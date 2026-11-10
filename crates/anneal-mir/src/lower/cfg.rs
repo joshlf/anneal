@@ -663,20 +663,23 @@ fn eval_panic_message(
     msg: &AssertMessage,
     state: &mut StatementEvalState,
 ) -> Result<PanicMessage, RvalueEvalError> {
+    let ptr_width = state.ptr_width;
     let check_usize = |val: MirValue| -> Result<MirValue, RvalueEvalError> {
-        if val.ty() != Ty::Uint(UintTy::Usize) {
+        if !mir_value_matches_ty(&val, &Ty::Uint(UintTy::Usize)) {
             return Err(RvalueEvalError::TypeMismatch(
                 "AssertMessage operand must evaluate to a usize value",
             ));
         }
+        check_value_well_formed(&val, ptr_width)?;
         Ok(val)
     };
     let check_int = |val: MirValue| -> Result<MirValue, RvalueEvalError> {
-        if !val.ty().is_integral() {
+        if !matches!(val, MirValue::Int { ref ty, .. } if ty.is_integral()) {
             return Err(RvalueEvalError::TypeMismatch(
                 "AssertMessage operand must evaluate to an integer value",
             ));
         }
+        check_value_well_formed(&val, ptr_width)?;
         Ok(val)
     };
     Ok(match msg {
@@ -700,11 +703,12 @@ fn eval_panic_message(
         }
         AssertMessage::OverflowNeg(op) => {
             let val = state.eval_operand(op)?;
-            if !val.ty().is_signed_int() {
+            if !matches!(val, MirValue::Int { ref ty, .. } if ty.is_signed_int()) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "AssertMessage::OverflowNeg operand must evaluate to a signed integer",
                 ));
             }
+            check_value_well_formed(&val, ptr_width)?;
             PanicMessage::OverflowNeg(val)
         }
         AssertMessage::DivisionByZero(op) => {
@@ -803,11 +807,24 @@ pub fn eval_lowered_terminator(
     unwinding: &mut UnwindState,
     mut call_handler: Option<&mut CallHandler<'_>>,
 ) -> Result<CfgStep, CfgEvalError> {
+    if state.ptr_width != body.ptr_width
+        || state.local_decls != body.local_decls
+        || state.slots.len() != body.local_decls.len()
+    {
+        return Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(
+                "StatementEvalState local_decls, slots, or ptr_width do not match LoweredBody",
+            ),
+        ));
+    }
     let Some(block) = body.basic_blocks.get(bb) else {
         return Err(CfgEvalError::InvalidBlock { bb });
     };
+    if block.is_cleanup != unwinding.is_some() {
+        return Err(CfgEvalError::InvalidUnwind { bb });
+    }
     let ptr_width = state.ptr_width;
-    let in_cleanup = block.is_cleanup || unwinding.is_some();
+    let in_cleanup = block.is_cleanup;
     let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
     let next = match term {
         LoweredTerminator::Goto { target } => *target,
@@ -848,6 +865,7 @@ pub fn eval_lowered_terminator(
                 )));
             }
             let ret_val = state.read_place(&Place::from_local(0)).map_err(term_err)?;
+            check_value_well_formed(&ret_val, ptr_width).map_err(term_err)?;
             return Ok(CfgStep::Done(CfgEvalOutcome::Returned(ret_val)));
         }
         LoweredTerminator::Unreachable => {
@@ -905,6 +923,7 @@ pub fn eval_lowered_terminator(
                     "Call callee runtime type does not match lowered type",
                 )));
             }
+            check_value_well_formed(&func_val, ptr_width).map_err(term_err)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for (arg, arg_ty) in args.iter().zip(arg_tys) {
                 let val = state.eval_operand(arg).map_err(term_err)?;
@@ -913,6 +932,7 @@ pub fn eval_lowered_terminator(
                         "Call argument runtime type does not match lowered type",
                     )));
                 }
+                check_value_well_formed(&val, ptr_width).map_err(term_err)?;
                 arg_vals.push(val);
             }
             state

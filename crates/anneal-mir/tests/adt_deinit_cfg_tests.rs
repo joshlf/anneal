@@ -8223,3 +8223,473 @@ fn test_a3_eval_lowered_terminator_steps_compose_into_eval_cfg_in_state() {
         Err(CfgEvalError::InvalidEdge { from: 0, to: 2 })
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// B4 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b4_niche_encoded_enum_init_values_reject_invalid_niche_payloads_in_discriminant_and_retag()
+{
+    let (nz_def, nz) = non_zero_u32();
+    let (opt_def, opt) = option_of("OptNzB4", nz.clone());
+    let (nz_ref_def, nz_ref) = adt(AdtDef::new_enum(
+        "NzRefB4",
+        None,
+        vec![
+            VariantDef::new("A", vec![nz.clone(), ref_ty(u32_ty())]),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    let (_, wrapper) = adt(AdtDef::new_struct("WrapOptNzB4", vec![opt.clone(), u32_ty()]));
+
+    let decls = vec![opt.clone(), nz_ref.clone(), u32_ty(), wrapper.clone(), Ty::Int(IntTy::Isize)];
+    let mut state = state_with(decls.clone(), PW);
+
+    // 1. Building `Option<NonZeroU32>` via `SetDiscriminant(_0, Some)` followed by writing `0u32`
+    // into the inner `u32` field `((_0 as Some).0).0` promotes `_0` to `LocalSlotState::Init`
+    // holding `Some(NonZeroU32(0))`. Because `0` is `None`'s niche bit pattern (and outside
+    // `NonZeroU32`'s valid range), `Discriminant(_0)` must fail closed in both stateful and
+    // stateless evaluators.
+    run(
+        Statement::SetDiscriminant {
+            place: local(0),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    let some_inner_u32 = place(
+        0,
+        vec![
+            ProjectionElem::Downcast(1),
+            field(0, nz.clone()),
+            field(0, u32_ty()),
+        ],
+    );
+    run(
+        assign(some_inner_u32.clone(), Rvalue::Use(cint(0, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    let invalid_some = MirValue::adt(&opt_def, 1, vec![MirValue::adt(&nz_def, 0, vec![u32v(0)])]);
+    assert_eq!(state.get_init(Local(0)), Some(&invalid_some));
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: nz.clone(),
+            bits: 0,
+        }))
+    );
+    let lowered_discr = lower_rvalue(&Rvalue::Discriminant(local(0)), &decls, PW).unwrap();
+    let mut tracker = ExposedProvenanceTracker::new();
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered_discr,
+            &[invalid_some],
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: nz.clone(),
+            bits: 0,
+        }))
+    );
+    // Writing a valid non-zero payload (`5`) restores a readable `Some` discriminant.
+    run(
+        assign(some_inner_u32, Rvalue::Use(cint(5, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Ok(MirValue::signed(1, IntTy::Isize, PW))
+    );
+
+    // Same when `Option<NonZeroU32>` is an `Init` field inside an incomplete outer struct shell.
+    let wrap_opt = place(3, vec![field(0, opt.clone())]);
+    let wrap_opt_u32 = place(
+        3,
+        vec![
+            field(0, opt.clone()),
+            ProjectionElem::Downcast(1),
+            field(0, nz.clone()),
+            field(0, u32_ty()),
+        ],
+    );
+    run(
+        Statement::SetDiscriminant {
+            place: wrap_opt.clone(),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(wrap_opt_u32, Rvalue::Use(cint(0, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(3)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        discriminant(&mut state, wrap_opt),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: nz.clone(),
+            bits: 0,
+        }))
+    );
+
+    // 2. `Statement::Retag` on `enum NzRef { A(NonZeroU32, &u32), B }` where `A.0` holds the
+    // invalid niche value `0` (even though `NonZeroU32` contains no references) must fail closed.
+    state.slots[2] = LocalSlotState::Init(u32v(9));
+    run(
+        Statement::SetDiscriminant {
+            place: local(1),
+            variant_index: 0,
+        },
+        &mut state,
+    )
+    .unwrap();
+    let a0_u32 = place(
+        1,
+        vec![
+            ProjectionElem::Downcast(0),
+            field(0, nz.clone()),
+            field(0, u32_ty()),
+        ],
+    );
+    let a1_ref = place(
+        1,
+        vec![ProjectionElem::Downcast(0), field(1, ref_ty(u32_ty()))],
+    );
+    run(assign(a0_u32.clone(), Rvalue::Use(cint(0, u32_ty()))), &mut state).unwrap();
+    run(
+        assign(a1_ref, Rvalue::Ref(Mutability::Not, local(2))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::Init(MirValue::Adt { adt_def: Some(def), variant_idx: 0, .. }))
+            if *def == nz_ref_def
+    ));
+    assert_eq!(
+        run(retag(RetagKind::Default, local(1)), &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: nz.clone(),
+            bits: 0,
+        }))
+    );
+    run(assign(a0_u32, Rvalue::Use(cint(1, u32_ty()))), &mut state).unwrap();
+    run(retag(RetagKind::Default, local(1)), &mut state).unwrap();
+
+    // 3. On `Bits32`, `check_scalar_ranges` must not mask an out-of-width pointer field into a
+    // valid `NonNull<u32>` bit pattern.
+    let pw32 = PtrWidth::Bits32;
+    let const_u32 = raw(u32_ty(), Mutability::Not);
+    let (non_null_def, non_null) = adt(
+        AdtDef::new_struct("NonNullU32B4", vec![const_u32.clone()])
+            .with_scalar_valid_range(ScalarValidRange::non_zero(32)),
+    );
+    let wide_ptr = (1u64 << 32) + 4;
+    let mut state32 = state_with(vec![non_null.clone(), const_u32.clone()], pw32);
+    state32.slots[1] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(wide_ptr),
+        const_u32,
+    ));
+    assert_eq!(
+        run(
+            assign(local(0), adt_aggregate(&non_null_def, 0, None, vec![cp(1)])),
+            &mut state32,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: non_null,
+            bits: u128::from(wide_ptr),
+        }))
+    );
+}
+
+#[test]
+fn test_b4_mir_value_matches_ty_subtype_and_wrap_unsafe_binder_enforce_scalar_and_leaf_validity() {
+    let (wrapper_def, wrapper) = adt(AdtDef::new_struct("WrapRefB4", vec![ref_ty(u32_ty())]));
+    let decls = vec![
+        Ty::Bool,
+        ref_ty(u32_ty()),
+        u32_ty(),
+        u8_ty(),
+        wrapper.clone(),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+
+    // 1. `MirValue::Int` with a non-integral `Ty` and `MirValue::Ptr` with a non-pointer `Ty`
+    // are rejected by `mir_value_matches_ty` (`write_place`, `from_body`, etc.).
+    for (slot_idx, ty, bad_val) in [
+        (
+            0,
+            Ty::Bool,
+            MirValue::Int {
+                bits: 1,
+                ty: Ty::Bool,
+            },
+        ),
+        (
+            1,
+            ref_ty(u32_ty()),
+            MirValue::Int {
+                bits: 0x1000,
+                ty: ref_ty(u32_ty()),
+            },
+        ),
+        (
+            2,
+            u32_ty(),
+            MirValue::Ptr {
+                ptr: PointerValue::without_provenance(7),
+                ty: u32_ty(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            state.write_place(&local(slot_idx), &ty, bad_val.clone()),
+            Err(RvalueEvalError::TypeMismatch(
+                "assigned value runtime type does not match destination place type"
+            ))
+        );
+        let body = lower_ok(
+            &mk_body(
+                vec![unit(), ty],
+                vec![blk(
+                    vec![assign(local(0), Rvalue::Use(Operand::Constant(Constant::Unit)))],
+                    Terminator::Return,
+                )],
+            ),
+            PW,
+        );
+        assert!(matches!(
+            StatementEvalState::from_body(&body, &[bad_val]),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+    }
+
+    // 2. `CastKind::Subtype` and `Rvalue::WrapUnsafeBinder` reject null references and
+    // out-of-width integers/pointers instead of passing them through `check_scalar_ranges`.
+    let null_ref = MirValue::ptr(PointerValue::without_provenance(0), ref_ty(u32_ty()));
+    state.slots[1] = LocalSlotState::Init(null_ref);
+    assert_eq!(
+        run(
+            assign(
+                local(1),
+                Rvalue::Cast(CastKind::Subtype, cp(1), ref_ty(u32_ty()))
+            ),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_ty(u32_ty()),
+            bits: 0,
+        }))
+    );
+    assert_eq!(
+        run(
+            assign(local(4), Rvalue::WrapUnsafeBinder(cp(1), wrapper.clone())),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_ty(u32_ty()),
+            bits: 0,
+        }))
+    );
+
+    state.slots[3] = LocalSlotState::Init(u8v(0x101));
+    assert_eq!(
+        run(
+            assign(local(3), Rvalue::Cast(CastKind::Subtype, cp(3), u8_ty())),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: u8_ty(),
+            bits: 0x101,
+        }))
+    );
+    assert_eq!(
+        run(
+            assign(local(3), Rvalue::WrapUnsafeBinder(cp(3), u8_ty())),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: u8_ty(),
+            bits: 0x101,
+        }))
+    );
+
+    // Valid reference passes both `Subtype` and `WrapUnsafeBinder`.
+    let good_ptr = PointerValue::with_provenance(0x2000, 2, 1);
+    state.slots[1] = LocalSlotState::Init(MirValue::ptr(good_ptr, ref_ty(u32_ty())));
+    run(
+        assign(local(4), Rvalue::WrapUnsafeBinder(cp(1), wrapper)),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::adt(
+            &wrapper_def,
+            0,
+            vec![MirValue::ptr(good_ptr, ref_ty(u32_ty()))]
+        ))
+    );
+}
+
+#[test]
+fn test_b4_eval_lowered_terminator_enforces_state_cleanup_mode_and_well_formed_boundary_values() {
+    let resume = cleanup_blk(vec![], Terminator::UnwindResume);
+    let unwinding_body = lower_ok(&assert_body(UnwindAction::Cleanup(2), vec![resume]), PW);
+    let term0 = unwinding_body.basic_blocks[0].terminator.clone().unwrap();
+    let term2 = unwinding_body.basic_blocks[2].terminator.clone().unwrap();
+
+    // 1. Direct calls to `eval_lowered_terminator` validate `state` against `body` and require
+    // `block.is_cleanup == unwinding.is_some()` on entry.
+    let mut wrong_pw_state = state_with(unwinding_body.local_decls.clone(), PtrWidth::Bits32);
+    let mut unwinding: UnwindState = None;
+    assert!(matches!(
+        eval_lowered_terminator(
+            &unwinding_body,
+            0,
+            &term0,
+            &mut wrong_pw_state,
+            &mut unwinding,
+            None,
+        ),
+        Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(_)
+        ))
+    ));
+
+    let mut state =
+        StatementEvalState::from_body(&unwinding_body, &[MirValue::Bool(true)]).unwrap();
+    // Cleanup block `bb2` cannot run while `unwinding` is `None` (even with `Goto { target: 0 }`).
+    assert_eq!(
+        eval_lowered_terminator(
+            &unwinding_body,
+            2,
+            &LoweredTerminator::Goto { target: 0 },
+            &mut state,
+            &mut None,
+            None,
+        ),
+        Err(CfgEvalError::InvalidUnwind { bb: 2 })
+    );
+    // Non-cleanup block `bb0` cannot run while `unwinding` is `Some(...)` (even with `UnwindResume`
+    // or `Goto { target: 2 }`).
+    let mut active_unwind: UnwindState = Some((0, custom_msg("boom")));
+    assert_eq!(
+        eval_lowered_terminator(
+            &unwinding_body,
+            0,
+            &term2,
+            &mut state,
+            &mut active_unwind,
+            None,
+        ),
+        Err(CfgEvalError::InvalidUnwind { bb: 0 })
+    );
+    assert_eq!(
+        eval_lowered_terminator(
+            &unwinding_body,
+            0,
+            &LoweredTerminator::Goto { target: 2 },
+            &mut state,
+            &mut active_unwind,
+            None,
+        ),
+        Err(CfgEvalError::InvalidUnwind { bb: 0 })
+    );
+
+    // 2. `Return`, `Call`, and failing `Assert` message evaluation reject out-of-width integers
+    // and null references.
+    let ret_body = lower_ok(
+        &mk_body(vec![u8_ty()], vec![blk(vec![], Terminator::Return)]),
+        PW,
+    );
+    let mut bad_ret_state = state_with(vec![u8_ty()], PW);
+    bad_ret_state.slots[0] = LocalSlotState::Init(u8v(0x101));
+    assert_eq!(
+        eval_cfg_in_state(&ret_body, bad_ret_state, 0, 2, None),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: u8_ty(),
+                bits: 0x101,
+            }),
+        })
+    );
+
+    let call_body = lower_ok(
+        &mk_body(
+            vec![u8_ty(), u8_ty()],
+            vec![
+                blk(
+                    vec![],
+                    Terminator::Call {
+                        func: Operand::Constant(Constant::Unit),
+                        args: vec![cp(1)],
+                        destination: local(0),
+                        target: Some(1),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        ),
+        PW,
+    );
+    let mut bad_call_state = state_with(vec![u8_ty(), u8_ty()], PW);
+    bad_call_state.slots[1] = LocalSlotState::Init(u8v(0x101));
+    let mut handler = |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Return(u8v(1)));
+    assert_eq!(
+        eval_cfg_in_state(&call_body, bad_call_state, 0, 2, Some(&mut handler)),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: u8_ty(),
+                bits: 0x101,
+            }),
+        })
+    );
+
+    let bounds_assert_body = lower_ok(
+        &mk_body(
+            vec![unit(), usize_ty()],
+            vec![blk(
+                vec![],
+                assert_t(
+                    cbool(false),
+                    true,
+                    AssertMessage::BoundsCheck {
+                        len: cp(1),
+                        index: cint(0, usize_ty()),
+                    },
+                    0,
+                    UnwindAction::Continue,
+                ),
+            )],
+        ),
+        PtrWidth::Bits32,
+    );
+    let mut bad_assert_state = state_with(vec![unit(), usize_ty()], PtrWidth::Bits32);
+    let wide_len = 1u128 << 32;
+    bad_assert_state.slots[1] = LocalSlotState::Init(usizev(wide_len));
+    assert_eq!(
+        eval_cfg_in_state(&bounds_assert_body, bad_assert_state, 0, 2, None),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: usize_ty(),
+                bits: wide_len,
+            }),
+        })
+    );
+}

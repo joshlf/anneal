@@ -2805,10 +2805,10 @@ fn ty_has_scalar_range(ty: &Ty) -> bool {
 }
 
 /// Scalar bit pattern of a scalar `MirValue` (integer bits, `bool`, `char`, or a pointer's
-/// address masked to `ptr_width`).
-fn scalar_value_bits(val: &MirValue, ptr_width: PtrWidth) -> Option<u128> {
+/// address).
+fn scalar_value_bits(val: &MirValue) -> Option<u128> {
     match val {
-        MirValue::Ptr { ptr, .. } => Some(u128::from(ptr.addr) & ptr_width.mask()),
+        MirValue::Ptr { ptr, .. } => Some(u128::from(ptr.addr)),
         _ => val.as_bits(),
     }
 }
@@ -2841,7 +2841,7 @@ pub(crate) fn check_scalar_ranges(val: &MirValue, ptr_width: PtrWidth) -> Result
             if let Some(def) = adt_def
                 && def.scalar_valid_range.is_some()
                 && let Some((idx, _)) = def.scalar_field(ptr_width)
-                && let Some(bits) = fields.get(idx).and_then(|f| scalar_value_bits(f, ptr_width))
+                && let Some(bits) = fields.get(idx).and_then(scalar_value_bits)
                 && !def.scalar_range_contains(bits, ptr_width)
             {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -2886,10 +2886,15 @@ pub(crate) fn check_value_well_formed(
             }))
         };
         match val {
-            MirValue::Int { bits, ty } if !ty.is_valid_scalar_bits(*bits, ptr_width) => {
+            MirValue::Int { bits, ty }
+                if !ty.is_integral() || !ty.is_valid_scalar_bits(*bits, ptr_width) =>
+            {
                 invalid(ty, *bits)
             }
-            MirValue::Ptr { ptr, ty } if !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) => {
+            MirValue::Ptr { ptr, ty }
+                if !ty.is_any_ptr()
+                    || !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) =>
+            {
                 invalid(ty, u128::from(ptr.addr))
             }
             MirValue::Array { elements, .. } => elements
@@ -3416,6 +3421,9 @@ pub fn eval_lowered_cast(
             }
         }
         LoweredCast::Subtype { src_ty, target_ty, .. } => {
+            src_ty
+                .check_representable(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(src_ty, err)))?;
             if !crate::lower::cast::is_subtype_compatible(src_ty, target_ty)
                 || !mir_value_matches_ty(val, src_ty)
             {
@@ -3423,7 +3431,7 @@ pub fn eval_lowered_cast(
                     "Subtype operand must match the (equal) source and target types",
                 ));
             }
-            check_scalar_ranges(val, ptr_width)?;
+            check_value_well_formed(val, ptr_width)?;
             Ok(val.clone())
         }
         LoweredCast::PointerCoercion {
@@ -3478,10 +3486,10 @@ fn checked_ptr_addr(
 /// single operand corresponds to `field_tys[field_idx]` of the union's declared tuple type.
 pub(crate) fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
     match (val, expected_ty) {
-        (MirValue::Int { ty, .. }, expected) => ty == expected,
+        (MirValue::Int { ty, .. }, expected) => ty.is_integral() && ty == expected,
         (MirValue::Bool(_), Ty::Bool) => true,
         (MirValue::Char(_), Ty::Char) => true,
-        (MirValue::Ptr { ty, .. }, expected) => ty == expected,
+        (MirValue::Ptr { ty, .. }, expected) => ty.is_any_ptr() && ty == expected,
         (MirValue::Unit, Ty::Tuple(fields)) => fields.is_empty(),
         (
             MirValue::Array { elements, elem_ty },
@@ -5438,6 +5446,14 @@ pub fn eval_lowered_rvalue(
                     ProjectedRef::Value(val @ MirValue::Adt { variant_idx, .. })
                         if mir_value_head_matches_ty(val, place_ty) =>
                     {
+                        if !def.tag_survives_field_deinit() {
+                            if !mir_value_matches_ty(val, place_ty) {
+                                return Err(RvalueEvalError::TypeMismatch(
+                                    "Discriminant place runtime value does not match lowered place_ty",
+                                ));
+                            }
+                            check_value_well_formed(val, ptr_width)?;
+                        }
                         discriminant_value(def, *variant_idx, ptr_width)
                     }
                     _ => Err(RvalueEvalError::TypeMismatch(
@@ -5608,8 +5624,8 @@ fn eval_wrap_unsafe_binder(
             "WrapUnsafeBinder operand runtime type does not match lowered type",
         ));
     }
+    check_value_well_formed(&val, ptr_width)?;
     if ty == operand_ty {
-        check_scalar_ranges(&val, ptr_width)?;
         return Ok(val);
     }
     match ty {
@@ -6201,7 +6217,22 @@ impl StatementEvalState {
         let base_decl_ty = &self.local_decls[place.local.0];
         let read_index = |idx_local: Local| cached_index(index_cache, idx_local);
         let variant_of = |val: &MirValue| match val {
-            MirValue::Adt { variant_idx, .. } if mir_value_head_matches_ty(val, place_ty) => {
+            MirValue::Adt {
+                variant_idx,
+                adt_def,
+                ..
+            } if mir_value_head_matches_ty(val, place_ty) => {
+                if adt_def
+                    .as_ref()
+                    .is_some_and(|def| !def.tag_survives_field_deinit())
+                {
+                    if !mir_value_matches_ty(val, place_ty) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Discriminant place runtime value does not match lowered place_ty",
+                        ));
+                    }
+                    check_value_well_formed(val, self.ptr_width)?;
+                }
                 Ok(*variant_idx)
             }
             _ => Err(RvalueEvalError::TypeMismatch(
@@ -8177,6 +8208,12 @@ fn retag_value(val: &MirValue, ty: &Ty, ctx: RetagCtx<'_>) -> Result<(), RvalueE
                 return Err(RvalueEvalError::UninhabitedEnumVariant {
                     variant_index: *variant_idx,
                 });
+            }
+            if def.is_enum() && !def.tag_survives_field_deinit() {
+                if !mir_value_matches_ty(val, ty) {
+                    return Err(mismatch());
+                }
+                check_value_well_formed(val, ctx.ptr_width)?;
             }
             for (value, field_ty) in vals.iter().zip(field_tys) {
                 retag_value(value, field_ty, ctx)?;
