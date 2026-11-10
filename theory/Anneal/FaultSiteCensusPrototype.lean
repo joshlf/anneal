@@ -5290,6 +5290,338 @@ theorem stepMirFn_exposesUb_in_batch_discharged_instantiated
       (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
   exact ⟨cls, hInDis, hReg⟩
 
+/-! ## 9c. `[adv A4]` Interprocedural Multi-Step Trace Safety Across Inline Callee Frames (`MirStepsInterproc`)
+
+`MirStepsTop` (`[adv B4]`) covers top-level multi-step traces (`activeCallee = none`,
+`callStack = []`) across intra-frame transitions and external calls, while
+`stepMirFn_exposesUb_in_batch_discharged` (`[adv B3]`) covers a single step inside an
+active inline callee. Here we bridge both by defining `ValidInterprocState` and the
+interprocedural multi-step relation `MirStepsInterproc` chaining intra-body statement/terminator
+steps, `pushCalleeFrame`, `pushDivergingCalleeFrame`, `enterTailCalleeFrame`, inline
+`TerminatorKind.return_`, and `unwindFromCallStack` across an arbitrary stack of inline
+callee frames in a `CoverageBatch`.
+-/
+
+/--
+`[adv A4]` Well-formedness of a saved caller frame with respect to a `CoverageBatch`:
+its return and unwind targets are in bounds (`ValidCallerFrame`), its `callerBody` has
+in-bounds CFG targets (`cfgTargetsInBounds`), and its `callerBody` belongs to `batch`.
+-/
+def ValidBatchCallerFrame (batch : CoverageBatch) (caller : SavedCallerFrame) : Prop :=
+  ValidCallerFrame caller ∧
+  cfgTargetsInBounds caller.callerBody = true ∧
+  ∃ d, (caller.callerBody, d) ∈ batch
+
+/--
+`[adv A4]` Every saved caller frame on `stack` satisfies `ValidBatchCallerFrame batch`.
+-/
+def ValidBatchCallStack (batch : CoverageBatch) (stack : List SavedCallerFrame) : Prop :=
+  ∀ c ∈ stack, ValidBatchCallerFrame batch c
+
+/--
+`[adv A4]` Global interprocedural machine-state invariant over a `CoverageBatch`:
+the active body `s.memory.activeCallee.getD rootBody` belongs to `batch`, has
+`cfgTargetsInBounds = true`, has a valid program counter `ValidMirPc`, and every frame
+on `s.memory.callStack` satisfies `ValidBatchCallerFrame batch`.
+-/
+def ValidInterprocState
+    (batch : CoverageBatch) (rootBody : CapturedMir) (s : MachineState) : Prop :=
+  let active := s.memory.activeCallee.getD rootBody
+  (∃ d, (active, d) ∈ batch) ∧
+  cfgTargetsInBounds active = true ∧
+  ValidMirPc active s.frame ∧
+  ValidBatchCallStack batch s.memory.callStack
+
+/--
+`[adv A4]` At `initMachineState body args` (or `initMachineStateWithCallees body callees args`),
+`ValidInterprocState batch body` holds whenever `(body, d₀) ∈ batch` and
+`cfgTargetsInBounds body = true`.
+-/
+theorem validInterprocState_initMachineState
+    (batch : CoverageBatch) (body : CapturedMir) (d₀ : List FaultSite)
+    (args : List Value)
+    (hMem : (body, d₀) ∈ batch)
+    (hCfg : cfgTargetsInBounds body = true) :
+    ValidInterprocState batch body (initMachineState body args) := by
+  have hNonEmpty : 0 < length body.basicBlocks := by
+    unfold cfgTargetsInBounds at hCfg
+    rcases Bool.and_eq_true_iff.mp hCfg with ⟨hPos, _⟩
+    exact of_decide_eq_true hPos
+  refine ⟨⟨d₀, hMem⟩, hCfg, validMirPc_initMachineState body args hNonEmpty, ?_⟩
+  intro c hc
+  nomatch hc
+
+/--
+`[adv A4]` Interprocedural unwind preservation over `ValidBatchCallStack`: if
+`unwindFromCallStack stack memAfter = .running s'`, then `ValidInterprocState batch rootBody s'`
+holds.
+-/
+theorem validInterprocState_unwindFromCallStack
+    (batch : CoverageBatch) (rootBody : CapturedMir) :
+    ∀ (stack : List SavedCallerFrame) (memAfter : Memory) (s' : MachineState),
+      ValidBatchCallStack batch stack →
+      unwindFromCallStack stack memAfter = .running s' →
+      ValidInterprocState batch rootBody s'
+  | [], _, _, _, hRun => by nomatch hRun
+  | caller :: restStack, memAfter, s', hValid, hRun => by
+    have hCaller : ValidBatchCallerFrame batch caller :=
+      hValid caller (List.Mem.head restStack)
+    have hRest : ValidBatchCallStack batch restStack :=
+      fun c hc => hValid c (List.Mem.tail caller hc)
+    dsimp only [unwindFromCallStack] at hRun
+    cases hUnw : caller.returnUnwind with
+    | unreachable =>
+      rw [hUnw] at hRun; nomatch hRun
+    | terminate =>
+      rw [hUnw] at hRun; nomatch hRun
+    | continue_ =>
+      rw [hUnw] at hRun
+      exact validInterprocState_unwindFromCallStack batch rootBody restStack _ s' hRest hRun
+    | cleanup cleanupBb =>
+      rw [hUnw] at hRun
+      injection hRun with hEq
+      subst hEq
+      have hUnwBounds := hCaller.1.2
+      rw [hUnw] at hUnwBounds
+      have hLt : cleanupBb < length caller.callerBody.basicBlocks := by
+        unfold unwindTargetsInBounds unwindTargets at hUnwBounds
+        rw [List.all_eq_true] at hUnwBounds
+        exact of_decide_eq_true (hUnwBounds cleanupBb (List.Mem.head []))
+      rcases exists_get?_of_lt_length caller.callerBody.basicBlocks cleanupBb hLt with ⟨bb, hBb⟩
+      exact ⟨hCaller.2.2, hCaller.2.1, ⟨bb, hBb, Nat.zero_le _⟩, hRest⟩
+
+/--
+`[adv A4]` Interprocedural multi-step reachability relation across inline callee frames
+and intra-body transitions in a `CoverageBatch`:
+- `refl`: zero steps;
+- `stepStmt`: evaluating the statement at `s₁.frame.stmtIdx` in the active body
+  (`s₁.memory.activeCallee.getD rootBody`) steps to `s₂` while keeping `activeCallee`
+  and `callStack`;
+- `stepTermIntra`: an intra-body terminator transition in the active body jumps to
+  `s₂.frame.blockIdx ∈ terminatorTargets bb.terminator.kind` at `stmtIdx = 0` while
+  keeping `activeCallee` and `callStack`;
+- `callInline`: pushing an inline callee frame via `pushCalleeFrame` for a callee in `batch`
+  with `cfgTargetsInBounds calleeBody = true`;
+- `callDivergingInline`: pushing a diverging inline callee frame via
+  `pushDivergingCalleeFrame` for a callee in `batch` with `cfgTargetsInBounds calleeBody = true`;
+- `tailCallInline`: entering a tail callee via `enterTailCalleeFrame` for a callee in `batch`
+  with `cfgTargetsInBounds calleeBody = true`;
+- `returnInline`: returning from an inline callee to a non-empty `s₁.memory.callStack`
+  via `evalTerminator s₁ ⟨.return_, span⟩ s₁.memory.activeCallee = MirStepNode.step s₂`;
+- `unwindInline`: unwinding across `s₁.memory.callStack` via
+  `unwindFromCallStack s₁.memory.callStack memAfter = .running s₂`.
+-/
+inductive MirStepsInterproc
+    (batch : CoverageBatch) (rootBody : CapturedMir) :
+    MachineState → MachineState → Prop where
+  | refl (s : MachineState) : MirStepsInterproc batch rootBody s s
+  | stepStmt {s₁ s₂ s₃ : MachineState} {bb : BasicBlockData} {stmt : Statement}
+      (hBb : get? (s₁.memory.activeCallee.getD rootBody).basicBlocks s₁.frame.blockIdx = some bb)
+      (hStmt : get? bb.statements s₁.frame.stmtIdx = some stmt)
+      (hAct : s₂.memory.activeCallee = s₁.memory.activeCallee)
+      (hStack : s₂.memory.callStack = s₁.memory.callStack)
+      (hEv : evalStmt s₁ stmt (s₁.memory.activeCallee.getD rootBody).localDecls
+               (s₁.memory.activeCallee.getD rootBody).layouts = MirStepNode.step s₂ ∨
+             ∃ obs, evalStmt s₁ stmt (s₁.memory.activeCallee.getD rootBody).localDecls
+               (s₁.memory.activeCallee.getD rootBody).layouts = MirStepNode.emitStep obs s₂)
+      (hRest : MirStepsInterproc batch rootBody s₂ s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | stepTermIntra {s₁ s₂ s₃ : MachineState} {bb : BasicBlockData}
+      (hBb : get? (s₁.memory.activeCallee.getD rootBody).basicBlocks s₁.frame.blockIdx = some bb)
+      (hTarget : s₂.frame.blockIdx ∈ terminatorTargets bb.terminator.kind)
+      (hZero : s₂.frame.stmtIdx = 0)
+      (hAct : s₂.memory.activeCallee = s₁.memory.activeCallee)
+      (hStack : s₂.memory.callStack = s₁.memory.callStack)
+      (hRest : MirStepsInterproc batch rootBody s₂ s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | callInline {s₁ s₃ : MachineState}
+      {bb : BasicBlockData} {func : Operand} {args : List Operand}
+      {destination : Place} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+      (localsAfterArgs : List LocalSlot) (calleeBody : CapturedMir) (argVals : List Value)
+      (hBb : get? (s₁.memory.activeCallee.getD rootBody).basicBlocks s₁.frame.blockIdx = some bb)
+      (hKind : bb.terminator.kind = .call func args destination (some targetBb) unwind)
+      (hCalleeBatch : ∃ d, (calleeBody, d) ∈ batch)
+      (hCalleeCfg : cfgTargetsInBounds calleeBody = true)
+      (hRest : MirStepsInterproc batch rootBody
+        (pushCalleeFrame s₁ (s₁.memory.activeCallee.getD rootBody)
+          localsAfterArgs destination targetBb calleeBody argVals unwind) s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | callDivergingInline {s₁ s₃ : MachineState}
+      {bb : BasicBlockData} {func : Operand} {args : List Operand}
+      {destination : Place} {unwind : UnwindAction}
+      (localsAfterArgs : List LocalSlot) (calleeBody : CapturedMir) (argVals : List Value)
+      (hBb : get? (s₁.memory.activeCallee.getD rootBody).basicBlocks s₁.frame.blockIdx = some bb)
+      (hKind : bb.terminator.kind = .call func args destination none unwind)
+      (hCalleeBatch : ∃ d, (calleeBody, d) ∈ batch)
+      (hCalleeCfg : cfgTargetsInBounds calleeBody = true)
+      (hRest : MirStepsInterproc batch rootBody
+        (pushDivergingCalleeFrame s₁ (s₁.memory.activeCallee.getD rootBody)
+          localsAfterArgs destination unwind calleeBody argVals) s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | tailCallInline {s₁ s₃ : MachineState}
+      (calleeBody : CapturedMir) (argVals : List Value)
+      (hCalleeBatch : ∃ d, (calleeBody, d) ∈ batch)
+      (hCalleeCfg : cfgTargetsInBounds calleeBody = true)
+      (hRest : MirStepsInterproc batch rootBody
+        (enterTailCalleeFrame s₁.memory calleeBody argVals) s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | returnInline {s₁ s₂ s₃ : MachineState}
+      {caller : SavedCallerFrame} {restStack : List SavedCallerFrame} (span : String)
+      (hStack : s₁.memory.callStack = caller :: restStack)
+      (hEv : evalTerminator s₁ ⟨.return_, span⟩ s₁.memory.activeCallee = MirStepNode.step s₂)
+      (hRest : MirStepsInterproc batch rootBody s₂ s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+  | unwindInline {s₁ s₂ s₃ : MachineState} (memAfter : Memory)
+      (hRun : unwindFromCallStack s₁.memory.callStack memAfter = .running s₂)
+      (hRest : MirStepsInterproc batch rootBody s₂ s₃) :
+      MirStepsInterproc batch rootBody s₁ s₃
+
+/--
+`[adv A4]` Multi-step interprocedural invariance: `MirStepsInterproc` preserves
+`ValidInterprocState batch rootBody` across arbitrarily nested inline calls, tail calls,
+returns, and unwinds.
+-/
+theorem mirStepsInterproc_preserves_validInterprocState
+    (batch : CoverageBatch) (rootBody : CapturedMir) {s s' : MachineState}
+    (hValid : ValidInterprocState batch rootBody s)
+    (hSteps : MirStepsInterproc batch rootBody s s') :
+    ValidInterprocState batch rootBody s' := by
+  induction hSteps with
+  | refl _ => exact hValid
+  | stepStmt hBb hStmt hAct hStack hEv _ ih =>
+    rcases hValid with ⟨hInBatch, hCfg, _, hStackValid⟩
+    have hLt := (lt_length_and_mem_of_get? _ _ _ hStmt).1
+    rcases evalStmt_step_or_emit_frame _ _ _ _ _ hEv with ⟨hBlk, hIdx⟩
+    apply ih
+    refine ⟨?_, ?_, ?_, ?_⟩
+    · rw [hAct]; exact hInBatch
+    · rw [hAct]; exact hCfg
+    · unfold ValidMirPc
+      rw [hAct]
+      exact ⟨_, by rw [hBlk]; exact hBb, by rw [hIdx]; exact Nat.succ_le_of_lt hLt⟩
+    · rw [hStack]; exact hStackValid
+  | stepTermIntra hBb hTarget hZero hAct hStack _ ih =>
+    rcases hValid with ⟨hInBatch, hCfg, _, hStackValid⟩
+    have hBbMem := (lt_length_and_mem_of_get? _ _ _ hBb).2
+    have hCfg' := hCfg
+    unfold cfgTargetsInBounds at hCfg'
+    rcases Bool.and_eq_true_iff.mp hCfg' with ⟨_, hAllBbs⟩
+    have hBbOk := (List.all_eq_true.mp hAllBbs) _ hBbMem
+    have hTargetLt := of_decide_eq_true ((List.all_eq_true.mp hBbOk) _ hTarget)
+    rcases exists_get?_of_lt_length _ _ hTargetLt with ⟨bb', hBb'⟩
+    apply ih
+    refine ⟨?_, ?_, ?_, ?_⟩
+    · rw [hAct]; exact hInBatch
+    · rw [hAct]; exact hCfg
+    · unfold ValidMirPc
+      rw [hAct]
+      refine ⟨bb', hBb', ?_⟩
+      rw [hZero]; exact Nat.zero_le _
+    · rw [hStack]; exact hStackValid
+  | callInline _ calleeBody _ hBb hKind hCalleeBatch hCalleeCfg _ ih =>
+    rcases hValid with ⟨hInBatch, hCfg, _, hStackValid⟩
+    rcases call_targets_in_bounds_of_cfg _ _ _ _ _ _ _ _ hCfg hBb hKind with
+      ⟨hTargetLt, hUnwBounds⟩
+    have hCalleeCfg' := hCalleeCfg
+    unfold cfgTargetsInBounds at hCalleeCfg'
+    rcases Bool.and_eq_true_iff.mp hCalleeCfg' with ⟨hPos, _⟩
+    have hNonEmpty := of_decide_eq_true hPos
+    apply ih
+    refine ⟨hCalleeBatch, hCalleeCfg,
+      validMirPc_pushCalleeFrame _ _ _ _ _ _ _ _ hNonEmpty, ?_⟩
+    intro c hc
+    rcases List.mem_cons.mp hc with rfl | hTail
+    · exact ⟨⟨(fun _ => hTargetLt), hUnwBounds⟩, hCfg, hInBatch⟩
+    · exact hStackValid c hTail
+  | callDivergingInline _ calleeBody _ hBb hKind hCalleeBatch hCalleeCfg _ ih =>
+    rcases hValid with ⟨hInBatch, hCfg, _, hStackValid⟩
+    have hUnwBounds := diverging_call_unwind_in_bounds_of_cfg _ _ _ _ _ _ _ hCfg hBb hKind
+    have hCalleeCfg' := hCalleeCfg
+    unfold cfgTargetsInBounds at hCalleeCfg'
+    rcases Bool.and_eq_true_iff.mp hCalleeCfg' with ⟨hPos, _⟩
+    have hNonEmpty := of_decide_eq_true hPos
+    apply ih
+    refine ⟨hCalleeBatch, hCalleeCfg,
+      validMirPc_pushDivergingCalleeFrame _ _ _ _ _ _ _ hNonEmpty, ?_⟩
+    intro c hc
+    rcases List.mem_cons.mp hc with rfl | hTail
+    · exact ⟨⟨(fun hF => by nomatch hF), hUnwBounds⟩, hCfg, hInBatch⟩
+    · exact hStackValid c hTail
+  | tailCallInline calleeBody _ hCalleeBatch hCalleeCfg _ ih =>
+    rcases hValid with ⟨_, _, _, hStackValid⟩
+    have hCalleeCfg' := hCalleeCfg
+    unfold cfgTargetsInBounds at hCalleeCfg'
+    rcases Bool.and_eq_true_iff.mp hCalleeCfg' with ⟨hPos, _⟩
+    have hNonEmpty := of_decide_eq_true hPos
+    apply ih
+    exact ⟨hCalleeBatch, hCalleeCfg,
+      validMirPc_enterTailCalleeFrame _ _ _ _ hNonEmpty, hStackValid⟩
+  | @returnInline s₁ s₂ s₃ caller restStack span hStack hEv _ ih =>
+    rcases hValid with ⟨_, _, _, hStackValid⟩
+    rw [hStack] at hStackValid
+    have hCaller : ValidBatchCallerFrame batch caller :=
+      hStackValid caller (List.Mem.head _)
+    have hRest : ValidBatchCallStack batch restStack :=
+      fun c hc => hStackValid c (List.Mem.tail _ hc)
+    have hEv' := hEv
+    dsimp only [evalTerminator] at hEv'
+    split at hEv'
+    · rw [hStack] at hEv'
+      dsimp only at hEv'
+      cases hDiv : caller.isDiverging with
+      | true =>
+        rw [hDiv] at hEv'; nomatch hEv'
+      | false =>
+        rw [hDiv] at hEv'
+        dsimp only at hEv'
+        split at hEv'
+        · injection hEv' with hTau
+          injection hTau with hEq
+          subst hEq
+          have hTargetLt := hCaller.1.1 hDiv
+          rcases exists_get?_of_lt_length caller.callerBody.basicBlocks
+            caller.returnTarget hTargetLt with ⟨bb, hBb⟩
+          apply ih
+          exact ⟨hCaller.2.2, hCaller.2.1, ⟨bb, hBb, Nat.zero_le _⟩, hRest⟩
+        · nomatch hEv'
+        · nomatch hEv'
+    · nomatch hEv'
+  | unwindInline memAfter hRun _ ih =>
+    rcases hValid with ⟨_, _, _, hStackValid⟩
+    exact ih (validInterprocState_unwindFromCallStack batch rootBody _ _ _ hStackValid hRun)
+
+/--
+`[adv A4]` End-to-End Interprocedural Multi-Step Reconciled Batch Safety Theorem
+(`initMachineState_mirStepsInterproc_batch_reconciled_safety`):
+when `reconcileCoverageBatch registry batch = true`, `(body, d₀) ∈ batch`, and
+`cfgTargetsInBounds body = true`, for **every** machine state `s` reachable from
+`initMachineState body args` along `MirStepsInterproc batch body` (including inside
+arbitrarily nested inline callees, tail calls, returns, and unwinds) whose next step
+exposes `.ub` (`StepNodeExposesUb (stepMirFn body s)`), there exist `discharged` and
+`cls : MirFaultClass` such that `(s.memory.activeCallee.getD body, discharged) ∈ batch`,
+`(s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged`, and
+`registry cls = .emittedAndVerified`.
+-/
+theorem initMachineState_mirStepsInterproc_batch_reconciled_safety
+    (registry : PropertyRegistry) (batch : CoverageBatch)
+    (body : CapturedMir) (d₀ : List FaultSite) (args : List Value) (s : MachineState)
+    (hBatch : reconcileCoverageBatch registry batch = true)
+    (hRootMem : (body, d₀) ∈ batch)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hSteps : MirStepsInterproc batch body (initMachineState body args) s)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ (discharged : List FaultSite) (cls : MirFaultClass),
+      (s.memory.activeCallee.getD body, discharged) ∈ batch ∧
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  have hInit : ValidInterprocState batch body (initMachineState body args) :=
+    validInterprocState_initMachineState batch body d₀ args hRootMem hCfg
+  rcases mirStepsInterproc_preserves_validInterprocState batch body hInit hSteps with
+    ⟨⟨discharged, hItem⟩, _, hPc, _⟩
+  rcases stepMirFn_exposesUb_in_batch_discharged registry batch body s discharged
+      hBatch hItem hPc hUb with ⟨cls, hInDis, hReg⟩
+  exact ⟨discharged, cls, hItem, hInDis, hReg⟩
+
 /-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
 
 `[adv B1]`: every witness body now declares well-typed `localDecls` for every local
@@ -6116,5 +6448,49 @@ theorem witnessExtCall_mirStepsTop_nonvacuous :
   refine ⟨_, _, _, rfl, rfl, rfl, rfl, ?_⟩
   exact MirStepsTop.extCall (ans := .returned (.scalar ⟨7, 4⟩) {}) rfl rfl rfl ⟨rfl, rfl⟩ rfl
     (MirStepsTop.refl _)
+
+/--
+`[adv A4]` Non-vacuity of `MirStepsInterproc`: starting at `(0, 0)` of `witnessExtCallBody`,
+pushing `witnessSwitchBreakStripBody` as an inline callee (`callInline`), branching from
+`bb0` to `bb1` inside the callee (`stepTermIntra`), executing `_0 = const 42_u32` inside
+the callee (`stepStmt` from `(1, 0)` to `(1, 1)`), and returning from the inline callee
+(`returnInline`) resumes the caller `witnessExtCallBody` at `(1, 0)` with
+`locals = [witnessU32Slot 42]` and `activeCallee = some witnessExtCallBody`.
+-/
+theorem witnessInterproc_call_and_return_nonvacuous :
+    let batch : CoverageBatch :=
+      [ (witnessExtCallBody, censusMirBodyFaultSites witnessExtCallBody)
+      , (witnessSwitchBreakStripBody, witnessSwitchBreakStripExpectedCensus) ]
+    let s₀ := witnessState 0 0 [witnessU32Slot 0]
+    let s₁ := pushCalleeFrame s₀ witnessExtCallBody [witnessU32Slot 0]
+      { local_ := 0, projection := [] } 1 witnessSwitchBreakStripBody
+      [.scalar ⟨0, 4⟩, .scalar ⟨0, 4⟩] .continue_
+    let s₂ : MachineState :=
+      { s₁ with frame := { s₁.frame with blockIdx := 1, stmtIdx := 0 } }
+    let s₃ : MachineState :=
+      { s₂ with frame := { s₂.frame with
+          stmtIdx := 1,
+          locals := [witnessU32Slot 42, witnessU32Slot 0, witnessU32Slot 0] } }
+    let s₄ : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0, locals := [witnessU32Slot 42] }
+        memory :=
+          { s₃.memory with
+            callStack := []
+            activeCallee := some witnessExtCallBody
+            activeProtectors := [] } }
+    MirStepsInterproc batch witnessExtCallBody s₀ s₄ ∧
+    s₄.frame.blockIdx = 1 ∧ s₄.frame.stmtIdx = 0 ∧
+    s₄.frame.locals = [witnessU32Slot 42] ∧
+    s₄.memory.activeCallee = some witnessExtCallBody := by
+  intro batch s₀ s₁ s₂ s₃ s₄
+  refine ⟨?_, rfl, rfl, rfl, rfl⟩
+  refine MirStepsInterproc.callInline [witnessU32Slot 0] witnessSwitchBreakStripBody
+    [.scalar ⟨0, 4⟩, .scalar ⟨0, 4⟩] rfl rfl
+    ⟨witnessSwitchBreakStripExpectedCensus, List.Mem.tail _ (List.Mem.head _)⟩
+    (by decide) ?_
+  refine MirStepsInterproc.stepTermIntra (s₂ := s₂) rfl (by decide) rfl rfl rfl ?_
+  refine MirStepsInterproc.stepStmt (s₂ := s₃) rfl rfl rfl rfl (Or.inl rfl) ?_
+  exact MirStepsInterproc.returnInline "proto.rs:21:15" rfl rfl
+    (MirStepsInterproc.refl _)
 
 end Anneal.FaultSiteCensusPrototype

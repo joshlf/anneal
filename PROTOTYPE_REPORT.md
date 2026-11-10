@@ -3,34 +3,35 @@
 - **Workstream ID**: `ws-proto-fault-site-coverage-reconciler` (`ep1-prototype-fault-site-census-and-reconciler`)
 - **Track**: Track P (`prototype`, isolated from `unstable` and `main`)
 - **Target Paired Track A Workstream**: `ws-fault-site-coverage-reconciler`
-- **Current Pass**: `[adv B4]` (Round 4 critique & fix of `[adv A3]`)
+- **Current Pass**: `[adv A4]` (Final Pass — Round 4 critique & fix of `[adv B4]`)
 
 ---
 
-## 0. GO/NO-GO Assessment (`[adv B4]`)
+## 0. GO/NO-GO Assessment (`[adv B4]` + `[adv A4]`)
 
 **Recommendation: GO** for the paired Track A workstream `ws-fault-site-coverage-reconciler`, under the preconditions listed below. The prototype shows that an independent census, reconciled fail-closed against the obligation generator's tagged sites, closes the "omitted fault site ⇒ vacuous `VERIFIED`" failure mode. Every step of that argument is kernel-checked against the trusted MIR semantics, except the steps marked *tested* below.
 
-**Kernel-checked** (Lean 4, `0` `sorryAx`, `0` `Lean.ofReduceBool`, `0` `Classical.choice`):
+**Kernel-checked** (Lean 4, `0` `sorryAx`, `0` `Lean.ofReduceBool`, `0` `Classical.choice` across `223/223` theorems):
 - *One-step census completeness* for the active body (subject or inline callee). It covers every UB exposure, including UB raised inside external-call continuations.
 - *Construct precision*: an exact `.ub` characterization for the §2.1 constructs, and no blanket class dump anywhere.
 - *Fail-closed reconciliation*: registry gating, partial-site detection, and per-body batches.
 - *Multi-step safety along real top-level executions*, including through external calls (`[adv B4]` `MirStepsTop`). It holds for every state reached from `initMachineState` by `stepMirFn` steps and top-level-answered external calls: if that state's next step can expose UB, the faulting site is discharged with an `emittedAndVerified` class.
+- *Multi-step interprocedural safety across arbitrarily nested inline callee frames* (`[adv A4]` `MirStepsInterproc`, `mirStepsInterproc_preserves_validInterprocState`, `initMachineState_mirStepsInterproc_batch_reconciled_safety`, `witnessInterproc_call_and_return_nonvacuous`). It holds for every state reached from `initMachineState` across intra-frame statements/branches, inline converging calls (`pushCalleeFrame`), inline diverging calls (`pushDivergingCalleeFrame`), inline tail calls (`enterTailCalleeFrame`), inline returns (`TerminatorKind.return_`), and unwind propagation (`unwindFromCallStack`).
 
 **Tested, not proved** (Rust):
 - Lean ↔ Rust census agreement: 400-body real-emitter fuzz, a 400-`#guard` Lean-evaluated differential, kernel-checked witness parity, and a real `rustc` corpus.
-- The strict `Mir/<Item>.lean` scanner (lexer traps, truncation, dialect pinning).
-- The native-callee lists, now pinned to the trusted Lean source (`[adv B4]`).
+- The strict `Mir/<Item>.lean` scanner (lexer traps, truncation, dialect pinning, and `RigidTy.param` call-constant detection).
+- The native-callee lists, pinned to the trusted Lean source (`[adv B4]`), plus fail-closed `bodyHasNoParamCallConst` and batch-item / external-callee conflict enforcement in `reconcile_multi_item_coverage` (`[adv A4]`).
 
 **Preconditions for Track A** (any one failing is a NO-GO for relying on `VERIFIED`):
 1. Obligations carry `FaultSite`s computed over the *emitted* (retag-stripped) body (§7.3).
-2. Every inline callee body is reconciled as its own batch item, with `CalleeClosure` filled from the exact callee list. Generic callees must satisfy `bodyHasNoParamCallConst` or be supplied instantiated.
+2. Every inline callee body is reconciled as its own batch item, with `CalleeClosure` filled from the exact callee list. Generic callees must satisfy `bodyHasNoParamCallConst` (now checked automatically by `ProtoMirBody::has_no_param_call_const` inside `reconcile_multi_item_coverage`, `[adv A4]`) or be supplied instantiated.
 3. External-call specs answer at the caller's frame (`MirCallAnsTopFrame`). This is an assumption about the environment, not something checked.
 4. Bodies satisfy `cfgTargetsInBounds`. Out-of-bounds targets are still censused (`boundsCheck`), but the trace theorems assume in-bounds CFGs.
 
 **Residual risks**:
-- Multi-step traces do not yet follow execution *into* inline callee frames. Each inline step is covered one step at a time by the batch theorem, but no single relation chains caller and callee frames.
 - Class-precise attribution exists only for the §2.1 constructs. Elsewhere completeness is existential in the class.
+- Combining external calls (`MirStepsTop`) and inline callee frames (`MirStepsInterproc`) inside an inline callee requires generalizing `MirCallAnsTopFrame` to preserve the active caller stack.
 
 ---
 
@@ -50,11 +51,12 @@ This Track P prototype builds a defense-in-depth cross-check for Anneal's MIR ve
      - `[adv A2]` / `[adv A3]` partial-coverage site rejection, census-append decomposition, registry monotonicity, and multi-step reconciled trace safety (`reconcileFaultCoverageWithRegistry_partial_site_rejected`, `reconcileFaultCoverageWithRegistry_append_verified_iff`, `reconcileFaultCoverageWithRegistry_mono`, `initMachineState_mirStepsIntra_reconciled_safety`, `initMachineState_mirStepsIntra_not_exposesUb_of_empty_census`, `initMachineState_mirStepsWithExtCalls_reconciled_safety`).
      - `[adv B3]` / `[adv A3]` per-body batch reconciliation for a subject plus its inline callees (`CoverageBatch`, `reconcileCoverageBatch`, `reconcileCoverageBatch_nil`, `reconcileCoverageBatch_iff`, `reconcileCoverageBatch_mono`, `stepMirFn_exposesUb_in_batch_discharged`), polymorphic generic-callee instantiation invariance (`censusMirBodyFaultSites_instantiate`, `cfgTargetsInBounds_instantiate`, `validMirPc_instantiate_iff`, `stepMirFn_exposesUb_in_batch_discharged_instantiated`, `[adv A3]`), and a kernel-checked counterexample showing that reconciling appended caller and callee censuses against one shared obligation list is unsound (`witnessCalleeMask_append_masks_batch_rejects`, `witnessCalleeStorage_masked_site_live`).
      - `[adv B4]` semantic multi-step traces through external calls (`stepMirFn_extCall_cont_preserves_validMirPc`, `MirStepsTop`, `mirStepsTop_preserves_validMirPc`, `initMachineState_mirStepsTop_exposesUb_in_census`, `initMachineState_mirStepsTop_reconciled_safety`, `witnessExtCall_mirStepsTop_nonvacuous`). The relation is generated by `stepMirFn` itself, so its safety theorems cover real top-level executions.
-   - Fail-closed reconciler theorems and kernel-checked `by decide` witnesses (`0` `sorryAx`, `0` `Lean.ofReduceBool`), with kernel-evaluated **liveness certificates** for every false-proof probe site. `[adv B3]` / `[adv A3]`: every theorem (`208/208`, including `private` ones) is `Classical.choice`-free.
+     - `[adv A4]` multi-step interprocedural traces across inline callee frames (`ValidBatchCallerFrame`, `ValidBatchCallStack`, `ValidInterprocState`, `validInterprocState_initMachineState`, `validInterprocState_unwindFromCallStack`, `MirStepsInterproc`, `mirStepsInterproc_preserves_validInterprocState`, `initMachineState_mirStepsInterproc_batch_reconciled_safety`, `witnessInterproc_call_and_return_nonvacuous`), chaining `pushCalleeFrame`, `pushDivergingCalleeFrame`, `enterTailCalleeFrame`, inline `TerminatorKind.return_`, and `unwindFromCallStack`.
+   - Fail-closed reconciler theorems and kernel-checked `by decide` witnesses (`0` `sorryAx`, `0` `Lean.ofReduceBool`), with kernel-evaluated **liveness certificates** for every false-proof probe site. `[adv B3]` / `[adv A3]` / `[adv A4]`: every theorem (`223/223`, including `private` ones) is `Classical.choice`-free.
 2. **Rust registry, census frontends, fail-closed reconciler and probes** (`crates/cargo-anneal/src/fault_census_proto.rs`):
    - 1-to-1 `MirFaultClass`, `FaultSite`, `PropertyStatus`, `PropertyDescriptor`, `PropertyRegistry`, `ProtoAggregateKind`, `ItemCoverageInput`, `CalleeClosure`, `MultiItemCoverageVerdict`.
    - Three census frontends: `census_mir_fault_sites(&ProtoMirBody)`, `census_ir_captured_mir(&IrCapturedMir)`, and the fail-closed Lean scanners `census_lean_mir_module(&str)` (strict emitter-module grammar with scope-stack and dialect-pinning enforcement) and `census_lean_mir_def(&str, &str)` (named-definition extraction for the witness file).
-   - `reconcile_obligation_coverage`, `reconcile_lean_mir_coverage`, and `reconcile_multi_item_coverage`. The last one reconciles each body of a caller/callee batch against its own obligations, recomputes every census from the item's body, checks item labels, and enforces terminator-kind-sensitive native-intrinsic / inline / external callee closure (`is_natively_modeled_converging_call_callee`, `is_natively_modeled_diverging_call_callee`, `reified_fn_def_paths`, `[adv A3]`).
+   - `reconcile_obligation_coverage`, `reconcile_lean_mir_coverage`, and `reconcile_multi_item_coverage`. The last one reconciles each body of a caller/callee batch against its own obligations, recomputes every census from the item's body, checks item labels, enforces `ProtoMirBody::has_no_param_call_const` (`[adv A4]`), rejects any batch item declared in `closure.external_callees` (`[adv A4]`), and enforces terminator-kind-sensitive native-intrinsic / inline / external callee closure (`is_natively_modeled_converging_call_callee`, `is_natively_modeled_diverging_call_callee`, `reified_fn_def_paths`, `[adv A3]` / `[adv A4]`).
    - The four false-proof probes driven by an independent mock obligation emitter, the registry probe, the randomized emitter differential fuzzer, a real `rustc`-captured corpus test, and the cross-language Lean-to-Rust parity test.
 
 ---
@@ -81,6 +83,7 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 | Generic instantiation invariance (`[adv A3]`) | `censusStmtFaultClasses_instantiate`, `censusTerminatorFaultClasses_instantiate`, `censusMirBodyFaultSites_instantiate`, `cfgTargetsInBounds_instantiate`, `validMirPc_instantiate_iff` | `CapturedMir.instantiate subst` preserves statement censuses, terminator censuses (when `bodyHasNoParamCallConst body = true`), full body censuses, `cfgTargetsInBounds`, and `ValidMirPc`. |
 | End-to-end bridge | `stepMirFn_fault_in_discharged_of_reconciled`, `stepMirFn_exposesUb_in_discharged_of_reconciled`, `initMachineState_mirStepsIntra_reconciled_safety`, `initMachineState_mirStepsWithExtCalls_reconciled_safety` | A reconciled body discharges (with an `emittedAndVerified` class) every UB exposure at a valid top-level PC and along any `MirStepsIntra` / `MirStepsWithExtCalls` trace from `initMachineState`. |
 | Semantic traces through external calls (`[adv B4]`) | `TermStepPreservesPc` (external-call case), `StmtStepPreservesPc` (statements never call), `stepMirFn_extCall_cont_preserves_validMirPc`, `MirStepsTop`, `mirStepsTop_of_mirStepsIntra`, `mirStepsTop_preserves_validMirPc`, `initMachineState_mirStepsTop_exposesUb_in_census`, `initMachineState_mirStepsTop_reconciled_safety`, `witnessExtCall_mirStepsTop_nonvacuous` | `MirStepsTop` is generated by `stepMirFn` itself: intra-frame steps, plus external calls whose continuation keeps running under a top-level answer. Every such continuation resumes at `stmtIdx = 0` of an in-bounds successor block. So census completeness and reconciled safety hold along every real top-level execution from `initMachineState`. A concrete external-call step inhabits the relation (`rfl`). |
+| Interprocedural multi-step traces (`[adv A4]`) | `ValidBatchCallerFrame`, `ValidBatchCallStack`, `ValidInterprocState`, `validInterprocState_initMachineState`, `validInterprocState_unwindFromCallStack`, `MirStepsInterproc`, `mirStepsInterproc_preserves_validInterprocState`, `initMachineState_mirStepsInterproc_batch_reconciled_safety`, `witnessInterproc_call_and_return_nonvacuous` | `MirStepsInterproc` chains intra-frame steps, inline converging/diverging/tail calls (`pushCalleeFrame`, `pushDivergingCalleeFrame`, `enterTailCalleeFrame`), inline returns (`TerminatorKind.return_`), and unwind propagation (`unwindFromCallStack`). Preserves `ValidInterprocState` from `initMachineState`, guaranteeing every reachable UB exposure in any caller or inline callee frame is discharged in that body's own batch entry with an `emittedAndVerified` class. |
 
 ### 2.1 Semantic Precision Certificates (`[adv B1]` + `[adv A1]` + `[adv A2]`)
 
@@ -165,7 +168,7 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 
 ---
 
-## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]` → `[adv A3]` → `[adv B4]`)
+## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]` → `[adv A3]` → `[adv B4]` → `[adv A4]`)
 
 ### `[adv B1]` findings against `[adv A0]` (fixed in `[adv B1]`)
 
@@ -307,26 +310,38 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
    - Hygiene: zero internal hostnames, paths, LDAPs, links, or model names in the four files and in every commit message since the base commit. `lib.rs` differs from the base by exactly the `pub mod fault_census_proto;` line.
    - Performance: the Lean file elaborates in about `14 s`. The profiler's hottest single tactic takes `1.4 s`, so no tuning was needed.
 
-### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`–`[adv B4]`)
+### `[adv A4]` final critique & closure of `[adv B4]` (interprocedural multi-step `MirStepsInterproc` safety, `bodyHasNoParamCallConst` in Rust, batch/external conflict closure)
 
-- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc`, `mirStepsIntra_preserves_validMirPc`, `mirStepsWithExtCalls_preserves_validMirPc`, and (`[adv B4]`, over real `stepMirFn` transitions) `mirStepsTop_preserves_validMirPc` keep it invariant for top-level frames with in-bounds CFG targets across intra-frame steps and external-call continuations.
+1. **`MirStepsTop` covered only `activeCallee = none` (top-level frame), leaving multi-step interprocedural execution across inline callee frames unbridged (`FaultSiteCensusPrototype.lean`, `[adv B4]` Residual Risk #1)**:
+   - In `[adv B4]`, `MirStepsTop` required `s₁.memory.activeCallee = none` and `s₁.memory.callStack = []` on every transition, so multi-step traces could not follow execution into and back out of inline callee frames (`pushCalleeFrame`, `pushDivergingCalleeFrame`, `enterTailCalleeFrame`, inline `TerminatorKind.return_`, and `unwindFromCallStack`).
+   - *Fix*: Added Section 9c (`ValidBatchCallerFrame`, `ValidBatchCallStack`, `ValidInterprocState`, `validInterprocState_initMachineState`, `validInterprocState_unwindFromCallStack`, `MirStepsInterproc`, `mirStepsInterproc_preserves_validInterprocState`, and `initMachineState_mirStepsInterproc_batch_reconciled_safety`), plus the kernel-evaluated 4-step non-vacuity certificate `witnessInterproc_call_and_return_nonvacuous` (`callInline` → `stepTermIntra` → `stepStmt` → `returnInline`).
+2. **Rust batch API could not check `bodyHasNoParamCallConst` because `ProtoConstValue` discarded `RigidTy.param` (`fault_census_proto.rs`, `[adv B4]` Known Limitation)**:
+   - Both `convert_ir_const_operand` and `parse_const_operand` discarded whether `ConstOperand.ty.kind` was `RigidTy.param`, preventing `reconcile_multi_item_coverage` from checking the `bodyHasNoParamCallConst` precondition of `stepMirFn_exposesUb_in_batch_discharged_instantiated`.
+   - *Fix*: Added `ProtoConstValue::ParamTypedConst(Box<ProtoConstValue>)` (populated in both `convert_ir_const_operand` and `parse_const_operand`), `ProtoOperand::has_no_param_const_ty`, and `ProtoMirBody::has_no_param_call_const` mirroring Lean's `operandHasNoParamConstTy` / `bodyHasNoParamCallConst` 1-to-1, and enforced `item.body.has_no_param_call_const()` fail-closed inside `reconcile_multi_item_coverage`.
+3. **`reconcile_multi_item_coverage` allowed a batch item (`item.def_path`) to be declared in `closure.external_callees` when omitted from `closure.inline_callees`, and `reified_fn_def_paths` missed `ClosureFnPointer*` (`fault_census_proto.rs`)**:
+   - In `[adv B4]`, `external.contains(callee.as_str())` was only checked while iterating over `closure.inline_callees`. Placing a batch item (such as recursive `items[0]`) in `closure.external_callees` while omitting it from `closure.inline_callees` was accepted, allowing a recursive call to a verified batch item to be treated as an uninterpreted external call without linking its body in `inline_callees`.
+   - Additionally, `reified_fn_def_paths` checked only `ReifyFnPointer`, missing `ClosureFnPointer` coercions.
+   - *Fix*: `reconcile_multi_item_coverage` now rejects any batch item whose `def_path` appears in `closure.external_callees`, `reified_fn_def_paths` also captures `ClosureFnPointer` coercions, and `test_a4_interproc_trace_param_call_const_and_batch_subject_external_conflict` verifies all `[adv A4]` invariants.
+
+### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`–`[adv A4]`)
+
+- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc`, `mirStepsIntra_preserves_validMirPc`, `mirStepsWithExtCalls_preserves_validMirPc`, `mirStepsTop_preserves_validMirPc` (`[adv B4]`), and `mirStepsInterproc_preserves_validInterprocState` (`[adv A4]`) keep it invariant across intra-frame steps, external-call continuations, and nested inline callee frames.
 - External-call answers replace the whole `Memory`, so trace theorems assume `MirCallAnsTopFrame ans` (the answer keeps `activeCallee = none` and `callStack = []`); `resumeExternalTailCall` at the top level never resumes the frame.
 - `.return_` reads `_0` and, in an inline frame, writes into the *caller's* `destination`, so its classes are attributed to the callee's return site.
 - The `.ub` of an out-of-bounds `Goto` happens on the *next* step.
-- `stepMirFn body s` executes `s.memory.activeCallee.getD body`, and an inline callee fault is located at the *callee's* body-relative coordinates. Obligation lists therefore cannot be shared across bodies (`[adv B3]`, §9b), and generic inline callees installed as `calleeBody.instantiate subst` preserve their uninstantiated census whenever `bodyHasNoParamCallConst calleeBody = true` (`censusMirBodyFaultSites_instantiate`, `[adv A3]`).
+- `stepMirFn body s` executes `s.memory.activeCallee.getD body`, and an inline callee fault is located at the *callee's* body-relative coordinates. Obligation lists therefore cannot be shared across bodies (`[adv B3]`, §9b), and generic inline callees installed as `calleeBody.instantiate subst` preserve their uninstantiated census whenever `bodyHasNoParamCallConst calleeBody = true` (`censusMirBodyFaultSites_instantiate`, `[adv A3]`; checked automatically in Rust via `ProtoMirBody::has_no_param_call_const`, `[adv A4]`).
 
-### Known limitations (final, `[adv B4]`)
+### Known limitations (final, `[adv A4]`)
 
 - Completeness remains existential in the class for constructs outside §2.1 (such as projected deref reads/writes, `copyNonOverlapping`, and complex calls).
 - The strict module grammar targets `anneal-rustc-capture` output. It enforces balanced `namespace`/`section`/`end` scopes and rejects anything outside the emitter's command set, `open`s, and constructor namespaces, but it does not model Lean elaboration in general.
 - The cross-language differential is a `#guard`-checked experiment over compiled evaluation (not kernel `decide`); kernel-checked parity is limited to the witness bodies.
-- Multi-step trace theorems (`MirStepsTop`) cover top-level frames. Inline callee frames are covered one step at a time (`stepMirFn_exposesUb_in_batch_discharged`), but there is no multi-step relation through `pushCalleeFrame` / inline `return_` yet. The per-transition PC lemmas for it exist (`validMirPc_pushCalleeFrame`, `validMirPc_return_inline`).
+- Multi-step trace theorems cover top-level traces with external calls (`MirStepsTop`, `[adv B4]`) and interprocedural traces across nested inline callee frames (`MirStepsInterproc`, `[adv A4]`). Combining an external call *inside* a nested inline callee frame into a single relation would require generalizing `MirCallAnsTopFrame` to preserve the active `callStack` and `activeCallee`.
 - `MirCallAnsTopFrame` is an assumption about external-call answers, not something checked.
-- The Rust batch API cannot see types, so it cannot check `bodyHasNoParamCallConst` for generic inline callees. The integration must check it on the Lean side or supply instantiated bodies.
 
 ---
 
-## 6. Verification Receipts (`[adv B4]`)
+## 6. Verification Receipts (`[adv A4]` Final)
 
 All commands run from the repository root with `W = 1`.
 
@@ -336,10 +351,10 @@ All commands run from the repository root with `W = 1`.
    cargo test --manifest-path crates/cargo-anneal/Cargo.toml fault_census_proto && \
    (cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean ../theory/Anneal/FaultSiteCensusPrototype.lean)
    ```
-   `20 passed, 0 failed, 1 ignored` (the manual Lean differential harness) on both test targets, `0` Rust warnings, and Lean `0` errors / `0` warnings. Wall clock about `31 s` with warm caches. The Lean file alone takes about `14 s`.
-2. **Kernel axiom audit**: a scratch copy with `#print axioms` over all `309` `def`/`abbrev`/`theorem` declarations (`218` theorems, `42` of the declarations `private`), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree. Result: `0` `sorryAx`, `0` `Lean.ofReduceBool`, and **`218/218` theorems `Classical.choice`-free** (depending only on `propext` and `Quot.sound`).
+   `21 passed, 0 failed, 1 ignored` (the manual Lean differential harness) on both test targets, `0` Rust warnings, and Lean `0` errors / `0` warnings.
+2. **Kernel axiom audit**: a scratch copy with `#print axioms` over all `321` `def`/`inductive`/`structure`/`theorem` declarations (`223` theorems, `98` `def`/`inductive`/`structure` declarations), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree. Result: `0` `sorryAx`, `0` `Lean.ofReduceBool`, and **`223/223` theorems `Classical.choice`-free** (depending only on `propext` and `Quot.sound`).
 3. **Proof health**: `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean` exits `0` with `0` findings. `rustfmt --edition 2021 --check crates/cargo-anneal/src/fault_census_proto.rs` is clean.
-4. **Cross-language differential** (`[adv B2]`, optional): `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib dump_lean_census_differential_corpus -- --ignored`, then `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`. Exit `0`: `400` `#guard`s, all 12 classes. Re-run in `[adv B4]`: exit `0`, about `71 s` including generation.
+4. **Cross-language differential** (`[adv B2]`, optional): `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib dump_lean_census_differential_corpus -- --ignored`, then `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`. Exit `0`: `400` `#guard`s, all 12 classes.
 5. **Hygiene**: `git status --porcelain` is empty after commit; no commit message since the base commit contains an internal identifier; and `git diff --name-only a5e12e5fac628cc71522b67a1b427e17e2927818..HEAD` ⊆ {`PROTOTYPE_REPORT.md`, `crates/cargo-anneal/src/fault_census_proto.rs`, `crates/cargo-anneal/src/lib.rs`, `theory/Anneal/FaultSiteCensusPrototype.lean`}. There are zero internal hostnames, user paths, LDAPs, CL numbers, or internal model names.
 
 ---
@@ -350,7 +365,7 @@ All commands run from the repository root with `W = 1`.
 2. **Tag obligations with fault sites**: every obligation emitted by `crates/cargo-anneal/src/obligations.rs` should carry the `FaultSite`s it discharges.
 3. **Reconcile at verification time**: run `census_ir_captured_mir` on the captured MIR and `census_lean_mir_module` on the generated `Mir/<Item>.lean`, require both censuses to agree, and reconcile against the discharged sites with a stage-aware registry (`PropertyRegistry::realistic_safe_subset_registry()` as the starting point).
    - `[adv B3]` *Coordinate alignment*: obligation sites must be tagged over the **same** body the census runs on. The emitter strips `Retag` statements (`census_ir_captured_mir` uses `strip_retags = true`), so tagging obligations with original `rustc` statement indices shifts every later statement. An obligation for one statement could then discharge a colliding site of another.
-   - `[adv B3]` / `[adv A3]` *Multi-body items*: reconcile the subject together with every inline callee body handed to `initMachineStateWithCallees` through `reconcile_multi_item_coverage`. Build each item with `ItemCoverageInput::from_lean_module` and its own obligations. Fill `CalleeClosure::inline_callees` with that exact callee list, and `external_callees` with the callees answered by `#[external_spec]` contracts. Never append censuses across bodies. By `censusMirBodyFaultSites_instantiate` (`[adv A3]`), polymorphic generic inline callees (`calleeBody.instantiate subst`) have the exact same census as `calleeBody` whenever `bodyHasNoParamCallConst calleeBody = true`.
+   - `[adv B3]` / `[adv A3]` / `[adv A4]` *Multi-body items*: reconcile the subject together with every inline callee body handed to `initMachineStateWithCallees` through `reconcile_multi_item_coverage`. Build each item with `ItemCoverageInput::from_lean_module` and its own obligations. Fill `CalleeClosure::inline_callees` with that exact callee list, and `external_callees` with the callees answered by `#[external_spec]` contracts. Never append censuses across bodies. By `censusMirBodyFaultSites_instantiate` (`[adv A3]`) and `ProtoMirBody::has_no_param_call_const` (`[adv A4]`), polymorphic generic inline callees (`calleeBody.instantiate subst`) have the exact same census as `calleeBody` whenever `bodyHasNoParamCallConst calleeBody = true`.
 4. **Gate `VERIFIED`** on `CoverageVerdict::Verified`; otherwise downgrade fail-closed to `UNKNOWN(UNSUPPORTED_CONSTRUCT)` with the exact `(bb, stmt, class)` list.
-   - `[adv B4]` *Trace-level guarantee*: with `cfgTargetsInBounds body = true` and a verified reconciliation, `initMachineState_mirStepsTop_reconciled_safety` covers every top-level execution through external calls. External `#[external_spec]` contracts must answer at the caller's frame (`MirCallAnsTopFrame`). Track that as an explicit assumption in the external-spec format.
+   - `[adv B4]` / `[adv A4]` *Trace-level guarantee*: with `cfgTargetsInBounds body = true` and a verified reconciliation, `initMachineState_mirStepsTop_reconciled_safety` covers every top-level execution through external calls, and `initMachineState_mirStepsInterproc_batch_reconciled_safety` covers every interprocedural execution across nested inline callee frames. External `#[external_spec]` contracts must answer at the caller's frame (`MirCallAnsTopFrame`). Track that as an explicit assumption in the external-spec format.
 5. **Keep the Lean side authoritative**: Track A should extend §2.1 (class-precise attribution) before relying on per-class discharge for constructs outside it.

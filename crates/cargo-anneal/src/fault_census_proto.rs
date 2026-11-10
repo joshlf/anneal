@@ -464,6 +464,11 @@ pub enum ProtoConstValue {
         offset_bytes: u64,
     },
     Unevaluated(String),
+    /// `[adv A4]` Constant operand whose `ConstOperand.ty.kind` is `RigidTy.param`,
+    /// preserved so `ProtoOperand::has_no_param_const_ty` and
+    /// `ProtoMirBody::has_no_param_call_const` mirror Lean's
+    /// `operandHasNoParamConstTy` / `bodyHasNoParamCallConst` 1-to-1.
+    ParamTypedConst(Box<ProtoConstValue>),
 }
 
 /// Prototype operand mirroring `Trusted.MirAst.Operand`.
@@ -494,8 +499,22 @@ impl ProtoOperand {
                 fn_def_path: Some(p),
             }) => Some(p.as_str()),
             ProtoOperand::Constant(ProtoConstValue::Unevaluated(p)) => Some(p.as_str()),
+            ProtoOperand::Constant(ProtoConstValue::ParamTypedConst(inner)) => match inner.as_ref()
+            {
+                ProtoConstValue::Unevaluated(p) => Some(p.as_str()),
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    /// `[adv A4]` `true` iff `self` is not a constant operand with a `RigidTy.param` type,
+    /// mirroring `Anneal.FaultSiteCensusPrototype.operandHasNoParamConstTy` 1-to-1.
+    pub fn has_no_param_const_ty(&self) -> bool {
+        !matches!(
+            self,
+            ProtoOperand::Constant(ProtoConstValue::ParamTypedConst(_))
+        )
     }
 }
 
@@ -724,6 +743,21 @@ pub struct ProtoMirBody {
     pub basic_blocks: Vec<ProtoBasicBlock>,
 }
 
+impl ProtoMirBody {
+    /// `[adv A4]` `true` iff no `Call` or `TailCall` terminator in `self` has a `func`
+    /// constant operand with a `RigidTy.param` type, mirroring
+    /// `Anneal.FaultSiteCensusPrototype.bodyHasNoParamCallConst` 1-to-1.
+    pub fn has_no_param_call_const(&self) -> bool {
+        self.basic_blocks
+            .iter()
+            .all(|bb| match &bb.terminator.kind {
+                ProtoTerminatorKind::Call { func, .. }
+                | ProtoTerminatorKind::TailCall { func, .. } => func.has_no_param_const_ty(),
+                _ => true,
+            })
+    }
+}
+
 /// Deduplicate and canonically order fault classes by `MirFaultClass::rank` (`0..11`),
 /// matching `Anneal.FaultSiteCensusPrototype.dedupFaultClasses` 1-to-1.
 pub fn dedup_fault_classes<I: IntoIterator<Item = MirFaultClass>>(raw: I) -> Vec<MirFaultClass> {
@@ -809,6 +843,7 @@ pub fn census_const_value_fault_classes(cv: &ProtoConstValue) -> Vec<MirFaultCla
             MirFaultClass::ScalarNicheInvalid,
             MirFaultClass::UninitRead,
         ],
+        ProtoConstValue::ParamTypedConst(inner) => census_const_value_fault_classes(inner),
         _ => Vec::new(),
     }
 }
@@ -1484,7 +1519,11 @@ fn convert_ir_const_operand(co: &IrConstOperand) -> ProtoConstValue {
         anneal_rustc_capture::lean_emit::IrRigidTy::FnDef(path, _) => Some(path.clone()),
         _ => None,
     };
-    match &co.val {
+    let is_type_param = matches!(
+        &co.ty.kind,
+        anneal_rustc_capture::lean_emit::IrRigidTy::Param { .. }
+    );
+    let inner = match &co.val {
         IrConstValue::ZeroSized => ProtoConstValue::ZeroSized { fn_def_path },
         IrConstValue::Scalar(IrConstScalar::Int(si)) => ProtoConstValue::ScalarInt {
             bits: si.bits,
@@ -1504,6 +1543,11 @@ fn convert_ir_const_operand(co: &IrConstOperand) -> ProtoConstValue {
             offset_bytes: *offset_bytes,
         },
         IrConstValue::Unevaluated(p) => ProtoConstValue::Unevaluated(p.clone()),
+    };
+    if is_type_param {
+        ProtoConstValue::ParamTypedConst(Box::new(inner))
+    } else {
+        inner
     }
 }
 
@@ -3237,12 +3281,15 @@ impl<'a> TokenCursor<'a> {
     fn parse_const_operand(&mut self) -> Result<ProtoConstValue, CensusScanError> {
         let mut has_ty = false;
         let mut fn_def_path: Option<String> = None;
+        let mut is_type_param = false;
         let mut val: Option<ProtoConstValue> = None;
 
         self.parse_record(|field, cur| {
             match field {
                 "ty" => {
-                    fn_def_path = cur.parse_ty_extract_fn_def()?;
+                    let (fn_def, is_param) = cur.parse_ty_extract_fn_def()?;
+                    fn_def_path = fn_def;
+                    is_type_param = is_param;
                     has_ty = true;
                 }
                 "val" => {
@@ -3278,17 +3325,24 @@ impl<'a> TokenCursor<'a> {
                 "`RigidTy.fnDef`-typed constant with a non-zero-sized value".to_string(),
             ));
         }
-        Ok(cv)
+        if is_type_param {
+            Ok(ProtoConstValue::ParamTypedConst(Box::new(cv)))
+        } else {
+            Ok(cv)
+        }
     }
 
-    fn parse_ty_extract_fn_def(&mut self) -> Result<Option<String>, CensusScanError> {
+    fn parse_ty_extract_fn_def(&mut self) -> Result<(Option<String>, bool), CensusScanError> {
         let mut has_kind = false;
         let mut has_layout_idx = false;
         let mut fn_def: Option<String> = None;
+        let mut is_type_param = false;
         self.parse_record(|field, cur| {
             match field {
                 "kind" => {
-                    fn_def = cur.parse_rigid_ty_extract_fn_def()?;
+                    let (fd, is_param) = cur.parse_rigid_ty_extract_fn_def()?;
+                    fn_def = fd;
+                    is_type_param = is_param;
                     has_kind = true;
                 }
                 "layoutIdx" => {
@@ -3313,18 +3367,19 @@ impl<'a> TokenCursor<'a> {
                 "Ty missing `layoutIdx`".to_string(),
             ));
         }
-        Ok(fn_def)
+        Ok((fn_def, is_type_param))
     }
 
-    fn parse_rigid_ty_extract_fn_def(&mut self) -> Result<Option<String>, CensusScanError> {
+    fn parse_rigid_ty_extract_fn_def(&mut self) -> Result<(Option<String>, bool), CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
             check_ctor_qualifier(&full, &short, "RigidTy")?;
             if short == "fnDef" {
                 let path = cur.parse_string()?;
                 let _ = cur.parse_list(|c| c.skip_atomic_expr())?; // typeArgs list
-                Ok(Some(path))
+                Ok((Some(path), false))
             } else {
+                let is_param = short == "param";
                 // Skip any remaining arguments inside this RigidTy constructor
                 while !matches!(
                     cur.peek(),
@@ -3337,7 +3392,7 @@ impl<'a> TokenCursor<'a> {
                 ) {
                     cur.skip_balanced_expr()?;
                 }
-                Ok(None)
+                Ok((None, is_param))
             }
         })
     }
@@ -4339,11 +4394,12 @@ pub fn direct_callee_def_paths(body: &ProtoMirBody) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// `[adv A3]` Sorted, duplicate-free `DefPath`s of function items reified into function
-/// pointers via `Rvalue::Cast(CastKind::PointerCoercion("ReifyFnPointer*"), op)` inside
-/// `body`. In `Trusted.MirSemantics.evalReifyFnPointer` (`Places.lean:6643`), reifying a
-/// `RigidTy.fnDef` constant registers `defPath` in `s.memory.fnPtrs`, allowing subsequent
-/// indirect `Call` / `TailCall` terminators to invoke `defPath`.
+/// `[adv A3]` / `[adv A4]` Sorted, duplicate-free `DefPath`s of function items or
+/// non-capturing closures reified into function pointers via
+/// `Rvalue::Cast(CastKind::PointerCoercion("ReifyFnPointer*" | "ClosureFnPointer*"), op)`
+/// inside `body`. In `Trusted.MirSemantics.evalReifyFnPointer` (`Places.lean:6643`),
+/// reifying a `RigidTy.fnDef` constant registers `defPath` in `s.memory.fnPtrs`, allowing
+/// subsequent indirect `Call` / `TailCall` terminators to invoke `defPath`.
 pub fn reified_fn_def_paths(body: &ProtoMirBody) -> Vec<String> {
     let mut out = BTreeSet::new();
     for bb in &body.basic_blocks {
@@ -4353,7 +4409,11 @@ pub fn reified_fn_def_paths(body: &ProtoMirBody) -> Vec<String> {
                 ProtoRvalue::Cast(ProtoCastKind::PointerCoercion(coercion), op),
             ) = &stmt.kind
             {
-                if coercion == "ReifyFnPointer" || coercion.starts_with("ReifyFnPointer(") {
+                let is_fn_ptr_coercion = coercion == "ReifyFnPointer"
+                    || coercion.starts_with("ReifyFnPointer(")
+                    || coercion == "ClosureFnPointer"
+                    || coercion.starts_with("ClosureFnPointer(");
+                if is_fn_ptr_coercion {
                     if let Some(path) = op.extract_callee_def_path() {
                         out.insert(path.to_string());
                     }
@@ -4597,6 +4657,18 @@ pub fn reconcile_multi_item_coverage(
         }
     }
     for item in items {
+        if external.contains(item.def_path.as_str()) {
+            unsupported_reasons.push(format!(
+                "batch item `{}` is declared in `closure.external_callees` (a verified batch item cannot be treated as an uninterpreted external callee)",
+                item.def_path
+            ));
+        }
+        if !item.body.has_no_param_call_const() {
+            unsupported_reasons.push(format!(
+                "[{}] body contains a `Call` or `TailCall` terminator whose `func` operand is a `RigidTy.param`-typed constant (`bodyHasNoParamCallConst` violated)",
+                item.def_path
+            ));
+        }
         for (bb_idx, bb) in item.body.basic_blocks.iter().enumerate() {
             match &bb.terminator.kind {
                 ProtoTerminatorKind::Call {
@@ -7806,6 +7878,142 @@ end Mir.Probe.item",
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(thm),
                 "missing `[adv B4]` Lean declaration `{thm}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a4_interproc_trace_param_call_const_and_batch_subject_external_conflict() {
+        let reg = PropertyRegistry::all_verified();
+
+        // 1. `ProtoMirBody::has_no_param_call_const` mirrors `bodyHasNoParamCallConst` 1-to-1,
+        //    and `reconcile_multi_item_coverage` fails closed when a batch item has a
+        //    `RigidTy.param`-typed `Call` or `TailCall` `func` constant operand.
+        let param_call_body = ProtoMirBody {
+            def_path: String::from("proto::generic_caller"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::Constant(ProtoConstValue::ParamTypedConst(Box::new(
+                        ProtoConstValue::ZeroSized { fn_def_path: None },
+                    ))),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: Some(0),
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        assert!(!param_call_body.has_no_param_call_const());
+        let param_call_census = census_mir_fault_sites(&param_call_body);
+        let param_verdict = reconcile_multi_item_coverage(
+            &[ItemCoverageInput {
+                def_path: String::from("proto::generic_caller"),
+                body: param_call_body,
+                discharged: param_call_census,
+            }],
+            &CalleeClosure::default(),
+            &reg,
+        );
+        assert!(
+            !param_verdict.is_verified()
+                && param_verdict
+                    .reasons()
+                    .iter()
+                    .any(|r| r.contains("bodyHasNoParamCallConst")),
+            "expected fail-closed rejection on RigidTy.param Call func constant: {param_verdict:?}"
+        );
+
+        // 2. A batch item (e.g. recursive subject `items[0]`) declared in `closure.external_callees`
+        //    while omitted from `closure.inline_callees` must be rejected fail-closed.
+        let rec_body = ProtoMirBody {
+            def_path: String::from("proto::recursive_subject"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::const_fn("proto::recursive_subject"),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: Some(0),
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        assert!(rec_body.has_no_param_call_const());
+        let rec_census = census_mir_fault_sites(&rec_body);
+        let ext_subject_verdict = reconcile_multi_item_coverage(
+            &[ItemCoverageInput {
+                def_path: String::from("proto::recursive_subject"),
+                body: rec_body.clone(),
+                discharged: rec_census.clone(),
+            }],
+            &CalleeClosure {
+                inline_callees: Vec::new(),
+                external_callees: vec![String::from("proto::recursive_subject")],
+            },
+            &reg,
+        );
+        assert!(
+            !ext_subject_verdict.is_verified()
+                && ext_subject_verdict
+                    .reasons()
+                    .iter()
+                    .any(|r| r.contains("is declared in `closure.external_callees`")),
+            "expected fail-closed rejection when batch item is in external_callees: {ext_subject_verdict:?}"
+        );
+
+        // Declaring the recursive subject in `closure.inline_callees` succeeds.
+        let inline_subject_verdict = reconcile_multi_item_coverage(
+            &[ItemCoverageInput {
+                def_path: String::from("proto::recursive_subject"),
+                body: rec_body,
+                discharged: rec_census,
+            }],
+            &CalleeClosure {
+                inline_callees: vec![String::from("proto::recursive_subject")],
+                external_callees: Vec::new(),
+            },
+            &reg,
+        );
+        assert!(inline_subject_verdict.is_verified());
+
+        // 3. `reified_fn_def_paths` also captures `ClosureFnPointer` coercions.
+        let closure_coercion_body = ProtoMirBody {
+            def_path: String::from("proto::closure_coercer"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: vec![ProtoStatement::new(ProtoStatementKind::Assign(
+                    ProtoPlace::local(0),
+                    ProtoRvalue::Cast(
+                        ProtoCastKind::PointerCoercion(String::from("ClosureFnPointer(Normal)")),
+                        ProtoOperand::const_fn("proto::non_capturing_closure"),
+                    ),
+                ))],
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Return),
+                is_cleanup: false,
+            }],
+        };
+        assert_eq!(
+            reified_fn_def_paths(&closure_coercion_body),
+            vec![String::from("proto::non_capturing_closure")]
+        );
+
+        // 4. All `[adv A4]` Lean interprocedural multi-step trace declarations exist.
+        for decl in [
+            "def ValidBatchCallerFrame",
+            "def ValidBatchCallStack",
+            "def ValidInterprocState",
+            "theorem validInterprocState_initMachineState",
+            "theorem validInterprocState_unwindFromCallStack",
+            "inductive MirStepsInterproc",
+            "theorem mirStepsInterproc_preserves_validInterprocState",
+            "theorem initMachineState_mirStepsInterproc_batch_reconciled_safety",
+            "theorem witnessInterproc_call_and_return_nonvacuous",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(decl),
+                "missing `[adv A4]` Lean declaration `{decl}`"
             );
         }
     }
