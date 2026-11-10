@@ -4364,6 +4364,84 @@ pub fn reified_fn_def_paths(body: &ProtoMirBody) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// `[adv B4]` Callees that `evalTerminator` models natively on a converging `Call`
+/// (`isDirectExactDivTarget` plus every non-`const_eval_select` arm of
+/// `classifyRustIntrinsic?`). Pinned to the trusted Lean source by
+/// `test_b4_native_callee_lists_match_trusted_semantics`.
+pub const NATIVE_CONVERGING_CALL_CALLEES: [&str; 25] = [
+    "core::intrinsics::exact_div",
+    "core::intrinsics::ub_checks",
+    "core::intrinsics::arith_offset",
+    "core::intrinsics::ctlz",
+    "core::intrinsics::ctlz_nonzero",
+    "core::intrinsics::cttz",
+    "core::intrinsics::cttz_nonzero",
+    "core::intrinsics::ctpop",
+    "core::intrinsics::bswap",
+    "core::intrinsics::bitreverse",
+    "core::intrinsics::wrapping_add",
+    "core::intrinsics::wrapping_sub",
+    "core::intrinsics::wrapping_mul",
+    "core::intrinsics::saturating_add",
+    "core::intrinsics::saturating_sub",
+    "core::intrinsics::unchecked_shl",
+    "core::intrinsics::unchecked_shr",
+    "core::intrinsics::unchecked_add",
+    "core::intrinsics::unchecked_sub",
+    "core::intrinsics::unchecked_mul",
+    "core::intrinsics::unchecked_div",
+    "core::intrinsics::unchecked_rem",
+    "core::intrinsics::three_way_compare",
+    "core::intrinsics::size_of_val",
+    "core::intrinsics::align_of_val",
+];
+
+/// `[adv B4]` Callees that `evalTerminator` models natively on a diverging `Call`
+/// (`isUnreachableCallTarget`, `isAbortingPanicDefPath`, `isUnwindingPanicDefPath`).
+/// Pinned to the trusted Lean source by
+/// `test_b4_native_callee_lists_match_trusted_semantics`.
+pub const NATIVE_DIVERGING_CALL_CALLEES: [&str; 39] = [
+    "core::hint::unreachable_unchecked",
+    "std::hint::unreachable_unchecked",
+    "core::intrinsics::unreachable",
+    "core::panicking::panic_nounwind",
+    "core::panicking::panic_nounwind_fmt",
+    "core::panicking::panic_nounwind_fmt::panic_impl",
+    "core::panicking::panic_nounwind_nobacktrace",
+    "core::panicking::panic_in_cleanup",
+    "core::panicking::panic_cannot_unwind",
+    "core::panicking::panic_misaligned_pointer_dereference",
+    "core::panicking::panic_null_pointer_dereference",
+    "core::panicking::panic_invalid_enum_construction",
+    "core::intrinsics::abort",
+    "core::panicking::panic",
+    "core::panicking::panic_fmt",
+    "core::panicking::panic_fmt::panic_impl",
+    "core::panicking::const_panic_fmt",
+    "core::panicking::assert_failed",
+    "core::panicking::assert_failed_inner",
+    "core::panicking::assert_matches_failed",
+    "core::slice::index::slice_index_fail",
+    "core::panicking::panic_bounds_check",
+    "core::panicking::panic_explicit",
+    "core::panicking::panic_display",
+    "core::panicking::panic_str_2015",
+    "core::panicking::unreachable_display",
+    "core::option::unwrap_failed",
+    "core::option::expect_failed",
+    "core::result::unwrap_failed",
+    "core::panicking::panic_const::panic_const_add_overflow",
+    "core::panicking::panic_const::panic_const_sub_overflow",
+    "core::panicking::panic_const::panic_const_mul_overflow",
+    "core::panicking::panic_const::panic_const_div_overflow",
+    "core::panicking::panic_const::panic_const_rem_overflow",
+    "core::panicking::panic_const::panic_const_neg_overflow",
+    "core::panicking::panic_const::panic_const_shr_overflow",
+    "core::panicking::panic_const::panic_const_shl_overflow",
+    "core::panicking::panic_const::panic_const_div_by_zero",
+    "core::panicking::panic_const::panic_const_rem_by_zero",
+];
+
 /// `[adv A3]` True iff `def_path` is natively modeled inline by `evalTerminator` on a
 /// **converging** `TerminatorKind::Call` (`target = Some(targetBb)`,
 /// `Terminators.lean:3119-3166`) without falling through to `MirStepNode.extCall`:
@@ -4375,38 +4453,7 @@ pub fn reified_fn_def_paths(body: &ProtoMirBody) -> Vec<String> {
 /// so it is only closed when that 3rd argument is a direct constant function item that is
 /// itself classified.
 pub fn is_natively_modeled_converging_call_callee(def_path: &str) -> bool {
-    if def_path == "core::intrinsics::exact_div" {
-        return true;
-    }
-    matches!(
-        def_path.strip_prefix("core::intrinsics::"),
-        Some(
-            "ub_checks"
-                | "arith_offset"
-                | "ctlz"
-                | "ctlz_nonzero"
-                | "cttz"
-                | "cttz_nonzero"
-                | "ctpop"
-                | "bswap"
-                | "bitreverse"
-                | "wrapping_add"
-                | "wrapping_sub"
-                | "wrapping_mul"
-                | "saturating_add"
-                | "saturating_sub"
-                | "unchecked_shl"
-                | "unchecked_shr"
-                | "unchecked_add"
-                | "unchecked_sub"
-                | "unchecked_mul"
-                | "unchecked_div"
-                | "unchecked_rem"
-                | "three_way_compare"
-                | "size_of_val"
-                | "align_of_val"
-        )
-    )
+    NATIVE_CONVERGING_CALL_CALLEES.contains(&def_path)
 }
 
 /// `[adv A3]` True iff `def_path` is natively modeled inline by `evalTerminator` on a
@@ -4414,48 +4461,7 @@ pub fn is_natively_modeled_converging_call_callee(def_path: &str) -> bool {
 /// without falling through to `MirStepNode.extCall`: `isUnreachableCallTarget`,
 /// `isAbortingPanicDefPath`, and `isUnwindingPanicDefPath`.
 pub fn is_natively_modeled_diverging_call_callee(def_path: &str) -> bool {
-    matches!(
-        def_path,
-        "core::hint::unreachable_unchecked"
-            | "std::hint::unreachable_unchecked"
-            | "core::intrinsics::unreachable"
-            | "core::panicking::panic_nounwind"
-            | "core::panicking::panic_nounwind_fmt"
-            | "core::panicking::panic_nounwind_fmt::panic_impl"
-            | "core::panicking::panic_nounwind_nobacktrace"
-            | "core::panicking::panic_in_cleanup"
-            | "core::panicking::panic_cannot_unwind"
-            | "core::panicking::panic_misaligned_pointer_dereference"
-            | "core::panicking::panic_null_pointer_dereference"
-            | "core::panicking::panic_invalid_enum_construction"
-            | "core::intrinsics::abort"
-            | "core::panicking::panic"
-            | "core::panicking::panic_fmt"
-            | "core::panicking::panic_fmt::panic_impl"
-            | "core::panicking::const_panic_fmt"
-            | "core::panicking::assert_failed"
-            | "core::panicking::assert_failed_inner"
-            | "core::panicking::assert_matches_failed"
-            | "core::slice::index::slice_index_fail"
-            | "core::panicking::panic_bounds_check"
-            | "core::panicking::panic_explicit"
-            | "core::panicking::panic_display"
-            | "core::panicking::panic_str_2015"
-            | "core::panicking::unreachable_display"
-            | "core::option::unwrap_failed"
-            | "core::option::expect_failed"
-            | "core::result::unwrap_failed"
-            | "core::panicking::panic_const::panic_const_add_overflow"
-            | "core::panicking::panic_const::panic_const_sub_overflow"
-            | "core::panicking::panic_const::panic_const_mul_overflow"
-            | "core::panicking::panic_const::panic_const_div_overflow"
-            | "core::panicking::panic_const::panic_const_rem_overflow"
-            | "core::panicking::panic_const::panic_const_neg_overflow"
-            | "core::panicking::panic_const::panic_const_shr_overflow"
-            | "core::panicking::panic_const::panic_const_shl_overflow"
-            | "core::panicking::panic_const::panic_const_div_by_zero"
-            | "core::panicking::panic_const::panic_const_rem_by_zero"
-    )
+    NATIVE_DIVERGING_CALL_CALLEES.contains(&def_path)
 }
 
 /// `[adv A2]` Fail-closed verdict for a multi-item / multi-callee verification batch.
@@ -7695,6 +7701,111 @@ end Mir.Probe.item",
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(thm),
                 "missing `[adv A3]` Lean theorem `{thm}`"
+            );
+        }
+    }
+
+    /// `[adv B4]` The trusted MIR semantics read by the native-callee parity test.
+    const TRUSTED_TERMINATORS_SRC: &str = include_str!(
+        "../../../trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean"
+    );
+
+    /// `[adv B4]` String literals compared by `stringEq` inside the body of the trusted
+    /// definition `def <def_name>`.
+    fn trusted_string_eq_literals(def_name: &str) -> BTreeSet<String> {
+        let header = format!("def {def_name} ");
+        let start = TRUSTED_TERMINATORS_SRC
+            .find(&header)
+            .unwrap_or_else(|| panic!("missing trusted `{header}`"))
+            + header.len();
+        let rest = &TRUSTED_TERMINATORS_SRC[start..];
+        let end = ["\n/--", "\ndef ", "\n@[", "\ntheorem "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let mut out = BTreeSet::new();
+        let mut cursor = 0;
+        while let Some(pos) = body[cursor..].find("stringEq ") {
+            let after = &body[cursor + pos..];
+            let open = after.find('"').expect("stringEq literal");
+            let close = after[open + 1..].find('"').expect("closing quote") + open + 1;
+            out.insert(after[open + 1..close].to_string());
+            cursor += pos + close + 1;
+        }
+        out
+    }
+
+    #[test]
+    fn test_b4_native_callee_lists_match_trusted_semantics() {
+        // `[adv B4]`: `[adv A3]` hard-coded which callees `evalTerminator` models natively.
+        // A stale entry would let `reconcile_multi_item_coverage` treat an external call as
+        // native (fail-open), so both lists are pinned to the trusted Lean source.
+        let intrinsics = trusted_string_eq_literals("classifyRustIntrinsic?");
+        assert_eq!(
+            intrinsics.len(),
+            25,
+            "classifyRustIntrinsic? arms: {intrinsics:?}"
+        );
+        let exact_div = trusted_string_eq_literals("isDirectExactDivTarget");
+        assert_eq!(
+            exact_div,
+            BTreeSet::from([String::from("core::intrinsics::exact_div")])
+        );
+        let mut converging: BTreeSet<String> = intrinsics
+            .iter()
+            .filter(|p| p.as_str() != "core::intrinsics::const_eval_select")
+            .cloned()
+            .collect();
+        converging.extend(exact_div);
+        let rust_converging: BTreeSet<String> = NATIVE_CONVERGING_CALL_CALLEES
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(rust_converging.len(), NATIVE_CONVERGING_CALL_CALLEES.len());
+        assert_eq!(rust_converging, converging);
+
+        let diverging: BTreeSet<String> = [
+            "isUnreachableCallTarget",
+            "isAbortingPanicDefPath",
+            "isUnwindingPanicDefPath",
+        ]
+        .iter()
+        .flat_map(|d| trusted_string_eq_literals(d))
+        .collect();
+        let rust_diverging: BTreeSet<String> = NATIVE_DIVERGING_CALL_CALLEES
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(rust_diverging.len(), NATIVE_DIVERGING_CALL_CALLEES.len());
+        assert_eq!(rust_diverging, diverging);
+
+        // `const_eval_select` is never native by itself, and `std::intrinsics::*` paths
+        // are ordinary callees.
+        assert!(!is_natively_modeled_converging_call_callee(
+            "core::intrinsics::const_eval_select"
+        ));
+        assert!(!is_natively_modeled_converging_call_callee(
+            "std::intrinsics::wrapping_add"
+        ));
+        assert!(!is_natively_modeled_diverging_call_callee(
+            "core::intrinsics::wrapping_add"
+        ));
+
+        // The kernel-checked `[adv B4]` Lean counterparts exist.
+        for thm in [
+            "theorem stepMirFn_extCall_cont_preserves_validMirPc",
+            "inductive MirStepsTop",
+            "theorem mirStepsTop_of_mirStepsIntra",
+            "theorem mirStepsTop_preserves_validMirPc",
+            "theorem initMachineState_mirStepsTop_exposesUb_in_census",
+            "theorem initMachineState_mirStepsTop_reconciled_safety",
+            "theorem witnessExtCall_mirStepsTop_nonvacuous",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(thm),
+                "missing `[adv B4]` Lean declaration `{thm}`"
             );
         }
     }

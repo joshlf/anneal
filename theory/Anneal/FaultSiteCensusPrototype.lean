@@ -2456,6 +2456,7 @@ def StmtStepPreservesPc (s : MachineState) : MirStepNode → Prop
     s'.frame.blockIdx = s.frame.blockIdx ∧
     s'.frame.stmtIdx = s.frame.stmtIdx + 1
   | .vis (.inr (.inl (.emit _))) _ => False
+  | .vis (.inr (.inr (.call _))) _ => False
   | _ => True
 
 private theorem commitCopyDstPlaceWrite_preservesPc
@@ -2906,9 +2907,25 @@ theorem lookupSwitchTarget_mem
       · exact List.Mem.tail otherwise (List.Mem.tail target hTail)
 
 /--
+`[adv A3]` Top-level frame invariant on an external-call answer `ans : MirCallAns`:
+any `memAfter` carried by `.returned` or `.panicked` remains at the top-level frame
+(`memAfter.activeCallee = none ∧ memAfter.callStack = []`).
+-/
+def MirCallAnsTopFrame : MirCallAns → Prop
+  | .returned _ memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
+  | .panicked memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
+  | .aborted => True
+
+/--
 Goal-directed step predicate for `evalTerminator`: holds when any intra-frame
 `MirStepNode.step s'` or `MirStepNode.emitStep obs s'` (`s'.memory.activeCallee = none`)
 resets `s'.frame.stmtIdx = 0` and jumps to `s'.frame.blockIdx ∈ targets`.
+
+`[adv B4]`: external-call nodes are no longer unconstrained. For every top-level answer
+(`MirCallAnsTopFrame ans`), a continuation that keeps running must resume at
+`stmtIdx = 0` of a block in `targets`, still at the top-level frame. This is what ties
+multi-step trace safety across external calls to `stepMirFn` itself
+(`stepMirFn_extCall_cont_preserves_validMirPc`, `MirStepsTop`).
 -/
 @[reducible]
 def TermStepPreservesPc (targets : List BasicBlockIdx) : MirStepNode → Prop
@@ -2921,6 +2938,11 @@ def TermStepPreservesPc (targets : List BasicBlockIdx) : MirStepNode → Prop
       s'.memory.activeCallee = none →
         s'.frame.stmtIdx = 0 ∧ s'.frame.blockIdx ∈ targets
     | _ => True
+  | .vis (.inr (.inr (.call _))) k =>
+    ∀ (ans : MirCallAns) (s' : MachineState),
+      MirCallAnsTopFrame ans → k ans = .running s' →
+        s'.frame.stmtIdx = 0 ∧ s'.frame.blockIdx ∈ targets ∧
+        s'.memory.activeCallee = none ∧ s'.memory.callStack = []
   | _ => True
 
 private theorem termStepPreservesPc_mono
@@ -2939,7 +2961,7 @@ private theorem termStepPreservesPc_mono
     | halted _ => trivial
     | faulted _ => trivial
   | vis eff k =>
-    rcases eff with _ | ⟨_ | _⟩
+    rcases eff with _ | ⟨_ | callEv⟩
     · trivial
     · dsimp only [TermStepPreservesPc] at hPres ⊢
       split
@@ -2949,7 +2971,11 @@ private theorem termStepPreservesPc_mono
         rcases hPres hIntra with ⟨hZ, hMem⟩
         exact ⟨hZ, hSub _ hMem⟩
       · trivial
-    · trivial
+    · cases callEv with
+      | call req =>
+        intro ans s' hAns hRun
+        rcases hPres ans s' hAns hRun with ⟨hZ, hMem, hTop, hStk⟩
+        exact ⟨hZ, hSub _ hMem, hTop, hStk⟩
 
 private theorem writeIntrinsicReturn_preservesPc
     (s : MachineState) (locals' : List LocalSlot) (destination : Place)
@@ -3140,6 +3166,95 @@ private theorem applyUnwindAction_root_preservesPc
     intro _
     exact ⟨rfl, List.Mem.head []⟩
 
+/-- `[adv B4]` With a top-level `memAfter`, `applyUnwindAction` keeps running only by
+jumping to the cleanup block of `unwind`, still at the top-level frame. -/
+private theorem applyUnwindAction_top_running
+    (s s' : MachineState) (localsAfterArgs : List LocalSlot) (memAfter : Memory)
+    (unwind : UnwindAction)
+    (hTop : memAfter.activeCallee = none) (hStack : memAfter.callStack = [])
+    (hRun : applyUnwindAction s localsAfterArgs memAfter unwind = .running s') :
+    s'.frame.stmtIdx = 0 ∧ s'.frame.blockIdx ∈ unwindTargets unwind ∧
+      s'.memory.activeCallee = none ∧ s'.memory.callStack = [] := by
+  cases unwind with
+  | unreachable => nomatch hRun
+  | terminate => nomatch hRun
+  | continue_ =>
+    dsimp only [applyUnwindAction] at hRun
+    rw [hStack] at hRun
+    nomatch hRun
+  | cleanup cleanupBb =>
+    dsimp only [applyUnwindAction] at hRun
+    injection hRun with hEq
+    subst hEq
+    exact ⟨rfl, List.Mem.head [], hTop, hStack⟩
+
+/-- `[adv B4]` External-call continuation of a converging `TerminatorKind.call`. -/
+private theorem resumeExternalCall_preservesPc
+    (s : MachineState) (localsAfterArgs : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (unwind : UnwindAction) (req : MirCallReq) :
+    TermStepPreservesPc (targetBb :: unwindTargets unwind)
+      (MirStepNode.extCall req
+        (resumeExternalCall s localsAfterArgs destination targetBb unwind)) := by
+  intro ans s' hAns hRun
+  cases ans with
+  | returned retVal memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    dsimp only [resumeExternalCall] at hRun
+    split at hRun
+    · injection hRun with hEq
+      subst hEq
+      exact ⟨rfl, List.Mem.head _, hTop, hStack⟩
+    · nomatch hRun
+    · nomatch hRun
+  | panicked memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    dsimp only [resumeExternalCall] at hRun
+    rcases applyUnwindAction_top_running s s' localsAfterArgs memAfter unwind hTop hStack hRun
+      with ⟨hZ, hMem, hT, hS⟩
+    exact ⟨hZ, List.Mem.tail targetBb hMem, hT, hS⟩
+  | aborted =>
+    dsimp only [resumeExternalCall] at hRun
+    nomatch hRun
+
+/-- `[adv B4]` External-call continuation of a diverging `TerminatorKind.call`. -/
+private theorem resumeExternalDivergingCall_preservesPc
+    (s : MachineState) (localsAfterArgs : List LocalSlot) (unwind : UnwindAction)
+    (req : MirCallReq) :
+    TermStepPreservesPc (unwindTargets unwind)
+      (MirStepNode.extCall req (resumeExternalDivergingCall s localsAfterArgs unwind)) := by
+  intro ans s' hAns hRun
+  cases ans with
+  | returned _ _ =>
+    dsimp only [resumeExternalDivergingCall] at hRun
+    nomatch hRun
+  | panicked memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    dsimp only [resumeExternalDivergingCall] at hRun
+    exact applyUnwindAction_top_running s s' localsAfterArgs memAfter unwind hTop hStack hRun
+  | aborted =>
+    dsimp only [resumeExternalDivergingCall] at hRun
+    nomatch hRun
+
+/-- `[adv B4]` A top-level external tail call never resumes the frame. -/
+private theorem resumeExternalTailCall_preservesPc
+    (targets : List BasicBlockIdx) (req : MirCallReq) :
+    TermStepPreservesPc targets (MirStepNode.extCall req resumeExternalTailCall) := by
+  intro ans s' hAns hRun
+  cases ans with
+  | returned retVal memAfter =>
+    rcases hAns with ⟨_, hStack⟩
+    dsimp only [resumeExternalTailCall] at hRun
+    rw [hStack] at hRun
+    nomatch hRun
+  | panicked memAfter =>
+    rcases hAns with ⟨_, hStack⟩
+    dsimp only [resumeExternalTailCall] at hRun
+    rw [hStack] at hRun
+    nomatch hRun
+  | aborted =>
+    dsimp only [resumeExternalTailCall] at hRun
+    nomatch hRun
+
 private theorem evalDirectRustIntrinsic?_preservesPc
     (s : MachineState) (currentBody : Option CapturedMir)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -3171,7 +3286,7 @@ private theorem evalDirectRustIntrinsic?_preservesPc
               · trivial
               · intro hIntra; nomatch hIntra
           · split
-            · trivial
+            · exact resumeExternalCall_preservesPc _ _ _ _ _ _
             · split
               · split
                 · split
@@ -3190,7 +3305,7 @@ private theorem evalDirectRustIntrinsic?_preservesPc
                     · split
                       · exact termStepPreservesPc_mono hSubTail
                           (applyUnwindAction_root_preservesPc s locals' unwind hStack)
-                      · trivial
+                      · exact resumeExternalCall_preservesPc _ _ _ _ _ _
     · trivial
   · injection hSome with hNode
     rw [← hNode]
@@ -3266,7 +3381,7 @@ theorem evalTerminator_preservesPc
         · split
           · trivial
           · intro hIntra; nomatch hIntra
-        · trivial
+        · exact resumeExternalTailCall_preservesPc _ _
   | call func argOps destination target unwind =>
     cases target with
     | none =>
@@ -3288,8 +3403,8 @@ theorem evalTerminator_preservesPc
                 · trivial
                 · split
                   · exact applyUnwindAction_root_preservesPc s _ unwind hStack
-                  · trivial
-            · trivial
+                  · exact resumeExternalDivergingCall_preservesPc _ _ _ _
+            · exact resumeExternalDivergingCall_preservesPc _ _ _ _
     | some targetBb =>
       dsimp only [evalTerminator]
       split
@@ -3314,12 +3429,12 @@ theorem evalTerminator_preservesPc
                   · trivial
               · trivial
             · split
-              · trivial
+              · exact resumeExternalCall_preservesPc _ _ _ _ _ _
               · cases hDir : evalDirectRustIntrinsic? s (some body) _ _ _ argOps _ _ destination targetBb unwind with
                 | some stepNode =>
                   exact evalDirectRustIntrinsic?_preservesPc s (some body) _ _ _
                     argOps _ _ destination targetBb unwind stepNode hStack hDir
-                | none => trivial
+                | none => exact resumeExternalCall_preservesPc _ _ _ _ _ _
 
 /--
 Every intra-frame transition (`MirStepNode.step s'` or `MirStepNode.emitStep obs s'`
@@ -3600,16 +3715,6 @@ theorem initMachineState_mirStepsIntra_exposesUb_in_census
 -/
 def unwindTargetsInBounds (numBlocks : Nat) (unwind : UnwindAction) : Bool :=
   (unwindTargets unwind).all (fun t => decide (t < numBlocks))
-
-/--
-`[adv A3]` Top-level frame invariant on an external-call answer `ans : MirCallAns`:
-any `memAfter` carried by `.returned` or `.panicked` remains at the top-level frame
-(`memAfter.activeCallee = none ∧ memAfter.callStack = []`).
--/
-def MirCallAnsTopFrame : MirCallAns → Prop
-  | .returned _ memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
-  | .panicked memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
-  | .aborted => True
 
 /--
 `[adv A3]` When `unwindTargetsInBounds (length body.basicBlocks) unwind = true` and
@@ -3954,6 +4059,176 @@ theorem initMachineState_mirStepsWithExtCalls_exposesUb_in_census
   have hPc : ValidMirPc body s.frame :=
     mirStepsWithExtCalls_preserves_validMirPc body hCfg hPc₀ hSteps
   exact stepMirFn_exposesUb_in_census body s hTop hPc hUb
+
+/-! ## 8c. `[adv B4]` Semantic Multi-Step Traces Through External Calls (`MirStepsTop`)
+
+`MirStepsWithExtCalls` (`[adv A3]`) describes an external-call step *syntactically*: a
+call terminator in `body` plus some application of `resumeExternalCall` /
+`resumeExternalDivergingCall` to arbitrary `localsAfterArgs`. Nothing ties that shape to
+the continuation `stepMirFn` actually emits. `MirStepsTop` is defined by the transitions
+of `stepMirFn` itself: an intra-frame step, or an external call
+`stepMirFn body s = MirStepNode.extCall req k` answered by a top-level environment answer
+`ans` (`MirCallAnsTopFrame ans`) whose continuation `k ans` keeps running. Its safety
+theorems therefore speak about real top-level executions.
+-/
+
+/--
+`[adv B4]` Bridge theorem (`stepMirFn_extCall_cont_preserves_validMirPc`): from a valid
+top-level PC of a body with in-bounds CFG targets, every running continuation of an
+external call issued by `stepMirFn` and answered at the top-level frame resumes at a
+valid PC of `body` (`stmtIdx = 0` of a successor block), still at the top-level frame.
+Statements never issue external calls (`StmtStepPreservesPc`), and every
+external-call continuation of `evalTerminator` is covered by `TermStepPreservesPc`.
+-/
+theorem stepMirFn_extCall_cont_preserves_validMirPc
+    (body : CapturedMir) (s s' : MachineState)
+    (req : MirCallReq) (k : MirCallAns → MirExecState) (ans : MirCallAns)
+    (hTop : s.memory.activeCallee = none)
+    (hStack : s.memory.callStack = [])
+    (hCfg : cfgTargetsInBounds body = true)
+    (hPc : ValidMirPc body s.frame)
+    (hNode : stepMirFn body s = MirStepNode.extCall req k)
+    (hAns : MirCallAnsTopFrame ans)
+    (hRun : k ans = .running s') :
+    ValidMirPc body s'.frame ∧
+      s'.memory.activeCallee = none ∧ s'.memory.callStack = [] := by
+  dsimp only [stepMirFn] at hNode
+  rw [hTop] at hNode
+  dsimp only [Option.getD] at hNode
+  rcases hPc with ⟨bb, hBb, hStmtLe⟩
+  have hStmt : ∀ stmt : Statement,
+      evalStmt s stmt body.localDecls body.layouts ≠ MirStepNode.extCall req k := by
+    intro stmt hE
+    have hPres := evalStmt_preservesPc s stmt body.localDecls body.layouts
+    rw [hE] at hPres
+    exact hPres
+  have hTerm : evalTerminator s bb.terminator (some body) = MirStepNode.extCall req k →
+      ValidMirPc body s'.frame ∧
+        s'.memory.activeCallee = none ∧ s'.memory.callStack = [] := by
+    intro hT
+    have hPres := evalTerminator_preservesPc body s bb.terminator hStack
+    rw [hT] at hPres
+    rcases hPres ans s' hAns hRun with ⟨hZ, hMem, hTop', hStack'⟩
+    have hBbMem : bb ∈ body.basicBlocks :=
+      (lt_length_and_mem_of_get? body.basicBlocks s.frame.blockIdx bb hBb).2
+    unfold cfgTargetsInBounds at hCfg
+    rcases Bool.and_eq_true_iff.mp hCfg with ⟨_, hAllBbs⟩
+    have hBbOk : (terminatorTargets bb.terminator.kind).all
+        (fun t => decide (t < length body.basicBlocks)) = true :=
+      (List.all_eq_true.mp hAllBbs) bb hBbMem
+    have hTargetLt : s'.frame.blockIdx < length body.basicBlocks :=
+      of_decide_eq_true ((List.all_eq_true.mp hBbOk) s'.frame.blockIdx hMem)
+    rcases exists_get?_of_lt_length body.basicBlocks s'.frame.blockIdx hTargetLt with
+      ⟨bb', hBb'⟩
+    refine ⟨⟨bb', hBb', ?_⟩, hTop', hStack'⟩
+    rw [hZ]
+    exact Nat.zero_le _
+  have hAtTerm : get? bb.statements s.frame.stmtIdx = none →
+      (s.frame.stmtIdx == length bb.statements) = true := by
+    intro hGetStmt
+    have hGe : length bb.statements ≤ s.frame.stmtIdx :=
+      length_le_of_get?_eq_none bb.statements s.frame.stmtIdx hGetStmt
+    rw [Nat.le_antisymm hStmtLe hGe]
+    exact decide_eq_true rfl
+  cases hPhase : body.phase with
+  | other tag =>
+    rw [hPhase] at hNode
+    nomatch hNode
+  | runtimePostCleanup =>
+    rw [hPhase, hBb] at hNode
+    dsimp only at hNode
+    cases hGetStmt : get? bb.statements s.frame.stmtIdx with
+    | some stmt =>
+      rw [hGetStmt] at hNode
+      exact absurd hNode (hStmt stmt)
+    | none =>
+      rw [hGetStmt, hAtTerm hGetStmt] at hNode
+      dsimp only [ite_true] at hNode
+      exact hTerm hNode
+  | runtimeOptimized =>
+    rw [hPhase, hBb] at hNode
+    dsimp only at hNode
+    cases hGetStmt : get? bb.statements s.frame.stmtIdx with
+    | some stmt =>
+      rw [hGetStmt] at hNode
+      exact absurd hNode (hStmt stmt)
+    | none =>
+      rw [hGetStmt, hAtTerm hGetStmt] at hNode
+      dsimp only [ite_true] at hNode
+      exact hTerm hNode
+
+/--
+`[adv B4]` Semantic top-level reachability: reflexive-transitive closure of top-level
+intra-frame steps of `stepMirFn body` and of external calls issued by `stepMirFn body`
+whose continuation keeps running under a top-level environment answer.
+-/
+inductive MirStepsTop (body : CapturedMir) : MachineState → MachineState → Prop where
+  | refl (s : MachineState) : MirStepsTop body s s
+  | intra {s₁ s₂ s₃ : MachineState}
+      (hTop₁ : s₁.memory.activeCallee = none)
+      (hStack₁ : s₁.memory.callStack = [])
+      (hTop₂ : s₂.memory.activeCallee = none)
+      (hStep : stepMirFn body s₁ = MirStepNode.step s₂ ∨
+               ∃ obs, stepMirFn body s₁ = MirStepNode.emitStep obs s₂)
+      (hRest : MirStepsTop body s₂ s₃) :
+      MirStepsTop body s₁ s₃
+  | extCall {s₁ s₂ s₃ : MachineState} {req : MirCallReq}
+      {k : MirCallAns → MirExecState} {ans : MirCallAns}
+      (hTop₁ : s₁.memory.activeCallee = none)
+      (hStack₁ : s₁.memory.callStack = [])
+      (hNode : stepMirFn body s₁ = MirStepNode.extCall req k)
+      (hAns : MirCallAnsTopFrame ans)
+      (hRun : k ans = .running s₂)
+      (hRest : MirStepsTop body s₂ s₃) :
+      MirStepsTop body s₁ s₃
+
+/-- `[adv B4]` Every `MirStepsIntra` trace is a `MirStepsTop` trace. -/
+theorem mirStepsTop_of_mirStepsIntra
+    (body : CapturedMir) {s s' : MachineState}
+    (hSteps : MirStepsIntra body s s') :
+    MirStepsTop body s s' := by
+  induction hSteps with
+  | refl s => exact MirStepsTop.refl s
+  | step hTop₁ hStack₁ hTop₂ hStep _ ih => exact MirStepsTop.intra hTop₁ hStack₁ hTop₂ hStep ih
+
+/--
+`[adv B4]` Multi-step `ValidMirPc` invariance along semantic top-level traces through
+external calls.
+-/
+theorem mirStepsTop_preserves_validMirPc
+    (body : CapturedMir) {s s' : MachineState}
+    (hCfg : cfgTargetsInBounds body = true)
+    (hPc : ValidMirPc body s.frame)
+    (hSteps : MirStepsTop body s s') :
+    ValidMirPc body s'.frame := by
+  induction hSteps with
+  | refl _ => exact hPc
+  | intra hTop₁ hStack₁ hTop₂ hStep _ ih =>
+    exact ih (stepMirFn_preserves_validMirPc body _ _ hTop₁ hStack₁ hTop₂ hCfg hPc hStep)
+  | extCall hTop₁ hStack₁ hNode hAns hRun _ ih =>
+    exact ih (stepMirFn_extCall_cont_preserves_validMirPc body _ _ _ _ _
+      hTop₁ hStack₁ hCfg hPc hNode hAns hRun).1
+
+/--
+`[adv B4]` Entry-to-fault census completeness along semantic top-level traces through
+external calls: from `initMachineState body args` on a body with in-bounds CFG targets,
+any state `s` reachable via `MirStepsTop` whose next step exposes `.ub` is censused.
+-/
+theorem initMachineState_mirStepsTop_exposesUb_in_census
+    (body : CapturedMir) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hSteps : MirStepsTop body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body := by
+  have hNonEmpty : 0 < length body.basicBlocks := by
+    unfold cfgTargetsInBounds at hCfg
+    rcases Bool.and_eq_true_iff.mp hCfg with ⟨hPos, _⟩
+    exact of_decide_eq_true hPos
+  exact stepMirFn_exposesUb_in_census body s hTop
+    (mirStepsTop_preserves_validMirPc body hCfg
+      (validMirPc_initMachineState body args hNonEmpty) hSteps) hUb
 
 /-! ## 9. Fail-Closed Coverage Reconciler & Soundness/Completeness Proofs -/
 
@@ -4399,6 +4674,31 @@ theorem initMachineState_mirStepsWithExtCalls_reconciled_safety
   rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
   exact ⟨cls, hInDis, hReg⟩
 
+/--
+`[adv B4]` End-to-end reconciled safety along semantic top-level traces through external
+calls (`initMachineState_mirStepsTop_reconciled_safety`): when the body's CFG targets
+are in bounds and its census reconciles, every state reachable from `initMachineState`
+through real `stepMirFn` steps and top-level-answered external calls that exposes `.ub`
+on its next step has its faulting site discharged with an `.emittedAndVerified` class.
+-/
+theorem initMachineState_mirStepsTop_reconciled_safety
+    (registry : PropertyRegistry) (body : CapturedMir)
+    (discharged : List FaultSite) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hVer : reconcileFaultCoverageWithRegistry registry
+      (censusMirBodyFaultSites body) discharged = .verified)
+    (hSteps : MirStepsTop body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  rcases initMachineState_mirStepsTop_exposesUb_in_census
+      body args s hCfg hSteps hTop hUb with ⟨cls, hInCensus⟩
+  rcases (reconcileFaultCoverageWithRegistry_verified_iff
+      registry (censusMirBodyFaultSites body) discharged).mp hVer
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
 /-! ## 9b. `[adv B3]` / `[adv A3]` Per-Body Batch Reconciliation & Polymorphic `CapturedMir.instantiate` Invariance
 
 `stepMirFn body s` executes the *active* body `s.memory.activeCallee.getD body`, which
@@ -5765,5 +6065,56 @@ theorem witnessCalleeStorage_masked_site_live :
           memory := { activeCallee := some witnessCalleeStorageBody } } ≠
       MirStepNode.fail .ub :=
   ⟨rfl, ne_fail_ub_of_stepNodeIsTau (by decide)⟩
+
+/-- `[adv B4]` External-call witness: `_0 = proto::ext_u32() -> bb1`, then `return`. -/
+def witnessExtCallBody : CapturedMir :=
+  { defPath := "proto::witness_ext_call"
+  , phase := MirPhaseTag.runtimePostCleanup
+  , role := ContractRole.subject
+  , argCount := 0
+  , localDecls := (List.cons witnessU32Decl List.nil)
+  , basicBlocks :=
+      (List.cons
+        { statements := List.nil
+        , terminator :=
+            { kind :=
+                (TerminatorKind.call
+                  (Operand.constant
+                    { ty := { kind := (RigidTy.fnDef "proto::ext_u32" List.nil), layoutIdx := 0 }
+                    , val := ConstValue.zeroSized
+                    })
+                  List.nil
+                  { local_ := 0, projection := List.nil }
+                  (Option.some 1)
+                  UnwindAction.continue_)
+            , span := "proto.rs:60:5"
+            }
+        , isCleanup := false
+        }
+        (List.cons
+          { statements := List.nil
+          , terminator := { kind := TerminatorKind.return_, span := "proto.rs:61:5" }
+          , isCleanup := false
+          }
+          List.nil))
+  , fnAbi := dummyWitnessFnAbi
+  , layouts := emptyLayoutTable
+  , allocations := List.nil
+  }
+
+/--
+`[adv B4]` Non-vacuity of `MirStepsTop.extCall`: `stepMirFn` really issues an external
+call at `(0, 0)` of `witnessExtCallBody`, and a top-level `.returned` answer resumes the
+frame at `(1, 0)`, so the semantic relation is inhabited by a genuine external-call step.
+-/
+theorem witnessExtCall_mirStepsTop_nonvacuous :
+    ∃ (req : MirCallReq) (k : MirCallAns → MirExecState) (s₂ : MachineState),
+      stepMirFn witnessExtCallBody (witnessState 0 0 [.uninit]) = MirStepNode.extCall req k ∧
+      k (.returned (.scalar ⟨7, 4⟩) {}) = .running s₂ ∧
+      s₂.frame.blockIdx = 1 ∧ s₂.frame.stmtIdx = 0 ∧
+      MirStepsTop witnessExtCallBody (witnessState 0 0 [.uninit]) s₂ := by
+  refine ⟨_, _, _, rfl, rfl, rfl, rfl, ?_⟩
+  exact MirStepsTop.extCall (ans := .returned (.scalar ⟨7, 4⟩) {}) rfl rfl rfl ⟨rfl, rfl⟩ rfl
+    (MirStepsTop.refl _)
 
 end Anneal.FaultSiteCensusPrototype
