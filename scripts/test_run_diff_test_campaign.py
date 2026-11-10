@@ -2071,6 +2071,256 @@ class BaselineRatchetAdversarialTest(unittest.TestCase):
             self.assertNotIn("baseline_missing", r3)
             self.assertNotIn("baseline_unmerged", r3)
 
+    def _run_twice_with_varied_reports(self, state_dir: Path, *extra: str) -> None:
+        for run_idx in range(2):
+
+            def fake_run_harness(repo_root, bin_name, harness_args, json_path, i=run_idx):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(state_dir, mutator_bonus=i)
+                return make_healthy_itree_report(state_dir, mutator_bonus=i)
+
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=fake_run_harness
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc = run_main(state_dir, *extra)
+            self.assertEqual(rc, campaign.EXIT_SUCCESS)
+
+    def test_repeated_baseline_merges_do_not_inflate_hit_counts(self) -> None:
+        """Re-merging the same configured baseline must be idempotent.
+
+        While `baseline_missing` stays set (here the ledger floor of 50 exceeds
+        the union), every run re-fetches the baseline. Summing the baseline's
+        `hit_count` into the local ratchet again on each run inflates counts for
+        paths that were never re-observed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_dir = tmp_path / "state_dir"
+            state_dir.mkdir()
+            write_initial_ledger(
+                state_dir, active_fingerprints=[], cumulative_distinct_obs_paths=50
+            )
+            baseline = tmp_path / "baseline_ratchet.json"
+            baseline.write_text(json.dumps(self._prior_ratchet()), encoding="utf-8")
+
+            self._run_twice_with_varied_reports(
+                state_dir, "--baseline-ratchet-uri", str(baseline)
+            )
+
+            ratchet = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(ratchet.get("baseline_missing"), True)
+            obs = ratchet["observed_paths"]
+            # Baseline hits plus one per run that observed the path.
+            self.assertEqual(
+                obs["miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree"]["hit_count"], 5
+            )
+            self.assertEqual(
+                obs["itree:it01_pure_return@IdentityMutator:0011223344556677:ok"]["hit_count"],
+                4,
+            )
+            # Baseline-only paths were never re-observed.
+            self.assertEqual(obs["miri:s99_prior_only@M0:pass_vs_pass:agree"]["hit_count"], 1)
+            self.assertEqual(obs["itree:it99_prior_only@I0:aaaa:ok"]["hit_count"], 1)
+            # Paths first seen by this campaign were observed exactly twice.
+            self.assertEqual(
+                obs["miri:s02_slice_get@BoundsCheckElimMutator:ub_vs_ub:agree"]["hit_count"], 2
+            )
+            self.assertEqual(
+                obs["miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree"]["first_seen_seed"],
+                "0x00001111",
+            )
+
+    def test_corrupt_local_ratchet_without_baseline_clears_after_catch_up(self) -> None:
+        """With no configured baseline there is nothing left to merge.
+
+        A corrupt local ratchet may be flagged when it is detected, but it must
+        not pin `baseline_missing` forever: as for an absent ratchet
+        (`test_missing_ratchet_baseline_is_flagged_not_hidden`), the flag clears
+        once the union catches up with every recorded floor.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            write_initial_ledger(
+                state_dir, active_fingerprints=[], cumulative_distinct_obs_paths=4
+            )
+            ratchet_path = state_dir / "state" / "coverage_ratchet.json"
+            ratchet_path.write_text('{"schema_version": 1, "observed_pa', encoding="utf-8")
+
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc1 = run_main(state_dir)
+            self.assertEqual(rc1, campaign.EXIT_SUCCESS)
+
+            def fake_run_harness_2(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(
+                        state_dir,
+                        obs_path_signatures=[
+                            "miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree",
+                            "miri:s02_slice_get@BoundsCheckElimMutator:ub_vs_ub:agree",
+                            "miri:s03_new_path@M9:panic_vs_panic:agree",
+                        ],
+                        mutator_bonus=1,
+                    )
+                return make_healthy_itree_report(
+                    state_dir,
+                    obs_path_signatures=[
+                        "itree:it01_pure_return@IdentityMutator:0011223344556677:ok",
+                        "itree:it02_single_ext_call@CallBoundaryOutliner:8899aabbccddeeff:ok",
+                        "itree:it03_new_path@I9:ffffffffffffffff:ok",
+                    ],
+                    mutator_bonus=1,
+                )
+
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=fake_run_harness_2
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc2 = run_main(state_dir)
+            self.assertEqual(rc2, campaign.EXIT_SUCCESS)
+            ratchet2 = json.loads(ratchet_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(ratchet2["observed_paths"]), 6)
+            self.assertEqual(ratchet2["cumulative_distinct_obs_paths"], 6)
+            self.assertNotIn("baseline_missing", ratchet2)
+            self.assertNotIn("baseline_unmerged", ratchet2)
+            summary2 = json.loads(
+                (state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIs(summary2["coverage_ratchet_baseline_missing"], False)
+
+    def test_remote_status_errors_mentioning_not_found_are_not_absent(self) -> None:
+        """Only file-absence errors classify a baseline as absent.
+
+        RPC status errors (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `PERMISSION_DENIED`)
+        whose message merely contains "not found" are fetch failures, so they
+        must still force `baseline_missing` (cf. the launcher's
+        `is_absent_error` tokens: `not_found`, `no files matched`, `no such file`).
+        """
+        for err in (
+            "UNAVAILABLE: upstream host not found",
+            "PERMISSION_DENIED: caller identity not found in access group",
+        ):
+            with self.subTest(err=err), tempfile.TemporaryDirectory() as tmp:
+                state_dir = Path(tmp)
+                write_initial_ledger(state_dir, active_fingerprints=[])
+                with mock.patch.object(
+                    campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+                ), mock.patch.object(
+                    campaign, "has_remote_sync", return_value=True
+                ), mock.patch.object(
+                    campaign,
+                    "run_remote_sync",
+                    return_value=subprocess.CompletedProcess([], 1, "", err),
+                ), mock.patch("sys.stderr", io.StringIO()):
+                    rc = run_main(
+                        state_dir,
+                        "--baseline-ratchet-uri",
+                        "/remote/teams/anneal-agent/difftest/state/coverage_ratchet.json",
+                    )
+                self.assertEqual(rc, campaign.EXIT_SUCCESS)
+                ratchet = json.loads(
+                    (state_dir / "state" / "coverage_ratchet.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertIs(ratchet.get("baseline_missing"), True, f"{err}: {ratchet}")
+
+    def test_unreadable_local_baseline_directory_warns_without_crashing(self) -> None:
+        """A baseline under an unsearchable directory degrades with a warning.
+
+        `Path.exists()` / `is_file()` raise `PermissionError` there, which must
+        not abort the campaign after the harnesses ran (losing the ledger and
+        reports); an unreadable configured baseline is a failed recovery.
+        """
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("permission bits are not enforced for root")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_dir = tmp_path / "state_dir"
+            state_dir.mkdir()
+            write_initial_ledger(state_dir, active_fingerprints=[])
+            locked_dir = tmp_path / "locked"
+            locked_dir.mkdir()
+            baseline = locked_dir / "coverage_ratchet.json"
+            baseline.write_text(json.dumps(self._prior_ratchet()), encoding="utf-8")
+            locked_dir.chmod(0)
+            stderr_buf = io.StringIO()
+            try:
+                with mock.patch.object(
+                    campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+                ), mock.patch("sys.stderr", stderr_buf):
+                    rc = run_main(state_dir, "--baseline-ratchet-uri", str(baseline))
+            finally:
+                locked_dir.chmod(0o755)
+
+            self.assertEqual(rc, campaign.EXIT_SUCCESS)
+            self.assertIn("warning:", stderr_buf.getvalue())
+            ratchet = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(ratchet.get("baseline_missing"), True)
+            self.assertTrue((state_dir / "reports" / "LATEST_REPORT.md").is_file())
+            self.assertEqual(read_ledger(state_dir)["total_campaigns_run"], 11)
+
+    def test_corrupt_numeric_values_in_baseline_degrade_without_crashing(self) -> None:
+        """Corrupt numbers in a recovered baseline must not crash after the harness ran.
+
+        `json.loads` raises a plain `ValueError` (not `JSONDecodeError`) for
+        integer literals over 4300 digits, and `str.isdigit()` accepts strings
+        such as "²" or 5000-digit runs that `int()` then rejects.
+        """
+        sig = "miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree"
+        huge = "1" * 5000
+        cases = {
+            "huge_int_literal": (
+                '{"schema_version": 1, "cumulative_distinct_obs_paths": '
+                + huge
+                + ', "observed_paths": {}}'
+            ),
+            "superscript_digit_strings": json.dumps(
+                {
+                    "schema_version": 1,
+                    "cumulative_distinct_obs_paths": "\u00b2",
+                    "per_suite_distinct_obs_paths": {"miri": "\u00b3", "itree": 1},
+                    "observed_paths": {sig: {"suite": "miri", "hit_count": "\u00b2"}},
+                }
+            ),
+            "huge_digit_string_hit_count": json.dumps(
+                {
+                    "schema_version": 1,
+                    "observed_paths": {sig: {"suite": "miri", "hit_count": huge}},
+                }
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                state_dir = tmp_path / "state_dir"
+                state_dir.mkdir()
+                write_initial_ledger(state_dir, active_fingerprints=[])
+                baseline = tmp_path / "coverage_ratchet.json"
+                baseline.write_text(text, encoding="utf-8")
+                with mock.patch.object(
+                    campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+                ), mock.patch("sys.stderr", io.StringIO()):
+                    rc = run_main(state_dir, "--baseline-ratchet-uri", str(baseline))
+                self.assertEqual(rc, campaign.EXIT_SUCCESS)
+                ratchet = json.loads(
+                    (state_dir / "state" / "coverage_ratchet.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertIn(sig, ratchet["observed_paths"])
+                self.assertTrue((state_dir / "reports" / "LATEST_REPORT.md").is_file())
+                if label == "huge_int_literal":
+                    self.assertIs(ratchet.get("baseline_missing"), True)
+
 
 if __name__ == "__main__":
     unittest.main()
