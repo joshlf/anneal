@@ -1995,6 +1995,82 @@ class BaselineRatchetAdversarialTest(unittest.TestCase):
             self.assertEqual(ratchet["cumulative_distinct_obs_paths"], 6)
             self.assertNotIn("baseline_missing", ratchet)
 
+    def test_unmerged_baseline_persists_across_runs_until_recovered_and_merged(
+        self,
+    ) -> None:
+        """A failed baseline fetch stays flagged across subsequent runs until recovered and union-merged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_dir = tmp_path / "state_dir"
+            state_dir.mkdir()
+            write_initial_ledger(state_dir, active_fingerprints=[])
+            remote_uri = "/remote/teams/anneal-agent/difftest/state/coverage_ratchet.json"
+            prior = self._prior_ratchet()
+
+            # Run 1: `--baseline-ratchet-uri` fails with transient `UNAVAILABLE` (no ledger floor).
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+            ), mock.patch.object(
+                campaign, "has_remote_sync", return_value=True
+            ), mock.patch.object(
+                campaign,
+                "run_remote_sync",
+                return_value=subprocess.CompletedProcess(
+                    [], 1, "", "UNAVAILABLE: transient backend error"
+                ),
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc1 = run_main(state_dir, "--baseline-ratchet-uri", remote_uri)
+            self.assertEqual(rc1, campaign.EXIT_SUCCESS)
+            r1 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(r1.get("baseline_missing"), True)
+
+            # Run 2: Runs without `--baseline-ratchet-uri` -> still honestly flagged `baseline_missing`.
+            def fake_run_harness_2(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(state_dir, mutator_bonus=1)
+                return make_healthy_itree_report(state_dir, mutator_bonus=1)
+
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=fake_run_harness_2
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc2 = run_main(state_dir)
+            self.assertEqual(rc2, campaign.EXIT_SUCCESS)
+            r2 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(r2.get("baseline_missing"), True)
+
+            # Run 3: `--baseline-ratchet-uri` succeeds -> union-merges baseline + prior runs and clears flag.
+            def ok_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+                if args[:2] == ["cp", "-f"] and args[2] == remote_uri:
+                    Path(args[3]).write_text(json.dumps(prior), encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            def fake_run_harness_3(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(state_dir, mutator_bonus=2)
+                return make_healthy_itree_report(state_dir, mutator_bonus=2)
+
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=fake_run_harness_3
+            ), mock.patch.object(
+                campaign, "has_remote_sync", return_value=True
+            ), mock.patch.object(
+                campaign, "run_remote_sync", side_effect=ok_remote_sync
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc3 = run_main(state_dir, "--baseline-ratchet-uri", remote_uri)
+            self.assertEqual(rc3, campaign.EXIT_SUCCESS)
+            r3 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(r3["observed_paths"]), 6)
+            self.assertNotIn("baseline_missing", r3)
+            self.assertNotIn("baseline_unmerged", r3)
+
 
 if __name__ == "__main__":
     unittest.main()

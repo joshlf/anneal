@@ -260,6 +260,9 @@ for label, d in [("seed1", d1), ("seed2", d2)]:
     assert d["diverge_count"] == d["kernel_confirmed_divergences"], label
     assert d["diverge_count"] == len(d["findings"]), label
     assert d["agree_count"] == d["compared_candidates"], label
+    assert d.get("unmodeled_external_calls", {}).get("miri_diff_corpus::helper_add_ten", 0) == 0, (
+        f"{label} unexpected helper_add_ten skip: {d.get('unmodeled_external_calls')}"
+    )
 
 # Seed sensitivity: mutator application counts and Miri/Anneal distributions
 # must change when the seed changes.
@@ -325,6 +328,10 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
     assert_eq!(neg_report.findings.len(), 1);
     let f = &neg_report.findings[0];
     assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_tag_"));
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_probe_"));
     assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
@@ -524,6 +531,10 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
     let f = &report.findings[0];
     assert_eq!(f.fn_name, "neg_ctrl_helper_call_surrogate__b0_c1");
     assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_tag_"));
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_probe_"));
     assert!(

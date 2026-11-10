@@ -15,7 +15,7 @@
 //! (`ArithmeticCastMutator`, `PlaceProjectionWrapper`, `RawPtrOffsetMutator`,
 //! `TreeBorrowsRetagInterleaver`, and `BitValidityTransmuteMutator`) produce
 //! closed zero-argument mutants suitable for direct execution by both Miri and
-//! Anneal's MIR-in-Lean oracle (`cargo_anneal::run_difftest_oracle_pipeline`).
+//! Anneal's helper-linked MIR-in-Lean oracle (`crate::miri_eval`).
 
 use quote::{ToTokens, format_ident};
 use syn::visit_mut::VisitMut;

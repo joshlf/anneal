@@ -23,9 +23,9 @@ use cargo_anneal::{
     DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
     DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
     MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
-    aggregate_unit_manifests, compare_miri_and_anneal, derive_item_module_suffix,
-    discover_zero_arg_pub_fns, normalize_path_against, parse_anneal_probe_output,
-    resolve_rustc_wrapper, run_lake_verify_targets, run_miri_oracle,
+    aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
+    derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
+    parse_anneal_probe_output, resolve_rustc_wrapper, run_miri_oracle,
     scaffold_workspace_with_config, source_files_match,
 };
 
@@ -163,7 +163,7 @@ pub struct MiriCampaignEvalReport {
     /// Deterministic, sorted observation-path signatures observed during live
     /// oracle evaluation (`miri:<mutator_chain_or_template>:<verdict_or_outcome>:<diff_tag>`).
     pub obs_path_signatures: Vec<String>,
-    /// Per-item oracle reports from `run_difftest_oracle_pipeline`.
+    /// Per-item oracle reports from the helper-linked Miri + Anneal oracle pipeline.
     pub item_reports: Vec<ItemOracleReport>,
     /// Total wall-clock duration in milliseconds.
     pub elapsed_ms: f64,
@@ -353,10 +353,11 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
 }
 
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
+    let callees_header = "def linkedCallees : List CapturedMir :=";
     let tag_header = format!("theorem confirm_tag_{fn_name} :");
     let probe_header = format!("theorem confirm_probe_{fn_name} :");
     let mut blocks = Vec::new();
-    for header in [&tag_header, &probe_header] {
+    for header in [callees_header, tag_header.as_str(), probe_header.as_str()] {
         if let Some(start_idx) = confirm_src.find(header) {
             let rest = &confirm_src[start_idx..];
             let end_rel = rest
@@ -413,11 +414,17 @@ fn resolve_lake_bin() -> PathBuf {
             return PathBuf::from(val.trim());
         }
     }
+    if let Some(toolchain_root) = cargo_anneal::setup::resolve_installed_toolchain() {
+        let bundled = toolchain_root.join("lean/bin/lake");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
     if let Ok(home) = env::var("HOME") {
         let home_path = PathBuf::from(home);
         for rel in [
-            ".elan/bin/lake",
             ".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake",
+            ".elan/bin/lake",
             ".anneal/toolchain/lean/bin/lake",
         ] {
             let candidate = home_path.join(rel);
@@ -427,6 +434,67 @@ fn resolve_lake_bin() -> PathBuf {
         }
     }
     PathBuf::from("lake")
+}
+
+fn run_lake_build_with_bin(
+    lake_bin: &Path,
+    dot_anneal_dir: &Path,
+    targets: &[&str],
+) -> Result<(), String> {
+    let mut cmd = build_lake_build_command(lake_bin, dot_anneal_dir);
+    for target in targets {
+        cmd.arg(target);
+    }
+    let output = cmd.output().map_err(|err| {
+        format!(
+            "failed to execute '{}' in {}: {}",
+            lake_bin.display(),
+            dot_anneal_dir.display(),
+            err
+        )
+    })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+            dot_anneal_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn find_executable_in_caller_or_system_path(tool_name: &str) -> Option<PathBuf> {
+    for var in ["ANNEAL_CALLER_PATH", "PATH"] {
+        if let Some(path_var) = env::var_os(var) {
+            for dir in env::split_paths(&path_var) {
+                let candidate = dir.join(tool_name);
+                if candidate.is_file() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = fs::metadata(&candidate)
+                            && (meta.permissions().mode() & 0o111) != 0
+                        {
+                            return Some(candidate);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let cargo_bin_tool = PathBuf::from(home).join(".cargo/bin").join(tool_name);
+        if cargo_bin_tool.is_file() {
+            return Some(cargo_bin_tool);
+        }
+    }
+    None
 }
 
 fn resolve_cargo_bin() -> PathBuf {
@@ -452,22 +520,29 @@ fn ensure_rustc_wrapper(
     if driver_cfg.rustc_wrapper.is_some() || resolved.is_file() {
         return Ok(resolved);
     }
+    if resolved.components().count() == 1
+        && let Some(name) = resolved.to_str()
+        && let Some(found) = find_executable_in_caller_or_system_path(name)
+    {
+        return Ok(found);
+    }
     if let Some(root) = anneal_repo_root.or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
     }) {
-        let built = root.join("target/debug/anneal-rustc-capture");
+        let exe_name = format!("anneal-rustc-capture{}", env::consts::EXE_SUFFIX);
+        let built = root.join("target/debug").join(&exe_name);
         if built.is_file() {
             return Ok(built);
         }
         let cargo_bin = resolve_cargo_bin();
-        let status = Command::new(&cargo_bin)
+        let output = Command::new(&cargo_bin)
             .args(["build", "-p", "anneal-rustc-capture", "--locked"])
             .current_dir(root)
-            .status()
+            .output()
             .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
-        if status.success() && built.is_file() {
+        if output.status.success() && built.is_file() {
             return Ok(built);
         }
     }
@@ -846,12 +921,10 @@ fn run_linked_difftest_oracle_pipeline(
     let lake_bin = resolve_lake_bin();
 
     if !present_items.is_empty() {
-        run_lake_verify_targets(
+        run_lake_build_with_bin(
+            &lake_bin,
             &dot_anneal,
-            &[
-                "Mir".to_string(),
-                "Anneal.Rustc.V2026_06_01.SymbolicEval".to_string(),
-            ],
+            &["Mir", "Anneal.Rustc.V2026_06_01.SymbolicEval"],
         )?;
 
         fs::create_dir_all(&oracle_dir)
@@ -1083,8 +1156,8 @@ fn write_finding_bundle_to_dir(
 }
 
 /// Evaluate generated `batches` through `compile_candidates` followed by the
-/// live Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`),
-/// optionally writing finding bundles under `findings_dir`.
+/// live helper-linked Miri + Anneal oracle pipeline, optionally writing finding
+/// bundles under `findings_dir`.
 pub fn evaluate_miri_batches(
     mode: &str,
     seed: u64,
@@ -1868,6 +1941,7 @@ mod tests {
             "initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.cand_call_helper.body [] emptyMemory linkedCallees"
         ));
         let extracted = extract_confirm_theorems(&confirm_src, "cand_call_helper");
+        assert!(extracted.contains("def linkedCallees : List CapturedMir :="));
         assert!(extracted.contains("theorem confirm_tag_cand_call_helper :"));
         assert!(extracted.contains("theorem confirm_probe_cand_call_helper :"));
         assert!(extracted.contains(":= by\n  rfl"));

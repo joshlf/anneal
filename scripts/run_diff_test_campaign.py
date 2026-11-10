@@ -269,37 +269,50 @@ def check_remote_uri(remote_uri: str) -> None:
             )
 
 
+def _is_absent_remote_error(err_text: str) -> bool:
+    lower = err_text.lower()
+    return any(
+        tok in lower
+        for tok in ("not_found", "not found", "no files matched", "no such file")
+    )
+
+
 def sync_state_from_remote(
     remote_uri: str, state_dir: Path, include_ratchet: bool = True
 ) -> None:
-    """Pulls the ledger (and coverage ratchet in live mode) from `/remote/` via `remote-sync` RPC."""
+    """Pulls the ledger (and coverage ratchet in live mode) from `/remote/` via `remote-sync` RPC.
+
+    Each file is staged into a sibling temporary path and atomically moved into
+    place only on success so transient remote read errors never clobber valid
+    pre-existing files in a reused `--state-dir`.
+    """
     if not remote_uri or not has_remote_sync():
         return
     check_remote_uri(remote_uri)
-    (state_dir / "state").mkdir(parents=True, exist_ok=True)
-    ledger_dst = state_dir / "state" / "campaign_ledger.json"
-    res_ledger = run_remote_sync(
-        [
-            "cp",
-            "-f",
-            f"{remote_uri.rstrip('/')}/state/campaign_ledger.json",
-            str(ledger_dst),
-        ]
-    )
-    if res_ledger.returncode != 0:
-        ledger_dst.unlink(missing_ok=True)
+    state_subdir = state_dir / "state"
+    state_subdir.mkdir(parents=True, exist_ok=True)
+    names = ["campaign_ledger.json"]
     if include_ratchet:
-        ratchet_dst = state_dir / "state" / "coverage_ratchet.json"
-        res_ratchet = run_remote_sync(
-            [
-                "cp",
-                "-f",
-                f"{remote_uri.rstrip('/')}/state/coverage_ratchet.json",
-                str(ratchet_dst),
-            ]
-        )
-        if res_ratchet.returncode != 0:
-            ratchet_dst.unlink(missing_ok=True)
+        names.append("coverage_ratchet.json")
+    base = remote_uri.rstrip("/")
+    pid = os.getpid()
+    for name in names:
+        dst = state_subdir / name
+        tmp_dst = state_subdir / f".sync_tmp_{pid}_{name}"
+        tmp_dst.unlink(missing_ok=True)
+        remote_src = f"{base}/state/{name}"
+        res = run_remote_sync(["cp", "-f", remote_src, str(tmp_dst)])
+        if res.returncode != 0:
+            tmp_dst.unlink(missing_ok=True)
+            err_detail = (res.stderr or res.stdout or "").strip()
+            if not err_detail or not _is_absent_remote_error(err_detail):
+                suffix = f": {err_detail}" if err_detail else ""
+                sys.stderr.write(
+                    f"warning: failed to fetch `{remote_src}` (exit {res.returncode}){suffix}; "
+                    f"preserving local {dst}\n"
+                )
+        elif tmp_dst.is_file():
+            os.replace(tmp_dst, dst)
 
 
 def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) -> None:
@@ -1882,23 +1895,137 @@ def load_coverage_ratchet(ratchet_path: Path) -> dict[str, Any]:
     return data
 
 
-def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> bool:
-    """Populates a missing `state/coverage_ratchet.json` from `baseline_uri`.
+BASELINE_RECOVERY_RECOVERED = "recovered"
+BASELINE_RECOVERY_ABSENT = "absent"
+BASELINE_RECOVERY_FAILED = "failed"
+BASELINE_RECOVERY_SKIPPED = "skipped"
 
-    Supports both `/remote/...` URIs (via `run_remote_sync`) and readable local
-    JSON files (after rejecting `/mnt/fuse/rw/...` paths via `check_remote_uri`).
-    Never overwrites an existing `ratchet_path`, and degrades safely with an
-    explicit `sys.stderr` warning on missing, unreadable, or malformed baseline
-    files without crashing the campaign.
+
+def _merge_ratchet_snapshots(
+    baseline: dict[str, Any], overlay: dict[str, Any]
+) -> dict[str, Any]:
+    """Union-merges a recovered `baseline` ratchet with an incomplete local `overlay`."""
+    merged_obs: dict[str, dict[str, Any]] = {}
+    for src in (baseline, overlay):
+        raw_obs = src.get("observed_paths", {})
+        if not isinstance(raw_obs, dict):
+            continue
+        for k, v in raw_obs.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            key = str(k)
+            prev = merged_obs.get(key)
+            if prev is None:
+                merged_obs[key] = copy.deepcopy(v)
+            else:
+                b_first = prev.get("first_seen_utc")
+                o_first = v.get("first_seen_utc")
+                if (
+                    isinstance(o_first, str)
+                    and o_first
+                    and (not isinstance(b_first, str) or not b_first or o_first < b_first)
+                ):
+                    prev["first_seen_utc"] = o_first
+                    if isinstance(v.get("first_seen_seed"), str) and v["first_seen_seed"]:
+                        prev["first_seen_seed"] = v["first_seen_seed"]
+                b_last = prev.get("last_seen_utc")
+                o_last = v.get("last_seen_utc")
+                if (
+                    isinstance(o_last, str)
+                    and o_last
+                    and (not isinstance(b_last, str) or not b_last or o_last >= b_last)
+                ):
+                    prev["last_seen_utc"] = o_last
+                    if isinstance(v.get("last_seen_seed"), str) and v["last_seen_seed"]:
+                        prev["last_seen_seed"] = v["last_seen_seed"]
+                prev["hit_count"] = _safe_nonneg_int(prev.get("hit_count"), 1) + _safe_nonneg_int(
+                    v.get("hit_count"), 1
+                )
+
+    def suite_cnt(sk: str) -> int:
+        return sum(
+            1
+            for k, v in merged_obs.items()
+            if (v.get("suite") == sk) or (v.get("suite") is None and k.startswith(f"{sk}:"))
+        )
+
+    b_ps = baseline.get("per_suite_distinct_obs_paths")
+    o_ps = overlay.get("per_suite_distinct_obs_paths")
+    b_ps_dict = b_ps if isinstance(b_ps, dict) else {}
+    o_ps_dict = o_ps if isinstance(o_ps, dict) else {}
+    per_suite = {
+        sk: max(
+            _safe_nonneg_int(b_ps_dict.get(sk)),
+            _safe_nonneg_int(o_ps_dict.get(sk)),
+            suite_cnt(sk),
+        )
+        for sk in ("miri", "itree")
+    }
+    total = max(
+        _safe_nonneg_int(baseline.get("cumulative_distinct_obs_paths")),
+        _safe_nonneg_int(overlay.get("cumulative_distinct_obs_paths")),
+        sum(per_suite.values()),
+        len(merged_obs),
+    )
+    out: dict[str, Any] = {
+        "schema_version": 1,
+        "updated_utc": str(overlay.get("updated_utc") or baseline.get("updated_utc") or utc_now_iso()),
+        "cumulative_distinct_obs_paths": total,
+        "per_suite_distinct_obs_paths": per_suite,
+        "observed_paths": merged_obs,
+    }
+    if baseline.get("baseline_missing") is True:
+        out["baseline_missing"] = True
+    return out
+
+
+def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> str:
+    """Populates a missing, corrupt, or incomplete `state/coverage_ratchet.json` from `baseline_uri`.
+
+    Returns one of:
+    - `BASELINE_RECOVERY_SKIPPED`: `baseline_uri` is empty or a valid complete local
+      ratchet already exists at `ratchet_path`;
+    - `BASELINE_RECOVERY_RECOVERED`: `baseline_uri` was parsed and written/merged into
+      `ratchet_path`;
+    - `BASELINE_RECOVERY_ABSENT`: `baseline_uri` points to a genuinely non-existent
+      remote/local file (`not_found` / missing path);
+    - `BASELINE_RECOVERY_FAILED`: `baseline_uri` was configured and either failed with
+      a non-absent remote/I/O error or contained malformed/non-object JSON.
     """
     clean_uri = baseline_uri.strip()
     if not clean_uri:
-        return False
+        return BASELINE_RECOVERY_SKIPPED
     check_remote_uri(clean_uri)
-    if ratchet_path.exists():
-        return False
-    if ratchet_path.is_symlink():
+
+    incomplete_overlay: dict[str, Any] | None = None
+    if ratchet_path.is_symlink() and not ratchet_path.exists():
         ratchet_path.unlink(missing_ok=True)
+    elif ratchet_path.exists():
+        if not ratchet_path.is_file():
+            sys.stderr.write(
+                f"warning: local coverage ratchet {ratchet_path} is not a regular file\n"
+            )
+            return BASELINE_RECOVERY_FAILED
+        try:
+            existing = json.loads(ratchet_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            sys.stderr.write(
+                f"warning: local coverage ratchet {ratchet_path} is malformed or unreadable "
+                f"({e}); attempting recovery from baseline `{clean_uri}`\n"
+            )
+            ratchet_path.unlink(missing_ok=True)
+        else:
+            if not isinstance(existing, dict):
+                sys.stderr.write(
+                    f"warning: local coverage ratchet {ratchet_path} is not a JSON object "
+                    f"(got {type(existing).__name__}); attempting recovery from baseline "
+                    f"`{clean_uri}`\n"
+                )
+                ratchet_path.unlink(missing_ok=True)
+            elif existing.get("baseline_missing") is True:
+                incomplete_overlay = existing
+            else:
+                return BASELINE_RECOVERY_SKIPPED
 
     ratchet_path.parent.mkdir(parents=True, exist_ok=True)
     if clean_uri.startswith("/remote/"):
@@ -1907,50 +2034,70 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
                 f"warning: cannot recover baseline coverage ratchet from `{clean_uri}`: "
                 f"`{REMOTE_SYNC_BIN}` is not available\n"
             )
-            return False
-        res = run_remote_sync(["cp", "-f", clean_uri, str(ratchet_path)])
+            return BASELINE_RECOVERY_FAILED
+        fetch_dst = (
+            ratchet_path.parent / f".baseline_tmp_{os.getpid()}_coverage_ratchet.json"
+            if incomplete_overlay is not None
+            else ratchet_path
+        )
+        if fetch_dst != ratchet_path:
+            fetch_dst.unlink(missing_ok=True)
+        res = run_remote_sync(["cp", "-f", clean_uri, str(fetch_dst)])
         if res.returncode != 0:
-            ratchet_path.unlink(missing_ok=True)
+            fetch_dst.unlink(missing_ok=True)
             err_detail = (res.stderr or res.stdout or "").strip()
             suffix = f": {err_detail}" if err_detail else ""
             sys.stderr.write(
                 f"warning: failed to fetch baseline coverage ratchet from `{clean_uri}` "
                 f"(exit {res.returncode}){suffix}\n"
             )
-            return False
-        if not ratchet_path.is_file():
+            if err_detail and _is_absent_remote_error(err_detail):
+                return BASELINE_RECOVERY_ABSENT
+            return BASELINE_RECOVERY_FAILED
+        if not fetch_dst.is_file():
             sys.stderr.write(
                 f"warning: remote sync from `{clean_uri}` exited 0 without creating "
-                f"{ratchet_path}\n"
+                f"{fetch_dst}\n"
             )
-            return False
+            return BASELINE_RECOVERY_FAILED
         try:
-            parsed = json.loads(ratchet_path.read_text(encoding="utf-8"))
+            parsed = json.loads(fetch_dst.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            ratchet_path.unlink(missing_ok=True)
+            fetch_dst.unlink(missing_ok=True)
             sys.stderr.write(
                 f"warning: baseline coverage ratchet fetched from `{clean_uri}` is "
                 f"malformed or unreadable: {e}\n"
             )
-            return False
+            return BASELINE_RECOVERY_FAILED
         if not isinstance(parsed, dict):
-            ratchet_path.unlink(missing_ok=True)
+            fetch_dst.unlink(missing_ok=True)
             sys.stderr.write(
                 f"warning: baseline coverage ratchet fetched from `{clean_uri}` is not "
                 f"a JSON object (got {type(parsed).__name__})\n"
             )
-            return False
+            return BASELINE_RECOVERY_FAILED
+        if incomplete_overlay is not None:
+            fetch_dst.unlink(missing_ok=True)
+            merged = _merge_ratchet_snapshots(parsed, incomplete_overlay)
+            ratchet_path.write_text(
+                json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
         sys.stderr.write(
             f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
         )
-        return True
+        return BASELINE_RECOVERY_RECOVERED
 
     src_path = Path(clean_uri)
+    if not src_path.exists() and not src_path.is_symlink():
+        sys.stderr.write(
+            f"warning: baseline coverage ratchet `{clean_uri}` does not exist\n"
+        )
+        return BASELINE_RECOVERY_ABSENT
     if not src_path.is_file():
         sys.stderr.write(
-            f"warning: baseline coverage ratchet `{clean_uri}` does not exist or is not a file\n"
+            f"warning: baseline coverage ratchet `{clean_uri}` is not a readable regular file\n"
         )
-        return False
+        return BASELINE_RECOVERY_FAILED
     try:
         raw_text = src_path.read_text(encoding="utf-8")
         parsed = json.loads(raw_text)
@@ -1958,26 +2105,33 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
         sys.stderr.write(
             f"warning: failed to read baseline coverage ratchet `{clean_uri}`: {e}\n"
         )
-        return False
+        return BASELINE_RECOVERY_FAILED
     if not isinstance(parsed, dict):
         sys.stderr.write(
             f"warning: baseline coverage ratchet `{clean_uri}` is not a JSON object "
             f"(got {type(parsed).__name__})\n"
         )
-        return False
+        return BASELINE_RECOVERY_FAILED
     try:
-        ratchet_path.write_text(raw_text, encoding="utf-8")
+        if incomplete_overlay is not None:
+            merged = _merge_ratchet_snapshots(parsed, incomplete_overlay)
+            ratchet_path.write_text(
+                json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        else:
+            ratchet_path.write_text(raw_text, encoding="utf-8")
     except OSError as e:
-        ratchet_path.unlink(missing_ok=True)
+        if incomplete_overlay is None:
+            ratchet_path.unlink(missing_ok=True)
         sys.stderr.write(
             f"warning: failed to write recovered baseline coverage ratchet to "
             f"{ratchet_path}: {e}\n"
         )
-        return False
+        return BASELINE_RECOVERY_FAILED
     sys.stderr.write(
         f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
     )
-    return True
+    return BASELINE_RECOVERY_RECOVERED
 
 
 def extract_suite_obs_path_signatures(
@@ -2040,6 +2194,7 @@ def update_coverage_ratchet(
     itree_suite_healthy: bool,
     itree: dict[str, Any] | None,
     itree_seed: int,
+    force_baseline_missing: bool = False,
 ) -> tuple[Path, bool]:
     """Monotonically merges observation-path signatures from healthy suite(s)
     into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
@@ -2126,16 +2281,27 @@ def update_coverage_ratchet(
         len(observed_paths),
     )
 
-    baseline_missing = len(observed_paths) < new_total or any(
+    below_floor = len(observed_paths) < new_total or any(
         suite_count(k) < per_suite[k] for k in ("miri", "itree")
     )
+    baseline_unmerged = force_baseline_missing or (
+        ratchet.get("baseline_unmerged") is True
+    )
+    baseline_missing = below_floor or baseline_unmerged
     if baseline_missing:
-        sys.stderr.write(
-            f"warning: {ratchet_path} holds {len(observed_paths)} observation paths but the "
-            f"recorded cumulative floor is {new_total}; this run cannot extend the "
-            "cumulative set (provide state/coverage_ratchet.json alongside "
-            "state/campaign_ledger.json to accumulate)\n"
-        )
+        if below_floor:
+            sys.stderr.write(
+                f"warning: {ratchet_path} holds {len(observed_paths)} observation paths but the "
+                f"recorded cumulative floor is {new_total}; this run cannot extend the "
+                "cumulative set (provide state/coverage_ratchet.json alongside "
+                "state/campaign_ledger.json to accumulate)\n"
+            )
+        else:
+            sys.stderr.write(
+                f"warning: {ratchet_path} could not merge a configured or corrupted "
+                "prior coverage ratchet baseline; marking baseline_missing=true so "
+                "this partial union is not mistaken for the full cumulative set\n"
+            )
 
     updated_ratchet = {
         "schema_version": 1,
@@ -2146,6 +2312,8 @@ def update_coverage_ratchet(
     }
     if baseline_missing:
         updated_ratchet["baseline_missing"] = True
+    if baseline_unmerged:
+        updated_ratchet["baseline_unmerged"] = True
     ratchet_path.parent.mkdir(parents=True, exist_ok=True)
     ratchet_path.write_text(
         json.dumps(updated_ratchet, indent=2, sort_keys=True) + "\n",
@@ -3119,8 +3287,30 @@ def main(argv: list[str] | None = None) -> int:
                 itree_quarantined,
             )
 
-            if baseline_ratchet_uri and not ratchet_path.exists():
+            local_ratchet_corrupt = False
+            if ratchet_path.exists():
+                if not ratchet_path.is_file():
+                    local_ratchet_corrupt = True
+                else:
+                    try:
+                        probe_obj = json.loads(ratchet_path.read_text(encoding="utf-8"))
+                        if not isinstance(probe_obj, dict):
+                            local_ratchet_corrupt = True
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        local_ratchet_corrupt = True
+
+            recovery_status = (
                 recover_baseline_coverage_ratchet(baseline_ratchet_uri, ratchet_path)
+                if baseline_ratchet_uri
+                else BASELINE_RECOVERY_SKIPPED
+            )
+            force_baseline_missing = (
+                recovery_status == BASELINE_RECOVERY_FAILED
+                or (
+                    local_ratchet_corrupt
+                    and recovery_status != BASELINE_RECOVERY_RECOVERED
+                )
+            )
 
             _, ratchet_baseline_missing = update_coverage_ratchet(
                 ratchet_path,
@@ -3131,6 +3321,7 @@ def main(argv: list[str] | None = None) -> int:
                 itree_suite_healthy,
                 itree if itree_performed else None,
                 itree_seed,
+                force_baseline_missing=force_baseline_missing,
             )
             written.append(ratchet_path)
 
