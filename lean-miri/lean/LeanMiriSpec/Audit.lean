@@ -460,6 +460,7 @@ open LeanMiriSpec.Correspondence in
   step_deref_misaligned_miri_ub
   step_cast_ptrToPtr_simulation
   step_binOp_offset_simulation
+  step_binOp_offset_disabled_divergence
   step_binOp_offset_oob_dangling_miri_ub
   WellTypedLM3_1StateStmt
   step_stmt_lm3_1_state_simulation
@@ -869,6 +870,7 @@ open LeanMiriSpec.Correspondence in
   tryNew_uninit_raw
   union_copy_freshAlloc_spec
   WellTypedUnionTy
+  WellTypedUnionTy.of_fullRangeScalarFields
   UnionMemRel
   UnionLocalRel
   FrameRelLM2_4
@@ -3963,6 +3965,51 @@ example
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (.copy ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl : MirAst.LocalDecl} {ptrMut dstMut : Mutability} {pointeeKind : RigidTy}
+    {rhsTy : Ty}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hpt : pointeeKind = .uint .u8 ∨ pointeeKind = .int .i8)
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame rhsOp rhsTy)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hno_int : ∀ sc, get? s.frame.locals ptrIdx ≠ some (.init (.scalar sc)))
+    {ptrVal : ProvenancePtr} {sc : MirAst.ScalarInt} {e : AllocMapEntry}
+    {tgtDecl : MirAst.LocalDecl}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hrhs_ok : evalOperand s.frame.locals rhsOp s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals = .ok (.scalar sc) s.frame.locals)
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag) (hdis : e.perm = .disabled)
+    (htgt_decl : get? body.localDecls e.localIdx = some tgtDecl)
+    (hinb :
+      (sc.bits = 0 ∧ ptrVal.offsetBytes = 0) ∨
+      (get? s.frame.locals e.localIdx ≠ some .dead ∧
+        ptrVal.offsetBytes + sc.bits ≤
+          (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) :=
+  step_binOp_offset_disabled_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty
+    hdst_ty hpt hrhs_ty hop_rhs himm hno_int hslot_p hrhs_ok he htag hdis htgt_decl hinb
+    hdst_live hptr8
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (.copy ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
     {dstDecl ptrDecl tgtDecl : MirAst.LocalDecl}
     {ptrMut : Mutability} {pointeeKind : RigidTy} {rhsTy : Ty}
     (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
@@ -7034,6 +7081,52 @@ example
   evalRvalue_reborrow_dangling_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hno_int hzero_perm hslot_p he htag hdead_t hdst_live hdecl_t
 
 open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local}
+    {dstDecl ptrDecl : MirAst.LocalDecl}
+    {bk : BorrowKind} {ptrMut dstMut : Mutability} {pointeeKind dstPointee : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hno_int : ∀ sc, get? s.frame.locals ptrIdx ≠ some (.init (.scalar sc)))
+    (hzero_perm : ∀ ptrVal e,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared))
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (huninit_t : get? s.frame.locals e.localIdx = some .uninit)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {targetDecl : MirAst.LocalDecl} (hdecl_t : get? body.localDecls e.localIdx = some targetDecl) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+              .concrete e.allocId borTag⟩)))) ∧
+      annealValidityAccessCheck m'.machine
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId), some (.concrete e.allocId borTag)⟩
+        (translateTy targetDecl.ty body.layouts).layout.size = .ok () :=
+  evalRvalue_reborrow_uninit_target_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty
+    hdst_ty hpk_prim himm hno_int hzero_perm hslot_p he htag huninit_t hdst_live hdecl_t
+
+open Trusted.Rustc.V2026_06_01.Layout in
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -8274,6 +8367,7 @@ open LeanMiriSpec.Correspondence in
   LocalRelLM3_2.ref_immediate_cases
   evalRvalue_reborrow_simulation
   evalRvalue_reborrow_dangling_divergence
+  evalRvalue_reborrow_uninit_target_divergence
   evalRvalue_reborrow_perm_divergence
   Witness.lm32Ref_stateRel_pre
   Witness.lm32Ref_immediate_pre
@@ -11125,6 +11219,37 @@ example
             (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes j)) = .ok (.ok ()) ↔
           j ≤ k) :=
   unionPrefixMask_vendoredCopy hS hk hle destInit
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {layouts : LayoutTable} {uTy : Ty} {S : Nat}
+    (hsz : ValidScalarBytes S)
+    (hfu : ∃ n, (translateTy uTy layouts).layout.fields = .Union n ∧ 0 < n)
+    (hsize : (translateTy uTy layouts).layout.size = translateSizeBytes S)
+    (hsized : (translateTy uTy layouts).layout.isSized = true)
+    (halign : (translateTy uTy layouts).layout.align.abi.pow2 ≤ 29)
+    {defPath : DefPath} {args : List RigidTy} {tl : TypeLayout} {n : Nat}
+    (hkind : uTy.kind = .adt defPath args)
+    (hidx_pos : 0 < uTy.layoutIdx)
+    (hidx_lt : uTy.layoutIdx < 900)
+    (hlook : layouts.lookup uTy.layoutIdx = some tl)
+    (htl_fields : tl.fields = .union n)
+    (htl_var : tl.variants = .single 0)
+    (htl_uninh : tl.isUninhabited = false)
+    (htl_sz : tl.size.bytes = S)
+    (htl_len : tl.fieldLayouts.length = n)
+    (hptr : layouts.pointerBits = 64)
+    (hle : layouts.isLittleEndian = true)
+    (hfields : ∀ idx flIdx, get? tl.fieldLayouts idx = some flIdx →
+      ∃ fTl, layouts.lookup flIdx = some fTl ∧
+        fTl.isUninhabited = false ∧
+        ValidScalarBytes fTl.size.bytes ∧
+        fTl.size.bytes ≤ S ∧
+        (∀ prim vr, fTl.backendRepr = .scalar (.initialized prim vr) →
+          vr.start = 0 ∧ vr.end_ + 1 = scalarModulus fTl.size.bytes)) :
+    WellTypedUnionTy layouts uTy S :=
+  WellTypedUnionTy.of_fullRangeScalarFields hsz hfu hsize hsized halign hkind hidx_pos hidx_lt
+    hlook htl_fields htl_var htl_uninh htl_sz htl_len hptr hle hfields
 
 example
     (localDecls : List MirAst.LocalDecl)

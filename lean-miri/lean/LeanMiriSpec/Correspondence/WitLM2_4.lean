@@ -151,51 +151,28 @@ def lm24FieldWriteStmt (u n : Nat) : MirAst.Statement :=
 def lm24Field1WriteU32Stmt (u n : Nat) : MirAst.Statement :=
   mkStmt (.assign ⟨u, [.field 1 lm24U32Ty]⟩ (.use (.constant (lm24ConstU32 n))))
 
-theorem lm24_wt_U : WellTypedUnionTy lm24Layouts lm24UTy 4 where
-  size_valid := Or.inr (Or.inr (Or.inl rfl))
-  fields_union := ⟨2, rfl, by decide⟩
-  size_eq := rfl
-  sized := rfl
-  align_le := by decide
-  adt_spec := by
-    refine ⟨"U", [], lm24ULayout, 2, rfl, by decide, by decide, rfl, rfl, rfl, rfl, rfl, rfl,
-      rfl, rfl, ?_⟩
-    intro idx flIdx hget
-    match idx with
-    | 0 =>
-      injection hget with h; subst h
-      refine ⟨lm24U8Layout, rfl, rfl, Or.inl rfl, by decide, ?_⟩
-      intro fTy sc msc _ himm hsz fuel'
-      cases himm with
-      | scalar _ _ hrel _ _ _ =>
-        have hcan := hrel.canonical
-        cases sc with | mk bits sz =>
-        dsimp only [lm24U8Layout] at hsz; subst hsz
-        dsimp only at hcan
-        rw [scalarModulus_eq_two_pow] at hcan
-        have hle : Nat.ble bits 255 = true := Nat.ble_eq.mpr (by omega)
-        have hzle : Nat.ble 0 bits = true := Nat.ble_eq.mpr (Nat.zero_le bits)
-        unfold encodeByLayoutIdxAux
-        simp [LayoutTable.lookup, lm24Layouts, get?, lm24U8Layout, wrappingRangeContains,
-          hzle, hle]
-        rfl
-    | 1 =>
-      injection hget with h; subst h
-      refine ⟨lm24U32Layout, rfl, rfl, Or.inr (Or.inr (Or.inl rfl)), by decide, ?_⟩
-      intro fTy sc msc _ himm hsz fuel'
-      cases himm with
-      | scalar _ _ hrel _ _ _ =>
-        have hcan := hrel.canonical
-        cases sc with | mk bits sz =>
-        dsimp only [lm24U32Layout] at hsz; subst hsz
-        dsimp only at hcan
-        rw [scalarModulus_eq_two_pow] at hcan
-        have hle : Nat.ble bits 4294967295 = true := Nat.ble_eq.mpr (by omega)
-        have hzle : Nat.ble 0 bits = true := Nat.ble_eq.mpr (Nat.zero_le bits)
-        unfold encodeByLayoutIdxAux
-        simp [LayoutTable.lookup, lm24Layouts, get?, lm24U32Layout, wrappingRangeContains,
-          hzle, hle]
-    | _ + 2 => simp [lm24ULayout, get?] at hget
+theorem lm24_wt_U : WellTypedUnionTy lm24Layouts lm24UTy 4 :=
+  WellTypedUnionTy.of_fullRangeScalarFields
+    (Or.inr (Or.inr (Or.inl rfl)))
+    ⟨2, rfl, by decide⟩
+    rfl rfl (by decide)
+    rfl (by decide) (by decide) rfl rfl rfl rfl rfl rfl rfl rfl
+    (by
+      intro idx flIdx hget
+      match idx with
+      | 0 =>
+        injection hget with h; subst h
+        refine ⟨lm24U8Layout, rfl, rfl, Or.inl rfl, by decide, ?_⟩
+        intro prim vr hrepr
+        injection hrepr with hs; injection hs with _ hvr; subst hvr
+        exact ⟨rfl, rfl⟩
+      | 1 =>
+        injection hget with h; subst h
+        refine ⟨lm24U32Layout, rfl, rfl, Or.inr (Or.inr (Or.inl rfl)), by decide, ?_⟩
+        intro prim vr hrepr
+        injection hrepr with hs; injection hs with _ hvr; subst hvr
+        exact ⟨rfl, rfl⟩
+      | _ + 2 => simp [lm24ULayout, get?] at hget)
 
 theorem lm24_isPrim_u8 : IsPrimScalarTy lm24U8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
 theorem lm24_isPrim_u32 : IsPrimScalarTy lm24U32Ty := Or.inr (Or.inr (Or.inr ⟨.u32, rfl⟩))

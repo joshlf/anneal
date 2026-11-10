@@ -3497,12 +3497,12 @@ theorem array_copy_alloc_spec
 `StateRel`'s `MemPlaceRel` requires every byte of an initialized memory-backed
 local to be initialized (`val_consistent`), so it cannot relate a union whose
 smaller field was written. `StateRelLM2_4` is `StateRel` with one more way to
-relate a local (`UnionLocalRel.union`): an initialized Anneal union
-`Value.aggregate 0 [.scalar sc]`, which is what Anneal's `evalRvalue` builds
-from a union aggregate, corresponds to a memory-backed union whose bytes
-`[0, k)` (`k = sc.sizeBytes`, the size of field `0`) hold `sc` and are
-initialized while its bytes `[k, S)` are not (`UnionMemRel`). Every
-`StateRel` is a `StateRelLM2_4` (`StateRel.toLM2_4`). -/
+relate a local (`UnionLocalRel.union`): an initialized `n`-field Anneal union
+`Value.aggregate 0 (unionSlotFields n f (.scalar sc))` (`f < n`, matching both
+`evalAggregateAdtUnionValue?` and `rebuildUnionFieldsAfterWriteOpt`) corresponds
+to a memory-backed union whose bytes `[0, k)` (`k = sc.sizeBytes`) hold `sc`
+and are initialized while its trailing bytes `[k, S)` are not (`UnionMemRel`).
+Every `StateRel` is a `StateRelLM2_4` (`StateRel.toLM2_4`). -/
 
 /-- The `n`-slot Anneal field list of a union whose active field `f < n` holds `v`
 and whose remaining `n - 1` sibling slots hold `.unit`, matching both
@@ -3512,8 +3512,10 @@ def unionSlotFields (n f : Nat) (v : Value) : List Value :=
 
 /-- A union of `S ∈ {1, 2, 4, 8, 16}` bytes: its `lean-miri` layout has
 `FieldsShape.Union` with at least one field, size `S`, an alignment that
-`Align.fromBytes` accepts, and a well-formed `FieldsShape.union` entry in
-`layouts` whose scalar `fieldLayouts` match `encodeByLayoutIdxAux`. -/
+`Align.fromBytes` accepts, `uTy.layoutIdx ∈ (0, 900)` (so `100 + uTy.layoutIdx < 1000`
+stays inside `LeanMiriSpec.Translate`'s ADT `TyId` range in `unionFieldLayoutOf`),
+and a well-formed `FieldsShape.union` entry in `layouts` whose scalar
+`fieldLayouts` match `encodeByLayoutIdxAux`. -/
 structure WellTypedUnionTy (layouts : LayoutTable) (uTy : Ty) (S : Nat) : Prop where
   size_valid : ValidScalarBytes S
   fields_union : ∃ n, (translateTy uTy layouts).layout.fields = .Union n ∧ 0 < n
@@ -3544,8 +3546,104 @@ structure WellTypedUnionTy (layouts : LayoutTable) (uTy : Ty) (S : Nat) : Prop w
           ∀ fuel', encodeByLayoutIdxAux (fuel' + 1) layouts flIdx (.scalar sc) =
             encodeScalarBytes sc .none
 
-/-- A memory-backed union local `mp` whose field `0` (of type `f0Ty`) holds
-`sc`: `mp` points at offset `0` of its own live allocation, which has `S`
+/-- Construct a `WellTypedUnionTy` from purely structural layout facts whenever
+every union field layout `fTl` has a full-range scalar (or non-range-restricted)
+`backendRepr` (`vr.start = 0 ∧ vr.end_ + 1 = scalarModulus fTl.size.bytes`),
+discharging the `encodeByLayoutIdxAux` codec clause once and for all. -/
+theorem WellTypedUnionTy.of_fullRangeScalarFields
+    {layouts : LayoutTable} {uTy : Ty} {S : Nat}
+    (hsz : ValidScalarBytes S)
+    (hfu : ∃ n, (translateTy uTy layouts).layout.fields = .Union n ∧ 0 < n)
+    (hsize : (translateTy uTy layouts).layout.size = translateSizeBytes S)
+    (hsized : (translateTy uTy layouts).layout.isSized = true)
+    (halign : (translateTy uTy layouts).layout.align.abi.pow2 ≤ 29)
+    {defPath : DefPath} {args : List RigidTy} {tl : TypeLayout} {n : Nat}
+    (hkind : uTy.kind = .adt defPath args)
+    (hidx_pos : 0 < uTy.layoutIdx)
+    (hidx_lt : uTy.layoutIdx < 900)
+    (hlook : layouts.lookup uTy.layoutIdx = some tl)
+    (htl_fields : tl.fields = .union n)
+    (htl_var : tl.variants = .single 0)
+    (htl_uninh : tl.isUninhabited = false)
+    (htl_sz : tl.size.bytes = S)
+    (htl_len : tl.fieldLayouts.length = n)
+    (hptr : layouts.pointerBits = 64)
+    (hle : layouts.isLittleEndian = true)
+    (hfields : ∀ idx flIdx, get? tl.fieldLayouts idx = some flIdx →
+      ∃ fTl, layouts.lookup flIdx = some fTl ∧
+        fTl.isUninhabited = false ∧
+        ValidScalarBytes fTl.size.bytes ∧
+        fTl.size.bytes ≤ S ∧
+        (∀ prim vr, fTl.backendRepr = .scalar (.initialized prim vr) →
+          vr.start = 0 ∧ vr.end_ + 1 = scalarModulus fTl.size.bytes)) :
+    WellTypedUnionTy layouts uTy S where
+  size_valid := hsz
+  fields_union := hfu
+  size_eq := hsize
+  sized := hsized
+  align_le := halign
+  adt_spec := by
+    refine ⟨defPath, args, tl, n, hkind, hidx_pos, hidx_lt, hlook, htl_fields, htl_var,
+      htl_uninh, htl_sz, htl_len, hptr, hle, ?_⟩
+    intro idx flIdx hget
+    obtain ⟨fTl, hfTl, huninh, hfSz, hfLe, hfull⟩ := hfields idx flIdx hget
+    refine ⟨fTl, hfTl, huninh, hfSz, hfLe, ?_⟩
+    intro fTy sc msc _ himm hsc_sz fuel'
+    cases himm with
+    | scalar _ _ hrel _ _ _ =>
+      have hcan := hrel.canonical
+      rcases sc with ⟨bits, sz⟩
+      dsimp only at hsc_sz hcan
+      have hlookup : LayoutTable.lookup layouts flIdx = some fTl := hfTl
+      unfold encodeByLayoutIdxAux
+      rw [hlookup]
+      rcases fTl with ⟨fSize, fAlign, fRepr, fFields, fVariants, fUninh, fLays⟩
+      dsimp only at huninh hfSz hfull hsc_sz ⊢
+      subst huninh hsc_sz
+      dsimp only []
+      have hble1 : Nat.ble 1 fSize.bytes = true := by
+        rcases hfSz with h1 | h1 | h1 | h1 | h1 <;> rw [h1] <;> rfl
+      have hbeqSz : Nat.beq fSize.bytes fSize.bytes = true := Nat.beq_refl fSize.bytes
+      rw [hble1]
+      dsimp only []
+      rw [hbeqSz]
+      dsimp only []
+      cases fRepr with
+      | memory => rfl
+      | scalarPair _ _ => rfl
+      | scalar sl =>
+        cases sl with
+        | union _ => rfl
+        | initialized prim vr =>
+          obtain ⟨hvs, hve⟩ := hfull prim vr rfl
+          have hbits_le : bits ≤ vr.end_ := by omega
+          have hse : Nat.ble vr.start vr.end_ = true := Nat.ble_eq.mpr (by omega)
+          have hsv : Nat.ble vr.start bits = true := Nat.ble_eq.mpr (by omega)
+          have hve_b : Nat.ble bits vr.end_ = true := Nat.ble_eq.mpr hbits_le
+          have hw : wrappingRangeContains vr bits = true := by
+            unfold wrappingRangeContains
+            simp [hse, hsv, hve_b]
+          have hnot_char : Nat.beq vr.end_ 0x10FFFF = false := by
+            rcases hfSz with h1 | h1 | h1 | h1 | h1
+            · rw [h1] at hve; have : vr.end_ = 255 := by simpa [scalarModulus] using hve
+              rw [this]; rfl
+            · rw [h1] at hve; have : vr.end_ = 65535 := by simpa [scalarModulus] using hve
+              rw [this]; rfl
+            · rw [h1] at hve; have : vr.end_ = 4294967295 := by simpa [scalarModulus] using hve
+              rw [this]; rfl
+            · rw [h1] at hve
+              have : vr.end_ = 18446744073709551615 := by simpa [scalarModulus] using hve
+              rw [this]; rfl
+            · rw [h1] at hve
+              have : vr.end_ = 340282366920938463463374607431768211455 := by
+                simpa [scalarModulus] using hve
+              rw [this]; rfl
+          dsimp only []
+          rw [hw]
+          simp [hvs, hnot_char]
+
+/-- A memory-backed union local `mp` whose active scalar field (of type `f0Ty`)
+holds `sc`: `mp` points at offset `0` of its own live allocation, which has `S`
 bytes, is mutable, has no provenance, Tree Borrows extra, or native buffer, has
 the union's alignment, initializes `[0, k)` and leaves `[k, S)` uninitialized
 for `k = sc.sizeBytes ≤ S` (`IsUnionPrefixMask`), and stores the little-endian

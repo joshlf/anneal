@@ -667,9 +667,12 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
         match set? locals dst.local_ (.init rootVal') with
         | some locals' =>
           let resolvedLocalProj :=
-            match resolveBorrowProjectionElems locals (proj :: rest) with
-            | some rp => rp
-            | none => proj :: rest
+            resolveBorrowWriteLocalProj
+              localDecls
+              layouts
+              locals
+              dst.local_
+              (proj :: rest)
           some (locals',
             invalidateConflictingBorrowsAtProj borrows dst.local_ .none
               resolvedLocalProj)

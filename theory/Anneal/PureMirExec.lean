@@ -1054,9 +1054,7 @@ private def evalAssignNonDeref
       match set? locals₁ dstLoc (.init rootVal') with
       | .some locals₂ =>
         let resolvedLocalProj :=
-          match resolveBorrowProjectionElems locals₁ proj with
-          | .some rp => rp
-          | .none => proj
+          resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc proj
         match mem₁.activeProtectors with
         | .nil =>
           let borrows' :=
@@ -1089,9 +1087,12 @@ private def evalAssignNonDeref
         match set? locals₁ dstLoc (.init rootVal') with
         | .some locals₂ =>
           let resolvedLocalProj :=
-            match resolveBorrowProjectionElems locals₁ proj with
-            | .some rp => rp
-            | .none => proj
+            resolveBorrowWriteLocalProj
+              localDecls
+              layouts
+              locals₁
+              dstLoc
+              proj
           match mem₁.activeProtectors with
           | .nil =>
             let borrows' :=
@@ -3794,8 +3795,10 @@ private def IsStmtNode (n : MirStepNode) : Prop :=
 
 private def copyWriteDstVal
     (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
-    (dstLoc : Local) (dstTag : Nat) (newVal : Value) : MirStepNode :=
-  match writePlaceValue locals₃ s.memory.borrows dstPlace newVal with
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value)
+    (localDecls : List LocalDecl := .nil) (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match writePlaceValue locals₃ s.memory.borrows dstPlace newVal localDecls layouts with
   | .ok locals₄ =>
     let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
     MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
@@ -3895,7 +3898,7 @@ private def copyViaBytesBody
           | _, _ => false
         match preferSplicedArray, spliceBytesToDstArray with
         | true, .some splicedVal =>
-          copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+          copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
         | _, _ =>
           match dstTargetTyOpt with
           | .some dstPt =>
@@ -3905,26 +3908,26 @@ private def copyViaBytesBody
               | true =>
                 match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
                 | .some decodedVal =>
-                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal
+                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal localDecls layouts
                 | .none =>
                   match spliceBytesToDstArray with
                   | .some splicedVal =>
-                    copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+                    copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
                   | .none => MirStepNode.fail .ub
               | false =>
                 match spliceBytesToDstArray with
                 | .some splicedVal =>
-                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
                 | .none => MirStepNode.unsupported
             | .none =>
               match spliceBytesToDstArray with
               | .some splicedVal =>
-                copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+                copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
               | .none => MirStepNode.unsupported
           | .none =>
             match spliceBytesToDstArray with
             | .some splicedVal =>
-              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
             | .none => MirStepNode.fail .ub
 
 private def evalCopyNonOverlappingPermOk
@@ -4016,7 +4019,7 @@ private def evalCopyNonOverlappingPermOk
               let copiedSlice := takeValues n (dropValues srcStart srcElems)
               let dstElems' := spliceValues copiedSlice dstStart dstElems
               copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag
-                (.aggregate 0 dstElems')
+                (.aggregate 0 dstElems') localDecls layouts
         | .ok srcSubVal, .ok dstSubVal =>
           copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
             countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
@@ -4070,19 +4073,21 @@ private theorem evalCopyNonOverlappingWithCount_eq
 private theorem copyWriteDstVal_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
-    (dstLoc : Local) (dstTag : Nat) (newVal : Value) :
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
     copyWriteDstVal (MachineState.pushBaseStack calleeBody baseStack s)
-        locals₃ dstPlace dstLoc dstTag newVal =
+        locals₃ dstPlace dstLoc dstTag newVal localDecls layouts =
       MirStepNode.pushBaseStack calleeBody baseStack
-        (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal) := by
+        (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts) := by
   unfold copyWriteDstVal
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
   repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 private theorem copyWriteDstVal_isStmtNode
     (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
-    (dstLoc : Local) (dstTag : Nat) (newVal : Value) :
-    IsStmtNode (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal) := by
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts) := by
   unfold copyWriteDstVal
   dsimp only
   repeat' (first

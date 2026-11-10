@@ -7314,9 +7314,8 @@ private theorem evalStmt_assign_projected_step_location
       (match set? locals₁ dstIdx (.init rootVal') with
        | .some locals₂ =>
          let resolvedLocalProj :=
-           match resolveBorrowProjectionElems locals₁ (.field idx₀ fty₀ :: ps) with
-           | .some rp => rp
-           | .none => .field idx₀ fty₀ :: ps
+           resolveBorrowWriteLocalProj
+             body.localDecls body.layouts locals₁ dstIdx (.field idx₀ fty₀ :: ps)
          match mem₁.activeProtectors with
          | .nil =>
            let borrows' :=

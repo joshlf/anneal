@@ -31,6 +31,7 @@ reference-aware relations `StateRelLM3_2` and `StepRelLM3_2` (`RefLM3_2`).
    same-allocation reference creation across dead, uninitialized, null/integer
    (on safe references), and live cases.
 3. **Reborrow Boundaries (`evalRvalue_reborrow_dangling_divergence`,
+   `evalRvalue_reborrow_uninit_target_divergence`,
    `evalRvalue_reborrow_safeRef_dangling_simulation`,
    `evalRvalue_reborrow_rawPtr_int_divergence`, and
    `evalRvalue_reborrow_perm_divergence`)**:
@@ -38,6 +39,10 @@ reference-aware relations `StateRelLM3_2` and `StepRelLM3_2` (`RefLM3_2`).
      `MirStepNode.fail .ub`, whereas `lean-miri` steps at reborrow time and only
      its `ValidityVisitor` and `annealSafeRefDerefCheck` reject the resulting
      dangling reference;
+   * uninitialized live-local raw-pointer reborrow (`&*_p` when `e.localIdx` is
+     `.uninit`): Anneal rejects eagerly with `MirStepNode.fail .ub`
+     (`targetRootAndDeclsOpt = none`), whereas `lean-miri` steps and creates a
+     valid reference to the live stack allocation;
    * dangling safe-reference reborrow (`&*_r` after `StorageDead`): Stage-1
      resolved this divergence; BOTH machines now report undefined behavior
      (`StepRelLM3_2.ub`, `lean-miri`: `"dereferencing a dangling reference"`);
@@ -1795,6 +1800,107 @@ theorem evalRvalue_reborrow_dangling_divergence
       simp
     rw [h0] at hck
     exact hck
+
+/-- **`evalRvalue_reborrow_uninit_target_divergence` (`LM-3.2` Stage-1
+Uninitialized-Target Reborrow Divergence)**:
+when `_p` holds a `StateRelLM3_2`-related raw pointer `.ptr ptrVal 8` whose
+target local `e.localIdx` is live but uninitialized (`get? s.frame.locals e.localIdx = some .uninit`,
+e.g. after `StorageLive(_x); _p = &raw mut _x`), and `e.perm` permits `bk`,
+reborrowing `_d = &*_p` / `_d = &mut *_p` diverges:
+1. Anneal's `stepMirFn` rejects the reborrow with `MirStepNode.fail .ub`
+   (`evalRvalueRefDeref` requires `targetRootAndDeclsOpt = some (v, ...)` with
+   `get? locals parentEntry.targetLocal = some (.init v)`); while
+2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) steps normally
+   to `(m', .ok true)` and writes a reference whose stack allocation is live and
+   dereferenceable (`annealValidityAccessCheck = .ok ()`), because safe-reference
+   creation in Miri checks allocation liveness, bounds, and alignment rather than
+   pointee byte initialization (when `T` is inhabited). -/
+theorem evalRvalue_reborrow_uninit_target_divergence
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local}
+    {dstDecl ptrDecl : LocalDecl}
+    {bk : BorrowKind} {ptrMut dstMut : Mutability} {pointeeKind dstPointee : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hno_int : ∀ sc, get? s.frame.locals ptrIdx ≠ some (.init (.scalar sc)))
+    (hzero_perm : ∀ ptrVal e,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared))
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (huninit_t : get? s.frame.locals e.localIdx = some .uninit)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {targetDecl : LocalDecl} (hdecl_t : get? body.localDecls e.localIdx = some targetDecl) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+              .concrete e.allocId borTag⟩)))) ∧
+      annealValidityAccessCheck m'.machine
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId), some (.concrete e.allocId borTag)⟩
+        (translateTy targetDecl.ty body.layouts).layout.size = .ok () := by
+  have _ := hno_int
+  obtain ⟨tf, hframes, _, _, _, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨hoff0, _, _⟩ := hzero_perm ptrVal e hslot_p he htag
+  have ha : stepMirFn body s = MirStepNode.fail .ub := by
+    have hlookup := (halloc.borrow_sync e he).2
+    rw [htag] at hlookup
+    rw [stepMirFn_eq_of_not_other body s hcal hphase]
+    simp only [hbb, hstmt]
+    unfold evalStmt evalRvalue evalRvalueRefDeref; dsimp only []
+    rw [hslot_p]; dsimp only []
+    cases Bool.and (Nat.beq 8 (layoutPointerBytes body.layouts))
+        (checkDerefAlign body.localDecls body.layouts _ ptrVal.offsetBytes)
+    · rfl
+    · dsimp only []
+      rw [hlookup]; dsimp only [AllocMapEntry.toBorrowEntry, resolveBorrowProjectionElems]
+      rw [huninit_t]
+      cases e.perm <;> cases bk <;> rfl
+  obtain ⟨m', tf', borTag, hstep, hframes', hmach, hval⟩ :=
+    miri_reborrow_rawPtr_step_ok hstate hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim
+      himm hdst_live hslot_p he htag
+  have h0_off : annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes =
+      annealStackBaseAddr e.allocId := by
+    rw [hoff0]; simp
+  rw [h0_off] at hval
+  refine ⟨ha, m', tf', borTag, hstep, hframes', hval, ?_⟩
+  rw [hmach]
+  obtain ⟨d, hd, hprim⟩ := halloc.target_decl e he
+  rw [hdecl_t] at hd
+  cases hd
+  obtain ⟨hsize, hpos, hfit, _, _, _⟩ := hprim.size_align_ok body.layouts
+  obtain ⟨hid, _, hbase⟩ := halloc.base_addr_valid e he
+  obtain ⟨_, _, hsh⟩ := (halloc.local_alloc_sync tf hframes e he).1 .uninit huninit_t (by decide)
+  obtain ⟨localAlloc, hfind, _, _, hshape⟩ := hsh targetDecl hdecl_t
+  have hinb : 0 + (translateTy targetDecl.ty body.layouts).layout.size.bytes.toNat ≤
+      localAlloc.allocation.byteSize.bytes.toNat := by
+    rw [Nat.zero_add, hshape.byteSize_eq]
+    exact Nat.le_refl _
+  have hacc := (annealValidityAccessCheck_stack m.machine e.allocId borTag 0
+    (translateTy targetDecl.ty body.layouts).layout.size hid (by decide) hbase hsize
+    (by exact_mod_cast hpos) hfit).1 localAlloc hfind hinb
+  have h0 : annealStackBaseAddr e.allocId + UInt64.ofNat 0 = annealStackBaseAddr e.allocId := by
+    simp
+  rw [h0] at hacc
+  exact hacc
 
 
 /-- **`evalRvalue_reborrow_perm_divergence` (`LM-3.2`, genuine divergence)**:

@@ -1772,9 +1772,12 @@ def finishAssignStmtNode
           match set? locals₁ dst.local_ (.init rootVal') with
           | .some locals₂ =>
             let resolvedLocalProj :=
-              match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-              | .some rp => rp
-              | .none => proj :: rest
+              resolveBorrowWriteLocalProj
+                localDecls
+                layouts
+                locals₁
+                dst.local_
+                (proj :: rest)
             match mem₁.activeProtectors with
             | .nil =>
               let borrows' :=
@@ -1815,9 +1818,12 @@ def finishAssignStmtNode
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
               let resolvedLocalProj :=
-                match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                | .some rp => rp
-                | .none => proj :: rest
+                resolveBorrowWriteLocalProj
+                  localDecls
+                  layouts
+                  locals₁
+                  dst.local_
+                  (proj :: rest)
               match mem₁.activeProtectors with
               | .nil =>
                 let borrows' :=
