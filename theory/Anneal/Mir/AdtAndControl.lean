@@ -66,14 +66,18 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `SlotBytes`, `pathRange`), `deinitFieldSlot_bytes_sim` /
      `evalDeinitPlace_nested_bytes_simulation`; the nested layouts are built from the layout
      specification (`specByteLayout`: field `i` at `resolveAdtOffsetOf spec v i`, well formed by
-     `specByteLayout_wf` for `#[repr(C)]` structs, canonical `#[repr(Rust)]` structs, and
-     explicit-tag enum variants via `reprC_struct_placed` / `reprRust_canonical_struct_placed` /
-     `taggedEnum_placed`), giving `evalDeinitPlace_spec_bytes_simulation`
-     and `evalDeinitPlace_taggedEnum_bytes_simulation` (an enum field's `Uninit` range lies inside
-     the field's `resolveAdtOffsetOf` range, after the tag, so the tag bytes and the discriminant
-     survive; `AdtDiscrSpec.CoherentWith` ties the discriminant facts to the layout): field-level
-     `Deinit` is MiniRust's byte-range `Uninit` write (closing the projected-`Deinit` gap noted at
-     `MiniRustSpec/Correspondence/Translate.lean:3742`).
+     `specByteLayout_wf` for `#[repr(C)]` structs, canonical `#[repr(Rust)]` structs,
+     explicit-tag enum variants, and univariant/no-present enum variants via
+     `reprC_struct_placed` / `reprRust_canonical_struct_placed` / `taggedEnum_placed` /
+     `univariantEnum_present_reprRust_placed` / `univariantEnum_absent_placed` /
+     `noPresentEnum_placed`), giving `evalDeinitPlace_spec_bytes_simulation`,
+     `evalDeinitPlace_taggedEnum_bytes_simulation`, and
+     `evalDeinitPlace_univariantEnum_bytes_simulation` (plus active/inactive `Downcast` variant
+     enforcement `evalDeinitPlace_downcast_inactive_variant_none` /
+     `evalDeinitPlace_downcast_active_variant_eq` and overlapping union byte simulation
+     `union_deinit_bytes_simulation`; `AdtDiscrSpec.CoherentWith` ties the discriminant facts to
+     the layout): field-level `Deinit` is MiniRust's byte-range `Uninit` write (closing the
+     projected-`Deinit` gap noted at `MiniRustSpec/Correspondence/Translate.lean:3742`).
    - Step refinement against Trusted's `evalStmt` on `.deinit` under the `SlotBelow` frame
      relation (Anneal knows less than Trusted; every Anneal read is a Trusted read:
      `readPlaceState_below_refines`), and the documented divergence on projected `Deinit`
@@ -88,7 +92,10 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      does (`copyWholeLocal_spec`); dead-local provenance rejected when the byte length is non-zero
      or `count = 1`; same-local non-ZST copies rejected as overlapping; zero-sized copies that are
      not whole-local copies, e.g. through out-of-frame provenance, are no-ops; whole-local copies
-     copy the source state verbatim, including `.uninit`), `evalShallowInitBox`,
+     copy the source state verbatim, including `.uninit`, with read-after-copy and frame laws
+     `evalCopyNonOverlappingState_read_dst_bare` / `evalCopyNonOverlappingState_read_other_bare`
+     and refinement against Trusted's `evalCopySingleDirect` in
+     `evalCopySingleDirect_whole_local_refines`), `evalShallowInitBox`,
      `evalWrapUnsafeBinder`, and `evalPointerCoercion` with their soundness/preservation
      theorems, and refinement of Trusted's `evalRvalue` for `Discriminant`
      (`evalAdtDiscriminant_refines_evalRvalue`) and identity `WrapUnsafeBinder`, with the
@@ -109,11 +116,14 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `runLoweredCfgSteps_with_stmts_refines_trusted` under `BodyCorrWithStmts`) against
      Trusted's `evalTerminator` / `stepMirFn` / `stepMirState` (Trusted never faults where Anneal
      succeeds), plus the projected-`Drop` refinement and the documented bare-`Drop` divergence.
-   - The frame part of `check_place_access` for `Drop` places and `Call` destinations is concrete
-     (`placeFrameAccessOk`: a live root local and initialized `Index` operand locals), so a `Drop`
-     of a dead local faults in both semantics (`evalLoweredTerminator_drop_dead_agrees_trusted`)
-     and a successful `Drop` names a local Trusted also holds live
-     (`evalLoweredTerminator_drop_trusted_live`).
+   - Both the frame part (`placeFrameAccessOk`: a live root local and initialized `Index` operand
+     locals) and the projection-walk part (`slotProjectionAccessOk` / `typedPlaceProjectionOk`:
+     non-`Deref`, active-variant `Downcast`, in-bounds `Field`, initialized `Index` / `ConstantIndex`
+     / `Subslice`, connected to `deinitFieldSlot` / `evalDeinitPlace` via
+     `typedPlaceProjectionOk_of_evalDeinitPlace`) of `check_place_access` for `Drop` places and
+     `Call` destinations are concrete, so a `Drop` of a dead local faults in both semantics
+     (`evalLoweredTerminator_drop_dead_agrees_trusted`) and a successful `Drop` names a local
+     Trusted also holds live (`evalLoweredTerminator_drop_trusted_live`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -4299,6 +4309,216 @@ theorem evalDeinitPlace_taggedEnum_bytes_simulation
   refine ⟨hLWF, hRTW, ⟨o, fs[f], hO, hfl, hTagLe, by omega, by rw [← hlSize]; omega, hBound⟩,
     sh, hSh, hBytes, hSet, hDisc, fun k hk => hOut k (by omega), hOut⟩
 
+/-- **Inactive `Downcast` variant fails closed (`evalDeinitPlace_downcast_inactive_variant_none`)**:
+deinitializing `.downcast nm dv :: .field f ty :: rest` on an initialized aggregate of variant `v`
+or a partial shell narrowed to variant `v` fails (`none`, `InactiveVariantProjection`) whenever
+`dv ≠ v`. -/
+theorem evalDeinitPlace_downcast_inactive_variant_none (ts : Bool) (slots : List LocalSlotState)
+    (loc : Local) {v dv f : Nat} (nm : Option String) (ty : Ty) (rest : List ProjectionElem)
+    (hNe : v ≠ dv) :
+    (∀ vals, slots[loc]? = some (.init (.aggregate v vals)) →
+      evalDeinitPlace ts slots ⟨loc, .downcast nm dv :: .field f ty :: rest⟩ = none) ∧
+    (∀ sh, slots[loc]? = some (.partialShell sh) → shellVariant sh = v →
+      evalDeinitPlace ts slots ⟨loc, .downcast nm dv :: .field f ty :: rest⟩ = none) := by
+  refine ⟨fun vals hRoot => ?_, fun sh hRoot hVar => ?_⟩
+  · simp [evalDeinitPlace, hRoot, slotStateToFieldSlot, deinitFieldSlot, deinitShellStep,
+      explodeAggregate, shellVariant, hNe]
+  · obtain ⟨var, adt, disc, fs⟩ := sh
+    simp [evalDeinitPlace, hRoot, slotStateToFieldSlot, PartialAggregate.toFieldSlot,
+      deinitFieldSlot, deinitShellStep, hVar, hNe]
+
+/-- A successful `evalDeinitPlace` through `.downcast nm dv :: .field f ty :: rest` on an
+initialized aggregate `.init (.aggregate v vals)` forces `dv = v` (`pathRange` may ignore `dv`
+because `evalDeinitPlace` enforces `dv = v`). -/
+theorem evalDeinitPlace_downcast_active_variant_eq {ts : Bool} {slots slots' : List LocalSlotState}
+    {loc : Local} {v dv f : Nat} {vals : List Value} {nm : Option String} {ty : Ty}
+    {rest : List ProjectionElem} (hRoot : slots[loc]? = some (.init (.aggregate v vals)))
+    (h : evalDeinitPlace ts slots ⟨loc, .downcast nm dv :: .field f ty :: rest⟩ = some slots') :
+    dv = v := by
+  by_cases hEq : dv = v
+  · exact hEq
+  · have hNe : v ≠ dv := Ne.symm hEq
+    simp [evalDeinitPlace, hRoot, slotStateToFieldSlot, deinitFieldSlot, deinitShellStep,
+      explodeAggregate, shellVariant, hNe] at h
+
+/-- **Univariant tagless enum present-variant placement (`univariantEnum_present_reprRust_placed`)**:
+for a canonical padding-free `#[repr(Rust)]` univariant enum (`spec.shape = .univariantEnum present vs`),
+the present variant `present` satisfies `SpecFieldsPlaced spec present fs`. -/
+theorem univariantEnum_present_reprRust_placed {spec : AdtLayoutSpec} {present : Nat}
+    {vs : List (List FieldLayout)} {fs : List FieldLayout}
+    (hShape : spec.shape = .univariantEnum present vs) (hRepr : spec.repr = .rust)
+    (hV : vs[present]? = some fs) (hCanon : spec.rustOrderCanonical = true)
+    (hPad : paddingFree 0 fs = true) : SpecFieldsPlaced spec present fs where
+  defined i hi := by
+    have hOff : resolveAdtOffsetOf spec present i = rustOffset? 0 fs i := by
+      simp [resolveAdtOffsetOf, adtLayout?, hShape, hV, hRepr, structLayout?, structFieldOffset?,
+        hCanon, hPad]
+    rw [hOff]
+    exact rustOffset?_isSome 0 fs i hi
+  disjoint i j oi oj fi fj hNe hoi hoj hfi hfj := by
+    have hOff : ∀ k, resolveAdtOffsetOf spec present k = rustOffset? 0 fs k := fun k => by
+      simp [resolveAdtOffsetOf, adtLayout?, hShape, hV, hRepr, structLayout?, structFieldOffset?,
+        hCanon, hPad]
+    rw [hOff i] at hoi
+    rw [hOff j] at hoj
+    rcases Nat.lt_or_gt_of_ne hNe with hlt | hgt
+    · obtain ⟨fi', hfi', hle⟩ := rustOffset?_monotone 0 fs i j oi oj hlt hoi hoj
+      rw [hfi] at hfi'; cases hfi'; exact Or.inl hle
+    · obtain ⟨fj', hfj', hle⟩ := rustOffset?_monotone 0 fs j i oj oi hgt hoj hoi
+      rw [hfj] at hfj'; cases hfj'; exact Or.inr hle
+
+/-- **Univariant tagless enum absent-variant placement (`univariantEnum_absent_placed`)**:
+every absent variant `v ≠ present` of a well-formed univariant enum with an exact layout has all
+1-ZST fields (`size = 0`) at offset `0` and satisfies `SpecFieldsPlaced spec v fs`. -/
+theorem univariantEnum_absent_placed {spec : AdtLayoutSpec} (hWF : spec.WF) {present v : Nat}
+    {vs : List (List FieldLayout)} {fs : List FieldLayout} {size align : Nat}
+    (hShape : spec.shape = .univariantEnum present vs)
+    (hLay : adtLayout? spec = some (size, align))
+    (hV : vs[v]? = some fs) (hNe : v ≠ present) : SpecFieldsPlaced spec v fs where
+  defined i hi := ⟨0, by simp [resolveAdtOffsetOf, hLay, hShape, hV, hNe, absentFieldOffset?, hi]⟩
+  disjoint i j oi oj fi fj _ hoi hoj hfi _ := by
+    have hZero : fi.size = 0 :=
+      hWF.absentZeroSized present vs hShape v fs hV hNe fi (getElem?_mem hfi)
+    have hOi : oi = 0 := by
+      simp only [resolveAdtOffsetOf, hLay, hShape, hV, hNe, ↓reduceIte, absentFieldOffset?] at hoi
+      split at hoi
+      · exact (Option.some.inj hoi).symm
+      · nomatch hoi
+    have hOj : oj = 0 := by
+      simp only [resolveAdtOffsetOf, hLay, hShape, hV, hNe, ↓reduceIte, absentFieldOffset?] at hoj
+      split at hoj
+      · exact (Option.some.inj hoj).symm
+      · nomatch hoj
+    exact Or.inl (by omega)
+
+/-- **All-absent enum placement (`noPresentEnum_placed`)**: every variant of a well-formed
+`noPresentEnum` with an exact layout has all 1-ZST fields (`size = 0`) at offset `0` and satisfies
+`SpecFieldsPlaced spec v fs`. -/
+theorem noPresentEnum_placed {spec : AdtLayoutSpec} (hWF : spec.WF) {v : Nat}
+    {vs : List (List FieldLayout)} {fs : List FieldLayout} {size align : Nat}
+    (hShape : spec.shape = .noPresentEnum vs)
+    (hLay : adtLayout? spec = some (size, align))
+    (hV : vs[v]? = some fs) : SpecFieldsPlaced spec v fs where
+  defined i hi := ⟨0, by simp [resolveAdtOffsetOf, hLay, hShape, hV, absentFieldOffset?, hi]⟩
+  disjoint i j oi oj fi fj _ hoi hoj hfi _ := by
+    have hZero : fi.size = 0 :=
+      hWF.noPresentZeroSized vs hShape fs (getElem?_mem hV) fi (getElem?_mem hfi)
+    have hOi : oi = 0 := by
+      simp only [resolveAdtOffsetOf, hLay, hShape, hV, absentFieldOffset?] at hoi
+      split at hoi
+      · exact (Option.some.inj hoi).symm
+      · nomatch hoi
+    have hOj : oj = 0 := by
+      simp only [resolveAdtOffsetOf, hLay, hShape, hV, absentFieldOffset?] at hoj
+      split at hoj
+      · exact (Option.some.inj hoj).symm
+      · nomatch hoj
+    exact Or.inl (by omega)
+
+/-- **Univariant tagless enum byte simulation (`evalDeinitPlace_univariantEnum_bytes_simulation`)**:
+for the present variant `present` of a canonical padding-free `#[repr(Rust)]` univariant enum
+(`spec.shape = .univariantEnum present vs`) with coherent discriminant facts `dspec`, `Deinit` of
+`Downcast(dv).f.rest` on an initialized local holding variant `present` forces `dv = present`,
+writes `Uninit` over `[off, off + len)` inside field `f`, leaves all other bytes unchanged, and
+preserves `evalAdtDiscriminant` (`dspec.requiresTagWrite = false`). -/
+theorem evalDeinitPlace_univariantEnum_bytes_simulation
+    {slots slots' : List LocalSlotState} {loc : Local} {present dv f : Nat} {vals : List Value}
+    {nm : Option String} {ty : Ty} {rest : List ProjectionElem}
+    {spec : AdtLayoutSpec} (hWF : spec.WF) {vs : List (List FieldLayout)}
+    (hShape : spec.shape = .univariantEnum present vs) (hRepr : spec.repr = .rust)
+    {fs : List FieldLayout} (hV : vs[present]? = some fs)
+    (hCanon : spec.rustOrderCanonical = true) (hPad : paddingFree 0 fs = true)
+    {children : List ByteLayout} (hCh : ChildrenFit fs children)
+    (dspec : AdtDiscrSpec) (hCoh : dspec.CoherentWith spec)
+    (wf : Value → Bool) (enc : Value → List UInt8) (img : ByteImage) {lay : ByteLayout}
+    (hLay : specByteLayout spec present children = some lay)
+    (hRoot : slots[loc]? = some (.init (.aggregate present vals)))
+    (h : evalDeinitPlace spec.tagSurvivesFieldDeinit slots
+      ⟨loc, .downcast nm dv :: .field f ty :: rest⟩ = some slots')
+    (hFits : lay.size ≤ img.length) (hS : SlotBytes enc img lay 0 (.init (.aggregate present vals)))
+    {off len : Nat}
+    (hRange : pathRange lay 0 (.downcast nm dv :: .field f ty :: rest) = some (off, len)) :
+    dv = present ∧ lay.WF ∧ dspec.requiresTagWrite = false ∧
+    ∃ sh, slots'[loc]? = some (.partialShell sh) ∧
+      SlotBytes enc (deinitBytes img off len) lay 0 sh.toFieldSlot ∧
+      evalAdtDiscriminant dspec wf (.partialShell sh) =
+        evalAdtDiscriminant dspec wf (.init (.aggregate present vals)) ∧
+      ∀ i, ¬ (off ≤ i ∧ i < off + len) → (deinitBytes img off len)[i]? = img[i]? := by
+  have hDv : present = dv := (evalDeinitPlace_downcast_active_variant_eq hRoot h).symm
+  subst hDv
+  have hTS : spec.tagSurvivesFieldDeinit = true := by
+    simp [AdtLayoutSpec.tagSurvivesFieldDeinit, hShape]
+  have hRTW : dspec.requiresTagWrite = false := by
+    rw [hCoh.requiresTagWrite_eq]
+    simp [AdtLayoutSpec.requiresTagWrite, hShape]
+  have hApart : dspec.tagSurvivesFieldDeinit = true := by rw [hCoh.tagSurvives_eq, hTS]
+  rw [hTS] at h
+  have hL : adtLayout? spec = some
+      (PlaceAndRvalue.alignUp (sumSizes fs) (maxAlign (spec.reprAlign.getD 1) fs),
+        maxAlign (spec.reprAlign.getD 1) fs) := by
+    simp [adtLayout?, hShape, hV, hRepr, structLayout?]
+  have hVF : variantFields spec present = some fs := by simp [variantFields, hShape, hV]
+  have hPl := univariantEnum_present_reprRust_placed hShape hRepr hV hCanon hPad
+  obtain ⟨hEq, hLWF⟩ := specByteLayout_wf hWF hL hVF hPl hCh
+  rw [hEq] at hLay
+  cases hLay
+  obtain ⟨sh, hSh, _, _, hDisc⟩ :=
+    evalDeinitPlace_enum_field_preserves_discriminant dspec wf hApart hRoot h
+  obtain ⟨st', hSt', hBytes, hOut⟩ := evalDeinitPlace_nested_bytes_simulation enc _ img
+    (place := ⟨loc, .downcast nm present :: .field f ty :: rest⟩) hRoot h (Or.inl rfl) hLWF hFits
+    hS hRange
+  have hSt'' : slots'[loc]? = some st' := hSt'
+  rw [hSh] at hSt''
+  cases hSt''
+  exact ⟨rfl, hLWF, hRTW, sh, hSh, hBytes, hDisc, hOut⟩
+
+/-- **Union overlapping byte representation (`UnionFieldBytes`)**: in a union (`spec.shape = .union fs`),
+every field `f` sits at byte offset `0` (`resolveAdtOffsetOf_union_eq_zero`), so field `f`'s
+slot is represented by `[0, fl.size)`. -/
+def UnionFieldBytes (enc : Value → List UInt8) (img : ByteImage) (fl : FieldLayout)
+    (slot : FieldSlot) : Prop :=
+  FieldBytes enc img 0 fl.size slot
+
+/-- **Union field `Deinit` byte simulation (`union_deinit_bytes_simulation`)**: for a well-formed
+union (`spec.shape = .union fs`) with layout `(size, align)` and field `fs[f]? = some fl`, field
+`f` sits at offset `0` (`fl.size ≤ size`), and writing `Uninit` over `[0, fl.size)`
+(`deinitBytes img 0 fl.size`):
+1. leaves field `f` represented as `.uninit` (`UnionFieldBytes enc (deinitBytes img 0 fl.size) fl .uninit`),
+2. invalidates any overlapping non-zero-sized initialized sibling field `g` at offset `0`
+   (`¬ UnionFieldBytes enc (deinitBytes img 0 fl.size) fg (.init w)` when `0 < fl.size ∧ 0 < fg.size`), and
+3. preserves all trailing bytes `[fl.size, img.length)` beyond `fl.size`. -/
+theorem union_deinit_bytes_simulation {spec : AdtLayoutSpec} (hWF : spec.WF)
+    {fs : List FieldLayout} (hShape : spec.shape = .union fs)
+    {f : Nat} {fl : FieldLayout} (hfl : fs[f]? = some fl)
+    {size align : Nat} (hLay : adtLayout? spec = some (size, align))
+    (enc : Value → List UInt8) (img : ByteImage) (hFits : size ≤ img.length) :
+    resolveAdtOffsetOf spec 0 f = some 0 ∧
+    fl.size ≤ size ∧
+    UnionFieldBytes enc (deinitBytes img 0 fl.size) fl .uninit ∧
+    (∀ (fg : FieldLayout) (w : Value), 0 < fl.size → 0 < fg.size →
+      ¬ UnionFieldBytes enc (deinitBytes img 0 fl.size) fg (.init w)) ∧
+    (∀ i, fl.size ≤ i → (deinitBytes img 0 fl.size)[i]? = img[i]?) := by
+  have hLt : f < fs.length := (List.getElem?_eq_some_iff.mp hfl).1
+  have hOff : resolveAdtOffsetOf spec 0 f = some 0 := by
+    simp [resolveAdtOffsetOf, hLay, hShape, hLt]
+  obtain ⟨fs', fl', size', align', hVF, hFl', hL', hBound, _⟩ :=
+    resolveAdtOffsetOf_bounds_and_align spec hWF hOff
+  have hVF0 : variantFields spec 0 = some fs := by simp [variantFields, hShape]
+  rw [hVF0] at hVF; cases hVF
+  rw [hfl] at hFl'; cases hFl'
+  rw [hLay] at hL'; simp only [Option.some.injEq, Prod.mk.injEq] at hL'; obtain ⟨rfl, rfl⟩ := hL'
+  refine ⟨hOff, by omega, ?_, ?_, fun i hi => deinitBytes_getElem?_outside (by omega)⟩
+  · intro k hk
+    simpa using deinitBytes_getElem?_inside (off := 0) (len := fl.size) (i := k)
+      ⟨Nat.zero_le k, by omega⟩ (by omega)
+  · intro fg w hFlPos hFgPos hInit
+    have h0 := hInit.2 0 hFgPos
+    have hUninit := deinitBytes_getElem?_inside (img := img) (off := 0) (len := fl.size) (i := 0)
+      ⟨Nat.le_refl 0, by omega⟩ (by omega)
+    simp only [Nat.zero_add] at h0
+    rw [hUninit] at h0
+    cases hE : (enc w)[0]? <;> rw [hE] at h0 <;> nomatch h0
+
 /-! ### Section 2f: `Retag` -/
 
 /-- What `check_retagged_reference` needs to know about a reference's pointee type: its
@@ -5202,6 +5422,160 @@ theorem evalCopyNonOverlappingState_whole_local_below {slots : List LocalSlotSta
     cases hSrc
     cases hTSrc
     exact SlotsRefine.set hAT dstLoc hRel
+
+/-- **Read-After-Copy on bare destination local (`evalCopyNonOverlappingState_read_dst_bare`)**:
+after a successful whole-local `evalCopyNonOverlappingState` copying `sl` to `dl`, reading the
+bare destination local `⟨dl, []⟩` in the updated frame yields the exact same `ProjReadResult` as
+reading the bare source local `⟨sl, []⟩` in the pre-state (whether `.ok v` or `.ub`). -/
+theorem evalCopyNonOverlappingState_read_dst_bare {ptrBits : Nat} {env : CopyEnv}
+    {slots slots' : List LocalSlotState} {src dst : CopyPtr} {elemSize elemAlign sl dl : Nat}
+    {st : LocalSlotState}
+    (hChk : copyNonOverlappingChecks ptrBits src dst 1 elemSize elemAlign = true)
+    (hSrc : copyWholeLocal env slots src = some sl)
+    (hDst : copyWholeLocal env slots dst = some dl)
+    (hLive : copyTargetDead env slots src = false ∧ copyTargetDead env slots dst = false)
+    (hDistinct : elemSize ≠ 0 ∨ sl ≠ dl) (hSt : slots[sl]? = some st)
+    (hEval : evalCopyNonOverlappingState ptrBits env slots src dst 1 elemSize elemAlign =
+      some slots') :
+    readPlaceState slots' ⟨dl, []⟩ = readPlaceState slots ⟨sl, []⟩ := by
+  have hEq := evalCopyNonOverlappingState_whole_local_copies_slot hChk hSrc hDst hLive hDistinct hSt
+  rw [hEq] at hEval
+  injection hEval with hSlots
+  subst hSlots
+  have hDlLt : dl < slots.length := (copyWholeLocal_spec hDst).1
+  have hGetDl : (slots.set dl st)[dl]? = some st := List.getElem?_set_self hDlLt
+  unfold readPlaceState
+  simp only [projectionHasDeref, get?_eq_getElem?, hGetDl, hSt]
+  cases st <;> rfl
+
+/-- **Other-Local Frame of whole-local `CopyNonOverlapping`
+(`evalCopyNonOverlappingState_read_other_bare`)**: after a successful whole-local copy from `sl`
+to `dl`, reading any other bare local `⟨loc', []⟩` (`loc' ≠ dl`) is unchanged. -/
+theorem evalCopyNonOverlappingState_read_other_bare {ptrBits : Nat} {env : CopyEnv}
+    {slots slots' : List LocalSlotState} {src dst : CopyPtr} {elemSize elemAlign sl dl : Nat}
+    {st : LocalSlotState} {loc' : Local} (hNe : loc' ≠ dl)
+    (hChk : copyNonOverlappingChecks ptrBits src dst 1 elemSize elemAlign = true)
+    (hSrc : copyWholeLocal env slots src = some sl)
+    (hDst : copyWholeLocal env slots dst = some dl)
+    (hLive : copyTargetDead env slots src = false ∧ copyTargetDead env slots dst = false)
+    (hDistinct : elemSize ≠ 0 ∨ sl ≠ dl) (hSt : slots[sl]? = some st)
+    (hEval : evalCopyNonOverlappingState ptrBits env slots src dst 1 elemSize elemAlign =
+      some slots') :
+    readPlaceState slots' ⟨loc', []⟩ = readPlaceState slots ⟨loc', []⟩ := by
+  have hEq := evalCopyNonOverlappingState_whole_local_copies_slot hChk hSrc hDst hLive hDistinct hSt
+  rw [hEq] at hEval
+  injection hEval with hSlots
+  subst hSlots
+  unfold readPlaceState
+  simp only [projectionHasDeref, get?_eq_getElem?, List.getElem?_set_ne (Ne.symm hNe)]
+  cases slots[loc']? with
+  | none => rfl
+  | some s => cases s <;> rfl
+
+/-- **Trusted's `evalCopySingleDirect` rejects same-local whole-local copies (`B3`)**: when `src`
+and `dst` resolve to the root of the same local (`srcEntry.targetLocal = dstEntry.targetLocal` and
+both target projections are `[]`), `evalCopySingleDirect` faults with `.fail .ub` (matching
+Anneal's `evalCopyNonOverlappingState_same_local_non_zst_none`). -/
+theorem evalCopySingleDirect_same_local_ub (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (locals₃ : List LocalSlot)
+    (hSameLoc : srcEntry.targetLocal = dstEntry.targetLocal)
+    (hSrcNil : srcEntry.targetProjection = []) (hDstNil : dstEntry.targetProjection = []) :
+    evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
+      .fail .ub := by
+  unfold evalCopySingleDirect
+  rcases beq_cases srcPtr.tag dstPtr.tag with ⟨hBTag, _⟩ | ⟨hBTag, _⟩
+  · simp [hBTag]
+  · have hOv : projectionsOverlap [] [] = true := rfl
+    simp [hSameLoc, hSrcNil, hDstNil, hBTag, hOv]
+
+/-- **Trusted's `evalCopySingleDirect` faults when the source local is dead or uninitialized**:
+matching Anneal's `DeadLocal` check and uninitialized-read UB on typed values. -/
+theorem evalCopySingleDirect_dead_or_uninit_src_ub (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry) (locals₃ : List LocalSlot)
+    (hSrc : locals₃[srcEntry.targetLocal]? = some .dead ∨
+      locals₃[srcEntry.targetLocal]? = some .uninit) :
+    evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
+      .fail .ub := by
+  unfold evalCopySingleDirect
+  rcases hSrc with hD | hU
+  · simp only [get?_eq_getElem?, hD]
+    split <;> rfl
+  · simp only [get?_eq_getElem?, hU]
+    split <;> rfl
+
+/-- **Whole-local `count = 1` `CopyNonOverlapping` refines Trusted's `evalCopySingleDirect`**:
+on below-related frames (`SlotsRefine SlotBelow slots locals₃`), when Anneal's
+`evalCopyNonOverlappingState` copies an initialized whole local `sl` (`slots[sl]? = some (.init v)`)
+into a distinct whole local `dl` (`sl ≠ dl`) whose slot is live (`slots[dl]? = some dstSt`,
+`dstSt ≠ .dead`), Trusted's `evalCopySingleDirect` (with distinct borrow tags on root places
+`⟨sl, []⟩` and `⟨dl, []⟩`, untyped pointees, and an empty borrow stack) steps to `advanceStmt`
+with `locals₃.set dl (.init v)`, and the updated frames stay related by `SlotsRefine SlotBelow`. -/
+theorem evalCopySingleDirect_whole_local_refines {ptrBits : Nat} {env : CopyEnv}
+    {slots slots' : List LocalSlotState} {locals₃ : List LocalSlot}
+    {src dst : CopyPtr} {elemSize elemAlign sl dl : Nat} {v : Value} {dstSt : LocalSlotState}
+    (hRel : SlotsRefine SlotBelow slots locals₃)
+    (hChk : copyNonOverlappingChecks ptrBits src dst 1 elemSize elemAlign = true)
+    (hSrcW : copyWholeLocal env slots src = some sl)
+    (hDstW : copyWholeLocal env slots dst = some dl)
+    (hLive : copyTargetDead env slots src = false ∧ copyTargetDead env slots dst = false)
+    (hNe : sl ≠ dl)
+    (hSrcInit : slots[sl]? = some (.init v))
+    (hDstLive : slots[dl]? = some dstSt) (hDstNotDead : dstSt ≠ .dead)
+    (hEval : evalCopyNonOverlappingState ptrBits env slots src dst 1 elemSize elemAlign =
+      some slots')
+    (s : MachineState) (srcOp dstOp : Operand) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (hTagNe : srcPtr.tag ≠ dstPtr.tag)
+    (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = [])
+    (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = [])
+    (hUntyped : operandPointeeTy localDecls layouts srcOp = none)
+    (hNoBorrows : s.memory.borrows = []) :
+    evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
+        .step (advanceStmt s (locals₃.set dl (.init v)) { s.memory with borrows := [] }) ∧
+      SlotsRefine SlotBelow slots' (locals₃.set dl (.init v)) := by
+  have hEq := evalCopyNonOverlappingState_whole_local_copies_slot hChk hSrcW hDstW hLive
+    (Or.inr hNe) hSrcInit
+  rw [hEq] at hEval
+  injection hEval with hSlots
+  subst hSlots
+  have hTSrc : locals₃[sl]? = some (.init v) := by
+    rcases SlotsRefine.get?_rel sl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+    · simp only [get?_eq_getElem?] at hA; rw [hA] at hSrcInit; nomatch hSrcInit
+    · simp only [get?_eq_getElem?] at hA hT
+      rw [hA] at hSrcInit; cases hSrcInit
+      cases t with
+      | init w => have hvw : v = w := hAT; subst hvw; exact hT
+      | _ => simp [SlotBelow] at hAT
+  have hTDst : ∃ tDst, locals₃[dl]? = some tDst ∧ tDst ≠ .dead := by
+    rcases SlotsRefine.get?_rel dl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+    · simp only [get?_eq_getElem?] at hA; rw [hA] at hDstLive; nomatch hDstLive
+    · simp only [get?_eq_getElem?] at hA hT
+      rw [hA] at hDstLive; cases hDstLive
+      refine ⟨t, hT, fun hTD => ?_⟩
+      subst hTD
+      cases dstSt with
+      | dead => exact hDstNotDead rfl
+      | _ => simp [SlotBelow] at hAT
+  obtain ⟨tDst, hTDstSlot, hTDstNotDead⟩ := hTDst
+  have hDlLt : dl < locals₃.length := (List.getElem?_eq_some_iff.mp hTDstSlot).1
+  refine ⟨?_, evalCopyNonOverlappingState_whole_local_below hRel hSrcInit hTSrc⟩
+  unfold evalCopySingleDirect
+  rcases beq_cases srcPtr.tag dstPtr.tag with ⟨_, hEqTag⟩ | ⟨hBTag, _⟩
+  · exact absurd hEqTag hTagNe
+  · rcases beq_cases sl dl with ⟨_, hEqLoc⟩ | ⟨hBLoc, _⟩
+    · exact absurd hEqLoc hNe
+    · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
+        get?_eq_getElem?, hTSrc, readProjectedValue, hUntyped, writePlaceValue, hNoBorrows,
+        hTDstSlot]
+      cases tDst with
+      | dead => exact absurd rfl hTDstNotDead
+      | uninit =>
+        simp [set?_eq_some_iff.mpr ⟨hDlLt, rfl⟩, invalidateConflictingBorrows]
+      | init _ =>
+        simp [set?_eq_some_iff.mpr ⟨hDlLt, rfl⟩, invalidateConflictingBorrows]
 
 /-! ### Section 2h: `ShallowInitBox`, `WrapUnsafeBinder`, and `PointerCoercion` -/
 
@@ -6524,6 +6898,166 @@ theorem placeFrameAccessOk_index {slots : List LocalSlotState} {place : Place}
   · rename_i sc hSc
     exact ⟨sc, hSc⟩
   · nomatch hI
+
+/-- Concrete projection-walk check (`prepare_place_access` / `validate_projection_tail` in
+`rvalue.rs`) over a `FieldSlot`:
+- empty projection `[]` always succeeds;
+- below `.uninit`, validates the remaining tail with `deinitTailOk` (no `Deref`, `Downcast`
+  followed by `Field`, `Index` scalar local, static `ConstantIndex`/`Subslice` bounds);
+- on an initialized aggregate `.init (.aggregate var vals)` or partial shell
+  `.nested var adt disc fs`, validates active-variant matching (`var = 0` for `Field`, `var = v`
+  for `Downcast(v)` + `Field`), field bounds (`idx < length`), and recurses into the child slot. -/
+def slotProjectionAccessOk (locals : List LocalSlot) :
+    FieldSlot → List ProjectionElem → Bool
+  | _, [] => true
+  | .uninit, p :: rest => deinitTailOk locals (p :: rest)
+  | .init (.aggregate var vals), .field idx _ :: rest =>
+    (var == 0) &&
+      match vals[idx]? with
+      | some fv => slotProjectionAccessOk locals (.init fv) rest
+      | none => false
+  | .init (.aggregate var vals), .downcast _ v :: .field idx _ :: rest =>
+    (var == v) &&
+      match vals[idx]? with
+      | some fv => slotProjectionAccessOk locals (.init fv) rest
+      | none => false
+  | .nested var adt disc fs, .field idx _ :: rest =>
+    (shellVariant ⟨var, adt, disc, fs⟩ == 0) &&
+      match fs[idx]? with
+      | some c => slotProjectionAccessOk locals c rest
+      | none => false
+  | .nested var adt disc fs, .downcast _ v :: .field idx _ :: rest =>
+    (shellVariant ⟨var, adt, disc, fs⟩ == v) &&
+      match fs[idx]? with
+      | some c => slotProjectionAccessOk locals c rest
+      | none => false
+  | _, _ :: _ => false
+
+/-- Concrete `check_place_access` (`typedPlaceProjectionOk`): the root local is live and its root
+slot satisfies `slotProjectionAccessOk` along `place.projection` (`B1` active-variant, field-bounds,
+and tail checks for `Drop`, `Call`, `Retag`, and `Discriminant`). -/
+def typedPlaceProjectionOk (slots : List LocalSlotState) (place : Place) : Bool :=
+  match slots[place.local_]? with
+  | none | some .dead => false
+  | some st =>
+    slotProjectionAccessOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) place.projection
+
+/-- `slotProjectionAccessOk` paths contain no `Deref`. -/
+theorem slotProjectionAccessOk_noDeref (locals : List LocalSlot) (slot : FieldSlot)
+    (p : List ProjectionElem) (h : slotProjectionAccessOk locals slot p = true) :
+    projectionHasDeref p = false := by
+  fun_induction slotProjectionAccessOk locals slot p with
+  | case1 => rfl
+  | case2 p rest => exact deinitTailOk_noDeref locals (p :: rest) h
+  | case3 var vals idx ty rest ih =>
+    simp only [Bool.and_eq_true] at h
+    split at h
+    · rename_i fv _
+      simpa [projectionHasDeref] using ih fv h.2
+    · nomatch h.2
+  | case4 var vals nm v idx ty rest ih =>
+    simp only [Bool.and_eq_true] at h
+    split at h
+    · rename_i fv _
+      simpa [projectionHasDeref] using ih fv h.2
+    · nomatch h.2
+  | case5 var adt disc fs idx ty rest ih =>
+    simp only [Bool.and_eq_true] at h
+    split at h
+    · rename_i c _
+      simpa [projectionHasDeref] using ih c h.2
+    · nomatch h.2
+  | case6 var adt disc fs nm v idx ty rest ih =>
+    simp only [Bool.and_eq_true] at h
+    split at h
+    · rename_i c _
+      simpa [projectionHasDeref] using ih c h.2
+    · nomatch h.2
+  | case7 => nomatch h
+
+/-- **Concrete `typedPlaceProjectionOk` rejects `Deref` (`UnsupportedPlaceProjection`)**. -/
+theorem typedPlaceProjectionOk_noDeref {slots : List LocalSlotState} {place : Place}
+    (h : typedPlaceProjectionOk slots place = true) :
+    projectionHasDeref place.projection = false := by
+  unfold typedPlaceProjectionOk at h
+  split at h
+  · nomatch h
+  · nomatch h
+  · exact slotProjectionAccessOk_noDeref _ _ _ h
+
+/-- **Concrete `typedPlaceProjectionOk` rejects inactive `Downcast` variants (`B1`)**:
+projecting `.downcast nm dv :: .field idx ty :: rest` on an initialized aggregate of variant `v`
+or a partial shell narrowed to variant `v` with `v ≠ dv` fails (`false`,
+`InactiveVariantProjection`). -/
+theorem typedPlaceProjectionOk_inactive_variant_false (slots : List LocalSlotState) (loc : Local)
+    {v dv idx : Nat} (nm : Option String) (ty : Ty) (rest : List ProjectionElem) (hNe : v ≠ dv) :
+    (∀ vals, slots[loc]? = some (.init (.aggregate v vals)) →
+      typedPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) ∧
+    (∀ sh, slots[loc]? = some (.partialShell sh) → shellVariant sh = v →
+      typedPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) := by
+  refine ⟨fun vals hRoot => ?_, fun sh hRoot hVar => ?_⟩
+  · simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNe]
+  · obtain ⟨var, adt, disc, fs⟩ := sh
+    simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, PartialAggregate.toFieldSlot,
+      slotProjectionAccessOk, hVar, hNe]
+
+/-- **Concrete `typedPlaceProjectionOk` rejects out-of-bounds `Field` projections (`B1`)**. -/
+theorem typedPlaceProjectionOk_field_oob_false (slots : List LocalSlotState) (loc : Local)
+    {vals : List Value} {idx : Nat} (ty : Ty) (rest : List ProjectionElem)
+    (hRoot : slots[loc]? = some (.init (.aggregate 0 vals))) (hOob : vals.length ≤ idx) :
+    typedPlaceProjectionOk slots ⟨loc, .field idx ty :: rest⟩ = false := by
+  have hNone : vals[idx]? = none := List.getElem?_eq_none hOob
+  simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNone]
+
+/-- Every successful `deinitFieldSlot` path satisfies `slotProjectionAccessOk` (`check_place_access`
+and `deinit_in_slot` enforce the exact same active-variant, field-bounds, and `.uninit` tail
+invariants). -/
+theorem slotProjectionAccessOk_of_deinitFieldSlot (ts : Bool) (locals : List LocalSlot)
+    (slot : FieldSlot) (p : List ProjectionElem) (slot' : FieldSlot)
+    (h : deinitFieldSlot ts locals slot p = some slot') :
+    slotProjectionAccessOk locals slot p = true := by
+  fun_induction deinitFieldSlot ts locals slot p generalizing slot' with
+  | case1 => rfl
+  | case2 p rest hT => exact hT
+  | case3 => nomatch h
+  | case4 var vals idx ty rest ih =>
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV' : var = 0 := hV
+    subst hV'
+    obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+    simp only [slotProjectionAccessOk, BEq.rfl, Bool.true_and, hcv]
+    exact ih (.init cv) c' hcc
+  | case5 var vals nm v idx ty rest ih =>
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV' : var = v := hV
+    subst hV'
+    obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+    simp only [slotProjectionAccessOk, BEq.rfl, Bool.true_and, hcv]
+    exact ih (.init cv) c' hcc
+  | case6 var adt disc fs idx ty rest ih =>
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV' : shellVariant ⟨var, adt, disc, fs⟩ = 0 := hV
+    simp only [slotProjectionAccessOk, hV', BEq.rfl, Bool.true_and, hc]
+    exact ih c c' hcc
+  | case7 var adt disc fs nm v idx ty rest ih =>
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV' : shellVariant ⟨var, adt, disc, fs⟩ = v := hV
+    simp only [slotProjectionAccessOk, hV', BEq.rfl, Bool.true_and, hc]
+    exact ih c c' hcc
+  | case8 => nomatch h
+
+/-- **Every place that `evalDeinitPlace` can deinitialize passes `typedPlaceProjectionOk`**. -/
+theorem typedPlaceProjectionOk_of_evalDeinitPlace {ts : Bool} {slots slots' : List LocalSlotState}
+    {place : Place} (h : evalDeinitPlace ts slots place = some slots') :
+    typedPlaceProjectionOk slots place = true := by
+  obtain ⟨st, hSt, hLive, slot', hD, _⟩ := evalDeinitPlace_eq_some h
+  unfold typedPlaceProjectionOk
+  rw [hSt]
+  cases st with
+  | dead => exact absurd rfl hLive
+  | uninit => exact slotProjectionAccessOk_of_deinitFieldSlot ts _ _ _ _ hD
+  | init _ => exact slotProjectionAccessOk_of_deinitFieldSlot ts _ _ _ _ hD
+  | partialShell _ => exact slotProjectionAccessOk_of_deinitFieldSlot ts _ _ _ _ hD
 
 /-- **`Drop` checks the frame and changes nothing**: a successful `Drop` jumps to its target with
 the frame unchanged, after the place passed the frame access check (live root local, initialized
