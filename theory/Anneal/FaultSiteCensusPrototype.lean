@@ -3595,6 +3595,366 @@ theorem initMachineState_mirStepsIntra_exposesUb_in_census
     mirStepsIntra_preserves_validMirPc body hCfg hPc₀ hSteps
   exact stepMirFn_exposesUb_in_census body s hTop hPc hUb
 
+/--
+`[adv A3]` Check that all basic-block targets in `unwindTargets unwind` are `< numBlocks`.
+-/
+def unwindTargetsInBounds (numBlocks : Nat) (unwind : UnwindAction) : Bool :=
+  (unwindTargets unwind).all (fun t => decide (t < numBlocks))
+
+/--
+`[adv A3]` Top-level frame invariant on an external-call answer `ans : MirCallAns`:
+any `memAfter` carried by `.returned` or `.panicked` remains at the top-level frame
+(`memAfter.activeCallee = none ∧ memAfter.callStack = []`).
+-/
+def MirCallAnsTopFrame : MirCallAns → Prop
+  | .returned _ memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
+  | .panicked memAfter => memAfter.activeCallee = none ∧ memAfter.callStack = []
+  | .aborted => True
+
+/--
+`[adv A3]` When `unwindTargetsInBounds (length body.basicBlocks) unwind = true` and
+`memAfter` is at the top-level frame (`activeCallee = none`, `callStack = []`),
+any `.running s'` produced by `applyUnwindAction` preserves `ValidMirPc body s'.frame`
+and remains at the top-level frame.
+-/
+theorem validMirPc_applyUnwindAction_top
+    (body : CapturedMir) (s s' : MachineState)
+    (localsAfterArgs : List LocalSlot) (memAfter : Memory)
+    (unwind : UnwindAction)
+    (hUnwind : unwindTargetsInBounds (length body.basicBlocks) unwind = true)
+    (hTop : memAfter.activeCallee = none)
+    (hStack : memAfter.callStack = [])
+    (hRun : applyUnwindAction s localsAfterArgs memAfter unwind = .running s') :
+    ValidMirPc body s'.frame ∧
+    s'.memory.activeCallee = none ∧
+    s'.memory.callStack = [] := by
+  cases unwind with
+  | unreachable => nomatch hRun
+  | terminate => nomatch hRun
+  | continue_ =>
+    dsimp only [applyUnwindAction] at hRun
+    rw [hStack] at hRun
+    nomatch hRun
+  | cleanup cleanupBb =>
+    dsimp only [applyUnwindAction] at hRun
+    injection hRun with hEq
+    subst hEq
+    have hLt : cleanupBb < length body.basicBlocks := by
+      unfold unwindTargetsInBounds unwindTargets at hUnwind
+      rw [List.all_eq_true] at hUnwind
+      exact of_decide_eq_true (hUnwind cleanupBb (List.Mem.head []))
+    rcases exists_get?_of_lt_length body.basicBlocks cleanupBb hLt with ⟨bb, hBb⟩
+    exact ⟨⟨bb, hBb, Nat.zero_le _⟩, hTop, hStack⟩
+
+/--
+`[adv A3]` PC preservation for `resumeExternalCall` continuations: when
+`targetBb < length body.basicBlocks`, `unwindTargetsInBounds (length body.basicBlocks) unwind = true`,
+and `MirCallAnsTopFrame ans` holds, any `.running s'` produced by `resumeExternalCall`
+satisfies `ValidMirPc body s'.frame` and remains at the top-level frame.
+-/
+theorem validMirPc_resumeExternalCall
+    (body : CapturedMir) (s s' : MachineState)
+    (localsAfterArgs : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (unwind : UnwindAction) (ans : MirCallAns)
+    (hTarget : targetBb < length body.basicBlocks)
+    (hUnwind : unwindTargetsInBounds (length body.basicBlocks) unwind = true)
+    (hAns : MirCallAnsTopFrame ans)
+    (hRun : resumeExternalCall s localsAfterArgs destination targetBb unwind ans = .running s') :
+    ValidMirPc body s'.frame ∧
+    s'.memory.activeCallee = none ∧
+    s'.memory.callStack = [] := by
+  cases ans with
+  | returned retVal memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    dsimp only [resumeExternalCall] at hRun
+    split at hRun
+    · injection hRun with hEq
+      subst hEq
+      rcases exists_get?_of_lt_length body.basicBlocks targetBb hTarget with ⟨bb, hBb⟩
+      exact ⟨⟨bb, hBb, Nat.zero_le _⟩, hTop, hStack⟩
+    · nomatch hRun
+    · nomatch hRun
+  | panicked memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    exact validMirPc_applyUnwindAction_top body s s' localsAfterArgs memAfter
+      unwind hUnwind hTop hStack hRun
+  | aborted => nomatch hRun
+
+/--
+`[adv A3]` PC preservation for `resumeExternalDivergingCall` continuations: when
+`unwindTargetsInBounds (length body.basicBlocks) unwind = true` and `MirCallAnsTopFrame ans`
+holds, any `.running s'` produced by `resumeExternalDivergingCall` satisfies
+`ValidMirPc body s'.frame` and remains at the top-level frame.
+-/
+theorem validMirPc_resumeExternalDivergingCall
+    (body : CapturedMir) (s s' : MachineState)
+    (localsAfterArgs : List LocalSlot) (unwind : UnwindAction) (ans : MirCallAns)
+    (hUnwind : unwindTargetsInBounds (length body.basicBlocks) unwind = true)
+    (hAns : MirCallAnsTopFrame ans)
+    (hRun : resumeExternalDivergingCall s localsAfterArgs unwind ans = .running s') :
+    ValidMirPc body s'.frame ∧
+    s'.memory.activeCallee = none ∧
+    s'.memory.callStack = [] := by
+  cases ans with
+  | returned _ _ => nomatch hRun
+  | panicked memAfter =>
+    rcases hAns with ⟨hTop, hStack⟩
+    exact validMirPc_applyUnwindAction_top body s s' localsAfterArgs memAfter
+      unwind hUnwind hTop hStack hRun
+  | aborted => nomatch hRun
+
+/--
+`[adv A3]` At the top-level frame (`MirCallAnsTopFrame ans`), `resumeExternalTailCall ans`
+either halts or aborts and never returns `.running s'`.
+-/
+theorem resumeExternalTailCall_top_ne_running
+    (ans : MirCallAns) (s' : MachineState)
+    (hAns : MirCallAnsTopFrame ans) :
+    resumeExternalTailCall ans ≠ .running s' := by
+  cases ans with
+  | returned retVal memAfter =>
+    rcases hAns with ⟨_, hStack⟩
+    dsimp only [resumeExternalTailCall]
+    rw [hStack]
+    intro h; nomatch h
+  | panicked memAfter =>
+    rcases hAns with ⟨_, hStack⟩
+    dsimp only [resumeExternalTailCall]
+    rw [hStack]
+    intro h; nomatch h
+  | aborted =>
+    intro h; nomatch h
+
+/--
+`[adv A3]` Well-formedness invariant for a saved caller frame on `Memory.callStack`:
+its normal return target (when non-diverging) and its unwind cleanup target (when present)
+are in bounds of `caller.callerBody.basicBlocks`.
+-/
+def ValidCallerFrame (caller : SavedCallerFrame) : Prop :=
+  (caller.isDiverging = false → caller.returnTarget < length caller.callerBody.basicBlocks) ∧
+  unwindTargetsInBounds (length caller.callerBody.basicBlocks) caller.returnUnwind = true
+
+/--
+`[adv A3]` Every saved caller frame in `stack` satisfies `ValidCallerFrame`.
+-/
+def ValidCallStack (stack : List SavedCallerFrame) : Prop :=
+  ∀ c ∈ stack, ValidCallerFrame c
+
+/--
+`[adv A3]` Interprocedural PC preservation across `unwindFromCallStack`: when
+`ValidCallStack stack` holds, if `unwindFromCallStack stack memAfter = .running s'`,
+then `ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame` and
+`ValidCallStack s'.memory.callStack` both hold.
+-/
+theorem validMirPc_unwindFromCallStack
+    (rootBody : CapturedMir) :
+    ∀ (stack : List SavedCallerFrame) (memAfter : Memory) (s' : MachineState),
+      ValidCallStack stack →
+      unwindFromCallStack stack memAfter = .running s' →
+      ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame ∧
+      ValidCallStack s'.memory.callStack
+  | [], _, _, _, hRun => by nomatch hRun
+  | caller :: restStack, memAfter, s', hValid, hRun => by
+    have hCaller : ValidCallerFrame caller := hValid caller (List.Mem.head restStack)
+    have hRest : ValidCallStack restStack :=
+      fun c hc => hValid c (List.Mem.tail caller hc)
+    dsimp only [unwindFromCallStack] at hRun
+    cases hUnw : caller.returnUnwind with
+    | unreachable =>
+      rw [hUnw] at hRun; nomatch hRun
+    | terminate =>
+      rw [hUnw] at hRun; nomatch hRun
+    | continue_ =>
+      rw [hUnw] at hRun
+      exact validMirPc_unwindFromCallStack rootBody restStack _ s' hRest hRun
+    | cleanup cleanupBb =>
+      rw [hUnw] at hRun
+      injection hRun with hEq
+      subst hEq
+      have hUnwBounds := hCaller.2
+      rw [hUnw] at hUnwBounds
+      have hLt : cleanupBb < length caller.callerBody.basicBlocks := by
+        unfold unwindTargetsInBounds unwindTargets at hUnwBounds
+        rw [List.all_eq_true] at hUnwBounds
+        exact of_decide_eq_true (hUnwBounds cleanupBb (List.Mem.head []))
+      rcases exists_get?_of_lt_length caller.callerBody.basicBlocks cleanupBb hLt with ⟨bb, hBb⟩
+      exact ⟨⟨bb, hBb, Nat.zero_le _⟩, hRest⟩
+
+/--
+`[adv A3]` Interprocedural PC preservation across `resumeExternalTailCall` over a
+`ValidCallStack`: if `resumeExternalTailCall ans = .running s'`, then
+`ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame` and
+`ValidCallStack s'.memory.callStack` hold.
+-/
+theorem validMirPc_resumeExternalTailCall
+    (rootBody : CapturedMir) (ans : MirCallAns) (s' : MachineState)
+    (hStack : match ans with
+      | .returned _ m | .panicked m => ValidCallStack m.callStack
+      | .aborted => True)
+    (hRun : resumeExternalTailCall ans = .running s') :
+    ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame ∧
+    ValidCallStack s'.memory.callStack := by
+  cases ans with
+  | returned retVal memAfter =>
+    dsimp only at hStack
+    dsimp only [resumeExternalTailCall] at hRun
+    cases hCs : memAfter.callStack with
+    | nil =>
+      rw [hCs] at hRun; nomatch hRun
+    | cons caller restStack =>
+      rw [hCs] at hRun hStack
+      dsimp only at hRun
+      have hCaller : ValidCallerFrame caller := hStack caller (List.Mem.head restStack)
+      have hRest : ValidCallStack restStack :=
+        fun c hc => hStack c (List.Mem.tail caller hc)
+      cases hDiv : caller.isDiverging with
+      | true =>
+        rw [hDiv] at hRun; nomatch hRun
+      | false =>
+        rw [hDiv] at hRun
+        dsimp only at hRun
+        split at hRun
+        · injection hRun with hEq
+          subst hEq
+          have hLt : caller.returnTarget < length caller.callerBody.basicBlocks :=
+            hCaller.1 hDiv
+          rcases exists_get?_of_lt_length caller.callerBody.basicBlocks caller.returnTarget hLt with
+            ⟨bb, hBb⟩
+          exact ⟨⟨bb, hBb, Nat.zero_le _⟩, hRest⟩
+        · nomatch hRun
+        · nomatch hRun
+  | panicked memAfter =>
+    dsimp only at hStack
+    exact validMirPc_unwindFromCallStack rootBody memAfter.callStack memAfter s' hStack hRun
+  | aborted => nomatch hRun
+
+/--
+`[adv A3]` Multi-step top-level reachability relation extending `MirStepsIntra`
+with external-call continuations (`resumeExternalCall` and `resumeExternalDivergingCall`)
+at valid call terminators.
+-/
+inductive MirStepsWithExtCalls (body : CapturedMir) : MachineState → MachineState → Prop where
+  | refl (s : MachineState) : MirStepsWithExtCalls body s s
+  | stepIntra {s₁ s₂ s₃ : MachineState}
+      (hTop₁ : s₁.memory.activeCallee = none)
+      (hStack₁ : s₁.memory.callStack = [])
+      (hTop₂ : s₂.memory.activeCallee = none)
+      (hStep : stepMirFn body s₁ = MirStepNode.step s₂ ∨
+               ∃ obs, stepMirFn body s₁ = MirStepNode.emitStep obs s₂)
+      (hRest : MirStepsWithExtCalls body s₂ s₃) :
+      MirStepsWithExtCalls body s₁ s₃
+  | stepExtCall {s₁ s₂ s₃ : MachineState}
+      {bb : BasicBlockData} {func : Operand} {args : List Operand}
+      {destination : Place} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+      {localsAfterArgs : List LocalSlot} {ans : MirCallAns}
+      (hBb : get? body.basicBlocks s₁.frame.blockIdx = some bb)
+      (hKind : bb.terminator.kind = .call func args destination (some targetBb) unwind)
+      (hAns : MirCallAnsTopFrame ans)
+      (hRun : resumeExternalCall s₁ localsAfterArgs destination targetBb unwind ans = .running s₂)
+      (hRest : MirStepsWithExtCalls body s₂ s₃) :
+      MirStepsWithExtCalls body s₁ s₃
+  | stepExtDivergingCall {s₁ s₂ s₃ : MachineState}
+      {bb : BasicBlockData} {func : Operand} {args : List Operand}
+      {destination : Place} {unwind : UnwindAction}
+      {localsAfterArgs : List LocalSlot} {ans : MirCallAns}
+      (hBb : get? body.basicBlocks s₁.frame.blockIdx = some bb)
+      (hKind : bb.terminator.kind = .call func args destination none unwind)
+      (hAns : MirCallAnsTopFrame ans)
+      (hRun : resumeExternalDivergingCall s₁ localsAfterArgs unwind ans = .running s₂)
+      (hRest : MirStepsWithExtCalls body s₂ s₃) :
+      MirStepsWithExtCalls body s₁ s₃
+
+private theorem call_targets_in_bounds_of_cfg
+    (body : CapturedMir) (blockIdx : BasicBlockIdx) (bb : BasicBlockData)
+    (func : Operand) (args : List Operand) (destination : Place)
+    (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hBb : get? body.basicBlocks blockIdx = some bb)
+    (hKind : bb.terminator.kind = .call func args destination (some targetBb) unwind) :
+    targetBb < length body.basicBlocks ∧
+    unwindTargetsInBounds (length body.basicBlocks) unwind = true := by
+  have hMemBb : bb ∈ body.basicBlocks :=
+    (lt_length_and_mem_of_get? body.basicBlocks blockIdx bb hBb).2
+  unfold cfgTargetsInBounds at hCfg
+  rcases Bool.and_eq_true_iff.mp hCfg with ⟨_, hAllBb⟩
+  rw [List.all_eq_true] at hAllBb
+  have hTermBounds : (terminatorTargets bb.terminator.kind).all
+      (fun t => decide (t < length body.basicBlocks)) = true :=
+    hAllBb bb hMemBb
+  rw [hKind] at hTermBounds
+  unfold terminatorTargets at hTermBounds
+  rw [List.all_eq_true] at hTermBounds
+  refine ⟨of_decide_eq_true (hTermBounds targetBb (List.Mem.head _)), ?_⟩
+  unfold unwindTargetsInBounds
+  rw [List.all_eq_true]
+  intro t ht
+  exact hTermBounds t (List.Mem.tail targetBb ht)
+
+private theorem diverging_call_unwind_in_bounds_of_cfg
+    (body : CapturedMir) (blockIdx : BasicBlockIdx) (bb : BasicBlockData)
+    (func : Operand) (args : List Operand) (destination : Place)
+    (unwind : UnwindAction)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hBb : get? body.basicBlocks blockIdx = some bb)
+    (hKind : bb.terminator.kind = .call func args destination none unwind) :
+    unwindTargetsInBounds (length body.basicBlocks) unwind = true := by
+  have hMemBb : bb ∈ body.basicBlocks :=
+    (lt_length_and_mem_of_get? body.basicBlocks blockIdx bb hBb).2
+  unfold cfgTargetsInBounds at hCfg
+  rcases Bool.and_eq_true_iff.mp hCfg with ⟨_, hAllBb⟩
+  rw [List.all_eq_true] at hAllBb
+  have hTermBounds : (terminatorTargets bb.terminator.kind).all
+      (fun t => decide (t < length body.basicBlocks)) = true :=
+    hAllBb bb hMemBb
+  rw [hKind] at hTermBounds
+  exact hTermBounds
+
+/--
+`[adv A3]` Multi-step `ValidMirPc` invariance across both intra-frame steps and
+external-call continuations (`MirStepsWithExtCalls`).
+-/
+theorem mirStepsWithExtCalls_preserves_validMirPc
+    (body : CapturedMir) {s s' : MachineState}
+    (hCfg : cfgTargetsInBounds body = true)
+    (hPc : ValidMirPc body s.frame)
+    (hSteps : MirStepsWithExtCalls body s s') :
+    ValidMirPc body s'.frame := by
+  induction hSteps with
+  | refl _ => exact hPc
+  | stepIntra hTop₁ hStack₁ hTop₂ hStep _ ih =>
+    exact ih (stepMirFn_preserves_validMirPc body _ _ hTop₁ hStack₁ hTop₂ hCfg hPc hStep)
+  | stepExtCall hBb hKind hAns hRun _ ih =>
+    rcases call_targets_in_bounds_of_cfg body _ _ _ _ _ _ _ hCfg hBb hKind with
+      ⟨hTarget, hUnwind⟩
+    exact ih (validMirPc_resumeExternalCall body _ _ _ _ _ _ _ hTarget hUnwind hAns hRun).1
+  | stepExtDivergingCall hBb hKind hAns hRun _ ih =>
+    have hUnwind := diverging_call_unwind_in_bounds_of_cfg body _ _ _ _ _ _ hCfg hBb hKind
+    exact ih (validMirPc_resumeExternalDivergingCall body _ _ _ _ _ hUnwind hAns hRun).1
+
+/--
+`[adv A3]` Multi-step entry-to-fault census completeness across external calls:
+starting from `initMachineState body args` on a body with `cfgTargetsInBounds body = true`,
+any state `s` reachable via `MirStepsWithExtCalls` whose next step exposes `.ub` is
+censused in `censusMirBodyFaultSites body`.
+-/
+theorem initMachineState_mirStepsWithExtCalls_exposesUb_in_census
+    (body : CapturedMir) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hSteps : MirStepsWithExtCalls body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body := by
+  have hNonEmpty : 0 < length body.basicBlocks := by
+    unfold cfgTargetsInBounds at hCfg
+    rcases Bool.and_eq_true_iff.mp hCfg with ⟨hPos, _⟩
+    exact of_decide_eq_true hPos
+  have hPc₀ : ValidMirPc body (initMachineState body args).frame :=
+    validMirPc_initMachineState body args hNonEmpty
+  have hPc : ValidMirPc body s.frame :=
+    mirStepsWithExtCalls_preserves_validMirPc body hCfg hPc₀ hSteps
+  exact stepMirFn_exposesUb_in_census body s hTop hPc hUb
+
 /-! ## 9. Fail-Closed Coverage Reconciler & Soundness/Completeness Proofs -/
 
 /--
@@ -4009,7 +4369,37 @@ theorem initMachineState_mirStepsIntra_not_exposesUb_of_empty_census
   rw [hEmpty] at hMem
   nomatch hMem
 
-/-! ## 9b. `[adv B3]` Per-Body Batch Reconciliation (Inline-Callee Coordinate Isolation)
+/--
+`[adv A3]` Multi-step End-to-End Reconciled Trace Safety Across External Calls
+(`initMachineState_mirStepsWithExtCalls_reconciled_safety`):
+when `cfgTargetsInBounds body = true` and
+`reconcileFaultCoverageWithRegistry registry (censusMirBodyFaultSites body) discharged = .verified`,
+every top-level state `s` reachable from `initMachineState body args` via
+`MirStepsWithExtCalls` (including `resumeExternalCall` and `resumeExternalDivergingCall`
+continuations) that exposes `.ub` on its next step is guaranteed to have its faulting
+`(blockIdx, stmtIdx, cls)` in `discharged` with `registry cls = .emittedAndVerified`.
+-/
+theorem initMachineState_mirStepsWithExtCalls_reconciled_safety
+    (registry : PropertyRegistry) (body : CapturedMir)
+    (discharged : List FaultSite) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hVer : reconcileFaultCoverageWithRegistry registry
+      (censusMirBodyFaultSites body) discharged = .verified)
+    (hSteps : MirStepsWithExtCalls body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  rcases initMachineState_mirStepsWithExtCalls_exposesUb_in_census
+      body args s hCfg hSteps hTop hUb with ⟨cls, hInCensus⟩
+  have hAll :=
+    (reconcileFaultCoverageWithRegistry_verified_iff
+      registry (censusMirBodyFaultSites body) discharged).mp hVer
+  rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
+
+/-! ## 9b. `[adv B3]` / `[adv A3]` Per-Body Batch Reconciliation & Polymorphic `CapturedMir.instantiate` Invariance
 
 `stepMirFn body s` executes the *active* body `s.memory.activeCallee.getD body`, which
 is the subject or an inline callee body installed by a call terminator. A fault in an
@@ -4035,23 +4425,41 @@ theorem CoverageVerdict.isVerified_iff (v : CoverageVerdict) :
   | verified => exact ⟨fun _ => rfl, fun _ => rfl⟩
   | unknownUnmappedFaultSites _ => exact ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
 
-/-- `[adv B3]` Fail-closed per-body batch reconciler: every body's census is
-reconciled against its *own* discharged list under `registry`. -/
+/-- `[adv B3]` / `[adv A3]` Fail-closed per-body batch reconciler: the batch must be
+non-empty (`!batch.isEmpty`), and every body's census is reconciled against its *own*
+discharged list under `registry`. -/
 def reconcileCoverageBatch (registry : PropertyRegistry) (batch : CoverageBatch) : Bool :=
+  !batch.isEmpty &&
   batch.all (fun item =>
     (reconcileFaultCoverageWithRegistry registry
       (censusMirBodyFaultSites item.1) item.2).isVerified)
 
-/-- `[adv B3]` Soundness and completeness of `reconcileCoverageBatch`. -/
+/-- `[adv A3]` An empty `CoverageBatch` always fails closed (`false`). -/
+@[simp]
+theorem reconcileCoverageBatch_nil (registry : PropertyRegistry) :
+    reconcileCoverageBatch registry [] = false :=
+  rfl
+
+/-- `[adv B3]` / `[adv A3]` Soundness and completeness of `reconcileCoverageBatch`. -/
 theorem reconcileCoverageBatch_iff (registry : PropertyRegistry) (batch : CoverageBatch) :
     reconcileCoverageBatch registry batch = true ↔
-      ∀ item ∈ batch,
-        reconcileFaultCoverageWithRegistry registry
-          (censusMirBodyFaultSites item.1) item.2 = .verified := by
+      (batch ≠ [] ∧
+       ∀ item ∈ batch,
+         reconcileFaultCoverageWithRegistry registry
+           (censusMirBodyFaultSites item.1) item.2 = .verified) := by
   unfold reconcileCoverageBatch
-  rw [List.all_eq_true]
-  exact ⟨fun h item hMem => (CoverageVerdict.isVerified_iff _).mp (h item hMem),
-         fun h item hMem => (CoverageVerdict.isVerified_iff _).mpr (h item hMem)⟩
+  rw [Bool.and_eq_true, List.all_eq_true]
+  constructor
+  · rintro ⟨hNe, hAll⟩
+    refine ⟨?_, fun item hMem => (CoverageVerdict.isVerified_iff _).mp (hAll item hMem)⟩
+    intro hNil
+    rw [hNil] at hNe
+    nomatch hNe
+  · rintro ⟨hNe, hAll⟩
+    refine ⟨?_, fun item hMem => (CoverageVerdict.isVerified_iff _).mpr (hAll item hMem)⟩
+    cases batch with
+    | nil => exact False.elim (hNe rfl)
+    | cons _ _ => rfl
 
 /--
 `[adv B3]` Interprocedural one-step batch soundness
@@ -4060,10 +4468,6 @@ body `s.memory.activeCallee.getD body` (subject or inline callee) appears in the
 paired with `discharged`, and the program counter is valid in the active body, then any
 one-step UB exposure of `stepMirFn body s` is discharged in the active body's own list
 with an `.emittedAndVerified` class. No obligation of any *other* body can be used.
-
-For non-generic callees `lookupCallee` installs the captured body verbatim; generic
-callees are installed as `calleeBody.instantiate subst`, so the batch must contain the
-instantiated body (census invariance under `CapturedMir.instantiate` is open).
 -/
 theorem stepMirFn_exposesUb_in_batch_discharged
     (registry : PropertyRegistry) (batch : CoverageBatch)
@@ -4076,27 +4480,515 @@ theorem stepMirFn_exposesUb_in_batch_discharged
       (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
       registry cls = .emittedAndVerified := by
   rcases stepMirFn_activeBody_exposesUb_in_census body s hPc hUb with ⟨cls, hInCensus⟩
-  have hVer := (reconcileCoverageBatch_iff registry batch).mp hBatch _ hItem
+  have hVer := ((reconcileCoverageBatch_iff registry batch).mp hBatch).2 _ hItem
   rcases (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp hVer
       (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
   exact ⟨cls, hInDis, hReg⟩
 
 /--
-`[adv B3]` Batch reconciliation is monotone in each entry's discharged list and in the
-registry: strengthening any body's obligations never breaks a verified batch.
+`[adv B3]` / `[adv A3]` Batch reconciliation is monotone in each entry's discharged
+list and in the registry: strengthening any body's obligations on a non-empty batch
+never breaks a verified batch.
 -/
 theorem reconcileCoverageBatch_mono
     (reg₁ reg₂ : PropertyRegistry) (batch₁ batch₂ : CoverageBatch)
     (hVer : reconcileCoverageBatch reg₁ batch₁ = true)
+    (hNonEmpty₂ : batch₂ ≠ [])
     (hCover : ∀ item₂ ∈ batch₂, ∃ d₁, (item₂.1, d₁) ∈ batch₁ ∧ ∀ s ∈ d₁, s ∈ item₂.2)
     (hSubReg : ∀ c : MirFaultClass,
       reg₁ c = .emittedAndVerified → reg₂ c = .emittedAndVerified) :
     reconcileCoverageBatch reg₂ batch₂ = true := by
   rw [reconcileCoverageBatch_iff] at hVer ⊢
-  intro item₂ hMem₂
+  refine ⟨hNonEmpty₂, fun item₂ hMem₂ => ?_⟩
   rcases hCover item₂ hMem₂ with ⟨d₁, hMem₁, hSub⟩
   exact reconcileFaultCoverageWithRegistry_mono reg₁ reg₂ _ d₁ item₂.2
-    (hVer _ hMem₁) hSub hSubReg
+    (hVer.2 _ hMem₁) hSub hSubReg
+
+/--
+`[adv A3]` True unless `op` is a `Operand.constant` whose `ty.kind` is a bare type
+parameter `RigidTy.param _ _` (which in Rust MIR never occurs on a call `func` constant,
+whose type is always `RigidTy.fnDef` or `RigidTy.fnPtr`).
+-/
+def operandHasNoParamConstTy : Operand → Bool
+  | .constant c =>
+    match c.ty.kind with
+    | .param _ _ => false
+    | _ => true
+  | _ => true
+
+/--
+`[adv A3]` True when no `.call` or `.tailCall` terminator has a `func` constant with a
+bare `RigidTy.param` type.
+-/
+def terminatorHasNoParamCallConst : TerminatorKind → Bool
+  | .call func _ _ _ _ => operandHasNoParamConstTy func
+  | .tailCall func _ => operandHasNoParamConstTy func
+  | _ => true
+
+/--
+`[adv A3]` True when every basic block terminator in `body` satisfies
+`terminatorHasNoParamCallConst`.
+-/
+def bodyHasNoParamCallConst (body : CapturedMir) : Bool :=
+  body.basicBlocks.all (fun bb => terminatorHasNoParamCallConst bb.terminator.kind)
+
+private theorem censusProjectionElem_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (elem : ProjectionElem) :
+    censusProjectionElemFaultClasses (ProjectionElem.instantiate tbl subst elem) =
+      censusProjectionElemFaultClasses elem := by
+  cases elem <;> rfl
+
+private theorem censusProjectionElem_instantiateList
+    (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (proj : List ProjectionElem),
+      (ProjectionElem.instantiateList tbl subst proj).flatMap censusProjectionElemFaultClasses =
+        proj.flatMap censusProjectionElemFaultClasses
+  | [] => rfl
+  | hd :: tl => by
+    change censusProjectionElemFaultClasses (ProjectionElem.instantiate tbl subst hd) ++
+        (ProjectionElem.instantiateList tbl subst tl).flatMap censusProjectionElemFaultClasses =
+      censusProjectionElemFaultClasses hd ++ tl.flatMap censusProjectionElemFaultClasses
+    rw [censusProjectionElem_instantiate tbl subst hd,
+        censusProjectionElem_instantiateList tbl subst tl]
+
+private theorem censusReadProjected_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (elem : ProjectionElem) :
+    censusReadProjectedFaultClasses (ProjectionElem.instantiate tbl subst elem) =
+      censusReadProjectedFaultClasses elem := by
+  cases elem <;> rfl
+
+private theorem censusReadProjected_instantiateList
+    (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (proj : List ProjectionElem),
+      (ProjectionElem.instantiateList tbl subst proj).flatMap censusReadProjectedFaultClasses =
+        proj.flatMap censusReadProjectedFaultClasses
+  | [] => rfl
+  | hd :: tl => by
+    change censusReadProjectedFaultClasses (ProjectionElem.instantiate tbl subst hd) ++
+        (ProjectionElem.instantiateList tbl subst tl).flatMap censusReadProjectedFaultClasses =
+      censusReadProjectedFaultClasses hd ++ tl.flatMap censusReadProjectedFaultClasses
+    rw [censusReadProjected_instantiate tbl subst hd,
+        censusReadProjected_instantiateList tbl subst tl]
+
+theorem censusPlaceReadFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (p : Place) :
+    censusPlaceReadFaultClasses (Place.instantiate tbl subst p) =
+      censusPlaceReadFaultClasses p := by
+  rcases p with ⟨loc, proj⟩
+  dsimp only [Place.instantiate, censusPlaceReadFaultClasses]
+  rw [censusProjectionElem_instantiateList tbl subst proj]
+
+theorem censusPlaceWriteFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (p : Place) :
+    censusPlaceWriteFaultClasses (Place.instantiate tbl subst p) =
+      censusPlaceWriteFaultClasses p := by
+  rcases p with ⟨loc, proj⟩
+  cases proj with
+  | nil => rfl
+  | cons hd tl =>
+    change [.storageLiveProtected, .treeBorrowsViolation, .uninitRead] ++
+        (ProjectionElem.instantiateList tbl subst (hd :: tl)).flatMap censusProjectionElemFaultClasses =
+      [.storageLiveProtected, .treeBorrowsViolation, .uninitRead] ++
+        (hd :: tl).flatMap censusProjectionElemFaultClasses
+    rw [censusProjectionElem_instantiateList tbl subst (hd :: tl)]
+
+theorem censusPlaceRefFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (p : Place) :
+    censusPlaceRefFaultClasses (Place.instantiate tbl subst p) =
+      censusPlaceRefFaultClasses p := by
+  rcases p with ⟨loc, proj⟩
+  cases proj with
+  | nil => rfl
+  | cons hd tl =>
+    cases hd with
+    | deref =>
+      change [.uninitRead, .ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation] ++
+          (ProjectionElem.instantiateList tbl subst (.deref :: tl)).flatMap
+            censusProjectionElemFaultClasses =
+        [.uninitRead, .ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation] ++
+          (.deref :: tl).flatMap censusProjectionElemFaultClasses
+      rw [censusProjectionElem_instantiateList tbl subst (.deref :: tl)]
+    | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+    | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ => rfl
+
+theorem censusOperandFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (op : Operand) :
+    censusOperandFaultClasses (Operand.instantiate tbl subst op) =
+      censusOperandFaultClasses op := by
+  cases op with
+  | copy p => exact censusPlaceReadFaultClasses_instantiate tbl subst p
+  | move p => exact censusPlaceReadFaultClasses_instantiate tbl subst p
+  | constant c => rfl
+
+private theorem censusOperandFaultClasses_instantiateList
+    (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (ops : List Operand),
+      (Operand.instantiateList tbl subst ops).flatMap censusOperandFaultClasses =
+        ops.flatMap censusOperandFaultClasses
+  | [] => rfl
+  | hd :: tl => by
+    change censusOperandFaultClasses (Operand.instantiate tbl subst hd) ++
+        (Operand.instantiateList tbl subst tl).flatMap censusOperandFaultClasses =
+      censusOperandFaultClasses hd ++ tl.flatMap censusOperandFaultClasses
+    rw [censusOperandFaultClasses_instantiate tbl subst hd,
+        censusOperandFaultClasses_instantiateList tbl subst tl]
+
+theorem censusLoadedOperandFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (op : Operand) :
+    censusLoadedOperandFaultClasses (Operand.instantiate tbl subst op) =
+      censusLoadedOperandFaultClasses op := by
+  cases op with
+  | copy p =>
+    dsimp only [Operand.instantiate, censusLoadedOperandFaultClasses]
+    rw [censusPlaceReadFaultClasses_instantiate tbl subst p]
+  | move p =>
+    dsimp only [Operand.instantiate, censusLoadedOperandFaultClasses]
+    rw [censusPlaceReadFaultClasses_instantiate tbl subst p]
+  | constant c => rfl
+
+private theorem aggregateKindUnevaluated_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (k : AggregateKind) :
+    aggregateKindUnevaluated (AggregateKind.instantiate tbl subst k) =
+      aggregateKindUnevaluated k := by
+  cases k <;> rfl
+
+theorem rvalueUnevaluated_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (rv : Rvalue) :
+    rvalueUnevaluated (Rvalue.instantiate tbl subst rv) = rvalueUnevaluated rv := by
+  cases rv with
+  | aggregate k ops => exact aggregateKindUnevaluated_instantiate tbl subst k
+  | _ => rfl
+
+theorem censusRvalueFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (rv : Rvalue) :
+    censusRvalueFaultClasses (Rvalue.instantiate tbl subst rv) =
+      censusRvalueFaultClasses rv := by
+  cases rv with
+  | use op => exact censusLoadedOperandFaultClasses_instantiate tbl subst op
+  | «repeat» op _ => exact censusOperandFaultClasses_instantiate tbl subst op
+  | ref _ p => exact censusPlaceRefFaultClasses_instantiate tbl subst p
+  | threadLocalRef _ => rfl
+  | rawPtr _ p => exact censusPlaceRefFaultClasses_instantiate tbl subst p
+  | len p =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [censusPlaceReadFaultClasses_instantiate tbl subst p]
+  | cast kind op _ =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [censusOperandFaultClasses_instantiate tbl subst op]
+  | binaryOp op lhs rhs =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [censusOperandFaultClasses_instantiate tbl subst lhs,
+        censusOperandFaultClasses_instantiate tbl subst rhs]
+  | nullaryOp _ _ => rfl
+  | unaryOp op val =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [censusOperandFaultClasses_instantiate tbl subst val]
+  | discriminant p =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [censusPlaceReadFaultClasses_instantiate tbl subst p]
+  | aggregate kind ops =>
+    dsimp only [Rvalue.instantiate, censusRvalueFaultClasses]
+    rw [aggregateKindUnevaluated_instantiate tbl subst kind,
+        censusOperandFaultClasses_instantiateList tbl subst ops]
+  | shallowInitBox _ _ => rfl
+  | copyForDeref p => exact censusPlaceReadFaultClasses_instantiate tbl subst p
+  | wrapUnsafeBinder op _ => exact censusLoadedOperandFaultClasses_instantiate tbl subst op
+
+theorem censusIntrinsicFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (intr : NonDivergingIntrinsic) :
+    censusIntrinsicFaultClasses (NonDivergingIntrinsic.instantiate tbl subst intr) =
+      censusIntrinsicFaultClasses intr := by
+  cases intr with
+  | assume op =>
+    dsimp only [NonDivergingIntrinsic.instantiate, censusIntrinsicFaultClasses]
+    rw [censusOperandFaultClasses_instantiate tbl subst op]
+  | copyNonOverlapping src dst count =>
+    dsimp only [NonDivergingIntrinsic.instantiate, censusIntrinsicFaultClasses]
+    rw [censusOperandFaultClasses_instantiate tbl subst src,
+        censusOperandFaultClasses_instantiate tbl subst dst,
+        censusOperandFaultClasses_instantiate tbl subst count]
+
+/--
+`[adv A3]` Statement fault-class census is unconditionally invariant under
+`StatementKind.instantiate tbl subst` for every `tbl` and `subst`.
+-/
+theorem censusStmtFaultClasses_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (sk : StatementKind) :
+    censusStmtFaultClasses (StatementKind.instantiate tbl subst sk) =
+      censusStmtFaultClasses sk := by
+  cases sk with
+  | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _
+  | storageLive _ | storageDead _ | placeMention _ => rfl
+  | deinit p =>
+    rcases p with ⟨loc, proj⟩
+    cases proj with
+    | nil => rfl
+    | cons hd tl =>
+      change dedupFaultClasses
+          (.uninitRead :: (ProjectionElem.instantiateList tbl subst (hd :: tl)).flatMap
+            censusReadProjectedFaultClasses) =
+        dedupFaultClasses
+          (.uninitRead :: (hd :: tl).flatMap censusReadProjectedFaultClasses)
+      rw [censusReadProjected_instantiateList tbl subst (hd :: tl)]
+  | retag _ p =>
+    dsimp only [StatementKind.instantiate, censusStmtFaultClasses]
+    rw [censusPlaceReadFaultClasses_instantiate tbl subst p]
+  | setDiscriminant p _ =>
+    rcases p with ⟨loc, proj⟩
+    cases proj with
+    | nil => rfl
+    | cons hd tl =>
+      dsimp only [StatementKind.instantiate, censusStmtFaultClasses]
+      rw [censusPlaceReadFaultClasses_instantiate tbl subst ⟨loc, hd :: tl⟩,
+          censusPlaceWriteFaultClasses_instantiate tbl subst ⟨loc, hd :: tl⟩]
+  | intrinsic intr =>
+    dsimp only [StatementKind.instantiate, censusStmtFaultClasses]
+    rw [censusIntrinsicFaultClasses_instantiate tbl subst intr]
+  | assign dst rv =>
+    dsimp only [StatementKind.instantiate, censusStmtFaultClasses]
+    rw [rvalueUnevaluated_instantiate tbl subst rv,
+        censusPlaceWriteFaultClasses_instantiate tbl subst dst,
+        censusRvalueFaultClasses_instantiate tbl subst rv]
+
+private theorem censusStmtsAux_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (blockIdx : BasicBlockIdx) :
+    ∀ (stmts : List Statement) (stmtIdx : Nat),
+      censusStmtsAux blockIdx stmtIdx (Statement.instantiateList tbl subst stmts) =
+        censusStmtsAux blockIdx stmtIdx stmts
+  | [], _ => rfl
+  | hd :: tl, stmtIdx => by
+    dsimp only [Statement.instantiateList, censusStmtsAux,
+      censusStmtFaultSites, Statement.instantiate]
+    rw [censusStmtFaultClasses_instantiate tbl subst hd.kind,
+        censusStmtsAux_instantiate tbl subst blockIdx tl (stmtIdx + 1)]
+
+private theorem statement_instantiateList_length
+    (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (stmts : List Statement),
+      length (Statement.instantiateList tbl subst stmts) = length stmts
+  | [] => rfl
+  | _ :: tl => congrArg Nat.succ (statement_instantiateList_length tbl subst tl)
+
+theorem terminatorTargets_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (tk : TerminatorKind) :
+    terminatorTargets (TerminatorKind.instantiate tbl subst tk) =
+      terminatorTargets tk := by
+  cases tk with
+  | call _ _ _ target _ => cases target <;> rfl
+  | _ => rfl
+
+theorem extractCalleeDefPath?_instantiate
+    (tbl : LayoutTable) (subst : TypeSubst) (func : Operand)
+    (hNoParam : operandHasNoParamConstTy func = true) :
+    extractCalleeDefPath? (Operand.instantiate tbl subst func) =
+      extractCalleeDefPath? func := by
+  cases func with
+  | copy _ => rfl
+  | move _ => rfl
+  | constant c =>
+    rcases c with ⟨⟨kind, layoutIdx⟩, val⟩
+    cases kind with
+    | param _ _ => nomatch hNoParam
+    | alias _ _ | bool | char | int _ | uint _ | float _ | never | str
+    | tuple _ | array _ _ | slice _ | ref _ _ | rawPtr _ _ | adt _ _
+    | fnDef _ _ | fnPtr _ _ _ _ | closure _ _ | dynamic _ | foreign _ | other _ => rfl
+
+/--
+`[adv A3]` Terminator fault-class census is invariant under
+`TerminatorKind.instantiate tbl subst` whenever `terminatorHasNoParamCallConst tk = true`.
+-/
+theorem censusTerminatorFaultClasses_instantiate
+    (numBlocks : Nat) (tbl : LayoutTable) (subst : TypeSubst) (tk : TerminatorKind)
+    (hNoParam : terminatorHasNoParamCallConst tk = true) :
+    censusTerminatorFaultClasses numBlocks (TerminatorKind.instantiate tbl subst tk) =
+      censusTerminatorFaultClasses numBlocks tk := by
+  cases tk with
+  | goto _ | unwindTerminate | inlineAsm _ _ _ | unreachable
+  | unwindResume | return_ => rfl
+  | switchInt discr _ =>
+    dsimp only [TerminatorKind.instantiate, censusTerminatorFaultClasses,
+      terminatorTargets]
+    rw [censusOperandFaultClasses_instantiate tbl subst discr]
+    rfl
+  | drop p target unwind =>
+    rcases p with ⟨loc, proj⟩
+    cases proj with
+    | nil => rfl
+    | cons hd tl =>
+      change dedupFaultClasses
+          ((.uninitRead :: (ProjectionElem.instantiateList tbl subst (hd :: tl)).flatMap
+              censusReadProjectedFaultClasses) ++
+            if (target :: unwindTargets unwind).any (fun t => decide (numBlocks ≤ t)) then
+              [.boundsCheck]
+            else []) =
+        dedupFaultClasses
+          ((.uninitRead :: (hd :: tl).flatMap censusReadProjectedFaultClasses) ++
+            if (target :: unwindTargets unwind).any (fun t => decide (numBlocks ≤ t)) then
+              [.boundsCheck]
+            else [])
+      rw [censusReadProjected_instantiateList tbl subst (hd :: tl)]
+  | assert cond _ _ _ =>
+    dsimp only [TerminatorKind.instantiate, censusTerminatorFaultClasses,
+      terminatorTargets]
+    rw [censusOperandFaultClasses_instantiate tbl subst cond]
+    rfl
+  | call func callArgs destination target unwind =>
+    dsimp only [terminatorHasNoParamCallConst] at hNoParam
+    dsimp only [TerminatorKind.instantiate, censusTerminatorFaultClasses]
+    rw [terminatorTargets_instantiate tbl subst (.call func callArgs destination target unwind),
+        extractCalleeDefPath?_instantiate tbl subst func hNoParam,
+        censusOperandFaultClasses_instantiate tbl subst func,
+        censusOperandFaultClasses_instantiateList tbl subst callArgs]
+    cases target with
+    | none => rfl
+    | some _ =>
+      rw [censusPlaceWriteFaultClasses_instantiate tbl subst destination]
+  | tailCall func callArgs =>
+    dsimp only [terminatorHasNoParamCallConst] at hNoParam
+    dsimp only [TerminatorKind.instantiate, censusTerminatorFaultClasses,
+      terminatorTargets]
+    rw [extractCalleeDefPath?_instantiate tbl subst func hNoParam,
+        censusOperandFaultClasses_instantiate tbl subst func,
+        censusOperandFaultClasses_instantiateList tbl subst callArgs]
+
+private theorem censusBlocksAux_instantiate
+    (numBlocks : Nat) (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (bbs : List BasicBlockData) (blockIdx : BasicBlockIdx),
+      bbs.all (fun bb => terminatorHasNoParamCallConst bb.terminator.kind) = true →
+      censusBlocksAux numBlocks blockIdx (BasicBlockData.instantiateList tbl subst bbs) =
+        censusBlocksAux numBlocks blockIdx bbs
+  | [], _, _ => rfl
+  | bb :: rest, blockIdx, hAll => by
+    rcases Bool.and_eq_true_iff.mp hAll with ⟨hBb, hRest⟩
+    dsimp only [BasicBlockData.instantiateList, censusBlocksAux,
+      censusBlockFaultSites, BasicBlockData.instantiate,
+      censusTerminatorFaultSites, Terminator.instantiate]
+    rw [censusStmtsAux_instantiate tbl subst blockIdx bb.statements 0,
+        statement_instantiateList_length tbl subst bb.statements,
+        censusTerminatorFaultClasses_instantiate numBlocks tbl subst bb.terminator.kind hBb,
+        censusBlocksAux_instantiate numBlocks tbl subst rest (blockIdx + 1) hRest]
+
+/--
+`[adv A3]` Polymorphic Generic-Instantiation Census Invariance Theorem
+(`censusMirBodyFaultSites_instantiate`):
+instantiating a polymorphic `body : CapturedMir` under any `subst : TypeSubst`
+produces the **exact same** fault-site census as `body` whenever
+`bodyHasNoParamCallConst body = true`.
+-/
+theorem censusMirBodyFaultSites_instantiate
+    (body : CapturedMir) (subst : TypeSubst)
+    (hNoParam : bodyHasNoParamCallConst body = true) :
+    censusMirBodyFaultSites (body.instantiate subst) =
+      censusMirBodyFaultSites body := by
+  dsimp only [censusMirBodyFaultSites, CapturedMir.instantiate]
+  have hLen : length (BasicBlockData.instantiateList body.layouts subst body.basicBlocks) =
+      length body.basicBlocks :=
+    BasicBlockData.instantiateList_length body.layouts subst body.basicBlocks
+  rw [hLen]
+  exact censusBlocksAux_instantiate (length body.basicBlocks) body.layouts subst
+    body.basicBlocks 0 hNoParam
+
+private theorem basicBlocks_all_terminatorTargets_instantiate
+    (numBlocks : Nat) (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (bbs : List BasicBlockData),
+      (BasicBlockData.instantiateList tbl subst bbs).all
+        (fun bb => (terminatorTargets bb.terminator.kind).all (fun t => decide (t < numBlocks))) =
+      bbs.all
+        (fun bb => (terminatorTargets bb.terminator.kind).all (fun t => decide (t < numBlocks)))
+  | [] => rfl
+  | bb :: rest => by
+    dsimp only [BasicBlockData.instantiateList, List.all_cons,
+      BasicBlockData.instantiate, Terminator.instantiate]
+    rw [terminatorTargets_instantiate tbl subst bb.terminator.kind,
+        basicBlocks_all_terminatorTargets_instantiate numBlocks tbl subst rest]
+
+/--
+`[adv A3]` `cfgTargetsInBounds` is unconditionally invariant under `body.instantiate subst`.
+-/
+theorem cfgTargetsInBounds_instantiate
+    (body : CapturedMir) (subst : TypeSubst) :
+    cfgTargetsInBounds (body.instantiate subst) = cfgTargetsInBounds body := by
+  unfold cfgTargetsInBounds
+  dsimp only [CapturedMir.instantiate]
+  rw [BasicBlockData.instantiateList_length body.layouts subst body.basicBlocks,
+      basicBlocks_all_terminatorTargets_instantiate
+        (length body.basicBlocks) body.layouts subst body.basicBlocks]
+
+private theorem get?_basicBlockData_instantiateList
+    (tbl : LayoutTable) (subst : TypeSubst) :
+    ∀ (bbs : List BasicBlockData) (idx : Nat),
+      get? (BasicBlockData.instantiateList tbl subst bbs) idx =
+        (get? bbs idx).map (BasicBlockData.instantiate tbl subst)
+  | [], idx => by cases idx <;> rfl
+  | bb :: rest, 0 => rfl
+  | bb :: rest, idx + 1 => get?_basicBlockData_instantiateList tbl subst rest idx
+
+/--
+`[adv A3]` `ValidMirPc` is unconditionally invariant under `body.instantiate subst`.
+-/
+theorem validMirPc_instantiate_iff
+    (body : CapturedMir) (subst : TypeSubst) (frame : StackFrame) :
+    ValidMirPc (body.instantiate subst) frame ↔ ValidMirPc body frame := by
+  unfold ValidMirPc
+  dsimp only [CapturedMir.instantiate]
+  rw [get?_basicBlockData_instantiateList body.layouts subst body.basicBlocks frame.blockIdx]
+  constructor
+  · rintro ⟨bbInst, hGet, hLe⟩
+    cases hOrig : get? body.basicBlocks frame.blockIdx with
+    | none => rw [hOrig] at hGet; nomatch hGet
+    | some bb =>
+      rw [hOrig] at hGet
+      injection hGet with hEq
+      subst hEq
+      have hStmtLen : length (Statement.instantiateList body.layouts subst bb.statements) =
+          length bb.statements :=
+        statement_instantiateList_length body.layouts subst bb.statements
+      rw [BasicBlockData.instantiate, hStmtLen] at hLe
+      exact ⟨bb, rfl, hLe⟩
+  · rintro ⟨bb, hGet, hLe⟩
+    rw [hGet]
+    refine ⟨BasicBlockData.instantiate body.layouts subst bb, rfl, ?_⟩
+    have hStmtLen : length (Statement.instantiateList body.layouts subst bb.statements) =
+        length bb.statements :=
+      statement_instantiateList_length body.layouts subst bb.statements
+    dsimp only [BasicBlockData.instantiate]
+    rw [hStmtLen]
+    exact hLe
+
+/--
+`[adv A3]` Interprocedural batch soundness for generic inline callees installed as
+`calleeBody.instantiate subst` by `lookupCallee`
+(`stepMirFn_exposesUb_in_batch_discharged_instantiated`):
+if `reconcileCoverageBatch registry batch = true`, the uninstantiated polymorphic
+`(calleeBody, discharged) ∈ batch` satisfies `bodyHasNoParamCallConst calleeBody = true`,
+and `s.memory.activeCallee = some (calleeBody.instantiate subst)` at a valid PC
+`ValidMirPc calleeBody s.frame`, then any one-step UB exposure of `stepMirFn body s`
+is discharged in `calleeBody`'s own `discharged` list with an `.emittedAndVerified` class.
+-/
+theorem stepMirFn_exposesUb_in_batch_discharged_instantiated
+    (registry : PropertyRegistry) (batch : CoverageBatch)
+    (body calleeBody : CapturedMir) (subst : TypeSubst)
+    (s : MachineState) (discharged : List FaultSite)
+    (hBatch : reconcileCoverageBatch registry batch = true)
+    (hItem : (calleeBody, discharged) ∈ batch)
+    (hNoParam : bodyHasNoParamCallConst calleeBody = true)
+    (hAct : s.memory.activeCallee = some (calleeBody.instantiate subst))
+    (hPc : ValidMirPc calleeBody s.frame)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  have hPcInst : ValidMirPc (s.memory.activeCallee.getD body) s.frame := by
+    rw [hAct]
+    exact (validMirPc_instantiate_iff calleeBody subst s.frame).mpr hPc
+  rcases stepMirFn_activeBody_exposesUb_in_census body s hPcInst hUb with ⟨cls, hInCensus⟩
+  rw [hAct] at hInCensus
+  dsimp only [Option.getD] at hInCensus
+  rw [censusMirBodyFaultSites_instantiate calleeBody subst hNoParam] at hInCensus
+  have hVer := ((reconcileCoverageBatch_iff registry batch).mp hBatch).2 _ hItem
+  rcases (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp hVer
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
 
 /-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
 

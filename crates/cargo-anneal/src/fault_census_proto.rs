@@ -2340,6 +2340,32 @@ const STRICT_MODULE_OPENS: [&str; 6] = [
     "Trusted.MirSemantics",
 ];
 
+/// `[adv A3]` Exact module paths a strict `Mir/<Item>.lean` module may `import`:
+/// `Trusted` or the `V2026_06_01` dialect modules re-exported by `Trusted`.
+/// Rejects `import Trusted.Evil` and foreign dialects such as
+/// `import Trusted.Rustc.V2026_08_01.MirAst`.
+const STRICT_MODULE_IMPORTS: [&str; 9] = [
+    "Trusted",
+    "Trusted.MirAst",
+    "Trusted.MirSemantics",
+    "Trusted.VerificationResult",
+    "Trusted.Rustc.V2026_06_01.Layout",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirSemantics",
+    "Trusted.Rustc.V2026_06_01",
+    "Trusted.Rustc",
+];
+
+/// `[adv A3]` True iff `ty` is `CapturedMir` or `<ns>.CapturedMir` for a dialect-pinned
+/// namespace `<ns>` in `MIR_AST_NAMESPACES` (rejecting `Evil.CapturedMir` and
+/// `Trusted.Rustc.V2026_08_01.MirAst.CapturedMir`).
+fn is_valid_captured_mir_type(ty: &str) -> bool {
+    ty == "CapturedMir"
+        || MIR_AST_NAMESPACES
+            .iter()
+            .any(|ns| ty.strip_prefix(ns).and_then(|r| r.strip_prefix('.')) == Some("CapturedMir"))
+}
+
 /// `Trusted` MIR AST type names whose constructors or fields the scanner
 /// interprets. Strict module scanning rejects any declaration or namespace that
 /// reuses one of these names, because a local `def TerminatorKind.goto` would
@@ -3823,14 +3849,27 @@ pub fn parse_lean_captured_mir_def(
     let mut found_body: Option<ProtoMirBody> = None;
 
     let mut idx = 0;
+    let mut delim_depth = 0isize;
     while idx + 4 < tokens.len() {
-        let is_def = matches!(&tokens[idx], LeanToken::Ident(kw) if kw == "def" || kw == "abbrev");
+        match &tokens[idx] {
+            LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => {
+                delim_depth += 1;
+                idx += 1;
+                continue;
+            }
+            LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => {
+                delim_depth -= 1;
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let is_def = delim_depth == 0
+            && matches!(&tokens[idx], LeanToken::Ident(kw) if kw == "def" || kw == "abbrev");
         let name_matches = matches!(&tokens[idx + 1], LeanToken::Ident(name) if name == def_name || name.ends_with(&format!(".{def_name}")));
         let is_colon = matches!(&tokens[idx + 2], LeanToken::Colon);
-        let is_captured_mir = matches!(
-            &tokens[idx + 3],
-            LeanToken::Ident(ty) if ty == "CapturedMir" || ty.ends_with(".CapturedMir")
-        );
+        let is_captured_mir =
+            matches!(&tokens[idx + 3], LeanToken::Ident(ty) if is_valid_captured_mir_type(ty));
         let is_assign = matches!(&tokens[idx + 4], LeanToken::ColonEq);
 
         if is_def && name_matches && is_colon && is_captured_mir && is_assign {
@@ -3900,6 +3939,7 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
         }
     };
     let mut scope_stack: Vec<(&'a str, &'a str)> = Vec::new();
+    let mut top_level_namespaces = 0usize;
     let mut body_defs = 0usize;
     let mut i = 0usize;
     while i < tokens.len() {
@@ -3913,9 +3953,9 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
             "import" => {
                 let imp =
                     ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
-                if imp != "Trusted" && !imp.starts_with("Trusted.") {
+                if !STRICT_MODULE_IMPORTS.contains(&imp) {
                     return Err(malformed(format!(
-                        "unsupported `import {imp}` in strict Mir module (only `Trusted` allowed)"
+                        "unsupported `import {imp}` in strict Mir module (only `Trusted` / `V2026_06_01` allowed)"
                     )));
                 }
                 i += 2;
@@ -3931,6 +3971,14 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
                     return Err(malformed(format!(
                         "namespace `{name}` shadows a MIR AST type name"
                     )));
+                }
+                if kw == "namespace" && scope_stack.is_empty() {
+                    if top_level_namespaces >= 1 {
+                        return Err(malformed(format!(
+                            "multiple top-level `namespace` blocks (`{name}`) in strict Mir module"
+                        )));
+                    }
+                    top_level_namespaces += 1;
                 }
                 scope_stack.push((kw, name));
                 i += 2;
@@ -4039,10 +4087,10 @@ fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), Ce
                     }
                     let ty_ok = j == ty_start + 1
                         && matches!(&tokens[ty_start], LeanToken::Ident(ty)
-                            if ty == "CapturedMir" || ty.ends_with(".CapturedMir"));
+                            if is_valid_captured_mir_type(ty));
                     if !ty_ok {
                         return Err(malformed(format!(
-                            "`def {name}` must be ascribed exactly `: CapturedMir`"
+                            "`def {name}` must be ascribed `: CapturedMir` (in `V2026_06_01` dialect)"
                         )));
                     }
                     body_defs += 1;
@@ -4274,8 +4322,7 @@ pub struct CalleeClosure {
 }
 
 /// `[adv B3]` Sorted, duplicate-free direct callee `DefPath`s of the `Call` / `TailCall`
-/// terminators in `body` (constant function-item operands only; indirect calls can
-/// only reach bodies in `CalleeClosure::inline_callees`).
+/// terminators in `body` (constant function-item operands only).
 pub fn direct_callee_def_paths(body: &ProtoMirBody) -> Vec<String> {
     let mut out = BTreeSet::new();
     for bb in &body.basic_blocks {
@@ -4290,6 +4337,125 @@ pub fn direct_callee_def_paths(body: &ProtoMirBody) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+/// `[adv A3]` Sorted, duplicate-free `DefPath`s of function items reified into function
+/// pointers via `Rvalue::Cast(CastKind::PointerCoercion("ReifyFnPointer*"), op)` inside
+/// `body`. In `Trusted.MirSemantics.evalReifyFnPointer` (`Places.lean:6643`), reifying a
+/// `RigidTy.fnDef` constant registers `defPath` in `s.memory.fnPtrs`, allowing subsequent
+/// indirect `Call` / `TailCall` terminators to invoke `defPath`.
+pub fn reified_fn_def_paths(body: &ProtoMirBody) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            if let ProtoStatementKind::Assign(
+                _,
+                ProtoRvalue::Cast(ProtoCastKind::PointerCoercion(coercion), op),
+            ) = &stmt.kind
+            {
+                if coercion == "ReifyFnPointer" || coercion.starts_with("ReifyFnPointer(") {
+                    if let Some(path) = op.extract_callee_def_path() {
+                        out.insert(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `[adv A3]` True iff `def_path` is natively modeled inline by `evalTerminator` on a
+/// **converging** `TerminatorKind::Call` (`target = Some(targetBb)`,
+/// `Terminators.lean:3119-3166`) without falling through to `MirStepNode.extCall`:
+/// `core::intrinsics::exact_div` (`isDirectExactDivTarget`) and all 24 non-`const_eval_select`
+/// `RustIntrinsicKind` intrinsics in `classifyRustIntrinsic?` (both the 12 faulting and
+/// the 12 zero-fault intrinsics).
+///
+/// Note: `core::intrinsics::const_eval_select` dispatches to its 3rd argument (`called_at_rt`),
+/// so it is only closed when that 3rd argument is a direct constant function item that is
+/// itself classified.
+pub fn is_natively_modeled_converging_call_callee(def_path: &str) -> bool {
+    if def_path == "core::intrinsics::exact_div" {
+        return true;
+    }
+    matches!(
+        def_path.strip_prefix("core::intrinsics::"),
+        Some(
+            "ub_checks"
+                | "arith_offset"
+                | "ctlz"
+                | "ctlz_nonzero"
+                | "cttz"
+                | "cttz_nonzero"
+                | "ctpop"
+                | "bswap"
+                | "bitreverse"
+                | "wrapping_add"
+                | "wrapping_sub"
+                | "wrapping_mul"
+                | "saturating_add"
+                | "saturating_sub"
+                | "unchecked_shl"
+                | "unchecked_shr"
+                | "unchecked_add"
+                | "unchecked_sub"
+                | "unchecked_mul"
+                | "unchecked_div"
+                | "unchecked_rem"
+                | "three_way_compare"
+                | "size_of_val"
+                | "align_of_val"
+        )
+    )
+}
+
+/// `[adv A3]` True iff `def_path` is natively modeled inline by `evalTerminator` on a
+/// **diverging** `TerminatorKind::Call` (`target = None`, `Terminators.lean:3227-3239`)
+/// without falling through to `MirStepNode.extCall`: `isUnreachableCallTarget`,
+/// `isAbortingPanicDefPath`, and `isUnwindingPanicDefPath`.
+pub fn is_natively_modeled_diverging_call_callee(def_path: &str) -> bool {
+    matches!(
+        def_path,
+        "core::hint::unreachable_unchecked"
+            | "std::hint::unreachable_unchecked"
+            | "core::intrinsics::unreachable"
+            | "core::panicking::panic_nounwind"
+            | "core::panicking::panic_nounwind_fmt"
+            | "core::panicking::panic_nounwind_fmt::panic_impl"
+            | "core::panicking::panic_nounwind_nobacktrace"
+            | "core::panicking::panic_in_cleanup"
+            | "core::panicking::panic_cannot_unwind"
+            | "core::panicking::panic_misaligned_pointer_dereference"
+            | "core::panicking::panic_null_pointer_dereference"
+            | "core::panicking::panic_invalid_enum_construction"
+            | "core::intrinsics::abort"
+            | "core::panicking::panic"
+            | "core::panicking::panic_fmt"
+            | "core::panicking::panic_fmt::panic_impl"
+            | "core::panicking::const_panic_fmt"
+            | "core::panicking::assert_failed"
+            | "core::panicking::assert_failed_inner"
+            | "core::panicking::assert_matches_failed"
+            | "core::slice::index::slice_index_fail"
+            | "core::panicking::panic_bounds_check"
+            | "core::panicking::panic_explicit"
+            | "core::panicking::panic_display"
+            | "core::panicking::panic_str_2015"
+            | "core::panicking::unreachable_display"
+            | "core::option::unwrap_failed"
+            | "core::option::expect_failed"
+            | "core::result::unwrap_failed"
+            | "core::panicking::panic_const::panic_const_add_overflow"
+            | "core::panicking::panic_const::panic_const_sub_overflow"
+            | "core::panicking::panic_const::panic_const_mul_overflow"
+            | "core::panicking::panic_const::panic_const_div_overflow"
+            | "core::panicking::panic_const::panic_const_rem_overflow"
+            | "core::panicking::panic_const::panic_const_neg_overflow"
+            | "core::panicking::panic_const::panic_const_shr_overflow"
+            | "core::panicking::panic_const::panic_const_shl_overflow"
+            | "core::panicking::panic_const::panic_const_div_by_zero"
+            | "core::panicking::panic_const::panic_const_rem_by_zero"
+    )
 }
 
 /// `[adv A2]` Fail-closed verdict for a multi-item / multi-callee verification batch.
@@ -4337,16 +4503,20 @@ impl MultiItemCoverageVerdict {
     }
 }
 
-/// `[adv A2]` / `[adv B3]` Reconcile a multi-item / multi-callee verification batch
-/// under `registry`. Returns `Verified` only when:
+/// `[adv A2]` / `[adv B3]` / `[adv A3]` Reconcile a multi-item / multi-callee
+/// verification batch under `registry`. Returns `Verified` only when:
 /// 1. the batch is non-empty and every `def_path` is unique and equals `body.def_path`;
 /// 2. every item's census, recomputed from its body, reconciles against that item's own
 ///    `discharged` list (`reconcileCoverageBatch` in Lean);
-/// 3. every `closure.inline_callees` entry has a batch item;
-/// 4. no `DefPath` is declared both inline and external; and
-/// 5. every direct `Call` / `TailCall` callee of every item is a batch item, a declared
-///    external callee, or a natively modeled intrinsic (non-empty
-///    `census_callee_def_path_fault_classes`).
+/// 3. every `closure.inline_callees` entry is unique and has a batch item;
+/// 4. no `DefPath` is declared both inline and external (and `external_callees` is duplicate-free);
+/// 5. every `Call` / `TailCall` callee of every item is in `closure.inline_callees`,
+///    in `closure.external_callees`, or natively modeled inline for that exact terminator
+///    shape (`is_natively_modeled_converging_call_callee` for converging `Call`,
+///    `is_natively_modeled_diverging_call_callee` for diverging `Call`, and none for
+///    `TailCall`, plus runtime-target closure for `core::intrinsics::const_eval_select`); and
+/// 6. every function item reified into a function pointer via `ReifyFnPointer`
+///    (`reified_fn_def_paths`) is in `closure.inline_callees` or `closure.external_callees`.
 pub fn reconcile_multi_item_coverage(
     items: &[ItemCoverageInput],
     closure: &CalleeClosure,
@@ -4393,12 +4563,21 @@ pub fn reconcile_multi_item_coverage(
         }
     }
 
-    let external: BTreeSet<&str> = closure
-        .external_callees
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let mut external: BTreeSet<&str> = BTreeSet::new();
+    for ext in &closure.external_callees {
+        if !external.insert(ext.as_str()) {
+            unsupported_reasons.push(format!(
+                "duplicate external callee `{ext}` in CalleeClosure"
+            ));
+        }
+    }
+    let mut inline_set: BTreeSet<&str> = BTreeSet::new();
     for callee in &closure.inline_callees {
+        if !inline_set.insert(callee.as_str()) {
+            unsupported_reasons.push(format!(
+                "duplicate inline callee `{callee}` in CalleeClosure"
+            ));
+        }
         if !seen_paths.contains(callee.as_str()) {
             unsupported_reasons.push(format!(
                 "inline callee `{callee}` has no batch item: its body can become \
@@ -4412,14 +4591,80 @@ pub fn reconcile_multi_item_coverage(
         }
     }
     for item in items {
-        for callee in direct_callee_def_paths(&item.body) {
-            let classified = seen_paths.contains(callee.as_str())
-                || external.contains(callee.as_str())
-                || !census_callee_def_path_fault_classes(&callee).is_empty();
-            if !classified {
+        for (bb_idx, bb) in item.body.basic_blocks.iter().enumerate() {
+            match &bb.terminator.kind {
+                ProtoTerminatorKind::Call {
+                    func,
+                    args,
+                    target: Some(_),
+                    ..
+                } => {
+                    if let Some(callee) = func.extract_callee_def_path() {
+                        if callee == "core::intrinsics::const_eval_select" {
+                            let rt_ok = args
+                                .get(2)
+                                .and_then(|op| op.extract_callee_def_path())
+                                .is_some_and(|rt| {
+                                    inline_set.contains(rt)
+                                        || external.contains(rt)
+                                        || is_natively_modeled_converging_call_callee(rt)
+                                });
+                            if !rt_ok {
+                                unsupported_reasons.push(format!(
+                                    "[{}] bb{bb_idx} `const_eval_select` runtime target is not classified in CalleeClosure",
+                                    item.def_path
+                                ));
+                            }
+                        } else {
+                            let classified = inline_set.contains(callee)
+                                || external.contains(callee)
+                                || is_natively_modeled_converging_call_callee(callee);
+                            if !classified {
+                                unsupported_reasons.push(format!(
+                                    "[{}] direct callee `{callee}` is neither a declared inline callee, \
+                                     a declared external callee, nor a natively modeled converging-call intrinsic",
+                                    item.def_path
+                                ));
+                            }
+                        }
+                    }
+                }
+                ProtoTerminatorKind::Call {
+                    func, target: None, ..
+                } => {
+                    if let Some(callee) = func.extract_callee_def_path() {
+                        let classified = inline_set.contains(callee)
+                            || external.contains(callee)
+                            || is_natively_modeled_diverging_call_callee(callee);
+                        if !classified {
+                            unsupported_reasons.push(format!(
+                                "[{}] direct callee `{callee}` is neither a declared inline callee, \
+                                 a declared external callee, nor a natively modeled diverging-call target",
+                                item.def_path
+                            ));
+                        }
+                    }
+                }
+                ProtoTerminatorKind::TailCall { func, .. } => {
+                    if let Some(callee) = func.extract_callee_def_path() {
+                        let classified = inline_set.contains(callee) || external.contains(callee);
+                        if !classified {
+                            unsupported_reasons.push(format!(
+                                "[{}] direct tail-call callee `{callee}` is neither a declared inline callee \
+                                 nor a declared external callee (`evalTailCallTerminator` does not model intrinsics inline)",
+                                item.def_path
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for reified in reified_fn_def_paths(&item.body) {
+            if !inline_set.contains(reified.as_str()) && !external.contains(reified.as_str()) {
                 unsupported_reasons.push(format!(
-                    "[{}] direct callee `{callee}` is neither a batch item, a declared \
-                     external callee, nor a natively modeled intrinsic",
+                    "[{}] reified function pointer target `{reified}` (`ReifyFnPointer`) is neither \
+                     a declared inline callee nor a declared external callee",
                     item.def_path
                 ));
             }
@@ -7188,6 +7433,268 @@ end Mir.Probe.item",
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(thm),
                 "missing `[adv B3]` Lean theorem `{thm}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a3_callee_closure_intrinsics_dialect_and_instantiate_invariance() {
+        let reg = PropertyRegistry::all_verified();
+        let item = ItemCoverageInput::from_body;
+
+        // 1. Zero-fault native `RustIntrinsicKind` intrinsics (`wrapping_add`, `ctpop`, `ub_checks`,
+        //    etc.) on a converging `Call` (`target = Some(1)`) are modeled inline by
+        //    `evalDirectRustIntrinsic?` in `Trusted.MirSemantics` and MUST reconcile as `Verified`
+        //    under `CalleeClosure::default()`, even though `census_callee_def_path_fault_classes`
+        //    returns `[]` for them!
+        for zero_fault_intrinsic in [
+            "core::intrinsics::ub_checks",
+            "core::intrinsics::ctlz",
+            "core::intrinsics::cttz",
+            "core::intrinsics::ctpop",
+            "core::intrinsics::bswap",
+            "core::intrinsics::bitreverse",
+            "core::intrinsics::wrapping_add",
+            "core::intrinsics::wrapping_sub",
+            "core::intrinsics::wrapping_mul",
+            "core::intrinsics::saturating_add",
+            "core::intrinsics::saturating_sub",
+            "core::intrinsics::three_way_compare",
+        ] {
+            assert!(
+                census_callee_def_path_fault_classes(zero_fault_intrinsic).is_empty(),
+                "{zero_fault_intrinsic}"
+            );
+            assert!(
+                is_natively_modeled_converging_call_callee(zero_fault_intrinsic),
+                "{zero_fault_intrinsic}"
+            );
+            let body = ProtoMirBody {
+                def_path: String::from("proto::calls_zero_fault_intrinsic"),
+                basic_blocks: vec![
+                    ProtoBasicBlock {
+                        statements: Vec::new(),
+                        terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                            func: ProtoOperand::const_fn(zero_fault_intrinsic),
+                            args: Vec::new(),
+                            destination: ProtoPlace::local(0),
+                            target: Some(1),
+                            unwind: ProtoUnwindAction::Continue,
+                        }),
+                        is_cleanup: false,
+                    },
+                    ProtoBasicBlock {
+                        statements: Vec::new(),
+                        terminator: ProtoTerminator::new(ProtoTerminatorKind::Return),
+                        is_cleanup: false,
+                    },
+                ],
+            };
+            let census = census_mir_fault_sites(&body);
+            assert_eq!(
+                reconcile_multi_item_coverage(&[item(body, census)], &CalleeClosure::default(), &reg),
+                MultiItemCoverageVerdict::Verified,
+                "zero-fault native intrinsic `{zero_fault_intrinsic}` must be accepted on converging Call"
+            );
+        }
+
+        // 2. Diverging `Call` (`target = None`) to aborting/unwinding panic hooks is natively
+        //    modeled in `Terminators.lean:3230-3239`, whereas a diverging `Call` to a converging-only
+        //    intrinsic (`core::intrinsics::unchecked_add`) or a `TailCall` to an intrinsic falls
+        //    through to `MirStepNode.extCall` and MUST fail closed unless declared external/inline!
+        for panic_hook in [
+            "core::panicking::panic",
+            "core::panicking::panic_fmt",
+            "core::panicking::panic_nounwind",
+            "core::intrinsics::abort",
+            "core::panicking::panic_const::panic_const_add_overflow",
+        ] {
+            let div_panic = ProtoMirBody {
+                def_path: String::from("proto::diverging_panic"),
+                basic_blocks: vec![ProtoBasicBlock {
+                    statements: Vec::new(),
+                    terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                        func: ProtoOperand::const_fn(panic_hook),
+                        args: Vec::new(),
+                        destination: ProtoPlace::local(0),
+                        target: None,
+                        unwind: ProtoUnwindAction::Continue,
+                    }),
+                    is_cleanup: false,
+                }],
+            };
+            let census = census_mir_fault_sites(&div_panic);
+            assert_eq!(
+                reconcile_multi_item_coverage(
+                    &[item(div_panic, census)],
+                    &CalleeClosure::default(),
+                    &reg
+                ),
+                MultiItemCoverageVerdict::Verified,
+                "diverging panic hook `{panic_hook}` is natively modeled"
+            );
+        }
+
+        let div_unchecked_add = ProtoMirBody {
+            def_path: String::from("proto::div_unchecked_add"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::const_fn("core::intrinsics::unchecked_add"),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: None,
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        let div_ua_census = census_mir_fault_sites(&div_unchecked_add);
+        assert!(!reconcile_multi_item_coverage(
+            &[item(div_unchecked_add, div_ua_census)],
+            &CalleeClosure::default(),
+            &reg
+        )
+        .is_verified());
+
+        let tail_call_intrinsic = ProtoMirBody {
+            def_path: String::from("proto::tail_call_intrinsic"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::TailCall {
+                    func: ProtoOperand::const_fn("core::intrinsics::unchecked_add"),
+                    args: Vec::new(),
+                }),
+                is_cleanup: false,
+            }],
+        };
+        let tc_census = census_mir_fault_sites(&tail_call_intrinsic);
+        assert!(!reconcile_multi_item_coverage(
+            &[item(tail_call_intrinsic, tc_census)],
+            &CalleeClosure::default(),
+            &reg
+        )
+        .is_verified());
+
+        // 3. Direct call to a batch item (e.g. recursive self-call or a second batch item)
+        //    that is NOT in `closure.inline_callees` or `closure.external_callees` MUST fail
+        //    closed, because `initMachineStateWithCallees` only links `closure.inline_callees`.
+        let recursive_self = ProtoMirBody {
+            def_path: String::from("proto::rec_self"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::const_fn("proto::rec_self"),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: Some(0),
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        let rec_census = census_mir_fault_sites(&recursive_self);
+        assert!(!reconcile_multi_item_coverage(
+            &[item(recursive_self.clone(), rec_census.clone())],
+            &CalleeClosure::default(),
+            &reg
+        )
+        .is_verified());
+        let rec_inline = CalleeClosure {
+            inline_callees: vec![String::from("proto::rec_self")],
+            external_callees: Vec::new(),
+        };
+        assert_eq!(
+            reconcile_multi_item_coverage(&[item(recursive_self, rec_census)], &rec_inline, &reg),
+            MultiItemCoverageVerdict::Verified
+        );
+
+        // 4. Function items reified via `CastKind::PointerCoercion("ReifyFnPointer")`
+        //    (`reified_fn_def_paths`) must be classified in `CalleeClosure`.
+        let reified_body = ProtoMirBody {
+            def_path: String::from("proto::reifies_fn"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: vec![ProtoStatement::new(ProtoStatementKind::Assign(
+                    ProtoPlace::local(1),
+                    ProtoRvalue::Cast(
+                        ProtoCastKind::PointerCoercion(String::from("ReifyFnPointer")),
+                        ProtoOperand::const_fn("proto::hidden_target"),
+                    ),
+                ))],
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Return),
+                is_cleanup: false,
+            }],
+        };
+        assert_eq!(
+            reified_fn_def_paths(&reified_body),
+            vec![String::from("proto::hidden_target")]
+        );
+        let reified_census = census_mir_fault_sites(&reified_body);
+        assert!(!reconcile_multi_item_coverage(
+            &[item(reified_body.clone(), reified_census.clone())],
+            &CalleeClosure::default(),
+            &reg
+        )
+        .is_verified());
+        let reified_ext = CalleeClosure {
+            inline_callees: Vec::new(),
+            external_callees: vec![String::from("proto::hidden_target")],
+        };
+        assert_eq!(
+            reconcile_multi_item_coverage(
+                &[item(reified_body, reified_census)],
+                &reified_ext,
+                &reg
+            ),
+            MultiItemCoverageVerdict::Verified
+        );
+
+        // 5. Dialect pinning in `import`, `: CapturedMir` type ascription, and single top-level
+        //    `namespace` enforcement in `check_strict_mir_module_grammar`.
+        let unreachable_block = single_terminator_block("TerminatorKind.unreachable");
+        let baseline = strict_module_with_blocks("", &unreachable_block);
+        let evil_trusted_import = baseline.replace("import Trusted", "import Trusted.Evil");
+        assert!(census_lean_mir_module(&evil_trusted_import).is_err());
+        let wrong_dialect_import =
+            baseline.replace("import Trusted", "import Trusted.Rustc.V2026_08_01.MirAst");
+        assert!(census_lean_mir_module(&wrong_dialect_import).is_err());
+        let evil_captured_mir_ty =
+            baseline.replace("def body : CapturedMir", "def body : Evil.CapturedMir");
+        assert!(census_lean_mir_module(&evil_captured_mir_ty).is_err());
+        assert!(census_lean_mir_def(&evil_captured_mir_ty, "body").is_err());
+        let wrong_dialect_captured_mir_ty = baseline.replace(
+            "def body : CapturedMir",
+            "def body : Trusted.Rustc.V2026_08_01.MirAst.CapturedMir",
+        );
+        assert!(census_lean_mir_module(&wrong_dialect_captured_mir_ty).is_err());
+        let two_top_namespaces = format!(
+            "import Trusted\nnamespace First\nend First\n{}",
+            baseline.trim_start_matches("import Trusted\n")
+        );
+        assert!(census_lean_mir_module(&two_top_namespaces).is_err());
+
+        // 6. Verify all new `[adv A3]` Lean theorems exist in `theory/Anneal/FaultSiteCensusPrototype.lean`.
+        for thm in [
+            "theorem validMirPc_applyUnwindAction_top",
+            "theorem validMirPc_resumeExternalCall",
+            "theorem validMirPc_resumeExternalDivergingCall",
+            "theorem resumeExternalTailCall_top_ne_running",
+            "theorem validMirPc_unwindFromCallStack",
+            "theorem validMirPc_resumeExternalTailCall",
+            "theorem mirStepsWithExtCalls_preserves_validMirPc",
+            "theorem initMachineState_mirStepsWithExtCalls_exposesUb_in_census",
+            "theorem initMachineState_mirStepsWithExtCalls_reconciled_safety",
+            "theorem reconcileCoverageBatch_nil",
+            "theorem censusStmtFaultClasses_instantiate",
+            "theorem censusTerminatorFaultClasses_instantiate",
+            "theorem censusMirBodyFaultSites_instantiate",
+            "theorem cfgTargetsInBounds_instantiate",
+            "theorem validMirPc_instantiate_iff",
+            "theorem stepMirFn_exposesUb_in_batch_discharged_instantiated",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(thm),
+                "missing `[adv A3]` Lean theorem `{thm}`"
             );
         }
     }
