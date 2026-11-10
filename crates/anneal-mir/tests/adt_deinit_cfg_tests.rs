@@ -17,12 +17,13 @@ use anneal_mir::ir::{
 };
 use anneal_mir::lower::{
     CallOutcome, CastEvalError, CastLowerError, CfgEvalError, CfgEvalOutcome,
-    ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredStatement,
-    LoweredTerminator, MirValue, PanicMessage, RvalueEvalError, RvalueLowerError,
-    StatementEvalState, TerminatorLowerError, TransmutePolicy, TransmuteValue, eval_cfg_in_state,
-    eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls, eval_lowered_rvalue_in_state,
-    eval_lowered_statement, eval_transmute, lower_body, lower_rvalue, lower_statement,
-    lower_terminator, resolve_offset_of, resolve_place_ty,
+    ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue,
+    LoweredStatement, LoweredTerminator, MirValue, PanicMessage, PartialAggregate, RvalueEvalError,
+    RvalueLowerError, StatementEvalState, TerminatorLowerError, TransmutePolicy, TransmuteValue,
+    eval_cfg_in_state, eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls,
+    eval_lowered_rvalue, eval_lowered_rvalue_in_state, eval_lowered_statement, eval_transmute,
+    lower_body, lower_rvalue, lower_statement, lower_terminator, resolve_offset_of,
+    resolve_place_ty,
 };
 
 const PW: PtrWidth = PtrWidth::Bits64;
@@ -5466,4 +5467,749 @@ fn test_property_cfg_evaluator_matches_a_reference_interpreter() {
         seen.iter().all(|count| *count >= 50),
         "outcome distribution {seen:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [ep1-adv B1] Regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_uninhabited_variants()
+ {
+    let (_, opt) = rust_option_u32();
+    // 1. `#[repr(transparent)]` structs and unions with a second non-1-ZST field whose layout is
+    // `Unspecified` (`Option<u32>`) must be rejected as ill-formed (`E0690`), not treated as a
+    // valid 1-field wrapper with an inexact layout.
+    let bad_trans_struct =
+        Ty::adt(AdtDef::new_struct("BadTS", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()));
+    assert!(matches!(
+        bad_trans_struct.layout_for(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+    assert!(matches!(
+        bad_trans_struct.check_representable(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+    let bad_trans_union =
+        Ty::adt(AdtDef::new_union("BadTU", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()));
+    assert!(matches!(
+        bad_trans_union.layout_for(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+    assert!(matches!(
+        bad_trans_union.check_representable(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+
+    // 2. `AdtDef::field_offset` and `resolve_offset_of` (including an empty path `&[]`) must
+    // reject containers whose overall layout is `Unspecified`, even when querying an earlier
+    // field whose offset would otherwise be known.
+    let (s_opt_def, s_opt_ty) = adt(
+        AdtDef::new_struct("SOpt", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::c()),
+    );
+    assert_eq!(s_opt_ty.layout_for(PW), Err(LayoutError::Unspecified));
+    assert_eq!(
+        s_opt_def.field_offset(0, 0, PW),
+        Err(LayoutError::Unspecified)
+    );
+    assert_eq!(
+        resolve_offset_of(&s_opt_ty, &[(0, 0)], PW),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(s_opt_ty.clone()))
+    );
+    assert_eq!(
+        resolve_offset_of(&opt, &[], PW),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(opt.clone()))
+    );
+    let (u_opt_def, u_opt_ty) =
+        adt(AdtDef::new_union("UOpt", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::c()));
+    assert_eq!(
+        u_opt_def.field_offset(0, 0, PW),
+        Err(LayoutError::Unspecified)
+    );
+    assert_eq!(
+        resolve_offset_of(&u_opt_ty, &[], PW),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(u_opt_ty))
+    );
+
+    // 3. `#[repr(u8)]` enums with uninhabited variants or niche-carrying payload fields:
+    // - 256 variants where variant 0 holds `!` has only 255 inhabited tags, so it still has a
+    //   niche;
+    // - 256 inhabited variants where variant 0 holds `bool` has a payload niche (`contains_niche`),
+    //   so a union containing it is not canonical for transmutation.
+    let mut vars_with_never: Vec<VariantDef> =
+        vec![VariantDef::new("V0", vec![Ty::Never])];
+    for i in 1..256 {
+        vars_with_never.push(VariantDef::new(format!("V{i}"), vec![]));
+    }
+    let (_, e256_never) = adt(AdtDef::new_enum(
+        "E256Never",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vars_with_never,
+    ));
+    assert!(e256_never.contains_niche_for(PW));
+
+    let mut vars_with_bool: Vec<VariantDef> =
+        vec![VariantDef::new("V0", vec![Ty::Bool]).with_discriminant(0)];
+    for i in 1..256 {
+        vars_with_bool.push(
+            VariantDef::new(format!("V{i}"), vec![u8_ty()]).with_discriminant(i as u128),
+        );
+    }
+    let (_, e256_bool) = adt(
+        AdtDef::new_enum("E256Bool", Some(ScalarTy::Uint(UintTy::U8)), vars_with_bool)
+            .with_repr(AdtRepr::c()),
+    );
+    assert!(e256_bool.contains_niche_for(PW));
+    let (_, union_e256_bool) =
+        adt(AdtDef::new_union("UE256Bool", vec![e256_bool]).with_repr(AdtRepr::c()));
+    assert!(!union_e256_bool.has_canonical_byte_layout(PW));
+
+    // 4. Transmuting bytes whose tag selects an uninhabited variant (`Dead(u8, !) = 0`) of an
+    // inhabited `#[repr(C, u8)]` enum must fail with `InvalidBitPattern` for the enum type, not
+    // `UninhabitedTarget { target_ty: Ty::Never }`.
+    let (_, e_dead_live) = adt(
+        AdtDef::new_enum(
+            "EDeadLive",
+            Some(ScalarTy::Uint(UintTy::U8)),
+            vec![
+                VariantDef::new("Dead", vec![u8_ty(), Ty::Never]).with_discriminant(0),
+                VariantDef::new("Live", vec![u8_ty()]).with_discriminant(1),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    );
+    let mut state = state_with(vec![e_dead_live.clone(), u16_ty()], PW);
+    assert_eq!(
+        transmute(&mut state, 0, cint(0x0000, u16_ty()), e_dead_live.clone()),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: e_dead_live.clone(),
+                bits: 0,
+            }
+        ))
+    );
+    transmute(&mut state, 0, cint(0x2A01, u16_ty()), e_dead_live).unwrap();
+}
+
+#[test]
+fn test_b1_place_access_checks_dynamic_index_bounds_and_active_variants_across_drop_call_retag_and_discriminant()
+ {
+    let (enum_def, enum_ty) = repr_u8_enum(); // V0(u8, u32), V1(u16)
+    let (single_def, single_ty) = adt(AdtDef::new_struct("Single", vec![u8_ty()]));
+    let (enum_single_def, enum_single_ty) = adt(AdtDef::new_enum(
+        "ESingle",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![single_ty.clone()]),
+            VariantDef::new("B", vec![single_ty.clone()]),
+        ],
+    ));
+    let arr_ty = Ty::Array(Box::new(single_ty.clone()), 2);
+    let decls = vec![
+        unit(),                  // _0
+        arr_ty.clone(),          // _1: [Single; 2]
+        usize_ty(),              // _2: usize index
+        enum_ty.clone(),         // _3: ReprU8
+        enum_single_ty.clone(),  // _4: ESingle
+        u8_ty(),                 // _5: discriminant scratch
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    state.slots[1] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![
+            MirValue::adt(&single_def, 0, vec![u8v(1)]),
+            MirValue::adt(&single_def, 0, vec![u8v(2)]),
+        ],
+        elem_ty: single_ty.clone(),
+    });
+    state.slots[2] = LocalSlotState::Init(usizev(5)); // out of bounds for len 2
+    state.slots[3] = LocalSlotState::Init(MirValue::adt(&enum_def, 0, vec![u8v(1), u32v(2)]));
+    state.slots[4] = LocalSlotState::Init(MirValue::adt(
+        &enum_single_def,
+        0,
+        vec![MirValue::adt(&single_def, 0, vec![u8v(9)])],
+    ));
+
+    let oob_elem = place(1, vec![ProjectionElem::Index(Local(2))]);
+    let inactive_v1 = place(3, vec![ProjectionElem::Downcast(1), field(0, u16_ty())]);
+    let inactive_single = place(
+        4,
+        vec![ProjectionElem::Downcast(1), field(0, single_ty.clone())],
+    );
+
+    // 1. `Statement::Retag` on a place without references still validates dynamic array bounds
+    // and active variants on `Downcast`.
+    assert_eq!(
+        run(retag(RetagKind::Default, oob_elem.clone()), &mut state),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 5, len: 2 })
+    );
+    assert_eq!(
+        run(retag(RetagKind::Default, inactive_v1.clone()), &mut state),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0,
+        })
+    );
+    // Even when `_1` is `Uninit`, static array length catches out-of-bounds `Index(_2)`.
+    state.slots[1] = LocalSlotState::Uninit;
+    assert_eq!(
+        run(retag(RetagKind::Default, oob_elem.clone()), &mut state),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 5, len: 2 })
+    );
+
+    // 2. `Rvalue::Discriminant` on a single-variant ADT (`!def.requires_tag_write()`) still
+    // validates `Index` bounds and outer `Downcast` active variants in both stateful and pure
+    // evaluation.
+    assert_eq!(
+        run(
+            assign(local(5), Rvalue::Discriminant(oob_elem.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 5, len: 2 })
+    );
+    assert_eq!(
+        run(
+            assign(local(5), Rvalue::Discriminant(inactive_single.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0,
+        })
+    );
+    let lowered_discr =
+        lower_rvalue(&Rvalue::Discriminant(inactive_single.clone()), &decls, PW).unwrap();
+    let pure_locals = vec![
+        MirValue::Unit,
+        MirValue::Array {
+            elements: vec![
+                MirValue::adt(&single_def, 0, vec![u8v(1)]),
+                MirValue::adt(&single_def, 0, vec![u8v(2)]),
+            ],
+            elem_ty: single_ty,
+        },
+        usizev(5),
+        MirValue::adt(&enum_def, 0, vec![u8v(1), u32v(2)]),
+        MirValue::adt(
+            &enum_single_def,
+            0,
+            vec![MirValue::adt(&single_def, 0, vec![u8v(9)])],
+        ),
+        u8v(0),
+    ];
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered_discr,
+            &pure_locals,
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &mut ExposedProvenanceTracker::new(),
+        ),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0,
+        })
+    );
+
+    // 3. `Terminator::Drop` and `Terminator::Call` (even when panicking) reject out-of-bounds
+    // `Index` and inactive `Downcast` places.
+    let drop_oob_body = lower_ok(
+        &mk_body(
+            decls.clone(),
+            vec![
+                blk(
+                    vec![],
+                    drop_t(oob_elem.clone(), 1, UnwindAction::Continue),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        ),
+        PW,
+    );
+    assert_eq!(
+        eval_cfg_in_state(&drop_oob_body, state.clone(), 0, 4, None),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::IndexOutOfBounds { index: 5, len: 2 },
+        })
+    );
+
+    let drop_inactive_body = lower_ok(
+        &mk_body(
+            decls.clone(),
+            vec![
+                blk(
+                    vec![],
+                    drop_t(inactive_v1.clone(), 1, UnwindAction::Continue),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        ),
+        PW,
+    );
+    assert_eq!(
+        eval_cfg_in_state(&drop_inactive_body, state.clone(), 0, 4, None),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::InactiveVariantProjection {
+                expected: 1,
+                actual: 0,
+            },
+        })
+    );
+
+    let call_inactive_body = lower_ok(
+        &mk_body(
+            decls,
+            vec![
+                blk(
+                    vec![],
+                    Terminator::Call {
+                        func: cint(1, u32_ty()),
+                        args: vec![],
+                        destination: inactive_v1,
+                        target: Some(1),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        ),
+        PW,
+    );
+    let mut panic_handler =
+        |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Panic("boom".into()));
+    assert_eq!(
+        eval_cfg_in_state(
+            &call_inactive_body,
+            state,
+            0,
+            4,
+            Some(&mut panic_handler),
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::InactiveVariantProjection {
+                expected: 1,
+                actual: 0,
+            },
+        })
+    );
+}
+
+#[test]
+fn test_b1_set_discriminant_and_discriminant_variant_ordering_and_fieldless_array_switches() {
+    let (e_def, e_ty) = adt(AdtDef::new_enum(
+        "E",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("Data", vec![u32_ty()]),
+            VariantDef::new("Unit", vec![]),
+            VariantDef::new("Dead", vec![Ty::Never]),
+        ],
+    ));
+    let (outer_def, outer_ty) = adt(AdtDef::new_enum(
+        "Outer",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("Left", vec![e_ty.clone()]),
+            VariantDef::new("Right", vec![e_ty.clone()]),
+        ],
+    ));
+    let arr_e_ty = Ty::Array(Box::new(e_ty.clone()), 2);
+    let decls = vec![
+        u8_ty(),           // _0
+        e_ty.clone(),      // _1: E
+        arr_e_ty.clone(),  // _2: [E; 2]
+        usize_ty(),        // _3: index
+        outer_ty.clone(),  // _4: Outer
+    ];
+    let mut state = state_with(decls, PW);
+
+    // 1. `SetDiscriminant` checks `DeadLocal`, index operands, and outer `InactiveVariantProjection`
+    // before checking `UninhabitedEnumVariant`, and reports `TypeMismatch` on out-of-range
+    // variant indices in hand-built `LoweredStatement::SetDiscriminant`.
+    state.slots[1] = LocalSlotState::Dead;
+    assert_eq!(
+        run(
+            Statement::SetDiscriminant {
+                place: local(1),
+                variant_index: 2,
+            },
+            &mut state
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+    state.slots[1] = LocalSlotState::Uninit;
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: local(1),
+                place_ty: e_ty.clone(),
+                variant_index: 99,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    state.slots[4] = LocalSlotState::Init(MirValue::adt(
+        &outer_def,
+        0,
+        vec![MirValue::adt(&e_def, 1, vec![])],
+    ));
+    let inactive_inner = place(
+        4,
+        vec![ProjectionElem::Downcast(1), field(0, e_ty.clone())],
+    );
+    assert_eq!(
+        run(
+            Statement::SetDiscriminant {
+                place: inactive_inner,
+                variant_index: 2,
+            },
+            &mut state
+        ),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0,
+        })
+    );
+
+    // 2. Switching a typed enum element inside an initialized array (`_2[_3]`) from a data
+    // variant `Data(42)` to a fieldless variant `Unit` succeeds in place without needing an
+    // array shell; switching from `Unit` to `Data(u32)` fails closed with `UnsupportedPlaceProjection`.
+    state.slots[2] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![
+            MirValue::adt(&e_def, 0, vec![u32v(42)]),
+            MirValue::adt(&e_def, 1, vec![]),
+        ],
+        elem_ty: e_ty.clone(),
+    });
+    state.slots[3] = LocalSlotState::Init(usizev(0));
+    let elem0 = place(2, vec![ProjectionElem::Index(Local(3))]);
+    run(
+        Statement::SetDiscriminant {
+            place: elem0.clone(),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        read(&state, &elem0),
+        Ok(MirValue::adt(&e_def, 1, vec![]))
+    );
+    assert_eq!(
+        run(
+            Statement::SetDiscriminant {
+                place: elem0.clone(),
+                variant_index: 0,
+            },
+            &mut state
+        ),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(elem0))
+    );
+
+    // 3. `Rvalue::Discriminant` on a shell whose tag selects an uninhabited variant (`Dead(!)`)
+    // fails closed with `UninhabitedEnumVariant`.
+    let mut dead_shell = PartialAggregate::new_uninit_adt(&e_def, 2).unwrap();
+    dead_shell.discriminant_set = true;
+    state.slots[1] = LocalSlotState::PartialShell(dead_shell);
+    assert_eq!(
+        run(assign(local(0), Rvalue::Discriminant(local(1))), &mut state),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 2 })
+    );
+}
+
+#[test]
+fn test_b1_copy_nonoverlapping_whole_local_zst_dead_provenance_and_layout_guards() {
+    let zst_src_ty = raw(unit(), Mutability::Not);
+    let zst_dst_ty = raw(unit(), Mutability::Mut);
+    let u32_src_ty = raw(u32_ty(), Mutability::Not);
+    let u32_dst_ty = raw(u32_ty(), Mutability::Mut);
+    let decls = vec![
+        unit(),             // _0: ()
+        unit(),             // _1: ()
+        zst_src_ty.clone(), // _2: *const ()
+        zst_dst_ty.clone(), // _3: *mut ()
+        u32_ty(),           // _4: u32
+        u32_src_ty.clone(), // _5: *const u32
+    ];
+    let mut state = state_with(decls, PW);
+    run(
+        assign(local(2), Rvalue::RawPtr(Mutability::Not, local(0))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(local(3), Rvalue::RawPtr(Mutability::Mut, local(1))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(local(5), Rvalue::RawPtr(Mutability::Not, local(4))),
+        &mut state,
+    )
+    .unwrap();
+
+    // 1. Whole-local `copy_nonoverlapping::<()>(src, dst, 1)` copies `_0`'s initialization state
+    // (`Init(Unit)` or `Uninit`) into `_1`, and faults with `DeadLocal` when `_0` or `_1` is `Dead`.
+    state.slots[0] = LocalSlotState::Init(MirValue::Unit);
+    state.slots[1] = LocalSlotState::Uninit;
+    run(
+        copy_nonoverlapping(cp(2), cp(3), cint(1, usize_ty())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(1)), Some(&MirValue::Unit));
+
+    state.slots[0] = LocalSlotState::Uninit;
+    run(
+        copy_nonoverlapping(cp(2), cp(3), cint(1, usize_ty())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+
+    state.slots[0] = LocalSlotState::Dead;
+    assert_eq!(
+        run(
+            copy_nonoverlapping(cp(2), cp(3), cint(1, usize_ty())),
+            &mut state
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(0)))
+    );
+    // `count == 0` is a no-op even when `_0` is `Dead`.
+    run(
+        copy_nonoverlapping(cp(2), cp(3), cint(0, usize_ty())),
+        &mut state,
+    )
+    .unwrap();
+
+    // 2. When `byte_len > 0` and a pointer carries the provenance of a `Dead` local (`_4`),
+    // `copy_nonoverlapping` reports `DeadLocal(Local(4))` even when `count > 1` or the peer
+    // pointer is not a whole-local pointer.
+    state.slots[4] = LocalSlotState::Dead;
+    assert_eq!(
+        run(
+            copy_nonoverlapping(
+                cp(5),
+                ptr_const(0x9000, Some(99), u32_dst_ty.clone()),
+                cint(2, usize_ty()),
+            ),
+            &mut state
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(4)))
+    );
+
+    // 3. Hand-built `LoweredStatement::CopyNonOverlapping` with wrong `elem_size` / `elem_align`
+    // fails closed with `TypeMismatch`.
+    state.slots[4] = LocalSlotState::Init(u32v(7));
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::CopyNonOverlapping {
+                src: cp(5),
+                dst: ptr_const(0x9000, Some(99), u32_dst_ty),
+                count: cint(0, usize_ty()),
+                elem_ty: u32_ty(),
+                elem_size: 8, // wrong size for u32
+                elem_align: 4,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
+#[test]
+fn test_b1_hand_built_lowered_casts_rvalues_shells_and_cfg_terminators_fail_closed() {
+    let (nz_def, nz_ty) = non_zero_u32();
+    let (s1_def, s1_ty) = adt(AdtDef::new_struct("S1", vec![u32_ty(), u32_ty()]));
+    let (s2_def, _) = adt(AdtDef::new_struct("S2", vec![u32_ty(), u32_ty()]));
+    let bad_adt = Ty::adt(AdtDef::new_struct("BadAlign", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(3)));
+
+    // 1. `Subtype` lowering rejects ill-formed ADTs.
+    assert!(matches!(
+        lower_rvalue(
+            &Rvalue::Cast(CastKind::Subtype, cp(0), bad_adt.clone()),
+            &[bad_adt],
+            PW,
+        ),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::IllFormedType { .. }
+        ))
+    ));
+
+    // 2. Hand-built `LoweredCast::Subtype` and `LoweredRvalue::WrapUnsafeBinder` validate
+    // `scalar_valid_range`, and hand-built `LoweredCast::PointerCoercion` validates coercion
+    // types.
+    let decls = vec![nz_ty.clone(), s1_ty.clone(), u32_ty()];
+    let mut state = state_with(decls.clone(), PW);
+    state.slots[0] = LocalSlotState::Init(MirValue::adt(&nz_def, 0, vec![u32v(0)]));
+    let hand_subtype = LoweredRvalue::Cast {
+        cast: anneal_mir::lower::LoweredCast::Subtype {
+            operand: cp(0),
+            src_ty: nz_ty.clone(),
+            target_ty: nz_ty.clone(),
+        },
+        ty: nz_ty.clone(),
+    };
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(&hand_subtype, &mut state),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz_ty.clone(),
+                bits: 0,
+            }
+        ))
+    );
+    let hand_binder = LoweredRvalue::WrapUnsafeBinder {
+        operand: cp(0),
+        operand_ty: nz_ty.clone(),
+        ty: nz_ty.clone(),
+    };
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(&hand_binder, &mut state),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz_ty,
+                bits: 0,
+            }
+        ))
+    );
+    let const_u8 = raw(u8_ty(), Mutability::Not);
+    let mut_u8 = raw(u8_ty(), Mutability::Mut);
+    let hand_coercion = LoweredRvalue::Cast {
+        cast: anneal_mir::lower::LoweredCast::PointerCoercion {
+            coercion: PointerCoercionKind::MutToConstPointer,
+            operand: Operand::Constant(Constant::Ptr(
+                PointerValue::without_provenance(8),
+                const_u8.clone(),
+            )),
+            src_ty: const_u8,
+            target_ty: mut_u8.clone(),
+        },
+        ty: mut_u8,
+    };
+    assert!(matches!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(&hand_coercion, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 3. A `PartialShell` whose `adt_def` (`S2`) does not match the local's declared `Ty::Adt(S1)`
+    // is rejected with `TypeMismatch` across read, write, deinit, retag, and SetDiscriminant.
+    let mut wrong_shell = PartialAggregate::new_uninit_adt(&s2_def, 0).unwrap();
+    wrong_shell.fields[0] = anneal_mir::lower::FieldSlot::Init(u32v(1));
+    state.slots[1] = LocalSlotState::PartialShell(wrong_shell);
+    let f0 = place(1, vec![field(0, u32_ty())]);
+    let f1 = place(1, vec![field(1, u32_ty())]);
+    assert!(matches!(
+        state.read_place(&f0),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&f1, &u32_ty(), u32v(2)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.deinit_place(&f0, &u32_ty()),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.retag_place(RetagKind::Default, &local(1), &s1_ty),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: local(1),
+                place_ty: s1_ty,
+                variant_index: 0,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let _ = s1_def;
+
+    // 4. Hand-built CFG terminators: `SwitchInt` with mismatched values/targets lengths, `Call`
+    // with `target: Some(_)` on an uninhabited destination, and `Assert` with mistyped message
+    // operands fail closed with `TypeMismatch`.
+    let run_hand_term = |decls: Vec<Ty>, term: LoweredTerminator| {
+        let state = state_with(decls.clone(), PW);
+        let body = LoweredBody {
+            local_decls: decls,
+            basic_blocks: vec![
+                LoweredBasicBlock {
+                    statements: vec![],
+                    terminator: Some(term),
+                    is_cleanup: false,
+                },
+                LoweredBasicBlock {
+                    statements: vec![],
+                    terminator: Some(LoweredTerminator::Return { ret_ty: unit() }),
+                    is_cleanup: false,
+                },
+            ],
+            ptr_width: PW,
+        };
+        let mut handler =
+            |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Panic("p".into()));
+        eval_cfg_in_state(&body, state, 0, 4, Some(&mut handler))
+    };
+    assert!(matches!(
+        run_hand_term(
+            vec![unit()],
+            LoweredTerminator::SwitchInt {
+                discr: cint(0, u32_ty()),
+                discr_ty: u32_ty(),
+                targets: SwitchTargets {
+                    values: vec![0, 1],
+                    targets: vec![1],
+                    otherwise: 1,
+                },
+            },
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
+    assert!(matches!(
+        run_hand_term(
+            vec![unit(), Ty::Never],
+            LoweredTerminator::Call {
+                func: cint(1, u32_ty()),
+                func_ty: u32_ty(),
+                args: vec![],
+                arg_tys: vec![],
+                destination: local(1),
+                dest_ty: Ty::Never,
+                target: Some(1),
+                unwind: UnwindAction::Continue,
+            },
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
+    assert!(matches!(
+        run_hand_term(
+            vec![unit()],
+            LoweredTerminator::Assert {
+                cond: cbool(false),
+                expected: true,
+                msg: AssertMessage::BoundsCheck {
+                    len: cint(2, u32_ty()), // not usize!
+                    index: cint(0, usize_ty()),
+                },
+                target: 1,
+                unwind: UnwindAction::Continue,
+            },
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
 }

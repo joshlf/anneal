@@ -1169,20 +1169,9 @@ fn struct_like_layout(
         }
         AdtReprKind::Transparent => {
             let mut inner: Option<LayoutInfo> = None;
-            let mut upper = LayoutInfo::exact(0, 1);
-            let mut unpadded = 0usize;
             for field in fields {
                 let field_info = field.layout_info(ptr_width)?;
-                unpadded = unpadded
-                    .checked_add(field_info.size)
-                    .ok_or(LayoutError::TooLarge)?;
-                upper.align = upper.align.max(field_info.align);
-                upper.min_align = upper.min_align.max(field_info.min_align);
-                upper.exact &= field_info.exact;
-                if !field_info.exact {
-                    continue;
-                }
-                if field_info.size == 0 {
+                if field_info.exact && field_info.size == 0 {
                     if field_info.align != 1 {
                         return Err(LayoutError::IllFormed(
                             "repr(transparent) zero-sized fields must have alignment 1 (E0691)",
@@ -1196,13 +1185,6 @@ fn struct_like_layout(
                     ));
                 }
                 inner = Some(field_info);
-            }
-            if !upper.exact {
-                // A field with an unspecified layout may or may not be a 1-ZST.
-                upper.size = unpadded
-                    .checked_next_multiple_of(upper.align)
-                    .ok_or(LayoutError::TooLarge)?;
-                return Ok(upper);
             }
             Ok(inner.unwrap_or(LayoutInfo::exact(0, 1)))
         }
@@ -1619,18 +1601,20 @@ impl AdtDef {
                 let mut non_zst_fields = 0usize;
                 for field in fields {
                     let field_info = field.layout_info(ptr_width)?;
-                    if transparent && field_info.exact {
-                        if field_info.size != 0 {
+                    if transparent {
+                        if field_info.exact && field_info.size == 0 {
+                            if field_info.align != 1 {
+                                return Err(LayoutError::IllFormed(
+                                    "repr(transparent) zero-sized fields must have alignment 1 (E0691)",
+                                ));
+                            }
+                        } else {
                             non_zst_fields += 1;
                             if non_zst_fields > 1 {
                                 return Err(LayoutError::IllFormed(
                                     "repr(transparent) allows at most one non-zero-sized field (E0690)",
                                 ));
                             }
-                        } else if field_info.align != 1 {
-                            return Err(LayoutError::IllFormed(
-                                "repr(transparent) zero-sized fields must have alignment 1 (E0691)",
-                            ));
                         }
                     }
                     info.size = info.size.max(field_info.size);
@@ -1698,12 +1682,15 @@ impl AdtDef {
         field_idx: usize,
         ptr_width: PtrWidth,
     ) -> Result<usize, LayoutError> {
-        self.layout_info(ptr_width)?;
+        let info = self.layout_info(ptr_width)?;
         let Some(fields) = self.variant_fields(variant_idx) else {
             return Err(LayoutError::IllFormed("variant index out of range"));
         };
         if field_idx >= fields.len() {
             return Err(LayoutError::IllFormed("field index out of range"));
+        }
+        if !info.exact {
+            return Err(LayoutError::Unspecified);
         }
         match &self.kind {
             AdtKind::Union { .. } => Ok(0),
@@ -1777,10 +1764,21 @@ impl AdtDef {
                 match tag_ty {
                     Some(tag) => {
                         let width = tag.bit_width(ptr_width);
-                        match self.discriminants(ptr_width) {
-                            Ok(discrs) => width >= 128 || (discrs.len() as u128) <= width_mask(width),
+                        let inhabited_variants = variants
+                            .iter()
+                            .filter(|v| v.fields.iter().all(|f| f.is_inhabited_for(ptr_width)))
+                            .count();
+                        let tag_has_niche = match self.discriminants(ptr_width) {
+                            Ok(_) => {
+                                width >= 128
+                                    || (inhabited_variants as u128) <= width_mask(width)
+                            }
                             Err(_) => true,
-                        }
+                        };
+                        tag_has_niche
+                            || variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|f| f.contains_niche_for(ptr_width)))
                     }
                     None if variants.len() == 1 => variants[0]
                         .fields

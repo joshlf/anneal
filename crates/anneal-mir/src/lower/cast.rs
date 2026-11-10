@@ -265,27 +265,19 @@ pub fn is_subtype_compatible(src: &Ty, target: &Ty) -> bool {
     }
 }
 
-/// Lowers a `CastKind::PointerCoercion` (`MutToConstPointer`: `*mut T -> *const T`;
-/// `ArrayToPointer`: `*m [T; N] -> *m T` with the same mutability).
-fn lower_pointer_coercion(
+/// Returns true if `coercion` is a valid `CastKind::PointerCoercion` from `src_ty` to
+/// `target_ty`.
+pub(crate) fn is_valid_pointer_coercion(
     coercion: PointerCoercionKind,
-    operand: &Operand,
     src_ty: &Ty,
     target_ty: &Ty,
-) -> Result<LoweredCast, CastLowerError> {
-    let Ty::RawPtr(src_pointee, src_mut) = src_ty else {
-        return Err(CastLowerError::InvalidSourceType {
-            expected: "raw pointer",
-            got: src_ty.clone(),
-        });
+) -> bool {
+    let (Ty::RawPtr(src_pointee, src_mut), Ty::RawPtr(target_pointee, target_mut)) =
+        (src_ty, target_ty)
+    else {
+        return false;
     };
-    let Ty::RawPtr(target_pointee, target_mut) = target_ty else {
-        return Err(CastLowerError::InvalidTargetType {
-            expected: "raw pointer",
-            got: target_ty.clone(),
-        });
-    };
-    let valid = match coercion {
+    match coercion {
         PointerCoercionKind::MutToConstPointer => {
             *src_mut == Mutability::Mut
                 && *target_mut == Mutability::Not
@@ -295,8 +287,37 @@ fn lower_pointer_coercion(
             src_mut == target_mut
                 && matches!(&**src_pointee, Ty::Array(elem, _) if elem == target_pointee)
         }
-    };
-    if !valid {
+    }
+}
+
+/// Lowers a `CastKind::PointerCoercion` (`MutToConstPointer`: `*mut T -> *const T`;
+/// `ArrayToPointer`: `*m [T; N] -> *m T` with the same mutability).
+fn lower_pointer_coercion(
+    coercion: PointerCoercionKind,
+    operand: &Operand,
+    src_ty: &Ty,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<LoweredCast, CastLowerError> {
+    if !src_ty.is_raw_ptr() {
+        return Err(CastLowerError::InvalidSourceType {
+            expected: "raw pointer",
+            got: src_ty.clone(),
+        });
+    }
+    if !target_ty.is_raw_ptr() {
+        return Err(CastLowerError::InvalidTargetType {
+            expected: "raw pointer",
+            got: target_ty.clone(),
+        });
+    }
+    src_ty
+        .check_representable(ptr_width)
+        .map_err(|err| cast_lower_layout_error(src_ty, err))?;
+    target_ty
+        .check_representable(ptr_width)
+        .map_err(|err| cast_lower_layout_error(target_ty, err))?;
+    if !is_valid_pointer_coercion(coercion, src_ty, target_ty) {
         return Err(CastLowerError::UnsupportedCast {
             kind: CastKind::PointerCoercion(coercion),
             src_ty: src_ty.clone(),
@@ -630,6 +651,12 @@ pub fn lower_cast_rvalue_with_ptr_width(
         }
         CastKind::Transmute => lower_transmute(operand, src_ty, target_ty, ptr_width, policy),
         CastKind::Subtype => {
+            src_ty
+                .check_representable(ptr_width)
+                .map_err(|err| cast_lower_layout_error(src_ty, err))?;
+            target_ty
+                .check_representable(ptr_width)
+                .map_err(|err| cast_lower_layout_error(target_ty, err))?;
             if !is_subtype_compatible(src_ty, target_ty) {
                 return Err(CastLowerError::UnsupportedCast {
                     kind,
@@ -644,7 +671,7 @@ pub fn lower_cast_rvalue_with_ptr_width(
             })
         }
         CastKind::PointerCoercion(coercion) => {
-            lower_pointer_coercion(coercion, operand, src_ty, target_ty)
+            lower_pointer_coercion(coercion, operand, src_ty, target_ty, ptr_width)
         }
     }
 }
@@ -986,6 +1013,16 @@ fn normalize_adt_bytes(
                     bits: tag_bits,
                 });
             };
+            if !variants[variant_idx]
+                .fields
+                .iter()
+                .all(|f| f.is_inhabited_for(ptr_width))
+            {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: tag_bits,
+                });
+            }
             out.extend(encode_int_bytes(tag_bits, tag_size));
             (tag_size, variants[variant_idx].fields.as_slice())
         }

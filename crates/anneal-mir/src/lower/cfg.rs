@@ -660,30 +660,65 @@ fn eval_panic_message(
     msg: &AssertMessage,
     state: &mut StatementEvalState,
 ) -> Result<PanicMessage, RvalueEvalError> {
+    let check_usize = |val: MirValue| -> Result<MirValue, RvalueEvalError> {
+        if val.ty() != Ty::Uint(UintTy::Usize) {
+            return Err(RvalueEvalError::TypeMismatch(
+                "AssertMessage operand must evaluate to a usize value",
+            ));
+        }
+        Ok(val)
+    };
+    let check_int = |val: MirValue| -> Result<MirValue, RvalueEvalError> {
+        if !val.ty().is_integral() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "AssertMessage operand must evaluate to an integer value",
+            ));
+        }
+        Ok(val)
+    };
     Ok(match msg {
         AssertMessage::BoundsCheck { len, index } => PanicMessage::BoundsCheck {
-            len: state.eval_operand(len)?,
-            index: state.eval_operand(index)?,
+            len: check_usize(state.eval_operand(len)?)?,
+            index: check_usize(state.eval_operand(index)?)?,
         },
         AssertMessage::Overflow(op, lhs, rhs) => {
-            let lhs = state.eval_operand(lhs)?;
-            let rhs = state.eval_operand(rhs)?;
+            let lhs = check_int(state.eval_operand(lhs)?)?;
+            let rhs = check_int(state.eval_operand(rhs)?)?;
+            let shift = matches!(
+                op,
+                BinOp::Shl | BinOp::Shr | BinOp::ShlUnchecked | BinOp::ShrUnchecked
+            );
+            if !shift && lhs.ty() != rhs.ty() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "AssertMessage::Overflow operands must have matching integer types",
+                ));
+            }
             PanicMessage::Overflow(*op, lhs, rhs)
         }
-        AssertMessage::OverflowNeg(op) => PanicMessage::OverflowNeg(state.eval_operand(op)?),
-        AssertMessage::DivisionByZero(op) => PanicMessage::DivisionByZero(state.eval_operand(op)?),
+        AssertMessage::OverflowNeg(op) => {
+            let val = state.eval_operand(op)?;
+            if !val.ty().is_signed_int() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "AssertMessage::OverflowNeg operand must evaluate to a signed integer",
+                ));
+            }
+            PanicMessage::OverflowNeg(val)
+        }
+        AssertMessage::DivisionByZero(op) => {
+            PanicMessage::DivisionByZero(check_int(state.eval_operand(op)?)?)
+        }
         AssertMessage::RemainderByZero(op) => {
-            PanicMessage::RemainderByZero(state.eval_operand(op)?)
+            PanicMessage::RemainderByZero(check_int(state.eval_operand(op)?)?)
         }
         AssertMessage::MisalignedPointerDereference { required, found } => {
             PanicMessage::MisalignedPointerDereference {
-                required: state.eval_operand(required)?,
-                found: state.eval_operand(found)?,
+                required: check_usize(state.eval_operand(required)?)?,
+                found: check_usize(state.eval_operand(found)?)?,
             }
         }
         AssertMessage::NullPointerDereference => PanicMessage::NullPointerDereference,
         AssertMessage::InvalidEnumConstruction(op) => {
-            PanicMessage::InvalidEnumConstruction(state.eval_operand(op)?)
+            PanicMessage::InvalidEnumConstruction(check_int(state.eval_operand(op)?)?)
         }
         AssertMessage::Custom(text) => PanicMessage::Custom(text.clone()),
     })
@@ -744,6 +779,11 @@ pub fn eval_cfg_in_state(
                 discr_ty,
                 targets,
             } => {
+                if targets.values.len() != targets.targets.len() {
+                    return Err(term_err(RvalueEvalError::TypeMismatch(
+                        "SwitchInt targets length mismatch",
+                    )));
+                }
                 let val = state.eval_operand(discr).map_err(term_err)?;
                 if !mir_value_matches_ty(&val, discr_ty) {
                     return Err(term_err(RvalueEvalError::TypeMismatch(
@@ -831,6 +871,11 @@ pub fn eval_cfg_in_state(
                 state
                     .check_place_access(destination, dest_ty)
                     .map_err(term_err)?;
+                if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
+                    return Err(term_err(RvalueEvalError::TypeMismatch(
+                        "Call with an uninhabited destination type must not have a return target",
+                    )));
+                }
                 let Some(handler) = call_handler.as_mut() else {
                     return Err(CfgEvalError::UnsupportedCall { bb });
                 };
