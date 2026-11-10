@@ -2300,7 +2300,10 @@ theorem stepMirFn_activeBody_exposesUb_in_census
       have hEqIdx : s.frame.stmtIdx = length bb.statements :=
         Nat.le_antisymm hStmtLe hGe
       have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
-        simp [hEqIdx]
+        -- `[adv B3]`: `decide_eq_true rfl` instead of `simp [hEqIdx]`, whose lemma
+        -- chain for `Nat` `==` depends on `Classical.choice`.
+        rw [hEqIdx]
+        exact decide_eq_true rfl
       rw [hBeq] at hUb'
       dsimp only [ite_true] at hUb'
       rcases evalTerminator_exposesUb_implies_mem_censusTerminator
@@ -3391,7 +3394,10 @@ theorem stepMirFn_preserves_validMirPc
       have hEqIdx : s.frame.stmtIdx = length bb.statements :=
         Nat.le_antisymm hStmtLe hGe
       have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
-        simp [hEqIdx]
+        -- `[adv B3]`: `decide_eq_true rfl` instead of `simp [hEqIdx]`, whose lemma
+        -- chain for `Nat` `==` depends on `Classical.choice`.
+        rw [hEqIdx]
+        exact decide_eq_true rfl
       rw [hBeq] at hStep
       dsimp only [ite_true] at hStep
       rcases evalTerminator_intraFrame_step_frame body s s' bb.terminator hStack hIntra hStep with
@@ -3430,7 +3436,10 @@ theorem stepMirFn_preserves_validMirPc
       have hEqIdx : s.frame.stmtIdx = length bb.statements :=
         Nat.le_antisymm hStmtLe hGe
       have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
-        simp [hEqIdx]
+        -- `[adv B3]`: `decide_eq_true rfl` instead of `simp [hEqIdx]`, whose lemma
+        -- chain for `Nat` `==` depends on `Classical.choice`.
+        rw [hEqIdx]
+        exact decide_eq_true rfl
       rw [hBeq] at hStep
       dsimp only [ite_true] at hStep
       rcases evalTerminator_intraFrame_step_frame body s s' bb.terminator hStack hIntra hStep with
@@ -3902,11 +3911,18 @@ theorem reconcileFaultCoverageWithRegistry_partial_site_rejected
     · rw [← hUnm]; exact hNotInUnm₁
 
 /--
-`[adv A2]` Multi-Body / Callee Compositionality Theorem
+`[adv A2]` Census-Append Decomposition
 (`reconcileFaultCoverageWithRegistry_append_verified_iff`):
-reconciling a combined census `census₁ ++ census₂` (e.g., a caller body combined with
-an inline callee or `#[external_spec]` body) returns `.verified` if and only if
-both `census₁` and `census₂` individually reconcile to `.verified`.
+reconciling `census₁ ++ census₂` against one `discharged` list returns `.verified` if
+and only if both `census₁` and `census₂` individually reconcile to `.verified`.
+
+`[adv B3]` Scope correction: this is only a sound *composition* principle when
+`census₁` and `census₂` are censuses of the **same** body (e.g. split by block range).
+`FaultSite` coordinates are body-relative, so appending a caller census and an inline
+callee census and reconciling both against the caller's `discharged` lets caller
+obligations mask colliding callee sites — see the kernel-checked counterexample
+`witnessCalleeMask_append_masks_batch_rejects`. Multi-body batches must use
+`reconcileCoverageBatch` (§9b), which reconciles every body against its own list.
 -/
 theorem reconcileFaultCoverageWithRegistry_append_verified_iff
     (registry : PropertyRegistry) (census₁ census₂ discharged : List FaultSite) :
@@ -3992,6 +4008,95 @@ theorem initMachineState_mirStepsIntra_not_exposesUb_of_empty_census
       body args s hCfg hSteps hTop hUb with ⟨cls, hMem⟩
   rw [hEmpty] at hMem
   nomatch hMem
+
+/-! ## 9b. `[adv B3]` Per-Body Batch Reconciliation (Inline-Callee Coordinate Isolation)
+
+`stepMirFn body s` executes the *active* body `s.memory.activeCallee.getD body`, which
+is the subject or an inline callee body installed by a call terminator. A fault in an
+inline callee is located at the callee's own body-relative coordinates
+(`stepMirFn_activeBody_exposesUb_in_census`), and those coordinates collide with the
+subject's: `(0, 0, cls)` names a different program point in every body. A
+multi-body verification batch therefore pairs every body with the obligations
+discharged *for that body*, and reconciles each pair separately.
+-/
+
+/-- `[adv B3]` A multi-body verification batch: each entry pairs a `CapturedMir`
+(the subject or an inline callee) with the fault sites discharged for that body. -/
+abbrev CoverageBatch : Type := List (CapturedMir × List FaultSite)
+
+/-- `[adv B3]` Kernel-evaluable test for `CoverageVerdict.verified`. -/
+def CoverageVerdict.isVerified : CoverageVerdict → Bool
+  | .verified => true
+  | .unknownUnmappedFaultSites _ => false
+
+theorem CoverageVerdict.isVerified_iff (v : CoverageVerdict) :
+    v.isVerified = true ↔ v = .verified := by
+  cases v with
+  | verified => exact ⟨fun _ => rfl, fun _ => rfl⟩
+  | unknownUnmappedFaultSites _ => exact ⟨fun h => (nomatch h), fun h => (nomatch h)⟩
+
+/-- `[adv B3]` Fail-closed per-body batch reconciler: every body's census is
+reconciled against its *own* discharged list under `registry`. -/
+def reconcileCoverageBatch (registry : PropertyRegistry) (batch : CoverageBatch) : Bool :=
+  batch.all (fun item =>
+    (reconcileFaultCoverageWithRegistry registry
+      (censusMirBodyFaultSites item.1) item.2).isVerified)
+
+/-- `[adv B3]` Soundness and completeness of `reconcileCoverageBatch`. -/
+theorem reconcileCoverageBatch_iff (registry : PropertyRegistry) (batch : CoverageBatch) :
+    reconcileCoverageBatch registry batch = true ↔
+      ∀ item ∈ batch,
+        reconcileFaultCoverageWithRegistry registry
+          (censusMirBodyFaultSites item.1) item.2 = .verified := by
+  unfold reconcileCoverageBatch
+  rw [List.all_eq_true]
+  exact ⟨fun h item hMem => (CoverageVerdict.isVerified_iff _).mp (h item hMem),
+         fun h item hMem => (CoverageVerdict.isVerified_iff _).mpr (h item hMem)⟩
+
+/--
+`[adv B3]` Interprocedural one-step batch soundness
+(`stepMirFn_exposesUb_in_batch_discharged`): if the batch reconciles, the *active*
+body `s.memory.activeCallee.getD body` (subject or inline callee) appears in the batch
+paired with `discharged`, and the program counter is valid in the active body, then any
+one-step UB exposure of `stepMirFn body s` is discharged in the active body's own list
+with an `.emittedAndVerified` class. No obligation of any *other* body can be used.
+
+For non-generic callees `lookupCallee` installs the captured body verbatim; generic
+callees are installed as `calleeBody.instantiate subst`, so the batch must contain the
+instantiated body (census invariance under `CapturedMir.instantiate` is open).
+-/
+theorem stepMirFn_exposesUb_in_batch_discharged
+    (registry : PropertyRegistry) (batch : CoverageBatch)
+    (body : CapturedMir) (s : MachineState) (discharged : List FaultSite)
+    (hBatch : reconcileCoverageBatch registry batch = true)
+    (hItem : (s.memory.activeCallee.getD body, discharged) ∈ batch)
+    (hPc : ValidMirPc (s.memory.activeCallee.getD body) s.frame)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  rcases stepMirFn_activeBody_exposesUb_in_census body s hPc hUb with ⟨cls, hInCensus⟩
+  have hVer := (reconcileCoverageBatch_iff registry batch).mp hBatch _ hItem
+  rcases (reconcileFaultCoverageWithRegistry_verified_iff registry _ discharged).mp hVer
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
+
+/--
+`[adv B3]` Batch reconciliation is monotone in each entry's discharged list and in the
+registry: strengthening any body's obligations never breaks a verified batch.
+-/
+theorem reconcileCoverageBatch_mono
+    (reg₁ reg₂ : PropertyRegistry) (batch₁ batch₂ : CoverageBatch)
+    (hVer : reconcileCoverageBatch reg₁ batch₁ = true)
+    (hCover : ∀ item₂ ∈ batch₂, ∃ d₁, (item₂.1, d₁) ∈ batch₁ ∧ ∀ s ∈ d₁, s ∈ item₂.2)
+    (hSubReg : ∀ c : MirFaultClass,
+      reg₁ c = .emittedAndVerified → reg₂ c = .emittedAndVerified) :
+    reconcileCoverageBatch reg₂ batch₂ = true := by
+  rw [reconcileCoverageBatch_iff] at hVer ⊢
+  intro item₂ hMem₂
+  rcases hCover item₂ hMem₂ with ⟨d₁, hMem₁, hSub⟩
+  exact reconcileFaultCoverageWithRegistry_mono reg₁ reg₂ _ d₁ item₂.2
+    (hVer _ hMem₁) hSub hSubReg
 
 /-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
 
@@ -4693,5 +4798,80 @@ theorem witnessWrappingArith_census_precise :
         site.2.2 != .scalarNicheInvalid && site.2.2 != .ptrDerefInvalid &&
         site.2.2 != .ptrAlignMismatch) = true := by
   refine ⟨by decide, rfl, by decide⟩
+
+/--
+Witness 6 (`[adv B3]` inline-callee coordinate-collision probe): a callee whose single
+block runs `StorageLive _1` and returns. Every one of its census sites
+(`(0, 0, .storageLiveProtected)` and the `return_` sites at `(0, 1)`) coincides
+*coordinate- and class-wise* with a site of the caller `witnessDerefAliasBody`.
+-/
+def witnessCalleeStorageBody : CapturedMir :=
+  { defPath := "proto::witness_callee_storage"
+  , phase := MirPhaseTag.runtimePostCleanup
+  , role := ContractRole.subject
+  , argCount := 0
+  , localDecls := (List.cons witnessU32Decl (List.cons witnessU32Decl List.nil))
+  , basicBlocks :=
+      (List.cons
+        { statements :=
+            (List.cons
+              { kind := (StatementKind.storageLive 1), span := "proto.rs:50:5" }
+              List.nil)
+        , terminator := { kind := TerminatorKind.return_, span := "proto.rs:51:5" }
+        , isCleanup := false
+        }
+        List.nil)
+  , fnAbi := dummyWitnessFnAbi
+  , layouts := emptyLayoutTable
+  , allocations := List.nil
+  }
+
+/-- Expected fault-site census for `witnessCalleeStorageBody`. -/
+def witnessCalleeStorageExpectedCensus : List FaultSite :=
+  [ (0, 0, .storageLiveProtected)
+  , (0, 1, .treeBorrowsViolation)
+  , (0, 1, .uninitRead)
+  , (0, 1, .callAbiMismatch)
+  ]
+
+/--
+`[adv B3]` Kernel-checked counterexample to shared-list multi-body composition:
+appending the callee census to the caller census and reconciling against the
+*caller's* discharged list returns `.verified` although not a single callee obligation
+was emitted, while the per-body batch (`reconcileCoverageBatch`) rejects the same
+obligations and accepts once the callee's own sites are discharged.
+-/
+theorem witnessCalleeMask_append_masks_batch_rejects :
+    censusMirBodyFaultSites witnessCalleeStorageBody = witnessCalleeStorageExpectedCensus ∧
+    reconcileFaultCoverageWithRegistry allVerifiedRegistry
+      (censusMirBodyFaultSites witnessDerefAliasBody ++
+        censusMirBodyFaultSites witnessCalleeStorageBody)
+      witnessDerefAliasExpectedCensus = .verified ∧
+    reconcileFaultCoverageWithRegistry allVerifiedRegistry
+      (censusMirBodyFaultSites witnessCalleeStorageBody) [] =
+        .unknownUnmappedFaultSites witnessCalleeStorageExpectedCensus ∧
+    reconcileCoverageBatch allVerifiedRegistry
+      [ (witnessDerefAliasBody, witnessDerefAliasExpectedCensus)
+      , (witnessCalleeStorageBody, []) ] = false ∧
+    reconcileCoverageBatch allVerifiedRegistry
+      [ (witnessDerefAliasBody, witnessDerefAliasExpectedCensus)
+      , (witnessCalleeStorageBody, witnessCalleeStorageExpectedCensus) ] = true := by
+  decide
+
+/--
+`[adv B3]` Liveness of the masked site: with `witnessCalleeStorageBody` installed as the
+active inline callee of `witnessDerefAliasBody`, `StorageLive _1` over a one-slot frame
+faults at `(0, 0)` — exactly the coordinate the caller's obligations would mask.
+-/
+theorem witnessCalleeStorage_masked_site_live :
+    stepMirFn witnessDerefAliasBody
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+          memory := { activeCallee := some witnessCalleeStorageBody } } =
+      MirStepNode.fail .ub ∧
+    stepMirFn witnessDerefAliasBody
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+          memory := { activeCallee := some witnessCalleeStorageBody } } ≠
+      MirStepNode.fail .ub :=
+  ⟨rfl, ne_fail_ub_of_stepNodeIsTau (by decide)⟩
 
 end Anneal.FaultSiteCensusPrototype

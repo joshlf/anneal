@@ -4212,30 +4212,94 @@ pub fn reconcile_lean_mir_coverage(
     }
 }
 
-/// `[adv A2]` Per-item coverage input for multi-item / multi-callee reconciliation
-/// (e.g., a subject function together with its verified callees or loop-invariant
-/// sub-obligations). Because `FaultSite` coordinates `(block_idx, stmt_idx, fault_class)`
-/// are body-relative (`0`-indexed within each `CapturedMir`), each item's `census`
-/// MUST be reconciled against its own `discharged` set so that a discharged site at
-/// `(0, 0)` in a caller can never mask an unmapped site at `(0, 0)` in a callee.
+/// `[adv A2]` / `[adv B3]` Per-item coverage input for multi-item / multi-callee
+/// reconciliation: a subject function together with the inline callee bodies that its
+/// verification harness can install as `activeCallee`. `FaultSite` coordinates
+/// `(block_idx, stmt_idx, fault_class)` are body-relative, so every item is reconciled
+/// against its *own* `discharged` list (`reconcileCoverageBatch` in
+/// `FaultSiteCensusPrototype.lean`), and a discharged `(0, 0, cls)` in a caller can never
+/// mask an unmapped `(0, 0, cls)` in a callee.
+///
+/// `[adv B3]`: an item carries its *body*, never a caller-supplied census. The
+/// `[adv A2]` shape accepted an arbitrary `census: Vec<FaultSite>`, so an empty or stale
+/// census reconciled `Verified` for a body full of fault sites; the reconciler now always
+/// recomputes `census_mir_fault_sites(&body)` itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemCoverageInput {
-    /// Canonical item `DefPath` (must be unique within a reconciliation batch).
+    /// Canonical item `DefPath`; must be unique within a batch and equal `body.def_path`.
     pub def_path: String,
-    /// Independent `FaultSite` census for this item's `CapturedMir`.
-    pub census: Vec<FaultSite>,
-    /// Discharged `FaultSite` obligations emitted for this item.
+    /// The item's MIR body; its census is recomputed by the reconciler.
+    pub body: ProtoMirBody,
+    /// Discharged `FaultSite` obligations emitted for this item's body.
     pub discharged: Vec<FaultSite>,
+}
+
+impl ItemCoverageInput {
+    /// Build an item labeled with the body's own `def_path`.
+    pub fn from_body(body: ProtoMirBody, discharged: Vec<FaultSite>) -> Self {
+        Self {
+            def_path: body.def_path.clone(),
+            body,
+            discharged,
+        }
+    }
+
+    /// `[adv B3]` Build an item from a captured `Mir/<Item>.lean` module. The module must
+    /// pass the strict module grammar (`check_strict_mir_module_grammar`), and the item is
+    /// labeled with the parsed `defPath`; any `CensusScanError` keeps the module out of
+    /// the batch (fail-closed).
+    pub fn from_lean_module(
+        lean_src: &str,
+        discharged: Vec<FaultSite>,
+    ) -> Result<Self, CensusScanError> {
+        let tokens = tokenize_lean_source(lean_src)?;
+        check_strict_mir_module_grammar(&tokens)?;
+        let body = parse_lean_captured_mir_def(lean_src, "body")?;
+        Ok(Self::from_body(body, discharged))
+    }
+}
+
+/// `[adv B3]` Callee classification for a multi-item batch.
+///
+/// `inline_callees` must be exactly the `callees` list handed to
+/// `initMachineStateWithCallees`: those bodies can become `activeCallee`, so each needs
+/// its own batch item. `external_callees` are modeled as external calls (answered by an
+/// `#[external_spec]` contract) whose bodies never execute inside the machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CalleeClosure {
+    /// `DefPath`s of bodies installed as inline callees.
+    pub inline_callees: Vec<String>,
+    /// `DefPath`s of callees modeled as external calls.
+    pub external_callees: Vec<String>,
+}
+
+/// `[adv B3]` Sorted, duplicate-free direct callee `DefPath`s of the `Call` / `TailCall`
+/// terminators in `body` (constant function-item operands only; indirect calls can
+/// only reach bodies in `CalleeClosure::inline_callees`).
+pub fn direct_callee_def_paths(body: &ProtoMirBody) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for bb in &body.basic_blocks {
+        let func = match &bb.terminator.kind {
+            ProtoTerminatorKind::Call { func, .. } | ProtoTerminatorKind::TailCall { func, .. } => {
+                func
+            }
+            _ => continue,
+        };
+        if let Some(path) = func.extract_callee_def_path() {
+            out.insert(path.to_string());
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// `[adv A2]` Fail-closed verdict for a multi-item / multi-callee verification batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MultiItemCoverageVerdict {
-    /// Every item in the batch is non-empty, has a distinct `def_path`, and
-    /// reconciled to `CoverageVerdict::Verified`.
+    /// The batch is non-empty, every item has a unique `def_path` equal to its body's,
+    /// every item's recomputed census reconciled to `CoverageVerdict::Verified` against
+    /// its own `discharged` list, and the `CalleeClosure` is satisfied.
     Verified,
-    /// Fail-closed downgrade when the batch is empty, contains duplicate
-    /// `def_path` entries, or at least one item failed reconciliation.
+    /// Fail-closed downgrade when any of the `Verified` conditions fails.
     UnknownUnmappedFaultSite {
         /// Per-item failures `(def_path, verdict)` for items that did not reconcile.
         failed_items: Vec<(String, CoverageVerdict)>,
@@ -4260,14 +4324,32 @@ impl MultiItemCoverageVerdict {
             }
         }
     }
+
+    /// Diagnostic reasons (empty for `Verified`).
+    pub fn reasons(&self) -> &[String] {
+        match self {
+            MultiItemCoverageVerdict::Verified => &[],
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+                unsupported_reasons,
+                ..
+            } => unsupported_reasons,
+        }
+    }
 }
 
-/// `[adv A2]` Reconcile a multi-item / multi-callee verification batch under `registry`.
-/// Enforces per-item coordinate isolation (preventing `(bb, stmt)` collisions across
-/// caller and callee `CapturedMir` bodies), rejects empty batches, and rejects
-/// duplicate `def_path` entries.
+/// `[adv A2]` / `[adv B3]` Reconcile a multi-item / multi-callee verification batch
+/// under `registry`. Returns `Verified` only when:
+/// 1. the batch is non-empty and every `def_path` is unique and equals `body.def_path`;
+/// 2. every item's census, recomputed from its body, reconciles against that item's own
+///    `discharged` list (`reconcileCoverageBatch` in Lean);
+/// 3. every `closure.inline_callees` entry has a batch item;
+/// 4. no `DefPath` is declared both inline and external; and
+/// 5. every direct `Call` / `TailCall` callee of every item is a batch item, a declared
+///    external callee, or a natively modeled intrinsic (non-empty
+///    `census_callee_def_path_fault_classes`).
 pub fn reconcile_multi_item_coverage(
     items: &[ItemCoverageInput],
+    closure: &CalleeClosure,
     registry: &PropertyRegistry,
 ) -> MultiItemCoverageVerdict {
     if items.is_empty() {
@@ -4280,18 +4362,25 @@ pub fn reconcile_multi_item_coverage(
         };
     }
 
-    let mut seen_paths = BTreeSet::new();
+    let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
     let mut failed_items = Vec::new();
     let mut unsupported_reasons = Vec::new();
 
     for item in items {
-        if !seen_paths.insert(item.def_path.clone()) {
+        if !seen_paths.insert(item.def_path.as_str()) {
             unsupported_reasons.push(format!(
                 "duplicate item def_path `{}` in multi-item coverage batch",
                 item.def_path
             ));
         }
-        let verdict = reconcile_obligation_coverage(&item.census, &item.discharged, registry);
+        if item.def_path != item.body.def_path {
+            unsupported_reasons.push(format!(
+                "item label `{}` does not match its body def_path `{}`",
+                item.def_path, item.body.def_path
+            ));
+        }
+        let census = census_mir_fault_sites(&item.body);
+        let verdict = reconcile_obligation_coverage(&census, &item.discharged, registry);
         if let CoverageVerdict::UnknownUnmappedFaultSite {
             unsupported_reasons: ref item_reasons,
             ..
@@ -4301,6 +4390,39 @@ pub fn reconcile_multi_item_coverage(
                 unsupported_reasons.push(format!("[{}] {r}", item.def_path));
             }
             failed_items.push((item.def_path.clone(), verdict));
+        }
+    }
+
+    let external: BTreeSet<&str> = closure
+        .external_callees
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for callee in &closure.inline_callees {
+        if !seen_paths.contains(callee.as_str()) {
+            unsupported_reasons.push(format!(
+                "inline callee `{callee}` has no batch item: its body can become \
+                 `activeCallee` but its census was never reconciled"
+            ));
+        }
+        if external.contains(callee.as_str()) {
+            unsupported_reasons.push(format!(
+                "callee `{callee}` is declared both inline and external"
+            ));
+        }
+    }
+    for item in items {
+        for callee in direct_callee_def_paths(&item.body) {
+            let classified = seen_paths.contains(callee.as_str())
+                || external.contains(callee.as_str())
+                || !census_callee_def_path_fault_classes(&callee).is_empty();
+            if !classified {
+                unsupported_reasons.push(format!(
+                    "[{}] direct callee `{callee}` is neither a batch item, a declared \
+                     external callee, nor a natively modeled intrinsic",
+                    item.def_path
+                ));
+            }
         }
     }
 
@@ -6686,10 +6808,7 @@ end Mir.Probe.item",
                 "def body : CapturedMir :=",
                 "namespace Sub\ndef body : CapturedMir :=",
             )
-            .replace(
-                "end Mir.Probe.item",
-                "end Sub\nend Mir.Probe.item",
-            );
+            .replace("end Mir.Probe.item", "end Sub\nend Mir.Probe.item");
         assert!(matches!(
             census_lean_mir_module(&nested_ns_body),
             Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("single top-level")
@@ -6791,54 +6910,56 @@ end Mir.Probe.item",
                 }
             }
         }
-        assert!(saw_const_eval_counter, "fuzzer must generate ConstEvalCounter");
-        assert_eq!(retag_kinds, [true, true, true, true], "fuzzer must generate all 4 RetagKind variants");
-        assert!(saw_mut_raw_ptr_agg, "fuzzer must generate AggregateKind::RawPtr(_, Mut)");
+        assert!(
+            saw_const_eval_counter,
+            "fuzzer must generate ConstEvalCounter"
+        );
+        assert_eq!(
+            retag_kinds,
+            [true, true, true, true],
+            "fuzzer must generate all 4 RetagKind variants"
+        );
+        assert!(
+            saw_mut_raw_ptr_agg,
+            "fuzzer must generate AggregateKind::RawPtr(_, Mut)"
+        );
 
-        // 4. Multi-item / multi-callee reconciliation (`reconcile_multi_item_coverage`):
-        //    - Discharging `(0, 0, ArithOverflow)` in `caller` NEVER masks an undischarged
-        //      `(0, 0, ArithOverflow)` in `callee`.
+        // 4. Multi-item / multi-callee reconciliation (`reconcile_multi_item_coverage`),
+        //    `[adv B3]` API (items carry bodies; censuses are recomputed internally):
+        //    - Discharging `(0, 0, StorageLiveProtected)` in the caller NEVER masks the
+        //      undischarged `(0, 0, StorageLiveProtected)` of the callee.
         //    - Empty batches and duplicate `def_path` entries fail closed.
         let reg = PropertyRegistry::all_verified();
-        let site0 = FaultSite::new(0, 0, MirFaultClass::ArithOverflow);
-        let caller_ok = ItemCoverageInput {
-            def_path: String::from("crate::caller"),
-            census: vec![site0],
-            discharged: vec![site0],
-        };
-        let callee_missing = ItemCoverageInput {
-            def_path: String::from("crate::callee"),
-            census: vec![site0],
-            discharged: Vec::new(),
-        };
-        let callee_ok = ItemCoverageInput {
-            def_path: String::from("crate::callee"),
-            census: vec![site0],
-            discharged: vec![site0],
-        };
+        let caller = parse_lean_captured_mir_def(LEAN_PROTOTYPE_SRC, "witnessDerefAliasBody")
+            .expect("parse caller witness");
+        let callee = parse_lean_captured_mir_def(LEAN_PROTOTYPE_SRC, "witnessCalleeStorageBody")
+            .expect("parse callee witness");
+        let caller_ok =
+            ItemCoverageInput::from_body(caller.clone(), census_mir_fault_sites(&caller));
+        let callee_missing = ItemCoverageInput::from_body(callee.clone(), Vec::new());
+        let callee_ok =
+            ItemCoverageInput::from_body(callee.clone(), census_mir_fault_sites(&callee));
+        let closure = CalleeClosure::default();
         assert_eq!(
-            reconcile_multi_item_coverage(&[], &reg).status_code(),
+            reconcile_multi_item_coverage(&[], &closure, &reg).status_code(),
             "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
         );
         let cross_item_mask_attempt =
-            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_missing], &reg);
-        assert_eq!(
-            cross_item_mask_attempt.status_code(),
-            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
-        );
+            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_missing], &closure, &reg);
         match cross_item_mask_attempt {
             MultiItemCoverageVerdict::UnknownUnmappedFaultSite { failed_items, .. } => {
                 assert_eq!(failed_items.len(), 1);
-                assert_eq!(failed_items[0].0, "crate::callee");
+                assert_eq!(failed_items[0].0, "proto::witness_callee_storage");
             }
             MultiItemCoverageVerdict::Verified => panic!("expected callee missing site failure"),
         }
         assert_eq!(
-            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_ok], &reg),
+            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_ok], &closure, &reg),
             MultiItemCoverageVerdict::Verified
         );
         assert_eq!(
-            reconcile_multi_item_coverage(&[caller_ok.clone(), caller_ok], &reg).status_code(),
+            reconcile_multi_item_coverage(&[caller_ok.clone(), caller_ok], &closure, &reg)
+                .status_code(),
             "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
         );
 
@@ -6861,6 +6982,212 @@ end Mir.Probe.item",
             assert!(
                 LEAN_PROTOTYPE_SRC.contains(thm),
                 "missing `[adv A2]` Lean theorem `{thm}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_b3_multi_item_batch_coordinate_isolation_and_callee_closure() {
+        let reg = PropertyRegistry::all_verified();
+        let caller = parse_lean_captured_mir_def(LEAN_PROTOTYPE_SRC, "witnessDerefAliasBody")
+            .expect("parse witnessDerefAliasBody");
+        let callee = parse_lean_captured_mir_def(LEAN_PROTOTYPE_SRC, "witnessCalleeStorageBody")
+            .expect("parse witnessCalleeStorageBody");
+        let caller_discharged = parse_lean_expected_fault_site_list(
+            LEAN_PROTOTYPE_SRC,
+            "witnessDerefAliasExpectedCensus",
+        );
+        let callee_expected = parse_lean_expected_fault_site_list(
+            LEAN_PROTOTYPE_SRC,
+            "witnessCalleeStorageExpectedCensus",
+        );
+        assert_eq!(census_mir_fault_sites(&callee), callee_expected);
+        assert_eq!(
+            census_lean_mir_module(&witness_as_strict_module("witnessCalleeStorageBody"))
+                .expect("strict scan of witnessCalleeStorageBody"),
+            callee_expected
+        );
+        let closure = CalleeClosure {
+            inline_callees: vec![callee.def_path.clone()],
+            external_callees: Vec::new(),
+        };
+        let item = ItemCoverageInput::from_body;
+
+        // 1. Rust mirror of `witnessCalleeMask_append_masks_batch_rejects`: every callee
+        //    site collides with a caller site, so shared-list composition is `Verified`
+        //    without a single callee obligation...
+        assert!(callee_expected
+            .iter()
+            .all(|s| caller_discharged.contains(s)));
+        let combined: Vec<FaultSite> = census_mir_fault_sites(&caller)
+            .into_iter()
+            .chain(callee_expected.iter().copied())
+            .collect();
+        assert_eq!(
+            reconcile_obligation_coverage(&combined, &caller_discharged, &reg),
+            CoverageVerdict::Verified
+        );
+        // ...while the per-body batch pinpoints every unmapped callee site.
+        let masked = reconcile_multi_item_coverage(
+            &[
+                item(caller.clone(), caller_discharged.clone()),
+                item(callee.clone(), Vec::new()),
+            ],
+            &closure,
+            &reg,
+        );
+        match &masked {
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite { failed_items, .. } => {
+                assert_eq!(failed_items.len(), 1);
+                assert_eq!(failed_items[0].0, "proto::witness_callee_storage");
+                match &failed_items[0].1 {
+                    CoverageVerdict::UnknownUnmappedFaultSite { missing_sites, .. } => {
+                        assert_eq!(missing_sites, &callee_expected);
+                    }
+                    CoverageVerdict::Verified => panic!("callee must not verify"),
+                }
+            }
+            MultiItemCoverageVerdict::Verified => {
+                panic!("caller obligations must never mask callee sites")
+            }
+        }
+        let full_batch = [
+            item(caller.clone(), caller_discharged.clone()),
+            item(callee.clone(), callee_expected.clone()),
+        ];
+        assert_eq!(
+            reconcile_multi_item_coverage(&full_batch, &closure, &reg),
+            MultiItemCoverageVerdict::Verified
+        );
+        // Registry gating still applies per item.
+        let downgraded = PropertyRegistry::all_verified().with_status(
+            MirFaultClass::StorageLiveProtected,
+            PropertyStatus::UnemittedGap,
+        );
+        assert!(!reconcile_multi_item_coverage(&full_batch, &closure, &downgraded).is_verified());
+
+        // 2. Census recomputation: the `[adv A2]` API accepted `census: vec![]` for any
+        //    body; an item now always carries its body, so empty obligations fail.
+        assert!(!reconcile_multi_item_coverage(
+            &[item(caller.clone(), Vec::new())],
+            &CalleeClosure::default(),
+            &reg
+        )
+        .is_verified());
+
+        // 3. Missing inline callee: the subject alone cannot verify while an inline callee
+        //    body (which can become `activeCallee`) was never reconciled.
+        let missing_callee = reconcile_multi_item_coverage(
+            &[item(caller.clone(), caller_discharged.clone())],
+            &closure,
+            &reg,
+        );
+        assert!(
+            missing_callee
+                .reasons()
+                .iter()
+                .any(|r| r
+                    .contains("inline callee `proto::witness_callee_storage` has no batch item"))
+        );
+
+        // 4. Mislabeled item: the label must equal the body's def_path.
+        let mut mislabeled = item(callee.clone(), callee_expected.clone());
+        mislabeled.def_path = String::from("proto::some_other_item");
+        let mislabeled_verdict = reconcile_multi_item_coverage(
+            &[item(caller.clone(), caller_discharged.clone()), mislabeled],
+            &CalleeClosure::default(),
+            &reg,
+        );
+        assert!(mislabeled_verdict
+            .reasons()
+            .iter()
+            .any(|r| r.contains("does not match its body def_path")));
+
+        // 5. A callee cannot be declared both inline and external.
+        let contradictory = CalleeClosure {
+            inline_callees: vec![callee.def_path.clone()],
+            external_callees: vec![callee.def_path.clone()],
+        };
+        assert!(!reconcile_multi_item_coverage(&full_batch, &contradictory, &reg).is_verified());
+
+        // 6. Direct-callee classification: `witnessCallArgBlindBody` calls
+        //    `proto::callee_u32`, which must be a batch item or a declared external callee.
+        let call_body = parse_lean_captured_mir_def(LEAN_PROTOTYPE_SRC, "witnessCallArgBlindBody")
+            .expect("parse witnessCallArgBlindBody");
+        assert_eq!(
+            direct_callee_def_paths(&call_body),
+            vec![String::from("proto::callee_u32")]
+        );
+        let call_discharged = census_mir_fault_sites(&call_body);
+        let call_items = [item(call_body.clone(), call_discharged.clone())];
+        let unclassified =
+            reconcile_multi_item_coverage(&call_items, &CalleeClosure::default(), &reg);
+        assert!(unclassified
+            .reasons()
+            .iter()
+            .any(|r| r.contains("direct callee `proto::callee_u32` is neither")));
+        let external = CalleeClosure {
+            inline_callees: Vec::new(),
+            external_callees: vec![String::from("proto::callee_u32")],
+        };
+        assert_eq!(
+            reconcile_multi_item_coverage(&call_items, &external, &reg),
+            MultiItemCoverageVerdict::Verified
+        );
+        // Natively modeled intrinsics need no classification.
+        let intrinsic_body = ProtoMirBody {
+            def_path: String::from("proto::calls_unreachable"),
+            basic_blocks: vec![ProtoBasicBlock {
+                statements: Vec::new(),
+                terminator: ProtoTerminator::new(ProtoTerminatorKind::Call {
+                    func: ProtoOperand::const_fn("core::intrinsics::unreachable"),
+                    args: Vec::new(),
+                    destination: ProtoPlace::local(0),
+                    target: None,
+                    unwind: ProtoUnwindAction::Continue,
+                }),
+                is_cleanup: false,
+            }],
+        };
+        let intrinsic_census = census_mir_fault_sites(&intrinsic_body);
+        assert!(intrinsic_census
+            .iter()
+            .any(|s| s.fault_class == MirFaultClass::UnreachableTerminator));
+        assert_eq!(
+            reconcile_multi_item_coverage(
+                &[item(intrinsic_body, intrinsic_census)],
+                &CalleeClosure::default(),
+                &reg
+            ),
+            MultiItemCoverageVerdict::Verified
+        );
+
+        // 7. Lean-module items go through the strict grammar and are labeled with the
+        //    parsed `defPath`; a module failing the grammar never enters a batch.
+        let strict_src = witness_as_strict_module("witnessCalleeStorageBody");
+        let lean_item = ItemCoverageInput::from_lean_module(&strict_src, callee_expected.clone())
+            .expect("strict module item");
+        assert_eq!(lean_item.def_path, "proto::witness_callee_storage");
+        assert_eq!(lean_item.body, callee);
+        let unclosed = strict_src.replace("end Mir.Witness.item", "");
+        assert!(ItemCoverageInput::from_lean_module(&unclosed, Vec::new()).is_err());
+        let smuggled = strict_src.replace(
+            "def body : CapturedMir :=",
+            "def body : CapturedMir := evil\ndef body2 : CapturedMir :=",
+        );
+        assert!(ItemCoverageInput::from_lean_module(&smuggled, Vec::new()).is_err());
+
+        // 8. The kernel-checked Lean counterparts exist.
+        for thm in [
+            "theorem reconcileCoverageBatch_iff",
+            "theorem stepMirFn_exposesUb_in_batch_discharged",
+            "theorem reconcileCoverageBatch_mono",
+            "theorem witnessCalleeMask_append_masks_batch_rejects",
+            "theorem witnessCalleeStorage_masked_site_live",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(thm),
+                "missing `[adv B3]` Lean theorem `{thm}`"
             );
         }
     }
