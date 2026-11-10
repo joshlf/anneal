@@ -184,6 +184,20 @@ class TestStripLeanCommentsAndStrings(unittest.TestCase):
             [(R5, 2, "«dup--id»"), (R1, 5, "wpMirExecSym")],
         )
 
+    def test_guillemet_char_literal_and_adjacent_escaped_single_quote(self) -> None:
+        # `'«'` is a Char literal, not an opening guillemet: a `»` inside a trailing
+        # `--` comment must never pair with it and expose the rest of the comment.
+        # Likewise `f '\''"'"` has `'\''` followed by string `"'"`, not char `'"'`.
+        src = (
+            "def openGui : Char := '«' -- note: » closes guillemet; do not dsimp [wpMirExecSym]\n"
+            "def adj := f '\\''\"'\" -- closed string, then comment dsimp [wpMirExecSym]\n"
+            "theorem after_adj : True := by dsimp [wpMirExecSym]\n"
+        )
+        self.assertEqual(scan(src), [(R1, 3, "wpMirExecSym")])
+        kept = proof_health.strip_lean_comments_and_strings(src, keep_strings=True)
+        self.assertIn("'«'", kept)
+        self.assertNotIn("closes guillemet", kept)
+
 
 class TestFiveStructuralAntiPatterns(unittest.TestCase):
     def test_rule1_dsimp_forbidden_sym(self) -> None:
@@ -571,6 +585,32 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
             self.assertEqual(scan(tight_src), [(R5, 2, "b2")])
         finally:
             proof_health._BODY_COMPARE_BUDGET = old_budget
+
+    def test_dotted_guillemet_names_comma_ascription_and_unfold_config(self) -> None:
+        # Dotted guillemet decl names (`Foo.«bar»`, `«Ns».dup`), guillemet-escaped
+        # Rust keyword segments in `Mir.Crate.«match».body`, comma-containing `∀` type
+        # ascriptions `(sym : ∀ {T}, ...)`, and `unfold (config := ...) / +opt`.
+        src = (
+            "private theorem Foo.«bar» : True := trivial\n"
+            "private theorem Foo.«baz» : False → True := fun h => False.elim h\n"
+            "private theorem «Ns».dup : True ∧ True := ⟨trivial, trivial⟩\n"
+            "private theorem «Ns».dup : Nat = Nat := rfl\n"
+            "theorem mir_and_ascr : True := by\n"
+            "  simp [Mir.Crate.«match».body]\n"
+            "  unfold (config := { zeta := false }) Mir.«from».item.body\n"
+            "  unfold +zeta bitwiseAndBits\n"
+            "  simp [(Trusted.Sequence.length : ∀ {T : Type}, List T → Nat)]\n"
+        )
+        self.assertEqual(
+            scan(src),
+            [
+                (R5, 4, "«Ns».dup"),
+                (R2, 6, "Mir.Crate.«match».body"),
+                (R2, 7, "Mir.«from».item.body"),
+                (R3, 8, "bitwiseAndBits"),
+                (R1, 9, "Trusted.Sequence.length"),
+            ],
+        )
 
 
 class TestDeltaOnlyPostEditCheck(unittest.TestCase):
@@ -1233,6 +1273,65 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             )
             self.assertEqual(res2["deltas"][R1], 1)
             self.assertEqual([f.line for f in res2["new_findings"]], [2])
+
+    def test_multi_replacement_starting_at_line_and_sibling_body_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # 1. Pre-existing `dsimp [wpMirExecSym]` at L2, plus 2 replacements starting
+            # at line 5 (L5 and L8): exact pre-edit text is recovered and [5, 8] reported.
+            lean_file = tmp_dir / "MultiLineHint.lean"
+            after = (
+                "theorem t1 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+                "theorem t2 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+                "theorem t3 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+            )
+            lean_file.write_text(after, encoding="utf-8")
+            payload = {
+                "result": f"Made 2 replacements in {lean_file} starting at line 5 (+2/-2 lines).",
+                **jetski_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+            }
+            res = proof_health.evaluate_post_edit_proof_health(
+                lean_file, payload, cache_path=tmp_dir / "c_multi.json"
+            )
+            self.assertEqual(res["deltas"][R1], 2)
+            self.assertEqual([f.line for f in res["new_findings"]], [5, 8])
+
+            # 2. Sibling body-key budget cap leaves over-budget binder-bearing defs lazy
+            # without dropping duplicate detection, and malformed `fp`/`bkeys` entries reload.
+            sib = tmp_dir / "SibBudget.lean"
+            sib.write_text(
+                "private def sb1 (x : Nat) : Nat := x + 10000000000000000000\n"
+                "private def sb2 (x : Nat) : Nat := x + 20000000000000000000\n",
+                encoding="utf-8",
+            )
+            settle(sib)
+            tgt = tmp_dir / "TgtBudget.lean"
+            tgt.write_text(
+                "private def tb2 (y : Nat) : Nat := y + 20000000000000000000\n",
+                encoding="utf-8",
+            )
+            old_budget = proof_health._BODY_COMPARE_BUDGET
+            proof_health._BODY_COMPARE_BUDGET = 15
+            try:
+                clear_in_process_caches()
+                bcache = tmp_dir / "bcache.json"
+                # First lexes sibling under tight budget (`sb2.body_keys` stays None);
+                # restore budget for target check to confirm lazy fallback still catches `sb2`.
+                proof_health._collect_sibling_private_decls(tgt, persisted={})
+                self.assertIsNone(proof_health._SIBLING_PRIVATE_CACHE[str(sib)][3][1].body_keys)
+                proof_health._BODY_COMPARE_BUDGET = old_budget
+                fb = proof_health.check_post_edit_proof_health(
+                    tgt, {"Path": str(tgt), "Content": tgt.read_text()}, cache_path=bcache
+                )
+                self.assertIn("same normalized signature and body as `private def sb2`", fb)
+            finally:
+                proof_health._BODY_COMPARE_BUDGET = old_budget
 
 
 class TestPerformanceAndDogfood(unittest.TestCase):

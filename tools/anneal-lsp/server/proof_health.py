@@ -258,6 +258,18 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             app(text[pos:nxt])
 
         if kind == 4:
+            # `'«'` is a character literal, not an opening guillemet identifier; blank
+            # it when stripping literals so a `»` inside a trailing `--` comment never pairs.
+            if (
+                nxt > 0
+                and nxt + 1 < n
+                and text[nxt - 1] == "'"
+                and text[nxt + 1] == "'"
+                and (nxt < 2 or (not _is_ident_char(text[nxt - 2]) and text[nxt - 2] != "\\"))
+            ):
+                app("«" if keep_strings else " ")
+                pos = nxt + 1
+                continue
             # Lean 4 guillemet identifier `«...»` (single-line): `--` or `/-` inside
             # `«a--b»` is part of the identifier name, not a comment start.
             g_end = find("»", nxt + 1)
@@ -323,7 +335,10 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
                 and (
                     (
                         text[nxt - 1] == "'"
-                        and (nxt < 2 or not _is_ident_char(text[nxt - 2]))
+                        and (
+                            nxt < 2
+                            or (not _is_ident_char(text[nxt - 2]) and text[nxt - 2] != "\\")
+                        )
                     )
                     or (
                         nxt >= 2
@@ -407,10 +422,12 @@ _SIMP_VARIANT_TUPLE: tuple[str, ...] = ("_all_arith", "_all", "_arith", "_rw", "
 _IDENT_BEFORE = r"(?<![\w'!?.])"
 _IDENT_AFTER = r"(?![\w'!?.])"
 # Optional namespace qualification (`Trusted.Sequence.length`,
-# `Anneal.Rustc.V2026_06_01.wpMirExecSym`) and optional unfolding-equation suffixes
+# `Anneal.Rustc.V2026_06_01.wpMirExecSym`, including guillemet-escaped Rust segments
+# like `Mir.Crate.«match».body`) and optional unfolding-equation suffixes
 # (`.eq_def`, `.eq_unfold`, `.eq_<n>`) are part of the flagged symbol; any other
 # `.`-suffix (a lemma living in the symbol's namespace) is not.
-_QUAL_PREFIX = r"(?:[^\W\d][\w'!?]*\.)*"
+_IDENT_PART = r"(?:[^\W\d][\w'!?]*|«[^»\n]+»)"
+_QUAL_PREFIX = r"(?:" + _IDENT_PART + r"\.)*"
 _UNFOLD_EQ_SUFFIX = r"(?:\.(?:eq_def|eq_unfold|eq_\d+))?"
 _FORBIDDEN_SIMP_SYM_RE = re.compile(
     _IDENT_BEFORE
@@ -421,7 +438,12 @@ _FORBIDDEN_SIMP_SYM_RE = re.compile(
     + _IDENT_AFTER
 )
 _MIR_BODY_RE = re.compile(
-    _IDENT_BEFORE + r"(" + _QUAL_PREFIX + r"Mir(?:\.[\w'!?]+)+\.body)" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
+    _IDENT_BEFORE
+    + r"("
+    + _QUAL_PREFIX
+    + r"Mir(?:\.(?:[\w'!?]+|«[^»\n]+»))+\.body)"
+    + _UNFOLD_EQ_SUFFIX
+    + _IDENT_AFTER
 )
 _RAW_BITWISE_RE = re.compile(
     _IDENT_BEFORE + _QUAL_PREFIX + r"(bitwise(?:And|Or)Bits)" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
@@ -430,9 +452,9 @@ _EQ_SUFFIX_AT_RE = re.compile(r"\.(?:eq_def|eq_unfold|eq_\d+)(?![\w'!?.])")
 _PROFILER_THRESHOLD_RE = re.compile(
     r"set_option\s+trace\.profiler\.threshold\s+(\d+(?:_\d+)*)(?![\w'!?])"
 )
-# Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`)
-# or `«guillemet-quoted»` names. Modifiers may sit between `private` and the keyword.
-_DECL_NAME = r"[^\W\d][\w'!?]*(?:\.[^\W\d][\w'!?]*)*|«[^»\n]*»"
+# Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`,
+# `Foo.«bar»`, `«guillemet-quoted»`). Modifiers may sit between `private` and the keyword.
+_DECL_NAME = _IDENT_PART + r"(?:\." + _IDENT_PART + r")*"
 _PRIVATE_LIT_RE = re.compile(
     r"private\s+(?:(?:noncomputable|partial|unsafe|nonrec)\s+)*(theorem|lemma|def)\s+("
     + _DECL_NAME
@@ -553,7 +575,8 @@ def _is_simp_unfold_entry(content: str, start: int, end: int | None = None) -> b
             rem_parens -= 1
             k += 1
             continue
-        if (content[k] == ":" and content[k : k + 2] != ":=") or is_eq_lemma:
+        is_ascription = content[k] == ":" and content[k : k + 2] != ":="
+        if is_ascription or is_eq_lemma:
             depth = 1
             bdepth = 0
             while k < n and depth > 0:
@@ -566,7 +589,7 @@ def _is_simp_unfold_entry(content: str, start: int, end: int | None = None) -> b
                     bdepth += 1
                 elif c2 in "]}" and bdepth > 0:
                     bdepth -= 1
-                elif c2 == "," and depth == 1 and bdepth == 0:
+                elif not is_ascription and c2 == "," and depth == 1 and bdepth == 0:
                     return False
                 k += 1
             if depth != 0:
@@ -849,6 +872,7 @@ def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
             line_indent = k_ind - line_start
 
             cur = end_kw
+            saw_target = False
             while cur < n:
                 while cur < n and stripped[cur] in " \t\r":
                     cur += 1
@@ -869,6 +893,28 @@ def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
                         break
                     cur = k
                 ch = stripped[cur]
+                if not saw_target:
+                    # Optional `(config := ...)` or `+opt` / `-opt` flags before targets.
+                    if ch == "(":
+                        depth = 1
+                        cur += 1
+                        while cur < n and depth > 0:
+                            c2 = stripped[cur]
+                            if c2 == "(":
+                                depth += 1
+                            elif c2 == ")":
+                                depth -= 1
+                            cur += 1
+                        if depth != 0:
+                            break
+                        continue
+                    if ch in "+-" and cur + 1 < n and (
+                        stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"
+                    ):
+                        cur += 2
+                        while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
+                            cur += 1
+                        continue
                 if not (_is_ident_char(ch) or ch == "«"):
                     break
                 tok_start = cur
@@ -887,6 +933,7 @@ def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
                 tok = stripped[tok_start:cur]
                 if not tok or tok in _UNFOLD_STOP_WORDS:
                     break
+                saw_target = True
                 yield kw, tok_start, tok
             pos = stripped.find(kw, end_kw)
 
@@ -963,19 +1010,19 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
             return cand0, first_ce + 2
 
     limit = _next_decl_boundary(stripped, start_pos, max_end, decl_indent)
-    if _EQN_ALT_LINE_RE is None:
-        _EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
-        _MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
-        _HDR_TOKEN_RE = re.compile(r"«[^»\n]*»|[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
     eqn_end = False
-    m_alt = _EQN_ALT_LINE_RE.search(stripped, start_pos, limit)
-    if (
-        m_alt is not None
-        and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None  # type: ignore[union-attr]
-    ):
-        eqn_end = True
-        limit = m_alt.start()
-    if "«" not in stripped[start_pos:limit]:
+    if stripped.find("|", start_pos, limit) != -1:
+        if _EQN_ALT_LINE_RE is None:
+            _EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
+            _MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
+        m_alt = _EQN_ALT_LINE_RE.search(stripped, start_pos, limit)
+        if (
+            m_alt is not None
+            and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None  # type: ignore[union-attr]
+        ):
+            eqn_end = True
+            limit = m_alt.start()
+    if stripped.find("«", start_pos, limit) == -1:
         search_pos = start_pos
         while search_pos < limit:
             colon_eq = stripped.find(":=", search_pos, limit)
@@ -993,9 +1040,11 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
             search_pos = colon_eq + 2
 
     # Token walk over guillemet names, brackets, `:=`, `:` and `where` only.
+    if _HDR_TOKEN_RE is None:
+        _HDR_TOKEN_RE = re.compile(r"«[^»\n]*»|[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
     depth = 0
     colon_pos = -1
-    for tm in _HDR_TOKEN_RE.finditer(stripped, start_pos, limit):  # type: ignore[union-attr]
+    for tm in _HDR_TOKEN_RE.finditer(stripped, start_pos, limit):
         tok = tm.group()
         c = tok[0]
         if c == "«":
@@ -1368,7 +1417,7 @@ _FILE_TEXTS_CACHE: dict[str, tuple[int, int, str, str]] = {}
 COUNT_CACHE_MAX_FILES = 1024
 # Bump whenever rule semantics, signature normalization, or index layout change:
 # count entries and sibling indexes written under another version are ignored.
-CACHE_FORMAT_VERSION = 5
+CACHE_FORMAT_VERSION = 6
 
 
 def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
@@ -1419,7 +1468,9 @@ def _decls_from_index_entry(
             if len(rec) != 9:
                 return None
             kind, name, line, body_start, norm_sig, fp, decl_indent, raw_header, bkeys = rec
-            if kind not in ("theorem", "lemma", "def"):
+            if kind not in ("theorem", "lemma", "def") or not isinstance(fp, list) or len(fp) != 4:
+                return None
+            if bkeys is not None and (not isinstance(bkeys, list) or len(bkeys) != 2):
                 return None
             out.append(
                 PrivateDecl(
@@ -1500,14 +1551,18 @@ def _extract_sibling_private_decls_fast(
         decls = extract_private_decls(
             stripped, file_label=sibling_path.name, lazy_norm=True, file_path=key
         )
+        sib_budget = _BODY_COMPARE_BUDGET
         for d in decls:
             if d.kind == "def" and d.body_start >= 0:
                 end = _next_decl_boundary(stripped, d.body_start, len(stripped), d.decl_indent)
+                has_b = "_v0" in d.ensure_norm_sig()
+                if has_b:
+                    if sib_budget <= 0:
+                        continue
+                    sib_budget -= end - d.body_start
                 d.body_keys = (
                     _body_key1(raw, stripped, d.body_start, end),
-                    _body_key2(
-                        raw, stripped, d.body_start, end, "_v0" in d.ensure_norm_sig()
-                    ),
+                    _body_key2(raw, stripped, d.body_start, end, has_b),
                 )
     _SIBLING_PRIVATE_CACHE[key] = (st.st_mtime_ns, st.st_size, file_crc, decls)
     if persisted is not None and not racy:
@@ -1559,19 +1614,18 @@ def _list_dir_lean_files(parent: Path, max_files: int) -> list[Path]:
     cached = _DIR_LEAN_FILES_CACHE.get(key)
     if cached is not None and cached[0] == st.st_mtime_ns:
         return cached[1]
-    files: list[Path] = []
     try:
-        entries = sorted(parent.iterdir(), key=lambda p: p.name)
+        with os.scandir(parent) as it:
+            names = sorted(
+                e.name
+                for e in it
+                if not e.name.startswith(".")
+                and e.name.endswith(".lean")
+                and e.is_file(follow_symlinks=False)
+            )
     except OSError:
         return []
-    for entry in entries:
-        if len(files) >= max_files + 1:
-            break
-        if entry.name.startswith(".") or entry.suffix != ".lean":
-            continue
-        if entry.is_symlink() or not entry.is_file():
-            continue
-        files.append(entry)
+    files = [parent / name for name in names[: max_files + 1]]
     _DIR_LEAN_FILES_CACHE[key] = (st.st_mtime_ns, files)
     return files
 
@@ -2233,11 +2287,14 @@ def reconstruct_before_text_from_payload(
             if occ > 1:
                 if repl_cnt == occ or args.get("replace_all"):
                     return after_text.replace(new_s, old_s)
-                if repl_cnt == 1 and repl_line is not None:
+                if repl_cnt is not None and repl_cnt >= 1 and repl_line is not None:
                     off = _line_start_offset(after_text, repl_line)
                     idx = after_text.find(new_s, off)
                     if idx != -1 and after_text.count("\n", off, idx) == 0:
-                        return after_text[:idx] + old_s + after_text[idx + len(new_s) :]
+                        if repl_cnt == 1:
+                            return after_text[:idx] + old_s + after_text[idx + len(new_s) :]
+                        if after_text.count(new_s, idx) == repl_cnt:
+                            return after_text[:idx] + after_text[idx:].replace(new_s, old_s)
                 return None
     return None
 
@@ -2248,7 +2305,7 @@ def _invert_ambiguous_without_cache(
     """Best-effort pre-edit text for rule-count baseline when no cache exists and
     `Replacement` / `new_string` occurs multiple times (or mixes a deletion step
     with an insertion step inside `MultiEdit`)."""
-    repl_cnt, _ = _jetski_result_hint(payload)
+    repl_cnt, repl_line = _jetski_result_hint(payload)
     for args in _extract_edit_args_list(payload):
         edits = args.get("edits")
         if isinstance(edits, list) and edits:
@@ -2285,6 +2342,9 @@ def _invert_ambiguous_without_cache(
         new_s = args.get("Replacement", args.get("new_string"))
         if isinstance(old_s, str) and isinstance(new_s, str) and new_s and new_s in after_text:
             if repl_cnt is not None and repl_cnt >= 1:
+                off = _line_start_offset(after_text, repl_line) if repl_line is not None else 0
+                if after_text.count(new_s, off) >= repl_cnt:
+                    return after_text[:off] + after_text[off:].replace(new_s, old_s, repl_cnt)
                 return after_text.replace(new_s, old_s, repl_cnt)
             if "old_string" in args and "Target" not in args and not args.get("replace_all"):
                 return after_text.replace(new_s, old_s, 1)
@@ -2349,8 +2409,13 @@ def _line_spans_of_insertions(
         last = repl_line + ins.count("\n", 0, max(len(ins) - 1, 0))
         return [(repl_line, last)]
     spans: list[tuple[int, int]] = []
+    min_off = (
+        _line_start_offset(after_text, repl_line)
+        if repl_line is not None and len(inserted) == 1
+        else 0
+    )
     for ins in inserted:
-        start = after_text.find(ins)
+        start = after_text.find(ins, min_off)
         hits = 0
         while start != -1 and hits < 64:
             first = after_text.count("\n", 0, start) + 1
