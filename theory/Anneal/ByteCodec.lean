@@ -170,6 +170,15 @@ theorem zeroInitBytes_add :
     rw [hEq]
     exact congrArg (.init (UInt8.ofNat 0) none :: ·) (zeroInitBytes_add k n)
 
+/-- Encoding `0` as `sz` little-endian bytes with `none` provenance yields `zeroInitBytes sz`. -/
+theorem encodeLittleEndianBytes_zero_eq_zeroInitBytes :
+    ∀ sz : Nat, encodeLittleEndianBytes 0 sz none = zeroInitBytes sz
+  | 0 => rfl
+  | k + 1 => by
+    unfold encodeLittleEndianBytes zeroInitBytes
+    have hDiv : Nat.div 0 256 = 0 := rfl
+    rw [hDiv, encodeLittleEndianBytes_zero_eq_zeroInitBytes k]
+
 /-- Length of `replicateUninitBytes n` is `n`. -/
 @[simp]
 theorem length_replicateUninitBytes :
@@ -453,6 +462,15 @@ theorem uintBitsLE_isSurjectiveInitDecoder (sz : Nat) (hNz : 0 < sz) :
 theorem uintBitsLE_hasZeroValid (sz : Nat) (hNz : 0 < sz) :
     (uintBitsLE sz hNz).HasZeroValid :=
   (uintBitsLE_isSurjectiveInitDecoder sz hNz).hasZeroValid
+
+/-- Decoding `zeroInitBytes sz` with `uintBitsLE sz hNz` yields `0`. -/
+theorem uintBitsLE_decode_zeroInitBytes (sz : Nat) (hNz : 0 < sz) :
+    (uintBitsLE sz hNz).decode (zeroInitBytes sz) =
+      some ⟨0, Nat.two_pow_pos (8 * sz)⟩ := by
+  have hEnc : (uintBitsLE sz hNz).encode ⟨0, Nat.two_pow_pos (8 * sz)⟩ = zeroInitBytes sz :=
+    encodeLittleEndianBytes_zero_eq_zeroInitBytes sz
+  rw [← hEnc]
+  exact (uintBitsLE sz hNz).decode_encode ⟨0, Nat.two_pow_pos (8 * sz)⟩
 
 /-- Map a `FixedByteCodec α n` across a type equivalence `(toβ, ofβ)`. -/
 def mapEquiv {α β : Type} {n : Nat}
@@ -792,6 +810,73 @@ theorem padRight_not_isInitCodec {α : Type} {n padBytes : Nat}
   have hTrue := hInit x₀
   rw [allBytesInitialized_padRight_encode_eq_false c hPos x₀] at hTrue
   nomatch hTrue
+
+/-- Zero-width padding (`padUninit 0`) emits `[]` and therefore satisfies `IsInitCodec`. -/
+theorem padUninit_zero_isInitCodec : (padUninit 0).IsInitCodec :=
+  fun _ => rfl
+
+/-- Zero left-padding (`padLeft 0 c`) preserves `IsInitCodec`. -/
+theorem padLeft_zero_isInitCodec {α : Type} {n : Nat}
+    {c : FixedByteCodec α n} (hc : c.IsInitCodec) :
+    (padLeft 0 c).IsInitCodec :=
+  fun x => hc x
+
+/-- Left-padding preserves `IsInitCodec` whenever `padBytes = 0`. -/
+theorem padLeft_isInitCodec_of_eq_zero {α : Type} {n padBytes : Nat}
+    {c : FixedByteCodec α n} (hZero : padBytes = 0) (hc : c.IsInitCodec) :
+    (padLeft padBytes c).IsInitCodec := by
+  subst hZero
+  exact padLeft_zero_isInitCodec hc
+
+/-- Zero right-padding (`padRight c 0`) preserves `IsInitCodec`. -/
+theorem padRight_zero_isInitCodec {α : Type} {n : Nat}
+    {c : FixedByteCodec α n} (hc : c.IsInitCodec) :
+    (padRight c 0).IsInitCodec := by
+  intro x
+  rw [padRight_encode_eq]
+  exact allBytesInitialized_append (hc x) rfl
+
+/-- Right-padding preserves `IsInitCodec` whenever `padBytes = 0`. -/
+theorem padRight_isInitCodec_of_eq_zero {α : Type} {n padBytes : Nat}
+    {c : FixedByteCodec α n} (hZero : padBytes = 0) (hc : c.IsInitCodec) :
+    (padRight c padBytes).IsInitCodec := by
+  subst hZero
+  exact padRight_zero_isInitCodec hc
+
+/-- Exact `IsInitCodec` characterization for `padLeft` over any inhabited type `α`. -/
+theorem padLeft_isInitCodec_iff {α : Type} {n padBytes : Nat}
+    (c : FixedByteCodec α n) (x₀ : α) :
+    (padLeft padBytes c).IsInitCodec ↔ padBytes = 0 ∧ c.IsInitCodec := by
+  cases padBytes with
+  | zero =>
+    simp only [true_and]
+    exact ⟨fun h x => h x, padLeft_zero_isInitCodec⟩
+  | succ k =>
+    constructor
+    · intro hInit
+      exact False.elim (padLeft_not_isInitCodec (Nat.succ_pos k) c x₀ hInit)
+    · rintro ⟨hEq, _⟩
+      nomatch hEq
+
+/-- Exact `IsInitCodec` characterization for `padRight` over any inhabited type `α`. -/
+theorem padRight_isInitCodec_iff {α : Type} {n padBytes : Nat}
+    (c : FixedByteCodec α n) (x₀ : α) :
+    (padRight c padBytes).IsInitCodec ↔ padBytes = 0 ∧ c.IsInitCodec := by
+  cases padBytes with
+  | zero =>
+    simp only [true_and]
+    constructor
+    · intro hInit x
+      have hx := hInit x
+      rw [padRight_encode_eq, show replicateUninitBytes 0 = [] from rfl, List.append_nil] at hx
+      exact hx
+    · exact padRight_zero_isInitCodec
+  | succ k =>
+    constructor
+    · intro hInit
+      exact False.elim (padRight_not_isInitCodec c (Nat.succ_pos k) x₀ hInit)
+    · rintro ⟨hEq, _⟩
+      nomatch hEq
 
 /-- On an exact-width `(n + padBytes)`-byte chunk, `(padRight c padBytes).decode` reduces to `c.decode (chunk.take n)`. -/
 theorem padRight_decode_of_length_eq {α : Type} {n padBytes : Nat}
@@ -1417,6 +1502,68 @@ theorem enumRepr_decode_rejects_non_canonical_tag (sz : Nat) (hNz : 0 < sz) {ε 
     injection hSome with hSub
     have hTagEq : bits = toTag e := congrArg Subtype.val hSub
     exact False.elim (hNonCanon e hTagEq.symm)
+
+/-- A fieldless `enumRepr` codec satisfies `HasZeroValid` (`FromZeros`) if and only if `0` is a discriminant. -/
+theorem enumRepr_hasZeroValid_iff (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz)) :
+    (enumRepr sz hNz toTag ofTag hRound hBounds).HasZeroValid ↔ ∃ e₀ : ε, toTag e₀ = 0 := by
+  unfold HasZeroValid
+  constructor
+  · rintro ⟨e₀, hDec⟩
+    have hSome := (enumRepr_decode_eq_some_iff sz hNz toTag ofTag hRound hBounds
+      (zeroInitBytes sz) e₀).mp hDec
+    rw [uintBitsLE_decode_zeroInitBytes sz hNz] at hSome
+    injection hSome with hSub
+    exact ⟨e₀, (congrArg Subtype.val hSub).symm⟩
+  · rintro ⟨e₀, hTag0⟩
+    refine ⟨e₀, (enumRepr_decode_eq_some_iff sz hNz toTag ofTag hRound hBounds
+      (zeroInitBytes sz) e₀).mpr ?_⟩
+    rw [uintBitsLE_decode_zeroInitBytes sz hNz]
+    exact congrArg some (Subtype.ext hTag0.symm)
+
+/-- Convenient constructor for `enumRepr` `HasZeroValid` from a zero-discriminant variant `e₀`. -/
+theorem enumRepr_hasZeroValid_of (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz))
+    (e₀ : ε) (hTag0 : toTag e₀ = 0) :
+    (enumRepr sz hNz toTag ofTag hRound hBounds).HasZeroValid :=
+  (enumRepr_hasZeroValid_iff sz hNz toTag ofTag hRound hBounds).mpr ⟨e₀, hTag0⟩
+
+/-- If some `sz`-byte bit pattern `bits < 2 ^ (8 * sz)` has no corresponding enum variant,
+`enumRepr` is NOT `IsSurjectiveInitDecoder` (hence not `FromBytes`). -/
+theorem enumRepr_not_isSurjectiveInitDecoder (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz))
+    {bits : Nat} (hLt : bits < 2 ^ (8 * sz))
+    (hMissing : ∀ e : ε, toTag e ≠ bits) :
+    ¬ (enumRepr sz hNz toTag ofTag hRound hBounds).IsSurjectiveInitDecoder := by
+  intro hSurj
+  let bs := encodeLittleEndianBytes bits sz none
+  rcases hSurj bs
+      (length_encodeLittleEndianBytes none sz bits)
+      (allBytesInitialized_encodeLittleEndianBytes none sz bits) with ⟨e, hDec⟩
+  rw [enumRepr_decode_rejects_non_canonical_tag sz hNz toTag ofTag hRound hBounds hLt hMissing]
+    at hDec
+  nomatch hDec
+
+/-- Conversely, if every `bits < 2 ^ (8 * sz)` is realized by some variant (e.g., a 256-variant
+`#[repr(u8)]` enum), `enumRepr` IS `IsSurjectiveInitDecoder` (`FromBytes`). -/
+theorem enumRepr_isSurjectiveInitDecoder (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz))
+    (hCover : ∀ bits : Nat, bits < 2 ^ (8 * sz) → ∃ e : ε, toTag e = bits) :
+    (enumRepr sz hNz toTag ofTag hRound hBounds).IsSurjectiveInitDecoder := by
+  intro bs hLen hInit
+  rcases uintBitsLE_isSurjectiveInitDecoder sz hNz bs hLen hInit with ⟨⟨bits, hLt⟩, hBase⟩
+  rcases hCover bits hLt with ⟨e, hTagEq⟩
+  refine ⟨e, (enumRepr_decode_eq_some_iff sz hNz toTag ofTag hRound hBounds bs e).mpr ?_⟩
+  rw [hBase]
+  exact congrArg some (Subtype.ext hTagEq.symm)
 
 end FixedByteCodec
 
@@ -3007,6 +3154,168 @@ def encodeUntypedValueFuelFree : Value → Option (List AbstractByte)
 termination_by v => sizeOf v
 decreasing_by
   exact sizeOf_lt_of_mem_aggregate_fields _ ‹_›
+
+/-- `List.foldr` over `xs.attach` equals `List.foldr` over `xs` when the step function ignores membership proofs. -/
+theorem foldr_attach_eq_foldr {α β : Type} (xs : List α)
+    (step : α → β → β) (init : β) :
+    xs.attach.foldr (fun ⟨a, _⟩ acc => step a acc) init = xs.foldr step init := by
+  have hMap : (xs.attach.map Subtype.val).foldr step init =
+      xs.attach.foldr (fun x acc => step x.val acc) init := List.foldr_map
+  have hUnattach : xs.attach.map Subtype.val = xs := List.unattach_attach
+  rw [hUnattach] at hMap
+  exact hMap.symm
+
+/-- Unfold one cons step of `List.foldr` over `(x :: xs).attach` when the step function ignores membership proofs. -/
+theorem foldr_attach_cons {α β : Type} (x : α) (xs : List α)
+    (step : α → β → β) (init : β) :
+    (x :: xs).attach.foldr (fun ⟨a, _⟩ acc => step a acc) init =
+      step x (xs.attach.foldr (fun ⟨a, _⟩ acc => step a acc) init) := by
+  rw [foldr_attach_eq_foldr, foldr_attach_eq_foldr, List.foldr_cons]
+
+/--
+Adequacy (soundness) of `encodeUntypedValueFuelFree` with respect to `Trusted`'s
+fuel-bounded `encodeUntypedValueToBytes`: whenever `encodeUntypedValueToBytes fuel v`
+succeeds with `some bs`, `encodeUntypedValueFuelFree v` produces the exact same `some bs`.
+-/
+theorem encodeUntypedValueToBytes_eq_some_imp_fuelFree
+    (fuel : Nat) :
+    ∀ (v : Value) (bs : List AbstractByte),
+      encodeUntypedValueToBytes fuel v = some bs →
+      encodeUntypedValueFuelFree v = some bs := by
+  induction fuel with
+  | zero =>
+    intro _ _ hEnc
+    unfold encodeUntypedValueToBytes at hEnc
+    nomatch hEnc
+  | succ fuel' ihFuel =>
+    intro v bs hEnc
+    cases v with
+    | unit =>
+      rw [encodeUntypedValueFuelFree]
+      exact hEnc
+    | scalar sv =>
+      rw [encodeUntypedValueFuelFree]
+      exact hEnc
+    | ptr p sz =>
+      rw [encodeUntypedValueFuelFree]
+      exact hEnc
+    | aggregate varIdx fields =>
+      rw [encodeUntypedValueFuelFree]
+      unfold encodeUntypedValueToBytes at hEnc
+      revert bs
+      induction fields with
+      | nil =>
+        intro bs hNil
+        exact hNil
+      | cons f fs ih =>
+        intro bs hCons
+        unfold encodeUntypedValueToBytes.encodeFields at hCons
+        cases hF : encodeUntypedValueToBytes fuel' f <;> rw [hF] at hCons
+        · nomatch hCons
+        case some b1 =>
+          cases hFs : encodeUntypedValueToBytes.encodeFields fuel' fs <;> rw [hFs] at hCons
+          · nomatch hCons
+          case some b2 =>
+            dsimp only at hCons
+            injection hCons with hBs
+            rw [appendAbstractBytes_eq_append] at hBs
+            rw [foldr_attach_cons f fs
+                (fun a accOpt =>
+                  match encodeUntypedValueFuelFree a, accOpt with
+                  | some x1, some x2 => some (x1 ++ x2)
+                  | _, _ => none)
+                (some []),
+                ihFuel f b1 hF,
+                ih b2 hFs]
+            dsimp only
+            rw [hBs]
+
+/-- Fuel-free aggregate nesting depth of a `Value` (`0` on leaves, `1 + max field depth` on `.aggregate`). -/
+def valueAggregateDepth : Value → Nat
+  | .unit | .scalar _ | .ptr _ _ => 0
+  | .aggregate _ fields =>
+    1 + fields.attach.foldr (fun ⟨f, _⟩ acc => Nat.max (valueAggregateDepth f) acc) 0
+termination_by v => sizeOf v
+decreasing_by
+  exact sizeOf_lt_of_mem_aggregate_fields _ ‹_›
+
+theorem mem_le_foldr_max_depth :
+    ∀ {fields : List Value} {f : Value},
+      f ∈ fields →
+      valueAggregateDepth f ≤
+        fields.attach.foldr (fun ⟨g, _⟩ acc => Nat.max (valueAggregateDepth g) acc) 0
+  | [], _, hMem => nomatch hMem
+  | x :: xs, f, hMem => by
+    rw [foldr_attach_cons x xs (fun g acc => Nat.max (valueAggregateDepth g) acc) 0]
+    cases List.mem_cons.mp hMem with
+    | inl hEq =>
+      subst hEq
+      exact Nat.le_max_left _ _
+    | inr hTail =>
+      exact Nat.le_trans (mem_le_foldr_max_depth hTail) (Nat.le_max_right _ _)
+
+/--
+Completeness / fuel-stabilization of `encodeUntypedValueFuelFree`: for every
+`fuel > valueAggregateDepth v`, `Trusted`'s `encodeUntypedValueToBytes fuel v`
+equals `encodeUntypedValueFuelFree v`.
+-/
+theorem encodeUntypedValueToBytes_eq_fuelFree_of_depth_lt
+    (fuel : Nat) :
+    ∀ (v : Value),
+      valueAggregateDepth v < fuel →
+      encodeUntypedValueToBytes fuel v = encodeUntypedValueFuelFree v := by
+  induction fuel with
+  | zero =>
+    intro _ hLt
+    nomatch hLt
+  | succ fuel' ihFuel =>
+    intro v hLt
+    cases v with
+    | unit => rw [encodeUntypedValueFuelFree]
+    | scalar _ => rw [encodeUntypedValueFuelFree]
+    | ptr _ _ => rw [encodeUntypedValueFuelFree]
+    | aggregate varIdx fields =>
+      rw [valueAggregateDepth] at hLt
+      have hMaxLt :
+          fields.attach.foldr (fun ⟨g, _⟩ acc => Nat.max (valueAggregateDepth g) acc) 0 < fuel' := by
+        omega
+      rw [encodeUntypedValueFuelFree]
+      unfold encodeUntypedValueToBytes
+      have hFields :
+          ∀ (fs : List Value),
+            (∀ f ∈ fs, valueAggregateDepth f < fuel') →
+            encodeUntypedValueToBytes.encodeFields fuel' fs =
+              fs.attach.foldr
+                (fun ⟨f, _⟩ accOpt =>
+                  match encodeUntypedValueFuelFree f, accOpt with
+                  | some b1, some b2 => some (b1 ++ b2)
+                  | _, _ => none)
+                (some []) := by
+        intro fs
+        induction fs with
+        | nil =>
+          intro _
+          rfl
+        | cons f rest ih =>
+          intro hBound
+          unfold encodeUntypedValueToBytes.encodeFields
+          rw [foldr_attach_cons f rest
+                (fun a accOpt =>
+                  match encodeUntypedValueFuelFree a, accOpt with
+                  | some b1, some b2 => some (b1 ++ b2)
+                  | _, _ => none)
+                (some []),
+              ihFuel f (hBound f (List.mem_cons_self ..)),
+              ih (fun g hg => hBound g (List.mem_cons_of_mem f hg))]
+          cases encodeUntypedValueFuelFree f <;>
+            cases rest.attach.foldr
+              (fun ⟨a, _⟩ accOpt =>
+                match encodeUntypedValueFuelFree a, accOpt with
+                | some b1, some b2 => some (b1 ++ b2)
+                | _, _ => none)
+              (some []) <;>
+            simp [appendAbstractBytes_eq_append]
+      exact hFields fields (fun f hf => Nat.lt_of_le_of_lt (mem_le_foldr_max_depth hf) hMaxLt)
 
 /-- Fuel-free node count on `Value` using `sizeOf_lt_of_mem_aggregate_fields`. -/
 def valueNodeCount : Value → Nat

@@ -297,6 +297,55 @@ theorem ordering3Codec_rejects_discriminant_3 :
     1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
     (bits := 3) (by decide) rfl
 
+/-- `enumRepr` marker-trait consequences (`B2-2`): `ordering3Codec` is `IsInitCodec` and
+`HasZeroValid` (via `.less ↦ 0`), and NOT `IsSurjectiveInitDecoder` (via missing tag `3`). -/
+theorem ordering3Codec_marker_traits :
+    ordering3Codec.IsInitCodec ∧
+    ordering3Codec.HasZeroValid ∧
+    ¬ ordering3Codec.IsSurjectiveInitDecoder :=
+  ⟨FixedByteCodec.enumRepr_isInitCodec
+     1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds,
+   FixedByteCodec.enumRepr_hasZeroValid_of
+     1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
+     .less rfl,
+   FixedByteCodec.enumRepr_not_isSurjectiveInitDecoder
+     1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
+     (bits := 3) (by decide) (fun e => by cases e <;> decide)⟩
+
+/-- Fieldless enum with non-zero discriminants `{1, 2}` fails `HasZeroValid` (`¬ FromZeros`)
+via `enumRepr_hasZeroValid_iff`. -/
+inductive NonZeroTagEnum : Type where
+  | one
+  | two
+  deriving DecidableEq
+
+def nonZeroTagToTag : NonZeroTagEnum → Nat
+  | .one => 1
+  | .two => 2
+
+def nonZeroTagOfTag : Nat → Option NonZeroTagEnum
+  | 1 => some .one
+  | 2 => some .two
+  | _ => none
+
+theorem nonZeroTag_round (e : NonZeroTagEnum) : nonZeroTagOfTag (nonZeroTagToTag e) = some e := by
+  cases e <;> rfl
+
+theorem nonZeroTag_bounds (e : NonZeroTagEnum) : nonZeroTagToTag e < 2 ^ (8 * 1) := by
+  cases e <;> decide
+
+def nonZeroTagEnumCodec : FixedByteCodec NonZeroTagEnum 1 :=
+  FixedByteCodec.enumRepr 1 (by decide) nonZeroTagToTag nonZeroTagOfTag
+    nonZeroTag_round nonZeroTag_bounds
+
+theorem nonZeroTagEnumCodec_not_hasZeroValid :
+    ¬ nonZeroTagEnumCodec.HasZeroValid := by
+  unfold nonZeroTagEnumCodec
+  rw [FixedByteCodec.enumRepr_hasZeroValid_iff
+        1 (by decide) nonZeroTagToTag nonZeroTagOfTag nonZeroTag_round nonZeroTag_bounds]
+  rintro ⟨e₀, h0⟩
+  cases e₀ <;> nomatch h0
+
 /-- Lenient `ofTag` regression (`B1-1`): `lenientBoolOfTag` maps every tag `≥ 2` to
 `some false`, yet `enumRepr` still rejects tag `2` with `none` because `toTag false = 0 ≠ 2`! -/
 def lenientBoolToTag : Bool → Nat
@@ -390,6 +439,20 @@ theorem padded_u16_not_isInitCodec :
    FixedByteCodec.padRight_hasZeroValid 2
      (FixedByteCodec.uintBitsLE_hasZeroValid 2 (by decide))⟩
 
+/-- Exact `padLeft`/`padRight` `IsInitCodec` characterization (`B2-1`): zero padding
+preserves `IsInitCodec`, whereas positive padding violates it. -/
+theorem pad_zero_vs_pos_isInitCodec_iff (p : Nat) :
+    ((FixedByteCodec.padLeft p u16Codec).IsInitCodec ↔ p = 0 ∧ u16Codec.IsInitCodec) ∧
+    ((FixedByteCodec.padRight u16Codec p).IsInitCodec ↔ p = 0 ∧ u16Codec.IsInitCodec) ∧
+    (FixedByteCodec.padLeft 0 u16Codec).IsInitCodec ∧
+    (FixedByteCodec.padRight u16Codec 0).IsInitCodec :=
+  ⟨FixedByteCodec.padLeft_isInitCodec_iff u16Codec ⟨0, by decide⟩,
+   FixedByteCodec.padRight_isInitCodec_iff u16Codec ⟨0, by decide⟩,
+   FixedByteCodec.padLeft_isInitCodec_of_eq_zero rfl
+     (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide)),
+   FixedByteCodec.padRight_isInitCodec_of_eq_zero rfl
+     (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide))⟩
+
 /-! ## 3. `MirValueCodec` + `Anneal.BitValidity` Marker-Trait & `transmute_sound` Bridges -/
 
 def nonZeroU32Layout : TypeLayout := {
@@ -421,10 +484,21 @@ def paddedU8U32TupleLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- Real `rustc` layout for unpadded `(u16, u16)`: `u16` at offset `0` (`pad₁ = 0`),
+`u16` at offset `2` (`pad₂ = 0`), total size `4` bytes. -/
+def laidOutU16PairLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 2 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 2 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
 def testLayouts : LayoutTable := {
   pointerBits := 64
   isLittleEndian := true
-  entries := [nonZeroU32Layout, paddedU16TupleLayout, paddedU8U32TupleLayout]
+  entries := [nonZeroU32Layout, paddedU16TupleLayout, paddedU8U32TupleLayout, laidOutU16PairLayout]
 }
 
 def mirUnit : MirValueCodec testLayouts { kind := .tuple [], layoutIdx := 0 } Unit 0 :=
@@ -458,10 +532,10 @@ def mirU8x4 :
   MirValueCodec.uintArray testLayouts .u8 4 (by decide) 0
 
 def mirU16Pair :
-    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 }
+    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 4 }
       ({ bits : Nat // bits < 2 ^ (8 * 2) } × { bits : Nat // bits < 2 ^ (8 * 2) })
       4 :=
-  MirValueCodec.uintPairTuple testLayouts .u16 .u16 3 rfl
+  MirValueCodec.uintPairTuple testLayouts .u16 .u16 4 rfl
 
 def mirPaddedU16Tuple :
     MirValueCodec testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 }
@@ -475,6 +549,13 @@ def mirPaddedU8U32Tuple :
       8 :=
   MirValueCodec.uintPairArbitraryTuple
     testLayouts .u8 .u32 3 0 2 paddedU8U32TupleLayout [0, 1] rfl rfl rfl
+
+def mirLaidOutU16Pair :
+    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 }
+      ({ bits : Nat // bits < 2 ^ (8 * 2) } × { bits : Nat // bits < 2 ^ (8 * 2) })
+      4 :=
+  MirValueCodec.uintPairArbitraryTuple
+    testLayouts .u16 .u16 0 0 3 laidOutU16PairLayout [0, 1] rfl rfl rfl
 
 /-- `u32` satisfies all four zerocopy marker traits with a non-vacuous `IsTryFromBytes` range bound. -/
 theorem mirU32_all_marker_traits :
@@ -635,6 +716,70 @@ theorem transmute_bool_to_u8_sound
     (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide))
     v bs hEnc
 
+/-- Real laid-out unpadded `(u16, u16)` (`B2-1`, offsets `[0, 2]`, size `4`) satisfies
+`IsIntoBytes`, `IsFromBytes`, `IsFromZeros`, and non-vacuous `IsTryFromBytes` purely
+via `padRight_zero_isInitCodec` and combinator lemmas. -/
+theorem mirLaidOutU16Pair_all_marker_traits :
+    IsIntoBytes testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 } ∧
+    IsFromBytes testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 } ∧
+    IsFromZeros testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 } ∧
+    IsTryFromBytes testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 }
+      (fun v =>
+        ∃ a b, a < 2 ^ 16 ∧ b < 2 ^ 16 ∧
+          v = .aggregate 0 [.scalar ⟨a, 2⟩, .scalar ⟨b, 2⟩]) :=
+  ⟨mirLaidOutU16Pair.isIntoBytes
+     (FixedByteCodec.prod_isInitCodec
+       (FixedByteCodec.padRight_zero_isInitCodec
+         (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide)))
+       (FixedByteCodec.padRight_zero_isInitCodec
+         (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide)))),
+   mirLaidOutU16Pair.isFromBytes
+     (FixedByteCodec.prod_isSurjectiveInitDecoder
+       (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
+         (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 2 (by decide)))
+       (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
+         (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 2 (by decide)))),
+   mirLaidOutU16Pair.isFromZeros
+     (FixedByteCodec.prod_hasZeroValid
+       (FixedByteCodec.padRight_hasZeroValid 0
+         (FixedByteCodec.uintBitsLE_hasZeroValid 2 (by decide)))
+       (FixedByteCodec.padRight_hasZeroValid 0
+         (FixedByteCodec.uintBitsLE_hasZeroValid 2 (by decide)))),
+   mirLaidOutU16Pair.isTryFromBytes_of
+     (fun ⟨⟨a, ha⟩, ⟨b, hb⟩⟩ => ⟨a, b, ha, hb, rfl⟩)⟩
+
+/-- Bidirectional `transmute_sound` for real laid-out `(u16, u16)` (`B2-1`):
+`(u16, u16) → u32` and `[u8; 4] → (u16, u16)`. -/
+theorem transmute_laidOutU16Pair_to_u32_sound
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel testLayouts
+      { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 } v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel testLayouts
+      { kind := .uint .u32, layoutIdx := 0 } bs = some v' :=
+  MirValueCodec.transmute_sound mirLaidOutU16Pair mirU32
+    (FixedByteCodec.prod_isInitCodec
+      (FixedByteCodec.padRight_zero_isInitCodec
+        (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide)))
+      (FixedByteCodec.padRight_zero_isInitCodec
+        (FixedByteCodec.uintBitsLE_isInitCodec 2 (by decide))))
+    (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide))
+    v bs hEnc
+
+theorem transmute_u8x4_to_laidOutU16Pair_sound
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel testLayouts
+      { kind := .array (.uint .u8) 4, layoutIdx := 0 } v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel testLayouts
+      { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 } bs = some v' :=
+  MirValueCodec.transmute_sound mirU8x4 mirLaidOutU16Pair
+    (FixedByteCodec.listFixed_isInitCodec 4 (FixedByteCodec.uintBitsLE_isInitCodec 1 (by decide)))
+    (FixedByteCodec.prod_isSurjectiveInitDecoder
+      (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
+        (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 2 (by decide)))
+      (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
+        (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 2 (by decide))))
+    v bs hEnc
+
 /-! ## 4. Fuel-Free Structural Recursion (`termination_by`) via `sizeOf_lt_*` -/
 
 /-- Custom fuel-free scalar-leaf collector over `RigidTy` exercising `sizeOf_lt_*` directly. -/
@@ -685,17 +830,44 @@ def nestedAggregateDepth : Nat → Value
   | 0 => .scalar ⟨0x2a, 1⟩
   | d + 1 => .aggregate 0 [nestedAggregateDepth d]
 
-/-- At depth `20 > defaultCodecFuel` (`16`), the fuel-bounded `encodeUntypedValueToBytes`
-exhausts fuel and returns `none`, whereas fuel-free `encodeUntypedValueFuelFree`
-succeeds! -/
+theorem valueAggregateDepth_nestedAggregateDepth :
+    ∀ d : Nat, valueAggregateDepth (nestedAggregateDepth d) = d
+  | 0 => by rw [nestedAggregateDepth, valueAggregateDepth]
+  | d + 1 => by
+    rw [nestedAggregateDepth, valueAggregateDepth,
+        foldr_attach_cons (nestedAggregateDepth d) []
+          (fun g acc => Nat.max (valueAggregateDepth g) acc) 0]
+    have hNil : ([].attach.foldr (fun ⟨g, _⟩ acc => Nat.max (valueAggregateDepth g) acc) 0) = 0 := rfl
+    rw [hNil, valueAggregateDepth_nestedAggregateDepth d]
+    simp only [Nat.max_def]
+    split <;> omega
+
+/-- At depth `20 > defaultCodecFuel` (`16`), `Trusted`'s `encodeUntypedValueToBytes`
+exhausts `defaultCodecFuel` (`= none`), stabilizes at `fuel = 21` (`= some [0x2a]`),
+and `encodeUntypedValueFuelFree` is proved equal to `Trusted`'s encoder via
+`encodeUntypedValueToBytes_eq_some_imp_fuelFree` and `encodeUntypedValueToBytes_eq_fuelFree_of_depth_lt` (`B2-3`). -/
 theorem fuelFree_succeeds_beyond_defaultCodecFuel :
     encodeUntypedValueToBytes defaultCodecFuel (nestedAggregateDepth 20) = none ∧
+    encodeUntypedValueToBytes 21 (nestedAggregateDepth 20) =
+      some [.init (UInt8.ofNat 0x2a) none] ∧
     encodeUntypedValueFuelFree (nestedAggregateDepth 20) =
       some [.init (UInt8.ofNat 0x2a) none] ∧
+    (∀ fuel : Nat, 20 < fuel →
+      encodeUntypedValueToBytes fuel (nestedAggregateDepth 20) =
+        encodeUntypedValueFuelFree (nestedAggregateDepth 20)) ∧
     valueNodeCount (nestedAggregateDepth 20) = 21 := by
-  refine ⟨rfl, ?_, ?_⟩
-  · simp [nestedAggregateDepth, encodeUntypedValueFuelFree, encodeScalarBytes, encodeLittleEndianBytes]
-  · simp [nestedAggregateDepth, valueNodeCount]
+  have hFuel21 :
+      encodeUntypedValueToBytes 21 (nestedAggregateDepth 20) =
+        some [.init (UInt8.ofNat 0x2a) none] := rfl
+  refine ⟨rfl,
+          hFuel21,
+          encodeUntypedValueToBytes_eq_some_imp_fuelFree 21
+            (nestedAggregateDepth 20) [.init (UInt8.ofNat 0x2a) none] hFuel21,
+          fun fuel hGt =>
+            encodeUntypedValueToBytes_eq_fuelFree_of_depth_lt fuel (nestedAggregateDepth 20)
+              (by rw [valueAggregateDepth_nestedAggregateDepth 20]; exact hGt),
+          ?_⟩
+  simp [nestedAggregateDepth, valueNodeCount]
 
 /-! ## 5. Kernel `rfl` Reductions & Characterizations of `RigidTy` Predicates -/
 
