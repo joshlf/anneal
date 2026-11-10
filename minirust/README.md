@@ -1138,7 +1138,10 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `childReborrowWriteDisablesParent` and `retagDisabledRefDiscrepancy` are now
   admitted in `inFragment` (`*_inFragment`) and return `9` across Anneal,
   `BasicMemory`, and `MachTB` (`childReborrowWriteDisablesParent_anneal_ret`,
-  `retagDisabledRefDiscrepancy_anneal_ret`); they disagree on the remaining
+  `retagDisabledRefDiscrepancy_anneal_ret`), with MiniRust's return transported
+  symbolically by `mirCall_ret` / `mirCall_noUB`
+  (`childReborrowWriteDisablesParent_minirust_ret_from_start` / `_minirust_noUB`,
+  `retagDisabledRefDiscrepancy_minirust_ret_from_start` / `_minirust_noUB`); they disagree on the remaining
   divergences listed under the gaps: `misaligned` (UB in MiniRust only),
   `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
   `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
@@ -1196,7 +1199,8 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `Stop.unsupported` on `MachTB` when two live `&mut` tags meet at `int2ptr`),
   `boolMutRefToggle` and `boolInvalidByteRefUb` (plus `boolInvalidLoadDirectUb`
   verifying `validateLoadedValue` invalid-`bool` UB parity at the dereference load
-  itself, `storageCycleDisablesBorrowUb` verifying `disableLocalBorrows` across
+  itself, with the valid-byte control `boolInvalidLoadDirectUb_valid_three_way_ret`
+  returning `0` on all three semantics for `1u8`, `storageCycleDisablesBorrowUb` verifying `disableLocalBorrows` across
   `StorageDead`/`StorageLive` stack-slot reuse, `derefReadFreezesActiveMutUb`
   verifying `freezeDerefReadBorrowsAt` on active `&mut`, and in-fragment
   `mutReborrowForeignReadRoundTrip` verifying `.reserved` `&mut (*_2)` across a

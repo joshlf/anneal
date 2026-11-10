@@ -3196,6 +3196,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   childReborrowWriteDisablesParent_inFragment
   childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
+  childReborrowWriteDisablesParent_translate
+  childReborrowWriteDisablesParent_noUB
+  childReborrowWriteDisablesParent_ctxOk
+  childReborrowWriteDisablesParent_minirust_ret_from_start
+  childReborrowWriteDisablesParent_minirust_noUB
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
   refMutReborrowWrite_translate
@@ -3289,6 +3294,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_inFragment
   retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
+  retagDisabledRefDiscrepancy_translate_eq
+  retagDisabledRefDiscrepancy_noUB
+  retagDisabledRefDiscrepancy_ctxOk
+  retagDisabledRefDiscrepancy_minirust_ret_from_start
+  retagDisabledRefDiscrepancy_minirust_noUB
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
   retagScalarDiscrepancy_anneal_ub
@@ -3621,6 +3631,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   childReborrowWriteDisablesParent_inFragment
   childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
+  childReborrowWriteDisablesParent_translate
+  childReborrowWriteDisablesParent_noUB
+  childReborrowWriteDisablesParent_ctxOk
+  childReborrowWriteDisablesParent_minirust_ret_from_start
+  childReborrowWriteDisablesParent_minirust_noUB
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
   refMutReborrowWrite_translate
@@ -3714,6 +3729,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_inFragment
   retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
+  retagDisabledRefDiscrepancy_translate_eq
+  retagDisabledRefDiscrepancy_noUB
+  retagDisabledRefDiscrepancy_ctxOk
+  retagDisabledRefDiscrepancy_minirust_ret_from_start
+  retagDisabledRefDiscrepancy_minirust_noUB
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
   retagScalarDiscrepancy_anneal_ub
@@ -4010,6 +4030,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unitTupleMutRefRoundTrip_three_way
   boolInvalidLoadDirectUb_translate
   boolInvalidLoadDirectUb_three_way_ub
+  boolInvalidLoadDirectUb_notInFragment
+  boolInvalidLoadDirectUb_valid_three_way_ret
   storageCycleDisablesBorrowUb_notInFragment
   storageCycleDisablesBorrowUb_translate
   storageCycleDisablesBorrowUb_three_way_ub
@@ -4199,6 +4221,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unitTupleMutRefRoundTrip_three_way
   boolInvalidLoadDirectUb_translate
   boolInvalidLoadDirectUb_three_way_ub
+  boolInvalidLoadDirectUb_notInFragment
+  boolInvalidLoadDirectUb_valid_three_way_ret
   storageCycleDisablesBorrowUb_notInFragment
   storageCycleDisablesBorrowUb_translate
   storageCycleDisablesBorrowUb_three_way_ub

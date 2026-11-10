@@ -1758,6 +1758,11 @@ def boolInvalidLoadDirectUb : CapturedMir :=
 theorem boolInvalidLoadDirectUb_translate :
     (translateFn boolInvalidLoadDirectUb).isSome = true := by decide +kernel
 
+/-- The `transmute`d `&bool` load is outside `inFragment`, so the parity below is
+established by direct evaluation of all three semantics. -/
+theorem boolInvalidLoadDirectUb_notInFragment :
+    inFragment boolInvalidLoadDirectUb = false := by decide +kernel
+
 theorem boolInvalidLoadDirectUb_three_way_ub :
     (∃ tr u, Reaches (mirTree boolInvalidLoadDirectUb
       (initMachineState boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩])) tr u ∧ FaultNow u) ∧
@@ -1766,6 +1771,23 @@ theorem boolInvalidLoadDirectUb_three_way_ub :
     ubAfterTB boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩] 7 =
       some "load at type but the data in memory violates the language invariant" :=
   ⟨faultsA_sound boolInvalidLoadDirectUb 20 _ (by decide),
+   by decide +kernel, by decide +kernel⟩
+
+/-- Control for `boolInvalidLoadDirectUb_three_way_ub`: on the valid `bool` byte
+`1u8` (`true`) the same program is UB-free in Anneal and returns `0` in Anneal,
+`Mach`, and `MachTB`, so the three-way UB on `2u8` stems from the loaded value's
+validity (Anneal's `validateLoadedValue`, MiniRust's typed-load invariant check),
+not from the `&raw const` / `transmute` pointer setup. -/
+theorem boolInvalidLoadDirectUb_valid_three_way_ret :
+    (∃ mem, ReachesRet (mirTree boolInvalidLoadDirectUb
+      (initMachineState boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩])) []
+      (.normal (.scalar ⟨0, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTree boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩]) ∧
+    retAfter boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩] 9 =
+      some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
+    retAfterTB boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩] 9 = tbRetU32 0 :=
+  ⟨⟨_, runA_sound boolInvalidLoadDirectUb 30 _ _ _ rfl⟩,
+   runA_noUB boolInvalidLoadDirectUb 30 _ _ _ rfl,
    by decide +kernel, by decide +kernel⟩
 
 /-- `D2` (`disableLocalBorrows`) tag-disabling correspondence across stack-slot

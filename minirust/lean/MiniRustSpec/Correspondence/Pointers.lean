@@ -2046,8 +2046,8 @@ theorem invalidateConflictingBorrowsAtProj_self_or_disjoint (borrows : List Borr
       ih (fun e' he' => h e' (by simp [he']))]
 
 /-- The Tree Borrows write transition of a write through tag `tag` keeps every
-entry that shares `tag` (local write: `.reserved` activates) or whose target is
-disjoint from the write (any writer). -/
+entry whose tag is an ancestor-or-self of `tag` (local write: `.reserved`
+activates) or whose target is disjoint from the write (any writer). -/
 theorem updateBorrowPermTreeAtProj_self_or_disjoint_keep (all : List BorrowEntry)
     (e : BorrowEntry) (targetLocal tag : Nat) (writeProj : List ProjectionElem)
     (h : e.targetLocal = targetLocal →
@@ -3409,9 +3409,10 @@ read through the pointer that `r` holds (tag `rv.tag`, entry `rEntry`), which
 updates the borrow table by `freezeTreeBorrowsOnReadAtProj` on `rEntry`'s target
 (a dereference read `freezeDerefReadBorrowsAt`, or a reference reborrow's
 initial read), `PtrEnvOk` holds for `stepForeignRead … r`: every mutable
-pointer/reference local that the read may freeze is `.disabled`, and every other
-local keeps its entry (the reader and its tag peers are local to the read,
-disjoint targets do not overlap it, and a freeze never disables). -/
+pointer/reference local that the read may freeze is `.disabled` when hot
+(`isHotPtrState`; cold `.reserved`/`.frozen` entries are left unfrozen), and every
+other local keeps its entry (the reader and its ancestor-or-self peers are local
+to the read, disjoint targets do not overlap it, and a freeze never disables). -/
 theorem PtrEnvOk.foreignRead {body : CapturedMir} {view : List LocalSlot}
     {borrows : List BorrowEntry} {env : List PtrLocalState}
     (hok : PtrEnvOk body view borrows env)

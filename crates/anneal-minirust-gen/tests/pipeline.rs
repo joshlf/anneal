@@ -396,7 +396,7 @@ fn anchors_match_generated_items_and_cover_interp() {
     let sim_sec = &audit_text[audit_text.find("#check_theorem_deps \"[SIMULATION-AUDIT]\"").unwrap()..];
     let sim_sec = &sim_sec[..sim_sec.find("\n\n").unwrap()];
     let sim_count = sim_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(sim_count >= 330, "expected at least 330 [SIMULATION-AUDIT] theorems, found {sim_count}");
+    assert!(sim_count >= 360, "expected at least 360 [SIMULATION-AUDIT] theorems, found {sim_count}");
 
     let wit_sec = &audit_text[audit_text.find("#check_theorem_deps \"[WITNESS-AUDIT]\"").unwrap()..];
     let wit_sec = &wit_sec[..wit_sec.find("\n\n").unwrap()];
@@ -406,17 +406,17 @@ fn anchors_match_generated_items_and_cover_interp() {
     let ptr_sec = &audit_text[audit_text.find("#check_theorem_deps \"[POINTER-AUDIT]\"").unwrap()..];
     let ptr_sec = &ptr_sec[..ptr_sec.find("\n\n").unwrap()];
     let ptr_count = ptr_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(ptr_count >= 217, "expected at least 217 [POINTER-AUDIT] theorems, found {ptr_count}");
+    assert!(ptr_count >= 221, "expected at least 221 [POINTER-AUDIT] theorems, found {ptr_count}");
 
     let ref_sec = &audit_text[audit_text.find("#check_theorem_deps \"[REF-AUDIT]\"").unwrap()..];
     let ref_sec = &ref_sec[..ref_sec.find("\n\n").unwrap()];
     let ref_count = ref_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(ref_count >= 418, "expected at least 418 [REF-AUDIT] theorems, found {ref_count}");
+    assert!(ref_count >= 432, "expected at least 432 [REF-AUDIT] theorems, found {ref_count}");
 
     let tb_sec = &audit_text[audit_text.find("#check_theorem_deps \"[TB-AUDIT]\"").unwrap()..];
     let tb_sec = &tb_sec[..tb_sec.find("\n\n").unwrap()];
     let tb_count = tb_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(tb_count >= 170, "expected at least 170 [TB-AUDIT] theorems, found {tb_count}");
+    assert!(tb_count >= 188, "expected at least 188 [TB-AUDIT] theorems, found {tb_count}");
 
     let prov_sec = &audit_text[audit_text.find("#check_theorem_deps \"[PROV-AUDIT]\"").unwrap()..];
     let prov_sec = &prov_sec[..prov_sec.find("\n\n").unwrap()];

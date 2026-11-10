@@ -1821,6 +1821,94 @@ theorem childReborrowWriteDisablesParent_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
   decide +kernel
 
+/-! Since `childReborrowWriteDisablesParent` is now in-fragment (ancestor-tracking
+`stepReborrow` keeps parent `_2` `.live` across the child write `(*_3) = 9`), the
+generic simulation theorems `mirCall_ret` / `mirCall_noUB` transport Anneal's
+return of `9` (a write through the `.reserved` child `_3`, which activates it and
+is a local write for its `.active` parent `_2`, followed by a parent read that
+freezes the child) to MiniRust's `Interp.steps`, symbolically rather than by
+direct evaluation. -/
+
+def childReborrowWriteDisablesParentFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .mut u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .mut u32)),
+      .Assign (.Deref (.Load (.Local (localName 3))) (.Int u32)) (.Constant (.Int 9) (.Int u32)),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem childReborrowWriteDisablesParent_translate :
+    translateFn childReborrowWriteDisablesParent = some childReborrowWriteDisablesParentFn := rfl
+
+def childReborrowWriteDisablesParentS0 : MachineState :=
+  initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]
+def childReborrowWriteDisablesParentMInit : Mach :=
+  machine childReborrowWriteDisablesParent childReborrowWriteDisablesParentFn
+    childReborrowWriteDisablesParentS0.frame.locals childReborrowWriteDisablesParentFn.start
+
+theorem childReborrowWriteDisablesParent_noUB :
+    MirNoUBTree (mirCallTree childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]) :=
+  runA_noUB childReborrowWriteDisablesParent 30 _ _ _ rfl
+
+theorem childReborrowWriteDisablesParent_ctxOk : CtxOk childReborrowWriteDisablesParent ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : childReborrowWriteDisablesParent.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [childReborrowWriteDisablesParent, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [childReborrowWriteDisablesParent, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : childReborrowWriteDisablesParent.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [childReborrowWriteDisablesParent, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem childReborrowWriteDisablesParent_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n childReborrowWriteDisablesParentMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 9 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret childReborrowWriteDisablesParent_inFragment
+      childReborrowWriteDisablesParent_translate ctx0 childReborrowWriteDisablesParent_ctxOk
+      [.scalar ⟨5, 4⟩] (by decide) childReborrowWriteDisablesParentMInit
+      rfl rfl rfl childReborrowWriteDisablesParent_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [childReborrowWriteDisablesParent, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem childReborrowWriteDisablesParent_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n childReborrowWriteDisablesParentMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k childReborrowWriteDisablesParentMInit = .ok mRet ∧
+      ReturnRel childReborrowWriteDisablesParent ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB childReborrowWriteDisablesParent_inFragment
+    childReborrowWriteDisablesParent_translate ctx0 childReborrowWriteDisablesParent_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) childReborrowWriteDisablesParentMInit
+    rfl rfl rfl childReborrowWriteDisablesParent_noUB herr
+
 /-! ### Ground truth for Tree Borrows `ReborrowSettings.new` -/
 
 def sampleTbPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
@@ -2275,6 +2363,92 @@ theorem retagDisabledRefDiscrepancy_minirust_direct :
     retAfter retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩] 9 =
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
   decide +kernel
+
+/-! `retagDisabledRefDiscrepancy` is likewise in-fragment now, so `mirCall_ret` /
+`mirCall_noUB` transport Anneal's return of `9` (a write through the `.reserved`
+child `_3`, local for its `.active` parent `_2`, then `Retag([default], _2)`
+lowered to `Statement::Validate`) to MiniRust's `Interp.steps`. -/
+
+def retagDisabledRefDiscrepancyFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .mut u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .mut u32)),
+      .Assign (.Deref (.Load (.Local (localName 3))) (.Int u32)) (.Constant (.Int 9) (.Int u32)),
+      .Validate (.Local (localName 2)) false,
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem retagDisabledRefDiscrepancy_translate_eq :
+    translateFn retagDisabledRefDiscrepancy = some retagDisabledRefDiscrepancyFn := rfl
+
+def retagDisabledRefDiscrepancyS0 : MachineState :=
+  initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]
+def retagDisabledRefDiscrepancyMInit : Mach :=
+  machine retagDisabledRefDiscrepancy retagDisabledRefDiscrepancyFn
+    retagDisabledRefDiscrepancyS0.frame.locals retagDisabledRefDiscrepancyFn.start
+
+theorem retagDisabledRefDiscrepancy_noUB :
+    MirNoUBTree (mirCallTree retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]) :=
+  runA_noUB retagDisabledRefDiscrepancy 25 _ _ _ rfl
+
+theorem retagDisabledRefDiscrepancy_ctxOk : CtxOk retagDisabledRefDiscrepancy ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : retagDisabledRefDiscrepancy.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [retagDisabledRefDiscrepancy, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [retagDisabledRefDiscrepancy, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : retagDisabledRefDiscrepancy.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [retagDisabledRefDiscrepancy, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem retagDisabledRefDiscrepancy_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n retagDisabledRefDiscrepancyMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 9 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret retagDisabledRefDiscrepancy_inFragment
+      retagDisabledRefDiscrepancy_translate_eq ctx0 retagDisabledRefDiscrepancy_ctxOk
+      [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
+      rfl rfl rfl retagDisabledRefDiscrepancy_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [retagDisabledRefDiscrepancy, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem retagDisabledRefDiscrepancy_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n retagDisabledRefDiscrepancyMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k retagDisabledRefDiscrepancyMInit = .ok mRet ∧
+      ReturnRel retagDisabledRefDiscrepancy ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB retagDisabledRefDiscrepancy_inFragment
+    retagDisabledRefDiscrepancy_translate_eq ctx0 retagDisabledRefDiscrepancy_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
+    rfl rfl rfl retagDisabledRefDiscrepancy_noUB herr
 
 /-- Scalar `Retag([default], _1)` discrepancy on `u32` parameter `_1`:
 `translateFn` lowers `Retag` to `Statement::Validate`, while `statementOk`

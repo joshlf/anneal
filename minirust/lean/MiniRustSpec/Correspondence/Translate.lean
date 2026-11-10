@@ -4213,8 +4213,11 @@ def borrowProjOverlap : List BorrowProjStep → List BorrowProjStep → Bool
   `BorrowEntry` is not `.disabled`, is not `.active` whenever `hot = false`
   (two-phase borrows `&two_phase mut`, mutable reference reborrows `&mut *_p`,
   and shared borrows start `.reserved` or `.frozen`, which foreign reads leave
-  unfrozen), targets `target` (when `some`), and shares its tag `pv.tag` with
-  every initialized pointer/reference local in `peers`;
+  unfrozen), is not `.frozen` when `p` is a mutable pointer/reference local,
+  targets `target` (when `some`), and has a tag `pv.tag` in the Tree Borrows
+  subtree of every initialized pointer/reference local in `peers` (the peers are
+  `p`'s tag-sharing copies and its reborrow ancestors, `PtrLocalOk`), so a write
+  or read through `p` is a local access for every peer;
 * `.disabled` (`⊤`): `p`'s tag may have been invalidated by a dereference write
   through a distinct overlapping tag (or frozen on a hot mutable borrow by a
   foreign read), so dereferencing `p` is forbidden. -/
@@ -4323,10 +4326,10 @@ def targetsDefinitelyDisjoint :
   | _, _ => false
 
 /-- Abstract transfer for a dereference write `(*_w) = rv`: every `.live` local
-that shares `w`'s tag (`q ∈ wPeers`) or targets a provably non-overlapping place
-(`targetsDefinitelyDisjoint`) stays `.live` (conservatively marked `hot = true`
-since writing activates `.reserved` entries), and all other `.live` locals become
-`.disabled`. -/
+whose tag is an ancestor-or-self of `w`'s tag (`q ∈ wPeers`, a local write that
+activates `.reserved` entries) or that targets a provably non-overlapping place
+(`targetsDefinitelyDisjoint`) stays `.live` (conservatively marked `hot = true`),
+and all other `.live` locals become `.disabled`. -/
 def stepDerefWrite (n : Nat) (env : List PtrLocalState) (w : Nat) : List PtrLocalState :=
   match env.getD w .disabled with
   | .empty => (List.range n).map (fun q => env.getD q .disabled)
@@ -4352,8 +4355,9 @@ def isMutPtrLocal (decls : List MirAst.LocalDecl) (q : Nat) : Bool :=
 
 /-- Whether a Tree Borrows read through `r`'s tag provably leaves `q`'s abstract
 state valid: `q` is `r` itself, `q` holds no pointer (`.empty`) or is already
-`.disabled`, `r` holds no pointer (the read is UB), or both are `.live` and `q`
-shares `r`'s tag (`q ∈ rPeers`) or targets a place that cannot overlap `r`'s
+`.disabled`, `r` holds no pointer (the read is UB), or both are `.live` and `q`'s
+tag is an ancestor-or-self of `r`'s tag (`q ∈ rPeers`, so the read is local for
+`q`) or `q` targets a place that cannot overlap `r`'s
 target (`targetsDefinitelyDisjoint`). A `.disabled` reader keeps no `.live` `q`
 (so that `stepForeignRead` is monotone). -/
 def foreignReadKeeps (env : List PtrLocalState) (r q : Nat) : Bool :=
