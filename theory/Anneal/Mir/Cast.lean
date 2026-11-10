@@ -594,7 +594,9 @@ is the identity. `Trusted.MirSemantics`' `CastKind.pointerExposeProvenance` inst
 canonical address `ptrAddress? … p` (the 64 KiB page-model address `ptrToAddress p` for pointers
 without a borrow-table entry) and records `p.allocId` in `Memory.exposedAllocIds`, which coincides
 with Anneal's `exposeProv` for every real allocation (`trusted_pointerExposeProvenance_eval`,
-`trusted_pointerExposeProvenance_address_model_bridge`). -/
+`trusted_pointerExposeProvenance_address_model_bridge`); a subsequent
+`pointerWithExposedProvenance` recovers the same pointer in both models
+(`trusted_vs_anneal_expose_withExposed_roundtrip_agreement`). -/
 def evalPtrToIntExpose
     (pw : PtrWidth)
     (dst : ScalarTy)
@@ -4985,7 +4987,10 @@ provenance-carrying pointer-to-pointer pair, `Int -> *T`, provenance-free pointe
 to `Trusted`'s provenance-less addresses `.scalar ⟨addr, 8⟩`), size mismatches, and partially
 overwritten pointer images (`trusted_vs_anneal_overwrite_provenance_no_forge_agreement`), including
 at the step level on `Copy` reads of union locals whose raw-byte overlay holds such an image
-(`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`, Section 8.2b).
+(`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`, Section 8.2b). The exposed-provenance
+protocol `ptr as usize as *const T` recovers the same pointer in both models
+(`trusted_vs_anneal_expose_withExposed_roundtrip_agreement`), although `Trusted` exposes the page
+address `ptrToAddress p` where Anneal exposes `p.offsetBytes`.
 Divergences: `Trusted` is *stricter* on `Int -> &T` (every provenance-free reference image is
 `.ub`) and on provenance-carrying `Ptr -> Int` (`.ub`, whereas Anneal's opt-in policy strips the
 provenance); `Trusted` is *more permissive* on provenance-carrying null-offset references and on
@@ -6219,6 +6224,120 @@ theorem trusted_pointerExposeProvenance_address_model_bridge
       exact (Nat.mul_eq_zero.mp h0).resolve_right (by decide)
     · intro h
       rw [h, Nat.zero_mul, Nat.zero_add]
+
+/-- **Exposed-provenance round-trip agreement (`ptr as usize as *const T`).** For a thin pointer
+`p` into a real allocation (`p.allocId ≠ 0`) without borrow-table entries (`mem.borrows = []`) and
+without a global allocation on page `p.allocId`, at an in-page offset (`p.offsetBytes < 65536`)
+whose page address `ptrToAddress p` fits in 64 bits, on a 64-bit layout table and for every caller
+`localDecls`:
+1. `Trusted`'s `pointerExposeProvenance` into `usize` returns the page address `ptrToAddress p` and
+   moves to the exposed post-state `mem'`;
+2. in `mem'`, `pointerWithExposedProvenance` of any `usize` operand evaluating to that address
+   recovers exactly `.ptr p 8`;
+3. Anneal's `evalPtrToIntExpose` / `evalIntToPtrExposed` round trip recovers
+   `.ptr p (some p.allocId)`, whose `Trusted` image is `.ptr p 8`, and both models record the same
+   exposed set (`recordExposedAllocId exposed p.allocId = exposeProv p.allocId exposed`).
+The intermediate integers differ (`Trusted` exposes the page address, Anneal the in-allocation
+address `p.offsetBytes`), but the recovered pointers and their provenance agree. -/
+theorem trusted_vs_anneal_expose_withExposed_roundtrip_agreement
+    (p : ProvenancePtr) (exposed : ExposedProvenance)
+    (locals locals' locals₂ locals₃ : List LocalSlot) (op1 op2 : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (usizeLIdx srcLIdx2 dstLIdx : Nat) (m1 m2 : Mutability) (pt1 pt2 : RigidTy)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_src : isExposePtrSourceTy (operandTy localDecls layouts op1) = true)
+    (h_alloc : p.allocId ≠ 0)
+    (h_page : p.offsetBytes < 65536)
+    (h_fit : ptrToAddress p < scalarModulus 8)
+    (h_borrows : mem.borrows = [])
+    (h_glob : lookupGlobalAlloc mem.globals p.allocId = none)
+    (h_thin2 : isThinPointee pt2 = true)
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr p 8) locals')
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨ptrToAddress p, 8⟩) locals₃)
+    (h_ty2 : operandTy localDecls layouts op2 =
+      some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
+    let mem' : Memory :=
+      { mem with exposedAllocIds := recordExposedAllocId mem.exposedAllocIds p.allocId }
+    evalRvalue locals
+        (.cast .pointerExposeProvenance op1 { kind := .uint .usize, layoutIdx := usizeLIdx })
+        mem localDecls layouts =
+      ok (.scalar ⟨ptrToAddress p, 8⟩) locals' mem' ∧
+    evalRvalue locals₂
+        (.cast .pointerWithExposedProvenance op2 { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
+        mem' localDecls layouts =
+      ok (.ptr p 8) locals₃ mem' ∧
+    evalPtrToIntExpose .bits64 .usize p exposed =
+      .ok (.scalar p.offsetBytes) (exposeProv p.allocId exposed) ∧
+    evalIntToPtrExposed .bits64 p.offsetBytes (some p.allocId) (exposeProv p.allocId exposed) =
+      .ok (.ptr p (some p.allocId)) (exposeProv p.allocId exposed) ∧
+    (CastVal.ptr p (some p.allocId)).toTrustedValue .bits64 .rawPtr = .ptr p 8 ∧
+    recordExposedAllocId exposed p.allocId = exposeProv p.allocId exposed := by
+  intro mem'
+  have h_off : p.offsetBytes < scalarModulus 8 :=
+    Nat.lt_of_lt_of_le h_page (by decide)
+  have h_lookup : lookupBorrow mem.borrows p.tag = none := by
+    rw [h_borrows]
+    rfl
+  have hAddr : ptrToAddress p = p.allocId * 65536 + p.offsetBytes := rfl
+  have hDiv : ptrToAddress p / 65536 = p.allocId := by
+    rw [hAddr]
+    omega
+  have hMod : ptrToAddress p % 65536 = p.offsetBytes := by
+    rw [hAddr]
+    omega
+  have hBridge := trusted_pointerExposeProvenance_address_model_bridge p exposed locals locals' op1
+    mem localDecls layouts usizeLIdx h_pw h_src h_off h_lookup h_op1
+  have hExpose := hBridge.1
+  rw [Nat.mod_eq_of_lt h_fit] at hExpose
+  have hRound := ptrToInt_intToPtr_roundtrip .bits64 .usize p exposed rfl h_off h_off
+  have hWith := (trusted_transmute_int_to_rawPtr_vs_pointerWithExposedProvenance
+    .rejectPtrToInt .usize m1 m2 pt1 pt2 (ptrToAddress p) exposed locals₂ locals₃ op2 mem'
+    localDecls layouts srcLIdx2 dstLIdx h_pw rfl rfl h_thin2 h_fit h_op2 h_ty2).2.2
+    h_borrows (by rw [hDiv]; exact h_glob) (by rw [hDiv]; exact h_alloc)
+    (by
+      rw [hDiv]
+      exact trusted_isExposedAllocId_recordExposedAllocId_self mem.exposedAllocIds p.allocId
+        h_alloc)
+  rw [hDiv, hMod] at hWith
+  exact ⟨hExpose, hWith, hRound.1, hRound.2, rfl,
+    trusted_recordExposedAllocId_eq_exposeProv exposed p.allocId h_alloc⟩
+
+/-- Non-vacuity of `trusted_vs_anneal_expose_withExposed_roundtrip_agreement`: with no borrows and
+no globals (`emptyMemory`), exposing the pointer `.ptr ⟨3, 16⟩ 8` held by `_0 : *const u8` yields
+the page address `ptrToAddress ⟨3, 16⟩ = 3 * 65536 + 16 = 196624` and exposes allocation `3`; in
+that post-state, casting the address held by `_1 : usize` back with `pointerWithExposedProvenance`
+recovers `.ptr ⟨3, 16⟩ 8`. -/
+example :
+    let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [] }
+    let p : ProvenancePtr := { allocId := 3, offsetBytes := 16 }
+    let decls : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 },
+         debugName := .none },
+       { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := .none }]
+    let locals : List LocalSlot := [.init (.ptr p 8), .init (.scalar ⟨ptrToAddress p, 8⟩)]
+    let mem' : Memory :=
+      { emptyMemory with exposedAllocIds := recordExposedAllocId emptyMemory.exposedAllocIds 3 }
+    ptrToAddress p = 196624 ∧
+    evalRvalue locals
+        (.cast .pointerExposeProvenance (.copy ⟨0, []⟩) { kind := .uint .usize, layoutIdx := 0 })
+        emptyMemory decls layouts =
+      ok (.scalar ⟨ptrToAddress p, 8⟩) locals mem' ∧
+    evalRvalue locals
+        (.cast .pointerWithExposedProvenance (.copy ⟨1, []⟩)
+          { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+        mem' decls layouts =
+      ok (.ptr p 8) locals mem' := by
+  intro layouts p decls locals mem'
+  have hAddr : ptrToAddress p = 196624 := by decide
+  have hFit : ptrToAddress p < scalarModulus 8 := by
+    rw [hAddr]
+    decide
+  have h := trusted_vs_anneal_expose_withExposed_roundtrip_agreement p [] locals locals locals
+    locals (.copy ⟨0, []⟩) (.copy ⟨1, []⟩) emptyMemory decls layouts 0 0 0 .not .not (.uint .u8)
+    (.uint .u8) rfl rfl (by decide) (by decide) hFit rfl rfl rfl rfl rfl rfl
+  exact ⟨hAddr, h.1, h.2.1⟩
 
 /-- `Trusted.MirSemantics.mergeByteProvenance` always retains `some pv` on the left, regardless
 of the right-hand provenance `restProv` (even when `restProv = none` or carries a different
@@ -7814,7 +7933,9 @@ step-level no-forge agreement holds for both `Copy` and `Move` transmutes of suc
 projections `_u.ptr_field` via `readProjectedForLocal`, `evalOperand`, and `evalPlaceRead`
 (`trusted_union_field_read_rawOverlay_no_forge_agreement`), and positively for intact
 `ptr -> union -> ptr` round-trips across both transmutes and union field reads
-(`trusted_union_rawOverlay_intact_ptr_roundtrip`). -/
+(`trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay` for the `ptr -> union` transmute,
+`trusted_union_rawOverlay_intact_ptr_roundtrip` for `union -> ptr`, composed in
+`trusted_ptr_union_ptr_roundtrip`). -/
 
 /-- The union `Value` that `Trusted` materializes for a `count`-field union whose storage holds the
 byte image `bytes` with every typed slot empty: `count` `.unit` placeholders followed by the
@@ -8494,8 +8615,10 @@ theorem trusted_union_field_read_rawOverlay_no_forge_agreement
 
 /-- **Positive intact `ptr -> union -> ptr` round-trip agreement.** When an 8-byte union local
 `loc : U` holds `unionRawOverlayValue count` of an *intact* pointer encoding
-`encodeCastBytes p.offsetBytes 8 (some p.allocId)` (`p.offsetBytes < 2^64`, the exact value that
-`decodeTypedValueFromBytes` materializes when transmuting `.ptr p 8` into `U`), both:
+`encodeCastBytes p.offsetBytes 8 (some p.allocId)` (`p.offsetBytes < 2^64`; when moreover
+`uL.variants = .single 0`, this is exactly the value that transmuting `.ptr p 8` into `U` produces,
+`trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay`, so this theorem is the `union -> ptr` half
+of `trusted_ptr_union_ptr_roundtrip`), both:
 1. transmuting `loc` (`evalByteCast` / `evalRvalue (.cast .transmute (.copy ⟨loc, []⟩) ...)`), and
 2. reading a pointer union field `⟨loc, [.field idx fieldTy]⟩` (`idx < count`) via
    `readProjectedForLocal`, `evalOperand (.copy ...)`, `evalOperand (.move ...)`, or `evalPlaceRead`
@@ -8614,6 +8737,125 @@ theorem trusted_union_rawOverlay_intact_ptr_roundtrip
     rw [hProj]; dsimp only; rw [hValidPtr]
   · unfold evalPlaceRead; dsimp only [fPlace]; rw [hGet]; dsimp only; rw [hProj]; dsimp only
     rw [hValidPtr]
+
+/-- **`ptr -> union` half of the round trip (kernel-checked).** On a 64-bit layout table and for
+every caller `localDecls`: whenever an operand of thin raw-pointer type evaluates to `.ptr p 8`,
+`evalByteCast` (`CastKind.transmute`) into an inhabited single-variant 8-byte `count`-field union
+type `U` with a resolved layout index yields exactly `unionRawOverlayValue count` of the intact
+image `(encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte`
+(all eight bytes carry `(p.allocId, p.allocId)`), the union value consumed by
+`trusted_union_rawOverlay_intact_ptr_roundtrip`. -/
+theorem trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pt : RigidTy) (srcLIdx : Nat)
+    (defPath : DefPath) (args : List RigidTy) (uIdx : Nat) (uL : TypeLayout) (count : Nat)
+    (p : ProvenancePtr)
+    (h_thin : isThinPointee pt = true)
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hVar : uL.variants = .single 0)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr p 8) locals')
+    (h_ty : operandTy localDecls layouts op =
+      some { kind := .rawPtr m pt, layoutIdx := srcLIdx }) :
+    evalByteCast locals op { kind := .adt defPath args, layoutIdx := uIdx } mem localDecls layouts =
+      ok (unionRawOverlayValue count
+        ((encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte))
+        locals' mem := by
+  have hMap :
+      (encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte =
+        encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag)) :=
+    map_toTrustedAbstractByte_encodeCastBytes p.offsetBytes 8 (some p.allocId)
+  have hResolve :
+      resolveTyWithLocalDecls localDecls layouts { kind := .adt defPath args, layoutIdx := uIdx } =
+        { kind := .adt defPath args, layoutIdx := uIdx } :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts _ uL hUIdx hLookup
+  have hValidAdt : layoutValidForAdt uL = true := by
+    unfold layoutValidForAdt
+    rw [hFields]
+  have hDstSz :
+      tyByteSize localDecls layouts
+          (resolveTyWithLocalDecls localDecls layouts
+            { kind := .adt defPath args, layoutIdx := uIdx }) = some 8 := by
+    rw [hResolve, trusted_tyByteSize_adt_of_lookup localDecls layouts defPath args uIdx uL hUIdx
+      hLookup hValidAdt, hSz]
+  have hLenC : (encodeCastBytes p.offsetBytes 8 (some p.allocId)).length = 8 :=
+    encodeCastBytes_length _ 8 _
+  have hNe : encodeCastBytes p.offsetBytes 8 (some p.allocId) ≠ [] := by
+    intro h
+    rw [h] at hLenC
+    nomatch hLenC
+  rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts (.ptr p 8)
+      { kind := .rawPtr m pt, layoutIdx := srcLIdx } { kind := .adt defPath args, layoutIdx := uIdx }
+      8 _ h_op hDstSz h_ty
+      (trusted_tyByteSize_resolve_thin_rawPtr localDecls layouts m pt srcLIdx h_thin)
+      (trusted_encodeByteCastSourceBytes_thin_rawPtr localDecls layouts m pt srcLIdx p h_thin)
+      (trusted_length_encodeLittleEndianBytes _ 8 _),
+    hResolve, show defaultCodecFuel = 15 + 1 from rfl, ← hMap,
+    trusted_decodeTypedValueFromBytes_union_map_toTrusted 15 layouts defPath args uIdx uL count _
+      hLookup hInhab hVar hFields (by rw [hSz, hLenC]) hNe]
+
+/-- **Kernel-checked `ptr -> union -> ptr` round trip.** On a 64-bit layout table and for every
+caller `localDecls`: transmuting a thin raw pointer `.ptr p 8` (`p.offsetBytes < 2^64`) into an
+inhabited single-variant 8-byte `count`-field union `U` yields the union value `vU`
+(`trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay`); once `vU` is stored in a union local
+`uLoc : U` (any later state `locals₂`, `mem₂`), both `Copy`-transmuting `uLoc` and reading any
+pointer field `uLoc.idx` (`idx < count`) at every thin raw-pointer or reference type recover exactly
+`.ptr p 8` (`trusted_union_rawOverlay_intact_ptr_roundtrip`), in agreement with Anneal's
+`decodeCastVal .bits64 .rawPtr` of the stored encoding (`.ptr p (some p.allocId)`). -/
+theorem trusted_ptr_union_ptr_roundtrip
+    (locals locals' locals₂ : List LocalSlot) (op : Operand) (mem mem₂ : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pt : RigidTy) (srcLIdx : Nat)
+    (uLoc : Local) (decl : LocalDecl)
+    (defPath : DefPath) (args : List RigidTy) (uIdx : Nat) (uL : TypeLayout) (count idx : Nat)
+    (isRef : Bool) (m2 : Mutability) (pt2 : RigidTy) (lIdx2 : Nat)
+    (p : ProvenancePtr)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_thin2 : isThinPointee pt2 = true)
+    (h_idx : idx < count)
+    (h_off : p.offsetBytes < scalarModulus 8)
+    (hDecl : Trusted.Sequence.get? localDecls uLoc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hVar : uL.variants = .single 0)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr p 8) locals')
+    (h_ty : operandTy localDecls layouts op =
+      some { kind := .rawPtr m pt, layoutIdx := srcLIdx })
+    (hStore : Trusted.Sequence.get? locals₂ uLoc = some (.init (unionRawOverlayValue count
+      ((encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte)))) :
+    let vU := unionRawOverlayValue count
+      ((encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte)
+    let ptrTy : Ty :=
+      { kind := (match isRef with | true => .ref m2 pt2 | false => .rawPtr m2 pt2),
+        layoutIdx := lIdx2 }
+    decodeCastVal .bits64 .rawPtr (encodeCastBytes p.offsetBytes 8 (some p.allocId)) =
+      some (.ptr p (some p.allocId)) ∧
+    evalByteCast locals op { kind := .adt defPath args, layoutIdx := uIdx } mem localDecls
+        layouts = ok vU locals' mem ∧
+    evalByteCast locals₂ (.copy ⟨uLoc, .nil⟩) ptrTy mem₂ localDecls layouts =
+      ok (.ptr p 8) locals₂ mem₂ ∧
+    evalPlaceRead locals₂ ⟨uLoc, [.field idx ptrTy]⟩ mem₂.borrows mem₂.globals layouts
+        mem₂.callerLocals localDecls =
+      .ok (.ptr p 8) locals₂ := by
+  intro vU ptrTy
+  have hFwd := trusted_evalByteCast_thin_rawPtr_to_union_rawOverlay locals locals' op mem
+    localDecls layouts m pt srcLIdx defPath args uIdx uL count p h_thin hUIdx hLookup hInhab hVar
+    hFields hSz h_op h_ty
+  have hBack := trusted_union_rawOverlay_intact_ptr_roundtrip locals₂ uLoc mem₂ localDecls layouts
+    decl defPath args uIdx count idx uL isRef m2 pt2 lIdx2 p h_pw h_thin2 h_idx h_off hDecl hDeclTy
+    hUIdx hLookup hInhab hFields hSz hStore
+  exact ⟨hBack.1, hFwd, hBack.2.1, hBack.2.2.2.2.2.2⟩
 
 /-- **Non-vacuity of `trusted_evalByteCast_union_rawOverlay_no_forge_agreement` and
 `trusted_union_field_read_rawOverlay_no_forge_agreement`.** On a 64-bit

@@ -539,6 +539,17 @@ theorem certFieldTy_kind (layouts : LayoutTable) (baseTy : Ty) (fieldIdx : Field
   unfold certFieldTy
   repeat' (first | rfl | split)
 
+/-- A `.field` step whose annotation is not an ADT (a tuple, array, scalar, or pointer
+field) always reaches a non-union field base, whatever layout index `certFieldTy`
+chooses; e.g. it discharges the outer-field side condition of
+`evalStmt_assign_uninit_nonUnion_adt_nested_field_ok` for tuple-typed outer fields. -/
+theorem tyIsNonUnionFieldBase_certFieldTy_of_not_adt
+    (layouts : LayoutTable) (baseTy : Ty) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (hNotAdt : rigidTyIsAdt fieldTy.kind = false) :
+    tyIsNonUnionFieldBase layouts (certFieldTy layouts baseTy fieldIdx fieldTy) = true := by
+  unfold tyIsNonUnionFieldBase
+  rw [certFieldTy_kind, hNotAdt]
+
 /-- `certElemTy` only replaces the layout index. -/
 theorem certElemTy_kind (layouts : LayoutTable) (baseTy elemTy : Ty) :
     (certElemTy layouts baseTy elemTy).kind = elemTy.kind := by
