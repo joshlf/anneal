@@ -2247,7 +2247,8 @@ pub enum Statement {
     /// write), deinitializing it while keeping disjoint sibling fields initialized.
     Deinit(Place),
     /// `Retag(kind, place)`: validates every reference reachable in `place`'s value (non-null,
-    /// aligned, inhabited pointee); Anneal does not model aliasing tags.
+    /// aligned, inhabited pointee, not dangling into a storage-dead local); Anneal does not
+    /// model aliasing tags.
     Retag(RetagKind, Place),
     /// `copy_nonoverlapping::<T>(src, dst, count)` (`NonDivergingIntrinsic::CopyNonOverlapping`).
     CopyNonOverlapping {

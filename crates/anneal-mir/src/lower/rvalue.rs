@@ -3453,6 +3453,26 @@ pub fn eval_lowered_cast(
     }
 }
 
+/// The address of the pointer `ptr` of type `ty` for a memory-access or validity check, which
+/// must fit `ptr_width`: an address beyond the target's pointer width is an ill-formed value
+/// (`InvalidBitPattern` naming `ty`) that a check must not truncate into a valid one.
+fn checked_ptr_addr(
+    ptr: &PointerValue,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<u128, RvalueEvalError> {
+    let addr = u128::from(ptr.addr);
+    if addr > ptr_width.mask() {
+        return Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: ty.clone(),
+                bits: addr,
+            },
+        ));
+    }
+    Ok(addr)
+}
+
 /// Checks whether a runtime `MirValue` is structurally compatible with `expected_ty`,
 /// accounting for union `MirValue::Adt { active_field: Some(field_idx), .. }` values whose
 /// single operand corresponds to `field_tys[field_idx]` of the union's declared tuple type.
@@ -5697,6 +5717,29 @@ impl PartialAggregate {
         }
     }
 
+    /// Returns true if the variant of this (incomplete) shell can be read from its tag
+    /// without reading its possibly uninitialized fields, as `Rvalue::Discriminant` and
+    /// `Statement::Retag` do: always for a shell whose ADT stores no tag, and otherwise once
+    /// `SetDiscriminant` has written a tag that is stored apart from the variant fields
+    /// ([`AdtDef::tag_survives_field_deinit`]; legacy tuple-modeled shells keep the rule that a
+    /// written tag is readable).
+    ///
+    /// A typed enum whose tag may be niche-encoded in a variant field (a tagless `repr(Rust)`
+    /// enum with several present variants) has no readable tag until the value is complete:
+    /// `SetDiscriminant` of the variant `rustc` leaves untagged writes no bytes at all, so its
+    /// discriminant is decoded from the (still uninitialized) niche field, which is undefined
+    /// behavior in MiniRust (and `InvalidNichedEnumVariantWritten` in Miri). This mirrors the
+    /// rule that deinitializing a variant field of such an enum loses its tag.
+    pub fn tag_is_readable(&self) -> bool {
+        match &self.adt_def {
+            Some(def) => {
+                !def.requires_tag_write()
+                    || (self.discriminant_set && def.tag_survives_field_deinit())
+            }
+            None => !self.is_adt || self.discriminant_set,
+        }
+    }
+
     /// Returns true if the shell has no initialized field and no written tag that matters
     /// (only shells needing a tag write remember their tag), i.e. it is indistinguishable from
     /// an uninitialized place.
@@ -6147,7 +6190,8 @@ impl StatementEvalState {
 
     /// Variant index read from the tag of the typed enum at `place` for `Rvalue::Discriminant`,
     /// without reading (or requiring initialized) variant fields: an initialized value's
-    /// variant, or a shell's variant once its tag is written.
+    /// variant, or a shell's variant once its tag is readable
+    /// ([`PartialAggregate::tag_is_readable`]).
     fn typed_enum_variant(
         &self,
         place: &Place,
@@ -6186,7 +6230,7 @@ impl StatementEvalState {
                 None,
             )? {
                 ProjectedShellRef::Shell(shell, _) => {
-                    if shell.discriminant_set || !shell.requires_tag_write() {
+                    if shell.tag_is_readable() {
                         Ok(shell.variant_idx)
                     } else {
                         Err(RvalueEvalError::UninitializedLocal(place.local))
@@ -6246,8 +6290,10 @@ impl StatementEvalState {
     /// Requires a live root local and reads the `Index` operands. `RetagKind::Raw(m)` reads the
     /// raw pointer at `place` (it must be initialized; it may be null, unaligned, or dangling).
     /// The other kinds validate every reference reachable in `place`'s value without
-    /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, aligned to
-    /// its pointee's alignment, and point to an inhabited type. A place whose type holds no
+    /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, within the
+    /// target's pointer width, aligned to its pointee's alignment, point to an inhabited type,
+    /// and must not point into the synthetic allocation of a storage-dead local unless its
+    /// pointee is zero-sized (`DeadLocal`: the reference dangles). A place whose type holds no
     /// references only needs to be live. Anneal does not model aliasing tags, so the value is
     /// unchanged.
     pub fn retag_place(
@@ -6275,6 +6321,10 @@ impl StatementEvalState {
         }
         let base_decl_ty = &self.local_decls[place.local.0];
         let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        let ctx = RetagCtx {
+            ptr_width: self.ptr_width,
+            slots: &self.slots,
+        };
         match &self.slots[place.local.0] {
             LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(place.local)),
             LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(place.local)),
@@ -6287,7 +6337,7 @@ impl StatementEvalState {
                     place,
                     None,
                 )?;
-                retag_projected(target, place_ty, self.ptr_width)
+                retag_projected(target, place_ty, ctx)
             }
             LocalSlotState::PartialShell(root) => match project_from_partial_shell(
                 root,
@@ -6300,11 +6350,9 @@ impl StatementEvalState {
                 None,
             )? {
                 ProjectedShellRef::Shell(shell, _) => {
-                    retag_shell(shell, place_ty, self.ptr_width, place.local)
+                    retag_shell(shell, place_ty, ctx, place.local)
                 }
-                ProjectedShellRef::Init(target, _) => {
-                    retag_projected(target, place_ty, self.ptr_width)
-                }
+                ProjectedShellRef::Init(target, _) => retag_projected(target, place_ty, ctx),
             },
         }
     }
@@ -8008,22 +8056,36 @@ fn deinit_in_slot(
     res
 }
 
-/// Validates the reference `ptr` of type `ref_ty` (`&pointee`) for `Statement::Retag`: it must
-/// be non-null (`InvalidBitPattern`), aligned to the pointee's alignment (`MisalignedPointer`;
-/// an alignment the layout model leaves unspecified is `UnsupportedLayout`), and point to an
-/// inhabited type (`UninhabitedPointee`).
+/// Context of a `Statement::Retag`: the target pointer width and the storage state of every
+/// local (whose synthetic allocations references may point into, see [`synthetic_local_ptr`]).
+#[derive(Clone, Copy)]
+struct RetagCtx<'a> {
+    ptr_width: PtrWidth,
+    slots: &'a [LocalSlotState],
+}
+
+/// Validates the reference `ptr` of type `ref_ty` (`&pointee`) for `Statement::Retag`: its
+/// address must be a valid `&T` bit pattern (non-null and within the target's pointer width:
+/// `InvalidBitPattern`), aligned to the pointee's alignment (`MisalignedPointer`; an alignment
+/// the layout model leaves unspecified is `UnsupportedLayout`), and point to an inhabited type
+/// (`UninhabitedPointee`). A reference to the synthetic allocation of a local whose storage is
+/// dead dangles (`DeadLocal`), unless its pointee is zero-sized (a zero-sized retag accesses no
+/// memory).
 fn check_retagged_reference(
     ptr: &PointerValue,
     ref_ty: &Ty,
     pointee: &Ty,
-    ptr_width: PtrWidth,
+    ctx: RetagCtx<'_>,
 ) -> Result<(), RvalueEvalError> {
-    let addr = u128::from(ptr.addr) & ptr_width.mask();
-    if addr == 0 {
-        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
-            target_ty: ref_ty.clone(),
-            bits: 0,
-        }));
+    let ptr_width = ctx.ptr_width;
+    let addr = u128::from(ptr.addr);
+    if !ref_ty.is_valid_scalar_bits(addr, ptr_width) {
+        return Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: ref_ty.clone(),
+                bits: addr,
+            },
+        ));
     }
     let (min_align, max_align) = pointee
         .align_bounds(ptr_width)
@@ -8042,12 +8104,22 @@ fn check_retagged_reference(
     if !pointee.is_inhabited_for(ptr_width) {
         return Err(RvalueEvalError::UninhabitedPointee(pointee.clone()));
     }
+    // Unspecified layouts are never zero-sized (they store a tag), so only an exact size `0`
+    // exempts a reference into a dead local.
+    if let Some(local) = resolve_synthetic_local(ptr, ptr_width, ctx.slots.len())
+        && matches!(ctx.slots[local], LocalSlotState::Dead)
+        && !pointee
+            .layout_for(ptr_width)
+            .is_ok_and(|layout| layout.size == 0)
+    {
+        return Err(RvalueEvalError::DeadLocal(Local(local)));
+    }
     Ok(())
 }
 
 /// Validates every reference reachable in the initialized value `val` of type `ty` for
 /// `Statement::Retag` (skipping union contents and subtrees without references).
-fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+fn retag_value(val: &MirValue, ty: &Ty, ctx: RetagCtx<'_>) -> Result<(), RvalueEvalError> {
     if !ty.contains_ref() {
         return Ok(());
     }
@@ -8056,11 +8128,11 @@ fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), Rvalu
     };
     match (ty, val) {
         (Ty::Ref(pointee, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
-            check_retagged_reference(ptr, ty, pointee, ptr_width)
+            check_retagged_reference(ptr, ty, pointee, ctx)
         }
         (Ty::Array(elem, _), MirValue::Array { elements, .. }) => {
             for element in elements {
-                retag_value(element, elem, ptr_width)?;
+                retag_value(element, elem, ctx)?;
             }
             Ok(())
         }
@@ -8078,7 +8150,7 @@ fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), Rvalu
                 return Err(mismatch());
             }
             for (value, field_ty) in vals.iter().zip(field_tys) {
-                retag_value(value, field_ty, ptr_width)?;
+                retag_value(value, field_ty, ctx)?;
             }
             Ok(())
         }
@@ -8101,13 +8173,13 @@ fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), Rvalu
             let Some(field_tys) = typed_adt_field_tys(val, ty) else {
                 return Err(mismatch());
             };
-            if def.is_enum() && !field_tys.iter().all(|f| f.is_inhabited_for(ptr_width)) {
+            if def.is_enum() && !field_tys.iter().all(|f| f.is_inhabited_for(ctx.ptr_width)) {
                 return Err(RvalueEvalError::UninhabitedEnumVariant {
                     variant_index: *variant_idx,
                 });
             }
             for (value, field_ty) in vals.iter().zip(field_tys) {
-                retag_value(value, field_ty, ptr_width)?;
+                retag_value(value, field_ty, ctx)?;
             }
             Ok(())
         }
@@ -8119,13 +8191,13 @@ fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), Rvalu
 fn retag_projected(
     target: ProjectedRef<'_>,
     ty: &Ty,
-    ptr_width: PtrWidth,
+    ctx: RetagCtx<'_>,
 ) -> Result<(), RvalueEvalError> {
     match target {
-        ProjectedRef::Value(val) => retag_value(val, ty, ptr_width),
+        ProjectedRef::Value(val) => retag_value(val, ty, ctx),
         ProjectedRef::ArrayWindow { window, elem_ty } => {
             for element in window {
-                retag_value(element, elem_ty, ptr_width)?;
+                retag_value(element, elem_ty, ctx)?;
             }
             Ok(())
         }
@@ -8134,11 +8206,13 @@ fn retag_projected(
 
 /// Validates every reference reachable in the partially initialized `shell` of type `ty` for
 /// `Statement::Retag`: an uninitialized field holding references is `UninitializedLocal`, as
-/// is an enum shell whose variant cannot be read because its tag is unwritten.
+/// is an enum shell whose variant cannot be read from its tag
+/// ([`PartialAggregate::tag_is_readable`]: the tag is unwritten, or may be niche-encoded in a
+/// still uninitialized field).
 fn retag_shell(
     shell: &PartialAggregate,
     ty: &Ty,
-    ptr_width: PtrWidth,
+    ctx: RetagCtx<'_>,
     base_local: Local,
 ) -> Result<(), RvalueEvalError> {
     if !shell_matches_declared_ty(shell, ty) {
@@ -8149,7 +8223,9 @@ fn retag_shell(
     if !ty.contains_ref() {
         return Ok(());
     }
-    if shell.requires_tag_write() && !shell.discriminant_set {
+    // Retagging an enum visits the fields of the variant its tag selects (Miri's retag
+    // visitor reads the discriminant), so the tag must be readable without the fields.
+    if !shell.tag_is_readable() {
         return Err(RvalueEvalError::UninitializedLocal(base_local));
     }
     let field_tys = match ty {
@@ -8163,7 +8239,7 @@ fn retag_shell(
         ));
     };
     if matches!(ty, Ty::Adt(def) if def.is_enum())
-        && !field_tys.iter().all(|f| f.is_inhabited_for(ptr_width))
+        && !field_tys.iter().all(|f| f.is_inhabited_for(ctx.ptr_width))
     {
         return Err(if shell.discriminant_set {
             RvalueEvalError::UninhabitedEnumVariant {
@@ -8179,8 +8255,8 @@ fn retag_shell(
                 return Err(RvalueEvalError::UninitializedLocal(base_local));
             }
             FieldSlot::Uninit => {}
-            FieldSlot::Init(val) => retag_value(val, field_ty, ptr_width)?,
-            FieldSlot::Partial(child) => retag_shell(child, field_ty, ptr_width, base_local)?,
+            FieldSlot::Init(val) => retag_value(val, field_ty, ctx)?,
+            FieldSlot::Partial(child) => retag_shell(child, field_ty, ctx, base_local)?,
         }
     }
     Ok(())
@@ -8201,15 +8277,16 @@ fn resolve_synthetic_local(ptr: &PointerValue, ptr_width: PtrWidth, local_count:
         return None;
     }
     let base = synthetic_local_ptr(local, ptr_width);
-    (u128::from(ptr.addr) & ptr_width.mask() == u128::from(base.addr)).then_some(local)
+    (ptr.addr == base.addr).then_some(local)
 }
 
 /// Evaluates `copy_nonoverlapping::<elem_ty>(src, dst, count)` in `state`.
 ///
-/// Operands are evaluated left to right. Then, even when the byte length is zero, both
-/// pointers must be non-null (`NullPointerAccess`) and aligned to `elem_align`
-/// (`MisalignedPointer`), `count * elem_size` must not exceed `isize::MAX`
-/// (`CopyLengthOverflow`), and neither range may wrap the address space
+/// Operands are evaluated left to right; both addresses and the count must fit the target's
+/// pointer width (an out-of-width value is `InvalidBitPattern`, never truncated). Then, even
+/// when the byte length is zero, both pointers must be non-null (`NullPointerAccess`) and
+/// aligned to `elem_align` (`MisalignedPointer`), `count * elem_size` must not exceed
+/// `isize::MAX` (`CopyLengthOverflow`), and neither range may wrap the address space
 /// (`PointerRangeOverflow`). A zero-length copy is then a no-op. A non-empty copy between
 /// pointers of the same allocation (same provenance `alloc_id`, or both without provenance)
 /// must not overlap (`CopyNonOverlappingOverlap`). Only after all of these checks, a copy of
@@ -8247,22 +8324,24 @@ fn eval_copy_nonoverlapping(
             "copy_nonoverlapping lowered layout does not match element type layout",
         ));
     }
-    let pointer = |val: &MirValue, need_mut: bool| -> Result<PointerValue, RvalueEvalError> {
-        match val {
-            MirValue::Ptr { ptr, ty: Ty::RawPtr(pointee, m) | Ty::Ref(pointee, m) }
-                if **pointee == *elem_ty && (!need_mut || *m == Mutability::Mut) =>
-            {
-                Ok(*ptr)
+    let pointer =
+        |val: &MirValue, need_mut: bool| -> Result<(PointerValue, u128), RvalueEvalError> {
+            match val {
+                MirValue::Ptr {
+                    ptr,
+                    ty: ptr_ty @ (Ty::RawPtr(pointee, m) | Ty::Ref(pointee, m)),
+                } if **pointee == *elem_ty && (!need_mut || *m == Mutability::Mut) => {
+                    Ok((*ptr, checked_ptr_addr(ptr, ptr_ty, ptr_width)?))
+                }
+                _ => Err(RvalueEvalError::TypeMismatch(
+                    "copy_nonoverlapping pointers must point to the copied element type",
+                )),
             }
-            _ => Err(RvalueEvalError::TypeMismatch(
-                "copy_nonoverlapping pointers must point to the copied element type",
-            )),
-        }
-    };
-    let src_ptr = pointer(&src_val, false)?;
-    let dst_ptr = pointer(&dst_val, true)?;
+        };
+    let (src_ptr, src_addr) = pointer(&src_val, false)?;
+    let (dst_ptr, dst_addr) = pointer(&dst_val, true)?;
     let MirValue::Int {
-        bits: count_bits,
+        bits: count,
         ty: Ty::Uint(UintTy::Usize),
     } = count_val
     else {
@@ -8270,9 +8349,15 @@ fn eval_copy_nonoverlapping(
             "copy_nonoverlapping count must be a usize",
         ));
     };
-    let count = count_bits & ptr_width.mask();
-    let src_addr = u128::from(src_ptr.addr) & ptr_width.mask();
-    let dst_addr = u128::from(dst_ptr.addr) & ptr_width.mask();
+    // An out-of-width count is an ill-formed value, never truncated to a valid one.
+    if count > ptr_width.max_usize() {
+        return Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: Ty::Uint(UintTy::Usize),
+                bits: count,
+            },
+        ));
+    }
     if src_addr == 0 || dst_addr == 0 {
         return Err(RvalueEvalError::NullPointerAccess);
     }

@@ -16,13 +16,14 @@ use anneal_mir::ir::{
     VariantDef, width_mask,
 };
 use anneal_mir::lower::{
-    CallOutcome, CastEvalError, CastLowerError, CastOp, CfgEvalError, CfgEvalOutcome,
+    CallOutcome, CastEvalError, CastLowerError, CastOp, CfgEvalError, CfgEvalOutcome, CfgStep,
     ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredCast,
     LoweredRvalue, LoweredStatement, LoweredTerminator, MirValue, PanicMessage, PartialAggregate,
     RvalueEvalError, RvalueLowerError, StatementEvalState, TerminatorLowerError, TransmutePolicy,
-    TransmuteValue, eval_cfg_in_state, eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls,
-    eval_lowered_rvalue, eval_lowered_rvalue_in_state, eval_lowered_statement, eval_place_read,
-    eval_place_write, eval_transmute, lower_body, lower_rvalue, lower_statement, lower_terminator,
+    TransmuteValue, UnwindState, eval_cfg_in_state, eval_lowered_body_cfg,
+    eval_lowered_body_cfg_with_calls, eval_lowered_rvalue, eval_lowered_rvalue_in_state,
+    eval_lowered_statement, eval_lowered_terminator, eval_place_read, eval_place_write,
+    eval_transmute, lower_body, lower_rvalue, lower_statement, lower_terminator,
     resolve_offset_of, resolve_place_ty,
 };
 
@@ -7836,5 +7837,389 @@ fn test_b3_eval_cfg_in_state_validates_state_switch_int_targets_and_unwind_actio
             Some(&mut ok_handler),
         ),
         Err(CfgEvalError::InvalidEdge { from: 0, to: 0 })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A3 regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// `Option<T>` modeled as the tagless `repr(Rust)` enum `{ None, Some(T) }`.
+fn option_of(name: &str, payload: Ty) -> (Arc<AdtDef>, Ty) {
+    adt(AdtDef::new_enum(
+        name,
+        None,
+        vec![
+            VariantDef::new("None", vec![]),
+            VariantDef::new("Some", vec![payload]),
+        ],
+    ))
+}
+
+#[test]
+fn test_a3_niche_capable_enum_shells_have_no_readable_tag_until_complete() {
+    // `Option<NonZeroU32>`: `rustc` niche-encodes `None` in the payload and leaves `Some`
+    // untagged, so `SetDiscriminant(Some)` writes no bytes and the discriminant is decoded from
+    // the payload. Before the payload is written, reading the discriminant is UB (MiniRust
+    // decodes uninitialized niche bytes; Miri reports `InvalidNichedEnumVariantWritten`).
+    let (nz_def, nz) = non_zero_u32();
+    let (opt_def, opt) = option_of("OptNz", nz.clone());
+    assert!(opt_def.requires_tag_write() && !opt_def.tag_survives_field_deinit());
+    // `enum BoolRef { A(bool, &u32), B }`: the niche (and so `B`'s tag) lives in `A`'s `bool`.
+    let (bool_ref_def, bool_ref) = adt(AdtDef::new_enum(
+        "BoolRef",
+        None,
+        vec![
+            VariantDef::new("A", vec![Ty::Bool, ref_ty(u32_ty())]),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    let decls = vec![opt.clone(), bool_ref.clone(), u32_ty()];
+    let mut state = state_with(decls.clone(), PW);
+    let set = |l: usize, v: usize| Statement::SetDiscriminant {
+        place: local(l),
+        variant_index: v,
+    };
+    let isize_v = |v: i128| MirValue::signed(v, IntTy::Isize, PW);
+
+    run(set(0, 1), &mut state).unwrap();
+    let Some(LocalSlotState::PartialShell(shell)) = state.get_local(Local(0)).cloned() else {
+        panic!("expected a shell");
+    };
+    assert!(shell.discriminant_set && !shell.tag_is_readable());
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    // Writing the payload completes the value, whose discriminant is then readable.
+    let some0 = place(0, vec![ProjectionElem::Downcast(1), field(0, nz.clone())]);
+    run(
+        assign(some0, adt_aggregate(&nz_def, 0, None, vec![cint(5, u32_ty())])),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(
+            &opt_def,
+            1,
+            vec![MirValue::adt(&nz_def, 0, vec![u32v(5)])]
+        ))
+    );
+    assert_eq!(discriminant(&mut state, local(0)), Ok(isize_v(1)));
+    // Switching an initialized `None` to `Some` without writing the payload: no readable tag.
+    state.slots[0] = LocalSlotState::Init(MirValue::adt(&opt_def, 0, vec![]));
+    run(set(0, 1), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    // A fieldless variant is complete (and its tag readable) right away.
+    run(set(0, 0), &mut state).unwrap();
+    assert_eq!(discriminant(&mut state, local(0)), Ok(isize_v(0)));
+
+    // Retag reads the discriminant to find the variant holding references: with `A.1` written
+    // but the niche-carrying `A.0` not, the variant is unreadable.
+    run(set(1, 0), &mut state).unwrap();
+    state.slots[2] = LocalSlotState::Init(u32v(7));
+    let a1 = place(1, vec![ProjectionElem::Downcast(0), field(1, ref_ty(u32_ty()))]);
+    run(assign(a1, Rvalue::Ref(Mutability::Not, local(2))), &mut state).unwrap();
+    assert_eq!(
+        run(retag(RetagKind::Default, local(1)), &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(
+        discriminant(&mut state, local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    let a0 = place(1, vec![ProjectionElem::Downcast(0), field(0, Ty::Bool)]);
+    run(assign(a0, Rvalue::Use(cbool(true))), &mut state).unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::Init(MirValue::Adt { adt_def: Some(def), variant_idx: 0, .. }))
+            if *def == bool_ref_def
+    ));
+    run(retag(RetagKind::Default, local(1)), &mut state).unwrap();
+    assert_eq!(discriminant(&mut state, local(1)), Ok(isize_v(0)));
+
+    // Tags stored apart from the fields (explicit `repr(Int)`, tagless `repr(C)`) are written by
+    // `SetDiscriminant` and stay readable on incomplete shells.
+    let (_, repr_u8) = repr_u8_enum();
+    let (c_def, c_opt) = adt(
+        AdtDef::new_enum(
+            "COptNz",
+            None,
+            vec![
+                VariantDef::new("None", vec![]),
+                VariantDef::new("Some", vec![nz.clone()]),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    );
+    assert!(c_def.tag_survives_field_deinit());
+    let mut tagged = state_with(vec![repr_u8, c_opt], PW);
+    run(set(0, 0), &mut tagged).unwrap();
+    assert_eq!(discriminant(&mut tagged, local(0)), Ok(u8v(0)));
+    run(set(1, 1), &mut tagged).unwrap();
+    assert_eq!(discriminant(&mut tagged, local(1)), Ok(isize_v(1)));
+
+    // Legacy tuple-modeled shells keep their rule (a written tag is readable), and tuple
+    // shells have no tag.
+    let mut legacy = PartialAggregate::new_uninit(1, 1, true);
+    assert!(!legacy.tag_is_readable());
+    legacy.discriminant_set = true;
+    assert!(legacy.tag_is_readable());
+    assert!(PartialAggregate::new_uninit(2, 0, false).tag_is_readable());
+}
+
+#[test]
+fn test_a3_episode1_evaluators_reject_out_of_width_values_instead_of_truncating() {
+    // On a 32-bit target, a `usize` or pointer value above `u32::MAX` is ill-formed. The
+    // evaluators used to mask such values, turning them into valid ones.
+    let pw = PtrWidth::Bits32;
+    let const_u32 = raw(u32_ty(), Mutability::Not);
+    let mut_u32 = raw(u32_ty(), Mutability::Mut);
+    let decls = vec![
+        unit(),
+        u32_ty(),
+        u32_ty(),
+        usize_ty(),
+        const_u32.clone(),
+        ref_ty(u32_ty()),
+    ];
+    let mut state = state_with(decls.clone(), pw);
+    state.slots[1] = LocalSlotState::Init(u32v(7));
+    // `copy_nonoverlapping::<u32>(&raw _1, &raw mut _2, _3)`: synthetic bases `0x2000`/`0x3000`.
+    let src = ptr_const(0x2000, Some(2), const_u32.clone());
+    let dst = ptr_const(0x3000, Some(3), mut_u32.clone());
+    let mut ok_state = state.clone();
+    ok_state.slots[3] = LocalSlotState::Init(usizev(1));
+    run(copy_nonoverlapping(src.clone(), dst.clone(), cp(3)), &mut ok_state).unwrap();
+    assert_eq!(ok_state.get_init(Local(2)), Some(&u32v(7)));
+    // An out-of-width count (`2^32 + 1`) used to be truncated to `1` and copied.
+    let wide_count = (1u128 << 32) + 1;
+    state.slots[3] = LocalSlotState::Init(usizev(wide_count));
+    let before = state.clone();
+    assert_eq!(
+        run(copy_nonoverlapping(src.clone(), dst.clone(), cp(3)), &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: usize_ty(),
+            bits: wide_count,
+        }))
+    );
+    assert_eq!(state, before);
+    // An out-of-width source address used to be truncated onto `_1`'s synthetic base.
+    let wide_addr = (1u64 << 32) + 0x2000;
+    state.slots[3] = LocalSlotState::Init(usizev(1));
+    state.slots[4] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::with_provenance(wide_addr, 2, 1),
+        const_u32.clone(),
+    ));
+    let before = state.clone();
+    assert_eq!(
+        run(copy_nonoverlapping(cp(4), dst.clone(), cp(3)), &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: const_u32.clone(),
+            bits: u128::from(wide_addr),
+        }))
+    );
+    assert_eq!(state, before);
+
+    // Retag: an out-of-width (but aligned once truncated) reference used to pass.
+    let wide_ref = (1u64 << 32) + 0x1000;
+    state.slots[5] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(wide_ref),
+        ref_ty(u32_ty()),
+    ));
+    assert_eq!(
+        run(retag(RetagKind::Default, local(5)), &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_ty(u32_ty()),
+            bits: u128::from(wide_ref),
+        }))
+    );
+    state.slots[5] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(0x1000),
+        ref_ty(u32_ty()),
+    ));
+    run(retag(RetagKind::Default, local(5)), &mut state).unwrap();
+
+    // SwitchInt: a `u8` holding `0x101` used to be truncated to `1` and take that arm.
+    let body = mk_body(
+        vec![u32_ty(), u8_ty()],
+        vec![
+            blk(
+                vec![],
+                Terminator::SwitchInt {
+                    discr: cp(1),
+                    targets: SwitchTargets::static_if(1, 1, 2),
+                },
+            ),
+            blk(
+                vec![assign(local(0), Rvalue::Use(cint(1, u32_ty())))],
+                Terminator::Return,
+            ),
+            blk(
+                vec![assign(local(0), Rvalue::Use(cint(2, u32_ty())))],
+                Terminator::Return,
+            ),
+        ],
+    );
+    let lowered = lower_ok(&body, pw);
+    let mut switch_state = state_with(body.local_decls.clone(), pw);
+    switch_state.slots[1] = LocalSlotState::Init(u8v(1));
+    assert_eq!(
+        returned(eval_cfg_in_state(&lowered, switch_state.clone(), 0, 4, None)),
+        u32v(1)
+    );
+    switch_state.slots[1] = LocalSlotState::Init(u8v(0x101));
+    assert_eq!(
+        eval_cfg_in_state(&lowered, switch_state, 0, 4, None),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: u8_ty(),
+                bits: 0x101,
+            }),
+        })
+    );
+}
+
+#[test]
+fn test_a3_retag_rejects_references_into_storage_dead_locals() {
+    let decls = vec![
+        unit(),
+        u32_ty(),
+        ref_ty(u32_ty()),
+        unit(),
+        ref_ty(unit()),
+        Ty::Tuple(vec![ref_ty(u32_ty()), u8_ty()]),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    state.slots[1] = LocalSlotState::Init(u32v(7));
+    state.slots[3] = LocalSlotState::Init(MirValue::Unit);
+    run(assign(local(2), Rvalue::Ref(Mutability::Not, local(1))), &mut state).unwrap();
+    run(assign(local(4), Rvalue::Ref(Mutability::Not, local(3))), &mut state).unwrap();
+    run(
+        assign(
+            local(5),
+            Rvalue::Aggregate(AggregateKind::Tuple, vec![cp(2), cint(1, u8_ty())]),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    for p in [local(2), local(4), local(5)] {
+        run(retag(RetagKind::Default, p), &mut state).unwrap();
+    }
+    run(Statement::StorageDead(Local(1)), &mut state).unwrap();
+    run(Statement::StorageDead(Local(3)), &mut state).unwrap();
+    // `&_1` now dangles: retagging it, directly or nested in an aggregate, is UB.
+    assert_eq!(
+        run(retag(RetagKind::Default, local(2)), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+    assert_eq!(
+        run(retag(RetagKind::FnEntry, local(5)), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+    // A zero-sized pointee needs no live allocation.
+    run(retag(RetagKind::Default, local(4)), &mut state).unwrap();
+    // `StorageLive` gives the local (and its synthetic allocation) live storage again.
+    run(Statement::StorageLive(Local(1)), &mut state).unwrap();
+    run(retag(RetagKind::TwoPhase, local(2)), &mut state).unwrap();
+}
+
+/// Runs `body` from `bb0` step by step with [`eval_lowered_terminator`], composing the steps
+/// exactly as [`eval_cfg_in_state`] specifies: one unit of fuel, the block's statements, then
+/// its terminator.
+fn run_terminator_steps(
+    body: &LoweredBody,
+    args: &[MirValue],
+    mut fuel: usize,
+) -> Result<CfgEvalOutcome, CfgEvalError> {
+    let mut state =
+        StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
+    let mut bb = 0;
+    let mut unwinding: UnwindState = None;
+    loop {
+        if fuel == 0 {
+            return Ok(CfgEvalOutcome::OutOfFuel { bb, state });
+        }
+        fuel -= 1;
+        let block = &body.basic_blocks[bb];
+        for (index, stmt) in block.statements.iter().enumerate() {
+            eval_lowered_statement(stmt, &mut state)
+                .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
+        }
+        let term = block
+            .terminator
+            .as_ref()
+            .ok_or(CfgEvalError::MissingTerminator { bb })?;
+        match eval_lowered_terminator(body, bb, term, &mut state, &mut unwinding, None)? {
+            CfgStep::Goto(next) => bb = next,
+            CfgStep::Done(outcome) => return Ok(outcome),
+        }
+    }
+}
+
+#[test]
+fn test_a3_eval_lowered_terminator_steps_compose_into_eval_cfg_in_state() {
+    let countdown = lower_ok(&countdown_body(), PW);
+    for n in [0u128, 1, 3] {
+        for fuel in 0..12 {
+            assert_eq!(
+                run_terminator_steps(&countdown, &[u32v(n)], fuel),
+                eval_lowered_body_cfg(&countdown, &[u32v(n)], fuel),
+                "countdown({n}) with fuel {fuel}"
+            );
+        }
+    }
+    let resume = cleanup_blk(vec![], Terminator::UnwindResume);
+    let unwinding_body = lower_ok(&assert_body(UnwindAction::Cleanup(2), vec![resume]), PW);
+    for c in [true, false] {
+        for fuel in 0..4 {
+            assert_eq!(
+                run_terminator_steps(&unwinding_body, &[MirValue::Bool(c)], fuel),
+                eval_lowered_body_cfg(&unwinding_body, &[MirValue::Bool(c)], fuel),
+                "assert({c}) with fuel {fuel}"
+            );
+        }
+    }
+
+    // One failing-assertion step enters unwinding mode at the cleanup block; `UnwindResume`
+    // then ends the body with the original panic and leaves unwinding mode.
+    let mut state =
+        StatementEvalState::from_body(&unwinding_body, &[MirValue::Bool(false)]).unwrap();
+    let mut unwinding: UnwindState = None;
+    let term0 = unwinding_body.basic_blocks[0].terminator.clone().unwrap();
+    let term2 = unwinding_body.basic_blocks[2].terminator.clone().unwrap();
+    assert_eq!(
+        eval_lowered_terminator(&unwinding_body, 0, &term0, &mut state, &mut unwinding, None),
+        Ok(CfgStep::Goto(2))
+    );
+    assert_eq!(unwinding, Some((0, custom_msg("boom"))));
+    assert_eq!(
+        eval_lowered_terminator(&unwinding_body, 2, &term2, &mut state, &mut unwinding, None),
+        Ok(CfgStep::Done(CfgEvalOutcome::Panicked {
+            bb: 0,
+            msg: custom_msg("boom"),
+        }))
+    );
+    assert_eq!(unwinding, None);
+    // Unknown blocks and edges that break the cleanup discipline are rejected.
+    assert_eq!(
+        eval_lowered_terminator(&unwinding_body, 9, &term0, &mut state, &mut unwinding, None),
+        Err(CfgEvalError::InvalidBlock { bb: 9 })
+    );
+    assert_eq!(
+        eval_lowered_terminator(
+            &unwinding_body,
+            0,
+            &LoweredTerminator::Goto { target: 2 },
+            &mut state,
+            &mut unwinding,
+            None,
+        ),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 2 })
     );
 }

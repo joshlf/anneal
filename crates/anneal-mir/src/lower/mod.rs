@@ -13,9 +13,9 @@ pub use cast::{
     lower_transmute,
 };
 pub use cfg::{
-    CallHandler, CallOutcome, CfgEvalError, CfgEvalOutcome, LoweredTerminator, PanicMessage,
-    TerminatorLowerError, eval_cfg_in_state, eval_lowered_body_cfg,
-    eval_lowered_body_cfg_with_calls, lower_terminator,
+    CallHandler, CallOutcome, CfgEvalError, CfgEvalOutcome, CfgStep, LoweredTerminator,
+    PanicMessage, TerminatorLowerError, UnwindState, eval_cfg_in_state, eval_lowered_body_cfg,
+    eval_lowered_body_cfg_with_calls, eval_lowered_terminator, lower_terminator,
 };
 pub use rvalue::{
     FieldSlot, LocalFrame, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue,

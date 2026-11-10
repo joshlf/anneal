@@ -1,5 +1,6 @@
 //! Basic-block terminators: static lowering ([`lower_terminator`]) and fuel-bounded
-//! multi-block control-flow evaluation ([`eval_lowered_body_cfg`]).
+//! multi-block control-flow evaluation ([`eval_lowered_body_cfg`]), whose single steps are
+//! [`eval_lowered_terminator`] (one terminator in an [`UnwindState`], yielding a [`CfgStep`]).
 //!
 //! # Control-flow semantics
 //!
@@ -9,7 +10,8 @@
 //! infinite loop (`bb0: goto bb0`) terminates cleanly. A block runs its statements in order and
 //! then its terminator:
 //! - `Goto` jumps; `SwitchInt` jumps on the discriminant's bits (`bool` as `0`/`1`, `char` as
-//!   its code point, integers masked to their width), first matching value first;
+//!   its code point, integers as their bit pattern, which must fit their width), first
+//!   matching value first;
 //! - `Return` reads `_0`, which must be fully initialized (no `PartialShell`; initialization is
 //!   tracked per local, so this also applies to a zero-sized `_0`), and returns it;
 //! - `Unreachable` is undefined behavior ([`CfgEvalError::UnreachableReached`]);
@@ -43,10 +45,11 @@ use crate::ir::{
     AssertMessage, BinOp, Body, Operand, Place, PtrWidth, SwitchTargets, Terminator, Ty, UintTy,
     UnwindAction,
 };
+use crate::lower::cast::CastEvalError;
 use crate::lower::rvalue::{
-    LoweredBody, MirValue, RvalueEvalError, RvalueLowerError, StatementEvalState,
-    check_value_well_formed, eval_lowered_statement, lower_operand_ty, mir_value_matches_ty,
-    resolve_place_ty,
+    LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
+    StatementEvalState, check_value_well_formed, eval_lowered_statement, lower_operand_ty,
+    mir_value_matches_ty, resolve_place_ty,
 };
 
 /// Terminator-specific static lowering error (wrapped in
@@ -636,7 +639,7 @@ fn start_panic(
     bb: usize,
     msg: PanicMessage,
     unwind: UnwindAction,
-    unwinding: &mut Option<(usize, PanicMessage)>,
+    unwinding: &mut UnwindState,
 ) -> Result<PanicFlow, CfgEvalError> {
     match unwind {
         UnwindAction::Unreachable => Err(CfgEvalError::UnwindIntoUnreachable {
@@ -724,12 +727,23 @@ fn eval_panic_message(
     })
 }
 
-/// Bits a `SwitchInt` discriminant value is matched on.
+/// Bits a `SwitchInt` discriminant value is matched on. An integer whose bits exceed its
+/// type's width is an ill-formed value (`InvalidBitPattern`), never truncated to a valid one.
 fn switch_bits(val: &MirValue, ptr_width: PtrWidth) -> Result<u128, RvalueEvalError> {
     match val {
         MirValue::Bool(b) => Ok(u128::from(*b)),
         MirValue::Char(c) => Ok(u128::from(u32::from(*c))),
-        MirValue::Int { bits, ty } if ty.is_integral() => Ok(bits & ty.scalar_mask(ptr_width)),
+        MirValue::Int { bits, ty } if ty.is_integral() => {
+            if !ty.is_valid_scalar_bits(*bits, ptr_width) {
+                return Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ty.clone(),
+                        bits: *bits,
+                    },
+                ));
+            }
+            Ok(*bits)
+        }
         _ => Err(RvalueEvalError::TypeMismatch(
             "SwitchInt discriminant must be a bool, char, or integer value",
         )),
@@ -741,7 +755,7 @@ fn check_unwind_action(
     bb: usize,
     unwind: UnwindAction,
     in_cleanup: bool,
-    basic_blocks: &[ crate::lower::rvalue::LoweredBasicBlock ],
+    basic_blocks: &[LoweredBasicBlock],
 ) -> Result<(), CfgEvalError> {
     match unwind {
         UnwindAction::Unreachable | UnwindAction::Terminate => Ok(()),
@@ -758,8 +772,214 @@ fn check_unwind_action(
     }
 }
 
+/// Execution mode between basic blocks: `None` in normal execution, or `Some((bb, msg))` while
+/// unwinding the panic `msg` raised in block `bb` (in which mode only cleanup blocks run).
+pub type UnwindState = Option<(usize, PanicMessage)>;
+
+/// Next control-flow step after a basic block's terminator ([`eval_lowered_terminator`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CfgStep {
+    /// Continue at this block, which exists and is a cleanup block iff the evaluation is (now)
+    /// unwinding.
+    Goto(usize),
+    /// The body finished cleanly (`Returned`, `Panicked`, or `Terminated`).
+    Done(CfgEvalOutcome),
+}
+
+/// Evaluates the terminator `term` of block `bb` of `body` (whose statements have run) in
+/// `state` and unwinding mode `unwinding`, using `call_handler` (if any) for a `Call`; see the
+/// module documentation. A panic updates `unwinding` when it enters a cleanup block, and
+/// `UnwindResume`/`UnwindTerminate` end the unwinding. A [`CfgStep::Goto`] target is checked
+/// to be a block of `body` that is a cleanup block iff the evaluation is unwinding afterwards
+/// (`InvalidBlock` / `InvalidEdge`).
+///
+/// One iteration of [`eval_cfg_in_state`] is one unit of fuel, the statements of a block, and
+/// this function on its terminator.
+pub fn eval_lowered_terminator(
+    body: &LoweredBody,
+    bb: usize,
+    term: &LoweredTerminator,
+    state: &mut StatementEvalState,
+    unwinding: &mut UnwindState,
+    mut call_handler: Option<&mut CallHandler<'_>>,
+) -> Result<CfgStep, CfgEvalError> {
+    let Some(block) = body.basic_blocks.get(bb) else {
+        return Err(CfgEvalError::InvalidBlock { bb });
+    };
+    let ptr_width = state.ptr_width;
+    let in_cleanup = block.is_cleanup || unwinding.is_some();
+    let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
+    let next = match term {
+        LoweredTerminator::Goto { target } => *target,
+        LoweredTerminator::SwitchInt {
+            discr,
+            discr_ty,
+            targets,
+        } => {
+            if targets.values.len() != targets.targets.len() {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "SwitchInt targets length mismatch",
+                )));
+            }
+            let val = state.eval_operand(discr).map_err(term_err)?;
+            if !mir_value_matches_ty(&val, discr_ty) {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "SwitchInt discriminant runtime type does not match lowered type",
+                )));
+            }
+            let bits = switch_bits(&val, ptr_width).map_err(term_err)?;
+            let mut seen = BTreeSet::new();
+            for value in &targets.values {
+                if !seen.insert(*value) || !discr_ty.is_valid_scalar_bits(*value, ptr_width) {
+                    return Err(term_err(RvalueEvalError::TypeMismatch(
+                        "SwitchInt targets contain duplicate or out-of-range values",
+                    )));
+                }
+            }
+            targets.target_for_value(bits)
+        }
+        LoweredTerminator::Return { ret_ty } => {
+            if in_cleanup {
+                return Err(CfgEvalError::InvalidUnwind { bb });
+            }
+            if state.local_decls.first() != Some(ret_ty) || !ret_ty.is_inhabited_for(ptr_width) {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "Return requires an inhabited return place _0 of the lowered type",
+                )));
+            }
+            let ret_val = state.read_place(&Place::from_local(0)).map_err(term_err)?;
+            return Ok(CfgStep::Done(CfgEvalOutcome::Returned(ret_val)));
+        }
+        LoweredTerminator::Unreachable => {
+            return Err(CfgEvalError::UnreachableReached { bb });
+        }
+        LoweredTerminator::Drop {
+            place,
+            place_ty,
+            target,
+            unwind,
+        } => {
+            // No drop glue: the place must be live and well-formed; its value is unchanged.
+            state
+                .check_place_access(place, place_ty)
+                .map_err(term_err)?;
+            check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
+            *target
+        }
+        LoweredTerminator::Assert {
+            cond,
+            expected,
+            msg,
+            target,
+            unwind,
+        } => {
+            let MirValue::Bool(actual) = state.eval_operand(cond).map_err(term_err)? else {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "Assert condition must be a bool value",
+                )));
+            };
+            if actual == *expected {
+                check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
+                *target
+            } else {
+                let panic_msg = eval_panic_message(msg, state).map_err(term_err)?;
+                match start_panic(bb, panic_msg, *unwind, unwinding)? {
+                    PanicFlow::Cleanup(target) => target,
+                    PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
+                }
+            }
+        }
+        LoweredTerminator::Call {
+            func,
+            func_ty,
+            args,
+            arg_tys,
+            destination,
+            dest_ty,
+            target,
+            unwind,
+        } => {
+            let func_val = state.eval_operand(func).map_err(term_err)?;
+            if !mir_value_matches_ty(&func_val, func_ty) || args.len() != arg_tys.len() {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "Call callee runtime type does not match lowered type",
+                )));
+            }
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for (arg, arg_ty) in args.iter().zip(arg_tys) {
+                let val = state.eval_operand(arg).map_err(term_err)?;
+                if !mir_value_matches_ty(&val, arg_ty) {
+                    return Err(term_err(RvalueEvalError::TypeMismatch(
+                        "Call argument runtime type does not match lowered type",
+                    )));
+                }
+                arg_vals.push(val);
+            }
+            state
+                .check_place_access(destination, dest_ty)
+                .map_err(term_err)?;
+            if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
+                return Err(term_err(RvalueEvalError::TypeMismatch(
+                    "Call with an uninhabited destination type must not have a return target",
+                )));
+            }
+            let Some(handler) = call_handler.as_mut() else {
+                return Err(CfgEvalError::UnsupportedCall { bb });
+            };
+            match handler(bb, &func_val, &arg_vals).map_err(term_err)? {
+                CallOutcome::Return(ret_val) => {
+                    check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
+                    let Some(target) = target else {
+                        return Err(CfgEvalError::UnreachableReached { bb });
+                    };
+                    check_value_well_formed(&ret_val, ptr_width).map_err(term_err)?;
+                    state
+                        .write_place(destination, dest_ty, ret_val)
+                        .map_err(term_err)?;
+                    *target
+                }
+                CallOutcome::Panic(text) => {
+                    match start_panic(bb, PanicMessage::Custom(text), *unwind, unwinding)? {
+                        PanicFlow::Cleanup(target) => target,
+                        PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
+                    }
+                }
+            }
+        }
+        LoweredTerminator::UnwindResume => {
+            let Some((panic_bb, msg)) = unwinding.take() else {
+                return Err(CfgEvalError::InvalidUnwind { bb });
+            };
+            return Ok(CfgStep::Done(CfgEvalOutcome::Panicked {
+                bb: panic_bb,
+                msg,
+            }));
+        }
+        LoweredTerminator::UnwindTerminate => {
+            let Some((panic_bb, msg)) = unwinding.take() else {
+                return Err(CfgEvalError::InvalidUnwind { bb });
+            };
+            return Ok(CfgStep::Done(CfgEvalOutcome::Terminated {
+                bb: panic_bb,
+                msg,
+            }));
+        }
+    };
+    match body.basic_blocks.get(next) {
+        None => Err(CfgEvalError::InvalidBlock { bb: next }),
+        Some(next_block) if next_block.is_cleanup != unwinding.is_some() => {
+            Err(CfgEvalError::InvalidEdge { from: bb, to: next })
+        }
+        Some(_) => Ok(CfgStep::Goto(next)),
+    }
+}
+
 /// Evaluates `body` from block `start_bb` in `state` with at most `fuel` executed basic blocks,
 /// using `call_handler` (if any) for `Call` terminators. See the module documentation.
+///
+/// Each executed block consumes one unit of fuel, runs its statements, and then its
+/// terminator with [`eval_lowered_terminator`], until a [`CfgStep::Done`] outcome, an error, or
+/// [`CfgEvalOutcome::OutOfFuel`] at the block that would run next.
 pub fn eval_cfg_in_state(
     body: &LoweredBody,
     mut state: StatementEvalState,
@@ -777,7 +997,6 @@ pub fn eval_cfg_in_state(
             ),
         ));
     }
-    let ptr_width = state.ptr_width;
     let mut bb = start_bb;
     match body.basic_blocks.get(bb) {
         None => return Err(CfgEvalError::InvalidBlock { bb }),
@@ -786,14 +1005,13 @@ pub fn eval_cfg_in_state(
         }
         Some(_) => {}
     }
-    let mut unwinding: Option<(usize, PanicMessage)> = None;
+    let mut unwinding: UnwindState = None;
     loop {
         if fuel == 0 {
             return Ok(CfgEvalOutcome::OutOfFuel { bb, state });
         }
         fuel -= 1;
         let block = &body.basic_blocks[bb];
-        let in_cleanup = block.is_cleanup || unwinding.is_some();
         for (index, stmt) in block.statements.iter().enumerate() {
             eval_lowered_statement(stmt, &mut state).map_err(|error| CfgEvalError::Statement {
                 bb,
@@ -804,168 +1022,16 @@ pub fn eval_cfg_in_state(
         let Some(term) = &block.terminator else {
             return Err(CfgEvalError::MissingTerminator { bb });
         };
-        let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
-        let next = match term {
-            LoweredTerminator::Goto { target } => *target,
-            LoweredTerminator::SwitchInt {
-                discr,
-                discr_ty,
-                targets,
-            } => {
-                if targets.values.len() != targets.targets.len() {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "SwitchInt targets length mismatch",
-                    )));
-                }
-                let val = state.eval_operand(discr).map_err(term_err)?;
-                if !mir_value_matches_ty(&val, discr_ty) {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "SwitchInt discriminant runtime type does not match lowered type",
-                    )));
-                }
-                let bits = switch_bits(&val, ptr_width).map_err(term_err)?;
-                let mut seen = BTreeSet::new();
-                for value in &targets.values {
-                    if !seen.insert(*value)
-                        || !discr_ty.is_valid_scalar_bits(*value, ptr_width)
-                    {
-                        return Err(term_err(RvalueEvalError::TypeMismatch(
-                            "SwitchInt targets contain duplicate or out-of-range values",
-                        )));
-                    }
-                }
-                targets.target_for_value(bits)
-            }
-            LoweredTerminator::Return { ret_ty } => {
-                if in_cleanup {
-                    return Err(CfgEvalError::InvalidUnwind { bb });
-                }
-                if state.local_decls.first() != Some(ret_ty) || !ret_ty.is_inhabited_for(ptr_width)
-                {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "Return requires an inhabited return place _0 of the lowered type",
-                    )));
-                }
-                let ret_val = state.read_place(&Place::from_local(0)).map_err(term_err)?;
-                return Ok(CfgEvalOutcome::Returned(ret_val));
-            }
-            LoweredTerminator::Unreachable => {
-                return Err(CfgEvalError::UnreachableReached { bb });
-            }
-            LoweredTerminator::Drop {
-                place,
-                place_ty,
-                target,
-                unwind,
-            } => {
-                // No drop glue: the place must be live and well-formed; its value is unchanged.
-                state
-                    .check_place_access(place, place_ty)
-                    .map_err(term_err)?;
-                check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
-                *target
-            }
-            LoweredTerminator::Assert {
-                cond,
-                expected,
-                msg,
-                target,
-                unwind,
-            } => {
-                let MirValue::Bool(actual) = state.eval_operand(cond).map_err(term_err)? else {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "Assert condition must be a bool value",
-                    )));
-                };
-                if actual == *expected {
-                    check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
-                    *target
-                } else {
-                    let panic_msg = eval_panic_message(msg, &mut state).map_err(term_err)?;
-                    match start_panic(bb, panic_msg, *unwind, &mut unwinding)? {
-                        PanicFlow::Cleanup(target) => target,
-                        PanicFlow::Done(outcome) => return Ok(outcome),
-                    }
-                }
-            }
-            LoweredTerminator::Call {
-                func,
-                func_ty,
-                args,
-                arg_tys,
-                destination,
-                dest_ty,
-                target,
-                unwind,
-            } => {
-                let func_val = state.eval_operand(func).map_err(term_err)?;
-                if !mir_value_matches_ty(&func_val, func_ty) || args.len() != arg_tys.len() {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "Call callee runtime type does not match lowered type",
-                    )));
-                }
-                let mut arg_vals = Vec::with_capacity(args.len());
-                for (arg, arg_ty) in args.iter().zip(arg_tys) {
-                    let val = state.eval_operand(arg).map_err(term_err)?;
-                    if !mir_value_matches_ty(&val, arg_ty) {
-                        return Err(term_err(RvalueEvalError::TypeMismatch(
-                            "Call argument runtime type does not match lowered type",
-                        )));
-                    }
-                    arg_vals.push(val);
-                }
-                state
-                    .check_place_access(destination, dest_ty)
-                    .map_err(term_err)?;
-                if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "Call with an uninhabited destination type must not have a return target",
-                    )));
-                }
-                let Some(handler) = call_handler.as_mut() else {
-                    return Err(CfgEvalError::UnsupportedCall { bb });
-                };
-                match handler(bb, &func_val, &arg_vals).map_err(term_err)? {
-                    CallOutcome::Return(ret_val) => {
-                        check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
-                        let Some(target) = target else {
-                            return Err(CfgEvalError::UnreachableReached { bb });
-                        };
-                        check_value_well_formed(&ret_val, ptr_width).map_err(term_err)?;
-                        state
-                            .write_place(destination, dest_ty, ret_val)
-                            .map_err(term_err)?;
-                        *target
-                    }
-                    CallOutcome::Panic(text) => {
-                        match start_panic(bb, PanicMessage::Custom(text), *unwind, &mut unwinding)?
-                        {
-                            PanicFlow::Cleanup(target) => target,
-                            PanicFlow::Done(outcome) => return Ok(outcome),
-                        }
-                    }
-                }
-            }
-            LoweredTerminator::UnwindResume => {
-                let Some((panic_bb, msg)) = unwinding.take() else {
-                    return Err(CfgEvalError::InvalidUnwind { bb });
-                };
-                return Ok(CfgEvalOutcome::Panicked { bb: panic_bb, msg });
-            }
-            LoweredTerminator::UnwindTerminate => {
-                let Some((panic_bb, msg)) = unwinding.take() else {
-                    return Err(CfgEvalError::InvalidUnwind { bb });
-                };
-                return Ok(CfgEvalOutcome::Terminated { bb: panic_bb, msg });
-            }
-        };
-        match body.basic_blocks.get(next) {
-            None => return Err(CfgEvalError::InvalidBlock { bb: next }),
-            Some(next_block) if next_block.is_cleanup != unwinding.is_some() => {
-                return Err(CfgEvalError::InvalidEdge { from: bb, to: next });
-            }
-            Some(_) => {}
+        match eval_lowered_terminator(
+            body,
+            bb,
+            term,
+            &mut state,
+            &mut unwinding,
+            call_handler.as_deref_mut(),
+        )? {
+            CfgStep::Goto(next) => bb = next,
+            CfgStep::Done(outcome) => return Ok(outcome),
         }
-        bb = next;
     }
 }
