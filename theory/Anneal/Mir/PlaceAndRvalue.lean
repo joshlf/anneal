@@ -182,7 +182,17 @@ correspondence theorems of Sections 1 and 4 are built. This section
      `placeTouchesUnion_enum_downcast_field_false`, `layoutIdxIsNonUnion_of_lookup`,
      `placeTouchesUnion_tuple_field_false`,
      `placeTouchesUnion_tuple_nested_field_false`,
-     `placeTouchesUnion_false_of_isTupleFieldChain` in Section 4).
+     `placeTouchesUnion_false_of_isTupleFieldChain` in Section 4);
+   - the per-step side conditions of that certificate, for non-ADT field / element
+     annotations and for resolved or container-recorded (`fieldLayouts`) non-union
+     layouts (`tyIsNonUnionFieldBase_certFieldTy_of_not_adt`,
+     `tyIsNonUnionFieldBase_certFieldTy_of_layoutIdxIsNonUnion`,
+     `tyIsNonUnionFieldBase_certFieldTy_of_fieldLayouts`,
+     `tyIsNonUnionFieldBase_certElemTy_of_not_adt`,
+     `tyIsNonUnionFieldBase_certElemTy_of_array_fieldLayouts`);
+   - `Copy` / `Move` operands (`operandTouchesUnion_copy_of_projFieldBasesNonUnion`,
+     `operandTouchesUnion_move_of_projFieldBasesNonUnion`,
+     `operandTouchesUnion_false_of_noFieldBeforeDeref`).
 
 Projected `SetDiscriminant` additionally passes through the `validateValueForTy?`
 check of `writePlaceValue`; `SetDiscriminantDestOk` packages both side conditions
@@ -190,6 +200,19 @@ check of `writePlaceValue`; `SetDiscriminantDestOk` packages both side condition
 `setDiscriminantDestOk_of_layoutsHaveNoUnion_and_adt`,
 `setDiscriminantDestOk_tuple_field_adt`,
 `setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt`).
+
+Section 4 also packages these discharges as one-step wrappers of the nested-frame
+refinement theorems that take a `projFieldBasesNonUnion` certificate on the declared
+type of the root local (`evalStmt_assign_init_root_certified_nested_refines`,
+`evalStmt_assign_partialShell_init_subslot_certified_nested_refines`,
+`evalSetDiscriminantState_general_certified_nested_refines`,
+`evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines`,
+`readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines`,
+`evalOperandState_copy_certified_nested_refines`,
+`evalOperandState_move_certified_nested_refines`), and discharges the `hNoUnion`
+obligation of `Statements.lean`'s uninitialized-field assignment lemmas for symbolic
+`localDecls` (`evalStmt_assign_uninit_nonUnion_adt_field_ok`,
+`evalStmt_assign_uninit_nonUnion_adt_nested_field_ok`).
 -/
 
 /-- `true` exactly for ADT kinds (`RigidTy.adt`), the only kinds that
