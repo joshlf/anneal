@@ -61,6 +61,14 @@ def jetski_edit(path: Path, target: str, replacement: str) -> dict:
     return {"toolCall": {"args": {"Path": str(path), "Target": target, "Replacement": replacement}}}
 
 
+def settle(*paths: Path) -> None:
+    """Backdate files by a minute, as if written long before the check (a file
+    modified within `RACY_MTIME_WINDOW_NS` is deliberately not persisted)."""
+    old = time.time() - 60
+    for p in paths:
+        os.utime(p, (old, old))
+
+
 def clear_in_process_caches() -> None:
     proof_health._SIBLING_PRIVATE_CACHE.clear()
     proof_health._DIR_LEAN_FILES_CACHE.clear()
@@ -245,6 +253,28 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
         )
         self.assertIn("`simp_all [...]`", findings[5].message)
         self.assertIn("`dsimp! [...]`", findings[6].message)
+
+    def test_rule1_explicit_and_parenthesized_entries(self) -> None:
+        # `@name`, `(name)` and `(name : T)` entries still put the definition's
+        # equations in the simp set; an argument position or a `←` rewrite does not.
+        src = (
+            "theorem w : True := by\n"
+            "  simp [@wpMirExecSym]\n"
+            "  simp only [foo, (Trusted.Sequence.length)]\n"
+            "  simp [(wpMirExecSym : Nat → Nat)]\n"
+            "  simp [f (wpMirExecSym)]\n"
+            "  simp [← @wpMirExecSym]\n"
+            "  simp [g x, @Trusted.Sequence.length]\n"
+        )
+        self.assertEqual(
+            scan(src),
+            [
+                (R1, 2, "wpMirExecSym"),
+                (R1, 3, "Trusted.Sequence.length"),
+                (R1, 4, "wpMirExecSym"),
+                (R1, 7, "Trusted.Sequence.length"),
+            ],
+        )
 
     def test_rule2_dsimp_mir_body_unfold(self) -> None:
         src = (
@@ -685,11 +715,26 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
 
             # Malformed counts read as 0 instead of raising.
             cache_file = tmp_dir / "cache.json"
-            cache_file.write_text(json.dumps({key: {R1: "not-a-number"}}), encoding="utf-8")
+            version = proof_health.CACHE_FORMAT_VERSION
+            cache_file.write_text(
+                json.dumps({key: {R1: "not-a-number", "_ver": version}}), encoding="utf-8"
+            )
             fb = proof_health.check_post_edit_proof_health(
                 lean_file, {"toolCall": {"args": {"Path": str(lean_file)}}}, cache_path=cache_file
             )
             self.assertIn("dsimp_forbidden_sym (+1", fb)
+
+            # Counts written under another cache format version are never compared
+            # (their rules may differ), so they cannot produce a false increase.
+            cache_file.write_text(
+                json.dumps({key: {R1: 0, "_ver": version - 1}}), encoding="utf-8"
+            )
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    lean_file, {"toolCall": {"args": {"Path": str(lean_file)}}}, cache_path=cache_file
+                ),
+                "",
+            )
 
             # Garbage content reads as an empty cache.
             cache_file.write_text("{ not json", encoding="utf-8")
@@ -718,6 +763,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             sibling.write_text("private theorem helper (n : Nat) : n = n := rfl\n", encoding="utf-8")
             target = tmp_dir / "Target.lean"
             target.write_text("private theorem other (k : Nat) : k + 0 = k := rfl\n", encoding="utf-8")
+            settle(sibling)
             clear_in_process_caches()
             proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file)
             index_file = proof_health.sibling_index_path(cache_file, target.parent)
@@ -758,6 +804,72 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 self.assertIn(str(sibling), lexed)
             finally:
                 proof_health.extract_private_decls = original_extract
+
+    def test_persisted_formats_are_versioned_and_fresh_files_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            cache_file = tmp_dir / "cache.json"
+            sibling = tmp_dir / "Sib.lean"
+            sibling.write_text("private theorem s (n : Nat) : n = n := rfl\n", encoding="utf-8")
+            target = tmp_dir / "Tgt.lean"
+            target.write_text("private theorem t (k : Nat) : k + 0 = k := rfl\n", encoding="utf-8")
+            index_file = proof_health.sibling_index_path(cache_file, tmp_dir)
+            self.assertIn(f".siblings-v{proof_health.CACHE_FORMAT_VERSION}-", index_file.name)
+
+            # A sibling written just now may still change within the same timestamp
+            # tick, so it is lexed but not persisted.
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file)
+            self.assertFalse(index_file.exists())
+            entry = json.loads(cache_file.read_text(encoding="utf-8"))[str(target.resolve())]
+            self.assertEqual(entry["_ver"], proof_health.CACHE_FORMAT_VERSION)
+
+            settle(sibling)
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file)
+            self.assertIn(str(sibling), json.loads(index_file.read_text(encoding="utf-8")))
+
+    def test_sibling_signature_is_stable_across_processes(self) -> None:
+        # Consecutive edits with unchanged siblings reuse the cached pre-edit counts
+        # (one scan) even when the second process restores sibling declarations from
+        # the persisted index instead of lexing them.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            cache_file = tmp_dir / "cache.json"
+            sibling = tmp_dir / "Sib.lean"
+            sibling.write_text(
+                "private theorem a1 (n : Nat) : n = n := rfl\n"
+                "private theorem a2 (n : Nat) : n + 0 = n := rfl\n"
+                "private def d1 : Nat := 1\n",
+                encoding="utf-8",
+            )
+            settle(sibling)
+            target = tmp_dir / "Tgt.lean"
+            v1 = "private theorem b (k : Nat) : k * 1 = k := by omega\n"
+            target.write_text(v1, encoding="utf-8")
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file)
+
+            calls: list[int] = []
+            original_scan = proof_health.scan_lean_text
+
+            def counting_scan(*args, **kwargs):
+                calls.append(1)
+                return original_scan(*args, **kwargs)
+
+            proof_health.scan_lean_text = counting_scan
+            try:
+                clear_in_process_caches()  # fresh process: siblings come from the index
+                target.write_text(v1 + "-- note\n", encoding="utf-8")
+                fb = proof_health.check_post_edit_proof_health(
+                    target,
+                    jetski_edit(target, "by omega\n", "by omega\n-- note\n"),
+                    cache_path=cache_file,
+                )
+                self.assertEqual(fb, "")
+                self.assertEqual(len(calls), 1)
+            finally:
+                proof_health.scan_lean_text = original_scan
 
     def test_persisted_sibling_index_on_episode1_directory_under_5ms(self) -> None:
         bit_validity = REPO_ROOT / "theory" / "Anneal" / "BitValidity.lean"
@@ -822,6 +934,7 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             # deleting the sibling prunes it from the persisted sibling index.
             sib = tmp_dir / "Sib.lean"
             sib.write_text("private theorem h (n : Nat) : n = 0 := sorry\n", encoding="utf-8")
+            settle(sib)
             tgt = tmp_dir / "Tgt.lean"
             tgt_v1 = "private theorem g (m : Nat) : m = 1 := sorry\n"
             tgt.write_text(tgt_v1, encoding="utf-8")
@@ -840,6 +953,9 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             )
             self.assertEqual(fb_sib, "")
             # Delete `Sib.lean` and verify persisted sibling index prunes it.
+            settle(sib)
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(tgt, None, cache_path=scache)
             sib.unlink()
             clear_in_process_caches()
             proof_health.check_post_edit_proof_health(tgt, None, cache_path=scache)
@@ -873,6 +989,32 @@ class TestPerformanceAndDogfood(unittest.TestCase):
         self.assertEqual([(f.rule, f.line) for f in findings], [(R1, planted_line)])
         elapsed_ms = best_of_ms(lambda: proof_health.scan_lean_text(text, scan_siblings=False))
         self.assertLess(elapsed_ms, 5.0, f"6,000-line synthetic scan took {elapsed_ms:.2f} ms")
+
+    def test_definition_heavy_files_have_no_quadratic_blowup(self) -> None:
+        # Regression guard for the private-definition comparison: many same-typed
+        # definitions, indented inside a namespace or with large bodies, must cost
+        # roughly linear time. (A quadratic comparison took 25-40 ms on the first.)
+        indented = ["namespace Foo\n"]
+        for i in range(300):
+            indented.append(
+                f"  private def val{i} : Nat :=\n    let a := {i}\n    let b := a + {i}\n    a * b + {i}\n"
+            )
+        indented.append("end Foo\n")
+        large = []
+        for i in range(150):
+            stmts = "\n".join(
+                f"    stmt{j} := .assign (.local {j}) (.use (.copy (.local {i + j}))),"
+                for j in range(30)
+            )
+            large.append(
+                f"private def body{i} : Body :=\n  {{ locals := #[x],\n{stmts}\n    blocks := #[] }}\n"
+            )
+        for label, text in (("indented", "".join(indented)), ("large", "".join(large))):
+            self.assertEqual(proof_health.scan_lean_text(text, scan_siblings=False), [])
+            elapsed_ms = best_of_ms(
+                lambda: proof_health.scan_lean_text(text, scan_siblings=False), budget_ms=15.0
+            )
+            self.assertLess(elapsed_ms, 15.0, f"{label} definitions took {elapsed_ms:.2f} ms")
 
     def test_dogfood_episode1_files_under_5ms(self) -> None:
         bit_validity = REPO_ROOT / "theory" / "Anneal" / "BitValidity.lean"

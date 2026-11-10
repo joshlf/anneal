@@ -8,7 +8,9 @@ mentions inside them never count:
    (optionally namespace-qualified or as `.eq_def`) inside the lemma list of a
    simp-family tactic (`dsimp`, `simp`, `simp only`, `simp?`, `simpa`, `simp_all`, ...,
    with or without `(config := ...)` / `+opt` arguments). Purely syntactic: no
-   location- or neighbour-based exemptions; only erasures `-name` do not count.
+   location- or neighbour-based exemptions. Only entries that do not unfold the
+   symbol are skipped: erasures `-name`, reverse rewrites `← name`, and arguments
+   to other terms (`[h (Sequence.length xs)]`).
 2. `dsimp_mir_body_unfold`: `Mir.<...>.body` unfolded inside such a list or `unfold`.
 3. `raw_bitwise_unfold`: raw recursive `bitwiseAndBits` or `bitwiseOrBits` unfolded inside
    such a list or `unfold` (excluding `*Fast` wrappers and closed-form mask lemmas).
@@ -195,13 +197,18 @@ def _blank(seg: str) -> str:
     return "\n".join([" " * len(part) for part in seg.split("\n")])
 
 
-def strip_lean_comments_and_strings(
-    text: str, *, keep_strings: bool = False, raw_utf8: bytes | None = None
-) -> str:
+def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) -> str:
     """Blank out Lean 4 `--` line comments, nested `/- ... -/` block comments
     (docstrings included) and string literals, character for character: the result
     has the same length as `text` and keeps every `\\n`, so offsets and line
     numbers in it are exactly those of `text`.
+
+    String literals honour `\\"` / `\\\\` escapes; raw strings `r"..."` / `r#"..."#`
+    end at the matching `"#...`; the quote character literals `'"'` / `'\\"'` do not
+    open a string, while an identifier prime before a string (`x'"..."`) does not
+    make a character literal; guillemet names `«a--b»` are code, not comments. With
+    `keep_strings=True` only comments are blanked. The scan jumps between delimiters
+    with `str.find`, about 3 ms per MB of Lean source.
     """
     n = len(text)
     if n == 0:
@@ -210,10 +217,10 @@ def strip_lean_comments_and_strings(
     app = out.append  # bound once: the loop runs once per comment/string token
     find = text.find
     pos = 0
-    i_blk = find("/-", 0) if (raw_utf8 is None or b"/-" in raw_utf8) else -1
-    i_lin = find("--", 0) if (raw_utf8 is None or b"--" in raw_utf8) else -1
-    i_str = find('"', 0) if (raw_utf8 is None or b'"' in raw_utf8) else -1
-    i_gui = find("«", 0) if (raw_utf8 is None or b"\xc2\xab" in raw_utf8) else -1
+    i_blk = find("/-", 0)
+    i_lin = find("--", 0)
+    i_str = find('"', 0)
+    i_gui = find("«", 0)
     while pos < n:
         if i_blk != -1 and i_blk < pos:
             i_blk = find("/-", pos)
@@ -421,12 +428,12 @@ _PRIVATE_LIT_RE = re.compile(
 )
 # Top-level or indented Lean command boundaries (for `section` / `namespace` blocks).
 _TOPLEVEL_LINE_RE = re.compile(r"\n(?=\S)")
-_INDENTED_CMD_LINE_RE = re.compile(
-    r"\n([ \t]*)(?:@\[|"
+_DECL_BOUNDARY_RE = re.compile(
+    r"\n(?:(?=\S)|([ \t]+)(?=@\[|"
     r"(?:private|protected|public|scoped|local|noncomputable|partial|unsafe|"
     r"theorem|lemma|def|abbrev|opaque|axiom|example|instance|class|structure|"
     r"inductive|mutual|section|namespace|end|variable|open|universe|set_option)(?![\w'!?.])|"
-    r"#(?:check|eval|print|reduce)\b)"
+    r"#(?:check|eval|print|reduce)\b))"
 )
 _EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
 _MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
@@ -493,16 +500,17 @@ def _has_simp_candidate(s: str) -> bool:
 
 def _is_simp_unfold_entry(content: str, start: int) -> bool:
     """True when the match at `content[start]` stands at the head of a `dsimp`/`simp`
-    lemma-list entry (optionally preceded by `↓`/`↑`), rather than being an erasure
-    `-name`, a reverse-folding rewrite `← name` / `<- name`, or an argument to another
-    term (`simp [lookupBlock_zero Mir.X.body]`, `simp [h (Sequence.length bs)]`).
+    lemma-list entry (optionally written `@name`, `(name)` / `(name : T)`, or with a
+    `↓`/`↑` annotation), rather than being an erasure `-name`, a reverse-folding
+    rewrite `← name` / `<- name`, or an argument to another term
+    (`simp [lookupBlock_zero Mir.X.body]`, `simp [h (Sequence.length bs)]`).
     """
     j = start - 1
-    while j >= 0 and content[j] in " \t\r\n":
+    while j >= 0 and content[j] in " \t\r\n@(":
         j -= 1
     if j >= 0 and content[j] in "↓↑":
         j -= 1
-        while j >= 0 and content[j] in " \t\r\n":
+        while j >= 0 and content[j] in " \t\r\n(":
             j -= 1
     if j < 0:
         return True
@@ -516,27 +524,18 @@ def _is_simp_unfold_entry(content: str, start: int) -> bool:
     )
 
 
-def _active_simp_keywords(
-    stripped: str, raw_utf8: bytes | None = None
-) -> tuple[list[str], bool, bool]:
-    """Scan `stripped` once to determine active candidate keywords plus `(has_mir_body, has_bitwise)`.
-    When `raw_utf8` is available, 1-byte glibc `memmem` rejects absent ASCII keywords in
-    quarter the memory bandwidth of 2-byte `UCS-2` `str` scans.
-    """
+def _active_simp_keywords(stripped: str) -> tuple[list[str], bool, bool]:
+    """Candidate keywords present in `stripped`, plus `(has_mir_body, has_bitwise)`."""
     active_kws: list[str] = []
-    if (raw_utf8 is None or b"wpMirExecSym" in raw_utf8) and "wpMirExecSym" in stripped:
+    if "wpMirExecSym" in stripped:
         active_kws.append("wpMirExecSym")
-    if (raw_utf8 is None or b"Sequence.length" in raw_utf8) and "Sequence.length" in stripped:
+    if "Sequence.length" in stripped:
         active_kws.append("Sequence.length")
-    has_mir_body = (
-        (raw_utf8 is None or (b".body" in raw_utf8 and b"Mir." in raw_utf8))
-        and ".body" in stripped
-        and "Mir." in stripped
-    )
+    has_mir_body = ".body" in stripped and "Mir." in stripped
     if has_mir_body:
         active_kws.append(".body")
     has_bitwise = False
-    if (raw_utf8 is None or b"bitwise" in raw_utf8) and "bitwise" in stripped:
+    if "bitwise" in stripped:
         if "bitwiseAndBits" in stripped:
             active_kws.append("bitwiseAndBits")
             has_bitwise = True
@@ -830,25 +829,31 @@ def _line_indent_at(stripped: str, pos: int) -> int:
 
 def _next_decl_boundary(stripped: str, start_pos: int, max_end: int, decl_indent: int) -> int:
     """Earliest offset in `stripped[start_pos:max_end]` where a new declaration or
-    section/namespace command begins (column 0 when `decl_indent == 0`, or any command
-    at indentation `<= decl_indent` inside an indented `section`/`namespace`).
+    section/namespace command begins: any column-0 line when `decl_indent == 0`;
+    otherwise a column-0 line or a command line indented by at most `decl_indent`
+    (declarations inside an indented `section` / `namespace`). One forward regex
+    scan that stops at the first boundary, so the cost is the distance to it.
     """
     if decl_indent <= 0:
         m = _TOPLEVEL_LINE_RE.search(stripped, start_pos, max_end)
         return m.start() if m is not None else max_end
-    limit = max_end
-    m_top = _TOPLEVEL_LINE_RE.search(stripped, start_pos, limit)
-    if m_top is not None:
-        limit = m_top.start()
-    for m_ind in _INDENTED_CMD_LINE_RE.finditer(stripped, start_pos, limit):
-        if len(m_ind.group(1).expandtabs(2)) <= decl_indent and len(m_ind.group(1)) <= decl_indent:
-            return m_ind.start()
-    return limit
+    for m in _DECL_BOUNDARY_RE.finditer(stripped, start_pos, max_end):
+        ind = m.group(1)
+        if ind is None or (len(ind) <= decl_indent and len(ind.expandtabs(2)) <= decl_indent):
+            return m.start()
+    return max_end
 
 
 def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tuple[str, int]:
     """Locate the header (binders and `: <type>`) of the declaration whose name ends
     at `start_pos` in comment-stripped text.
+
+    The header ends at the top-level `:=` or `where`, or at the first
+    pattern-matching equation line (`| ...` not preceded by a `match` / `fun` in the
+    header, so match arms inside a statement stay part of it), and must contain a
+    `:`. It never extends past the next declaration boundary (`_next_decl_boundary`)
+    or 2,500 characters. Returns `(header, body_start)` with `body_start` the offset
+    where the body begins, or `("", -1)` when no complete header is found.
     """
     n = len(stripped)
     max_end = min(n, start_pos + 2500)
@@ -932,6 +937,11 @@ _SIG_PAD_CHARS: tuple[tuple[str, str], ...] = (
 )
 
 _BINDER_IDENT_RE = re.compile(r"[^\W\d][\w'!?]*")
+_BODY_IDENT_RE = re.compile(r"[^\W\d][\w'!?]*")
+# Punctuation counted for the first, cheapest body comparison (never part of a name).
+_BODY_KEY1_CHARS = "({[:,=."
+# Characters of body text the finer body comparisons may process per scan.
+_BODY_COMPARE_BUDGET = 64 * 1024
 
 
 def _is_valid_binder_ident(tok: str) -> bool:
@@ -1022,11 +1032,11 @@ def _decl_body_key(
                 )
             )
         ):
-            seg = _apply_rename_to_code_segment(no_comments[pos : q - (1 if no_comments[q - 1] == "'" else 2)], rmap)
+            lit_open = q - (1 if no_comments[q - 1] == "'" else 2)
+            seg = _apply_rename_to_code_segment(no_comments[pos:lit_open], rmap)
             if seg:
                 parts.append(seg)
-            lit_start = q - (1 if no_comments[q - 1] == "'" else 2)
-            parts.append(no_comments[lit_start : q + 2])
+            parts.append(no_comments[lit_open : q + 2])
             pos = q + 2
             continue
         # Normal `"..."` string literal
@@ -1057,55 +1067,6 @@ def _decl_body_key(
 _NORM_SIG_CACHE: dict[str, tuple[str, dict[str, str]]] = {}
 
 
-def _find_matching_binder_close(header: str, open_idx: int) -> tuple[int, int]:
-    """Given `header[open_idx]` in `'([{'`, return `(close_idx, top_colon_idx)` where
-    `close_idx` is the matching balanced closer and `top_colon_idx` is the first single
-    `:` (not `:=`) at relative nesting depth 0 inside the binder (or `-1` if none).
-    """
-    open_ch = header[open_idx]
-    close_ch = ")" if open_ch == "(" else ("}" if open_ch == "{" else "]")
-    n = len(header)
-    depth = 1
-    p_depth = 0
-    b_depth = 0
-    k_depth = 0
-    top_colon = -1
-    i = open_idx + 1
-    while i < n:
-        ch = header[i]
-        if ch == close_ch and p_depth == 0 and b_depth == 0 and k_depth == 0:
-            depth -= 1
-            if depth == 0:
-                return i, top_colon
-        if ch == "(":
-            p_depth += 1
-        elif ch == ")":
-            if p_depth > 0:
-                p_depth -= 1
-        elif ch == "{":
-            b_depth += 1
-        elif ch == "}":
-            if b_depth > 0:
-                b_depth -= 1
-        elif ch == "[":
-            k_depth += 1
-        elif ch == "]":
-            if k_depth > 0:
-                k_depth -= 1
-        elif (
-            top_colon == -1
-            and p_depth == 0
-            and b_depth == 0
-            and k_depth == 0
-            and ch == ":"
-            and (i + 1 >= n or header[i + 1] != "=")
-            and (i == open_idx + 1 or header[i - 1] != ":")
-        ):
-            top_colon = i
-        i += 1
-    return -1, -1
-
-
 def _normalize_signature_with_map(raw_header: str) -> tuple[str, dict[str, str]]:
     """Return `(normalized_signature, rename_map)` for `raw_header`."""
     if not raw_header or ":" not in raw_header:
@@ -1125,23 +1086,36 @@ def _normalize_signature(raw_header: str) -> str:
     return _normalize_signature_with_map(raw_header)[0]
 
 
+_BINDER_TOKEN_RE = re.compile(r"[(){}\[\]]|:=|:")
+_BRACKET_PAIRS = {"(": ")", "{": "}", "[": "]"}
+
+
 def _normalize_signature_uncached(raw_header: str) -> tuple[str, dict[str, str]]:
     if "(" not in raw_header and "{" not in raw_header and "[" not in raw_header:
         return _apply_rename_to_code_segment(raw_header, {}), {}
+    # One pass over brackets and colons: a `(...)`, `{...}` or `[...]` group whose first
+    # `:` (not `:=`) at its own nesting level is preceded only by identifiers binds
+    # those identifiers (`(xs : List (Nat × Nat))`, `{α : Type}`, `[inst : Foo α]`).
+    groups: list[tuple[int, int]] = []
+    stack: list[list[Any]] = []
+    for m in _BINDER_TOKEN_RE.finditer(raw_header):
+        tok = m.group()
+        c = tok[0]
+        if c in "({[":
+            stack.append([m.start(), c, -1])
+        elif c in ")}]":
+            if stack and _BRACKET_PAIRS[stack[-1][1]] == c:
+                open_idx, _, colon_idx = stack.pop()
+                if colon_idx != -1:
+                    groups.append((open_idx, colon_idx))
+        elif tok == ":" and stack and stack[-1][2] == -1:
+            stack[-1][2] = m.start()
+    groups.sort()  # number binders in order of appearance
     rename_map: dict[str, str] = {}
     counter = 0
-    n = len(raw_header)
-    for i in range(n):
-        if raw_header[i] not in "({[":
-            continue
-        close_idx, colon_idx = _find_matching_binder_close(raw_header, i)
-        if close_idx == -1 or colon_idx == -1:
-            continue
-        lhs = raw_header[i + 1 : colon_idx].strip()
-        if not lhs:
-            continue
-        tokens = lhs.split()
-        if all(_is_valid_binder_ident(t) for t in tokens):
+    for open_idx, colon_idx in groups:
+        tokens = raw_header[open_idx + 1 : colon_idx].split()
+        if tokens and all(_is_valid_binder_ident(t) for t in tokens):
             for vname in tokens:
                 if vname not in rename_map and vname not in _RESERVED_TYPE_NAMES:
                     rename_map[vname] = f"_v{counter}"
@@ -1221,6 +1195,9 @@ _FILE_TEXTS_CACHE: dict[str, tuple[int, int, str, str]] = {}
 # `.lean` file on every check. Counts stay in the small per-file count cache, which
 # keeps at most `COUNT_CACHE_MAX_FILES` entries (least recently checked dropped).
 COUNT_CACHE_MAX_FILES = 1024
+# Bump whenever rule semantics or signature normalization change: count entries and
+# sibling indexes written under another version are ignored, never compared.
+CACHE_FORMAT_VERSION = 3
 
 
 def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
@@ -1230,7 +1207,7 @@ def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
 
     cpath = Path(cache_path)
     tag = zlib.crc32(str(directory).encode("utf-8", "surrogatepass"))
-    return cpath.with_name(f"{cpath.name}.siblings-{tag:08x}.json")
+    return cpath.with_name(f"{cpath.name}.siblings-v{CACHE_FORMAT_VERSION}-{tag:08x}.json")
 
 
 def _index_entry(st: os.stat_result, decls: list[PrivateDecl]) -> list[Any]:
@@ -1304,7 +1281,7 @@ def _extract_sibling_private_decls_fast(
     cached = _SIBLING_PRIVATE_CACHE.get(key)
     if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         decls = cached[2]
-        if persisted is not None:
+        if persisted is not None and not _is_racy(st):
             old = persisted.get(key)
             if not (
                 isinstance(old, list)
@@ -1335,9 +1312,21 @@ def _extract_sibling_private_decls_fast(
             stripped, file_label=sibling_path.name, lazy_norm=True, file_path=key
         )
     _SIBLING_PRIVATE_CACHE[key] = (st.st_mtime_ns, st.st_size, decls)
-    if persisted is not None:
+    if persisted is not None and not _is_racy(st):
         persisted[key] = _index_entry(st, decls)
     return decls
+
+
+# File timestamps come from a coarse kernel clock, so a second same-size write within
+# one tick leaves `(mtime_ns, size)` unchanged. Files modified within this window are
+# not persisted in the sibling index and are lexed again by the next process.
+RACY_MTIME_WINDOW_NS = 2_000_000_000
+
+
+def _is_racy(st: os.stat_result) -> bool:
+    import time
+
+    return time.time_ns() - st.st_mtime_ns < RACY_MTIME_WINDOW_NS
 
 
 def _file_texts(path_str: str) -> tuple[str, str] | None:
@@ -1447,70 +1436,127 @@ def _duplicate_private_findings(
         ns = d.ensure_norm_sig()
         return (_sig_class(d.kind), ns) if ns else None
 
-    # Definition bodies are compared in two steps: a cheap key (counts taken on the
-    # Definition bodies are compared in two steps: a rename-invariant delimiter-skeleton
-    # key rejects structurally distinct bodies cheaply, and only bodies with equal
-    # delimiter skeletons are compared after comment-stripping, string-literal
-    # preservation, and header-binder alpha-renaming.
-    BodyQuickKey = tuple[int, int, int, int, int]
-    quick_keys: dict[int, BodyQuickKey | None] = {}
+    # Definition bodies are compared in three steps, each only among the bodies that
+    # survived the previous one:
+    # 1. counts of a few punctuation characters on the comment/string-blanked body
+    #    (C-level `str.count`; invariant under binder renaming and layout);
+    # 2. a hash of that body with identifiers collapsed to `_` and whitespace dropped
+    #    (still rename-invariant, but literals and operator order now matter);
+    # 3. the exact key: comments stripped, string literals verbatim, header binders
+    #    alpha-renamed.
+    # Steps 2-3 are capped at `_BODY_COMPARE_BUDGET` characters of body text per
+    # scan, so files with very many large same-typed definitions stay within the
+    # scan budget; definitions past the cap are not compared by body (no finding).
+    BodyKey = tuple[int, ...]
+    key1_cache: dict[int, BodyKey | None] = {}
+    key2_cache: dict[int, BodyKey | None] = {}
     exact_keys: dict[int, str] = {}
+    budget = [_BODY_COMPARE_BUDGET]
+
+    spans: dict[int, tuple[str, str, int, int] | None] = {}
 
     def body_span(d: PrivateDecl, local: bool) -> tuple[str, str, int, int] | None:
-        texts = (raw, stripped) if local else (_file_texts(d.path) if d.path else None)
-        if texts is None:
-            return None
-        r, st = texts
-        if d.body_start < 0 or d.body_start > len(st) or len(r) != len(st):
-            return None
-        end = _next_decl_boundary(st, d.body_start, len(st), d.decl_indent)
-        return r, st, d.body_start, end
-
-    def quick_key(d: PrivateDecl, local: bool) -> BodyQuickKey | None:
         k = id(d)
-        if k not in quick_keys:
-            key: BodyQuickKey | None = None
+        if k in spans:
+            return spans[k]
+        span = None
+        texts = (raw, stripped) if local else (_file_texts(d.path) if d.path else None)
+        if texts is not None:
+            r, st = texts
+            if 0 <= d.body_start <= len(st) and len(r) == len(st):
+                end = _next_decl_boundary(st, d.body_start, len(st), d.decl_indent)
+                span = (r, st, d.body_start, end)
+        spans[k] = span
+        return span
+
+    def key1(d: PrivateDecl, local: bool) -> BodyKey | None:
+        k = id(d)
+        if k not in key1_cache:
+            key: BodyKey | None = None
             span = body_span(d, local)
             if span is not None:
                 r, st, b, e = span
                 if b < e and r[b:e].strip():
-                    key = (
-                        st.count("(", b, e),
-                        st.count("{", b, e),
-                        st.count("[", b, e),
-                        st.count(":", b, e),
-                        st.count(",", b, e),
-                    )
-            quick_keys[k] = key
-        return quick_keys[k]
+                    key = tuple(st.count(c, b, e) for c in _BODY_KEY1_CHARS)
+            key1_cache[k] = key
+        return key1_cache[k]
+
+    def key2(d: PrivateDecl, local: bool) -> BodyKey | None:
+        k = id(d)
+        if k not in key2_cache:
+            key: BodyKey | None = None
+            span = body_span(d, local)
+            if span is not None and budget[0] > 0:
+                st, b, e = span[1], span[2], span[3]
+                budget[0] -= e - b
+                skeleton = "".join(_BODY_IDENT_RE.sub("_", st[b:e]).split())
+                key = (len(skeleton), hash(skeleton))
+            key2_cache[k] = key
+        return key2_cache[k]
 
     def exact_key(d: PrivateDecl, local: bool) -> str:
         k = id(d)
         v = exact_keys.get(k)
         if v is None:
+            v = ""
             span = body_span(d, local)
-            if span is not None:
+            if span is not None and budget[0] > 0:
+                budget[0] -= span[3] - span[2]
                 v = _decl_body_key(
                     span[0], span[1], span[2], d.decl_indent, d.ensure_rename_map()
                 )
-            else:
-                v = ""
             exact_keys[k] = v
         return v
 
-    def match_in(
-        d: PrivateDecl, buckets: dict[BodyQuickKey, list[PrivateDecl]], local: bool
-    ) -> PrivateDecl | None:
-        q = quick_key(d, True)
-        if q is None:
+    # Per signature, definitions are indexed level by level: `key1 -> [pending, by_key2]`
+    # and `key2 -> [pending, by_exact]`. A definition enters a deeper level (and pays
+    # for its finer key) only once a second definition reaches the same node, so
+    # every lookup is a dictionary probe and no pair is compared twice.
+    DefIndex = dict[BodyKey, list[Any]]
+
+    def match_in(d: PrivateDecl, index: DefIndex, local: bool) -> PrivateDecl | None:
+        q1 = key1(d, True)
+        node2 = index.get(q1) if q1 is not None else None
+        if node2 is None:
             return None
-        target_exact = exact_key(d, True)
-        if not target_exact:
+        q2 = key2(d, True)
+        if q2 is None:
             return None
-        for c in buckets.get(q, ()):
-            if exact_key(c, local) == target_exact:
-                return c
-        return None
+        pending2, by_key2 = node2
+        for c in pending2:
+            c2 = key2(c, local)
+            if c2 is not None:
+                by_key2.setdefault(c2, [[], {}])[0].append(c)
+        pending2.clear()
+        node3 = by_key2.get(q2)
+        if node3 is None:
+            return None
+        target = exact_key(d, True)
+        if not target:
+            return None
+        pending3, by_exact = node3
+        for c in pending3:
+            ce = exact_key(c, local)
+            if ce:
+                by_exact.setdefault(ce, c)
+        pending3.clear()
+        return by_exact.get(target)
+
+    def index_add(d: PrivateDecl, index: DefIndex) -> None:
+        q1 = key1(d, True)
+        if q1 is None:
+            return
+        pending2, by_key2 = index.setdefault(q1, [[], {}])
+        q2 = key2_cache.get(id(d))
+        if q2 is None:
+            pending2.append(d)
+            return
+        pending3, by_exact = by_key2.setdefault(q2, [[], {}])
+        ex = exact_keys.get(id(d))
+        if ex:
+            by_exact.setdefault(ex, d)
+        else:
+            pending3.append(d)
 
     local_keys = [sig_key(d) for d in local_decls]
     local_key_counts: dict[tuple[str, str], int] = {}
@@ -1525,25 +1571,25 @@ def _duplicate_private_findings(
         k = sig_key(d)
         if k is not None:
             ext_by_sig.setdefault(k, []).append(d)
-    # Sibling definitions of one signature, bucketed by cheap body key on first use
-    # (so sibling texts are only re-read for signatures a local definition shares).
-    ext_def_buckets: dict[tuple[str, str], dict[BodyQuickKey, list[PrivateDecl]]] = {}
+    # Sibling definitions of one signature, indexed on first use (so sibling texts are
+    # only re-read for signatures a local definition shares).
+    ext_def_indexes: dict[tuple[str, str], DefIndex] = {}
 
-    def ext_def_bucket(k: tuple[str, str]) -> dict[BodyQuickKey, list[PrivateDecl]]:
-        b = ext_def_buckets.get(k)
-        if b is None:
-            b = {}
+    def ext_def_index(k: tuple[str, str]) -> DefIndex:
+        idx = ext_def_indexes.get(k)
+        if idx is None:
+            idx = {}
             for c in ext_by_sig.get(k, ()):
-                q = quick_key(c, False)
+                q = key1(c, False)
                 if q is not None:
-                    b.setdefault(q, []).append(c)
-            ext_def_buckets[k] = b
-        return b
+                    idx.setdefault(q, [[], {}])[0].append(c)
+            ext_def_indexes[k] = idx
+        return idx
 
     findings: list[ProofHealthFinding] = []
     seen_names: dict[str, PrivateDecl] = {}
     seen_props: dict[tuple[str, str], PrivateDecl] = {}
-    seen_def_buckets: dict[tuple[str, str], dict[BodyQuickKey, list[PrivateDecl]]] = {}
+    seen_def_indexes: dict[tuple[str, str], DefIndex] = {}
     for d, k in zip(local_decls, local_keys):
         same = "signature and body" if d.kind == "def" else "signature"
         dup_reason: str | None = None
@@ -1555,8 +1601,8 @@ def _duplicate_private_findings(
             if k is not None:
                 if k[0] == "prop":
                     prev = seen_props.get(k)
-                elif k in seen_def_buckets:
-                    prev = match_in(d, seen_def_buckets[k], True)
+                elif k in seen_def_indexes:
+                    prev = match_in(d, seen_def_indexes[k], True)
             if prev is not None:
                 dup_reason = (
                     f"has the same normalized {same} as `private {prev.kind} {prev.name}` "
@@ -1572,7 +1618,7 @@ def _duplicate_private_findings(
                 sib = (
                     ext_by_sig[k][0]
                     if k[0] == "prop"
-                    else match_in(d, ext_def_bucket(k), False)
+                    else match_in(d, ext_def_index(k), False)
                 )
                 if sib is not None:
                     dup_reason = (
@@ -1585,9 +1631,7 @@ def _duplicate_private_findings(
             if k[0] == "prop":
                 seen_props.setdefault(k, d)
             elif local_key_counts[k] >= 2:
-                q = quick_key(d, True)
-                if q is not None:
-                    seen_def_buckets.setdefault(k, {}).setdefault(q, []).append(d)
+                index_add(d, seen_def_indexes.setdefault(k, {}))
 
         if dup_reason is not None:
             findings.append(
@@ -1611,14 +1655,13 @@ def scan_lean_text(
     file_path: str | Path | None = None,
     scan_siblings: bool = True,
     sibling_decls: list[PrivateDecl] | None = None,
-    raw_utf8: bytes | None = None,
 ) -> list[ProofHealthFinding]:
     """Scan Lean 4 source `text` and return all structural proof-health findings."""
-    stripped = strip_lean_comments_and_strings(text, raw_utf8=raw_utf8)
+    stripped = strip_lean_comments_and_strings(text)
     line_of = _LineCounter(stripped)
     findings: list[ProofHealthFinding] = []
 
-    active_kws, has_mir_body, has_bitwise = _active_simp_keywords(stripped, raw_utf8)
+    active_kws, has_mir_body, has_bitwise = _active_simp_keywords(stripped)
 
     # Rules 1, 2, 3 inside `dsimp [...]` / `simp [...]` bracket lists
     if active_kws and "simp" in stripped:
@@ -1748,9 +1791,10 @@ def scan_lean_text(
                     )
 
     # Rule 4: `low_profiler_threshold`
-    if (raw_utf8 is None or b"profiler.threshold" in raw_utf8) and "profiler.threshold" in stripped:
+    if "profiler.threshold" in stripped:
         for pm in _PROFILER_THRESHOLD_RE.finditer(stripped):
-            if pm.start() > 0 and (_is_ident_char(stripped[pm.start() - 1]) or stripped[pm.start() - 1] == "."):
+            before = stripped[pm.start() - 1] if pm.start() > 0 else " "
+            if _is_ident_char(before) or before == ".":
                 continue
             val = int(pm.group(1).replace("_", ""))
             if val < MIN_PROFILER_THRESHOLD:
@@ -1772,15 +1816,11 @@ def scan_lean_text(
                 )
 
     # Rule 5: `duplicate_private_lemma`
-    local_decls = (
-        extract_private_decls(
-            stripped,
-            file_label=Path(file_path).name if file_path else "",
-            lazy_norm=True,
-            line_of=line_of,
-        )
-        if (raw_utf8 is None or b"private" in raw_utf8)
-        else []
+    local_decls = extract_private_decls(
+        stripped,
+        file_label=Path(file_path).name if file_path else "",
+        lazy_norm=True,
+        line_of=line_of,
     )
     if local_decls:
         ext_decls: list[PrivateDecl] = []
@@ -1802,11 +1842,8 @@ def scan_lean_file(
     path = Path(file_path)
     # Bytes + decode skips text-mode newline translation; line numbers count `\n`
     # either way and a stray `\r` is whitespace to every rule.
-    raw_bytes = path.read_bytes()
-    text = raw_bytes.decode("utf-8", errors="replace")
-    return scan_lean_text(
-        text, file_path=path, scan_siblings=scan_siblings, raw_utf8=raw_bytes
-    )
+    text = path.read_bytes().decode("utf-8", errors="replace")
+    return scan_lean_text(text, file_path=path, scan_siblings=scan_siblings)
 
 
 def count_findings_by_rule(findings: Iterable[ProofHealthFinding]) -> dict[str, int]:
@@ -2159,7 +2196,22 @@ def evaluate_post_edit_proof_health(
     cache_path: str | Path | None = None,
     scan_siblings: bool = True,
 ) -> dict[str, Any]:
-    """Compute delta-only proof-health diagnostics for `target_file` after an edit."""
+    """Compute delta-only proof-health diagnostics for `target_file` after an edit.
+
+    The pre-edit text comes, in order of preference, from an explicit
+    `before_text`, from Claude Code's `tool_response.originalFile`, from inverting
+    the edit payload in memory (using Jetski's `Made <K> replacement(s) ... starting
+    at line <L>` result and Claude's `replace_all` to resolve repeated occurrences),
+    or from the edit shape itself (a `write_file` that creates a new file starts from
+    an empty file; a `write_file` with `Append` starts from the text before the
+    appended content). Its counts are taken from the persisted per-file cache when
+    the cached entry was recorded by this cache format for exactly that text (same
+    length, CRC and sibling stamps), which saves the second scan on consecutive
+    edits; otherwise the text is scanned. Without a pre-edit text, the cached counts
+    are the baseline, then a count-preserving inversion of repeated replacements.
+    When none is available (an overwrite or a deletion of a file never seen before),
+    the current counts become the baseline and no increase is claimed.
+    """
     # Absolute (not symlink-resolved) path, so sibling-index keys do not depend on the
     # working directory of the hook process.
     path = Path(os.path.abspath(target_file))
@@ -2198,15 +2250,17 @@ def evaluate_post_edit_proof_health(
     after_counts = count_findings_by_rule(after_findings)
 
     cached_entry = cache.get(resolved_key)
-    if not isinstance(cached_entry, dict):
+    if not isinstance(cached_entry, dict) or cached_entry.get("_ver") != CACHE_FORMAT_VERSION:
         cached_entry = None
+    # Siblings are identified by path, (mtime_ns, size) and the position, kind and
+    # name of every private declaration (fields present however the declarations
+    # were obtained, unlike a lazily normalized signature): an edit to a sibling with
+    # private declarations invalidates reuse of this file's cached counts.
     sib_parts: list[str] = []
-    for d in sibling_decls:
-        st_pair = _SIBLING_PRIVATE_CACHE.get(d.path)
-        stamp = f"{st_pair[0]}:{st_pair[1]}" if st_pair is not None else ""
-        sib_parts.append(
-            f"{d.file}:{d.line}:{d.kind}:{d.name}:{d.sig_fp}:{d.norm_sig}:{d.body_start}:{stamp}"
-        )
+    for sib_path in sorted({d.path for d in sibling_decls}):
+        st_pair = _SIBLING_PRIVATE_CACHE.get(sib_path)
+        sib_parts.append(f"{sib_path}:{st_pair[0]}:{st_pair[1]}" if st_pair else f"{sib_path}:?")
+    sib_parts.extend(f"{d.path}:{d.line}:{d.kind}:{d.name}" for d in sibling_decls)
     sib_sig = _text_crc("\n".join(sib_parts))
 
     def _cached_counts_for(text: str) -> dict[str, int] | None:
@@ -2277,6 +2331,7 @@ def evaluate_post_edit_proof_health(
     entry["_len"] = len(after_text)
     entry["_crc"] = _text_crc(after_text)
     entry["_sib"] = sib_sig
+    entry["_ver"] = CACHE_FORMAT_VERSION
     cache.pop(resolved_key, None)
     cache[resolved_key] = entry  # most recently checked last
     for stale in list(cache)[: max(0, len(cache) - COUNT_CACHE_MAX_FILES)]:
@@ -2500,6 +2555,19 @@ def compute_unbatched_tool_latencies(
     separating calls that ran inside a multi-call batch containing a long-running call
     (`>= long_call_threshold_ms`, classified as `"batched_with_long_call"`) from
     standalone/unbatched calls (`"unbatched"`).
+
+    Accepted inputs:
+    - explicit latency events `{tool, duration_ms | latency_ms | started_at/completed_at,
+      batch_id | step_index | turn_id, batch_size?}`;
+    - step objects whose `tool_calls` entries carry their own timings;
+    - Jetski `transcript.jsonl` steps, where a `PLANNER_RESPONSE` step lists its
+      `tool_calls` (one batch) and the following result steps report, in order,
+      `Created At: ... / Completed At: ...` timestamps for each call. A result step
+      without `Completed At` (a call backgrounded while still `RUNNING`, or an error)
+      still consumes its call, and a backgrounded call marks its batch as containing
+      a long call. These timestamps have one-second resolution, so such durations
+      are whole seconds (a sub-second call straddling a second boundary reads 1000 ms).
+    Entries without usable timings are skipped without raising.
     """
     import statistics
 
