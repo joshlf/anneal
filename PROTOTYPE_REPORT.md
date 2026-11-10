@@ -3,183 +3,177 @@
 - **Workstream ID**: `ws-proto-fault-site-coverage-reconciler` (`ep1-prototype-fault-site-census-and-reconciler`)
 - **Track**: Track P (`prototype`, isolated from `unstable` and `main`)
 - **Target Paired Track A Workstream**: `ws-fault-site-coverage-reconciler`
+- **Current Pass**: `[adv B1]` (round 1 adversarial critique & repair of `[adv A0]`)
 
 ---
 
 ## 1. Executive Summary
 
-This Track P prototype implements and machine-verifies a defense-in-depth architecture for Anneal's MIR verification pipeline that eliminates the silent false-proof failure mode ("bug in `obligations.rs` omits a fault site $\rightarrow$ vacuous `VERIFIED`").
+This Track P prototype builds a defense-in-depth cross-check for Anneal's MIR verification pipeline against the silent false-proof failure mode ("the obligation generator omits a fault site, so the item reports `VERIFIED` vacuously"). Instead of trusting `cargo-anneal`'s obligation generator to enumerate every runtime UB condition, it adds two independent components:
 
-Rather than trusting `cargo-anneal`'s obligation generator to enumerate all runtime Undefined Behavior (UB) conditions, this prototype introduces two independent, cross-checked components:
-
-1. **Lean 4 Independent Syntactic MIR Fault-Site Census & Completeness Proof (`theory/Anneal/FaultSiteCensusPrototype.lean`)**:
-   - Formalizes the 12 canonical `MirFaultClass` categories, `FaultSite`, `PropertyStatus`, and `PropertyRegistry`.
-   - Defines an independent structural AST walker `censusMirBodyFaultSites (body : CapturedMir) : List FaultSite` directly over `Trusted.MirAst.CapturedMir`.
-   - Machine-checks the **Fault-Site Census Completeness Theorem (`stepMirFn_fault_in_census`)** directly over `Trusted.MirSemantics.stepMirFn` (both for general `s.memory.activeCallee.getD body` and top-level `s.memory.activeCallee = none` under valid PC bounds `ValidMirPc`), alongside CFG target-bounds preservation (`stepMirFn_preserves_validMirPc`).
-   - Machine-checks **Construct-Level Precision / Non-Overapproximation Theorems** proving that pure MIR statements/terminators emit `[]` and cannot fault with `MirStepNode.fail .ub`, and that each syntactic MIR construct emits only the exact subset of `MirFaultClass` variants justified by `Trusted.MirSemantics`.
-   - Machine-checks the fail-closed `CoverageVerdict` and `reconcileFaultCoverage` / `reconcileFaultCoverageWithRegistry` soundness, completeness, unemitted-class rejection, and mutation-detection theorems, backed by compile-time `by decide` witness suites (`0` `sorryAx`, `0` `Lean.ofReduceBool`).
-
-2. **Rust Obligation Property Registry, Fail-Closed Coverage Reconciler & False-Proof Mutation Probes (`crates/cargo-anneal/src/fault_census_proto.rs`)**:
-   - Implements the 1-to-1 `MirFaultClass` vocabulary, `FaultSite`, `PropertyStatus`, and `PropertyRegistry` (with stage-aware and full-verified configurations).
-   - Implements three independent census frontends:
-     - `census_mir_fault_sites(&ProtoMirBody)` over a structured MIR representation mirroring `Trusted.MirAst`.
-     - `census_ir_captured_mir(&IrCapturedMir)` directly over `anneal_rustc_capture::mir_ir::IrCapturedMir`.
-     - `census_lean_mir_module(&str)` / `census_lean_mir_def(&str, &str)`, a fail-closed recursive-descent lexer/parser for emitted `Mir/<Item>.lean` files that handles line comments (`--`), nested block comments (`/- ... -/`), string literals, raw strings (`r#"..."#`), interpolated strings (`s!"..."`), and guillemet identifiers (`«...»`), rejecting malformed or non-inline definitions fail-closed.
-   - Implements `reconcile_obligation_coverage` and `reconcile_lean_mir_coverage`, which return `CoverageVerdict::Verified` if and only if the census succeeds without unsupported constructs, every censused `FaultSite` is present in the discharged obligation set (`census ⊆ discharged`), and every censused `MirFaultClass` has `PropertyStatus::EmittedAndVerified` in `PropertyRegistry`.
-   - Validates all **4 False-Proof Mutation Probes** (`CallArgBlindProbe`, `SwitchBreakStripProbe`, `LoopUpdateOverflowProbe`, `DerefAliasProbe`), the `PropertyRegistry` unemitted-class downgrade probe, and a **Cross-Language Lean-to-Rust Witness Parity Test** (`include_str!("../../../theory/Anneal/FaultSiteCensusPrototype.lean")`).
+1. **Lean 4 independent fault-site census and completeness proofs** (`theory/Anneal/FaultSiteCensusPrototype.lean`):
+   - 12 canonical `MirFaultClass` categories, `FaultSite`, `PropertyStatus`, `PropertyRegistry`.
+   - An independent structural walker `censusMirBodyFaultSites (body : CapturedMir) : List FaultSite` over `Trusted.MirAst`, duplicate-free (`censusMirBodyFaultSites_nodup`).
+   - Completeness over `Trusted.MirSemantics.stepMirFn` (`stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census`), strengthened in `[adv B1]` to every **one-step UB exposure**, including `.faulted .ub` continuations of external calls (`stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`).
+   - `[adv B1]` **semantic precision certificates**: class-level justification of census entries against the trusted evaluator (`censusBinOpFaultClasses_exact`, `evalScalarBinOp_ub_cause`, exact `StorageLive`/`StorageDead`/`Return`/`Goto`/borrow `.ub` edges).
+   - Fail-closed reconciler theorems and kernel-checked `by decide` witnesses (`0` `sorryAx`, `0` `Lean.ofReduceBool`), with kernel-evaluated **liveness certificates** for every false-proof probe site.
+2. **Rust registry, census frontends, fail-closed reconciler and probes** (`crates/cargo-anneal/src/fault_census_proto.rs`):
+   - 1-to-1 `MirFaultClass`, `FaultSite`, `PropertyStatus`, `PropertyDescriptor`, `PropertyRegistry`.
+   - Three census frontends: `census_mir_fault_sites(&ProtoMirBody)`, `census_ir_captured_mir(&IrCapturedMir)`, and the fail-closed Lean scanners `census_lean_mir_module(&str)` (strict emitter-module grammar, `[adv B1]`) and `census_lean_mir_def(&str, &str)` (named-definition extraction for the witness file).
+   - `reconcile_obligation_coverage` / `reconcile_lean_mir_coverage`, the four false-proof probes driven by an independent mock obligation emitter (`[adv B1]`), the registry probe, a real `rustc`-captured corpus test, and the cross-language Lean-to-Rust parity test.
 
 ---
 
-## 2. Lean 4 Machine-Checked Theorem Inventory (`theory/Anneal/FaultSiteCensusPrototype.lean`)
+## 2. Lean 4 Theorem Inventory (`theory/Anneal/FaultSiteCensusPrototype.lean`)
 
-All declarations in `theory/Anneal/FaultSiteCensusPrototype.lean` elaborate in the Lean 4 kernel with **zero `sorryAx`** and **zero `Lean.ofReduceBool` (`native_decide`)** (verified over standard axioms `propext`, `Quot.sound`, and `Classical.choice` only).
+Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBool`** (scratch `#print axioms` over all `188` public declarations / `113` public theorems; `101/113` theorems are `Classical.choice`-free — the `12` exceptions are the `stepMirFn_*` theorems that go through `simp`/`omega` over the trusted machine, plus the witness corollary built on them).
 
-| Category | Declaration Name | Statement Summary |
+| Category | Declaration(s) | Statement |
 | :--- | :--- | :--- |
-| **Taxonomy & Canonical Encoding** | `MirFaultClass.mem_all` | Every `c : MirFaultClass` is a member of the 12-element canonical list `MirFaultClass.all`. |
-| | `MirFaultClass.nodup_all` | `MirFaultClass.all` is duplicate-free (`List.Nodup`). |
-| | `MirFaultClass.ofRank?_toRank` / `toRank_ofRank?` | Exact bijection between `MirFaultClass` and canonical ranks `0..11`. |
-| | `MirFaultClass.toRank_injective` | `toRank` is injective. |
-| | `MirFaultClass.fromStr?_asStr` / `asStr_fromStr?` / `asStr_injective` | Exact round-trip and injectivity for canonical snake_case identifiers (`arith_overflow`, ..., `unreachable_terminator`). |
-| **Deduplication & Structural Nodup** | `mem_dedupFaultClasses` | `c ∈ dedupFaultClasses raw ↔ c ∈ raw`. |
-| | `nodup_dedupFaultClasses` | `dedupFaultClasses raw` is strictly duplicate-free in canonical rank order. |
-| | `censusStmtFaultSites_nodup` / `censusTerminatorFaultSites_nodup` | Per-statement and per-terminator fault-site lists are duplicate-free. |
-| | `censusMirBodyFaultSites_nodup` | For every `body : CapturedMir`, `(censusMirBodyFaultSites body).Nodup`. |
-| | `mem_censusMirBodyFaultSites_stmt` / `mem_censusMirBodyFaultSites_term` | Exact structural membership characterizations connecting `(bbIdx, stmtIdx, cls) ∈ censusMirBodyFaultSites body` to `get? body.basicBlocks bbIdx` and `get? bb.statements stmtIdx` or `stmtIdx = length bb.statements`. |
-| **Construct Precision & Non-Overapproximation** | `censusStmtFaultClasses_nop` / `_coverage` / `_constEvalCounter` / `_backwardIncompatibleDropHint` | Pure no-fault statements emit `[]` (0 classes). |
-| | `evalStmt_nop_ne_ub` / `_coverage_ne_ub` / `_constEvalCounter_ne_ub` / `_backwardIncompatibleDropHint_ne_ub` | Pure no-fault statements never evaluate to `MirStepNode.fail .ub`. |
-| | `censusTerminatorFaultClasses_goto_inBounds` / `_unwindTerminate` / `_inlineAsm` | Pure no-fault terminators emit `[]` (0 classes). |
-| | `evalTerminator_goto_ne_ub` / `_unwindTerminate_ne_ub` / `_inlineAsm_ne_ub` | Pure no-fault terminators never evaluate to `MirStepNode.fail .ub`. |
-| | `censusStmtFaultClasses_storageLive` / `_storageDead` | `.storageLive` and `.storageDead` emit strictly `[.boundsCheck, .storageLiveProtected]` (2 of 12 classes). |
-| | `censusStmtFaultClasses_intrinsic_assume` | `.intrinsic (.assume (.copy { localIdx := l, projection := [] }))` emits strictly `[.boundsCheck, .scalarNicheInvalid, .uninitRead]` (3 of 12 classes). |
-| | `censusTerminatorFaultClasses_unreachable` | `.unreachable` emits strictly `[.unreachableTerminator]` (1 of 12 classes). |
-| | `censusTerminatorFaultClasses_return` | `.return_` emits strictly `[.treeBorrowsViolation, .uninitRead, .callAbiMismatch]` (3 of 12 classes). |
-| | `censusStmtFaultClasses_not_all_twelve` | Witness proof that `censusStmtFaultClasses` is strictly narrower than `MirFaultClass.all`. |
-| **Valid PC & CFG Target-Bounds Invariance** | `validMirPc_iff` | Decidable reflection `validMirPcDec body frame = true ↔ ValidMirPc body frame`. |
-| | `validMirPc_initMachineState` | If `length body.basicBlocks > 0`, `ValidMirPc body (initMachineState body args).frame`. |
-| | `stepMirFn_preserves_validMirPc` | If `s.memory.activeCallee = none`, `s.memory.callStack = []`, `cfgTargetsInBounds body = true`, and `ValidMirPc body s.frame`, then any intra-frame step (`MirStepNode.step s'` or `MirStepNode.emitStep obs s'`) preserves `ValidMirPc body s'.frame`. |
-| **Fine-Grained Construct Soundness** | `evalStmt_ub_implies_mem_censusStmt` | If `evalStmt activeBody s stmt = MirStepNode.fail .ub`, then `∃ cls ∈ censusStmtFaultClasses stmt, True` with construct-specific class witnesses. |
-| | `evalTerminator_ub_implies_mem_censusTerminator` | If `evalTerminator activeBody s term = MirStepNode.fail .ub`, then `∃ cls ∈ censusTerminatorFaultClasses (length activeBody.basicBlocks) term, True` with construct-specific class witnesses. |
-| **Fault-Site Census Completeness** | `stepMirFn_activeBody_fault_in_census` | For any `body : CapturedMir` and `s : MachineState` with `ValidMirPc (s.memory.activeCallee.getD body) s.frame`, `stepMirFn body s = MirStepNode.fail .ub → ∃ cls, (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites (s.memory.activeCallee.getD body)`. |
-| | `stepMirFn_fault_in_census` | Top-level specialization (`s.memory.activeCallee = none`): `ValidMirPc body s.frame → stepMirFn body s = MirStepNode.fail .ub → ∃ cls, (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body`. |
-| | `stepMirFn_ne_ub_of_site_uncensused` | Contrapositive safety corollary: if no `(s.frame.blockIdx, s.frame.stmtIdx, cls)` is in `censusMirBodyFaultSites body`, then `stepMirFn body s ≠ MirStepNode.fail .ub`. |
-| | `stepMirFn_ne_ub_of_empty_census` | Whole-body zero-census corollary: if `censusMirBodyFaultSites body = []`, `stepMirFn body s ≠ MirStepNode.fail .ub` at every valid PC. |
-| **Fail-Closed Reconciler & Registry Soundness** | `reconcileFaultCoverage_verified_iff` | `reconcileFaultCoverage census discharged = .verified ↔ ∀ site ∈ census, site ∈ discharged`. |
-| | `reconcileFaultCoverage_unknown_nonempty` | When `reconcileFaultCoverage census discharged = .unknownUnmappedFaultSites missing`, `missing ≠ []` and `∀ site, site ∈ missing ↔ site ∈ census ∧ site ∉ discharged`. |
-| | `reconcileFaultCoverageWithRegistry_verified_iff` | Registry-gated reconciliation returns `.verified` iff every site in `census` is in `discharged` AND has `registry site.faultClass = .emittedAndVerified`. |
-| | `reconcileFaultCoverageWithRegistry_rejects_unemitted` | If `site ∈ census` and `registry site.faultClass ≠ .emittedAndVerified`, reconciliation never returns `.verified` (even if `site ∈ discharged`). |
-| | `reconcileFaultCoverage_mutation_detected` | Stripping any `site ∈ census` from `discharged'` forces `.unknownUnmappedFaultSites missing` with `site ∈ missing`. |
-| | `stepMirFn_fault_in_discharged_of_reconciled` | End-to-end bridge: if `reconcileFaultCoverageWithRegistry registry (censusMirBodyFaultSites body) discharged = .verified`, any runtime `.ub` fault in `stepMirFn body s` occurs at a site `(bb, stmt, cls) ∈ discharged` with `registry cls = .emittedAndVerified`. |
+| Taxonomy | `MirFaultClass.mem_all`, `MirFaultClass.nodup_all`, `MirFaultClass.length_all` | `all` lists exactly the 12 classes, duplicate-free. |
+| | `MirFaultClass.toRank_lt_twelve`, `MirFaultClass.ofRank?_toRank`, `MirFaultClass.toRank_injective` | Rank encoding `0..11` with round trip and injectivity. |
+| | `MirFaultClass.fromStr?_asStr`, `MirFaultClass.asStr_fromStr?`, `MirFaultClass.asStr_injective` | Canonical `snake_case` names (shared with Rust) round-trip. |
+| Registry | `PropertyStatus.isVerified_eq_true_iff`, `registryWithStatus_self`, `registryWithStatus_ne` | Registry status semantics and point overrides. |
+| Dedup / Nodup | `mem_dedupFaultClasses_iff`, `nodup_dedupFaultClasses`, `censusMirBodyFaultSites_nodup` | Canonical per-site dedup; the whole census is `Nodup`. |
+| Membership | `mem_censusStmtsAux_of_get?`, `mem_censusBlockFaultSites_of_stmt`, `mem_censusBlockFaultSites_of_terminator`, `mem_censusBlocksAux_of_get?`, `mem_censusMirBodyFaultSites_of_block` | Structural membership of `(bb, stmt, cls)` sites. |
+| Census equations | `censusStmtFaultClasses_nop` / `_coverage` / `_constEvalCounter` / `_dropHint` / `_storageLive` / `_storageDead`; `censusTerminatorFaultClasses_unwindTerminate` / `_inlineAsm` / `_unreachable` / `_unwindResume` / `_return` / `_goto_inBounds` / `_goto_outOfBounds`; `censusBinOpFaultClasses_add` / `_addWithOverflow` / `_addUnchecked` / `_div` / `_shl` / `_shlUnchecked` / `_offset`; `storageLive_strict_subset_all` | `rfl`-level restatements of the census definition (these alone justify nothing semantically — see §2.1). |
+| Pure constructs never fault | `evalStmt_pure_constructs_ne_ub`, `evalTerminator_pure_constructs_ne_ub`, `evalOperand_constant_non_indirect_ne_ub` | `.nop`/`.coverage`/`.constEvalCounter`/`.backwardIncompatibleDropHint`, `.goto`/`.unwindTerminate`/`.inlineAsm`, and non-`.indirect` constants never return `.ub`. |
+| Valid PC / CFG | `ValidMirPc`, `cfgTargetsInBounds`, `validMirPc_initMachineState`, `stepMirFn_preserves_validMirPc` (+ `evalStmt_preservesPc`, `evalTerminator_preservesPc`) | Entry PC is valid; intra-frame steps of a top-level frame with in-bounds CFG targets preserve `ValidMirPc`. |
+| Construct classification | `evalStmt_exposesUb_implies_mem_censusStmt`, `evalTerminator_exposesUb_implies_mem_censusTerminator` (and the `.fail .ub` corollaries `evalStmt_ub_implies_mem_censusStmt`, `evalTerminator_ub_implies_mem_censusTerminator`) | Any UB exposure of a statement/terminator implies a non-empty construct census. |
+| Completeness | `stepMirFn_activeBody_exposesUb_in_census`, `stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`, `stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census` | Every UB exposure from a valid PC (active callee or top level) is censused at that PC. |
+| Zero-census corollaries | `stepMirFn_not_exposesUb_of_site_uncensused`, `stepMirFn_ne_ub_of_site_uncensused`, `stepMirFn_ne_ub_of_empty_census` | An uncensused PC exposes no UB, directly or through any continuation. |
+| Reconciler | `mem_unmappedFaultSites_iff`, `mem_unmappedFaultSitesWithRegistry_iff`, `reconcileFaultCoverage_verified_iff`, `reconcileFaultCoverage_unknown_nonempty`, `reconcileFaultCoverageWithRegistry_verified_iff`, `reconcileFaultCoverageWithRegistry_rejects_unemitted`, `reconcileFaultCoverage_mutation_detected` | Soundness/completeness of the fail-closed verdict; non-verified registry classes can never be discharged; stripping any census site is detected. |
+| End-to-end bridge | `stepMirFn_fault_in_discharged_of_reconciled`, `stepMirFn_exposesUb_in_discharged_of_reconciled` | A reconciled body discharges (with an `emittedAndVerified` class) every UB exposure at a valid top-level PC. |
+
+### 2.1 `[adv B1]` Semantic Precision Certificates
+
+| Declaration | What it proves against `Trusted.MirSemantics` |
+| :--- | :--- |
+| `evalScalarBinOp_ne_ub_of_census_nil` | Every `BinOp` with census `[]` (wrapping `add`/`sub`/`mul`, flagged `*WithOverflow`, masked `shl`/`shr`, bitwise, comparisons, `cmp`) can never make `evalScalarBinOp` return `.ub`. |
+| `BinOpFaultCause`, `evalScalarBinOp_ub_cause` | Class-precise completeness: each `.ub` of `evalScalarBinOp` is explained by a class in `censusBinOpFaultClasses op` *and* its concrete cause (`.divRemByZero` only for a zero divisor, `.shiftOverflow` only for a distance `≥` the bit width, `.arithOverflow` only for unchecked arithmetic or signed `MIN / -1`). |
+| `censusBinOpFaultClasses_exact` (+ `evalScalarBinOp_*_ub_witness`) | For every scalar operator, census `= []` **iff** `evalScalarBinOp` can never fault — no over- and no under-approximation, with concrete faulting inputs (`rfl`) for every non-empty entry. |
+| `evalStmt_storageLive_ub_iff`, `evalStmt_storageDead_ub_iff` | Exact edges: fault iff `loc ≥ locals.length` or an active protector protects a borrow of `loc` (`hasProtectedLocalBorrow`). |
+| `evalTerminator_unreachable_ub` | `Unreachable` always faults. |
+| `evalTerminator_return_root_ub_iff`, `evalTerminator_return_inline_ub_iff` | Root frame: fault iff `_0` is not initialized. Inline frame: additionally iff the caller expected a diverging callee or the write into `caller.destination` faults. |
+| `stepMirFn_after_goto_oob_ub` | An out-of-bounds `Goto` steps successfully but makes the *next* `stepMirFn` fault — the reason the census labels that `Goto` site with `.boundsCheck`. |
+| `evalRvalue_borrow_nonDeref_ub_iff` | Borrowing (`Ref`/`RawPtr`) a place whose projection does not start with `.deref` faults iff the root local is missing/dead or an `.index` local is uninitialized — justifying the `[.uninitRead]` census. |
+| `witness*_site_live` (4 probes) | `stepMirFn witness... (concrete state) = MirStepNode.fail .ub` by kernel evaluation at the exact site each mutant strips, plus a non-faulting contrast state (`ne_fail_ub_of_stepNodeIsTau`). |
 
 ---
 
-## 3. Construct-to-Fault-Class Matrix (`Trusted.MirSemantics` Alignment)
+## 3. Construct-to-Fault-Class Matrix (as implemented after `[adv B1]`)
 
-Every syntactic construct in `Trusted.MirAst` is mapped to the exact subset of `MirFaultClass` categories that its operational evaluation in `Trusted.MirSemantics` (`Places.lean`, `Statements.lean`, `Terminators.lean`, `Machine.lean`) can trigger:
+`Place read` = `uninitRead :: projection classes`; projection classes: `.deref` → `ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation`; `.index` → `boundsCheck, uninitRead`; `.constantIndex`/`.subslice` → `boundsCheck`; `.downcast` → `scalarNicheInvalid`; `.field`/`.opaqueCast`/`.unwrapUnsafeBinder` → `[]`. `Place write` = `storageLiveProtected, treeBorrowsViolation` (plus `uninitRead` and projection classes when projected).
 
-| Syntactic Construct | Emitted `MirFaultClass` Subset (in Canonical Rank Order) | Semantic Justification in `Trusted.MirSemantics` |
+| Construct | Census classes | Justification in `Trusted.MirSemantics` |
 | :--- | :--- | :--- |
-| **Place Projection (`ProjectionElem`)** | | |
-| `.deref` | `boundsCheck`, `ptrDerefInvalid`, `ptrAlignMismatch`, `treeBorrowsViolation`, `scalarNicheInvalid`, `uninitRead` | Reads pointer local (`evalPlace` $\rightarrow$ `boundsCheck`, `scalarNicheInvalid`, `uninitRead`), validates pointer provenance/bounds/alignment (`ptrDerefInvalid`, `ptrAlignMismatch`), and checks Tree Borrows read/write access (`treeBorrowsViolation`). |
-| `.field idx` / `.downcast idx` / `.subslice f t fl` | `boundsCheck` | Sub-place layout / field / slice bounds resolution in `evalPlace` / `resolvePlaceRef`. |
-| `.index idxLocal` | `boundsCheck`, `scalarNicheInvalid`, `uninitRead` | Reads `idxLocal` (`uninitRead`, `scalarNicheInvalid`) and checks array/slice index bounds (`boundsCheck`). |
-| `.constantIndex offset minLen fromEnd` | `boundsCheck` | Checks constant index against `minLen` and slice/array length (`boundsCheck`). |
-| `.opaqueCast` / `.unwrapUnsafeBinder` | `boundsCheck`, `scalarNicheInvalid` | Validates layout/niche compatibility at cast/unwrap boundary. |
-| **Operand (`Operand`)** | | |
-| `.copy place` / `.move place` | `censusPlaceReadFaultClasses place` (`boundsCheck`, `scalarNicheInvalid`, `uninitRead` + projection classes) | `evalOperand` evaluates `evalPlace` (`uninitRead`, `scalarNicheInvalid`, `boundsCheck`); `.move` also deinitializes the source place (`writePlaceRaw` $\rightarrow$ `treeBorrowsViolation` if deref). |
-| `.constant c` where `c.kind = .zeroSized \| .scalar _ \| .slice _ \| .unevaluated _` | `[]` (0 classes) | Pure immediate constant in `evalConstOperand`; cannot fail with `.ub`. |
-| `.constant c` where `c.kind = .indirect allocId offset` | `boundsCheck`, `scalarNicheInvalid`, `uninitRead` | Reads constant bytes from global memory allocation `allocId` at `offset` (`readGlobalAllocBytes`). |
-| **Rvalue (`Rvalue`)** | | |
-| `.use op` | `Operand` classes | Direct operand evaluation. |
-| `.BinaryOp (.add \| .sub \| .mul \| .cmp)` | `Operand` classes | Wrapping arithmetic / comparison; only operand evaluation can fault. |
-| `.BinaryOp (.addUnchecked \| .subUnchecked \| .mulUnchecked)` | `arithOverflow` + `Operand` classes | Unchecked signed/unsigned arithmetic faults on overflow (`evalBinOp`). |
-| `.BinaryOp (.addWithOverflow \| .subWithOverflow \| .mulWithOverflow)` | `boundsCheck` + `Operand` classes | Checked arithmetic constructs tuple aggregate using destination layout (`boundsCheck`). |
-| `.BinaryOp (.div \| .rem)` | `arithOverflow`, `divRemByZero` + `Operand` classes | Faults on divisor `== 0` (`divRemByZero`) or signed `MIN / -1` (`arithOverflow`). |
-| `.BinaryOp (.shl \| .shr \| .shlUnchecked \| .shrUnchecked)` | `shiftOverflow` + `Operand` classes | Faults when shift amount $\ge$ bit width or negative (`shiftOverflow`). |
-| `.BinaryOp (.offset)` | `boundsCheck`, `ptrDerefInvalid` + `Operand` classes | `inbounds` pointer offset arithmetic (`evalPtrOffset`). |
-| `.UnaryOp .neg` | `arithOverflow` + `Operand` classes | Signed negation of `Int.min` faults (`arithOverflow`). |
-| `.UnaryOp (.not \| .ptrMetadata)` | `Operand` classes | Bitwise complement / metadata extraction; only operand evaluation can fault. |
-| `.NullaryOp .ubChecks` / `.discriminant p` / `.len p` / `.ref _ _ p` / `.addressOf _ p` / `.copyForDeref p` | Place / layout classes (`boundsCheck`, `treeBorrowsViolation`, `scalarNicheInvalid`, `uninitRead`) | Place resolution, discriminant read, or borrow creation. |
-| `.cast kind op` / `.repeat op _ _` / `.shallowInitBox op` / `.aggregate kind ops` / `.wrapUnsafeBinder op` | `boundsCheck`, `ptrDerefInvalid`, `scalarNicheInvalid` + `Operand` classes | Layout resolution, scalar niche validation, or box header validation. |
-| **Statement (`StatementKind`)** | | |
-| `.nop` / `.coverage` / `.constEvalCounter` / `.backwardIncompatibleDropHint _` | `[]` (0 classes) | Pure operational step (`MirStepNode.step s.advanceStmt`); proven never to return `.ub`. |
-| `.storageLive loc` / `.storageDead loc` | `boundsCheck`, `storageLiveProtected` | Faults iff `loc >= length s.frame.locals` (`boundsCheck`) or `hasProtectedLocalBorrow s.memory s.frame.frameId loc` holds (`storageLiveProtected`). |
-| `.assign lhs rhs` | `PlaceWrite(lhs)` $\cup$ `Rvalue(rhs)` $\cup$ `{boundsCheck, scalarNicheInvalid}` | Evaluates `rhs`, validates destination layout/niche, and writes to `lhs`. |
-| `.setDiscriminant place _ _` / `.deinit place` | `PlaceWrite(place)` $\cup$ `{boundsCheck}` | Resolves destination place and updates discriminant/initialization state. |
-| `.retag kind place` | `PlaceRead(place)` $\cup$ `PlaceWrite(place)` $\cup$ `{boundsCheck, ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation}` | Resolves pointer in `place`, validates alignment/bounds if Box/Ref, and performs Tree Borrows retag (`retagPlace`). |
-| `.placeMention place` | `PlaceRef(place)` $\cup$ `{boundsCheck}` | Evaluates place projection without reading value bytes (`evalPlaceRef`). |
-| `.intrinsic (.assume op)` | `Operand(op)` $\cup$ `{scalarNicheInvalid}` | Evaluates boolean operand and faults if false (`b = false`) or non-boolean (`scalarNicheInvalid`). |
-| `.intrinsic (.copyNonOverlapping src dst count)` | `Operand(src, dst, count)` $\cup$ `{arithOverflow, boundsCheck, ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation, uninitRead}` | Validates `count * size` overflow, alignment, non-overlap, source/dest allocation bounds, and Tree Borrows permissions. |
-| **Terminator (`TerminatorKind`)** | | |
-| `.goto target` (with `target < numBlocks`) | `[]` (0 classes) | Unconditional jump to valid basic block; proven never to return `.ub`. |
-| `.goto target` (with `target >= numBlocks`) | `boundsCheck` | Out-of-bounds target causes next step's `get? basicBlocks blockIdx` to fault. |
-| `.unwindTerminate` / `.inlineAsm` | `[]` (0 classes) | Terminates with `.panic` or `.unsupported`, never `.ub`. |
-| `.unreachable` | `unreachableTerminator` | Always returns `MirStepNode.fail .ub`. |
-| `.switchInt discr targets otherwise` | `Operand(discr)` $\cup$ `{boundsCheck, scalarNicheInvalid}` | Evaluates discriminant operand (`uninitRead`, `scalarNicheInvalid`, `boundsCheck`) and branches. |
-| `.return_` | `treeBorrowsViolation`, `uninitRead`, `callAbiMismatch` | Reads `_0` (`uninitRead`), checks non-diverging caller ABI (`callAbiMismatch`), and writes `caller.destination` (`treeBorrowsViolation`). |
-| `.drop place target` / `.assert cond expected target` | Place / Operand classes $\cup$ `{boundsCheck, treeBorrowsViolation, scalarNicheInvalid}` | Validates place/condition before branching or panicking. |
-| `.call func args dest target` / `.tailCall func args` | `Operand(func, args)` $\cup$ `PlaceWrite(dest)` $\cup$ `{boundsCheck, ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation, scalarNicheInvalid, uninitRead, storageLiveProtected, callAbiMismatch}` | Evaluates callee and argument operands, validates ABI/signature/intrinsic preconditions (`callAbiMismatch`), and writes destination place. |
+| `.copy p` / `.move p` operand | place read | `evalOperand` reads the place. |
+| `.constant c` | `[]`, or `boundsCheck, scalarNicheInvalid, uninitRead` for `.indirect` | `evalOperand_constant_non_indirect_ne_ub`; `.indirect` decodes global bytes. |
+| `Use op` / `WrapUnsafeBinder op` | operand + `scalarNicheInvalid` for `copy`/`move` | `validateLoadedValue` rejects invalid `bool` scalars (**class gap fixed in `[adv B1]`**). |
+| `BinaryOp op l r` | operands + `censusBinOpFaultClasses op` | `censusBinOpFaultClasses_exact`; `.offset` → `arithOverflow, boundsCheck, ptrDerefInvalid, treeBorrowsViolation` (`evalPtrOffsetBinOp` faults on a disabled tag — **`treeBorrowsViolation` added in `[adv B1]`**). |
+| `UnaryOp .neg` / `.not` / `.ptrMetadata` | operand + `[]` / `scalarNicheInvalid` / `ptrDerefInvalid` | `.neg` wraps; `evalUnaryNot` faults on invalid `bool`; width mismatch for metadata. |
+| `Cast .intToInt` / `.pointerExposeProvenance` / `.pointerWithExposedProvenance` | operand only | no `.ub` edge beyond the operand. |
+| `Cast .floatToInt` / `.floatToFloat` / `.intToFloat` | `[]` | no `evalRvalue` arm (`.unsupported`, operand never read). |
+| `Cast .transmute` / `.subtype` | operand + `scalarNicheInvalid, uninitRead` | `evalByteCast`. |
+| `Cast .ptrToPtr` / `.pointerCoercion` / `.fnPtrToPtr` | operand + `boundsCheck, ptrDerefInvalid, ptrAlignMismatch, scalarNicheInvalid` | pointer re-typing / reification (kept conservative). |
+| `Ref`/`RawPtr p` | `[uninitRead]` unless `p` starts with `.deref`; else `uninitRead, ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation` + projection classes | `evalRvalue_borrow_nonDeref_ub_iff`. |
+| `Repeat op _` / `Aggregate _ ops` | operands only | no `.ub` beyond operand evaluation. |
+| `NullaryOp _` / `ThreadLocalRef _` / `ShallowInitBox _ _` | `[]` | no `evalRvalue` arm (`.unsupported`). |
+| `Len p` / `Discriminant p` / `CopyForDeref p` | place read + `boundsCheck` / + `scalarNicheInvalid` / place read | `evalPlaceLen` / `evalPlaceDiscriminant` / plain read. |
+| `.nop`, `.coverage`, `.constEvalCounter`, `.backwardIncompatibleDropHint` | `[]` | `evalStmt_pure_constructs_ne_ub`. |
+| `.storageLive l` / `.storageDead l` | `storageLiveProtected` | `evalStmt_storageLive_ub_iff` / `evalStmt_storageDead_ub_iff`. |
+| `.assign dst rv` | place write(dst) + rvalue classes | `evalRvalue` then the destination write. |
+| `.retag _ p` | place read + `boundsCheck, ptrDerefInvalid, treeBorrowsViolation` | retag checks pointer shape, permissions, mutability, bounds — never alignment (**`ptrAlignMismatch` removed in `[adv B1]`**). |
+| `.placeMention p` / `.deinit p` | `uninitRead` + projection classes | dead/missing root, uninitialized index operands, projected read. |
+| `.setDiscriminant p _` | `scalarNicheInvalid, uninitRead` (unprojected) or read + write + `scalarNicheInvalid` | non-aggregate / uninitialized / dead targets. |
+| `.intrinsic (.assume op)` | operand + `scalarNicheInvalid` | violated assumption or non-scalar condition. |
+| `.intrinsic (.copyNonOverlapping ..)` | operands + `arithOverflow, boundsCheck, ptrDerefInvalid, ptrAlignMismatch, treeBorrowsViolation, scalarNicheInvalid, uninitRead` | `evalCopyNonOverlapping` (kept conservative). |
+| `.goto t` | `[]` in bounds, `boundsCheck` out of bounds | `evalTerminator_pure_constructs_ne_ub`, `stepMirFn_after_goto_oob_ub`. |
+| `.unwindTerminate` / `.inlineAsm` | `[]` | abort / `.unsupported`. |
+| `.unreachable` | `unreachableTerminator` | `evalTerminator_unreachable_ub`. |
+| `.unwindResume` | `callAbiMismatch` | `unwindFromCallStack` faults through a `returnUnwind = .unreachable` caller. |
+| `.return_` | `treeBorrowsViolation, uninitRead, callAbiMismatch` | `evalTerminator_return_root_ub_iff`, `evalTerminator_return_inline_ub_iff`. |
+| `.switchInt d _` | operand + `scalarNicheInvalid` (+ `boundsCheck` if a target is out of bounds) | non-scalar discriminant. |
+| `.drop p _ _` | place read (+ `boundsCheck` for out-of-bounds targets) | dead/missing/uninitialized place. |
+| `.assert c _ _ u` | operand + `scalarNicheInvalid` + (`unreachableTerminator` for `u = .unreachable`, `callAbiMismatch` for `.continue_`, nothing for `.cleanup`/`.terminate`) | `applyUnwindAction` (**speculative arithmetic/bounds labels removed in `[adv B1]`**; the trusted AST carries no `AssertKind`). |
+| `.call f args dst _ u` | operands + place write(dst) + `callAbiMismatch` + callee classes (`censusCalleeDefPathFaultClasses`, or `ptrDerefInvalid` for indirect callees) + `unreachableTerminator` for `u = .unreachable` | `resolveCallTarget`, argument evaluation, `checkCalleeTargetCompatible`, intrinsic dispatch, and the external-call continuations covered by `stepMirFn_extCall_cont_fault_in_census`. |
+| `.tailCall f args` | operands + `callAbiMismatch` (+ `ptrDerefInvalid` for indirect callees) | `evalTailCallTerminator`. |
+
+Callee classes follow `classifyRustIntrinsic?` exactly: only `core::intrinsics::*` paths are intrinsics (`std::intrinsics::*` paths are ordinary callees — **Rust parity bug fixed in `[adv B1]`**).
 
 ---
 
 ## 4. False-Proof Mutation Probe Results
 
-All four false-proof mutation probes required by the design specification (plus the `PropertyRegistry` un-emitted class probe) are implemented in both Lean 4 (`by decide` compile-time kernel witnesses) and Rust (`FaultMutationProbe::run_all_false_proof_probes()`):
+`[adv B1]` replaced the `[adv A0]` probe harness, which reconciled the census against *itself minus a hard-coded subset* (pure set difference), with an **independent mock obligation emitter** (`mock_emit_obligations`): it explores the CFG from `bb0`, identifies loop latches, and injects one realistic emitter bug per probe. The baseline emitter must reconcile `Verified` against the independent census, and each mutant must be rejected at exactly the sites pinned by the Lean `by decide` witnesses. Each stripped site also has a Lean liveness certificate (a concrete state where `stepMirFn` faults there).
 
-| Probe | Simulated `obligations.rs` Bug | Baseline Verdict | Mutant Verdict | Missing Fault Sites Pinpointed |
-| :--- | :--- | :--- | :--- | :--- |
-| **`CallArgBlindProbe`** | Obligation emitter ignores `TerminatorKind::Call` argument / ABI preconditions at `(bb=0, stmt=1)`. | `Verified` | `UnknownUnmappedFaultSite` | `(0, 1, bounds_check)`, `(0, 1, ptr_deref_invalid)`, `(0, 1, ptr_align_mismatch)`, `(0, 1, tree_borrows_violation)`, `(0, 1, scalar_niche_invalid)`, `(0, 1, uninit_read)`, `(0, 1, storage_live_protected)`, `(0, 1, call_abi_mismatch)` |
-| **`SwitchBreakStripProbe`** | Emitter strips the `otherwise` arm of a `SwitchInt` terminator, omitting `bb2` (which contains an unchecked addition at `(bb=2, stmt=0)`). | `Verified` | `UnknownUnmappedFaultSite` | `(2, 0, arith_overflow)`, `(2, 0, bounds_check)`, `(2, 0, scalar_niche_invalid)`, `(2, 0, uninit_read)` |
-| **`LoopUpdateOverflowProbe`** | Emitter verifies loop header (`bb1`) and body (`bb2`) but drops the back-edge latch increment overflow check at `(bb=3, stmt=0)`. | `Verified` | `UnknownUnmappedFaultSite` | `(3, 0, arith_overflow)` |
-| **`DerefAliasProbe`** | Emitter discharges local bounds and initialization at a `*ptr` deref assignment + `.retag` (`bb=0, stmt=0..1`) but omits pointer validity, alignment, and Tree Borrows permissions. | `Verified` | `UnknownUnmappedFaultSite` | `(0, 0, ptr_deref_invalid)`, `(0, 0, ptr_align_mismatch)`, `(0, 0, tree_borrows_violation)`, `(0, 1, ptr_deref_invalid)`, `(0, 1, ptr_align_mismatch)`, `(0, 1, tree_borrows_violation)` |
-| **`PropertyRegistryUnemittedProbe`** | Emitter claims all sites are discharged, but `PropertyRegistry` marks `tree_borrows_violation` as `UnemittedGap` (or `UnsupportedFailClosed`). | `Verified` (under full registry) | `UnknownUnmappedFaultSite` | Pinpoints `unemitted_classes: [TreeBorrowsViolation]` and all sites requiring `tree_borrows_violation`. |
-
----
-
-## 5. Edge Cases, Lexer Traps & Semantic Subtleties Resolved
-
-1. **Out-of-Bounds `ValidMirPc` vs. `stepMirFn` Block Lookup**:
-   - In `Trusted.MirSemantics.stepMirFn`, if `get? activeBody.basicBlocks s.frame.blockIdx = none` or `s.frame.stmtIdx > length bb.statements`, `stepMirFn` returns `MirStepNode.fail .ub`.
-   - Because an out-of-bounds PC does not correspond to any syntactic block in `activeBody.basicBlocks`, `stepMirFn_fault_in_census` requires `ValidMirPc activeBody s.frame` (`∃ bb, get? activeBody.basicBlocks s.frame.blockIdx = some bb ∧ s.frame.stmtIdx ≤ length bb.statements`), paired with `validMirPc_initMachineState` and `stepMirFn_preserves_validMirPc` (plus static `.goto target` / `.switchInt` / `.drop` / `.assert` / `.call` target-bounds checking in `censusTerminatorFaultClasses`).
-2. **`.return_` Subtle UB Edges in `Trusted.MirSemantics.evalTerminator`**:
-   - Unlike a naive model where `return` is pure, `Trusted.MirSemantics.evalTerminator` on `.return_` reads `_0` (`get? s.frame.locals 0`, faulting with `.ub` if `_0` is uninitialized or missing) and, when `s.memory.callStack` is non-empty, faults with `.ub` if `caller.isDiverging = true` or if writing the return value to `caller.destination` fails (`writePlaceValue`, which can trigger `treeBorrowsViolation` when `caller.destination` has a `.deref` projection). Our census accurately emits `[.treeBorrowsViolation, .uninitRead, .callAbiMismatch]` for `.return_`.
-3. **`.constant` Immediate vs. `.indirect` Global Allocation Reads**:
-   - `ConstOperandKind.zeroSized`, `.scalar`, `.slice`, and `.unevaluated` evaluate purely in `evalConstOperand`, whereas `.indirect allocId offset` calls `readGlobalAllocBytes` and can fault with `.ub` if `allocId` is missing, out of bounds, or contains uninitialized bytes. Our census inspects `c.kind` so immediate constants emit `[]` while `.indirect` constants emit `[.boundsCheck, .scalarNicheInvalid, .uninitRead]`.
-4. **Fail-Closed `.lean` Lexer & Recursive-Descent Parser (`census_lean_mir_module`)**:
-   - `census_lean_mir_module` uses a full Lean 4 lexical scanner that strips `--` line comments and arbitrarily nested `/- ... -/` block comments, skips string literals (`"..."`), raw string literals (`r#"..."#`), and interpolated string literals (`s!"..."`), and unwraps `«...»` guillemet identifiers.
-   - Any unrecognized statement/terminator/rvalue/projection constructor, missing `basicBlocks` field, or non-inline helper reference fails closed with `CensusScanError` $\rightarrow$ `CoverageVerdict::UnknownUnmappedFaultSite` rather than silently omitting fault sites.
+| Probe | Emitter bug | Baseline | Mutant | Missing sites (Rust = Lean) | Lean liveness certificate |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `CallArgBlindProbe` | call arguments treated as opaque values (deref projections unchecked) | `VERIFIED` | `UNKNOWN(UNSUPPORTED_CONSTRUCT)` | `(0,0,ptr_deref_invalid)`, `(0,0,ptr_align_mismatch)` | `witnessCallArgBlind_call_site_live` (dangling `*_1` argument) |
+| `SwitchBreakStripProbe` | `SwitchInt` exploration drops the `otherwise` edge (`bb2` never explored) | `VERIFIED` | `UNKNOWN(..)` | all `bb2` sites: `(2,0,{arith_overflow, div_rem_by_zero, tree_borrows_violation, uninit_read, storage_live_protected})`, `(2,1,{tree_borrows_violation, uninit_read, call_abi_mismatch})` | `witnessSwitchBreakStrip_div_site_live` (`_2 = 0` faults, `_2 = 2` steps) |
+| `LoopUpdateOverflowProbe` | overflow obligations skipped in loop-latch blocks | `VERIFIED` | `UNKNOWN(..)` | `(2,0,arith_overflow)` for the latch `AddUnchecked` | `witnessLoopUpdateOverflow_latch_site_live` (`u32::MAX` faults, `7` steps; wrapping `Add` at `(2,1)` carries no `arith_overflow`) |
+| `DerefAliasProbe` | deref/alignment/aliasing obligations skipped at dereferencing statements | `VERIFIED` | `UNKNOWN(..)` | `(0,0,ptr_deref_invalid)`, `(0,0,ptr_align_mismatch)`, `(0,0,tree_borrows_violation)` | `witnessDerefAlias_deref_site_live` (dangling `*_2`) |
+| `PropertyRegistryUnemittedProbe` | `tree_borrows_violation` marked `UnemittedGap` while `discharged = census` | `VERIFIED` (full registry) | `UNKNOWN(..)` | `(0,0,tree_borrows_violation)`, `(0,1,tree_borrows_violation)`; `unemitted_classes = [TreeBorrowsViolation]` | `witnessDerefAlias_registry_unemitted_rejected` (`by decide`) |
 
 ---
 
-## 6. Verification Receipts
+## 5. Findings, Lexer Traps & Semantic Subtleties (by round)
 
-All verification commands pass from the repository root with concurrency $W = 1$:
+### `[adv B1]` findings against `[adv A0]` (all fixed in this pass)
 
-1. **Rust Unit, Mutation Probe & Cross-Language Parity Tests**:
+1. **Class labels were never checked against the semantics.** `stepMirFn_fault_in_census` is existential in the class, so it only needs a non-empty census at the faulting PC; every `[adv A0]` "precision theorem" was an `rfl` restatement of the definition. Consequences found by reading `Trusted.MirSemantics`:
+   - *Over-approximation*: wrapping/flagged/masked binops, comparisons and bitwise ops, `Neg`, `IntToInt`/exposed-provenance casts, `NullaryOp`, `ThreadLocalRef`, `ShallowInitBox`, `Repeat`/`Aggregate`, `CopyForDeref`, non-deref borrows, `Retag` alignment, and speculative `Assert` arithmetic labels emitted classes the evaluator can never trigger.
+   - *Under-approximation (class level)*: `Use(copy p)` lacked `scalarNicheInvalid` (`validateLoadedValue`), and `BinOp.offset` lacked `treeBorrowsViolation` (disabled-tag check in `evalPtrOffsetBinOp`).
+   - Fixed definitions plus the §2.1 certificates (`censusBinOpFaultClasses_exact`, `evalScalarBinOp_ub_cause`, exact edge theorems).
+2. **External-call continuations were outside the completeness theorem.** `resumeExternalCall` / `resumeExternalDivergingCall` return `.faulted .ub` *inside* the `MirStepNode.extCall` continuation (destination write, `.unreachable` unwind, normal return of a diverging callee); `stepMirFn` never returns `.fail .ub` for these. Fixed with `StepNodeExposesUb` and the exposure theorems.
+3. **`LoopUpdateOverflowProbe` stripped a semantically dead label.** The latch used wrapping `BinOp.add`, which `evalScalarBinOp` can never overflow-fault. The witness now uses `AddUnchecked`, keeps a wrapping accumulator as a precision contrast, and every probe has a liveness certificate.
+4. **Probes were set-difference tautologies** (baseline = census) — replaced by the mock emitter (§4).
+5. **Lean scanner fail-opens** (each has a regression test in `test_b1_lean_scanner_fail_open_regressions`):
+   - constructor heads matched only on the last segment, so `Evil.goto 0` / bare `goto 0` (arbitrary user definitions) were read as `TerminatorKind.goto` — now `check_ctor_qualifier` requires `.ctor` or `Type.ctor` (optionally under a known `Trusted` MIR AST namespace);
+   - anything applied to the `body` record (`{..} |> mutate`, `{..}.withBlocks evil`) was ignored — now rejected;
+   - duplicate record fields silently overwrote earlier ones — now rejected;
+   - unknown string escapes were mangled (`\u0061` became `u0061`), changing callee `DefPath`s such as `core::intrinsics::unreachable` — escapes now follow Lean exactly (`\\ \" \' \n \r \t \xHH \uHHHH`, string gaps, `\{` in interpolations) and fail closed otherwise;
+   - only `s!`/`f!` were interpolation prefixes, so `m!"{"def body ..."}"` leaked a decoy definition into the token stream — every `<ident>!"` now lexes as an interpolated string, and comments inside interpolations fail closed;
+   - `census_lean_mir_module` now enforces a strict emitter-module grammar (`import`/`namespace`/`section`/`end`/plain `open`/`set_option`/`def name : type := term` only, exactly one `def body : CapturedMir`, no declaration or namespace reusing a MIR AST type name), so syntax extensions (`notation`, `macro_rules`), attributes, `#eval`, instances, shadowing `def TerminatorKind.goto`, hidden `def body : (CapturedMir)` bodies, and brace-carrying strings or `!`-macros inside skipped definitions (where a Lean interpolation such as `throwError "{"..."}"` could desynchronize the token stream) fail closed; the lenient `census_lean_mir_def` keeps handling arbitrary surrounding Lean (comments, raw/interpolated strings, char literals, guillemets) for the witness file.
+6. **Rust/Lean parity bugs**: `std::intrinsics::*` was classified as an intrinsic only in Rust; `RigidTy.fnDef`-typed constants with non-zero-sized values lost their callee path (now rejected).
+7. **Witness bodies were ill-formed** (`localDecls := []` while mentioning locals `_0.._2`) — all witnesses now declare their locals.
+8. **This report** previously cited nonexistent theorems (for example `validMirPc_iff`, `censusStmtFaultClasses_intrinsic_assume`, `censusStmtFaultClasses_not_all_twelve`) and a construct matrix/probe table that contradicted the code; it now reflects the implementation.
+
+### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`)
+
+- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc` keeps it invariant for top-level frames with in-bounds CFG targets.
+- `.return_` reads `_0` and, in an inline frame, writes into the *caller's* `destination`, so its classes are attributed to the callee's return site.
+- The `.ub` of an out-of-bounds `Goto` happens on the *next* step.
+
+### Known limitations (for later rounds)
+
+- Completeness remains existential in the class for constructs outside §2.1; extending class-precise attribution to operand reads, places, calls, and `copyNonOverlapping` is open.
+- `ProtoRvalue::Aggregate` does not carry its `AggregateKind`, so coroutine aggregates (never evaluated by `evalRvalue`) still contribute operand classes (safe over-approximation).
+- The strict module grammar targets `anneal-rustc-capture` output; Lean elaboration-level tricks beyond lexical/grammar checks (for example overloaded `open` resolution) are mitigated, not proven impossible.
+
+---
+
+## 6. Verification Receipts (`[adv B1]`)
+
+All commands run from the repository root with `W = 1`.
+
+1. **Primary command** — exit `0`:
    ```bash
-   cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib fault_census_proto
-   cargo test --manifest-path crates/cargo-anneal/Cargo.toml fault_census_proto
-   ```
-2. **Lean 4 Kernel Typechecking & Compile-Time `by decide` Witnesses**:
-   ```bash
+   cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib fault_census_proto && \
+   cargo test --manifest-path crates/cargo-anneal/Cargo.toml fault_census_proto && \
    (cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean ../theory/Anneal/FaultSiteCensusPrototype.lean)
    ```
-3. **Structural Proof-Health Linter (`0` Findings)**:
-   ```bash
-   python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean
-   ```
-4. **Kernel Axiom Audit**:
-   - Verified via `#print axioms` across all 84 theorems and witnesses in `theory/Anneal/FaultSiteCensusPrototype.lean`: only standard axioms (`propext`, `Quot.sound`, `Classical.choice`) are used (`0` `sorryAx`, `0` `Lean.ofReduceBool`, `77/84` declarations completely `Classical.choice`-free).
+   `12 passed, 0 failed` (library target), `0` Rust warnings, Lean `0` errors / `0` warnings (primary command `18.2 s` wall-clock).
+2. **Kernel axiom audit** — scratch copy with `#print axioms` over all `188` public declarations (`113` theorems), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree: `0` `sorryAx`, `0` `Lean.ofReduceBool`, `101/113` theorems `Classical.choice`-free.
+3. **Proof health** — `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean`: exit `0`, `0` findings.
+4. **Hygiene** — `git status --porcelain` empty after commit; `git diff --name-only a5e12e5fac628cc71522b67a1b427e17e2927818..HEAD` ⊆ {`PROTOTYPE_REPORT.md`, `crates/cargo-anneal/src/fault_census_proto.rs`, `crates/cargo-anneal/src/lib.rs`, `theory/Anneal/FaultSiteCensusPrototype.lean`}.
 
 ---
 
 ## 7. Integration Architecture for Track A (`ws-fault-site-coverage-reconciler`)
 
-To graduate this prototype into the production Track A workstream `ws-fault-site-coverage-reconciler` on `unstable`:
-
-1. **Promote `FaultSiteCensusPrototype.lean` into `theory/Anneal/FaultSiteCensus.lean`**:
-   - Import `Anneal.FaultSiteCensus` in `theory/Anneal.lean` (updating `trusted/audit/check_trusted.py`'s pinned `theory/Anneal.lean` import list in a coordinated Track A commit).
-2. **Wire `PropertyRegistry` and `census_ir_captured_mir` into `crates/cargo-anneal/src/obligations.rs` & `verify.rs`**:
-   - Tag every emitted proof obligation in `obligations.rs` with its covered `Vec<FaultSite>`.
-   - During `cargo anneal verify` / `agent-verify`, run `census_ir_captured_mir(&captured_mir)` (and cross-check `census_lean_mir_def` on the generated `Mir/<Item>.lean` artifact) against the discharged obligation `FaultSite` set using `PropertyRegistry::stage_default()`.
-   - Gate the `[VERIFIED]` badge on `CoverageVerdict::Verified`; if any site is unmapped or uses an un-emitted `MirFaultClass`, downgrade the item verdict fail-closed to `UNKNOWN(UNSUPPORTED_CONSTRUCT)` with the exact `(bbIdx, stmtIdx, faultClass)` diagnostic list.
+1. **Promote the Lean module** to `theory/Anneal/FaultSiteCensus.lean`, importing it from `theory/Anneal.lean` in a coordinated Track A change that also updates the trusted-boundary checker's pinned import list.
+2. **Tag obligations with fault sites**: every obligation emitted by `crates/cargo-anneal/src/obligations.rs` should carry the `FaultSite`s it discharges.
+3. **Reconcile at verification time**: run `census_ir_captured_mir` on the captured MIR and `census_lean_mir_module` on the generated `Mir/<Item>.lean`, require both censuses to agree, and reconcile against the discharged sites with a stage-aware registry (`PropertyRegistry::realistic_safe_subset_registry()` as the starting point).
+4. **Gate `VERIFIED`** on `CoverageVerdict::Verified`; otherwise downgrade fail-closed to `UNKNOWN(UNSUPPORTED_CONSTRUCT)` with the exact `(bb, stmt, class)` list.
+5. **Keep the Lean side authoritative**: Track A should extend §2.1 (class-precise attribution) before relying on per-class discharge for constructs outside it.

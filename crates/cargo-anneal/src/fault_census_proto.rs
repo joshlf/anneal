@@ -31,8 +31,8 @@ use std::fmt;
 use anneal_rustc_capture::lean_emit::{
     IrAggregateKind, IrBasicBlockData, IrBinOp, IrBorrowKind, IrCapturedMir, IrCastKind,
     IrConstOperand, IrConstScalar, IrConstValue, IrMutability, IrNonDivergingIntrinsic, IrNullOp,
-    IrOperand, IrPlace, IrProjectionElem, IrRvalue, IrStatement, IrStatementKind,
-    IrSwitchTargets, IrTerminator, IrTerminatorKind, IrUnOp, IrUnwindAction,
+    IrOperand, IrPlace, IrProjectionElem, IrRvalue, IrStatement, IrStatementKind, IrSwitchTargets,
+    IrTerminator, IrTerminatorKind, IrUnOp, IrUnwindAction,
 };
 
 // ============================================================================
@@ -172,7 +172,9 @@ impl MirFaultClass {
             .trim_start_matches("Anneal.FaultSiteCensusPrototype.")
             .trim_start_matches("MirFaultClass.")
             .trim_start_matches('.');
-        Self::ALL.into_iter().find(|c| c.lean_ctor_name() == trimmed)
+        Self::ALL
+            .into_iter()
+            .find(|c| c.lean_ctor_name() == trimmed)
     }
 }
 
@@ -306,7 +308,10 @@ impl PropertyRegistry {
     /// indirect call ABI classes are marked `UnemittedGap` or `UnsupportedFailClosed`.
     pub fn realistic_safe_subset_registry() -> Self {
         Self::all_verified()
-            .with_status(MirFaultClass::TreeBorrowsViolation, PropertyStatus::UnemittedGap)
+            .with_status(
+                MirFaultClass::TreeBorrowsViolation,
+                PropertyStatus::UnemittedGap,
+            )
             .with_status(
                 MirFaultClass::CallAbiMismatch,
                 PropertyStatus::UnsupportedFailClosed,
@@ -357,18 +362,34 @@ impl PropertyRegistry {
 
 const fn default_class_description(cls: MirFaultClass) -> &'static str {
     match cls {
-        MirFaultClass::ArithOverflow => "Checked/unchecked integer arithmetic and negation overflow",
+        MirFaultClass::ArithOverflow => {
+            "Checked/unchecked integer arithmetic and negation overflow"
+        }
         MirFaultClass::DivRemByZero => "Integer division/remainder by zero and signed MIN / -1",
         MirFaultClass::ShiftOverflow => "Bit shift distance >= bit_width or < 0",
         MirFaultClass::BoundsCheck => "Array/slice indexing, pointer offset, and CFG target bounds",
-        MirFaultClass::PtrDerefInvalid => "Pointer dereference liveness, bounds, and provenance validity",
-        MirFaultClass::PtrAlignMismatch => "Pointer dereference and copy_nonoverlapping byte alignment",
-        MirFaultClass::TreeBorrowsViolation => "Tree Borrows permission and active protector conflicts",
-        MirFaultClass::ScalarNicheInvalid => "Scalar validity range, enum discriminant, transmute, and assume",
+        MirFaultClass::PtrDerefInvalid => {
+            "Pointer dereference liveness, bounds, and provenance validity"
+        }
+        MirFaultClass::PtrAlignMismatch => {
+            "Pointer dereference and copy_nonoverlapping byte alignment"
+        }
+        MirFaultClass::TreeBorrowsViolation => {
+            "Tree Borrows permission and active protector conflicts"
+        }
+        MirFaultClass::ScalarNicheInvalid => {
+            "Scalar validity range, enum discriminant, transmute, and assume"
+        }
         MirFaultClass::UninitRead => "Initialized local slot and memory byte reads",
-        MirFaultClass::StorageLiveProtected => "Local slot liveness and StorageLive/StorageDead protector checks",
-        MirFaultClass::CallAbiMismatch => "Function call signature/ABI compatibility and unwind ABI checks",
-        MirFaultClass::UnreachableTerminator => "Unreachable terminator and unreachable_unchecked non-reachability",
+        MirFaultClass::StorageLiveProtected => {
+            "Local slot liveness and StorageLive/StorageDead protector checks"
+        }
+        MirFaultClass::CallAbiMismatch => {
+            "Function call signature/ABI compatibility and unwind ABI checks"
+        }
+        MirFaultClass::UnreachableTerminator => {
+            "Unreachable terminator and unreachable_unchecked non-reachability"
+        }
     }
 }
 
@@ -423,11 +444,25 @@ impl ProtoPlace {
 /// Prototype constant value mirroring `Trusted.MirAst.ConstValue`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtoConstValue {
-    ZeroSized { fn_def_path: Option<String> },
-    ScalarInt { bits: u128, size_bytes: u64 },
-    ScalarPtr { alloc_id: u64, offset_bytes: u64, size: u64 },
-    Slice { meta: u64 },
-    Indirect { alloc_id: u64, offset_bytes: u64 },
+    ZeroSized {
+        fn_def_path: Option<String>,
+    },
+    ScalarInt {
+        bits: u128,
+        size_bytes: u64,
+    },
+    ScalarPtr {
+        alloc_id: u64,
+        offset_bytes: u64,
+        size: u64,
+    },
+    Slice {
+        meta: u64,
+    },
+    Indirect {
+        alloc_id: u64,
+        offset_bytes: u64,
+    },
     Unevaluated(String),
 }
 
@@ -735,7 +770,14 @@ pub fn census_place_write_fault_classes(place: &ProtoPlace) -> Vec<MirFaultClass
 }
 
 /// Fault classes triggered when borrowing `place` (`censusPlaceRefFaultClasses`).
+///
+/// `[adv B1]`: only places whose projection starts with `Deref` inspect pointer
+/// provenance, permissions, and bounds; every other borrow can only fault on a
+/// missing/dead root local or an uninitialized `Index` local (`[UninitRead]`).
 pub fn census_place_ref_fault_classes(place: &ProtoPlace) -> Vec<MirFaultClass> {
+    if !matches!(place.projection.first(), Some(ProtoProjectionElem::Deref)) {
+        return vec![MirFaultClass::UninitRead];
+    }
     let mut out = vec![
         MirFaultClass::UninitRead,
         MirFaultClass::PtrDerefInvalid,
@@ -770,30 +812,48 @@ pub fn census_operand_fault_classes(op: &ProtoOperand) -> Vec<MirFaultClass> {
     }
 }
 
+/// Fault classes triggered by an operand whose loaded value is re-validated by
+/// `validateLoadedValue` (`censusLoadedOperandFaultClasses`): `Copy`/`Move` of a
+/// `bool` place holding a scalar other than `0`/`1` is `.ub`.
+pub fn census_loaded_operand_fault_classes(op: &ProtoOperand) -> Vec<MirFaultClass> {
+    match op {
+        ProtoOperand::Copy(place) | ProtoOperand::Move(place) => {
+            let mut out = census_place_read_fault_classes(place);
+            out.push(MirFaultClass::ScalarNicheInvalid);
+            out
+        }
+        ProtoOperand::Constant(cv) => census_const_value_fault_classes(cv),
+    }
+}
+
 /// Fault classes triggered by a `ProtoBinOp` (`censusBinOpFaultClasses`).
 pub fn census_bin_op_fault_classes(op: ProtoBinOp) -> Vec<MirFaultClass> {
+    // `[adv B1]` precision (kernel-checked in Lean by `censusBinOpFaultClasses_exact`):
+    // wrapping, overflow-flagged, masked-shift, bitwise, and comparison operators
+    // never make `evalScalarBinOp` return `.ub`.
     match op {
-        ProtoBinOp::Add
-        | ProtoBinOp::Sub
-        | ProtoBinOp::Mul
-        | ProtoBinOp::AddUnchecked
-        | ProtoBinOp::SubUnchecked
-        | ProtoBinOp::MulUnchecked
-        | ProtoBinOp::AddWithOverflow
-        | ProtoBinOp::SubWithOverflow
-        | ProtoBinOp::MulWithOverflow => vec![MirFaultClass::ArithOverflow],
+        ProtoBinOp::AddUnchecked | ProtoBinOp::SubUnchecked | ProtoBinOp::MulUnchecked => {
+            vec![MirFaultClass::ArithOverflow]
+        }
         ProtoBinOp::Div | ProtoBinOp::Rem => {
             vec![MirFaultClass::ArithOverflow, MirFaultClass::DivRemByZero]
         }
-        ProtoBinOp::Shl | ProtoBinOp::Shr | ProtoBinOp::ShlUnchecked | ProtoBinOp::ShrUnchecked => {
-            vec![MirFaultClass::ShiftOverflow]
-        }
+        ProtoBinOp::ShlUnchecked | ProtoBinOp::ShrUnchecked => vec![MirFaultClass::ShiftOverflow],
         ProtoBinOp::Offset => vec![
             MirFaultClass::ArithOverflow,
             MirFaultClass::BoundsCheck,
             MirFaultClass::PtrDerefInvalid,
+            MirFaultClass::TreeBorrowsViolation,
         ],
-        ProtoBinOp::BitXor
+        ProtoBinOp::Add
+        | ProtoBinOp::Sub
+        | ProtoBinOp::Mul
+        | ProtoBinOp::AddWithOverflow
+        | ProtoBinOp::SubWithOverflow
+        | ProtoBinOp::MulWithOverflow
+        | ProtoBinOp::Shl
+        | ProtoBinOp::Shr
+        | ProtoBinOp::BitXor
         | ProtoBinOp::BitAnd
         | ProtoBinOp::BitOr
         | ProtoBinOp::Eq
@@ -802,14 +862,14 @@ pub fn census_bin_op_fault_classes(op: ProtoBinOp) -> Vec<MirFaultClass> {
         | ProtoBinOp::Ne
         | ProtoBinOp::Ge
         | ProtoBinOp::Gt
-        | ProtoBinOp::Cmp => vec![MirFaultClass::ScalarNicheInvalid],
+        | ProtoBinOp::Cmp => Vec::new(),
     }
 }
 
 /// Fault classes triggered by a `ProtoUnOp` (`censusUnOpFaultClasses`).
 pub fn census_un_op_fault_classes(op: ProtoUnOp) -> Vec<MirFaultClass> {
     match op {
-        ProtoUnOp::Neg => vec![MirFaultClass::ArithOverflow],
+        ProtoUnOp::Neg => Vec::new(),
         ProtoUnOp::Not => vec![MirFaultClass::ScalarNicheInvalid],
         ProtoUnOp::PtrMetadata => vec![MirFaultClass::PtrDerefInvalid],
     }
@@ -817,11 +877,13 @@ pub fn census_un_op_fault_classes(op: ProtoUnOp) -> Vec<MirFaultClass> {
 
 /// Fault classes triggered by a `ProtoNullOp` (`censusNullOpFaultClasses`).
 pub fn census_null_op_fault_classes(op: &ProtoNullOp) -> Vec<MirFaultClass> {
+    // `[adv B1]`: `evalRvalue` has no `NullaryOp` arm (`.unsupported`, never `.ub`).
     match op {
-        ProtoNullOp::SizeOf | ProtoNullOp::AlignOf | ProtoNullOp::OffsetOf(_) => {
-            vec![MirFaultClass::ScalarNicheInvalid]
-        }
-        ProtoNullOp::UbChecks | ProtoNullOp::ContractChecks => Vec::new(),
+        ProtoNullOp::SizeOf
+        | ProtoNullOp::AlignOf
+        | ProtoNullOp::OffsetOf(_)
+        | ProtoNullOp::UbChecks
+        | ProtoNullOp::ContractChecks => Vec::new(),
     }
 }
 
@@ -831,42 +893,49 @@ pub fn census_cast_kind_fault_classes(kind: &ProtoCastKind) -> Vec<MirFaultClass
         ProtoCastKind::IntToInt
         | ProtoCastKind::FloatToInt
         | ProtoCastKind::FloatToFloat
-        | ProtoCastKind::IntToFloat => vec![MirFaultClass::ScalarNicheInvalid],
+        | ProtoCastKind::IntToFloat
+        | ProtoCastKind::PointerExposeProvenance
+        | ProtoCastKind::PointerWithExposedProvenance => Vec::new(),
         ProtoCastKind::Transmute | ProtoCastKind::Subtype => {
             vec![MirFaultClass::ScalarNicheInvalid, MirFaultClass::UninitRead]
         }
-        ProtoCastKind::PointerExposeProvenance
-        | ProtoCastKind::PointerWithExposedProvenance
-        | ProtoCastKind::PointerCoercion(_)
-        | ProtoCastKind::PtrToPtr
-        | ProtoCastKind::FnPtrToPtr => vec![
-            MirFaultClass::BoundsCheck,
-            MirFaultClass::PtrDerefInvalid,
-            MirFaultClass::PtrAlignMismatch,
-            MirFaultClass::ScalarNicheInvalid,
-        ],
+        ProtoCastKind::PointerCoercion(_) | ProtoCastKind::PtrToPtr | ProtoCastKind::FnPtrToPtr => {
+            vec![
+                MirFaultClass::BoundsCheck,
+                MirFaultClass::PtrDerefInvalid,
+                MirFaultClass::PtrAlignMismatch,
+                MirFaultClass::ScalarNicheInvalid,
+            ]
+        }
     }
+}
+
+/// True for the cast kinds that `evalRvalue` never evaluates (`castKindUnevaluated`).
+pub const fn cast_kind_unevaluated(kind: &ProtoCastKind) -> bool {
+    matches!(
+        kind,
+        ProtoCastKind::FloatToInt | ProtoCastKind::FloatToFloat | ProtoCastKind::IntToFloat
+    )
 }
 
 /// Fault classes triggered by evaluating a `ProtoRvalue` (`censusRvalueFaultClasses`).
 pub fn census_rvalue_fault_classes(rv: &ProtoRvalue) -> Vec<MirFaultClass> {
     match rv {
-        ProtoRvalue::Use(op) => census_operand_fault_classes(op),
-        ProtoRvalue::Repeat(op, _) => {
-            let mut out = census_operand_fault_classes(op);
-            out.push(MirFaultClass::ScalarNicheInvalid);
-            out
-        }
+        ProtoRvalue::Use(op) => census_loaded_operand_fault_classes(op),
+        ProtoRvalue::Repeat(op, _) => census_operand_fault_classes(op),
         ProtoRvalue::Ref { place, .. } | ProtoRvalue::RawPtr { place, .. } => {
             census_place_ref_fault_classes(place)
         }
-        ProtoRvalue::ThreadLocalRef(_) => vec![MirFaultClass::PtrDerefInvalid],
+        ProtoRvalue::ThreadLocalRef(_) => Vec::new(),
         ProtoRvalue::Len(place) => {
             let mut out = census_place_read_fault_classes(place);
             out.push(MirFaultClass::BoundsCheck);
             out
         }
         ProtoRvalue::Cast(kind, op) => {
+            if cast_kind_unevaluated(kind) {
+                return Vec::new();
+            }
             let mut out = census_operand_fault_classes(op);
             out.extend(census_cast_kind_fault_classes(kind));
             out
@@ -893,25 +962,11 @@ pub fn census_rvalue_fault_classes(rv: &ProtoRvalue) -> Vec<MirFaultClass> {
             for op in ops {
                 out.extend(census_operand_fault_classes(op));
             }
-            out.push(MirFaultClass::ScalarNicheInvalid);
             out
         }
-        ProtoRvalue::ShallowInitBox(op) => {
-            let mut out = census_operand_fault_classes(op);
-            out.push(MirFaultClass::PtrDerefInvalid);
-            out.push(MirFaultClass::PtrAlignMismatch);
-            out
-        }
-        ProtoRvalue::CopyForDeref(place) => {
-            let mut out = census_place_read_fault_classes(place);
-            out.push(MirFaultClass::PtrDerefInvalid);
-            out
-        }
-        ProtoRvalue::WrapUnsafeBinder(op) => {
-            let mut out = census_operand_fault_classes(op);
-            out.push(MirFaultClass::ScalarNicheInvalid);
-            out
-        }
+        ProtoRvalue::ShallowInitBox(_) => Vec::new(),
+        ProtoRvalue::CopyForDeref(place) => census_place_read_fault_classes(place),
+        ProtoRvalue::WrapUnsafeBinder(op) => census_loaded_operand_fault_classes(op),
     }
 }
 
@@ -964,7 +1019,6 @@ pub fn census_stmt_fault_classes(kind: &ProtoStatementKind) -> Vec<MirFaultClass
             v.extend([
                 MirFaultClass::BoundsCheck,
                 MirFaultClass::PtrDerefInvalid,
-                MirFaultClass::PtrAlignMismatch,
                 MirFaultClass::TreeBorrowsViolation,
             ]);
             v
@@ -1059,9 +1113,10 @@ pub fn census_callee_def_path_fault_classes(def_path: &str) -> Vec<MirFaultClass
     ) {
         return vec![MirFaultClass::ArithOverflow, MirFaultClass::DivRemByZero];
     }
-    let intrinsic_suffix = def_path
-        .strip_prefix("core::intrinsics::")
-        .or_else(|| def_path.strip_prefix("std::intrinsics::"));
+    // `[adv B1]` parity fix: `Trusted.MirSemantics.classifyRustIntrinsic?` only
+    // recognizes `core::intrinsics::*`; `std::intrinsics::*` paths are ordinary
+    // (external/inline) callees and contribute no intrinsic fault classes.
+    let intrinsic_suffix = def_path.strip_prefix("core::intrinsics::");
     match intrinsic_suffix {
         Some("arith_offset") => vec![
             MirFaultClass::ArithOverflow,
@@ -1128,15 +1183,13 @@ pub fn census_terminator_fault_classes(
         ProtoTerminatorKind::Assert { cond, unwind, .. } => {
             let mut v = census_operand_fault_classes(cond);
             v.push(MirFaultClass::ScalarNicheInvalid);
+            // `[adv B1]`: only `Unreachable` (immediate `.ub`) and `Continue`
+            // (propagation through a caller with `returnUnwind = .unreachable`)
+            // unwind edges can fault; `Cleanup`/`Terminate` never do.
             match unwind {
-                ProtoUnwindAction::Unreachable => v.extend([
-                    MirFaultClass::ArithOverflow,
-                    MirFaultClass::DivRemByZero,
-                    MirFaultClass::ShiftOverflow,
-                    MirFaultClass::BoundsCheck,
-                    MirFaultClass::UnreachableTerminator,
-                ]),
-                _ => v.push(MirFaultClass::CallAbiMismatch),
+                ProtoUnwindAction::Unreachable => v.push(MirFaultClass::UnreachableTerminator),
+                ProtoUnwindAction::Continue => v.push(MirFaultClass::CallAbiMismatch),
+                ProtoUnwindAction::Cleanup(_) | ProtoUnwindAction::Terminate => {}
             }
             v.extend(target_oob);
             v
@@ -1457,15 +1510,19 @@ fn convert_ir_unwind(ua: IrUnwindAction) -> ProtoUnwindAction {
 fn convert_ir_terminator(term: &IrTerminator) -> ProtoTerminator {
     let kind = match &term.kind {
         IrTerminatorKind::Goto(bb) => ProtoTerminatorKind::Goto(*bb),
-        IrTerminatorKind::SwitchInt(op, IrSwitchTargets { branches, otherwise }) => {
-            ProtoTerminatorKind::SwitchInt(
-                convert_ir_operand(op),
-                ProtoSwitchTargets {
-                    branches: branches.clone(),
-                    otherwise: *otherwise,
-                },
-            )
-        }
+        IrTerminatorKind::SwitchInt(
+            op,
+            IrSwitchTargets {
+                branches,
+                otherwise,
+            },
+        ) => ProtoTerminatorKind::SwitchInt(
+            convert_ir_operand(op),
+            ProtoSwitchTargets {
+                branches: branches.clone(),
+                otherwise: *otherwise,
+            },
+        ),
         IrTerminatorKind::UnwindResume => ProtoTerminatorKind::UnwindResume,
         IrTerminatorKind::UnwindTerminate => ProtoTerminatorKind::UnwindTerminate,
         IrTerminatorKind::Return => ProtoTerminatorKind::Return,
@@ -1826,6 +1883,15 @@ fn tokenize_lean_source(src: &str) -> Result<Vec<LeanToken>, CensusScanError> {
         // Identifier (possibly dotted with segments and `«...»`)
         if ch.is_alphabetic() || ch == '_' {
             let (ident, next_i) = lex_dotted_ident(&chars, i)?;
+            // `[adv B1]`: every `<ident>!"..."` (`s!`, `m!`, `f!`, user `foo!` macros) is
+            // an interpolated string in Lean; lexing it as a plain string would let a
+            // `{"..."}` interpolation leak string contents into the token stream.
+            if ident.ends_with('!') && next_i < n && chars[next_i] == '"' {
+                let (content, after) = lex_interpolated_string(&chars, next_i + 1)?;
+                tokens.push(LeanToken::StrLit(content));
+                i = after;
+                continue;
+            }
             tokens.push(LeanToken::Ident(ident));
             i = next_i;
             continue;
@@ -1900,6 +1966,67 @@ fn lex_dotted_ident(chars: &[char], start: usize) -> Result<(String, usize), Cen
     Ok((out, i))
 }
 
+/// Decode one Lean 4 string escape starting right after the backslash at
+/// `chars[i]` (`Lean.Parser.quotedCharCoreFn`): `\\`, `\"`, `\'`, `\n`, `\r`,
+/// `\t`, `\xHH` (exactly 2 hex digits), `\uHHHH` (exactly 4 hex digits), a
+/// string gap (`\` + newline + skipped whitespace), and `\{` inside interpolated
+/// strings only. Any other escape fails closed (`[adv B1]`): silently mangling an
+/// unknown escape could change a callee `DefPath` (for example
+/// `"core::intrinsics::unreach\u0061ble"`) and hide its fault classes.
+fn lex_string_escape(
+    chars: &[char],
+    i: usize,
+    out: &mut String,
+    interpolated: bool,
+) -> Result<usize, CensusScanError> {
+    let n = chars.len();
+    let bad = |what: &str| {
+        CensusScanError::MalformedCapturedMirSyntax(format!("invalid Lean string escape {what}"))
+    };
+    if i >= n {
+        return Err(CensusScanError::UnterminatedStringLiteral);
+    }
+    let hex_digits = |start: usize, count: usize| -> Result<u32, CensusScanError> {
+        if start + count > n
+            || !chars[start..start + count]
+                .iter()
+                .all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(bad("(expected hex digits)"));
+        }
+        let hex: String = chars[start..start + count].iter().collect();
+        u32::from_str_radix(&hex, 16).map_err(|_| bad("(hex overflow)"))
+    };
+    match chars[i] {
+        '\\' => out.push('\\'),
+        '"' => out.push('"'),
+        '\'' => out.push('\''),
+        'n' => out.push('\n'),
+        'r' => out.push('\r'),
+        't' => out.push('\t'),
+        'x' => {
+            let code = hex_digits(i + 1, 2)?;
+            out.push(char::from_u32(code).ok_or_else(|| bad("(invalid \\x code point)"))?);
+            return Ok(i + 3);
+        }
+        'u' => {
+            let code = hex_digits(i + 1, 4)?;
+            out.push(char::from_u32(code).ok_or_else(|| bad("(invalid \\u code point)"))?);
+            return Ok(i + 5);
+        }
+        '\n' => {
+            let mut j = i + 1;
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            return Ok(j);
+        }
+        '{' if interpolated => out.push('{'),
+        other => return Err(bad(&format!("`\\{other}`"))),
+    }
+    Ok(i + 1)
+}
+
 fn lex_standard_string(
     chars: &[char],
     after_open_quote: usize,
@@ -1913,28 +2040,7 @@ fn lex_standard_string(
             return Ok((out, i + 1));
         }
         if ch == '\\' {
-            i += 1;
-            if i >= n {
-                return Err(CensusScanError::UnterminatedStringLiteral);
-            }
-            match chars[i] {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                'x' if i + 2 < n => {
-                    let hex: String = chars[i + 1..=i + 2].iter().collect();
-                    if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                        out.push(b as char);
-                        i += 2;
-                    } else {
-                        out.push('x');
-                    }
-                }
-                other => out.push(other),
-            }
-            i += 1;
+            i = lex_string_escape(chars, i + 1, &mut out, false)?;
         } else {
             out.push(ch);
             i += 1;
@@ -1956,20 +2062,29 @@ fn lex_interpolated_string(
             return Ok((out, i + 1));
         }
         if ch == '\\' {
-            i += 1;
-            if i >= n {
-                return Err(CensusScanError::UnterminatedInterpolatedString);
-            }
-            out.push(chars[i]);
-            i += 1;
+            i = lex_string_escape(chars, i + 1, &mut out, true).map_err(|e| match e {
+                CensusScanError::UnterminatedStringLiteral => {
+                    CensusScanError::UnterminatedInterpolatedString
+                }
+                other => other,
+            })?;
             continue;
         }
         if ch == '{' {
-            // Walk nested `{ ... }` inside string interpolation, respecting nested strings/comments.
+            // Walk nested `{ ... }` inside string interpolation, respecting nested strings.
             let mut brace_depth = 1usize;
             out.push('{');
             i += 1;
             while i < n && brace_depth > 0 {
+                // `[adv B1]`: a `--` or `/-` comment inside an interpolated term would
+                // swallow the closing `}`/`"` in Lean but not here; fail closed.
+                if (chars[i] == '-' && i + 1 < n && chars[i + 1] == '-')
+                    || (chars[i] == '/' && i + 1 < n && chars[i + 1] == '-')
+                {
+                    return Err(CensusScanError::MalformedCapturedMirSyntax(
+                        "comment inside string interpolation".to_string(),
+                    ));
+                }
                 if chars[i] == '"' {
                     let (inner_s, next_i) = lex_standard_string(chars, i + 1)
                         .map_err(|_| CensusScanError::UnterminatedInterpolatedString)?;
@@ -1999,6 +2114,128 @@ fn lex_interpolated_string(
         i += 1;
     }
     Err(CensusScanError::UnterminatedInterpolatedString)
+}
+
+/// Lean namespaces under which `Trusted` MIR AST constructors may be fully qualified.
+const MIR_AST_NAMESPACES: [&str; 5] = [
+    "MirAst",
+    "Trusted.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "Trusted.Rustc.V2026_08_01.MirAst",
+    "_root_.Trusted.Rustc.V2026_06_01.MirAst",
+];
+
+/// `Trusted` MIR AST type names whose constructors or fields the scanner
+/// interprets. Strict module scanning rejects any declaration or namespace that
+/// reuses one of these names, because a local `def TerminatorKind.goto` would
+/// shadow the real constructor for every `TerminatorKind.goto` written in the module.
+const MIR_AST_TYPE_NAMES: [&str; 33] = [
+    "AggregateKind",
+    "BasicBlockData",
+    "BinOp",
+    "Bool",
+    "BorrowKind",
+    "CapturedMir",
+    "CastKind",
+    "ConstOperand",
+    "ConstScalar",
+    "ConstValue",
+    "List",
+    "LocalDecl",
+    "Mutability",
+    "Nat",
+    "NonDivergingIntrinsic",
+    "NullOp",
+    "Operand",
+    "Option",
+    "Place",
+    "ProjectionElem",
+    "ProvenancePtr",
+    "RetagKind",
+    "RigidTy",
+    "Rvalue",
+    "ScalarInt",
+    "Statement",
+    "StatementKind",
+    "SwitchTargets",
+    "Terminator",
+    "TerminatorKind",
+    "Ty",
+    "UnOp",
+    "UnwindAction",
+];
+
+/// `[adv B1]`: validate that the constructor head `full` (whose last segment is
+/// `short`) denotes constructor `short` of `type_name`: either leading-dot syntax
+/// (`.short`, resolved against the expected type) or `type_name.short`, optionally
+/// under a known `Trusted` MIR AST namespace. Bare heads (`goto 1`) and foreign
+/// qualifiers (`Evil.goto 1`) may resolve to arbitrary non-inline user definitions
+/// in Lean, so they fail closed instead of being read as the constructor.
+fn check_ctor_qualifier(full: &str, short: &str, type_name: &str) -> Result<(), CensusScanError> {
+    if full.strip_prefix('.') == Some(short) {
+        return Ok(());
+    }
+    let qualified = format!("{type_name}.{short}");
+    if full == qualified
+        || MIR_AST_NAMESPACES
+            .iter()
+            .any(|ns| full.strip_prefix(ns).and_then(|r| r.strip_prefix('.')) == Some(&qualified))
+    {
+        return Ok(());
+    }
+    Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+        "constructor head `{full}` is not a `{type_name}` constructor \
+         (expected `.{short}` or `{type_name}.{short}`)"
+    )))
+}
+
+/// True for tokens that can begin a new top-level Lean command, used to verify
+/// that nothing (such as `|> mutate` or `.withBlocks evil`) is applied to a parsed
+/// `CapturedMir` record before the next declaration.
+fn is_lean_command_start(tok: &LeanToken) -> bool {
+    match tok {
+        LeanToken::Ident(kw) => {
+            kw.starts_with('#')
+                || kw.starts_with('@')
+                || matches!(
+                    kw.as_str(),
+                    "def"
+                        | "theorem"
+                        | "lemma"
+                        | "abbrev"
+                        | "example"
+                        | "instance"
+                        | "structure"
+                        | "inductive"
+                        | "class"
+                        | "opaque"
+                        | "axiom"
+                        | "namespace"
+                        | "end"
+                        | "section"
+                        | "open"
+                        | "import"
+                        | "export"
+                        | "set_option"
+                        | "attribute"
+                        | "private"
+                        | "protected"
+                        | "noncomputable"
+                        | "partial"
+                        | "unsafe"
+                        | "mutual"
+                        | "variable"
+                        | "universe"
+                        | "macro"
+                        | "macro_rules"
+                        | "syntax"
+                        | "notation"
+                        | "elab"
+                        | "deriving"
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Recursive-descent cursor over `LeanToken`s.
@@ -2224,7 +2461,10 @@ impl<'a> TokenCursor<'a> {
 
     fn parse_bool(&mut self) -> Result<bool, CensusScanError> {
         self.with_optional_parens(|cur| {
-            let (_, short) = cur.parse_ctor_head()?;
+            let (full, short) = cur.parse_ctor_head()?;
+            if full != short {
+                check_ctor_qualifier(&full, &short, "Bool")?;
+            }
             match short.as_str() {
                 "true" => Ok(true),
                 "false" => Ok(false),
@@ -2320,6 +2560,7 @@ impl<'a> TokenCursor<'a> {
     {
         self.with_optional_parens(|cur| {
             cur.expect(&LeanToken::LBrace)?;
+            let mut seen_fields: BTreeSet<String> = BTreeSet::new();
             while !matches!(cur.peek(), Some(LeanToken::RBrace)) {
                 let field_name = match cur.next() {
                     Some(LeanToken::Ident(name)) => name.clone(),
@@ -2329,6 +2570,13 @@ impl<'a> TokenCursor<'a> {
                         )));
                     }
                 };
+                // `[adv B1]`: Lean rejects duplicate structure-instance fields; never
+                // let a later `basicBlocks := ...` silently replace an earlier one.
+                if !seen_fields.insert(field_name.clone()) {
+                    return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                        "duplicate record field `{field_name}`"
+                    )));
+                }
                 cur.expect(&LeanToken::ColonEq)?;
                 on_field(&field_name, cur)?;
                 if matches!(cur.peek(), Some(LeanToken::Comma | LeanToken::Semicolon)) {
@@ -2352,16 +2600,8 @@ impl<'a> TokenCursor<'a> {
                 "basicBlocks" => {
                     basic_blocks = Some(cur.parse_list(|c| c.parse_basic_block())?);
                 }
-                "phase"
-                | "role"
-                | "argCount"
-                | "localDecls"
-                | "fnAbi"
-                | "layouts"
-                | "allocations"
-                | "typeParamCount"
-                | "genericParams"
-                | "traitImpls" => {
+                "phase" | "role" | "argCount" | "localDecls" | "fnAbi" | "layouts"
+                | "allocations" | "typeParamCount" | "genericParams" | "traitImpls" => {
                     cur.skip_balanced_expr()?;
                 }
                 other => {
@@ -2457,6 +2697,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_statement_kind(&mut self) -> Result<ProtoStatementKind, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "StatementKind")?;
             match short.as_str() {
                 "assign" => {
                     let place = cur.parse_place()?;
@@ -2494,6 +2735,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_retag_kind(&mut self) -> Result<(), CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "RetagKind")?;
             match short.as_str() {
                 "fnEntry" | "twoPhase" | "raw" | "default" => Ok(()),
                 _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
@@ -2506,6 +2748,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_intrinsic(&mut self) -> Result<ProtoIntrinsic, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "NonDivergingIntrinsic")?;
             match short.as_str() {
                 "assume" => Ok(ProtoIntrinsic::Assume(cur.parse_operand()?)),
                 "copyNonOverlapping" => {
@@ -2547,7 +2790,9 @@ impl<'a> TokenCursor<'a> {
                 CensusScanError::MalformedCapturedMirSyntax("Place missing `local_`".to_string())
             })?,
             projection: projection.ok_or_else(|| {
-                CensusScanError::MalformedCapturedMirSyntax("Place missing `projection`".to_string())
+                CensusScanError::MalformedCapturedMirSyntax(
+                    "Place missing `projection`".to_string(),
+                )
             })?,
         })
     }
@@ -2555,6 +2800,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_projection_elem(&mut self) -> Result<ProtoProjectionElem, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "ProjectionElem")?;
             match short.as_str() {
                 "deref" => Ok(ProtoProjectionElem::Deref),
                 "field" => {
@@ -2606,6 +2852,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_operand(&mut self) -> Result<ProtoOperand, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "Operand")?;
             match short.as_str() {
                 "copy" => Ok(ProtoOperand::Copy(cur.parse_place()?)),
                 "move" => Ok(ProtoOperand::Move(cur.parse_place()?)),
@@ -2646,6 +2893,13 @@ impl<'a> TokenCursor<'a> {
         } = cv
         {
             *slot = fn_def_path;
+        } else if fn_def_path.is_some() {
+            // `[adv B1]`: `extractCalleeDefPath?` takes the callee from an
+            // `RigidTy.fnDef` type before looking at the value, which
+            // `ProtoConstValue` can only represent for zero-sized function items.
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "`RigidTy.fnDef`-typed constant with a non-zero-sized value".to_string(),
+            ));
         }
         Ok(cv)
     }
@@ -2673,7 +2927,8 @@ impl<'a> TokenCursor<'a> {
 
     fn parse_rigid_ty_extract_fn_def(&mut self) -> Result<Option<String>, CensusScanError> {
         self.with_optional_parens(|cur| {
-            let (_, short) = cur.parse_ctor_head()?;
+            let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "RigidTy")?;
             if short == "fnDef" {
                 let path = cur.parse_string()?;
                 cur.skip_balanced_expr()?; // typeArgs list
@@ -2682,8 +2937,12 @@ impl<'a> TokenCursor<'a> {
                 // Skip any remaining arguments inside this RigidTy constructor
                 while !matches!(
                     cur.peek(),
-                    Some(LeanToken::Comma | LeanToken::Semicolon | LeanToken::RBrace | LeanToken::RParen)
-                        | None
+                    Some(
+                        LeanToken::Comma
+                            | LeanToken::Semicolon
+                            | LeanToken::RBrace
+                            | LeanToken::RParen
+                    ) | None
                 ) {
                     cur.skip_balanced_expr()?;
                 }
@@ -2695,6 +2954,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_const_value(&mut self) -> Result<ProtoConstValue, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "ConstValue")?;
             match short.as_str() {
                 "zeroSized" => Ok(ProtoConstValue::ZeroSized { fn_def_path: None }),
                 "scalar" => cur.parse_const_scalar(),
@@ -2722,6 +2982,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_const_scalar(&mut self) -> Result<ProtoConstValue, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "ConstScalar")?;
             match short.as_str() {
                 "int" => {
                     let mut bits: Option<u128> = None;
@@ -2778,6 +3039,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_rvalue(&mut self) -> Result<ProtoRvalue, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "Rvalue")?;
             match short.as_str() {
                 "use" => Ok(ProtoRvalue::Use(cur.parse_operand()?)),
                 "repeat" => {
@@ -2846,6 +3108,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_borrow_kind(&mut self) -> Result<bool, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "BorrowKind")?;
             match short.as_str() {
                 "shared" => Ok(false),
                 "mut" => {
@@ -2862,6 +3125,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_mutability(&mut self) -> Result<bool, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "Mutability")?;
             match short.as_str() {
                 "not" => Ok(false),
                 "mut" => Ok(true),
@@ -2875,6 +3139,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_cast_kind(&mut self) -> Result<ProtoCastKind, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "CastKind")?;
             match short.as_str() {
                 "pointerExposeProvenance" => Ok(ProtoCastKind::PointerExposeProvenance),
                 "pointerWithExposedProvenance" => Ok(ProtoCastKind::PointerWithExposedProvenance),
@@ -2897,6 +3162,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_bin_op(&mut self) -> Result<ProtoBinOp, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "BinOp")?;
             match short.as_str() {
                 "add" => Ok(ProtoBinOp::Add),
                 "addUnchecked" => Ok(ProtoBinOp::AddUnchecked),
@@ -2934,6 +3200,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_un_op(&mut self) -> Result<ProtoUnOp, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "UnOp")?;
             match short.as_str() {
                 "not" => Ok(ProtoUnOp::Not),
                 "neg" => Ok(ProtoUnOp::Neg),
@@ -2948,6 +3215,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_null_op(&mut self) -> Result<ProtoNullOp, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "NullOp")?;
             match short.as_str() {
                 "sizeOf" => Ok(ProtoNullOp::SizeOf),
                 "alignOf" => Ok(ProtoNullOp::AlignOf),
@@ -3003,6 +3271,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_terminator_kind(&mut self) -> Result<ProtoTerminatorKind, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "TerminatorKind")?;
             match short.as_str() {
                 "goto" => Ok(ProtoTerminatorKind::Goto(cur.parse_usize()?)),
                 "switchInt" => {
@@ -3117,6 +3386,7 @@ impl<'a> TokenCursor<'a> {
     fn parse_unwind_action(&mut self) -> Result<ProtoUnwindAction, CensusScanError> {
         self.with_optional_parens(|cur| {
             let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "UnwindAction")?;
             match short.as_str() {
                 "cleanup" => Ok(ProtoUnwindAction::Cleanup(cur.parse_usize()?)),
                 "unreachable" => Ok(ProtoUnwindAction::Unreachable),
@@ -3161,6 +3431,16 @@ pub fn parse_lean_captured_mir_def(
                 pos: idx + 5,
             };
             let parsed = cursor.parse_captured_mir()?;
+            // `[adv B1]`: the record must be the *entire* definition body. Anything
+            // applied to it (`|> mutate`, `.withBlocks evil`, `++ extra`) would change
+            // the elaborated `CapturedMir` in Lean while being ignored here.
+            if let Some(tok) = cursor.peek() {
+                if !is_lean_command_start(tok) {
+                    return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                        "unexpected token {tok:?} after `def {def_name} : CapturedMir` record"
+                    )));
+                }
+            }
             found_body = Some(parsed);
             idx = cursor.pos;
         } else {
@@ -3177,13 +3457,182 @@ pub fn parse_lean_captured_mir_def(
 
 /// Enumerate all `FaultSite` records for a named `def <def_name> : CapturedMir := ...`
 /// declaration in `lean_src`.
-pub fn census_lean_mir_def(lean_src: &str, def_name: &str) -> Result<Vec<FaultSite>, CensusScanError> {
+pub fn census_lean_mir_def(
+    lean_src: &str,
+    def_name: &str,
+) -> Result<Vec<FaultSite>, CensusScanError> {
     let body = parse_lean_captured_mir_def(lean_src, def_name)?;
     Ok(census_mir_fault_sites(&body))
 }
 
-/// Enumerate all `FaultSite` records from a `Mir/<Item>.lean` module (`def body : CapturedMir := ...`).
+/// True when any dotted segment of `name` reuses a `Trusted` MIR AST type name.
+fn shadows_mir_ast_name(name: &str) -> bool {
+    name.split('.').any(|seg| MIR_AST_TYPE_NAMES.contains(&seg))
+}
+
+/// Strict `[adv B1]` grammar check for an `anneal-rustc-capture` `Mir/<Item>.lean`
+/// module: only `import`, `namespace`/`section`/`end`, plain `open` lists,
+/// `set_option`, and `def <name> : <type> := <single balanced term>` commands are
+/// accepted, no declaration or namespace may reuse a MIR AST type name (constructor
+/// shadowing), and exactly one `def body : CapturedMir := { ... }` must exist.
+/// Syntax extensions (`macro`, `notation`, `syntax`, `elab`, ...), attributes,
+/// `#eval`, theorems, instances, or any other command fail closed.
+fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusScanError> {
+    let malformed = |msg: String| CensusScanError::MalformedCapturedMirSyntax(msg);
+    let ident_at = |i: usize| match tokens.get(i) {
+        Some(LeanToken::Ident(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let mut body_defs = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let Some(kw) = ident_at(i) else {
+            return Err(malformed(format!(
+                "unexpected top-level token {:?} in strict Mir module",
+                tokens[i]
+            )));
+        };
+        match kw {
+            "import" => {
+                ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
+                i += 2;
+            }
+            "namespace" | "section" | "end" => {
+                i += 1;
+                if let Some(name) = ident_at(i) {
+                    if !is_lean_command_start(&tokens[i]) {
+                        if shadows_mir_ast_name(name) {
+                            return Err(malformed(format!(
+                                "namespace `{name}` shadows a MIR AST type name"
+                            )));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            "open" => {
+                i += 1;
+                let mut count = 0usize;
+                while let Some(name) = ident_at(i) {
+                    if is_lean_command_start(&tokens[i]) {
+                        break;
+                    }
+                    if matches!(name, "renaming" | "hiding" | "in" | "scoped") {
+                        return Err(malformed(format!("`open ... {name}` is not supported")));
+                    }
+                    count += 1;
+                    i += 1;
+                }
+                if count == 0 {
+                    return Err(malformed("`open` without namespaces".into()));
+                }
+            }
+            "set_option" => {
+                ident_at(i + 1).ok_or_else(|| malformed("`set_option` without name".into()))?;
+                match tokens.get(i + 2) {
+                    Some(LeanToken::Ident(_) | LeanToken::NatLit(_) | LeanToken::StrLit(_)) => {}
+                    other => {
+                        return Err(malformed(format!("`set_option` with value {other:?}")));
+                    }
+                }
+                i += 3;
+            }
+            "def" => {
+                let name = ident_at(i + 1)
+                    .ok_or_else(|| malformed("`def` without a plain identifier name".into()))?;
+                if shadows_mir_ast_name(name) || is_lean_command_start(&tokens[i + 1]) {
+                    return Err(malformed(format!(
+                        "declaration `{name}` shadows a MIR AST name or keyword"
+                    )));
+                }
+                if tokens.get(i + 2) != Some(&LeanToken::Colon) {
+                    return Err(malformed(format!(
+                        "`def {name}` must carry an explicit `: <type>` ascription"
+                    )));
+                }
+                let is_body = name == "body" || name.ends_with(".body");
+                let mut j = i + 3;
+                let ty_start = j;
+                let mut depth = 0isize;
+                while j < tokens.len() {
+                    match &tokens[j] {
+                        LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket => depth += 1,
+                        LeanToken::RParen | LeanToken::RBrace | LeanToken::RBracket => depth -= 1,
+                        LeanToken::ColonEq if depth == 0 => break,
+                        tok if depth == 0 && is_lean_command_start(tok) => {
+                            return Err(malformed(format!("`def {name}` has no `:=` body")));
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j >= tokens.len() {
+                    return Err(malformed(format!("`def {name}` has no `:=` body")));
+                }
+                if is_body {
+                    let ty_ok = j == ty_start + 1
+                        && matches!(&tokens[ty_start], LeanToken::Ident(ty)
+                            if ty == "CapturedMir" || ty.ends_with(".CapturedMir"));
+                    if !ty_ok {
+                        return Err(malformed(format!(
+                            "`def {name}` must be ascribed exactly `: CapturedMir`"
+                        )));
+                    }
+                    body_defs += 1;
+                }
+                let mut cursor = TokenCursor { tokens, pos: j + 1 };
+                cursor.skip_balanced_expr()?;
+                if !is_body {
+                    // Strings in a skipped definition are never parsed, so a Lean
+                    // interpolation (`throwError "{"..."}"`, `m!"..."`, `panic!"..."`)
+                    // there could desynchronize the token stream; the emitter never
+                    // produces braces in such strings or `!`-macros, so fail closed.
+                    for tok in &tokens[i + 3..cursor.pos] {
+                        match tok {
+                            LeanToken::StrLit(lit) if lit.contains('{') || lit.contains('}') => {
+                                return Err(malformed(format!(
+                                    "brace-carrying string in skipped `def {name}`"
+                                )));
+                            }
+                            LeanToken::Ident(id) if id.ends_with('!') => {
+                                return Err(malformed(format!(
+                                    "macro invocation `{id}` in skipped `def {name}`"
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(tok) = cursor.peek() {
+                    if !is_lean_command_start(tok) {
+                        return Err(malformed(format!(
+                            "unexpected token {tok:?} after the value of `def {name}`"
+                        )));
+                    }
+                }
+                i = cursor.pos;
+            }
+            other => {
+                return Err(malformed(format!(
+                    "unsupported top-level command `{other}` in strict Mir module"
+                )));
+            }
+        }
+    }
+    if body_defs != 1 {
+        return Err(CensusScanError::MissingOrDuplicateCapturedMirDef(format!(
+            "expected exactly one `def body : CapturedMir`, found {body_defs}"
+        )));
+    }
+    Ok(())
+}
+
+/// Enumerate all `FaultSite` records from an `anneal-rustc-capture`
+/// `Mir/<Item>.lean` module (`def body : CapturedMir := ...`), first enforcing the
+/// strict module grammar (`check_strict_mir_module_grammar`).
 pub fn census_lean_mir_module(lean_src: &str) -> Result<Vec<FaultSite>, CensusScanError> {
+    let tokens = tokenize_lean_source(lean_src)?;
+    check_strict_mir_module_grammar(&tokens)?;
     census_lean_mir_def(lean_src, "body")
 }
 
@@ -3366,8 +3815,172 @@ impl ProbeExecutionReport {
     }
 }
 
-/// Construct the canonical `ProtoMirBody`, baseline discharged set, mutant
-/// discharged set, and expected missing sites for `probe`, matching the Lean 4
+fn place_has_deref(place: &ProtoPlace) -> bool {
+    place.projection.contains(&ProtoProjectionElem::Deref)
+}
+
+fn operand_has_deref(op: &ProtoOperand) -> bool {
+    matches!(op, ProtoOperand::Copy(p) | ProtoOperand::Move(p) if place_has_deref(p))
+}
+
+fn rvalue_has_deref(rv: &ProtoRvalue) -> bool {
+    match rv {
+        ProtoRvalue::Use(op)
+        | ProtoRvalue::Repeat(op, _)
+        | ProtoRvalue::Cast(_, op)
+        | ProtoRvalue::UnaryOp(_, op)
+        | ProtoRvalue::ShallowInitBox(op)
+        | ProtoRvalue::WrapUnsafeBinder(op) => operand_has_deref(op),
+        ProtoRvalue::BinaryOp(_, lhs, rhs) => operand_has_deref(lhs) || operand_has_deref(rhs),
+        ProtoRvalue::Aggregate(ops) => ops.iter().any(operand_has_deref),
+        ProtoRvalue::Ref { place, .. }
+        | ProtoRvalue::RawPtr { place, .. }
+        | ProtoRvalue::Len(place)
+        | ProtoRvalue::Discriminant(place)
+        | ProtoRvalue::CopyForDeref(place) => place_has_deref(place),
+        ProtoRvalue::ThreadLocalRef(_) | ProtoRvalue::NullaryOp(_) => false,
+    }
+}
+
+fn stmt_has_deref(kind: &ProtoStatementKind) -> bool {
+    match kind {
+        ProtoStatementKind::Assign(dst, rv) => place_has_deref(dst) || rvalue_has_deref(rv),
+        ProtoStatementKind::SetDiscriminant(p, _)
+        | ProtoStatementKind::Deinit(p)
+        | ProtoStatementKind::Retag(p)
+        | ProtoStatementKind::PlaceMention(p) => place_has_deref(p),
+        ProtoStatementKind::Intrinsic(ProtoIntrinsic::Assume(op)) => operand_has_deref(op),
+        ProtoStatementKind::Intrinsic(ProtoIntrinsic::CopyNonOverlapping { .. }) => true,
+        _ => false,
+    }
+}
+
+fn strip_deref_projections(op: &ProtoOperand) -> ProtoOperand {
+    let strip = |p: &ProtoPlace| ProtoPlace {
+        local_: p.local_,
+        projection: p
+            .projection
+            .iter()
+            .filter(|e| **e != ProtoProjectionElem::Deref)
+            .cloned()
+            .collect(),
+    };
+    match op {
+        ProtoOperand::Copy(p) => ProtoOperand::Copy(strip(p)),
+        ProtoOperand::Move(p) => ProtoOperand::Move(strip(p)),
+        ProtoOperand::Constant(_) => op.clone(),
+    }
+}
+
+/// `[adv B1]` Independent mock obligation emitter driving the false-proof probes.
+///
+/// The `[adv A0]` probes reconciled the census against *itself minus a hard-coded
+/// subset*, which only exercised set difference. This walker instead models how
+/// an obligation generator explores a body: it follows CFG edges from `bb0`
+/// (unreachable or un-followed blocks emit nothing), treats a block with an edge to
+/// an earlier-or-same block as a loop latch, and — when `mutation` is set — injects
+/// one realistic emitter bug:
+/// - `CallArgBlindProbe`: call arguments are treated as opaque by-value operands, so
+///   their dereference projections are never checked;
+/// - `SwitchBreakStripProbe`: `SwitchInt` exploration drops the `otherwise` edge;
+/// - `LoopUpdateOverflowProbe`: overflow obligations are skipped in latch blocks;
+/// - `DerefAliasProbe`: dereference/alignment/aliasing obligations are skipped at
+///   statements that dereference a pointer.
+///
+/// The unmutated emitter must reconcile `Verified` against the census, and each
+/// mutant must be rejected with exactly the sites pinned by the Lean witnesses.
+pub fn mock_emit_obligations(
+    body: &ProtoMirBody,
+    mutation: Option<FaultMutationProbe>,
+) -> Vec<FaultSite> {
+    let num_blocks = body.basic_blocks.len();
+    let mut reachable = vec![false; num_blocks];
+    let mut work = vec![0usize];
+    while let Some(b) = work.pop() {
+        if b >= num_blocks || reachable[b] {
+            continue;
+        }
+        reachable[b] = true;
+        let kind = &body.basic_blocks[b].terminator.kind;
+        match (kind, mutation) {
+            (
+                ProtoTerminatorKind::SwitchInt(_, targets),
+                Some(FaultMutationProbe::SwitchBreakStripProbe),
+            ) => work.extend(targets.branches.iter().map(|&(_, t)| t)),
+            _ => work.extend(terminator_targets(kind)),
+        }
+    }
+
+    let mut out = Vec::new();
+    for (b, bb) in body.basic_blocks.iter().enumerate() {
+        if !reachable[b] {
+            continue;
+        }
+        let is_latch = terminator_targets(&bb.terminator.kind)
+            .iter()
+            .any(|&t| t <= b);
+        for (i, stmt) in bb.statements.iter().enumerate() {
+            let mut classes = census_stmt_fault_classes(&stmt.kind);
+            match mutation {
+                Some(FaultMutationProbe::LoopUpdateOverflowProbe) if is_latch => {
+                    classes.retain(|c| *c != MirFaultClass::ArithOverflow);
+                }
+                Some(FaultMutationProbe::DerefAliasProbe) if stmt_has_deref(&stmt.kind) => {
+                    classes.retain(|c| {
+                        !matches!(
+                            c,
+                            MirFaultClass::PtrDerefInvalid
+                                | MirFaultClass::PtrAlignMismatch
+                                | MirFaultClass::TreeBorrowsViolation
+                        )
+                    });
+                }
+                _ => {}
+            }
+            out.extend(classes.into_iter().map(|c| FaultSite::new(b, i, c)));
+        }
+        let term_idx = bb.statements.len();
+        let classes = match (&bb.terminator.kind, mutation) {
+            (
+                ProtoTerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    target,
+                    unwind,
+                },
+                Some(FaultMutationProbe::CallArgBlindProbe),
+            ) => census_terminator_fault_classes(
+                num_blocks,
+                &ProtoTerminatorKind::Call {
+                    func: func.clone(),
+                    args: args.iter().map(strip_deref_projections).collect(),
+                    destination: destination.clone(),
+                    target: *target,
+                    unwind: *unwind,
+                },
+            ),
+            (kind, _) => census_terminator_fault_classes(num_blocks, kind),
+        };
+        out.extend(classes.into_iter().map(|c| FaultSite::new(b, term_idx, c)));
+    }
+    out
+}
+
+/// Package a probe scenario: `(body, baseline emitter obligations, mutant emitter
+/// obligations, expected missing sites)`.
+fn emitter_scenario(
+    body: ProtoMirBody,
+    probe: FaultMutationProbe,
+    expected_missing: Vec<FaultSite>,
+) -> (ProtoMirBody, Vec<FaultSite>, Vec<FaultSite>, Vec<FaultSite>) {
+    let baseline = mock_emit_obligations(&body, None);
+    let mutant = mock_emit_obligations(&body, Some(probe));
+    (body, baseline, mutant, expected_missing)
+}
+
+/// Construct the canonical `ProtoMirBody`, baseline emitter obligations, mutant
+/// emitter obligations, and expected missing sites for `probe`, matching the Lean 4
 /// witness definitions in `theory/Anneal/FaultSiteCensusPrototype.lean` 1-to-1.
 pub fn build_probe_scenario(
     probe: FaultMutationProbe,
@@ -3401,17 +4014,11 @@ pub fn build_probe_scenario(
                     },
                 ],
             };
-            let census = census_mir_fault_sites(&body);
             let expected_missing = vec![
                 FaultSite::new(0, 0, MirFaultClass::PtrDerefInvalid),
                 FaultSite::new(0, 0, MirFaultClass::PtrAlignMismatch),
             ];
-            let mutant: Vec<FaultSite> = census
-                .iter()
-                .copied()
-                .filter(|s| !expected_missing.contains(s))
-                .collect();
-            (body, census, mutant, expected_missing)
+            emitter_scenario(body, probe, expected_missing)
         }
         FaultMutationProbe::SwitchBreakStripProbe => {
             let body = ProtoMirBody {
@@ -3465,18 +4072,17 @@ pub fn build_probe_scenario(
                     },
                 ],
             };
-            let census = census_mir_fault_sites(&body);
-            let expected_missing: Vec<FaultSite> = census
-                .iter()
-                .copied()
-                .filter(|s| s.block_idx == 2)
-                .collect();
-            let mutant: Vec<FaultSite> = census
-                .iter()
-                .copied()
-                .filter(|s| s.block_idx != 2)
-                .collect();
-            (body, census, mutant, expected_missing)
+            let expected_missing = vec![
+                FaultSite::new(2, 0, MirFaultClass::ArithOverflow),
+                FaultSite::new(2, 0, MirFaultClass::DivRemByZero),
+                FaultSite::new(2, 0, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(2, 0, MirFaultClass::UninitRead),
+                FaultSite::new(2, 0, MirFaultClass::StorageLiveProtected),
+                FaultSite::new(2, 1, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(2, 1, MirFaultClass::UninitRead),
+                FaultSite::new(2, 1, MirFaultClass::CallAbiMismatch),
+            ];
+            emitter_scenario(body, probe, expected_missing)
         }
         FaultMutationProbe::LoopUpdateOverflowProbe => {
             let body = ProtoMirBody {
@@ -3505,20 +4111,33 @@ pub fn build_probe_scenario(
                         is_cleanup: false,
                     },
                     ProtoBasicBlock {
-                        statements: vec![ProtoStatement {
-                            kind: ProtoStatementKind::Assign(
-                                ProtoPlace::local(1),
-                                ProtoRvalue::BinaryOp(
-                                    ProtoBinOp::Add,
-                                    ProtoOperand::Copy(ProtoPlace::local(1)),
-                                    ProtoOperand::const_u32(1),
+                        statements: vec![
+                            ProtoStatement {
+                                kind: ProtoStatementKind::Assign(
+                                    ProtoPlace::local(1),
+                                    ProtoRvalue::BinaryOp(
+                                        ProtoBinOp::AddUnchecked,
+                                        ProtoOperand::Copy(ProtoPlace::local(1)),
+                                        ProtoOperand::const_u32(1),
+                                    ),
                                 ),
-                            ),
-                            span: String::from("proto.rs:32:9"),
-                        }],
+                                span: String::from("proto.rs:32:9"),
+                            },
+                            ProtoStatement {
+                                kind: ProtoStatementKind::Assign(
+                                    ProtoPlace::local(0),
+                                    ProtoRvalue::BinaryOp(
+                                        ProtoBinOp::Add,
+                                        ProtoOperand::Copy(ProtoPlace::local(0)),
+                                        ProtoOperand::Copy(ProtoPlace::local(1)),
+                                    ),
+                                ),
+                                span: String::from("proto.rs:33:9"),
+                            },
+                        ],
                         terminator: ProtoTerminator {
                             kind: ProtoTerminatorKind::Goto(1),
-                            span: String::from("proto.rs:32:20"),
+                            span: String::from("proto.rs:33:20"),
                         },
                         is_cleanup: false,
                     },
@@ -3526,18 +4145,14 @@ pub fn build_probe_scenario(
                         statements: Vec::new(),
                         terminator: ProtoTerminator {
                             kind: ProtoTerminatorKind::Return,
-                            span: String::from("proto.rs:33:5"),
+                            span: String::from("proto.rs:34:5"),
                         },
                         is_cleanup: false,
                     },
                 ],
             };
-            let census = census_mir_fault_sites(&body);
-            let dropped = FaultSite::new(2, 0, MirFaultClass::ArithOverflow);
-            let expected_missing = vec![dropped];
-            let mutant: Vec<FaultSite> =
-                census.iter().copied().filter(|&s| s != dropped).collect();
-            (body, census, mutant, expected_missing)
+            let expected_missing = vec![FaultSite::new(2, 0, MirFaultClass::ArithOverflow)];
+            emitter_scenario(body, probe, expected_missing)
         }
         FaultMutationProbe::DerefAliasProbe => {
             let body = ProtoMirBody {
@@ -3557,18 +4172,12 @@ pub fn build_probe_scenario(
                     is_cleanup: false,
                 }],
             };
-            let census = census_mir_fault_sites(&body);
             let expected_missing = vec![
                 FaultSite::new(0, 0, MirFaultClass::PtrDerefInvalid),
                 FaultSite::new(0, 0, MirFaultClass::PtrAlignMismatch),
                 FaultSite::new(0, 0, MirFaultClass::TreeBorrowsViolation),
             ];
-            let mutant: Vec<FaultSite> = census
-                .iter()
-                .copied()
-                .filter(|s| !expected_missing.contains(s))
-                .collect();
-            (body, census, mutant, expected_missing)
+            emitter_scenario(body, probe, expected_missing)
         }
     }
 }
@@ -3576,8 +4185,10 @@ pub fn build_probe_scenario(
 /// Execute a single `FaultMutationProbe` against `PropertyRegistry::all_verified()`.
 pub fn run_false_proof_probe(probe: FaultMutationProbe) -> ProbeExecutionReport {
     let registry = PropertyRegistry::all_verified();
-    let (_body, census, mutant_discharged, expected_missing_sites) = build_probe_scenario(probe);
-    let baseline_verdict = reconcile_obligation_coverage(&census, &census, &registry);
+    let (body, baseline_discharged, mutant_discharged, expected_missing_sites) =
+        build_probe_scenario(probe);
+    let census = census_mir_fault_sites(&body);
+    let baseline_verdict = reconcile_obligation_coverage(&census, &baseline_discharged, &registry);
     let mutant_verdict = reconcile_obligation_coverage(&census, &mutant_discharged, &registry);
     ProbeExecutionReport {
         probe,
@@ -3601,8 +4212,9 @@ pub fn run_all_false_proof_probes() -> Vec<ProbeExecutionReport> {
 /// `PropertyStatus::UnemittedGap` causes `reconcile_obligation_coverage` to
 /// reject even when `discharged == census`.
 pub fn run_property_registry_unemitted_probe() -> CoverageVerdict {
-    let (_body, census, _mutant, _expected_missing) =
+    let (body, _baseline, _mutant, _expected_missing) =
         build_probe_scenario(FaultMutationProbe::DerefAliasProbe);
+    let census = census_mir_fault_sites(&body);
     let registry = PropertyRegistry::all_verified().with_status(
         MirFaultClass::TreeBorrowsViolation,
         PropertyStatus::UnemittedGap,
@@ -3618,10 +4230,10 @@ pub fn run_property_registry_unemitted_probe() -> CoverageVerdict {
 mod tests {
     use super::*;
     use anneal_rustc_capture::lean_emit::{
-        IrAbiPassMode, IrAlign, IrArgAbi, IrBackendRepr, IrCallConv, IrContractRole,
-        IrFieldsShape, IrFnAbi, IrLayoutTable, IrLocalDecl, IrMirPhaseTag, IrPrimitiveKind,
-        IrRigidTy, IrScalarLayout, IrSize, IrTy, IrTypeLayout, IrUintTy,
-        IrVariantsShape, IrWrappingRange, emit_mir_lean_module,
+        emit_mir_lean_module, IrAbiPassMode, IrAlign, IrArgAbi, IrBackendRepr, IrCallConv,
+        IrContractRole, IrFieldsShape, IrFnAbi, IrLayoutTable, IrLocalDecl, IrMirPhaseTag,
+        IrPrimitiveKind, IrRigidTy, IrScalarLayout, IrSize, IrTy, IrTypeLayout, IrUintTy,
+        IrVariantsShape, IrWrappingRange,
     };
 
     const LEAN_PROTOTYPE_SRC: &str =
@@ -3743,8 +4355,36 @@ mod tests {
             census_terminator_fault_classes(1, &ProtoTerminatorKind::UnwindResume),
             vec![MirFaultClass::CallAbiMismatch]
         );
+        // `[adv B1]`: wrapping/flagged/masked operators never fault in
+        // `evalScalarBinOp` (`censusBinOpFaultClasses_exact` in Lean).
+        for op in [
+            ProtoBinOp::Add,
+            ProtoBinOp::Sub,
+            ProtoBinOp::Mul,
+            ProtoBinOp::AddWithOverflow,
+            ProtoBinOp::SubWithOverflow,
+            ProtoBinOp::MulWithOverflow,
+            ProtoBinOp::Shl,
+            ProtoBinOp::Shr,
+            ProtoBinOp::BitXor,
+            ProtoBinOp::BitAnd,
+            ProtoBinOp::BitOr,
+            ProtoBinOp::Eq,
+            ProtoBinOp::Lt,
+            ProtoBinOp::Le,
+            ProtoBinOp::Ne,
+            ProtoBinOp::Ge,
+            ProtoBinOp::Gt,
+            ProtoBinOp::Cmp,
+        ] {
+            assert_eq!(
+                census_bin_op_fault_classes(op),
+                Vec::<MirFaultClass>::new(),
+                "{op:?}"
+            );
+        }
         assert_eq!(
-            census_bin_op_fault_classes(ProtoBinOp::Add),
+            census_bin_op_fault_classes(ProtoBinOp::AddUnchecked),
             vec![MirFaultClass::ArithOverflow]
         );
         assert_eq!(
@@ -3752,8 +4392,59 @@ mod tests {
             vec![MirFaultClass::ArithOverflow, MirFaultClass::DivRemByZero]
         );
         assert_eq!(
-            census_bin_op_fault_classes(ProtoBinOp::Shl),
+            census_bin_op_fault_classes(ProtoBinOp::ShlUnchecked),
             vec![MirFaultClass::ShiftOverflow]
+        );
+        assert_eq!(
+            census_un_op_fault_classes(ProtoUnOp::Neg),
+            Vec::<MirFaultClass>::new()
+        );
+        // Non-dereferencing borrows only fault on a dead/missing root or index local.
+        assert_eq!(
+            census_place_ref_fault_classes(&ProtoPlace::local(1)),
+            vec![MirFaultClass::UninitRead]
+        );
+        // `validateLoadedValue` makes `Use(Copy(p))` fault on invalid `bool` scalars.
+        assert!(
+            census_rvalue_fault_classes(&ProtoRvalue::Use(ProtoOperand::Copy(ProtoPlace::local(
+                1
+            ))))
+            .contains(&MirFaultClass::ScalarNicheInvalid)
+        );
+        // `Assert` unwind edges: only `Unreachable`/`Continue` can fault.
+        for (unwind, expected) in [
+            (
+                ProtoUnwindAction::Unreachable,
+                Some(MirFaultClass::UnreachableTerminator),
+            ),
+            (
+                ProtoUnwindAction::Continue,
+                Some(MirFaultClass::CallAbiMismatch),
+            ),
+            (ProtoUnwindAction::Cleanup(0), None),
+            (ProtoUnwindAction::Terminate, None),
+        ] {
+            let classes = census_terminator_fault_classes(
+                1,
+                &ProtoTerminatorKind::Assert {
+                    cond: ProtoOperand::const_u32(1),
+                    expected: true,
+                    target: 0,
+                    unwind,
+                },
+            );
+            let mut want = vec![MirFaultClass::ScalarNicheInvalid];
+            want.extend(expected);
+            assert_eq!(dedup_fault_classes(want), classes, "{unwind:?}");
+        }
+        // `std::intrinsics::*` is not classified by `classifyRustIntrinsic?`.
+        assert_eq!(
+            census_callee_def_path_fault_classes("std::intrinsics::unchecked_add"),
+            Vec::<MirFaultClass>::new()
+        );
+        assert_eq!(
+            census_callee_def_path_fault_classes("core::intrinsics::unchecked_add"),
+            vec![MirFaultClass::ArithOverflow]
         );
     }
 
@@ -3803,8 +4494,8 @@ mod tests {
 
         // Also verify `realistic_safe_subset_registry` rejects indirect call / aliasing sites.
         let safe_reg = PropertyRegistry::realistic_safe_subset_registry();
-        let (_body, call_census, _, _) =
-            build_probe_scenario(FaultMutationProbe::CallArgBlindProbe);
+        let (call_body, _, _, _) = build_probe_scenario(FaultMutationProbe::CallArgBlindProbe);
+        let call_census = census_mir_fault_sites(&call_body);
         let call_verdict = reconcile_obligation_coverage(&call_census, &call_census, &safe_reg);
         match call_verdict {
             CoverageVerdict::UnknownUnmappedFaultSite {
@@ -3872,13 +4563,31 @@ def «body» : CapturedMir :=
 end Mir.Tricky.«fn--with--dashes»
 "##;
 
-        let sites = census_lean_mir_module(tricky_lean).expect("scan tricky Lean module");
+        let expected = vec![
+            FaultSite::new(0, 0, MirFaultClass::StorageLiveProtected),
+            FaultSite::new(0, 1, MirFaultClass::UnreachableTerminator),
+        ];
+        // The lexer neutralizes every trap for named-definition extraction ...
+        let sites = census_lean_mir_def(tricky_lean, "body").expect("scan tricky Lean module");
+        assert_eq!(sites, expected);
+        // ... while the strict emitter-module grammar (`[adv B1]`) fails closed on the
+        // brace-carrying interpolated/raw strings in the skipped `helperInterp` /
+        // `helperRawStr` definitions, and accepts the same module (comments, char
+        // literals, guillemets) once those non-emitter helpers are removed.
+        assert!(matches!(
+            census_lean_mir_module(tricky_lean),
+            Err(CensusScanError::MalformedCapturedMirSyntax(_))
+        ));
+        let without_interp: String = tricky_lean
+            .lines()
+            .filter(|line| {
+                !line.starts_with("def helperInterp") && !line.starts_with("def helperRawStr")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(
-            sites,
-            vec![
-                FaultSite::new(0, 0, MirFaultClass::StorageLiveProtected),
-                FaultSite::new(0, 1, MirFaultClass::UnreachableTerminator),
-            ]
+            census_lean_mir_module(&without_interp).expect("strict tricky module"),
+            expected
         );
     }
 
@@ -4062,9 +4771,8 @@ def body : CapturedMir :=
 
         // 2. Parse `witnessPureNoopBody` directly from `FaultSiteCensusPrototype.lean`
         //    and verify 0 fault sites (`[]`).
-        let pure_noop_sites =
-            census_lean_mir_def(LEAN_PROTOTYPE_SRC, "witnessPureNoopBody")
-                .expect("parse witnessPureNoopBody from Lean");
+        let pure_noop_sites = census_lean_mir_def(LEAN_PROTOTYPE_SRC, "witnessPureNoopBody")
+            .expect("parse witnessPureNoopBody from Lean");
         assert!(pure_noop_sites.is_empty());
 
         // 3. Parse all 4 probe witness `CapturedMir` bodies and their kernel-checked
@@ -4094,9 +4802,8 @@ def body : CapturedMir :=
 
         for (probe, expected_def_name) in expected_defs {
             let lean_body_name = probe.lean_witness_def_name();
-            let scanned_from_lean_body =
-                census_lean_mir_def(LEAN_PROTOTYPE_SRC, lean_body_name)
-                    .unwrap_or_else(|e| panic!("failed to scan {lean_body_name}: {e}"));
+            let scanned_from_lean_body = census_lean_mir_def(LEAN_PROTOTYPE_SRC, lean_body_name)
+                .unwrap_or_else(|e| panic!("failed to scan {lean_body_name}: {e}"));
             let lean_decide_expected =
                 parse_lean_expected_fault_site_list(LEAN_PROTOTYPE_SRC, expected_def_name);
             let rust_probe_report = run_false_proof_probe(probe);
@@ -4111,5 +4818,291 @@ def body : CapturedMir :=
             );
             assert!(rust_probe_report.passed());
         }
+
+        // 4. `[adv B1]` precision witness: the Lean `witnessWrappingArithBody` scan must
+        //    match its kernel-checked expected census and carry no arithmetic, shift,
+        //    niche, or pointer-dereference labels.
+        let wrapping_scan = census_lean_mir_def(LEAN_PROTOTYPE_SRC, "witnessWrappingArithBody")
+            .expect("parse witnessWrappingArithBody from Lean");
+        let wrapping_expected = parse_lean_expected_fault_site_list(
+            LEAN_PROTOTYPE_SRC,
+            "witnessWrappingArithExpectedCensus",
+        );
+        assert_eq!(wrapping_scan, wrapping_expected);
+        assert!(wrapping_scan.iter().all(|site| !matches!(
+            site.fault_class,
+            MirFaultClass::ArithOverflow
+                | MirFaultClass::ShiftOverflow
+                | MirFaultClass::ScalarNicheInvalid
+                | MirFaultClass::PtrDerefInvalid
+                | MirFaultClass::PtrAlignMismatch
+        )));
+
+        // 5. `[adv B1]` every probe's baseline emitter covers exactly the census and the
+        //    Lean liveness certificates exist for each stripped site.
+        for probe in FaultMutationProbe::ALL {
+            let (body, baseline, _, _) = build_probe_scenario(probe);
+            assert_eq!(census_mir_fault_sites(&body), baseline, "{probe:?}");
+        }
+        for live in [
+            "theorem witnessCallArgBlind_call_site_live",
+            "theorem witnessSwitchBreakStrip_div_site_live",
+            "theorem witnessLoopUpdateOverflow_latch_site_live",
+            "theorem witnessDerefAlias_deref_site_live",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(live),
+                "missing Lean liveness certificate `{live}`"
+            );
+        }
+    }
+
+    /// Wrap `blocks` (a Lean `List BasicBlockData` literal) in a canonical strict
+    /// `Mir/<Item>.lean` module.
+    fn strict_module_with_blocks(prelude: &str, blocks: &str) -> String {
+        format!(
+            r#"import Trusted
+namespace Mir.Probe.item
+open Trusted.Rustc.V2026_06_01.MirAst
+{prelude}
+def body : CapturedMir :=
+  {{ defPath := "probe::item"
+  , phase := MirPhaseTag.runtimePostCleanup
+  , role := ContractRole.subject
+  , argCount := 0
+  , localDecls := List.nil
+  , basicBlocks := {blocks}
+  , fnAbi := dummyAbi
+  , layouts := emptyLayoutTable
+  , allocations := List.nil
+  }}
+end Mir.Probe.item
+"#
+        )
+    }
+
+    fn single_terminator_block(term_kind: &str) -> String {
+        format!(
+            "[{{ statements := [], terminator := {{ kind := {term_kind}, span := \"s\" }}, isCleanup := false }}]"
+        )
+    }
+
+    #[test]
+    fn test_real_rustc_captured_mir_corpus_census() {
+        // `[adv B1]`: run the strict scanner over real `anneal-rustc-capture` output
+        // committed in the repository (separate `def layouts`, `-- bbN:` comments,
+        // `/-! -/` doc comments, `def defaultClaim`, namespaces, and `open`s).
+        let magic = include_str!(
+            "../../../examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/magic_version.lean"
+        );
+        assert_eq!(
+            census_lean_mir_module(magic).expect("scan magic_version"),
+            vec![
+                FaultSite::new(0, 0, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(0, 0, MirFaultClass::StorageLiveProtected),
+                FaultSite::new(0, 1, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(0, 1, MirFaultClass::UninitRead),
+                FaultSite::new(0, 1, MirFaultClass::CallAbiMismatch),
+            ]
+        );
+        let advance = include_str!(
+            "../../../examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/advance_offset.lean"
+        );
+        assert_eq!(
+            census_lean_mir_module(advance).expect("scan advance_offset"),
+            vec![
+                // StorageLive(_2)
+                FaultSite::new(0, 0, MirFaultClass::StorageLiveProtected),
+                // _2 = AddWithOverflow(copy _1, const 4_u8): flagged add never faults.
+                FaultSite::new(0, 1, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(0, 1, MirFaultClass::UninitRead),
+                FaultSite::new(0, 1, MirFaultClass::StorageLiveProtected),
+                // assert(!move (_2.1)) -> [success: bb1, unwind continue]
+                FaultSite::new(0, 2, MirFaultClass::ScalarNicheInvalid),
+                FaultSite::new(0, 2, MirFaultClass::UninitRead),
+                FaultSite::new(0, 2, MirFaultClass::CallAbiMismatch),
+                // _0 = move (_2.0): loaded-value validation.
+                FaultSite::new(1, 0, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(1, 0, MirFaultClass::ScalarNicheInvalid),
+                FaultSite::new(1, 0, MirFaultClass::UninitRead),
+                FaultSite::new(1, 0, MirFaultClass::StorageLiveProtected),
+                // return
+                FaultSite::new(1, 1, MirFaultClass::TreeBorrowsViolation),
+                FaultSite::new(1, 1, MirFaultClass::UninitRead),
+                FaultSite::new(1, 1, MirFaultClass::CallAbiMismatch),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_b1_lean_scanner_fail_open_regressions() {
+        let unreachable_block = single_terminator_block("TerminatorKind.unreachable");
+        let baseline = strict_module_with_blocks("", &unreachable_block);
+        assert_eq!(
+            census_lean_mir_module(&baseline).expect("baseline strict module"),
+            vec![FaultSite::new(0, 0, MirFaultClass::UnreachableTerminator)]
+        );
+
+        // (a) Foreign-qualified or bare constructor heads may name arbitrary user
+        //     definitions; only `.goto` / `TerminatorKind.goto` are accepted.
+        for head in ["Evil.goto 0", "goto 0", "Mir.Probe.TerminatorKind.goto 0"] {
+            let src = strict_module_with_blocks("", &single_terminator_block(head));
+            assert!(
+                matches!(
+                    census_lean_mir_module(&src),
+                    Err(CensusScanError::MalformedCapturedMirSyntax(_))
+                ),
+                "accepted constructor head `{head}`"
+            );
+        }
+        for head in [
+            ".goto 0",
+            "TerminatorKind.goto 0",
+            "Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.goto 0",
+        ] {
+            let src = strict_module_with_blocks("", &single_terminator_block(head));
+            assert_eq!(
+                census_lean_mir_module(&src),
+                Ok(Vec::new()),
+                "rejected `{head}`"
+            );
+        }
+
+        // (b) Anything applied to the `CapturedMir` record fails closed, in both the
+        //     strict module scanner and the lenient named-def scanner.
+        let piped = baseline.replace(
+            "  }}
+end Mir.Probe.item",
+            "  }} |> mutateBody
+end Mir.Probe.item",
+        );
+        let piped = if piped == baseline {
+            baseline.replace(
+                "allocations := List.nil
+  }
+",
+                "allocations := List.nil
+  } |> mutateBody
+",
+            )
+        } else {
+            piped
+        };
+        assert_ne!(piped, baseline);
+        assert!(census_lean_mir_module(&piped).is_err());
+        assert!(census_lean_mir_def(&piped, "body").is_err());
+        let dotted = baseline.replace(
+            "allocations := List.nil
+  }
+",
+            "allocations := List.nil
+  }.withBlocks evil
+",
+        );
+        assert_ne!(dotted, baseline);
+        assert!(census_lean_mir_def(&dotted, "body").is_err());
+
+        // (c) Duplicate record fields fail closed instead of last-write-wins.
+        let dup = baseline.replace(
+            "  , basicBlocks := ",
+            "  , basicBlocks := List.nil
+  , basicBlocks := ",
+        );
+        assert!(matches!(
+            census_lean_mir_module(&dup),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("duplicate")
+        ));
+
+        // (d) Exact Lean string escapes: `\u0061` decodes to `a`, so the escaped
+        //     `core::intrinsics::unreachable` callee keeps its fault class; unknown
+        //     escapes fail closed.
+        let call_unreachable = |path: &str| {
+            single_terminator_block(&format!(
+                "TerminatorKind.call (Operand.constant {{ ty := {{ kind := RigidTy.fnDef \"{path}\" List.nil, layoutIdx := 0 }}, val := ConstValue.zeroSized }}) List.nil {{ local_ := 0, projection := List.nil }} Option.none UnwindAction.continue_"
+            ))
+        };
+        let escaped =
+            strict_module_with_blocks("", &call_unreachable(r"core::intrinsics::unreach\u0061ble"));
+        let escaped_sites = census_lean_mir_module(&escaped).expect("escaped callee path");
+        assert!(escaped_sites.contains(&FaultSite::new(
+            0,
+            0,
+            MirFaultClass::UnreachableTerminator
+        )));
+        let bad_escape =
+            strict_module_with_blocks("", &call_unreachable(r"core::intrinsics::unreach\qble"));
+        assert!(census_lean_mir_module(&bad_escape).is_err());
+        let std_path =
+            strict_module_with_blocks("", &call_unreachable("std::intrinsics::unchecked_add"));
+        assert!(!census_lean_mir_module(&std_path)
+            .expect("std intrinsic path")
+            .iter()
+            .any(|s| s.fault_class == MirFaultClass::ArithOverflow));
+
+        // (e) A decoy `def body` hidden inside an `m!` interpolation is a string in Lean
+        //     and must stay a string here; a decoy exposed through a plain-string
+        //     interpolation desync (`throwError "{"...`) yields two bodies and fails.
+        let decoy_interp = strict_module_with_blocks(
+            "def helperMsg : String := m!\"{\"def body : CapturedMir := { basicBlocks := List.nil }\"}\"",
+            &unreachable_block,
+        );
+        assert_eq!(
+            census_lean_mir_def(&decoy_interp, "body").expect("m! decoy stays a string"),
+            vec![FaultSite::new(0, 0, MirFaultClass::UnreachableTerminator)]
+        );
+        assert!(census_lean_mir_module(&decoy_interp).is_err());
+        let decoy_plain = strict_module_with_blocks(
+            "def helperErr : String := throwError \"{\"def body : CapturedMir := { basicBlocks := List.nil } -- \"}\"",
+            &unreachable_block,
+        );
+        assert!(census_lean_mir_module(&decoy_plain).is_err());
+        let spaced_macro =
+            strict_module_with_blocks("def helperErr : Unit := panic! \"{\"", &unreachable_block);
+        assert!(census_lean_mir_module(&spaced_macro).is_err());
+        let comment_in_interp = strict_module_with_blocks(
+            "def helperMsg : String := s!\"{x -- }\"\n  }\"",
+            &unreachable_block,
+        );
+        assert!(census_lean_mir_module(&comment_in_interp).is_err());
+
+        // (f) Syntax extensions, attributes, and non-canonical commands fail closed.
+        for prelude in [
+            "notation \"EVIL\" => 0",
+            "macro_rules | `(x) => `(y)",
+            "@[simp] theorem helper : True := trivial",
+            "instance : Inhabited Nat := ⟨0⟩",
+            "#eval 1",
+        ] {
+            let src = strict_module_with_blocks(prelude, &unreachable_block);
+            assert!(
+                census_lean_mir_module(&src).is_err(),
+                "accepted prelude `{prelude}`"
+            );
+        }
+
+        // (g) Shadowing MIR AST names in the module namespace fails closed.
+        let shadow_ns = strict_module_with_blocks(
+            "namespace TerminatorKind\nend TerminatorKind",
+            &unreachable_block,
+        );
+        assert!(census_lean_mir_module(&shadow_ns).is_err());
+        let shadow_def =
+            strict_module_with_blocks("def TerminatorKind.goto : Nat := 0", &unreachable_block);
+        assert!(census_lean_mir_module(&shadow_def).is_err());
+
+        // (h) A `body` with a non-canonical type ascription (invisible to a naive
+        //     `def body : CapturedMir :=` matcher) fails closed.
+        let hidden =
+            strict_module_with_blocks("def body : (CapturedMir) := realBody", &unreachable_block);
+        assert!(census_lean_mir_module(&hidden).is_err());
+
+        // (i) `RigidTy.fnDef`-typed constants must be zero-sized function items.
+        let non_zst_fn = strict_module_with_blocks(
+            "",
+            &single_terminator_block(
+                "TerminatorKind.call (Operand.constant { ty := { kind := RigidTy.fnDef \"core::intrinsics::unreachable\" List.nil, layoutIdx := 0 }, val := ConstValue.scalar (ConstScalar.int { bits := 0, sizeBytes := 1 }) }) List.nil { local_ := 0, projection := List.nil } Option.none UnwindAction.continue_",
+            ),
+        );
+        assert!(census_lean_mir_module(&non_zst_fn).is_err());
     }
 }

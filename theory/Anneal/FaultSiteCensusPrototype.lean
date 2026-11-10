@@ -45,6 +45,19 @@ MIR fault-site enumeration and fail-closed obligation coverage reconciliation:
      `reconcileFaultCoverage_mutation_detected`
    - Compile-time kernel-checked `by decide` witnesses covering pure no-op MIR
      and all 4 false-proof mutation probe scenarios (`0` `native_decide`).
+6. **`[adv B1]` Semantic Precision Certificates & Exposure Completeness**:
+   - Census classes are justified against `Trusted.MirSemantics` rather than only
+     restated: `censusBinOpFaultClasses_exact` / `evalScalarBinOp_ub_cause`
+     (class-precise binary operators), `evalStmt_storageLive_ub_iff`,
+     `evalStmt_storageDead_ub_iff`, `evalTerminator_return_root_ub_iff`,
+     `evalTerminator_return_inline_ub_iff`, `stepMirFn_after_goto_oob_ub`, and
+     `evalRvalue_borrow_nonDeref_ub_iff`.
+   - `StepNodeExposesUb` extends completeness to `.faulted .ub` continuations of
+     external calls (`stepMirFn_exposesUb_in_census`,
+     `stepMirFn_extCall_cont_fault_in_census`), which `stepMirFn ... = .fail .ub`
+     alone does not cover.
+   - Every false-proof probe carries a kernel-evaluated liveness certificate at the
+     stripped site (`witness*_site_live`).
 -/
 
 /-! ## 1. Canonical `MirFaultClass` Enumeration & Bijections -/
@@ -368,10 +381,21 @@ def censusPlaceWriteFaultClasses (place : Place) : List MirFaultClass :=
 /--
 Fault classes that can be triggered when creating a reference or raw pointer to
 `place : Place` (`Rvalue.ref`, `Rvalue.rawPtr`).
+
+`[adv B1]` precision: `evalRvalue (.ref _ place)` / `evalRvalue (.rawPtr _ place)`
+only inspect pointer provenance, Tree Borrows permissions, and target bounds when
+`place.projection` starts with `.deref`. For every other place, the only `.ub`
+edges are a missing/dead root local or an uninitialized `.index` local inside
+`resolveBorrowProjectionElems` (no bounds, alignment, or permission check is
+performed when borrowing a stack place), so the census emits exactly
+`[.uninitRead]` (`evalRvalue_borrow_nonDeref_ub_iff`).
 -/
 def censusPlaceRefFaultClasses (place : Place) : List MirFaultClass :=
-  [.uninitRead, .ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation] ++
-    place.projection.flatMap censusProjectionElemFaultClasses
+  match place.projection with
+  | .deref :: _ =>
+    [.uninitRead, .ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation] ++
+      place.projection.flatMap censusProjectionElemFaultClasses
+  | _ => [.uninitRead]
 
 /--
 Fault classes that can be triggered by evaluating a `ConstValue` in
@@ -394,62 +418,107 @@ def censusOperandFaultClasses : Operand → List MirFaultClass
   | .constant c => censusConstValueFaultClasses c.val
 
 /--
+Fault classes that can be triggered by evaluating an `Operand` whose loaded value
+is then validated by `validateLoadedValue` (`Rvalue.use`, `Rvalue.wrapUnsafeBinder`).
+
+`[adv B1]` class-gap fix: `evalRvalue (.use (.copy p))` returns `.ub` when a
+`bool`-typed place holds a scalar other than `0`/`1` (`validateLoadedValue`), so
+`.copy`/`.move` operands additionally emit `.scalarNicheInvalid`. Constants are
+never re-validated (`validateLoadedValue _ _ (.constant _) _ = true`).
+-/
+def censusLoadedOperandFaultClasses : Operand → List MirFaultClass
+  | .copy place => censusPlaceReadFaultClasses place ++ [.scalarNicheInvalid]
+  | .move place => censusPlaceReadFaultClasses place ++ [.scalarNicheInvalid]
+  | .constant c => censusConstValueFaultClasses c.val
+
+/--
 Fault classes that can be triggered by a `BinOp` in `evalRvalue (.binaryOp op lhs rhs)`
 (excluding the operand evaluations of `lhs` and `rhs` themselves).
+
+`[adv B1]` precision fix (kernel-checked by `evalScalarBinOp_ne_ub_of_census_nil`,
+`evalScalarBinOp_ub_cause`, and the `evalScalarBinOp_*_ub_witness` examples):
+`Trusted.MirSemantics.evalScalarBinOp` wraps `.add`/`.sub`/`.mul`, returns an
+overflow flag for `.addWithOverflow`/`.subWithOverflow`/`.mulWithOverflow`, masks
+the shift distance of `.shl`/`.shr`, and never faults on bitwise or comparison
+operators, so all of these emit `[]`. Only the `*Unchecked` arithmetic/shift
+operators, `.div`/`.rem` (division by zero and signed `MIN / -1`), and pointer
+`.offset` (`evalPtrOffsetBinOp`: disabled Tree Borrows tag, unknown stride, or
+out-of-allocation result) can return `.ub`.
 -/
 def censusBinOpFaultClasses : BinOp → List MirFaultClass
+  | .addUnchecked | .subUnchecked | .mulUnchecked => [.arithOverflow]
+  | .div | .rem => [.arithOverflow, .divRemByZero]
+  | .shlUnchecked | .shrUnchecked => [.shiftOverflow]
+  | .offset => [.arithOverflow, .boundsCheck, .ptrDerefInvalid, .treeBorrowsViolation]
   | .add | .sub | .mul
-  | .addUnchecked | .subUnchecked | .mulUnchecked
-  | .addWithOverflow | .subWithOverflow | .mulWithOverflow =>
-    [.arithOverflow]
-  | .div | .rem =>
-    [.arithOverflow, .divRemByZero]
-  | .shl | .shr | .shlUnchecked | .shrUnchecked =>
-    [.shiftOverflow]
-  | .offset =>
-    [.arithOverflow, .boundsCheck, .ptrDerefInvalid]
+  | .addWithOverflow | .subWithOverflow | .mulWithOverflow
+  | .shl | .shr
   | .bitXor | .bitAnd | .bitOr
-  | .eq | .lt | .le | .ne | .ge | .gt | .cmp =>
-    [.scalarNicheInvalid]
+  | .eq | .lt | .le | .ne | .ge | .gt | .cmp => []
 
 /--
 Fault classes that can be triggered by a `UnOp` in `evalRvalue (.unaryOp op val)`.
+
+`[adv B1]` precision fix: `evalRvalue (.unaryOp .neg _)` computes the wrapping
+two's-complement negation and never returns `.ub`; `.not` faults only on an invalid
+`bool` scalar (`evalUnaryNot`), and `.ptrMetadata` faults on a pointer-width mismatch.
 -/
 def censusUnOpFaultClasses : UnOp → List MirFaultClass
-  | .neg => [.arithOverflow]
+  | .neg => []
   | .not => [.scalarNicheInvalid]
   | .ptrMetadata => [.ptrDerefInvalid]
 
 /--
 Fault classes that can be triggered by a `NullOp` in `evalRvalue (.nullaryOp op ty)`.
+
+`[adv B1]` precision fix: `evalRvalue` has no `.nullaryOp` arm (it steps to
+`.unsupported`, which fails closed but is not `.ub`), so every `NullOp` emits `[]`.
 -/
 def censusNullOpFaultClasses : NullOp → List MirFaultClass
-  | .sizeOf | .alignOf | .offsetOf _ => [.scalarNicheInvalid]
-  | .ubChecks | .contractChecks => []
+  | _ => []
 
 /--
-Fault classes that can be triggered by a `CastKind` in `evalRvalue (.cast kind op ty)`.
+Fault classes that can be triggered by a `CastKind` in `evalRvalue (.cast kind op ty)`
+(excluding the operand evaluation itself).
+
+`[adv B1]` precision fix: `.intToInt` truncates/sign-extends and
+`.pointerExposeProvenance` / `.pointerWithExposedProvenance` re-encode the address
+without any `.ub` edge; float casts have no `evalRvalue` arm (`.unsupported`).
 -/
 def censusCastKindFaultClasses : CastKind → List MirFaultClass
-  | .intToInt | .floatToInt | .floatToFloat | .intToFloat =>
-    [.scalarNicheInvalid]
+  | .intToInt | .floatToInt | .floatToFloat | .intToFloat => []
+  | .pointerExposeProvenance | .pointerWithExposedProvenance => []
   | .transmute | .subtype =>
     [.scalarNicheInvalid, .uninitRead]
-  | .pointerExposeProvenance | .pointerWithExposedProvenance
   | .pointerCoercion _ | .ptrToPtr | .fnPtrToPtr =>
     [.boundsCheck, .ptrDerefInvalid, .ptrAlignMismatch, .scalarNicheInvalid]
 
 /--
+True for the `CastKind`s that `evalRvalue` never evaluates (no matching arm, so the
+cast steps to `.unsupported` before its operand is read).
+-/
+def castKindUnevaluated : CastKind → Bool
+  | .floatToInt | .floatToFloat | .intToFloat => true
+  | _ => false
+
+/--
 Fault classes that can be triggered by evaluating an `Rvalue`.
+
+`[adv B1]` precision fixes: `.threadLocalRef`, `.nullaryOp`, `.shallowInitBox`, and
+float casts have no `evalRvalue` arm (`.unsupported`, operand never evaluated) and
+emit `[]`; `.repeat` and every evaluated `.aggregate` only fault while evaluating
+their operands; `.copyForDeref` only faults while reading its place.
 -/
 def censusRvalueFaultClasses : Rvalue → List MirFaultClass
-  | .use op => censusOperandFaultClasses op
-  | .repeat op _ => censusOperandFaultClasses op ++ [.scalarNicheInvalid]
+  | .use op => censusLoadedOperandFaultClasses op
+  | .repeat op _ => censusOperandFaultClasses op
   | .ref _ place => censusPlaceRefFaultClasses place
-  | .threadLocalRef _ => [.ptrDerefInvalid]
+  | .threadLocalRef _ => []
   | .rawPtr _ place => censusPlaceRefFaultClasses place
   | .len place => censusPlaceReadFaultClasses place ++ [.boundsCheck]
-  | .cast kind op _ => censusOperandFaultClasses op ++ censusCastKindFaultClasses kind
+  | .cast kind op _ =>
+    if castKindUnevaluated kind then []
+    else censusOperandFaultClasses op ++ censusCastKindFaultClasses kind
   | .binaryOp op lhs rhs =>
     censusOperandFaultClasses lhs ++
       censusOperandFaultClasses rhs ++
@@ -457,14 +526,10 @@ def censusRvalueFaultClasses : Rvalue → List MirFaultClass
   | .nullaryOp op _ => censusNullOpFaultClasses op
   | .unaryOp op val => censusOperandFaultClasses val ++ censusUnOpFaultClasses op
   | .discriminant place => censusPlaceReadFaultClasses place ++ [.scalarNicheInvalid]
-  | .aggregate _ ops =>
-    (ops.flatMap censusOperandFaultClasses) ++ [.scalarNicheInvalid]
-  | .shallowInitBox op _ =>
-    censusOperandFaultClasses op ++ [.ptrDerefInvalid, .ptrAlignMismatch]
-  | .copyForDeref place =>
-    censusPlaceReadFaultClasses place ++ [.ptrDerefInvalid]
-  | .wrapUnsafeBinder op _ =>
-    censusOperandFaultClasses op ++ [.scalarNicheInvalid]
+  | .aggregate _ ops => ops.flatMap censusOperandFaultClasses
+  | .shallowInitBox _ _ => []
+  | .copyForDeref place => censusPlaceReadFaultClasses place
+  | .wrapUnsafeBinder op _ => censusLoadedOperandFaultClasses op
 
 /--
 Fault classes that can be triggered by a `NonDivergingIntrinsic`.
@@ -503,8 +568,13 @@ def censusStmtFaultClasses (kind : StatementKind) : List MirFaultClass :=
     | .deinit place =>
       .uninitRead :: (place.projection.flatMap censusProjectionElemFaultClasses)
     | .retag _ place =>
+      -- `[adv B1]`: `evalStmt (.retag ..)` reads `place` (`evalOperand (.copy place)`),
+      -- then faults on a non-pointer value, a disabled/frozen Tree Borrows tag, a
+      -- mutable retag of an immutable global, an out-of-bounds pointee, or a dangling
+      -- non-slice pointer; it never checks alignment, so `.ptrAlignMismatch` is only
+      -- emitted when `place` itself dereferences a pointer.
       censusPlaceReadFaultClasses place ++
-        [.boundsCheck, .ptrDerefInvalid, .ptrAlignMismatch, .treeBorrowsViolation]
+        [.boundsCheck, .ptrDerefInvalid, .treeBorrowsViolation]
     | .setDiscriminant place _ =>
       match place.projection with
       | [] => [.scalarNicheInvalid, .uninitRead]
@@ -589,11 +659,17 @@ def censusTerminatorFaultClasses
     | .drop place _ _ =>
       censusPlaceReadFaultClasses place ++ targetOob
     | .assert cond _ _ unwind =>
+      -- `[adv B1]`: a failed assertion dispatches `applyUnwindAction`, which faults
+      -- only for `.unreachable` (immediate `.ub`) or `.continue_` (propagating through
+      -- a caller whose `returnUnwind = .unreachable` in `unwindFromCallStack`);
+      -- `.cleanup _` and `.terminate` never fault. The trusted AST carries no
+      -- `AssertKind`, so the census does not guess arithmetic/bounds classes.
       let unwindClasses :=
         match unwind with
-        | .unreachable =>
-          [.arithOverflow, .divRemByZero, .shiftOverflow, .boundsCheck, .unreachableTerminator]
-        | _ => [.callAbiMismatch]
+        | .unreachable => [.unreachableTerminator]
+        | .continue_ => [.callAbiMismatch]
+        | .cleanup _ => []
+        | .terminate => []
       censusOperandFaultClasses cond ++ [.scalarNicheInvalid] ++ unwindClasses ++ targetOob
     | .call func args destination _ unwind =>
       let calleeClasses :=
@@ -883,7 +959,15 @@ theorem censusTerminatorFaultClasses_goto_outOfBounds
 
 @[simp]
 theorem censusBinOpFaultClasses_add :
-    censusBinOpFaultClasses .add = [.arithOverflow] := rfl
+    censusBinOpFaultClasses .add = [] := rfl
+
+@[simp]
+theorem censusBinOpFaultClasses_addWithOverflow :
+    censusBinOpFaultClasses .addWithOverflow = [] := rfl
+
+@[simp]
+theorem censusBinOpFaultClasses_addUnchecked :
+    censusBinOpFaultClasses .addUnchecked = [.arithOverflow] := rfl
 
 @[simp]
 theorem censusBinOpFaultClasses_div :
@@ -891,11 +975,16 @@ theorem censusBinOpFaultClasses_div :
 
 @[simp]
 theorem censusBinOpFaultClasses_shl :
-    censusBinOpFaultClasses .shl = [.shiftOverflow] := rfl
+    censusBinOpFaultClasses .shl = [] := rfl
+
+@[simp]
+theorem censusBinOpFaultClasses_shlUnchecked :
+    censusBinOpFaultClasses .shlUnchecked = [.shiftOverflow] := rfl
 
 @[simp]
 theorem censusBinOpFaultClasses_offset :
-    censusBinOpFaultClasses .offset = [.arithOverflow, .boundsCheck, .ptrDerefInvalid] := rfl
+    censusBinOpFaultClasses .offset =
+      [.arithOverflow, .boundsCheck, .ptrDerefInvalid, .treeBorrowsViolation] := rfl
 
 /--
 Non-overapproximation witness: `StorageLive` only emits `[.storageLiveProtected]`
@@ -976,6 +1065,336 @@ theorem evalOperand_constant_non_indirect_ne_ub
     intro h; nomatch h
   | indirect allocId offset =>
     exact False.elim (hNonIndirect allocId offset rfl)
+
+/-! ## 5b. `[adv B1]` Kernel-Checked Semantic Precision Certificates
+
+The `rfl` census equations above only restate the census definition. The theorems
+in this section instead justify census entries against `Trusted.MirSemantics`
+itself:
+
+1. `evalScalarBinOp_ne_ub_of_census_nil`: every `BinOp` whose census is `[]` can
+   never make `evalScalarBinOp` return `.ub` (zero-census soundness).
+2. `evalScalarBinOp_ub_cause`: every `.ub` result of `evalScalarBinOp` is explained
+   by a class in `censusBinOpFaultClasses op` together with its concrete semantic
+   cause (`BinOpFaultCause`: zero divisor, out-of-range shift distance, or
+   unchecked/signed-division overflow) — class-level, not just site-level,
+   completeness.
+3. `censusBinOpFaultClasses_exact`: for every scalar `BinOp`, the census is `[]`
+   *iff* `evalScalarBinOp` can never return `.ub`, witnessed by concrete faulting
+   inputs for each non-empty entry (no over-approximation).
+4. Exact `.ub` edges for `StorageLive`/`StorageDead`, `Unreachable`, `Return`
+   (root and inline frames), and out-of-bounds `Goto` targets.
+-/
+
+/-- `MirStepNode.fail` is injective in its `FailureKind`. -/
+theorem mirStepNode_fail_inj {k₁ k₂ : FailureKind}
+    (h : MirStepNode.fail k₁ = MirStepNode.fail k₂) : k₁ = k₂ := by
+  simp only [MirStepNode.fail] at h
+  injection h with h1 _
+  injection h1 with h1
+  injection h1
+
+/-- `MirStepNode.unsupported` is never `MirStepNode.fail .ub`. -/
+theorem mirStepNode_unsupported_ne_fail_ub :
+    MirStepNode.unsupported ≠ MirStepNode.fail .ub := by
+  intro h
+  have hk := mirStepNode_fail_inj h
+  cases hk
+
+/--
+Zero-census soundness for scalar binary operators: if `censusBinOpFaultClasses op = []`,
+then `evalScalarBinOp op lhs rhs locals mem isSigned` never returns `.ub`.
+-/
+theorem evalScalarBinOp_ne_ub_of_census_nil
+    (op : BinOp) (lhs rhs : ScalarInt) (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hNil : censusBinOpFaultClasses op = []) :
+    evalScalarBinOp op lhs rhs locals mem isSigned ≠ .ub := by
+  intro hUb
+  cases op <;> simp only [censusBinOpFaultClasses] at hNil <;> (try contradiction) <;>
+  · unfold evalScalarBinOp at hUb
+    repeat' (first | contradiction | (dsimp only at hUb) | (split at hUb))
+
+/--
+Concrete semantic cause justifying fault class `cls` for a `.ub` result of
+`evalScalarBinOp op lhs rhs _ _ isSigned`.
+-/
+def BinOpFaultCause
+    (cls : MirFaultClass) (op : BinOp) (lhs rhs : ScalarInt) (isSigned : Bool) : Prop :=
+  match cls with
+  | .divRemByZero => (op = .div ∨ op = .rem) ∧ rhs.bits = 0
+  | .shiftOverflow =>
+    (op = .shlUnchecked ∨ op = .shrUnchecked) ∧ lhs.sizeBytes * 8 ≤ rhs.bits
+  | .arithOverflow =>
+    ((op = .addUnchecked ∨ op = .subUnchecked ∨ op = .mulUnchecked) ∧
+        lhs.sizeBytes = rhs.sizeBytes) ∨
+      ((op = .div ∨ op = .rem) ∧ rhs.bits ≠ 0 ∧ isSigned = true ∧
+        lhs.sizeBytes = rhs.sizeBytes)
+  | _ => False
+
+/--
+Class-precise binary-operator completeness: whenever `evalScalarBinOp` returns
+`.ub`, some class `cls ∈ censusBinOpFaultClasses op` explains it via its concrete
+semantic cause `BinOpFaultCause cls op lhs rhs isSigned` (division by zero is
+attributed to `.divRemByZero` only when the divisor is `0`, shift overflow to
+`.shiftOverflow` only when the distance is `≥` the bit width, and `.arithOverflow`
+only to unchecked arithmetic or signed `MIN / -1` division/remainder).
+-/
+theorem evalScalarBinOp_ub_cause
+    (op : BinOp) (lhs rhs : ScalarInt) (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hUb : evalScalarBinOp op lhs rhs locals mem isSigned = .ub) :
+    ∃ cls, cls ∈ censusBinOpFaultClasses op ∧ BinOpFaultCause cls op lhs rhs isSigned := by
+  unfold evalScalarBinOp at hUb
+  cases op <;>
+  · repeat' (first | contradiction | (dsimp only at hUb) | (split at hUb))
+    all_goals first
+      | (refine ⟨.divRemByZero, by decide, ?_⟩; simp_all [BinOpFaultCause]; done)
+      | (refine ⟨.shiftOverflow, by decide, ?_⟩; simp_all [BinOpFaultCause]; done)
+      | (refine ⟨.shiftOverflow, by decide, ?_⟩; simp_all [BinOpFaultCause]; omega)
+      | (refine ⟨.arithOverflow, by decide, ?_⟩; simp_all [BinOpFaultCause];
+          (try (intro hz; simp_all)); done)
+
+/-- Faulting witness: `u8` `AddUnchecked 255 1` overflows. -/
+theorem evalScalarBinOp_addUnchecked_ub_witness :
+    evalScalarBinOp .addUnchecked ⟨255, 1⟩ ⟨1, 1⟩ [] {} false = .ub := rfl
+
+/-- Faulting witness: `u8` `SubUnchecked 0 1` underflows. -/
+theorem evalScalarBinOp_subUnchecked_ub_witness :
+    evalScalarBinOp .subUnchecked ⟨0, 1⟩ ⟨1, 1⟩ [] {} false = .ub := rfl
+
+/-- Faulting witness: `u8` `MulUnchecked 16 16` overflows. -/
+theorem evalScalarBinOp_mulUnchecked_ub_witness :
+    evalScalarBinOp .mulUnchecked ⟨16, 1⟩ ⟨16, 1⟩ [] {} false = .ub := rfl
+
+/-- Faulting witnesses: `Div`/`Rem` by zero, and signed `i8::MIN / -1`. -/
+theorem evalScalarBinOp_divRem_ub_witness :
+    evalScalarBinOp .div ⟨16, 1⟩ ⟨0, 1⟩ [] {} false = .ub ∧
+    evalScalarBinOp .rem ⟨16, 1⟩ ⟨0, 1⟩ [] {} false = .ub ∧
+    evalScalarBinOp .div ⟨128, 1⟩ ⟨255, 1⟩ [] {} true = .ub ∧
+    evalScalarBinOp .rem ⟨128, 1⟩ ⟨255, 1⟩ [] {} true = .ub :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Faulting witnesses: `u8` `ShlUnchecked`/`ShrUnchecked` by `8`. -/
+theorem evalScalarBinOp_shiftUnchecked_ub_witness :
+    evalScalarBinOp .shlUnchecked ⟨1, 1⟩ ⟨8, 1⟩ [] {} false = .ub ∧
+    evalScalarBinOp .shrUnchecked ⟨1, 1⟩ ⟨8, 1⟩ [] {} false = .ub :=
+  ⟨rfl, rfl⟩
+
+/--
+Binary-operator census exactness (no over-approximation, no under-approximation):
+for every scalar operator (`op ≠ .offset`, which `evalRvalue` routes to
+`evalPtrOffsetBinOp` instead), `censusBinOpFaultClasses op = []` holds exactly when
+`evalScalarBinOp op` can never return `.ub`.
+-/
+theorem censusBinOpFaultClasses_exact (op : BinOp) (hOff : op ≠ .offset) :
+    censusBinOpFaultClasses op = [] ↔
+      ∀ (lhs rhs : ScalarInt) (locals : List LocalSlot) (mem : Memory) (isSigned : Bool),
+        evalScalarBinOp op lhs rhs locals mem isSigned ≠ .ub := by
+  constructor
+  · intro hNil lhs rhs locals mem isSigned
+    exact evalScalarBinOp_ne_ub_of_census_nil op lhs rhs locals mem isSigned hNil
+  · intro hNe
+    cases op
+    all_goals first
+      | rfl
+      | exact absurd rfl hOff
+      | exact False.elim (hNe ⟨255, 1⟩ ⟨1, 1⟩ [] {} false rfl)
+      | exact False.elim (hNe ⟨0, 1⟩ ⟨1, 1⟩ [] {} false rfl)
+      | exact False.elim (hNe ⟨16, 1⟩ ⟨16, 1⟩ [] {} false rfl)
+      | exact False.elim (hNe ⟨16, 1⟩ ⟨0, 1⟩ [] {} false rfl)
+      | exact False.elim (hNe ⟨1, 1⟩ ⟨8, 1⟩ [] {} false rfl)
+
+/--
+Exact `StorageLive` `.ub` edge: `StorageLive loc` faults iff `loc` is out of bounds
+for the frame's locals, or an active function-entry protector protects a borrow of
+`loc` (`hasProtectedLocalBorrow`). Both edges are `.storageLiveProtected`, the only
+class in `censusStmtFaultClasses (.storageLive loc)`.
+-/
+theorem evalStmt_storageLive_ub_iff
+    (s : MachineState) (loc : Local) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub ↔
+      (s.frame.locals.length ≤ loc ∨
+        (s.memory.activeProtectors ≠ [] ∧
+          hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true)) := by
+  dsimp only [evalStmt]
+  by_cases hLt : loc < s.frame.locals.length
+  · have hGet : get? s.frame.locals loc = some (s.frame.locals[loc]) := by
+      simp [get?, hLt]
+    have hSet : set? s.frame.locals loc .uninit =
+        some (s.frame.locals.set loc .uninit) := by
+      simp [set?, hLt]
+    rw [hGet]
+    dsimp only
+    rw [hSet]
+    dsimp only
+    have hNotLe : ¬ (s.frame.locals.length ≤ loc) := Nat.not_le_of_lt hLt
+    cases hProt : s.memory.activeProtectors with
+    | nil => simp [hNotLe, MirStepNode.step, MirStepNode.fail]
+    | cons p ps =>
+      cases hHas : hasProtectedLocalBorrow s.memory.borrows (p :: ps) loc
+      · simp [hHas, hNotLe, MirStepNode.step, MirStepNode.fail]
+      · simp [hHas]
+  · have hGet : get? s.frame.locals loc = none := by
+      simp only [get?]
+      exact List.getElem?_eq_none (Nat.le_of_not_lt hLt)
+    rw [hGet]
+    exact ⟨fun _ => Or.inl (Nat.le_of_not_lt hLt), fun _ => rfl⟩
+
+/--
+Exact `StorageDead` `.ub` edge (same shape as `evalStmt_storageLive_ub_iff`).
+-/
+theorem evalStmt_storageDead_ub_iff
+    (s : MachineState) (loc : Local) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub ↔
+      (s.frame.locals.length ≤ loc ∨
+        (s.memory.activeProtectors ≠ [] ∧
+          hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true)) := by
+  dsimp only [evalStmt]
+  by_cases hLt : loc < s.frame.locals.length
+  · have hGet : get? s.frame.locals loc = some (s.frame.locals[loc]) := by
+      simp [get?, hLt]
+    have hSet : set? s.frame.locals loc .dead =
+        some (s.frame.locals.set loc .dead) := by
+      simp [set?, hLt]
+    rw [hGet]
+    dsimp only
+    rw [hSet]
+    dsimp only
+    have hNotLe : ¬ (s.frame.locals.length ≤ loc) := Nat.not_le_of_lt hLt
+    cases hProt : s.memory.activeProtectors with
+    | nil => simp [hNotLe, MirStepNode.step, MirStepNode.fail]
+    | cons p ps =>
+      cases hHas : hasProtectedLocalBorrow s.memory.borrows (p :: ps) loc
+      · simp [hHas, hNotLe, MirStepNode.step, MirStepNode.fail]
+      · simp [hHas]
+  · have hGet : get? s.frame.locals loc = none := by
+      simp only [get?]
+      exact List.getElem?_eq_none (Nat.le_of_not_lt hLt)
+    rw [hGet]
+    exact ⟨fun _ => Or.inl (Nat.le_of_not_lt hLt), fun _ => rfl⟩
+
+/-- `Unreachable` always faults with `.ub` (its sole class is `.unreachableTerminator`). -/
+theorem evalTerminator_unreachable_ub
+    (s : MachineState) (span : String) (currentBody : Option CapturedMir) :
+    evalTerminator s ⟨.unreachable, span⟩ currentBody = MirStepNode.fail .ub := rfl
+
+/--
+Exact root-frame `Return` `.ub` edge: with an empty call stack, `Return` faults iff
+the return place `_0` does not hold an initialized value (`.uninitRead`).
+-/
+theorem evalTerminator_return_root_ub_iff
+    (s : MachineState) (span : String) (currentBody : Option CapturedMir)
+    (hStack : s.memory.callStack = []) :
+    evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub ↔
+      ∀ v, get? s.frame.locals 0 ≠ some (.init v) := by
+  dsimp only [evalTerminator]
+  rw [hStack]
+  cases hRet : get? s.frame.locals 0 with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | init v =>
+      simp [MirStepNode.retNormal, MirStepNode.fail]
+    | uninit => simp
+    | dead => simp
+
+/--
+Exact inline-frame `Return` `.ub` edges: when returning into `caller`, `Return`
+faults iff `_0` is not initialized (`.uninitRead`), the caller frame expected a
+diverging callee (`.callAbiMismatch`), or writing the return value into the
+caller's `destination` place faults (`writePlaceValue`, `.treeBorrowsViolation`).
+-/
+theorem evalTerminator_return_inline_ub_iff
+    (s : MachineState) (span : String) (currentBody : Option CapturedMir)
+    (caller : SavedCallerFrame) (restStack : List SavedCallerFrame)
+    (hStack : s.memory.callStack = caller :: restStack) :
+    evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub ↔
+      ((∀ v, get? s.frame.locals 0 ≠ some (.init v)) ∨
+        ∃ v, get? s.frame.locals 0 = some (.init v) ∧
+          (caller.isDiverging = true ∨
+            writePlaceValue caller.frame.locals s.memory.borrows caller.destination v =
+              .ub)) := by
+  dsimp only [evalTerminator]
+  rw [hStack]
+  cases hRet : get? s.frame.locals 0 with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | init v =>
+      dsimp only
+      cases hDiv : caller.isDiverging with
+      | true => simp
+      | false =>
+        dsimp only
+        cases hW : writePlaceValue caller.frame.locals s.memory.borrows caller.destination v with
+        | ok updated => simp [hW, MirStepNode.step, MirStepNode.fail]
+        | ub => simp [hW]
+        | unsupported => simp [hW, mirStepNode_unsupported_ne_fail_ub]
+    | uninit => simp
+    | dead => simp
+
+/--
+Exact `.ub` edges of a borrow (`Rvalue.ref` / `Rvalue.rawPtr`) of a place whose
+projection does not start with `.deref`: evaluation faults iff the root local is
+missing or dead, or an `.index` local is not an initialized scalar
+(`resolveBorrowProjectionElems`). All three edges are `.uninitRead`, the only class
+in `censusPlaceRefFaultClasses` for such places — no bounds, alignment, or
+Tree Borrows permission check happens when borrowing a stack place.
+-/
+theorem evalRvalue_borrow_nonDeref_ub_iff
+    (locals : List LocalSlot) (rv : Rvalue) (place : Place) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hRv : (∃ bk, rv = .ref bk place) ∨ (∃ m, rv = .rawPtr m place))
+    (hNoDeref : ∀ rest, place.projection ≠ .deref :: rest) :
+    evalRvalue locals rv mem localDecls layouts = .ub ↔
+      (get? locals place.local_ = none ∨ get? locals place.local_ = some .dead ∨
+        resolveBorrowProjectionElems locals place.projection = none) := by
+  rcases hRv with ⟨bk, rfl⟩ | ⟨m, rfl⟩ <;>
+  · -- `simp`'s match splitter discharges the `.deref :: _` overlap with `hNoDeref`.
+    simp only [evalRvalue]
+    cases hGet : get? locals place.local_ with
+    | none => simp
+    | some slot =>
+      cases slot with
+      | dead => simp
+      | uninit =>
+        cases hRes : resolveBorrowProjectionElems locals place.projection with
+        | none => simp
+        | some r => simp
+      | init v =>
+        cases hRes : resolveBorrowProjectionElems locals place.projection with
+        | none => simp
+        | some r => simp
+
+/--
+Out-of-bounds `Goto` edge: `Goto target` itself never faults, but when
+`length body.basicBlocks ≤ target`, the *next* `stepMirFn` from the resulting
+top-level state faults with `.ub` (`get? body.basicBlocks target = none`). This is
+why `censusTerminatorFaultClasses` attributes `.boundsCheck` to an out-of-bounds
+`Goto` site even though `evalTerminator` steps successfully there.
+-/
+theorem stepMirFn_after_goto_oob_ub
+    (body : CapturedMir) (s s' : MachineState) (target : BasicBlockIdx) (span : String)
+    (hTop : s.memory.activeCallee = none)
+    (hPhase : ∀ tag, body.phase ≠ .other tag)
+    (hOob : length body.basicBlocks ≤ target)
+    (hStep : evalTerminator s ⟨.goto target, span⟩ (some body) = MirStepNode.step s') :
+    stepMirFn body s' = MirStepNode.fail .ub := by
+  dsimp only [evalTerminator, MirStepNode.step] at hStep
+  injection hStep with hS
+  injection hS with hS
+  subst hS
+  have hNone : get? body.basicBlocks target = none := by
+    simp only [get?, length] at hOob ⊢
+    exact List.getElem?_eq_none hOob
+  dsimp only [stepMirFn]
+  rw [hTop]
+  dsimp only [Option.getD]
+  cases hPh : body.phase with
+  | other tag => exact absurd hPh (hPhase tag)
+  | runtimePostCleanup => simp [hNone]
+  | runtimeOptimized => simp [hNone]
 
 /-! ## 6. Census Membership Lemmas & Completeness over `stepMirFn` -/
 
@@ -1079,22 +1498,80 @@ theorem mem_censusMirBodyFaultSites_of_block
   exact mem_censusBlocksAux_of_get?
     (length body.basicBlocks) body.basicBlocks 0 blockIdx bb site hBb hSite'
 
+/-! ### 6a. `[adv B1]` One-Step UB Exposure (Covers External-Call Continuations) -/
+
 /--
-Statement-level census completeness: whenever `evalStmt` faults with
-`MirStepNode.fail .ub`, `censusStmtFaultClasses stmt.kind` contains at least one
-justifying `MirFaultClass` for `stmt.kind`.
+One-step UB exposure of a `MirStepNode`: either the node itself is
+`MirStepNode.fail .ub`, or one of its immediate continuation states (after a silent
+`.tau`, or after *any* answer to a visible request such as an external `MirCallE`
+call) is `MirExecState.faulted .ub`, which `stepMirState` unfolds to
+`MirStepNode.fail .ub` on the very next step of `mirTree`.
+
+`stepMirFn body s = MirStepNode.fail .ub` alone misses the second disjunct:
+`resumeExternalCall` faults *inside* the `MirStepNode.extCall` continuation when the
+returned value cannot be written into the call's `destination` place or the unwind
+edge is `.unreachable`, and `resumeExternalDivergingCall` faults when a diverging
+external callee returns normally. Those `.ub` nodes are reachable in
+`mirTree body s` without `stepMirFn` ever returning `MirStepNode.fail .ub`.
 -/
-theorem evalStmt_ub_implies_mem_censusStmt
+def StepNodeExposesUb (node : MirStepNode) : Prop :=
+  node = MirStepNode.fail .ub ∨
+    match node with
+    | .ret _ => False
+    | .tau t => t = .faulted .ub
+    | .vis _ k => ∃ a, k a = .faulted .ub
+
+/-- `MirStepNode.fail .ub` exposes `.ub`. -/
+theorem stepNodeExposesUb_fail_ub : StepNodeExposesUb (MirStepNode.fail .ub) :=
+  Or.inl rfl
+
+/-- An external call whose continuation faults on some answer exposes `.ub`. -/
+theorem stepNodeExposesUb_extCall
+    (req : MirCallReq) (k : MirCallAns → MirExecState) (ans : MirCallAns)
+    (hFault : k ans = .faulted .ub) :
+    StepNodeExposesUb (MirStepNode.extCall req k) :=
+  Or.inr ⟨ans, hFault⟩
+
+/-- A silent step to a running state never exposes `.ub`. -/
+theorem not_stepNodeExposesUb_step (st : MachineState) :
+    ¬ StepNodeExposesUb (MirStepNode.step st) := by
+  intro h
+  rcases h with h | h
+  · nomatch h
+  · nomatch h
+
+/-- A terminal `.ret` node never exposes `.ub`. -/
+theorem not_stepNodeExposesUb_ret (out : MirOutcome) :
+    ¬ StepNodeExposesUb (.ret out : MirStepNode) := by
+  intro h
+  rcases h with h | h
+  · nomatch h
+  · exact h
+
+/-- The fail-closed `.unsupported` node never exposes `.ub`. -/
+theorem not_stepNodeExposesUb_unsupported :
+    ¬ StepNodeExposesUb MirStepNode.unsupported := by
+  intro h
+  rcases h with h | ⟨a, _⟩
+  · exact mirStepNode_unsupported_ne_fail_ub h
+  · exact PEmpty.elim a
+
+/--
+Statement-level census completeness over one-step UB exposure: whenever
+`evalStmt` exposes `.ub` (immediately or through a continuation),
+`censusStmtFaultClasses stmt.kind` contains at least one justifying class.
+-/
+theorem evalStmt_exposesUb_implies_mem_censusStmt
     (s : MachineState) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (hUb : evalStmt s stmt localDecls layouts = MirStepNode.fail .ub) :
+    (hUb : StepNodeExposesUb (evalStmt s stmt localDecls layouts)) :
     ∃ cls : MirFaultClass, cls ∈ censusStmtFaultClasses stmt.kind := by
   rcases stmt with ⟨kind, span⟩
   cases kind with
-  | nop => nomatch hUb
-  | coverage => nomatch hUb
-  | constEvalCounter => nomatch hUb
-  | backwardIncompatibleDropHint _ => nomatch hUb
+  | nop => exact absurd hUb (not_stepNodeExposesUb_step _)
+  | coverage => exact absurd hUb (not_stepNodeExposesUb_step _)
+  | constEvalCounter => exact absurd hUb (not_stepNodeExposesUb_step _)
+  | backwardIncompatibleDropHint _ => exact absurd hUb (not_stepNodeExposesUb_step _)
   | storageLive _ =>
     exact ⟨.storageLiveProtected, by dsimp only [censusStmtFaultClasses]; decide⟩
   | storageDead _ =>
@@ -1125,20 +1602,32 @@ theorem evalStmt_ub_implies_mem_censusStmt
       simp [censusStmtFaultClasses, censusPlaceWriteFaultClasses, hProj]
 
 /--
-Terminator-level census completeness: whenever `evalTerminator` faults with
-`MirStepNode.fail .ub`, `censusTerminatorFaultClasses numBlocks term.kind`
-contains at least one justifying `MirFaultClass` for `term.kind`.
+Statement-level census completeness: whenever `evalStmt` faults with
+`MirStepNode.fail .ub`, `censusStmtFaultClasses stmt.kind` contains at least one
+justifying `MirFaultClass` for `stmt.kind`.
 -/
-theorem evalTerminator_ub_implies_mem_censusTerminator
+theorem evalStmt_ub_implies_mem_censusStmt
+    (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUb : evalStmt s stmt localDecls layouts = MirStepNode.fail .ub) :
+    ∃ cls : MirFaultClass, cls ∈ censusStmtFaultClasses stmt.kind :=
+  evalStmt_exposesUb_implies_mem_censusStmt s stmt localDecls layouts (Or.inl hUb)
+
+/--
+Terminator-level census completeness over one-step UB exposure (including `.ub`
+raised inside `resumeExternalCall` / `resumeExternalDivergingCall` /
+`resumeExternalTailCall` continuations of external calls).
+-/
+theorem evalTerminator_exposesUb_implies_mem_censusTerminator
     (numBlocks : Nat) (s : MachineState) (term : Terminator)
     (currentBody : Option CapturedMir)
-    (hUb : evalTerminator s term currentBody = MirStepNode.fail .ub) :
+    (hUb : StepNodeExposesUb (evalTerminator s term currentBody)) :
     ∃ cls : MirFaultClass, cls ∈ censusTerminatorFaultClasses numBlocks term.kind := by
   rcases term with ⟨kind, span⟩
   cases kind with
-  | goto _ => nomatch hUb
-  | unwindTerminate => nomatch hUb
-  | inlineAsm _ _ _ => nomatch hUb
+  | goto _ => exact absurd hUb (not_stepNodeExposesUb_step _)
+  | unwindTerminate => exact absurd hUb (not_stepNodeExposesUb_ret _)
+  | inlineAsm _ _ _ => exact absurd hUb not_stepNodeExposesUb_unsupported
   | unreachable =>
     exact ⟨.unreachableTerminator, by dsimp only [censusTerminatorFaultClasses]; decide⟩
   | unwindResume =>
@@ -1160,6 +1649,19 @@ theorem evalTerminator_ub_implies_mem_censusTerminator
   | tailCall func args =>
     refine ⟨.callAbiMismatch, ?_⟩
     simp [censusTerminatorFaultClasses]
+
+/--
+Terminator-level census completeness: whenever `evalTerminator` faults with
+`MirStepNode.fail .ub`, `censusTerminatorFaultClasses numBlocks term.kind`
+contains at least one justifying `MirFaultClass` for `term.kind`.
+-/
+theorem evalTerminator_ub_implies_mem_censusTerminator
+    (numBlocks : Nat) (s : MachineState) (term : Terminator)
+    (currentBody : Option CapturedMir)
+    (hUb : evalTerminator s term currentBody = MirStepNode.fail .ub) :
+    ∃ cls : MirFaultClass, cls ∈ censusTerminatorFaultClasses numBlocks term.kind :=
+  evalTerminator_exposesUb_implies_mem_censusTerminator numBlocks s term currentBody
+    (Or.inl hUb)
 
 /-! ## 7. Valid PC Bounds (`ValidMirPc`), CFG Invariance, and `stepMirFn_fault_in_census` -/
 
@@ -1237,6 +1739,75 @@ theorem validMirPc_initMachineState
   exact ⟨bb0, hBb0, Nat.zero_le _⟩
 
 /--
+`[adv B1]` Strengthened Fault-Site Census Completeness over the active body: whenever
+`stepMirFn body s` *exposes* `.ub` from a valid program counter — either by
+returning `MirStepNode.fail .ub` directly or through a continuation such as an
+external call's `resumeExternalCall` that yields `MirExecState.faulted .ub` — the
+active program counter `(s.frame.blockIdx, s.frame.stmtIdx, cls)` is present in
+`censusMirBodyFaultSites (s.memory.activeCallee.getD body)` for some `cls`.
+-/
+theorem stepMirFn_activeBody_exposesUb_in_census
+    (body : CapturedMir) (s : MachineState)
+    (hPc : ValidMirPc (s.memory.activeCallee.getD body) s.frame)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈
+        censusMirBodyFaultSites (s.memory.activeCallee.getD body) := by
+  dsimp only [stepMirFn] at hUb
+  generalize s.memory.activeCallee.getD body = currentBody at hPc hUb ⊢
+  rcases hPc with ⟨bb, hBb, hStmtLe⟩
+  have hCore :
+      StepNodeExposesUb
+          (match get? bb.statements s.frame.stmtIdx with
+            | some stmt => evalStmt s stmt currentBody.localDecls currentBody.layouts
+            | none =>
+              if (s.frame.stmtIdx == length bb.statements) = true then
+                evalTerminator s bb.terminator (some currentBody)
+              else MirStepNode.fail .ub) →
+        ∃ cls : MirFaultClass,
+          (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites currentBody := by
+    intro hUb'
+    cases hGetStmt : get? bb.statements s.frame.stmtIdx with
+    | some stmt =>
+      rw [hGetStmt] at hUb'
+      rcases evalStmt_exposesUb_implies_mem_censusStmt s stmt currentBody.localDecls
+          currentBody.layouts hUb' with ⟨cls, hCls⟩
+      refine ⟨cls, ?_⟩
+      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
+        (s.frame.blockIdx, s.frame.stmtIdx, cls) hBb
+        (mem_censusBlockFaultSites_of_stmt (length currentBody.basicBlocks)
+          s.frame.blockIdx bb s.frame.stmtIdx stmt cls hGetStmt hCls)
+    | none =>
+      rw [hGetStmt] at hUb'
+      have hGe : length bb.statements ≤ s.frame.stmtIdx :=
+        length_le_of_get?_eq_none bb.statements s.frame.stmtIdx hGetStmt
+      have hEqIdx : s.frame.stmtIdx = length bb.statements :=
+        Nat.le_antisymm hStmtLe hGe
+      have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
+        simp [hEqIdx]
+      rw [hBeq] at hUb'
+      dsimp only [ite_true] at hUb'
+      rcases evalTerminator_exposesUb_implies_mem_censusTerminator
+          (length currentBody.basicBlocks) s bb.terminator (some currentBody) hUb' with
+        ⟨cls, hCls⟩
+      refine ⟨cls, ?_⟩
+      rw [hEqIdx]
+      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
+        (s.frame.blockIdx, length bb.statements, cls) hBb
+        (mem_censusBlockFaultSites_of_terminator (length currentBody.basicBlocks)
+          s.frame.blockIdx bb cls hCls)
+  cases hPhase : currentBody.phase with
+  | other tag =>
+    rw [hPhase] at hUb
+    exact absurd hUb not_stepNodeExposesUb_unsupported
+  | runtimePostCleanup =>
+    rw [hPhase, hBb] at hUb
+    exact hCore hUb
+  | runtimeOptimized =>
+    rw [hPhase, hBb] at hUb
+    exact hCore hUb
+
+/--
 General Fault-Site Census Completeness Theorem over the active body
 (`s.memory.activeCallee.getD body`): whenever `stepMirFn body s` faults with
 `MirStepNode.fail .ub` from a valid program counter `ValidMirPc`, the active
@@ -1250,78 +1821,24 @@ theorem stepMirFn_activeBody_fault_in_census
     (hUb : stepMirFn body s = MirStepNode.fail .ub) :
     ∃ cls : MirFaultClass,
       (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈
-        censusMirBodyFaultSites (s.memory.activeCallee.getD body) := by
-  dsimp only [stepMirFn] at hUb
-  generalize s.memory.activeCallee.getD body = currentBody at hPc hUb ⊢
-  rcases hPc with ⟨bb, hBb, hStmtLe⟩
-  cases hPhase : currentBody.phase with
-  | other tag =>
-    rw [hPhase] at hUb
-    nomatch hUb
-  | runtimePostCleanup =>
-    rw [hPhase, hBb] at hUb
-    dsimp only at hUb
-    cases hGetStmt : get? bb.statements s.frame.stmtIdx with
-    | some stmt =>
-      rw [hGetStmt] at hUb
-      rcases evalStmt_ub_implies_mem_censusStmt s stmt currentBody.localDecls
-          currentBody.layouts hUb with ⟨cls, hCls⟩
-      refine ⟨cls, ?_⟩
-      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
-        (s.frame.blockIdx, s.frame.stmtIdx, cls) hBb
-        (mem_censusBlockFaultSites_of_stmt (length currentBody.basicBlocks)
-          s.frame.blockIdx bb s.frame.stmtIdx stmt cls hGetStmt hCls)
-    | none =>
-      rw [hGetStmt] at hUb
-      have hGe : length bb.statements ≤ s.frame.stmtIdx :=
-        length_le_of_get?_eq_none bb.statements s.frame.stmtIdx hGetStmt
-      have hEqIdx : s.frame.stmtIdx = length bb.statements :=
-        Nat.le_antisymm hStmtLe hGe
-      have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
-        simp [hEqIdx]
-      rw [hBeq] at hUb
-      dsimp only [ite_true] at hUb
-      rcases evalTerminator_ub_implies_mem_censusTerminator
-          (length currentBody.basicBlocks) s bb.terminator (some currentBody) hUb with
-        ⟨cls, hCls⟩
-      refine ⟨cls, ?_⟩
-      rw [hEqIdx]
-      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
-        (s.frame.blockIdx, length bb.statements, cls) hBb
-        (mem_censusBlockFaultSites_of_terminator (length currentBody.basicBlocks)
-          s.frame.blockIdx bb cls hCls)
-  | runtimeOptimized =>
-    rw [hPhase, hBb] at hUb
-    dsimp only at hUb
-    cases hGetStmt : get? bb.statements s.frame.stmtIdx with
-    | some stmt =>
-      rw [hGetStmt] at hUb
-      rcases evalStmt_ub_implies_mem_censusStmt s stmt currentBody.localDecls
-          currentBody.layouts hUb with ⟨cls, hCls⟩
-      refine ⟨cls, ?_⟩
-      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
-        (s.frame.blockIdx, s.frame.stmtIdx, cls) hBb
-        (mem_censusBlockFaultSites_of_stmt (length currentBody.basicBlocks)
-          s.frame.blockIdx bb s.frame.stmtIdx stmt cls hGetStmt hCls)
-    | none =>
-      rw [hGetStmt] at hUb
-      have hGe : length bb.statements ≤ s.frame.stmtIdx :=
-        length_le_of_get?_eq_none bb.statements s.frame.stmtIdx hGetStmt
-      have hEqIdx : s.frame.stmtIdx = length bb.statements :=
-        Nat.le_antisymm hStmtLe hGe
-      have hBeq : (s.frame.stmtIdx == length bb.statements) = true := by
-        simp [hEqIdx]
-      rw [hBeq] at hUb
-      dsimp only [ite_true] at hUb
-      rcases evalTerminator_ub_implies_mem_censusTerminator
-          (length currentBody.basicBlocks) s bb.terminator (some currentBody) hUb with
-        ⟨cls, hCls⟩
-      refine ⟨cls, ?_⟩
-      rw [hEqIdx]
-      exact mem_censusMirBodyFaultSites_of_block currentBody s.frame.blockIdx bb
-        (s.frame.blockIdx, length bb.statements, cls) hBb
-        (mem_censusBlockFaultSites_of_terminator (length currentBody.basicBlocks)
-          s.frame.blockIdx bb cls hCls)
+        censusMirBodyFaultSites (s.memory.activeCallee.getD body) :=
+  stepMirFn_activeBody_exposesUb_in_census body s hPc (Or.inl hUb)
+
+/--
+`[adv B1]` Top-level strengthened completeness over one-step UB exposure
+(`s.memory.activeCallee = none`).
+-/
+theorem stepMirFn_exposesUb_in_census
+    (body : CapturedMir) (s : MachineState)
+    (hTop : s.memory.activeCallee = none)
+    (hPc : ValidMirPc body s.frame)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body := by
+  have hPcActive : ValidMirPc (s.memory.activeCallee.getD body) s.frame := by
+    simpa [hTop] using hPc
+  have hActive := stepMirFn_activeBody_exposesUb_in_census body s hPcActive hUb
+  simpa [hTop] using hActive
 
 /--
 Top-Level Fault-Site Census Completeness Theorem (`stepMirFn_fault_in_census`):
@@ -1336,11 +1853,44 @@ theorem stepMirFn_fault_in_census
     (hPc : ValidMirPc body s.frame)
     (hUb : stepMirFn body s = MirStepNode.fail .ub) :
     ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body :=
+  stepMirFn_exposesUb_in_census body s hTop hPc (Or.inl hUb)
+
+/--
+`[adv B1]` External-call continuation coverage: if `stepMirFn body s` issues an
+external call `MirStepNode.extCall req k` and *some* answer `ans` makes the
+continuation fault (`k ans = .faulted .ub`, e.g. an invalid `destination` write in
+`resumeExternalCall` or a normal return from a diverging callee in
+`resumeExternalDivergingCall`), the calling program counter is censused.
+-/
+theorem stepMirFn_extCall_cont_fault_in_census
+    (body : CapturedMir) (s : MachineState)
+    (hTop : s.memory.activeCallee = none)
+    (hPc : ValidMirPc body s.frame)
+    (req : MirCallReq) (k : MirCallAns → MirExecState) (ans : MirCallAns)
+    (hStep : stepMirFn body s = MirStepNode.extCall req k)
+    (hFault : k ans = .faulted .ub) :
+    ∃ cls : MirFaultClass,
       (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body := by
-  have hPcActive : ValidMirPc (s.memory.activeCallee.getD body) s.frame := by
-    simpa [hTop] using hPc
-  have hActive := stepMirFn_activeBody_fault_in_census body s hPcActive hUb
-  simpa [hTop] using hActive
+  apply stepMirFn_exposesUb_in_census body s hTop hPc
+  rw [hStep]
+  exact stepNodeExposesUb_extCall req k ans hFault
+
+/--
+`[adv B1]` Strengthened zero-census UB-freedom: if no class is censused at the
+current program counter, `stepMirFn body s` neither faults with `.ub` nor reaches
+`.faulted .ub` through any continuation (including external-call answers).
+-/
+theorem stepMirFn_not_exposesUb_of_site_uncensused
+    (body : CapturedMir) (s : MachineState)
+    (hTop : s.memory.activeCallee = none)
+    (hPc : ValidMirPc body s.frame)
+    (hUncensused : ∀ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∉ censusMirBodyFaultSites body) :
+    ¬ StepNodeExposesUb (stepMirFn body s) := by
+  intro hUb
+  rcases stepMirFn_exposesUb_in_census body s hTop hPc hUb with ⟨cls, hMem⟩
+  exact hUncensused cls hMem
 
 /--
 Zero-Census UB-Freedom at a Program Counter (`stepMirFn_ne_ub_of_site_uncensused`):
@@ -1354,10 +1904,8 @@ theorem stepMirFn_ne_ub_of_site_uncensused
     (hPc : ValidMirPc body s.frame)
     (hUncensused : ∀ cls : MirFaultClass,
       (s.frame.blockIdx, s.frame.stmtIdx, cls) ∉ censusMirBodyFaultSites body) :
-    stepMirFn body s ≠ MirStepNode.fail .ub := by
-  intro hUb
-  rcases stepMirFn_fault_in_census body s hTop hPc hUb with ⟨cls, hMem⟩
-  exact hUncensused cls hMem
+    stepMirFn body s ≠ MirStepNode.fail .ub := fun hUb =>
+  stepMirFn_not_exposesUb_of_site_uncensused body s hTop hPc hUncensused (Or.inl hUb)
 
 /--
 Zero-Census UB-Freedom for a Pure Body (`stepMirFn_ne_ub_of_empty_census`):
@@ -2634,7 +3182,48 @@ theorem stepMirFn_fault_in_discharged_of_reconciled
   rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
   exact ⟨cls, hInDis, hReg⟩
 
-/-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`) -/
+/--
+`[adv B1]` Reconciled coverage also discharges every one-step UB *exposure*,
+including `.faulted .ub` continuations of external calls.
+-/
+theorem stepMirFn_exposesUb_in_discharged_of_reconciled
+    (registry : PropertyRegistry) (body : CapturedMir)
+    (discharged : List FaultSite) (s : MachineState)
+    (hVer : reconcileFaultCoverageWithRegistry registry
+      (censusMirBodyFaultSites body) discharged = .verified)
+    (hTop : s.memory.activeCallee = none)
+    (hPc : ValidMirPc body s.frame)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  rcases stepMirFn_exposesUb_in_census body s hTop hPc hUb with ⟨cls, hInCensus⟩
+  have hAll :=
+    (reconcileFaultCoverageWithRegistry_verified_iff
+      registry (censusMirBodyFaultSites body) discharged).mp hVer
+  rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
+
+/-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
+
+`[adv B1]`: every witness body now declares well-typed `localDecls` for every local
+it mentions, and each probe is paired with a kernel-evaluated *liveness* certificate
+(`stepMirFn ... = MirStepNode.fail .ub` by `rfl` from a concrete state at the very
+site the mutant strips) plus a *non-fault* contrast state, so no probe can pass by
+stripping a semantically dead census label.
+-/
+
+/-- `true` iff `node` is a silent `.tau` transition (kernel-evaluable non-fault check). -/
+def stepNodeIsTau : MirStepNode → Bool
+  | .tau _ => true
+  | _ => false
+
+/-- A node recognized as `.tau` by `stepNodeIsTau` is not `MirStepNode.fail .ub`. -/
+theorem ne_fail_ub_of_stepNodeIsTau {node : MirStepNode}
+    (h : stepNodeIsTau node = true) : node ≠ MirStepNode.fail .ub := by
+  intro hEq
+  rw [hEq] at h
+  exact absurd h (by decide)
 
 /-- Default dummy ABI used by synthetic witness `CapturedMir` bodies. -/
 def dummyWitnessFnAbi : FnAbi :=
@@ -2657,6 +3246,32 @@ def dummyWitnessFnAbi : FnAbi :=
   , conv := CallConv.rust
   , canUnwind := false
   }
+
+/-- `u32` local declaration used by synthetic witness bodies. -/
+def witnessU32Decl : LocalDecl :=
+  { mutability := Mutability.mut
+  , ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+  , debugName := Option.none
+  }
+
+/-- `*const u32` local declaration used by synthetic witness bodies. -/
+def witnessPtrU32Decl : LocalDecl :=
+  { mutability := Mutability.not
+  , ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 0 }
+  , debugName := Option.none
+  }
+
+/-- Concrete witness state at program counter `(blockIdx, stmtIdx)` with `locals`. -/
+def witnessState (blockIdx stmtIdx : Nat) (locals : List LocalSlot) : MachineState :=
+  { frame := { blockIdx := blockIdx, stmtIdx := stmtIdx, locals := locals }
+    memory := {} }
+
+/-- `u32` scalar local slot holding `bits`. -/
+def witnessU32Slot (bits : Nat) : LocalSlot := .init (.scalar ⟨bits, 4⟩)
+
+/-- Dangling thin pointer slot into a non-existent allocation `allocId`. -/
+def witnessDanglingPtrSlot (allocId : Nat) : LocalSlot :=
+  .init (.ptr { allocId := allocId, offsetBytes := 0 } 8)
 
 /--
 Witness 0: Pure zero-fault MIR body (`witnessPureNoopBody`) containing `.nop`,
@@ -2707,8 +3322,8 @@ theorem witnessPureNoopBody_census_empty :
   decide
 
 /--
-By `stepMirFn_ne_ub_of_empty_census`, `witnessPureNoopBody` can never fault with
-`MirStepNode.fail .ub` at any valid program counter.
+By `stepMirFn_not_exposesUb_of_site_uncensused`, `witnessPureNoopBody` never exposes
+`.ub` (directly or through any continuation) at any valid program counter.
 -/
 theorem witnessPureNoopBody_stepMirFn_ne_ub
     (s : MachineState)
@@ -2728,18 +3343,7 @@ def witnessCallArgBlindBody : CapturedMir :=
   , phase := MirPhaseTag.runtimePostCleanup
   , role := ContractRole.subject
   , argCount := 1
-  , localDecls :=
-      (List.cons
-        { mutability := Mutability.mut
-        , ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
-        , debugName := Option.none
-        }
-        (List.cons
-          { mutability := Mutability.not
-          , ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 0 }
-          , debugName := (Option.some "arg_ptr")
-          }
-          List.nil))
+  , localDecls := (List.cons witnessU32Decl (List.cons witnessPtrU32Decl List.nil))
   , basicBlocks :=
       (List.cons
         { statements := List.nil
@@ -2811,8 +3415,19 @@ theorem witnessCallArgBlind_probe_verified_and_detected :
   decide
 
 /--
+`CallArgBlindProbe` liveness: the stripped call site `(0, 0)` really faults in
+`Trusted.MirSemantics` — evaluating the argument `copy (*_1)` through a dangling
+pointer makes `stepMirFn` return `MirStepNode.fail .ub` at `(0, 0)`.
+-/
+theorem witnessCallArgBlind_call_site_live :
+    stepMirFn witnessCallArgBlindBody
+        (witnessState 0 0 [.uninit, witnessDanglingPtrSlot 9]) =
+      MirStepNode.fail .ub := by
+  rfl
+
+/--
 Witness 2 (`SwitchBreakStripProbe`): `TerminatorKind.switchInt` in `bb0`
-branching to `bb1` (safe constant assignment) and `bb2` (unchecked division
+branching to `bb1` (safe constant assignment) and `bb2` (checked-by-UB division
 `BinOp.div` at `(2, 0)`).
 -/
 def witnessSwitchBreakStripBody : CapturedMir :=
@@ -2820,7 +3435,8 @@ def witnessSwitchBreakStripBody : CapturedMir :=
   , phase := MirPhaseTag.runtimePostCleanup
   , role := ContractRole.subject
   , argCount := 2
-  , localDecls := List.nil
+  , localDecls :=
+      (List.cons witnessU32Decl (List.cons witnessU32Decl (List.cons witnessU32Decl List.nil)))
   , basicBlocks :=
       (List.cons
         { statements := List.nil
@@ -2916,16 +3532,32 @@ theorem witnessSwitchBreakStrip_probe_verified_and_detected :
   decide
 
 /--
+`SwitchBreakStripProbe` liveness: the stripped arm's division site `(2, 0)` really
+faults (`_2 = 0`), while a non-zero divisor steps silently.
+-/
+theorem witnessSwitchBreakStrip_div_site_live :
+    stepMirFn witnessSwitchBreakStripBody
+        (witnessState 2 0 [.uninit, witnessU32Slot 7, witnessU32Slot 0]) =
+      MirStepNode.fail .ub ∧
+    stepMirFn witnessSwitchBreakStripBody
+        (witnessState 2 0 [.uninit, witnessU32Slot 7, witnessU32Slot 2]) ≠
+      MirStepNode.fail .ub :=
+  ⟨rfl, ne_fail_ub_of_stepNodeIsTau (by decide)⟩
+
+/--
 Witness 3 (`LoopUpdateOverflowProbe`): Loop CFG (`bb0` entry -> `bb1` header ->
-`bb2` latch with `_1 = BinOp.add (copy _1) (const 1)` back-edge to `bb1`, or
-exit to `bb3` return).
+`bb2` latch -> back-edge to `bb1`, or exit to `bb3` return). The latch increments
+the counter with `_1 = AddUnchecked(copy _1, const 1_u32)` at `(2, 0)` — a genuine
+`.arithOverflow` site in `evalScalarBinOp` — and accumulates with the *wrapping*
+`_0 = Add(copy _0, copy _1)` at `(2, 1)`, which `[adv B1]` precision proves can
+never overflow-fault (no `.arithOverflow` at `(2, 1)`).
 -/
 def witnessLoopUpdateOverflowBody : CapturedMir :=
   { defPath := "proto::witness_loop_update_overflow"
   , phase := MirPhaseTag.runtimePostCleanup
   , role := ContractRole.subject
   , argCount := 1
-  , localDecls := List.nil
+  , localDecls := (List.cons witnessU32Decl (List.cons witnessU32Decl List.nil))
   , basicBlocks :=
       (List.cons
         { statements := List.nil
@@ -2950,7 +3582,7 @@ def witnessLoopUpdateOverflowBody : CapturedMir :=
                       (StatementKind.assign
                         { local_ := 1, projection := List.nil }
                         (Rvalue.binaryOp
-                          BinOp.add
+                          BinOp.addUnchecked
                           (Operand.copy { local_ := 1, projection := List.nil })
                           (Operand.constant
                             { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
@@ -2958,13 +3590,23 @@ def witnessLoopUpdateOverflowBody : CapturedMir :=
                             })))
                   , span := "proto.rs:32:9"
                   }
-                  List.nil)
-            , terminator := { kind := (TerminatorKind.goto 1), span := "proto.rs:32:20" }
+                  (List.cons
+                    { kind :=
+                        (StatementKind.assign
+                          { local_ := 0, projection := List.nil }
+                          (Rvalue.binaryOp
+                            BinOp.add
+                            (Operand.copy { local_ := 0, projection := List.nil })
+                            (Operand.copy { local_ := 1, projection := List.nil })))
+                    , span := "proto.rs:33:9"
+                    }
+                    List.nil))
+            , terminator := { kind := (TerminatorKind.goto 1), span := "proto.rs:33:20" }
             , isCleanup := false
             }
             (List.cons
               { statements := List.nil
-              , terminator := { kind := TerminatorKind.return_, span := "proto.rs:33:5" }
+              , terminator := { kind := TerminatorKind.return_, span := "proto.rs:34:5" }
               , isCleanup := false
               }
               List.nil))))
@@ -2981,6 +3623,9 @@ def witnessLoopUpdateOverflowExpectedCensus : List FaultSite :=
   , (2, 0, .treeBorrowsViolation)
   , (2, 0, .uninitRead)
   , (2, 0, .storageLiveProtected)
+  , (2, 1, .treeBorrowsViolation)
+  , (2, 1, .uninitRead)
+  , (2, 1, .storageLiveProtected)
   , (3, 0, .treeBorrowsViolation)
   , (3, 0, .uninitRead)
   , (3, 0, .callAbiMismatch)
@@ -3005,16 +3650,33 @@ theorem witnessLoopUpdateOverflow_probe_verified_and_detected :
   decide
 
 /--
+`LoopUpdateOverflowProbe` liveness: the stripped latch site `(2, 0, .arithOverflow)`
+really faults when the counter is `u32::MAX`, and steps silently for a small
+counter; the wrapping accumulator at `(2, 1)` carries no `.arithOverflow` label.
+-/
+theorem witnessLoopUpdateOverflow_latch_site_live :
+    stepMirFn witnessLoopUpdateOverflowBody
+        (witnessState 2 0 [witnessU32Slot 0, witnessU32Slot 4294967295]) =
+      MirStepNode.fail .ub ∧
+    stepMirFn witnessLoopUpdateOverflowBody
+        (witnessState 2 0 [witnessU32Slot 0, witnessU32Slot 7]) ≠
+      MirStepNode.fail .ub ∧
+    (2, 1, MirFaultClass.arithOverflow) ∉ censusMirBodyFaultSites witnessLoopUpdateOverflowBody :=
+  ⟨rfl, ne_fail_ub_of_stepNodeIsTau (by decide), by decide⟩
+
+/--
 Witness 4 (`DerefAliasProbe`): Pointer dereference write `*_1 = copy (*_2)` at
 `(0, 0)` exercising `ptrDerefInvalid`, `ptrAlignMismatch`, and
-`treeBorrowsViolation`.
+`treeBorrowsViolation` (plus `scalarNicheInvalid` from `validateLoadedValue`).
 -/
 def witnessDerefAliasBody : CapturedMir :=
   { defPath := "proto::witness_deref_alias"
   , phase := MirPhaseTag.runtimePostCleanup
   , role := ContractRole.subject
   , argCount := 2
-  , localDecls := List.nil
+  , localDecls :=
+      (List.cons witnessU32Decl
+        (List.cons witnessPtrU32Decl (List.cons witnessPtrU32Decl List.nil)))
   , basicBlocks :=
       (List.cons
         { statements :=
@@ -3046,6 +3708,7 @@ def witnessDerefAliasExpectedCensus : List FaultSite :=
   [ (0, 0, .ptrDerefInvalid)
   , (0, 0, .ptrAlignMismatch)
   , (0, 0, .treeBorrowsViolation)
+  , (0, 0, .scalarNicheInvalid)
   , (0, 0, .uninitRead)
   , (0, 0, .storageLiveProtected)
   , (0, 1, .treeBorrowsViolation)
@@ -3058,7 +3721,8 @@ Mutated discharged set for `DerefAliasProbe`: omits pointer dereference,
 alignment, and Tree Borrows aliasing obligations at `(0, 0)`.
 -/
 def witnessDerefAliasMutantDischarged : List FaultSite :=
-  [ (0, 0, .uninitRead)
+  [ (0, 0, .scalarNicheInvalid)
+  , (0, 0, .uninitRead)
   , (0, 0, .storageLiveProtected)
   , (0, 1, .treeBorrowsViolation)
   , (0, 1, .uninitRead)
@@ -3081,6 +3745,17 @@ theorem witnessDerefAlias_probe_verified_and_detected :
   decide
 
 /--
+`DerefAliasProbe` liveness: reading `*_2` through a dangling pointer at the
+stripped site `(0, 0)` really faults in `Trusted.MirSemantics`.
+-/
+theorem witnessDerefAlias_deref_site_live :
+    stepMirFn witnessDerefAliasBody
+        (witnessState 0 0
+          [.uninit, witnessDanglingPtrSlot 7, witnessDanglingPtrSlot 9]) =
+      MirStepNode.fail .ub := by
+  rfl
+
+/--
 Compile-time `by decide` witness for `PropertyRegistry` un-emitted class
 rejection: marking `.treeBorrowsViolation` as `.unemittedGap` causes
 `reconcileFaultCoverageWithRegistry` to reject `witnessDerefAliasBody` even when
@@ -3093,6 +3768,135 @@ theorem witnessDerefAlias_registry_unemitted_rejected :
       witnessDerefAliasExpectedCensus =
         .unknownUnmappedFaultSites
           [(0, 0, .treeBorrowsViolation), (0, 1, .treeBorrowsViolation)] := by
+  decide
+
+/--
+Witness 5 (`[adv B1]` precision witness): wrapping/flagged arithmetic, masked
+shifts, comparisons, negation, `Repeat`, aggregates, integer casts, nullary
+operators, and a non-dereferencing borrow over constant operands. Under the
+pre-`[adv B1]` census every statement carried spurious `.arithOverflow`,
+`.shiftOverflow`, `.scalarNicheInvalid`, `.ptrDerefInvalid`, or
+`.ptrAlignMismatch` labels; now each site only carries the destination-write
+classes (`.treeBorrowsViolation`, `.storageLiveProtected`), and the `&_1` borrow
+only `.uninitRead`.
+-/
+def witnessWrappingArithBody : CapturedMir :=
+  { defPath := "proto::witness_wrapping_arith"
+  , phase := MirPhaseTag.runtimePostCleanup
+  , role := ContractRole.subject
+  , argCount := 0
+  , localDecls :=
+      (List.cons witnessU32Decl
+        (List.cons witnessU32Decl (List.cons witnessPtrU32Decl List.nil)))
+  , basicBlocks :=
+      (List.cons
+        { statements :=
+            (List.cons
+              { kind :=
+                  (StatementKind.assign
+                    { local_ := 1, projection := List.nil }
+                    (Rvalue.binaryOp BinOp.addWithOverflow
+                      (Operand.constant
+                        { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                        , val := (ConstValue.scalar (ConstScalar.int { bits := 4294967295, sizeBytes := 4 }))
+                        })
+                      (Operand.constant
+                        { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                        , val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 }))
+                        })))
+              , span := "proto.rs:50:5"
+              }
+              (List.cons
+                { kind :=
+                    (StatementKind.assign
+                      { local_ := 1, projection := List.nil }
+                      (Rvalue.binaryOp BinOp.shl
+                        (Operand.constant
+                          { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                          , val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 }))
+                          })
+                        (Operand.constant
+                          { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                          , val := (ConstValue.scalar (ConstScalar.int { bits := 40, sizeBytes := 4 }))
+                          })))
+                , span := "proto.rs:51:5"
+                }
+                (List.cons
+                  { kind :=
+                      (StatementKind.assign
+                        { local_ := 1, projection := List.nil }
+                        (Rvalue.unaryOp UnOp.neg
+                          (Operand.constant
+                            { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                            , val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 }))
+                            })))
+                  , span := "proto.rs:52:5"
+                  }
+                  (List.cons
+                    { kind :=
+                        (StatementKind.assign
+                          { local_ := 1, projection := List.nil }
+                          (Rvalue.cast CastKind.intToInt
+                            (Operand.constant
+                              { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }
+                              , val := (ConstValue.scalar (ConstScalar.int { bits := 300, sizeBytes := 4 }))
+                              })
+                            { kind := (RigidTy.uint UintTy.u8), layoutIdx := 0 }))
+                    , span := "proto.rs:53:5"
+                    }
+                    (List.cons
+                      { kind :=
+                          (StatementKind.assign
+                            { local_ := 1, projection := List.nil }
+                            (Rvalue.nullaryOp NullOp.sizeOf
+                              { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }))
+                      , span := "proto.rs:54:5"
+                      }
+                      (List.cons
+                        { kind :=
+                            (StatementKind.assign
+                              { local_ := 2, projection := List.nil }
+                              (Rvalue.rawPtr Mutability.not
+                                { local_ := 1, projection := List.nil }))
+                        , span := "proto.rs:55:5"
+                        }
+                        List.nil))))))
+        , terminator := { kind := TerminatorKind.unwindTerminate, span := "proto.rs:56:5" }
+        , isCleanup := false
+        }
+        List.nil)
+  , fnAbi := dummyWitnessFnAbi
+  , layouts := emptyLayoutTable
+  , allocations := List.nil
+  }
+
+/-- Expected fault-site census for `witnessWrappingArithBody`. -/
+def witnessWrappingArithExpectedCensus : List FaultSite :=
+  [ (0, 0, .treeBorrowsViolation)
+  , (0, 0, .storageLiveProtected)
+  , (0, 1, .treeBorrowsViolation)
+  , (0, 1, .storageLiveProtected)
+  , (0, 2, .treeBorrowsViolation)
+  , (0, 2, .storageLiveProtected)
+  , (0, 3, .treeBorrowsViolation)
+  , (0, 3, .storageLiveProtected)
+  , (0, 4, .treeBorrowsViolation)
+  , (0, 4, .storageLiveProtected)
+  , (0, 5, .treeBorrowsViolation)
+  , (0, 5, .uninitRead)
+  , (0, 5, .storageLiveProtected)
+  ]
+
+/--
+Precision witness: the census matches exactly, and none of the six statements
+carries an arithmetic, shift, niche, or pointer-dereference label.
+-/
+theorem witnessWrappingArith_census_precise :
+    censusMirBodyFaultSites witnessWrappingArithBody = witnessWrappingArithExpectedCensus ∧
+    (censusMirBodyFaultSites witnessWrappingArithBody).all (fun site =>
+      site.2.2 != .arithOverflow && site.2.2 != .shiftOverflow &&
+        site.2.2 != .scalarNicheInvalid && site.2.2 != .ptrDerefInvalid &&
+        site.2.2 != .ptrAlignMismatch) = true := by
   decide
 
 end Anneal.FaultSiteCensusPrototype
