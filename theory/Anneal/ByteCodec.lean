@@ -633,6 +633,30 @@ theorem prod_hasZeroValid {α β : Type} {n₁ n₂ : Nat}
       List.drop_left' (length_zeroInitBytes n₁),
       ha, hb]
 
+/-- Negative propagation: if the first component `c₁` rejects `bs.take n₁`, `prod c₁ c₂` rejects `bs`. -/
+theorem prod_decode_eq_none_of_fst_none {α β : Type} {n₁ n₂ : Nat}
+    (c₁ : FixedByteCodec α n₁) (c₂ : FixedByteCodec β n₂)
+    {bs : List AbstractByte} (hFst : c₁.decode (bs.take n₁) = none) :
+    (prod c₁ c₂).decode bs = none := by
+  unfold prod ofRoundTrip
+  dsimp only
+  cases Nat.beq bs.length (n₁ + n₂)
+  · rfl
+  · dsimp only
+    rw [hFst]
+
+/-- Negative propagation: if the second component `c₂` rejects `bs.drop n₁`, `prod c₁ c₂` rejects `bs`. -/
+theorem prod_decode_eq_none_of_snd_none {α β : Type} {n₁ n₂ : Nat}
+    (c₁ : FixedByteCodec α n₁) (c₂ : FixedByteCodec β n₂)
+    {bs : List AbstractByte} (hSnd : c₂.decode (bs.drop n₁) = none) :
+    (prod c₁ c₂).decode bs = none := by
+  unfold prod ofRoundTrip
+  dsimp only
+  cases Nat.beq bs.length (n₁ + n₂)
+  · rfl
+  · dsimp only
+    cases c₁.decode (bs.take n₁) <;> rw [hSnd]
+
 /--
 Uninitialized padding codec of width `padBytes`: encodes `()` to
 `replicateUninitBytes padBytes` and accepts any `padBytes`-length slice on `decode`.
@@ -768,6 +792,22 @@ theorem padRight_not_isInitCodec {α : Type} {n padBytes : Nat}
   have hTrue := hInit x₀
   rw [allBytesInitialized_padRight_encode_eq_false c hPos x₀] at hTrue
   nomatch hTrue
+
+/-- On an exact-width `(n + padBytes)`-byte chunk, `(padRight c padBytes).decode` reduces to `c.decode (chunk.take n)`. -/
+theorem padRight_decode_of_length_eq {α : Type} {n padBytes : Nat}
+    (c : FixedByteCodec α n) {chunk : List AbstractByte}
+    (hLen : chunk.length = n + padBytes) :
+    (padRight c padBytes).decode chunk = c.decode (chunk.take n) := by
+  unfold padRight mapEquiv prod padUninit ofRoundTrip
+  dsimp only
+  rw [Nat.beq_eq.mpr hLen]
+  dsimp only
+  have hDropLen : Nat.beq (chunk.drop n).length padBytes = true := by
+    apply Nat.beq_eq.mpr
+    rw [List.length_drop]
+    omega
+  simp only [hDropLen, ↓reduceIte]
+  cases c.decode (chunk.take n) <;> rfl
 
 /-! ### Homogeneous Fixed-Length Lists (`listFixed`) and Arrays (`array`) -/
 
@@ -1001,6 +1041,41 @@ theorem array_hasZeroValid {α : Type} {n : Nat} (k : Nat)
     (array k c).HasZeroValid :=
   mapEquiv_hasZeroValid _ _ _ _ _ (listFixed_hasZeroValid hc k)
 
+/-- Negative propagation: if the head chunk `bs.take n` fails `c.decode`, `listFixed (k + 1) c` returns `none`. -/
+theorem listFixed_decode_eq_none_of_head_none {α : Type} {n : Nat}
+    (k : Nat) (c : FixedByteCodec α n) {bs : List AbstractByte}
+    (hHead : c.decode (bs.take n) = none) :
+    (listFixed (k + 1) c).decode bs = none := by
+  show decodeChunks c (k + 1) bs = none
+  unfold decodeChunks
+  cases Nat.ble n bs.length
+  · rfl
+  · dsimp only
+    rw [hHead]
+
+/-- Negative propagation: if any tail suffix `bs.drop n` fails `listFixed k c`, `listFixed (k + 1) c` returns `none`. -/
+theorem listFixed_decode_eq_none_of_tail_none {α : Type} {n : Nat}
+    (k : Nat) (c : FixedByteCodec α n) {bs : List AbstractByte}
+    (hTail : (listFixed k c).decode (bs.drop n) = none) :
+    (listFixed (k + 1) c).decode bs = none := by
+  show decodeChunks c (k + 1) bs = none
+  have hTailChunks : decodeChunks c k (bs.drop n) = none := hTail
+  unfold decodeChunks
+  cases Nat.ble n bs.length
+  · rfl
+  · dsimp only
+    cases c.decode (bs.take n) <;> rw [hTailChunks]
+
+/-- Negative propagation from `listFixed k c` to `array k c`. -/
+theorem array_decode_eq_none_of_listFixed_none {α : Type} {n : Nat}
+    (k : Nat) (c : FixedByteCodec α n) {bs : List AbstractByte}
+    (hNone : (listFixed k c).decode bs = none) :
+    (array k c).decode bs = none := by
+  unfold array mapEquiv ofRoundTrip
+  dsimp only
+  rw [hNone]
+  rfl
+
 /-! ### Niche Refinement (`refineNiche`), `scalarValidRange`, and `enumRepr` -/
 
 /--
@@ -1131,19 +1206,39 @@ theorem scalarValidRange_decode_rejects_out_of_range
       (fun x => wrappingRangeContains range x.val) hBase hOut]
   rfl
 
+/-- Kernel-reducing predicate classifying non-pointer `PrimitiveKind`s (`.int` and `.float`)
+that decode to `Value.scalar` in `decodeScalarLayoutBytes`.
+
+Note: `.pointer _` is intentionally excluded here because `decodeScalarLayoutBytes`
+decodes pointer layouts to `Value.ptr` (incorporating byte-level provenance `(allocId, tag)`),
+rather than `Value.scalar`. -/
+@[reducible]
+def isNonPointerPrimitiveKind : PrimitiveKind → Bool
+  | .int _ _ | .float _ => true
+  | .pointer _ => false
+
 /--
 Exact pointwise bridge between `scalarValidRange` and `Trusted`'s
-`decodeScalarLayoutBytes (.initialized (.int bitsWidth signed) range)`.
+`decodeScalarLayoutBytes (.initialized pk range)` for any non-pointer
+`PrimitiveKind` (`.int bitsWidth signed` or `.float bitsWidth`).
+
+Pointer `PrimitiveKind`s (`.pointer _`) decode to `Value.ptr` using byte
+provenance rather than `Value.scalar` and are therefore out of scope of
+scalar bit-pattern codecs.
 -/
-theorem decodeScalarLayoutBytes_initialized_int_eq_scalarValidRange_map
-    (bitsWidth : Nat) (signed : Bool) (range : WrappingRange)
+theorem decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+    (pk : PrimitiveKind) (range : WrappingRange)
     (sz : Nat) (hNz : 0 < sz)
-    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
+    (hNonPtr : isNonPointerPrimitiveKind pk = true)
+    (hWidth : primitiveKindByteWidth pk = some sz)
     (bs : List AbstractByte) :
-    decodeScalarLayoutBytes (.initialized (.int bitsWidth signed) range) bs =
+    decodeScalarLayoutBytes (.initialized pk range) bs =
       ((scalarValidRange sz hNz range).decode bs).map
         (fun x => Value.scalar ⟨x.val, sz⟩) := by
-  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed range sz bs hWidth]
+  unfold decodeScalarLayoutBytes scalarLayoutByteWidth
+  dsimp only
+  rw [hWidth]
+  dsimp only
   unfold scalarValidRange mapEquiv refineNiche uintBitsLE ofRoundTrip
   dsimp only
   have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
@@ -1171,14 +1266,37 @@ theorem decodeScalarLayoutBytes_initialized_int_eq_scalarValidRange_map
       simp only [hLt, ↓reduceDIte]
       rw [hLenDef, hLenEq]
       by_cases hRange : wrappingRangeContains range bits = true
-      · simp [hRange]
+      · simp only [hRange, ↓reduceDIte, Option.map_some]
+        cases pk with
+        | int _ _ => rfl
+        | float _ => rfl
+        | pointer _ => nomatch hNonPtr
       · have hFalse : wrappingRangeContains range bits = false :=
           Bool.eq_false_iff.mpr hRange
         simp [hFalse]
 
 /--
+Specialization of `decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map`
+to integer `PrimitiveKind.int bitsWidth signed`.
+-/
+theorem decodeScalarLayoutBytes_initialized_int_eq_scalarValidRange_map
+    (bitsWidth : Nat) (signed : Bool) (range : WrappingRange)
+    (sz : Nat) (hNz : 0 < sz)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
+    (bs : List AbstractByte) :
+    decodeScalarLayoutBytes (.initialized (.int bitsWidth signed) range) bs =
+      ((scalarValidRange sz hNz range).decode bs).map
+        (fun x => Value.scalar ⟨x.val, sz⟩) :=
+  decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+    (.int bitsWidth signed) range sz hNz rfl hWidth bs
+
+/--
 Codec for a fieldless `#[repr(u8/u16/u32/u64)]` enum `ε` with discriminant map
 `toTag : ε → Nat` and partial inverse `ofTag : Nat → Option ε`.
+
+Decoding enforces canonical discriminant round-tripping (`Nat.beq (toTag e) x.val`),
+so even if `ofTag` maps an unused/non-canonical tag `t` to some variant `e` with
+`toTag e ≠ t`, `decode` still rejects `t` with `none`.
 -/
 def enumRepr (sz : Nat) (hNz : 0 < sz) {ε : Type}
     (toTag : ε → Nat)
@@ -1188,11 +1306,23 @@ def enumRepr (sz : Nat) (hNz : 0 < sz) {ε : Type}
     FixedByteCodec ε sz :=
   ofRoundTrip
     (fun e => (uintBitsLE sz hNz).encode ⟨toTag e, hBounds e⟩)
-    (fun bs => ((uintBitsLE sz hNz).decode bs).bind (fun x => ofTag x.val))
+    (fun bs =>
+      ((uintBitsLE sz hNz).decode bs).bind (fun x =>
+        match ofTag x.val with
+        | some e => if Nat.beq (toTag e) x.val then some e else none
+        | none => none))
     (fun e => (uintBitsLE sz hNz).encode_length ⟨toTag e, hBounds e⟩)
     (fun e => by
+      change
+        (((uintBitsLE sz hNz).decode ((uintBitsLE sz hNz).encode ⟨toTag e, hBounds e⟩)).bind _) =
+          some e
       rw [(uintBitsLE sz hNz).decode_encode ⟨toTag e, hBounds e⟩]
-      exact hRound e)
+      unfold Option.bind
+      dsimp only
+      rw [hRound e]
+      dsimp only
+      rw [nat_beq_self (toTag e)]
+      rfl)
 
 theorem enumRepr_isExactWidth (sz : Nat) (hNz : 0 < sz) {ε : Type}
     (toTag : ε → Nat) (ofTag : Nat → Option ε)
@@ -1213,6 +1343,41 @@ theorem enumRepr_isInitCodec (sz : Nat) (hNz : 0 < sz) {ε : Type}
     (enumRepr sz hNz toTag ofTag hRound hBounds).IsInitCodec :=
   fun e => uintBitsLE_isInitCodec sz hNz ⟨toTag e, hBounds e⟩
 
+/-- Exact canonical characterization of `enumRepr.decode`: `bs` decodes to `some e`
+if and only if `uintBitsLE` decodes `bs` to the canonical discriminant `toTag e`. -/
+theorem enumRepr_decode_eq_some_iff (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz))
+    (bs : List AbstractByte) (e : ε) :
+    (enumRepr sz hNz toTag ofTag hRound hBounds).decode bs = some e ↔
+      (uintBitsLE sz hNz).decode bs = some ⟨toTag e, hBounds e⟩ := by
+  unfold enumRepr ofRoundTrip
+  dsimp only
+  constructor
+  · intro hDec
+    cases hBase : (uintBitsLE sz hNz).decode bs <;> rw [hBase] at hDec
+    · nomatch hDec
+    case some x =>
+      dsimp only [Option.bind] at hDec
+      cases hOf : ofTag x.val <;> rw [hOf] at hDec
+      · nomatch hDec
+      case some e' =>
+        dsimp only at hDec
+        cases hEqTag : Nat.beq (toTag e') x.val <;> rw [hEqTag] at hDec
+        · nomatch hDec
+        · simp only [↓reduceIte, Option.some.injEq] at hDec
+          subst hDec
+          have hValEq : x.val = toTag e' := (Nat.eq_of_beq_eq_true hEqTag).symm
+          exact congrArg some (Subtype.ext hValEq)
+  · intro hBase
+    rw [hBase]
+    dsimp only [Option.bind]
+    rw [hRound e]
+    dsimp only
+    rw [nat_beq_self (toTag e)]
+    rfl
+
 /-- `enumRepr` rejects any byte sequence whose decoded discriminant `bits` has `ofTag bits = none`. -/
 theorem enumRepr_decode_rejects_invalid_tag (sz : Nat) (hNz : 0 < sz) {ε : Type}
     (toTag : ε → Nat) (ofTag : Nat → Option ε)
@@ -1224,10 +1389,34 @@ theorem enumRepr_decode_rejects_invalid_tag (sz : Nat) (hNz : 0 < sz) {ε : Type
   unfold enumRepr ofRoundTrip
   dsimp only
   have hBase := (uintBitsLE sz hNz).decode_encode ⟨bits, hLt⟩
-  change (((uintBitsLE sz hNz).decode ((uintBitsLE sz hNz).encode ⟨bits, hLt⟩)).bind
-      (fun x => ofTag x.val)) = none
+  change (((uintBitsLE sz hNz).decode ((uintBitsLE sz hNz).encode ⟨bits, hLt⟩)).bind _) = none
   rw [hBase]
-  exact hInvalid
+  dsimp only [Option.bind]
+  rw [hInvalid]
+
+/-- `enumRepr` rejects any non-canonical discriminant `bits` (`∀ e, toTag e ≠ bits`),
+even if `ofTag bits` leniently returns `some e`. -/
+theorem enumRepr_decode_rejects_non_canonical_tag (sz : Nat) (hNz : 0 < sz) {ε : Type}
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e, ofTag (toTag e) = some e)
+    (hBounds : ∀ e, toTag e < 2 ^ (8 * sz))
+    {bits : Nat} (hLt : bits < 2 ^ (8 * sz))
+    (hNonCanon : ∀ e : ε, toTag e ≠ bits) :
+    (enumRepr sz hNz toTag ofTag hRound hBounds).decode
+        (encodeLittleEndianBytes bits sz none) = none := by
+  cases hDec : (enumRepr sz hNz toTag ofTag hRound hBounds).decode
+      (encodeLittleEndianBytes bits sz none) with
+  | none => rfl
+  | some e =>
+    have hSome := (enumRepr_decode_eq_some_iff sz hNz toTag ofTag hRound hBounds
+      (encodeLittleEndianBytes bits sz none) e).mp hDec
+    have hBase : (uintBitsLE sz hNz).decode (encodeLittleEndianBytes bits sz none) =
+        some ⟨bits, hLt⟩ :=
+      (uintBitsLE sz hNz).decode_encode ⟨bits, hLt⟩
+    rw [hBase] at hSome
+    injection hSome with hSub
+    have hTagEq : bits = toTag e := congrArg Subtype.val hSub
+    exact False.elim (hNonCanon e hTagEq.symm)
 
 end FixedByteCodec
 
@@ -1326,6 +1515,16 @@ theorem isTryFromBytes {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
     injection hDec with hV
     subst hV
     exact ⟨x, rfl, m.ofValue_toValue x⟩
+
+/-- Lift any typed invariant `valid : Value → Prop` holding on `m.toValue` to `IsTryFromBytes`. -/
+theorem isTryFromBytes_of {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
+    (m : MirValueCodec layouts ty α sz) {valid : Value → Prop}
+    (hValid : ∀ x : α, valid (m.toValue x)) :
+    IsTryFromBytes layouts ty valid := by
+  rcases m.isTryFromBytes with ⟨sz', hSz', hDec⟩
+  refine ⟨sz', hSz', fun bs v hD => ?_⟩
+  rcases hDec bs v hD with ⟨x, rfl, _⟩
+  exact hValid x
 
 /-- Unconditional `IsTryFromBytes layouts ty` (default `True` predicate). -/
 theorem isTryFromBytes_trivial {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
@@ -1603,21 +1802,23 @@ def uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
           rfl)
 
 /--
-`MirValueCodec` for a `.primitive` scalar-niche ADT (`NonZeroU8`, `NonZeroU32`,
-or fieldless `#[repr(uN)]` enum) backed by `ScalarLayout.initialized (.int bitsWidth signed) range`.
+`MirValueCodec` for a `.primitive` scalar-niche ADT backed by
+`ScalarLayout.initialized pk range` for any non-pointer `PrimitiveKind` `pk`
+(`.int bitsWidth signed` or `.float bitsWidth`).
 -/
-def primitiveNicheAdt
+def primitiveNicheAdtNonPtr
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
-    (l : TypeLayout) (sz bitsWidth : Nat) (signed : Bool) (varIdx : VariantIdx)
+    (l : TypeLayout) (sz : Nat) (pk : PrimitiveKind) (varIdx : VariantIdx)
     (range : WrappingRange)
     (hNz : 0 < sz)
+    (hNonPtr : FixedByteCodec.isNonPointerPrimitiveKind pk = true)
     (hLookup : LayoutTable.lookup layouts idx = some l)
     (hInhab : l.isUninhabited = false)
     (hSize : l.size.bytes = sz)
     (hFields : l.fields = .primitive)
     (hVar : l.variants = .single varIdx)
-    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) range))
-    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz) :
+    (hRepr : l.backendRepr = .scalar (.initialized pk range))
+    (hWidth : primitiveKindByteWidth pk = some sz) :
     MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx }
       { bits : Nat // bits < 2 ^ (8 * sz) ∧ wrappingRangeContains range bits = true } sz where
   codec := FixedByteCodec.scalarValidRange sz hNz range
@@ -1687,8 +1888,29 @@ def primitiveNicheAdt
     · rw [Bool.not_true, hVar, hFields]
       have hSzBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
       rw [hSzBeq0, hRepr]
-      exact FixedByteCodec.decodeScalarLayoutBytes_initialized_int_eq_scalarValidRange_map
-        bitsWidth signed range sz hNz hWidth bs
+      exact FixedByteCodec.decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+        pk range sz hNz hNonPtr hWidth bs
+
+/--
+`MirValueCodec` for a `.primitive` integer scalar-niche ADT (`NonZeroU8`, `NonZeroU32`,
+or fieldless `#[repr(uN)]` enum) backed by `ScalarLayout.initialized (.int bitsWidth signed) range`.
+-/
+def primitiveNicheAdt
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (sz bitsWidth : Nat) (signed : Bool) (varIdx : VariantIdx)
+    (range : WrappingRange)
+    (hNz : 0 < sz)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .primitive)
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) range))
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz) :
+    MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx }
+      { bits : Nat // bits < 2 ^ (8 * sz) ∧ wrappingRangeContains range bits = true } sz :=
+  primitiveNicheAdtNonPtr layouts defPath args idx l sz (.int bitsWidth signed) varIdx range
+    hNz rfl hLookup hInhab hSize hFields hVar hRepr hWidth
 
 /-- Helper decoder extracting `ScalarInt` elements of byte width `sz` from a `List Value`. -/
 def uintArrayDecodeVals (sz : Nat) :
@@ -2146,6 +2368,26 @@ theorem writeAbstractBytesAt_zero_replicateUninit {len : Nat}
     dsimp only [List.length_cons, replicateUninitBytes, List.cons_append, writeAbstractBytesAt]
     rw [ih]
 
+theorem writeAbstractBytesAt_offset_replicateUninit {off len : Nat}
+    (pre patch post : List AbstractByte)
+    (hPre : pre.length = off) (hPatch : patch.length = len) :
+    writeAbstractBytesAt (pre ++ replicateUninitBytes len ++ post) off patch =
+      some (pre ++ patch ++ post) := by
+  subst hPre
+  induction pre with
+  | nil =>
+    dsimp only [List.length_nil, List.nil_append]
+    exact writeAbstractBytesAt_zero_replicateUninit patch post hPatch
+  | cons b ps ih =>
+    cases patch with
+    | nil =>
+      subst hPatch
+      dsimp only [List.length_nil, replicateUninitBytes, List.nil_append,
+                  List.cons_append, writeAbstractBytesAt]
+    | cons w ws =>
+      dsimp only [List.length_cons, List.cons_append, writeAbstractBytesAt]
+      rw [ih]
+
 /-- Single-element tuple `(UintTy,)` laid out with `padBytes` bytes of trailing
 uninitialized alignment padding (`FieldsShape.arbitrary [{ bytes := 0 }] [0]`
 and `l.size.bytes = uintByteSize w + padBytes`), bridged to
@@ -2318,6 +2560,311 @@ def paddedSingleElemTuple (layouts : LayoutTable) (w : UintTy) (padBytes : Nat)
           omega
         simp only [hDropLen, ↓reduceIte]
         cases c.decode (bs.take (uintByteSize w)) <;> rfl)
+
+/--
+Laid-out two-field integer tuple `(UintTy, UintTy)` backed by a concrete compiler
+`TypeLayout` entry (`FieldsShape.arbitrary [{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] memoryIndex`
+and `l.size = { bytes := (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂) }`),
+bridged to `FixedByteCodec.prod (FixedByteCodec.padRight c₁ pad₁) (FixedByteCodec.padRight c₂ pad₂)`.
+
+Models real `rustc` aggregate layouts with interior alignment padding (`0 < pad₁`,
+such as `(u8, u32)` laid out at offsets `[0, 4]` with total size `8`) and/or
+trailing alignment padding (`0 < pad₂`), proving pointwise equivalence against
+`Trusted`'s `encodeFieldsAtOffsetsWith` and `decodeFieldsAtOffsetsWith`.
+-/
+def uintPairArbitraryTuple (layouts : LayoutTable) (w₁ w₂ : UintTy)
+    (pad₁ pad₂ : Nat) (idx : LayoutIdx) (l : TypeLayout) (memoryIndex : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hSize : l.size = { bytes := (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂) })
+    (hFields : l.fields =
+      .arbitrary [{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] memoryIndex) :
+    MirValueCodec layouts { kind := .tuple [.uint w₁, .uint w₂], layoutIdx := idx }
+      ({ bits : Nat // bits < 2 ^ (8 * uintByteSize w₁) } ×
+        { bits : Nat // bits < 2 ^ (8 * uintByteSize w₂) })
+      ((uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂)) :=
+  let c₁ := FixedByteCodec.uintBitsLE (uintByteSize w₁) (uintByteSize_pos w₁)
+  let c₂ := FixedByteCodec.uintBitsLE (uintByteSize w₂) (uintByteSize_pos w₂)
+  let p₁ := FixedByteCodec.padRight c₁ pad₁
+  let p₂ := FixedByteCodec.padRight c₂ pad₂
+  let m₁ := uint layouts w₁ 0
+  let m₂ := uint layouts w₂ 0
+  ofCanonicalEncode
+    (FixedByteCodec.prod p₁ p₂)
+    (fun ⟨a, b⟩ => .aggregate 0 [m₁.toValue a, m₂.toValue b])
+    (fun v =>
+      match v with
+      | .aggregate 0 [v₁, v₂] =>
+        match m₁.ofValue v₁, m₂.ofValue v₂ with
+        | some a, some b => some (a, b)
+        | _, _ => none
+      | _ => none)
+    (fun ⟨a, b⟩ => by
+      simp only []
+      rw [m₁.ofValue_toValue a, m₂.ofValue_toValue b])
+    (by
+      unfold rigidTyByteSize
+      dsimp only [rigidTyKindByteSize]
+      rw [hLookup]
+      dsimp only
+      rw [hSize])
+    (fun ⟨a, b⟩ => by
+      have ha : encodeValueToBytes 15 layouts { kind := .uint w₁, layoutIdx := 0 }
+          (m₁.toValue a) = some (c₁.encode a) := m₁.encode_toValue a
+      have hb : encodeValueToBytes 15 layouts { kind := .uint w₂, layoutIdx := 0 }
+          (m₂.toValue b) = some (c₂.encode b) := m₂.encode_toValue b
+      unfold defaultCodecFuel encodeValueToBytes
+      simp only []
+      have hLen2 : Nat.beq (Trusted.Sequence.length [m₁.toValue a, m₂.toValue b])
+          (Trusted.Sequence.length [RigidTy.uint w₁, RigidTy.uint w₂]) = true := rfl
+      rw [hLen2]
+      dsimp only
+      rw [hLookup]
+      dsimp only
+      rw [hFields, hSize]
+      dsimp only
+      have hOffLen : Nat.beq
+          (Trusted.Sequence.length ([{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] : List Size))
+          (Trusted.Sequence.length [m₁.toValue a, m₂.toValue b]) = true := rfl
+      rw [hOffLen]
+      dsimp only [encodeFieldsAtOffsetsWith]
+      rw [ha]
+      dsimp only
+      rw [replicateUninitBytes_add_eq (uintByteSize w₁ + pad₁) (uintByteSize w₂ + pad₂),
+          replicateUninitBytes_add_eq (uintByteSize w₁) pad₁,
+          replicateUninitBytes_add_eq (uintByteSize w₂) pad₂,
+          List.append_assoc (replicateUninitBytes (uintByteSize w₁)) (replicateUninitBytes pad₁),
+          writeAbstractBytesAt_zero_replicateUninit (c₁.encode a)
+            (replicateUninitBytes pad₁ ++
+              (replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂))
+            (c₁.encode_length a)]
+      dsimp only [encodeFieldsAtOffsetsWith]
+      rw [hb]
+      dsimp only
+      have hAssoc₁ :
+          c₁.encode a ++
+              (replicateUninitBytes pad₁ ++
+                (replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂)) =
+            (c₁.encode a ++ replicateUninitBytes pad₁) ++
+              replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂ := by
+        simp only [List.append_assoc]
+      have hPreLen : (c₁.encode a ++ replicateUninitBytes pad₁).length = uintByteSize w₁ + pad₁ := by
+        rw [List.length_append, c₁.encode_length a, length_replicateUninitBytes]
+      rw [hAssoc₁,
+          writeAbstractBytesAt_offset_replicateUninit
+            (c₁.encode a ++ replicateUninitBytes pad₁) (c₂.encode b) (replicateUninitBytes pad₂)
+            hPreLen (c₂.encode_length b)]
+      dsimp only [encodeFieldsAtOffsetsWith]
+      apply congrArg some
+      dsimp only [FixedByteCodec.prod, p₁, p₂, FixedByteCodec.padRight,
+                  FixedByteCodec.mapEquiv, FixedByteCodec.padUninit, FixedByteCodec.ofRoundTrip]
+      simp only [List.append_assoc])
+    (fun v bs hEnc => by
+      unfold defaultCodecFuel encodeValueToBytes at hEnc
+      cases v <;> dsimp only at hEnc
+      case unit => nomatch hEnc
+      case scalar => nomatch hEnc
+      case ptr => nomatch hEnc
+      case aggregate varIdx fs =>
+        cases varIdx with
+        | succ _ => nomatch hEnc
+        | zero =>
+          cases fs with
+          | nil => nomatch hEnc
+          | cons v₁ rest₁ =>
+            cases rest₁ with
+            | nil => nomatch hEnc
+            | cons v₂ rest₂ =>
+              cases rest₂ with
+              | cons _ _ => nomatch hEnc
+              | nil =>
+                simp only [] at hEnc
+                have hLen2 : Nat.beq (Trusted.Sequence.length [v₁, v₂])
+                    (Trusted.Sequence.length [RigidTy.uint w₁, RigidTy.uint w₂]) = true := rfl
+                rw [hLen2] at hEnc
+                dsimp only at hEnc
+                rw [hLookup] at hEnc
+                dsimp only at hEnc
+                rw [hFields, hSize] at hEnc
+                dsimp only at hEnc
+                have hOffLen : Nat.beq
+                    (Trusted.Sequence.length ([{ bytes := 0 }, { bytes := uintByteSize w₁ + pad₁ }] : List Size))
+                    (Trusted.Sequence.length [v₁, v₂]) = true := rfl
+                rw [hOffLen] at hEnc
+                dsimp only [encodeFieldsAtOffsetsWith] at hEnc
+                cases hE₁ : encodeValueToBytes 15 layouts { kind := .uint w₁, layoutIdx := 0 } v₁ <;>
+                  rw [hE₁] at hEnc
+                · dsimp only [rigidTyKindByteSize] at hEnc
+                  rw [intCastTargetBytes_uint_eq w₁] at hEnc
+                  nomatch hEnc
+                case some b₁ =>
+                  dsimp only at hEnc
+                  unfold encodeValueToBytes at hE₁
+                  dsimp only at hE₁
+                  rw [intCastTargetBytes_uint_eq w₁] at hE₁
+                  cases v₁ <;> dsimp only at hE₁
+                  case unit => nomatch hE₁
+                  case ptr => nomatch hE₁
+                  case aggregate => nomatch hE₁
+                  case scalar sv₁ =>
+                    cases hS₁ : Nat.beq sv₁.sizeBytes (uintByteSize w₁) <;> rw [hS₁] at hE₁
+                    · nomatch hE₁
+                    · have hSvSz₁ : sv₁.sizeBytes = uintByteSize w₁ := Nat.eq_of_beq_eq_true hS₁
+                      unfold encodeScalarBytes at hE₁
+                      rw [hSvSz₁] at hE₁
+                      have hNz₁ : Nat.beq (uintByteSize w₁) 0 = false :=
+                        nat_beq_eq_false_of_ne (by have := uintByteSize_pos w₁; omega)
+                      rw [hNz₁] at hE₁
+                      injection hE₁ with hB₁
+                      let x₁ : { bits : Nat // bits < 2 ^ (8 * uintByteSize w₁) } :=
+                        ⟨sv₁.bits % 2 ^ (8 * uintByteSize w₁), Nat.mod_lt _ (Nat.two_pow_pos _)⟩
+                      have hCEnc₁ : b₁ = c₁.encode x₁ := by
+                        rw [← hB₁]
+                        exact (encodeLittleEndianBytes_mod_two_pow none (uintByteSize w₁) sv₁.bits).symm
+                      have hB₁Len : b₁.length = uintByteSize w₁ := by
+                        rw [hCEnc₁]
+                        exact c₁.encode_length x₁
+                      rw [replicateUninitBytes_add_eq (uintByteSize w₁ + pad₁) (uintByteSize w₂ + pad₂),
+                          replicateUninitBytes_add_eq (uintByteSize w₁) pad₁,
+                          replicateUninitBytes_add_eq (uintByteSize w₂) pad₂,
+                          List.append_assoc (replicateUninitBytes (uintByteSize w₁)) (replicateUninitBytes pad₁),
+                          writeAbstractBytesAt_zero_replicateUninit b₁
+                            (replicateUninitBytes pad₁ ++
+                              (replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂))
+                            hB₁Len] at hEnc
+                      dsimp only [encodeFieldsAtOffsetsWith] at hEnc
+                      cases hE₂ : encodeValueToBytes 15 layouts { kind := .uint w₂, layoutIdx := 0 } v₂ <;>
+                        rw [hE₂] at hEnc
+                      · dsimp only [rigidTyKindByteSize] at hEnc
+                        rw [intCastTargetBytes_uint_eq w₂] at hEnc
+                        nomatch hEnc
+                      case some b₂ =>
+                        dsimp only at hEnc
+                        unfold encodeValueToBytes at hE₂
+                        dsimp only at hE₂
+                        rw [intCastTargetBytes_uint_eq w₂] at hE₂
+                        cases v₂ <;> dsimp only at hE₂
+                        case unit => nomatch hE₂
+                        case ptr => nomatch hE₂
+                        case aggregate => nomatch hE₂
+                        case scalar sv₂ =>
+                          cases hS₂ : Nat.beq sv₂.sizeBytes (uintByteSize w₂) <;> rw [hS₂] at hE₂
+                          · nomatch hE₂
+                          · have hSvSz₂ : sv₂.sizeBytes = uintByteSize w₂ := Nat.eq_of_beq_eq_true hS₂
+                            unfold encodeScalarBytes at hE₂
+                            rw [hSvSz₂] at hE₂
+                            have hNz₂ : Nat.beq (uintByteSize w₂) 0 = false :=
+                              nat_beq_eq_false_of_ne (by have := uintByteSize_pos w₂; omega)
+                            rw [hNz₂] at hE₂
+                            injection hE₂ with hB₂
+                            let x₂ : { bits : Nat // bits < 2 ^ (8 * uintByteSize w₂) } :=
+                              ⟨sv₂.bits % 2 ^ (8 * uintByteSize w₂), Nat.mod_lt _ (Nat.two_pow_pos _)⟩
+                            have hCEnc₂ : b₂ = c₂.encode x₂ := by
+                              rw [← hB₂]
+                              exact (encodeLittleEndianBytes_mod_two_pow none (uintByteSize w₂) sv₂.bits).symm
+                            have hB₂Len : b₂.length = uintByteSize w₂ := by
+                              rw [hCEnc₂]
+                              exact c₂.encode_length x₂
+                            have hAssoc₁ :
+                                b₁ ++
+                                    (replicateUninitBytes pad₁ ++
+                                      (replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂)) =
+                                  (b₁ ++ replicateUninitBytes pad₁) ++
+                                    replicateUninitBytes (uintByteSize w₂) ++ replicateUninitBytes pad₂ := by
+                              simp only [List.append_assoc]
+                            have hPreLen : (b₁ ++ replicateUninitBytes pad₁).length =
+                                uintByteSize w₁ + pad₁ := by
+                              rw [List.length_append, hB₁Len, length_replicateUninitBytes]
+                            rw [hAssoc₁,
+                                writeAbstractBytesAt_offset_replicateUninit
+                                  (b₁ ++ replicateUninitBytes pad₁) b₂ (replicateUninitBytes pad₂)
+                                  hPreLen hB₂Len] at hEnc
+                            dsimp only [encodeFieldsAtOffsetsWith] at hEnc
+                            injection hEnc with hBs
+                            refine ⟨(x₁, x₂), ?_⟩
+                            rw [← hBs, hCEnc₁, hCEnc₂]
+                            dsimp only [FixedByteCodec.prod, p₁, p₂, FixedByteCodec.padRight,
+                                        FixedByteCodec.mapEquiv, FixedByteCodec.padUninit,
+                                        FixedByteCodec.ofRoundTrip]
+                            simp only [List.append_assoc])
+    (fun bs => by
+      unfold defaultCodecFuel decodeValueFromBytes
+      dsimp only
+      rw [hLookup]
+      dsimp only
+      rw [hSize, hFields]
+      dsimp only
+      have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+      rw [hLenDef]
+      let totalSz := (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂)
+      cases hBeq : Nat.beq bs.length totalSz
+      · dsimp only
+        have hNe : bs.length ≠ totalSz := by
+          intro hEq
+          rw [Nat.beq_eq.mpr hEq] at hBeq
+          nomatch hBeq
+        rw [(FixedByteCodec.prod_isExactWidth p₁ p₂).decode_eq_none_of_length_ne hNe]
+        rfl
+      · dsimp only [decodeFieldsAtOffsetsWith]
+        have hSz₁ : rigidTyByteSize layouts { kind := .uint w₁, layoutIdx := 0 } =
+            some (uintByteSize w₁) := m₁.tySize_eq
+        have hSz₂ : rigidTyByteSize layouts { kind := .uint w₂, layoutIdx := 0 } =
+            some (uintByteSize w₂) := m₂.tySize_eq
+        rw [hSz₁]
+        dsimp only [sliceAbstractBytes]
+        rw [hLenDef]
+        have hBsEq : bs.length = (uintByteSize w₁ + pad₁) + (uintByteSize w₂ + pad₂) :=
+          Nat.eq_of_beq_eq_true hBeq
+        have hBle₁ : Nat.ble (Nat.add 0 (uintByteSize w₁)) bs.length = true :=
+          Nat.ble_eq_true_of_le (by
+            have h0 : Nat.add 0 (uintByteSize w₁) = uintByteSize w₁ := Nat.zero_add _
+            rw [h0]
+            omega)
+        rw [hBle₁]
+        dsimp only [dropAbstractBytes]
+        have hMC₁ : m₁.codec = c₁ := rfl
+        have hMC₂ : m₂.codec = c₂ := rfl
+        rw [takeAbstractBytes_eq_take, m₁.decode_eq_map (bs.take (uintByteSize w₁)), hMC₁]
+        have hBle₂ : Nat.ble (Nat.add (uintByteSize w₁ + pad₁) (uintByteSize w₂)) bs.length = true :=
+          Nat.ble_eq_true_of_le (by
+            have hAdd : Nat.add (uintByteSize w₁ + pad₁) (uintByteSize w₂) =
+                (uintByteSize w₁ + pad₁) + uintByteSize w₂ := rfl
+            rw [hAdd]
+            omega)
+        have hTakeLen₁ : (bs.take (uintByteSize w₁ + pad₁)).length = uintByteSize w₁ + pad₁ := by
+          rw [List.length_take]
+          omega
+        have hDropLen₂ : (bs.drop (uintByteSize w₁ + pad₁)).length = uintByteSize w₂ + pad₂ := by
+          rw [List.length_drop]
+          omega
+        have hTakeTake :
+            (bs.take (uintByteSize w₁ + pad₁)).take (uintByteSize w₁) =
+              bs.take (uintByteSize w₁) := by
+          rw [List.take_take]
+          exact congrArg (fun k => bs.take k) (Nat.min_eq_left (by omega))
+        unfold FixedByteCodec.prod FixedByteCodec.ofRoundTrip
+        dsimp only
+        rw [hBeq]
+        dsimp only
+        have hP₁ : p₁.decode (bs.take (uintByteSize w₁ + pad₁)) =
+            c₁.decode (bs.take (uintByteSize w₁)) := by
+          dsimp only [p₁]
+          rw [FixedByteCodec.padRight_decode_of_length_eq c₁ hTakeLen₁, hTakeTake]
+        have hP₂ : p₂.decode (bs.drop (uintByteSize w₁ + pad₁)) =
+            c₂.decode ((bs.drop (uintByteSize w₁ + pad₁)).take (uintByteSize w₂)) := by
+          dsimp only [p₂]
+          exact FixedByteCodec.padRight_decode_of_length_eq c₂ hDropLen₂
+        rw [hP₁, hP₂]
+        cases c₁.decode (bs.take (uintByteSize w₁)) with
+        | none => rfl
+        | some a =>
+          dsimp only [Option.map, decodeFieldsAtOffsetsWith]
+          rw [hSz₂]
+          dsimp only [sliceAbstractBytes]
+          rw [hBle₂]
+          dsimp only
+          rw [dropAbstractBytes_eq_drop, takeAbstractBytes_eq_take,
+              m₂.decode_eq_map ((bs.drop (uintByteSize w₁ + pad₁)).take (uintByteSize w₂)), hMC₂]
+          cases c₂.decode ((bs.drop (uintByteSize w₁ + pad₁)).take (uintByteSize w₂)) <;> rfl)
 
 end MirValueCodec
 

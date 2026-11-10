@@ -201,7 +201,14 @@ theorem ordering3_roundtrip_and_slice (e : Ordering3) (pre post : List AbstractB
   ⟨ordering3Codec.decode_encode e,
    ordering3Codec.decode_sliceAbstractBytes_append pre post e⟩
 
-/-! ## 2. Negative Tests: Niche Rejection, `bool` Bit Patterns, and Padding `¬ IsInitCodec` -/
+theorem ordering3_decode_eq_some_iff_canonical (bs : List AbstractByte) (e : Ordering3) :
+    ordering3Codec.decode bs = some e ↔
+      (FixedByteCodec.uintBitsLE 1 (by decide)).decode bs =
+        some ⟨ordering3ToTag e, ordering3_bounds e⟩ :=
+  FixedByteCodec.enumRepr_decode_eq_some_iff
+    1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds bs e
+
+/-! ## 2. Negative Tests: Niche Rejection, `bool` Bit Patterns, Combinator Propagation, and Padding `¬ IsInitCodec` -/
 
 def nonZeroU32Range : WrappingRange :=
   { start := 1, end_ := 2 ^ 32 - 1 }
@@ -225,6 +232,37 @@ theorem nonZeroU32Refine_positive_one :
       ⟨⟨1, by decide⟩, by decide⟩
     nonZeroU32RefineCodec.decode (nonZeroU32RefineCodec.encode one) = some one :=
   nonZeroU32RefineCodec.decode_encode _
+
+def nonZeroU32Min :
+    { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true } :=
+  ⟨1, by decide, by decide⟩
+
+def nonZeroU32Max :
+    { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true } :=
+  ⟨2 ^ 32 - 1, by decide, by decide⟩
+
+/-- Positive round-trip, `decode_take_append`, and `decode_sliceAbstractBytes_append`
+tests for `scalarValidRange` on both `1` and `u32::MAX` (`0xffff_ffff`). -/
+theorem nonZeroU32ScalarValidRange_positive_bounds (pre post : List AbstractByte) :
+    nonZeroU32RangeCodec.decode (nonZeroU32RangeCodec.encode nonZeroU32Min) = some nonZeroU32Min ∧
+    nonZeroU32RangeCodec.decode ((nonZeroU32RangeCodec.encode nonZeroU32Max ++ post).take 4) =
+      some nonZeroU32Max ∧
+    (sliceAbstractBytes (pre ++ nonZeroU32RangeCodec.encode nonZeroU32Min ++ post) pre.length 4).bind
+      nonZeroU32RangeCodec.decode = some nonZeroU32Min ∧
+    (sliceAbstractBytes (pre ++ nonZeroU32RangeCodec.encode nonZeroU32Max ++ post) pre.length 4).bind
+      nonZeroU32RangeCodec.decode = some nonZeroU32Max :=
+  ⟨nonZeroU32RangeCodec.decode_encode nonZeroU32Min,
+   nonZeroU32RangeCodec.decode_take_append nonZeroU32Max post,
+   nonZeroU32RangeCodec.decode_sliceAbstractBytes_append pre post nonZeroU32Min,
+   nonZeroU32RangeCodec.decode_sliceAbstractBytes_append pre post nonZeroU32Max⟩
+
+/-- Non-pointer `.float 32` layout bridge via `decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map`. -/
+theorem float32_scalarLayout_bridge (range : WrappingRange) (bs : List AbstractByte) :
+    decodeScalarLayoutBytes (.initialized (.float 32) range) bs =
+      ((FixedByteCodec.scalarValidRange 4 (by decide) range).decode bs).map
+        (fun x => Value.scalar ⟨x.val, 4⟩) :=
+  FixedByteCodec.decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+    (.float 32) range 4 (by decide) rfl rfl bs
 
 /-- Negative test: `0` is rejected by `NonZeroU32` via `refineNiche_decode_rejects_false`. -/
 theorem nonZeroU32Refine_rejects_zero :
@@ -259,6 +297,35 @@ theorem ordering3Codec_rejects_discriminant_3 :
     1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
     (bits := 3) (by decide) rfl
 
+/-- Lenient `ofTag` regression (`B1-1`): `lenientBoolOfTag` maps every tag `≥ 2` to
+`some false`, yet `enumRepr` still rejects tag `2` with `none` because `toTag false = 0 ≠ 2`! -/
+def lenientBoolToTag : Bool → Nat
+  | false => 0
+  | true => 1
+
+def lenientBoolOfTag : Nat → Option Bool
+  | 0 => some false
+  | 1 => some true
+  | _ => some false
+
+theorem lenientBool_round (b : Bool) : lenientBoolOfTag (lenientBoolToTag b) = some b := by
+  cases b <;> rfl
+
+theorem lenientBool_bounds (b : Bool) : lenientBoolToTag b < 2 ^ (8 * 1) := by
+  cases b <;> decide
+
+def lenientBoolEnumCodec : FixedByteCodec Bool 1 :=
+  FixedByteCodec.enumRepr 1 (by decide) lenientBoolToTag lenientBoolOfTag
+    lenientBool_round lenientBool_bounds
+
+theorem lenientBoolEnumCodec_rejects_tag_2 :
+    lenientBoolOfTag 2 = some false ∧
+    lenientBoolEnumCodec.decode (encodeLittleEndianBytes 2 1 none) = none :=
+  ⟨rfl,
+   FixedByteCodec.enumRepr_decode_rejects_non_canonical_tag
+     1 (by decide) lenientBoolToTag lenientBoolOfTag lenientBool_round lenientBool_bounds
+     (bits := 2) (by decide) (fun b => by cases b <;> decide)⟩
+
 /-- Negative test: invalid `bool` bit patterns (`0x02`, `0xff`) and `.uninit` return `none`. -/
 theorem boolByte_rejects_two :
     FixedByteCodec.boolByte.decode [.init (UInt8.ofNat 2) none] = none :=
@@ -274,6 +341,33 @@ theorem boolByte_rejects_uninit :
 theorem boolByte_not_surjective_init :
     ¬ FixedByteCodec.boolByte.IsSurjectiveInitDecoder :=
   FixedByteCodec.boolByte_not_isSurjectiveInitDecoder
+
+/-- Negative propagation tests (`B1-6`): `prod`, `listFixed`, and `array` reject
+whenever any component/element byte slice fails its element decoder. -/
+theorem prod_propagates_component_rejections :
+    let pairC := FixedByteCodec.prod FixedByteCodec.u8 FixedByteCodec.boolByte
+    pairC.decode [.init (UInt8.ofNat 0x2a) none, .init (UInt8.ofNat 2) none] = none ∧
+    pairC.decode [.uninit, .init (UInt8.ofNat 1) none] = none :=
+  ⟨FixedByteCodec.prod_decode_eq_none_of_snd_none FixedByteCodec.u8 FixedByteCodec.boolByte
+     boolByte_rejects_two,
+   FixedByteCodec.prod_decode_eq_none_of_fst_none FixedByteCodec.u8 FixedByteCodec.boolByte rfl⟩
+
+theorem listFixed_and_array_propagate_element_rejection :
+    let badBytes : List AbstractByte :=
+      [.init (UInt8.ofNat 1) none, .init (UInt8.ofNat 2) none, .init (UInt8.ofNat 0) none]
+    (FixedByteCodec.listFixed 3 FixedByteCodec.boolByte).decode badBytes = none ∧
+    (FixedByteCodec.array 3 FixedByteCodec.boolByte).decode badBytes = none := by
+  have hMid :
+      (FixedByteCodec.listFixed 2 FixedByteCodec.boolByte).decode
+        [.init (UInt8.ofNat 2) none, .init (UInt8.ofNat 0) none] = none :=
+    FixedByteCodec.listFixed_decode_eq_none_of_head_none 1 FixedByteCodec.boolByte
+      boolByte_rejects_two
+  have hList :
+      (FixedByteCodec.listFixed 3 FixedByteCodec.boolByte).decode
+        [.init (UInt8.ofNat 1) none, .init (UInt8.ofNat 2) none, .init (UInt8.ofNat 0) none] =
+        none :=
+    FixedByteCodec.listFixed_decode_eq_none_of_tail_none 2 FixedByteCodec.boolByte hMid
+  exact ⟨hList, FixedByteCodec.array_decode_eq_none_of_listFixed_none 3 FixedByteCodec.boolByte hList⟩
 
 /-- Negative test: padded codecs (`padRight` / `padLeft` with `padBytes = 2 > 0`) emit
 `.uninit` bytes (`allBytesInitialized = false`) and violate `IsInitCodec`. -/
@@ -316,10 +410,21 @@ def paddedU16TupleLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- Real `rustc` layout for `(u8, u32)`: `u8` at offset `0`, 3 bytes of interior
+alignment padding (`pad₁ = 3`), `u32` at offset `4`, total size `8` bytes (`pad₂ = 0`). -/
+def paddedU8U32TupleLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 4 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
 def testLayouts : LayoutTable := {
   pointerBits := 64
   isLittleEndian := true
-  entries := [nonZeroU32Layout, paddedU16TupleLayout]
+  entries := [nonZeroU32Layout, paddedU16TupleLayout, paddedU8U32TupleLayout]
 }
 
 def mirUnit : MirValueCodec testLayouts { kind := .tuple [], layoutIdx := 0 } Unit 0 :=
@@ -353,10 +458,10 @@ def mirU8x4 :
   MirValueCodec.uintArray testLayouts .u8 4 (by decide) 0
 
 def mirU16Pair :
-    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 2 }
+    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 3 }
       ({ bits : Nat // bits < 2 ^ (8 * 2) } × { bits : Nat // bits < 2 ^ (8 * 2) })
       4 :=
-  MirValueCodec.uintPairTuple testLayouts .u16 .u16 2 rfl
+  MirValueCodec.uintPairTuple testLayouts .u16 .u16 3 rfl
 
 def mirPaddedU16Tuple :
     MirValueCodec testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 }
@@ -364,49 +469,80 @@ def mirPaddedU16Tuple :
       4 :=
   MirValueCodec.paddedSingleElemTuple testLayouts .u16 2 1 paddedU16TupleLayout rfl rfl rfl
 
-/-- `u32` satisfies all four zerocopy marker traits (`IntoBytes`, `FromBytes`, `FromZeros`, `TryFromBytes`). -/
+def mirPaddedU8U32Tuple :
+    MirValueCodec testLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 2 }
+      ({ bits : Nat // bits < 2 ^ (8 * 1) } × { bits : Nat // bits < 2 ^ (8 * 4) })
+      8 :=
+  MirValueCodec.uintPairArbitraryTuple
+    testLayouts .u8 .u32 3 0 2 paddedU8U32TupleLayout [0, 1] rfl rfl rfl
+
+/-- `u32` satisfies all four zerocopy marker traits with a non-vacuous `IsTryFromBytes` range bound. -/
 theorem mirU32_all_marker_traits :
     IsIntoBytes testLayouts { kind := .uint .u32, layoutIdx := 0 } ∧
     IsFromBytes testLayouts { kind := .uint .u32, layoutIdx := 0 } ∧
     IsFromZeros testLayouts { kind := .uint .u32, layoutIdx := 0 } ∧
-    IsTryFromBytes testLayouts { kind := .uint .u32, layoutIdx := 0 } :=
+    IsTryFromBytes testLayouts { kind := .uint .u32, layoutIdx := 0 }
+      (fun v => ∃ bits, bits < 2 ^ 32 ∧ v = .scalar ⟨bits, 4⟩) :=
   ⟨mirU32.isIntoBytes (FixedByteCodec.uintBitsLE_isInitCodec 4 (by decide)),
    mirU32.isFromBytes (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide)),
    mirU32.isFromZeros (FixedByteCodec.uintBitsLE_hasZeroValid 4 (by decide)),
-   mirU32.isTryFromBytes_trivial⟩
+   mirU32.isTryFromBytes_of (fun ⟨bits, hLt⟩ => ⟨bits, hLt, rfl⟩)⟩
 
-/-- `bool` is `IntoBytes`, `FromZeros`, and `TryFromBytes`, but NOT `FromBytes`. -/
+/-- `bool` is `IntoBytes`, `FromZeros`, and `IsTryFromBytes` with `{0, 1}` bit-pattern
+invariant, but NOT `FromBytes`. -/
 theorem mirBool_marker_traits_and_not_fromBytes :
     IsIntoBytes testLayouts { kind := .bool, layoutIdx := 0 } ∧
     IsFromZeros testLayouts { kind := .bool, layoutIdx := 0 } ∧
-    IsTryFromBytes testLayouts { kind := .bool, layoutIdx := 0 } ∧
+    IsTryFromBytes testLayouts { kind := .bool, layoutIdx := 0 }
+      (fun v => v = .scalar ⟨0, 1⟩ ∨ v = .scalar ⟨1, 1⟩) ∧
     ¬ IsFromBytes testLayouts { kind := .bool, layoutIdx := 0 } :=
   ⟨mirBool.isIntoBytes FixedByteCodec.boolByte_isInitCodec,
    mirBool.isFromZeros FixedByteCodec.boolByte_hasZeroValid,
-   mirBool.isTryFromBytes_trivial,
+   mirBool.isTryFromBytes_of (fun b => by
+     cases b with
+     | false => exact Or.inl rfl
+     | true => exact Or.inr rfl),
    mirBool.not_isFromBytes_of_rejected_init
      (bs := [.init (UInt8.ofNat 2) none]) rfl rfl boolByte_rejects_two⟩
 
-/-- `NonZeroU32` is `IntoBytes` and `TryFromBytes`, but NOT `FromBytes` (`0` is rejected). -/
+/-- `NonZeroU32` is `IntoBytes` and `IsTryFromBytes` with non-zero guarantee
+(`v ≠ .scalar ⟨0, 4⟩` and `1 ≤ bits ≤ 2^32 - 1`), but NOT `FromBytes` (`0` is rejected). -/
 theorem mirNonZeroU32_into_and_not_fromBytes :
     IsIntoBytes testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 } ∧
-    IsTryFromBytes testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 } ∧
-    ¬ IsFromBytes testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 } :=
-  ⟨mirNonZeroU32.isIntoBytes
-     (FixedByteCodec.scalarValidRange_isInitCodec 4 (by decide) nonZeroU32Range),
-   mirNonZeroU32.isTryFromBytes_trivial,
-   mirNonZeroU32.not_isFromBytes_of_rejected_init
-     (bs := encodeLittleEndianBytes 0 4 none)
-     (length_encodeLittleEndianBytes none 4 0)
-     (allBytesInitialized_encodeLittleEndianBytes none 4 0)
-     nonZeroU32ScalarValidRange_rejects_zero⟩
+    IsTryFromBytes testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 }
+      (fun v => v ≠ .scalar ⟨0, 4⟩ ∧ ∃ bits, 1 ≤ bits ∧ bits < 2 ^ 32 ∧ v = .scalar ⟨bits, 4⟩) ∧
+    ¬ IsFromBytes testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 } := by
+  refine ⟨mirNonZeroU32.isIntoBytes
+            (FixedByteCodec.scalarValidRange_isInitCodec 4 (by decide) nonZeroU32Range),
+          mirNonZeroU32.isTryFromBytes_of ?_,
+          mirNonZeroU32.not_isFromBytes_of_rejected_init
+            (bs := encodeLittleEndianBytes 0 4 none)
+            (length_encodeLittleEndianBytes none 4 0)
+            (allBytesInitialized_encodeLittleEndianBytes none 4 0)
+            nonZeroU32ScalarValidRange_rejects_zero⟩
+  rintro ⟨bits, hLt, hRange⟩
+  have hGe1 : 1 ≤ bits := by
+    unfold wrappingRangeContains nonZeroU32Range at hRange
+    dsimp only at hRange
+    have hBle : Nat.ble 1 (2 ^ 32 - 1) = true := by decide
+    rw [hBle] at hRange
+    dsimp only at hRange
+    simp only [Bool.and_eq_true] at hRange
+    exact Nat.le_of_ble_eq_true hRange.1
+  refine ⟨?_, bits, hGe1, hLt, rfl⟩
+  intro hEqZero
+  change Value.scalar ⟨bits, 4⟩ = Value.scalar ⟨0, 4⟩ at hEqZero
+  injection hEqZero with hSc
+  have hBits0 : bits = 0 := congrArg ScalarInt.bits hSc
+  omega
 
 /-- Padded `(u16,)` (2-byte field + 2-byte trailing padding) is `FromBytes`, `FromZeros`,
-and `TryFromBytes`, but NOT `IntoBytes`! -/
+and non-vacuous `IsTryFromBytes`, but NOT `IntoBytes`! -/
 theorem mirPaddedU16Tuple_fromBytes_and_not_intoBytes :
     IsFromBytes testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 } ∧
     IsFromZeros testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 } ∧
-    IsTryFromBytes testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 } ∧
+    IsTryFromBytes testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 }
+      (fun v => ∃ bits, bits < 2 ^ 16 ∧ v = .aggregate 0 [.scalar ⟨bits, 2⟩]) ∧
     ¬ IsIntoBytes testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 } :=
   ⟨mirPaddedU16Tuple.isFromBytes
      (FixedByteCodec.padRight_isSurjectiveInitDecoder 2
@@ -414,11 +550,41 @@ theorem mirPaddedU16Tuple_fromBytes_and_not_intoBytes :
    mirPaddedU16Tuple.isFromZeros
      (FixedByteCodec.padRight_hasZeroValid 2
        (FixedByteCodec.uintBitsLE_hasZeroValid 2 (by decide))),
-   mirPaddedU16Tuple.isTryFromBytes_trivial,
+   mirPaddedU16Tuple.isTryFromBytes_of (fun ⟨bits, hLt⟩ => ⟨bits, hLt, rfl⟩),
    mirPaddedU16Tuple.not_isIntoBytes_of_uninit_encode
      ⟨0x0042, by decide⟩
      (FixedByteCodec.allBytesInitialized_padRight_encode_eq_false
        (FixedByteCodec.uintBitsLE 2 (by decide)) (by decide) ⟨0x0042, by decide⟩)⟩
+
+/-- Real laid-out `(u8, u32)` with 3 bytes of interior padding (`B1-2`) is
+`FromBytes`, `FromZeros`, and non-vacuous `IsTryFromBytes`, while failing `IntoBytes`! -/
+theorem mirPaddedU8U32Tuple_fromBytes_and_not_intoBytes :
+    IsFromBytes testLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 2 } ∧
+    IsFromZeros testLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 2 } ∧
+    IsTryFromBytes testLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 2 }
+      (fun v =>
+        ∃ b0 b1,
+          b0 < 2 ^ 8 ∧ b1 < 2 ^ 32 ∧
+          v = .aggregate 0 [.scalar ⟨b0, 1⟩, .scalar ⟨b1, 4⟩]) ∧
+    ¬ IsIntoBytes testLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 2 } := by
+  refine
+    ⟨mirPaddedU8U32Tuple.isFromBytes
+       (FixedByteCodec.prod_isSurjectiveInitDecoder
+         (FixedByteCodec.padRight_isSurjectiveInitDecoder 3
+           (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide)))
+         (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
+           (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide)))),
+     mirPaddedU8U32Tuple.isFromZeros
+       (FixedByteCodec.prod_hasZeroValid
+         (FixedByteCodec.padRight_hasZeroValid 3
+           (FixedByteCodec.uintBitsLE_hasZeroValid 1 (by decide)))
+         (FixedByteCodec.padRight_hasZeroValid 0
+           (FixedByteCodec.uintBitsLE_hasZeroValid 4 (by decide)))),
+     mirPaddedU8U32Tuple.isTryFromBytes_of
+       (fun ⟨⟨b0, hb0⟩, ⟨b1, hb1⟩⟩ => ⟨b0, b1, hb0, hb1, rfl⟩),
+     mirPaddedU8U32Tuple.not_isIntoBytes_of_uninit_encode
+       (⟨0x07, by decide⟩, ⟨0xdead_beef, by decide⟩)
+       (by rfl)⟩
 
 /-- Safe `transmute_sound` instance: `NonZeroU32 -> u32`. -/
 theorem transmute_nonZeroU32_to_u32_sound
