@@ -457,15 +457,17 @@ fn collect_pointer_offsets(
 /// The fields whose declaration-order concatenation forms a canonical, untagged ADT's byte
 /// image: a struct's fields, a single-field union's field, the only present variant's fields
 /// of an enum laid out without a tag ([`AdtDef::univariant_index`]), or none for a variant-less
-/// enum. `None` for enums that store a tag, whose image depends on it.
+/// or all-absent-variant enum. `None` for enums that store a tag, whose image depends on it.
 pub(crate) fn canonical_untagged_fields(def: &AdtDef) -> Option<&[Ty]> {
     match &def.kind {
         AdtKind::Struct { fields } => Some(fields),
         AdtKind::Union { fields } => Some(&fields[..fields.len().min(1)]),
         AdtKind::Enum { variants, .. } if variants.is_empty() => Some(&[]),
-        AdtKind::Enum { variants, .. } => def
-            .univariant_index()
-            .map(|v| variants[v].fields.as_slice()),
+        AdtKind::Enum { variants, .. } => match def.univariant_index() {
+            Some(v) => Some(variants[v].fields.as_slice()),
+            None if !def.requires_tag_write() => Some(&[]),
+            None => None,
+        },
     }
 }
 
@@ -995,12 +997,12 @@ fn normalize_adt_bytes(
     ptr_width: PtrWidth,
     out: &mut Vec<AbstractByte>,
 ) -> Result<(), CastEvalError> {
+    if !def.is_inhabited_for(ptr_width) {
+        return Err(CastEvalError::UninhabitedTarget {
+            target_ty: ty.clone(),
+        });
+    }
     let (start, fields) = match &def.kind {
-        AdtKind::Enum { variants, .. } if variants.is_empty() => {
-            return Err(CastEvalError::UninhabitedTarget {
-                target_ty: ty.clone(),
-            });
-        }
         AdtKind::Enum {
             tag_ty: Some(tag),
             variants,

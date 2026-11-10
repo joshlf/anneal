@@ -16,11 +16,11 @@ use anneal_mir::ir::{
     VariantDef, width_mask,
 };
 use anneal_mir::lower::{
-    CallOutcome, CastEvalError, CastLowerError, CfgEvalError, CfgEvalOutcome,
-    ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue,
-    LoweredStatement, LoweredTerminator, MirValue, PanicMessage, PartialAggregate, RvalueEvalError,
-    RvalueLowerError, StatementEvalState, TerminatorLowerError, TransmutePolicy, TransmuteValue,
-    eval_cfg_in_state, eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls,
+    CallOutcome, CastEvalError, CastLowerError, CastOp, CfgEvalError, CfgEvalOutcome,
+    ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredCast,
+    LoweredRvalue, LoweredStatement, LoweredTerminator, MirValue, PanicMessage, PartialAggregate,
+    RvalueEvalError, RvalueLowerError, StatementEvalState, TerminatorLowerError, TransmutePolicy,
+    TransmuteValue, eval_cfg_in_state, eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls,
     eval_lowered_rvalue, eval_lowered_rvalue_in_state, eval_lowered_statement, eval_transmute,
     lower_body, lower_rvalue, lower_statement, lower_terminator, resolve_offset_of,
     resolve_place_ty,
@@ -6483,4 +6483,339 @@ fn test_a1_tagless_enums_with_one_present_variant_use_rustc_univariant_layouts()
     );
     transmute(&mut state, 1, Operand::Copy(local(2)), u32_ty()).unwrap();
     assert_eq!(state.get_init(Local(1)), Some(&u32v(0xDEAD_BEEF)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial Round B2 Regression Tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b2_univariant_enum_absent_variant_shell_discriminant_and_retag() {
+    let (inf_def, inf_ty) = adt(AdtDef::new_enum("Infallible", None, vec![]));
+    // `enum E8 { A((), Infallible), B(u32) }`: `A` is absent (`univariant_index() == Some(1)`,
+    // `!requires_tag_write()`).
+    let (e8_def, e8_ty) = adt(AdtDef::new_enum(
+        "E8",
+        None,
+        vec![
+            VariantDef::new("A", vec![unit(), inf_ty.clone()]),
+            VariantDef::new("B", vec![u32_ty()]),
+        ],
+    ));
+    assert_eq!(e8_def.univariant_index(), Some(1));
+    assert!(!e8_def.requires_tag_write());
+
+    // 1. If a program writes to the inhabited field of the absent variant `(_0 as A).0 = ()`,
+    // `_0` is a `PartialShell` narrowed to absent variant `0`. `Discriminant(_0)` must inspect
+    // the runtime shell variant and fail with `UninhabitedEnumVariant { variant_index: 0 }`
+    // rather than returning variant `B`'s constant discriminant `1`.
+    let mut state = state_with(vec![e8_ty.clone()], PW);
+    run(
+        assign(
+            place(0, vec![ProjectionElem::Downcast(0), field(0, unit())]),
+            Rvalue::Use(Operand::Constant(Constant::Unit)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(0)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+
+    // Hand-built `MirValue::Adt` with `variant_idx = 0` must also fail in both stateful and
+    // stateless `eval_lowered_rvalue`.
+    let bad_e8_val = MirValue::adt(
+        &e8_def,
+        0,
+        vec![MirValue::Unit, MirValue::adt(&inf_def, 0, vec![])],
+    );
+    state.slots[0] = LocalSlotState::Init(bad_e8_val.clone());
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+    let lowered_discr =
+        lower_rvalue(&Rvalue::Discriminant(local(0)), &[e8_ty.clone()], PW).unwrap();
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered_discr,
+            &[bad_e8_val],
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &mut ExposedProvenanceTracker::new(),
+        ),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+
+    // 2. `enum ERef<'a> { A((), Infallible), B(&'a u32) }`: narrowing `_0` to absent variant `A`
+    // via `(_0 as A).0 = ()` must not allow `Statement::Retag` to succeed by skipping variant
+    // `B`'s uninitialized `&'a u32`.
+    let (eref_def, eref_ty) = adt(AdtDef::new_enum(
+        "ERef",
+        None,
+        vec![
+            VariantDef::new("A", vec![unit(), inf_ty.clone()]),
+            VariantDef::new("B", vec![ref_ty(u32_ty())]),
+        ],
+    ));
+    assert_eq!(eref_def.univariant_index(), Some(1));
+    assert!(!eref_def.requires_tag_write());
+    assert!(eref_ty.contains_ref());
+
+    let mut ref_state = state_with(vec![eref_ty.clone()], PW);
+    run(
+        assign(
+            place(0, vec![ProjectionElem::Downcast(0), field(0, unit())]),
+            Rvalue::Use(Operand::Constant(Constant::Unit)),
+        ),
+        &mut ref_state,
+    )
+    .unwrap();
+    assert_eq!(
+        run(retag(RetagKind::Default, local(0)), &mut ref_state),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    if let LocalSlotState::PartialShell(shell) = &mut ref_state.slots[0] {
+        shell.discriminant_set = true;
+    }
+    assert_eq!(
+        run(retag(RetagKind::Default, local(0)), &mut ref_state),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+    ref_state.slots[0] = LocalSlotState::Init(MirValue::adt(
+        &eref_def,
+        0,
+        vec![MirValue::Unit, MirValue::adt(&inf_def, 0, vec![])],
+    ));
+    assert_eq!(
+        run(retag(RetagKind::Default, local(0)), &mut ref_state),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+}
+
+#[test]
+fn test_b2_absent_variant_layout_validation_and_transmute_uninhabited_errors() {
+    // 1. `#[repr(transparent)]` single-variant enums whose single variant is absent must still
+    // enforce E0691 (non-1-aligned ZST) and E0690 (>1 non-ZST field).
+    let (_, bad_align_zst) = adt(AdtDef::new_enum(
+        "ETransAlign",
+        None,
+        vec![VariantDef::new(
+            "A",
+            vec![Ty::Array(Box::new(u64_ty()), 0), Ty::Never],
+        )],
+    )
+    .with_repr(AdtRepr::transparent()));
+    assert!(matches!(
+        bad_align_zst.layout_for(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+
+    let (_, bad_two_non_zst) = adt(AdtDef::new_enum(
+        "ETransTwo",
+        None,
+        vec![VariantDef::new("A", vec![u32_ty(), u32_ty(), Ty::Never])],
+    )
+    .with_repr(AdtRepr::transparent()));
+    assert!(matches!(
+        bad_two_non_zst.layout_for(PW),
+        Err(LayoutError::IllFormed(_))
+    ));
+
+    // 2. `enum EBigAbsent { A(!, [(); 1 << 40]), B(u32) }`:
+    // On `Bits64`, `[(); 1 << 40]` is a valid 1-ZST so `A` is absent and `EBigAbsent` has the
+    // 4-byte layout of `B(u32)`. On `Bits32`, `[(); 1 << 40]` exceeds `u32::MAX` (`TooLarge`).
+    let (_, e_big_absent) = adt(AdtDef::new_enum(
+        "EBigAbsent",
+        None,
+        vec![
+            VariantDef::new(
+                "A",
+                vec![Ty::Never, Ty::Array(Box::new(unit()), 1usize << 40)],
+            ),
+            VariantDef::new("B", vec![u32_ty()]),
+        ],
+    ));
+    assert_eq!(
+        e_big_absent.layout_for(PtrWidth::Bits64),
+        Ok(TyLayout { size: 4, align: 4 })
+    );
+    assert_eq!(
+        e_big_absent.layout_for(PtrWidth::Bits32),
+        Err(LayoutError::TooLarge)
+    );
+    assert_eq!(
+        e_big_absent.check_representable(PtrWidth::Bits32),
+        Err(LayoutError::TooLarge)
+    );
+
+    // 3. Transmuting into an uninhabited enum whose variants are all absent (`enum E1 { A(!) }`)
+    // or whose single variant has a payload and `!` (`enum E2 { A(u32, !) }`) must fail with
+    // `UninhabitedTarget` naming the target enum `Ty::Adt`, not `UnsupportedLayout` or `Ty::Never`.
+    let (_, e1) = adt(AdtDef::new_enum(
+        "E1",
+        None,
+        vec![VariantDef::new("A", vec![Ty::Never])],
+    ));
+    let (_, e2) = adt(AdtDef::new_enum(
+        "E2",
+        None,
+        vec![VariantDef::new("A", vec![u32_ty(), Ty::Never])],
+    ));
+    let mut state = state_with(vec![e1.clone(), e2.clone()], PW);
+    let hand_transmute = |src_ty: Ty, target_ty: Ty, operand: Operand, op: CastOp, size_bytes: usize| {
+        LoweredRvalue::Cast {
+            cast: LoweredCast::Transmute {
+                src_ty,
+                target_ty: target_ty.clone(),
+                operand,
+                op,
+                size_bytes,
+                exposes_provenance: false,
+            },
+            ty: target_ty,
+        }
+    };
+    assert_eq!(
+        eval_lowered_rvalue_in_state(
+            &hand_transmute(
+                unit(),
+                e1.clone(),
+                Operand::Constant(Constant::Unit),
+                CastOp::AggregateTransmute { size_bytes: 0 },
+                0,
+            ),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::UninhabitedTarget {
+                target_ty: e1.clone()
+            }
+        ))
+    );
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Bytes(vec![]),
+            &unit(),
+            &e1,
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &ExposedProvenanceTracker::new(),
+        ),
+        Err(CastEvalError::UninhabitedTarget { target_ty: e1 })
+    );
+    assert_eq!(
+        eval_lowered_rvalue_in_state(
+            &hand_transmute(
+                u32_ty(),
+                e2.clone(),
+                cint(0, u32_ty()),
+                CastOp::AggregateTransmute { size_bytes: 4 },
+                4,
+            ),
+            &mut state,
+        ),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::UninhabitedTarget {
+                target_ty: e2.clone()
+            }
+        ))
+    );
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Scalar(0),
+            &u32_ty(),
+            &e2,
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &ExposedProvenanceTracker::new(),
+        ),
+        Err(CastEvalError::UninhabitedTarget { target_ty: e2 })
+    );
+}
+
+#[test]
+fn test_b2_scalar_range_contains_validates_underlying_scalar_and_hand_built_aggregate_validates_adt_def()
+ {
+    // 1. `AdtDef::scalar_range_contains` must reject bit patterns that are invalid for the
+    // underlying scalar field even when they fall within `scalar_valid_range`.
+    let (niche_ref_def, niche_ref_ty) = adt(AdtDef::new_struct("NicheRef", vec![ref_ty(u8_ty())])
+        .with_scalar_valid_range(ScalarValidRange::new(0, 0xFFFF)));
+    assert!(!niche_ref_def.scalar_range_contains(0, PW));
+    assert!(niche_ref_def.scalar_range_contains(1, PW));
+
+    let (niche_bool_def, _) = adt(AdtDef::new_struct("NicheBool", vec![Ty::Bool])
+        .with_scalar_valid_range(ScalarValidRange::new(1, 3)));
+    assert!(!niche_bool_def.scalar_range_contains(0, PW));
+    assert!(niche_bool_def.scalar_range_contains(1, PW));
+    assert!(!niche_bool_def.scalar_range_contains(2, PW));
+
+    let (niche_char_def, _) = adt(AdtDef::new_struct("NicheChar", vec![Ty::Char])
+        .with_scalar_valid_range(ScalarValidRange::new(0, 0xFFFF)));
+    assert!(!niche_char_def.scalar_range_contains(0xD800, PW));
+    assert!(niche_char_def.scalar_range_contains(0x41, PW));
+
+    let mut state = state_with(vec![niche_ref_ty.clone()], PW);
+    state.slots[0] = LocalSlotState::Init(MirValue::adt(
+        &niche_ref_def,
+        0,
+        vec![MirValue::ptr(
+            PointerValue::without_provenance(0),
+            ref_ty(u8_ty()),
+        )],
+    ));
+    assert_eq!(
+        read(&state, &local(0)),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: niche_ref_ty.clone(),
+                bits: 0,
+            }
+        ))
+    );
+
+    // 2. `struct SBigRange(u32, [(); 1 << 40])` with `scalar_valid_range`:
+    // Valid 4-byte struct on `Bits64`, and `TooLarge` (not `IllFormed`) on `Bits32`.
+    let (_, s_big_range) = adt(AdtDef::new_struct(
+        "SBigRange",
+        vec![u32_ty(), Ty::Array(Box::new(unit()), 1usize << 40)],
+    )
+    .with_scalar_valid_range(ScalarValidRange::non_zero(32)));
+    assert_eq!(
+        s_big_range.layout_for(PtrWidth::Bits64),
+        Ok(TyLayout { size: 4, align: 4 })
+    );
+    assert_eq!(
+        s_big_range.layout_for(PtrWidth::Bits32),
+        Err(LayoutError::TooLarge)
+    );
+
+    // 3. Hand-built `LoweredRvalue::Aggregate` with an ill-formed `AdtDef` must fail closed at
+    // evaluation time.
+    let (bad_align_def, bad_align_ty) =
+        adt(AdtDef::new_struct("BadAlign", vec![u32_ty()]).with_repr(AdtRepr::c().with_align(3)));
+    let hand_agg = LoweredRvalue::Aggregate {
+        kind: AggregateKind::Adt {
+            def_path: "BadAlign".to_string(),
+            variant_idx: 0,
+            active_field: None,
+            adt_def: Some(bad_align_def),
+        },
+        operands: vec![cint(1, u32_ty())],
+        operand_tys: vec![u32_ty()],
+        ty: bad_align_ty.clone(),
+    };
+    let mut bad_state = state_with(vec![bad_align_ty.clone()], PW);
+    assert!(matches!(
+        eval_lowered_rvalue_in_state(&hand_agg, &mut bad_state),
+        Err(RvalueEvalError::CastEval(CastEvalError::IllFormedType {
+            ty,
+            ..
+        })) if ty == bad_align_ty
+    ));
 }

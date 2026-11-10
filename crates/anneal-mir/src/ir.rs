@@ -1493,18 +1493,14 @@ impl AdtDef {
     }
 
     /// Returns true if `rustc` never represents a value of an enum variant with these `fields`
-    /// (an *absent* variant): some field is uninhabited and every field is a 1-ZST, under both
-    /// pointer widths (a variant absent under only one width conservatively counts as present).
+    /// (an *absent* variant): some field is uninhabited and every field is a 1-ZST (which is
+    /// width-independent among representable types; `layout_info` checks `ptr_width` bounds).
     fn is_absent_variant(fields: &[Ty]) -> bool {
-        const WIDTHS: [PtrWidth; 2] = [PtrWidth::Bits32, PtrWidth::Bits64];
-        fields
-            .iter()
-            .any(|f| WIDTHS.iter().all(|pw| !f.is_inhabited_for(*pw)))
-            && fields.iter().all(|f| {
-                WIDTHS
-                    .iter()
-                    .all(|pw| f.layout_info(*pw).is_ok_and(|l| l.is_one_zst()))
-            })
+        let pw = PtrWidth::Bits64;
+        fields.iter().any(|f| !f.is_inhabited_for(pw))
+            && fields
+                .iter()
+                .all(|f| f.layout_info(pw).is_ok_and(|l| l.is_one_zst()))
     }
 
     /// For a tagless, non-`#[repr(C)]` enum, the indices of its variants that are not absent
@@ -1590,16 +1586,20 @@ impl AdtDef {
         found
     }
 
-    /// Returns true if `bits` (the scalar field's bit pattern) satisfies `scalar_valid_range`
-    /// (always true without a range or scalar field).
+    /// Returns true if `bits` (the scalar field's bit pattern) is a valid bit pattern of the
+    /// scalar field and satisfies `scalar_valid_range` (always true without a range or scalar
+    /// field).
     pub fn scalar_range_contains(&self, bits: u128, ptr_width: PtrWidth) -> bool {
         let Some(range) = &self.scalar_valid_range else {
             return true;
         };
         match self.scalar_field(ptr_width) {
-            Some((_, field)) => field
-                .scalar_bit_width(ptr_width)
-                .is_some_and(|w| range.contains(bits, w)),
+            Some((_, field)) => {
+                field.is_valid_scalar_bits(bits, ptr_width)
+                    && field
+                        .scalar_bit_width(ptr_width)
+                        .is_some_and(|w| range.contains(bits, w))
+            }
             None => true,
         }
     }
@@ -1652,14 +1652,9 @@ impl AdtDef {
                 "repr(transparent) cannot be combined with repr(align) (E0692)",
             ));
         }
-        if self.scalar_valid_range.is_some() && self.scalar_field(ptr_width).is_none() {
-            return Err(LayoutError::IllFormed(
-                "scalar_valid_range requires a struct whose only non-1-ZST field is a primitive scalar",
-            ));
-        }
-        match &self.kind {
+        let info = match &self.kind {
             AdtKind::Struct { fields } => {
-                struct_like_layout(fields, self.repr.kind, repr_align, ptr_width)
+                struct_like_layout(fields, self.repr.kind, repr_align, ptr_width)?
             }
             AdtKind::Union { fields } => {
                 if fields.is_empty() {
@@ -1694,7 +1689,7 @@ impl AdtDef {
                     .size
                     .checked_next_multiple_of(info.align)
                     .ok_or(LayoutError::TooLarge)?;
-                Ok(info)
+                info
             }
             AdtKind::Enum { tag_ty, variants } => {
                 let discrs = self.discriminants(ptr_width)?;
@@ -1712,39 +1707,65 @@ impl AdtDef {
                             "unsupported representation for zero-variant enum (E0084)",
                         ));
                     }
-                    return Ok(LayoutInfo::exact(0, 1));
-                }
-                if let Some(tag) = tag_ty {
-                    return tagged_layout(*tag, variants, self.repr.kind, repr_align, ptr_width);
-                }
-                match self.untagged_present_variants().as_deref() {
-                    // Only absent variants: laid out like `!` (`repr(align)` is ignored).
-                    Some([]) => return Ok(LayoutInfo::exact(0, 1)),
-                    Some([v]) => {
-                        return struct_like_layout(
-                            &variants[*v].fields,
+                    LayoutInfo::exact(0, 1)
+                } else if let Some(tag) = tag_ty {
+                    tagged_layout(*tag, variants, self.repr.kind, repr_align, ptr_width)?
+                } else {
+                    for variant in variants {
+                        for field in &variant.fields {
+                            field.layout_info(ptr_width)?;
+                        }
+                    }
+                    if transparent {
+                        struct_like_layout(
+                            &variants[0].fields,
                             self.repr.kind,
                             repr_align,
                             ptr_width,
-                        );
+                        )?
+                    } else {
+                        match self.untagged_present_variants().as_deref() {
+                            // Only absent variants: laid out like `!` (`repr(align)` is ignored).
+                            Some([]) => LayoutInfo::exact(0, 1),
+                            Some([v]) => struct_like_layout(
+                                &variants[*v].fields,
+                                self.repr.kind,
+                                repr_align,
+                                ptr_width,
+                            )?,
+                            _ => {
+                                // Unspecified layout: bound it by the tagged layout with the smallest tag that
+                                // fits every discriminant (at least the 4-byte C `int` for `repr(C)`).
+                                let (_, bit_width) = self.discr_int(ptr_width)?;
+                                let min_tag_bytes =
+                                    if self.repr.kind == AdtReprKind::C { 4 } else { 1 };
+                                let tag = smallest_fit_tag(&discrs, bit_width, min_tag_bytes);
+                                let mut upper = tagged_layout(
+                                    tag,
+                                    variants,
+                                    self.repr.kind,
+                                    repr_align,
+                                    ptr_width,
+                                )?;
+                                let mut min_align = repr_align;
+                                for field in self.all_fields() {
+                                    min_align = min_align.max(field.layout_info(ptr_width)?.min_align);
+                                }
+                                upper.min_align = min_align;
+                                upper.exact = false;
+                                upper
+                            }
+                        }
                     }
-                    _ => {}
                 }
-                // Unspecified layout: bound it by the tagged layout with the smallest tag that
-                // fits every discriminant (at least the 4-byte C `int` for `repr(C)`).
-                let (_, bit_width) = self.discr_int(ptr_width)?;
-                let min_tag_bytes = if self.repr.kind == AdtReprKind::C { 4 } else { 1 };
-                let tag = smallest_fit_tag(&discrs, bit_width, min_tag_bytes);
-                let mut upper = tagged_layout(tag, variants, self.repr.kind, repr_align, ptr_width)?;
-                let mut min_align = repr_align;
-                for field in self.all_fields() {
-                    min_align = min_align.max(field.layout_info(ptr_width)?.min_align);
-                }
-                upper.min_align = min_align;
-                upper.exact = false;
-                Ok(upper)
             }
+        };
+        if self.scalar_valid_range.is_some() && self.scalar_field(ptr_width).is_none() {
+            return Err(LayoutError::IllFormed(
+                "scalar_valid_range requires a struct whose only non-1-ZST field is a primitive scalar",
+            ));
         }
+        Ok(info)
     }
 
     /// Byte offset of field `field_idx` of variant `variant_idx` within this ADT.

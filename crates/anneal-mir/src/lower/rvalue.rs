@@ -2572,6 +2572,9 @@ pub fn eval_aggregate(
                     "ADT aggregate def_path does not match its AdtDef",
                 ));
             }
+            def.validate(ptr_width).map_err(|err| {
+                RvalueEvalError::CastEval(cast_eval_layout_error(&Ty::Adt(def.clone()), err))
+            })?;
             let Some(variant_fields) = def.variant_fields(*variant_idx) else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "ADT aggregate variant index out of range",
@@ -3112,12 +3115,12 @@ fn decode_mir_value(
             target_ty: Ty::Never,
         })),
         Ty::Adt(def) => {
+            if !def.is_inhabited_for(ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                    target_ty: ty.clone(),
+                }));
+            }
             let (start, variant_idx, field_tys) = match &def.kind {
-                AdtKind::Enum { variants, .. } if variants.is_empty() => {
-                    return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
-                        target_ty: ty.clone(),
-                    }));
-                }
                 AdtKind::Enum {
                     tag_ty: Some(tag),
                     variants,
@@ -5237,11 +5240,9 @@ pub fn eval_lowered_rvalue(
                     "Discriminant requires an inhabited place_ty and its discriminant result ty",
                 ));
             }
-            if let Ty::Adt(def) = place_ty
-                && !def.requires_tag_write()
-            {
-                // Layouts without a tag (`AdtDef::univariant_index`) make the discriminant a
-                // constant, after validating the place projection over `locals`.
+            if let Ty::Adt(def) = place_ty {
+                // `Rvalue::Discriminant` on a typed ADT reads only the tag (not the variant
+                // payload fields), after validating the place projection over `locals`.
                 if place
                     .projection
                     .iter()
@@ -5270,8 +5271,10 @@ pub fn eval_lowered_rvalue(
                     None,
                 )?;
                 return match target {
-                    ProjectedRef::Value(val) if mir_value_head_matches_ty(val, place_ty) => {
-                        discriminant_value(def, def.univariant_index().unwrap_or(0), ptr_width)
+                    ProjectedRef::Value(val @ MirValue::Adt { variant_idx, .. })
+                        if mir_value_head_matches_ty(val, place_ty) =>
+                    {
+                        discriminant_value(def, *variant_idx, ptr_width)
                     }
                     _ => Err(RvalueEvalError::TypeMismatch(
                         "Discriminant place runtime value does not match lowered place_ty",
@@ -7932,10 +7935,22 @@ fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), Rvalu
                 ..
             },
         ) => Ok(()),
-        (Ty::Adt(_), MirValue::Adt { fields: vals, .. }) => {
+        (
+            Ty::Adt(def),
+            MirValue::Adt {
+                variant_idx,
+                fields: vals,
+                ..
+            },
+        ) => {
             let Some(field_tys) = typed_adt_field_tys(val, ty) else {
                 return Err(mismatch());
             };
+            if def.is_enum() && !field_tys.iter().all(|f| f.is_inhabited_for(ptr_width)) {
+                return Err(RvalueEvalError::UninhabitedEnumVariant {
+                    variant_index: *variant_idx,
+                });
+            }
             for (value, field_ty) in vals.iter().zip(field_tys) {
                 retag_value(value, field_ty, ptr_width)?;
             }
@@ -7992,6 +8007,17 @@ fn retag_shell(
             "retagged shell does not match its declared type",
         ));
     };
+    if matches!(ty, Ty::Adt(def) if def.is_enum())
+        && !field_tys.iter().all(|f| f.is_inhabited_for(ptr_width))
+    {
+        return Err(if shell.discriminant_set {
+            RvalueEvalError::UninhabitedEnumVariant {
+                variant_index: shell.variant_idx,
+            }
+        } else {
+            RvalueEvalError::UninitializedLocal(base_local)
+        });
+    }
     for (slot, field_ty) in shell.fields.iter().zip(field_tys) {
         match slot {
             FieldSlot::Uninit if field_ty.contains_ref() => {
@@ -8757,13 +8783,16 @@ pub fn eval_lowered_rvalue_in_state(
             if let Ty::Adt(def) = place_ty {
                 // `Rvalue::Discriminant` on a typed ADT reads only the tag (Miri's
                 // `read_discriminant`): layouts without a tag (structs, unions, and
-                // `AdtDef::univariant_index` enums) make the discriminant a constant; otherwise
-                // the tag must be initialized.
+                // `AdtDef::univariant_index` enums) need no initialized tag when the place is
+                // uninitialized, while an initialized or partially initialized ADT still validates
+                // its runtime variant index.
                 let index_cache = state.prepare_place_access(place, place_ty)?;
-                let variant_idx = if def.requires_tag_write() {
-                    state.typed_enum_variant(place, place_ty, &index_cache)?
-                } else {
-                    def.univariant_index().unwrap_or(0)
+                let variant_idx = match state.typed_enum_variant(place, place_ty, &index_cache) {
+                    Ok(v) => v,
+                    Err(RvalueEvalError::UninitializedLocal(_)) if !def.requires_tag_write() => {
+                        def.univariant_index().unwrap_or(0)
+                    }
+                    Err(err) => return Err(err),
                 };
                 return discriminant_value(def, variant_idx, state.ptr_width);
             }
