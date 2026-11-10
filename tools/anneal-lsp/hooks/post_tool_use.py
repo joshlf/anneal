@@ -29,6 +29,7 @@ def extract_target_path(payload: dict) -> str | None:
         candidates.append(payload["tool_input"])
     if isinstance(payload.get("args"), dict):
         candidates.append(payload["args"])
+    candidates.append(payload)
     for args in candidates:
         for key in ("Path", "TargetFile", "path", "file_path", "file"):
             val = args.get(key)

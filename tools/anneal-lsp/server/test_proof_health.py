@@ -481,6 +481,83 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
                 ],
             )
 
+    def test_rule1_and_rule2_parenthesized_propositions_tuples_and_indexing_not_flagged(self) -> None:
+        # Parenthesized equality propositions, tuples, and block/field indexing do not
+        # unfold the symbol, whereas `(@sym : T)`, `((sym))`, `↓ @sym`, and `sym.eq_def x` do.
+        src = (
+            "theorem entry_tails : True := by\n"
+            "  simp [(Trusted.Sequence.length bs = 4)]\n"
+            "  simp [Trusted.Sequence.length bs = 4]\n"
+            "  simp [(wpMirExecSym, foo)]\n"
+            "  simp [Mir.Crate.Item.body[0]!]\n"
+            "  simp [(Mir.Crate.Item.body)[0]!]\n"
+            "  simp [(Mir.Crate.Item.body).length]\n"
+            "  simp [(bitwiseAndBits.eq_def, foo)]\n"
+            "  simp [(@wpMirExecSym : Nat → Nat)]\n"
+            "  simp [((Trusted.Sequence.length))]\n"
+            "  simp [↓ @wpMirExecSym, @↓Trusted.Sequence.length]\n"
+            "  simp [wpMirExecSym.eq_def cfg]\n"
+        )
+        self.assertEqual(
+            scan(src),
+            [
+                (R1, 9, "wpMirExecSym"),
+                (R1, 10, "Trusted.Sequence.length"),
+                (R1, 11, "Trusted.Sequence.length"),
+                (R1, 11, "wpMirExecSym"),
+                (R1, 12, "wpMirExecSym"),
+            ],
+        )
+
+    def test_rule5_guillemet_binders_and_large_def_table_past_budget(self) -> None:
+        # 1. Guillemet-quoted binder variables (`«x-1»`, `«z».length`) alpha-rename
+        # identically to standard identifiers, while `«a.b»` is not split at `.`.
+        src_gui = (
+            "private theorem g1 («x-1» : Nat) : «x-1» + 1 = 1 + «x-1» := by omega\n"
+            "private theorem g2 (y : Nat) : y + 1 = 1 + y := by omega\n"
+            "private def gd1 («z» : List Nat) : Nat := «z».length + 1\n"
+            "private def gd2 (w : List Nat) : Nat := w.length + 1\n"
+            "private def dotA («a.b» : Nat) : Nat := «a.b»\n"
+            "private def dotB (x : Nat) : Nat := x.b\n"
+        )
+        self.assertEqual(
+            scan(src_gui),
+            [(R5, 2, "g2"), (R5, 4, "gd2")],
+        )
+
+        # 2. Large binderless `private def` table (>250 KB, identical punctuation counts)
+        # must still detect a duplicate at the very end without silent 64 KB truncation.
+        blocks: list[str] = []
+        for i in range(150):
+            stmts = "\n".join(
+                f"    stmt{j} := .assign (.local {j}) (.use (.copy (.local {i + j}))),"
+                for j in range(30)
+            )
+            blocks.append(
+                f"private def body{i} : Body :=\n  {{ locals := #[x],\n{stmts}\n    blocks := #[] }}\n"
+            )
+        dup_line = "".join(blocks).count("\n") + 1
+        blocks.append(blocks[-1].replace("private def body149", "private def body149Copy"))
+        large_src = "".join(blocks)
+        self.assertGreater(len(large_src), 250_000)
+        self.assertEqual(scan(large_src), [(R5, dup_line, "body149Copy")])
+
+        # 3. Tight `_BODY_COMPARE_BUDGET` on binder-bearing defs must never wipe `pending3`
+        # once `target` already collided on `(sig, key1, key2)`.
+        old_budget = proof_health._BODY_COMPARE_BUDGET
+        proof_health._BODY_COMPARE_BUDGET = 40
+        try:
+            tight_src = (
+                "private def b1 (x : Nat) : Nat := x + 100000000000000000000000000000\n"
+                "private def b2 (y : Nat) : Nat := y + 100000000000000000000000000000\n"
+            )
+            # Budget allows `key2(b2)` (leaves >0? test with budget=90 so `key2(b2)`, `key2(b1)`
+            # and `exact_key(b2)` exhaust budget right before `exact_key(b1)` in `pending3`):
+            proof_health._BODY_COMPARE_BUDGET = 90
+            self.assertEqual(scan(tight_src), [(R5, 2, "b2")])
+        finally:
+            proof_health._BODY_COMPARE_BUDGET = old_budget
+
 
 class TestDeltaOnlyPostEditCheck(unittest.TestCase):
     def test_delta_only_jetski_and_claude_payloads(self) -> None:
@@ -964,6 +1041,128 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             )
             self.assertNotIn(str(sib), idx_data)
 
+    def test_same_tick_same_size_sibling_edit_invalidates_count_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            cache_file = tmp_dir / "cache.json"
+            sib = tmp_dir / "Sib.lean"
+            tgt = tmp_dir / "Tgt.lean"
+
+            # 1. Same-tick, same-size theorem header rewrite (`n = 0` -> `n = 1`)
+            v_sib1 = "private theorem h (n : Nat) : n = 0 := sorry\n"
+            v_sib2 = "private theorem h (n : Nat) : n = 1 := sorry\n"
+            self.assertEqual(len(v_sib1), len(v_sib2))
+            sib.write_text(v_sib1, encoding="utf-8")
+            st0 = sib.stat()
+            tgt_v1 = "private theorem g (m : Nat) : m = 1 := sorry\n"
+            tgt.write_text(tgt_v1, encoding="utf-8")
+            clear_in_process_caches()
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(tgt, None, cache_path=cache_file), ""
+            )
+
+            # Overwrite `Sib.lean` and pin exact `(atime_ns, mtime_ns)` to simulate one tick.
+            sib.write_text(v_sib2, encoding="utf-8")
+            os.utime(sib, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+            self.assertEqual((sib.stat().st_mtime_ns, sib.stat().st_size), (st0.st_mtime_ns, st0.st_size))
+
+            tgt_v2 = tgt_v1 + "-- harmless comment\n"
+            tgt.write_text(tgt_v2, encoding="utf-8")
+            # Both in-process and cross-process checks must see the updated sibling CRC
+            # and re-scan `tgt_v1` (delta 1 - 1 = 0 -> ""), never claiming a false +1.
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    tgt, jetski_edit(tgt, "sorry\n", "sorry\n-- harmless comment\n"), cache_path=cache_file
+                ),
+                "",
+            )
+
+            # 2. Same-tick, same-size `private def` body rewrite (`:= 0` -> `:= 1`)
+            sib_d1 = "private def c : Nat := 0\n"
+            sib_d2 = "private def c : Nat := 1\n"
+            sib.write_text(sib_d1, encoding="utf-8")
+            st1 = sib.stat()
+            tgt_d1 = "private def d : Nat := 1\n"
+            tgt.write_text(tgt_d1, encoding="utf-8")
+            cache2 = tmp_dir / "cache2.json"
+            clear_in_process_caches()
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(tgt, None, cache_path=cache2), ""
+            )
+            sib.write_text(sib_d2, encoding="utf-8")
+            os.utime(sib, ns=(st1.st_atime_ns, st1.st_mtime_ns))
+            clear_in_process_caches()
+            tgt.write_text(tgt_d1 + "-- touch\n", encoding="utf-8")
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    tgt, jetski_edit(tgt, ":= 1\n", ":= 1\n-- touch\n"), cache_path=cache2
+                ),
+                "",
+            )
+
+    def test_insertion_above_identical_line_and_mixed_delete_insert_multiedit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # 1. Inserting an identical `new_string` at L2 above a pre-existing L5 occurrence
+            # must attribute the new finding to L2, not L5.
+            f1 = tmp_dir / "Above.lean"
+            before = (
+                "theorem t1 : True := by\n"
+                "  skip\n"
+                "  trivial\n"
+                "theorem t2 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+            )
+            after = (
+                "theorem t1 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+                "theorem t2 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+            )
+            f1.write_text(after, encoding="utf-8")
+            payload = {
+                "tool_input": {
+                    "file_path": str(f1),
+                    "old_string": "  skip\n",
+                    "new_string": "  dsimp [wpMirExecSym]\n",
+                },
+                "tool_response": {"originalFile": before},
+            }
+            res = proof_health.evaluate_post_edit_proof_health(
+                f1, payload, cache_path=tmp_dir / "c1.json"
+            )
+            self.assertEqual(res["deltas"][R1], 1)
+            self.assertEqual([f.line for f in res["new_findings"]], [2])
+            self.assertIn("(+1 at L2)", res["feedback"])
+
+            # 2. Uncached `MultiEdit` combining a deletion (`new_string == ""`) with an
+            # anti-pattern insertion must still flag the new anti-pattern (+1).
+            f2 = tmp_dir / "MixedMulti.lean"
+            f2.write_text(
+                "theorem m : True := by\n  dsimp [wpMirExecSym]\n  trivial\n",
+                encoding="utf-8",
+            )
+            mixed_payload = {
+                "tool_input": {
+                    "file_path": str(f2),
+                    "edits": [
+                        {"old_string": "-- obsolete comment\n", "new_string": ""},
+                        {
+                            "old_string": "  trivial\n",
+                            "new_string": "  dsimp [wpMirExecSym]\n  trivial\n",
+                        },
+                    ],
+                }
+            }
+            res2 = proof_health.evaluate_post_edit_proof_health(
+                f2, mixed_payload, cache_path=tmp_dir / "c2.json"
+            )
+            self.assertEqual(res2["deltas"][R1], 1)
+            self.assertEqual([f.line for f in res2["new_findings"]], [2])
+
 
 class TestPerformanceAndDogfood(unittest.TestCase):
     def test_synthetic_6000_line_file_under_5ms(self) -> None:
@@ -1226,6 +1425,36 @@ class TestTranscriptLatencyTelemetry(unittest.TestCase):
         self.assertNotIn("bad_inf", stats["by_tool"])
         self.assertNotIn("bad_nan", stats["by_tool"])
 
+    def test_zero_epoch_timestamps_and_interrupted_turn_reset(self) -> None:
+        steps = [
+            # Monotonic `start_time: 0.0` must not be dropped by truthiness checks.
+            {"tool": "lean_goal", "start_time": 0.0, "end_time": 0.025, "batch_id": "m1"},
+            # Interrupted planner step: 2 calls emitted, only 1 result arrives before USER_INPUT.
+            {
+                "step_index": 30,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "lean_hover"}, {"name": "stale_call"}],
+            },
+            {
+                "step_index": 31,
+                "type": "GENERIC",
+                "content": "Created At: 2026-11-10T01:00:00Z\nCompleted At: 2026-11-10T01:00:00Z\nok",
+            },
+            {"step_index": 32, "type": "USER_INPUT", "content": "stop and retry"},
+            {"step_index": 33, "type": "PLANNER_RESPONSE", "content": "acknowledged"},
+            # Stray generic step after turn reset must not attach to `stale_call`.
+            {
+                "step_index": 34,
+                "type": "GENERIC",
+                "content": "Created At: 2026-11-10T01:00:05Z\nCompleted At: 2026-11-10T01:00:06Z\nstray",
+            },
+        ]
+        stats = proof_health.compute_unbatched_tool_latencies(steps)
+        self.assertEqual(stats["unbatched_count"], 2)
+        self.assertEqual(sorted(stats["by_tool"].keys()), ["lean_goal", "lean_hover"])
+        self.assertAlmostEqual(stats["by_tool"]["lean_goal"]["unbatched_mean_ms"], 25.0)
+        self.assertNotIn("stale_call", stats["by_tool"])
+
 
 class TestPostToolUseHookIntegration(unittest.TestCase):
     def run_hook(self, payload: object, env: dict[str, str], runner: str | None = None) -> dict:
@@ -1342,6 +1571,18 @@ class TestPostToolUseHookIntegration(unittest.TestCase):
             context = out["hookSpecificOutput"]["additionalContext"]
             self.assertIn("`raw_bitwise_unfold` (+1 at L2)", context)
             self.assertNotIn("[Lean LSP]", context)
+
+    def test_hook_accepts_flat_payload_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            lean_file = tmp_dir / "Flat.lean"
+            text = "theorem t : True := by\n  dsimp [wpMirExecSym]\n  trivial\n"
+            lean_file.write_text(text, encoding="utf-8")
+            out = self.run_hook(
+                {"Path": str(lean_file), "Content": text},
+                self.hook_env(tmp_dir / "flat-cache.json"),
+            )
+            self.assertIn("`dsimp_forbidden_sym` (+1 at L2)", out["overwriteResult"])
 
 
 if __name__ == "__main__":
