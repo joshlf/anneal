@@ -248,11 +248,25 @@ def run_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def check_remote_uri(remote_uri: str) -> None:
-    if remote_uri.startswith("/mnt/fuse/rw/"):
+    if not remote_uri:
+        return
+    norm = os.path.normpath(remote_uri)
+    if (
+        remote_uri.startswith("/mnt/fuse/rw/")
+        or norm == "/mnt/fuse/rw"
+        or norm.startswith("/mnt/fuse/rw/")
+    ):
         raise ValueError(
             f"Refusing FUSE path `{remote_uri}`; always use `/remote/...` URIs with "
             f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
         )
+    if not remote_uri.startswith("/remote/"):
+        real = os.path.realpath(remote_uri)
+        if real == "/mnt/fuse/rw" or real.startswith("/mnt/fuse/rw/"):
+            raise ValueError(
+                f"Refusing FUSE path `{remote_uri}` (resolves to `{real}`); always use "
+                f"`/remote/...` URIs with `{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
+            )
 
 
 def sync_state_from_remote(
@@ -263,23 +277,29 @@ def sync_state_from_remote(
         return
     check_remote_uri(remote_uri)
     (state_dir / "state").mkdir(parents=True, exist_ok=True)
-    run_remote_sync(
+    ledger_dst = state_dir / "state" / "campaign_ledger.json"
+    res_ledger = run_remote_sync(
         [
             "cp",
             "-f",
             f"{remote_uri.rstrip('/')}/state/campaign_ledger.json",
-            str(state_dir / "state" / "campaign_ledger.json"),
+            str(ledger_dst),
         ]
     )
+    if res_ledger.returncode != 0:
+        ledger_dst.unlink(missing_ok=True)
     if include_ratchet:
-        run_remote_sync(
+        ratchet_dst = state_dir / "state" / "coverage_ratchet.json"
+        res_ratchet = run_remote_sync(
             [
                 "cp",
                 "-f",
                 f"{remote_uri.rstrip('/')}/state/coverage_ratchet.json",
-                str(state_dir / "state" / "coverage_ratchet.json"),
+                str(ratchet_dst),
             ]
         )
+        if res_ratchet.returncode != 0:
+            ratchet_dst.unlink(missing_ok=True)
 
 
 def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) -> None:
@@ -1848,9 +1868,116 @@ def load_coverage_ratchet(ratchet_path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(ratchet_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        sys.stderr.write(
+            f"warning: ignoring malformed or unreadable coverage ratchet {ratchet_path}: {e}\n"
+        )
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        sys.stderr.write(
+            f"warning: ignoring non-object coverage ratchet {ratchet_path} "
+            f"(expected JSON object, got {type(data).__name__})\n"
+        )
+        return {}
+    return data
+
+
+def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> bool:
+    """Populates a missing `state/coverage_ratchet.json` from `baseline_uri`.
+
+    Supports both `/remote/...` URIs (via `run_remote_sync`) and readable local
+    JSON files (after rejecting `/mnt/fuse/rw/...` paths via `check_remote_uri`).
+    Never overwrites an existing `ratchet_path`, and degrades safely with an
+    explicit `sys.stderr` warning on missing, unreadable, or malformed baseline
+    files without crashing the campaign.
+    """
+    clean_uri = baseline_uri.strip()
+    if not clean_uri:
+        return False
+    check_remote_uri(clean_uri)
+    if ratchet_path.exists():
+        return False
+    if ratchet_path.is_symlink():
+        ratchet_path.unlink(missing_ok=True)
+
+    ratchet_path.parent.mkdir(parents=True, exist_ok=True)
+    if clean_uri.startswith("/remote/"):
+        if not has_remote_sync():
+            sys.stderr.write(
+                f"warning: cannot recover baseline coverage ratchet from `{clean_uri}`: "
+                f"`{REMOTE_SYNC_BIN}` is not available\n"
+            )
+            return False
+        res = run_remote_sync(["cp", "-f", clean_uri, str(ratchet_path)])
+        if res.returncode != 0:
+            ratchet_path.unlink(missing_ok=True)
+            err_detail = (res.stderr or res.stdout or "").strip()
+            suffix = f": {err_detail}" if err_detail else ""
+            sys.stderr.write(
+                f"warning: failed to fetch baseline coverage ratchet from `{clean_uri}` "
+                f"(exit {res.returncode}){suffix}\n"
+            )
+            return False
+        if not ratchet_path.is_file():
+            sys.stderr.write(
+                f"warning: remote sync from `{clean_uri}` exited 0 without creating "
+                f"{ratchet_path}\n"
+            )
+            return False
+        try:
+            parsed = json.loads(ratchet_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            ratchet_path.unlink(missing_ok=True)
+            sys.stderr.write(
+                f"warning: baseline coverage ratchet fetched from `{clean_uri}` is "
+                f"malformed or unreadable: {e}\n"
+            )
+            return False
+        if not isinstance(parsed, dict):
+            ratchet_path.unlink(missing_ok=True)
+            sys.stderr.write(
+                f"warning: baseline coverage ratchet fetched from `{clean_uri}` is not "
+                f"a JSON object (got {type(parsed).__name__})\n"
+            )
+            return False
+        sys.stderr.write(
+            f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
+        )
+        return True
+
+    src_path = Path(clean_uri)
+    if not src_path.is_file():
+        sys.stderr.write(
+            f"warning: baseline coverage ratchet `{clean_uri}` does not exist or is not a file\n"
+        )
+        return False
+    try:
+        raw_text = src_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw_text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        sys.stderr.write(
+            f"warning: failed to read baseline coverage ratchet `{clean_uri}`: {e}\n"
+        )
+        return False
+    if not isinstance(parsed, dict):
+        sys.stderr.write(
+            f"warning: baseline coverage ratchet `{clean_uri}` is not a JSON object "
+            f"(got {type(parsed).__name__})\n"
+        )
+        return False
+    try:
+        ratchet_path.write_text(raw_text, encoding="utf-8")
+    except OSError as e:
+        ratchet_path.unlink(missing_ok=True)
+        sys.stderr.write(
+            f"warning: failed to write recovered baseline coverage ratchet to "
+            f"{ratchet_path}: {e}\n"
+        )
+        return False
+    sys.stderr.write(
+        f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
+    )
+    return True
 
 
 def extract_suite_obs_path_signatures(
@@ -1954,10 +2081,16 @@ def update_coverage_ratchet(
         for sig in sigs:
             prev = observed_paths.get(sig)
             if isinstance(prev, dict):
+                if not isinstance(prev.get("first_seen_utc"), str) or not prev["first_seen_utc"]:
+                    prev["first_seen_utc"] = now_utc
+                if not isinstance(prev.get("first_seen_seed"), str) or not prev["first_seen_seed"]:
+                    prev["first_seen_seed"] = seed_hex
                 prev["last_seen_utc"] = now_utc
                 prev["last_seen_seed"] = seed_hex
-                prev["hit_count"] = _safe_nonneg_int(prev.get("hit_count"), 1) + 1
+                prev["hit_count"] = max(1, _safe_nonneg_int(prev.get("hit_count"), 1)) + 1
                 prev["suite"] = suite_key
+                if not derived:
+                    prev.pop("derived", None)
             else:
                 entry: dict[str, Any] = {
                     "suite": suite_key,
@@ -2440,6 +2573,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="remote directory to synchronize the ledger and reports with (default: no remote sync).",
     )
+    parser.add_argument(
+        "--baseline-ratchet-uri",
+        type=str,
+        default=os.environ.get("ANNEAL_BASELINE_RATCHET_URI", "").strip(),
+        help=(
+            "Optional fallback `/remote/...` URI or local JSON file path used to "
+            "populate a missing `state/coverage_ratchet.json` before union-merging "
+            "(default: `ANNEAL_BASELINE_RATCHET_URI`)."
+        ),
+    )
     parser.add_argument("--miri-seed", type=str, default=None)
     parser.add_argument("--itree-seed", type=str, default=None)
     parser.add_argument(
@@ -2496,8 +2639,10 @@ def main(argv: list[str] | None = None) -> int:
     start_time = time.monotonic()
 
     remote_uri = args.remote_uri.strip()
+    baseline_ratchet_uri = args.baseline_ratchet_uri.strip()
     try:
         check_remote_uri(remote_uri)
+        check_remote_uri(baseline_ratchet_uri)
         cli_miri_seed = parse_seed_int(args.miri_seed) if args.miri_seed is not None else None
         cli_itree_seed = parse_seed_int(args.itree_seed) if args.itree_seed is not None else None
         quarantine_rules = load_quarantine_rules(args.quarantine_file)
@@ -2973,6 +3118,9 @@ def main(argv: list[str] | None = None) -> int:
                 itree_unquarantined,
                 itree_quarantined,
             )
+
+            if baseline_ratchet_uri and not ratchet_path.exists():
+                recover_baseline_coverage_ratchet(baseline_ratchet_uri, ratchet_path)
 
             _, ratchet_baseline_missing = update_coverage_ratchet(
                 ratchet_path,
