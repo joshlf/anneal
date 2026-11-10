@@ -45,17 +45,17 @@ bb0: StorageLive(_1); StorageLive(_2);
    `evalRvalue_reborrow_safeRef_simulation`.
 4. **`wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences`**:
    concrete real-step witnesses for both
-   `evalRvalue_reborrow_safeRef_dangling_divergence` (`&*_2` after
-   `StorageDead(_1)`: Anneal steps while `Step.step` fails with
-   `"dereferencing a dangling reference"`) and
+   `evalRvalue_reborrow_safeRef_dangling_simulation` (`&*_2` after
+   `StorageDead(_1)`: undefined behavior in BOTH machines, `lean-miri` failing
+   with `"dereferencing a dangling reference"`) and
    `evalRvalue_reborrow_rawPtr_int_divergence` (`&*_1` on an integer-valued raw
    pointer: Anneal fails with UB while `Step.step` steps).
 5. **`wit_lm3_2_ref_never_and_enum_discriminant_validity`,
-   `wit_lm3_2_invalid_bool_deref_read_divergence_real_steps`, and
+   `wit_lm3_2_invalid_bool_deref_read_ub_real_steps`, and
    `wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps`** (Section 6):
    `&!` validation failing even on a live stack pointer, zero-variant and
    `u8`-tagged enum discriminant validation against `decodeValueFromBytes`, the
-   invalid-`bool` deref-read divergence on real steps, and a 5-step Tree Borrows
+   invalid-`bool` deref-read UB in both machines on real steps, and a 5-step Tree Borrows
    child-write/parent-read chain driven through the `StateRelLM3_2Tree`
    simulations.
 -/
@@ -2010,17 +2010,18 @@ theorem lm32RawPtrIntReborrow_stateRel_pre :
     simp [lm32RawPtrIntReborrowBody, get?] at hdecl
 
 /-- **`wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences`**:
-1. **Dangling safe-reference reborrow**: from pointer-free `StateRel`, `_2 = &_1`
-   and `StorageDead(_1)` step in lockstep to `StateRelLM3_2`-related states
-   `(s₂, m₂)`, after which `_3 = &*_2` steps in Anneal (`stepMirFn`) while
-   `Miri.Interpreter.Step.step` immediately fails with
-   `undefinedBehavior "dereferencing a dangling reference"`
-   (`evalRvalue_reborrow_safeRef_dangling_divergence`).
-2. **Integer-scalar raw-pointer reborrow**: from pointer-free `StateRel` where
-   `_1 : *const u64` holds `0` without provenance, `_2 = &*_1` fails with UB in
-   Anneal (`stepMirFn`) while `Miri.Interpreter.Step.step` steps and writes a
-   provenance-less scalar into `_2`
-   (`evalRvalue_reborrow_rawPtr_int_divergence`). -/
+1. **Dangling safe-reference reborrow (now a UB simulation)**: from pointer-free
+   `StateRel`, `_2 = &_1` and `StorageDead(_1)` step in lockstep to
+   `StateRelLM3_2`-related states `(s₂, m₂)`, after which `_3 = &*_2` raises
+   undefined behavior in BOTH Anneal (`stepMirFn`, `MirStepNode.fail .ub`) and
+   `Miri.Interpreter.Step.step`
+   (`undefinedBehavior "dereferencing a dangling reference"`,
+   `evalRvalue_reborrow_safeRef_dangling_simulation`).
+2. **Integer-scalar raw-pointer reborrow (genuine divergence)**: from
+   pointer-free `StateRel` where `_1 : *const u64` holds `0` without provenance,
+   `_2 = &*_1` fails with UB in Anneal (`stepMirFn`) while
+   `Miri.Interpreter.Step.step` steps and writes a provenance-less scalar into
+   `_2` (`evalRvalue_reborrow_rawPtr_int_divergence`). -/
 theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
     (∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
       let hooks := annealStepHooks lm32DanglingReborrowBody.localDecls
@@ -2086,7 +2087,7 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
       intro tf₂ htf₂
       obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
       exact himm₂_step tf₁ tf₂ htf₁ htf₂ 2 (himm₁_ne1 tf₁ htf₁ 2 (by decide))
-    obtain ⟨hs₃, m₃, hm₃⟩ := evalRvalue_reborrow_safeRef_dangling_divergence
+    obtain ⟨_, hs₃, m₃, hm₃⟩ := evalRvalue_reborrow_safeRef_dangling_simulation
       hrel₂ hphase (dstIdx := 3) (refIdx := 2) (bk := .shared)
       rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₂_2
       (fun h => nomatch h) (ptrVal := { allocId := 1, offsetBytes := 0 }) rfl
@@ -2213,7 +2214,7 @@ theorem wit_lm3_2_recursive_ref_pointee_validity :
   · exact ⟨_, by with_unfolding_all rfl⟩
   · with_unfolding_all rfl
 
-/-! ## 5. Pass B2 Validity, OOB/Misaligned/Permission Divergences, PlaceMention, and Unified Trace Witnesses -/
+/-! ## 5. Pass B2 Validity, OOB/Misaligned UB Simulations, Permission Divergences, PlaceMention, and Unified Trace Witnesses -/
 
 /-- `&()` as an Anneal type. -/
 def refUnitTyLM32 : Ty := { kind := .ref .not (.tuple .nil), layoutIdx := 0 }
@@ -2585,16 +2586,19 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
     · cases h
     · cases h
 
-/-- **`wit_lm3_2_oob_and_misaligned_deref_divergences`**:
+/-- **`wit_lm3_2_oob_and_misaligned_deref_ub_simulations`**:
 Concrete instances of all four safe-reference OOB and misaligned dereference
-read/write divergence theorems:
-1. `step_safeRef_deref_read_oob_divergence` (`_1 : u8`, `_2 : &mut u64`, `_0 = copy *_2`);
-2. `step_safeRef_deref_write_oob_divergence` (`_1 : u8`, `_2 : &mut u64`, `*_2 = 99_u64`);
-3. `step_safeRef_deref_read_misaligned_divergence` (`_1 : u64`, `_3 : &mut u16` at
-   offset `1`, `_0 = copy *_3`);
-4. `step_safeRef_deref_write_misaligned_divergence` (`_1 : u64`, `_3 : &mut u16` at
-   offset `1`, `*_3 = 7_u16`). -/
-theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
+read/write UB simulations, in each of which BOTH machines raise undefined
+behavior:
+1. `step_safeRef_deref_read_oob_simulation` (`_1 : u8`, `_2 : &mut u64`,
+   `_0 = copy *_2`);
+2. `step_safeRef_deref_write_oob_simulation` (`_1 : u8`, `_2 : &mut u64`,
+   `*_2 = 99_u64`);
+3. `step_safeRef_deref_read_misaligned_simulation` (`_1 : u64`, `_3 : &mut u16`
+   at offset `1`, `_0 = copy *_3`);
+4. `step_safeRef_deref_write_misaligned_simulation` (`_1 : u64`, `_3 : &mut u16`
+   at offset `1`, `*_3 = 7_u16`). -/
+theorem wit_lm3_2_oob_and_misaligned_deref_ub_simulations :
     (∃ (b : CapturedMir) (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let hooks := annealStepHooks b.localDecls b.layouts
       stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨7, 1⟩))) = .step s₁ ∧
@@ -2664,7 +2668,7 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
     have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
       fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
-    obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_oob_divergence hrel₁ hphase
+    obtain ⟨_, hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_oob_simulation hrel₁ hphase
       (Or.inl rfl) rfl rfl (dstDecl := u64Decl) (refDecl := refMutU64Decl) (allocDecl := u8DeclLM32)
       rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₁_2
       (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entry) (sc := ⟨7, 1⟩)
@@ -2704,7 +2708,7 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
     have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
       fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
-    obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_write_oob_divergence hrel₁ hphase
+    obtain ⟨_, hs₂, m₂, hm₂⟩ := step_safeRef_deref_write_oob_simulation hrel₁ hphase
       rfl rfl (refDecl := refMutU64Decl) (allocDecl := u8DeclLM32) (valTy := u64Ty)
       rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩)))
       (fun tf _ => constU64_wellTypedLM32 b tf 99 (by decide)) himm₁_2
@@ -2793,8 +2797,8 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
         injection hmls with hmls'
         rw [← hmls'] at hmp
         cases hmp
-      obtain ⟨hs_out, m_out, hm_out⟩ :=
-        step_safeRef_deref_read_misaligned_divergence hrel_mis hphase (Or.inl rfl) rfl rfl
+      obtain ⟨_, hs_out, m_out, hm_out⟩ :=
+        step_safeRef_deref_read_misaligned_simulation hrel_mis hphase (Or.inl rfl) rfl rfl
           (dstDecl := u16DeclLM32) (refDecl := refMutU16DeclLM32) (allocDecl := u64Decl)
           rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩))) himm_mis_3
           (ptrVal := p_mis) (e := entry) (sc := ⟨42, 8⟩)
@@ -2888,8 +2892,8 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       have hop_u16 : ∀ tf, WellTypedScalarOperand b tf (.constant (constU16LM32 7)) u16TyLM32 :=
         fun _ => .constScalar (constU16LM32 7) ⟨7, 2⟩ rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩)))
           (Or.inr (Or.inl rfl)) (by decide) rfl (fun h => nomatch h) (fun h => nomatch h)
-      obtain ⟨hs_out, m_out, hm_out⟩ :=
-        step_safeRef_deref_write_misaligned_divergence hrel_mis hphase rfl rfl
+      obtain ⟨_, hs_out, m_out, hm_out⟩ :=
+        step_safeRef_deref_write_misaligned_simulation hrel_mis hphase rfl rfl
           (refDecl := refMutU16DeclLM32) (allocDecl := u64Decl) (valTy := u16TyLM32)
           rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩))) (fun tf _ => hop_u16 tf) himm_mis_3
           (ptrVal := p_mis) (e := entry) (sc := ⟨7, 2⟩)
@@ -4538,17 +4542,15 @@ def lm32InvalidBoolReadBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- **`wit_lm3_2_invalid_bool_deref_read_divergence_real_steps`**: a real-step
-instance of `step_safeRef_deref_read_invalid_scalar_divergence` on
-`lm32InvalidBoolReadBody`, starting from pointer-free `StateRel` states in
-which `_1 : u8` holds `2`:
+/-- **`wit_lm3_2_invalid_bool_deref_read_ub_real_steps`**: a real-step instance of
+`step_safeRef_deref_read_invalid_scalar_simulation` on `lm32InvalidBoolReadBody`,
+starting from pointer-free `StateRel` states in which `_1 : u8` holds `2`:
 1. `_2 = &_1` steps in lockstep (`evalRvalue_ref_simulation`) to
    `StateRelLM3_2`-related states with `_2` pointing at `_1`;
-2. `_0 = copy *_2` diverges: Anneal does not re-validate the byte read at type
-   `bool`, storing the invalid `bool` `2` in `_0` and then returning it from the
-   function, while `lean-miri` rejects the typed load with
-   `"reading invalid value"`. -/
-theorem wit_lm3_2_invalid_bool_deref_read_divergence_real_steps :
+2. `_0 = copy *_2` raises undefined behavior in BOTH machines: Anneal re-validates
+   the byte read at type `bool` and fails with `MirStepNode.fail .ub`, and
+   `lean-miri` rejects the typed load with `"reading invalid value"`. -/
+theorem wit_lm3_2_invalid_bool_deref_read_ub_real_steps :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let b := lm32InvalidBoolReadBody
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -4589,7 +4591,7 @@ theorem wit_lm3_2_invalid_bool_deref_read_divergence_real_steps :
   have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
     fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
   -- Step 2 (`stmtIdx = 1`): `_0 = copy *_2` both reject with UB
-  obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_invalid_scalar_divergence hrel₁
+  obtain ⟨_, hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_invalid_scalar_simulation hrel₁
     hphase (Or.inl rfl) rfl rfl (dstDecl := boolDeclLM32) (refDecl := refBoolDeclLM32)
     (allocDecl := u8DeclLM32) rfl rfl rfl (Or.inl rfl) himm₁_2
     (ptrVal := p0) (e := entry) (sc := ⟨2, 1⟩)

@@ -5179,10 +5179,15 @@ theorem evalProjection_subslice_fromEndFalse_oob_divergence
 aggregate `Rvalue.aggregate (.adt d 0 (some f)) [op]` for ANY valid field
 `f < n` evaluates `op` and constructs the `.unit`-padded `n`-slot union value
 `.aggregate 0 (unionSlotFields n f (.scalar sc))` whose active slot `f` holds
-`.scalar sc` and whose sibling slots `j ≠ f` hold `.unit` (so subsequent reads
-of field `f` return `sc`, narrower/equal sibling reads pun the low bytes of
-`sc`, and wider sibling reads fault with `.ub` on the uninitialized tail, in
-lockstep with `lean-miri`). -/
+`.scalar sc` and whose sibling slots `j ≠ f` hold `.unit`, instead of ignoring
+`activeField`. This is the Anneal-side evaluation half of the `D13a` upgrade;
+the two-machine lockstep statement (`lean-miri`'s `writeAggregate` projecting to
+field `f` and writing `sc` into bytes `[0, k)`) is
+`step_union_aggregate_simulation`, and the lockstep reads of the resulting union
+(same-field, narrower/equal cross-field type punning, and wider-field `.ub` on
+the uninitialized tail) are `step_union_field_read_simulation`,
+`step_union_type_punning_read_simulation`, and
+`union_uninit_bytes_read_ub_simulation`. -/
 theorem evalRvalue_union_aggregate_activeField_simulation
     {body : CapturedMir} {locals : List LocalSlot} {mem : Memory}
     (hbor : mem.borrows = .nil) (hcaller : mem.callerLocals = .nil)
@@ -8748,8 +8753,9 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
 /-- **`step_union_self_copy_overlap_divergence`** (`LM-2.4` `A2` boundary):
 self-copy `_u = copy _u` on a `UnionMemRel` union `_u`.
 
-Anneal evaluates `copy _u` to a pure value `.aggregate 0 [.scalar sc]` and
-writes it back into `_u` (`MirStepNode.step`), whereas `lean-miri` follows
+Anneal evaluates `copy _u` to the pure value
+`.aggregate 0 (unionSlotFields n f (.scalar sc))` and writes it back into `_u`
+(`MirStepNode.step`), whereas `lean-miri` follows
 rustc's `copy_op` (`nonoverlapping = true` with `sameAllocation = true` on
 identical nonzero byte ranges) and reports
 `StepError.undefinedBehavior "whole-value copy between overlapping ranges"`
@@ -10168,8 +10174,9 @@ theorem step_subslice_assign_overwrite_simulation
 /-! ## 17. `Subslice` Composition, Projected `Subslice` Writes, and `Repeat` on Union Fields
 
 `evalProjection_nested_subslice_simulation` composes two `Subslice` projections,
-`step_subslice_elem_write_characterization` characterizes LHS destination places
-that chain `.Subslice` with `.ConstantIndex` (`annealEvalSubslicePlace`), and
+`step_subslice_elem_write_simulation` simulates projected writes whose LHS
+destination places chain `.Subslice` with `.ConstantIndex`
+(`annealEvalSubslicePlace`), and
 `step_repeat_union_field_simulation` exercises `Rvalue.Repeat` on union field
 operands (`annealRvalueHooksLM2_4.writeRepeat`). -/
 

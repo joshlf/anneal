@@ -194,7 +194,7 @@ theorem bisim_applies (divisor : Nat) (hd : divisor < 256) :
 
 /-! ## Concrete runs
 
-Kernel evaluation (`decide`, no `native_decide`) of both machines on
+Kernel evaluation (`decide`, no native-code evaluation) of both machines on
 `divBody`, independent of the simulation proofs: both reach undefined
 behavior at `Div` when the divisor is `0`, and both return `7 / 2 = 3` when it
 is `2`. -/
@@ -474,7 +474,7 @@ theorem run_bisim_signedDiv (fuel : Nat) (divisorBits : Nat) (hd : divisorBits <
     (NonAddrTakenImmediate.of_live_nil _ (stateRel_signedDiv divisorBits) rfl)
 
 
-/-! ## Concrete multi-step outcome checks (`decide`, zero `native_decide`) -/
+/-! ## Concrete multi-step outcome checks (kernel `decide`, no native-code evaluation) -/
 
 def annealOutcomeIsUB : AnnealRunOutcome → Bool
   | .faulted .ub => true

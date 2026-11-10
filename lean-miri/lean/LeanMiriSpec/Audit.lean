@@ -50,7 +50,7 @@ import LeanMiriSpec.Correspondence.WitLM3_3
 `#assert_standard_axioms` fails the build unless each listed declaration
 depends only on Lean's standard axioms (`propext`, `Quot.sound`,
 `Classical.choice`); in particular on zero `sorryAx` and zero
-`Lean.ofReduceBool` (which `native_decide` would introduce).
+`Lean.ofReduceBool` (which native-code `decide` evaluation would introduce).
 
 `#assert_all_leanmirispec_and_miri_standard_axioms` additionally walks every
 declaration across all `LeanMiriSpec.*` and `Miri.*` modules in `Lean.Environment`
@@ -466,9 +466,9 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_rawPtr_step
   Witness.wit_lm3_1_addrOf_write_read_deref
   Witness.wit_lm3_1_binOp_offset_inbounds_and_oob
-  Witness.wit_lm3_1_anneal_offset_deref_divergence
-  Witness.wit_lm3_1_anneal_storage_revive_divergence
-  Witness.wit_lm3_1_anneal_deref_type_pun_divergence
+  Witness.wit_lm3_1_anneal_offset_deref_agreement
+  Witness.wit_lm3_1_anneal_storage_revive_agreement
+  Witness.wit_lm3_1_anneal_deref_type_pun_agreement
   step_deref_oob_simulation
   lookupBorrow_map_toBorrowEntry_parentTag
   derefWriteTreeUB_map_toBorrowEntry_eq_false
@@ -508,13 +508,13 @@ open LeanMiriSpec.Correspondence in
   lookupDerefPointeeLayout_ref_eq_none
   annealValidateScalarForTyId_never_false
   annealValidateScalarForTyId_nonNullPtr_null_false
-  step_deref_invalid_char_divergence
-  step_deref_write_invalid_bool_divergence
-  step_placeMention_deref_uninit_divergence
+  step_deref_invalid_char_simulation
+  step_deref_write_invalid_bool_simulation
+  step_placeMention_deref_uninit_simulation
   annealForceAllocation_memory_eq
   memPlace_toRef_withoutProvenance
-  step_rawPtr_deref_null_divergence
-  step_rawPtr_deref_nonzero_offset_divergence
+  step_rawPtr_deref_null_correspondence
+  step_rawPtr_deref_nonzero_offset_correspondence
   step_cast_expose_provenance_ptr_unsupported
   step_cast_with_exposed_provenance_divergence
   step_terminator_goto_return_lm3_1_simulation
@@ -531,24 +531,24 @@ open LeanMiriSpec.Correspondence in
   step_binOp_offset_move_simulation
   step_cast_expose_provenance_scalar_simulation
   lookupDerefPointeeLayout_decl_eq_encoded
-  step_cast_ptrToPtr_scalar_divergence
-  step_binOp_offset_scalar_zero_divergence
-  step_binOp_offset_scalar_nonzero_divergence
-  step_rawPtr_deref_perm_divergence
+  step_cast_ptrToPtr_scalar_correspondence
+  step_binOp_offset_scalar_zero_correspondence
+  step_binOp_offset_scalar_nonzero_simulation
+  step_rawPtr_deref_perm_correspondence
   step_rawPtr_deref_zero_offset_correspondence
   Witness.wit_lm3_1_rawPtr_use_move_and_expose_scalar_real_steps
-  Witness.wit_lm3_1_null_ptrToPtr_and_offset_divergences_real_steps
-  Witness.wit_lm3_1_rawPtr_deref_zero_and_perm_divergence_real_steps
+  Witness.wit_lm3_1_null_ptrToPtr_and_offset_correspondences_real_steps
+  Witness.wit_lm3_1_rawPtr_deref_zero_and_perm_correspondence_real_steps
   annealExecutionScalarLeaves
   annealDerefValidity
   annealDerefValidity_nonThin_or_ref_err
   step_rawPtr_cmp_scalar_lm3_1_simulation
   step_binOp_offset_zero_any_stride_lm3_1_simulation
   step_unaryOp_ptrMetadata_thin_rawPtr_ub_simulation
-  step_unaryOp_ptrMetadata_thin_rawPtr_divergence
+  step_unaryOp_ptrMetadata_thin_rawPtr_correspondence
   step_rawPtr_cmp_ptr_divergence
-  step_cast_ptrToPtr_move_scalar_divergence
-  step_binOp_offset_move_scalar_zero_divergence
+  step_cast_ptrToPtr_move_scalar_correspondence
+  step_binOp_offset_move_scalar_zero_correspondence
   StepObsRelLM3_1
   StepRelLM3_1.toStepObsRelLM3_1
   StepObsRelLM3_1.emitStep_iff
@@ -562,12 +562,12 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_rawPtr_cmp_and_ptrMetadata_real_steps
   step_rawPtr_cmp_ub_lm3_1_simulation
   step_rawPtr_cmp_scalar_ptr_divergence
-  step_binOp_offset_move_scalar_nonzero_divergence
+  step_binOp_offset_move_scalar_nonzero_simulation
   WellTypedLM3_1StateTerminator
   step_terminator_lm3_1_state_simulation
   step_mir_lm3_1_state_simulation
   Witness.wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps
-  step_safeRef_deref_read_invalid_scalar_divergence
+  step_safeRef_deref_read_invalid_scalar_simulation
   evalRvalue_reborrow_safeRef_tree_simulation
   step_safeRef_deref_read_tree_simulation
   step_safeRef_deref_write_tree_simulation
@@ -577,7 +577,7 @@ open LeanMiriSpec.Correspondence in
   derefWriteTreeUB_treeMap_eq_false
   step_terminator_goto_return_tree_simulation
   Witness.wit_lm3_2_ref_never_and_enum_discriminant_validity
-  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+  Witness.wit_lm3_2_invalid_bool_deref_read_ub_real_steps
   Witness.wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps
 
 open LeanMiriSpec.Correspondence in
@@ -3697,7 +3697,7 @@ example :
         ((8 : Nat) : Int) .memoryAccess
         (annealResolvePtr (mkSingleAllocMachine lm31AllocId1 alloc))
         (annealLookupAlloc (mkSingleAllocMachine lm31AllocId1 alloc)) = .error err :=
-  Witness.wit_lm3_1_anneal_offset_deref_divergence
+  Witness.wit_lm3_1_anneal_offset_deref_agreement
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4123,7 +4123,7 @@ example :
         addresses := { AnnealMachine.empty.addresses with
           baseAddr := #[⟨lm31AllocId1, annealStackBaseAddr lm31AllocId1⟩] } }) =
       .error (.allocationLookup (.deadAllocation lm31AllocId1)) :=
-  Witness.wit_lm3_1_anneal_storage_revive_divergence
+  Witness.wit_lm3_1_anneal_storage_revive_agreement
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4158,7 +4158,7 @@ example :
     annealOutcomeScalarBits 4
       (runAnnealBounded lm31TypePunBody 10 (initMachineState lm31TypePunBody [])) =
       some 5 :=
-  Witness.wit_lm3_1_anneal_deref_type_pun_divergence
+  Witness.wit_lm3_1_anneal_deref_type_pun_agreement
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4807,11 +4807,14 @@ example
     (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
     (hinvalid : isValidCharCode sc.bits = false)
     (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)  :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) :=
-  step_deref_invalid_char_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hdst_char hptr_ty himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_word htarget hinvalid h_hdst_live
+  step_deref_invalid_char_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ptr hdst_char hptr_ty himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_word htarget hinvalid h_hdst_live
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4838,11 +4841,14 @@ example
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
     (htgt_1 : tgtDecl.ty.kind = .bool ∨ tgtDecl.ty.kind = .uint .u8 ∨ tgtDecl.ty.kind = .int .i8)
     (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead)  :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "writing invalid value")) :=
-  step_deref_write_invalid_bool_divergence hstate hphase hbb hstmt hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_1 htgt_live
+  step_deref_write_invalid_bool_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_1 htgt_live
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4860,11 +4866,14 @@ example
     (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
     (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
     (huninit : get? s.frame.locals ptrIdx = some .uninit)  :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "read of uninitialized local")) :=
-  step_placeMention_deref_uninit_divergence hstate hphase hbb hstmt hdecl_ptr hptr_ty hpk_prim himm_ptr huninit
+  step_placeMention_deref_uninit_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hpk_prim himm_ptr huninit
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4898,7 +4907,7 @@ example
       ScalarRel sc msc_ref ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc_ref)))) :=
-  step_rawPtr_deref_null_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p hptr8
+  step_rawPtr_deref_null_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4938,7 +4947,7 @@ example
             ⟨Miri.ABI.Size.ofBytes
               (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes),
               .concrete e.allocId borTag⟩)))) :=
-  step_rawPtr_deref_nonzero_offset_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p he htag h_hperm hptr8
+  step_rawPtr_deref_nonzero_offset_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p he htag h_hperm hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5373,7 +5382,7 @@ example
       ScalarRel sc msc ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc)))) :=
-  step_cast_ptrToPtr_scalar_divergence hstate hphase hbb hstmt hdecl_dst hdecl_src hsrc_ty hdst_ty hcast_ty hsrc_thin hdst_thin himm hdst_live hslot_s hptr8
+  step_cast_ptrToPtr_scalar_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_src hsrc_ty hdst_ty hcast_ty hsrc_thin hdst_thin himm hdst_live hslot_s hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5412,7 +5421,7 @@ example
       ScalarRel sc msc_out ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc_out)))) :=
-  step_binOp_offset_scalar_zero_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpt hrhs_ty hop_rhs himm hdst_live hslot_p hrhs_eval hrhs_zero hptr8
+  step_binOp_offset_scalar_zero_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpt hrhs_ty hop_rhs himm hdst_live hslot_p hrhs_eval hrhs_zero hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5440,11 +5449,14 @@ example
     (hrhs_pos : 0 < sc_rhs.bits)
     (hrhs_lt : sc_rhs.bits < 2 ^ 32)
     (hptr8 : layoutPointerBytes body.layouts = 8)  :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "pointer Offset out of bounds")) :=
-  step_binOp_offset_scalar_nonzero_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p hrhs_eval hrhs_pos hrhs_lt hptr8
+  step_binOp_offset_scalar_nonzero_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p hrhs_eval hrhs_pos hrhs_lt hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5483,7 +5495,7 @@ example
             ⟨Miri.ABI.Size.ofBytes
               (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes),
               .concrete e.allocId borTag⟩)))) :=
-  step_rawPtr_deref_perm_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p he htag h_hperm hptr8
+  step_rawPtr_deref_perm_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p he htag h_hperm hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5617,7 +5629,7 @@ example :
       stepMirFn b s₀ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₀ =
         (m₁, .error (.undefinedBehavior "pointer Offset out of bounds"))) :=
-  Witness.wit_lm3_1_null_ptrToPtr_and_offset_divergences_real_steps
+  Witness.wit_lm3_1_null_ptrToPtr_and_offset_correspondences_real_steps
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
@@ -5664,7 +5676,7 @@ example :
           (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
             ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
               .concrete lm31AllocId1 borTag⟩))))) :=
-  Witness.wit_lm3_1_rawPtr_deref_zero_and_perm_divergence_real_steps
+  Witness.wit_lm3_1_rawPtr_deref_zero_and_perm_correspondence_real_steps
 
 example
     (layouts : Layout.LayoutTable)
@@ -5815,7 +5827,7 @@ example
       m'.stack.frames = #[tf'] ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate .uninit)) :=
-  step_unaryOp_ptrMetadata_thin_rawPtr_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hexact hdst_ty himm hdst_live hptr_init hptr8
+  step_unaryOp_ptrMetadata_thin_rawPtr_correspondence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hexact hdst_ty himm hdst_live hptr_init hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5894,7 +5906,7 @@ example
       ScalarRel sc msc ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc)))) :=
-  step_cast_ptrToPtr_move_scalar_divergence hstate hphase hbb hstmt hdecl_dst hdecl_src hsrc_ty hdst_ty hcast_ty hsrc_thin hdst_thin himm hdst_live hslot_s hptr8
+  step_cast_ptrToPtr_move_scalar_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_src hsrc_ty hdst_ty hcast_ty hsrc_thin hdst_thin himm hdst_live hslot_s hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5936,7 +5948,7 @@ example
       ScalarRel sc_p msc_out ∧
       (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt msc_out)))) :=
-  step_binOp_offset_move_scalar_zero_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hexact hrhs_ty hop_rhs himm hdst_live hslot_p ha_rhs hbits0 hstride hptr8
+  step_binOp_offset_move_scalar_zero_correspondence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hexact hrhs_ty hop_rhs himm hdst_live hslot_p ha_rhs hbits0 hstride hptr8
 
 example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -6044,7 +6056,7 @@ example :
       Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [] ∧
       get? s₁.frame.locals 2 = some (.init (.scalar ⟨1, 1⟩))) ∧
-    -- (2) Tracked raw-pointer `Eq(copy _2, copy _2)` divergence
+    -- (2) Tracked raw-pointer `Eq(copy _2, copy _2)`: both step, results unrelated
     (∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState)
       (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (aRes eqRes : Bool),
@@ -6060,7 +6072,7 @@ example :
       m₂.stack.frames = #[tf₂] ∧
       (tf₂.locals[3]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt (.ofBool eqRes)))))) ∧
-    -- (3) Move-operand provenance-less `PtrToPtr` divergence
+    -- (3) Move-operand provenance-less `PtrToPtr` correspondence
     (∃ (s₁ : MachineState) (m₁ : AnnealStepState)
       (tf₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
       let b := lm31MoveNullPtrToPtrBody
@@ -6073,7 +6085,7 @@ example :
       m₁.stack.frames = #[tf₁] ∧
       (tf₁.locals[2]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt lm31Scalar0U64))))) ∧
-    -- (4) Move-operand null `Offset(..., 0)` divergence (`stride = 8`)
+    -- (4) Move-operand null `Offset(..., 0)` correspondence (`stride = 8`)
     (∃ (s₁ : MachineState) (m₁ : AnnealStepState)
       (tf₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
       let b := lm31MoveNullOffsetZeroBody
@@ -6086,7 +6098,7 @@ example :
       m₁.stack.frames = #[tf₁] ∧
       (tf₁.locals[2]?).map Miri.Interpreter.LocalState.value =
         some (.live (.immediate (.scalar (.fromScalarInt lm31Scalar0U64))))) ∧
-    -- (5) `PtrMetadata` UB simulation on `.uninit` vs. thin-pointer divergence
+    -- (5) `PtrMetadata` UB simulation on `.uninit` and thin-pointer correspondence
     (∃ (st' : MachineState) (m_ub m_ok : AnnealStepState) (msg : String)
       (tf_ok : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
       let bu := lm31PtrMetadataUninitBody
@@ -6241,11 +6253,14 @@ example
     (hrhs_pos : 0 < sc_r.bits)
     (hrhs_lt : sc_r.bits < 2 ^ 32)
     (hptr8 : layoutPointerBytes body.layouts = 8)  :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "pointer Offset out of bounds")) :=
-  step_binOp_offset_move_scalar_nonzero_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p ha_rhs hrhs_pos hrhs_lt hptr8
+  step_binOp_offset_move_scalar_nonzero_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p ha_rhs hrhs_pos hrhs_lt hptr8
 
 example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -6287,7 +6302,7 @@ example
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
 example :
-    -- (1) Symmetric `(.scalar, .ptr)` pointer comparison divergence (`null() == p`)
+    -- (1) Symmetric `(.scalar, .ptr)` pointer comparison (`null() == p`): both step, results unrelated
     (∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState)
       (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (aRes eqRes : Bool),
@@ -7681,11 +7696,14 @@ example
     (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
     (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
     (hdead_t : get? s.frame.locals e.localIdx = some .dead)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) :=
-  evalRvalue_reborrow_safeRef_dangling_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ref href_ty hpk_prim himm_ref h_hdst_live hslot_r he htag hdead_t
+  evalRvalue_reborrow_safeRef_dangling_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ref href_ty hpk_prim himm_ref h_hdst_live hslot_r he htag hdead_t
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
@@ -8285,7 +8303,7 @@ open LeanMiriSpec.Correspondence in
   annealDerefOperandToMemPlace_safeRef_ptr_dead
   annealDerefOperandToMemPlace_safeRef_ptr_live
   evalRvalue_reborrow_safeRef_simulation
-  evalRvalue_reborrow_safeRef_dangling_divergence
+  evalRvalue_reborrow_safeRef_dangling_simulation
   LocalRelLM3_2.of_setLiveAllocation_ne
   FrameRelLM3_2.map_preserve
   StateRelLM3_2.advance_write_immediate_perm_map
@@ -8568,11 +8586,14 @@ example
     (hoob : (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat <
       ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
     (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) :=
-  step_safeRef_deref_read_oob_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live
+  step_safeRef_deref_read_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8607,11 +8628,14 @@ example
     (hsl_init : get? s.frame.locals e.localIdx ≠ some .uninit)
     (hsc_sz : sc.sizeBytes =
       (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) :=
-  step_safeRef_deref_write_oob_divergence hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hoob hsl_init hsc_sz
+  step_safeRef_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hoob hsl_init hsc_sz
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8645,11 +8669,14 @@ example
       (translateTy dstDecl.ty body.layouts).layout.align.abi = .ok (some mis))
     (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
     (hlay_coh : PrimLayoutsCoherent body.layouts)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) :=
-  step_safeRef_deref_read_misaligned_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hinbounds hmis h_hdst_live hlay_coh
+  step_safeRef_deref_read_misaligned_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hinbounds hmis h_hdst_live hlay_coh
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8687,11 +8714,14 @@ example
       (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.align.abi =
       .ok (some mis))
     (hlay_coh : PrimLayoutsCoherent body.layouts)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) :=
-  step_safeRef_deref_write_misaligned_divergence hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hinbounds hmis hlay_coh
+  step_safeRef_deref_write_misaligned_simulation hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hinbounds hmis hlay_coh
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -9235,7 +9265,7 @@ example :
       stepMirFn b s_mis = .fail .ub ∧
       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m_mis =
         (m_out, .error (.undefinedBehavior "dereferencing an unaligned reference"))) :=
-  Witness.wit_lm3_2_oob_and_misaligned_deref_divergences
+  Witness.wit_lm3_2_oob_and_misaligned_deref_ub_simulations
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
@@ -9356,10 +9386,10 @@ open LeanMiriSpec.Correspondence in
   step_safeRef_use_dangling_post_validity_divergence
   annealDerefOperandToMemPlace_safeRef_ptr_oob
   annealDerefOperandToMemPlace_safeRef_ptr_misaligned
-  step_safeRef_deref_read_oob_divergence
-  step_safeRef_deref_write_oob_divergence
-  step_safeRef_deref_read_misaligned_divergence
-  step_safeRef_deref_write_misaligned_divergence
+  step_safeRef_deref_read_oob_simulation
+  step_safeRef_deref_write_oob_simulation
+  step_safeRef_deref_read_misaligned_simulation
+  step_safeRef_deref_write_misaligned_simulation
   step_safeRef_deref_write_perm_divergence
   step_safeRef_deref_read_disabled_divergence
   evalRvalue_reborrow_safeRef_perm_divergence
@@ -9399,7 +9429,7 @@ open LeanMiriSpec.Correspondence in
   Witness.mkPre4MiriFrameLM32
   Witness.mkPre4MiriLM32
   Witness.wit_lm3_2_unit_zst_and_misaligned_ref_validity
-  Witness.wit_lm3_2_oob_and_misaligned_deref_divergences
+  Witness.wit_lm3_2_oob_and_misaligned_deref_ub_simulations
   Witness.wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps
   Witness.wit_lm3_2_placeMention_and_unified_return_ref_real_steps
 
@@ -9432,11 +9462,14 @@ example
       (translateTy allocDecl.ty body.layouts).layout.size)
     (hinvalid : ¬ AnnealScalarValid dstDecl.ty sc)
     (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)  :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) :=
-  step_safeRef_deref_read_invalid_scalar_divergence hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag hoff0 h_hperm hdecl_a htarget hsize hinvalid h_hdst_live
+  step_safeRef_deref_read_invalid_scalar_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag hoff0 h_hperm hdecl_a htarget hsize hinvalid h_hdst_live
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -9616,7 +9649,7 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
   annealDerefOperandToMemPlace_safeRef_ptr_same_size
-  step_safeRef_deref_read_invalid_scalar_divergence
+  step_safeRef_deref_read_invalid_scalar_simulation
   lookupTreeMapByTag
   ReborrowMapEntry.updateOnRead
   derefReadMapFnTree
@@ -9693,7 +9726,7 @@ example :
       stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ =
         (m₂, .error (.undefinedBehavior "reading invalid value")) :=
-  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+  Witness.wit_lm3_2_invalid_bool_deref_read_ub_real_steps
 
 open Witness in
 example :
@@ -9744,7 +9777,7 @@ open LeanMiriSpec.Correspondence in
   Witness.refBoolDeclLM32
   Witness.lm32MlsU8Two
   Witness.lm32InvalidBoolReadBody
-  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+  Witness.wit_lm3_2_invalid_bool_deref_read_ub_real_steps
   Witness.lm32TreeRoot
   Witness.lm32TreeChild
   Witness.lm32ReborrowTreeBody

@@ -30,16 +30,17 @@ reference-aware relations `StateRelLM3_2` and `StepRelLM3_2` (`RefLM3_2`).
    safe references (`&T` / `&mut T`): exact undefined-behavior equivalence and
    same-allocation reference creation across dead, uninitialized, null/integer
    (on safe references), and live cases.
-3. **Genuine Reborrow Divergences (`evalRvalue_reborrow_dangling_divergence`,
-   `evalRvalue_reborrow_safeRef_dangling_divergence`,
+3. **Reborrow Boundaries (`evalRvalue_reborrow_dangling_divergence`,
+   `evalRvalue_reborrow_safeRef_dangling_simulation`,
    `evalRvalue_reborrow_rawPtr_int_divergence`, and
    `evalRvalue_reborrow_perm_divergence`)**:
-   * dangling raw-pointer reborrow: both machines step at reborrow time, while
-     `ValidityVisitor` and `annealSafeRefDerefCheck` reject the resulting
+   * dangling raw-pointer reborrow: Anneal rejects the reborrow eagerly with
+     `MirStepNode.fail .ub`, whereas `lean-miri` steps at reborrow time and only
+     its `ValidityVisitor` and `annealSafeRefDerefCheck` reject the resulting
      dangling reference;
-   * dangling safe-reference reborrow (`&*_r` after `StorageDead`): Anneal
-     steps, whereas `lean-miri`'s `Miri.Interpreter.Step.step` immediately
-     fails with `"dereferencing a dangling reference"`;
+   * dangling safe-reference reborrow (`&*_r` after `StorageDead`): Stage-1
+     resolved this divergence; BOTH machines now report undefined behavior
+     (`StepRelLM3_2.ub`, `lean-miri`: `"dereferencing a dangling reference"`);
    * integer-scalar raw-pointer reborrow (`&*_p` when `_p` holds an integer
      without provenance): Anneal fails with UB, whereas `lean-miri` steps and
      creates a reference without provenance;
@@ -1143,7 +1144,14 @@ local of type `T` at offset `0` with a parent borrow that permits the reborrow
    or uninitialized `_p`, or a dead `_d`); and
 2. otherwise steps in both machines, Anneal writing the fresh child borrow
    `nextTag` at offset `0` into `_d` and `lean-miri` writing a reference to
-   the same stack allocation `e.allocId` that `_p` points into. -/
+   the same stack allocation `e.allocId` that `_p` points into.
+
+Boundary (excluded by `hzero_perm`, not covered here): on the Stage-1 repaired
+semantics Anneal's reborrow requires the pointee local to be `.init`
+(`evalRvalue`, `targetRootAndDeclsOpt`), so reborrowing through a pointer into
+an `.uninit` local is undefined behavior in Anneal, whereas `lean-miri`'s
+shallow reference validity (before `LM-3.3` retags) does not require an
+initialized pointee. -/
 theorem evalRvalue_reborrow_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -2646,7 +2654,13 @@ of type `T` at offset `0` with a parent borrow permitting `bk`, reborrowing
    `Step.step`, matching `stepMirFn`); and
 2. otherwise steps in both machines, writing the fresh child borrow `nextTag` at
    offset `0` into `_d` in Anneal and the reference to `e.allocId` into `_d` in
-   `lean-miri`. -/
+   `lean-miri`.
+
+Boundary (excluded by `hlive_zero_perm`, not covered here): on the Stage-1
+repaired semantics Anneal's reborrow requires the pointee local to be `.init`,
+so reborrowing through a reference into an `.uninit` local is undefined behavior
+in Anneal, whereas `lean-miri`'s shallow reference validity (before `LM-3.3`
+retags) does not require an initialized pointee. -/
 theorem evalRvalue_reborrow_safeRef_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -3028,14 +3042,10 @@ theorem evalRvalue_reborrow_safeRef_simulation
       subst he_eq
       exact ⟨ha_step, hm_step⟩
 
-/-- **`evalRvalue_reborrow_safeRef_dangling_divergence` (`LM-3.2`, upgraded to UB simulation)**:
-when a safe reference `_r : &(mut) T` (`T` primitive scalar) points into a local
-`e.localIdx` that `StorageDead` has already killed, reborrowing `_d = &*_r` /
-`_d = &mut *_r` into a live destination local `_d` raises undefined behavior in
-BOTH `stepMirFn` (`MirStepNode.fail .ub` via `resolveRefDerefTarget?`) and
-`Miri.Interpreter.Step.step` (`annealStepHooks`,
-`"dereferencing a dangling reference"`). -/
-theorem evalRvalue_reborrow_safeRef_dangling_divergence
+/-- Both-UB core of `evalRvalue_reborrow_safeRef_dangling_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem evalRvalue_reborrow_safeRef_dangling_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -3142,6 +3152,44 @@ theorem evalRvalue_reborrow_safeRef_dangling_divergence
         rw [hrv_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq
         hbb hstmt hm_err⟩
+
+/-- **`evalRvalue_reborrow_safeRef_dangling_simulation` (`LM-3.2`, upgraded to UB simulation)**:
+when a safe reference `_r : &(mut) T` (`T` primitive scalar) points into a local
+`e.localIdx` that `StorageDead` has already killed, reborrowing `_d = &*_r` /
+`_d = &mut *_r` into a live destination local `_d` raises undefined behavior in
+BOTH `stepMirFn` (`MirStepNode.fail .ub` via `resolveRefDerefTarget?`) and
+`Miri.Interpreter.Step.step` (`annealStepHooks`,
+`"dereferencing a dangling reference"`). -/
+theorem evalRvalue_reborrow_safeRef_dangling_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {dstDecl refDecl : LocalDecl}
+    {bk : BorrowKind} {refMut : Mutability} {pointeeKind : RigidTy}
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref refMut pointeeKind)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    (_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hdead_t : get? s.frame.locals e.localIdx = some .dead) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
+  obtain ⟨ha, m', hm⟩ := evalRvalue_reborrow_safeRef_dangling_both_ub hstate hphase hbb hstmt hdecl_dst hdecl_ref href_ty hpk_prim himm_ref _hdst_live hslot_r he htag hdead_t
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
 /-! ## 4. Safe-Reference Copy/Move (`_d = (copy|move) _r`) and Dereference Read/Write (`*_r`) -/
 
@@ -3854,16 +3902,10 @@ theorem annealDerefOperandToMemPlace_safeRef_ptr_same_size
   rw [annealDerefOperandToMemPlace_safeRef_pointer_eq hdecl hty hpk mptr ptrLay st,
     hmach, hmptr_eq, hck, h0_add]
 
-/-- **`step_safeRef_deref_read_invalid_scalar_divergence` (`LM-3.2` Safe-Reference Deref Read Invalid Scalar, upgraded to UB simulation)**:
-from any `StateRelLM3_2` state where `_r : &(mut) T` (`T` primitive scalar, e.g.
-`bool` or `char`) points at offset `0` with non-disabled permission to a live
-stack local `e.localIdx` of equal byte size (e.g. `u8` holding `2` or `u32`
-holding `0xD800`) whose scalar `sc` violates `AnnealScalarValid dstDecl.ty sc`,
-executing `_d = (copy|move) *_r` into a live destination `dstIdx` raises
-undefined behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
-`validateValueForTy?`) and `Miri.Interpreter.Step.step` (`annealStepHooks`,
-`"reading invalid value"`). -/
-theorem step_safeRef_deref_read_invalid_scalar_divergence
+/-- Both-UB core of `step_safeRef_deref_read_invalid_scalar_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_safeRef_deref_read_invalid_scalar_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -4113,6 +4155,53 @@ theorem step_safeRef_deref_read_invalid_scalar_divergence
           EStateM.bind_eq_error hread_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb
         hstmt hm_err⟩
+
+/-- **`step_safeRef_deref_read_invalid_scalar_simulation` (`LM-3.2` Safe-Reference Deref Read Invalid Scalar, upgraded to UB simulation)**:
+from any `StateRelLM3_2` state where `_r : &(mut) T` (`T` primitive scalar, e.g.
+`bool` or `char`) points at offset `0` with non-disabled permission to a live
+stack local `e.localIdx` of equal byte size (e.g. `u8` holding `2` or `u32`
+holding `0xD800`) whose scalar `sc` violates `AnnealScalarValid dstDecl.ty sc`,
+executing `_d = (copy|move) *_r` into a live destination `dstIdx` raises
+undefined behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
+`validateValueForTy?`) and `Miri.Interpreter.Step.step` (`annealStepHooks`,
+`"reading invalid value"`). -/
+theorem step_safeRef_deref_read_invalid_scalar_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl refDecl allocDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (_hperm : e.perm ≠ .disabled)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hsize : (translateTy dstDecl.ty body.layouts).layout.size =
+      (translateTy allocDecl.ty body.layouts).layout.size)
+    (hinvalid : ¬ AnnealScalarValid dstDecl.ty sc)
+    (_hdst_live : get? s.frame.locals dstIdx ≠ some .dead) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) := by
+  obtain ⟨ha, m', hm⟩ := step_safeRef_deref_read_invalid_scalar_both_ub hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag hoff0 _hperm hdecl_a htarget hsize hinvalid _hdst_live
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
 /-- **`step_safeRef_deref_read_simulation_explicit` (`LM-3.2` Safe-Reference Deref Read)**:
 from any `StateRelLM3_2` state, reading a primitive scalar through an immediate
@@ -6493,7 +6582,7 @@ theorem step_safeRef_use_dangling_post_validity_divergence
     exact ((validatePlace_ref_nonrecursive_simulation hstate' rfl hlt_d' hprim hdst_ty fuel).2.2.2
       hptrRel he htag ⟨targetDecl, hdecl_t, rfl⟩ hval_d').2.2 hdead_t'
 
-/-! ## 6. Safe-Reference Out-of-Bounds & Misaligned Dereference Divergences -/
+/-! ## 6. Safe-Reference Out-of-Bounds & Misaligned Dereference UB Simulations -/
 
 /-- Dereferencing a `PtrRel`-related safe-reference local `_r : &(mut) P` whose
 pointee range `ptrVal.offsetBytes + sizeof(P)` extends past the live stack
@@ -6815,16 +6904,10 @@ private theorem PrimScalar_misaligned_offset_mod_ne_zero₂
     · exact check_align 3 7 (by decide) rfl (by simp only [translateTy, hk]; rfl)
         (by simp only [translateTy, hk]; rfl)
 
-/-- **`step_safeRef_deref_read_oob_divergence` (`LM-3.2`, upgraded to UB simulation)**:
-closing the `ptrVal.offsetBytes = 0` / pointee-size precondition of
-`step_safeRef_deref_read_simulation`: when `_r : &(mut) P` holds a `PtrRel`
-pointer into a live stack local `e.localIdx` (holding `.init (.scalar sc)` with
-`e.perm ≠ .disabled`), but `ptrVal.offsetBytes + sizeof(P)` exceeds
-`sizeof(allocDecl.ty)`, executing `_d = (copy|move) *_r` raises undefined
-behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
-`evalStackThinPtrTypedDerefRead`) and `Miri.Interpreter.Step.step`
-(`annealStepHooks`, `"dereferencing a dangling reference"`). -/
-theorem step_safeRef_deref_read_oob_divergence
+/-- Both-UB core of `step_safeRef_deref_read_oob_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_safeRef_deref_read_oob_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -7066,17 +7149,55 @@ theorem step_safeRef_deref_read_oob_divergence
         rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_error hop_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_safeRef_deref_write_oob_divergence` (`LM-3.2`, upgraded to UB simulation)**:
+/-- **`step_safeRef_deref_read_oob_simulation` (`LM-3.2`, upgraded to UB simulation)**:
 closing the `ptrVal.offsetBytes = 0` / pointee-size precondition of
-`step_safeRef_deref_write_simulation`: when `_r : &(mut) P` holds a `PtrRel`
-pointer into a live stack local `e.localIdx` with writable borrow
-(`e.perm ∈ {.active, .reserved}`), `op` evaluates to `.scalar sc` in Anneal, and
-`ptrVal.offsetBytes + sizeof(P)` exceeds `sizeof(allocDecl.ty)`, executing
-`*_r = .use op` raises undefined behavior in BOTH `stepMirFn`
-(`MirStepNode.fail .ub` via `writeStackThinPtrTypedDeref`) and
-`Miri.Interpreter.Step.step` (`annealStepHooks`,
-`"dereferencing a dangling reference"`). -/
-theorem step_safeRef_deref_write_oob_divergence
+`step_safeRef_deref_read_simulation`: when `_r : &(mut) P` holds a `PtrRel`
+pointer into a live stack local `e.localIdx` (holding `.init (.scalar sc)` with
+`e.perm ≠ .disabled`), but `ptrVal.offsetBytes + sizeof(P)` exceeds
+`sizeof(allocDecl.ty)`, executing `_d = (copy|move) *_r` raises undefined
+behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
+`evalStackThinPtrTypedDerefRead`) and `Miri.Interpreter.Step.step`
+(`annealStepHooks`, `"dereferencing a dangling reference"`). -/
+theorem step_safeRef_deref_read_oob_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl refDecl allocDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (_hperm : e.perm ≠ .disabled)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hoob : (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat <
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
+    (_hdst_live : get? s.frame.locals dstIdx ≠ some .dead) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
+  obtain ⟨ha, m', hm⟩ := step_safeRef_deref_read_oob_both_ub hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag _hperm hdecl_a htarget hoob _hdst_live
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
+
+/-- Both-UB core of `step_safeRef_deref_write_oob_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_safeRef_deref_write_oob_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -7253,15 +7374,62 @@ theorem step_safeRef_deref_write_oob_divergence
         rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_error hdst_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_safeRef_deref_read_misaligned_divergence` (`LM-3.2`, upgraded to UB simulation)**:
-when `_r : &(mut) P` holds an in-bounds `PtrRel` pointer into a live stack local
-`e.localIdx` (`ptrVal.offsetBytes + sizeof(P) ≤ sizeof(allocDecl.ty)`) whose
-address is misaligned for `P` (`annealOffsetMisalignment ... = .ok (some mis)`,
-e.g. `offsetBytes = 1` on `&u16` into an 8-byte `u64` stack local), executing
-`_d = (copy|move) *_r` raises undefined behavior in BOTH `stepMirFn`
-(`MirStepNode.fail .ub` via `checkDerefAlign`) and `Miri.Interpreter.Step.step`
-(`annealStepHooks`, `"dereferencing an unaligned reference"`). -/
-theorem step_safeRef_deref_read_misaligned_divergence
+/-- **`step_safeRef_deref_write_oob_simulation` (`LM-3.2`, upgraded to UB simulation)**:
+closing the `ptrVal.offsetBytes = 0` / pointee-size precondition of
+`step_safeRef_deref_write_simulation`: when `_r : &(mut) P` holds a `PtrRel`
+pointer into a live stack local `e.localIdx` with writable borrow
+(`e.perm ∈ {.active, .reserved}`), `op` evaluates to `.scalar sc` in Anneal, and
+`ptrVal.offsetBytes + sizeof(P)` exceeds `sizeof(allocDecl.ty)`, executing
+`*_r = .use op` raises undefined behavior in BOTH `stepMirFn`
+(`MirStepNode.fail .ub` via `writeStackThinPtrTypedDeref`) and
+`Miri.Interpreter.Step.step` (`annealStepHooks`,
+`"dereferencing a dangling reference"`). -/
+theorem step_safeRef_deref_write_oob_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {refIdx : Local} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨refIdx, .cons .deref .nil⟩ (.use op), span⟩)
+    {refDecl allocDecl : LocalDecl} {mutability : Mutability} {pointeeKind : RigidTy}
+    {valTy : Ty}
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame op valTy)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hop_ok : evalOperand s.frame.locals op s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals = .ok (.scalar sc) s.frame.locals)
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hperm : e.perm = .active ∨ e.perm = .reserved)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    {sl_a : LocalSlot} (hsl_a : get? s.frame.locals e.localIdx = some sl_a)
+    (hsl_ne : sl_a ≠ .dead)
+    (hoob : (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat <
+      ptrVal.offsetBytes +
+        (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat)
+    (hsl_init : get? s.frame.locals e.localIdx ≠ some .uninit := by intro h; cases h)
+    (hsc_sz : sc.sizeBytes =
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat := by rfl) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "dereferencing a dangling reference")) := by
+  obtain ⟨ha, m', hm⟩ := step_safeRef_deref_write_oob_both_ub hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hoob hsl_init hsc_sz
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
+
+/-- Both-UB core of `step_safeRef_deref_read_misaligned_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_safeRef_deref_read_misaligned_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -7459,15 +7627,59 @@ theorem step_safeRef_deref_read_misaligned_divergence
         rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_error hop_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_safeRef_deref_write_misaligned_divergence` (`LM-3.2`, upgraded to UB simulation)**:
+/-- **`step_safeRef_deref_read_misaligned_simulation` (`LM-3.2`, upgraded to UB simulation)**:
 when `_r : &(mut) P` holds an in-bounds `PtrRel` pointer into a live stack local
-`e.localIdx` with writable borrow (`e.perm ∈ {.active, .reserved}`), `op`
-evaluates to `.scalar sc` in Anneal, and `ptrVal.offsetBytes` is misaligned for
-`P` (`annealOffsetMisalignment ... = .ok (some mis)`), executing `*_r = .use op`
-raises undefined behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
-`checkDerefAlign`) and `Miri.Interpreter.Step.step` (`annealStepHooks`,
-`"dereferencing an unaligned reference"`). -/
-theorem step_safeRef_deref_write_misaligned_divergence
+`e.localIdx` (`ptrVal.offsetBytes + sizeof(P) ≤ sizeof(allocDecl.ty)`) whose
+address is misaligned for `P` (`annealOffsetMisalignment ... = .ok (some mis)`,
+e.g. `offsetBytes = 1` on `&u16` into an 8-byte `u64` stack local), executing
+`_d = (copy|move) *_r` raises undefined behavior in BOTH `stepMirFn`
+(`MirStepNode.fail .ub` via `checkDerefAlign`) and `Miri.Interpreter.Step.step`
+(`annealStepHooks`, `"dereferencing an unaligned reference"`). -/
+theorem step_safeRef_deref_read_misaligned_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl refDecl allocDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (_hperm : e.perm ≠ .disabled)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hinbounds : ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat ≤
+      (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat)
+    {mis : Miri.Memory.Misalignment}
+    (hmis : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes))
+      (translateTy dstDecl.ty body.layouts).layout.align.abi = .ok (some mis))
+    (_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hlay_coh : PrimLayoutsCoherent body.layouts := by exact ⟨rfl, fun _ _ h => nomatch h⟩) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) := by
+  obtain ⟨ha, m', hm⟩ := step_safeRef_deref_read_misaligned_both_ub hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag _hperm hdecl_a htarget hinbounds hmis _hdst_live hlay_coh
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
+
+/-- Both-UB core of `step_safeRef_deref_write_misaligned_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_safeRef_deref_write_misaligned_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -7636,6 +7848,59 @@ theorem step_safeRef_deref_write_misaligned_divergence
             .error (.undefinedBehavior "dereferencing an unaligned reference")) := by
         rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_error hdst_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
+
+/-- **`step_safeRef_deref_write_misaligned_simulation` (`LM-3.2`, upgraded to UB simulation)**:
+when `_r : &(mut) P` holds an in-bounds `PtrRel` pointer into a live stack local
+`e.localIdx` with writable borrow (`e.perm ∈ {.active, .reserved}`), `op`
+evaluates to `.scalar sc` in Anneal, and `ptrVal.offsetBytes` is misaligned for
+`P` (`annealOffsetMisalignment ... = .ok (some mis)`), executing `*_r = .use op`
+raises undefined behavior in BOTH `stepMirFn` (`MirStepNode.fail .ub` via
+`checkDerefAlign`) and `Miri.Interpreter.Step.step` (`annealStepHooks`,
+`"dereferencing an unaligned reference"`). -/
+theorem step_safeRef_deref_write_misaligned_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {refIdx : Local} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨refIdx, .cons .deref .nil⟩ (.use op), span⟩)
+    {refDecl allocDecl : LocalDecl} {mutability : Mutability} {pointeeKind : RigidTy}
+    {valTy : Ty}
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame op valTy)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hop_ok : evalOperand s.frame.locals op s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals = .ok (.scalar sc) s.frame.locals)
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hperm : e.perm = .active ∨ e.perm = .reserved)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    {sl_a : LocalSlot} (hsl_a : get? s.frame.locals e.localIdx = some sl_a)
+    (hsl_ne : sl_a ≠ .dead)
+    (hinbounds : ptrVal.offsetBytes +
+        (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat ≤
+      (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat)
+    {mis : Miri.Memory.Misalignment}
+    (hmis : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes))
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.align.abi =
+      .ok (some mis))
+    (hlay_coh : PrimLayoutsCoherent body.layouts := by exact ⟨rfl, fun _ _ h => nomatch h⟩) :
+    StepRelLM3_2 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "dereferencing an unaligned reference")) := by
+  obtain ⟨ha, m', hm⟩ := step_safeRef_deref_write_misaligned_both_ub hstate hphase hbb hstmt hdecl_ref href_ty hpk_prim hop himm_ref hop_ok hslot_r he htag hperm hdecl_a hsl_a hsl_ne hinbounds hmis hlay_coh
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
 /-! ## 7. Tree Borrows Permission Divergences on Safe References (`LM-3.2` vs `LM-3.3`) -/
 

@@ -26,11 +26,13 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `step_rawPtr_addrOf_lm3_1_simulation`,
    `step_rawPtr_addrOf_indirect_lm3_1_simulation`,
    `step_rawPtr_deref_zero_offset_correspondence`,
-   `step_rawPtr_deref_null_divergence`,
-   `step_rawPtr_deref_nonzero_offset_divergence`,
-   `step_rawPtr_deref_perm_divergence`)**: real-step correspondence and
-   divergence characterizations for taking the raw address of an immediate
-   local, an already-promoted local, or a dereferenced pointer place `*_p`
+   `step_rawPtr_deref_null_correspondence`,
+   `step_rawPtr_deref_nonzero_offset_correspondence`,
+   `step_rawPtr_deref_perm_correspondence`)**: real-step simulation and
+   (on the Stage-1 repaired semantics) value-level correspondence of the stored
+   results for taking the raw address of an immediate local, an
+   already-promoted local, or a dereferenced pointer place `*_p`, including
+   provenance-less, non-zero-offset, and `.disabled`/`.frozen` parents
    (together with `step_storageLive_lm3_1_simulation`,
    `step_storageDead_lm3_1_simulation`, and
    `step_rawPtr_use_lm3_1_simulation` for copying and moving raw pointers).
@@ -40,41 +42,52 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `evalProjection_deref_simulation`)**: real-step `Miri.Interpreter.Step.step`
    (`annealStepHooks`) and `stepMirFn` correspondence for `_d = (copy|move) *_p`
    and `*_p = .use op`, declaration/TyId pointee-layout coherence, and real-step
-   divergence theorems for out-of-bounds, misaligned, and invalid `bool`/`char`
-   dereferences as well as `PlaceMention(*_p)`.
+   UB simulations (`StepRelLM3_1.ub`) for out-of-bounds, misaligned, and invalid
+   `bool`/`char` dereferences as well as `PlaceMention(*_p)` on an `.uninit`
+   pointer (`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
+   `step_deref_invalid_bool_simulation`, `step_deref_invalid_char_simulation`,
+   `step_deref_write_invalid_bool_simulation`,
+   `step_placeMention_deref_uninit_simulation`).
 3. **`BinOp.Offset`, Relational Comparisons & `UnOp.PtrMetadata`
    (`step_binOp_offset_simulation`, `step_binOp_offset_move_simulation`,
    `step_binOp_offset_zero_any_stride_lm3_1_simulation`,
    `step_binOp_offset_oob_dangling_miri_ub`,
-   `step_binOp_offset_scalar_zero_divergence`,
-   `step_binOp_offset_move_scalar_zero_divergence`,
-   `step_binOp_offset_scalar_nonzero_divergence`,
-   `step_binOp_offset_move_scalar_nonzero_divergence`,
+   `step_binOp_offset_scalar_zero_correspondence`,
+   `step_binOp_offset_move_scalar_zero_correspondence`,
+   `step_binOp_offset_scalar_nonzero_simulation`,
+   `step_binOp_offset_move_scalar_nonzero_simulation`,
    `step_rawPtr_cmp_scalar_lm3_1_simulation`,
    `step_rawPtr_cmp_ub_lm3_1_simulation`,
    `step_rawPtr_cmp_ptr_divergence`,
    `step_rawPtr_cmp_scalar_ptr_divergence`,
    `step_unaryOp_ptrMetadata_thin_rawPtr_ub_simulation`,
-   `step_unaryOp_ptrMetadata_thin_rawPtr_divergence`,
+   `step_unaryOp_ptrMetadata_thin_rawPtr_correspondence`,
    `annealDerefValidity_nonThin_or_ref_err`)**: real-step simulation of
    `_d = Offset((copy|move) _p, rhsOp)` (byte-sized in-bounds offsets and
    zero-count offsets across all exact-layout pointee strides), provenance-less
    thin raw-pointer comparisons (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`), and
-   uninitialized/dead/use-after-move pointer comparison UB, paired with
-   real-step divergence theorems on out-of-bounds/dangling offsets, non-byte
-   non-zero strides, negative `isize` offsets, provenance-tracked pointer
-   comparisons (with `.ptr` on either the LHS or RHS), and `UnOp.PtrMetadata`.
+   uninitialized/dead/use-after-move pointer comparison UB, together with the
+   Stage-1 upgrades: out-of-bounds/dangling offsets are UB in both machines
+   (`step_binOp_offset_oob_dangling_miri_ub`), non-byte strides and negative
+   `isize` offsets step in lockstep (`step_binOp_offset_stride_simulation`,
+   `step_binOp_offset_neg_isize_simulation`), non-zero offsets of
+   provenance-less pointers are UB in both machines, and zero offsets of
+   provenance-less pointers and thin `UnOp.PtrMetadata` step in both machines
+   with corresponding results. Remaining boundary: provenance-tracked pointer
+   comparisons (with `.ptr` on either the LHS or RHS), where both machines step
+   but their result values are not related.
 4. **`CastKind.PtrToPtr` & Exposure Casts (`step_cast_ptrToPtr_simulation`,
-   `step_cast_ptrToPtr_move_simulation`, `step_cast_ptrToPtr_scalar_divergence`,
-   `step_cast_ptrToPtr_move_scalar_divergence`,
+   `step_cast_ptrToPtr_move_simulation`, `step_cast_ptrToPtr_scalar_correspondence`,
+   `step_cast_ptrToPtr_move_scalar_correspondence`,
    `step_cast_expose_provenance_scalar_simulation`,
    `step_cast_expose_provenance_ptr_unsupported`,
    `step_cast_with_exposed_provenance_divergence`,
    `evalCast_ptrToPtr_simulation`, `evalRvalue_expose_withExposed_roundtrip`)**:
    real-step lockstep simulation of `_d = (copy|move) _s as *(const|mut) T`
-   (`PtrToPtr`) and provenance-less `PointerExposeProvenance`, paired with
-   real-step divergence characterizations for provenance-less `(copy|move)`
-   `PtrToPtr` casts and provenance-exposing / exposed-address casts.
+   (`PtrToPtr`) and provenance-less `PointerExposeProvenance`, value-level
+   correspondences for provenance-less `(copy|move)` `PtrToPtr` casts, and the
+   remaining fail-closed divergences for provenance-exposing / exposed-address
+   casts (Anneal steps, `lean-miri` reports `StepError.unsupported`).
 5. **Composed step & root-frame terminators (`step_stmt_lm3_1_simulation`,
    `step_stmt_lm3_1_state_simulation`,
    `step_terminator_goto_return_lm3_1_simulation`,
@@ -1616,9 +1629,11 @@ leaf-level companion to `step_deref_read_simulation`,
 3. **Unknown tag**: Anneal finds neither a borrow nor a global for the tag, and
    the stand-in rejects a read past the end of a live allocation. The two
    pointers are not related by `PtrRel`; in particular this is not an
-   out-of-bounds read through one pointer. Anneal's dereference of a tracked
-   stack pointer ignores `offsetBytes`, so it does not report out-of-bounds
-   reads at all (`WitLM3_1.wit_lm3_1_anneal_offset_deref_divergence`).
+   out-of-bounds read through one pointer. On the Stage-1 repaired semantics,
+   Anneal's typed dereference of a tracked stack pointer checks `offsetBytes`
+   against the pointee local's size, so both machines reject out-of-bounds
+   reads (`step_deref_oob_simulation`,
+   `WitLM3_1.wit_lm3_1_anneal_offset_deref_agreement`).
 4. **Misaligned read**: the stand-in rejects a misaligned 8-byte read (no
    Anneal counterpart is stated). -/
 theorem evalProjection_deref_simulation
@@ -7990,7 +8005,13 @@ execute `_d = Offset(copy _p, rhsOp)` on a byte-sized raw pointer (`*const u8`,
    `ptrVal.offsetBytes + sc.bits ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat`:
    BOTH machines evaluate the offset to `ptrVal.offsetBytes + sc.bits` (preserving
    provenance and `PtrRel allocMap`), raising UB if `_d` is `.dead` or stepping
-   in lockstep to `StateRelLM3_1`-related states if `_d` is live. -/
+   in lockstep to `StateRelLM3_1`-related states if `_d` is live.
+
+Boundary (excluded by `hinbounds`, not a simulation): Stage-1
+`evalPtrOffsetBinOp` rejects `Offset` on a pointer whose borrow entry is
+`.disabled` with `.ub`, whereas `lean-miri`'s `ptrOffsetInbounds` performs no
+Tree Borrows access and only checks allocation bounds, so a `.disabled` but
+in-bounds `Offset` source is undefined behavior in Anneal only. -/
 theorem step_binOp_offset_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -12843,12 +12864,16 @@ Despite its name, this predicate is not a static typing judgment: besides types,
 its constructors carry state-side conditions on `(s, m, allocMap)` (pointer
 offset `0`, non-disabled permissions, in-bounds or zero `Offset` counts,
 `u8`/`i8` pointees for `Offset`, thin pointees for `PtrToPtr`, unmapped
-`StorageLive` targets). These conditions exclude the states where Anneal's
-trusted semantics and `lean-miri` diverge (`step_deref_oob_divergence`,
-`step_deref_misaligned_divergence`, `step_deref_invalid_bool_divergence`,
-`step_binOp_offset_oob_dangling_miri_ub`, `step_binOp_offset_stride_divergence`,
-`step_binOp_offset_neg_isize_divergence`, and the `WitLM3_1` divergence
-witnesses). -/
+`StorageLive` targets). These conditions exclude the states outside the
+lockstep-step fragment of the composed simulation: states where both machines
+report undefined behavior through the dedicated UB simulations
+(`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
+`step_deref_invalid_bool_simulation`, `step_binOp_offset_oob_dangling_miri_ub`),
+states covered by the separate Stage-1 lockstep theorems
+(`step_binOp_offset_stride_simulation`,
+`step_binOp_offset_neg_isize_simulation`), and the remaining boundaries
+(`.disabled` `Offset` sources, provenance-tracked comparisons, and
+exposure casts). -/
 inductive WellTypedLM3_1StateStmt
     (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
     (allocMap : List AllocMapEntry) : Statement → Prop where
@@ -13274,7 +13299,7 @@ theorem step_stmt_lm3_1_state_simulation
     · exact Or.inr (Or.inr (Or.inr (Or.inl h)))
     · exact Or.inr (Or.inr (Or.inr (Or.inr h)))
 
-/-! ## 12. Real-Step Divergence Characterizations (`LM-3.1`) -/
+/-! ## 12. Real-Step Boundary Characterizations and Stage-1 Upgrades (`LM-3.1`) -/
 
 private theorem divModBytesAux_snd_mod (fuel rem stride quot : Nat)
     (hpos : 0 < stride) (hfuel : rem ≤ fuel) :
@@ -14770,18 +14795,10 @@ theorem annealValidateScalarForTyId_nonNullPtr_null_false
   rcases hty with rfl | rfl <;>
     (unfold annealValidateScalarForTyId; rw [hptr0]; rfl)
 
-/-- **`step_deref_invalid_char_divergence`**: in `StateRelLM3_1`-related states
-where `_p : *(const|mut) char` at `offsetBytes = 0` points to a 4-byte
-`u32`/`i32` stack local holding `sc` with `isValidCharCode sc.bits = false`
-(e.g. a UTF-16 surrogate `0xD800` or `0x110000` cast via `PtrToPtr` to
-`*const char`), executing `_d = copy *_p` diverges:
-
-1. Anneal's `stepMirFn` takes a normal step storing `.init (.scalar sc)` in `_d`
-   without checking Unicode scalar-value validity; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) rejects the
-   invalid `char` bit pattern with
-   `StepError.undefinedBehavior "reading invalid value"`. -/
-theorem step_deref_invalid_char_divergence
+/-- Both-UB core of `step_deref_invalid_char_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_deref_invalid_char_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -15021,18 +15038,56 @@ theorem step_deref_invalid_char_divergence
         rw [EStateM.bind_eq_error hread_m]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_deref_write_invalid_bool_divergence`**: in `StateRelLM3_1`-related
-states where `_p : *mut bool` at `offsetBytes = 0` (`e.perm = .active` or
-`e.perm = .reserved`) points to a live 1-byte stack local (`bool`, `u8`, or
-`i8`) and `c` is a 1-byte `bool` constant with `2 ≤ b < 256`, executing
-`*_p = const c` diverges:
+/-- **`step_deref_invalid_char_simulation`** (Stage-1 upgrade of
+`step_deref_invalid_char_divergence`): in `StateRelLM3_1`-related states where
+`_p : *(const|mut) char` at `offsetBytes = 0` points to a 4-byte `u32`/`i32`
+stack local holding `sc` with `isValidCharCode sc.bits = false` (e.g. a UTF-16
+surrogate `0xD800` or `0x110000` cast via `PtrToPtr` to `*const char`),
+executing `_d = copy *_p` raises undefined behavior in BOTH machines
+(`StepRelLM3_1.ub`): Anneal's `stepMirFn` rejects the invalid `char` scalar in
+its typed dereference read (`MirStepNode.fail .ub`) instead of storing it in
+`_d`, and `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`)
+rejects the invalid bit pattern with
+`StepError.undefinedBehavior "reading invalid value"`. -/
+theorem step_deref_invalid_char_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨ptrIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl ptrDecl tgtDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hdst_char : dstDecl.ty.kind = .char)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hperm : e.perm ≠ .disabled)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (htgt_word : tgtDecl.ty.kind = .uint .u32 ∨ tgtDecl.ty.kind = .int .i32)
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hinvalid : isValidCharCode sc.bits = false)
+    (_hdst_live : get? s.frame.locals dstIdx ≠ some .dead) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) := by
+  obtain ⟨ha, m', hm⟩ := step_deref_invalid_char_both_ub hstate hphase hbb hstmt hdecl_dst hdecl_ptr hdst_char hptr_ty himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_word htarget hinvalid _hdst_live
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
-1. Anneal's `stepMirFn` writes `.init (.scalar ⟨b, 1⟩)` into `e.localIdx`
-   without checking `bool` bit-pattern validity; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) rejects the
-   invalid `bool` bit pattern with
-   `StepError.undefinedBehavior "writing invalid value"`. -/
-theorem step_deref_write_invalid_bool_divergence
+/-- Both-UB core of `step_deref_write_invalid_bool_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_deref_write_invalid_bool_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -15247,17 +15302,54 @@ theorem step_deref_write_invalid_bool_divergence
         rw [annealWriteImmediate_memory_eq rfl, hw_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_placeMention_deref_uninit_divergence`**: when an immediate
-raw-pointer local `_p : *(const|mut) T` (`T` primitive scalar) is `.uninit`
-(`StorageLive(_p)` before `_p` is initialized), `PlaceMention(*_p)`
-(`let _ = *_p;`) diverges:
+/-- **`step_deref_write_invalid_bool_simulation`** (Stage-1 upgrade of
+`step_deref_write_invalid_bool_divergence`): in `StateRelLM3_1`-related states
+where `_p : *mut bool` at `offsetBytes = 0` (`e.perm = .active` or
+`e.perm = .reserved`) points to a live 1-byte stack local (`bool`, `u8`, or
+`i8`) and `c` is a 1-byte `bool` constant with `2 ≤ b < 256`, executing
+`*_p = const c` raises undefined behavior in BOTH machines (`StepRelLM3_1.ub`):
+Anneal's `stepMirFn` rejects the invalid `bool` bit pattern
+(`MirStepNode.fail .ub`) instead of writing `⟨b, 1⟩` into `e.localIdx`, and
+`lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) reports
+`StepError.undefinedBehavior "writing invalid value"`. -/
+theorem step_deref_write_invalid_bool_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {ptrIdx : Local} {c : ConstOperand} {b : Nat} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩)
+    {ptrDecl tgtDecl : LocalDecl}
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr .mut .bool)
+    (hc_val : c.val = .scalar (.int ⟨b, 1⟩))
+    (hc_ty : c.ty.kind = .bool)
+    (hb_lo : 2 ≤ b) (hb_hi : b < 256)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hperm : e.perm = .active ∨ e.perm = .reserved)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (htgt_1 : tgtDecl.ty.kind = .bool ∨ tgtDecl.ty.kind = .uint .u8 ∨ tgtDecl.ty.kind = .int .i8)
+    (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "writing invalid value")) := by
+  obtain ⟨ha, m', hm⟩ := step_deref_write_invalid_bool_both_ub hstate hphase hbb hstmt hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_1 htgt_live
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
-1. Anneal's `stepMirFn` checks only `get? s.frame.locals ptrIdx ≠ some .dead`
-   and steps normally without reading `_p`; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) reads `_p` to
-   evaluate the place `*_p` and raises
-   `StepError.undefinedBehavior "read of uninitialized local"`. -/
-theorem step_placeMention_deref_uninit_divergence
+/-- Both-UB core of `step_placeMention_deref_uninit_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_placeMention_deref_uninit_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -15310,6 +15402,41 @@ theorem step_placeMention_deref_uninit_divergence
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
     · cases h
     · cases h
+
+/-- **`step_placeMention_deref_uninit_simulation`** (Stage-1 `D9` upgrade of
+`step_placeMention_deref_uninit_divergence`): when an immediate raw-pointer
+local `_p : *(const|mut) T` (`T` primitive scalar) is `.uninit`
+(`StorageLive(_p)` before `_p` is initialized), `PlaceMention(*_p)`
+(`let _ = *_p;`) raises undefined behavior in BOTH machines
+(`StepRelLM3_1.ub`): Anneal's `evalStmt` rejects a `PlaceMention` through an
+uninitialized pointer local (`MirStepNode.fail .ub`) instead of stepping
+without reading `_p`, and `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`) reads `_p` to evaluate `*_p` and reports
+`StepError.undefinedBehavior "read of uninitialized local"`. -/
+theorem step_placeMention_deref_uninit_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {ptrIdx : Local} {ptrDecl : LocalDecl}
+    {mutability : Mutability} {pointeeKind : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.placeMention ⟨ptrIdx, .cons .deref .nil⟩, span⟩)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    (huninit : get? s.frame.locals ptrIdx = some .uninit) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "read of uninitialized local")) := by
+  obtain ⟨ha, m', hm⟩ := step_placeMention_deref_uninit_both_ub hstate hphase hbb hstmt hdecl_ptr hptr_ty hpk_prim himm_ptr huninit
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
 /-- `annealForceAllocation` on an already-dereferenced `.memory mp` place is a
 pure no-op (returning `mp` without touching `AnnealStepState`). -/
@@ -15453,20 +15580,24 @@ private theorem recoverExposedPtrValue_nil_exposed_globals
   · cases lookupBorrow borrows (Nat.div addrBits 65536) <;> rfl
   · rfl
 
-/-- **`step_rawPtr_deref_null_divergence` (RFC 2582 Place-to-Pointer False
-UB)**: in `StateRelLM3_1`-related states where `_p : *(const|mut) T` (`T`
-primitive scalar) holds a provenance-less 8-byte integer scalar `sc` (such as a
-null raw pointer `0 as *const T`), executing `_d = &raw (const|mut) (*_p)`
-diverges:
+/-- **`step_rawPtr_deref_null_correspondence`** (RFC 2582 place-to-pointer on a
+provenance-less pointer; Stage-1 resolution of
+`step_rawPtr_deref_null_divergence`): in `StateRelLM3_1`-related states where
+`_p : *(const|mut) T` (`T` primitive scalar) holds a provenance-less 8-byte
+integer scalar `sc` (such as a null raw pointer `0 as *const T`), executing
+`_d = &raw (const|mut) (*_p)` steps normally in BOTH machines without accessing
+pointee memory:
 
-1. Anneal's `stepMirFn` (`Places.lean:2708, 2743`) requires `_p` to hold a
-   `Value.ptr` and falsely reports `MirStepNode.fail .ub`.
+1. Anneal's `stepMirFn` stores `.init (.scalar sc)` in `_d` (it no longer
+   requires `_p` to hold a `Value.ptr` and no longer reports UB); and
 2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) evaluates
-   `*_p` as a `MemPlace` without reading pointee memory
-   (`annealForceAllocation_memory_eq`) and steps normally via `MemPlace.toRef`,
-   storing an 8-byte integer scalar `msc_ref` (`ScalarRel sc msc_ref`) into `_d`
-   (matching RFC 2582 `&raw const (*ptr::null::<T>())`). -/
-theorem step_rawPtr_deref_null_divergence
+   `*_p` as a `MemPlace` without reading pointee memory and stores an 8-byte
+   integer scalar `msc_ref` (`ScalarRel sc msc_ref`) into `_d` (matching RFC 2582
+   `&raw const (*ptr::null::<T>())`).
+
+This relates the stored results only; preservation of `StateRelLM3_1` by the
+two steps is not established here. -/
+theorem step_rawPtr_deref_null_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -15612,21 +15743,23 @@ theorem step_rawPtr_deref_null_divergence
       simp [Array.getElem?_set_self]
   · cases h
 
-/-- **`step_rawPtr_deref_nonzero_offset_divergence` (Offset-Reset Reborrow
-Bug)**: in `StateRelLM3_1`-related states where `_p : *(const|mut) T` (`T`
-primitive scalar) holds a `PtrRel` pointer `ptrVal` at `ptrVal.offsetBytes > 0`
-(`e.perm = .active`), executing `_d = &raw (const|mut) (*_p)` diverges in the
-resulting pointer offset:
+/-- **`step_rawPtr_deref_nonzero_offset_correspondence`** (Stage-1 resolution of
+the offset-reset reborrow bug `step_rawPtr_deref_nonzero_offset_divergence`): in
+`StateRelLM3_1`-related states where `_p : *(const|mut) T` (`T` primitive
+scalar) holds a `PtrRel` pointer `ptrVal` (`e ∈ allocMap`, `e.tag = ptrVal.tag`;
+in particular at a non-zero `ptrVal.offsetBytes`), executing
+`_d = &raw (const|mut) (*_p)` steps normally in BOTH machines and preserves the
+byte offset:
 
-1. Anneal's `stepMirFn` (`Places.lean:2741`) stores
-   `.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8` in `_d`,
-   **silently resetting `offsetBytes` to `0`** (dropping `ptrVal.offsetBytes`);
-   while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) preserves the
-   exact byte offset
-   `annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes` via
-   `MemPlace.toRef`. -/
-theorem step_rawPtr_deref_nonzero_offset_divergence
+1. Anneal's `stepMirFn` stores `.ptr ptrVal 8` in `_d` (it no longer mints a
+   fresh tag at `offsetBytes := 0`); and
+2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) stores the
+   pointer at address `annealStackBaseAddr e.allocId + ptrVal.offsetBytes` with
+   provenance `.concrete e.allocId borTag`.
+
+This relates the stored pointers only; preservation of `StateRelLM3_1` by the
+two steps is not established here. -/
+theorem step_rawPtr_deref_nonzero_offset_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -15787,13 +15920,11 @@ theorem step_rawPtr_deref_nonzero_offset_divergence
 /-- **`step_cast_expose_provenance_ptr_unsupported`**: in `StateRelLM3_1`
 states where `_p` holds a thin raw pointer (`isThinRawPtrPointee`) with concrete
 provenance (`PtrRel`), `_d = copy _p as usize (PointerExposeProvenance)`
-diverges by design:
-
-1. Anneal's `stepMirFn` steps storing the synthetic integer
-   `⟨ptrVal.allocId * 65536 + ptrVal.offsetBytes, 8⟩`.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) fails closed
-   with `StepError.unsupported "exposeProvenance in cast"` rather than
-   fabricating Anneal's non-canonical `65536`-stride formula. -/
+diverges by design: Anneal's `stepMirFn` steps, storing an integer address
+`⟨addr, 8⟩` from its canonical address model, while `lean-miri`'s
+`Miri.Interpreter.Step.step` (`annealStepHooks`) fails closed with
+`StepError.unsupported "exposeProvenance in cast"` rather than fabricating an
+address. -/
 theorem step_cast_expose_provenance_ptr_unsupported
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -15950,16 +16081,17 @@ theorem step_cast_expose_provenance_ptr_unsupported
         rw [hcast_err]
       exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_cast_with_exposed_provenance_divergence` (Forged-Provenance Bug)**:
-in `StateRelLM3_1`-related states, executing `_d = const c as *(const|mut) T`
+/-- **`step_cast_with_exposed_provenance_divergence`**
+(`PointerWithExposedProvenance` fail-closed boundary): in `StateRelLM3_1`-related
+states with no exposed allocations (`s.memory.exposedAllocIds = []`,
+`s.memory.globals = []`), executing `_d = const c as *(const|mut) T`
 (`CastKind.PointerWithExposedProvenance`) on a `usize` integer constant `c`
 (`c.val = .scalar (.int ⟨bits, 8⟩)`, `bits < 2 ^ 64`) diverges:
 
-1. Anneal's `stepMirFn` (`Places.lean:2818-2825`) unconditionally fabricates
-   live pointer provenance
-   `{ allocId := bits / 65536, offsetBytes := bits % 65536 }` in `_d` without
-   checking whether any pointer was ever exposed, allowing
-   `65536_usize as *const T` to forge tag `1` for an unexposed local.
+1. Anneal's `stepMirFn` steps, storing the provenance-less integer scalar
+   `.init (.scalar ⟨bits, 8⟩)` in `_d` (Stage-1 no longer forges provenance
+   `{ allocId := bits / 65536, offsetBytes := bits % 65536 }` for an unexposed
+   address, so a later dereference of `_d` faults); while
 2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) fails closed
    with `StepError.unsupported "pointerFromExposedAddress in cast"`. -/
 theorem step_cast_with_exposed_provenance_divergence
@@ -16233,19 +16365,18 @@ theorem step_cast_with_exposed_provenance_divergence
       rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_ok hop_c, hcast_err]
     exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err⟩
 
-/-- **`step_cast_ptrToPtr_scalar_divergence`**: in `StateRelLM3_1` states
-where `_s : *(const|mut) T` (`isThinRawPtrPointee`) holds a provenance-less
-8-byte integer scalar `.init (.scalar sc)` (such as `0 as *const T`) and
+/-- **`step_cast_ptrToPtr_scalar_correspondence`** (Stage-1 resolution of
+`step_cast_ptrToPtr_scalar_divergence`): in `StateRelLM3_1` states where
+`_s : *(const|mut) T` (`isThinRawPtrPointee`) holds a provenance-less 8-byte
+integer scalar `.init (.scalar sc)` (such as `0 as *const T`) and
 `_d : *(const|mut) V` (`isThinRawPtrPointee`) is a live immediate local,
-executing `_d = copy _s as *(const|mut) V` (`CastKind.PtrToPtr`) diverges:
-
-1. Anneal's `stepMirFn` (`Places.lean:2798`) only matches `.ptr` and wide
-   `.aggregate` pointers in `CastKind.PtrToPtr`, rejecting `.scalar sc` with
-   `MirStepNode.unsupported`; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) steps cleanly
-   via `Cast.ptrToPtr` (`8 == 8`), storing the provenance-less pointer scalar
-   `.fromScalarInt msc` (`ScalarRel sc msc`) in `_d`. -/
-theorem step_cast_ptrToPtr_scalar_divergence
+executing `_d = copy _s as *(const|mut) V` (`CastKind.PtrToPtr`) steps normally
+in BOTH machines: Anneal's `stepMirFn` stores `.init (.scalar sc)` in `_d`
+(previously `MirStepNode.unsupported`), and `lean-miri`'s
+`Miri.Interpreter.Step.step` (`annealStepHooks`) stores `.fromScalarInt msc`
+with `ScalarRel sc msc`. This relates the stored results only; preservation of
+`StateRelLM3_1` is not established here. -/
+theorem step_cast_ptrToPtr_scalar_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -16608,19 +16739,19 @@ private theorem evalScalarPtrOffsetBinOp_thin_rawPtr_eq
   rw [hstride]
   rfl
 
-/-- **`step_binOp_offset_scalar_zero_divergence`**: in `StateRelLM3_1`-related
-states where `_p : *(const|mut) (u8|i8)` holds a provenance-less integer scalar
+/-- **`step_binOp_offset_scalar_zero_correspondence`** (Stage-1 resolution of
+`step_binOp_offset_scalar_zero_divergence`): in `StateRelLM3_1`-related states
+where `_p : *(const|mut) (u8|i8)` holds a provenance-less integer scalar
 `.init (.scalar sc)` (such as `0 as *const u8`), `rhsOp` evaluates to `0`
 (`sc_rhs.bits = 0`), and `_d` is live immediate, executing
-`_d = Offset(copy _p, rhsOp)` diverges:
-
-1. Anneal's `stepMirFn` rejects `Offset` on `.scalar` pointers with
-   `MirStepNode.unsupported`; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) succeeds via
-   `ptrOffsetInbounds_zero_ok` (matching Rust `ptr::offset(_, 0)` semantics on
-   null/integer pointers), storing `.fromScalarInt msc_out`
-   (`ScalarRel sc msc_out`) in `_d`. -/
-theorem step_binOp_offset_scalar_zero_divergence
+`_d = Offset(copy _p, rhsOp)` steps normally in BOTH machines: Anneal's
+`stepMirFn` stores `sc` unchanged in `_d` (previously
+`MirStepNode.unsupported`), and `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`) succeeds via `ptrOffsetInbounds_zero_ok` (Rust
+`ptr::offset(_, 0)` on a null/integer pointer) storing `msc_out` with
+`ScalarRel sc msc_out`. This relates the stored results only; preservation of
+`StateRelLM3_1` is not established here. -/
+theorem step_binOp_offset_scalar_zero_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -16863,17 +16994,10 @@ theorem step_binOp_offset_scalar_zero_divergence
       simp [Array.getElem?_set_self]
   · cases h
 
-/-- **`step_binOp_offset_scalar_nonzero_divergence`**: in `StateRelLM3_1`
-states where `_p : *(const|mut) (u8|i8)` holds a provenance-less integer scalar
-`.init (.scalar sc)` (such as `0 as *const u8`) and `rhsOp` evaluates to a
-non-zero offset `sc_rhs` (`0 < sc_rhs.bits < 2 ^ 32`), executing
-`_d = Offset(copy _p, rhsOp)` diverges:
-
-1. Anneal's `stepMirFn` fails with `MirStepNode.unsupported`; while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) reports
-   `StepError.undefinedBehavior "pointer Offset out of bounds"` via
-   `ptrOffsetInbounds_withoutProvenance_err`. -/
-theorem step_binOp_offset_scalar_nonzero_divergence
+/-- Both-UB core of `step_binOp_offset_scalar_nonzero_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_binOp_offset_scalar_nonzero_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -17023,20 +17147,71 @@ theorem step_binOp_offset_scalar_nonzero_divergence
         hbb hstmt hm_err⟩
   · cases h
 
-/-- **`step_rawPtr_deref_perm_divergence` (Spurious Tree Borrows Access on
-`&raw (*_p)`)**: in `StateRelLM3_1`-related states where `_p : *(const|mut) T`
-(`T` primitive scalar) holds `.init (.ptr ptrVal 8)` (`e ∈ allocMap`,
-`e.tag = ptrVal.tag`), `_d` is live immediate, and `e.perm = .disabled` or
-`e.perm = .frozen ∧ rawMut = .mut`, executing `_d = &raw rawMut (*_p)` diverges:
+/-- **`step_binOp_offset_scalar_nonzero_simulation`** (Stage-1 upgrade of
+`step_binOp_offset_scalar_nonzero_divergence`): in `StateRelLM3_1` states where
+`_p : *(const|mut) (u8|i8)` holds a provenance-less integer scalar
+`.init (.scalar sc)` (such as `0 as *const u8`) and `rhsOp` evaluates to a
+non-zero offset `sc_rhs` (`0 < sc_rhs.bits < 2 ^ 32`), executing
+`_d = Offset(copy _p, rhsOp)` raises undefined behavior in BOTH machines
+(`StepRelLM3_1.ub`): Anneal's `stepMirFn` rejects the non-zero offset of a
+provenance-less pointer with `MirStepNode.fail .ub` (previously
+`MirStepNode.unsupported`), and `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`) reports
+`StepError.undefinedBehavior "pointer Offset out of bounds"`
+(`ptrOffsetInbounds_withoutProvenance_err`). -/
+theorem step_binOp_offset_scalar_nonzero_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand}
+    {dstDecl ptrDecl : LocalDecl} {ptrMut : Mutability}
+    {pointeeKind : RigidTy} {rhsTy : Ty} {sc sc_rhs : MirAst.ScalarInt} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (.copy ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hpt : pointeeKind = .uint .u8 ∨ pointeeKind = .int .i8)
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame rhsOp rhsTy)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.scalar sc)))
+    (hrhs_eval : evalOperand s.frame.locals rhsOp s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals = .ok (.scalar sc_rhs) s.frame.locals)
+    (hrhs_pos : 0 < sc_rhs.bits)
+    (hrhs_lt : sc_rhs.bits < 2 ^ 32)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "pointer Offset out of bounds")) := by
+  obtain ⟨ha, m', hm⟩ := step_binOp_offset_scalar_nonzero_both_ub hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p hrhs_eval hrhs_pos hrhs_lt hptr8
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
-1. Anneal's `stepMirFn` (`Places.lean:2711-2713`) rejects `.disabled` parents
-   and mutable raw reborrows of `.frozen` parents with `MirStepNode.fail .ub`;
-   while
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) steps cleanly
-   via `MemPlace.toRef`, because `&raw (*_p)` in Rust / Miri
-   (`core::ptr::addr_of!` / `addr_of_mut!`) is pure pointer re-tagging /
-   passthrough with **zero** memory or Tree Borrows access. -/
-theorem step_rawPtr_deref_perm_divergence
+/-- **`step_rawPtr_deref_perm_correspondence`** (Stage-1 resolution of the
+spurious Tree Borrows access on `&raw (*_p)`, `step_rawPtr_deref_perm_divergence`):
+in `StateRelLM3_1`-related states where `_p : *(const|mut) T` (`T` primitive
+scalar) holds `.init (.ptr ptrVal 8)` (`e ∈ allocMap`, `e.tag = ptrVal.tag`),
+`_d` is live immediate, and `e.perm = .disabled` or
+`e.perm = .frozen ∧ rawMut = .mut`, executing `_d = &raw rawMut (*_p)` steps
+normally in BOTH machines with no memory or Tree Borrows access (Rust / Miri
+`core::ptr::addr_of!` / `addr_of_mut!` semantics):
+
+1. Anneal's `stepMirFn` stores `.ptr ptrVal 8` in `_d` (it no longer rejects
+   `.disabled` parents or mutable raw reborrows of `.frozen` parents); and
+2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) stores the
+   pointer at `annealStackBaseAddr e.allocId + ptrVal.offsetBytes` with
+   provenance `.concrete e.allocId borTag` via `MemPlace.toRef`.
+
+This relates the stored pointers only; preservation of `StateRelLM3_1` by the
+two steps is not established here. -/
+theorem step_rawPtr_deref_perm_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -17744,18 +17919,19 @@ private theorem scalarOps_unary_ptrMetadata_exactLayout_eq
     Miri.Interpreter.Immediate.toScalarAndMeta, Except.mapError, liftScalarResult,
     bind, EStateM.bind, pure, EStateM.pure, hderef_ok]
 
-/-- **`step_unaryOp_ptrMetadata_thin_rawPtr_divergence`**: in `StateRelLM3_1`
-states where `_p : *(const|mut) T` (`derefPointeeKindHasExactLayout T = true`)
-is initialized (holding either a tracked `.ptr ptrVal 8` — even dangling! — or a
-provenance-less `.scalar sc` such as `0 as *const T`) and `_d : ()` is a live
-immediate local, executing `_d = PtrMetadata((copy|move) _p)` diverges:
-1. Anneal's `stepMirFn` (`Places.lean:2880-2885`) only handles wide
-   `.aggregate 0 ...` pointers and returns `MirStepNode.unsupported` on thin
-   `.ptr` and `.scalar` pointers.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) validates `_p`
-   via `annealDerefValidity` without touching memory and writes the `()` ZST
-   metadata `.uninit` into `_d`. -/
-theorem step_unaryOp_ptrMetadata_thin_rawPtr_divergence
+/-- **`step_unaryOp_ptrMetadata_thin_rawPtr_correspondence`** (Stage-1
+resolution of `step_unaryOp_ptrMetadata_thin_rawPtr_divergence`): in
+`StateRelLM3_1` states where `_p : *(const|mut) T`
+(`derefPointeeKindHasExactLayout T = true`) is initialized (holding either a
+tracked `.ptr ptrVal 8`, even dangling, or a provenance-less `.scalar sc` such as
+`0 as *const T`) and `_d : ()` is a live immediate local, executing
+`_d = PtrMetadata((copy|move) _p)` steps normally in BOTH machines: Anneal's
+`stepMirFn` stores the thin-pointer metadata `.init .unit` in `_d` (previously
+`MirStepNode.unsupported`), and `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`) writes the zero-sized `()` immediate `.uninit` into `_d`.
+This relates the stored results only; preservation of `StateRelLM3_1` is not
+established here. -/
+theorem step_unaryOp_ptrMetadata_thin_rawPtr_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -18028,19 +18204,24 @@ private theorem evalScalarBinOp_cmp_size8_eq
   rcases hbop with rfl | rfl | rfl | rfl | rfl | rfl <;>
     (unfold evalScalarBinOp; rw [hsz₁, hsz₂]; dsimp only [nat_beq_self]; exact ⟨_, rfl⟩)
 
-/-- **`step_rawPtr_cmp_ptr_divergence`**: in `StateRelLM3_1` states where
-`_l : *(const|mut) T` holds a provenance-tracked raw pointer `.init (.ptr ptrVal₁ 8)`
-and `_r : *(const|mut) U` is initialized (holding either `.init (.ptr ptrVal₂ 8)`
-or a provenance-less scalar `.init (.scalar sc₂)` such as `0 as *const U`, e.g.
-`!p.is_null()`), relational comparisons (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`)
+/-- **`step_rawPtr_cmp_ptr_divergence`** (Stage-1 closed the
+`MirStepNode.unsupported` gap; result values remain unrelated): in
+`StateRelLM3_1` states where `_l : *(const|mut) T` holds a provenance-tracked
+raw pointer `.init (.ptr ptrVal₁ 8)` and `_r : *(const|mut) U` is initialized
+(holding either `.init (.ptr ptrVal₂ 8)` or a provenance-less scalar
+`.init (.scalar sc₂)` such as `0 as *const U`, e.g. `!p.is_null()`), relational
+comparisons (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`)
 `_d = bop((copy|move) _l, (copy|move) _r)` into a live immediate `bool` local
-`_d` diverge:
-1. Anneal's `stepMirFn` (`Places.lean:2843-2853`) only handles `.offset` when
-   the LHS is `Value.ptr`, returning `MirStepNode.unsupported` on `Eq..Ge`.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) compares the
-   64-bit unsigned addresses via `Miri.Interpreter.ExecutionScalar.pointerBinary`
-   (`offsetIsAddr = true` on `AnnealProv`) and writes the resulting `bool`
-   immediate into `_d`. -/
+`_d` step normally in BOTH machines:
+
+1. Anneal's `stepMirFn` stores `boolToScalar aRes`, computed on Anneal's
+   canonical address model (`ptrAddressScalar?`: stack places at
+   `(stackLocalAddrPageBase + local) * 65536 + offset`); and
+2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) stores
+   `.fromScalarInt (.ofBool b)`, computed on `annealStackBaseAddr` addresses.
+
+The theorem does NOT relate `aRes` and `b`: agreement of relational comparison
+results across the two address models is a residual (unproven) divergence. -/
 theorem step_rawPtr_cmp_ptr_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -18390,14 +18571,11 @@ theorem step_rawPtr_cmp_ptr_divergence
 provenance-less 8-byte integer scalar `.init (.scalar sc₁)` (such as
 `core::ptr::null()` on the LHS, `null() == p` or `null() < p`) and
 `_r : *(const|mut) U` holds a provenance-tracked raw pointer
-`.init (.ptr ptrVal₂ 8)`:
-1. Anneal's `stepMirFn` (`Places.lean:2837-2854`) only accepts `.scalar` on the
-   RHS when the LHS is `.scalar`, returning `MirStepNode.unsupported` on
-   `(.scalar sc₁, .ptr ptrVal₂ 8)`.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) compares the
-   64-bit unsigned address `sc₁.bits` against `mptr₂.offset.bytes.toNat` via
-   `Miri.Interpreter.ExecutionScalar.pointerBinary` and writes the resulting
-   `bool` immediate into `_d`. -/
+`.init (.ptr ptrVal₂ 8)`: Stage-1 closed the `MirStepNode.unsupported` gap, so
+BOTH machines step normally (Anneal storing `boolToScalar aRes` on its canonical
+address model, `lean-miri` storing `.fromScalarInt (.ofBool b)` on
+`annealStackBaseAddr` addresses), but the theorem does NOT relate `aRes` and
+`b`; result agreement remains a residual (unproven) divergence. -/
 theorem step_rawPtr_cmp_scalar_ptr_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -18617,13 +18795,17 @@ theorem step_rawPtr_cmp_scalar_ptr_divergence
         exact ⟨_, _, bRes, miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt
           hm_ok rfl hloc₂, rfl, by simp [Array.getElem?_set_self]⟩
 
-/-- **`step_cast_ptrToPtr_move_scalar_divergence`**: move-operand counterpart of
-`step_cast_ptrToPtr_scalar_divergence` (`_d = move _s as *(const|mut) V` when
-`_s` holds a provenance-less 8-byte integer scalar `.init (.scalar sc)` such as
-`0 as *const T`): Anneal's `stepMirFn` returns `MirStepNode.unsupported` while
-`lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) deinitializes `_s`
-and stores `.fromScalarInt msc` (`ScalarRel sc msc`) into `_d`. -/
-theorem step_cast_ptrToPtr_move_scalar_divergence
+/-- **`step_cast_ptrToPtr_move_scalar_correspondence`** (Stage-1 resolution of
+`step_cast_ptrToPtr_move_scalar_divergence`): move-operand counterpart of
+`step_cast_ptrToPtr_scalar_correspondence` (`_d = move _s as *(const|mut) V`
+when `_s` holds a provenance-less 8-byte integer scalar `.init (.scalar sc)` such
+as `0 as *const T`): both machines step normally; Anneal's `stepMirFn` stores
+`.init (.scalar sc)` in `_d` (previously `MirStepNode.unsupported`), and
+`lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) deinitializes
+`_s` and stores `.fromScalarInt msc` (`ScalarRel sc msc`) into `_d`. This
+relates the stored results only; preservation of `StateRelLM3_1` is not
+established here. -/
+theorem step_cast_ptrToPtr_move_scalar_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -18801,19 +18983,20 @@ theorem step_cast_ptrToPtr_move_scalar_divergence
       hbb hstmt hm_ok rfl hfr_mid.location_eq, rfl, hrel_sc, by simp [Array.getElem?_set_self]⟩
   · cases h
 
-/-- **`step_binOp_offset_move_scalar_zero_divergence`**: move-operand and
-arbitrary-stride zero-offset counterpart of `step_binOp_offset_scalar_zero_divergence`:
-when `_p : *(const|mut) T` (`derefPointeeKindHasExactLayout T = true`, including
-any stride `{0, 1, 2, 4, 8, 16}`) holds a provenance-less 8-byte integer scalar
+/-- **`step_binOp_offset_move_scalar_zero_correspondence`** (Stage-1 resolution
+of `step_binOp_offset_move_scalar_zero_divergence`): move-operand and
+arbitrary-stride zero-offset counterpart of
+`step_binOp_offset_scalar_zero_correspondence`: when `_p : *(const|mut) T`
+(`derefPointeeKindHasExactLayout T = true`, including any stride
+`{0, 1, 2, 4, 8, 16}`) holds a provenance-less 8-byte integer scalar
 `.init (.scalar sc_p)` (such as `0 as *const u64`) and `rhsOp` evaluates to `0`
-after moving `_p`, `_d = Offset(move _p, rhsOp)` diverges:
-1. Anneal's `stepMirFn` dispatches `evalScalarBinOp .offset` on `.scalar sc_p`
-   and returns `MirStepNode.unsupported`.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) deinitializes
-   `_p`, succeeds on `0 * stride = 0` via `ptrOffsetInbounds_zero_ok`, and
-   stores the provenance-less 8-byte pointer scalar `msc_out`
-   (`ScalarRel ⟨(UInt64.ofNat sc_p.bits).toNat, 8⟩ msc_out`) into `_d`. -/
-theorem step_binOp_offset_move_scalar_zero_divergence
+after moving `_p`, executing `_d = Offset(move _p, rhsOp)` steps normally in
+BOTH machines: Anneal's `stepMirFn` stores `sc_p` unchanged in `_d` (previously
+`MirStepNode.unsupported`), and `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`) stores `msc_out` with `ScalarRel sc_p msc_out`. This relates
+the stored results only; preservation of `StateRelLM3_1` is not established
+here. -/
+theorem step_binOp_offset_move_scalar_zero_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -19069,18 +19252,10 @@ theorem step_binOp_offset_move_scalar_zero_divergence
       exact ⟨ha_step, _, _, msc_out, miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq
         hbb hstmt hm_ok rfl hloc₂, rfl, hrel_out, by simp [Array.getElem?_set_self]⟩
 
-/-- **`step_binOp_offset_move_scalar_nonzero_divergence`**: move-operand
-counterpart of `step_binOp_offset_scalar_nonzero_divergence`: in `StateRelLM3_1`
-states where `_p : *(const|mut) (u8|i8)` holds a provenance-less 8-byte integer
-scalar `.init (.scalar sc_p)` (such as `0 as *const u8`) and `rhsOp` evaluates to
-a non-zero offset `sc_r` (`0 < sc_r.bits < 2 ^ 32`) after moving `_p`, executing
-`_d = Offset(move _p, rhsOp)` diverges:
-1. Anneal's `stepMirFn` dispatches `evalScalarBinOp .offset` on `.scalar sc_p`
-   and returns `MirStepNode.unsupported`.
-2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) deinitializes
-   `_p` and reports `StepError.undefinedBehavior "pointer Offset out of bounds"`
-   via `ptrOffsetInbounds_withoutProvenance_err`. -/
-theorem step_binOp_offset_move_scalar_nonzero_divergence
+/-- Both-UB core of `step_binOp_offset_move_scalar_nonzero_simulation`: Anneal's `stepMirFn` fails with `.ub` and
+`lean-miri`'s `Miri.Interpreter.Step.step` reports the stated
+`StepError.undefinedBehavior`. -/
+private theorem step_binOp_offset_move_scalar_nonzero_both_ub
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_1 body s m allocMap)
@@ -19230,6 +19405,53 @@ theorem step_binOp_offset_move_scalar_nonzero_divergence
         unfold evalStmt; dsimp only []; rw [hrv_ub]
       exact ⟨ha_ub, _, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq
         hbb hstmt hm_err⟩
+
+/-- **`step_binOp_offset_move_scalar_nonzero_simulation`** (Stage-1 upgrade of
+`step_binOp_offset_move_scalar_nonzero_divergence`): move-operand counterpart of
+`step_binOp_offset_scalar_nonzero_simulation`: in `StateRelLM3_1` states where
+`_p : *(const|mut) (u8|i8)` holds a provenance-less 8-byte integer scalar
+`.init (.scalar sc_p)` (such as `0 as *const u8`) and `rhsOp` evaluates to a
+non-zero offset `sc_r` (`0 < sc_r.bits < 2 ^ 32`) after moving `_p`, executing
+`_d = Offset(move _p, rhsOp)` raises undefined behavior in BOTH machines
+(`StepRelLM3_1.ub`): Anneal's `stepMirFn` fails with `MirStepNode.fail .ub`
+(previously `MirStepNode.unsupported`), and `lean-miri`'s
+`Miri.Interpreter.Step.step` (`annealStepHooks`) deinitializes `_p` and reports
+`StepError.undefinedBehavior "pointer Offset out of bounds"`. -/
+theorem step_binOp_offset_move_scalar_nonzero_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (.move ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl : LocalDecl} {ptrMut : Mutability} {pointeeKind : RigidTy}
+    {rhsTy : Ty} {sc_p sc_r : MirAst.ScalarInt} {locals_r : List LocalSlot}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hpt : pointeeKind = .uint .u8 ∨ pointeeKind = .int .i8)
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame rhsOp rhsTy)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.scalar sc_p)))
+    (ha_rhs : evalOperand (s.frame.locals.set ptrIdx .uninit) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+      .ok (.scalar sc_r) locals_r)
+    (hrhs_pos : 0 < sc_r.bits)
+    (hrhs_lt : sc_r.bits < 2 ^ 32)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "pointer Offset out of bounds")) := by
+  obtain ⟨ha, m', hm⟩ := step_binOp_offset_move_scalar_nonzero_both_ub hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p ha_rhs hrhs_pos hrhs_lt hptr8
+  exact ⟨by rw [ha, hm]; exact .ub m' _, ha, m', hm⟩
 
 /-- Observation- and raw-pointer-return-aware one-step outcome correspondence
 extending `StepRelLM3_1` to:
