@@ -6798,6 +6798,90 @@ theorem decodeScalarLayoutBytes_toScalarLayout_bits64_ptr_eq
     cases ty <;> first | contradiction | (cases prov <;> rfl)
 
 /--
+Exact value-level characterization of the provenance-faithful
+`decodeScalarLayoutBytesNoForge (ty.toScalarLayout .bits64)` for pointer scalar
+descriptors (`ty.isPtr = true`, i.e., `rawPtr` and `refPtr`) on any 8-byte encoding
+`encodeLittleEndianBytes bits 8 prov`:
+- When `prov = some (allocId, tag)` (intact provenance across all 8 bytes), both `rawPtr`
+  and `refPtr` decode to `some (.ptr { allocId := allocId, offsetBytes := bits } 8)`.
+- When `prov = none` (provenance-free bytes), `decodeScalarLayoutBytesNoForge` never
+  fabricates the page-model pointer `addressToPtr bits`: it decodes to the provenance-less
+  scalar `some (.scalar ⟨bits, 8⟩)` (`= some ((CastVal.ptr ⟨0, bits⟩ none).toTrustedValue .bits64 ty)`)
+  iff `ty.isValidBits .bits64 bits = true` (always for `rawPtr`; `0 < bits` for `refPtr`),
+  and returns `none` when `bits = 0` at `refPtr`.
+-/
+theorem decodeScalarLayoutBytesNoForge_toScalarLayout_bits64_ptr_eq
+    (ty : ScalarTy) (bits : Nat) (prov : Option (Nat × Nat))
+    (h_ptr : ty.isPtr = true)
+    (h_bits : bits < scalarModulus (ty.sizeBytes .bits64)) :
+    decodeScalarLayoutBytesNoForge (ty.toScalarLayout .bits64)
+        (encodeLittleEndianBytes bits (ty.sizeBytes .bits64) prov) =
+      match prov with
+      | some (allocId, _) =>
+        some (.ptr { allocId := allocId, offsetBytes := bits } 8)
+      | none =>
+        match ty.isValidBits .bits64 bits with
+        | true => some (.scalar ⟨bits, 8⟩)
+        | false => none := by
+  have hSz8 : ty.sizeBytes .bits64 = 8 := ScalarTy.sizeBytes_of_isPtr .bits64 ty h_ptr
+  have hBits8 : bits < scalarModulus 8 := hSz8 ▸ h_bits
+  have hLen :
+      Trusted.Sequence.length (encodeLittleEndianBytes bits (ty.sizeBytes .bits64) prov) =
+        ty.sizeBytes .bits64 :=
+    trusted_length_encodeLittleEndianBytes bits _ prov
+  have hBeq :
+      Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits (ty.sizeBytes .bits64) prov))
+        (ty.sizeBytes .bits64) = true := by
+    rw [hLen]; exact Nat.beq_refl _
+  have hDec :
+      decodeScalarBytes (encodeLittleEndianBytes bits (ty.sizeBytes .bits64) prov) false =
+        some (⟨bits, ty.sizeBytes .bits64⟩, prov) :=
+    trusted_decodeScalarBytes_encodeLittleEndianBytes _ bits prov false
+      (ScalarTy.sizeBytes_pos .bits64 ty) h_bits
+  have hNe : ty ≠ .char := by
+    intro hC; subst hC; nomatch h_ptr
+  have hIff := scalarTy_isValidBits_iff_validRange_of_ne_char .bits64 ty bits hNe
+  have hUniSome : ∀ allocId tag,
+      abstractBytesUniformProv
+        (encodeLittleEndianBytes bits (ty.sizeBytes .bits64) (some (allocId, tag))) = true := by
+    intro allocId tag
+    rw [hSz8]
+    exact trusted_abstractBytesUniformProv_encodeLittleEndianBytes_some allocId tag bits 7
+  unfold decodeScalarLayoutBytesNoForge
+  rw [ScalarTy.scalarLayoutByteWidth_toScalarLayout_bits64 ty]
+  dsimp only [ScalarTy.toScalarLayout]
+  rw [hBeq]
+  have hW_iff :
+      (match wrappingRangeContains (ty.toValidRange .bits64) bits with
+       | true => some (.scalar ⟨bits, ty.sizeBytes .bits64⟩)
+       | false => none : Option Value) =
+        match ty.isValidBits .bits64 bits with
+        | true => some (.scalar ⟨bits, 8⟩)
+        | false => none := by
+    rw [hSz8]
+    cases hW : wrappingRangeContains (ty.toValidRange .bits64) bits
+    · have hF : ty.isValidBits .bits64 bits = false := by
+        apply Bool.eq_false_iff.mpr
+        intro ht
+        rw [hIff.mp ht] at hW
+        nomatch hW
+      rw [hF]
+    · have hT : ty.isValidBits .bits64 bits = true := hIff.mpr hW
+      rw [hT]
+  cases ty <;> first | contradiction | skip
+  all_goals
+    dsimp only [ScalarTy.toPrimitiveKind]
+    rw [hDec]
+    dsimp only
+    cases prov with
+    | some pv =>
+      rcases pv with ⟨allocId, tag⟩
+      rw [hUniSome allocId tag, hSz8]
+    | none =>
+      rw [trusted_abstractBytesUniformProv_encodeLittleEndianBytes_none]
+      exact hW_iff
+
+/--
 Unified value-level agreement between `decodeScalarLayoutBytes (ty.toScalarLayout .bits64)`
 and `decodeValueFromBytes` on provenance-free bytes (`prov = none`) for **all** `ty ≠ .char`
 (both non-pointer scalars `bool`, `int`, `uint` AND pointer descriptors `rawPtr`, `refPtr`
@@ -6827,12 +6911,13 @@ theorem decodeScalarLayoutBytes_toScalarLayout_bits64_eq_decodeValueFromBytes_of
           (trusted_decodeScalarBytes_encodeLittleEndianBytes 8 bits none false (by decide) hBits8)]
 
 /--
-**Divergence (`char` surrogate gap).** `rustc`'s `char` scalar layout records
-only `valid_range: 0..=0x10FFFF`, so on 64-bit targets the scalar-layout
-decoder at `ScalarTy.char.toScalarLayout .bits64` accepts a 4-byte candidate
-iff it is a valid `char` **or** a UTF-16 surrogate in `0xD800..=0xDFFF`.
-`ScalarTy.isValidBits` and `Trusted.decodeValueFromBytes` at `RigidTy.char`
-both reject surrogates; the surrogate `0xD800` (`55296`) witnesses the gap.
+**Legacy-decoder divergence (`char` surrogate gap).** `rustc`'s `char` scalar layout records
+only `valid_range: 0..=0x10FFFF`, so on 64-bit targets the layout-free scalar-layout
+decoder `decodeScalarLayoutBytes` at `ScalarTy.char.toScalarLayout .bits64` accepts a 4-byte
+candidate iff it is a valid `char` **or** a UTF-16 surrogate in `0xD800..=0xDFFF`.
+`ScalarTy.isValidBits`, `Trusted.decodeValueFromBytes` at `RigidTy.char`, and the executed
+`decodeScalarLayoutBytesNoForge` (`decodeScalarLayoutBytesNoForge_char_layout_surrogate_agreement`)
+all reject surrogates; the surrogate `0xD800` (`55296`) witnesses the legacy gap.
 -/
 theorem decodeScalarLayoutBytes_char_layout_surrogate_divergence
     (layouts : LayoutTable) (lIdx : LayoutIdx) (bits : Nat) (prov : Option (Nat × Nat))
@@ -6861,6 +6946,70 @@ theorem decodeScalarLayoutBytes_char_layout_surrogate_divergence
   · rintro (⟨hLe, _⟩ | ⟨_, hHi⟩)
     · exact hLe
     · omega
+
+/--
+**Executed-decoder agreement (`char` surrogate rejection on `decodeScalarLayoutBytesNoForge`).**
+Unlike the legacy `decodeScalarLayoutBytes`, `Trusted`'s `decodeScalarLayoutBytesNoForge`
+(used by `decodeTypedValueFromBytes` on `.primitive` and single-field scalar-wrapper `char`
+layouts) checks `isValidCharCode` whenever a 4-byte integer scalar layout has `validRange =
+0..=0x10FFFF`. On provenance-free 4-byte candidates `bits < scalarModulus 4`,
+`decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)` therefore agrees
+with `ScalarTy.char.isValidBits .bits64 bits` and `decodeValueFromBytes` at `RigidTy.char`,
+rejecting `0xD800` (`55296`) and every UTF-16 surrogate in `55296..=57343`.
+-/
+theorem decodeScalarLayoutBytesNoForge_char_layout_surrogate_agreement
+    (layouts : LayoutTable) (lIdx : LayoutIdx) (bits : Nat)
+    (h_bits : bits < scalarModulus 4) :
+    decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)
+        (encodeLittleEndianBytes bits 4 none) =
+      (match ScalarTy.char.isValidBits .bits64 bits with
+       | true => some (.scalar ⟨bits, 4⟩)
+       | false => none) ∧
+    ((∃ v, decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)
+        (encodeLittleEndianBytes bits 4 none) = some v) ↔
+      ScalarTy.char.isValidBits .bits64 bits = true) ∧
+    decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)
+        (encodeLittleEndianBytes 55296 4 none) = none ∧
+    decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)
+        (encodeLittleEndianBytes bits 4 none) =
+      decodeValueFromBytes defaultCodecFuel layouts { kind := .char, layoutIdx := lIdx }
+        (encodeLittleEndianBytes bits 4 none) := by
+  have hNoForge := trusted_decodeScalarLayoutBytesNoForge_int_encode 32 false ⟨0, 1114111⟩ 4 bits
+    rfl (by decide) h_bits
+  have hInRange : Bool.not (Nat.ble (scalarModulus 4) bits) = true :=
+    (ScalarTy.not_ble_iff_lt (scalarModulus 4) bits).mpr h_bits
+  have hValidEq :
+      scalarLayoutNoForgeValid ⟨0, 1114111⟩ 4 bits = ScalarTy.char.isValidBits .bits64 bits := by
+    have hIsValid : ScalarTy.char.isValidBits .bits64 bits = isValidCharCode bits := by
+      unfold ScalarTy.isValidBits
+      dsimp only [ScalarTy.sizeBytes]
+      rw [hInRange, Bool.true_and]
+    rw [hIsValid]
+    unfold scalarLayoutNoForgeValid
+    cases hW : wrappingRangeContains ⟨0, 1114111⟩ bits
+    · apply (Bool.eq_false_iff.mpr ?_).symm
+      intro hChar
+      have hRange := (isValidCharCode_iff bits).mp hChar
+      have hLe : bits ≤ 1114111 := by omega
+      rw [(wrappingRangeContains_zero_max_iff 1114111 bits).mpr hLe] at hW
+      nomatch hW
+    · rfl
+  have hEq :
+      decodeScalarLayoutBytesNoForge (ScalarTy.char.toScalarLayout .bits64)
+          (encodeLittleEndianBytes bits 4 none) =
+        (match ScalarTy.char.isValidBits .bits64 bits with
+         | true => some (.scalar ⟨bits, 4⟩)
+         | false => none) := by
+    change decodeScalarLayoutBytesNoForge (.initialized (.int 32 false) ⟨0, 1114111⟩)
+        (encodeLittleEndianBytes bits 4 none) = _
+    rw [hNoForge, hValidEq]
+  have hDecChar := trusted_decodeValueFromBytes_scalar 15 layouts .not .bool .char lIdx bits rfl
+    h_bits
+  refine ⟨hEq, ?_, rfl, ?_⟩
+  · rw [hEq]
+    cases ScalarTy.char.isValidBits .bits64 bits <;> simp
+  · rw [hEq, show defaultCodecFuel = 15 + 1 from rfl]
+    exact hDecChar.symm
 
 /-! ### 8.2 `ProvenanceFrag` Codec & `BitValidity` Byte-Sequence Bridge -/
 
@@ -7296,7 +7445,10 @@ theorem trusted_vs_anneal_overwrite_provenance_no_forge_agreement
       some ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
         .bits64 .rawPtr) ∧
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .ref m pt, layoutIdx := lIdx } tBytes =
-      none := by
+      none ∧
+    decodeScalarLayoutBytesNoForge (ScalarTy.rawPtr.toScalarLayout .bits64) tBytes =
+      some ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) := by
   intro bytes tBytes
   have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
   have hLenT : Trusted.Sequence.length tBytes = 8 := by
@@ -7366,18 +7518,98 @@ theorem trusted_vs_anneal_overwrite_provenance_no_forge_agreement
         injection hj3 with hja _
         exact absurd (hfa.trans hja.symm) hNeA
   have hBeq : Nat.beq (Trusted.Sequence.length tBytes) 8 = true := by rw [hLenT]; rfl
-  refine ⟨hAnneal, ?_, ?_⟩
+  have hScLayout :
+      decodeScalarLayoutBytesNoForge (ScalarTy.rawPtr.toScalarLayout .bits64) tBytes =
+        some ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+          .bits64 .rawPtr) := by
+    have hRange : wrappingRangeContains ⟨0, scalarModulus 8 - 1⟩ (decodeCastIntBytes bytes) = true := by
+      have hLt := decodeCastIntBytes_lt bytes
+      rw [hLenB] at hLt
+      exact (wrappingRangeContains_zero_max_iff (scalarModulus 8 - 1) _).mpr (by omega)
+    unfold decodeScalarLayoutBytesNoForge
+    dsimp only [ScalarTy.toScalarLayout, ScalarTy.toPrimitiveKind, ScalarTy.toValidRange,
+      ScalarTy.sizeBytes, PtrWidth.byteSize, scalarLayoutByteWidth, primitiveKindByteWidth]
+    rw [hBeq, hDec, hUni]
+    dsimp only
+    rw [hRange]
+    rfl
+  refine ⟨hAnneal, ?_, ?_, hScLayout⟩
   · rw [trusted_decodeTypedValueFromBytes_rawPtr_eq, trusted_decodePtrBytesNoForge_thin_eq _ pt _ _
       h_thin, h_pw, hBeq, hDec, hUni]
     rfl
   · rw [trusted_decodeTypedValueFromBytes_ref_eq, trusted_decodePtrBytesNoForge_thin_eq _ pt _ _
       h_thin, h_pw, hBeq, hDec, hUni]
 
+/-- Step-level `evalByteCast` / `evalRvalue (.cast .transmute ...)` provenance no-forge agreement
+under any single-byte overwrite: whenever an operand `op` of a resolved 8-byte source type `srcTy`
+(such as a union or byte-array source) encodes via `encodeByteCastSourceBytes` to the partially
+overwritten pointer image `tBytes`, `evalByteCast` at any thin raw-pointer target produces the
+provenance-less address `.scalar ⟨decodeCastIntBytes bytes, 8⟩` (the exact `Trusted` image of
+Anneal's `decodeCastVal .bits64 .rawPtr bytes`), and `evalByteCast` at any thin reference target
+returns `.ub`. -/
+theorem trusted_evalByteCast_overwrite_provenance_no_forge_agreement
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcTy : Ty) (v : Value) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (off : Nat) (optAlloc : Option Nat) (i : Nat) (b : CastByte)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_i : i < 8)
+    (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok v locals')
+    (h_ty : operandTy localDecls layouts op = some srcTy)
+    (h_src_sz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts srcTy) =
+      some 8)
+    (h_enc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls localDecls layouts srcTy) v =
+      some (((encodeCastBytes off 8 optAlloc).set i b).map CastByte.toTrustedAbstractByte)) :
+    let bytes := (encodeCastBytes off 8 optAlloc).set i b
+    evalByteCast locals op { kind := .rawPtr m pt, layoutIdx := lIdx } mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals' mem ∧
+    evalRvalue locals (.cast .transmute op { kind := .rawPtr m pt, layoutIdx := lIdx })
+        mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals' mem ∧
+    evalByteCast locals op { kind := .ref m pt, layoutIdx := lIdx } mem localDecls layouts = ub ∧
+    evalRvalue locals (.cast .transmute op { kind := .ref m pt, layoutIdx := lIdx })
+        mem localDecls layouts = ub := by
+  intro bytes
+  let tBytes := bytes.map CastByte.toTrustedAbstractByte
+  have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
+  have hLenT : Trusted.Sequence.length tBytes = 8 := by
+    change (bytes.map CastByte.toTrustedAbstractByte).length = 8
+    rw [List.length_map, hLenB]
+  have hRawDec := fun li =>
+    (trusted_vs_anneal_overwrite_provenance_no_forge_agreement 15 layouts m pt li off optAlloc i b
+      h_pw h_thin h_i h_b).2.1
+  have hRefDec := fun li =>
+    (trusted_vs_anneal_overwrite_provenance_no_forge_agreement 15 layouts m pt li off optAlloc i b
+      h_pw h_thin h_i h_b).2.2.1
+  have hRaw :
+      evalByteCast locals op { kind := .rawPtr m pt, layoutIdx := lIdx } mem localDecls layouts =
+        ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+          .bits64 .rawPtr) locals' mem := by
+    rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts v srcTy
+        { kind := .rawPtr m pt, layoutIdx := lIdx } 8 tBytes h_op
+        (trusted_tyByteSize_resolve_thin_rawPtr localDecls layouts m pt lIdx h_thin) h_ty h_src_sz
+        h_enc hLenT,
+      trusted_resolveTyWithLocalDecls_mk, show defaultCodecFuel = 15 + 1 from rfl, hRawDec]
+  have hRef :
+      evalByteCast locals op { kind := .ref m pt, layoutIdx := lIdx } mem localDecls layouts = ub := by
+    rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts v srcTy
+        { kind := .ref m pt, layoutIdx := lIdx } 8 tBytes h_op
+        (trusted_tyByteSize_resolve_thin_ref localDecls layouts m pt lIdx h_thin) h_ty h_src_sz
+        h_enc hLenT,
+      trusted_resolveTyWithLocalDecls_mk, show defaultCodecFuel = 15 + 1 from rfl, hRefDec]
+  exact ⟨hRaw, hRaw, hRef, hRef⟩
+
 /-- Pairing for `trusted_vs_anneal_partial_overwrite_provenance_divergence` (byte `1` overwritten
 with a provenance-free byte): the executed decoder `decodeTypedValueFromBytes` decodes the very same
 `Trusted` bytes at a thin raw pointer to the provenance-less address
-`.scalar ⟨decodeCastIntBytes annealOverwritten, 8⟩`, the exact `Trusted` image of Anneal's
-`decodeCastVal` result, instead of the provenance-retaining pointer of the legacy decoder. -/
+`.scalar ⟨decodeCastIntBytes annealOverwritten, 8⟩` (the exact `Trusted` image of Anneal's
+`decodeCastVal` result, instead of the provenance-retaining pointer of the legacy decoder), and
+rejects the overwritten image at every thin reference type. -/
 theorem trusted_vs_anneal_partial_overwrite_provenance_agreement
     (fuel : Nat) (layouts : LayoutTable) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
     (p : ProvenancePtr) (d : UInt8)
@@ -7388,6 +7620,8 @@ theorem trusted_vs_anneal_partial_overwrite_provenance_agreement
       (encodeCastBytes p.offsetBytes 8 (some p.allocId)).set 1 { data := d, prov := none }
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .rawPtr m pt, layoutIdx := lIdx }
         trustedOverwritten = some (.scalar ⟨decodeCastIntBytes annealOverwritten, 8⟩) ∧
+    decodeTypedValueFromBytes (fuel + 1) layouts { kind := .ref m pt, layoutIdx := lIdx }
+        trustedOverwritten = none ∧
     decodeCastVal .bits64 .rawPtr annealOverwritten =
       some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes annealOverwritten } none) := by
   intro trustedOverwritten annealOverwritten
@@ -7398,11 +7632,11 @@ theorem trusted_vs_anneal_partial_overwrite_provenance_agreement
   have h := trusted_vs_anneal_overwrite_provenance_no_forge_agreement fuel layouts m pt lIdx
     p.offsetBytes (some p.allocId) 1 { data := d, prov := none } h_pw h_thin (by decide) (Or.inl rfl)
   rw [hMap]
-  exact ⟨h.2.1, h.1⟩
+  exact ⟨h.2.1, h.2.2.1, h.1⟩
 
 /-- Pairing for `trusted_vs_anneal_head_none_overwrite_provenance_divergence` (byte `0` overwritten
-with a provenance-free byte): the executed decoder yields the provenance-less address, exactly the
-`Trusted` image of Anneal's result. -/
+with a provenance-free byte): the executed decoder yields the provenance-less address at a thin raw
+pointer (exactly the `Trusted` image of Anneal's result) and rejects the image at a thin reference. -/
 theorem trusted_vs_anneal_head_none_overwrite_provenance_agreement
     (fuel : Nat) (layouts : LayoutTable) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
     (p : ProvenancePtr) (d : UInt8)
@@ -7413,6 +7647,8 @@ theorem trusted_vs_anneal_head_none_overwrite_provenance_agreement
       (encodeCastBytes p.offsetBytes 8 (some p.allocId)).set 0 { data := d, prov := none }
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .rawPtr m pt, layoutIdx := lIdx }
         trustedCorrupted = some (.scalar ⟨decodeCastIntBytes annealCorrupted, 8⟩) ∧
+    decodeTypedValueFromBytes (fuel + 1) layouts { kind := .ref m pt, layoutIdx := lIdx }
+        trustedCorrupted = none ∧
     decodeCastVal .bits64 .rawPtr annealCorrupted =
       some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes annealCorrupted } none) := by
   intro trustedCorrupted annealCorrupted
@@ -7423,12 +7659,12 @@ theorem trusted_vs_anneal_head_none_overwrite_provenance_agreement
   have h := trusted_vs_anneal_overwrite_provenance_no_forge_agreement fuel layouts m pt lIdx
     p.offsetBytes (some p.allocId) 0 { data := d, prov := none } h_pw h_thin (by decide) (Or.inl rfl)
   rw [hMap]
-  exact ⟨h.2.1, h.1⟩
+  exact ⟨h.2.1, h.2.2.1, h.1⟩
 
 /-- Pairing for `trusted_vs_anneal_foreign_first_byte_provenance_forging` (byte `0` overwritten with
 a byte carrying a *foreign* allocation's provenance): the executed decoder does **not** produce a
-pointer into the foreign allocation `q.allocId`; it yields the provenance-less address, exactly the
-`Trusted` image of Anneal's result. -/
+pointer into the foreign allocation `q.allocId`; it yields the provenance-less address at a thin raw
+pointer (the exact `Trusted` image of Anneal's result) and rejects the image at a thin reference. -/
 theorem trusted_vs_anneal_foreign_first_byte_no_forge_agreement
     (fuel : Nat) (layouts : LayoutTable) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
     (p q : ProvenancePtr) (d : UInt8)
@@ -7442,6 +7678,8 @@ theorem trusted_vs_anneal_foreign_first_byte_no_forge_agreement
         { data := d, prov := some { allocId := q.allocId, position := 0 } }
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .rawPtr m pt, layoutIdx := lIdx }
         trustedForged = some (.scalar ⟨decodeCastIntBytes annealForged, 8⟩) ∧
+    decodeTypedValueFromBytes (fuel + 1) layouts { kind := .ref m pt, layoutIdx := lIdx }
+        trustedForged = none ∧
     decodeCastVal .bits64 .rawPtr annealForged =
       some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes annealForged } none) := by
   intro trustedForged annealForged
@@ -7453,7 +7691,7 @@ theorem trusted_vs_anneal_foreign_first_byte_no_forge_agreement
     p.offsetBytes (some p.allocId) 0 { data := d, prov := some { allocId := q.allocId, position := 0 } }
     h_pw h_thin (by decide) (Or.inr ⟨_, p.allocId, rfl, rfl, h_ne⟩)
   rw [hMap]
-  exact ⟨h.2.1, h.1⟩
+  exact ⟨h.2.1, h.2.2.1, h.1⟩
 
 /-- Converse of `trusted_abstractBytesAllProvAux_mem`. -/
 theorem trusted_abstractBytesAllProvAux_of_mem (a t : Nat) :
@@ -9405,16 +9643,18 @@ theorem trusted_decodeTypedValueFromBytes_adt_newtype_eq
 
 /--
 **`try_transmute` into a single-field scalar-wrapper newtype ADT (`FieldsShape.arbitrary [⟨0⟩]`) at the `Trusted` step level.**
-For a scalar-niche wrapper decoded on the backend scalar path (`.adt defPath []` with
-`l.fieldLayouts = []` and a resolved, non-zero layout index), `decodeValueFromBytes` succeeds
-(producing `.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]`) iff
-`wrappingRangeContains validRange bits = true`, and `Trusted.MirSemantics.evalByteCast` (for every
-caller `localDecls`) succeeds with the same value iff `scalarLayoutNoForgeValid validRange _ bits`
-— the same valid-range check, strengthened by `char` validity only for a 4-byte layout whose valid
-range is exactly `0..=0x10FFFF` (`scalarLayoutNoForgeValid_eq_of_not_charRange`) — and is `ub`
-otherwise. A monomorphized generic wrapper such as `NonZero<u32>` (type arguments `[u32]`) is
-decoded by `decodeValueFromBytes` at its type argument instead, where it does not enforce the niche
-(`adt_generic_nonZero_typeArg_path_niche_unenforced`).
+For a scalar-niche wrapper with `l.fieldLayouts = []` and a resolved, non-zero layout index:
+1. On empty type arguments (`.adt defPath []`), the layout-free `decodeValueFromBytes` succeeds
+   (producing `.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]`) iff
+   `wrappingRangeContains validRange bits = true`, and otherwise returns `none` (on a monomorphized
+   generic wrapper with a single type argument `[T]` the layout-free decoder takes its type-argument
+   branch instead, `adt_generic_nonZero_typeArg_path_niche_unenforced`).
+2. `Trusted.MirSemantics.evalByteCast` (which decodes via `decodeTypedValueFromBytes` and ignores
+   generic type arguments `args`) succeeds for **every** `args : List RigidTy` and every caller
+   `localDecls` with `.ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem`
+   iff `scalarLayoutNoForgeValid validRange _ bits` — the same valid-range check, strengthened by
+   `char` validity only for a 4-byte layout whose valid range is exactly `0..=0x10FFFF`
+   (`scalarLayoutNoForgeValid_eq_of_not_charRange`) — and is `ub` otherwise.
 -/
 theorem tryTransmute_adt_newtype_scalarLayout_eq
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
@@ -9444,10 +9684,12 @@ theorem tryTransmute_adt_newtype_scalarLayout_eq
       (match wrappingRangeContains validRange bits with
        | true => some (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩])
        | false => none) ∧
-    evalByteCast locals op dstTy mem localDecls layouts =
-      (match scalarLayoutNoForgeValid validRange (src.sizeBytes .bits64) bits with
-       | true => ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem
-       | false => ub) := by
+    (∀ args : List RigidTy,
+      evalByteCast locals op { kind := .adt defPath args, layoutIdx := dstLIdx } mem localDecls
+          layouts =
+        (match scalarLayoutNoForgeValid validRange (src.sizeBytes .bits64) bits with
+         | true => ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem
+         | false => ub)) := by
   intro dstTy
   have hNz : Nat.beq l.size.bytes 0 = false := by
     rw [hLSz]
@@ -9470,30 +9712,34 @@ theorem tryTransmute_adt_newtype_scalarLayout_eq
   have hPos : 0 < l.size.bytes := by
     rw [hLSz]
     exact ScalarTy.sizeBytes_pos .bits64 src
-  have hTyped := trusted_decodeTypedValueFromBytes_adt_newtype_eq 15 layouts defPath [] dstLIdx l
+  refine ⟨hDec, fun args => ?_⟩
+  have hTyped := trusted_decodeTypedValueFromBytes_adt_newtype_eq 15 layouts defPath args dstLIdx l
     variantIdx bitsWidth memoryOrder signed validRange bits hLookup hInhab hVar hFields
     hNoFieldLayouts hRepr hWidth hPos hBits
   rw [hLSz] at hTyped
-  refine ⟨hDec, ?_⟩
   rw [trusted_evalByteCast_scalar_to_adt_eq locals locals' op mem localDecls layouts m pointee src
-    srcLIdx defPath [] dstLIdx l bits hSrcNp hValid hDstLIdx hLookup hValidAdt hLSz hOp hTy,
+    srcLIdx defPath args dstLIdx l bits hSrcNp hValid hDstLIdx hLookup hValidAdt hLSz hOp hTy,
     show defaultCodecFuel = 15 + 1 from rfl, hTyped]
   cases scalarLayoutNoForgeValid validRange (src.sizeBytes .bits64) bits <;> rfl
 
 /--
 **`NonZero*` single-field newtype (`FieldsShape.arbitrary [⟨0⟩]`) niche validation at the `Trusted` step level.**
 Transmuting a valid same-width non-pointer scalar into a `NonZero*`-style newtype layout
-(`validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`) decoded on the backend scalar path
-(`.adt defPath []`, `l.fieldLayouts = []`) with `Trusted.MirSemantics.evalByteCast`
+(`validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`, `l.fieldLayouts = []`, resolved non-zero layout
+index) at `{ kind := .adt defPath args, layoutIdx := dstLIdx }` with `Trusted.MirSemantics.evalByteCast`
 succeeds with `ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem`
-iff `0 < bits`, and is `ub` iff `bits = 0`. On the type-argument path of a generic wrapper the
-niche is not enforced (`adt_generic_nonZero_typeArg_path_niche_unenforced`).
+iff `0 < bits`, and is `ub` iff `bits = 0`, for **every** `args : List RigidTy` (including
+monomorphized generic wrappers such as `NonZero<u32>` with `args = [.uint .u32]`). Unlike the
+legacy layout-free `decodeValueFromBytes` (`adt_generic_nonZero_typeArg_path_niche_unenforced`),
+`decodeTypedValueFromBytes` never treats generic type arguments as field types, so it enforces the
+`l.backendRepr` scalar niche regardless of `args`
+(`trusted_evalByteCast_generic_nonZero_enforces_niche_vs_legacy_decoder`).
 -/
 theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (m : Mutability) (pointee : RigidTy) (src : ScalarTy) (srcLIdx : LayoutIdx)
-    (defPath : DefPath) (dstLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx : LayoutIdx)
     (l : TypeLayout) (variantIdx bitsWidth bits : Nat) (memoryOrder : List Nat) (signed : Bool)
     (hSrcNp : src.isPtr = false)
     (hValid : src.validBits .bits64 bits)
@@ -9512,7 +9758,7 @@ theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
       .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
     (hTy : operandTy localDecls layouts op =
       some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
-    let dstTy : Ty := { kind := .adt defPath [], layoutIdx := dstLIdx }
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
     (evalByteCast locals op dstTy mem localDecls layouts =
       ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem ↔ 0 < bits) ∧
     (evalByteCast locals op dstTy mem localDecls layouts = ub ↔ bits = 0) := by
@@ -9520,7 +9766,7 @@ theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
   have hBc := (tryTransmute_adt_newtype_scalarLayout_eq locals locals' op mem localDecls layouts
     m pointee src srcLIdx defPath dstLIdx l variantIdx bitsWidth bits memoryOrder signed
     ⟨1, scalarModulus l.size.bytes - 1⟩ hSrcNp hValid hDstLIdx hLookup hInhab hVar hFields
-    hNoFieldLayouts hRepr hLSz hWidth hOp hTy).2
+    hNoFieldLayouts hRepr hLSz hWidth hOp hTy).2 args
   rw [scalarLayoutNoForgeValid_eq_of_not_charRange _ _ _ (by simp)] at hBc
   have hPos : 0 < l.size.bytes := by
     rw [hLSz]
@@ -9538,6 +9784,70 @@ theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
     simp
   · have hPosB : 0 < bits := (hIff.mp hW).1
     simp [hPosB, show bits ≠ 0 by omega]
+
+/--
+**Executed `evalByteCast` / `decodeTypedValueFromBytes` vs. legacy `decodeValueFromBytes` on
+monomorphized generic `NonZero<u32>` (`{ kind := .adt defPath [.uint .u32], layoutIdx := dstLIdx }`).**
+On a 4-byte single-field `NonZero<u32>` layout (`l.fieldLayouts = []`,
+`l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, 2^32 - 1⟩)`):
+1. The layout-free `decodeValueFromBytes` and `checkFromBytes` inspect the generic type argument
+   `[.uint .u32]` instead of `l.backendRepr`, accepting `zeroInitBytes 4` and certifying `FromBytes`
+   (`adt_generic_nonZero_typeArg_path_niche_unenforced`, `checkFromBytes_generic_nonZero_ignores_niche`).
+2. `checkFromBytesNicheAware` inspects `checkBackendReprFullRange l` and rejects `nonZeroU32Ty`
+   (`checkFromBytesNicheAware_rejects_generic_nonZero`).
+3. `Trusted`'s `decodeTypedValueFromBytes` and `evalByteCast` agree with `checkFromBytesNicheAware`
+   and Rust: `decodeTypedValueFromBytes` rejects `zeroInitBytes 4` (`= none`), and `evalByteCast`
+   from a `u32` operand `bits < 2^32` succeeds iff `0 < bits` and returns `ub` iff `bits = 0`.
+-/
+theorem trusted_evalByteCast_generic_nonZero_enforces_niche_vs_legacy_decoder
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (srcLIdx dstLIdx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bits : Nat) (memoryOrder : List Nat)
+    (hBits : bits < scalarModulus 4)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hSz : l.size.bytes = 4)
+    (hRepr :
+      l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, 4⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := .uint .u32, layoutIdx := srcLIdx }) :
+    let nonZeroU32Ty : Ty := { kind := .adt defPath [.uint .u32], layoutIdx := dstLIdx }
+    decodeValueFromBytes defaultCodecFuel layouts nonZeroU32Ty (zeroInitBytes 4) =
+      some (.aggregate variantIdx [.scalar ⟨0, 4⟩]) ∧
+    checkFromBytes layouts nonZeroU32Ty = true ∧
+    checkFromBytesNicheAware layouts nonZeroU32Ty = false ∧
+    decodeTypedValueFromBytes defaultCodecFuel layouts nonZeroU32Ty (zeroInitBytes 4) = none ∧
+    (evalByteCast locals op nonZeroU32Ty mem localDecls layouts =
+      ok (.aggregate variantIdx [.scalar ⟨bits, 4⟩]) locals' mem ↔ 0 < bits) ∧
+    (evalByteCast locals op nonZeroU32Ty mem localDecls layouts = ub ↔ bits = 0) := by
+  intro nonZeroU32Ty
+  have hLegacy := adt_generic_nonZero_typeArg_path_niche_unenforced layouts defPath dstLIdx l
+    variantIdx memoryOrder hLookup hInhab hVar hFields hSz hRepr
+  have hCheck := checkFromBytes_generic_nonZero_ignores_niche layouts defPath dstLIdx l
+    variantIdx memoryOrder hLookup hInhab hVar hFields hSz hRepr
+  have hNicheAware := checkFromBytesNicheAware_rejects_generic_nonZero layouts defPath dstLIdx l
+    hLookup hRepr
+  have hTyped0 :
+      decodeTypedValueFromBytes defaultCodecFuel layouts nonZeroU32Ty (zeroInitBytes 4) = none := by
+    have hZeroEq : zeroInitBytes 4 = encodeLittleEndianBytes 0 l.size.bytes none := by
+      rw [hSz]
+    have hT := trusted_decodeTypedValueFromBytes_adt_newtype_eq 15 layouts defPath [.uint .u32]
+      dstLIdx l variantIdx 32 memoryOrder false ⟨1, scalarModulus 4 - 1⟩ 0 hLookup hInhab hVar
+      hFields hNoFieldLayouts hRepr (by rw [hSz]) (by rw [hSz]; decide) (by rw [hSz]; decide)
+    rw [hZeroEq, show defaultCodecFuel = 15 + 1 from rfl]
+    exact hT
+  have hBc := tryTransmute_adt_newtype_nonZero_evalByteCast_iff locals locals' op mem localDecls
+    layouts .not .bool .u32 srcLIdx defPath [.uint .u32] dstLIdx l variantIdx 32 bits memoryOrder
+    false rfl ⟨hBits, trivial⟩ hDstLIdx hLookup hInhab hVar hFields hNoFieldLayouts
+    (by rw [hSz]; exact hRepr) hSz (by rw [hSz]) hOp hTy
+  exact ⟨hLegacy.2.1, hCheck.1, hNicheAware, hTyped0, hBc.1, hBc.2⟩
 
 /--
 **`try_transmute` into a multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enum ADT (`VariantsShape.multiple`) at the `Trusted` step level.**
