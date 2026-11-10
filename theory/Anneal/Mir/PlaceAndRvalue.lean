@@ -604,6 +604,42 @@ theorem certElemTy_kind (layouts : LayoutTable) (baseTy elemTy : Ty) :
   unfold certElemTy
   repeat' (first | rfl | split)
 
+/-- An `.index` / `.constantIndex` step whose element type is not an ADT (e.g. an array or
+slice of tuples, arrays, scalars, or pointers) always reaches a non-union field base,
+whatever layout index `certElemTy` chooses. -/
+theorem tyIsNonUnionFieldBase_certElemTy_of_not_adt
+    (layouts : LayoutTable) (baseTy elemTy : Ty)
+    (hNotAdt : rigidTyIsAdt elemTy.kind = false) :
+    tyIsNonUnionFieldBase layouts (certElemTy layouts baseTy elemTy) = true := by
+  unfold tyIsNonUnionFieldBase
+  rw [certElemTy_kind, hNotAdt]
+
+/-- An `.index` / `.constantIndex` step out of a resolved array container `baseTy` whose
+layout entry records `fields = .array stride count` and `fieldLayouts = flIdx :: restFls`
+with a non-union element layout index `flIdx` (`layoutIdxIsNonUnion layouts flIdx = true`,
+e.g. `[MyStruct; N]`) resolves to `flIdx` under `certElemTy` and therefore reaches a
+non-union field base. -/
+theorem tyIsNonUnionFieldBase_certElemTy_of_array_fieldLayouts
+    (layouts : LayoutTable) (baseTy elemTy : Ty)
+    (l : TypeLayout) (stride : Size) (count flIdx : Nat) (restFls : List LayoutIdx)
+    (hBaseNonUnion : layoutIdxIsNonUnion layouts baseTy.layoutIdx = true)
+    (hLookup : LayoutTable.lookup layouts baseTy.layoutIdx = .some l)
+    (hFields : l.fields = .array stride count)
+    (hFl : l.fieldLayouts = flIdx :: restFls)
+    (hFlNonUnion : layoutIdxIsNonUnion layouts flIdx = true) :
+    tyIsNonUnionFieldBase layouts (certElemTy layouts baseTy elemTy) = true := by
+  have hResBase :=
+    isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion layouts baseTy.layoutIdx hBaseNonUnion
+  rcases l with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+  dsimp only at hFields hFl
+  subst hFields hFl
+  unfold tyIsNonUnionFieldBase certElemTy
+  rw [hResBase, hLookup]
+  dsimp only
+  cases rigidTyIsAdt elemTy.kind with
+  | false => rfl
+  | true => exact hFlNonUnion
+
 /-- Certificate transport from an unresolved type to any type of the same kind
 (an unresolved ADT is never a certified `.field` base, so re-indexing within the
 kind can only enable steps). -/
@@ -1261,6 +1297,36 @@ theorem operandTouchesUnion_false_of_layoutsHaveNoUnion
   | copy p => exact placeTouchesUnion_false_of_layoutsHaveNoUnion localDecls layouts p hNo
   | move p => exact placeTouchesUnion_false_of_layoutsHaveNoUnion localDecls layouts p hNo
   | constant _ => rfl
+
+/-- Copying a `projFieldBasesNonUnion`-certified place on a local declared with type
+`declTy` never touches a union, for arbitrary `localDecls` / `layouts`. -/
+theorem operandTouchesUnion_copy_of_projFieldBasesNonUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (declTy : Ty)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy proj = true) :
+    operandTouchesUnion localDecls layouts (.copy ⟨loc, proj⟩) = false :=
+  placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc proj declTy hTy hCert
+
+/-- Moving a `projFieldBasesNonUnion`-certified place on a local declared with type
+`declTy` never touches a union, for arbitrary `localDecls` / `layouts`. -/
+theorem operandTouchesUnion_move_of_projFieldBasesNonUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (declTy : Ty)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy proj = true) :
+    operandTouchesUnion localDecls layouts (.move ⟨loc, proj⟩) = false :=
+  placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc proj declTy hTy hCert
+
+/-- Copying or moving a place whose projection has no `.field` step before its first `Deref`
+never touches a union, for arbitrary `localDecls` / `layouts`. -/
+theorem operandTouchesUnion_false_of_noFieldBeforeDeref
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (hNoField : projHasNoFieldBeforeDeref proj = true) :
+    operandTouchesUnion localDecls layouts (.copy ⟨loc, proj⟩) = false ∧
+    operandTouchesUnion localDecls layouts (.move ⟨loc, proj⟩) = false :=
+  ⟨placeTouchesUnion_false_of_noFieldBeforeDeref localDecls layouts loc proj hNoField,
+   placeTouchesUnion_false_of_noFieldBeforeDeref localDecls layouts loc proj hNoField⟩
 
 /-- Trusted's `evalPlaceRead` on a root local `⟨loc, .nil⟩` whose initialized value
 `rootVal` passes `validateValueForTy?` returns `.ok rootVal locals` for every
@@ -15110,5 +15176,102 @@ theorem evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines
       (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) declTy defPath args lIdx
       hRootTy hCert hLeafTy)
     hOk
+
+/-- **Certified `readPlaceStateCheckedIndex` ↔ `readProjectedForLocal` / `evalPlaceRead` Refinement on Nested Frames (`readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines`)**:
+One-step wrapper around `readPlaceStateCheckedIndex_evalPlaceRead_nested_refines` that discharges
+`placeTouchesUnion localDecls layouts place = false` directly from a Section 0
+`projFieldBasesNonUnion` certificate on `place.local_`'s declared type `declTy`. -/
+theorem readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines
+    (slots : List LocalSlotState)
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callerLocals : List LocalSlot)
+    (ptrBytes : Nat)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place)
+    (declTy : Ty)
+    (val : Value)
+    (hRel : SlotsRefine NestedSlotStateRefines slots locals)
+    (hRootTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy place.projection = true)
+    (hRead : readPlaceStateCheckedIndex slots ptrBytes localDecls layouts place = .ok val) :
+    placeIndexLocalsUsizeValid slots ptrBytes localDecls place.projection = true ∧
+    ∃ rootVal,
+      get? locals place.local_ = .some (.init rootVal) ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedForLocal
+        locals localDecls layouts place.local_ rootVal place.projection = .ok val ∧
+      (validateValueForTy? layouts
+          (match place.projection with
+           | .nil => placeTy localDecls layouts place
+           | _ :: _ => placeTyResolved localDecls layouts place) val = true →
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalPlaceRead
+          locals place borrows globals layouts callerLocals localDecls = .ok val locals) :=
+  readPlaceStateCheckedIndex_evalPlaceRead_nested_refines slots locals borrows globals callerLocals
+    ptrBytes localDecls layouts place val hRel
+    (placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts place.local_
+      place.projection declTy hRootTy hCert)
+    hRead
+
+/-- **Certified `.copy` `evalOperandState` Refinement on Nested Frames (`evalOperandState_copy_certified_nested_refines`)**:
+One-step wrapper around `evalOperandState_nested_refines` for `.copy place` that discharges
+`operandTouchesUnion localDecls layouts (.copy place) = false` directly from a Section 0
+`projFieldBasesNonUnion` certificate on `place.local_`'s declared type `declTy`. -/
+theorem evalOperandState_copy_certified_nested_refines
+    (slots slots' : List LocalSlotState)
+    (locals : List LocalSlot)
+    (place : Place)
+    (declTy : Ty)
+    (val : Value)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (hRel : SlotsRefine NestedSlotStateRefines slots locals)
+    (hNoDeref : OperandNonDeref (.copy place))
+    (hRootTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy place.projection = true)
+    (hEval : evalOperandState slots (.copy place) layouts globals = (.ok val, slots')) :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals (.copy place) borrows globals layouts callerLocals localDecls = .ok val locals' ∧
+      SlotsRefine NestedSlotStateRefines slots' locals' :=
+  evalOperandState_nested_refines slots slots' locals (.copy place) val borrows globals layouts
+    callerLocals localDecls hRel hNoDeref
+    (operandTouchesUnion_copy_of_projFieldBasesNonUnion localDecls layouts place.local_
+      place.projection declTy hRootTy hCert)
+    hEval
+
+/-- **Certified `.move` `evalOperandState` Refinement on Nested Frames (`evalOperandState_move_certified_nested_refines`)**:
+One-step wrapper around `evalOperandState_nested_refines` for `.move place` that discharges
+`operandTouchesUnion localDecls layouts (.move place) = false` directly from a Section 0
+`projFieldBasesNonUnion` certificate on `place.local_`'s declared type `declTy`. -/
+theorem evalOperandState_move_certified_nested_refines
+    (slots slots' : List LocalSlotState)
+    (locals : List LocalSlot)
+    (place : Place)
+    (declTy : Ty)
+    (val : Value)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (hRel : SlotsRefine NestedSlotStateRefines slots locals)
+    (hNoDeref : OperandNonDeref (.move place))
+    (hRootTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy place.projection = true)
+    (hEval : evalOperandState slots (.move place) layouts globals = (.ok val, slots')) :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals (.move place) borrows globals layouts callerLocals localDecls = .ok val locals' ∧
+      SlotsRefine NestedSlotStateRefines slots' locals' :=
+  evalOperandState_nested_refines slots slots' locals (.move place) val borrows globals layouts
+    callerLocals localDecls hRel hNoDeref
+    (operandTouchesUnion_move_of_projFieldBasesNonUnion localDecls layouts place.local_
+      place.projection declTy hRootTy hCert)
+    hEval
 
 end Anneal.Mir.PlaceAndRvalue

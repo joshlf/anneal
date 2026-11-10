@@ -1983,8 +1983,8 @@ theorem isExposed_of_pickExposedProv_eq_some
 
 /-- Deterministic `IntToPtr` (`evalIntToPtrDeterministic`, matching `rvalue.rs:2202-2210`)
 never fails with `UnexposedProvenance`: for any valid address `addr < scalarModulus pw.byteSize`,
-it always evaluates to `.ok`, picking the head exposed provenance when `pick = true` and
-`exposed` is non-empty, and `none` otherwise. -/
+it always evaluates to `.ok`, picking the least exposed provenance (`leastExposed exposed`) when
+`pick = true` and `exposed` is non-empty, and `none` otherwise. -/
 theorem evalIntToPtrDeterministic_eq_ok
     (pw : PtrWidth)
     (pick : Bool)
@@ -6584,10 +6584,12 @@ example :
 (`evalIntToPtrDeterministic .bits64 true`, `rvalue.rs:2196-2206`) instead predicts the *least*
 exposed allocation. Under the hypotheses of the round-trip theorem and for every prior Anneal
 exposed set `exposed`:
-1. `Trusted`'s page-based recovery yields exactly `.ptr p 8`, whatever else was exposed before;
+1. `Trusted`'s `pointerExposeProvenance` returns the page address `ptrToAddress p` in `mem'`, and
+   `pointerWithExposedProvenance` in `mem'` yields `.ptr p 8` whatever else was exposed before;
 2. Anneal's deterministic lowering reconstructs `.ptr ⟨least, p.offsetBytes⟩ (some least)` for the
    least exposed allocation `least ≤ p.allocId`, whose `Trusted` image is
-   `.ptr ⟨least, p.offsetBytes⟩ 8`;
+   `.ptr ⟨least, p.offsetBytes⟩ 8`, and both models record the same exposed set
+   (`recordExposedAllocId exposed p.allocId = exposeProv p.allocId exposed`);
 3. the two recovered pointers coincide iff no allocation smaller than `p.allocId` was exposed
    before (`∀ b ∈ exposed, p.allocId ≤ b`, e.g. from an empty tracker); otherwise the two models
    resolve MiniRust's angelic `int2ptr` provenance choice to different exposed allocations. -/
@@ -6615,6 +6617,10 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_least_exposed
     ∃ least,
       leastExposed (exposeProv p.allocId exposed) = some least ∧
       least ≤ p.allocId ∧
+      evalRvalue locals
+          (.cast .pointerExposeProvenance op1 { kind := .uint .usize, layoutIdx := usizeLIdx })
+          mem localDecls layouts =
+        ok (.scalar ⟨ptrToAddress p, 8⟩) locals' mem' ∧
       evalRvalue locals₂
           (.cast .pointerWithExposedProvenance op2 { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
           mem' localDecls layouts =
@@ -6624,6 +6630,7 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_least_exposed
       evalIntToPtrDeterministic .bits64 true p.offsetBytes (exposeProv p.allocId exposed) =
         .ok (.ptr { allocId := least, offsetBytes := p.offsetBytes } (some least))
           (exposeProv p.allocId exposed) ∧
+      recordExposedAllocId exposed p.allocId = exposeProv p.allocId exposed ∧
       ((CastVal.ptr { allocId := least, offsetBytes := p.offsetBytes } (some least)).toTrustedValue
           .bits64 .rawPtr = .ptr p 8 ↔
         ∀ b ∈ exposed, p.allocId ≤ b) := by
@@ -6634,7 +6641,7 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_least_exposed
   have h_off : p.offsetBytes < scalarModulus 8 := Nat.lt_of_lt_of_le h_page (by decide)
   obtain ⟨least, hLeast, hLe, hExp, hDet, hIff⟩ :=
     ptrToInt_intToPtrDeterministic_picks_least_exposed .bits64 .usize p exposed rfl h_off h_off
-  refine ⟨least, hLeast, hLe, hRT.2.1, hExp, hDet, ?_⟩
+  refine ⟨least, hLeast, hLe, hRT.1, hRT.2.1, hExp, hDet, hRT.2.2.2.2.2, ?_⟩
   rw [← hIff]
   constructor
   · intro h
@@ -6644,16 +6651,96 @@ theorem trusted_vs_anneal_expose_withExposed_deterministic_least_exposed
     subst h
     rfl
 
-/-- **Isolation holds for `Trusted`'s page model but not for Anneal's deterministic lowering.**
+/-- **Intra-allocation offset recovery under Anneal's deterministic lowering (`(ptr as usize + delta) as *const T`).**
+Deterministic-lowering counterpart to `trusted_vs_anneal_expose_withExposed_in_alloc_offset_agreement`:
+exposing `p₁ = ⟨allocId, off₁⟩` (`allocId ≠ 0`, `off₁ < 65536`) and casting at any in-page offset
+`off₂ < 65536` (`p₂ = ⟨allocId, off₂⟩`) recovers `.ptr p₂ 8` in `Trusted` and
+`.ok (.ptr ⟨least, off₂⟩ (some least)) (exposeProv allocId exposed)` in
+`evalIntToPtrDeterministic .bits64 true off₂ (exposeProv allocId exposed)` for the least exposed
+allocation `least ≤ allocId`; their `Trusted` values agree (`= .ptr p₂ 8`) iff no smaller
+allocation was exposed before (`∀ b ∈ exposed, allocId ≤ b`). -/
+theorem trusted_vs_anneal_expose_withExposed_in_alloc_offset_deterministic_least_exposed
+    (allocId off₁ off₂ : Nat) (exposed : ExposedProvenance)
+    (locals locals' locals₂ locals₃ : List LocalSlot) (op1 op2 : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (usizeLIdx srcLIdx2 dstLIdx : Nat) (m2 : Mutability) (pt2 : RigidTy)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_src : isExposePtrSourceTy (operandTy localDecls layouts op1) = true)
+    (h_alloc : allocId ≠ 0)
+    (h_page1 : off₁ < 65536)
+    (h_page2 : off₂ < 65536)
+    (h_fit1 : ptrToAddress { allocId := allocId, offsetBytes := off₁ } < scalarModulus 8)
+    (h_fit2 : ptrToAddress { allocId := allocId, offsetBytes := off₂ } < scalarModulus 8)
+    (h_borrows : mem.borrows = [])
+    (h_glob : lookupGlobalAlloc mem.globals allocId = none)
+    (h_thin2 : isThinPointee pt2 = true)
+    (h_op1 : evalOperand locals op1 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr { allocId := allocId, offsetBytes := off₁ } 8) locals')
+    (h_op2 : evalOperand locals₂ op2 mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨ptrToAddress { allocId := allocId, offsetBytes := off₂ }, 8⟩) locals₃)
+    (h_ty2 : operandTy localDecls layouts op2 =
+      some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
+    let p₁ : ProvenancePtr := { allocId := allocId, offsetBytes := off₁ }
+    let p₂ : ProvenancePtr := { allocId := allocId, offsetBytes := off₂ }
+    let mem' : Memory :=
+      { mem with exposedAllocIds := recordExposedAllocId mem.exposedAllocIds allocId }
+    ∃ least,
+      leastExposed (exposeProv allocId exposed) = some least ∧
+      least ≤ allocId ∧
+      evalRvalue locals
+          (.cast .pointerExposeProvenance op1 { kind := .uint .usize, layoutIdx := usizeLIdx })
+          mem localDecls layouts =
+        ok (.scalar ⟨ptrToAddress p₁, 8⟩) locals' mem' ∧
+      evalRvalue locals₂
+          (.cast .pointerWithExposedProvenance op2 { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
+          mem' localDecls layouts =
+        ok (.ptr p₂ 8) locals₃ mem' ∧
+      evalPtrToIntExpose .bits64 .usize p₁ exposed =
+        .ok (.scalar off₁) (exposeProv allocId exposed) ∧
+      evalIntToPtrDeterministic .bits64 true off₂ (exposeProv allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := off₂ } (some least))
+          (exposeProv allocId exposed) ∧
+      ((CastVal.ptr { allocId := least, offsetBytes := off₂ } (some least)).toTrustedValue
+          .bits64 .rawPtr = .ptr p₂ 8 ↔
+        ∀ b ∈ exposed, allocId ≤ b) := by
+  intro p₁ p₂ mem'
+  have hShift := trusted_vs_anneal_expose_withExposed_in_alloc_offset_agreement allocId off₁ off₂
+    exposed locals locals' locals₂ locals₃ op1 op2 mem localDecls layouts usizeLIdx srcLIdx2 dstLIdx
+    m2 pt2 h_pw h_src h_alloc h_page1 h_page2 h_fit1 h_fit2 h_borrows h_glob h_thin2 h_op1 h_op2
+    h_ty2
+  have h_off2 : off₂ < scalarModulus 8 := Nat.lt_of_lt_of_le h_page2 (by decide)
+  obtain ⟨least, hLeast, hLe, _, hDet2, hIff⟩ :=
+    ptrToInt_intToPtrDeterministic_picks_least_exposed .bits64 .usize p₂ exposed rfl h_off2 h_off2
+  refine ⟨least, hLeast, hLe, hShift.1, hShift.2.1, hShift.2.2.1, hDet2, ?_⟩
+  rw [← hIff]
+  constructor
+  · intro h
+    injection h with h1 _
+    exact congrArg (fun r => r.allocId) h1
+  · intro h
+    subst h
+    rfl
+
+/-- **Isolation holds for `Trusted`'s page model and `pick = false`, but not for Anneal's
+`pick = true` deterministic lowering across arbitrary prior exposed sets.**
 `trusted_vs_anneal_expose_other_alloc_isolation_agreement` compares `Trusted` with Anneal's
 `evalIntToPtrExposed` given the prediction `some q.allocId`. Episode 1's deterministic lowering
-predicts the least exposed allocation instead, so after exposing only `p.allocId` (from an empty
-Anneal tracker) it attaches `p.allocId`'s provenance to *every* in-range integer, including the
-in-allocation address `q.offsetBytes` of an allocation `q.allocId ≠ p.allocId`; `Trusted` leaves
-the page address `ptrToAddress q` provenance-less. The two models thus resolve MiniRust's angelic
-`int2ptr` choice differently: Anneal's resolution carries provenance where `Trusted`'s does not. -/
+(`evalIntToPtrDeterministic .bits64 true`) predicts the least exposed allocation
+`leastExposed (exposeProv p.allocId exposed) = some least` (`least ≤ p.allocId`) for *every*
+prior Anneal exposed set `exposed`:
+1. `Trusted` keeps `q.allocId ≠ p.allocId` unexposed (`isExposedAllocId mem'.exposedAllocIds q.allocId = false`)
+   and evaluates `pointerWithExposedProvenance` on `ptrToAddress q` to the provenance-less address
+   `ok (.scalar ⟨ptrToAddress q, 8⟩) locals₃ mem'`;
+2. with `pick = true`, Anneal's deterministic lowering attaches `some least` to **both** the
+   in-allocation address `q.offsetBytes` and the page address `ptrToAddress q`, producing
+   `.ptr ⟨least, q.offsetBytes⟩ 8` and `.ptr ⟨least, ptrToAddress q⟩ 8`, both distinct from
+   `.scalar ⟨ptrToAddress q, 8⟩`;
+3. by contrast, with `pick = false` (provenance-stripping `IntToPtr`),
+   `evalIntToPtrDeterministic .bits64 false (ptrToAddress q) (exposeProv p.allocId exposed)`
+   predicts `none` and yields `.ptr ⟨0, ptrToAddress q⟩ none`, whose `Trusted` image agrees with
+   `.scalar ⟨ptrToAddress q, 8⟩`. -/
 theorem trusted_vs_anneal_expose_other_alloc_deterministic_divergence
-    (p q : ProvenancePtr)
+    (p q : ProvenancePtr) (exposed : ExposedProvenance := [])
     (locals₂ locals₃ : List LocalSlot) (op2 : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcLIdx2 dstLIdx : Nat) (m2 : Mutability) (pt2 : RigidTy)
@@ -6671,60 +6758,121 @@ theorem trusted_vs_anneal_expose_other_alloc_deterministic_divergence
       some { kind := .uint .usize, layoutIdx := srcLIdx2 }) :
     let mem' : Memory :=
       { mem with exposedAllocIds := recordExposedAllocId mem.exposedAllocIds p.allocId }
-    let pq : ProvenancePtr := { allocId := p.allocId, offsetBytes := q.offsetBytes }
-    evalRvalue locals₂
-        (.cast .pointerWithExposedProvenance op2 { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
-        mem' localDecls layouts =
-      ok (.scalar ⟨ptrToAddress q, 8⟩) locals₃ mem' ∧
-    evalIntToPtrDeterministic .bits64 true q.offsetBytes (exposeProv p.allocId []) =
-      .ok (.ptr pq (some p.allocId)) (exposeProv p.allocId []) ∧
-    (CastVal.ptr pq (some p.allocId)).toTrustedValue .bits64 .rawPtr = .ptr pq 8 ∧
-    (.scalar ⟨ptrToAddress q, 8⟩ : Value) ≠ .ptr pq 8 := by
-  intro mem' pq
+    ∃ least,
+      leastExposed (exposeProv p.allocId exposed) = some least ∧
+      least ≤ p.allocId ∧
+      isExposedAllocId mem'.exposedAllocIds q.allocId = false ∧
+      evalRvalue locals₂
+          (.cast .pointerWithExposedProvenance op2 { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
+          mem' localDecls layouts =
+        ok (.scalar ⟨ptrToAddress q, 8⟩) locals₃ mem' ∧
+      evalIntToPtrDeterministic .bits64 true q.offsetBytes (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := q.offsetBytes } (some least))
+          (exposeProv p.allocId exposed) ∧
+      evalIntToPtrDeterministic .bits64 true (ptrToAddress q) (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := ptrToAddress q } (some least))
+          (exposeProv p.allocId exposed) ∧
+      evalIntToPtrDeterministic .bits64 false (ptrToAddress q) (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := 0, offsetBytes := ptrToAddress q } none)
+          (exposeProv p.allocId exposed) ∧
+      (.scalar ⟨ptrToAddress q, 8⟩ : Value) ≠
+        (CastVal.ptr { allocId := least, offsetBytes := q.offsetBytes } (some least)).toTrustedValue
+          .bits64 .rawPtr ∧
+      (.scalar ⟨ptrToAddress q, 8⟩ : Value) ≠
+        (CastVal.ptr { allocId := least, offsetBytes := ptrToAddress q } (some least)).toTrustedValue
+          .bits64 .rawPtr ∧
+      (CastVal.ptr { allocId := 0, offsetBytes := ptrToAddress q } none).toTrustedValue
+          .bits64 .rawPtr =
+        .scalar ⟨ptrToAddress q, 8⟩ := by
+  intro mem'
   have hIso := trusted_vs_anneal_expose_other_alloc_isolation_agreement p q [] locals₂ locals₃ op2
     mem localDecls layouts srcLIdx2 dstLIdx m2 pt2 h_pw h_ne h_page_q h_fit_q h_borrows h_glob_q
     h_unexp_t rfl h_thin2 h_op2 h_ty2
   have h_offq : q.offsetBytes < scalarModulus PtrWidth.bits64.byteSize :=
     Nat.lt_of_lt_of_le h_page_q (by decide)
-  have hDet := evalIntToPtrDeterministic_eq_ok .bits64 true q.offsetBytes (exposeProv p.allocId [])
-    h_offq
-  have hPick : pickExposedProv true (exposeProv p.allocId []) = some p.allocId := by
-    simp [pickExposedProv, exposeProv, leastExposed]
-  rw [hPick] at hDet
-  exact ⟨hIso.2.2.1, hDet, rfl, fun h => by cases h⟩
+  obtain ⟨least, hLeast, hLe, _, hDetOff, _⟩ :=
+    ptrToInt_intToPtrDeterministic_picks_least_exposed .bits64 .usize
+      { allocId := p.allocId, offsetBytes := q.offsetBytes } exposed rfl h_offq h_offq
+  have hDetAddr :
+      evalIntToPtrDeterministic .bits64 true (ptrToAddress q) (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := ptrToAddress q } (some least))
+          (exposeProv p.allocId exposed) := by
+    rw [evalIntToPtrDeterministic_eq_ok .bits64 true (ptrToAddress q) _ h_fit_q]
+    show (match leastExposed (exposeProv p.allocId exposed) with
+          | some allocId =>
+            CastOutcome.ok (.ptr { allocId := allocId, offsetBytes := ptrToAddress q } (some allocId))
+              (exposeProv p.allocId exposed)
+          | none =>
+            CastOutcome.ok (.ptr { allocId := 0, offsetBytes := ptrToAddress q } none)
+              (exposeProv p.allocId exposed)) = _
+    rw [hLeast]
+  have hDetFalse :
+      evalIntToPtrDeterministic .bits64 false (ptrToAddress q) (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := 0, offsetBytes := ptrToAddress q } none)
+          (exposeProv p.allocId exposed) :=
+    evalIntToPtrExposed_none .bits64 (ptrToAddress q) (exposeProv p.allocId exposed) h_fit_q
+  refine ⟨least, hLeast, hLe, hIso.1, hIso.2.2.1, hDetOff, hDetAddr, hDetFalse, ?_, ?_, rfl⟩
+  · intro h
+    cases h
+  · intro h
+    cases h
 
-/-- Divergence witness for `trusted_vs_anneal_expose_withExposed_deterministic_least_exposed`:
+/-- Divergence witness for `trusted_vs_anneal_expose_withExposed_deterministic_least_exposed`,
+`trusted_vs_anneal_expose_withExposed_in_alloc_offset_deterministic_least_exposed`, and
+`trusted_vs_anneal_expose_other_alloc_deterministic_divergence`:
 with allocation `1` exposed beforehand in both models (no borrows, no globals), exposing the
-pointer `.ptr ⟨7, 64⟩ 8` and casting its address back lets `Trusted` recover `.ptr ⟨7, 64⟩ 8`
-(page `7`), whereas Episode 1's deterministic lowering predicts the least exposed allocation `1`
-and reconstructs `.ptr ⟨1, 64⟩ (some 1)`, whose `Trusted` image `.ptr ⟨1, 64⟩ 8` differs. -/
+pointer `.ptr ⟨7, 64⟩ 8` returns `ptrToAddress ⟨7, 64⟩ = 458816` in `mem'`; casting `458816` back
+lets `Trusted` recover `.ptr ⟨7, 64⟩ 8` (page `7`), whereas Episode 1's deterministic lowering
+predicts the least exposed allocation `1` (`leastExposed (exposeProv 7 [1]) = some 1`) and
+reconstructs `.ptr ⟨1, 64⟩ (some 1)`. Likewise, at the unexposed allocation `q = ⟨4, 8⟩`
+(`ptrToAddress q = 262152`), `Trusted` leaves `262152` provenance-less while deterministic lowering
+with `pick = true` attaches provenance `some 1` to both `8` and `262152`. -/
 example :
     let layouts : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [] }
     let p : ProvenancePtr := { allocId := 7, offsetBytes := 64 }
+    let q : ProvenancePtr := { allocId := 4, offsetBytes := 8 }
     let mem0 : Memory := { emptyMemory with exposedAllocIds := [1] }
     let decls : List LocalDecl :=
       [{ mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 },
          debugName := .none },
+       { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := .none },
        { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := .none }]
-    let locals : List LocalSlot := [.init (.ptr p 8), .init (.scalar ⟨ptrToAddress p, 8⟩)]
+    let locals : List LocalSlot :=
+      [.init (.ptr p 8), .init (.scalar ⟨ptrToAddress p, 8⟩),
+       .init (.scalar ⟨ptrToAddress q, 8⟩)]
     let mem' : Memory :=
       { mem0 with exposedAllocIds := recordExposedAllocId mem0.exposedAllocIds 7 }
+    let rawU8Ty : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
     evalRvalue locals
-        (.cast .pointerWithExposedProvenance (.copy ⟨1, []⟩)
-          { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+        (.cast .pointerExposeProvenance (.copy ⟨0, []⟩) { kind := .uint .usize, layoutIdx := 0 })
+        mem0 decls layouts =
+      ok (.scalar ⟨ptrToAddress p, 8⟩) locals mem' ∧
+    evalRvalue locals (.cast .pointerWithExposedProvenance (.copy ⟨1, []⟩) rawU8Ty)
         mem' decls layouts =
       ok (.ptr p 8) locals mem' ∧
+    evalRvalue locals (.cast .pointerWithExposedProvenance (.copy ⟨2, []⟩) rawU8Ty)
+        mem' decls layouts =
+      ok (.scalar ⟨ptrToAddress q, 8⟩) locals mem' ∧
     evalPtrToIntExpose .bits64 .usize p [1] = .ok (.scalar 64) (exposeProv 7 [1]) ∧
     evalIntToPtrDeterministic .bits64 true 64 (exposeProv 7 [1]) =
       .ok (.ptr { allocId := 1, offsetBytes := 64 } (some 1)) (exposeProv 7 [1]) ∧
+    evalIntToPtrDeterministic .bits64 true (ptrToAddress q) (exposeProv 7 [1]) =
+      .ok (.ptr { allocId := 1, offsetBytes := ptrToAddress q } (some 1)) (exposeProv 7 [1]) ∧
     (CastVal.ptr { allocId := 1, offsetBytes := 64 } (some 1)).toTrustedValue .bits64 .rawPtr ≠
       .ptr p 8 := by
-  intro layouts p mem0 decls locals mem'
+  intro layouts p q mem0 decls locals mem' rawU8Ty
   have hFit : ptrToAddress p < scalarModulus 8 := by decide
+  have hFitQ : ptrToAddress q < scalarModulus 8 := by decide
   have h := trusted_vs_anneal_expose_withExposed_roundtrip_agreement p [1] locals locals locals
     locals (.copy ⟨0, []⟩) (.copy ⟨1, []⟩) mem0 decls layouts 0 0 0 .not (.uint .u8) rfl rfl
     (by decide) (by decide) hFit rfl rfl rfl rfl rfl rfl
-  refine ⟨h.2.1, h.2.2.1, rfl, ?_⟩
+  have hDivQ := trusted_vs_anneal_expose_other_alloc_deterministic_divergence p q [1] locals locals
+    (.copy ⟨2, []⟩) mem0 decls layouts 0 0 .not (.uint .u8) rfl (by decide) (by decide) hFitQ rfl
+    rfl rfl rfl rfl rfl
+  rcases hDivQ with ⟨least, hLeast, _, _, hWithQ, _, hDetAddr, _, _, _, _⟩
+  have hLeast1 : least = 1 := Option.some.inj hLeast.symm
+  rw [hLeast1] at hDetAddr
+  refine ⟨h.1, h.2.1, hWithQ, h.2.2.1, rfl, hDetAddr, ?_⟩
   intro hEq
   injection hEq with h1 _
   exact absurd (congrArg (fun r => r.allocId) h1) (by decide)
