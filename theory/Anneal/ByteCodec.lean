@@ -1589,8 +1589,15 @@ structure MirValueCodec (layouts : LayoutTable) (ty : Ty) (α : Type) (sz : Nat)
   encode_toValue :
     ∀ x : α,
       encodeValueToBytes defaultCodecFuel layouts ty (toValue x) = some (codec.encode x)
-  /-- Whenever `codec` is `IsInitCodec`, every `Value` encoded at `ty` produces `sz` initialized bytes. -/
+  /-- Whether `encodeValueToBytes` at `ty` checks exact field widths on arbitrary untyped `Value`s
+      (true for scalars, arrays, laid-out tuples, `.primitive` ADTs, and `.multiple` fieldless enums;
+      false on unparameterized `.adt defPath []` newtypes with `FieldsShape.arbitrary` where
+      `encodeValueToBytes` delegates untyped field values to `encodeUntypedValueToBytes`). -/
+  enforcesUntypedFieldWidths : Bool := true
+  /-- Whenever `enforcesUntypedFieldWidths = true` and `codec` is `IsInitCodec`,
+      every `Value` encoded at `ty` produces `sz` initialized bytes. -/
   encode_length_and_init_of_isInit :
+    enforcesUntypedFieldWidths = true →
     codec.IsInitCodec →
     ∀ (v : Value) (bs : List AbstractByte),
       encodeValueToBytes defaultCodecFuel layouts ty v = some bs →
@@ -1629,7 +1636,8 @@ def ofCanonicalEncode {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
   ofValue_toValue := ofValue_toValue
   tySize_eq := tySize_eq
   encode_toValue := encode_toValue
-  encode_length_and_init_of_isInit := fun hInit v bs hEnc => by
+  enforcesUntypedFieldWidths := true
+  encode_length_and_init_of_isInit := fun _ hInit v bs hEnc => by
     rcases encode_witness v bs hEnc with ⟨x, rfl⟩
     exact ⟨codec.encode_length x, hInit x⟩
   decode_eq_map := decode_eq_map
@@ -1699,11 +1707,24 @@ theorem isFromBytes {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
   rw [m.decode_eq_map bs, hx]
   rfl
 
-/-- `IsInitCodec` on `m.codec` lifts to `IsIntoBytes layouts ty`. -/
+/-- `IsInitCodec` on `m.codec` lifts to `IsIntoBytes layouts ty` whenever `m` enforces untyped field widths. -/
 theorem isIntoBytes {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
-    (m : MirValueCodec layouts ty α sz) (hInit : m.codec.IsInitCodec) :
+    (m : MirValueCodec layouts ty α sz) (hInit : m.codec.IsInitCodec)
+    (hWidths : m.enforcesUntypedFieldWidths = true := by rfl) :
     IsIntoBytes layouts ty :=
-  ⟨sz, m.tySize_eq, m.encode_length_and_init_of_isInit hInit⟩
+  ⟨sz, m.tySize_eq, m.encode_length_and_init_of_isInit hWidths hInit⟩
+
+/-- Negative bridge: if `zeroInitBytes sz` fails `m.codec.decode`, `ty` is NOT `IsFromZeros`. -/
+theorem not_isFromZeros_of_zero_none {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
+    (m : MirValueCodec layouts ty α sz)
+    (hNone : m.codec.decode (zeroInitBytes sz) = none) :
+    ¬ IsFromZeros layouts ty := by
+  rintro ⟨sz', v, hSz', hDec⟩
+  rw [m.tySize_eq] at hSz'
+  injection hSz' with hEq
+  subst hEq
+  rw [m.decode_eq_map (zeroInitBytes sz), hNone] at hDec
+  nomatch hDec
 
 /-- Negative bridge: if an initialized `sz`-byte sequence fails `m.codec.decode`, `ty` is NOT `IsFromBytes`. -/
 theorem not_isFromBytes_of_rejected_init {layouts : LayoutTable} {ty : Ty} {α : Type} {sz : Nat}
@@ -1746,13 +1767,43 @@ theorem transmute_sound {layouts : LayoutTable} {srcTy dstTy : Ty} {α β : Type
     (hInto : mSrc.codec.IsInitCodec)
     (hFrom : mDst.codec.IsSurjectiveInitDecoder)
     (v : Value) (bs : List AbstractByte)
-    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs) :
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs)
+    (hWidths : mSrc.enforcesUntypedFieldWidths = true := by rfl) :
     ∃ v', decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v' :=
   transmute_sound_of_into_from_bytes layouts srcTy dstTy
-    (mSrc.isIntoBytes hInto)
+    (mSrc.isIntoBytes hInto hWidths)
     (mDst.isFromBytes hFrom)
     (by rw [mSrc.tySize_eq, mDst.tySize_eq])
     v bs hEnc
+
+/--
+Safe byte transmutation for any decoded/well-typed inhabitant `v` of `srcTy`
+(`decodeValueFromBytes defaultCodecFuel layouts srcTy bs₀ = some v`), applicable to
+every `MirValueCodec` including `scalarNicheNewtype` without requiring `enforcesUntypedFieldWidths`.
+-/
+theorem transmute_sound_of_decoded {layouts : LayoutTable} {srcTy dstTy : Ty} {α β : Type} {sz : Nat}
+    (mSrc : MirValueCodec layouts srcTy α sz)
+    (mDst : MirValueCodec layouts dstTy β sz)
+    (hInto : mSrc.codec.IsInitCodec)
+    (hFrom : mDst.codec.IsSurjectiveInitDecoder)
+    {bs₀ : List AbstractByte} {v : Value} {bs : List AbstractByte}
+    (hValidSrc : decodeValueFromBytes defaultCodecFuel layouts srcTy bs₀ = some v)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v' := by
+  rw [mSrc.decode_eq_map bs₀] at hValidSrc
+  cases hC : mSrc.codec.decode bs₀ <;> rw [hC] at hValidSrc
+  · nomatch hValidSrc
+  case some x =>
+    injection hValidSrc with hV
+    subst hV
+    rw [mSrc.encode_toValue x] at hEnc
+    injection hEnc with hBs
+    subst hBs
+    rcases mDst.isFromBytes hFrom with ⟨sz', hSz', hDecDst⟩
+    rw [mDst.tySize_eq] at hSz'
+    injection hSz' with hEq
+    subst hEq
+    exact hDecDst (mSrc.codec.encode x) (mSrc.codec.encode_length x) (hInto x)
 
 /-- Typed transmutation: `mSrc.codec.encode x` decodes to a typed `y : β` in `mDst`. -/
 theorem transmute_typed {layouts : LayoutTable} {srcTy dstTy : Ty} {α β : Type} {sz : Nat}
@@ -1949,9 +2000,15 @@ def uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
           rfl)
 
 /--
-`MirValueCodec` for a `.primitive` scalar-niche ADT backed by
-`ScalarLayout.initialized pk range` for any non-pointer `PrimitiveKind` `pk`
-(`.int bitsWidth signed` or `.float bitsWidth`).
+`MirValueCodec` for a `.primitive`-fields scalar-niche ADT (`l.fields = .primitive`,
+`l.variants = .single varIdx`) backed by `ScalarLayout.initialized pk range` for any
+non-pointer `PrimitiveKind` `pk` (`.int bitsWidth signed` or `.float bitsWidth`).
+
+This covers `.primitive`-fields ADT layouts (such as inner scalar field layouts
+referenced through `TypeLayout.fieldLayouts`). For single-field newtype wrappers
+with `l.fields = .arbitrary [⟨0⟩] _` (such as `rustc`'s newtype `NonZero*` shape),
+use `scalarNicheNewtype` / `scalarNicheNewtypeNonPtr`; for multi-variant fieldless
+enums (`l.variants = .multiple ...`), use `fieldlessEnum`.
 -/
 def primitiveNicheAdtNonPtr
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -2002,7 +2059,8 @@ def primitiveNicheAdtNonPtr
     have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
     rw [hBeq0]
     rfl
-  encode_length_and_init_of_isInit := fun _ v bs hEnc => by
+  enforcesUntypedFieldWidths := true
+  encode_length_and_init_of_isInit := fun _ _ v bs hEnc => by
     unfold defaultCodecFuel encodeValueToBytes at hEnc
     dsimp only at hEnc
     rw [hLookup] at hEnc
@@ -2039,8 +2097,10 @@ def primitiveNicheAdtNonPtr
         pk range sz hNz hNonPtr hWidth bs
 
 /--
-`MirValueCodec` for a `.primitive` integer scalar-niche ADT (`NonZeroU8`, `NonZeroU32`,
-or fieldless `#[repr(uN)]` enum) backed by `ScalarLayout.initialized (.int bitsWidth signed) range`.
+`MirValueCodec` for a `.primitive`-fields integer scalar-niche ADT (`l.fields = .primitive`,
+`l.variants = .single varIdx`) backed by `ScalarLayout.initialized (.int bitsWidth signed) range`.
+See `scalarNicheNewtype` for single-field newtype wrappers (`l.fields = .arbitrary [⟨0⟩] _`)
+and `fieldlessEnum` for multi-variant fieldless enums (`l.variants = .multiple ...`).
 -/
 def primitiveNicheAdt
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3012,6 +3072,414 @@ def uintPairArbitraryTuple (layouts : LayoutTable) (w₁ w₂ : UintTy)
           rw [dropAbstractBytes_eq_drop, takeAbstractBytes_eq_take,
               m₂.decode_eq_map ((bs.drop (uintByteSize w₁ + pad₁)).take (uintByteSize w₂)), hMC₂]
           cases c₂.decode ((bs.drop (uintByteSize w₁ + pad₁)).take (uintByteSize w₂)) <;> rfl)
+
+/--
+`MirValueCodec` for a single-field scalar-niche newtype wrapper `.adt defPath []`
+(`l.fields = .arbitrary [{ bytes := 0 }] memoryOrder`, `l.fieldLayouts = []`,
+`l.variants = .single varIdx`, `l.backendRepr = .scalar (.initialized pk range)`),
+matching the newtype `NonZero*` shape analyzed in `Anneal.BitValidity` §6.4
+(`decodeValueFromBytes_adt_newtype_scalarLayout`).
+
+Values decode to and encode from `.aggregate varIdx [.scalar ⟨x.val, sz⟩]`.
+
+**Important note on monomorphized `NonZero<T>` (`args = [T]`) and untyped `IsIntoBytes`:**
+1. On the monomorphized type `.adt "core::num::NonZero" [.uint .u32]`, `args.length == offsets.length`,
+   so `Trusted`'s `decodeValueFromBytes` takes the `byArgs` type-argument path and decodes the field at
+   `.uint .u32` without inspecting `l.backendRepr` (`adt_generic_nonZero_typeArg_path_niche_unenforced`).
+   Consequently, `zeroInitBytes 4` is accepted (`IsFromZeros` holds) and **no zero-rejecting niche
+   `MirValueCodec` can exist** for `.adt defPath [.uint .u32]` (`monomorphized_nonZero_u32_forces_hasZeroValid`).
+2. On `.adt defPath []` (`args = []`), `decodeValueFromBytes` enforces the `l.backendRepr` niche,
+   and every well-typed/decoded value (`transmute_typed`, `transmute_sound_of_decoded`) encodes to `sz`
+   initialized bytes. However, `enforcesUntypedFieldWidths` is `false` because `encodeValueToBytes`
+   falls back to `encodeUntypedValueToBytes` when `args = []`, so an ill-typed 0-byte field
+   `.aggregate varIdx [.unit]` encodes to `replicateUninitBytes sz` (`scalarNicheNewtype_untyped_unit_field_divergence`).
+-/
+def scalarNicheNewtypeNonPtr
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (sz : Nat) (pk : PrimitiveKind) (varIdx : VariantIdx)
+    (memoryOrder : List Nat) (range : WrappingRange)
+    (hNz : 0 < sz)
+    (hNonPtr : FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized pk range))
+    (hWidth : primitiveKindByteWidth pk = some sz) :
+    MirValueCodec layouts { kind := .adt defPath [], layoutIdx := idx }
+      { bits : Nat // bits < 2 ^ (8 * sz) ∧ wrappingRangeContains range bits = true } sz where
+  codec := FixedByteCodec.scalarValidRange sz hNz range
+  toValue := fun x => .aggregate varIdx [.scalar ⟨x.val, sz⟩]
+  ofValue := fun v =>
+    match v with
+    | .aggregate vIdx [.scalar sv] =>
+      if vIdx == varIdx && sv.sizeBytes == sz then
+        if h : sv.bits < 2 ^ (8 * sz) ∧ wrappingRangeContains range sv.bits = true then
+          some ⟨sv.bits, h⟩
+        else none
+      else none
+    | _ => none
+  ofValue_toValue := fun ⟨bits, hProp⟩ => by
+    simp [hProp]
+  tySize_eq := by
+    unfold rigidTyByteSize rigidTyKindByteSize
+    rw [hLookup]
+    exact congrArg some hSize
+  encode_toValue := fun ⟨bits, hProp⟩ => by
+    unfold defaultCodecFuel encodeValueToBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hInhab]
+    dsimp only
+    rw [hVar]
+    dsimp only
+    rw [hFields, hSize]
+    dsimp only
+    have hCond :
+        Bool.and (Nat.beq varIdx varIdx)
+          (Nat.beq (Trusted.Sequence.length ([{ bytes := 0 }] : List Size))
+            (Trusted.Sequence.length [Value.scalar ⟨bits, sz⟩])) = true := by
+      rw [nat_beq_self varIdx]
+      rfl
+    rw [hCond]
+    dsimp only
+    have hArgsNe : Nat.beq (Trusted.Sequence.length ([] : List RigidTy))
+        (Trusted.Sequence.length ([{ bytes := 0 }] : List Size)) = false := rfl
+    rw [hArgsNe]
+    dsimp only [encodeFieldsAtOffsetsWith, encodeUntypedValueToBytes]
+    unfold encodeScalarBytes
+    have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+    dsimp only
+    rw [hBeq0]
+    dsimp only
+    have hWrite :
+        writeAbstractBytesAt (replicateUninitBytes sz) 0
+          (encodeLittleEndianBytes bits sz none) =
+        some (encodeLittleEndianBytes bits sz none) := by
+      have hRep : replicateUninitBytes sz = replicateUninitBytes sz ++ [] :=
+        (List.append_nil _).symm
+      rw [hRep,
+          writeAbstractBytesAt_zero_replicateUninit
+            (encodeLittleEndianBytes bits sz none) []
+            (length_encodeLittleEndianBytes none sz bits),
+          List.append_nil]
+    rw [hWrite]
+    rfl
+  enforcesUntypedFieldWidths := false
+  encode_length_and_init_of_isInit := fun h => nomatch h
+  decode_eq_map := fun bs => by
+    have hScalarWidth : scalarLayoutByteWidth (.initialized pk range) = some l.size.bytes := by
+      unfold scalarLayoutByteWidth
+      dsimp only
+      rw [hWidth, hSize]
+    rw [show defaultCodecFuel = 15 + 1 from rfl,
+        decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l varIdx
+          memoryOrder (.initialized pk range) hLookup hInhab hVar hFields hNoFieldLayouts
+          hRepr hScalarWidth]
+    have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+    rw [hLenDef, hSize]
+    cases hLen : Nat.beq bs.length sz
+    · have hNe : bs.length ≠ sz := fun hEq => by
+        rw [Nat.beq_eq.mpr hEq] at hLen; nomatch hLen
+      rw [(FixedByteCodec.scalarValidRange_isExactWidth sz hNz range).decode_eq_none_of_length_ne hNe]
+      rfl
+    · dsimp only
+      rw [FixedByteCodec.decodeScalarLayoutBytes_initialized_nonPtr_eq_scalarValidRange_map
+            pk range sz hNz hNonPtr hWidth bs]
+      cases (FixedByteCodec.scalarValidRange sz hNz range).decode bs <;> rfl
+
+/--
+Integer specialization of `scalarNicheNewtypeNonPtr` for single-field scalar-niche
+newtype ADTs `.adt defPath []` (such as newtype `NonZeroU8` / `NonZeroU32` with
+`l.fields = .arbitrary [{ bytes := 0 }] memoryOrder` and `l.fieldLayouts = []`).
+-/
+def scalarNicheNewtype
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (sz bitsWidth : Nat) (signed : Bool) (varIdx : VariantIdx)
+    (memoryOrder : List Nat) (range : WrappingRange)
+    (hNz : 0 < sz)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) range))
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz) :
+    MirValueCodec layouts { kind := .adt defPath [], layoutIdx := idx }
+      { bits : Nat // bits < 2 ^ (8 * sz) ∧ wrappingRangeContains range bits = true } sz :=
+  scalarNicheNewtypeNonPtr layouts defPath idx l sz (.int bitsWidth signed) varIdx
+    memoryOrder range hNz rfl hLookup hInhab hSize hFields hNoFieldLayouts hVar hRepr hWidth
+
+/--
+Kernel divergence witness explaining why `scalarNicheNewtype` sets
+`enforcesUntypedFieldWidths := false`: on `.adt defPath []` with
+`l.fields = .arbitrary [{ bytes := 0 }] memoryOrder` and `0 < sz`, passing the
+ill-typed 0-byte field `.aggregate varIdx [.unit]` to `encodeValueToBytes` hits
+`encodeUntypedValueToBytes` and returns `some (replicateUninitBytes sz)`, so
+untyped `BitValidity.IsIntoBytes` does not hold (while well-typed transmutation
+holds via `transmute_typed` and `transmute_sound_of_decoded`).
+-/
+theorem scalarNicheNewtype_untyped_unit_field_divergence
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (sz : Nat) (varIdx : VariantIdx) (memoryOrder : List Nat)
+    (hNz : 0 < sz)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hVar : l.variants = .single varIdx) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .adt defPath [], layoutIdx := idx }
+        (.aggregate varIdx [.unit]) = some (replicateUninitBytes sz) ∧
+    ¬ IsIntoBytes layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  have hEncUnit :
+      encodeValueToBytes defaultCodecFuel layouts { kind := .adt defPath [], layoutIdx := idx }
+        (.aggregate varIdx [.unit]) = some (replicateUninitBytes sz) := by
+    unfold defaultCodecFuel encodeValueToBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hInhab]
+    dsimp only
+    rw [hVar]
+    dsimp only
+    rw [hFields, hSize]
+    dsimp only
+    have hCond :
+        Bool.and (Nat.beq varIdx varIdx)
+          (Nat.beq (Trusted.Sequence.length ([{ bytes := 0 }] : List Size))
+            (Trusted.Sequence.length [Value.unit])) = true := by
+      rw [nat_beq_self varIdx]
+      rfl
+    rw [hCond]
+    dsimp only
+    have hArgsNe : Nat.beq (Trusted.Sequence.length ([] : List RigidTy))
+        (Trusted.Sequence.length ([{ bytes := 0 }] : List Size)) = false := rfl
+    rw [hArgsNe]
+    dsimp only [encodeFieldsAtOffsetsWith, encodeUntypedValueToBytes, writeAbstractBytesAt]
+    cases sz with
+    | zero => omega
+    | succ _ => rfl
+  refine ⟨hEncUnit, ?_⟩
+  rintro ⟨_, _, hEncProps⟩
+  have ⟨_, hInit⟩ := hEncProps (.aggregate varIdx [.unit]) (replicateUninitBytes sz) hEncUnit
+  rw [allBytesInitialized_replicateUninitBytes_eq_false hNz] at hInit
+  nomatch hInit
+
+/--
+Impossibility of a zero-rejecting niche `MirValueCodec` on monomorphized
+`NonZero<u32>` (`.adt defPath [.uint .u32]`): because `args.length == offsets.length`,
+`Trusted`'s `decodeValueFromBytes` decodes the field at `.uint .u32` and ignores
+`l.backendRepr` (`adt_generic_nonZero_typeArg_path_niche_unenforced`), so `IsFromZeros`
+holds and *every* `MirValueCodec` for `{ kind := .adt defPath [.uint .u32], layoutIdx := idx }`
+must satisfy `m.codec.HasZeroValid`.
+-/
+theorem monomorphized_nonZero_u32_forces_hasZeroValid
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (varIdx : VariantIdx) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single varIdx)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hSz : l.size.bytes = 4)
+    (hRepr : l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩)) :
+    IsFromZeros layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } ∧
+    ∀ {α : Type} (m : MirValueCodec layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } α 4),
+      m.codec.HasZeroValid := by
+  have ⟨_, hDec0, hFz⟩ :=
+    adt_generic_nonZero_typeArg_path_niche_unenforced
+      layouts defPath idx l varIdx memoryOrder hLookup hInhab hVar hFields hSz hRepr
+  refine ⟨hFz, ?_⟩
+  intro α m
+  rw [m.decode_eq_map (zeroInitBytes 4)] at hDec0
+  cases hC : m.codec.decode (zeroInitBytes 4) <;> rw [hC] at hDec0
+  · nomatch hDec0
+  case some x₀ =>
+    exact ⟨x₀, hC⟩
+
+/--
+`MirValueCodec` for a real multi-variant fieldless `#[repr(uN)]` / `#[repr(Int)]` enum
+`.adt defPath args` (`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
+`l.fields = .arbitrary [{ bytes := 0 }] memoryOrder`), bridged to
+`FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds` with `toValue e = .aggregate (toTag e) []`
+under `Trusted`'s direct variant-index discriminant discipline (`0 .. k - 1`).
+
+Proves full `enforcesUntypedFieldWidths := true` (`IsIntoBytes` via
+`BitValidity.adt_multiple_enum_fieldless_isIntoBytes`) and pointwise `decode_eq_map`
+via `BitValidity.decodeValueFromBytes_adt_multiple_enum_scalarLayout`.
+-/
+def fieldlessEnum {ε : Type}
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (sz bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (toTag : ε → Nat) (ofTag : Nat → Option ε)
+    (hRound : ∀ e : ε, ofTag (toTag e) = some e)
+    (hBounds : ∀ e : ε, toTag e < 2 ^ (8 * sz))
+    (hNz : 0 < sz)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
+    (hAllFieldless :
+      ∀ (varIdx : Nat) (varOffsets : List Size) (varMemOrder : List Nat),
+        Trusted.Sequence.get? variantShapes varIdx = some (.arbitrary varOffsets varMemOrder) →
+        varOffsets = [])
+    (hTagValid :
+      ∀ e : ε,
+        wrappingRangeContains validRange (toTag e) = true ∧
+        ∃ vm, Trusted.Sequence.get? variantShapes (toTag e) = some (.arbitrary [] vm))
+    (hTagComplete :
+      ∀ (t : Nat) (varShape : FieldsShape),
+        t < 2 ^ (8 * sz) →
+        wrappingRangeContains validRange t = true →
+        Trusted.Sequence.get? variantShapes t = some varShape →
+        ∃ e : ε, toTag e = t) :
+    MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx } ε sz where
+  codec := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
+  toValue := fun e => .aggregate (toTag e) []
+  ofValue := fun v =>
+    match v with
+    | .aggregate tag [] =>
+      match ofTag tag with
+      | some e => if Nat.beq (toTag e) tag then some e else none
+      | none => none
+    | _ => none
+  ofValue_toValue := fun e => by
+    simp only []
+    rw [hRound e]
+    dsimp only
+    rw [nat_beq_self (toTag e)]
+    rfl
+  tySize_eq := by
+    unfold rigidTyByteSize rigidTyKindByteSize
+    rw [hLookup]
+    exact congrArg some hSize
+  encode_toValue := fun e => by
+    rcases (hTagValid e).2 with ⟨vm, hGetVar⟩
+    have hScalarWidth :
+        scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) = some sz :=
+      hWidth
+    unfold defaultCodecFuel encodeValueToBytes
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hInhab]
+    dsimp only
+    rw [hVar]
+    dsimp only
+    rw [hFields, hScalarWidth, hGetVar]
+    dsimp only
+    have hGet0 : Trusted.Sequence.get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
+    rw [hGet0, hSize]
+    dsimp only
+    unfold encodeScalarBytes
+    have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
+    dsimp only
+    rw [hBeq0]
+    dsimp only
+    have hWrite :
+        writeAbstractBytesAt (replicateUninitBytes sz) 0
+          (encodeLittleEndianBytes (toTag e) sz none) =
+        some (encodeLittleEndianBytes (toTag e) sz none) := by
+      have hRep : replicateUninitBytes sz = replicateUninitBytes sz ++ [] :=
+        (List.append_nil _).symm
+      rw [hRep,
+          writeAbstractBytesAt_zero_replicateUninit
+            (encodeLittleEndianBytes (toTag e) sz none) []
+            (length_encodeLittleEndianBytes none sz (toTag e)),
+          List.append_nil]
+    rw [hWrite]
+    rfl
+  enforcesUntypedFieldWidths := true
+  encode_length_and_init_of_isInit := fun _ _ v bs hEnc => by
+    have hScalarWidth :
+        scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) =
+          some l.size.bytes := by
+      unfold scalarLayoutByteWidth
+      dsimp only
+      rw [hWidth, hSize]
+    rcases adt_multiple_enum_fieldless_isIntoBytes layouts defPath args idx l
+        (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+        hLookup hInhab hVar hFields hScalarWidth hAllFieldless with ⟨sz', hSz', hInto⟩
+    have hSzEq : sz' = sz := by
+      unfold rigidTyByteSize rigidTyKindByteSize at hSz'
+      rw [hLookup] at hSz'
+      dsimp only at hSz'
+      rw [hSize] at hSz'
+      exact Option.some.inj hSz'.symm
+    subst hSzEq
+    exact hInto v bs hEnc
+  decode_eq_map := fun bs => by
+    have hScalarWidth :
+        scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) =
+          some l.size.bytes := by
+      unfold scalarLayoutByteWidth
+      dsimp only
+      rw [hWidth, hSize]
+    rw [show defaultCodecFuel = 15 + 1 from rfl,
+        decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+          (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+          hLookup hInhab hVar hFields hScalarWidth]
+    have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
+    rw [hLenDef, hSize]
+    let enumC := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
+    cases hLen : Nat.beq bs.length sz
+    · have hNe : bs.length ≠ sz := fun hEq => by
+        rw [Nat.beq_eq.mpr hEq] at hLen; nomatch hLen
+      rw [(FixedByteCodec.enumRepr_isExactWidth sz hNz toTag ofTag hRound hBounds).decode_eq_none_of_length_ne hNe]
+      rfl
+    · dsimp only
+      rw [FixedByteCodec.decodeScalarLayoutBytes_initialized_int_eq_scalarValidRange_map
+            bitsWidth signed validRange sz hNz hWidth bs]
+      unfold FixedByteCodec.scalarValidRange FixedByteCodec.mapEquiv
+             FixedByteCodec.refineNiche FixedByteCodec.ofRoundTrip
+      dsimp only
+      cases hU : (FixedByteCodec.uintBitsLE sz hNz).decode bs with
+      | none =>
+        have hENone : enumC.decode bs = none := by
+          unfold enumC FixedByteCodec.enumRepr FixedByteCodec.ofRoundTrip
+          dsimp only
+          rw [hU]
+          rfl
+        rw [hENone]
+        rfl
+      | some x =>
+        rcases x with ⟨t, ht⟩
+        dsimp only
+        cases hEnumDec : enumC.decode bs with
+        | some e =>
+          have hSome := (FixedByteCodec.enumRepr_decode_eq_some_iff
+            sz hNz toTag ofTag hRound hBounds bs e).mp hEnumDec
+          rw [hU] at hSome
+          injection hSome with hSub
+          have hTEq : t = toTag e := congrArg Subtype.val hSub
+          subst hTEq
+          rcases hTagValid e with ⟨hRangeTrue, vm, hGetVar⟩
+          simp only [hRangeTrue, ↓reduceDIte, Option.map_some]
+          rw [hGetVar]
+        | none =>
+          dsimp only [Option.map]
+          by_cases hRange : wrappingRangeContains validRange t = true
+          · simp only [hRange, ↓reduceDIte]
+            cases hGet : Trusted.Sequence.get? variantShapes t with
+            | none => rfl
+            | some varShape =>
+              rcases hTagComplete t varShape ht hRange hGet with ⟨e, hTagEq⟩
+              have hMustDecode : enumC.decode bs = some e := by
+                apply (FixedByteCodec.enumRepr_decode_eq_some_iff
+                  sz hNz toTag ofTag hRound hBounds bs e).mpr
+                rw [hU]
+                exact congrArg some (Subtype.ext hTagEq.symm)
+              rw [hMustDecode] at hEnumDec
+              nomatch hEnumDec
+          · have hRangeFalse : wrappingRangeContains validRange t = false :=
+              Bool.eq_false_iff.mpr hRange
+            simp only [hRangeFalse, Bool.false_eq_true, ↓reduceDIte]
 
 end MirValueCodec
 

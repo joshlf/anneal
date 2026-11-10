@@ -455,6 +455,8 @@ theorem pad_zero_vs_pos_isInitCodec_iff (p : Nat) :
 
 /-! ## 3. `MirValueCodec` + `Anneal.BitValidity` Marker-Trait & `transmute_sound` Bridges -/
 
+/-- `.primitive`-fields scalar-niche layout (`l.fields = .primitive`, e.g., inner
+scalar field layout referenced through `TypeLayout.fieldLayouts`). -/
 def nonZeroU32Layout : TypeLayout := {
   size := { bytes := 4 }
   align := { bytes := 4 }
@@ -495,10 +497,45 @@ def laidOutU16PairLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- Real `rustc` single-field newtype layout for `NonZeroU32` (`B3-1`, matching
+`Anneal.BitValidity` §6.4): `fields = .arbitrary [⟨0⟩] [0]`, `fieldLayouts = []`,
+and scalar niche `[1 ..= u32::MAX]` recorded on `backendRepr`. -/
+def newtypeNonZeroU32Layout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.int 32 false) nonZeroU32Range)
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := []
+}
+
+/-- Real `rustc` multi-variant fieldless `#[repr(u8)]` enum layout for `Ordering3` (`B3-3`):
+`variants = .multiple (.initialized (.int 8 false) ⟨0, 2⟩) 0 [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]`
+and `fields = .arbitrary [⟨0⟩] [0]`. -/
+def ordering3EnumLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 2 })
+    0
+    [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+  isUninhabited := false
+}
+
 def testLayouts : LayoutTable := {
   pointerBits := 64
   isLittleEndian := true
-  entries := [nonZeroU32Layout, paddedU16TupleLayout, paddedU8U32TupleLayout, laidOutU16PairLayout]
+  entries := [
+    nonZeroU32Layout,
+    paddedU16TupleLayout,
+    paddedU8U32TupleLayout,
+    laidOutU16PairLayout,
+    newtypeNonZeroU32Layout,
+    ordering3EnumLayout
+  ]
 }
 
 def mirUnit : MirValueCodec testLayouts { kind := .tuple [], layoutIdx := 0 } Unit 0 :=
@@ -517,6 +554,7 @@ def mirU32 :
       { bits : Nat // bits < 2 ^ (8 * 4) } 4 :=
   MirValueCodec.uint testLayouts .u32 0
 
+/-- `.primitive`-fields scalar-niche ADT instance (`l.fields = .primitive`). -/
 def mirNonZeroU32 :
     MirValueCodec testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 0 }
       { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true }
@@ -532,10 +570,10 @@ def mirU8x4 :
   MirValueCodec.uintArray testLayouts .u8 4 (by decide) 0
 
 def mirU16Pair :
-    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 4 }
+    MirValueCodec testLayouts { kind := .tuple [.uint .u16, .uint .u16], layoutIdx := 6 }
       ({ bits : Nat // bits < 2 ^ (8 * 2) } × { bits : Nat // bits < 2 ^ (8 * 2) })
       4 :=
-  MirValueCodec.uintPairTuple testLayouts .u16 .u16 4 rfl
+  MirValueCodec.uintPairTuple testLayouts .u16 .u16 6 rfl
 
 def mirPaddedU16Tuple :
     MirValueCodec testLayouts { kind := .tuple [.uint .u16], layoutIdx := 1 }
@@ -556,6 +594,39 @@ def mirLaidOutU16Pair :
       4 :=
   MirValueCodec.uintPairArbitraryTuple
     testLayouts .u16 .u16 0 0 3 laidOutU16PairLayout [0, 1] rfl rfl rfl
+
+/-- Real single-field newtype `NonZeroU32` (`B3-1`, `fields = .arbitrary [⟨0⟩] [0]`,
+`fieldLayouts = []`, `toValue x = .aggregate 0 [.scalar ⟨x.val, 4⟩]`). -/
+def mirNewtypeNonZeroU32 :
+    MirValueCodec testLayouts { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 4 }
+      { bits : Nat // bits < 2 ^ (8 * 4) ∧ wrappingRangeContains nonZeroU32Range bits = true }
+      4 :=
+  MirValueCodec.scalarNicheNewtype
+    testLayouts "core::num::NonZeroU32" 4 newtypeNonZeroU32Layout 4 32 false 0 [0]
+    nonZeroU32Range (by decide) rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- Real multi-variant fieldless `#[repr(u8)]` enum `Ordering3` (`B3-3`,
+`variants = .multiple`, `toValue e = .aggregate (ordering3ToTag e) []`). -/
+def mirOrdering3Enum :
+    MirValueCodec testLayouts { kind := .adt "test::Ordering3" [], layoutIdx := 5 }
+      Ordering3 1 :=
+  MirValueCodec.fieldlessEnum
+    testLayouts "test::Ordering3" [] 5 ordering3EnumLayout 1 8 false
+    { start := 0, end_ := 2 }
+    [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []] [0]
+    ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
+    (by decide) rfl rfl rfl rfl rfl rfl
+    (fun varIdx varOffsets varMemOrder hGet => by
+      match varIdx with
+      | 0 | 1 | 2 => injection hGet with hShape; injection hShape with hOff _; exact hOff.symm
+      | _ + 3 => nomatch hGet)
+    (fun e => by cases e <;> exact ⟨rfl, [], rfl⟩)
+    (fun t _ _ _ hGet => by
+      match t with
+      | 0 => exact ⟨.less, rfl⟩
+      | 1 => exact ⟨.equal, rfl⟩
+      | 2 => exact ⟨.greater, rfl⟩
+      | _ + 3 => nomatch hGet)
 
 /-- `u32` satisfies all four zerocopy marker traits with a non-vacuous `IsTryFromBytes` range bound. -/
 theorem mirU32_all_marker_traits :
@@ -779,6 +850,102 @@ theorem transmute_u8x4_to_laidOutU16Pair_sound
       (FixedByteCodec.padRight_isSurjectiveInitDecoder 0
         (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 2 (by decide))))
     v bs hEnc
+
+/-- Real single-field newtype `NonZeroU32` (`B3-1`): satisfies non-vacuous `IsTryFromBytes`
+(`v = .aggregate 0 [.scalar ⟨bits, 4⟩]` with `1 ≤ bits < 2^32`, `bits ≠ 0`), `¬ IsFromBytes`,
+`¬ IsFromZeros`, and well-typed/decoded transmutation `NonZeroU32 → u32`
+(`transmute_typed` and `transmute_sound_of_decoded`), while untyped `BitValidity.IsIntoBytes`
+fails on ill-typed `.aggregate 0 [.unit]` (`scalarNicheNewtype_untyped_unit_field_divergence`). -/
+theorem mirNewtypeNonZeroU32_traits_and_transmute :
+    let newtypeTy : Ty := { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 4 }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    IsTryFromBytes testLayouts newtypeTy
+      (fun v =>
+        ∃ bits, 1 ≤ bits ∧ bits < 2 ^ 32 ∧
+          v = .aggregate 0 [.scalar ⟨bits, 4⟩]) ∧
+    ¬ IsFromBytes testLayouts newtypeTy ∧
+    ¬ IsFromZeros testLayouts newtypeTy ∧
+    ¬ IsIntoBytes testLayouts newtypeTy ∧
+    (∀ (bs₀ : List AbstractByte) (v : Value) (bs : List AbstractByte),
+      decodeValueFromBytes defaultCodecFuel testLayouts newtypeTy bs₀ = some v →
+      encodeValueToBytes defaultCodecFuel testLayouts newtypeTy v = some bs →
+      ∃ v', decodeValueFromBytes defaultCodecFuel testLayouts u32Ty bs = some v') := by
+  refine
+    ⟨mirNewtypeNonZeroU32.isTryFromBytes_of ?_,
+     mirNewtypeNonZeroU32.not_isFromBytes_of_rejected_init
+       (bs := encodeLittleEndianBytes 0 4 none)
+       (length_encodeLittleEndianBytes none 4 0)
+       (allBytesInitialized_encodeLittleEndianBytes none 4 0)
+       nonZeroU32ScalarValidRange_rejects_zero,
+     mirNewtypeNonZeroU32.not_isFromZeros_of_zero_none
+       (by
+         rw [← encodeLittleEndianBytes_zero_eq_zeroInitBytes 4]
+         exact nonZeroU32ScalarValidRange_rejects_zero),
+     (MirValueCodec.scalarNicheNewtype_untyped_unit_field_divergence
+       testLayouts "core::num::NonZeroU32" 4 newtypeNonZeroU32Layout 4 0 [0]
+       (by decide) rfl rfl rfl rfl rfl).2,
+     fun bs₀ v bs hDec hEnc =>
+       MirValueCodec.transmute_sound_of_decoded mirNewtypeNonZeroU32 mirU32
+         (FixedByteCodec.scalarValidRange_isInitCodec 4 (by decide) nonZeroU32Range)
+         (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide))
+         hDec hEnc⟩
+  rintro ⟨bits, hLt, hRange⟩
+  have hGe1 : 1 ≤ bits := by
+    unfold wrappingRangeContains nonZeroU32Range at hRange
+    dsimp only at hRange
+    have hBle : Nat.ble 1 (2 ^ 32 - 1) = true := by decide
+    rw [hBle] at hRange
+    dsimp only at hRange
+    simp only [Bool.and_eq_true] at hRange
+    exact Nat.le_of_ble_eq_true hRange.1
+  exact ⟨bits, hGe1, hLt, rfl⟩
+
+/-- Monomorphized `NonZero<u32>` (`.adt "core::num::NonZero" [.uint .u32]`, `B3-2`):
+on the exact same `newtypeNonZeroU32Layout`, `Trusted` takes the type-argument path,
+accepting `zeroInitBytes 4` (`IsFromZeros`), so every `MirValueCodec` on this form
+must satisfy `HasZeroValid` (no zero-rejecting niche codec can exist). -/
+theorem monomorphized_nonZeroU32_accepts_zero_and_blocks_niche_codec :
+    let monoTy : Ty := { kind := .adt "core::num::NonZero" [.uint .u32], layoutIdx := 4 }
+    IsFromZeros testLayouts monoTy ∧
+    (∀ {α : Type} (m : MirValueCodec testLayouts monoTy α 4), m.codec.HasZeroValid) :=
+  MirValueCodec.monomorphized_nonZero_u32_forces_hasZeroValid
+    testLayouts "core::num::NonZero" 4 newtypeNonZeroU32Layout 0 [0]
+    rfl rfl rfl rfl rfl rfl
+
+/-- Real multi-variant fieldless `#[repr(u8)]` enum `Ordering3` (`B3-3`): satisfies
+`IsIntoBytes`, `IsFromZeros`, non-vacuous `IsTryFromBytes` (`tag < 3`), `¬ IsFromBytes`
+(tag `3` rejected), and full `MirValueCodec.transmute_sound` (`Ordering3 → u8`). -/
+theorem mirOrdering3Enum_marker_traits_and_transmute :
+    let enumTy : Ty := { kind := .adt "test::Ordering3" [], layoutIdx := 5 }
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+    IsIntoBytes testLayouts enumTy ∧
+    IsFromZeros testLayouts enumTy ∧
+    IsTryFromBytes testLayouts enumTy
+      (fun v => ∃ tag, tag < 3 ∧ v = .aggregate tag []) ∧
+    ¬ IsFromBytes testLayouts enumTy ∧
+    (∀ (v : Value) (bs : List AbstractByte),
+      encodeValueToBytes defaultCodecFuel testLayouts enumTy v = some bs →
+      ∃ v', decodeValueFromBytes defaultCodecFuel testLayouts u8Ty bs = some v') :=
+  ⟨mirOrdering3Enum.isIntoBytes
+     (FixedByteCodec.enumRepr_isInitCodec
+       1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds),
+   mirOrdering3Enum.isFromZeros
+     (FixedByteCodec.enumRepr_hasZeroValid_of
+       1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds
+       .less rfl),
+   mirOrdering3Enum.isTryFromBytes_of
+     (fun e => ⟨ordering3ToTag e, by cases e <;> decide, rfl⟩),
+   mirOrdering3Enum.not_isFromBytes_of_rejected_init
+     (bs := encodeLittleEndianBytes 3 1 none)
+     (length_encodeLittleEndianBytes none 1 3)
+     (allBytesInitialized_encodeLittleEndianBytes none 1 3)
+     ordering3Codec_rejects_discriminant_3,
+   fun v bs hEnc =>
+     MirValueCodec.transmute_sound mirOrdering3Enum mirU8
+       (FixedByteCodec.enumRepr_isInitCodec
+         1 (by decide) ordering3ToTag ordering3OfTag ordering3_round ordering3_bounds)
+       (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide))
+       v bs hEnc⟩
 
 /-! ## 4. Fuel-Free Structural Recursion (`termination_by`) via `sizeOf_lt_*` -/
 
