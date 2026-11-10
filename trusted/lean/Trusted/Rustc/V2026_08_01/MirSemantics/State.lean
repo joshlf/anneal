@@ -467,6 +467,40 @@ structure Memory : Type where
       >     instance: ty::Instance<'tcx>,
       > }," -/
   fnPtrs : List FnPtrEntry := .nil
+  /-- Allocation IDs whose provenance has been exposed via
+      `CastKind.pointerExposeProvenance` (`ptr.expose_provenance()` / `ptr as usize`),
+      allowing `CastKind.pointerWithExposedProvenance` (`ptr::with_exposed_provenance`
+      / `usize as *const T`) to recover tracked provenance (`Value.ptr`).
+
+      Reference (MiniRust `spec/mem/intptrcast.md`):
+      `IntPtrCast::expose` inserts `provenance` into `exposed`, and `IntPtrCast::int2ptr`
+      predicts exposed provenance when available or `None` otherwise. -/
+  exposedAllocIds : List Nat := .nil
+
+/--
+Check whether `allocId` has been recorded in `exposed` via
+`CastKind.pointerExposeProvenance`.
+-/
+@[reducible]
+def isExposedAllocId : List Nat → Nat → Bool
+  | .nil, _ => false
+  | h :: t, allocId =>
+    match Nat.beq h allocId with
+    | true => true
+    | false => isExposedAllocId t allocId
+
+/--
+Record `allocId` in `exposed` (deduplicating and ignoring `allocId = 0`, which
+represents synthetic provenance-less addresses rather than a real allocation).
+-/
+@[reducible]
+def recordExposedAllocId (exposed : List Nat) (allocId : Nat) : List Nat :=
+  match Nat.beq allocId 0 with
+  | true => exposed
+  | false =>
+    match isExposedAllocId exposed allocId with
+    | true => exposed
+    | false => allocId :: exposed
 
 /--
 Default empty `Memory` state used when evaluating pure `Rvalue` expressions
@@ -485,6 +519,7 @@ def emptyMemory : Memory where
   nextProtector := 1
   callerLocals := .nil
   fnPtrs := .nil
+  exposedAllocIds := .nil
 
 /--
 Small-step machine configuration for `CapturedMir` execution.

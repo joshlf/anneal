@@ -32,6 +32,16 @@ This module formalizes the four semantic components lowered and evaluated in
 soundness invariants, lens laws, and step correspondence/refinement against
 `Trusted.Rustc.V2026_06_01.MirSemantics`:
 
+0. **Section 0 — Union-Dispatch Bridges**: Trusted routes non-`Deref` projected
+   accesses through a union-aware path whenever `placeTouchesUnion localDecls
+   layouts p = true`. Section 0 collapses that dispatch to the plain value-tree
+   `readProjectedValue` / `writeProjectedValue` under `placeTouchesUnion … = false`
+   and discharges that side condition structurally for arbitrary `localDecls` /
+   `layouts` (tuples, arrays, scalars, non-union ADTs, union-free layout tables,
+   and multi-step field chains), so every correspondence theorem below is stated
+   for the same arbitrary `localDecls` that Trusted's `evalStmt` / `evalRvalue`
+   thread into `evalOperand`, `writePlaceValue`, and `writeProjectedForLocal`.
+
 1. **Section 1 — Pure Value-Tree Projections & Lens Laws**:
    - Normalized value-tree projection evaluators (`evalConstantIndex`,
      `evalValueProjRead`, `evalValueProjWrite`) covering `.field`, `.downcast`
@@ -87,7 +97,12 @@ soundness invariants, lens laws, and step correspondence/refinement against
      `Trusted.Rustc.V2026_06_01.MirSemantics` (`evalOperand` bare vs. projected
      `.move`, `placeMentionOperandsInit` / `evalStmt` `.placeMention`,
      `.intrinsic (.assume op)`, `.storageLive`, `.storageDead`,
-     `.setDiscriminant`, and `D13b` `.assign`).
+     `.setDiscriminant`, and `D13b` `.assign`), all for arbitrary `localDecls`.
+     Projected operands, `SetDiscriminant` targets, and `Assign` destinations
+     carry an explicit non-union side condition (`operandTouchesUnion … = false`,
+     `SetDiscriminantDestOk`, `placeTouchesUnion … = false`) exactly where no
+     typing hypothesis already implies it; tuple-typed destinations derive it
+     from their `placeTy` hypothesis.
    - `D13b` refinement on frames containing incomplete flat tuple shells
      (`FlatShellRefines`, `FlatSlotStateRefines`): Anneal's field-by-field
      initialization refines Trusted's `.unit`-padded default shells for any
@@ -124,6 +139,986 @@ soundness invariants, lens laws, and step correspondence/refinement against
      value (`evalSetDiscriminantState_unit_vs_trusted_ub`), on which Trusted
      reports `.ub`.
 -/
+
+/-! ## Section 0: Union-Dispatch Bridges for `placeTouchesUnion`
+
+`Places.lean` dispatches every non-`Deref` projected access to a local on
+`placeTouchesUnion localDecls layouts p`: `evalOperand` matches on it directly, and
+`evalPlaceRead`, `writePlaceValue`, and the `.assign` arm of `evalStmt` go through
+`readProjectedForLocal` / `writeProjectedForLocal`. When the place does not project
+into a union field (`placeTouchesUnion … = false`), all of these coincide with the
+plain value-tree `readProjectedValue` / `writeProjectedValue` on which the Anneal
+correspondence theorems of Sections 1 and 4 are built. This section
+
+1. collapses the dispatch under `placeTouchesUnion … = false`
+   (`readProjectedForLocal_of_placeTouchesUnion_false`,
+   `writeProjectedForLocal_of_placeTouchesUnion_false`,
+   `evalOperand_eq_nil_localDecls_of_noUnion`, `evalOperand_copy_proj_of_noUnion`,
+   `evalOperand_move_proj_of_noUnion`, `writePlaceValue_proj_of_noUnion`), and
+2. discharges `placeTouchesUnion … = false` in a single step for arbitrary symbolic
+   `localDecls` / `layouts`, without unfolding `placeTouchesUnion` at call sites:
+   - root and `Deref` places, empty `localDecls`, empty layout tables, and
+     undeclared locals (`placeTouchesUnion_nil_proj`, `placeTouchesUnion_deref`,
+     `placeTouchesUnion_nil_decls`, `placeTouchesUnion_of_entries_nil`,
+     `placeTouchesUnion_of_get?_none`);
+   - layout tables without any union entry, covering every struct, enum, tuple,
+     array, and scalar layout (`placeTouchesUnion_false_of_layoutsHaveNoUnion`);
+   - projections without a `.field` step before the first `Deref` (array/slice
+     indexing, subslicing, enum downcasts;
+     `placeTouchesUnion_false_of_noFieldBeforeDeref`);
+   - places whose every `.field` step leaves a non-ADT base (tuples, arrays,
+     scalars) or an ADT whose layout index resolves to a non-union `TypeLayout`
+     (`projFieldBasesNonUnion`, `placeTouchesUnion_false_of_projFieldBasesNonUnion`,
+     tracking array element layouts through `certElemTy`), with ready-made
+     corollaries for non-union struct/enum fields, tuple fields, two-level tuple
+     fields, and arbitrary-depth tuple field chains
+     (`placeTouchesUnion_nonUnion_adt_field_false`, `layoutIdxIsNonUnion_of_lookup`,
+     `placeTouchesUnion_tuple_field_false`,
+     `placeTouchesUnion_tuple_nested_field_false`,
+     `placeTouchesUnion_false_of_isTupleFieldChain` in Section 4).
+
+Projected `SetDiscriminant` additionally passes through the `validateValueForTy?`
+check of `writePlaceValue`; `SetDiscriminantDestOk` packages both side conditions.
+-/
+
+/-- `true` exactly for ADT kinds (`RigidTy.adt`), the only kinds that
+`isUnionLayout` can classify as unions. -/
+def rigidTyIsAdt : RigidTy → Bool
+  | .adt _ _ => true
+  | _ => false
+
+/-- `true` exactly for the union field shape (`FieldsShape.union`). -/
+def fieldsShapeIsUnion : FieldsShape → Bool
+  | .union _ => true
+  | _ => false
+
+/-- `true` when no `TypeLayout` entry of `layouts` has a union field shape. -/
+def layoutsHaveNoUnion (layouts : LayoutTable) : Bool :=
+  layouts.entries.all fun l => !fieldsShapeIsUnion l.fields
+
+/-- `true` when `idx` is a non-zero index of an existing, non-union `TypeLayout`
+in `layouts`. `resolveTyWithLocalDecls` leaves types with such indices unchanged. -/
+def layoutIdxIsNonUnion (layouts : LayoutTable) (idx : LayoutIdx) : Bool :=
+  match Nat.beq idx 0 with
+  | true => false
+  | false =>
+    match LayoutTable.lookup layouts idx with
+    | .some l => !fieldsShapeIsUnion l.fields
+    | .none => false
+
+/-- A `.field` step out of a value of type `ty` cannot enter a union: `ty` is not
+an ADT, or it is an ADT whose layout index resolves to a non-union `TypeLayout`
+(`layoutIdxIsNonUnion`). -/
+def tyIsNonUnionFieldBase (layouts : LayoutTable) (ty : Ty) : Bool :=
+  match rigidTyIsAdt ty.kind with
+  | false => true
+  | true => layoutIdxIsNonUnion layouts ty.layoutIdx
+
+/-- Element type reached by an `.index` / `.constantIndex` step out of `baseTy`
+whose element type is `elemTy` (`elemTyOf`), as far as the choice made by
+`tyProjTouchesUnion` is determined without `localDecls`: when `baseTy` has a
+resolved array layout recording an element layout index (`fieldLayouts = flIdx :: _`),
+that index; otherwise `elemTy` itself, whose synthesized index `0` is unresolved. -/
+def certElemTy (layouts : LayoutTable) (baseTy elemTy : Ty) : Ty :=
+  match isUnresolvedLayoutIdx layouts baseTy.layoutIdx with
+  | true => elemTy
+  | false =>
+    match LayoutTable.lookup layouts baseTy.layoutIdx with
+    | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+      { elemTy with layoutIdx := flIdx }
+    | _ => elemTy
+
+/-- Layout-checked union-freedom certificate for walking `proj` from `baseTy`,
+mirroring `tyProjTouchesUnion`: every `.field` step projects out of a
+`tyIsNonUnionFieldBase` type. The type reached after a `.field`, `.opaqueCast`, or
+`.unwrapUnsafeBinder` step is the step's annotation, after an `.index` /
+`.constantIndex` step it is the element type with the container's recorded element
+layout (`certElemTy`), and `.subslice` / `.downcast` keep the base type. The walk
+stops at the first `Deref`. -/
+def projFieldBasesNonUnion (layouts : LayoutTable) : Ty → List ProjectionElem → Bool
+  | _, .nil => true
+  | _, .deref :: _ => true
+  | baseTy, .field _ fieldTy :: rest =>
+    match tyIsNonUnionFieldBase layouts baseTy with
+    | true => projFieldBasesNonUnion layouts fieldTy rest
+    | false => false
+  | _, .opaqueCast castTy :: rest => projFieldBasesNonUnion layouts castTy rest
+  | _, .unwrapUnsafeBinder innerTy :: rest => projFieldBasesNonUnion layouts innerTy rest
+  | baseTy, .index _ :: rest =>
+    match elemTyOf baseTy with
+    | .some elemTy => projFieldBasesNonUnion layouts (certElemTy layouts baseTy elemTy) rest
+    | .none => true
+  | baseTy, .constantIndex _ _ _ :: rest =>
+    match elemTyOf baseTy with
+    | .some elemTy => projFieldBasesNonUnion layouts (certElemTy layouts baseTy elemTy) rest
+    | .none => true
+  | baseTy, .subslice _ _ _ :: rest => projFieldBasesNonUnion layouts baseTy rest
+  | baseTy, .downcast _ _ :: rest => projFieldBasesNonUnion layouts baseTy rest
+
+/-- `true` when `proj` has no `.field` step before its first `Deref`. -/
+def projHasNoFieldBeforeDeref : List ProjectionElem → Bool
+  | .nil => true
+  | .deref :: _ => true
+  | .field _ _ :: _ => false
+  | _ :: rest => projHasNoFieldBeforeDeref rest
+
+/-- Under `placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false`,
+`readProjectedForLocal` is the plain value-tree read `readProjectedValue`. -/
+theorem readProjectedForLocal_of_placeTouchesUnion_false
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (rootVal : Value)
+    (proj : List ProjectionElem)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false) :
+    readProjectedForLocal locals localDecls layouts loc rootVal proj =
+      readProjectedValue locals rootVal proj := by
+  unfold readProjectedForLocal
+  rw [hNoUnion]
+
+/-- Under `placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false`,
+`writeProjectedForLocal` is the plain value-tree write `writeProjectedValue`. -/
+theorem writeProjectedForLocal_of_placeTouchesUnion_false
+    (locals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (rootVal : Value)
+    (proj : List ProjectionElem)
+    (newVal : Value)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false) :
+    writeProjectedForLocal locals localDecls layouts loc rootVal proj newVal =
+      writeProjectedValue locals rootVal proj newVal := by
+  unfold writeProjectedForLocal
+  rw [hNoUnion]
+
+/-- A root place (empty projection) never touches a union. -/
+theorem placeTouchesUnion_nil_proj
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local) :
+    placeTouchesUnion localDecls layouts ⟨loc, .nil⟩ = false := rfl
+
+/-- A place whose projection starts with `Deref` never touches a union of the
+local's own value. -/
+theorem placeTouchesUnion_deref
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (rest : List ProjectionElem) :
+    placeTouchesUnion localDecls layouts ⟨loc, .deref :: rest⟩ = false := rfl
+
+/-- With no local declarations, no place touches a union. -/
+theorem placeTouchesUnion_nil_decls (layouts : LayoutTable) (p : Place) :
+    placeTouchesUnion .nil layouts p = false := by
+  rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+  · rfl
+  · cases hd <;> rfl
+
+/-- With an empty layout table, no place touches a union. -/
+theorem placeTouchesUnion_of_entries_nil
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place)
+    (hEmpty : layouts.entries = .nil) :
+    placeTouchesUnion localDecls layouts p = false := by
+  rcases layouts with ⟨pointerBits, isLittleEndian, entries⟩
+  dsimp only at hEmpty
+  subst hEmpty
+  rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+  · rfl
+  · cases localDecls with
+    | nil => cases hd <;> rfl
+    | cons d ds => cases hd <;> rfl
+
+/-- `placeTouchesUnion` is `false` whenever the declared type of `loc` (if any)
+does not project into a union along `proj` (`tyProjTouchesUnion`). -/
+theorem placeTouchesUnion_false_of_tyProjTouchesUnion_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem)
+    (hTy : ∀ decl, get? localDecls loc = .some decl →
+      tyProjTouchesUnion localDecls layouts decl.ty proj = false) :
+    placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false := by
+  rcases layouts with ⟨pointerBits, isLittleEndian, entries⟩
+  cases proj with
+  | nil => rfl
+  | cons hd tl =>
+    cases localDecls with
+    | nil => cases hd <;> rfl
+    | cons d ds =>
+      cases entries with
+      | nil => cases hd <;> rfl
+      | cons e es =>
+        cases hd with
+        | deref => rfl
+        | _ =>
+          unfold placeTouchesUnion
+          dsimp only
+          cases hG : get? (d :: ds) loc with
+          | none => rfl
+          | some decl => exact hTy decl hG
+
+/-- A place on an undeclared local never touches a union. -/
+theorem placeTouchesUnion_of_get?_none
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem)
+    (hNone : get? localDecls loc = .none) :
+    placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false :=
+  placeTouchesUnion_false_of_tyProjTouchesUnion_false localDecls layouts loc proj
+    (fun decl hDecl => by rw [hNone] at hDecl; nomatch hDecl)
+
+/-- `resolveTyWithLocalDecls` only ever replaces the layout index: the kind is
+preserved. -/
+theorem resolveTyWithLocalDecls_kind
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty) :
+    (resolveTyWithLocalDecls localDecls layouts ty).kind = ty.kind := by
+  unfold resolveTyWithLocalDecls
+  repeat' (first | rfl | split)
+
+/-- `resolveTyWithLocalDecls` is the identity on resolved layout indices. -/
+theorem resolveTyWithLocalDecls_of_resolved
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty)
+    (hRes : isUnresolvedLayoutIdx layouts ty.layoutIdx = false) :
+    resolveTyWithLocalDecls localDecls layouts ty = ty := by
+  unfold resolveTyWithLocalDecls
+  rw [hRes]
+
+/-- Only ADT kinds can have a union layout. -/
+theorem isUnionLayout_eq_false_of_not_adt
+    (layouts : LayoutTable) (ty : Ty) (hNotAdt : rigidTyIsAdt ty.kind = false) :
+    isUnionLayout layouts ty = false := by
+  rcases ty with ⟨kind, idx⟩
+  cases kind <;> first | rfl | nomatch hNotAdt
+
+/-- `isUnionLayout` is `false` when the layout entry of `ty` (if any) is not a
+union. -/
+theorem isUnionLayout_eq_false_of_lookup
+    (layouts : LayoutTable) (ty : Ty)
+    (hNotUnion : ∀ l, LayoutTable.lookup layouts ty.layoutIdx = .some l →
+      fieldsShapeIsUnion l.fields = false) :
+    isUnionLayout layouts ty = false := by
+  unfold isUnionLayout
+  split
+  · cases hL : LayoutTable.lookup layouts ty.layoutIdx with
+    | none => rfl
+    | some l =>
+      have hl := hNotUnion l hL
+      rcases l with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+      cases fields with
+      | union n => nomatch hl
+      | _ => rfl
+  · rfl
+
+/-- In a layout table without union entries, no type has a union layout. -/
+theorem isUnionLayout_eq_false_of_layoutsHaveNoUnion
+    (layouts : LayoutTable) (ty : Ty) (hNo : layoutsHaveNoUnion layouts = true) :
+    isUnionLayout layouts ty = false := by
+  apply isUnionLayout_eq_false_of_lookup
+  intro l hL
+  have hL' : layouts.entries[ty.layoutIdx]? = .some l := hL
+  obtain ⟨hLt, hEq⟩ := List.getElem?_eq_some_iff.mp hL'
+  have hMem : l ∈ layouts.entries := hEq ▸ List.getElem_mem hLt
+  have hAll := List.all_eq_true.mp hNo l hMem
+  simpa using hAll
+
+/-- A `layoutIdxIsNonUnion` index is resolved. -/
+theorem isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion
+    (layouts : LayoutTable) (idx : LayoutIdx) (h : layoutIdxIsNonUnion layouts idx = true) :
+    isUnresolvedLayoutIdx layouts idx = false := by
+  unfold layoutIdxIsNonUnion at h
+  unfold isUnresolvedLayoutIdx
+  cases hZ : Nat.beq idx 0 with
+  | true => rw [hZ] at h; nomatch h
+  | false =>
+    rw [hZ] at h
+    dsimp only at h ⊢
+    cases hL : LayoutTable.lookup layouts idx with
+    | none => rw [hL] at h; nomatch h
+    | some _ => rfl
+
+/-- A `tyIsNonUnionFieldBase` type stays non-union after `resolveTyWithLocalDecls`. -/
+theorem isUnionLayout_resolve_eq_false_of_tyIsNonUnionFieldBase
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty)
+    (hBase : tyIsNonUnionFieldBase layouts ty = true) :
+    isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts ty) = false := by
+  unfold tyIsNonUnionFieldBase at hBase
+  cases hAdt : rigidTyIsAdt ty.kind with
+  | false =>
+    apply isUnionLayout_eq_false_of_not_adt
+    rw [resolveTyWithLocalDecls_kind]
+    exact hAdt
+  | true =>
+    rw [hAdt] at hBase
+    dsimp only at hBase
+    rw [resolveTyWithLocalDecls_of_resolved localDecls layouts ty
+      (isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion layouts ty.layoutIdx hBase)]
+    apply isUnionLayout_eq_false_of_lookup
+    intro l hL
+    unfold layoutIdxIsNonUnion at hBase
+    cases hZ : Nat.beq ty.layoutIdx 0 with
+    | true => rw [hZ] at hBase; nomatch hBase
+    | false =>
+      rw [hZ] at hBase
+      dsimp only at hBase
+      rw [hL] at hBase
+      simpa using hBase
+
+/-- Re-indexing an unresolved type within its kind preserves
+`tyIsNonUnionFieldBase` (an unresolved ADT is never a certified base). -/
+theorem tyIsNonUnionFieldBase_of_unresolved
+    (layouts : LayoutTable) (t t' : Ty)
+    (hUnres : isUnresolvedLayoutIdx layouts t.layoutIdx = true)
+    (hKind : t'.kind = t.kind)
+    (hBase : tyIsNonUnionFieldBase layouts t = true) :
+    tyIsNonUnionFieldBase layouts t' = true := by
+  unfold tyIsNonUnionFieldBase at hBase ⊢
+  rw [hKind]
+  cases hAdt : rigidTyIsAdt t.kind with
+  | false => rfl
+  | true =>
+    rw [hAdt] at hBase
+    dsimp only at hBase
+    have hRes := isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion layouts t.layoutIdx hBase
+    rw [hUnres] at hRes
+    nomatch hRes
+
+/-- `tyIsNonUnionFieldBase` is preserved by `resolveTyWithLocalDecls`. -/
+theorem tyIsNonUnionFieldBase_resolve
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (t : Ty)
+    (hBase : tyIsNonUnionFieldBase layouts t = true) :
+    tyIsNonUnionFieldBase layouts (resolveTyWithLocalDecls localDecls layouts t) = true := by
+  cases hUnres : isUnresolvedLayoutIdx layouts t.layoutIdx with
+  | false =>
+    rw [resolveTyWithLocalDecls_of_resolved localDecls layouts t hUnres]
+    exact hBase
+  | true =>
+    exact tyIsNonUnionFieldBase_of_unresolved layouts t _ hUnres
+      (resolveTyWithLocalDecls_kind localDecls layouts t) hBase
+
+/-- `elemTyOf` always synthesizes layout index `0`. -/
+theorem elemTyOf_layoutIdx_eq_zero (t e : Ty) (h : elemTyOf t = .some e) :
+    e.layoutIdx = 0 := by
+  unfold elemTyOf at h
+  split at h
+  · injection h with h; rw [← h]
+  · injection h with h; rw [← h]
+  · nomatch h
+
+/-- `certElemTy` only replaces the layout index. -/
+theorem certElemTy_kind (layouts : LayoutTable) (baseTy elemTy : Ty) :
+    (certElemTy layouts baseTy elemTy).kind = elemTy.kind := by
+  unfold certElemTy
+  repeat' (first | rfl | split)
+
+/-- Certificate transport from an unresolved type to any type of the same kind
+(an unresolved ADT is never a certified `.field` base, so re-indexing within the
+kind can only enable steps). -/
+theorem projFieldBasesNonUnion_of_unresolved (layouts : LayoutTable) :
+    ∀ (proj : List ProjectionElem) (t t' : Ty),
+      isUnresolvedLayoutIdx layouts t.layoutIdx = true →
+      t'.kind = t.kind →
+      projFieldBasesNonUnion layouts t proj = true →
+      projFieldBasesNonUnion layouts t' proj = true := by
+  intro proj
+  induction proj with
+  | nil => intro _ _ _ _ _; rfl
+  | cons hd tl ih =>
+    intro t t' hUnres hKind hCert
+    have hElem : elemTyOf t' = elemTyOf t := by
+      unfold elemTyOf
+      rw [hKind]
+    have hCertElem : ∀ e, elemTyOf t = .some e →
+        projFieldBasesNonUnion layouts (certElemTy layouts t e) tl = true →
+        projFieldBasesNonUnion layouts (certElemTy layouts t' e) tl = true := by
+      intro e hEl hCertE
+      have hZero := elemTyOf_layoutIdx_eq_zero t e hEl
+      have hSelf : certElemTy layouts t e = e := by
+        unfold certElemTy
+        rw [hUnres]
+      rw [hSelf] at hCertE
+      exact ih e _ (by rw [hZero]) (certElemTy_kind layouts t' e) hCertE
+    cases hd with
+    | deref => rfl
+    | field i fieldTy =>
+      dsimp only [projFieldBasesNonUnion] at hCert ⊢
+      cases hB : tyIsNonUnionFieldBase layouts t with
+      | false => rw [hB] at hCert; nomatch hCert
+      | true =>
+        rw [hB] at hCert
+        rw [tyIsNonUnionFieldBase_of_unresolved layouts t t' hUnres hKind hB]
+        exact hCert
+    | opaqueCast _ => exact hCert
+    | unwrapUnsafeBinder _ => exact hCert
+    | index _ =>
+      dsimp only [projFieldBasesNonUnion] at hCert ⊢
+      rw [hElem]
+      cases hEl : elemTyOf t with
+      | none => rfl
+      | some e =>
+        rw [hEl] at hCert
+        exact hCertElem e hEl hCert
+    | constantIndex _ _ _ =>
+      dsimp only [projFieldBasesNonUnion] at hCert ⊢
+      rw [hElem]
+      cases hEl : elemTyOf t with
+      | none => rfl
+      | some e =>
+        rw [hEl] at hCert
+        exact hCertElem e hEl hCert
+    | subslice _ _ _ => exact ih t t' hUnres hKind hCert
+    | downcast _ _ => exact ih t t' hUnres hKind hCert
+
+/-- Certificate transport through `resolveTyWithLocalDecls`. -/
+theorem projFieldBasesNonUnion_resolve
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (proj : List ProjectionElem)
+    (t : Ty) (hCert : projFieldBasesNonUnion layouts t proj = true) :
+    projFieldBasesNonUnion layouts (resolveTyWithLocalDecls localDecls layouts t) proj = true := by
+  cases hUnres : isUnresolvedLayoutIdx layouts t.layoutIdx with
+  | false =>
+    rw [resolveTyWithLocalDecls_of_resolved localDecls layouts t hUnres]
+    exact hCert
+  | true =>
+    exact projFieldBasesNonUnion_of_unresolved layouts proj t _ hUnres
+      (resolveTyWithLocalDecls_kind localDecls layouts t) hCert
+
+/-- Element step of the certificate soundness proof: the element type chosen by
+`tyProjTouchesUnion` after an `.index` / `.constantIndex` step inherits the
+certificate of `certElemTy`. -/
+theorem tyProjTouchesUnion_elem_step
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (tl : List ProjectionElem)
+    (baseTy elemTy : Ty)
+    (hEl : elemTyOf baseTy = .some elemTy)
+    (ih : ∀ t', projFieldBasesNonUnion layouts t' tl = true →
+      tyProjTouchesUnion localDecls layouts t' tl = false)
+    (hCert : projFieldBasesNonUnion layouts (certElemTy layouts baseTy elemTy) tl = true) :
+    (match elemTy with
+      | { kind := ek, .. } =>
+        tyProjTouchesUnion localDecls layouts
+          (match LayoutTable.lookup layouts
+              (resolveTyWithLocalDecls localDecls layouts baseTy).layoutIdx with
+            | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+              { kind := ek, layoutIdx := flIdx }
+            | _ =>
+              resolveTyWithLocalDecls localDecls layouts
+                { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek })
+          tl) = false := by
+  have hZero := elemTyOf_layoutIdx_eq_zero baseTy elemTy hEl
+  rcases elemTy with ⟨ek, eIdx⟩
+  dsimp only at hZero
+  subst hZero
+  dsimp only
+  apply ih
+  cases hUnres : isUnresolvedLayoutIdx layouts baseTy.layoutIdx with
+  | true =>
+    have hSelf :
+        certElemTy layouts baseTy { kind := ek, layoutIdx := 0 } =
+          { kind := ek, layoutIdx := 0 } := by
+      unfold certElemTy
+      rw [hUnres]
+    rw [hSelf] at hCert
+    repeat' split
+    all_goals first
+      | exact projFieldBasesNonUnion_of_unresolved layouts tl
+          { kind := ek, layoutIdx := 0 } _ rfl rfl hCert
+      | exact projFieldBasesNonUnion_of_unresolved layouts tl
+          { kind := ek, layoutIdx := 0 } _ rfl
+          (resolveTyWithLocalDecls_kind localDecls layouts _) hCert
+  | false =>
+    rw [resolveTyWithLocalDecls_of_resolved localDecls layouts baseTy hUnres]
+    unfold certElemTy at hCert
+    rw [hUnres] at hCert
+    dsimp only at hCert
+    cases hL : LayoutTable.lookup layouts baseTy.layoutIdx with
+    | none =>
+      rw [hL] at hCert
+      exact projFieldBasesNonUnion_of_unresolved layouts tl
+        { kind := ek, layoutIdx := 0 } _ rfl
+        (resolveTyWithLocalDecls_kind localDecls layouts _) hCert
+    | some l =>
+      rw [hL] at hCert
+      rcases l with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+      cases fields <;> cases fieldLayouts <;> (try dsimp only at hCert) <;> (try dsimp only) <;>
+        first
+          | exact hCert
+          | exact projFieldBasesNonUnion_of_unresolved layouts tl
+              { kind := ek, layoutIdx := 0 } _ rfl
+              (resolveTyWithLocalDecls_kind localDecls layouts _) hCert
+
+/-- Soundness of the certificate: a `projFieldBasesNonUnion` walk never projects
+into a union, for every `localDecls`. -/
+theorem tyProjTouchesUnion_eq_false_of_projFieldBasesNonUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (proj : List ProjectionElem) (baseTy : Ty),
+      projFieldBasesNonUnion layouts baseTy proj = true →
+      tyProjTouchesUnion localDecls layouts baseTy proj = false := by
+  intro proj
+  induction proj with
+  | nil => intro _ _; rfl
+  | cons hd tl ih =>
+    intro baseTy hCert
+    have hElem :
+        elemTyOf (resolveTyWithLocalDecls localDecls layouts baseTy) = elemTyOf baseTy := by
+      unfold elemTyOf
+      rw [resolveTyWithLocalDecls_kind]
+    cases hd with
+    | deref => rfl
+    | field i fieldTy =>
+      dsimp only [projFieldBasesNonUnion] at hCert
+      cases hB : tyIsNonUnionFieldBase layouts baseTy with
+      | false => rw [hB] at hCert; nomatch hCert
+      | true =>
+        rw [hB] at hCert
+        dsimp only at hCert
+        dsimp only [tyProjTouchesUnion]
+        rw [isUnionLayout_resolve_eq_false_of_tyIsNonUnionFieldBase localDecls layouts baseTy hB]
+        dsimp only
+        apply ih
+        cases hUnres : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+        | false => exact hCert
+        | true =>
+          dsimp only
+          repeat' split
+          all_goals first
+            | exact projFieldBasesNonUnion_of_unresolved layouts tl fieldTy _ hUnres rfl hCert
+            | exact projFieldBasesNonUnion_resolve localDecls layouts tl fieldTy hCert
+    | opaqueCast castTy =>
+      dsimp only [tyProjTouchesUnion]
+      exact ih _ (projFieldBasesNonUnion_resolve localDecls layouts tl castTy hCert)
+    | unwrapUnsafeBinder innerTy =>
+      dsimp only [tyProjTouchesUnion]
+      exact ih _ (projFieldBasesNonUnion_resolve localDecls layouts tl innerTy hCert)
+    | index _ =>
+      dsimp only [projFieldBasesNonUnion] at hCert
+      dsimp only [tyProjTouchesUnion]
+      rw [hElem]
+      cases hEl : elemTyOf baseTy with
+      | none => rfl
+      | some elemTy =>
+        rw [hEl] at hCert
+        dsimp only at hCert
+        exact tyProjTouchesUnion_elem_step localDecls layouts tl baseTy elemTy hEl
+          (fun t' hC => ih t' hC) hCert
+    | constantIndex _ _ _ =>
+      dsimp only [projFieldBasesNonUnion] at hCert
+      dsimp only [tyProjTouchesUnion]
+      rw [hElem]
+      cases hEl : elemTyOf baseTy with
+      | none => rfl
+      | some elemTy =>
+        rw [hEl] at hCert
+        dsimp only at hCert
+        exact tyProjTouchesUnion_elem_step localDecls layouts tl baseTy elemTy hEl
+          (fun t' hC => ih t' hC) hCert
+    | subslice _ _ _ =>
+      dsimp only [tyProjTouchesUnion]
+      exact ih baseTy hCert
+    | downcast _ _ =>
+      dsimp only [tyProjTouchesUnion]
+      exact ih baseTy hCert
+
+/-- In a layout table without union entries, no projection touches a union. -/
+theorem tyProjTouchesUnion_eq_false_of_layoutsHaveNoUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hNo : layoutsHaveNoUnion layouts = true) :
+    ∀ (proj : List ProjectionElem) (baseTy : Ty),
+      tyProjTouchesUnion localDecls layouts baseTy proj = false := by
+  intro proj
+  induction proj with
+  | nil => intro _; rfl
+  | cons hd tl ih =>
+    intro baseTy
+    cases hd with
+    | deref => rfl
+    | field i fieldTy =>
+      dsimp only [tyProjTouchesUnion]
+      rw [isUnionLayout_eq_false_of_layoutsHaveNoUnion layouts _ hNo]
+      exact ih _
+    | index _ =>
+      dsimp only [tyProjTouchesUnion]
+      split
+      · exact ih _
+      · rfl
+    | constantIndex _ _ _ =>
+      dsimp only [tyProjTouchesUnion]
+      split
+      · exact ih _
+      · rfl
+    | opaqueCast _ => dsimp only [tyProjTouchesUnion]; exact ih _
+    | unwrapUnsafeBinder _ => dsimp only [tyProjTouchesUnion]; exact ih _
+    | subslice _ _ _ => dsimp only [tyProjTouchesUnion]; exact ih _
+    | downcast _ _ => dsimp only [tyProjTouchesUnion]; exact ih _
+
+/-- **Global non-union discharge**: in a layout table without union entries (every
+struct, enum, tuple, array, and scalar layout), no place touches a union. -/
+theorem placeTouchesUnion_false_of_layoutsHaveNoUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place)
+    (hNo : layoutsHaveNoUnion layouts = true) :
+    placeTouchesUnion localDecls layouts p = false := by
+  rcases p with ⟨loc, proj⟩
+  exact placeTouchesUnion_false_of_tyProjTouchesUnion_false localDecls layouts loc proj
+    (fun decl _ => tyProjTouchesUnion_eq_false_of_layoutsHaveNoUnion localDecls layouts hNo proj decl.ty)
+
+/-- **Per-place non-union discharge**: if `loc` is declared with type `declTy`
+and the projection carries a `projFieldBasesNonUnion` certificate from `declTy`,
+the place does not touch a union, for arbitrary `localDecls` / `layouts`. -/
+theorem placeTouchesUnion_false_of_projFieldBasesNonUnion
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (declTy : Ty)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy proj = true) :
+    placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false := by
+  apply placeTouchesUnion_false_of_tyProjTouchesUnion_false
+  intro decl hDecl
+  have hEq : decl.ty = declTy := by
+    unfold placeTy at hTy
+    dsimp only at hTy
+    rw [hDecl] at hTy
+    have hSome : Option.some decl.ty = Option.some declTy := hTy
+    injection hSome
+  rw [hEq]
+  exact tyProjTouchesUnion_eq_false_of_projFieldBasesNonUnion localDecls layouts proj declTy hCert
+
+/-- **Canonical tuple field discharge**: a single `.field` step on a local declared
+as a tuple never touches a union, for arbitrary `localDecls` / `layouts`. -/
+theorem placeTouchesUnion_tuple_field_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (fieldTys : List RigidTy) (lIdx : LayoutIdx) (i : FieldIdx) (fieldTy : Ty)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
+      .some { kind := .tuple fieldTys, layoutIdx := lIdx }) :
+    placeTouchesUnion localDecls layouts ⟨loc, [.field i fieldTy]⟩ = false :=
+  placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc _ _ hTy rfl
+
+/-- A projection with no `.field` step before its first `Deref` (e.g. `Index`,
+`ConstantIndex`, `Subslice`, `Downcast`, `OpaqueCast` chains on arrays, slices, and
+enums) is certified from every base type. -/
+theorem projFieldBasesNonUnion_of_noFieldBeforeDeref (layouts : LayoutTable) :
+    ∀ (proj : List ProjectionElem) (t : Ty),
+      projHasNoFieldBeforeDeref proj = true →
+      projFieldBasesNonUnion layouts t proj = true := by
+  intro proj
+  induction proj with
+  | nil => intro _ _; rfl
+  | cons hd tl ih =>
+    intro t h
+    cases hd with
+    | deref => rfl
+    | field _ _ => nomatch h
+    | opaqueCast c => exact ih c h
+    | unwrapUnsafeBinder c => exact ih c h
+    | index _ =>
+      dsimp only [projFieldBasesNonUnion]
+      cases elemTyOf t with
+      | none => rfl
+      | some e => exact ih _ h
+    | constantIndex _ _ _ =>
+      dsimp only [projFieldBasesNonUnion]
+      cases elemTyOf t with
+      | none => rfl
+      | some e => exact ih _ h
+    | subslice _ _ _ => exact ih t h
+    | downcast _ _ => exact ih t h
+
+/-- **Field-free projection discharge**: a place whose projection has no `.field`
+step before its first `Deref` (array/slice indexing, subslicing, enum downcasts)
+never touches a union, for arbitrary `localDecls` / `layouts` and whether or not
+the local is declared. -/
+theorem placeTouchesUnion_false_of_noFieldBeforeDeref
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (hNoField : projHasNoFieldBeforeDeref proj = true) :
+    placeTouchesUnion localDecls layouts ⟨loc, proj⟩ = false :=
+  placeTouchesUnion_false_of_tyProjTouchesUnion_false localDecls layouts loc proj
+    (fun decl _ => tyProjTouchesUnion_eq_false_of_projFieldBasesNonUnion localDecls layouts
+      proj decl.ty (projFieldBasesNonUnion_of_noFieldBeforeDeref layouts proj decl.ty hNoField))
+
+/-- A non-zero layout index with an existing non-union entry is
+`layoutIdxIsNonUnion`. -/
+theorem layoutIdxIsNonUnion_of_lookup
+    (layouts : LayoutTable) (idx : LayoutIdx) (l : TypeLayout)
+    (hNonZero : idx ≠ 0)
+    (hL : LayoutTable.lookup layouts idx = .some l)
+    (hNotUnion : fieldsShapeIsUnion l.fields = false) :
+    layoutIdxIsNonUnion layouts idx = true := by
+  unfold layoutIdxIsNonUnion
+  have hZ : Nat.beq idx 0 = false := by
+    cases idx with
+    | zero => exact absurd rfl hNonZero
+    | succ k => rfl
+  rw [hZ]
+  dsimp only
+  rw [hL]
+  simpa using hNotUnion
+
+/-- **Non-union struct/enum field discharge**: a `.field` step on a local declared
+as an ADT whose layout index resolves to a non-union `TypeLayout`, followed by any
+`projFieldBasesNonUnion`-certified tail, never touches a union, for arbitrary
+`localDecls` / `layouts`. -/
+theorem placeTouchesUnion_nonUnion_adt_field_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx) (i : FieldIdx)
+    (fieldTy : Ty) (rest : List ProjectionElem)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
+      .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hNonUnion : layoutIdxIsNonUnion layouts lIdx = true)
+    (hRest : projFieldBasesNonUnion layouts fieldTy rest = true) :
+    placeTouchesUnion localDecls layouts ⟨loc, .field i fieldTy :: rest⟩ = false := by
+  apply placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc _ _ hTy
+  dsimp only [projFieldBasesNonUnion, tyIsNonUnionFieldBase, rigidTyIsAdt]
+  rw [hNonUnion]
+  exact hRest
+
+/-- Non-vacuity of the union side conditions: in a layout table holding a union
+entry (index `2`) next to a struct entry (index `1`), a field of the union-typed
+local `_1` takes Trusted's union-aware path (`placeTouchesUnion = true`), so the
+non-union hypotheses of the correspondence theorems below are not trivially true,
+while in the same table the struct field `_0.0`, the struct field of an array
+element `_2[_0].0`, and the whole-array element `_2[_0]` are discharged by the
+Section 0 lemmas. -/
+example :
+    let structL : TypeLayout :=
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false }
+    let unionL : TypeLayout :=
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .union 2, variants := .single 0, isUninhabited := false }
+    let arrL : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .array ⟨4⟩ 2, variants := .single 0, isUninhabited := false,
+        fieldLayouts := [1] }
+    let layouts : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := [structL, structL, unionL, arrL] }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let structTy : Ty := { kind := .adt "S" [], layoutIdx := 1 }
+    let unionTy : Ty := { kind := .adt "U" [], layoutIdx := 2 }
+    let arrTy : Ty := { kind := .array (.adt "S" []) 2, layoutIdx := 3 }
+    let decls : List LocalDecl :=
+      [{ mutability := .mut, ty := structTy, debugName := .none },
+       { mutability := .mut, ty := unionTy, debugName := .none },
+       { mutability := .mut, ty := arrTy, debugName := .none }]
+    placeTouchesUnion decls layouts ⟨1, [.field 0 u32Ty]⟩ = true ∧
+    placeTouchesUnion decls layouts ⟨0, [.field 0 u32Ty]⟩ = false ∧
+    placeTouchesUnion decls layouts ⟨2, [.index 0, .field 0 u32Ty]⟩ = false ∧
+    placeTouchesUnion decls layouts ⟨2, [.index 0]⟩ = false := by
+  intro structL unionL arrL layouts u32Ty structTy unionTy arrTy decls
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · exact placeTouchesUnion_nonUnion_adt_field_false decls layouts 0 "S" [] 1 0 u32Ty []
+      rfl rfl rfl
+  · exact placeTouchesUnion_false_of_projFieldBasesNonUnion decls layouts 2 _ arrTy rfl rfl
+  · exact placeTouchesUnion_false_of_noFieldBeforeDeref decls layouts 2 _ rfl
+
+/-- **Two-level tuple field discharge**: `_l.i.j` on a local declared as a tuple
+whose field `i` is annotated with a tuple type never touches a union, for
+arbitrary `localDecls` / `layouts`. -/
+theorem placeTouchesUnion_tuple_nested_field_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (outerFieldTys innerFieldTys : List RigidTy) (outerLIdx innerLIdx : LayoutIdx)
+    (i j : FieldIdx) (leafTy : Ty)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
+      .some { kind := .tuple outerFieldTys, layoutIdx := outerLIdx }) :
+    placeTouchesUnion localDecls layouts
+        ⟨loc, [.field i { kind := .tuple innerFieldTys, layoutIdx := innerLIdx }, .field j leafTy]⟩ =
+      false :=
+  placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc _ _ hTy rfl
+
+/-- Non-dereferencing operand predicate: for `.copy p` or `.move p`, `p.projection`
+does not start with `.deref` (`p.projection = .nil ∨ ∃ h t, p.projection = h :: t ∧ h ≠ .deref`). -/
+def OperandNonDeref : Operand → Prop
+  | .copy p => ∀ r, p.projection ≠ .deref :: r
+  | .move p => ∀ r, p.projection ≠ .deref :: r
+  | .constant _ => True
+
+/-- `true` when the place read or moved by `op` projects into a union field
+(`placeTouchesUnion`); constants never do. -/
+def operandTouchesUnion (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Operand → Bool
+  | .copy p => placeTouchesUnion localDecls layouts p
+  | .move p => placeTouchesUnion localDecls layouts p
+  | .constant _ => false
+
+/-- **`localDecls`-irrelevance of non-`Deref`, non-union operands**: evaluating a
+constant, a root place, or a non-`Deref` projected place that does not touch a
+union gives the same result for every `localDecls` as for `localDecls = []`. -/
+theorem evalOperand_eq_nil_localDecls_of_noUnion
+    (locals : List LocalSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
+    evalOperand locals op borrows globals layouts callerLocals localDecls =
+      evalOperand locals op borrows globals layouts callerLocals := by
+  cases op with
+  | constant c => rfl
+  | copy p =>
+    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+    · rfl
+    · cases hd with
+      | deref => exact False.elim (hNoDeref tl rfl)
+      | _ =>
+        dsimp only [operandTouchesUnion] at hNoUnion
+        unfold evalOperand
+        dsimp only
+        rw [hNoUnion]
+  | move p =>
+    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+    · rfl
+    · cases hd with
+      | deref => exact False.elim (hNoDeref tl rfl)
+      | _ =>
+        dsimp only [operandTouchesUnion] at hNoUnion
+        unfold evalOperand
+        dsimp only
+        rw [hNoUnion]
+
+/-- With no local declarations, no operand touches a union. -/
+theorem operandTouchesUnion_nil_decls (layouts : LayoutTable) (op : Operand) :
+    operandTouchesUnion .nil layouts op = false := by
+  cases op with
+  | copy p => exact placeTouchesUnion_nil_decls layouts p
+  | move p => exact placeTouchesUnion_nil_decls layouts p
+  | constant _ => rfl
+
+/-- Trusted's `evalOperand` on a non-`Deref`, non-union projected `.copy` place
+reads the projected sub-value with the plain `readProjectedValue`, for every
+`localDecls`, and leaves `locals` unchanged. -/
+theorem evalOperand_copy_proj_of_noUnion
+    (locals : List LocalSlot)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (rootVal outVal : Value)
+    (hNotDeref : proj ≠ .deref)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
+    (hGet : get? locals loc = .some (.init rootVal))
+    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal) :
+    evalOperand locals (.copy ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals
+        localDecls =
+      .ok outVal locals := by
+  cases proj with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ =>
+    unfold evalOperand
+    dsimp only
+    rw [hGet]
+    dsimp only
+    rw [hNoUnion]
+    dsimp only
+    rw [hRead]
+
+/-- Trusted's `evalOperand` on a non-`Deref`, non-union projected `.move` place
+reads the projected sub-value with the plain `readProjectedValue`, for every
+`localDecls`, and leaves the root local initialized (`locals` unchanged). -/
+theorem evalOperand_move_proj_of_noUnion
+    (locals : List LocalSlot)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (rootVal outVal : Value)
+    (hNotDeref : proj ≠ .deref)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
+    (hGet : get? locals loc = .some (.init rootVal))
+    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal) :
+    evalOperand locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals
+        localDecls =
+      .ok outVal locals := by
+  cases proj with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ =>
+    unfold evalOperand
+    dsimp only
+    rw [hGet]
+    dsimp only
+    rw [hNoUnion]
+    dsimp only
+    rw [hRead]
+
+/-- `validateValueForTy?` constrains only `bool` and `char` places. -/
+theorem validateValueForTy?_of_not_bool_char
+    (layouts : LayoutTable) (tyOpt : Option Ty) (v : Value)
+    (hNotBC : ∀ ty, tyOpt = .some ty → ty.kind ≠ .bool ∧ ty.kind ≠ .char) :
+    validateValueForTy? layouts tyOpt v = true := by
+  rcases tyOpt with _ | ⟨kind, idx⟩
+  · rfl
+  · cases kind <;> first
+      | rfl
+      | exact absurd rfl (hNotBC _ rfl).1
+      | exact absurd rfl (hNotBC _ rfl).2
+
+/-- Trusted's `writePlaceValue` on a non-`Deref`, non-union projected place whose
+static type accepts `val` (`validateValueForTy?`) writes `val` with the plain
+value-tree update `writeProjectedValue` and stores the new root, for every
+`localDecls`. -/
+theorem writePlaceValue_proj_of_noUnion
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (val rootVal rootVal' : Value)
+    (locals' : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hNotDeref : proj ≠ .deref)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
+    (hValid :
+      validateValueForTy? layouts (placeTy localDecls layouts ⟨loc, proj :: rest⟩) val = true)
+    (hGet : get? locals loc = .some (.init rootVal))
+    (hWrite : writeProjectedValue locals rootVal (proj :: rest) val = .ok rootVal')
+    (hSet : set? locals loc (.init rootVal') = .some locals') :
+    writePlaceValue locals borrows ⟨loc, proj :: rest⟩ val localDecls layouts = .ok locals' := by
+  have hWriteL :=
+    (writeProjectedForLocal_of_placeTouchesUnion_false locals localDecls layouts loc rootVal
+      (proj :: rest) val hNoUnion).trans hWrite
+  cases proj with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ =>
+    cases localDecls with
+    | nil =>
+      unfold writePlaceValue
+      dsimp only
+      rw [hGet]
+      dsimp only
+      rw [hWriteL]
+      dsimp only
+      rw [hSet]
+    | cons d ds =>
+      unfold writePlaceValue
+      dsimp only
+      rw [hValid]
+      dsimp only
+      rw [hGet]
+      dsimp only
+      rw [hWriteL]
+      dsimp only
+      rw [hSet]
+
+/-- Static side conditions on a projected `SetDiscriminant` destination `p` under
+which Trusted's `evalStmt` (`evalOperand (.copy p)` followed by `writePlaceValue p`)
+reduces to the plain value-tree `readProjectedValue` / `writeProjectedValue`:
+1. `p` does not project into a union field (`placeTouchesUnion localDecls layouts p = false`);
+2. `p` is not statically typed `bool` or `char`, so the `validateValueForTy?` check
+   of `writePlaceValue` accepts the written aggregate.
+
+Both hold for well-typed MIR (whose `SetDiscriminant` targets are enums) and hold
+trivially when `localDecls = []` (`setDiscriminantDestOk_nil_decls`). -/
+def SetDiscriminantDestOk
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) : Prop :=
+  placeTouchesUnion localDecls layouts p = false ∧
+    ∀ ty, placeTy localDecls layouts p = .some ty → ty.kind ≠ .bool ∧ ty.kind ≠ .char
+
+/-- With no local declarations, every `SetDiscriminant` destination is admissible. -/
+theorem setDiscriminantDestOk_nil_decls (layouts : LayoutTable) (p : Place) :
+    SetDiscriminantDestOk .nil layouts p :=
+  ⟨placeTouchesUnion_nil_decls layouts p, fun ty hTy => by nomatch hTy⟩
+
+
 
 /-! ## Section 1: Pure Value-Tree Projections, Lens Laws & `Places.lean` Correspondence -/
 
@@ -2571,7 +3566,8 @@ theorem evalCharToIntByKind_some_implies_valid
 In `Runtime(PostCleanup)` MIR, `rustc` lowers `char as Int` to
 `Rvalue.cast .intToInt op targetTy` on an unsigned 4-byte `RigidTy.char` operand.
 Whenever `op` has type `.char` (`operandTy localDecls layouts op = .some { kind := .char, .. }`)
-and evaluates to a 4-byte scalar `.scalar ⟨bits, 4⟩` (without requiring
+and evaluates (under the same `localDecls` that `evalRvalue` threads into
+`evalOperand`) to a 4-byte scalar `.scalar ⟨bits, 4⟩` (without requiring
 `isValidUnicodeScalar bits = true` as an external hypothesis):
 1. If `evalCharToIntByKind bits targetTy.kind = .some outSc`, then `bits` is a
    valid Unicode scalar value and
@@ -2588,7 +3584,7 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
     (bits charLayoutIdx : Nat)
     (hOpEval :
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals op mem.borrows mem.globals layouts mem.callerLocals =
+        locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
         .ok (.scalar ⟨bits, 4⟩) locals')
     (hOpTy :
       Trusted.Rustc.V2026_06_01.MirSemantics.operandTy localDecls layouts op =
@@ -5153,9 +6149,11 @@ theorem setDiscriminantOnShell_nonAdt_nonzero_variant_resets_fields
 1. Moving a bare local (`p.projection = .nil`) reads `v` and transitions `p.local_`
    from `.init v` to `.uninit`.
 2. Moving a projected non-`Deref` place (`p.projection = proj :: rest` with
-   `proj ≠ .deref`) reads the projected sub-value `outVal` and leaves the root
-   local `p.local_` initialized to `.init rootVal` (`locals` unchanged), matching
-   Episode 1 `[adv B1]` (`ec5df9f4`). -/
+   `proj ≠ .deref`) that does not project into a union field
+   (`placeTouchesUnion localDecls layouts p = false`) reads the projected sub-value
+   `outVal` and leaves the root local `p.local_` initialized to `.init rootVal`
+   (`locals` unchanged), matching Episode 1 `[adv B1]` (`ec5df9f4`).
+Both parts hold for arbitrary `localDecls`. -/
 theorem evalOperand_move_bare_vs_projected_correspondence
     (locals locals' : List LocalSlot)
     (loc : Local)
@@ -5165,17 +6163,19 @@ theorem evalOperand_move_bare_vs_projected_correspondence
     (borrows : List BorrowEntry)
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) :
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) :
     (get? locals loc = .some (.init rootVal) →
       set? locals loc .uninit = .some locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals (.move ⟨loc, .nil⟩) borrows globals layouts callerLocals =
+        locals (.move ⟨loc, .nil⟩) borrows globals layouts callerLocals localDecls =
         .ok rootVal locals') ∧
     (proj ≠ .deref →
+      placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false →
       get? locals loc = .some (.init rootVal) →
       evalValueProjRead locals rootVal (proj :: rest) = .ok outVal →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals =
+        locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals localDecls =
         .ok outVal locals) := by
   refine ⟨?_, ?_⟩
   · intro hGet hSet
@@ -5183,16 +6183,10 @@ theorem evalOperand_move_bare_vs_projected_correspondence
     rw [hGet]
     dsimp only
     rw [hSet]
-  · intro hNotDeref hGet hProjRead
-    have hTrustedRead :=
-      evalValueProjRead_refines_readProjectedValue (proj :: rest) locals rootVal outVal hProjRead
-    cases proj with
-    | deref => exact False.elim (hNotDeref rfl)
-    | _ =>
-      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
-      rw [hGet]
-      dsimp only
-      rw [hTrustedRead]
+  · intro hNotDeref hNoUnion hGet hProjRead
+    exact evalOperand_move_proj_of_noUnion locals loc proj rest borrows globals layouts
+      callerLocals localDecls rootVal outVal hNotDeref hNoUnion hGet
+      (evalValueProjRead_refines_readProjectedValue (proj :: rest) locals rootVal outVal hProjRead)
 
 /-- Pointwise lifting of a per-slot refinement relation `R` between Anneal
 `LocalSlotState`s and Trusted `LocalSlot`s to whole frames (equal lengths). -/
@@ -5472,7 +6466,8 @@ and `evalAssumeState_nested_refines` below. -/
 def evalAssume
     (s : MachineState)
     (op : Operand)
-    (layouts : LayoutTable := emptyLayoutTable) :
+    (layouts : LayoutTable := emptyLayoutTable)
+    (localDecls : List LocalDecl := .nil) :
     MirStepNode :=
   match
     Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
@@ -5482,6 +6477,7 @@ def evalAssume
       s.memory.globals
       layouts
       s.memory.callerLocals
+      localDecls
   with
   | .ok (.scalar sc) locals' =>
     match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
@@ -5504,17 +6500,19 @@ theorem evalAssume_trusted_correspondence
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (locals' : List LocalSlot) :
-    evalAssume s op layouts =
+    evalAssume s op layouts localDecls =
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts ∧
     (Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals =
+        s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+          localDecls =
         .ok (.scalar ⟨1, 1⟩) locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals')) ∧
     (Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals =
+        s.frame.locals op s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+          localDecls =
         .ok (.scalar ⟨0, 1⟩) locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
         s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
@@ -5535,9 +6533,12 @@ theorem evalAssume_trusted_correspondence
    `.init (.aggregate variantIdx fields)` (including 0-field unit enum variants where
    `fields = .nil`).
 2. On a projected non-`Deref` place (`p.projection = proj :: rest`, `proj ≠ .deref`)
-   where reading `proj :: rest` from `rootVal` yields `.aggregate oldVar fields`
-   and writing `.aggregate variantIdx fields` back along `proj :: rest` yields `rootVal'`,
-   `evalStmt` updates `p.local_` to `.init rootVal'` and steps. -/
+   that is an admissible destination for arbitrary `localDecls` / `layouts`
+   (`SetDiscriminantDestOk`: no union field is projected into, and the place is not
+   statically typed `bool`/`char`), where reading `proj :: rest` from `rootVal`
+   yields `.aggregate oldVar fields` and writing `.aggregate variantIdx fields`
+   back along `proj :: rest` yields `rootVal'`, `evalStmt` updates `p.local_` to
+   `.init rootVal'` and steps. -/
 theorem evalStmt_setDiscriminant_correspondence
     (s : MachineState)
     (loc : Local)
@@ -5556,6 +6557,7 @@ theorem evalStmt_setDiscriminant_correspondence
         s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals')) ∧
     (proj ≠ .deref →
+      SetDiscriminantDestOk localDecls layouts ⟨loc, proj :: rest⟩ →
       get? s.frame.locals loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (proj :: rest) =
         .ok (.aggregate oldVar fields) →
@@ -5571,28 +6573,26 @@ theorem evalStmt_setDiscriminant_correspondence
     rw [hGet]
     dsimp only
     rw [hSet]
-  · intro hNotDeref hGet hRead hWrite hSet
+  · intro hNotDeref hDestOk hGet hRead hWrite hSet
     have hTrustedRead :=
       evalValueProjRead_refines_readProjectedValue
         (proj :: rest) s.frame.locals rootVal (.aggregate oldVar fields) hRead
     have hTrustedWrite :=
       evalValueProjWrite_refines_writeProjectedValue
         (proj :: rest) s.frame.locals rootVal (.aggregate variantIdx fields) rootVal' hWrite
-    cases proj with
-    | deref => exact False.elim (hNotDeref rfl)
-    | _ =>
-      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt,
-        Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand,
-        Trusted.Rustc.V2026_06_01.MirSemantics.writePlaceValue]
-      rw [hGet]
-      dsimp only
-      rw [hTrustedRead]
-      dsimp only
-      rw [hGet]
-      dsimp only
-      rw [hTrustedWrite]
-      dsimp only
-      rw [hSet]
+    have hOp :=
+      evalOperand_copy_proj_of_noUnion s.frame.locals loc proj rest s.memory.borrows
+        s.memory.globals layouts s.memory.callerLocals localDecls rootVal
+        (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead
+    have hPW :=
+      writePlaceValue_proj_of_noUnion s.frame.locals s.memory.borrows loc proj rest
+        (.aggregate variantIdx fields) rootVal rootVal' locals' localDecls layouts hNotDeref
+        hDestOk.1 (validateValueForTy?_of_not_bool_char layouts _ _ hDestOk.2)
+        hGet hTrustedWrite hSet
+    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+    rw [hOp]
+    dsimp only
+    rw [hPW]
 
 /-- **`D13b` Uninitialized Array Write Rejection (`evalStmt_assign_uninit_array_proj_ub`)**:
 Writing to an element (`.index` or `.constantIndex`) or window (`.subslice`) of a
@@ -6278,17 +7278,13 @@ theorem evalPlaceMentionState_trusted_correspondence
           · unfold evalPlaceMentionState; rw [hGetS]
           · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]; rw [hGetT]
 
-/-- Non-dereferencing operand predicate: for `.copy p` or `.move p`, `p.projection`
-does not start with `.deref` (`p.projection = .nil ∨ ∃ h t, p.projection = h :: t ∧ h ≠ .deref`). -/
-def OperandNonDeref : Operand → Prop
-  | .copy p => ∀ r, p.projection ≠ .deref :: r
-  | .move p => ∀ r, p.projection ≠ .deref :: r
-  | .constant _ => True
-
 /-- **Stateful `evalOperandState` Correspondence (`evalOperandState_trusted_correspondence`)**:
 Under `SlotsRefine PromotedSlotRefines slots locals` and `OperandNonDeref op`,
-every successful operand evaluation `evalOperandState slots op layouts globals = (.ok val, slots')`
-is matched by `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` stepping to
+for arbitrary `localDecls` under which the operand's place does not project into a
+union field (`operandTouchesUnion localDecls layouts op = false`, automatic for
+constants, root places, and `localDecls = []`), every successful operand evaluation
+`evalOperandState slots op layouts globals = (.ok val, slots')` is matched by
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand ... localDecls` stepping to
 `.ok val locals'` with `SlotsRefine PromotedSlotRefines slots' locals'`. -/
 theorem evalOperandState_trusted_correspondence
     (slots slots' : List LocalSlotState)
@@ -6299,13 +7295,17 @@ theorem evalOperandState_trusted_correspondence
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
     (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
     (hRel : SlotsRefine PromotedSlotRefines slots locals)
     (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
     (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+        locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine PromotedSlotRefines slots' locals' := by
+  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
+    localDecls hNoDeref hNoUnion]
   have hLocEq : slotsToTrustedLocals slots = locals :=
     slotsToTrustedLocals_eq_of_promoted hRel
   cases op with
@@ -6489,7 +7489,8 @@ def evalAssumeState
   | .unsupported => .unsupported
 
 /-- **Stateful `Assume` Correspondence (`evalAssumeState_trusted_correspondence`)**:
-Under `SlotsRefine PromotedSlotRefines slots s.frame.locals` and `OperandNonDeref op`:
+Under `SlotsRefine PromotedSlotRefines slots s.frame.locals`, `OperandNonDeref op`, and
+`operandTouchesUnion localDecls layouts op = false` (for arbitrary `localDecls`):
 1. Whenever `evalAssumeState slots op layouts s.memory.globals = .ok slots'`, there exists `locals'`
    such that `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt s ⟨.intrinsic (.assume op), span⟩ localDecls layouts`
    steps to `advanceStmt s locals'` and `SlotsRefine PromotedSlotRefines slots' locals'`.
@@ -6504,7 +7505,8 @@ theorem evalAssumeState_trusted_correspondence
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals)
-    (hNoDeref : OperandNonDeref op) :
+    (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -6539,8 +7541,8 @@ theorem evalAssumeState_trusted_correspondence
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_trusted_correspondence
                 slots nextSlots s.frame.locals op (.scalar sc)
-                s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-                hRel hNoDeref hOp
+                s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+                hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [hTOp]
@@ -6551,8 +7553,8 @@ theorem evalAssumeState_trusted_correspondence
     obtain ⟨locals', hTOp, _⟩ :=
       evalOperandState_trusted_correspondence
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
-        s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-        hRel hNoDeref hFalseOp
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+        hRel hNoDeref hNoUnion hFalseOp
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -6758,7 +7760,9 @@ Under `SlotsRefine PromotedSlotRefines slots s.frame.locals`:
 2. On a projected place `⟨loc, proj :: rest⟩` (`proj ≠ .deref`) where reading `proj :: rest`
    from `rootVal` yields `.aggregate oldVar fields` and writing `.aggregate variantIdx fields`
    back yields `rootVal'`, `evalSetDiscriminantState` returns `.ok (slots.set loc (.init rootVal'))`
-   and Trusted's `evalStmt` steps to a `PromotedSlotRefines`-related frame. -/
+   and, whenever the place is an admissible Trusted destination for the given
+   `localDecls` / `layouts` (`SetDiscriminantDestOk`), Trusted's `evalStmt` steps to a
+   `PromotedSlotRefines`-related frame. -/
 theorem evalSetDiscriminantState_trusted_correspondence
     (s : MachineState)
     (slots : List LocalSlotState)
@@ -6782,6 +7786,7 @@ theorem evalSetDiscriminantState_trusted_correspondence
         SlotsRefine PromotedSlotRefines
           (slots.set loc (.init (.aggregate variantIdx fields))) locals') ∧
     (proj ≠ .deref →
+      SetDiscriminantDestOk localDecls layouts ⟨loc, proj :: rest⟩ →
       get? slots loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (proj :: rest) =
         .ok (.aggregate oldVar fields) →
@@ -6829,7 +7834,7 @@ theorem evalSetDiscriminantState_trusted_correspondence
             s loc proj rest variantIdx oldVar fields rootVal rootVal'
             (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
             span localDecls layouts).1 hGetT hSetT
-  · intro hNotDeref hGetS hRead hWrite
+  · intro hNotDeref hDestOk hGetS hRead hWrite
     rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
     · rw [hNoneS] at hGetS; nomatch hGetS
     · rw [hGetS] at hGetS'
@@ -6864,7 +7869,7 @@ theorem evalSetDiscriminantState_trusted_correspondence
         · exact (evalStmt_setDiscriminant_correspondence
             s loc proj rest variantIdx oldVar fields rootVal rootVal'
             (s.frame.locals.set loc (.init rootVal'))
-            span localDecls layouts).2 hNotDeref hGetT hRead hWrite hSetT
+            span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
 
 /-- Stateful place writer over `slots : List LocalSlotState`
 (`StatementEvalState::write_place` in `crates/anneal-mir/src/lower/rvalue.rs:4850-4949`).
@@ -6904,7 +7909,8 @@ def writePlaceState
 Under `SlotsRefine PromotedSlotRefines slots locals`:
 1. Writing `newVal` to a bare live local `⟨loc, .nil⟩` (`get? slots loc = .some slot`,
    `slot ≠ .dead`) updates `slots` to `slots.set loc (.init newVal)` and Trusted's
-   `writePlaceValue` (with `projection = .nil`) updates `locals` to
+   root store (`set? locals loc (.init newVal)`, performed by `writePlaceValue` with
+   `projection = .nil` after its `validateValueForTy?` check) updates `locals` to
    `locals.set loc (.init newVal)`, preserving `SlotsRefine PromotedSlotRefines`.
 2. Writing `newVal` to a projected non-`Deref` place `⟨loc, proj :: rest⟩` on an
    initialized root local (`get? slots loc = .some (.init rootVal)`) where
@@ -7529,6 +8535,9 @@ theorem evalStmt_assign_field_flat_refines
     intro protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
+  -- `_l` is declared as a tuple, so `_l.i` never takes Trusted's union-aware path.
+  have hNoUnion :=
+    placeTouchesUnion_tuple_field_false localDecls layouts loc fieldTys lIdx i fieldTy hTy
   unfold writePlaceState at hWrite
   dsimp only at hWrite
   rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
@@ -7568,7 +8577,8 @@ theorem evalStmt_assign_field_flat_refines
             evalStmt_assign_uninit_aggregate_field_step s loc i fieldTy .nil rv span
               localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil) _ _ hRv hGetT
               (uninitFieldWriteShell?_field_tuple localDecls layouts loc i fieldTy fieldTys lIdx hTy)
-              hTW hSetT hNoConflict,
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
             SlotsRefine.set hSlotRel loc hRel⟩
     | partialShell shell =>
       cases t with
@@ -7603,7 +8613,9 @@ theorem evalStmt_assign_field_flat_refines
           refine ⟨_, _,
             evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
               localDecls layouts val (.aggregate 0 tfs) _ locals₁ _ mem₁
-              (by intro h; nomatch h) hRv hGetT rfl hTW₁ hSetT hNoConflict,
+              (by intro h; nomatch h) hRv hGetT rfl
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW₁) hSetT hNoConflict,
             SlotsRefine.set hSlotRel loc hRel⟩
     | init w =>
       cases t with
@@ -7647,7 +8659,9 @@ theorem evalStmt_assign_field_flat_refines
             evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
               localDecls layouts val w w'' locals₁ _ mem₁
               (by intro h; nomatch h) hRv hGetT
-              (by cases w <;> rfl) hTW hSetT hNoConflict,
+              (by cases w <;> rfl)
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
             SlotsRefine.set (a := .init w'') (t := .init w'') rfl loc hRel⟩
 
 /-- Regression for `evalStmt_assign_field_flat_refines` (reverse-order writes on a
@@ -8134,7 +9148,9 @@ Lifts `evalOperandState_trusted_correspondence` from `PromotedSlotRefines` to
 `FlatSlotStateRefines`: on any frame that may contain incomplete flat tuple
 partial shells, every successful `evalOperandState` evaluation (`constant`,
 `copy`, bare `move`, or projected `move`) is matched by Trusted's `evalOperand`
-and preserves `SlotsRefine FlatSlotStateRefines`. -/
+(for arbitrary `localDecls` under which the operand does not touch a union,
+`operandTouchesUnion localDecls layouts op = false`) and preserves
+`SlotsRefine FlatSlotStateRefines`. -/
 theorem evalOperandState_flat_refines
     (slots slots' : List LocalSlotState)
     (locals : List LocalSlot)
@@ -8144,13 +9160,17 @@ theorem evalOperandState_flat_refines
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
     (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
     (hRel : SlotsRefine FlatSlotStateRefines slots locals)
     (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
     (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+        locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine FlatSlotStateRefines slots' locals' := by
+  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
+    localDecls hNoDeref hNoUnion]
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -8275,7 +9295,8 @@ theorem evalOperandState_flat_refines
 /-- **Flat-Frame `Assume` Refinement (`evalAssumeState_flat_refines`)**:
 Lifts `evalAssumeState_trusted_correspondence` from `PromotedSlotRefines` to
 `FlatSlotStateRefines` across frames that may contain incomplete flat tuple
-partial shells. -/
+partial shells, for arbitrary `localDecls` under which the operand does not
+touch a union (`operandTouchesUnion localDecls layouts op = false`). -/
 theorem evalAssumeState_flat_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -8284,7 +9305,8 @@ theorem evalAssumeState_flat_refines
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals)
-    (hNoDeref : OperandNonDeref op) :
+    (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -8319,8 +9341,8 @@ theorem evalAssumeState_flat_refines
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_flat_refines
                 slots nextSlots s.frame.locals op (.scalar sc)
-                s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-                hRel hNoDeref hOp
+                s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+                hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [hTOp]
@@ -8331,8 +9353,8 @@ theorem evalAssumeState_flat_refines
     obtain ⟨locals', hTOp, _⟩ :=
       evalOperandState_flat_refines
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
-        s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-        hRel hNoDeref hFalseOp
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+        hRel hNoDeref hNoUnion hFalseOp
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -9005,8 +10027,10 @@ target value is not `.unit` (complementing `evalSetDiscriminantState_unit_vs_tru
    `evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx = .ok slots'` implies
    Trusted's `evalStmt` steps to `advanceStmt s locals'` with
    `SlotsRefine FlatSlotStateRefines slots' locals'`.
-2. On a projected place `⟨loc, p :: rest⟩` (`p ≠ .deref`) where `get? slots loc = .some (.init rootVal)`
-   and the target value is not `.unit`, `evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots'`
+2. On a projected place `⟨loc, p :: rest⟩` (`p ≠ .deref`) that is an admissible Trusted
+   destination (`SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩`), where
+   `get? slots loc = .some (.init rootVal)` and the target value is not `.unit`,
+   `evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots'`
    implies Trusted's `evalStmt` steps to `advanceStmt s locals'` with
    `SlotsRefine FlatSlotStateRefines slots' locals'`. -/
 theorem evalSetDiscriminantState_general_flat_refines
@@ -9030,6 +10054,7 @@ theorem evalSetDiscriminantState_general_flat_refines
           MirStepNode.step (advanceStmt s locals') ∧
         SlotsRefine FlatSlotStateRefines slots' locals') ∧
     (p ≠ .deref →
+      SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩ →
       get? slots loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit →
       evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots' →
@@ -9078,7 +10103,7 @@ theorem evalSetDiscriminantState_general_flat_refines
             (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
             span localDecls layouts).1 hGetT hSetT
     | _ => nomatch hOk
-  · intro hNotDeref hGetS hNotUnit hOk
+  · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
     dsimp only at hOk
     cases hDeref : Trusted.Rustc.V2026_06_01.MirSemantics.projectionHasDeref (p :: rest) with
@@ -9135,7 +10160,7 @@ theorem evalSetDiscriminantState_general_flat_refines
               exact (evalStmt_setDiscriminant_correspondence
                 s loc p rest variantIdx oldVar fields rootVal rootVal'
                 (s.frame.locals.set loc (.init rootVal'))
-                span localDecls layouts).2 hNotDeref hGetT hRead hWrite hSetT
+                span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
       | _ => nomatch hOk
 
 /-- Trusted's `setOrExtendFields` coincides with `List.set` on in-bounds indices. -/
@@ -9203,9 +10228,11 @@ theorem setDiscriminantProjectedValue_inv_of_not_unit
 covers the D13b case `discriminant(_l.i.rest) = v` where `_l` is still an
 incomplete flat tuple shell, its field `i` holds an initialized value `w`, and the
 target inside `w` is not `()` (see `evalSetDiscriminantState_unit_vs_trusted_ub`).
-Whenever Anneal's `evalSetDiscriminantState` succeeds, Trusted's `evalStmt` on the
-`.unit`-padded aggregate steps, and the resulting frames are again related by
-`SlotsRefine FlatSlotStateRefines`. -/
+Whenever Anneal's `evalSetDiscriminantState` succeeds and the destination is
+admissible for Trusted's `localDecls` / `layouts` (`SetDiscriminantDestOk`; Anneal's
+flat tuple shell says nothing about Trusted's declared type of `_l`), Trusted's
+`evalStmt` on the `.unit`-padded aggregate steps, and the resulting frames are again
+related by `SlotsRefine FlatSlotStateRefines`. -/
 theorem evalSetDiscriminantState_partialShell_field_flat_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -9223,6 +10250,7 @@ theorem evalSetDiscriminantState_partialShell_field_flat_refines
     (hSlot : get? slots loc = .some (.partialShell shell))
     (hField : get? shell.fields i = .some (.init w))
     (hNotUnit : evalValueProjRead s.frame.locals w rest ≠ .ok .unit)
+    (hDestOk : SetDiscriminantDestOk localDecls layouts ⟨loc, .field i fieldTy :: rest⟩)
     (hOk :
       evalSetDiscriminantState slots ⟨loc, .field i fieldTy :: rest⟩ variantIdx = .ok slots') :
     ∃ locals',
@@ -9325,7 +10353,7 @@ theorem evalSetDiscriminantState_partialShell_field_flat_refines
     (evalStmt_setDiscriminant_correspondence s loc (.field i fieldTy) rest variantIdx oldVar
       fields (.aggregate 0 tfs) (.aggregate 0 (tfs.set i w'))
       (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) span localDecls layouts).2
-      (by intro h; nomatch h) hGetT hTRead hTWrite hSetLoc, ?_⟩
+      (by intro h; nomatch h) hDestOk hGetT hTRead hTWrite hSetLoc, ?_⟩
   -- The frames stay related.
   have hRef' := flatShellRefines_write sFields tfs i w' hShellRef hLtS
   rw [setOrExtendFields_eq_set_of_lt tfs i w' hLtT] at hRef'
@@ -10034,7 +11062,9 @@ theorem readPlaceStateCheckedIndex_nested_refines
               exact ⟨rfl, readPlaceState_nested_refines slots locals place val hRel hRead⟩
 
 /-- **Arbitrary-Depth Nested-Frame `evalOperandState` Refinement (`evalOperandState_nested_refines`)**:
-Lifts `evalOperandState_flat_refines` to `SlotsRefine NestedSlotStateRefines`. -/
+Lifts `evalOperandState_flat_refines` to `SlotsRefine NestedSlotStateRefines`, for
+arbitrary `localDecls` under which the operand does not touch a union
+(`operandTouchesUnion localDecls layouts op = false`). -/
 theorem evalOperandState_nested_refines
     (slots slots' : List LocalSlotState)
     (locals : List LocalSlot)
@@ -10044,13 +11074,17 @@ theorem evalOperandState_nested_refines
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
     (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
     (hRel : SlotsRefine NestedSlotStateRefines slots locals)
     (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
     (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
-        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+        locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine NestedSlotStateRefines slots' locals' := by
+  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
+    localDecls hNoDeref hNoUnion]
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -10623,6 +11657,9 @@ theorem evalStmt_assign_field_nested_refines
     intro protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
+  -- `_l` is declared as a tuple, so `_l.i` never takes Trusted's union-aware path.
+  have hNoUnion :=
+    placeTouchesUnion_tuple_field_false localDecls layouts loc fieldTys lIdx i fieldTy hTy
   unfold writePlaceState at hWrite
   dsimp only at hWrite
   rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
@@ -10662,7 +11699,8 @@ theorem evalStmt_assign_field_nested_refines
             evalStmt_assign_uninit_aggregate_field_step s loc i fieldTy .nil rv span
               localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil) _ _ hRv hGetT
               (uninitFieldWriteShell?_field_tuple localDecls layouts loc i fieldTy fieldTys lIdx hTy)
-              hTW hSetT hNoConflict,
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
             SlotsRefine.set
               (fieldSlotToLocalSlotState_of_nestedFieldRefines slot' _ hNotUninit hSlotRef)
               loc hRel⟩
@@ -10699,7 +11737,9 @@ theorem evalStmt_assign_field_nested_refines
           refine ⟨_, _,
             evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
               localDecls layouts val (.aggregate 0 tfs) _ locals₁ _ mem₁
-              (by intro h; nomatch h) hRv hGetT rfl hTW₁ hSetT hNoConflict,
+              (by intro h; nomatch h) hRv hGetT rfl
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW₁) hSetT hNoConflict,
             SlotsRefine.set
               (fieldSlotToLocalSlotState_of_nestedFieldRefines slot' _ hNotUninit hSlotRef)
               loc hRel⟩
@@ -10744,7 +11784,9 @@ theorem evalStmt_assign_field_nested_refines
             evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
               localDecls layouts val w w'' locals₁ _ mem₁
               (by intro h; nomatch h) hRv hGetT
-              (by cases w <;> rfl) hTW hSetT hNoConflict,
+              (by cases w <;> rfl)
+              ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
             SlotsRefine.set (a := .init w'') (t := .init w'') rfl loc hRel⟩
 
 /-- A successful pure value-tree write never traverses an absent or `.unit`
@@ -10905,7 +11947,10 @@ theorem evalStmt_assign_bare_nested_refines
 /-- **Projected Assignment Into an Initialized Local on Nested Frames (`evalStmt_assign_init_root_nested_refines`)**:
 For any non-empty destination projection (fields, `Index`, `ConstantIndex`,
 `Subslice`, `Downcast`+`Field`, at any depth) into a local `_l` that holds an
-initialized value, on a frame that may contain partial shells elsewhere:
+initialized value, on a frame that may contain partial shells elsewhere, and that
+does not project into a union field for Trusted's `localDecls` / `layouts`
+(`placeTouchesUnion localDecls layouts ⟨l, proj :: rest⟩ = false`, discharged by the
+Section 0 lemmas, e.g. `placeTouchesUnion_false_of_layoutsHaveNoUnion`):
 whenever Anneal's `writePlaceState` succeeds, Trusted's `evalStmt` `.assign` steps
 (its `ensureNestedFieldShells` pass is the identity on such roots,
 `fieldShellChainPopulated_of_evalValueProjWrite_ok`) and the frames stay related
@@ -10931,6 +11976,7 @@ theorem evalStmt_assign_init_root_nested_refines
     (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
     (hInitRoot : get? slots₁ loc = .some (.init rootVal))
     (hNoProt : mem₁.activeProtectors = .nil)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
     (hWrite : writePlaceState arityOf slots₁ ⟨loc, proj :: rest⟩ rootTy val = .ok slots₂) :
     ∃ locals₂ mem₂,
       Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -10994,7 +12040,9 @@ theorem evalStmt_assign_init_root_nested_refines
     evalStmt_assign_init_projected_step s loc proj rest rv span localDecls layouts val
       rootVal w' locals₁ _ mem₁ hNotDeref hRv hGetT
       (fieldShellChainPopulated_of_evalValueProjWrite_ok locals₁ (proj :: rest) rootVal val w' hE)
-      (evalValueProjWrite_refines_writeProjectedValue (proj :: rest) locals₁ rootVal val w' hE)
+      ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc rootVal
+        (proj :: rest) val hNoUnion).trans
+        (evalValueProjWrite_refines_writeProjectedValue (proj :: rest) locals₁ rootVal val w' hE))
       hSetT hNoConflict,
     SlotsRefine.set (a := .init w') (t := .init w') rfl loc hRel⟩
 
@@ -11050,6 +12098,10 @@ theorem evalStmt_assign_two_level_field_nested_refines
   intro innerTy
   let outerTy : Ty := { kind := .tuple outerFieldTys, layoutIdx := outerLIdx }
   let projs : List ProjectionElem := [.field i innerTy, .field j leafTy]
+  -- `_l : (.., (..), ..)` and `_l.i : (..)` are tuples: no union-aware Trusted path.
+  have hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, projs⟩ = false :=
+    placeTouchesUnion_tuple_nested_field_false localDecls layouts loc outerFieldTys
+      innerFieldTys outerLIdx innerLIdx i j leafTy hTy
   have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
@@ -11127,7 +12179,7 @@ theorem evalStmt_assign_two_level_field_nested_refines
             Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_uninit_nested_field_ok
               s loc i j innerTy leafTy rv span localDecls layouts val locals₁ mem₁ _
               hRv hGetT (Or.inr ⟨outerFieldTys, outerLIdx, hTy⟩)
-              (Or.inr ⟨innerFieldTys, rfl⟩) hSetT hNoProt,
+              (Or.inr ⟨innerFieldTys, rfl⟩) hSetT hNoProt hNoUnion,
             SlotsRefine.set
               (fieldSlotToLocalSlotState_of_nestedFieldRefines slot' trustedVal hNotUninit hSlot''Ref)
               loc hRel⟩
@@ -11188,7 +12240,9 @@ theorem evalStmt_assign_two_level_field_nested_refines
           refine ⟨_, _,
             evalStmt_assign_init_projected_step s loc (.field i innerTy) [.field j leafTy]
               rv span localDecls layouts val rootVal rootVal' locals₁ _ mem₁
-              (by intro h; nomatch h) hRv hGetT hPop hTW hSetT hNoConflict,
+              (by intro h; nomatch h) hRv hGetT hPop
+                ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts
+                  loc _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
             SlotsRefine.set (R := NestedSlotStateRefines)
               (a := .init rootVal') (t := .init rootVal') rfl loc hRel⟩
     | partialShell shell =>
@@ -11260,12 +12314,14 @@ theorem evalStmt_assign_two_level_field_nested_refines
                 · refine ⟨_, _,
                     Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_init_unpopulated_nested_field_ok
                       s loc 0 tfs i j innerTy leafTy rv span localDecls layouts val locals₁ _ mem₁
-                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inl hNoneT) hSetT hNoProt,
+                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inl hNoneT) hSetT hNoProt
+                      hNoUnion,
                     SlotsRefine.set hSlotRel loc hRel⟩
                 · refine ⟨_, _,
                     Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_init_unpopulated_nested_field_ok
                       s loc 0 tfs i j innerTy leafTy rv span localDecls layouts val locals₁ _ mem₁
-                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inr hUnitT) hSetT hNoProt,
+                      hRv hGetT (Or.inr ⟨innerFieldTys, rfl⟩) (Or.inr hUnitT) hSetT hNoProt
+                      hNoUnion,
                     SlotsRefine.set hSlotRel loc hRel⟩
                 · have hLtTfs : i < tfs.length := by
                     simp only [get?_eq_getElem?] at hNilAggT
@@ -11296,7 +12352,9 @@ theorem evalStmt_assign_two_level_field_nested_refines
                   refine ⟨_, _,
                     evalStmt_assign_init_projected_step s loc (.field i innerTy) [.field j leafTy]
                       rv span localDecls layouts val (.aggregate 0 tfs) newRootTV locals₁ _ mem₁
-                      (by intro h; nomatch h) hRv hGetT hPop hTW hSetT hNoConflict,
+                      (by intro h; nomatch h) hRv hGetT hPop
+                ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts
+                  loc _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
                     SlotsRefine.set hSlotRel loc hRel⟩
               | nested cVar cAdt cDisc cFields =>
                 cases hGetTfs : get? tfs i with
@@ -11361,7 +12419,9 @@ theorem evalStmt_assign_two_level_field_nested_refines
                     refine ⟨_, _,
                       evalStmt_assign_init_projected_step s loc (.field i innerTy) [.field j leafTy]
                         rv span localDecls layouts val (.aggregate 0 tfs) newRootTV locals₁ _ mem₁
-                        (by intro h; nomatch h) hRv hGetT hPop hTW hSetT hNoConflict,
+                        (by intro h; nomatch h) hRv hGetT hPop
+                ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts
+                  loc _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
                       SlotsRefine.set hSlotRel loc hRel⟩
                   | _ => nomatch hChildRef
               | init childVal =>
@@ -11429,7 +12489,9 @@ theorem evalStmt_assign_two_level_field_nested_refines
                 refine ⟨_, _,
                   evalStmt_assign_init_projected_step s loc (.field i innerTy) [.field j leafTy]
                     rv span localDecls layouts val (.aggregate 0 tfs) newRootTV locals₁ _ mem₁
-                    (by intro h; nomatch h) hRv hGetT hPop hTW hSetT hNoConflict,
+                    (by intro h; nomatch h) hRv hGetT hPop
+                ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts
+                  loc _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
                   SlotsRefine.set hSlotRel loc hRel⟩
 
 /-- **Reverse-Order 4-Write Nested Tuple Completion Witness**:
@@ -11609,7 +12671,8 @@ theorem evalStorageDead_nested_refines
 /-- **Arbitrary-Depth Nested-Frame `Assume` Refinement (`evalAssumeState_nested_refines`)**:
 Lifts `evalAssumeState_flat_refines` from `FlatSlotStateRefines` to
 `SlotsRefine NestedSlotStateRefines` across frames that may contain arbitrarily
-nested tuple partial shells:
+nested tuple partial shells, for arbitrary `localDecls` under which the operand
+does not touch a union (`operandTouchesUnion localDecls layouts op = false`):
 1. Whenever `evalAssumeState slots op layouts s.memory.globals = .ok slots'`,
    Trusted's `evalStmt` on `.intrinsic (.assume op)` steps to `advanceStmt s locals'`
    with `SlotsRefine NestedSlotStateRefines slots' locals'`.
@@ -11623,7 +12686,8 @@ theorem evalAssumeState_nested_refines
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals)
-    (hNoDeref : OperandNonDeref op) :
+    (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -11658,8 +12722,8 @@ theorem evalAssumeState_nested_refines
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_nested_refines
                 slots nextSlots s.frame.locals op (.scalar sc)
-                s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-                hRel hNoDeref hOp
+                s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+                hRel hNoDeref hNoUnion hOp
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [hTOp]
@@ -11670,8 +12734,8 @@ theorem evalAssumeState_nested_refines
     obtain ⟨locals', hTOp, _⟩ :=
       evalOperandState_nested_refines
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
-        s.memory.borrows s.memory.globals layouts s.memory.callerLocals
-        hRel hNoDeref hFalseOp
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
+        hRel hNoDeref hNoUnion hFalseOp
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -11683,7 +12747,8 @@ theorem evalAssumeState_nested_refines
 /-- **General Nested-Frame `SetDiscriminant` Refinement on Initialized Roots (`evalSetDiscriminantState_general_nested_refines`)**:
 Lifts `evalSetDiscriminantState_general_flat_refines` from `FlatSlotStateRefines`
 to `SlotsRefine NestedSlotStateRefines` for both bare and projected non-`()`
-initialized targets on frames that may contain nested tuple partial shells. -/
+initialized targets (projected targets being admissible Trusted destinations,
+`SetDiscriminantDestOk`) on frames that may contain nested tuple partial shells. -/
 theorem evalSetDiscriminantState_general_nested_refines
     (s : MachineState)
     (slots slots' : List LocalSlotState)
@@ -11705,6 +12770,7 @@ theorem evalSetDiscriminantState_general_nested_refines
           MirStepNode.step (advanceStmt s locals') ∧
         SlotsRefine NestedSlotStateRefines slots' locals') ∧
     (p ≠ .deref →
+      SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩ →
       get? slots loc = .some (.init rootVal) →
       evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit →
       evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots' →
@@ -11753,7 +12819,7 @@ theorem evalSetDiscriminantState_general_nested_refines
             (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
             span localDecls layouts).1 hGetT hSetT
     | _ => nomatch hOk
-  · intro hNotDeref hGetS hNotUnit hOk
+  · intro hNotDeref hDestOk hGetS hNotUnit hOk
     unfold evalSetDiscriminantState at hOk
     dsimp only at hOk
     cases hDeref : Trusted.Rustc.V2026_06_01.MirSemantics.projectionHasDeref (p :: rest) with
@@ -11810,7 +12876,7 @@ theorem evalSetDiscriminantState_general_nested_refines
               exact (evalStmt_setDiscriminant_correspondence
                 s loc p rest variantIdx oldVar fields rootVal rootVal'
                 (s.frame.locals.set loc (.init rootVal'))
-                span localDecls layouts).2 hNotDeref hGetT hRead hWrite hSetT
+                span localDecls layouts).2 hNotDeref hDestOk hGetT hRead hWrite hSetT
       | _ => nomatch hOk
 
 /-- Convert a list of `(FieldIdx, Ty)` steps into `.field` projection elements. -/
@@ -12004,7 +13070,8 @@ depth-1 flat shells to **arbitrary-depth nested tuple partial shells**
 (`SlotsRefine NestedSlotStateRefines`): for any non-empty field chain
 `(i₀, ty₀) :: restSteps` (`k ≥ 1` levels deep) inside `slots[loc] = .partialShell shell`
 reaching an initialized sub-slot `.init w` with trailing projection `tail`
-(`evalValueProjRead s.frame.locals w tail ≠ .ok .unit`), every successful
+(`evalValueProjRead s.frame.locals w tail ≠ .ok .unit`) and an admissible Trusted
+destination (`SetDiscriminantDestOk`), every successful
 `evalSetDiscriminantState` step is matched by Trusted's `evalStmt` stepping to a
 `SlotsRefine NestedSlotStateRefines`-related frame. -/
 theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
@@ -12025,6 +13092,9 @@ theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
     (hSlot : get? slots loc = .some (.partialShell shell))
     (hChain : lookupFieldSlotChain shell.toFieldSlot ((i₀, ty₀) :: restSteps) = .some (.init w))
     (hNotUnit : evalValueProjRead s.frame.locals w tail ≠ .ok .unit)
+    (hDestOk :
+      SetDiscriminantDestOk localDecls layouts
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩)
     (hOk :
       evalSetDiscriminantState slots
         ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots') :
@@ -12083,7 +13153,7 @@ theorem evalSetDiscriminantState_partialShell_any_depth_nested_refines
             s loc (.field i₀ ty₀) (fieldStepsToProjs restSteps ++ tail)
             variantIdx oldVar fields (.aggregate 0 tfs) tv'
             (s.frame.locals.set loc (.init tv')) span localDecls layouts).2
-            (by intro h; nomatch h) hGetT hTRead hTWrite hSetLoc,
+            (by intro h; nomatch h) hDestOk hGetT hTRead hTWrite hSetLoc,
           SlotsRefine.set
             (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
             loc hRel⟩
@@ -12177,6 +13247,46 @@ def IsTupleFieldChain : List ProjectionElem → Bool
     (match fieldTy.kind with | .tuple _ => true | _ => false) &&
       IsTupleFieldChain (.field idx' ty' :: rest)
   | _ => false
+
+/-- Every tuple field chain walked from a tuple-typed base carries a
+`projFieldBasesNonUnion` certificate (every `.field` base is a tuple). -/
+theorem projFieldBasesNonUnion_of_isTupleFieldChain (layouts : LayoutTable) :
+    ∀ (projs : List ProjectionElem) (fieldTys : List RigidTy) (lIdx : LayoutIdx),
+      IsTupleFieldChain projs = true →
+      projFieldBasesNonUnion layouts { kind := .tuple fieldTys, layoutIdx := lIdx } projs = true := by
+  intro projs
+  induction projs with
+  | nil => intro _ _ hChain; nomatch hChain
+  | cons p rest ih =>
+    intro fieldTys lIdx hChain
+    cases p with
+    | field idx fieldTy =>
+      cases rest with
+      | nil => rfl
+      | cons q rest' =>
+        cases q with
+        | field idx' ty' =>
+          dsimp only [IsTupleFieldChain] at hChain
+          rcases fieldTy with ⟨kind, fIdx⟩
+          cases kind with
+          | tuple innerTys =>
+            exact ih innerTys fIdx hChain
+          | _ => nomatch hChain
+        | _ => nomatch hChain
+    | _ => cases rest <;> nomatch hChain
+
+/-- **Tuple field-chain discharge**: an arbitrary-depth tuple field chain
+(`IsTupleFieldChain`) on a local declared as a tuple never touches a union, for
+arbitrary `localDecls` / `layouts`. -/
+theorem placeTouchesUnion_false_of_isTupleFieldChain
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (projs : List ProjectionElem) (fieldTys : List RigidTy) (lIdx : LayoutIdx)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
+      .some { kind := .tuple fieldTys, layoutIdx := lIdx })
+    (hChain : IsTupleFieldChain projs = true) :
+    placeTouchesUnion localDecls layouts ⟨loc, projs⟩ = false :=
+  placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc projs _ hTy
+    (projFieldBasesNonUnion_of_isTupleFieldChain layouts projs fieldTys lIdx hChain)
 
 /-- **Master Arbitrary-Depth Inductive Lemma (`writeToFieldSlot_any_depth_field_chain_nested_refines`)**:
 For **every** depth `k ≥ 1` tuple field chain `projs` (`IsTupleFieldChain projs = true`),
@@ -12618,6 +13728,9 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
   let projs : List ProjectionElem := .field idx₀ ty₀ :: rest
   let rootTy : Ty := { kind := .tuple fieldTys, layoutIdx := lIdx }
   have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
+  -- A tuple field chain on a tuple-declared local never takes Trusted's union-aware path.
+  have hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, .field idx₀ ty₀ :: rest⟩ = false :=
+    placeTouchesUnion_false_of_isTupleFieldChain localDecls layouts loc _ fieldTys lIdx hTy hChain
   have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
@@ -12672,7 +13785,9 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
               set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
             refine ⟨_, _,
               evalStmt_assign_uninit_aggregate_field_step s loc idx₀ ty₀ rest rv span
-                localDecls layouts val locals₁ mem₁ _ tv' _ hRv hGetT hShell hTW hSetT hNoConflict,
+                localDecls layouts val locals₁ mem₁ _ tv' _ hRv hGetT hShell
+                ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                  _ _ val hNoUnion).trans hTW) hSetT hNoConflict,
               SlotsRefine.set
                 (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
                 loc hRel⟩
@@ -12716,7 +13831,8 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
             dsimp only
             rw [hGetT]
             dsimp only
-            rw [hTW]
+            rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+              _ _ val hNoUnion, hTW]
             dsimp only
             rw [hSetT]
             dsimp only
@@ -12761,7 +13877,8 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
             dsimp only
             rw [hGetT]
             dsimp only
-            rw [hTW]
+            rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+              _ _ val hNoUnion, hTW]
             dsimp only
             rw [hSetT]
             dsimp only
@@ -12916,7 +14033,10 @@ Closes the remaining gap between `evalStmt_assign_init_root_nested_refines`
 `.init w`, any projected write `tail` (`Index`, `ConstantIndex`, `Subslice`,
 `Downcast`+`Field`, `Field`, or `.nil` — e.g. `_l.0[idx] = rv` while `_l.1` is
 still `.uninit`) refines Trusted's `evalStmt` `.assign` and preserves
-`SlotsRefine NestedSlotStateRefines` for any `arityOf` (absent active protectors). -/
+`SlotsRefine NestedSlotStateRefines` for any `arityOf` (absent active protectors),
+whenever the destination does not project into a union field for Trusted's
+`localDecls` / `layouts` (`placeTouchesUnion … = false`; Anneal's tuple shell says
+nothing about Trusted's declared type of `_l`). -/
 theorem evalStmt_assign_partialShell_init_subslot_nested_refines
     (s : MachineState)
     (slots₁ slots₂ : List LocalSlotState)
@@ -12942,6 +14062,9 @@ theorem evalStmt_assign_partialShell_init_subslot_nested_refines
     (hSlot : get? slots₁ loc = .some (.partialShell shell))
     (hChain : lookupFieldSlotChain shell.toFieldSlot ((i₀, ty₀) :: restSteps) = .some (.init w))
     (hNoProt : mem₁.activeProtectors = .nil)
+    (hNoUnion :
+      placeTouchesUnion localDecls layouts
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ = false)
     (hWrite :
       writePlaceState arityOf slots₁
         ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ rootTy val = .ok slots₂) :
@@ -13008,8 +14131,10 @@ theorem evalStmt_assign_partialShell_init_subslot_nested_refines
           evalStmt_assign_init_projected_step s loc (.field i₀ ty₀) restProjs rv span
             localDecls layouts val (.aggregate 0 tfs) tv' locals₁ _ mem₁
             (by intro h; nomatch h) hRv hGetT hPop
-            (evalValueProjWrite_refines_writeProjectedValue
-              (.field i₀ ty₀ :: restProjs) locals₁ (.aggregate 0 tfs) val tv' hEWrite)
+            ((writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+              (.aggregate 0 tfs) (.field i₀ ty₀ :: restProjs) val hNoUnion).trans
+              (evalValueProjWrite_refines_writeProjectedValue
+                (.field i₀ ty₀ :: restProjs) locals₁ (.aggregate 0 tfs) val tv' hEWrite))
             hSetT hNoConflict,
           SlotsRefine.set
             (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
