@@ -449,8 +449,11 @@ _RAW_BITWISE_RE = re.compile(
     _IDENT_BEFORE + _QUAL_PREFIX + r"(bitwise(?:And|Or)Bits)" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
 )
 _EQ_SUFFIX_AT_RE = re.compile(r"\.(?:eq_def|eq_unfold|eq_\d+)(?![\w'!?.])")
+# The value is a Lean `numLit`: decimal, or `0x`/`0b`/`0o` prefixed.
 _PROFILER_THRESHOLD_RE = re.compile(
-    r"set_option\s+trace\.profiler\.threshold\s+(\d+(?:_\d+)*)(?![\w'!?])"
+    r"set_option\s+trace\.profiler\.threshold\s+"
+    r"(0[xX][0-9a-fA-F]+(?:_[0-9a-fA-F]+)*|0[bB][01]+(?:_[01]+)*|0[oO][0-7]+(?:_[0-7]+)*"
+    r"|\d+(?:_\d+)*)(?![\w'!?])"
 )
 # Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`,
 # `Foo.«bar»`, `«guillemet-quoted»`). Modifiers may sit between `private` and the keyword.
@@ -1492,7 +1495,7 @@ def _decls_from_index_entry(
                     tuple(int(x) for x in bkeys[1]) if bkeys[1] is not None else None,
                 )
         return file_crc, out
-    except (TypeError, ValueError, IndexError, KeyError):
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError):
         return None
 
 
@@ -2072,7 +2075,15 @@ def scan_lean_text(
             before = stripped[pm.start() - 1] if pm.start() > 0 else " "
             if _is_ident_char(before) or before == ".":
                 continue
-            val = int(pm.group(1).replace("_", ""))
+            lit = pm.group(1).replace("_", "").lower()
+            base = {"0x": 16, "0b": 2, "0o": 8}.get(lit[:2], 10)
+            digits = (lit[2:] if base != 10 else lit).lstrip("0") or "0"
+            # With more significant digits than the threshold has bits, the value is at
+            # least 2**bit_length > threshold in any base. Skipping such literals also
+            # keeps huge ones away from `int()` (which refuses over 4300 digits).
+            if len(digits) > MIN_PROFILER_THRESHOLD.bit_length():
+                continue
+            val = int(digits, base)
             if val < MIN_PROFILER_THRESHOLD:
                 line = line_of(pm.start())
                 findings.append(
@@ -2212,7 +2223,8 @@ def _jetski_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int
         return None, None
     if _JETSKI_REPL_RESULT_RE is None:
         _JETSKI_REPL_RESULT_RE = re.compile(
-            r"\bMade\s+(\d+)\s+replacements?\b(?:[^\n]*?\bstarting at line\s+(\d+)\b)?"
+            r"\bMade\s+(\d{1,9})\s+replacements?\b"
+            r"(?:[^\n]*?\bstarting at line\s+(\d{1,9})\b)?"
         )
     m = _JETSKI_REPL_RESULT_RE.search(res)
     if m is None:
@@ -2737,14 +2749,20 @@ def _is_finite_nonneg_number(val: Any) -> bool:
         return False
     import math
 
-    return math.isfinite(val) and val >= 0
+    try:
+        return math.isfinite(val) and val >= 0
+    except OverflowError:  # an int too large for a float
+        return False
 
 
 def _parse_iso_ts(ts: Any) -> float | None:
     if not isinstance(ts, bool) and isinstance(ts, (int, float)):
         import math
 
-        return float(ts) if math.isfinite(ts) else None
+        try:
+            return float(ts) if math.isfinite(ts) else None
+        except OverflowError:  # an int too large for a float
+            return None
     if not isinstance(ts, str) or not ts.strip():
         return None
     from datetime import datetime
@@ -2754,7 +2772,7 @@ def _parse_iso_ts(ts: Any) -> float | None:
         s = s[:-1] + "+00:00"
     try:
         return datetime.fromisoformat(s).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):  # naive dates near year 1 / 9999
         return None
 
 
@@ -2775,11 +2793,13 @@ def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
     for key in ("duration_s", "latency_s", "elapsed_s"):
         val = obj.get(key)
         if _is_finite_nonneg_number(val):
-            return float(val) * 1000.0
+            ms = float(val) * 1000.0
+            return ms if _is_finite_nonneg_number(ms) else None
     start_ts = _parse_iso_ts(_first_present(obj, ("started_at", "created_at", "start_time")))
     end_ts = _parse_iso_ts(_first_present(obj, ("completed_at", "finished_at", "end_time")))
     if start_ts is not None and end_ts is not None and end_ts >= start_ts:
-        return (end_ts - start_ts) * 1000.0
+        ms = (end_ts - start_ts) * 1000.0
+        return ms if _is_finite_nonneg_number(ms) else None
     content = obj.get("content") if obj.get("content") is not None else obj.get("output")
     if isinstance(content, str) and "Created At:" in content:
         if _CREATED_COMPLETED_RE is None:
@@ -2825,7 +2845,11 @@ def _iter_transcript_items(
 ) -> Iterable[dict[str, Any]]:
     if isinstance(source, (str, Path)):
         path = Path(source)
-        if path.is_file():
+        try:
+            is_file = path.is_file()
+        except (OSError, ValueError):  # e.g. inline JSONL content longer than NAME_MAX
+            is_file = False
+        if is_file:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     s = line.strip()
@@ -2856,9 +2880,16 @@ def _iter_transcript_items(
 
 
 def _batch_key(obj: dict[str, Any], fallback: str) -> Any:
+    """First usable batch id: a non-empty string, an int, or a finite float. Other
+    values (lists, dicts, NaN, booleans) are ignored, so a malformed id can neither
+    crash the grouping (unhashable keys) nor merge unrelated calls."""
     for key in ("batch_id", "step_index", "turn_id"):
         val = obj.get(key)
-        if val is not None and val != "" and not isinstance(val, bool):
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, int) or (isinstance(val, str) and val != ""):
+            return val
+        if isinstance(val, float) and val == val and val not in (float("inf"), float("-inf")):
             return val
     return fallback
 
@@ -2868,7 +2899,7 @@ def _safe_int(val: Any, default: int = 1) -> int:
         return default
     try:
         return int(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(inf)
         return default
 
 

@@ -366,6 +366,32 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
             ],
         )
 
+    def test_rule4_prefixed_and_oversized_literals(self) -> None:
+        # Lean `numLit` values may be `0x`/`0b`/`0o` prefixed or zero-padded, and a
+        # literal past Python's 4300-digit `int()` limit must not crash the scan.
+        src = (
+            "set_option trace.profiler.threshold 0x10\n"
+            "set_option trace.profiler.threshold 0x40\n"
+            "set_option trace.profiler.threshold 0b110001\n"
+            "set_option trace.profiler.threshold 0o62\n"
+            "set_option trace.profiler.threshold 049\n"
+            "set_option trace.profiler.threshold " + "0" * 5000 + "1\n"
+            "set_option trace.profiler.threshold " + "9" * 5000 + "\n"
+            "set_option trace.profiler.threshold 0xg\n"
+            "set_option trace.profiler.threshold 0b1000000\n"
+            "set_option trace.profiler.threshold 0o61\n"
+        )
+        self.assertEqual(
+            scan(src),
+            [
+                (R4, 1, "trace.profiler.threshold=16"),
+                (R4, 3, "trace.profiler.threshold=49"),
+                (R4, 5, "trace.profiler.threshold=49"),
+                (R4, 6, "trace.profiler.threshold=1"),
+                (R4, 10, "trace.profiler.threshold=49"),
+            ],
+        )
+
     def test_rule5_duplicate_private_lemma_intra_and_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
@@ -1333,6 +1359,30 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
             finally:
                 proof_health._BODY_COMPARE_BUDGET = old_budget
 
+    def test_oversized_jetski_result_numbers_are_not_hints(self) -> None:
+        # A replacement count or start line too long to be real (past Python's
+        # 4300-digit `int()` limit) is ignored instead of raising.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            lean_file = tmp_dir / "HugeHint.lean"
+            lean_file.write_text(
+                "theorem t : True := by\n  dsimp [wpMirExecSym]\n  trivial\n", encoding="utf-8"
+            )
+            results = (
+                "Made " + "2" * 5000 + " replacements starting at line 2.",
+                "Made 1 replacement starting at line " + "2" * 5000 + ".",
+            )
+            for idx, result in enumerate(results):
+                payload = {
+                    "result": result,
+                    **jetski_edit(lean_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+                }
+                res = proof_health.evaluate_post_edit_proof_health(
+                    lean_file, payload, cache_path=tmp_dir / f"c{idx}.json"
+                )
+                self.assertEqual(res["deltas"][R1], 1)
+                self.assertEqual([f.line for f in res["new_findings"]], [2])
+
 
 class TestPerformanceAndDogfood(unittest.TestCase):
     def test_synthetic_6000_line_file_under_5ms(self) -> None:
@@ -1624,6 +1674,48 @@ class TestTranscriptLatencyTelemetry(unittest.TestCase):
         self.assertEqual(sorted(stats["by_tool"].keys()), ["lean_goal", "lean_hover"])
         self.assertAlmostEqual(stats["by_tool"]["lean_goal"]["unbatched_mean_ms"], 25.0)
         self.assertNotIn("stale_call", stats["by_tool"])
+
+    def test_unhashable_nonfinite_and_oversized_fields_never_crash(self) -> None:
+        events = [
+            # Unhashable or non-finite ids are skipped: a call stands alone unless a
+            # later key (`step_index`, `turn_id`) holds a usable id.
+            {"tool": "a", "duration_ms": 5.0, "batch_id": [1]},
+            {"tool": "b", "duration_ms": 9000.0, "batch_id": [1]},
+            {"tool": "c", "duration_ms": 7.0, "batch_id": {"k": 1}, "step_index": float("nan")},
+            {"tool": "d", "duration_ms": 3.0, "batch_id": float("inf"), "turn_id": [2]},
+            {"tool": "e", "duration_ms": 4.0, "batch_id": ["x"], "step_index": 77},
+            {"tool": "f", "duration_ms": 6000.0, "step_index": 77},
+            # JSON integers too large for a float, and an overflow to `inf` ms.
+            {"tool": "g", "duration_ms": 10**400},
+            {"tool": "h", "started_at": 10**400, "completed_at": 10**400 + 5},
+            {"tool": "i", "duration_s": 1e306},
+            {"tool": "j", "started_at": -1.7e308, "completed_at": 1.7e308},
+            # `int(inf)` / `int(nan)` batch sizes fall back to 1.
+            {"tool": "k", "duration_ms": 8.0, "batch_size": float("inf")},
+            {"tool": "l", "duration_ms": 2.0, "batch_size": float("nan")},
+            # A long-call marker whose only id is unhashable.
+            {"tool": "m", "is_long_call": True, "batch_id": {"k": 2}},
+        ]
+        stats = proof_health.compute_unbatched_tool_latencies(events)
+        self.assertEqual(sorted(e["tool"] for e in stats["batched_with_long_call"]), ["e", "f"])
+        self.assertEqual(
+            sorted(e["tool"] for e in stats["unbatched"]), ["a", "b", "c", "d", "k", "l"]
+        )
+        for tool in ("g", "h", "i", "j", "m"):
+            self.assertNotIn(tool, stats["by_tool"])
+
+    def test_inline_jsonl_longer_than_name_max_and_overlong_paths(self) -> None:
+        pad = "p" * 6000
+        lines = [
+            json.dumps({"tool": "lean_goal", "duration_ms": 10.0, "batch_id": "t1", "pad": pad}),
+            json.dumps({"tool": "lean_hover", "duration_ms": 30.0, "batch_id": "t2", "pad": pad}),
+        ]
+        stats = proof_health.compute_unbatched_tool_latencies("\n".join(lines))
+        self.assertEqual(stats["unbatched_count"], 2)
+        self.assertAlmostEqual(stats["unbatched_mean_ms"], 20.0)
+        self.assertEqual(proof_health.compute_unbatched_tool_latencies(lines[0])["unbatched_count"], 1)
+        for missing in ("x" * 5000, Path(tempfile.gettempdir()) / ("y" * 300)):
+            self.assertEqual(proof_health.compute_unbatched_tool_latencies(missing)["total_count"], 0)
 
 
 class TestPostToolUseHookIntegration(unittest.TestCase):
