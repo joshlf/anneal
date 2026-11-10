@@ -37,18 +37,22 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
    - `AdtLayoutSpec`: `#[repr(C)]`/`#[repr(Rust)]`/`#[repr(transparent)]` structs, unions,
      explicit-tag `#[repr(Int)]`/`#[repr(C, Int)]` enums, `rustc`'s univariant tagless enums
      (absent variants are 1-ZSTs, `A1`/`B2`), zero-variant enums (`E0084`), and unspecified
-     tagless layouts; `adtLayout?` and `resolveAdtOffsetOf` (`AdtDef::field_offset`), with
-     `resolveAdtOffsetOf_bounds_and_align` (every resolved field fits in the container and is
-     aligned), `#[repr(C)]` offset monotonicity, union zero offsets, and
-     `#[repr(transparent)]` zero-offset delegation.
+     tagless layouts; `adtLayout?`, `resolveAdtOffsetOf` (`AdtDef::field_offset`), and multi-step
+     `resolveAdtOffsetOfChain` (`NullOp::OffsetOf(fields)`), with
+     `resolveAdtOffsetOf_bounds_and_align` and `resolveAdtOffsetOfChain_bounds_and_align` (every
+     single-step and chained field projection fits in the root container and is aligned),
+     `#[repr(C)]` offset monotonicity, union zero offsets, and `#[repr(transparent)]` zero-offset
+     delegation.
    - `evalAdtDiscriminant` (`Rvalue::Discriminant` on typed ADTs): absent/uninhabited variant
      rejection (`B2`), the niche-capable incomplete-shell rule (`PartialAggregate::tag_is_readable`,
-     `A3`), and agreement with Trusted's `evalPlaceDiscriminant`.
+     `A3`), niche-capable `Init` well-formedness (`B4`), and agreement with Trusted's
+     `evalPlaceDiscriminant`.
 
 2. **Section 2 — Projected `Deinit`, `Retag`, `CopyNonOverlapping`, `ShallowInitBox`,
    `WrapUnsafeBinder`, and `PointerCoercion`** (`rvalue.rs`):
    - `deinitFieldSlot` / `evalDeinitPlace` (`deinit_in_slot` / `deinit_place`) over the
-     `FieldSlot` / `LocalSlotState` model of `Anneal.Mir.PlaceAndRvalue`, with the lens laws
+     `FieldSlot` / `LocalSlotState` model of `Anneal.Mir.PlaceAndRvalue`, including static
+     `ConstantIndex`/`Subslice` tail bounds (`deinitTailOk`), with the lens laws
      `evalDeinitPlace_read_same_ub` (Get-Deinit: every prefix and extension of the place,
      including the whole local, faults), `evalDeinitPlace_read_disjoint_eq` (Disjoint-Sibling
      and distinct-local frames), `evalDeinitPlace_write_reinit` (Put-After-Deinit re-promotion)
@@ -64,7 +68,10 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `readPlaceState_below_refines`), and the documented divergence on projected `Deinit`
      below an uninitialized local (`evalStmt_deinit_projected_uninit_root_divergence`).
    - `evalRetagPlace` (`retag_place`: raw retags and recursive reference checks with the `A3`
-     dangling rule), `copyNonOverlappingChecks` (agreeing with Trusted's `rangesDisjoint`),
+     dangling rule, `A3` niche-shell tag readability, `B4` niche-capable `Init` well-formedness,
+     and `B2` uninhabited/out-of-range variant rejection), `copyNonOverlappingChecks` and
+     stateful `evalCopyNonOverlappingState` (agreeing with Trusted's `rangesDisjoint`, rejecting
+     dead-local provenance, copying whole locals, and preserving `SlotsRefine SlotBelow`),
      `evalShallowInitBox`, `evalWrapUnsafeBinder`, and `evalPointerCoercion` with their
      soundness/preservation theorems.
 
@@ -73,11 +80,13 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      (`eval_lowered_terminator`), and the fuel-bounded driver `runLoweredCfgSteps`
      (`eval_cfg_in_state`), with fuel metatheory (`runLoweredCfgSteps_zero_fuel`,
      `runLoweredCfgSteps_add_fuel`, `runLoweredCfgSteps_mono`),
-     `evalSwitchTargets_eq_lookupSwitchTarget`, and the refinement theorems
-     `evalLoweredTerminator_refines_trusted` / `runLoweredCfgSteps_refines_trusted` against
-     Trusted's `evalTerminator` / `stepMirFn` / `stepMirState` under `BodyCorr` / `StateCorr`
-     (Trusted never faults where Anneal succeeds), plus the projected-`Drop` refinement and
-     the documented bare-`Drop` divergence.
+     `evalSwitchTargets_eq_lookupSwitchTarget`, the target-block cleanup/unwinding edge
+     invariant (`evalLoweredTerminator_goto_cleanup_invariant`), and the refinement theorems
+     `evalLoweredTerminator_refines_trusted` / `runLoweredCfgSteps_refines_trusted` (and their
+     statement-bearing generalizations `evalLoweredTerminator_at_end_refines_trusted` /
+     `runLoweredCfgSteps_with_stmts_refines_trusted` under `BodyCorrWithStmts`) against
+     Trusted's `evalTerminator` / `stepMirFn` / `stepMirState` (Trusted never faults where Anneal
+     succeeds), plus the projected-`Drop` refinement and the documented bare-`Drop` divergence.
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -1137,6 +1146,97 @@ theorem resolveAdtOffsetOf_reprC_monotone {spec : AdtLayoutSpec} {fs : List Fiel
     simp only [↓reduceIte, structFieldOffset?, hRepr] at hi hj
     exact cOffset?_monotone 0 fs i j oi oj hLt hi hj
 
+/-- One `(containerSpec, variantIdx, fieldIdx)` hop in a multi-step `NullOp::OffsetOf(fields)`
+projection chain (`resolve_offset_of` in `rvalue.rs`). -/
+structure OffsetOfStep : Type where
+  spec : AdtLayoutSpec
+  variantIdx : Nat
+  fieldIdx : Nat
+
+/-- `resolve_offset_of` over a chain of nested ADT `(variantIdx, fieldIdx)` steps: sums the byte
+offset of each step along the chain. -/
+def resolveAdtOffsetOfChain : List OffsetOfStep → Option Nat
+  | [] => some 0
+  | step :: rest =>
+    match resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx,
+        resolveAdtOffsetOfChain rest with
+    | some off, some tailOff => some (off + tailOff)
+    | _, _ => none
+
+/-- Well-formedness of a non-empty `OffsetOf` chain reaching a leaf field with layout `leaf`:
+every container specification is `AdtLayoutSpec.WF`, a single-step chain resolves directly to
+`leaf`, and in a multi-step chain `step :: next :: rest`, the field selected in `step` has the
+exact `(size, align)` layout of `next.spec` and its alignment is a multiple of `leaf.align`. -/
+inductive OffsetOfChainWF : List OffsetOfStep → FieldLayout → Prop where
+  | single (step : OffsetOfStep) (fs : List FieldLayout) (leaf : FieldLayout)
+      (hWF : step.spec.WF)
+      (hVar : variantFields step.spec step.variantIdx = some fs)
+      (hField : fs[step.fieldIdx]? = some leaf) :
+      OffsetOfChainWF [step] leaf
+  | cons (step next : OffsetOfStep) (rest : List OffsetOfStep)
+      (fs : List FieldLayout) (mid leaf : FieldLayout)
+      (hWF : step.spec.WF)
+      (hVar : variantFields step.spec step.variantIdx = some fs)
+      (hField : fs[step.fieldIdx]? = some mid)
+      (hNextLay : adtLayout? next.spec = some (mid.size, mid.align))
+      (hDvdAlign : leaf.align ∣ mid.align)
+      (hTail : OffsetOfChainWF (next :: rest) leaf) :
+      OffsetOfChainWF (step :: next :: rest) leaf
+
+/-- **Multi-step `OffsetOf` cumulative bounds and alignment (`resolveAdtOffsetOfChain_bounds_and_align`)**:
+for any well-formed chain `step :: rest` of nested ADT field projections (`NullOp::OffsetOf`)
+reaching `leaf`, if `resolveAdtOffsetOfChain (step :: rest) = some totalOff`, then the root
+container `step.spec` has a layout `(rootSize, rootAlign)`, the leaf field lies completely inside
+the root container (`totalOff + leaf.size ≤ rootSize`), and the cumulative byte offset is aligned
+to the leaf field's alignment (`leaf.align ∣ totalOff`). -/
+theorem resolveAdtOffsetOfChain_bounds_and_align {chain : List OffsetOfStep} {leaf : FieldLayout}
+    (hChain : OffsetOfChainWF chain leaf) {totalOff : Nat}
+    (hRes : resolveAdtOffsetOfChain chain = some totalOff) :
+    match chain with
+    | [] => True
+    | root :: _ =>
+      ∃ rootSize rootAlign, adtLayout? root.spec = some (rootSize, rootAlign) ∧
+        totalOff + leaf.size ≤ rootSize ∧ leaf.align ∣ totalOff := by
+  induction hChain generalizing totalOff with
+  | single step fs leaf hWF hVar hField =>
+    simp only [resolveAdtOffsetOfChain] at hRes
+    cases hOff : resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx with
+    | none => rw [hOff] at hRes; nomatch hRes
+    | some off =>
+      rw [hOff] at hRes
+      simp only [Option.some.injEq, Nat.add_zero] at hRes
+      subst hRes
+      obtain ⟨fs', f', size, align, hVF, hF', hLay, hBound, hAlign⟩ :=
+        resolveAdtOffsetOf_bounds_and_align step.spec hWF hOff
+      rw [hVar] at hVF
+      cases hVF
+      rw [hField] at hF'
+      cases hF'
+      exact ⟨size, align, hLay, hBound, hAlign⟩
+  | cons step next rest fs mid leaf hWF hVar hField hNextLay hDvdAlign _ ih =>
+    rw [resolveAdtOffsetOfChain] at hRes
+    cases hOff : resolveAdtOffsetOf step.spec step.variantIdx step.fieldIdx with
+    | none => rw [hOff] at hRes; nomatch hRes
+    | some off =>
+      rw [hOff] at hRes
+      cases hTail : resolveAdtOffsetOfChain (next :: rest) with
+      | none => rw [hTail] at hRes; nomatch hRes
+      | some tailOff =>
+        rw [hTail] at hRes
+        simp only [Option.some.injEq] at hRes
+        subst hRes
+        obtain ⟨fs', f', rootSize, rootAlign, hVF, hF', hLay, hBound, hMidAlign⟩ :=
+          resolveAdtOffsetOf_bounds_and_align step.spec hWF hOff
+        rw [hVar] at hVF
+        cases hVF
+        rw [hField] at hF'
+        cases hF'
+        obtain ⟨nextSize, nextAlign, hNL, hTailBound, hTailAlign⟩ := ih hTail
+        rw [hNextLay] at hNL
+        cases hNL
+        refine ⟨rootSize, rootAlign, hLay, by omega, ?_⟩
+        exact Nat.dvd_add (Nat.dvd_trans hDvdAlign hMidAlign) hTailAlign
+
 /-! ## Section 1c: Typed ADT `Discriminant` -/
 
 /-- Discriminant-relevant facts of a typed ADT (`AdtDef` in `ir.rs`): whether it is an enum,
@@ -1300,8 +1400,9 @@ def explodeAggregate (variantIdx : Nat) (vals : List Value) : PartialAggregate :
 
 /-- `validate_projection_tail` for a `Deinit` below an uninitialized part (where it changes
 nothing), over this untyped model: no `Deref` (`UnsupportedPlaceProjection`), every `Downcast`
-immediately followed by a `Field`, no `OpaqueCast`/`UnwrapUnsafeBinder`, and every `Index`
-operand an initialized scalar local (the statement's pre-read index cache). -/
+immediately followed by a `Field`, no `OpaqueCast`/`UnwrapUnsafeBinder`, every `Index` operand
+an initialized scalar local (the statement's pre-read index cache), and static `ConstantIndex` /
+`Subslice` bounds (`OutOfBounds`) satisfied. -/
 def deinitTailOk (locals : List LocalSlot) : List ProjectionElem → Bool
   | [] => true
   | .field _ _ :: rest => deinitTailOk locals rest
@@ -1310,8 +1411,11 @@ def deinitTailOk (locals : List LocalSlot) : List ProjectionElem → Bool
     match get? locals i with
     | some (.init (.scalar _)) => deinitTailOk locals rest
     | _ => false
-  | .constantIndex _ _ _ :: rest => deinitTailOk locals rest
-  | .subslice _ _ _ :: rest => deinitTailOk locals rest
+  | .constantIndex offset minLen fromEnd :: rest =>
+    (if fromEnd then decide (1 ≤ offset ∧ offset ≤ minLen) else decide (offset < minLen)) &&
+      deinitTailOk locals rest
+  | .subslice from_ to_ fromEnd :: rest =>
+    (fromEnd || decide (from_ ≤ to_)) && deinitTailOk locals rest
   | _ :: _ => false
 
 /-- One `Field` step of `deinit_in_slot` on the (possibly just exploded) shell `shell`, where
@@ -2343,6 +2447,27 @@ theorem deinitTailOk_noDeref (locals : List LocalSlot) (p : List ProjectionElem)
     (h : deinitTailOk locals p = true) : projectionHasDeref p = false := by
   fun_induction deinitTailOk locals p <;> simp_all [projectionHasDeref]
 
+/-- Out-of-bounds `ConstantIndex` in a projection tail under `.uninit` fails closed (`none`),
+matching `validate_projection_tail` in `rvalue.rs`. -/
+theorem evalDeinitPlace_uninit_constantIndex_oob_none (ts : Bool) (slots : List LocalSlotState)
+    (loc : Local) (offset minLen : Nat) (fromEnd : Bool) (rest : List ProjectionElem)
+    (hRoot : slots[loc]? = some .uninit)
+    (hOob : (if fromEnd then decide (1 ≤ offset ∧ offset ≤ minLen) else decide (offset < minLen)) =
+      false) :
+    evalDeinitPlace ts slots ⟨loc, .constantIndex offset minLen fromEnd :: rest⟩ = none := by
+  simp only [evalDeinitPlace, hRoot, slotStateToFieldSlot, deinitFieldSlot, deinitTailOk, hOob,
+    Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
+/-- Out-of-bounds non-`fromEnd` `Subslice` (`from_ > to_`) in a projection tail under `.uninit`
+fails closed (`none`), matching `validate_projection_tail` in `rvalue.rs`. -/
+theorem evalDeinitPlace_uninit_subslice_oob_none (ts : Bool) (slots : List LocalSlotState)
+    (loc : Local) (from_ to_ : Nat) (rest : List ProjectionElem)
+    (hRoot : slots[loc]? = some .uninit) (hOob : to_ < from_) :
+    evalDeinitPlace ts slots ⟨loc, .subslice from_ to_ false :: rest⟩ = none := by
+  have hFalse : decide (from_ ≤ to_) = false := decide_eq_false (by omega)
+  simp only [evalDeinitPlace, hRoot, slotStateToFieldSlot, deinitFieldSlot, deinitTailOk, hFalse,
+    Bool.false_or, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
 /-- A successfully deinitialized place has no `Deref`. -/
 theorem deinitFieldSlot_noDeref {ts : Bool} {locals : List LocalSlot} {slot : FieldSlot}
     {p : List ProjectionElem} {slot' : FieldSlot}
@@ -3228,12 +3353,14 @@ end
 
 /-- The context of a `Retag` (`RetagCtx`): the target pointer width, Anneal's synthetic address
 of a pointer and the local whose synthetic allocation it points into (`resolve_synthetic_local`),
-and the storage state of every local. -/
+the storage state of every local, and the value well-formedness check (`check_value_well_formed`,
+used by `retag_value` on niche-capable enums, `B4`). -/
 structure RetagCtx : Type where
   ptrBits : Nat
   addrOf : ProvenancePtr → Nat
   localOf : ProvenancePtr → Option Nat
   slots : List LocalSlotState
+  wf : Value → Bool := fun _ => true
 
 /-- The alignment check of `check_retagged_reference` (an unspecified alignment is
 `UnsupportedLayout`). -/
@@ -3260,14 +3387,18 @@ def retagRefOk (ctx : RetagCtx) (pt : RetagPointee) (p : ProvenancePtr) : Bool :
     retagAlignOk pt (ctx.addrOf p) && pt.inhabited && retagTargetLive ctx pt p
 
 mutual
-  /-- `retag_value`: validates every reference reachable by value in an initialized value. -/
+  /-- `retag_value`: validates every reference reachable by value in an initialized value,
+  including niche-capable enum well-formedness (`B4`, `!tag_survives_field_deinit` requires
+  `check_value_well_formed`) and variant inhabitedness (`B2`, modeled in `retagVariantOk`). -/
   def retagValueOk (ctx : RetagCtx) : RetagTy → Value → Bool
     | .noRef, _ => true
     | .ref pt, .ptr p _ => retagRefOk ctx pt p
     | .ref _, _ => false
     | .tuple fs, .aggregate _ vals => !RetagTy.listContainsRef fs || retagValuesOk ctx fs vals
     | .tuple fs, _ => !RetagTy.listContainsRef fs
-    | .enum vs _ _, .aggregate v vals => !RetagTy.listContainsRef vs || retagVariantOk ctx vs v vals
+    | .enum vs _ ts, .aggregate v vals =>
+      !RetagTy.listContainsRef vs ||
+        ((ts || ctx.wf (.aggregate v vals)) && retagVariantOk ctx vs v vals)
     | .enum vs _ _, _ => !RetagTy.listContainsRef vs
 
   /-- `retag_value` over the fields of a tuple/struct/variant (lengths must match). -/
@@ -3496,6 +3627,57 @@ theorem evalStmt_retag_uninit_or_dead_ub (s : MachineState) (kind : RetagKind) (
     · rcases hT with hT | hT <;> simp [hT]
   simp only [evalStmt, hOp]
 
+/-- **`Retag` on a niche-capable enum shell fails (`A3`)**: for a reference-bearing enum whose tag
+requires a tag write (`rt = true`) but does not survive field deinitialization (`ts = false`),
+retagging any incomplete shell fails (`false`), even after `SetDiscriminant` (`disc = true`). -/
+theorem retagSlotOk_enum_niche_shell_false (ctx : RetagCtx) (vs : List RetagTy)
+    (hRef : RetagTy.listContainsRef vs = true) (var : Nat) (adt disc : Bool)
+    (cfs : List FieldSlot) :
+    retagSlotOk ctx (.enum vs true false) (.nested var adt disc cfs) = false := by
+  simp [retagSlotOk, hRef]
+
+/-- **`Retag` on an ill-formed niche-capable enum value fails (`B4`)**: for a reference-bearing
+niche-capable enum (`ts = false`), retagging an initialized value that fails
+`check_value_well_formed` (`ctx.wf (.aggregate v vals) = false`) fails (`false`). -/
+theorem retagValueOk_enum_niche_ill_formed_false (ctx : RetagCtx) (vs : List RetagTy) (rt : Bool)
+    (hRef : RetagTy.listContainsRef vs = true) (v : Nat) (vals : List Value)
+    (hBad : ctx.wf (.aggregate v vals) = false) :
+    retagValueOk ctx (.enum vs rt false) (.aggregate v vals) = false := by
+  simp [retagValueOk, hRef, hBad]
+
+/-- An uninhabited (non-`.tuple`) or out-of-range variant in `vs` is rejected by both
+`retagVariantOk` and `retagVariantSlotsOk` (`B2`). -/
+theorem retagVariant_uninhabited_or_oob_false (ctx : RetagCtx) :
+    ∀ (vs : List RetagTy) (v : Nat),
+      (vs[v]? = none ∨ vs[v]? = some .noRef) →
+      (∀ vals, retagVariantOk ctx vs v vals = false) ∧
+      (∀ cfs, retagVariantSlotsOk ctx vs v cfs = false)
+  | [], _, _ => ⟨fun _ => rfl, fun _ => rfl⟩
+  | t :: _, 0, h => by
+    rcases h with hNone | hSome
+    · simp at hNone
+    · simp only [List.getElem?_cons_zero, Option.some.injEq] at hSome
+      subst hSome
+      exact ⟨fun _ => rfl, fun _ => rfl⟩
+  | _ :: vs, v + 1, h => by
+    simp only [List.getElem?_cons_succ] at h
+    simp only [retagVariantOk, retagVariantSlotsOk]
+    exact retagVariant_uninhabited_or_oob_false ctx vs v h
+
+/-- **`Retag` on an uninhabited or out-of-range enum variant fails (`B2`)**: for a
+reference-bearing enum (`RetagTy.listContainsRef vs = true`), retagging an initialized aggregate
+or shell narrowed to an out-of-range (`vs[v]? = none`) or uninhabited (`vs[v]? = some .noRef`)
+variant fails (`false`). -/
+theorem retagSlotOk_enum_uninhabited_or_oob_false (ctx : RetagCtx) (vs : List RetagTy)
+    (rt ts : Bool) (hRef : RetagTy.listContainsRef vs = true) (v : Nat)
+    (hUninh : vs[v]? = none ∨ vs[v]? = some .noRef) :
+    (∀ vals, retagSlotOk ctx (.enum vs rt ts) (.init (.aggregate v vals)) = false) ∧
+    (∀ adt disc cfs, retagSlotOk ctx (.enum vs rt ts) (.nested v adt disc cfs) = false) := by
+  obtain ⟨hVal, hSlot⟩ := retagVariant_uninhabited_or_oob_false ctx vs v hUninh
+  refine ⟨fun vals => ?_, fun adt disc cfs => ?_⟩
+  · simp [retagSlotOk, retagValueOk, hRef, hVal vals]
+  · simp [retagSlotOk, hRef, hSlot cfs]
+
 /-! ### Section 2g: `CopyNonOverlapping` -/
 
 /-- A pointer operand of `copy_nonoverlapping`: its address and the allocation id of its
@@ -3607,6 +3789,122 @@ theorem evalCopyNonOverlappingWithCount_zero (s : MachineState) (src dst : Opera
     (locals₃ : List LocalSlot) :
     evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal 0 locals₃ =
       .step (advanceStmt s locals₃) := rfl
+
+/-- Resolution of a `CopyPtr` to a synthetic local allocation in `StatementEvalState`:
+either external (`none`), or `some (localIdx, byteOffset, localByteSize)`. -/
+abbrev CopyLocalTarget := Option (Nat × Nat × Nat)
+
+/-- Whether a synthetic local target is live in `slots` (`DeadLocal` check in
+`eval_copy_nonoverlapping` when `byteLen > 0 || count == 1`). -/
+def copyTargetLive (slots : List LocalSlotState) : CopyLocalTarget → Bool
+  | none => true
+  | some (loc, _, _) =>
+    match slots[loc]? with
+    | some .dead | none => false
+    | some _ => true
+
+/-- Stateful execution of `Statement::Intrinsic(CopyNonOverlapping)` (`eval_copy_nonoverlapping`
+in `rvalue.rs`):
+1. validates `copyNonOverlappingChecks`;
+2. when `count = 0`, succeeds as a no-op (`some slots`);
+3. when `count > 0`, checks that any referenced synthetic source/destination local is live
+   (`DeadLocal`);
+4. when `count = 1` and both pointers address the root (`offset = 0`) of whole synthetic locals
+   of size `elemSize`, copies the source local's `LocalSlotState` into the destination local
+   (for ZST `elemSize = 0`, copying `.init` / `.partialShell` and leaving `.uninit` unchanged;
+   for `elemSize > 0`, copying the slot directly). -/
+def evalCopyNonOverlappingState (ptrBits : Nat) (slots : List LocalSlotState)
+    (src dst : CopyPtr) (srcTarget dstTarget : CopyLocalTarget)
+    (count elemSize elemAlign : Nat) : Option (List LocalSlotState) :=
+  if !copyNonOverlappingChecks ptrBits src dst count elemSize elemAlign then none
+  else if count = 0 then some slots
+  else if !copyTargetLive slots srcTarget || !copyTargetLive slots dstTarget then none
+  else if count = 1 then
+    match srcTarget, dstTarget with
+    | some (srcLoc, 0, srcSz), some (dstLoc, 0, dstSz) =>
+      if srcSz = elemSize ∧ dstSz = elemSize then
+        match slots[srcLoc]? with
+        | some .dead | none => none
+        | some .uninit =>
+          if elemSize = 0 then some slots else some (slots.set dstLoc .uninit)
+        | some st => some (slots.set dstLoc st)
+      else none
+    | none, none => if elemSize = 0 then some slots else none
+    | _, _ => none
+  else if elemSize = 0 then some slots else none
+
+/-- **`count = 0` is a no-op after `copyNonOverlappingChecks`**. -/
+theorem evalCopyNonOverlappingState_zero_count {ptrBits : Nat} {slots : List LocalSlotState}
+    {src dst : CopyPtr} {srcTarget dstTarget : CopyLocalTarget} {elemSize elemAlign : Nat}
+    (hChk : copyNonOverlappingChecks ptrBits src dst 0 elemSize elemAlign = true) :
+    evalCopyNonOverlappingState ptrBits slots src dst srcTarget dstTarget 0 elemSize elemAlign =
+      some slots := by
+  simp [evalCopyNonOverlappingState, hChk]
+
+/-- **Dead source local faults (`DeadLocal`) whenever `count > 0`**, including a 1-ZST copy
+(`count = 1, elemSize = 0`). -/
+theorem evalCopyNonOverlappingState_dead_src_none (ptrBits : Nat) (slots : List LocalSlotState)
+    (src dst : CopyPtr) (srcLoc srcOff srcSz : Nat) (dstTarget : CopyLocalTarget)
+    (count elemSize elemAlign : Nat) (hCount : count ≠ 0)
+    (hDead : slots[srcLoc]? = some .dead) :
+    evalCopyNonOverlappingState ptrBits slots src dst (some (srcLoc, srcOff, srcSz)) dstTarget
+      count elemSize elemAlign = none := by
+  simp [evalCopyNonOverlappingState, copyTargetLive, hCount, hDead]
+
+/-- **Dead destination local faults (`DeadLocal`) whenever `count > 0`**, including a 1-ZST copy
+(`count = 1, elemSize = 0`). -/
+theorem evalCopyNonOverlappingState_dead_dst_none (ptrBits : Nat) (slots : List LocalSlotState)
+    (src dst : CopyPtr) (srcTarget : CopyLocalTarget) (dstLoc dstOff dstSz : Nat)
+    (count elemSize elemAlign : Nat) (hCount : count ≠ 0)
+    (hDead : slots[dstLoc]? = some .dead) :
+    evalCopyNonOverlappingState ptrBits slots src dst srcTarget (some (dstLoc, dstOff, dstSz))
+      count elemSize elemAlign = none := by
+  simp [evalCopyNonOverlappingState, copyTargetLive, hCount, hDead]
+
+/-- **Whole-local `count = 1` copy of an initialized value or partial shell**: when
+`copyNonOverlappingChecks` succeeds and both pointers address live whole locals `srcLoc` and
+`dstLoc` of size `elemSize`, copying an initialized value or partial shell updates `dstLoc` to
+`srcSt` (for both ZST `elemSize = 0` and non-ZST `elemSize > 0`). -/
+theorem evalCopyNonOverlappingState_whole_local_copies_slot {ptrBits : Nat}
+    {slots : List LocalSlotState} {src dst : CopyPtr} {srcLoc dstLoc elemSize elemAlign : Nat}
+    {srcSt dstSt : LocalSlotState}
+    (hChk : copyNonOverlappingChecks ptrBits src dst 1 elemSize elemAlign = true)
+    (hSrc : slots[srcLoc]? = some srcSt) (hSrcInit : srcSt ≠ .dead ∧ srcSt ≠ .uninit)
+    (hDst : slots[dstLoc]? = some dstSt) (hDstLive : dstSt ≠ .dead) :
+    evalCopyNonOverlappingState ptrBits slots src dst
+        (some (srcLoc, 0, elemSize)) (some (dstLoc, 0, elemSize)) 1 elemSize elemAlign =
+      some (slots.set dstLoc srcSt) := by
+  have hSL : copyTargetLive slots (some (srcLoc, 0, elemSize)) = true := by
+    cases srcSt <;> simp_all [copyTargetLive]
+  have hDL : copyTargetLive slots (some (dstLoc, 0, elemSize)) = true := by
+    cases dstSt <;> simp_all [copyTargetLive]
+  simp only [evalCopyNonOverlappingState, hChk, hSL, hDL, Bool.not_true, Bool.false_or,
+    Bool.false_eq_true, ↓reduceIte, and_self]
+  rw [hSrc]
+  cases srcSt with
+  | dead => exact absurd rfl hSrcInit.1
+  | uninit => exact absurd rfl hSrcInit.2
+  | init v => rfl
+  | partialShell sh => rfl
+
+/-- **Whole-local `CopyNonOverlapping` preserves `SlotsRefine SlotBelow`**: when Anneal copies a
+whole local `srcLoc` into `dstLoc` (`slots.set dstLoc srcSt`) and Trusted updates `dstLoc` to
+`locals[srcLoc]`, the frames remain related by `SlotsRefine SlotBelow`. -/
+theorem evalCopyNonOverlappingState_whole_local_below {slots : List LocalSlotState}
+    {locals : List LocalSlot} {srcLoc dstLoc : Nat} {srcSt : LocalSlotState} {tSrc : LocalSlot}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hSrc : slots[srcLoc]? = some srcSt) (hTSrc : locals[srcLoc]? = some tSrc) :
+    SlotsRefine SlotBelow (slots.set dstLoc srcSt) (locals.set dstLoc tSrc) := by
+  rcases SlotsRefine.get?_rel srcLoc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+  · simp only [get?_eq_getElem?] at hA
+    rw [hA] at hSrc
+    nomatch hSrc
+  · simp only [get?_eq_getElem?] at hA hT
+    rw [hA] at hSrc
+    rw [hT] at hTSrc
+    cases hSrc
+    cases hTSrc
+    exact SlotsRefine.set hAT dstLoc hRel
 
 /-! ### Section 2h: `ShallowInitBox`, `WrapUnsafeBinder`, and `PointerCoercion` -/
 
@@ -4579,5 +4877,498 @@ theorem evalLoweredTerminator_drop_projected_refines {env : CfgEnv} {body : LBod
     simp only [evalTerminator, get?_eq_getElem?, hRoot, hP]
     rw [hP] at hTRead
     simp only [hTRead]
+
+/-- Every `cfgGoto` jump targets an existing block whose `isCleanup` flag matches
+`unwinding.isSome`. -/
+theorem cfgGoto_cleanup_invariant {body : LBody} {t next : Nat}
+    {slots slots' : List LocalSlotState} {unwinding unwinding' : Option Nat}
+    (h : cfgGoto body t slots unwinding = some (.goto next slots' unwinding')) :
+    next = t ∧ slots' = slots ∧ unwinding' = unwinding ∧
+      ∃ nb, body.blocks[next]? = some nb ∧ nb.isCleanup = unwinding'.isSome := by
+  unfold cfgGoto at h
+  cases hnb : body.blocks[t]? with
+  | none => rw [hnb] at h; nomatch h
+  | some nb =>
+    rw [hnb] at h
+    simp only at h
+    split at h
+    · rename_i hClean
+      injection h with hStep
+      injection hStep with hNext hSlots hUnw
+      subst hNext hSlots hUnw
+      exact ⟨rfl, rfl, rfl, nb, hnb, hClean⟩
+    · nomatch h
+
+/-- Every `.goto` step produced by `startPanic` enters cleanup mode (`unwinding' = some bb`) at an
+existing cleanup block (`nb.isCleanup = true`). -/
+theorem startPanic_goto_cleanup_invariant {body : LBody} {bb next : Nat} {u : UnwindAction}
+    {slots slots' : List LocalSlotState} {unwinding unwinding' : Option Nat}
+    (h : startPanic body bb u slots unwinding = some (.goto next slots' unwinding')) :
+    unwinding = none ∧ unwinding' = some bb ∧
+      ∃ nb, body.blocks[next]? = some nb ∧ nb.isCleanup = true := by
+  cases u with
+  | unreachable => simp [startPanic] at h
+  | terminate => simp [startPanic] at h
+  | continue_ =>
+    simp only [startPanic] at h
+    split at h <;> nomatch h
+  | cleanup c =>
+    simp only [startPanic] at h
+    split at h
+    · nomatch h
+    · rename_i hNotUnw
+      have hUnwNone : unwinding = none := by
+        cases unwinding with
+        | none => rfl
+        | some _ => simp at hNotUnw
+      obtain ⟨rfl, rfl, rfl, nb, hnb, hClean⟩ := cfgGoto_cleanup_invariant h
+      exact ⟨hUnwNone, rfl, nb, hnb, hClean⟩
+
+/-- **Target-block cleanup/unwind invariant (`evalLoweredTerminator_goto_cleanup_invariant`)**:
+every `.goto next slots' unwinding'` transition produced by `evalLoweredTerminator` targets a
+valid basic block `nb` in `body.blocks` whose `isCleanup` flag matches `unwinding'.isSome`
+(`B4` standalone/loop CFG edge invariant). -/
+theorem evalLoweredTerminator_goto_cleanup_invariant {env : CfgEnv} {body : LBody}
+    {bb next : Nat} {slots slots' : List LocalSlotState} {unwinding unwinding' : Option Nat}
+    (h : evalLoweredTerminator env body bb slots unwinding =
+      some (.goto next slots' unwinding')) :
+    ∃ nb, body.blocks[next]? = some nb ∧ nb.isCleanup = unwinding'.isSome := by
+  unfold evalLoweredTerminator at h
+  cases hb : body.blocks[bb]? with
+  | none => rw [hb] at h; nomatch h
+  | some block =>
+    rw [hb] at h
+    simp only at h
+    split at h
+    · nomatch h
+    · cases hT : block.terminator with
+      | goto t =>
+        rw [hT] at h
+        exact (cfgGoto_cleanup_invariant h).2.2.2
+      | switchInt discr bytes targets =>
+        rw [hT] at h
+        simp only at h
+        split at h
+        · split at h
+          · split at h
+            · exact (cfgGoto_cleanup_invariant h).2.2.2
+            · nomatch h
+          · nomatch h
+        · nomatch h
+      | return_ =>
+        rw [hT] at h
+        simp only at h
+        split at h
+        · nomatch h
+        · split at h
+          · split at h <;> nomatch h
+          · nomatch h
+      | unreachable => rw [hT] at h; nomatch h
+      | drop place target unwind =>
+        rw [hT] at h
+        simp only at h
+        split at h
+        · exact (cfgGoto_cleanup_invariant h).2.2.2
+        · nomatch h
+      | assert cond expected msg target unwind =>
+        rw [hT] at h
+        simp only at h
+        split at h
+        · split at h
+          · split at h
+            · split at h
+              · exact (cfgGoto_cleanup_invariant h).2.2.2
+              · nomatch h
+            · split at h
+              · obtain ⟨_, hUnw', nb, hnb, hClean⟩ := startPanic_goto_cleanup_invariant h
+                exact ⟨nb, hnb, by simp [hUnw', hClean]⟩
+              · nomatch h
+          · nomatch h
+        · nomatch h
+      | call func args dest destTy target unwind =>
+        rw [hT] at h
+        simp only at h
+        split at h
+        · split at h
+          · nomatch h
+          · split at h
+            · split at h
+              · nomatch h
+              · split at h
+                · nomatch h
+                · split at h
+                  · split at h
+                    · nomatch h
+                    · split at h
+                      · nomatch h
+                      · split at h
+                        · nomatch h
+                        · split at h
+                          · exact (cfgGoto_cleanup_invariant h).2.2.2
+                          · nomatch h
+                  · obtain ⟨_, hUnw', nb, hnb, hClean⟩ := startPanic_goto_cleanup_invariant h
+                    exact ⟨nb, hnb, by simp [hUnw', hClean]⟩
+                  · nomatch h
+            · nomatch h
+        · nomatch h
+      | unwindResume =>
+        rw [hT] at h
+        simp only at h
+        split at h <;> nomatch h
+      | unwindTerminate =>
+        rw [hT] at h
+        simp only at h
+        split at h <;> nomatch h
+
+/-- `TrustedRun` is transitive: composing two fault-free Trusted execution prefixes yields a
+fault-free Trusted execution prefix. -/
+theorem TrustedRun.trans {cm : CapturedMir} {s₁ s₂ s₃ : MachineState}
+    (h₁ : TrustedRun cm s₁ s₂) (h₂ : TrustedRun cm s₂ s₃) : TrustedRun cm s₁ s₃ := by
+  induction h₁ with
+  | refl => exact h₂
+  | step hStep _ ih => exact .step hStep (ih h₂)
+
+/-- **`BodyCorrWithStmts`**: generalizes `BodyCorr` to basic blocks with arbitrary statement
+lists (not restricted to `b.statements = []`), requiring only that `env.evalStmts b.statements`
+is refined by a `TrustedRun` advancing `stmtIdx` from `0` to `tStmts.length` while preserving
+`SlotsRefine SlotBelow` and the machine environment. -/
+structure BodyCorrWithStmts (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
+  phase : ∀ tag, cm.phase ≠ .other tag
+  layouts : cm.layouts = env.layouts
+  block : ∀ (i : Nat) (b : LBlock), body.blocks[i]? = some b →
+    b.terminator.Refinable ∧
+      ∃ (tStmts : List Statement) (span : String),
+        cm.basicBlocks[i]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩ ∧
+        ∀ (slots slots1 : List LocalSlotState) (s : MachineState),
+          StateCorr env i slots s →
+          env.evalStmts b.statements slots = some slots1 →
+          ∃ (locals1 : List LocalSlot),
+            TrustedRun cm s { s with frame := ⟨i, tStmts.length, locals1⟩ } ∧
+            SlotsRefine SlotBelow slots1 locals1
+
+/-- At the end of a basic block's statement list (`stmtIdx = tStmts.length`), Trusted's
+`stepMirFn` evaluates the block's terminator. -/
+theorem stepMirFn_at_end_eq_evalTerminator {cm : CapturedMir} {bb : Nat}
+    {tStmts : List Statement} {tKind : TerminatorKind} {span : String} {isCleanup : Bool}
+    {s : MachineState} {locals1 : List LocalSlot}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hCallee : s.memory.activeCallee = none)
+    (hcm : cm.basicBlocks[bb]? = some ⟨tStmts, ⟨tKind, span⟩, isCleanup⟩) :
+    stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
+      evalTerminator { s with frame := ⟨bb, tStmts.length, locals1⟩ } ⟨tKind, span⟩ (some cm) := by
+  have hNone : tStmts[tStmts.length]? = none := List.getElem?_eq_none (Nat.le_refl _)
+  unfold stepMirFn
+  simp only [hCallee, Option.getD_none, get?_eq_getElem?, hcm, hNone,
+    length_eq_list_length, BEq.rfl, ↓reduceIte]
+
+/-- **`evalLoweredTerminator_at_end_refines_trusted`**: generalizes
+`evalLoweredTerminator_refines_trusted` to a state sitting at the end of a block's statement list
+(`stmtIdx = tStmts.length`). -/
+theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBody}
+    {cm : CapturedMir} {bb : Nat} {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {locals1 : List LocalSlot} {tStmts : List Statement} {span : String}
+    {b : LBlock} {step : CfgStep}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hLayouts : cm.layouts = env.layouts)
+    (hb : body.blocks[bb]? = some b)
+    (hRef : b.terminator.Refinable)
+    (hcm : cm.basicBlocks[bb]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩)
+    (hCorr : StateCorr env bb slots s)
+    (hRel1 : SlotsRefine SlotBelow slots1 locals1)
+    (h : evalLoweredTerminator env body bb slots1 unwinding = some step) :
+    match step with
+    | .goto next slots' _ =>
+      ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
+        StateCorr env next slots' s'
+    | .returned v =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retNormal v s.memory
+    | .panicked _ =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retOutcome .panic
+    | .terminated _ =>
+      stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } = .retOutcome .abort := by
+  have hStepEnd : stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
+      evalTerminator { s with frame := ⟨bb, tStmts.length, locals1⟩ }
+        ⟨b.terminator.toTrusted, span⟩ (some cm) :=
+    stepMirFn_at_end_eq_evalTerminator hPhase hCorr.callee hcm
+  unfold evalLoweredTerminator at h
+  rw [hb] at h
+  simp only at h
+  rw [hStepEnd]
+  split at h
+  · nomatch h
+  · cases hT : b.terminator with
+    | goto t =>
+      rw [hT] at h
+      simp only at h
+      obtain rfl := cfgGoto_eq_some h
+      exact ⟨_, Or.inl rfl, hCorr.jump t locals1 hRel1⟩
+    | switchInt discr bytes targets =>
+      rw [hT] at hRef h
+      simp only at h
+      split at h
+      · split at h
+        · rename_i sc slots' hOp
+          split at h
+          · obtain rfl := cfgGoto_eq_some h
+            obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots1 slots'
+              locals1 discr (.scalar sc) s.memory.borrows env.globals env.layouts
+              s.memory.callerLocals hRel1 hRef hOp
+            refine ⟨_, Or.inr ⟨sc.bits, ?_⟩, hCorr.jump _ locals' hRel⟩
+            simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals,
+              hTOp, evalSwitchTargets_eq_lookupSwitchTarget]
+          · nomatch h
+        · nomatch h
+      · nomatch h
+    | return_ =>
+      rw [hT] at h
+      simp only at h
+      split at h
+      · nomatch h
+      · split at h
+        · rename_i v hRead
+          split at h
+          · cases h
+            obtain ⟨rootVal, hRoot, hProj⟩ := readPlaceState_below_refines hRel1 hRead
+            simp only [readProjectedValue, ProjReadResult.ok.injEq] at hProj
+            subst hProj
+            simp only [LTerminator.toTrusted, evalTerminator, hRoot, hCorr.stack]
+          · nomatch h
+        · nomatch h
+    | unreachable => rw [hT] at h; nomatch h
+    | drop place t u => rw [hT] at hRef; exact absurd hRef id
+    | assert cond expected msg t u =>
+      rw [hT] at hRef h
+      simp only at h
+      split at h
+      · rename_i sc slots' hOp
+        obtain ⟨locals', hTOp, hRel⟩ := evalOperandState_below_refines slots1 slots'
+          locals1 cond (.scalar sc) s.memory.borrows env.globals env.layouts
+          s.memory.callerLocals hRel1 hRef hOp
+        simp only [LTerminator.toTrusted, evalTerminator, hLayouts, hCorr.globals, hTOp]
+        split at h
+        · rename_i hBool
+          obtain ⟨bits, sz⟩ := sc
+          obtain ⟨_, hLe⟩ := hBool
+          have hB01 : bits = 0 ∨ bits = 1 := by simp only at hLe; omega
+          rcases hB01 with rfl | rfl <;> cases expected
+          · rw [show (((0 : Nat) == 1) == false) = true from rfl] at h
+            simp only [↓reduceIte] at h
+            dsimp only
+            split at h
+            · obtain rfl := cfgGoto_eq_some h
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+            · nomatch h
+          · rw [show (((0 : Nat) == 1) == true) = false from rfl] at h
+            simp only [Bool.false_eq_true, ↓reduceIte] at h
+            dsimp only
+            split at h
+            · cases u with
+              | unreachable => simp [startPanic] at h
+              | terminate =>
+                simp only [startPanic, Option.some.injEq] at h
+                subst h
+                simp [applyUnwindAction]
+              | continue_ =>
+                simp only [startPanic] at h
+                split at h
+                · nomatch h
+                · cases h
+                  simp [applyUnwindAction, hCorr.stack]
+              | cleanup c =>
+                simp only [startPanic] at h
+                split at h
+                · nomatch h
+                · obtain rfl := cfgGoto_eq_some h
+                  exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
+                    Or.inl rfl, hCorr.jump c locals' hRel⟩
+            · nomatch h
+          · rw [show (((1 : Nat) == 1) == false) = false from rfl] at h
+            simp only [Bool.false_eq_true, ↓reduceIte] at h
+            dsimp only
+            split at h
+            · cases u with
+              | unreachable => simp [startPanic] at h
+              | terminate =>
+                simp only [startPanic, Option.some.injEq] at h
+                subst h
+                simp [applyUnwindAction]
+              | continue_ =>
+                simp only [startPanic] at h
+                split at h
+                · nomatch h
+                · cases h
+                  simp [applyUnwindAction, hCorr.stack]
+              | cleanup c =>
+                simp only [startPanic] at h
+                split at h
+                · nomatch h
+                · obtain rfl := cfgGoto_eq_some h
+                  exact ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals' } },
+                    Or.inl rfl, hCorr.jump c locals' hRel⟩
+            · nomatch h
+          · rw [show (((1 : Nat) == 1) == true) = true from rfl] at h
+            simp only [↓reduceIte] at h
+            dsimp only
+            split at h
+            · obtain rfl := cfgGoto_eq_some h
+              exact ⟨_, Or.inl rfl, hCorr.jump t locals' hRel⟩
+            · nomatch h
+        · nomatch h
+      · nomatch h
+    | call func args dest destTy t u => rw [hT] at hRef; exact absurd hRef id
+    | unwindResume =>
+      rw [hT] at h
+      simp only at h
+      split at h
+      · cases h
+        simp [LTerminator.toTrusted, evalTerminator, hCorr.stack]
+      · nomatch h
+    | unwindTerminate =>
+      rw [hT] at h
+      simp only at h
+      split at h
+      · cases h
+        simp [LTerminator.toTrusted, evalTerminator]
+      · nomatch h
+
+/-- **`runLoweredCfgSteps_with_stmts_refines_trusted`**: multi-block fuel-bounded CFG execution
+over blocks with non-empty statement lists (`BodyCorrWithStmts`) is matched by a fault-free
+`TrustedRun` execution of `stepMirFn` across both statements and terminators, preserving
+`StateCorr` and the target-block cleanup/unwinding invariant on every block transition. -/
+theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBody}
+    {cm : CapturedMir} (hBody : BodyCorrWithStmts env body cm) :
+    ∀ (fuel bb : Nat) (slots : List LocalSlotState) (unwinding : Option Nat) (s : MachineState)
+      (o : CfgOutcome), StateCorr env bb slots s →
+      runLoweredCfgSteps env body fuel bb slots unwinding = some o →
+      match o with
+      | .outOfFuel bb' slots' _ => ∃ s', TrustedRun cm s s' ∧ StateCorr env bb' slots' s'
+      | .returned v => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retNormal v s'.memory
+      | .panicked _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .panic
+      | .terminated _ => ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = .retOutcome .abort := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro bb slots unwinding s o hCorr h
+    simp only [runLoweredCfgSteps, Option.some.injEq] at h
+    subst h
+    exact ⟨s, .refl s, hCorr⟩
+  | succ fuel ih =>
+    intro bb slots unwinding s o hCorr h
+    simp only [runLoweredCfgSteps] at h
+    cases hb : body.blocks[bb]? with
+    | none => rw [hb] at h; nomatch h
+    | some block =>
+      rw [hb] at h
+      simp only at h
+      cases hSt : env.evalStmts block.statements slots with
+      | none => rw [hSt] at h; nomatch h
+      | some slots1 =>
+        rw [hSt] at h
+        simp only at h
+        obtain ⟨hTermRef, tStmts, span, hcm, hStmtsRun⟩ := hBody.block bb block hb
+        obtain ⟨locals1, hRunStmts, hRel1⟩ := hStmtsRun slots slots1 s hCorr hSt
+        cases hT : evalLoweredTerminator env body bb slots1 unwinding with
+        | none => rw [hT] at h; nomatch h
+        | some step =>
+          rw [hT] at h
+          have hRef := evalLoweredTerminator_at_end_refines_trusted
+            hBody.phase hBody.layouts hb hTermRef hcm hCorr hRel1 hT
+          cases step with
+          | goto next slots' unwinding' =>
+            simp only at h hRef
+            obtain ⟨s', hStep, hCorr'⟩ := hRef
+            have hRest := ih next slots' unwinding' s' o hCorr' h
+            cases o with
+            | outOfFuel bb' slots'' _ =>
+              obtain ⟨s'', hRun, hC⟩ := hRest
+              exact ⟨s'', hRunStmts.trans (.step hStep hRun), hC⟩
+            | returned v =>
+              obtain ⟨s'', hRun, hC⟩ := hRest
+              exact ⟨s'', hRunStmts.trans (.step hStep hRun), hC⟩
+            | panicked b =>
+              obtain ⟨s'', hRun, hC⟩ := hRest
+              exact ⟨s'', hRunStmts.trans (.step hStep hRun), hC⟩
+            | terminated b =>
+              obtain ⟨s'', hRun, hC⟩ := hRest
+              exact ⟨s'', hRunStmts.trans (.step hStep hRun), hC⟩
+          | returned v =>
+            simp only [Option.some.injEq] at h
+            subst h
+            exact ⟨{ s with frame := ⟨bb, tStmts.length, locals1⟩ }, hRunStmts, hRef⟩
+          | panicked b =>
+            simp only [Option.some.injEq] at h
+            subst h
+            exact ⟨{ s with frame := ⟨bb, tStmts.length, locals1⟩ }, hRunStmts, hRef⟩
+          | terminated b =>
+            simp only [Option.some.injEq] at h
+            subst h
+            exact ⟨{ s with frame := ⟨bb, tStmts.length, locals1⟩ }, hRunStmts, hRef⟩
+
+/-- Every statement-free `BodyCorr` (with `env.evalStmts [] slots = some slots`) is an instance
+of `BodyCorrWithStmts`. -/
+theorem BodyCorr.toBodyCorrWithStmts {env : CfgEnv} {body : LBody} {cm : CapturedMir}
+    (hBody : BodyCorr env body cm) (hStmts : ∀ slots, env.evalStmts [] slots = some slots) :
+    BodyCorrWithStmts env body cm where
+  phase := hBody.phase
+  layouts := hBody.layouts
+  block i b hb := by
+    obtain ⟨hNil, hRef, span, hcm⟩ := hBody.block i b hb
+    refine ⟨hRef, [], span, hcm, fun slots slots1 s hCorr hEval => ?_⟩
+    rw [hNil, hStmts] at hEval
+    injection hEval with hEq
+    subst hEq
+    refine ⟨s.frame.locals, ?_, hCorr.slots⟩
+    have hFrame : { s with frame := ⟨i, ([] : List Statement).length, s.frame.locals⟩ } = s := by
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
+      obtain ⟨rfl, rfl, _⟩ := hCorr
+      rfl
+    rw [hFrame]
+    exact .refl s
+
+/-- Executing a single bare-local `Deinit` statement at the start of basic block `bb` produces a
+one-step `TrustedRun` to `stmtIdx = 1` while preserving `SlotsRefine SlotBelow` (discharging
+`BodyCorrWithStmts`'s block statement obligation for bare `Deinit` blocks). -/
+theorem stepMirFn_deinit_root_trustedRun {env : CfgEnv} {cm : CapturedMir} {bb : Nat}
+    {ts : Bool} {slots slots1 : List LocalSlotState} {place : Place} {span : String}
+    {term : Terminator} {isCleanup : Bool} {s : MachineState}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hCorr : StateCorr env bb slots s)
+    (hcm : cm.basicBlocks[bb]? = some ⟨[⟨.deinit place, span⟩], term, isCleanup⟩)
+    (hRoot : place.projection = [])
+    (hDeinit : evalDeinitPlace ts slots place = some slots1) :
+    TrustedRun cm s { s with frame := ⟨bb, 1, s.frame.locals.set place.local_ .uninit⟩ } ∧
+      SlotsRefine SlotBelow slots1 (s.frame.locals.set place.local_ .uninit) := by
+  obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_root_refines (s := s) (span := span)
+    (localDecls := cm.localDecls) (layouts := cm.layouts) hCorr.slots hRoot hDeinit
+  refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
+  unfold stepMirFn
+  simp only [hCorr.callee, Option.getD_none, get?_eq_getElem?, hCorr.block, hcm, hCorr.stmt,
+    List.getElem?_cons_zero]
+  rw [hStmt]
+  simp only [advanceStmt, hCorr.block, hCorr.stmt]
+
+/-- Executing a single projected `Deinit` statement at the start of basic block `bb` produces a
+one-step `TrustedRun` to `stmtIdx = 1` while preserving `SlotsRefine SlotBelow` (discharging
+`BodyCorrWithStmts`'s block statement obligation for projected `Deinit` blocks). -/
+theorem stepMirFn_deinit_projected_trustedRun {env : CfgEnv} {cm : CapturedMir} {bb : Nat}
+    {ts : Bool} {slots slots1 : List LocalSlotState} {place : Place} {span : String}
+    {term : Terminator} {isCleanup : Bool} {s : MachineState} {rootVal tv : Value}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hCorr : StateCorr env bb slots s)
+    (hcm : cm.basicBlocks[bb]? = some ⟨[⟨.deinit place, span⟩], term, isCleanup⟩)
+    (hProj : place.projection ≠ [])
+    (hDeinit : evalDeinitPlace ts slots place = some slots1)
+    (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
+    (hTRead : readProjectedValue s.frame.locals rootVal place.projection = .ok tv) :
+    TrustedRun cm s { s with frame := ⟨bb, 1, s.frame.locals⟩ } ∧
+      SlotsRefine SlotBelow slots1 s.frame.locals := by
+  obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_projected_refines (s := s) (span := span)
+    (localDecls := cm.localDecls) (layouts := cm.layouts) hCorr.slots hProj hDeinit hTRoot hTRead
+  refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
+  unfold stepMirFn
+  simp only [hCorr.callee, Option.getD_none, get?_eq_getElem?, hCorr.block, hcm, hCorr.stmt,
+    List.getElem?_cons_zero]
+  rw [hStmt]
+  simp only [advanceStmt, hCorr.block, hCorr.stmt]
 
 end Anneal.Mir.AdtAndControl
