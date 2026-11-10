@@ -564,6 +564,17 @@ pub enum ProtoCastKind {
     Subtype,
 }
 
+/// Prototype aggregate kind mirroring `Trusted.MirAst.AggregateKind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtoAggregateKind {
+    Array,
+    Tuple,
+    Adt(String, usize, Option<usize>),
+    Closure(String),
+    Coroutine(String),
+    RawPtr(bool),
+}
+
 /// Prototype rvalue mirroring `Trusted.MirAst.Rvalue`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtoRvalue {
@@ -578,7 +589,7 @@ pub enum ProtoRvalue {
     NullaryOp(ProtoNullOp),
     UnaryOp(ProtoUnOp, ProtoOperand),
     Discriminant(ProtoPlace),
-    Aggregate(Vec<ProtoOperand>),
+    Aggregate(ProtoAggregateKind, Vec<ProtoOperand>),
     ShallowInitBox(ProtoOperand),
     CopyForDeref(ProtoPlace),
     WrapUnsafeBinder(ProtoOperand),
@@ -887,6 +898,25 @@ pub fn census_null_op_fault_classes(op: &ProtoNullOp) -> Vec<MirFaultClass> {
     }
 }
 
+/// `[adv A1]` Fault classes triggered by a `ProtoProjectionElem` inside
+/// `readProjectedValue` (used by projected `Deinit` and `Drop`), matching
+/// `censusReadProjectedFaultClasses` in `FaultSiteCensusPrototype.lean`.
+pub fn census_read_projected_fault_classes(proj: &ProtoProjectionElem) -> Vec<MirFaultClass> {
+    match proj {
+        ProtoProjectionElem::Deref
+        | ProtoProjectionElem::Field(_)
+        | ProtoProjectionElem::OpaqueCast
+        | ProtoProjectionElem::UnwrapUnsafeBinder => Vec::new(),
+        ProtoProjectionElem::Downcast(_, _) => vec![MirFaultClass::ScalarNicheInvalid],
+        ProtoProjectionElem::Subslice { .. } => vec![MirFaultClass::BoundsCheck],
+        ProtoProjectionElem::Index(_) | ProtoProjectionElem::ConstantIndex { .. } => vec![
+            MirFaultClass::BoundsCheck,
+            MirFaultClass::ScalarNicheInvalid,
+            MirFaultClass::UninitRead,
+        ],
+    }
+}
+
 /// Fault classes triggered by a `ProtoCastKind` (`censusCastKindFaultClasses`).
 pub fn census_cast_kind_fault_classes(kind: &ProtoCastKind) -> Vec<MirFaultClass> {
     match kind {
@@ -899,14 +929,30 @@ pub fn census_cast_kind_fault_classes(kind: &ProtoCastKind) -> Vec<MirFaultClass
         ProtoCastKind::Transmute | ProtoCastKind::Subtype => {
             vec![MirFaultClass::ScalarNicheInvalid, MirFaultClass::UninitRead]
         }
-        ProtoCastKind::PointerCoercion(_) | ProtoCastKind::PtrToPtr | ProtoCastKind::FnPtrToPtr => {
+        ProtoCastKind::PointerCoercion(coercion) if coercion == "MutToConstPointer" => Vec::new(),
+        ProtoCastKind::PointerCoercion(coercion)
+            if coercion == "Unsize" || coercion == "ArrayToPointer" =>
+        {
             vec![
                 MirFaultClass::BoundsCheck,
                 MirFaultClass::PtrDerefInvalid,
                 MirFaultClass::PtrAlignMismatch,
+                MirFaultClass::TreeBorrowsViolation,
                 MirFaultClass::ScalarNicheInvalid,
             ]
         }
+        ProtoCastKind::PtrToPtr => vec![
+            MirFaultClass::BoundsCheck,
+            MirFaultClass::PtrDerefInvalid,
+            MirFaultClass::PtrAlignMismatch,
+            MirFaultClass::TreeBorrowsViolation,
+            MirFaultClass::ScalarNicheInvalid,
+        ],
+        ProtoCastKind::PointerCoercion(_) | ProtoCastKind::FnPtrToPtr => vec![
+            MirFaultClass::PtrDerefInvalid,
+            MirFaultClass::ScalarNicheInvalid,
+            MirFaultClass::CallAbiMismatch,
+        ],
     }
 }
 
@@ -916,6 +962,25 @@ pub const fn cast_kind_unevaluated(kind: &ProtoCastKind) -> bool {
         kind,
         ProtoCastKind::FloatToInt | ProtoCastKind::FloatToFloat | ProtoCastKind::IntToFloat
     )
+}
+
+/// `[adv A1]` True for `ProtoAggregateKind`s that `evalRvalue` never evaluates
+/// (`aggregateKindUnevaluated` in Lean).
+pub const fn aggregate_kind_unevaluated(kind: &ProtoAggregateKind) -> bool {
+    matches!(kind, ProtoAggregateKind::Coroutine(_))
+}
+
+/// `[adv A1]` True for `ProtoRvalue` forms that `evalRvalue` never evaluates
+/// (`rvalueUnevaluated` in Lean).
+pub const fn rvalue_unevaluated(rv: &ProtoRvalue) -> bool {
+    match rv {
+        ProtoRvalue::ThreadLocalRef(_)
+        | ProtoRvalue::NullaryOp(_)
+        | ProtoRvalue::ShallowInitBox(_) => true,
+        ProtoRvalue::Cast(kind, _) => cast_kind_unevaluated(kind),
+        ProtoRvalue::Aggregate(kind, _) => aggregate_kind_unevaluated(kind),
+        _ => false,
+    }
 }
 
 /// Fault classes triggered by evaluating a `ProtoRvalue` (`censusRvalueFaultClasses`).
@@ -957,7 +1022,10 @@ pub fn census_rvalue_fault_classes(rv: &ProtoRvalue) -> Vec<MirFaultClass> {
             out.push(MirFaultClass::ScalarNicheInvalid);
             out
         }
-        ProtoRvalue::Aggregate(ops) => {
+        ProtoRvalue::Aggregate(kind, ops) => {
+            if aggregate_kind_unevaluated(kind) {
+                return Vec::new();
+            }
             let mut out = Vec::new();
             for op in ops {
                 out.extend(census_operand_fault_classes(op));
@@ -1007,12 +1075,17 @@ pub fn census_stmt_fault_classes(kind: &ProtoStatementKind) -> Vec<MirFaultClass
         ProtoStatementKind::StorageLive(_) | ProtoStatementKind::StorageDead(_) => {
             vec![MirFaultClass::StorageLiveProtected]
         }
-        ProtoStatementKind::PlaceMention(place) | ProtoStatementKind::Deinit(place) => {
-            let mut v = vec![MirFaultClass::UninitRead];
-            for proj in &place.projection {
-                v.extend(census_projection_elem_fault_classes(proj));
+        ProtoStatementKind::PlaceMention(_) => vec![MirFaultClass::UninitRead],
+        ProtoStatementKind::Deinit(place) => {
+            if place.projection.is_empty() {
+                vec![MirFaultClass::StorageLiveProtected]
+            } else {
+                let mut v = vec![MirFaultClass::UninitRead];
+                for proj in &place.projection {
+                    v.extend(census_read_projected_fault_classes(proj));
+                }
+                v
             }
-            v
         }
         ProtoStatementKind::Retag(place) => {
             let mut v = census_place_read_fault_classes(place);
@@ -1035,9 +1108,13 @@ pub fn census_stmt_fault_classes(kind: &ProtoStatementKind) -> Vec<MirFaultClass
         }
         ProtoStatementKind::Intrinsic(intr) => census_intrinsic_fault_classes(intr),
         ProtoStatementKind::Assign(dst, rv) => {
-            let mut v = census_place_write_fault_classes(dst);
-            v.extend(census_rvalue_fault_classes(rv));
-            v
+            if rvalue_unevaluated(rv) {
+                Vec::new()
+            } else {
+                let mut v = census_place_write_fault_classes(dst);
+                v.extend(census_rvalue_fault_classes(rv));
+                v
+            }
         }
     };
     dedup_fault_classes(raw)
@@ -1107,21 +1184,17 @@ pub fn census_callee_def_path_fault_classes(def_path: &str) -> Vec<MirFaultClass
     ) {
         return vec![MirFaultClass::UnreachableTerminator];
     }
-    if matches!(
-        def_path,
-        "core::intrinsics::exact_div" | "std::intrinsics::exact_div"
-    ) {
+    if def_path == "core::intrinsics::exact_div" {
         return vec![MirFaultClass::ArithOverflow, MirFaultClass::DivRemByZero];
     }
-    // `[adv B1]` parity fix: `Trusted.MirSemantics.classifyRustIntrinsic?` only
-    // recognizes `core::intrinsics::*`; `std::intrinsics::*` paths are ordinary
-    // (external/inline) callees and contribute no intrinsic fault classes.
+    // `[adv B1]` / `[adv A1]` parity fix: `Trusted.MirSemantics.classifyRustIntrinsic?`
+    // and `isDirectExactDivTarget` only recognize `core::intrinsics::*`; `std::intrinsics::*`
+    // paths are ordinary callees and contribute no intrinsic fault classes.
     let intrinsic_suffix = def_path.strip_prefix("core::intrinsics::");
     match intrinsic_suffix {
         Some("arith_offset") => vec![
-            MirFaultClass::ArithOverflow,
-            MirFaultClass::BoundsCheck,
             MirFaultClass::PtrDerefInvalid,
+            MirFaultClass::ScalarNicheInvalid,
         ],
         Some("unchecked_add" | "unchecked_sub" | "unchecked_mul") => {
             vec![MirFaultClass::ArithOverflow]
@@ -1137,8 +1210,13 @@ pub fn census_callee_def_path_fault_classes(def_path: &str) -> Vec<MirFaultClass
             MirFaultClass::ScalarNicheInvalid,
         ],
         Some("const_eval_select") => vec![
-            MirFaultClass::CallAbiMismatch,
+            MirFaultClass::ArithOverflow,
+            MirFaultClass::DivRemByZero,
+            MirFaultClass::ShiftOverflow,
+            MirFaultClass::PtrDerefInvalid,
             MirFaultClass::ScalarNicheInvalid,
+            MirFaultClass::CallAbiMismatch,
+            MirFaultClass::UnreachableTerminator,
         ],
         _ => Vec::new(),
     }
@@ -1176,7 +1254,15 @@ pub fn census_terminator_fault_classes(
             v
         }
         ProtoTerminatorKind::Drop { place, .. } => {
-            let mut v = census_place_read_fault_classes(place);
+            let mut v = if place.projection.is_empty() {
+                vec![MirFaultClass::StorageLiveProtected]
+            } else {
+                let mut p = vec![MirFaultClass::UninitRead];
+                for proj in &place.projection {
+                    p.extend(census_read_projected_fault_classes(proj));
+                }
+                p
+            };
             v.extend(target_oob);
             v
         }
@@ -1198,17 +1284,30 @@ pub fn census_terminator_fault_classes(
             func,
             args,
             destination,
+            target,
             unwind,
-            ..
         } => {
             let mut v = census_operand_fault_classes(func);
             for arg in args {
                 v.extend(census_operand_fault_classes(arg));
             }
-            v.extend(census_place_write_fault_classes(destination));
+            if target.is_some() {
+                v.extend(census_place_write_fault_classes(destination));
+            }
             v.push(MirFaultClass::CallAbiMismatch);
             match func.extract_callee_def_path() {
-                Some(def_path) => v.extend(census_callee_def_path_fault_classes(def_path)),
+                Some(def_path) => {
+                    if target.is_some() {
+                        v.extend(census_callee_def_path_fault_classes(def_path));
+                    } else if matches!(
+                        def_path,
+                        "core::hint::unreachable_unchecked"
+                            | "std::hint::unreachable_unchecked"
+                            | "core::intrinsics::unreachable"
+                    ) {
+                        v.push(MirFaultClass::UnreachableTerminator);
+                    }
+                }
                 None => v.push(MirFaultClass::PtrDerefInvalid),
             }
             if matches!(unwind, ProtoUnwindAction::Unreachable) {
@@ -1222,7 +1321,12 @@ pub fn census_terminator_fault_classes(
             for arg in args {
                 v.extend(census_operand_fault_classes(arg));
             }
-            v.push(MirFaultClass::CallAbiMismatch);
+            v.extend([
+                MirFaultClass::TreeBorrowsViolation,
+                MirFaultClass::UninitRead,
+                MirFaultClass::StorageLiveProtected,
+                MirFaultClass::CallAbiMismatch,
+            ]);
             if func.extract_callee_def_path().is_none() {
                 v.push(MirFaultClass::PtrDerefInvalid);
             }
@@ -1485,12 +1589,20 @@ fn convert_ir_rvalue(rv: &IrRvalue) -> ProtoRvalue {
             ProtoRvalue::UnaryOp(u, convert_ir_operand(op))
         }
         IrRvalue::Discriminant(p) => ProtoRvalue::Discriminant(convert_ir_place(p)),
-        IrRvalue::Aggregate(_ak, ops) => {
-            let _ = match _ak {
-                IrAggregateKind::Tuple => {}
-                _ => {}
+        IrRvalue::Aggregate(ak, ops) => {
+            let kind = match ak {
+                IrAggregateKind::Array(_) => ProtoAggregateKind::Array,
+                IrAggregateKind::Tuple => ProtoAggregateKind::Tuple,
+                IrAggregateKind::Adt(def_id, variant_idx, active_field) => {
+                    ProtoAggregateKind::Adt(def_id.clone(), *variant_idx, *active_field)
+                }
+                IrAggregateKind::Closure(def_id) => ProtoAggregateKind::Closure(def_id.clone()),
+                IrAggregateKind::Coroutine(def_id) => ProtoAggregateKind::Coroutine(def_id.clone()),
+                IrAggregateKind::RawPtr(_, m) => {
+                    ProtoAggregateKind::RawPtr(matches!(m, IrMutability::Mut))
+                }
             };
-            ProtoRvalue::Aggregate(ops.iter().map(convert_ir_operand).collect())
+            ProtoRvalue::Aggregate(kind, ops.iter().map(convert_ir_operand).collect())
         }
         IrRvalue::ShallowInitBox(op, _) => ProtoRvalue::ShallowInitBox(convert_ir_operand(op)),
         IrRvalue::CopyForDeref(p) => ProtoRvalue::CopyForDeref(convert_ir_place(p)),
@@ -1648,6 +1760,7 @@ enum LeanToken {
     Ident(String),
     NatLit(u128),
     StrLit(String),
+    CharLit(char),
 }
 
 fn is_lean_ident_continue(ch: char) -> bool {
@@ -1701,25 +1814,14 @@ fn tokenize_lean_source(src: &str) -> Result<Vec<LeanToken>, CensusScanError> {
             continue;
         }
 
-        // Character literal `'x'` or `'\x'` (so `'«'`, `'"'`, `'/'` are not mis-tokenized)
+        // `[adv A1]` Character literal `'x'` or `'\x'` (including `'\''`):
+        // lexed as `LeanToken::CharLit(char)` so `parse_string` rejects `'a'` instead
+        // of reading it as `""`, and `'\''` advances past the closing quote.
         if ch == '\'' {
-            let prev_is_ident = i > 0 && is_lean_ident_continue(chars[i - 1]);
-            if !prev_is_ident && i + 2 < n {
-                if chars[i + 1] == '\\' {
-                    let mut end = i + 2;
-                    while end < n && chars[end] != '\'' && chars[end] != '\n' {
-                        end += 1;
-                    }
-                    if end < n && chars[end] == '\'' {
-                        i = end + 1;
-                        tokens.push(LeanToken::StrLit(String::new()));
-                        continue;
-                    }
-                } else if chars[i + 2] == '\'' && chars[i + 1] != '\n' {
-                    i += 3;
-                    tokens.push(LeanToken::StrLit(String::new()));
-                    continue;
-                }
+            if let Some((lit_ch, next_i)) = lex_char_literal(&chars, i)? {
+                tokens.push(LeanToken::CharLit(lit_ch));
+                i = next_i;
+                continue;
             }
         }
 
@@ -1732,39 +1834,10 @@ fn tokenize_lean_source(src: &str) -> Result<Vec<LeanToken>, CensusScanError> {
         }
 
         // Raw string literal `r"..."` or `r#"..."#`
-        if ch == 'r' && i + 1 < n && (chars[i + 1] == '"' || chars[i + 1] == '#') {
-            let mut hashes = 0usize;
-            let mut k = i + 1;
-            while k < n && chars[k] == '#' {
-                hashes += 1;
-                k += 1;
-            }
-            if k < n && chars[k] == '"' {
-                k += 1;
-                let mut content = String::new();
-                let mut closed = false;
-                while k < n {
-                    if chars[k] == '"' {
-                        let mut m = 0usize;
-                        while m < hashes && k + 1 + m < n && chars[k + 1 + m] == '#' {
-                            m += 1;
-                        }
-                        if m == hashes {
-                            k += 1 + hashes;
-                            closed = true;
-                            break;
-                        }
-                    }
-                    content.push(chars[k]);
-                    k += 1;
-                }
-                if !closed {
-                    return Err(CensusScanError::UnterminatedRawString);
-                }
-                tokens.push(LeanToken::StrLit(content));
-                i = k;
-                continue;
-            }
+        if let Some((content, next_i)) = lex_raw_string(&chars, i)? {
+            tokens.push(LeanToken::StrLit(content));
+            i = next_i;
+            continue;
         }
 
         // Interpolated string `s!"..."` (with `{...}` interpolation nesting)
@@ -2027,6 +2100,91 @@ fn lex_string_escape(
     Ok(i + 1)
 }
 
+/// `[adv A1]` Lex a Lean character literal `'c'` or `'\...'` starting at `open_quote`
+/// (`chars[open_quote] == '\''`). Properly decodes `'\''`, `'\"'`, `'\\'`, `'\xHH'`,
+/// and `'\uHHHH'` via `lex_string_escape` so `'\''` never terminates prematurely at
+/// the escaped quote.
+fn lex_char_literal(
+    chars: &[char],
+    open_quote: usize,
+) -> Result<Option<(char, usize)>, CensusScanError> {
+    let n = chars.len();
+    let prev_is_ident = open_quote > 0 && is_lean_ident_continue(chars[open_quote - 1]);
+    if prev_is_ident || open_quote + 2 >= n {
+        return Ok(None);
+    }
+    if chars[open_quote + 1] == '\\' {
+        let mut decoded = String::new();
+        let after_esc = lex_string_escape(chars, open_quote + 2, &mut decoded, false)?;
+        let mut ch_iter = decoded.chars();
+        let Some(ch) = ch_iter.next() else {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "empty character literal escape".to_string(),
+            ));
+        };
+        if ch_iter.next().is_some() || after_esc >= n || chars[after_esc] != '\'' {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "unterminated escaped character literal".to_string(),
+            ));
+        }
+        return Ok(Some((ch, after_esc + 1)));
+    }
+    if chars[open_quote + 2] == '\''
+        && chars[open_quote + 1] != '\''
+        && chars[open_quote + 1] != '\n'
+    {
+        return Ok(Some((chars[open_quote + 1], open_quote + 3)));
+    }
+    Ok(None)
+}
+
+/// `[adv A1]` Lex a Lean raw string literal `r"..."` or `r#"..."#` starting at `start`.
+fn lex_raw_string(
+    chars: &[char],
+    start: usize,
+) -> Result<Option<(String, usize)>, CensusScanError> {
+    let n = chars.len();
+    let prev_is_ident = start > 0 && is_lean_ident_continue(chars[start - 1]);
+    if prev_is_ident
+        || start + 1 >= n
+        || chars[start] != 'r'
+        || (chars[start + 1] != '"' && chars[start + 1] != '#')
+    {
+        return Ok(None);
+    }
+    let mut hashes = 0usize;
+    let mut k = start + 1;
+    while k < n && chars[k] == '#' {
+        hashes += 1;
+        k += 1;
+    }
+    if k >= n || chars[k] != '"' {
+        return Ok(None);
+    }
+    k += 1;
+    let mut content = String::new();
+    let mut closed = false;
+    while k < n {
+        if chars[k] == '"' {
+            let mut m = 0usize;
+            while m < hashes && k + 1 + m < n && chars[k + 1 + m] == '#' {
+                m += 1;
+            }
+            if m == hashes {
+                k += 1 + hashes;
+                closed = true;
+                break;
+            }
+        }
+        content.push(chars[k]);
+        k += 1;
+    }
+    if !closed {
+        return Err(CensusScanError::UnterminatedRawString);
+    }
+    Ok(Some((content, k)))
+}
+
 fn lex_standard_string(
     chars: &[char],
     after_open_quote: usize,
@@ -2071,7 +2229,9 @@ fn lex_interpolated_string(
             continue;
         }
         if ch == '{' {
-            // Walk nested `{ ... }` inside string interpolation, respecting nested strings.
+            // Walk nested `{ ... }` inside string interpolation, respecting nested
+            // strings, raw strings, nested `<ident>!"..."` interpolations, character
+            // literals `'...'`, and `«...»` guillemet identifiers (`[adv A1]`).
             let mut brace_depth = 1usize;
             out.push('{');
             i += 1;
@@ -2084,6 +2244,45 @@ fn lex_interpolated_string(
                     return Err(CensusScanError::MalformedCapturedMirSyntax(
                         "comment inside string interpolation".to_string(),
                     ));
+                }
+                if chars[i] == '\'' {
+                    if let Some((lit_ch, next_i)) = lex_char_literal(chars, i)? {
+                        out.push('\'');
+                        out.push(lit_ch);
+                        out.push('\'');
+                        i = next_i;
+                        continue;
+                    }
+                }
+                if chars[i] == '«' {
+                    let (ident, next_i) = lex_dotted_ident(chars, i)?;
+                    out.push('«');
+                    out.push_str(&ident);
+                    out.push('»');
+                    i = next_i;
+                    continue;
+                }
+                if let Some((raw_s, next_i)) = lex_raw_string(chars, i)? {
+                    out.push('"');
+                    out.push_str(&raw_s);
+                    out.push('"');
+                    i = next_i;
+                    continue;
+                }
+                if chars[i].is_alphabetic() || chars[i] == '_' {
+                    let (ident, next_i) = lex_dotted_ident(chars, i)?;
+                    out.push_str(&ident);
+                    if ident.ends_with('!') && next_i < n && chars[next_i] == '"' {
+                        let (inner_interp, after_interp) =
+                            lex_interpolated_string(chars, next_i + 1)?;
+                        out.push('"');
+                        out.push_str(&inner_interp);
+                        out.push('"');
+                        i = after_interp;
+                    } else {
+                        i = next_i;
+                    }
+                    continue;
                 }
                 if chars[i] == '"' {
                     let (inner_s, next_i) = lex_standard_string(chars, i + 1)
@@ -2129,7 +2328,7 @@ const MIR_AST_NAMESPACES: [&str; 5] = [
 /// interprets. Strict module scanning rejects any declaration or namespace that
 /// reuses one of these names, because a local `def TerminatorKind.goto` would
 /// shadow the real constructor for every `TerminatorKind.goto` written in the module.
-const MIR_AST_TYPE_NAMES: [&str; 33] = [
+const MIR_AST_TYPE_NAMES: [&str; 35] = [
     "AggregateKind",
     "BasicBlockData",
     "BinOp",
@@ -2140,8 +2339,10 @@ const MIR_AST_TYPE_NAMES: [&str; 33] = [
     "ConstOperand",
     "ConstScalar",
     "ConstValue",
+    "ContractRole",
     "List",
     "LocalDecl",
+    "MirPhaseTag",
     "Mutability",
     "Nat",
     "NonDivergingIntrinsic",
@@ -2380,6 +2581,7 @@ impl<'a> TokenCursor<'a> {
                                 | LeanToken::LBracket
                                 | LeanToken::NatLit(_)
                                 | LeanToken::StrLit(_)
+                                | LeanToken::CharLit(_)
                                 | LeanToken::Dot
                         )
                     ) {
@@ -2400,6 +2602,7 @@ impl<'a> TokenCursor<'a> {
                             | LeanToken::LBracket
                             | LeanToken::NatLit(_)
                             | LeanToken::StrLit(_)
+                            | LeanToken::CharLit(_)
                             | LeanToken::Dot
                     )
                 ) {
@@ -2407,7 +2610,7 @@ impl<'a> TokenCursor<'a> {
                 }
                 Ok(())
             }
-            Some(LeanToken::NatLit(_) | LeanToken::StrLit(_)) => Ok(()),
+            Some(LeanToken::NatLit(_) | LeanToken::StrLit(_) | LeanToken::CharLit(_)) => Ok(()),
             other => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
                 "unexpected token while skipping expression: {other:?}"
             ))),
@@ -2590,18 +2793,52 @@ impl<'a> TokenCursor<'a> {
 
     fn parse_captured_mir(&mut self) -> Result<ProtoMirBody, CensusScanError> {
         let mut def_path: Option<String> = None;
+        let mut has_phase = false;
+        let mut has_role = false;
+        let mut has_arg_count = false;
+        let mut has_local_decls = false;
         let mut basic_blocks: Option<Vec<ProtoBasicBlock>> = None;
+        let mut has_fn_abi = false;
+        let mut has_layouts = false;
+        let mut has_allocations = false;
 
         self.parse_record(|field, cur| {
             match field {
                 "defPath" => {
                     def_path = Some(cur.parse_string()?);
                 }
+                "phase" => {
+                    cur.parse_mir_phase_tag()?;
+                    has_phase = true;
+                }
+                "role" => {
+                    cur.parse_contract_role()?;
+                    has_role = true;
+                }
+                "argCount" => {
+                    let _ = cur.parse_usize()?;
+                    has_arg_count = true;
+                }
+                "localDecls" => {
+                    cur.skip_balanced_expr()?;
+                    has_local_decls = true;
+                }
                 "basicBlocks" => {
                     basic_blocks = Some(cur.parse_list(|c| c.parse_basic_block())?);
                 }
-                "phase" | "role" | "argCount" | "localDecls" | "fnAbi" | "layouts"
-                | "allocations" | "typeParamCount" | "genericParams" | "traitImpls" => {
+                "fnAbi" => {
+                    cur.skip_balanced_expr()?;
+                    has_fn_abi = true;
+                }
+                "layouts" => {
+                    cur.skip_balanced_expr()?;
+                    has_layouts = true;
+                }
+                "allocations" => {
+                    cur.skip_balanced_expr()?;
+                    has_allocations = true;
+                }
+                "typeParamCount" | "genericParams" | "traitImpls" => {
                     cur.skip_balanced_expr()?;
                 }
                 other => {
@@ -2613,6 +2850,26 @@ impl<'a> TokenCursor<'a> {
             Ok(())
         })?;
 
+        let def_path = def_path.ok_or_else(|| {
+            CensusScanError::MalformedCapturedMirSyntax(
+                "CapturedMir record is missing required `defPath` field".to_string(),
+            )
+        })?;
+        for (present, name) in [
+            (has_phase, "phase"),
+            (has_role, "role"),
+            (has_arg_count, "argCount"),
+            (has_local_decls, "localDecls"),
+            (has_fn_abi, "fnAbi"),
+            (has_layouts, "layouts"),
+            (has_allocations, "allocations"),
+        ] {
+            if !present {
+                return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                    "CapturedMir record is missing required `{name}` field"
+                )));
+            }
+        }
         let basic_blocks = basic_blocks.ok_or_else(|| {
             CensusScanError::MalformedCapturedMirSyntax(
                 "CapturedMir record is missing required `basicBlocks` field".to_string(),
@@ -2620,8 +2877,38 @@ impl<'a> TokenCursor<'a> {
         })?;
 
         Ok(ProtoMirBody {
-            def_path: def_path.unwrap_or_default(),
+            def_path,
             basic_blocks,
+        })
+    }
+
+    fn parse_mir_phase_tag(&mut self) -> Result<(), CensusScanError> {
+        self.with_optional_parens(|cur| {
+            let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "MirPhaseTag")?;
+            match short.as_str() {
+                "runtimePostCleanup" | "runtimeOptimized" => Ok(()),
+                "other" => {
+                    let _ = cur.parse_string()?;
+                    Ok(())
+                }
+                _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                    "unknown MirPhaseTag constructor `{full}`"
+                ))),
+            }
+        })
+    }
+
+    fn parse_contract_role(&mut self) -> Result<(), CensusScanError> {
+        self.with_optional_parens(|cur| {
+            let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "ContractRole")?;
+            match short.as_str() {
+                "subject" | "ensures" | "precondition" | "requires" => Ok(()),
+                _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                    "unknown ContractRole constructor `{full}`"
+                ))),
+            }
         })
     }
 
@@ -2661,7 +2948,11 @@ impl<'a> TokenCursor<'a> {
                     "BasicBlockData missing `terminator`".to_string(),
                 )
             })?,
-            is_cleanup: is_cleanup.unwrap_or(false),
+            is_cleanup: is_cleanup.ok_or_else(|| {
+                CensusScanError::MalformedCapturedMirSyntax(
+                    "BasicBlockData missing `isCleanup`".to_string(),
+                )
+            })?,
         })
     }
 
@@ -2690,7 +2981,9 @@ impl<'a> TokenCursor<'a> {
             kind: kind.ok_or_else(|| {
                 CensusScanError::MalformedCapturedMirSyntax("Statement missing `kind`".to_string())
             })?,
-            span: span.unwrap_or_default(),
+            span: span.ok_or_else(|| {
+                CensusScanError::MalformedCapturedMirSyntax("Statement missing `span`".to_string())
+            })?,
         })
     }
 
@@ -3000,8 +3293,16 @@ impl<'a> TokenCursor<'a> {
                         Ok(())
                     })?;
                     Ok(ProtoConstValue::ScalarInt {
-                        bits: bits.unwrap_or(0),
-                        size_bytes: size_bytes.unwrap_or(0),
+                        bits: bits.ok_or_else(|| {
+                            CensusScanError::MalformedCapturedMirSyntax(
+                                "ScalarInt missing `bits`".to_string(),
+                            )
+                        })?,
+                        size_bytes: size_bytes.ok_or_else(|| {
+                            CensusScanError::MalformedCapturedMirSyntax(
+                                "ScalarInt missing `sizeBytes`".to_string(),
+                            )
+                        })?,
                     })
                 }
                 "ptr" => {
@@ -3024,13 +3325,51 @@ impl<'a> TokenCursor<'a> {
                     })?;
                     let size = cur.parse_u64()?;
                     Ok(ProtoConstValue::ScalarPtr {
-                        alloc_id: alloc_id.unwrap_or(0),
-                        offset_bytes: offset_bytes.unwrap_or(0),
+                        alloc_id: alloc_id.ok_or_else(|| {
+                            CensusScanError::MalformedCapturedMirSyntax(
+                                "ProvenancePtr missing `allocId`".to_string(),
+                            )
+                        })?,
+                        offset_bytes: offset_bytes.ok_or_else(|| {
+                            CensusScanError::MalformedCapturedMirSyntax(
+                                "ProvenancePtr missing `offsetBytes`".to_string(),
+                            )
+                        })?,
                         size,
                     })
                 }
                 _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
                     "unknown ConstScalar constructor `{full}`"
+                ))),
+            }
+        })
+    }
+
+    fn parse_aggregate_kind(&mut self) -> Result<ProtoAggregateKind, CensusScanError> {
+        self.with_optional_parens(|cur| {
+            let (full, short) = cur.parse_ctor_head()?;
+            check_ctor_qualifier(&full, &short, "AggregateKind")?;
+            match short.as_str() {
+                "array" => {
+                    cur.skip_balanced_expr()?; // elemTy
+                    Ok(ProtoAggregateKind::Array)
+                }
+                "tuple" => Ok(ProtoAggregateKind::Tuple),
+                "adt" => {
+                    let def_id = cur.parse_string()?;
+                    let variant_idx = cur.parse_usize()?;
+                    let active_field = cur.parse_option(|c| c.parse_usize())?;
+                    Ok(ProtoAggregateKind::Adt(def_id, variant_idx, active_field))
+                }
+                "closure" => Ok(ProtoAggregateKind::Closure(cur.parse_string()?)),
+                "coroutine" => Ok(ProtoAggregateKind::Coroutine(cur.parse_string()?)),
+                "rawPtr" => {
+                    cur.skip_balanced_expr()?; // pointeeTy
+                    let mutable = cur.parse_mutability()?;
+                    Ok(ProtoAggregateKind::RawPtr(mutable))
+                }
+                _ => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                    "unknown AggregateKind constructor `{full}`"
                 ))),
             }
         })
@@ -3083,9 +3422,9 @@ impl<'a> TokenCursor<'a> {
                 }
                 "discriminant" => Ok(ProtoRvalue::Discriminant(cur.parse_place()?)),
                 "aggregate" => {
-                    cur.skip_balanced_expr()?; // AggregateKind
+                    let kind = cur.parse_aggregate_kind()?;
                     let ops = cur.parse_list(|c| c.parse_operand())?;
-                    Ok(ProtoRvalue::Aggregate(ops))
+                    Ok(ProtoRvalue::Aggregate(kind, ops))
                 }
                 "shallowInitBox" => {
                     let op = cur.parse_operand()?;
@@ -3264,7 +3603,9 @@ impl<'a> TokenCursor<'a> {
             kind: kind.ok_or_else(|| {
                 CensusScanError::MalformedCapturedMirSyntax("Terminator missing `kind`".to_string())
             })?,
-            span: span.unwrap_or_default(),
+            span: span.ok_or_else(|| {
+                CensusScanError::MalformedCapturedMirSyntax("Terminator missing `span`".to_string())
+            })?,
         })
     }
 
@@ -3470,13 +3811,12 @@ fn shadows_mir_ast_name(name: &str) -> bool {
     name.split('.').any(|seg| MIR_AST_TYPE_NAMES.contains(&seg))
 }
 
-/// Strict `[adv B1]` grammar check for an `anneal-rustc-capture` `Mir/<Item>.lean`
-/// module: only `import`, `namespace`/`section`/`end`, plain `open` lists,
-/// `set_option`, and `def <name> : <type> := <single balanced term>` commands are
-/// accepted, no declaration or namespace may reuse a MIR AST type name (constructor
-/// shadowing), and exactly one `def body : CapturedMir := { ... }` must exist.
-/// Syntax extensions (`macro`, `notation`, `syntax`, `elab`, ...), attributes,
-/// `#eval`, theorems, instances, or any other command fail closed.
+/// Strict `[adv B1]` / `[adv A1]` grammar check for an `anneal-rustc-capture`
+/// `Mir/<Item>.lean` module: only `import Trusted*`, `namespace`/`section`/`end`,
+/// `open Trusted*` lists, `set_option`, and `def <name> : <type> := <single balanced term>`
+/// commands are accepted, no declaration or namespace may reuse a MIR AST type name
+/// (constructor shadowing), and exactly one bare `def body : CapturedMir := { ... }`
+/// must exist (rejecting qualified sub-namespace `def Sub.body`).
 fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusScanError> {
     let malformed = |msg: String| CensusScanError::MalformedCapturedMirSyntax(msg);
     let ident_at = |i: usize| match tokens.get(i) {
@@ -3494,7 +3834,12 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
         };
         match kw {
             "import" => {
-                ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
+                let imp = ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
+                if imp != "Trusted" && !imp.starts_with("Trusted.") {
+                    return Err(malformed(format!(
+                        "unsupported `import {imp}` in strict Mir module (only `Trusted` allowed)"
+                    )));
+                }
                 i += 2;
             }
             "namespace" | "section" | "end" => {
@@ -3520,6 +3865,11 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                     if matches!(name, "renaming" | "hiding" | "in" | "scoped") {
                         return Err(malformed(format!("`open ... {name}` is not supported")));
                     }
+                    if name != "Trusted" && !name.starts_with("Trusted.") && name != "MirAst" {
+                        return Err(malformed(format!(
+                            "unsupported `open {name}` in strict Mir module (only `Trusted` namespaces allowed)"
+                        )));
+                    }
                     count += 1;
                     i += 1;
                 }
@@ -3530,7 +3880,12 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
             "set_option" => {
                 ident_at(i + 1).ok_or_else(|| malformed("`set_option` without name".into()))?;
                 match tokens.get(i + 2) {
-                    Some(LeanToken::Ident(_) | LeanToken::NatLit(_) | LeanToken::StrLit(_)) => {}
+                    Some(
+                        LeanToken::Ident(_)
+                        | LeanToken::NatLit(_)
+                        | LeanToken::StrLit(_)
+                        | LeanToken::CharLit(_),
+                    ) => {}
                     other => {
                         return Err(malformed(format!("`set_option` with value {other:?}")));
                     }
@@ -3545,12 +3900,17 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                         "declaration `{name}` shadows a MIR AST name or keyword"
                     )));
                 }
+                if name.ends_with(".body") {
+                    return Err(malformed(format!(
+                        "qualified `def {name}` is not allowed in strict Mir module (expected bare `def body`)"
+                    )));
+                }
                 if tokens.get(i + 2) != Some(&LeanToken::Colon) {
                     return Err(malformed(format!(
                         "`def {name}` must carry an explicit `: <type>` ascription"
                     )));
                 }
-                let is_body = name == "body" || name.ends_with(".body");
+                let is_body = name == "body";
                 let mut j = i + 3;
                 let ty_start = j;
                 let mut depth = 0isize;
@@ -3832,7 +4192,7 @@ fn rvalue_has_deref(rv: &ProtoRvalue) -> bool {
         | ProtoRvalue::ShallowInitBox(op)
         | ProtoRvalue::WrapUnsafeBinder(op) => operand_has_deref(op),
         ProtoRvalue::BinaryOp(_, lhs, rhs) => operand_has_deref(lhs) || operand_has_deref(rhs),
-        ProtoRvalue::Aggregate(ops) => ops.iter().any(operand_has_deref),
+        ProtoRvalue::Aggregate(_, ops) => ops.iter().any(operand_has_deref),
         ProtoRvalue::Ref { place, .. }
         | ProtoRvalue::RawPtr { place, .. }
         | ProtoRvalue::Len(place)
@@ -5104,5 +5464,214 @@ end Mir.Probe.item",
             ),
         );
         assert!(census_lean_mir_module(&non_zst_fn).is_err());
+    }
+
+    #[test]
+    fn test_a1_semantic_precision_and_scanner_regressions() {
+        // 1. Unevaluated Rvalues (`NullaryOp`, `ThreadLocalRef`, `ShallowInitBox`, float casts,
+        //    and `AggregateKind.coroutine`) make `evalStmt (.assign dst rv)` step directly to
+        //    `MirStepNode.unsupported` before inspecting `dst`, so `census_stmt_fault_classes`
+        //    must emit `[]` even when `dst` is a dereferenced place `*_1`.
+        for uneval_rv in [
+            ProtoRvalue::NullaryOp(ProtoNullOp::SizeOf),
+            ProtoRvalue::ThreadLocalRef(String::from("tls::KEY")),
+            ProtoRvalue::ShallowInitBox(ProtoOperand::Copy(ProtoPlace::deref_local(2))),
+            ProtoRvalue::Cast(
+                ProtoCastKind::FloatToInt,
+                ProtoOperand::Copy(ProtoPlace::deref_local(2)),
+            ),
+            ProtoRvalue::Aggregate(
+                ProtoAggregateKind::Coroutine(String::from("coro::gen")),
+                vec![ProtoOperand::Copy(ProtoPlace::deref_local(2))],
+            ),
+        ] {
+            assert!(rvalue_unevaluated(&uneval_rv), "{uneval_rv:?}");
+            assert_eq!(
+                census_stmt_fault_classes(&ProtoStatementKind::Assign(
+                    ProtoPlace::deref_local(1),
+                    uneval_rv
+                )),
+                Vec::<MirFaultClass>::new()
+            );
+        }
+
+        // 2. `PlaceMention` only checks root/index initialization (`[UninitRead]`), never
+        //    dereferencing pointers or checking bounds/alignment/Tree Borrows.
+        assert_eq!(
+            census_stmt_fault_classes(&ProtoStatementKind::PlaceMention(
+                ProtoPlace::deref_local(1)
+            )),
+            vec![MirFaultClass::UninitRead]
+        );
+
+        // 3. Unprojected `Deinit` and `Drop` only check `[StorageLiveProtected]` (succeeding on
+        //    `.uninit` slots); projected `Deinit`/`Drop` use `readProjectedValue`, which has no
+        //    `.deref` arm (`Deref` contributes `[]`).
+        assert_eq!(
+            census_stmt_fault_classes(&ProtoStatementKind::Deinit(ProtoPlace::local(1))),
+            vec![MirFaultClass::StorageLiveProtected]
+        );
+        assert_eq!(
+            census_stmt_fault_classes(&ProtoStatementKind::Deinit(ProtoPlace::deref_local(1))),
+            vec![MirFaultClass::UninitRead]
+        );
+        assert_eq!(
+            census_terminator_fault_classes(
+                2,
+                &ProtoTerminatorKind::Drop {
+                    place: ProtoPlace::local(1),
+                    target: 1,
+                    unwind: ProtoUnwindAction::Continue,
+                }
+            ),
+            vec![MirFaultClass::StorageLiveProtected]
+        );
+        assert_eq!(
+            census_terminator_fault_classes(
+                2,
+                &ProtoTerminatorKind::Drop {
+                    place: ProtoPlace::deref_local(1),
+                    target: 1,
+                    unwind: ProtoUnwindAction::Continue,
+                }
+            ),
+            vec![MirFaultClass::UninitRead]
+        );
+
+        // 4. `CastKind` precision & soundness:
+        //    - `PointerCoercion("MutToConstPointer")` emits `[]`.
+        //    - `PointerCoercion("Unsize" | "ArrayToPointer")` and `PtrToPtr` include `TreeBorrowsViolation`.
+        //    - `PointerCoercion("ReifyFnPointer")` and `FnPtrToPtr` include `CallAbiMismatch` and
+        //      do not emit `BoundsCheck` or `PtrAlignMismatch`.
+        assert_eq!(
+            census_cast_kind_fault_classes(&ProtoCastKind::PointerCoercion(String::from(
+                "MutToConstPointer"
+            ))),
+            Vec::<MirFaultClass>::new()
+        );
+        for ck in [
+            ProtoCastKind::PtrToPtr,
+            ProtoCastKind::PointerCoercion(String::from("Unsize")),
+            ProtoCastKind::PointerCoercion(String::from("ArrayToPointer")),
+        ] {
+            let classes = census_cast_kind_fault_classes(&ck);
+            assert!(classes.contains(&MirFaultClass::TreeBorrowsViolation), "{ck:?}");
+        }
+        for ck in [
+            ProtoCastKind::FnPtrToPtr,
+            ProtoCastKind::PointerCoercion(String::from("ReifyFnPointer")),
+            ProtoCastKind::PointerCoercion(String::from("UnsafeFnPointer")),
+        ] {
+            let classes = census_cast_kind_fault_classes(&ck);
+            assert_eq!(
+                classes,
+                vec![
+                    MirFaultClass::PtrDerefInvalid,
+                    MirFaultClass::ScalarNicheInvalid,
+                    MirFaultClass::CallAbiMismatch,
+                ],
+                "{ck:?}"
+            );
+        }
+
+        // 5. Diverging `Call` (`target = None`) never writes to `destination` and only dispatches
+        //    `isUnreachableCallTarget` (not `evalDirectRustIntrinsic?`), while `TailCall`
+        //    includes destination-write classes from `resumeExternalTailCall`.
+        let div_call_classes = census_terminator_fault_classes(
+            1,
+            &ProtoTerminatorKind::Call {
+                func: ProtoOperand::const_fn("core::intrinsics::unchecked_add"),
+                args: Vec::new(),
+                destination: ProtoPlace::deref_local(0),
+                target: None,
+                unwind: ProtoUnwindAction::Continue,
+            },
+        );
+        assert_eq!(div_call_classes, vec![MirFaultClass::CallAbiMismatch]);
+
+        let tail_call_classes = census_terminator_fault_classes(
+            1,
+            &ProtoTerminatorKind::TailCall {
+                func: ProtoOperand::const_fn("proto::callee"),
+                args: Vec::new(),
+            },
+        );
+        assert_eq!(
+            tail_call_classes,
+            vec![
+                MirFaultClass::TreeBorrowsViolation,
+                MirFaultClass::UninitRead,
+                MirFaultClass::StorageLiveProtected,
+                MirFaultClass::CallAbiMismatch,
+            ]
+        );
+
+        // 6. `census_callee_def_path_fault_classes`: `std::intrinsics::exact_div` is not
+        //    matched by `isDirectExactDivTarget`, `arith_offset` wraps modularly, and
+        //    `const_eval_select` covers all inline intrinsic fault classes.
+        assert_eq!(
+            census_callee_def_path_fault_classes("std::intrinsics::exact_div"),
+            Vec::<MirFaultClass>::new()
+        );
+        assert_eq!(
+            census_callee_def_path_fault_classes("core::intrinsics::arith_offset"),
+            vec![
+                MirFaultClass::PtrDerefInvalid,
+                MirFaultClass::ScalarNicheInvalid,
+            ]
+        );
+        let ces = census_callee_def_path_fault_classes("core::intrinsics::const_eval_select");
+        assert!(ces.contains(&MirFaultClass::ArithOverflow));
+        assert!(ces.contains(&MirFaultClass::DivRemByZero));
+        assert!(ces.contains(&MirFaultClass::ShiftOverflow));
+        assert!(ces.contains(&MirFaultClass::UnreachableTerminator));
+
+        // 7. Lexer & scanner fail-open regressions:
+        //    (a) Character literal `'a'` must not be accepted as `String` in `defPath := 'a'`,
+        //        and `'\''` must not leave a trailing `'` token.
+        let unreachable_block = single_terminator_block("TerminatorKind.unreachable");
+        let baseline = strict_module_with_blocks("", &unreachable_block);
+        let char_as_str = baseline.replace("defPath := \"probe::item\"", "defPath := 'a'");
+        assert!(census_lean_mir_module(&char_as_str).is_err());
+
+        let escaped_single_quote_helper =
+            strict_module_with_blocks("def helperSq : Char := '\\''", &unreachable_block);
+        assert_eq!(
+            census_lean_mir_module(&escaped_single_quote_helper).expect("escaped single quote"),
+            vec![FaultSite::new(0, 0, MirFaultClass::UnreachableTerminator)]
+        );
+
+        //    (b) `s!"..."` with `'\"'`, `'}'`, `r#"}"#`, nested `s!"..."`, or `«}»` inside `{...}`
+        //        must not desynchronize `census_lean_mir_def` into scanning a decoy `def body`.
+        let interp_traps = strict_module_with_blocks(
+            r##"def helperTrap : String := s!"{if c == '"' || c == '}' then r#"}"# else s!"{"def body : CapturedMir := { basicBlocks := List.nil }"}"}""##,
+            &unreachable_block,
+        );
+        assert_eq!(
+            census_lean_mir_def(&interp_traps, "body").expect("interp traps stay inside string"),
+            vec![FaultSite::new(0, 0, MirFaultClass::UnreachableTerminator)]
+        );
+
+        //    (c) `AggregateKind` constructor head is validated (`Evil.tuple` rejected).
+        let evil_agg = strict_module_with_blocks(
+            "",
+            "[{ statements := [{ kind := StatementKind.assign { local_ := 0, projection := [] } (Rvalue.aggregate Evil.tuple []), span := \"s\" }], terminator := { kind := TerminatorKind.return_, span := \"s\" }, isCleanup := false }]",
+        );
+        assert!(census_lean_mir_module(&evil_agg).is_err());
+
+        //    (d) `import EvilMod`, `open EvilNs`, and `def Sub.body : CapturedMir` are rejected.
+        let evil_import = baseline.replace("import Trusted", "import EvilMod");
+        assert!(census_lean_mir_module(&evil_import).is_err());
+        let evil_open = strict_module_with_blocks("open EvilNs", &unreachable_block);
+        assert!(census_lean_mir_module(&evil_open).is_err());
+        let sub_body = baseline.replace("def body : CapturedMir", "def Sub.body : CapturedMir");
+        assert!(census_lean_mir_module(&sub_body).is_err());
+
+        //    (e) Missing required `CapturedMir` fields (`defPath`, `phase`, `allocations`) or
+        //        missing `ScalarInt.bits` / `BasicBlockData.isCleanup` fail closed.
+        let missing_def_path = baseline.replace("  { defPath := \"probe::item\"\n  , ", "  { ");
+        assert!(census_lean_mir_module(&missing_def_path).is_err());
+        let missing_is_cleanup = baseline.replace(", isCleanup := false", "");
+        assert!(census_lean_mir_module(&missing_is_cleanup).is_err());
     }
 }

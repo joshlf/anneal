@@ -478,20 +478,59 @@ def censusNullOpFaultClasses : NullOp → List MirFaultClass
   | _ => []
 
 /--
+`[adv A1]` Fault classes that can be triggered by a `ProjectionElem` inside
+`readProjectedValue` (used by projected `StatementKind.deinit` and
+`TerminatorKind.drop`).
+
+Unlike `readPlaceValue` / `writePlaceValue`, `readProjectedValue` has no `.deref`
+arm (`Places.lean:1666`: `.deref` returns `.unsupported` immediately without
+dereferencing a pointer, checking alignment, or checking Tree Borrows).
+-/
+def censusReadProjectedFaultClasses : ProjectionElem → List MirFaultClass
+  | .deref => []
+  | .field _ _ => []
+  | .downcast _ _ => [.scalarNicheInvalid]
+  | .opaqueCast _ => []
+  | .unwrapUnsafeBinder _ => []
+  | .subslice _ _ _ => [.boundsCheck]
+  | .index _ | .constantIndex _ _ _ =>
+    [.boundsCheck, .scalarNicheInvalid, .uninitRead]
+
+/--
 Fault classes that can be triggered by a `CastKind` in `evalRvalue (.cast kind op ty)`
 (excluding the operand evaluation itself).
 
-`[adv B1]` precision fix: `.intToInt` truncates/sign-extends and
-`.pointerExposeProvenance` / `.pointerWithExposedProvenance` re-encode the address
-without any `.ub` edge; float casts have no `evalRvalue` arm (`.unsupported`).
+`[adv B1]` / `[adv A1]` precision & soundness fixes:
+- `.intToInt` truncates/sign-extends and `.pointerExposeProvenance` /
+  `.pointerWithExposedProvenance` re-encode the address without any `.ub` edge (`[]`).
+- Float casts (`.floatToInt`, `.floatToFloat`, `.intToFloat`) have no `evalRvalue`
+  arm (`.unsupported`, `[]`).
+- `.pointerCoercion "MutToConstPointer"` (`evalReifyFnPointer`) never faults beyond
+  evaluating its operand (`[]`).
+- `.pointerCoercion ("Unsize" | "ArrayToPointer")` and `.ptrToPtr` call
+  `evalUnsizeCoercion` / `deriveStackElemThinPtr`, which check Tree Borrows tags
+  (`.disabled` / `.frozen` -> `.ub`), allocation bounds, pointer validity, and
+  scalar layout niche.
+- `.pointerCoercion` function-pointer coercions (`"ReifyFnPointer"`,
+  `"ClosureFnPointer*"`, `"UnsafeFnPointer"`) and `.fnPtrToPtr` validate callee ABI
+  and signature compatibility (`checkCalleeSig`, `CallConv.rustIntrinsic`, `Safety`)
+  and never dereference memory or check alignment.
 -/
 def censusCastKindFaultClasses : CastKind → List MirFaultClass
   | .intToInt | .floatToInt | .floatToFloat | .intToFloat => []
   | .pointerExposeProvenance | .pointerWithExposedProvenance => []
   | .transmute | .subtype =>
     [.scalarNicheInvalid, .uninitRead]
-  | .pointerCoercion _ | .ptrToPtr | .fnPtrToPtr =>
-    [.boundsCheck, .ptrDerefInvalid, .ptrAlignMismatch, .scalarNicheInvalid]
+  | .pointerCoercion "MutToConstPointer" => []
+  | .pointerCoercion "Unsize" | .pointerCoercion "ArrayToPointer" | .ptrToPtr =>
+    [ .boundsCheck
+    , .ptrDerefInvalid
+    , .ptrAlignMismatch
+    , .treeBorrowsViolation
+    , .scalarNicheInvalid
+    ]
+  | .pointerCoercion _ | .fnPtrToPtr =>
+    [.ptrDerefInvalid, .scalarNicheInvalid, .callAbiMismatch]
 
 /--
 True for the `CastKind`s that `evalRvalue` never evaluates (no matching arm, so the
@@ -502,12 +541,34 @@ def castKindUnevaluated : CastKind → Bool
   | _ => false
 
 /--
+`[adv A1]` True for `AggregateKind`s that `evalRvalue` never evaluates
+(`.aggregate (.coroutine _) _` has no matching arm in `evalRvalue` and returns
+`.unsupported` before inspecting any operand).
+-/
+def aggregateKindUnevaluated : AggregateKind → Bool
+  | .coroutine _ => true
+  | _ => false
+
+/--
+`[adv A1]` True for `Rvalue` forms that `evalRvalue` never evaluates (immediately
+returning `.unsupported` without inspecting any operand or destination place).
+-/
+def rvalueUnevaluated : Rvalue → Bool
+  | .threadLocalRef _ => true
+  | .nullaryOp _ _ => true
+  | .shallowInitBox _ _ => true
+  | .cast kind _ _ => castKindUnevaluated kind
+  | .aggregate kind _ => aggregateKindUnevaluated kind
+  | _ => false
+
+/--
 Fault classes that can be triggered by evaluating an `Rvalue`.
 
-`[adv B1]` precision fixes: `.threadLocalRef`, `.nullaryOp`, `.shallowInitBox`, and
-float casts have no `evalRvalue` arm (`.unsupported`, operand never evaluated) and
-emit `[]`; `.repeat` and every evaluated `.aggregate` only fault while evaluating
-their operands; `.copyForDeref` only faults while reading its place.
+`[adv B1]` / `[adv A1]` precision fixes: `.threadLocalRef`, `.nullaryOp`,
+`.shallowInitBox`, float casts, and `.aggregate (.coroutine _) _` have no
+`evalRvalue` arm (`.unsupported`, operand never evaluated) and emit `[]`; `.repeat`
+and every evaluated `.aggregate` only fault while evaluating their operands;
+`.copyForDeref` only faults while reading its place.
 -/
 def censusRvalueFaultClasses : Rvalue → List MirFaultClass
   | .use op => censusLoadedOperandFaultClasses op
@@ -526,7 +587,9 @@ def censusRvalueFaultClasses : Rvalue → List MirFaultClass
   | .nullaryOp op _ => censusNullOpFaultClasses op
   | .unaryOp op val => censusOperandFaultClasses val ++ censusUnOpFaultClasses op
   | .discriminant place => censusPlaceReadFaultClasses place ++ [.scalarNicheInvalid]
-  | .aggregate _ ops => ops.flatMap censusOperandFaultClasses
+  | .aggregate kind ops =>
+    if aggregateKindUnevaluated kind then []
+    else ops.flatMap censusOperandFaultClasses
   | .shallowInitBox _ _ => []
   | .copyForDeref place => censusPlaceReadFaultClasses place
   | .wrapUnsafeBinder op _ => censusLoadedOperandFaultClasses op
@@ -563,10 +626,20 @@ def censusStmtFaultClasses (kind : StatementKind) : List MirFaultClass :=
     | .backwardIncompatibleDropHint _ => []
     | .storageLive _ => [.storageLiveProtected]
     | .storageDead _ => [.storageLiveProtected]
-    | .placeMention place =>
-      .uninitRead :: (place.projection.flatMap censusProjectionElemFaultClasses)
+    | .placeMention _ =>
+      -- `[adv A1]`: `evalStmt (.placeMention place)` only checks that `place.local_`
+      -- is in bounds and not `.dead` and `placeMentionOperandsInit` holds (root local
+      -- initialized when `projectionHasDeref`, and every `.index idxLocal` is an
+      -- initialized scalar). It never dereferences pointers or checks bounds/downcasts.
+      [.uninitRead]
     | .deinit place =>
-      .uninitRead :: (place.projection.flatMap censusProjectionElemFaultClasses)
+      -- `[adv A1]`: when `place.projection = []`, `evalStmt (.deinit place)` only
+      -- faults if `place.local_` is out of bounds or `.dead` (`[.storageLiveProtected]`);
+      -- when projected, it reads the root local and runs `readProjectedValue` (which
+      -- has no `.deref` arm).
+      match place.projection with
+      | [] => [.storageLiveProtected]
+      | proj => .uninitRead :: (proj.flatMap censusReadProjectedFaultClasses)
     | .retag _ place =>
       -- `[adv B1]`: `evalStmt (.retag ..)` reads `place` (`evalOperand (.copy place)`),
       -- then faults on a non-pointer value, a disabled/frozen Tree Borrows tag, a
@@ -584,7 +657,12 @@ def censusStmtFaultClasses (kind : StatementKind) : List MirFaultClass :=
           [.scalarNicheInvalid]
     | .intrinsic intr => censusIntrinsicFaultClasses intr
     | .assign dst rv =>
-      censusPlaceWriteFaultClasses dst ++ censusRvalueFaultClasses rv
+      -- `[adv A1]`: `evalStmt (.assign dst rv)` evaluates `evalRvalue` before
+      -- inspecting `dst`. When `rvalueUnevaluated rv = true`, `evalRvalue` returns
+      -- `.unsupported` immediately, so `evalStmt` steps to `MirStepNode.unsupported`
+      -- and can never fault with `.ub` even if `dst` is a dereferenced or dead place.
+      if rvalueUnevaluated rv then []
+      else censusPlaceWriteFaultClasses dst ++ censusRvalueFaultClasses rv
   dedupFaultClasses raw
 
 /--
@@ -620,18 +698,25 @@ Additional fault classes contributed by a direct call target `defPath` in
 def censusCalleeDefPathFaultClasses (defPath : DefPath) : List MirFaultClass :=
   if isUnreachableCallTarget defPath then
     [.unreachableTerminator]
-  else if defPath == "core::intrinsics::exact_div" ||
-          defPath == "std::intrinsics::exact_div" then
+  else if defPath == "core::intrinsics::exact_div" then
     [.arithOverflow, .divRemByZero]
   else
     match classifyRustIntrinsic? defPath with
-    | some .arithOffset => [.arithOverflow, .boundsCheck, .ptrDerefInvalid]
+    | some .arithOffset => [.ptrDerefInvalid, .scalarNicheInvalid]
     | some .uncheckedAdd | some .uncheckedSub | some .uncheckedMul => [.arithOverflow]
     | some .uncheckedDiv | some .uncheckedRem => [.arithOverflow, .divRemByZero]
     | some .uncheckedShl | some .uncheckedShr => [.shiftOverflow]
     | some .ctlzNonzero | some .cttzNonzero => [.scalarNicheInvalid]
     | some .sizeOfVal | some .alignOfVal => [.arithOverflow, .ptrDerefInvalid, .scalarNicheInvalid]
-    | some .constEvalSelect => [.callAbiMismatch, .scalarNicheInvalid]
+    | some .constEvalSelect =>
+      [ .arithOverflow
+      , .divRemByZero
+      , .shiftOverflow
+      , .ptrDerefInvalid
+      , .scalarNicheInvalid
+      , .callAbiMismatch
+      , .unreachableTerminator
+      ]
     | _ => []
 
 /--
@@ -657,7 +742,14 @@ def censusTerminatorFaultClasses
     | .switchInt discr _ =>
       censusOperandFaultClasses discr ++ [.scalarNicheInvalid] ++ targetOob
     | .drop place _ _ =>
-      censusPlaceReadFaultClasses place ++ targetOob
+      -- `[adv A1]`: like `StatementKind.deinit`, unprojected `drop` only checks that
+      -- `place.local_` is in bounds and not `.dead` (`[.storageLiveProtected]`), while
+      -- projected `drop` reads the root local and evaluates `readProjectedValue`.
+      let dropPlaceClasses :=
+        match place.projection with
+        | [] => [.storageLiveProtected]
+        | proj => .uninitRead :: (proj.flatMap censusReadProjectedFaultClasses)
+      dropPlaceClasses ++ targetOob
     | .assert cond _ _ unwind =>
       -- `[adv B1]`: a failed assertion dispatches `applyUnwindAction`, which faults
       -- only for `.unreachable` (immediate `.ub`) or `.continue_` (propagating through
@@ -671,30 +763,44 @@ def censusTerminatorFaultClasses
         | .cleanup _ => []
         | .terminate => []
       censusOperandFaultClasses cond ++ [.scalarNicheInvalid] ++ unwindClasses ++ targetOob
-    | .call func args destination _ unwind =>
+    | .call func args destination target unwind =>
+      -- `[adv A1]`: diverging calls (`target = none`) never write to `destination`
+      -- and only dispatch `isUnreachableCallTarget` (not `evalDirectRustIntrinsic?`
+      -- or `isDirectExactDivTarget`).
       let calleeClasses :=
         match extractCalleeDefPath? func with
-        | some defPath => censusCalleeDefPathFaultClasses defPath
+        | some defPath =>
+          match target with
+          | some _ => censusCalleeDefPathFaultClasses defPath
+          | none =>
+            if isUnreachableCallTarget defPath then [.unreachableTerminator] else []
         | none => [.ptrDerefInvalid]
+      let dstClasses :=
+        match target with
+        | some _ => censusPlaceWriteFaultClasses destination
+        | none => []
       let unwindClasses :=
         match unwind with
         | .unreachable => [.unreachableTerminator]
         | _ => []
       censusOperandFaultClasses func ++
         (args.flatMap censusOperandFaultClasses) ++
-        censusPlaceWriteFaultClasses destination ++
+        dstClasses ++
         [.callAbiMismatch] ++
         calleeClasses ++
         unwindClasses ++
         targetOob
     | .tailCall func args =>
+      -- `[adv A1]`: `resumeExternalTailCall` writes the returned value to
+      -- `caller.destination` when `callStack` is non-empty, which can fault with
+      -- `.treeBorrowsViolation`, `.uninitRead`, or `.storageLiveProtected`.
       let calleeClasses :=
         match extractCalleeDefPath? func with
         | some _ => []
         | none => [.ptrDerefInvalid]
       censusOperandFaultClasses func ++
         (args.flatMap censusOperandFaultClasses) ++
-        [.callAbiMismatch] ++
+        [.treeBorrowsViolation, .uninitRead, .storageLiveProtected, .callAbiMismatch] ++
         calleeClasses
   dedupFaultClasses raw
 
@@ -1396,6 +1502,166 @@ theorem stepMirFn_after_goto_oob_ub
   | runtimePostCleanup => simp [hNone]
   | runtimeOptimized => simp [hNone]
 
+/--
+`[adv A1]` Every `Rvalue` with `rvalueUnevaluated rv = true` evaluates immediately to
+`.unsupported` under `evalRvalue` without inspecting any operand or memory.
+-/
+theorem evalRvalue_eq_unsupported_of_rvalueUnevaluated
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUneval : rvalueUnevaluated rv = true) :
+    evalRvalue locals rv mem localDecls layouts = .unsupported := by
+  cases rv with
+  | threadLocalRef _ => rfl
+  | nullaryOp _ _ => rfl
+  | shallowInitBox _ _ => rfl
+  | cast kind op ty =>
+    cases kind <;> first | rfl | nomatch hUneval
+  | aggregate kind ops =>
+    cases kind <;> first | rfl | nomatch hUneval
+  | _ => nomatch hUneval
+
+/--
+`[adv A1]` Because `evalStmt` on `StatementKind.assign dst rv` evaluates `evalRvalue`
+before inspecting `dst`, any assignment whose RHS satisfies `rvalueUnevaluated rv = true`
+steps unconditionally to `MirStepNode.unsupported` (even if `dst` is `*_1` or dead)
+and has `censusStmtFaultClasses (.assign dst rv) = []`.
+-/
+theorem evalStmt_assign_unevaluated_eq_unsupported
+    (s : MachineState) (dst : Place) (rv : Rvalue) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hUneval : rvalueUnevaluated rv = true) :
+    evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts = MirStepNode.unsupported ∧
+    censusStmtFaultClasses (.assign dst rv) = [] := by
+  refine ⟨?_, ?_⟩
+  · dsimp only [evalStmt]
+    rw [evalRvalue_eq_unsupported_of_rvalueUnevaluated
+      s.frame.locals rv s.memory localDecls layouts hUneval]
+  · simp [censusStmtFaultClasses, hUneval]
+
+/--
+`[adv A1]` Exact `.ub` characterization of `StatementKind.placeMention`: `evalStmt`
+never dereferences pointers or checks alignment, bounds, or downcasts; it faults iff
+`place.local_` is out of bounds, `.dead`, or `placeMentionOperandsInit` is false,
+matching `censusStmtFaultClasses (.placeMention place) = [.uninitRead]`.
+-/
+theorem evalStmt_placeMention_ub_iff
+    (s : MachineState) (place : Place) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (evalStmt s ⟨.placeMention place, span⟩ localDecls layouts = MirStepNode.fail .ub ↔
+      match get? s.frame.locals place.local_ with
+      | none | some .dead => True
+      | some slot => placeMentionOperandsInit s.frame.locals slot place.projection = false) ∧
+    censusStmtFaultClasses (.placeMention place) = [.uninitRead] := by
+  refine ⟨?_, rfl⟩
+  dsimp only [evalStmt]
+  cases get? s.frame.locals place.local_ with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit =>
+      cases hInit : placeMentionOperandsInit s.frame.locals .uninit place.projection <;>
+        simp [hInit, MirStepNode.step, MirStepNode.fail]
+    | init v =>
+      cases hInit : placeMentionOperandsInit s.frame.locals (.init v) place.projection <;>
+        simp [hInit, MirStepNode.step, MirStepNode.fail]
+
+private theorem set?_eq_some_of_get?_eq_some {α : Type}
+    (xs : List α) (idx : Nat) (oldVal newVal : α)
+    (hGet : get? xs idx = some oldVal) :
+    ∃ xs', set? xs idx newVal = some xs' := by
+  have hLt : idx < xs.length := (List.getElem?_eq_some_iff.mp hGet).1
+  exact ⟨xs.set idx newVal, by simp [set?, hLt]⟩
+
+/--
+`[adv A1]` Unprojected `StatementKind.deinit` only faults when `loc` is out of bounds
+or `.dead` (succeeding even when `loc` is `.uninit`), matching
+`censusStmtFaultClasses (.deinit { local_ := loc, projection := [] }) = [.storageLiveProtected]`.
+-/
+theorem evalStmt_deinit_unprojected_ub_iff
+    (s : MachineState) (loc : LocalIdx) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (evalStmt s ⟨.deinit { local_ := loc, projection := [] }, span⟩ localDecls layouts =
+        MirStepNode.fail .ub ↔
+      (get? s.frame.locals loc = none ∨ get? s.frame.locals loc = some .dead)) ∧
+    censusStmtFaultClasses (.deinit { local_ := loc, projection := [] }) =
+      [.storageLiveProtected] := by
+  refine ⟨?_, rfl⟩
+  simp only [evalStmt]
+  cases hGet : get? s.frame.locals loc with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit =>
+      rcases set?_eq_some_of_get?_eq_some s.frame.locals loc .uninit .uninit hGet with
+        ⟨locals', hSet⟩
+      simp [hSet, MirStepNode.step, MirStepNode.fail]
+    | init v =>
+      rcases set?_eq_some_of_get?_eq_some s.frame.locals loc (.init v) .uninit hGet with
+        ⟨locals', hSet⟩
+      simp [hSet, MirStepNode.step, MirStepNode.fail]
+
+/--
+`[adv A1]` Because `readProjectedValue` has no `.deref` arm (`Places.lean:1666`),
+a `StatementKind.deinit` starting with `.deref` on an initialized local steps
+immediately to `MirStepNode.unsupported` without dereferencing memory.
+-/
+theorem evalStmt_deinit_deref_eq_unsupported
+    (s : MachineState) (loc : LocalIdx) (rest : List ProjectionElem) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (v : Value)
+    (hInit : get? s.frame.locals loc = some (.init v)) :
+    evalStmt s ⟨.deinit { local_ := loc, projection := .deref :: rest }, span⟩
+        localDecls layouts =
+      MirStepNode.unsupported := by
+  simp [evalStmt, hInit, readProjectedValue]
+
+/--
+`[adv A1]` Unprojected `TerminatorKind.drop` only faults when `loc` is out of bounds
+or `.dead` (succeeding even when `loc` is `.uninit`).
+-/
+theorem evalTerminator_drop_unprojected_ub_iff
+    (s : MachineState) (loc : LocalIdx) (target : BasicBlockIdx)
+    (unwind : UnwindAction) (span : String) (currentBody : Option CapturedMir) :
+    evalTerminator s ⟨.drop { local_ := loc, projection := [] } target unwind, span⟩
+        currentBody = MirStepNode.fail .ub ↔
+      (get? s.frame.locals loc = none ∨ get? s.frame.locals loc = some .dead) := by
+  simp only [evalTerminator]
+  cases hGet : get? s.frame.locals loc with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit =>
+      rcases set?_eq_some_of_get?_eq_some s.frame.locals loc .uninit .uninit hGet with
+        ⟨locals', hSet⟩
+      simp [hSet, MirStepNode.step, MirStepNode.fail]
+    | init v =>
+      rcases set?_eq_some_of_get?_eq_some s.frame.locals loc (.init v) .uninit hGet with
+        ⟨locals', hSet⟩
+      simp [hSet, MirStepNode.step, MirStepNode.fail]
+
+/--
+`[adv A1]` `CastKind.pointerCoercion "MutToConstPointer"` (`evalReifyFnPointer`) never
+faults beyond evaluating its operand (`censusCastKindFaultClasses (.pointerCoercion "MutToConstPointer") = []`).
+-/
+theorem evalRvalue_cast_mutToConstPointer_ub_iff
+    (locals : List LocalSlot) (op : Operand) (ty : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op ty)
+        mem localDecls layouts = .ub ↔
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ub := by
+  have h1 : isReifyFnPointerCoercion "MutToConstPointer" = false := by decide
+  have h2 : stringEq "MutToConstPointer" "Unsize" = false := by decide
+  have h3 : stringEq "MutToConstPointer" "ArrayToPointer" = false := by decide
+  simp only [evalRvalue, evalReifyFnPointer, h1, h2, h3]
+  cases hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | ub => simp
+  | unsupported => simp
+  | ok val locals' =>
+    split <;> simp_all
+
 /-! ## 6. Census Membership Lemmas & Completeness over `stepMirFn` -/
 
 /--
@@ -1557,6 +1823,32 @@ theorem not_stepNodeExposesUb_unsupported :
   · exact PEmpty.elim a
 
 /--
+`[adv A1]` Diverging `TerminatorKind.call` (`target = none`) never writes to its
+`destination` place in `evalTerminator` (nor in `resumeExternalDivergingCall`), so
+`StepNodeExposesUb` on a diverging call is completely independent of `destination`.
+-/
+theorem evalTerminator_diverging_call_exposesUb_destination_irrelevant
+    (s : MachineState) (func : Operand) (argOps : List Operand)
+    (dst₁ dst₂ : Place) (unwind : UnwindAction) (span : String)
+    (currentBody : Option CapturedMir) :
+    StepNodeExposesUb (evalTerminator s ⟨.call func argOps dst₁ none unwind, span⟩ currentBody) ↔
+      StepNodeExposesUb (evalTerminator s ⟨.call func argOps dst₂ none unwind, span⟩ currentBody) := by
+  dsimp only [evalTerminator]
+  split
+  · rfl
+  · rfl
+  · split
+    · rfl
+    · rfl
+    · split
+      · split
+        · rfl
+        · split
+          · rfl
+          · constructor <;> (intro h; exact absurd h (not_stepNodeExposesUb_step _))
+      · rfl
+
+/--
 Statement-level census completeness over one-step UB exposure: whenever
 `evalStmt` exposes `.ub` (immediately or through a continuation),
 `censusStmtFaultClasses stmt.kind` contains at least one justifying class.
@@ -1576,12 +1868,16 @@ theorem evalStmt_exposesUb_implies_mem_censusStmt
     exact ⟨.storageLiveProtected, by dsimp only [censusStmtFaultClasses]; decide⟩
   | storageDead _ =>
     exact ⟨.storageLiveProtected, by dsimp only [censusStmtFaultClasses]; decide⟩
-  | placeMention place =>
-    refine ⟨.uninitRead, ?_⟩
-    simp [censusStmtFaultClasses]
+  | placeMention _ =>
+    exact ⟨.uninitRead, by dsimp only [censusStmtFaultClasses]; decide⟩
   | deinit place =>
-    refine ⟨.uninitRead, ?_⟩
-    simp [censusStmtFaultClasses]
+    cases hProj : place.projection with
+    | nil =>
+      refine ⟨.storageLiveProtected, ?_⟩
+      simp [censusStmtFaultClasses, hProj]
+    | cons hd tl =>
+      refine ⟨.uninitRead, ?_⟩
+      simp [censusStmtFaultClasses, hProj]
   | retag _ place =>
     refine ⟨.uninitRead, ?_⟩
     simp [censusStmtFaultClasses, censusPlaceReadFaultClasses]
@@ -1597,9 +1893,15 @@ theorem evalStmt_exposesUb_implies_mem_censusStmt
       refine ⟨.ptrDerefInvalid, ?_⟩
       simp [censusStmtFaultClasses, censusIntrinsicFaultClasses]
   | assign dst rv =>
-    refine ⟨.storageLiveProtected, ?_⟩
-    cases hProj : dst.projection <;>
-      simp [censusStmtFaultClasses, censusPlaceWriteFaultClasses, hProj]
+    cases hUneval : rvalueUnevaluated rv with
+    | true =>
+      rw [(evalStmt_assign_unevaluated_eq_unsupported s dst rv span localDecls layouts hUneval).1]
+        at hUb
+      exact absurd hUb not_stepNodeExposesUb_unsupported
+    | false =>
+      refine ⟨.storageLiveProtected, ?_⟩
+      cases hProj : dst.projection <;>
+        simp [censusStmtFaultClasses, censusPlaceWriteFaultClasses, hUneval, hProj]
 
 /--
 Statement-level census completeness: whenever `evalStmt` faults with
@@ -1638,14 +1940,19 @@ theorem evalTerminator_exposesUb_implies_mem_censusTerminator
     refine ⟨.scalarNicheInvalid, ?_⟩
     simp [censusTerminatorFaultClasses]
   | drop place target unwind =>
-    refine ⟨.uninitRead, ?_⟩
-    simp [censusTerminatorFaultClasses, censusPlaceReadFaultClasses]
+    cases hProj : place.projection with
+    | nil =>
+      refine ⟨.storageLiveProtected, ?_⟩
+      simp [censusTerminatorFaultClasses, hProj]
+    | cons hd tl =>
+      refine ⟨.uninitRead, ?_⟩
+      simp [censusTerminatorFaultClasses, hProj]
   | assert cond expected target unwind =>
     refine ⟨.scalarNicheInvalid, ?_⟩
     simp [censusTerminatorFaultClasses]
   | call func args destination target unwind =>
     refine ⟨.callAbiMismatch, ?_⟩
-    simp [censusTerminatorFaultClasses]
+    cases target <;> simp [censusTerminatorFaultClasses]
   | tailCall func args =>
     refine ⟨.callAbiMismatch, ?_⟩
     simp [censusTerminatorFaultClasses]
@@ -2934,6 +3241,86 @@ theorem stepMirFn_preserves_validMirPc
       rw [hStmtZero]
       exact Nat.zero_le _
 
+/--
+`[adv A1]` Interprocedural PC preservation across `pushCalleeFrame`: entering an
+inline callee `calleeBody` with `0 < length calleeBody.basicBlocks` sets
+`s'.memory.activeCallee = some calleeBody` and starts at `(blockIdx := 0, stmtIdx := 0)`,
+preserving `ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame`.
+-/
+theorem validMirPc_pushCalleeFrame
+    (s : MachineState) (callerBody : CapturedMir)
+    (localsAfterArgs : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (calleeBody : CapturedMir)
+    (argVals : List Value) (unwind : UnwindAction)
+    (hNonEmpty : 0 < length calleeBody.basicBlocks) :
+    let s' := pushCalleeFrame s callerBody localsAfterArgs destination targetBb
+      calleeBody argVals unwind
+    ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame := by
+  rcases exists_get?_of_lt_length calleeBody.basicBlocks 0 hNonEmpty with ⟨bb0, hBb0⟩
+  exact ⟨bb0, hBb0, Nat.zero_le _⟩
+
+/--
+`[adv A1]` Interprocedural PC preservation across `pushDivergingCalleeFrame`: entering
+an inline diverging callee `calleeBody` with `0 < length calleeBody.basicBlocks`
+preserves `ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame`.
+-/
+theorem validMirPc_pushDivergingCalleeFrame
+    (s : MachineState) (callerBody : CapturedMir)
+    (localsAfterArgs : List LocalSlot) (destination : Place)
+    (unwind : UnwindAction) (calleeBody : CapturedMir)
+    (argVals : List Value)
+    (hNonEmpty : 0 < length calleeBody.basicBlocks) :
+    let s' := pushDivergingCalleeFrame s callerBody localsAfterArgs destination
+      unwind calleeBody argVals
+    ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame := by
+  rcases exists_get?_of_lt_length calleeBody.basicBlocks 0 hNonEmpty with ⟨bb0, hBb0⟩
+  exact ⟨bb0, hBb0, Nat.zero_le _⟩
+
+/--
+`[adv A1]` Interprocedural PC preservation across `enterTailCalleeFrame`: tail-calling
+an inline callee `calleeBody` with `0 < length calleeBody.basicBlocks` preserves
+`ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame`.
+-/
+theorem validMirPc_enterTailCalleeFrame
+    (mem : Memory) (callerBody calleeBody : CapturedMir)
+    (argVals : List Value)
+    (hNonEmpty : 0 < length calleeBody.basicBlocks) :
+    let s' := enterTailCalleeFrame mem calleeBody argVals
+    ValidMirPc (s'.memory.activeCallee.getD callerBody) s'.frame := by
+  rcases exists_get?_of_lt_length calleeBody.basicBlocks 0 hNonEmpty with ⟨bb0, hBb0⟩
+  exact ⟨bb0, hBb0, Nat.zero_le _⟩
+
+/--
+`[adv A1]` Interprocedural PC preservation across inline `TerminatorKind.return_`:
+returning to a saved caller frame `caller` whose `returnTarget < length caller.callerBody.basicBlocks`
+restores `s'.memory.activeCallee = some caller.callerBody` at `(caller.returnTarget, 0)`,
+preserving `ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame`.
+-/
+theorem validMirPc_return_inline
+    (rootBody : CapturedMir) (s s' : MachineState)
+    (caller : SavedCallerFrame) (restStack : List SavedCallerFrame)
+    (currentBody : Option CapturedMir) (span : String)
+    (hStack : s.memory.callStack = caller :: restStack)
+    (hTarget : caller.returnTarget < length caller.callerBody.basicBlocks)
+    (hStep : evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.step s') :
+    ValidMirPc (s'.memory.activeCallee.getD rootBody) s'.frame := by
+  dsimp only [evalTerminator] at hStep
+  split at hStep
+  · rw [hStack] at hStep
+    dsimp only at hStep
+    split at hStep
+    · nomatch hStep
+    · split at hStep
+      · injection hStep with hTau
+        injection hTau with hEq
+        subst hEq
+        rcases exists_get?_of_lt_length caller.callerBody.basicBlocks
+          caller.returnTarget hTarget with ⟨bb, hBb⟩
+        exact ⟨bb, hBb, Nat.zero_le _⟩
+      · nomatch hStep
+      · nomatch hStep
+  · nomatch hStep
+
 /-! ## 9. Fail-Closed Coverage Reconciler & Soundness/Completeness Proofs -/
 
 /--
@@ -3870,7 +4257,10 @@ def witnessWrappingArithBody : CapturedMir :=
   , allocations := List.nil
   }
 
-/-- Expected fault-site census for `witnessWrappingArithBody`. -/
+/-- Expected fault-site census for `witnessWrappingArithBody` (`[adv A1]`: statement `(0, 4)`
+`_1 = NullaryOp.sizeOf u32` has `rvalueUnevaluated = true`, so it steps immediately to
+`MirStepNode.unsupported` and emits `[]`, eliminating the two spurious destination-write
+sites at `(0, 4)`). -/
 def witnessWrappingArithExpectedCensus : List FaultSite :=
   [ (0, 0, .treeBorrowsViolation)
   , (0, 0, .storageLiveProtected)
@@ -3880,23 +4270,26 @@ def witnessWrappingArithExpectedCensus : List FaultSite :=
   , (0, 2, .storageLiveProtected)
   , (0, 3, .treeBorrowsViolation)
   , (0, 3, .storageLiveProtected)
-  , (0, 4, .treeBorrowsViolation)
-  , (0, 4, .storageLiveProtected)
   , (0, 5, .treeBorrowsViolation)
   , (0, 5, .uninitRead)
   , (0, 5, .storageLiveProtected)
   ]
 
 /--
-Precision witness: the census matches exactly, and none of the six statements
-carries an arithmetic, shift, niche, or pointer-dereference label.
+Precision witness: the census matches `witnessWrappingArithExpectedCensus` exactly,
+statement `(0, 4)` (`_1 = NullaryOp.sizeOf u32`) steps directly to `MirStepNode.unsupported`
+even when `_1` is `.dead` (and therefore emits zero fault sites at `(0, 4)`), and none of
+the statements carries an arithmetic, shift, niche, or pointer-dereference label.
 -/
 theorem witnessWrappingArith_census_precise :
     censusMirBodyFaultSites witnessWrappingArithBody = witnessWrappingArithExpectedCensus ∧
+    stepMirFn witnessWrappingArithBody
+      (witnessState 0 4 [.uninit, .dead, .uninit]) = MirStepNode.unsupported ∧
     (censusMirBodyFaultSites witnessWrappingArithBody).all (fun site =>
+      site.2.1 != 4 &&
       site.2.2 != .arithOverflow && site.2.2 != .shiftOverflow &&
         site.2.2 != .scalarNicheInvalid && site.2.2 != .ptrDerefInvalid &&
         site.2.2 != .ptrAlignMismatch) = true := by
-  decide
+  refine ⟨by decide, rfl, by decide⟩
 
 end Anneal.FaultSiteCensusPrototype
