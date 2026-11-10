@@ -31,7 +31,7 @@ instance instDecidableVerifiedRemediationWitness
 /-! ## 1. Individual Mandatory Remediation & Divergence Witnesses (`by decide`) -/
 
 /-- `GAP-MR-0001` (`anneal_soundness_bug`, `L4_TreeBorrows`, `status = "closed"`):
-    `BorrowKind.shared` over `UnsafeCell` initializes `TreeBorrowPerm.reserved` in Anneal
+    `BorrowKind.shared` over `UnsafeCell` initializes `TreeBorrowPerm.cell` in Anneal
     so both Anneal and MiniRust permit interior-mutable write (`normalUnit`). -/
 theorem witness_GAP_MR_0001 :
     VerifiedRemediationWitness

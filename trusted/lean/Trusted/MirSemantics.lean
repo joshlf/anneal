@@ -70,12 +70,17 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
-  writePlaceValue evalByteCast
+  writePlaceValue derefWriteTreeUB evalByteCast
   unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
-  resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
+  resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
+  rigidTyIsZeroSized tyIsZeroSized placeIsZeroSized
+  rigidTyIsUninhabited tyIsUninhabited placeIsUninhabited
+  sharedBorrowPerm mutableBorrowPerm fnEntryRetagPerm retagPerm
   splitLastDeref? evalPlaceLen
   findDeclTyWithKind? pointeeElemByteStride valueDefaultByteSize
   projectedValueDefaultByteSize ptrAllocByteBound?
+  ptrToAddrScalar stackLocalAddrPageBase borrowPlaceByteOffset?
+  borrowBaseAddress? ptrAddress? ptrAddressScalar? recoverExposedPtrValue?
   evalBinOpOffset evalPtrOffsetBinOp evalSliceFatPtrDerefBorrow
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
   evalRvalue evalRvalueWithMemory advanceStmt
