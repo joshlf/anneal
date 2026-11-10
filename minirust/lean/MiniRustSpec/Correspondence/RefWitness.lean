@@ -1909,6 +1909,20 @@ theorem childReborrowWriteDisablesParent_minirust_noUB {n : Nat} {e : Stop}
     [.scalar ⟨5, 4⟩] (by decide) childReborrowWriteDisablesParentMInit
     rfl rfl rfl childReborrowWriteDisablesParent_noUB herr
 
+theorem childReborrowWriteDisablesParent_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) childReborrowWriteDisablesParentMInit = .ok m' ∧
+      StateRelN childReborrowWriteDisablesParent childReborrowWriteDisablesParentFn ctx0 s' m' ∧
+      Reaches (mirCallTree childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]) tr
+        (mirTree childReborrowWriteDisablesParent s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k childReborrowWriteDisablesParentMInit = .ok mRet ∧
+      ReturnRel childReborrowWriteDisablesParent ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem))) :=
+  mirCall_progress_N childReborrowWriteDisablesParent_inFragment
+    childReborrowWriteDisablesParent_translate ctx0 childReborrowWriteDisablesParent_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) childReborrowWriteDisablesParentMInit
+    rfl rfl rfl childReborrowWriteDisablesParent_noUB n
+
 /-! ### Ground truth for Tree Borrows `ReborrowSettings.new` -/
 
 def sampleTbPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
@@ -2449,6 +2463,20 @@ theorem retagDisabledRefDiscrepancy_minirust_noUB {n : Nat} {e : Stop}
     retagDisabledRefDiscrepancy_translate_eq ctx0 retagDisabledRefDiscrepancy_ctxOk
     [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
     rfl rfl rfl retagDisabledRefDiscrepancy_noUB herr
+
+theorem retagDisabledRefDiscrepancy_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) retagDisabledRefDiscrepancyMInit = .ok m' ∧
+      StateRelN retagDisabledRefDiscrepancy retagDisabledRefDiscrepancyFn ctx0 s' m' ∧
+      Reaches (mirCallTree retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]) tr
+        (mirTree retagDisabledRefDiscrepancy s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k retagDisabledRefDiscrepancyMInit = .ok mRet ∧
+      ReturnRel retagDisabledRefDiscrepancy ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem))) :=
+  mirCall_progress_N retagDisabledRefDiscrepancy_inFragment
+    retagDisabledRefDiscrepancy_translate_eq ctx0 retagDisabledRefDiscrepancy_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
+    rfl rfl rfl retagDisabledRefDiscrepancy_noUB n
 
 /-- Scalar `Retag([default], _1)` discrepancy on `u32` parameter `_1`:
 `translateFn` lowers `Retag` to `Statement::Validate`, while `statementOk`

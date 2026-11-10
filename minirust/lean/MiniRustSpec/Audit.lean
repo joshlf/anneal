@@ -525,6 +525,15 @@ open MiniRustSpec.Correspondence in
   mkStartFn_funcCfgWf
   translateProgFns_names_and_mem
   translateProg_progWf
+  translateTy_eq_none_of_not_isMonoRigidTy
+  derefPointeeTy_eq_none_of_not_isMonoRigidTy
+  translateTy_container_param
+  translateTy_container_alias
+  isBorrowDescendantOrSelfAux_mono
+  isBorrowDescendantOrSelfAux_of_lookup_sub
+  isBorrowDescendantOrSelf_of_lookup_sub
+  isBorrowDescendantOrSelf_map_eq
+  isBorrowDescendantOrSelf_cons_child
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -1800,6 +1809,15 @@ open MiniRustSpec.Correspondence in
   mkStartFn_funcCfgWf
   translateProgFns_names_and_mem
   translateProg_progWf
+  translateTy_eq_none_of_not_isMonoRigidTy
+  derefPointeeTy_eq_none_of_not_isMonoRigidTy
+  translateTy_container_param
+  translateTy_container_alias
+  isBorrowDescendantOrSelfAux_mono
+  isBorrowDescendantOrSelfAux_of_lookup_sub
+  isBorrowDescendantOrSelf_of_lookup_sub
+  isBorrowDescendantOrSelf_map_eq
+  isBorrowDescendantOrSelf_cons_child
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -3201,6 +3219,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   childReborrowWriteDisablesParent_ctxOk
   childReborrowWriteDisablesParent_minirust_ret_from_start
   childReborrowWriteDisablesParent_minirust_noUB
+  childReborrowWriteDisablesParent_progress
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
   refMutReborrowWrite_translate
@@ -3299,6 +3318,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_ctxOk
   retagDisabledRefDiscrepancy_minirust_ret_from_start
   retagDisabledRefDiscrepancy_minirust_noUB
+  retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
   retagScalarDiscrepancy_anneal_ub
@@ -3636,6 +3656,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   childReborrowWriteDisablesParent_ctxOk
   childReborrowWriteDisablesParent_minirust_ret_from_start
   childReborrowWriteDisablesParent_minirust_noUB
+  childReborrowWriteDisablesParent_progress
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
   refMutReborrowWrite_translate
@@ -3734,6 +3755,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_ctxOk
   retagDisabledRefDiscrepancy_minirust_ret_from_start
   retagDisabledRefDiscrepancy_minirust_noUB
+  retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
   retagScalarDiscrepancy_anneal_ub
@@ -4045,7 +4067,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   mutReborrowForeignReadRoundTrip_noUB
   mutReborrowForeignReadRoundTrip_minirust_ret_from_start
   mutReborrowForeignReadRoundTrip_minirust_noUB
+  mutReborrowForeignReadRoundTrip_progress
   mutReborrowForeignReadRoundTrip_three_way
+  storageLiveReallocDisablesBorrowUb_notInFragment
+  storageLiveReallocDisablesBorrowUb_translate
+  storageLiveReallocDisablesBorrowUb_three_way_ub
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #check_theorem_deps "[TB-AUDIT]"
@@ -4236,7 +4262,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   mutReborrowForeignReadRoundTrip_noUB
   mutReborrowForeignReadRoundTrip_minirust_ret_from_start
   mutReborrowForeignReadRoundTrip_minirust_noUB
+  mutReborrowForeignReadRoundTrip_progress
   mutReborrowForeignReadRoundTrip_three_way
+  storageLiveReallocDisablesBorrowUb_notInFragment
+  storageLiveReallocDisablesBorrowUb_translate
+  storageLiveReallocDisablesBorrowUb_three_way_ub
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -5154,6 +5184,8 @@ open MiniRustSpec.Correspondence in
   bdUnreach_rejected
   bdUnreachableTerminator_covered
   bdPolymorphicCallee_rejected
+  bdPolymorphicCall_anneal_failClosed
+  bdUnmonoParamAliasBody_failClosed
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

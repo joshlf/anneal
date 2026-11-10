@@ -755,7 +755,9 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `BinOp::Offset` scales the signed count by `size_of::<T>()` and enforces
   in-bounds byte arithmetic (`bdOffset1_anneal_ret`, `bdOffsetNeg1_anneal_ub`,
   `bdOffsetNeg1_not_noUB`); unmonomorphized `RigidTy.param`, `RigidTy.alias`, and
-  polymorphic `monoCallee?` calls fail closed (`bdPolymorphicCallee_rejected`);
+  polymorphic `monoCallee?` calls fail closed both statically and in `stepMirFn`
+  (`bdPolymorphicCallee_rejected`, `bdPolymorphicCall_anneal_failClosed`,
+  `bdUnmonoParamAliasBody_failClosed`);
   and `core::hint::unreachable_unchecked()` faults with UB in Anneal, matching
   `Terminator::Unreachable` (`bdUnreach_anneal_ub`, `bd_minirust_unreachable_ub`).
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
@@ -1139,9 +1141,10 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   admitted in `inFragment` (`*_inFragment`) and return `9` across Anneal,
   `BasicMemory`, and `MachTB` (`childReborrowWriteDisablesParent_anneal_ret`,
   `retagDisabledRefDiscrepancy_anneal_ret`), with MiniRust's return transported
-  symbolically by `mirCall_ret` / `mirCall_noUB`
-  (`childReborrowWriteDisablesParent_minirust_ret_from_start` / `_minirust_noUB`,
-  `retagDisabledRefDiscrepancy_minirust_ret_from_start` / `_minirust_noUB`); they disagree on the remaining
+  symbolically by `mirCall_ret` / `mirCall_noUB` / `mirCall_progress_N`
+  (`childReborrowWriteDisablesParent_minirust_ret_from_start` / `_minirust_noUB` /
+  `_progress`, `retagDisabledRefDiscrepancy_minirust_ret_from_start` /
+  `_minirust_noUB` / `_progress`); they disagree on the remaining
   divergences listed under the gaps: `misaligned` (UB in MiniRust only),
   `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
   `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
@@ -1200,11 +1203,13 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `boolMutRefToggle` and `boolInvalidByteRefUb` (plus `boolInvalidLoadDirectUb`
   verifying `validateLoadedValue` invalid-`bool` UB parity at the dereference load
   itself, with the valid-byte control `boolInvalidLoadDirectUb_valid_three_way_ret`
-  returning `0` on all three semantics for `1u8`, `storageCycleDisablesBorrowUb` verifying `disableLocalBorrows` across
-  `StorageDead`/`StorageLive` stack-slot reuse, `derefReadFreezesActiveMutUb`
-  verifying `freezeDerefReadBorrowsAt` on active `&mut`, and in-fragment
-  `mutReborrowForeignReadRoundTrip` verifying `.reserved` `&mut (*_2)` across a
-  foreign parent read), and two upstream MiniRust
+  returning `0` on all three semantics for `1u8`, `storageCycleDisablesBorrowUb`
+  and `storageLiveReallocDisablesBorrowUb` verifying `disableLocalBorrows` across
+  `StorageDead`/`StorageLive` cycling and repeated `StorageLive` re-allocation,
+  `derefReadFreezesActiveMutUb` verifying `freezeDerefReadBorrowsAt` on active
+  `&mut`, and in-fragment `mutReborrowForeignReadRoundTrip` verifying `.reserved`
+  `&mut (*_2)` across a foreign parent read via `mirCall_ret` / `mirCall_noUB` /
+  `mirCall_progress_N`), and two upstream MiniRust
   specification findings (`zstWrappingSubReborrow_tb_specPanic` /
   `nonZstWrappingSubReborrow_bm_and_tb_ub`, where reborrowing a negative-offset
   `ptr_offset_wrapping(-8)` pointer at ZST `&()` passes `BasicMemory::check_ptr`

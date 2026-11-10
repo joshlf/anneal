@@ -1967,6 +1967,20 @@ theorem mutReborrowForeignReadRoundTrip_minirust_noUB {n : Nat} {e : Stop}
     mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
     mutReborrowForeignReadRoundTripMInit rfl rfl rfl mutReborrowForeignReadRoundTrip_noUB herr
 
+theorem mutReborrowForeignReadRoundTrip_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) mutReborrowForeignReadRoundTripMInit = .ok m' ∧
+      StateRelN mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripFn ctx0 s' m' ∧
+      Reaches (mirCallTree mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]) tr
+        (mirTree mutReborrowForeignReadRoundTrip s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k mutReborrowForeignReadRoundTripMInit = .ok mRet ∧
+      ReturnRel mutReborrowForeignReadRoundTrip ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem))) :=
+  mirCall_progress_N mutReborrowForeignReadRoundTrip_inFragment
+    mutReborrowForeignReadRoundTrip_translate ctx0
+    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+    mutReborrowForeignReadRoundTripMInit rfl rfl rfl mutReborrowForeignReadRoundTrip_noUB n
+
 theorem mutReborrowForeignReadRoundTrip_three_way :
     (∃ mem, ReachesRet (mirTree mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripS0) []
       (.normal (.scalar ⟨42, 4⟩, mem))) ∧
@@ -1974,5 +1988,39 @@ theorem mutReborrowForeignReadRoundTrip_three_way :
       some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
     retAfterTB mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩] 10 = tbRetU32 42 :=
   ⟨mutReborrowForeignReadRoundTrip_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-- `D2` (`evalStmt_storageLive_disable`) tag-disabling correspondence on repeated
+`StorageLive(_2)` *without* a preceding `StorageDead(_2)`: `_2 = 5; _3 = &raw mut _2;
+StorageLive(_2); _2 = 77; _0 = copy (*_3)`. MiniRust's `storage_live` first
+deallocates the old allocation of `_2` before allocating a fresh one, and Anneal's
+`evalStmt` `.storageLive` runs `disableLocalBorrows` so the stale tag in `_3`
+faults with UB on `(*_3)` in Anneal, `Mach`, and `MachTB` (whereas without
+`StorageLive` tag disabling, `_2 = 77` would re-initialize the slot and Anneal
+would silently return `77`). -/
+def storageLiveReallocDisablesBorrowUb : CapturedMir :=
+  ptrBody "witness::storage_live_realloc_disables_borrow_ub"
+    [u32Decl, u32Decl, u32Decl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.use (constU32 5)),
+     .assign (local_ 3) (.rawPtr .mut (local_ 2)),
+     .storageLive 2,
+     .assign (local_ 2) (.use (constU32 77)),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem storageLiveReallocDisablesBorrowUb_notInFragment :
+    inFragment storageLiveReallocDisablesBorrowUb = false := by decide +kernel
+
+theorem storageLiveReallocDisablesBorrowUb_translate :
+    (translateFn storageLiveReallocDisablesBorrowUb).isSome = true := by decide +kernel
+
+theorem storageLiveReallocDisablesBorrowUb_three_way_ub :
+    (∃ tr u, Reaches (mirTree storageLiveReallocDisablesBorrowUb
+      (initMachineState storageLiveReallocDisablesBorrowUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    ubAfter storageLiveReallocDisablesBorrowUb [.scalar ⟨5, 4⟩] 8 =
+      some "dereferencing pointer to dead allocation" ∧
+    ubAfterTB storageLiveReallocDisablesBorrowUb [.scalar ⟨5, 4⟩] 8 =
+      some "dereferencing pointer to dead allocation" :=
+  ⟨faultsA_sound storageLiveReallocDisablesBorrowUb 25 _ (by decide),
+   by decide +kernel, by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.TbWitness

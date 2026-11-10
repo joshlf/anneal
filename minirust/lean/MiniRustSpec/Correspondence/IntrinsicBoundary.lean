@@ -929,4 +929,74 @@ theorem bdPolymorphicCallee_rejected :
       progInFragment fbBlackBoxCaller [{ fbBlackBoxCallee with typeParamCount := 1 }] = false :=
   ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
 
+/-- Runtime fail-closed execution for polymorphic callee mismatches in Anneal's
+`stepMirFn`:
+1. Even when `Memory.callees` links `fbBlackBoxCallee` (`typeParamCount = 0`),
+   a caller passing unmonomorphized `tys = [.param 0 "T"]` (`bdPolyBlackBoxCaller`)
+   is **not** dispatched to `fbBlackBoxCallee` (`lookupCallee = none`); `stepMirFn`
+   emits `MirStepNode.extCall` carrying `typeArgs := [.param 0 "T"]` instead of
+   silently pushing a frame with erased type arguments.
+2. Calling `core::intrinsics::exact_div` with unmonomorphized `RigidTy.param` or
+   `RigidTy.alias` `typeArgs` fails closed immediately with
+   `MirStepNode.unsupported` (`resolveIntrinsicIsSigned = none`). -/
+def bdPolyBlackBoxCaller : CapturedMir :=
+  fbCaller "boundary::poly_caller" "core::intrinsics::black_box" [.param 0 "T"]
+    [u32Decl, u32Decl] (fbAbi [u32Layout] u32Layout)
+
+def bdExactDivParamCaller : CapturedMir :=
+  bdCallBody "boundary::exact_div_param" "core::intrinsics::exact_div" [.param 0 "T"] 2
+    [u32Decl, u32Decl, u32Decl] (some 1)
+
+def bdExactDivAliasCaller : CapturedMir :=
+  bdCallBody "boundary::exact_div_alias" "core::intrinsics::exact_div" [.alias "T::Item" []] 2
+    [u32Decl, u32Decl, u32Decl] (some 1)
+
+theorem bdPolymorphicCall_anneal_failClosed :
+    (∃ k, stepMirFn bdPolyBlackBoxCaller
+        (initMachineStateWithCallees bdPolyBlackBoxCaller [.scalar ⟨7, 4⟩] [fbBlackBoxCallee]) =
+      MirStepNode.extCall
+        { defPath := "core::intrinsics::black_box", typeArgs := [.param 0 "T"],
+          args := [.scalar ⟨7, 4⟩],
+          memory := (initMachineStateWithCallees bdPolyBlackBoxCaller
+            [.scalar ⟨7, 4⟩] [fbBlackBoxCallee]).memory } k) ∧
+    stepMirFn bdExactDivParamCaller
+        (initMachineState bdExactDivParamCaller bdExactDivArgs) = MirStepNode.unsupported ∧
+    stepMirFn bdExactDivAliasCaller
+        (initMachineState bdExactDivAliasCaller bdExactDivArgs) = MirStepNode.unsupported :=
+  ⟨⟨_, rfl⟩, rfl, rfl⟩
+
+/-- End-to-end fail-closed rejection of MIR bodies containing unmonomorphized
+`RigidTy.param` or `RigidTy.alias` locals/casts across `inFragment`,
+`translateFn`, and Anneal's `stepMirFn` (`MirStepNode.unsupported`). -/
+def bdUnmonoCastBody (rk : RigidTy) : CapturedMir :=
+  { defPath := "boundary::unmono_cast"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls := [
+      { mutability := .mut, ty := { kind := rk, layoutIdx := 0 }, debugName := none },
+      u32Decl]
+    basicBlocks := [
+      { statements := [
+          mkStmt (.assign (local_ 0)
+            (.cast .intToInt (.copy (local_ 1)) { kind := rk, layoutIdx := 0 }))]
+        terminator := mkTerm .return_
+        isCleanup := false }]
+    fnAbi := fbAbi [u32Layout] u32Layout
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+theorem bdUnmonoParamAliasBody_failClosed :
+    inFragment (bdUnmonoCastBody (.param 0 "T")) = false ∧
+      translateFn (bdUnmonoCastBody (.param 0 "T")) = none ∧
+      stepMirFn (bdUnmonoCastBody (.param 0 "T"))
+        (initMachineState (bdUnmonoCastBody (.param 0 "T")) [.scalar ⟨7, 4⟩]) =
+        MirStepNode.unsupported ∧
+      inFragment (bdUnmonoCastBody (.alias "T::Item" [])) = false ∧
+      translateFn (bdUnmonoCastBody (.alias "T::Item" [])) = none ∧
+      stepMirFn (bdUnmonoCastBody (.alias "T::Item" []))
+        (initMachineState (bdUnmonoCastBody (.alias "T::Item" [])) [.scalar ⟨7, 4⟩]) =
+        MirStepNode.unsupported :=
+  ⟨by decide, rfl, rfl, by decide, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence
