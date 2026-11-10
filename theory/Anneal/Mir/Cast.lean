@@ -6071,7 +6071,8 @@ theorem encodeCastVal_preserved_of_isIntoBytes
   intro tBytes
   have ⟨hLen, hInit⟩ := encodeCastVal_length_and_init pw src val cBytes hEnc
   have hTLen : Trusted.Sequence.length tBytes = src.sizeBytes pw := by
-    simp [tBytes, Trusted.Sequence.length, hLen]
+    change tBytes.length = src.sizeBytes pw
+    rw [List.length_map, hLen]
   refine ⟨hLen, hInit, ?_, ?_, ?_⟩
   · intro hPw hNp
     subst hPw
@@ -6193,7 +6194,8 @@ theorem encodeCastVal_overwrite_strips_provenance_preserves_bitValidity
   have hInit : allBytesInitialized tBytes = true :=
     allBytesInitialized_map_toTrustedAbstractByte bytes
   have hTLen : Trusted.Sequence.length tBytes = src.sizeBytes pw := by
-    simp [tBytes, Trusted.Sequence.length, hLen]
+    change tBytes.length = src.sizeBytes pw
+    rw [List.length_map, hLen]
   have hProv : decodeCastPtrProv bytes = none := by
     rcases h_b with hNone | ⟨f, p, a, hSome, hVal, hNe⟩
     · exact decodeCastPtrProv_eq_none_of_prov_none bytes i (by simp [bytes, h_i])
@@ -6398,8 +6400,10 @@ theorem scalarTy_isIntoBytes
               encodeScalarBytes_length_and_init ⟨metaSc.bits, 8⟩ none b2 hB2
             dsimp only at hL1 hL2
             refine ⟨?_, allBytesInitialized_append hI1 hI2⟩
-            simp [Trusted.Sequence.length] at hL1 hL2 ⊢
-            omega
+            change (b1 ++ b2).length = 16
+            change b1.length = 8 at hL1
+            change b2.length = 8 at hL2
+            rw [List.length_append, hL1, hL2]
       · nomatch hEnc
   · exact scalarTy_isIntoBytes_of_thin layouts m pointee ty lIdx hThin
 
@@ -6468,11 +6472,13 @@ theorem wide_rawPtr_isFromBytes
   have hBeq16 : Nat.beq (Trusted.Sequence.length bs) 16 = true := by
     rw [hLen]; rfl
   have hTakeLen : Trusted.Sequence.length (bs.take 8) = 8 := by
-    simp [Trusted.Sequence.length, List.length_take] at hLen ⊢
-    omega
+    change (bs.take 8).length = 8
+    have hBs : bs.length = 16 := hLen
+    rw [List.length_take, hBs]; decide
   have hDropLen : Trusted.Sequence.length (bs.drop 8) = 8 := by
-    simp [Trusted.Sequence.length, List.length_drop] at hLen ⊢
-    omega
+    change (bs.drop 8).length = 8
+    have hBs : bs.length = 16 := hLen
+    rw [List.length_drop, hBs]
   have hTakeNz : Nat.beq (Trusted.Sequence.length (bs.take 8)) 0 = false := by
     rw [hTakeLen]; rfl
   have hDropNz : Nat.beq (Trusted.Sequence.length (bs.drop 8)) 0 = false := by
