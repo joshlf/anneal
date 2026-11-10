@@ -20,6 +20,15 @@ import MiniRustSpec.Correspondence.AnnealEval
 import MiniRustSpec.Correspondence.Simulation
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.Witness
+import MiniRustSpec.Correspondence.Pointers
+import MiniRustSpec.Correspondence.PointerStep
+import MiniRustSpec.Correspondence.PointerWitness
+import MiniRustSpec.Correspondence.RefWitness
+import MiniRustSpec.Correspondence.TbWitness
+import MiniRustSpec.Correspondence.Provenance
+import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.Audit
 
 /-!
@@ -34,7 +43,25 @@ import MiniRustSpec.Audit
   transcribed upstream item to the generated model.
 * `MiniRustSpec.Correspondence.*`: the correspondence between Anneal's MIR
   semantics (`Trusted.Rustc.V2026_06_01`) and that interpretation, with
-  non-vacuity witnesses (`Correspondence.Witness`).
+  non-vacuity witnesses (`Correspondence.Witness`); `Correspondence.Pointers`
+  and `Correspondence.PointerStep` relate the two semantics on the raw pointer
+  and reference statements the fragment admits (`&raw`, `&`, `&mut`,
+  reborrowing `&*_p` / `&mut *_p` / `&raw *_p`, pointer copies, and reads and
+  writes through pointers and references, including `move` rvalues and
+  pointer-to-pointer dereference copies) and prove structural Tree Borrows
+  (`TreeBorrowsMemory.wf` / `wfLive` and panic-freedom) invariants, while
+  `Correspondence.PointerWitness`, `Correspondence.RefWitness`, and
+  `Correspondence.TbWitness` compare Anneal, `Machine<BasicMemory>`, and
+  `Machine<TreeBorrowsMemory>` on concrete raw pointer, reference, reborrowing,
+  safe-pointer validity, `CastKind.transmute`, `Box<T>`, `UnsafeCell<T>`,
+  `IntPtrCast`, and Tree Borrows programs; `Correspondence.Provenance` and
+  `Correspondence.ProvenanceWitness` cover the integer-pointer provenance casts;
+  the multi-function relation (`Terminator::Call`, call stacks, and the
+  `Assume` intrinsic) is proven in `Correspondence.Simulation` and
+  `Correspondence.Run`, with witnesses for intrinsic calls that resolve to MIR
+  fallback bodies (`Correspondence.IntrinsicFallback`) and boundary witnesses
+  for the intrinsic constructs outside the fragment
+  (`Correspondence.IntrinsicBoundary`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

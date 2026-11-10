@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 40, "only {total} quotations found");
+    assert!(total >= 170, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -725,4 +725,2228 @@ def u := \"trailing\\";
     let qs4 = extract_quotes(unmatched_tick_and_divider, &valid_paths).unwrap();
     assert_eq!(qs4.len(), 1);
     assert_eq!(qs4[0].cited_file, ops);
+}
+
+/// The upstream items behind `bool`, comparisons, and transmutes (`MR-1.1`):
+/// each quotation that the Lean transcriptions rely on occurs verbatim in its
+/// vendored file, a one-token tampering of it is rejected, and the Lean
+/// sources still carry it (so the doc comment cannot silently lose the quote
+/// that justifies a definition).
+#[test]
+fn bool_comparison_and_transmute_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let repr = "spec/lang/representation.md";
+    let types = "spec/lang/types.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let bb = "tooling/minimize/src/bb.rs";
+    let constant = "tooling/minimize/src/constant.rs";
+
+    // Note: `tooling/miniutil/src/...` (e.g. `expr.rs`, `ty.rs`) is not vendored
+    // by `minirust.lock.toml`, so quotations from it (`bool_to_int`, `not`,
+    // `bool_and`, `bool_or`, `bool_xor`, `tuple_ty`) cannot be pinned here.
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `Machine::transmute`: encode at the old type, decode at the new one.
+        (
+            repr,
+            "let bytes = type1.encode::<M>(val); if let Some(raw_value) = type2.decode::<M>(bytes) { \
+             self.check_value(raw_value, type2)?; ret(raw_value) } else { \
+             throw_ub!(\"transmuted value is not valid at new type\") }",
+            "let bytes = type1.encode::<M>(val); if let Some(raw_value) = type1.decode::<M>(bytes) {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `CastOp::Transmute` checks the sizes before transmuting.
+        (
+            ops,
+            "Transmute(new_ty) => { if old_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") \
+             != new_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") { \
+             throw_ub!(\"transmute between types of different size\") }",
+            "Transmute(new_ty) => { if old_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") \
+             == new_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `eval_rel_op`: every relational operator and the `i8` of `Cmp`.
+        (
+            ops,
+            "Lt => (Value::Bool(ord.is_lt()), Type::Bool), Gt => (Value::Bool(ord.is_gt()), Type::Bool), \
+             Le => (Value::Bool(ord.is_le()), Type::Bool), Ge => (Value::Bool(ord.is_ge()), Type::Bool), \
+             Eq => (Value::Bool(ord.is_eq()), Type::Bool), Ne => (Value::Bool(ord.is_ne()), Type::Bool),",
+            "Lt => (Value::Bool(ord.is_gt()), Type::Bool),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            ops,
+            "(Value::Int(Int::from(val)), Type::Int(IntType::I8))",
+            "(Value::Int(Int::from(val)), Type::Int(IntType::I32))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `BinOp::Rel` compares integers and Booleans with `cmp`.
+        (
+            ops,
+            "(Type::Int(_), Value::Int(left), Value::Int(right)) => { left.cmp(&right) } \
+             (Type::Bool, Value::Bool(left), Value::Bool(right)) => { left.cmp(&right) }",
+            "(Type::Int(_), Value::Int(left), Value::Int(right)) => { right.cmp(&left) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub const I8: IntType = IntType { signed: Signedness::Signed, size: Size::from_bytes_const(1) };",
+            "pub const I8: IntType = IntType { signed: Signedness::Unsigned, size: Size::from_bytes_const(1) };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `bool` decodes only the bytes 0 and 1.
+        (
+            repr,
+            "AbstractByte::Init(0, _) => Value::Bool(false), AbstractByte::Init(1, _) => Value::Bool(true), \
+             _ => throw!(),",
+            "AbstractByte::Init(2, _) => Value::Bool(true),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `!b` on a `bool` is `build::not`, comparisons are
+        // `build::lt` and friends, `bool` constants go through `to_bool`, and a
+        // `bool` switch is transmuted to `u8`.
+        (
+            rvalue,
+            "(Not, Type::Int(_)) => build::bit_not(operand), (Not, Type::Bool) => build::not(operand),",
+            "(Not, Type::Bool) => build::bit_not(operand),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "(BitAnd, Type::Bool) => build::bool_and(l, r), \
+             (BitOr, Type::Bool) => build::bool_or(l, r), \
+             (BitXor, Type::Bool) => build::bool_xor(l, r),",
+            "(BitAnd, Type::Bool) => build::bit_and(l, r),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "(Lt, _) => build::lt(l, r), (Le, _) => build::le(l, r), (Gt, _) => build::gt(l, r), \
+             (Ge, _) => build::ge(l, r), (Eq, _) => build::eq(l, r), (Ne, _) => build::ne(l, r),",
+            "(Lt, _) => build::le(l, r),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "let operand = match operand_ty { Type::Int(_) => operand, \
+             Type::Bool => build::transmute(operand, u8::get_type()),",
+            "Type::Bool => build::transmute(operand, i8::get_type()),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            constant,
+            "let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap(); \
+             ValueExpr::Constant(Constant::Bool(val), ty)",
+            "let val = ecx.read_scalar(&val).unwrap().to_u8().unwrap();",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let Type::Int(u8_inttype) = <u8>::get_type() else { unreachable!() }; ( ValueExpr::UnOp { \
+             operator: UnOp::Cast(CastOp::Transmute(Type::Int(u8_inttype))), operand: GcCow::new(discr_op), }, \
+             u8_inttype, )",
+            "operator: UnOp::Cast(CastOp::IntToInt(u8_inttype)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        // The same quotation must be rejected when attributed to another file.
+        let other = if *file == ops { repr } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}
+
+/// The upstream items behind `core::cmp::Ordering` and MIR's three-way `Cmp`
+/// (`MR-1.1`): the representation of enums (`decode_discriminant`,
+/// `encode_discriminant`, `Type::{decode, encode}` for `Enum`) and of the
+/// tuples that carry variant data, `check_value` for both, the layout of
+/// both, and `minimize`'s translation of `Cmp` and of directly tagged enums.
+/// Each quotation occurs verbatim in its vendored file, a one-token tampering
+/// of it is rejected, it does not match another file, and the Lean sources
+/// still carry it.
+#[test]
+fn enum_tuple_and_cmp_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let repr = "spec/lang/representation.md";
+    let types = "spec/lang/types.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let enums = "tooling/minimize/src/enums.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `decode_discriminant`: `Known` and `Invalid` leaves, and the
+        // half-open ranges of `Branch` children.
+        (
+            repr,
+            "fn decode_discriminant<M: Memory>(mut accessor: impl FnMut(Offset, Size) -> \
+             Result<List<AbstractByte<M::Provenance>>>, discriminator: Discriminator) -> \
+             Result<Option<Int>> { match discriminator { Discriminator::Known(val) => ret(Some(val)), \
+             Discriminator::Invalid => ret(None),",
+            "Discriminator::Invalid => ret(Some(val)),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            ".find_map(|((start, end), child)| if start <= val && val < end { Some(child) } else { None }) \
+             .unwrap_or(fallback);",
+            ".find_map(|((start, end), child)| if start <= val && val <= end { Some(child) } else { None })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `encode_discriminant` encodes each tag at its integer type.
+        (
+            repr,
+            "for (offset, (value_type, value)) in tagger.iter() { \
+             let bytes = Type::Int(value_type).encode::<M>(Value::Int(value)); accessor(offset, bytes)?; }",
+            "let bytes = Type::Int(value_type).encode::<M>(Value::Int(offset));",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Type::decode` for `Enum` and for `Tuple`, and `Type::encode` for
+        // `Tuple` (padding is `Uninit`).
+        (
+            repr,
+            "if bytes.len() != size.bytes() { panic!(\"decode of Type::Enum with invalid length\"); }",
+            "if bytes.len() != size.bytes() { throw_ub!(\"decode of Type::Enum with invalid length\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "let Some(value) = variants[discriminant].ty.decode(bytes) else { return None }; \
+             Some(Value::Variant { discriminant, data: value })",
+            "Some(Value::Variant { discriminant: Int::ZERO, data: value })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "assert!(unsized_field.is_none(), \"decode of Type::Tuple with unsized field\"); \
+             let (size, _) = sized_head_layout.head_size_and_align(); \
+             if bytes.len() != size.bytes() { panic!(\"decode of Type::Tuple with invalid length\"); }",
+            "let (_, size) = sized_head_layout.head_size_and_align();",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "let mut bytes = list![AbstractByte::Uninit; size.bytes()];",
+            "let mut bytes = list![AbstractByte::Init(0, None); size.bytes()];",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "sized_fields.try_map(|(offset, ty)| { \
+             let subslice = bytes.subslice_with_length( \
+                 offset.bytes(), \
+                 ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes() \
+             ); \
+             ty.decode::<M>(subslice) })?",
+            "sized_fields.try_map(|(offset, ty)| { \
+             let subslice = bytes.subslice_with_length(0, offset.bytes()); \
+             ty.decode::<M>(subslice) })?",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `check_value` for variants and tuples, and `ensure_else_ub`.
+        (
+            repr,
+            "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> { \
+             if !b { throw_ub!(\"{}\", msg); } ret(()) }",
+            "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> { \
+             if !b { panic!(\"{}\", msg); } ret(()) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "let Some(variant) = variants.get(discriminant) else { \
+             throw_ub!(\"Value::Variant: invalid discrimant\"); }; self.check_value(data, variant.ty)?;",
+            "let Some(variant) = variants.get(discriminant) else { panic!(\"Value::Variant: invalid discrimant\"); };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;",
+            "ensure_else_ub(vals.len() <= sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Type::decode`, `Type::encode`, and `check_value` for `Union`.
+        (
+            repr,
+            "fn decode<M: Memory>(Type::Union { size, chunks, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             if bytes.len() != size.bytes() { panic!(\"decode of Type::Union with invalid length\"); } \
+             let mut chunk_data = list![]; \
+             for (offset, size) in chunks { \
+                 chunk_data.push(bytes.subslice_with_length(offset.bytes(), size.bytes())); \
+             } \
+             ret(Value::Union(chunk_data)) }",
+            "if bytes.len() != size.bytes() { throw_ub!(\"decode of Type::Union with invalid length\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "for ((offset, size), data) in chunks.zip(chunk_data) { \
+             assert_eq!(size.bytes(), data.len()); \
+             bytes.write_subslice_at_index(offset.bytes(), data); }",
+            "for ((offset, size), data) in chunks.zip(chunk_data) { \
+             assert_eq!(offset.bytes(), data.len()); \
+             bytes.write_subslice_at_index(offset.bytes(), data); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "(Value::Union(chunk_data), Type::Union { chunks, .. }) => { \
+             ensure_else_ub(chunk_data.len() == chunks.len(), \"Value::Union: invalid chunk size\")?;",
+            "(Value::Union(chunk_data), Type::Union { chunks, .. }) => { \
+             ensure_else_ub(chunk_data.len() <= chunks.len(), \"Value::Union: invalid chunk size\")?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "for (data, (_, size)) in chunk_data.zip(chunks) { \
+             ensure_else_ub(data.len() == size.bytes(), \"Value::Union: invalid chunk data\")?; }",
+            "for (data, (_, size)) in chunk_data.zip(chunks) { \
+             ensure_else_ub(data.len() <= size.bytes(), \"Value::Union: invalid chunk data\")?; }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // Layout of enums and sized tuples.
+        (
+            types,
+            "pub fn head_size_and_align(self) -> (Size, Align) { \
+             (self.end.align_to(self.align), self.align) }",
+            "pub fn head_size_and_align(self) -> (Size, Align) { (self.end, self.align) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),",
+            "Union { size, align, .. } | Enum { size, align, .. } => Sized(align, size),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Some(tail_ty) => LayoutStrategy::Tuple { \
+             head: sized_head_layout, \
+             tail: tail_ty.layout::<T>(), },",
+            "Some(tail_ty) => LayoutStrategy::Sized(sized_head_layout, tail_ty.layout::<T>()),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Slice { elem } => LayoutStrategy::Slice( \
+             elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"), \
+             elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), ), \
+             TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),",
+            "Slice { elem } => LayoutStrategy::Sized( \
+             elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"), \
+             elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), ),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn decode<M: Memory>(Type::Slice { .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             panic!(\"decode of Type::Slice\") }",
+            "fn decode<M: Memory>(Type::Slice { .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             throw_ub!(\"decode of Type::Slice\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             panic!(\"decode of Type::TraitObject\") }",
+            "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             throw_ub!(\"decode of Type::TraitObject\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             panic!(\"encode of Type::Slice\") }",
+            "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             throw_ub!(\"encode of Type::Slice\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             panic!(\"encode of Type::TraitObject\") }",
+            "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             throw_ub!(\"encode of Type::TraitObject\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "(_, Type::Slice { .. }) => panic!(\"Value: slices cannot be represented as values\"), \
+             (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),",
+            "(_, Type::Slice { .. }) => throw_ub!(\"Value: slices cannot be represented as values\"),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `Cmp` is `build::cmp` transmuted to the translation of
+        // `Ordering`, and directly tagged enums tag every variant with its
+        // own discriminant, with an `Invalid` fallback.
+        (
+            rvalue,
+            "(Cmp, _) => { let res = build::cmp(l, r);",
+            "(Cmp, _) => { let res = build::lt(l, r);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "let ordering_ty: rs::Ty = self.tcx.ty_ordering_enum(rs::DUMMY_SP); \
+             let ordering_ty: Type = self.translate_ty(ordering_ty, span); build::transmute(res, ordering_ty)",
+            "let ordering_ty: Type = self.translate_ty(ordering_ty, span); build::int_cast(res, ordering_ty)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "let tagger = [(tag_offset, (tag_ty, discr_int))] .into_iter() \
+             .collect::<Map<Offset, (IntType, Int)>>();",
+            "let tagger = [(tag_offset, (discriminant_ty, discr_int))]",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "discriminator_branches.insert( (discr_int, discr_int + Int::ONE), Discriminator::Known(discr_int), );",
+            "discriminator_branches.insert( (discr_int, discr_int), Discriminator::Known(discr_int), );",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "rs::TagEncoding::Direct => GcCow::new(Discriminator::Invalid),",
+            "rs::TagEncoding::Direct => GcCow::new(Discriminator::Known(discr_int)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        let other = if *file == ops { repr } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}
+
+/// The upstream items behind checked integer arithmetic (`IntWithOverflow`),
+/// `(Int, bool)` 2-tuples (`IntType::with_overflow`, `ValueExpr::Tuple`), and
+/// field projections (`PlaceExpr::Field`, `ptr_offset_inbounds`,
+/// `LayoutStrategy::compute_size_and_align`) (`MR-1.2`).
+#[test]
+fn with_overflow_tuple_and_field_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let types = "spec/lang/types.md";
+    let ptr = "spec/mem/pointer.md";
+    let basic = "spec/mem/basic.md";
+    let iface = "spec/mem/interface.md";
+    let conc = "spec/mem/concurrent.md";
+    let mach = "spec/lang/machine.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let min_ty = "tooling/minimize/src/ty.rs";
+    let bb = "tooling/minimize/src/bb.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `IntType::with_overflow` constructs `(self, bool)` with trailing padding
+        // up to `self.size + Size::from_bytes(align.bytes()).unwrap()`.
+        (
+            types,
+            "pub fn with_overflow<T: Target>(&self) -> Type { \
+             let fields = list![(Size::ZERO, Type::Int(*self)), (self.size, Type::Bool)]; \
+             let align = self.align::<T>(); \
+             let size = self.size + Size::from_bytes(align.bytes()).unwrap(); \
+             Type::Tuple { \
+                 sized_fields: fields, \
+                 sized_head_layout: TupleHeadLayout { end: size, align, packed_align: None, }, \
+                 unsized_field: None, \
+             } }",
+            "let size = self.size + Size::from_bytes_const(1);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `TupleHeadLayout::{capped_tail_align, tail_offset, full_size_and_align}` and
+        // `LayoutStrategy::{is_sized, compute_size_and_align}`.
+        (
+            types,
+            "fn capped_tail_align(self, tail_align: Align) -> Align { \
+             match self.packed_align { \
+                 Some(packed_align) => tail_align.min(packed_align), \
+                 None => tail_align, \
+             } }",
+            "Some(packed_align) => tail_align.max(packed_align),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn tail_offset(self, tail_align: Align) -> Offset { \
+             let capped_tail_align = self.capped_tail_align(tail_align); \
+             let tail_offset = self.end.align_to(capped_tail_align); \
+             tail_offset }",
+            "let tail_offset = self.end;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align) -> (Size, Align) { \
+             let capped_tail_align = self.capped_tail_align(tail_align); \
+             let align = capped_tail_align.max(self.align); \
+             let tail_offset = self.tail_offset(tail_align); \
+             let end = tail_offset + tail_size; \
+             let size = end.align_to(align); \
+             (size, align) }",
+            "let align = capped_tail_align.min(self.align);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn is_sized(self) -> bool { \
+             matches!(self, LayoutStrategy::Sized(..)) }",
+            "matches!(self, LayoutStrategy::Tuple { .. })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "(LayoutStrategy::Tuple { head, tail }, Some(meta)) => { \
+             let (tail_size, tail_align) = tail.compute_size_and_align(Some(meta), vtables); \
+             head.full_size_and_align(tail_size, tail_align) }",
+            "head.head_size_and_align()",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `ThinPointer::{wrapping_offset, widen}`, `dereferenceable`, `signed_dereferenceable`.
+        (
+            ptr,
+            "pub fn wrapping_offset<T: Target>(self, offset: Int) -> Self { \
+             let addr = self.addr + offset; \
+             let addr = addr.bring_in_bounds(Unsigned, T::PTR_SIZE); \
+             ThinPointer { addr, ..self } }",
+            "let addr = addr.bring_in_bounds(Signed, T::PTR_SIZE);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            ptr,
+            "pub fn widen(self, metadata: Option<PointerMeta<Provenance>>) -> Pointer<Provenance> { \
+             Pointer { thin_pointer: self, metadata, } }",
+            "Pointer { thin_pointer: self, metadata: None, }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result { \
+             self.check_ptr(ptr, len)?; ret(()) }",
+            "self.check_ptr(ptr, Size::ZERO)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            iface,
+            "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int) -> Result { \
+             if len > 0 { \
+                 self.dereferenceable(ptr, Size::from_bytes(len).unwrap()) \
+             } else { \
+                 let begin_ptr = ThinPointer { addr: ptr.addr + len, ..ptr }; \
+                 self.dereferenceable(begin_ptr, Size::from_bytes(-len).unwrap()) \
+             } }",
+            "let begin_ptr = ThinPointer { addr: ptr.addr - len, ..ptr };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result { \
+             self.memory.signed_dereferenceable(ptr, len) }",
+            "self.memory.signed_dereferenceable(ptr, -len)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::{vtable_lookup, compute_size, compute_align}`.
+        (
+            mach,
+            "fn compute_size(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Size { \
+             let (size, _) = layout.compute_size_and_align(meta, self.vtable_lookup()); \
+             size }",
+            "let (_, size) = layout.compute_size_and_align(meta, self.vtable_lookup());",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn compute_align(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Align { \
+             let (_, align) = layout.compute_size_and_align(meta, self.vtable_lookup()); \
+             align }",
+            "let (align, _) = layout.compute_size_and_align(meta, self.vtable_lookup());",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::ptr_offset_inbounds` and `Machine::eval_place` (`PlaceExpr::Field`).
+        (
+            ops,
+            "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> Result<ThinPointer<M::Provenance>> { \
+             self.mem.signed_dereferenceable(ptr, offset)?; \
+             assert!(offset.in_bounds(Signed, M::T::PTR_SIZE)); \
+             assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE)); \
+             ret(ThinPointer { addr: ptr.addr + offset, ..ptr }) }",
+            "assert!(offset.in_bounds(Unsigned, M::T::PTR_SIZE));",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> { \
+             let (root, ty) = self.eval_place(root)?; \
+             let (offset, field_ty) = match ty { \
+                 Type::Tuple { sized_fields, unsized_field, sized_head_layout } => { \
+                     if field >= 0 && field < sized_fields.len() { \
+                         sized_fields[field] \
+                     } else if field == sized_fields.len() {",
+            "if field >= 0 && field <= sized_fields.len() { sized_fields[field] }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\"); \
+             let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata); \
+             let offset = sized_head_layout.tail_offset(tail_align); \
+             (offset, tail_ty)",
+            "let offset = Size::ZERO; (offset, tail_ty)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "Type::Union { fields, .. } => fields[field], \
+             _ => panic!(\"field projection on non-projectable type\"),",
+            "Type::Union { fields, .. } => panic!(\"field projection on non-projectable type\"),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)); \
+             let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;",
+            "let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, -offset.bytes())?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::eval_bin_op` for `BinOp::IntWithOverflow` and `Machine::eval_value` for `ValueExpr::Tuple`.
+        (
+            ops,
+            "let result = match op { \
+                 IntBinOpWithOverflow::Add => left + right, \
+                 IntBinOpWithOverflow::Sub => left - right, \
+                 IntBinOpWithOverflow::Mul => left * right, \
+             }; \
+             let overflow = !int_ty.can_represent(result); \
+             let result = int_ty.bring_in_bounds(result); \
+             let value = Value::Tuple(list![Value::Int::<M>(result), Value::Bool::<M>(overflow)]); \
+             let ty = int_ty.with_overflow::<M::T>(); \
+             ret((value, ty))",
+            "let overflow = int_ty.can_represent(result);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "fn eval_value(&mut self, ValueExpr::Tuple(exprs, ty): ValueExpr) -> Result<(Value<M>, Type)> { \
+             let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0); \
+             ret((Value::Tuple(vals), ty)) }",
+            "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.1);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `Tuple` layout, `ProjectionElem::Field`, `CheckedBinaryOp`, `AggregateKind::Tuple`.
+        (
+            min_ty,
+            "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>, span: rs::Span) -> Type { \
+             let size = translate_size(layout.size); \
+             let align = translate_align(layout.align.abi);",
+            "let size = translate_align(layout.align.abi);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "smir::ProjectionElem::Field(f, _ty) => { \
+             let indirected = GcCow::new(expr); \
+             PlaceExpr::Field { root: indirected, field: (*f).into() } }",
+            "PlaceExpr::Field { root: indirected, field: Int::ZERO }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "smir::Rvalue::CheckedBinaryOp(op, l, r) => { \
+             let l = GcCow::new(self.translate_operand_smir(l, span)); \
+             let r = GcCow::new(self.translate_operand_smir(r, span)); \
+             let op = match op { \
+                 smir::BinOp::Add => BinOp::IntWithOverflow(IntBinOpWithOverflow::Add), \
+                 smir::BinOp::Sub => BinOp::IntWithOverflow(IntBinOpWithOverflow::Sub), \
+                 smir::BinOp::Mul => BinOp::IntWithOverflow(IntBinOpWithOverflow::Mul), \
+                 x => panic!(\"CheckedBinaryOp {x:?} not supported.\"), \
+             }; \
+             ValueExpr::BinOp { operator: op, left: l, right: r } }",
+            "smir::BinOp::Sub => BinOp::IntWithOverflow(IntBinOpWithOverflow::Add),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "Type::Tuple { .. } | Type::Array { .. } => { \
+             let ops: List<_> = operands.iter().map(|x| self.translate_operand_smir(x, span)).collect(); \
+             ValueExpr::Tuple(ops, ty) }",
+            "Type::Tuple { .. } | Type::Array { .. } => { ValueExpr::Tuple(list![], ty) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::StatementKind::PlaceMention(place) => { \
+             let place = self.translate_place(place, span); \
+             Statement::PlaceMention(place) }",
+            "rs::StatementKind::PlaceMention(place) => { Statement::StorageLive(place) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 25, "expected 25 pinned MR-1.2 quotations");
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        let other = if *file == ops { types } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}
+
+/// The upstream items behind `MR-1.3`: arbitrary locals, `StorageLive`,
+/// `StorageDead`, `Statement::Deinit`, `ConcurrentMemory::deinit`,
+/// `ConcurrentMemory::allocate`, `BasicMemory::allocate`, `Allocation::overlaps`,
+/// `x86_64::valid_size`, `Machine::try_mutate_cur_frame`, `Operand::Move`,
+/// `initBlock` (`always_storage_live_locals`), and the predicate of the daemonic
+/// address choice (`pick`) in `BasicMemory::allocate`.
+#[test]
+fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let stmts = "spec/lang/step/statements.md";
+    let terms = "spec/lang/step/terminators.md";
+    let mach = "spec/lang/machine.md";
+    let basic = "spec/mem/basic.md";
+    let conc = "spec/mem/concurrent.md";
+    let target = "spec/prelude/target.md";
+    let wf = "spec/lang/well-formed.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let bb = "tooling/minimize/src/bb.rs";
+    let func = "tooling/minimize/src/function.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            target,
+            "fn valid_size(size: Size) -> bool { \
+             size.bytes().in_bounds(Signed, Self::PTR_SIZE) }",
+            "size.bytes().in_bounds(Unsigned, Self::PTR_SIZE)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "fn overlaps(self, other_addr: Address, other_size: Size) -> bool { \
+             let end_addr = self.addr + self.size().bytes(); \
+             let other_end_addr = other_addr + other_size.bytes(); \
+             if end_addr <= other_addr || other_end_addr <= self.addr { \
+                 self.addr == other_addr \
+             } else { true } }",
+            "if end_addr < other_addr || other_end_addr < self.addr { false }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "if !T::valid_size(size) { \
+                 throw_ub!(\"asking for a too large allocation\"); \
+             } .. \
+             let allocation = Allocation { \
+                 addr, align, kind, live: true, \
+                 data: list![AbstractByte::Uninit; size.bytes()], \
+                 extra: alloc_extra, \
+             }; \
+             let id = AllocId(self.allocations.len()); \
+             self.allocations.push(allocation); \
+             ret(ThinPointer { addr, provenance: Some((id, prov_extra)) })",
+            "live: false, data: list![AbstractByte::Uninit; size.bytes()],",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "let addr = pick(distr, |addr: Address| { .. \
+             if addr <= 0 { return false; } .. \
+             if !align.is_aligned(addr) { return false; } .. \
+             if !(addr+size.bytes()).in_bounds(Unsigned, T::PTR_SIZE) { return false; } .. \
+             if self.allocations.any(|a| a.live && a.overlaps(addr, size)) { return false; } .. \
+             true })?;",
+            "if self.allocations.any(|a| a.overlaps(addr, size)) { return false; }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "let Some((id, prov_extra)) = ptr.provenance else { \
+                 throw_ub!(\"deallocating invalid pointer\") \
+             }; \
+             let mut allocation = self.allocations[id.0]; \
+             if !allocation.live { throw_ub!(\"double-free\"); } \
+             if ptr.addr != allocation.addr { \
+                 throw_ub!(\"deallocating with pointer not to the beginning of its allocation\"); \
+             } \
+             if kind != allocation.kind { \
+                 throw_ub!(\"deallocating {:?} memory with {:?} deallocation operation\", allocation.kind, kind); \
+             } \
+             if size != allocation.size() { \
+                 throw_ub!(\"deallocating with incorrect size information\"); \
+             } \
+             if align != allocation.align { \
+                 throw_ub!(\"deallocating with incorrect alignment information\"); \
+             } \
+             handle_extra(&mut allocation.extra, prov_extra)?; \
+             allocation.live = false; \
+             self.allocations.set(id.0, allocation);",
+            "if !allocation.live { ret(()); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> NdResult<ThinPointer<M::Provenance>> { \
+             self.memory.allocate(kind, size, align) }",
+            "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> Result<ThinPointer<M::Provenance>>",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn deallocate(&mut self, ptr: ThinPointer<M::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result { \
+             self.memory.deallocate(ptr, kind, size, align) }",
+            "self.memory.deallocate(ptr, AllocationKind::Stack, size, align)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn try_mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>, &mut ConcurrentMemory<M>) -> NdResult<O>) -> NdResult<O> { \
+             self.threads.try_mutate_at(self.active_thread, |thread| thread.try_mutate_cur_frame(|frame| f(frame, &mut self.mem))) }",
+            "self.threads.mutate_at(self.active_thread, |thread| thread.cur_frame())",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn deinit(&mut self, ptr: ThinPointer<M::Provenance>, len: Size, align: Align) -> Result { \
+             self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::None)?; \
+             ret(()) }",
+            "self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::Atomic)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn eval_statement(&mut self, Statement::Deinit { place }: Statement) -> NdResult { \
+             let (p, ty) = self.eval_place(place)?; \
+             if !p.aligned { \
+                 throw_ub!(\"de-initializing a place based on a misaligned pointer\"); \
+             } \
+             self.mem.deinit(p.ptr.thin_pointer, ty.layout::<M::T>().expect_size(\"WF ensures deinits are sized\"), Align::ONE)?; \
+             ret(()) }",
+            "self.mem.deinit(p.ptr.thin_pointer, Size::ZERO, Align::ONE)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult { \
+             self.storage_dead(mem, local)?; \
+             let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\"); \
+             let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\"); \
+             let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?; \
+             self.locals.insert(local, ptr); \
+             ret(()) }",
+            "let ptr = mem.allocate(AllocationKind::Heap, pointee_size, pointee_align)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn storage_dead(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult { \
+             let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\"); \
+             let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\"); \
+             if let Some(ptr) = self.locals.remove(local) { \
+                 mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?; \
+             } \
+             ret(()) }",
+            "mem.deallocate(ptr, AllocationKind::Global, pointee_size, pointee_align)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn eval_statement(&mut self, Statement::StorageLive(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_live(mem, local) }) } \
+             fn eval_statement(&mut self, Statement::StorageDead(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_dead(mem, local) }) }",
+            "fn eval_statement(&mut self, Statement::StorageLive(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_dead(mem, local) }) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "while let Some(local) = frame.locals.keys().next() { \
+                 frame.storage_dead(&mut self.mem, local)?; \
+             }",
+            "while let Some(local) = frame.locals.keys().next() { \
+                 frame.storage_live(&mut self.mem, local)?; \
+             }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            rvalue,
+            "smir::Operand::Copy(place) => \
+             ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) }, \
+             smir::Operand::Move(place) => \
+             ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },",
+            "smir::Operand::Move(place) => ValueExpr::Tuple(list![], ty),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::StatementKind::StorageLive(local) => \
+             Statement::StorageLive(self.local_name_map[&local]), \
+             rs::StatementKind::StorageDead(local) => \
+             Statement::StorageDead(self.local_name_map[&local]),",
+            "rs::StatementKind::StorageLive(local) => Statement::StorageDead(self.local_name_map[&local]),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            func,
+            "for (id, local_name) in &self.local_name_map { \
+                 let local_decl = &self.body.local_decls[*id]; \
+                 let span = local_decl.source_info.span; \
+                 let ty = self.cx.translate_ty(local_decl.ty, span); \
+                 self.locals.insert(*local_name, ty); \
+             }",
+            "self.locals.remove(*local_name);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            func,
+            "for i in 1..=(self.body.arg_count) { \
+                 if Some(i) == spread_local_idx { .. } else { \
+                     args.push(LocalName(Name::from_internal(i as _))); \
+                 } \
+             } \
+             let free_argc = self.body.arg_count + 1; .. \
+             init_statements.extend(rs::always_storage_live_locals(&self.body).iter() \
+             .map(|loc| self.local_name_map[&loc]) \
+             .filter(|LocalName(i)| i.get_internal() as usize >= free_argc) \
+             .map(Statement::StorageLive),); .. \
+             self.blocks.insert(init_bb, init_blk); .. \
+             let ret = LocalName(Name::from_internal(0));",
+            ".filter(|LocalName(i)| i.get_internal() as usize < free_argc)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "let mut start_live: Set<LocalName> = Set::new(); \
+             for arg in self.args { \
+                 ensure_wf(self.locals.contains_key(arg), \"Function: argument local does not exist\")?; \
+                 if start_live.try_insert(arg).is_err() { \
+                     throw_ill_formed!(\"Function: two arguments refer to the same local\"); \
+                 }; \
+             } \
+             ensure_wf(self.locals.contains_key(self.ret), \"Function: return local does not exist\")?; \
+             if start_live.try_insert(self.ret).is_err() { \
+                 throw_ill_formed!(\"Function: return local is also used for an argument\"); \
+             };",
+            "ensure_wf(!self.locals.contains_key(self.ret), \"Function: return local does not exist\")?;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "Deinit { place } => { \
+                 let ty = place.check_wf::<T>(func.locals, prog)?; \
+                 ensure_wf(ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?; \
+             }",
+            "ensure_wf(!ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "StorageLive(local) => { \
+                 ensure_wf(func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?; \
+             }",
+            "StorageLive(local) => { \
+                 ensure_wf(!func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?; \
+             }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "StorageDead(local) => { \
+                 ensure_wf(func.locals.contains_key(local), \"Statement::StorageDead: invalid local variable\")?; \
+                 if local == func.ret || func.args.any(|arg_name| local == arg_name) { \
+                     throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\"); \
+                 } \
+             }",
+            "if local == func.ret && func.args.any(|arg_name| local == arg_name)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 22, "expected 22 pinned MR-1.3 quotations");
+
+    let mr13_files = [target, basic, conc, mach, stmts, terms, wf, rvalue, bb, func];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr13_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
+}
+
+#[test]
+fn mr_2_1_array_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/lang/types.md", "pub fn compute_size_and_align<Provenance>("),
+        ("spec/lang/machine.md", "fn compute_size(&self, layout: LayoutStrategy,"),
+        ("spec/lang/types.md", "Array { elem, count } => Sized("),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Array { elem, count }: Self,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Array { elem, count }: Self,"),
+        ("spec/lang/representation.md", "fn ensure_else_ub(b: bool, msg: &str) -> Result<()>"),
+        ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Array { elem, count }) =>"),
+        ("spec/mem/basic.md", "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size)"),
+        ("spec/mem/interface.md", "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int)"),
+        ("spec/mem/concurrent.md", "pub fn dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Size) -> Result"),
+        ("spec/mem/concurrent.md", "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result"),
+        ("spec/lang/step/operators.md", "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int)"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Index { root, index }: PlaceExpr"),
+        ("spec/lang/step/expressions.md", "offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),"),
+        ("spec/lang/step/expressions.md", "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);"),
+        ("spec/lang/step/expressions.md", "ValueExpr::Tuple(exprs, ty): ValueExpr"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-2.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        // Verify tamper sensitivity: mutating the quoted snippet must fail against `cited_file`.
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Array(ty, c) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Index(loc) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::ConstantIndex { .. }"),
+        ("tooling/minimize/src/rvalue.rs", "Type::Tuple { .. } | Type::Array { .. } =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Len(place) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Repeat(op, c) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Translate.lean missing MR-2.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+}
+
+#[test]
+fn mr_2_2_tuple_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/lang/types.md", "fn capped_tail_align(self, tail_align: Align) -> Align"),
+        ("spec/lang/types.md", "pub fn tail_offset(self, tail_align: Align) -> Offset"),
+        ("spec/lang/types.md", "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align)"),
+        ("spec/lang/types.md", "pub fn head_size_and_align(self) -> (Size, Align)"),
+        ("spec/lang/types.md", "pub fn is_sized(self) -> bool"),
+        ("spec/lang/types.md", "(LayoutStrategy::Tuple { head, tail }, Some(meta)) =>"),
+        ("spec/lang/machine.md", "fn compute_align(&self, layout: LayoutStrategy,"),
+        ("spec/lang/types.md", "Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {"),
+        ("spec/lang/types.md", "Slice { elem } => LayoutStrategy::Slice("),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Tuple { sized_fields,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Tuple { sized_fields,"),
+        ("spec/lang/representation.md", "let mut bytes = list![AbstractByte::Uninit; size.bytes()];"),
+        ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Tuple { sized_fields, unsized_field, .. }) =>"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Field { root, field }: PlaceExpr"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-2.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>"),
+        ("tooling/minimize/src/ty.rs", "fn translate_non_enum_adt("),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Tuple(..) =>"),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Adt(adt_def, sref) if adt_def.is_struct() =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Field(f, _ty) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Translate.lean missing MR-2.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+}
+
+/// Pins the MR-3.1 raw-pointer transcriptions: thin and wide pointer
+/// representation with provenance fragments, `check_ptr`, `AddrOf`, `Deref`,
+/// pointer arithmetic and comparison, and the integer-pointer cast
+/// intrinsics. Each needle must occur in an extracted block quote citing the
+/// given file, the quote must verify against that file, and a tampered
+/// variant must not.
+#[test]
+fn mr_3_1_pointer_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/prelude/target.md", "const PTR_ALIGN: Align = Align::from_bits_const(64).unwrap();"),
+        ("spec/lang/types.md", "pub fn usize_ty<T: Target>() -> Self"),
+        ("spec/lang/types.md", "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN),"),
+        ("spec/lang/types.md", "Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),"),
+        ("spec/lang/types.md", "LayoutStrategy::Tuple { tail, .. } => tail.meta_kind(),"),
+        ("spec/mem/pointer.md", "pub fn safe_pointee(self) -> Option<PointeeInfo>"),
+        ("spec/mem/pointer.md", "PtrType::Raw { meta_kind, .. } => meta_kind,"),
+        ("spec/mem/interface.md", "pub fn provenance_frag(self) -> Option<ProvenanceFrag<Provenance>>"),
+        ("spec/mem/interface.md", "fn retag_ptr("),
+        ("spec/lang/representation.md", "let provenance = bytes.fold_with_idx("),
+        ("spec/lang/representation.md", "fn decode_ptr<M: Memory>(bytes: List<AbstractByte<M::Provenance>>)"),
+        ("spec/lang/representation.md", "fn encode_ptr<M: Memory>(ptr: ThinPointer<M::Provenance>)"),
+        ("spec/lang/representation.md", "pub fn as_wide_pair<T: Target>(self) -> Option<Type>"),
+        ("spec/lang/representation.md", "fn decode_value<M: Memory>(self, value: Value<M>)"),
+        ("spec/lang/representation.md", "fn encode_as_value<M: Memory>(self, meta: Option<PointerMeta<M::Provenance>>)"),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Ptr(ptr_type): Self,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Ptr(ptr_type): Self, val: Value<M>)"),
+        ("spec/lang/representation.md", "fn check_ptr_metadata(&self, meta: Option<PointerMeta<M::Provenance>>, kind: PointerMetaKind)"),
+        ("spec/lang/representation.md", "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result"),
+        ("spec/lang/representation.md", "(Value::Ptr(ptr), Type::Ptr(ptr_ty)) => self.check_ptr(ptr, ptr_ty)?,"),
+        ("spec/lang/step/expressions.md", "Constant::PointerWithoutProvenance(addr) =>"),
+        ("spec/lang/step/expressions.md", "ValueExpr::AddrOf { target, ptr_ty }: ValueExpr"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Deref { operand, ty }: PlaceExpr"),
+        ("spec/lang/step/operators.md", "UnOp::GetThinPointer: UnOp"),
+        ("spec/lang/step/operators.md", "fn compare_ptr(left: Pointer<M::Provenance>, right: Pointer<M::Provenance>)"),
+        ("spec/lang/step/operators.md", "fn ptr_offset_wrapping(&self, ptr: ThinPointer<M::Provenance>, offset: Int)"),
+        ("spec/lang/step/operators.md", "BinOp::PtrOffset { inbounds }: BinOp,"),
+        ("spec/lang/step/operators.md", "BinOp::PtrOffsetFrom { inbounds, nonneg }: BinOp,"),
+        ("spec/lang/machine.md", "fn mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>) -> O) -> O"),
+        ("spec/mem/intptrcast.md", "pub fn expose(&mut self, ptr: ThinPointer<Provenance>)"),
+        ("spec/mem/intptrcast.md", "pub fn int2ptr(&self, addr: Int) -> NdResult<ThinPointer<Provenance>>"),
+        ("spec/lang/step/intrinsics.md", "IntrinsicOp::PointerExposeProvenance: IntrinsicOp,"),
+        ("spec/lang/step/intrinsics.md", "IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,"),
+        ("spec/lang/step/terminators.md", "Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-3.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::RawPtr(ty, _mutbl) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Deref =>"),
+        ("tooling/minimize/src/rvalue.rs", "(Offset, Type::Ptr(_)) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::AddressOf(_mutbl, place) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::CastKind::PtrToPtr =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::CastKind::Transmute"),
+        (
+            "tooling/minimize/src/bb.rs",
+            "rs::Rvalue::Cast(rs::CastKind::PointerExposeProvenance, operand, _) =>",
+        ),
+        (
+            "tooling/minimize/src/bb.rs",
+            "StatementResult::Intrinsic { intrinsic, destination, arguments } =>",
+        ),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Translate.lean missing MR-3.1 quotation `{needle}` cited to `{cited_file}`"
+                )
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    // Semantic tampers: plausible misreadings of the pointer semantics must not
+    // verify against the vendored specification.
+    let tampers: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "if let Some(frag) = byte.provenance_frag() && \
+             frag.position == idx || Some(frag.provenance) == acc",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr.in_bounds(Signed, M::T::PTR_SIZE), \
+             \"Value::Ptr: pointer out-of-bounds\")?;",
+        ),
+        (
+            "spec/lang/step/operators.md",
+            "let offset_ptr = if inbounds { self.ptr_offset_wrapping(left, right) }",
+        ),
+        ("spec/mem/intptrcast.md", "|p| !self.exposed.contains(p),"),
+        (
+            "spec/lang/step/expressions.md",
+            "let aligned = self.compute_align(ptr_type.layout::<M::T>(), ptr.metadata)",
+        ),
+    ];
+    for (cited_file, tampered) in tampers {
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{cited_file}`: {tampered}"
+        );
+    }
+}
+
+/// Every MR-3.2 reference, validation, and Tree Borrows `ReborrowSettings`
+/// definition in `Interp.lean` and `Translate.lean` carries a verbatim
+/// upstream quotation pinned to its vendored file, and mutating any of those
+/// quotations (or flipping key reference/permission invariants) fails
+/// verification.
+#[test]
+fn mr_3_2_reference_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr != 0, \"Value::Ptr: null safe pointer\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(align.is_aligned(ptr.thin_pointer.addr), \"Value::Ptr: unaligned safe pointer\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(pointee.inhabited, \"Value::Ptr: safe pointer to uninhabited type\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "\"Value::Ptr: non-dereferenceable safe pointer\"",
+        ),
+        (
+            "spec/lang/step/statements.md",
+            "Statement::Validate { place, fn_entry }: Statement",
+        ),
+        (
+            "spec/lang/step/statements.md",
+            "let val = self.mutate_cur_frame(|frame, mem| { mem.retag_ptr(&mut frame.extra, ptr, ptr_type, fn_entry, frame.func.implicit_writes, lookup) })?;",
+        ),
+        ("spec/mem/tree_borrows/tree.md", "fn yes(self) -> bool"),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "fn cells_to_freeze_mask(cells: List<(Offset, Size)>, size: Size) -> List<bool>",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "(UnsafeCellStrategy::Sized { cells }, LayoutStrategy::Sized(size, _align), ..)",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "mk_perm(PermissionUnprot::Frozen, PermissionProt::Frozen { had_local_read: false })",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "Permission::Prot(PermissionProt::Unique)",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "Some(ReborrowSettings { protected, inside, outside })",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Disabled => throw_ub!(\"Tree Borrows: local read of Disabled reference\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Frozen => throw_ub!(\"Tree Borrows: local write of Frozen reference\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "throw_ub!(\"Tree Borrows: local write to protected Reserved reference that had a foreign read\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "PermissionProt::Unique => (PermissionUnprot::Unique, Some(AccessKind::Write))",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine.md",
+            "fn matches_protector(&self, protected: Protected) -> bool",
+        ),
+        (
+            "spec/mem/tree_borrows/tree.md",
+            "fn contains_strong_protector_preventing_deallocation(&self) -> bool",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "assert!(child_node.permissions.all(|x| x.matches_protector(child_node.protected)));",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "throw_ub!(\"Tree Borrows: deallocating strongly protected allocation\")",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "self.reborrow(ptr.thin_pointer, perms, frame_extra)?.widen(ptr.metadata)",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "extra.protectors.try_map(|provenance| self.release_protector(provenance))?;",
+        ),
+        (
+            "spec/mem/concurrent.md",
+            "self.memory.retag_ptr(frame_extra, ptr, ptr_type, fn_entry, fn_implicit_writes, vtable_lookup)",
+        ),
+        (
+            "spec/mem/concurrent.md",
+            "self.memory.end_call(extra)",
+        ),
+        (
+            "spec/lang/representation.md",
+            "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result",
+        ),
+        (
+            "spec/lang/step/terminators.md",
+            "self.mem.end_call(frame.extra)?;",
+        ),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-3.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    // Per-definition check on `def checkPtrM` (a flat `interp_quotes` search
+    // alone would let monomorphic `checkPtr`'s doc comment mask a copy-pasted
+    // `fn check_ptr_metadata` quotation on polymorphic `checkPtrM`).
+    let before_check_ptr_m = interp_text
+        .split_once("\ndef checkPtrM ")
+        .expect("Interp.lean missing `def checkPtrM`")
+        .0;
+    let check_ptr_m_doc = &before_check_ptr_m[before_check_ptr_m
+        .rfind("/--")
+        .expect("`def checkPtrM` missing doc comment")..];
+    let check_ptr_m_quotes = extract_quotes(check_ptr_m_doc, &valid_paths).unwrap();
+    assert!(
+        check_ptr_m_quotes.iter().any(|q| {
+            q.cited_file == "spec/lang/representation.md"
+                && squash(&q.text).contains(&squash(
+                    "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result",
+                ))
+        }),
+        "`def checkPtrM` doc comment must quote `fn check_ptr(...)` from `spec/lang/representation.md`"
+    );
+    assert!(
+        !check_ptr_m_quotes
+            .iter()
+            .any(|q| squash(&q.text).contains(&squash("fn check_ptr_metadata("))),
+        "`def checkPtrM` doc comment must not quote `fn check_ptr_metadata`"
+    );
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn translate_mutbl_smir(mutbl: smir::Mutability) -> Mutability",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn pointee_info_of(&mut self, ty: rs::Ty<'tcx>, span: rs::Span) -> PointeeInfo",
+        ),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Ref(_, ty, mutbl) =>"),
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn cells_in_sized_ty(&mut self, ty: rs::Ty<'tcx>, span: rs::Span) -> Vec<(Offset, Size)>",
+        ),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Adt(adt_def, _) if adt_def.is_box() =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Ref(_, bkind, place) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Translate.lean missing MR-3.2 quotation `{needle}` cited to `{cited_file}`"
+                )
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let tampers: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr >= 0, \"Value::Ptr: null safe pointer\")?;",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "PtrType::Box { .. } => Protected::Strong,",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "mk_perm(PermissionUnprot::Cell, PermissionProt::Frozen { had_local_read: false })",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "smir::Mutability::Mut => Mutability::Immutable,",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Reserved => ret(PermissionUnprot::Frozen),",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "PermissionProt::Unique => (PermissionUnprot::Unique, Some(AccessKind::Read)),",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "permissions: list![Permission::Unprot(PermissionUnprot::Frozen); size.bytes()],",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "self.reborrow(ptr.thin_pointer, perms, frame_extra)?.widen(None)",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(!pointee.inhabited, \"Value::Ptr: safe pointer to uninhabited type\")?;",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "rs::TyKind::Adt(adt_def, _) if adt_def.is_unsafe_cell() => Vec::new(),",
+        ),
+    ];
+    for (cited_file, tampered) in tampers {
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{cited_file}`: {tampered}"
+        );
+    }
+}
+
+#[test]
+fn call_return_and_multi_fn_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let ptr = "spec/mem/pointer.md";
+    let types = "spec/lang/types.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let mach = "spec/lang/machine.md";
+    let terms = "spec/lang/step/terminators.md";
+    let bb = "tooling/minimize/src/bb.rs";
+    let prog = "tooling/minimize/src/program.rs";
+    let ty_rs = "tooling/minimize/src/ty.rs";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            ptr,
+            "pub fn meta_kind(self) -> PointerMetaKind { \
+                 match self { \
+                     PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => pointee.layout.meta_kind(), \
+                     PtrType::Raw { meta_kind, .. } => meta_kind, \
+                     PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::None, \
+                 } \
+             }",
+            "PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::ElementCount,",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN), \
+             Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN), .. \
+             Array { elem, count } => Sized( \
+                 elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count, \
+                 elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), \
+             ),",
+            "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(None)) }",
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(Some(0))) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> { \
+                 if let Value::Ptr(Pointer { thin_pointer: thin_ptr, metadata }) = ptr { \
+                     if metadata.is_some() { \
+                         throw_ub!(\"invalid pointer for function lookup\"); \
+                     }",
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Method> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn check_abi_compatibility( caller_ty: Type, callee_ty: Type, ) -> bool {",
+            "fn check_abi_compatibility( caller_ty: Type, callee_ty: Type, ) -> Result<bool> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn prepare_for_inplace_passing( &mut self, place: Place<M>, ty: Type, ) -> NdResult {",
+            "fn prepare_for_in_place_passing( &mut self, place: Place<M>, ty: Type, ) -> NdResult {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_argument( &mut self, val: ArgumentExpr, ) -> NdResult<(Value<M>, Type)> {",
+            "fn eval_argument( &mut self, val: ValueExpr, ) -> NdResult<(Value<M>, Type)> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn create_frame( \
+                 &mut self, \
+                 func: Function, \
+                 stack_pop_action: StackPopAction<M>, \
+                 caller_conv: CallingConvention, \
+                 caller_ret_ty: Type, \
+                 caller_args: List<(Value<M>, Type)>, \
+             ) -> NdResult<StackFrame<M>> {",
+            "fn create_frame( &mut self, func: Function, arg_vals: List<Place<M>>, ) -> NdResult<StackFrame<M>> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_call( \
+                 &mut self, \
+                 callee: Function, \
+                 caller_conv: CallingConvention, \
+                 arguments: List<(Value<M>, Type)>, \
+                 caller_ret: (Place<M>, Type), \
+                 next_block: Option<BbName>, \
+                 unwind_block: Option<BbName>, \
+             ) -> NdResult {",
+            "fn eval_call(&mut self, func: FnName, caller_conv: CallingConvention) -> NdResult {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Terminator",
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Statement",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block, .. } => {",
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block } => {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            prog,
+            "let entry_name = FnName(Name::from_internal(0)); \
+             self.fn_name_map.insert(entry_instance, entry_name);",
+            "let entry_name = FnName(Name::from_internal(1)); \
+             self.fn_name_map.insert(entry_instance, entry_name);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "match &x.node { \
+                 rs::Operand::Move(place) => \
+                     ArgumentExpr::InPlace(self.translate_place(&place, x.span)), \
+                 op => ArgumentExpr::ByValue(self.translate_operand(op, x.span)), \
+             }",
+            "rs::Operand::Move(place) => ArgumentExpr::ByValue(self.translate_place(&place, x.span)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::UnwindAction::Continue => { .. \
+                 let block_kind = BbKind::Cleanup; \
+                 let unwind_bb_name = self.fresh_bb_name(); \
+                 let unwind_bb = BasicBlock { \
+                     statements: list![], \
+                     terminator: Terminator::ResumeUnwind, \
+                     kind: block_kind, \
+                 };",
+            "rs::UnwindAction::Continue => { let block_kind = BbKind::Regular;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let unwind_block = Some(self.translate_unwind_action(unwind, bb)); .. \
+             build::fn_ptr(self.cx.get_fn_name(instance)) .. \
+             Terminator::Call { \
+                 callee, \
+                 calling_convention: conv, \
+                 arguments: args, \
+                 ret: self.translate_place(&destination, span), \
+                 next_block: target.as_ref().map(|t| self.bb_name_map[t]), \
+                 unwind_block, \
+             }",
+            "let unwind_block = None; Terminator::Call { callee,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "fn mk_start_fn(entry: u32) -> Function { \
+                 let b0_name = BbName(Name::from_internal(0)); \
+                 let b1_name = BbName(Name::from_internal(1)); \
+                 let b2_name = BbName(Name::from_internal(2)); \
+                 let l0_name = LocalName(Name::from_internal(0));",
+            "fn mk_start_fn(entry: u64) -> Function {",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "let number_of_fns = self.fn_name_map.len(); \
+             let start = FnName(Name::from_internal(number_of_fns as _)); \
+             self.functions.insert(start, mk_start_fn(0)); \
+             Program { \
+                 start, \
+                 functions: self.functions, \
+                 globals: self.globals, \
+                 vtables: self.vtables, \
+                 traits: self.traits, \
+             }",
+            "self.functions.insert(start, mk_start_fn(1));",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            ty_rs,
+            "pub fn translate_calling_convention(conv: rs::CanonAbi) -> CallingConvention { \
+                 match conv { \
+                     rs::CanonAbi::C => CallingConvention::C, \
+                     rs::CanonAbi::Rust => CallingConvention::Rust, \
+                     .. \
+                 } \
+             }",
+            "rs::CanonAbi::C => CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let abi = self \
+                 .cx \
+                 .tcx \
+                 .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = translate_calling_convention(abi.conv);",
+            ".fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = CallingConvention::Rust;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName { \
+                 let len = self.fn_name_map.len(); \
+                 *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _))) \
+             }",
+            "*self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(0)))",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 20, "expected 20 pinned MR-4.1 quotations");
+
+    let mr41_files = [ptr, types, exprs, mach, terms, bb, prog, ty_rs];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr41_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
+}
+
+#[test]
+fn intrinsic_and_assume_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let intr = "spec/lang/step/intrinsics.md";
+    let terms = "spec/lang/step/terminators.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let prelude = "spec/prelude/main.md";
+    let basic = "spec/mem/basic.md";
+    let intptr = "spec/mem/intptrcast.md";
+    let wf = "spec/lang/well-formed.md";
+    let bb = "tooling/minimize/src/bb.rs";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            intr,
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![]) }",
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![Value::Bool(true)]) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn unit_type() -> Type { \
+                 Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout { \
+                     end: Size::ZERO, align: Align::ONE, packed_align: None, \
+                 }, unsized_field: None } \
+             }",
+            "end: Size::ZERO, align: Align::ONE, packed_align: Some(Align::ONE),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "if !b { \
+                 throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); \
+             } \
+             ret(unit_value())",
+            "if b { throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_abort!(); \
+             }",
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_ub!(\"abort\"); \
+             }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn exit(&self) -> NdResult<!> { .. self.mem.leak_check()?; .. throw_machine_stop!(); }",
+            "fn exit(&self) -> NdResult<!> { throw_machine_stop!(); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "Value::Int(i) => write!(stream, \"{}\\n\", i).unwrap(), \
+             Value::Bool(b) => write!(stream, \"{}\\n\", b).unwrap(), \
+             _ => throw_ub!(\"unsupported value for printing\"),",
+            "Value::Int(i) => write!(stream, \"{}\", i).unwrap(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr))",
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr + 1))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator \
+             ) -> NdResult { \
+                 let (ret_place, ret_ty) = self.eval_place(ret_expr)?; \
+                 let arguments = arguments.try_map(|arg| self.eval_value(arg))?; \
+                 let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+                 self.place_store(ret_place, value, ret_ty)?;",
+            "let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+             self.place_store(ret_place, value, unit_type())?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "throw_ub!(\"return from an intrinsic where caller did not specify next block\");",
+            "throw_ub!(\"return from an intrinsic where callee did not specify next block\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr); \
+             ret((Place { ptr, aligned }, ty))",
+            "ret((Place { ptr, aligned: true }, ty))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            prelude,
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::Abort } }",
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::MachineStop } }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "match allocation.kind { .. Heap => throw_memory_leak!(), .. \
+                 Global | Function | Stack | VTable => {} \
+             }",
+            "Stack => throw_memory_leak!(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intptr,
+            "pub fn expose(&mut self, ptr: ThinPointer<Provenance>) { \
+                 if let Some(provenance) = ptr.provenance { .. \
+                     self.exposed.insert(provenance); \
+                 } \
+             }",
+            "if let Some(provenance) = ptr.provenance { self.exposed.remove(provenance);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "enum StatementResult { \
+                 Statement(Statement), \
+                 Intrinsic { intrinsic: IntrinsicOp, destination: PlaceExpr, arguments: List<ValueExpr> }, \
+             }",
+            "Intrinsic { intrinsic: IntrinsicOp, arguments: List<ValueExpr> },",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::Assume(op) => { \
+                 let op = self.translate_operand(op, span); .. \
+                 let destination = build::unit_place(); \
+                 return StatementResult::Intrinsic { \
+                     intrinsic: IntrinsicOp::Assume, \
+                     destination, \
+                     arguments: list![op], \
+                 }; \
+             }",
+            "return StatementResult::Intrinsic { \
+                 intrinsic: IntrinsicOp::Abort, \
+                 destination, \
+                 arguments: list![op], \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "StatementResult::Intrinsic { intrinsic, destination, arguments } => { .. \
+                 let next_bb = self.fresh_bb_name(); .. \
+                 let terminator = Terminator::Intrinsic { \
+                     intrinsic, \
+                     arguments, \
+                     ret: destination, \
+                     next_block: Some(next_bb), \
+                 };",
+            "let terminator = Terminator::Intrinsic { \
+                 intrinsic, \
+                 arguments, \
+                 ret: destination, \
+                 next_block: None, \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             for stmt in stmts.iter() { \
+                 cur_block_statements.push(stmt); \
+             }",
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             let cur_block =",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => \
+                 rs::span_bug!(span, \"NonDivergingIntrinsic not supported: {intrinsic:?}\"),",
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => StatementResult::Statement(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            intr,
+            "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> { \
+                 let PtrType::Ref { pointee, .. } = ptr_ty else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\"); \
+                 }; .. \
+                 let Some(data) = bytes.try_map(|byte| byte.data()) else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: byte is uninitialized\"); \
+                 };",
+            "let PtrType::Raw { .. } = ptr_ty else { \
+                 throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::RawEq: IntrinsicOp, .. \
+             if l_ty != r_ty { \
+                 throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\"); \
+             } .. \
+             let left_data = self.load_raw_data(left, l_ty)?; \
+             let right_data = self.load_raw_data(right, l_ty)?; \
+             ret(Value::Bool(left_data == right_data))",
+            "ret(Value::Bool(left_data != right_data))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "struct TerminatorResult { \
+                 stmts: List<Statement>, \
+                 terminator: Terminator, \
+             }",
+            "struct TerminatorResult { terminator: Terminator }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::raw_eq => \
+                 return TerminatorResult { \
+                     stmts: List::new(), \
+                     terminator: Terminator::Intrinsic { \
+                         intrinsic: IntrinsicOp::RawEq,",
+            "rs::sym::raw_eq => return TerminatorResult { stmts: List::new(), terminator: Terminator::Goto(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::ctpop => { .. \
+                 let val = build::count_ones(v); \
+                 let stmt = Statement::Assign { destination, source: val }; \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); .. \
+             } \
+             rs::sym::exact_div => { .. \
+                 let val = build::div_exact(l, r); \
+                 let stmt = Statement::Assign { destination, source: val };",
+            "rs::sym::ctpop => { let val = build::div_exact(v, v);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::cold_path => { .. \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); \
+                 return TerminatorResult { stmts: list![], terminator }; \
+             }",
+            "rs::sym::cold_path => { let terminator = build::abort();",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::abort => { \
+                 let terminator = build::abort(); \
+                 TerminatorResult { stmts: list![], terminator } \
+             }",
+            "rs::sym::abort => { let terminator = Terminator::Unreachable;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { \
+                 let Some(next_block) = self.blocks.get(next_block_name) else { \
+                     throw_ill_formed!(\"Terminator: next block does not exist\"); \
+                 }; \
+                 ensure_wf( \
+                     next_block.kind == expected_block_kind, \
+                     \"Terminator: next block has the wrong block kind\", \
+                 )?; \
+                 ret(()) \
+             }",
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { ret(()) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "fn check_unwind_block(self, current_block_kind: BbKind, unwind_block_name: BbName) -> Result<()> { \
+                 let expected_block_kinds = match current_block_kind { \
+                     BbKind::Regular => list![BbKind::Cleanup, BbKind::Catch], \
+                     BbKind::Cleanup | BbKind::Terminate => list![BbKind::Terminate], \
+                     BbKind::Catch => throw_ill_formed!(\"Terminator: unwinding is not allowed in a catch block\"), \
+                 };",
+            "BbKind::Regular => list![BbKind::Regular],",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "let Some(start) = self.functions.get(self.start) else { \
+                 throw_ill_formed!(\"Program: start function does not exist\"); \
+             }; \
+             ensure_wf(start.calling_convention == CallingConvention::C, \"Program: start function has invalid calling convention\")?; \
+             let ret_layout = start.locals[start.ret].layout::<T>(); \
+             ensure_wf( \
+                 ret_layout == LayoutStrategy::Sized(Size::ZERO, Align::ONE), \
+                 \"Program: start function return local has invalid layout\" \
+             )?; \
+             ensure_wf(start.args.is_empty(), \"Program: start function has arguments\")?;",
+            "ensure_wf(start.calling_convention == CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 28, "expected 28 pinned MR-4.2 quotations");
+
+    let mr42_files = [intr, terms, exprs, prelude, basic, intptr, wf, bb];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr42_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
 }
