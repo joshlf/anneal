@@ -26,7 +26,12 @@ open Trusted.Rustc.V2026_06_01.MirSemantics (tyByteSize tyByteSizeAndAlignAux
   evalPointerWithExposedProvenance exposeTargetBytes? isExposePtrSourceTy
   isExposeIntSourceTy isBadWithExposedTargetTy evalCastPtrToPtr isUnresolvedLayoutIdx
   layoutValidForAdt findArrayElemStrideAndAlign? decodeScalarLayoutBytesNoForge
-  decodeFieldsByLayoutIdxs)
+  decodeFieldsByLayoutIdxs encodeByLayoutIdxAux encodeUnionSlotsIntoBufAux
+  splitUnionTypedAndOverlay overlayRawAbstractByteVals encodeRawAbstractByteVals
+  mergeUnionTypedSlotsAux unionNonUnitNonZstTypedSlotCount unionLayoutFreeOccupiedSlotCount
+  layoutEntriesHaveNonZstFieldlessEnum0 unionTypedSlotsLackLayoutFreeImage appendValueList
+  unresolvedLayoutIdx decodeUnionBytesWithCountOpt finalizeUnionFieldsWithRawOverlayOpt
+  forceValueListOpt abstractByteListEq abstractByteEq replicateBool)
 open Anneal.BitValidity
 open Anneal.MirFuelFree
 
@@ -4976,7 +4981,9 @@ this section proves that the model *agrees* with `Trusted.MirSemantics.evalByteC
 where the two models diverge. Agreement covers every non-pointer scalar pair, every
 provenance-carrying pointer-to-pointer pair, `Int -> *T`, provenance-free pointer sources (mapped
 to `Trusted`'s provenance-less addresses `.scalar ⟨addr, 8⟩`), size mismatches, and partially
-overwritten pointer images (`trusted_vs_anneal_overwrite_provenance_no_forge_agreement`).
+overwritten pointer images (`trusted_vs_anneal_overwrite_provenance_no_forge_agreement`), including
+at the step level on `Copy` reads of union locals whose raw-byte overlay holds such an image
+(`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`, Section 8.2b).
 Divergences: `Trusted` is *stricter* on `Int -> &T` (every provenance-free reference image is
 `.ub`) and on provenance-carrying `Ptr -> Int` (`.ub`, whereas Anneal's opt-in policy strips the
 provenance); `Trusted` is *more permissive* on provenance-carrying null-offset references and on
@@ -7542,11 +7549,15 @@ theorem trusted_vs_anneal_overwrite_provenance_no_forge_agreement
 
 /-- Step-level `evalByteCast` / `evalRvalue (.cast .transmute ...)` provenance no-forge agreement
 under any single-byte overwrite: whenever an operand `op` of a resolved 8-byte source type `srcTy`
-(such as a union or byte-array source) encodes via `encodeByteCastSourceBytes` to the partially
-overwritten pointer image `tBytes`, `evalByteCast` at any thin raw-pointer target produces the
-provenance-less address `.scalar ⟨decodeCastIntBytes bytes, 8⟩` (the exact `Trusted` image of
-Anneal's `decodeCastVal .bits64 .rawPtr bytes`), and `evalByteCast` at any thin reference target
-returns `.ub`. -/
+encodes via `encodeByteCastSourceBytes` to the partially overwritten pointer image `tBytes`,
+`evalByteCast` at any thin raw-pointer target produces the provenance-less address
+`.scalar ⟨decodeCastIntBytes bytes, 8⟩` (the exact `Trusted` image of Anneal's
+`decodeCastVal .bits64 .rawPtr bytes`), and `evalByteCast` at any thin reference target returns
+`.ub`. Provenance-carrying images (`optAlloc = some a`) are realized by union sources holding the
+raw-byte overlay of the image (`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`, with a
+concrete instance after it); sources whose values have only `.scalar` leaves (e.g. well-typed
+`u64` / `[u8; 8]` values) encode only provenance-free bytes and so realize only the instances with
+`optAlloc = none` and `b.prov = none`. -/
 theorem trusted_evalByteCast_overwrite_provenance_no_forge_agreement
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -7783,6 +7794,368 @@ theorem trusted_vs_anneal_same_alloc_position_mismatch_divergence
     rw [List.length_map, hLenB]; rfl
   rw [trusted_decodeTypedValueFromBytes_rawPtr_eq, trusted_decodePtrBytesNoForge_thin_eq _ pt _ _
     h_thin, h_pw, hBeq, hProv, hUni]
+
+/-! ### 8.2b Union Raw-Byte Overlays Realize Every Overwritten Pointer Image
+
+`trusted_evalByteCast_overwrite_provenance_no_forge_agreement` assumes an operand whose
+`encodeByteCastSourceBytes` image is the partially overwritten pointer image. When `Trusted`
+materializes a `count`-field union value from a byte image `bytes` (`decodeUnionBytesWithCountOpt`,
+reached by `decodeTypedValueFromBytes` and hence by transmutes into the union), it produces
+`count` empty `.unit` slots followed by a raw-byte overlay slot whenever the empty slots do not
+reproduce `bytes` (`finalizeUnionFieldsWithRawOverlayOpt`;
+`trusted_decodeTypedValueFromBytes_union_map_toTrusted`), and `encodeByteCastSourceBytes`
+reproduces `bytes` from that value byte-for-byte, provenance included. Union sources therefore
+realize the hypothesis for every overwrite position and every provenance pattern, and the
+step-level no-forge agreement holds for `Copy` reads of such union locals with purely structural
+hypotheses (`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`). -/
+
+/-- The union `Value` that `Trusted` materializes for a `count`-field union whose storage holds the
+byte image `bytes` with every typed slot empty: `count` `.unit` placeholders followed by the
+raw-byte overlay slot `.aggregate 0 (encodeRawAbstractByteVals bytes)`
+(`trusted_decodeUnionBytesWithCountOpt_map_toTrusted`). -/
+def unionRawOverlayValue (count : Nat) (bytes : List AbstractByte) : Value :=
+  .aggregate 0
+    (appendValueList (replicateValue count .unit) [.aggregate 0 (encodeRawAbstractByteVals bytes)])
+
+/-- `splitUnionTypedAndOverlay` separates the empty typed slots of `unionRawOverlayValue` from its
+raw-byte overlay. -/
+theorem trusted_splitUnionTypedAndOverlay_units_overlay (rawVals : List Value) :
+    ∀ count : Nat,
+      splitUnionTypedAndOverlay count
+          (appendValueList (replicateValue count .unit) [.aggregate 0 rawVals]) =
+        some (replicateValue count .unit, some rawVals)
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, appendValueList, splitUnionTypedAndOverlay,
+      trusted_splitUnionTypedAndOverlay_units_overlay rawVals k]
+
+/-- Empty (`.unit`) typed union slots occupy no storage next to a raw-byte overlay. -/
+theorem trusted_unionNonUnitNonZstTypedSlotCount_units (layouts : LayoutTable) :
+    ∀ (count : Nat) (fls : List Nat),
+      unionNonUnitNonZstTypedSlotCount layouts count fls (replicateValue count .unit) = 0
+  | 0, _ => rfl
+  | k + 1, [] => trusted_unionNonUnitNonZstTypedSlotCount_units layouts k []
+  | k + 1, _ :: fls => trusted_unionNonUnitNonZstTypedSlotCount_units layouts k fls
+
+/-- Empty (`.unit`) typed union slots occupy no layout-free storage. -/
+theorem trusted_unionLayoutFreeOccupiedSlotCount_units (h : Bool) :
+    ∀ count : Nat, unionLayoutFreeOccupiedSlotCount h count (replicateValue count .unit) = 0
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, unionLayoutFreeOccupiedSlotCount,
+      trusted_unionLayoutFreeOccupiedSlotCount_units h k]
+
+/-- Merging empty (`.unit`) typed union slots leaves the storage image unchanged. -/
+theorem trusted_mergeUnionTypedSlotsAux_units (layouts : LayoutTable)
+    (encodeSlot : Nat → Value → Option (List AbstractByte)) (fallbackLayoutIdx : Nat)
+    (hasOverlay : Bool) (unionSize : Nat) :
+    ∀ (count : Nat) (fls : List Nat) (buf : List AbstractByte) (mask : List Bool),
+      mergeUnionTypedSlotsAux layouts encodeSlot fallbackLayoutIdx hasOverlay unionSize fls
+          (replicateValue count .unit) buf mask = some buf
+  | 0, _, _, _ => by simp only [replicateValue, mergeUnionTypedSlotsAux]
+  | k + 1, [], buf, mask => by
+    simp only [replicateValue, mergeUnionTypedSlotsAux,
+      trusted_mergeUnionTypedSlotsAux_units layouts encodeSlot fallbackLayoutIdx hasOverlay
+        unionSize k [] buf mask]
+  | k + 1, _ :: fls, buf, mask => by
+    simp only [replicateValue, mergeUnionTypedSlotsAux,
+      trusted_mergeUnionTypedSlotsAux_units layouts encodeSlot fallbackLayoutIdx hasOverlay
+        unionSize k fls buf mask]
+
+/-- The raw-byte overlay of the `Trusted` image of any Anneal `CastByte` list (whose provenance
+tags are canonical, `(allocId, allocId)`) reproduces that image exactly, provenance included, over
+any equally long buffer. -/
+theorem trusted_overlayRawAbstractByteVals_encodeRaw_map_toTrusted :
+    ∀ (cbs : List CastByte) (buf : List AbstractByte), buf.length = cbs.length →
+      overlayRawAbstractByteVals
+          (encodeRawAbstractByteVals (cbs.map CastByte.toTrustedAbstractByte)) buf =
+        some (cbs.map CastByte.toTrustedAbstractByte)
+  | [], buf, h => by
+    cases buf with
+    | nil => rfl
+    | cons _ _ => nomatch h
+  | _ :: _, [], h => by nomatch h
+  | ⟨data, prov⟩ :: rest, _ :: bufRest, h => by
+    have ih := trusted_overlayRawAbstractByteVals_encodeRaw_map_toTrusted rest bufRest
+      (by simpa using h)
+    cases prov with
+    | none =>
+      simp [CastByte.toTrustedAbstractByte, encodeRawAbstractByteVals, overlayRawAbstractByteVals, ih]
+    | some f =>
+      simp [CastByte.toTrustedAbstractByte, encodeRawAbstractByteVals, overlayRawAbstractByteVals, ih,
+        ProvenancePtr.tag]
+
+/-- `Trusted`'s byte encoder reproduces the image of `unionRawOverlayValue` over the `Trusted`
+image of any Anneal `CastByte` list at every inhabited `count`-field union layout of the same size. -/
+theorem trusted_encodeByLayoutIdxAux_unionRawOverlay_map_toTrusted
+    (layouts : LayoutTable) (uIdx : Nat) (uL : TypeLayout) (count : Nat) (cbs : List CastByte)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = cbs.length) :
+    encodeByLayoutIdxAux 8 layouts uIdx
+        (unionRawOverlayValue count (cbs.map CastByte.toTrustedAbstractByte)) =
+      some (cbs.map CastByte.toTrustedAbstractByte) := by
+  unfold unionRawOverlayValue encodeByLayoutIdxAux
+  rw [hLookup]
+  dsimp only
+  rw [hInhab]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  unfold encodeUnionSlotsIntoBufAux
+  rw [trusted_splitUnionTypedAndOverlay_units_overlay]
+  dsimp only
+  have hLenBuf : (replicateUninitBytes uL.size.bytes).length = cbs.length := by
+    rw [replicateUninitBytes_eq_replicate, List.length_replicate, hSz]
+  have hOv := trusted_overlayRawAbstractByteVals_encodeRaw_map_toTrusted cbs _ hLenBuf
+  have h20 : Nat.ble 2 0 = false := rfl
+  have h01 : Nat.ble 0 1 = true := rfl
+  cases hFL : uL.fieldLayouts with
+  | nil =>
+    simp only [trusted_unionLayoutFreeOccupiedSlotCount_units, h20, Bool.false_and,
+      trusted_unionNonUnitNonZstTypedSlotCount_units, h01, hOv, trusted_mergeUnionTypedSlotsAux_units]
+  | cons f fs =>
+    simp only [trusted_unionNonUnitNonZstTypedSlotCount_units, h01, hOv,
+      trusted_mergeUnionTypedSlotsAux_units]
+
+/-- `forceValueListOpt` is the identity on value lists (it only forces the list spine). -/
+theorem trusted_forceValueListOpt_eq : ∀ l : List Value, forceValueListOpt l = some l
+  | [] => rfl
+  | v :: vs => by simp only [forceValueListOpt, trusted_forceValueListOpt_eq vs]
+
+/-- `splitUnionTypedAndOverlay` on `count` empty typed slots without an overlay. -/
+theorem trusted_splitUnionTypedAndOverlay_units :
+    ∀ count : Nat,
+      splitUnionTypedAndOverlay count (replicateValue count .unit) =
+        some (replicateValue count .unit, none)
+  | 0 => rfl
+  | k + 1 => by
+    simp only [replicateValue, splitUnionTypedAndOverlay, trusted_splitUnionTypedAndOverlay_units k]
+
+/-- **`Trusted` materializes `unionRawOverlayValue`.** Decoding the `Trusted` image of any non-empty
+Anneal `CastByte` list (every byte initialized) at an inhabited `count`-field union layout of the
+same size yields exactly `unionRawOverlayValue count` of that image: the empty typed slots encode to
+all-`.uninit` storage, which differs from the image, so `finalizeUnionFieldsWithRawOverlayOpt`
+appends the raw-byte overlay. -/
+theorem trusted_decodeUnionBytesWithCountOpt_map_toTrusted
+    (layouts : LayoutTable) (uIdx : Nat) (uL : TypeLayout) (count : Nat) (cbs : List CastByte)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = cbs.length)
+    (hNe : cbs ≠ []) :
+    decodeUnionBytesWithCountOpt layouts uIdx count (cbs.map CastByte.toTrustedAbstractByte) =
+      some (unionRawOverlayValue count (cbs.map CastByte.toTrustedAbstractByte)) := by
+  have hEmpty :
+      encodeByLayoutIdxAux 8 layouts uIdx (.aggregate 0 (replicateValue count .unit)) =
+        some (replicateUninitBytes uL.size.bytes) := by
+    unfold encodeByLayoutIdxAux
+    rw [hLookup]
+    dsimp only
+    rw [hInhab]
+    dsimp only
+    rw [hFields]
+    dsimp only
+    unfold encodeUnionSlotsIntoBufAux
+    rw [trusted_splitUnionTypedAndOverlay_units]
+    dsimp only
+    have h20 : Nat.ble 2 0 = false := rfl
+    cases hFL : uL.fieldLayouts with
+    | nil =>
+      simp only [trusted_unionLayoutFreeOccupiedSlotCount_units, h20, Bool.false_and,
+        trusted_mergeUnionTypedSlotsAux_units]
+    | cons f fs =>
+      simp only [trusted_mergeUnionTypedSlotsAux_units]
+  have hNeq :
+      abstractByteListEq (replicateUninitBytes uL.size.bytes)
+        (cbs.map CastByte.toTrustedAbstractByte) = false := by
+    rw [hSz]
+    cases cbs with
+    | nil => exact absurd rfl hNe
+    | cons c cs => rfl
+  unfold decodeUnionBytesWithCountOpt finalizeUnionFieldsWithRawOverlayOpt
+  dsimp only
+  rw [hEmpty]
+  dsimp only
+  rw [hNeq]
+  dsimp only
+  simp only [trusted_forceValueListOpt_eq]
+  rfl
+
+/-- **Transmuting into a union materializes `unionRawOverlayValue`.** At an inhabited single-variant
+`count`-field union layout of size `cbs.length`, `decodeTypedValueFromBytes` (the decoder executed by
+`evalByteCast`) decodes the `Trusted` image of any non-empty Anneal `CastByte` list to
+`unionRawOverlayValue count` of that image, for every generic argument list `args`. -/
+theorem trusted_decodeTypedValueFromBytes_union_map_toTrusted
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (uIdx : Nat)
+    (uL : TypeLayout) (count : Nat) (cbs : List CastByte)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hVar : uL.variants = .single 0)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = cbs.length)
+    (hNe : cbs ≠ []) :
+    decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := uIdx }
+        (cbs.map CastByte.toTrustedAbstractByte) =
+      some (unionRawOverlayValue count (cbs.map CastByte.toTrustedAbstractByte)) := by
+  have hLen : Nat.beq (Trusted.Sequence.length (cbs.map CastByte.toTrustedAbstractByte))
+      uL.size.bytes = true := by
+    change Nat.beq (cbs.map CastByte.toTrustedAbstractByte).length uL.size.bytes = true
+    rw [List.length_map, hSz]
+    exact Nat.beq_refl _
+  unfold decodeTypedValueFromBytes
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hInhab, hLen, hVar, hFields]
+  exact trusted_decodeUnionBytesWithCountOpt_map_toTrusted layouts uIdx uL count cbs hLookup
+    hInhab hFields hSz hNe
+
+/-- `encodeByteCastSourceBytes` (the source encoder executed by `evalByteCast`) at an inhabited
+`count`-field union type reproduces the `Trusted` image of any Anneal `CastByte` list of the
+union's size from its `unionRawOverlayValue`, provenance included. -/
+theorem trusted_encodeByteCastSourceBytes_unionRawOverlay_map_toTrusted
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (uIdx : Nat)
+    (uL : TypeLayout) (count : Nat) (cbs : List CastByte)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = cbs.length) :
+    encodeByteCastSourceBytes layouts { kind := .adt defPath args, layoutIdx := uIdx }
+        (unionRawOverlayValue count (cbs.map CastByte.toTrustedAbstractByte)) =
+      some (cbs.map CastByte.toTrustedAbstractByte) := by
+  have hUnion : isUnionLayout layouts { kind := .adt defPath args, layoutIdx := uIdx } = true := by
+    unfold isUnionLayout
+    dsimp only
+    rw [hLookup]
+    rcases uL with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+    dsimp only at hFields
+    subst hFields
+    rfl
+  unfold encodeByteCastSourceBytes encodeTypedValueToBytes
+  dsimp only [normalizeCodecTy]
+  rw [hUnion]
+  dsimp only
+  rw [trusted_encodeByLayoutIdxAux_unionRawOverlay_map_toTrusted layouts uIdx uL count cbs hLookup
+    hInhab hFields hSz]
+
+/-- **Step-level no-forge agreement on union sources (all hypotheses structural).** Let local
+`loc` be declared at an inhabited 8-byte `count`-field union type `U` (resolved layout index) and
+hold `unionRawOverlayValue count` of the `Trusted` image of a stored Anneal pointer encoding
+`encodeCastBytes off 8 optAlloc` with any single byte `i` overwritten by `b`, where `b` is
+provenance-free or carries a fragment of a *foreign* allocation (the union value that `Trusted`
+itself materializes for such storage, `trusted_decodeTypedValueFromBytes_union_map_toTrusted`).
+Then for every caller `localDecls`, `Copy`-transmuting `loc` (`evalByteCast` and
+`evalRvalue (.cast .transmute ...)`) to any thin raw-pointer type yields the provenance-less address
+`.scalar ⟨decodeCastIntBytes bytes, 8⟩`, the exact `Trusted` image of Anneal's
+provenance-less `decodeCastVal .bits64 .rawPtr bytes`, and to any thin reference type is UB:
+`Trusted` never forges provenance out of the overwritten union storage. -/
+theorem trusted_evalByteCast_union_rawOverlay_no_forge_agreement
+    (locals : List LocalSlot) (loc : Local) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (decl : LocalDecl) (defPath : DefPath) (args : List RigidTy) (uIdx : Nat) (uL : TypeLayout)
+    (count : Nat) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (off : Nat) (optAlloc : Option Nat) (i : Nat) (b : CastByte)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_i : i < 8)
+    (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (hGet : Trusted.Sequence.get? locals loc = some (.init (unionRawOverlayValue count
+      (((encodeCastBytes off 8 optAlloc).set i b).map CastByte.toTrustedAbstractByte)))) :
+    let bytes := (encodeCastBytes off 8 optAlloc).set i b
+    let op : Operand := .copy ⟨loc, .nil⟩
+    decodeCastVal .bits64 .rawPtr bytes =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none) ∧
+    evalByteCast locals op { kind := .rawPtr m pt, layoutIdx := lIdx } mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals mem ∧
+    evalRvalue locals (.cast .transmute op { kind := .rawPtr m pt, layoutIdx := lIdx })
+        mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals mem ∧
+    evalByteCast locals op { kind := .ref m pt, layoutIdx := lIdx } mem localDecls layouts = ub ∧
+    evalRvalue locals (.cast .transmute op { kind := .ref m pt, layoutIdx := lIdx })
+        mem localDecls layouts = ub := by
+  intro bytes op
+  let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
+  have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
+  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) locals := by
+    unfold evalOperand
+    dsimp only [op]
+    rw [hGet]
+    rfl
+  have hTy : operandTy localDecls layouts op = some uTy := by
+    unfold operandTy placeTy
+    dsimp only [op]
+    rw [hDecl]
+    show resolveProjectedTy layouts decl.ty [] = some uTy
+    rw [hDeclTy]
+  have hResolve : resolveTyWithLocalDecls localDecls layouts uTy = uTy :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts uTy uL hUIdx hLookup
+  have hValidAdt : layoutValidForAdt uL = true := by
+    unfold layoutValidForAdt
+    rw [hFields]
+  have hSrcSz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts uTy) =
+      some 8 := by
+    rw [hResolve, trusted_tyByteSize_adt_of_lookup localDecls layouts defPath args uIdx uL hUIdx
+      hLookup hValidAdt, hSz]
+  have hEnc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls localDecls layouts uTy)
+      (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) =
+      some (bytes.map CastByte.toTrustedAbstractByte) := by
+    rw [hResolve]
+    exact trusted_encodeByteCastSourceBytes_unionRawOverlay_map_toTrusted layouts defPath args uIdx
+      uL count bytes hLookup hInhab hFields (by rw [hSz, hLenB])
+  have hStep := trusted_evalByteCast_overwrite_provenance_no_forge_agreement locals locals op mem
+    localDecls layouts uTy _ m pt lIdx off optAlloc i b h_pw h_thin h_i h_b hOp hTy hSrcSz hEnc
+  have hAnneal := (trusted_vs_anneal_overwrite_provenance_no_forge_agreement 15 layouts m pt lIdx
+    off optAlloc i b h_pw h_thin h_i h_b).1
+  exact ⟨hAnneal, hStep⟩
+
+/-- **Non-vacuity of `trusted_evalByteCast_union_rawOverlay_no_forge_agreement`.** On a 64-bit
+layout table whose entry `1` is an 8-byte two-field union `U`, let local `_0 : U` hold the raw
+overlay of a pointer into allocation `7` at address `0x1000` whose byte `1` was overwritten by the
+provenance-free byte `0xAB` (the remaining seven bytes still carry allocation `7`'s provenance; the
+image encodes the address `0xAB00`). Anneal's `decodeCastVal` strips the provenance; `Trusted`
+`Copy`-transmutes `_0` to `*const u8` as the provenance-less address `.scalar ⟨0xAB00, 8⟩`, the
+`Trusted` image of Anneal's result, and rejects the transmute to `&u8` as UB. -/
+example (mem : Memory) :
+    let uL : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .union 2,
+        variants := .single 0, isUninhabited := false }
+    let layouts : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := [uL, uL] }
+    let decls : List LocalDecl :=
+      [{ mutability := .mut, ty := { kind := .adt "U" [], layoutIdx := 1 }, debugName := .none }]
+    let bytes := (encodeCastBytes 0x1000 8 (some 7)).set 1 { data := 0xAB, prov := none }
+    let locals : List LocalSlot :=
+      [.init (unionRawOverlayValue 2 (bytes.map CastByte.toTrustedAbstractByte))]
+    decodeCastVal .bits64 .rawPtr bytes =
+      some (.ptr { allocId := 0, offsetBytes := 0xAB00 } none) ∧
+    evalRvalue locals
+        (.cast .transmute (.copy ⟨0, []⟩) { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+        mem decls layouts =
+      ok (.scalar ⟨0xAB00, 8⟩) locals mem ∧
+    evalRvalue locals
+        (.cast .transmute (.copy ⟨0, []⟩) { kind := .ref .not (.uint .u8), layoutIdx := 0 })
+        mem decls layouts =
+      ub := by
+  intro uL layouts decls bytes locals
+  have h := trusted_evalByteCast_union_rawOverlay_no_forge_agreement locals 0 mem decls layouts
+    _ "U" [] 1 uL 2 .not (.uint .u8) 0 0x1000 (some 7) 1 { data := 0xAB, prov := none }
+    rfl rfl (by decide) (Or.inl rfl) rfl rfl (by decide) rfl rfl rfl rfl rfl
+  have hInt : decodeCastIntBytes bytes = 0xAB00 := by decide
+  dsimp only at h
+  rw [hInt] at h
+  exact ⟨h.1, h.2.2.1, h.2.2.2.2⟩
 
 /-! ### 8.3 `zerocopy` Traits ↔ `evalTransmuteSameSize` & `Trusted.MirSemantics.evalByteCast` Soundness -/
 

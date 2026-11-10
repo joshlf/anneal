@@ -175,9 +175,11 @@ correspondence theorems of Sections 1 and 4 are built. This section
      (`projFieldBasesNonUnion`, `placeTouchesUnion_false_of_projFieldBasesNonUnion`,
      tracking nested struct field layouts through `certFieldTy` and array element
      layouts through `certElemTy`), with ready-made
-     corollaries for non-union struct/enum fields, tuple fields, two-level tuple
-     fields, and arbitrary-depth tuple field chains
-     (`placeTouchesUnion_nonUnion_adt_field_false`, `layoutIdxIsNonUnion_of_lookup`,
+     corollaries for non-union struct/enum fields, enum variant fields
+     (`(_l as Variant).i`), tuple fields, two-level tuple fields, and
+     arbitrary-depth tuple field chains
+     (`placeTouchesUnion_nonUnion_adt_field_false`,
+     `placeTouchesUnion_enum_downcast_field_false`, `layoutIdxIsNonUnion_of_lookup`,
      `placeTouchesUnion_tuple_field_false`,
      `placeTouchesUnion_tuple_nested_field_false`,
      `placeTouchesUnion_false_of_isTupleFieldChain` in Section 4).
@@ -977,6 +979,60 @@ theorem placeTouchesUnion_nonUnion_adt_field_false
   dsimp only [projFieldBasesNonUnion, tyIsNonUnionFieldBase, rigidTyIsAdt]
   rw [hNonUnion]
   exact hRest
+
+/-- **Enum variant field discharge**: MIR's `(_l as Variant).i` (a `.downcast` to any
+variant followed by a `.field` step) on a local declared as an ADT whose layout index
+resolves to a non-union `TypeLayout` (every enum layout, whose variants are recorded in
+`VariantsShape.multiple`), followed by any `projFieldBasesNonUnion`-certified tail
+(evaluated at the `certFieldTy`-resolved field type), never touches a union, for
+arbitrary `localDecls` / `layouts`. -/
+theorem placeTouchesUnion_enum_downcast_field_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
+    (variantName : Option String) (vIdx : VariantIdx) (i : FieldIdx)
+    (fieldTy : Ty) (rest : List ProjectionElem)
+    (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
+      .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hNonUnion : layoutIdxIsNonUnion layouts lIdx = true)
+    (hRest :
+      projFieldBasesNonUnion layouts
+        (certFieldTy layouts { kind := .adt defPath args, layoutIdx := lIdx } i fieldTy) rest =
+        true) :
+    placeTouchesUnion localDecls layouts
+        ⟨loc, .downcast variantName vIdx :: .field i fieldTy :: rest⟩ = false := by
+  apply placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc _ _ hTy
+  dsimp only [projFieldBasesNonUnion, tyIsNonUnionFieldBase, rigidTyIsAdt]
+  rw [hNonUnion]
+  exact hRest
+
+/-- Non-vacuity of `placeTouchesUnion_enum_downcast_field_false`: for an
+`Option<u32>`-shaped enum entry (index `1`, `VariantsShape.multiple` with a `u32`
+payload in variant `1`) next to a union entry (index `2`), the variant field
+`(_0 as Some).0` of the enum local `_0` is discharged by the lemma, while the same
+projection on the union local `_1` takes Trusted's union-aware path. -/
+example :
+    let enumL : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .arbitrary [⟨0⟩] [0],
+        variants := .multiple (.initialized (.int 32 false) ⟨0, 1⟩) 0
+          [.arbitrary [] [], .arbitrary [⟨4⟩] [0]],
+        isUninhabited := false }
+    let unionL : TypeLayout :=
+      { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .union 2, variants := .single 0, isUninhabited := false }
+    let layouts : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := [enumL, enumL, unionL] }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let decls : List LocalDecl :=
+      [{ mutability := .mut, ty := { kind := .adt "Option" [.uint .u32], layoutIdx := 1 },
+         debugName := .none },
+       { mutability := .mut, ty := { kind := .adt "U" [], layoutIdx := 2 },
+         debugName := .none }]
+    placeTouchesUnion decls layouts ⟨0, [.downcast (.some "Some") 1, .field 0 u32Ty]⟩ = false ∧
+    placeTouchesUnion decls layouts ⟨1, [.downcast (.some "Some") 1, .field 0 u32Ty]⟩ = true := by
+  intro enumL unionL layouts u32Ty decls
+  exact ⟨placeTouchesUnion_enum_downcast_field_false decls layouts 0 "Option" [.uint .u32] 1
+    (.some "Some") 1 0 u32Ty [] rfl rfl rfl, rfl⟩
 
 /-- Non-vacuity of the union side conditions: in a layout table holding a union
 entry (index `2`) next to a struct entry (index `1`), a nested outer struct
