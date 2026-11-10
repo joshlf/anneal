@@ -9,7 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::ir::{CastKind, Operand, PointerValue, Provenance, PtrWidth, ScalarTy, Ty};
+use crate::ir::{
+    AdtDef, AdtKind, CastKind, LayoutError, Mutability, Operand, PointerCoercionKind, PointerValue,
+    Provenance, PtrWidth, ScalarTy, Ty,
+};
 
 /// Policy governing pointer-to-integer reinterpretation in `CastKind::Transmute`.
 ///
@@ -86,6 +89,35 @@ pub enum CastLowerError {
     UnsupportedLayout {
         ty: Ty,
     },
+    /// Type contains an ill-formed [`AdtDef`] (see [`LayoutError::IllFormed`]).
+    IllFormedType {
+        ty: Ty,
+        reason: &'static str,
+    },
+}
+
+/// Maps a [`LayoutError`] of `ty` to the corresponding [`CastLowerError`].
+pub(crate) fn cast_lower_layout_error(ty: &Ty, err: LayoutError) -> CastLowerError {
+    match err {
+        LayoutError::TooLarge => CastLowerError::LayoutTooLarge { ty: ty.clone() },
+        LayoutError::Unspecified => CastLowerError::UnsupportedLayout { ty: ty.clone() },
+        LayoutError::IllFormed(reason) => CastLowerError::IllFormedType {
+            ty: ty.clone(),
+            reason,
+        },
+    }
+}
+
+/// Maps a [`LayoutError`] of `ty` to the corresponding [`CastEvalError`].
+pub(crate) fn cast_eval_layout_error(ty: &Ty, err: LayoutError) -> CastEvalError {
+    match err {
+        LayoutError::TooLarge => CastEvalError::LayoutTooLarge { ty: ty.clone() },
+        LayoutError::Unspecified => CastEvalError::UnsupportedLayout { ty: ty.clone() },
+        LayoutError::IllFormed(reason) => CastEvalError::IllFormedType {
+            ty: ty.clone(),
+            reason,
+        },
+    }
 }
 
 impl std::fmt::Display for CastLowerError {
@@ -125,6 +157,9 @@ impl std::fmt::Display for CastLowerError {
             }
             CastLowerError::UnsupportedLayout { ty } => {
                 write!(f, "type {ty:?} has no canonical byte layout for transmute")
+            }
+            CastLowerError::IllFormedType { ty, reason } => {
+                write!(f, "type {ty:?} is ill-formed: {reason}")
             }
         }
     }
@@ -183,6 +218,97 @@ pub enum LoweredCast {
         size_bytes: usize,
         exposes_provenance: bool,
     },
+    /// Subtyping coercion (`CastKind::Subtype`) between equal types; preserves the value.
+    Subtype {
+        src_ty: Ty,
+        target_ty: Ty,
+        operand: Operand,
+    },
+    /// Built-in pointer coercion (`CastKind::PointerCoercion`); preserves address and
+    /// provenance.
+    PointerCoercion {
+        coercion: PointerCoercionKind,
+        src_ty: Ty,
+        target_ty: Ty,
+        operand: Operand,
+    },
+}
+
+impl LoweredCast {
+    /// The cast's operand.
+    pub fn operand(&self) -> &Operand {
+        match self {
+            LoweredCast::PtrToInt { operand, .. }
+            | LoweredCast::IntToPtr { operand, .. }
+            | LoweredCast::IntToInt { operand, .. }
+            | LoweredCast::CharToInt { operand, .. }
+            | LoweredCast::PtrToPtr { operand, .. }
+            | LoweredCast::Transmute { operand, .. }
+            | LoweredCast::Subtype { operand, .. }
+            | LoweredCast::PointerCoercion { operand, .. } => operand,
+        }
+    }
+}
+
+/// Returns true if `src` is a subtype of `target` in Anneal's lifetime-free MIR types:
+/// recursively equal types (there is no variance to exploit).
+pub fn is_subtype_compatible(src: &Ty, target: &Ty) -> bool {
+    match (src, target) {
+        (Ty::RawPtr(s, sm), Ty::RawPtr(t, tm)) | (Ty::Ref(s, sm), Ty::Ref(t, tm)) => {
+            sm == tm && is_subtype_compatible(s, t)
+        }
+        (Ty::Array(s, sn), Ty::Array(t, tn)) => sn == tn && is_subtype_compatible(s, t),
+        (Ty::Tuple(s), Ty::Tuple(t)) => {
+            s.len() == t.len() && s.iter().zip(t).all(|(a, b)| is_subtype_compatible(a, b))
+        }
+        _ => src == target,
+    }
+}
+
+/// Lowers a `CastKind::PointerCoercion` (`MutToConstPointer`: `*mut T -> *const T`;
+/// `ArrayToPointer`: `*m [T; N] -> *m T` with the same mutability).
+fn lower_pointer_coercion(
+    coercion: PointerCoercionKind,
+    operand: &Operand,
+    src_ty: &Ty,
+    target_ty: &Ty,
+) -> Result<LoweredCast, CastLowerError> {
+    let Ty::RawPtr(src_pointee, src_mut) = src_ty else {
+        return Err(CastLowerError::InvalidSourceType {
+            expected: "raw pointer",
+            got: src_ty.clone(),
+        });
+    };
+    let Ty::RawPtr(target_pointee, target_mut) = target_ty else {
+        return Err(CastLowerError::InvalidTargetType {
+            expected: "raw pointer",
+            got: target_ty.clone(),
+        });
+    };
+    let valid = match coercion {
+        PointerCoercionKind::MutToConstPointer => {
+            *src_mut == Mutability::Mut
+                && *target_mut == Mutability::Not
+                && src_pointee == target_pointee
+        }
+        PointerCoercionKind::ArrayToPointer => {
+            src_mut == target_mut
+                && matches!(&**src_pointee, Ty::Array(elem, _) if elem == target_pointee)
+        }
+    };
+    if !valid {
+        return Err(CastLowerError::UnsupportedCast {
+            kind: CastKind::PointerCoercion(coercion),
+            src_ty: src_ty.clone(),
+            target_ty: target_ty.clone(),
+        });
+    }
+    Ok(LoweredCast::PointerCoercion {
+        coercion,
+        src_ty: src_ty.clone(),
+        target_ty: target_ty.clone(),
+        operand: operand.clone(),
+    })
 }
 
 /// Lowers a pointer-to-integer cast (`Rvalue::Cast(PointerExposeProvenance)`).
@@ -289,6 +415,36 @@ fn collect_pointer_offsets(
             true
         }
         Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never => true,
+        Ty::Adt(def) => {
+            // Canonical ADTs are the declaration-order concatenation of their (single-variant)
+            // fields; canonical explicit-tag enums carry no pointers (handled above).
+            let Some(fields) = canonical_untagged_fields(def) else {
+                return false;
+            };
+            let mut offset = base;
+            for field in fields {
+                if !collect_pointer_offsets(field, ptr_width, offset, out, budget) {
+                    return false;
+                }
+                offset += field.byte_size_for(ptr_width);
+            }
+            true
+        }
+    }
+}
+
+/// The fields whose declaration-order concatenation forms a canonical, untagged ADT's byte
+/// image: a struct's fields, a single-field union's field, or a tagless single-variant (or
+/// variant-less) enum's fields. `None` for explicit-tag enums, whose image depends on the tag.
+pub(crate) fn canonical_untagged_fields(def: &AdtDef) -> Option<&[Ty]> {
+    match &def.kind {
+        AdtKind::Struct { fields } => Some(fields),
+        AdtKind::Union { fields } => Some(&fields[..fields.len().min(1)]),
+        AdtKind::Enum {
+            tag_ty: None,
+            variants,
+        } if variants.len() <= 1 => Some(variants.first().map_or(&[][..], |v| &v.fields)),
+        AdtKind::Enum { .. } => None,
     }
 }
 
@@ -342,7 +498,9 @@ fn check_transmute_layouts(
 /// Checks, in order: the target (then source) is inhabited; both layouts are representable
 /// on the target ([`Ty::layout_size_for`]); the sizes match; non-scalar sides have canonical
 /// byte layouts ([`Ty::has_canonical_byte_layout`]); and `policy` permits every source
-/// pointer that does not land exactly on a target pointer.
+/// pointer that does not land exactly on a target pointer. Exact layouts are required on both
+/// sides, so a type with an unspecified layout (see [`crate::ir::AdtDef`]) is rejected with
+/// `UnsupportedLayout` and an ill-formed ADT with `IllFormedType`.
 pub fn lower_transmute(
     operand: &Operand,
     src_ty: &Ty,
@@ -350,12 +508,12 @@ pub fn lower_transmute(
     ptr_width: PtrWidth,
     policy: TransmutePolicy,
 ) -> Result<LoweredCast, CastLowerError> {
-    if !target_ty.is_inhabited() {
+    if !target_ty.is_inhabited_for(ptr_width) {
         return Err(CastLowerError::UninhabitedTarget {
             target_ty: target_ty.clone(),
         });
     }
-    if !src_ty.is_inhabited() {
+    if !src_ty.is_inhabited_for(ptr_width) {
         return Err(CastLowerError::InvalidSourceType {
             expected: "inhabited type",
             got: src_ty.clone(),
@@ -363,13 +521,13 @@ pub fn lower_transmute(
     }
 
     let src_bytes = src_ty
-        .layout_size_for(ptr_width)
-        .ok_or_else(|| CastLowerError::LayoutTooLarge { ty: src_ty.clone() })?;
+        .layout_for(ptr_width)
+        .map_err(|err| cast_lower_layout_error(src_ty, err))?
+        .size;
     let target_bytes = target_ty
-        .layout_size_for(ptr_width)
-        .ok_or_else(|| CastLowerError::LayoutTooLarge {
-            ty: target_ty.clone(),
-        })?;
+        .layout_for(ptr_width)
+        .map_err(|err| cast_lower_layout_error(target_ty, err))?
+        .size;
     if src_bytes != target_bytes {
         return Err(CastLowerError::SizeMismatchTransmute {
             src_ty: src_ty.clone(),
@@ -471,6 +629,23 @@ pub fn lower_cast_rvalue_with_ptr_width(
             })
         }
         CastKind::Transmute => lower_transmute(operand, src_ty, target_ty, ptr_width, policy),
+        CastKind::Subtype => {
+            if !is_subtype_compatible(src_ty, target_ty) {
+                return Err(CastLowerError::UnsupportedCast {
+                    kind,
+                    src_ty: src_ty.clone(),
+                    target_ty: target_ty.clone(),
+                });
+            }
+            Ok(LoweredCast::Subtype {
+                src_ty: src_ty.clone(),
+                target_ty: target_ty.clone(),
+                operand: operand.clone(),
+            })
+        }
+        CastKind::PointerCoercion(coercion) => {
+            lower_pointer_coercion(coercion, operand, src_ty, target_ty)
+        }
     }
 }
 
@@ -566,6 +741,11 @@ pub enum CastEvalError {
     UnsupportedLayout {
         ty: Ty,
     },
+    /// Type contains an ill-formed [`AdtDef`] (see [`LayoutError::IllFormed`]).
+    IllFormedType {
+        ty: Ty,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for CastEvalError {
@@ -601,6 +781,9 @@ impl std::fmt::Display for CastEvalError {
             }
             CastEvalError::UnsupportedLayout { ty } => {
                 write!(f, "type {ty:?} has no canonical byte layout for transmute")
+            }
+            CastEvalError::IllFormedType { ty, reason } => {
+                write!(f, "type {ty:?} is ill-formed: {reason}")
             }
         }
     }
@@ -735,7 +918,7 @@ fn normalize_bytes(
             let elem_size = elem.byte_size_for(ptr_width);
             if elem_size == 0 {
                 // Zero-sized elements occupy no bytes; inhabited ZST elements are always valid.
-                return if *count == 0 || elem.is_inhabited() {
+                return if *count == 0 || elem.is_inhabited_for(ptr_width) {
                     Ok(())
                 } else {
                     Err(CastEvalError::UninhabitedTarget {
@@ -760,7 +943,79 @@ fn normalize_bytes(
         Ty::Never => Err(CastEvalError::UninhabitedTarget {
             target_ty: Ty::Never,
         }),
+        Ty::Adt(def) => normalize_adt_bytes(bytes, ty, def, ptr_width, out),
     }
+}
+
+/// Decodes the scalar bit pattern (integer bits, or a pointer's address) of the canonical byte
+/// image `bytes` of the scalar type `ty`.
+pub(crate) fn decode_scalar_bits(bytes: &[AbstractByte], ty: &Ty) -> u128 {
+    if ty.is_any_ptr() {
+        u128::from(decode_ptr_bytes(bytes).addr)
+    } else {
+        decode_int_bytes(bytes)
+    }
+}
+
+/// [`normalize_bytes`] for a canonical `Ty::Adt` (`ty`, with definition `def`): walks the
+/// fields of the single (or tag-selected) variant in declaration order, rejects tags matching
+/// no variant, and enforces the struct's `scalar_valid_range`, all as
+/// `CastEvalError::InvalidBitPattern { target_ty: ty, bits }` naming the ADT.
+fn normalize_adt_bytes(
+    bytes: &[AbstractByte],
+    ty: &Ty,
+    def: &AdtDef,
+    ptr_width: PtrWidth,
+    out: &mut Vec<AbstractByte>,
+) -> Result<(), CastEvalError> {
+    let (start, fields) = match &def.kind {
+        AdtKind::Enum { variants, .. } if variants.is_empty() => {
+            return Err(CastEvalError::UninhabitedTarget {
+                target_ty: ty.clone(),
+            });
+        }
+        AdtKind::Enum {
+            tag_ty: Some(tag),
+            variants,
+        } => {
+            let tag_size = tag.size_bytes(ptr_width);
+            let tag_bits = decode_int_bytes(&bytes[..tag_size]);
+            let Some(variant_idx) = def.variant_index_of_discriminant(tag_bits, ptr_width) else {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: tag_bits,
+                });
+            };
+            out.extend(encode_int_bytes(tag_bits, tag_size));
+            (tag_size, variants[variant_idx].fields.as_slice())
+        }
+        _ => match canonical_untagged_fields(def) {
+            Some(fields) => (0, fields),
+            None => {
+                return Err(CastEvalError::UnsupportedLayout { ty: ty.clone() });
+            }
+        },
+    };
+    let scalar_field = def
+        .scalar_valid_range
+        .and_then(|_| def.scalar_field(ptr_width).map(|(idx, _)| idx));
+    let mut offset = start;
+    for (i, field) in fields.iter().enumerate() {
+        let size = field.byte_size_for(ptr_width);
+        let field_bytes = &bytes[offset..offset + size];
+        normalize_bytes(field_bytes, field, ptr_width, out)?;
+        if scalar_field == Some(i) {
+            let bits = decode_scalar_bits(field_bytes, field);
+            if !def.scalar_range_contains(bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits,
+                });
+            }
+        }
+        offset += size;
+    }
+    Ok(())
 }
 
 /// Evaluates a lowered `PtrToInt` cast on a concrete pointer value under `ptr_width`.
@@ -997,23 +1252,23 @@ pub fn eval_transmute(
     policy: TransmutePolicy,
     _tracker: &ExposedProvenanceTracker,
 ) -> Result<TransmuteValue, CastEvalError> {
-    if !target_ty.is_inhabited() {
+    if !target_ty.is_inhabited_for(ptr_width) {
         return Err(CastEvalError::UninhabitedTarget {
             target_ty: target_ty.clone(),
         });
     }
-    if !src_ty.is_inhabited() {
+    if !src_ty.is_inhabited_for(ptr_width) {
         return Err(CastEvalError::TypeMismatch("source type is uninhabited"));
     }
 
     let src_bytes = src_ty
-        .layout_size_for(ptr_width)
-        .ok_or_else(|| CastEvalError::LayoutTooLarge { ty: src_ty.clone() })?;
+        .layout_for(ptr_width)
+        .map_err(|err| cast_eval_layout_error(src_ty, err))?
+        .size;
     let target_bytes = target_ty
-        .layout_size_for(ptr_width)
-        .ok_or_else(|| CastEvalError::LayoutTooLarge {
-            ty: target_ty.clone(),
-        })?;
+        .layout_for(ptr_width)
+        .map_err(|err| cast_eval_layout_error(target_ty, err))?
+        .size;
     if src_bytes != target_bytes {
         return Err(CastEvalError::SizeMismatch {
             src_bytes,

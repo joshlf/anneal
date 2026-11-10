@@ -1,0 +1,5469 @@
+//! Episode 1 (`ws-mir-lower-adt-deinit-retag-terminators`) tests: first-class `Ty::Adt` layouts,
+//! `ScalarValidRange` niches, `OffsetOf`, `Discriminant`, transmutes, `Statement::{Deinit,
+//! Retag, CopyNonOverlapping}`, `Rvalue::{ShallowInitBox, WrapUnsafeBinder}`,
+//! `CastKind::{Subtype, PointerCoercion}`, and the `Terminator` CFG evaluator.
+//!
+//! Layout expectations marked "rustc" were observed with `size_of`/`align_of`/`offset_of!` on the
+//! workspace toolchain (`rustc 1.98.0-nightly`, `x86_64-unknown-linux-gnu`).
+
+use std::sync::Arc;
+
+use anneal_mir::ir::{
+    AdtDef, AdtKind, AdtRepr, AdtReprKind, AggregateKind, AssertMessage, BasicBlockData, BinOp,
+    Body, CastKind, Constant, IntTy, LayoutError, Local, Mutability, NullOp, Operand, Place,
+    PointerCoercionKind, PointerValue, ProjectionElem, PtrWidth, RetagKind, Rvalue, ScalarTy,
+    ScalarValidRange, Statement, SwitchTargets, Terminator, Ty, TyLayout, UintTy, UnwindAction,
+    VariantDef, width_mask,
+};
+use anneal_mir::lower::{
+    CallOutcome, CastEvalError, CastLowerError, CfgEvalError, CfgEvalOutcome,
+    ExposedProvenanceTracker, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredStatement,
+    LoweredTerminator, MirValue, PanicMessage, RvalueEvalError, RvalueLowerError,
+    StatementEvalState, TerminatorLowerError, TransmutePolicy, TransmuteValue, eval_cfg_in_state,
+    eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls, eval_lowered_rvalue_in_state,
+    eval_lowered_statement, eval_transmute, lower_body, lower_rvalue, lower_statement,
+    lower_terminator, resolve_offset_of, resolve_place_ty,
+};
+
+const PW: PtrWidth = PtrWidth::Bits64;
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+fn u8_ty() -> Ty {
+    Ty::Uint(UintTy::U8)
+}
+fn u16_ty() -> Ty {
+    Ty::Uint(UintTy::U16)
+}
+fn u32_ty() -> Ty {
+    Ty::Uint(UintTy::U32)
+}
+fn u64_ty() -> Ty {
+    Ty::Uint(UintTy::U64)
+}
+fn usize_ty() -> Ty {
+    Ty::Uint(UintTy::Usize)
+}
+fn i8_ty() -> Ty {
+    Ty::Int(IntTy::I8)
+}
+fn i16_ty() -> Ty {
+    Ty::Int(IntTy::I16)
+}
+fn uint(v: u128, ty: Ty) -> MirValue {
+    MirValue::Int { bits: v, ty }
+}
+fn u8v(v: u128) -> MirValue {
+    uint(v, u8_ty())
+}
+fn u16v(v: u128) -> MirValue {
+    uint(v, u16_ty())
+}
+fn u32v(v: u128) -> MirValue {
+    uint(v, u32_ty())
+}
+fn usizev(v: u128) -> MirValue {
+    uint(v, usize_ty())
+}
+fn cint(v: u128, ty: Ty) -> Operand {
+    Operand::Constant(Constant::Int(v, ty))
+}
+fn field(idx: usize, ty: Ty) -> ProjectionElem {
+    ProjectionElem::Field(idx, ty)
+}
+fn place(local: usize, projection: Vec<ProjectionElem>) -> Place {
+    Place::with_projection(local, projection)
+}
+fn local(l: usize) -> Place {
+    Place::from_local(l)
+}
+fn unit() -> Ty {
+    Ty::unit()
+}
+fn ref_ty(pointee: Ty) -> Ty {
+    Ty::Ref(Box::new(pointee), Mutability::Not)
+}
+fn raw(pointee: Ty, m: Mutability) -> Ty {
+    Ty::RawPtr(Box::new(pointee), m)
+}
+fn adt(def: AdtDef) -> (Arc<AdtDef>, Ty) {
+    let arc = Arc::new(def);
+    (arc.clone(), Ty::Adt(arc))
+}
+fn layout(ty: &Ty, pw: PtrWidth) -> TyLayout {
+    ty.layout_for(pw)
+        .unwrap_or_else(|e| panic!("layout of {ty:?}: {e:?}"))
+}
+fn offset(ty: &Ty, path: &[(usize, usize)]) -> Result<usize, RvalueLowerError> {
+    resolve_offset_of(ty, path, PW)
+}
+fn run(stmt: Statement, state: &mut StatementEvalState) -> Result<(), RvalueEvalError> {
+    let lowered = lower_statement(&stmt, &state.local_decls, state.ptr_width)
+        .unwrap_or_else(|e| panic!("lowering {stmt:?}: {e:?}"));
+    eval_lowered_statement(&lowered, state)
+}
+fn assign(p: Place, rv: Rvalue) -> Statement {
+    Statement::Assign(p, rv)
+}
+fn read(state: &StatementEvalState, p: &Place) -> Result<MirValue, RvalueEvalError> {
+    state.read_place(p)
+}
+fn discriminant(state: &mut StatementEvalState, p: Place) -> Result<MirValue, RvalueEvalError> {
+    let rv = lower_rvalue(
+        &Rvalue::Discriminant(p),
+        &state.local_decls,
+        state.ptr_width,
+    )
+    .unwrap();
+    eval_lowered_rvalue_in_state(&rv, state)
+}
+fn state_with(decls: Vec<Ty>, pw: PtrWidth) -> StatementEvalState {
+    StatementEvalState::from_local_decls(decls, pw)
+}
+
+/// `NonZeroU32` (`#[rustc_layout_scalar_valid_range_start(1)] struct(u32)`).
+fn non_zero_u32() -> (Arc<AdtDef>, Ty) {
+    adt(AdtDef::new_struct("NonZeroU32", vec![u32_ty()])
+        .with_repr(AdtRepr::transparent())
+        .with_scalar_valid_range(ScalarValidRange::non_zero(32)))
+}
+
+/// `#[repr(u8)] enum E { A(u8, u32), B(u16) }`.
+fn repr_u8_enum() -> (Arc<AdtDef>, Ty) {
+    adt(AdtDef::new_enum(
+        "ReprU8",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![u8_ty(), u32_ty()]),
+            VariantDef::new("B", vec![u16_ty()]),
+        ],
+    ))
+}
+
+/// `enum Opt { None, Some(u32) }` (tagless, multi-variant: unspecified layout).
+fn rust_option_u32() -> (Arc<AdtDef>, Ty) {
+    adt(AdtDef::new_enum(
+        "Opt",
+        None,
+        vec![
+            VariantDef::new("None", vec![]),
+            VariantDef::new("Some", vec![u32_ty()]),
+        ],
+    ))
+}
+
+// ---------------------------------------------------------------------------------------------
+// ScalarValidRange
+// ---------------------------------------------------------------------------------------------
+
+/// Brute-force model of `ScalarValidRange` membership.
+fn model_contains(start: u128, end: u128, bits: u128, width: u32) -> bool {
+    let mask = width_mask(width);
+    bits <= mask
+        && if start <= end {
+            start <= bits && bits <= end
+        } else {
+            bits >= start || bits <= end
+        }
+}
+
+#[test]
+fn test_scalar_valid_range_matches_brute_force_model_for_small_widths() {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for width in 1..=10u32 {
+        let mask = width_mask(width);
+        for _ in 0..60 {
+            // Bounds sometimes exceed the width to exercise clipping.
+            let start = u128::from(next()) % (mask + 4);
+            let end = u128::from(next()) % (mask + 4);
+            let range = ScalarValidRange::new(start, end);
+            let members: Vec<u128> = (0..=mask + 2)
+                .filter(|&b| model_contains(start, end, b, width))
+                .collect();
+            for bits in 0..=mask + 2 {
+                assert_eq!(
+                    range.contains(bits, width),
+                    model_contains(start, end, bits, width),
+                    "{range:?} contains {bits} at width {width}"
+                );
+            }
+            assert_eq!(
+                range.is_empty(width),
+                members.is_empty(),
+                "{range:?} empty @{width}"
+            );
+            assert_eq!(
+                range.is_full(width),
+                members.len() as u128 == mask + 1,
+                "{range:?} full @{width}"
+            );
+            let from_intervals: Vec<u128> = range
+                .intervals(width)
+                .iter()
+                .flat_map(|&(a, b)| a..=b)
+                .collect();
+            assert_eq!(from_intervals, members, "{range:?} intervals @{width}");
+            assert_eq!(range.is_wrapping(), start > end);
+        }
+    }
+}
+
+#[test]
+fn test_scalar_valid_range_full_width_128_and_non_zero_niches() {
+    // Width 128 must not evaluate `1u128 << 128`.
+    assert_eq!(width_mask(128), u128::MAX);
+    assert_eq!(width_mask(0), 0);
+    let full = ScalarValidRange::full(128);
+    assert!(full.contains(0, 128) && full.contains(u128::MAX, 128));
+    assert!(full.is_full(128) && !full.is_empty(128));
+    let nz128 = ScalarValidRange::non_zero(128);
+    assert!(!nz128.contains(0, 128));
+    assert!(nz128.contains(1, 128) && nz128.contains(u128::MAX, 128));
+    assert!(!nz128.is_full(128));
+    assert_eq!(nz128.intervals(128), vec![(1, u128::MAX)]);
+    let nz8 = ScalarValidRange::non_zero(8);
+    assert!(!nz8.contains(0, 8) && nz8.contains(255, 8) && !nz8.contains(256, 8));
+    // A wrapping range `250..=5` at width 8 holds 250..=255 and 0..=5, and always contains 0.
+    let wrap = ScalarValidRange::new(250, 5);
+    assert!(wrap.is_wrapping());
+    assert!(wrap.contains(0, 8) && wrap.contains(5, 8) && wrap.contains(250, 8));
+    assert!(!wrap.contains(6, 8) && !wrap.contains(249, 8));
+    assert_eq!(wrap.intervals(8), vec![(0, 5), (250, 255)]);
+    assert!(!wrap.is_empty(1));
+    // Wrapping `u128::MAX..=0` at width 128 contains exactly {0, MAX}.
+    let edge = ScalarValidRange::new(u128::MAX, 0);
+    assert!(edge.contains(0, 128) && edge.contains(u128::MAX, 128) && !edge.contains(1, 128));
+    // Non-wrapping ranges entirely above the width are empty; wrapping ones never are.
+    assert!(ScalarValidRange::new(300, 400).is_empty(8));
+    assert!(!ScalarValidRange::new(300, 5).is_empty(8));
+    // `start == end + 1` wraps around every value.
+    assert!(ScalarValidRange::new(100, 99).is_full(8));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ty::Adt layouts (checked against rustc)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_adt_layouts_match_rustc_repr_int_repr_c_int_transparent_unions() {
+    // #[repr(u8)] enum ReprU8 { A(u8, u32), B(u16) }: size 8, align 4, A.0=1, A.1=4, B.0=2.
+    let (_, repr_u8) = repr_u8_enum();
+    assert_eq!(layout(&repr_u8, PW), TyLayout { size: 8, align: 4 });
+    assert_eq!(offset(&repr_u8, &[(0, 0)]), Ok(1));
+    assert_eq!(offset(&repr_u8, &[(0, 1)]), Ok(4));
+    assert_eq!(offset(&repr_u8, &[(1, 0)]), Ok(2));
+
+    // #[repr(C, u8)] enum ReprCU8 { A(u8, u32), B(u16) }: size 12, align 4, A.0=4, A.1=8, B.0=4.
+    let (_, repr_c_u8) = adt(AdtDef::new_enum(
+        "ReprCU8",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![u8_ty(), u32_ty()]),
+            VariantDef::new("B", vec![u16_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert_eq!(layout(&repr_c_u8, PW), TyLayout { size: 12, align: 4 });
+    assert_eq!(offset(&repr_c_u8, &[(0, 0)]), Ok(4));
+    assert_eq!(offset(&repr_c_u8, &[(0, 1)]), Ok(8));
+    assert_eq!(offset(&repr_c_u8, &[(1, 0)]), Ok(4));
+
+    // #[repr(u16)] enum { A = 1, B = 7 }: size 2, align 2.
+    let (_, fieldless) = adt(AdtDef::new_enum(
+        "ReprU16Fieldless",
+        Some(ScalarTy::Uint(UintTy::U16)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(1),
+            VariantDef::new("B", vec![]).with_discriminant(7),
+        ],
+    ));
+    assert_eq!(layout(&fieldless, PW), TyLayout { size: 2, align: 2 });
+
+    // #[repr(transparent)] struct W2(u32, PhantomData<u8>): size 4, offsets 0 and 4.
+    let (_, w2) =
+        adt(AdtDef::new_struct("W2", vec![u32_ty(), unit()]).with_repr(AdtRepr::transparent()));
+    assert_eq!(layout(&w2, PW), TyLayout { size: 4, align: 4 });
+    assert_eq!(offset(&w2, &[(0, 0)]), Ok(0));
+    assert_eq!(offset(&w2, &[(0, 1)]), Ok(4));
+    // #[repr(transparent)] struct W(PhantomData<u8>, u32): the u32 is at 0, but rustc moves
+    // the leading 1-ZST to offset 4, so its offset fails closed instead of guessing.
+    let (_, w) =
+        adt(AdtDef::new_struct("W", vec![unit(), u32_ty()]).with_repr(AdtRepr::transparent()));
+    assert_eq!(offset(&w, &[(0, 1)]), Ok(0));
+    assert_eq!(
+        offset(&w, &[(0, 0)]),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(w.clone()))
+    );
+    // All-1-ZST transparent struct: size 0, every field at 0.
+    let (_, zst) =
+        adt(AdtDef::new_struct("Z", vec![unit(), unit()]).with_repr(AdtRepr::transparent()));
+    assert_eq!(layout(&zst, PW), TyLayout { size: 0, align: 1 });
+    assert_eq!(offset(&zst, &[(0, 1)]), Ok(0));
+
+    // struct S(u32, ()) => offsets 0, 4; struct S2((), u32) => reordered (unspecified).
+    let (_, s) = adt(AdtDef::new_struct("S", vec![u32_ty(), unit()]));
+    assert_eq!(offset(&s, &[(0, 1)]), Ok(4));
+    let (_, s2) = adt(AdtDef::new_struct("S2", vec![unit(), u32_ty()]));
+    assert_eq!(layout(&s2, PW), TyLayout { size: 4, align: 4 });
+    assert_eq!(
+        offset(&s2, &[(0, 1)]),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(s2.clone()))
+    );
+
+    // #[repr(C)] struct C1 { a: u8, b: u32, c: u16 }: size 12, offsets 0, 4, 8 (with padding).
+    let (_, c1) =
+        adt(AdtDef::new_struct("C1", vec![u8_ty(), u32_ty(), u16_ty()]).with_repr(AdtRepr::c()));
+    assert_eq!(layout(&c1, PW), TyLayout { size: 12, align: 4 });
+    assert_eq!(
+        (0..3)
+            .map(|i| offset(&c1, &[(0, i)]).unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 4, 8]
+    );
+    // #[repr(C, align(16))] struct C2 { a: u8 }: size 16, align 16.
+    let (_, c2) =
+        adt(AdtDef::new_struct("C2", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(16)));
+    assert_eq!(
+        layout(&c2, PW),
+        TyLayout {
+            size: 16,
+            align: 16
+        }
+    );
+    // #[repr(align(8))] struct RA(u8, u8): size 8, align 8.
+    let (_, ra) =
+        adt(AdtDef::new_struct("RA", vec![u8_ty(), u8_ty()])
+            .with_repr(AdtRepr::rust().with_align(8)));
+    assert_eq!(layout(&ra, PW), TyLayout { size: 8, align: 8 });
+    assert_eq!(offset(&ra, &[(0, 1)]), Ok(1));
+
+    // union U1 { a: u8, b: u32 }: size 4, align 4, every field at 0.
+    let (_, u1) = adt(AdtDef::new_union("U1", vec![u8_ty(), u32_ty()]));
+    assert_eq!(layout(&u1, PW), TyLayout { size: 4, align: 4 });
+    assert_eq!(offset(&u1, &[(0, 1)]), Ok(0));
+    // #[repr(C)] union U2 { a: [u8; 5], b: u32 }: size 8, align 4.
+    let (_, u2) = adt(
+        AdtDef::new_union("U2", vec![Ty::Array(Box::new(u8_ty()), 5), u32_ty()])
+            .with_repr(AdtRepr::c()),
+    );
+    assert_eq!(layout(&u2, PW), TyLayout { size: 8, align: 4 });
+    // #[repr(align(16))] union U3 { a: u8 }: size 16, align 16.
+    let (_, u3) =
+        adt(AdtDef::new_union("U3", vec![u8_ty()]).with_repr(AdtRepr::rust().with_align(16)));
+    assert_eq!(
+        layout(&u3, PW),
+        TyLayout {
+            size: 16,
+            align: 16
+        }
+    );
+
+    // enum Single { A = 5 }: size 0. enum SingleData { A(u32, u8) }: size 8 (offsets fail closed:
+    // the field tuple has tail padding, so its order is not canonical).
+    let (_, single) = adt(AdtDef::new_enum(
+        "Single",
+        None,
+        vec![VariantDef::new("A", vec![]).with_discriminant(5)],
+    ));
+    assert_eq!(layout(&single, PW), TyLayout { size: 0, align: 1 });
+    let (_, single_data) = adt(AdtDef::new_enum(
+        "SingleData",
+        None,
+        vec![VariantDef::new("A", vec![u32_ty(), u8_ty()])],
+    ));
+    assert_eq!(layout(&single_data, PW), TyLayout { size: 8, align: 4 });
+    assert_eq!(
+        offset(&single_data, &[(0, 1)]),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(
+            single_data.clone()
+        ))
+    );
+
+    // #[repr(u8)] enum { A(!), B }: size 1. enum Void {}: size 0, align 1.
+    let (_, uninhabited_variant) = adt(AdtDef::new_enum(
+        "ReprU8Uninhabited",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![Ty::Never]),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    assert_eq!(
+        layout(&uninhabited_variant, PW),
+        TyLayout { size: 1, align: 1 }
+    );
+    let (_, void) = adt(AdtDef::new_enum("Void", None, vec![]));
+    assert_eq!(layout(&void, PW), TyLayout { size: 0, align: 1 });
+
+    // #[repr(C, u16)] enum { A(u16), B(i16) }: size 4, A.0 = B.0 = 2.
+    let (_, c_u16_same) = adt(AdtDef::new_enum(
+        "ReprCU16Same",
+        Some(ScalarTy::Uint(UintTy::U16)),
+        vec![
+            VariantDef::new("A", vec![u16_ty()]),
+            VariantDef::new("B", vec![i16_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert_eq!(layout(&c_u16_same, PW), TyLayout { size: 4, align: 2 });
+    assert_eq!(offset(&c_u16_same, &[(1, 0)]), Ok(2));
+    // #[repr(u8)] enum { A(u8, u16) }: size 4, A.0 = 1, A.1 = 2.
+    let (_, pad) = adt(AdtDef::new_enum(
+        "ReprU8Pad",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![VariantDef::new("A", vec![u8_ty(), u16_ty()])],
+    ));
+    assert_eq!(layout(&pad, PW), TyLayout { size: 4, align: 2 });
+    assert_eq!(offset(&pad, &[(0, 1)]), Ok(2));
+    // #[repr(u32)] enum { A(u8), B(u64) }: size 16, align 8, A.0 = 4, B.0 = 8.
+    let (_, big) = adt(AdtDef::new_enum(
+        "ReprU32Big",
+        Some(ScalarTy::Uint(UintTy::U32)),
+        vec![
+            VariantDef::new("A", vec![u8_ty()]),
+            VariantDef::new("B", vec![u64_ty()]),
+        ],
+    ));
+    assert_eq!(layout(&big, PW), TyLayout { size: 16, align: 8 });
+    assert_eq!(offset(&big, &[(0, 0)]), Ok(4));
+    assert_eq!(offset(&big, &[(1, 0)]), Ok(8));
+    // #[repr(C, u8)] enum { A(u8), B(u64) }: size 16, align 8, A.0 = B.0 = 8.
+    let (_, c_big) = adt(AdtDef::new_enum(
+        "ReprCU8Big",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![u8_ty()]),
+            VariantDef::new("B", vec![u64_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert_eq!(layout(&c_big, PW), TyLayout { size: 16, align: 8 });
+    assert_eq!(offset(&c_big, &[(0, 0)]), Ok(8));
+
+    // Multi-variant tagless enums (repr(Rust) niche/tag optimization, repr(C)'s C `int`) have
+    // unspecified layouts: representable, but `size_of`/`align_of`/`offset_of!` fail closed.
+    let (_, opt) = rust_option_u32();
+    assert_eq!(opt.layout_for(PW), Err(LayoutError::Unspecified));
+    assert_eq!(opt.check_representable(PW), Ok(()));
+    assert_eq!(opt.layout_size_for(PW), None);
+    let (_, c_fieldless) = adt(AdtDef::new_enum(
+        "ReprCFieldless",
+        None,
+        vec![VariantDef::new("A", vec![]), VariantDef::new("B", vec![])],
+    )
+    .with_repr(AdtRepr::c()));
+    assert_eq!(c_fieldless.layout_for(PW), Err(LayoutError::Unspecified));
+    for op in [NullOp::SizeOf, NullOp::AlignOf] {
+        assert_eq!(
+            lower_rvalue(&Rvalue::NullaryOp(op, opt.clone()), &[], PW),
+            Err(RvalueLowerError::UnsupportedLayout(opt.clone()))
+        );
+    }
+    assert_eq!(
+        offset(&opt, &[(1, 0)]),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(opt.clone()))
+    );
+    // ... but locals of such types are fine, and alignment bounds bracket rustc's choice.
+    assert_eq!(opt.align_bounds(PW), Ok((4, 4)));
+}
+
+#[test]
+fn test_adt_layouts_depend_on_pointer_width() {
+    // #[repr(C)] struct { a: u8, p: *const u8 } is 16 bytes on 64-bit and 8 on 32-bit.
+    let (_, s) = adt(
+        AdtDef::new_struct("P", vec![u8_ty(), raw(u8_ty(), Mutability::Not)])
+            .with_repr(AdtRepr::c()),
+    );
+    assert_eq!(
+        layout(&s, PtrWidth::Bits64),
+        TyLayout { size: 16, align: 8 }
+    );
+    assert_eq!(layout(&s, PtrWidth::Bits32), TyLayout { size: 8, align: 4 });
+    assert_eq!(resolve_offset_of(&s, &[(0, 1)], PtrWidth::Bits32), Ok(4));
+    assert_eq!(resolve_offset_of(&s, &[(0, 1)], PtrWidth::Bits64), Ok(8));
+    // #[repr(isize)] enum discriminants must fit the target's isize.
+    let (_, wide) = adt(AdtDef::new_enum(
+        "Wide",
+        Some(ScalarTy::Int(IntTy::Isize)),
+        vec![VariantDef::new("A", vec![]).with_discriminant(1 << 40)],
+    ));
+    assert_eq!(
+        layout(&wide, PtrWidth::Bits64),
+        TyLayout { size: 8, align: 8 }
+    );
+    assert!(matches!(
+        wide.layout_for(PtrWidth::Bits32),
+        Err(LayoutError::IllFormed(_))
+    ));
+    // Sizes above the target's isize::MAX are too large, also inside ADTs.
+    let (_, huge) = adt(AdtDef::new_struct(
+        "Huge",
+        vec![Ty::Array(Box::new(u8_ty()), 0x8000_0000)],
+    ));
+    assert_eq!(
+        huge.layout_for(PtrWidth::Bits32),
+        Err(LayoutError::TooLarge)
+    );
+    assert_eq!(layout(&huge, PtrWidth::Bits64).size, 0x8000_0000);
+    let (_, huge_union) = adt(AdtDef::new_union(
+        "HugeU",
+        vec![Ty::Array(Box::new(u8_ty()), usize::MAX / 2), u16_ty()],
+    ));
+    assert_eq!(huge_union.layout_for(PW), Err(LayoutError::TooLarge));
+    assert_eq!(
+        huge_union.check_representable(PW),
+        Err(LayoutError::TooLarge)
+    );
+}
+
+#[test]
+fn test_ill_formed_adt_definitions_fail_closed() {
+    let ill = |def: AdtDef| {
+        let ty = Ty::adt(def);
+        let err = ty.layout_for(PW);
+        assert!(
+            matches!(err, Err(LayoutError::IllFormed(_))),
+            "{ty:?}: {err:?}"
+        );
+        // Lowering a body with such a local fails with InvalidAdtDef.
+        let body = Body {
+            local_decls: vec![ty.clone()],
+            basic_blocks: vec![],
+        };
+        assert!(matches!(
+            lower_body(&body, PW),
+            Err(RvalueLowerError::InvalidAdtDef { .. })
+        ));
+    };
+    // repr(align) must be a power of two.
+    ill(AdtDef::new_struct("A3", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(3)));
+    ill(AdtDef::new_struct("A0", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(0)));
+    // repr(transparent): at most one non-1-ZST field, ZST fields of align 1, no repr(align).
+    ill(AdtDef::new_struct("T2", vec![u32_ty(), u32_ty()]).with_repr(AdtRepr::transparent()));
+    ill(
+        AdtDef::new_struct("TZ", vec![u32_ty(), Ty::Array(Box::new(u64_ty()), 0)])
+            .with_repr(AdtRepr::transparent()),
+    );
+    ill(AdtDef::new_struct("TA", vec![u32_ty()]).with_repr(AdtRepr::transparent().with_align(8)));
+    ill(AdtDef::new_enum(
+        "TE",
+        None,
+        vec![VariantDef::new("A", vec![]), VariantDef::new("B", vec![])],
+    )
+    .with_repr(AdtRepr::transparent()));
+    ill(AdtDef::new_union("TU", vec![u32_ty(), u16_ty()]).with_repr(AdtRepr::transparent()));
+    // Enum tags must be integers; discriminants must fit, not overflow, and be distinct.
+    ill(AdtDef::new_enum(
+        "BoolTag",
+        Some(ScalarTy::Bool),
+        vec![VariantDef::new("A", vec![])],
+    ));
+    ill(AdtDef::new_enum(
+        "Overflow",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(255),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    ill(AdtDef::new_enum(
+        "SignedOverflow",
+        Some(ScalarTy::Int(IntTy::I8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(127),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    ill(AdtDef::new_enum(
+        "TooBig",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![VariantDef::new("A", vec![]).with_discriminant(256)],
+    ));
+    ill(AdtDef::new_enum(
+        "TooNegative",
+        Some(ScalarTy::Int(IntTy::I8)),
+        vec![VariantDef::new("A", vec![]).with_discriminant((-129i128) as u128)],
+    ));
+    ill(AdtDef::new_enum(
+        "Duplicate",
+        None,
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(1),
+            VariantDef::new("B", vec![]).with_discriminant(0),
+            VariantDef::new("C", vec![]),
+        ],
+    ));
+    // Unions need a field; scalar ranges need a single scalar field of a struct.
+    ill(AdtDef::new_union("Empty", vec![]));
+    ill(AdtDef::new_struct("Pair", vec![u8_ty(), u8_ty()])
+        .with_scalar_valid_range(ScalarValidRange::non_zero(8)));
+    ill(
+        AdtDef::new_struct("Arr", vec![Ty::Array(Box::new(u8_ty()), 1)])
+            .with_scalar_valid_range(ScalarValidRange::non_zero(8)),
+    );
+    ill(
+        AdtDef::new_enum("E", None, vec![VariantDef::new("A", vec![u8_ty()])])
+            .with_scalar_valid_range(ScalarValidRange::non_zero(8)),
+    );
+
+    // Signed discriminants given sign-extended are masked; sequential ones continue from them.
+    let (def, _) = adt(AdtDef::new_enum(
+        "ReprI8",
+        Some(ScalarTy::Int(IntTy::I8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(u128::MAX),
+            VariantDef::new("B", vec![]),
+            VariantDef::new("C", vec![]).with_discriminant(5),
+        ],
+    ));
+    assert_eq!(def.discriminants(PW), Ok(vec![0xFF, 0x00, 0x05]));
+    assert_eq!(def.discr_ty(), i8_ty());
+    assert_eq!(def.variant_index_of_discriminant(0xFF, PW), Some(0));
+    // ZST fields beside the scalar of a niche struct are fine (e.g. PhantomData).
+    let (_, nz_phantom) = adt(AdtDef::new_struct("NzP", vec![unit(), u32_ty()])
+        .with_repr(AdtRepr::transparent())
+        .with_scalar_valid_range(ScalarValidRange::non_zero(32)));
+    assert_eq!(layout(&nz_phantom, PW), TyLayout { size: 4, align: 4 });
+}
+
+/// Reference copy of the pre-ADT `Ty::layout_size_for` algorithm for non-ADT types.
+fn legacy_layout_size(ty: &Ty, pw: PtrWidth) -> Option<usize> {
+    let size = match ty {
+        Ty::Array(elem, count) => {
+            if (*count as u128) > pw.max_usize() {
+                return None;
+            }
+            legacy_layout_size(elem, pw)?.checked_mul(*count)?
+        }
+        Ty::Tuple(fields) => {
+            let mut unpadded = 0usize;
+            for f in fields {
+                unpadded = unpadded.checked_add(legacy_layout_size(f, pw)?)?;
+            }
+            unpadded.checked_next_multiple_of(ty.align_for(pw))?
+        }
+        _ => ty.byte_size_for(pw),
+    };
+    ((size as u128) <= pw.max_object_size()).then_some(size)
+}
+
+#[test]
+fn test_layout_engine_agrees_with_legacy_layout_for_non_adt_types() {
+    let mut seed = 0xfeed_beef_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    fn gen_ty(depth: u32, next: &mut dyn FnMut() -> u64) -> Ty {
+        let leaves = [
+            Ty::Bool,
+            Ty::Char,
+            Ty::Uint(UintTy::U8),
+            Ty::Int(IntTy::I16),
+            Ty::Uint(UintTy::U64),
+            Ty::Int(IntTy::Isize),
+            Ty::Uint(UintTy::U128),
+            Ty::Never,
+            Ty::RawPtr(Box::new(Ty::Bool), Mutability::Mut),
+        ];
+        if depth == 0 || next().is_multiple_of(3) {
+            return leaves[(next() % leaves.len() as u64) as usize].clone();
+        }
+        if next().is_multiple_of(2) {
+            let counts = [0usize, 1, 3, 1 << 20, usize::MAX / 4, usize::MAX];
+            Ty::Array(
+                Box::new(gen_ty(depth - 1, next)),
+                counts[(next() % 6) as usize],
+            )
+        } else {
+            let n = (next() % 4) as usize;
+            Ty::Tuple((0..n).map(|_| gen_ty(depth - 1, next)).collect())
+        }
+    }
+    for _ in 0..3000 {
+        let ty = gen_ty(4, &mut next);
+        for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+            assert_eq!(
+                ty.layout_size_for(pw),
+                legacy_layout_size(&ty, pw),
+                "{ty:?} @ {pw:?}"
+            );
+            if let Ok(l) = ty.layout_for(pw) {
+                assert_eq!(l.align, ty.align_for(pw));
+            }
+        }
+    }
+}
+
+/// Generates random small ADTs (and types containing them) for layout property checks.
+struct AdtGen {
+    seed: u64,
+}
+
+impl AdtGen {
+    fn next(&mut self) -> u64 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        self.seed
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn leaf(&mut self) -> Ty {
+        let leaves = [
+            u8_ty(),
+            u16_ty(),
+            u32_ty(),
+            u64_ty(),
+            Ty::Bool,
+            Ty::Char,
+            i8_ty(),
+            usize_ty(),
+            unit(),
+            Ty::Array(Box::new(u8_ty()), 3),
+            raw(u8_ty(), Mutability::Not),
+        ];
+        leaves[self.below(leaves.len() as u64) as usize].clone()
+    }
+    fn ty(&mut self, depth: u32) -> Ty {
+        if depth == 0 || self.below(3) == 0 {
+            return self.leaf();
+        }
+        match self.below(4) {
+            0 => {
+                let n = self.below(4) as usize;
+                Ty::Tuple((0..n).map(|_| self.ty(depth - 1)).collect())
+            }
+            _ => Ty::adt(self.adt(depth - 1)),
+        }
+    }
+    fn repr(&mut self) -> AdtRepr {
+        let kind = [AdtReprKind::Rust, AdtReprKind::C][self.below(2) as usize];
+        let align = [None, None, None, Some(2), Some(16)][self.below(5) as usize];
+        AdtRepr { kind, align }
+    }
+    fn adt(&mut self, depth: u32) -> AdtDef {
+        match self.below(3) {
+            0 => {
+                let n = self.below(4) as usize;
+                let fields = (0..n).map(|_| self.ty(depth)).collect();
+                AdtDef::new_struct("S", fields).with_repr(self.repr())
+            }
+            1 => {
+                let n = 1 + self.below(3) as usize;
+                let fields = (0..n).map(|_| self.ty(depth)).collect();
+                AdtDef::new_union("U", fields).with_repr(self.repr())
+            }
+            _ => {
+                let tags = [
+                    Some(ScalarTy::Uint(UintTy::U8)),
+                    Some(ScalarTy::Int(IntTy::I16)),
+                    Some(ScalarTy::Uint(UintTy::U32)),
+                    None,
+                ];
+                let tag = tags[self.below(4) as usize];
+                let n = if tag.is_none() {
+                    1
+                } else {
+                    1 + self.below(3) as usize
+                };
+                let variants = (0..n)
+                    .map(|v| {
+                        let m = self.below(3) as usize;
+                        VariantDef::new(format!("V{v}"), (0..m).map(|_| self.ty(depth)).collect())
+                    })
+                    .collect();
+                AdtDef::new_enum("E", tag, variants).with_repr(self.repr())
+            }
+        }
+    }
+}
+
+#[test]
+fn test_property_adt_field_offsets_are_in_bounds_aligned_and_non_overlapping() {
+    let mut g = AdtGen { seed: 0x5eed_0001 };
+    let mut checked = 0usize;
+    for _ in 0..4000 {
+        let def = Arc::new(g.adt(3));
+        let ty = Ty::Adt(def.clone());
+        for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+            let Ok(container) = ty.layout_for(pw) else {
+                continue;
+            };
+            assert!(container.align.is_power_of_two());
+            assert!(container.size.is_multiple_of(container.align), "{ty:?}");
+            for v in 0..def.variant_count() {
+                let fields = def.variant_fields(v).unwrap();
+                let mut spans = Vec::new();
+                for (i, field_ty) in fields.iter().enumerate() {
+                    let Ok(off) = def.field_offset(v, i, pw) else {
+                        continue;
+                    };
+                    let fl = field_ty.layout_for(pw).unwrap();
+                    assert!(off + fl.size <= container.size, "{ty:?} v{v}.{i} @ {pw:?}");
+                    assert!(off.is_multiple_of(fl.align), "{ty:?} v{v}.{i} @ {pw:?}");
+                    if def.is_union() {
+                        assert_eq!(off, 0);
+                    }
+                    if let AdtKind::Enum {
+                        tag_ty: Some(tag), ..
+                    } = &def.kind
+                    {
+                        assert!(off >= tag.size_bytes(pw), "{ty:?}: field overlaps the tag");
+                    }
+                    assert_eq!(resolve_offset_of(&ty, &[(v, i)], pw), Ok(off));
+                    spans.push((off, off + fl.size));
+                    checked += 1;
+                }
+                if !def.is_union() {
+                    spans.sort();
+                    for w in spans.windows(2) {
+                        assert!(w[0].1 <= w[1].0, "{ty:?}: overlapping fields {spans:?}");
+                    }
+                }
+            }
+            // A canonical layout is exactly the declaration-order concatenation of its fields.
+            if ty.has_canonical_byte_layout(pw)
+                && let AdtKind::Struct { fields } = &def.kind
+            {
+                let total: usize = fields.iter().map(|f| f.layout_for(pw).unwrap().size).sum();
+                assert_eq!(total, container.size, "{ty:?}");
+            }
+        }
+    }
+    assert!(checked > 2000, "only {checked} offsets checked");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Inhabitedness, niches, canonical layouts
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_adt_inhabitedness_niches_and_canonical_layouts() {
+    let (_, void) = adt(AdtDef::new_enum("Void", None, vec![]));
+    assert!(!void.is_inhabited());
+    let (_, s_never) = adt(AdtDef::new_struct("SN", vec![u32_ty(), Ty::Never]));
+    assert!(!s_never.is_inhabited());
+    // A union with an inhabited field is inhabited even if another field is `!`.
+    let (_, u_never) = adt(AdtDef::new_union("UN", vec![u32_ty(), Ty::Never]));
+    assert!(u_never.is_inhabited());
+    let (_, u_only_never) = adt(AdtDef::new_union("UON", vec![Ty::Never]));
+    assert!(!u_only_never.is_inhabited());
+    let (_, e_partial) = adt(AdtDef::new_enum(
+        "EP",
+        None,
+        vec![
+            VariantDef::new("A", vec![Ty::Never]),
+            VariantDef::new("B", vec![]),
+        ],
+    ));
+    assert!(e_partial.is_inhabited());
+    let (_, e_none) = adt(AdtDef::new_enum(
+        "EN",
+        None,
+        vec![VariantDef::new("A", vec![u8_ty(), Ty::Never])],
+    ));
+    assert!(!e_none.is_inhabited());
+    // Scalar valid ranges excluding every valid scalar bit pattern are uninhabited.
+    let niche = |field: Ty, range: ScalarValidRange| {
+        Ty::adt(AdtDef::new_struct("N", vec![field]).with_scalar_valid_range(range))
+    };
+    assert!(!niche(Ty::Bool, ScalarValidRange::new(2, 3)).is_inhabited());
+    assert!(niche(Ty::Bool, ScalarValidRange::new(1, 3)).is_inhabited());
+    assert!(!niche(Ty::Char, ScalarValidRange::new(0xD800, 0xDFFF)).is_inhabited());
+    assert!(!niche(ref_ty(u8_ty()), ScalarValidRange::new(0, 0)).is_inhabited());
+    assert!(!niche(u8_ty(), ScalarValidRange::new(300, 400)).is_inhabited());
+    assert!(niche(u8_ty(), ScalarValidRange::new(300, 4)).is_inhabited());
+    let (_, nz) = non_zero_u32();
+    assert!(nz.is_inhabited());
+    // Pointer-sized ranges are evaluated for the requested pointer width.
+    let high = niche(usize_ty(), ScalarValidRange::new(1 << 40, 1 << 41));
+    assert!(high.is_inhabited_for(PtrWidth::Bits64));
+    assert!(!high.is_inhabited_for(PtrWidth::Bits32));
+
+    // Niches: non-full valid ranges, enum tags with invalid values; unions expose none.
+    assert!(nz.contains_niche());
+    assert!(!niche(u32_ty(), ScalarValidRange::full(32)).contains_niche());
+    let (_, repr_u8) = repr_u8_enum();
+    assert!(repr_u8.contains_niche());
+    let (_, u1) = adt(AdtDef::new_union("U1", vec![Ty::Bool]));
+    assert!(!u1.contains_niche());
+    let (_, plain) = adt(AdtDef::new_struct("P", vec![u32_ty(), u16_ty()]));
+    assert!(!plain.contains_niche());
+    let (_, with_bool) = adt(AdtDef::new_struct("B", vec![u32_ty(), Ty::Bool]));
+    assert!(with_bool.contains_niche());
+    let full_u8_variants: Vec<VariantDef> = (0..256)
+        .map(|i| VariantDef::new(format!("V{i}"), vec![]))
+        .collect();
+    let (_, all_tags) = adt(AdtDef::new_enum(
+        "All",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        full_u8_variants,
+    ));
+    assert!(
+        !all_tags.contains_niche(),
+        "a u8 tag with 256 variants has no invalid value"
+    );
+
+    // Canonical byte layouts.
+    let canonical = |ty: &Ty| ty.has_canonical_byte_layout(PW);
+    assert!(canonical(&nz));
+    let (_, c_padded) =
+        adt(AdtDef::new_struct("CP", vec![u8_ty(), u32_ty()]).with_repr(AdtRepr::c()));
+    assert!(!canonical(&c_padded));
+    let (_, c_tight) =
+        adt(AdtDef::new_struct("CT", vec![u8_ty(), Ty::Bool, u16_ty()]).with_repr(AdtRepr::c()));
+    assert!(
+        canonical(&c_tight),
+        "repr(C) field order is fixed, so niches do not matter"
+    );
+    let (_, r_padded) = adt(AdtDef::new_struct("RP", vec![u8_ty(), u32_ty()]));
+    assert!(!canonical(&r_padded));
+    let (_, r_aligned) =
+        adt(AdtDef::new_struct("RA", vec![u32_ty()]).with_repr(AdtRepr::rust().with_align(8)));
+    assert!(!canonical(&r_aligned), "repr(align) tail padding");
+    let (_, transparent) = adt(AdtDef::new_struct(
+        "T",
+        vec![Ty::Tuple(vec![u16_ty(), u16_ty()]), unit()],
+    )
+    .with_repr(AdtRepr::transparent()));
+    assert!(canonical(&transparent));
+    let (_, u32_union) = adt(AdtDef::new_union("UU", vec![u32_ty()]));
+    assert!(canonical(&u32_union));
+    assert!(
+        !canonical(&u1),
+        "a union of bool has invalid-for-bool but valid-for-union bytes"
+    );
+    let (_, two_field_union) = adt(AdtDef::new_union(
+        "U2",
+        vec![u32_ty(), Ty::Array(Box::new(u8_ty()), 4)],
+    ));
+    assert!(!canonical(&two_field_union));
+    let (_, fieldless) = adt(AdtDef::new_enum(
+        "F",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(1),
+            VariantDef::new("B", vec![]).with_discriminant(7),
+        ],
+    ));
+    assert!(canonical(&fieldless));
+    assert!(!canonical(&repr_u8), "variant A has padding after its tag");
+    let (_, c_u16_same) = adt(AdtDef::new_enum(
+        "CS",
+        Some(ScalarTy::Uint(UintTy::U16)),
+        vec![
+            VariantDef::new("A", vec![u16_ty()]),
+            VariantDef::new("B", vec![i16_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert!(canonical(&c_u16_same));
+    let (_, ptr_enum) = adt(AdtDef::new_enum(
+        "PE",
+        Some(ScalarTy::Uint(UintTy::Usize)),
+        vec![
+            VariantDef::new("A", vec![raw(u8_ty(), Mutability::Not)]),
+            VariantDef::new("B", vec![usize_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert!(
+        !canonical(&ptr_enum),
+        "pointer positions would depend on the variant"
+    );
+    let (_, opt) = rust_option_u32();
+    assert!(!canonical(&opt));
+    // Tuples mixing niche ADTs with other fields are not canonical (rustc may move niches).
+    assert!(!canonical(&Ty::Tuple(vec![nz.clone(), u32_ty()])));
+    assert!(canonical(&Ty::Tuple(vec![nz.clone(), nz.clone()])));
+    assert!(canonical(&Ty::Tuple(vec![plain.clone(), plain.clone()])) == canonical(&plain));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Typed ADT values, aggregates, Discriminant, SetDiscriminant
+// ---------------------------------------------------------------------------------------------
+
+fn adt_aggregate(
+    def: &Arc<AdtDef>,
+    variant_idx: usize,
+    active_field: Option<usize>,
+    ops: Vec<Operand>,
+) -> Rvalue {
+    Rvalue::Aggregate(
+        AggregateKind::Adt {
+            def_path: def.def_path.clone(),
+            variant_idx,
+            active_field,
+            adt_def: Some(def.clone()),
+        },
+        ops,
+    )
+}
+
+#[test]
+fn test_typed_adt_values_report_ty_adt_and_aggregates_type_check_against_def() {
+    let (pair_def, pair_ty) = adt(AdtDef::new_struct("Pair", vec![u32_ty(), u8_ty()]));
+    let (repr_u8_def, repr_u8_ty) = repr_u8_enum();
+    let (union_def, union_ty) = adt(AdtDef::new_union("U", vec![u32_ty(), u16_ty()]));
+    let decls = vec![pair_ty.clone(), repr_u8_ty.clone(), union_ty.clone()];
+    let mut state = state_with(decls.clone(), PW);
+
+    run(
+        assign(
+            local(0),
+            adt_aggregate(
+                &pair_def,
+                0,
+                None,
+                vec![cint(7, u32_ty()), cint(9, u8_ty())],
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    let pair_val = state.get_init(Local(0)).unwrap().clone();
+    assert_eq!(pair_val, MirValue::adt(&pair_def, 0, vec![u32v(7), u8v(9)]));
+    assert_eq!(pair_val.ty(), pair_ty);
+    run(
+        assign(
+            local(1),
+            adt_aggregate(&repr_u8_def, 1, None, vec![cint(3, u16_ty())]),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(1)).unwrap().ty(), repr_u8_ty);
+    run(
+        assign(
+            local(2),
+            adt_aggregate(&union_def, 0, Some(1), vec![cint(5, u16_ty())]),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::union_value(&union_def, 1, u16v(5)))
+    );
+    // Legacy ADT values (no AdtDef) keep reporting the tuple of their fields.
+    let legacy = MirValue::Adt {
+        def_path: "L".into(),
+        variant_idx: 0,
+        active_field: None,
+        fields: vec![u32v(1)],
+        adt_def: None,
+    };
+    assert_eq!(legacy.ty(), Ty::Tuple(vec![u32_ty()]));
+
+    // Field reads/writes through typed places.
+    assert_eq!(read(&state, &place(0, vec![field(1, u8_ty())])), Ok(u8v(9)));
+    run(
+        assign(
+            place(0, vec![field(0, u32_ty())]),
+            Rvalue::Use(cint(11, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        read(&state, &local(0)),
+        Ok(MirValue::adt(&pair_def, 0, vec![u32v(11), u8v(9)]))
+    );
+    let b0 = place(1, vec![ProjectionElem::Downcast(1), field(0, u16_ty())]);
+    assert_eq!(read(&state, &b0), Ok(u16v(3)));
+    let a0 = place(1, vec![ProjectionElem::Downcast(0), field(0, u8_ty())]);
+    assert_eq!(
+        read(&state, &a0),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 0,
+            actual: 1
+        })
+    );
+    // Union: reading the inactive field is UB; writing a whole field switches it.
+    assert!(matches!(
+        read(&state, &place(2, vec![field(0, u32_ty())])),
+        Err(RvalueEvalError::InactiveUnionField { .. })
+    ));
+    run(
+        assign(
+            place(2, vec![field(0, u32_ty())]),
+            Rvalue::Use(cint(42, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::union_value(&union_def, 0, u32v(42)))
+    );
+
+    // Static place checks: `Field` on an enum needs `Downcast`; `Downcast` needs an enum and an
+    // in-range variant; struct field types must match.
+    for bad in [
+        place(1, vec![field(0, u8_ty())]),
+        place(1, vec![ProjectionElem::Downcast(2), field(0, u8_ty())]),
+        place(0, vec![ProjectionElem::Downcast(0), field(0, u32_ty())]),
+        place(0, vec![field(1, u32_ty())]),
+        place(2, vec![field(2, u32_ty())]),
+    ] {
+        assert!(
+            matches!(
+                resolve_place_ty(&bad, &decls),
+                Err(RvalueLowerError::InvalidProjection { .. })
+            ),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(resolve_place_ty(&a0, &decls), Ok(u8_ty()));
+
+    // Aggregate lowering checks operands against the definition.
+    let bad_aggs = [
+        adt_aggregate(&pair_def, 0, None, vec![cint(7, u32_ty())]),
+        adt_aggregate(
+            &pair_def,
+            0,
+            None,
+            vec![cint(7, u32_ty()), cint(9, u16_ty())],
+        ),
+        adt_aggregate(&pair_def, 1, None, vec![]),
+        adt_aggregate(&pair_def, 0, Some(0), vec![cint(7, u32_ty())]),
+        adt_aggregate(&union_def, 0, None, vec![cint(7, u32_ty())]),
+        adt_aggregate(&union_def, 0, Some(2), vec![cint(7, u32_ty())]),
+        adt_aggregate(&union_def, 0, Some(0), vec![cint(7, u16_ty())]),
+        adt_aggregate(&repr_u8_def, 2, None, vec![]),
+        Rvalue::Aggregate(
+            AggregateKind::Adt {
+                def_path: "Other".into(),
+                variant_idx: 0,
+                active_field: None,
+                adt_def: Some(pair_def.clone()),
+            },
+            vec![cint(7, u32_ty()), cint(9, u8_ty())],
+        ),
+    ];
+    for bad in bad_aggs {
+        assert!(
+            lower_rvalue(&bad, &decls, PW).is_err(),
+            "{bad:?} must not lower"
+        );
+    }
+    // Typed values do not match legacy tuple places (and vice versa).
+    let lowered = lower_statement(
+        &assign(
+            local(0),
+            Rvalue::Aggregate(
+                AggregateKind::Tuple,
+                vec![cint(7, u32_ty()), cint(9, u8_ty())],
+            ),
+        ),
+        &decls,
+        PW,
+    );
+    assert!(matches!(
+        lowered,
+        Err(RvalueLowerError::AssignmentTypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_discriminant_on_typed_enums_structs_unions_and_shells() {
+    // #[repr(i8)] enum { A = -1, B, C = 5 }: discriminants are i8 bit patterns.
+    let (i8_def, i8_enum) = adt(AdtDef::new_enum(
+        "ReprI8",
+        Some(ScalarTy::Int(IntTy::I8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant((-1i128) as u128),
+            VariantDef::new("B", vec![u32_ty()]),
+            VariantDef::new("C", vec![]).with_discriminant(5),
+        ],
+    ));
+    // enum { A, B = 10, C } with the default isize discriminant type.
+    let (isize_def, isize_enum) = adt(AdtDef::new_enum(
+        "Isize",
+        None,
+        vec![
+            VariantDef::new("A", vec![]),
+            VariantDef::new("B", vec![u8_ty()]).with_discriminant(10),
+            VariantDef::new("C", vec![]),
+        ],
+    ));
+    let (pair_def, pair_ty) = adt(AdtDef::new_struct("Pair", vec![u32_ty()]));
+    let (union_def, union_ty) = adt(AdtDef::new_union("U", vec![u32_ty()]));
+    let (single_def, single) = adt(AdtDef::new_enum(
+        "Single",
+        None,
+        vec![VariantDef::new("A", vec![u8_ty()]).with_discriminant(5)],
+    ));
+    let decls = vec![
+        i8_enum.clone(),
+        isize_enum.clone(),
+        pair_ty.clone(),
+        union_ty.clone(),
+        single.clone(),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+
+    // Lowered result types follow `rustc`'s discriminant_ty.
+    let lowered_ty = |p: Place| {
+        lower_rvalue(&Rvalue::Discriminant(p), &decls, PW)
+            .unwrap()
+            .ty()
+            .clone()
+    };
+    assert_eq!(lowered_ty(local(0)), i8_ty());
+    assert_eq!(lowered_ty(local(1)), Ty::Int(IntTy::Isize));
+    assert_eq!(lowered_ty(local(2)), u8_ty());
+    assert_eq!(lowered_ty(local(3)), u8_ty());
+    assert_eq!(lowered_ty(local(4)), Ty::Int(IntTy::Isize));
+
+    for (variant, ops, bits) in [
+        (0, vec![], 0xFF),
+        (1, vec![cint(1, u32_ty())], 0x00),
+        (2, vec![], 0x05),
+    ] {
+        run(
+            assign(local(0), adt_aggregate(&i8_def, variant, None, ops)),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(discriminant(&mut state, local(0)), Ok(uint(bits, i8_ty())));
+    }
+    for (variant, ops, value) in [
+        (0usize, vec![], 0i128),
+        (1, vec![cint(2, u8_ty())], 10),
+        (2, vec![], 11),
+    ] {
+        run(
+            assign(local(1), adt_aggregate(&isize_def, variant, None, ops)),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            discriminant(&mut state, local(1)),
+            Ok(MirValue::signed(value, IntTy::Isize, PW))
+        );
+    }
+    // Structs, unions, and tagless single-variant enums store no tag: the discriminant is a
+    // constant read without touching (possibly uninitialized) memory, but the local must be live.
+    assert_eq!(discriminant(&mut state, local(2)), Ok(u8v(0)));
+    assert_eq!(discriminant(&mut state, local(3)), Ok(u8v(0)));
+    assert_eq!(
+        discriminant(&mut state, local(4)),
+        Ok(MirValue::signed(5, IntTy::Isize, PW))
+    );
+    state.slots[2] = LocalSlotState::Dead;
+    assert_eq!(
+        discriminant(&mut state, local(2)),
+        Err(RvalueEvalError::DeadLocal(Local(2)))
+    );
+    // Initialized values report the same constants.
+    state.slots[2] = LocalSlotState::Init(MirValue::adt(&pair_def, 0, vec![u32v(1)]));
+    state.slots[3] = LocalSlotState::Init(MirValue::union_value(&union_def, 0, u32v(1)));
+    state.slots[4] = LocalSlotState::Init(MirValue::adt(&single_def, 0, vec![u8v(1)]));
+    assert_eq!(discriminant(&mut state, local(2)), Ok(u8v(0)));
+    assert_eq!(discriminant(&mut state, local(3)), Ok(u8v(0)));
+    assert_eq!(
+        discriminant(&mut state, local(4)),
+        Ok(MirValue::signed(5, IntTy::Isize, PW))
+    );
+
+    // A tagged enum shell answers Discriminant once its tag is written, not before.
+    let mut fresh = state_with(decls.clone(), PW);
+    let b0 = place(0, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]);
+    run(
+        assign(b0.clone(), Rvalue::Use(cint(9, u32_ty()))),
+        &mut fresh,
+    )
+    .unwrap();
+    assert!(matches!(
+        fresh.get_local(Local(0)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        discriminant(&mut fresh, local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    run(
+        Statement::SetDiscriminant {
+            place: local(0),
+            variant_index: 1,
+        },
+        &mut fresh,
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.get_init(Local(0)),
+        Some(&MirValue::adt(&i8_def, 1, vec![u32v(9)]))
+    );
+    assert_eq!(discriminant(&mut fresh, local(0)), Ok(uint(0, i8_ty())));
+}
+
+#[test]
+fn test_set_discriminant_writes_typed_enum_tags_like_minirust() {
+    let (def, enum_ty) = adt(AdtDef::new_enum(
+        "E",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![u32_ty(), u8_ty()]),
+            VariantDef::new("B", vec![]),
+            VariantDef::new("C", vec![Ty::Never]),
+        ],
+    ));
+    let (outer_def, outer_ty) =
+        adt(AdtDef::new_struct("Outer", vec![u16_ty(), enum_ty.clone()]).with_repr(AdtRepr::c()));
+    let decls = vec![
+        enum_ty.clone(),
+        outer_ty.clone(),
+        Ty::Tuple(vec![u16_ty(), enum_ty.clone()]),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let set = |p: Place, v: usize| Statement::SetDiscriminant {
+        place: p,
+        variant_index: v,
+    };
+
+    // On an uninitialized typed enum, SetDiscriminant writes the tag: a fieldless variant is
+    // then fully initialized, a data variant becomes a tagged shell.
+    run(set(local(0), 1), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&def, 1, vec![]))
+    );
+    state.slots[0] = LocalSlotState::Uninit;
+    run(set(local(0), 0), &mut state).unwrap();
+    let LocalSlotState::PartialShell(shell) = state.get_local(Local(0)).unwrap().clone() else {
+        panic!("expected a shell");
+    };
+    assert!(shell.discriminant_set && shell.variant_idx == 0 && shell.adt_def.is_some());
+    assert_eq!(discriminant(&mut state, local(0)), Ok(u8v(0)));
+    run(
+        assign(
+            place(0, vec![ProjectionElem::Downcast(0), field(0, u32_ty())]),
+            Rvalue::Use(cint(1, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            place(0, vec![ProjectionElem::Downcast(0), field(1, u8_ty())]),
+            Rvalue::Use(cint(2, u8_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&def, 0, vec![u32v(1), u8v(2)]))
+    );
+    // Same-variant SetDiscriminant is a no-op; switching variants leaves the new variant's
+    // fields uninitialized (the old variant's fields do not initialize them).
+    run(set(local(0), 0), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&def, 0, vec![u32v(1), u8v(2)]))
+    );
+    run(set(local(0), 1), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&def, 1, vec![]))
+    );
+    run(set(local(0), 0), &mut state).unwrap();
+    assert!(matches!(
+        state.get_local(Local(0)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        read(&state, &local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    // Writing the tag of an uninhabited variant is UB; out-of-range variants do not lower.
+    assert_eq!(
+        run(set(local(0), 2), &mut state),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 2 })
+    );
+    assert!(matches!(
+        lower_statement(&set(local(0), 3), &decls, PW),
+        Err(RvalueLowerError::InvalidVariantIndex {
+            variant_index: 3,
+            ..
+        })
+    ));
+
+    // Through a typed struct: an uninitialized container materializes shells.
+    let inner = place(1, vec![field(1, enum_ty.clone())]);
+    run(set(inner.clone(), 1), &mut state).unwrap();
+    run(
+        assign(
+            place(1, vec![field(0, u16_ty())]),
+            Rvalue::Use(cint(3, u16_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::adt(
+            &outer_def,
+            0,
+            vec![u16v(3), MirValue::adt(&def, 1, vec![])]
+        ))
+    );
+    // A variant switch nested in an initialized struct demotes the path to shells.
+    run(set(inner.clone(), 0), &mut state).unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        read(&state, &place(1, vec![field(0, u16_ty())])),
+        Ok(u16v(3))
+    );
+    assert_eq!(discriminant(&mut state, inner.clone()), Ok(u8v(0)));
+    // A failed SetDiscriminant leaves the state unchanged.
+    let before = state.clone();
+    assert!(run(set(inner.clone(), 2), &mut state).is_err());
+    assert_eq!(state, before);
+    // Legacy tuple containers keep the conservative rule: no tag write through Uninit.
+    assert_eq!(
+        run(
+            set(place(2, vec![field(1, enum_ty.clone())]), 1),
+            &mut state
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(2)))
+    );
+    // Structs only have variant 0 (a no-op).
+    run(set(local(1), 0), &mut state).unwrap();
+    assert!(lower_statement(&set(local(1), 1), &decls, PW).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// OffsetOf through nested ADTs, Transmute with niches and tags
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_offset_of_nested_adt_paths_and_errors() {
+    let (_, repr_u8) = repr_u8_enum();
+    let (_, inner) =
+        adt(AdtDef::new_struct("Inner", vec![u8_ty(), u64_ty()]).with_repr(AdtRepr::c()));
+    let (_, outer) = adt(AdtDef::new_struct(
+        "Outer",
+        vec![u32_ty(), inner.clone(), repr_u8.clone()],
+    )
+    .with_repr(AdtRepr::c()));
+    // Outer: u32 @0, Inner (align 8, size 16) @8, ReprU8 (align 4, size 8) @24; size 32.
+    assert_eq!(layout(&outer, PW), TyLayout { size: 32, align: 8 });
+    assert_eq!(offset(&outer, &[(0, 1), (0, 1)]), Ok(16));
+    assert_eq!(offset(&outer, &[(0, 2), (0, 1)]), Ok(28));
+    assert_eq!(offset(&outer, &[(0, 2), (1, 0)]), Ok(26));
+    // Mixed tuple/ADT paths.
+    let tup = Ty::Tuple(vec![inner.clone(), inner.clone()]);
+    assert!(tup.has_canonical_byte_layout(PW) == inner.has_canonical_byte_layout(PW));
+    // Errors: bad variant, bad field, struct with a non-zero variant, union field offsets.
+    let invalid = |ty: &Ty, v: usize, f: usize| RvalueLowerError::InvalidOffsetOfField {
+        container_ty: ty.clone(),
+        variant_idx: v,
+        field_idx: f,
+    };
+    assert_eq!(offset(&outer, &[(1, 0)]), Err(invalid(&outer, 1, 0)));
+    assert_eq!(offset(&outer, &[(0, 3)]), Err(invalid(&outer, 0, 3)));
+    assert_eq!(offset(&repr_u8, &[(2, 0)]), Err(invalid(&repr_u8, 2, 0)));
+    assert_eq!(offset(&repr_u8, &[(1, 1)]), Err(invalid(&repr_u8, 1, 1)));
+    assert_eq!(
+        offset(&outer, &[(0, 0), (0, 0)]),
+        Err(invalid(&u32_ty(), 0, 0))
+    );
+    // NullOp::OffsetOf lowers and evaluates to the same offsets.
+    let mut state = state_with(vec![usize_ty()], PW);
+    run(
+        assign(
+            local(0),
+            Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 2), (0, 1)]), outer.clone()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(0)), Some(&usizev(28)));
+    run(
+        assign(local(0), Rvalue::NullaryOp(NullOp::SizeOf, outer.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(0)), Some(&usizev(32)));
+    run(
+        assign(
+            local(0),
+            Rvalue::NullaryOp(NullOp::AlignOf, repr_u8.clone()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(0)), Some(&usizev(4)));
+}
+
+fn transmute(
+    state: &mut StatementEvalState,
+    dst: usize,
+    src: Operand,
+    target: Ty,
+) -> Result<(), RvalueEvalError> {
+    run(
+        assign(local(dst), Rvalue::Cast(CastKind::Transmute, src, target)),
+        state,
+    )
+}
+
+#[test]
+fn test_transmute_enforces_scalar_valid_ranges_and_enum_tags() {
+    let (nz_def, nz) = non_zero_u32();
+    let (nz128_def, nz128) = adt(
+        AdtDef::new_struct("NonZeroU128", vec![Ty::Uint(UintTy::U128)])
+            .with_scalar_valid_range(ScalarValidRange::non_zero(128)),
+    );
+    // A wrapping niche: u8 valid in 250..=255 or 0..=5.
+    let (wrap_def, wrap) = adt(AdtDef::new_struct("Wrap", vec![u8_ty()])
+        .with_scalar_valid_range(ScalarValidRange::new(250, 5)));
+    let (fieldless_def, fieldless) = adt(AdtDef::new_enum(
+        "F",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![]).with_discriminant(1),
+            VariantDef::new("B", vec![]).with_discriminant(7),
+        ],
+    ));
+    let (cs_def, cs) = adt(AdtDef::new_enum(
+        "CS",
+        Some(ScalarTy::Uint(UintTy::U16)),
+        vec![
+            VariantDef::new("A", vec![u16_ty()]),
+            VariantDef::new("B", vec![i16_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    let (cpair_def, cpair) =
+        adt(AdtDef::new_struct("CPair", vec![u16_ty(), u16_ty()]).with_repr(AdtRepr::c()));
+    let (u32_union_def, u32_union) = adt(AdtDef::new_union("UU", vec![u32_ty()]));
+    let (_, bool_union) = adt(AdtDef::new_union("UB", vec![Ty::Bool]));
+    let (_, opt) = rust_option_u32();
+    let decls = vec![
+        nz.clone(),
+        nz128.clone(),
+        wrap.clone(),
+        fieldless.clone(),
+        cs.clone(),
+        cpair.clone(),
+        u32_union.clone(),
+        u32_ty(),
+        Ty::Uint(UintTy::U128),
+        u8_ty(),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+
+    // `0u32 -> NonZeroU32` violates the niche: InvalidBitPattern naming the ADT.
+    assert_eq!(
+        transmute(&mut state, 0, cint(0, u32_ty()), nz.clone()),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz.clone(),
+                bits: 0
+            }
+        ))
+    );
+    transmute(&mut state, 0, cint(5, u32_ty()), nz.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&nz_def, 0, vec![u32v(5)]))
+    );
+    transmute(&mut state, 7, Operand::Copy(local(0)), u32_ty()).unwrap();
+    assert_eq!(state.get_init(Local(7)), Some(&u32v(5)));
+    // The public cast-level API agrees.
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Scalar(0),
+            &u32_ty(),
+            &nz,
+            PW,
+            TransmutePolicy::RejectPtrToInt,
+            &ExposedProvenanceTracker::new()
+        ),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: nz.clone(),
+            bits: 0
+        })
+    );
+    // 128-bit niches.
+    assert!(
+        transmute(
+            &mut state,
+            1,
+            cint(0, Ty::Uint(UintTy::U128)),
+            nz128.clone()
+        )
+        .is_err()
+    );
+    transmute(
+        &mut state,
+        1,
+        cint(u128::MAX, Ty::Uint(UintTy::U128)),
+        nz128.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::adt(
+            &nz128_def,
+            0,
+            vec![uint(u128::MAX, Ty::Uint(UintTy::U128))]
+        ))
+    );
+    // Wrapping niches.
+    for (bits, ok) in [
+        (0, true),
+        (5, true),
+        (6, false),
+        (249, false),
+        (250, true),
+        (255, true),
+    ] {
+        let res = transmute(&mut state, 2, cint(bits, u8_ty()), wrap.clone());
+        assert_eq!(res.is_ok(), ok, "wrap {bits}");
+        if ok {
+            assert_eq!(
+                state.get_init(Local(2)),
+                Some(&MirValue::adt(&wrap_def, 0, vec![u8v(bits)]))
+            );
+        }
+    }
+    // Fieldless repr(u8) enums decode the tag; unknown tags are invalid.
+    transmute(&mut state, 3, cint(7, u8_ty()), fieldless.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(3)),
+        Some(&MirValue::adt(&fieldless_def, 1, vec![]))
+    );
+    assert_eq!(
+        transmute(&mut state, 3, cint(2, u8_ty()), fieldless.clone()),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: fieldless.clone(),
+                bits: 2
+            }
+        ))
+    );
+    transmute(&mut state, 9, Operand::Copy(local(3)), u8_ty()).unwrap();
+    assert_eq!(state.get_init(Local(9)), Some(&u8v(7)));
+    // #[repr(C, u16)] enum: tag then payload, little-endian.
+    transmute(&mut state, 4, cint(0xBEEF_0001, u32_ty()), cs.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::adt(&cs_def, 1, vec![uint(0xBEEF, i16_ty())]))
+    );
+    assert!(transmute(&mut state, 4, cint(0x0000_0002, u32_ty()), cs.clone()).is_err());
+    transmute(&mut state, 7, Operand::Copy(local(4)), u32_ty()).unwrap();
+    assert_eq!(state.get_init(Local(7)), Some(&u32v(0xBEEF_0001)));
+    // repr(C) structs without padding and niche-free single-field unions are canonical.
+    transmute(&mut state, 5, cint(0x0002_0001, u32_ty()), cpair.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(5)),
+        Some(&MirValue::adt(&cpair_def, 0, vec![u16v(1), u16v(2)]))
+    );
+    transmute(&mut state, 6, cint(0xABCD, u32_ty()), u32_union.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(6)),
+        Some(&MirValue::union_value(&u32_union_def, 0, u32v(0xABCD)))
+    );
+    // Unspecified layouts and niche-bearing unions fail closed at lowering.
+    let lower = |src: Ty, dst: Ty| {
+        lower_rvalue(
+            &Rvalue::Cast(
+                CastKind::Transmute,
+                Operand::Constant(Constant::Int(0, src)),
+                dst,
+            ),
+            &[],
+            PW,
+        )
+    };
+    assert_eq!(
+        lower(u32_ty(), opt.clone()),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::UnsupportedLayout { ty: opt.clone() }
+        ))
+    );
+    assert_eq!(
+        lower(u8_ty(), bool_union.clone()),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::UnsupportedLayout {
+                ty: bool_union.clone()
+            }
+        ))
+    );
+    // Identity transmutes of typed values revalidate niches.
+    state.slots[0] = LocalSlotState::Init(MirValue::adt(&nz_def, 0, vec![u32v(0)]));
+    assert_eq!(
+        transmute(&mut state, 0, Operand::Copy(local(0)), nz.clone()),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz.clone(),
+                bits: 0
+            }
+        ))
+    );
+}
+
+#[test]
+fn test_scalar_valid_ranges_are_enforced_on_construction_and_typed_reads_only() {
+    let (nz_def, nz) = non_zero_u32();
+    let (pair_def, pair) = adt(AdtDef::new_struct("P", vec![nz.clone(), u8_ty()]));
+    let decls = vec![nz.clone(), pair.clone(), u32_ty()];
+    let mut state = state_with(decls.clone(), PW);
+    // Constructing NonZeroU32(0) by aggregate is invalid.
+    assert_eq!(
+        run(
+            assign(
+                local(0),
+                adt_aggregate(&nz_def, 0, None, vec![cint(0, u32_ty())])
+            ),
+            &mut state
+        ),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz.clone(),
+                bits: 0
+            }
+        ))
+    );
+    assert_eq!(state.get_local(Local(0)), Some(&LocalSlotState::Uninit));
+    run(
+        assign(
+            local(0),
+            adt_aggregate(&nz_def, 0, None, vec![cint(3, u32_ty())]),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    // A raw field write may store 0 (the bytes are just a u32); a typed read of the whole
+    // NonZeroU32 (or of a value containing it) is then invalid, while the field stays readable.
+    run(
+        assign(
+            place(0, vec![field(0, u32_ty())]),
+            Rvalue::Use(cint(0, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        read(&state, &place(0, vec![field(0, u32_ty())])),
+        Ok(u32v(0))
+    );
+    assert_eq!(
+        read(&state, &local(0)),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz.clone(),
+                bits: 0
+            }
+        ))
+    );
+    // Writing a valid value back makes it readable again.
+    run(
+        assign(
+            place(0, vec![field(0, u32_ty())]),
+            Rvalue::Use(cint(9, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        read(&state, &local(0)),
+        Ok(MirValue::adt(&nz_def, 0, vec![u32v(9)]))
+    );
+    // Nested niches are checked when the containing value is read.
+    run(
+        assign(
+            local(1),
+            adt_aggregate(
+                &pair_def,
+                0,
+                None,
+                vec![Operand::Copy(local(0)), cint(1, u8_ty())],
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            place(1, vec![field(0, nz.clone()), field(0, u32_ty())]),
+            Rvalue::Use(cint(0, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        read(&state, &local(1)),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern { .. }
+        ))
+    ));
+    assert_eq!(read(&state, &place(1, vec![field(1, u8_ty())])), Ok(u8v(1)));
+    // Body arguments are validated too.
+    let body = lower_body(
+        &Body {
+            local_decls: vec![unit(), nz.clone()],
+            basic_blocks: vec![],
+        },
+        PW,
+    )
+    .unwrap();
+    assert!(matches!(
+        StatementEvalState::from_body(&body, &[MirValue::adt(&nz_def, 0, vec![u32v(0)])]),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern { .. }
+        ))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statement::Deinit
+// ---------------------------------------------------------------------------------------------
+
+fn deinit(p: Place) -> Statement {
+    Statement::Deinit(p)
+}
+
+#[test]
+fn test_deinit_root_and_projected_places_satisfy_lens_laws() {
+    let pair = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let nested = Ty::Tuple(vec![u16_ty(), pair.clone()]);
+    let decls = vec![
+        unit(),
+        nested.clone(),
+        usize_ty(),
+        Ty::Array(Box::new(u32_ty()), 3),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let full = MirValue::Tuple(vec![u16v(1), MirValue::Tuple(vec![u32v(2), u8v(3)])]);
+    state.slots[1] = LocalSlotState::Init(full.clone());
+
+    // Root deinit makes the local Uninit; a dead local is UB.
+    run(deinit(local(1)), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+    state.slots[1] = LocalSlotState::Dead;
+    assert_eq!(
+        run(deinit(local(1)), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+    assert_eq!(
+        run(deinit(place(1, vec![field(0, u16_ty())])), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+
+    // (_1.1).0: Get-Deinit on the place, its parents, and the root.
+    state.slots[1] = LocalSlotState::Init(full.clone());
+    let p10 = place(1, vec![field(1, pair.clone()), field(0, u32_ty())]);
+    let p11 = place(1, vec![field(1, pair.clone()), field(1, u8_ty())]);
+    let p1 = place(1, vec![field(1, pair.clone())]);
+    let p0 = place(1, vec![field(0, u16_ty())]);
+    run(deinit(p10.clone()), &mut state).unwrap();
+    for uninit in [&p10, &p1, &local(1)] {
+        assert_eq!(
+            read(&state, uninit),
+            Err(RvalueEvalError::UninitializedLocal(Local(1))),
+            "{uninit:?}"
+        );
+    }
+    // Disjoint-sibling frame: every other field keeps its exact value.
+    assert_eq!(read(&state, &p11), Ok(u8v(3)));
+    assert_eq!(read(&state, &p0), Ok(u16v(1)));
+    // Re-initialization re-promotes the local to Init.
+    run(
+        assign(p10.clone(), Rvalue::Use(cint(2, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_local(Local(1)),
+        Some(&LocalSlotState::Init(full.clone()))
+    );
+
+    // Deinitializing every field one by one leaves an Uninit local (not an empty shell).
+    for p in [&p0, &p10, &p11] {
+        run(deinit((*p).clone()), &mut state).unwrap();
+    }
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+    // Already-uninitialized base: no fault, stays Uninit.
+    run(deinit(p10.clone()), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+
+    // Arrays have no element shells: an element of an initialized array is unsupported (after
+    // the index local and bounds are checked); of an uninitialized array it is a no-op.
+    let elem = place(3, vec![ProjectionElem::Index(Local(2))]);
+    state.slots[3] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![u32v(1), u32v(2), u32v(3)],
+        elem_ty: u32_ty(),
+    });
+    state.slots[2] = LocalSlotState::Dead;
+    assert_eq!(
+        run(deinit(elem.clone()), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(2)))
+    );
+    state.slots[2] = LocalSlotState::Uninit;
+    assert_eq!(
+        run(deinit(elem.clone()), &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(2)))
+    );
+    state.slots[2] = LocalSlotState::Init(usizev(3));
+    assert_eq!(
+        run(deinit(elem.clone()), &mut state),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 3, len: 3 })
+    );
+    state.slots[2] = LocalSlotState::Init(usizev(1));
+    assert_eq!(
+        run(deinit(elem.clone()), &mut state),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(elem.clone()))
+    );
+    assert!(matches!(
+        state.get_local(Local(3)),
+        Some(LocalSlotState::Init(_))
+    ));
+    state.slots[3] = LocalSlotState::Uninit;
+    run(deinit(elem.clone()), &mut state).unwrap();
+    state.slots[2] = LocalSlotState::Init(usizev(9));
+    assert_eq!(
+        run(deinit(elem), &mut state),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 9, len: 3 })
+    );
+
+    // A failed deinit leaves the state unchanged (atomicity), and ill-typed places do not lower.
+    state.slots[1] = LocalSlotState::Init(full.clone());
+    let before = state.clone();
+    let deref_decls = vec![unit(), raw(u32_ty(), Mutability::Mut)];
+    let mut deref_state = state_with(deref_decls.clone(), PW);
+    deref_state.slots[1] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(8),
+        raw(u32_ty(), Mutability::Mut),
+    ));
+    let deref_place = place(1, vec![ProjectionElem::Deref]);
+    assert_eq!(
+        run(deinit(deref_place.clone()), &mut deref_state),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(deref_place))
+    );
+    assert!(lower_statement(&deinit(place(1, vec![field(2, u8_ty())])), &decls, PW).is_err());
+    assert!(lower_statement(&deinit(local(9)), &decls, PW).is_err());
+    assert_eq!(state, before);
+
+    // Zero-sized fields are tracked like any other field.
+    let zst_pair = Ty::Tuple(vec![u8_ty(), unit()]);
+    let mut zst_state = state_with(vec![unit(), zst_pair.clone()], PW);
+    zst_state.slots[1] = LocalSlotState::Init(MirValue::Tuple(vec![u8v(1), MirValue::Unit]));
+    run(deinit(place(1, vec![field(1, unit())])), &mut zst_state).unwrap();
+    assert_eq!(
+        read(&zst_state, &local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(
+        read(&zst_state, &place(1, vec![field(0, u8_ty())])),
+        Ok(u8v(1))
+    );
+}
+
+#[test]
+fn test_deinit_enum_variant_fields_keeps_separate_tags_and_drops_niche_tags() {
+    // Explicit tag: deinitializing a variant field keeps the tag (stored apart).
+    let (def, enum_ty) = repr_u8_enum();
+    let (opt_def, opt) = rust_option_u32();
+    let (union_def, union_ty) = adt(AdtDef::new_union(
+        "U",
+        vec![u32_ty(), Ty::Tuple(vec![u16_ty(), u16_ty()])],
+    ));
+    let decls = vec![
+        unit(),
+        enum_ty.clone(),
+        opt.clone(),
+        union_ty.clone(),
+        Ty::Tuple(vec![u32_ty(), u8_ty()]),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let a0 = place(1, vec![ProjectionElem::Downcast(0), field(0, u8_ty())]);
+    let a1 = place(1, vec![ProjectionElem::Downcast(0), field(1, u32_ty())]);
+    let b0 = place(1, vec![ProjectionElem::Downcast(1), field(0, u16_ty())]);
+    let value = MirValue::adt(&def, 0, vec![u8v(7), u32v(8)]);
+    state.slots[1] = LocalSlotState::Init(value.clone());
+    run(deinit(a0.clone()), &mut state).unwrap();
+    assert_eq!(
+        read(&state, &a0),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(read(&state, &a1), Ok(u32v(8)));
+    assert_eq!(
+        read(&state, &local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(discriminant(&mut state, local(1)), Ok(u8v(0)));
+    // Other variants stay inactive; a deinit through them is like a write (UB here).
+    let before = state.clone();
+    assert_eq!(
+        run(deinit(b0.clone()), &mut state),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 0
+        })
+    );
+    assert_eq!(state, before);
+    run(
+        assign(a0.clone(), Rvalue::Use(cint(7, u8_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_local(Local(1)),
+        Some(&LocalSlotState::Init(value.clone()))
+    );
+    // Deinit through `Downcast` on an uninitialized enum is a no-op.
+    state.slots[1] = LocalSlotState::Uninit;
+    run(deinit(b0.clone()), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+
+    // Unspecified layout (tagless, multi-variant): the tag may live in the field's niche, so it
+    // is lost; rewriting the field does not re-promote until SetDiscriminant.
+    let some0 = place(2, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]);
+    let some = MirValue::adt(&opt_def, 1, vec![u32v(5)]);
+    state.slots[2] = LocalSlotState::Init(some.clone());
+    run(deinit(some0.clone()), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(2)),
+        Err(RvalueEvalError::UninitializedLocal(Local(2)))
+    );
+    run(
+        assign(some0.clone(), Rvalue::Use(cint(5, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(2)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    run(
+        Statement::SetDiscriminant {
+            place: local(2),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_local(Local(2)), Some(&LocalSlotState::Init(some)));
+
+    // Union fields of an initialized union have no shells (fail closed); uninit: no-op.
+    let u_a = place(3, vec![field(0, u32_ty())]);
+    state.slots[3] = LocalSlotState::Init(MirValue::union_value(&union_def, 0, u32v(1)));
+    assert_eq!(
+        run(deinit(u_a.clone()), &mut state),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(u_a.clone()))
+    );
+    state.slots[3] = LocalSlotState::Uninit;
+    run(deinit(u_a), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(3)), Some(&LocalSlotState::Uninit));
+
+    // Legacy tuple-modeled enums: the tag is conservatively lost as well.
+    let legacy = place(4, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]);
+    state.slots[4] = LocalSlotState::Init(MirValue::Adt {
+        def_path: "L".into(),
+        variant_idx: 1,
+        active_field: None,
+        fields: vec![u32v(1), u8v(2)],
+        adt_def: None,
+    });
+    run(deinit(legacy.clone()), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(4)),
+        Err(RvalueEvalError::UninitializedLocal(Local(4)))
+    );
+    assert_eq!(
+        read(
+            &state,
+            &place(4, vec![ProjectionElem::Downcast(1), field(1, u8_ty())])
+        ),
+        Ok(u8v(2))
+    );
+}
+
+/// Leaf places of the differential test's local `_1: S` (see [`differential_types`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Leaf {
+    A,
+    B0,
+    B1,
+    EA0,
+    EA1,
+    EB0,
+}
+
+const LEAVES: [Leaf; 6] = [Leaf::A, Leaf::B0, Leaf::B1, Leaf::EA0, Leaf::EA1, Leaf::EB0];
+const TAG_BYTE: usize = 8;
+
+/// `#[repr(u8)] enum E { A(u8, u16), B(u32) }` (tag @0, A.0 @1, A.1 @2, B.0 @4; size 8) and
+/// `#[repr(C)] struct S { a: u32, b: (u16, u16), e: E }` (a @0, b @4, e @8; size 16).
+fn differential_types() -> (Arc<AdtDef>, Ty, Arc<AdtDef>, Ty) {
+    let (e_def, e_ty) = adt(AdtDef::new_enum(
+        "E",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![u8_ty(), u16_ty()]),
+            VariantDef::new("B", vec![u32_ty()]),
+        ],
+    ));
+    let (s_def, s_ty) = adt(AdtDef::new_struct(
+        "S",
+        vec![u32_ty(), Ty::Tuple(vec![u16_ty(), u16_ty()]), e_ty.clone()],
+    )
+    .with_repr(AdtRepr::c()));
+    (e_def, e_ty, s_def, s_ty)
+}
+
+impl Leaf {
+    fn range(self) -> (usize, usize) {
+        match self {
+            Leaf::A => (0, 4),
+            Leaf::B0 => (4, 6),
+            Leaf::B1 => (6, 8),
+            Leaf::EA0 => (9, 10),
+            Leaf::EA1 => (10, 12),
+            Leaf::EB0 => (12, 16),
+        }
+    }
+    fn variant(self) -> Option<usize> {
+        match self {
+            Leaf::EA0 | Leaf::EA1 => Some(0),
+            Leaf::EB0 => Some(1),
+            _ => None,
+        }
+    }
+    fn ty(self) -> Ty {
+        match self {
+            Leaf::A | Leaf::EB0 => u32_ty(),
+            Leaf::B0 | Leaf::B1 | Leaf::EA1 => u16_ty(),
+            Leaf::EA0 => u8_ty(),
+        }
+    }
+    fn place(self, e_ty: &Ty) -> Place {
+        let b = Ty::Tuple(vec![u16_ty(), u16_ty()]);
+        let e = |v: usize, i: usize, ty: Ty| {
+            place(
+                1,
+                vec![
+                    field(2, e_ty.clone()),
+                    ProjectionElem::Downcast(v),
+                    field(i, ty),
+                ],
+            )
+        };
+        match self {
+            Leaf::A => place(1, vec![field(0, u32_ty())]),
+            Leaf::B0 => place(1, vec![field(1, b), field(0, u16_ty())]),
+            Leaf::B1 => place(1, vec![field(1, b), field(1, u16_ty())]),
+            Leaf::EA0 => e(0, 0, u8_ty()),
+            Leaf::EA1 => e(0, 1, u16_ty()),
+            Leaf::EB0 => e(1, 0, u32_ty()),
+        }
+    }
+}
+
+/// Byte-level reference memory for `_1: S`: one `Option<u8>` per byte (`None` = uninitialized)
+/// plus the variant the enum field was narrowed to by `Downcast` writes before its tag byte was
+/// written (the only state a byte image cannot express).
+#[derive(Clone, Debug)]
+struct ByteModel {
+    live: bool,
+    bytes: [Option<u8>; 16],
+    narrow: Option<usize>,
+}
+
+impl ByteModel {
+    fn variant_leaves(v: usize) -> &'static [Leaf] {
+        if v == 0 {
+            &[Leaf::EA0, Leaf::EA1]
+        } else {
+            &[Leaf::EB0]
+        }
+    }
+    fn effective_variant(&self) -> Option<usize> {
+        self.bytes[TAG_BYTE].map(usize::from).or(self.narrow)
+    }
+    fn normalize(&mut self) {
+        if self.bytes[TAG_BYTE].is_none() && self.bytes[9..16].iter().all(Option::is_none) {
+            self.narrow = None;
+        }
+    }
+    fn get(&self, leaf: Leaf) -> Option<u128> {
+        let (lo, hi) = leaf.range();
+        let mut v = 0u128;
+        for (i, b) in self.bytes[lo..hi].iter().enumerate() {
+            v |= u128::from((*b)?) << (8 * i);
+        }
+        Some(v)
+    }
+    fn set(&mut self, leaf: Leaf, val: Option<u128>) {
+        let (lo, hi) = leaf.range();
+        for (i, b) in self.bytes[lo..hi].iter_mut().enumerate() {
+            *b = val.map(|v| (v >> (8 * i)) as u8);
+        }
+    }
+    fn check_variant(&self, leaf: Leaf) -> Result<(), RvalueEvalError> {
+        match (leaf.variant(), self.effective_variant()) {
+            (Some(v), Some(w)) if v != w => Err(RvalueEvalError::InactiveVariantProjection {
+                expected: v,
+                actual: w,
+            }),
+            _ => Ok(()),
+        }
+    }
+    fn live(&self) -> Result<(), RvalueEvalError> {
+        if self.live {
+            Ok(())
+        } else {
+            Err(RvalueEvalError::DeadLocal(Local(1)))
+        }
+    }
+    fn write_leaf(&mut self, leaf: Leaf, val: u128) -> Result<(), RvalueEvalError> {
+        self.live()?;
+        self.check_variant(leaf)?;
+        if let Some(v) = leaf.variant() {
+            self.narrow = Some(v);
+        }
+        self.set(leaf, Some(val));
+        Ok(())
+    }
+    fn write_enum(&mut self, variant: usize, vals: &[u128]) -> Result<(), RvalueEvalError> {
+        self.live()?;
+        for l in [Leaf::EA0, Leaf::EA1, Leaf::EB0] {
+            self.set(l, None);
+        }
+        self.bytes[TAG_BYTE] = Some(variant as u8);
+        for (l, v) in Self::variant_leaves(variant).iter().zip(vals) {
+            self.set(*l, Some(*v));
+        }
+        self.narrow = Some(variant);
+        Ok(())
+    }
+    fn deinit(&mut self, target: DeinitTarget) -> Result<(), RvalueEvalError> {
+        self.live()?;
+        match target {
+            DeinitTarget::Root => self.bytes = [None; 16],
+            DeinitTarget::B => {
+                self.set(Leaf::B0, None);
+                self.set(Leaf::B1, None);
+            }
+            DeinitTarget::E => {
+                self.bytes[8..16].fill(None);
+            }
+            DeinitTarget::Leaf(leaf) => {
+                self.check_variant(leaf)?;
+                self.set(leaf, None);
+            }
+        }
+        self.normalize();
+        Ok(())
+    }
+    fn set_discriminant(&mut self, variant: usize) -> Result<(), RvalueEvalError> {
+        self.live()?;
+        if let Some(w) = self.effective_variant()
+            && w != variant
+        {
+            for l in Self::variant_leaves(w) {
+                self.set(*l, None);
+            }
+        }
+        self.bytes[TAG_BYTE] = Some(variant as u8);
+        self.narrow = Some(variant);
+        Ok(())
+    }
+    fn read_leaf(&self, leaf: Leaf) -> Result<u128, RvalueEvalError> {
+        self.live()?;
+        self.check_variant(leaf)?;
+        self.get(leaf)
+            .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))
+    }
+    fn read_enum(&self) -> Result<(usize, Vec<u128>), RvalueEvalError> {
+        self.live()?;
+        let tag = self.bytes[TAG_BYTE].ok_or(RvalueEvalError::UninitializedLocal(Local(1)))?;
+        let v = usize::from(tag);
+        let vals = Self::variant_leaves(v)
+            .iter()
+            .map(|l| self.get(*l))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))?;
+        Ok((v, vals))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeinitTarget {
+    Root,
+    B,
+    E,
+    Leaf(Leaf),
+}
+
+#[test]
+fn test_property_deinit_set_discriminant_and_writes_match_byte_level_reference_memory() {
+    let (e_def, e_ty, s_def, s_ty) = differential_types();
+    let b_ty = Ty::Tuple(vec![u16_ty(), u16_ty()]);
+    let decls = vec![unit(), s_ty.clone()];
+    let mut seed = 0x0dd_ba11_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut steps = 0usize;
+    let mut partial_states = 0usize;
+    for _round in 0..300 {
+        let mut state = state_with(decls.clone(), PW);
+        let mut model = ByteModel {
+            live: true,
+            bytes: [None; 16],
+            narrow: None,
+        };
+        for _ in 0..40 {
+            let choice = next() % 100;
+            let rand_val = |next: &mut dyn FnMut() -> u64, ty: &Ty| -> u128 {
+                u128::from(next()) & ty.scalar_mask(PW)
+            };
+            let (impl_res, model_res) = match choice {
+                0..=2 => (run(Statement::StorageLive(Local(1)), &mut state), {
+                    model = ByteModel {
+                        live: true,
+                        bytes: [None; 16],
+                        narrow: None,
+                    };
+                    Ok(())
+                }),
+                3..=4 => (run(Statement::StorageDead(Local(1)), &mut state), {
+                    model.live = false;
+                    Ok(())
+                }),
+                5..=34 => {
+                    let leaf = LEAVES[(next() % 6) as usize];
+                    let val = rand_val(&mut next, &leaf.ty());
+                    (
+                        run(
+                            assign(leaf.place(&e_ty), Rvalue::Use(cint(val, leaf.ty()))),
+                            &mut state,
+                        ),
+                        model.write_leaf(leaf, val),
+                    )
+                }
+                35..=39 => {
+                    let (x, y) = (
+                        rand_val(&mut next, &u16_ty()),
+                        rand_val(&mut next, &u16_ty()),
+                    );
+                    let rv = Rvalue::Aggregate(
+                        AggregateKind::Tuple,
+                        vec![cint(x, u16_ty()), cint(y, u16_ty())],
+                    );
+                    let res = model.live().map(|()| {
+                        model.set(Leaf::B0, Some(x));
+                        model.set(Leaf::B1, Some(y));
+                    });
+                    (
+                        run(
+                            assign(place(1, vec![field(1, b_ty.clone())]), rv),
+                            &mut state,
+                        ),
+                        res,
+                    )
+                }
+                40..=46 => {
+                    let variant = (next() % 2) as usize;
+                    let vals: Vec<u128> = if variant == 0 {
+                        vec![
+                            rand_val(&mut next, &u8_ty()),
+                            rand_val(&mut next, &u16_ty()),
+                        ]
+                    } else {
+                        vec![rand_val(&mut next, &u32_ty())]
+                    };
+                    let ops = vals
+                        .iter()
+                        .zip(e_def.variant_fields(variant).unwrap())
+                        .map(|(v, ty)| cint(*v, ty.clone()))
+                        .collect();
+                    (
+                        run(
+                            assign(
+                                place(1, vec![field(2, e_ty.clone())]),
+                                adt_aggregate(&e_def, variant, None, ops),
+                            ),
+                            &mut state,
+                        ),
+                        model.write_enum(variant, &vals),
+                    )
+                }
+                47..=74 => {
+                    let target = match next() % 9 {
+                        0 => DeinitTarget::Root,
+                        1 => DeinitTarget::B,
+                        2 => DeinitTarget::E,
+                        k => DeinitTarget::Leaf(LEAVES[(k - 3) as usize]),
+                    };
+                    let p = match target {
+                        DeinitTarget::Root => local(1),
+                        DeinitTarget::B => place(1, vec![field(1, b_ty.clone())]),
+                        DeinitTarget::E => place(1, vec![field(2, e_ty.clone())]),
+                        DeinitTarget::Leaf(leaf) => leaf.place(&e_ty),
+                    };
+                    (run(deinit(p), &mut state), model.deinit(target))
+                }
+                _ => {
+                    let variant = (next() % 2) as usize;
+                    (
+                        run(
+                            Statement::SetDiscriminant {
+                                place: place(1, vec![field(2, e_ty.clone())]),
+                                variant_index: variant,
+                            },
+                            &mut state,
+                        ),
+                        model.set_discriminant(variant),
+                    )
+                }
+            };
+            assert_eq!(
+                impl_res, model_res,
+                "op {choice} diverged; model {model:?}\nstate {:?}",
+                state.slots[1]
+            );
+            steps += 1;
+
+            // Observations: every leaf, the composite fields, the whole local, the discriminant.
+            for leaf in LEAVES {
+                let expected = model.read_leaf(leaf).map(|v| uint(v, leaf.ty()));
+                assert_eq!(
+                    read(&state, &leaf.place(&e_ty)),
+                    expected,
+                    "{leaf:?}; model {model:?}\nstate {:?}",
+                    state.slots[1]
+                );
+            }
+            let expected_b = model.live().and_then(|()| {
+                let b0 = model
+                    .get(Leaf::B0)
+                    .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))?;
+                let b1 = model
+                    .get(Leaf::B1)
+                    .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))?;
+                Ok(MirValue::Tuple(vec![u16v(b0), u16v(b1)]))
+            });
+            assert_eq!(
+                read(&state, &place(1, vec![field(1, b_ty.clone())])),
+                expected_b
+            );
+            let expected_e = model.read_enum().map(|(v, vals)| {
+                let fields = vals
+                    .iter()
+                    .zip(e_def.variant_fields(v).unwrap())
+                    .map(|(x, ty)| uint(*x, ty.clone()))
+                    .collect();
+                MirValue::adt(&e_def, v, fields)
+            });
+            assert_eq!(
+                read(&state, &place(1, vec![field(2, e_ty.clone())])),
+                expected_e,
+                "model {model:?}"
+            );
+            let expected_root = model.live().and_then(|()| {
+                let a = model
+                    .get(Leaf::A)
+                    .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))?;
+                let b = expected_b.clone()?;
+                let e = expected_e.clone()?;
+                Ok(MirValue::adt(&s_def, 0, vec![u32v(a), b, e]))
+            });
+            assert_eq!(read(&state, &local(1)), expected_root);
+            let expected_discr = model.live().and_then(|()| {
+                model.bytes[TAG_BYTE]
+                    .map(|t| u8v(u128::from(t)))
+                    .ok_or(RvalueEvalError::UninitializedLocal(Local(1)))
+            });
+            assert_eq!(
+                discriminant(&mut state, place(1, vec![field(2, e_ty.clone())])),
+                expected_discr
+            );
+            // Canonical slot representation: an all-uninitialized local is `Uninit`, a fully
+            // readable one is `Init`.
+            if model.live && model.bytes.iter().all(Option::is_none) {
+                assert_eq!(state.slots[1], LocalSlotState::Uninit);
+            }
+            if expected_root.is_ok() {
+                assert!(matches!(state.slots[1], LocalSlotState::Init(_)));
+            }
+            if matches!(state.slots[1], LocalSlotState::PartialShell(_)) {
+                partial_states += 1;
+            }
+        }
+    }
+    assert!(
+        steps >= 12_000 && partial_states > 2_000,
+        "steps {steps}, partial {partial_states}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statement::Retag
+// ---------------------------------------------------------------------------------------------
+
+fn retag(kind: RetagKind, p: Place) -> Statement {
+    Statement::Retag(kind, p)
+}
+
+#[test]
+fn test_retag_validates_every_reachable_reference() {
+    let r32 = ref_ty(u32_ty());
+    let (holder_def, holder) = adt(AdtDef::new_struct("H", vec![u8_ty(), r32.clone()]));
+    let (union_def, union_ty) = adt(AdtDef::new_union("U", vec![r32.clone(), usize_ty()]));
+    let (_, opt) = rust_option_u32();
+    let decls = vec![
+        unit(),
+        r32.clone(),
+        Ty::Tuple(vec![u64_ty(), r32.clone()]),
+        holder.clone(),
+        union_ty.clone(),
+        ref_ty(Ty::Never),
+        raw(u32_ty(), Mutability::Mut),
+        u64_ty(),
+        Ty::Array(Box::new(r32.clone()), 2),
+        ref_ty(opt.clone()),
+        ref_ty(u64_ty()),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let rptr =
+        |addr: u64, ty: &Ty| MirValue::ptr(PointerValue::with_provenance(addr, 1, 1), ty.clone());
+    for kind in [RetagKind::Default, RetagKind::FnEntry, RetagKind::TwoPhase] {
+        // Direct references: initialized, non-null, aligned, inhabited pointee.
+        assert_eq!(
+            run(retag(kind, local(1)), &mut state),
+            Err(RvalueEvalError::UninitializedLocal(Local(1)))
+        );
+        state.slots[1] = LocalSlotState::Init(rptr(0x1000, &r32));
+        run(retag(kind, local(1)), &mut state).unwrap();
+        state.slots[1] = LocalSlotState::Init(rptr(0x1002, &r32));
+        assert_eq!(
+            run(retag(kind, local(1)), &mut state),
+            Err(RvalueEvalError::MisalignedPointer {
+                addr: 0x1002,
+                required_align: 4
+            })
+        );
+        state.slots[1] = LocalSlotState::Init(rptr(0, &r32));
+        assert_eq!(
+            run(retag(kind, local(1)), &mut state),
+            Err(RvalueEvalError::CastEval(
+                CastEvalError::InvalidBitPattern {
+                    target_ty: r32.clone(),
+                    bits: 0
+                }
+            ))
+        );
+        state.slots[5] = LocalSlotState::Init(rptr(0x1000, &ref_ty(Ty::Never)));
+        assert_eq!(
+            run(retag(kind, local(5)), &mut state),
+            Err(RvalueEvalError::UninhabitedPointee(Ty::Never))
+        );
+        state.slots[1] = LocalSlotState::Dead;
+        assert_eq!(
+            run(retag(kind, local(1)), &mut state),
+            Err(RvalueEvalError::DeadLocal(Local(1)))
+        );
+        state.slots[1] = LocalSlotState::Uninit;
+        // 64-bit alignment of `&u64`.
+        state.slots[10] = LocalSlotState::Init(rptr(0x1004, &ref_ty(u64_ty())));
+        assert_eq!(
+            run(retag(kind, local(10)), &mut state),
+            Err(RvalueEvalError::MisalignedPointer {
+                addr: 0x1004,
+                required_align: 8
+            })
+        );
+
+        // References inside aggregates; uninitialized non-reference fields are fine, an
+        // uninitialized reference field is UB.
+        run(
+            assign(
+                place(2, vec![field(1, r32.clone())]),
+                Rvalue::Use(Operand::Constant(Constant::Ptr(
+                    PointerValue::without_provenance(0x2000),
+                    r32.clone(),
+                ))),
+            ),
+            &mut state,
+        )
+        .unwrap();
+        run(retag(kind, local(2)), &mut state).unwrap();
+        state.slots[2] = LocalSlotState::Uninit;
+        run(
+            assign(
+                place(2, vec![field(0, u64_ty())]),
+                Rvalue::Use(cint(1, u64_ty())),
+            ),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            run(retag(kind, local(2)), &mut state),
+            Err(RvalueEvalError::UninitializedLocal(Local(2)))
+        );
+        state.slots[2] = LocalSlotState::Uninit;
+        state.slots[3] = LocalSlotState::Init(MirValue::adt(
+            &holder_def,
+            0,
+            vec![u8v(1), rptr(0x3001, &r32)],
+        ));
+        assert!(matches!(
+            run(retag(kind, local(3)), &mut state),
+            Err(RvalueEvalError::MisalignedPointer { .. })
+        ));
+        state.slots[3] = LocalSlotState::Init(MirValue::adt(
+            &holder_def,
+            0,
+            vec![u8v(1), rptr(0x3000, &r32)],
+        ));
+        run(retag(kind, local(3)), &mut state).unwrap();
+        run(retag(kind, place(3, vec![field(0, u8_ty())])), &mut state).unwrap();
+        state.slots[8] = LocalSlotState::Init(MirValue::Array {
+            elements: vec![rptr(0x4000, &r32), rptr(0, &r32)],
+            elem_ty: r32.clone(),
+        });
+        assert!(matches!(
+            run(retag(kind, local(8)), &mut state),
+            Err(RvalueEvalError::CastEval(
+                CastEvalError::InvalidBitPattern { .. }
+            ))
+        ));
+        state.slots[8] = LocalSlotState::Uninit;
+        // Union contents are never retagged.
+        state.slots[4] = LocalSlotState::Init(MirValue::union_value(&union_def, 1, usizev(3)));
+        run(retag(kind, local(4)), &mut state).unwrap();
+        state.slots[4] = LocalSlotState::Uninit;
+        run(retag(kind, local(4)), &mut state).unwrap();
+        // Places without references only need to be live (uninitialized is fine).
+        run(retag(kind, local(7)), &mut state).unwrap();
+        run(retag(kind, local(6)), &mut state).unwrap();
+        // An alignment the layout model cannot determine fails closed unless provably wrong.
+        state.slots[9] = LocalSlotState::Init(rptr(0x5000, &ref_ty(opt.clone())));
+        run(retag(kind, local(9)), &mut state).unwrap();
+        state.slots[9] = LocalSlotState::Init(rptr(0x5002, &ref_ty(opt.clone())));
+        assert!(matches!(
+            run(retag(kind, local(9)), &mut state),
+            Err(RvalueEvalError::MisalignedPointer { .. })
+        ));
+    }
+
+    // Raw retags read the (initialized) pointer, which may be null, unaligned, or dangling.
+    let raw_mut = raw(u32_ty(), Mutability::Mut);
+    assert_eq!(
+        run(retag(RetagKind::Raw(Mutability::Mut), local(6)), &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(6)))
+    );
+    state.slots[6] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(1),
+        raw_mut.clone(),
+    ));
+    run(retag(RetagKind::Raw(Mutability::Mut), local(6)), &mut state).unwrap();
+    state.slots[6] =
+        LocalSlotState::Init(MirValue::ptr(PointerValue::without_provenance(0), raw_mut));
+    run(retag(RetagKind::Raw(Mutability::Mut), local(6)), &mut state).unwrap();
+    // Raw retags need a raw pointer place of the same mutability.
+    for (kind, l) in [
+        (RetagKind::Raw(Mutability::Not), 6),
+        (RetagKind::Raw(Mutability::Mut), 1),
+        (RetagKind::Raw(Mutability::Mut), 7),
+    ] {
+        assert!(matches!(
+            lower_statement(&retag(kind, local(l)), &decls, PW),
+            Err(RvalueLowerError::InvalidRetagTarget { .. })
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statement::CopyNonOverlapping
+// ---------------------------------------------------------------------------------------------
+
+fn copy_nonoverlapping(src: Operand, dst: Operand, count: Operand) -> Statement {
+    Statement::CopyNonOverlapping { src, dst, count }
+}
+
+fn ptr_const(addr: u64, alloc: Option<u64>, ty: Ty) -> Operand {
+    let ptr = match alloc {
+        Some(a) => PointerValue::with_provenance(addr, a, 1),
+        None => PointerValue::without_provenance(addr),
+    };
+    Operand::Constant(Constant::Ptr(ptr, ty))
+}
+
+#[test]
+fn test_copy_nonoverlapping_checks_ub_even_for_empty_copies_and_copies_whole_locals() {
+    let src_ty = raw(u32_ty(), Mutability::Not);
+    let dst_ty = raw(u32_ty(), Mutability::Mut);
+    let decls = vec![
+        unit(),
+        u32_ty(),
+        u32_ty(),
+        src_ty.clone(),
+        dst_ty.clone(),
+        usize_ty(),
+        Ty::Tuple(vec![u32_ty(), u8_ty()]),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let cnt = |n: u128| cint(n, usize_ty());
+    let src = |addr: u64| ptr_const(addr, Some(10), src_ty.clone());
+    let dst = |addr: u64| ptr_const(addr, Some(20), dst_ty.clone());
+    // Null and misaligned pointers are UB even when nothing is copied.
+    assert_eq!(
+        run(copy_nonoverlapping(src(0), dst(0x100), cnt(0)), &mut state),
+        Err(RvalueEvalError::NullPointerAccess)
+    );
+    assert_eq!(
+        run(copy_nonoverlapping(src(0x100), dst(0), cnt(0)), &mut state),
+        Err(RvalueEvalError::NullPointerAccess)
+    );
+    assert_eq!(
+        run(
+            copy_nonoverlapping(src(0x101), dst(0x100), cnt(0)),
+            &mut state
+        ),
+        Err(RvalueEvalError::MisalignedPointer {
+            addr: 0x101,
+            required_align: 4
+        })
+    );
+    assert_eq!(
+        run(
+            copy_nonoverlapping(src(0x100), dst(0x102), cnt(0)),
+            &mut state
+        ),
+        Err(RvalueEvalError::MisalignedPointer {
+            addr: 0x102,
+            required_align: 4
+        })
+    );
+    // `count * size_of::<T>()` must fit in isize::MAX, and ranges must not wrap.
+    let huge = (u128::from(u64::MAX) >> 1) / 4 + 1;
+    assert_eq!(
+        run(
+            copy_nonoverlapping(src(0x100), dst(0x200), cnt(huge)),
+            &mut state
+        ),
+        Err(RvalueEvalError::CopyLengthOverflow {
+            count: huge,
+            elem_size: 4
+        })
+    );
+    assert_eq!(
+        run(
+            copy_nonoverlapping(src(0xFFFF_FFFF_FFFF_FFF0), dst(0x200), cnt(8)),
+            &mut state
+        ),
+        Err(RvalueEvalError::PointerRangeOverflow {
+            addr: 0xFFFF_FFFF_FFFF_FFF0,
+            byte_len: 32
+        })
+    );
+    // Empty copies are no-ops after the checks.
+    run(
+        copy_nonoverlapping(src(0x100), dst(0x100), cnt(0)),
+        &mut state,
+    )
+    .unwrap();
+    // Overlap is checked within one allocation (or between pointers without provenance).
+    let same = |addr: u64, ty: &Ty| ptr_const(addr, Some(7), ty.clone());
+    assert_eq!(
+        run(
+            copy_nonoverlapping(same(0x100, &src_ty), same(0x104, &dst_ty), cnt(2)),
+            &mut state
+        ),
+        Err(RvalueEvalError::CopyNonOverlappingOverlap {
+            src_addr: 0x100,
+            dst_addr: 0x104,
+            byte_len: 8
+        })
+    );
+    assert_eq!(
+        run(
+            copy_nonoverlapping(
+                ptr_const(0x104, None, src_ty.clone()),
+                ptr_const(0x100, None, dst_ty.clone()),
+                cnt(2)
+            ),
+            &mut state
+        ),
+        Err(RvalueEvalError::CopyNonOverlappingOverlap {
+            src_addr: 0x104,
+            dst_addr: 0x100,
+            byte_len: 8
+        })
+    );
+    // Adjacent ranges do not overlap; the copy itself then needs a byte-level memory model.
+    assert_eq!(
+        run(
+            copy_nonoverlapping(same(0x100, &src_ty), same(0x108, &dst_ty), cnt(2)),
+            &mut state
+        ),
+        Err(RvalueEvalError::UnsupportedMemoryAccess(
+            "copy_nonoverlapping outside of whole-local copies"
+        ))
+    );
+    // On 32-bit targets the length limit is i32::MAX.
+    let mut state32 = state_with(decls.clone(), PtrWidth::Bits32);
+    assert!(matches!(
+        run(
+            copy_nonoverlapping(src(0x100), dst(0x200), cnt(0x2000_0000)),
+            &mut state32
+        ),
+        Err(RvalueEvalError::CopyLengthOverflow { .. })
+    ));
+
+    // Whole-local copies through `&raw` pointers copy the source's state, even uninitialized.
+    run(
+        assign(local(3), Rvalue::RawPtr(Mutability::Not, local(1))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(local(4), Rvalue::RawPtr(Mutability::Mut, local(2))),
+        &mut state,
+    )
+    .unwrap();
+    state.slots[1] = LocalSlotState::Init(u32v(0xC0FFEE));
+    state.slots[5] = LocalSlotState::Init(usizev(1));
+    let copy_locals = copy_nonoverlapping(
+        Operand::Copy(local(3)),
+        Operand::Copy(local(4)),
+        Operand::Copy(local(5)),
+    );
+    run(copy_locals.clone(), &mut state).unwrap();
+    assert_eq!(state.get_init(Local(2)), Some(&u32v(0xC0FFEE)));
+    state.slots[1] = LocalSlotState::Uninit;
+    run(copy_locals.clone(), &mut state).unwrap();
+    assert_eq!(state.get_local(Local(2)), Some(&LocalSlotState::Uninit));
+    state.slots[1] = LocalSlotState::Dead;
+    assert_eq!(
+        run(copy_locals.clone(), &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(1)))
+    );
+    // Copying a local onto itself overlaps.
+    state.slots[1] = LocalSlotState::Init(u32v(1));
+    run(
+        assign(local(4), Rvalue::RawPtr(Mutability::Mut, local(1))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        run(copy_locals, &mut state),
+        Err(RvalueEvalError::CopyNonOverlappingOverlap { .. })
+    ));
+    // `Move` operands deinitialize their locals.
+    state.slots[5] = LocalSlotState::Init(usizev(0));
+    run(
+        copy_nonoverlapping(
+            Operand::Copy(local(3)),
+            Operand::Copy(local(4)),
+            Operand::Move(local(5)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_local(Local(5)), Some(&LocalSlotState::Uninit));
+
+    // Lowering: `(*const T | &T, *mut T | &mut T, usize)` with equal `T` of exact layout.
+    let (_, opt) = rust_option_u32();
+    let lower = |s: Operand, d: Operand, c: Operand| {
+        lower_statement(&copy_nonoverlapping(s, d, c), &decls, PW)
+    };
+    assert!(matches!(
+        lower(src(4), ptr_const(4, None, src_ty.clone()), cnt(1)),
+        Err(RvalueLowerError::InvalidCopyNonOverlapping { .. })
+    ));
+    assert!(matches!(
+        lower(src(4), dst(4), cint(1, u32_ty())),
+        Err(RvalueLowerError::InvalidCopyNonOverlapping { .. })
+    ));
+    assert!(matches!(
+        lower(
+            src(4),
+            ptr_const(4, None, raw(u8_ty(), Mutability::Mut)),
+            cnt(1)
+        ),
+        Err(RvalueLowerError::InvalidCopyNonOverlapping { .. })
+    ));
+    assert_eq!(
+        lower(
+            ptr_const(4, None, raw(opt.clone(), Mutability::Not)),
+            ptr_const(8, None, raw(opt.clone(), Mutability::Mut)),
+            cnt(1)
+        ),
+        Err(RvalueLowerError::UnsupportedLayout(opt.clone()))
+    );
+    let ok = lower(
+        ptr_const(4, None, ref_ty(u32_ty())),
+        ptr_const(8, None, Ty::Ref(Box::new(u32_ty()), Mutability::Mut)),
+        cnt(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        ok,
+        LoweredStatement::CopyNonOverlapping {
+            elem_size: 4,
+            elem_align: 4,
+            ..
+        }
+    ));
+    // A ZST copy of any count is a no-op once the pointers are non-null and aligned.
+    let zst_src = raw(unit(), Mutability::Not);
+    let zst_dst = raw(unit(), Mutability::Mut);
+    run(
+        copy_nonoverlapping(
+            ptr_const(1, None, zst_src),
+            ptr_const(1, None, zst_dst),
+            cnt(u128::from(u64::MAX)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rvalue::{ShallowInitBox, WrapUnsafeBinder}, CastKind::{Subtype, PointerCoercion}
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_shallow_init_box_and_wrap_unsafe_binder() {
+    let (nz_def, nz) = non_zero_u32();
+    let (wrapper_def, wrapper) = adt(AdtDef::new_struct("Wrapper", vec![u32_ty()]));
+    let (_, two) = adt(AdtDef::new_struct("Two", vec![u32_ty(), u32_ty()]));
+    let decls = vec![
+        unit(),
+        raw(u64_ty(), Mutability::Mut),
+        wrapper.clone(),
+        u32_ty(),
+        nz.clone(),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let heap = PointerValue::with_provenance(0x9000, 77, 3);
+    run(
+        assign(
+            local(1),
+            Rvalue::ShallowInitBox(
+                Operand::Constant(Constant::Ptr(heap, raw(u8_ty(), Mutability::Mut))),
+                u64_ty(),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::ptr(heap, raw(u64_ty(), Mutability::Mut)))
+    );
+    assert!(matches!(
+        lower_rvalue(
+            &Rvalue::ShallowInitBox(cint(1, usize_ty()), u64_ty()),
+            &decls,
+            PW
+        ),
+        Err(RvalueLowerError::InvalidShallowInitBox { .. })
+    ));
+
+    run(
+        assign(
+            local(2),
+            Rvalue::WrapUnsafeBinder(cint(5, u32_ty()), wrapper.clone()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::adt(&wrapper_def, 0, vec![u32v(5)]))
+    );
+    run(
+        assign(
+            local(3),
+            Rvalue::WrapUnsafeBinder(cint(6, u32_ty()), u32_ty()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(3)), Some(&u32v(6)));
+    assert_eq!(
+        run(
+            assign(
+                local(4),
+                Rvalue::WrapUnsafeBinder(cint(0, u32_ty()), nz.clone())
+            ),
+            &mut state
+        ),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: nz.clone(),
+                bits: 0
+            }
+        ))
+    );
+    run(
+        assign(
+            local(4),
+            Rvalue::WrapUnsafeBinder(cint(1, u32_ty()), nz.clone()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::adt(&nz_def, 0, vec![u32v(1)]))
+    );
+    for bad in [two.clone(), u64_ty()] {
+        assert!(matches!(
+            lower_rvalue(
+                &Rvalue::WrapUnsafeBinder(cint(1, u32_ty()), bad),
+                &decls,
+                PW
+            ),
+            Err(RvalueLowerError::InvalidWrapUnsafeBinder { .. })
+        ));
+    }
+}
+
+#[test]
+fn test_subtype_and_pointer_coercion_casts() {
+    let mut_u8 = raw(u8_ty(), Mutability::Mut);
+    let const_u8 = raw(u8_ty(), Mutability::Not);
+    let arr_const = raw(Ty::Array(Box::new(u16_ty()), 4), Mutability::Not);
+    let arr_mut = raw(Ty::Array(Box::new(u16_ty()), 4), Mutability::Mut);
+    let decls = vec![
+        unit(),
+        const_u8.clone(),
+        raw(u16_ty(), Mutability::Not),
+        raw(u16_ty(), Mutability::Mut),
+        u32_ty(),
+        mut_u8.clone(),
+    ];
+    let mut state = state_with(decls.clone(), PW);
+    let p = PointerValue::with_provenance(0x1_0000_0010, 3, 9);
+    let cast = |kind: CastKind, src: Ty, target: Ty| {
+        Rvalue::Cast(kind, Operand::Constant(Constant::Ptr(p, src)), target)
+    };
+    let m2c = CastKind::PointerCoercion(PointerCoercionKind::MutToConstPointer);
+    let a2p = CastKind::PointerCoercion(PointerCoercionKind::ArrayToPointer);
+
+    run(
+        assign(local(1), cast(m2c, mut_u8.clone(), const_u8.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::ptr(p, const_u8.clone()))
+    );
+    run(
+        assign(
+            local(2),
+            cast(a2p, arr_const.clone(), raw(u16_ty(), Mutability::Not)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::ptr(p, raw(u16_ty(), Mutability::Not)))
+    );
+    run(
+        assign(
+            local(3),
+            cast(a2p, arr_mut.clone(), raw(u16_ty(), Mutability::Mut)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    // 32-bit targets mask the address (and reject over-wide pointer constants).
+    let mut state32 = state_with(decls.clone(), PtrWidth::Bits32);
+    assert!(matches!(
+        lower_rvalue(
+            &cast(m2c, mut_u8.clone(), const_u8.clone()),
+            &decls,
+            PtrWidth::Bits32
+        ),
+        Err(RvalueLowerError::InvalidConstant { .. })
+    ));
+    state32.slots[5] = LocalSlotState::Init(MirValue::ptr(p, mut_u8.clone()));
+    run(
+        assign(
+            local(1),
+            Rvalue::Cast(m2c, Operand::Copy(local(5)), const_u8.clone()),
+        ),
+        &mut state32,
+    )
+    .unwrap();
+    assert_eq!(
+        state32.get_init(Local(1)),
+        Some(&MirValue::ptr(
+            PointerValue::with_provenance(0x10, 3, 9),
+            const_u8.clone()
+        ))
+    );
+
+    let rejects = [
+        (m2c, const_u8.clone(), const_u8.clone()),
+        (m2c, mut_u8.clone(), mut_u8.clone()),
+        (m2c, mut_u8.clone(), raw(u16_ty(), Mutability::Not)),
+        (m2c, ref_ty(u8_ty()), const_u8.clone()),
+        (a2p, arr_const.clone(), raw(u16_ty(), Mutability::Mut)),
+        (a2p, arr_mut.clone(), raw(u16_ty(), Mutability::Not)),
+        (a2p, arr_const.clone(), raw(u8_ty(), Mutability::Not)),
+        (a2p, const_u8.clone(), const_u8.clone()),
+    ];
+    for (kind, src, target) in rejects {
+        assert!(
+            matches!(
+                lower_rvalue(&cast(kind, src.clone(), target.clone()), &decls, PW),
+                Err(RvalueLowerError::CastError(_))
+            ),
+            "{kind:?} {src:?} -> {target:?}"
+        );
+    }
+
+    // Subtype casts preserve values of equal types and reject anything else.
+    run(
+        assign(
+            local(4),
+            Rvalue::Cast(CastKind::Subtype, cint(42, u32_ty()), u32_ty()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(4)), Some(&u32v(42)));
+    assert!(matches!(
+        lower_rvalue(
+            &Rvalue::Cast(CastKind::Subtype, cint(42, u32_ty()), u64_ty()),
+            &decls,
+            PW
+        ),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::UnsupportedCast { .. }
+        ))
+    ));
+    assert!(matches!(
+        lower_rvalue(
+            &cast(CastKind::Subtype, mut_u8.clone(), const_u8.clone()),
+            &decls,
+            PW
+        ),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::UnsupportedCast { .. }
+        ))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Terminators and the fuel-bounded CFG evaluator
+// ---------------------------------------------------------------------------------------------
+
+fn blk(stmts: Vec<Statement>, term: Terminator) -> BasicBlockData {
+    BasicBlockData::with_terminator(stmts, term, false)
+}
+fn cleanup_blk(stmts: Vec<Statement>, term: Terminator) -> BasicBlockData {
+    BasicBlockData::with_terminator(stmts, term, true)
+}
+fn mk_body(local_decls: Vec<Ty>, basic_blocks: Vec<BasicBlockData>) -> Body {
+    Body {
+        local_decls,
+        basic_blocks,
+    }
+}
+fn lower_ok(body: &Body, pw: PtrWidth) -> LoweredBody {
+    lower_body(body, pw).unwrap_or_else(|e| panic!("lowering {body:?}: {e:?}"))
+}
+fn lower_term_err(body: &Body, pw: PtrWidth) -> (usize, TerminatorLowerError) {
+    match lower_body(body, pw) {
+        Err(RvalueLowerError::InvalidTerminator { bb, error }) => (bb, error),
+        other => panic!("expected InvalidTerminator for {body:?}, got {other:?}"),
+    }
+}
+fn goto_t(target: usize) -> Terminator {
+    Terminator::Goto { target }
+}
+fn assert_t(
+    cond: Operand,
+    expected: bool,
+    msg: AssertMessage,
+    target: usize,
+    unwind: UnwindAction,
+) -> Terminator {
+    Terminator::Assert {
+        cond,
+        expected,
+        msg,
+        target,
+        unwind,
+    }
+}
+fn drop_t(p: Place, target: usize, unwind: UnwindAction) -> Terminator {
+    Terminator::Drop {
+        place: p,
+        target,
+        unwind,
+    }
+}
+fn custom(text: &str) -> AssertMessage {
+    AssertMessage::Custom(text.to_string())
+}
+fn custom_msg(text: &str) -> PanicMessage {
+    PanicMessage::Custom(text.to_string())
+}
+fn cp(l: usize) -> Operand {
+    Operand::Copy(local(l))
+}
+fn mv(l: usize) -> Operand {
+    Operand::Move(local(l))
+}
+fn cbool(b: bool) -> Operand {
+    Operand::Constant(Constant::Bool(b))
+}
+fn returned(outcome: Result<CfgEvalOutcome, CfgEvalError>) -> MirValue {
+    match outcome {
+        Ok(CfgEvalOutcome::Returned(val)) => val,
+        other => panic!("expected Returned, got {other:?}"),
+    }
+}
+
+/// `fn(x: T) -> u32 { match x { values[0] => 10, values[1] => 20, .., _ => 10 * (n + 1) } }`:
+/// `bb0` switches to the arm blocks `bb1..=bb(n+1)` (the last one is `otherwise`), which
+/// write `_0` and jump to the return block `bb(n+2)`.
+fn switch_body(discr_ty: Ty, values: &[u128]) -> Body {
+    let n = values.len();
+    let mut blocks = vec![blk(
+        vec![],
+        Terminator::SwitchInt {
+            discr: cp(1),
+            targets: SwitchTargets::new(values.iter().copied().zip(1..), n + 1),
+        },
+    )];
+    for arm in 0..=n {
+        blocks.push(blk(
+            vec![assign(
+                local(0),
+                Rvalue::Use(cint(10 * (arm as u128 + 1), u32_ty())),
+            )],
+            goto_t(n + 2),
+        ));
+    }
+    blocks.push(blk(vec![], Terminator::Return));
+    mk_body(vec![u32_ty(), discr_ty], blocks)
+}
+
+#[test]
+fn test_cfg_switch_int_matches_bool_char_and_masked_integer_bits() {
+    let run_switch = |discr_ty: Ty, values: &[u128], arg: MirValue, pw: PtrWidth| -> MirValue {
+        let body = lower_ok(&switch_body(discr_ty, values), pw);
+        returned(eval_lowered_body_cfg(&body, &[arg], 16))
+    };
+    // Signed discriminants switch on their two's-complement bits masked to their width.
+    let i8_values = [0xFF, 5];
+    assert_eq!(
+        run_switch(i8_ty(), &i8_values, MirValue::signed(-1, IntTy::I8, PW), PW),
+        u32v(10)
+    );
+    assert_eq!(
+        run_switch(i8_ty(), &i8_values, uint(5, i8_ty()), PW),
+        u32v(20)
+    );
+    for other in [0, 0x7F, 0x80, 0xFE] {
+        assert_eq!(
+            run_switch(i8_ty(), &i8_values, uint(other, i8_ty()), PW),
+            u32v(30)
+        );
+    }
+    // `bool` switches on `0`/`1` (`switchInt(_1) -> [0: bb1, otherwise: bb2]`).
+    assert_eq!(
+        run_switch(Ty::Bool, &[0], MirValue::Bool(false), PW),
+        u32v(10)
+    );
+    assert_eq!(
+        run_switch(Ty::Bool, &[0], MirValue::Bool(true), PW),
+        u32v(20)
+    );
+    // `char` switches on its code point.
+    let char_values = ['a' as u128, '\u{10FFFF}' as u128];
+    assert_eq!(
+        run_switch(Ty::Char, &char_values, MirValue::Char('a'), PW),
+        u32v(10)
+    );
+    assert_eq!(
+        run_switch(Ty::Char, &char_values, MirValue::Char('\u{10FFFF}'), PW),
+        u32v(20)
+    );
+    assert_eq!(
+        run_switch(Ty::Char, &char_values, MirValue::Char('b'), PW),
+        u32v(30)
+    );
+    // Full-width 128-bit values (`u128::MAX` is `-1i128`); the first matching value wins.
+    let u128_ty = Ty::Uint(UintTy::U128);
+    let i128_ty = Ty::Int(IntTy::I128);
+    let wide = [u128::MAX, 0];
+    assert_eq!(
+        run_switch(u128_ty.clone(), &wide, uint(u128::MAX, u128_ty.clone()), PW),
+        u32v(10)
+    );
+    assert_eq!(
+        run_switch(u128_ty.clone(), &wide, uint(0, u128_ty.clone()), PW),
+        u32v(20)
+    );
+    assert_eq!(
+        run_switch(u128_ty.clone(), &wide, uint(7, u128_ty.clone()), PW),
+        u32v(30)
+    );
+    assert_eq!(
+        run_switch(
+            i128_ty.clone(),
+            &wide,
+            MirValue::signed(-1, IntTy::I128, PW),
+            PW
+        ),
+        u32v(10)
+    );
+    // `usize` values are checked against the target's pointer width.
+    let b32 = PtrWidth::Bits32;
+    assert_eq!(
+        run_switch(usize_ty(), &[0xFFFF_FFFF], usizev(0xFFFF_FFFF), b32),
+        u32v(10)
+    );
+    assert_eq!(
+        run_switch(usize_ty(), &[0xFFFF_FFFF], usizev(0), b32),
+        u32v(20)
+    );
+    assert_eq!(
+        run_switch(usize_ty(), &[1 << 32], usizev(1 << 32), PW),
+        u32v(10)
+    );
+
+    // Values that are not valid bit patterns of the discriminant type are rejected statically.
+    for (discr_ty, value, pw) in [
+        (i8_ty(), u128::MAX, PW),
+        (i8_ty(), 0x100, PW),
+        (u16_ty(), 0x1_0000, PW),
+        (Ty::Bool, 2, PW),
+        (Ty::Char, 0xD800, PW),
+        (Ty::Char, 0xDFFF, PW),
+        (Ty::Char, 0x11_0000, PW),
+        (usize_ty(), 1 << 32, b32),
+    ] {
+        assert_eq!(
+            lower_term_err(&switch_body(discr_ty.clone(), &[value]), pw),
+            (
+                0,
+                TerminatorLowerError::SwitchValueOutOfRange { value, discr_ty }
+            ),
+        );
+    }
+    assert_eq!(
+        lower_term_err(&switch_body(u8_ty(), &[3, 4, 3]), PW),
+        (0, TerminatorLowerError::DuplicateSwitchValue(3)),
+    );
+    let mut mismatched = switch_body(u8_ty(), &[1, 2]);
+    if let Some(Terminator::SwitchInt { targets, .. }) = &mut mismatched.basic_blocks[0].terminator
+    {
+        targets.targets.pop();
+    }
+    assert_eq!(
+        lower_term_err(&mismatched, PW),
+        (
+            0,
+            TerminatorLowerError::SwitchTargetsLengthMismatch {
+                values: 2,
+                targets: 1
+            }
+        ),
+    );
+    for discr_ty in [
+        unit(),
+        raw(u8_ty(), Mutability::Not),
+        ref_ty(u8_ty()),
+        Ty::Array(Box::new(u8_ty()), 1),
+        non_zero_u32().1,
+        repr_u8_enum().1,
+    ] {
+        assert_eq!(
+            lower_term_err(&switch_body(discr_ty.clone(), &[]), PW),
+            (0, TerminatorLowerError::InvalidSwitchDiscrType(discr_ty)),
+        );
+    }
+    // A switch on a dead local faults at runtime in the terminator.
+    let body = lower_ok(&switch_body(u8_ty(), &[1]), PW);
+    assert_eq!(
+        eval_lowered_body_cfg(&body, &[], 16),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::DeadLocal(Local(1)),
+        }),
+    );
+}
+
+/// `fn(n: u32) -> u32 { let mut acc = 0; while n != 0 { acc += n; n -= 1; } acc }`.
+fn countdown_body() -> Body {
+    mk_body(
+        vec![u32_ty(), u32_ty(), Ty::Bool],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(2)),
+                    assign(local(0), Rvalue::Use(cint(0, u32_ty()))),
+                ],
+                goto_t(1),
+            ),
+            blk(
+                vec![assign(
+                    local(2),
+                    Rvalue::BinaryOp(BinOp::Ne, cp(1), cint(0, u32_ty())),
+                )],
+                Terminator::SwitchInt {
+                    discr: cp(2),
+                    targets: SwitchTargets::static_if(0, 3, 2),
+                },
+            ),
+            blk(
+                vec![
+                    assign(local(0), Rvalue::BinaryOp(BinOp::Add, cp(0), cp(1))),
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Sub, cp(1), cint(1, u32_ty())),
+                    ),
+                ],
+                goto_t(1),
+            ),
+            blk(vec![Statement::StorageDead(Local(2))], Terminator::Return),
+        ],
+    )
+}
+
+#[test]
+fn test_cfg_loops_consume_one_unit_of_fuel_per_executed_block() {
+    let body = lower_ok(&countdown_body(), PW);
+    // `n = 10` executes bb0, 11 x bb1, 10 x bb2, and bb3: 23 blocks.
+    assert_eq!(
+        returned(eval_lowered_body_cfg(&body, &[u32v(10)], 23)),
+        u32v(55)
+    );
+    assert_eq!(
+        returned(eval_lowered_body_cfg(&body, &[u32v(10)], 10_000)),
+        u32v(55)
+    );
+    assert_eq!(
+        returned(eval_lowered_body_cfg(&body, &[u32v(0)], 3)),
+        u32v(0)
+    );
+    match eval_lowered_body_cfg(&body, &[u32v(10)], 22) {
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 3, state }) => {
+            assert_eq!(state.slots[0], LocalSlotState::Init(u32v(55)));
+            assert_eq!(state.slots[1], LocalSlotState::Init(u32v(0)));
+            assert_eq!(state.slots[2], LocalSlotState::Init(MirValue::Bool(false)));
+        }
+        other => panic!("expected OutOfFuel at bb3, got {other:?}"),
+    }
+    // Fuel 0 runs no block at all: the state is the entry state.
+    let entry = StatementEvalState::from_body(&body, &[u32v(10)]).unwrap();
+    assert_eq!(
+        eval_lowered_body_cfg(&body, &[u32v(10)], 0),
+        Ok(CfgEvalOutcome::OutOfFuel {
+            bb: 0,
+            state: entry.clone()
+        }),
+    );
+    // Resuming an out-of-fuel evaluation with `eval_cfg_in_state` finishes the loop.
+    let Ok(CfgEvalOutcome::OutOfFuel { bb, state }) = eval_lowered_body_cfg(&body, &[u32v(10)], 7)
+    else {
+        panic!("expected OutOfFuel");
+    };
+    assert_eq!(
+        eval_cfg_in_state(&body, state, bb, 16, None),
+        Ok(CfgEvalOutcome::Returned(u32v(55)))
+    );
+    assert_eq!(
+        eval_cfg_in_state(&body, entry.clone(), 4, 16, None),
+        Err(CfgEvalError::InvalidBlock { bb: 4 })
+    );
+    // An infinite loop terminates cleanly.
+    let spin = lower_ok(&mk_body(vec![unit()], vec![blk(vec![], goto_t(0))]), PW);
+    for fuel in [0, 1, 7] {
+        match eval_lowered_body_cfg(&spin, &[], fuel) {
+            Ok(CfgEvalOutcome::OutOfFuel { bb: 0, state }) => {
+                assert_eq!(state.slots, vec![LocalSlotState::Uninit]);
+            }
+            other => panic!("expected OutOfFuel, got {other:?}"),
+        }
+    }
+    // Fuel 0 wins even over a block that would be undefined behavior.
+    let ub = lower_ok(
+        &mk_body(vec![unit()], vec![blk(vec![], Terminator::Unreachable)]),
+        PW,
+    );
+    assert!(matches!(
+        eval_lowered_body_cfg(&ub, &[], 0),
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 0, .. })
+    ));
+    assert_eq!(
+        eval_lowered_body_cfg(&ub, &[], 1),
+        Err(CfgEvalError::UnreachableReached { bb: 0 })
+    );
+}
+
+/// `fn(n: u64) -> u32 { let mut steps = 0; while n != 1 { n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 }; steps += 1; } steps }`.
+fn collatz_body() -> Body {
+    let bump = || {
+        assign(
+            local(0),
+            Rvalue::BinaryOp(BinOp::Add, cp(0), cint(1, u32_ty())),
+        )
+    };
+    mk_body(
+        vec![u32_ty(), u64_ty(), Ty::Bool, u64_ty()],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(2)),
+                    Statement::StorageLive(Local(3)),
+                    assign(local(0), Rvalue::Use(cint(0, u32_ty()))),
+                ],
+                goto_t(1),
+            ),
+            blk(
+                vec![assign(
+                    local(2),
+                    Rvalue::BinaryOp(BinOp::Ne, cp(1), cint(1, u64_ty())),
+                )],
+                Terminator::SwitchInt {
+                    discr: cp(2),
+                    targets: SwitchTargets::static_if(0, 5, 2),
+                },
+            ),
+            blk(
+                vec![assign(
+                    local(3),
+                    Rvalue::BinaryOp(BinOp::Rem, cp(1), cint(2, u64_ty())),
+                )],
+                Terminator::SwitchInt {
+                    discr: cp(3),
+                    targets: SwitchTargets::static_if(0, 3, 4),
+                },
+            ),
+            blk(
+                vec![
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Div, cp(1), cint(2, u64_ty())),
+                    ),
+                    bump(),
+                ],
+                goto_t(1),
+            ),
+            blk(
+                vec![
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Mul, cp(1), cint(3, u64_ty())),
+                    ),
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Add, cp(1), cint(1, u64_ty())),
+                    ),
+                    bump(),
+                ],
+                goto_t(1),
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    )
+}
+
+/// `fn(n: u32) -> u64 { let (mut a, mut b) = (0, 1); while n != 0 { let t = a + b; a = b; b = t; n -= 1; } a }`.
+fn fibonacci_body() -> Body {
+    mk_body(
+        vec![u64_ty(), u32_ty(), u64_ty(), u64_ty(), Ty::Bool],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(2)),
+                    Statement::StorageLive(Local(3)),
+                    Statement::StorageLive(Local(4)),
+                    assign(local(0), Rvalue::Use(cint(0, u64_ty()))),
+                    assign(local(2), Rvalue::Use(cint(1, u64_ty()))),
+                ],
+                goto_t(1),
+            ),
+            blk(
+                vec![assign(
+                    local(4),
+                    Rvalue::BinaryOp(BinOp::Ne, cp(1), cint(0, u32_ty())),
+                )],
+                Terminator::SwitchInt {
+                    discr: cp(4),
+                    targets: SwitchTargets::static_if(0, 3, 2),
+                },
+            ),
+            blk(
+                vec![
+                    assign(local(3), Rvalue::BinaryOp(BinOp::Add, cp(0), cp(2))),
+                    assign(local(0), Rvalue::Use(cp(2))),
+                    assign(local(2), Rvalue::Use(mv(3))),
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Sub, cp(1), cint(1, u32_ty())),
+                    ),
+                ],
+                goto_t(1),
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    )
+}
+
+#[test]
+fn test_cfg_collatz_and_fibonacci_loops_match_direct_computation() {
+    let collatz = lower_ok(&collatz_body(), PW);
+    let steps = |mut n: u64| {
+        let mut steps = 0u32;
+        while n != 1 {
+            n = if n.is_multiple_of(2) { n / 2 } else { 3 * n + 1 };
+            steps += 1;
+        }
+        steps
+    };
+    for n in 1..=300u64 {
+        let expected = steps(n);
+        // bb0, then bb1 + bb2 + (bb3 | bb4) per step, then the final bb1 and bb5.
+        let needed = 3 * expected as usize + 3;
+        assert_eq!(
+            returned(eval_lowered_body_cfg(
+                &collatz,
+                &[uint(u128::from(n), u64_ty())],
+                needed
+            )),
+            u32v(u128::from(expected)),
+            "collatz({n})"
+        );
+        assert!(matches!(
+            eval_lowered_body_cfg(&collatz, &[uint(u128::from(n), u64_ty())], needed - 1),
+            Ok(CfgEvalOutcome::OutOfFuel { bb: 5, .. })
+        ));
+    }
+    assert_eq!(steps(27), 111);
+
+    let fibonacci = lower_ok(&fibonacci_body(), PW);
+    let (mut a, mut b) = (0u64, 1u64);
+    for n in 0..=93u32 {
+        assert_eq!(
+            returned(eval_lowered_body_cfg(
+                &fibonacci,
+                &[u32v(u128::from(n))],
+                2 * n as usize + 3
+            )),
+            uint(u128::from(a), u64_ty()),
+            "fib({n})"
+        );
+        (a, b) = (b, a.wrapping_add(b));
+    }
+    assert_eq!(
+        returned(eval_lowered_body_cfg(&fibonacci, &[u32v(50)], 1_000)),
+        uint(12_586_269_025, u64_ty())
+    );
+}
+
+/// `fn(a: [u32; 4], limit: usize) -> u32 { let (mut i, mut s) = (0, 0); while i < limit { s += a[i]; i += 1; } s }`
+/// with `rustc`'s bounds-check and overflow-check `Assert`s.
+fn array_sum_body() -> Body {
+    let a_i = || Operand::Copy(place(1, vec![ProjectionElem::Index(Local(3))]));
+    let checked = |ty: Ty| Ty::Tuple(vec![ty, Ty::Bool]);
+    mk_body(
+        vec![
+            u32_ty(),
+            Ty::Array(Box::new(u32_ty()), 4),
+            usize_ty(),
+            usize_ty(),
+            Ty::Bool,
+            checked(u32_ty()),
+            checked(usize_ty()),
+            Ty::Bool,
+        ],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(3)),
+                    Statement::StorageLive(Local(4)),
+                    Statement::StorageLive(Local(5)),
+                    Statement::StorageLive(Local(6)),
+                    Statement::StorageLive(Local(7)),
+                    assign(local(0), Rvalue::Use(cint(0, u32_ty()))),
+                    assign(local(3), Rvalue::Use(cint(0, usize_ty()))),
+                ],
+                goto_t(1),
+            ),
+            blk(
+                vec![assign(local(4), Rvalue::BinaryOp(BinOp::Lt, cp(3), cp(2)))],
+                Terminator::SwitchInt {
+                    discr: cp(4),
+                    targets: SwitchTargets::static_if(0, 5, 2),
+                },
+            ),
+            blk(
+                vec![assign(
+                    local(7),
+                    Rvalue::BinaryOp(BinOp::Lt, cp(3), cint(4, usize_ty())),
+                )],
+                assert_t(
+                    cp(7),
+                    true,
+                    AssertMessage::BoundsCheck {
+                        len: cint(4, usize_ty()),
+                        index: cp(3),
+                    },
+                    3,
+                    UnwindAction::Continue,
+                ),
+            ),
+            blk(
+                vec![assign(
+                    local(5),
+                    Rvalue::BinaryOp(BinOp::AddWithOverflow, cp(0), a_i()),
+                )],
+                assert_t(
+                    Operand::Copy(place(5, vec![field(1, Ty::Bool)])),
+                    false,
+                    AssertMessage::Overflow(BinOp::Add, cp(0), a_i()),
+                    4,
+                    UnwindAction::Continue,
+                ),
+            ),
+            blk(
+                vec![
+                    assign(
+                        local(0),
+                        Rvalue::Use(Operand::Copy(place(5, vec![field(0, u32_ty())]))),
+                    ),
+                    assign(
+                        local(6),
+                        Rvalue::BinaryOp(BinOp::AddWithOverflow, cp(3), cint(1, usize_ty())),
+                    ),
+                    assign(
+                        local(3),
+                        Rvalue::Use(Operand::Copy(place(6, vec![field(0, usize_ty())]))),
+                    ),
+                ],
+                goto_t(1),
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    )
+}
+
+#[test]
+fn test_cfg_bounds_and_overflow_asserts_panic_with_evaluated_messages() {
+    let body = lower_ok(&array_sum_body(), PW);
+    let arr = |vals: [u128; 4]| MirValue::Array {
+        elements: vals.iter().map(|v| u32v(*v)).collect(),
+        elem_ty: u32_ty(),
+    };
+    let sum = |vals: [u128; 4], limit: u128| {
+        eval_lowered_body_cfg(&body, &[arr(vals), usizev(limit)], 1_000)
+    };
+    assert_eq!(returned(sum([1, 2, 3, 4], 4)), u32v(10));
+    assert_eq!(returned(sum([1, 2, 3, 4], 2)), u32v(3));
+    assert_eq!(returned(sum([1, 2, 3, 4], 0)), u32v(0));
+    assert_eq!(
+        sum([1, 2, 3, 4], 5),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 2,
+            msg: PanicMessage::BoundsCheck {
+                len: usizev(4),
+                index: usizev(4),
+            },
+        }),
+    );
+    assert_eq!(
+        sum([u32::MAX as u128, 1, 0, 0], 4),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 3,
+            msg: PanicMessage::Overflow(BinOp::Add, u32v(u32::MAX as u128), u32v(1)),
+        }),
+    );
+
+    // Every message kind evaluates its operands when (and only when) the assertion fails.
+    // `fn(i: usize, x: i8) -> ()`; `_3: usize` is a dead temporary.
+    let msg_body = |cond: bool, msg: AssertMessage| {
+        mk_body(
+            vec![unit(), usize_ty(), i8_ty(), usize_ty()],
+            vec![
+                blk(
+                    vec![],
+                    assert_t(cbool(cond), true, msg, 1, UnwindAction::Continue),
+                ),
+                blk(
+                    vec![assign(
+                        local(0),
+                        Rvalue::Use(Operand::Constant(Constant::Unit)),
+                    )],
+                    Terminator::Return,
+                ),
+            ],
+        )
+    };
+    let args = [usizev(9), uint(0x7F, i8_ty())];
+    let cases = vec![
+        (
+            AssertMessage::BoundsCheck {
+                len: cint(4, usize_ty()),
+                index: cp(1),
+            },
+            PanicMessage::BoundsCheck {
+                len: usizev(4),
+                index: usizev(9),
+            },
+        ),
+        (
+            AssertMessage::Overflow(BinOp::Add, cp(2), cint(1, i8_ty())),
+            PanicMessage::Overflow(BinOp::Add, uint(0x7F, i8_ty()), uint(1, i8_ty())),
+        ),
+        (
+            AssertMessage::Overflow(BinOp::Shl, cp(2), cint(9, u32_ty())),
+            PanicMessage::Overflow(BinOp::Shl, uint(0x7F, i8_ty()), u32v(9)),
+        ),
+        (
+            AssertMessage::OverflowNeg(cint(0x80, i8_ty())),
+            PanicMessage::OverflowNeg(uint(0x80, i8_ty())),
+        ),
+        (
+            AssertMessage::DivisionByZero(cp(2)),
+            PanicMessage::DivisionByZero(uint(0x7F, i8_ty())),
+        ),
+        (
+            AssertMessage::RemainderByZero(cp(1)),
+            PanicMessage::RemainderByZero(usizev(9)),
+        ),
+        (
+            AssertMessage::MisalignedPointerDereference {
+                required: cint(4, usize_ty()),
+                found: cp(1),
+            },
+            PanicMessage::MisalignedPointerDereference {
+                required: usizev(4),
+                found: usizev(9),
+            },
+        ),
+        (
+            AssertMessage::NullPointerDereference,
+            PanicMessage::NullPointerDereference,
+        ),
+        (
+            AssertMessage::InvalidEnumConstruction(cint(3, u8_ty())),
+            PanicMessage::InvalidEnumConstruction(u8v(3)),
+        ),
+        (custom("custom"), custom_msg("custom")),
+    ];
+    for (msg, expected) in cases {
+        let failing = lower_ok(&msg_body(false, msg.clone()), PW);
+        assert_eq!(
+            eval_lowered_body_cfg(&failing, &args, 10),
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: expected
+            }),
+            "{msg:?}"
+        );
+        let passing = lower_ok(&msg_body(true, msg.clone()), PW);
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&passing, &args, 10)),
+            MirValue::Unit,
+            "{msg:?}"
+        );
+    }
+    // A message operand reading a dead local only faults when the assertion fails.
+    for msg in [
+        AssertMessage::BoundsCheck {
+            len: cint(4, usize_ty()),
+            index: cp(3),
+        },
+        AssertMessage::InvalidEnumConstruction(cp(3)),
+    ] {
+        let passing = lower_ok(&msg_body(true, msg.clone()), PW);
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&passing, &args, 10)),
+            MirValue::Unit
+        );
+        let failing = lower_ok(&msg_body(false, msg), PW);
+        assert_eq!(
+            eval_lowered_body_cfg(&failing, &args, 10),
+            Err(CfgEvalError::Terminator {
+                bb: 0,
+                error: RvalueEvalError::DeadLocal(Local(3)),
+            }),
+        );
+    }
+    // Message operands and the condition are type-checked statically.
+    let bad_operand =
+        |msg: AssertMessage, got: Ty| match lower_term_err(&msg_body(false, msg.clone()), PW) {
+            (0, TerminatorLowerError::InvalidAssertMessageOperand { got: actual, .. }) => {
+                assert_eq!(actual, got, "{msg:?}")
+            }
+            other => panic!("{msg:?}: {other:?}"),
+        };
+    bad_operand(
+        AssertMessage::BoundsCheck {
+            len: cint(4, u32_ty()),
+            index: cp(1),
+        },
+        u32_ty(),
+    );
+    bad_operand(
+        AssertMessage::BoundsCheck {
+            len: cint(4, usize_ty()),
+            index: cp(2),
+        },
+        i8_ty(),
+    );
+    bad_operand(
+        AssertMessage::Overflow(BinOp::Add, cp(2), cint(1, u8_ty())),
+        u8_ty(),
+    );
+    bad_operand(
+        AssertMessage::Overflow(BinOp::Add, cbool(true), cbool(true)),
+        Ty::Bool,
+    );
+    bad_operand(AssertMessage::OverflowNeg(cint(1, u8_ty())), u8_ty());
+    bad_operand(AssertMessage::DivisionByZero(cbool(false)), Ty::Bool);
+    bad_operand(
+        AssertMessage::RemainderByZero(Operand::Constant(Constant::Char('x'))),
+        Ty::Char,
+    );
+    bad_operand(
+        AssertMessage::MisalignedPointerDereference {
+            required: cint(4, usize_ty()),
+            found: cint(2, u64_ty()),
+        },
+        u64_ty(),
+    );
+    bad_operand(
+        AssertMessage::InvalidEnumConstruction(Operand::Constant(Constant::Unit)),
+        unit(),
+    );
+    lower_ok(
+        &msg_body(
+            false,
+            AssertMessage::Overflow(BinOp::Shr, cint(1, u64_ty()), cint(1, i8_ty())),
+        ),
+        PW,
+    );
+    let mut not_bool = msg_body(false, custom("c"));
+    not_bool.basic_blocks[0].terminator = Some(assert_t(
+        cp(2),
+        true,
+        custom("c"),
+        1,
+        UnwindAction::Continue,
+    ));
+    assert_eq!(
+        lower_term_err(&not_bool, PW),
+        (0, TerminatorLowerError::InvalidAssertCondType(i8_ty()))
+    );
+}
+
+/// `fn(c: bool) -> u8`: `bb0: _0 = 7; assert(c, "boom") -> [success: bb1, unwind: <unwind>]`,
+/// `bb1: return`, followed by `cleanup` blocks from `bb2` on (`_2: u8` is a dead temporary).
+fn assert_body(unwind: UnwindAction, cleanup: Vec<BasicBlockData>) -> Body {
+    let mut blocks = vec![
+        blk(
+            vec![assign(local(0), Rvalue::Use(cint(7, u8_ty())))],
+            assert_t(cp(1), true, custom("boom"), 1, unwind),
+        ),
+        blk(vec![], Terminator::Return),
+    ];
+    blocks.extend(cleanup);
+    mk_body(vec![u8_ty(), Ty::Bool, u8_ty()], blocks)
+}
+
+#[test]
+fn test_cfg_panics_follow_unwind_actions_through_cleanup_blocks() {
+    let eval = |body: &Body, c: bool, fuel: usize| {
+        eval_lowered_body_cfg(&lower_ok(body, PW), &[MirValue::Bool(c)], fuel)
+    };
+    let resume = || cleanup_blk(vec![], Terminator::UnwindResume);
+    let terminate = || cleanup_blk(vec![], Terminator::UnwindTerminate);
+    let panicked = |bb: usize, text: &str| {
+        Ok(CfgEvalOutcome::Panicked {
+            bb,
+            msg: custom_msg(text),
+        })
+    };
+    let terminated = |bb: usize, text: &str| {
+        Ok(CfgEvalOutcome::Terminated {
+            bb,
+            msg: custom_msg(text),
+        })
+    };
+
+    for unwind in [
+        UnwindAction::Continue,
+        UnwindAction::Terminate,
+        UnwindAction::Unreachable,
+        UnwindAction::Cleanup(2),
+    ] {
+        assert_eq!(
+            returned(eval(&assert_body(unwind, vec![resume()]), true, 10)),
+            u8v(7)
+        );
+    }
+    assert_eq!(
+        eval(&assert_body(UnwindAction::Continue, vec![]), false, 10),
+        panicked(0, "boom")
+    );
+    assert_eq!(
+        eval(&assert_body(UnwindAction::Terminate, vec![]), false, 10),
+        terminated(0, "boom")
+    );
+    assert_eq!(
+        eval(&assert_body(UnwindAction::Unreachable, vec![]), false, 10),
+        Err(CfgEvalError::UnwindIntoUnreachable {
+            bb: 0,
+            msg: Box::new(custom_msg("boom")),
+        })
+    );
+    assert_eq!(
+        eval(
+            &assert_body(UnwindAction::Cleanup(2), vec![resume()]),
+            false,
+            10
+        ),
+        panicked(0, "boom")
+    );
+    assert_eq!(
+        eval(
+            &assert_body(UnwindAction::Cleanup(2), vec![terminate()]),
+            false,
+            10
+        ),
+        terminated(0, "boom")
+    );
+
+    // A cleanup chain runs every block's statements and terminators, consuming fuel.
+    let chain = assert_body(
+        UnwindAction::Cleanup(2),
+        vec![
+            cleanup_blk(
+                vec![
+                    Statement::StorageLive(Local(2)),
+                    assign(local(2), Rvalue::Use(cint(1, u8_ty()))),
+                ],
+                goto_t(3),
+            ),
+            cleanup_blk(
+                vec![Statement::StorageDead(Local(2))],
+                drop_t(local(0), 4, UnwindAction::Terminate),
+            ),
+            resume(),
+        ],
+    );
+    assert_eq!(eval(&chain, false, 4), panicked(0, "boom"));
+    match eval(&chain, false, 2) {
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 3, state }) => {
+            assert_eq!(state.slots[0], LocalSlotState::Init(u8v(7)));
+            assert_eq!(state.slots[2], LocalSlotState::Init(u8v(1)));
+        }
+        other => panic!("expected OutOfFuel at bb3, got {other:?}"),
+    }
+    match eval(&chain, false, 3) {
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 4, state }) => {
+            assert_eq!(state.slots[2], LocalSlotState::Dead)
+        }
+        other => panic!("expected OutOfFuel at bb4, got {other:?}"),
+    }
+    // An endless cleanup loop runs out of fuel.
+    let spin = assert_body(
+        UnwindAction::Cleanup(2),
+        vec![cleanup_blk(vec![], goto_t(2))],
+    );
+    assert!(matches!(
+        eval(&spin, false, 50),
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 2, .. })
+    ));
+    // Undefined behavior inside a cleanup block is reported with its location.
+    let ub = assert_body(
+        UnwindAction::Cleanup(2),
+        vec![cleanup_blk(
+            vec![assign(local(0), Rvalue::Use(cp(2)))],
+            Terminator::UnwindResume,
+        )],
+    );
+    assert_eq!(
+        eval(&ub, false, 10),
+        Err(CfgEvalError::Statement {
+            bb: 2,
+            index: 0,
+            error: RvalueEvalError::DeadLocal(Local(2)),
+        })
+    );
+    let unreachable = assert_body(
+        UnwindAction::Cleanup(2),
+        vec![cleanup_blk(vec![], Terminator::Unreachable)],
+    );
+    assert_eq!(
+        eval(&unreachable, false, 10),
+        Err(CfgEvalError::UnreachableReached { bb: 2 })
+    );
+    // A second panic inside a cleanup block aborts (`Terminate`) or is UB (`Unreachable`); a
+    // passing cleanup assertion keeps unwinding the original panic.
+    let nested = |cond: bool, unwind: UnwindAction| {
+        assert_body(
+            UnwindAction::Cleanup(2),
+            vec![
+                cleanup_blk(
+                    vec![],
+                    assert_t(cbool(cond), true, custom("double"), 3, unwind),
+                ),
+                resume(),
+            ],
+        )
+    };
+    assert_eq!(
+        eval(&nested(false, UnwindAction::Terminate), false, 10),
+        terminated(2, "double")
+    );
+    assert_eq!(
+        eval(&nested(false, UnwindAction::Unreachable), false, 10),
+        Err(CfgEvalError::UnwindIntoUnreachable {
+            bb: 2,
+            msg: Box::new(custom_msg("double")),
+        })
+    );
+    assert_eq!(
+        eval(&nested(true, UnwindAction::Terminate), false, 10),
+        panicked(0, "boom")
+    );
+}
+
+#[test]
+fn test_cfg_return_requires_a_fully_initialized_inhabited_return_place() {
+    let eval = |body: &Body| eval_lowered_body_cfg(&lower_ok(body, PW), &[], 10);
+    // `_0` never written (also for a zero-sized `_0`: initialization is tracked per local).
+    for ret_ty in [u32_ty(), unit()] {
+        assert_eq!(
+            eval(&mk_body(
+                vec![ret_ty],
+                vec![blk(vec![], Terminator::Return)]
+            )),
+            Err(CfgEvalError::Terminator {
+                bb: 0,
+                error: RvalueEvalError::UninitializedLocal(Local(0)),
+            })
+        );
+    }
+    // A partially initialized typed struct cannot be returned; a complete one can.
+    let (pair_def, pair_ty) = adt(AdtDef::new_struct("Pair", vec![u8_ty(), u32_ty()]));
+    let write0 = assign(
+        place(0, vec![field(0, u8_ty())]),
+        Rvalue::Use(cint(1, u8_ty())),
+    );
+    let write1 = assign(
+        place(0, vec![field(1, u32_ty())]),
+        Rvalue::Use(cint(2, u32_ty())),
+    );
+    assert_eq!(
+        eval(&mk_body(
+            vec![pair_ty.clone()],
+            vec![blk(vec![write0.clone()], Terminator::Return)]
+        )),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::UninitializedLocal(Local(0)),
+        })
+    );
+    assert_eq!(
+        returned(eval(&mk_body(
+            vec![pair_ty.clone()],
+            vec![blk(
+                vec![write0.clone(), write1.clone()],
+                Terminator::Return
+            )]
+        ))),
+        MirValue::adt(&pair_def, 0, vec![u8v(1), u32v(2)])
+    );
+    // An enum built field-by-field plus `SetDiscriminant` across blocks.
+    let (enum_def, enum_ty) = repr_u8_enum();
+    let body = mk_body(
+        vec![enum_ty.clone()],
+        vec![
+            blk(
+                vec![assign(
+                    place(0, vec![ProjectionElem::Downcast(1), field(0, u16_ty())]),
+                    Rvalue::Use(cint(5, u16_ty())),
+                )],
+                goto_t(1),
+            ),
+            blk(
+                vec![Statement::SetDiscriminant {
+                    place: local(0),
+                    variant_index: 1,
+                }],
+                Terminator::Return,
+            ),
+        ],
+    );
+    assert_eq!(
+        returned(eval(&body)),
+        MirValue::adt(&enum_def, 1, vec![u16v(5)])
+    );
+    // Returning reads `_0` as a typed value, which enforces scalar valid ranges.
+    let (_, nz_ty) = non_zero_u32();
+    let zero = assign(
+        place(0, vec![field(0, u32_ty())]),
+        Rvalue::Use(cint(0, u32_ty())),
+    );
+    assert_eq!(
+        eval(&mk_body(
+            vec![nz_ty.clone()],
+            vec![blk(vec![zero], Terminator::Return)]
+        )),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: nz_ty.clone(),
+                bits: 0,
+            }),
+        })
+    );
+    // Statically: no return place, an uninhabited return type, or a `Return` in a cleanup block.
+    assert_eq!(
+        lower_term_err(&mk_body(vec![], vec![blk(vec![], Terminator::Return)]), PW),
+        (0, TerminatorLowerError::MissingReturnPlace)
+    );
+    let (_, void_ty) = adt(AdtDef::new_enum("Void", None, vec![]));
+    for ret_ty in [Ty::Never, void_ty, Ty::Tuple(vec![u8_ty(), Ty::Never])] {
+        assert_eq!(
+            lower_term_err(
+                &mk_body(vec![ret_ty.clone()], vec![blk(vec![], Terminator::Return)]),
+                PW
+            ),
+            (0, TerminatorLowerError::UninhabitedReturnPlace(ret_ty))
+        );
+    }
+    let cleanup_return = mk_body(
+        vec![u8_ty()],
+        vec![
+            blk(
+                vec![],
+                assert_t(cbool(true), true, custom("x"), 0, UnwindAction::Cleanup(1)),
+            ),
+            cleanup_blk(vec![], Terminator::Return),
+        ],
+    );
+    assert_eq!(
+        lower_term_err(&cleanup_return, PW),
+        (1, TerminatorLowerError::ReturnInCleanupBlock)
+    );
+    // `-> !` functions may still diverge without returning.
+    let diverge = lower_ok(&mk_body(vec![Ty::Never], vec![blk(vec![], goto_t(0))]), PW);
+    assert!(matches!(
+        eval_lowered_body_cfg(&diverge, &[], 3),
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 0, .. })
+    ));
+}
+
+#[test]
+fn test_cfg_drop_is_a_no_op_on_live_places() {
+    let eval = |body: &Body, args: &[MirValue], fuel: usize| {
+        eval_lowered_body_cfg(&lower_ok(body, PW), args, fuel)
+    };
+    // `fn(x: u32) -> u32 { drop(x); x }`: the dropped value is unchanged.
+    let body = mk_body(
+        vec![u32_ty(), u32_ty()],
+        vec![
+            blk(vec![], drop_t(local(1), 1, UnwindAction::Continue)),
+            blk(
+                vec![assign(local(0), Rvalue::Use(cp(1)))],
+                Terminator::Return,
+            ),
+        ],
+    );
+    assert_eq!(returned(eval(&body, &[u32v(42)], 10)), u32v(42));
+    // Dropping an uninitialized field of a partially initialized struct leaves the shell as is.
+    let (pair_def, pair_ty) = adt(AdtDef::new_struct("Pair", vec![u8_ty(), u32_ty()]));
+    let write0 = assign(
+        place(0, vec![field(0, u8_ty())]),
+        Rvalue::Use(cint(1, u8_ty())),
+    );
+    let body = mk_body(
+        vec![pair_ty.clone()],
+        vec![
+            blk(
+                vec![write0.clone()],
+                drop_t(
+                    place(0, vec![field(1, u32_ty())]),
+                    1,
+                    UnwindAction::Continue,
+                ),
+            ),
+            blk(
+                vec![assign(
+                    place(0, vec![field(1, u32_ty())]),
+                    Rvalue::Use(cint(2, u32_ty())),
+                )],
+                Terminator::Return,
+            ),
+        ],
+    );
+    let lowered = lower_ok(&body, PW);
+    let mut expected = StatementEvalState::from_body(&lowered, &[]).unwrap();
+    run(write0, &mut expected).unwrap();
+    assert!(matches!(expected.slots[0], LocalSlotState::PartialShell(_)));
+    assert_eq!(
+        eval_lowered_body_cfg(&lowered, &[], 1),
+        Ok(CfgEvalOutcome::OutOfFuel {
+            bb: 1,
+            state: expected
+        })
+    );
+    assert_eq!(
+        returned(eval_lowered_body_cfg(&lowered, &[], 2)),
+        MirValue::adt(&pair_def, 0, vec![u8v(1), u32v(2)])
+    );
+    // Dropping a dead local, or a place indexed by an uninitialized local, is UB.
+    let arr = Ty::Array(Box::new(u32_ty()), 2);
+    let dead = mk_body(
+        vec![u32_ty(), u32_ty()],
+        vec![
+            blk(vec![], drop_t(local(1), 1, UnwindAction::Continue)),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    assert_eq!(
+        eval(&dead, &[], 10),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::DeadLocal(Local(1)),
+        })
+    );
+    let uninit_index = mk_body(
+        vec![u32_ty(), arr, usize_ty()],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(1)),
+                    Statement::StorageLive(Local(2)),
+                ],
+                drop_t(
+                    place(1, vec![ProjectionElem::Index(Local(2))]),
+                    1,
+                    UnwindAction::Continue,
+                ),
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    assert_eq!(
+        eval(&uninit_index, &[], 10),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::UninitializedLocal(Local(2)),
+        })
+    );
+    // Statically: the unwind edge must lead to a cleanup block, and cleanup blocks may not
+    // `Continue` unwinding.
+    let bad_unwind = mk_body(
+        vec![u32_ty()],
+        vec![
+            blk(vec![], drop_t(local(0), 1, UnwindAction::Cleanup(1))),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    assert!(matches!(
+        lower_term_err(&bad_unwind, PW),
+        (0, TerminatorLowerError::InvalidEdge { target: 1, .. })
+    ));
+    let continue_in_cleanup = mk_body(
+        vec![u32_ty()],
+        vec![
+            blk(vec![], drop_t(local(0), 0, UnwindAction::Cleanup(1))),
+            cleanup_blk(vec![], drop_t(local(0), 2, UnwindAction::Continue)),
+            cleanup_blk(vec![], Terminator::UnwindResume),
+        ],
+    );
+    assert_eq!(
+        lower_term_err(&continue_in_cleanup, PW),
+        (
+            1,
+            TerminatorLowerError::InvalidUnwindAction {
+                unwind: UnwindAction::Continue,
+                reason: "UnwindAction::Continue in a cleanup block",
+            }
+        )
+    );
+}
+
+const FN_ADD: u128 = 0xADD;
+
+/// `fn(a: u32, b: u32) -> u32`: `bb0: _0 = add(move _1, copy _2) -> [return: <target>, unwind:
+/// <unwind>]`, `bb1: return`, followed by `extra` blocks from `bb2` on.
+fn call_body(target: Option<usize>, unwind: UnwindAction, extra: Vec<BasicBlockData>) -> Body {
+    let mut blocks = vec![
+        blk(
+            vec![],
+            Terminator::Call {
+                func: cint(FN_ADD, usize_ty()),
+                args: vec![mv(1), cp(2)],
+                destination: local(0),
+                target,
+                unwind,
+            },
+        ),
+        blk(vec![], Terminator::Return),
+    ];
+    blocks.extend(extra);
+    mk_body(vec![u32_ty(), u32_ty(), u32_ty()], blocks)
+}
+
+/// Call handler adding two `u32` arguments of `FN_ADD`.
+fn add_handler(
+    _bb: usize,
+    func: &MirValue,
+    args: &[MirValue],
+) -> Result<CallOutcome, RvalueEvalError> {
+    assert_eq!(func, &usizev(FN_ADD));
+    match args {
+        [MirValue::Int { bits: a, .. }, MirValue::Int { bits: b, .. }] => {
+            Ok(CallOutcome::Return(u32v((a + b) & 0xFFFF_FFFF)))
+        }
+        _ => panic!("unexpected arguments {args:?}"),
+    }
+}
+
+#[test]
+fn test_cfg_calls_go_through_the_call_handler() {
+    let args = [u32v(40), u32v(2)];
+    let body = lower_ok(&call_body(Some(1), UnwindAction::Continue, vec![]), PW);
+    assert_eq!(
+        eval_lowered_body_cfg(&body, &args, 10),
+        Err(CfgEvalError::UnsupportedCall { bb: 0 })
+    );
+    let mut log = Vec::new();
+    let outcome = eval_lowered_body_cfg_with_calls(&body, &args, 10, |bb, func, call_args| {
+        log.push((bb, func.clone(), call_args.to_vec()));
+        add_handler(bb, func, call_args)
+    });
+    assert_eq!(returned(outcome), u32v(42));
+    assert_eq!(log, vec![(0, usizev(FN_ADD), args.to_vec())]);
+
+    // A moved argument local is deinitialized by the call; a copied one is not.
+    let reread = |l: usize| {
+        call_body(
+            Some(2),
+            UnwindAction::Continue,
+            vec![blk(
+                vec![assign(local(0), Rvalue::BinaryOp(BinOp::Add, cp(0), cp(l)))],
+                goto_t(1),
+            )],
+        )
+    };
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_calls(
+            &lower_ok(&reread(2), PW),
+            &args,
+            10,
+            add_handler
+        )),
+        u32v(44)
+    );
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(&lower_ok(&reread(1), PW), &args, 10, add_handler),
+        Err(CfgEvalError::Statement {
+            bb: 2,
+            index: 0,
+            error: RvalueEvalError::UninitializedLocal(Local(1)),
+        })
+    );
+    // Chained calls: the second call consumes the first call's result.
+    let chained = mk_body(
+        vec![u32_ty(), u32_ty(), u32_ty()],
+        vec![
+            blk(
+                vec![],
+                Terminator::Call {
+                    func: cint(FN_ADD, usize_ty()),
+                    args: vec![cp(1), cp(2)],
+                    destination: local(2),
+                    target: Some(1),
+                    unwind: UnwindAction::Continue,
+                },
+            ),
+            blk(
+                vec![],
+                Terminator::Call {
+                    func: cint(FN_ADD, usize_ty()),
+                    args: vec![cp(2), cp(2)],
+                    destination: local(0),
+                    target: Some(2),
+                    unwind: UnwindAction::Terminate,
+                },
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    let mut blocks_called = Vec::new();
+    let outcome = eval_lowered_body_cfg_with_calls(
+        &lower_ok(&chained, PW),
+        &args,
+        10,
+        |bb, func, call_args| {
+            blocks_called.push(bb);
+            add_handler(bb, func, call_args)
+        },
+    );
+    assert_eq!(returned(outcome), u32v(84));
+    assert_eq!(blocks_called, vec![0, 1]);
+
+    // Panicking callees unwind like a failed assertion; the destination is left unchanged.
+    let panicking =
+        |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Panic("callee".into()));
+    let unwound = |unwind: UnwindAction, extra: Vec<BasicBlockData>| {
+        eval_lowered_body_cfg_with_calls(
+            &lower_ok(&call_body(Some(1), unwind, extra), PW),
+            &args,
+            10,
+            panicking,
+        )
+    };
+    let callee = || custom_msg("callee");
+    assert_eq!(
+        unwound(UnwindAction::Continue, vec![]),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 0,
+            msg: callee()
+        })
+    );
+    assert_eq!(
+        unwound(UnwindAction::Terminate, vec![]),
+        Ok(CfgEvalOutcome::Terminated {
+            bb: 0,
+            msg: callee()
+        })
+    );
+    assert_eq!(
+        unwound(UnwindAction::Unreachable, vec![]),
+        Err(CfgEvalError::UnwindIntoUnreachable {
+            bb: 0,
+            msg: Box::new(callee()),
+        })
+    );
+    assert_eq!(
+        unwound(
+            UnwindAction::Cleanup(2),
+            vec![cleanup_blk(vec![], Terminator::UnwindResume)]
+        ),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 0,
+            msg: callee()
+        })
+    );
+    let mut pre_init = call_body(
+        Some(1),
+        UnwindAction::Cleanup(2),
+        vec![cleanup_blk(vec![], goto_t(2))],
+    );
+    pre_init.basic_blocks[0].statements = vec![assign(local(0), Rvalue::Use(cint(5, u32_ty())))];
+    match eval_lowered_body_cfg_with_calls(&lower_ok(&pre_init, PW), &args, 3, panicking) {
+        Ok(CfgEvalOutcome::OutOfFuel { bb: 2, state }) => {
+            assert_eq!(state.slots[0], LocalSlotState::Init(u32v(5)));
+            assert_eq!(state.slots[1], LocalSlotState::Uninit);
+            assert_eq!(state.slots[2], LocalSlotState::Init(u32v(2)));
+        }
+        other => panic!("expected OutOfFuel in the cleanup loop, got {other:?}"),
+    }
+
+    // Undefined behavior reported by the handler, or ill-typed / ill-formed return values.
+    let with = |handler: &dyn Fn() -> Result<CallOutcome, RvalueEvalError>| {
+        eval_lowered_body_cfg_with_calls(&body, &args, 10, |_, _, _| handler())
+    };
+    assert_eq!(
+        with(&|| Err(RvalueEvalError::AssumeFalse)),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::AssumeFalse,
+        })
+    );
+    assert!(matches!(
+        with(&|| Ok(CallOutcome::Return(u8v(1)))),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
+    assert_eq!(
+        with(&|| Ok(CallOutcome::Return(uint(1 << 32, u32_ty())))),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: u32_ty(),
+                bits: 1 << 32,
+            }),
+        })
+    );
+    let (nz_def, nz_ty) = non_zero_u32();
+    let nz_call = mk_body(
+        vec![nz_ty.clone()],
+        vec![
+            blk(
+                vec![],
+                Terminator::Call {
+                    func: Operand::Constant(Constant::Unit),
+                    args: vec![],
+                    destination: local(0),
+                    target: Some(1),
+                    unwind: UnwindAction::Continue,
+                },
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    let nz_call = lower_ok(&nz_call, PW);
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_calls(
+            &nz_call,
+            &[],
+            10,
+            |_, func, _| {
+                assert_eq!(func, &MirValue::Unit);
+                Ok(CallOutcome::Return(MirValue::adt(
+                    &nz_def,
+                    0,
+                    vec![u32v(9)],
+                )))
+            }
+        )),
+        MirValue::adt(&nz_def, 0, vec![u32v(9)])
+    );
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(&nz_call, &[], 10, |_, _, _| {
+            Ok(CallOutcome::Return(MirValue::adt(
+                &nz_def,
+                0,
+                vec![u32v(0)],
+            )))
+        }),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: nz_ty.clone(),
+                bits: 0,
+            }),
+        })
+    );
+    // A call without a return target must not return.
+    let diverging = lower_ok(&call_body(None, UnwindAction::Continue, vec![]), PW);
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(&diverging, &args, 10, add_handler),
+        Err(CfgEvalError::UnreachableReached { bb: 0 })
+    );
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(&diverging, &args, 10, panicking),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 0,
+            msg: callee()
+        })
+    );
+    // Faulting arguments or destinations are reported before the callee runs.
+    let mut called = false;
+    let mut dead_dest = call_body(Some(1), UnwindAction::Continue, vec![]);
+    dead_dest.local_decls.push(u32_ty());
+    if let Some(Terminator::Call { destination, .. }) = &mut dead_dest.basic_blocks[0].terminator {
+        *destination = local(3);
+    }
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(
+            &lower_ok(&dead_dest, PW),
+            &args,
+            10,
+            |bb, func, call_args| {
+                called = true;
+                add_handler(bb, func, call_args)
+            }
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::DeadLocal(Local(3)),
+        })
+    );
+    let mut dead_arg = call_body(Some(1), UnwindAction::Continue, vec![]);
+    dead_arg.local_decls.push(u32_ty());
+    if let Some(Terminator::Call { args, .. }) = &mut dead_arg.basic_blocks[0].terminator {
+        args[1] = cp(3);
+    }
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(
+            &lower_ok(&dead_arg, PW),
+            &args,
+            10,
+            |bb, func, call_args| {
+                called = true;
+                add_handler(bb, func, call_args)
+            }
+        ),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::DeadLocal(Local(3)),
+        })
+    );
+    assert!(!called);
+    // Statically: a call into an uninhabited destination must not have a return target.
+    let never_dest = |target: Option<usize>| {
+        mk_body(
+            vec![unit(), Ty::Never],
+            vec![
+                blk(
+                    vec![Statement::StorageLive(Local(1))],
+                    Terminator::Call {
+                        func: Operand::Constant(Constant::Unit),
+                        args: vec![],
+                        destination: local(1),
+                        target,
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                blk(
+                    vec![assign(
+                        local(0),
+                        Rvalue::Use(Operand::Constant(Constant::Unit)),
+                    )],
+                    Terminator::Return,
+                ),
+            ],
+        )
+    };
+    assert_eq!(
+        lower_term_err(&never_dest(Some(1)), PW),
+        (
+            0,
+            TerminatorLowerError::CallToUninhabitedDestinationWithTarget(Ty::Never)
+        )
+    );
+    assert_eq!(
+        eval_lowered_body_cfg_with_calls(&lower_ok(&never_dest(None), PW), &[], 10, |_, _, _| {
+            Ok(CallOutcome::Return(MirValue::Unit))
+        }),
+        Err(CfgEvalError::UnreachableReached { bb: 0 })
+    );
+}
+
+#[test]
+fn test_cfg_lowering_rejects_bad_targets_and_cleanup_edges() {
+    let decls = || vec![u8_ty(), Ty::Bool];
+    let err = |blocks: Vec<BasicBlockData>| lower_term_err(&mk_body(decls(), blocks), PW);
+    let ret = || blk(vec![], Terminator::Return);
+    let resume = || cleanup_blk(vec![], Terminator::UnwindResume);
+    let call = |target: Option<usize>, unwind: UnwindAction| Terminator::Call {
+        func: Operand::Constant(Constant::Unit),
+        args: vec![],
+        destination: local(0),
+        target,
+        unwind,
+    };
+    let invalid_target = |target: usize, num_blocks: usize| TerminatorLowerError::InvalidTarget {
+        target,
+        num_blocks,
+    };
+
+    // Out-of-range targets on every kind of edge.
+    assert_eq!(err(vec![blk(vec![], goto_t(3))]), (0, invalid_target(3, 1)));
+    assert_eq!(
+        err(vec![blk(
+            vec![],
+            Terminator::SwitchInt {
+                discr: cp(1),
+                targets: SwitchTargets::static_if(0, 0, 9),
+            }
+        )]),
+        (0, invalid_target(9, 1))
+    );
+    assert_eq!(
+        err(vec![blk(
+            vec![],
+            assert_t(cp(1), true, custom("a"), 5, UnwindAction::Continue)
+        )]),
+        (0, invalid_target(5, 1))
+    );
+    assert_eq!(
+        err(vec![blk(
+            vec![],
+            drop_t(local(0), 0, UnwindAction::Cleanup(7))
+        )]),
+        (0, invalid_target(7, 1))
+    );
+    assert_eq!(
+        err(vec![blk(vec![], call(Some(2), UnwindAction::Continue))]),
+        (0, invalid_target(2, 1))
+    );
+    // Unreachable blocks are validated too.
+    assert_eq!(
+        err(vec![ret(), blk(vec![], goto_t(4))]),
+        (1, invalid_target(4, 2))
+    );
+
+    // Normal edges stay on one side of the cleanup boundary; unwind edges enter cleanup blocks.
+    assert!(matches!(
+        err(vec![blk(vec![], goto_t(1)), resume()]),
+        (0, TerminatorLowerError::InvalidEdge { target: 1, .. })
+    ));
+    assert!(matches!(
+        err(vec![
+            blk(
+                vec![],
+                assert_t(cp(1), true, custom("a"), 0, UnwindAction::Cleanup(1))
+            ),
+            cleanup_blk(vec![], goto_t(0)),
+        ]),
+        (1, TerminatorLowerError::InvalidEdge { target: 0, .. })
+    ));
+    assert!(matches!(
+        err(vec![
+            blk(
+                vec![],
+                Terminator::SwitchInt {
+                    discr: cp(1),
+                    targets: SwitchTargets::static_if(0, 2, 1),
+                }
+            ),
+            resume(),
+            ret(),
+        ]),
+        (0, TerminatorLowerError::InvalidEdge { target: 1, .. })
+    ));
+    assert!(matches!(
+        err(vec![
+            blk(vec![], call(Some(1), UnwindAction::Continue)),
+            resume()
+        ]),
+        (0, TerminatorLowerError::InvalidEdge { target: 1, .. })
+    ));
+    assert!(matches!(
+        err(vec![blk(vec![], call(Some(0), UnwindAction::Cleanup(0)))]),
+        (0, TerminatorLowerError::InvalidEdge { target: 0, .. })
+    ));
+    // Inside cleanup blocks: no further `Cleanup` or `Continue` unwinding, no `Return`.
+    let in_cleanup = |term: Terminator| {
+        err(vec![
+            blk(vec![], call(Some(0), UnwindAction::Cleanup(1))),
+            cleanup_blk(vec![], term),
+            resume(),
+        ])
+    };
+    assert!(matches!(
+        in_cleanup(call(Some(2), UnwindAction::Cleanup(2))),
+        (
+            1,
+            TerminatorLowerError::InvalidUnwindAction {
+                unwind: UnwindAction::Cleanup(2),
+                ..
+            }
+        )
+    ));
+    assert!(matches!(
+        in_cleanup(assert_t(
+            cp(1),
+            true,
+            custom("a"),
+            2,
+            UnwindAction::Continue
+        )),
+        (
+            1,
+            TerminatorLowerError::InvalidUnwindAction {
+                unwind: UnwindAction::Continue,
+                ..
+            }
+        )
+    ));
+    assert_eq!(
+        in_cleanup(Terminator::Return),
+        (1, TerminatorLowerError::ReturnInCleanupBlock)
+    );
+    for ok in [
+        call(Some(2), UnwindAction::Terminate),
+        call(None, UnwindAction::Unreachable),
+        drop_t(local(0), 2, UnwindAction::Terminate),
+        Terminator::UnwindTerminate,
+        Terminator::Unreachable,
+    ] {
+        let body = mk_body(
+            decls(),
+            vec![
+                blk(vec![], call(Some(0), UnwindAction::Cleanup(1))),
+                cleanup_blk(vec![], ok.clone()),
+                resume(),
+            ],
+        );
+        assert!(lower_body(&body, PW).is_ok(), "{ok:?}");
+    }
+    // Unwinding terminators only inside cleanup blocks; the entry block is not a cleanup block.
+    for term in [Terminator::UnwindResume, Terminator::UnwindTerminate] {
+        assert_eq!(
+            err(vec![blk(vec![], term)]),
+            (0, TerminatorLowerError::UnwindTerminatorOutsideCleanup)
+        );
+    }
+    assert_eq!(
+        err(vec![resume()]),
+        (0, TerminatorLowerError::CleanupEntryBlock)
+    );
+    // Operand lowering errors are reported as such (not as terminator errors).
+    let bad_local = mk_body(
+        decls(),
+        vec![blk(
+            vec![],
+            Terminator::SwitchInt {
+                discr: cp(9),
+                targets: SwitchTargets::static_if(0, 0, 0),
+            },
+        )],
+    );
+    assert!(matches!(
+        lower_body(&bad_local, PW),
+        Err(e) if !matches!(e, RvalueLowerError::InvalidTerminator { .. })
+    ));
+    // `lower_terminator` itself rejects a block index outside the body.
+    assert_eq!(
+        lower_terminator(&Terminator::Return, 3, &mk_body(decls(), vec![ret()]), PW),
+        Err(RvalueLowerError::InvalidTerminator {
+            bb: 3,
+            error: invalid_target(3, 1),
+        })
+    );
+}
+
+#[test]
+fn test_cfg_evaluator_rejects_hand_built_bodies_that_break_the_discipline() {
+    let lb = |terminator: Option<LoweredTerminator>, is_cleanup: bool| LoweredBasicBlock {
+        statements: vec![],
+        terminator,
+        is_cleanup,
+    };
+    let body = |basic_blocks: Vec<LoweredBasicBlock>| LoweredBody {
+        local_decls: vec![u8_ty()],
+        basic_blocks,
+        ptr_width: PW,
+    };
+    let eval = |blocks: Vec<LoweredBasicBlock>| eval_lowered_body_cfg(&body(blocks), &[], 10);
+    let panic_to = |unwind: UnwindAction| LoweredTerminator::Assert {
+        cond: cbool(false),
+        expected: true,
+        msg: custom("p"),
+        target: 0,
+        unwind,
+    };
+    assert_eq!(eval(vec![]), Err(CfgEvalError::InvalidBlock { bb: 0 }));
+    assert_eq!(
+        eval(vec![lb(Some(LoweredTerminator::Goto { target: 9 }), false)]),
+        Err(CfgEvalError::InvalidBlock { bb: 9 })
+    );
+    assert_eq!(
+        eval(vec![lb(None, false)]),
+        Err(CfgEvalError::MissingTerminator { bb: 0 })
+    );
+    // Entering a cleanup block without unwinding (or starting in one), and vice versa.
+    assert_eq!(
+        eval(vec![
+            lb(Some(LoweredTerminator::Goto { target: 1 }), false),
+            lb(Some(LoweredTerminator::UnwindResume), true),
+        ]),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 1 })
+    );
+    assert_eq!(
+        eval(vec![lb(Some(LoweredTerminator::UnwindResume), true)]),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 0 })
+    );
+    assert_eq!(
+        eval(vec![lb(Some(panic_to(UnwindAction::Cleanup(0))), false)]),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 0 })
+    );
+    assert_eq!(
+        eval(vec![
+            lb(Some(panic_to(UnwindAction::Cleanup(1))), false),
+            lb(Some(LoweredTerminator::Goto { target: 0 }), true),
+        ]),
+        Err(CfgEvalError::InvalidEdge { from: 1, to: 0 })
+    );
+    // Unwinding terminators while not unwinding; returning or re-unwinding while unwinding.
+    for term in [
+        LoweredTerminator::UnwindResume,
+        LoweredTerminator::UnwindTerminate,
+    ] {
+        assert_eq!(
+            eval(vec![lb(Some(term), false)]),
+            Err(CfgEvalError::InvalidUnwind { bb: 0 })
+        );
+    }
+    for in_cleanup in [
+        LoweredTerminator::Return { ret_ty: u8_ty() },
+        panic_to(UnwindAction::Continue),
+        panic_to(UnwindAction::Cleanup(1)),
+    ] {
+        assert_eq!(
+            eval(vec![
+                lb(Some(panic_to(UnwindAction::Cleanup(1))), false),
+                lb(Some(in_cleanup), true)
+            ]),
+            Err(CfgEvalError::InvalidUnwind { bb: 1 })
+        );
+    }
+    // Lowered types that disagree with the body are runtime type errors.
+    let type_errors = [
+        LoweredTerminator::SwitchInt {
+            discr: cint(1, u16_ty()),
+            discr_ty: u8_ty(),
+            targets: SwitchTargets::static_if(1, 0, 0),
+        },
+        LoweredTerminator::SwitchInt {
+            discr: Operand::Constant(Constant::Unit),
+            discr_ty: unit(),
+            targets: SwitchTargets::static_if(1, 0, 0),
+        },
+        LoweredTerminator::Return { ret_ty: u16_ty() },
+        LoweredTerminator::Assert {
+            cond: cint(1, u8_ty()),
+            expected: true,
+            msg: custom("x"),
+            target: 0,
+            unwind: UnwindAction::Continue,
+        },
+        LoweredTerminator::Call {
+            func: Operand::Constant(Constant::Unit),
+            func_ty: u8_ty(),
+            args: vec![],
+            arg_tys: vec![],
+            destination: local(0),
+            dest_ty: u8_ty(),
+            target: Some(0),
+            unwind: UnwindAction::Continue,
+        },
+        LoweredTerminator::Call {
+            func: Operand::Constant(Constant::Unit),
+            func_ty: unit(),
+            args: vec![cint(1, u8_ty())],
+            arg_tys: vec![],
+            destination: local(0),
+            dest_ty: u8_ty(),
+            target: Some(0),
+            unwind: UnwindAction::Continue,
+        },
+        LoweredTerminator::Call {
+            func: Operand::Constant(Constant::Unit),
+            func_ty: unit(),
+            args: vec![cint(1, u8_ty())],
+            arg_tys: vec![u16_ty()],
+            destination: local(0),
+            dest_ty: u8_ty(),
+            target: Some(0),
+            unwind: UnwindAction::Continue,
+        },
+        LoweredTerminator::Drop {
+            place: local(0),
+            place_ty: u16_ty(),
+            target: 0,
+            unwind: UnwindAction::Continue,
+        },
+    ];
+    for term in type_errors {
+        let result = eval_lowered_body_cfg_with_calls(
+            &body(vec![lb(Some(term.clone()), false)]),
+            &[],
+            10,
+            |_, _, _| Ok(CallOutcome::Return(u8v(0))),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CfgEvalError::Terminator {
+                    bb: 0,
+                    error: RvalueEvalError::TypeMismatch(_)
+                })
+            ),
+            "{term:?}: {result:?}"
+        );
+    }
+    let never = LoweredBody {
+        local_decls: vec![Ty::Never],
+        basic_blocks: vec![lb(
+            Some(LoweredTerminator::Return { ret_ty: Ty::Never }),
+            false,
+        )],
+        ptr_width: PW,
+    };
+    assert!(matches!(
+        eval_lowered_body_cfg(&never, &[], 10),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_)
+        })
+    ));
+}
+
+#[test]
+fn test_cfg_arguments_must_be_well_formed_values_of_the_parameter_types() {
+    let body = lower_ok(&countdown_body(), PW);
+    let invalid = |args: &[MirValue]| match eval_lowered_body_cfg(&body, args, 5) {
+        Err(CfgEvalError::InvalidArguments(err)) => err,
+        other => panic!("expected InvalidArguments for {args:?}, got {other:?}"),
+    };
+    assert!(matches!(
+        invalid(&[u8v(1)]),
+        RvalueEvalError::TypeMismatch(_)
+    ));
+    assert!(matches!(
+        invalid(&[u32v(1), u32v(2)]),
+        RvalueEvalError::TypeMismatch(_)
+    ));
+    assert!(matches!(
+        invalid(&[u32v(1), MirValue::Bool(true), u32v(3)]),
+        RvalueEvalError::TypeMismatch(_)
+    ));
+    assert_eq!(
+        invalid(&[uint(1 << 32, u32_ty())]),
+        RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: u32_ty(),
+            bits: 1 << 32,
+        })
+    );
+    // Null references, over-wide pointers, and scalar-range violations nested in aggregates.
+    let r = ref_ty(u8_ty());
+    let p = raw(u8_ty(), Mutability::Not);
+    let (nz_def, nz_ty) = non_zero_u32();
+    let decls = vec![
+        unit(),
+        r.clone(),
+        p.clone(),
+        Ty::Tuple(vec![u8_ty(), nz_ty.clone()]),
+    ];
+    let body = lower_ok(
+        &mk_body(decls.clone(), vec![blk(vec![], Terminator::Unreachable)]),
+        PtrWidth::Bits32,
+    );
+    let good = [
+        MirValue::ptr(PointerValue::with_provenance(0x10, 1, 0), r.clone()),
+        MirValue::ptr(PointerValue::without_provenance(0), p.clone()),
+        MirValue::Tuple(vec![u8v(1), MirValue::adt(&nz_def, 0, vec![u32v(1)])]),
+    ];
+    assert_eq!(
+        eval_lowered_body_cfg(&body, &good, 5),
+        Err(CfgEvalError::UnreachableReached { bb: 0 })
+    );
+    let with = |idx: usize, val: MirValue| {
+        let mut args = good.to_vec();
+        args[idx] = val;
+        match eval_lowered_body_cfg(&body, &args, 5) {
+            Err(CfgEvalError::InvalidArguments(err)) => err,
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+    };
+    let bit_pattern = |target_ty: Ty, bits: u128| {
+        RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { target_ty, bits })
+    };
+    assert_eq!(
+        with(
+            0,
+            MirValue::ptr(PointerValue::without_provenance(0), r.clone())
+        ),
+        bit_pattern(r.clone(), 0)
+    );
+    assert_eq!(
+        with(
+            1,
+            MirValue::ptr(PointerValue::without_provenance(1 << 32), p.clone())
+        ),
+        bit_pattern(p.clone(), 1 << 32)
+    );
+    assert_eq!(
+        with(
+            2,
+            MirValue::Tuple(vec![u8v(1), MirValue::adt(&nz_def, 0, vec![u32v(0)])])
+        ),
+        bit_pattern(nz_ty, 0)
+    );
+    assert_eq!(
+        with(
+            2,
+            MirValue::Tuple(vec![u8v(0x100), MirValue::adt(&nz_def, 0, vec![u32v(1)])])
+        ),
+        bit_pattern(u8_ty(), 0x100)
+    );
+}
+
+#[test]
+fn test_cfg_matches_on_typed_enum_discriminants() {
+    // `#[repr(i8)] enum S { Neg(u8) = -1, Pos(u16, u8) = 5, Zero = 0 }`
+    let (def, enum_ty) = adt(AdtDef::new_enum(
+        "S",
+        Some(ScalarTy::Int(IntTy::I8)),
+        vec![
+            VariantDef::new("Neg", vec![u8_ty()]).with_discriminant(u128::MAX),
+            VariantDef::new("Pos", vec![u16_ty(), u8_ty()]).with_discriminant(5),
+            VariantDef::new("Zero", vec![]).with_discriminant(0),
+        ],
+    ));
+    let downcast = |variant: usize, idx: usize, ty: Ty| {
+        Operand::Copy(place(
+            1,
+            vec![ProjectionElem::Downcast(variant), field(idx, ty)],
+        ))
+    };
+    let widen = |op: Operand| Rvalue::Cast(CastKind::IntToInt, op, u32_ty());
+    // fn(s: S) -> u32 { match s { Neg(x) => x as u32, Pos(y, z) => y as u32 + z as u32, Zero => 100 } }
+    let body = mk_body(
+        vec![u32_ty(), enum_ty.clone(), i8_ty(), u32_ty()],
+        vec![
+            blk(
+                vec![
+                    Statement::StorageLive(Local(2)),
+                    assign(local(2), Rvalue::Discriminant(local(1))),
+                ],
+                Terminator::SwitchInt {
+                    discr: cp(2),
+                    targets: SwitchTargets::new([(0xFF, 1), (5, 2), (0, 3)], 4),
+                },
+            ),
+            blk(
+                vec![assign(local(0), widen(downcast(0, 0, u8_ty())))],
+                goto_t(5),
+            ),
+            blk(
+                vec![
+                    Statement::StorageLive(Local(3)),
+                    assign(local(3), widen(downcast(1, 1, u8_ty()))),
+                    assign(local(0), widen(downcast(1, 0, u16_ty()))),
+                    assign(local(0), Rvalue::BinaryOp(BinOp::Add, cp(0), cp(3))),
+                ],
+                goto_t(5),
+            ),
+            blk(
+                vec![assign(local(0), Rvalue::Use(cint(100, u32_ty())))],
+                goto_t(5),
+            ),
+            blk(vec![], Terminator::Unreachable),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    let lowered = lower_ok(&body, PW);
+    let eval = |val: MirValue| eval_lowered_body_cfg(&lowered, &[val], 10);
+    assert_eq!(
+        returned(eval(MirValue::adt(&def, 0, vec![u8v(7)]))),
+        u32v(7)
+    );
+    assert_eq!(
+        returned(eval(MirValue::adt(&def, 1, vec![u16v(300), u8v(12)]))),
+        u32v(312)
+    );
+    assert_eq!(returned(eval(MirValue::adt(&def, 2, vec![]))), u32v(100));
+    // Projecting through the wrong variant is UB.
+    let mut wrong_arm = body.clone();
+    wrong_arm.basic_blocks[1].statements = vec![assign(local(0), widen(downcast(1, 1, u8_ty())))];
+    assert!(matches!(
+        eval_lowered_body_cfg(
+            &lower_ok(&wrong_arm, PW),
+            &[MirValue::adt(&def, 0, vec![u8v(7)])],
+            10
+        ),
+        Err(CfgEvalError::Statement {
+            bb: 1,
+            index: 0,
+            error: RvalueEvalError::InactiveVariantProjection { .. },
+        })
+    ));
+}
+
+/// Terminator shapes of the random CFGs in
+/// `test_property_cfg_evaluator_matches_a_reference_interpreter`.
+#[derive(Clone, Debug)]
+enum RefTerm {
+    Goto(usize),
+    /// Switch on `acc & 7`.
+    Switch(Vec<(u128, usize)>, usize),
+    Return,
+    /// `assert(acc & 7 < 6)`, unwinding with `Continue` or `Terminate`.
+    Assert(usize, bool),
+}
+
+/// Outcome of the reference interpreter.
+#[derive(Debug, PartialEq)]
+enum RefOutcome {
+    Returned(u32),
+    Panicked(usize),
+    Terminated(usize),
+    OutOfFuel(usize, u32),
+}
+
+#[test]
+fn test_property_cfg_evaluator_matches_a_reference_interpreter() {
+    let mut g = AdtGen { seed: 0xcf9_0001 };
+    let multipliers = [1u32, 3, 5, 0x9E37_79B9];
+    // Outcome counts: returned, panicked, terminated, out of fuel.
+    let mut seen = [0usize; 4];
+    for _ in 0..300 {
+        let n = 1 + g.below(6) as usize;
+        let blocks: Vec<(u32, u32, RefTerm)> = (0..n)
+            .map(|_| {
+                let m = multipliers[g.below(4) as usize];
+                let k = g.next() as u32;
+                let term = match g.below(8) {
+                    0 | 1 => RefTerm::Goto(g.below(n as u64) as usize),
+                    2..=4 => {
+                        let mut values: Vec<u128> = (0..8).filter(|_| g.below(2) == 0).collect();
+                        if g.below(2) == 0 {
+                            values.reverse();
+                        }
+                        let branches = values
+                            .into_iter()
+                            .map(|v| (v, g.below(n as u64) as usize))
+                            .collect();
+                        RefTerm::Switch(branches, g.below(n as u64) as usize)
+                    }
+                    5 => RefTerm::Return,
+                    _ => RefTerm::Assert(g.below(n as u64) as usize, g.below(2) == 0),
+                };
+                (m, k, term)
+            })
+            .collect();
+        // Lower to MIR: `_0: u32` (return), `_1: u32` (acc), `_2: u32` (acc & 7), `_3: bool`.
+        let mir_blocks = blocks
+            .iter()
+            .map(|(m, k, term)| {
+                let mut stmts = vec![
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Mul, cp(1), cint(u128::from(*m), u32_ty())),
+                    ),
+                    assign(
+                        local(1),
+                        Rvalue::BinaryOp(BinOp::Add, cp(1), cint(u128::from(*k), u32_ty())),
+                    ),
+                    assign(
+                        local(2),
+                        Rvalue::BinaryOp(BinOp::BitAnd, cp(1), cint(7, u32_ty())),
+                    ),
+                ];
+                let term = match term {
+                    RefTerm::Goto(t) => goto_t(*t),
+                    RefTerm::Switch(branches, otherwise) => Terminator::SwitchInt {
+                        discr: cp(2),
+                        targets: SwitchTargets::new(branches.iter().copied(), *otherwise),
+                    },
+                    RefTerm::Return => {
+                        stmts.push(assign(local(0), Rvalue::Use(cp(1))));
+                        Terminator::Return
+                    }
+                    RefTerm::Assert(t, terminate) => {
+                        stmts.push(assign(
+                            local(3),
+                            Rvalue::BinaryOp(BinOp::Lt, cp(2), cint(6, u32_ty())),
+                        ));
+                        let unwind = if *terminate {
+                            UnwindAction::Terminate
+                        } else {
+                            UnwindAction::Continue
+                        };
+                        assert_t(cp(3), true, custom("high"), *t, unwind)
+                    }
+                };
+                blk(stmts, term)
+            })
+            .collect();
+        let body = lower_ok(
+            &mk_body(vec![u32_ty(), u32_ty(), u32_ty(), Ty::Bool], mir_blocks),
+            PW,
+        );
+        for _ in 0..4 {
+            let start = g.next() as u32;
+            let fuel = g.below(40) as usize;
+            // Reference interpreter.
+            let (mut acc, mut bb, mut left) = (start, 0usize, fuel);
+            let expected = loop {
+                if left == 0 {
+                    break RefOutcome::OutOfFuel(bb, acc);
+                }
+                left -= 1;
+                let (m, k, term) = &blocks[bb];
+                acc = acc.wrapping_mul(*m).wrapping_add(*k);
+                let low = u128::from(acc & 7);
+                match term {
+                    RefTerm::Goto(t) => bb = *t,
+                    RefTerm::Switch(branches, otherwise) => {
+                        bb = branches
+                            .iter()
+                            .find(|(v, _)| *v == low)
+                            .map_or(*otherwise, |(_, t)| *t);
+                    }
+                    RefTerm::Return => break RefOutcome::Returned(acc),
+                    RefTerm::Assert(t, terminate) => {
+                        if low < 6 {
+                            bb = *t;
+                        } else if *terminate {
+                            break RefOutcome::Terminated(bb);
+                        } else {
+                            break RefOutcome::Panicked(bb);
+                        }
+                    }
+                }
+            };
+            let args = [u32v(u128::from(start)), u32v(0), MirValue::Bool(false)];
+            let actual = match eval_lowered_body_cfg(&body, &args, fuel) {
+                Ok(CfgEvalOutcome::Returned(MirValue::Int { bits, .. })) => {
+                    RefOutcome::Returned(bits as u32)
+                }
+                Ok(CfgEvalOutcome::Panicked { bb, msg }) => {
+                    assert_eq!(msg, custom_msg("high"));
+                    RefOutcome::Panicked(bb)
+                }
+                Ok(CfgEvalOutcome::Terminated { bb, msg }) => {
+                    assert_eq!(msg, custom_msg("high"));
+                    RefOutcome::Terminated(bb)
+                }
+                Ok(CfgEvalOutcome::OutOfFuel { bb, state }) => match &state.slots[1] {
+                    LocalSlotState::Init(MirValue::Int { bits, .. }) => {
+                        RefOutcome::OutOfFuel(bb, *bits as u32)
+                    }
+                    other => panic!("acc slot {other:?}"),
+                },
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            assert_eq!(
+                actual, expected,
+                "blocks {blocks:?}, start {start:#x}, fuel {fuel}"
+            );
+            seen[match expected {
+                RefOutcome::Returned(_) => 0,
+                RefOutcome::Panicked(_) => 1,
+                RefOutcome::Terminated(_) => 2,
+                RefOutcome::OutOfFuel(..) => 3,
+            }] += 1;
+        }
+    }
+    assert!(
+        seen.iter().all(|count| *count >= 50),
+        "outcome distribution {seen:?}"
+    );
+}

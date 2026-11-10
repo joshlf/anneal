@@ -11,17 +11,21 @@
 //!   `CopyForDeref`) and `Statement` / `Body` lowering.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::ir::{
-    AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, Local, Mutability, NullOp,
-    Operand, Place, PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy, UnOp,
+    AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, LayoutError,
+    Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem, PtrWidth, RetagKind,
+    Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use crate::lower::cast::{
     AbstractByte, CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast,
-    TransmutePolicy, TransmuteValue, decode_int_bytes, decode_ptr_bytes, encode_int_bytes,
-    encode_ptr_bytes, eval_char_to_int, eval_int_to_int, eval_int_to_ptr_with_ptr_width,
+    TransmutePolicy, TransmuteValue, canonical_untagged_fields, cast_eval_layout_error,
+    decode_int_bytes, decode_ptr_bytes, encode_int_bytes, encode_ptr_bytes,
+    eval_char_to_int, eval_int_to_int, eval_int_to_ptr_with_ptr_width,
     eval_ptr_to_int_with_ptr_width, eval_transmute, lower_cast_rvalue_with_ptr_width,
 };
+use crate::lower::cfg::{LoweredTerminator, TerminatorLowerError, lower_terminator};
 
 /// Maximum number of array elements the evaluator materializes in a single `MirValue::Array`.
 const MAX_EVAL_ARRAY_LEN: usize = 1 << 20;
@@ -102,6 +106,57 @@ pub enum RvalueLowerError {
     InvalidSetDiscriminantTarget(Ty),
     /// `Statement::Assume` applied to a non-`bool` operand.
     InvalidAssumeType(Ty),
+    /// A type contains an ill-formed [`AdtDef`] (see [`LayoutError::IllFormed`]).
+    InvalidAdtDef {
+        ty: Ty,
+        reason: &'static str,
+    },
+    /// An operation needs the exact layout of a type whose layout is unspecified (see
+    /// [`LayoutError::Unspecified`]).
+    UnsupportedLayout(Ty),
+    /// Variant index out of range for an ADT (`SetDiscriminant`, aggregates, `Downcast`).
+    InvalidVariantIndex {
+        ty: Ty,
+        variant_index: usize,
+    },
+    /// `Statement::Retag(Raw(m), place)` on a place that is not a raw pointer of mutability `m`.
+    InvalidRetagTarget {
+        kind: RetagKind,
+        ty: Ty,
+    },
+    /// `Statement::CopyNonOverlapping` operands are not `*const T` / `*mut T` / `usize`.
+    InvalidCopyNonOverlapping {
+        src_ty: Ty,
+        dst_ty: Ty,
+        count_ty: Ty,
+    },
+    /// `Rvalue::ShallowInitBox` with a non-raw-pointer operand.
+    InvalidShallowInitBox {
+        operand_ty: Ty,
+        inner_ty: Ty,
+    },
+    /// `Rvalue::WrapUnsafeBinder` whose binder type does not wrap the operand type.
+    InvalidWrapUnsafeBinder {
+        operand_ty: Ty,
+        binder_ty: Ty,
+    },
+    /// Ill-formed terminator of basic block `bb`.
+    InvalidTerminator {
+        bb: usize,
+        error: TerminatorLowerError,
+    },
+}
+
+/// Maps a [`LayoutError`] of `ty` to the corresponding [`RvalueLowerError`].
+pub(crate) fn lower_layout_error(ty: &Ty, err: LayoutError) -> RvalueLowerError {
+    match err {
+        LayoutError::TooLarge => RvalueLowerError::LayoutTooLarge(ty.clone()),
+        LayoutError::Unspecified => RvalueLowerError::UnsupportedLayout(ty.clone()),
+        LayoutError::IllFormed(reason) => RvalueLowerError::InvalidAdtDef {
+            ty: ty.clone(),
+            reason,
+        },
+    }
 }
 
 impl std::fmt::Display for RvalueLowerError {
@@ -195,6 +250,46 @@ impl std::fmt::Display for RvalueLowerError {
             RvalueLowerError::InvalidAssumeType(ty) => {
                 write!(f, "Statement::Assume requires bool operand, got {ty:?}")
             }
+            RvalueLowerError::InvalidAdtDef { ty, reason } => {
+                write!(f, "ill-formed ADT in type {ty:?}: {reason}")
+            }
+            RvalueLowerError::UnsupportedLayout(ty) => {
+                write!(f, "type {ty:?} has an unspecified layout")
+            }
+            RvalueLowerError::InvalidVariantIndex { ty, variant_index } => {
+                write!(f, "variant index {variant_index} out of range for {ty:?}")
+            }
+            RvalueLowerError::InvalidRetagTarget { kind, ty } => {
+                write!(f, "Retag({kind:?}) applied to place of type {ty:?}")
+            }
+            RvalueLowerError::InvalidCopyNonOverlapping {
+                src_ty,
+                dst_ty,
+                count_ty,
+            } => {
+                write!(
+                    f,
+                    "copy_nonoverlapping requires (*const T, *mut T, usize), got ({src_ty:?}, {dst_ty:?}, {count_ty:?})"
+                )
+            }
+            RvalueLowerError::InvalidShallowInitBox {
+                operand_ty,
+                inner_ty,
+            } => {
+                write!(
+                    f,
+                    "ShallowInitBox of {inner_ty:?} requires a raw pointer operand, got {operand_ty:?}"
+                )
+            }
+            RvalueLowerError::InvalidWrapUnsafeBinder {
+                operand_ty,
+                binder_ty,
+            } => {
+                write!(f, "WrapUnsafeBinder type {binder_ty:?} does not wrap {operand_ty:?}")
+            }
+            RvalueLowerError::InvalidTerminator { bb, error } => {
+                write!(f, "invalid terminator in bb{bb}: {error}")
+            }
         }
     }
 }
@@ -282,6 +377,18 @@ pub enum LoweredRvalue {
         place: Place,
         ty: Ty,
     },
+    /// `ShallowInitBox(operand, inner)` typed `*mut inner`.
+    ShallowInitBox {
+        operand: Operand,
+        operand_ty: Ty,
+        ty: Ty,
+    },
+    /// `WrapUnsafeBinder(operand, ty)`.
+    WrapUnsafeBinder {
+        operand: Operand,
+        operand_ty: Ty,
+        ty: Ty,
+    },
 }
 
 impl LoweredRvalue {
@@ -300,7 +407,9 @@ impl LoweredRvalue {
             | LoweredRvalue::UnaryOp { ty, .. }
             | LoweredRvalue::Discriminant { ty, .. }
             | LoweredRvalue::Aggregate { ty, .. }
-            | LoweredRvalue::CopyForDeref { ty, .. } => ty,
+            | LoweredRvalue::CopyForDeref { ty, .. }
+            | LoweredRvalue::ShallowInitBox { ty, .. }
+            | LoweredRvalue::WrapUnsafeBinder { ty, .. } => ty,
         }
     }
 }
@@ -328,12 +437,34 @@ pub enum LoweredStatement {
     StorageLive(Local),
     StorageDead(Local),
     Nop,
+    /// `Deinit(place)` of declared type `place_ty`.
+    Deinit {
+        place: Place,
+        place_ty: Ty,
+    },
+    /// `Retag(kind, place)` of declared type `place_ty`.
+    Retag {
+        kind: RetagKind,
+        place: Place,
+        place_ty: Ty,
+    },
+    /// `copy_nonoverlapping::<elem_ty>(src, dst, count)` with `elem_ty`'s exact layout.
+    CopyNonOverlapping {
+        src: Operand,
+        dst: Operand,
+        count: Operand,
+        elem_ty: Ty,
+        elem_size: usize,
+        elem_align: usize,
+    },
 }
 
 /// Lowered representation of a MIR basic block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoweredBasicBlock {
     pub statements: Vec<LoweredStatement>,
+    /// Lowered terminator (`None` when the captured block has no terminator).
+    pub terminator: Option<LoweredTerminator>,
     pub is_cleanup: bool,
 }
 
@@ -353,11 +484,16 @@ pub struct LoweredBody {
 /// constant offsets); `Downcast(_)` selects an ADT variant, which Anneal models as the tuple of
 /// that variant's fields, so it leaves the tuple type unchanged and subsequent `Field`
 /// projections are still fully type-checked.
+///
+/// On a `Ty::Adt`, `Field(i, ty)` selects field `i` of a struct or union, and of variant `v`
+/// of an enum only directly after `Downcast(v)` (with `v` in range); `Downcast` is invalid on
+/// structs and unions.
 pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueLowerError> {
     let Some(base_ty) = local_decls.get(place.local.0) else {
         return Err(RvalueLowerError::UnknownLocal(place.local));
     };
     let mut cur_ty = base_ty.clone();
+    let mut downcast: Option<usize> = None;
 
     for (i, elem) in place.projection.iter().enumerate() {
         let invalid = |current_ty: Ty| RvalueLowerError::InvalidProjection {
@@ -367,10 +503,13 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
         };
         cur_ty = match (elem, cur_ty) {
             (ProjectionElem::Deref, Ty::RawPtr(inner, _) | Ty::Ref(inner, _)) => *inner,
-            (ProjectionElem::Field(idx, field_ty), Ty::Tuple(fields)) => {
-                if fields.get(*idx) != Some(field_ty) {
-                    return Err(invalid(Ty::Tuple(fields)));
+            (ProjectionElem::Field(idx, field_ty), ty @ (Ty::Tuple(_) | Ty::Adt(_))) => {
+                if projectable_field_tys(&ty, downcast).and_then(|fields| fields.get(*idx))
+                    != Some(field_ty)
+                {
+                    return Err(invalid(ty));
                 }
+                downcast = None;
                 field_ty.clone()
             }
             (ProjectionElem::Index(idx_local), Ty::Array(elem_ty, _)) => {
@@ -416,17 +555,52 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
                 };
                 Ty::Array(elem_ty, new_len as usize)
             }
-            (ProjectionElem::Downcast(_), Ty::Tuple(fields)) => {
-                if !matches!(place.projection.get(i + 1), Some(ProjectionElem::Field(..))) {
-                    return Err(invalid(Ty::Tuple(fields)));
+            (ProjectionElem::Downcast(v), ty @ (Ty::Tuple(_) | Ty::Adt(_))) => {
+                if !matches!(place.projection.get(i + 1), Some(ProjectionElem::Field(..)))
+                    || !downcast_allowed(&ty, *v)
+                {
+                    return Err(invalid(ty));
                 }
-                Ty::Tuple(fields)
+                downcast = Some(*v);
+                ty
             }
             (_, other) => return Err(invalid(other)),
         };
     }
 
     Ok(cur_ty)
+}
+
+/// Field types that a `Field` projection selects from a place of type `ty` after an optional
+/// `Downcast(variant)`: a tuple's fields (the legacy ADT model, any downcast), a struct's or
+/// union's fields (no downcast), or the fields of the downcast variant of an enum.
+pub(crate) fn projectable_field_tys(ty: &Ty, downcast: Option<usize>) -> Option<&[Ty]> {
+    match (ty, downcast) {
+        (Ty::Tuple(fields), _) => Some(fields),
+        (Ty::Adt(def), None) if !def.is_enum() => def.variant_fields(0),
+        (Ty::Adt(def), Some(variant)) if def.is_enum() => def.variant_fields(variant),
+        _ => None,
+    }
+}
+
+/// Returns true if `Downcast(variant)` is statically valid on a place of type `ty`: any variant
+/// of a legacy tuple-modeled ADT, or an in-range variant of an enum `Ty::Adt`.
+pub(crate) fn downcast_allowed(ty: &Ty, variant: usize) -> bool {
+    match ty {
+        Ty::Tuple(_) => true,
+        Ty::Adt(def) => def.is_enum() && variant < def.variant_count(),
+        _ => false,
+    }
+}
+
+/// Field types of a union-typed place: a legacy union modeled as the `Ty::Tuple` of its
+/// fields, or a union `Ty::Adt`.
+fn union_fields_of(ty: &Ty) -> Option<&[Ty]> {
+    match ty {
+        Ty::Tuple(fields) => Some(fields),
+        Ty::Adt(def) if def.is_union() => def.variant_fields(0),
+        _ => None,
+    }
 }
 
 /// Resolves the static `Ty` of an `Operand` against `local_decls`.
@@ -478,7 +652,7 @@ fn check_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<(), &'stat
 }
 
 /// Resolves an operand's type during lowering, additionally validating constants.
-fn lower_operand_ty(
+pub(crate) fn lower_operand_ty(
     operand: &Operand,
     local_decls: &[Ty],
     ptr_width: PtrWidth,
@@ -493,9 +667,12 @@ fn lower_operand_ty(
 }
 
 /// Returns `ty` if its layout is representable under `ptr_width`, else `LayoutTooLarge`.
+///
+/// ADTs must be well-formed (`InvalidAdtDef` otherwise); unspecified ADT layouts are
+/// representable (see [`Ty::check_representable`]).
 fn check_layout(ty: Ty, ptr_width: PtrWidth) -> Result<Ty, RvalueLowerError> {
-    if ty.layout_size_for(ptr_width).is_none() {
-        return Err(RvalueLowerError::LayoutTooLarge(ty));
+    if let Err(err) = ty.check_representable(ptr_width) {
+        return Err(lower_layout_error(&ty, err));
     }
     Ok(ty)
 }
@@ -506,6 +683,11 @@ fn check_layout(ty: Ty, ptr_width: PtrWidth) -> Result<Ty, RvalueLowerError> {
 /// Requires `arg_ty` to have a representable layout ([`Ty::layout_size_for`]) and every
 /// projected container to be a `Ty::Tuple` with a canonical byte layout
 /// ([`Ty::has_canonical_byte_layout`]), `variant_idx == 0`, and `field_idx < fields.len()`.
+///
+/// A projected `Ty::Adt` container follows [`AdtDef::field_offset`]: `variant_idx` must select
+/// an existing variant (`0` for structs and unions) and `field_idx` one of its fields; an
+/// unspecified offset fails with `UnsupportedOffsetOfLayout(container)`. Every `Ok(off)` step
+/// satisfies `off + size_of(field) <= size_of(container)` and `off % align_of(field) == 0`.
 pub fn resolve_offset_of(
     arg_ty: &Ty,
     fields: &[(usize, usize)],
@@ -515,12 +697,38 @@ pub fn resolve_offset_of(
     let mut cur_ty = arg_ty;
     let mut total_offset = 0usize;
     for &(variant_idx, field_idx) in fields {
+        let invalid_step = |container_ty: &Ty| RvalueLowerError::InvalidOffsetOfField {
+            container_ty: container_ty.clone(),
+            variant_idx,
+            field_idx,
+        };
+        if let Ty::Adt(def) = cur_ty {
+            let Some(variant_fields) = def.variant_fields(variant_idx) else {
+                return Err(invalid_step(cur_ty));
+            };
+            if field_idx >= variant_fields.len() {
+                return Err(invalid_step(cur_ty));
+            }
+            let offset = def
+                .field_offset(variant_idx, field_idx, ptr_width)
+                .map_err(|err| match err {
+                    LayoutError::TooLarge => RvalueLowerError::LayoutTooLarge(arg_ty.clone()),
+                    LayoutError::Unspecified => {
+                        RvalueLowerError::UnsupportedOffsetOfLayout(cur_ty.clone())
+                    }
+                    LayoutError::IllFormed(reason) => RvalueLowerError::InvalidAdtDef {
+                        ty: cur_ty.clone(),
+                        reason,
+                    },
+                })?;
+            total_offset = total_offset
+                .checked_add(offset)
+                .ok_or_else(|| RvalueLowerError::LayoutTooLarge(arg_ty.clone()))?;
+            cur_ty = &variant_fields[field_idx];
+            continue;
+        }
         let Ty::Tuple(tuple_fields) = cur_ty else {
-            return Err(RvalueLowerError::InvalidOffsetOfField {
-                container_ty: cur_ty.clone(),
-                variant_idx,
-                field_idx,
-            });
+            return Err(invalid_step(cur_ty));
         };
         if variant_idx != 0 || field_idx >= tuple_fields.len() {
             return Err(RvalueLowerError::InvalidOffsetOfField {
@@ -644,8 +852,9 @@ fn validate_binop_types(
             // The stride is the pointee's layout size, which is well-defined even for
             // uninhabited pointees (`*const !` has stride 0, `*const (!, u32)` stride 4).
             let stride = pointee
-                .layout_size_for(ptr_width)
-                .ok_or_else(|| RvalueLowerError::LayoutTooLarge(pointee.clone()))?;
+                .layout_for(ptr_width)
+                .map_err(|err| lower_layout_error(pointee, err))?
+                .size;
             Ok((lhs_ty.clone(), Some(stride)))
         }
     }
@@ -785,7 +994,10 @@ pub fn lower_rvalue_with_policy(
         Rvalue::NullaryOp(op, arg_ty) => {
             let ty = match op {
                 NullOp::SizeOf | NullOp::AlignOf => {
-                    check_layout(arg_ty.clone(), ptr_width)?;
+                    // `size_of` / `align_of` need the exact layout (not merely a bound).
+                    arg_ty
+                        .layout_for(ptr_width)
+                        .map_err(|err| lower_layout_error(arg_ty, err))?;
                     Ty::Uint(UintTy::Usize)
                 }
                 NullOp::OffsetOf(fields) => {
@@ -852,13 +1064,14 @@ pub fn lower_rvalue_with_policy(
         }
         Rvalue::Discriminant(place) => {
             let place_ty = resolve_place_ty(place, local_decls)?;
-            if !place_ty.is_inhabited() {
+            if !place_ty.is_inhabited_for(ptr_width) {
                 return Err(RvalueLowerError::UninhabitedType(place_ty));
             }
+            let ty = discriminant_result_ty(&place_ty);
             Ok(LoweredRvalue::Discriminant {
                 place: place.clone(),
                 place_ty,
-                ty: Ty::Int(IntTy::Isize),
+                ty,
             })
         }
         Rvalue::Aggregate(kind, operands) => {
@@ -885,8 +1098,66 @@ pub fn lower_rvalue_with_policy(
                 }
                 AggregateKind::Tuple => check_layout(Ty::Tuple(operand_tys.clone()), ptr_width)?,
                 AggregateKind::Adt {
+                    def_path,
                     variant_idx,
                     active_field,
+                    adt_def: Some(def),
+                } => {
+                    let adt_ty = check_layout(Ty::Adt(def.clone()), ptr_width)?;
+                    if *def_path != def.def_path {
+                        return Err(invalid("ADT aggregate def_path does not match its AdtDef"));
+                    }
+                    let Some(variant_fields) = def.variant_fields(*variant_idx) else {
+                        return Err(RvalueLowerError::InvalidVariantIndex {
+                            ty: adt_ty,
+                            variant_index: *variant_idx,
+                        });
+                    };
+                    match (def.is_union(), active_field) {
+                        (true, Some(field_idx)) => {
+                            if operands.len() != 1 {
+                                return Err(invalid(
+                                    "union aggregate initialization requires exactly 1 operand",
+                                ));
+                            }
+                            let Some(field_ty) = variant_fields.get(*field_idx) else {
+                                return Err(invalid("union aggregate active_field out of range"));
+                            };
+                            if operand_tys[0] != *field_ty {
+                                return Err(RvalueLowerError::AggregateElementTypeMismatch {
+                                    expected: field_ty.clone(),
+                                    got: operand_tys[0].clone(),
+                                });
+                            }
+                        }
+                        (true, None) => {
+                            return Err(invalid("union aggregate requires an active_field"));
+                        }
+                        (false, Some(_)) => {
+                            return Err(invalid("only union aggregates have an active_field"));
+                        }
+                        (false, None) => {
+                            if operand_tys.len() != variant_fields.len() {
+                                return Err(invalid(
+                                    "ADT aggregate operand count does not match the variant's fields",
+                                ));
+                            }
+                            for (op_ty, field_ty) in operand_tys.iter().zip(variant_fields) {
+                                if op_ty != field_ty {
+                                    return Err(RvalueLowerError::AggregateElementTypeMismatch {
+                                        expected: field_ty.clone(),
+                                        got: op_ty.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    adt_ty
+                }
+                AggregateKind::Adt {
+                    variant_idx,
+                    active_field,
+                    adt_def: None,
                     ..
                 } => {
                     if active_field.is_some() {
@@ -952,6 +1223,58 @@ pub fn lower_rvalue_with_policy(
                 ty,
             })
         }
+        Rvalue::ShallowInitBox(operand, inner_ty) => {
+            let operand_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
+            if !operand_ty.is_raw_ptr() {
+                return Err(RvalueLowerError::InvalidShallowInitBox {
+                    operand_ty,
+                    inner_ty: inner_ty.clone(),
+                });
+            }
+            check_layout(inner_ty.clone(), ptr_width)?;
+            Ok(LoweredRvalue::ShallowInitBox {
+                operand: operand.clone(),
+                operand_ty,
+                ty: Ty::RawPtr(Box::new(inner_ty.clone()), Mutability::Mut),
+            })
+        }
+        Rvalue::WrapUnsafeBinder(operand, binder_ty) => {
+            let operand_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
+            let binder_ty = check_layout(binder_ty.clone(), ptr_width)?;
+            if binder_ty != operand_ty && wrapped_field_ty(&binder_ty) != Some(&operand_ty) {
+                return Err(RvalueLowerError::InvalidWrapUnsafeBinder {
+                    operand_ty,
+                    binder_ty,
+                });
+            }
+            Ok(LoweredRvalue::WrapUnsafeBinder {
+                operand: operand.clone(),
+                operand_ty,
+                ty: binder_ty,
+            })
+        }
+    }
+}
+
+/// Field type of a single-field struct `Ty::Adt` (the type a `WrapUnsafeBinder` wraps).
+fn wrapped_field_ty(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::Adt(def) if def.is_struct() => match def.variant_fields(0) {
+            Some([field]) => Some(field),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Result type of `Rvalue::Discriminant` on a place of type `place_ty`: [`AdtDef::discr_ty`]
+/// for a `Ty::Adt` (the enum's `tag_ty` or `isize`; `u8` for structs and unions, as `rustc`'s
+/// `discriminant_ty`), and `isize` for every other type, matching the legacy model in which
+/// enums are captured as the `Ty::Tuple` of their fields.
+pub(crate) fn discriminant_result_ty(place_ty: &Ty) -> Ty {
+    match place_ty {
+        Ty::Adt(def) => def.discr_ty(),
+        _ => Ty::Int(IntTy::Isize),
     }
 }
 
@@ -981,6 +1304,7 @@ pub fn lower_statement_with_policy(
                 kind:
                     AggregateKind::Adt {
                         active_field: Some(field_idx),
+                        adt_def: None,
                         ..
                     },
                 operand_tys,
@@ -1019,8 +1343,20 @@ pub fn lower_statement_with_policy(
             variant_index,
         } => {
             let place_ty = resolve_place_ty(place, local_decls)?;
-            if !matches!(place_ty, Ty::Tuple(_)) {
-                return Err(RvalueLowerError::InvalidSetDiscriminantTarget(place_ty));
+            match &place_ty {
+                Ty::Tuple(_) => {}
+                Ty::Adt(def) => {
+                    // `rustc` allows `SetDiscriminant` on any ADT; on structs and unions only
+                    // variant `0` exists. Writing the tag of an uninhabited variant is UB, but
+                    // that is a dynamic property of the executed statement.
+                    if *variant_index >= def.variant_count() {
+                        return Err(RvalueLowerError::InvalidVariantIndex {
+                            ty: place_ty,
+                            variant_index: *variant_index,
+                        });
+                    }
+                }
+                _ => return Err(RvalueLowerError::InvalidSetDiscriminantTarget(place_ty)),
             }
             Ok(LoweredStatement::SetDiscriminant {
                 place: place.clone(),
@@ -1057,6 +1393,62 @@ pub fn lower_statement_with_policy(
             Ok(LoweredStatement::StorageDead(*loc))
         }
         Statement::Nop => Ok(LoweredStatement::Nop),
+        Statement::Deinit(place) => {
+            let place_ty = resolve_place_ty(place, local_decls)?;
+            Ok(LoweredStatement::Deinit {
+                place: place.clone(),
+                place_ty,
+            })
+        }
+        Statement::Retag(kind, place) => {
+            let place_ty = resolve_place_ty(place, local_decls)?;
+            if let RetagKind::Raw(mutability) = kind
+                && !matches!(&place_ty, Ty::RawPtr(_, m) if m == mutability)
+            {
+                return Err(RvalueLowerError::InvalidRetagTarget {
+                    kind: *kind,
+                    ty: place_ty,
+                });
+            }
+            Ok(LoweredStatement::Retag {
+                kind: *kind,
+                place: place.clone(),
+                place_ty,
+            })
+        }
+        Statement::CopyNonOverlapping { src, dst, count } => {
+            let src_ty = lower_operand_ty(src, local_decls, ptr_width)?;
+            let dst_ty = lower_operand_ty(dst, local_decls, ptr_width)?;
+            let count_ty = lower_operand_ty(count, local_decls, ptr_width)?;
+            // `copy_nonoverlapping::<T>(src: *const T, dst: *mut T, count: usize)`: `rustc`'s
+            // validator accepts any dereferenceable `src`, but `dst` must be writable.
+            let elem_ty = match (&src_ty, &dst_ty) {
+                (
+                    Ty::RawPtr(src_pointee, _) | Ty::Ref(src_pointee, _),
+                    Ty::RawPtr(dst_pointee, Mutability::Mut) | Ty::Ref(dst_pointee, Mutability::Mut),
+                ) if src_pointee == dst_pointee && count_ty == Ty::Uint(UintTy::Usize) => {
+                    (**src_pointee).clone()
+                }
+                _ => {
+                    return Err(RvalueLowerError::InvalidCopyNonOverlapping {
+                        src_ty,
+                        dst_ty,
+                        count_ty,
+                    });
+                }
+            };
+            let layout = elem_ty
+                .layout_for(ptr_width)
+                .map_err(|err| lower_layout_error(&elem_ty, err))?;
+            Ok(LoweredStatement::CopyNonOverlapping {
+                src: src.clone(),
+                dst: dst.clone(),
+                count: count.clone(),
+                elem_ty,
+                elem_size: layout.size,
+                elem_align: layout.align,
+            })
+        }
     }
 }
 
@@ -1073,6 +1465,9 @@ pub fn lower_statement(
 ///
 /// Every local's declared type must be representable on the target
 /// ([`Ty::layout_size_for`]), otherwise `RvalueLowerError::LayoutTooLarge` is returned.
+/// Unspecified ADT layouts are representable; ill-formed ADTs are `InvalidAdtDef`. Every
+/// terminator is lowered with [`lower_terminator`] against the whole body (block indices,
+/// cleanup edges, and operand types).
 pub fn lower_body_with_policy(
     body: &Body,
     ptr_width: PtrWidth,
@@ -1082,11 +1477,12 @@ pub fn lower_body_with_policy(
         check_layout(local_ty.clone(), ptr_width)?;
     }
     let mut basic_blocks = Vec::with_capacity(body.basic_blocks.len());
-    for BasicBlockData {
-        statements,
-        is_cleanup,
-    } in &body.basic_blocks
-    {
+    for (bb, block) in body.basic_blocks.iter().enumerate() {
+        let BasicBlockData {
+            statements,
+            terminator,
+            is_cleanup,
+        } = block;
         let mut lowered_stmts = Vec::with_capacity(statements.len());
         for stmt in statements {
             lowered_stmts.push(lower_statement_with_policy(
@@ -1096,8 +1492,13 @@ pub fn lower_body_with_policy(
                 policy,
             )?);
         }
+        let lowered_terminator = match terminator {
+            Some(term) => Some(lower_terminator(term, bb, body, ptr_width)?),
+            None => None,
+        };
         basic_blocks.push(LoweredBasicBlock {
             statements: lowered_stmts,
+            terminator: lowered_terminator,
             is_cleanup: *is_cleanup,
         });
     }
@@ -1131,11 +1532,16 @@ pub enum MirValue {
     /// Heterogeneous tuple or closure capture value.
     Tuple(Vec<MirValue>),
     /// Algebraic data type (struct, enum variant, or union) value.
+    ///
+    /// `adt_def: Some(def)` types the value as `Ty::Adt(def)` (`def_path == def.def_path`;
+    /// a union holds exactly its active field's value in `fields`); legacy values with
+    /// `adt_def: None` are typed as the `Ty::Tuple` of their fields.
     Adt {
         def_path: String,
         variant_idx: usize,
         active_field: Option<usize>,
         fields: Vec<MirValue>,
+        adt_def: Option<Arc<AdtDef>>,
     },
 }
 
@@ -1162,6 +1568,29 @@ impl MirValue {
     /// Constructs a pointer `MirValue`.
     pub fn ptr(ptr: PointerValue, ty: Ty) -> Self {
         MirValue::Ptr { ptr, ty }
+    }
+
+    /// Constructs a typed struct or enum-variant value of `def` (`variant_idx` `0` for
+    /// structs), without validating `fields` against `def`.
+    pub fn adt(def: &Arc<AdtDef>, variant_idx: usize, fields: Vec<MirValue>) -> Self {
+        MirValue::Adt {
+            def_path: def.def_path.clone(),
+            variant_idx,
+            active_field: None,
+            fields,
+            adt_def: Some(def.clone()),
+        }
+    }
+
+    /// Constructs a typed union value of `def` whose active field `field_idx` holds `value`.
+    pub fn union_value(def: &Arc<AdtDef>, field_idx: usize, value: MirValue) -> Self {
+        MirValue::Adt {
+            def_path: def.def_path.clone(),
+            variant_idx: 0,
+            active_field: Some(field_idx),
+            fields: vec![value],
+            adt_def: Some(def.clone()),
+        }
     }
 
     /// Returns true if this value represents `()` (`MirValue::Unit` or empty `MirValue::Tuple`).
@@ -1220,6 +1649,9 @@ impl MirValue {
     }
 
     /// Returns the runtime `Ty` of this value.
+    ///
+    /// A typed ADT value reports `Ty::Adt(def)`; a legacy ADT value (`adt_def: None`) reports
+    /// the `Ty::Tuple` of its fields' types.
     pub fn ty(&self) -> Ty {
         match self {
             MirValue::Int { ty, .. } => ty.clone(),
@@ -1231,6 +1663,10 @@ impl MirValue {
                 Ty::Array(Box::new(elem_ty.clone()), elements.len())
             }
             MirValue::Tuple(fields) => Ty::Tuple(fields.iter().map(MirValue::ty).collect()),
+            MirValue::Adt {
+                adt_def: Some(def),
+                ..
+            } => Ty::Adt(def.clone()),
             MirValue::Adt { fields, .. } => Ty::Tuple(fields.iter().map(MirValue::ty).collect()),
         }
     }
@@ -1313,6 +1749,40 @@ pub enum RvalueEvalError {
     InvalidSetDiscriminant(Place),
     /// `Statement::Assume` evaluated to `false` (immediate undefined behavior).
     AssumeFalse,
+    /// A pointer used for a memory access (`copy_nonoverlapping`) is null.
+    NullPointerAccess,
+    /// A pointer used for a memory access, or a retagged reference, is not aligned to
+    /// `required_align`.
+    MisalignedPointer {
+        addr: u64,
+        required_align: usize,
+    },
+    /// A retagged reference points to an uninhabited type.
+    UninhabitedPointee(Ty),
+    /// `copy_nonoverlapping`'s byte length `count * elem_size` overflows or exceeds the
+    /// target's `isize::MAX`.
+    CopyLengthOverflow {
+        count: u128,
+        elem_size: usize,
+    },
+    /// A memory range `[addr, addr + byte_len)` wraps around the target address space.
+    PointerRangeOverflow {
+        addr: u64,
+        byte_len: u128,
+    },
+    /// `copy_nonoverlapping` source and destination ranges overlap.
+    CopyNonOverlappingOverlap {
+        src_addr: u64,
+        dst_addr: u64,
+        byte_len: u128,
+    },
+    /// A memory access that the value-tree evaluator cannot perform (no byte-level memory):
+    /// raised only after every undefined-behavior check of the access has passed.
+    UnsupportedMemoryAccess(&'static str),
+    /// `SetDiscriminant` to (or `Discriminant` of) an uninhabited enum variant.
+    UninhabitedEnumVariant {
+        variant_index: usize,
+    },
 }
 
 impl std::fmt::Display for RvalueEvalError {
@@ -1401,6 +1871,44 @@ impl std::fmt::Display for RvalueEvalError {
             }
             RvalueEvalError::AssumeFalse => {
                 write!(f, "Statement::Assume evaluated to false (UB)")
+            }
+            RvalueEvalError::NullPointerAccess => write!(f, "memory access through a null pointer (UB)"),
+            RvalueEvalError::MisalignedPointer {
+                addr,
+                required_align,
+            } => {
+                write!(f, "pointer {addr:#x} is not aligned to {required_align} bytes (UB)")
+            }
+            RvalueEvalError::UninhabitedPointee(ty) => {
+                write!(f, "reference to uninhabited type {ty:?} (UB)")
+            }
+            RvalueEvalError::CopyLengthOverflow { count, elem_size } => {
+                write!(
+                    f,
+                    "copy length {count} * {elem_size} bytes overflows isize::MAX (UB)"
+                )
+            }
+            RvalueEvalError::PointerRangeOverflow { addr, byte_len } => {
+                write!(
+                    f,
+                    "memory range of {byte_len} bytes at {addr:#x} wraps the address space (UB)"
+                )
+            }
+            RvalueEvalError::CopyNonOverlappingOverlap {
+                src_addr,
+                dst_addr,
+                byte_len,
+            } => {
+                write!(
+                    f,
+                    "copy_nonoverlapping ranges of {byte_len} bytes at {src_addr:#x} and {dst_addr:#x} overlap (UB)"
+                )
+            }
+            RvalueEvalError::UnsupportedMemoryAccess(reason) => {
+                write!(f, "memory access requires a memory model: {reason}")
+            }
+            RvalueEvalError::UninhabitedEnumVariant { variant_index } => {
+                write!(f, "discriminant of uninhabited enum variant {variant_index} (UB)")
             }
         }
     }
@@ -2053,6 +2561,54 @@ pub fn eval_aggregate(
             def_path,
             variant_idx,
             active_field,
+            adt_def: Some(def),
+        } => {
+            if *def_path != def.def_path {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "ADT aggregate def_path does not match its AdtDef",
+                ));
+            }
+            let Some(variant_fields) = def.variant_fields(*variant_idx) else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "ADT aggregate variant index out of range",
+                ));
+            };
+            let shape_ok = match (def.is_union(), active_field) {
+                (true, Some(field_idx)) => {
+                    operands.len() == 1
+                        && variant_fields
+                            .get(*field_idx)
+                            .is_some_and(|ty| mir_value_matches_ty(&operands[0], ty))
+                }
+                (false, None) => {
+                    operands.len() == variant_fields.len()
+                        && operands
+                            .iter()
+                            .zip(variant_fields)
+                            .all(|(v, ty)| mir_value_matches_ty(v, ty))
+                }
+                _ => false,
+            };
+            if !shape_ok {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "ADT aggregate operands do not match the AdtDef's field types",
+                ));
+            }
+            let value = MirValue::Adt {
+                def_path: def_path.clone(),
+                variant_idx: *variant_idx,
+                active_field: *active_field,
+                fields: operands,
+                adt_def: Some(def.clone()),
+            };
+            check_scalar_ranges(&value, ptr_width)?;
+            Ok(value)
+        }
+        AggregateKind::Adt {
+            def_path,
+            variant_idx,
+            active_field,
+            adt_def: None,
         } => {
             if active_field.is_some() {
                 if operands.len() != 1 {
@@ -2071,6 +2627,7 @@ pub fn eval_aggregate(
                 variant_idx: *variant_idx,
                 active_field: *active_field,
                 fields: operands,
+                adt_def: None,
             })
         }
         AggregateKind::RawPtr {
@@ -2164,6 +2721,50 @@ fn encode_mir_value(
                 encode_mir_value(value, field, ptr_width, out)?;
             }
         }
+        (Ty::Adt(def), MirValue::Adt { .. }) => {
+            if !mir_value_head_matches_ty(val, ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "transmute operand value does not match its source ADT type",
+                ));
+            }
+            if !def.has_canonical_byte_layout(ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                    ty: ty.clone(),
+                }));
+            }
+            check_scalar_ranges(val, ptr_width)?;
+            let MirValue::Adt {
+                variant_idx,
+                fields: values,
+                ..
+            } = val
+            else {
+                unreachable!()
+            };
+            let field_tys = match &def.kind {
+                AdtKind::Enum {
+                    tag_ty: Some(tag),
+                    variants,
+                } => {
+                    let bits = def
+                        .discriminant_bits(*variant_idx, ptr_width)
+                        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(ty, err)))?;
+                    out.extend(encode_int_bytes(bits, tag.size_bytes(ptr_width)));
+                    variants[*variant_idx].fields.as_slice()
+                }
+                _ => canonical_untagged_fields(def).ok_or_else(|| {
+                    RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout { ty: ty.clone() })
+                })?,
+            };
+            if values.len() != field_tys.len() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "transmute operand ADT value does not match its field count",
+                ));
+            }
+            for (value, field) in values.iter().zip(field_tys) {
+                encode_mir_value(value, field, ptr_width, out)?;
+            }
+        }
         _ => {
             return Err(RvalueEvalError::TypeMismatch(
                 "transmute operand value does not match its source type (ADT values have no modeled byte layout)",
@@ -2171,6 +2772,104 @@ fn encode_mir_value(
         }
     }
     Ok(())
+}
+
+/// Returns true if `ty` may contain a value restricted by a `scalar_valid_range` (a typed
+/// ADT with a range, directly or nested in arrays, tuples, or ADT fields).
+fn ty_has_scalar_range(ty: &Ty) -> bool {
+    match ty {
+        Ty::Array(elem, count) => *count > 0 && ty_has_scalar_range(elem),
+        Ty::Tuple(fields) => fields.iter().any(ty_has_scalar_range),
+        Ty::Adt(def) => def.scalar_valid_range.is_some() || def.all_fields().any(ty_has_scalar_range),
+        _ => false,
+    }
+}
+
+/// Scalar bit pattern of a scalar `MirValue` (integer bits, `bool`, `char`, or a pointer's
+/// address masked to `ptr_width`).
+fn scalar_value_bits(val: &MirValue, ptr_width: PtrWidth) -> Option<u128> {
+    match val {
+        MirValue::Ptr { ptr, .. } => Some(u128::from(ptr.addr) & ptr_width.mask()),
+        _ => val.as_bits(),
+    }
+}
+
+/// Enforces the `scalar_valid_range` of every typed ADT value inside `val` (e.g. a
+/// `NonZeroU32` holding `0`), which the structural check [`mir_value_matches_ty`] does not
+/// cover, failing with `CastEvalError::InvalidBitPattern { target_ty: Ty::Adt(def), bits }`.
+pub(crate) fn check_scalar_ranges(val: &MirValue, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+    match val {
+        MirValue::Array { elements, elem_ty } => {
+            if ty_has_scalar_range(elem_ty) {
+                for element in elements {
+                    check_scalar_ranges(element, ptr_width)?;
+                }
+            }
+            Ok(())
+        }
+        MirValue::Tuple(fields) => {
+            for field in fields {
+                check_scalar_ranges(field, ptr_width)?;
+            }
+            Ok(())
+        }
+        MirValue::Adt {
+            fields, adt_def, ..
+        } => {
+            if let Some(def) = adt_def
+                && def.scalar_valid_range.is_some()
+                && let Some((idx, _)) = def.scalar_field(ptr_width)
+                && let Some(bits) = fields.get(idx).and_then(|f| scalar_value_bits(f, ptr_width))
+                && !def.scalar_range_contains(bits, ptr_width)
+            {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: Ty::Adt(def.clone()),
+                    bits,
+                }));
+            }
+            for field in fields {
+                check_scalar_ranges(field, ptr_width)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks that a value entering the evaluator from outside (a body argument or a call
+/// handler's return value) is well formed: every integer leaf is a valid bit pattern of its
+/// type under `ptr_width`, every pointer address fits `ptr_width` (and `&T` is non-null), and
+/// every typed ADT respects its `scalar_valid_range` ([`check_scalar_ranges`]). Fails with
+/// `CastEvalError::InvalidBitPattern` naming the offending leaf type and bits.
+pub(crate) fn check_value_well_formed(
+    val: &MirValue,
+    ptr_width: PtrWidth,
+) -> Result<(), RvalueEvalError> {
+    fn check_leaves(val: &MirValue, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+        let invalid = |target_ty: &Ty, bits: u128| {
+            Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: target_ty.clone(),
+                bits,
+            }))
+        };
+        match val {
+            MirValue::Int { bits, ty } if !ty.is_valid_scalar_bits(*bits, ptr_width) => {
+                invalid(ty, *bits)
+            }
+            MirValue::Ptr { ptr, ty } if !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) => {
+                invalid(ty, u128::from(ptr.addr))
+            }
+            MirValue::Array { elements, .. } => elements
+                .iter()
+                .try_for_each(|element| check_leaves(element, ptr_width)),
+            MirValue::Tuple(fields) | MirValue::Adt { fields, .. } => fields
+                .iter()
+                .try_for_each(|field| check_leaves(field, ptr_width)),
+            _ => Ok(()),
+        }
+    }
+    check_leaves(val, ptr_width)?;
+    check_scalar_ranges(val, ptr_width)
 }
 
 /// Validates and normalizes `val` against `ty` for an identity transmute (`src_ty == target_ty`):
@@ -2249,6 +2948,7 @@ fn eval_identity_transmute_value(
                 variant_idx,
                 active_field: None,
                 fields: values,
+                adt_def: None,
             },
         ) if values.len() == fields.len() => {
             let norm = values
@@ -2261,6 +2961,7 @@ fn eval_identity_transmute_value(
                 variant_idx: *variant_idx,
                 active_field: None,
                 fields: norm,
+                adt_def: None,
             })
         }
         (
@@ -2270,6 +2971,7 @@ fn eval_identity_transmute_value(
                 variant_idx: 0,
                 active_field: Some(field_idx),
                 fields: values,
+                adt_def: None,
             },
         ) if values.len() == 1 => {
             let Some(field_ty) = fields.get(*field_idx) else {
@@ -2283,7 +2985,44 @@ fn eval_identity_transmute_value(
                 variant_idx: 0,
                 active_field: Some(*field_idx),
                 fields: vec![norm],
+                adt_def: None,
             })
+        }
+        (
+            Ty::Adt(def),
+            MirValue::Adt {
+                def_path,
+                variant_idx,
+                active_field,
+                fields: values,
+                adt_def: Some(_),
+            },
+        ) if mir_value_head_matches_ty(val, ty) => {
+            let field_tys: &[Ty] = match (active_field, def.variant_fields(*variant_idx)) {
+                (Some(field_idx), Some(union_fields)) => {
+                    std::slice::from_ref(&union_fields[*field_idx])
+                }
+                (None, Some(variant_fields)) => variant_fields,
+                (_, None) => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "transmute operand ADT variant out of range",
+                    ));
+                }
+            };
+            let norm = values
+                .iter()
+                .zip(field_tys)
+                .map(|(value, field)| eval_identity_transmute_value(value, field, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            let out = MirValue::Adt {
+                def_path: def_path.clone(),
+                variant_idx: *variant_idx,
+                active_field: *active_field,
+                fields: norm,
+                adt_def: Some(def.clone()),
+            };
+            check_scalar_ranges(&out, ptr_width)?;
+            Ok(out)
         }
         _ => Err(RvalueEvalError::TypeMismatch(
             "transmute operand value does not match its source type",
@@ -2359,6 +3098,54 @@ fn decode_mir_value(
         Ty::Never => Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
             target_ty: Ty::Never,
         })),
+        Ty::Adt(def) => {
+            let (start, variant_idx, field_tys) = match &def.kind {
+                AdtKind::Enum { variants, .. } if variants.is_empty() => {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                        target_ty: ty.clone(),
+                    }));
+                }
+                AdtKind::Enum {
+                    tag_ty: Some(tag),
+                    variants,
+                } => {
+                    let tag_size = tag.size_bytes(ptr_width);
+                    let tag_bits = decode_int_bytes(&bytes[..tag_size]);
+                    let Some(variant_idx) = def.variant_index_of_discriminant(tag_bits, ptr_width)
+                    else {
+                        return Err(invalid(tag_bits));
+                    };
+                    (tag_size, variant_idx, variants[variant_idx].fields.as_slice())
+                }
+                _ => {
+                    let fields = canonical_untagged_fields(def).ok_or_else(|| {
+                        RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                            ty: ty.clone(),
+                        })
+                    })?;
+                    (0, 0, fields)
+                }
+            };
+            let mut offset = start;
+            let mut values = Vec::with_capacity(field_tys.len());
+            for field in field_tys {
+                let size = field.byte_size_for(ptr_width);
+                values.push(decode_mir_value(&bytes[offset..offset + size], field, ptr_width)?);
+                offset += size;
+            }
+            let value = if def.is_union() {
+                let Some(field) = values.pop() else {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                        ty: ty.clone(),
+                    }));
+                };
+                MirValue::union_value(def, 0, field)
+            } else {
+                MirValue::adt(def, variant_idx, values)
+            };
+            check_scalar_ranges(&value, ptr_width)?;
+            Ok(value)
+        }
     }
 }
 
@@ -2516,15 +3303,13 @@ pub fn eval_lowered_cast(
                 // Identity transmute (`T.decode(T.encode(v)) == v` for every valid `v`),
                 // covering both canonical and non-canonical layouts as well as `MirValue::Adt`
                 // struct/enum/union values.
-                if !src_ty.is_inhabited() {
+                if !src_ty.is_inhabited_for(ptr_width) {
                     return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
                         target_ty: target_ty.clone(),
                     }));
                 }
-                if src_ty.layout_size_for(ptr_width).is_none() {
-                    return Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
-                        ty: src_ty.clone(),
-                    }));
+                if let Err(err) = src_ty.layout_for(ptr_width) {
+                    return Err(RvalueEvalError::CastEval(cast_eval_layout_error(src_ty, err)));
                 }
                 return eval_identity_transmute_value(val, src_ty, ptr_width);
             }
@@ -2564,13 +3349,44 @@ pub fn eval_lowered_cast(
                 TransmuteValue::AbstractBytes(bytes) => decode_mir_value(&bytes, target_ty, ptr_width),
             }
         }
+        LoweredCast::Subtype { src_ty, target_ty, .. } => {
+            if !crate::lower::cast::is_subtype_compatible(src_ty, target_ty)
+                || !mir_value_matches_ty(val, src_ty)
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Subtype operand must match the (equal) source and target types",
+                ));
+            }
+            Ok(val.clone())
+        }
+        LoweredCast::PointerCoercion {
+            src_ty, target_ty, ..
+        } => {
+            let MirValue::Ptr { ptr, ty } = val else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "PointerCoercion requires pointer value",
+                ));
+            };
+            if ty != src_ty || !src_ty.is_raw_ptr() || !target_ty.is_raw_ptr() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "PointerCoercion requires raw pointer source and target types matching operand",
+                ));
+            }
+            Ok(MirValue::Ptr {
+                ptr: PointerValue {
+                    addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
+                    provenance: ptr.provenance,
+                },
+                ty: target_ty.clone(),
+            })
+        }
     }
 }
 
 /// Checks whether a runtime `MirValue` is structurally compatible with `expected_ty`,
 /// accounting for union `MirValue::Adt { active_field: Some(field_idx), .. }` values whose
 /// single operand corresponds to `field_tys[field_idx]` of the union's declared tuple type.
-fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
+pub(crate) fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
     match (val, expected_ty) {
         (MirValue::Int { ty, .. }, expected) => ty == expected,
         (MirValue::Bool(_), Ty::Bool) => true,
@@ -2596,6 +3412,7 @@ fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
             MirValue::Adt {
                 active_field: None,
                 fields: vals,
+                adt_def: None,
                 ..
             },
             Ty::Tuple(field_tys),
@@ -2611,6 +3428,7 @@ fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
                 variant_idx: 0,
                 active_field: Some(field_idx),
                 fields: vals,
+                adt_def: None,
                 ..
             },
             Ty::Tuple(field_tys),
@@ -2627,7 +3445,46 @@ fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
                         .is_some_and(|(ft, v)| mir_value_matches_ty(v, ft))
             }
         }
+        (MirValue::Adt { fields: vals, .. }, Ty::Adt(_)) => {
+            typed_adt_field_tys(val, expected_ty).is_some_and(|field_tys| {
+                vals.iter()
+                    .zip(field_tys)
+                    .all(|(v, t)| mir_value_matches_ty(v, t))
+            })
+        }
         _ => false,
+    }
+}
+
+/// For a typed ADT value `val` whose outermost constructor matches the `Ty::Adt` `ty` (same
+/// definition and `def_path`; a struct's variant `0`, an in-range enum variant, or a union's
+/// in-range active field with exactly one value; field counts matching), returns the types of
+/// `val`'s fields in order. Returns `None` on any mismatch.
+fn typed_adt_field_tys<'t>(val: &MirValue, ty: &'t Ty) -> Option<&'t [Ty]> {
+    let (
+        MirValue::Adt {
+            def_path,
+            variant_idx,
+            active_field,
+            fields,
+            adt_def: Some(val_def),
+        },
+        Ty::Adt(def),
+    ) = (val, ty)
+    else {
+        return None;
+    };
+    if val_def != def || *def_path != def.def_path {
+        return None;
+    }
+    let variant_fields = def.variant_fields(*variant_idx)?;
+    match (def.is_union(), active_field) {
+        (true, Some(field_idx)) => {
+            let field_ty = variant_fields.get(*field_idx)?;
+            (fields.len() == 1).then_some(std::slice::from_ref(field_ty))
+        }
+        (false, None) => (fields.len() == variant_fields.len()).then_some(variant_fields),
+        _ => None,
     }
 }
 
@@ -2645,6 +3502,7 @@ fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
             MirValue::Adt {
                 active_field: None,
                 fields: vals,
+                adt_def: None,
                 ..
             },
             Ty::Tuple(field_tys),
@@ -2654,6 +3512,7 @@ fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
                 variant_idx: 0,
                 active_field: Some(field_idx),
                 fields: vals,
+                adt_def: None,
                 ..
             },
             Ty::Tuple(field_tys),
@@ -2670,6 +3529,16 @@ fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
                         .is_some_and(|(ft, v)| mir_value_head_matches_ty(v, ft))
             }
         }
+        (
+            MirValue::Adt {
+                active_field: Some(_),
+                fields: vals,
+                ..
+            },
+            Ty::Adt(_),
+        ) => typed_adt_field_tys(val, expected_ty)
+            .is_some_and(|field_tys| mir_value_head_matches_ty(&vals[0], &field_tys[0])),
+        (MirValue::Adt { .. }, Ty::Adt(_)) => typed_adt_field_tys(val, expected_ty).is_some(),
         _ => mir_value_matches_ty(val, expected_ty),
     }
 }
@@ -2797,17 +3666,17 @@ where
                     "Downcast projection must be followed by Field",
                 ));
             }
-            if !matches!(cur_ty, Ty::Tuple(_)) {
+            if !downcast_allowed(cur_ty, *v) {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Downcast projection requires a tuple-typed (ADT) place",
+                    "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
                 ));
             }
             validate_projection_tail(cur_ty, rest, local_decls, read_index, full_place, Some(*v))
         }
         ProjectionElem::Field(idx, expected_ty) => {
-            let Ty::Tuple(field_tys) = cur_ty else {
+            let Some(field_tys) = projectable_field_tys(cur_ty, active_downcast) else {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Field projection requires a tuple-typed place",
+                    "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
                 ));
             };
             if *idx >= field_tys.len() {
@@ -3207,9 +4076,9 @@ fn project_mir_value<'a>(
                     ))?
                 };
                 if let Some(decl_ty) = declared_ty {
-                    let Ty::Tuple(union_field_tys) = decl_ty else {
+                    let Some(union_field_tys) = union_fields_of(decl_ty) else {
                         return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT declared type must be Ty::Tuple",
+                            "union ADT declared type must be a Ty::Tuple or a union Ty::Adt",
                         ));
                     };
                     let Some(active_ty) = union_field_tys.get(*active) else {
@@ -3285,12 +4154,16 @@ fn project_mir_value<'a>(
 /// value the read returns is checked in full with [`mir_value_matches_ty`]. A read therefore
 /// costs time proportional to the projection length plus the size of the returned value,
 /// not the size of the containing local.
+///
+/// The returned value must also satisfy the `scalar_valid_range` of every typed ADT inside it
+/// (a typed copy of an invalid `NonZeroU32` is undefined behavior), while reading a field of
+/// such an ADT only validates that field.
 fn read_projected_mir_value(
     val: &MirValue,
     declared_ty: Option<&Ty>,
     proj: &[ProjectionElem],
     read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    _ptr_width: PtrWidth,
+    ptr_width: PtrWidth,
     full_place: &Place,
     active_downcast: Option<usize>,
 ) -> Result<MirValue, RvalueEvalError> {
@@ -3305,7 +4178,9 @@ fn read_projected_mir_value(
     // When `proj` is empty and `declared_ty` is `None` (pure `eval_place_read` on a bare local),
     // `leaf_ty` is `None`; when `proj` is non-empty, `project_mir_value` supplies the last
     // step's type as `leaf_ty`.
-    projected_ref_into_mir_value(target, if proj.is_empty() { None } else { leaf_ty })
+    let value = projected_ref_into_mir_value(target, if proj.is_empty() { None } else { leaf_ty })?;
+    check_scalar_ranges(&value, ptr_width)?;
+    Ok(value)
 }
 
 /// Traverses `proj` over a mutable array window `window` of element type `elem_ty` for an
@@ -3710,9 +4585,9 @@ fn write_projected_mir_value(
                     ))?
                 };
                 if let Some(decl_ty) = declared_ty {
-                    let Ty::Tuple(union_field_tys) = decl_ty else {
+                    let Some(union_field_tys) = union_fields_of(decl_ty) else {
                         return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT declared type must be Ty::Tuple",
+                            "union ADT declared type must be a Ty::Tuple or a union Ty::Adt",
                         ));
                     };
                     let Some(active_ty) = union_field_tys.get(*active) else {
@@ -4047,29 +4922,28 @@ pub fn eval_nullary_op(
 ) -> Result<MirValue, RvalueEvalError> {
     match op {
         NullOp::SizeOf => {
-            let Some(size) = arg_ty.layout_size_for(ptr_width) else {
-                return Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
-                    ty: arg_ty.clone(),
-                }));
-            };
-            Ok(MirValue::unsigned(size as u128, UintTy::Usize, ptr_width))
+            let layout = arg_ty
+                .layout_for(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(arg_ty, err)))?;
+            Ok(MirValue::unsigned(layout.size as u128, UintTy::Usize, ptr_width))
         }
         NullOp::AlignOf => {
-            if arg_ty.layout_size_for(ptr_width).is_none() {
-                return Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
-                    ty: arg_ty.clone(),
-                }));
-            }
-            let align = arg_ty.align_for(ptr_width);
-            Ok(MirValue::unsigned(align as u128, UintTy::Usize, ptr_width))
+            let layout = arg_ty
+                .layout_for(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(arg_ty, err)))?;
+            Ok(MirValue::unsigned(layout.align as u128, UintTy::Usize, ptr_width))
         }
         NullOp::OffsetOf(fields) => {
             let offset = resolve_offset_of(arg_ty, fields, ptr_width).map_err(|err| match err {
                 RvalueLowerError::LayoutTooLarge(ty) => {
                     RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge { ty })
                 }
-                RvalueLowerError::UnsupportedOffsetOfLayout(ty) => {
+                RvalueLowerError::UnsupportedOffsetOfLayout(ty)
+                | RvalueLowerError::UnsupportedLayout(ty) => {
                     RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout { ty })
+                }
+                RvalueLowerError::InvalidAdtDef { ty, reason } => {
+                    RvalueEvalError::CastEval(CastEvalError::IllFormedType { ty, reason })
                 }
                 _ => RvalueEvalError::TypeMismatch("invalid OffsetOf field path"),
             })?;
@@ -4235,14 +5109,7 @@ pub fn eval_lowered_rvalue(
             Ok(MirValue::unsigned(*static_len as u128, UintTy::Usize, ptr_width))
         }
         LoweredRvalue::Cast { cast, ty } => {
-            let op = match cast {
-                LoweredCast::PtrToInt { operand, .. }
-                | LoweredCast::IntToPtr { operand, .. }
-                | LoweredCast::IntToInt { operand, .. }
-                | LoweredCast::CharToInt { operand, .. }
-                | LoweredCast::PtrToPtr { operand, .. }
-                | LoweredCast::Transmute { operand, .. } => operand,
-            };
+            let op = cast.operand();
             let v = eval_op(op)?;
             let out = eval_lowered_cast(cast, &v, ptr_width, policy, tracker)?;
             if !mir_value_matches_ty(&out, ty) {
@@ -4340,10 +5207,16 @@ pub fn eval_lowered_rvalue(
             place_ty,
             ty,
         } => {
-            if *ty != Ty::Int(IntTy::Isize) || !place_ty.is_inhabited() {
+            if *ty != discriminant_result_ty(place_ty) || !place_ty.is_inhabited_for(ptr_width) {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Discriminant requires an inhabited place_ty and isize result ty",
+                    "Discriminant requires an inhabited place_ty and its discriminant result ty",
                 ));
+            }
+            if let Ty::Adt(def) = place_ty
+                && !def.requires_tag_write()
+            {
+                // Single-variant layouts store no tag: the discriminant is a constant.
+                return discriminant_value(def, 0, ptr_width);
             }
             let val = read_place(place)?;
             if !mir_value_matches_ty(&val, place_ty) {
@@ -4351,15 +5224,20 @@ pub fn eval_lowered_rvalue(
                     "Discriminant place runtime value does not match lowered place_ty",
                 ));
             }
-            let discr = match val {
-                MirValue::Adt {
-                    variant_idx,
-                    active_field: None,
-                    ..
-                } => variant_idx as i128,
-                _ => 0,
-            };
-            Ok(MirValue::signed(discr, IntTy::Isize, ptr_width))
+            match (&val, place_ty) {
+                (MirValue::Adt { variant_idx, .. }, Ty::Adt(def)) => {
+                    discriminant_value(def, *variant_idx, ptr_width)
+                }
+                (
+                    MirValue::Adt {
+                        variant_idx,
+                        active_field: None,
+                        ..
+                    },
+                    _,
+                ) => Ok(MirValue::signed(*variant_idx as i128, IntTy::Isize, ptr_width)),
+                _ => Ok(MirValue::signed(0, IntTy::Isize, ptr_width)),
+            }
         }
         LoweredRvalue::Aggregate {
             kind,
@@ -4418,6 +5296,84 @@ pub fn eval_lowered_rvalue(
                 "CopyForDeref requires a pointer value matching the place type",
             )),
         },
+        LoweredRvalue::ShallowInitBox {
+            operand,
+            operand_ty,
+            ty,
+        } => eval_shallow_init_box(&eval_op(operand)?, operand_ty, ty, ptr_width),
+        LoweredRvalue::WrapUnsafeBinder {
+            operand,
+            operand_ty,
+            ty,
+        } => eval_wrap_unsafe_binder(eval_op(operand)?, operand_ty, ty, ptr_width),
+    }
+}
+
+/// `Rvalue::Discriminant` result for variant `variant_idx` of `def`: its discriminant bits
+/// typed [`AdtDef::discr_ty`].
+fn discriminant_value(
+    def: &Arc<AdtDef>,
+    variant_idx: usize,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    let bits = def.discriminant_bits(variant_idx, ptr_width).map_err(|err| {
+        RvalueEvalError::CastEval(cast_eval_layout_error(&Ty::Adt(def.clone()), err))
+    })?;
+    Ok(MirValue::Int {
+        bits,
+        ty: def.discr_ty(),
+    })
+}
+
+/// Evaluates `ShallowInitBox` on the evaluated raw pointer `val`: the same address (masked to
+/// `ptr_width`) and provenance, typed `ty` (`*mut T`).
+fn eval_shallow_init_box(
+    val: &MirValue,
+    operand_ty: &Ty,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    match val {
+        MirValue::Ptr { ptr, ty: val_ty } if val_ty == operand_ty && val_ty.is_raw_ptr() && ty.is_raw_ptr() => {
+            Ok(MirValue::Ptr {
+                ptr: PointerValue {
+                    addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
+                    provenance: ptr.provenance,
+                },
+                ty: ty.clone(),
+            })
+        }
+        _ => Err(RvalueEvalError::TypeMismatch(
+            "ShallowInitBox requires a raw pointer operand matching its lowered type",
+        )),
+    }
+}
+
+/// Evaluates `WrapUnsafeBinder` on `val`: unchanged when `ty` is the operand type, otherwise
+/// wrapped as the single field of the struct `ty` (enforcing its `scalar_valid_range`).
+fn eval_wrap_unsafe_binder(
+    val: MirValue,
+    operand_ty: &Ty,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    if !mir_value_matches_ty(&val, operand_ty) {
+        return Err(RvalueEvalError::TypeMismatch(
+            "WrapUnsafeBinder operand runtime type does not match lowered type",
+        ));
+    }
+    if ty == operand_ty {
+        return Ok(val);
+    }
+    match ty {
+        Ty::Adt(def) if wrapped_field_ty(ty) == Some(operand_ty) => {
+            let out = MirValue::adt(def, 0, vec![val]);
+            check_scalar_ranges(&out, ptr_width)?;
+            Ok(out)
+        }
+        _ => Err(RvalueEvalError::TypeMismatch(
+            "WrapUnsafeBinder type does not wrap the operand type",
+        )),
     }
 }
 
@@ -4466,6 +5422,10 @@ pub struct PartialAggregate {
     pub discriminant_set: bool,
     /// Per-field initialization states in declaration order.
     pub fields: Vec<FieldSlot>,
+    /// Definition of a typed ADT shell (`Ty::Adt` place): promotes to a typed
+    /// `MirValue::Adt`, and requires `discriminant_set` only when
+    /// [`AdtDef::requires_tag_write`]. `None` for tuples and legacy tuple-modeled ADTs.
+    pub adt_def: Option<Arc<AdtDef>>,
 }
 
 impl PartialAggregate {
@@ -4478,13 +5438,53 @@ impl PartialAggregate {
             is_adt,
             discriminant_set: false,
             fields: vec![FieldSlot::Uninit; field_count],
+            adt_def: None,
         }
+    }
+
+    /// Creates an all-uninitialized shell for variant `variant_idx` of the typed ADT `def`,
+    /// with an unwritten tag. Returns `None` if the variant does not exist or `def` is a union
+    /// (union fields overlap, so unions never get per-field shells).
+    pub fn new_uninit_adt(def: &Arc<AdtDef>, variant_idx: usize) -> Option<Self> {
+        if def.is_union() {
+            return None;
+        }
+        let field_count = def.variant_fields(variant_idx)?.len();
+        Some(PartialAggregate {
+            def_path: Some(def.def_path.clone()),
+            variant_idx,
+            is_adt: true,
+            discriminant_set: false,
+            fields: vec![FieldSlot::Uninit; field_count],
+            adt_def: Some(def.clone()),
+        })
+    }
+
+    /// Returns true if a whole-value read of this shell needs its tag written first: enum
+    /// shells of a legacy tuple-modeled ADT (`is_adt` without `adt_def`) and typed shells
+    /// whose ADT stores a tag ([`AdtDef::requires_tag_write`]).
+    pub fn requires_tag_write(&self) -> bool {
+        match &self.adt_def {
+            Some(def) => def.requires_tag_write(),
+            None => self.is_adt,
+        }
+    }
+
+    /// Returns true if the shell has no initialized field and no written tag that matters
+    /// (only shells needing a tag write remember their tag), i.e. it is indistinguishable from
+    /// an uninitialized place.
+    pub fn is_empty(&self) -> bool {
+        (!self.discriminant_set || !self.requires_tag_write())
+            && self.fields.iter().all(|f| matches!(f, FieldSlot::Uninit))
     }
 
     /// Returns `Some(MirValue)` if every field in `self.fields` is `FieldSlot::Init` and, for
     /// an enum/ADT shell (`is_adt`), the variant tag has been written by `SetDiscriminant`.
+    ///
+    /// A typed shell (`adt_def: Some(def)`) promotes to a typed `MirValue::Adt` and only needs
+    /// its tag written when `def` stores one ([`PartialAggregate::requires_tag_write`]).
     pub fn try_into_mir_value(&self) -> Option<MirValue> {
-        if self.is_adt && !self.discriminant_set {
+        if self.requires_tag_write() && !self.discriminant_set {
             return None;
         }
         if !self.fields.iter().all(|f| matches!(f, FieldSlot::Init(_))) {
@@ -4497,12 +5497,15 @@ impl PartialAggregate {
                 FieldSlot::Uninit | FieldSlot::Partial(_) => return None,
             }
         }
-        if self.is_adt {
+        if let Some(def) = &self.adt_def {
+            Some(MirValue::adt(def, self.variant_idx, init_fields))
+        } else if self.is_adt {
             Some(MirValue::Adt {
                 def_path: self.def_path.clone().unwrap_or_default(),
                 variant_idx: self.variant_idx,
                 active_field: None,
                 fields: init_fields,
+                adt_def: None,
             })
         } else {
             Some(MirValue::Tuple(init_fields))
@@ -4586,7 +5589,9 @@ impl StatementEvalState {
 
     /// Constructs a `StatementEvalState` from a `LoweredBody` and function arguments `args`:
     /// `_0` (`RETURN_PLACE`) starts `Uninit`, `_1..=args.len()` start `Init(arg)`, and
-    /// remaining temporaries start `Dead` (awaiting `StorageLive`).
+    /// remaining temporaries start `Dead` (awaiting `StorageLive`). Every argument must match
+    /// its parameter type and be well formed (valid scalar bits, non-null references, ADT
+    /// scalar valid ranges).
     pub fn from_body(body: &LoweredBody, args: &[MirValue]) -> Result<Self, RvalueEvalError> {
         if body.local_decls.is_empty() || args.len() >= body.local_decls.len() {
             return Err(RvalueEvalError::TypeMismatch(
@@ -4602,6 +5607,7 @@ impl StatementEvalState {
                     "argument runtime value does not match declared parameter type",
                 ));
             }
+            check_value_well_formed(arg, body.ptr_width)?;
             slots[i + 1] = LocalSlotState::Init(arg.clone());
         }
         Ok(Self::new(
@@ -4843,6 +5849,225 @@ impl StatementEvalState {
         }
     }
 
+    /// Checks the projection of `place` against the local declarations (it must not contain
+    /// `Deref` and must have declared type `place_ty`), that the root local is live
+    /// (`DeadLocal` otherwise), and reads every `Index(idx_local)` operand in order (faulting
+    /// on dead or uninitialized index locals), without reading or changing the place itself.
+    pub fn check_place_access(&self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
+        self.prepare_place_access(place, place_ty).map(|_| ())
+    }
+
+    /// Evaluates an operand in this state: `Copy` reads the place, `Move` reads it and (for a
+    /// bare local) deinitializes it (see [`StatementEvalState::move_place`]), and `Constant`
+    /// is validated and evaluated.
+    pub fn eval_operand(&mut self, operand: &Operand) -> Result<MirValue, RvalueEvalError> {
+        match operand {
+            Operand::Copy(place) => self.read_place(place),
+            Operand::Move(place) => self.move_place(place),
+            Operand::Constant(c) => eval_constant(c, self.ptr_width),
+        }
+    }
+
+    /// Checks the projection of `place` against the local declarations (it must not contain
+    /// `Deref` and must have declared type `place_ty`), that the root local is live
+    /// (`DeadLocal` otherwise), and reads every `Index(idx_local)` operand in order (faulting
+    /// on dead or uninitialized index locals), returning the index values for the traversal.
+    fn prepare_place_access(
+        &self,
+        place: &Place,
+        place_ty: &Ty,
+    ) -> Result<Vec<(Local, u128)>, RvalueEvalError> {
+        if place
+            .projection
+            .iter()
+            .any(|p| matches!(p, ProjectionElem::Deref))
+        {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        }
+        let decl_place_ty = self.check_place_against_decls(place)?;
+        if decl_place_ty != *place_ty {
+            return Err(RvalueEvalError::TypeMismatch(
+                "statement place_ty does not match declared place type",
+            ));
+        }
+        match self.slots.get(place.local.0) {
+            None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
+            Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
+            Some(_) => {}
+        }
+        let mut index_cache = Vec::new();
+        for elem in &place.projection {
+            if let ProjectionElem::Index(idx_local) = elem {
+                index_cache.push((*idx_local, self.read_index_local(*idx_local)?));
+            }
+        }
+        Ok(index_cache)
+    }
+
+    /// Variant index read from the tag of the typed enum at `place` for `Rvalue::Discriminant`,
+    /// without reading (or requiring initialized) variant fields: an initialized value's
+    /// variant, or a shell's variant once its tag is written.
+    fn typed_enum_variant(
+        &self,
+        place: &Place,
+        place_ty: &Ty,
+        index_cache: &[(Local, u128)],
+    ) -> Result<usize, RvalueEvalError> {
+        let base_decl_ty = &self.local_decls[place.local.0];
+        let read_index = |idx_local: Local| cached_index(index_cache, idx_local);
+        let variant_of = |val: &MirValue| match val {
+            MirValue::Adt { variant_idx, .. } if mir_value_head_matches_ty(val, place_ty) => {
+                Ok(*variant_idx)
+            }
+            _ => Err(RvalueEvalError::TypeMismatch(
+                "Discriminant place runtime value does not match lowered place_ty",
+            )),
+        };
+        match &self.slots[place.local.0] {
+            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(place.local)),
+            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(place.local)),
+            LocalSlotState::Init(root) => {
+                match project_mir_value(root, Some(base_decl_ty), &place.projection, &read_index, place, None)? {
+                    (ProjectedRef::Value(val), _) => variant_of(val),
+                    (ProjectedRef::ArrayWindow { .. }, _) => Err(RvalueEvalError::TypeMismatch(
+                        "Discriminant place must not be an array window",
+                    )),
+                }
+            }
+            LocalSlotState::PartialShell(root) => match project_from_partial_shell(
+                root,
+                base_decl_ty,
+                &place.projection,
+                &read_index,
+                self.ptr_width,
+                place.local,
+                place,
+                None,
+            )? {
+                ProjectedShellRef::Shell(shell) => {
+                    if shell.discriminant_set || !shell.requires_tag_write() {
+                        Ok(shell.variant_idx)
+                    } else {
+                        Err(RvalueEvalError::UninitializedLocal(place.local))
+                    }
+                }
+                ProjectedShellRef::Init(ProjectedRef::Value(val), _) => variant_of(val),
+                ProjectedShellRef::Init(ProjectedRef::ArrayWindow { .. }, _) => {
+                    Err(RvalueEvalError::TypeMismatch(
+                        "Discriminant place must not be an array window",
+                    ))
+                }
+            },
+        }
+    }
+
+    /// Evaluates `Statement::Deinit(place)` (of declared type `place_ty`).
+    ///
+    /// Requires a live root local (`DeadLocal`), reads the `Index` operands first, then:
+    /// - a bare local becomes `LocalSlotState::Uninit`;
+    /// - a projected place through tuple/struct fields and `Downcast` variant fields demotes the
+    ///   containing values to `PartialShell`s whose target slot is `FieldSlot::Uninit`, keeping
+    ///   every disjoint sibling (and the enum tag when it is stored apart from the fields, see
+    ///   [`AdtDef::tag_survives_field_deinit`]) initialized; writing the place again re-promotes
+    ///   the shells to `Init`;
+    /// - a place inside an already uninitialized part is a no-op (after the static and dynamic
+    ///   bounds checks);
+    /// - a `Downcast` to an inactive variant of an initialized enum is
+    ///   `InactiveVariantProjection` (as for assignments); a place inside an initialized array
+    ///   element or union field is `UnsupportedPlaceProjection` (arrays and unions have no
+    ///   per-element shells); a `Deref` is `UnsupportedPlaceProjection`.
+    ///
+    /// Deinitializing a zero-sized part still marks it uninitialized (Anneal tracks
+    /// initialization per field, like `rustc`'s move paths, rather than per byte).
+    pub fn deinit_place(&mut self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
+        let index_cache = self.prepare_place_access(place, place_ty)?;
+        if place.projection.is_empty() {
+            self.slots[place.local.0] = LocalSlotState::Uninit;
+            return Ok(());
+        }
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        let mut root_slot = take_root_slot(&mut self.slots[place.local.0]);
+        let res = deinit_in_slot(
+            &mut root_slot,
+            &self.local_decls[place.local.0],
+            &place.projection,
+            &read_index,
+            place,
+            None,
+        );
+        normalize_slot(&mut root_slot);
+        self.slots[place.local.0] = root_slot_state(root_slot);
+        res
+    }
+
+    /// Evaluates `Statement::Retag(kind, place)` (of declared type `place_ty`).
+    ///
+    /// Requires a live root local and reads the `Index` operands. `RetagKind::Raw(m)` reads the
+    /// raw pointer at `place` (it must be initialized; it may be null, unaligned, or dangling).
+    /// The other kinds validate every reference reachable in `place`'s value without
+    /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, aligned to
+    /// its pointee's alignment, and point to an inhabited type. A place whose type holds no
+    /// references only needs to be live. Anneal does not model aliasing tags, so the value is
+    /// unchanged.
+    pub fn retag_place(
+        &self,
+        kind: RetagKind,
+        place: &Place,
+        place_ty: &Ty,
+    ) -> Result<(), RvalueEvalError> {
+        let index_cache = self.prepare_place_access(place, place_ty)?;
+        if let RetagKind::Raw(mutability) = kind {
+            if !matches!(place_ty, Ty::RawPtr(_, m) if *m == mutability) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Retag(Raw) requires a raw pointer place of matching mutability",
+                ));
+            }
+            return match self.read_place(place)? {
+                MirValue::Ptr { .. } => Ok(()),
+                _ => Err(RvalueEvalError::TypeMismatch(
+                    "Retag(Raw) place must hold a pointer value",
+                )),
+            };
+        }
+        if !place_ty.contains_ref() {
+            return Ok(());
+        }
+        let base_decl_ty = &self.local_decls[place.local.0];
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        match &self.slots[place.local.0] {
+            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(place.local)),
+            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(place.local)),
+            LocalSlotState::Init(root) => {
+                let (target, _) = project_mir_value(
+                    root,
+                    Some(base_decl_ty),
+                    &place.projection,
+                    &read_index,
+                    place,
+                    None,
+                )?;
+                retag_projected(target, place_ty, self.ptr_width)
+            }
+            LocalSlotState::PartialShell(root) => match project_from_partial_shell(
+                root,
+                base_decl_ty,
+                &place.projection,
+                &read_index,
+                self.ptr_width,
+                place.local,
+                place,
+                None,
+            )? {
+                ProjectedShellRef::Shell(shell) => {
+                    retag_shell(shell, place_ty, self.ptr_width, place.local)
+                }
+                ProjectedShellRef::Init(target, _) => {
+                    retag_projected(target, place_ty, self.ptr_width)
+                }
+            },
+        }
+    }
+
     /// Writes `val` to `place` (of declared leaf type `place_ty`), supporting `D13b` nested
     /// tuple/ADT field-shell initialization while rejecting array-element writes on
     /// uninitialized arrays.
@@ -5003,9 +6228,9 @@ fn project_from_partial_shell<'a>(
                     ));
                 }
             }
-            if !matches!(declared_ty, Ty::Tuple(_)) {
+            if !downcast_allowed(declared_ty, *expected_variant) {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Downcast projection requires a tuple-typed (ADT) place",
+                    "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
                 ));
             }
             let actual = if shell.is_adt { shell.variant_idx } else { 0 };
@@ -5027,9 +6252,9 @@ fn project_from_partial_shell<'a>(
             )
         }
         ProjectionElem::Field(idx, expected_ty) => {
-            let Ty::Tuple(field_tys) = declared_ty else {
+            let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast) else {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Field projection requires a tuple-typed place",
+                    "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
                 ));
             };
             let expected_variant = active_downcast.unwrap_or(0);
@@ -5161,11 +6386,17 @@ fn read_from_partial_shell(
         full_place,
         active_downcast,
     )? {
-        ProjectedShellRef::Shell(reached) => reached
-            .try_into_mir_value()
-            .ok_or(RvalueEvalError::UninitializedLocal(base_local)),
+        ProjectedShellRef::Shell(reached) => {
+            let value = reached
+                .try_into_mir_value()
+                .ok_or(RvalueEvalError::UninitializedLocal(base_local))?;
+            check_scalar_ranges(&value, ptr_width)?;
+            Ok(value)
+        }
         ProjectedShellRef::Init(projected, leaf_ty) => {
-            projected_ref_into_mir_value(projected, leaf_ty)
+            let value = projected_ref_into_mir_value(projected, leaf_ty)?;
+            check_scalar_ranges(&value, ptr_width)?;
+            Ok(value)
         }
     }
 }
@@ -5239,11 +6470,11 @@ fn write_to_partial_slot(
                     "Downcast projection must be followed by Field",
                 ));
             }
-            let Ty::Tuple(_) = declared_ty else {
+            if !downcast_allowed(declared_ty, *expected_variant) {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Downcast projection requires a tuple-typed (ADT) place",
+                    "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
                 ));
-            };
+            }
             if let FieldSlot::Partial(shell) = &*slot {
                 let actual = if shell.is_adt { shell.variant_idx } else { 0 };
                 if actual != *expected_variant {
@@ -5266,9 +6497,9 @@ fn write_to_partial_slot(
             )
         }
         ProjectionElem::Field(idx, expected_ty) => {
-            let Ty::Tuple(field_tys) = declared_ty else {
+            let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast) else {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Field projection requires a tuple-typed place",
+                    "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
                 ));
             };
             if *idx >= field_tys.len() {
@@ -5281,6 +6512,31 @@ fn write_to_partial_slot(
                 return Err(RvalueEvalError::TypeMismatch(
                     "projected field type does not match declared tuple field type",
                 ));
+            }
+            if let (FieldSlot::Uninit, Ty::Adt(def)) = (&*slot, declared_ty)
+                && def.is_union()
+            {
+                // Writing a whole union field initializes the union with that field active; a
+                // nested write into an uninitialized union field would need a per-byte model of
+                // the overlapping fields.
+                let leaf_ty = validate_projection_tail(
+                    expected_ty,
+                    rest,
+                    None,
+                    Some(read_index),
+                    full_place,
+                    None,
+                )?;
+                if !mir_value_matches_ty(&new_val, &leaf_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "assigned value runtime type does not match declared field type",
+                    ));
+                }
+                if !rest.is_empty() {
+                    return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+                }
+                *slot = FieldSlot::Init(MirValue::union_value(def, *idx, new_val));
+                return Ok(());
             }
             if matches!(slot, FieldSlot::Uninit) {
                 let mut child_slot = FieldSlot::Uninit;
@@ -5295,11 +6551,17 @@ fn write_to_partial_slot(
                     full_place,
                     None,
                 )?;
-                let mut shell = PartialAggregate::new_uninit(
-                    field_tys.len(),
-                    active_downcast.unwrap_or(0),
-                    active_downcast.is_some(),
-                );
+                let mut shell = match declared_ty {
+                    Ty::Adt(def) => PartialAggregate::new_uninit_adt(def, active_downcast.unwrap_or(0))
+                        .ok_or(RvalueEvalError::TypeMismatch(
+                            "ADT shell variant out of range",
+                        ))?,
+                    _ => PartialAggregate::new_uninit(
+                        field_tys.len(),
+                        active_downcast.unwrap_or(0),
+                        active_downcast.is_some(),
+                    ),
+                };
                 shell.fields[*idx] = child_slot;
                 *slot = if let Some(full_val) = shell.try_into_mir_value() {
                     FieldSlot::Init(full_val)
@@ -5490,6 +6752,26 @@ fn set_discriminant_projected_mir_value(
                 "SetDiscriminant target cannot end with Downcast",
             ));
         }
+        if let Ty::Adt(def) = declared_ty {
+            // Typed ADT values: same-variant `SetDiscriminant` is a no-op (the tag already
+            // holds the variant). A variant switch must demote the value to a shell first,
+            // which only `set_discriminant_in_slot` can do, so it never reaches this point.
+            if !mir_value_head_matches_ty(val, declared_ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "SetDiscriminant target runtime value does not match declared type",
+                ));
+            }
+            let MirValue::Adt { variant_idx, .. } = val else {
+                unreachable!()
+            };
+            if *variant_idx == variant_index {
+                return Ok(());
+            }
+            if !def.is_enum() {
+                return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+            }
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+        }
         if !matches!(declared_ty, Ty::Tuple(_)) {
             return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
         }
@@ -5523,6 +6805,7 @@ fn set_discriminant_projected_mir_value(
                     variant_idx: variant_index,
                     active_field: None,
                     fields: moved,
+                    adt_def: None,
                 };
                 Ok(())
             }
@@ -5537,6 +6820,7 @@ fn set_discriminant_projected_mir_value(
                     variant_idx: variant_index,
                     active_field: None,
                     fields: Vec::new(),
+                    adt_def: None,
                 };
                 Ok(())
             }
@@ -5707,9 +6991,9 @@ fn set_discriminant_projected_mir_value(
                         "union ADT active_field index out of bounds of fields",
                     ))?
                 };
-                let Ty::Tuple(union_field_tys) = declared_ty else {
+                let Some(union_field_tys) = union_fields_of(declared_ty) else {
                     return Err(RvalueEvalError::TypeMismatch(
-                        "union ADT declared type must be Ty::Tuple",
+                        "union ADT declared type must be a Ty::Tuple or a union Ty::Adt",
                     ));
                 };
                 let Some(active_ty) = union_field_tys.get(*active) else {
@@ -5742,7 +7026,7 @@ fn set_discriminant_projected_mir_value(
                         full_place,
                         None,
                     )?;
-                    if !matches!(leaf_ty, Ty::Tuple(_)) {
+                    if !matches!(leaf_ty, Ty::Tuple(_) | Ty::Adt(_)) {
                         return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
                     }
                     return Err(RvalueEvalError::UnsupportedPlaceProjection(
@@ -5798,7 +7082,580 @@ fn set_discriminant_projected_mir_value(
     }
 }
 
+/// Promotes a complete `Partial` shell to `Init` and collapses an empty shell (no initialized
+/// field, no written tag) to `Uninit`, so that equivalent slots have one representation.
+fn normalize_slot(slot: &mut FieldSlot) {
+    if let FieldSlot::Partial(shell) = slot {
+        if let Some(full_val) = shell.try_into_mir_value() {
+            *slot = FieldSlot::Init(full_val);
+        } else if shell.is_empty() {
+            *slot = FieldSlot::Uninit;
+        }
+    }
+}
+
+/// Converts an initialized tuple or (non-union) ADT value in `slot` into the equivalent
+/// complete `Partial` shell (every field `Init`; an ADT's tag counts as written), so that a
+/// statement can deinitialize or re-tag one of its parts. [`normalize_slot`] restores the
+/// value if nothing below changed. Other values (arrays, unions, scalars, `()`) have no
+/// per-field shells: `UnsupportedPlaceProjection(full_place)`.
+fn explode_init_slot(slot: &mut FieldSlot, full_place: &Place) -> Result<(), RvalueEvalError> {
+    let FieldSlot::Init(val) = std::mem::replace(slot, FieldSlot::Uninit) else {
+        unreachable!("explode_init_slot requires an initialized slot")
+    };
+    let shell = match val {
+        MirValue::Tuple(fields) => PartialAggregate {
+            def_path: None,
+            variant_idx: 0,
+            is_adt: false,
+            discriminant_set: false,
+            fields: fields.into_iter().map(FieldSlot::Init).collect(),
+            adt_def: None,
+        },
+        MirValue::Adt {
+            def_path,
+            variant_idx,
+            active_field: None,
+            fields,
+            adt_def,
+        } => PartialAggregate {
+            def_path: Some(def_path),
+            variant_idx,
+            is_adt: true,
+            discriminant_set: true,
+            fields: fields.into_iter().map(FieldSlot::Init).collect(),
+            adt_def,
+        },
+        other => {
+            *slot = FieldSlot::Init(other);
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+        }
+    };
+    *slot = FieldSlot::Partial(shell);
+    Ok(())
+}
+
+/// The slot of a typed enum whose tag was just written to `variant_index` while every field is
+/// uninitialized (initialized right away if the variant has no fields).
+fn tagged_variant_slot(def: &Arc<AdtDef>, variant_index: usize) -> Result<FieldSlot, RvalueEvalError> {
+    let mut shell = PartialAggregate::new_uninit_adt(def, variant_index).ok_or(
+        RvalueEvalError::TypeMismatch("SetDiscriminant variant index out of range"),
+    )?;
+    shell.discriminant_set = true;
+    Ok(match shell.try_into_mir_value() {
+        Some(full_val) => FieldSlot::Init(full_val),
+        None => FieldSlot::Partial(shell),
+    })
+}
+
+/// Returns true if `SetDiscriminant` at `proj` inside the initialized `val` targets a typed
+/// enum value of a different variant (which must be demoted to a shell of the new variant).
+fn typed_variant_switch_target(
+    val: &MirValue,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    variant_index: usize,
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> bool {
+    matches!(
+        project_mir_value(val, Some(declared_ty), proj, read_index, full_place, active_downcast),
+        Ok((
+            ProjectedRef::Value(MirValue::Adt {
+                adt_def: Some(def),
+                variant_idx,
+                ..
+            }),
+            _,
+        )) if def.is_enum() && *variant_idx != variant_index
+    )
+}
+
+/// Looks up the pre-read value of `idx_local` in a statement's index cache.
+fn cached_index(index_cache: &[(Local, u128)], idx_local: Local) -> Result<u128, RvalueEvalError> {
+    index_cache
+        .iter()
+        .find_map(|(loc, bits)| (*loc == idx_local).then_some(*bits))
+        .ok_or(RvalueEvalError::TypeMismatch(
+            "index local not found in pre-validated cache",
+        ))
+}
+
+/// Moves a live local's state out as a [`FieldSlot`] (leaving `Uninit` behind until
+/// [`root_slot_state`] writes it back).
+fn take_root_slot(slot: &mut LocalSlotState) -> FieldSlot {
+    match std::mem::replace(slot, LocalSlotState::Uninit) {
+        LocalSlotState::Dead | LocalSlotState::Uninit => FieldSlot::Uninit,
+        LocalSlotState::PartialShell(shell) => FieldSlot::Partial(shell),
+        LocalSlotState::Init(v) => FieldSlot::Init(v),
+    }
+}
+
+/// Converts a (normalized) root [`FieldSlot`] back into a live local's state.
+fn root_slot_state(slot: FieldSlot) -> LocalSlotState {
+    match slot {
+        FieldSlot::Uninit => LocalSlotState::Uninit,
+        FieldSlot::Partial(shell) => LocalSlotState::PartialShell(shell),
+        FieldSlot::Init(v) => LocalSlotState::Init(v),
+    }
+}
+
+/// Writes "uninitialized" over the sub-place `proj` of `slot` (of declared type `declared_ty`)
+/// for `Statement::Deinit` (see [`StatementEvalState::deinit_place`]). The caller normalizes
+/// `slot` afterwards; every error leaves the represented state unchanged.
+fn deinit_in_slot(
+    slot: &mut FieldSlot,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<(), RvalueEvalError> {
+    let Some((first, rest)) = proj.split_first() else {
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
+        }
+        *slot = FieldSlot::Uninit;
+        return Ok(());
+    };
+    if matches!(slot, FieldSlot::Uninit) {
+        // Writing uninitialized bytes into an uninitialized part changes nothing, but the
+        // place must still be well-typed and in bounds.
+        validate_projection_tail(declared_ty, proj, None, Some(read_index), full_place, active_downcast)?;
+        return Ok(());
+    }
+    if let FieldSlot::Init(val) = &*slot {
+        if !mir_value_head_matches_ty(val, declared_ty) {
+            return Err(RvalueEvalError::TypeMismatch(
+                "initialized slot runtime value does not match declared type",
+            ));
+        }
+        match (first, val) {
+            (ProjectionElem::Deref, _) => {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+            }
+            (
+                ProjectionElem::Index(_)
+                | ProjectionElem::ConstantIndex { .. }
+                | ProjectionElem::Subslice { .. },
+                _,
+            )
+            | (
+                _,
+                MirValue::Adt {
+                    active_field: Some(_),
+                    ..
+                },
+            ) => {
+                // Array elements and union fields have no per-part shells.
+                validate_projection_tail(
+                    declared_ty,
+                    proj,
+                    None,
+                    Some(read_index),
+                    full_place,
+                    active_downcast,
+                )?;
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()));
+            }
+            (ProjectionElem::Field(idx, _), MirValue::Unit) => {
+                return Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count: 0,
+                });
+            }
+            _ => explode_init_slot(slot, full_place)?,
+        }
+    }
+    let res = (|| match first {
+        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
+            full_place.clone(),
+        )),
+        ProjectionElem::Downcast(expected_variant) => {
+            if active_downcast.is_some() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "consecutive Downcast projections without Field",
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
+            }
+            if !downcast_allowed(declared_ty, *expected_variant) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
+                ));
+            }
+            let FieldSlot::Partial(shell) = &*slot else {
+                unreachable!()
+            };
+            let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+            if actual != *expected_variant {
+                return Err(RvalueEvalError::InactiveVariantProjection {
+                    expected: *expected_variant,
+                    actual,
+                });
+            }
+            deinit_in_slot(slot, declared_ty, rest, read_index, full_place, Some(*expected_variant))
+        }
+        ProjectionElem::Field(idx, expected_ty) => {
+            let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast) else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
+                ));
+            };
+            if *idx >= field_tys.len() {
+                return Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count: field_tys.len(),
+                });
+            }
+            if field_tys[*idx] != *expected_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "projected field type does not match declared tuple field type",
+                ));
+            }
+            let FieldSlot::Partial(shell) = &mut *slot else {
+                unreachable!()
+            };
+            let expected_variant = active_downcast.unwrap_or(0);
+            let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+            if actual != expected_variant {
+                return Err(RvalueEvalError::InactiveVariantProjection {
+                    expected: expected_variant,
+                    actual,
+                });
+            }
+            let field_count = shell.fields.len();
+            let Some(child_slot) = shell.fields.get_mut(*idx) else {
+                return Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count,
+                });
+            };
+            deinit_in_slot(child_slot, &field_tys[*idx], rest, read_index, full_place, None)?;
+            normalize_slot(child_slot);
+            // Uninitialized bytes in a variant field may cover a niche-encoded tag; only a tag
+            // stored apart from the fields (or no tag at all) is known to survive.
+            if active_downcast.is_some()
+                && !shell
+                    .adt_def
+                    .as_ref()
+                    .is_some_and(|def| def.tag_survives_field_deinit())
+            {
+                shell.discriminant_set = false;
+            }
+            Ok(())
+        }
+        ProjectionElem::Index(_)
+        | ProjectionElem::ConstantIndex { .. }
+        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::TypeMismatch(
+            "array projection applied to a partially initialized tuple/ADT shell",
+        )),
+    })();
+    normalize_slot(slot);
+    res
+}
+
+/// Validates the reference `ptr` of type `ref_ty` (`&pointee`) for `Statement::Retag`: it must
+/// be non-null (`InvalidBitPattern`), aligned to the pointee's alignment (`MisalignedPointer`;
+/// an alignment the layout model leaves unspecified is `UnsupportedLayout`), and point to an
+/// inhabited type (`UninhabitedPointee`).
+fn check_retagged_reference(
+    ptr: &PointerValue,
+    ref_ty: &Ty,
+    pointee: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<(), RvalueEvalError> {
+    let addr = u128::from(ptr.addr) & ptr_width.mask();
+    if addr == 0 {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_ty.clone(),
+            bits: 0,
+        }));
+    }
+    let (min_align, max_align) = pointee
+        .align_bounds(ptr_width)
+        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(pointee, err)))?;
+    if !addr.is_multiple_of(min_align as u128) {
+        return Err(RvalueEvalError::MisalignedPointer {
+            addr: addr as u64,
+            required_align: min_align,
+        });
+    }
+    if !addr.is_multiple_of(max_align as u128) {
+        return Err(RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+            ty: pointee.clone(),
+        }));
+    }
+    if !pointee.is_inhabited_for(ptr_width) {
+        return Err(RvalueEvalError::UninhabitedPointee(pointee.clone()));
+    }
+    Ok(())
+}
+
+/// Validates every reference reachable in the initialized value `val` of type `ty` for
+/// `Statement::Retag` (skipping union contents and subtrees without references).
+fn retag_value(val: &MirValue, ty: &Ty, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+    if !ty.contains_ref() {
+        return Ok(());
+    }
+    let mismatch = || {
+        RvalueEvalError::TypeMismatch("retagged runtime value does not match its declared type")
+    };
+    match (ty, val) {
+        (Ty::Ref(pointee, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
+            check_retagged_reference(ptr, ty, pointee, ptr_width)
+        }
+        (Ty::Array(elem, _), MirValue::Array { elements, .. }) => {
+            for element in elements {
+                retag_value(element, elem, ptr_width)?;
+            }
+            Ok(())
+        }
+        (Ty::Tuple(field_tys), MirValue::Tuple(vals))
+        | (
+            Ty::Tuple(field_tys),
+            MirValue::Adt {
+                active_field: None,
+                fields: vals,
+                adt_def: None,
+                ..
+            },
+        ) => {
+            if vals.len() != field_tys.len() {
+                return Err(mismatch());
+            }
+            for (value, field_ty) in vals.iter().zip(field_tys) {
+                retag_value(value, field_ty, ptr_width)?;
+            }
+            Ok(())
+        }
+        (
+            Ty::Tuple(_),
+            MirValue::Adt {
+                active_field: Some(_),
+                adt_def: None,
+                ..
+            },
+        ) => Ok(()),
+        (Ty::Adt(_), MirValue::Adt { fields: vals, .. }) => {
+            let Some(field_tys) = typed_adt_field_tys(val, ty) else {
+                return Err(mismatch());
+            };
+            for (value, field_ty) in vals.iter().zip(field_tys) {
+                retag_value(value, field_ty, ptr_width)?;
+            }
+            Ok(())
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+/// [`retag_value`] for the target of a projection (a value or an array window).
+fn retag_projected(
+    target: ProjectedRef<'_>,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<(), RvalueEvalError> {
+    match target {
+        ProjectedRef::Value(val) => retag_value(val, ty, ptr_width),
+        ProjectedRef::ArrayWindow { window, elem_ty } => {
+            for element in window {
+                retag_value(element, elem_ty, ptr_width)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validates every reference reachable in the partially initialized `shell` of type `ty` for
+/// `Statement::Retag`: an uninitialized field holding references is `UninitializedLocal`, as
+/// is an enum shell whose variant cannot be read because its tag is unwritten.
+fn retag_shell(
+    shell: &PartialAggregate,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+    base_local: Local,
+) -> Result<(), RvalueEvalError> {
+    if !ty.contains_ref() {
+        return Ok(());
+    }
+    if shell.requires_tag_write() && !shell.discriminant_set {
+        return Err(RvalueEvalError::UninitializedLocal(base_local));
+    }
+    let field_tys = match ty {
+        Ty::Tuple(fields) => Some(fields.as_slice()),
+        Ty::Adt(def) => def.variant_fields(shell.variant_idx),
+        _ => None,
+    };
+    let Some(field_tys) = field_tys.filter(|tys| tys.len() == shell.fields.len()) else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "retagged shell does not match its declared type",
+        ));
+    };
+    for (slot, field_ty) in shell.fields.iter().zip(field_tys) {
+        match slot {
+            FieldSlot::Uninit if field_ty.contains_ref() => {
+                return Err(RvalueEvalError::UninitializedLocal(base_local));
+            }
+            FieldSlot::Uninit => {}
+            FieldSlot::Init(val) => retag_value(val, field_ty, ptr_width)?,
+            FieldSlot::Partial(child) => retag_shell(child, field_ty, ptr_width, base_local)?,
+        }
+    }
+    Ok(())
+}
+
+/// Synthetic address and provenance of local `local` for `&_l` / `&raw _l` (page-aligned per
+/// local, with allocation id `local + 1`).
+pub(crate) fn synthetic_local_ptr(local: usize, ptr_width: PtrWidth) -> PointerValue {
+    let addr = ((local as u128 + 1) * 0x1000) & ptr_width.mask();
+    PointerValue::with_provenance(addr as u64, local as u64 + 1, 1)
+}
+
+/// The local whose synthetic base address and provenance `ptr` carries, if any.
+fn resolve_synthetic_local(ptr: &PointerValue, ptr_width: PtrWidth, local_count: usize) -> Option<usize> {
+    let alloc_id = ptr.provenance?.alloc_id;
+    let local = usize::try_from(alloc_id.checked_sub(1)?).ok()?;
+    if local >= local_count {
+        return None;
+    }
+    let base = synthetic_local_ptr(local, ptr_width);
+    (u128::from(ptr.addr) & ptr_width.mask() == u128::from(base.addr)).then_some(local)
+}
+
+/// Evaluates `copy_nonoverlapping::<elem_ty>(src, dst, count)` in `state`.
+///
+/// Operands are evaluated left to right. Then, even when the byte length is zero, both
+/// pointers must be non-null (`NullPointerAccess`) and aligned to `elem_align`
+/// (`MisalignedPointer`), `count * elem_size` must not exceed `isize::MAX`
+/// (`CopyLengthOverflow`), and neither range may wrap the address space
+/// (`PointerRangeOverflow`). A zero-length copy is then a no-op. A non-empty copy between
+/// pointers of the same allocation (same provenance `alloc_id`, or both without provenance)
+/// must not overlap (`CopyNonOverlappingOverlap`). Only after all of these checks, a copy of
+/// one whole local into another (both synthetic `&raw` base pointers of locals declared
+/// `elem_ty`, `count == 1`) copies the source local's state, including uninitialized parts;
+/// any other memory access is `UnsupportedMemoryAccess`.
+#[allow(clippy::too_many_arguments)]
+fn eval_copy_nonoverlapping(
+    state: &mut StatementEvalState,
+    src: &Operand,
+    dst: &Operand,
+    count: &Operand,
+    elem_ty: &Ty,
+    elem_size: usize,
+    elem_align: usize,
+) -> Result<(), RvalueEvalError> {
+    let mut eval_op = |op: &Operand| -> Result<MirValue, RvalueEvalError> {
+        match op {
+            Operand::Copy(place) => state.read_place(place),
+            Operand::Move(place) => state.move_place(place),
+            Operand::Constant(c) => eval_constant(c, state.ptr_width),
+        }
+    };
+    let src_val = eval_op(src)?;
+    let dst_val = eval_op(dst)?;
+    let count_val = eval_op(count)?;
+    let ptr_width = state.ptr_width;
+    let pointer = |val: &MirValue, need_mut: bool| -> Result<PointerValue, RvalueEvalError> {
+        match val {
+            MirValue::Ptr { ptr, ty: Ty::RawPtr(pointee, m) | Ty::Ref(pointee, m) }
+                if **pointee == *elem_ty && (!need_mut || *m == Mutability::Mut) =>
+            {
+                Ok(*ptr)
+            }
+            _ => Err(RvalueEvalError::TypeMismatch(
+                "copy_nonoverlapping pointers must point to the copied element type",
+            )),
+        }
+    };
+    let src_ptr = pointer(&src_val, false)?;
+    let dst_ptr = pointer(&dst_val, true)?;
+    let MirValue::Int {
+        bits: count_bits,
+        ty: Ty::Uint(UintTy::Usize),
+    } = count_val
+    else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "copy_nonoverlapping count must be a usize",
+        ));
+    };
+    let count = count_bits & ptr_width.mask();
+    let src_addr = u128::from(src_ptr.addr) & ptr_width.mask();
+    let dst_addr = u128::from(dst_ptr.addr) & ptr_width.mask();
+    if src_addr == 0 || dst_addr == 0 {
+        return Err(RvalueEvalError::NullPointerAccess);
+    }
+    for addr in [src_addr, dst_addr] {
+        if !addr.is_multiple_of(elem_align as u128) {
+            return Err(RvalueEvalError::MisalignedPointer {
+                addr: addr as u64,
+                required_align: elem_align,
+            });
+        }
+    }
+    let byte_len = count
+        .checked_mul(elem_size as u128)
+        .filter(|len| *len <= ptr_width.max_object_size())
+        .ok_or(RvalueEvalError::CopyLengthOverflow { count, elem_size })?;
+    for addr in [src_addr, dst_addr] {
+        if addr + byte_len > ptr_width.max_usize() {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: addr as u64,
+                byte_len,
+            });
+        }
+    }
+    if byte_len == 0 {
+        return Ok(());
+    }
+    let same_allocation =
+        src_ptr.provenance.map(|p| p.alloc_id) == dst_ptr.provenance.map(|p| p.alloc_id);
+    if same_allocation && src_addr < dst_addr + byte_len && dst_addr < src_addr + byte_len {
+        return Err(RvalueEvalError::CopyNonOverlappingOverlap {
+            src_addr: src_addr as u64,
+            dst_addr: dst_addr as u64,
+            byte_len,
+        });
+    }
+    let local_count = state.slots.len().min(state.local_decls.len());
+    match (
+        resolve_synthetic_local(&src_ptr, ptr_width, local_count),
+        resolve_synthetic_local(&dst_ptr, ptr_width, local_count),
+    ) {
+        (Some(src_local), Some(dst_local))
+            if count == 1
+                && state.local_decls[src_local] == *elem_ty
+                && state.local_decls[dst_local] == *elem_ty =>
+        {
+            if matches!(state.slots[src_local], LocalSlotState::Dead) {
+                return Err(RvalueEvalError::DeadLocal(Local(src_local)));
+            }
+            if matches!(state.slots[dst_local], LocalSlotState::Dead) {
+                return Err(RvalueEvalError::DeadLocal(Local(dst_local)));
+            }
+            state.slots[dst_local] = state.slots[src_local].clone();
+            Ok(())
+        }
+        _ => Err(RvalueEvalError::UnsupportedMemoryAccess(
+            "copy_nonoverlapping outside of whole-local copies",
+        )),
+    }
+}
+
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.
+///
+/// On a typed enum (`Ty::Adt`), `SetDiscriminant(v)` writes the tag: an uninitialized enum
+/// becomes a shell of variant `v` with its tag written (MiniRust writes the tag bytes only),
+/// a same-variant value is unchanged, and a value of another variant becomes a shell of `v`
+/// whose fields are uninitialized (the old variant's fields do not initialize `v`'s). Typed
+/// struct/union containers along `proj` materialize shells as needed. Legacy tuple-modeled
+/// places keep the conservative rule that an uninitialized place cannot be re-tagged.
 #[allow(clippy::too_many_arguments)]
 fn set_discriminant_in_slot(
     slot: &mut FieldSlot,
@@ -5817,15 +7674,44 @@ fn set_discriminant_in_slot(
                 "initialized slot runtime value does not match declared type",
             ));
         }
-        return set_discriminant_projected_mir_value(
-            existing_val,
-            declared_ty,
-            proj,
-            variant_index,
-            read_index,
-            full_place,
-            active_downcast,
-        );
+        let demote = if proj.is_empty() {
+            if let (Ty::Adt(def), None) = (declared_ty, active_downcast) {
+                let MirValue::Adt { variant_idx, .. } = &*existing_val else {
+                    unreachable!("head match guarantees an ADT value")
+                };
+                if *variant_idx == variant_index {
+                    return Ok(());
+                }
+                if !def.is_enum() {
+                    return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+                }
+                *slot = tagged_variant_slot(def, variant_index)?;
+                return Ok(());
+            }
+            false
+        } else {
+            typed_variant_switch_target(
+                existing_val,
+                declared_ty,
+                proj,
+                variant_index,
+                read_index,
+                full_place,
+                active_downcast,
+            )
+        };
+        if !demote {
+            return set_discriminant_projected_mir_value(
+                existing_val,
+                declared_ty,
+                proj,
+                variant_index,
+                read_index,
+                full_place,
+                active_downcast,
+            );
+        }
+        explode_init_slot(slot, full_place)?;
     }
     if proj.is_empty() {
         if active_downcast.is_some() {
@@ -5833,45 +7719,91 @@ fn set_discriminant_in_slot(
                 "SetDiscriminant target cannot end with Downcast",
             ));
         }
-        if !matches!(declared_ty, Ty::Tuple(_)) {
+        if !matches!(declared_ty, Ty::Tuple(_) | Ty::Adt(_)) {
             return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
         }
-        match slot {
-            FieldSlot::Uninit => Err(RvalueEvalError::UninitializedLocal(base_local)),
-            FieldSlot::Partial(shell) => {
-                // If `SetDiscriminant` switches the shell to a different variant than the one
-                // whose fields were partially written via `Downcast(v)` (or tuple `Field` writes
-                // on variant 0), those written fields belong to the old variant and do not
-                // initialize the new variant's fields.
-                if shell.variant_idx != variant_index {
-                    shell.fields.fill(FieldSlot::Uninit);
-                }
-                shell.variant_idx = variant_index;
-                shell.is_adt = true;
-                shell.discriminant_set = true;
-                if let Some(full_val) = shell.try_into_mir_value() {
-                    *slot = FieldSlot::Init(full_val);
-                }
-                Ok(())
+        if matches!(slot, FieldSlot::Uninit) {
+            let Ty::Adt(def) = declared_ty else {
+                return Err(RvalueEvalError::UninitializedLocal(base_local));
+            };
+            if def.is_enum() {
+                *slot = tagged_variant_slot(def, variant_index)?;
+            } else if variant_index != 0 {
+                return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
             }
-            FieldSlot::Init(_) => unreachable!(),
+            return Ok(());
         }
-    } else if matches!(slot, FieldSlot::Uninit) {
-        let leaf_ty = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-            declared_ty,
-            proj,
-            None,
-            None,
-            full_place,
-            active_downcast,
-        )?;
-        if !matches!(leaf_ty, Ty::Tuple(_)) {
-            return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+        let FieldSlot::Partial(shell) = &mut *slot else {
+            unreachable!()
+        };
+        if shell.adt_def.as_ref().is_some_and(|def| !def.is_enum()) {
+            // Structs (and their shells) have only variant 0 and no tag.
+            return if variant_index == 0 {
+                Ok(())
+            } else {
+                Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()))
+            };
         }
-        Err(RvalueEvalError::UninitializedLocal(base_local))
+        // If `SetDiscriminant` switches the shell to a different variant than the one
+        // whose fields were partially written via `Downcast(v)` (or tuple `Field` writes
+        // on variant 0), those written fields belong to the old variant and do not
+        // initialize the new variant's fields.
+        if shell.variant_idx != variant_index {
+            if let Some(def) = &shell.adt_def {
+                let field_count = def.variant_fields(variant_index).map_or(0, <[Ty]>::len);
+                shell.fields = vec![FieldSlot::Uninit; field_count];
+            } else {
+                shell.fields.fill(FieldSlot::Uninit);
+            }
+        }
+        shell.variant_idx = variant_index;
+        shell.is_adt = true;
+        shell.discriminant_set = true;
+        normalize_slot(slot);
+        Ok(())
     } else {
         let (first, rest) = proj.split_first().unwrap();
-        match first {
+        if matches!(slot, FieldSlot::Uninit) {
+            // A typed struct or enum container materializes an (empty) shell for the step,
+            // which `normalize_slot` collapses again if nothing below gets initialized.
+            let fresh_shell = match (declared_ty, first) {
+                (Ty::Adt(def), ProjectionElem::Downcast(v))
+                    if active_downcast.is_none() && downcast_allowed(declared_ty, *v) =>
+                {
+                    PartialAggregate::new_uninit_adt(def, *v)
+                }
+                (Ty::Adt(def), ProjectionElem::Field(..)) if !def.is_union() => {
+                    PartialAggregate::new_uninit_adt(def, active_downcast.unwrap_or(0))
+                }
+                _ => None,
+            };
+            match fresh_shell {
+                Some(shell) => *slot = FieldSlot::Partial(shell),
+                None => {
+                    let leaf_ty =
+                        validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+                            declared_ty,
+                            proj,
+                            None,
+                            None,
+                            full_place,
+                            active_downcast,
+                        )?;
+                    if !matches!(leaf_ty, Ty::Tuple(_) | Ty::Adt(_)) {
+                        return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+                    }
+                    if matches!(declared_ty, Ty::Adt(def) if def.is_union()) {
+                        // A re-tag inside an uninitialized union field writes part of the
+                        // union's overlapping storage.
+                        return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                            full_place.clone(),
+                        ));
+                    }
+                    return Err(RvalueEvalError::UninitializedLocal(base_local));
+                }
+            }
+        }
+        let res = (|| match first {
             ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
                 full_place.clone(),
             )),
@@ -5891,9 +7823,9 @@ fn set_discriminant_in_slot(
                         "Downcast projection must be followed by Field",
                     ));
                 }
-                if !matches!(declared_ty, Ty::Tuple(_)) {
+                if !downcast_allowed(declared_ty, *expected_variant) {
                     return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection requires a tuple-typed (ADT) place",
+                        "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
                     ));
                 }
                 let FieldSlot::Partial(shell) = &*slot else {
@@ -5919,9 +7851,9 @@ fn set_discriminant_in_slot(
                 )
             }
             ProjectionElem::Field(idx, expected_ty) => {
-                let Ty::Tuple(field_tys) = declared_ty else {
+                let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast) else {
                     return Err(RvalueEvalError::TypeMismatch(
-                        "Field projection requires a tuple-typed place",
+                        "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
                     ));
                 };
                 if *idx >= field_tys.len() {
@@ -5935,7 +7867,7 @@ fn set_discriminant_in_slot(
                         "projected field type does not match declared tuple field type",
                     ));
                 }
-                let FieldSlot::Partial(shell) = slot else {
+                let FieldSlot::Partial(shell) = &mut *slot else {
                     unreachable!()
                 };
                 let expected_variant = active_downcast.unwrap_or(0);
@@ -5963,11 +7895,7 @@ fn set_discriminant_in_slot(
                     base_local,
                     full_place,
                     None,
-                )?;
-                if let Some(full_val) = shell.try_into_mir_value() {
-                    *slot = FieldSlot::Init(full_val);
-                }
-                Ok(())
+                )
             }
             // A shell is a tuple/struct/enum-variant value: an array projection on it is a
             // static type error.
@@ -5976,7 +7904,9 @@ fn set_discriminant_in_slot(
             | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::TypeMismatch(
                 "array projection applied to a partially initialized tuple/ADT shell",
             )),
-        }
+        })();
+        normalize_slot(slot);
+        res
     }
 }
 
@@ -6165,14 +8095,7 @@ pub fn eval_lowered_rvalue_in_state(
             ))
         }
         LoweredRvalue::Cast { cast, ty } => {
-            let op = match cast {
-                LoweredCast::PtrToInt { operand, .. }
-                | LoweredCast::IntToPtr { operand, .. }
-                | LoweredCast::IntToInt { operand, .. }
-                | LoweredCast::CharToInt { operand, .. }
-                | LoweredCast::PtrToPtr { operand, .. }
-                | LoweredCast::Transmute { operand, .. } => operand,
-            };
+            let op = cast.operand();
             let v = eval_op(op, state)?;
             let out =
                 eval_lowered_cast(cast, &v, state.ptr_width, state.policy, &mut state.tracker)?;
@@ -6280,10 +8203,24 @@ pub fn eval_lowered_rvalue_in_state(
             place_ty,
             ty,
         } => {
-            if *ty != Ty::Int(IntTy::Isize) || !place_ty.is_inhabited() {
+            if *ty != discriminant_result_ty(place_ty)
+                || !place_ty.is_inhabited_for(state.ptr_width)
+            {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Discriminant requires an inhabited place_ty and isize result ty",
+                    "Discriminant requires an inhabited place_ty and its discriminant result ty",
                 ));
+            }
+            if let Ty::Adt(def) = place_ty {
+                // `Rvalue::Discriminant` on a typed ADT reads only the tag (Miri's
+                // `read_discriminant`): single-variant layouts store none, so their
+                // discriminant is a constant; otherwise the tag must be initialized.
+                let index_cache = state.prepare_place_access(place, place_ty)?;
+                let variant_idx = if def.requires_tag_write() {
+                    state.typed_enum_variant(place, place_ty, &index_cache)?
+                } else {
+                    0
+                };
+                return discriminant_value(def, variant_idx, state.ptr_width);
             }
             if place
                 .projection
@@ -6385,6 +8322,22 @@ pub fn eval_lowered_rvalue_in_state(
                 "CopyForDeref requires a pointer value matching the place type",
             )),
         },
+        LoweredRvalue::ShallowInitBox {
+            operand,
+            operand_ty,
+            ty,
+        } => {
+            let v = eval_op(operand, state)?;
+            eval_shallow_init_box(&v, operand_ty, ty, state.ptr_width)
+        }
+        LoweredRvalue::WrapUnsafeBinder {
+            operand,
+            operand_ty,
+            ty,
+        } => {
+            let v = eval_op(operand, state)?;
+            eval_wrap_unsafe_binder(v, operand_ty, ty, state.ptr_width)
+        }
     }
 }
 
@@ -6547,6 +8500,17 @@ pub fn eval_lowered_statement(
                     "SetDiscriminant place_ty does not match declared place type",
                 ));
             }
+            if let Ty::Adt(def) = place_ty {
+                // Miri's `write_discriminant`: writing the tag of an uninhabited variant is UB.
+                let inhabited = def.variant_fields(*variant_index).is_some_and(|fields| {
+                    fields.iter().all(|f| f.is_inhabited_for(state.ptr_width))
+                });
+                if def.is_enum() && !inhabited {
+                    return Err(RvalueEvalError::UninhabitedEnumVariant {
+                        variant_index: *variant_index,
+                    });
+                }
+            }
             let mut index_cache: Vec<(Local, u128)> = Vec::new();
             for elem in &place.projection {
                 if let ProjectionElem::Index(idx_local) = elem {
@@ -6590,21 +8554,8 @@ pub fn eval_lowered_statement(
                 place,
                 None,
             );
-            state.slots[place.local.0] = match root_slot {
-                FieldSlot::Uninit => LocalSlotState::Uninit,
-                FieldSlot::Partial(shell) => {
-                    if set_res.is_ok() {
-                        if let Some(full_val) = shell.try_into_mir_value() {
-                            LocalSlotState::Init(full_val)
-                        } else {
-                            LocalSlotState::PartialShell(shell)
-                        }
-                    } else {
-                        LocalSlotState::PartialShell(shell)
-                    }
-                }
-                FieldSlot::Init(v) => LocalSlotState::Init(v),
-            };
+            normalize_slot(&mut root_slot);
+            state.slots[place.local.0] = root_slot_state(root_slot);
             set_res
         }
         LoweredStatement::Assign {
@@ -6615,6 +8566,20 @@ pub fn eval_lowered_statement(
             let val = eval_lowered_rvalue_in_state(rvalue, state)?;
             state.write_place(place, place_ty, val)
         }
+        LoweredStatement::Deinit { place, place_ty } => state.deinit_place(place, place_ty),
+        LoweredStatement::Retag {
+            kind,
+            place,
+            place_ty,
+        } => state.retag_place(*kind, place, place_ty),
+        LoweredStatement::CopyNonOverlapping {
+            src,
+            dst,
+            count,
+            elem_ty,
+            elem_size,
+            elem_align,
+        } => eval_copy_nonoverlapping(state, src, dst, count, elem_ty, *elem_size, *elem_align),
     }
 }
 
@@ -6825,6 +8790,7 @@ mod tests {
             variant_idx: 0,
             active_field: None,
             fields: vec![],
+            adt_def: None,
         };
         assert!(matches!(
             encode_mir_value(&adt, &Ty::unit(), pw, &mut Vec::new()),

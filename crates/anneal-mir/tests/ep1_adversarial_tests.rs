@@ -310,6 +310,7 @@ fn test_ep1_b1_downcast_field_writes_do_not_initialize_enum_tag_until_set_discri
         variant_idx: 1,
         active_field: None,
         fields: vec![u32v(99)],
+        adt_def: None,
     };
     assert_eq!(state.get_init(Local(1)), Some(&full));
     run(
@@ -379,6 +380,7 @@ fn test_ep1_b1_downcast_field_writes_do_not_initialize_enum_tag_until_set_discri
             variant_idx: 2,
             active_field: None,
             fields: vec![u32v(5), u8v(7)],
+            adt_def: None,
         })
     );
 
@@ -453,6 +455,7 @@ fn test_ep1_b1_downcast_field_writes_do_not_initialize_enum_tag_until_set_discri
                 variant_idx: 1,
                 active_field: None,
                 fields: vec![u32v(1), u8v(2)],
+                adt_def: None,
             },
             u8v(3),
         ]))
@@ -476,6 +479,7 @@ fn test_ep1_b1_projected_leaf_writes_preserve_field_types() {
             variant_idx: 0,
             active_field: None,
             fields: vec![u32v(3), u8v(4)],
+            adt_def: None,
         },
     ];
     for local in 0..2 {
@@ -818,6 +822,7 @@ fn test_ep1_b1_union_nested_write_to_inactive_field_is_unsupported_not_ub() {
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![u32v(0x1234)],
+        adt_def: None,
     };
     let mut locals = vec![union_val.clone()];
     let a = proj(0, vec![field(0, u32_ty())]);
@@ -1158,6 +1163,7 @@ fn test_ep1_b1_property_d13b_random_field_orders_never_false_accept() {
                     variant_idx: variant,
                     active_field: None,
                     fields,
+                    adt_def: None,
                 }
             } else {
                 expected.clone()
@@ -1375,7 +1381,9 @@ fn test_ep1_a1_set_discriminant_through_downcast_promotes_nested_and_outer_enum_
             variant_idx: 2,
             active_field: None,
             fields: vec![u32v(42)],
+            adt_def: None,
         }],
+        adt_def: None,
     };
     assert_eq!(state.get_init(Local(1)), Some(&expected));
     run(
@@ -1470,6 +1478,7 @@ fn test_ep1_a1_set_discriminant_variant_switch_on_partial_shell_clears_old_varia
             variant_idx: 2,
             active_field: None,
             fields: vec![u32v(77)],
+            adt_def: None,
         })
     );
 
@@ -1520,6 +1529,7 @@ fn test_ep1_a1_union_reads_and_writes_validate_declared_fields_and_inactive_tail
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![u32v(0x1234)],
+        adt_def: None,
     };
     let mut state = StatementEvalState::from_local_decls(local_decls, PW);
     state.slots[0] = LocalSlotState::Init(union_val.clone());
@@ -1599,6 +1609,7 @@ fn test_ep1_a1_union_reads_and_writes_validate_declared_fields_and_inactive_tail
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![],
+        adt_def: None,
     };
     let mut bad_locals = vec![empty_union];
     assert!(matches!(
@@ -1741,6 +1752,7 @@ fn test_ep1_a1_array_aggregates_of_unions_and_lowered_rvalue_runtime_type_guards
                 def_path: "U".into(),
                 variant_idx: 0,
                 active_field: Some(1),
+                adt_def: None,
             },
             vec![Operand::Constant(Constant::Int(0x7F, u8_ty()))],
         ),
@@ -2087,6 +2099,7 @@ fn test_ep1_b2_property_union_active_field_reads_and_writes_match_reference_mode
                         def_path: "U".into(),
                         variant_idx: 0,
                         active_field: Some(0),
+                        adt_def: None,
                     },
                     vec![Operand::Constant(Constant::Int(
                         model.as_bits().unwrap(),
@@ -2174,6 +2187,7 @@ fn test_ep1_b2_property_union_active_field_reads_and_writes_match_reference_mode
                     variant_idx: 0,
                     active_field: Some(active),
                     fields: vec![model.clone()],
+                    adt_def: None,
                 })
             );
         }
@@ -2355,6 +2369,7 @@ fn test_ep1_a2_union_head_and_active_field_checks_reject_malformed_active_field(
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![MirValue::Bool(true)],
+        adt_def: None,
     };
     state.slots[0] = LocalSlotState::Init(bad_head_union.clone());
     let f0 = proj(0, vec![field(0, pair_ty.clone())]);
@@ -2377,6 +2392,7 @@ fn test_ep1_a2_union_head_and_active_field_checks_reject_malformed_active_field(
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![MirValue::Tuple(vec![MirValue::Bool(true), u8v(7)])],
+        adt_def: None,
     };
     state.slots[0] = LocalSlotState::Init(bad_nested_union.clone());
     assert!(matches!(
@@ -2454,6 +2470,7 @@ impl DShape {
                         variant_idx: rng.below(2) as usize,
                         active_field: None,
                         fields: vals,
+                        adt_def: None,
                     }
                 } else {
                     MirValue::Tuple(vals)
@@ -2643,6 +2660,7 @@ fn ref_write(
                 variant_idx,
                 active_field: None,
                 fields,
+                adt_def: None,
             },
         ) => {
             (downcast.unwrap_or(0) == *variant_idx).then_some(())?;
@@ -2655,6 +2673,7 @@ fn ref_write(
                 variant_idx: *variant_idx,
                 active_field: None,
                 fields,
+                adt_def: None,
             })
         }
         (_, MirValue::Array { elements, elem_ty }) if downcast.is_none() => {
@@ -2862,6 +2881,7 @@ fn test_ep1_b3_stateful_accesses_reject_deep_field_annotation_mismatches() {
             variant_idx: 0,
             active_field: None,
             fields: vec![u32v(8)],
+            adt_def: None,
         },
     ])]);
     let mut state = StatementEvalState::from_local_decls(local_decls, PW);
@@ -2988,6 +3008,7 @@ fn test_ep1_a3_trailing_and_consecutive_downcasts_rejected_everywhere() {
         variant_idx: 1,
         active_field: None,
         fields: vec![u32v(10), u8v(20)],
+        adt_def: None,
     };
     let outer_val = MirValue::Tuple(vec![enum_v1.clone(), u32v(99)]);
     let ptr_val = MirValue::Ptr {
@@ -3285,6 +3306,7 @@ fn test_ep1_a3_index_local_decls_and_lowered_type_invariants() {
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![u32v(42)],
+        adt_def: None,
     };
     assert!(matches!(
         state.write_place(&Place::from_local(4), &union_1_ty, u_val.clone()),
@@ -3514,6 +3536,7 @@ fn ref_shell_read(
                 variant_idx: v,
                 active_field: None,
                 fields,
+                adt_def: None,
             },
             (_, _, sub) => sub,
         });
@@ -3768,6 +3791,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
         variant_idx: 0,
         active_field: None,
         fields: vec![big_arr],
+        adt_def: None,
     };
     let unit_arr = MirValue::Array {
         elements: vec![MirValue::Unit; 4],
@@ -3834,6 +3858,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
             variant_idx: 5,
             active_field: None,
             fields: Vec::new(),
+            adt_def: None,
         })
     );
 
@@ -3869,6 +3894,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
             variant_idx: 7,
             active_field: None,
             fields: Vec::new(),
+            adt_def: None,
         })
     );
 
@@ -3887,6 +3913,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![u32v(42)],
+        adt_def: None,
     });
     assert_eq!(
         eval_lowered_statement(
@@ -3906,6 +3933,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![MirValue::Bool(true)], // malformed active field 0 (declared u32)
+        adt_def: None,
     });
     assert!(matches!(
         eval_lowered_statement(
@@ -3925,6 +3953,7 @@ fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
         variant_idx: 0,
         active_field: None,
         fields: Vec::new(),
+        adt_def: None,
     });
     assert!(matches!(
         eval_lowered_statement(
