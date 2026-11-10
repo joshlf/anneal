@@ -188,7 +188,8 @@ Projected `SetDiscriminant` additionally passes through the `validateValueForTy?
 check of `writePlaceValue`; `SetDiscriminantDestOk` packages both side conditions
 (`setDiscriminantDestOk_nil_decls`, `setDiscriminantDestOk_of_adt_ty`,
 `setDiscriminantDestOk_of_layoutsHaveNoUnion_and_adt`,
-`setDiscriminantDestOk_tuple_field_adt`).
+`setDiscriminantDestOk_tuple_field_adt`,
+`setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt`).
 -/
 
 /-- `true` exactly for ADT kinds (`RigidTy.adt`), the only kinds that
@@ -1486,6 +1487,23 @@ theorem setDiscriminantDestOk_tuple_field_adt
   cases hG : get? localDecls loc with
   | none => rw [hG] at hTy; nomatch hTy
   | some decl => rfl
+
+/-- Any projected place `⟨loc, proj⟩` whose root local has `placeTy = some declTy`
+with `projFieldBasesNonUnion layouts declTy proj = true` and whose leaf `placeTy`
+is an ADT satisfies `SetDiscriminantDestOk` for arbitrary `localDecls` / `layouts`. -/
+theorem setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (proj : List ProjectionElem) (declTy : Ty)
+    (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
+    (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy proj = true)
+    (hLeafTy : placeTy localDecls layouts ⟨loc, proj⟩ =
+      .some { kind := .adt defPath args, layoutIdx := lIdx }) :
+    SetDiscriminantDestOk localDecls layouts ⟨loc, proj⟩ :=
+  setDiscriminantDestOk_of_adt_ty localDecls layouts ⟨loc, proj⟩ defPath args lIdx
+    (placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc proj declTy
+      hRootTy hCert)
+    hLeafTy
 
 
 
@@ -14737,5 +14755,202 @@ theorem three_level_nested_tuple_out_of_order_completion
     writePlaceState tupleArityOf s2 ⟨0, p1_1⟩ rootTy v1 = .ok s3 ∧
     writePlaceState tupleArityOf s3 ⟨0, p2_1⟩ rootTy v01 = .ok s4 := by
   exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **Non-Union Struct/ADT Uninitialized Field Assignment (`evalStmt_assign_uninit_nonUnion_adt_field_ok`)**:
+Discharges the `hNoUnion` obligation of `Statements.evalStmt_assign_uninit_union_field_ok`
+(whose `:= by rfl` default only fires on concrete `localDecls`) for **arbitrary symbolic
+`localDecls` and `layouts`** whenever `dstLoc`'s declared ADT layout index satisfies
+`layoutIdxIsNonUnion layouts layoutIdx = true`. -/
+theorem evalStmt_assign_uninit_nonUnion_adt_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (layoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hNonUnion : layoutIdxIsNonUnion layouts layoutIdx = true)
+    (hSet : set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                 | .some rp => rp
+                 | .none => .field fieldIdx fieldTy :: .nil) }) :=
+  Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_uninit_union_field_ok
+    s dstLoc fieldIdx fieldTy rv span localDecls layouts defPath args layoutIdx val
+    locals₁ mem₁ locals₂ hRv hUninit hTy hSet hProt
+    (placeTouchesUnion_nonUnion_adt_field_false localDecls layouts dstLoc defPath args
+      layoutIdx fieldIdx fieldTy .nil hTy hNonUnion rfl)
+
+/-- **Non-Union Struct/ADT 2-Level Uninitialized Nested Field Assignment (`evalStmt_assign_uninit_nonUnion_adt_nested_field_ok`)**:
+Discharges the `hNoUnion` obligation of `Statements.evalStmt_assign_uninit_nested_field_ok`
+for **arbitrary symbolic `localDecls` and `layouts`** when `dstLoc` is an uninitialized
+non-union struct/ADT (`layoutIdxIsNonUnion layouts layoutIdx = true`) and the outer field
+step `.field outerIdx outerTy` is itself a non-union field base after `certFieldTy`
+resolution (`tyIsNonUnionFieldBase layouts (certFieldTy ...) = true`, which holds both when
+`outerTy` is a tuple and when `outerTy` is a nested non-union struct whose layout index is
+carried either on `outerTy` or in `fieldLayouts[outerIdx]` of the outer struct). -/
+theorem evalStmt_assign_uninit_nonUnion_adt_nested_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (outerIdx innerIdx : FieldIdx)
+    (outerTy innerTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (layoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hOuterAgg :
+      (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+      (∃ innerFields, outerTy.kind = .tuple innerFields))
+    (hNonUnionRoot : layoutIdxIsNonUnion layouts layoutIdx = true)
+    (hNonUnionOuter :
+      tyIsNonUnionFieldBase layouts
+        (certFieldTy layouts { kind := .adt defPath args, layoutIdx := layoutIdx }
+          outerIdx outerTy) = true)
+    (hSet :
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate 0
+            (setOrExtendFields .nil outerIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ projs with
+                 | .some rp => rp
+                 | .none => projs) }) := by
+  have hRestCert :
+      projFieldBasesNonUnion layouts
+        (certFieldTy layouts { kind := .adt defPath args, layoutIdx := layoutIdx }
+          outerIdx outerTy)
+        [.field innerIdx innerTy] = true := by
+    dsimp only [projFieldBasesNonUnion]
+    rw [hNonUnionOuter]
+  exact Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt_assign_uninit_nested_field_ok
+    s dstLoc outerIdx innerIdx outerTy innerTy rv span localDecls layouts val
+    locals₁ mem₁ locals₂ hRv hUninit (Or.inl ⟨defPath, args, layoutIdx, hTy⟩) hOuterAgg
+    hSet hProt
+    (placeTouchesUnion_nonUnion_adt_field_false localDecls layouts dstLoc defPath args
+      layoutIdx outerIdx outerTy [.field innerIdx innerTy] hTy hNonUnionRoot hRestCert)
+
+/-- **Certified Projected Assignment Into an Initialized Local (`evalStmt_assign_init_root_certified_nested_refines`)**:
+One-step wrapper around `evalStmt_assign_init_root_nested_refines` that discharges
+`placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false` directly from a
+Section 0 `projFieldBasesNonUnion` certificate on `loc`'s declared type `declTy`. -/
+theorem evalStmt_assign_init_root_certified_nested_refines
+    (s : MachineState)
+    (slots₁ slots₂ : List LocalSlotState)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val rootVal : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTy declTy : Ty)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
+    (hInitRoot : get? slots₁ loc = .some (.init rootVal))
+    (hNoProt : mem₁.activeProtectors = .nil)
+    (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy (proj :: rest) = true)
+    (hWrite : writePlaceState arityOf slots₁ ⟨loc, proj :: rest⟩ rootTy val = .ok slots₂) :
+    ∃ locals₂ mem₂,
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.assign ⟨loc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
+      SlotsRefine NestedSlotStateRefines slots₂ locals₂ :=
+  evalStmt_assign_init_root_nested_refines s slots₁ slots₂ loc proj rest rv span
+    localDecls layouts val rootVal locals₁ mem₁ arityOf rootTy hRv hRel hInitRoot hNoProt
+    (placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc (proj :: rest)
+      declTy hRootTy hCert)
+    hWrite
+
+/-- **Certified Projected `SetDiscriminant` Refinement on Initialized Roots (`evalSetDiscriminantState_general_certified_nested_refines`)**:
+One-step wrapper around the projected branch of `evalSetDiscriminantState_general_nested_refines`
+that discharges `SetDiscriminantDestOk localDecls layouts ⟨loc, p :: rest⟩` directly from a
+Section 0 `projFieldBasesNonUnion` certificate on `loc`'s declared type `declTy` together with
+an ADT destination `placeTy`. -/
+theorem evalSetDiscriminantState_general_certified_nested_refines
+    (s : MachineState)
+    (slots slots' : List LocalSlotState)
+    (loc : Local)
+    (p : ProjectionElem)
+    (rest : List ProjectionElem)
+    (variantIdx : VariantIdx)
+    (rootVal : Value)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (declTy : Ty)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (lIdx : LayoutIdx)
+    (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals)
+    (hNotDeref : p ≠ .deref)
+    (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert : projFieldBasesNonUnion layouts declTy (p :: rest) = true)
+    (hLeafTy : placeTy localDecls layouts ⟨loc, p :: rest⟩ =
+      .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hGetS : get? slots loc = .some (.init rootVal))
+    (hNotUnit : evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit)
+    (hOk : evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots') :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.setDiscriminant ⟨loc, p :: rest⟩ variantIdx, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals') ∧
+      SlotsRefine NestedSlotStateRefines slots' locals' :=
+  (evalSetDiscriminantState_general_nested_refines s slots slots' loc p rest variantIdx
+    rootVal rootVal span localDecls layouts hRel).2 hNotDeref
+    (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc (p :: rest)
+      declTy defPath args lIdx hRootTy hCert hLeafTy)
+    hGetS hNotUnit hOk
 
 end Anneal.Mir.PlaceAndRvalue

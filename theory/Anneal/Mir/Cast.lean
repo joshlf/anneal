@@ -31,7 +31,9 @@ open Trusted.Rustc.V2026_06_01.MirSemantics (tyByteSize tyByteSizeAndAlignAux
   mergeUnionTypedSlotsAux unionNonUnitNonZstTypedSlotCount unionLayoutFreeOccupiedSlotCount
   layoutEntriesHaveNonZstFieldlessEnum0 unionTypedSlotsLackLayoutFreeImage appendValueList
   unresolvedLayoutIdx decodeUnionBytesWithCountOpt finalizeUnionFieldsWithRawOverlayOpt
-  forceValueListOpt abstractByteListEq abstractByteEq replicateBool)
+  forceValueListOpt abstractByteListEq abstractByteEq replicateBool readProjectedForLocal
+  readProjectedValueUnionAware unionNeedsConsistencyCheck placeTouchesUnion tyProjTouchesUnion
+  validateValueForTy? placeTyResolved resolveProjectedTyResolved)
 open Anneal.BitValidity
 open Anneal.MirFuelFree
 
@@ -7806,8 +7808,13 @@ reproduce `bytes` (`finalizeUnionFieldsWithRawOverlayOpt`;
 `trusted_decodeTypedValueFromBytes_union_map_toTrusted`), and `encodeByteCastSourceBytes`
 reproduces `bytes` from that value byte-for-byte, provenance included. Union sources therefore
 realize the hypothesis for every overwrite position and every provenance pattern, and the
-step-level no-forge agreement holds for `Copy` reads of such union locals with purely structural
-hypotheses (`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`). -/
+step-level no-forge agreement holds for both `Copy` and `Move` transmutes of such union locals
+(`trusted_evalByteCast_union_rawOverlay_no_forge_agreement`,
+`trusted_evalByteCast_move_union_rawOverlay_no_forge_agreement`), for direct union pointer-field
+projections `_u.ptr_field` via `readProjectedForLocal`, `evalOperand`, and `evalPlaceRead`
+(`trusted_union_field_read_rawOverlay_no_forge_agreement`), and positively for intact
+`ptr -> union -> ptr` round-trips across both transmutes and union field reads
+(`trusted_union_rawOverlay_intact_ptr_roundtrip`). -/
 
 /-- The union `Value` that `Trusted` materializes for a `count`-field union whose storage holds the
 byte image `bytes` with every typed slot empty: `count` `.unit` placeholders followed by the
@@ -8120,13 +8127,503 @@ theorem trusted_evalByteCast_union_rawOverlay_no_forge_agreement
     off optAlloc i b h_pw h_thin h_i h_b).1
   exact ⟨hAnneal, hStep⟩
 
-/-- **Non-vacuity of `trusted_evalByteCast_union_rawOverlay_no_forge_agreement`.** On a 64-bit
+/-- **`Move` variant of `trusted_evalByteCast_union_rawOverlay_no_forge_agreement`.** Moving the
+union local `loc` (`Operand.move ⟨loc, .nil⟩`, which transitions `locals[loc]` to `.uninit` in
+`locals'`) into a `CastKind.transmute` obeys the identical provenance no-forge agreement at both
+thin raw-pointer and thin reference targets. -/
+theorem trusted_evalByteCast_move_union_rawOverlay_no_forge_agreement
+    (locals locals' : List LocalSlot) (loc : Local) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (decl : LocalDecl) (defPath : DefPath) (args : List RigidTy) (uIdx : Nat) (uL : TypeLayout)
+    (count : Nat) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (off : Nat) (optAlloc : Option Nat) (i : Nat) (b : CastByte)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_i : i < 8)
+    (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (hGet : Trusted.Sequence.get? locals loc = some (.init (unionRawOverlayValue count
+      (((encodeCastBytes off 8 optAlloc).set i b).map CastByte.toTrustedAbstractByte))))
+    (hSet : Trusted.Sequence.set? locals loc .uninit = some locals') :
+    let bytes := (encodeCastBytes off 8 optAlloc).set i b
+    let op : Operand := .move ⟨loc, .nil⟩
+    decodeCastVal .bits64 .rawPtr bytes =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none) ∧
+    evalByteCast locals op { kind := .rawPtr m pt, layoutIdx := lIdx } mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals' mem ∧
+    evalRvalue locals (.cast .transmute op { kind := .rawPtr m pt, layoutIdx := lIdx })
+        mem localDecls layouts =
+      ok ((CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr) locals' mem ∧
+    evalByteCast locals op { kind := .ref m pt, layoutIdx := lIdx } mem localDecls layouts = ub ∧
+    evalRvalue locals (.cast .transmute op { kind := .ref m pt, layoutIdx := lIdx })
+        mem localDecls layouts = ub := by
+  intro bytes op
+  let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
+  have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
+  have hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) locals' := by
+    unfold evalOperand
+    dsimp only [op]
+    rw [hGet]
+    dsimp only
+    rw [hSet]
+  have hTy : operandTy localDecls layouts op = some uTy := by
+    unfold operandTy placeTy
+    dsimp only [op]
+    rw [hDecl]
+    show resolveProjectedTy layouts decl.ty [] = some uTy
+    rw [hDeclTy]
+  have hResolve : resolveTyWithLocalDecls localDecls layouts uTy = uTy :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts uTy uL hUIdx hLookup
+  have hValidAdt : layoutValidForAdt uL = true := by
+    unfold layoutValidForAdt
+    rw [hFields]
+  have hSrcSz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts uTy) =
+      some 8 := by
+    rw [hResolve, trusted_tyByteSize_adt_of_lookup localDecls layouts defPath args uIdx uL hUIdx
+      hLookup hValidAdt, hSz]
+  have hEnc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls localDecls layouts uTy)
+      (unionRawOverlayValue count (bytes.map CastByte.toTrustedAbstractByte)) =
+      some (bytes.map CastByte.toTrustedAbstractByte) := by
+    rw [hResolve]
+    exact trusted_encodeByteCastSourceBytes_unionRawOverlay_map_toTrusted layouts defPath args uIdx
+      uL count bytes hLookup hInhab hFields (by rw [hSz, hLenB])
+  have hStep := trusted_evalByteCast_overwrite_provenance_no_forge_agreement locals locals' op mem
+    localDecls layouts uTy _ m pt lIdx off optAlloc i b h_pw h_thin h_i h_b hOp hTy hSrcSz hEnc
+  have hAnneal := (trusted_vs_anneal_overwrite_provenance_no_forge_agreement 15 layouts m pt lIdx
+    off optAlloc i b h_pw h_thin h_i h_b).1
+  exact ⟨hAnneal, hStep⟩
+
+/-- Looking up any index `idx < count` in `appendValueList (replicateValue count .unit) tail`
+returns `some .unit`. -/
+theorem trusted_get?_appendValueList_replicate_unit :
+    ∀ (count idx : Nat) (tail : List Value), idx < count →
+      Trusted.Sequence.get? (appendValueList (replicateValue count .unit) tail) idx = some .unit
+  | 0, _, _, h => nomatch h
+  | _ + 1, 0, _, _ => rfl
+  | k + 1, j + 1, tail, h =>
+    trusted_get?_appendValueList_replicate_unit k j tail (Nat.lt_of_succ_lt_succ h)
+
+/-- `validateValueForTy?` always succeeds at a `.field idx fieldTy` place whose annotation `fieldTy`
+has a `.rawPtr` or `.ref` kind, for every `localDecls`, `layouts`, and runtime `Value`. -/
+theorem trusted_validateValueForTy?_placeTyResolved_field_ptr
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
+    (idx : FieldIdx) (isRef : Bool) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (v : Value) :
+    let fieldTy : Ty :=
+      { kind := (match isRef with | true => .ref m pt | false => .rawPtr m pt), layoutIdx := lIdx }
+    validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨loc, [.field idx fieldTy]⟩) v =
+      true := by
+  intro fieldTy
+  unfold placeTyResolved
+  dsimp only
+  cases Trusted.Sequence.get? localDecls loc with
+  | none => rfl
+  | some decl =>
+    let rTy : Ty :=
+      match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+      | false => fieldTy
+      | true =>
+        match LayoutTable.lookup layouts decl.ty.layoutIdx with
+        | .some l =>
+          match l.variants with
+          | .single _ =>
+            match Trusted.Sequence.get? l.fieldLayouts idx with
+            | .some flIdx => { fieldTy with layoutIdx := flIdx }
+            | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+          | _ => resolveTyWithLocalDecls localDecls layouts fieldTy
+        | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+    have hKind : rTy.kind = fieldTy.kind := by
+      unfold rTy
+      cases isUnresolvedLayoutIdx layouts fieldTy.layoutIdx
+      · rfl
+      · dsimp only
+        cases LayoutTable.lookup layouts decl.ty.layoutIdx with
+        | none => exact trusted_resolveTyWithLocalDecls_kind localDecls layouts fieldTy
+        | some l =>
+          dsimp only
+          cases l.variants with
+          | single _ =>
+            dsimp only
+            cases Trusted.Sequence.get? l.fieldLayouts idx
+            · exact trusted_resolveTyWithLocalDecls_kind localDecls layouts fieldTy
+            · rfl
+          | empty => exact trusted_resolveTyWithLocalDecls_kind localDecls layouts fieldTy
+          | multiple _ _ _ => exact trusted_resolveTyWithLocalDecls_kind localDecls layouts fieldTy
+    show validateValueForTy? layouts (some rTy) v = true
+    rcases hR : rTy with ⟨rk, rl⟩
+    rw [hR] at hKind
+    dsimp only at hKind
+    rw [hKind]
+    cases isRef <;> rfl
+
+/-- A `.field` projection on a local declared at a resolved union layout satisfies
+`placeTouchesUnion = true`. -/
+theorem trusted_placeTouchesUnion_union_field
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local) (decl : LocalDecl)
+    (defPath : DefPath) (args : List RigidTy) (uIdx count : Nat) (uL : TypeLayout)
+    (idx : FieldIdx) (fieldTy : Ty) (rest : List ProjectionElem)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hFields : uL.fields = .union count) :
+    placeTouchesUnion localDecls layouts ⟨loc, .field idx fieldTy :: rest⟩ = true := by
+  have hResolve :
+      resolveTyWithLocalDecls localDecls layouts { kind := .adt defPath args, layoutIdx := uIdx } =
+        { kind := .adt defPath args, layoutIdx := uIdx } :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts _ uL hUIdx hLookup
+  have hIsUnion :
+      isUnionLayout layouts { kind := .adt defPath args, layoutIdx := uIdx } = true := by
+    unfold isUnionLayout
+    dsimp only
+    rw [hLookup]
+    rcases uL with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+    dsimp only at hFields
+    subst hFields
+    rfl
+  cases localDecls with
+  | nil => nomatch hDecl
+  | cons d ds =>
+    rcases layouts with ⟨pB, lE, entries⟩
+    cases entries with
+    | nil =>
+      change ([][uIdx]? : Option TypeLayout) = some uL at hLookup
+      simp at hLookup
+    | cons e es =>
+      unfold placeTouchesUnion
+      dsimp only
+      rw [hDecl]
+      dsimp only [tyProjTouchesUnion]
+      rw [hDeclTy, hResolve, hIsUnion]
+
+/-- Reading a pointer union field `⟨loc, [.field idx fieldTy]⟩` (`idx < count`, where `fieldTy` is a
+thin `.rawPtr` or `.ref` type) out of an 8-byte union holding `unionRawOverlayValue count` of an
+8-byte Anneal `CastByte` list decodes those bytes via `decodeTypedValueFromBytes` at `fieldTy`. -/
+theorem trusted_readProjectedForLocal_union_rawOverlay_thin_ptr
+    (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (loc : Local) (decl : LocalDecl) (defPath : DefPath) (args : List RigidTy)
+    (uIdx count idx : Nat) (uL : TypeLayout)
+    (isRef : Bool) (m : Mutability) (pt : RigidTy) (lIdx : Nat) (cbs : List CastByte)
+    (h_thin : isThinPointee pt = true)
+    (h_idx : idx < count)
+    (h_len : cbs.length = 8)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8) :
+    let fieldTy : Ty :=
+      { kind := (match isRef with | true => .ref m pt | false => .rawPtr m pt), layoutIdx := lIdx }
+    let tBytes := cbs.map CastByte.toTrustedAbstractByte
+    readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
+        [.field idx fieldTy] =
+      match decodePtrBytesNoForge isRef pt (layoutPointerBytes layouts) tBytes with
+      | .some v => .ok v
+      | .none => .ub := by
+  intro fieldTy tBytes
+  have hTouch := trusted_placeTouchesUnion_union_field localDecls layouts loc decl defPath args
+    uIdx count uL idx fieldTy [] hDecl hDeclTy hUIdx hLookup hFields
+  have hResolve :
+      resolveTyWithLocalDecls localDecls layouts { kind := .adt defPath args, layoutIdx := uIdx } =
+        { kind := .adt defPath args, layoutIdx := uIdx } :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts _ uL hUIdx hLookup
+  have hBle : Nat.ble (idx + 1) count = true := Nat.ble_eq.mpr h_idx
+  have hGetUnit := trusted_get?_appendValueList_replicate_unit count idx
+    [.aggregate 0 (encodeRawAbstractByteVals tBytes)] h_idx
+  have hEnc := trusted_encodeByLayoutIdxAux_unionRawOverlay_map_toTrusted layouts uIdx uL count
+    cbs hLookup hInhab hFields (by rw [hSz, h_len])
+  have hLenT : Trusted.Sequence.length tBytes = 8 := by
+    change (cbs.map CastByte.toTrustedAbstractByte).length = 8
+    rw [List.length_map, h_len]
+  have hSlice : sliceAbstractBytes tBytes 0 8 = some tBytes :=
+    sliceAbstractBytes_zero_full tBytes 8 hLenT
+  have hSzLi : ∀ li,
+      tyByteSize localDecls layouts { kind := fieldTy.kind, layoutIdx := li } = some 8 := by
+    intro li
+    cases isRef
+    · exact trusted_tyByteSize_of_rigidTyKindByteSize localDecls layouts _ 8 rfl
+        (trusted_rigidTyKindByteSize_thin_rawPtr m pt h_thin)
+    · exact trusted_tyByteSize_of_rigidTyKindByteSize localDecls layouts _ 8 rfl
+        (trusted_rigidTyKindByteSize_thin_ref m pt h_thin)
+  have hDecLi : ∀ li,
+      decodeTypedValueFromBytes defaultCodecFuel layouts { kind := fieldTy.kind, layoutIdx := li }
+          tBytes =
+        decodePtrBytesNoForge isRef pt (layoutPointerBytes layouts) tBytes := by
+    intro li
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    cases isRef <;> rfl
+  unfold unionRawOverlayValue at hEnc
+  unfold readProjectedForLocal
+  rw [hTouch]
+  dsimp only
+  rw [hDecl]
+  dsimp only
+  rw [hDeclTy]
+  unfold readProjectedValueUnionAware unionRawOverlayValue
+  dsimp only
+  rw [hResolve]
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hFields]
+  dsimp only
+  rw [hBle]
+  simp only []
+  rw [hEnc, hGetUnit]
+  cases isUnresolvedLayoutIdx layouts fieldTy.layoutIdx <;>
+    (try cases Trusted.Sequence.get? uL.fieldLayouts idx) <;>
+    (try rw [trusted_resolveTyWithLocalDecls_eta localDecls layouts fieldTy]) <;>
+    cases unionNeedsConsistencyCheck count
+      (appendValueList (replicateValue count .unit)
+        [.aggregate 0 (encodeRawAbstractByteVals (cbs.map CastByte.toTrustedAbstractByte))]) <;>
+    cases uL.fieldLayouts <;>
+    simp only [] <;>
+    cases isRef <;>
+    simp only [fieldTy] at hSzLi hDecLi ⊢ <;>
+    rw [hSzLi] <;>
+    dsimp only <;>
+    rw [hSlice] <;>
+    dsimp only <;>
+    rw [hDecLi] <;>
+    cases decodePtrBytesNoForge _ pt (layoutPointerBytes layouts)
+      (cbs.map CastByte.toTrustedAbstractByte) <;> rfl
+
+/-- **Union-pun field-read no-forge agreement (`_u.ptr_field`).** In Rust MIR, reading a union field
+is lowered as a `.field idx fieldTy` projection rather than `CastKind.transmute`. When local
+`loc : U` of an 8-byte `count`-field union holds `unionRawOverlayValue count` of a partially
+overwritten pointer image (`encodeCastBytes off 8 optAlloc` with byte `i < 8` overwritten by a
+provenance-free or foreign-allocation byte `b`):
+1. Reading a thin raw-pointer field `idx < count` via `readProjectedForLocal`, `evalOperand (.copy ...)`,
+   `evalOperand (.move ...)`, or `evalPlaceRead` succeeds with the provenance-less address
+   `.scalar ⟨decodeCastIntBytes bytes, 8⟩` (the exact `Trusted` image of Anneal's `decodeCastVal`).
+2. Reading a thin reference field `idx < count` via any of those four evaluators faults with `.ub`. -/
+theorem trusted_union_field_read_rawOverlay_no_forge_agreement
+    (locals : List LocalSlot) (loc : Local) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (decl : LocalDecl) (defPath : DefPath) (args : List RigidTy) (uIdx count idx : Nat)
+    (uL : TypeLayout) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (off : Nat) (optAlloc : Option Nat) (i : Nat) (b : CastByte)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_idx : idx < count)
+    (h_i : i < 8)
+    (h_b : b.prov = none ∨ ∃ f a, b.prov = some f ∧ optAlloc = some a ∧ f.allocId ≠ a)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (hGet : Trusted.Sequence.get? locals loc = some (.init (unionRawOverlayValue count
+      (((encodeCastBytes off 8 optAlloc).set i b).map CastByte.toTrustedAbstractByte)))) :
+    let bytes := (encodeCastBytes off 8 optAlloc).set i b
+    let tBytes := bytes.map CastByte.toTrustedAbstractByte
+    let rawFieldTy : Ty := { kind := .rawPtr m pt, layoutIdx := lIdx }
+    let refFieldTy : Ty := { kind := .ref m pt, layoutIdx := lIdx }
+    let rawPlace : Place := ⟨loc, [.field idx rawFieldTy]⟩
+    let refPlace : Place := ⟨loc, [.field idx refFieldTy]⟩
+    let outVal : Value :=
+      (CastVal.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none).toTrustedValue
+        .bits64 .rawPtr
+    readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
+        [.field idx rawFieldTy] = .ok outVal ∧
+    evalOperand locals (.copy rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok outVal locals ∧
+    evalOperand locals (.move rawPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok outVal locals ∧
+    evalPlaceRead locals rawPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok outVal locals ∧
+    readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
+        [.field idx refFieldTy] = .ub ∧
+    evalOperand locals (.copy refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ub ∧
+    evalOperand locals (.move refPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ub ∧
+    evalPlaceRead locals refPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ub := by
+  intro bytes tBytes rawFieldTy refFieldTy rawPlace refPlace outVal
+  have hLenB : bytes.length = 8 := by simp [bytes, encodeCastBytes_length]
+  have hNoForge := trusted_vs_anneal_overwrite_provenance_no_forge_agreement 0 layouts m pt lIdx
+    off optAlloc i b h_pw h_thin h_i h_b
+  have hRawDec : decodePtrBytesNoForge false pt (layoutPointerBytes layouts) tBytes = some outVal :=
+    hNoForge.2.1
+  have hRefDec : decodePtrBytesNoForge true pt (layoutPointerBytes layouts) tBytes = none :=
+    hNoForge.2.2.1
+  have hRawProj := trusted_readProjectedForLocal_union_rawOverlay_thin_ptr locals localDecls layouts
+    loc decl defPath args uIdx count idx uL false m pt lIdx bytes h_thin h_idx hLenB hDecl hDeclTy
+    hUIdx hLookup hInhab hFields hSz
+  dsimp only at hRawProj
+  rw [hRawDec] at hRawProj
+  have hRefProj := trusted_readProjectedForLocal_union_rawOverlay_thin_ptr locals localDecls layouts
+    loc decl defPath args uIdx count idx uL true m pt lIdx bytes h_thin h_idx hLenB hDecl hDeclTy
+    hUIdx hLookup hInhab hFields hSz
+  dsimp only at hRefProj
+  rw [hRefDec] at hRefProj
+  have hTouchRaw := trusted_placeTouchesUnion_union_field localDecls layouts loc decl defPath args
+    uIdx count uL idx rawFieldTy [] hDecl hDeclTy hUIdx hLookup hFields
+  have hTouchRef := trusted_placeTouchesUnion_union_field localDecls layouts loc decl defPath args
+    uIdx count uL idx refFieldTy [] hDecl hDeclTy hUIdx hLookup hFields
+  have hValidRaw :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts rawPlace) outVal = true :=
+    trusted_validateValueForTy?_placeTyResolved_field_ptr localDecls layouts loc idx false m pt
+      lIdx outVal
+  refine ⟨hRawProj, ?_, ?_, ?_, hRefProj, ?_, ?_, ?_⟩
+  · unfold evalOperand; dsimp only [rawPlace]; rw [hGet]; dsimp only; rw [hTouchRaw]; dsimp only
+    rw [hRawProj]; dsimp only; rw [hValidRaw]
+  · unfold evalOperand; dsimp only [rawPlace]; rw [hGet]; dsimp only; rw [hTouchRaw]; dsimp only
+    rw [hRawProj]; dsimp only; rw [hValidRaw]
+  · unfold evalPlaceRead; dsimp only [rawPlace]; rw [hGet]; dsimp only; rw [hRawProj]; dsimp only
+    rw [hValidRaw]
+  · unfold evalOperand; dsimp only [refPlace]; rw [hGet]; dsimp only; rw [hTouchRef]; dsimp only
+    rw [hRefProj]
+  · unfold evalOperand; dsimp only [refPlace]; rw [hGet]; dsimp only; rw [hTouchRef]; dsimp only
+    rw [hRefProj]
+  · unfold evalPlaceRead; dsimp only [refPlace]; rw [hGet]; dsimp only; rw [hRefProj]
+
+/-- **Positive intact `ptr -> union -> ptr` round-trip agreement.** When an 8-byte union local
+`loc : U` holds `unionRawOverlayValue count` of an *intact* pointer encoding
+`encodeCastBytes p.offsetBytes 8 (some p.allocId)` (`p.offsetBytes < 2^64`, the exact value that
+`decodeTypedValueFromBytes` materializes when transmuting `.ptr p 8` into `U`), both:
+1. transmuting `loc` (`evalByteCast` / `evalRvalue (.cast .transmute (.copy ⟨loc, []⟩) ...)`), and
+2. reading a pointer union field `⟨loc, [.field idx fieldTy]⟩` (`idx < count`) via
+   `readProjectedForLocal`, `evalOperand (.copy ...)`, `evalOperand (.move ...)`, or `evalPlaceRead`
+recover `.ok (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8)` at every thin
+raw-pointer or reference type (`isRef : Bool`), matching Anneal's `decodeCastVal .bits64 .rawPtr`
+(`some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } (some p.allocId))`). -/
+theorem trusted_union_rawOverlay_intact_ptr_roundtrip
+    (locals : List LocalSlot) (loc : Local) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (decl : LocalDecl) (defPath : DefPath) (args : List RigidTy) (uIdx count idx : Nat)
+    (uL : TypeLayout) (isRef : Bool) (m : Mutability) (pt : RigidTy) (lIdx : Nat)
+    (p : ProvenancePtr)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_idx : idx < count)
+    (h_off : p.offsetBytes < scalarModulus 8)
+    (hDecl : Trusted.Sequence.get? localDecls loc = some decl)
+    (hDeclTy : decl.ty = { kind := .adt defPath args, layoutIdx := uIdx })
+    (hUIdx : uIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts uIdx = some uL)
+    (hInhab : uL.isUninhabited = false)
+    (hFields : uL.fields = .union count)
+    (hSz : uL.size.bytes = 8)
+    (hGet : Trusted.Sequence.get? locals loc = some (.init (unionRawOverlayValue count
+      ((encodeCastBytes p.offsetBytes 8 (some p.allocId)).map CastByte.toTrustedAbstractByte)))) :
+    let cbs := encodeCastBytes p.offsetBytes 8 (some p.allocId)
+    let tBytes := cbs.map CastByte.toTrustedAbstractByte
+    let pCanon : ProvenancePtr := { allocId := p.allocId, offsetBytes := p.offsetBytes }
+    let ptrTy : Ty :=
+      { kind := (match isRef with | true => .ref m pt | false => .rawPtr m pt), layoutIdx := lIdx }
+    let fPlace : Place := ⟨loc, [.field idx ptrTy]⟩
+    decodeCastVal .bits64 .rawPtr cbs = some (.ptr pCanon (some p.allocId)) ∧
+    evalByteCast locals (.copy ⟨loc, .nil⟩) ptrTy mem localDecls layouts =
+      ok (.ptr pCanon 8) locals mem ∧
+    evalRvalue locals (.cast .transmute (.copy ⟨loc, .nil⟩) ptrTy) mem localDecls layouts =
+      ok (.ptr pCanon 8) locals mem ∧
+    readProjectedForLocal locals localDecls layouts loc (unionRawOverlayValue count tBytes)
+        [.field idx ptrTy] = .ok (.ptr pCanon 8) ∧
+    evalOperand locals (.copy fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr pCanon 8) locals ∧
+    evalOperand locals (.move fPlace) mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr pCanon 8) locals ∧
+    evalPlaceRead locals fPlace mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr pCanon 8) locals := by
+  intro cbs tBytes pCanon ptrTy fPlace
+  have hLenC : cbs.length = 8 := encodeCastBytes_length p.offsetBytes 8 (some p.allocId)
+  have hMap : tBytes = encodeLittleEndianBytes pCanon.offsetBytes 8 (some (pCanon.allocId, pCanon.tag)) :=
+    map_toTrustedAbstractByte_encodeCastBytes p.offsetBytes 8 (some p.allocId)
+  have hLenT : Trusted.Sequence.length tBytes = 8 := by
+    rw [hMap]
+    exact trusted_length_encodeLittleEndianBytes _ 8 _
+  have hValidBits : ScalarTy.rawPtr.isValidBits .bits64 p.offsetBytes = true :=
+    (ScalarTy.isValidBits_iff_validBits .bits64 .rawPtr p.offsetBytes).mpr ⟨h_off, trivial⟩
+  have hAnneal : decodeCastVal .bits64 .rawPtr cbs = some (.ptr pCanon (some p.allocId)) := by
+    unfold decodeCastVal cbs
+    dsimp only [ScalarTy.isPtr]
+    rw [decodeCastIntBytes_encodeCastBytes 8 p.offsetBytes (some p.allocId) h_off, hValidBits,
+        decodeCastPtrBytes_encodeCastBytes_some 7 pCanon h_off]
+  have hIntactDec : ∀ li,
+      decodeTypedValueFromBytes defaultCodecFuel layouts
+        { kind := ptrTy.kind, layoutIdx := li } tBytes = some (.ptr pCanon 8) := by
+    intro li
+    rw [hMap, show defaultCodecFuel = 15 + 1 from rfl]
+    exact trusted_decodeTypedValueFromBytes_thin_ptr_intact 15 layouts isRef m pt li pCanon
+      h_pw h_thin h_off
+  have hPtrNoForge :
+      decodePtrBytesNoForge isRef pt (layoutPointerBytes layouts) tBytes = some (.ptr pCanon 8) := by
+    have h0 := hIntactDec 0
+    cases isRef <;> exact h0
+  let uTy : Ty := { kind := .adt defPath args, layoutIdx := uIdx }
+  have hOp : evalOperand locals (.copy ⟨loc, .nil⟩) mem.borrows mem.globals layouts
+      mem.callerLocals localDecls = .ok (unionRawOverlayValue count tBytes) locals := by
+    unfold evalOperand; dsimp only; rw [hGet]; rfl
+  have hTy : operandTy localDecls layouts (.copy ⟨loc, .nil⟩) = some uTy := by
+    unfold operandTy placeTy; dsimp only; rw [hDecl]
+    show resolveProjectedTy layouts decl.ty [] = some uTy
+    rw [hDeclTy]
+  have hResolve : resolveTyWithLocalDecls localDecls layouts uTy = uTy :=
+    trusted_resolveTyWithLocalDecls_of_lookup localDecls layouts uTy uL hUIdx hLookup
+  have hValidAdt : layoutValidForAdt uL = true := by unfold layoutValidForAdt; rw [hFields]
+  have hSrcSz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts uTy) =
+      some 8 := by
+    rw [hResolve, trusted_tyByteSize_adt_of_lookup localDecls layouts defPath args uIdx uL hUIdx
+      hLookup hValidAdt, hSz]
+  have hDstSz : tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts ptrTy) =
+      some 8 := by
+    cases isRef
+    · exact trusted_tyByteSize_resolve_thin_rawPtr localDecls layouts m pt lIdx h_thin
+    · exact trusted_tyByteSize_resolve_thin_ref localDecls layouts m pt lIdx h_thin
+  have hEnc : encodeByteCastSourceBytes layouts (resolveTyWithLocalDecls localDecls layouts uTy)
+      (unionRawOverlayValue count tBytes) = some tBytes := by
+    rw [hResolve]
+    exact trusted_encodeByteCastSourceBytes_unionRawOverlay_map_toTrusted layouts defPath args uIdx
+      uL count cbs hLookup hInhab hFields (by rw [hSz, hLenC])
+  have hBc : evalByteCast locals (.copy ⟨loc, .nil⟩) ptrTy mem localDecls layouts =
+      ok (.ptr pCanon 8) locals mem := by
+    rw [trusted_evalByteCast_of_encode locals locals (.copy ⟨loc, .nil⟩) mem localDecls layouts
+        (unionRawOverlayValue count tBytes) uTy ptrTy 8 tBytes hOp hDstSz hTy hSrcSz hEnc hLenT,
+      trusted_resolveTyWithLocalDecls_eta localDecls layouts ptrTy, hIntactDec]
+  have hProj := trusted_readProjectedForLocal_union_rawOverlay_thin_ptr locals localDecls layouts
+    loc decl defPath args uIdx count idx uL isRef m pt lIdx cbs h_thin h_idx hLenC hDecl hDeclTy
+    hUIdx hLookup hInhab hFields hSz
+  dsimp only at hProj
+  rw [hPtrNoForge] at hProj
+  have hTouch := trusted_placeTouchesUnion_union_field localDecls layouts loc decl defPath args
+    uIdx count uL idx ptrTy [] hDecl hDeclTy hUIdx hLookup hFields
+  have hValidPtr :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts fPlace) (.ptr pCanon 8) =
+        true :=
+    trusted_validateValueForTy?_placeTyResolved_field_ptr localDecls layouts loc idx isRef m pt
+      lIdx (.ptr pCanon 8)
+  refine ⟨hAnneal, hBc, hBc, hProj, ?_, ?_, ?_⟩
+  · unfold evalOperand; dsimp only [fPlace]; rw [hGet]; dsimp only; rw [hTouch]; dsimp only
+    rw [hProj]; dsimp only; rw [hValidPtr]
+  · unfold evalOperand; dsimp only [fPlace]; rw [hGet]; dsimp only; rw [hTouch]; dsimp only
+    rw [hProj]; dsimp only; rw [hValidPtr]
+  · unfold evalPlaceRead; dsimp only [fPlace]; rw [hGet]; dsimp only; rw [hProj]; dsimp only
+    rw [hValidPtr]
+
+/-- **Non-vacuity of `trusted_evalByteCast_union_rawOverlay_no_forge_agreement` and
+`trusted_union_field_read_rawOverlay_no_forge_agreement`.** On a 64-bit
 layout table whose entry `1` is an 8-byte two-field union `U`, let local `_0 : U` hold the raw
 overlay of a pointer into allocation `7` at address `0x1000` whose byte `1` was overwritten by the
 provenance-free byte `0xAB` (the remaining seven bytes still carry allocation `7`'s provenance; the
 image encodes the address `0xAB00`). Anneal's `decodeCastVal` strips the provenance; `Trusted`
-`Copy`-transmutes `_0` to `*const u8` as the provenance-less address `.scalar ⟨0xAB00, 8⟩`, the
-`Trusted` image of Anneal's result, and rejects the transmute to `&u8` as UB. -/
+both `Copy`-transmutes `_0` and reads union field `_0.0` at `*const u8` as the provenance-less
+address `.scalar ⟨0xAB00, 8⟩` (the `Trusted` image of Anneal's result), and rejects both the
+transmute and the union field read at `&u8` as UB. -/
 example (mem : Memory) :
     let uL : TypeLayout :=
       { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory, fields := .union 2,
@@ -8138,24 +8635,31 @@ example (mem : Memory) :
     let bytes := (encodeCastBytes 0x1000 8 (some 7)).set 1 { data := 0xAB, prov := none }
     let locals : List LocalSlot :=
       [.init (unionRawOverlayValue 2 (bytes.map CastByte.toTrustedAbstractByte))]
+    let rawPtrTy : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+    let refPtrTy : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 0 }
     decodeCastVal .bits64 .rawPtr bytes =
       some (.ptr { allocId := 0, offsetBytes := 0xAB00 } none) ∧
-    evalRvalue locals
-        (.cast .transmute (.copy ⟨0, []⟩) { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
-        mem decls layouts =
+    evalRvalue locals (.cast .transmute (.copy ⟨0, []⟩) rawPtrTy) mem decls layouts =
       ok (.scalar ⟨0xAB00, 8⟩) locals mem ∧
-    evalRvalue locals
-        (.cast .transmute (.copy ⟨0, []⟩) { kind := .ref .not (.uint .u8), layoutIdx := 0 })
-        mem decls layouts =
-      ub := by
-  intro uL layouts decls bytes locals
+    evalRvalue locals (.cast .transmute (.copy ⟨0, []⟩) refPtrTy) mem decls layouts =
+      ub ∧
+    evalPlaceRead locals ⟨0, [.field 0 rawPtrTy]⟩ mem.borrows mem.globals layouts mem.callerLocals
+        decls =
+      .ok (.scalar ⟨0xAB00, 8⟩) locals ∧
+    evalPlaceRead locals ⟨0, [.field 0 refPtrTy]⟩ mem.borrows mem.globals layouts mem.callerLocals
+        decls =
+      .ub := by
+  intro uL layouts decls bytes locals rawPtrTy refPtrTy
   have h := trusted_evalByteCast_union_rawOverlay_no_forge_agreement locals 0 mem decls layouts
     _ "U" [] 1 uL 2 .not (.uint .u8) 0 0x1000 (some 7) 1 { data := 0xAB, prov := none }
     rfl rfl (by decide) (Or.inl rfl) rfl rfl (by decide) rfl rfl rfl rfl rfl
+  have hField := trusted_union_field_read_rawOverlay_no_forge_agreement locals 0 mem decls layouts
+    _ "U" [] 1 2 0 uL .not (.uint .u8) 0 0x1000 (some 7) 1 { data := 0xAB, prov := none }
+    rfl rfl (by decide) (by decide) (Or.inl rfl) rfl rfl (by decide) rfl rfl rfl rfl rfl
   have hInt : decodeCastIntBytes bytes = 0xAB00 := by decide
-  dsimp only at h
-  rw [hInt] at h
-  exact ⟨h.1, h.2.2.1, h.2.2.2.2⟩
+  dsimp only at h hField
+  rw [hInt] at h hField
+  exact ⟨h.1, h.2.2.1, h.2.2.2.2, hField.2.2.2.1, hField.2.2.2.2.2.2.2⟩
 
 /-! ### 8.3 `zerocopy` Traits ↔ `evalTransmuteSameSize` & `Trusted.MirSemantics.evalByteCast` Soundness -/
 
