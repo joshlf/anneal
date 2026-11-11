@@ -3506,6 +3506,65 @@ theorem evalRvalue_derefRead_unsupported_of_evalOperand {locals : List LocalSlot
   · exact evalRvalue_use_unsupported hop
   · exact evalRvalue_copyForDeref_unsupported hop
 
+/-! ### `Rvalue::Discriminant` of an `Ordering` local -/
+
+theorem isOrderingTy_kind {t : MirAst.Ty} (h : isOrderingTy t = true) :
+    t.kind = .adt "core::cmp::Ordering" [] ∨ t.kind = .adt "std::cmp::Ordering" [] := by
+  unfold isOrderingTy at h
+  split at h
+  · rename_i p hk
+    simp only [Bool.or_eq_true, decide_eq_true_eq] at h
+    rcases h with rfl | rfl
+    · exact .inl hk
+    · exact .inr hk
+  · cases h
+
+theorem placeTyResolved_root {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {j : Nat} {d : LocalDecl} (hd : decls[j]? = some d) :
+    MirSemantics.placeTyResolved decls layouts ⟨j, []⟩ = some d.ty := by
+  simp [MirSemantics.placeTyResolved, Trusted.Sequence.get?, hd,
+    MirSemantics.resolveProjectedTyResolved]
+
+/-- Anneal's `evalPlaceDiscriminant` on a valid `Ordering` tag (`255`, `0`, or
+`1`) loaded from an `Ordering` local whose layout passes
+`orderingDiscrLayoutOk` returns the tag itself. -/
+theorem evalPlaceDiscriminant_ordering {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {j : Nat} {d : LocalDecl} (hd : decls[j]? = some d) (hord : isOrderingTy d.ty = true)
+    (hlay : orderingDiscrLayoutOk layouts d.ty = true)
+    {bits : Nat} (hb : bits = 255 ∨ bits = 0 ∨ bits = 1)
+    (L : List LocalSlot) (mem : MirSemantics.Memory) :
+    MirSemantics.evalPlaceDiscriminant (.scalar ⟨bits, 1⟩) L mem ⟨j, []⟩ decls layouts =
+      .ok (.scalar ⟨bits, 1⟩) L mem := by
+  have hpty := placeTyResolved_root (layouts := layouts) hd
+  rcases d with ⟨mutb, ⟨kind, lidx⟩, dn⟩
+  simp only at hord hlay hpty ⊢
+  unfold MirSemantics.evalPlaceDiscriminant
+  rw [hpty]
+  unfold orderingDiscrLayoutOk at hlay
+  rcases isOrderingTy_kind hord with hk | hk <;> subst hk <;>
+    simp only at hlay ⊢ <;>
+    cases hl : Layout.LayoutTable.lookup layouts lidx with
+    | none =>
+      rcases hb with rfl | rfl | rfl <;> simp <;> split <;> rfl
+    | some l =>
+      rw [hl] at hlay
+      obtain ⟨size, align, br, fields, variants, isU, fl⟩ := l
+      cases isU with
+      | true => simp at hlay
+      | false =>
+      simp only [Bool.not_false, Bool.true_and] at hlay
+      cases variants with
+      | empty => simp at hlay
+      | single _ => simp at hlay
+      | multiple tag tf vs =>
+        cases tag with
+        | initialized pk vr =>
+          simp only [Bool.and_eq_true] at hlay
+          obtain ⟨⟨h1, h2⟩, h3⟩ := hlay
+          rcases hb with rfl | rfl | rfl <;> simp [h1, h2, h3]
+        | union pk =>
+          rcases hb with rfl | rfl | rfl <;> simp <;> split <;> rfl
+
 theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
     (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (rv : Rvalue)
@@ -3673,6 +3732,26 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
           show evalPlaceLen locals ⟨j, []⟩ mem decls layouts = _
           rw [evalPlaceLen_array_local hd hk hs, hptr, hlen]
           rfl
+  | .discriminant ⟨j, []⟩, hok =>
+    simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨⟨rfl, hj⟩, hjd⟩ := hok
+    cases hd : decls[j]? with
+    | none => simp [hd] at hjd
+    | some d =>
+      simp only [hd, Bool.and_eq_true] at hjd
+      obtain ⟨hord, hlay⟩ := hjd
+      have hokT : OperandOkT layouts decls orderingTy (.copy ⟨j, []⟩) :=
+        operandOkO_T (by
+          simp only [operandOkO, operandIsOrdering, hd, hord, Bool.and_true, decide_eq_true_eq]
+          exact hj)
+      obtain ⟨hsome, hnone⟩ := evalOperand_fragT decls locals hslots hn .ordering
+        (.copy ⟨j, []⟩) hokT mem.borrows mem.globals mem.callerLocals
+      refine ⟨fun r hr => ?_, fun hr => ?_⟩
+      · have hb := (validBits_ordering r).mp
+          (opBits_valid decls locals hslots .ordering (.copy ⟨j, []⟩) hokT r hr)
+        simp only [evalRvalue, hsome r hr]
+        exact evalPlaceDiscriminant_ordering hd hord hlay hb locals mem
+      · simp only [evalRvalue, hnone hr]
 
 theorem evalOperands_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -5531,6 +5610,15 @@ def rvWithLocals : RvalueEvalResult → List LocalSlot → RvalueEvalResult
   | .ok v _ m, L' => .ok v L' m
   | r, _ => r
 
+/-- `evalPlaceDiscriminant` returns its input slots. -/
+theorem evalPlaceDiscriminant_locals (v : Value) (L : List LocalSlot) (mem : MirSemantics.Memory)
+    (p : Place) (decls : List LocalDecl) (layouts : Layout.LayoutTable) :
+    MirSemantics.evalPlaceDiscriminant v L mem p decls layouts =
+      rvWithLocals (MirSemantics.evalPlaceDiscriminant v L mem p decls layouts) L := by
+  unfold MirSemantics.evalPlaceDiscriminant
+  repeat' (first | split | (dsimp only))
+  all_goals rfl
+
 /-- Anneal's slots after reading `op`: a root `move _j` of a live local
 leaves `_j` uninitialized (reading a dead local is UB, so how this function
 treats one does not matter; it keeps the slot dead). -/
@@ -6064,10 +6152,11 @@ theorem evalOperands_move (mo : List Nat) (locals : List LocalSlot) (ops : List 
       | unsupported => rfl
 
 /-- The rvalue kinds whose evaluation `evalRvalue_move` reduces: those of
-the fragment (including `CopyForDeref` and the cast kinds `IntToInt`,
-`PtrToPtr`, and `Transmute`). -/
+the fragment (including `CopyForDeref`, `Discriminant`, and the cast kinds
+`IntToInt`, `PtrToPtr`, and `Transmute`). -/
 def moveKind : Rvalue → Bool
-  | .use _ | .copyForDeref _ | .repeat _ _ | .len _ | .unaryOp .not _ | .unaryOp .neg _
+  | .use _ | .copyForDeref _ | .repeat _ _ | .len _ | .discriminant _ | .unaryOp .not _
+  | .unaryOp .neg _
   | .binaryOp _ _ _ | .cast .intToInt _ _ | .cast .ptrToPtr _ _ | .cast .transmute _ _
   | .aggregate .tuple _ | .aggregate (.array _) _ | .aggregate (.adt _ 0 none) _ => true
   | _ => false
@@ -7032,6 +7121,18 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
     have hpost : opPost locals (.copy p) = locals := rfl
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl, hpost]
     exact evalPlaceLen_locals_of_simpleProj hsp mem decls layouts
+  | .discriminant p, _, _ =>
+    obtain ⟨hs, _⟩ := hspec (.copy p) (by simp [rvOperands])
+    have hcopy := evalOperand_copy_frame locals locals (.copy p) hs (fun _ _ => rfl)
+      mem.borrows mem.globals layouts mem.callerLocals decls
+    have hpost : opPost locals (.copy p) = locals := rfl
+    simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl, hpost]
+    cases hc : evalOperand locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals decls with
+    | ok v L1 =>
+      rw [opResult_locals hcopy hc]
+      exact evalPlaceDiscriminant_locals v locals mem p decls layouts
+    | ub => rfl
+    | unsupported => rfl
   | .unaryOp .not op, _, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
@@ -7235,7 +7336,7 @@ theorem simpleOp_copyOp (op : Operand) : simpleOp (copyOp op) = simpleOp op := b
 
 theorem moveKind_copyRv {rv : Rvalue} (h : moveKind rv = true) : moveKind (copyRv rv) = true := by
   match rv, h with
-  | .use _, _ | .copyForDeref _, _ | .repeat _ _, _ | .len _, _
+  | .use _, _ | .copyForDeref _, _ | .repeat _ _, _ | .len _, _ | .discriminant _, _
   | .unaryOp .not _, _ | .unaryOp .neg _, _
   | .binaryOp _ _ _, _ | .cast .intToInt _ _, _ | .cast .ptrToPtr _ _, _
   | .cast .transmute _ _, _

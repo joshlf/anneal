@@ -198,6 +198,19 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   dead-local `Assume` UB (`assumeDeadLocal`), and necessity witnesses proving
   that neither `stmtMoved` (`assumeMoveReuse`) nor `stmtReadsOk`
   (`assumeAfterMove`) on `Assume` can be dropped.
+* `cmpDiscrSwitch`: `Rvalue::Discriminant` of a `core::cmp::Ordering`
+  temporary (`_5 = discriminant(_4)` after `_4 = Cmp(_1, _2)`, then
+  `StorageDead(_4)` and a `SwitchInt` on the `i8` tag), in the fragment
+  (`cmpDiscrSwitch_inFragment`), translated through `orderingDiscrExpr`
+  (`cmpDiscrSwitch_translate`), with Anneal runs for all three outcomes, the
+  end-to-end MiniRust return through `mirCall_ret`
+  (`cmpDiscrLess_minirust_ret_from_start`), and direct MiniRust runs.
+* `paddedDeinitRead` and `paddedRetagRead`: kernel-computed divergences of a
+  projected `Deinit(_1.1)` (Anneal keeps the field readable and returns `99`,
+  MiniRust writes `Uninit` and the later load is UB) and of a projected
+  `Retag(_1.1)` on a `u32` field (Anneal faults, MiniRust's `Validate`
+  succeeds and returns `99`), which is why `statementOk` rejects both
+  (`statementOk_deinit_proj`, `statementOk_retag_proj`).
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -13175,5 +13188,420 @@ theorem tuple_encode_decode_place_edge_cases :
       .error (.specPanic "field projection on non-projectable type") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## `Rvalue::Discriminant` of an `Ordering` temporary in a `SwitchInt` body -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn cmp_discr_switch(x: i8, y: i8, _b: bool) -> i8 {
+    let o = x.cmp(&y);                 // StorageLive(_4); _4 = Cmp(copy _1, copy _2)
+    let d = discriminant(o) as i8;     // StorageLive(_5); _5 = discriminant(_4); StorageDead(_4)
+    match d {                          // switchInt(copy _5) -> [255: bb1, 0: bb2, otherwise: bb3]
+        -1 => -10,                     // bb1: _0 = const -10_i8; return
+        0 => 0,                        // bb2: _0 = const 0_i8; return
+        _ => d,                        // bb3: _0 = copy _5; return
+    }
+}
+```
+whose `_5 = discriminant(_4)` reads the `i8` tag of the `core::cmp::Ordering`
+temporary `_4` (`Rvalue::Discriminant`, lowered by `orderingDiscrExpr` to
+`transmute::<i8>(load _4)`), after which `_4` is dead and the `SwitchInt` on
+`_5` dispatches on the tag. -/
+def cmpDiscrSwitch : CapturedMir where
+  defPath := "witness::cmp_discr_switch"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [i8Decl, i8Decl, i8Decl, boolDecl, orderingDecl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 4) (.binaryOp .cmp (.copy (local_ 1)) (.copy (local_ 2)))),
+        mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 5) (.discriminant (local_ 4))),
+        mkStmt (.storageDead 4)],
+      terminator := mkTerm (.switchInt (.copy (local_ 5))
+        { branches := [(255, 1), (0, 2)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constI8 246)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constI8 0)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 5)))),
+        mkStmt (.storageDead 5)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiCmpSel
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem cmpDiscrSwitch_inFragment : inFragment cmpDiscrSwitch = true := by decide
+
+/-- The `Discriminant` statement is a fragment statement precisely through the
+`Rvalue::Discriminant` case of `rvalueOk` (an `i8` destination and an
+`Ordering` local without a layout entry). -/
+theorem cmpDiscrSwitch_discriminant_statementOk :
+    statementOk cmpDiscrSwitch.localDecls (mkStmt (.assign (local_ 5) (.discriminant (local_ 4))))
+        cmpDiscrSwitch.layouts = true ∧
+      rvalueOk cmpDiscrSwitch.layouts cmpDiscrSwitch.localDecls IntType.I8
+        (.discriminant (local_ 4)) = true ∧
+      rvalueOk cmpDiscrSwitch.layouts cmpDiscrSwitch.localDecls u8
+        (.discriminant (local_ 4)) = false ∧
+      rvalueOk cmpDiscrSwitch.layouts cmpDiscrSwitch.localDecls IntType.I8
+        (.discriminant (local_ 5)) = false := by
+  decide
+
+/-- The MiniRust function `minimize` produces for `cmpDiscrSwitch`, spelled
+out, with `Rvalue::Discriminant` lowered to `transmute::<i8>` of the load of the
+`Ordering` local (`orderingDiscrExpr`). -/
+def cmpDiscrSwitchFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8),
+    (localName 3, .Bool), (localName 4, orderingTy), (localName 5, .Int i8)]⟩
+  args := [localName 1, localName 2, localName 3]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 4))
+        (translateCmp (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .StorageLive (localName 5),
+      .Assign (.Local (localName 5)) (orderingDiscrExpr (.Load (.Local (localName 4)))),
+      .StorageDead (localName 4)],
+      .Switch (.Load (.Local (localName 5))) ⟨[(-1, bbName 1), (0, bbName 2)]⟩ (bbName 3),
+      .Regular⟩),
+    (bbName 1, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int (-10)) (.Int i8))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 0) (.Int i8))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 5))),
+      .StorageDead (localName 5)],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem cmpDiscrSwitch_translate : translateFn cmpDiscrSwitch = some cmpDiscrSwitchFn := rfl
+
+theorem ctxI8_ok_cmpDiscrSwitch : CtxOk cmpDiscrSwitch ctxI8_4 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [cmpDiscrSwitch] at hd; subst hd; decide
+    | 1, _, hd => simp [cmpDiscrSwitch] at hd; subst hd; decide
+    | 2, _, hd => simp [cmpDiscrSwitch] at hd; subst hd; decide
+    | 3, _, hd => simp [cmpDiscrSwitch] at hd; subst hd; decide
+    | _ + 4, hi, _ => simp [cmpDiscrSwitch] at hi
+  ret := by
+    intro d hd; simp [cmpDiscrSwitch] at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- Input `(x, y) = (-1, 1)`: `(-1).cmp(&1)` is `Less`, whose discriminant is
+the `i8` `-1` (byte `255`), so the `SwitchInt` (which emits the event `255`,
+the discriminant's bit pattern) takes `bb1` and returns `-10` (byte `246`). -/
+def cmpDiscrLessArgs : List Value := [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩]
+def cmpDiscrLessS0 : MachineState := initMachineState cmpDiscrSwitch cmpDiscrLessArgs
+def cmpDiscrLessMInit : Mach :=
+  machineWithCtx ctxI8_4 cmpDiscrSwitch cmpDiscrSwitchFn cmpDiscrLessS0.frame.locals
+    cmpDiscrSwitchFn.start
+
+theorem cmpDiscrLess_anneal_ret :
+    ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrLessArgs) [⟨.inr (.inl (.emit (.event 255))), PUnit.unit⟩]
+      (.normal (.scalar ⟨246, 1⟩, cmpDiscrLessS0.memory)) :=
+  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+
+theorem cmpDiscrLess_noUB : MirNoUBTree (mirCallTree cmpDiscrSwitch cmpDiscrLessArgs) :=
+  runA_noUB cmpDiscrSwitch 20 _ _ _ rfl
+
+/-- End to end, through the correspondence theorem (`mirCall_ret`): MiniRust
+returns the byte `246` as well. -/
+theorem cmpDiscrLess_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cmpDiscrLessMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 246 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret cmpDiscrSwitch_inFragment cmpDiscrSwitch_translate ctxI8_4 ctxI8_ok_cmpDiscrSwitch
+      cmpDiscrLessArgs (by decide) cmpDiscrLessMInit rfl rfl rfl cmpDiscrLess_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [cmpDiscrSwitch] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+/-- Direct computation of the same MiniRust run (the init block's `Goto`, the
+five statements of `bb0`, the `Switch`, `bb1`'s assignment, and `Return`). -/
+theorem cmpDiscrLess_minirust_direct :
+    (Interp.steps 9 cmpDiscrLessMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 246 }, [1]) := rfl
+
+/-- Input `(7, 7)`: `Equal`, discriminant `0`, `bb2`, returns `0`. -/
+def cmpDiscrEqualArgs : List Value := [.scalar ⟨7, 1⟩, .scalar ⟨7, 1⟩, .scalar ⟨1, 1⟩]
+def cmpDiscrEqualS0 : MachineState := initMachineState cmpDiscrSwitch cmpDiscrEqualArgs
+
+theorem cmpDiscrEqual_anneal_ret :
+    ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrEqualArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨0, 1⟩, cmpDiscrEqualS0.memory)) :=
+  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+
+/-- Input `(2, 1)`: `Greater`, discriminant `1`, the `otherwise` block `bb3`
+returns the discriminant itself. -/
+def cmpDiscrGreaterArgs : List Value := [.scalar ⟨2, 1⟩, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩]
+def cmpDiscrGreaterS0 : MachineState := initMachineState cmpDiscrSwitch cmpDiscrGreaterArgs
+
+theorem cmpDiscrGreater_anneal_ret :
+    ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrGreaterArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨1, 1⟩, cmpDiscrGreaterS0.memory)) :=
+  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+
+def cmpDiscrGreaterMInit : Mach :=
+  machineWithCtx ctxI8_4 cmpDiscrSwitch cmpDiscrSwitchFn cmpDiscrGreaterS0.frame.locals
+    cmpDiscrSwitchFn.start
+
+set_option maxRecDepth 8192 in
+/-- MiniRust returns the discriminant `1` (byte `1`) through the `otherwise`
+block, which reads `_5` after the `Ordering` temporary `_4` is dead. -/
+theorem cmpDiscrGreater_minirust_direct :
+    (Interp.steps 10 cmpDiscrGreaterMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
+
+/-! ## Projected `Deinit` and `Retag` outside the fragment (kernel-checked divergences)
+
+`statementOk` admits `Deinit` and `Retag` only on unprojected locals
+(`statementOk_deinit_proj`, `statementOk_retag_proj`). The two witnesses below
+compute, inside the kernel, why each projected form diverges between Anneal's
+MIR semantics and MiniRust on a fragment `Padded(u8, u32, u16)` argument, so
+that neither can be admitted without changing the state relation:
+
+* `Deinit(_1.1)`: Anneal only checks that `_1` is initialized and `_1.1`
+  readable and keeps the slot, so a later read of `_1.1` returns the old field,
+  whereas MiniRust's `Statement::Deinit` writes `Uninit` over bytes `4..8` and
+  the later read is UB.
+* `Retag(_1.1)`: Anneal's `Retag` reads `_1.1` and requires a pointer
+  (`extractDerefPtrVal?`), so it is UB on the `u32` field, whereas MiniRust's
+  `Statement::Validate` loads the `u32`, retags it as the identity
+  (`retag_val` on `Value::Int`), and stores it back. -/
+
+/-- `statementOk` rejects every projected `Deinit`. -/
+theorem statementOk_deinit_proj (decls : List LocalDecl) (i : Nat) (pe : ProjectionElem)
+    (rest : List ProjectionElem) (span : String) (layouts : LayoutTable) :
+    statementOk decls ⟨.deinit ⟨i, pe :: rest⟩, span⟩ layouts = false := rfl
+
+/-- `statementOk` rejects every projected `Retag`. -/
+theorem statementOk_retag_proj (decls : List LocalDecl) (kind : RetagKind) (i : Nat)
+    (pe : ProjectionElem) (rest : List ProjectionElem) (span : String) (layouts : LayoutTable) :
+    statementOk decls ⟨.retag kind ⟨i, pe :: rest⟩, span⟩ layouts = false := rfl
+
+/-- Anneal's `Retag` of any place that evaluates to a scalar faults. Every
+projected place of the fragment holds a scalar (a tuple/struct or `(Int, bool)`
+scalar field, an array element, or an integer pointee `*_p`), whereas MiniRust's
+`Statement::Validate` of an integer place stores back the integer it loaded
+(`retagVal_int_id`), so no projected `Retag` can be simulated in lockstep. -/
+theorem evalStmt_retag_scalar_ub (s : MachineState) (decls : List LocalDecl)
+    (layouts : LayoutTable) (k : RetagKind) (place : Place) (span : String)
+    (sc : ScalarInt) (L : List LocalSlot)
+    (h : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals decls = .ok (.scalar sc) L) :
+    evalStmt s ⟨.retag k place, span⟩ decls layouts = MirStepNode.fail .ub := by
+  simp [evalStmt, h]
+
+/-- Anneal's `Deinit` of a projected place whose root is initialized and whose
+projected value is readable keeps every slot (it steps to the next statement
+with the same `locals`), whereas MiniRust's `Statement::Deinit` overwrites the
+projected bytes with `Uninit` (`paddedDeinitRead_minirust_ub`). -/
+theorem evalStmt_deinit_proj_keeps (s : MachineState) (decls : List LocalDecl)
+    (layouts : LayoutTable) (i : Nat) (pe : ProjectionElem) (rest : List ProjectionElem)
+    (span : String) (rootVal v : Value)
+    (hs : s.frame.locals[i]? = some (.init rootVal))
+    (hr : readProjectedValue s.frame.locals rootVal (pe :: rest) = .ok v) :
+    evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
+      MirStepNode.step (advanceStmt s s.frame.locals) := by
+  simp [evalStmt, Trusted.Sequence.get?, hs, hr]
+
+/-- The ABI of a function with one `Padded(u8, u32, u16)` argument returning
+`u32`. -/
+def fnAbiPaddedOne : FnAbi :=
+  { args := [{ layout := paddedStructLayout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- The callee's `_0: u32` and `_1: Padded` live at addresses `128` and `256`. -/
+def ctxPadded2 : Ctx :=
+  { caller := callerFrame, payloads := [], base := [retAlloc], addrs := [128, 256],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+/-- MIR of
+```rust
+fn padded_deinit_read(mut s: Padded) -> u32 {
+    Deinit(s.1);   // bb0: Deinit(_1.1)
+    s.1            //      _0 = copy _1.1; return
+}
+``` -/
+def paddedDeinitRead : CapturedMir where
+  defPath := "witness::padded_deinit_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+/-- `paddedDeinitRead` without its projected `Deinit`. -/
+def paddedReadOnly : CapturedMir where
+  defPath := "witness::padded_deinit_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+/-- The fragment rejects the body because of (and only because of) its
+projected `Deinit`: the body without it is in the fragment. -/
+theorem paddedDeinitRead_not_inFragment :
+    inFragment paddedDeinitRead = false ∧
+      statementOk paddedDeinitRead.localDecls (mkStmt (.deinit (placeField 1 [(1, u32Ty)])))
+        paddedDeinitRead.layouts = false ∧
+      inFragment paddedReadOnly = true := by
+  decide
+
+/-- `minimize`'s translation, which `translateFn` still produces: the
+projected `Deinit` becomes MiniRust's `Statement::Deinit` of the field place. -/
+def paddedDeinitReadFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitRead_translate :
+    translateFn paddedDeinitRead = some paddedDeinitReadFn := rfl
+
+def paddedDeinitReadArgs : List Value := [initPaddedStruct]
+def paddedDeinitReadS0 : MachineState := initMachineState paddedDeinitRead paddedDeinitReadArgs
+def paddedDeinitReadMInit : Mach :=
+  machineWithCtx ctxPadded2 paddedDeinitRead paddedDeinitReadFn paddedDeinitReadS0.frame.locals
+    paddedDeinitReadFn.start
+
+/-- Anneal's projected `Deinit` keeps `_1` initialized: the function returns
+the old field `99` (computed by the kernel). -/
+theorem paddedDeinitRead_anneal_ret :
+    ReachesRet (mirCallTree paddedDeinitRead paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨99, 4⟩, paddedDeinitReadS0.memory)) :=
+  runA_sound paddedDeinitRead 10 _ _ _ rfl
+
+/-- MiniRust's `Deinit(_1.1)` overwrites exactly bytes `4..8` of `_1` with
+`Uninit` (keeping field `0`, field `2`, and the padding), and the following
+load of `_1.1` is UB (computed by the kernel). -/
+theorem paddedDeinitRead_minirust_ub :
+    ((Interp.steps 2 paddedDeinitReadMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Uninit, .Uninit, .Uninit, .Uninit,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] ∧
+    ∃ msg, Interp.steps 3 paddedDeinitReadMInit = .error (.ub msg) :=
+  ⟨rfl, _, rfl⟩
+
+/-- MIR of
+```rust
+fn padded_retag_read(mut s: Padded) -> u32 {
+    Retag(s.1);    // bb0: Retag(_1.1)
+    s.1            //      _0 = copy _1.1; return
+}
+``` -/
+def paddedRetagRead : CapturedMir where
+  defPath := "witness::padded_retag_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.retag .default (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem paddedRetagRead_not_inFragment :
+    inFragment paddedRetagRead = false ∧
+      statementOk paddedRetagRead.localDecls (mkStmt (.retag .default (placeField 1 [(1, u32Ty)])))
+        paddedRetagRead.layouts = false := by
+  decide
+
+def paddedRetagReadFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Validate (.Field (.Local (localName 1)) 1) false,
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedRetagRead_translate :
+    translateFn paddedRetagRead = some paddedRetagReadFn := rfl
+
+def paddedRetagReadS0 : MachineState := initMachineState paddedRetagRead paddedDeinitReadArgs
+def paddedRetagReadMInit : Mach :=
+  machineWithCtx ctxPadded2 paddedRetagRead paddedRetagReadFn paddedRetagReadS0.frame.locals
+    paddedRetagReadFn.start
+
+/-- Anneal's `Retag(_1.1)` faults: the `u32` field is not a pointer (computed
+by the kernel). -/
+theorem paddedRetagRead_anneal_ub :
+    ∃ tr u, Reaches (mirTree paddedRetagRead paddedRetagReadS0) tr u ∧ FaultNow u :=
+  faultsA_sound paddedRetagRead 2 _ (by decide)
+
+/-- MiniRust's `retag_val` is the identity on `Value::Int`
+("(Value::Int(..) | Value::Bool(..) | Value::Union(..), _) => val"), so
+`Statement::Validate` of an integer place stores back the integer it loaded. -/
+theorem retagVal_int_id (m : Mach) (fnEntry : Bool) (i : Int) (ty : Gen.Type) :
+    retagVal m fnEntry (.Int i) ty = .ok (.Int i) := by
+  simp [retagVal]
+
+/-- After `4` MiniRust steps of `paddedRetagReadFn` (the init block's `Goto`,
+`Validate(_1.1)`, the load of `_1.1`, and `Return`), the callee frame is
+popped and the caller's return place holds `99`. -/
+def paddedRetagReadMiniRustRet : Bool :=
+  match Interp.steps 4 paddedRetagReadMInit with
+  | .ok m => m.threads.map (·.stack.length) == [1] &&
+      (m.mem.memory.allocations[0]?.map (·.data)) == some (scalarBytes u32 99)
+  | .error _ => false
+
+/-- MiniRust's `Validate(_1.1)` succeeds and the function returns `99`
+(computed by the kernel; `Validate` goes through `retagVal`, which the
+elaborator does not unfold, so the check runs in the kernel). -/
+theorem paddedRetagRead_minirust_ret : paddedRetagReadMiniRustRet = true := by
+  decide +kernel
 
 end MiniRustSpec.Correspondence.Witness

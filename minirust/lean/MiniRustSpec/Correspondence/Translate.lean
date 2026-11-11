@@ -1904,6 +1904,34 @@ translation of `Ordering` is `orderingTy`. MiniRust thus computes the `i8`
 def translateCmp (l r : Gen.ValueExpr) : Gen.ValueExpr :=
   .UnOp (.Cast (.Transmute orderingTy)) (.BinOp (.Rel .Cmp) l r)
 
+/-- The translation of MIR's `Rvalue::Discriminant(_j)` on an `Ordering` local
+`_j`, given the `Load` `v` of `_j` at `orderingTy`. `minimize` lowers
+`Rvalue::Discriminant` to MiniRust's `ValueExpr::GetDiscriminant`
+(`tooling/minimize/src/rvalue.rs`):
+> "smir::Rvalue::Discriminant(place) =>
+>     ValueExpr::GetDiscriminant {
+>         place: GcCow::new(self.translate_place_smir(place, span)),
+>     },"
+which reads only the bytes that the enum's discriminator touches and returns
+the decoded discriminant at the enum's `discriminant_ty`
+(`spec/lang/step/expressions.md`):
+> "let Some(discriminant) = decode_discriminant::<M>(accessor, discriminator)? else {
+>     throw_ub!(\"ValueExpr::GetDiscriminant encountered invalid discriminant.\");
+> };
+> ret((Value::Int(discriminant), Type::Int(discriminant_ty)))"
+The executable interpretation `MiniRustSpec.Interp` does not implement
+`GetDiscriminant`, so the correspondence lowers it, for `orderingTy` only, to
+the `Load` of the place followed by `transmute::<i8>` (`build::transmute`, as
+in `translateCmp`). `orderingTy` occupies exactly its one tag byte, which its
+discriminator decodes at `i8` with the three branches `-1`, `0`, `1` (and
+`Discriminator::Invalid` otherwise, see `orderingTy`), so both the `Load` at
+`orderingTy` and `GetDiscriminant` read that one byte, raise UB unless it is
+the tag `255`, `0`, or `1`, and otherwise produce `Value::Int` of the tag read
+as an `i8` (`orderingDiscrExpr_eq_getDiscriminant` in
+`MiniRustSpec.Correspondence.MiniRustEval` checks this on every byte). -/
+def orderingDiscrExpr (v : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Cast (.Transmute (.Int IntType.I8))) v
+
 /-- `minimize`'s checked binary-operator translation for integer operands
 (`tooling/minimize/src/rvalue.rs`):
 > "smir::Rvalue::CheckedBinaryOp(op, l, r) => {
@@ -1971,7 +1999,8 @@ on integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, checked integer
 `BinaryOp`s (`AddWithOverflow | SubWithOverflow | MulWithOverflow`), `bool`
 bitwise `BinaryOp`s (`BitAnd | BitOr | BitXor` via `boolBitOp`), the comparison
 `BinaryOp`s (including the three-way `Cmp`, `translateCmp`),
-`Aggregate(Tuple | Adt | Array)`, `Len`, `Repeat`, and
+`Aggregate(Tuple | Adt | Array)`, `Len`, `Repeat`, `Discriminant` of an
+`Ordering` local (`orderingDiscrExpr`), and
 `Cast(CastKind::IntToInt)` on integers and `bool`
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
@@ -2187,6 +2216,9 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
   | .len ⟨j, []⟩ => do
     let (_, count) ← decls[j]? >>= (arrayTypeOf ·.ty)
     pure (.Constant (.Int (Int.ofNat count)) (.Int usizeIt))
+  | .discriminant ⟨j, []⟩ => do
+    let d ← decls[j]?
+    if isOrderingTy d.ty then pure (orderingDiscrExpr (.Load (.Local (localName j)))) else none
   | .cast .intToInt op castTy => do
     let intTy ← intTypeOf castTy
     let operand ← translateOperand decls op
@@ -3346,7 +3378,32 @@ def operandOkB (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
   | .constant _ => operandIsBool layouts decls op && (translateOperand decls op).isSome
   | _ => false
 
-/-- Fragment rvalues of integer type `it`. -/
+/-- Whether Anneal's `evalPlaceDiscriminant` (`Rvalue::Discriminant`) returns
+the loaded scalar unchanged for every tag (`255`, `0`, `1`) of an `Ordering`
+place of type `t`: the layout table has no entry at `t.layoutIdx` (then
+`evalPlaceDiscriminant` checks the `core::cmp::Ordering` bit pattern itself),
+or an inhabited entry whose variants are `Variants::Multiple` with either a
+`union` tag (the same fallback) or an initialized tag whose valid range
+contains the three tags. On an uninhabited entry, `Variants::Empty`, or
+`Variants::Single` (which returns the 8-byte scalar `0`), or a valid range
+excluding a tag, Anneal and MiniRust's `GetDiscriminant` (which reads the
+`i8` tag) would disagree, so those layouts are outside the fragment. -/
+def orderingDiscrLayoutOk (layouts : Layout.LayoutTable) (t : MirAst.Ty) : Bool :=
+  match Layout.LayoutTable.lookup layouts t.layoutIdx with
+  | none => true
+  | some l =>
+    !l.isUninhabited &&
+    match l.variants with
+    | .multiple (.initialized _ vr) _ _ =>
+      MirAst.ScalarInt.inRange ⟨255, 1⟩ vr && MirAst.ScalarInt.inRange ⟨0, 1⟩ vr &&
+        MirAst.ScalarInt.inRange ⟨1, 1⟩ vr
+    | .multiple (.union _) _ _ => true
+    | _ => false
+
+/-- Fragment rvalues of integer type `it`. `Discriminant(_j)` of an
+`Ordering` local `_j` has MiniRust type `Type::Int(i8)` (the `discriminant_ty`
+of `orderingTy`), so it is an `i8` rvalue (`orderingDiscrLayoutOk` keeps
+Anneal's result the loaded `i8` tag). -/
 def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOk layouts decls it op
@@ -3374,6 +3431,12 @@ def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
       -- Anneal's `evalPlaceLen` returns a `layoutPointerBytes layouts`-byte
       -- scalar, which is MiniRust's 8-byte `usize` only on a 64-bit layout table.
       decide (MirSemantics.layoutPointerBytes layouts = 8))
+  | .discriminant ⟨j, []⟩ =>
+    decide (it = IntType.I8) &&
+    decide (j < decls.length) &&
+    match decls[j]? with
+    | some d => isOrderingTy d.ty && orderingDiscrLayoutOk layouts d.ty
+    | none => false
   | _ => false
 
 /-- `RigidTy.char` (`DIFF-AB`) is outside the MiniRust translation and integer
@@ -3930,10 +3993,12 @@ def simpleOp : MirAst.Operand → Bool
   | .copy ⟨_, projs⟩ | .move ⟨_, projs⟩ => simpleProj projs
 
 /-- The operands of an rvalue in the order in which Anneal's `evalRvalue`
-evaluates them (left to right). -/
+evaluates them (left to right). `Discriminant(p)` reads `p` through
+`evalOperand (.copy p)` before `evalPlaceDiscriminant` inspects the loaded
+value, so its operand is `copy p`. -/
 def rvOperands : MirAst.Rvalue → List MirAst.Operand
   | .use op | .repeat op _ | .unaryOp _ op | .cast _ op _ => [op]
-  | .copyForDeref p | .len p => [.copy p]
+  | .copyForDeref p | .len p | .discriminant p => [.copy p]
   | .binaryOp _ a b => [a, b]
   | .aggregate _ ops => ops
   | _ => []

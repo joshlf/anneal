@@ -4271,6 +4271,7 @@ def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType)
     let srcIt := (operandIntType layouts decls op).getD u8Ty
     let x ← opBits locals op
     pure (intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat
+  | .discriminant p => opBits locals (.copy p)
   | _ => none
 
 theorem bringInBounds_eq_intFromBits (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (z : Int) :
@@ -4371,6 +4372,92 @@ theorem translateRvalue_cast_bool {layouts : Layout.LayoutTable} {decls : List L
     simp [heo, hty] at he
     exact ⟨eo, rfl, he.symm⟩
 
+/-! ### `Rvalue::Discriminant` of an `Ordering` local -/
+
+set_option maxRecDepth 8192 in
+/-- `transmute::<i8>` of the `Ordering` variant with a valid tag is that tag
+read as an `i8` (computed by the kernel for each of the three tags). -/
+theorem evalUnOp_transmute_ordering_i8 {bits : Nat} (hb : ValidBits orderingTy bits)
+    (m? : Option Mach) :
+    evalUnOp (.Cast (.Transmute (.Int IntType.I8))) (valOf orderingTy bits, orderingTy) m? =
+      .ok (.Int (intFromBits bits IntType.I8), .Int IntType.I8) := by
+  rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
+
+/-- `orderingDiscrExpr e0`, where `e0` evaluates to the `Ordering` variant with
+a valid tag, evaluates to that tag read as an `i8`. -/
+theorem evalValue_orderingDiscrExpr {m m' : Mach} {e0 : Gen.ValueExpr} {bits : Nat}
+    (hb : ValidBits orderingTy bits)
+    (h0 : evalValue m e0 = .ok ((valOf orderingTy bits, orderingTy), m')) :
+    evalValue m (orderingDiscrExpr e0) =
+      .ok ((.Int (intFromBits bits IntType.I8), .Int IntType.I8), m') := by
+  simp only [orderingDiscrExpr, evalValue, h0, ok_bind, evalUnOp_transmute_ordering_i8 hb]
+  rfl
+
+/-- `orderingDiscrExpr e0` is UB when evaluating `e0` is. -/
+theorem evalValue_orderingDiscrExpr_ub {m : Mach} {e0 : Gen.ValueExpr} {msg : String}
+    (h0 : evalValue m e0 = .error (.ub msg)) :
+    evalValue m (orderingDiscrExpr e0) = .error (.ub msg) := by
+  simp [orderingDiscrExpr, evalValue, h0]
+
+theorem translateRvalue_discriminant {layouts : Layout.LayoutTable} {decls : List LocalDecl}
+    {targetTy : Option MirAst.Ty} {j : Nat} {d : LocalDecl} {e : Gen.ValueExpr}
+    (hd : decls[j]? = some d) (hord : isOrderingTy d.ty = true)
+    (he : translateRvalue layouts decls targetTy (.discriminant ⟨j, []⟩) = some e) :
+    e = orderingDiscrExpr (.Load (.Local (localName j))) := by
+  simp [translateRvalue, hd, hord] at he
+  subst he
+  rfl
+
+/-- MiniRust's `ValueExpr::GetDiscriminant` (`spec/lang/step/expressions.md`) on
+an `orderingTy` place whose one byte is `b`: the accessor loads the tag bytes
+the discriminator asks for and `decode_discriminant` decodes them; `none` is
+`GetDiscriminant`'s UB ("ValueExpr::GetDiscriminant encountered invalid
+discriminant."). -/
+def orderingGetDiscriminant (b : Byte) : Interp (Option Int) :=
+  match orderingTy with
+  | .Enum _ _ discriminator _ _ => do
+    let accessor := fun (_ : Unit) (offset : Gen.Offset) (size : Size) => do
+      let bs ← subsliceWithLength [b] offset.bytes size.bytes
+      pure (bs, ())
+    pure (← decodeDiscriminant accessor discriminator ()).1
+  | _ => pure none
+
+/-- The lowering `orderingDiscrExpr (Load place)` on an `orderingTy` place whose
+one byte is `b`: the `Load` decodes the byte at `orderingTy` (`none` is the
+load's UB, "load at type .. but the data in memory violates the validity
+invariant"), and `transmute::<i8>` re-encodes the variant and decodes it at
+`i8`. -/
+def orderingLoweredDiscriminant (b : Byte) : Interp (Option Int) := do
+  match ← Type.decode orderingTy [b] with
+  | some v =>
+    match ← transmute v orderingTy (.Int IntType.I8) with
+    | .Int i => pure (some i)
+    | _ => pure none
+  | none => pure none
+
+/-- Whether two discriminant computations both succeed with the same result. -/
+def sameDiscriminant : Interp (Option Int) → Interp (Option Int) → Bool
+  | .ok a, .ok b => a == b
+  | _, _ => false
+
+/-- The lowering `orderingDiscrExpr` of `Rvalue::Discriminant` agrees with
+MiniRust's `GetDiscriminant` on every byte an `Ordering` local can hold in the
+fragment: the uninitialized byte and each of the 256 initialized bytes without
+provenance (both are UB, `none`, exactly off the tags `255`, `0`, `1`, and
+otherwise return the tag read as an `i8`). -/
+theorem orderingDiscrExpr_eq_getDiscriminant :
+    sameDiscriminant (orderingGetDiscriminant .Uninit) (orderingLoweredDiscriminant .Uninit) = true ∧
+    (List.range 256).all (fun n =>
+      sameDiscriminant (orderingGetDiscriminant (.Init (UInt8.ofNat n) none))
+        (orderingLoweredDiscriminant (.Init (UInt8.ofNat n) none))) = true ∧
+    orderingGetDiscriminant (.Init 255 none) = .ok (some (-1)) ∧
+    orderingGetDiscriminant (.Init 0 none) = .ok (some 0) ∧
+    orderingGetDiscriminant (.Init 1 none) = .ok (some 1) ∧
+    orderingGetDiscriminant (.Init 2 none) = .ok none ∧
+    orderingGetDiscriminant .Uninit = .ok none := by
+  refine ⟨rfl, ?_, rfl, rfl, rfl, rfl, rfl⟩
+  decide +kernel
+
 /-- Evaluating a translated fragment rvalue. -/
 theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
@@ -4412,6 +4499,27 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         subst hr
         refine ⟨hlt, m, ?_, h⟩
         simp [evalValue, evalConstant, intFromBits, usizeIt]
+  | .discriminant ⟨j, []⟩, hok, he =>
+    simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨⟨rfl, hj⟩, hjd⟩ := hok
+    cases hd : body.localDecls[j]? with
+    | none => simp [hd] at hjd
+    | some d =>
+      simp only [hd, Bool.and_eq_true] at hjd
+      obtain ⟨hord, _⟩ := hjd
+      obtain rfl := translateRvalue_discriminant hd hord he
+      have hokT : OperandOkT body.layouts body.localDecls orderingTy (.copy ⟨j, []⟩) :=
+        operandOkO_T (by
+          simp only [operandOkO, operandIsOrdering, hd, hord, Bool.and_true, decide_eq_true_eq]
+          exact hj)
+      obtain ⟨hsome, hnone⟩ := evalValue_operandT h .ordering (.copy ⟨j, []⟩) hokT
+        (.Load (.Local (localName j))) rfl
+      refine ⟨fun r hr => ?_, fun hr => ?_⟩
+      · obtain ⟨hvalid, m', hm', h'⟩ := hsome r hr
+        refine ⟨?_, m', evalValue_orderingDiscrExpr hvalid hm', h'⟩
+        rcases (validBits_ordering r).mp hvalid with rfl | rfl | rfl <;> decide
+      · obtain ⟨msg, hmsg⟩ := hnone hr
+        exact ⟨msg, evalValue_orderingDiscrExpr_ub hmsg⟩
   | .unaryOp uop op, hok, he =>
     simp only [rvalueOk, Bool.and_eq_true] at hok
     obtain ⟨huop, hok⟩ := hok

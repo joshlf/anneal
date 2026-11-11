@@ -22,11 +22,12 @@ open Anneal.Mir.PlaceAndRvalue
 namespace Anneal.Mir.AdtAndControl
 
 /-!
-# ADT Layouts, Projected `Deinit`/`Retag`/`CopyNonOverlapping`, and Multi-Block CFG Execution
+# ADT Layouts, Projected `Deinit`/`Retag`/`CopyNonOverlapping`, Multi-Block CFG Execution, and Synthetic Sub-Place Pointers
 
 This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
-(`ws-mir-lower-adt-deinit-retag-terminators`) and relates it to
-`Trusted.Rustc.V2026_06_01.MirSemantics`:
+(`ws-mir-lower-adt-deinit-retag-terminators`, and in Section 4 the synthetic sub-place pointer,
+`Deref`, and `copy_nonoverlapping` surface of `ws-mir-lower-deref-subplace-and-minirust-adt-deinit`)
+and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
 
 1. **Section 1 — `ScalarValidRange` niches, ADT layouts, `OffsetOf`, and `Discriminant`**
    (`crates/anneal-mir/src/ir.rs`, `rvalue.rs`):
@@ -162,6 +163,58 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      (`evalLoweredTerminator_drop_projected_init_refines`), and a projected `Drop` below an
      uninitialized local is a documented divergence
      (`evalLoweredTerminator_drop_projected_uninit_divergence`).
+
+4. **Section 4 — Synthetic sub-place pointers, `ProjectionElem.deref` places, and sub-place
+   `CopyNonOverlapping`** (`ws-mir-lower-deref-subplace-and-minirust-adt-deinit` Episode 1,
+   `rvalue.rs:8789-11129`):
+   - `localBaseAddr` (`local_base_addr_for_decls`): the legacy `(local + 1) * 0x1000` whenever
+     the preceding locals fit in a page (`localBaseAddr_small`), page-rounded strides and
+     over-alignment for larger locals, failing closed without masking (`localBaseAddr_fits`,
+     `localBaseAddr_example_overflow_none`), collision-free allocations of distinct locals
+     (`localBaseAddr_disjoint`, `localBaseAddr_example_two_page_local`), and alignment
+     (`localBaseAddr_page_dvd`, `localBaseAddr_align_dvd`, `localBaseAddr_aligned`).
+   - Layout-offset sub-places (`subplaceAt`, `computeSubplaceByteOffset`: `Field`, forward
+     `ConstantIndex`, `Downcast`) that stay inside their container and are disjoint for distinct
+     siblings (`subplaceAt_sub`, `subplaceAt_disjoint_siblings`) and agree with Section 2e's
+     `pathRange` (`subplaceAt_of_pathRange`); synthetic borrows `&_l.proj` / `&raw _l.proj`
+     (`evalSubplaceRef`, `evalSubplaceRef_inbounds`, `evalSubplaceRef_disjoint_locals`,
+     `evalSubplaceRef_disjoint_siblings`, `evalSubplaceRef_dead`); and reborrows
+     `&((*p).tail)` / `&raw ((*p).tail)` (`evalReborrowTail`: alignment and liveness for
+     references, address-only raw reborrows valid at offset `0` on null, dangling, or
+     provenance-free pointers: `evalReborrowTail_raw_null_zero`, `evalReborrowTail_raw_dangling`,
+     `evalReborrowTail_ref_null`, `evalReborrowTail_ref_misaligned`, `evalReborrowTail_ref_dead`).
+   - No-guess resolution `resolveSyntheticSubplace` (`resolve_synthetic_subplace_in` /
+     `select_subplace_candidate_in`): fault characterizations (`resolveSyntheticSubplace_null`,
+     `_misaligned`, `_rangeOverflow`, `_dead`, `_no_provenance`), soundness
+     (`resolveSyntheticSubplace_sound`), no guessing (`selectSubplaceCandidate_no_guess`,
+     `selectSubplaceCandidate_ambiguous_none`), the borrow/`Deref` round trip
+     (`resolveSyntheticSubplace_evalSubplaceRef`), and stability under writes
+     (`resolveSyntheticSubplace_stable`).
+   - `Deref` places (`derefTarget`, `resolvePlace`): `evalDerefPlaceRead`, `evalDerefPlaceWrite`
+     (`PartialShell` field initialization and sibling preservation through `writePlaceState`),
+     `evalDerefPlaceDeinit`, `evalDerefOperand` (Move-Deref Non-Deinit:
+     `evalDerefOperand_move_deref`, `evalDerefOperand_move_deref_slots`), `evalRetagDerefPlace`
+     and dangling sub-place references (`retag_subplace_ref_dead_local`), with Get-Put, Put-Get,
+     and frame laws (`writePlaceState_get_put_init`, `writePlaceState_put_get_init`,
+     `evalDerefPlaceWrite_get_put`, `evalDerefPlaceWrite_put_get`, `evalDerefPlaceWrite_frame`,
+     `evalDerefPlaceWrite_read_sibling`, `evalDerefPlaceDeinit_target`) and step refinement of
+     Trusted (`evalDerefPlaceRead_refines_evalOperand`, `evalDerefPlaceRead_refines_evalRvalue`,
+     `evalDerefPlaceWrite_refines_writePlaceValue`, `evalStmt_assign_deref_refines`).
+   - Sub-place and array-window `CopyNonOverlapping` (`evalCopyNonOverlappingSubplace`,
+     `readSubplaceSlot`, `writeSubplaceSlot`): Read-After-Copy
+     (`evalCopyNonOverlappingSubplace_read_after_copy`), Disjoint-Frame for every copy shape
+     (`evalCopyNonOverlappingSubplace_frame`, `writeSubplaceSlot_frame`), self-overlap rejection
+     (`evalCopyNonOverlappingSubplace_overlap_none`), dead-provenance faults and zero-byte bulk
+     no-ops (`evalCopyNonOverlappingSubplace_dead_none`,
+     `evalCopyNonOverlappingSubplace_zst_bulk_noop`), `[T; 1]` deinitialization and fail-closed
+     uninitialized element writes (`writeSubplaceSlot_uninit_unit_array`,
+     `writeSubplaceSlot_uninit_elem_init_array_none`), and refinement of Trusted's
+     `evalCopySingleDirect` and `evalStmt` (`evalCopyNonOverlappingSubplace_refines`,
+     `evalStmt_copyNonOverlapping_singleDirect`, `evalStmt_copyNonOverlapping_subplace_refines`).
+   - A concrete frame `(u32, u32)` + `*mut u32` exercising the whole pipeline (`witnessCtx_wf`,
+     `witness_borrow`, `witness_resolve`, `witness_deref_read`, `witness_deref_write_put_get`,
+     `witness_bases`), and the same frame under Trusted's pointer representation discharging
+     every hypothesis of the `Deref` refinement (`witnessCtxT_wf`, `witness_trusted_deref_read`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -9583,5 +9636,3040 @@ theorem stepMirFn_deinit_projected_trustedRun {env : CfgEnv} {cm : CapturedMir} 
     List.getElem?_cons_zero]
   rw [hStmt]
   simp only [advanceStmt, hCorr.block, hCorr.stmt]
+
+/-! ## Section 4: Synthetic Sub-Place Pointers, `Deref` Places, and Sub-Place `CopyNonOverlapping`
+-/
+
+/-! ### Section 4a: Collision-free synthetic allocation bases (`local_base_addr_for_decls`) -/
+
+/-- The synthetic stack page (`PAGE = 0x1000` in `local_base_addr_for_decls`). Irreducible, so that
+symbolic page multiples `n * synthPage` are never unfolded into unary `Nat.mul` recursions. -/
+@[irreducible] def synthPage : Nat := 0x1000
+
+theorem synthPage_eq : synthPage = 4096 := by unfold synthPage; rfl
+
+/-- `alloc_size_and_align` of every declared local of a frame: `some (size, align)`, or `none`
+when the layout model rejects the declared type (`Err(_)`, which strides one page). -/
+abbrev AllocLayouts : Type := List (Option (Nat × Nat))
+
+/-- One step of the base scan over a preceding local (`local_base_addr_for_decls`): align the
+cursor to `max(align, PAGE)` and advance by the page-rounded allocation size (at least one
+page, `size.max(1).div_ceil(PAGE) * PAGE`); a layout error advances by one page. -/
+def baseScanStep (cur : Nat) : Option (Nat × Nat) → Nat
+  | some (size, align) =>
+    PlaceAndRvalue.alignUp cur (max align synthPage) + PlaceAndRvalue.alignUp (max size 1) synthPage
+  | none => cur + synthPage
+
+/-- The cursor after scanning the preceding locals `ls` from `cur`, failing closed as soon as it
+exceeds `limit` (`cur > limit ⇒ UnsupportedMemoryAccess`, never a masked address). -/
+def baseScan (limit : Nat) : Nat → AllocLayouts → Option Nat
+  | cur, [] => some cur
+  | cur, x :: xs => if limit < baseScanStep cur x then none else baseScan limit (baseScanStep cur x) xs
+
+/-- The layout of local `l` (`local_decls.get(l).and_then(|t| t.alloc_size_and_align().ok())`). -/
+def ownLayout (lays : AllocLayouts) (l : Nat) : Option (Nat × Nat) := (lays[l]?).join
+
+/-- The allocation size of local `l` (`0` without a layout). -/
+def ownAllocSize (lays : AllocLayouts) (l : Nat) : Nat := ((ownLayout lays l).map Prod.fst).getD 0
+
+/-- The cursor aligned to local `l`'s own alignment when that exceeds a page
+(`if align > PAGE { cur = cur.div_ceil(align) * align }`). -/
+def ownAlignedCursor (lays : AllocLayouts) (l cur : Nat) : Nat :=
+  match ownLayout lays l with
+  | some (_, align) => if synthPage < align then PlaceAndRvalue.alignUp cur align else cur
+  | none => cur
+
+/-- **`local_base_addr_for_decls`**: the synthetic base address of local `l` in a frame whose
+declared locals have the allocation layouts `lays`, on a target whose largest address is
+`limit` (`ptr_width.max_usize()`):
+1. scan the `min(l, lays.length)` preceding locals from `PAGE` (`baseScan`), failing as soon as
+   the cursor exceeds `limit`;
+2. align to the local's own alignment when it exceeds a page (`ownAlignedCursor`);
+3. a local beyond the declarations advances one page per missing declaration;
+4. fail closed (`none`, `UnsupportedMemoryAccess`) unless the whole allocation
+   `[base, base + size)` fits below `limit`. -/
+def localBaseAddr (lays : AllocLayouts) (l limit : Nat) : Option Nat :=
+  match baseScan limit synthPage (lays.take l) with
+  | none => none
+  | some cur =>
+    if limit < ownAlignedCursor lays l cur + (l - lays.length) * synthPage + ownAllocSize lays l then
+      none
+    else some (ownAlignedCursor lays l cur + (l - lays.length) * synthPage)
+
+theorem synthPage_pos : 0 < synthPage := by rw [synthPage_eq]; decide
+
+/-- Characterization of a successful `localBaseAddr`. -/
+theorem localBaseAddr_eq_some {lays : AllocLayouts} {l limit b : Nat} :
+    localBaseAddr lays l limit = some b ↔
+      ∃ cur, baseScan limit synthPage (lays.take l) = some cur ∧
+        b = ownAlignedCursor lays l cur + (l - lays.length) * synthPage ∧
+        b + ownAllocSize lays l ≤ limit := by
+  unfold localBaseAddr
+  cases hS : baseScan limit synthPage (lays.take l) with
+  | none => simp
+  | some cur =>
+    by_cases hc : limit < ownAlignedCursor lays l cur + (l - lays.length) * synthPage +
+        ownAllocSize lays l
+    · simp only [hc, ↓reduceIte, reduceCtorEq, false_iff, not_exists, not_and, Option.some.injEq]
+      intro c hc' hb
+      subst hc'
+      omega
+    · simp only [hc, ↓reduceIte, Option.some.injEq]
+      constructor
+      · intro h
+        exact ⟨cur, rfl, h.symm, by omega⟩
+      · rintro ⟨c, hc', hb, _⟩
+        cases hc'
+        exact hb.symm
+
+/-- The aligned cursor is at least the cursor. -/
+theorem le_ownAlignedCursor (lays : AllocLayouts) (l cur : Nat) : cur ≤ ownAlignedCursor lays l cur := by
+  unfold ownAlignedCursor
+  split
+  · split
+    · exact alignUp_ge _ _
+    · exact Nat.le_refl _
+  · exact Nat.le_refl _
+
+/-- A positive value rounds up to at least the alignment. -/
+theorem alignUp_ge_align {x a : Nat} (hx : 0 < x) (ha : 0 < a) : a ≤ PlaceAndRvalue.alignUp x a := by
+  have hDvd := alignUp_dvd x a ha
+  have hGe := alignUp_ge x a
+  exact Nat.le_of_dvd (by omega) hDvd
+
+/-- A size of at most one page (and at least one byte) rounds up to exactly one page. -/
+theorem alignUp_page_of_le {x : Nat} (h1 : 1 ≤ x) (h2 : x ≤ synthPage) :
+    PlaceAndRvalue.alignUp x synthPage = synthPage := by
+  rw [synthPage_eq] at *
+  unfold PlaceAndRvalue.alignUp roundUpToAlign
+  cases hB : Nat.beq (Nat.mod x 4096) 0 with
+  | true =>
+    have hM : x % 4096 = 0 := Nat.eq_of_beq_eq_true hB
+    show x = 4096
+    omega
+  | false =>
+    have hM : x % 4096 ≠ 0 := Nat.ne_of_beq_eq_false hB
+    show x + (4096 - x % 4096) = 4096
+    omega
+
+/-- Every scan step advances the cursor by at least one page. -/
+theorem baseScanStep_ge (cur : Nat) (x : Option (Nat × Nat)) : cur + synthPage ≤ baseScanStep cur x := by
+  cases x with
+  | none => exact Nat.le_refl _
+  | some p =>
+    obtain ⟨s, a⟩ := p
+    have h1 := alignUp_ge cur (max a synthPage)
+    have h2 := alignUp_ge_align (x := max s 1) (a := synthPage) (by omega) synthPage_pos
+    simp only [baseScanStep]
+    omega
+
+/-- The scan of a concatenation is the scan of the suffix from the scan of the prefix. -/
+theorem baseScan_append (limit : Nat) :
+    ∀ (cur : Nat) (xs ys : AllocLayouts),
+      baseScan limit cur (xs ++ ys) = (baseScan limit cur xs).bind (fun c => baseScan limit c ys)
+  | cur, [], ys => rfl
+  | cur, x :: xs, ys => by
+    simp only [List.cons_append, baseScan]
+    split
+    · rfl
+    · exact baseScan_append limit _ xs ys
+
+/-- The scan never moves the cursor backwards. -/
+theorem baseScan_ge {limit : Nat} :
+    ∀ {cur cur' : Nat} {xs : AllocLayouts}, baseScan limit cur xs = some cur' → cur ≤ cur'
+  | cur, cur', [], h => by simp only [baseScan, Option.some.injEq] at h; omega
+  | cur, cur', x :: xs, h => by
+    simp only [baseScan] at h
+    split at h
+    · nomatch h
+    · have := baseScan_ge h
+      have := baseScanStep_ge cur x
+      omega
+
+/-- **No masking (`localBaseAddr_fits`)**: a successful base address leaves room for the whole
+synthetic allocation of the local below `limit`. -/
+theorem localBaseAddr_fits {lays : AllocLayouts} {l limit b : Nat}
+    (h : localBaseAddr lays l limit = some b) : b + ownAllocSize lays l ≤ limit := by
+  obtain ⟨_, _, _, hFit⟩ := localBaseAddr_eq_some.mp h
+  exact hFit
+
+/-- Splitting a prefix of a list at an inner index. -/
+theorem take_split_getElem {α : Type} :
+    ∀ (l : List α) (i j : Nat) (_ : i < j) (hil : i < l.length),
+      l.take j = l.take i ++ l[i] :: (l.drop (i + 1)).take (j - i - 1)
+  | [], _, _, _, hil => absurd hil (by simp)
+  | _ :: _, _, 0, hij, _ => absurd hij (by omega)
+  | x :: xs, 0, j + 1, _, _ => by simp
+  | x :: xs, i + 1, j + 1, hij, hil => by
+    have ih := take_split_getElem xs i j (by omega) (by simpa using hil)
+    simp only [List.take_succ_cons, List.getElem_cons_succ, List.drop_succ_cons, List.cons_append]
+    rw [ih, show j + 1 - (i + 1) - 1 = j - i - 1 by omega]
+
+/-- **Collision-free synthetic allocations (`localBaseAddr_disjoint`)**: the synthetic
+allocations `[base, base + size)` of two distinct locals never overlap — every earlier local's
+allocation ends at or before a later local's base address, and distinct locals (even
+zero-sized ones) have distinct base addresses. -/
+theorem localBaseAddr_disjoint {lays : AllocLayouts} {i j limit bi bj : Nat} (hij : i < j)
+    (hi : localBaseAddr lays i limit = some bi) (hj : localBaseAddr lays j limit = some bj) :
+    bi + ownAllocSize lays i ≤ bj ∧ bi < bj := by
+  obtain ⟨ci, hci, hbi, _⟩ := localBaseAddr_eq_some.mp hi
+  obtain ⟨cj, hcj, hbj, _⟩ := localBaseAddr_eq_some.mp hj
+  have hCj : cj ≤ bj := by have := le_ownAlignedCursor lays j cj; omega
+  by_cases hil : i < lays.length
+  · -- `lays.take j = lays.take i ++ lays[i] :: rest`: the scan for `j` passes over `i`
+    rw [take_split_getElem lays i j hij hil, baseScan_append, hci] at hcj
+    simp only [Option.bind_some, baseScan] at hcj
+    split at hcj
+    · nomatch hcj
+    · have hStepLe := baseScan_ge hcj
+      have hOwn : ownLayout lays i = lays[i] := by
+        simp [ownLayout, List.getElem?_eq_getElem hil]
+      rw [show i - lays.length = 0 by omega, Nat.zero_mul, Nat.add_zero] at hbi
+      subst hbi
+      unfold ownAllocSize ownAlignedCursor
+      rw [hOwn]
+      cases hx : lays[i] with
+      | none =>
+        rw [hx] at hStepLe
+        simp only [baseScanStep] at hStepLe
+        simp only [Option.map_none, Option.getD_none]
+        have := synthPage_pos
+        omega
+      | some p =>
+        obtain ⟨s, a⟩ := p
+        rw [hx] at hStepLe
+        simp only [baseScanStep] at hStepLe
+        simp only [Option.map_some, Option.getD_some]
+        have hSz := alignUp_ge (max s 1) synthPage
+        have hSzPos := alignUp_ge_align (x := max s 1) (a := synthPage) (by omega) synthPage_pos
+        split
+        · rename_i hBig
+          rw [show max a synthPage = a by omega] at hStepLe
+          omega
+        · have := alignUp_ge ci (max a synthPage)
+          omega
+  · -- both locals lie beyond the declarations
+    have hTi : lays.take i = lays := List.take_of_length_le (by omega)
+    have hTj : lays.take j = lays := List.take_of_length_le (by omega)
+    rw [hTi] at hci
+    rw [hTj, hci] at hcj
+    cases hcj
+    have hNi : ownLayout lays i = none := by
+      simp [ownLayout, List.getElem?_eq_none (by omega : lays.length ≤ i)]
+    have hNj : ownLayout lays j = none := by
+      simp [ownLayout, List.getElem?_eq_none (by omega : lays.length ≤ j)]
+    simp only [ownAlignedCursor, hNi, hNj] at hbi hbj
+    simp only [ownAllocSize, hNi, Option.map_none, Option.getD_none]
+    have : (i - lays.length) * synthPage + synthPage ≤ (j - lays.length) * synthPage := by
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right _ (by omega)
+    have := synthPage_pos
+    omega
+
+/-- Scanning locals that each fit in one page advances the cursor by exactly one page per local. -/
+theorem baseScan_small {limit : Nat} :
+    ∀ (n : Nat) (xs : AllocLayouts),
+      (∀ x ∈ xs, ∀ s a, x = some (s, a) → s ≤ synthPage ∧ a ≤ synthPage) →
+      (n + 1 + xs.length) * synthPage ≤ limit →
+      baseScan limit ((n + 1) * synthPage) xs = some ((n + 1 + xs.length) * synthPage)
+  | n, [], _, _ => rfl
+  | n, x :: xs, hS, hL => by
+    have hStep : baseScanStep ((n + 1) * synthPage) x = (n + 1 + 1) * synthPage := by
+      rw [Nat.add_one_mul (n + 1)]
+      cases x with
+      | none => rfl
+      | some p =>
+        obtain ⟨s, a⟩ := p
+        obtain ⟨hs, ha⟩ := hS (some (s, a)) (List.mem_cons_self ..) s a rfl
+        have hP := synthPage_pos
+        have hM : max a synthPage = synthPage := by omega
+        have hA1 : PlaceAndRvalue.alignUp ((n + 1) * synthPage) synthPage = (n + 1) * synthPage :=
+          alignUp_eq_self_of_mod_zero (Nat.mul_mod_left (n + 1) synthPage)
+        have hA2 : PlaceAndRvalue.alignUp (max s 1) synthPage = synthPage :=
+          alignUp_page_of_le (by omega) (by omega)
+        show PlaceAndRvalue.alignUp ((n + 1) * synthPage) (max a synthPage) +
+          PlaceAndRvalue.alignUp (max s 1) synthPage = (n + 1) * synthPage + synthPage
+        rw [hM, hA1, hA2]
+    have hLen : (x :: xs).length = xs.length + 1 := rfl
+    rw [hLen, show n + 1 + (xs.length + 1) = n + 1 + 1 + xs.length by omega] at hL
+    have ih := baseScan_small (n + 1) xs (fun y hy => hS y (List.mem_cons_of_mem _ hy)) hL
+    have hLe : (n + 1 + 1) * synthPage ≤ (n + 1 + 1 + xs.length) * synthPage :=
+      Nat.mul_le_mul_right _ (by omega)
+    simp only [baseScan, hStep]
+    have hNot : ¬ limit < (n + 1 + 1) * synthPage := by omega
+    simp only [hNot, ↓reduceIte]
+    rw [ih, hLen, show n + 1 + (xs.length + 1) = n + 1 + 1 + xs.length by omega]
+
+/-- **Page-per-local layout (`localBaseAddr_small`)**: when every preceding local fits in one page
+(size and alignment at most `0x1000`, or a layout error) and the local's own alignment is at most
+a page, the synthetic base address is the legacy `(local + 1) * 0x1000`. -/
+theorem localBaseAddr_small {lays : AllocLayouts} {l limit : Nat}
+    (hSmall : ∀ x ∈ lays.take l, ∀ s a, x = some (s, a) → s ≤ synthPage ∧ a ≤ synthPage)
+    (hOwn : ∀ s a, ownLayout lays l = some (s, a) → a ≤ synthPage)
+    (hFit : (l + 1) * synthPage + ownAllocSize lays l ≤ limit) :
+    localBaseAddr lays l limit = some ((l + 1) * synthPage) := by
+  have hLen : (lays.take l).length = min l lays.length := List.length_take ..
+  have hMul : (0 + 1 + (lays.take l).length) * synthPage ≤ (l + 1) * synthPage :=
+    Nat.mul_le_mul_right _ (by rw [hLen]; omega)
+  have hScan := baseScan_small (limit := limit) 0 (lays.take l) hSmall (by omega)
+  rw [Nat.zero_add, Nat.one_mul] at hScan
+  have hCur : ownAlignedCursor lays l ((1 + (lays.take l).length) * synthPage) =
+      (1 + (lays.take l).length) * synthPage := by
+    unfold ownAlignedCursor
+    cases hO : ownLayout lays l with
+    | none => rfl
+    | some p =>
+      obtain ⟨s, a⟩ := p
+      have := hOwn s a hO
+      have hNot : ¬ synthPage < a := by omega
+      simp only [hNot, ↓reduceIte]
+  have hEq : (1 + (lays.take l).length) * synthPage + (l - lays.length) * synthPage =
+      (l + 1) * synthPage := by
+    rw [← Nat.add_mul, hLen]
+    congr 1
+    omega
+  refine localBaseAddr_eq_some.mpr ⟨_, hScan, ?_, ?_⟩
+  · rw [hCur, hEq]
+  · exact hFit
+
+/-- Alignments the scan keeps page-aligned: at most a page (powers of two dividing `0x1000`), or a
+multiple of a page. -/
+def PageCompatAlign (a : Nat) : Prop := a ≤ synthPage ∨ synthPage ∣ a
+
+theorem dvd_max_page {a : Nat} (h : PageCompatAlign a) : synthPage ∣ max a synthPage := by
+  rcases h with h | h
+  · rw [show max a synthPage = synthPage by omega]
+    exact Nat.dvd_refl _
+  · by_cases ha : synthPage ≤ a
+    · rw [show max a synthPage = a by omega]
+      exact h
+    · rw [show max a synthPage = synthPage by omega]
+      exact Nat.dvd_refl _
+
+/-- The scan keeps a page-aligned cursor page-aligned. -/
+theorem baseScan_page_dvd {limit : Nat} :
+    ∀ {cur cur' : Nat} {xs : AllocLayouts},
+      (∀ x ∈ xs, ∀ s a, x = some (s, a) → PageCompatAlign a) →
+      synthPage ∣ cur → baseScan limit cur xs = some cur' → synthPage ∣ cur'
+  | cur, cur', [], _, hc, h => by
+    simp only [baseScan, Option.some.injEq] at h
+    subst h
+    exact hc
+  | cur, cur', x :: xs, hA, hc, h => by
+    simp only [baseScan] at h
+    split at h
+    · nomatch h
+    · refine baseScan_page_dvd (fun y hy => hA y (List.mem_cons_of_mem _ hy)) ?_ h
+      cases x with
+      | none => exact Nat.dvd_add hc (Nat.dvd_refl _)
+      | some p =>
+        obtain ⟨s, a⟩ := p
+        have hPC := hA (some (s, a)) (List.mem_cons_self ..) s a rfl
+        have hMaxPos : 0 < max a synthPage := by have := synthPage_pos; omega
+        simp only [baseScanStep]
+        exact Nat.dvd_add (Nat.dvd_trans (dvd_max_page hPC) (alignUp_dvd _ _ hMaxPos))
+          (alignUp_dvd _ _ synthPage_pos)
+
+/-- **Page-aligned bases (`localBaseAddr_page_dvd`)**: with page-compatible alignments (every
+power of two is), every synthetic base address is a multiple of `0x1000`. -/
+theorem localBaseAddr_page_dvd {lays : AllocLayouts} {l limit b : Nat}
+    (hPre : ∀ x ∈ lays.take l, ∀ s a, x = some (s, a) → PageCompatAlign a)
+    (hOwn : ∀ s a, ownLayout lays l = some (s, a) → PageCompatAlign a)
+    (h : localBaseAddr lays l limit = some b) : synthPage ∣ b := by
+  obtain ⟨cur, hScan, hb, _⟩ := localBaseAddr_eq_some.mp h
+  have hCur := baseScan_page_dvd hPre (Nat.dvd_refl _) hScan
+  subst hb
+  refine Nat.dvd_add ?_ (Nat.dvd_mul_left _ _)
+  unfold ownAlignedCursor
+  split
+  · rename_i s a hO
+    split
+    · rename_i hBig
+      rcases hOwn s a hO with hPC | hPC
+      · omega
+      · exact Nat.dvd_trans hPC (alignUp_dvd _ _ (by omega))
+    · exact hCur
+  · exact hCur
+
+/-- **Over-aligned locals (`localBaseAddr_align_dvd`)**: a local whose alignment exceeds a page is
+placed at a multiple of its alignment (unconditionally). -/
+theorem localBaseAddr_align_dvd {lays : AllocLayouts} {l limit b s a : Nat}
+    (hOwn : ownLayout lays l = some (s, a)) (hBig : synthPage < a)
+    (h : localBaseAddr lays l limit = some b) : a ∣ b := by
+  have hl : l < lays.length := by
+    rcases Nat.lt_or_ge l lays.length with hl | hl
+    · exact hl
+    · simp [ownLayout, List.getElem?_eq_none hl] at hOwn
+  obtain ⟨cur, _, hb, _⟩ := localBaseAddr_eq_some.mp h
+  subst hb
+  rw [show l - lays.length = 0 by omega, Nat.zero_mul, Nat.add_zero]
+  unfold ownAlignedCursor
+  rw [hOwn]
+  simp only [hBig, ↓reduceIte]
+  exact alignUp_dvd _ _ (by omega)
+
+/-- **A base is aligned for its own (page-compatible) alignment**: an alignment dividing the page
+divides every page-aligned base, and a larger one is honored explicitly. -/
+theorem localBaseAddr_aligned {lays : AllocLayouts} {l limit b s a : Nat}
+    (hPre : ∀ x ∈ lays.take l, ∀ s a, x = some (s, a) → PageCompatAlign a)
+    (hOwn : ownLayout lays l = some (s, a)) (hA : a ∣ synthPage ∨ synthPage < a)
+    (h : localBaseAddr lays l limit = some b) : a ∣ b := by
+  rcases hA with hA | hA
+  · have hPC : PageCompatAlign a := Or.inl (Nat.le_of_dvd synthPage_pos hA)
+    exact Nat.dvd_trans hA (localBaseAddr_page_dvd hPre (fun s' a' h' => by
+      rw [hOwn] at h'; cases h'; exact hPC) h)
+  · exact localBaseAddr_align_dvd hOwn hA h
+
+/-- **Concrete collision-freedom witness**: in a frame `[u32, [u8; 8192], u8]` the two-page local
+`_1` lives at `0x2000` and `_2` at `0x4000`, past `_1`'s allocation `[0x2000, 0x4000)`; the legacy
+`(local + 1) * 0x1000` scheme would have put `_2` at `0x3000`, inside `_1`. -/
+theorem localBaseAddr_example_two_page_local :
+    localBaseAddr [some (4, 4), some (8192, 1), some (1, 1)] 0 (2 ^ 64 - 1) = some 0x1000 ∧
+    localBaseAddr [some (4, 4), some (8192, 1), some (1, 1)] 1 (2 ^ 64 - 1) = some 0x2000 ∧
+    localBaseAddr [some (4, 4), some (8192, 1), some (1, 1)] 2 (2 ^ 64 - 1) = some 0x4000 ∧
+    0x2000 < (2 + 1) * synthPage + 1 ∧ (2 + 1) * synthPage < 0x2000 + 8192 := by
+  with_unfolding_all decide
+
+/-- **Fail closed without masking**: an allocation that does not fit the address space has no
+synthetic base address (`UnsupportedMemoryAccess`), instead of a wrapped one. -/
+theorem localBaseAddr_example_overflow_none :
+    localBaseAddr [some (2 ^ 64, 1)] 0 (2 ^ 64 - 1) = none ∧
+    localBaseAddr [some (2 ^ 63, 1), some (2 ^ 63, 1)] 1 (2 ^ 64 - 1) = none := by
+  with_unfolding_all decide
+
+/-! ### Section 4b: Layout-offset sub-place ranges and synthetic sub-place borrows -/
+
+/-- The sub-layout and absolute byte offset reached by a projection inside a layout rooted at
+`base` (`compute_subplace_offset_and_tag`'s offset): `Field` selects a struct/tuple/variant field,
+a forward `ConstantIndex` selects an array element (an array of `n` elements is laid out as a
+`ByteLayout.struct` of its elements), and `Downcast` keeps the offset (the variant's fields are
+laid out in the enum's layout tree); `Deref`, `Index`, `Subslice`, and backward `ConstantIndex`
+have no static synthetic offset. -/
+def subplaceAt : ByteLayout → Nat → List ProjectionElem → Option (ByteLayout × Nat)
+  | lay, base, [] => some (lay, base)
+  | lay, base, .downcast _ _ :: rest => subplaceAt lay base rest
+  | .struct _ offs ls, base, .field f _ :: rest =>
+    match offs[f]?, ls[f]? with
+    | some o, some l => subplaceAt l (base + o) rest
+    | _, _ => none
+  | .struct _ offs ls, base, .constantIndex k _ false :: rest =>
+    match offs[k]?, ls[k]? with
+    | some o, some l => subplaceAt l (base + o) rest
+    | _, _ => none
+  | _, _, _ :: _ => none
+
+/-- **`computeSubplaceByteOffset`**: the byte range `(offset, size)` of the sub-place `proj` inside
+a local of byte layout `lay`. -/
+def computeSubplaceByteOffset (lay : ByteLayout) (proj : List ProjectionElem) : Option (Nat × Nat) :=
+  (subplaceAt lay 0 proj).map fun r => (r.2, r.1.size)
+
+/-- A sub-place lies inside its container, and its sub-layout is well formed. -/
+theorem subplaceAt_sub :
+    ∀ {lay : ByteLayout} {base : Nat} {p : List ProjectionElem} {l : ByteLayout} {o : Nat},
+      lay.WF → subplaceAt lay base p = some (l, o) → l.WF ∧ base ≤ o ∧ o + l.size ≤ base + lay.size
+  | lay, base, [], l, o, hWF, h => by
+    simp only [subplaceAt, Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    exact ⟨hWF, Nat.le_refl _, Nat.le_refl _⟩
+  | lay, base, .downcast _ _ :: rest, l, o, hWF, h => by
+    simp only [subplaceAt] at h
+    exact subplaceAt_sub hWF h
+  | .leaf _, _, .field _ _ :: _, _, _, _, h => by simp [subplaceAt] at h
+  | .leaf _, _, .constantIndex _ _ _ :: _, _, _, _, h => by simp [subplaceAt] at h
+  | .struct n offs ls, base, .field f _ :: rest, l, o, hWF, h => by
+    simp only [subplaceAt] at h
+    split at h
+    · rename_i o' l' ho hl
+      cases hWF with
+      | struct _ _ _ hLen hFit hDisj hChildren =>
+        have ih := subplaceAt_sub (hChildren f l' hl) h
+        have := hFit f o' l' ho hl
+        have hn : (ByteLayout.struct n offs ls).size = n := rfl
+        rw [hn]
+        exact ⟨ih.1, by omega, by omega⟩
+    · nomatch h
+  | .struct n offs ls, base, .constantIndex k _ fromEnd :: rest, l, o, hWF, h => by
+    cases fromEnd with
+    | true => simp [subplaceAt] at h
+    | false =>
+      simp only [subplaceAt] at h
+      split at h
+      · rename_i o' l' ho hl
+        cases hWF with
+        | struct _ _ _ hLen hFit hDisj hChildren =>
+          have ih := subplaceAt_sub (hChildren k l' hl) h
+          have := hFit k o' l' ho hl
+          have hn : (ByteLayout.struct n offs ls).size = n := rfl
+          rw [hn]
+          exact ⟨ih.1, by omega, by omega⟩
+      · nomatch h
+  | _, _, .deref :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .index _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .subslice _ _ _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .opaqueCast _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .unwrapUnsafeBinder _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+
+/-- A projection step that selects child `i` of a struct/tuple/array layout: `Field(i)` or a
+forward `ConstantIndex(i)`. -/
+def SelectsChild (e : ProjectionElem) (i : Nat) : Prop :=
+  (∃ ty, e = .field i ty) ∨ (∃ m, e = .constantIndex i m false)
+
+/-- One child-selecting step from a struct layout. -/
+theorem subplaceAt_struct_child {n : Nat} {offs : List Nat} {ls : List ByteLayout} {base : Nat}
+    {e : ProjectionElem} {i : Nat} (he : SelectsChild e i) {r : List ProjectionElem}
+    {l : ByteLayout} {o : Nat} (h : subplaceAt (.struct n offs ls) base (e :: r) = some (l, o)) :
+    ∃ oi li, offs[i]? = some oi ∧ ls[i]? = some li ∧ subplaceAt li (base + oi) r = some (l, o) := by
+  rcases he with ⟨ty, rfl⟩ | ⟨m, rfl⟩
+  all_goals
+    simp only [subplaceAt] at h
+    split at h
+    · rename_i oi li ho hl
+      exact ⟨oi, li, ho, hl, h⟩
+    · nomatch h
+
+/-- Extending a resolved sub-place resolves the extension inside its sub-layout. -/
+theorem subplaceAt_append :
+    ∀ {lay : ByteLayout} {base : Nat} {p : List ProjectionElem} {l : ByteLayout} {o : Nat}
+      (q : List ProjectionElem),
+      subplaceAt lay base p = some (l, o) → subplaceAt lay base (p ++ q) = subplaceAt l o q
+  | lay, base, [], l, o, q, h => by
+    simp only [subplaceAt, Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    rfl
+  | lay, base, .downcast _ _ :: rest, l, o, q, h => by
+    simp only [subplaceAt] at h
+    simp only [List.cons_append, subplaceAt]
+    exact subplaceAt_append q h
+  | .leaf _, _, .field _ _ :: _, _, _, _, h => by simp [subplaceAt] at h
+  | .leaf _, _, .constantIndex _ _ _ :: _, _, _, _, h => by simp [subplaceAt] at h
+  | .struct n offs ls, base, .field f ty :: rest, l, o, q, h => by
+    obtain ⟨o', l', ho, hl, h'⟩ := subplaceAt_struct_child (Or.inl ⟨ty, rfl⟩) h
+    simp only [List.cons_append, subplaceAt, ho, hl]
+    exact subplaceAt_append q h'
+  | .struct n offs ls, base, .constantIndex k m fromEnd :: rest, l, o, q, h => by
+    cases fromEnd with
+    | true => simp [subplaceAt] at h
+    | false =>
+      obtain ⟨o', l', ho, hl, h'⟩ := subplaceAt_struct_child (Or.inr ⟨m, rfl⟩) h
+      simp only [List.cons_append, subplaceAt, ho, hl]
+      exact subplaceAt_append q h' 
+  | _, _, .deref :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .index _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .subslice _ _ _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .opaqueCast _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .unwrapUnsafeBinder _ :: _, _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+
+/-- **Disjoint siblings (`subplaceAt_disjoint_siblings`)**: on a well-formed layout, two
+sub-places diverging at distinct fields or elements `i ≠ j` of the same struct/tuple/array occupy
+disjoint byte ranges (the byte-level Disjoint-Sibling frame of synthetic sub-place pointers). -/
+theorem subplaceAt_disjoint_siblings {lay : ByteLayout} {base : Nat} {p : List ProjectionElem}
+    {n : Nat} {offs : List Nat} {ls : List ByteLayout} {o : Nat} (hWF : lay.WF)
+    (hp : subplaceAt lay base p = some (.struct n offs ls, o))
+    {e₁ e₂ : ProjectionElem} {i j : Nat} (hi : SelectsChild e₁ i) (hj : SelectsChild e₂ j)
+    (hij : i ≠ j) {r₁ r₂ : List ProjectionElem} {l₁ l₂ : ByteLayout} {o₁ o₂ : Nat}
+    (h₁ : subplaceAt lay base (p ++ e₁ :: r₁) = some (l₁, o₁))
+    (h₂ : subplaceAt lay base (p ++ e₂ :: r₂) = some (l₂, o₂)) :
+    o₁ + l₁.size ≤ o₂ ∨ o₂ + l₂.size ≤ o₁ := by
+  rw [subplaceAt_append _ hp] at h₁ h₂
+  obtain ⟨hSWF, _, _⟩ := subplaceAt_sub hWF hp
+  obtain ⟨oi, li, hoi, hli, hr₁⟩ := subplaceAt_struct_child hi h₁
+  obtain ⟨oj, lj, hoj, hlj, hr₂⟩ := subplaceAt_struct_child hj h₂
+  cases hSWF with
+  | struct _ _ _ hLen hFit hDisj hChildren =>
+    obtain ⟨_, hA₁, hB₁⟩ := subplaceAt_sub (hChildren i li hli) hr₁
+    obtain ⟨_, hA₂, hB₂⟩ := subplaceAt_sub (hChildren j lj hlj) hr₂
+    rcases hDisj i j oi oj li lj hij hoi hoj hli hlj with hD | hD <;> omega
+
+/-- **Agreement with `pathRange`**: every `Field` / `Downcast`+`Field` byte range of Section 2e
+(`pathRange`, used by `evalDeinitPlace_spec_bytes_simulation`) is the synthetic sub-place range
+`subplaceAt` assigns to the same path, so synthetic sub-place pointers and MiniRust's byte-level
+`Deinit` address the same bytes. -/
+theorem subplaceAt_of_pathRange :
+    ∀ {lay : ByteLayout} {base : Nat} {p : List ProjectionElem} {off len : Nat},
+      pathRange lay base p = some (off, len) → ∃ l, subplaceAt lay base p = some (l, off) ∧ l.size = len
+  | lay, base, [], off, len, h => by
+    simp only [pathRange, Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    exact ⟨lay, rfl, rfl⟩
+  | .leaf _, _, e :: rest, _, _, h => by
+    cases e with
+    | downcast _ _ => cases rest with
+      | nil => simp [pathRange] at h
+      | cons b _ => cases b <;> simp [pathRange] at h
+    | _ => simp [pathRange] at h
+  | .struct n offs ls, base, .field f _ :: rest, off, len, h => by
+    simp only [pathRange] at h
+    split at h
+    · rename_i o l ho hl
+      obtain ⟨l', h', hs⟩ := subplaceAt_of_pathRange h
+      exact ⟨l', by simp only [subplaceAt, ho, hl, h'], hs⟩
+    · nomatch h
+  | .struct n offs ls, base, .downcast _ _ :: rest, off, len, h => by
+    cases rest with
+    | nil => simp [pathRange] at h
+    | cons b rest' =>
+      cases b with
+      | field f ty =>
+        simp only [pathRange] at h
+        split at h
+        · rename_i o l ho hl
+          obtain ⟨l', h', hs⟩ := subplaceAt_of_pathRange h
+          exact ⟨l', by simp only [subplaceAt, ho, hl, h'], hs⟩
+        · nomatch h
+      | _ => simp [pathRange] at h
+  | .struct _ _ _, _, .deref :: _, _, _, h => by simp [pathRange] at h
+  | .struct _ _ _, _, .index _ :: _, _, _, h => by simp [pathRange] at h
+  | .struct _ _ _, _, .constantIndex _ _ _ :: _, _, _, h => by simp [pathRange] at h
+  | .struct _ _ _, _, .subslice _ _ _ :: _, _, _, h => by simp [pathRange] at h
+  | .struct _ _ _, _, .opaqueCast _ :: _, _, _, h => by simp [pathRange] at h
+  | .struct _ _ _, _, .unwrapUnsafeBinder _ :: _, _, _, h => by simp [pathRange] at h
+
+/-- Layout facts of a type that synthetic pointer resolution consults (`align_bounds`,
+`alloc_size_and_align`, `layout_for`, `is_inhabited_for`): the (upper-bound) size, the minimum and
+maximum alignment, whether the layout is exact, and inhabitedness. -/
+structure TyLayout : Type where
+  size : Nat
+  minAlign : Nat
+  maxAlign : Nat
+  exact : Bool
+  inhabited : Bool
+
+/-- The type of a pointer value (`ptr_ty`): a reference (`&T` / `&mut T`) or a raw pointer, and
+its pointee type (by identity). -/
+structure PtrTy : Type where
+  isRef : Bool
+  pointee : Nat
+
+/-- A synthetic pointer value (`PointerValue`): an address and an optional provenance
+`(alloc_id, tag)`. -/
+structure SynPtr : Type where
+  addr : Nat
+  prov : Option (Nat × Nat)
+  deriving DecidableEq
+
+/-- The frame-independent context of synthetic sub-place pointers: allocation layouts and the
+address-space limit (for `localBaseAddr`), byte layouts of the declared locals, type identities
+of the declared locals and the same-offset/same-type candidate paths (`collect_subplace_paths`),
+type layouts, the pointer type stored at every `Deref`-free place, Anneal's synthetic reading of
+a pointer value (`addr`, `provenance`), `decode_subplace_tag`, and `slot_union_path_active`. -/
+structure SubplaceCtx : Type where
+  allocs : AllocLayouts
+  limit : Nat
+  layoutOf : Nat → Option ByteLayout
+  declTy : Nat → Option Nat
+  candidates : Nat → Nat → Nat → List (List ProjectionElem)
+  tyLayout : Nat → Option TyLayout
+  ptrTyAt : Nat → List ProjectionElem → Option PtrTy
+  ptrOf : ProvenancePtr → SynPtr
+  decodeTag : Nat → Nat → Option Nat
+  unionActive : LocalSlotState → List ProjectionElem → Bool → Bool := fun _ _ _ => true
+
+/-- Well-formed contexts: every local's byte layout is well formed and fits its synthetic
+allocation, and every candidate path of a pointee type at offset `off` of local `l` addresses a
+sub-place of that type's size at `off` (the specification of `collect_subplace_paths`). -/
+structure SubplaceCtx.WF (cx : SubplaceCtx) : Prop where
+  layout : ∀ l lay, cx.layoutOf l = some lay → lay.WF ∧ lay.size ≤ ownAllocSize cx.allocs l
+  candidates : ∀ t l off q, q ∈ cx.candidates t l off →
+    ∃ lay sub tl, cx.layoutOf l = some lay ∧ subplaceAt lay 0 q = some (sub, off) ∧
+      cx.tyLayout t = some tl ∧ sub.size = tl.size
+
+/-- Errors of synthetic pointer evaluation (`RvalueEvalError` variants of `rvalue.rs`). -/
+inductive DerefErr : Type where
+  | invalidBitPattern
+  | nullPointer
+  | misaligned
+  | unsupportedLayout
+  | uninhabited
+  | rangeOverflow
+  | deadLocal (l : Nat)
+  | ub
+  | unsupported
+  | typeMismatch
+  deriving DecidableEq, Repr
+
+/-- **Synthetic sub-place borrow (`evalSubplaceRef`)**: `&_l.proj` / `&raw _l.proj` (the
+`Deref`-free branch of `eval_projected_ref_in`): a live local (`DeadLocal` otherwise) whose runtime
+state accepts the projection (`check_slot_projection`: active variants, in-bounds elements), at
+address `localBaseAddr l + offset(proj)` with provenance `(l + 1, tag)`. An uninitialized local
+can be borrowed (the place itself is never read). -/
+def evalSubplaceRef (cx : SubplaceCtx) (slots : List LocalSlotState) (l : Nat)
+    (proj : List ProjectionElem) (tag : Nat) : Except DerefErr SynPtr :=
+  match slots[l]? with
+  | none => .error .typeMismatch
+  | some .dead => .error (.deadLocal l)
+  | some st =>
+    if checkSlotProjectionOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) proj then
+      match cx.layoutOf l, localBaseAddr cx.allocs l cx.limit with
+      | some lay, some base =>
+        match subplaceAt lay 0 proj with
+        | some (_, off) => .ok ⟨base + off, some (l + 1, tag)⟩
+        | none => .error .unsupported
+      | _, _ => .error .unsupported
+    else .error .unsupported
+
+/-- A borrow of a sub-place of a dead local faults (`DeadLocal`). -/
+theorem evalSubplaceRef_dead {cx : SubplaceCtx} {slots : List LocalSlotState} {l : Nat}
+    (proj : List ProjectionElem) (tag : Nat) (h : slots[l]? = some .dead) :
+    evalSubplaceRef cx slots l proj tag = .error (.deadLocal l) := by
+  simp [evalSubplaceRef, h]
+
+/-- Inversion of a successful synthetic sub-place borrow. -/
+theorem evalSubplaceRef_eq_ok {cx : SubplaceCtx} {slots : List LocalSlotState} {l : Nat}
+    {proj : List ProjectionElem} {tag : Nat} {p : SynPtr}
+    (h : evalSubplaceRef cx slots l proj tag = .ok p) :
+    ∃ st lay base sub off, slots[l]? = some st ∧ st ≠ .dead ∧
+      checkSlotProjectionOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) proj = true ∧
+      cx.layoutOf l = some lay ∧ localBaseAddr cx.allocs l cx.limit = some base ∧
+      subplaceAt lay 0 proj = some (sub, off) ∧ p = ⟨base + off, some (l + 1, tag)⟩ := by
+  unfold evalSubplaceRef at h
+  split at h
+  · nomatch h
+  · nomatch h
+  · rename_i st hNotDead hSt
+    split at h
+    · rename_i hChk
+      split at h
+      · rename_i lay base hLay hBase
+        split at h
+        · rename_i sub off hSub
+          simp only [Except.ok.injEq] at h
+          exact ⟨st, lay, base, sub, off, hSt, fun hD => hNotDead hD, hChk, hLay, hBase, hSub, h.symm⟩
+        · nomatch h
+      · nomatch h
+    · nomatch h
+
+/-- **In-bounds synthetic borrows (`evalSubplaceRef_inbounds`)**: in a well-formed context, the
+borrowed sub-place `[addr, addr + size)` lies inside the local's synthetic allocation, which fits
+below the address-space limit (`offset_inbounds` never wraps), and carries the local's
+provenance. -/
+theorem evalSubplaceRef_inbounds {cx : SubplaceCtx} (hWF : cx.WF) {slots : List LocalSlotState}
+    {l : Nat} {proj : List ProjectionElem} {tag : Nat} {p : SynPtr}
+    (h : evalSubplaceRef cx slots l proj tag = .ok p) :
+    ∃ (base : Nat) (lay sub : ByteLayout), localBaseAddr cx.allocs l cx.limit = some base ∧
+      cx.layoutOf l = some lay ∧
+      computeSubplaceByteOffset lay proj = some (p.addr - base, sub.size) ∧
+      base ≤ p.addr ∧ p.addr + sub.size ≤ base + ownAllocSize cx.allocs l ∧
+      base + ownAllocSize cx.allocs l ≤ cx.limit ∧ p.prov = some (l + 1, tag) := by
+  obtain ⟨st, lay, base, sub, off, _, _, _, hLay, hBase, hSub, rfl⟩ := evalSubplaceRef_eq_ok h
+  obtain ⟨hLWF, hFitL⟩ := hWF.layout l lay hLay
+  obtain ⟨_, _, hIn⟩ := subplaceAt_sub hLWF hSub
+  refine ⟨base, lay, sub, hBase, hLay, ?_, by simp, by simp only; omega, localBaseAddr_fits hBase,
+    rfl⟩
+  simp only [computeSubplaceByteOffset, hSub, Option.map_some, Nat.add_sub_cancel_left]
+
+/-- **Non-aliasing of distinct locals' synthetic sub-places (`evalSubplaceRef_disjoint_locals`)**:
+in a well-formed context, sub-place borrows of two distinct locals `l₁ < l₂` designate disjoint
+byte ranges, whatever their projections. -/
+theorem evalSubplaceRef_disjoint_locals {cx : SubplaceCtx} (hWF : cx.WF)
+    {slots : List LocalSlotState} {l₁ l₂ : Nat} (hl : l₁ < l₂) {proj₁ proj₂ : List ProjectionElem}
+    {t₁ t₂ : Nat} {p₁ p₂ : SynPtr} {lay₁ sub₁ : ByteLayout} {off₁ : Nat}
+    (hLay₁ : cx.layoutOf l₁ = some lay₁) (hSub₁ : subplaceAt lay₁ 0 proj₁ = some (sub₁, off₁))
+    (h₁ : evalSubplaceRef cx slots l₁ proj₁ t₁ = .ok p₁)
+    (h₂ : evalSubplaceRef cx slots l₂ proj₂ t₂ = .ok p₂) :
+    p₁.addr + sub₁.size ≤ p₂.addr := by
+  obtain ⟨_, lay, base₁, sub, off, _, _, _, hL, hB₁, hS, rfl⟩ := evalSubplaceRef_eq_ok h₁
+  obtain ⟨_, lay', base₂, sub', off', _, _, _, _, hB₂, _, rfl⟩ := evalSubplaceRef_eq_ok h₂
+  rw [hLay₁] at hL
+  cases hL
+  rw [hSub₁] at hS
+  cases hS
+  obtain ⟨hLWF, hFitL⟩ := hWF.layout l₁ lay₁ hLay₁
+  obtain ⟨_, _, hIn⟩ := subplaceAt_sub hLWF hSub₁
+  obtain ⟨hDisj, _⟩ := localBaseAddr_disjoint hl hB₁ hB₂
+  simp only
+  omega
+
+/-- **Disjoint sibling borrows (`evalSubplaceRef_disjoint_siblings`)**: borrows of two sibling
+fields/elements `i ≠ j` (below a common prefix) of the same local designate disjoint byte
+ranges. -/
+theorem evalSubplaceRef_disjoint_siblings {cx : SubplaceCtx} (hWF : cx.WF)
+    {slots : List LocalSlotState} {l : Nat} {lay : ByteLayout} (hLay : cx.layoutOf l = some lay)
+    {p : List ProjectionElem} {n : Nat} {offs : List Nat} {ls : List ByteLayout} {o : Nat}
+    (hp : subplaceAt lay 0 p = some (.struct n offs ls, o))
+    {e₁ e₂ : ProjectionElem} {i j : Nat} (hi : SelectsChild e₁ i) (hj : SelectsChild e₂ j)
+    (hij : i ≠ j) {r₁ r₂ : List ProjectionElem} {t₁ t₂ : Nat} {p₁ p₂ : SynPtr}
+    {sub₁ sub₂ : ByteLayout} {o₁ o₂ : Nat}
+    (hs₁ : subplaceAt lay 0 (p ++ e₁ :: r₁) = some (sub₁, o₁))
+    (hs₂ : subplaceAt lay 0 (p ++ e₂ :: r₂) = some (sub₂, o₂))
+    (h₁ : evalSubplaceRef cx slots l (p ++ e₁ :: r₁) t₁ = .ok p₁)
+    (h₂ : evalSubplaceRef cx slots l (p ++ e₂ :: r₂) t₂ = .ok p₂) :
+    p₁.addr + sub₁.size ≤ p₂.addr ∨ p₂.addr + sub₂.size ≤ p₁.addr := by
+  obtain ⟨_, lay₁, base₁, _, _, _, _, _, hL₁, hB₁, hS₁, rfl⟩ := evalSubplaceRef_eq_ok h₁
+  obtain ⟨_, lay₂, base₂, _, _, _, _, _, hL₂, hB₂, hS₂, rfl⟩ := evalSubplaceRef_eq_ok h₂
+  rw [hLay] at hL₁ hL₂
+  cases hL₁
+  cases hL₂
+  rw [hB₁] at hB₂
+  cases hB₂
+  rw [hs₁] at hS₁
+  cases hS₁
+  rw [hs₂] at hS₂
+  cases hS₂
+  have := subplaceAt_disjoint_siblings (hWF.layout l lay hLay).1 hp hi hj hij hs₁ hs₂
+  simp only
+  omega
+
+/-! ### Section 4c: No-guess sub-place resolution (`resolveSyntheticSubplace`) -/
+
+/-- The indices of the candidates that satisfy `ok`. -/
+def consistentIdx (cands : List (List ProjectionElem)) (ok : List ProjectionElem → Bool) :
+    List Nat :=
+  (List.range cands.length).filter fun i =>
+    match cands[i]? with
+    | some q => ok q
+    | none => false
+
+theorem mem_consistentIdx {cands : List (List ProjectionElem)} {ok : List ProjectionElem → Bool}
+    {i : Nat} : i ∈ consistentIdx cands ok ↔ ∃ q, cands[i]? = some q ∧ ok q = true := by
+  unfold consistentIdx
+  simp only [List.mem_filter, List.mem_range]
+  constructor
+  · rintro ⟨hlt, h⟩
+    rw [List.getElem?_eq_getElem hlt] at h ⊢
+    exact ⟨_, rfl, h⟩
+  · rintro ⟨q, hq, hok⟩
+    have hlt := (List.getElem?_eq_some_iff.mp hq).1
+    exact ⟨hlt, by rw [hq]; exact hok⟩
+
+/-- The zero-sized fallback of `select_subplace_candidate_in`: all values of a zero-sized pointee
+are equal, so the first readable consistent candidate (or the first one) is as good as any;
+for any other pointee type, ambiguity is never resolved by guessing. -/
+def zstPick (cands : List (List ProjectionElem)) (consistent : List Nat) (zst : Bool)
+    (readable : List ProjectionElem → Bool) : Option (List ProjectionElem) :=
+  if zst then
+    match consistent.find? (fun j => (cands[j]?.map readable).getD false) with
+    | some j => cands[j]?
+    | none =>
+      match consistent.head? with
+      | some i => cands[i]?
+      | none => none
+  else none
+
+/-- Selection among the consistent candidates: a unique one, else the one the provenance tag's
+ordinal designates, else the zero-sized fallback. -/
+def pickConsistent (cands : List (List ProjectionElem)) (consistent : List Nat)
+    (ordinal : Option Nat) (zst : Bool) (readable : List ProjectionElem → Bool) :
+    Option (List ProjectionElem) :=
+  match consistent with
+  | [] => none
+  | [i] => cands[i]?
+  | _ :: _ :: _ =>
+    match ordinal with
+    | some o => if consistent.contains o then cands[o]? else zstPick cands consistent zst readable
+    | none => zstPick cands consistent zst readable
+
+/-- **`select_subplace_candidate_in`**: chooses, without guessing, the sub-place a synthetic
+pointer designates among the same-offset, same-type candidates: candidates inconsistent with the
+runtime state of the local (`cons`; with a whole-place write, `consOw` admits overwriting a leaf
+union field) are discarded; an overwrite designated by the tag ordinal wins; then a unique
+consistent candidate, the tag-designated one, or (zero-sized pointees only) the first readable
+one is chosen; anything else is `none` (`UnsupportedPlaceProjection`). -/
+def selectSubplaceCandidate (cands : List (List ProjectionElem))
+    (cons consOw : List ProjectionElem → Bool) (ordinal : Option Nat) (zst : Bool)
+    (readable : List ProjectionElem → Bool) (ow : Bool) : Option (List ProjectionElem) :=
+  let active := consistentIdx cands cons
+  let overw := if ow then consistentIdx cands consOw else []
+  let byOrd : Option (List ProjectionElem) :=
+    match ow, ordinal with
+    | true, some o => if overw.contains o then cands[o]? else none
+    | _, _ => none
+  match byOrd with
+  | some q => some q
+  | none => pickConsistent cands (if !active.isEmpty || !ow then active else overw) ordinal zst readable
+
+theorem zstPick_spec {cands : List (List ProjectionElem)} {C : List Nat} {zst : Bool}
+    {readable : List ProjectionElem → Bool} {q : List ProjectionElem}
+    (h : zstPick cands C zst readable = some q) : zst = true ∧ ∃ i ∈ C, cands[i]? = some q := by
+  unfold zstPick at h
+  split at h
+  · rename_i hz
+    split at h
+    · rename_i j hj
+      exact ⟨hz, j, List.mem_of_find?_eq_some hj, h⟩
+    · split at h
+      · rename_i i hi
+        exact ⟨hz, i, List.mem_of_mem_head? hi, h⟩
+      · nomatch h
+  · nomatch h
+
+theorem pickConsistent_spec {cands : List (List ProjectionElem)} {C : List Nat}
+    {ordinal : Option Nat} {zst : Bool} {readable : List ProjectionElem → Bool}
+    {q : List ProjectionElem} (h : pickConsistent cands C ordinal zst readable = some q) :
+    ∃ i ∈ C, cands[i]? = some q ∧ (C = [i] ∨ ordinal = some i ∨ zst = true) := by
+  unfold pickConsistent at h
+  split at h
+  · nomatch h
+  · rename_i i
+    exact ⟨i, List.mem_singleton_self _, h, Or.inl rfl⟩
+  · split at h
+    · rename_i o
+      split at h
+      · rename_i hc
+        exact ⟨o, List.contains_iff_mem.mp hc, h, Or.inr (Or.inl rfl)⟩
+      · obtain ⟨hz, k, hk, hq⟩ := zstPick_spec h
+        exact ⟨k, hk, hq, Or.inr (Or.inr hz)⟩
+    · obtain ⟨hz, k, hk, hq⟩ := zstPick_spec h
+      exact ⟨k, hk, hq, Or.inr (Or.inr hz)⟩
+
+/-- **No-guess selection (`selectSubplaceCandidate_no_guess`)**: a selected sub-place is a
+candidate that passed the runtime consistency check (or, for a whole-place write, the leaf
+union-overwrite check), and it was selected because it is the unique consistent candidate, or
+the provenance tag's ordinal designates it, or the pointee is zero-sized. -/
+theorem selectSubplaceCandidate_no_guess {cands : List (List ProjectionElem)}
+    {cons consOw : List ProjectionElem → Bool} {ordinal : Option Nat} {zst : Bool}
+    {readable : List ProjectionElem → Bool} {ow : Bool} {q : List ProjectionElem}
+    (h : selectSubplaceCandidate cands cons consOw ordinal zst readable ow = some q) :
+    ∃ i C, (C = consistentIdx cands cons ∨ (ow = true ∧ C = consistentIdx cands consOw)) ∧
+      i ∈ C ∧ cands[i]? = some q ∧ (C = [i] ∨ ordinal = some i ∨ zst = true) := by
+  unfold selectSubplaceCandidate at h
+  dsimp only at h
+  split at h
+  · rename_i q' hq
+    simp only [Option.some.injEq] at h
+    subst h
+    split at hq
+    · rename_i o
+      by_cases hc : (consistentIdx cands consOw).contains o = true
+      · simp only [hc, ↓reduceIte] at hq
+        exact ⟨o, _, Or.inr ⟨rfl, rfl⟩, List.contains_iff_mem.mp hc, hq, Or.inr (Or.inl rfl)⟩
+      · simp only [hc, Bool.false_eq_true, ↓reduceIte] at hq
+        nomatch hq
+    · nomatch hq
+  · obtain ⟨i, hiC, hq, hDesig⟩ := pickConsistent_spec h
+    refine ⟨i, _, ?_, hiC, hq, hDesig⟩
+    split
+    · exact Or.inl rfl
+    · rename_i hc
+      cases ow with
+      | false => simp at hc
+      | true => exact Or.inr ⟨rfl, rfl⟩
+
+/-- A selected sub-place passed the runtime check of its mode. -/
+theorem selectSubplaceCandidate_consistent {cands : List (List ProjectionElem)}
+    {cons consOw : List ProjectionElem → Bool} {ordinal : Option Nat} {zst : Bool}
+    {readable : List ProjectionElem → Bool} {ow : Bool} {q : List ProjectionElem}
+    (h : selectSubplaceCandidate cands cons consOw ordinal zst readable ow = some q) :
+    q ∈ cands ∧ (cons q = true ∨ (ow = true ∧ consOw q = true)) := by
+  obtain ⟨i, C, hC, hiC, hq, _⟩ := selectSubplaceCandidate_no_guess h
+  refine ⟨List.mem_of_getElem? hq, ?_⟩
+  rcases hC with rfl | ⟨hOw, rfl⟩
+  · obtain ⟨q', hq', hok⟩ := mem_consistentIdx.mp hiC
+    rw [hq] at hq'
+    cases hq'
+    exact Or.inl hok
+  · obtain ⟨q', hq', hok⟩ := mem_consistentIdx.mp hiC
+    rw [hq] at hq'
+    cases hq'
+    exact Or.inr ⟨hOw, hok⟩
+
+/-- **Ambiguity fails closed (`selectSubplaceCandidate_ambiguous_none`)**: outside a whole-place
+write, two or more consistent candidates of a sized pointee that the tag does not disambiguate
+(e.g. same-typed fields of two variants of an uninitialized enum, or byte-punned union fields)
+are never guessed between. -/
+theorem selectSubplaceCandidate_ambiguous_none {cands : List (List ProjectionElem)}
+    {cons consOw : List ProjectionElem → Bool} {ordinal : Option Nat}
+    {readable : List ProjectionElem → Bool} {i j : Nat} {rest : List Nat}
+    (hTwo : consistentIdx cands cons = i :: j :: rest)
+    (hOrd : ∀ o, ordinal = some o → o ∉ consistentIdx cands cons) :
+    selectSubplaceCandidate cands cons consOw ordinal false readable false = none := by
+  unfold selectSubplaceCandidate
+  simp only [hTwo, List.isEmpty_cons, Bool.not_false, Bool.true_or, ↓reduceIte, pickConsistent,
+    zstPick, Bool.false_eq_true]
+  cases ordinal with
+  | none => rfl
+  | some o =>
+    have hNot := hOrd o rfl
+    rw [hTwo] at hNot
+    have hc : (i :: j :: rest).contains o = false := by
+      cases hC : (i :: j :: rest).contains o with
+      | false => rfl
+      | true => exact absurd (List.contains_iff_mem.mp hC) hNot
+    simp only [hc, Bool.false_eq_true, ↓reduceIte]
+
+/-- Runtime consistency of a candidate path with local `l` (`check_frame_slot_projection` plus
+`slot_union_path_active`, with or without leaf union overwrite). -/
+def candConsistent (cx : SubplaceCtx) (slots : List LocalSlotState) (l : Nat) (ow : Bool)
+    (q : List ProjectionElem) : Bool :=
+  match slots[l]? with
+  | none => false
+  | some .dead => false
+  | some st =>
+    checkSlotProjectionOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) q &&
+      cx.unionActive st q ow
+
+/-- Whether reading the sub-place succeeds (the zero-sized fallback prefers initialized parts). -/
+def subplaceReadable (slots : List LocalSlotState) (l : Nat) (q : List ProjectionElem) : Bool :=
+  match readPlaceState slots ⟨l, q⟩ with
+  | .ok _ => true
+  | _ => false
+
+/-- **`resolve_synthetic_subplace_in`**: maps a synthetic pointer `p` of type `pty` back to
+`(target_local, path)` in the frame `slots`, checking in order: the address bit pattern
+(`InvalidBitPattern`), non-null (`InvalidBitPattern` for `&T`, `NullPointerAccess` otherwise), the
+pointee layout (`UnsupportedLayout`), alignment (`MisalignedPointer`, or `UnsupportedLayout` for an
+unspecified alignment), an inhabited `&T` pointee (`UninhabitedPointee`), a non-wrapping pointee
+range (`PointerRangeOverflow` under an exact layout), synthetic provenance of a local of the frame
+and its liveness (`DeadLocal`), a synthetic allocation that fits the address space, and an
+in-bounds `[relOff, relOff + size)`; offset `0` with the local's own type is the root, and
+otherwise the designated sub-place is selected without guessing (`selectSubplaceCandidate`).
+Every unresolvable pointer is `unsupported` (never a guessed sub-place). -/
+def resolveSyntheticSubplace (cx : SubplaceCtx) (slots : List LocalSlotState) (p : SynPtr)
+    (pty : PtrTy) (ow : Bool) : Except DerefErr (Nat × List ProjectionElem) :=
+  if cx.limit < p.addr then .error .invalidBitPattern
+  else if p.addr = 0 then (if pty.isRef then .error .invalidBitPattern else .error .nullPointer)
+  else
+    match cx.tyLayout pty.pointee with
+    | none => .error .unsupportedLayout
+    | some tl =>
+      if p.addr % tl.minAlign ≠ 0 then .error .misaligned
+      else if p.addr % tl.maxAlign ≠ 0 then .error .unsupportedLayout
+      else if pty.isRef && !tl.inhabited then .error .uninhabited
+      else if cx.limit < p.addr + tl.size then
+        (if tl.exact then .error .rangeOverflow else .error .unsupported)
+      else
+        match p.prov with
+        | none => .error .unsupported
+        | some (0, _) => .error .unsupported
+        | some (l + 1, tag) =>
+          if min slots.length cx.allocs.length ≤ l then .error .unsupported
+          else
+            match slots[l]? with
+            | some .dead => .error (.deadLocal l)
+            | _ =>
+              match localBaseAddr cx.allocs l cx.limit, ownLayout cx.allocs l with
+              | some base, some (allocSize, _) =>
+                if p.addr < base then .error .unsupported
+                else if allocSize < p.addr - base + tl.size then .error .unsupported
+                else if p.addr - base = 0 ∧ cx.declTy l = some pty.pointee then .ok (l, [])
+                else
+                  match selectSubplaceCandidate (cx.candidates pty.pointee l (p.addr - base))
+                      (candConsistent cx slots l false) (candConsistent cx slots l true)
+                      (cx.decodeTag tag pty.pointee) (tl.size == 0) (subplaceReadable slots l) ow with
+                  | some q => .ok (l, q)
+                  | none => .error .unsupported
+              | _, _ => .error .unsupported
+
+/-- The address checks `resolveSyntheticSubplace` performs before consulting the provenance. -/
+structure PtrPrechecks (cx : SubplaceCtx) (p : SynPtr) (pty : PtrTy) (tl : TyLayout) : Prop where
+  inWidth : p.addr ≤ cx.limit
+  nonNull : p.addr ≠ 0
+  layout : cx.tyLayout pty.pointee = some tl
+  minAligned : p.addr % tl.minAlign = 0
+  maxAligned : p.addr % tl.maxAlign = 0
+  inhabited : pty.isRef = true → tl.inhabited = true
+  noWrap : p.addr + tl.size ≤ cx.limit
+
+/-- `resolveSyntheticSubplace` once the address checks pass. -/
+theorem resolveSyntheticSubplace_of_prechecks {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {tl : TyLayout} (hP : PtrPrechecks cx p pty tl) :
+    resolveSyntheticSubplace cx slots p pty ow =
+      match p.prov with
+      | none => .error .unsupported
+      | some (0, _) => .error .unsupported
+      | some (l + 1, tag) =>
+        if min slots.length cx.allocs.length ≤ l then .error .unsupported
+        else
+          match slots[l]? with
+          | some .dead => .error (.deadLocal l)
+          | _ =>
+            match localBaseAddr cx.allocs l cx.limit, ownLayout cx.allocs l with
+            | some base, some (allocSize, _) =>
+              if p.addr < base then .error .unsupported
+              else if allocSize < p.addr - base + tl.size then .error .unsupported
+              else if p.addr - base = 0 ∧ cx.declTy l = some pty.pointee then .ok (l, [])
+              else
+                match selectSubplaceCandidate (cx.candidates pty.pointee l (p.addr - base))
+                    (candConsistent cx slots l false) (candConsistent cx slots l true)
+                    (cx.decodeTag tag pty.pointee) (tl.size == 0) (subplaceReadable slots l) ow with
+                | some q => .ok (l, q)
+                | none => .error .unsupported
+            | _, _ => .error .unsupported := by
+  have h1 : ¬ cx.limit < p.addr := by have := hP.inWidth; omega
+  have h3 : ¬ p.addr % tl.minAlign ≠ 0 := by have := hP.minAligned; omega
+  have h4 : ¬ p.addr % tl.maxAlign ≠ 0 := by have := hP.maxAligned; omega
+  have h5 : (pty.isRef && !tl.inhabited) = false := by
+    cases hr : pty.isRef with
+    | false => rfl
+    | true => simp [hP.inhabited hr]
+  have h6 : ¬ cx.limit < p.addr + tl.size := by have := hP.noWrap; omega
+  unfold resolveSyntheticSubplace
+  simp only [h1, hP.nonNull, hP.layout, h3, h4, h5, h6, ↓reduceIte, Bool.false_eq_true]
+
+/-- **Null pointers fault (`resolveSyntheticSubplace_null`)**: `InvalidBitPattern` for a null
+`&T`, `NullPointerAccess` for a null raw pointer. -/
+theorem resolveSyntheticSubplace_null {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} (pty : PtrTy) (ow : Bool) (h0 : p.addr = 0) :
+    resolveSyntheticSubplace cx slots p pty ow =
+      .error (if pty.isRef then .invalidBitPattern else .nullPointer) := by
+  unfold resolveSyntheticSubplace
+  simp only [h0, Nat.not_lt_zero, ↓reduceIte]
+  cases pty.isRef <;> rfl
+
+/-- **Misaligned pointers fault (`resolveSyntheticSubplace_misaligned`)**. -/
+theorem resolveSyntheticSubplace_misaligned {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {tl : TyLayout} (hW : p.addr ≤ cx.limit)
+    (hNZ : p.addr ≠ 0) (hL : cx.tyLayout pty.pointee = some tl) (hMis : p.addr % tl.minAlign ≠ 0) :
+    resolveSyntheticSubplace cx slots p pty ow = .error .misaligned := by
+  have h1 : ¬ cx.limit < p.addr := by omega
+  unfold resolveSyntheticSubplace
+  simp only [h1, hNZ, hL, hMis, ↓reduceIte, ne_eq, not_false_eq_true]
+
+/-- **Exact-layout pointee ranges that wrap the address space fault
+(`resolveSyntheticSubplace_rangeOverflow`)** with `PointerRangeOverflow`. -/
+theorem resolveSyntheticSubplace_rangeOverflow {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {tl : TyLayout} (hW : p.addr ≤ cx.limit)
+    (hNZ : p.addr ≠ 0) (hL : cx.tyLayout pty.pointee = some tl) (hA1 : p.addr % tl.minAlign = 0)
+    (hA2 : p.addr % tl.maxAlign = 0) (hInh : pty.isRef = true → tl.inhabited = true)
+    (hWrap : cx.limit < p.addr + tl.size) (hExact : tl.exact = true) :
+    resolveSyntheticSubplace cx slots p pty ow = .error .rangeOverflow := by
+  have h1 : ¬ cx.limit < p.addr := by omega
+  have h5 : (pty.isRef && !tl.inhabited) = false := by
+    cases hr : pty.isRef with
+    | false => rfl
+    | true => simp [hInh hr]
+  unfold resolveSyntheticSubplace
+  simp only [h1, hNZ, hL, hA1, hA2, h5, hWrap, hExact, ↓reduceIte, ne_eq, not_true_eq_false,
+    Bool.false_eq_true]
+
+/-- **Dangling sub-place pointers fault (`resolveSyntheticSubplace_dead`)**: a pointer whose
+synthetic provenance names a storage-dead local of the frame is `DeadLocal`, at any offset. -/
+theorem resolveSyntheticSubplace_dead {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {tl : TyLayout} (hP : PtrPrechecks cx p pty tl)
+    {l tag : Nat} (hProv : p.prov = some (l + 1, tag)) (hl : l < min slots.length cx.allocs.length)
+    (hDead : slots[l]? = some .dead) :
+    resolveSyntheticSubplace cx slots p pty ow = .error (.deadLocal l) := by
+  rw [resolveSyntheticSubplace_of_prechecks hP, hProv]
+  have hNot : ¬ min slots.length cx.allocs.length ≤ l := by omega
+  simp only [hNot, ↓reduceIte, hDead]
+
+/-- A pointer without synthetic provenance is never resolved to a local (`unsupported`). -/
+theorem resolveSyntheticSubplace_no_provenance {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {tl : TyLayout} (hP : PtrPrechecks cx p pty tl)
+    (hProv : p.prov = none) :
+    resolveSyntheticSubplace cx slots p pty ow = .error .unsupported := by
+  rw [resolveSyntheticSubplace_of_prechecks hP, hProv]
+
+/-- **Soundness of synthetic sub-place resolution (`resolveSyntheticSubplace_sound`)**: a resolved
+pointer passed the address checks, carries the provenance `l + 1` of a live local of the frame, and
+addresses an in-bounds offset `relOff = addr - base` of that local's synthetic allocation; the
+resolved path is the root (offset `0` with the local's own type) or a candidate of the pointee
+type at `relOff` that passed the runtime consistency check and was designated without guessing. -/
+theorem resolveSyntheticSubplace_sound {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow : Bool} {l : Nat} {q : List ProjectionElem}
+    (h : resolveSyntheticSubplace cx slots p pty ow = .ok (l, q)) :
+    ∃ tl tag base allocSize align, PtrPrechecks cx p pty tl ∧ p.prov = some (l + 1, tag) ∧
+      l < slots.length ∧ l < cx.allocs.length ∧ slots[l]? ≠ some .dead ∧
+      localBaseAddr cx.allocs l cx.limit = some base ∧
+      ownLayout cx.allocs l = some (allocSize, align) ∧ base ≤ p.addr ∧
+      p.addr - base + tl.size ≤ allocSize ∧
+      ((p.addr = base ∧ cx.declTy l = some pty.pointee ∧ q = []) ∨
+        ∃ i C, ¬ (p.addr - base = 0 ∧ cx.declTy l = some pty.pointee) ∧
+          (C = consistentIdx (cx.candidates pty.pointee l (p.addr - base))
+              (candConsistent cx slots l false) ∨
+            (ow = true ∧ C = consistentIdx (cx.candidates pty.pointee l (p.addr - base))
+              (candConsistent cx slots l true))) ∧
+          i ∈ C ∧ (cx.candidates pty.pointee l (p.addr - base))[i]? = some q ∧
+          (C = [i] ∨ cx.decodeTag tag pty.pointee = some i ∨ tl.size = 0)) := by
+  unfold resolveSyntheticSubplace at h
+  split at h
+  · nomatch h
+  · rename_i hW
+    split at h
+    · split at h <;> nomatch h
+    · rename_i hNZ
+      split at h
+      · nomatch h
+      · rename_i tl hTl
+        split at h
+        · nomatch h
+        · rename_i hA1
+          split at h
+          · nomatch h
+          · rename_i hA2
+            split at h
+            · nomatch h
+            · rename_i hInh
+              split at h
+              · split at h <;> nomatch h
+              · rename_i hWrap
+                have hP : PtrPrechecks cx p pty tl :=
+                  ⟨by omega, hNZ, hTl, by omega, by omega,
+                    fun hr => by simp [hr] at hInh; exact hInh, by omega⟩
+                split at h
+                · nomatch h
+                · nomatch h
+                · rename_i l' tag hProv
+                  split at h
+                  · nomatch h
+                  · rename_i hLt
+                    split at h
+                    · nomatch h
+                    · rename_i hNotDead
+                      split at h
+                      · rename_i base allocSize align hBase hOwn
+                        split at h
+                        · nomatch h
+                        · rename_i hGe
+                          split at h
+                          · nomatch h
+                          · rename_i hIn
+                            split at h
+                            · rename_i hRoot
+                              simp only [Except.ok.injEq, Prod.mk.injEq] at h
+                              obtain ⟨rfl, rfl⟩ := h
+                              refine ⟨tl, tag, base, allocSize, align, hP, hProv, by omega,
+                                by omega, fun hD => hNotDead hD, hBase, hOwn, by omega, by omega,
+                                Or.inl ⟨by omega, hRoot.2, rfl⟩⟩
+                            · rename_i hNR
+                              split at h
+                              · rename_i q' hSel
+                                simp only [Except.ok.injEq, Prod.mk.injEq] at h
+                                obtain ⟨rfl, rfl⟩ := h
+                                obtain ⟨i, C, hC, hiC, hq, hD⟩ := selectSubplaceCandidate_no_guess hSel
+                                refine ⟨tl, tag, base, allocSize, align, hP, hProv, by omega,
+                                  by omega, fun hD => hNotDead hD, hBase, hOwn, by omega,
+                                  by omega, Or.inr ⟨i, C, hNR, hC, hiC, hq, ?_⟩⟩
+                                rcases hD with hD | hD | hD
+                                · exact Or.inl hD
+                                · exact Or.inr (Or.inl hD)
+                                · exact Or.inr (Or.inr (by simpa using hD))
+                              · nomatch h
+                      · nomatch h
+
+/-- Selection from a single consistent candidate always succeeds with it, in either mode. -/
+theorem selectSubplaceCandidate_singleton {q : List ProjectionElem}
+    {cons consOw : List ProjectionElem → Bool} (ordinal : Option Nat) (zst : Bool)
+    (readable : List ProjectionElem → Bool) (ow : Bool) (hc : cons q = true)
+    (hcOw : ow = true → consOw q = true) :
+    selectSubplaceCandidate [q] cons consOw ordinal zst readable ow = some q := by
+  have hA : consistentIdx [q] cons = [0] := by simp [consistentIdx, hc]
+  unfold selectSubplaceCandidate
+  simp only [hA]
+  cases ow with
+  | false => simp [pickConsistent]
+  | true =>
+    have hO : consistentIdx [q] consOw = [0] := by simp [consistentIdx, hcOw rfl]
+    simp only [hO, ↓reduceIte]
+    cases ordinal with
+    | none => simp [pickConsistent]
+    | some o => by_cases ho : o = 0 <;> simp [ho, pickConsistent]
+
+/-- Every synthetic base address lies at or above the first page (so it is never null). -/
+theorem localBaseAddr_ge_page {lays : AllocLayouts} {l limit b : Nat}
+    (h : localBaseAddr lays l limit = some b) : synthPage ≤ b := by
+  obtain ⟨cur, hScan, hb, _⟩ := localBaseAddr_eq_some.mp h
+  have h1 := baseScan_ge hScan
+  have h2 := le_ownAlignedCursor lays l cur
+  omega
+
+/-- **Borrow/`Deref` round trip (`resolveSyntheticSubplace_evalSubplaceRef`)**: dereferencing the
+pointer that a synthetic sub-place borrow `&_l.proj` produced resolves back to exactly
+`(l, proj)` — in read and in whole-place-write mode — whenever `proj` is the only candidate of the
+pointee type at its offset (`collect_subplace_paths` finds no other sub-place to confuse it
+with), it is not the local's own root type at offset `0`, its union path is active, and the
+address satisfies the pointee's alignment (and inhabitedness for `&T`). -/
+theorem resolveSyntheticSubplace_evalSubplaceRef {cx : SubplaceCtx} (hWF : cx.WF)
+    {slots : List LocalSlotState} {l : Nat} {proj : List ProjectionElem} {tag : Nat} {p : SynPtr}
+    (hRef : evalSubplaceRef cx slots l proj tag = .ok p) {pty : PtrTy} {tl : TyLayout} (ow : Bool)
+    (hTl : cx.tyLayout pty.pointee = some tl) (hA1 : p.addr % tl.minAlign = 0)
+    (hA2 : p.addr % tl.maxAlign = 0) (hInh : pty.isRef = true → tl.inhabited = true)
+    {lay sub : ByteLayout} {off : Nat} (hLay : cx.layoutOf l = some lay)
+    (hSub : subplaceAt lay 0 proj = some (sub, off)) (hSize : sub.size = tl.size)
+    (hCands : cx.candidates pty.pointee l off = [proj])
+    (hNotRoot : off = 0 → cx.declTy l ≠ some pty.pointee)
+    (hUnion : ∀ st, slots[l]? = some st → cx.unionActive st proj false = true ∧
+      cx.unionActive st proj true = true)
+    {allocSize align : Nat} (hOwn : ownLayout cx.allocs l = some (allocSize, align)) :
+    resolveSyntheticSubplace cx slots p pty ow = .ok (l, proj) := by
+  obtain ⟨st, lay', base, sub', off', hSt, hLive, hChk, hLay', hBase, hSub', rfl⟩ :=
+    evalSubplaceRef_eq_ok hRef
+  rw [hLay] at hLay'
+  cases hLay'
+  rw [hSub] at hSub'
+  cases hSub'
+  obtain ⟨hLWF, hFitL⟩ := hWF.layout l lay hLay
+  obtain ⟨_, _, hIn⟩ := subplaceAt_sub hLWF hSub
+  have hFits := localBaseAddr_fits hBase
+  have hPage := localBaseAddr_ge_page hBase
+  have hAS : ownAllocSize cx.allocs l = allocSize := by simp [ownAllocSize, hOwn]
+  have hPP := synthPage_pos
+  have hP : PtrPrechecks cx ⟨base + off, some (l + 1, tag)⟩ pty tl :=
+    ⟨by simp only; omega, by simp only; omega, hTl, hA1, hA2, hInh, by simp only; omega⟩
+  rw [resolveSyntheticSubplace_of_prechecks hP]
+  have hlS : l < slots.length := (List.getElem?_eq_some_iff.mp hSt).1
+  have hlA : l < cx.allocs.length := by
+    rcases Nat.lt_or_ge l cx.allocs.length with h | h
+    · exact h
+    · simp [ownLayout, List.getElem?_eq_none h] at hOwn
+  have hNot : ¬ min slots.length cx.allocs.length ≤ l := by omega
+  have hRel : base + off - base = off := by omega
+  simp only [hNot, ↓reduceIte, hSt, hBase, hOwn, hRel]
+  have hStMatch : (match some st with
+      | some .dead => (Except.error (.deadLocal l) : Except DerefErr (Nat × List ProjectionElem))
+      | _ => Except.error .unsupported) = Except.error .unsupported ∨ st ≠ .dead := Or.inr hLive
+  clear hStMatch
+  cases st with
+  | dead => exact absurd rfl hLive
+  | _ =>
+    have hLt : ¬ base + off < base := by omega
+    have hIn' : ¬ allocSize < off + tl.size := by omega
+    have hNR : ¬ (off = 0 ∧ cx.declTy l = some pty.pointee) := fun h => hNotRoot h.1 h.2
+    simp only [hLt, hIn', hNR, ↓reduceIte, hCands]
+    obtain ⟨hU1, hU2⟩ := hUnion _ hSt
+    rw [selectSubplaceCandidate_singleton _ _ _ _
+      (by simp [candConsistent, hSt, hChk, hU1])
+      (fun _ => by simp [candConsistent, hSt, hChk, hU2])]
+
+/-! ### Section 4d: `ProjectionElem.deref` places: read, write, deinit, move, and retag -/
+
+/-- **`resolve_deref_place_in`**: resolves the `Deref` steps of a projection from left to right,
+reading each dereferenced pointer from the (`Deref`-free) place resolved so far
+(`readPlaceState`) and resolving it with `resolveSyntheticSubplace`; a final `Deref` of a
+whole-place write (`ow`) may overwrite a leaf union field. -/
+def derefTarget (cx : SubplaceCtx) (slots : List LocalSlotState) (ow : Bool) :
+    Nat → List ProjectionElem → List ProjectionElem → Except DerefErr Place
+  | cur, curProj, [] => .ok ⟨cur, curProj⟩
+  | cur, curProj, .deref :: rest =>
+    match readPlaceState slots ⟨cur, curProj⟩, cx.ptrTyAt cur curProj with
+    | .ok (.ptr pv _), some pty =>
+      match resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (ow && rest.isEmpty) with
+      | .ok (l, q) => derefTarget cx slots ow l q rest
+      | .error e => .error e
+    | .ok _, _ => .error .typeMismatch
+    | .ub, _ => .error .ub
+    | .unsupported, _ => .error .unsupported
+  | cur, curProj, e :: rest => derefTarget cx slots ow cur (curProj ++ [e]) rest
+
+/-- The `Deref`-free target of a place (`resolve_deref_place_in` after the live-root check). -/
+def resolvePlace (cx : SubplaceCtx) (slots : List LocalSlotState) (place : Place) (ow : Bool) :
+    Except DerefErr Place :=
+  match slots[place.local_]? with
+  | none => .error .typeMismatch
+  | some .dead => .error (.deadLocal place.local_)
+  | some _ => derefTarget cx slots ow place.local_ [] place.projection
+
+/-- A `Deref`-free projection is appended to the current place without reading any slot. -/
+theorem derefTarget_noDeref (cx : SubplaceCtx) (slots : List LocalSlotState) (ow : Bool) :
+    ∀ (proj : List ProjectionElem) (cur : Nat) (curProj : List ProjectionElem),
+      projectionHasDeref proj = false →
+      derefTarget cx slots ow cur curProj proj = .ok ⟨cur, curProj ++ proj⟩ := by
+  intro proj
+  induction proj with
+  | nil => intro cur curProj _; simp [derefTarget]
+  | cons e rest ih =>
+    intro cur curProj h
+    cases e with
+    | deref => simp [projectionHasDeref] at h
+    | _ =>
+      simp only [projectionHasDeref] at h
+      simp only [derefTarget]
+      rw [ih _ _ h, List.append_assoc, List.singleton_append]
+
+/-- A leading `Deref` reads the pointer at the current place and continues at its target. -/
+theorem derefTarget_deref {cx : SubplaceCtx} {slots : List LocalSlotState} {ow : Bool}
+    {cur : Nat} {curProj rest : List ProjectionElem} {pv : ProvenancePtr} {sz : Nat}
+    {pty : PtrTy} {l : Nat} {q : List ProjectionElem}
+    (hPtr : readPlaceState slots ⟨cur, curProj⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt cur curProj = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (ow && rest.isEmpty) = .ok (l, q)) :
+    derefTarget cx slots ow cur curProj (.deref :: rest) = derefTarget cx slots ow l q rest := by
+  simp only [derefTarget, hPtr, hTy, hRes]
+
+/-- **Conservative extension**: a `Deref`-free place of a live local resolves to itself. -/
+theorem resolvePlace_noDeref {cx : SubplaceCtx} {slots : List LocalSlotState} {place : Place}
+    (ow : Bool) {st : LocalSlotState} (hSt : slots[place.local_]? = some st) (hLive : st ≠ .dead)
+    (hNoDeref : projectionHasDeref place.projection = false) :
+    resolvePlace cx slots place ow = .ok place := by
+  unfold resolvePlace
+  rw [hSt]
+  cases st with
+  | dead => exact absurd rfl hLive
+  | _ => simp only [derefTarget_noDeref cx slots ow _ _ _ hNoDeref, List.nil_append]
+
+/-- A place rooted at a dead local faults (`DeadLocal`), before any pointer is read. -/
+theorem resolvePlace_dead {cx : SubplaceCtx} {slots : List LocalSlotState} {place : Place}
+    (ow : Bool) (h : slots[place.local_]? = some .dead) :
+    resolvePlace cx slots place ow = .error (.deadLocal place.local_) := by
+  simp [resolvePlace, h]
+
+/-- A single leading `Deref` `⟨p, .deref :: rest⟩` (the only shape of runtime MIR, after
+`CopyForDeref` separation) with a `Deref`-free `rest` resolves to the pointer's target followed by
+`rest`. -/
+theorem resolvePlace_deref {cx : SubplaceCtx} {slots : List LocalSlotState} {ow : Bool}
+    {p : Nat} {rest : List ProjectionElem} {stp : LocalSlotState} {pv : ProvenancePtr} {sz : Nat}
+    {pty : PtrTy} {l : Nat} {q : List ProjectionElem} (hSt : slots[p]? = some stp)
+    (hLive : stp ≠ .dead) (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (ow && rest.isEmpty) = .ok (l, q))
+    (hRest : projectionHasDeref rest = false) :
+    resolvePlace cx slots ⟨p, .deref :: rest⟩ ow = .ok ⟨l, q ++ rest⟩ := by
+  unfold resolvePlace
+  simp only [hSt]
+  cases stp with
+  | dead => exact absurd rfl hLive
+  | _ =>
+    rw [derefTarget_deref hPtr hTy hRes, derefTarget_noDeref cx slots ow _ _ _ hRest]
+
+/-- Lifting a value-tree read result into `Deref` evaluation. -/
+def liftRead : ProjReadResult → Except DerefErr Value
+  | .ok v => .ok v
+  | .ub => .error .ub
+  | .unsupported => .error .unsupported
+
+/-- Lifting a slot write result into `Deref` evaluation. -/
+def liftWrite {α : Type} : SlotWriteResult α → Except DerefErr α
+  | .ok v => .ok v
+  | .ub => .error .ub
+  | .unsupported => .error .unsupported
+
+/-- **`evalDerefPlaceRead`** (`read_place` through `Deref`): resolve the place's `Deref` steps
+(read mode), then read the `Deref`-free target. -/
+def evalDerefPlaceRead (cx : SubplaceCtx) (slots : List LocalSlotState) (place : Place) :
+    Except DerefErr Value :=
+  match resolvePlace cx slots place false with
+  | .ok tgt => liftRead (readPlaceState slots tgt)
+  | .error e => .error e
+
+/-- **`evalDerefPlaceWrite`** (`write_place` through `Deref`): resolve the place's `Deref` steps
+(whole-place-write mode), then write the target with `writePlaceState` — initializing
+`PartialShell` fields and preserving their siblings. -/
+def evalDerefPlaceWrite (arityOf : Ty → VariantIdx → Bool → Option Nat) (rootTyOf : Nat → Ty)
+    (cx : SubplaceCtx) (slots : List LocalSlotState) (place : Place) (v : Value) :
+    Except DerefErr (List LocalSlotState) :=
+  match resolvePlace cx slots place true with
+  | .ok tgt => liftWrite (writePlaceState arityOf slots tgt (rootTyOf tgt.local_) v)
+  | .error e => .error e
+
+/-- **`evalDerefPlaceDeinit`** (`deinit_place` through `Deref`): resolve, then `evalDeinitPlace`
+the target. -/
+def evalDerefPlaceDeinit (ts : Bool) (cx : SubplaceCtx) (slots : List LocalSlotState)
+    (place : Place) : Except DerefErr (List LocalSlotState) :=
+  match resolvePlace cx slots place false with
+  | .ok tgt =>
+    match evalDeinitPlace ts slots tgt with
+    | some slots' => .ok slots'
+    | none => .error .unsupported
+  | .error e => .error e
+
+/-- **Operands through `Deref`** (`eval_op`): `Copy` and `Move` of a place with a `Deref` read
+through the pointer and leave every slot unchanged; any other operand is `evalOperandState`
+(where `Move` of a bare local deinitializes it). -/
+def evalDerefOperand (cx : SubplaceCtx) (slots : List LocalSlotState) (op : Operand) :
+    Except DerefErr Value × List LocalSlotState :=
+  match op with
+  | .copy place | .move place =>
+    if projectionHasDeref place.projection then (evalDerefPlaceRead cx slots place, slots)
+    else
+      let r := evalOperandState slots op
+      (liftRead r.1, r.2)
+  | .constant _ =>
+    let r := evalOperandState slots op
+    (liftRead r.1, r.2)
+
+/-- **Move-Deref Non-Deinit (`evalDerefOperand_move_deref`)**: `Operand.move (*_p).rest` reads
+the target exactly like a copy and deinitializes nothing — neither the target local nor `_p` (nor
+any other local) changes. -/
+theorem evalDerefOperand_move_deref (cx : SubplaceCtx) (slots : List LocalSlotState)
+    (place : Place) (h : projectionHasDeref place.projection = true) :
+    evalDerefOperand cx slots (.move place) = (evalDerefPlaceRead cx slots place, slots) ∧
+      evalDerefOperand cx slots (.copy place) = (evalDerefPlaceRead cx slots place, slots) := by
+  simp [evalDerefOperand, h]
+
+/-- In particular, after `move (*_p)` the pointer local and the target local keep their slots. -/
+theorem evalDerefOperand_move_deref_slots (cx : SubplaceCtx) (slots : List LocalSlotState)
+    (p : Nat) (rest : List ProjectionElem) (l : Nat) :
+    (evalDerefOperand cx slots (.move ⟨p, .deref :: rest⟩)).2[p]? = slots[p]? ∧
+      (evalDerefOperand cx slots (.move ⟨p, .deref :: rest⟩)).2[l]? = slots[l]? := by
+  simp [evalDerefOperand, projectionHasDeref]
+
+/-- Contrast: moving a bare local does deinitialize it (`move_place`). -/
+theorem evalDerefOperand_move_bare (cx : SubplaceCtx) (slots : List LocalSlotState) (l : Nat)
+    (v : Value) (h : readPlaceState slots ⟨l, []⟩ = .ok v) :
+    evalDerefOperand cx slots (.move ⟨l, []⟩) = (.ok v, slots.set l .uninit) := by
+  simp [evalDerefOperand, projectionHasDeref, evalOperandState, movePlaceState, h, liftRead]
+
+/-- `Deref` reads of a `Deref`-free place are plain `readPlaceState` reads. -/
+theorem evalDerefPlaceRead_noDeref {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {place : Place} {st : LocalSlotState} (hSt : slots[place.local_]? = some st)
+    (hLive : st ≠ .dead) (hNoDeref : projectionHasDeref place.projection = false) :
+    evalDerefPlaceRead cx slots place = liftRead (readPlaceState slots place) := by
+  simp only [evalDerefPlaceRead, resolvePlace_noDeref false hSt hLive hNoDeref]
+
+/-- **`evalDerefPlaceRead` through one `Deref`**: reading `(*_p).rest` reads `rest` below the
+pointer's resolved target sub-place. -/
+theorem evalDerefPlaceRead_deref {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {p : Nat} {rest : List ProjectionElem} {stp : LocalSlotState} {pv : ProvenancePtr} {sz : Nat}
+    {pty : PtrTy} {l : Nat} {q : List ProjectionElem} (hSt : slots[p]? = some stp)
+    (hLive : stp ≠ .dead) (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false = .ok (l, q))
+    (hRest : projectionHasDeref rest = false) :
+    evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = liftRead (readPlaceState slots ⟨l, q ++ rest⟩) := by
+  have hRes' : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (false && rest.isEmpty) =
+      .ok (l, q) := by simpa using hRes
+  simp only [evalDerefPlaceRead, resolvePlace_deref hSt hLive hPtr hTy hRes' hRest]
+
+/-- `writePlaceState` only changes the written local. -/
+theorem writePlaceState_frame {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {place : Place} {rootTy : Ty} {w : Value}
+    (h : writePlaceState arityOf slots place rootTy w = .ok slots') :
+    ∃ x, slots' = slots.set place.local_ x := by
+  unfold writePlaceState at h
+  split at h
+  · nomatch h
+  · dsimp only at h
+    split at h
+    · nomatch h
+    · nomatch h
+    · split at h
+      · rename_i next _
+        simp only [SlotWriteResult.ok.injEq] at h
+        exact ⟨_, h.symm⟩
+      · nomatch h
+      · nomatch h
+    · split at h
+      · rename_i next _
+        simp only [SlotWriteResult.ok.injEq] at h
+        exact ⟨_, h.symm⟩
+      · nomatch h
+      · nomatch h
+    · split at h
+      · rename_i next _
+        simp only [SlotWriteResult.ok.injEq] at h
+        exact ⟨_, h.symm⟩
+      · nomatch h
+      · nomatch h
+
+/-- **Distinct-Local Frame of `Deref` writes (`evalDerefPlaceWrite_frame`)**: a write through a
+pointer changes only the slot of its resolved target local; every other local — including the
+pointer local `_p` when the target is another local — keeps its slot. -/
+theorem evalDerefPlaceWrite_frame {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} {slots slots' : List LocalSlotState} {place : Place}
+    {v : Value} {tgt : Place} (hRes : resolvePlace cx slots place true = .ok tgt)
+    (h : evalDerefPlaceWrite arityOf rootTyOf cx slots place v = .ok slots') :
+    ∀ j, j ≠ tgt.local_ → slots'[j]? = slots[j]? := by
+  intro j hj
+  simp only [evalDerefPlaceWrite, hRes] at h
+  cases hW : writePlaceState arityOf slots tgt (rootTyOf tgt.local_) v with
+  | ub => simp [hW, liftWrite] at h
+  | unsupported => simp [hW, liftWrite] at h
+  | ok s =>
+    simp only [hW, liftWrite, Except.ok.injEq] at h
+    subst h
+    obtain ⟨x, rfl⟩ := writePlaceState_frame hW
+    exact List.getElem?_set_ne (Ne.symm hj)
+
+/-- `writePlaceState` of an initialized root writes the value tree (`evalValueProjWrite`). -/
+theorem writePlaceState_init_root {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots : List LocalSlotState} {l : Nat} {q : List ProjectionElem} {rootTy : Ty}
+    {root w root' : Value} (hSt : slots[l]? = some (.init root))
+    (hNoDeref : projectionHasDeref q = false)
+    (hW : evalValueProjWrite (slotsToTrustedLocals slots) root q w = .ok root') :
+    writePlaceState arityOf slots ⟨l, q⟩ rootTy w = .ok (slots.set l (.init root')) := by
+  rw [writePlaceState_eq (place := ⟨l, q⟩) hSt (by simp) hNoDeref]
+  have hT := (writeToFieldSlot_init_correspondence (slotsToTrustedLocals slots) arityOf root w
+    root' rootTy q).1.mpr hW
+  simp only [slotStateToFieldSlot, hT, fieldSlotToLocalSlotState]
+
+/-- Inversion of `writePlaceState` on an initialized root. -/
+theorem writePlaceState_init_root_inv {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {l : Nat} {q : List ProjectionElem} {rootTy : Ty}
+    {root w : Value} (hSt : slots[l]? = some (.init root)) (hNoDeref : projectionHasDeref q = false)
+    (h : writePlaceState arityOf slots ⟨l, q⟩ rootTy w = .ok slots') :
+    ∃ root', evalValueProjWrite (slotsToTrustedLocals slots) root q w = .ok root' ∧
+      slots' = slots.set l (.init root') := by
+  rw [writePlaceState_eq (place := ⟨l, q⟩) hSt (by simp) hNoDeref] at h
+  simp only [slotStateToFieldSlot] at h
+  cases q with
+  | nil =>
+    simp only [writeToFieldSlot] at h
+    simp only [SlotWriteResult.ok.injEq] at h
+    exact ⟨w, rfl, by rw [← h]; rfl⟩
+  | cons e rest =>
+    unfold writeToFieldSlot at h
+    dsimp only at h
+    cases hE : evalValueProjWrite (slotsToTrustedLocals slots) root (e :: rest) w with
+    | ok r' =>
+      rw [hE] at h
+      simp only [SlotWriteResult.ok.injEq] at h
+      exact ⟨r', rfl, by rw [← h]; rfl⟩
+    | ub => rw [hE] at h; nomatch h
+    | unsupported => rw [hE] at h; nomatch h
+
+/-- **Get-Put at a `Deref` target (`writePlaceState_get_put_init`)**: writing back the value read
+from a sub-place of an initialized local leaves the frame unchanged. -/
+theorem writePlaceState_get_put_init {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots : List LocalSlotState} {l : Nat} {q : List ProjectionElem} {rootTy : Ty}
+    {root v : Value} (hSt : slots[l]? = some (.init root))
+    (hRead : readPlaceState slots ⟨l, q⟩ = .ok v) :
+    writePlaceState arityOf slots ⟨l, q⟩ rootTy v = .ok slots := by
+  have hND : projectionHasDeref q = false := readPlaceState_ok_noDeref hRead
+  have hR : evalValueProjRead (slotsToTrustedLocals slots) root q = .ok v := by
+    simpa [readPlaceState, hND, get?_eq_getElem?, hSt] using hRead
+  rw [writePlaceState_init_root hSt hND (evalValueProjWrite_read_same q _ root v hR)]
+  have hLt : l < slots.length := (List.getElem?_eq_some_iff.mp hSt).1
+  have hEq : slots[l] = .init root := by
+    rw [List.getElem?_eq_getElem hLt] at hSt
+    exact Option.some.inj hSt
+  rw [← hEq, List.set_getElem_self hLt]
+
+/-- A value-tree read of a non-empty path never succeeds on a scalar. -/
+theorem evalValueProjRead_cons_scalar (locals : List LocalSlot) (sc : ScalarInt)
+    (e : ProjectionElem) (rest : List ProjectionElem) (w : Value) :
+    evalValueProjRead locals (.scalar sc) (e :: rest) ≠ .ok w := by
+  cases e <;> simp [evalValueProjRead]
+
+/-- A value-tree write of a non-empty path never succeeds on a scalar. -/
+theorem evalValueProjWrite_cons_scalar (locals : List LocalSlot) (sc : ScalarInt)
+    (e : ProjectionElem) (rest : List ProjectionElem) (w v' : Value) :
+    evalValueProjWrite locals (.scalar sc) (e :: rest) w ≠ .ok v' := by
+  cases e <;> simp [evalValueProjWrite]
+
+/-- **Put-Get at a `Deref` target (`writePlaceState_put_get_init`)**: after writing `w` to a
+sub-place of an initialized local, reading the sub-place yields `w`. -/
+theorem writePlaceState_put_get_init {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {l : Nat} {q : List ProjectionElem} {rootTy : Ty}
+    {root w : Value} (hSt : slots[l]? = some (.init root)) (hNoDeref : projectionHasDeref q = false)
+    (h : writePlaceState arityOf slots ⟨l, q⟩ rootTy w = .ok slots') :
+    readPlaceState slots' ⟨l, q⟩ = .ok w := by
+  obtain ⟨root', hW, rfl⟩ := writePlaceState_init_root_inv hSt hNoDeref h
+  have hLt : l < slots.length := (List.getElem?_eq_some_iff.mp hSt).1
+  have hRd := evalValueProjRead_write_same q (slotsToTrustedLocals slots) root w root' hW
+  unfold readPlaceState
+  simp only [hNoDeref, get?_eq_getElem?, List.getElem?_set_self hLt]
+  cases q with
+  | nil => simpa [evalValueProjRead] using hRd
+  | cons e rest =>
+    have hNS : ∀ sc, slotStateToTrustedLocal (.init root) ≠ .init (.scalar sc) := by
+      intro sc hEq
+      simp only [slotStateToTrustedLocal, LocalSlot.init.injEq] at hEq
+      subst hEq
+      exact evalValueProjWrite_cons_scalar _ sc e rest w root' hW
+    have hNS' : ∀ sc, slotStateToTrustedLocal (.init root') ≠ .init (.scalar sc) := by
+      intro sc hEq
+      simp only [slotStateToTrustedLocal, LocalSlot.init.injEq] at hEq
+      subst hEq
+      exact evalValueProjRead_cons_scalar _ sc e rest w hRd
+    have hSame := sameScalarLocals_set hSt hNS hNS'
+    rw [← evalValueProjRead_congr_scalar_locals hSame]
+    exact hRd
+
+/-- Reading a whole local depends only on its slot. -/
+theorem readPlaceState_root_congr {s s' : List LocalSlotState} {p : Nat} (h : s'[p]? = s[p]?) :
+    readPlaceState s' ⟨p, []⟩ = readPlaceState s ⟨p, []⟩ := by
+  unfold readPlaceState
+  simp only [projectionHasDeref, get?_eq_getElem?, h]
+  cases s[p]? with
+  | none => rfl
+  | some st => cases st <;> simp [evalValueProjRead, readFromPartialShell]
+
+/-- A successful read is of a live local. -/
+theorem readPlaceState_ok_live {slots : List LocalSlotState} {place : Place} {v : Value}
+    (h : readPlaceState slots place = .ok v) :
+    ∃ st, slots[place.local_]? = some st ∧ st ≠ .dead := by
+  have hND := readPlaceState_ok_noDeref h
+  cases hS : slots[place.local_]? with
+  | none => simp [readPlaceState, hND, get?_eq_getElem?, hS] at h
+  | some st =>
+    refine ⟨st, rfl, fun hD => ?_⟩
+    subst hD
+    simp [readPlaceState, hND, get?_eq_getElem?, hS] at h
+
+/-- **Stability of synthetic resolution (`resolveSyntheticSubplace_stable`)**: a resolution decided
+by the root shortcut or by a unique candidate gives the same sub-place in any frame of the same
+size in which the target local is still live and the candidate still passes the runtime checks. -/
+theorem resolveSyntheticSubplace_stable {cx : SubplaceCtx} {slots slots' : List LocalSlotState}
+    {p : SynPtr} {pty : PtrTy} {ow ow' : Bool} {l : Nat} {q : List ProjectionElem}
+    (hRes : resolveSyntheticSubplace cx slots p pty ow = .ok (l, q))
+    (hLen : slots'.length = slots.length) (hLive : slots'[l]? ≠ some .dead)
+    (hShape : ∀ base, localBaseAddr cx.allocs l cx.limit = some base →
+      (p.addr = base ∧ cx.declTy l = some pty.pointee ∧ q = []) ∨
+      (cx.candidates pty.pointee l (p.addr - base) = [q] ∧ candConsistent cx slots' l false q = true ∧
+        candConsistent cx slots' l true q = true)) :
+    resolveSyntheticSubplace cx slots' p pty ow' = .ok (l, q) := by
+  obtain ⟨tl, tag, base, allocSize, align, hP, hProv, hlS, hlA, _, hBase, hOwn, hGe, hIn, hWhich⟩ :=
+    resolveSyntheticSubplace_sound hRes
+  rw [resolveSyntheticSubplace_of_prechecks hP, hProv]
+  have hNot : ¬ min slots'.length cx.allocs.length ≤ l := by omega
+  have hLt' : ¬ p.addr < base := by omega
+  have hIn' : ¬ allocSize < p.addr - base + tl.size := by omega
+  simp only [hNot, ↓reduceIte, hBase, hOwn, hLt', hIn']
+  have hTail : (if p.addr - base = 0 ∧ cx.declTy l = some pty.pointee then
+        (Except.ok (l, []) : Except DerefErr (Nat × List ProjectionElem))
+      else
+        match selectSubplaceCandidate (cx.candidates pty.pointee l (p.addr - base))
+            (candConsistent cx slots' l false) (candConsistent cx slots' l true)
+            (cx.decodeTag tag pty.pointee) (tl.size == 0) (subplaceReadable slots' l) ow' with
+        | some q => .ok (l, q)
+        | none => .error .unsupported) = .ok (l, q) := by
+    by_cases hR : p.addr - base = 0 ∧ cx.declTy l = some pty.pointee
+    · simp only [hR.1, hR.2, and_self, ↓reduceIte]
+      rcases hWhich with ⟨_, _, rfl⟩ | ⟨_, _, hNR, _⟩
+      · rfl
+      · exact absurd hR hNR
+    · simp only [hR, ↓reduceIte]
+      rcases hShape base hBase with ⟨hA, hD, _⟩ | ⟨hC, hc1, hc2⟩
+      · exact absurd ⟨by omega, hD⟩ hR
+      · rw [hC, selectSubplaceCandidate_singleton _ _ _ _ hc1 (fun _ => hc2)]
+  cases hS' : slots'[l]? with
+  | none => exact hTail
+  | some st =>
+    cases st with
+    | dead => exact absurd hS' hLive
+    | _ => exact hTail
+
+/-- **Put-Get through a pointer (`evalDerefPlaceWrite_put_get`)**: writing `v` through `*_p` into
+an initialized target sub-place of another local and then reading `*_p` yields `v`, whenever the
+pointer's resolution is decided by its root or by a unique candidate whose union path is active
+(so that the write does not change which sub-place the pointer designates). -/
+theorem evalDerefPlaceWrite_put_get {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} {slots slots' : List LocalSlotState} {p : Nat}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {l : Nat} {q : List ProjectionElem}
+    {root v : Value} (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty true = .ok (l, q))
+    (hNe : l ≠ p) (hTgt : slots[l]? = some (.init root)) (hQ : projectionHasDeref q = false)
+    (hShape : ∀ base, localBaseAddr cx.allocs l cx.limit = some base →
+      ((cx.ptrOf pv).addr = base ∧ cx.declTy l = some pty.pointee ∧ q = []) ∨
+      cx.candidates pty.pointee l ((cx.ptrOf pv).addr - base) = [q])
+    (hUnion : ∀ st b, cx.unionActive st q b = true)
+    (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, [.deref]⟩ v = .ok slots') :
+    evalDerefPlaceRead cx slots' ⟨p, [.deref]⟩ = .ok v := by
+  obtain ⟨stp, hStp, hLiveP⟩ := readPlaceState_ok_live hPtr
+  have hResT : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty
+      (true && ([] : List ProjectionElem).isEmpty) = .ok (l, q) := by simpa using hRes
+  have hPl := resolvePlace_deref (rest := []) hStp hLiveP hPtr hTy hResT rfl
+  rw [List.append_nil] at hPl
+  simp only [evalDerefPlaceWrite, hPl] at hW
+  cases hWS : writePlaceState arityOf slots ⟨l, q⟩ (rootTyOf l) v with
+  | ub => simp [hWS, liftWrite] at hW
+  | unsupported => simp [hWS, liftWrite] at hW
+  | ok s =>
+    simp only [hWS, liftWrite, Except.ok.injEq] at hW
+    subst hW
+    have hPG := writePlaceState_put_get_init hTgt hQ hWS
+    obtain ⟨root', _, hEq⟩ := writePlaceState_init_root_inv hTgt hQ hWS
+    have hLt : l < slots.length := (List.getElem?_eq_some_iff.mp hTgt).1
+    have hT' : s[l]? = some (.init root') := by rw [hEq, List.getElem?_set_self hLt]
+    have hStp' : s[p]? = slots[p]? := by rw [hEq, List.getElem?_set_ne hNe]
+    have hPtr' : readPlaceState s ⟨p, []⟩ = .ok (.ptr pv sz) := by
+      rw [readPlaceState_root_congr hStp']
+      exact hPtr
+    have hEval : evalValueProjRead (slotsToTrustedLocals s) root' q = .ok v := by
+      simpa [readPlaceState, hQ, get?_eq_getElem?, hT'] using hPG
+    have hCons : ∀ b, candConsistent cx s l b q = true := by
+      intro b
+      simp [candConsistent, hT', slotStateToFieldSlot, checkSlotProjectionOk, hEval, hUnion]
+    have hRes' : resolveSyntheticSubplace cx s (cx.ptrOf pv) pty false = .ok (l, q) := by
+      refine resolveSyntheticSubplace_stable hRes (by rw [hEq, List.length_set]) (by simp [hT'])
+        (fun base hB => ?_)
+      rcases hShape base hB with h | h
+      · exact Or.inl h
+      · exact Or.inr ⟨h, hCons false, hCons true⟩
+    rw [evalDerefPlaceRead_deref (rest := []) (by rw [hStp']; exact hStp) hLiveP hPtr' hTy hRes' rfl,
+      List.append_nil, hPG]
+    rfl
+
+/-- **Get-Put through a pointer (`evalDerefPlaceWrite_get_put`)**: writing back, through `*_p`,
+the value read through `*_p` from an initialized target leaves the frame unchanged (whenever the
+read and write modes resolve `*_p` to the same sub-place). -/
+theorem evalDerefPlaceWrite_get_put {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} {slots : List LocalSlotState} {place tgt : Place}
+    {root v : Value} (hResR : resolvePlace cx slots place false = .ok tgt)
+    (hResW : resolvePlace cx slots place true = .ok tgt)
+    (hTgt : slots[tgt.local_]? = some (.init root))
+    (hRead : evalDerefPlaceRead cx slots place = .ok v) :
+    evalDerefPlaceWrite arityOf rootTyOf cx slots place v = .ok slots := by
+  simp only [evalDerefPlaceRead, hResR] at hRead
+  have hR : readPlaceState slots tgt = .ok v := by
+    cases hRS : readPlaceState slots tgt with
+    | ok w => rw [hRS] at hRead; simp only [liftRead, Except.ok.injEq] at hRead; rw [hRead]
+    | ub => rw [hRS] at hRead; nomatch hRead
+    | unsupported => rw [hRS] at hRead; nomatch hRead
+  obtain ⟨l, q⟩ := tgt
+  simp only [evalDerefPlaceWrite, hResW, writePlaceState_get_put_init hTgt hR, liftWrite]
+
+/-- **Disjoint-Sibling frame of `Deref` writes (`evalDerefPlaceWrite_read_sibling`)**: a write
+through `*_p` into field `f` of an initialized target leaves every disjoint sibling field `g ≠ f`
+of the same aggregate (and everything below it) unchanged. -/
+theorem evalDerefPlaceWrite_read_sibling {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} {slots slots' : List LocalSlotState} {place : Place}
+    {l f g : Nat} {tyF tyG : Ty} {r : List ProjectionElem} {var : Nat} {fields : List Value}
+    {v : Value} (hRes : resolvePlace cx slots place true = .ok ⟨l, [.field f tyF]⟩)
+    (hTgt : slots[l]? = some (.init (.aggregate var fields))) (hfg : f ≠ g)
+    (h : evalDerefPlaceWrite arityOf rootTyOf cx slots place v = .ok slots') :
+    readPlaceState slots' ⟨l, .field g tyG :: r⟩ = readPlaceState slots ⟨l, .field g tyG :: r⟩ := by
+  simp only [evalDerefPlaceWrite, hRes] at h
+  cases hWS : writePlaceState arityOf slots ⟨l, [.field f tyF]⟩ (rootTyOf l) v with
+  | ub => simp [hWS, liftWrite] at h
+  | unsupported => simp [hWS, liftWrite] at h
+  | ok s =>
+    simp only [hWS, liftWrite, Except.ok.injEq] at h
+    subst h
+    obtain ⟨root', hW, hEq⟩ := writePlaceState_init_root_inv hTgt (by rfl) hWS
+    have hLt : l < slots.length := (List.getElem?_eq_some_iff.mp hTgt).1
+    -- the written aggregate differs from the old one only at field `f`
+    simp only [evalValueProjWrite, get?_eq_getElem?] at hW
+    cases hF : fields[f]? with
+    | none => rw [hF] at hW; nomatch hW
+    | some old =>
+      rw [hF] at hW
+      cases hSet : set? fields f v with
+      | none => rw [hSet] at hW; nomatch hW
+      | some fields' =>
+        rw [hSet] at hW
+        simp only [ProjWriteResult.ok.injEq] at hW
+        subst hW
+        have hG : fields'[g]? = fields[g]? := by
+          obtain ⟨_, rfl⟩ := set?_eq_some_iff.mp hSet
+          exact List.getElem?_set_ne hfg
+        have hNS : ∀ sc, slotStateToTrustedLocal (.init (.aggregate var fields)) ≠ .init (.scalar sc) := by
+          intro sc hE; simp [slotStateToTrustedLocal] at hE
+        have hNS' : ∀ sc, slotStateToTrustedLocal (.init (.aggregate var fields')) ≠ .init (.scalar sc) := by
+          intro sc hE; simp [slotStateToTrustedLocal] at hE
+        have hSame := sameScalarLocals_set (new := .init (.aggregate var fields')) hTgt hNS hNS'
+        rw [hEq]
+        unfold readPlaceState
+        simp only [get?_eq_getElem?, List.getElem?_set_self hLt, hTgt]
+        split
+        · rfl
+        · rw [← evalValueProjRead_congr_scalar_locals hSame]
+          simp only [evalValueProjRead, get?_eq_getElem?, hG]
+
+/-- **`Deinit` through a pointer (`evalDerefPlaceDeinit_target`)**: `Deinit((*_p).rest)`
+deinitializes exactly the resolved target sub-place: the frame changes only at the target local
+(so `_p` keeps its slot when the target is another local), and the target then reads as
+uninitialized (Get-Deinit of Section 2a). -/
+theorem evalDerefPlaceDeinit_target {ts : Bool} {cx : SubplaceCtx}
+    {slots slots' : List LocalSlotState} {place : Place} {l : Nat} {q : List ProjectionElem}
+    (hRes : resolvePlace cx slots place false = .ok ⟨l, q⟩)
+    (h : evalDerefPlaceDeinit ts cx slots place = .ok slots') :
+    evalDeinitPlace ts slots ⟨l, q⟩ = some slots' ∧
+      (∀ j, j ≠ l → slots'[j]? = slots[j]?) ∧
+      readPlaceState slots' ⟨l, q⟩ = .ub := by
+  simp only [evalDerefPlaceDeinit, hRes] at h
+  cases hD : evalDeinitPlace ts slots ⟨l, q⟩ with
+  | none => rw [hD] at h; nomatch h
+  | some s =>
+    rw [hD] at h
+    simp only [Except.ok.injEq] at h
+    subst h
+    obtain ⟨_, _, _, slot', hDS, hEq⟩ := evalDeinitPlace_eq_some hD
+    refine ⟨rfl, fun j hj => ?_,
+      evalDeinitPlace_read_same_ub hD (Or.inl ⟨[], (List.append_nil _).symm⟩)
+        (deinitFieldSlot_noDeref hDS)⟩
+    rw [hEq]
+    exact List.getElem?_set_ne (Ne.symm hj)
+
+/-! ### Section 4e: `Retag` of synthetic sub-place references (dangling `DeadLocal` detection) -/
+
+/-- The `Retag` context of a synthetic frame: Anneal's address of a pointer value, and the local
+its synthetic provenance names (`resolve_synthetic_alloc_local`: by `alloc_id` alone, at the
+local's base address or at any sub-place offset). -/
+def synthRetagCtx (cx : SubplaceCtx) (ptrBits : Nat) (slots : List LocalSlotState) : RetagCtx where
+  ptrBits := ptrBits
+  addrOf pv := (cx.ptrOf pv).addr
+  localOf pv :=
+    match (cx.ptrOf pv).prov with
+    | some (l + 1, _) => if l < slots.length then some l else none
+    | _ => none
+  slots := slots
+
+/-- **Dangling sub-place references fault (`retag_subplace_ref_dead_local`)**: retagging a reference
+whose synthetic provenance names a storage-dead local fails (`DeadLocal`) for every non-zero-sized
+pointee — in particular a reference to a sub-place `&_s.f` at a non-zero offset `relOff > 0` from
+the dead local's base address, which the base-address-only resolution `resolveSyntheticLocal`
+does not recognize as that local. -/
+theorem retag_subplace_ref_dead_local (cx : SubplaceCtx) (ptrBits : Nat)
+    (slots : List LocalSlotState) (pt : RetagPointee) (pv : ProvenancePtr) {l tag : Nat}
+    (hProv : (cx.ptrOf pv).prov = some (l + 1, tag)) (hDead : slots[l]? = some .dead)
+    (hNZ : pt.zeroSized = false) :
+    retagRefOk (synthRetagCtx cx ptrBits slots) pt pv = false := by
+  obtain ⟨hlt, hEq⟩ := List.getElem?_eq_some_iff.mp hDead
+  have hLive : retagTargetLive (synthRetagCtx cx ptrBits slots) pt pv = false := by
+    simp [retagTargetLive, synthRetagCtx, hProv, hlt, hEq, hNZ]
+  simp [retagRefOk, hLive]
+
+/-- The legacy base-address-only resolution misses such a dangling sub-place reference: a pointer
+at offset `relOff > 0` from its provenance local's base address is not that local's base pointer. -/
+theorem resolveSyntheticLocal_misses_subplace (env : CopyEnv) (n : Nat) (p : CopyPtr) {l : Nat}
+    (hl : provenanceLocal n p = some l) (hOff : p.addr ≠ env.baseAddr l) :
+    resolveSyntheticLocal env n p = none := by
+  simp [resolveSyntheticLocal, hl, hOff]
+
+/-- `Retag` of a place through `Deref` (`retag_place` after `prepare_place_access` resolves every
+`Deref` to its live synthetic target): the target sub-place is retagged by `evalRetagPlace`. -/
+def evalRetagDerefPlace (cx : SubplaceCtx) (ctx : RetagCtx) (kind : RetagKind) (place : Place)
+    (ty : RetagTy) (rawPtrPlace : Bool) : Bool :=
+  match resolvePlace cx ctx.slots place false with
+  | .ok tgt => evalRetagPlace ctx kind tgt ty rawPtrPlace
+  | .error _ => false
+
+/-- `Retag` through `Deref` is `evalRetagPlace` of the resolved target; a dangling pointer
+(target local dead) or an unresolvable one fails. -/
+theorem evalRetagDerefPlace_eq {cx : SubplaceCtx} {ctx : RetagCtx} {kind : RetagKind}
+    {place tgt : Place} {ty : RetagTy} {b : Bool}
+    (hRes : resolvePlace cx ctx.slots place false = .ok tgt) :
+    evalRetagDerefPlace cx ctx kind place ty b = evalRetagPlace ctx kind tgt ty b := by
+  simp [evalRetagDerefPlace, hRes]
+
+/-- A `Deref`-free place is retagged exactly as before (conservative extension). -/
+theorem evalRetagDerefPlace_noDeref {cx : SubplaceCtx} {ctx : RetagCtx} {kind : RetagKind}
+    {place : Place} {ty : RetagTy} {b : Bool} {st : LocalSlotState}
+    (hSt : ctx.slots[place.local_]? = some st) (hLive : st ≠ .dead)
+    (hNoDeref : projectionHasDeref place.projection = false) :
+    evalRetagDerefPlace cx ctx kind place ty b = evalRetagPlace ctx kind place ty b :=
+  evalRetagDerefPlace_eq (resolvePlace_noDeref false hSt hLive hNoDeref)
+
+/-! ### Section 4f: Step refinement of `Deref` accesses against `Trusted.Rustc.V2026_06_01.MirSemantics`
+
+Trusted tracks a pointer by its borrow-table tag (`BorrowEntry.targetLocal` /
+`targetProjection`), Anneal by its synthetic address and provenance. The refinement theorems
+below relate the two through the pointer correspondence "Trusted's borrow entry for the pointer's
+tag names exactly the sub-place that Anneal's address-based resolution designates", and show that
+every successful Anneal `Deref` access of runtime MIR's shape `⟨p, .deref :: rest⟩` is matched by
+Trusted (`evalOperand`, `writePlaceValue`, and `evalStmt` `.assign`) with the same value, keeping
+the frames related by `SlotsRefine SlotBelow`. -/
+
+theorem appendProjections_eq_append :
+    ∀ (xs ys : List ProjectionElem), appendProjections xs ys = xs ++ ys
+  | [], _ => rfl
+  | x :: xs, ys => by simp only [appendProjections, appendProjections_eq_append xs ys, List.cons_append]
+
+/-- A static sub-place path has no `Deref`. -/
+theorem subplaceAt_noDeref :
+    ∀ {lay : ByteLayout} {base : Nat} {p : List ProjectionElem} {l : ByteLayout} {o : Nat},
+      subplaceAt lay base p = some (l, o) → projectionHasDeref p = false
+  | _, _, [], _, _, _ => rfl
+  | lay, base, .downcast _ _ :: rest, l, o, h => by
+    simp only [subplaceAt] at h
+    simpa [projectionHasDeref] using subplaceAt_noDeref h
+  | .leaf _, _, .field _ _ :: _, _, _, h => by simp [subplaceAt] at h
+  | .leaf _, _, .constantIndex _ _ _ :: _, _, _, h => by simp [subplaceAt] at h
+  | .struct n offs ls, base, .field f ty :: rest, l, o, h => by
+    obtain ⟨o', l', _, _, h'⟩ := subplaceAt_struct_child (Or.inl ⟨ty, rfl⟩) h
+    simpa [projectionHasDeref] using subplaceAt_noDeref h'
+  | .struct n offs ls, base, .constantIndex k m fromEnd :: rest, l, o, h => by
+    cases fromEnd with
+    | true => simp [subplaceAt] at h
+    | false =>
+      obtain ⟨o', l', _, _, h'⟩ := subplaceAt_struct_child (Or.inr ⟨m, rfl⟩) h
+      simpa [projectionHasDeref] using subplaceAt_noDeref h'
+  | _, _, .deref :: _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .index _ :: _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .subslice _ _ _ :: _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .opaqueCast _ :: _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+  | _, _, .unwrapUnsafeBinder _ :: _, _, _, h => by cases ‹ByteLayout› <;> simp [subplaceAt] at h
+
+/-- In a well-formed context, every resolved sub-place is a static (`Deref`-free) path. -/
+theorem resolveSyntheticSubplace_noDeref {cx : SubplaceCtx} (hWF : cx.WF)
+    {slots : List LocalSlotState} {p : SynPtr} {pty : PtrTy} {ow : Bool} {l : Nat}
+    {q : List ProjectionElem} (h : resolveSyntheticSubplace cx slots p pty ow = .ok (l, q)) :
+    projectionHasDeref q = false := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, hWhich⟩ := resolveSyntheticSubplace_sound h
+  rcases hWhich with ⟨_, _, rfl⟩ | ⟨i, C, _, _, _, hq, _⟩
+  · rfl
+  · obtain ⟨lay, sub, tl, _, hSub, _, _⟩ := hWF.candidates _ _ _ q (List.mem_of_getElem? hq)
+    exact subplaceAt_noDeref hSub
+
+theorem projectionHasDeref_append : ∀ (xs ys : List ProjectionElem),
+    projectionHasDeref (xs ++ ys) = (projectionHasDeref xs || projectionHasDeref ys)
+  | [], ys => by simp [projectionHasDeref]
+  | x :: xs, ys => by cases x <;> simp [projectionHasDeref, projectionHasDeref_append xs ys]
+
+/-- **`Deref` reads refine Trusted's `evalOperand` (`evalDerefPlaceRead_refines_evalOperand`)**:
+on below-related frames, if Anneal reads `v` from `(*_p).rest` and Trusted's (non-disabled)
+borrow entry for `_p`'s tag names the sub-place Anneal resolves `*_p` to, then Trusted's
+`Operand.copy ((*_p).rest)` evaluates to the same `v` without changing the frame. -/
+theorem evalDerefPlaceRead_refines_evalOperand {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
+    {v : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v)
+    (globals : List CapturedAllocation) (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    evalOperand locals (.copy ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals =
+      .ok v locals := by
+  obtain ⟨stp, hStp, hLiveP⟩ := readPlaceState_ok_live hPtr
+  rw [evalDerefPlaceRead_deref hStp hLiveP hPtr hTy hRes hRest] at hRead
+  have hTR : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection ++ rest⟩ = .ok v := by
+    cases hRS : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection ++ rest⟩ with
+    | ok w => rw [hRS] at hRead; simp only [liftRead, Except.ok.injEq] at hRead; rw [hRead]
+    | ub => rw [hRS] at hRead; nomatch hRead
+    | unsupported => rw [hRS] at hRead; nomatch hRead
+  obtain ⟨rootVal, ht, hr⟩ := readPlaceState_below_refines hRel hTR
+  obtain ⟨rootP, hp, hrp⟩ := readPlaceState_below_refines hRel hPtr
+  simp only [readProjectedValue] at hrp
+  cases hrp
+  simp only [get?_eq_getElem?] at ht hp
+  rw [← appendProjections_eq_append] at hr
+  cases htp : entry.targetProjection with
+  | nil =>
+    rw [htp] at hr
+    simp only [appendProjections] at hr
+    cases hpe : entry.perm with
+    | disabled => exact absurd hpe hPerm
+    | _ => simp [evalOperand, get?_eq_getElem?, hp, hEntry, hpe, ht, htp, hr]
+  | cons ph pt =>
+    rw [htp] at hr hThin
+    simp only [appendProjections] at hr
+    cases hpe : entry.perm with
+    | disabled => exact absurd hpe hPerm
+    | _ => simp [evalOperand, get?_eq_getElem?, hp, hEntry, hpe, ht, htp, hr, hThin]
+
+/-- **`Deref` reads refine Trusted's `evalRvalue` (`evalDerefPlaceRead_refines_evalRvalue`)**: under
+the hypotheses of `evalDerefPlaceRead_refines_evalOperand`, Trusted's `Rvalue.use (copy (*_p).rest)`
+evaluates to the same value without changing the frame (Trusted may only freeze the read tags of
+its borrow table). -/
+theorem evalDerefPlaceRead_refines_evalRvalue {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
+    {v : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
+    {entry : BorrowEntry} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow mem.borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v) (layouts : LayoutTable) :
+    ∃ mem', evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem [] layouts = .ok v locals mem' := by
+  have hOp := evalDerefPlaceRead_refines_evalOperand hRel hRest hPtr hTy hRes hEntry hPerm hThin
+    hRead mem.globals layouts mem.callerLocals
+  have hV : validateLoadedValue layouts [] (.copy ⟨p, .deref :: rest⟩) v = true := by
+    simp [validateLoadedValue, operandTy, placeTy]
+  simp only [evalRvalue, hOp, hV]
+  cases hb : mem.borrows with
+  | nil => exact ⟨_, rfl⟩
+  | cons b₁ bs =>
+    cases bs with
+    | nil => exact ⟨_, rfl⟩
+    | cons b₂ bs => exact ⟨_, rfl⟩
+
+/-- **`Deref` writes refine Trusted's `writePlaceValue` (`evalDerefPlaceWrite_refines_writePlaceValue`)**:
+on below-related frames, if Anneal writes `v` through `(*_p).rest` into an initialized target and
+Trusted's writable (`active`/`reserved`) borrow entry for `_p`'s tag names the sub-place Anneal
+resolves `*_p` to, then Trusted's `writePlaceValue` succeeds and the updated frames stay related
+by `SlotsRefine SlotBelow`. -/
+theorem evalDerefPlaceWrite_refines_writePlaceValue {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} (hWF : cx.WF) {slots slots' : List LocalSlotState}
+    {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem} {v root : Value}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty rest.isEmpty =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry)
+    (hPerm : entry.perm = .active ∨ entry.perm = .reserved)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hTgt : slots[entry.targetLocal]? = some (.init root))
+    (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, .deref :: rest⟩ v = .ok slots') :
+    ∃ locals', writePlaceValue locals borrows ⟨p, .deref :: rest⟩ v = .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨stp, hStp, hLiveP⟩ := readPlaceState_ok_live hPtr
+  have hResT : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (true && rest.isEmpty) =
+      .ok (entry.targetLocal, entry.targetProjection) := by simpa using hRes
+  have hPl := resolvePlace_deref hStp hLiveP hPtr hTy hResT hRest
+  simp only [evalDerefPlaceWrite, hPl] at hW
+  have hQ : projectionHasDeref (entry.targetProjection ++ rest) = false := by
+    rw [projectionHasDeref_append, resolveSyntheticSubplace_noDeref hWF hRes, hRest]; rfl
+  cases hWS : writePlaceState arityOf slots ⟨entry.targetLocal, entry.targetProjection ++ rest⟩
+      (rootTyOf entry.targetLocal) v with
+  | ub => simp [hWS, liftWrite] at hW
+  | unsupported => simp [hWS, liftWrite] at hW
+  | ok s =>
+    simp only [hWS, liftWrite, Except.ok.injEq] at hW
+    subst hW
+    obtain ⟨root', hWr, hEq⟩ := writePlaceState_init_root_inv hTgt hQ hWS
+    subst hEq
+    have hSame := sameScalarLocals_of_slotBelow hRel
+    have hWT : evalValueProjWrite locals root (entry.targetProjection ++ rest) v = .ok root' := by
+      rw [← evalValueProjWrite_congr_scalar_locals hSame]; exact hWr
+    have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hWT
+    obtain ⟨rootP, hp, hrp⟩ := readPlaceState_below_refines hRel hPtr
+    simp only [readProjectedValue] at hrp
+    cases hrp
+    have hTT : locals[entry.targetLocal]? = some (.init root) := by
+      rcases SlotsRefine.get?_rel entry.targetLocal hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+      · simp only [get?_eq_getElem?] at hA; rw [hA] at hTgt; nomatch hTgt
+      · simp only [get?_eq_getElem?] at hA hT
+        rw [hA] at hTgt
+        cases hTgt
+        cases t with
+        | init w => have hvw : root = w := hAT; subst hvw; exact hT
+        | _ => simp [SlotBelow] at hAT
+    have hLtT : entry.targetLocal < locals.length := (List.getElem?_eq_some_iff.mp hTT).1
+    refine ⟨locals.set entry.targetLocal (.init root'), ?_,
+      SlotsRefine.set (a := .init root') (t := .init root') rfl _ hRel⟩
+    simp only [get?_eq_getElem?] at hp
+    have hSet : set? locals entry.targetLocal (.init root') =
+        some (locals.set entry.targetLocal (.init root')) := set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+    cases htp : entry.targetProjection with
+    | nil =>
+      rw [htp] at hWP hThin hWr
+      cases rest with
+      | nil =>
+        have hRV : root' = v := by
+          simp only [List.append_nil, evalValueProjWrite, ProjWriteResult.ok.injEq] at hWr
+          exact hWr.symm
+        subst hRV
+        rcases hPerm with hpe | hpe <;>
+          simp [writePlaceValue, get?_eq_getElem?, hp, hEntry, hpe, htp, hTT, hSet]
+      | cons r rs =>
+        simp only [List.nil_append] at hWP
+        rcases hPerm with hpe | hpe <;>
+          simp [writePlaceValue, get?_eq_getElem?, hp, hEntry, hpe, htp, hTT, hWP, hSet]
+    | cons ph pt =>
+      rw [htp] at hWP hThin
+      rw [← appendProjections_eq_append] at hWP
+      simp only [appendProjections] at hWP
+      rcases hPerm with hpe | hpe <;>
+        simp [writePlaceValue, get?_eq_getElem?, hp, hEntry, hpe, htp, hThin, hTT, hWP, hSet]
+
+/-- **`Deref` assignments refine Trusted's `evalStmt` (`evalStmt_assign_deref_refines`)**: with no
+active function-entry protector, when Trusted evaluates the rvalue to `v` without changing the
+frame, a successful Anneal write of `v` through `(*_p).rest` (as above) is matched by Trusted's
+`evalStmt` stepping the `.assign` with the written frame and the deref-write borrow invalidation,
+keeping the frames related by `SlotsRefine SlotBelow`. -/
+theorem evalStmt_assign_deref_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {cx : SubplaceCtx} (hWF : cx.WF) {slots slots' : List LocalSlotState}
+    (s : MachineState) {p : Nat} {rest : List ProjectionElem} (rv : Rvalue) (span : String)
+    {v root : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {entry : BorrowEntry}
+    (hprot : s.memory.activeProtectors = [])
+    (hv : evalRvalue s.frame.locals rv s.memory = .ok v s.frame.locals s.memory)
+    (hRel : SlotsRefine SlotBelow slots s.frame.locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty rest.isEmpty =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow s.memory.borrows pv.tag = some entry)
+    (hPerm : entry.perm = .active ∨ entry.perm = .reserved)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hTgt : slots[entry.targetLocal]? = some (.init root))
+    (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, .deref :: rest⟩ v = .ok slots') :
+    ∃ locals', evalStmt s ⟨.assign ⟨p, .deref :: rest⟩ rv, span⟩ =
+        MirStepNode.step (advanceStmt s locals'
+          { s.memory with
+            borrows := invalidateDerefWriteBorrows s.frame.locals s.memory.borrows
+              ⟨p, .deref :: rest⟩ rest }) ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨locals', hWV, hRel'⟩ := evalDerefPlaceWrite_refines_writePlaceValue hWF hRel hRest hPtr
+    hTy hRes hEntry hPerm hThin hTgt hW
+  refine ⟨locals', ?_, hRel'⟩
+  simp only [evalStmt, hv, evalPlaceWrite, hprot, hWV]
+
+/-! ### Section 4g: Sub-place and array-window `CopyNonOverlapping` (`eval_copy_nonoverlapping`) -/
+
+/-- The `CopyPtr` (address and allocation id) of a synthetic pointer. -/
+def SynPtr.toCopyPtr (p : SynPtr) : CopyPtr := ⟨p.addr, p.prov.map Prod.fst⟩
+
+/-- The `DeadLocal` check of `eval_copy_nonoverlapping` on a synthetic pointer: its provenance
+names a storage-dead local of the frame. -/
+def synthTargetDead (slots : List LocalSlotState) (p : SynPtr) : Bool :=
+  match p.prov with
+  | some (l + 1, _) =>
+    match slots[l]? with
+    | some .dead => true
+    | _ => false
+  | _ => false
+
+/-- **`read_subplace_slot`**: the field slot (`Uninit`, `PartialShell`, or `Init`) at a sub-place
+of a live local. -/
+def readSubplaceSlot (slots : List LocalSlotState) (l : Nat) (q : List ProjectionElem) :
+    Option FieldSlot :=
+  match slots[l]? with
+  | none => none
+  | some .dead => none
+  | some st => projectFieldSlot (slotsToTrustedLocals slots) (slotStateToFieldSlot st) q
+
+/-- Whether a sub-place slot is (known to be) uninitialized. -/
+def isUninitSlot : Option FieldSlot → Bool
+  | some .uninit => true
+  | _ => false
+
+/-- The element `0` of a 1-element array (`ConstantIndex { offset: 0, min_length: 1 }`), which
+covers the whole `[T; 1]`. -/
+def isUnitElem : ProjectionElem → Bool
+  | .constantIndex 0 1 false => true
+  | _ => false
+
+/-- Strip trailing 1-element-array element steps (nested `[[T; 1]; 1]` included). -/
+def stripUnitElems (q : List ProjectionElem) : List ProjectionElem :=
+  (q.reverse.dropWhile isUnitElem).reverse
+
+/-- Whether a path ends with an array element step (a forward `ConstantIndex`). -/
+def endsWithElem (q : List ProjectionElem) : Bool :=
+  match q.getLast? with
+  | some (.constantIndex _ _ false) => true
+  | _ => false
+
+/-- **`write_subplace_slot`**: stores a copied slot at a sub-place without guessing: an initialized
+slot is an ordinary write (`writePlaceState`: partial-shell fields are initialized and their
+siblings preserved); an uninitialized slot deinitializes the destination (`evalDeinitPlace`),
+except that an element of a multi-element array (arrays have no per-element state) is a no-op on
+an uninitialized array and fails closed otherwise, while the element of a `[T; 1]` covers, and
+deinitializes, the whole array; a partially initialized shell is stored verbatim at a whole-local
+destination and fails closed elsewhere. -/
+def writeSubplaceSlot (arityOf : Ty → VariantIdx → Bool → Option Nat) (rootTyOf : Nat → Ty)
+    (ts : Bool) (slots : List LocalSlotState) (l : Nat) (q : List ProjectionElem) :
+    FieldSlot → Option (List LocalSlotState)
+  | .init v =>
+    match writePlaceState arityOf slots ⟨l, q⟩ (rootTyOf l) v with
+    | .ok s => some s
+    | _ => none
+  | .uninit =>
+    if endsWithElem (stripUnitElems q) then
+      if isUninitSlot (readSubplaceSlot slots l (stripUnitElems q).dropLast) then some slots
+      else none
+    else evalDeinitPlace ts slots ⟨l, stripUnitElems q⟩
+  | .nested var adt disc fs =>
+    match q with
+    | [] =>
+      match slots[l]? with
+      | none => none
+      | some .dead => none
+      | some _ => some (slots.set l (fieldSlotToLocalSlotState (.nested var adt disc fs)))
+    | _ :: _ => none
+
+/-- The last array-element step of a path: `(array path, start, array length)`. -/
+def splitLastElem (q : List ProjectionElem) : Option (List ProjectionElem × Nat × Nat) :=
+  match q.getLast? with
+  | some (.constantIndex k n false) => some (q.dropLast, k, n)
+  | _ => none
+
+open Classical in
+/-- **Stateful sub-place `CopyNonOverlapping` (`eval_copy_nonoverlapping`)**, after its operands
+are evaluated to the synthetic pointers `src`, `dst` and the count, with endpoint resolution
+`resolve` (`resolve_synthetic_subplace` at the element type, the destination in whole-place-write
+mode):
+1. `copyNonOverlappingChecks` (width, null, alignment, length, wrap, and same-allocation byte
+   overlap `rangesDisjoint`), even for an empty copy; `count = 0` is then a no-op;
+2. a non-empty (or single-element) copy through the provenance of a storage-dead local is
+   `DeadLocal`;
+3. `count = 1`: the source sub-place's slot (`Uninit`, `PartialShell`, or `Init`) is stored at the
+   destination sub-place (`writeSubplaceSlot`); a zero-sized self-copy only checks readability;
+4. `count ≥ 2`: a contiguous window of `count` elements of one array is copied into a window of
+   another (`Subslice` read and write; the whole destination array when the window covers it);
+   an uninitialized source array leaves an uninitialized destination unchanged and
+   deinitializes a fully covered one, failing closed on a partial overwrite of initialized
+   elements;
+5. a zero-byte copy (`count * elemSize = 0`) between unresolved pointers accesses no memory and
+   is a no-op even through storage-dead locals; anything else is unsupported (`none`).
+(Classical decidability only decides the zero-sized self-copy test `sp = dp`.) -/
+noncomputable def evalCopyNonOverlappingSubplace (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTyOf : Nat → Ty) (ts : Bool) (ptrBits : Nat) (slots : List LocalSlotState)
+    (resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)) (src dst : SynPtr)
+    (count elemSize elemAlign : Nat) : Option (List LocalSlotState) :=
+  if !copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr count elemSize elemAlign then none
+  else if count = 0 then some slots
+  else if (count * elemSize != 0 || count == 1) &&
+      (synthTargetDead slots src || synthTargetDead slots dst) then none
+  else
+    match resolve src false, resolve dst true with
+    | .ok (sl, sp), .ok (dl, dp) =>
+      if count = 1 ∨ count * elemSize = 0 then
+        if elemSize = 0 ∧ sl = dl ∧ sp = dp then (readSubplaceSlot slots sl sp).map fun _ => slots
+        else
+          match readSubplaceSlot slots sl sp with
+          | some c => writeSubplaceSlot arityOf rootTyOf ts slots dl dp c
+          | none => none
+      else
+        match splitLastElem sp, splitLastElem dp with
+        | some (sArr, s0, sLen), some (dArr, d0, dLen) =>
+          if s0 + count ≤ sLen ∧ d0 + count ≤ dLen then
+            match readPlaceState slots ⟨sl, sArr ++ [.subslice s0 (s0 + count) false]⟩ with
+            | .ok w =>
+              let dstPlace : Place :=
+                if d0 = 0 ∧ count = dLen then ⟨dl, dArr⟩
+                else ⟨dl, dArr ++ [.subslice d0 (d0 + count) false]⟩
+              match writePlaceState arityOf slots dstPlace (rootTyOf dl) w with
+              | .ok s => some s
+              | _ => none
+            | _ =>
+              if isUninitSlot (readSubplaceSlot slots sl sArr) then
+                if isUninitSlot (readSubplaceSlot slots dl dArr) then some slots
+                else if d0 = 0 ∧ count = dLen then evalDeinitPlace ts slots ⟨dl, dArr⟩
+                else none
+              else none
+          else none
+        | _, _ => none
+    | _, _ => if count * elemSize = 0 then some slots else none
+
+/-- `count = 0` is a no-op after the checks. -/
+theorem evalCopyNonOverlappingSubplace_zero_count {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {elemSize elemAlign : Nat}
+    (hChk : copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr 0 elemSize elemAlign = true) :
+    evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst 0 elemSize
+      elemAlign = some slots := by
+  simp [evalCopyNonOverlappingSubplace, hChk]
+
+/-- **Self-overlap rejection (`evalCopyNonOverlappingSubplace_overlap_none`)**: a non-empty copy
+between overlapping byte ranges of the same allocation — e.g. a sub-place onto itself, or two
+overlapping windows of one array — is rejected (`CopyNonOverlappingOverlap`). -/
+theorem evalCopyNonOverlappingSubplace_overlap_none {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign : Nat} (hLen : 0 < count * elemSize)
+    (hSame : src.prov.map Prod.fst = dst.prov.map Prod.fst)
+    (hOverlap : src.addr < dst.addr + count * elemSize ∧ dst.addr < src.addr + count * elemSize) :
+    evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count elemSize
+      elemAlign = none := by
+  have hChkF : copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr count elemSize elemAlign = false := by
+    cases hC : copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr count elemSize elemAlign with
+    | false => rfl
+    | true =>
+      have hDisj := copyNonOverlappingChecks_disjoint hC hLen (by simp [SynPtr.toCopyPtr, hSame])
+      have := (copyOverlap_iff_not_rangesDisjoint src.addr dst.addr (count * elemSize)).mp hOverlap
+      simp only [SynPtr.toCopyPtr] at hDisj
+      rw [hDisj] at this
+      nomatch this
+  simp [evalCopyNonOverlappingSubplace, hChkF]
+
+/-- **Zero-byte bulk copies never fault (`evalCopyNonOverlappingSubplace_zst_bulk_noop`)**: a copy of
+`count ≥ 2` zero-sized elements between unresolved pointers is a no-op even through the
+provenance of storage-dead locals (no memory is accessed). -/
+theorem evalCopyNonOverlappingSubplace_zst_bulk_noop {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemAlign : Nat}
+    (hChk : copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr count 0 elemAlign = true)
+    (hCount : 2 ≤ count) {e : DerefErr} (hUnres : resolve src false = .error e) :
+    evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count 0
+      elemAlign = some slots := by
+  have h0 : count ≠ 0 := by omega
+  have h1 : (count == 1) = false := by simp; omega
+  simp [evalCopyNonOverlappingSubplace, hChk, h0, h1, hUnres]
+
+/-- Dead provenance faults (`DeadLocal`) for every non-empty or single-element copy. -/
+theorem evalCopyNonOverlappingSubplace_dead_none {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign : Nat} (hCount : count ≠ 0) (hLen : count * elemSize ≠ 0 ∨ count = 1)
+    (hDead : synthTargetDead slots src = true ∨ synthTargetDead slots dst = true) :
+    evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count elemSize
+      elemAlign = none := by
+  unfold evalCopyNonOverlappingSubplace
+  cases hChk : copyNonOverlappingChecks ptrBits src.toCopyPtr dst.toCopyPtr count elemSize elemAlign with
+  | false => rfl
+  | true =>
+    have hGuard : ((count * elemSize != 0 || count == 1) &&
+        (synthTargetDead slots src || synthTargetDead slots dst)) = true := by
+      rcases hLen with h | h <;> rcases hDead with hd | hd <;> simp [h, hd]
+    simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, hCount, hGuard]
+
+/-- **Read-After-Copy (`evalCopyNonOverlappingSubplace_read_after_copy`)**: after a single-element
+sub-place copy of an initialized source value `v` into a sub-place of an initialized local, the
+destination sub-place reads `v`. -/
+theorem evalCopyNonOverlappingSubplace_read_after_copy {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {elemSize elemAlign sl dl : Nat} {sp dp : List ProjectionElem} {v droot : Value}
+    (hSrcR : resolve src false = .ok (sl, sp)) (hDstR : resolve dst true = .ok (dl, dp))
+    (hDistinct : elemSize ≠ 0 ∨ sl ≠ dl ∨ sp ≠ dp)
+    (hSrc : readSubplaceSlot slots sl sp = some (.init v))
+    (hDst : slots[dl]? = some (.init droot)) (hDp : projectionHasDeref dp = false)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst 1 elemSize
+      elemAlign = some slots') :
+    readPlaceState slots' ⟨dl, dp⟩ = .ok v ∧ ∀ j, j ≠ dl → slots'[j]? = slots[j]? := by
+  unfold evalCopyNonOverlappingSubplace at h
+  split at h
+  · nomatch h
+  · split at h
+    · omega
+    · split at h
+      · nomatch h
+      · rw [hSrcR, hDstR] at h
+        simp only [true_or, ↓reduceIte] at h
+        have hNS : ¬ (elemSize = 0 ∧ sl = dl ∧ sp = dp) := by
+          rintro ⟨h1, h2, h3⟩
+          rcases hDistinct with h' | h' | h'
+          · exact h' h1
+          · exact h' h2
+          · exact h' h3
+        simp only [hNS, ↓reduceIte, hSrc, writeSubplaceSlot] at h
+        cases hWS : writePlaceState arityOf slots ⟨dl, dp⟩ (rootTyOf dl) v with
+        | ok s =>
+          rw [hWS] at h
+          simp only [Option.some.injEq] at h
+          subst h
+          refine ⟨writePlaceState_put_get_init hDst hDp hWS, fun j hj => ?_⟩
+          obtain ⟨x, hx⟩ := writePlaceState_frame hWS
+          rw [hx]
+          exact List.getElem?_set_ne (Ne.symm hj)
+        | ub => rw [hWS] at h; nomatch h
+        | unsupported => rw [hWS] at h; nomatch h
+
+/-- `writeSubplaceSlot` only changes the destination local. -/
+theorem writeSubplaceSlot_frame {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {slots slots' : List LocalSlotState} {l : Nat}
+    {q : List ProjectionElem} {c : FieldSlot}
+    (h : writeSubplaceSlot arityOf rootTyOf ts slots l q c = some slots') :
+    ∀ j, j ≠ l → slots'[j]? = slots[j]? := by
+  intro j hj
+  cases c with
+  | init v =>
+    simp only [writeSubplaceSlot] at h
+    split at h
+    · rename_i s hW
+      obtain ⟨x, hx⟩ := writePlaceState_frame hW
+      simp only [Option.some.injEq] at h
+      subst h
+      rw [hx]
+      exact List.getElem?_set_ne (Ne.symm hj)
+    · nomatch h
+  | uninit =>
+    simp only [writeSubplaceSlot] at h
+    split at h
+    · split at h
+      · simp only [Option.some.injEq] at h
+        subst h
+        rfl
+      · nomatch h
+    · obtain ⟨_, _, _, _, _, hs⟩ := evalDeinitPlace_eq_some h
+      subst hs
+      exact List.getElem?_set_ne (Ne.symm hj)
+  | nested var adt disc fs =>
+    simp only [writeSubplaceSlot] at h
+    split at h
+    · split at h
+      · nomatch h
+      · nomatch h
+      · simp only [Option.some.injEq] at h
+        subst h
+        exact List.getElem?_set_ne (Ne.symm hj)
+    · nomatch h
+
+/-- **Disjoint-Frame (`evalCopyNonOverlappingSubplace_frame`)**: a successful sub-place or
+array-window copy changes only the destination's local (whatever the source slot, the copied
+count, or the destination's shape); every other local of the frame — in particular the source's
+local when it is distinct — is untouched. -/
+theorem evalCopyNonOverlappingSubplace_frame {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign dl : Nat} {dp : List ProjectionElem}
+    (hDstR : resolve dst true = .ok (dl, dp))
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count
+      elemSize elemAlign = some slots') :
+    ∀ j, j ≠ dl → slots'[j]? = slots[j]? := by
+  intro j hj
+  have hSet : ∀ x, (slots.set dl x)[j]? = slots[j]? := fun _ => List.getElem?_set_ne (Ne.symm hj)
+  unfold evalCopyNonOverlappingSubplace at h
+  rw [hDstR] at h
+  split at h
+  · nomatch h
+  split at h
+  · simp only [Option.some.injEq] at h
+    subst h
+    rfl
+  split at h
+  · nomatch h
+  cases hS : resolve src false with
+  | error e =>
+    rw [hS] at h
+    simp only at h
+    split at h
+    · simp only [Option.some.injEq] at h
+      subst h
+      rfl
+    · nomatch h
+  | ok sv =>
+    obtain ⟨sl, sp⟩ := sv
+    rw [hS] at h
+    simp only at h
+    split at h
+    · split at h
+      · cases hr : readSubplaceSlot slots sl sp with
+        | none => rw [hr] at h; nomatch h
+        | some _ =>
+          rw [hr] at h
+          simp only [Option.map_some, Option.some.injEq] at h
+          subst h
+          rfl
+      · split at h
+        · exact writeSubplaceSlot_frame h j hj
+        · nomatch h
+    · split at h
+      · split at h
+        · split at h
+          · split at h
+            · rename_i s hW
+              obtain ⟨x, hx⟩ := writePlaceState_frame hW
+              simp only [Option.some.injEq] at h
+              subst h
+              rw [hx]
+              split <;> exact hSet x
+            · nomatch h
+          · split at h
+            · split at h
+              · simp only [Option.some.injEq] at h
+                subst h
+                rfl
+              · split at h
+                · obtain ⟨_, _, _, _, _, hs⟩ := evalDeinitPlace_eq_some h
+                  subst hs
+                  exact hSet _
+                · nomatch h
+            · nomatch h
+        · nomatch h
+      · nomatch h
+
+/-- **Uninitialized copies into a `[T; 1]` deinitialize the array
+(`writeSubplaceSlot_uninit_unit_array`)**: storing an uninitialized slot at element `0` of a
+1-element array deinitializes the whole array place; at an element of a longer initialized array
+(no per-element state) it fails closed. -/
+theorem writeSubplaceSlot_uninit_unit_array {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {slots : List LocalSlotState} {l : Nat}
+    {arr : List ProjectionElem} (hArr : endsWithElem (stripUnitElems arr) = false)
+    (hArr' : stripUnitElems (arr ++ [.constantIndex 0 1 false]) = stripUnitElems arr) :
+    writeSubplaceSlot arityOf rootTyOf ts slots l (arr ++ [.constantIndex 0 1 false]) .uninit =
+      evalDeinitPlace ts slots ⟨l, stripUnitElems arr⟩ := by
+  simp [writeSubplaceSlot, hArr', hArr]
+
+/-- Stripping a trailing `[T; 1]` element step. -/
+theorem stripUnitElems_append_unit (arr : List ProjectionElem) :
+    stripUnitElems (arr ++ [.constantIndex 0 1 false]) = stripUnitElems arr := by
+  simp [stripUnitElems, isUnitElem, List.reverse_append]
+
+/-- An element write of an uninitialized slot into an initialized multi-element array fails
+closed (arrays have no per-element initialization state). -/
+theorem writeSubplaceSlot_uninit_elem_init_array_none
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {slots : List LocalSlotState} {l : Nat} {q : List ProjectionElem}
+    (hElem : endsWithElem (stripUnitElems q) = true)
+    (hNotUninit : isUninitSlot (readSubplaceSlot slots l (stripUnitElems q).dropLast) = false) :
+    writeSubplaceSlot arityOf rootTyOf ts slots l q .uninit = none := by
+  simp [writeSubplaceSlot, hElem, hNotUninit]
+
+/-- **Single-element sub-place copies refine Trusted's `evalCopySingleDirect`
+(`evalCopyNonOverlappingSubplace_refines`)**: on below-related frames, when Anneal copies an
+initialized source sub-place `(sl, sp)` (value `v`, from an initialized local) into a sub-place
+`(dl, dp ≠ [])` of an initialized local of another local, and Trusted's borrow entries for the two
+pointers name exactly these sub-places (distinct tags, no union along `dp`, a value valid for the
+destination type), Trusted's `evalCopySingleDirect` steps with the written frame and the
+updated frames stay related by `SlotsRefine SlotBelow`. -/
+theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {locals₃ : List LocalSlot}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {elemSize elemAlign sl dl : Nat} {sp : List ProjectionElem} {dh : ProjectionElem}
+    {dt : List ProjectionElem} {v droot : Value}
+    (hRel : SlotsRefine SlotBelow slots locals₃)
+    (hSrcR : resolve src false = .ok (sl, sp)) (hDstR : resolve dst true = .ok (dl, dh :: dt))
+    (hNe : sl ≠ dl) (hSrcRead : readPlaceState slots ⟨sl, sp⟩ = .ok v)
+    (hSrcSlot : readSubplaceSlot slots sl sp = some (.init v))
+    (hDstRoot : slots[dl]? = some (.init droot)) (hDh : dh ≠ .deref)
+    (hDt : projectionHasDeref dt = false)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst 1
+      elemSize elemAlign = some slots')
+    (s : MachineState) (srcOp dstOp : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (hTagNe : srcPtr.tag ≠ dstPtr.tag)
+    (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = sp)
+    (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = dh :: dt)
+    (hPointee : operandPointeeTy localDecls layouts srcOp = none ∨
+      ∃ srcPt dstPt, operandPointeeTy localDecls layouts srcOp = some srcPt ∧
+        operandPointeeTy localDecls layouts dstOp = some dstPt ∧
+        sameRigidTyShape srcPt.kind dstPt.kind = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
+    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true) :
+    ∃ locals₄, evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        locals₃ = .step (advanceStmt s locals₄
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+      SlotsRefine SlotBelow slots' locals₄ := by
+  have hDp : projectionHasDeref (dh :: dt) = false := by
+    cases dh with
+    | deref => exact absurd rfl hDh
+    | _ => simpa [projectionHasDeref] using hDt
+  obtain ⟨hRead', hFrame⟩ := evalCopyNonOverlappingSubplace_read_after_copy hSrcR hDstR
+    (Or.inr (Or.inl hNe)) hSrcSlot hDstRoot hDp h
+  -- the Anneal step is an `evalValueProjWrite` of `v` into the destination root
+  unfold evalCopyNonOverlappingSubplace at h
+  split at h
+  · nomatch h
+  · split at h
+    · omega
+    · split at h
+      · nomatch h
+      · rw [hSrcR, hDstR] at h
+        simp only [true_or, ↓reduceIte] at h
+        have hNS : ¬ (elemSize = 0 ∧ sl = dl ∧ sp = dh :: dt) := fun hc => hNe hc.2.1
+        simp only [hNS, ↓reduceIte, hSrcSlot, writeSubplaceSlot] at h
+        cases hWS : writePlaceState arityOf slots ⟨dl, dh :: dt⟩ (rootTyOf dl) v with
+        | ub => rw [hWS] at h; nomatch h
+        | unsupported => rw [hWS] at h; nomatch h
+        | ok s' =>
+          rw [hWS] at h
+          simp only [Option.some.injEq] at h
+          subst h
+          obtain ⟨droot', hW, hEq⟩ := writePlaceState_init_root_inv hDstRoot hDp hWS
+          subst hEq
+          have hSame := sameScalarLocals_of_slotBelow hRel
+          -- Trusted's view of the source and destination roots
+          obtain ⟨tsroot, hTS, hTSR⟩ := readPlaceState_below_refines hRel hSrcRead
+          have hTD : locals₃[dl]? = some (.init droot) := by
+            rcases SlotsRefine.get?_rel dl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+            · simp only [get?_eq_getElem?] at hA; rw [hA] at hDstRoot; nomatch hDstRoot
+            · simp only [get?_eq_getElem?] at hA hT
+              rw [hA] at hDstRoot
+              cases hDstRoot
+              cases t with
+              | init w => have hvw : droot = w := hAT; subst hvw; exact hT
+              | _ => simp [SlotBelow] at hAT
+          have hLtD : dl < locals₃.length := (List.getElem?_eq_some_iff.mp hTD).1
+          have hWT : evalValueProjWrite locals₃ droot (dh :: dt) v = .ok droot' := by
+            rw [← evalValueProjWrite_congr_scalar_locals hSame]; exact hW
+          have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hWT
+          have hSet : set? locals₃ dl (.init droot') = some (locals₃.set dl (.init droot')) :=
+            set?_eq_some_iff.mpr ⟨hLtD, rfl⟩
+          have hWrite : writePlaceValue locals₃ s.memory.borrows ⟨dl, dh :: dt⟩ v localDecls layouts =
+              .ok (locals₃.set dl (.init droot')) :=
+            writePlaceValue_proj_of_noUnion locals₃ s.memory.borrows dl dh dt v droot droot' _
+              localDecls layouts hDh hNoUnion hValid (by simp [get?_eq_getElem?, hTD]) hWP hSet
+          refine ⟨locals₃.set dl (.init droot'), ?_,
+            SlotsRefine.set (a := .init droot') (t := .init droot') rfl dl hRel⟩
+          unfold evalCopySingleDirect
+          rcases beq_cases srcPtr.tag dstPtr.tag with ⟨_, hEqTag⟩ | ⟨hBTag, _⟩
+          · exact absurd hEqTag hTagNe
+          · rcases beq_cases sl dl with ⟨_, hEqLoc⟩ | ⟨hBLoc, _⟩
+            · exact absurd hEqLoc hNe
+            · simp only [get?_eq_getElem?] at hTS
+              rcases hPointee with hUntyped | ⟨srcPt, dstPt, hSPt, hDPt, hShape⟩
+              · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
+                  get?_eq_getElem?, hTS, hTSR, hUntyped, hWrite]
+              · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
+                  get?_eq_getElem?, hTS, hTSR, hSPt, hDPt, hShape, hWrite]
+
+/-- **Trusted's `evalStmt` reaches `evalCopySingleDirect` (`evalStmt_copyNonOverlapping_singleDirect`)**:
+for a `copy_nonoverlapping(src, dst, 1)` whose operands evaluate (without changing the frame) to
+pointers with usable borrow entries (a readable source, a writable destination) at offset `0`
+outside unions, Trusted's statement step is exactly its single-element direct copy. -/
+theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp countOp : Operand)
+    (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat} {countSc : ScalarInt}
+    {srcEntry dstEntry : BorrowEntry}
+    (hSrc : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+    (hDst : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+    (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+    (hOne : countSc.bits = 1)
+    (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
+    (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
+    (hSrcP : srcEntry.perm ≠ .disabled) (hDstP : dstEntry.perm = .active ∨ dstEntry.perm = .reserved)
+    (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
+    (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
+    (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0) :
+    evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
+      evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        s.frame.locals := by
+  have hPermOk : evalCopyNonOverlappingWithCount s srcOp dstOp localDecls layouts
+      (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) 1 s.frame.locals =
+      evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry 1
+        s.frame.locals := by
+    unfold evalCopyNonOverlappingWithCount
+    simp only [hSrcE, hDstE]
+    cases hs : srcEntry.perm with
+    | disabled => exact absurd hs hSrcP
+    | _ => rcases hDstP with hd | hd <;> simp [hd]
+  simp only [evalStmt, evalCopyNonOverlapping, hSrc, hDst, hCnt, hOne, hPermOk]
+  unfold evalCopyNonOverlappingPermOk
+  simp only [hSrcU, hDstU, hSrcOff, hDstOff, Nat.beq_refl, Bool.and_self]
+
+/-- **Sub-place `CopyNonOverlapping` refines Trusted's `evalStmt`
+(`evalStmt_copyNonOverlapping_subplace_refines`)**: on below-related frames, a successful Anneal
+single-element sub-place copy of an initialized source value into a sub-place of another
+initialized local is matched by Trusted's `evalStmt` on `copy_nonoverlapping(src, dst, 1)` — whose
+pointer operands carry borrow entries naming exactly the two resolved sub-places — stepping with
+the written frame, and the frames stay related by `SlotsRefine SlotBelow`. -/
+theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {elemSize elemAlign sl dl : Nat} {sp : List ProjectionElem} {dh : ProjectionElem}
+    {dt : List ProjectionElem} {v droot : Value} (s : MachineState)
+    (hRel : SlotsRefine SlotBelow slots s.frame.locals)
+    (hSrcR : resolve src false = .ok (sl, sp)) (hDstR : resolve dst true = .ok (dl, dh :: dt))
+    (hNe : sl ≠ dl) (hSrcRead : readPlaceState slots ⟨sl, sp⟩ = .ok v)
+    (hSrcSlot : readSubplaceSlot slots sl sp = some (.init v))
+    (hDstRoot : slots[dl]? = some (.init droot)) (hDh : dh ≠ .deref)
+    (hDt : projectionHasDeref dt = false)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst 1
+      elemSize elemAlign = some slots')
+    (srcOp dstOp countOp : Operand) (span : String) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat}
+    {countSc : ScalarInt} {srcEntry dstEntry : BorrowEntry}
+    (hSrcOp : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+    (hDstOp : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+    (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+    (hOne : countSc.bits = 1)
+    (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
+    (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
+    (hSrcP : srcEntry.perm ≠ .disabled) (hDstP : dstEntry.perm = .active ∨ dstEntry.perm = .reserved)
+    (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
+    (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
+    (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0)
+    (hTagNe : srcPtr.tag ≠ dstPtr.tag)
+    (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = sp)
+    (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = dh :: dt)
+    (hPointee : operandPointeeTy localDecls layouts srcOp = none ∨
+      ∃ srcPt dstPt, operandPointeeTy localDecls layouts srcOp = some srcPt ∧
+        operandPointeeTy localDecls layouts dstOp = some dstPt ∧
+        sameRigidTyShape srcPt.kind dstPt.kind = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
+    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true) :
+    ∃ locals₄, evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩
+        localDecls layouts = .step (advanceStmt s locals₄
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+      SlotsRefine SlotBelow slots' locals₄ := by
+  rw [evalStmt_copyNonOverlapping_singleDirect s srcOp dstOp countOp span localDecls layouts hSrcOp
+    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff]
+  exact evalCopyNonOverlappingSubplace_refines hRel hSrcR hDstR hNe hSrcRead hSrcSlot hDstRoot hDh
+    hDt h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
+    hPointee hNoUnion hValid
+
+/-! ### Section 4h: Reborrows through a pointer (`&((*_p).tail)` vs `&raw ((*_p).tail)`) -/
+
+/-- The local a synthetic provenance names (`alloc_id - 1`, when it is a local of the frame). -/
+def synthProvLocal (slots : List LocalSlotState) (p : SynPtr) : Option Nat :=
+  match p.prov with
+  | some (l + 1, _) => if l < slots.length then some l else none
+  | _ => none
+
+/-- Whether the target local of a reborrow base is storage-dead. -/
+def reborrowTargetDead (slots : List LocalSlotState) : Option Nat → Bool
+  | some l =>
+    match slots[l]? with
+    | some .dead => true
+    | _ => false
+  | none => false
+
+/-- The `DeadLocal` fault of a dangling reborrow base. -/
+def reborrowDeadErr : Option Nat → Except DerefErr SynPtr
+  | some l => .error (.deadLocal l)
+  | none => .error .unsupported
+
+/-- An address-only raw reborrow: a raw result of a raw base without `Downcast` in the tail. -/
+def addrOnlyRaw (expectedRef : Bool) (pty : PtrTy) (hasDowncast : Bool) : Bool :=
+  !expectedRef && !pty.isRef && !hasDowncast
+
+/-- **`resolve_reborrow_with_tail_in`**: `&((*p).tail)` (`expectedRef`) or `&raw ((*p).tail)` of a
+base pointer `p` of type `pty` whose pointee has layout `dtl`, where `tail` (with `Downcast` steps
+iff `hasDowncast`) has static offset `tailOff` inside the pointee:
+1. a reference result or a reference base needs a non-null base (`InvalidBitPattern` for `&T`,
+   `NullPointerAccess` otherwise) aligned to the pointee (`MisalignedPointer`,
+   `UnsupportedLayout`) with an inhabited pointee for a reference base;
+2. anything but an address-only raw reborrow needs a non-null base with the synthetic provenance
+   of a live local (`NullPointerAccess`, `DeadLocal`);
+3. an address-only raw reborrow of a null, provenance-free, or dangling base is valid exactly at
+   offset `0` (it keeps the base pointer), and otherwise faults or is unsupported (MiniRust's
+   `offset_inbounds`);
+4. otherwise the base resolves to a sub-place `(l, q)` (`resolveSyntheticSubplace`), and the result
+   addresses `q ++ tail` inside `l`'s synthetic allocation with provenance `(l + 1, tag)`. -/
+def evalReborrowTail (cx : SubplaceCtx) (slots : List LocalSlotState) (base : SynPtr)
+    (pty : PtrTy) (dtl : TyLayout) (expectedRef hasDowncast : Bool) (tail : List ProjectionElem)
+    (tailOff tag : Nat) : Except DerefErr SynPtr :=
+  if cx.limit < base.addr then .error .invalidBitPattern
+  else if (expectedRef || pty.isRef) && base.addr = 0 then
+    (if pty.isRef then .error .invalidBitPattern else .error .nullPointer)
+  else if (expectedRef || pty.isRef) && base.addr % dtl.minAlign ≠ 0 then .error .misaligned
+  else if (expectedRef || pty.isRef) && base.addr % dtl.maxAlign ≠ 0 then .error .unsupportedLayout
+  else if pty.isRef && !dtl.inhabited then .error .uninhabited
+  else if !addrOnlyRaw expectedRef pty hasDowncast && base.addr = 0 then .error .nullPointer
+  else if !addrOnlyRaw expectedRef pty hasDowncast && (synthProvLocal slots base).isNone then
+    .error .unsupported
+  else if !addrOnlyRaw expectedRef pty hasDowncast &&
+      reborrowTargetDead slots (synthProvLocal slots base) then
+    reborrowDeadErr (synthProvLocal slots base)
+  else if addrOnlyRaw expectedRef pty hasDowncast && (base.addr = 0 ||
+      (synthProvLocal slots base).isNone || reborrowTargetDead slots (synthProvLocal slots base)) then
+    if tailOff = 0 then .ok base
+    else if base.addr = 0 then .error .nullPointer
+    else if reborrowTargetDead slots (synthProvLocal slots base) then
+      reborrowDeadErr (synthProvLocal slots base)
+    else .error .unsupported
+  else
+    match resolveSyntheticSubplace cx slots base pty false with
+    | .ok (l, q) =>
+      match cx.layoutOf l, localBaseAddr cx.allocs l cx.limit with
+      | some lay, some b =>
+        match subplaceAt lay 0 (q ++ tail) with
+        | some (_, off) => .ok ⟨b + off, some (l + 1, tag)⟩
+        | none => .error .unsupported
+      | _, _ => .error .unsupported
+    | .error e => .error e
+
+/-- **Offset-`0` raw reborrows of null pointers are valid (`evalReborrowTail_raw_null_zero`)**:
+`&raw ((*p).tail)` of a null raw pointer with a zero-offset, `Downcast`-free tail is the null
+pointer itself. -/
+theorem evalReborrowTail_raw_null_zero (cx : SubplaceCtx) (slots : List LocalSlotState)
+    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag : Nat)
+    (hRaw : pty.isRef = false) (h0 : base.addr = 0) :
+    evalReborrowTail cx slots base pty dtl false false tail 0 tag = .ok base := by
+  simp [evalReborrowTail, addrOnlyRaw, hRaw, h0]
+
+/-- **Offset-`0` raw reborrows of dangling pointers are valid; non-zero offsets fault
+(`evalReborrowTail_raw_dangling`)**: an address-only raw reborrow of a pointer into a storage-dead
+local keeps the pointer at offset `0` and is `DeadLocal` at any non-zero tail offset. -/
+theorem evalReborrowTail_raw_dangling (cx : SubplaceCtx) {slots : List LocalSlotState}
+    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag : Nat)
+    {l t : Nat} (hRaw : pty.isRef = false) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hProv : base.prov = some (l + 1, t)) (hDead : slots[l]? = some .dead) :
+    evalReborrowTail cx slots base pty dtl false false tail 0 tag = .ok base ∧
+      ∀ tailOff, tailOff ≠ 0 →
+        evalReborrowTail cx slots base pty dtl false false tail tailOff tag = .error (.deadLocal l) := by
+  have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hDead).1
+  have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
+  have h1 : ¬ cx.limit < base.addr := by omega
+  constructor
+  · simp [evalReborrowTail, addrOnlyRaw, reborrowTargetDead, hRaw, h1, hT, hDead]
+  · intro tailOff hOff
+    simp [evalReborrowTail, addrOnlyRaw, reborrowTargetDead, reborrowDeadErr, hRaw, h1, hNZ, hT,
+      hDead, hOff]
+
+/-- **Reference reborrows of null pointers fault (`evalReborrowTail_ref_null`)**, whatever the tail. -/
+theorem evalReborrowTail_ref_null (cx : SubplaceCtx) (slots : List LocalSlotState)
+    {base : SynPtr} (pty : PtrTy) (dtl : TyLayout) (hasDowncast : Bool) (tail : List ProjectionElem)
+    (tailOff tag : Nat) (h0 : base.addr = 0) :
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag =
+      .error (if pty.isRef then .invalidBitPattern else .nullPointer) := by
+  simp only [evalReborrowTail, h0]
+  cases pty.isRef <;> simp
+
+/-- **Reference reborrows enforce the pointee's alignment (`evalReborrowTail_ref_misaligned`)**. -/
+theorem evalReborrowTail_ref_misaligned (cx : SubplaceCtx) (slots : List LocalSlotState)
+    {base : SynPtr} (pty : PtrTy) {dtl : TyLayout} (hasDowncast : Bool) (tail : List ProjectionElem)
+    (tailOff tag : Nat) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hMis : base.addr % dtl.minAlign ≠ 0) :
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag = .error .misaligned := by
+  have h1 : ¬ cx.limit < base.addr := by omega
+  simp [evalReborrowTail, h1, hNZ, hMis]
+
+/-- **Reference reborrows enforce liveness (`evalReborrowTail_ref_dead`)**: `&((*p).tail)` of an
+aligned pointer into a storage-dead local is `DeadLocal`. -/
+theorem evalReborrowTail_ref_dead (cx : SubplaceCtx) {slots : List LocalSlotState}
+    {base : SynPtr} {pty : PtrTy} {dtl : TyLayout} (hasDowncast : Bool) (tail : List ProjectionElem)
+    (tailOff tag : Nat) {l t : Nat} (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hA1 : base.addr % dtl.minAlign = 0) (hA2 : base.addr % dtl.maxAlign = 0)
+    (hInh : pty.isRef = true → dtl.inhabited = true)
+    (hProv : base.prov = some (l + 1, t)) (hDead : slots[l]? = some .dead) :
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag = .error (.deadLocal l) := by
+  have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hDead).1
+  have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
+  have h1 : ¬ cx.limit < base.addr := by omega
+  have h5 : (pty.isRef && !dtl.inhabited) = false := by
+    cases hr : pty.isRef with
+    | false => rfl
+    | true => simp [hInh hr]
+  simp [evalReborrowTail, addrOnlyRaw, reborrowTargetDead, reborrowDeadErr, h1, hNZ, hA1, hA2, h5,
+    hT, hDead]
+
+/-! ### Section 4i: A concrete synthetic frame (non-vacuity witnesses)
+
+The frame `_0 : (u32, u32) = (7, 9)`, `_1 : *mut u32 = &raw _0.1` with the synthetic pointer
+`0x1004` (base `0x1000` of `_0` plus `_0.1`'s offset `4`) exercises the whole pipeline: the
+synthetic sub-place borrow, the unique-candidate resolution, `Deref` reads and writes, and the
+collision-free base of `_1`. -/
+
+/-- The `u32` field type of the witness. -/
+def witnessU32 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+/-- The witness context: type `1` is `u32` (`4`-byte, `4`-aligned), type `100` is `(u32, u32)`;
+`_0.1` is the only `u32` sub-place of `_0` at offset `4` (and `_0.0` at offset `0`); the pointer
+value `⟨allocId, off⟩` reads as the synthetic pointer `off` with provenance `allocId`. -/
+def witnessCtx : SubplaceCtx where
+  allocs := [some (8, 4), some (8, 8)]
+  limit := 2 ^ 64 - 1
+  layoutOf l := if l = 0 then some (.struct 8 [0, 4] [.leaf 4, .leaf 4])
+    else if l = 1 then some (.leaf 8) else none
+  declTy l := if l = 0 then some 100 else if l = 1 then some 101 else none
+  candidates t l off :=
+    if t = 1 ∧ l = 0 ∧ off = 4 then [[.field 1 witnessU32]]
+    else if t = 1 ∧ l = 0 ∧ off = 0 then [[.field 0 witnessU32]]
+    else []
+  tyLayout t := if t = 1 then some ⟨4, 4, 4, true, true⟩ else none
+  ptrTyAt l q := if l = 1 ∧ q = [] then some ⟨false, 1⟩ else none
+  ptrOf pv := ⟨pv.offsetBytes, some (pv.allocId, 0)⟩
+  decodeTag _ _ := none
+
+/-- The witness pointer value `&raw _0.1`. -/
+def witnessPtr : ProvenancePtr := { allocId := 1, offsetBytes := 0x1004 }
+
+/-- The witness frame. -/
+def witnessSlots : List LocalSlotState :=
+  [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .init (.ptr witnessPtr 8)]
+
+/-- **Witness: the synthetic sub-place borrow `&raw _0.1`** is the pointer `0x1004` (`_0`'s base
+`0x1000` plus `_0.1`'s offset `4`) with provenance `1`. -/
+theorem witness_borrow :
+    evalSubplaceRef witnessCtx witnessSlots 0 [.field 1 witnessU32] 0 = .ok ⟨0x1004, some (1, 0)⟩ := by
+  with_unfolding_all rfl
+
+/-- **Witness: `*_1` reads `9`** (the value of `_0.1`). -/
+theorem witness_deref_read :
+    evalDerefPlaceRead witnessCtx witnessSlots ⟨1, [.deref]⟩ = .ok (.scalar ⟨9, 4⟩) := by
+  with_unfolding_all rfl
+
+/-- **Witness: `*_1 = 5` writes only `_0.1`**, and reading `*_1` back yields `5`. -/
+theorem witness_deref_write_put_get :
+    evalDerefPlaceWrite (fun _ _ _ => none) (fun _ => witnessU32) witnessCtx witnessSlots
+        ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩) =
+      .ok [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtr 8)] ∧
+    evalDerefPlaceRead witnessCtx
+        [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtr 8)]
+        ⟨1, [.deref]⟩ = .ok (.scalar ⟨5, 4⟩) := by
+  constructor <;> with_unfolding_all rfl
+
+/-- **Witness: collision-free bases** — `_1`'s synthetic allocation starts at `0x2000`, past
+`_0`'s `[0x1000, 0x1008)`. -/
+theorem witness_bases :
+    localBaseAddr witnessCtx.allocs 0 witnessCtx.limit = some 0x1000 ∧
+    localBaseAddr witnessCtx.allocs 1 witnessCtx.limit = some 0x2000 := by
+  with_unfolding_all decide
+
+/-- The witness layout is well formed. -/
+theorem witnessLayout_wf : (ByteLayout.struct 8 [0, 4] [.leaf 4, .leaf 4]).WF := by
+  refine .struct 8 [0, 4] [.leaf 4, .leaf 4] rfl ?_ ?_ ?_
+  · intro i o l ho hl
+    match i, ho, hl with
+    | 0, ho, hl =>
+      simp only [List.getElem?_cons_zero, Option.some.injEq] at ho hl
+      subst ho hl
+      decide
+    | 1, ho, hl =>
+      simp only [List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at ho hl
+      subst ho hl
+      decide
+    | i + 2, ho, _ => simp at ho
+  · intro i j oi oj li lj hij hoi hoj hli hlj
+    match i, j, hoi, hoj, hli, hlj with
+    | 0, 0, _, _, _, _ => exact absurd rfl hij
+    | 1, 1, _, _, _, _ => exact absurd rfl hij
+    | 0, 1, hoi, hoj, hli, hlj =>
+      simp only [List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hoi hoj hli hlj
+      subst hoi hoj hli hlj
+      decide
+    | 1, 0, hoi, hoj, hli, hlj =>
+      simp only [List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hoi hoj hli hlj
+      subst hoi hoj hli hlj
+      decide
+    | i + 2, _, hoi, _, _, _ => simp at hoi
+    | 0, j + 2, _, hoj, _, _ => simp at hoj
+    | 1, j + 2, _, hoj, _, _ => simp at hoj
+  · intro i l hl
+    match i, hl with
+    | 0, hl =>
+      simp only [List.getElem?_cons_zero, Option.some.injEq] at hl
+      subst hl
+      exact .leaf 4
+    | 1, hl =>
+      simp only [List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hl
+      subst hl
+      exact .leaf 4
+    | i + 2, hl => simp at hl
+
+/-- The witness context is well formed, so every theorem of this section applies to it. -/
+theorem witnessCtx_wf : witnessCtx.WF := by
+  refine ⟨fun l lay h => ?_, fun t l off q hq => ?_⟩
+  · by_cases h0 : l = 0
+    · subst h0
+      simp only [witnessCtx, ↓reduceIte, Option.some.injEq] at h
+      subst h
+      exact ⟨witnessLayout_wf, by with_unfolding_all decide⟩
+    · by_cases h1 : l = 1
+      · subst h1
+        simp only [witnessCtx, Nat.one_ne_zero, ↓reduceIte, Option.some.injEq] at h
+        subst h
+        exact ⟨.leaf 8, by with_unfolding_all decide⟩
+      · simp [witnessCtx, h0, h1] at h
+  · by_cases hA : t = 1 ∧ l = 0 ∧ off = 4
+    · obtain ⟨rfl, rfl, rfl⟩ := hA
+      have hq' : q = [.field 1 witnessU32] := by simpa [witnessCtx] using hq
+      rw [hq']
+      exact ⟨.struct 8 [0, 4] [.leaf 4, .leaf 4], .leaf 4, ⟨4, 4, 4, true, true⟩,
+        by simp [witnessCtx], by with_unfolding_all rfl, by simp [witnessCtx], rfl⟩
+    · by_cases hB : t = 1 ∧ l = 0 ∧ off = 0
+      · obtain ⟨rfl, rfl, rfl⟩ := hB
+        have hq' : q = [.field 0 witnessU32] := by simpa [witnessCtx] using hq
+        rw [hq']
+        exact ⟨.struct 8 [0, 4] [.leaf 4, .leaf 4], .leaf 4, ⟨4, 4, 4, true, true⟩,
+          by simp [witnessCtx], by with_unfolding_all rfl, by simp [witnessCtx], rfl⟩
+      · simp [witnessCtx, hA, hB] at hq
+
+/-- **Witness: no-guess resolution through the general round-trip theorem**: dereferencing the
+borrowed pointer `0x1004` (pointee `u32`) resolves to exactly `_0.1`, in both modes — an instance
+of `resolveSyntheticSubplace_evalSubplaceRef` whose hypotheses all hold in the witness frame. -/
+theorem witness_resolve (ow : Bool) :
+    resolveSyntheticSubplace witnessCtx witnessSlots ⟨0x1004, some (1, 0)⟩ ⟨false, 1⟩ ow =
+      .ok (0, [.field 1 witnessU32]) :=
+  resolveSyntheticSubplace_evalSubplaceRef witnessCtx_wf witness_borrow ow
+    (tl := ⟨4, 4, 4, true, true⟩) (by simp [witnessCtx]) (by decide) (by decide) (by simp)
+    (lay := .struct 8 [0, 4] [.leaf 4, .leaf 4]) (sub := .leaf 4) (off := 4)
+    (by simp [witnessCtx]) (by with_unfolding_all rfl) rfl (by simp [witnessCtx])
+    (by simp) (by simp [witnessCtx]) (allocSize := 8) (align := 4)
+    (by simp [ownLayout, witnessCtx])
+
+/-- The witness under Trusted's pointer representation: Trusted represents `&raw _0.1` by its borrow
+tag `1` at offset `0` (the field is the tag's `targetProjection`), which Anneal reads as the
+synthetic pointer `0x1004` with provenance `1`. -/
+def witnessCtxT : SubplaceCtx :=
+  { witnessCtx with
+    ptrOf := fun pv => if pv.allocId = 1 then ⟨0x1004, some (1, 0)⟩ else ⟨pv.offsetBytes, none⟩ }
+
+/-- Trusted's pointer value of `&raw _0.1` (tag `1`, offset `0`). -/
+def witnessPtrT : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+
+/-- The witness frame holding Trusted's pointer value (Anneal's and Trusted's slots coincide). -/
+def witnessSlotsT : List LocalSlotState :=
+  [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .init (.ptr witnessPtrT 8)]
+
+/-- Trusted's frame. -/
+def witnessLocalsT : List LocalSlot :=
+  [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .init (.ptr witnessPtrT 8)]
+
+/-- Trusted's borrow entry of `&raw _0.1`. -/
+def witnessEntry : BorrowEntry :=
+  { tag := 1, targetLocal := 0, targetProjection := [.field 1 witnessU32], perm := .active }
+
+theorem witnessCtxT_wf : witnessCtxT.WF := ⟨witnessCtx_wf.layout, witnessCtx_wf.candidates⟩
+
+/-- **Non-vacuity of the `Deref` refinement (`witness_trusted_deref_read`)**: every hypothesis of
+`evalDerefPlaceRead_refines_evalOperand` holds in the witness frame (below-related slots, Anneal's
+no-guess resolution of `*_1` agreeing with Trusted's borrow entry), so Trusted's
+`Operand.copy (*_1)` reads `9`, exactly as Anneal does. -/
+theorem witness_trusted_deref_read :
+    evalOperand witnessLocalsT (.copy ⟨1, [.deref]⟩) [witnessEntry] [] emptyLayoutTable [] =
+      .ok (.scalar ⟨9, 4⟩) witnessLocalsT := by
+  have hRef : evalSubplaceRef witnessCtxT witnessSlotsT 0 [.field 1 witnessU32] 0 =
+      .ok ⟨0x1004, some (1, 0)⟩ := by with_unfolding_all rfl
+  have hPtrOf : witnessCtxT.ptrOf witnessPtrT = ⟨0x1004, some (1, 0)⟩ := by
+    simp [witnessCtxT, witnessPtrT]
+  have hRes : resolveSyntheticSubplace witnessCtxT witnessSlotsT (witnessCtxT.ptrOf witnessPtrT)
+      ⟨false, 1⟩ false = .ok (witnessEntry.targetLocal, witnessEntry.targetProjection) := by
+    rw [hPtrOf]
+    exact resolveSyntheticSubplace_evalSubplaceRef witnessCtxT_wf hRef false
+      (tl := ⟨4, 4, 4, true, true⟩) (by simp [witnessCtxT, witnessCtx]) (by decide) (by decide)
+      (by simp) (lay := .struct 8 [0, 4] [.leaf 4, .leaf 4]) (sub := .leaf 4) (off := 4)
+      (by simp [witnessCtxT, witnessCtx]) (by with_unfolding_all rfl) rfl
+      (by simp [witnessCtxT, witnessCtx]) (by simp) (by simp [witnessCtxT, witnessCtx])
+      (allocSize := 8) (align := 4) (by simp [ownLayout, witnessCtxT, witnessCtx])
+  exact evalDerefPlaceRead_refines_evalOperand (cx := witnessCtxT) (pty := ⟨false, 1⟩)
+    (sz := 8) (rest := [])
+    (by simp [witnessSlotsT, witnessLocalsT, SlotsRefine, SlotBelow]) rfl
+    (by with_unfolding_all rfl) (by simp [witnessCtxT, witnessCtx]) hRes
+    (by simp [lookupBorrow, witnessEntry, witnessPtrT, ProvenancePtr.tag])
+    (by simp [witnessEntry]) (by with_unfolding_all rfl) (by with_unfolding_all rfl)
+    [] emptyLayoutTable []
 
 end Anneal.Mir.AdtAndControl

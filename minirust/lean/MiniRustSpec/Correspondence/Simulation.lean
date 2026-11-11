@@ -841,6 +841,8 @@ theorem rvalueOk_noMove {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     exact ⟨by simp [copyRv, hop.1], fun o ho => by simp [rvOperands] at ho; subst ho; exact hop.2⟩
   | .len ⟨j, []⟩, _ =>
     exact ⟨rfl, fun o ho => by simp [rvOperands] at ho; subst ho; rfl⟩
+  | .discriminant ⟨j, []⟩, _ =>
+    exact ⟨rfl, fun o ho => by simp [rvOperands] at ho; subst ho; rfl⟩
 
 theorem arrayRvalueOk_noMove {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     {elemIt : Gen.IntType} {count : Nat} {rv : Rvalue}
@@ -996,10 +998,10 @@ private theorem rvalue_filterMap_opMoved_lt {layouts : Layout.LayoutTable} {decl
   | .repeat _ _, _, hok =>
     rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩ <;>
       simp [copyRv, rvalueOk, rvalueOkB, rvalueOkO, rvalueOkTuple] at h
-  | .len _, hop_mem, _ | .copyForDeref _, hop_mem, _ =>
+  | .len _, hop_mem, _ | .copyForDeref _, hop_mem, _ | .discriminant _, hop_mem, _ =>
     simp [rvOperands] at hop_mem; subst hop_mem; simp [opMoved] at hop_mv
   | .ref _ _, hop_mem, _
-  | .rawPtr _ _, hop_mem, _ | .discriminant _, hop_mem, _
+  | .rawPtr _ _, hop_mem, _
   | .threadLocalRef _, hop_mem, _ | .nullaryOp _ _, hop_mem, _
   | .shallowInitBox _ _, hop_mem, _ | .wrapUnsafeBinder _ _, hop_mem, _ =>
     simp [rvOperands] at hop_mem
