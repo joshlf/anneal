@@ -27590,11 +27590,317 @@ locals, and a live destination `_d` for the stepping rows). Write `off = ptrVal.
 The only combination outside the map is `e.perm ≠ .disabled`, `c = 0`, and `off ≠ 0` with
 `t` dead or `off > |t|`. It is unreachable: `StorageDead` disables every entry of `t`
 (`disableAllocMapLocal`), and in-bounds `Offset` steps never produce `off > |t|`.
+`step_binOp_offset_d6_partition` below machine-checks this four-quadrant outcome partition
+across all `(e.perm, rhsTy, sc.bits)` combinations, with
+`step_binOp_offset_d6_lockstep_of_not_disabled` isolating the unconditional `StepRelLM3_1`
+lockstep fragment (`e.perm ≠ .disabled` without unsigned `usize` wrap-around).
 Provenance-less (`.scalar`) pointers are handled separately
 (`step_binOp_offset_scalar_zero_correspondence`, `step_binOp_offset_scalar_nonzero_simulation`,
 and their `move` counterparts). The byte-sized Stage-1 theorems (`step_binOp_offset_simulation`,
 `step_binOp_offset_move_simulation`, `step_binOp_offset_oob_dangling_miri_ub`,
 `step_binOp_offset_disabled_divergence`) are instances of the rows above. -/
+
+/-- **`step_binOp_offset_d6_partition` (`LM-3.1` D6 Master `BinOp.Offset` Outcome Partition)**:
+machine-checked exhaustiveness of the `D6` `BinOp.Offset` coverage map above. For any tracked
+pointer `.ptr ptrVal 8` with borrow entry `e ∈ allocMap` (`e.tag = ptrVal.tag`) into target
+local `e.localIdx`, any primary scalar pointee stride (`1, 2, 4, 8, 16`), either `copy _p` or
+`move _p`, and any `usize` / `isize` scalar count `sc` (modulo the unreachable
+`e.perm ≠ .disabled ∧ sc.bits = 0 ∧ off ≠ 0 ∧ (t dead ∨ off > |t|)` corner `hreach`),
+executing `_d = Offset((copy|move) _p, rhsOp)` lands in one of the four mutually exclusive
+quadrants of `{.step, .fail .ub} × {.ok true, .error (.undefinedBehavior _)}`:
+1. **Lockstep step**: `StepRelLM3_1` holds, `stepMirFn` steps, and `lean-miri` returns `.ok true`.
+2. **Lockstep UB**: `StepRelLM3_1` holds, `stepMirFn` fails with `.ub`, and `lean-miri` raises UB.
+3. **Conservative disabled-tag divergence**: `e.perm = .disabled`, `stepMirFn` fails with `.ub`,
+   and `lean-miri` returns `.ok true`.
+4. **Unsound unsigned wrap-around divergence**: `e.perm ≠ .disabled`, `rhsTy.kind = .uint .usize`,
+   `2 ^ 63 ≤ sc.bits`, `stepMirFn` steps backward, and `lean-miri` raises
+   `"PointerArithOverflow"` UB. -/
+theorem step_binOp_offset_d6_partition
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl tgtDecl : LocalDecl}
+    {ptrMut dstMut : Mutability} {pointeeKind : RigidTy} {rhsTy : Ty}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hprim_pt : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {sc : MirAst.ScalarInt} {locals_rhs : List LocalSlot}
+    {e : AllocMapEntry}
+    (hptr_slot : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hrhs_eval : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+      .ok (.scalar sc) locals_rhs)
+    (hdst_live : get? locals_rhs dstIdx ≠ some .dead)
+    (he_mem : e ∈ allocMap)
+    (he_tag : e.tag = ptrVal.tag)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (hreach : e.perm ≠ .disabled → sc.bits = 0 →
+      ptrVal.offsetBytes = 0 ∨
+      (get? s.frame.locals e.localIdx ≠ some .dead ∧
+        ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    let hooks := annealStepHooks body.localDecls body.layouts
+    (StepRelLM3_1 body m allocMap (stepMirFn body s) (Miri.Interpreter.Step.step hooks () m) ∧
+      (∃ s', stepMirFn body s = MirStepNode.step s') ∧
+      ∃ m', Miri.Interpreter.Step.step hooks () m = (m', .ok true)) ∨
+    (StepRelLM3_1 body m allocMap (stepMirFn body s) (Miri.Interpreter.Step.step hooks () m) ∧
+      stepMirFn body s = MirStepNode.fail .ub ∧
+      ∃ m' msg, Miri.Interpreter.Step.step hooks () m = (m', .error (.undefinedBehavior msg))) ∨
+    (e.perm = .disabled ∧
+      stepMirFn body s = MirStepNode.fail .ub ∧
+      ∃ m', Miri.Interpreter.Step.step hooks () m = (m', .ok true)) ∨
+    (e.perm ≠ .disabled ∧
+      rhsTy.kind = .uint .usize ∧
+      2 ^ 63 ≤ sc.bits ∧
+      (∃ s', stepMirFn body s = MirStepNode.step s') ∧
+      ∃ m',
+        Miri.Interpreter.Step.step hooks () m =
+          (m', .error (.undefinedBehavior "PointerArithOverflow"))) := by
+  dsimp only []
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, halloc, _⟩ := id hstate
+  have hrhs_prim : IsPrimScalarTy rhsTy := by
+    rcases hrhs_ty with hk | hk
+    · exact Or.inr (Or.inr (Or.inr ⟨.usize, hk⟩))
+    · exact Or.inr (Or.inr (Or.inl ⟨.isize, hk⟩))
+  obtain ⟨_, himm_ptr⟩ := himm tf hframes
+  obtain ⟨_, _, _, hlt_d, _⟩ := hfr.lookup_local hdecl_dst
+  have hstate_a : StateRelLM3_1 body s
+      { m with stack :=
+          ⟨#[cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)]⟩ }
+      allocMap :=
+    hstate.cache_layout hframes hdecl_dst hlt_d
+  have hsc_props : sc.sizeBytes = 8 ∧ sc.bits < 2 ^ 64 := by
+    rcases evalLhsRawPtr_lm3_1_d6 hstate_a hopKind hdecl_ptr hptr_ty
+        (himm_ptr.cache_layout hlt_d _) none with
+      ⟨_, _, ha_ub, _⟩ | ⟨_, hbad⟩ | ⟨_, _, tf₁, _, _, _, _, hstate₁, _, hmono₁⟩
+    · exfalso
+      obtain ⟨_, _, hlt_p, _⟩ := hfr.lookup_local hdecl_ptr
+      rcases hopKind with rfl | rfl
+      · simp [evalOperand, readProjectedValue, hptr_slot] at ha_ub
+      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p] at ha_ub
+    · rw [hptr_slot] at hbad; cases hbad
+    · have hop_rhs₁ : WellTypedScalarCopyOrMoveOperand body tf₁ rhsOp rhsTy :=
+        (hop_rhs tf hframes).mono_immediate (fun j hj => hmono₁ j (hj.cache_layout hlt_d _))
+      rcases evalOperand_copyOrMove_with_imm_d6 hstate₁ hop_rhs₁ hrhs_prim with
+        ⟨_, _, hrhs_ub, _⟩ | ⟨sc', _, _, _, ha_r, _, _, _, _, himm_rel, _, _⟩
+      · dsimp only [] at hrhs_ub; rw [hrhs_eval] at hrhs_ub; cases hrhs_ub
+      · dsimp only [] at ha_r
+        rw [hrhs_eval] at ha_r; injection ha_r with hv_eq _; injection hv_eq with hsc_eq
+        subst sc'
+        cases himm_rel with
+        | scalar _ _ hrel hsz _ _ =>
+          have hsz8 : sc.sizeBytes = 8 :=
+            translateSizeBytes_inj hrel.validBytes
+              (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+              (by rw [← hsz]; rcases hrhs_ty with hk | hk <;> (unfold translateTy; rw [hk]; rfl))
+          have hc := hrel.canonical; rw [hsz8] at hc
+          have hm : scalarModulus 8 = 2 ^ 64 := rfl
+          exact ⟨hsz8, by omega⟩
+  obtain ⟨hsc_sz, hcan_sc⟩ := hsc_props
+  rcases sc with ⟨c, sz⟩
+  dsimp only [] at hsc_sz hcan_sc hreach ⊢
+  subst sz
+  let stride :=
+    (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat
+  let tgtBytes := (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat
+  have mk_oob :
+      ((2 ^ 63 ≤ c ∧
+          (get? s.frame.locals e.localIdx = some .dead ∨
+            ptrVal.offsetBytes < (2 ^ 64 - c) * stride ∨
+            tgtBytes < ptrVal.offsetBytes)) ∨
+        (1 ≤ c ∧ c < 2 ^ 63 ∧
+          (get? s.frame.locals e.localIdx = some .dead ∨
+            tgtBytes < ptrVal.offsetBytes + c * stride))) →
+      StepRelLM3_1 body m allocMap
+        (stepMirFn body s)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+      stepMirFn body s = MirStepNode.fail .ub ∧
+      ∃ m' msg,
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .error (.undefinedBehavior msg)) := by
+    intro hoob_c
+    exact step_binOp_offset_neg_oob_ub_simulation hstate hphase hopKind hbb hstmt
+      hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+      (fun _ hbad => by rw [hptr_slot] at hbad; cases hbad)
+      (fun pv' sc' _ e' td' hpv' hsc' he'_mem he'_tag htd' => by
+        have hpv_eq : pv' = ptrVal := by
+          rw [hptr_slot] at hpv'
+          injection hpv' with h1; injection h1 with h2; injection h2 with h3 _; exact h3.symm
+        subst pv'
+        have hsc'_eq : sc' = ⟨c, 8⟩ := by
+          rw [hrhs_eval] at hsc'; injection hsc' with h1 _; injection h1 with h2; exact h2.symm
+        subst sc'
+        have he'_eq : e' = e :=
+          allocMap_mem_tag_injective_d6 halloc.tags_nodup he'_mem he_mem (he'_tag.trans he_tag.symm)
+        subst e'
+        have htd'_eq : td' = tgtDecl := Option.some.inj (htd'.symm.trans hdecl_tgt)
+        subst td'
+        exact hoob_c)
+      hptr8
+  by_cases hdis : e.perm = .disabled
+  · by_cases hc0 : c = 0
+    · obtain ⟨ha_ub, m', hm_ok⟩ := step_binOp_offset_disabled_stride_divergence hstate hphase
+        hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+        hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt (Or.inl hc0)
+      exact Or.inr (Or.inr (Or.inl ⟨hdis, ha_ub, m', hm_ok⟩))
+    · by_cases hlt63 : c < 2 ^ 63
+      · have hc_pos : 1 ≤ c := by omega
+        by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+        · exact Or.inr (Or.inl (mk_oob (Or.inr ⟨hc_pos, hlt63, Or.inl hdead⟩)))
+        · by_cases hle : ptrVal.offsetBytes + c * stride ≤ tgtBytes
+          · obtain ⟨ha_ub, m', hm_ok⟩ := step_binOp_offset_disabled_stride_divergence hstate
+              hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty
+              hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt
+              (Or.inr ⟨hdead, hle⟩)
+            exact Or.inr (Or.inr (Or.inl ⟨hdis, ha_ub, m', hm_ok⟩))
+          · exact Or.inr (Or.inl (mk_oob (Or.inr ⟨hc_pos, hlt63, Or.inr (by omega)⟩)))
+      · have hge63 : 2 ^ 63 ≤ c := by omega
+        rcases hrhs_ty with hrhs_u | hrhs_i
+        · obtain ⟨hrel_ub, ha_ub, m', hm_ub⟩ :=
+            step_binOp_offset_usize_wrap_disabled_ub_simulation hstate hphase hopKind hbb hstmt
+              hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_u hop_rhs himm hptr_slot
+              hrhs_eval hge63 he_mem he_tag hdis
+          exact Or.inr (Or.inl ⟨hrel_ub, ha_ub, m', "PointerArithOverflow", hm_ub⟩)
+        · by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+          · exact Or.inr (Or.inl (mk_oob (Or.inl ⟨hge63, Or.inl hdead⟩)))
+          · by_cases hinb_neg : (2 ^ 64 - c) * stride ≤ ptrVal.offsetBytes ∧
+                ptrVal.offsetBytes ≤ tgtBytes
+            · have hk_pos : 1 ≤ 2 ^ 64 - c := by omega
+              have hrhs_neg : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx)
+                  rhsOp s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals
+                  body.localDecls = .ok (.scalar ⟨2 ^ 64 - (2 ^ 64 - c), 8⟩) locals_rhs := by
+                have hc_sub : 2 ^ 64 - (2 ^ 64 - c) = c := by omega
+                rw [hc_sub]; exact hrhs_eval
+              obtain ⟨ha_ub, m', hm_ok⟩ := step_binOp_offset_disabled_neg_isize_divergence
+                hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt
+                hrhs_i hop_rhs himm hptr_slot hrhs_neg hk_pos hdst_live he_mem he_tag hdis
+                hdecl_tgt hdead hinb_neg.1 hinb_neg.2
+              exact Or.inr (Or.inr (Or.inl ⟨hdis, ha_ub, m', hm_ok⟩))
+            · have hoob_neg : ptrVal.offsetBytes < (2 ^ 64 - c) * stride ∨
+                  tgtBytes < ptrVal.offsetBytes := by omega
+              exact Or.inr (Or.inl (mk_oob (Or.inl ⟨hge63, Or.inr hoob_neg⟩)))
+  · by_cases hc0 : c = 0
+    · have hinb0 : (c = 0 ∧ ptrVal.offsetBytes = 0) ∨
+          (get? s.frame.locals e.localIdx ≠ some .dead ∧
+            ptrVal.offsetBytes + c * stride ≤ tgtBytes) := by
+        rcases hreach hdis hc0 with hoff0 | ⟨hlive, hle⟩
+        · exact Or.inl ⟨hc0, hoff0⟩
+        · exact Or.inr ⟨hlive, by rw [hc0, Nat.zero_mul, Nat.add_zero]; exact hle⟩
+      obtain ⟨hrel_s, ha_s, m', _, _, hm_s, _⟩ := step_binOp_offset_stride_simulation hstate
+        hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs
+        himm hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt hinb0 hptr8
+      exact Or.inl ⟨hrel_s, ⟨_, ha_s⟩, m', hm_s⟩
+    · by_cases hlt63 : c < 2 ^ 63
+      · have hc_pos : 1 ≤ c := by omega
+        by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+        · exact Or.inr (Or.inl (mk_oob (Or.inr ⟨hc_pos, hlt63, Or.inl hdead⟩)))
+        · by_cases hle : ptrVal.offsetBytes + c * stride ≤ tgtBytes
+          · obtain ⟨hrel_s, ha_s, m', _, _, hm_s, _⟩ := step_binOp_offset_stride_simulation
+              hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt
+              hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag hdis hdecl_tgt
+              (Or.inr ⟨hdead, hle⟩) hptr8
+            exact Or.inl ⟨hrel_s, ⟨_, ha_s⟩, m', hm_s⟩
+          · exact Or.inr (Or.inl (mk_oob (Or.inr ⟨hc_pos, hlt63, Or.inr (by omega)⟩)))
+      · have hge63 : 2 ^ 63 ≤ c := by omega
+        by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+        · exact Or.inr (Or.inl (mk_oob (Or.inl ⟨hge63, Or.inl hdead⟩)))
+        · by_cases hinb_neg : (2 ^ 64 - c) * stride ≤ ptrVal.offsetBytes ∧
+              ptrVal.offsetBytes ≤ tgtBytes
+          · have hk_pos : 1 ≤ 2 ^ 64 - c := by omega
+            have hrhs_neg : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx)
+                rhsOp s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals
+                body.localDecls = .ok (.scalar ⟨2 ^ 64 - (2 ^ 64 - c), 8⟩) locals_rhs := by
+              have hc_sub : 2 ^ 64 - (2 ^ 64 - c) = c := by omega
+              rw [hc_sub]; exact hrhs_eval
+            rcases hrhs_ty with hrhs_u | hrhs_i
+            · obtain ⟨ha_s, m', hm_ub⟩ := step_binOp_offset_usize_wrap_divergence hstate
+                hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_u
+                hop_rhs himm hptr_slot hrhs_neg hk_pos hdst_live he_mem he_tag hdis hdecl_tgt
+                hdead hinb_neg.1 hinb_neg.2 hptr8
+              exact Or.inr (Or.inr (Or.inr ⟨hdis, hrhs_u, hge63, ⟨_, ha_s⟩, m', hm_ub⟩))
+            · obtain ⟨hrel_s, ha_s, m', _, _, hm_s, _⟩ := step_binOp_offset_neg_isize_simulation
+                hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt
+                hrhs_i hop_rhs himm hptr_slot hrhs_neg hk_pos hdst_live he_mem he_tag hdis
+                hdecl_tgt hdead hinb_neg.1 hinb_neg.2 hptr8
+              exact Or.inl ⟨hrel_s, ⟨_, ha_s⟩, m', hm_s⟩
+          · have hoob_neg : ptrVal.offsetBytes < (2 ^ 64 - c) * stride ∨
+                tgtBytes < ptrVal.offsetBytes := by omega
+            exact Or.inr (Or.inl (mk_oob (Or.inl ⟨hge63, Or.inr hoob_neg⟩)))
+
+/-- **`step_binOp_offset_d6_lockstep_of_not_disabled` (`LM-3.1` D6 Non-Disabled Lockstep
+Corollary)**: immediate corollary of `step_binOp_offset_d6_partition`. Whenever `_p`'s borrow entry
+`e` is not `.disabled` and the RHS count avoids the unsigned `usize` wrap-around divergence
+(`rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63`), `stepMirFn` and `Miri.Interpreter.Step.step` are
+unconditionally in `StepRelLM3_1` lockstep (either both stepping or both raising UB) without
+requiring a separate bounds or liveness case split beyond the unreachable `sc.bits = 0, off ≠ 0`
+corner `hreach`. -/
+theorem step_binOp_offset_d6_lockstep_of_not_disabled
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl tgtDecl : LocalDecl}
+    {ptrMut dstMut : Mutability} {pointeeKind : RigidTy} {rhsTy : Ty}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hprim_pt : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {sc : MirAst.ScalarInt} {locals_rhs : List LocalSlot}
+    {e : AllocMapEntry}
+    (hptr_slot : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hrhs_eval : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+      .ok (.scalar sc) locals_rhs)
+    (hdst_live : get? locals_rhs dstIdx ≠ some .dead)
+    (he_mem : e ∈ allocMap)
+    (he_tag : e.tag = ptrVal.tag)
+    (hperm : e.perm ≠ .disabled)
+    (hno_uwrap : rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (hreach : sc.bits = 0 →
+      ptrVal.offsetBytes = 0 ∨
+      (get? s.frame.locals e.localIdx ≠ some .dead ∧
+        ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat))
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases step_binOp_offset_d6_partition hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr
+      hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag
+      hdecl_tgt (fun _ hc0 => hreach hc0) hptr8 with
+    ⟨hrel, _⟩ | ⟨hrel, _⟩ | ⟨hdis, _⟩ | ⟨_, hrhs_u, hge63, _⟩
+  · exact hrel
+  · exact hrel
+  · exact absurd hdis hperm
+  · rcases hno_uwrap with hrhs_i | hlt63
+    · rw [hrhs_u] at hrhs_i; cases hrhs_i
+    · omega
 
 /-! ## 11. Composed `StateRelLM3_1` Statement Simulation (`step_stmt_lm3_1_state_simulation`) -/
 
@@ -27640,6 +27946,10 @@ raw pointers and memory-backed locals):
   target, overflow `isize`, or target a dead local (UB in both machines)
 * `binOpOffsetUsizeWrapDisabledUb`: a `usize` count with `2 ^ 63 ≤ sc.bits` on a
   `.disabled` borrow entry (UB in both machines)
+* `binOpOffsetNonDisabledLockstep`: unified bounds-insensitive `Offset` lockstep
+  (`step_binOp_offset_d6_lockstep_of_not_disabled`) for any non-`.disabled` borrow entry
+  when `rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63` (stepping in lockstep when in-bounds
+  and failing with `.ub` in both machines when OOB, dead, or overflowing)
 * `derefReadOobUb` / `derefWriteOobUb`: `_d = (copy|move) *_p` / `*_p = .use op`
   past the end of the live allocation (UB in both machines)
 * `derefReadMisalignedUb` / `derefWriteMisalignedUb`: in-bounds but misaligned
@@ -28423,6 +28733,38 @@ inductive WellTypedLM3_1StateStmt
         (translateTy valTy body.layouts).layout.size.bytes.toNat ≠ 0 →
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use op), span⟩
+  | binOpOffsetNonDisabledLockstep
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand) (rhsOp : MirAst.Operand)
+      (dstDecl ptrDecl tgtDecl : LocalDecl) (ptrMut dstMut : Mutability)
+      (pointeeKind : RigidTy) (rhsTy : Ty)
+      (ptrVal : ProvenancePtr) (sc : MirAst.ScalarInt) (locals_rhs : List LocalSlot)
+      (e : AllocMapEntry) (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind →
+      dstDecl.ty.kind = .rawPtr dstMut pointeeKind →
+      IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 } →
+      (rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize) →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy) →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+        s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+        .ok (.scalar sc) locals_rhs →
+      get? locals_rhs dstIdx ≠ some .dead →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      e.perm ≠ .disabled →
+      (rhsTy.kind = .int .isize ∨ sc.bits < 2 ^ 63) →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      (sc.bits = 0 →
+        ptrVal.offsetBytes = 0 ∨
+        (get? s.frame.locals e.localIdx ≠ some .dead ∧
+          ptrVal.offsetBytes ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)) →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩
 
 /-- **`step_stmt_lm3_1_state_simulation` (`LM-3.1` Composed `StateRelLM3_1` Step)**:
 every statement satisfying `WellTypedLM3_1StateStmt body s m allocMap` at the
@@ -28640,6 +28982,13 @@ theorem step_stmt_lm3_1_state_simulation
     exact ⟨allocMap, (step_deref_write_misaligned_offset_simulation hstate hphase hbb hstmt
       hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hdecl_tgt
       htgt_live hinb hmis_mod hlay_coh).1⟩
+  | binOpOffsetNonDisabledLockstep dstIdx ptrIdx opKind rhsOp dstDecl ptrDecl tgtDecl
+      ptrMut dstMut pointeeKind rhsTy ptrVal sc locals_rhs e span
+      hopKind hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+      hptr_slot hrhs_eval hdst_live he_mem he_tag hperm hno_uwrap hdecl_tgt hreach =>
+    exact ⟨allocMap, step_binOp_offset_d6_lockstep_of_not_disabled hstate hphase hopKind
+      hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
+      hptr_slot hrhs_eval hdst_live he_mem he_tag hperm hno_uwrap hdecl_tgt hreach hlay_coh.1⟩
 
 
 /-- State-dependent well-typedness predicate for `LM-3.1` root-frame basic-block
