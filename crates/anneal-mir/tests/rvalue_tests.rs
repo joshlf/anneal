@@ -316,6 +316,7 @@ fn test_aggregates_and_pointer_offset() {
             def_path: "MyStruct".into(),
             variant_idx: 0,
             active_field: None,
+            adt_def: None,
         },
         vec![
             Operand::Copy(Place::from_local(0)),
@@ -333,6 +334,7 @@ fn test_aggregates_and_pointer_offset() {
             def_path: "MyUnion".into(),
             variant_idx: 0,
             active_field: Some(0),
+            adt_def: None,
         },
         vec![Operand::Copy(Place::from_local(0))],
     );
@@ -343,6 +345,7 @@ fn test_aggregates_and_pointer_offset() {
             def_path: "MyUnion".into(),
             variant_idx: 0,
             active_field: Some(0),
+            adt_def: None,
         },
         vec![
             Operand::Copy(Place::from_local(0)),
@@ -466,6 +469,7 @@ fn test_place_projections_statement_and_body_lowering() {
                 Statement::Nop,
             ],
             is_cleanup: false,
+            terminator: None,
         }],
     };
 
@@ -887,6 +891,7 @@ fn test_b1_union_aggregates_check_variant_and_destination_field() {
                 def_path: "U".into(),
                 variant_idx,
                 active_field: Some(field),
+                adt_def: None,
             },
             vec![Operand::Copy(Place::from_local(1))],
         )
@@ -905,6 +910,7 @@ fn test_b1_union_aggregates_check_variant_and_destination_field() {
                 def_path: "U".into(),
                 variant_idx: 1,
                 active_field: Some(1),
+                adt_def: None,
             },
             vec![MirValue::unsigned(7, UintTy::U16, pw)],
             pw,
@@ -1022,7 +1028,9 @@ fn test_b1_place_evaluation_respects_projections() {
                 variant_idx: 1,
                 active_field: None,
                 fields: vec![],
+                adt_def: None,
             }],
+            adt_def: None,
         },
     ];
     let deref = |local: usize| Place::with_projection(local, vec![ProjectionElem::Deref]);
@@ -1229,6 +1237,7 @@ fn test_a1_single_field_union_rejects_out_of_bounds_active_field_and_aggregate_l
                 def_path: "SingleFieldUnion".into(),
                 variant_idx: 0,
                 active_field: Some(0),
+                adt_def: None,
             },
             vec![op_u32.clone()],
         ),
@@ -1243,6 +1252,7 @@ fn test_a1_single_field_union_rejects_out_of_bounds_active_field_and_aggregate_l
                 def_path: "SingleFieldUnion".into(),
                 variant_idx: 0,
                 active_field: Some(99),
+                adt_def: None,
             },
             vec![op_u32],
         ),
@@ -1266,6 +1276,7 @@ fn test_a1_single_field_union_rejects_out_of_bounds_active_field_and_aggregate_l
             def_path: "BigPair".into(),
             variant_idx: 0,
             active_field: None,
+            adt_def: None,
         },
         AggregateKind::Closure,
     ] {
@@ -1540,6 +1551,7 @@ fn test_b2_identity_transmute_of_non_canonical_types_returns_validated_value() {
             MirValue::unsigned(1, UintTy::U8, pw),
             MirValue::unsigned(2, UintTy::U32, pw),
         ],
+        adt_def: None,
     };
     let locals = vec![adt_val.clone(), MirValue::Unit];
     assert_eq!(
@@ -1598,6 +1610,7 @@ fn test_a2_identity_transmute_handles_canonical_structs_unions_and_32bit_ptr_mas
             MirValue::unsigned(10, UintTy::U32, pw64),
             MirValue::unsigned(20, UintTy::U32, pw64),
         ],
+        adt_def: None,
     };
     let identity_pair = Rvalue::Cast(
         CastKind::Transmute,
@@ -1624,6 +1637,7 @@ fn test_a2_identity_transmute_handles_canonical_structs_unions_and_32bit_ptr_mas
         variant_idx: 0,
         active_field: Some(1),
         fields: vec![MirValue::unsigned(0xCAFE_BABE, UintTy::U64, pw64)],
+        adt_def: None,
     };
     let identity_union = Rvalue::Cast(
         CastKind::Transmute,
@@ -1646,6 +1660,7 @@ fn test_a2_identity_transmute_handles_canonical_structs_unions_and_32bit_ptr_mas
         variant_idx: 0,
         active_field: Some(5),
         fields: vec![MirValue::unsigned(1, UintTy::U32, pw64)],
+        adt_def: None,
     };
     assert!(matches!(
         eval_rv(
@@ -1954,6 +1969,7 @@ fn test_ep1_value_tree_place_projections_read_write_and_rvalue_integration() {
                 MirValue::unsigned(777, UintTy::U32, pw),
                 MirValue::unsigned(9, UintTy::U8, pw),
             ],
+            adt_def: None,
         },
     ];
 
@@ -2137,6 +2153,7 @@ fn test_ep1_value_tree_place_projections_read_write_and_rvalue_integration() {
         variant_idx: 0,
         active_field: Some(0),
         fields: vec![MirValue::unsigned(0x1234, UintTy::U32, pw)],
+        adt_def: None,
     };
     let union_f0 = Place::with_projection(2, vec![ProjectionElem::Field(0, u32_ty.clone())]);
     let union_f1 = Place::with_projection(2, vec![ProjectionElem::Field(1, u8_ty)]);
@@ -2434,6 +2451,7 @@ fn test_ep1_statement_and_block_evaluation_d9_d13b_set_discriminant_assume_and_m
             variant_idx: 2,
             active_field: None,
             fields: vec![MirValue::unsigned(99, UintTy::U32, pw)],
+            adt_def: None,
         })
     );
 
@@ -2517,6 +2535,7 @@ fn test_ep1_statement_and_block_evaluation_d9_d13b_set_discriminant_assume_and_m
                 Statement::StorageDead(Local(2)),
             ],
             is_cleanup: false,
+            terminator: None,
         }],
     };
     let lowered_body = lower_body(&body, pw).unwrap();
