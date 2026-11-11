@@ -74,18 +74,29 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `evalDeinitPlace_taggedEnum_bytes_simulation`, and
      `evalDeinitPlace_univariantEnum_bytes_simulation` (plus active/inactive `Downcast` variant
      enforcement `evalDeinitPlace_downcast_inactive_variant_none` /
-     `evalDeinitPlace_downcast_active_variant_eq` and overlapping union byte simulation
-     `union_deinit_bytes_simulation`; `AdtDiscrSpec.CoherentWith` ties the discriminant facts to
-     the layout): field-level `Deinit` is MiniRust's byte-range `Uninit` write (closing the
-     projected-`Deinit` gap noted at `MiniRustSpec/Correspondence/Translate.lean:3742`).
+     `evalDeinitPlace_downcast_active_variant_eq`; `AdtDiscrSpec.CoherentWith` ties the
+     discriminant facts to the layout): field-level `Deinit` is MiniRust's byte-range `Uninit`
+     write (closing the projected-`Deinit` gap noted at
+     `MiniRustSpec/Correspondence/Translate.lean:3742`).
+   - The Rust-faithful typed walk `evalDeinitPlaceTyped` (with the declared types' union
+     information `unionAt`) rejects a projected `Deinit` into an initialized union
+     (`evalDeinitPlaceTyped_through_init_union_none`, `UnsupportedPlaceProjection`: a union has no
+     per-field shell, and an `Uninit` write over one field clobbers its overlapping siblings,
+     `union_field_uninit_bytes`) and is otherwise `evalDeinitPlace` (`evalDeinitPlaceTyped_sound`,
+     `evalDeinitPlaceTyped_no_union`), so every `evalDeinitPlace` theorem applies to it;
+     `evalDeinitPlace_union_field_divergence` records the untyped walk's over-acceptance.
    - Step refinement against Trusted's `evalStmt` on `.deinit` under the `SlotBelow` frame
      relation (Anneal knows less than Trusted; every Anneal read is a Trusted read:
      `readPlaceState_below_refines`), and the documented divergence on projected `Deinit`
      below an uninitialized local (`evalStmt_deinit_projected_uninit_root_divergence`).
-   - `evalRetagPlace` (`retag_place`: raw retags and recursive reference checks with the `A3`
+   - `evalRetagPlace` (`retag_place`: the index pre-read of `prepare_place_access`
+     (`evalRetagPlace_bad_index_false`), raw retags and recursive reference checks with the `A3`
      dangling rule, `A3` niche-shell tag readability, `B4` niche-capable `Init` well-formedness,
      `B2` rejection of out-of-range variants and variants with uninhabited fields via
-     `RetagTy.inhabited`, and `Deinit`-then-`Retag` failure `evalDeinitPlace_then_retag_same_false`),
+     `RetagTy.inhabited`, and `Deinit`-then-`Retag` failure `evalDeinitPlace_then_retag_same_false`)
+     with step refinement of Trusted's `evalStmt` on `.retag`: Trusted reads and retags exactly the
+     pointer Anneal validated and steps without faulting whenever its borrow model grants the tag
+     (`evalStmt_retag_ref_refines`; `evalStmt_retag_disabled_ub` for a disabled tag),
      `copyNonOverlappingChecks` and the stateful `evalCopyNonOverlappingState` (agreeing with
      Trusted's `rangesDisjoint`; whole locals are resolved from the pointers themselves —
      provenance local, synthetic base address, declared element type — as `resolve_synthetic_local`
@@ -94,7 +105,7 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      not whole-local copies, e.g. through out-of-frame provenance, are no-ops; whole-local copies
      copy the source state verbatim, including `.uninit`, with read-after-copy and frame laws
      `evalCopyNonOverlappingState_read_dst_bare` / `evalCopyNonOverlappingState_read_other_bare`
-     and refinement against Trusted's `evalCopySingleDirect` in
+     and refinement against Trusted's `evalCopySingleDirect` (with an empty borrow stack) in
      `evalCopySingleDirect_whole_local_refines`), `evalShallowInitBox`,
      `evalWrapUnsafeBinder`, and `evalPointerCoercion` with their soundness/preservation
      theorems, and refinement of Trusted's `evalRvalue` for `Discriminant`
@@ -116,14 +127,16 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `runLoweredCfgSteps_with_stmts_refines_trusted` under `BodyCorrWithStmts`) against
      Trusted's `evalTerminator` / `stepMirFn` / `stepMirState` (Trusted never faults where Anneal
      succeeds), plus the projected-`Drop` refinement and the documented bare-`Drop` divergence.
-   - Both the frame part (`placeFrameAccessOk`: a live root local and initialized `Index` operand
-     locals) and the projection-walk part (`slotProjectionAccessOk` / `typedPlaceProjectionOk`:
-     non-`Deref`, active-variant `Downcast`, in-bounds `Field`, initialized `Index` / `ConstantIndex`
-     / `Subslice`, connected to `deinitFieldSlot` / `evalDeinitPlace` via
-     `typedPlaceProjectionOk_of_evalDeinitPlace`) of `check_place_access` for `Drop` places and
-     `Call` destinations are concrete, so a `Drop` of a dead local faults in both semantics
-     (`evalLoweredTerminator_drop_dead_agrees_trusted`) and a successful `Drop` names a local
-     Trusted also holds live (`evalLoweredTerminator_drop_trusted_live`).
+   - The frame part of `check_place_access` for `Drop` places and `Call` destinations is concrete
+     (`placeFrameAccessOk`: a live root local and initialized `Index` operand locals), so a `Drop`
+     of a dead local faults in both semantics (`evalLoweredTerminator_drop_dead_agrees_trusted`)
+     and a successful `Drop` names a local Trusted also holds live
+     (`evalLoweredTerminator_drop_trusted_live`); its type-directed part
+     (`validate_projection_tail` against the declared types) is the environment's
+     `CfgEnv.placeAccessOk`. The value-directed walk `slotProjectionAccessOk` /
+     `slotPlaceProjectionOk` (active variants, in-bounds fields) is the path discipline of
+     `deinit_in_slot` (`slotPlaceProjectionOk_of_evalDeinitPlace`), not Rust's type-directed
+     check, and the evaluator does not consult it.
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -4479,15 +4492,18 @@ def UnionFieldBytes (enc : Value → List UInt8) (img : ByteImage) (fl : FieldLa
     (slot : FieldSlot) : Prop :=
   FieldBytes enc img 0 fl.size slot
 
-/-- **Union field `Deinit` byte simulation (`union_deinit_bytes_simulation`)**: for a well-formed
+/-- **Overlapping union fields at the byte level (`union_field_uninit_bytes`)**: for a well-formed
 union (`spec.shape = .union fs`) with layout `(size, align)` and field `fs[f]? = some fl`, field
-`f` sits at offset `0` (`fl.size ≤ size`), and writing `Uninit` over `[0, fl.size)`
+`f` sits at offset `0` (`fl.size ≤ size`), and an `Uninit` write over its bytes `[0, fl.size)`
 (`deinitBytes img 0 fl.size`):
-1. leaves field `f` represented as `.uninit` (`UnionFieldBytes enc (deinitBytes img 0 fl.size) fl .uninit`),
-2. invalidates any overlapping non-zero-sized initialized sibling field `g` at offset `0`
-   (`¬ UnionFieldBytes enc (deinitBytes img 0 fl.size) fg (.init w)` when `0 < fl.size ∧ 0 < fg.size`), and
-3. preserves all trailing bytes `[fl.size, img.length)` beyond `fl.size`. -/
-theorem union_deinit_bytes_simulation {spec : AdtLayoutSpec} (hWF : spec.WF)
+1. represents field `f` as `.uninit` (`UnionFieldBytes enc (deinitBytes img 0 fl.size) fl .uninit`),
+2. destroys every overlapping initialized non-zero-sized sibling `g` at offset `0`
+   (`¬ UnionFieldBytes enc (deinitBytes img 0 fl.size) fg (.init w)` when `0 < fl.size ∧ 0 < fg.size`),
+3. preserves the trailing bytes `[fl.size, img.length)`.
+This is a fact about bytes only (no `Deinit` evaluation is involved): it is why a union has no
+per-field shell, and why `deinit_in_slot` rejects a projected `Deinit` into an initialized union
+instead (`evalDeinitPlaceTyped_through_init_union_none`). -/
+theorem union_field_uninit_bytes {spec : AdtLayoutSpec} (hWF : spec.WF)
     {fs : List FieldLayout} (hShape : spec.shape = .union fs)
     {f : Nat} {fl : FieldLayout} (hfl : fs[f]? = some fl)
     {size align : Nat} (hLay : adtLayout? spec = some (size, align))
@@ -4694,28 +4710,41 @@ def projectFieldSlot (locals : List LocalSlot) : FieldSlot → List ProjectionEl
     else none
   | _, _ => none
 
-/-- `StatementEvalState::retag_place`: a dead local faults (`DeadLocal`); `Retag(Raw)` requires a
-raw-pointer place holding an initialized pointer whose address fits the pointer width (it may be
-null, unaligned, or dangling); every other kind requires nothing of a place without references
-but its liveness, and otherwise validates every reference reachable in the place's part. -/
+/-- The index pre-read of `prepare_place_access` (`read_index_local`): every `Index` operand local
+of a projection holds an initialized scalar (`DeadLocal` / `UninitializedLocal` otherwise). -/
+def indexLocalsOk (slots : List LocalSlotState) (proj : List ProjectionElem) : Bool :=
+  proj.all fun e =>
+    match e with
+    | .index i =>
+      match slots[i]? with
+      | some (.init (.scalar _)) => true
+      | _ => false
+    | _ => true
+
+/-- `StatementEvalState::retag_place`: a dead local faults (`DeadLocal`) and every `Index` operand
+local must be readable (`prepare_place_access`'s index pre-read, `indexLocalsOk`); `Retag(Raw)`
+requires a raw-pointer place holding an initialized pointer whose address fits the pointer width
+(it may be null, unaligned, or dangling); every other kind requires nothing more of a place
+without references, and otherwise validates every reference reachable in the place's part. -/
 def evalRetagPlace (ctx : RetagCtx) (kind : RetagKind) (place : Place) (ty : RetagTy)
     (rawPtrPlace : Bool) : Bool :=
   match ctx.slots[place.local_]? with
   | none => false
   | some .dead => false
   | some st =>
-    match kind with
-    | .raw =>
-      rawPtrPlace &&
-        (match readPlaceState ctx.slots place with
-         | .ok (.ptr p _) => decide (ctx.addrOf p < 2 ^ ctx.ptrBits)
-         | _ => false)
-    | _ =>
-      !ty.containsRef ||
-        (match projectFieldSlot (slotsToTrustedLocals ctx.slots) (slotStateToFieldSlot st)
-            place.projection with
-         | some target => retagSlotOk ctx ty target
-         | none => false)
+    indexLocalsOk ctx.slots place.projection &&
+      (match kind with
+       | .raw =>
+         rawPtrPlace &&
+           (match readPlaceState ctx.slots place with
+            | .ok (.ptr p _) => decide (ctx.addrOf p < 2 ^ ctx.ptrBits)
+            | _ => false)
+       | _ =>
+         !ty.containsRef ||
+           (match projectFieldSlot (slotsToTrustedLocals ctx.slots) (slotStateToFieldSlot st)
+               place.projection with
+            | some target => retagSlotOk ctx ty target
+            | none => false))
 
 /-- `retagAlignOk` spelled out. -/
 theorem retagAlignOk_iff (pt : RetagPointee) (addr : Nat) :
@@ -4751,6 +4780,50 @@ theorem evalRetagPlace_dead (ctx : RetagCtx) (kind : RetagKind) (place : Place) 
     evalRetagPlace ctx kind place ty b = false := by
   simp [evalRetagPlace, h]
 
+/-- **`Retag` through an unreadable `Index` operand local fails** (`prepare_place_access`'s index
+pre-read: `DeadLocal` / `UninitializedLocal`), for every kind and every place type — even a
+reference-free one, which otherwise needs only a live local. -/
+theorem evalRetagPlace_bad_index_false (ctx : RetagCtx) (kind : RetagKind) {place : Place}
+    (ty : RetagTy) (b : Bool) {i : Local} (hIdx : .index i ∈ place.projection)
+    (hBad : ∀ sc, ctx.slots[i]? ≠ some (.init (.scalar sc))) :
+    evalRetagPlace ctx kind place ty b = false := by
+  have hI : indexLocalsOk ctx.slots place.projection = false := by
+    cases hc : indexLocalsOk ctx.slots place.projection with
+    | false => rfl
+    | true =>
+      unfold indexLocalsOk at hc
+      rw [List.all_eq_true] at hc
+      have hE := hc _ hIdx
+      cases hS : ctx.slots[i]? with
+      | none => simp [hS] at hE
+      | some st =>
+        cases st with
+        | init v =>
+          cases v with
+          | scalar sc => exact absurd hS (hBad sc)
+          | _ => simp [hS] at hE
+        | _ => simp [hS] at hE
+  unfold evalRetagPlace
+  split
+  · rfl
+  · rfl
+  · simp [hI]
+
+/-- A reference-free place is retagged (by any non-raw kind) exactly when its local is live and its
+`Index` operand locals are readable. -/
+theorem evalRetagPlace_noRef {ctx : RetagCtx} {kind : RetagKind} {place : Place} {ty : RetagTy}
+    {b : Bool} (hKind : kind ≠ .raw) (hNoRef : ty.containsRef = false) :
+    evalRetagPlace ctx kind place ty b = true ↔
+      (∃ st, ctx.slots[place.local_]? = some st ∧ st ≠ .dead) ∧
+        indexLocalsOk ctx.slots place.projection = true := by
+  unfold evalRetagPlace
+  cases hS : ctx.slots[place.local_]? with
+  | none => simp
+  | some st =>
+    cases st with
+    | dead => simp
+    | _ => cases kind <;> first | exact absurd rfl hKind | simp [hNoRef]
+
 /-- **`Retag(Raw)` soundness**: a successful raw retag read an initialized pointer of the place
 whose address fits the pointer width. -/
 theorem evalRetagPlace_raw_sound {ctx : RetagCtx} {place : Place} {ty : RetagTy} {b : Bool}
@@ -4762,7 +4835,7 @@ theorem evalRetagPlace_raw_sound {ctx : RetagCtx} {place : Place} {ty : RetagTy}
   · nomatch h
   · nomatch h
   · simp only [Bool.and_eq_true] at h
-    obtain ⟨hb, hR⟩ := h
+    obtain ⟨_, hb, hR⟩ := h
     refine ⟨hb, ?_⟩
     split at hR
     · rename_i p sz hRead
@@ -4805,7 +4878,8 @@ theorem evalRetagPlace_ref_sound {ctx : RetagCtx} {kind : RetagKind} {place : Pl
     cases kind with
     | raw => exact absurd rfl hKind
     | _ =>
-      simp only [RetagTy.containsRef, Bool.not_true, Bool.false_or] at h
+      simp only [RetagTy.containsRef, Bool.not_true, Bool.false_or, Bool.and_eq_true] at h
+      obtain ⟨_, h⟩ := h
       split at h
       · rename_i target hT
         cases target with
@@ -4858,6 +4932,197 @@ theorem evalStmt_retag_uninit_or_dead_ub (s : MachineState) (kind : RetagKind) (
       simp [projectionHasDeref] at hNoDeref
     · rcases hT with hT | hT <;> simp [hT]
   simp only [evalStmt, hOp]
+
+/-- A successful projected value read has no `Deref` (`evalValueProjRead` reports `Deref` as
+unsupported). -/
+theorem evalValueProjRead_ok_noDeref (locals : List LocalSlot) :
+    ∀ (p : List ProjectionElem) (v w : Value), evalValueProjRead locals v p = .ok w →
+      projectionHasDeref p = false
+  | [], _, _, _ => rfl
+  | .deref :: _, v, _, h => by cases v <;> simp [evalValueProjRead] at h
+  | .field _ _ :: rest, v, w, h => by
+    cases v with
+    | aggregate var fields =>
+      simp only [evalValueProjRead] at h
+      split at h
+      · exact evalValueProjRead_ok_noDeref locals rest _ w h
+      · nomatch h
+    | _ => simp [evalValueProjRead] at h
+  | .downcast _ _ :: rest, v, w, h => by
+    cases v with
+    | aggregate var fields =>
+      simp only [evalValueProjRead] at h
+      split at h
+      · exact evalValueProjRead_ok_noDeref locals rest _ w h
+      · nomatch h
+    | _ => simp [evalValueProjRead] at h
+  | .index _ :: rest, v, w, h => by
+    cases v with
+    | aggregate var fields =>
+      cases var with
+      | zero =>
+        simp only [evalValueProjRead] at h
+        split at h
+        · split at h
+          · exact evalValueProjRead_ok_noDeref locals rest _ w h
+          · nomatch h
+        · nomatch h
+      | succ _ => simp [evalValueProjRead] at h
+    | _ => simp [evalValueProjRead] at h
+  | .constantIndex _ _ _ :: rest, v, w, h => by
+    cases v with
+    | aggregate var fields =>
+      cases var with
+      | zero =>
+        simp only [evalValueProjRead] at h
+        split at h
+        · split at h
+          · exact evalValueProjRead_ok_noDeref locals rest _ w h
+          · nomatch h
+        · nomatch h
+      | succ _ => simp [evalValueProjRead] at h
+    | _ => simp [evalValueProjRead] at h
+  | .subslice _ _ _ :: rest, v, w, h => by
+    cases v with
+    | aggregate var fields =>
+      cases var with
+      | zero =>
+        simp only [evalValueProjRead] at h
+        split at h
+        · exact evalValueProjRead_ok_noDeref locals rest _ w h
+        · nomatch h
+      | succ _ => simp [evalValueProjRead] at h
+    | _ => simp [evalValueProjRead] at h
+  | .opaqueCast _ :: _, v, _, h => by cases v <;> simp [evalValueProjRead] at h
+  | .unwrapUnsafeBinder _ :: _, v, _, h => by cases v <;> simp [evalValueProjRead] at h
+
+/-- **A part `projectFieldSlot` finds initialized is what `read_place` reads there**: its path has
+no `Deref`, and `readFieldSlot` reads exactly that value. -/
+theorem projectFieldSlot_init_spec_aux (locals : List LocalSlot) :
+    ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n → ∀ (slot : FieldSlot) (w : Value),
+      projectFieldSlot locals slot p = some (.init w) →
+        projectionHasDeref p = false ∧ readFieldSlot locals slot p = .ok w := by
+  intro n
+  induction n with
+  | zero =>
+    intro p hLen slot w h
+    have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
+    subst hp
+    simp only [projectFieldSlot, Option.some.injEq] at h
+    subst h
+    exact ⟨rfl, rfl⟩
+  | succ n ih =>
+    intro p hLen slot w h
+    rcases p with _ | ⟨a, rest⟩
+    · simp only [projectFieldSlot, Option.some.injEq] at h
+      subst h
+      exact ⟨rfl, rfl⟩
+    · simp only [List.length_cons] at hLen
+      cases slot with
+      | uninit => simp [projectFieldSlot] at h
+      | init v =>
+        simp only [projectFieldSlot] at h
+        split at h
+        · rename_i w' hw'
+          simp only [Option.some.injEq, FieldSlot.init.injEq] at h
+          subst h
+          exact ⟨evalValueProjRead_ok_noDeref locals _ v _ hw', hw'⟩
+        · nomatch h
+      | nested var adt disc fs =>
+        cases a
+        case field idx ty =>
+          rw [readFieldSlot_nested_field]
+          unfold shellFieldRead
+          by_cases hV : shellVariant ⟨var, adt, disc, fs⟩ = 0
+          · simp only [projectFieldSlot, hV, ↓reduceIte] at h
+            simp only [hV, ↓reduceIte]
+            cases hc : fs[idx]? with
+            | none => simp [hc] at h
+            | some c =>
+              simp only [hc] at h ⊢
+              exact ih rest (by omega) c w h
+          · simp [projectFieldSlot, hV] at h
+        case downcast nm v =>
+          rcases rest with _ | ⟨b, rest'⟩
+          · simp [projectFieldSlot] at h
+          · simp only [List.length_cons] at hLen
+            cases b
+            case field idx ty =>
+              rw [readFieldSlot_nested_downcast_field]
+              unfold shellFieldRead
+              by_cases hV : shellVariant ⟨var, adt, disc, fs⟩ = v
+              · simp only [projectFieldSlot, hV, ↓reduceIte] at h
+                simp only [hV, ↓reduceIte]
+                cases hc : fs[idx]? with
+                | none => simp [hc] at h
+                | some c =>
+                  simp only [hc] at h ⊢
+                  exact ih rest' (by omega) c w h
+              · simp [projectFieldSlot, hV] at h
+            all_goals simp [projectFieldSlot] at h
+        all_goals simp [projectFieldSlot] at h
+
+/-- `read_place` reads the value `projectFieldSlot` finds initialized in a live local. -/
+theorem readPlaceState_of_projectFieldSlot_init {slots : List LocalSlotState} {place : Place}
+    {st : LocalSlotState} {w : Value} (hSt : slots[place.local_]? = some st) (hLive : st ≠ .dead)
+    (h : projectFieldSlot (slotsToTrustedLocals slots) (slotStateToFieldSlot st)
+      place.projection = some (.init w)) :
+    readPlaceState slots place = .ok w := by
+  obtain ⟨hND, hRead⟩ := projectFieldSlot_init_spec_aux _ _ _ (Nat.le_refl _) _ _ h
+  exact (readPlaceState_eq_readFieldSlot hSt hLive place.projection hND).trans hRead
+
+/-- **Reference `Retag` refines Trusted's `evalStmt` (`.retag`)**: on below-related frames, a
+successful non-raw Anneal retag of a reference-typed place read the pointer `p` stored there
+(`readPlaceState`) and validated it (`retagRefOk`: non-null, within the pointer width, aligned,
+inhabited pointee, not dangling into a dead local); Trusted's `.retag` reads that same pointer
+(`evalOperand (.copy place)`), and whenever Trusted's borrow model grants the retag (`p`'s tag is
+tracked with an `active` or `reserved` permission) Trusted's `evalStmt` steps — it never faults —
+to the next statement with its locals unchanged (`advanceStmt s s.frame.locals mem'`, where only
+`FnEntry` changes the memory, installing a protector).
+Anneal's model has no borrow tracking, so the aliasing permission is the only fact taken from
+Trusted's side. -/
+theorem evalStmt_retag_ref_refines {ctx : RetagCtx} {kind : RetagKind} {place : Place}
+    {pt : RetagPointee} {b : Bool} (hKind : kind ≠ .raw)
+    (h : evalRetagPlace ctx kind place (.ref pt) b = true) {s : MachineState}
+    (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧ retagRefOk ctx pt p = true ∧
+      ∀ entry, lookupBorrow s.memory.borrows p.tag = some entry →
+        (entry.perm = .active ∨ entry.perm = .reserved) →
+        ∃ mem', evalStmt s ⟨.retag kind place, span⟩ localDecls layouts =
+          .step (advanceStmt s s.frame.locals mem') := by
+  obtain ⟨st, p, sz, hSt, hLive, hProj, hChecks⟩ := evalRetagPlace_ref_sound hKind h
+  have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
+  refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks, fun entry hLook hPerm => ?_⟩
+  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals
+  cases kind with
+  | raw => exact absurd rfl hKind
+  | fnEntry =>
+    rcases hPerm with hP | hP <;> exact ⟨_, by simp only [evalStmt, hOp, hLook, hP] <;> rfl⟩
+  | twoPhase =>
+    rcases hPerm with hP | hP <;> exact ⟨_, by simp only [evalStmt, hOp, hLook, hP] <;> rfl⟩
+  | default =>
+    rcases hPerm with hP | hP <;> exact ⟨_, by simp only [evalStmt, hOp, hLook, hP] <;> rfl⟩
+
+/-- **Trusted rejects a disabled tag where Anneal has no aliasing model**: Trusted's `.retag`
+faults on a pointer whose tag is `disabled`, a place Anneal's (borrow-free) retag may accept —
+the refinement of `evalStmt_retag_ref_refines` is conditional on Trusted's permission. -/
+theorem evalStmt_retag_disabled_ub {ctx : RetagCtx} {kind : RetagKind} {place : Place}
+    {pt : RetagPointee} {b : Bool} (hKind : kind ≠ .raw)
+    (h : evalRetagPlace ctx kind place (.ref pt) b = true) {s : MachineState}
+    (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) {entry : BorrowEntry}
+    (hDis : entry.perm = .disabled) :
+    ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
+      (lookupBorrow s.memory.borrows p.tag = some entry →
+        evalStmt s ⟨.retag kind place, span⟩ localDecls layouts = .fail .ub) := by
+  obtain ⟨st, p, sz, hSt, hLive, hProj, _⟩ := evalRetagPlace_ref_sound hKind h
+  have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
+  refine ⟨p, sz, hRead, fun hLook => ?_⟩
+  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals
+  simp only [evalStmt, hOp, hLook, hDis]
 
 /-- **`Retag` on a niche-capable enum shell fails (`A3`)**: for a reference-bearing enum whose tag
 requires a tag write (`rt = true`) but does not survive field deinitialization (`ts = false`),
@@ -5027,7 +5292,103 @@ theorem evalDeinitPlace_then_retag_same_false {ts : Bool} {slots : List LocalSlo
       simp only [hRef, Bool.not_true, Bool.false_or, hRound]
       rcases projectFieldSlot_of_uninitAt (slotsToTrustedLocals ctx.slots) hU with h1 | h2
       · rw [h1]; simp [retagSlotOk, hRef]
-      · rw [h2]
+      · simp [h2]
+
+/-! #### Unions in the typed `Deinit` walk -/
+
+/-- Whether the `Deinit` walk of the path `p` from `root` reaches an *initialized union* with path
+left to walk. In `deinit_in_slot`, "array elements and union fields have no per-part shells", so a
+projected `Deinit` into an initialized union value is `UnsupportedPlaceProjection`. Union-ness is
+a property of the declared types that the untyped value model cannot see (a union value is an
+aggregate like any other), so `unionAt q` says whether the place prefix `q` is union-typed; the
+walk reaches an initialized part at the proper prefix `p.take k` exactly when `projectFieldSlot`
+yields `.init` there. -/
+def deinitReachesInitUnion (unionAt : List ProjectionElem → Bool) (locals : List LocalSlot)
+    (root : FieldSlot) (p : List ProjectionElem) : Bool :=
+  (List.range p.length).any fun k =>
+    unionAt (p.take k) &&
+      match projectFieldSlot locals root (p.take k) with
+      | some (.init _) => true
+      | _ => false
+
+/-- **Rust-faithful projected `Deinit`** (`StatementEvalState::deinit_place` with the declared
+types' union information `unionAt`): `evalDeinitPlace`, except that a projected `Deinit` that
+reaches an initialized union value with path left (`deinitReachesInitUnion`) is rejected
+(`UnsupportedPlaceProjection`). -/
+def evalDeinitPlaceTyped (unionAt : List ProjectionElem → Bool) (ts : Bool)
+    (slots : List LocalSlotState) (place : Place) : Option (List LocalSlotState) :=
+  match slots[place.local_]? with
+  | none => none
+  | some st =>
+    if deinitReachesInitUnion unionAt (slotsToTrustedLocals slots) (slotStateToFieldSlot st)
+        place.projection then none
+    else evalDeinitPlace ts slots place
+
+/-- **Every typed `Deinit` is an untyped one**: a successful `evalDeinitPlaceTyped` is a
+successful `evalDeinitPlace` with the same result, so every `evalDeinitPlace` theorem (the lens
+laws, the byte simulations, and the Trusted `evalStmt` refinements) applies to it. -/
+theorem evalDeinitPlaceTyped_sound {unionAt : List ProjectionElem → Bool} {ts : Bool}
+    {slots slots' : List LocalSlotState} {place : Place}
+    (h : evalDeinitPlaceTyped unionAt ts slots place = some slots') :
+    evalDeinitPlace ts slots place = some slots' := by
+  unfold evalDeinitPlaceTyped at h
+  split at h
+  · nomatch h
+  · split at h
+    · nomatch h
+    · exact h
+
+/-- Without union-typed prefixes the typed `Deinit` is exactly the untyped one. -/
+theorem evalDeinitPlaceTyped_no_union (ts : Bool) (slots : List LocalSlotState) (place : Place) :
+    evalDeinitPlaceTyped (fun _ => false) ts slots place = evalDeinitPlace ts slots place := by
+  unfold evalDeinitPlaceTyped deinitReachesInitUnion
+  cases h : slots[place.local_]? with
+  | none => simp [evalDeinitPlace, h]
+  | some st => simp
+
+/-- **A projected `Deinit` through an initialized union is rejected**
+(`UnsupportedPlaceProjection`): if the walk reaches an initialized union-typed part at a proper
+prefix of the path, the typed `Deinit` fails (while the untyped model would explode the union like
+a struct; `union_field_uninit_bytes` shows why that would be wrong at the byte level). -/
+theorem evalDeinitPlaceTyped_through_init_union_none {unionAt : List ProjectionElem → Bool}
+    {ts : Bool} {slots : List LocalSlotState} {place : Place} {st : LocalSlotState} {k : Nat}
+    {w : Value} (hSt : slots[place.local_]? = some st) (hk : k < place.projection.length)
+    (hU : unionAt (place.projection.take k) = true)
+    (hInit : projectFieldSlot (slotsToTrustedLocals slots) (slotStateToFieldSlot st)
+      (place.projection.take k) = some (.init w)) :
+    evalDeinitPlaceTyped unionAt ts slots place = none := by
+  have hReach : deinitReachesInitUnion unionAt (slotsToTrustedLocals slots)
+      (slotStateToFieldSlot st) place.projection = true := by
+    unfold deinitReachesInitUnion
+    rw [List.any_eq_true]
+    exact ⟨k, List.mem_range.mpr hk, by simp [hU, hInit]⟩
+  unfold evalDeinitPlaceTyped
+  rw [hSt]
+  simp only [hReach, ↓reduceIte]
+
+/-- **`Deinit` of a field of an initialized union local is rejected**: the root local is
+union-typed and initialized, so every projected `Deinit` of it fails, whereas the untyped
+`evalDeinitPlace` would succeed on a union value's field (e.g. `Deinit(u.0)` on
+`u = .init (.aggregate 0 [v])`). -/
+theorem evalDeinitPlaceTyped_init_union_root_none {unionAt : List ProjectionElem → Bool}
+    {ts : Bool} {slots : List LocalSlotState} {loc : Local} {v : Value} {a : ProjectionElem}
+    {rest : List ProjectionElem} (hU : unionAt [] = true)
+    (hRoot : slots[loc]? = some (.init v)) :
+    evalDeinitPlaceTyped unionAt ts slots ⟨loc, a :: rest⟩ = none :=
+  evalDeinitPlaceTyped_through_init_union_none (st := .init v) (k := 0) (w := v) hRoot
+    (by simp) (by simpa using hU) (by simp [slotStateToFieldSlot, projectFieldSlot])
+
+/-- The divergence the typed walk closes: the untyped `evalDeinitPlace` accepts `Deinit(u.0)` on
+an initialized single-field aggregate (as it must for a struct), while the typed walk rejects it
+when the local is a union. -/
+theorem evalDeinitPlace_union_field_divergence {ts : Bool} {slots : List LocalSlotState}
+    {loc : Local} {v : Value} {ty : Ty} (hRoot : slots[loc]? = some (.init (.aggregate 0 [v])))
+    (unionAt : List ProjectionElem → Bool) (hU : unionAt [] = true) :
+    (∃ slots', evalDeinitPlace ts slots ⟨loc, [.field 0 ty]⟩ = some slots') ∧
+      evalDeinitPlaceTyped unionAt ts slots ⟨loc, [.field 0 ty]⟩ = none := by
+  refine ⟨?_, evalDeinitPlaceTyped_init_union_root_none hU hRoot⟩
+  simp [evalDeinitPlace, hRoot, slotStateToFieldSlot, deinitFieldSlot, deinitShellStep,
+    explodeAggregate, shellVariant]
 
 /-! ### Section 2g: `CopyNonOverlapping` -/
 
@@ -6899,8 +7260,8 @@ theorem placeFrameAccessOk_index {slots : List LocalSlotState} {place : Place}
     exact ⟨sc, hSc⟩
   · nomatch hI
 
-/-- Concrete projection-walk check (`prepare_place_access` / `validate_projection_tail` in
-`rvalue.rs`) over a `FieldSlot`:
+/-- The value-directed projection walk of `deinit_in_slot` over a `FieldSlot` (not the
+type-directed `prepare_place_access` / `validate_projection_tail`; see `slotPlaceProjectionOk`):
 - empty projection `[]` always succeeds;
 - below `.uninit`, validates the remaining tail with `deinitTailOk` (no `Deref`, `Downcast`
   followed by `Field`, `Index` scalar local, static `ConstantIndex`/`Subslice` bounds);
@@ -6933,10 +7294,15 @@ def slotProjectionAccessOk (locals : List LocalSlot) :
       | none => false
   | _, _ :: _ => false
 
-/-- Concrete `check_place_access` (`typedPlaceProjectionOk`): the root local is live and its root
-slot satisfies `slotProjectionAccessOk` along `place.projection` (`B1` active-variant, field-bounds,
-and tail checks for `Drop`, `Call`, `Retag`, and `Discriminant`). -/
-def typedPlaceProjectionOk (slots : List LocalSlotState) (place : Place) : Bool :=
+/-- The value-directed path discipline of a place (`slotPlaceProjectionOk`): the root local is
+live and its root slot satisfies `slotProjectionAccessOk` along `place.projection` (active
+variants, in-bounds fields, well-formed tails below uninitialized parts). This is the discipline
+`deinit_in_slot` enforces (`slotPlaceProjectionOk_of_evalDeinitPlace`). It is *not* Rust's
+`check_place_access`, which is type-directed (`validate_projection_tail` against the declared
+types: it accepts a `Downcast` to any variant of the type, and in-bounds array projections, on
+whatever value the place holds); the CFG evaluator keeps that typed part abstract in
+`CfgEnv.placeAccessOk` and checks the frame part concretely (`placeFrameAccessOk`). -/
+def slotPlaceProjectionOk (slots : List LocalSlotState) (place : Place) : Bool :=
   match slots[place.local_]? with
   | none | some .dead => false
   | some st =>
@@ -6975,39 +7341,39 @@ theorem slotProjectionAccessOk_noDeref (locals : List LocalSlot) (slot : FieldSl
     · nomatch h.2
   | case7 => nomatch h
 
-/-- **Concrete `typedPlaceProjectionOk` rejects `Deref` (`UnsupportedPlaceProjection`)**. -/
-theorem typedPlaceProjectionOk_noDeref {slots : List LocalSlotState} {place : Place}
-    (h : typedPlaceProjectionOk slots place = true) :
+/-- **Concrete `slotPlaceProjectionOk` rejects `Deref` (`UnsupportedPlaceProjection`)**. -/
+theorem slotPlaceProjectionOk_noDeref {slots : List LocalSlotState} {place : Place}
+    (h : slotPlaceProjectionOk slots place = true) :
     projectionHasDeref place.projection = false := by
-  unfold typedPlaceProjectionOk at h
+  unfold slotPlaceProjectionOk at h
   split at h
   · nomatch h
   · nomatch h
   · exact slotProjectionAccessOk_noDeref _ _ _ h
 
-/-- **Concrete `typedPlaceProjectionOk` rejects inactive `Downcast` variants (`B1`)**:
+/-- **Concrete `slotPlaceProjectionOk` rejects inactive `Downcast` variants (`B1`)**:
 projecting `.downcast nm dv :: .field idx ty :: rest` on an initialized aggregate of variant `v`
 or a partial shell narrowed to variant `v` with `v ≠ dv` fails (`false`,
 `InactiveVariantProjection`). -/
-theorem typedPlaceProjectionOk_inactive_variant_false (slots : List LocalSlotState) (loc : Local)
+theorem slotPlaceProjectionOk_inactive_variant_false (slots : List LocalSlotState) (loc : Local)
     {v dv idx : Nat} (nm : Option String) (ty : Ty) (rest : List ProjectionElem) (hNe : v ≠ dv) :
     (∀ vals, slots[loc]? = some (.init (.aggregate v vals)) →
-      typedPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) ∧
+      slotPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) ∧
     (∀ sh, slots[loc]? = some (.partialShell sh) → shellVariant sh = v →
-      typedPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) := by
+      slotPlaceProjectionOk slots ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ = false) := by
   refine ⟨fun vals hRoot => ?_, fun sh hRoot hVar => ?_⟩
-  · simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNe]
+  · simp [slotPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNe]
   · obtain ⟨var, adt, disc, fs⟩ := sh
-    simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, PartialAggregate.toFieldSlot,
+    simp [slotPlaceProjectionOk, hRoot, slotStateToFieldSlot, PartialAggregate.toFieldSlot,
       slotProjectionAccessOk, hVar, hNe]
 
-/-- **Concrete `typedPlaceProjectionOk` rejects out-of-bounds `Field` projections (`B1`)**. -/
-theorem typedPlaceProjectionOk_field_oob_false (slots : List LocalSlotState) (loc : Local)
+/-- **Concrete `slotPlaceProjectionOk` rejects out-of-bounds `Field` projections (`B1`)**. -/
+theorem slotPlaceProjectionOk_field_oob_false (slots : List LocalSlotState) (loc : Local)
     {vals : List Value} {idx : Nat} (ty : Ty) (rest : List ProjectionElem)
     (hRoot : slots[loc]? = some (.init (.aggregate 0 vals))) (hOob : vals.length ≤ idx) :
-    typedPlaceProjectionOk slots ⟨loc, .field idx ty :: rest⟩ = false := by
+    slotPlaceProjectionOk slots ⟨loc, .field idx ty :: rest⟩ = false := by
   have hNone : vals[idx]? = none := List.getElem?_eq_none hOob
-  simp [typedPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNone]
+  simp [slotPlaceProjectionOk, hRoot, slotStateToFieldSlot, slotProjectionAccessOk, hNone]
 
 /-- Every successful `deinitFieldSlot` path satisfies `slotProjectionAccessOk` (`check_place_access`
 and `deinit_in_slot` enforce the exact same active-variant, field-bounds, and `.uninit` tail
@@ -7046,12 +7412,12 @@ theorem slotProjectionAccessOk_of_deinitFieldSlot (ts : Bool) (locals : List Loc
     exact ih c c' hcc
   | case8 => nomatch h
 
-/-- **Every place that `evalDeinitPlace` can deinitialize passes `typedPlaceProjectionOk`**. -/
-theorem typedPlaceProjectionOk_of_evalDeinitPlace {ts : Bool} {slots slots' : List LocalSlotState}
+/-- **Every place that `evalDeinitPlace` can deinitialize passes `slotPlaceProjectionOk`**. -/
+theorem slotPlaceProjectionOk_of_evalDeinitPlace {ts : Bool} {slots slots' : List LocalSlotState}
     {place : Place} (h : evalDeinitPlace ts slots place = some slots') :
-    typedPlaceProjectionOk slots place = true := by
+    slotPlaceProjectionOk slots place = true := by
   obtain ⟨st, hSt, hLive, slot', hD, _⟩ := evalDeinitPlace_eq_some h
-  unfold typedPlaceProjectionOk
+  unfold slotPlaceProjectionOk
   rw [hSt]
   cases st with
   | dead => exact absurd rfl hLive
