@@ -3302,7 +3302,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   ptrAliasingOk_iff_blockPtrAliasOk
   ptrEnvAtEntry_least
   statementOk_retag_spec
-  evalStmt_retag_local
+  evalStmt_retag_rawPtr_local
+  evalStmt_retag_ref_local
   evalStatement_validate_local_mr
   retagRefReborrowChain_inFragment
   retagRefReborrowChain_translate
@@ -3337,7 +3338,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
-  retagScalarDiscrepancy_anneal_ub
+  retagScalarDiscrepancy_anneal_ret
   retagScalarDiscrepancy_minirust_direct
   transmute_declPtrTy_ok
   evalCastOp_transmute_declPtrTy_ok
@@ -3754,7 +3755,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   ptrAliasingOk_iff_blockPtrAliasOk
   ptrEnvAtEntry_least
   statementOk_retag_spec
-  evalStmt_retag_local
+  evalStmt_retag_rawPtr_local
+  evalStmt_retag_ref_local
   evalStatement_validate_local_mr
   retagRefReborrowChain_inFragment
   retagRefReborrowChain_translate
@@ -3789,7 +3791,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
-  retagScalarDiscrepancy_anneal_ub
+  retagScalarDiscrepancy_anneal_ret
   retagScalarDiscrepancy_minirust_direct
   transmute_declPtrTy_ok
   evalCastOp_transmute_declPtrTy_ok

@@ -990,7 +990,7 @@ private theorem annealReadImmediate_indirect_prim_eq₃
   dsimp only
   rw [hf]
 
-private theorem step_safeRef_deref_read_preserves
+private theorem step_safeRef_deref_read_machine_and_preserves
     {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
@@ -1015,8 +1015,9 @@ private theorem step_safeRef_deref_read_preserves
             decl.ty.kind = dstDecl.ty.kind))
     (hstep : Miri.Interpreter.Step.step
       (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
-    ∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
-      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k := by
+    m'.machine = m.machine ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) := by
   obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, halloc, _⟩ := id hstate
   obtain ⟨himm_dst, himm_ref⟩ := himm tf hframes
   have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
@@ -1329,6 +1330,7 @@ private theorem step_safeRef_deref_read_preserves
               rfl hfrb.location_eq] at hstep
             injection hstep with hm' _
             subst hm'
+            refine ⟨rfl, ?_⟩
             intro tf₀ tf' htf₀ htf' k hk mls' hmls' mp hmp
             rw [hframes] at htf₀
             injection htf₀ with h₀; injection h₀ with h₀'; subst h₀'
@@ -1340,6 +1342,36 @@ private theorem step_safeRef_deref_read_preserves
               rw [← hmls'] at hmp; cases hmp
             · simp only [hdk, ↓reduceIte] at hmls'
               exact ((hk.cache_layout hlt_d _).cache_layout hlt_ra _) mls' hmls' mp hmp
+
+private theorem step_safeRef_deref_read_preserves
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl refDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_ref : ∀ ptrVal, get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      ∀ e ∈ allocMap, e.tag = ptrVal.tag →
+        get? s.frame.locals e.localIdx ≠ some .dead →
+          ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
+          (∀ decl, get? body.localDecls e.localIdx = some decl →
+            decl.ty.kind = dstDecl.ty.kind))
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    ∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k :=
+  (step_safeRef_deref_read_machine_and_preserves hstate hopKind hbb hstmt hdecl_dst hdecl_ref
+    href_ty hdst_prim himm hlive_ref hstep).2
 
 private theorem u64Local_value_of_stateRelLM3_2
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -3707,12 +3739,16 @@ private theorem step_direct_write_promoted_const_supply
    lockstep to `StateRelLM3_2` at every step while `ValidityVisitor.validatePlace`
    rejects the newly written dangling destination (`_3` after `copy`, `_0` after
    `move`) with `"validation: encountered a dangling reference (use-after-free)"`.
-2. **Tree Borrows permission divergences (`LM-3.2` vs `LM-3.3`)**:
-   - `_2 = &_1 -> *_2 = 99_u64` (`step_safeRef_deref_write_perm_divergence`);
-   - `_2 = &_1 -> _3 = &mut *_2` (`evalRvalue_reborrow_safeRef_perm_divergence`);
+2. **Tree Borrows permission divergences (`LM-3.2` hook-free `annealStepHooks` vs
+   `LM-3.3` `BorrowTree` in `SimLM3_3.lean`)**:
+   - `_2 = &_1 -> *_2 = 99_u64` (`step_safeRef_deref_write_perm_divergence`; cf.
+     `sim_lm3_3_child_write_step` and `sim_lm3_3_interpreter_deref_write_step`);
+   - `_2 = &_1 -> _3 = &mut *_2` (`evalRvalue_reborrow_safeRef_perm_divergence`; cf.
+     `sim_lm3_3_retag_ref_step` and `sim_lm3_3_interpreter_reborrow_step`);
    - `_2 = &mut _1 -> _1 = 77_u64 -> _0 = copy *_2`
      (`step_direct_write_promoted_lm3_2_simulation` disabling `entry.perm` +
-     `step_safeRef_deref_read_disabled_divergence`). -/
+     `step_safeRef_deref_read_disabled_divergence`; cf. `sim_lm3_3_child_read_step`
+     and `sim_lm3_3_interpreter_deref_read_step`). -/
 theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
     (∃ (b : CapturedMir) (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState)
         (tf₃ tf₄ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
@@ -4993,10 +5029,14 @@ Concrete end-to-end non-vacuity witness for
 `evalRvalue_reborrow_uninit_target_divergence` starting from pointer-free `StateRel`:
 1. `_2 = &raw const _1` promotes live `.uninit` `_1 : u64` to `lm31AllocId1` in
    lockstep (`StateRelLM3_2`);
-2. `_3 = &*_2` faults with `MirStepNode.fail .ub` in Anneal (`stepMirFn`) while
-   `lean-miri` (`Miri.Interpreter.Step.step`) steps to `(m₂, .ok true)`, writes a
-   tagged pointer into `_3`, and passes shallow `annealValidityAccessCheck` on the
-   8-byte uninitialized allocation. -/
+2. `_3 = &*_2` faults with `MirStepNode.fail .ub` in Anneal (`stepMirFn`, which
+   requires `get? locals targetLocal = some (.init _)`) while `lean-miri`
+   (`Miri.Interpreter.Step.step` under `annealStepHooks`) steps to `(m₂, .ok true)`,
+   writes a tagged pointer into `_3`, and passes shallow `annealValidityAccessCheck`
+   on the 8-byte uninitialized allocation (contrast recursive `RefTracking` pointee
+   validation in `wit_lm3_2_recursive_ref_pointee_validity`, which rejects the
+   uninitialized pointee, and `sim_lm3_3_interpreter_reborrow_step` in `SimLM3_3.lean`,
+   which establishes 3-way lockstep whenever the target local is initialized). -/
 theorem wit_lm3_2_reborrow_uninit_target_divergence :
     ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState)
       (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
@@ -5072,6 +5112,784 @@ theorem wit_lm3_2_reborrow_uninit_target_divergence :
       (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entry) (targetDecl := u64Decl)
       rfl (.head _) rfl rfl (by rintro ⟨⟩) rfl
   exact ⟨s₁, m₁, m₂, tf₂, borTag, hs₁, hm₁, hrel₁, hs₂, hm₂, htf₂, hloc₃, hval₂⟩
+
+/-! ## 7. Unified Multi-Block `step_mir_lm3_2_tree_state_simulation` Witness Across 3-Level Reborrow Hierarchies, `SwitchInt`, `Assert`, and Safe-Reference `Return` -/
+
+private def mkWitLocStateLM32 (body : CapturedMir) (blockIdx stmtIdx : Nat)
+    (locals : List LocalSlot) (borrows : List BorrowEntry) (nextTag : Nat) : MachineState :=
+  { frame := { blockIdx := blockIdx, stmtIdx := stmtIdx, locals := locals }
+    memory := { (initMachineState body []).memory with
+                  borrows := borrows, nextTag := nextTag } }
+
+/-- Shared 6-local Anneal pre-state for `lm32ComposedTreeBody`. -/
+def mkPre6AnnealLM32 (b : CapturedMir) (slot₁ : LocalSlot) : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 0,
+        locals := [.uninit, slot₁, .uninit, .uninit, .uninit, .uninit] }
+    memory := (initMachineState b []).memory }
+
+/-- Shared 6-local `lean-miri` frame pre-state for `lm32ComposedTreeBody`. -/
+def mkPre6MiriFrameLM32 (b : CapturedMir) (retTy : Ty)
+    (mls₁ : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody b
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy retTy b.layouts) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      mls₁,
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+/-- Shared 6-local `lean-miri` step state for `lm32ComposedTreeBody`. -/
+def mkPre6MiriLM32 (b : CapturedMir) (retTy : Ty)
+    (mls₁ : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
+    AnnealStepState :=
+  { stack := ⟨#[mkPre6MiriFrameLM32 b retTy mls₁]⟩, machine := AnnealMachine.empty }
+
+private theorem mkPre6_stateRel_and_imm
+    (b : CapturedMir) (d0 d1 d2 d3 d4 d5 : LocalDecl)
+    (hdecls : b.localDecls = [d0, d1, d2, d3, d4, d5])
+    (slot₁ : LocalSlot)
+    (mls₁ : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
+    (hnoind₁ : ∀ mp, mls₁.value ≠ .live (.indirect mp))
+    (hrel₁ : LocalRel AnnealMachine.empty d1 b.layouts slot₁ mls₁) :
+    StateRel b (mkPre6AnnealLM32 b slot₁) (mkPre6MiriLM32 b d0.ty mls₁) ∧
+    (∀ tf, (mkPre6MiriLM32 b d0.ty mls₁).stack.frames = #[tf] →
+      ∀ k, IsImmediateFrameLocal tf k) := by
+  have himm_all : ∀ tf, (mkPre6MiriLM32 b d0.ty mls₁).stack.frames = #[tf] →
+      ∀ k, IsImmediateFrameLocal tf k := by
+    intro tf h k mls hmls mp hmp
+    injection h with h₁; injection h₁ with h₂; subst h₂
+    match k with
+    | 0 | 2 | 3 | 4 | 5 => simp [mkPre6MiriFrameLM32] at hmls; subst hmls; cases hmp
+    | 1 => simp [mkPre6MiriFrameLM32] at hmls; subst hmls; exact hnoind₁ mp hmp
+    | _ + 6 => simp [mkPre6MiriFrameLM32] at hmls
+  refine ⟨?_, himm_all⟩
+  refine StateRel.mk (mkPre6MiriFrameLM32 b d0.ty mls₁) rfl rfl ⟨translateTy d0.ty b.layouts, rfl⟩
+    ?_ rfl rfl rfl rfl rfl
+    (MemoryAllocDisjoint.of_no_indirect _ (himm_all _ rfl))
+  refine ⟨rfl, rfl, by simp [mkPre6AnnealLM32, hdecls], by simp [mkPre6MiriFrameLM32, hdecls], ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  rw [hdecls] at hdecl
+  match i with
+  | 0 =>
+    have hd : decl = d0 := by simpa [get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = d1 := by simpa [get?] using hdecl.symm
+    have hs : slot = slot₁ := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = mls₁ := by simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact hrel₁
+  | 2 =>
+    have hd : decl = d2 := by simpa [get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 3 =>
+    have hd : decl = d3 := by simpa [get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 4 =>
+    have hd : decl = d4 := by simpa [get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 5 =>
+    have hd : decl = d5 := by simpa [get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [mkPre6AnnealLM32, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [mkPre6MiriFrameLM32] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | _ + 6 =>
+    simp [get?] at hdecl
+
+private theorem stepObsRelLM3_2Tree_of_anneal_step
+    {body : CapturedMir} {m : AnnealStepState} {treeMap : List ReborrowMapEntry}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {s' : MachineState}
+    (hsim : StepObsRelLM3_2Tree body m treeMap aRes mRes)
+    (ha : aRes = .step s') :
+    ∃ m', mRes = (m', .ok true) ∧ StateRelLM3_2Tree body s' m' treeMap := by
+  generalize ha_eq : aRes = aNode at hsim
+  cases hsim with
+  | emitStep obs s₁ m' hrel =>
+    rw [ha] at ha_eq
+    cases obs with
+    | silent =>
+      injection ha_eq with hrun
+      injection hrun with hs
+      subst hs
+      exact ⟨m', rfl, hrel⟩
+    | event _ => cases ha_eq
+  | retRoot _ _ _ _ _ _ _ _ hm' => rw [ha] at ha_eq; cases ha_eq
+  | ub _ _ => rw [ha] at ha_eq; cases ha_eq
+
+private theorem stepObsRelLM3_2Tree_of_anneal_emitEvent
+    {body : CapturedMir} {m : AnnealStepState} {treeMap : List ReborrowMapEntry}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {tag : Nat} {s' : MachineState}
+    (hsim : StepObsRelLM3_2Tree body m treeMap aRes mRes)
+    (ha : aRes = .emitStep (.event tag) s') :
+    ∃ m', mRes = (m', .ok true) ∧ StateRelLM3_2Tree body s' m' treeMap := by
+  generalize ha_eq : aRes = aNode at hsim
+  cases hsim with
+  | emitStep obs s₁ m' hrel =>
+    rw [ha] at ha_eq
+    cases obs with
+    | silent => cases ha_eq
+    | event _ =>
+      injection ha_eq with _ h2
+      have hfun := congrFun h2 PUnit.unit
+      injection hfun with hs
+      subst hs
+      exact ⟨m', rfl, hrel⟩
+  | retRoot _ _ _ _ _ _ _ _ _ => rw [ha] at ha_eq; cases ha_eq
+  | ub _ _ => rw [ha] at ha_eq; cases ha_eq
+
+private theorem treeMap_eq_of_toBorrowEntry_eq
+    {treeMap expected : List ReborrowMapEntry}
+    (hta1 : ∀ e' ∈ treeMap, e'.allocId = lm31AllocId1)
+    (ha1 : ∀ e ∈ expected, e.allocId = lm31AllocId1)
+    (hmap : treeMap.map ReborrowMapEntry.toBorrowEntry =
+      expected.map ReborrowMapEntry.toBorrowEntry) :
+    treeMap = expected := by
+  induction treeMap generalizing expected with
+  | nil =>
+    cases expected with
+    | nil => rfl
+    | cons _ _ => cases hmap
+  | cons e' rest ih =>
+    cases expected with
+    | nil => cases hmap
+    | cons e rest_exp =>
+      injection hmap with hbe hrest
+      have he'_a1 := hta1 e' (List.Mem.head _)
+      have he_a1 := ha1 e (List.Mem.head _)
+      have htl := ih (fun x hx => hta1 x (List.Mem.tail _ hx))
+        (fun x hx => ha1 x (List.Mem.tail _ hx)) hrest
+      subst htl
+      have ht : e'.tag = e.tag := congrArg BorrowEntry.tag hbe
+      have hl : e'.localIdx = e.localIdx := congrArg BorrowEntry.targetLocal hbe
+      have hp : e'.perm = e.perm := congrArg BorrowEntry.perm hbe
+      have hpar : e'.parentTag = e.parentTag := congrArg BorrowEntry.parentTag hbe
+      rcases e' with ⟨t', l', a', p', par'⟩
+      rcases e with ⟨t, l, a, p, par⟩
+      dsimp only at ht hl hp hpar he'_a1 he_a1
+      subst ht hl hp hpar he'_a1 he_a1
+      rfl
+
+private theorem treeMap_eq_of_borrows_and_nextAllocId_two
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap expected : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hbor : s.memory.borrows = expected.map ReborrowMapEntry.toBorrowEntry)
+    (ha1 : ∀ e ∈ expected, e.allocId = lm31AllocId1)
+    (hnext2 : m.machine.memory.nextAllocId = 2) :
+    treeMap = expected := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, halloc, _⟩ := id htree.erased_rel
+  refine treeMap_eq_of_toBorrowEntry_eq (fun e' he' => ?_) ha1 (htree.borrows_eq.symm.trans hbor)
+  have hlt := (halloc.base_addr_valid e'.toAllocMapEntry (List.mem_map_of_mem he')).2.1
+  rw [hnext2] at hlt
+  exact allocId_eq_one_of_lt_two hlt
+
+/-- Constant `true : bool` operand for `Assert` terminator witnesses. -/
+def constBoolTrueLM32 : ConstOperand :=
+  { ty := boolTyLM32, val := .scalar (.int ⟨1, 1⟩) }
+
+private theorem constBoolTrue_wellTypedLM32 (body : CapturedMir)
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (hlay : body.layouts = emptyLayoutTable) :
+    WellTypedScalarOperand body tf (.constant constBoolTrueLM32) boolTyLM32 :=
+  .constScalar constBoolTrueLM32 ⟨1, 1⟩ rfl (Or.inl rfl) (Or.inl rfl) (by decide)
+    (by rw [hlay]; rfl) (fun _ => ⟨rfl, Or.inr rfl⟩) (fun h => nomatch h)
+
+private theorem step_terminator_switchInt_u64_machine_eq
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {bb : BasicBlockData} {discr : MirAst.Operand} {targets : SwitchTargets}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hterm : bb.terminator.kind = .switchInt discr targets)
+    (hdiscr : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf discr u64Ty)
+    (hcases : SwitchCasesFit u64Ty targets)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    m'.machine = m.machine := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  rw [miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none] at hstep
+  have hm_term : translateTerminator bb.terminator =
+      { sourceInfo := defaultSourceInfo,
+        kind := .SwitchInt (translateOperand discr) (translateSwitchTargets targets) } := by
+    unfold translateTerminator; rw [hterm]; rfl
+  rw [hm_term] at hstep
+  have hprim : IsPrimScalarTy u64Ty := Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))
+  have hty : u64Ty.kind = .bool ∨ (∃ k, u64Ty.kind = .int k) ∨ (∃ k, u64Ty.kind = .uint k) :=
+    Or.inr (Or.inr ⟨.u64, rfl⟩)
+  have hdisc_eq : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
+      (translateOperand discr) m =
+      Miri.Interpreter.runRvalue
+        (annealEvalOperand body.localDecls body.layouts (translateOperand discr) none >>=
+          annealReadImmediate) m := rfl
+  rcases evalOperand_scalar_lm3_2_simulation hstate hframes (hdiscr tf hframes) hprim none with
+    ⟨m_e, msg, _, hm_ub⟩ | ⟨sc, msc, tf', _, hm_ok, _, himm, _, _⟩
+  · have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
+        (translateOperand discr) m = (m_e, .error (.undefinedBehavior msg)) := by
+      rw [hdisc_eq]; unfold Miri.Interpreter.runRvalue; rw [hm_ub]
+    rw [evalTerminator_switchInt_error _ () _ _ _ m m_e _ hdisc] at hstep
+    cases hstep
+  · obtain ⟨sc₀, msc₀, hsc_eq, hmsc_eq, hrel, hsz, _, _⟩ := himm.of_primitive_scalar hprim
+    injection hsc_eq with hsc_eq'; subst hsc_eq'
+    have hmsc_eq' : msc = msc₀ := by cases hmsc_eq; rfl
+    subst hmsc_eq'
+    have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
+        (translateOperand discr) m =
+        ({ m with stack := ⟨#[tf']⟩ },
+          .ok ⟨.scalar (.fromScalarInt msc), translateTy u64Ty body.layouts⟩) := by
+      rw [hdisc_eq]; unfold Miri.Interpreter.runRvalue; rw [hm_ok]
+    obtain ⟨hwsz, hwvalid⟩ := boolOrInt_translateTy_size hty body.layouts
+    have hwidth : sc.sizeBytes = boolOrIntByteWidth u64Ty :=
+      translateSizeBytes_inj hrel.validBytes hwvalid (by rw [← hsz, hwsz])
+    have hsz_ty : sc.sizeBytes = match u64Ty.kind with
+        | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc.sizeBytes := by
+      rw [hwidth]; rfl
+    have hcmp : ∀ v b, (v, b) ∈ targets.branches →
+        (annealTerminatorHooks body.localDecls body.layouts).compareSwitchCase ()
+          ⟨.scalar (.fromScalarInt msc), translateTy u64Ty body.layouts⟩ v
+          { m with stack := ⟨#[tf']⟩ } =
+        ({ m with stack := ⟨#[tf']⟩ }, .ok (Nat.beq sc.bits v)) := by
+      intro v b hmem
+      obtain ⟨hlt, hcase_bool⟩ := hcases v b hmem
+      rw [← hwidth] at hlt
+      exact compareSwitchCase_simulation hrel body.localDecls body.layouts u64Ty hty hsz_ty
+        (fun h => nomatch h) v hlt hcase_bool _
+    rw [evalTerminator_switchInt_ok _ () _ _ _ m _ _ sc.bits hdisc hcmp] at hstep
+    unfold Miri.Interpreter.ControlFlow.goToBlock Miri.Interpreter.ControlFlow.setLocation at hstep
+    rw [stack_currentFrame?_singleton _ tf' rfl] at hstep
+    dsimp only [Except.map] at hstep
+    try split at hstep
+    all_goals first | (injection hstep with hm' _; subst hm'; rfl) | cases hstep
+
+private theorem step_terminator_assert_constTrue_machine_eq
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {bb : BasicBlockData} {target : BasicBlockIdx}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hterm : bb.terminator.kind = .assert (.constant constBoolTrueLM32) true target .unreachable)
+    (hlay : body.layouts = emptyLayoutTable)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    m'.machine = m.machine := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  rw [miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none] at hstep
+  have hm_term : translateTerminator bb.terminator =
+      { sourceInfo := defaultSourceInfo,
+        kind := .Assert (translateOperand (.constant constBoolTrueLM32)) true
+          (.BoundsCheck (translateOperand (.constant constBoolTrueLM32))
+            (translateOperand (.constant constBoolTrueLM32)))
+          target .Unreachable } := by
+    unfold translateTerminator; rw [hterm]; rfl
+  rw [hm_term] at hstep
+  dsimp only [Miri.Interpreter.ControlFlow.evalTerminator] at hstep
+  rcases evalOperand_scalar_lm3_2_simulation hstate hframes
+      (constBoolTrue_wellTypedLM32 body tf hlay) (Or.inl rfl) none with
+    ⟨_, _, ha_ub, _⟩ | ⟨sc, msc, tf', ha_ok, hm_ok, _, himm, _, _⟩
+  · cases ha_ub
+  · obtain ⟨sc₀, msc₀, hsc_eq, hmsc_eq, hsc_rel, _, _, _⟩ := himm.of_primitive_scalar (Or.inl rfl)
+    injection hsc_eq with hsc_eq'; subst hsc_eq'
+    have hmsc_eq' : msc = msc₀ := by cases hmsc_eq; rfl
+    subst hmsc_eq'
+    have hsc1 : sc = ⟨1, 1⟩ := by cases ha_ok; rfl
+    subst hsc1
+    have htoB : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok true := by
+      have hsz := hsc_rel.size_eq
+      have hdat := hsc_rel.data_eq
+      rcases msc with ⟨d, s_sz⟩
+      dsimp only at hsz hdat; subst hsz hdat
+      with_unfolding_all rfl
+    have hread_ok : (annealTerminatorHooks body.localDecls body.layouts).readAssertCondition ()
+        (translateOperand (.constant constBoolTrueLM32)) m =
+        ({ m with stack := ⟨#[tf']⟩ }, .ok true) := by
+      dsimp only [annealTerminatorHooks, Miri.Interpreter.TerminatorHooks.readAssertCondition]
+      unfold Miri.Interpreter.runRvalue
+      rw [EStateM.bind_assoc_apply, EStateM.bind_eq_ok hm_ok]
+      dsimp only [Miri.Interpreter.Immediate.toScalar, bind, EStateM.bind, pure, EStateM.pure]
+      rw [htoB]; rfl
+    have h8 := readAssertCondition_to_8 hread_ok
+    simp only [h8] at hstep
+    dsimp only [Id.run, bind, Except.bind, pure, Except.pure,
+      Miri.Interpreter.TerminatorHooks.ignoreOptionalOverflowChecks,
+      Miri.Interpreter.ControlFlow.isOptionalOverflowCheck] at hstep
+    have hbeq_t : (true == true) = true := rfl
+    simp only [Bool.and_false, Bool.false_or, hbeq_t, ↓reduceIte] at hstep
+    unfold Miri.Interpreter.ControlFlow.goToBlock Miri.Interpreter.ControlFlow.setLocation at hstep
+    rw [stack_currentFrame?_singleton _ tf' rfl] at hstep
+    dsimp only [Except.map] at hstep
+    try split at hstep
+    all_goals first | (injection hstep with hm' _; subst hm'; rfl) | cases hstep
+
+/-- Grandchild Tree Borrows entry for `&*_3` (tag `3`, parent tag `2`). -/
+def lm32TreeGrandchild (perm : TreeBorrowPerm) : ReborrowMapEntry :=
+  { tag := 3, localIdx := 1, allocId := lm31AllocId1, perm := perm, parentTag := some 2 }
+
+/-- Multi-block `Runtime(PostCleanup)` MIR body exercising 3-level parent -> child ->
+grandchild Tree Borrows reborrows, child write activating ancestor, root read
+freezing child descendant, `SwitchInt`, `Assert`, safe-ref `move`, and root-frame
+safe-ref `return`:
+```text
+bb0: _2 = &mut _1;
+     _3 = &mut *_2;
+     *_3 = const 99_u64;
+     _4 = &*_3;
+     _5 = copy *_2;
+     switchInt(copy _5) -> [99: bb1, otherwise: bb2]
+bb1: assert(const true == true) -> [success: bb2, unwind: unreachable]
+bb2: _0 = move _4;
+     return
+``` -/
+def lm32ComposedTreeBody : CapturedMir where
+  defPath := "lm_3_2_witness::composed_tree_state_sim"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [refU64Decl, u64Decl, refMutU64Decl, refMutU64Decl, refU64Decl, u64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.ref (.mut false) (local_ 1))),
+        mkStmt (.assign (local_ 3) (.ref (.mut false) (derefLocal 2))),
+        mkStmt (.assign (derefLocal 3) (.use (.constant (constU64 99)))),
+        mkStmt (.assign (local_ 4) (.ref .shared (derefLocal 3))),
+        mkStmt (.assign (local_ 5) (.use (.copy (derefLocal 2))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 5)) { branches := [(99, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.assert (.constant constBoolTrueLM32) true 2 .unreachable),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.move (local_ 4))))],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_2_composed_tree_state_simulation_real_steps`**: end-to-end 9-step
+multi-block execution of `lm32ComposedTreeBody` driven at **every single step**
+through the unified `step_mir_lm3_2_tree_state_simulation` theorem across a
+3-level parent -> child -> grandchild Tree Borrows hierarchy (`tag 1` -> `tag 2`
+-> `tag 3`), `SwitchInt`, `Assert`, safe-ref `move`, and safe-ref root `return`:
+1. `bb0[0]`: `_2 = &mut _1` (`[root(.reserved)]`);
+2. `bb0[1]`: `_3 = &mut *_2` (`[child(.reserved), root(.reserved)]`);
+3. `bb0[2]`: `*_3 = const 99_u64` (activates child and ancestor:
+   `[child(.active), root(.active)]`);
+4. `bb0[3]`: `_4 = &*_3` (`[grandchild(.frozen), child(.active), root(.active)]`);
+5. `bb0[4]`: `_5 = copy *_2` (root read yields `99_u64` and freezes child:
+   `[grandchild(.frozen), child(.frozen), root(.active)]`);
+6. `bb0` `SwitchInt(copy _5)` -> emits `MirObs.event 99` and branches to `bb1`;
+7. `bb1` `Assert(const true == true)` -> jumps to `bb2`;
+8. `bb2[0]`: `_0 = move _4` -> moves grandchild `&u64` (`tag 3`) into `_0`;
+9. `bb2` `return` -> returns `.ptr { allocId := 3, offsetBytes := 0 } 8` in
+   lockstep with `ImmediateRelLM3_2` across the 3-level `treeMap`. -/
+theorem wit_lm3_2_composed_tree_state_simulation_real_steps :
+    ∃ (s₁ s₂ s₃ s₄ s₅ s₆ s₇ s₈ : MachineState)
+      (m₁ m₂ m₃ m₄ m₅ m₆ m₇ m₈ : AnnealStepState)
+      (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      let b := lm32ComposedTreeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let finalTree :=
+        [lm32TreeGrandchild .frozen, lm32TreeChild .frozen, lm32TreeRoot .active]
+      stepMirFn b (mkPre6AnnealLM32 b (.init (.scalar ⟨42, 8⟩))) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkPre6MiriLM32 b refU64Ty lm32Mls42) =
+        (m₁, .ok true) ∧
+      StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .reserved] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .reserved] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_2Tree b s₃ m₃ [lm32TreeChild .active, lm32TreeRoot .active] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_2Tree b s₄ m₄
+        [lm32TreeGrandchild .frozen, lm32TreeChild .active, lm32TreeRoot .active] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_2Tree b s₅ m₅ finalTree ∧
+      stepMirFn b s₅ = .emitStep (.event 99) s₆ ∧
+      Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
+      StateRelLM3_2Tree b s₆ m₆ finalTree ∧
+      s₆.frame.blockIdx = 1 ∧
+      stepMirFn b s₆ = .step s₇ ∧
+      Miri.Interpreter.Step.step hooks () m₆ = (m₇, .ok true) ∧
+      StateRelLM3_2Tree b s₇ m₇ finalTree ∧
+      s₇.frame.blockIdx = 2 ∧
+      stepMirFn b s₇ = .step s₈ ∧
+      Miri.Interpreter.Step.step hooks () m₇ = (m₈, .ok true) ∧
+      StateRelLM3_2Tree b s₈ m₈ finalTree ∧
+      (∃ tm, StepObsRelLM3_2Tree b m₈ tm (stepMirFn b s₈) (Miri.Interpreter.Step.step hooks () m₈)) ∧
+      stepMirFn b s₈ = .retNormal (.ptr { allocId := 3, offsetBytes := 0 } 8) s₈.memory ∧
+      Miri.Interpreter.Step.step hooks () m₈ = ({ m₈ with stack := ⟨#[]⟩ }, .ok true) ∧
+      get? b.localDecls 0 = some decl0 ∧
+      annealControlHooks.returnOperand () m₈ = (m₈, .ok (.immediate imm0)) ∧
+      ImmediateRelLM3_2 (finalTree.map ReborrowMapEntry.toAllocMapEntry)
+        decl0.ty b.layouts (.ptr { allocId := 3, offsetBytes := 0 } 8) imm0 := by
+  let b := lm32ComposedTreeBody
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have hu64 : IsPrimScalarTy u64Ty := Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))
+  obtain ⟨hrel₀, himm₀⟩ := mkPre6_stateRel_and_imm b refU64Decl u64Decl refMutU64Decl
+    refMutU64Decl refU64Decl u64Decl rfl (.init (.scalar ⟨42, 8⟩)) lm32Mls42
+    (fun _ h => nomatch h)
+    (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
+  have htree₀ : StateRelLM3_2Tree b (mkPre6AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))
+      (mkPre6MiriLM32 b refU64Ty lm32Mls42) [] := hrel₀.toLM3_1.toLM3_2.toTree
+  let p1 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+  let p2 : ProvenancePtr := { allocId := 2, offsetBytes := 0 }
+  let p3 : ProvenancePtr := { allocId := 3, offsetBytes := 0 }
+  -- Step 1 (`bb0[0]`): `_2 = &mut _1`
+  let s₁ := mkWitLocStateLM32 b 0 1
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p1 8), .uninit, .uninit, .uninit]
+    [(lm32TreeRoot .reserved).toBorrowEntry] 2
+  have hs₁ : stepMirFn b (mkPre6AnnealLM32 b (.init (.scalar ⟨42, 8⟩))) = .step s₁ := rfl
+  have hwt₁ : WellTypedLM3_2TreeStateStmt b (mkPre6AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))
+      (mkPre6MiriLM32 b refU64Ty lm32Mls42) []
+      (mkStmt (.assign (local_ 2) (.ref (.mut false) (local_ 1)))) :=
+    .refAddrOf 2 1 (.mut false) refMutU64Decl u64Decl .mut (.uint .u64) _
+      rfl rfl rfl hu64 (by decide) (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩)
+  obtain ⟨tm₁, hobs₁⟩ := step_mir_lm3_2_tree_state_simulation htree₀ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₁⟩) AllocIdSupplyReady.empty
+  obtain ⟨m₁, hm₁, htree₁⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₁ hs₁
+  obtain ⟨hsup₁, hnext₁⟩ := step_ref_supply_two hrel₀ rfl rfl
+    (dstDecl := refMutU64Decl) (targetDecl := u64Decl) rfl rfl hu64 (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
+  have htm₁ : tm₁ = [lm32TreeRoot .reserved] :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₁ rfl
+      (by intro _ he; cases he with | head _ => rfl | tail _ h => cases h) hnext₁
+  subst htm₁
+  -- Step 2 (`bb0[1]`): `_3 = &mut *_2` (child tag `2`, `parentTag = some 1`)
+  let s₂ := mkWitLocStateLM32 b 0 2
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .uninit, .uninit]
+    [(lm32TreeChild .reserved).toBorrowEntry, (lm32TreeRoot .reserved).toBorrowEntry] 3
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  have himm₁ : ∀ tf, m₁.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k :=
+    fun tf htf k hne => immediate_of_nextAllocId_two htree₁.erased_rel hsup₁ hnext₁
+      (List.Mem.head _) rfl htf k (Or.inr hne)
+  have hlive₂ : ∀ (ptrVal : ProvenancePtr) (e : ReborrowMapEntry),
+      get? s₁.frame.locals 2 = some (.init (.ptr ptrVal 8)) →
+      e ∈ [lm32TreeRoot .reserved] → e.tag = ptrVal.tag →
+      get? s₁.frame.locals e.localIdx ≠ some .dead ∧
+      get? s₁.frame.locals e.localIdx ≠ some .uninit ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
+      ¬(e.perm = .frozen ∧ BorrowKind.mut false ≠ .shared) ∧
+      (∀ tgtDecl, get? b.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = .uint .u64) := by
+    intro ptrVal e hp he _
+    rcases ptrVal_of_some_initLM32 hp with rfl
+    cases he with
+    | tail _ h => cases h
+    | head _ =>
+      exact ⟨(fun h => nomatch h), (fun h => nomatch h), rfl, (fun h => nomatch h),
+        (fun ⟨h, _⟩ => nomatch h), (fun d hd => by injection hd with hd'; subst hd'; rfl)⟩
+  have hwt₂ : WellTypedLM3_2TreeStateStmt b s₁ m₁ [lm32TreeRoot .reserved]
+      (mkStmt (.assign (local_ 3) (.ref (.mut false) (derefLocal 2)))) :=
+    .reborrowSafeRef 3 2 (.mut false) refMutU64Decl refMutU64Decl .mut .mut
+      (.uint .u64) (.uint .u64) _ rfl rfl rfl rfl hu64
+      (fun tf htf => ⟨himm₁ tf htf 3 (by decide), himm₁ tf htf 2 (by decide)⟩) hlive₂
+      (fun _ _ _ he _ => by cases he with | head _ => rfl | tail _ h => cases h)
+  obtain ⟨tm₂, hobs₂⟩ := step_mir_lm3_2_tree_state_simulation htree₁ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₂⟩) hsup₁
+  obtain ⟨m₂, hm₂, htree₂⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₂ hs₂
+  have hflat₂ := evalRvalue_reborrow_safeRef_simulation htree₁.erased_rel hphase
+    (dstIdx := 3) (refIdx := 2) (bk := .mut false) rfl rfl rfl rfl rfl rfl hu64
+    (fun tf htf => ⟨himm₁ tf htf 3 (by decide), himm₁ tf htf 2 (by decide)⟩)
+    (fun ptrVal e' hget he' htag' => by
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'; exact hlive₂ ptrVal e hget he htag')
+  obtain ⟨_, m₂', _, _, hm₂', _, hmach₂', _⟩ :=
+    hflat₂.2 p1 (lm32TreeRoot .reserved).toAllocMapEntry rfl (List.Mem.head _) rfl (fun h => nomatch h)
+  have hmach₂ : m₂.machine = m₁.machine := (by have h := hm₂'.symm.trans hm₂; injection h : m₂' = m₂) ▸ hmach₂'
+  have hsup₂ : AllocIdSupplyReady m₂.machine.memory := hmach₂ ▸ hsup₁
+  have hnext₂ : m₂.machine.memory.nextAllocId = 2 := by rw [hmach₂]; exact hnext₁
+  have htm₂ : tm₂ = [lm32TreeChild .reserved, lm32TreeRoot .reserved] :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₂ rfl
+      (by
+        intro e he
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at he
+        rcases he with rfl | rfl <;> rfl) hnext₂
+  subst htm₂
+  -- Step 3 (`bb0[2]`): `*_3 = const 99_u64` (child write activates child & root)
+  let s₃ := mkWitLocStateLM32 b 0 3
+    [.uninit, .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .uninit, .uninit]
+    [(lm32TreeChild .active).toBorrowEntry, (lm32TreeRoot .active).toBorrowEntry] 3
+  have hs₃ : stepMirFn b s₂ = .step s₃ := rfl
+  have himm₂_3 : ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf 3 :=
+    fun tf htf => immediate_of_nextAllocId_two htree₂.erased_rel hsup₂ hnext₂
+      (List.Mem.head _) rfl htf 3 (Or.inr (by decide))
+  have hwt₃ : WellTypedLM3_2TreeStateStmt b s₂ m₂
+      [lm32TreeChild .reserved, lm32TreeRoot .reserved]
+      (mkStmt (.assign (derefLocal 3) (.use (.constant (constU64 99))))) :=
+    .safeRefDerefWrite 3 (.constant (constU64 99)) refMutU64Decl .mut (.uint .u64) u64Ty _
+      rfl rfl hu64 rfl (fun tf _ => constU64_wellTypedLM32 b tf 99 (by decide)) himm₂_3
+      (fun ptrVal e tgtDecl hp he htag htgt _ => by
+        rcases ptrVal_of_some_initLM32 hp with rfl
+        cases he with
+        | head _ => injection htgt with hd; subst hd; exact ⟨rfl, Or.inr rfl, rfl⟩
+        | tail _ h => cases h with | head _ => exact absurd htag (by decide) | tail _ h' => cases h')
+      (fun ptrVal e hp he htag => by
+        rcases ptrVal_of_some_initLM32 hp with rfl
+        cases he with
+        | head _ => rfl
+        | tail _ h => cases h with | head _ => exact absurd htag (by decide) | tail _ h' => cases h')
+  obtain ⟨tm₃, hobs₃⟩ := step_mir_lm3_2_tree_state_simulation htree₂ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₃⟩) hsup₂
+  obtain ⟨m₃, hm₃, htree₃⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₃ hs₃
+  obtain ⟨hsup₃, hnext₃⟩ := step_safeRef_deref_write_const_supply htree₂.erased_rel rfl rfl
+    (refDecl := refMutU64Decl) rfl rfl hu64 rfl
+    (fun tf _ => constU64_wellTypedLM32 b tf 99 (by decide)) himm₂_3
+    (ptrVal := p2) (e := (lm32TreeChild .reserved).toAllocMapEntry)
+    rfl (List.Mem.head _) rfl rfl (fun h => nomatch h)
+    (fun d hd => by injection hd with hd'; subst hd'; rfl) hsup₂ hnext₂ rfl hm₃
+  have htm₃ : tm₃ = [lm32TreeChild .active, lm32TreeRoot .active] :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₃ rfl
+      (by
+        intro e he
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at he
+        rcases he with rfl | rfl <;> rfl) hnext₃
+  subst htm₃
+  -- Step 4 (`bb0[3]`): `_4 = &*_3` (grandchild tag `3`, `parentTag = some 2`)
+  let tree₄ := [lm32TreeGrandchild .frozen, lm32TreeChild .active, lm32TreeRoot .active]
+  let s₄ := mkWitLocStateLM32 b 0 4
+    [.uninit, .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8), .init (.ptr p3 8), .uninit]
+    (tree₄.map ReborrowMapEntry.toBorrowEntry) 4
+  have hs₄ : stepMirFn b s₃ = .step s₄ := rfl
+  have himm₃ : ∀ tf, m₃.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k :=
+    fun tf htf k hne => immediate_of_nextAllocId_two htree₃.erased_rel hsup₃ hnext₃
+      (List.Mem.head _) rfl htf k (Or.inr hne)
+  have hlive₄ : ∀ (ptrVal : ProvenancePtr) (e : ReborrowMapEntry),
+      get? s₃.frame.locals 3 = some (.init (.ptr ptrVal 8)) →
+      e ∈ [lm32TreeChild .active, lm32TreeRoot .active] → e.tag = ptrVal.tag →
+      get? s₃.frame.locals e.localIdx ≠ some .dead ∧
+      get? s₃.frame.locals e.localIdx ≠ some .uninit ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
+      ¬(e.perm = .frozen ∧ BorrowKind.shared ≠ .shared) ∧
+      (∀ tgtDecl, get? b.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = .uint .u64) := by
+    intro ptrVal e hp he htag
+    rcases ptrVal_of_some_initLM32 hp with rfl
+    cases he with
+    | head _ =>
+      exact ⟨(fun h => nomatch h), (fun h => nomatch h), rfl, (fun h => nomatch h),
+        (fun ⟨_, h⟩ => h rfl), (fun d hd => by injection hd with hd'; subst hd'; rfl)⟩
+    | tail _ h => cases h with | head _ => exact absurd htag (by decide) | tail _ h' => cases h'
+  have hwt₄ : WellTypedLM3_2TreeStateStmt b s₃ m₃
+      [lm32TreeChild .active, lm32TreeRoot .active]
+      (mkStmt (.assign (local_ 4) (.ref .shared (derefLocal 3)))) :=
+    .reborrowSafeRef 4 3 .shared refU64Decl refMutU64Decl .mut .not
+      (.uint .u64) (.uint .u64) _ rfl rfl rfl rfl hu64
+      (fun tf htf => ⟨himm₃ tf htf 4 (by decide), himm₃ tf htf 3 (by decide)⟩) hlive₄
+      (fun ptrVal e hp he htag => by
+        rcases ptrVal_of_some_initLM32 hp with rfl
+        cases he with
+        | head _ => rfl
+        | tail _ h => cases h with | head _ => exact absurd htag (by decide) | tail _ h' => cases h')
+  obtain ⟨tm₄, hobs₄⟩ := step_mir_lm3_2_tree_state_simulation htree₃ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₄⟩) hsup₃
+  obtain ⟨m₄, hm₄, htree₄⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₄ hs₄
+  have hflat₄ := evalRvalue_reborrow_safeRef_simulation htree₃.erased_rel hphase
+    (dstIdx := 4) (refIdx := 3) (bk := .shared) rfl rfl rfl rfl rfl rfl hu64
+    (fun tf htf => ⟨himm₃ tf htf 4 (by decide), himm₃ tf htf 3 (by decide)⟩)
+    (fun ptrVal e' hget he' htag' => by
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'; exact hlive₄ ptrVal e hget he htag')
+  obtain ⟨_, m₄', _, _, hm₄', _, hmach₄', _⟩ :=
+    hflat₄.2 p2 (lm32TreeChild .active).toAllocMapEntry rfl (List.Mem.head _) rfl (fun h => nomatch h)
+  have hmach₄ : m₄.machine = m₃.machine := (by have h := hm₄'.symm.trans hm₄; injection h : m₄' = m₄) ▸ hmach₄'
+  have hsup₄ : AllocIdSupplyReady m₄.machine.memory := hmach₄ ▸ hsup₃
+  have hnext₄ : m₄.machine.memory.nextAllocId = 2 := by rw [hmach₄]; exact hnext₃
+  have htree₄_a1 : ∀ e ∈ tree₄, e.allocId = lm31AllocId1 := by
+    intro e he
+    simp only [tree₄, List.mem_cons, List.not_mem_nil, or_false] at he
+    rcases he with rfl | rfl | rfl <;> rfl
+  have htm₄ : tm₄ = tree₄ :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₄ rfl htree₄_a1 hnext₄
+  subst htm₄
+  -- Step 5 (`bb0[4]`): `_5 = copy *_2` (root read yields `99_u64` & freezes child `tag 2`)
+  let finalTree := [lm32TreeGrandchild .frozen, lm32TreeChild .frozen, lm32TreeRoot .active]
+  have hfinal_a1 : ∀ e ∈ finalTree, e.allocId = lm31AllocId1 := by
+    intro e he
+    simp only [finalTree, List.mem_cons, List.not_mem_nil, or_false] at he
+    rcases he with rfl | rfl | rfl <;> rfl
+  let s₅ := mkWitLocStateLM32 b 0 5
+    [.uninit, .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8),
+     .init (.ptr p3 8), .init (.scalar ⟨99, 8⟩)]
+    (finalTree.map ReborrowMapEntry.toBorrowEntry) 4
+  have hs₅ : stepMirFn b s₄ = .step s₅ := rfl
+  have himm₄ : ∀ tf, m₄.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k :=
+    fun tf htf k hne => immediate_of_nextAllocId_two htree₄.erased_rel hsup₄ hnext₄
+      (List.Mem.head _) rfl htf k (Or.inr hne)
+  have hlive₅ : ∀ (ptrVal : ProvenancePtr), get? s₄.frame.locals 2 = some (.init (.ptr ptrVal 8)) →
+      ∀ e ∈ tree₄, e.tag = ptrVal.tag →
+        get? s₄.frame.locals e.localIdx ≠ some .dead →
+          ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
+          (∀ decl, get? b.localDecls e.localIdx = some decl →
+            decl.ty.kind = u64Decl.ty.kind) := by
+    intro ptrVal hp e he htag _
+    rcases ptrVal_of_some_initLM32 hp with rfl
+    simp only [tree₄, List.mem_cons, List.not_mem_nil, or_false] at he
+    rcases he with rfl | rfl | rfl
+    · exact absurd htag (by decide)
+    · exact absurd htag (by decide)
+    · exact ⟨rfl, (fun h => nomatch h), (fun d hd => by injection hd with hd'; subst hd'; rfl)⟩
+  have hwt₅ : WellTypedLM3_2TreeStateStmt b s₄ m₄ tree₄
+      (mkStmt (.assign (local_ 5) (.use (.copy (derefLocal 2))))) :=
+    .safeRefDerefRead 5 2 MirAst.Operand.copy u64Decl refMutU64Decl .mut _
+      (Or.inl rfl) rfl rfl rfl hu64
+      (fun tf htf => ⟨himm₄ tf htf 5 (by decide), himm₄ tf htf 2 (by decide)⟩) hlive₅
+      (fun ptrVal hp e he htag => by
+        rcases ptrVal_of_some_initLM32 hp with rfl
+        simp only [tree₄, List.mem_cons, List.not_mem_nil, or_false] at he
+        rcases he with rfl | rfl | rfl
+        · exact absurd htag (by decide)
+        · exact absurd htag (by decide)
+        · rfl)
+  obtain ⟨tm₅, hobs₅⟩ := step_mir_lm3_2_tree_state_simulation htree₄ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₅⟩) hsup₄
+  obtain ⟨m₅, hm₅, htree₅⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₅ hs₅
+  have hmach₅ : m₅.machine = m₄.machine :=
+    (step_safeRef_deref_read_machine_and_preserves htree₄.erased_rel (Or.inl rfl) rfl rfl
+      (dstDecl := u64Decl) (refDecl := refMutU64Decl) rfl rfl rfl hu64
+      (fun tf htf => ⟨himm₄ tf htf 5 (by decide), himm₄ tf htf 2 (by decide)⟩)
+      (fun ptrVal hget e' he' htag' hdead => by
+        obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+        exact hlive₅ ptrVal hget e he htag' hdead) hm₅).1
+  have hsup₅ : AllocIdSupplyReady m₅.machine.memory := hmach₅ ▸ hsup₄
+  have hnext₅ : m₅.machine.memory.nextAllocId = 2 := by rw [hmach₅]; exact hnext₄
+  have htm₅ : tm₅ = finalTree :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₅ rfl hfinal_a1 hnext₅
+  subst htm₅
+  -- Step 6 (`bb0` terminator): `SwitchInt(copy _5)` -> `bb1` emitting `MirObs.event 99`
+  let s₆ := mkWitLocStateLM32 b 1 0 s₅.frame.locals s₅.memory.borrows 4
+  have hs₆ : stepMirFn b s₅ = .emitStep (.event 99) s₆ := rfl
+  have himm₅_5 : ∀ tf, m₅.stack.frames = #[tf] → IsImmediateFrameLocal tf 5 :=
+    fun tf htf => immediate_of_nextAllocId_two htree₅.erased_rel hsup₅ hnext₅
+      (List.Mem.head _) rfl htf 5 (Or.inr (by decide))
+  have hcases : SwitchCasesFit u64Ty { branches := [(99, 1)], otherwise := 2 } := by
+    intro v blk hmem
+    rcases List.mem_singleton.mp hmem with ⟨rfl, rfl⟩
+    exact ⟨by decide, fun hb => nomatch hb⟩
+  have hwt₆ : WellTypedLM3_2TreeStateTerminator b m₅
+      { statements := [
+          mkStmt (.assign (local_ 2) (.ref (.mut false) (local_ 1))),
+          mkStmt (.assign (local_ 3) (.ref (.mut false) (derefLocal 2))),
+          mkStmt (.assign (derefLocal 3) (.use (.constant (constU64 99)))),
+          mkStmt (.assign (local_ 4) (.ref .shared (derefLocal 3))),
+          mkStmt (.assign (local_ 5) (.use (.copy (derefLocal 2))))],
+        terminator := mkTerm (.switchInt (.copy (local_ 5)) { branches := [(99, 1)], otherwise := 2 }),
+        isCleanup := false } :=
+    .switchInt (.copy (local_ 5)) { branches := [(99, 1)], otherwise := 2 } u64Ty rfl
+      (Or.inr (Or.inr ⟨.u64, rfl⟩))
+      (fun tf htf => .copyLocal 5 u64Decl rfl (by decide) (himm₅_5 tf htf)) hcases
+  obtain ⟨tm₆, hobs₆⟩ := step_mir_lm3_2_tree_state_simulation htree₅ hphase rfl
+    (Or.inr ⟨rfl, rfl, hwt₆⟩) hsup₅
+  obtain ⟨m₆, hm₆, htree₆⟩ := stepObsRelLM3_2Tree_of_anneal_emitEvent hobs₆ hs₆
+  have hmach₆ : m₆.machine = m₅.machine :=
+    step_terminator_switchInt_u64_machine_eq htree₅.erased_rel rfl rfl rfl
+      (fun tf htf => .copyLocal 5 u64Decl rfl (by decide) (himm₅_5 tf htf)) hcases hm₆
+  have hsup₆ : AllocIdSupplyReady m₆.machine.memory := hmach₆ ▸ hsup₅
+  have hnext₆ : m₆.machine.memory.nextAllocId = 2 := by rw [hmach₆]; exact hnext₅
+  have htm₆ : tm₆ = finalTree :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₆ rfl hfinal_a1 hnext₆
+  subst htm₆
+  -- Step 7 (`bb1` terminator): `Assert(const true == true)` -> `bb2`
+  let s₇ := mkWitLocStateLM32 b 2 0 s₅.frame.locals s₅.memory.borrows 4
+  have hs₇ : stepMirFn b s₆ = .step s₇ := rfl
+  have hwt₇ : WellTypedLM3_2TreeStateTerminator b m₆
+      { statements := [],
+        terminator := mkTerm (.assert (.constant constBoolTrueLM32) true 2 .unreachable),
+        isCleanup := false } :=
+    .assert_ (.constant constBoolTrueLM32) boolTyLM32 true 2 rfl rfl
+      (fun tf _ => constBoolTrue_wellTypedLM32 b tf rfl)
+  obtain ⟨tm₇, hobs₇⟩ := step_mir_lm3_2_tree_state_simulation htree₆ hphase rfl
+    (Or.inr ⟨rfl, rfl, hwt₇⟩) hsup₆
+  obtain ⟨m₇, hm₇, htree₇⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₇ hs₇
+  have hmach₇ : m₇.machine = m₆.machine :=
+    step_terminator_assert_constTrue_machine_eq htree₆.erased_rel rfl rfl rfl rfl hm₇
+  have hsup₇ : AllocIdSupplyReady m₇.machine.memory := hmach₇ ▸ hsup₆
+  have hnext₇ : m₇.machine.memory.nextAllocId = 2 := by rw [hmach₇]; exact hnext₆
+  have htm₇ : tm₇ = finalTree :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₇ rfl hfinal_a1 hnext₇
+  subst htm₇
+  -- Step 8 (`bb2[0]`): `_0 = move _4`
+  let s₈ := mkWitLocStateLM32 b 2 1
+    [.init (.ptr p3 8), .init (.scalar ⟨99, 8⟩), .init (.ptr p1 8), .init (.ptr p2 8),
+     .uninit, .init (.scalar ⟨99, 8⟩)]
+    s₅.memory.borrows 4
+  have hs₈ : stepMirFn b s₇ = .step s₈ := rfl
+  have himm₇_04 : ∀ tf, m₇.stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 0 ∧ IsImmediateFrameLocal tf 4 :=
+    fun tf htf =>
+      ⟨immediate_of_nextAllocId_two htree₇.erased_rel hsup₇ hnext₇
+        (List.Mem.head _) rfl htf 0 (Or.inr (by decide)),
+       immediate_of_nextAllocId_two htree₇.erased_rel hsup₇ hnext₇
+        (List.Mem.head _) rfl htf 4 (Or.inr (by decide))⟩
+  have hwt₈ : WellTypedLM3_2TreeStateStmt b s₇ m₇ finalTree
+      (mkStmt (.assign (local_ 0) (.use (.move (local_ 4))))) :=
+    .safeRefUse 0 4 MirAst.Operand.move refU64Decl refU64Decl .not .not
+      (.uint .u64) (.uint .u64) _ (Or.inr rfl) rfl rfl rfl rfl himm₇_04
+  obtain ⟨tm₈, hobs₈⟩ := step_mir_lm3_2_tree_state_simulation htree₇ hphase rfl
+    (Or.inl ⟨_, rfl, hwt₈⟩) hsup₇
+  obtain ⟨m₈, hm₈, htree₈⟩ := stepObsRelLM3_2Tree_of_anneal_step hobs₈ hs₈
+  have hmach₈ : m₈.machine = m₇.machine :=
+    step_safeRef_use_machine_eq htree₇.erased_rel (Or.inr rfl) rfl rfl
+      (dstDecl := refU64Decl) (srcDecl := refU64Decl) rfl rfl rfl rfl himm₇_04
+      rfl (fun h => nomatch h) hm₈
+  have hsup₈ : AllocIdSupplyReady m₈.machine.memory := hmach₈ ▸ hsup₇
+  have hnext₈ : m₈.machine.memory.nextAllocId = 2 := by rw [hmach₈]; exact hnext₇
+  have htm₈ : tm₈ = finalTree :=
+    treeMap_eq_of_borrows_and_nextAllocId_two htree₈ rfl hfinal_a1 hnext₈
+  subst htm₈
+  -- Step 9 (`bb2` terminator): root-frame `return` of `_0 : &u64` (`p3`, tag `3`)
+  have hs₉ : stepMirFn b s₈ = .retNormal (.ptr p3 8) s₈.memory := rfl
+  have himm₈_0 : ∀ tf, m₈.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
+    fun tf htf => immediate_of_nextAllocId_two htree₈.erased_rel hsup₈ hnext₈
+      (List.Mem.head _) rfl htf 0 (Or.inr (by decide))
+  have hwt₉ : WellTypedLM3_2TreeStateTerminator b m₈
+      { statements := [mkStmt (.assign (local_ 0) (.use (.move (local_ 4))))],
+        terminator := mkTerm .return_,
+        isCleanup := false } :=
+    .return_ refU64Decl rfl rfl rfl (by decide) himm₈_0
+  have hobs₉_uni := step_mir_lm3_2_tree_state_simulation htree₈ hphase rfl
+    (Or.inr ⟨rfl, rfl, hwt₉⟩) hsup₈
+  have hobs₉ := step_terminator_lm3_2_tree_state_simulation htree₈ hphase rfl rfl rfl hwt₉
+  rw [hs₉] at hobs₉
+  obtain ⟨decl0, imm0, hdecl0, hretOp, himmRel0, hm₉⟩ := hobs₉.retNormal_rel
+  exact ⟨s₁, s₂, s₃, s₄, s₅, s₆, s₇, s₈, m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈, decl0, imm0,
+    hs₁, hm₁, htree₁, hs₂, hm₂, htree₂, hs₃, hm₃, htree₃, hs₄, hm₄, htree₄,
+    hs₅, hm₅, htree₅, hs₆, hm₆, htree₆, rfl, hs₇, hm₇, htree₇, rfl,
+    hs₈, hm₈, htree₈, hobs₉_uni, hs₉, hm₉, hdecl0, hretOp, himmRel0⟩
 
 end LeanMiriSpec.Correspondence.Witness
 

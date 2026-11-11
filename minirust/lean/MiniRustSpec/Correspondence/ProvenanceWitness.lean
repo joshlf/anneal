@@ -1683,11 +1683,12 @@ def stopStepsTB (n : Nat) (m : MachTB) : Option Stop :=
   | .error e => some e
   | .ok _ => none
 
+set_option maxHeartbeats 800000 in
 theorem callProtectorConflict_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees callerProtectorConflictMir [.scalar ⟨5, 4⟩] [calleeProtectorConflictMir])
       tr u ∧ FaultNow u :=
-  faultsA_sound callerProtectorConflictMir 25 _ (by decide)
+  faultsA_sound callerProtectorConflictMir 25 _ (by decide +kernel)
 
 /-- On `Mach` (`BasicMemory`, which has no Tree Borrows aliasing model),
 `callProtectorConflict` completes normally and returns `20`; on `MachTB`

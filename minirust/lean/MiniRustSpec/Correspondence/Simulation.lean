@@ -2710,6 +2710,10 @@ private theorem evalStmt_assign_derefWrite_mem (s : MachineState) (decls : List 
       mem1.activeProtectors = [] →
       mem1.callerLocals = [] →
       writePlaceValue s.frame.locals mem1.borrows ⟨p, [.deref]⟩ v decls layouts = .ok locals' →
+      MirSemantics.derefWriteTreeUB s.frame.locals mem1.borrows ⟨p, [.deref]⟩ = false →
+      MirSemantics.invalidateDerefWriteBorrowsWithLayouts decls layouts s.frame.locals
+        mem1.borrows ⟨p, [.deref]⟩ [] =
+        invalidateDerefWriteBorrows s.frame.locals mem1.borrows ⟨p, [.deref]⟩ [] →
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s locals'
           { mem1 with
@@ -2722,9 +2726,9 @@ private theorem evalStmt_assign_derefWrite_mem (s : MachineState) (decls : List 
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) ∧
     (evalRvalue s.frame.locals rv s.memory decls layouts = .ub →
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
-  refine ⟨fun v mem1 locals' hv hprot hcl hw => ?_,
+  refine ⟨fun v mem1 locals' hv hprot hcl hw hdub hinv => ?_,
     fun v mem1 hv hprot hcl hw => ?_, fun hu => ?_⟩
-  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hw]
+  · simp only [evalStmt, hv, evalPlaceWrite, hprot, hw, hdub, hinv]
     cases hm : mem1
     simp_all [MirStepNode.step]
   · simp only [evalStmt, hv, evalPlaceWrite, hprot, hw, hcl]
@@ -2746,7 +2750,7 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
     (hvr : view[r]? = some (.init (.ptr ptrValR 8)))
     (hrA : s.frame.locals[r]? = some (.init (.ptr ptrValR 8)))
     (hlookupR : lookupBorrow s.memory.borrows ptrValR.tag = some entryR)
-    (hndisW_env : (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD w .disabled ≠ .disabled)
+    (hw_env : isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD w .disabled) = true)
     (hkeeps : foreignReadKeeps (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx) r w = true) :
     let borrowsR := MirSemantics.freezeDerefReadBorrowsAt s.frame.locals r [] s.memory.borrows
     ∃ (entryW' : BorrowEntry),
@@ -2756,6 +2760,7 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
       entryW'.targetProjection = entryW.targetProjection ∧
       entryW'.rangeOffset = 0 ∧
       entryW'.rangeLen = 0 ∧
+      MirSemantics.derefWriteTreeUB s.frame.locals borrowsR ⟨w, [.deref]⟩ = false ∧
       (∀ (locals' : List LocalSlot) (slot' : LocalSlot),
         (∃ v, slot' = .init v) →
         (∀ dp pv, body.localDecls[entryW.targetLocal]? = some dp → isPtrTy dp.ty = true →
@@ -2774,6 +2779,8 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
   have hfrz_eq := freezeDerefReadBorrowsAt_eq_of_lookup hrA hlookupR
   have hAfter := hb.freezeRead entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
     entryR.rangeOffset entryR.rangeLen
+  have hdag1 := hb.freezeRead_dag entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
+    entryR.rangeOffset entryR.rangeLen
   have hranges : ∀ e ∈ s.memory.borrows, e.rangeLen = 0 :=
     fun e he => by obtain ⟨_, _, _, _, hrl⟩ := hb.perm_eq he; exact hrl
   let env := ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx
@@ -2782,16 +2789,15 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
     entryR.targetLocal (some ptrValR.tag) entryR.targetProjection
     entryR.rangeOffset entryR.rangeLen
   have hok1 : PtrEnvOk body view borrows1 env1 :=
-    hb.alias_ok.foreignRead hranges hdr hr_ptr hvr hlookupR
-  have hndis1 : env1.getD w .disabled ≠ .disabled := by
-    change (stepForeignRead body.localDecls body.localDecls.length env r).getD w .disabled ≠
-      .disabled
+    hb.alias_ok.foreignRead hb.dag_ordered hranges hdr hr_ptr hvr hlookupR
+  have hw_env1 : isWritablePtrState (env1.getD w .disabled) = true := by
+    change isWritablePtrState ((stepForeignRead body.localDecls body.localDecls.length env r).getD w .disabled) = true
     rw [stepForeignRead_getD hw_lt]
     split
     · next h =>
       dsimp only [env] at h
       simp [hkeeps] at h
-    · exact hndisW_env
+    · exact hw_env
   have hf := updateBorrowPermOnReadAtProj_freezeOrSelf s.memory.borrows entryR.targetLocal
     (some ptrValR.tag) entryR.targetProjection entryR.rangeOffset entryR.rangeLen
   let entryW' := MirSemantics.updateBorrowPermOnReadAtProj s.memory.borrows entryW
@@ -2806,22 +2812,50 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
   have hrlenW' : entryW'.rangeLen = 0 := (hf.rangeLen entryW).trans hrlenW
   have hlocW' : entryW'.targetLocal = entryW.targetLocal := hf.targetLocal entryW
   have hprojW' : entryW'.targetProjection = entryW.targetProjection := hf.targetProjection entryW
-  have hpermW' : entryW'.perm = .active ∨ entryW'.perm = .reserved := by
+  have hstd1 : ∀ e ∈ borrows1,
+      e.perm = .active ∨ e.perm = .frozen ∨ e.perm = .reserved ∨ e.perm = .disabled := by
+    intro e he
+    change e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj _ _ _ _ _ _ _ at he
+    rw [freezeTreeBorrowsOnReadAtProj_eq_map, List.mem_map] at he
+    obtain ⟨e0, he0, rfl⟩ := he
+    exact hf.perm_std (hb.perm_std he0)
+  have hpermW_and_anc : (entryW'.perm = .active ∨ entryW'.perm = .reserved) ∧
+      MirSemantics.derefWriteTreeUB s.frame.locals borrows1 ⟨w, [.deref]⟩ = false := by
     have hw_ok1 := hok1 w hw_lt
     cases hst_w1 : env1.getD w .disabled with
-    | disabled => exact absurd hst_w1 hndis1
+    | disabled => rw [hst_w1] at hw_env1; cases hw_env1
     | empty =>
       rw [hst_w1] at hw_ok1
       exact False.elim (hw_ok1 dw ptrValW hdw hw_ptr hvw)
-    | live _ _ =>
-      rw [hst_w1] at hw_ok1
-      obtain ⟨⟨eW1, hlk1, hnd1, hnf1, _⟩, _⟩ := hw_ok1 dw ptrValW hdw hw_ptr hvw
+    | live _ _ _ wW =>
+      rw [hst_w1] at hw_ok1 hw_env1
+      dsimp only [isWritablePtrState] at hw_env1
+      obtain ⟨⟨eW1, hlk1, hnd1, hnf1, _, _, hanc1⟩, _⟩ := hw_ok1 dw ptrValW hdw hw_ptr hvw
       rw [hlkW'] at hlk1
       injection hlk1 with heq1
       subst heq1
-      have hnf' := hnf1 hw_mut
-      cases hp : entryW'.perm <;> simp_all
-  refine ⟨entryW', ?_, hpermW', hlocW', hprojW', hroffW', hrlenW',
+      have hnf' := hnf1 hw_env1 hw_mut
+      have hstdW' := hstd1 entryW' (lookupBorrow_mem_and_tag hlkW').1
+      refine ⟨?_, ?_⟩
+      · rcases hstdW' with hp | hp | hp | hp
+        · exact .inl hp
+        · exact absurd hp hnf'
+        · exact .inr hp
+        · exact absurd hp hnd1
+      · apply derefWriteTreeUB_false_of_ancestors_writable
+        intro pv sz hw_loc anc hanc_mem hanc_rel
+        rw [hwA] at hw_loc
+        injection hw_loc with hinit
+        injection hinit with hval
+        injection hval with hpv_eq _
+        subst hpv_eq
+        obtain ⟨hnd_a, hnf_a, _, _⟩ := hanc1 anc hanc_mem hanc_rel
+        exact ⟨hnd_a, hnf_a hw_env1 hw_mut⟩
+  refine ⟨entryW', ?_, hpermW_and_anc.1, hlocW', hprojW', hroffW', hrlenW',
+    by
+      have hdub := hpermW_and_anc.2
+      dsimp only [borrows1] at hdub
+      rwa [← hfrz_eq] at hdub,
     fun locals' slot' hinit hnp => ?_⟩
   · change lookupBorrow
         (MirSemantics.freezeDerefReadBorrowsAt s.frame.locals r [] s.memory.borrows)
@@ -2896,6 +2930,10 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
           exact List.map_congr_left (fun e _ => (hupd_fields e).1)
         rw [htags_eq]
         exact hAfter.2.2.1
+      dag_ordered := by
+        dsimp only [advanceStmt]
+        rw [hmap]
+        exact hdag1.map (fun e => (hupd_fields e).1) (fun e => (hupd_fields e).2.2.2.2.2.2)
       entries_ok := fun e' he' => by
         dsimp only [advanceStmt] at he'
         rw [hmap, List.mem_map] at he'
@@ -2904,6 +2942,8 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
         obtain ⟨hprot_e, hroff_e, hrlen_e⟩ := hperm_eq1 e he
         obtain ⟨_, hloc, hproj, hroff_u, hrlen_u, hprot_u, _⟩ := hupd_fields e
         obtain ⟨mutbl', hform'⟩ := borrowEntry_form_of_unranged (upd e)
+          (updateBorrowPermTreeAtProj_perm_std borrows1 e entryW'.targetLocal
+            ptrValW.tag entryW'.targetProjection (hstd1 e he))
           (hprot_u.trans hprot_e) (hroff_u.trans hroff_e) (hrlen_u.trans hrlen_e)
         refine ⟨mutbl', pointeeIt', relOff', hform', hloc ▸ hk_addr, ?_⟩
         rwa [hloc, hproj]
@@ -2968,9 +3008,9 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
       intro q hq
       rw [getD_map_range _ _ _ hq]
       trivial
-    | live wTarget wPeers _wHot =>
+    | live wTarget wPeers _wHot _wWritable =>
       rw [hst_w] at hw_ok
-      obtain ⟨⟨entry_w, hlk_w, _, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrValW hdw hw_ptr hvw
+      obtain ⟨⟨entry_w, hlk_w, _, _, _, hw_tgt, _⟩, hw_peers⟩ := hw_ok dw ptrValW hdw hw_ptr hvw
       rw [hlkW'] at hlk_w
       injection hlk_w with heq_w
       subst heq_w
@@ -2983,23 +3023,31 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
         exact hq_ok
       | disabled =>
         trivial
-      | live qTarget qPeers _qHot =>
+      | live qTarget qPeers _qHot qWritable =>
         rw [hst_q] at hq_ok
         by_cases hkeep : (wPeers.contains q || targetsDefinitelyDisjoint qTarget wTarget) = true
         · simp only [hkeep, ↓reduceIte]
           intro dq pv_q hdq hq_ptr hvq
-          obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, _, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
+          obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, _, hq_tgt, hanc_q⟩, hq_peers⟩ :=
+            hq_ok dq pv_q hdq hq_ptr hvq
           obtain ⟨_, he_q_tag⟩ := lookupBorrow_mem_and_tag hlk_q
-          have hkeep_q : upd e_q = e_q ∨ upd e_q = { e_q with perm := .active } := by
+          have hkeep_same_target : ∀ (ea : BorrowEntry),
+              ea.targetLocal = e_q.targetLocal →
+              borrowProjSteps ea.targetProjection = borrowProjSteps e_q.targetProjection →
+              IsBorrowAncestorOrSelf borrows1 pv_q.tag ea.tag →
+              upd ea = ea ∨ upd ea = { ea with perm := .active } := by
+            intro ea hloc_ea hproj_ea hanc_q_ea
             apply updateBorrowPermTreeAtProj_self_or_disjoint_keep
             intro hloc
+            have hloc_q : e_q.targetLocal = entryW'.targetLocal := hloc_ea ▸ hloc
             have hkeep' : wPeers.contains q = true ∨
                 targetsDefinitelyDisjoint qTarget wTarget = true := by
               simpa only [Bool.or_eq_true] using hkeep
             rcases hkeep' with hpeer | hdisj
             · have hdesc := hw_peers q (List.contains_iff_mem.mp hpeer) dq pv_q hdq hq_ptr hvq
-              exact .inl (he_q_tag.symm ▸ hdesc)
-            · by_cases htag_eq : e_q.tag = ptrValW.tag
+              have hanc_w_ea := (IsBorrowAncestorOrSelf.of_descendant hdesc).trans hanc_q_ea
+              exact .inl (hdag1.descendant_of_ancestor hlkW' hanc_w_ea)
+            · by_cases htag_eq : ea.tag = ptrValW.tag
               · exact .inl (htag_eq ▸ isBorrowDescendantOrSelf_self _ _)
               · right
                 refine ⟨htag_eq, ?_⟩
@@ -3016,10 +3064,14 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
                     simp only [Prod.mk.injEq] at h1 h2
                     obtain ⟨rfl, rfl⟩ := h1
                     obtain ⟨rfl, rfl⟩ := h2
-                    simp only [targetsDefinitelyDisjoint, hloc, ne_eq, not_true_eq_false,
+                    simp only [targetsDefinitelyDisjoint, hloc_q, ne_eq, not_true_eq_false,
                       decide_false, Bool.false_or, Bool.not_eq_true'] at hdisj
-                    rwa [← borrowProjOverlap_borrowProjSteps]
-          refine ⟨⟨upd e_q, ?_, ?_, ?_, ?_, ?_⟩,
+                    apply borrowProjOverlap_borrowProjSteps
+                    rw [hproj_ea]
+                    exact hdisj
+          have hkeep_q : upd e_q = e_q ∨ upd e_q = { e_q with perm := .active } :=
+            hkeep_same_target e_q rfl rfl (he_q_tag.symm ▸ IsBorrowAncestorOrSelf.refl _ _)
+          refine ⟨⟨upd e_q, ?_, ?_, ?_, (fun _ h => by cases h), ?_, ?_⟩,
             fun r' hr' dr' pv_r' hdr' hptr' hvr' => by
               rw [isBorrowDescendantOrSelf_map_eq (fun e => (hupd_fields e).1)
                 (fun e => (hupd_fields e).2.2.2.2.2.2)]
@@ -3029,14 +3081,33 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
           · rcases hkeep_q with hsame | hact_q
             · rwa [hsame]
             · simp [hact_q]
-          · intro hmut_q
+          · intro hqw hmut_q
             rcases hkeep_q with hsame | hact_q
-            · rw [hsame]; exact hnf_q hmut_q
+            · rw [hsame]; exact hnf_q hqw hmut_q
             · simp [hact_q]
-          · intro _ h; cases h
           · intro qp hqp
             rw [(hupd_fields e_q).2.1, (hupd_fields e_q).2.2.1]
             exact hq_tgt qp hqp
+          · intro anc hanc_mem hanc_map
+            obtain ⟨ea, hea_mem, rfl⟩ := List.mem_map.mp hanc_mem
+            rw [(hupd_fields ea).1] at hanc_map
+            have hanc : IsBorrowAncestorOrSelf borrows1 pv_q.tag ea.tag :=
+              (IsBorrowAncestorOrSelf.map_iff (fun e => (hupd_fields e).1)
+                (fun e => (hupd_fields e).2.2.2.2.2.2)).mp hanc_map
+            obtain ⟨hea_ndis, hea_nf, _, hea_tgt⟩ := hanc_q ea hea_mem hanc
+            obtain ⟨hea_loc, hea_proj⟩ := Prod.mk.inj hea_tgt
+            have hkeep_a := hkeep_same_target ea hea_loc hea_proj hanc
+            refine ⟨?_, ?_, (fun _ h => by cases h), ?_⟩
+            · rcases hkeep_a with hsame | hact_a
+              · rwa [hsame]
+              · simp [hact_a]
+            · intro hqw hmut_q
+              rcases hkeep_a with hsame | hact_a
+              · rw [hsame]; exact hea_nf hqw hmut_q
+              · simp [hact_a]
+            · rw [(hupd_fields ea).2.1, (hupd_fields ea).2.2.1,
+                (hupd_fields e_q).2.1, (hupd_fields e_q).2.2.1]
+              exact hea_tgt
         · simp only [hkeep, Bool.false_eq_true, ↓reduceIte]
           trivial
 
@@ -3859,7 +3930,7 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
     dsimp only at hb
     cases hperm : entry.perm with
     | disabled => rw [hperm] at hb; simp only [Option.some.injEq] at hb; omega
-    | active | reserved | frozen =>
+    | unique | reservedFrz _ | reservedIM | cell | frozen =>
       rw [hperm] at hb
       simp only [hsA, hrlen, Nat.beq_refl] at hb
       obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
@@ -3939,7 +4010,7 @@ private theorem ptrAllocByteBound?_spec {body : CapturedMir}
     dsimp only
     cases hperm : entry.perm with
     | disabled => exact absurd hperm hndis
-    | active | reserved | frozen =>
+    | unique | reservedFrz _ | reservedIM | cell | frozen =>
       simp only [hsA, hrlen, Nat.beq_refl]
       obtain ⟨_, hcases⟩ := ptrTargetSpec_cases hdeclsOk htspec
       rcases hcases with ⟨hproj, d', hd', _⟩ |
@@ -4823,12 +4894,27 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled ≠
                       .disabled := by
                   have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
-                  simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, bne_iff_ne] using hpst
-                obtain ⟨hndis_p, hact_p⟩ :=
+                  cases mutbl with
+                  | not =>
+                    simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, isMutReborrow,
+                      bne_iff_ne] using hpst
+                  | «mut» =>
+                    have hw : isWritablePtrState
+                        ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) =
+                        true := by
+                      simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, isMutReborrow]
+                        using hpst
+                    intro hd; rw [hd] at hw; cases hw
+                obtain ⟨hndis_p, _⟩ :=
                   hbo.usable_of_not_disabled hndis_env hdp hp_pt hvp hlookup
                 have hpA : s.frame.locals[p]? = some (.init (.ptr parentPtr 8)) := hpAgree.trans hvp
-                have hmut_perm : mutbl = .mut → parentEntry.perm = .active ∨ parentEntry.perm = .reserved :=
-                  fun hm => hact_p (hmut_compat hm)
+                have hmut_ip : isMutPtrLocal body.localDecls i = true →
+                    isMutPtrLocal body.localDecls p = true := by
+                  intro hm
+                  unfold isMutPtrLocal at hm ⊢
+                  rw [hdi] at hm; rw [hdp]
+                  simp only [Option.bind_eq_bind, Option.bind_some, hpt, hp_pt] at hm ⊢
+                  cases mutbl <;> simp_all
                 have he_mem := (lookupBorrow_mem_and_tag hlookup).1
                 obtain ⟨_, _, _, _, hk_addr, _⟩ := hbo.entries_ok parentEntry he_mem
                 obtain ⟨_, _, _, _, hrlen⟩ := hbo.perm_eq he_mem
@@ -4861,8 +4947,8 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (by rw [h4.allocs]; exact h3.locs)
                     h3.nonScalar hstale
                     (retLive_set hrel.retLive i (by simp))
-                    (hbo.rawPtr_reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt]) rfl
-                      parentPtr hoff0 hvp parentEntry hlookup hndis_p hmut_perm pointeeIt relOff
+                    (hbo.rawPtr_reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt])
+                      hmut_ip rfl parentPtr hoff0 hvp parentEntry hlookup hndis_p pointeeIt relOff
                       htspec hpt hdst_addr _)
                     rfl rfl rfl rfl
               · have hAub := evalStmt_assign_ub s body.localDecls body.layouts ⟨i, []⟩
@@ -4935,18 +5021,42 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (borrowKindMutbl bkind) pointeeIt hpt p dp srcMutbl hdp hp_pt
                     (.inr ⟨bkind, rfl, rfl⟩) e he with
                   ⟨parentPtr, parentEntry, relOff, hvp, hoff0, hlookup, htspec, hMok⟩ | ⟨hnot, hMub⟩
-                · have hndis_env :
+                · have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
+                  have hndis_env :
                       (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled ≠
                         .disabled := by
-                    have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
-                    simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, bne_iff_ne] using hpst
+                    cases bkind with
+                    | shared =>
+                      simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, isMutReborrow,
+                        bne_iff_ne] using hpst
+                    | «mut» tp =>
+                      have hw : isWritablePtrState
+                          ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) = true := by
+                        simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, isMutReborrow]
+                          using hpst
+                      intro hd; rw [hd] at hw; cases hw
+                  have hw_env : borrowKindMutbl bkind = .mut →
+                      isWritablePtrState
+                        ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) =
+                        true := by
+                    intro hm
+                    cases bkind <;> simp [borrowKindMutbl] at hm
+                    simpa [ptrStmtOk, ptrDerefReadSrc, copyRv, reborrowParentOf, isMutReborrow]
+                      using hpst
                   obtain ⟨hndis_p, hact_p⟩ :=
                     hbo.usable_of_not_disabled hndis_env hdp hp_pt hvp hlookup
                   have hpA : s.frame.locals[p]? = some (.init (.ptr parentPtr 8)) := hpAgree.trans hvp
                   have hmut_perm :
                       borrowKindMutbl bkind = .mut →
                         parentEntry.perm = .active ∨ parentEntry.perm = .reserved :=
-                    fun hm => hact_p (hmut_compat hm)
+                    fun hm => hact_p (hw_env hm) (hmut_compat hm)
+                  have hmut_ip : isMutPtrLocal body.localDecls i = true →
+                      isMutPtrLocal body.localDecls p = true := by
+                    intro hm
+                    unfold isMutPtrLocal at hm ⊢
+                    rw [hdi] at hm; rw [hdp]
+                    simp only [Option.bind_eq_bind, Option.bind_some, hpt, hp_pt] at hm ⊢
+                    cases bkind <;> simp_all [borrowKindMutbl]
                   have he_mem := (lookupBorrow_mem_and_tag hlookup).1
                   obtain ⟨_, _, _, _, hk_addr, _⟩ := hbo.entries_ok parentEntry he_mem
                   have hkAgree := hrel.stale.addrTaken_eq hpa hk_addr
@@ -4962,6 +5072,10 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     hlookup hndis_p hmut_perm targetRootVal ht_init
                     (resolveRefDerefTarget?_of_ptrTargetSpec hdlo hdeclsOk hslotsA hdp hp_pt hoff0
                       (hbo.entries_place parentEntry he_mem) htspec ht_init)
+                    (by
+                      rw [hrel.protectors]
+                      exact hasTreeReadUB_false_of_ancestors_not_disabled _ _ _ _ _ _ _
+                        (hbo.ancestors_not_disabled hndis_env hdp (by simp [isPtrTy, hp_pt]) hvp))
                     hi hbor_i hrel.protectors hptr8
                   by_cases hdead : s.frame.locals[i]? = some .dead
                   · have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
@@ -4980,7 +5094,8 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                       (by rw [h4.allocs, ctxWithBorrows_refReborrowEntry_eq]; exact h3.locs)
                       h3.nonScalar hstale
                       (retLive_set hrel.retLive i (by simp))
-                      (hbo.reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt]) rfl rfl
+                      (hbo.reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt])
+                        hmut_ip rfl rfl
                         parentPtr hvp parentEntry hlookup hndis_p pointeeIt relOff htspec hpt
                         hdst_addr _ (.inr ⟨rfl, rfl⟩) (.inr ⟨bkind, rfl, rfl⟩)
                         (by cases bkind <;> simp [refReborrowEntry, refReborrowPerm]))
@@ -5042,17 +5157,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                       (by
                         cases bkind with
                         | shared => simp [refBorrowEntry, refBorrowPerm]
-                        | «mut» tp =>
-                          cases tp with
-                          | true => simp [refBorrowEntry, refBorrowPerm]
-                          | false =>
-                            rcases q with ⟨_, projs⟩
-                            cases projs with
-                            | nil => simp [borrowStartsHot]
-                            | cons ph pt =>
-                              cases ph with
-                              | deref => exact False.elim (hnd_qproj pt rfl)
-                              | _ => simp [borrowStartsHot]))
+                        | «mut» tp => cases tp <;> simp [refBorrowEntry, refBorrowPerm]))
                     rfl rfl rfl rfl
             · by_cases hder : ∃ p rest, copyRv rv = .use (.copy ⟨p, .deref :: rest⟩)
               · ---------------------------------------------------- `_i = copy (*_p)` / `move (*_p)`
@@ -5125,6 +5230,18 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                       body.localDecls body.layouts hdp hpt entry
                       (evalOperand_deref_eq_target_typed hdlo hdeclsOk hslotsA s.memory hdp hpt hpA
                         hoff0 hlookup hndis_p (hbo.entries_place entry he_mem) htspec ht_init)
+                      (by
+                        rw [hrel.protectors]
+                        exact derefReadTreeUB_false_of_ancestors_not_disabled _ _ _
+                          (fun pv sz hp' => by
+                            rw [hpA] at hp'
+                            injection hp' with hi'
+                            injection hi' with hval'
+                            injection hval' with hpv' _
+                            subst hpv'
+                            exact hbo.ancestors_not_disabled hndis_env hdp
+                              (by simp [isPtrTy, hpt]) hvp))
+                      hrel.protectors
                     have hagq : ReadsAgree s.frame.locals view
                         [.copy ⟨entry.targetLocal, entry.targetProjection⟩] :=
                       readsAgree_copy_target hni hkAgree
@@ -5653,7 +5770,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
             subst he'
             have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
             simp only [ptrStmtOk, hsrc, Bool.and_eq_true, bne_iff_ne] at hpst
-            obtain ⟨hndisI_env, hndisR_env, hkeeps_env⟩ := hpst
+            obtain ⟨hwI_env, hndisR_env, hkeeps_env⟩ := hpst
             have hgoodP : GoodSize pointeeIt.size.bytes := ptrPointeeOf_good hptI
             let memFrz : MirSemantics.Memory :=
               { s.memory with
@@ -5676,10 +5793,10 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                 have hpRA : s.frame.locals[r]? = some (.init (.ptr ptrValR 8)) :=
                   hrAgree.trans hvpR
                 obtain ⟨entryI', hlookupI_frz, hactI_frz, hlocI_frz, hprojI_frz, hroffI_frz,
-                    hrlenI_frz, hBdw⟩ :=
+                    hrlenI_frz, hdubI_frz, hBdw⟩ :=
                   hbo.derefWriteRead hbb hst rfl hsrc hdi hptI hdr
                     (by simp [isPtrTy, hptR]) ptrValI ptrValR entryI entryR
-                    hvpI hpIA hlookupI hvpR hpRA hlookupR hndisI_env hkeeps_env
+                    hvpI hpIA hlookupI hvpR hpRA hlookupR hwI_env hkeeps_env
                 have hkAgreeI := hrel.stale.addrTaken_eq hpa hk_addrI
                 have hkAgreeR := hrel.stale.addrTaken_eq hpa hk_addrR
                 obtain ⟨_, _, hd_kI⟩ := hbo.target_ptrs hfrag entryI.targetLocal hk_addrI
@@ -5696,6 +5813,18 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                   body.localDecls body.layouts hdr hptR entryR
                   (evalOperand_deref_eq_target_typed hdlo hdeclsOk hslotsA s.memory hdr hptR hpRA
                     hoff0R hlookupR hndisR (hbo.entries_place entryR he_memR) htspecR ht_initR)
+                  (by
+                    rw [hrel.protectors]
+                    exact derefReadTreeUB_false_of_ancestors_not_disabled _ _ _
+                      (fun pv sz hp' => by
+                        rw [hpRA] at hp'
+                        injection hp' with hi'
+                        injection hi' with hval'
+                        injection hval' with hpv' _
+                        subst hpv'
+                        exact hbo.ancestors_not_disabled hndisR_env hdr
+                          (by simp [isPtrTy, hptR]) hvpR))
+                  hrel.protectors
                 have hagqR : ReadsAgree s.frame.locals view
                     [.copy ⟨entryR.targetLocal, entryR.targetProjection⟩] :=
                   readsAgree_copy_target hniR hkAgreeR
@@ -5780,7 +5909,13 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     · exact .inl ⟨hprojI_frz.trans hproj, rfl⟩
                     · exact .inr ⟨ph, pt, rootVal, hprojI_frz.trans hproj,
                         by rwa [hlocI_frz], hwp s.frame.locals⟩
-                  rw [hAok (.scalar wSc) memFrz _ hv' hrel.protectors hrel.callerLocals hw]
+                  rw [hAok (.scalar wSc) memFrz _ hv' hrel.protectors hrel.callerLocals hw
+                    hdubI_frz
+                    (invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union s.frame.locals
+                      memFrz.borrows i ptrValI entryI' hpIA hlookupI_frz
+                      (resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals s.frame.locals
+                        ptrValI 8 entryI' [] htspecI' hoff0I)
+                      (placeTouchesUnion_false_of_inFragment (.inr (.inr (.inr (by simp [htspecI']))))))]
                   obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
                   refine StepRelN.tau' m4
                     (by simp [hne, listIndex_nat _ _ _ htst, hMeq, hm3, hm4, check_after h4]) ?_
@@ -5829,6 +5964,18 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (evalOperand_deref_eq_target_typed hdlo hdeclsOk hslotsA s.memory hdr hptR
                       (hrAgree.trans hvpR) hoff0R hlookupR hndisR
                       (hbo.entries_place entryR he_memR) htspecR ht_initR)
+                    (by
+                      rw [hrel.protectors]
+                      exact derefReadTreeUB_false_of_ancestors_not_disabled _ _ _
+                        (fun pv sz hp' => by
+                          rw [hrAgree.trans hvpR] at hp'
+                          injection hp' with hi'
+                          injection hi' with hval'
+                          injection hval' with hpv' _
+                          subst hpv'
+                          exact hbo.ancestors_not_disabled hndisR_env hdr
+                            (by simp [isPtrTy, hptR]) hvpR))
+                    hrel.protectors
                   have hopokR := ptrTargetSpec_operandOk hdeclsOk htspecR
                   obtain ⟨hopR1, hopR2⟩ := evalOperand_frag body.localDecls s.frame.locals hslotsA
                     hnA pointeeIt (.copy ⟨entryR.targetLocal, entryR.targetProjection⟩) hopokR
@@ -6035,13 +6182,18 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                   ⟨ptrVal, entry, relOff, m1, hvp, hoff0, hlookup, hk_addr, htspec, hderef, h1,
                     htgt⟩ |
                   ⟨hnot, msg, hmsg⟩
-                · have hndis_env :
+                · have hw_env :
+                      isWritablePtrState
+                        ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD i .disabled) =
+                        true := by
+                    have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
+                    simpa [ptrStmtOk, hsrcNone] using hpst
+                  have hndis_env :
                       (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD i .disabled ≠
                         .disabled := by
-                    have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
-                    simpa [ptrStmtOk, hsrcNone, bne_iff_ne] using hpst
+                    intro h; rw [h] at hw_env; cases hw_env
                   have hact' : entry.perm = .active ∨ entry.perm = .reserved :=
-                    (hbo.usable_of_not_disabled hndis_env hdi hpt hvp hlookup).2 rfl
+                    (hbo.usable_of_not_disabled hndis_env hdi hpt hvp hlookup).2 hw_env rfl
                   obtain ⟨_, _, _, hroff, hrlen⟩ := hbo.perm_eq (lookupBorrow_mem_and_tag hlookup).1
                   have hpA : s.frame.locals[i]? = some (.init (.ptr ptrVal 8)) := hiAgree.trans hvp
                   have hpL1 : (rvPost s.frame.locals rv)[i]? = some (.init (.ptr ptrVal 8)) :=
@@ -6105,7 +6257,20 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     have hinvL1 := invalidateDerefWriteBorrows_congr_local
                       (rvPost s.frame.locals rv) s.frame.locals s.memory.borrows i ptrVal entry
                       htspec hoff0 hpL1 hpA hlookup hrlen hroff
-                    rw [hAok (.scalar wSc) _ hv hw, hinvL1]
+                    rw [hAok (.scalar wSc) _ hv hw
+                      (derefWriteTreeUB_false_of_ancestors_writable _ _ _
+                        (fun pv sz hp' => by
+                          rw [hpL1] at hp'
+                          injection hp' with hi'
+                          injection hi' with hval'
+                          injection hval' with hpv' _
+                          subst hpv'
+                          exact hbo.ancestors_writable hw_env hdi hpt hvp))
+                      (invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
+                        (rvPost s.frame.locals rv) s.memory.borrows i ptrVal entry hpL1 hlookup
+                        (resolveDerefWriteFullProj_of_ptrTargetSpec _ _ ptrVal 8 entry [] htspec hoff0)
+                        (placeTouchesUnion_false_of_inFragment (.inr (.inr (.inr (by simp [htspec])))))),
+                      hinvL1]
                     obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
                     refine StepRelN.tau' m4
                       (by simp [hne, listIndex_nat _ _ _ htst, hMeq, hm3, hm4, check_after h4]) ?_
@@ -6327,7 +6492,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
       obtain ⟨kind, span⟩ := st
       simp only at hkind
       subst hkind
-      obtain ⟨i, di, srcMutbl, srcIt, rfl, hnotFnEntry, hdi, hpt⟩ :=
+      obtain ⟨i, di, srcMutbl, srcIt, rfl, hnotFnEntry, hdi, hpt, hbranch⟩ :=
         statementOk_retag_spec hok
       simp only [translatePlace, Option.some.injEq] at hpe
       subst hpe
@@ -6335,30 +6500,64 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
       have hiRead : i ∉ movedBefore body s.frame.blockIdx s.frame.stmtIdx := by
         simpa [stmtReadsOk, List.contains_iff_mem] using hreads
       have hiAgree : s.frame.locals[i]? = view[i]? := hrel.stale.agree hiRead
-      obtain ⟨hAok, hAub⟩ := evalStmt_retag_local s body.localDecls body.layouts
-        retagKind i span hnotFnEntry
       rcases evalStatement_validate_local_mr hframe hbo hns hfrag i di srcMutbl srcIt
           false hdi hpt with
-        ⟨ptrVal, entry, m3, hvi, hlk, hm3, h3⟩ | ⟨hnot, msg, hmsg⟩
+        ⟨ptrVal, entry, relOff, m3, hvi, hoff0, hlk, hspec, hm3, h3_keep, h3_retag⟩ | ⟨hnot, msg, hmsg⟩
       · have hndis_env :
             (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD i .disabled ≠
               .disabled := by
           have hpst := ptrStmtOk_of_ptrAliasingOk hpa hbb hst
           simpa [ptrStmtOk, bne_iff_ne] using hpst
-        obtain ⟨hndis, hmut_act⟩ :=
+        have hisPtr_i : isPtrTy di.ty = true := by simp [isPtrTy, hpt]
+        obtain ⟨hndis, _⟩ :=
           hbo.usable_of_not_disabled hndis_env hdi hpt hvi hlk
-        rw [hAok ptrVal 8 entry (hiAgree.trans hvi) hlk hndis
-          (retag_not_frozen_of_usable hdi hpt hmut_act)]
-        obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
-        refine StepRelN.tau' m4
-          (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
-        exact hrel.advanceN hfrag hbb hlt _ view _ lm m4 h4.threads h4.active
-          (by rw [h4.allocs]; exact h3.locs) h3.nonScalar (hrel.stale.keep hbb hst rfl)
-          hrel.retLive (hbo.advance_keep hbb hst (by simp [ptrStmtStep])) rfl rfl rfl rfl
+        rcases hbranch with ⟨href_true, hraw_false⟩ | ⟨href_false, hraw_true⟩
+        · obtain ⟨hAok, _⟩ := evalStmt_retag_ref_local s body.localDecls body.layouts
+            retagKind i di srcMutbl srcIt span hnotFnEntry hraw_false hdi hpt href_true hrel.protectors
+          have hrub : MirSemantics.hasTreeReadUB s.memory.borrows s.memory.borrows
+              s.memory.activeProtectors entry.targetLocal (some ptrVal.tag)
+              entry.targetProjection entry.rangeOffset entry.rangeLen = false := by
+            rw [hrel.protectors]
+            exact hasTreeReadUB_false_of_ancestors_not_disabled _ _ _ _ _ _ _
+              (hbo.ancestors_not_disabled hndis_env hdi hisPtr_i hvi)
+          rw [hAok ptrVal entry (hiAgree.trans hvi) hoff0 hlk hndis hrub]
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3_retag.shape
+          have hi_addr : i ∉ bodyAddrTakenLocals body := fun hk => by
+            rw [((hbo.target_ptrs hfrag i hk).2.2 di hdi).1] at hisPtr_i
+            cases hisPtr_i
+          have hbm : borrowKindMutbl (retagBorrowKind srcMutbl) = srcMutbl := by
+            cases srcMutbl <;> rfl
+          refine StepRelN.tau' m4
+            (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+          exact hrel.advanceN hfrag hbb hlt _
+            (view.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8))) _ lm m4 h4.threads h4.active
+            (by rw [h4.allocs, ctxWithBorrows_refReborrowEntry_eq, hbm]; exact h3_retag.locs)
+            h3_retag.nonScalar
+            (hrel.stale.setBothKeep hbb hst rfl (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
+            (retLive_set hrel.retLive i (by simp))
+            (hbo.retagRef hlo.nlocals hbb hst hdi href_true rfl
+              ptrVal hvi entry hlk hndis srcIt relOff hspec hpt hi_addr _)
+            rfl rfl rfl rfl
+        · obtain ⟨hAok, _⟩ := evalStmt_retag_rawPtr_local s body.localDecls body.layouts
+            retagKind i di srcMutbl srcIt span hraw_true hdi hpt href_false
+          rw [hAok ptrVal 8 (hiAgree.trans hvi)]
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3_keep.shape
+          refine StepRelN.tau' m4
+            (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+          exact hrel.advanceN hfrag hbb hlt _ view _ lm m4 h4.threads h4.active
+            (by rw [h4.allocs]; exact h3_keep.locs) h3_keep.nonScalar (hrel.stale.keep hbb hst rfl)
+            hrel.retLive (hbo.advance_keep hbb hst (by simp [ptrStmtStep, href_false])) rfl rfl rfl rfl
       · have hnotA : s.frame.locals[i]? = some .uninit ∨ s.frame.locals[i]? = some .dead := by
           rw [hiAgree]; exact hnot
-        rw [hAub hnotA]
-        exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+        rcases hbranch with ⟨href_true, hraw_false⟩ | ⟨href_false, hraw_true⟩
+        · obtain ⟨_, hAub⟩ := evalStmt_retag_ref_local s body.localDecls body.layouts
+            retagKind i di srcMutbl srcIt span hnotFnEntry hraw_false hdi hpt href_true hrel.protectors
+          rw [hAub hnotA]
+          exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+        · obtain ⟨_, hAub⟩ := evalStmt_retag_rawPtr_local s body.localDecls body.layouts
+            retagKind i di srcMutbl srcIt span hraw_true hdi hpt href_false
+          rw [hAub hnotA]
+          exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]
@@ -10034,7 +10233,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
       exfalso
       obtain ⟨kind, span⟩ := st
       simp only at hkind; subst hkind
-      obtain ⟨i, di, _, _, rfl, _, hdi, hpt⟩ := statementOk_retag_spec hok
+      obtain ⟨i, di, _, _, rfl, _, hdi, hpt, _⟩ := statementOk_retag_spec hok
       rw [hnoPtr i di hdi] at hpt
       cases hpt
   · ----------------------------------------------------------------- terminator
@@ -14646,7 +14845,8 @@ theorem BorrowsOk.ptr_slots_after_expose_withExposed {body : CapturedMir}
       ∀ (entry : BorrowEntry),
         lookupBorrow s.memory.borrows pv.tag = some entry →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   obtain ⟨hit_eq, hmut_compat⟩ := exposeSourceCompatible_iff.mp hcompat
   have hd_decl : d < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdd).1
   have hd_v1 : d < (view.set i (.init (.scalar ⟨addrBits, 8⟩))).length := by
@@ -14690,9 +14890,9 @@ theorem BorrowsOk.ptr_slots_after_expose_withExposed {body : CapturedMir}
         exact ⟨entry, relOff, hoff0, hlk, hk_addr, hspec⟩
   · intro hndis entry hlk
     obtain ⟨hperm_nd, hmut_act⟩ := hb.usable_of_not_disabled hndis hdp hp_ty hview_p hlk
-    refine ⟨hperm_nd, fun hdm => ?_⟩
+    refine ⟨hperm_nd, fun hw hdm => ?_⟩
     rcases hmut_compat with hsm | hdn
-    · exact hmut_act hsm
+    · exact hmut_act hw hsm
     · rw [hdn] at hdm; cases hdm
 
 /-- Strengthened 3-segment simulation (`Assume` -> `PointerExposeProvenance` ->
@@ -14815,7 +15015,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
             some (pointeeIt, relOff')) ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   have hp_pty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt) :=
     (ptrPointeeOf_of_rawPtrPointeeOf hp_ty).1
   have hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i :=
@@ -14879,7 +15080,7 @@ private theorem ptrEnvOk_setPtrLocal_disabled {body : CapturedMir} {view : List 
       rw [List.getElem?_set_ne hneq] at hv
       exact hq_ok dq pv hdq hpty hv
     | disabled => trivial
-    | live target ps =>
+    | live target ps hot writable =>
       rw [hst] at hq_ok
       dsimp only [removePeerFromState, PtrLocalOk]
       intro dq pv hdq hpty hv
@@ -14935,7 +15136,8 @@ theorem BorrowsOk.after_expose_withExposed {body : CapturedMir}
       ∀ (entry : BorrowEntry),
         lookupBorrow s0.memory.borrows pv.tag = some entry →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s0.frame.blockIdx s0.frame.stmtIdx).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   have hi_not_ptr : isDeclPtrLocal body.localDecls i = false := by
     unfold isDeclPtrLocal
     rw [hdi]
@@ -14970,6 +15172,7 @@ theorem BorrowsOk.after_expose_withExposed {body : CapturedMir}
     tags_pos := hb1.tags_pos
     tags_lt := hb1.tags_lt
     tags_nodup := hb1.tags_nodup
+    dag_ordered := hb1.dag_ordered
     entries_ok := hb1.entries_ok
     entries_place := hb1.entries_place
     target_init := fun hfrag k hk => by
@@ -15113,7 +15316,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   have hp_pty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt) :=
     (ptrPointeeOf_of_rawPtrPointeeOf hp_ty).1
   obtain ⟨entry, relOff, mA, m4, m6, m8, hlk, hsp, hart0, hit_eq, hoff0, hk_addr,
@@ -15348,7 +15552,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   exact hprov.assume_then_expose_then_withExposed_closed_from_frameOk
     hframe hb hat hstale hbb hstA hkA hst1 hst2 hreadsA hokBA hopA hbits1
     hop1 hop2 hdi hit_i hi_addr hprot hview_i hdp hp_ty hp hview_p
@@ -15459,7 +15664,8 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWi
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   have hlt31 : body.localDecls.length < 2 ^ 31 :=
     localDecls_lt_of_inFragmentWithIntrinsics hfrag
   have hpage8 : MirSemantics.stackLocalAddrPageBase 8 = 1048576 := rfl
@@ -15981,8 +16187,11 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_f
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) :=
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) :=
   hprov.assume_then_expose_then_withExposed_closed_from_frameOk
+    (nb1 := nb1) (nb2 := nb2) (nb3 := nb3) (targetTy1 := targetTy1) (targetTy2 := targetTy2)
+    (span1 := span1) (span2 := span2)
     hframe hb hat hstale hbb hstA hkA hst1 hst2 hreadsA hokBA hopA hbits1
     hop1 hop2 hdi hit_i hi_addr hprot hview_i hdp hp_ty hp hview_p
     hdd hd_ty hd_addr hcompat hview_d
@@ -16113,11 +16322,14 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_of_inF
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+          (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) = true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
   have hlt31 : body.localDecls.length < 2 ^ 31 :=
     localDecls_lt_of_inFragmentWithIntrinsics hfrag
   have hpage8 : MirSemantics.stackLocalAddrPageBase 8 = 1048576 := rfl
   exact hprov.assume_then_expose_then_withExposed_closed_distinct_from_frameOk
+    (nb1 := nb1) (nb2 := nb2) (nb3 := nb3) (targetTy1 := targetTy1) (targetTy2 := targetTy2)
+    (span1 := span1) (span2 := span2)
     hframe hb hat hstale hbb hstA hkA hst1 hst2 hreadsA hokBA hopA hbits1
     hop1 hop2 hdi hit_i hi_addr hprot hview_i hdp hp_ty hp hview_p
     hdd hd_ty hd_addr hcompat hview_d hsep hnoadj
@@ -16332,8 +16544,13 @@ theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFra
       FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm mLoad nb3 0 ∧
       ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
         entry.perm ≠ .disabled ∧
-          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) :=
+          (isWritablePtrState
+              ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled) =
+              true →
+            dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) :=
   hprov.assume_then_expose_then_withExposed_closed_distinct_of_inFragmentWithIntrinsics
+    (nb1 := nb1) (nb2 := nb2) (nb3 := nb3)
+    (targetTy1 := targetTy1) (targetTy2 := targetTy2) (span1 := span1) (span2 := span2)
     hfrag hframe hb hat hstale hbb hstA hkA hst1 hst2 hreadsA hokBA hopA hbits1
     hop1 hop2 hdi hit_i hi_addr hprot hview_i hdp hp_ty hp hview_p
     hdd hd_ty hd_addr hcompat hview_d hsep

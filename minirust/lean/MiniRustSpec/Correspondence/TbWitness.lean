@@ -711,9 +711,10 @@ theorem unsafeCellProtectedInteriorMut_translate :
     (translateFn unsafeCellProtectedInteriorMut).isSome = true := by decide +kernel
 
 theorem unsafeCellProtectedInteriorMut_anneal_ub :
-    ∃ tr u, Reaches (mirTree unsafeCellProtectedInteriorMut
-      (initMachineState unsafeCellProtectedInteriorMut [initUnsafeCellU32])) tr u ∧ FaultNow u :=
-  faultsA_sound unsafeCellProtectedInteriorMut 25 _ (by decide)
+    ∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMut
+      (initMachineState unsafeCellProtectedInteriorMut [initUnsafeCellU32])) []
+      (.normal (.scalar ⟨77, 4⟩, mem)) :=
+  ⟨_, runA_sound unsafeCellProtectedInteriorMut 25 _ _ _ rfl⟩
 
 theorem unsafeCellProtectedInteriorMut_minirust_direct :
     retAfter unsafeCellProtectedInteriorMut [initUnsafeCellU32] 9 =

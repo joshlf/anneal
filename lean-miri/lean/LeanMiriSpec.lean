@@ -169,15 +169,22 @@ import LeanMiriSpec.Audit
   (`AllocMapRel`, `PtrRel`), pointer resolution (`annealResolvePtr`), bounds/alignment
   validation (`checkAndDerefPtr`), and `Miri.Interpreter.ptrOffsetInbounds` (`LM-3.1`).
 * `LeanMiriSpec.Correspondence.SimLM3_1`: `LM-3.1` correspondence for `Rvalue.RawPtr`
-  (`&raw const`/`&raw mut`) with `forceAllocation`, `PlaceElem.Deref` (`*ptr`) reads,
-  writes, and UB, `StorageLive`/`StorageDead` on address-taken locals,
-  `BinOp.Offset` (`inbounds` vs. `wrapping`, including zero-count offsets across
-  all exact-layout pointee strides), relational raw-pointer comparisons (`Eq`..`Ge`),
-  `UnOp.PtrMetadata`, `CastKind.PtrToPtr`, pointer/integer exposure casts, and
-  `StateRelLM3_1` root-frame terminators (`Goto`, scalar and raw-pointer `Return`,
-  `Unreachable`, `SwitchInt`, and `Assert`).
-* `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and end-to-end real-step
-  (`Miri.Interpreter.Step.step`) witnesses for `LM-3.1`.
+  (`&raw const`/`&raw mut` on locals and `*ptr` deref reborrows across zero/nonzero
+  offsets, null/scalar pointers, and `.disabled`/`.frozen` tags) with `forceAllocation`,
+  `PlaceElem.Deref` (`*ptr`) reads, writes, `PlaceMention(*ptr)`, and UB,
+  `StorageLive`/`StorageDead` on address-taken locals, `BinOp.Offset` (`inbounds` vs.
+  `wrapping`, including zero-count offsets on live/dangling/scalar pointers across all
+  exact-layout pointee strides and nonzero-offset scalar UB), relational raw-pointer
+  comparisons (`Eq`..`Ge` across same-allocation, `< 64` KiB cross-local `Eq`/`Ne`, and
+  null-vs-live regimes, plus cross-local ordering and page-wrapping address boundaries),
+  `UnOp.PtrMetadata` on thin raw pointers, `CastKind.PtrToPtr` (pointer and scalar
+  operands, `.copy` and `.move`), fail-closed provenance exposure boundaries, and
+  unified `WellTypedLM3_1StateStmt` / `WellTypedLM3_1StateTerminator` /
+  `step_mir_lm3_1_state_simulation` across `Goto`, scalar and raw-pointer `Return`,
+  `Unreachable`, `SwitchInt`, and `Assert`.
+* `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and composed multi-step real-step
+  (`Miri.Interpreter.Step.step` / `step_mir_lm3_1_state_simulation`) witnesses for `LM-3.1`,
+  covering `D1..D12` simulations and genuine address/hook boundaries.
 * `LeanMiriSpec.Correspondence.RefLM3_2`: reference-aware relations
   (`LocalRelLM3_2`, `StateRelLM3_2`), the vendored validity visitor instantiated
   for Anneal (`annealValidityHooks`), the eager safe-reference dereference checks
@@ -185,11 +192,18 @@ import LeanMiriSpec.Audit
   `validityVisitor_scalar_bool_simulation` and
   `validityVisitor_ref_dereferenceable_simulation` (`LM-3.2`).
 * `LeanMiriSpec.Correspondence.SimLM3_2`: `LM-3.2` real-step correspondence for
-  `Rvalue.Ref` (`&_t`, `&mut _t`, with `forceAllocation`,
-  `evalRvalue_ref_simulation`), reborrowing through a raw pointer
-  (`evalRvalue_reborrow_simulation`), and the dangling-reborrow divergence.
+  `Rvalue.Ref` (`&_t`, `&mut _t`, with `forceAllocation`), reborrowing through raw
+  pointers and safe references (`&*_p`, `&*_r`), safe-reference deref reads, writes,
+  and `PlaceMention(*_r)` boundaries, plus the parent-preserving `StateRelLM3_2Tree` /
+  `StepRelLM3_2Tree` / `StepObsRelLM3_2Tree` simulation hierarchy
+  (`WellTypedLM3_2TreeStateStmt`, `WellTypedLM3_2TreeStateTerminator`,
+  `step_stmt_lm3_2_tree_state_simulation`, `step_terminator_lm3_2_tree_state_simulation`,
+  `step_mir_lm3_2_tree_state_simulation`) and `D14` hook-free vs. `SimLM3_3` boundary
+  characterizations.
 * `LeanMiriSpec.Correspondence.WitLM3_2`: `LM-3.2` witnesses, including end-to-end
-  runs of `ValidityVisitor.validatePlace`.
+  runs of `ValidityVisitor.validatePlace`, composed multi-step `StateRelLM3_2Tree`
+  hierarchies driven through `step_mir_lm3_2_tree_state_simulation` across `SwitchInt`,
+  `Assert`, and safe-reference root `Return`, and `D14` boundary traces.
 * `LeanMiriSpec.Correspondence.TreeBorrowsRel`: exact six-state bijection
   (`TreeBorrowsBijection`), per-node, `LocationState`, `BorrowTree`,
   `RetagPipeline`, `MachineMemoryHooks`, `NormalTreeState`, and

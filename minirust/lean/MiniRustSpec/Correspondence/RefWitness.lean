@@ -1049,7 +1049,8 @@ theorem refLoopCountdown_inFragment : inFragment refLoopCountdown = true := by d
 /-- At `bb3` of `refLoopCountdown`, forward CFG borrow dataflow (`ptrEnvAtEntry`)
 propagates the live `&mut _1` borrow `_5` across `bb2 -> bb3` inside the loop. -/
 theorem refLoopCountdown_ptrEnvAtEntry_bb3 :
-    (ptrEnvAtEntry refLoopCountdown 3)[5]? = some (.live (some (1, [])) [5]) := by
+    (ptrEnvAtEntry refLoopCountdown 3)[5]? =
+      some (.live (some (1, [])) [5] false true) := by
   decide
 
 def refLoopCountdownFn : Gen.Function where
@@ -1724,13 +1725,9 @@ theorem twoPhaseDirectWriteTreeBorrowsGap_notInFragment :
     inFragment twoPhaseDirectWriteTreeBorrowsGap = false := by decide +kernel
 
 theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ret :
-    ReachesRet (mirTree twoPhaseDirectWriteTreeBorrowsGap
-      (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨99, 4⟩,
-        { (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 1 .mut (local_ 1) with perm := .reserved }],
-          nextTag := 2 })) :=
-  runA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ _ _ rfl
+    ∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrowsGap
+      (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ (by decide)
 
 theorem twoPhaseDirectWriteTreeBorrowsGap_minirust_direct :
     retAfter twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 6 =
@@ -2145,10 +2142,15 @@ theorem retagRefReborrowChain_anneal_ret :
     ReachesRet (mirTree retagRefReborrowChain retagRefReborrowChainS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRefReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+          borrows := [{ rawPtrEntry 7 .not (local_ 1) with parentTag := some 6 },
+                      { rawPtrEntry 6 .not (local_ 1) with parentTag := some 5 },
+                      { rawPtrEntry 5 .mut (local_ 1) with
+                        perm := .reservedFrz false, parentTag := some 4 },
+                      { rawPtrEntry 4 .mut (local_ 1) with parentTag := some 3 },
+                      { rawPtrEntry 3 .mut (local_ 1) with parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 4 })) :=
+          nextTag := 8 })) :=
   runA_sound retagRefReborrowChain 40 _ _ _ rfl
 
 theorem retagRefReborrowChain_noUB :
@@ -2366,9 +2368,12 @@ theorem retagDisabledRefDiscrepancy_anneal_ret :
       (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,
         { (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+          borrows := [{ rawPtrEntry 3 .mut (local_ 1) with
+                        perm := .reservedFrz false, parentTag := some 1 },
+                      { rawPtrEntry 2 .mut (local_ 1) with
+                        perm := .frozen, parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 3 })) :=
+          nextTag := 4 })) :=
   runA_sound retagDisabledRefDiscrepancy 25 _ _ _ rfl
 
 theorem retagDisabledRefDiscrepancy_minirust_direct :
@@ -2476,11 +2481,11 @@ theorem retagDisabledRefDiscrepancy_progress (n : Nat) :
     [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
     rfl rfl rfl retagDisabledRefDiscrepancy_noUB n
 
-/-- Scalar `Retag([default], _1)` discrepancy on `u32` parameter `_1`:
+/-- Scalar `Retag([default], _1)` on `u32` parameter `_1`:
 `translateFn` lowers `Retag` to `Statement::Validate`, while `statementOk`
-restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Anneal's
-`evalStmt` `.retag` rejects non-`.ptr` scalar values with `.ub`, whereas
-MiniRust's `Machine::retag_val` treats `Value::Int` as a no-op and returns `5`. -/
+restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Since `314c4453`,
+Anneal's `evalStmt` `.retag` treats non-pointer scalar values as a no-op and
+returns `5`, matching MiniRust's `Machine::retag_val` (`Value::Int`). -/
 def retagScalarDiscrepancy : CapturedMir :=
   ptrBody "witness::retag_scalar_discrepancy" [u32Decl, u32Decl]
     [.retag .default (local_ 1),
@@ -2492,10 +2497,12 @@ theorem retagScalarDiscrepancy_translate :
 theorem retagScalarDiscrepancy_notInFragment :
     inFragment retagScalarDiscrepancy = false := by decide +kernel
 
-theorem retagScalarDiscrepancy_anneal_ub :
-    ∃ tr u, Reaches (mirTree retagScalarDiscrepancy
-      (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound retagScalarDiscrepancy 15 _ (by decide)
+theorem retagScalarDiscrepancy_anneal_ret :
+    ReachesRet (mirTree retagScalarDiscrepancy
+      (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩,
+        (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩]).memory)) :=
+  runA_sound retagScalarDiscrepancy 15 _ _ _ rfl
 
 theorem retagScalarDiscrepancy_minirust_direct :
     retAfter retagScalarDiscrepancy [.scalar ⟨5, 4⟩] 4 =
