@@ -1943,8 +1943,9 @@ theorem evalRvalue_binOp_offset_eq
    `wrappingSignedOffset` computes the wrapped address.
 
 This leaf-level theorem characterizes `ptrOffsetInbounds` directly; see
-`step_binOp_offset_simulation` and `step_binOp_offset_oob_dangling_simulation` for
-the full `Miri.Interpreter.Step.step` (`annealStepHooks`) correspondence. -/
+`step_binOp_offset_simulation`, `step_binOp_offset_oob_dangling_miri_ub`, and the
+`D6` coverage map before section 11 for the full `Miri.Interpreter.Step.step`
+(`annealStepHooks`) correspondence. -/
 theorem evalBinOp_offset_inbounds_simulation
     {s : MachineState} {mach : AnnealMachine}
     {allocMap : List AllocMapEntry}
@@ -27554,6 +27555,46 @@ theorem step_binOp_offset_usize_wrap_disabled_ub_simulation
       have hm_step :=
         miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err
       exact ⟨by rw [ha_ub, hm_step]; exact .ub _ _, ha_ub, _, hm_step⟩
+
+/-! ### `D6` `BinOp.Offset` coverage map
+
+For `_d = Offset((copy|move) _p, rhsOp)` where `_p` holds a tracked pointer `.ptr ptrVal 8`
+with borrow entry `e` (`e.tag = ptrVal.tag`) into target local `t = e.localIdx`, pointee
+`T` with `IsPrimScalarTy T` and stride `s = sizeof(T) ∈ {1, 2, 4, 8, 16}`, and a `usize` /
+`isize` count with bits `c < 2 ^ 64`, the theorems below partition the outcomes under their
+common premises (`StateRelLM3_1`, well-typed operands, immediate pointer and destination
+locals, and a live destination `_d` for the stepping rows). Write `off = ptrVal.offsetBytes`,
+`|t|` for the byte size of `t`, and `k = 2 ^ 64 - c` when `2 ^ 63 ≤ c`.
+
+* `e.perm ≠ .disabled`:
+  * `c = 0 ∧ off = 0`, or `t` live, `c < 2 ^ 63`, and `off + c * s ≤ |t|`: lockstep step to
+    `off + c * s` (`step_binOp_offset_stride_simulation`).
+  * `isize`, `2 ^ 63 ≤ c`, `t` live, `k * s ≤ off ≤ |t|`: lockstep step back to
+    `off - k * s` (`step_binOp_offset_neg_isize_simulation`).
+  * `usize`, `2 ^ 63 ≤ c`, `t` live, `k * s ≤ off ≤ |t|`: divergence. Anneal steps back,
+    `lean-miri` raises `"PointerArithOverflow"` (`step_binOp_offset_usize_wrap_divergence`;
+    unsound direction, `Trusted` follow-up).
+  * every other count (dead `t`, underflow below byte `0`, start past `|t|`, positive count
+    exceeding `|t|` or overflowing `isize`): UB in both machines
+    (`step_binOp_offset_neg_oob_ub_simulation`, which carries no permission premise).
+* `e.perm = .disabled`:
+  * `c = 0` at any offset, or `t` live, `c < 2 ^ 63`, and `off + c * s ≤ |t|`: divergence.
+    Anneal raises `.ub` (`borrowDisabled`), `lean-miri` steps
+    (`step_binOp_offset_disabled_stride_divergence`; conservative direction).
+  * `isize`, `2 ^ 63 ≤ c`, `t` live, `k * s ≤ off ≤ |t|`: divergence in the same direction
+    (`step_binOp_offset_disabled_neg_isize_divergence`).
+  * `usize`, `2 ^ 63 ≤ c`: UB in both machines
+    (`step_binOp_offset_usize_wrap_disabled_ub_simulation`).
+  * every other count: UB in both machines (`step_binOp_offset_neg_oob_ub_simulation`).
+
+The only combination outside the map is `e.perm ≠ .disabled`, `c = 0`, and `off ≠ 0` with
+`t` dead or `off > |t|`. It is unreachable: `StorageDead` disables every entry of `t`
+(`disableAllocMapLocal`), and in-bounds `Offset` steps never produce `off > |t|`.
+Provenance-less (`.scalar`) pointers are handled separately
+(`step_binOp_offset_scalar_zero_correspondence`, `step_binOp_offset_scalar_nonzero_simulation`,
+and their `move` counterparts). The byte-sized Stage-1 theorems (`step_binOp_offset_simulation`,
+`step_binOp_offset_move_simulation`, `step_binOp_offset_oob_dangling_miri_ub`,
+`step_binOp_offset_disabled_divergence`) are instances of the rows above. -/
 
 /-! ## 11. Composed `StateRelLM3_1` Statement Simulation (`step_stmt_lm3_1_state_simulation`) -/
 
