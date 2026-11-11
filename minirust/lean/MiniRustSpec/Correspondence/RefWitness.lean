@@ -338,10 +338,9 @@ theorem refMutRoundTrip_anneal_ret :
     ReachesRet (mirTree refMutRoundTrip refMutRoundTripS0) []
       (.normal (.scalar ⟨6, 4⟩,
         { refMutRoundTripS0.memory with
-          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
-                      { rawPtrEntry 2 .not (local_ 1) with parentTag := some 1 },
+          borrows := [{ rawPtrEntry 2 .not (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 4 })) :=
+          nextTag := 3 })) :=
   runA_sound refMutRoundTrip 30 _ _ _ rfl
 
 theorem refMutRoundTrip_noUB :
@@ -495,15 +494,13 @@ theorem refArrayReborrowChain_anneal_ret :
     ReachesRet (mirTree refArrayReborrowChain refArrayReborrowChainS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refArrayReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 7 .not (placeConstIdx 1 0 2 false) with parentTag := some 5 },
-                      { rawPtrEntry 6 .mut (placeConstIdx 1 1 2 false) with parentTag := some 2 },
-                      { rawPtrEntry 5 .not (placeConstIdx 1 0 2 false) with parentTag := some 4 },
+          borrows := [{ rawPtrEntry 5 .not (placeConstIdx 1 0 2 false) with parentTag := some 4 },
                       { rawPtrEntry 4 .not (placeConstIdx 1 0 2 false) with parentTag := some 3 },
                       { rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false) with
                           perm := .reserved, parentTag := some 1 },
                       rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
                       rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
-          nextTag := 8 })) :=
+          nextTag := 6 })) :=
   runA_sound refArrayReborrowChain 60 _ _ _ rfl
 
 theorem refArrayReborrowChain_noUB :
@@ -1470,10 +1467,9 @@ theorem refMutDivZeroUb_minirust_direct :
 /-! ### Safe-pointer validity (`PtrType::Ref` vs `PtrType::Raw`) -/
 
 /-- Creating an unused `&u32` reference from a misaligned `*const u32`
-(`_6 = &(*_5); _0 = copy _1; return`): unlike `misaligned`, which must *load*
-from `*q` to trigger UB on a raw pointer, merely forming `&*q` triggers
-`checkPtr`'s safe-pointer alignment check (`"Value::Ptr: unaligned safe pointer"`)
-in MiniRust, whereas Anneal returns `x`. -/
+(`_6 = &(*_5); _0 = copy _1; return`): unlike a raw borrow `&raw const (*_5)`,
+forming `&*q` checks safe-pointer alignment and raises UB in both MiniRust
+(`"Value::Ptr: unaligned safe pointer"`) and Anneal (`resolveRefDerefTarget?`). -/
 def misalignedRef : CapturedMir :=
   ptrBody "witness::misaligned_ref"
     [u32Decl, u32Decl, ptrConstU32Decl, ptrConstU8Decl, ptrConstU8Decl,
@@ -1487,10 +1483,10 @@ def misalignedRef : CapturedMir :=
 
 theorem misalignedRef_notInFragment : inFragment misalignedRef = false := by decide +kernel
 
-theorem misalignedRef_anneal_ret :
-    ∃ mem, ReachesRet (mirTree misalignedRef (initMachineState misalignedRef [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩, mem)) :=
-  ⟨_, runA_sound misalignedRef 30 _ _ _ rfl⟩
+theorem misalignedRef_anneal_ub :
+    ∃ tr u, Reaches (mirTree misalignedRef (initMachineState misalignedRef [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u :=
+  faultsA_sound misalignedRef 30 _ (by decide)
 
 theorem misalignedRef_minirust_direct :
     ubAfter misalignedRef [.scalar ⟨5, 4⟩] 11 = some "Value::Ptr: unaligned safe pointer" := by
@@ -1500,7 +1496,7 @@ theorem misalignedRef_minirust_direct :
 without ever dereferencing `*_3`: unlike a dangling `*const u32`, loading a
 `&u32` value runs `checkPtr`'s dereferenceability check and raises
 `"Value::Ptr: non-dereferenceable safe pointer"` in MiniRust, whereas Anneal
-copies the `(tag, offset)` pair and returns `x`. -/
+copies the `(tag, offset)` pair without retagging or dereferencing and returns `x`. -/
 def danglingRef : CapturedMir :=
   ptrBody "witness::dangling_ref"
     [u32Decl, u32Decl, u32Decl, refSharedU32Decl, refSharedU32Decl]
@@ -2146,11 +2142,10 @@ theorem retagRefReborrowChain_anneal_ret :
     ReachesRet (mirTree retagRefReborrowChain retagRefReborrowChainS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRefReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
-                      { rawPtrEntry 3 .mut (local_ 1) with parentTag := some 2 },
+          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 5 })) :=
+          nextTag := 4 })) :=
   runA_sound retagRefReborrowChain 40 _ _ _ rfl
 
 theorem retagRefReborrowChain_noUB :
@@ -2774,10 +2769,9 @@ theorem transmuteSharedRefToMutWriteDiscrepancy_minirust_direct :
 
 /-- Transmuting an aligned non-null integer (`4_usize`) to `&u32` without ever
 dereferencing it (`_2 = 4_usize; _3 = copy _2 as &u32 (Transmute); _0 = copy _1`):
-`ptrRvalueOk` excludes integer-to-pointer transmutes (`notInFragment = true`).
-Anneal's `decodeValueFromBytes` checks only `bits != 0` when `prov = .none` and
-returns `5`, whereas MiniRust's `CastOp::Transmute` runs `Value::check` with
-`some m` and immediately raises `"Value::Ptr: non-dereferenceable safe pointer"`. -/
+`ptrRvalueOk` excludes integer-to-pointer transmutes (`notInFragment = true`),
+and both Anneal (`decodeValueFromBytes` safe-reference dereferenceability check)
+and MiniRust (`CastOp::Transmute` `Value::check`) raise UB immediately. -/
 def transmuteDanglingIntToRefDiscrepancy : CapturedMir :=
   ptrBody "witness::transmute_dangling_int_to_ref_discrepancy"
     [u32Decl, u32Decl, usizeDecl, refSharedU32Decl]
@@ -2792,12 +2786,11 @@ theorem transmuteDanglingIntToRefDiscrepancy_translate :
 theorem transmuteDanglingIntToRefDiscrepancy_notInFragment :
     inFragment transmuteDanglingIntToRefDiscrepancy = false := by decide +kernel
 
-theorem transmuteDanglingIntToRefDiscrepancy_anneal_ret :
-    ReachesRet (mirTree transmuteDanglingIntToRefDiscrepancy
-      (initMachineState transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩,
-        (initMachineState transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩]).memory)) :=
-  runA_sound transmuteDanglingIntToRefDiscrepancy 20 _ _ _ rfl
+theorem transmuteDanglingIntToRefDiscrepancy_anneal_ub :
+    ∃ tr u, Reaches (mirTree transmuteDanglingIntToRefDiscrepancy
+      (initMachineState transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u :=
+  faultsA_sound transmuteDanglingIntToRefDiscrepancy 20 _ (by decide)
 
 theorem transmuteDanglingIntToRefDiscrepancy_minirust_ub :
     ubAfter transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩] 5 =

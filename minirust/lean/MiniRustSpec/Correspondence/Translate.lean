@@ -377,6 +377,21 @@ inductive TupleSpec : Type where
 
 mutual
 
+/-- Canonical zero-initialized `MirSemantics.Value` of shape `TupleSpec`,
+matching the runtime `.aggregate 0 vals` arities of `TupleSpec.valOk`. -/
+def TupleSpec.zeroVal : TupleSpec → MirSemantics.Value
+  | .scalar it => .scalar ⟨0, it.size.bytes⟩
+  | .tuple fields _ _ => .aggregate 0 (TupleSpec.zeroFieldVals fields)
+
+/-- Pointwise `TupleSpec.zeroVal` across tuple/struct fields. -/
+def TupleSpec.zeroFieldVals : List (Nat × TupleSpec) → List MirSemantics.Value
+  | [] => []
+  | (_, s) :: rest => s.zeroVal :: TupleSpec.zeroFieldVals rest
+
+end
+
+mutual
+
 /-- Boolean equality on `TupleSpec`. -/
 def TupleSpec.beq : TupleSpec → TupleSpec → Bool
   | .scalar it1, .scalar it2 => decide (it1 = it2)
@@ -472,6 +487,14 @@ def TupleSpec.fieldsWf (size align : Nat) : List (Nat × TupleSpec) → Bool
 
 end
 
+/-- Whether a captured `TypeLayout` has non-union `FieldsShape` (`minimize` and
+`TupleSpec` only translate single-variant structs `FieldsShape.arbitrary`, never
+unions `FieldsShape.union`). -/
+def isNonUnionTypeLayout (l : Layout.TypeLayout) : Bool :=
+  match l.fields with
+  | .union _ => false
+  | _ => true
+
 mutual
 
 /-- `minimize`'s tuple and struct layout extraction (`tooling/minimize/src/ty.rs`):
@@ -518,7 +541,7 @@ def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Op
     let l ← Layout.LayoutTable.lookup layouts layoutIdx
     match l.variants, l.isUninhabited, l.fields with
     | .single 0, false, .arbitrary offsets _ =>
-      if offsets.length = fieldKinds.length then do
+      if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
         pure (.tuple fields l.size.bytes l.align.bytes)
       else none
@@ -527,7 +550,7 @@ def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Op
     let l ← Layout.LayoutTable.lookup layouts layoutIdx
     match l.variants, l.isUninhabited, l.fields with
     | .single 0, false, .arbitrary offsets _ =>
-      if offsets.length = fieldKinds.length then do
+      if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
         pure (.tuple fields l.size.bytes l.align.bytes)
       else none
@@ -4126,6 +4149,97 @@ def bodyAddrTakenLocals (body : MirAst.CapturedMir) : List Nat :=
       | .assign _ rv => (directBorrowOf rv).map (·.2.local_)
       | _ => none
 
+/-- All places `q` directly borrowed via `.rawPtr` or `.ref` anywhere in `body`. -/
+def bodyDirectBorrowPlaces (body : MirAst.CapturedMir) : List MirAst.Place :=
+  body.basicBlocks.flatMap fun bb =>
+    bb.statements.filterMap fun s =>
+      match s.kind with
+      | .assign _ rv => (directBorrowOf rv).map (·.2)
+      | _ => none
+
+/-- Canonical zero-initialized `MirSemantics.Value` for a fragment `LocalDecl`. -/
+def canonicalDeclVal (layouts : Layout.LayoutTable) (d : MirAst.LocalDecl) : MirSemantics.Value :=
+  match intTypeOf d.ty with
+  | some it => .scalar ⟨0, it.size.bytes⟩
+  | none =>
+    match arrayTypeOf d.ty with
+    | some (elemIt, count) => .aggregate 0 (List.replicate count (.scalar ⟨0, elemIt.size.bytes⟩))
+    | none =>
+      match tupleTypeOf layouts d.ty with
+      | some (fields, size, align) => (TupleSpec.tuple fields size align).zeroVal
+      | none => .unit
+
+/-- Static consistency of `body.layouts` and `body.localDecls` with `minimize`'s
+pointer, target-alignment, stride, and byte-offset rules across all pointer
+locals and directly borrowed places in `body`. -/
+def ptrDeclLayoutsOk (body : MirAst.CapturedMir) : Bool :=
+  let decls := body.localDecls
+  let layouts := body.layouts
+  let canonLocals : List MirSemantics.LocalSlot :=
+    decls.map (fun d => .init (canonicalDeclVal layouts d))
+  let borrowPlaces := bodyDirectBorrowPlaces body
+  (List.range decls.length).all (fun p =>
+    match decls[p]? with
+    | none => true
+    | some dp =>
+      match ptrPointeeOf dp.ty with
+      | none => true
+      | some (_, pointeeIt) =>
+        match MirSemantics.placeTyResolved decls layouts ⟨p, [.deref]⟩ with
+        | none => false
+        | some pTy =>
+          let rAccTy := MirSemantics.resolveTyWithLocalDecls decls layouts pTy
+          decide (MirSemantics.tyScalarBytes rAccTy = some pointeeIt.size.bytes) &&
+          decide (MirSemantics.tyByteSize decls layouts pTy = some pointeeIt.size.bytes) &&
+          decide (MirSemantics.tyByteSize decls layouts rAccTy = some pointeeIt.size.bytes) &&
+          (match rAccTy.kind with
+           | .bool | .char | .never => false
+           | _ => true) &&
+          borrowPlaces.all (fun q =>
+            match decls[q.local_]? with
+            | none => true
+            | some dk =>
+              let qEntry : MirSemantics.BorrowEntry :=
+                { tag := 0, targetLocal := q.local_, targetProjection := q.projection,
+                  perm := .active }
+              MirSemantics.checkTargetPlaceAlign decls layouts (some pTy)
+                qEntry ⟨0, 0⟩ (some (canonicalDeclVal layouts dk)) &&
+              MirSemantics.checkTargetPlaceAlign decls layouts (some rAccTy)
+                qEntry ⟨0, 0⟩ (some (canonicalDeclVal layouts dk)))) &&
+  borrowPlaces.all (fun q =>
+    match decls[q.local_]?, ptrTargetSpec layouts decls q with
+    | some dk, some (pointeeIt, relOff) =>
+      let qEntry : MirSemantics.BorrowEntry :=
+        { tag := 0, targetLocal := q.local_, targetProjection := q.projection, perm := .active }
+      decide (MirSemantics.borrowPlaceByteOffset? canonLocals [] decls layouts qEntry =
+        some relOff) &&
+      match q.projection with
+      | [] =>
+        decide (MirSemantics.tyByteSize decls layouts
+          (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty) = some pointeeIt.size.bytes)
+      | [.constantIndex _ _ _] =>
+        decide (MirSemantics.resolveSeqContainerElemByteStride decls layouts q.local_ [] [] =
+          pointeeIt.size.bytes) &&
+        match MirSemantics.placeTyResolved decls layouts q with
+        | some projTy =>
+          decide (MirSemantics.tyByteSize decls layouts projTy = some pointeeIt.size.bytes)
+        | none => false
+      | .field _ _ :: _ =>
+        (match tupleTypeOf layouts dk.ty with
+         | some (_, size, _) =>
+           decide (MirSemantics.tyByteSize decls layouts
+             (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty) = some size) &&
+           decide (MirSemantics.projectionChainByteOffset? layouts
+             (some (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty))
+             (some (canonicalDeclVal layouts dk)) none 0 decls q.projection = some relOff)
+         | none => false) &&
+        match MirSemantics.placeTyResolved decls layouts q with
+        | some projTy =>
+          decide (MirSemantics.tyByteSize decls layouts projTy = some pointeeIt.size.bytes)
+        | none => false
+      | _ => true
+    | _, _ => true)
+
 /-- Whether `s` neither directly writes/deinits/changes storage of any local in
 `addrLocals` nor moves out any local in `addrLocals`. -/
 def stmtPreservesAddrTaken (addrLocals : List Nat) (s : MirAst.Statement) : Bool :=
@@ -4568,6 +4682,7 @@ per-borrow Tree Borrows tags with MiniRust's flat byte-level `BasicMemory`
 def ptrAliasingOk (body : MirAst.CapturedMir) : Bool :=
   let addrLocals := bodyAddrTakenLocals body
   let n := body.localDecls.length
+  ptrDeclLayoutsOk body &&
   addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
   body.basicBlocks.all (fun bb =>
     bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
@@ -4588,7 +4703,8 @@ type (`scalarTypeOf`), a thin raw pointer or reference to an integer (`isPtrTy`)
 a homogeneous 1D integer array whose byte size fits in signed 64-bit `isize`
 (`< 2 ^ 63`), or a well-formed tuple / single-variant struct (`TupleSpec.wf`). -/
 def localDeclOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (d : MirAst.LocalDecl) : Bool :=
-  (scalarTypeOf d.ty).isSome || isPtrTy d.ty ||
+  (scalarTypeOf d.ty).isSome ||
+  (isPtrTy d.ty && decide (MirSemantics.layoutPointerBytes layouts = 8)) ||
   match arrayTypeOf d.ty with
   | some (elemIt, count) => decide (count * elemIt.size.bytes < 2 ^ 63)
   | none =>
@@ -4660,7 +4776,7 @@ def exposeCastOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rva
     decide (it = usizeIt) &&
     decide (intTypeOf targetTy = some usizeIt) &&
     decide (p < decls.length) &&
-    (decls[p]? >>= (ptrPointeeOf ·.ty)).isSome
+    (decls[p]? >>= (rawPtrPointeeOf ·.ty)).isSome
   | _ => false
 
 /-- Fragment rvalue check for `CastKind::PointerWithExposedProvenance(op, targetTy)`
@@ -4771,7 +4887,7 @@ def exposeSourcesOf (body : MirAst.CapturedMir) (e : Nat) :
     | .assign ⟨e', []⟩ (.cast .pointerExposeProvenance op _) =>
       if e' = e then
         some (match copyOp op with
-          | .copy ⟨p, []⟩ => body.localDecls[p]? >>= (ptrPointeeOf ·.ty)
+          | .copy ⟨p, []⟩ => body.localDecls[p]? >>= (rawPtrPointeeOf ·.ty)
           | _ => none)
       else none
     | _ => none
@@ -6140,6 +6256,7 @@ with `ptrAliasingOk` when `body` contains no returning `Call` terminators
 def ptrAliasingProgOk (body : MirAst.CapturedMir) : Bool :=
   let addrLocals := bodyAddrTakenLocals body
   let n := body.localDecls.length
+  ptrDeclLayoutsOk body &&
   addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
   body.basicBlocks.all (fun bb =>
     bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
@@ -6757,12 +6874,51 @@ private theorem termPreservesAddrTaken_nil (t : MirAst.Terminator) :
     cases opMoved op <;> rfl
   | _ => rfl
 
+private theorem bodyDirectBorrowPlaces_eq_nil_of_scalar {body : MirAst.CapturedMir}
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    bodyDirectBorrowPlaces body = [] := by
+  unfold bodyDirectBorrowPlaces
+  rw [List.flatMap_eq_nil_iff]
+  intro bb hbb
+  rw [List.filterMap_eq_nil_iff]
+  intro s hs
+  have h0 := progStatementOk_not_directBorrow_of_scalar hsc (hbbs bb hbb s hs)
+  cases sk : s.kind with
+  | assign _ rv =>
+    rw [sk] at h0
+    dsimp only at h0 ⊢
+    cases hdb : directBorrowOf rv with
+    | none => rfl
+    | some _ => simp [hdb] at h0
+  | _ => rfl
+
+private theorem ptrDeclLayoutsOk_of_scalar {body : MirAst.CapturedMir}
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    ptrDeclLayoutsOk body = true := by
+  unfold ptrDeclLayoutsOk
+  rw [bodyDirectBorrowPlaces_eq_nil_of_scalar hsc hbbs]
+  simp only [List.all_nil, Bool.and_true, List.all_eq_true]
+  intro p _
+  cases hd : body.localDecls[p]? with
+  | none => rfl
+  | some dp =>
+    have hf := isPtrTy_false_of_scalarTypeOf (hsc dp (List.mem_of_getElem? hd))
+    simp only [isPtrTy] at hf
+    cases hpt : ptrPointeeOf dp.ty with
+    | none => dsimp only; rw [hpt]
+    | some _ => simp [hpt] at hf
+
 theorem ptrAliasingProgOk_of_scalar (body : MirAst.CapturedMir)
     (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
     (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
       progStatementOk body.localDecls s body.layouts = true) :
     ptrAliasingProgOk body = true := by
   dsimp only [ptrAliasingProgOk]
+  rw [ptrDeclLayoutsOk_of_scalar hsc hbbs]
   rw [bodyAddrTakenLocals_eq_nil_of_scalar hsc hbbs]
   rw [ptrProgEnvAtEntry_of_scalar 0 hsc hbbs]
   have hsub_self : subsumesPtrEnv body.localDecls.length
@@ -7280,7 +7436,7 @@ theorem bodyInProgFragmentWithIntrinsics_implies_crossFrameTranslatable
     h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, hptr⟩, htr⟩ := h
   simp only [ptrAliasingProgOk, bodyAddrTakenLocals_provCastAliasView, Bool.and_eq_true,
     List.all_eq_true] at hptr
-  obtain ⟨⟨⟨hat_arg, hpres⟩, _⟩, _⟩ := hptr
+  obtain ⟨⟨⟨⟨_, hat_arg⟩, hpres⟩, _⟩, _⟩ := hptr
   have hat_arg' : ∀ k ∈ bodyAddrTakenLocals body, decide (1 ≤ k ∧ k ≤ body.argCount) = true := by
     intro k hk
     have hk' := hat_arg k hk

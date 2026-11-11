@@ -2764,7 +2764,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   offsetDeref3_minirust_direct
   offsetDerefMax_minirust_direct
   misaligned_notInFragment
-  misaligned_anneal_ret
+  misaligned_anneal_ub
   misaligned_minirust_direct
   exposeTwice_translate
   exposeTwice_notInFragment
@@ -2988,7 +2988,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   offsetDeref3_minirust_direct
   offsetDerefMax_minirust_direct
   misaligned_notInFragment
-  misaligned_anneal_ret
+  misaligned_anneal_ub
   misaligned_minirust_direct
   exposeTwice_translate
   exposeTwice_notInFragment
@@ -3182,7 +3182,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   uninitRefReborrowUb_outcome
   uninitRefReborrowUb_minirust_direct
   misalignedRef_notInFragment
-  misalignedRef_anneal_ret
+  misalignedRef_anneal_ub
   misalignedRef_minirust_direct
   danglingRef_notInFragment
   danglingRef_anneal_ret
@@ -3363,7 +3363,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteSharedRefToMutWriteDiscrepancy_minirust_direct
   transmuteDanglingIntToRefDiscrepancy_translate
   transmuteDanglingIntToRefDiscrepancy_notInFragment
-  transmuteDanglingIntToRefDiscrepancy_anneal_ret
+  transmuteDanglingIntToRefDiscrepancy_anneal_ub
   transmuteDanglingIntToRefDiscrepancy_minirust_ub
   treeBorrowsChildWritePreservesParent
   treeBorrowsFrozenAndDisabledUb
@@ -3619,7 +3619,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   uninitRefReborrowUb_outcome
   uninitRefReborrowUb_minirust_direct
   misalignedRef_notInFragment
-  misalignedRef_anneal_ret
+  misalignedRef_anneal_ub
   misalignedRef_minirust_direct
   danglingRef_notInFragment
   danglingRef_anneal_ret
@@ -3800,7 +3800,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteSharedRefToMutWriteDiscrepancy_minirust_direct
   transmuteDanglingIntToRefDiscrepancy_translate
   transmuteDanglingIntToRefDiscrepancy_notInFragment
-  transmuteDanglingIntToRefDiscrepancy_anneal_ret
+  transmuteDanglingIntToRefDiscrepancy_anneal_ub
   transmuteDanglingIntToRefDiscrepancy_minirust_ub
   treeBorrowsChildWritePreservesParent
   treeBorrowsFrozenAndDisabledUb
@@ -4401,7 +4401,7 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeTwice_three_way_divergence
   int2ptrForgedTag_inFragmentWithIntrinsicsA1
   int2ptrForgedTag_notInFragmentWithIntrinsics
-  int2ptrForgedTag_anneal_ret
+  int2ptrForgedTag_anneal_ub
   int2ptrForgedTag_minirust_direct
   int2ptrForgedTag_tb_direct
   int2ptrForgedTag_three_way_divergence
@@ -4412,6 +4412,7 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_A1_divergence
   int2ptrRawRoundTripOk_anneal_ret
   int2ptrRoundTripOk_three_way
+  int2ptrRawRoundTripOk_annealExposeRoundTripOk
   int2ptrUnexposedDerefUb_anneal_ub
   int2ptrUnexposedUb_three_way
   int2ptrAdjacentArgsAmbiguous_inFragmentWithIntrinsics
@@ -4774,7 +4775,7 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeTwice_three_way_divergence
   int2ptrForgedTag_inFragmentWithIntrinsicsA1
   int2ptrForgedTag_notInFragmentWithIntrinsics
-  int2ptrForgedTag_anneal_ret
+  int2ptrForgedTag_anneal_ub
   int2ptrForgedTag_minirust_direct
   int2ptrForgedTag_tb_direct
   int2ptrForgedTag_three_way_divergence
@@ -4785,6 +4786,7 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSharedRefWriteUb_A1_divergence
   int2ptrRawRoundTripOk_anneal_ret
   int2ptrRoundTripOk_three_way
+  int2ptrRawRoundTripOk_annealExposeRoundTripOk
   int2ptrUnexposedDerefUb_anneal_ub
   int2ptrUnexposedUb_three_way
   int2ptrAdjacentArgsAmbiguous_inFragmentWithIntrinsics
