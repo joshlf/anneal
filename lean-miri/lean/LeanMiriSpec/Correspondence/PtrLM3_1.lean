@@ -2259,4 +2259,778 @@ theorem LocalRelLM3_1.of_setLiveAllocation_ne
       exact .base (.indirect slot mp cl hc hnd
         (hmp.of_setLiveAllocation_ne hfind hset (hne mp rfl)))
 
+
+/-! ### Narrower / Sub-Slice Scalar Read & Write Correspondence (`LM-3.1` D3/D5) -/
+
+private def leBytesList (x n : Nat) : List UInt8 :=
+  (List.range' 0 n).map fun i => UInt8.ofNat ((x / 2 ^ (8 * i)) % 256)
+
+private def leListVal : List UInt8 → Nat
+  | [] => 0
+  | b :: bs => b.toNat + 256 * leListVal bs
+
+private theorem leListVal_lt (bs : List UInt8) :
+    leListVal bs < 2 ^ (8 * bs.length) := by
+  induction bs with
+  | nil => decide
+  | cons b bs ih =>
+    have hb : b.toNat < 256 := b.toBitVec.isLt
+    simp only [leListVal, List.length_cons]
+    rw [show 8 * (bs.length + 1) = 8 + 8 * bs.length by omega, Nat.pow_add]
+    have h256 : (2 : Nat) ^ 8 = 256 := rfl
+    rw [h256]
+    omega
+
+private theorem range'_zero_succ_map {α : Type} (n : Nat) (f : Nat → α) :
+    (List.range' 0 (n + 1)).map f = f 0 :: (List.range' 0 n).map (fun i => f (i + 1)) := by
+  rw [List.range'_succ, List.map_cons]
+  congr 1
+  have hshift : ∀ m k, (List.range' (k + 1) m).map f =
+      (List.range' k m).map (fun i => f (i + 1)) := by
+    intro m
+    induction m with
+    | zero => intro k; rfl
+    | succ m ih =>
+      intro k
+      rw [List.range'_succ, List.range'_succ, List.map_cons, List.map_cons, ih (k + 1)]
+  exact hshift n 0
+
+private theorem leBytesList_succ (x n : Nat) :
+    leBytesList x (n + 1) = UInt8.ofNat (x % 256) :: leBytesList (x / 256) n := by
+  unfold leBytesList
+  rw [range'_zero_succ_map]
+  simp only [Nat.mul_zero, Nat.pow_zero, Nat.div_one]
+  congr 2
+  funext i
+  congr 2
+  rw [show 8 * (i + 1) = 8 + 8 * i by omega, Nat.pow_add, show (2 : Nat) ^ 8 = 256 from rfl,
+    Nat.div_div_eq_div_mul]
+
+private theorem leBytesList_length (x n : Nat) : (leBytesList x n).length = n := by
+  simp [leBytesList]
+
+private theorem leListVal_leBytesList (x n : Nat) :
+    leListVal (leBytesList x n) = x % 2 ^ (8 * n) := by
+  induction n generalizing x with
+  | zero => simp [leBytesList, leListVal, Nat.mod_one]
+  | succ n ih =>
+    rw [leBytesList_succ, leListVal, ih (x / 256)]
+    have hb : (UInt8.ofNat (x % 256)).toNat = x % 256 := by
+      rw [UInt8.toNat_ofNat', Nat.mod_eq_of_lt (Nat.mod_lt _ (by decide))]
+    have hstep : x % 256 + 256 * (x / 256 % 2 ^ (8 * n)) = x % (256 * 2 ^ (8 * n)) := by
+      rw [Nat.mul_comm 256 (2 ^ (8 * n)), ← Nat.mod_mul_left_div_self,
+        Nat.mul_comm (2 ^ (8 * n)) 256]
+      have hmod : x % 256 = x % (256 * 2 ^ (8 * n)) % 256 :=
+        (Nat.mod_mul_right_mod x 256 (2 ^ (8 * n))).symm
+      rw [hmod, Nat.mod_add_div]
+    rw [hb, show 8 * (n + 1) = 8 + 8 * n by omega, Nat.pow_add,
+      show (2 : Nat) ^ 8 = 256 from rfl, hstep]
+
+private theorem leBytesList_leListVal (bs : List UInt8) :
+    leBytesList (leListVal bs) bs.length = bs := by
+  induction bs with
+  | nil => rfl
+  | cons b bs ih =>
+    simp only [List.length_cons, leBytesList_succ, leListVal]
+    have hblt : b.toNat < 256 := b.toBitVec.isLt
+    have hmod : (b.toNat + 256 * leListVal bs) % 256 = b.toNat := by omega
+    have hdiv : (b.toNat + 256 * leListVal bs) / 256 = leListVal bs := by omega
+    rw [hmod, hdiv, ih]
+    congr 1
+    exact UInt8.ofNat_toNat
+
+private theorem leBytesList_drop (x n off : Nat) (hle : off ≤ n) :
+    (leBytesList x n).drop off = leBytesList (x / 2 ^ (8 * off)) (n - off) := by
+  induction off generalizing x n with
+  | zero => simp
+  | succ k ih =>
+    cases n with
+    | zero => omega
+    | succ m =>
+      rw [leBytesList_succ, List.drop_succ_cons, ih (x / 256) m (by omega)]
+      simp only [Nat.succ_sub_succ_eq_sub]
+      congr 1
+      rw [show 8 * (k + 1) = 8 + 8 * k by omega, Nat.pow_add, show (2 : Nat) ^ 8 = 256 from rfl,
+        Nat.div_div_eq_div_mul]
+
+private theorem leBytesList_take (x n len : Nat) (hle : len ≤ n) :
+    (leBytesList x n).take len = leBytesList x len := by
+  induction len generalizing x n with
+  | zero => simp [leBytesList]
+  | succ k ih =>
+    cases n with
+    | zero => omega
+    | succ m =>
+      rw [leBytesList_succ, leBytesList_succ, List.take_succ_cons, ih (x / 256) m (by omega)]
+
+private theorem ptrAlloc_decode_any_loop
+    (f : Nat → Nat → Except Miri.Memory.AllocError (ForInStep Nat)) :
+    ∀ (bs : List UInt8) (k acc : Nat),
+      (∀ i s (hi : i < bs.length),
+        f (k + i) s = .ok (.yield (s + (bs[i]'hi).toNat * 2 ^ (8 * (k + i))))) →
+      forIn (List.range' k bs.length) acc f =
+        .ok (acc + leListVal bs * 2 ^ (8 * k)) := by
+  intro bs
+  induction bs with
+  | nil => intro k acc _; simp [leListVal, pure, Except.pure]
+  | cons b bs ih =>
+    intro k acc hf
+    have h0 := hf 0 acc (by simp)
+    simp only [Nat.add_zero, List.getElem_cons_zero] at h0
+    rw [List.length_cons, List.range'_succ, List.forIn_cons, h0]
+    rw [show (Except.ok (ForInStep.yield (acc + b.toNat * 2 ^ (8 * k))) :
+        Except Miri.Memory.AllocError (ForInStep Nat)) = pure (ForInStep.yield _) from rfl,
+      pure_bind]
+    simp only []
+    rw [ih (k + 1) (acc + b.toNat * 2 ^ (8 * k)) (fun i s hi => by
+      have h1 := hf (i + 1) s (by simp; omega)
+      simpa [Nat.add_right_comm, Nat.add_assoc] using h1)]
+    simp only [leListVal]
+    congr 1
+    rw [show 8 * (k + 1) = 8 + 8 * k by omega, Nat.pow_add, show (2 : Nat) ^ 8 = 256 from rfl,
+      Nat.add_mul, Nat.mul_assoc, Nat.add_assoc]
+    congr 2
+    rw [Nat.mul_left_comm]
+
+private theorem ptrAlloc_readTargetUInt_any (arr : Array UInt8) (hn : arr.size ≤ 16) :
+    ptrAlloc_readTargetUInt annealTargetDataLayout arr =
+      .ok (BitVec.ofNat 128 (leListVal arr.toList)) := by
+  have small : ¬ arr.size > 16 := by omega
+  have hendian : (annealTargetDataLayout.endian == Miri.ABI.Endian.little) = true := rfl
+  have hlen : arr.size = arr.toList.length := Array.length_toList.symm
+  unfold ptrAlloc_readTargetUInt
+  simp only [small, ↓reduceIte, Std.Legacy.Range.forIn_eq_forIn_range',
+    hendian, Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  rw [hlen, ptrAlloc_decode_any_loop _ arr.toList 0 0 ?hf]
+  · simp [pure, Except.pure, bind, Except.bind]
+  · intro i s hi
+    have hlt_a : i < arr.size := by rw [hlen]; exact hi
+    simp [Nat.zero_add, Array.getElem?_eq_getElem hlt_a, pure, Except.pure]
+
+private theorem encodeLittleEndianBytes_eq_leBytesList (x n : Nat) :
+    encodeLittleEndianBytes x n none =
+      (leBytesList x n).map (fun b => AbstractByte.init b none) := by
+  induction n generalizing x with
+  | zero => rfl
+  | succ n ih =>
+    rw [leBytesList_succ, List.map_cons]
+    dsimp only [encodeLittleEndianBytes]
+    have hdiv : Nat.div x 256 = x / 256 := rfl
+    rw [hdiv, ih (x / 256)]
+    congr 2
+    apply UInt8.toNat_inj.mp
+    simp [UInt8.toNat_ofNat']
+
+private theorem decodeLittleEndianBytes_map_init (bs : List UInt8) :
+    decodeLittleEndianBytes (bs.map (fun b => AbstractByte.init b none)) =
+      some (leListVal bs, none) := by
+  induction bs with
+  | nil => rfl
+  | cons b bs ih =>
+    dsimp only [List.map, decodeLittleEndianBytes]
+    rw [ih]
+    rfl
+
+private theorem writeAbstractBytesAt_map_init (bs ws : List UInt8) (off : Nat)
+    (hbound : off + ws.length ≤ bs.length) :
+    writeAbstractBytesAt
+        (bs.map (fun b => AbstractByte.init b none))
+        off
+        (ws.map (fun b => AbstractByte.init b none)) =
+      some ((bs.take off ++ ws ++ bs.drop (off + ws.length)).map
+        (fun b => AbstractByte.init b none)) := by
+  induction bs generalizing off ws with
+  | nil =>
+    have hw0 : ws = [] := by cases ws <;> simp at hbound ⊢
+    subst hw0
+    simp [writeAbstractBytesAt]
+  | cons b bs ih =>
+    cases off with
+    | zero =>
+      cases ws with
+      | nil => simp [writeAbstractBytesAt]
+      | cons w ws =>
+        simp only [List.length_cons] at hbound
+        dsimp only [List.map, writeAbstractBytesAt]
+        rw [ih ws 0 (by omega)]
+        simp [List.take]
+    | succ off =>
+      cases ws with
+      | nil =>
+        dsimp only [List.map, writeAbstractBytesAt]
+        simp [List.take]
+      | cons w ws =>
+        simp only [List.length_cons] at hbound
+        dsimp only [List.map, writeAbstractBytesAt]
+        have hstep := ih (w :: ws) off (by simp; omega)
+        dsimp only [List.map] at hstep
+        rw [hstep]
+        simp [List.take, Nat.succ_add]
+
+private theorem scalarPow2_eq (k : Nat) : scalarPow2 k = 2 ^ k := by
+  induction k with
+  | zero => rfl
+  | succ k ih =>
+    unfold scalarPow2
+    rw [ih, Nat.pow_succ, Nat.mul_comm]
+    rfl
+
+theorem extractScalarSlice?_eq_of_inbounds
+    (sc : MirAst.ScalarInt) (off reqBytes : Nat)
+    (hpos : 1 ≤ reqBytes) (hinb : off + reqBytes ≤ sc.sizeBytes)
+    (hcan : sc.bits < scalarModulus sc.sizeBytes) :
+    extractScalarSlice? sc off reqBytes =
+      some ⟨(sc.bits / 2 ^ (8 * off)) % scalarModulus reqBytes, reqBytes⟩ := by
+  unfold extractScalarSlice?
+  have hb1 : Nat.ble 1 reqBytes = true := Nat.ble_eq.mpr hpos
+  have hb2 : Nat.ble (Nat.add off reqBytes) sc.sizeBytes = true := Nat.ble_eq.mpr hinb
+  rw [hb1, hb2, Bool.true_and]
+  cases hfull : Bool.and (Nat.beq off 0) (Nat.beq reqBytes sc.sizeBytes)
+  · dsimp only [shiftRightUnsignedBits]
+    have hmul : Nat.mul 8 off = 8 * off := rfl
+    have hdiv : Nat.div sc.bits (scalarPow2 (8 * off)) = sc.bits / 2 ^ (8 * off) := by
+      rw [← scalarPow2_eq]; rfl
+    rw [hmul, hdiv, wrapScalarBits_eq_mod]
+  · simp only [Bool.and_eq_true, Nat.beq_eq] at hfull
+    obtain ⟨hoff0, hsz_eq⟩ := hfull
+    subst hoff0 hsz_eq
+    simp only [Nat.mul_zero, Nat.pow_zero, Nat.div_one, Nat.mod_eq_of_lt hcan]
+
+theorem spliceScalarSlice?_eq_of_inbounds
+    (oldSc patchSc : MirAst.ScalarInt) (off : Nat)
+    (hpos : 1 ≤ patchSc.sizeBytes)
+    (hinb : off + patchSc.sizeBytes ≤ oldSc.sizeBytes)
+    (hcan_patch : patchSc.bits < scalarModulus patchSc.sizeBytes) :
+    let mergedList :=
+      (leBytesList oldSc.bits oldSc.sizeBytes).take off ++
+        leBytesList patchSc.bits patchSc.sizeBytes ++
+        (leBytesList oldSc.bits oldSc.sizeBytes).drop (off + patchSc.sizeBytes)
+    spliceScalarSlice? oldSc off patchSc =
+      some ⟨leListVal mergedList, oldSc.sizeBytes⟩ ∧
+    mergedList.length = oldSc.sizeBytes ∧
+    leListVal mergedList < scalarModulus oldSc.sizeBytes := by
+  intro mergedList
+  have hlen_m : mergedList.length = oldSc.sizeBytes := by
+    simp only [mergedList, List.length_append, List.length_take, List.length_drop,
+      leBytesList_length]
+    omega
+  have hlt_m : leListVal mergedList < scalarModulus oldSc.sizeBytes := by
+    rw [ptrAlloc_scalarModulus_eq_two_pow, ← hlen_m]
+    exact leListVal_lt mergedList
+  refine ⟨?_, hlen_m, hlt_m⟩
+  unfold spliceScalarSlice?
+  have hb1 : Nat.ble 1 patchSc.sizeBytes = true := Nat.ble_eq.mpr hpos
+  have hb2 : Nat.ble (Nat.add off patchSc.sizeBytes) oldSc.sizeBytes = true := Nat.ble_eq.mpr hinb
+  rw [hb1, hb2, Bool.true_and]
+  cases hfull : Bool.and (Nat.beq off 0) (Nat.beq patchSc.sizeBytes oldSc.sizeBytes)
+  · dsimp only []
+    rw [encodeLittleEndianBytes_eq_leBytesList, encodeLittleEndianBytes_eq_leBytesList,
+      writeAbstractBytesAt_map_init _ _ _ (by simp [leBytesList_length]; exact hinb)]
+    dsimp only []
+    rw [decodeLittleEndianBytes_map_init, leBytesList_length]
+  · simp only [Bool.and_eq_true, Nat.beq_eq] at hfull
+    obtain ⟨hoff0, hsz_eq⟩ := hfull
+    subst hoff0
+    have hdrop : (leBytesList oldSc.bits oldSc.sizeBytes).drop (0 + patchSc.sizeBytes) = [] := by
+      rw [Nat.zero_add, hsz_eq, List.drop_eq_nil_of_le (by simp [leBytesList_length])]
+    have hm_eq : mergedList = leBytesList patchSc.bits patchSc.sizeBytes := by
+      dsimp only [mergedList]
+      rw [hdrop]
+      simp
+    rw [hm_eq, leListVal_leBytesList, ← ptrAlloc_scalarModulus_eq_two_pow,
+      Nat.mod_eq_of_lt hcan_patch]
+    cases patchSc; dsimp only at hsz_eq ⊢; subst hsz_eq; rfl
+
+private theorem uint64_ofNat_toNat_small (n : Nat) (hn : n ≤ 16) :
+    (UInt64.ofNat n).toNat = n := by
+  rw [UInt64.toNat_ofNat']
+  exact Nat.mod_eq_of_lt (by omega)
+
+private theorem ptrAlloc_allocRange_end_at (off sz : Nat) (h16 : off + sz ≤ 16) :
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat sz))).endExclusive =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + sz))) := by
+  have hle : UInt64.ofNat off ≤ UInt64.ofNat off + UInt64.ofNat sz := by
+    rw [← UInt64.ofNat_add, UInt64.le_iff_toNat_le,
+      uint64_ofNat_toNat_small off (by omega),
+      uint64_ofNat_toNat_small (off + sz) h16]
+    omega
+  have hnot_lt : ¬ (UInt64.ofNat off + UInt64.ofNat sz < UInt64.ofNat off) :=
+    UInt64.not_lt.mpr hle
+  unfold Miri.Memory.AllocRange.endExclusive Miri.Memory.AllocRange.end Miri.Memory.allocRange
+    Miri.ABI.Size.add
+  simp [Miri.ABI.Size.ofBytes, hnot_lt, Except.mapError, UInt64.ofNat_add]
+
+private theorem translateSizeBytes_eq_ofBytes (n : Nat) (hv : ValidScalarBytes n) :
+    translateSizeBytes n = Miri.ABI.Size.ofBytes (UInt64.ofNat n) := by
+  rcases hv with rfl | rfl | rfl | rfl | rfl <;> rfl
+
+private theorem validScalarBytes_pos_le16 {n : Nat} (hv : ValidScalarBytes n) :
+    1 ≤ n ∧ n ≤ 16 := by
+  rcases hv with rfl | rfl | rfl | rfl | rfl <;> decide
+
+private theorem initMask_new_true_setRange_inbounds (sz off w : Nat) (h16 : off + w ≤ sz)
+    (hsz16 : sz ≤ 16) :
+    let fullSz := Miri.ABI.Size.ofBytes (UInt64.ofNat sz)
+    let r := Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat w))
+    (Miri.Memory.InitMask.new fullSz true).setRange r true =
+      .ok (Miri.Memory.InitMask.new fullSz true) := by
+  intro fullSz r
+  have hend := ptrAlloc_allocRange_end_at off w (by omega)
+  have hle_u : UInt64.ofNat (off + w) ≤ UInt64.ofNat sz := by
+    rw [UInt64.le_iff_toNat_le, uint64_ofNat_toNat_small _ (by omega),
+      uint64_ofNat_toNat_small _ (by omega)]
+    exact h16
+  have hnot_lt : ¬ (UInt64.ofNat sz < UInt64.ofNat (off + w)) := UInt64.not_lt.mpr hle_u
+  simp only [Miri.Memory.InitMask.setRange, Miri.Memory.InitMask.new, r, fullSz, hend,
+    bind, Except.bind, pure, Except.pure, BEq.rfl, ↓reduceIte, GT.gt]
+  split
+  · rename_i hfull
+    have heq_sz : UInt64.ofNat (off + w) = UInt64.ofNat sz :=
+      UInt64.le_antisymm hle_u hfull.2
+    rw [heq_sz]
+  · simp [Miri.ABI.Size.ofBytes, -UInt64.ofNat_add, hnot_lt]
+
+private theorem ptrAlloc_raw_eq_of_readScalar_zero {E : Type}
+    {oldSc : MirAst.ScalarInt} {msc_old : Miri.Memory.ScalarInt}
+    (hrel_old : ScalarRel oldSc msc_old)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes oldSc.sizeBytes) A)
+    (hinit : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+      .ok (.ok ()))
+    (hread_old : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) false =
+      .ok (.fromScalarInt msc_old)) :
+    (ptrAlloc_raw A).toList = leBytesList oldSc.bits oldSc.sizeBytes ∧
+    A.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes oldSc.sizeBytes) true := by
+  obtain ⟨hpos_old, hle16_old⟩ := validScalarBytes_pos_le16 hrel_old.validBytes
+  have hts_eq := translateSizeBytes_eq_ofBytes oldSc.sizeBytes hrel_old.validBytes
+  have hsz_toNat : (translateSizeBytes oldSc.sizeBytes).bytes.toNat = oldSc.sizeBytes := by
+    rw [hts_eq]; exact uint64_ofNat_toNat_small _ hle16_old
+  have hend0 : (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+      (translateSizeBytes oldSc.sizeBytes)).endExclusive =
+      .ok (translateSizeBytes oldSc.sizeBytes) := by
+    change (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat 0))
+      (translateSizeBytes oldSc.sizeBytes)).endExclusive = _
+    rw [hts_eq]
+    simpa [Nat.zero_add] using ptrAlloc_allocRange_end_at 0 oldSc.sizeBytes (by omega)
+  have hmask_true : A.initializationMask =
+      Miri.Memory.InitMask.new (translateSizeBytes oldSc.sizeBytes) true := by
+    obtain ⟨b, hb⟩ := hshape.initMask_lazy
+    cases b with
+    | true => exact hb
+    | false =>
+      have hun := Miri.Memory.InitMask.lazy_uninitialized_query
+        (translateSizeBytes oldSc.sizeBytes) _ _ hend0 (UInt64.le_refl _)
+      rw [← hb, hinit] at hun
+      cases hun
+  refine ⟨?_, hmask_true⟩
+  have hr := hread_old
+  rw [ptrAlloc_readScalar_eq] at hr
+  unfold ptrAlloc_readScalar at hr
+  have hraw_len_eq : (ptrAlloc_raw A).size = A.len := rfl
+  have hlen_raw : (ptrAlloc_raw A).size = oldSc.sizeBytes := by
+    rw [hraw_len_eq, hshape.len_eq, hsz_toNat]
+  have hslice0' : ptrAlloc_checkedSlice A
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+      .ok (ptrAlloc_raw A) := by
+    unfold ptrAlloc_checkedSlice
+    simp only [hshape.byteSize_eq, hsz_toNat, hlen_raw, bne_self_eq_false, Bool.false_eq_true,
+      ↓reduceIte, hend0, Except.mapError, bind, Except.bind]
+    have hnot_z : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes <
+        (translateSizeBytes oldSc.sizeBytes).bytes) :=
+      UInt64.not_lt.mpr (UInt64.le_refl _)
+    have hnot_0 : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes < (0 : UInt64)) :=
+      UInt64.not_lt.mpr UInt64.zero_le
+    have hextr : (ptrAlloc_raw A).extract 0 oldSc.sizeBytes = ptrAlloc_raw A := by
+      rw [← hlen_raw]
+      exact Array.extract_eq_self_of_le (Nat.le_refl _)
+    simp only [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, GT.gt, hnot_0, hnot_z,
+      decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte, UInt64.toNat_zero,
+      hextr, pure, Except.pure]
+  have hlen_l : (ptrAlloc_raw A).toList.length = oldSc.sizeBytes := by
+    rw [Array.length_toList, hlen_raw]
+  have hcan_a : leListVal (ptrAlloc_raw A).toList < scalarModulus oldSc.sizeBytes := by
+    rw [ptrAlloc_scalarModulus_eq_two_pow, ← hlen_l]; exact leListVal_lt _
+  obtain ⟨msc_a, htry_a, hrel_a⟩ :=
+    tryFromUInt_of_valid_canonical
+      (sc := ⟨leListVal (ptrAlloc_raw A).toList, oldSc.sizeBytes⟩)
+      hrel_old.validBytes hcan_a
+  have hfrom_a : Miri.Memory.Scalar.fromUInt (Prov := AnnealProv)
+      (BitVec.ofNat 128 (leListVal (ptrAlloc_raw A).toList))
+      (translateSizeBytes oldSc.sizeBytes) = .ok (.fromScalarInt msc_a) := by
+    unfold Miri.Memory.Scalar.fromUInt
+    simp [htry_a, Except.mapError, bind, Except.bind, pure, Except.pure]
+  have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+  simp only [hinit, Except.mapError, bind, Except.bind, ptrAlloc_getBytesUnchecked_eq,
+    hslice0', ptrAlloc_readTargetUInt_any (ptrAlloc_raw A) (by omega),
+    Bool.false_eq_true, ↓reduceIte, hoff_addr] at hr
+  dsimp only [Miri.Memory.allocRange] at hr
+  rw [hfrom_a] at hr
+  unfold Miri.Memory.Scalar.fromScalarInt at hr
+  injection hr with hr
+  injection hr with hr
+  injection hr with hr
+  have hdata : leListVal (ptrAlloc_raw A).toList = oldSc.bits := by
+    have hd := (hrel_a.data_eq.symm.trans (congrArg Miri.Memory.ScalarInt.data hr)).trans
+      hrel_old.data_eq
+    have hlt1 : leListVal (ptrAlloc_raw A).toList < 2 ^ 128 := by
+      have h1 := hcan_a; rw [ptrAlloc_scalarModulus_eq_two_pow] at h1
+      have h2 : 2 ^ (8 * oldSc.sizeBytes) ≤ 2 ^ 128 := Nat.pow_le_pow_right (by decide) (by omega)
+      omega
+    have hlt2 : oldSc.bits < 2 ^ 128 := by
+      have h1 := hrel_old.canonical; rw [ptrAlloc_scalarModulus_eq_two_pow] at h1
+      have h2 : 2 ^ (8 * oldSc.sizeBytes) ≤ 2 ^ 128 := Nat.pow_le_pow_right (by decide) (by omega)
+      omega
+    have hv := congrArg BitVec.toNat hd
+    simpa [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt1, Nat.mod_eq_of_lt hlt2] using hv
+  rw [← leBytesList_leListVal (ptrAlloc_raw A).toList, hdata, hlen_l]
+
+theorem StackScalarAllocShape.readScalar_subrange {E : Type}
+    {oldSc : MirAst.ScalarInt} {msc_old : Miri.Memory.ScalarInt}
+    (hrel_old : ScalarRel oldSc msc_old)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes oldSc.sizeBytes) A)
+    (hinit : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+      .ok (.ok ()))
+    (hread_old : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) false =
+      .ok (.fromScalarInt msc_old))
+    (off accBytes : Nat) (hv_acc : ValidScalarBytes accBytes)
+    (hinb : off + accBytes ≤ oldSc.sizeBytes) :
+    ∃ (subSc : MirAst.ScalarInt) (msc_sub : Miri.Memory.ScalarInt),
+      extractScalarSlice? oldSc off accBytes = some subSc ∧
+      subSc = ⟨(oldSc.bits / 2 ^ (8 * off)) % scalarModulus accBytes, accBytes⟩ ∧
+      ScalarRel subSc msc_sub ∧
+      A.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+          (translateSizeBytes accBytes)) false =
+        .ok (.fromScalarInt msc_sub) := by
+  obtain ⟨hraw_list, hmask_true⟩ := ptrAlloc_raw_eq_of_readScalar_zero hrel_old hshape hinit hread_old
+  obtain ⟨hpos_acc, hle16_acc⟩ := validScalarBytes_pos_le16 hv_acc
+  obtain ⟨_, hle16_old⟩ := validScalarBytes_pos_le16 hrel_old.validBytes
+  let subSc : MirAst.ScalarInt :=
+    ⟨(oldSc.bits / 2 ^ (8 * off)) % scalarModulus accBytes, accBytes⟩
+  have hcan_sub : subSc.bits < scalarModulus subSc.sizeBytes := by
+    dsimp only [subSc]
+    rw [ptrAlloc_scalarModulus_eq_two_pow]
+    exact Nat.mod_lt _ (Nat.two_pow_pos _)
+  obtain ⟨msc_sub, htry_sub, hrel_sub⟩ :=
+    tryFromUInt_of_valid_canonical (sc := subSc) hv_acc hcan_sub
+  refine ⟨subSc, msc_sub,
+    extractScalarSlice?_eq_of_inbounds oldSc off accBytes hpos_acc hinb hrel_old.canonical,
+    rfl, hrel_sub, ?_⟩
+  have hts_old := translateSizeBytes_eq_ofBytes oldSc.sizeBytes hrel_old.validBytes
+  have hts_acc := translateSizeBytes_eq_ofBytes accBytes hv_acc
+  have hend : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (translateSizeBytes accBytes)).endExclusive =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + accBytes))) := by
+    rw [hts_acc]; exact ptrAlloc_allocRange_end_at off accBytes (by omega)
+  have hle_end : (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + accBytes))).bytes ≤
+      (translateSizeBytes oldSc.sizeBytes).bytes := by
+    rw [hts_old]; simp only [Miri.ABI.Size.ofBytes, UInt64.le_iff_toNat_le,
+      uint64_ofNat_toNat_small (off + accBytes) (by omega),
+      uint64_ofNat_toNat_small oldSc.sizeBytes hle16_old]
+    exact hinb
+  have hinit_sub : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (translateSizeBytes accBytes)) = .ok (.ok ()) := by
+    rw [hmask_true]
+    exact Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend hle_end
+  have hsz_old_nat : (translateSizeBytes oldSc.sizeBytes).bytes.toNat = oldSc.sizeBytes := by
+    rw [hts_old]; exact uint64_ofNat_toNat_small _ hle16_old
+  have hraw_len_eq : (ptrAlloc_raw A).size = A.len := rfl
+  have hlen_raw : (ptrAlloc_raw A).size = oldSc.sizeBytes := by
+    rw [hraw_len_eq, hshape.len_eq, hsz_old_nat]
+  have hle_start : UInt64.ofNat off ≤ UInt64.ofNat (off + accBytes) := by
+    rw [UInt64.le_iff_toNat_le, uint64_ofNat_toNat_small _ (by omega),
+      uint64_ofNat_toNat_small _ (by omega)]
+    omega
+  have hnot_gt1 : ¬ (UInt64.ofNat (off + accBytes) < UInt64.ofNat off) :=
+    UInt64.not_lt.mpr hle_start
+  have hnot_gt2 : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes < UInt64.ofNat (off + accBytes)) :=
+    UInt64.not_lt.mpr hle_end
+  have hslice : ptrAlloc_checkedSlice A
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (translateSizeBytes accBytes)) =
+      .ok ((ptrAlloc_raw A).extract off (off + accBytes)) := by
+    unfold ptrAlloc_checkedSlice
+    simp only [hshape.byteSize_eq, hsz_old_nat, hlen_raw, bne_self_eq_false, Bool.false_eq_true,
+      ↓reduceIte, hend, Except.mapError, bind, Except.bind]
+    simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, GT.gt, hnot_gt1, hnot_gt2,
+      decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte,
+      uint64_ofNat_toNat_small off (by omega),
+      uint64_ofNat_toNat_small (off + accBytes) (by omega), pure, Except.pure]
+  have hextr_list : ((ptrAlloc_raw A).extract off (off + accBytes)).toList =
+      leBytesList (oldSc.bits / 2 ^ (8 * off)) accBytes := by
+    rw [Array.toList_extract, List.extract_eq_take_drop, hraw_list,
+      leBytesList_drop _ _ _ (by omega),
+      show off + accBytes - off = accBytes by omega,
+      leBytesList_take _ _ _ (by omega)]
+  have hextr_sz : ((ptrAlloc_raw A).extract off (off + accBytes)).size ≤ 16 := by
+    rw [← Array.length_toList, hextr_list, leBytesList_length]
+    exact hle16_acc
+  have hval_extr : leListVal ((ptrAlloc_raw A).extract off (off + accBytes)).toList =
+      subSc.bits := by
+    rw [hextr_list, leListVal_leBytesList, ← ptrAlloc_scalarModulus_eq_two_pow accBytes]
+  have hfrom_sub : Miri.Memory.Scalar.fromUInt (Prov := AnnealProv)
+      (BitVec.ofNat 128 subSc.bits) (translateSizeBytes accBytes) =
+      .ok (.fromScalarInt msc_sub) := by
+    unfold Miri.Memory.Scalar.fromUInt
+    simp [subSc, htry_sub, Except.mapError, bind, Except.bind, pure, Except.pure]
+  have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+  rw [ptrAlloc_readScalar_eq]
+  unfold ptrAlloc_readScalar
+  simp only [hinit_sub, Except.mapError, bind, Except.bind, ptrAlloc_getBytesUnchecked_eq,
+    hslice, ptrAlloc_readTargetUInt_any _ hextr_sz, hval_extr,
+    Bool.false_eq_true, ↓reduceIte, hoff_addr]
+  dsimp only [Miri.Memory.allocRange]
+  rw [hfrom_sub]
+
+theorem StackScalarAllocShape.writeScalar_subrange {E : Type}
+    {oldSc wSc : MirAst.ScalarInt} {msc_old msc_w : Miri.Memory.ScalarInt}
+    (hrel_old : ScalarRel oldSc msc_old)
+    (hrel_w : ScalarRel wSc msc_w)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes oldSc.sizeBytes) A)
+    (hinit : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+      .ok (.ok ()))
+    (hread_old : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) false =
+      .ok (.fromScalarInt msc_old))
+    (off : Nat) (hinb : off + wSc.sizeBytes ≤ oldSc.sizeBytes) :
+    ∃ (alloc' : Miri.Memory.Allocation AnnealProv E)
+      (mergedSc : MirAst.ScalarInt) (msc_merged : Miri.Memory.ScalarInt),
+      spliceScalarSlice? oldSc off wSc = some mergedSc ∧
+      mergedSc.sizeBytes = oldSc.sizeBytes ∧
+      ScalarRel mergedSc msc_merged ∧
+      Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) msc_w.size)
+        (.fromScalarInt msc_w) A = .ok () alloc' ∧
+      alloc'.align = A.align ∧
+      StackScalarAllocShape (translateSizeBytes oldSc.sizeBytes) alloc' ∧
+      alloc'.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+        .ok (.ok ()) ∧
+      alloc'.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) false =
+        .ok (.fromScalarInt msc_merged) := by
+  obtain ⟨hraw_list, hmask_true⟩ := ptrAlloc_raw_eq_of_readScalar_zero hrel_old hshape hinit hread_old
+  obtain ⟨hpos_w, hle16_w⟩ := validScalarBytes_pos_le16 hrel_w.validBytes
+  obtain ⟨_, hle16_old⟩ := validScalarBytes_pos_le16 hrel_old.validBytes
+  obtain ⟨hspl, hlen_m, hcan_m⟩ :=
+    spliceScalarSlice?_eq_of_inbounds oldSc wSc off hpos_w hinb hrel_w.canonical
+  let mergedList :=
+    (leBytesList oldSc.bits oldSc.sizeBytes).take off ++
+      leBytesList wSc.bits wSc.sizeBytes ++
+      (leBytesList oldSc.bits oldSc.sizeBytes).drop (off + wSc.sizeBytes)
+  let mergedSc : MirAst.ScalarInt := ⟨leListVal mergedList, oldSc.sizeBytes⟩
+  obtain ⟨msc_merged, htry_m, hrel_m⟩ :=
+    tryFromUInt_of_valid_canonical (sc := mergedSc) hrel_old.validBytes hcan_m
+  have hts_old := translateSizeBytes_eq_ofBytes oldSc.sizeBytes hrel_old.validBytes
+  have hts_w := translateSizeBytes_eq_ofBytes wSc.sizeBytes hrel_w.validBytes
+  have hsz_old_nat : (translateSizeBytes oldSc.sizeBytes).bytes.toNat = oldSc.sizeBytes := by
+    rw [hts_old]; exact uint64_ofNat_toNat_small _ hle16_old
+  have hsz_w_nat : (translateSizeBytes wSc.sizeBytes).bytes.toNat = wSc.sizeBytes := by
+    rw [hts_w]; exact uint64_ofNat_toNat_small _ hle16_w
+  have hend_w : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (translateSizeBytes wSc.sizeBytes)).endExclusive =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + wSc.sizeBytes))) := by
+    rw [hts_w]; exact ptrAlloc_allocRange_end_at off wSc.sizeBytes (by omega)
+  have hend0 : (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+      (translateSizeBytes oldSc.sizeBytes)).endExclusive =
+      .ok (translateSizeBytes oldSc.sizeBytes) := by
+    change (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat 0))
+      (translateSizeBytes oldSc.sizeBytes)).endExclusive = _
+    rw [hts_old]
+    simpa [Nat.zero_add] using ptrAlloc_allocRange_end_at 0 oldSc.sizeBytes (by omega)
+  have hraw_len_eq : (ptrAlloc_raw A).size = A.len := rfl
+  have hlen_raw : (ptrAlloc_raw A).size = oldSc.sizeBytes := by
+    rw [hraw_len_eq, hshape.len_eq, hsz_old_nat]
+  have hle_start : UInt64.ofNat off ≤ UInt64.ofNat (off + wSc.sizeBytes) := by
+    rw [UInt64.le_iff_toNat_le, uint64_ofNat_toNat_small _ (by omega),
+      uint64_ofNat_toNat_small _ (by omega)]; omega
+  have hle_end : UInt64.ofNat (off + wSc.sizeBytes) ≤ (translateSizeBytes oldSc.sizeBytes).bytes := by
+    rw [hts_old]; simp only [Miri.ABI.Size.ofBytes, UInt64.le_iff_toNat_le,
+      uint64_ofNat_toNat_small (off + wSc.sizeBytes) (by omega),
+      uint64_ofNat_toNat_small oldSc.sizeBytes hle16_old]; exact hinb
+  have hnot_gt1 : ¬ (UInt64.ofNat (off + wSc.sizeBytes) < UInt64.ofNat off) :=
+    UInt64.not_lt.mpr hle_start
+  have hnot_gt2 : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes <
+      UInt64.ofNat (off + wSc.sizeBytes)) :=
+    UInt64.not_lt.mpr hle_end
+  have hslice_w : Miri.Memory.Allocation.getBytesUnchecked A
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (translateSizeBytes wSc.sizeBytes)) =
+      .ok ((ptrAlloc_raw A).extract off (off + wSc.sizeBytes)) := by
+    rw [ptrAlloc_getBytesUnchecked_eq]
+    unfold ptrAlloc_checkedSlice
+    simp only [hshape.byteSize_eq, hsz_old_nat, hlen_raw, bne_self_eq_false, Bool.false_eq_true,
+      ↓reduceIte, hend_w, Except.mapError, bind, Except.bind]
+    simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, GT.gt, hnot_gt1, hnot_gt2,
+      decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte,
+      uint64_ofNat_toNat_small off (by omega),
+      uint64_ofNat_toNat_small (off + wSc.sizeBytes) (by omega),
+      pure, Except.pure]
+  have hmask_set : A.initializationMask.setRange
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (translateSizeBytes wSc.sizeBytes)) true =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes oldSc.sizeBytes) true) := by
+    rw [hmask_true, hts_old, hts_w]
+    exact initMask_new_true_setRange_inbounds oldSc.sizeBytes off wSc.sizeBytes hinb hle16_old
+  have hconv_w :
+      (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc_w).toBitsOrPtrInternal
+          (translateSizeBytes wSc.sizeBytes) = .ok (.bits (BitVec.ofNat 128 wSc.bits)) := by
+    unfold Miri.Memory.Scalar.toBitsOrPtrInternal
+    simp only [Miri.Memory.Scalar.fromScalarInt, hrel_w.toBits_eq, Except.mapError, bind,
+      Except.bind, pure, Except.pure]
+  have htoNat_w : (BitVec.ofNat 128 wSc.bits).toNat = wSc.bits := by
+    rw [BitVec.toNat_ofNat]
+    apply Nat.mod_eq_of_lt
+    have h1 := hrel_w.canonical
+    rw [ptrAlloc_scalarModulus_eq_two_pow] at h1
+    have h2 : 2 ^ (8 * wSc.sizeBytes) ≤ 2 ^ 128 := Nat.pow_le_pow_right (by decide) (by omega)
+    omega
+  have htarget_bytes_w :
+      ptrAlloc_targetUIntBytes annealTargetDataLayout
+        (translateSizeBytes wSc.sizeBytes) (BitVec.ofNat 128 wSc.bits) =
+        .ok (leBytesList wSc.bits wSc.sizeBytes).toArray := by
+    have small : ¬ (translateSizeBytes wSc.sizeBytes).bytes > 16 := by
+      rw [hts_w]
+      simp only [Miri.ABI.Size.ofBytes, GT.gt, UInt64.lt_iff_toNat_lt,
+        uint64_ofNat_toNat_small wSc.sizeBytes hle16_w]
+      have h16_u : (16 : UInt64).toNat = 16 := rfl
+      rw [h16_u]; omega
+    have hendian : (annealTargetDataLayout.endian == Miri.ABI.Endian.little) = true := rfl
+    unfold ptrAlloc_targetUIntBytes
+    simp only [small, ↓reduceIte, Std.Legacy.Range.forIn_eq_forIn_range', hendian,
+      Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, bind_pure,
+      hsz_w_nat, htoNat_w]
+    have henc : ∀ (l : List Nat) (acc : Array UInt8),
+        forIn (m := Except Miri.Memory.AllocError) l acc
+          (fun index (r : Array UInt8) => pure (ForInStep.yield
+            (r.push (UInt8.ofNat (wSc.bits / 2 ^ (8 * index) % 256))))) =
+          .ok (acc ++ (l.map fun i => UInt8.ofNat (wSc.bits / 2 ^ (8 * i) % 256)).toArray) := by
+      intro l
+      induction l with
+      | nil => intro acc; simp [pure, Except.pure]
+      | cons i l ih =>
+        intro acc
+        rw [List.forIn_cons, pure_bind]
+        simp only []
+        rw [ih]
+        congr 1; apply Array.toList_inj.mp; simp
+    rw [henc]
+    simp [leBytesList]
+  rcases hshape with ⟨hsz_A, hlen_A, hmut_A, hprov_A, _⟩
+  unfold Miri.Memory.Allocation.getBytesUnchecked at hslice_w
+  unfold Miri.Memory.Allocation.initializationMask at hmask_set
+  unfold Miri.Memory.Allocation.provenanceMap at hprov_A
+  obtain ⟨alloc', hw_ok, halign', hsz', hlen_out, hmut', hprov', hmask', hraw'⟩ :
+      ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+        Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) msc_w.size)
+          (.fromScalarInt msc_w) A = .ok () alloc' ∧
+        alloc'.align = A.align ∧
+        alloc'.byteSize = translateSizeBytes oldSc.sizeBytes ∧
+        alloc'.len = (translateSizeBytes oldSc.sizeBytes).bytes.toNat ∧
+        alloc'.mutability = .Mut ∧
+        alloc'.provenanceMap = Miri.Memory.ProvenanceMap.new ∧
+        alloc'.initializationMask =
+          Miri.Memory.InitMask.new (translateSizeBytes oldSc.sizeBytes) true ∧
+        (ptrAlloc_raw alloc').toList = mergedList := by
+    rw [hrel_w.size_eq]
+    have hrange_sz :
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+          (translateSizeBytes wSc.sizeBytes)).size = translateSizeBytes wSc.sizeBytes := rfl
+    unfold Miri.Memory.Allocation.writeScalar
+    simp only [hmut_A, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hrange_sz, hconv_w,
+      pure_bind]
+    rw [hslice_w]
+    simp only [hmask_set]
+    rw [hprov_A, Miri.Memory.ProvenanceMap.clear_new _ _ _ _ (by decide) hend_w]
+    simp only []
+    split
+    · rename_i data hdata
+      have hdata' : ptrAlloc_targetUIntBytes annealTargetDataLayout
+          (translateSizeBytes wSc.sizeBytes) (BitVec.ofNat 128 wSc.bits) = .ok data := hdata
+      rw [htarget_bytes_w] at hdata'
+      injection hdata' with hd_eq
+      subst hd_eq
+      have hstart_nat : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+          (translateSizeBytes wSc.sizeBytes)).start.bytes.toNat = off :=
+        uint64_ofNat_toNat_small _ (by omega)
+      have hdata_sz : (leBytesList wSc.bits wSc.sizeBytes).toArray.size = wSc.sizeBytes := by
+        simp [leBytesList_length]
+      have hlen_A' := hlen_A; unfold Miri.Memory.Allocation.len at hlen_A'
+      have hsz_A' := hsz_A; unfold Miri.Memory.Allocation.byteSize at hsz_A'
+      cases A
+      dsimp only [ptrAlloc_raw] at hlen_A' hsz_A' hlen_raw hraw_list ⊢
+      split
+      · rename_i hbad
+        exfalso
+        simp only [Array.size_append, Array.size_extract, hstart_nat, hdata_sz, hsz_A',
+          hlen_raw, hsz_old_nat, bne_iff_ne, ne_eq] at hbad
+        omega
+      · refine ⟨_, rfl, rfl, hsz_A', ?_, rfl, rfl, rfl, ?_⟩
+        · simp only [Miri.Memory.Allocation.len, Array.size_append, Array.size_extract,
+            hstart_nat, hdata_sz, hlen_raw, hsz_old_nat]
+          omega
+        · simp only [Array.toList_append, Array.toList_extract,
+            List.extract_eq_take_drop, hstart_nat, hsz_w_nat,
+            hlen_raw, hraw_list]
+          have hdrop_all :
+              List.take (oldSc.sizeBytes - (off + wSc.sizeBytes))
+                ((leBytesList oldSc.bits oldSc.sizeBytes).drop (off + wSc.sizeBytes)) =
+              (leBytesList oldSc.bits oldSc.sizeBytes).drop (off + wSc.sizeBytes) := by
+            apply List.take_of_length_le
+            simp [List.length_drop, leBytesList_length]
+          simp [mergedList, List.drop_zero, Nat.sub_zero, hdrop_all]
+    · rename_i err herr
+      have herr' : ptrAlloc_targetUIntBytes annealTargetDataLayout
+          (translateSizeBytes wSc.sizeBytes) (BitVec.ofNat 128 wSc.bits) = .error err := herr
+      rw [htarget_bytes_w] at herr'
+      cases herr'
+  refine ⟨alloc', mergedSc, msc_merged, hspl, rfl, hrel_m, hw_ok, halign',
+    ⟨hsz', hlen_out, hmut', hprov', ⟨true, hmask'⟩⟩, ?_, ?_⟩
+  · rw [hmask']
+    exact Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend0 (UInt64.le_refl _)
+  · have hlen_raw' : (ptrAlloc_raw alloc').size = oldSc.sizeBytes := by
+      rw [← Array.length_toList, hraw', hlen_m]
+    have hslice0 : ptrAlloc_checkedSlice alloc'
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes oldSc.sizeBytes)) =
+        .ok (ptrAlloc_raw alloc') := by
+      unfold ptrAlloc_checkedSlice
+      simp only [hsz', hsz_old_nat, hlen_raw', bne_self_eq_false, Bool.false_eq_true,
+        ↓reduceIte, hend0, Except.mapError, bind, Except.bind]
+      have hnot_0 : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes < (0 : UInt64)) :=
+        UInt64.not_lt.mpr UInt64.zero_le
+      have hnot_z : ¬ ((translateSizeBytes oldSc.sizeBytes).bytes <
+          (translateSizeBytes oldSc.sizeBytes).bytes) :=
+        UInt64.not_lt.mpr (UInt64.le_refl _)
+      have hextr : (ptrAlloc_raw alloc').extract 0 oldSc.sizeBytes = ptrAlloc_raw alloc' := by
+        rw [← hlen_raw']
+        exact Array.extract_eq_self_of_le (Nat.le_refl _)
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, GT.gt, hnot_0, hnot_z,
+        decide_false, Bool.or_self, Bool.false_eq_true, ↓reduceIte, UInt64.toNat_zero,
+        hextr, pure, Except.pure]
+    have hfrom_m : Miri.Memory.Scalar.fromUInt (Prov := AnnealProv)
+        (BitVec.ofNat 128 (leListVal mergedList)) (translateSizeBytes oldSc.sizeBytes) =
+        .ok (.fromScalarInt msc_merged) := by
+      unfold Miri.Memory.Scalar.fromUInt
+      simp [mergedSc, htry_m, Except.mapError, bind, Except.bind, pure, Except.pure]
+    have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+    have hextr_sz' : (ptrAlloc_raw alloc').size ≤ 16 := by omega
+    rw [ptrAlloc_readScalar_eq]
+    unfold ptrAlloc_readScalar
+    rw [hmask', Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend0 (UInt64.le_refl _)]
+    simp only [Except.mapError, bind, Except.bind, ptrAlloc_getBytesUnchecked_eq, hslice0,
+      ptrAlloc_readTargetUInt_any _ hextr_sz', hraw', Bool.false_eq_true, ↓reduceIte, hoff_addr]
+    dsimp only [Miri.Memory.allocRange]
+    rw [hfrom_m]
+
 end LeanMiriSpec.Correspondence
