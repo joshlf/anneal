@@ -1246,9 +1246,15 @@ written only by `PointerExposeProvenance`, read only by
 `PointerWithExposedProvenance` at the exposed pointer's pointee and without
 adding mutability, and never otherwise observed; no forged addresses) and
 `ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
-pointer copy: Anneal exposes the canonical stack address of the borrowed place,
-records the tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?`
-recovers the same tag).
+pointer copy: Anneal exposes the canonical stack address
+`canonicalLocalAddr entry.targetLocal relOff` of the borrowed place, records the
+tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?` recovers the same
+tag; `AnnealExposeRoundTripOk.of_structural` derives this Anneal-side round-trip
+obligation from `BorrowsOk`, `ExposeTargetSlotOk`, and `NoCompetingExposedBorrow`
+so all `ProvenanceRel.*_from_frameOk` theorems — and their unexposed
+`exposedTags = []` specializations `expose_then_withExposed_unexposed_from_frameOk`
+and `assume_then_expose_then_withExposed_closed_unexposed_from_frameOk` — require
+no opaque `hart` hypothesis).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
 without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
 `int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected

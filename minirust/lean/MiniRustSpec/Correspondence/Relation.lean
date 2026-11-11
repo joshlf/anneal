@@ -563,6 +563,7 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d body.layouts) (itOf d body.layouts)
   baseLow : BaseLow ctx
   borrows : s.memory.borrows = []
+  nextTag_pos : 0 < s.memory.nextTag := by decide
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
   protectors : s.memory.activeProtectors = []
@@ -931,6 +932,13 @@ theorem ProvenanceRel.exposed_alloc_live {body : CapturedMir} {ctx : Ctx} {s : M
   obtain ⟨tag, _, htgt⟩ := hrel.sound p hp
   exact htgt.toExposedAllocOk
 
+/-- Canonical 64-bit byte address assigned by Anneal (`MirSemantics.ptrAddress?`
+/ `MirSemantics.borrowBaseAddress?` at `ptrBytes = 8`) to a stack borrow entry
+targeting `targetLocal` at sub-place byte offset `relOff`:
+`(stackLocalAddrPageBase 8 + targetLocal) * 65536 + relOff`. -/
+def canonicalLocalAddr (targetLocal relOff : Nat) : Nat :=
+  (MirSemantics.stackLocalAddrPageBase 8 + targetLocal) * 65536 + relOff
+
 /-- Coupling invariant for an exposed-address `usize` local `e` written by
 `PointerExposeProvenance`: in Anneal, slot `e` holds `.init (.scalar ⟨fullAddr, 8⟩)`
 (`fullAddr < 2^64`) with `pv.allocId` recorded in `s.memory.exposedAllocIds` and
@@ -940,7 +948,7 @@ with `setContains m.intptrcast.exposed p = true`, and `tAddr` lies within `p`'s
 live allocation `[a.addr, a.addr + a.size]`. -/
 structure ExposedLocalRel (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
     (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov)
-    (fullAddr : Nat := 1048576 * 65536) : Prop where
+    (fullAddr : Nat) : Prop where
   slot_eq : view[e]? = some (.init (.scalar ⟨fullAddr, 8⟩))
   addr_lt : fullAddr < 2 ^ 64
   recover_eq : ∀ (localsPost : List LocalSlot),
@@ -983,7 +991,7 @@ theorem ExposedLocalRel.candidate_mem {body : CapturedMir} {ctx : Ctx}
 loading `localName e` in `m` succeeds and returns `(.Int tAddr, .Int usizeIt)`. -/
 structure ExposedLocalSynced (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
     (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov)
-    (fullAddr : Nat := 1048576 * 65536) :
+    (fullAddr : Nat) :
     Prop extends ExposedLocalRel body ctx view s m e pv tAddr p fullAddr where
   load_ok : ∃ m_load,
     evalValue m (.Load (.Local (localName e))) =
@@ -1246,6 +1254,7 @@ structure MultiStartRel (entry : CapturedMir) (callees : List CapturedMir)
   baseLow : BaseLow rootCtx
   calleesEq : s.memory.callees = callees
   borrows : s.memory.borrows = []
+  nextTag_pos : 0 < s.memory.nextTag := by decide
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
   protectors : s.memory.activeProtectors = []

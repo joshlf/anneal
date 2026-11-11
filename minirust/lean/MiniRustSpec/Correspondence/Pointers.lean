@@ -4647,7 +4647,10 @@ theorem LocalsOkA.extend_ptrTargets {body : CapturedMir} {ctx1 ctx2 : Ctx} {al :
 invariant for `StateRelN`. -/
 structure BorrowsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
     (s : MachineState) (lm : Map Gen.LocalName Ptr) : Prop where
+  nextTag_pos : (∃ d ∈ body.localDecls, isPtrTy d.ty = true) → 0 < s.memory.nextTag
+  tags_pos : ∀ e ∈ s.memory.borrows, 0 < e.tag
   tags_lt : ∀ e ∈ s.memory.borrows, e.tag < s.memory.nextTag
+  tags_nodup : (s.memory.borrows.map (·.tag)).Nodup
   entries_ok : ∀ e ∈ s.memory.borrows,
     ∃ (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) (relOff : Nat),
       (e = { rawPtrEntry e.tag mutbl ⟨e.targetLocal, e.targetProjection⟩ with
@@ -4660,7 +4663,7 @@ structure BorrowsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
       e.targetLocal ∈ bodyAddrTakenLocals body ∧
       ptrTargetSpec body.layouts body.localDecls ⟨e.targetLocal, e.targetProjection⟩ =
         some (pointeeIt, relOff)
-  entries_place : inFragment body = true → ∀ e ∈ s.memory.borrows,
+  entries_place : ∀ e ∈ s.memory.borrows,
     ⟨e.targetLocal, e.targetProjection⟩ ∈ bodyDirectBorrowPlaces body
   target_init : inFragment body = true → ∀ k ∈ bodyAddrTakenLocals body,
     ∃ v, view[k]? = some (.init v)
@@ -4733,9 +4736,53 @@ theorem BorrowsOk.usable_of_not_disabled {body : CapturedMir} {ctx : Ctx}
     | frozen => exact absurd hpe hnf
     | disabled => exact absurd hpe hndis'
 
+theorem lookupBorrow_split_of_nodup {borrows : List BorrowEntry} {tag : Nat} {entry : BorrowEntry}
+    (hnd : (borrows.map (·.tag)).Nodup)
+    (hlk : lookupBorrow borrows tag = some entry) :
+    ∃ pre suf,
+      borrows = pre ++ entry :: suf ∧
+      entry.tag = tag ∧
+      (∀ b ∈ pre, b.tag ≠ tag) ∧
+      (∀ b ∈ suf, b.tag ≠ tag) := by
+  induction borrows with
+  | nil => simp [lookupBorrow] at hlk
+  | cons e rest ih =>
+    simp only [List.map_cons, List.nodup_cons] at hnd
+    obtain ⟨hnot_mem, hnd_rest⟩ := hnd
+    unfold lookupBorrow at hlk
+    cases hb : Nat.beq e.tag tag with
+    | true =>
+      rw [hb] at hlk
+      simp only [Option.some.injEq] at hlk
+      subst hlk
+      have htag : e.tag = tag := Nat.beq_eq.mp hb
+      refine ⟨[], rest, rfl, htag, (fun _ hm => by cases hm), fun b hb_mem hbt => ?_⟩
+      apply hnot_mem
+      rw [htag, ← hbt]
+      exact List.mem_map_of_mem hb_mem
+    | false =>
+      rw [hb] at hlk
+      have hne : e.tag ≠ tag := fun h => by rw [Nat.beq_eq.mpr h] at hb; cases hb
+      obtain ⟨pre, suf, rfl, htag, hpre, hsuf⟩ := ih hnd_rest hlk
+      refine ⟨e :: pre, suf, rfl, htag, ?_, hsuf⟩
+      intro b hb_mem
+      rcases List.mem_cons.mp hb_mem with rfl | hb_pre
+      · exact hne
+      · exact hpre b hb_pre
+
+theorem BorrowsOk.lookupBorrow_tag_ne_zero {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    (hb : BorrowsOk body ctx view s lm) {tag : Nat} {entry : BorrowEntry}
+    (hlk : lookupBorrow s.memory.borrows tag = some entry) :
+    tag ≠ 0 ∧ 0 < entry.tag ∧ entry.tag = tag := by
+  obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlk
+  have hpos := hb.tags_pos entry hmem
+  exact ⟨by omega, hpos, htag⟩
+
 theorem BorrowsOk.start {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
     {s : MachineState} {lm : Map Gen.LocalName Ptr}
     (hbor : s.memory.borrows = [])
+    (hnext : (∃ d ∈ body.localDecls, isPtrTy d.ty = true) → 0 < s.memory.nextTag)
     (hinit : inFragment body = true → ∀ k ∈ bodyAddrTakenLocals body,
       ∃ v, view[k]? = some (.init v))
     (htgt : inFragment body = true → ∀ k ∈ bodyAddrTakenLocals body,
@@ -4748,9 +4795,12 @@ theorem BorrowsOk.start {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
     (hnoPtr : ∀ (p : Nat) dp pv, body.localDecls[p]? = some dp → isPtrTy dp.ty = true →
       view[p]? ≠ some (.init (.ptr pv 8))) :
     BorrowsOk body ctx view s lm where
+  nextTag_pos := hnext
+  tags_pos e he := by simp [hbor] at he
   tags_lt e he := by simp [hbor] at he
+  tags_nodup := by simp [hbor]
   entries_ok e he := by simp [hbor] at he
-  entries_place _ e he := by simp [hbor] at he
+  entries_place e he := by simp [hbor] at he
   target_init := hinit
   target_ptrs := htgt
   alias_ok p _ := (PtrLocalOk.of_empty (fun dp pv hdp hpty => hnoPtr p dp pv hdp hpty)) _
@@ -4769,7 +4819,10 @@ theorem BorrowsOk.advance_keep {body : CapturedMir} {ctx : Ctx} {view : List Loc
       ptrStmtStep body.localDecls env st =
         (List.range body.localDecls.length).map (fun q => env.getD q .disabled)) :
     BorrowsOk body ctx view (advanceStmt s locals' s.memory) lm where
+  nextTag_pos := hb.nextTag_pos
+  tags_pos := hb.tags_pos
   tags_lt := hb.tags_lt
+  tags_nodup := hb.tags_nodup
   entries_ok := hb.entries_ok
   entries_place := hb.entries_place
   target_init := hb.target_init
@@ -4833,7 +4886,10 @@ theorem BorrowsOk.advance_set_nonptr {body : CapturedMir} {ctx : Ctx} {view : Li
     BorrowsOk body ctx (view.set i slot') (advanceStmt s locals' s.memory) lm' := by
   have hb' := hb.advance_keep (locals' := locals') hbb hst hstep
   refine {
+    nextTag_pos := hb'.nextTag_pos
+    tags_pos := hb'.tags_pos
     tags_lt := hb'.tags_lt
+    tags_nodup := hb'.tags_nodup
     entries_ok := hb'.entries_ok
     entries_place := hb'.entries_place
     target_init := fun hfrag k hk => by
@@ -4898,7 +4954,10 @@ theorem BorrowsOk.jump {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
     (target : Nat) (htgt : target ∈ termTargets bb.terminator)
     (locals' : List LocalSlot) :
     BorrowsOk body ctx view (jumpState s target locals') lm :=
-  { tags_lt := hb.tags_lt
+  { nextTag_pos := hb.nextTag_pos
+    tags_pos := hb.tags_pos
+    tags_lt := hb.tags_lt
+    tags_nodup := hb.tags_nodup
     entries_ok := hb.entries_ok
     entries_place := hb.entries_place
     target_init := hb.target_init

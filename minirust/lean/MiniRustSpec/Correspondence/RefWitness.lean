@@ -1469,7 +1469,8 @@ theorem refMutDivZeroUb_minirust_direct :
 /-- Creating an unused `&u32` reference from a misaligned `*const u32`
 (`_6 = &(*_5); _0 = copy _1; return`): unlike a raw borrow `&raw const (*_5)`,
 forming `&*q` checks safe-pointer alignment and raises UB in both MiniRust
-(`"Value::Ptr: unaligned safe pointer"`) and Anneal (`resolveRefDerefTarget?`). -/
+(`"Value::Ptr: unaligned safe pointer"`) and Anneal (`resolveRefDerefTarget?`;
+see `misalignedRef_three_way_ub_agreement` below). -/
 def misalignedRef : CapturedMir :=
   ptrBody "witness::misaligned_ref"
     [u32Decl, u32Decl, ptrConstU32Decl, ptrConstU8Decl, ptrConstU8Decl,
@@ -2771,7 +2772,8 @@ theorem transmuteSharedRefToMutWriteDiscrepancy_minirust_direct :
 dereferencing it (`_2 = 4_usize; _3 = copy _2 as &u32 (Transmute); _0 = copy _1`):
 `ptrRvalueOk` excludes integer-to-pointer transmutes (`notInFragment = true`),
 and both Anneal (`decodeValueFromBytes` safe-reference dereferenceability check)
-and MiniRust (`CastOp::Transmute` `Value::check`) raise UB immediately. -/
+and MiniRust (`CastOp::Transmute` `Value::check`) raise UB immediately
+(see `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement` below). -/
 def transmuteDanglingIntToRefDiscrepancy : CapturedMir :=
   ptrBody "witness::transmute_dangling_int_to_ref_discrepancy"
     [u32Decl, u32Decl, usizeDecl, refSharedU32Decl]

@@ -302,28 +302,51 @@ def int2ptrRawRoundTripOkPreExposeState : MachineState :=
       nextTag := 2 } }
 
 /-- Concrete non-vacuity witness instantiating `AnnealExposeRoundTripOk` on
-`int2ptrRawRoundTripOk` (`pv = ⟨1, 0⟩`, `fullAddr = (stackLocalAddrPageBase 8 + 1) * 65536`). -/
+`int2ptrRawRoundTripOk` (`pv = ⟨1, 0⟩`, `fullAddr = canonicalLocalAddr 1 0`) via
+`AnnealExposeRoundTripOk.of_borrows` (no manual unfolding of
+`recoverExposedPtrValue?` or `findBestExposedStackBorrow`). -/
 theorem int2ptrRawRoundTripOk_annealExposeRoundTripOk :
     AnnealExposeRoundTripOk int2ptrRawRoundTripOk int2ptrRawRoundTripOkPreExposeState
-      ⟨1, 0⟩ ((MirSemantics.stackLocalAddrPageBase 8 + 1) * 65536) where
-  tag_ne_zero := by decide
-  addr_lt := by decide
-  ptr_addr := by
-    intro _ _
-    rfl
-  recover_eq := by
-    intro localsPost hloc
-    have h1 : Trusted.Sequence.get? localsPost 1 = some (.init (.scalar ⟨5, 4⟩)) := by
-      have hb := hloc (rawPtrEntry 1 .mut (local_ 1)) (.head _)
-      simpa [Trusted.Sequence.get?, int2ptrRawRoundTripOkPreExposeState, rawPtrEntry, local_] using hb
-    have hbase : (MirSemantics.stackLocalAddrPageBase 8 + 1) * 65536 = 68719542272 := rfl
-    rw [hbase]
-    unfold MirSemantics.recoverExposedPtrValue? MirSemantics.findBestExposedStackBorrow
-      MirSemantics.borrowPlaceByteOffset? MirSemantics.ptrAllocByteBound? lookupBorrow
-    simp only [int2ptrRawRoundTripOkPreExposeState, initMachineState,
-      MirSemantics.recordExposedAllocId, MirSemantics.isExposedAllocId,
-      rawPtrEntry, local_, MirAst.ProvenancePtr.tag, h1]
-    rfl
+      ⟨1, 0⟩ (canonicalLocalAddr 1 0) :=
+  AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 1 .mut (local_ 1)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun h => absurd rfl h⟩
+    (fun b hb hexp _ => by
+      simp [int2ptrRawRoundTripOkPreExposeState, initMachineState,
+        MirSemantics.isExposedAllocId] at hb hexp)
+
+/-- Multi-borrow pre-exposure state on `int2ptrRawRoundTripOk` where an older
+borrow tag `1` on `_1` is ALREADY in `exposedAllocIds` (`[1]`) with permission
+`.disabled`, while child/reborrow tag `2` on the same local `_1` is `.active`. -/
+def exposeCompetingDisabledParentState : MachineState :=
+  let s0 := initMachineState int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init (.ptr ⟨2, 0⟩ 8), .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 2 .mut (local_ 1),
+                  { rawPtrEntry 1 .mut (local_ 1) with perm := .disabled }]
+      nextTag := 3
+      exposedAllocIds := [1] } }
+
+/-- Structural non-vacuity witness for `NoCompetingExposedBorrow` +
+`AnnealExposeRoundTripOk.of_borrows` when `exposedAllocIds = [1]` is non-empty
+and two borrow tags share the exact same canonical stack local `_1`: tag `2`
+(`.active`, score `3`) strictly outranks the previously exposed `.disabled` tag
+`1` (score `0`), so `recoverExposedPtrValue?` recovers `.ptr ⟨2, 0⟩ 8`. -/
+theorem exposeCompetingDisabledParent_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrRawRoundTripOk exposeCompetingDisabledParentState
+      ⟨2, 0⟩ (canonicalLocalAddr 1 0) :=
+  AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 2 .mut (local_ 1)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun h => absurd rfl h⟩
+    (fun b hb _ hne => by
+      rcases List.mem_cons.mp hb with rfl | hb_tl
+      · exact absurd rfl hne
+      · rcases List.mem_singleton.mp hb_tl with rfl
+        exact .inl (by decide))
 
 /-! ### `int2ptrUnexposedUb` -/
 

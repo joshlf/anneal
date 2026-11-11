@@ -4647,6 +4647,17 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   inFragmentWithIntrinsics_and_singleExpose_implies_prog
   BorrowsOk.after_expose_withExposed
   ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk
+  lookupBorrow_split_of_nodup
+  BorrowsOk.lookupBorrow_tag_ne_zero
+  borrowPlaceByteOffset?_of_ptrTargetSpec
+  canonicalLocalAddr_lt_two_pow_64
+  NoCompetingExposedBorrow.of_same_or_unexposed
+  NoCompetingExposedBorrow.of_unexposed
+  AnnealExposeRoundTripOk.of_borrows
+  AnnealExposeRoundTripOk.of_structural
+  ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_frameOk
+  exposeCompetingDisabledParent_annealExposeRoundTripOk
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 
@@ -5023,6 +5034,17 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   inFragmentWithIntrinsics_and_singleExpose_implies_prog
   BorrowsOk.after_expose_withExposed
   ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk
+  lookupBorrow_split_of_nodup
+  BorrowsOk.lookupBorrow_tag_ne_zero
+  borrowPlaceByteOffset?_of_ptrTargetSpec
+  canonicalLocalAddr_lt_two_pow_64
+  NoCompetingExposedBorrow.of_same_or_unexposed
+  NoCompetingExposedBorrow.of_unexposed
+  AnnealExposeRoundTripOk.of_borrows
+  AnnealExposeRoundTripOk.of_structural
+  ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_frameOk
+  exposeCompetingDisabledParent_annealExposeRoundTripOk
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 

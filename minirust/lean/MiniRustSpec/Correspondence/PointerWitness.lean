@@ -2289,7 +2289,9 @@ def misaligned : CapturedMir :=
 theorem misaligned_notInFragment : inFragment misaligned = false := by decide +kernel
 
 /-- Anneal raises UB: `*q` has `offsetBytes = 1`, which fails `u32` alignment
-(`checkTargetPlaceAlign`), matching MiniRust (`misaligned_minirust_direct`). -/
+(`checkTargetPlaceAlign`), matching MiniRust (`misaligned_minirust_direct`;
+bundled across Anneal, `BasicMemory`, and `TreeBorrowsMemory` in
+`misaligned_three_way_ub_agreement` in `RefWitness.lean`). -/
 theorem misaligned_anneal_ub :
     ∃ tr u, Reaches (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) tr u ∧
       FaultNow u :=
