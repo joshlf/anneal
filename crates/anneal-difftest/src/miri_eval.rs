@@ -386,34 +386,116 @@ const STD_PANIC_MACRO_NAMES: [&str; 12] = [
 ];
 
 /// Staged `src/lib.rs` text indexed by the line range of each top-level `fn`
-/// item and the non-literal token start coordinates in the file, used by
+/// item and the 1-based `(line, col)` start coordinates of every standard
+/// panic or assertion macro invocation, used by
 /// [`compare_difftest_miri_and_anneal`] to decide whether Miri's panic position
 /// is a panic-macro call site inside the evaluated function.
 #[derive(Debug, Clone, Default)]
 pub struct StagedLibSource {
-    lines: Vec<String>,
     fn_lines: BTreeMap<String, (usize, usize)>,
-    token_starts: BTreeSet<(usize, usize)>,
+    panic_macro_starts: BTreeSet<(usize, usize)>,
 }
 
-fn collect_non_literal_token_starts(
+fn is_colon_pair(tokens: &[proc_macro2::TokenTree], idx: usize) -> bool {
+    matches!(
+        (tokens.get(idx), tokens.get(idx + 1)),
+        (
+            Some(proc_macro2::TokenTree::Punct(a)),
+            Some(proc_macro2::TokenTree::Punct(b))
+        ) if a.as_char() == ':'
+            && a.spacing() == proc_macro2::Spacing::Joint
+            && b.as_char() == ':'
+            && b.spacing() == proc_macro2::Spacing::Alone
+    )
+}
+
+fn is_panic_macro_tail(tokens: &[proc_macro2::TokenTree], idx: usize) -> bool {
+    let Some(proc_macro2::TokenTree::Ident(mac)) = tokens.get(idx) else {
+        return false;
+    };
+    if !STD_PANIC_MACRO_NAMES.contains(&mac.to_string().as_str()) {
+        return false;
+    }
+    let Some(proc_macro2::TokenTree::Punct(bang)) = tokens.get(idx + 1) else {
+        return false;
+    };
+    if bang.as_char() != '!' || bang.spacing() != proc_macro2::Spacing::Alone {
+        return false;
+    }
+    matches!(
+        tokens.get(idx + 2),
+        Some(proc_macro2::TokenTree::Group(g))
+            if matches!(
+                g.delimiter(),
+                proc_macro2::Delimiter::Parenthesis
+                    | proc_macro2::Delimiter::Bracket
+                    | proc_macro2::Delimiter::Brace
+            )
+    )
+}
+
+fn is_crate_qualified_panic_macro_tail(tokens: &[proc_macro2::TokenTree], idx: usize) -> bool {
+    let Some(proc_macro2::TokenTree::Ident(krate)) = tokens.get(idx) else {
+        return false;
+    };
+    matches!(krate.to_string().as_str(), "core" | "std")
+        && is_colon_pair(tokens, idx + 1)
+        && is_panic_macro_tail(tokens, idx + 3)
+}
+
+/// Return `true` when `tokens[idx]` is the first token of an invocation of one
+/// of [`STD_PANIC_MACRO_NAMES`], written bare (`assert!(...)`) or through
+/// `core::` / `std::` (optionally rooted with `::`), and is not preceded by a
+/// path/member/macro-definition token (`:`, `.`, `!`, or an identifier before
+/// `::`).
+fn is_panic_macro_token_at(tokens: &[proc_macro2::TokenTree], idx: usize) -> bool {
+    let preceded_by_path_or_bang = idx > 0
+        && matches!(
+            tokens.get(idx - 1),
+            Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '.' | '!')
+        );
+    if preceded_by_path_or_bang {
+        return false;
+    }
+    if is_panic_macro_tail(tokens, idx) || is_crate_qualified_panic_macro_tail(tokens, idx) {
+        return true;
+    }
+    if is_colon_pair(tokens, idx) && is_crate_qualified_panic_macro_tail(tokens, idx + 2) {
+        if idx == 0 {
+            return true;
+        }
+        return match tokens.get(idx - 1) {
+            Some(proc_macro2::TokenTree::Ident(id)) => matches!(
+                id.to_string().as_str(),
+                "return" | "break" | "if" | "while" | "match" | "in"
+            ),
+            Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '>' => {
+                idx >= 2
+                    && matches!(
+                        tokens.get(idx - 2),
+                        Some(proc_macro2::TokenTree::Punct(prev))
+                            if matches!(prev.as_char(), '=' | '-')
+                                && prev.spacing() == proc_macro2::Spacing::Joint
+                    )
+            }
+            _ => true,
+        };
+    }
+    false
+}
+
+fn collect_panic_macro_starts(
     stream: proc_macro2::TokenStream,
     out: &mut BTreeSet<(usize, usize)>,
 ) {
-    for tt in stream {
-        match tt {
-            proc_macro2::TokenTree::Ident(id) => {
-                let start = id.span().start();
-                out.insert((start.line, start.column + 1));
-            }
-            proc_macro2::TokenTree::Punct(p) => {
-                let start = p.span().start();
-                out.insert((start.line, start.column + 1));
-            }
-            proc_macro2::TokenTree::Group(g) => {
-                collect_non_literal_token_starts(g.stream(), out);
-            }
-            proc_macro2::TokenTree::Literal(_) => {}
+    let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    for (idx, tt) in tokens.iter().enumerate() {
+        if is_panic_macro_token_at(&tokens, idx) {
+            let start = tt.span().start();
+            out.insert((start.line, start.column + 1));
+        }
+        if let proc_macro2::TokenTree::Group(g) = tt {
+            collect_panic_macro_starts(g.stream(), out);
         }
     }
 }
@@ -421,16 +503,16 @@ fn collect_non_literal_token_starts(
 impl StagedLibSource {
     /// Index `lib_rs`, recording the 1-based inclusive line range from each
     /// top-level `fn` keyword to its closing brace and the 1-based `(line, col)`
-    /// start positions of all non-literal tokens.
+    /// start positions of all standard panic or assertion macro invocations.
     ///
     /// A source that fails to parse indexes no functions, so no panic site in
     /// it is reconciled.
     pub fn parse(lib_rs: &str) -> Self {
-        let mut token_starts = BTreeSet::new();
+        let mut panic_macro_starts = BTreeSet::new();
         let fn_lines = match syn::parse_file(lib_rs) {
             Ok(file) => {
                 if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
-                    collect_non_literal_token_starts(ts, &mut token_starts);
+                    collect_panic_macro_starts(ts, &mut panic_macro_starts);
                 }
                 file.items
                     .iter()
@@ -449,9 +531,8 @@ impl StagedLibSource {
             Err(_) => BTreeMap::new(),
         };
         Self {
-            lines: lib_rs.lines().map(str::to_string).collect(),
             fn_lines,
-            token_starts,
+            panic_macro_starts,
         }
     }
 
@@ -462,8 +543,8 @@ impl StagedLibSource {
     }
 
     /// Return `true` when `pos` lies in the staged `src/lib.rs`, within the
-    /// line range of `fn_name`, at a real non-literal token starting an
-    /// invocation of one of [`STD_PANIC_MACRO_NAMES`].
+    /// line range of `fn_name`, at the first token of an invocation of one of
+    /// [`STD_PANIC_MACRO_NAMES`].
     fn is_panic_macro_call_site(&self, fn_name: &str, pos: &SourcePos) -> bool {
         let file = pos.file.replace('\\', "/");
         if file.strip_prefix("./").unwrap_or(&file) != "src/lib.rs" {
@@ -473,15 +554,7 @@ impl StagedLibSource {
             return false;
         };
         let (line, col) = (pos.line as usize, pos.col as usize);
-        if line < first || line > last || col == 0 || !self.token_starts.contains(&(line, col)) {
-            return false;
-        }
-        let Some(text) = self.lines.get(line - 1) else {
-            return false;
-        };
-        // Miri reports 1-based columns counted in characters.
-        let invocation: String = text.chars().skip(col - 1).collect();
-        starts_with_std_panic_macro_invocation(&invocation)
+        line >= first && line <= last && self.panic_macro_starts.contains(&(line, col))
     }
 }
 
@@ -489,37 +562,18 @@ impl StagedLibSource {
 /// [`STD_PANIC_MACRO_NAMES`], written bare (`assert!(...)`) or through
 /// `core::` / `std::` (optionally rooted with `::`), followed by `!` and an
 /// opening macro delimiter (`(`, `[`, or `{`).
+#[cfg(test)]
 fn starts_with_std_panic_macro_invocation(text: &str) -> bool {
-    let mut rest = text;
-    let rooted = rest.starts_with("::");
-    if rooted {
-        rest = &rest[2..];
-    }
-    let mut crate_qualified = false;
-    for krate in ["core::", "std::"] {
-        if let Some(after) = rest.strip_prefix(krate) {
-            rest = after;
-            crate_qualified = true;
-            break;
-        }
-    }
-    if rooted && !crate_qualified {
-        return false;
-    }
-    let name_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let (name, after_name) = rest.split_at(name_len);
-    if !STD_PANIC_MACRO_NAMES.contains(&name) {
-        return false;
-    }
-    let Some(after_bang) = after_name.trim_start().strip_prefix('!') else {
+    let trimmed = text.trim_start();
+    let Ok(ts) = trimmed.parse::<proc_macro2::TokenStream>() else {
         return false;
     };
-    matches!(
-        after_bang.trim_start().chars().next(),
-        Some('(' | '[' | '{')
-    )
+    let tokens: Vec<proc_macro2::TokenTree> = ts.into_iter().collect();
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let start = first.span().start();
+    start.line == 1 && start.column == 0 && is_panic_macro_token_at(&tokens, 0)
 }
 
 /// Return `true` when `file` ends with one of
@@ -3055,8 +3109,11 @@ pub fn cand_plain__b0_c2() -> u32 {
         ));
 
         // A line inside a multi-line string literal or block comment that
-        // contains `panic!("...")` text does not start at a non-literal token,
-        // so it must never reconcile.
+        // contains `panic!("...")` text, or a non-standard path such as
+        // `foo::panic!` or `foo::core::panic!` (even when Miri's column points
+        // at the trailing `panic!` or `core::panic!` segment), must never
+        // reconcile; multi-line `core::\npanic!(...)` and inline comments
+        // between `panic` and `!(` do reconcile at the invocation's first token.
         let spoofed_src = StagedLibSource::parse(
             "\
 #![no_std]
@@ -3070,38 +3127,78 @@ pub fn cand_spoof__b0_c0() -> u32 {
     let panic: u32 = 1u32;
     if panic != 0u32 { 2u32 } else { 3u32 }
 }
+
+pub fn cand_paths__b0_c1() {
+    foo::panic!(\"non_std\");
+    ::panic!(\"rooted_bare\");
+    foo::core::panic!(\"nested_core\");
+    core::
+        panic!(\"multiline_core\");
+    panic/* inline comment */!(
+        \"multiline_args\"
+    );
+}
 ",
         );
-        assert!(matches!(
-            compare_difftest_miri_and_anneal(
-                &panic_at(4, 5),
-                &anneal_panic_in(std_panic, 62),
-                None,
-                &spoofed_src,
-                "cand_spoof__b0_c0"
-            ),
-            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
-        ));
-        assert!(matches!(
-            compare_difftest_miri_and_anneal(
-                &panic_at(7, 5),
-                &anneal_panic_in(std_panic, 62),
-                None,
-                &spoofed_src,
-                "cand_spoof__b0_c0"
-            ),
-            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
-        ));
-        assert!(matches!(
-            compare_difftest_miri_and_anneal(
-                &panic_at(10, 8),
-                &anneal_panic_in(std_panic, 62),
-                None,
-                &spoofed_src,
-                "cand_spoof__b0_c0"
-            ),
-            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
-        ));
+        for (line, col) in [(4, 5), (7, 5), (10, 8)] {
+            assert!(
+                matches!(
+                    compare_difftest_miri_and_anneal(
+                        &panic_at(line, col),
+                        &anneal_panic_in(std_panic, 62),
+                        None,
+                        &spoofed_src,
+                        "cand_spoof__b0_c0"
+                    ),
+                    ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+                ),
+                "spoofed site at {line}:{col} must not reconcile"
+            );
+        }
+        // Every column of `foo::panic!`, `::panic!`, and `foo::core::panic!`
+        // (including the interior `panic!` and `core::panic!` segments) must be
+        // rejected, as must the interior `panic!` line of multi-line
+        // `core::\npanic!`.
+        for (line, col) in [
+            (14, 5),
+            (14, 8),
+            (14, 10),
+            (15, 5),
+            (15, 7),
+            (16, 5),
+            (16, 10),
+            (16, 16),
+            (18, 9),
+        ] {
+            assert!(
+                matches!(
+                    compare_difftest_miri_and_anneal(
+                        &panic_at(line, col),
+                        &anneal_panic_in(std_panic, 62),
+                        None,
+                        &spoofed_src,
+                        "cand_paths__b0_c1"
+                    ),
+                    ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+                ),
+                "non-std or interior segment at {line}:{col} must not reconcile"
+            );
+        }
+        // Only the leading token of `core::\npanic!` (17:5) and
+        // `panic/* ... */!(` (19:5) reconciles.
+        for (line, col) in [(17, 5), (19, 5)] {
+            assert_eq!(
+                compare_difftest_miri_and_anneal(
+                    &panic_at(line, col),
+                    &anneal_panic_in(std_panic, 62),
+                    None,
+                    &spoofed_src,
+                    "cand_paths__b0_c1"
+                ),
+                ComparisonVerdict::Agree,
+                "valid macro start at {line}:{col} must reconcile"
+            );
+        }
     }
 
     #[test]
@@ -3215,6 +3312,8 @@ pub fn cand_spoof__b0_c0() -> u32 {
             "panic ! (\"x\")",
             "panic![\"x\"]",
             "panic!{\"x\"}",
+            "panic/* comment */!(\"x\")",
+            "core::\npanic!(\"x\")",
         ] {
             assert!(starts_with_std_panic_macro_invocation(text), "{text}");
         }
@@ -3223,6 +3322,8 @@ pub fn cand_spoof__b0_c0() -> u32 {
             "panicky!(\"x\")",
             "::panic!(\"x\")",
             "foo::panic!(\"x\")",
+            "foo::core::panic!(\"x\")",
+            "/* leading */ panic!(\"x\")",
             "panic(\"x\")",
             "panic != 0",
             "assert != true",
