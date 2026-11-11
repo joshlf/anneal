@@ -92,8 +92,9 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      relation (Anneal knows less than Trusted; every Anneal read is a Trusted read:
      `readPlaceState_below_refines`), and the documented divergence on projected `Deinit`
      below an uninitialized local (`evalStmt_deinit_projected_uninit_root_divergence`).
-   - `evalRetagPlace` (`retag_place`: the index pre-read of `prepare_place_access`
-     (`evalRetagPlace_bad_index_false`), raw retags and recursive reference checks with the `A3`
+   - `evalRetagPlace` (`retag_place`: the value-dependent part of `prepare_place_access` — no
+     `Deref` (`evalRetagPlace_deref_false`), the index pre-read (`evalRetagPlace_bad_index_false`),
+     and `check_slot_projection` (`evalRetagPlace_inactive_variant_false`) — raw retags and recursive reference checks with the `A3`
      dangling rule, `A3` niche-shell tag readability, `B4` niche-capable `Init` well-formedness,
      `B2` rejection of out-of-range variants and variants with uninhabited fields via
      `RetagTy.inhabited`, and `Deinit`-then-`Retag` failure `evalDeinitPlace_then_retag_same_false`)
@@ -134,18 +135,25 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `runLoweredCfgSteps_with_stmts_refines_trusted` under `BodyCorrWithStmts`) against
      Trusted's `evalTerminator` / `stepMirFn` / `stepMirState` (Trusted never faults where Anneal
      succeeds), plus the projected-`Drop` refinement and the documented bare-`Drop` divergence.
-   - The frame part of `check_place_access` for `Drop` places and `Call` destinations is concrete
-     (`placeFrameAccessOk`: a live root local and initialized `Index` operand locals,
-     `placeFrameAccessOk_of_evalDeinitPlace`), so a `Drop` of a dead local faults in both
-     semantics (`evalLoweredTerminator_drop_dead_agrees_trusted`) and a successful `Drop` names a
-     local Trusted also holds live (`evalLoweredTerminator_drop_trusted_live`). The value-directed
-     walk `slotProjectionAccessOk` / `slotPlaceProjectionOk` captures `deinit_in_slot`'s path
-     discipline (`slotPlaceProjectionOk_of_evalDeinitPlace`), while `checkSlotProjectionOk` /
-     `checkPlaceSlotOk` models `prepare_place_access`'s runtime `check_slot_projection`
-     (`rvalue.rs:6203, 6531-6856`), which subsumes `slotPlaceProjectionOk`
-     (`checkPlaceSlotOk_of_slotPlaceProjectionOk`), rejects inactive `Downcast` variants
-     (`checkPlaceSlotOk_inactive_variant_false`), and checks dynamic `Index` bounds on initialized
-     arrays (`checkPlaceSlotOk_array_index_eq`).
+   - The value-dependent part of `check_place_access` (`prepare_place_access`) for `Drop` places
+     and `Call` destinations is concrete in the evaluator (`placeRuntimeAccessOk`): no `Deref`
+     (`evalLoweredTerminator_drop_deref_none`), a live root local and readable `Index` operand
+     locals (`placeFrameAccessOk`, `placeFrameAccessOk_of_evalDeinitPlace`), and the runtime
+     value/shell projection check `check_slot_projection` (`checkSlotProjectionOk` /
+     `checkPlaceSlotOk`, `rvalue.rs:6203, 6531-6856`), which subsumes `deinit_in_slot`'s path
+     discipline `slotPlaceProjectionOk` (`checkPlaceSlotOk_of_slotPlaceProjectionOk`), rejects
+     inactive `Downcast` variants (`evalLoweredTerminator_drop_inactive_variant_none`) and
+     out-of-bounds elements of initialized arrays (`evalLoweredTerminator_drop_index_oob_none`,
+     `checkPlaceSlotOk_array_index_eq`), and accepts any path below an uninitialized local
+     (`checkPlaceSlotOk_uninit`); only the type-directed part (declared place type,
+     `validate_projection_tail`) stays the environment's `CfgEnv.placeAccessOk`. Hence a `Drop`
+     of a dead local faults in both semantics (`evalLoweredTerminator_drop_dead_agrees_trusted`),
+     a successful `Drop` names a local Trusted also holds live
+     (`evalLoweredTerminator_drop_trusted_live`), a successful projected `Drop` of an initialized
+     local refines Trusted without any read premise
+     (`evalLoweredTerminator_drop_projected_init_refines`), and a projected `Drop` below an
+     uninitialized local is a documented divergence
+     (`evalLoweredTerminator_drop_projected_uninit_divergence`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -4719,6 +4727,44 @@ def projectFieldSlot (locals : List LocalSlot) : FieldSlot → List ProjectionEl
     else none
   | _, _ => none
 
+/-- The runtime value/shell projection check `check_slot_projection` (`check_value_projection` /
+`check_shell_projection` in `crates/anneal-mir/src/lower/rvalue.rs:6531-6856`), which
+`prepare_place_access` runs after `validate_projection_tail`:
+- an uninitialized slot (`.uninit`) has no active variant or runtime array length to conflict with
+  the projection (`LocalSlotState::Uninit => Ok(())`, `FieldSlot::Uninit => Ok(())`);
+- an initialized value (`.init v`) must accept `evalValueProjRead` along `p` (enforcing active
+  `Downcast` variants, field bounds, and dynamic `Index`/`ConstantIndex`/`Subslice` bounds on
+  initialized arrays);
+- a partial shell (`.nested var adt disc fs`) enforces active `Downcast`/field variants and field
+  bounds, recursing into the child slot while rejecting array projections directly on a shell. -/
+def checkSlotProjectionOk (locals : List LocalSlot) :
+    FieldSlot → List ProjectionElem → Bool
+  | .uninit, _ => true
+  | .init v, p =>
+    match evalValueProjRead locals v p with
+    | .ok _ => true
+    | _ => false
+  | .nested _ _ _ _, [] => true
+  | .nested var adt disc fs, .field idx _ :: rest =>
+    (shellVariant ⟨var, adt, disc, fs⟩ == 0) &&
+      match fs[idx]? with
+      | some c => checkSlotProjectionOk locals c rest
+      | none => false
+  | .nested var adt disc fs, .downcast _ v :: .field idx _ :: rest =>
+    (shellVariant ⟨var, adt, disc, fs⟩ == v) &&
+      match fs[idx]? with
+      | some c => checkSlotProjectionOk locals c rest
+      | none => false
+  | .nested _ _ _ _, _ :: _ => false
+
+/-- Whole-place `check_slot_projection` (`checkPlaceSlotOk`): the root local is live and its root
+slot satisfies `checkSlotProjectionOk` along `place.projection`. -/
+def checkPlaceSlotOk (slots : List LocalSlotState) (place : Place) : Bool :=
+  match slots[place.local_]? with
+  | none | some .dead => false
+  | some st =>
+    checkSlotProjectionOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) place.projection
+
 /-- The index pre-read of `prepare_place_access` (`read_index_local`): every `Index` operand local
 of a projection holds an initialized scalar (`DeadLocal` / `UninitializedLocal` otherwise). -/
 def indexLocalsOk (slots : List LocalSlotState) (proj : List ProjectionElem) : Bool :=
@@ -4730,18 +4776,24 @@ def indexLocalsOk (slots : List LocalSlotState) (proj : List ProjectionElem) : B
       | _ => false
     | _ => true
 
-/-- `StatementEvalState::retag_place`: a dead local faults (`DeadLocal`) and every `Index` operand
-local must be readable (`prepare_place_access`'s index pre-read, `indexLocalsOk`); `Retag(Raw)`
-requires a raw-pointer place holding an initialized pointer whose address fits the pointer width
-(it may be null, unaligned, or dangling); every other kind requires nothing more of a place
-without references, and otherwise validates every reference reachable in the place's part. -/
+/-- `StatementEvalState::retag_place`: first the value-dependent part of `prepare_place_access` —
+a dead local faults (`DeadLocal`), a `Deref` is unsupported, every `Index` operand local must be
+readable (the index pre-read, `indexLocalsOk`), and the runtime projection check
+`check_slot_projection` (`checkSlotProjectionOk`: active variants, field and array bounds) must
+pass; then `Retag(Raw)` requires a raw-pointer place holding an initialized pointer whose address
+fits the pointer width (it may be null, unaligned, or dangling), and every other kind requires
+nothing more of a place without references and otherwise validates every reference reachable in
+the place's part. -/
 def evalRetagPlace (ctx : RetagCtx) (kind : RetagKind) (place : Place) (ty : RetagTy)
     (rawPtrPlace : Bool) : Bool :=
   match ctx.slots[place.local_]? with
   | none => false
   | some .dead => false
   | some st =>
-    indexLocalsOk ctx.slots place.projection &&
+    !projectionHasDeref place.projection &&
+    (indexLocalsOk ctx.slots place.projection &&
+    (checkSlotProjectionOk (slotsToTrustedLocals ctx.slots) (slotStateToFieldSlot st)
+      place.projection &&
       (match kind with
        | .raw =>
          rawPtrPlace &&
@@ -4753,7 +4805,7 @@ def evalRetagPlace (ctx : RetagCtx) (kind : RetagKind) (place : Place) (ty : Ret
            (match projectFieldSlot (slotsToTrustedLocals ctx.slots) (slotStateToFieldSlot st)
                place.projection with
             | some target => retagSlotOk ctx ty target
-            | none => false))
+            | none => false))))
 
 /-- `retagAlignOk` spelled out. -/
 theorem retagAlignOk_iff (pt : RetagPointee) (addr : Nat) :
@@ -4818,20 +4870,126 @@ theorem evalRetagPlace_bad_index_false (ctx : RetagCtx) (kind : RetagKind) {plac
   · rfl
   · simp [hI]
 
-/-- A reference-free place is retagged (by any non-raw kind) exactly when its local is live and its
-`Index` operand locals are readable. -/
+/-- A reference-free place is retagged (by any non-raw kind) exactly when it passes the
+value-dependent part of `prepare_place_access`: a live local, no `Deref`, readable `Index`
+operand locals, and `check_slot_projection`. -/
 theorem evalRetagPlace_noRef {ctx : RetagCtx} {kind : RetagKind} {place : Place} {ty : RetagTy}
     {b : Bool} (hKind : kind ≠ .raw) (hNoRef : ty.containsRef = false) :
     evalRetagPlace ctx kind place ty b = true ↔
       (∃ st, ctx.slots[place.local_]? = some st ∧ st ≠ .dead) ∧
-        indexLocalsOk ctx.slots place.projection = true := by
-  unfold evalRetagPlace
+        projectionHasDeref place.projection = false ∧
+        indexLocalsOk ctx.slots place.projection = true ∧
+        checkPlaceSlotOk ctx.slots place = true := by
+  unfold evalRetagPlace checkPlaceSlotOk
   cases hS : ctx.slots[place.local_]? with
   | none => simp
   | some st =>
     cases st with
     | dead => simp
     | _ => cases kind <;> first | exact absurd rfl hKind | simp [hNoRef]
+
+/-- **A successful read passes `check_slot_projection`**: whatever `readFieldSlot` reads along a
+path, `checkSlotProjectionOk` accepts that path. -/
+theorem readFieldSlot_ok_checkSlotProjectionOk_aux (locals : List LocalSlot) :
+    ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n → ∀ (slot : FieldSlot) (w : Value),
+      readFieldSlot locals slot p = .ok w → checkSlotProjectionOk locals slot p = true := by
+  intro n
+  induction n with
+  | zero =>
+    intro p hLen slot w _
+    have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
+    subst hp
+    cases slot with
+    | uninit => rfl
+    | init v => simp [checkSlotProjectionOk, evalValueProjRead]
+    | nested var adt disc fs => rfl
+  | succ n ih =>
+    intro p hLen slot w h
+    cases slot with
+    | uninit => simp [readFieldSlot] at h
+    | init v =>
+      simp only [readFieldSlot] at h
+      simp [checkSlotProjectionOk, h]
+    | nested var adt disc fs =>
+      rcases p with _ | ⟨a, rest⟩
+      · rfl
+      · simp only [List.length_cons] at hLen
+        cases a
+        case field idx ty =>
+          rw [readFieldSlot_nested_field] at h
+          unfold shellFieldRead at h
+          by_cases hV : shellVariant ⟨var, adt, disc, fs⟩ = 0
+          · simp only [hV, ↓reduceIte] at h
+            cases hc : fs[idx]? with
+            | none => simp [hc] at h
+            | some c =>
+              simp only [hc] at h
+              simp only [checkSlotProjectionOk, hV, BEq.rfl, Bool.true_and, hc]
+              exact ih rest (by omega) c w h
+          · simp [hV] at h
+        case downcast nm v =>
+          rcases rest with _ | ⟨b, rest'⟩
+          · simp [readFieldSlot, readFromPartialShell, isFieldHead] at h
+          · simp only [List.length_cons] at hLen
+            cases b
+            case field idx ty =>
+              rw [readFieldSlot_nested_downcast_field] at h
+              unfold shellFieldRead at h
+              by_cases hV : shellVariant ⟨var, adt, disc, fs⟩ = v
+              · simp only [hV, ↓reduceIte] at h
+                cases hc : fs[idx]? with
+                | none => simp [hc] at h
+                | some c =>
+                  simp only [hc] at h
+                  simp only [checkSlotProjectionOk, hV, BEq.rfl, Bool.true_and, hc]
+                  exact ih rest' (by omega) c w h
+              · simp [hV] at h
+            all_goals simp [readFieldSlot, readFromPartialShell, isFieldHead] at h
+        all_goals simp [readFieldSlot, readFromPartialShell] at h
+
+/-- Every place Anneal reads passes `check_slot_projection` (`checkPlaceSlotOk`). -/
+theorem checkPlaceSlotOk_of_readPlaceState {slots : List LocalSlotState} {place : Place}
+    {w : Value} (h : readPlaceState slots place = .ok w) : checkPlaceSlotOk slots place = true := by
+  have hND : projectionHasDeref place.projection = false := by
+    cases hD : projectionHasDeref place.projection with
+    | false => rfl
+    | true => simp only [readPlaceState, hD] at h; nomatch h
+  cases hS : slots[place.local_]? with
+  | none => simp [readPlaceState, hND, get?_eq_getElem?, hS] at h
+  | some st =>
+    have hLive : st ≠ .dead := by
+      intro hD
+      subst hD
+      simp [readPlaceState, hND, get?_eq_getElem?, hS] at h
+    have hR := (readPlaceState_eq_readFieldSlot hS hLive place.projection hND).symm.trans h
+    unfold checkPlaceSlotOk
+    rw [hS]
+    cases st with
+    | dead => exact absurd rfl hLive
+    | uninit => exact readFieldSlot_ok_checkSlotProjectionOk_aux _ _ _ (Nat.le_refl _) _ _ hR
+    | init _ => exact readFieldSlot_ok_checkSlotProjectionOk_aux _ _ _ (Nat.le_refl _) _ _ hR
+    | partialShell _ =>
+      exact readFieldSlot_ok_checkSlotProjectionOk_aux _ _ _ (Nat.le_refl _) _ _ hR
+
+/-- **`Retag` through an inactive enum variant fails (`InactiveVariantProjection`)**, for every
+kind and every place type (`prepare_place_access` runs `check_slot_projection` first). -/
+theorem evalRetagPlace_inactive_variant_false (ctx : RetagCtx) (kind : RetagKind) (ty : RetagTy)
+    (b : Bool) {loc : Local} {v dv idx : Nat} (nm : Option String) (fty : Ty)
+    (rest : List ProjectionElem) (hNe : v ≠ dv) {vals : List Value}
+    (hRoot : ctx.slots[loc]? = some (.init (.aggregate v vals))) :
+    evalRetagPlace ctx kind ⟨loc, .downcast nm dv :: .field idx fty :: rest⟩ ty b = false := by
+  simp [evalRetagPlace, hRoot, slotStateToFieldSlot, checkSlotProjectionOk,
+    evalValueProjRead_aggregate_downcast_field, hNe]
+
+/-- **`Retag` of a place with a `Deref` is unsupported (`UnsupportedPlaceProjection`)**. -/
+theorem evalRetagPlace_deref_false (ctx : RetagCtx) (kind : RetagKind) {place : Place}
+    (ty : RetagTy) (b : Bool) (hD : projectionHasDeref place.projection = true) :
+    evalRetagPlace ctx kind place ty b = false := by
+  unfold evalRetagPlace
+  split
+  · rfl
+  · rfl
+  · simp [hD]
 
 /-- **`Retag(Raw)` soundness**: a successful raw retag read an initialized pointer of the place
 whose address fits the pointer width. -/
@@ -4844,7 +5002,7 @@ theorem evalRetagPlace_raw_sound {ctx : RetagCtx} {place : Place} {ty : RetagTy}
   · nomatch h
   · nomatch h
   · simp only [Bool.and_eq_true] at h
-    obtain ⟨_, hb, hR⟩ := h
+    obtain ⟨_, _, _, hb, hR⟩ := h
     refine ⟨hb, ?_⟩
     split at hR
     · rename_i p sz hRead
@@ -4888,7 +5046,7 @@ theorem evalRetagPlace_ref_sound {ctx : RetagCtx} {kind : RetagKind} {place : Pl
     | raw => exact absurd rfl hKind
     | _ =>
       simp only [RetagTy.containsRef, Bool.not_true, Bool.false_or, Bool.and_eq_true] at h
-      obtain ⟨_, h⟩ := h
+      obtain ⟨_, _, _, h⟩ := h
       split at h
       · rename_i target hT
         cases target with
@@ -5176,8 +5334,8 @@ theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
   simp only [evalStmt, hOp, hNoB, hNoG]
 
 /-- **Documented reference-free `Retag` divergence (`B4`)**: in Rust/MiniRust (`retag_place`), a
-non-raw `Retag` of a reference-free place (`ty.containsRef = false`, e.g. `u32`) is a no-op once
-the local is live and its `Index` operands are readable, whereas Trusted's `evalStmt` requires the
+non-raw `Retag` of a reference-free place (`ty.containsRef = false`, e.g. `u32`) that Anneal can
+read is a no-op (the read discharges `prepare_place_access`'s checks), whereas Trusted's `evalStmt` requires the
 retagged place itself to evaluate to a pointer (`extractDerefPtrVal?`), faulting with `.fail .ub`
 on a scalar value `.scalar sc`. -/
 theorem evalStmt_retag_noRef_scalar_divergence {ctx : RetagCtx} {kind : RetagKind}
@@ -5200,9 +5358,14 @@ theorem evalStmt_retag_noRef_scalar_divergence {ctx : RetagCtx} {kind : RetagKin
         | uninit => exact ⟨_, rfl, by simp⟩
         | init _ => exact ⟨_, rfl, by simp⟩
         | partialShell _ => exact ⟨_, rfl, by simp⟩
+  have hND : projectionHasDeref place.projection = false := by
+    cases hD : projectionHasDeref place.projection with
+    | false => rfl
+    | true => simp only [readPlaceState, hD] at hRead; nomatch hRead
   have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
     layouts s.memory.callerLocals
-  exact ⟨(evalRetagPlace_noRef hKind hNoRef).mpr ⟨hLive, hIdx⟩,
+  exact ⟨(evalRetagPlace_noRef hKind hNoRef).mpr
+      ⟨hLive, hND, hIdx, checkPlaceSlotOk_of_readPlaceState hRead⟩,
     by simp only [evalStmt, hOp]⟩
 
 /-- **`Retag` on a niche-capable enum shell fails (`A3`)**: for a reference-bearing enum whose tag
@@ -6640,11 +6803,30 @@ def placeFrameAccessOk (slots : List LocalSlotState) (place : Place) : Bool :=
       | _ => false
     | _ => true)
 
+/-- The value-dependent part of `check_place_access` (`prepare_place_access`): no `Deref`
+(`UnsupportedPlaceProjection`), the frame check `placeFrameAccessOk` (a live root local and
+readable `Index` operand locals), and the runtime value/shell projection check
+`check_slot_projection` (`checkPlaceSlotOk`: active variants, field bounds, and dynamic array
+bounds on initialized arrays; anything below an uninitialized part). The type-directed part (the
+declared place type and `validate_projection_tail`) is `CfgEnv.placeAccessOk`. -/
+def placeRuntimeAccessOk (slots : List LocalSlotState) (place : Place) : Bool :=
+  !projectionHasDeref place.projection && placeFrameAccessOk slots place &&
+    checkPlaceSlotOk slots place
+
+/-- `placeRuntimeAccessOk` spelled out. -/
+theorem placeRuntimeAccessOk_iff {slots : List LocalSlotState} {place : Place} :
+    placeRuntimeAccessOk slots place = true ↔
+      projectionHasDeref place.projection = false ∧ placeFrameAccessOk slots place = true ∧
+        checkPlaceSlotOk slots place = true := by
+  unfold placeRuntimeAccessOk
+  cases projectionHasDeref place.projection <;> cases placeFrameAccessOk slots place <;>
+    cases checkPlaceSlotOk slots place <;> simp
+
 /-- The environment of CFG evaluation: layouts and globals for constants, the boundary
 well-formedness check `check_value_well_formed` (with the inhabitedness of the return type
-folded into `retOk`), the typed part of the place-access check of `Drop`/`Call` destinations
-(`check_place_access`; its frame part is the concrete `placeFrameAccessOk`), the arity function
-of shell writes, the statement evaluator
+folded into `retOk`), the type-directed part of the place-access check of `Drop`/`Call`
+destinations (`check_place_access`; its value-dependent part is the concrete
+`placeRuntimeAccessOk`), the arity function of shell writes, the statement evaluator
 (`eval_lowered_statement` over a block's statements), the call handler (`none`:
 `UnsupportedCall`), and `Ty::is_inhabited_for` (a returning `Call` needs an inhabited
 destination type). -/
@@ -6741,7 +6923,7 @@ def evalLoweredTerminator (env : CfgEnv) (body : LBody) (bb : Nat)
       | _ => none
     | .unreachable => none
     | .drop place target unwind =>
-      if placeFrameAccessOk slots place ∧ env.placeAccessOk slots place ∧
+      if placeRuntimeAccessOk slots place ∧ env.placeAccessOk slots place ∧
           unwindActionOk body block.isCleanup unwind then
         cfgGoto body target slots unwinding
       else none
@@ -6766,7 +6948,7 @@ def evalLoweredTerminator (env : CfgEnv) (body : LBody) (bb : Nat)
         if !env.wf fv then none else
         match evalOperandsState env.layouts env.globals slots1 args with
         | some (avs, slots2) =>
-          if !(avs.all env.wf && placeFrameAccessOk slots2 destination &&
+          if !(avs.all env.wf && placeRuntimeAccessOk slots2 destination &&
               env.placeAccessOk slots2 destination) then none else
           if target.isSome && !env.inhabited destTy then none else
           match env.handler with
@@ -7370,7 +7552,7 @@ theorem evalLoweredTerminator_call_goto_sound {env : CfgEnv} {body : LBody} {bb 
       env.wf fv = true ∧
       evalOperandsState env.layouts env.globals slots1 args = some (avs, slots2) ∧
       avs.all env.wf = true ∧
-      placeFrameAccessOk slots2 destination = true ∧
+      placeRuntimeAccessOk slots2 destination = true ∧
       env.placeAccessOk slots2 destination = true ∧
       env.handler = some fn ∧
       ((∃ rv, fn bb fv avs = some (.ret rv) ∧
@@ -7401,9 +7583,9 @@ theorem evalLoweredTerminator_call_goto_sound {env : CfgEnv} {body : LBody} {bb 
           split at h
           · nomatch h
           · rename_i hArgsWf
-            have hAllWf : avs.all env.wf = true ∧ placeFrameAccessOk slots2 destination = true ∧
+            have hAllWf : avs.all env.wf = true ∧ placeRuntimeAccessOk slots2 destination = true ∧
                 env.placeAccessOk slots2 destination = true := by
-              cases h1 : avs.all env.wf <;> cases h2 : placeFrameAccessOk slots2 destination <;>
+              cases h1 : avs.all env.wf <;> cases h2 : placeRuntimeAccessOk slots2 destination <;>
                 cases h3 : env.placeAccessOk slots2 destination <;> simp_all
             split at h
             · nomatch h
@@ -7692,44 +7874,6 @@ theorem placeFrameAccessOk_of_evalDeinitPlace {ts : Bool} {slots slots' : List L
   | dead => exact absurd rfl hLive
   | _ => rfl
 
-/-- The runtime value/shell projection check `check_slot_projection` (`check_value_projection` /
-`check_shell_projection` in `crates/anneal-mir/src/lower/rvalue.rs:6531-6856`), which
-`prepare_place_access` runs after `validate_projection_tail`:
-- an uninitialized slot (`.uninit`) has no active variant or runtime array length to conflict with
-  the projection (`LocalSlotState::Uninit => Ok(())`, `FieldSlot::Uninit => Ok(())`);
-- an initialized value (`.init v`) must accept `evalValueProjRead` along `p` (enforcing active
-  `Downcast` variants, field bounds, and dynamic `Index`/`ConstantIndex`/`Subslice` bounds on
-  initialized arrays);
-- a partial shell (`.nested var adt disc fs`) enforces active `Downcast`/field variants and field
-  bounds, recursing into the child slot while rejecting array projections directly on a shell. -/
-def checkSlotProjectionOk (locals : List LocalSlot) :
-    FieldSlot → List ProjectionElem → Bool
-  | .uninit, _ => true
-  | .init v, p =>
-    match evalValueProjRead locals v p with
-    | .ok _ => true
-    | _ => false
-  | .nested _ _ _ _, [] => true
-  | .nested var adt disc fs, .field idx _ :: rest =>
-    (shellVariant ⟨var, adt, disc, fs⟩ == 0) &&
-      match fs[idx]? with
-      | some c => checkSlotProjectionOk locals c rest
-      | none => false
-  | .nested var adt disc fs, .downcast _ v :: .field idx _ :: rest =>
-    (shellVariant ⟨var, adt, disc, fs⟩ == v) &&
-      match fs[idx]? with
-      | some c => checkSlotProjectionOk locals c rest
-      | none => false
-  | .nested _ _ _ _, _ :: _ => false
-
-/-- Whole-place `check_slot_projection` (`checkPlaceSlotOk`): the root local is live and its root
-slot satisfies `checkSlotProjectionOk` along `place.projection`. -/
-def checkPlaceSlotOk (slots : List LocalSlotState) (place : Place) : Bool :=
-  match slots[place.local_]? with
-  | none | some .dead => false
-  | some st =>
-    checkSlotProjectionOk (slotsToTrustedLocals slots) (slotStateToFieldSlot st) place.projection
-
 /-- Every path accepted by `slotProjectionAccessOk` (`deinit_in_slot`) is also accepted by
 `checkSlotProjectionOk` (`check_slot_projection`). -/
 theorem checkSlotProjectionOk_of_slotProjectionAccessOk (locals : List LocalSlot)
@@ -7837,15 +7981,16 @@ theorem checkPlaceSlotOk_array_index_eq {slots : List LocalSlotState} {loc i : L
     evalValueProjRead, hTIdx, get?_eq_getElem?]
   by_cases hLt : sc.bits < elems.length <;> simp [hLt]
 
-/-- **`Drop` checks the frame and changes nothing**: a successful `Drop` jumps to its target with
-the frame unchanged, after the place passed the frame access check (live root local, initialized
-index locals), the typed access check, and the unwind-action check. -/
+/-- **`Drop` checks the place and changes nothing**: a successful `Drop` jumps to its target with
+the frame unchanged, after the place passed the value-dependent access check
+(`placeRuntimeAccessOk`: no `Deref`, live root local, initialized index locals, and
+`check_slot_projection`), the typed access check, and the unwind-action check. -/
 theorem evalLoweredTerminator_drop_sound {env : CfgEnv} {body : LBody} {bb : Nat}
     {slots : List LocalSlotState} {unwinding : Option Nat} {b : LBlock} {place : Place}
     {target : Nat} {u : UnwindAction} (hb : body.blocks[bb]? = some b)
     (hT : b.terminator = .drop place target u) {step : CfgStep}
     (h : evalLoweredTerminator env body bb slots unwinding = some step) :
-    step = .goto target slots unwinding ∧ placeFrameAccessOk slots place = true ∧
+    step = .goto target slots unwinding ∧ placeRuntimeAccessOk slots place = true ∧
       env.placeAccessOk slots place = true ∧ unwindActionOk body b.isCleanup u = true ∧
       ∃ st, slots[place.local_]? = some st ∧ st ≠ .dead := by
   unfold evalLoweredTerminator at h
@@ -7856,7 +8001,8 @@ theorem evalLoweredTerminator_drop_sound {env : CfgEnv} {body : LBody} {bb : Nat
   · split at h
     · rename_i hC
       obtain ⟨h1, h2, h3⟩ := hC
-      exact ⟨cfgGoto_eq_some h, h1, h2, h3, placeFrameAccessOk_live h1⟩
+      exact ⟨cfgGoto_eq_some h, h1, h2, h3,
+        placeFrameAccessOk_live (placeRuntimeAccessOk_iff.mp h1).2.1⟩
     · nomatch h
 
 /-- **`Drop` of a dead local is an error (`DeadLocal`)**. -/
@@ -7885,8 +8031,8 @@ theorem evalLoweredTerminator_drop_bad_index_none {env : CfgEnv} {body : LBody} 
   cases hE : evalLoweredTerminator env body bb slots unwinding with
   | none => rfl
   | some step =>
-    obtain ⟨_, hF, _⟩ := evalLoweredTerminator_drop_sound hb hT hE
-    obtain ⟨sc, hSc⟩ := placeFrameAccessOk_index hF hIdx
+    obtain ⟨_, hR, _⟩ := evalLoweredTerminator_drop_sound hb hT hE
+    obtain ⟨sc, hSc⟩ := placeFrameAccessOk_index (placeRuntimeAccessOk_iff.mp hR).2.1 hIdx
     exact absurd hSc (hBad sc)
 
 /-- **`Drop` of a dead local faults in both semantics** (`DeadLocal` in Anneal's
@@ -7997,6 +8143,119 @@ theorem evalLoweredTerminator_drop_projected_refines {env : CfgEnv} {body : LBod
     simp only [evalTerminator, get?_eq_getElem?, hRoot, hP]
     rw [hP] at hTRead
     simp only [hTRead]
+
+/-- `check_slot_projection` accepts every path below an uninitialized local. -/
+theorem checkPlaceSlotOk_uninit {slots : List LocalSlotState} {place : Place}
+    (hRoot : slots[place.local_]? = some .uninit) : checkPlaceSlotOk slots place = true := by
+  simp [checkPlaceSlotOk, hRoot, slotStateToFieldSlot, checkSlotProjectionOk]
+
+/-- **`Drop` through an inactive enum variant is an error (`InactiveVariantProjection`)**:
+`check_slot_projection` rejects dropping `(x as V).f` while `x` holds another variant, whether `x`
+is an initialized value or a partial shell narrowed to that variant. -/
+theorem evalLoweredTerminator_drop_inactive_variant_none {env : CfgEnv} {body : LBody} {bb : Nat}
+    {slots : List LocalSlotState} {unwinding : Option Nat} {b : LBlock} {loc : Local}
+    {v dv idx : Nat} {nm : Option String} {ty : Ty} {rest : List ProjectionElem} {target : Nat}
+    {u : UnwindAction} (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .drop ⟨loc, .downcast nm dv :: .field idx ty :: rest⟩ target u)
+    (hNe : v ≠ dv)
+    (hRoot : (∃ vals, slots[loc]? = some (.init (.aggregate v vals))) ∨
+      (∃ sh, slots[loc]? = some (.partialShell sh) ∧ shellVariant sh = v)) :
+    evalLoweredTerminator env body bb slots unwinding = none := by
+  cases hE : evalLoweredTerminator env body bb slots unwinding with
+  | none => rfl
+  | some step =>
+    obtain ⟨_, hR, _⟩ := evalLoweredTerminator_drop_sound hb hT hE
+    have hC := (placeRuntimeAccessOk_iff.mp hR).2.2
+    have hF := checkPlaceSlotOk_inactive_variant_false slots loc nm ty rest (idx := idx) hNe
+    rcases hRoot with ⟨vals, hV⟩ | ⟨sh, hS, hVar⟩
+    · rw [hF.1 vals hV] at hC
+      nomatch hC
+    · rw [hF.2 sh hS hVar] at hC
+      nomatch hC
+
+/-- **`Drop` of an out-of-bounds element of an initialized array is an error
+(`IndexOutOfBounds`)**: `check_slot_projection` checks the read index against the runtime array
+length. -/
+theorem evalLoweredTerminator_drop_index_oob_none {env : CfgEnv} {body : LBody} {bb : Nat}
+    {slots : List LocalSlotState} {unwinding : Option Nat} {b : LBlock} {loc i : Local}
+    {elems : List Value} {sc : ScalarInt} {target : Nat} {u : UnwindAction}
+    (hb : body.blocks[bb]? = some b) (hT : b.terminator = .drop ⟨loc, [.index i]⟩ target u)
+    (hArr : slots[loc]? = some (.init (.aggregate 0 elems)))
+    (hIdx : slots[i]? = some (.init (.scalar sc))) (hOob : elems.length ≤ sc.bits) :
+    evalLoweredTerminator env body bb slots unwinding = none := by
+  cases hE : evalLoweredTerminator env body bb slots unwinding with
+  | none => rfl
+  | some step =>
+    obtain ⟨_, hR, _⟩ := evalLoweredTerminator_drop_sound hb hT hE
+    have hC := (placeRuntimeAccessOk_iff.mp hR).2.2
+    rw [checkPlaceSlotOk_array_index_eq hArr hIdx] at hC
+    simp only [decide_eq_true_eq] at hC
+    omega
+
+/-- **`Drop` of a place with a `Deref` is unsupported (`UnsupportedPlaceProjection`)**. -/
+theorem evalLoweredTerminator_drop_deref_none {env : CfgEnv} {body : LBody} {bb : Nat}
+    {slots : List LocalSlotState} {unwinding : Option Nat} {b : LBlock} {place : Place}
+    {target : Nat} {u : UnwindAction} (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .drop place target u)
+    (hD : projectionHasDeref place.projection = true) :
+    evalLoweredTerminator env body bb slots unwinding = none := by
+  cases hE : evalLoweredTerminator env body bb slots unwinding with
+  | none => rfl
+  | some step =>
+    obtain ⟨_, hR, _⟩ := evalLoweredTerminator_drop_sound hb hT hE
+    rw [(placeRuntimeAccessOk_iff.mp hR).1] at hD
+    nomatch hD
+
+/-- **Projected `Drop` of an initialized local refines Trusted without a read premise**: a
+successful Anneal `Drop` of a projected place whose local is initialized has walked the value
+(`check_slot_projection`), so Anneal reads the place, and Trusted's `evalTerminator` jumps to the
+drop target with the frame unchanged, preserving `StateCorr` (the read premise of
+`evalLoweredTerminator_drop_projected_refines` is derived). -/
+theorem evalLoweredTerminator_drop_projected_init_refines {env : CfgEnv} {body : LBody}
+    {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction} {step : CfgStep}
+    (hCorr : StateCorr env bb slots s) (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .drop place target u) (hProj : place.projection ≠ [])
+    {rootVal : Value} (hRoot : slots[place.local_]? = some (.init rootVal))
+    (h : evalLoweredTerminator env body bb slots unwinding = some step) (span : String)
+    (cmOpt : Option CapturedMir) :
+    step = .goto target slots unwinding ∧
+      evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+        .step { s with frame := ⟨target, 0, s.frame.locals⟩ } ∧
+      StateCorr env target slots { s with frame := ⟨target, 0, s.frame.locals⟩ } := by
+  obtain ⟨_, hR, _⟩ := evalLoweredTerminator_drop_sound hb hT h
+  obtain ⟨hND, _, hC⟩ := placeRuntimeAccessOk_iff.mp hR
+  have hRead : ∃ w, readPlaceState slots place = .ok w := by
+    unfold checkPlaceSlotOk at hC
+    rw [hRoot] at hC
+    simp only [slotStateToFieldSlot, checkSlotProjectionOk] at hC
+    split at hC
+    · rename_i w hw
+      exact ⟨w, (readPlaceState_eq_readFieldSlot hRoot (by simp) place.projection hND).trans hw⟩
+    · nomatch hC
+  obtain ⟨w, hw⟩ := hRead
+  exact evalLoweredTerminator_drop_projected_refines hCorr hb hT hProj hw h span cmOpt
+
+/-- **Documented divergence of projected `Drop` below an uninitialized local**: Anneal's `Drop`
+(no drop glue) accepts a projected place of an uninitialized local (`check_slot_projection`
+accepts any tail below `Uninit`, `checkPlaceSlotOk_uninit`) and jumps to the drop target, while
+Trusted's `evalTerminator` faults when the local is uninitialized there too. -/
+theorem evalLoweredTerminator_drop_projected_uninit_divergence {env : CfgEnv} {body : LBody}
+    {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction} {step : CfgStep}
+    (hb : body.blocks[bb]? = some b) (hT : b.terminator = .drop place target u)
+    (hProj : place.projection ≠ []) (hRoot : slots[place.local_]? = some .uninit)
+    (h : evalLoweredTerminator env body bb slots unwinding = some step)
+    (hTU : s.frame.locals[place.local_]? = some .uninit) (span : String)
+    (cmOpt : Option CapturedMir) :
+    checkPlaceSlotOk slots place = true ∧ step = .goto target slots unwinding ∧
+      evalTerminator s ⟨.drop place target u, span⟩ cmOpt = MirStepNode.fail .ub := by
+  refine ⟨checkPlaceSlotOk_uninit hRoot, (evalLoweredTerminator_drop_sound hb hT h).1, ?_⟩
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  simp only [evalTerminator, get?_eq_getElem?, hTU, hP]
 
 /-- Every `cfgGoto` jump targets an existing block whose `isCleanup` flag matches
 `unwinding.isSome`. -/
