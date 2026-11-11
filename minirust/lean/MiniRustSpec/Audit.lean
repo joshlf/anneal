@@ -3219,7 +3219,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_minirust_direct
   twoPhaseDirectWriteTreeBorrowsGap_translate
   twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ret
+  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
   twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
@@ -3672,7 +3672,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_minirust_direct
   twoPhaseDirectWriteTreeBorrowsGap_translate
   twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ret
+  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
   twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
@@ -4006,7 +4006,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_minirust_direct
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
-  unsafeCellProtectedInteriorMut_anneal_ub
+  unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
   exposeSingleRefMutRoundTrip_translateIntr
@@ -4201,7 +4201,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_minirust_direct
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
-  unsafeCellProtectedInteriorMut_anneal_ub
+  unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
   exposeSingleRefMutRoundTrip_translateIntr

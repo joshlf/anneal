@@ -1700,16 +1700,20 @@ theorem twoPhaseForeignWriteDiscrepancy_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 99 }, [1]) := by
   decide +kernel
 
-/-- Direct-write modeling gap between Anneal's `updateBorrowPerm` (`writerTag = .none`)
-and upstream Tree Borrows on `Freeze` two-phase borrows
+/-- Direct write to a local with an unprotected `Freeze` two-phase borrow
 (`_2 = &two_phase mut _1; _1 = 99; _0 = copy (*_2)`):
 `inFragment` rejects this body because `stmtPreservesAddrTaken` forbids direct
-writes to address-taken locals. Both Anneal (`updateBorrowPerm` keeps `.reserved`
-unchanged when `writerTag = .none`, as if every `.reserved` borrow were interior-mutable
-`ReservedIm`) and MiniRust's `BasicMemory` return `99`, whereas ground-truth
-`TreeBorrowsMemory` (`Permission.foreign_write_unprot_reserved_iff.1` and
-`treeBorrowsDirectWriteDisablesUnprotReserved` below) transitions unprotected
-`Freeze` `Reserved -> Disabled` on foreign writes so reading `*_2` raises UB. -/
+writes to address-taken locals. Under the merged `LM-3.3` `Trusted` semantics
+the former Anneal/Tree Borrows gap is closed: `&two_phase mut _1` records
+`.reservedFrz false` (`TreeBorrowPerm.reserved`), and `updateBorrowPerm` with
+`writerTag = .none` (the direct write `_1 = 99`) disables an unprotected
+`.reservedFrz false` entry, so reading `*_2` raises UB in Anneal
+(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`), agreeing with ground-truth
+`TreeBorrowsMemory` (`Permission.foreign_write_unprot_reserved_iff.1`,
+`treeBorrowsDirectWriteDisablesUnprotReserved`, and
+`twoPhaseDirectWriteTreeBorrowsGap_tb_direct`), which transitions unprotected
+`Freeze` `Reserved -> Disabled` on foreign writes. Only MiniRust's `BasicMemory`
+(no aliasing model) returns `99`. -/
 def twoPhaseDirectWriteTreeBorrowsGap : CapturedMir :=
   ptrBody "witness::two_phase_direct_write_tree_borrows_gap"
     [u32Decl, u32Decl, refMutU32Decl]
@@ -1724,7 +1728,7 @@ theorem twoPhaseDirectWriteTreeBorrowsGap_translate :
 theorem twoPhaseDirectWriteTreeBorrowsGap_notInFragment :
     inFragment twoPhaseDirectWriteTreeBorrowsGap = false := by decide +kernel
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ret :
+theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ub :
     ∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrowsGap
       (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
   faultsA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ (by decide)
@@ -1735,8 +1739,8 @@ theorem twoPhaseDirectWriteTreeBorrowsGap_minirust_direct :
   decide +kernel
 
 /-- Mutably reborrowing `&mut (*_2)` from a `Frozen` shared reference `_2 = &_1`:
-Anneal faults on the permission check (`parentEntry.perm == .active`), while
-MiniRust's `BasicMemory` returns `5`. -/
+Anneal faults on the reborrow permission check (a `.frozen` parent entry rejects a
+`.mut` borrow kind), while MiniRust's `BasicMemory` returns `5`. -/
 def frozenRefMutReborrow : CapturedMir :=
   ptrBody "witness::frozen_ref_mut_reborrow" [u32Decl, u32Decl, refSharedU32Decl, refMutU32Decl]
     [.storageLive 2, .storageLive 3,
@@ -2483,9 +2487,14 @@ theorem retagDisabledRefDiscrepancy_progress (n : Nat) :
 
 /-- Scalar `Retag([default], _1)` on `u32` parameter `_1`:
 `translateFn` lowers `Retag` to `Statement::Validate`, while `statementOk`
-restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Since `314c4453`,
-Anneal's `evalStmt` `.retag` treats non-pointer scalar values as a no-op and
-returns `5`, matching MiniRust's `Machine::retag_val` (`Value::Int`). -/
+restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Under the
+merged `LM-3.3` `Trusted` `evalStmt` `.retag` dispatch (from `05658250`, kept by
+the `9ffc1853` merge; `314c4453`'s `extractDerefPtrVal?` dispatch instead faulted
+on scalars), a place whose type is neither `.rawPtr` nor `.ref` holding a
+non-pointer scalar value is a no-op, so Anneal returns `5`, now agreeing with
+MiniRust's `Machine::retag_val` (`Value::Int` no-op) on both `BasicMemory`
+(`retagScalarDiscrepancy_minirust_direct`) and `MachTB`
+(`retagScalarDiscrepancy_tb_direct`). -/
 def retagScalarDiscrepancy : CapturedMir :=
   ptrBody "witness::retag_scalar_discrepancy" [u32Decl, u32Decl]
     [.retag .default (local_ 1),
@@ -3083,18 +3092,19 @@ theorem twoPhaseForeignWriteDiscrepancy_tb_direct :
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
 
-/-- End-to-end translated-MIR proof of the direct-write two-phase borrow gap:
-both Anneal (`writerTag = .none` leaves `.reserved` unchanged) and `BasicMemory`
-return `99`, whereas `MachTB` transitions unprotected `Freeze` `Reserved` to
-`Disabled` on `_1 = 99` and raises `"Tree Borrows: local read of Disabled reference"`
-at `_0 = copy (*_2)`. -/
+/-- End-to-end translated-MIR ground truth for the direct-write two-phase borrow
+witness: `MachTB` transitions unprotected `Freeze` `Reserved` to `Disabled` on
+`_1 = 99` and raises `"Tree Borrows: local read of Disabled reference"` at
+`_0 = copy (*_2)`, agreeing with Anneal's UB under the `LM-3.3` `updateBorrowPerm`
+(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`: `writerTag = .none` disables the
+unprotected `.reservedFrz false` entry), whereas `BasicMemory` returns `99`. -/
 theorem twoPhaseDirectWriteTreeBorrowsGap_tb_direct :
     ubAfterTB twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 5 =
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
 
 /-- Read-only mutable reborrow `_3 = &mut (*_2)` from shared `_2 = &_1`:
-Anneal faults eagerly at `&mut (*_2)` (`parentEntry.perm == .active`), whereas
+Anneal faults eagerly at `&mut (*_2)` (a `.frozen` parent rejects `.mut`), whereas
 `MachTB` creates `_3` lazily in `Reserved` (`init_access = Some(Read)`) and
 returns `5` because `_3` is only read and never written. -/
 theorem frozenRefMutReborrow_tb_direct :

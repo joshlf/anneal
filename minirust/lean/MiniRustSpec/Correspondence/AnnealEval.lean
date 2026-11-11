@@ -3386,8 +3386,9 @@ theorem freezeDerefReadBorrowsAt_singleton (locals : List LocalSlot) (ptrLoc : N
       split <;> rfl
   · rfl
 
-/-- When no protectors are active, a read through `rTag` fails `borrowEntryReadUB`
-whenever `entry` is non-`.disabled` whenever `rTag` descends from `entry.tag`. -/
+/-- When no protectors are active, a read through `rTag` raises no
+`borrowEntryReadUB` on `entry` (returns `false`) provided `entry` is
+non-`.disabled` whenever `rTag` descends from (or equals) `entry.tag`. -/
 theorem borrowEntryReadUB_nil_protectors (allBorrows : List BorrowEntry)
     (entry : BorrowEntry) (targetLocal rTag : Nat) (readProj : List ProjectionElem)
     (readRangeOff readRangeLen : Nat)
