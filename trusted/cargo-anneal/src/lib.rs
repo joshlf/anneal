@@ -13,28 +13,34 @@
 //!    ([`validate_target_crate`]), pinning `Cargo.toml`, `src/lib.rs`, and
 //!    optional `anneal-tcb.lock` via `lstat`/`fstat` `(dev, ino)` verification
 //!    without ever reading `.anneal/`.
-//! 2. Resolves the toolchain andAnneal root directories and verifies the Lean
-//!    foundation against `trusted/lean/foundation-lock.json`.
+//! 2. Authenticates the toolchain directory against the compiled-in
+//!    `toolchain-lock.sha256` manifest ([`authenticate_toolchain`]),
+//!    `trusted/lean/foundation-lock.json`, and `anneal-sources.sha256`
+//!    ([`authenticate_anneal_root`]).
 //! 3. Enforces candidate trust-tier opt-in
 //!    (`[package.metadata.anneal.trust-policy]` and
 //!    `--allow-candidate-features`) and release-channel gating (`alpha` vs.
 //!    `stable`).
 //! 4. Invokes `anneal-rustc-capture` in a private `/tmp` directory to extract
 //!    the target crate's root-anchored first-order `Mir.lean` AST across
-//!    `release` and `debug` configurations.
+//!    `release` and `debug` configurations and verifies from `rustc`'s escaped
+//!    dep-info that `src/lib.rs` was the sole source file read.
 //! 5. Runs the pre-compilation syntax and attribute gate on `Mir.lean`,
 //!    verifies 1-to-1 bijection between `/// anneal:trusted` waivers and
 //!    `anneal-tcb.lock`, compiles `Mir.lean` (`0444` read-only with SHA-256
-//!    verification), and compiles the static 8-line [`PROOF_LEAN_SOURCE`]
-//!    against the precompiled `Trusted` and `Anneal` `.olean`s with the Lean 4
-//!    kernel (`-Ddebug.skipKernelTC=false -t0`).
+//!    verification), and compiles the static [`PROOF_LEAN_SOURCE`] against the
+//!    precompiled `Trusted` and `Anneal` `.olean`s with the Lean 4 kernel
+//!    (`-Ddebug.skipKernelTC=false -t0`).
 
 pub mod setup;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -52,12 +58,17 @@ use walkdir::WalkDir;
 /// Because `Mir.crate` is 100% first-order syntax data (`Trusted.Crate`) and
 /// `Anneal.proveCrate` is a total verified decision procedure proved sound in
 /// `theory/Anneal/MirLemmas.lean`, every crate's kernel-checked proof script is
-/// identical.
+/// identical. Evaluating `Anneal.checkCrate Mir.crate` before `verify_crate`
+/// prints `[]` on passing crates and `["<message>", "<scope>"]` on failing
+/// crates so `cargo-anneal` can report the exact failing item and cause from
+/// the single `lean Proof.lean` invocation.
 pub const PROOF_LEAN_SOURCE: &str = "\
 prelude
 import Trusted
 import Anneal
 import Mir
+
+#eval Anneal.checkCrate Mir.crate
 
 namespace Proof
 
@@ -78,6 +89,17 @@ pub enum ReleaseChannel {
 }
 
 impl ReleaseChannel {
+    /// Returns the default release channel for this `cargo-anneal` binary
+    /// (`Alpha` when `CARGO_PKG_VERSION` carries a pre-release suffix such as
+    /// `-alpha`, `Stable` otherwise).
+    pub fn default_for_binary() -> Self {
+        if env!("CARGO_PKG_VERSION").contains('-') {
+            Self::Alpha
+        } else {
+            Self::Stable
+        }
+    }
+
     /// Parses `"alpha"` or `"stable"`.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
@@ -88,6 +110,51 @@ impl ReleaseChannel {
             )),
         }
     }
+
+    /// Resolves the active release channel from an optional `--release-channel`
+    /// CLI override, enforcing that a `Stable` binary cannot be downgraded to
+    /// `Alpha`.
+    pub fn resolve(override_str: Option<&str>) -> Result<Self, String> {
+        let default_channel = Self::default_for_binary();
+        let Some(raw) = override_str else {
+            return Ok(default_channel);
+        };
+        let parsed = Self::parse(raw)?;
+        if default_channel == Self::Stable && parsed == Self::Alpha {
+            return Err(
+                "`--release-channel alpha` is not permitted in a stable cargo-anneal release"
+                    .to_string(),
+            );
+        }
+        Ok(parsed)
+    }
+}
+
+/// Pipeline stage and item scope for a structured verification failure.
+///
+/// Modeling `Capture` and `Proof` as distinct variants ensures that `Capture`
+/// failures never carry a proof item scope and `Proof` failures always carry
+/// `scope` (`"crate"` or `<fn_name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureStage {
+    /// `anneal-rustc-capture` rejected the target crate during MIR extraction.
+    Capture,
+    /// `Anneal.checkCrate` / `Anneal.proveCrate` failed on `scope` (`"crate"`
+    /// or `<fn_name>`).
+    Proof {
+        /// Item scope (`"crate"` or `<fn_name>`) reported by `Anneal.checkCrate`.
+        scope: String,
+    },
+}
+
+/// Structured stage and diagnostic payload for a capture or proof failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageFailure {
+    /// Pipeline stage (and item scope for `Proof`) where verification failed.
+    pub stage: FailureStage,
+    /// Diagnostic text for the failing stage (`anneal-rustc-capture` stderr or
+    /// `Anneal.checkCrate` diagnostic message).
+    pub diagnostic: String,
 }
 
 /// Configuration for `cargo anneal verify`.
@@ -105,15 +172,93 @@ pub struct VerifyConfig {
     pub release_channel: ReleaseChannel,
 }
 
-/// Summary returned by a successful [`verify_crate_with_report`] invocation.
+/// Summary returned by a successful [`verify_crate`] invocation.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
+    /// Captured first-order `Mir.lean` module source for the target crate.
+    pub mir_lean: String,
     /// Sorted list of candidate TCB features active during verification.
     pub candidate_features: Vec<String>,
     /// Human-readable verification summary (including the
     /// `[candidate-tcb-audit]` report when candidate features are active).
     pub output_text: String,
 }
+
+/// Error returned by [`verify_crate`], preserving structured stage attribution
+/// and the captured `Mir.lean` module source when verification fails after MIR
+/// capture succeeds.
+#[derive(Debug, Clone)]
+pub struct VerifyError {
+    /// Human-readable error message.
+    pub message: String,
+    /// Structured pipeline stage and diagnostic when the failure occurred in
+    /// crate capture or proof checking (as opposed to host configuration,
+    /// manifest validation, or toolchain authentication).
+    pub failure: Option<StageFailure>,
+    /// Captured `Mir.lean` module source, if MIR capture succeeded before the
+    /// failure occurred.
+    pub mir_lean: Option<String>,
+}
+
+impl VerifyError {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            failure: None,
+            mir_lean: None,
+        }
+    }
+
+    fn capture(stdout: &str, stderr: &str) -> Self {
+        let message = format!(
+            "anneal-rustc-capture failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        Self {
+            message,
+            failure: Some(StageFailure {
+                stage: FailureStage::Capture,
+                diagnostic: stderr.to_string(),
+            }),
+            mir_lean: None,
+        }
+    }
+
+    fn with_mir(
+        message: String,
+        mir_lean: String,
+        failure: Option<StageFailure>,
+    ) -> Self {
+        Self {
+            message,
+            failure,
+            mir_lean: Some(mir_lean),
+        }
+    }
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Deref for VerifyError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Compiled-in SHA-256 lock of the toolchain's `lean/` and `rust/` trees.
+const TOOLCHAIN_LOCK: &str = include_str!("toolchain-lock.sha256");
+
+/// Compiled-in SHA-256 manifest authenticating `trusted/lean/`, `theory/`, and
+/// `trusted/rustc-capture/` under `--anneal-root`.
+///
+/// The entry order in `anneal-sources.sha256` is also the canonical compilation
+/// order for `trusted/lean/*.lean` and `theory/*.lean`.
+const LOCKED_ANNEAL_SOURCES: &str = include_str!("anneal-sources.sha256");
 
 /// The only `PATH` passed to child processes.
 const CHILD_PATH: &str = "/usr/bin:/bin";
@@ -144,36 +289,6 @@ const CRATE_FILES: [&str; 6] = [
 /// Rust editions accepted by target crate validation (`anneal-rustc-capture`
 /// further narrows to `"2024"`).
 const EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
-
-/// Ordered list of `Trusted` Lean source file paths under `trusted/lean/`.
-const TRUSTED_LEAN_PATHS: [&str; 5] = [
-    "Trusted/Refinement.lean",
-    "Trusted/StepResult.lean",
-    "Trusted/MirAst.lean",
-    "Trusted/MirSemantics.lean",
-    "Trusted.lean",
-];
-
-/// Ordered list of `Anneal` Lean source file paths under `theory/`.
-const THEORY_LEAN_PATHS: [&str; 5] = [
-    "Anneal/Refinement.lean",
-    "Anneal/StepResult.lean",
-    "Anneal/Lowering.lean",
-    "Anneal/MirLemmas.lean",
-    "Anneal.lean",
-];
-
-/// `trusted/rustc-capture` source file paths used to build
-/// `anneal-rustc-capture`.
-const RUSTC_CAPTURE_PATHS: [&str; 7] = [
-    "src/main.rs",
-    "src/hook.rs",
-    "src/extract.rs",
-    "src/items.rs",
-    "src/ir.rs",
-    "src/lean.rs",
-    "src/spec.rs",
-];
 
 /// Keywords forbidden in generated `Mir.lean` modules by the pre-compilation
 /// syntax gate (`THREAT_MODEL.md` Section 3.1).
@@ -215,6 +330,10 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn has_dot_segment(path: &Path) -> bool {
     path.as_os_str()
         .as_bytes()
@@ -222,9 +341,44 @@ fn has_dot_segment(path: &Path) -> bool {
         .any(|seg| seg == b"." || seg == b"..")
 }
 
+/// Inode and timestamp fingerprint captured via `fstat`/`lstat` to detect
+/// post-authentication replacement or in-place modification.
+///
+/// Note: `ctime` is intentionally excluded because creating or dropping a
+/// private hardlink snapshot increments/decrements `st_nlink` on the shared
+/// inode, which updates `st_ctime` across concurrent processes without
+/// altering file contents or permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileFingerprint {
+    fn from_meta(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mode: meta.mode(),
+            len: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
 /// Reads a regular file after verifying with `lstat` and `fstat` that `path`
-/// is not a symlink and did not change `(dev, ino)` between `lstat` and `open`.
-fn read_regular(path: &Path, phase: &str) -> Result<Vec<u8>, String> {
+/// is not a symlink and did not change `(dev, ino)` between `lstat` and `open`,
+/// returning both the bytes read from the open descriptor and its `fstat`
+/// [`FileFingerprint`].
+fn read_regular_with_fp(
+    path: &Path,
+    phase: &str,
+) -> Result<(Vec<u8>, FileFingerprint), String> {
     let lmeta = fs::symlink_metadata(path)
         .map_err(|e| format!("{phase}: cannot stat {}: {e}", path.display()))?;
     if !lmeta.file_type().is_file() {
@@ -246,10 +400,15 @@ fn read_regular(path: &Path, phase: &str) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
+    let fp = FileFingerprint::from_meta(&fmeta);
     let mut buf = Vec::with_capacity(fmeta.len() as usize);
     io::Read::read_to_end(&mut file, &mut buf)
         .map_err(|e| format!("{phase}: cannot read {}: {e}", path.display()))?;
-    Ok(buf)
+    Ok((buf, fp))
+}
+
+fn read_regular(path: &Path, phase: &str) -> Result<Vec<u8>, String> {
+    Ok(read_regular_with_fp(path, phase)?.0)
 }
 
 fn sha256_file(path: &Path, phase: &str) -> Result<String, String> {
@@ -310,6 +469,33 @@ fn private_tempdir(prefix: &str) -> Result<TempDir, String> {
         .map_err(|e| format!("failed to create private /tmp directory: {e}"))
 }
 
+fn join_env_paths<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    var_name: &str,
+) -> Result<OsString, String> {
+    env::join_paths(paths).map_err(|e| {
+        format!(
+            "cannot construct {var_name} (path contains path-list separator): {e}"
+        )
+    })
+}
+
+fn write_staged(
+    base: &Path,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let dst = base.join(rel);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!("cannot create staged directory {}: {e}", parent.display())
+        })?;
+    }
+    fs::write(&dst, bytes)
+        .map_err(|e| format!("cannot write staged {rel}: {e}"))?;
+    Ok(dst)
+}
+
 fn child_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear().env("PATH", CHILD_PATH).current_dir("/");
@@ -317,48 +503,386 @@ fn child_command(program: &Path) -> Command {
 }
 
 // ---------------------------------------------------------------------------
-// Toolchain and Anneal root resolution
+// Toolchain authentication and private snapshot isolation
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+struct LockedFileRecord {
+    src: PathBuf,
+    src_fp: FileFingerprint,
+    dst: PathBuf,
+    dst_fp: FileFingerprint,
+}
+
+#[derive(Debug, Clone)]
 struct Toolchain {
-    root: PathBuf,
+    /// Canonical source toolchain path used as the in-process cache key.
+    source_root: PathBuf,
+    /// Private snapshot directory holding only SHA-256-authenticated files.
+    _snapshot: Arc<TempDir>,
+    snapshot_root: PathBuf,
     lean: PathBuf,
     rustc: PathBuf,
     rust_lib: PathBuf,
     sysroot: PathBuf,
+    locked_files: Arc<Vec<LockedFileRecord>>,
+    locked_dirs: Arc<Vec<(PathBuf, String)>>,
 }
 
-fn resolve_toolchain(root: &Path) -> Result<Toolchain, String> {
+impl Toolchain {
+    /// Verifies that every authenticated file and directory listing in both
+    /// the source toolchain and the private snapshot still matches the exact
+    /// `(dev, ino, mode, len, mtime, mtime_nsec)` fingerprint recorded when
+    /// its bytes were SHA-256-verified.
+    fn verify_unchanged(&self, phase: &str) -> Result<(), String> {
+        for rec in self.locked_files.iter() {
+            let src_meta = fs::symlink_metadata(&rec.src).map_err(|e| {
+                format!(
+                    "{phase}: toolchain file disappeared {}: {e}",
+                    rec.src.display()
+                )
+            })?;
+            if !src_meta.file_type().is_file()
+                || FileFingerprint::from_meta(&src_meta) != rec.src_fp
+            {
+                return Err(format!(
+                    "{phase}: toolchain file modified after authentication: {}",
+                    rec.src.display()
+                ));
+            }
+            let dst_meta = fs::symlink_metadata(&rec.dst).map_err(|e| {
+                format!(
+                    "{phase}: snapshot file disappeared {}: {e}",
+                    rec.dst.display()
+                )
+            })?;
+            if !dst_meta.file_type().is_file()
+                || FileFingerprint::from_meta(&dst_meta) != rec.dst_fp
+            {
+                return Err(format!(
+                    "{phase}: toolchain snapshot modified after authentication: {}",
+                    rec.dst.display()
+                ));
+            }
+        }
+        for (dir, want_sha) in self.locked_dirs.iter() {
+            let got_sha = listing_digest(dir, phase)?;
+            if &got_sha != want_sha {
+                return Err(format!(
+                    "{phase}: toolchain directory listing modified after authentication: {}",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_digest_lines(
+    text: &str,
+    phase: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || format!("{phase}: malformed lock line: {line}");
+        let (hex, rel) = line.split_once("  ").ok_or_else(bad)?;
+        if !is_sha256_hex(hex)
+            || has_dot_segment(Path::new(rel))
+            || !seen.insert(rel.to_string())
+        {
+            return Err(bad());
+        }
+        entries.push((rel.to_string(), hex.to_string()));
+    }
+    Ok(entries)
+}
+
+fn listing_digest(dir: &Path, phase: &str) -> Result<String, String> {
+    let mut names = fs::read_dir(dir)
+        .and_then(|it| {
+            it.map(|e| Ok(e?.file_name().as_bytes().to_vec()))
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .map_err(|e| format!("{phase}: cannot list {}: {e}", dir.display()))?;
+    names.sort();
+    let mut text = Vec::new();
+    for name in names {
+        text.extend(name);
+        text.push(b'\n');
+    }
+    Ok(sha256_bytes(&text))
+}
+
+/// Reads and hashes a single regular file at `rel` beneath `src_root`, stages
+/// it into `snapshot_root/rel` via a verified same-inode hardlink (or direct
+/// write of the hashed buffer when across filesystems), and records its
+/// [`LockedFileRecord`].
+fn stage_locked_file(
+    src_root: &Path,
+    snapshot_root: &Path,
+    rel: &str,
+    phase: &str,
+    locked_files: &mut Vec<LockedFileRecord>,
+) -> Result<String, String> {
+    let src = beneath(src_root, rel, phase, ExpectedKind::RegularFile)?;
+    let (bytes, src_fp) = read_regular_with_fp(&src, phase)?;
+    let sha = sha256_bytes(&bytes);
+    let dst = snapshot_root.join(rel);
+    if !dst.exists() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "{phase}: cannot create snapshot dir {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let dst_fp = if fs::hard_link(&src, &dst).is_ok() {
+            let meta = fs::symlink_metadata(&dst).map_err(|e| {
+                format!("{phase}: cannot stat snapshot {}: {e}", dst.display())
+            })?;
+            let fp = FileFingerprint::from_meta(&meta);
+            if fp != src_fp {
+                return Err(format!(
+                    "{phase}: snapshot hardlink fingerprint mismatch on {}",
+                    dst.display()
+                ));
+            }
+            fp
+        } else {
+            fs::write(&dst, &bytes).map_err(|e| {
+                format!("{phase}: cannot write snapshot {}: {e}", dst.display())
+            })?;
+            let mode = if src_fp.mode & 0o111 != 0 {
+                0o500
+            } else {
+                0o400
+            };
+            fs::set_permissions(&dst, fs::Permissions::from_mode(mode))
+                .map_err(|e| {
+                    format!(
+                        "{phase}: cannot chmod snapshot {}: {e}",
+                        dst.display()
+                    )
+                })?;
+            let meta = fs::symlink_metadata(&dst).map_err(|e| {
+                format!("{phase}: cannot stat snapshot {}: {e}", dst.display())
+            })?;
+            FileFingerprint::from_meta(&meta)
+        };
+        locked_files.push(LockedFileRecord {
+            src,
+            src_fp,
+            dst,
+            dst_fp,
+        });
+    }
+    Ok(sha)
+}
+
+fn stage_tree_digest(
+    src_root: &Path,
+    snapshot_root: &Path,
+    dir_rel: &str,
+    phase: &str,
+    locked_files: &mut Vec<LockedFileRecord>,
+) -> Result<String, String> {
+    let dir = beneath(src_root, dir_rel, phase, ExpectedKind::Directory)?;
+    let mut lines = Vec::new();
+    for entry in WalkDir::new(&dir)
+        .follow_links(false)
+        .follow_root_links(false)
+    {
+        let entry = entry.map_err(|e| {
+            format!("{phase}: cannot walk {}: {e}", dir.display())
+        })?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(format!(
+                "{phase}: symlink or special file in toolchain: {}",
+                entry.path().display()
+            ));
+        }
+        let rel_in_dir = entry.path().strip_prefix(&dir).unwrap_or(entry.path());
+        let rel_in_root = entry
+            .path()
+            .strip_prefix(src_root)
+            .unwrap_or(entry.path())
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "{phase}: non-UTF-8 path in toolchain: {}",
+                    entry.path().display()
+                )
+            })?;
+        let file_sha = stage_locked_file(
+            src_root,
+            snapshot_root,
+            rel_in_root,
+            phase,
+            locked_files,
+        )?;
+        let mut line = file_sha.into_bytes();
+        line.extend_from_slice(b"  ");
+        line.extend_from_slice(rel_in_dir.as_os_str().as_bytes());
+        line.push(b'\n');
+        lines.push((rel_in_dir.as_os_str().as_bytes().to_vec(), line));
+    }
+    lines.sort();
+    Ok(sha256_bytes(
+        &lines.into_iter().flat_map(|(_, l)| l).collect::<Vec<_>>(),
+    ))
+}
+
+fn create_toolchain_snapshot_dir(canonical_root: &Path) -> Result<TempDir, String> {
+    if let Some(cache_dir) = canonical_root.parent().and_then(Path::parent)
+        && let Ok(dir) = tempfile::Builder::new()
+            .prefix(".anneal-tc-snapshot-")
+            .tempdir_in(cache_dir)
+        && join_env_paths([dir.path()], "toolchain").is_ok()
+    {
+        return Ok(dir);
+    }
+    private_tempdir("anneal-tc-snapshot-")
+}
+
+fn authenticate_toolchain(
+    root: &Path,
+    anneal_root: &AuthenticatedRoot,
+) -> Result<Toolchain, String> {
+    static AUTHENTICATED: Mutex<BTreeMap<PathBuf, Toolchain>> =
+        Mutex::new(BTreeMap::new());
     let phase = "toolchain";
     let canonical = fs::canonicalize(root).map_err(|e| {
         format!("{phase}: cannot resolve toolchain {}: {e}", root.display())
     })?;
-    let lean =
-        beneath(&canonical, "lean/bin/lean", phase, ExpectedKind::RegularFile)?;
-    let rustc =
-        beneath(&canonical, "rust/bin/rustc", phase, ExpectedKind::RegularFile)?;
-    let rust_lib =
-        beneath(&canonical, "rust/lib", phase, ExpectedKind::Directory)?;
-    let sysroot = beneath(&canonical, "rust", phase, ExpectedKind::Directory)?;
+    join_env_paths([canonical.as_path()], phase)?;
+
+    let mut cache = AUTHENTICATED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tc) = cache.get(&canonical)
+        && tc.verify_unchanged(phase).is_ok()
+    {
+        return Ok(tc.clone());
+    }
+
+    let tc = authenticate_toolchain_uncached(
+        &canonical,
+        &anneal_root.foundation_lock,
+    )?;
+    tc.verify_unchanged(phase)?;
+    cache.insert(canonical, tc.clone());
+    Ok(tc)
+}
+
+fn authenticate_toolchain_uncached(
+    root: &Path,
+    foundation_lock_bytes: &[u8],
+) -> Result<Toolchain, String> {
+    let phase = "toolchain";
+    let snapshot = Arc::new(create_toolchain_snapshot_dir(root)?);
+    let snapshot_root = snapshot.path().to_path_buf();
+    join_env_paths([snapshot_root.as_path()], phase)?;
+
+    let mut locked_files = Vec::new();
+    let mut locked_dirs = Vec::new();
+
+    // FIXME(#87): Add aarch64-linux, x86_64-macos, and aarch64-macos entries to
+    // `toolchain-lock.sha256` once those platform toolchain archives are pinned.
+    let platform = format!("{}-{}/", env::consts::ARCH, env::consts::OS);
+    let lock = parse_digest_lines(TOOLCHAIN_LOCK, phase)?;
+    let mut saw_platform = false;
+    for (key, want) in &lock {
+        let Some(rel) = key.strip_prefix(&platform) else {
+            continue;
+        };
+        saw_platform = true;
+        let got = if let Some(dir) = rel.strip_suffix("/**") {
+            stage_tree_digest(
+                root,
+                &snapshot_root,
+                dir,
+                phase,
+                &mut locked_files,
+            )?
+        } else if let Some(dir) = rel.strip_suffix('/') {
+            let dir_path = beneath(root, dir, phase, ExpectedKind::Directory)?;
+            let digest = listing_digest(&dir_path, phase)?;
+            locked_dirs.push((dir_path, want.clone()));
+            digest
+        } else {
+            stage_locked_file(
+                root,
+                &snapshot_root,
+                rel,
+                phase,
+                &mut locked_files,
+            )?
+        };
+        if &got != want {
+            return Err(format!(
+                "{phase}: toolchain entry {rel} has SHA-256 {got}, locked {want}"
+            ));
+        }
+    }
+    if !saw_platform {
+        return Err(format!(
+            "{phase}: toolchain-lock.sha256 has no entries for platform `{}`",
+            platform.trim_end_matches('/')
+        ));
+    }
+
+    verify_and_stage_foundation_lock(
+        root,
+        &snapshot_root,
+        foundation_lock_bytes,
+        &mut locked_files,
+    )?;
+
     Ok(Toolchain {
-        root: canonical,
-        lean,
-        rustc,
-        rust_lib,
-        sysroot,
+        source_root: root.to_path_buf(),
+        lean: beneath(
+            &snapshot_root,
+            "lean/bin/lean",
+            phase,
+            ExpectedKind::RegularFile,
+        )?,
+        rustc: beneath(
+            &snapshot_root,
+            "rust/bin/rustc",
+            phase,
+            ExpectedKind::RegularFile,
+        )?,
+        rust_lib: snapshot_root.join("rust/lib"),
+        sysroot: snapshot_root.join("rust"),
+        _snapshot: snapshot,
+        snapshot_root,
+        locked_files: Arc::new(locked_files),
+        locked_dirs: Arc::new(locked_dirs),
     })
 }
 
-/// Source buffers loaded from `--anneal-root`.
-struct AnnealRootSources {
+/// Authenticated source buffers read from `--anneal-root` after verifying
+/// every file against [`LOCKED_ANNEAL_SOURCES`].
+struct AuthenticatedRoot {
     foundation_lock: Vec<u8>,
-    trusted_lean: Vec<(&'static str, Vec<u8>)>,
-    theory_lean: Vec<(&'static str, Vec<u8>)>,
-    rustc_capture: Option<Vec<(&'static str, Vec<u8>)>>,
+    trusted_lean: Vec<(String, Vec<u8>)>,
+    theory_lean: Vec<(String, Vec<u8>)>,
+    rustc_capture: Vec<(String, Vec<u8>)>,
 }
 
-fn load_anneal_root(anneal_root: &Path) -> Result<AnnealRootSources, String> {
+/// Authenticates `anneal_root` (`trusted/lean/foundation-lock.json`,
+/// `trusted/lean/*.lean`, `theory/*.lean`, and `trusted/rustc-capture/src/*.rs`)
+/// against [`LOCKED_ANNEAL_SOURCES`] and returns the verified in-memory source
+/// buffers.
+fn authenticate_anneal_root(
+    anneal_root: &Path,
+) -> Result<Arc<AuthenticatedRoot>, String> {
     let phase = "anneal-root";
     let canonical = fs::canonicalize(anneal_root).map_err(|e| {
         format!(
@@ -366,36 +890,57 @@ fn load_anneal_root(anneal_root: &Path) -> Result<AnnealRootSources, String> {
             anneal_root.display()
         )
     })?;
-    let load_file = |rel: &str| -> Result<Vec<u8>, String> {
-        let path = beneath(&canonical, rel, phase, ExpectedKind::RegularFile)?;
-        read_regular(&path, phase)
-    };
+    join_env_paths([canonical.as_path()], phase)?;
 
-    let foundation_lock = load_file("trusted/lean/foundation-lock.json")?;
-    let mut trusted_lean = Vec::with_capacity(TRUSTED_LEAN_PATHS.len());
-    for rel in TRUSTED_LEAN_PATHS {
-        trusted_lean.push((rel, load_file(&format!("trusted/lean/{rel}"))?));
-    }
-    let mut theory_lean = Vec::with_capacity(THEORY_LEAN_PATHS.len());
-    for rel in THEORY_LEAN_PATHS {
-        theory_lean.push((rel, load_file(&format!("theory/{rel}"))?));
-    }
-    let rustc_capture = if canonical.join("trusted/rustc-capture").exists() {
-        let mut sources = Vec::with_capacity(RUSTC_CAPTURE_PATHS.len());
-        for rel in RUSTC_CAPTURE_PATHS {
-            sources.push((rel, load_file(&format!("trusted/rustc-capture/{rel}"))?));
+    let entries = parse_digest_lines(LOCKED_ANNEAL_SOURCES, phase)?;
+    let mut foundation_lock: Option<Vec<u8>> = None;
+    let mut trusted_lean = Vec::new();
+    let mut theory_lean = Vec::new();
+    let mut rustc_capture = Vec::new();
+
+    for (rel, expected_sha) in entries {
+        let path = beneath(&canonical, &rel, phase, ExpectedKind::RegularFile)?;
+        let actual = read_regular(&path, phase)?;
+        let actual_sha = sha256_bytes(&actual);
+        if actual_sha != expected_sha {
+            return Err(format!(
+                "{phase}: {rel} in {} does not match compiled-in sources \
+                 ({actual_sha} != {expected_sha})",
+                canonical.display()
+            ));
         }
-        Some(sources)
-    } else {
-        None
-    };
+        if rel == "trusted/lean/foundation-lock.json" {
+            foundation_lock = Some(actual);
+        } else if let Some(sub) = rel.strip_prefix("trusted/lean/") {
+            trusted_lean.push((sub.to_string(), actual));
+        } else if let Some(sub) = rel.strip_prefix("theory/") {
+            theory_lean.push((sub.to_string(), actual));
+        } else if let Some(sub) = rel.strip_prefix("trusted/rustc-capture/") {
+            rustc_capture.push((sub.to_string(), actual));
+        } else {
+            return Err(format!(
+                "{phase}: unrecognized path `{rel}` in anneal-sources.sha256"
+            ));
+        }
+    }
 
-    Ok(AnnealRootSources {
+    let foundation_lock = foundation_lock.ok_or_else(|| {
+        format!(
+            "{phase}: trusted/lean/foundation-lock.json missing from anneal-sources.sha256"
+        )
+    })?;
+    if rustc_capture.is_empty() {
+        return Err(format!(
+            "{phase}: trusted/rustc-capture sources missing from anneal-sources.sha256"
+        ));
+    }
+
+    Ok(Arc::new(AuthenticatedRoot {
         foundation_lock,
         trusted_lean,
         theory_lean,
         rustc_capture,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,11 +997,12 @@ struct TargetTrustPolicy {
     allow_candidate_features: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedTargetCrate {
     crate_name: String,
     edition: String,
     allow_candidate_features: Vec<String>,
+    cargo_toml_bytes: Vec<u8>,
     lib_rs_bytes: Vec<u8>,
     tcb_lock_bytes: Option<Vec<u8>>,
 }
@@ -530,9 +1076,9 @@ fn validate_target_crate(path: &Path) -> Result<ValidatedTargetCrate, String> {
     } else {
         None
     };
-    let text = String::from_utf8(cargo_toml_bytes)
+    let text = std::str::from_utf8(&cargo_toml_bytes)
         .map_err(|_| format!("{phase}: Cargo.toml is not UTF-8"))?;
-    let manifest: TargetManifest = toml::from_str(&text).map_err(|e| {
+    let manifest: TargetManifest = toml::from_str(text).map_err(|e| {
         format!("{phase}: Cargo.toml outside the allowed schema: {e}")
     })?;
     let pkg = manifest.package;
@@ -558,9 +1104,24 @@ fn validate_target_crate(path: &Path) -> Result<ValidatedTargetCrate, String> {
             .metadata
             .map(|m| m.anneal.trust_policy.allow_candidate_features)
             .unwrap_or_default(),
+        cargo_toml_bytes,
         lib_rs_bytes,
         tcb_lock_bytes,
     })
+}
+
+fn revalidate_target_crate(
+    path: &Path,
+    expected: &ValidatedTargetCrate,
+) -> Result<(), String> {
+    let current = validate_target_crate(path)?;
+    if &current != expected {
+        return Err(
+            "target-crate: Cargo.toml, src/lib.rs, or anneal-tcb.lock changed during verification"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -761,14 +1322,14 @@ fn parse_module_trust_tier(
     })
 }
 
-/// Discovers all candidate TCB features in `TRUSTED_LEAN_PATHS` plus
+/// Discovers all candidate TCB features in `trusted_lean` plus
 /// `rustc_capture`, and verifies that the target crate and release channel
 /// permit them.
 ///
 /// Returns a map from candidate feature name to the list of TCB components
 /// gated by that feature.
 fn check_candidate_policy(
-    trusted_lean: &[(&'static str, Vec<u8>)],
+    trusted_lean: &[(String, Vec<u8>)],
     crate_allowed: &[String],
     cli_allowed: &[String],
     release_channel: ReleaseChannel,
@@ -840,75 +1401,34 @@ fn check_candidate_policy(
     Ok(required)
 }
 
-/// Validated and policy-checked inputs for a single capture or verification
-/// invocation.
-struct PreparedVerify {
-    target: ValidatedTargetCrate,
-    tc: Toolchain,
-    root: AnnealRootSources,
-    active_candidates: BTreeMap<String, Vec<String>>,
-}
-
-fn prepare_verify(config: &VerifyConfig) -> Result<PreparedVerify, String> {
-    let target = validate_target_crate(&config.crate_dir)?;
-    let tc = resolve_toolchain(&config.toolchain_dir)?;
-    let root = load_anneal_root(&config.anneal_root)?;
-    let active_candidates = check_candidate_policy(
-        &root.trusted_lean,
-        &target.allow_candidate_features,
-        &config.allow_candidate_features,
-        config.release_channel,
-    )?;
-    Ok(PreparedVerify {
-        target,
-        tc,
-        root,
-        active_candidates,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Building and running `anneal-rustc-capture`
 // ---------------------------------------------------------------------------
 
-/// Builds (or resolves) the `anneal-rustc-capture` binary for `tc` from the
-/// [`AnnealRootSources`] sources in a process-cached private `/tmp` directory
-/// (or uses `tc.root/bin/anneal-rustc-capture` when running from an installed
-/// archive without `trusted/rustc-capture` sources).
+/// Builds the `anneal-rustc-capture` binary for `tc` from the authenticated
+/// [`AuthenticatedRoot`] sources inside a process-private `/tmp` directory.
 fn ensure_rustc_capture_bin(
     tc: &Toolchain,
-    root: &AnnealRootSources,
+    root: &AuthenticatedRoot,
 ) -> Result<PathBuf, String> {
-    static BUILT_CAPTURE: Mutex<BTreeMap<PathBuf, (Arc<TempDir>, PathBuf)>> =
+    static BUILT_CAPTURE: Mutex<BTreeMap<PathBuf, Arc<TempDir>>> =
         Mutex::new(BTreeMap::new());
 
-    let Some(rustc_capture_sources) = &root.rustc_capture else {
-        let prebuilt = tc.root.join("bin/anneal-rustc-capture");
-        if prebuilt.is_file() {
-            return Ok(prebuilt);
-        }
-        return Err(format!(
-            "missing both trusted/rustc-capture sources and {}",
-            prebuilt.display()
-        ));
-    };
-
+    tc.verify_unchanged("rustc-capture-build")?;
     let mut cache = BUILT_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, bin)) = cache.get(&tc.root) {
-        return Ok(bin.clone());
+    if let Some(stage) = cache.get(&tc.source_root) {
+        return Ok(stage.path().join("anneal-rustc-capture"));
     }
 
     let stage = Arc::new(private_tempdir("anneal-capture-build-")?);
+    let bin = stage.path().join("anneal-rustc-capture");
     let src_stage = stage.path().join("rustc-capture");
-    fs::create_dir_all(src_stage.join("src"))
-        .map_err(|e| format!("cannot create capture staging dir: {e}"))?;
-
-    for (rel, bytes) in rustc_capture_sources {
-        fs::write(src_stage.join(rel), bytes)
-            .map_err(|e| format!("cannot write staged {rel}: {e}"))?;
+    for (rel, bytes) in &root.rustc_capture {
+        write_staged(&src_stage, rel, bytes)?;
     }
 
-    let bin = stage.path().join("anneal-rustc-capture");
+    let dylib_path =
+        join_env_paths([tc.rust_lib.as_path()], DYLIB_PATH_VAR)?;
     let out = child_command(&tc.rustc)
         .arg("--edition=2024")
         .arg("--crate-name")
@@ -918,7 +1438,8 @@ fn ensure_rustc_capture_bin(
         .arg(src_stage.join("src/main.rs"))
         .arg("-o")
         .arg(&bin)
-        .env(DYLIB_PATH_VAR, &tc.rust_lib)
+        .env("CARGO_PKG_VERSION", "0.1.0")
+        .env(DYLIB_PATH_VAR, dylib_path)
         .output()
         .map_err(|e| format!("failed to spawn rustc for rustc-capture: {e}"))?;
     if !out.status.success() {
@@ -928,63 +1449,136 @@ fn ensure_rustc_capture_bin(
             String::from_utf8_lossy(&out.stderr),
         ));
     }
+    tc.verify_unchanged("rustc-capture-build")?;
 
-    if !bin.is_file() {
-        return Err(format!(
-            "rustc build succeeded but {} is missing",
-            bin.display()
-        ));
-    }
-    cache.insert(tc.root.clone(), (stage, bin.clone()));
+    cache.insert(tc.source_root.clone(), stage);
     Ok(bin)
 }
 
-fn capture_prepared(prep: &PreparedVerify) -> Result<String, String> {
-    let capture_bin = ensure_rustc_capture_bin(&prep.tc, &prep.root)?;
-    let stage = private_tempdir("anneal-capture-run-")?;
-    let staged_src_dir = stage.path().join("src");
-    fs::create_dir_all(&staged_src_dir)
-        .map_err(|e| format!("cannot create staged src dir: {e}"))?;
-    let staged_lib_rs = staged_src_dir.join("lib.rs");
-    fs::write(&staged_lib_rs, &prep.target.lib_rs_bytes)
-        .map_err(|e| format!("cannot write staged src/lib.rs: {e}"))?;
+/// Verifies from `rustc`'s `--emit=dep-info` output that `staged_lib_rs` was
+/// the sole source file read while expanding the target crate (rejecting
+/// `#[path = "..."]`, `include!`, `include_str!`, and `include_bytes!`).
+fn verify_sole_source_dep_info(
+    deps_d: &Path,
+    staged_lib_rs: &Path,
+) -> Result<(), VerifyError> {
+    let dep_bytes =
+        read_regular(deps_d, "capture-dep-info").map_err(VerifyError::new)?;
+    let dep_text = std::str::from_utf8(&dep_bytes).map_err(|_| {
+        VerifyError::new("capture-dep-info: deps.d is not UTF-8".to_string())
+    })?;
+    let expected = format!(
+        "{}: {}\n\n{}:",
+        deps_d.display(),
+        staged_lib_rs.display(),
+        staged_lib_rs.display(),
+    );
+    if dep_text.trim() != expected.trim() {
+        let diag = format!(
+            "error: target crate read source files or environment variables \
+             outside staged src/lib.rs (dep-info: {})",
+            dep_text.trim().replace('\n', " ")
+        );
+        return Err(VerifyError::capture("", &diag));
+    }
+    Ok(())
+}
 
+fn capture_mir(
+    tc: &Toolchain,
+    root: &AuthenticatedRoot,
+    target: &ValidatedTargetCrate,
+) -> Result<String, VerifyError> {
+    let capture_bin =
+        ensure_rustc_capture_bin(tc, root).map_err(VerifyError::new)?;
+    let stage =
+        private_tempdir("anneal-capture-run-").map_err(VerifyError::new)?;
+    let staged_lib_rs =
+        write_staged(stage.path(), "src/lib.rs", &target.lib_rs_bytes)
+            .map_err(VerifyError::new)?;
+    let deps_d = stage.path().join("deps.d");
     let out_mir = stage.path().join("Mir.lean");
+    let dylib_path = join_env_paths([tc.rust_lib.as_path()], DYLIB_PATH_VAR)
+        .map_err(VerifyError::new)?;
+
+    tc.verify_unchanged("capture").map_err(VerifyError::new)?;
+    let dep_out = child_command(&tc.rustc)
+        .arg(format!("--edition={}", target.edition))
+        .arg("--crate-type=lib")
+        .arg("--crate-name")
+        .arg(&target.crate_name)
+        .arg("--sysroot")
+        .arg(&tc.sysroot)
+        .arg(format!("--emit=dep-info={}", deps_d.display()))
+        .arg("-Z")
+        .arg("no-codegen")
+        .arg(&staged_lib_rs)
+        .env(DYLIB_PATH_VAR, &dylib_path)
+        .output()
+        .map_err(|e| {
+            VerifyError::new(format!("failed to run rustc dep-info check: {e}"))
+        })?;
+    if deps_d.exists() {
+        verify_sole_source_dep_info(&deps_d, &staged_lib_rs)?;
+    }
 
     let out = child_command(&capture_bin)
         .arg("--sysroot")
-        .arg(&prep.tc.sysroot)
+        .arg(&tc.sysroot)
         .arg("--edition")
-        .arg(&prep.target.edition)
+        .arg(&target.edition)
         .arg("--crate-name")
-        .arg(&prep.target.crate_name)
+        .arg(&target.crate_name)
         .arg("--src")
         .arg(&staged_lib_rs)
         .arg("--out")
         .arg(&out_mir)
-        .env(DYLIB_PATH_VAR, &prep.tc.rust_lib)
+        .env(DYLIB_PATH_VAR, &dylib_path)
         .output()
-        .map_err(|e| format!("failed to run anneal-rustc-capture: {e}"))?;
+        .map_err(|e| {
+            VerifyError::new(format!("failed to run anneal-rustc-capture: {e}"))
+        })?;
+    tc.verify_unchanged("capture").map_err(VerifyError::new)?;
 
     if !out.status.success() {
-        return Err(format!(
-            "anneal-rustc-capture failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
+        return Err(VerifyError::capture(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
         ));
     }
+    if !dep_out.status.success() {
+        return Err(VerifyError::capture(
+            &String::from_utf8_lossy(&dep_out.stdout),
+            &String::from_utf8_lossy(&dep_out.stderr),
+        ));
+    }
+    verify_sole_source_dep_info(&deps_d, &staged_lib_rs)?;
 
-    let mir_bytes = read_regular(&out_mir, "capture-output")?;
-    String::from_utf8(mir_bytes)
-        .map_err(|_| "generated Mir.lean is not UTF-8".to_string())
+    let mir_bytes =
+        read_regular(&out_mir, "capture-output").map_err(VerifyError::new)?;
+    String::from_utf8(mir_bytes).map_err(|_| {
+        VerifyError::new("generated Mir.lean is not UTF-8".to_string())
+    })
 }
 
-/// Validates the target crate, runs `anneal-rustc-capture` in a private `/tmp`
-/// directory on the pinned `src/lib.rs` bytes, and returns the captured
-/// `Mir.lean` source string.
-pub fn capture(config: &VerifyConfig) -> Result<String, String> {
-    let prep = prepare_verify(config)?;
-    capture_prepared(&prep)
+/// Validates the target crate, authenticates the toolchain and Anneal root,
+/// runs `anneal-rustc-capture` in a private `/tmp` directory on the pinned
+/// `src/lib.rs` bytes, and returns the captured `Mir.lean` source string.
+pub fn capture(config: &VerifyConfig) -> Result<String, VerifyError> {
+    let target =
+        validate_target_crate(&config.crate_dir).map_err(VerifyError::new)?;
+    let root =
+        authenticate_anneal_root(&config.anneal_root).map_err(VerifyError::new)?;
+    let tc = authenticate_toolchain(&config.toolchain_dir, &root)
+        .map_err(VerifyError::new)?;
+    let _active_candidates = check_candidate_policy(
+        &root.trusted_lean,
+        &target.allow_candidate_features,
+        &config.allow_candidate_features,
+        config.release_channel,
+    )
+    .map_err(VerifyError::new)?;
+    capture_mir(&tc, &root, &target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,15 +1596,25 @@ struct FoundationModule {
     parts: BTreeMap<String, String>,
 }
 
-fn verify_foundation_lock(
-    tc: &Toolchain,
+fn verify_and_stage_foundation_lock(
+    src_root: &Path,
+    snapshot_root: &Path,
     foundation_lock_bytes: &[u8],
+    locked_files: &mut Vec<LockedFileRecord>,
 ) -> Result<(), String> {
     let phase = "foundation-lock";
     let lock: FoundationLock = serde_json::from_slice(foundation_lock_bytes)
         .map_err(|e| format!("{phase}: invalid JSON: {e}"))?;
 
-    let ver_out = child_command(&tc.lean)
+    let actual_lean_sha = stage_locked_file(
+        src_root,
+        snapshot_root,
+        "lean/bin/lean",
+        phase,
+        locked_files,
+    )?;
+    let staged_lean = snapshot_root.join("lean/bin/lean");
+    let ver_out = child_command(&staged_lean)
         .arg("--version")
         .output()
         .map_err(|e| format!("{phase}: failed to run lean --version: {e}"))?;
@@ -1028,24 +1632,26 @@ fn verify_foundation_lock(
             "{phase}: Lean version string `{ver_line}` not found in foundation-lock.json"
         )
     })?;
-    let actual_lean_sha = sha256_file(&tc.lean, phase)?;
     if &actual_lean_sha != expected_lean_sha {
         return Err(format!(
             "{phase}: lean binary SHA-256 mismatch ({actual_lean_sha} != {expected_lean_sha})"
         ));
     }
 
-    let lean_lib = tc.root.join("lean/lib/lean");
     for (mod_name, mod_entry) in &lock.modules {
         let rel_base = mod_name.replace('.', "/");
         for (ext, expected_sha) in &mod_entry.parts {
-            let rel = format!("{rel_base}.{ext}");
-            let path =
-                beneath(&lean_lib, &rel, phase, ExpectedKind::RegularFile)?;
-            let actual_sha = sha256_file(&path, phase)?;
+            let rel = format!("lean/lib/lean/{rel_base}.{ext}");
+            let actual_sha = stage_locked_file(
+                src_root,
+                snapshot_root,
+                &rel,
+                phase,
+                locked_files,
+            )?;
             if &actual_sha != expected_sha {
                 return Err(format!(
-                    "{phase}: foundation artifact {rel} SHA-256 mismatch \
+                    "{phase}: foundation artifact {rel_base}.{ext} SHA-256 mismatch \
                      ({actual_sha} != {expected_sha})"
                 ));
             }
@@ -1056,15 +1662,20 @@ fn verify_foundation_lock(
 
 fn compile_lean_file(
     tc: &Toolchain,
-    lean_path: &str,
+    lean_path: &OsString,
     src_file: &Path,
     out_olean: &Path,
-) -> Result<(), String> {
+) -> Result<(), (String, Option<StageFailure>)> {
     if let Some(parent) = out_olean.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            format!("cannot create parent directory {}: {e}", parent.display())
+            (
+                format!("cannot create parent directory {}: {e}", parent.display()),
+                None,
+            )
         })?;
     }
+    tc.verify_unchanged("lean-compile")
+        .map_err(|e| (e, None))?;
     let out = child_command(&tc.lean)
         .env("LEAN_PATH", lean_path)
         .arg("-DwarningAsError=true")
@@ -1076,133 +1687,181 @@ fn compile_lean_file(
         .arg(src_file)
         .output()
         .map_err(|e| {
-            format!("failed to invoke lean on {}: {e}", src_file.display())
+            (
+                format!("failed to invoke lean on {}: {e}", src_file.display()),
+                None,
+            )
         })?;
+    tc.verify_unchanged("lean-compile")
+        .map_err(|e| (e, None))?;
     if !out.status.success() {
-        return Err(format!(
-            "lean failed on {}:\nstdout:\n{}\nstderr:\n{}",
-            src_file.display(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stage_failure = stdout
+            .lines()
+            .next()
+            .and_then(|line| {
+                serde_json::from_str::<[String; 2]>(line.trim()).ok()
+            })
+            .map(|[diagnostic, scope]| StageFailure {
+                stage: FailureStage::Proof { scope },
+                diagnostic,
+            });
+        let prefix = match &stage_failure {
+            Some(StageFailure {
+                stage: FailureStage::Proof { scope },
+                diagnostic,
+            }) => format!("proof [{scope}]: {diagnostic}\n"),
+            _ => String::new(),
+        };
+        return Err((
+            format!(
+                "{prefix}lean failed on {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                src_file.display(),
+            ),
+            stage_failure,
         ));
     }
     Ok(())
 }
 
 /// Compiles `Trusted` and `Anneal` `.olean`s into a process-cached private
-/// `/tmp` directory from [`AnnealRootSources`].
+/// `/tmp` directory from the authenticated [`AuthenticatedRoot`] sources.
 fn ensure_compiled_prefix(
     tc: &Toolchain,
-    root: &AnnealRootSources,
+    root: &AuthenticatedRoot,
 ) -> Result<Arc<TempDir>, String> {
     static PREFIX_CACHE: Mutex<BTreeMap<PathBuf, Arc<TempDir>>> =
         Mutex::new(BTreeMap::new());
 
+    tc.verify_unchanged("lean-prefix")?;
     let mut cache = PREFIX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(dir) = cache.get(&tc.root) {
+    if let Some(dir) = cache.get(&tc.source_root) {
         return Ok(dir.clone());
     }
 
-    verify_foundation_lock(tc, &root.foundation_lock)?;
-
     let prefix_dir = Arc::new(private_tempdir("anneal-lean-prefix-")?);
-    let lean_sys_lib = tc.root.join("lean/lib/lean");
-    let lean_path = format!(
-        "{}:{}",
-        prefix_dir.path().display(),
-        lean_sys_lib.display()
-    );
+    let lean_sys_lib = tc.snapshot_root.join("lean/lib/lean");
+    let lean_path = join_env_paths(
+        [prefix_dir.path(), lean_sys_lib.as_path()],
+        "LEAN_PATH",
+    )?;
 
-    for (rel, bytes) in root
-        .trusted_lean
-        .iter()
-        .chain(root.theory_lean.iter())
-    {
-        let staged_src = prefix_dir.path().join("src").join(rel);
-        if let Some(parent) = staged_src.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "cannot create staged Lean source dir {}: {e}",
-                    parent.display()
-                )
-            })?;
-        }
-        fs::write(&staged_src, bytes).map_err(|e| {
-            format!("cannot write staged Lean source {rel}: {e}")
-        })?;
-        let out_olean = prefix_dir
-            .path()
-            .join(rel.strip_suffix(".lean").unwrap_or(rel))
-            .with_extension("olean");
-        compile_lean_file(tc, &lean_path, &staged_src, &out_olean)?;
+    for (rel, bytes) in root.trusted_lean.iter().chain(&root.theory_lean) {
+        let rel_olean =
+            format!("{}.olean", rel.strip_suffix(".lean").unwrap_or(rel));
+        let staged_src =
+            write_staged(&prefix_dir.path().join("src"), rel, bytes)?;
+        let out_olean = prefix_dir.path().join(&rel_olean);
+        compile_lean_file(tc, &lean_path, &staged_src, &out_olean)
+            .map_err(|(msg, _)| msg)?;
     }
 
-    cache.insert(tc.root.clone(), prefix_dir.clone());
+    cache.insert(tc.source_root.clone(), prefix_dir.clone());
     Ok(prefix_dir)
 }
 
 /// Verifies the crate described by `config` and returns a [`VerifyReport`]
-/// including any active `[candidate-tcb-audit]` details.
-pub fn verify_crate_with_report(
-    config: &VerifyConfig,
-) -> Result<VerifyReport, String> {
-    let prep = prepare_verify(config)?;
-    let mir_lean_src = capture_prepared(&prep)?;
+/// including the captured `Mir.lean` module source and any active
+/// `[candidate-tcb-audit]` details.
+pub fn verify_crate(config: &VerifyConfig) -> Result<VerifyReport, VerifyError> {
+    let target =
+        validate_target_crate(&config.crate_dir).map_err(VerifyError::new)?;
+    let root =
+        authenticate_anneal_root(&config.anneal_root).map_err(VerifyError::new)?;
+    let tc = authenticate_toolchain(&config.toolchain_dir, &root)
+        .map_err(VerifyError::new)?;
+    let active_candidates = check_candidate_policy(
+        &root.trusted_lean,
+        &target.allow_candidate_features,
+        &config.allow_candidate_features,
+        config.release_channel,
+    )
+    .map_err(VerifyError::new)?;
+
+    let mir_lean_src = capture_mir(&tc, &root, &target)?;
     validate_mir_lean_and_waivers(
         &mir_lean_src,
-        prep.target.tcb_lock_bytes.as_deref(),
-    )?;
-    let prefix_dir = ensure_compiled_prefix(&prep.tc, &prep.root)?;
+        target.tcb_lock_bytes.as_deref(),
+    )
+    .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
 
-    let verify_dir = private_tempdir("anneal-verify-")?;
-    let mir_lean_path = verify_dir.path().join("Mir.lean");
+    let prefix_dir =
+        ensure_compiled_prefix(&tc, &root).map_err(VerifyError::new)?;
+
+    let verify_dir =
+        private_tempdir("anneal-verify-").map_err(VerifyError::new)?;
+    let mir_lean_path =
+        write_staged(verify_dir.path(), "Mir.lean", mir_lean_src.as_bytes())
+            .map_err(VerifyError::new)?;
     let mir_olean_path = verify_dir.path().join("Mir.olean");
-    let proof_lean_path = verify_dir.path().join("Proof.lean");
-    fs::write(&mir_lean_path, &mir_lean_src)
-        .map_err(|e| format!("cannot write staged Mir.lean: {e}"))?;
-    fs::write(&proof_lean_path, PROOF_LEAN_SOURCE)
-        .map_err(|e| format!("cannot write staged Proof.lean: {e}"))?;
+    let proof_lean_path = write_staged(
+        verify_dir.path(),
+        "Proof.lean",
+        PROOF_LEAN_SOURCE.as_bytes(),
+    )
+    .map_err(VerifyError::new)?;
 
-    let lean_sys_lib = prep.tc.root.join("lean/lib/lean");
-    let lean_path = format!(
-        "{}:{}:{}",
-        verify_dir.path().display(),
-        prefix_dir.path().display(),
-        lean_sys_lib.display()
-    );
+    let lean_sys_lib = tc.snapshot_root.join("lean/lib/lean");
+    let lean_path = join_env_paths(
+        [
+            verify_dir.path(),
+            prefix_dir.path(),
+            lean_sys_lib.as_path(),
+        ],
+        "LEAN_PATH",
+    )
+    .map_err(VerifyError::new)?;
 
-    compile_lean_file(&prep.tc, &lean_path, &mir_lean_path, &mir_olean_path)?;
-    set_readonly(&mir_lean_path, "verify")?;
-    set_readonly(&mir_olean_path, "verify")?;
-    let mir_olean_sha = sha256_file(&mir_olean_path, "verify")?;
+    compile_lean_file(&tc, &lean_path, &mir_lean_path, &mir_olean_path)
+        .map_err(|(msg, failure)| {
+            VerifyError::with_mir(msg, mir_lean_src.clone(), failure)
+        })?;
+    set_readonly(&mir_lean_path, "verify")
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
+    set_readonly(&mir_olean_path, "verify")
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
+    let mir_olean_sha = sha256_file(&mir_olean_path, "verify")
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
 
     compile_lean_file(
-        &prep.tc,
+        &tc,
         &lean_path,
         &proof_lean_path,
         &verify_dir.path().join("Proof.olean"),
-    )?;
-    let post_mir_olean_sha = sha256_file(&mir_olean_path, "verify")?;
+    )
+    .map_err(|(msg, failure)| {
+        VerifyError::with_mir(msg, mir_lean_src.clone(), failure)
+    })?;
+    let post_mir_olean_sha = sha256_file(&mir_olean_path, "verify")
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
     if post_mir_olean_sha != mir_olean_sha {
-        return Err(
+        return Err(VerifyError::with_mir(
             "verify: Mir.olean was modified during Proof.lean compilation"
                 .into(),
-        );
+            mir_lean_src,
+            None,
+        ));
     }
 
+    revalidate_target_crate(&config.crate_dir, &target)
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
+    tc.verify_unchanged("verify")
+        .map_err(|e| VerifyError::with_mir(e, mir_lean_src.clone(), None))?;
+
     let candidate_features: Vec<String> =
-        prep.active_candidates.keys().cloned().collect();
+        active_candidates.keys().cloned().collect();
     let mut output_text = format!(
         "verified crate `{}` (Proof.verify_crate : Trusted.CrateTheorem Mir.crate)\n",
-        prep.target.crate_name
+        target.crate_name
     );
-    if !prep.active_candidates.is_empty() {
+    if !active_candidates.is_empty() {
         output_text.push_str(&format!(
             "Candidate-Trusted TCB (Unvetted / Alpha): {}\n",
             candidate_features.join(", ")
         ));
         output_text.push_str("[candidate-tcb-audit]\n");
-        for (feat, origins) in &prep.active_candidates {
+        for (feat, origins) in &active_candidates {
             output_text.push_str(&format!(
                 "  candidate:{feat} -> {}\n",
                 origins.join(", ")
@@ -1211,12 +1870,16 @@ pub fn verify_crate_with_report(
     }
 
     Ok(VerifyReport {
+        mir_lean: mir_lean_src,
         candidate_features,
         output_text,
     })
 }
 
-/// Verifies the crate described by `config`.
-pub fn verify_crate(config: &VerifyConfig) -> Result<(), String> {
-    verify_crate_with_report(config).map(|_| ())
+/// Alias for [`verify_crate`] retained for compatibility with callers that
+/// inspect the returned [`VerifyReport`].
+pub fn verify_crate_with_report(
+    config: &VerifyConfig,
+) -> Result<VerifyReport, VerifyError> {
+    verify_crate(config)
 }

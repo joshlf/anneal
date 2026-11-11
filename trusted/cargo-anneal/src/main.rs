@@ -19,7 +19,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use cargo_anneal::setup;
-use cargo_anneal::{ReleaseChannel, VerifyConfig, verify_crate_with_report};
+use cargo_anneal::{ReleaseChannel, VerifyConfig, verify_crate};
 
 #[derive(Parser)]
 #[command(
@@ -59,23 +59,12 @@ enum Commands {
     },
 }
 
-fn default_release_channel() -> ReleaseChannel {
-    if env!("CARGO_PKG_VERSION").contains('-') {
-        ReleaseChannel::Alpha
-    } else {
-        ReleaseChannel::Stable
-    }
-}
-
 fn resolve_default_anneal_root(toolchain_dir: &Path) -> PathBuf {
     let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if manifest_root.join("trusted/lean/Trusted.lean").is_file()
         && manifest_root.join("theory/Anneal.lean").is_file()
     {
-        if let Ok(canon) = std::fs::canonicalize(&manifest_root) {
-            return canon;
-        }
-        return manifest_root;
+        return std::fs::canonicalize(&manifest_root).unwrap_or(manifest_root);
     }
     toolchain_dir.join("share/anneal")
 }
@@ -156,11 +145,9 @@ fn run(mut raw_args: Vec<String>) -> Result<(), CliError> {
             toolchain,
             anneal_root,
         }) => {
-            let release_channel = match release_channel {
-                Some(raw) => ReleaseChannel::parse(&raw)
-                    .map_err(|e| CliError::usage(format!("error: {e}")))?,
-                None => default_release_channel(),
-            };
+            let release_channel =
+                ReleaseChannel::resolve(release_channel.as_deref())
+                    .map_err(|e| CliError::usage(format!("error: {e}")))?;
             let allow_candidate_features = allow_candidate_features
                 .unwrap_or_default()
                 .into_iter()
@@ -190,7 +177,7 @@ fn run(mut raw_args: Vec<String>) -> Result<(), CliError> {
                 allow_candidate_features,
                 release_channel,
             };
-            let report = verify_crate_with_report(&config)
+            let report = verify_crate(&config)
                 .map_err(|e| CliError::failed(format!("error: {e}")))?;
             print!("{}", report.output_text);
             Ok(())

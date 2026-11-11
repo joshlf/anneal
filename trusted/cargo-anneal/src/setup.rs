@@ -68,19 +68,15 @@ pub fn resolve_installed() -> Option<PathBuf> {
         home.join("anneal/toolchain"),
         home.join(".anneal/toolchain"),
     ] {
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            continue;
-        };
-        let mut candidates = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_valid_toolchain_dir(&path) {
-                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
-                candidates.push((mtime, path));
-            }
-        }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        if let Some((_, dir)) = candidates.into_iter().next() {
+        if let Some(dir) = std::fs::read_dir(&base)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_valid_toolchain_dir(p))
+            .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        {
             return Some(dir);
         }
     }
