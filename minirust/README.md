@@ -1154,7 +1154,11 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `&raw const (*q)` of the same misaligned `*const u32` that makes
   `misalignedRef` UB returns `5` everywhere (`misalignedRaw_three_way_agreement`),
   and `&raw mut` of an uninitialized local followed by a write through the raw
-  pointer returns `12` everywhere (`rawAddrOfUninit_three_way_agreement`).
+  pointer returns `12` everywhere (`rawAddrOfUninit_three_way_agreement`);
+  transmuting `4_usize` to `*const u32` without dereferencing likewise returns
+  `5` everywhere via provenance-less `decodeScalarBytes`
+  (`transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement`, contrasting
+  directly with `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`).
   They disagree on the remaining divergences listed under the gaps:
   `danglingRef`
   (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
@@ -1249,8 +1253,13 @@ and `PointerWithExposedProvenance` casts lowered by `translateFnWithIntrinsics`
 under `provCastFlowOk` (exposed-address locals are non-argument temporaries,
 written only by `PointerExposeProvenance`, read only by
 `PointerWithExposedProvenance` at the exposed pointer's pointee and without
-adding mutability, and never otherwise observed; no forged addresses) and
-`ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
+adding mutability, and never otherwise observed; no forged addresses),
+`ptrDeclLayoutsOk body` (required directly in both `inFragmentWithIntrinsics`
+and `bodyInProgFragmentWithIntrinsics` because `provCastAliasView` retypes
+exposed `usize` locals to `provCastAliasTy`, which would otherwise erase a
+corrupt `usize` `layoutIdx` that makes Anneal's `checkTargetPlaceAlign` fault
+while `Mach` and `MachTB` succeed: `shadowedUsizeLayoutDivergence_three_way`),
+and `ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
 pointer copy: Anneal exposes the canonical stack address
 `canonicalLocalAddr entry.targetLocal relOff` of the borrowed place, records the
 tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?` recovers the same
@@ -1269,9 +1278,17 @@ proper-sub-place target-slot readiness from `FrameOkWithIntrinsics`, `BorrowsOk`
 canonical-page bound `body.localDecls.length ≤ 2^47 - stackLocalAddrPageBase 8 + 1`
 (`canonicalLocalAddr_lt_two_pow_64`, sized for in-local offsets below `2^63`;
 `canonicalLocalAddr_lt_two_pow_64_iff` gives the exact per-local limit for
-offsets inside one page), with `bodyPreservesAddrTaken` and the
-locals-count bound discharged automatically on `inFragmentWithIntrinsics` via
-`assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`).
+offsets inside one page), with `ptrDeclLayoutsOk`, `bodyPreservesAddrTaken`, and
+the locals-count bound all discharged unconditionally on `inFragmentWithIntrinsics`
+via `assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`;
+for `exposedTags ≠ []`, `NoCompetingExposedBorrow.of_distinct_locals_or_lower_perm`
+and `assume_then_expose_then_withExposed_closed_distinct_from_frameOk` — via
+`NoCompetingExposedBorrow.of_borrows_distinct` and `ptrTargetPlaceSpan_lt_page`,
+witnessed at equal `.frozen` permission scores across distinct locals by
+`exposePriorOtherLocal_annealExposeRoundTripOk` and at proper sub-places by
+`int2ptrArraySubPlaceRoundTripOk_hsub_page` — derive `NoCompetingExposedBorrow`
+whenever previously exposed borrows either target distinct canonical-page-bounded
+locals under `bodyBorrowTargetsFitPage` or have strictly lower permission rank).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
 without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
 `int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
@@ -1281,7 +1298,10 @@ three machines return `0` on `exposeTwice` and raise UB on `int2ptrForgedTag`
 (`exposeTwice_three_way_agreement`, `int2ptrForgedTag_three_way_ub_agreement`),
 while `directWrite` and `exposeSharedRefWriteUb` still diverge; and it runs
 the brief's suite across all three semantics: `int2ptrRoundTripOk_three_way`
-(`77`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
+(`77`; whereas replacing `PointerWithExposedProvenance` with `CastKind.transmute`
+decodes provenance-less scalar bytes via `decodeScalarBytes` despite
+`exposedAllocIds = [1]` and faults across all three in
+`transmuteExposedAddrToRawPtrDerefUb_three_way`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
 (two adjacent exposed arguments under `ctxAdj`: Anneal `9`, `Stop.unsupported`
 on `Mach` and `MachTB`; `9` everywhere when the arguments are apart), and
 `int2ptrDeadAllocUb_three_way` (the cast after `StorageDead`), plus
@@ -1597,7 +1617,7 @@ These are deliberate and are the first things to lift:
   1. **`progInFragmentWithIntrinsics`** (`bodyInProgFragmentWithIntrinsics`): the
      sound unified correspondence fragment combining intra-frame pointers,
      references, reborrows, `Transmute`, `Assume`, `PointerExposeProvenance`, and
-     `PointerWithExposedProvenance` (`provCastFlowOk` and
+     `PointerWithExposedProvenance` (`provCastFlowOk`, `ptrDeclLayoutsOk body`, and
      `ptrAliasingProgOk (provCastAliasView body)`) with scalar-boundary `Call`
      terminators. Both `progInFragment` and `inFragmentWithIntrinsics` embed
      into it (`progInFragment_implies_progInFragmentWithIntrinsics`,
@@ -1670,7 +1690,7 @@ These are deliberate and are the first things to lift:
   locals for the symbolic `multi_step_correspondence` induction, while
   `progInFragmentWithIntrinsics` (`bodyInProgFragmentWithIntrinsics` and
   `translateProgWithIntrinsics`) unifies `progInFragment` and
-  `inFragmentWithIntrinsics` under `provCastFlowOk` and
+  `inFragmentWithIntrinsics` under `provCastFlowOk`, `ptrDeclLayoutsOk body`, and
   `ptrAliasingProgOk (provCastAliasView body)` (and `progCrossFrameTranslatable`
   checks syntactic `translateProgWithIntrinsics` lowering for cross-frame
   pointer/reference witnesses). The

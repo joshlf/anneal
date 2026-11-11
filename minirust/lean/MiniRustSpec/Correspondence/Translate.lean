@@ -4996,8 +4996,14 @@ def inFragmentWithIntrinsics (body : MirAst.CapturedMir) : Bool :=
     bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
     terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
-  provCastFlowOk body && ptrAliasingOk (provCastAliasView body) &&
+  provCastFlowOk body && ptrDeclLayoutsOk body && ptrAliasingOk (provCastAliasView body) &&
   (translateFnWithIntrinsics body).isSome
+
+theorem ptrDeclLayoutsOk_of_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
+    (h : inFragmentWithIntrinsics body = true) :
+    ptrDeclLayoutsOk body = true := by
+  simp only [inFragmentWithIntrinsics, Bool.and_eq_true] at h
+  exact h.1.1.2
 
 /-- Number of `.intrinsic` entries in a `StmtTranslation` list. -/
 def countIntrinsics : List StmtTranslation → Nat
@@ -5429,9 +5435,12 @@ theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
   have hclean : ∀ bb ∈ body.basicBlocks, bb.isCleanup = false := by
     intro bb hbb
     simpa using (h9 bb hbb).1.1
+  have hdlo : ptrDeclLayoutsOk body = true := by
+    simp only [ptrAliasingOk, Bool.and_eq_true] at h13
+    exact h13.1.1.1.1
   have hfi := translateFnWithIntrinsics_of_translateFn hclean hf
-  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩,
-    provCastFlowOk_of_not_hasProvCast hnp⟩,
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩,
+    provCastFlowOk_of_not_hasProvCast hnp⟩, hdlo⟩,
     by rw [provCastAliasView_of_not_hasProvCast hnp]; exact h13⟩, by simp [hfi]⟩
   intro bb hbb
   obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
@@ -7200,7 +7209,7 @@ def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
     | none => true) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
   livenessOk body && tupleInitOk body &&
-  provCastFlowOk body && ptrAliasingProgOk (provCastAliasView body) &&
+  provCastFlowOk body && ptrDeclLayoutsOk body && ptrAliasingProgOk (provCastAliasView body) &&
   (translateFnInProgWithIntrinsics fnMap body).isSome
 
 /-- Decidable sound multi-function correspondence fragment unifying
@@ -7268,10 +7277,14 @@ theorem bodyInProgFragment_implies_withIntrinsics {fnMap : FnMap}
   have htr' : (translateFnInProgWithIntrinsics fnMap body).isSome = true := by
     rw [translateFnInProgWithIntrinsics_eq_of_no_provCast fnMap body hnp_stmt, hf]
     rfl
-  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hd0⟩, hdeclOk⟩, hargs⟩, htemps⟩, h5⟩, hbbs'⟩,
-    h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, provCastFlowOk_of_not_hasProvCast hnp⟩, ?_⟩, htr'⟩
+  have hptr_sc := ptrAliasingProgOk_of_scalar body hsc hbbs_stmt
+  have hdlo : ptrDeclLayoutsOk body = true := by
+    simp only [ptrAliasingProgOk, Bool.and_eq_true] at hptr_sc
+    exact hptr_sc.1.1.1.1
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hd0⟩, hdeclOk⟩, hargs⟩, htemps⟩, h5⟩, hbbs'⟩,
+    h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, provCastFlowOk_of_not_hasProvCast hnp⟩, hdlo⟩, ?_⟩, htr'⟩
   rw [provCastAliasView_of_not_hasProvCast hnp]
-  exact ptrAliasingProgOk_of_scalar body hsc hbbs_stmt
+  exact hptr_sc
 
 theorem translateProgWithIntrinsics_eq_of_progInFragment
     {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
@@ -7438,8 +7451,8 @@ theorem bodyInProgFragmentWithIntrinsics_implies_crossFrameTranslatable
     bodyCrossFrameTranslatable fnMap callees body = true := by
   simp only [bodyInProgFragmentWithIntrinsics, bodyCrossFrameTranslatable,
     Bool.and_eq_true, List.all_eq_true] at h ⊢
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, _⟩, h5⟩, _⟩, _⟩, h8⟩, hbbs⟩,
-    h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, hptr⟩, htr⟩ := h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, _⟩, h5⟩, _⟩, _⟩, h8⟩, hbbs⟩,
+    h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, _⟩, hptr⟩, htr⟩ := h
   simp only [ptrAliasingProgOk, bodyAddrTakenLocals_provCastAliasView, Bool.and_eq_true,
     List.all_eq_true] at hptr
   obtain ⟨⟨⟨⟨_, hat_arg⟩, hpres⟩, _⟩, _⟩ := hptr

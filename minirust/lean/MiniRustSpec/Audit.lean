@@ -1444,6 +1444,8 @@ open MiniRustSpec.Correspondence.Witness in
   assumeMoveReuse_diverges
   assumeAfterMove_rejected
   assumeAfterMove_diverges
+  itOf_uint
+  tyOf_uint
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -2567,6 +2569,8 @@ open MiniRustSpec.Correspondence.Witness in
   assumeMoveReuse_diverges
   assumeAfterMove_rejected
   assumeAfterMove_diverges
+  itOf_uint
+  tyOf_uint
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
 #assert_standard_axioms
@@ -3463,6 +3467,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   rawAddrOfUninit_notInFragment
   rawAddrOfUninit_anneal_ret
   rawAddrOfUninit_three_way_agreement
+  transmuteDanglingIntToRawPtrNoDerefOk_translate
+  transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
+  transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
+  transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3911,6 +3919,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   rawAddrOfUninit_notInFragment
   rawAddrOfUninit_anneal_ret
   rawAddrOfUninit_three_way_agreement
+  transmuteDanglingIntToRawPtrNoDerefOk_translate
+  transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
+  transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
+  transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms
@@ -4705,6 +4717,23 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrArraySubPlaceRoundTripOk_hsub_static
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
+  ptrDeclLayoutsOk_of_inFragmentWithIntrinsics
+  ptrDeclLayoutsOk_of_inFragment
+  bodyBorrowTargetsFitPage_spec
+  BorrowsOk.entry_rangeLen_zero
+  ptrTargetPlaceSpan_lt_page
+  NoCompetingExposedBorrow.of_borrows_distinct
+  NoCompetingExposedBorrow.of_distinct_locals_or_lower_perm
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_frameOk
+  exposePriorOtherLocal_annealExposeRoundTripOk
+  shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad
+  shadowedUsizeLayoutDivergence_anneal_ub
+  shadowedUsizeLayoutDivergence_three_way
+  transmuteExposedAddrToRawPtrDerefUb_translateIntr
+  transmuteExposedAddrToRawPtrDerefUb_notInFragmentWithIntrinsics
+  transmuteExposedAddrToRawPtrDerefUb_anneal_ub
+  transmuteExposedAddrToRawPtrDerefUb_three_way
+  int2ptrArraySubPlaceRoundTripOk_hsub_page
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -5109,6 +5138,23 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrArraySubPlaceRoundTripOk_hsub_static
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
+  ptrDeclLayoutsOk_of_inFragmentWithIntrinsics
+  ptrDeclLayoutsOk_of_inFragment
+  bodyBorrowTargetsFitPage_spec
+  BorrowsOk.entry_rangeLen_zero
+  ptrTargetPlaceSpan_lt_page
+  NoCompetingExposedBorrow.of_borrows_distinct
+  NoCompetingExposedBorrow.of_distinct_locals_or_lower_perm
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_frameOk
+  exposePriorOtherLocal_annealExposeRoundTripOk
+  shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad
+  shadowedUsizeLayoutDivergence_anneal_ub
+  shadowedUsizeLayoutDivergence_three_way
+  transmuteExposedAddrToRawPtrDerefUb_translateIntr
+  transmuteExposedAddrToRawPtrDerefUb_notInFragmentWithIntrinsics
+  transmuteExposedAddrToRawPtrDerefUb_anneal_ub
+  transmuteExposedAddrToRawPtrDerefUb_three_way
+  int2ptrArraySubPlaceRoundTripOk_hsub_page
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"

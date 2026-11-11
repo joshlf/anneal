@@ -17,7 +17,9 @@ Concrete MIR bodies and ground-truth execution witnesses exercising safe
 references (`&T`, `&mut T`), two-phase mutable borrows (`BorrowKind.mut true`),
 multi-step reborrowing chains, `StatementKind.retag` (`Statement.Validate`),
 cross-kind pointer/reference `CastKind.transmute`, safe-pointer validity checks,
-and Tree Borrows permissions (`ReborrowSettings` and `TreeBorrowsMemory`) across
+RFC 2582 raw place addressing (`Rvalue.rawPtr`), provenance-faithful scalar-to-pointer
+transmute byte decoding (`decodeScalarBytes`), and Tree Borrows permissions
+(`ReborrowSettings` and `TreeBorrowsMemory`) across
 three semantics:
 
 1. **Anneal's MIR semantics** (`runA_sound`, `faultsA_sound`),
@@ -3364,5 +3366,53 @@ theorem rawAddrOfUninit_three_way_agreement :
       some (some { retAlloc with data := scalarBytes u32 12 }, [1]) ∧
     retAfterTB rawAddrOfUninit [.scalar ⟨5, 4⟩] 7 = tbRetU32 12 :=
   ⟨rawAddrOfUninit_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-! #### 7. Provenance-faithful scalar-to-pointer transmute byte decoding (`decodeScalarBytes`)
+
+Unlike `transmuteDanglingIntToRefDiscrepancy` (where transmuting `4_usize` to a
+safe reference `&u32` immediately faults because `decodeValueFromBytes` checks
+`isRef = true` dereferenceability and intact provenance, matching MiniRust's
+`Value::check` on `PtrType::Ref`), transmuting the same `4_usize` to a raw
+pointer `*const u32` without dereferencing takes the `isRef = false` branch of
+`decodeValueFromBytes`, decoding the provenance-less byte sequence via
+`decodeScalarBytes` into a provenance-less scalar on Anneal just as MiniRust
+decodes `Value::Ptr { addr: 4, provenance: None }` under `PtrType::Raw`
+(`safe_pointee = None`). (Dereferencing such a transmuted raw pointer — even
+when its address matches a previously exposed live local — faults across all
+three semantics; see `transmuteExposedAddrToRawPtrDerefUb_three_way` in
+`ProvenanceWitness.lean`.) -/
+
+/-- Transmuting `4_usize` to `*const u32` without dereferencing
+(`_2 = 4_usize; _3 = copy _2 as *const u32 (Transmute); _0 = copy _1`):
+succeeds across Anneal, `Mach`, and `MachTB` and returns `5`, contrasting
+one-for-one with `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`. -/
+def transmuteDanglingIntToRawPtrNoDerefOk : CapturedMir :=
+  ptrBody "witness::transmute_dangling_int_to_raw_ptr_no_deref_ok"
+    [u32Decl, u32Decl, usizeDecl, ptrConstU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.use (constUsize 4)),
+     .assign (local_ 3) (.cast .transmute (.copy (local_ 2)) ptrConstU32Ty),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+theorem transmuteDanglingIntToRawPtrNoDerefOk_translate :
+    (translateFn transmuteDanglingIntToRawPtrNoDerefOk).isSome = true := by decide +kernel
+
+theorem transmuteDanglingIntToRawPtrNoDerefOk_notInFragment :
+    inFragment transmuteDanglingIntToRawPtrNoDerefOk = false := by decide +kernel
+
+theorem transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret :
+    ∃ mem, ReachesRet (mirTree transmuteDanglingIntToRawPtrNoDerefOk
+      (initMachineState transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩, mem)) :=
+  ⟨_, runA_sound transmuteDanglingIntToRawPtrNoDerefOk 20 _ _ _ rfl⟩
+
+theorem transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement :
+    (∃ mem, ReachesRet (mirTree transmuteDanglingIntToRawPtrNoDerefOk
+      (initMachineState transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩, mem))) ∧
+    retAfter transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩] 7 =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) ∧
+    retAfterTB transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩] 7 = tbRetU32 5 :=
+  ⟨transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret, by decide +kernel, by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.RefWitness
