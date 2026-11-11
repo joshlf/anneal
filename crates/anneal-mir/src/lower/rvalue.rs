@@ -6825,6 +6825,38 @@ impl StatementEvalState {
         if let FieldSlot::Init(val) = new_slot {
             return self.write_place(&dst_place, expected_ty, val);
         }
+        // Element `0` (or `0..1`) of a 1-element array `[T; 1]` covers the entire array, so
+        // writing `Uninit` to it deinitializes the 1-element array itself.
+        let mut dst_proj = dst_proj;
+        if matches!(new_slot, FieldSlot::Uninit) {
+            while let Some((
+                ProjectionElem::ConstantIndex {
+                    offset: 0,
+                    min_length: 1,
+                    from_end: false,
+                }
+                | ProjectionElem::Subslice {
+                    from: 0,
+                    to: 1,
+                    from_end: false,
+                },
+                prefix,
+            )) = dst_proj.split_last()
+            {
+                dst_proj = prefix;
+            }
+        }
+        if proj_traverses_union(&self.local_decls[dst_local.0], dst_proj) {
+            if matches!(new_slot, FieldSlot::Uninit)
+                && matches!(
+                    self.read_subplace_slot(dst_local, dst_proj, full_place),
+                    Ok(FieldSlot::Uninit)
+                )
+            {
+                return Ok(());
+            }
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(UNINIT_UNION_COPY));
+        }
         // Array elements do not have per-element `Uninit` / `PartialShell` slots (`c6d2ad74`).
         if dst_proj.iter().any(|p| {
             matches!(
@@ -6837,8 +6869,8 @@ impl StatementEvalState {
             // Uninitialized bytes copied over uninitialized bytes: nothing changes.
             if matches!(new_slot, FieldSlot::Uninit)
                 && matches!(
-                    self.read_subplace_slot(dst_local, dst_proj, full_place)?,
-                    FieldSlot::Uninit
+                    self.read_subplace_slot(dst_local, dst_proj, full_place),
+                    Ok(FieldSlot::Uninit)
                 )
             {
                 return Ok(());
@@ -9459,18 +9491,18 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
     let ptr_width = frame.frame_ptr_width();
     let decls = frame.frame_decls();
     let base_addr = checked_ptr_addr(base_ptr, base_ptr_ty, ptr_width)?;
-    if base_addr == 0 {
-        if base_ptr_ty.is_ref() {
-            return Err(RvalueEvalError::CastEval(
-                CastEvalError::InvalidBitPattern {
-                    target_ty: base_ptr_ty.clone(),
-                    bits: 0,
-                },
-            ));
-        }
-        return Err(RvalueEvalError::NullPointerAccess);
-    }
     if expected_ref || base_ptr_ty.is_ref() {
+        if base_addr == 0 {
+            if base_ptr_ty.is_ref() {
+                return Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: base_ptr_ty.clone(),
+                        bits: 0,
+                    },
+                ));
+            }
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
         let (min_align, max_align) = deref_ty
             .align_bounds(ptr_width)
             .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(deref_ty, err)))?;
@@ -9491,27 +9523,73 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             return Err(RvalueEvalError::UninhabitedPointee(deref_ty.clone()));
         }
     }
-    let Some(prov) = base_ptr.provenance else {
-        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-    };
-    let Some(target_local) = prov
-        .alloc_id
-        .checked_sub(1)
-        .and_then(|id| usize::try_from(id).ok())
-        .filter(|&loc| loc < frame.frame_local_count())
-    else {
-        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-    };
-    if matches!(frame.frame_slot(target_local), Some(FrameSlot::Dead)) {
-        return Err(RvalueEvalError::DeadLocal(Local(target_local)));
+    let target_local_opt = base_ptr.provenance.and_then(|prov| {
+        prov.alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < frame.frame_local_count())
+    });
+    let target_is_dead =
+        target_local_opt.is_some_and(|loc| matches!(frame.frame_slot(loc), Some(FrameSlot::Dead)));
+    let has_downcast = tail.iter().any(|p| matches!(p, ProjectionElem::Downcast(_)));
+    let is_address_only_raw =
+        !expected_ref && matches!(base_ptr_ty, Ty::RawPtr(..)) && !has_downcast;
+    if !is_address_only_raw {
+        if base_addr == 0 {
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        let Some(target_local) = target_local_opt else {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        };
+        if target_is_dead {
+            return Err(RvalueEvalError::DeadLocal(Local(target_local)));
+        }
     }
     let mut tail_index_cache = Vec::new();
     for elem in tail {
         if let ProjectionElem::Index(idx_local) = elem {
-            tail_index_cache.push((*idx_local, frame.frame_index_operand(*idx_local)?));
+            match frame.frame_index_operand(*idx_local) {
+                Ok(bits) => tail_index_cache.push((*idx_local, bits)),
+                Err(err) => {
+                    if base_addr == 0 {
+                        return Err(RvalueEvalError::NullPointerAccess);
+                    }
+                    if let Some(dead_loc) = target_local_opt.filter(|_| target_is_dead) {
+                        return Err(RvalueEvalError::DeadLocal(Local(dead_loc)));
+                    }
+                    return Err(err);
+                }
+            }
         }
     }
     let read_index = |idx_local: Local| cached_index(&tail_index_cache, idx_local);
+    if is_address_only_raw && (base_addr == 0 || target_local_opt.is_none() || target_is_dead) {
+        validate_projection_tail(
+            deref_ty,
+            tail,
+            Some(decls),
+            Some(&read_index),
+            place,
+            None,
+        )?;
+        let (tail_off, _) =
+            compute_subplace_offset_and_tag(deref_ty, tail, &read_index, ptr_width, place)?;
+        if tail_off == 0 {
+            return Ok(PointerValue {
+                addr: base_addr as u64,
+                provenance: base_ptr.provenance,
+            });
+        }
+        if base_addr == 0 {
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        if let Some(dead_loc) = target_local_opt.filter(|_| target_is_dead) {
+            return Err(RvalueEvalError::DeadLocal(Local(dead_loc)));
+        }
+        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+    }
+    let target_local = target_local_opt.unwrap();
+    let prov = base_ptr.provenance.unwrap();
     match resolve_synthetic_subplace_in(frame, base_ptr, base_ptr_ty, deref_ty, place, false) {
         Ok((resolved_local, mut combined_proj)) => {
             combined_proj.extend_from_slice(tail);
@@ -9550,24 +9628,9 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             ))
         }
         Err(err) => {
-            if expected_ref
-                || !matches!(base_ptr_ty, Ty::RawPtr(..))
-                || tail.iter().any(|p| matches!(p, ProjectionElem::Downcast(_)))
-            {
+            if !is_address_only_raw {
                 return Err(err);
             }
-            let local_base = local_base_addr_for_decls(target_local, decls, ptr_width)?;
-            let target_decl_ty = &decls[target_local];
-            let (target_alloc_size, _) = target_decl_ty
-                .alloc_size_and_align(ptr_width)
-                .map_err(|e| RvalueEvalError::CastEval(cast_eval_layout_error(target_decl_ty, e)))?;
-            let Some(rel_off) = base_addr
-                .checked_sub(local_base)
-                .and_then(|off| usize::try_from(off).ok())
-                .filter(|&off| off <= target_alloc_size)
-            else {
-                return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-            };
             validate_projection_tail(
                 deref_ty,
                 tail,
@@ -9578,6 +9641,24 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             )?;
             let (tail_off, _) =
                 compute_subplace_offset_and_tag(deref_ty, tail, &read_index, ptr_width, place)?;
+            let local_base = local_base_addr_for_decls(target_local, decls, ptr_width)?;
+            let target_decl_ty = &decls[target_local];
+            let (target_alloc_size, _) = target_decl_ty
+                .alloc_size_and_align(ptr_width)
+                .map_err(|e| RvalueEvalError::CastEval(cast_eval_layout_error(target_decl_ty, e)))?;
+            let Some(rel_off) = base_addr
+                .checked_sub(local_base)
+                .and_then(|off| usize::try_from(off).ok())
+                .filter(|&off| off <= target_alloc_size)
+            else {
+                if tail_off == 0 {
+                    return Ok(PointerValue {
+                        addr: base_addr as u64,
+                        provenance: base_ptr.provenance,
+                    });
+                }
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+            };
             let Some(total_off) = rel_off
                 .checked_add(tail_off)
                 .filter(|&end| end <= target_alloc_size)
@@ -10447,6 +10528,45 @@ fn read_slot_at_proj(
 const UNINIT_UNION_COPY: &str =
     "copy of uninitialized bytes into a union field needs a byte-level memory model";
 
+/// Returns whether any `ProjectionElem::Field` step in `proj` projects out of a union ADT
+/// starting from `cur_ty`.
+fn proj_traverses_union<'a>(mut cur_ty: &'a Ty, proj: &'a [ProjectionElem]) -> bool {
+    let mut active_downcast: Option<usize> = None;
+    for elem in proj {
+        match elem {
+            ProjectionElem::Downcast(v) => {
+                active_downcast = Some(*v);
+            }
+            ProjectionElem::Field(idx, field_ty) => {
+                let v = active_downcast.take().unwrap_or(0);
+                if matches!(cur_ty, Ty::Adt(def) if def.is_union()) {
+                    return true;
+                }
+                cur_ty = match cur_ty {
+                    Ty::Tuple(fields) => fields.get(*idx).unwrap_or(field_ty),
+                    Ty::Adt(def) => def
+                        .variant_fields(v)
+                        .and_then(|fs| fs.get(*idx))
+                        .unwrap_or(field_ty),
+                    _ => field_ty,
+                };
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                active_downcast = None;
+                let Ty::Array(elem_ty, _) = cur_ty else {
+                    return false;
+                };
+                cur_ty = elem_ty;
+            }
+            ProjectionElem::Subslice { .. } => {
+                active_downcast = None;
+            }
+            ProjectionElem::Deref => return false,
+        }
+    }
+    false
+}
+
 /// Writes `FieldSlot::Partial(new_shell)` into `proj` inside `slot` (materializing parent
 /// shells on `FieldSlot::Uninit` or exploding `FieldSlot::Init` aggregates as needed).
 ///
@@ -10914,15 +11034,18 @@ fn eval_copy_nonoverlapping(
             // uninitialized elements, which fails closed (`c6d2ad74`).
             Err(RvalueEvalError::UninitializedLocal(_))
                 if matches!(
-                    state.read_subplace_slot(src_local, src_arr_proj, &dummy_place)?,
-                    FieldSlot::Uninit
+                    state.read_subplace_slot(src_local, src_arr_proj, &dummy_place),
+                    Ok(FieldSlot::Uninit)
                 ) =>
             {
                 if matches!(
-                    state.read_subplace_slot(dst_local, dst_arr_proj, &dummy_place)?,
-                    FieldSlot::Uninit
+                    state.read_subplace_slot(dst_local, dst_arr_proj, &dummy_place),
+                    Ok(FieldSlot::Uninit)
                 ) {
                     return Ok(());
+                }
+                if proj_traverses_union(&state.local_decls[dst_local.0], dst_arr_proj) {
+                    return Err(RvalueEvalError::UnsupportedMemoryAccess(UNINIT_UNION_COPY));
                 }
                 if *dst_start == 0 && count_usize == dst_len_usize {
                     let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);

@@ -1560,3 +1560,243 @@ fn a2_copy_nonoverlapping_whole_union_array_overwrite_and_multi_count_zst_subpla
     .unwrap();
     assert_eq!(state.get_init(Local(5)), Some(&MirValue::Unit));
 }
+
+#[test]
+fn a3_offset_zero_raw_reborrows_on_null_dangling_and_provenance_free_pointers() {
+    let pair = Ty::Tuple(vec![u32_ty(), u32_ty()]);
+    let raw_pair = Ty::RawPtr(Box::new(pair.clone()), Mutability::Not);
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let ref_u32 = Ty::Ref(Box::new(u32_ty()), Mutability::Not);
+    let decls = vec![
+        pair,             // _0 at 0x1000
+        raw_pair.clone(), // _1: *const (u32, u32)
+        raw_u32.clone(),  // _2: *const u32
+        ref_u32,          // _3: &u32
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    let deref1_f0 = proj(1, vec![ProjectionElem::Deref, field(0, u32_ty())]);
+    let deref1_f1 = proj(1, vec![ProjectionElem::Deref, field(1, u32_ty())]);
+
+    // 1. Null raw pointer: `&raw const (*null).0` (offset 0) is defined (`offset_inbounds(null, 0)`),
+    // while `&raw const (*null).1` (offset 4) and `&((*null).0)` fault with `NullPointerAccess`.
+    state.slots[1] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(0),
+        raw_pair.clone(),
+    ));
+    run(
+        assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f0.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::ptr(
+            PointerValue::without_provenance(0),
+            raw_u32.clone()
+        ))
+    );
+    assert_eq!(
+        run(
+            assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f1.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::NullPointerAccess)
+    );
+    assert_eq!(
+        run(
+            assign(local(3), Rvalue::Ref(Mutability::Not, deref1_f0.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::NullPointerAccess)
+    );
+
+    // 2. Provenance-free non-null raw pointer `0x1234`: `&raw const (*p).0` is defined (`0x1234`),
+    // while `&raw const (*p).1` (offset 4 without provenance) is `UnsupportedPlaceProjection`.
+    state.slots[1] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(0x1234),
+        raw_pair,
+    ));
+    run(
+        assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f0.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::ptr(
+            PointerValue::without_provenance(0x1234),
+            raw_u32.clone()
+        ))
+    );
+    assert_eq!(
+        run(
+            assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f1.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(deref1_f1.clone()))
+    );
+
+    // 3. Dangling raw pointer (target `_0` is `StorageDead`): `&raw const (*p).0` (offset 0) is
+    // defined (`offset_inbounds(p, 0)`), while `&raw const (*p).1` (offset 4) and `&((*p).0)`
+    // fault with `DeadLocal(Local(0))`.
+    run(
+        assign(local(1), Rvalue::RawPtr(Mutability::Not, local(0))),
+        &mut state,
+    )
+    .unwrap();
+    run(Statement::StorageDead(Local(0)), &mut state).unwrap();
+    run(
+        assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f0.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::ptr(
+            PointerValue::with_provenance(0x1000, 1, 1),
+            raw_u32
+        ))
+    );
+    assert_eq!(
+        run(
+            assign(local(2), Rvalue::RawPtr(Mutability::Not, deref1_f1)),
+            &mut state
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(0)))
+    );
+    assert_eq!(
+        run(
+            assign(local(3), Rvalue::Ref(Mutability::Not, deref1_f0)),
+            &mut state
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(0)))
+    );
+}
+
+#[test]
+fn a3_uninit_copy_into_union_array_field_and_one_element_array_deinitialization() {
+    let arr4 = Ty::Array(Box::new(u32_ty()), 4);
+    let arr1 = Ty::Array(Box::new(u32_ty()), 1);
+    let u_def = Arc::new(AdtDef::new_union("U", vec![arr4.clone(), u64_ty()]));
+    let raw_u32_const = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let raw_u32_mut = Ty::RawPtr(Box::new(u32_ty()), Mutability::Mut);
+    let decls = vec![
+        Ty::Adt(u_def.clone()), // _0: union U { a: [u32; 4], b: u64 }
+        arr4.clone(),           // _1: [u32; 4] (uninitialized source)
+        arr1.clone(),           // _2: [u32; 1]
+        u32_ty(),               // _3: u32 (uninitialized source)
+        raw_u32_const,          // _4: *const u32
+        raw_u32_mut,            // _5: *mut u32
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    let elem0_of_4 = ProjectionElem::ConstantIndex {
+        offset: 0,
+        min_length: 4,
+        from_end: false,
+    };
+    let elem0_of_1 = ProjectionElem::ConstantIndex {
+        offset: 0,
+        min_length: 1,
+        from_end: false,
+    };
+    run(
+        assign(
+            local(4),
+            Rvalue::RawPtr(Mutability::Not, proj(1, vec![elem0_of_4.clone()])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(5),
+            Rvalue::RawPtr(
+                Mutability::Mut,
+                proj(0, vec![field(0, arr4), elem0_of_4]),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+
+    // 1. Copying uninitialized `_1[0..4]` into `_0.a` while `_0` is uninitialized is a no-op (`Ok(())`).
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(4)),
+            dst: Operand::Copy(local(5)),
+            count: Operand::Constant(Constant::Int(4, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_local(Local(0)), Some(&LocalSlotState::Uninit));
+
+    // 2. When `_0` has active field `b = 99` (inactive `a: [u32; 4]`), or active field `a = [1, 2, 3, 4]`,
+    // copying uninitialized elements (`count = 1`, `2`, or `4`) into `_0.a` is `UnsupportedMemoryAccess`
+    // (never `UninitializedLocal` UB and never `UnsupportedPlaceProjection`).
+    state.slots[0] = LocalSlotState::Init(MirValue::union_value(&u_def, 1, u64v(99)));
+    for count in [1u128, 2, 4] {
+        assert!(matches!(
+            run(
+                Statement::CopyNonOverlapping {
+                    src: Operand::Copy(local(4)),
+                    dst: Operand::Copy(local(5)),
+                    count: Operand::Constant(Constant::Int(count, usize_ty())),
+                },
+                &mut state
+            ),
+            Err(RvalueEvalError::UnsupportedMemoryAccess(_))
+        ));
+    }
+    state.slots[0] = LocalSlotState::Init(MirValue::union_value(
+        &u_def,
+        0,
+        MirValue::Array {
+            elements: vec![u32v(1), u32v(2), u32v(3), u32v(4)],
+            elem_ty: u32_ty(),
+        },
+    ));
+    for count in [1u128, 2, 4] {
+        assert!(matches!(
+            run(
+                Statement::CopyNonOverlapping {
+                    src: Operand::Copy(local(4)),
+                    dst: Operand::Copy(local(5)),
+                    count: Operand::Constant(Constant::Int(count, usize_ty())),
+                },
+                &mut state
+            ),
+            Err(RvalueEvalError::UnsupportedMemoryAccess(_))
+        ));
+    }
+
+    // 3. Copying 1 uninitialized `u32` (`_3`) into element `0` of a 1-element array `_2: [u32; 1]`
+    // overwrites the entire 1-element array and deinitializes `_2`.
+    state.slots[2] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![u32v(77)],
+        elem_ty: u32_ty(),
+    });
+    run(
+        assign(local(4), Rvalue::RawPtr(Mutability::Not, local(3))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(5),
+            Rvalue::RawPtr(Mutability::Mut, proj(2, vec![elem0_of_1])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(4)),
+            dst: Operand::Copy(local(5)),
+            count: Operand::Constant(Constant::Int(1, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_local(Local(2)), Some(&LocalSlotState::Uninit));
+}
