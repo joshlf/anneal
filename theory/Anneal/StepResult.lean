@@ -36,6 +36,10 @@ theorem RawStep.toStepResult_choice_inhabited {State Obs Val : Type}
     injection h with hbr
     subst hbr
     exact ⟨s', rfl⟩
+  | choiceList head tail =>
+    injection h with hbr
+    subst hbr
+    exact ⟨head, List.Mem.head tail⟩
   | terminated _ => nomatch h
   | failed => nomatch h
 

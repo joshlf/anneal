@@ -12,6 +12,7 @@ import Init.NotationExtra
 import Trusted.Refinement
 import Trusted.StepResult
 import Trusted.MirAst
+import Trusted.Memory
 
 /-!
 # Trusted MIR Semantics and Crate Theorem (`Trusted/MirSemantics.lean`)
@@ -116,10 +117,12 @@ structure StackFrame where
   `AdtRepr.rust` struct declaration `id`.
 - `ubChecks`: nondeterministic boolean value yielded by
   `Operand.runtimeChecks .ubChecks` (`core::intrinsics::ub_checks()`).
+- `mem`: operational weak-memory state (`curView`, `atomicMsgs`, and
+  non-atomic store).
 
 The defaults exist for writing concrete states; `initEntryState` pins every
-structural control field while leaving `tySizes`, `adtPad`, and `ubChecks`
-universally quantified across initial states. -/
+structural control field while leaving `tySizes`, `adtPad`, `ubChecks`, and
+`mem` universally quantified across initial states. -/
 structure MirState where
   locals : Nat → Option MirVal
   localGens : Nat → Nat := fun _ => 0
@@ -132,6 +135,7 @@ structure MirState where
   nextFrameId : Nat := 1
   adtPad : Nat → Nat := fun _ => 0
   ubChecks : Bool := true
+  mem : MemState := MemState.empty
 
 /-- Result of a normal return from the root function: the returned value and
 the terminal state at `Terminator.return_`.
@@ -198,6 +202,8 @@ def MirTy.subst (typeArgs : List MirTy) : MirTy → Option MirTy
   | .param idx => lookupAt typeArgs idx
   | .ref inner => (inner.subst typeArgs).map .ref
   | .rawPtr inner m => (inner.subst typeArgs).map (MirTy.rawPtr · m)
+  | .refAtomicUsize => some .refAtomicUsize
+  | .atomicOrdering => some .atomicOrdering
   | .array elem len => (elem.subst typeArgs).map (MirTy.array · len)
   | .arraySizeOf elem sizedTy =>
     (elem.subst typeArgs).bind fun elem' =>
@@ -271,6 +277,8 @@ def Terminator.subst (typeArgs : List MirTy) :
     (srcTy.subst typeArgs).bind fun srcTy' =>
       (dstTy.subst typeArgs).map fun dstTy' =>
         .callTransmuteCopy dst srcTy' dstTy' op target
+  | .callAtomicLoad dst ptr ord target =>
+    some (.callAtomicLoad dst ptr ord target)
   | .call1 dst callee arg target calleeTypeArgs =>
     (mapAll (MirTy.subst typeArgs) calleeTypeArgs).map fun calleeTypeArgs' =>
       .call1 dst callee arg target calleeTypeArgs'
@@ -401,9 +409,10 @@ nested struct unfoldings:
 def tyLayoutStep (adts : List AdtDecl) (tySizes : Nat → Nat)
   (adtPad : Nat → Nat) (target : TargetLayout)
   (unfold : MirTy → Option (Nat × Nat)) : MirTy → Option (Nat × Nat)
-  | .usize | .isize => some (target.ptrByteWidth, target.ptrByteWidth)
+  | .usize | .isize | .refAtomicUsize =>
+    some (target.ptrByteWidth, target.ptrByteWidth)
   | .uint w | .int w => intBitWidthLayout target w
-  | .bool => some (1, 1)
+  | .bool | .atomicOrdering => some (1, 1)
   | .char => some (4, 4)
   | .unit => some (0, 1)
   | .param idx => some (tySizes idx, 1)
@@ -519,7 +528,8 @@ def StaticBodyWf (adts : List AdtDecl) (body : MirBody) : Prop :=
 (contain no `.uninit` sub-value). -/
 def MirVal.isFullyInit : MirVal → Bool
   | .uninit => false
-  | .usize _ | .bool _ | .unit | .bytes _ _ | .ref _ _ _ _ => true
+  | .usize _ | .bool _ | .unit | .bytes _ _ | .ref _ _ _ _
+  | .atomicLoc _ | .ordering _ => true
   | .adt _ inner => inner.isFullyInit
   | .fieldCons h t => h.isFullyInit && t.isFullyInit
 
@@ -602,7 +612,8 @@ limit fails closed. -/
 def returnRefsStep (s : MirState) (localCount : Nat)
     (follow : MirVal → Bool) : MirVal → Bool
   | .uninit => false
-  | .usize _ | .bool _ | .unit | .bytes _ _ => true
+  | .usize _ | .bool _ | .unit | .bytes _ _
+  | .atomicLoc _ | .ordering _ => true
   | .adt _ inner => returnRefsStep s localCount follow inner
   | .fieldCons h t =>
     returnRefsStep s localCount follow h &&
@@ -734,6 +745,11 @@ def validStep (adts : List AdtDecl) (adtInv : AdtInv)
       validStep adts adtInv s callerBase unfold inner pointee
     | none => False
   | .rawPtr _ _, _ => False
+  | .refAtomicUsize, .atomicLoc loc =>
+    s.mem.visibleAtomicMsgs loc ≠ []
+  | .refAtomicUsize, _ => False
+  | .atomicOrdering, .ordering _ => True
+  | .atomicOrdering, _ => False
   | _, _ => False
 
 def MirVal.validFuel (adts : List AdtDecl) (adtInv : AdtInv)
@@ -815,8 +831,9 @@ checks that `Rvalue.aggregate` and `Rvalue.aggregateFields` perform. Opaque
 generic bytes cannot be MIR literals. Rejecting a constant makes the step
 undefined behavior, which fails closed. -/
 def MirVal.isConstScalar : MirVal → Bool
-  | .usize _ | .bool _ | .unit => true
-  | .uninit | .adt _ _ | .fieldCons _ _ | .bytes _ _ | .ref _ _ _ _ => false
+  | .usize _ | .bool _ | .unit | .ordering _ => true
+  | .uninit | .adt _ _ | .fieldCons _ _ | .bytes _ _ | .ref _ _ _ _
+  | .atomicLoc _ => false
 
 /-- Follow a projection list from `v` in state `s`, requiring the resulting
 value to be fully initialized (`MirVal.isFullyInit`). -/
@@ -895,6 +912,8 @@ def evalRefProj (s : MirState) (frameId gen : Nat) (loc : LocalId)
     | some pointee =>
       evalRefProj s frameId' gen' loc' fieldDepth' rest pointee
     | none => none
+  | .deref :: rest, .atomicLoc aLoc =>
+    if rest.isEmpty then some (.atomicLoc aLoc) else none
   | _, _ => none
 
 /-- Evaluate a shared borrow `&p` (`Rvalue.ref p`) within a frame of
@@ -968,7 +987,8 @@ def evalUnOp (op : UnOp) (v : MirVal) : Option MirVal :=
 /-- Structural boolean equality on `MirTy`. -/
 def MirTy.beq : MirTy → MirTy → Bool
   | .usize, .usize | .isize, .isize | .bool, .bool
-  | .char, .char | .unit, .unit => true
+  | .char, .char | .unit, .unit | .refAtomicUsize, .refAtomicUsize
+  | .atomicOrdering, .atomicOrdering => true
   | .uint a, .uint b => a == b
   | .int a, .int b => a == b
   | .adt a, .adt b => a == b
@@ -1203,27 +1223,27 @@ def evalTransmuteCopy (adts : List AdtDecl) (s : MirState)
 def MirState.nextStmt :
     MirState → (Nat → Option MirVal) → RawStep MirState MirReturn
   | ⟨_, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
-     nextFrameId, adtPad, ubChecks⟩, locals' =>
+     nextFrameId, adtPad, ubChecks, mem⟩, locals' =>
     .silent ⟨locals', localGens, block, stmtIdx + 1, tySizes, curBody, stack,
-      frameId, nextFrameId, adtPad, ubChecks⟩
+      frameId, nextFrameId, adtPad, ubChecks, mem⟩
 
 /-- Advance to the next statement updating both `locals'` and `localGens'`. -/
 def MirState.nextStmtGen :
     MirState → (Nat → Option MirVal) → (Nat → Nat) →
       RawStep MirState MirReturn
   | ⟨_, _, block, stmtIdx, tySizes, curBody, stack, frameId, nextFrameId,
-     adtPad, ubChecks⟩, locals', localGens' =>
+     adtPad, ubChecks, mem⟩, locals', localGens' =>
     .silent ⟨locals', localGens', block, stmtIdx + 1, tySizes, curBody, stack,
-      frameId, nextFrameId, adtPad, ubChecks⟩
+      frameId, nextFrameId, adtPad, ubChecks, mem⟩
 
 /-- Jump to statement `0` of basic block `target` in the current frame. -/
 def MirState.gotoBlock :
     MirState → (Nat → Option MirVal) → Nat →
       RawStep MirState MirReturn
   | ⟨_, localGens, _, _, tySizes, curBody, stack, frameId, nextFrameId,
-     adtPad, ubChecks⟩, locals', target =>
+     adtPad, ubChecks, mem⟩, locals', target =>
     .silent ⟨locals', localGens, target, 0, tySizes, curBody, stack, frameId,
-      nextFrameId, adtPad, ubChecks⟩
+      nextFrameId, adtPad, ubChecks, mem⟩
 
 /-- Canonical initial state for evaluating a zero-argument compile-time constant
 `MirBody` under `tySizes` and `adtPad`. -/
@@ -1459,6 +1479,7 @@ def evalMirTerminator (adts : List AdtDecl)
                   nextFrameId := s.nextFrameId
                   adtPad := s.adtPad
                   ubChecks := s.ubChecks
+                  mem := s.mem
                 }
               | none => .failed
             else
@@ -1534,6 +1555,30 @@ def evalMirTerminator (adts : List AdtDecl)
       | none => .failed
     else
       .failed
+  | .callAtomicLoad dst ptrOp ordOp target =>
+    if dst.projection.isEmpty &&
+       dst.loc.index < activeBody.localCount &&
+       target.index < activeBody.blocks.length then
+      match evalOperand activeBody.localCount s ptrOp with
+      | some (.atomicLoc loc, locals1) =>
+        match evalOperand activeBody.localCount
+            { s with locals := locals1 } ordOp with
+        | some (.ordering ord, locals2) =>
+          let stepMsg (msg : AtomicMsg) : MirState :=
+            { s with
+              locals :=
+                updateLocal locals2 dst.loc.index (some (.usize msg.bits))
+              block := target.index
+              stmtIdx := 0
+              mem := s.mem.applyAtomicLoad ord msg }
+          match s.mem.visibleAtomicMsgs loc with
+          | [] => .failed
+          | head :: tail =>
+            .choiceList (stepMsg head) (tail.map stepMsg)
+        | _ => .failed
+      | _ => .failed
+    else
+      .failed
   | .call1 dst calleeId arg target typeArgs =>
     ((findBody bodies calleeId).bind (MirBody.subst typeArgs)).elim .failed
       fun instCallee =>
@@ -1566,6 +1611,7 @@ def evalMirTerminator (adts : List AdtDecl)
             nextFrameId := s.nextFrameId + 1
             adtPad := s.adtPad
             ubChecks := s.ubChecks
+            mem := s.mem
           }
         | none => .failed
       else
@@ -1775,6 +1821,20 @@ def EnsuresEqArg (argLocal : Nat) (adts : List AdtDecl := [])
     ∀ tr r, out = .terminated tr (.normal r) →
       s.locals argLocal = some r.value)
 
+/-- Postcondition for `pub fn load_relaxed(a: &AtomicUsize) -> usize`
+(`/// anneal:spec ensures(atomic_load(<arg>))`): any normal return value
+equals `MirVal.usize msg.bits` for some modification-order message `msg` at
+the atomic location referenced by argument `argLocal` that was visible in the
+entry state's coherence view (`msg ∈ s.mem.visibleAtomicMsgs loc`). -/
+def EnsuresAtomicLoad (argLocal : Nat) (adts : List AdtDecl := [])
+    (bodies : List BodyDecl := []) : (MirLang adts bodies).Behavior :=
+  (MirLang adts bodies).Spec (fun s out =>
+    ∀ tr r, out = .terminated tr (.normal r) →
+      ∃ loc msg,
+        s.locals argLocal = some (.atomicLoc loc) ∧
+        msg ∈ s.mem.visibleAtomicMsgs loc ∧
+        r.value = .usize msg.bits)
+
 /-- Denote an optional first-order `RequiresSpec` (`/// anneal:requires`) as a
 precondition on the entry `MirState`. -/
 def denoteRequires : Option RequiresSpec → MirState → Prop
@@ -1782,11 +1842,25 @@ def denoteRequires : Option RequiresSpec → MirState → Prop
   | some req, s =>
     ∀ n, s.locals req.argLocal = some (.usize n) → n ≠ req.ne
 
+/-- Relational postcondition denoted by a first-order `PostSpec`
+(`/// anneal:spec`). -/
+def denotePostSpecRel :
+    PostSpec → MirState → EventualOut Empty MirReturn → Prop
+  | .ensuresEqArg argLocal => fun s out =>
+    ∀ tr r, out = .terminated tr (.normal r) →
+      s.locals argLocal = some r.value
+  | .ensuresAtomicLoad argLocal => fun s out =>
+    ∀ tr r, out = .terminated tr (.normal r) →
+      ∃ loc msg,
+        s.locals argLocal = some (.atomicLoc loc) ∧
+        msg ∈ s.mem.visibleAtomicMsgs loc ∧
+        r.value = .usize msg.bits
+
 /-- Denote a first-order `PostSpec` (`/// anneal:spec`) as a behavioral
 specification in `MirLang adts bodies`. -/
-def denotePostSpec (adts : List AdtDecl) (bodies : List BodyDecl := []) :
-    PostSpec → (MirLang adts bodies).Behavior
-  | .ensuresEqArg argLocal => EnsuresEqArg argLocal adts bodies
+def denotePostSpec (adts : List AdtDecl) (bodies : List BodyDecl := [])
+    (p : PostSpec) : (MirLang adts bodies).Behavior :=
+  (MirLang adts bodies).Spec (denotePostSpecRel p)
 
 /-- Denoted `# Safety` precondition of `fn`. -/
 abbrev CapturedFn.safetyPre (fn : CapturedFn) : MirState → Prop :=

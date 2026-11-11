@@ -51,22 +51,26 @@ def StepResult.silent {State Obs Val : Type}
     (next : State) : StepResult State Obs Val :=
   .choice (· = next)
 
-/-- First-order deterministic small-step outcome without observation events.
+/-- First-order small-step outcome without observation events.
 
 Unlike `StepResult.silent` (which wraps `next` inside `StepResult.choice
 (· = next)`), `RawStep.silent` carries `next : State` as first-order data so
 bounded inner evaluators (such as `evalConstLoop` in `Trusted/MirSemantics.lean`)
 can pattern-match on successor states directly before lifting to `StepResult`
-via `RawStep.toStepResult`. -/
+via `RawStep.toStepResult`. `RawStep.choiceList` carries a non-empty list of
+enabled successor states `(head :: tail)` for finite demonic nondeterminism
+(such as weak-memory atomic loads). -/
 inductive RawStep (State Val : Type) where
   | silent (next : State)
+  | choiceList (head : State) (tail : List State)
   | terminated (term : TerminationKind Val)
   | failed
 
-/-- Lift a deterministic `RawStep` into `StepResult`. -/
+/-- Lift a `RawStep` into `StepResult`. -/
 def RawStep.toStepResult {State Obs Val : Type} :
     RawStep State Val → StepResult State Obs Val
   | .silent s => .silent s
+  | .choiceList head tail => .choice (fun s' => s' ∈ head :: tail)
   | .terminated t => .terminated t
   | .failed => .failed
 

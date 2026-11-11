@@ -69,6 +69,12 @@ impl Names {
             ir::Ty::RefMut(inner) => {
                 format!("(_root_.Trusted.MirTy.refMut {})", self.ty(inner))
             }
+            ir::Ty::RefAtomicUsize => {
+                "_root_.Trusted.MirTy.refAtomicUsize".into()
+            }
+            ir::Ty::AtomicOrdering => {
+                "_root_.Trusted.MirTy.atomicOrdering".into()
+            }
             ir::Ty::RawPtr(inner, m) => format!(
                 "(_root_.Trusted.MirTy.rawPtr {} {})",
                 self.ty(inner),
@@ -99,6 +105,17 @@ impl Names {
                 format!("(_root_.Trusted.MirVal.bool {})", Self::bool_lit(*b))
             }
             ir::Val::Unit => "_root_.Trusted.MirVal.unit".into(),
+            ir::Val::AtomicLoc(loc) => {
+                format!("(_root_.Trusted.MirVal.atomicLoc {loc})")
+            }
+            ir::Val::Ordering(ir::AtomicOrdering::Relaxed) => {
+                "(_root_.Trusted.MirVal.ordering _root_.Trusted.AtomicOrdering.relaxed)"
+                    .into()
+            }
+            ir::Val::Ordering(ir::AtomicOrdering::Acquire) => {
+                "(_root_.Trusted.MirVal.ordering _root_.Trusted.AtomicOrdering.acquire)"
+                    .into()
+            }
         }
     }
 
@@ -531,6 +548,12 @@ impl Names {
                     self.ty_list(type_args)
                 )
             }
+            ir::Terminator::CallAtomicLoad { dst, ptr, ord, target } => format!(
+                "_root_.Trusted.Terminator.callAtomicLoad {} {} {} ⟨{target}⟩",
+                self.place(dst),
+                self.operand(ptr),
+                self.operand(ord)
+            ),
             ir::Terminator::Call { dst, args, target } => format!(
                 "_root_.Trusted.Terminator.call {} {} {}",
                 self.place(dst),
@@ -586,6 +609,9 @@ impl Names {
         match s {
             ir::Spec::EnsuresEqArg(l) => {
                 format!("_root_.Trusted.PostSpec.ensuresEqArg {l}")
+            }
+            ir::Spec::EnsuresAtomicLoad(l) => {
+                format!("_root_.Trusted.PostSpec.ensuresAtomicLoad {l}")
             }
         }
     }

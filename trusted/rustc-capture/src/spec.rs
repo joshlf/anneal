@@ -34,6 +34,9 @@
 //!
 //! ```text
 //! anneal:spec ensures(ret == IDENT)    on a function; IDENT is a parameter
+//! anneal:spec ensures(atomic_load(IDENT))
+//!                                      on a function; IDENT is an
+//!                                      `&AtomicUsize` parameter
 //! anneal:spec well_formed              on a function; adds nothing
 //! anneal:requires IDENT != INT         on a function; IDENT is a `usize`
 //!                                      parameter (enters `SafetyPre` on
@@ -59,6 +62,7 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Directive {
     EnsuresRetEq(String),
+    EnsuresAtomicLoad(String),
     WellFormed,
     Requires { ident: String, ne: u128 },
     Trusted { reason: String },
@@ -215,6 +219,18 @@ pub fn parse_doc(doc: &str) -> Result<Vec<Directive>, String> {
                 if k == "spec" && e == "ensures" && r == "ret" =>
             {
                 Directive::EnsuresRetEq(x.clone())
+            }
+            [
+                Ident(k),
+                Ident(e),
+                LParen,
+                Ident(a),
+                LParen,
+                Ident(x),
+                RParen,
+                RParen,
+            ] if k == "spec" && e == "ensures" && a == "atomic_load" => {
+                Directive::EnsuresAtomicLoad(x.clone())
             }
             [Ident(k), Ident(w)] if k == "spec" && w == "well_formed" => {
                 Directive::WellFormed

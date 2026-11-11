@@ -141,6 +141,17 @@ pub enum Spec {
     /// `ensures(ret == <param>)`, where `<param>` is the 1-based argument
     /// local (`_1`, `_2`, ...): `Trusted.PostSpec.ensuresEqArg <arg_local>`.
     EnsuresEqArg(u32),
+    /// `ensures(atomic_load(<param>))`, where `<param>` is the 1-based
+    /// `&AtomicUsize` argument local (`_1`, `_2`, ...):
+    /// `Trusted.PostSpec.ensuresAtomicLoad <arg_local>`.
+    EnsuresAtomicLoad(u32),
+}
+
+/// `Trusted.AtomicOrdering`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicOrdering {
+    Relaxed,
+    Acquire,
 }
 
 /// `Trusted.MirBody`.
@@ -180,6 +191,8 @@ pub enum Ty {
     Param(u32),
     Ref(Box<Ty>),
     RefMut(Box<Ty>),
+    RefAtomicUsize,
+    AtomicOrdering,
     RawPtr(Box<Ty>, bool),
     Array(Box<Ty>, u64),
     Slice(Box<Ty>),
@@ -228,6 +241,8 @@ impl Ty {
             | Self::Unit
             | Self::Never
             | Self::Param(_)
+            | Self::RefAtomicUsize
+            | Self::AtomicOrdering
             | Self::FnDef(_)
             | Self::FnPtr
             | Self::Unmodeled => {}
@@ -268,6 +283,8 @@ impl Ty {
                 | Self::Never
                 | Self::Adt(_)
                 | Self::Param(_)
+                | Self::RefAtomicUsize
+                | Self::AtomicOrdering
                 | Self::FnDef(_)
                 | Self::FnPtr
                 | Self::Unmodeled,
@@ -285,6 +302,8 @@ pub enum Val {
     Usize(u128),
     Bool(bool),
     Unit,
+    AtomicLoc(u32),
+    Ordering(AtomicOrdering),
 }
 
 /// `Trusted.PlaceElem`.
@@ -522,6 +541,12 @@ pub enum Terminator {
         arg: Operand,
         target: u32,
         type_args: Vec<Ty>,
+    },
+    CallAtomicLoad {
+        dst: Place,
+        ptr: Operand,
+        ord: Operand,
+        target: u32,
     },
     Call {
         dst: Place,

@@ -107,6 +107,7 @@ fn verifies_annotated_pub_fn_id_via_cli() {
     let output = cli().arg(&crate_dir.path).output().unwrap();
     assert_cli_success(&output);
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(
         mir_lean.contains("Trusted.PostSpec.ensuresEqArg 1"),
         "expected first-order PostSpec in Mir.lean, got:\n{mir_lean}"
@@ -192,6 +193,7 @@ fn rejects_unsupported_mir_construct_fail_closed() {
         "pub fn add(x: u32, y: u32) -> u32 {\n    x.wrapping_add(y)\n}\n",
     );
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(
         mir_lean.contains("Trusted.MirTy.uint 32"),
         "expected unconditional MIR AST capture of u32, got:\n{mir_lean}"
@@ -326,6 +328,7 @@ fn verifies_nonzero_library_crate_with_safe_and_unsafe_apis() {
     let report = verify_crate_with_report(&cfg_for(&crate_dir.path)).unwrap();
     assert!(report.output_text.contains("verified crate `sample`"));
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(mir_lean.contains("Trusted.FieldAccess.priv"));
     assert!(mir_lean.contains("Trusted.AdtRepr.transparent"));
 
@@ -352,6 +355,7 @@ fn verifies_repr_transparent_struct_transmute() {
     );
     verify_crate(&cfg_for(&crate_dir.path)).unwrap();
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(mir_lean.contains("Trusted.AdtRepr.transparent"));
     assert!(
         mir_lean.contains(
@@ -499,6 +503,7 @@ fn captures_alloc_passthrough_with_doc_spec() {
     );
     verify_crate(&cfg_for(&crate_dir.path)).unwrap();
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(mir_lean.contains("Trusted.PostSpec.ensuresEqArg 1"));
 }
 
@@ -602,6 +607,7 @@ fn verifies_safe_fn_with_functional_requires_contract() {
     );
     verify_crate(&cfg_for(&crate_dir.path)).unwrap();
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    eprintln!("CAPTURED MIR_LEAN:\n{mir_lean}");
     assert!(
         !mir_lean.contains("isUnsafe := _root_.Bool.true")
             && mir_lean.contains(
@@ -675,4 +681,55 @@ fn verifies_trusted_fn_waiver_with_matching_tcb_lock_and_rejects_mismatch() {
     )
     .unwrap();
     verify_crate(&cfg_for(&crate_dir.path)).unwrap();
+}
+
+#[test]
+fn verifies_annotated_pub_fn_load_relaxed() {
+    let crate_dir = TempCrateDir::new(
+        "annotated-load-relaxed",
+        "use core::sync::atomic::{AtomicUsize, Ordering};\n\n\
+         /// anneal:spec ensures(atomic_load(a))\n\
+         pub fn load_relaxed(a: &AtomicUsize) -> usize {\n    \
+             a.load(Ordering::Relaxed)\n\
+         }\n",
+    );
+    let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    assert!(
+        mir_lean.contains("Trusted.PostSpec.ensuresAtomicLoad 1"),
+        "got:\n{mir_lean}"
+    );
+    assert!(
+        mir_lean.contains("Trusted.Terminator.callAtomicLoad"),
+        "got:\n{mir_lean}"
+    );
+    verify_crate(&cfg_for(&crate_dir.path)).unwrap();
+}
+
+#[test]
+fn verifies_unannotated_pub_fn_load_relaxed_well_formedness() {
+    let crate_dir = TempCrateDir::new(
+        "unannotated-load-relaxed",
+        "use core::sync::atomic::{AtomicUsize, Ordering};\n\n\
+         pub fn load_relaxed(a: &AtomicUsize) -> usize {\n    \
+             a.load(Ordering::Relaxed)\n\
+         }\n",
+    );
+    verify_crate(&cfg_for(&crate_dir.path)).unwrap();
+}
+
+#[test]
+fn rejects_incorrect_load_relaxed_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-load-relaxed",
+        "use core::sync::atomic::AtomicUsize;\n\n\
+         /// anneal:spec ensures(atomic_load(_a))\n\
+         pub fn load_relaxed(_a: &AtomicUsize) -> usize {\n    \
+             0\n\
+         }\n",
+    );
+    let err = verify_crate(&cfg_for(&crate_dir.path)).unwrap_err();
+    assert!(
+        err.contains("lean failed"),
+        "expected Lean kernel rejection for false atomic load spec, got: {err}"
+    );
 }

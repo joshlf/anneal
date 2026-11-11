@@ -170,7 +170,8 @@ theorem validFields_with_stmtIdx
       validFields unfold1 fields v ↔ validFields unfold2 fields v
   | [], .unit => Iff.rfl
   | [], .uninit | [], .usize _ | [], .bool _ | [], .adt _ _
-  | [], .fieldCons _ _ | [], .bytes _ _ | [], .ref _ _ _ _ => Iff.rfl
+  | [], .fieldCons _ _ | [], .bytes _ _ | [], .ref _ _ _ _
+  | [], .atomicLoc _ | [], .ordering _ => Iff.rfl
   | [f], v => hunf f.ty v
   | f :: g :: rest, .fieldCons h t => by
     dsimp [validFields]
@@ -179,7 +180,8 @@ theorem validFields_with_stmtIdx
            fun ⟨h1, h2⟩ => ⟨(hunf f.ty h).mpr h1, ih.mpr h2⟩⟩
   | _ :: _ :: _, .uninit | _ :: _ :: _, .usize _ | _ :: _ :: _, .bool _
   | _ :: _ :: _, .unit | _ :: _ :: _, .adt _ _ | _ :: _ :: _, .bytes _ _
-  | _ :: _ :: _, .ref _ _ _ _ => Iff.rfl
+  | _ :: _ :: _, .ref _ _ _ _ | _ :: _ :: _, .atomicLoc _
+  | _ :: _ :: _, .ordering _ => Iff.rfl
 
 theorem validAdtDecl_with_stmtIdx
     {unfold1 unfold2 : MirTy → MirVal → Prop}
@@ -199,25 +201,26 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
         validStep adts adtInv s callerBase unfold2 ty v
   | .usize, .usize _ | .usize, .uninit | .usize, .bool _ | .usize, .unit
   | .usize, .adt _ _ | .usize, .fieldCons _ _ | .usize, .bytes _ _
-  | .usize, .ref _ _ _ _ => Iff.rfl
+  | .usize, .ref _ _ _ _ | .usize, .atomicLoc _ | .usize, .ordering _ => Iff.rfl
   | .isize, .usize _ | .isize, .uninit | .isize, .bool _ | .isize, .unit
   | .isize, .adt _ _ | .isize, .fieldCons _ _ | .isize, .bytes _ _
-  | .isize, .ref _ _ _ _ => Iff.rfl
+  | .isize, .ref _ _ _ _ | .isize, .atomicLoc _ | .isize, .ordering _ => Iff.rfl
   | .uint _, .usize _ | .uint _, .uninit | .uint _, .bool _ | .uint _, .unit
   | .uint _, .adt _ _ | .uint _, .fieldCons _ _ | .uint _, .bytes _ _
-  | .uint _, .ref _ _ _ _ => Iff.rfl
+  | .uint _, .ref _ _ _ _ | .uint _, .atomicLoc _ | .uint _, .ordering _ =>
+    Iff.rfl
   | .int _, .usize _ | .int _, .uninit | .int _, .bool _ | .int _, .unit
   | .int _, .adt _ _ | .int _, .fieldCons _ _ | .int _, .bytes _ _
-  | .int _, .ref _ _ _ _ => Iff.rfl
+  | .int _, .ref _ _ _ _ | .int _, .atomicLoc _ | .int _, .ordering _ => Iff.rfl
   | .char, .usize _ | .char, .uninit | .char, .bool _ | .char, .unit
   | .char, .adt _ _ | .char, .fieldCons _ _ | .char, .bytes _ _
-  | .char, .ref _ _ _ _ => Iff.rfl
+  | .char, .ref _ _ _ _ | .char, .atomicLoc _ | .char, .ordering _ => Iff.rfl
   | .bool, .bool _ | .bool, .uninit | .bool, .usize _ | .bool, .unit
   | .bool, .adt _ _ | .bool, .fieldCons _ _ | .bool, .bytes _ _
-  | .bool, .ref _ _ _ _ => Iff.rfl
+  | .bool, .ref _ _ _ _ | .bool, .atomicLoc _ | .bool, .ordering _ => Iff.rfl
   | .unit, .unit | .unit, .uninit | .unit, .usize _ | .unit, .bool _
   | .unit, .adt _ _ | .unit, .fieldCons _ _ | .unit, .bytes _ _
-  | .unit, .ref _ _ _ _ => Iff.rfl
+  | .unit, .ref _ _ _ _ | .unit, .atomicLoc _ | .unit, .ordering _ => Iff.rfl
   | .adt id, .adt _ inner => by
     dsimp [validStep]
     cases findAdtDecl adts id with
@@ -228,17 +231,20 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
              fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
   | .adt _, .uninit | .adt _, .usize _ | .adt _, .bool _
   | .adt _, .unit | .adt _, .fieldCons _ _ | .adt _, .bytes _ _
-  | .adt _, .ref _ _ _ _ => Iff.rfl
+  | .adt _, .ref _ _ _ _ | .adt _, .atomicLoc _ | .adt _, .ordering _ => Iff.rfl
   | .param _, .bytes _ _ | .param _, .uninit | .param _, .usize _
   | .param _, .bool _ | .param _, .unit | .param _, .adt _ _
-  | .param _, .fieldCons _ _ | .param _, .ref _ _ _ _ => Iff.rfl
+  | .param _, .fieldCons _ _ | .param _, .ref _ _ _ _
+  | .param _, .atomicLoc _ | .param _, .ordering _ => Iff.rfl
   | .array _ _, .bytes _ _ | .array _ _, .uninit | .array _ _, .usize _
   | .array _ _, .bool _ | .array _ _, .unit | .array _ _, .adt _ _
-  | .array _ _, .fieldCons _ _ | .array _ _, .ref _ _ _ _ => Iff.rfl
+  | .array _ _, .fieldCons _ _ | .array _ _, .ref _ _ _ _
+  | .array _ _, .atomicLoc _ | .array _ _, .ordering _ => Iff.rfl
   | .arraySizeOf _ _, .bytes _ _ | .arraySizeOf _ _, .uninit
   | .arraySizeOf _ _, .usize _ | .arraySizeOf _ _, .bool _
   | .arraySizeOf _ _, .unit | .arraySizeOf _ _, .adt _ _
-  | .arraySizeOf _ _, .fieldCons _ _ | .arraySizeOf _ _, .ref _ _ _ _ => Iff.rfl
+  | .arraySizeOf _ _, .fieldCons _ _ | .arraySizeOf _ _, .ref _ _ _ _
+  | .arraySizeOf _ _, .atomicLoc _ | .arraySizeOf _ _, .ordering _ => Iff.rfl
   | .ref inner, .ref frameId gen loc fieldDepth => by
     dsimp [validStep]
     rw [resolveRef_with_stmtIdx]
@@ -251,7 +257,7 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
              fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
   | .ref _, .uninit | .ref _, .usize _ | .ref _, .bool _
   | .ref _, .unit | .ref _, .adt _ _ | .ref _, .fieldCons _ _
-  | .ref _, .bytes _ _ => Iff.rfl
+  | .ref _, .bytes _ _ | .ref _, .atomicLoc _ | .ref _, .ordering _ => Iff.rfl
   | .rawPtr inner _, .ref frameId gen loc fieldDepth => by
     dsimp [validStep]
     rw [resolveRef_with_stmtIdx]
@@ -264,7 +270,18 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
              fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
   | .rawPtr _ _, .uninit | .rawPtr _ _, .usize _ | .rawPtr _ _, .bool _
   | .rawPtr _ _, .unit | .rawPtr _ _, .adt _ _ | .rawPtr _ _, .fieldCons _ _
-  | .rawPtr _ _, .bytes _ _ => Iff.rfl
+  | .rawPtr _ _, .bytes _ _ | .rawPtr _ _, .atomicLoc _
+  | .rawPtr _ _, .ordering _ => Iff.rfl
+  | .refAtomicUsize, .atomicLoc _ | .refAtomicUsize, .uninit
+  | .refAtomicUsize, .usize _ | .refAtomicUsize, .bool _
+  | .refAtomicUsize, .unit | .refAtomicUsize, .adt _ _
+  | .refAtomicUsize, .fieldCons _ _ | .refAtomicUsize, .bytes _ _
+  | .refAtomicUsize, .ref _ _ _ _ | .refAtomicUsize, .ordering _ => Iff.rfl
+  | .atomicOrdering, .ordering _ | .atomicOrdering, .uninit
+  | .atomicOrdering, .usize _ | .atomicOrdering, .bool _
+  | .atomicOrdering, .unit | .atomicOrdering, .adt _ _
+  | .atomicOrdering, .fieldCons _ _ | .atomicOrdering, .bytes _ _
+  | .atomicOrdering, .ref _ _ _ _ | .atomicOrdering, .atomicLoc _ => Iff.rfl
   | .float _, _ | .str, _ | .never, _ | .refMut _, _
   | .slice _, _ | .tuple _, _ | .fnDef _, _ | .fnPtr, _
   | .unmodeled, _ => Iff.rfl
@@ -296,7 +313,8 @@ theorem returnRefsStep_with_stmtIdx (s : MirState) (idx localCount : Nat)
     ∀ (v : MirVal),
       returnRefsStep { s with stmtIdx := idx } localCount follow1 v =
         returnRefsStep s localCount follow2 v
-  | .uninit | .usize _ | .bool _ | .unit | .bytes _ _ => rfl
+  | .uninit | .usize _ | .bool _ | .unit | .bytes _ _
+  | .atomicLoc _ | .ordering _ => rfl
   | .adt _ inner => returnRefsStep_with_stmtIdx s idx localCount hf inner
   | .fieldCons h t => by
     dsimp [returnRefsStep]
@@ -342,7 +360,8 @@ theorem evalProj_with_stmtIdx (s : MirState) (idx : Nat) :
     | some fVal => exact evalProj_with_stmtIdx s idx rest fVal
   | .field _ :: _, .uninit | .field _ :: _, .usize _ | .field _ :: _, .bool _
   | .field _ :: _, .unit | .field _ :: _, .bytes _ _
-  | .field _ :: _, .ref _ _ _ _ => rfl
+  | .field _ :: _, .ref _ _ _ _ | .field _ :: _, .atomicLoc _
+  | .field _ :: _, .ordering _ => rfl
   | .deref :: rest, .ref frameId gen loc fieldDepth => by
     dsimp [evalProj]
     rw [resolveRef_with_stmtIdx]
@@ -351,7 +370,8 @@ theorem evalProj_with_stmtIdx (s : MirState) (idx : Nat) :
     | some pointee => exact evalProj_with_stmtIdx s idx rest pointee
   | .deref :: _, .uninit | .deref :: _, .usize _ | .deref :: _, .bool _
   | .deref :: _, .unit | .deref :: _, .adt _ _ | .deref :: _, .fieldCons _ _
-  | .deref :: _, .bytes _ _ => rfl
+  | .deref :: _, .bytes _ _ | .deref :: _, .atomicLoc _
+  | .deref :: _, .ordering _ => rfl
   | .index _ :: _, _ | .constantIndex _ _ _ :: _, _
   | .subslice _ _ _ :: _, _ | .downcast _ :: _, _
   | .opaqueCast _ :: _, _ | .unwrapUnsafeBinder _ :: _, _ => rfl
@@ -382,7 +402,9 @@ theorem evalRefProj_with_stmtIdx (s : MirState) (idx : Nat) :
   | _, _, _, _, .field 0 :: _, .bool _ | _, _, _, _, .field 0 :: _, .unit
   | _, _, _, _, .field 0 :: _, .fieldCons _ _
   | _, _, _, _, .field 0 :: _, .bytes _ _
-  | _, _, _, _, .field 0 :: _, .ref _ _ _ _ => rfl
+  | _, _, _, _, .field 0 :: _, .ref _ _ _ _
+  | _, _, _, _, .field 0 :: _, .atomicLoc _
+  | _, _, _, _, .field 0 :: _, .ordering _ => rfl
   | _, _, _, _, .field (_ + 1) :: _, _ => rfl
   | _, _, _, _, .deref :: rest, .ref frameId' gen' loc' fieldDepth' => by
     dsimp [evalRefProj]
@@ -395,7 +417,8 @@ theorem evalRefProj_with_stmtIdx (s : MirState) (idx : Nat) :
   | _, _, _, _, .deref :: _, .uninit | _, _, _, _, .deref :: _, .usize _
   | _, _, _, _, .deref :: _, .bool _ | _, _, _, _, .deref :: _, .unit
   | _, _, _, _, .deref :: _, .adt _ _ | _, _, _, _, .deref :: _, .fieldCons _ _
-  | _, _, _, _, .deref :: _, .bytes _ _ => rfl
+  | _, _, _, _, .deref :: _, .bytes _ _ | _, _, _, _, .deref :: _, .atomicLoc _
+  | _, _, _, _, .deref :: _, .ordering _ => rfl
   | _, _, _, _, .index _ :: _, _ | _, _, _, _, .constantIndex _ _ _ :: _, _
   | _, _, _, _, .subslice _ _ _ :: _, _ | _, _, _, _, .downcast _ :: _, _
   | _, _, _, _, .opaqueCast _ :: _, _
@@ -722,6 +745,7 @@ theorem evalMirStmt_not_normal (adts : List AdtDecl) (b : MirBody)
       refine not_normal_of_if_failed ?_
       cases evalConstBody cBody (constEntryState s.tySizes s.adtPad) with
       | silent _ => intro h; cases h
+      | choiceList _ _ => intro h; cases h
       | failed => intro h; cases h
       | terminated t =>
         cases t with
@@ -778,10 +802,10 @@ theorem evalMirStmt_with_stmtIdx_silent (adts : List AdtDecl)
       s'.stack = s.stack := by
   cases s with
   | mk locals localGens block stmtIdx tySizes curBody stack frameId
-       nextFrameId adtPad ubChecks =>
+       nextFrameId adtPad ubChecks mem =>
   let s : MirState :=
     ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
-     nextFrameId, adtPad, ubChecks⟩
+     nextFrameId, adtPad, ubChecks, mem⟩
   cases stmt with
   | assign dst rv =>
     cases rv with
@@ -958,6 +982,7 @@ theorem evalMirStmt_with_stmtIdx_silent (adts : List AdtDecl)
       revert h1
       cases evalConstBody cBody (constEntryState tySizes adtPad) with
       | silent _ => intro h1; cases h1
+      | choiceList _ _ => intro h1; cases h1
       | failed => intro h1; cases h1
       | terminated t =>
         cases t with
@@ -1013,12 +1038,12 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
           targetLayout = .terminated (.normal v') ∧ P v' := by
   cases s with
   | mk locals localGens block stmtIdx tySizes curBody stack frameId
-       nextFrameId adtPad ubChecks =>
+       nextFrameId adtPad ubChecks mem =>
   dsimp at hstack
   subst hstack
   let s : MirState :=
     ⟨locals, localGens, block, stmtIdx, tySizes, curBody, [], frameId,
-     nextFrameId, adtPad, ubChecks⟩
+     nextFrameId, adtPad, ubChecks, mem⟩
   cases term with
   | return_ =>
     dsimp [evalMirTerminator]
@@ -1104,6 +1129,28 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
         dsimp
         cases assignPlace b₁.localCount p.2 dst outVal <;>
           (intro h1; cases h1)
+  | callAtomicLoad dst ptrOp ordOp _ =>
+    dsimp [evalMirTerminator]
+    refine fun h => False.elim (not_normal_of_if_failed ?_ h)
+    cases evalOperand b₁.localCount s ptrOp with
+    | none => intro h1; cases h1
+    | some p1 =>
+      cases p1 with
+      | mk pval1 locals1 =>
+        cases pval1 with
+        | atomicLoc loc =>
+          dsimp
+          cases evalOperand b₁.localCount { s with locals := locals1 } ordOp with
+          | none => intro h1; cases h1
+          | some p2 =>
+            cases p2 with
+            | mk pval2 locals2 =>
+              cases pval2 with
+              | ordering ord =>
+                dsimp
+                cases mem.visibleAtomicMsgs loc <;> (intro h1; cases h1)
+              | _ => intro h1; cases h1
+        | _ => intro h1; cases h1
   | call1 _ _ _ _ _ => cases hnocall
   | _ => intro h; cases h
 
@@ -1124,10 +1171,10 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
       s'.stack = [] := by
   cases s with
   | mk locals localGens block stmtIdx tySizes curBody stack frameId
-       nextFrameId adtPad ubChecks =>
+       nextFrameId adtPad ubChecks mem =>
   let s : MirState :=
     ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
-     nextFrameId, adtPad, ubChecks⟩
+     nextFrameId, adtPad, ubChecks, mem⟩
   dsimp at hcur hstack
   cases term with
   | return_ =>
@@ -1236,6 +1283,28 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
           intro hs
           have hg := gotoBlock_with_stmtIdx idx hs
           exact ⟨hg.1, hg.2.1, hg.2.2.1.trans hcur, hg.2.2.2.trans hstack⟩
+  | callAtomicLoad dst ptrOp ordOp _ =>
+    dsimp [evalMirTerminator]
+    refine fun h => False.elim (not_silent_of_if_failed ?_ h)
+    cases evalOperand b₁.localCount s ptrOp with
+    | none => intro h1; cases h1
+    | some p1 =>
+      cases p1 with
+      | mk pval1 locals1 =>
+        cases pval1 with
+        | atomicLoc loc =>
+          dsimp
+          cases evalOperand b₁.localCount { s with locals := locals1 } ordOp with
+          | none => intro h1; cases h1
+          | some p2 =>
+            cases p2 with
+            | mk pval2 locals2 =>
+              cases pval2 with
+              | ordering ord =>
+                dsimp
+                cases mem.visibleAtomicMsgs loc <;> (intro h1; cases h1)
+              | _ => intro h1; cases h1
+        | _ => intro h1; cases h1
   | call1 _ _ _ _ _ => cases hnocall
   | _ => intro h; cases h
 
@@ -1644,6 +1713,9 @@ theorem evalMirTerminator_eq_of_nocall (adts : List AdtDecl)
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | callTransmuteCopy _ _ _ _ _ =>
+    dsimp [evalMirTerminator, lowerBodyStep]
+    rw [list_length_map]
+  | callAtomicLoad _ _ _ _ =>
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | call1 _ _ _ _ _ => cases hnocall

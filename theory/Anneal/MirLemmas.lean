@@ -68,10 +68,135 @@ theorem ensuresEqArg_le_wellFormed (argLocal : Nat)
     EnsuresEqArg argLocal adts bodies ≤ wellFormed (MirLang adts bodies) :=
   spec_le_wellFormed _
 
+/-- Postcondition `EnsuresAtomicLoad argLocal adts bodies` refines
+`wellFormed (MirLang adts bodies)`. -/
+theorem ensuresAtomicLoad_le_wellFormed (argLocal : Nat)
+    (adts : List AdtDecl := []) (bodies : List BodyDecl := []) :
+    EnsuresAtomicLoad argLocal adts bodies ≤ wellFormed (MirLang adts bodies) :=
+  spec_le_wellFormed _
+
 /-- `defaultAdtInv` is admissible for an empty list of ADT declarations. -/
 theorem defaultAdtInv_admissible :
     AdmissibleAdtInv [] defaultAdtInv :=
   ⟨True.intro, fun _ h => by cases h⟩
+
+/-!
+## 1b. View Partial Order and Non-Atomic Ownership Helpers (`OwnLoc`)
+-/
+
+/-- When `a ≤ b`, `max a b = b`. -/
+theorem nat_max_eq_right {a b : Nat} (h : a ≤ b) : max a b = b :=
+  if_true_eq h b a
+
+/-- When `¬ a ≤ b`, `max a b = a`. -/
+theorem nat_max_eq_left {a b : Nat} (h : ¬ a ≤ b) : max a b = a :=
+  if_false_eq h b a
+
+/-- Left upper-bound property of `max` on `Nat` (`a ≤ max a b`). -/
+theorem nat_le_max_left (a b : Nat) : a ≤ max a b := by
+  cases (inferInstance : Decidable (a ≤ b)) with
+  | isFalse h =>
+    rw [nat_max_eq_left h]
+    exact Nat.le_refl a
+  | isTrue h =>
+    rw [nat_max_eq_right h]
+    exact h
+
+/-- Right upper-bound property of `max` on `Nat` (`b ≤ max a b`). -/
+theorem nat_le_max_right (a b : Nat) : b ≤ max a b := by
+  cases (inferInstance : Decidable (a ≤ b)) with
+  | isFalse h =>
+    rw [nat_max_eq_left h]
+    exact Nat.le_of_not_le h
+  | isTrue h =>
+    rw [nat_max_eq_right h]
+    exact Nat.le_refl b
+
+/-- Bumping a coherence view at `(loc, ts)` is inflationary in `Preorder View`
+(`v ≤ View.bump v loc ts`). -/
+theorem View.le_bump (v : View) (loc : Nat) (ts : Timestamp) :
+    v ≤ View.bump v loc ts := by
+  intro l
+  unfold View.bump
+  cases l == loc with
+  | false => exact Nat.le_refl _
+  | true => exact nat_le_max_left (v l) ts
+
+/-- Left upper-bound property of `View.join` in `Preorder View`
+(`v₁ ≤ View.join v₁ v₂`). -/
+theorem View.le_join_left (v₁ v₂ : View) :
+    v₁ ≤ View.join v₁ v₂ :=
+  fun l => nat_le_max_left (v₁ l) (v₂ l)
+
+/-- Right upper-bound property of `View.join` in `Preorder View`
+(`v₂ ≤ View.join v₁ v₂`). -/
+theorem View.le_join_right (v₁ v₂ : View) :
+    v₂ ≤ View.join v₁ v₂ :=
+  fun l => nat_le_max_right (v₁ l) (v₂ l)
+
+/-- Any atomic load (`.relaxed` or `.acquire`) monotonically advances the active
+thread's coherence view in `Preorder View`
+(`m.curView ≤ (m.applyAtomicLoad ord msg).curView`). -/
+theorem applyAtomicLoad_curView_mono (m : MemState) (ord : AtomicOrdering)
+    (msg : AtomicMsg) :
+    m.curView ≤ (m.applyAtomicLoad ord msg).curView := by
+  cases ord with
+  | relaxed =>
+    exact View.le_bump m.curView msg.loc msg.ts
+  | acquire =>
+    exact Preorder.le_trans
+      (View.le_bump m.curView msg.loc msg.ts)
+      (View.le_join_left (View.bump m.curView msg.loc msg.ts) msg.relView)
+
+/-- Single-threaded / lock-synchronized non-atomic ownership predicate:
+non-atomic location `loc` holds initialized value `v`, and its last write and
+read timestamps are both visible in the active thread's `curView`. -/
+def OwnLoc (m : MemState) (loc : Nat) (v : MirVal) : Prop :=
+  m.naVal loc = some v ∧
+  m.naWriteTs loc ≤ m.curView loc ∧
+  m.naReadTs loc ≤ m.curView loc
+
+/-- Under `OwnLoc m loc v`, a non-atomic read at `loc` is completely
+deterministic, never triggers a data-race failure, and returns `v`. -/
+theorem OwnLoc.readNA_eq {m : MemState} {loc : Nat} {v : MirVal}
+    (hOwn : OwnLoc m loc v) :
+    m.readNA loc =
+      some (v, { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) }) := by
+  unfold MemState.readNA
+  have hdec : decide (m.naWriteTs loc ≤ m.curView loc) = true :=
+    decide_eq_true hOwn.2.1
+  rw [hdec, hOwn.1]
+  rfl
+
+/-- `OwnLoc` is preserved whenever the thread's coherence view advances in
+`Preorder View` (`m.curView ≤ v'`) without concurrent modification to `loc`. -/
+theorem OwnLoc.mono_view {m : MemState} {loc : Nat} {v : MirVal} {v' : View}
+    (hOwn : OwnLoc m loc v) (hle : m.curView ≤ v') :
+    OwnLoc { m with curView := v' } loc v :=
+  ⟨hOwn.1, Nat.le_trans hOwn.2.1 (hle loc), Nat.le_trans hOwn.2.2 (hle loc)⟩
+
+/-- Any atomic load preserves `OwnLoc` on non-atomic locations. -/
+theorem OwnLoc.preserved_by_atomic_load {m : MemState} {loc : Nat} {v : MirVal}
+    (ord : AtomicOrdering) (msg : AtomicMsg) (hOwn : OwnLoc m loc v) :
+    OwnLoc (m.applyAtomicLoad ord msg) loc v := by
+  have hmono := applyAtomicLoad_curView_mono m ord msg
+  cases ord with
+  | relaxed => exact OwnLoc.mono_view hOwn hmono
+  | acquire => exact OwnLoc.mono_view hOwn hmono
+
+/-- Release-Acquire ownership transfer (for example, across a `Mutex`
+unlock/lock): if a `Release` message `msg` captured a view `msg.relView` that
+dominates `loc`'s non-atomic write/read timestamps, performing an `Acquire` load
+of `msg` establishes `OwnLoc` in the acquiring thread. -/
+theorem OwnLoc.transfer_acquire {m : MemState} {loc : Nat} {v : MirVal}
+    (msg : AtomicMsg)
+    (hVal : m.naVal loc = some v)
+    (hWrite : m.naWriteTs loc ≤ msg.relView loc)
+    (hRead : m.naReadTs loc ≤ msg.relView loc) :
+    OwnLoc (m.applyAtomicLoad .acquire msg) loc v := by
+  have hjoin :=
+    View.le_join_right (View.bump m.curView msg.loc msg.ts) msg.relView loc
+  exact ⟨hVal, Nat.le_trans hWrite hjoin, Nat.le_trans hRead hjoin⟩
 
 /-!
 ## 2. Symbolic Small-Step Execution Helpers
@@ -743,6 +868,270 @@ theorem execNormal_fnVerifiedAndRetInv {adts : List AdtDecl}
     FnVerifiedAndRetInv adts bodies adtInv fn tcb :=
   execNormal_fnBodySafetyVerified fn (fn.resolveBody bodies) hcwf h_exec
 
+theorem toStepResult_of_choiceList {head : MirState} {tail : List MirState}
+    {r : RawStep MirState MirReturn} (h : r = .choiceList head tail) :
+    r.toStepResult (Obs := Empty) =
+      StepResult.choice (fun s' => s' ∈ head :: tail) :=
+  congrArg RawStep.toStepResult h
+
+theorem reachesPrefix_of_choiceList
+    {adts : List AdtDecl} {bodies : List BodyDecl} {body : MirBody}
+    {s head : MirState} {tail : List MirState} {n : Nat} {tr : List Empty}
+    {out : PrefixOutcome MirState MirReturn}
+    (hstep : evalMirStep adts bodies body s = .choiceList head tail)
+    (hreach : ReachesPrefix (MirStep adts bodies) body n s tr out) :
+    out = .running s ∨
+      ∃ s', s' ∈ head :: tail ∧ ∃ n' tr',
+        ReachesPrefix (MirStep adts bodies) body n' s' tr' out := by
+  have hstepR := toStepResult_of_choiceList hstep
+  cases hreach with
+  | zero => exact Or.inl rfl
+  | step _ _ _ obs _ _ _ _ => nomatch obs
+  | choice n' _ s₂ branches _ _ h1 hbr hr =>
+    have h1' :
+        StepResult.choice branches =
+          (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'
+    injection h1' with hbr_eq
+    subst hbr_eq
+    exact Or.inr ⟨s₂, hbr, n', tr, hr⟩
+  | emptyChoice _ _ branches h1 hemp =>
+    have h1' :
+        StepResult.choice branches =
+          (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'
+    injection h1' with hbr_eq
+    subst hbr_eq
+    exact False.elim (hemp ⟨head, .head tail⟩)
+  | terminated _ _ _ h1 =>
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
+  | failed _ _ h1 =>
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
+  | noStep _ _ hno =>
+    exact False.elim (hno ⟨_, hstepR.symm⟩)
+
+theorem reachesPrefix_safeAndEnsures_of_choiceList
+    {adts : List AdtDecl} {bodies : List BodyDecl} {body : MirBody}
+    {s head : MirState} {tail : List MirState} {n : Nat} {tr : List Empty}
+    {out : PrefixOutcome MirState MirReturn} {P : MirReturn → Prop}
+    (hstep : evalMirStep adts bodies body s = .choiceList head tail)
+    (hreach : ReachesPrefix (MirStep adts bodies) body n s tr out)
+    (hnext : ∀ s', s' ∈ head :: tail → ∀ n' tr',
+      ReachesPrefix (MirStep adts bodies) body n' s' tr' out →
+      SafeAndEnsures P out) :
+    SafeAndEnsures P out := by
+  cases reachesPrefix_of_choiceList hstep hreach with
+  | inl hrun =>
+    subst hrun
+    exact ⟨True.intro, (fun _ h => by cases h), (fun h => by cases h)⟩
+  | inr hex =>
+    cases hex with
+    | intro s' hs' =>
+      cases hs'.2 with
+      | intro n' htr =>
+        cases htr with
+        | intro tr' hr' => exact hnext s' hs'.1 n' tr' hr'
+
+/-- Inductive normal-termination symbolic execution relation supporting both
+deterministic `.silent` steps and demonic `.choiceList` transitions. -/
+inductive ExecChoiceNormal (adts : List AdtDecl := [])
+    (bodies : List BodyDecl := []) (body : MirBody) :
+    MirState → (MirReturn → Prop) → Prop where
+  | step {s s' : MirState} {P : MirReturn → Prop} :
+      evalMirStep adts bodies body s = .silent s' →
+      ExecChoiceNormal adts bodies body s' P →
+      ExecChoiceNormal adts bodies body s P
+  | choice {s head : MirState} {tail : List MirState} {P : MirReturn → Prop} :
+      evalMirStep adts bodies body s = .choiceList head tail →
+      (∀ s', s' ∈ head :: tail → ExecChoiceNormal adts bodies body s' P) →
+      ExecChoiceNormal adts bodies body s P
+  | normal {s : MirState} {v : MirReturn} {P : MirReturn → Prop} :
+      evalMirStep adts bodies body s = .terminated (.normal v) →
+      P v →
+      ExecChoiceNormal adts bodies body s P
+
+/-- Weaken the return predicate `P` of `ExecChoiceNormal`. -/
+theorem ExecChoiceNormal.map {adts : List AdtDecl} {bodies : List BodyDecl}
+    {body : MirBody} {s : MirState} {P Q : MirReturn → Prop}
+    (himp : ∀ v, P v → Q v)
+    (hexec : ExecChoiceNormal adts bodies body s P) :
+    ExecChoiceNormal adts bodies body s Q := by
+  induction hexec with
+  | step hstep _ ih => exact .step hstep (ih himp)
+  | choice hstep _ ih => exact .choice hstep (fun s' hm => ih s' hm himp)
+  | normal hterm hp => exact .normal hterm (himp _ hp)
+
+theorem execChoiceNormal_safeAndEnsures {adts : List AdtDecl}
+    {bodies : List BodyDecl} {body : MirBody} {s : MirState}
+    {P : MirReturn → Prop}
+    (hexec : ExecChoiceNormal adts bodies body s P) :
+    ∀ {n : Nat} {tr : List Empty} {out : PrefixOutcome MirState MirReturn},
+      ReachesPrefix (MirStep adts bodies) body n s tr out →
+      SafeAndEnsures P out := by
+  induction hexec with
+  | step hstep _ ih =>
+    intro n tr out hreach
+    exact reachesPrefix_safeAndEnsures_of_step hstep hreach
+      (fun _ _ hr => ih hr)
+  | choice hstep _ ih =>
+    intro n tr out hreach
+    exact reachesPrefix_safeAndEnsures_of_choiceList hstep hreach
+      (fun s' hm _ _ hr => ih s' hm hr)
+  | normal hterm hp =>
+    intro n tr out hreach
+    exact reachesPrefix_safeAndEnsures_of_normal hterm hreach hp
+
+theorem execChoiceNormal_reaches {adts : List AdtDecl}
+    {bodies : List BodyDecl} {body : MirBody} {s : MirState}
+    {P : MirReturn → Prop}
+    (hexec : ExecChoiceNormal adts bodies body s P) :
+    ∃ n v,
+      ReachesPrefix (MirStep adts bodies) body n s []
+        (.terminated (.normal v)) ∧ P v := by
+  induction hexec with
+  | step hstep _ ih =>
+    cases ih with
+    | intro n hn =>
+      cases hn with
+      | intro v hv =>
+        exact ⟨n + 1, v,
+          .choice n _ _ _ [] (.terminated (.normal v))
+            (toStepResult_of_silent hstep).symm rfl hv.1,
+          hv.2⟩
+  | @choice _ head tail _ hstep _ ih =>
+    cases ih head (.head tail) with
+    | intro n hn =>
+      cases hn with
+      | intro v hv =>
+        exact ⟨n + 1, v,
+          .choice n _ head _ [] (.terminated (.normal v))
+            (toStepResult_of_choiceList hstep).symm (.head tail) hv.1,
+          hv.2⟩
+  | normal hterm hp =>
+    exact ⟨1, _,
+      .terminated 0 _ (.normal _) (toStepResult_of_terminated hterm).symm, hp⟩
+
+theorem execChoiceNormal_specOn {adts : List AdtDecl} {bodies : List BodyDecl}
+    {body : MirBody} {pre : MirState → Prop} {P : MirState → MirReturn → Prop}
+    (h_exec : ∀ s, initMirState adts bodies body s → pre s →
+      ExecChoiceNormal adts bodies body s (P s)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).SpecOn pre (fun s out =>
+        ∀ tr ret, out = .terminated tr (.normal ret) → P s ret) := by
+  refine eventualBehaviorOf_le_normalSpecOn (M := MirMachine adts bodies) ?_
+  intro init _ _ out hpre hpfx
+  have hsafe := execChoiceNormal_safeAndEnsures (h_exec init hpfx.1 hpre) hpfx.2
+  exact ⟨hsafe.1, hsafe.2.1⟩
+
+theorem execChoiceNormal_spec {adts : List AdtDecl} {bodies : List BodyDecl}
+    {body : MirBody} {P : MirState → MirReturn → Prop}
+    (h_exec : ∀ s, initMirState adts bodies body s →
+      ExecChoiceNormal adts bodies body s (P s)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).Spec (fun s out =>
+        ∀ tr ret, out = .terminated tr (.normal ret) → P s ret) :=
+  execChoiceNormal_specOn (fun s hinit _ => h_exec s hinit)
+
+theorem execChoiceNormal_spec_on_pre {adts : List AdtDecl}
+    {bodies : List BodyDecl} {body : MirBody} {pre : MirState → Prop}
+    {P : MirState → MirReturn → Prop}
+    (h_exec : ∀ s, pre s → ExecChoiceNormal adts bodies body s (P s)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).SpecOn pre (fun s out =>
+        ∀ tr ret, out = .terminated tr (.normal ret) → P s ret) :=
+  execChoiceNormal_specOn (fun s _ h => h_exec s h)
+
+theorem execChoiceNormal_safetyPost {adts : List AdtDecl}
+    {bodies : List BodyDecl} {adtInv : AdtInv} {body : MirBody}
+    {pre : MirState → Prop} {allowGuard : Bool}
+    (h_exec : ∀ s, pre s →
+      ExecChoiceNormal adts bodies body s (fun r =>
+        r.value.valid adts adtInv r.state body.localCount body.retTy)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).SpecOn pre
+        (fun s out => SafetyPost adts adtInv body s out allowGuard) := by
+  intro s hpre
+  refine ⟨fun _ n tr oc hreach =>
+    (execChoiceNormal_safeAndEnsures (h_exec s hpre) hreach).1, ?_⟩
+  intro out hval
+  refine ⟨?_, ?_⟩
+  · intro tr ret hout
+    subst hout
+    cases hval.2 with
+    | intro n hreach =>
+      exact (execChoiceNormal_safeAndEnsures (h_exec s hpre) hreach).2.1 ret rfl
+  · have hnoErr : ∀ tr, out ≠ .terminated tr .compileTimeError := by
+      intro tr hout
+      subst hout
+      cases hval.2 with
+      | intro n hreach =>
+        exact (execChoiceNormal_safeAndEnsures (h_exec s hpre) hreach).2.2 rfl
+    cases allowGuard with
+    | false => exact hnoErr
+    | true => exact fun _ => hnoErr
+
+theorem execChoiceNormal_safetyVerified {adts : List AdtDecl}
+    {bodies : List BodyDecl} {adtInv : AdtInv} {body : MirBody}
+    {pre : MirState → Prop} {allowGuard : Bool}
+    (hwf : StaticBodyWf adts body)
+    (h_pre_init : ∀ s, pre s → initMirState adts bodies body s)
+    (h_exec : ∀ s, pre s →
+      ExecChoiceNormal adts bodies body s (fun r =>
+        r.value.valid adts adtInv r.state body.localCount body.retTy)) :
+    (MirLang adts bodies).Verified pre
+      (fun s out => SafetyPost adts adtInv body s out allowGuard)
+      body := by
+  have h_spec := execChoiceNormal_safetyPost (allowGuard := allowGuard) h_exec
+  refine ⟨hwf, ?_, h_spec⟩
+  intro s hpre
+  have hinit : initMirState adts bodies body s := h_pre_init s hpre
+  have hdef : (MirSem adts bodies body s).defined := (h_spec s hpre).1
+  cases execChoiceNormal_reaches (h_exec s hpre) with
+  | intro n hn =>
+    cases hn with
+    | intro v hv =>
+      exact ⟨hdef, .terminated [] (.normal v), hinit, n, hv.1⟩
+
+theorem execChoiceNormal_fnBodySafetyVerified {adts : List AdtDecl}
+    {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
+    (body : MirBody) {tcb : List TCBItem}
+    (hcwf : ContractWellFormed adts bodies fn body)
+    (h_exec : ∀ s, SafetyPre adts bodies adtInv fn body s tcb →
+      ExecChoiceNormal adts bodies body s (fun r =>
+        r.value.valid adts adtInv r.state body.localCount body.retTy)) :
+    FnBodySafetyVerified adts bodies adtInv fn body tcb :=
+  ⟨hcwf, execChoiceNormal_safetyVerified hcwf.1 (fun _ h => h.1) h_exec⟩
+
+theorem specOn_contractPost_ensuresAtomicLoad1 {adts : List AdtDecl}
+    {bodies : List BodyDecl} {fn : CapturedFn} {body : MirBody}
+    {pre : MirState → Prop}
+    (hspecs : fn.specs = [.ensuresAtomicLoad 1] := by rfl)
+    (h_exec : ∀ s, pre s →
+      ExecChoiceNormal adts bodies body s (fun r =>
+        ∃ loc msg,
+          s.locals 1 = some (.atomicLoc loc) ∧
+          msg ∈ s.mem.visibleAtomicMsgs loc ∧
+          r.value = .usize msg.bits)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).SpecOn pre (ContractPost adts bodies fn) := by
+  have hsingle := execChoiceNormal_spec_on_pre h_exec
+  intro s hpre
+  have hs := hsingle s hpre
+  refine ⟨hs.1, fun out hpfx => ?_⟩
+  unfold ContractPost
+  rw [hspecs]
+  exact ⟨hs.2 out hpfx, True.intro⟩
+
+theorem mem_cons_map {α β : Type} (f : α → β) (head : α) :
+    ∀ (tail : List α) {y : β},
+      y ∈ f head :: tail.map f → ∃ x, x ∈ head :: tail ∧ y = f x
+  | _, _, .head _ => ⟨head, .head _, rfl⟩
+  | _ :: tail, _, .tail _ hm =>
+    match mem_cons_map f _ tail hm with
+    | ⟨x, hx, hy⟩ => ⟨x, .tail _ hx, hy⟩
+
 /-- Discharge `FnBodySafetyVerified` when
 `hasCompileTimeGuardWaiver fn tcb = true`, given that execution from any state
 in `SafetyPre` either returns a valid result (`ExecNormal`) or terminates with
@@ -1225,6 +1614,8 @@ theorem idCopyBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         apply ExecNormal.step
         · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
@@ -1265,7 +1656,7 @@ theorem idMoveBody_execNormal {bodies : List BodyDecl} (s : MirState)
       s.locals 1 = some r.value ∧
       r.value.valid [] defaultAdtInv r.state 2 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 mem0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -1287,6 +1678,8 @@ theorem idMoveBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         apply ExecNormal.step
         · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
@@ -1334,6 +1727,166 @@ abbrev derefPlace (idx : Nat) : Place :=
 /-- Shorthand for field `0` of local `_idx` (`_idx.0`). -/
 abbrev field0Place (idx : Nat) : Place :=
   { loc := ⟨idx⟩, projection := [.field 0] }
+
+/-- Canonical `Runtime(PostCleanup)` MIR body for
+`pub fn load_relaxed(a: &AtomicUsize) -> usize { a.load(Ordering::Relaxed) }`. -/
+def loadRelaxedBody : MirBody where
+  argTys := [.refAtomicUsize]
+  retTy := .usize
+  localCount := 4
+  blocks := [
+    { stmts := [
+        .storageLive ⟨2⟩,
+        .assign (locPlace 2) (.ref (derefPlace 1)),
+        .storageLive ⟨3⟩,
+        .assign (locPlace 3) (.use (.constVal (.ordering .relaxed)))
+      ]
+      terminator :=
+        .callAtomicLoad (locPlace 0) (.move (locPlace 2))
+          (.move (locPlace 3)) ⟨1⟩ },
+    { stmts := [
+        .storageDead ⟨3⟩,
+        .storageDead ⟨2⟩
+      ]
+      terminator := .return_ }
+  ]
+
+/-- `loadRelaxedBody` executes across the demonic weak-memory choice in `bb0`
+to normal termination in `bb1`, returning `MirVal.usize msg.bits` for some
+visible modification-order message `msg ∈ s.mem.visibleAtomicMsgs loc`. -/
+theorem loadRelaxedBody_execChoiceNormal {bodies : List BodyDecl}
+    (s : MirState)
+    (hinit : initMirState [] bodies loadRelaxedBody s) :
+    ExecChoiceNormal [] bodies loadRelaxedBody s (fun r =>
+      (∃ loc msg,
+        s.locals 1 = some (.atomicLoc loc) ∧
+        msg ∈ s.mem.visibleAtomicMsgs loc ∧
+        r.value = .usize msg.bits) ∧
+      r.value.valid [] defaultAdtInv r.state 4 .usize) := by
+  cases s with
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0
+       nextFrameId0 adtPad0 ubChecks0 mem0 =>
+    have hentry := hinit.1
+    have hb : block0 = 0 := hentry.1
+    have hs : stmtIdx0 = 0 := hentry.2.1
+    have hc : curBody0 = none := hentry.2.2.1
+    have hst : stack0 = [] := hentry.2.2.2.1
+    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+    subst hb hs hc hst hfid hnfid hlg
+    cases (initEntryState_argsMatch hentry).1 with
+    | intro v hv =>
+      have hv1 : locals0 1 = some v := hv.1
+      have hvty := hv.2
+      cases v with
+      | uninit => cases hvty
+      | usize _ => cases hvty
+      | bool _ => cases hvty
+      | unit => cases hvty
+      | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
+      | bytes _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
+      | ordering _ => cases hvty
+      | atomicLoc loc =>
+        have hvis : mem0.visibleAtomicMsgs loc ≠ [] := hvty
+        refine .step rfl ?_
+        apply ExecChoiceNormal.step
+        · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+            lookupAt, List.foldr, Option.getD, evalMirStmt, evalRefPlace,
+            evalRefProj, assignPlace, locPlace, derefPlace,
+            loadRelaxedBody, updateLocal]
+          rw [hv1]
+          rfl
+        · refine .step rfl (.step rfl ?_)
+          cases hlist : mem0.visibleAtomicMsgs loc with
+          | nil => exact False.elim (hvis hlist)
+          | cons head tail =>
+            let localsAfterMoves : Nat → Option MirVal :=
+              updateLocal
+                (updateLocal
+                  (updateLocal
+                    (updateLocal
+                      (updateLocal
+                        (updateLocal locals0 2 none)
+                        2 (some (.atomicLoc loc)))
+                      3 none)
+                    3 (some (.ordering .relaxed)))
+                  2 none)
+                3 none
+            let stepMsg (msg : AtomicMsg) : MirState := {
+              locals :=
+                updateLocal localsAfterMoves 0 (some (.usize msg.bits))
+              localGens := bumpGen (bumpGen (fun _ => 0) 2) 3
+              block := 1
+              stmtIdx := 0
+              tySizes := tySizes0
+              curBody := none
+              stack := []
+              frameId := 0
+              nextFrameId := 1
+              adtPad := adtPad0
+              ubChecks := ubChecks0
+              mem := mem0.applyAtomicLoad .relaxed msg
+            }
+            apply ExecChoiceNormal.choice (head := stepMsg head)
+              (tail := tail.map stepMsg)
+            · change (match mem0.visibleAtomicMsgs loc with
+                | [] => RawStep.failed
+                | head :: tail =>
+                  RawStep.choiceList (stepMsg head) (tail.map stepMsg)) = _
+              rw [hlist]
+            · intro s' hs'
+              cases mem_cons_map stepMsg head tail hs' with
+              | intro msg hmsg =>
+                have hmem : msg ∈ head :: tail := hmsg.1
+                have hs'Eq : s' = stepMsg msg := hmsg.2
+                subst hs'Eq
+                refine .step rfl (.step rfl (.normal rfl ?_))
+                refine ⟨⟨loc, msg, hv1, ?_, rfl⟩, True.intro⟩
+                rw [hlist]
+                exact hmem
+
+/-- `loadRelaxedBody` satisfies `EnsuresAtomicLoad 1` under any `bodies`. -/
+theorem loadRelaxedBody_satisfies_ensures {bodies : List BodyDecl} :
+    MirSem [] bodies loadRelaxedBody ≤ EnsuresAtomicLoad 1 [] bodies :=
+  execChoiceNormal_spec (fun s hinit =>
+    (loadRelaxedBody_execChoiceNormal s hinit).map (fun _ h => h.1))
+
+/-- `loadRelaxedBody` satisfies `wellFormed (MirLang [] bodies)`. -/
+theorem loadRelaxedBody_satisfies_wellFormed {bodies : List BodyDecl} :
+    MirSem [] bodies loadRelaxedBody ≤ wellFormed (MirLang [] bodies) :=
+  Preorder.le_trans loadRelaxedBody_satisfies_ensures
+    (ensuresAtomicLoad_le_wellFormed 1)
+
+/-- `loadRelaxedBody` satisfies `FnBodySafetyVerified` for any `fn` and `body`
+equal to `loadRelaxedBody`. -/
+theorem loadRelaxedBody_verified_of_eq {bodies : List BodyDecl}
+    {tcb : List TCBItem}
+    (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
+    (hres : body = loadRelaxedBody) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb := by
+  rw [hres]
+  exact execChoiceNormal_fnBodySafetyVerified fn loadRelaxedBody
+    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl)
+    (fun s hpre =>
+      (loadRelaxedBody_execChoiceNormal s hpre.1).map (fun _ h => h.2))
+
+/-- `loadRelaxedBody` satisfies `ContractPost` when
+`fn.specs = [.ensuresAtomicLoad 1]`. -/
+theorem loadRelaxedBody_specs_of_eq {bodies : List BodyDecl}
+    {tcb : List TCBItem}
+    (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
+    (hres : body = loadRelaxedBody)
+    (hspecs : fn.specs = [.ensuresAtomicLoad 1]) :
+    MirSem [] bodies body ≤
+      (MirLang [] bodies).SpecOn
+        (fun s => SafetyPre [] bodies defaultAdtInv fn body s tcb ∧ fn.safetyPre s)
+        (ContractPost [] bodies fn) := by
+  rw [hres]
+  exact specOn_contractPost_ensuresAtomicLoad1 hspecs (fun s hpre =>
+    (loadRelaxedBody_execChoiceNormal s hpre.1.1).map (fun _ h => h.1))
 
 /-- Constant body for `assert!(size_of::<T0>() == size_of::<T1>())`, exactly as
 `anneal-rustc-capture` emits it from `rustc`'s `Runtime(PostCleanup)` MIR. -/
@@ -1563,6 +2116,8 @@ theorem concreteTransmuteCaller_execNormal {bodies : List BodyDecl}
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -1882,6 +2437,8 @@ theorem makeNonZeroBody_execNormal {bodies : List BodyDecl} {repr : AdtRepr}
         | fieldCons _ _ => cases hvty
         | bytes _ _ => cases hvty
         | ref _ _ _ _ => cases hvty
+        | atomicLoc _ => cases hvty
+        | ordering _ => cases hvty
         | usize n =>
           refine .step rfl (.step rfl ?_)
           apply ExecNormal.step
@@ -1949,7 +2506,7 @@ theorem newUncheckedBody_execNormal {bodies : List BodyDecl} {repr : AdtRepr}
   | inl hrepr | inr hrepr =>
     subst hrepr
     cases s with
-    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 mem0 =>
       have hentry := hinit.1
       have hb : block0 = 0 := hentry.1
       have hs : stmtIdx0 = 0 := hentry.2.1
@@ -1971,6 +2528,8 @@ theorem newUncheckedBody_execNormal {bodies : List BodyDecl} {repr : AdtRepr}
         | fieldCons _ _ => cases hvty
         | bytes _ _ => cases hvty
         | ref _ _ _ _ => cases hvty
+        | atomicLoc _ => cases hvty
+        | ordering _ => cases hvty
         | usize n =>
           have hne0 : n ≠ 0 := hsafety n hv1
           refine .step rfl ?_
@@ -2036,7 +2595,7 @@ theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
   | inl hrepr | inr hrepr =>
     subst hrepr
     cases s with
-    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 mem0 =>
       have hentry := hinit.1
       have hb : block0 = 0 := hentry.1
       have hs : stmtIdx0 = 0 := hentry.2.1
@@ -2058,6 +2617,8 @@ theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
         | fieldCons _ _ => cases hvinv
         | bytes _ _ => cases hvinv
         | ref _ _ _ _ => cases hvinv
+        | atomicLoc _ => cases hvinv
+        | ordering _ => cases hvinv
         | adt vAdtId inner =>
           have hveq : vAdtId = 0 := hvinv.1
           subst hveq
@@ -2069,6 +2630,8 @@ theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
           | fieldCons _ _ => cases hvinv.2.2
           | bytes _ _ => cases hvinv.2.2
           | ref _ _ _ _ => cases hvinv.2.2
+          | atomicLoc _ => cases hvinv.2.2
+          | ordering _ => cases hvinv.2.2
           | usize n =>
             cases n with
             | zero => exact False.elim (hvinv.2.1 rfl)
@@ -2379,6 +2942,73 @@ theorem canary_wrong_id_violates_ensures :
         injection hpost with hval'
         injection hval' with hnum
         cases hnum
+
+/-- MIR body that accepts `_1 : &AtomicUsize` (`MirTy.refAtomicUsize`) and
+returns constant `0` instead of loading from `_1`. -/
+def wrongAtomicReturnZeroBody : MirBody where
+  argTys := [.refAtomicUsize]
+  retTy := .usize
+  localCount := 2
+  blocks := [
+    { stmts := [.assign (locPlace 0) (.use (.constVal (.usize 0)))]
+      terminator := .return_ }
+  ]
+
+/-- Negative canary for weak-memory atomic loads: returning constant `0` without
+reading `_1` violates `EnsuresAtomicLoad 1` when location `0`'s only visible
+modification-order message has `bits = 1`. -/
+theorem canary_wrong_atomic_load_violates_ensures :
+    ¬ (MirSem [] [] wrongAtomicReturnZeroBody ≤ EnsuresAtomicLoad 1 [] []) := by
+  intro hEns
+  let msg0 : AtomicMsg := { loc := 0, ts := 0, bits := 1, relView := View.bot }
+  let mem0 : MemState := { MemState.empty with atomicMsgs := [msg0] }
+  let s0 : MirState := {
+    locals := updateLocal (fun _ => none) 1 (some (.atomicLoc 0))
+    block := 0
+    stmtIdx := 0
+    mem := mem0
+  }
+  have hvis : mem0.visibleAtomicMsgs 0 ≠ [] := by
+    intro hnil
+    cases hnil
+  have hargs : argsMatchInv [] defaultAdtInv 2 s0 [.refAtomicUsize] :=
+    ⟨⟨MirVal.atomicLoc 0, rfl, hvis⟩, fun j hj _ => updateLocal_one_gt_one j hj⟩
+  have hinit : initMirState [] [] wrongAtomicReturnZeroBody s0 :=
+    ⟨mkInitEntryState hargs, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  have hexec :
+      ExecNormal [] [] wrongAtomicReturnZeroBody s0
+        (fun r => r.value = .usize 0) :=
+    .step rfl (.normal rfl rfl)
+  cases hEns s0 True.intro with
+  | intro hdef hval =>
+    cases execNormal_reaches hexec with
+    | intro n hn =>
+      cases hn with
+      | intro v hv =>
+        have hpfx :
+            (MirSem [] [] wrongAtomicReturnZeroBody s0).val hdef
+              (.terminated [] (.normal v)) :=
+          ⟨hinit, n, hv.1⟩
+        have hpost := hval _ hpfx [] v rfl
+        cases hpost with
+        | intro loc hpost2 =>
+          cases hpost2 with
+          | intro msg hprops =>
+            have hloc : s0.locals 1 = some (MirVal.atomicLoc 0) := rfl
+            have hloc_eq := hprops.1
+            rw [hloc] at hloc_eq
+            injection hloc_eq with hval'
+            injection hval' with hloc0
+            subst hloc0
+            have hmem : msg ∈ [msg0] := hprops.2.1
+            cases hmem with
+            | head =>
+              have hret := hprops.2.2
+              rw [hv.2] at hret
+              injection hret with hbits
+              cases hbits
+            | tail _ htail =>
+              cases htail
 
 /-!
 ## 7. Reference, Frame-ID, Type-Substitution, and ADT Canaries
@@ -3060,6 +3690,8 @@ theorem idNonZeroUnchecked_execNormal {bodies : List BodyDecl} (s : MirState)
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         cases n with
         | zero => exact False.elim (hsafety 0 hv1 rfl)
@@ -3231,6 +3863,8 @@ theorem clampNonZero_execNormal {bodies : List BodyDecl} (s : MirState)
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -3828,13 +4462,15 @@ theorem adtTransmuteBody_transparent_execNormal {bodies : List BodyDecl}
       have hv1 : locals0 1 = some v := hv.1
       have hvty := hv.2
       cases v with
-      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+      | atomicLoc _ | ordering _ =>
         cases hvty
       | adt vAdtId inner =>
         have hveq : vAdtId = 0 := hvty.1
         subst hveq
         cases inner with
-        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+        | atomicLoc _ | ordering _ =>
           cases hvty.2.2
         | usize n =>
           have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
@@ -3868,7 +4504,7 @@ theorem adtTransmuteBody_rustPinned_execNormal {bodies : List BodyDecl}
         r.value.valid [reprRustWrapAdtDecl]
           (denoteAdtInv [reprRustWrapAdtDecl]) r.state 3 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 mem0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -3884,13 +4520,15 @@ theorem adtTransmuteBody_rustPinned_execNormal {bodies : List BodyDecl}
       have hv1 : locals0 1 = some v := hv.1
       have hvty := hv.2
       cases v with
-      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+      | atomicLoc _ | ordering _ =>
         cases hvty
       | adt vAdtId inner =>
         have hveq : vAdtId = 0 := hvty.1
         subst hveq
         cases inner with
-        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+        | atomicLoc _ | ordering _ =>
           cases hvty.2.2
         | usize n =>
           have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
@@ -3929,7 +4567,7 @@ theorem capturedGuardedAdtTransmuteBody_exec_zero {bodies : List BodyDecl}
     (hconst :
       findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
     (locals0 : Nat → Option MirVal) (tySizes0 : Nat → Nat)
-    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (n : Nat) :
+    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (mem0 : MemState) (n : Nat) :
     ExecNormal [reprRustWrapAdtDecl] bodies
       (capturedGuardedAdtTransmuteBody constId 0)
       { locals := updateLocal locals0 1 (some (.adt 0 (.usize n)))
@@ -3942,7 +4580,8 @@ theorem capturedGuardedAdtTransmuteBody_exec_zero {bodies : List BodyDecl}
         frameId := 0
         nextFrameId := 1
         adtPad := padAtZero 0 adtPad0
-        ubChecks := ubChecks0 }
+        ubChecks := ubChecks0
+        mem := mem0 }
       (fun r =>
         r.value.valid [reprRustWrapAdtDecl]
           (denoteAdtInv [reprRustWrapAdtDecl]) r.state 4 .usize) := by
@@ -3961,7 +4600,7 @@ theorem capturedGuardedAdtTransmuteBody_exec_succ {bodies : List BodyDecl}
     (hconst :
       findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
     (locals0 : Nat → Option MirVal) (tySizes0 : Nat → Nat)
-    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (n k : Nat) :
+    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (mem0 : MemState) (n k : Nat) :
     ExecCompileTimeError [reprRustWrapAdtDecl] bodies
       (capturedGuardedAdtTransmuteBody constId 0)
       { locals := updateLocal locals0 1 (some (.adt 0 (.usize n)))
@@ -3974,7 +4613,8 @@ theorem capturedGuardedAdtTransmuteBody_exec_succ {bodies : List BodyDecl}
         frameId := 0
         nextFrameId := 1
         adtPad := padAtZero (Nat.succ k) adtPad0
-        ubChecks := ubChecks0 } := by
+        ubChecks := ubChecks0
+        mem := mem0 } := by
   refine .step rfl (.compileTimeError ?_)
   dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
     lookupAt, List.foldr, Option.getD, evalMirStmt,
@@ -4001,7 +4641,7 @@ theorem capturedGuardedAdtTransmuteBody_rustGuarded_exec
      ExecCompileTimeError [reprRustWrapAdtDecl] bodies
         (capturedGuardedAdtTransmuteBody constId 0) s) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 mem0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -4016,13 +4656,15 @@ theorem capturedGuardedAdtTransmuteBody_rustGuarded_exec
       have hv1 : locals0 1 = some v := hv.1
       have hvty := hv.2
       cases v with
-      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+      | atomicLoc _ | ordering _ =>
         cases hvty
       | adt vAdtId inner =>
         have hveq : vAdtId = 0 := hvty.1
         subst hveq
         cases inner with
-        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _
+        | atomicLoc _ | ordering _ =>
           cases hvty.2.2
         | usize n =>
           have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
@@ -4042,15 +4684,15 @@ theorem capturedGuardedAdtTransmuteBody_rustGuarded_exec
           · have hp0 : adtPad0 0 = 0 := congrFun h0.1 0
             rw [hL, hPad, hp0]
             exact capturedGuardedAdtTransmuteBody_exec_zero hconst locals0
-              tySizes0 adtPad0 ubChecks0 n
+              tySizes0 adtPad0 ubChecks0 mem0 n
           · rw [hL, hPad]
             cases adtPad0 0 with
             | zero =>
               exact Or.inl (capturedGuardedAdtTransmuteBody_exec_zero hconst
-                locals0 tySizes0 adtPad0 ubChecks0 n)
+                locals0 tySizes0 adtPad0 ubChecks0 mem0 n)
             | succ k =>
               exact Or.inr (capturedGuardedAdtTransmuteBody_exec_succ hconst
-                locals0 tySizes0 adtPad0 ubChecks0 n k)
+                locals0 tySizes0 adtPad0 ubChecks0 mem0 n k)
 
 theorem capturedGuardedAdtTransmuteBody_rustGuarded_verified_of_resolve
     {bodies : List BodyDecl} {constId : BodyId} {tcb : List TCBItem}
@@ -4151,6 +4793,8 @@ theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -4237,6 +4881,8 @@ theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
       | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
+      | atomicLoc _ => cases hvty
+      | ordering _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -4355,6 +5001,15 @@ theorem eq_of_beqFieldAccess {a b : FieldAccess}
     (h : beqFieldAccess a b = true) : a = b := by
   cases a <;> cases b <;> first | rfl | cases h
 
+def beqAtomicOrdering : AtomicOrdering → AtomicOrdering → Bool
+  | .relaxed, .relaxed => true
+  | .acquire, .acquire => true
+  | _, _ => false
+
+theorem eq_of_beqAtomicOrdering {a b : AtomicOrdering}
+    (h : beqAtomicOrdering a b = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
 def beqMirTy : MirTy → MirTy → Bool
   | .usize => fun b => match b with | .usize => true | _ => false
   | .bool => fun b => match b with | .bool => true | _ => false
@@ -4362,6 +5017,10 @@ def beqMirTy : MirTy → MirTy → Bool
   | .adt i => fun b => match b with | .adt j => i == j | _ => false
   | .param i => fun b => match b with | .param j => i == j | _ => false
   | .ref a => fun b => match b with | .ref b1 => beqMirTy a b1 | _ => false
+  | .refAtomicUsize => fun b =>
+    match b with | .refAtomicUsize => true | _ => false
+  | .atomicOrdering => fun b =>
+    match b with | .atomicOrdering => true | _ => false
   | .array a n => fun b =>
     match b with | .array b1 m => beqMirTy a b1 && n == m | _ => false
   | _ => fun _ => false
@@ -4382,6 +5041,8 @@ theorem eq_of_beqMirTy : ∀ {a b : MirTy}, beqMirTy a b = true → a = b
     cases b with
     | ref _ => exact congrArg MirTy.ref (eq_of_beqMirTy h)
     | _ => cases h
+  | .refAtomicUsize, b, h => by cases b <;> first | rfl | cases h
+  | .atomicOrdering, b, h => by cases b <;> first | rfl | cases h
   | .array _ _, b, h => by
     cases b with
     | array _ _ =>
@@ -4439,6 +5100,8 @@ def beqMirVal : MirVal → MirVal → Bool
   | .bytes s1 b1, .bytes s2 b2 => s1 == s2 && b1 == b2
   | .ref d1 g1 l1 f1, .ref d2 g2 l2 f2 =>
     d1 == d2 && g1 == g2 && beqLocalId l1 l2 && f1 == f2
+  | .atomicLoc a, .atomicLoc b => a == b
+  | .ordering a, .ordering b => beqAtomicOrdering a b
   | _, _ => false
 
 theorem eq_of_beqMirVal : ∀ {a b : MirVal}, beqMirVal a b = true → a = b
@@ -4460,6 +5123,10 @@ theorem eq_of_beqMirVal : ∀ {a b : MirVal}, beqMirVal a b = true → a = b
   | .ref _ _ _ _, .ref _ _ _ _, h => by
     simp [beqMirVal] at h
     rw [h.1.1.1, h.1.1.2, eq_of_beqLocalId h.1.2, h.2]
+  | .atomicLoc _, .atomicLoc _, h => by
+    simp [beqMirVal] at h; exact congrArg MirVal.atomicLoc h
+  | .ordering _, .ordering _, h =>
+    congrArg MirVal.ordering (eq_of_beqAtomicOrdering h)
 
 def beqOperand (a b : Operand) : Bool :=
   match a with
@@ -4689,6 +5356,12 @@ def beqTerminator (a b : Terminator) : Bool :=
       beqPlace d1 d2 && beqMirTy s1 s2 && beqMirTy dt1 dt2 &&
       beqOperand o1 o2 && beqBlockId t1 t2
     | _ => false
+  | .callAtomicLoad d1 p1 o1 t1 =>
+    match b with
+    | .callAtomicLoad d2 p2 o2 t2 =>
+      beqPlace d1 d2 && beqOperand p1 p2 && beqOperand o1 o2 &&
+      beqBlockId t1 t2
+    | _ => false
   | .call1 d1 c1 a1 t1 tys1 =>
     match b with
     | .call1 d2 c2 a2 t2 tys2 =>
@@ -4739,6 +5412,13 @@ theorem eq_of_beqTerminator {a b : Terminator} (h : beqTerminator a b = true) :
       rw [eq_of_beqPlace h.1.1.1.1, eq_of_beqMirTy h.1.1.1.2,
         eq_of_beqMirTy h.1.1.2, eq_of_beqOperand h.1.2, eq_of_beqBlockId h.2]
     | _ => cases h
+  | callAtomicLoad d1 p1 o1 t1 =>
+    cases b with
+    | callAtomicLoad d2 p2 o2 t2 =>
+      simp [beqTerminator] at h
+      rw [eq_of_beqPlace h.1.1.1, eq_of_beqOperand h.1.1.2,
+        eq_of_beqOperand h.1.2, eq_of_beqBlockId h.2]
+    | _ => cases h
   | call1 d1 c1 a1 t1 tys1 =>
     cases b with
     | call1 d2 c2 a2 t2 tys2 =>
@@ -4786,10 +5466,14 @@ theorem eq_of_beqRequiresSpec {a b : RequiresSpec}
 
 def beqPostSpec : PostSpec → PostSpec → Bool
   | .ensuresEqArg a, .ensuresEqArg b => a == b
+  | .ensuresAtomicLoad a, .ensuresAtomicLoad b => a == b
+  | _, _ => false
 
 theorem eq_of_beqPostSpec : ∀ {a b : PostSpec}, beqPostSpec a b = true → a = b
   | .ensuresEqArg _, .ensuresEqArg _, h => by
     simp [beqPostSpec] at h; exact congrArg PostSpec.ensuresEqArg h
+  | .ensuresAtomicLoad _, .ensuresAtomicLoad _, h => by
+    simp [beqPostSpec] at h; exact congrArg PostSpec.ensuresAtomicLoad h
 
 def beqObligationId : ObligationId → ObligationId → Bool
   | .fnBody n1, .fnBody n2 => decide (n1 = n2)
@@ -5085,6 +5769,22 @@ def proveBodyNoAdtOpt (bodies : List BodyDecl) (tcb : List TCBItem)
       (fun s hinit _ =>
         (allocPassthroughBody_execNormal s hinit).map (fun _ h => h.1))
       "unsupported specs on alloc_passthrough"
+  else if hb : beqMirBody b loadRelaxedBody = true then
+    have hres : b = loadRelaxedBody := eq_of_beqMirBody hb
+    if optBeq beqRequiresSpec fn.requires none = true then
+      have hver := loadRelaxedBody_verified_of_eq fn b hres
+      if hs0 : listBeq beqPostSpec fn.specs [] = true then
+        .ok (.up (fnBodyVerified_of_safety_and_specs hver
+          (bodyUserSpecsHold_nil hver (listEq_of_beq eq_of_beqPostSpec hs0))))
+      else if hs1 :
+          listBeq beqPostSpec fn.specs [.ensuresAtomicLoad 1] = true then
+        .ok (.up (fnBodyVerified_of_safety_and_specs hver
+          (loadRelaxedBody_specs_of_eq fn b hres
+            (listEq_of_beq eq_of_beqPostSpec hs1))))
+      else
+        .error ⟨"unsupported specs on load_relaxed", fn.name⟩
+    else
+      .error ⟨"unsupported requires clause on load_relaxed", fn.name⟩
   else if hb : beqMirBody lb clampNonZeroBody = true then
     have hres : lowerBody b = clampNonZeroBody := eq_of_beqMirBody hb
     have hver := clampNonZeroBody_verified_of_resolve fn b hres hpin
@@ -5755,7 +6455,23 @@ def rustWrapGuardedCrate (fnName : String) : Crate := {
   ]
 }
 
-/-- Canary confirming that `proveCrate` discharges all thirteen verified crate
+/-- Expected `Crate` for `load_relaxed` (`specs := [.ensuresAtomicLoad 1]`). -/
+def loadRelaxedEnsuresCrate (fnName : String) : Crate := {
+  bodies := [{ id := ⟨0⟩, body := loadRelaxedBody }]
+  functions := [{
+    name := fnName
+    bodyId := ⟨0⟩
+    specs := [.ensuresAtomicLoad 1]
+  }]
+}
+
+/-- Expected `Crate` for unannotated `load_relaxed` (`specs := []`). -/
+def loadRelaxedWfCrate (fnName : String) : Crate := {
+  bodies := [{ id := ⟨0⟩, body := loadRelaxedBody }]
+  functions := [{ name := fnName, bodyId := ⟨0⟩, specs := [] }]
+}
+
+/-- Canary confirming that `proveCrate` discharges all fifteen verified crate
 archetypes via `rfl` kernel reduction. -/
 theorem canary_proveCrate_dispatches_all_archetypes :
     CrateTheorem (idCopyEnsuresCrate "id") ∧
@@ -5771,8 +6487,12 @@ theorem canary_proveCrate_dispatches_all_archetypes :
     CrateTheorem (clampNonZeroCrate "clamp_nonzero") ∧
     CrateTheorem (transWrapTransmuteCrate "transparent_transmute") ∧
     CrateTheorem (rustWrapPinnedCrate "unguarded_transmute") ∧
-    CrateTheorem (rustWrapGuardedCrate "guarded_transmute") :=
+    CrateTheorem (rustWrapGuardedCrate "guarded_transmute") ∧
+    CrateTheorem (loadRelaxedEnsuresCrate "load_relaxed") ∧
+    CrateTheorem (loadRelaxedWfCrate "load_relaxed") :=
   ⟨proveCrate _ rfl,
+   proveCrate _ rfl,
+   proveCrate _ rfl,
    proveCrate _ rfl,
    proveCrate _ rfl,
    proveCrate _ rfl,

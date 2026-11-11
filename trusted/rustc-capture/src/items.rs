@@ -522,11 +522,34 @@ fn function(
                     format!("`ensures`: `{x}` is not a parameter"),
                 ),
             },
+            Directive::EnsuresAtomicLoad(x) => match arg_local(&x) {
+                Some(l)
+                    if extract::ty(tcx, sig.inputs()[l as usize - 1])
+                        == ir::Ty::RefAtomicUsize
+                        && extract::ty(tcx, sig.output()) == ir::Ty::Usize =>
+                {
+                    specs.push(ir::Spec::EnsuresAtomicLoad(l));
+                }
+                Some(_) => errs.push(
+                    tcx,
+                    def,
+                    format!(
+                        "`ensures(atomic_load({x}))` requires `{x}: \
+                         &AtomicUsize` and return type `usize`"
+                    ),
+                ),
+                None => errs.push(
+                    tcx,
+                    def,
+                    format!("`ensures`: `{x}` is not a parameter"),
+                ),
+            },
             Directive::WellFormed => {}
             Directive::Requires { ident, ne } => {
                 let local = arg_local(&ident);
                 let is_usize = local.is_some_and(|l| {
-                    extract::ty(sig.inputs()[l as usize - 1]) == ir::Ty::Usize
+                    extract::ty(tcx, sig.inputs()[l as usize - 1])
+                        == ir::Ty::Usize
                 });
                 if requires.is_some() {
                     errs.push(
@@ -663,8 +686,8 @@ fn check_signature(
 ) {
     let sig = tcx.fn_sig(def).skip_binder().skip_binder();
     let inputs: Vec<_> =
-        sig.inputs().iter().map(|t| extract::ty(*t)).collect();
-    let output = extract::ty(sig.output());
+        sig.inputs().iter().map(|t| extract::ty(tcx, *t)).collect();
+    let output = extract::ty(tcx, sig.output());
     if inputs != body.arg_tys || output != body.ret_ty {
         errs.push(
             tcx,
@@ -708,7 +731,7 @@ fn adt(
         .raw
         .iter()
         .map(|field| {
-            let ty = extract::ty(tcx.type_of(field.did).skip_binder());
+            let ty = extract::ty(tcx, tcx.type_of(field.did).skip_binder());
             let access =
                 if field.vis.is_public() && field.safety == hir::Safety::Safe {
                     ir::FieldAccess::PubSafe
@@ -983,6 +1006,11 @@ fn check_references(
                         ));
                     }
                     tys.extend(type_args.iter().cloned());
+                }
+                ir::Terminator::CallAtomicLoad { dst, ptr, ord, .. } => {
+                    push_place(&mut tys, dst);
+                    push_op(&mut tys, ptr);
+                    push_op(&mut tys, ord);
                 }
                 ir::Terminator::CallLayout { dst, query, .. } => {
                     push_place(&mut tys, dst);

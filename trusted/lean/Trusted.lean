@@ -13,4 +13,5 @@ import Init.Core
 import Trusted.Refinement
 import Trusted.StepResult
 import Trusted.MirAst
+import Trusted.Memory
 import Trusted.MirSemantics

@@ -69,11 +69,28 @@ structure TargetLayout where
 `i128Align = 16`). -/
 def defaultTargetLayout : TargetLayout := ⟨8, 8, 16⟩
 
+/-- Atomic memory ordering for atomic load operations
+(`core::sync::atomic::Ordering`, `library/core/src/sync/atomic.rs#L450-L503`):
+> "Memory orderings specify the way atomic operations synchronize memory.
+> In its weakest [`Ordering::Relaxed`], only the memory directly touched by
+> the operation is synchronized."
+> "When coupled with a load, if the loaded value was written by a store
+> operation with [`Release`] (or stronger) ordering, then all subsequent
+> operations become ordered after that store." -/
+inductive AtomicOrdering where
+  | relaxed
+  | acquire
+
 /-- MIR type grammar for scalar, aggregate (ADT), polymorphic, reference, and
 pointer types (`src/types/numeric.md#L37-L38`, `src/types/boolean.md#L6-L7`,
+`library/core/src/sync/atomic.rs#L36-L42`,
 `compiler/rustc_type_ir/src/ty_kind.rs#L106-L165`):
 > "The `usize` type is an unsigned integer type with the same number of bits as
 > the platform's pointer type."
+> "The end result is *almost* equivalent to saying that creating a *shared
+> reference* to one of the Rust atomic types corresponds to creating an
+> `atomic_ref` in C++, with the `atomic_ref` being destroyed when the lifetime
+> of the shared reference ends."
 
 `.param idx` is the `idx`-th generic type parameter of the *root* function
 being verified. Callee bodies are instantiated by substitution
@@ -82,10 +99,12 @@ root function's parameters. `.adt id` names the `AdtDecl` with that `id`; the
 capture monomorphizes generic ADTs into distinct declarations, so `.adt` has
 no type arguments. `.arraySizeOf elem sizedTy` represents
 `[elem; size_of::<sizedTy>()]` whose length is evaluated symbolically against
-`sizedTy`'s layout. `.unmodeled` is the bounded leaf fallback for `rustc`
-type-checker internal types (`Dynamic`, `Alias`, `Coroutine`, `Closure`, `Pat`,
-`UnsafeBinder`, `Bound`, `Placeholder`, `Foreign`) and has no size or valid
-values in `Trusted/MirSemantics.lean`. -/
+`sizedTy`'s layout. `.refAtomicUsize` models `&core::sync::atomic::AtomicUsize`
+(`&Atomic<usize>`) and `.atomicOrdering` models
+`core::sync::atomic::Ordering`. `.unmodeled` is the bounded leaf fallback for
+`rustc` type-checker internal types (`Dynamic`, `Alias`, `Coroutine`,
+`Closure`, `Pat`, `UnsafeBinder`, `Bound`, `Placeholder`, `Foreign`) and has no
+size or valid values in `Trusted/MirSemantics.lean`. -/
 inductive MirTy where
   | usize
   | isize
@@ -102,6 +121,8 @@ inductive MirTy where
   | ref (inner : MirTy)
   | refMut (inner : MirTy)
   | rawPtr (inner : MirTy) (mutable : Bool)
+  | refAtomicUsize
+  | atomicOrdering
   | array (elem : MirTy) (len : Nat)
   | arraySizeOf (elem : MirTy) (sizedTy : MirTy)
   | slice (elem : MirTy)
@@ -232,7 +253,10 @@ def AdtDecl.payloadTy (decl : AdtDecl) : Option MirTy :=
 - `.ref frameId gen loc fieldDepth`: a shared reference to `fieldDepth` nested
   `.field 0` projections of local `loc` of the activation with identifier
   `frameId`, valid only while that local's storage generation is still `gen`
-  (see `resolveRef`). -/
+  (see `resolveRef`).
+- `.atomicLoc loc`: a shared reference `&AtomicUsize` to atomic memory location
+  identifier `loc`.
+- `.ordering ord`: an initialized `core::sync::atomic::Ordering` value. -/
 inductive MirVal where
   | uninit
   | usize (bits : Nat)
@@ -242,6 +266,8 @@ inductive MirVal where
   | fieldCons (head : MirVal) (tail : MirVal)
   | bytes (sz : Nat) (bits : Nat)
   | ref (frameId : Nat) (gen : Nat) (loc : LocalId) (fieldDepth : Nat := 0)
+  | atomicLoc (loc : Nat)
+  | ordering (ord : AtomicOrdering)
 
 /-- Session runtime-check flag queried by `Operand.runtimeChecks`
 (`rustc_middle::mir::RuntimeChecks`,
@@ -427,6 +453,8 @@ inductive Terminator where
   | callLayout (dst : Place) (query : LayoutQuery) (target : BlockId)
   | callTransmuteCopy (dst : Place) (srcTy dstTy : MirTy) (op : Operand)
       (target : BlockId)
+  | callAtomicLoad (dst : Place) (ptr : Operand) (ord : Operand)
+      (target : BlockId)
   | call1 (dst : Place) (callee : BodyId) (arg : Operand)
       (target : BlockId) (typeArgs : List MirTy := [])
   | call (dst : Place) (args : List Operand) (target : Option BlockId)
@@ -490,10 +518,12 @@ structure RequiresSpec where
   argLocal : Nat
   ne : Nat
 
-/-- First-order user specification (`/// anneal:spec ensures(ret == <arg>)`) on
-a captured function. -/
+/-- First-order user specification (`/// anneal:spec ensures(...)`) on a
+captured function (`ensures(ret == <arg>)` or
+`ensures(atomic_load(<arg>))`). -/
 inductive PostSpec where
   | ensuresEqArg (argLocal : Nat)
+  | ensuresAtomicLoad (argLocal : Nat)
 
 /-- Identifier of a function-body behavioral verification obligation in
 `CrateTheorem`.

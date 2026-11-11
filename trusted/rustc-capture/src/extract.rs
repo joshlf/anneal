@@ -40,6 +40,38 @@ fn reject<T>(msg: impl Into<String>) -> Res<T> {
     Err(msg.into())
 }
 
+fn is_core_def_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    expected: &[&str],
+) -> bool {
+    if def_id.krate == LOCAL_CRATE
+        || tcx.crate_name(def_id.krate).as_str() != "core"
+    {
+        return false;
+    }
+    let path = tcx.def_path(def_id);
+    if path.data.len() != expected.len() {
+        return false;
+    }
+    path.data.iter().zip(expected).all(|(elem, want)| {
+        elem.disambiguator == 0
+            && elem.data.get_opt_name().is_some_and(|n| n.as_str() == *want)
+    })
+}
+
+fn is_core_atomic_usize<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: DefId,
+    args: ty::GenericArgsRef<'tcx>,
+) -> bool {
+    is_core_def_path(tcx, did, &["sync", "atomic", "Atomic"])
+        && args.len() == 1
+        && args[0]
+            .as_type()
+            .is_some_and(|t| matches!(t.kind(), ty::Uint(ty::UintTy::Usize)))
+}
+
 /// Translates a `rustc` type to `Trusted.MirTy`
 /// (`rustc_type_ir::TyKind`, `compiler/rustc_type_ir/src/ty_kind.rs`).
 ///
@@ -47,7 +79,7 @@ fn reject<T>(msg: impl Into<String>) -> Res<T> {
 /// `Trusted.MirTy` constructor (or `ir::Ty::Unmodeled` for higher-ranked,
 /// closure, coroutine, or foreign/generic ADT types), which
 /// `Trusted/MirSemantics.lean` rejects fail-closed whenever evaluated.
-pub fn ty<'tcx>(t: Ty<'tcx>) -> ir::Ty {
+pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, t: Ty<'tcx>) -> ir::Ty {
     match *t.kind() {
         ty::Uint(ty::UintTy::Usize) => ir::Ty::Usize,
         ty::Int(ty::IntTy::Isize) => ir::Ty::Isize,
@@ -59,24 +91,36 @@ pub fn ty<'tcx>(t: Ty<'tcx>) -> ir::Ty {
         ty::Str => ir::Ty::Str,
         ty::Never => ir::Ty::Never,
         ty::Tuple(elems) if elems.is_empty() => ir::Ty::Unit,
-        ty::Tuple(elems) => ir::Ty::Tuple(elems.iter().map(ty).collect()),
+        ty::Tuple(elems) => {
+            ir::Ty::Tuple(elems.iter().map(|e| ty(tcx, e)).collect())
+        }
         ty::Adt(adt, args) => {
             let did = adt.did();
             if did.is_local() && args.is_empty() && adt.is_struct() {
                 ir::Ty::Adt(did.index.as_u32())
+            } else if args.is_empty()
+                && is_core_def_path(tcx, did, &["sync", "atomic", "Ordering"])
+            {
+                ir::Ty::AtomicOrdering
             } else {
                 ir::Ty::Unmodeled
             }
         }
         ty::Param(p) => ir::Ty::Param(p.index),
         ty::Ref(_, inner, ty::Mutability::Not) => {
-            ir::Ty::Ref(Box::new(ty(inner)))
+            if let ty::Adt(adt, args) = *inner.kind()
+                && is_core_atomic_usize(tcx, adt.did(), args)
+            {
+                ir::Ty::RefAtomicUsize
+            } else {
+                ir::Ty::Ref(Box::new(ty(tcx, inner)))
+            }
         }
         ty::Ref(_, inner, ty::Mutability::Mut) => {
-            ir::Ty::RefMut(Box::new(ty(inner)))
+            ir::Ty::RefMut(Box::new(ty(tcx, inner)))
         }
         ty::RawPtr(inner, m) => {
-            ir::Ty::RawPtr(Box::new(ty(inner)), m.is_mut())
+            ir::Ty::RawPtr(Box::new(ty(tcx, inner)), m.is_mut())
         }
         ty::Array(inner, len) => match len.kind() {
             ty::ConstKind::Value(val) => {
@@ -85,13 +129,13 @@ pub fn ty<'tcx>(t: Ty<'tcx>) -> ir::Ty {
                     .try_to_leaf()
                     .and_then(|s| u64::try_from(s.to_bits_unchecked()).ok())
                 {
-                    Some(n) => ir::Ty::Array(Box::new(ty(inner)), n),
+                    Some(n) => ir::Ty::Array(Box::new(ty(tcx, inner)), n),
                     None => ir::Ty::Unmodeled,
                 }
             }
             _ => ir::Ty::Unmodeled,
         },
-        ty::Slice(inner) => ir::Ty::Slice(Box::new(ty(inner))),
+        ty::Slice(inner) => ir::Ty::Slice(Box::new(ty(tcx, inner))),
         ty::FnDef(did, _) => ir::Ty::FnDef(format!("{did:?}")),
         ty::FnPtr(..) => ir::Ty::FnPtr,
         _ => ir::Ty::Unmodeled,
@@ -124,6 +168,9 @@ enum Known {
     /// (`library/core/src/panicking.rs#L138`), which `assert!(cond)` expands
     /// to. The model's `Terminator.panic` abstracts away the message.
     Panic,
+    /// `core::sync::atomic::Atomic::<usize>::load(&self, order: Ordering) -> usize`
+    /// (`library/core/src/sync/atomic.rs#L2868`).
+    AtomicUsizeLoad,
 }
 
 const KNOWN_CORE_FNS: &[(&[&str], Known)] = &[
@@ -139,6 +186,18 @@ fn known_core_fn(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Known> {
         || tcx.crate_name(def_id.krate).as_str() != "core"
     {
         return None;
+    }
+    if tcx.def_kind(def_id) == DefKind::AssocFn
+        && tcx.item_name(def_id).as_str() == "load"
+    {
+        let parent = tcx.parent(def_id);
+        if matches!(tcx.def_kind(parent), DefKind::Impl { of_trait: false })
+            && let ty::Adt(adt, args) =
+                *tcx.type_of(parent).skip_binder().kind()
+            && is_core_atomic_usize(tcx, adt.did(), args)
+        {
+            return Some(Known::AtomicUsizeLoad);
+        }
     }
     let path = tcx.def_path(def_id);
     let mut names = Vec::new();
@@ -208,13 +267,13 @@ pub fn body<'tcx>(
 
     let locals = &body.local_decls;
     let arg_tys = (1..=body.arg_count)
-        .map(|i| ty(locals[mir::Local::from_usize(i)].ty))
+        .map(|i| ty(tcx, locals[mir::Local::from_usize(i)].ty))
         .collect::<Vec<_>>();
-    let ret_ty = ty(locals[mir::RETURN_PLACE].ty);
+    let ret_ty = ty(tcx, locals[mir::RETURN_PLACE].ty);
 
     let mut required_layouts = Vec::new();
     for i in (body.arg_count + 1)..locals.len() {
-        let local_ty = ty(locals[mir::Local::from_usize(i)].ty);
+        let local_ty = ty(tcx, locals[mir::Local::from_usize(i)].ty);
         if needs_layout_check(&local_ty, &arg_tys, &ret_ty)
             && !required_layouts.contains(&local_ty)
         {
@@ -294,7 +353,12 @@ fn needs_layout_check(
 ) -> bool {
     if matches!(
         t,
-        ir::Ty::Usize | ir::Ty::Bool | ir::Ty::Unit | ir::Ty::Never
+        ir::Ty::Usize
+            | ir::Ty::Bool
+            | ir::Ty::Unit
+            | ir::Ty::Never
+            | ir::Ty::RefAtomicUsize
+            | ir::Ty::AtomicOrdering
     ) {
         return false;
     }
@@ -349,7 +413,7 @@ fn required_const<'tcx>(
     }
     // The model gives every required constant type `()`: a required constant
     // only contributes the obligation that it evaluates successfully.
-    if ty(const_ty) != ir::Ty::Unit {
+    if ty(tcx, const_ty) != ir::Ty::Unit {
         return reject(format!(
             "required constant `{c:?}` does not have type `()`"
         ));
@@ -381,7 +445,7 @@ fn required_const<'tcx>(
     let type_args = args
         .into_iter()
         .map(|a| match a.kind() {
-            GenericArgKind::Type(t) => Ok(ty(t)),
+            GenericArgKind::Type(t) => Ok(ty(tcx, t)),
             _ => reject("required constant has a non-type generic argument"),
         })
         .collect::<Res<Vec<_>>>()?;
@@ -506,10 +570,10 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                     ir::PlaceElem::Downcast(v.as_u32())
                 }
                 ProjectionElem::OpaqueCast(t) => {
-                    ir::PlaceElem::OpaqueCast(ty(t))
+                    ir::PlaceElem::OpaqueCast(ty(self.tcx, t))
                 }
                 ProjectionElem::UnwrapUnsafeBinder(t) => {
-                    ir::PlaceElem::UnwrapUnsafeBinder(ty(t))
+                    ir::PlaceElem::UnwrapUnsafeBinder(ty(self.tcx, t))
                 }
             })
             .collect();
@@ -523,9 +587,9 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
     ///
     /// `mir::Const` has three forms (`MIR/consts.rs#L212-L233`):
     ///
-    /// - `Val(Scalar(Int(i)), ty)` with `ty` `usize` or `bool`, and
-    ///   `Val(ZeroSized, ())`: an already-evaluated literal, which is its own
-    ///   value.
+    /// - `Val(Scalar(Int(i)), ty)` with `ty` `usize`, `bool`, or
+    ///   `core::sync::atomic::Ordering`, and `Val(ZeroSized, ())`: an
+    ///   already-evaluated literal, which is its own value.
     /// - `Unevaluated(uv, ())` assigned as a statement (`_d = const ...`):
     ///   translated in `stmt` to `ir::Stmt::EvalConst`, which evaluates the
     ///   constant body in order at its statement position; an unevaluated `()`
@@ -536,22 +600,27 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
     fn constant(&self, c: &mir::ConstOperand<'tcx>) -> Res<ir::Val> {
         match c.const_ {
             mir::Const::Val(ConstValue::Scalar(Scalar::Int(int)), t) => {
-                match ty(t) {
+                match ty(self.tcx, t) {
                     ir::Ty::Usize => {
                         Ok(ir::Val::Usize(int.to_bits_unchecked()))
                     }
                     ir::Ty::Bool => {
                         Ok(ir::Val::Bool(int.to_bits_unchecked() != 0))
                     }
+                    ir::Ty::AtomicOrdering => match int.to_bits_unchecked() {
+                        0 => Ok(ir::Val::Ordering(ir::AtomicOrdering::Relaxed)),
+                        2 => Ok(ir::Val::Ordering(ir::AtomicOrdering::Acquire)),
+                        _ => Ok(ir::Val::Uninit),
+                    },
                     _ => Ok(ir::Val::Uninit),
                 }
             }
             mir::Const::Val(ConstValue::ZeroSized, t)
-                if ty(t) == ir::Ty::Unit =>
+                if ty(self.tcx, t) == ir::Ty::Unit =>
             {
                 Ok(ir::Val::Unit)
             }
-            mir::Const::Unevaluated(_, t) if ty(t) == ir::Ty::Unit => {
+            mir::Const::Unevaluated(_, t) if ty(self.tcx, t) == ir::Ty::Unit => {
                 reject(format!(
                     "unevaluated `()` constant `{c:?}` is only supported as a \
                      statement assignment"
@@ -601,11 +670,11 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 Ok(ir::Rvalue::RawPtr(raw_ptr_kind(*k), self.place(p)))
             }
             mir::Rvalue::Cast(k, op, t) => {
-                let src_ty = ty(op.ty(&self.body.local_decls, self.tcx));
+                let src_ty = ty(self.tcx, op.ty(&self.body.local_decls, self.tcx));
                 Ok(ir::Rvalue::Cast(
                     cast_kind(*k, src_ty),
                     self.operand(op)?,
-                    ty(*t),
+                    ty(self.tcx, *t),
                 ))
             }
             mir::Rvalue::BinaryOp(op, ops) => Ok(ir::Rvalue::BinaryOp(
@@ -620,6 +689,27 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 Ok(ir::Rvalue::Discriminant(self.place(p)))
             }
             mir::Rvalue::Aggregate(kind, ops) => match **kind {
+                AggregateKind::Adt(did, variant, args, None, None)
+                    if args.is_empty()
+                        && ops.is_empty()
+                        && is_core_def_path(
+                            self.tcx,
+                            did,
+                            &["sync", "atomic", "Ordering"],
+                        ) =>
+                {
+                    match variant.as_u32() {
+                        0 => Ok(ir::Rvalue::Use(ir::Operand::Const(
+                            ir::Val::Ordering(ir::AtomicOrdering::Relaxed),
+                        ))),
+                        2 => Ok(ir::Rvalue::Use(ir::Operand::Const(
+                            ir::Val::Ordering(ir::AtomicOrdering::Acquire),
+                        ))),
+                        _ => Ok(ir::Rvalue::Use(ir::Operand::Const(
+                            ir::Val::Uninit,
+                        ))),
+                    }
+                }
                 AggregateKind::Adt(did, variant, args, None, None)
                     if did.is_local()
                         && variant.as_u32() == 0
@@ -655,12 +745,14 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
             mir::Rvalue::CopyForDeref(p) => {
                 Ok(ir::Rvalue::CopyForDeref(self.place(p)))
             }
-            mir::Rvalue::WrapUnsafeBinder(op, t) => {
-                Ok(ir::Rvalue::WrapUnsafeBinder(self.operand(op)?, ty(*t)))
-            }
-            mir::Rvalue::Reborrow(t, m, p) => {
-                Ok(ir::Rvalue::Reborrow(ty(*t), m.is_mut(), self.place(p)))
-            }
+            mir::Rvalue::WrapUnsafeBinder(op, t) => Ok(
+                ir::Rvalue::WrapUnsafeBinder(self.operand(op)?, ty(self.tcx, *t)),
+            ),
+            mir::Rvalue::Reborrow(t, m, p) => Ok(ir::Rvalue::Reborrow(
+                ty(self.tcx, *t),
+                m.is_mut(),
+                self.place(p),
+            )),
         }
     }
 
@@ -671,7 +763,7 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 let (place, rv) = &**b;
                 if let mir::Rvalue::Use(mir::Operand::Constant(c), _) = rv
                     && let mir::Const::Unevaluated(_, t) = c.const_
-                    && ty(t) == ir::Ty::Unit
+                    && ty(self.tcx, t) == ir::Ty::Unit
                 {
                     if !self.required.iter().any(|r| r.const_ == c.const_) {
                         return reject(format!(
@@ -884,7 +976,7 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
         let mut type_args = Vec::with_capacity(gargs.len());
         for a in gargs {
             match a.kind() {
-                GenericArgKind::Type(t) => type_args.push(ty(t)),
+                GenericArgKind::Type(t) => type_args.push(ty(self.tcx, t)),
                 _ => return Ok(fallback()),
             }
         }
@@ -931,6 +1023,18 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 (Known::Panic, [], [_msg], None, has_cleanup) => {
                     ir::Terminator::Panic { has_cleanup }
                 }
+                (
+                    Known::AtomicUsizeLoad,
+                    [],
+                    [ptr, ord],
+                    Some(target),
+                    false,
+                ) => ir::Terminator::CallAtomicLoad {
+                    dst,
+                    ptr: ptr.clone(),
+                    ord: ord.clone(),
+                    target,
+                },
                 _ => fallback(),
             });
         }
