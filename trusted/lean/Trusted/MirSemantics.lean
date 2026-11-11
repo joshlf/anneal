@@ -17,9 +17,11 @@ import Trusted.MirAst
 # Trusted MIR Semantics and Crate Theorem (`Trusted/MirSemantics.lean`)
 
 Defines the small-step operational semantics `MirSem` for `Trusted/MirAst.lean`,
-static body well-formedness (`LocalLayoutsAdmitted`, `StaticBodyWf`),
-Post-Monomorphization Error (PME) admission (`RequiresConst`, `ConstSucceeds`,
-`ConstUnwinds`, `ConstsTotal`, `MonoAdmitted`, `MonoConstsWf`,
+in-order compile-time constant evaluation (`Stmt.evalConst`), target-aware and
+forward-compatible type layout (`tyLayoutStep`, `evalTyByteSize`, `evalTyAlign`,
+`evalLayoutQuery`), static body well-formedness (`LocalLayoutsAdmitted`,
+`StaticBodyWf`), Post-Monomorphization Error (PME) admission (`RequiresConst`,
+`ConstSucceeds`, `ConstUnwinds`, `ConstsTotal`, `MonoAdmitted`, `MonoConstsWf`,
 `ContractWellFormed`), the library representation invariant and API boundary
 contract (`AdtInv`, `denoteAdtInv`, `MirVal.valid`, `AdmissibleAdtInv`,
 `SafetyPre`, `SafetyPost`, `ContractPost`, `EffectivePost`, `FnBodyVerified`),
@@ -37,9 +39,9 @@ The semantics has two notions of "well-typed", and only two:
 - **Type well-formedness** (`evalTyByteSize`, `MirTy.wfInAdts`,
   `LocalLayoutsAdmitted`): the model can measure the type within target bounds
   (`≤ isizeMaxBytes`). Every unmodeled shape (`MirTy.unmodeled`, unmodeled
-  primitive/pointer/composite types, an undeclared ADT, a struct with two or
-  more fields, a cycle of struct declarations, or an overflowing array layout)
-  is ill formed.
+  primitive/pointer/composite types, an undeclared ADT, an ADT with
+  `AdtRepr.unmodeled`, a cycle of struct declarations, or an overflowing array
+  layout) is ill formed.
 - **Value validity** (`MirVal.valid`): a value is valid at a type in a given
   state. It is the only validity relation; function entry, function return,
   and `AdmissibleAdtInv` all use it.
@@ -50,12 +52,32 @@ static boundary, `StaticBodyWf` (`MirLang.wf`) and `ContractWellFormed`
 reject ill-formed bodies, unmodeled or overflowing layouts, and dead-on-arrival
 post-monomorphization errors before any behavioral obligation is discharged.
 
+## Forward-compatible layout and compile-time guards
+
+Rust's default `#[repr(Rust)]` representation makes no stability guarantee on
+field ordering or padding (`src/type-layout.md#L47-L56`):
+> "The default representation of nominal types is called the `Rust`
+> representation... In other words, the data layout is undefined."
+
+By contrast, `#[repr(C)]` (`src/type-layout.md#L127-L162`) and
+`#[repr(transparent)]` (`src/type-layout.md#L211-L234`) have language-specified
+layouts. Each execution state `MirState` therefore carries `adtPad : Nat → Nat`:
+for `AdtRepr.c` and `AdtRepr.transparent`, layout is deterministic across all
+`adtPad` worlds, whereas for `AdtRepr.rust`, `adtPad id` adds an arbitrary
+non-negative byte count of compiler-chosen padding to struct `id`. A proof that
+holds for all initial states therefore holds across all valid `#[repr(Rust)]`
+padding choices unless the code either uses `#[repr(C)]`/`#[repr(transparent)]`,
+executes an in-order `Stmt.evalConst` layout guard (which terminates with
+`.compileTimeError` on rejected layout worlds and surfaces
+`TCBItem.compileTimeGuard`), or carries an explicit
+`TCBItem.pinnedCompilerCoupled` waiver.
+
 Generic code is verified once for all instantiations. A generic function's
 type parameters stay abstract: values of parameter type are opaque bytes
-(`MirVal.bytes`) that are never reinterpreted, so `transmute_copy` into or out
-of a type parameter is undefined behavior in the model. A call to a generic
-callee looks up its `BodyId` in `Crate.bodies` and substitutes its type
-arguments into the callee body (`MirBody.subst`), so every `.param` the
+(`MirVal.bytes`) that are never reinterpreted as integers, so `transmute_copy`
+into or out of a bare type parameter is undefined behavior in the model. A call
+to a generic callee looks up its `BodyId` in `Crate.bodies` and substitutes its
+type arguments into the callee body (`MirBody.subst`), so every `.param` the
 semantics reads refers to the root function's parameters, whose sizes are
 `MirState.tySizes`.
 -/
@@ -65,9 +87,9 @@ namespace Trusted
 /-- Saved caller activation frame pushed onto `MirState.stack` by a static
 `Terminator.call1` and popped by the callee's `Terminator.return_`.
 
-`tySizes` is not saved: instantiation by substitution keeps every frame in the
-root function's parameter space, so `MirState.tySizes` never changes during an
-execution. -/
+`tySizes` and `adtPad` are not saved: instantiation by substitution keeps every
+frame in the root function's parameter and layout space, so `MirState.tySizes`
+and `MirState.adtPad` never change during an execution. -/
 structure StackFrame where
   callerBody : MirBody
   callerLocals : Nat → Option MirVal
@@ -90,9 +112,14 @@ structure StackFrame where
   activation can never resolve against a later sibling activation. The root
   activation is frame `0`; a caller-owned referent of the root function is a
   frame-`0` local at an index at or above the root's `localCount`.
+- `adtPad`: non-negative compiler-chosen extra padding bytes for each
+  `AdtRepr.rust` struct declaration `id`.
+- `ubChecks`: nondeterministic boolean value yielded by
+  `Operand.runtimeChecks .ubChecks` (`core::intrinsics::ub_checks()`).
 
 The defaults exist for writing concrete states; `initEntryState` pins every
-field that has a default. -/
+structural control field while leaving `tySizes`, `adtPad`, and `ubChecks`
+universally quantified across initial states. -/
 structure MirState where
   locals : Nat → Option MirVal
   localGens : Nat → Nat := fun _ => 0
@@ -103,6 +130,8 @@ structure MirState where
   stack : List StackFrame := []
   frameId : Nat := 0
   nextFrameId : Nat := 1
+  adtPad : Nat → Nat := fun _ => 0
+  ubChecks : Bool := true
 
 /-- Result of a normal return from the root function: the returned value and
 the terminal state at `Terminator.return_`.
@@ -159,15 +188,67 @@ undefined behavior, so an arity mismatch or unmodeled type can never leave a
 callee parameter to be misread as a caller parameter. -/
 def MirTy.subst (typeArgs : List MirTy) : MirTy → Option MirTy
   | .usize => some .usize
+  | .isize => some .isize
+  | .uint w => some (.uint w)
+  | .int w => some (.int w)
   | .bool => some .bool
+  | .char => some .char
   | .unit => some .unit
   | .adt id => some (.adt id)
   | .param idx => lookupAt typeArgs idx
   | .ref inner => (inner.subst typeArgs).map .ref
-  | .array elem len => (elem.subst typeArgs).map fun elem' => .array elem' len
-  | .isize | .uint _ | .int _ | .float _ | .char | .str | .never
-  | .refMut _ | .rawPtr _ _ | .slice _ | .tuple _
+  | .rawPtr inner m => (inner.subst typeArgs).map (MirTy.rawPtr · m)
+  | .array elem len => (elem.subst typeArgs).map (MirTy.array · len)
+  | .arraySizeOf elem sizedTy =>
+    (elem.subst typeArgs).bind fun elem' =>
+      (sizedTy.subst typeArgs).map (MirTy.arraySizeOf elem')
+  | .float _ | .str | .never | .refMut _ | .slice _ | .tuple _
   | .fnDef _ | .fnPtr | .unmodeled => none
+
+/-- Substitute type arguments into a `LayoutQuery`. -/
+def LayoutQuery.subst (typeArgs : List MirTy) :
+    LayoutQuery → Option LayoutQuery
+  | .sizeOf ty => (ty.subst typeArgs).map .sizeOf
+  | .alignOf ty => (ty.subst typeArgs).map .alignOf
+  | .offsetOf ty varIdx fieldIdx =>
+    (ty.subst typeArgs).map (LayoutQuery.offsetOf · varIdx fieldIdx)
+
+/-- Substitute type arguments into every type in an `Rvalue`, failing (`none`)
+on unmodeled rvalues. -/
+def Rvalue.subst (typeArgs : List MirTy) : Rvalue → Option Rvalue
+  | .use op => some (.use op)
+  | .repeat op len => some (.repeat op len)
+  | .repeatSizeOf op sizedTy =>
+    (sizedTy.subst typeArgs).map (.repeatSizeOf op)
+  | .ref src => some (.ref src)
+  | .rawPtr m src => some (.rawPtr m src)
+  | .cast (.transmute srcTy) op dstTy =>
+    (srcTy.subst typeArgs).bind fun srcTy' =>
+      (dstTy.subst typeArgs).map fun dstTy' =>
+        .cast (.transmute srcTy') op dstTy'
+  | .cast kind op dstTy =>
+    (dstTy.subst typeArgs).map (.cast kind op)
+  | .binaryOp op lhs rhs => some (.binaryOp op lhs rhs)
+  | .unaryOp op src => some (.unaryOp op src)
+  | .aggregate adtId op => some (.aggregate adtId op)
+  | .aggregateFields ops adtId => some (.aggregateFields ops adtId)
+  | .refMut _ | .refFake _ | .threadLocalRef _ | .discriminant _
+  | .copyForDeref _ | .wrapUnsafeBinder _ _ | .reborrow _ _ _ => none
+
+/-- Substitute type arguments into a `Stmt`, failing (`none`) on unmodeled
+statements. -/
+def Stmt.subst (typeArgs : List MirTy) : Stmt → Option Stmt
+  | .assign dst rv => (rv.subst typeArgs).map (.assign dst)
+  | .evalConst dst constId calleeTypeArgs =>
+    (mapAll (MirTy.subst typeArgs) calleeTypeArgs).map
+      (fun tys => .evalConst dst constId tys)
+  | .placeMention p => some (.placeMention p)
+  | .storageLive loc => some (.storageLive loc)
+  | .storageDead loc => some (.storageDead loc)
+  | .nop => some .nop
+  | .constEvalCounter => some .constEvalCounter
+  | .setDiscriminant _ _ | .fakeRead _ | .ascribeUserType _
+  | .intrinsic _ | .coverage | .backwardIncompatibleDropHint _ => none
 
 /-- Substitute type arguments into every type in a `Terminator`, failing
 (`none`) on unmodeled terminators.
@@ -181,11 +262,11 @@ def Terminator.subst (typeArgs : List MirTy) :
   | .goto target => some (.goto target)
   | .unreachable => some .unreachable
   | .panic hasCleanup => some (.panic hasCleanup)
-  | .assert cond expected target hasCleanup =>
-    some (.assert cond expected target hasCleanup)
+  | .assert cond expected target onFail hasCleanup =>
+    some (.assert cond expected target onFail hasCleanup)
   | .switchInt discr f t => some (.switchInt discr f t)
-  | .callSizeOf dst ty target =>
-    (ty.subst typeArgs).map fun ty' => .callSizeOf dst ty' target
+  | .callLayout dst query target =>
+    (query.subst typeArgs).map fun q' => .callLayout dst q' target
   | .callTransmuteCopy dst srcTy dstTy op target =>
     (srcTy.subst typeArgs).bind fun srcTy' =>
       (dstTy.subst typeArgs).map fun dstTy' =>
@@ -198,12 +279,12 @@ def Terminator.subst (typeArgs : List MirTy) :
   | .yield _ _ _ | .coroutineDrop | .falseEdge _ _
   | .falseUnwind _ | .inlineAsm => none
 
-/-- Substitute type arguments into a `BasicBlock` (statements carry no
-types). -/
+/-- Substitute type arguments into a `BasicBlock`. -/
 def BasicBlock.subst (typeArgs : List MirTy)
     (bb : BasicBlock) : Option BasicBlock :=
-  (bb.terminator.subst typeArgs).map fun term =>
-    { stmts := bb.stmts, terminator := term }
+  (mapAll (Stmt.subst typeArgs) bb.stmts).bind fun stmts =>
+    (bb.terminator.subst typeArgs).map fun term =>
+      { stmts := stmts, terminator := term }
 
 /-- Instantiate a generic body with `typeArgs`, written in the caller's
 parameter space. This is the only way the semantics instantiates generics.
@@ -226,7 +307,7 @@ def MirBody.subst (typeArgs : List MirTy)
     requiredConsts := requiredConsts
     requiredLayouts := requiredLayouts }
 
-/-! ## Type well-formedness and size -/
+/-! ## Type well-formedness, size, alignment, and field offsets -/
 
 /-- Maximum byte size of a Rust type on a 64-bit target (`isize::MAX`,
 `2^63 - 1`, `compiler/rustc_abi/src/layout.rs#L50-L60`). -/
@@ -237,60 +318,131 @@ target's maximum object size (`≤ isizeMaxBytes`). -/
 def ValidTySizes (tySizes : Nat → Nat) : Prop :=
   ∀ idx, tySizes idx ≤ isizeMaxBytes
 
-/-- Byte size of `ty`, allowing at most `fuel` nested struct unfoldings.
+/-- Round `offset` up to the next multiple of `align` (`align ≥ 1`,
+`compiler/rustc_abi/src/layout.rs#L1283-L1320`). -/
+def alignUp (offset align : Nat) : Nat :=
+  let rem := Nat.mod offset align
+  if rem == 0 then offset else offset + (align - rem)
 
-The recursion is structural on `ty` except at `.adt`, which replaces the
-struct by its payload type (`AdtDecl.payloadTy`) and spends one unit of fuel.
-A reference is pointer-sized, but only if its pointee type is itself
-well formed, so `&&Undeclared` is rejected at every depth; references cost no
-fuel because the pointee is a subterm of the reference type.
+/-- Sequential `#[repr(C)]` field layout fold (`src/type-layout.md#L127-L162`):
+> "The alignment of the struct is the alignment of the most-aligned field in
+> it... For each field in declaration order in the struct, first determine the
+> size and alignment of the field. If the current offset is not a multiple of
+> the field's alignment, then add padding bytes to the current offset until it
+> is a multiple of the field's alignment. The offset for the field is what the
+> current offset is now. Then increase the current offset by the size of the
+> field. Finally, the size of the struct is the current offset rounded up to the
+> nearest multiple of the struct's alignment." -/
+def foldReprCFields (unfold : MirTy → Option (Nat × Nat)) :
+    List FieldDecl → Nat → Nat → Option (Nat × Nat)
+  | [], offset, maxAlign =>
+    some (alignUp offset maxAlign, maxAlign)
+  | f :: rest, offset, maxAlign =>
+    (unfold f.ty).bind fun (fSz, fAlign) =>
+      let alignedOffset := alignUp offset fAlign
+      foldReprCFields unfold rest (alignedOffset + fSz)
+        (Nat.max maxAlign fAlign)
 
-Sizes model `x86_64-unknown-linux-gnu`, the only target the pinned toolchain
-is used for:
+/-- Byte offset of field `targetIdx` inside a `#[repr(C)]` field list, failing
+(`none`) if `targetIdx` is out of bounds or any field type is ill formed. -/
+def reprCFieldOffset (unfold : MirTy → Option (Nat × Nat)) :
+    List FieldDecl → Nat → Nat → Option Nat
+  | [], _, _ => none
+  | f :: rest, 0, offset =>
+    (unfold f.ty).bind fun (fSz, fAlign) =>
+      let alignedOffset := alignUp offset fAlign
+      (foldReprCFields unfold rest (alignedOffset + fSz) fAlign).map
+        fun _ => alignedOffset
+  | f :: rest, idx + 1, offset =>
+    (unfold f.ty).bind fun (fSz, fAlign) =>
+      let alignedOffset := alignUp offset fAlign
+      reprCFieldOffset unfold rest idx (alignedOffset + fSz)
 
-- `usize` and references to sized types are 8 bytes. The target specification
-  fixes the pointer width (`rustc@f8a08b68`,
-  `compiler/rustc_target/src/spec/targets/x86_64_unknown_linux_gnu.rs#L32`):
-  > `pointer_width: 64,`
-- `bool` is 1 byte and `()` is 0 bytes (`src/type-layout.md`, "Primitive
-  Data Layout").
-- A single-field struct has its field's size. `repr(Rust)` makes no layout
-  guarantee (`src/type-layout.md`, "The `Rust` Representation"), so this is a
-  statement about the pinned `rustc`: `univariant` places the first field at
-  offset 0 and rounds the end offset up to the struct's alignment, which for
-  one field is that field's alignment (`rustc@f8a08b68`,
-  `compiler/rustc_abi/src/layout.rs#L1283-L1320`):
-  > `offset = offset.align_to(field_align.abi);`
-  > `align = align.max(field_align.abi);`
-  > ...
-  > `let min_size = offset;`
-  > `let size = min_size.align_to(align);`
+/-- Boolean equality on `AdtRepr`. -/
+def AdtRepr.beq : AdtRepr → AdtRepr → Bool
+  | .rust, .rust => true
+  | .transparent, .transparent => true
+  | .c, .c => true
+  | .unmodeled, .unmodeled => true
+  | _, _ => false
 
-  A field's size is already a multiple of its alignment, so the struct's size
-  equals the field's. This assumes no `repr(align)`/`repr(packed)` attribute;
-  the capture rejects both. -/
-def tySizeStep (adts : List AdtDecl) (tySizes : Nat → Nat)
-    (unfold : MirTy → Option Nat) : MirTy → Option Nat
-  | .usize => some 8
-  | .bool => some 1
-  | .unit => some 0
-  | .adt id =>
-    (findAdtDecl adts id).bind fun decl => decl.payloadTy.bind unfold
-  | .param idx => some (tySizes idx)
-  | .ref inner => (tySizeStep adts tySizes unfold inner).map fun _ => 8
+instance : BEq AdtRepr := ⟨AdtRepr.beq⟩
+
+/-- Whether `decl` has zero compiler-added padding in the current `adtPad`
+world (either `#[repr(transparent)]`, or `#[repr(Rust)]` when
+`adtPad decl.id == 0`). -/
+def AdtDecl.isZeroPaddedWrapper (decl : AdtDecl)
+    (adtPad : Nat → Nat) : Bool :=
+  decl.repr == .transparent || (decl.repr == .rust && adtPad decl.id == 0)
+
+/-- Byte width and alignment of an `n`-bit integer type (`u8`/`i8` through
+`u128`/`i128`) under `target`. -/
+def intBitWidthLayout (target : TargetLayout) (w : Nat) : Option (Nat × Nat) :=
+  if w == 8 then some (1, 1)
+  else if w == 16 then some (2, 2)
+  else if w == 32 then some (4, 4)
+  else if w == 64 then some (8, target.i64Align)
+  else if w == 128 then some (16, target.i128Align)
+  else none
+
+/-- Byte size and alignment `(size, align)` of `ty`, allowing at most `fuel`
+nested struct unfoldings:
+
+- Primitive scalars follow `src/type-layout.md` ("Primitive Data Layout") and
+  the captured `TargetLayout` (`ptrByteWidth`, `i64Align`, `i128Align`).
+- Shared references and raw pointers to well-formed pointees have size and
+  alignment `target.ptrByteWidth`.
+- Fixed-length arrays `[T; N]` and `[T; size_of::<U>()]` have size
+  `size(T) * N` (bounded by `isizeMaxBytes` for `[T; N]`) and alignment
+  `align(T)` (`src/type-layout.md`, "Array Layout").
+- `AdtRepr.c` and `AdtRepr.transparent` structs have deterministic layout;
+  `AdtRepr.rust` structs add `adtPad id` non-negative compiler-chosen padding
+  bytes (`src/type-layout.md`, "The `Rust` Representation"). -/
+def tyLayoutStep (adts : List AdtDecl) (tySizes : Nat → Nat)
+  (adtPad : Nat → Nat) (target : TargetLayout)
+  (unfold : MirTy → Option (Nat × Nat)) : MirTy → Option (Nat × Nat)
+  | .usize | .isize => some (target.ptrByteWidth, target.ptrByteWidth)
+  | .uint w | .int w => intBitWidthLayout target w
+  | .bool => some (1, 1)
+  | .char => some (4, 4)
+  | .unit => some (0, 1)
+  | .param idx => some (tySizes idx, 1)
+  | .ref inner | .rawPtr inner _ =>
+    (tyLayoutStep adts tySizes adtPad target unfold inner).map
+      fun _ => (target.ptrByteWidth, target.ptrByteWidth)
   | .array elem len =>
-    (tySizeStep adts tySizes unfold elem).bind fun elemSz =>
-      let sz := elemSz * len
-      if decide (sz ≤ isizeMaxBytes) then some sz else none
+    (tyLayoutStep adts tySizes adtPad target unfold elem).bind
+      fun (elemSz, elemAlign) =>
+        let sz := elemSz * len
+        if decide (sz ≤ isizeMaxBytes) then some (sz, elemAlign) else none
+  | .arraySizeOf elem sizedTy =>
+    (tyLayoutStep adts tySizes adtPad target unfold elem).bind
+      fun (elemSz, elemAlign) =>
+        (tyLayoutStep adts tySizes adtPad target unfold sizedTy).map
+          fun (n, _) => (elemSz * n, elemAlign)
+  | .adt id =>
+    (findAdtDecl adts id).bind fun decl =>
+      let baseLayout :=
+        match decl.fields with
+        | [f] => unfold f.ty
+        | fields => foldReprCFields unfold fields 0 1
+      match decl.repr with
+      | .unmodeled => none
+      | .transparent | .c => baseLayout
+      | .rust => baseLayout.map fun (sz, al) => (adtPad id + sz, al)
   | _ => none
 
-def tySizeFuel (adts : List AdtDecl) (tySizes : Nat → Nat) :
-    Nat → MirTy → Option Nat
+def tyLayoutFuel (adts : List AdtDecl) (tySizes : Nat → Nat)
+    (adtPad : Nat → Nat := fun _ => 0)
+    (target : TargetLayout := defaultTargetLayout) :
+    Nat → MirTy → Option (Nat × Nat)
   | 0, _ => none
-  | fuel + 1, ty => tySizeStep adts tySizes (tySizeFuel adts tySizes fuel) ty
+  | fuel + 1, ty =>
+    tyLayoutStep adts tySizes adtPad target
+      (tyLayoutFuel adts tySizes adtPad target fuel) ty
 
-/-- Byte size of a `MirTy` under `adts` and `tySizes` (`core::mem::size_of`,
-`src/type-layout.md#L16-L18`):
+/-- Byte size of a `MirTy` under `adts`, `tySizes`, `adtPad`, and `target`
+(`core::mem::size_of`, `src/type-layout.md#L16-L18`):
 > "The size of a value is the offset in bytes between successive elements in an
 > array with that item type including alignment padding."
 
@@ -300,8 +452,39 @@ chain of nested unfoldings visits distinct declarations, and there are at most
 behind a reference, such as `struct Node { next: &'static Node }`) exhausts
 the fuel, so its size is `none` and it is ill formed. -/
 def evalTyByteSize (adts : List AdtDecl) (tySizes : Nat → Nat)
-    (ty : MirTy) : Option Nat :=
-  tySizeFuel adts tySizes (adts.length + 1) ty
+    (ty : MirTy) (adtPad : Nat → Nat := fun _ => 0)
+    (target : TargetLayout := defaultTargetLayout) : Option Nat :=
+  (tyLayoutFuel adts tySizes adtPad target (adts.length + 1) ty).map Prod.fst
+
+/-- Byte alignment of a `MirTy` under `adts`, `tySizes`, `adtPad`, and `target`
+(`core::mem::align_of`, `src/type-layout.md#L20-L24`). -/
+def evalTyAlign (adts : List AdtDecl) (tySizes : Nat → Nat)
+    (ty : MirTy) (adtPad : Nat → Nat := fun _ => 0)
+    (target : TargetLayout := defaultTargetLayout) : Option Nat :=
+  (tyLayoutFuel adts tySizes adtPad target (adts.length + 1) ty).map Prod.snd
+
+/-- Evaluate a compile-time or runtime `LayoutQuery` (`size_of`, `align_of`,
+or `offset_of!`). -/
+def evalLayoutQuery (adts : List AdtDecl) (tySizes : Nat → Nat)
+    (query : LayoutQuery) (adtPad : Nat → Nat := fun _ => 0)
+    (target : TargetLayout := defaultTargetLayout) : Option Nat :=
+  match query with
+  | .sizeOf ty => evalTyByteSize adts tySizes ty adtPad target
+  | .alignOf ty => evalTyAlign adts tySizes ty adtPad target
+  | .offsetOf (.adt id) variantIdx fieldIdx =>
+    if variantIdx == 0 then
+      (findAdtDecl adts id).bind fun decl =>
+        let unfold := tyLayoutFuel adts tySizes adtPad target (adts.length + 1)
+        if decl.repr == .c then
+          reprCFieldOffset unfold decl.fields fieldIdx 0
+        else if decl.isZeroPaddedWrapper adtPad &&
+            fieldIdx == 0 && decl.fields.length == 1 then
+          (evalTyByteSize adts tySizes (.adt id) adtPad target).map fun _ => 0
+        else
+          none
+    else
+      none
+  | .offsetOf _ _ _ => none
 
 /-- Type well-formedness: the model can measure `ty` in `adts` under zero
 parameter sizes. -/
@@ -332,18 +515,46 @@ def StaticBodyWf (adts : List AdtDecl) (body : MirBody) : Prop :=
 
 /-! ## Initialization and references -/
 
-/-- Whether `v` and all struct payloads inside `v` are initialized (contain no
-`.uninit` sub-value). -/
+/-- Whether `v` and all struct or field payloads inside `v` are initialized
+(contain no `.uninit` sub-value). -/
 def MirVal.isFullyInit : MirVal → Bool
   | .uninit => false
   | .usize _ | .bool _ | .unit | .bytes _ _ | .ref _ _ _ _ => true
   | .adt _ inner => inner.isFullyInit
+  | .fieldCons h t => h.isFullyInit && t.isFullyInit
 
-/-- Peel `d` single-field `.adt` wrappers off `v` (`d > 0` corresponds to `d`
-`.field 0` projections from a borrowed local). -/
+/-- Pack a list of field values into a `MirVal` payload. A single field `[v]`
+is stored directly as `v` so single-field structs are `.adt id v`; two or more
+fields are right-nested with `.fieldCons`. -/
+def packFields : List MirVal → MirVal
+  | [] => .unit
+  | [v] => v
+  | v :: rest => .fieldCons v (packFields rest)
+
+/-- Extract field `0` from a struct or tuple payload `MirVal`. -/
+def firstFieldVal : MirVal → MirVal
+  | .fieldCons h _ => h
+  | v => v
+
+/-- Extract field `idx` from a struct or tuple payload `MirVal`. -/
+def getFieldVal : Nat → MirVal → Option MirVal
+  | 0, v => some (firstFieldVal v)
+  | i + 1, .fieldCons _ t => getFieldVal i t
+  | _ + 1, _ => none
+
+/-- Replace field `idx` in a struct or tuple payload `MirVal` with
+`newField`. -/
+def setFieldVal (newField : MirVal) : Nat → MirVal → Option MirVal
+  | 0, .fieldCons _ t => some (.fieldCons newField t)
+  | 0, _ => some newField
+  | i + 1, .fieldCons h t => (setFieldVal newField i t).map (.fieldCons h)
+  | _ + 1, _ => none
+
+/-- Peel `d` `.field 0` projections off `.adt` wrappers in `v` (`d > 0`
+corresponds to `d` nested `.field 0` projections from a borrowed local). -/
 def peelFields : Nat → MirVal → Option MirVal
   | 0, v => some v
-  | d + 1, .adt _ inner => peelFields d inner
+  | d + 1, .adt _ inner => peelFields d (firstFieldVal inner)
   | _ + 1, _ => none
 
 /-- Resolve a shared reference `.ref targetFrameId gen loc fieldDepth` in state
@@ -393,6 +604,9 @@ def returnRefsStep (s : MirState) (localCount : Nat)
   | .uninit => false
   | .usize _ | .bool _ | .unit | .bytes _ _ => true
   | .adt _ inner => returnRefsStep s localCount follow inner
+  | .fieldCons h t =>
+    returnRefsStep s localCount follow h &&
+    returnRefsStep s localCount follow t
   | .ref frameId gen loc fieldDepth =>
     !(if s.frameId == 0 then
         decide (0 < frameId) || decide (loc.index < localCount)
@@ -445,6 +659,25 @@ def denoteAdtInv (adts : List AdtDecl) : AdtInv :=
       | some { invariant := some inv, .. } => denoteInvariant inv v
       | _ => True
 
+/-- Field-by-field validity of a struct payload `MirVal` against a list of
+declared fields. Single-field structs `[f]` reduce directly to `unfold f.ty v`;
+multi-field structs match `.fieldCons h t` against `f :: rest`. -/
+def validFields (unfold : MirTy → MirVal → Prop) :
+    List FieldDecl → MirVal → Prop
+  | [], .unit => True
+  | [], _ => False
+  | [f], v => unfold f.ty v
+  | f :: rest, .fieldCons h t => unfold f.ty h ∧ validFields unfold rest t
+  | _ :: _, _ => False
+
+/-- Validity of `inner` as the payload of `decl` under `unfold`. Structs with
+`AdtRepr.unmodeled` have no valid value. -/
+def validAdtDecl (unfold : MirTy → MirVal → Prop) (decl : AdtDecl)
+    (inner : MirVal) : Prop :=
+  match decl.repr with
+  | .unmodeled => False
+  | .rust | .transparent | .c => validFields unfold decl.fields inner
+
 /-- Value validity with at most `fuel` nested struct unfoldings; see
 `MirVal.valid`, which fixes the fuel. `MirVal.usize` models non-negative
 integers (`Nat`), while arithmetic overflow checks in `evalBinOp` guard
@@ -454,6 +687,14 @@ def validStep (adts : List AdtDecl) (adtInv : AdtInv)
     (unfold : MirTy → MirVal → Prop) : MirTy → MirVal → Prop
   | .usize, .usize _ => True
   | .usize, _ => False
+  | .isize, .usize _ => True
+  | .isize, _ => False
+  | .uint _, .usize _ => True
+  | .uint _, _ => False
+  | .int _, .usize _ => True
+  | .int _, _ => False
+  | .char, .usize _ => True
+  | .char, _ => False
   | .bool, .bool _ => True
   | .bool, _ => False
   | .unit, .unit => True
@@ -461,12 +702,22 @@ def validStep (adts : List AdtDecl) (adtInv : AdtInv)
   | .adt id, .adt vId inner =>
     vId = id ∧
     adtInv id inner ∧
-    match (findAdtDecl adts id).bind AdtDecl.payloadTy with
-    | some payload => unfold payload inner
+    match findAdtDecl adts id with
+    | some decl => validAdtDecl unfold decl inner
     | none => False
   | .adt _, _ => False
   | .param idx, .bytes sz _ => sz = s.tySizes idx
   | .param _, _ => False
+  | .array elem len, .bytes sz _ =>
+    match evalTyByteSize adts s.tySizes (.array elem len) s.adtPad with
+    | some arrSz => sz = arrSz
+    | none => False
+  | .array _ _, _ => False
+  | .arraySizeOf elem sizedTy, .bytes sz _ =>
+    match evalTyByteSize adts s.tySizes (.arraySizeOf elem sizedTy) s.adtPad with
+    | some arrSz => sz = arrSz
+    | none => False
+  | .arraySizeOf _ _, _ => False
   | .ref inner, .ref frameId gen loc fieldDepth =>
     frameId = 0 ∧
     callerBase ≤ loc.index ∧
@@ -475,6 +726,14 @@ def validStep (adts : List AdtDecl) (adtInv : AdtInv)
       validStep adts adtInv s callerBase unfold inner pointee
     | none => False
   | .ref _, _ => False
+  | .rawPtr inner _, .ref frameId gen loc fieldDepth =>
+    frameId = 0 ∧
+    callerBase ≤ loc.index ∧
+    match resolveRef s frameId gen loc fieldDepth with
+    | some pointee =>
+      validStep adts adtInv s callerBase unfold inner pointee
+    | none => False
+  | .rawPtr _ _, _ => False
   | _, _ => False
 
 def MirVal.validFuel (adts : List AdtDecl) (adtInv : AdtInv)
@@ -492,22 +751,7 @@ root function whose caller-owned referents start at local `callerBase`
 
 This is the only value-validity relation. It is used at function entry (each
 argument), at function return (the returned value, in the terminal state),
-and by `AdmissibleAdtInv`. Its cases:
-
-- `usize`, `bool`, `()`: the value has the matching scalar constructor.
-- `.adt id`: the value is a struct value of the same `id`, its payload
-  satisfies the library invariant `adtInv id`, and the payload is valid at the
-  declared payload type. Structs that `AdtDecl.payloadTy` cannot represent
-  have no valid value.
-- `.param idx`: the value is opaque bytes of the parameter's size.
-- `.ref inner`: the value is a reference to a caller-owned referent (a frame-0
-  local at or above `callerBase`) that resolves in `s` to a valid `inner`.
-  At function entry this rules out aliasing the callee's own locals; at return
-  it matches what `MirVal.returnRefsOk` lets through.
-- Any unmodeled `MirTy` and `MirVal.uninit`: never valid.
-
-Fuel bounds struct unfoldings: a type the model cannot measure has no valid
-value. -/
+and by `AdmissibleAdtInv`. -/
 def MirVal.valid (adts : List AdtDecl) (adtInv : AdtInv)
     (s : MirState) (callerBase : Nat) (ty : MirTy) (v : MirVal) : Prop :=
   MirVal.validFuel adts adtInv s callerBase (adts.length + 1) ty v
@@ -566,20 +810,23 @@ forms point into global allocations named by an `AllocId`:
 
 The model's references (`MirVal.ref`) can only name locals of an activation,
 so a constant reference would forge provenance to some frame's local.
-Constant struct values are rejected too: they would bypass the single-field
-check that `Rvalue.aggregate` performs. Opaque generic bytes cannot be MIR
-literals. Rejecting a constant makes the step undefined behavior, which fails
-closed. -/
+Constant struct values are rejected too: they would bypass the constructor
+checks that `Rvalue.aggregate` and `Rvalue.aggregateFields` perform. Opaque
+generic bytes cannot be MIR literals. Rejecting a constant makes the step
+undefined behavior, which fails closed. -/
 def MirVal.isConstScalar : MirVal → Bool
   | .usize _ | .bool _ | .unit => true
-  | .uninit | .adt _ _ | .bytes _ _ | .ref _ _ _ _ => false
+  | .uninit | .adt _ _ | .fieldCons _ _ | .bytes _ _ | .ref _ _ _ _ => false
 
 /-- Follow a projection list from `v` in state `s`, requiring the resulting
 value to be fully initialized (`MirVal.isFullyInit`). -/
 def evalProj (s : MirState) :
     List PlaceElem → MirVal → Option MirVal
   | [], v => if v.isFullyInit then some v else none
-  | .field 0 :: rest, .adt _ inner => evalProj s rest inner
+  | .field idx :: rest, .adt _ inner =>
+    (getFieldVal idx inner).bind (evalProj s rest)
+  | .field idx :: rest, .fieldCons h t =>
+    (getFieldVal idx (.fieldCons h t)).bind (evalProj s rest)
   | .deref :: rest, .ref frameId gen loc fieldDepth =>
     match resolveRef s frameId gen loc fieldDepth with
     | some pointee => evalProj s rest pointee
@@ -602,8 +849,14 @@ immutable. -/
 def updateProj (newVal : MirVal) :
     List PlaceElem → Option MirVal → Option MirVal
   | [], _ => some newVal
-  | .field 0 :: rest, some (.adt id inner) =>
-    (updateProj newVal rest (some inner)).map (.adt id)
+  | .field idx :: rest, some (.adt id inner) =>
+    (getFieldVal idx inner).bind fun curField =>
+      (updateProj newVal rest (some curField)).bind fun updatedField =>
+        (setFieldVal updatedField idx inner).map (.adt id)
+  | .field idx :: rest, some (.fieldCons h t) =>
+    (getFieldVal idx (.fieldCons h t)).bind fun curField =>
+      (updateProj newVal rest (some curField)).bind fun updatedField =>
+        setFieldVal updatedField idx (.fieldCons h t)
   | _, _ => none
 
 /-- Write `val` to `dst` within a frame of `localCount` locals. -/
@@ -636,7 +889,7 @@ def evalRefProj (s : MirState) (frameId gen : Nat) (loc : LocalId)
   | [], v =>
     if v.isFullyInit then some (.ref frameId gen loc fieldDepth) else none
   | .field 0 :: rest, .adt _ inner =>
-    evalRefProj s frameId gen loc (fieldDepth + 1) rest inner
+    evalRefProj s frameId gen loc (fieldDepth + 1) rest (firstFieldVal inner)
   | .deref :: rest, .ref frameId' gen' loc' fieldDepth' =>
     match resolveRef s frameId' gen' loc' fieldDepth' with
     | some pointee =>
@@ -667,52 +920,347 @@ def evalOperand (localCount : Nat) (s : MirState)
       (deinitPlace localCount s.locals src).map fun locals' => (v, locals')
   | .constVal v =>
     if v.isConstScalar then some (v, s.locals) else none
+  | .runtimeChecks .ubChecks =>
+    some (.bool s.ubChecks, s.locals)
   | .runtimeChecks _ => none
 
-/-- Evaluate a binary comparison `BinOp` on two initialized `MirVal`
+/-- Evaluate a list of operands left-to-right, threading `locals` updates
+across moves. -/
+def evalOperandList (localCount : Nat) (s : MirState) :
+    List Operand → Option (List MirVal × (Nat → Option MirVal))
+  | [] => some ([], s.locals)
+  | op :: rest =>
+    (evalOperand localCount s op).bind fun (v, locals1) =>
+      (evalOperandList localCount { s with locals := locals1 } rest).map
+        fun (vs, locals2) => (v :: vs, locals2)
+
+/-- Evaluate a binary operation `BinOp` on two initialized `MirVal`
 operands. -/
 def evalBinOp (op : BinOp) (lhs rhs : MirVal) : Option MirVal :=
   match op, lhs, rhs with
   | .eq, .usize a, .usize b => some (.bool (decide (a = b)))
   | .eq, .bool a, .bool b => some (.bool (decide (a = b)))
   | .eq, .unit, .unit => some (.bool true)
+  | .ne, .usize a, .usize b => some (.bool (decide (a ≠ b)))
+  | .ne, .bool a, .bool b => some (.bool (decide (a ≠ b)))
+  | .ne, .unit, .unit => some (.bool false)
+  | .lt, .usize a, .usize b => some (.bool (decide (a < b)))
+  | .le, .usize a, .usize b => some (.bool (decide (a ≤ b)))
+  | .gt, .usize a, .usize b => some (.bool (decide (b < a)))
+  | .ge, .usize a, .usize b => some (.bool (decide (b ≤ a)))
+  | .add, .usize a, .usize b => some (.usize (a + b))
+  | .sub, .usize a, .usize b =>
+    if decide (b ≤ a) then some (.usize (a - b)) else none
+  | .mul, .usize a, .usize b => some (.usize (a * b))
+  | .bitAnd, .bool a, .bool b => some (.bool (a && b))
+  | .bitOr, .bool a, .bool b => some (.bool (a || b))
+  | .bitXor, .bool a, .bool b => some (.bool (bne a b))
   | _, _, _ => none
+
+/-- Evaluate a unary operation `UnOp` on an initialized `MirVal` operand. -/
+def evalUnOp (op : UnOp) (v : MirVal) : Option MirVal :=
+  match op, v with
+  | .not, .bool b => some (.bool (!b))
+  | _, _ => none
+
+/-! ## Transmutation and transparent wrapper peeling -/
+
+/-- Structural boolean equality on `MirTy`. -/
+def MirTy.beq : MirTy → MirTy → Bool
+  | .usize, .usize | .isize, .isize | .bool, .bool
+  | .char, .char | .unit, .unit => true
+  | .uint a, .uint b => a == b
+  | .int a, .int b => a == b
+  | .adt a, .adt b => a == b
+  | .param a, .param b => a == b
+  | .ref a, .ref b => MirTy.beq a b
+  | .rawPtr a m1, .rawPtr b m2 => m1 == m2 && MirTy.beq a b
+  | .array a n1, .array b n2 => n1 == n2 && MirTy.beq a b
+  | .arraySizeOf a1 s1, .arraySizeOf a2 s2 =>
+    MirTy.beq a1 a2 && MirTy.beq s1 s2
+  | _, _ => false
+
+/-- Peel single-field `#[repr(transparent)]` (or zero-padded `#[repr(Rust)]`)
+struct wrappers off `(ty, v)` down to the underlying payload type and value. -/
+def peelTransparent (adts : List AdtDecl) (adtPad : Nat → Nat) :
+    Nat → MirTy → MirVal → Option (MirTy × MirVal)
+  | 0, ty, v => some (ty, v)
+  | fuel + 1, .adt id, .adt vId inner =>
+    if vId == id then
+      match findAdtDecl adts id with
+      | some decl =>
+        if decl.isZeroPaddedWrapper adtPad then
+          match decl.payloadTy with
+          | some payload => peelTransparent adts adtPad fuel payload inner
+          | none => some (.adt id, .adt vId inner)
+        else
+          some (.adt id, .adt vId inner)
+      | none => none
+    else
+      none
+  | _ + 1, ty, v => some (ty, v)
+
+/-- Wrap `baseVal` of type `baseTy` into `dstTy` through `allFieldsPubSafe`
+single-field `#[repr(transparent)]` (or zero-padded `#[repr(Rust)]`) struct
+wrappers. -/
+def wrapTransparent (adts : List AdtDecl) (adtPad : Nat → Nat) :
+    Nat → MirTy → MirTy → MirVal → Option MirVal
+  | 0, _, _, _ => none
+  | fuel + 1, baseTy, dstTy, baseVal =>
+    if MirTy.beq baseTy dstTy then
+      some baseVal
+    else
+      match dstTy with
+      | .adt id =>
+        (findAdtDecl adts id).bind fun decl =>
+          if decl.allFieldsPubSafe && decl.isZeroPaddedWrapper adtPad then
+            decl.payloadTy.bind fun payload =>
+              (wrapTransparent adts adtPad fuel baseTy payload baseVal).map
+                (MirVal.adt id)
+          else
+            none
+      | _ => none
+
+/-- Byte width of a primitive scalar `MirTy` on `target`. -/
+def primitiveByteSize (target : TargetLayout := defaultTargetLayout) :
+    MirTy → Option Nat
+  | .usize | .isize => some target.ptrByteWidth
+  | .uint w | .int w => (intBitWidthLayout target w).map Prod.fst
+  | .bool => some 1
+  | .char => some 4
+  | .unit => some 0
+  | _ => none
+
+/-- Extract the total initialized byte count and little-endian bit pattern from
+a struct's field values. -/
+def extractFieldBits (extract : MirVal → MirTy → Option (Nat × Nat)) :
+    List FieldDecl → MirVal → Option (Nat × Nat)
+  | [], .unit => some (0, 0)
+  | [f], v =>
+    match v with
+    | .fieldCons _ _ => none
+    | _ => extract v f.ty
+  | f :: rest, .fieldCons h t =>
+    (extract h f.ty).bind fun (sz1, bits1) =>
+      (extractFieldBits extract rest t).map fun (sz2, bits2) =>
+        (sz1 + sz2, bits1 + bits2 * Nat.pow 2 (8 * sz1))
+  | _, _ => none
+
+/-- Extract the initialized byte size and bit pattern of a `transmute` source
+value with at most `fuel` nested struct unfoldings.
+
+Opaque generic type-parameter bytes (`.param _`) and uninitialized values
+(`MirVal.uninit`) are rejected: a value of parameter type may contain padding
+or uninitialized bytes, and reading those bytes as an integer is undefined
+behavior (`src/behavior-considered-undefined.md`, "invalid values"):
+> "An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be
+> initialized, i.e., must not be obtained from uninitialized memory."
+
+Byte arrays (`[u8; N]` and `[u8; size_of::<T>()]`) have every byte initialized
+as a `u8`. References are rejected because the model gives them no integer bit
+pattern. -/
+def extractTransmuteBitsFuel (adts : List AdtDecl) :
+    Nat → MirVal → MirTy → Option (Nat × Nat)
+  | 0, _, _ => none
+  | _ + 1, .usize bits, ty =>
+    match primitiveByteSize defaultTargetLayout ty with
+    | some sz => some (sz, bits)
+    | none => some (8, bits)
+  | _ + 1, .bool b, _ => some (1, if b then 1 else 0)
+  | _ + 1, .unit, _ => some (0, 0)
+  | _ + 1, .bytes sz bits, .array (.uint w) _ =>
+    if w == 8 then some (sz, bits) else none
+  | _ + 1, .bytes sz bits, .arraySizeOf (.uint w) _ =>
+    if w == 8 then some (sz, bits) else none
+  | fuel + 1, .adt adtId inner, _ =>
+    (findAdtDecl adts adtId).bind fun decl =>
+      if decl.repr == .unmodeled then
+        none
+      else
+        extractFieldBits (extractTransmuteBitsFuel adts fuel) decl.fields inner
+  | _, _, _ => none
+
+def extractTransmuteBits (adts : List AdtDecl) (v : MirVal)
+    (srcTy : MirTy := .unmodeled) : Option (Nat × Nat) :=
+  extractTransmuteBitsFuel adts (adts.length + 1) v srcTy
+
+/-- Construct a list of field values from `bits`, returning the sum of field
+byte sizes along with the constructed field values. -/
+def constructFieldVals (construct : Nat → MirTy → Option MirVal)
+    (bits : Nat) : List FieldDecl → Option (Nat × List MirVal)
+  | [] => some (0, [])
+  | f :: rest =>
+    (primitiveByteSize defaultTargetLayout f.ty).bind fun fSz =>
+      (construct fSz f.ty).bind fun v =>
+        (constructFieldVals construct
+          (Nat.div bits (Nat.pow 2 (8 * fSz))) rest).map
+          fun (restSz, vs) => (fSz + restSz, v :: vs)
+
+/-- Build the `transmute` result of type `ty` from `dstSz` bytes holding
+`bits`, with at most `fuel` nested struct unfoldings. Fails (`none`) unless
+every bit pattern of that size is a valid value of `ty`:
+
+- All-bit-pattern integers (`usize`, `isize`, `u*`, `i*`), `()` (0 bytes), and
+  byte arrays (`[u8; N]`, `[u8; size_of::<T>()]`) accept every initialized bit
+  pattern of matching byte length.
+- A struct accepts the result only if safe code could build it from arbitrary
+  field values (`AdtDecl.allFieldsPubSafe`) and its fields have no padding
+  (`sumSz == dstSz`); otherwise its library invariant might be violated.
+- `bool`, `char`, and references are rejected because not every bit pattern is
+  valid (`src/behavior-considered-undefined.md`, "invalid values"):
+  > "A value other than `false` (`0`) or `true` (`1`) in a `bool`."
+- An unconstrained type parameter is rejected because it could be instantiated
+  with `bool`, a reference, or a struct with an invariant. -/
+def constructTransmuteVal (adts : List AdtDecl)
+    (dstSz bits : Nat) : Nat → MirTy → Option MirVal
+  | 0, _ => none
+  | _ + 1, .usize | _ + 1, .isize =>
+    if dstSz == 8 then some (.usize bits) else none
+  | _ + 1, .uint w | _ + 1, .int w =>
+    match intBitWidthLayout defaultTargetLayout w with
+    | some (sz, _) => if dstSz == sz then some (.usize bits) else none
+    | none => none
+  | _ + 1, .bool | _ + 1, .char => none
+  | _ + 1, .unit => if dstSz == 0 then some .unit else none
+  | _ + 1, .array (.uint w) len =>
+    if w == 8 && dstSz == len then some (.bytes dstSz bits) else none
+  | _ + 1, .arraySizeOf (.uint w) _ =>
+    if w == 8 then some (.bytes dstSz bits) else none
+  | fuel + 1, .adt id =>
+    (findAdtDecl adts id).bind fun decl =>
+      if decl.allFieldsPubSafe && decl.repr != .unmodeled then
+        match decl.fields with
+        | [f] =>
+          (constructTransmuteVal adts dstSz bits fuel f.ty).map
+            (MirVal.adt id)
+        | fields =>
+          (constructFieldVals
+            (fun fSz fTy => constructTransmuteVal adts fSz bits fuel fTy)
+            bits fields).bind fun (sumSz, vs) =>
+              if sumSz == dstSz then
+                some (.adt id (packFields vs))
+              else
+                none
+      else
+        none
+  | _ + 1, _ => none
+
+/-- Evaluate a by-value transmutation of `srcVal` from `srcTy` to `dstTy`
+(`CastKind.transmute` and the core of `transmute_copy`).
+
+Accepts either:
+1. Equal-size transparent wrapper peeling/wrapping (`peelTransparent` +
+   `wrapTransparent`) when the peeled payload type equals the target payload
+   type (for example, `Wrapper<T> <-> T` under `#[repr(transparent)]`), or
+2. Equal-size bit-pattern transmutation when `srcVal` has `vSz = srcSz`
+   initialized non-padding bytes (`extractTransmuteBits`) and every bit pattern
+   of that size is valid at `dstTy` (`constructTransmuteVal`). -/
+def evalTransmuteVal (adts : List AdtDecl) (s : MirState)
+    (srcTy dstTy : MirTy) (srcVal : MirVal)
+    (target : TargetLayout := defaultTargetLayout) : Option MirVal :=
+  if !srcVal.isFullyInit then
+    none
+  else
+    match evalTyByteSize adts s.tySizes srcTy s.adtPad target,
+          evalTyByteSize adts s.tySizes dstTy s.adtPad target with
+    | some srcSz, some dstSz =>
+      if decide (srcSz = dstSz) then
+        let fuel := adts.length + 1
+        match (peelTransparent adts s.adtPad fuel srcTy srcVal).bind
+            (fun (baseTy, baseVal) =>
+              wrapTransparent adts s.adtPad fuel baseTy dstTy baseVal) with
+        | some wrapped => some wrapped
+        | none =>
+          match extractTransmuteBits adts srcVal srcTy with
+          | some (vSz, bits) =>
+            if decide (vSz = srcSz) then
+              constructTransmuteVal adts dstSz bits fuel dstTy
+            else
+              none
+          | none => none
+      else
+        none
+    | _, _ => none
+
+/-- Operational evaluation of `core::mem::transmute_copy::<srcTy, dstTy>(&src)`
+(`rustc@f8a08b68`, `library/core/src/mem/mod.rs#L1028-L1039`):
+> "Interprets `src` as having type `&Dst`, and then reads `src` without moving
+> the contained value."
+> "This function triggers undefined behavior if `Dst` is larger than `Src`." -/
+def evalTransmuteCopy (adts : List AdtDecl) (s : MirState)
+    (srcTy dstTy : MirTy) (argVal : MirVal)
+    (target : TargetLayout := defaultTargetLayout) : Option MirVal :=
+  match argVal with
+  | .ref frameId gen loc fieldDepth =>
+    match resolveRef s frameId gen loc fieldDepth with
+    | some pointee => evalTransmuteVal adts s srcTy dstTy pointee target
+    | none => none
+  | _ => none
+
+/-! ## Small-step statement, terminator, and constant evaluation -/
 
 /-- Advance to the next statement in the current basic block with `locals'`. -/
 def MirState.nextStmt :
-    MirState → (Nat → Option MirVal) → StepResult MirState Empty MirReturn
+    MirState → (Nat → Option MirVal) → RawStep MirState MirReturn
   | ⟨_, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
-     nextFrameId⟩, locals' =>
+     nextFrameId, adtPad, ubChecks⟩, locals' =>
     .silent ⟨locals', localGens, block, stmtIdx + 1, tySizes, curBody, stack,
-      frameId, nextFrameId⟩
+      frameId, nextFrameId, adtPad, ubChecks⟩
 
 /-- Advance to the next statement updating both `locals'` and `localGens'`. -/
 def MirState.nextStmtGen :
     MirState → (Nat → Option MirVal) → (Nat → Nat) →
-      StepResult MirState Empty MirReturn
-  | ⟨_, _, block, stmtIdx, tySizes, curBody, stack, frameId, nextFrameId⟩,
-    locals', localGens' =>
+      RawStep MirState MirReturn
+  | ⟨_, _, block, stmtIdx, tySizes, curBody, stack, frameId, nextFrameId,
+     adtPad, ubChecks⟩, locals', localGens' =>
     .silent ⟨locals', localGens', block, stmtIdx + 1, tySizes, curBody, stack,
-      frameId, nextFrameId⟩
+      frameId, nextFrameId, adtPad, ubChecks⟩
 
 /-- Jump to statement `0` of basic block `target` in the current frame. -/
 def MirState.gotoBlock :
     MirState → (Nat → Option MirVal) → Nat →
-      StepResult MirState Empty MirReturn
-  | ⟨_, localGens, _, _, tySizes, curBody, stack, frameId, nextFrameId⟩,
-    locals', target =>
+      RawStep MirState MirReturn
+  | ⟨_, localGens, _, _, tySizes, curBody, stack, frameId, nextFrameId,
+     adtPad, ubChecks⟩, locals', target =>
     .silent ⟨locals', localGens, target, 0, tySizes, curBody, stack, frameId,
-      nextFrameId⟩
+      nextFrameId, adtPad, ubChecks⟩
+
+/-- Canonical initial state for evaluating a zero-argument compile-time constant
+`MirBody` under `tySizes` and `adtPad`. -/
+def constEntryState (tySizes : Nat → Nat)
+    (adtPad : Nat → Nat := fun _ => 0) : MirState where
+  locals := fun _ => none
+  block := 0
+  stmtIdx := 0
+  tySizes := tySizes
+  adtPad := adtPad
+
+/-- Extract the repeated byte value from a `[elem; N]` repeat operand. -/
+def evalRepeatElem : MirVal → Option Nat
+  | .usize bits => some bits
+  | .bool b => some (if b then 1 else 0)
+  | _ => none
 
 /-- Single-step operational evaluation of a MIR statement inside `activeBody`
 (`src/behavior-considered-undefined.md#L54-L55`,
 `src/expressions.md#L199-L215`):
 > "After moving out of a place expression that evaluates to a local variable,
 > the location is deinitialized and cannot be read from again until it is
-> reinitialized." -/
+> reinitialized."
+
+`Stmt.evalConst` evaluates a compile-time constant or `const { ... }` block in
+the exact basic-block statement order where `rustc` places it: a constant that
+panics (`Terminator.panic` or `Terminator.assert`) terminates the enclosing
+execution with `.terminated .compileTimeError` (pruning that layout or
+type-parameter world as a compile-time error), whereas a constant that hits
+undefined behavior or a model limit steps to `.failed`. -/
 def evalMirStmt (activeBody : MirBody) (s : MirState)
-    (stmt : Stmt) (adts : List AdtDecl) :
-    StepResult MirState Empty MirReturn :=
+    (stmt : Stmt) (adts : List AdtDecl)
+    (bodies : List BodyDecl := [])
+    (evalConstBody : MirBody → MirState → RawStep MirState MirReturn :=
+      fun _ _ => .failed)
+    (target : TargetLayout := defaultTargetLayout) :
+    RawStep MirState MirReturn :=
   match stmt with
   | .assign dst (.use op) =>
     match evalOperand activeBody.localCount s op with
@@ -721,6 +1269,29 @@ def evalMirStmt (activeBody : MirBody) (s : MirState)
       | some locals'' => s.nextStmt locals''
       | none => .failed
     | none => .failed
+  | .assign dst (.repeat op len) =>
+    match evalOperand activeBody.localCount s op with
+    | some (v, locals') =>
+      match evalRepeatElem v with
+      | some bits =>
+        match assignPlace activeBody.localCount locals' dst
+            (.bytes len bits) with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+      | none => .failed
+    | none => .failed
+  | .assign dst (.repeatSizeOf op sizedTy) =>
+    match evalOperand activeBody.localCount s op,
+          evalTyByteSize adts s.tySizes sizedTy s.adtPad target with
+    | some (v, locals'), some sz =>
+      match evalRepeatElem v with
+      | some bits =>
+        match assignPlace activeBody.localCount locals' dst
+            (.bytes sz bits) with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+      | none => .failed
+    | _, _ => .failed
   | .assign dst (.binaryOp op lhs rhs) =>
     match evalOperand activeBody.localCount s lhs with
     | some (v1, locals1) =>
@@ -735,10 +1306,19 @@ def evalMirStmt (activeBody : MirBody) (s : MirState)
         | none => .failed
       | none => .failed
     | none => .failed
+  | .assign dst (.unaryOp op src) =>
+    match evalOperand activeBody.localCount s src with
+    | some (v, locals') =>
+      match evalUnOp op v with
+      | some outVal =>
+        match assignPlace activeBody.localCount locals' dst outVal with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+      | none => .failed
+    | none => .failed
   | .assign dst (.aggregate adtId op) =>
-    -- `MirVal.adt` carries exactly one field value, so only declared
-    -- single-field ADTs may be constructed.
-    if (findAdtDecl adts adtId).any (·.fields.length == 1) then
+    if (findAdtDecl adts adtId).any
+        (fun d => d.fields.length == 1 && d.repr != .unmodeled) then
       match evalOperand activeBody.localCount s op with
       | some (v, locals') =>
         match assignPlace activeBody.localCount locals' dst (.adt adtId v) with
@@ -747,15 +1327,74 @@ def evalMirStmt (activeBody : MirBody) (s : MirState)
       | none => .failed
     else
       .failed
-  | .assign dst (.ref src) =>
+  | .assign dst (.aggregateFields ops adtIdOpt) =>
+    match evalOperandList activeBody.localCount s ops with
+    | some (vs, locals') =>
+      match adtIdOpt with
+      | some adtId =>
+        if (findAdtDecl adts adtId).any
+            (fun d => d.fields.length == vs.length && d.repr != .unmodeled) then
+          match assignPlace activeBody.localCount locals' dst
+              (.adt adtId (packFields vs)) with
+          | some locals'' => s.nextStmt locals''
+          | none => .failed
+        else
+          .failed
+      | none =>
+        match assignPlace activeBody.localCount locals' dst (packFields vs) with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+    | none => .failed
+  | .assign dst (.ref src) | .assign dst (.rawPtr _ src) =>
     match evalRefPlace activeBody.localCount s src with
     | some refVal =>
       match assignPlace activeBody.localCount s.locals dst refVal with
       | some locals' => s.nextStmt locals'
       | none => .failed
     | none => .failed
+  | .assign dst (.cast (.transmute srcTy) op dstTy) =>
+    match evalOperand activeBody.localCount s op with
+    | some (v, locals') =>
+      match evalTransmuteVal adts { s with locals := locals' }
+          srcTy dstTy v target with
+      | some outVal =>
+        match assignPlace activeBody.localCount locals' dst outVal with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+      | none => .failed
+    | none => .failed
+  | .assign dst (.cast .intToInt op dstTy)
+  | .assign dst (.cast .ptrToPtr op dstTy) =>
+    if (evalTyByteSize adts s.tySizes dstTy s.adtPad target).isSome then
+      match evalOperand activeBody.localCount s op with
+      | some (v, locals') =>
+        match assignPlace activeBody.localCount locals' dst v with
+        | some locals'' => s.nextStmt locals''
+        | none => .failed
+      | none => .failed
+    else
+      .failed
   | .assign _ _ =>
     .failed
+  | .evalConst dst constId typeArgs =>
+    match (findBody bodies constId).bind (MirBody.subst typeArgs) with
+    | some cBody =>
+      if cBody.argTys.isEmpty then
+        match evalConstBody cBody (constEntryState s.tySizes s.adtPad) with
+        | .terminated (.normal ret) =>
+          if ret.value.isConstScalar then
+            match assignPlace activeBody.localCount s.locals dst ret.value with
+            | some locals' => s.nextStmt locals'
+            | none => .failed
+          else
+            .failed
+        | .terminated .unwind | .terminated .abort
+        | .terminated .compileTimeError =>
+          .terminated .compileTimeError
+        | _ => .failed
+      else
+        .failed
+    | none => .failed
   | .placeMention p =>
     match p.projection with
     | [] =>
@@ -778,89 +1417,6 @@ def evalMirStmt (activeBody : MirBody) (s : MirState)
   | _ =>
     .failed
 
-/-- Extract the byte size and bit pattern of a `transmute_copy` source value,
-looking through struct payloads.
-
-Opaque generic bytes (`MirVal.bytes`) and uninitialized values
-(`MirVal.uninit`) are rejected: a value of parameter type may contain padding
-or uninitialized bytes, and reading those bytes as an integer is undefined
-behavior (`src/behavior-considered-undefined.md`, "invalid values"):
-> "An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be
-> initialized, i.e., must not be obtained from uninitialized memory."
-
-References are rejected because the model gives them no bit pattern. -/
-def extractTransmuteBits (adts : List AdtDecl) :
-    MirVal → Option (Nat × Nat)
-  | .usize bits => some (8, bits)
-  | .bool b => some (1, if b then 1 else 0)
-  | .unit => some (0, 0)
-  | .adt adtId inner =>
-    (findAdtDecl adts adtId).bind fun decl =>
-      decl.payloadTy.bind fun _ => extractTransmuteBits adts inner
-  | .uninit | .bytes _ _ | .ref _ _ _ _ => none
-
-/-- Build the `transmute_copy` result of type `ty` from `dstSz` bytes holding
-`bits`, with at most `fuel` nested struct unfoldings. Fails (`none`) unless
-every bit pattern of that size is a valid value of `ty`:
-
-- `usize` (8 bytes) and `()` (0 bytes) accept every bit pattern.
-- A struct accepts the result only if safe code could build it from arbitrary
-  field values (`AdtDecl.allFieldsPubSafe`); otherwise its library invariant
-  might be violated.
-- `bool` and references are rejected because not every bit pattern is valid
-  (`src/behavior-considered-undefined.md`, "invalid values"):
-  > "A value other than `false` (`0`) or `true` (`1`) in a `bool`."
-- A type parameter is rejected. A generic function is verified once for every
-  instantiation, and the parameter could be instantiated with `bool`, a
-  reference, or a struct with an invariant, so no bit pattern is valid for
-  every instantiation. A transmute into a parameter is therefore undefined
-  behavior in the model; only call sites that instantiate the parameter with
-  a concrete type (by `MirBody.subst`) can transmute successfully. -/
-def constructTransmuteVal (adts : List AdtDecl)
-    (dstSz bits : Nat) : Nat → MirTy → Option MirVal
-  | 0, _ => none
-  | _ + 1, .usize => if dstSz == 8 then some (.usize bits) else none
-  | _ + 1, .bool => none
-  | _ + 1, .unit => if dstSz == 0 then some .unit else none
-  | fuel + 1, .adt id =>
-    (findAdtDecl adts id).bind fun decl =>
-      if decl.allFieldsPubSafe then
-        decl.payloadTy.bind fun payload =>
-          (constructTransmuteVal adts dstSz bits fuel payload).map
-            (MirVal.adt id)
-      else
-        none
-  | _ + 1, _ => none
-
-/-- Operational evaluation of `core::mem::transmute_copy::<srcTy, dstTy>(&src)`
-(`rustc@f8a08b68`, `library/core/src/mem/mod.rs#L1028-L1039`):
-> "Interprets `src` as having type `&Dst`, and then reads `src` without moving
-> the contained value."
-> "This function triggers undefined behavior if `Dst` is larger than `Src`."
-
-The model accepts only equal sizes, and only when the source value has a
-modeled bit pattern of that size and every bit pattern is valid at `dstTy`
-(`constructTransmuteVal`). -/
-def evalTransmuteCopy (adts : List AdtDecl) (s : MirState)
-    (srcTy dstTy : MirTy) (argVal : MirVal) : Option MirVal :=
-  match evalTyByteSize adts s.tySizes srcTy,
-        evalTyByteSize adts s.tySizes dstTy, argVal with
-  | some srcSz, some dstSz, .ref frameId gen target fieldDepth =>
-    if decide (srcSz = dstSz) then
-      match resolveRef s frameId gen target fieldDepth with
-      | some pointee =>
-        match extractTransmuteBits adts pointee with
-        | some (vSz, bits) =>
-          if decide (vSz = srcSz) then
-            constructTransmuteVal adts dstSz bits (adts.length + 1) dstTy
-          else
-            none
-        | none => none
-      | none => none
-    else
-      none
-  | _, _, _ => none
-
 /-- Single-step operational evaluation of a MIR terminator
 (`compiler/rustc_middle/src/mir/syntax.rs#L684-L798`):
 > "Returning very likely at least assigns the value currently in the return
@@ -873,7 +1429,8 @@ instantiates it with `MirBody.subst`, and runs it in a fresh activation; an
 unknown `BodyId` or failed instantiation is undefined behavior. -/
 def evalMirTerminator (adts : List AdtDecl)
     (bodies : List BodyDecl) (activeBody : MirBody) (s : MirState)
-    (term : Terminator) : StepResult MirState Empty MirReturn :=
+    (term : Terminator) (targetLayout : TargetLayout := defaultTargetLayout) :
+    RawStep MirState MirReturn :=
   match term with
   | .return_ =>
     if 0 < activeBody.localCount then
@@ -900,6 +1457,8 @@ def evalMirTerminator (adts : List AdtDecl)
                   stack := restStack
                   frameId := frame.callerFrameId
                   nextFrameId := s.nextFrameId
+                  adtPad := s.adtPad
+                  ubChecks := s.ubChecks
                 }
               | none => .failed
             else
@@ -920,7 +1479,7 @@ def evalMirTerminator (adts : List AdtDecl)
       .failed
     else
       .terminated .unwind
-  | .assert cond expected target hasCleanup =>
+  | .assert cond expected target onFail hasCleanup =>
     match evalOperand activeBody.localCount s cond with
     | some (.bool b, locals') =>
       if b == expected then
@@ -928,10 +1487,15 @@ def evalMirTerminator (adts : List AdtDecl)
           s.gotoBlock locals' target.index
         else
           .failed
-      else if hasCleanup || !s.stack.isEmpty then
-        .failed
       else
-        .terminated .unwind
+        match onFail with
+        | .unwind =>
+          if hasCleanup || !s.stack.isEmpty then
+            .failed
+          else
+            .terminated .unwind
+        | .abort => .terminated .abort
+        | .ub => .failed
     | _ => .failed
   | .switchInt discr falseTarget trueTarget =>
     match evalOperand activeBody.localCount s discr with
@@ -946,11 +1510,11 @@ def evalMirTerminator (adts : List AdtDecl)
       else
         .failed
     | _ => .failed
-  | .callSizeOf dst ty target =>
+  | .callLayout dst query target =>
     if target.index < activeBody.blocks.length then
-      match evalTyByteSize adts s.tySizes ty with
-      | some sz =>
-        match assignPlace activeBody.localCount s.locals dst (.usize sz) with
+      match evalLayoutQuery adts s.tySizes query s.adtPad targetLayout with
+      | some val =>
+        match assignPlace activeBody.localCount s.locals dst (.usize val) with
         | some locals' => s.gotoBlock locals' target.index
         | none => .failed
       | none => .failed
@@ -961,7 +1525,7 @@ def evalMirTerminator (adts : List AdtDecl)
       match evalOperand activeBody.localCount s op with
       | some (argVal, locals') =>
         match evalTransmuteCopy adts { s with locals := locals' }
-            srcTy dstTy argVal with
+            srcTy dstTy argVal targetLayout with
         | some outVal =>
           match assignPlace activeBody.localCount locals' dst outVal with
           | some locals'' => s.gotoBlock locals'' target.index
@@ -1000,6 +1564,8 @@ def evalMirTerminator (adts : List AdtDecl)
             stack := frame :: s.stack
             frameId := s.nextFrameId
             nextFrameId := s.nextFrameId + 1
+            adtPad := s.adtPad
+            ubChecks := s.ubChecks
           }
         | none => .failed
       else
@@ -1007,27 +1573,65 @@ def evalMirTerminator (adts : List AdtDecl)
   | _ =>
     .failed
 
-/-- Single-step transition function of a `MirBody` under `adts` and `bodies`. -/
-def evalMirStep (adts : List AdtDecl)
-    (bodies : List BodyDecl := []) (rootBody : MirBody)
-    (s : MirState) : StepResult MirState Empty MirReturn :=
+/-- Single-step transition of `rootBody` parameterized by a constant-body
+evaluator `evalConstBody`. -/
+def evalMirStepWith (adts : List AdtDecl) (bodies : List BodyDecl)
+    (evalConstBody : MirBody → MirState → RawStep MirState MirReturn)
+    (target : TargetLayout) (rootBody : MirBody)
+    (s : MirState) : RawStep MirState MirReturn :=
   let active := s.curBody.getD rootBody
   match lookupAt active.blocks s.block with
   | none => .failed
   | some bb =>
     match lookupAt bb.stmts s.stmtIdx with
-    | some stmt => evalMirStmt active s stmt adts
+    | some stmt =>
+      evalMirStmt active s stmt adts bodies evalConstBody target
     | none =>
       if s.stmtIdx == bb.stmts.length then
-        evalMirTerminator adts bodies active s bb.terminator
+        evalMirTerminator adts bodies active s bb.terminator target
       else
         .failed
+
+/-- Run `stepFn` for at most `fuel` silent steps on `cBody` starting from `cs`
+(`src/const_eval.md#L1-L25`):
+> "A constant expression is evaluated at compile time. If evaluation fails (for
+> example, due to a panic or integer overflow), compilation fails." -/
+def runConstSteps (stepFn : MirBody → MirState → RawStep MirState MirReturn) :
+    Nat → MirBody → MirState → RawStep MirState MirReturn
+  | 0, _, _ => .failed
+  | fuel + 1, cBody, cs =>
+    match stepFn cBody cs with
+    | .silent cs' => runConstSteps stepFn fuel cBody cs'
+    | out => out
+
+/-- Default step budget per compile-time constant evaluation. -/
+def defaultConstFuel : Nat := 64
+
+/-- Evaluate `evalMirStepWith` supporting up to `depth` nested constant
+evaluations via structural recursion on `depth`. -/
+def evalMirStepDepth (adts : List AdtDecl) (bodies : List BodyDecl)
+    (target : TargetLayout) :
+    Nat → MirBody → MirState → RawStep MirState MirReturn
+  | 0, rootBody, s =>
+    evalMirStepWith adts bodies (fun _ _ => .failed) target rootBody s
+  | depth + 1, rootBody, s =>
+    let stepFn := evalMirStepDepth adts bodies target depth
+    evalMirStepWith adts bodies
+      (runConstSteps stepFn defaultConstFuel) target rootBody s
+
+/-- Single-step transition function of a `MirBody` under `adts`, `bodies`, and
+`target`. -/
+def evalMirStep (adts : List AdtDecl)
+    (bodies : List BodyDecl := []) (rootBody : MirBody)
+    (s : MirState) (target : TargetLayout := defaultTargetLayout) :
+    RawStep MirState MirReturn :=
+  evalMirStepDepth adts bodies target 2 rootBody s
 
 /-- Relational step transition of a `MirBody`. -/
 abbrev MirStep (adts : List AdtDecl) (bodies : List BodyDecl := [])
     (body : MirBody) (s : MirState)
     (r : StepResult MirState Empty MirReturn) : Prop :=
-  r = evalMirStep adts bodies body s
+  r = (evalMirStep adts bodies body s).toStepResult
 
 /-! ## Post-monomorphization constants -/
 
@@ -1066,14 +1670,6 @@ inductive RequiresConst (bodies : List BodyDecl) :
       RequiresConst bodies
         ((findBody bodies calleeId).bind (MirBody.subst typeArgs)) d →
       RequiresConst bodies (some body) d
-
-/-- Canonical initial state for evaluating a zero-argument compile-time constant
-`MirBody` under `tySizes`. -/
-def constEntryState (tySizes : Nat → Nat) : MirState where
-  locals := fun _ => none
-  block := 0
-  stmtIdx := 0
-  tySizes := tySizes
 
 /-- Compile-Time Function Evaluation (CTFE) success predicate
 (`src/const_eval.md#L1-L25`):
@@ -1167,9 +1763,8 @@ shape affects only the functions that mention it. -/
 def AdmissibleAdtInv (adts : List AdtDecl) (adtInv : AdtInv) : Prop :=
   NoDupIds (adts.map AdtDecl.id) ∧
   ∀ decl, decl ∈ adts → decl.allFieldsPubSafe = true →
-    ∀ (s : MirState) (payload : MirTy) (inner : MirVal),
-      decl.payloadTy = some payload →
-      inner.valid adts defaultAdtInv s 0 payload →
+    ∀ (s : MirState) (inner : MirVal),
+      validAdtDecl (MirVal.valid adts defaultAdtInv s 0) decl inner →
       adtInv decl.id inner
 
 /-- Postcondition asserting that a normal return value equals the initial value
@@ -1202,6 +1797,20 @@ abbrev Crate.adtInv (c : Crate) : AdtInv :=
   denoteAdtInv c.adts
 
 /-! ## Contract well-formedness, obligations, and `CrateTheorem` -/
+
+/-- Whether `tcb` carries a `TCBItem.compileTimeGuard` waiver for `fn`. -/
+def hasCompileTimeGuardWaiver (fn : CapturedFn) (tcb : List TCBItem) : Bool :=
+  tcb.any fun
+    | .compileTimeGuard name bodyId =>
+      name == fn.name && bodyId.index == fn.bodyId.index
+    | _ => false
+
+/-- Whether `tcb` carries a `TCBItem.pinnedCompilerCoupled` waiver for `fn`. -/
+def hasPinnedCoupledWaiver (fn : CapturedFn) (tcb : List TCBItem) : Bool :=
+  tcb.any fun
+    | .pinnedCompilerCoupled name bodyId _ =>
+      name == fn.name && bodyId.index == fn.bodyId.index
+    | _ => false
 
 /-- Post-monomorphization contract completeness (`MonoConstsWf`) for `fn` and
 `body`:
@@ -1271,22 +1880,40 @@ an initialized entry state (`initMirState`), arguments valid under the crate's
 library representation invariant `adtInv`, and—only when `fn.isUnsafe = true`—
 the function's `# Safety` precondition `fn.safetyPre`. Safe functions
 (`fn.isUnsafe = false`) cannot assume `fn.safetyPre` to avoid undefined behavior
-or violate library representation invariants. -/
+or violate library representation invariants. When a
+`TCBItem.pinnedCompilerCoupled` waiver is present in `tcb`, the precondition
+additionally restricts `s.adtPad` to the pinned compiler's zero-extra-padding
+world (`s.adtPad = fun _ => 0`). -/
 def SafetyPre (adts : List AdtDecl) (bodies : List BodyDecl)
     (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody)
-    (s : MirState) : Prop :=
+    (s : MirState) (tcb : List TCBItem := []) : Prop :=
   initMirState adts bodies body s ∧
   argsMatchInv adts adtInv body.localCount s body.argTys ∧
-  (fn.isUnsafe = true → fn.safetyPre s)
+  (if hasPinnedCoupledWaiver fn tcb then
+     s.adtPad = (fun _ => 0) ∧ (fn.isUnsafe = true → fn.safetyPre s)
+   else
+     (fn.isUnsafe = true → fn.safetyPre s))
 
-/-- Mandatory return-validity postcondition: any normal return yields a value
-that is valid (including `adtInv`) in the terminal state, with references
-restricted to caller-owned referents. -/
+/-- Mandatory return-validity and compile-time guard postcondition:
+1. Any normal return yields a value that is valid (including `adtInv`) in the
+   terminal state, with references restricted to caller-owned referents.
+2. When `allowCompileTimeGuard` is `false` (no `TCBItem.compileTimeGuard` waiver
+   in `Crate.tcb`), execution never terminates with `.compileTimeError` in any
+   layout or type-parameter world. When `allowCompileTimeGuard` is `true`,
+   `.compileTimeError` may prune incompatible layout or type-parameter worlds,
+   provided execution still never hits `.compileTimeError` in the pinned
+   zero-extra-padding world (`s.adtPad = fun _ => 0` and `s.tySizes = fun _ => 8`). -/
 def SafetyPost (adts : List AdtDecl) (adtInv : AdtInv)
-    (body : MirBody) (_s : MirState)
-    (out : EventualOut Empty MirReturn) : Prop :=
-  ∀ tr r, out = .terminated tr (.normal r) →
-    r.value.valid adts adtInv r.state body.localCount body.retTy
+    (body : MirBody) (s : MirState)
+    (out : EventualOut Empty MirReturn)
+    (allowCompileTimeGuard : Bool := false) : Prop :=
+  (∀ tr r, out = .terminated tr (.normal r) →
+    r.value.valid adts adtInv r.state body.localCount body.retTy) ∧
+  (if allowCompileTimeGuard then
+     s.adtPad = (fun _ => 0) ∧ s.tySizes = (fun _ => 8) →
+       ∀ tr, out ≠ .terminated tr .compileTimeError
+   else
+     ∀ tr, out ≠ .terminated tr .compileTimeError)
 
 /-- Conjunction of all user-declared postconditions (`fn.specs`) evaluated at
 initial state `s` and outcome `out`. -/
@@ -1304,34 +1931,37 @@ def ContractPost (adts : List AdtDecl) (bodies : List BodyDecl)
 `SpecOn (SafetyPre ∧ fn.safetyPre) ContractPost`. -/
 def EffectivePost (adts : List AdtDecl) (bodies : List BodyDecl)
     (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody)
-    (s : MirState) (out : EventualOut Empty MirReturn) : Prop :=
-  SafetyPost adts adtInv body s out ∧
+    (s : MirState) (out : EventualOut Empty MirReturn)
+    (tcb : List TCBItem := []) : Prop :=
+  SafetyPost adts adtInv body s out (hasCompileTimeGuardWaiver fn tcb) ∧
   (fn.safetyPre s → ContractPost adts bodies fn s out)
 
 /-- Behavioral verification of a single lowered `MirBody` (`bodyId` or
 `debugBodyId`) for `fn`. -/
 def FnBodyVerified (adts : List AdtDecl) (bodies : List BodyDecl)
-    (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody) : Prop :=
+    (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody)
+    (tcb : List TCBItem := []) : Prop :=
   (MirLang adts bodies).Verified
-    (SafetyPre adts bodies adtInv fn body)
-    (EffectivePost adts bodies adtInv fn body)
+    (fun s => SafetyPre adts bodies adtInv fn body s tcb)
+    (fun s out => EffectivePost adts bodies adtInv fn body s out tcb)
     body
 
 /-- Behavioral verification of `fn` across both `fn.bodyId` (`--release`) and
 optional `fn.debugBodyId` (`--debug`). -/
 def FnVerified (adts : List AdtDecl) (bodies : List BodyDecl)
-    (adtInv : AdtInv) (fn : CapturedFn) : Prop :=
-  FnBodyVerified adts bodies adtInv fn (fn.resolveBody bodies) ∧
+    (adtInv : AdtInv) (fn : CapturedFn) (tcb : List TCBItem := []) : Prop :=
+  FnBodyVerified adts bodies adtInv fn (fn.resolveBody bodies) tcb ∧
   match fn.debugBodyId with
   | none => True
   | some dbgId =>
-    FnBodyVerified adts bodies adtInv fn (resolveBodyById bodies dbgId)
+    FnBodyVerified adts bodies adtInv fn (resolveBodyById bodies dbgId) tcb
 
 /-- Named behavioral verification obligation for `fn`. -/
 def CapturedFn.obligation (adts : List AdtDecl) (bodies : List BodyDecl)
-    (adtInv : AdtInv) (fn : CapturedFn) : Obligation ObligationId where
+    (adtInv : AdtInv) (fn : CapturedFn) (tcb : List TCBItem := []) :
+    Obligation ObligationId where
   id := .fnBody fn.name
-  prop := FnVerified adts bodies adtInv fn
+  prop := FnVerified adts bodies adtInv fn tcb
 
 /-- Top-level theorem required of every verified Rust crate:
 1. Non-empty function inventory (`c.functions ≠ []`),
@@ -1348,6 +1978,6 @@ def CrateTheorem (c : Crate) : Prop :=
   AdmissibleAdtInv c.adts c.adtInv ∧
   AllHold (c.functions.map (FnContractWellFormed c.adts c.bodies)) ∧
   VerificationResult c.tcbWaivedIds
-    (c.functions.map (fun fn => fn.obligation c.adts c.bodies c.adtInv))
+    (c.functions.map (fun fn => fn.obligation c.adts c.bodies c.adtInv c.tcb))
 
 end Trusted

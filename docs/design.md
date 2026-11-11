@@ -313,6 +313,18 @@ verification on any item requires an explicit `#[anneal::trusted(reason =
 "...")]` waiver recorded in `anneal-tcb.lock`, while `ContractWellFormed`
 remains unwaivable across all items.
 
+To ensure baseline safety proofs remain sound across compiler versions and
+layout flags (such as `-Z randomize-layout`), Anneal models target layouts
+(`TargetLayout`), multi-field ADT representations (`AdtRepr.rust`,
+`AdtRepr.transparent`, `AdtRepr.c`), layout queries (`Terminator.callLayout` for
+`size_of` and `align_of`), assertion failure classifications (`AssertFailKind`),
+and two-stage transmutation (`evalTransmuteVal`) directly in the reference
+semantics. `#[repr(Rust)]` structs carry universally quantified padding
+(`MirState.adtPad`), while inline `const { ... }` guards (`Stmt.evalConst`) step
+failing instantiations cleanly to `TerminationKind.compileTimeError` and
+classify layout assumptions along the `S0`–`S3` forward-compatibility tiers (see
+[`docs/architecture.md`](architecture.md)).
+
 ### 2. Preconditions, postconditions, and invariants
 
 Functions and types can attach relational pre- and postconditions

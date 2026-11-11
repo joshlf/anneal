@@ -47,252 +47,19 @@ abbrev locPlace (idx : Nat) : Place :=
 -/
 
 /-- `MirMachine adts bodies` is total: every `(body, s)` pair steps to
-`evalMirStep adts bodies body s`. -/
+`(evalMirStep adts bodies body s).toStepResult`. -/
 theorem mirMachine_total (adts : List AdtDecl := [])
     (bodies : List BodyDecl := []) :
     TotalStep (MirMachine adts bodies) :=
-  fun body s => ⟨evalMirStep adts bodies body s, rfl⟩
-
-theorem silent_choice_inhabited {s' : MirState} {branches : MirState → Prop}
-    (h : StepResult.choice (Obs := Empty) (Val := MirReturn) branches =
-      .silent s') :
-    ∃ s₂, branches s₂ := by
-  injection h with hbr
-  subst hbr
-  exact ⟨s', rfl⟩
-
-theorem choice_inhabited_of_if_failed {P : Prop} [Decidable P]
-    {a : StepResult MirState Empty MirReturn} {branches : MirState → Prop}
-    (ha : StepResult.choice branches = a → ∃ s', branches s') :
-    StepResult.choice branches = (if P then a else .failed) →
-    ∃ s', branches s' := by
-  cases ‹Decidable P› with
-  | isFalse _ => intro h; cases h
-  | isTrue _ => exact ha
-
-theorem nextStmt_choice_inhabited (s : MirState)
-    (locals' : Nat → Option MirVal) (branches : MirState → Prop) :
-    StepResult.choice branches = s.nextStmt locals' →
-    ∃ s', branches s' := by
-  cases s; exact silent_choice_inhabited
-
-theorem nextStmtGen_choice_inhabited (s : MirState)
-    (locals' : Nat → Option MirVal) (localGens' : Nat → Nat)
-    (branches : MirState → Prop) :
-    StepResult.choice branches = s.nextStmtGen locals' localGens' →
-    ∃ s', branches s' := by
-  cases s; exact silent_choice_inhabited
-
-theorem gotoBlock_choice_inhabited (s : MirState)
-    (locals' : Nat → Option MirVal) (target : Nat)
-    (branches : MirState → Prop) :
-    StepResult.choice branches = s.gotoBlock locals' target →
-    ∃ s', branches s' := by
-  cases s; exact silent_choice_inhabited
-
-theorem assignPlace_choice_inhabited (localCount : Nat)
-    (locals : Nat → Option MirVal) (dst : Place) (val : MirVal)
-    (s : MirState) (branches : MirState → Prop) :
-    StepResult.choice branches =
-      (match assignPlace localCount locals dst val with
-       | some locals' => s.nextStmt locals'
-       | none => .failed) →
-    ∃ s', branches s' := by
-  cases assignPlace localCount locals dst val with
-  | none => intro h; cases h
-  | some _ => exact nextStmt_choice_inhabited s _ branches
-
-theorem evalMirStmt_choice_inhabited (adts : List AdtDecl) (active : MirBody)
-    (s : MirState) (stmt : Stmt) (branches : MirState → Prop) :
-    StepResult.choice branches = evalMirStmt active s stmt adts →
-    ∃ s', branches s' := by
-  cases stmt with
-  | assign dst rv =>
-    cases rv with
-    | use op =>
-      dsimp [evalMirStmt]
-      cases evalOperand active.localCount s op with
-      | none => intro h; cases h
-      | some p =>
-        exact assignPlace_choice_inhabited active.localCount p.2 dst p.1 s
-          branches
-    | binaryOp op lhs rhs =>
-      dsimp [evalMirStmt]
-      cases evalOperand active.localCount s lhs with
-      | none => intro h; cases h
-      | some p1 =>
-        dsimp
-        cases evalOperand active.localCount { s with locals := p1.2 } rhs with
-        | none => intro h; cases h
-        | some p2 =>
-          dsimp
-          cases evalBinOp op p1.1 p2.1 with
-          | none => intro h; cases h
-          | some outVal =>
-            exact assignPlace_choice_inhabited active.localCount p2.2 dst
-              outVal s branches
-    | aggregate adtId op =>
-      dsimp [evalMirStmt]
-      refine choice_inhabited_of_if_failed ?_
-      cases evalOperand active.localCount s op with
-      | none => intro h; cases h
-      | some p =>
-        exact assignPlace_choice_inhabited active.localCount p.2 dst
-          (.adt adtId p.1) s branches
-    | ref src =>
-      dsimp [evalMirStmt]
-      cases evalRefPlace active.localCount s src with
-      | none => intro h; cases h
-      | some refVal =>
-        exact assignPlace_choice_inhabited active.localCount s.locals dst
-          refVal s branches
-    | _ => intro h; cases h
-  | placeMention p =>
-    dsimp [evalMirStmt]
-    cases p.projection with
-    | nil =>
-      dsimp
-      exact choice_inhabited_of_if_failed
-        (nextStmt_choice_inhabited s _ branches)
-    | cons _ _ =>
-      dsimp
-      cases evalPlace active.localCount s _ with
-      | none => intro h; cases h
-      | some _ => exact nextStmt_choice_inhabited s _ branches
-  | storageLive _ =>
-    dsimp [evalMirStmt]
-    exact choice_inhabited_of_if_failed
-      (nextStmtGen_choice_inhabited s _ _ branches)
-  | storageDead _ =>
-    dsimp [evalMirStmt]
-    exact choice_inhabited_of_if_failed
-      (nextStmtGen_choice_inhabited s _ _ branches)
-  | nop | constEvalCounter => exact nextStmt_choice_inhabited s _ branches
-  | _ => intro h; cases h
-
-theorem evalMirTerminator_choice_inhabited (adts : List AdtDecl)
-    (bodies : List BodyDecl) (active : MirBody) (s : MirState)
-    (term : Terminator) (branches : MirState → Prop) :
-    StepResult.choice branches = evalMirTerminator adts bodies active s term →
-    ∃ s', branches s' := by
-  cases term with
-  | return_ =>
-    dsimp [evalMirTerminator]
-    refine choice_inhabited_of_if_failed ?_
-    cases s.locals 0 with
-    | none => intro h; cases h
-    | some retVal =>
-      dsimp
-      refine choice_inhabited_of_if_failed ?_
-      cases s.stack with
-      | nil => intro h; cases h
-      | cons frame restStack =>
-        dsimp
-        refine choice_inhabited_of_if_failed ?_
-        cases assignPlace frame.callerBody.localCount frame.callerLocals
-            frame.retDst retVal with
-        | none => intro h; cases h
-        | some _ => exact silent_choice_inhabited
-  | goto _ =>
-    dsimp [evalMirTerminator]
-    exact choice_inhabited_of_if_failed
-      (gotoBlock_choice_inhabited s _ _ branches)
-  | unreachable => intro h; cases h
-  | panic hasCleanup =>
-    dsimp [evalMirTerminator]
-    cases hasCleanup || !s.stack.isEmpty <;> (intro h; cases h)
-  | assert cond expected _ hasCleanup =>
-    dsimp [evalMirTerminator]
-    cases evalOperand active.localCount s cond with
-    | none => intro h; cases h
-    | some p =>
-      cases p with
-      | mk v _ =>
-        cases v with
-        | bool b =>
-          dsimp
-          cases b == expected with
-          | false =>
-            dsimp
-            cases hasCleanup || !s.stack.isEmpty <;> (intro h; cases h)
-          | true =>
-            dsimp
-            exact choice_inhabited_of_if_failed
-              (gotoBlock_choice_inhabited s _ _ branches)
-        | _ => intro h; cases h
-  | switchInt discr _ _ =>
-    dsimp [evalMirTerminator]
-    cases evalOperand active.localCount s discr with
-    | none => intro h; cases h
-    | some p =>
-      cases p with
-      | mk v _ =>
-        cases v with
-        | bool b =>
-          cases b <;>
-            (dsimp; exact choice_inhabited_of_if_failed
-              (gotoBlock_choice_inhabited s _ _ branches))
-        | _ => intro h; cases h
-  | callSizeOf dst ty _ =>
-    dsimp [evalMirTerminator]
-    refine choice_inhabited_of_if_failed ?_
-    cases evalTyByteSize adts s.tySizes ty with
-    | none => intro h; cases h
-    | some sz =>
-      dsimp
-      cases assignPlace active.localCount s.locals dst (.usize sz) with
-      | none => intro h; cases h
-      | some _ => exact gotoBlock_choice_inhabited s _ _ branches
-  | callTransmuteCopy dst srcTy dstTy op _ =>
-    dsimp [evalMirTerminator]
-    refine choice_inhabited_of_if_failed ?_
-    cases evalOperand active.localCount s op with
-    | none => intro h; cases h
-    | some p =>
-      dsimp
-      cases evalTransmuteCopy adts { s with locals := p.2 }
-          srcTy dstTy p.1 with
-      | none => intro h; cases h
-      | some outVal =>
-        dsimp
-        cases assignPlace active.localCount p.2 dst outVal with
-        | none => intro h; cases h
-        | some _ => exact gotoBlock_choice_inhabited s _ _ branches
-  | call1 _ calleeId arg _ typeArgs =>
-    dsimp [evalMirTerminator]
-    cases (findBody bodies calleeId).bind (MirBody.subst typeArgs) with
-    | none => intro h; cases h
-    | some instCallee =>
-      dsimp [Option.elim]
-      refine choice_inhabited_of_if_failed ?_
-      cases evalOperand active.localCount s arg with
-      | none => intro h; cases h
-      | some _ => intro h; exact silent_choice_inhabited h
-  | _ => intro h; cases h
+  fun body s => ⟨(evalMirStep adts bodies body s).toStepResult, rfl⟩
 
 /-- `MirMachine adts bodies` has no empty choice nodes (`evalMirStep` only
-emits `.silent` choices, which are uniquely inhabited). -/
+emits `.silent` choices via `RawStep.toStepResult`, which are uniquely
+inhabited). -/
 theorem mirMachine_inhabited (adts : List AdtDecl := [])
     (bodies : List BodyDecl := []) :
-    InhabitedDemonic (MirMachine adts bodies) := by
-  intro body s branches hstep
-  have h : StepResult.choice branches = evalMirStep adts bodies body s := hstep
-  dsimp [evalMirStep] at h
-  revert h
-  cases lookupAt (s.curBody.getD body).blocks s.block with
-  | none => intro h; cases h
-  | some bb =>
-    intro h
-    dsimp at h
-    revert h
-    cases lookupAt bb.stmts s.stmtIdx with
-    | none =>
-      exact choice_inhabited_of_if_failed
-        (evalMirTerminator_choice_inhabited adts bodies (s.curBody.getD body) s
-          bb.terminator branches)
-    | some stmt =>
-      exact evalMirStmt_choice_inhabited adts (s.curBody.getD body) s stmt
-        branches
+    InhabitedDemonic (MirMachine adts bodies) :=
+  fun _ _ _ hstep => RawStep.toStepResult_choice_inhabited hstep
 
 /-- Postcondition `EnsuresEqArg argLocal adts bodies` refines
 `wellFormed (MirLang adts bodies)`. -/
@@ -427,6 +194,21 @@ theorem contractWellFormed_of_simple {adts : List AdtDecl}
    monoConstsWf_of_all_monoAdmitted hwf
      (fun _ => monoAdmitted_of_simple hrc hcalls)⟩
 
+theorem toStepResult_of_silent {s' : MirState}
+    {r : RawStep MirState MirReturn} (h : r = .silent s') :
+    r.toStepResult (Obs := Empty) = StepResult.silent s' :=
+  congrArg RawStep.toStepResult h
+
+theorem toStepResult_of_terminated {term : TerminationKind MirReturn}
+    {r : RawStep MirState MirReturn} (h : r = .terminated term) :
+    r.toStepResult (Obs := Empty) = StepResult.terminated term :=
+  congrArg RawStep.toStepResult h
+
+theorem toStepResult_of_failed {r : RawStep MirState MirReturn}
+    (h : r = .failed) :
+    r.toStepResult (Obs := Empty) = StepResult.failed :=
+  congrArg RawStep.toStepResult h
+
 theorem reachesPrefix_of_step
     {adts : List AdtDecl} {bodies : List BodyDecl} {body : MirBody}
     {s s' : MirState} {n : Nat} {tr : List Empty}
@@ -435,30 +217,35 @@ theorem reachesPrefix_of_step
     (hreach : ReachesPrefix (MirStep adts bodies) body n s tr out) :
     out = .running s ∨
       ∃ n' tr', ReachesPrefix (MirStep adts bodies) body n' s' tr' out := by
+  have hstepR := toStepResult_of_silent hstep
   cases hreach with
   | zero => exact Or.inl rfl
   | step _ _ _ obs _ _ _ _ => nomatch obs
   | choice n' _ s₂ branches _ _ h1 hbr hr =>
-    have h1' : StepResult.choice branches = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'
+    have h1' :
+        StepResult.choice branches =
+          (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'
     injection h1' with hbr_eq
     subst hbr_eq
     subst hbr
     exact Or.inr ⟨n', tr, hr⟩
   | emptyChoice _ _ branches h1 hemp =>
-    have h1' : StepResult.choice branches = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'
+    have h1' :
+        StepResult.choice branches =
+          (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'
     injection h1' with hbr_eq
     subst hbr_eq
     exact False.elim (hemp ⟨s', rfl⟩)
   | terminated _ _ _ h1 =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | failed _ _ h1 =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | noStep _ _ hno =>
-    exact False.elim (hno ⟨_, hstep.symm⟩)
+    exact False.elim (hno ⟨_, hstepR.symm⟩)
 
 theorem reachesPrefix_of_terminated
     {adts : List AdtDecl} {bodies : List BodyDecl} {body : MirBody}
@@ -468,31 +255,37 @@ theorem reachesPrefix_of_terminated
     (hstep : evalMirStep adts bodies body s = .terminated term)
     (hreach : ReachesPrefix (MirStep adts bodies) body n s tr out) :
     out = .running s ∨ out = .terminated term := by
+  have hstepR := toStepResult_of_terminated hstep
   cases hreach with
   | zero => exact Or.inl rfl
   | step _ _ _ obs _ _ _ _ => nomatch obs
   | choice _ _ _ _ _ _ h1 _ _ =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | emptyChoice _ _ _ h1 _ =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | terminated _ _ t h1 =>
-    have h1' : StepResult.terminated t = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'
+    have h1' :
+        StepResult.terminated t =
+          (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'
     injection h1' with ht
     subst ht
     exact Or.inr rfl
   | failed _ _ h1 =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | noStep _ _ hno =>
-    exact False.elim (hno ⟨_, hstep.symm⟩)
+    exact False.elim (hno ⟨_, hstepR.symm⟩)
 
-/-- Combined prefix-safety and normal-return postcondition predicate. -/
+/-- Combined prefix-safety, normal-return postcondition, and
+compile-time-error-freedom predicate. -/
 def SafeAndEnsures (P : MirReturn → Prop)
     (out : PrefixOutcome MirState MirReturn) : Prop :=
-  out.isSafe ∧ ∀ ret, out = .terminated (.normal ret) → P ret
+  out.isSafe ∧
+  (∀ ret, out = .terminated (.normal ret) → P ret) ∧
+  out ≠ .terminated .compileTimeError
 
 theorem reachesPrefix_safeAndEnsures_of_step
     {adts : List AdtDecl} {bodies : List BodyDecl} {body : MirBody}
@@ -507,7 +300,7 @@ theorem reachesPrefix_safeAndEnsures_of_step
   cases reachesPrefix_of_step hstep hreach with
   | inl hrun =>
     subst hrun
-    exact ⟨True.intro, fun _ h => by cases h⟩
+    exact ⟨True.intro, (fun _ h => by cases h), (fun h => by cases h)⟩
   | inr hex =>
     cases hex with
     | intro n' htr =>
@@ -526,10 +319,10 @@ theorem reachesPrefix_safeAndEnsures_of_normal
   cases reachesPrefix_of_terminated hstep hreach with
   | inl hrun =>
     subst hrun
-    exact ⟨True.intro, fun _ h => by cases h⟩
+    exact ⟨True.intro, (fun _ h => by cases h), (fun h => by cases h)⟩
   | inr hterm =>
     subst hterm
-    refine ⟨True.intro, ?_⟩
+    refine ⟨True.intro, ?_, (fun h => by cases h)⟩
     intro ret hret
     injection hret with h1
     injection h1 with h2
@@ -572,14 +365,15 @@ theorem reachesPrefix_not_normal_of_failed
     (hreach : ReachesPrefix (MirStep adts bodies) body n s tr
       (.terminated (.normal v))) :
     False := by
+  have hstepR := toStepResult_of_failed hstep
   cases hreach with
   | step _ _ _ obs _ _ _ _ => nomatch obs
   | choice _ _ _ _ _ _ h1 _ _ =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | terminated _ _ _ h1 =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
 
 /-- Inductive unwind-termination symbolic execution relation for a `MirBody`. -/
 inductive ExecUnwind (adts : List AdtDecl := []) (bodies : List BodyDecl := [])
@@ -603,9 +397,10 @@ theorem execUnwind_reaches {adts : List AdtDecl} {bodies : List BodyDecl}
     cases ih with
     | intro n hr =>
       exact ⟨n + 1,
-        .choice n _ _ _ [] (.terminated .unwind) hstep.symm rfl hr⟩
+        .choice n _ _ _ [] (.terminated .unwind)
+          (toStepResult_of_silent hstep).symm rfl hr⟩
   | unwind hterm =>
-    exact ⟨1, .terminated 0 _ .unwind hterm.symm⟩
+    exact ⟨1, .terminated 0 _ .unwind (toStepResult_of_terminated hterm).symm⟩
 
 /-- No prefix from an `ExecUnwind` state can terminate normally. -/
 theorem execUnwind_not_normal {adts : List AdtDecl} {bodies : List BodyDecl}
@@ -621,9 +416,66 @@ theorem execUnwind_not_normal {adts : List AdtDecl} {bodies : List BodyDecl}
     intro n tr v hreach
     exact reachesPrefix_not_normal_of_unwind hterm hreach
 
+/-- Inductive compile-time-error symbolic execution relation for a `MirBody`. -/
+inductive ExecCompileTimeError (adts : List AdtDecl := [])
+    (bodies : List BodyDecl := []) (body : MirBody) : MirState → Prop where
+  | step {s s' : MirState} :
+      evalMirStep adts bodies body s = .silent s' →
+      ExecCompileTimeError adts bodies body s' →
+      ExecCompileTimeError adts bodies body s
+  | compileTimeError {s : MirState} :
+      evalMirStep adts bodies body s = .terminated .compileTimeError →
+      ExecCompileTimeError adts bodies body s
+
+theorem execCompileTimeError_reaches {adts : List AdtDecl}
+    {bodies : List BodyDecl} {body : MirBody} {s : MirState}
+    (hexec : ExecCompileTimeError adts bodies body s) :
+    ∃ n,
+      ReachesPrefix (MirStep adts bodies) body n s []
+        (.terminated .compileTimeError) := by
+  induction hexec with
+  | step hstep _ ih =>
+    cases ih with
+    | intro n hr =>
+      exact ⟨n + 1,
+        .choice n _ _ _ [] (.terminated .compileTimeError)
+          (toStepResult_of_silent hstep).symm rfl hr⟩
+  | compileTimeError hterm =>
+    exact ⟨1,
+      .terminated 0 _ .compileTimeError
+        (toStepResult_of_terminated hterm).symm⟩
+
+theorem execCompileTimeError_safe_and_not_normal {adts : List AdtDecl}
+    {bodies : List BodyDecl} {body : MirBody} {s : MirState}
+    (hexec : ExecCompileTimeError adts bodies body s) :
+    ∀ {n : Nat} {tr : List Empty} {out : PrefixOutcome MirState MirReturn},
+      ReachesPrefix (MirStep adts bodies) body n s tr out →
+      out.isSafe ∧ ∀ ret, out ≠ .terminated (.normal ret) := by
+  induction hexec with
+  | step hstep _ ih =>
+    intro n tr out hreach
+    cases reachesPrefix_of_step hstep hreach with
+    | inl hrun =>
+      subst hrun
+      exact ⟨True.intro, fun _ h => by cases h⟩
+    | inr hex =>
+      cases hex with
+      | intro n' htr =>
+        cases htr with
+        | intro tr' hr' => exact ih hr'
+  | compileTimeError hterm =>
+    intro n tr out hreach
+    cases reachesPrefix_of_terminated hterm hreach with
+    | inl hrun =>
+      subst hrun
+      exact ⟨True.intro, fun _ h => by cases h⟩
+    | inr herr =>
+      subst herr
+      exact ⟨True.intro, fun _ h => by cases h⟩
+
 /-- Every prefix reachable from a state satisfying
-`ExecNormal adts bodies body s P` is safe and satisfies `P` on normal
-termination. -/
+`ExecNormal adts bodies body s P` is safe, satisfies `P` on normal
+termination, and never terminates with `.compileTimeError`. -/
 theorem execNormal_safeAndEnsures {adts : List AdtDecl} {bodies : List BodyDecl}
     {body : MirBody} {s : MirState} {P : MirReturn → Prop}
     (hexec : ExecNormal adts bodies body s P) :
@@ -654,10 +506,12 @@ theorem execNormal_reaches {adts : List AdtDecl} {bodies : List BodyDecl}
       cases hn with
       | intro v hv =>
         exact ⟨n + 1, v,
-          .choice n _ _ _ [] (.terminated (.normal v)) hstep.symm rfl hv.1,
+          .choice n _ _ _ [] (.terminated (.normal v))
+            (toStepResult_of_silent hstep).symm rfl hv.1,
           hv.2⟩
   | normal hterm hp =>
-    exact ⟨1, _, .terminated 0 _ (.normal _) hterm.symm, hp⟩
+    exact ⟨1, _,
+      .terminated 0 _ (.normal _) (toStepResult_of_terminated hterm).symm, hp⟩
 
 /-- `ExecNormal` implies conditional specification refinement `SpecOn`. -/
 theorem execNormal_specOn {adts : List AdtDecl} {bodies : List BodyDecl}
@@ -670,7 +524,7 @@ theorem execNormal_specOn {adts : List AdtDecl} {bodies : List BodyDecl}
   refine eventualBehaviorOf_le_normalSpecOn (M := MirMachine adts bodies) ?_
   intro init _ _ out hpre hpfx
   have hsafe := execNormal_safeAndEnsures (h_exec init hpfx.1 hpre) hpfx.2
-  exact ⟨hsafe.1, hsafe.2⟩
+  exact ⟨hsafe.1, hsafe.2.1⟩
 
 /-- `ExecNormal` implies unconditional specification refinement `Spec`. -/
 theorem execNormal_spec {adts : List AdtDecl} {bodies : List BodyDecl}
@@ -696,10 +550,13 @@ theorem execNormal_spec_on_pre {adts : List AdtDecl} {bodies : List BodyDecl}
 from any `SpecOn` proof on a weaker or equal precondition `pre0`. -/
 theorem specOn_contractPost_nil {adts : List AdtDecl} {bodies : List BodyDecl}
     {fn : CapturedFn} {body : MirBody} {pre0 pre : MirState → Prop}
+    {allowGuard : Bool}
     (himp : ∀ s, pre s → pre0 s)
     (h0 :
       MirSem adts bodies body ≤
-        (MirLang adts bodies).SpecOn pre0 (SafetyPost adts (denoteAdtInv adts) body))
+        (MirLang adts bodies).SpecOn pre0
+          (fun s out =>
+            SafetyPost adts (denoteAdtInv adts) body s out allowGuard))
     (hspecs : fn.specs = [] := by rfl) :
     MirSem adts bodies body ≤
       (MirLang adts bodies).SpecOn pre (ContractPost adts bodies fn) := by
@@ -735,9 +592,11 @@ def NonVacuousOn {Query : Type u} (dom pre : Query → Prop) : Prop :=
 
 /-- Return-value library-invariant postcondition behavior on `pre`. -/
 def EnsuresRetLibInv (adts : List AdtDecl) (bodies : List BodyDecl := [])
-    (adtInv : AdtInv) (body : MirBody) (pre : MirState → Prop) :
+    (adtInv : AdtInv) (body : MirBody) (pre : MirState → Prop)
+    (allowCompileTimeGuard : Bool := false) :
     (MirLang adts bodies).Behavior :=
-  (MirLang adts bodies).SpecOn pre (SafetyPost adts adtInv body)
+  (MirLang adts bodies).SpecOn pre
+    (fun s out => SafetyPost adts adtInv body s out allowCompileTimeGuard)
 
 /-- Effective precondition (`initMirState ∧ argsMatchInv ∧ fn.safetyPre`) on
 `fn.resolveBody bodies`. -/
@@ -783,48 +642,190 @@ theorem execNormal_verified {adts : List AdtDecl} {bodies : List BodyDecl}
     | intro v hv =>
       exact ⟨hdef, .terminated [] (.normal v), hinit, n, hv.1⟩
 
+/-- `ExecNormal` on `pre` discharges `SpecOn pre (SafetyPost ...)` for any
+`allowCompileTimeGuard` flag. -/
+theorem execNormal_safetyPost {adts : List AdtDecl} {bodies : List BodyDecl}
+    {adtInv : AdtInv} {body : MirBody} {pre : MirState → Prop}
+    {allowGuard : Bool}
+    (h_exec : ∀ s, pre s →
+      ExecNormal adts bodies body s (fun r =>
+        r.value.valid adts adtInv r.state body.localCount body.retTy)) :
+    MirSem adts bodies body ≤
+      (MirLang adts bodies).SpecOn pre
+        (fun s out => SafetyPost adts adtInv body s out allowGuard) := by
+  intro s hpre
+  refine ⟨fun _ n tr oc hreach =>
+    (execNormal_safeAndEnsures (h_exec s hpre) hreach).1, ?_⟩
+  intro out hval
+  refine ⟨?_, ?_⟩
+  · intro tr ret hout
+    subst hout
+    cases hval.2 with
+    | intro n hreach =>
+      exact (execNormal_safeAndEnsures (h_exec s hpre) hreach).2.1 ret rfl
+  · have hnoErr : ∀ tr, out ≠ .terminated tr .compileTimeError := by
+      intro tr hout
+      subst hout
+      cases hval.2 with
+      | intro n hreach =>
+        exact (execNormal_safeAndEnsures (h_exec s hpre) hreach).2.2 rfl
+    cases allowGuard with
+    | false => exact hnoErr
+    | true => exact fun _ => hnoErr
+
+/-- Discharge `(MirLang adts bodies).Verified pre (SafetyPost ...) body` from
+`StaticBodyWf` and `ExecNormal`. -/
+theorem execNormal_safetyVerified {adts : List AdtDecl} {bodies : List BodyDecl}
+    {adtInv : AdtInv} {body : MirBody} {pre : MirState → Prop}
+    {allowGuard : Bool}
+    (hwf : StaticBodyWf adts body)
+    (h_pre_init : ∀ s, pre s → initMirState adts bodies body s)
+    (h_exec : ∀ s, pre s →
+      ExecNormal adts bodies body s (fun r =>
+        r.value.valid adts adtInv r.state body.localCount body.retTy)) :
+    (MirLang adts bodies).Verified pre
+      (fun s out => SafetyPost adts adtInv body s out allowGuard)
+      body := by
+  have h_spec := execNormal_safetyPost (allowGuard := allowGuard) h_exec
+  refine ⟨hwf, ?_, h_spec⟩
+  intro s hpre
+  have hinit : initMirState adts bodies body s := h_pre_init s hpre
+  have hdef : (MirSem adts bodies body s).defined := (h_spec s hpre).1
+  cases execNormal_reaches (h_exec s hpre) with
+  | intro n hn =>
+    cases hn with
+    | intro v hv =>
+      exact ⟨hdef, .terminated [] (.normal v), hinit, n, hv.1⟩
+
 /-- Combined per-body contract well-formedness (`ContractWellFormed`) and
 baseline safety verification (`(MirLang adts bodies).Verified (SafetyPre ...)
 (SafetyPost ...)`). -/
 abbrev FnBodySafetyVerified (adts : List AdtDecl := [])
     (bodies : List BodyDecl := []) (adtInv : AdtInv) (fn : CapturedFn)
-    (body : MirBody) : Prop :=
+    (body : MirBody) (tcb : List TCBItem := []) : Prop :=
   ContractWellFormed adts bodies fn body ∧
   (MirLang adts bodies).Verified
-    (SafetyPre adts bodies adtInv fn body)
-    (SafetyPost adts adtInv body)
+    (fun s => SafetyPre adts bodies adtInv fn body s tcb)
+    (fun s out =>
+      SafetyPost adts adtInv body s out (hasCompileTimeGuardWaiver fn tcb))
     body
 
 /-- Combined per-function contract well-formedness and baseline safety
 verification for `fn.resolveBody bodies`. -/
 abbrev FnVerifiedAndRetInv (adts : List AdtDecl := [])
-    (bodies : List BodyDecl := []) (adtInv : AdtInv) (fn : CapturedFn) : Prop :=
-  FnBodySafetyVerified adts bodies adtInv fn (fn.resolveBody bodies)
+    (bodies : List BodyDecl := []) (adtInv : AdtInv) (fn : CapturedFn)
+    (tcb : List TCBItem := []) : Prop :=
+  FnBodySafetyVerified adts bodies adtInv fn (fn.resolveBody bodies) tcb
 
 /-- Discharge `FnBodySafetyVerified` directly from `ContractWellFormed` and
 `ExecNormal`. -/
 theorem execNormal_fnBodySafetyVerified {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
-    (body : MirBody)
+    (body : MirBody) {tcb : List TCBItem}
     (hcwf : ContractWellFormed adts bodies fn body)
-    (h_exec : ∀ s, SafetyPre adts bodies adtInv fn body s →
+    (h_exec : ∀ s, SafetyPre adts bodies adtInv fn body s tcb →
       ExecNormal adts bodies body s (fun r =>
         r.value.valid adts adtInv r.state body.localCount body.retTy)) :
-    FnBodySafetyVerified adts bodies adtInv fn body :=
-  ⟨hcwf, execNormal_verified hcwf.1 (fun _ h => h.1) h_exec⟩
+    FnBodySafetyVerified adts bodies adtInv fn body tcb :=
+  ⟨hcwf, execNormal_safetyVerified hcwf.1 (fun _ h => h.1) h_exec⟩
 
 /-- Discharge `FnVerifiedAndRetInv` directly from `ContractWellFormed` and
 `ExecNormal`. -/
 theorem execNormal_fnVerifiedAndRetInv {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
+    {tcb : List TCBItem}
     (hcwf : ContractWellFormed adts bodies fn (fn.resolveBody bodies))
     (h_exec : ∀ s,
-      SafetyPre adts bodies adtInv fn (fn.resolveBody bodies) s →
+      SafetyPre adts bodies adtInv fn (fn.resolveBody bodies) s tcb →
       ExecNormal adts bodies (fn.resolveBody bodies) s (fun r =>
         r.value.valid adts adtInv r.state (fn.resolveBody bodies).localCount
           (fn.resolveBody bodies).retTy)) :
-    FnVerifiedAndRetInv adts bodies adtInv fn :=
+    FnVerifiedAndRetInv adts bodies adtInv fn tcb :=
   execNormal_fnBodySafetyVerified fn (fn.resolveBody bodies) hcwf h_exec
+
+/-- Discharge `FnBodySafetyVerified` when
+`hasCompileTimeGuardWaiver fn tcb = true`, given that execution from any state
+in `SafetyPre` either returns a valid result (`ExecNormal`) or terminates with
+`.compileTimeError` (`ExecCompileTimeError`), and returns normally in the
+zero-extra-padding world
+(`s.adtPad = (fun _ => 0) ∧ s.tySizes = (fun _ => 8)`). -/
+theorem execNormalOrGuard_fnBodySafetyVerified {adts : List AdtDecl}
+    {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
+    (body : MirBody) {tcb : List TCBItem}
+    (hguard : hasCompileTimeGuardWaiver fn tcb = true)
+    (hcwf : ContractWellFormed adts bodies fn body)
+    (h_exec : ∀ s, SafetyPre adts bodies adtInv fn body s tcb →
+      (s.adtPad = (fun _ => 0) ∧ s.tySizes = (fun _ => 8) →
+        ExecNormal adts bodies body s (fun r =>
+          r.value.valid adts adtInv r.state body.localCount body.retTy)) ∧
+      (ExecNormal adts bodies body s (fun r =>
+          r.value.valid adts adtInv r.state body.localCount body.retTy) ∨
+       ExecCompileTimeError adts bodies body s)) :
+    FnBodySafetyVerified adts bodies adtInv fn body tcb := by
+  let pre := fun s => SafetyPre adts bodies adtInv fn body s tcb
+  have h_wf : MirSem adts bodies body ≤ wellFormedOn (MirLang adts bodies) pre := by
+    refine
+      (eventualBehaviorOf_le_wellFormedOn_iff (M := MirMachine adts bodies)).mpr ?_
+    intro s n tr out hpre _ hreach
+    cases (h_exec s hpre).2 with
+    | inl hnorm => exact (execNormal_safeAndEnsures hnorm hreach).1
+    | inr hcte => exact (execCompileTimeError_safe_and_not_normal hcte hreach).1
+  refine ⟨hcwf, hcwf.1, ?_, ?_⟩
+  · intro s hpre
+    have hdef : (MirSem adts bodies body s).defined := (h_wf s hpre).1
+    cases (h_exec s hpre).2 with
+    | inl hnorm =>
+      cases execNormal_reaches hnorm with
+      | intro n hn =>
+        cases hn with
+        | intro v hv =>
+          exact ⟨hdef, .terminated [] (.normal v), hpre.1, n, hv.1⟩
+    | inr hcte =>
+      cases execCompileTimeError_reaches hcte with
+      | intro n hr =>
+        exact ⟨hdef, .terminated [] .compileTimeError, hpre.1, n, hr⟩
+  · intro s hpre
+    refine ⟨(h_wf s hpre).1, ?_⟩
+    intro out hval
+    refine ⟨?_, ?_⟩
+    · intro tr ret hout
+      subst hout
+      cases hval.2 with
+      | intro n hreach =>
+        cases (h_exec s hpre).2 with
+        | inl hnorm =>
+          exact (execNormal_safeAndEnsures hnorm hreach).2.1 ret rfl
+        | inr hcte =>
+          exact False.elim
+            ((execCompileTimeError_safe_and_not_normal hcte hreach).2 ret rfl)
+    · rw [if_true_eq hguard]
+      intro h0 tr hout
+      subst hout
+      cases hval.2 with
+      | intro n hreach =>
+        have hnorm := (h_exec s hpre).1 h0
+        exact (execNormal_safeAndEnsures hnorm hreach).2.2 rfl
+
+/-- Discharge `FnVerifiedAndRetInv` when
+`hasCompileTimeGuardWaiver fn tcb = true`. -/
+theorem execNormalOrGuard_fnVerifiedAndRetInv {adts : List AdtDecl}
+    {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
+    {tcb : List TCBItem}
+    (hguard : hasCompileTimeGuardWaiver fn tcb = true)
+    (hcwf : ContractWellFormed adts bodies fn (fn.resolveBody bodies))
+    (h_exec : ∀ s,
+      SafetyPre adts bodies adtInv fn (fn.resolveBody bodies) s tcb →
+      (s.adtPad = (fun _ => 0) ∧ s.tySizes = (fun _ => 8) →
+        ExecNormal adts bodies (fn.resolveBody bodies) s (fun r =>
+          r.value.valid adts adtInv r.state (fn.resolveBody bodies).localCount
+            (fn.resolveBody bodies).retTy)) ∧
+      (ExecNormal adts bodies (fn.resolveBody bodies) s (fun r =>
+          r.value.valid adts adtInv r.state (fn.resolveBody bodies).localCount
+            (fn.resolveBody bodies).retTy) ∨
+       ExecCompileTimeError adts bodies (fn.resolveBody bodies) s)) :
+    FnVerifiedAndRetInv adts bodies adtInv fn tcb :=
+  execNormalOrGuard_fnBodySafetyVerified fn (fn.resolveBody bodies) hguard hcwf
+    h_exec
 
 /-- Transfer `ContractWellFormed` from `target = lowerBody body` back to `body`
 when `target` has no `.call1` terminators. -/
@@ -873,14 +874,18 @@ theorem contractWellFormed_of_lowerBody {adts : List AdtDecl}
         exact hty.2.2
 
 /-- Equivalence of `SafetyPre` across in-place lowering `lowerBody` when
-`lowerBody body = target` and `target` has no `.call1` terminators. -/
+`lowerBody body = target`, `target` has no `.call1` terminators, and
+`hasPinnedCoupledWaiver fn tcb = false`. -/
 theorem safetyPre_of_lowerBody_eq {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} {fn : CapturedFn}
-    {body target : MirBody} {s : MirState}
+    {body target : MirBody} {s : MirState} {tcb : List TCBItem}
     (hres : lowerBody body = target)
-    (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true) :
-    SafetyPre adts bodies adtInv fn body s ↔
-      SafetyPre adts bodies adtInv fn target s := by
+    (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    SafetyPre adts bodies adtInv fn body s tcb ↔
+      initMirState adts bodies target s ∧
+      argsMatchInv adts adtInv target.localCount s target.argTys ∧
+      (fn.isUnsafe = true → fn.safetyPre s) := by
   have hcallsOrig :
       body.blocks.all (fun bb => !isCall1 bb.terminator) = true := by
     rw [← noCall_lowerBody body, hres]
@@ -893,23 +898,25 @@ theorem safetyPre_of_lowerBody_eq {adts : List AdtDecl}
   have hargs : body.argTys = target.argTys := by
     rw [← lowerBody_argTys body, hres]
   dsimp [SafetyPre]
-  rw [← hinitIff, hres, hlc, hargs]
+  rw [hpin, ← hinitIff, hres, hlc, hargs]
+  exact Iff.rfl
 
 /-- Discharge `FnBodySafetyVerified` for `body` from an `ExecNormal` proof on
 its normalized body `target = lowerBody body`. -/
 theorem execNormal_fnBodySafetyVerified_of_lowerBody {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
-    (body target : MirBody)
+    (body target : MirBody) {tcb : List TCBItem}
     (hres : lowerBody body = target)
     (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
     (hcwf : ContractWellFormed adts bodies fn target)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl)
     (h_exec : ∀ s,
       initMirState adts bodies target s →
       argsMatchInv adts adtInv target.localCount s target.argTys →
       (fn.isUnsafe = true → fn.safetyPre s) →
       ExecNormal adts bodies target s (fun r =>
         r.value.valid adts adtInv r.state target.localCount target.retTy)) :
-    FnBodySafetyVerified adts bodies adtInv fn body := by
+    FnBodySafetyVerified adts bodies adtInv fn body tcb := by
   have hcwfBody := contractWellFormed_of_lowerBody hres hcalls hcwf
   have hcallsOrig :
       body.blocks.all (fun bb => !isCall1 bb.terminator) = true := by
@@ -922,7 +929,7 @@ theorem execNormal_fnBodySafetyVerified_of_lowerBody {adts : List AdtDecl}
   refine execNormal_fnBodySafetyVerified fn body hcwfBody ?_
   intro s hpre
   have ⟨hinitT, hargsT, hsafetyT⟩ :=
-    (safetyPre_of_lowerBody_eq hres hcalls).mp hpre
+    (safetyPre_of_lowerBody_eq hres hcalls hpin).mp hpre
   rw [hlc, hret]
   have hexecLow :
       ExecNormal adts bodies (lowerBody body) s
@@ -938,19 +945,20 @@ theorem execNormal_fnBodySafetyVerified_of_lowerBody {adts : List AdtDecl}
 normalized body `target = lowerBody (fn.resolveBody bodies)`. -/
 theorem execNormal_fnVerifiedAndRetInv_of_lowerBody {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} (fn : CapturedFn)
-    (target : MirBody)
+    (target : MirBody) {tcb : List TCBItem}
     (hres : lowerBody (fn.resolveBody bodies) = target)
     (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
     (hcwf : ContractWellFormed adts bodies fn target)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl)
     (h_exec : ∀ s,
       initMirState adts bodies target s →
       argsMatchInv adts adtInv target.localCount s target.argTys →
       (fn.isUnsafe = true → fn.safetyPre s) →
       ExecNormal adts bodies target s (fun r =>
         r.value.valid adts adtInv r.state target.localCount target.retTy)) :
-    FnVerifiedAndRetInv adts bodies adtInv fn :=
+    FnVerifiedAndRetInv adts bodies adtInv fn tcb :=
   execNormal_fnBodySafetyVerified_of_lowerBody fn (fn.resolveBody bodies)
-    target hres hcalls hcwf h_exec
+    target hres hcalls hcwf hpin h_exec
 
 /-- Inductive failure symbolic execution relation for negative canaries. -/
 inductive ExecFail (adts : List AdtDecl := []) (bodies : List BodyDecl := [])
@@ -970,9 +978,10 @@ theorem execFail_reaches {adts : List AdtDecl} {bodies : List BodyDecl}
   | step hstep _ ih =>
     cases ih with
     | intro n hr =>
-      exact ⟨n + 1, .choice n _ _ _ [] .failed hstep.symm rfl hr⟩
+      exact ⟨n + 1,
+        .choice n _ _ _ [] .failed (toStepResult_of_silent hstep).symm rfl hr⟩
   | fail hfail =>
-    exact ⟨1, .failed 0 _ hfail.symm⟩
+    exact ⟨1, .failed 0 _ (toStepResult_of_failed hfail).symm⟩
 
 /-- No prefix from an `ExecFail` state can terminate normally. -/
 theorem execFail_not_normal {adts : List AdtDecl} {bodies : List BodyDecl}
@@ -1013,14 +1022,15 @@ theorem reachesPrefix_not_unwind_of_failed
     (hreach : ReachesPrefix (MirStep adts bodies) body n s tr
       (.terminated .unwind)) :
     False := by
+  have hstepR := toStepResult_of_failed hstep
   cases hreach with
   | step _ _ _ obs _ _ _ _ => nomatch obs
   | choice _ _ _ _ _ _ h1 _ _ =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
   | terminated _ _ _ h1 =>
-    have h1' : _ = evalMirStep adts bodies body s := h1
-    rw [hstep] at h1'; cases h1'
+    have h1' : _ = (evalMirStep adts bodies body s).toStepResult := h1
+    rw [hstepR] at h1'; cases h1'
 
 /-- No prefix from an `ExecFail` state can unwind. -/
 theorem execFail_not_unwind {adts : List AdtDecl} {bodies : List BodyDecl}
@@ -1046,14 +1056,15 @@ theorem mem_cons_eq_or_mem {α : Type} {x y : α} {ys : List α}
 obligations of the only function of an unwaived single-function crate,
 extracted from `CrateTheorem`. -/
 theorem crateTheorem_single_fnVerified {adts : List AdtDecl}
-    {bodies : List BodyDecl} {fn : CapturedFn}
+    {bodies : List BodyDecl} {fn : CapturedFn} {tcb : List TCBItem}
     (h : CrateTheorem {
       adts := adts
       bodies := bodies
-      functions := [fn] }) :
+      functions := [fn]
+      tcb := tcb }) :
     ContractWellFormed adts bodies fn (fn.resolveBody bodies) ∧
     FnBodyVerified adts bodies (denoteAdtInv adts) fn
-      (fn.resolveBody bodies) := by
+      (fn.resolveBody bodies) tcb := by
   have hcwf : ContractWellFormed adts bodies fn (fn.resolveBody bodies) :=
     h.2.2.2.2.1.1.1
   cases h.2.2.2.2.2.2.2.2.1 with
@@ -1063,14 +1074,17 @@ theorem crateTheorem_single_fnVerified {adts : List AdtDecl}
 /-- A function that fails from some state satisfying `SafetyPre` makes a
 single-function crate unverifiable. -/
 theorem crateTheorem_single_rejects_of_safetyPre_fail {adts : List AdtDecl}
-    {bodies : List BodyDecl} {fn : CapturedFn} (s0 : MirState)
+    {bodies : List BodyDecl} {fn : CapturedFn} {tcb : List TCBItem}
+    (s0 : MirState)
     (hpre :
-      SafetyPre adts bodies (denoteAdtInv adts) fn (fn.resolveBody bodies) s0)
+      SafetyPre adts bodies (denoteAdtInv adts) fn (fn.resolveBody bodies) s0
+        tcb)
     (hfail : ExecFail adts bodies (fn.resolveBody bodies) s0) :
     ¬ CrateTheorem {
       adts := adts
       bodies := bodies
-      functions := [fn] } := by
+      functions := [fn]
+      tcb := tcb } := by
   intro hCrate
   have hWF := (crateTheorem_single_fnVerified hCrate).2.2.2
   cases execFail_reaches hfail with
@@ -1079,26 +1093,32 @@ theorem crateTheorem_single_rejects_of_safetyPre_fail {adts : List AdtDecl}
 /-- A function that fails from some state satisfying its effective precondition
 makes a single-function crate unverifiable. -/
 theorem crateTheorem_single_rejects_of_fail {adts : List AdtDecl}
-    {bodies : List BodyDecl} {fn : CapturedFn} (s0 : MirState)
+    {bodies : List BodyDecl} {fn : CapturedFn} {tcb : List TCBItem}
+    (s0 : MirState)
     (hpre : fnEffectivePre adts bodies (denoteAdtInv adts) fn s0)
-    (hfail : ExecFail adts bodies (fn.resolveBody bodies) s0) :
+    (hfail : ExecFail adts bodies (fn.resolveBody bodies) s0)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
     ¬ CrateTheorem {
       adts := adts
       bodies := bodies
-      functions := [fn] } :=
-  crateTheorem_single_rejects_of_safetyPre_fail s0
-    ⟨hpre.1, hpre.2.1, fun _ => hpre.2.2⟩ hfail
+      functions := [fn]
+      tcb := tcb } := by
+  refine crateTheorem_single_rejects_of_safetyPre_fail s0 ?_ hfail
+  dsimp [SafetyPre]
+  rw [hpin]
+  exact ⟨hpre.1, hpre.2.1, fun _ => hpre.2.2⟩
 
 /-- A function whose required constants are not total across valid `tySizes`
 makes a single-function crate unverifiable (`ContractWellFormed` fails
 closed). -/
 theorem crateTheorem_single_rejects_of_not_constsTotal {adts : List AdtDecl}
-    {bodies : List BodyDecl} {fn : CapturedFn}
+    {bodies : List BodyDecl} {fn : CapturedFn} {tcb : List TCBItem}
     (hnot : ¬ ConstsTotal adts bodies (fn.resolveBody bodies)) :
     ¬ CrateTheorem {
       adts := adts
       bodies := bodies
-      functions := [fn] } :=
+      functions := [fn]
+      tcb := tcb } :=
   fun hCrate => hnot (crateTheorem_single_fnVerified hCrate).1.2.1
 
 /-- Generic single-function `CrateTheorem` discharge for a function with
@@ -1106,29 +1126,30 @@ theorem crateTheorem_single_rejects_of_not_constsTotal {adts : List AdtDecl}
 `FnVerifiedAndRetInv` proof `h_ver`, and a proof of its `ContractPost` on
 `SafetyPre ∧ fn.safetyPre`. -/
 theorem verify_single_fn_crate_gen {adts : List AdtDecl}
-    {bodies : List BodyDecl} (fn : CapturedFn)
+    {bodies : List BodyDecl} (fn : CapturedFn) {tcb : List TCBItem}
     (h_dbg : fn.debugBodyId = none := by rfl)
     (h_bodies_nodup : NoDupIds (bodies.map (fun d => d.id.index)))
     (h_adm : AdmissibleAdtInv adts (denoteAdtInv adts))
-    (h_ver : FnVerifiedAndRetInv adts bodies (denoteAdtInv adts) fn)
+    (h_ver : FnVerifiedAndRetInv adts bodies (denoteAdtInv adts) fn tcb)
     (h_specs :
       MirSem adts bodies (fn.resolveBody bodies) ≤
         (MirLang adts bodies).SpecOn
           (fun s =>
             SafetyPre adts bodies (denoteAdtInv adts) fn
-              (fn.resolveBody bodies) s ∧
+              (fn.resolveBody bodies) s tcb ∧
             fn.safetyPre s)
           (ContractPost adts bodies fn)) :
     CrateTheorem {
       adts := adts
       bodies := bodies
       functions := [fn]
+      tcb := tcb
     } := by
   have hcwf : FnContractWellFormed adts bodies fn := by
     unfold FnContractWellFormed
     rw [h_dbg]
     exact ⟨h_ver.1, True.intro⟩
-  have hfnVer : FnVerified adts bodies (denoteAdtInv adts) fn := by
+  have hfnVer : FnVerified adts bodies (denoteAdtInv adts) fn tcb := by
     unfold FnVerified
     rw [h_dbg]
     exact ⟨verified_split h_ver.2 h_specs, True.intro⟩
@@ -1182,7 +1203,7 @@ theorem idCopyBody_execNormal {bodies : List BodyDecl} (s : MirState)
       s.locals 1 = some r.value ∧
       r.value.valid [] defaultAdtInv r.state 2 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -1195,22 +1216,20 @@ theorem idCopyBody_execNormal {bodies : List BodyDecl} (s : MirState)
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        2 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
         apply ExecNormal.step
-        · change evalMirStmt idCopyBody _
-            (.assign (locPlace 0) (.use (.copy (locPlace 1)))) [] = _
-          dsimp only [evalMirStmt, evalOperand, evalPlace, assignPlace,
-            locPlace, idCopyBody]
+        · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+            List.foldr, Option.getD, evalMirStmt, evalOperand, evalPlace,
+            assignPlace, locPlace, idCopyBody]
           rw [hv1]
           rfl
         · exact .normal rfl ⟨hv1, True.intro⟩
@@ -1229,11 +1248,13 @@ theorem idCopyBody_satisfies_wellFormed {bodies : List BodyDecl} :
 /-- `idCopyBody` satisfies `FnBodySafetyVerified` for any `fn` and `body` whose
 lowered body is `idCopyBody`. -/
 theorem idCopyBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = idCopyBody) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body :=
+    (hres : lowerBody body = idCopyBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb :=
   execNormal_fnBodySafetyVerified_of_lowerBody fn body idCopyBody hres rfl
-    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl)
+    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) hpin
     (fun s hinitS _ _ => (idCopyBody_execNormal s hinitS).map (fun _ h => h.2))
 
 /-- `idMoveBody` executes to normal termination returning the initial `_1`
@@ -1244,7 +1265,7 @@ theorem idMoveBody_execNormal {bodies : List BodyDecl} (s : MirState)
       s.locals 1 = some r.value ∧
       r.value.valid [] defaultAdtInv r.state 2 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -1257,22 +1278,20 @@ theorem idMoveBody_execNormal {bodies : List BodyDecl} (s : MirState)
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        2 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
         apply ExecNormal.step
-        · change evalMirStmt idMoveBody _
-            (.assign (locPlace 0) (.use (.move (locPlace 1)))) [] = _
-          dsimp only [evalMirStmt, evalOperand, evalPlace, deinitPlace,
-            assignPlace, locPlace, idMoveBody]
+        · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+            List.foldr, Option.getD, evalMirStmt, evalOperand, evalPlace,
+            deinitPlace, assignPlace, locPlace, idMoveBody]
           rw [hv1]
           rfl
         · exact .normal rfl ⟨hv1, True.intro⟩
@@ -1286,11 +1305,13 @@ theorem idMoveBody_satisfies_ensures {bodies : List BodyDecl} :
 /-- `idMoveBody` satisfies `FnBodySafetyVerified` for any `fn` and `body` whose
 lowered body is `idMoveBody`. -/
 theorem idMoveBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = idMoveBody) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body :=
+    (hres : lowerBody body = idMoveBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb :=
   execNormal_fnBodySafetyVerified_of_lowerBody fn body idMoveBody hres rfl
-    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl)
+    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) hpin
     (fun s hinitS _ _ => (idMoveBody_execNormal s hinitS).map (fun _ h => h.2))
 
 /-!
@@ -1302,7 +1323,8 @@ constant is *not* verifiable as a root function: its `transmute_copy` into
 rejected`). The preserved archetype is a concrete instantiation: a caller that
 calls `transmute_checked::<usize, usize>` is verified end to end
 (`prove_pme_concrete_transmute_crate`), and an instantiation with mismatched
-sizes is rejected by `MonoAdmitted`.
+sizes steps to `.terminated .compileTimeError` at `.evalConst` and is rejected
+(`canary_concrete_mismatched_pme_rejected`).
 -/
 
 /-- Shorthand for a dereferenced local place `*_idx`. -/
@@ -1339,7 +1361,6 @@ def sizeEqConstBodyAt (t0 t1 : MirTy) : MirBody where
     { stmts := [.storageDead ⟨3⟩, .storageDead ⟨2⟩, .storageLive ⟨4⟩]
       terminator := .panic }
   ]
-  requiredConsts := []
 
 /-- The generic size-equality constant (`T0 := Src`, `T1 := Dst`). -/
 def sizeEqConstBody : MirBody := sizeEqConstBodyAt (.param 0) (.param 1)
@@ -1355,7 +1376,7 @@ def transmuteCheckedBodyAt (constId : BodyId) (src dst : MirTy) : MirBody where
   blocks := [
     { stmts := [
         .storageLive ⟨2⟩,
-        .assign (locPlace 2) (.use (.constVal .unit)),
+        .evalConst (locPlace 2) constId [src, dst],
         .storageDead ⟨2⟩,
         .storageLive ⟨3⟩,
         .storageLive ⟨4⟩,
@@ -1367,14 +1388,13 @@ def transmuteCheckedBodyAt (constId : BodyId) (src dst : MirTy) : MirBody where
     { stmts := [.storageDead ⟨4⟩, .storageDead ⟨3⟩]
       terminator := .return_ }
   ]
-  requiredConsts := [(constId, [src, dst])]
 
 /-- The generic `pub fn transmute_checked<Src: Copy, Dst: Copy>(x: Src) -> Dst`
 referencing `constId`. -/
 def transmuteCheckedBody (constId : BodyId := ⟨0⟩) : MirBody :=
   transmuteCheckedBodyAt constId (.param 0) (.param 1)
 
-/-- `transmute_checked` without its PME assertion (`requiredConsts = []`). -/
+/-- `transmute_checked` without its PME assertion. -/
 def transmuteUncheckedBody : MirBody where
   argTys := [.param 0]
   retTy := .param 1
@@ -1392,194 +1412,6 @@ def transmuteUncheckedBody : MirBody where
     { stmts := [.storageDead ⟨3⟩, .storageDead ⟨2⟩]
       terminator := .return_ }
   ]
-  requiredConsts := []
-
-/-- Constructive CTFE success of `sizeEqConstBody` whenever
-`tySizes 0 = tySizes 1`. -/
-theorem sizeEqConstBody_constSucceeds_of_eq {bodies : List BodyDecl}
-    (tySizes : Nat → Nat) (heq : tySizes 0 = tySizes 1) :
-    ConstSucceeds [] bodies tySizes sizeEqConstBody := by
-  refine ⟨rfl, ?_⟩
-  have hdec : decide (tySizes 0 = tySizes 1) = true := decide_eq_true heq
-  have hexec : ExecNormal [] bodies sizeEqConstBody (constEntryState tySizes)
-      (fun r => r.value = .unit) := by
-    refine .step rfl (.step rfl (.step rfl (.step rfl (.step rfl ?_))))
-    dsimp only [constEntryState, updateLocal, bumpGen]
-    refine .step rfl ?_
-    apply ExecNormal.step
-    · dsimp only [evalMirStep, lookupAt, Option.getD, List.length,
-        evalMirTerminator, evalOperand, evalPlace, deinitPlace, locPlace,
-        sizeEqConstBody, sizeEqConstBodyAt, updateLocal]
-      rw [hdec]
-      rfl
-    · exact .step rfl (.step rfl (.step rfl (.step rfl (.normal rfl rfl))))
-  cases execNormal_reaches hexec with
-  | intro n hn =>
-    cases hn with
-    | intro v hv => exact ⟨n, v, hv.1⟩
-
-/-- Key PME soundness lemma: if CTFE of `sizeEqConstBody` succeeds under
-`tySizes`, then `tySizes 0 = tySizes 1`. -/
-theorem constSucceeds_sizeEqConstBody_imp_eq {bodies : List BodyDecl}
-    (tySizes : Nat → Nat)
-    (h : ConstSucceeds [] bodies tySizes sizeEqConstBody) :
-    tySizes 0 = tySizes 1 := by
-  cases h.2 with
-  | intro n hn =>
-    cases hn with
-    | intro v hreach =>
-      cases hdec : decide (tySizes 0 = tySizes 1) with
-      | true => exact of_decide_eq_true hdec
-      | false =>
-        have hunw :
-            ExecUnwind [] bodies sizeEqConstBody (constEntryState tySizes) := by
-          refine .step rfl (.step rfl (.step rfl (.step rfl (.step rfl ?_))))
-          dsimp only [constEntryState, updateLocal, bumpGen]
-          refine .step rfl ?_
-          apply ExecUnwind.step
-          · dsimp only [evalMirStep, lookupAt, Option.getD, List.length,
-              evalMirTerminator, evalOperand, evalPlace, deinitPlace, locPlace,
-              sizeEqConstBody, sizeEqConstBodyAt, updateLocal]
-            rw [hdec]
-            rfl
-          · exact .step rfl (.step rfl (.step rfl (.unwind rfl)))
-        exact False.elim (execUnwind_not_normal hunw hreach)
-
-/-- For any well-formed types `t0` and `t1` in `[]`, `sizeEqConstBodyAt t0 t1`
-is total across all `tySizes`: it either returns `()` normally (`ConstSucceeds`)
-when their byte sizes are equal, or panics cleanly (`ConstUnwinds`) when their
-byte sizes differ. -/
-theorem sizeEqConstBodyAt_total {bodies : List BodyDecl}
-    (t0 t1 : MirTy) (tySizes : Nat → Nat) {sz0 sz1 : Nat}
-    (h0 : evalTyByteSize [] tySizes t0 = some sz0 := by rfl)
-    (h1 : evalTyByteSize [] tySizes t1 = some sz1 := by rfl) :
-    ConstSucceeds [] bodies tySizes (sizeEqConstBodyAt t0 t1) ∨
-      ConstUnwinds [] bodies tySizes (sizeEqConstBodyAt t0 t1) := by
-  cases hdec : decide (sz0 = sz1) with
-  | true =>
-    left
-    refine ⟨rfl, ?_⟩
-    have hexec : ExecNormal [] bodies (sizeEqConstBodyAt t0 t1)
-        (constEntryState tySizes) (fun r => r.value = .unit) := by
-      refine .step rfl (.step rfl ?_)
-      apply ExecNormal.step
-      · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-          (.callSizeOf (locPlace 2) t0 ⟨1⟩) = _
-        dsimp only [evalMirTerminator, assignPlace, locPlace,
-          sizeEqConstBodyAt, List.length, constEntryState]
-        rw [h0]
-        rfl
-      · refine .step rfl ?_
-        apply ExecNormal.step
-        · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-            (.callSizeOf (locPlace 3) t1 ⟨2⟩) = _
-          dsimp only [evalMirTerminator, assignPlace, locPlace,
-            sizeEqConstBodyAt, List.length, constEntryState,
-            MirState.gotoBlock]
-          rw [h1]
-          rfl
-        · refine .step rfl ?_
-          apply ExecNormal.step
-          · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-              (.switchInt (.move (locPlace 1)) ⟨4⟩ ⟨3⟩) = _
-            dsimp only [evalMirTerminator, evalOperand, evalPlace, deinitPlace,
-              locPlace, sizeEqConstBodyAt, List.length, updateLocal]
-            rw [hdec]
-            rfl
-          · exact .step rfl (.step rfl (.step rfl (.step rfl (.normal rfl rfl))))
-    cases execNormal_reaches hexec with
-    | intro n hn =>
-      cases hn with
-      | intro v hv => exact ⟨n, v, hv.1⟩
-  | false =>
-    right
-    refine ⟨rfl, ?_⟩
-    have hunw : ExecUnwind [] bodies (sizeEqConstBodyAt t0 t1)
-        (constEntryState tySizes) := by
-      refine .step rfl (.step rfl ?_)
-      apply ExecUnwind.step
-      · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-          (.callSizeOf (locPlace 2) t0 ⟨1⟩) = _
-        dsimp only [evalMirTerminator, assignPlace, locPlace,
-          sizeEqConstBodyAt, List.length, constEntryState]
-        rw [h0]
-        rfl
-      · refine .step rfl ?_
-        apply ExecUnwind.step
-        · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-            (.callSizeOf (locPlace 3) t1 ⟨2⟩) = _
-          dsimp only [evalMirTerminator, assignPlace, locPlace,
-            sizeEqConstBodyAt, List.length, constEntryState,
-            MirState.gotoBlock]
-          rw [h1]
-          rfl
-        · refine .step rfl ?_
-          apply ExecUnwind.step
-          · change evalMirTerminator [] bodies (sizeEqConstBodyAt t0 t1) _
-              (.switchInt (.move (locPlace 1)) ⟨4⟩ ⟨3⟩) = _
-            dsimp only [evalMirTerminator, evalOperand, evalPlace, deinitPlace,
-              locPlace, sizeEqConstBodyAt, List.length, updateLocal]
-            rw [hdec]
-            rfl
-          · exact .step rfl (.step rfl (.step rfl (.unwind rfl)))
-    exact execUnwind_reaches hunw
-
-/-- `transmuteCheckedBody constId` has total required constants whenever
-`findBody bodies constId = some sizeEqConstBody`. -/
-theorem transmuteCheckedBody_constsTotal {bodies : List BodyDecl}
-    {constId : BodyId}
-    (hconst : findBody bodies constId = some sizeEqConstBody) :
-    ConstsTotal [] bodies (transmuteCheckedBody constId) := by
-  intro tySizes c _ hc
-  cases hc with
-  | direct hmem =>
-    cases hmem with
-    | head =>
-      rw [hconst]
-      exact ⟨sizeEqConstBody, rfl,
-        sizeEqConstBodyAt_total (.param 0) (.param 1) tySizes⟩
-    | tail _ hnil => cases hnil
-  | viaConst hmem hrest =>
-    cases hmem with
-    | head =>
-      rw [hconst] at hrest
-      change RequiresConst bodies (some sizeEqConstBody) _ at hrest
-      exact False.elim (noRequires_of_simple rfl rfl hrest)
-    | tail _ hnil => cases hnil
-  | viaCall hbb hterm _ =>
-    have h := noCall_of_all
-      (bbs := (transmuteCheckedBody constId).blocks) rfl hbb
-    rw [hterm] at h
-    cases h
-
-/-- The generic `transmute_checked` is monomorphization-admitted under any
-`tySizes` with `tySizes 0 = tySizes 1`: the PME check alone does not reject
-it. -/
-theorem transmuteCheckedBody_monoAdmitted {bodies : List BodyDecl}
-    {constId : BodyId} {tySizes : Nat → Nat}
-    (hconst : findBody bodies constId = some sizeEqConstBody)
-    (heq : tySizes 0 = tySizes 1) :
-    MonoAdmitted [] bodies tySizes (transmuteCheckedBody constId) := by
-  intro c hc
-  cases hc with
-  | direct hmem =>
-    cases hmem with
-    | head =>
-      rw [hconst]
-      exact ⟨sizeEqConstBody, rfl, sizeEqConstBody_constSucceeds_of_eq tySizes heq⟩
-    | tail _ hnil => cases hnil
-  | viaConst hmem hrest =>
-    cases hmem with
-    | head =>
-      rw [hconst] at hrest
-      change RequiresConst bodies (some sizeEqConstBody) _ at hrest
-      exact False.elim (noRequires_of_simple rfl rfl hrest)
-    | tail _ hnil => cases hnil
-  | viaCall hbb hterm _ =>
-    have h := noCall_of_all
-      (bbs := (transmuteCheckedBody constId).blocks) rfl hbb
-    rw [hterm] at h
-    cases h
 
 /-- Canonical PME entry state (`_1 = .bytes 8 0`, every parameter 8 bytes). -/
 def pmeInitState : MirState where
@@ -1606,13 +1438,22 @@ theorem canary_generic_transmute_checked_rejected (fnName : String) :
   have hargs : argsMatchInv [] defaultAdtInv 5 pmeInitState [.param 0] :=
     ⟨⟨.bytes 8 0, rfl, rfl⟩, fun j hj _ => updateLocal_one_gt_one j hj⟩
   have hinit : initMirState [] bodies (transmuteCheckedBody ⟨0⟩) pmeInitState :=
-    ⟨mkInitEntryState hargs, transmuteCheckedBody_constsTotal rfl,
-      transmuteCheckedBody_monoAdmitted rfl rfl⟩
+    ⟨mkInitEntryState hargs, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  have hfail : ExecFail [] bodies (transmuteCheckedBody ⟨0⟩) pmeInitState := by
+    refine .step rfl ?_
+    apply ExecFail.step
+    · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+        List.foldr, Option.getD, evalMirStmt, transmuteCheckedBody,
+        transmuteCheckedBodyAt, findBody, List.find?, Option.map, Option.bind,
+        MirBody.subst, BasicBlock.subst, Stmt.subst, Rvalue.subst,
+        Terminator.subst, LayoutQuery.subst, MirTy.subst, mapAll,
+        sizeEqConstBody, sizeEqConstBodyAt]
+      rfl
+    · dsimp only [updateLocal, bumpGen]
+      exact .step rfl (.step rfl (.step rfl (.step rfl (.step rfl (.fail rfl)))))
   exact crateTheorem_single_rejects_of_fail
     (bodies := bodies) (fn := { name := fnName, bodyId := ⟨1⟩ })
-    pmeInitState ⟨hinit, hargs, True.intro⟩
-    (.step rfl (.step rfl (.step rfl (.step rfl (.step rfl (.step rfl
-      (.step rfl (.fail rfl))))))))
+    pmeInitState ⟨hinit, hargs, True.intro⟩ hfail
 
 /-- Canary: removing the PME assertion (`transmuteUncheckedBody`) is likewise
 rejected. -/
@@ -1652,42 +1493,12 @@ def concreteTransmuteCallerBody (calleeId : BodyId) (dstTy : MirTy) :
       terminator := .return_ }
   ]
 
-/-- The concrete size check `size_of::<usize>() == size_of::<usize>()`
-succeeds under any `bodies`. -/
-theorem sizeEq_usize_usize_succeeds {bodies : List BodyDecl}
-    (tySizes : Nat → Nat) :
-    ConstSucceeds [] bodies tySizes (sizeEqConstBodyAt .usize .usize) := by
-  refine ⟨rfl, ?_⟩
-  have hexec : ExecNormal [] bodies (sizeEqConstBodyAt .usize .usize)
-      (constEntryState tySizes) (fun r => r.value = .unit) := by
-    repeat (first | exact ExecNormal.normal rfl rfl | refine ExecNormal.step rfl ?_)
-  cases execNormal_reaches hexec with
-  | intro n hn =>
-    cases hn with
-    | intro v hv => exact ⟨n, v, hv.1⟩
-
-/-- The concrete size check `size_of::<usize>() == size_of::<bool>()` fails
-(it panics) under any `bodies`. -/
-theorem sizeEq_usize_bool_fails {bodies : List BodyDecl}
-    (tySizes : Nat → Nat) :
-    ¬ ConstSucceeds [] bodies tySizes (sizeEqConstBodyAt .usize .bool) := by
-  intro h
-  have hunw : ExecUnwind [] bodies (sizeEqConstBodyAt .usize .bool)
-      (constEntryState tySizes) := by
-    repeat (first | exact ExecUnwind.unwind rfl | refine ExecUnwind.step rfl ?_)
-  cases h.2 with
-  | intro n hn =>
-    cases hn with
-    | intro v hr => exact execUnwind_not_normal hunw hr
-
-/-- Instantiating `transmute_checked` at `[.usize, .usize]` has total required
-constants across all valid `tySizes`. -/
-theorem concreteTransmuteCaller_constsTotal {bodies : List BodyDecl}
-    {calleeId constId : BodyId}
+theorem concreteTransmuteCaller_noRequires {bodies : List BodyDecl}
+    {calleeId constId : BodyId} {dstTy : MirTy} {c : Option MirBody}
     (hcallee : findBody bodies calleeId = some (transmuteCheckedBody constId))
-    (hconst : findBody bodies constId = some sizeEqConstBody) :
-    ConstsTotal [] bodies (concreteTransmuteCallerBody calleeId .usize) := by
-  intro tySizes c _ hc
+    (hc : RequiresConst bodies
+      (some (concreteTransmuteCallerBody calleeId dstTy)) c) :
+    False := by
   cases hc with
   | direct hmem => cases hmem
   | viaConst hmem _ => cases hmem
@@ -1697,91 +1508,40 @@ theorem concreteTransmuteCaller_constsTotal {bodies : List BodyDecl}
       cases hterm
       rw [hcallee] at hrest
       change RequiresConst bodies
-        (some (transmuteCheckedBodyAt constId .usize .usize)) _ at hrest
-      cases hrest with
-      | direct hmem =>
-        cases hmem with
-        | head =>
-          rw [hconst]
-          exact ⟨sizeEqConstBodyAt .usize .usize, rfl,
-            sizeEqConstBodyAt_total .usize .usize tySizes⟩
-        | tail _ hnil => cases hnil
-      | viaConst hmem hrest2 =>
-        cases hmem with
-        | head =>
-          rw [hconst] at hrest2
-          change RequiresConst bodies
-            (some (sizeEqConstBodyAt .usize .usize)) _ at hrest2
-          exact False.elim (noRequires_of_simple rfl rfl hrest2)
-        | tail _ hnil => cases hnil
-      | viaCall hbb2 hterm2 _ =>
-        have h := noCall_of_all
-          (bbs := (transmuteCheckedBodyAt constId .usize .usize).blocks) rfl hbb2
-        rw [hterm2] at h
-        cases h
+        (some (transmuteCheckedBodyAt constId .usize dstTy)) _ at hrest
+      exact noRequires_of_simple rfl rfl hrest
     | tail _ hbb1 =>
       cases hbb1 with
       | head => cases hterm
       | tail _ hnil => cases hnil
 
-/-- Instantiating `transmute_checked` at `[.usize, .usize]` admits the
-caller. -/
+theorem concreteTransmuteCaller_constsTotal {bodies : List BodyDecl}
+    {calleeId constId : BodyId} {dstTy : MirTy}
+    (hcallee : findBody bodies calleeId = some (transmuteCheckedBody constId)) :
+    ConstsTotal [] bodies (concreteTransmuteCallerBody calleeId dstTy) :=
+  fun _ _ _ hc => False.elim (concreteTransmuteCaller_noRequires hcallee hc)
+
 theorem concreteTransmuteCaller_monoAdmitted {bodies : List BodyDecl}
-    {calleeId constId : BodyId}
+    {calleeId constId : BodyId} {dstTy : MirTy}
     (hcallee : findBody bodies calleeId = some (transmuteCheckedBody constId))
-    (hconst : findBody bodies constId = some sizeEqConstBody)
     (tySizes : Nat → Nat) :
     MonoAdmitted [] bodies tySizes
-      (concreteTransmuteCallerBody calleeId .usize) := by
-  intro c hc
-  cases hc with
-  | direct hmem => cases hmem
-  | viaConst hmem _ => cases hmem
-  | viaCall hbb hterm hrest =>
-    cases hbb with
-    | head =>
-      cases hterm
-      rw [hcallee] at hrest
-      change RequiresConst bodies
-        (some (transmuteCheckedBodyAt constId .usize .usize)) _ at hrest
-      cases hrest with
-      | direct hmem =>
-        cases hmem with
-        | head =>
-          rw [hconst]
-          exact ⟨sizeEqConstBodyAt .usize .usize, rfl,
-            sizeEq_usize_usize_succeeds tySizes⟩
-        | tail _ hnil => cases hnil
-      | viaConst hmem hrest2 =>
-        cases hmem with
-        | head =>
-          rw [hconst] at hrest2
-          change RequiresConst bodies
-            (some (sizeEqConstBodyAt .usize .usize)) _ at hrest2
-          exact False.elim (noRequires_of_simple rfl rfl hrest2)
-        | tail _ hnil => cases hnil
-      | viaCall hbb2 hterm2 _ =>
-        have h := noCall_of_all
-          (bbs := (transmuteCheckedBodyAt constId .usize .usize).blocks) rfl hbb2
-        rw [hterm2] at h
-        cases h
-    | tail _ hbb1 =>
-      cases hbb1 with
-      | head => cases hterm
-      | tail _ hnil => cases hnil
+      (concreteTransmuteCallerBody calleeId dstTy) :=
+  fun _ hc => False.elim (concreteTransmuteCaller_noRequires hcallee hc)
 
 /-- The concrete caller returns its argument, transmuted to `usize`, from every
 initial state. -/
 theorem concreteTransmuteCaller_execNormal {bodies : List BodyDecl}
     {calleeId constId : BodyId}
     (hcallee : findBody bodies calleeId = some (transmuteCheckedBody constId))
+    (hconst : findBody bodies constId = some sizeEqConstBody)
     (s : MirState)
     (hinit :
       initMirState [] bodies (concreteTransmuteCallerBody calleeId .usize) s) :
     ExecNormal [] bodies (concreteTransmuteCallerBody calleeId .usize) s
       (fun r => r.value.valid [] defaultAdtInv r.state 3 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -1794,14 +1554,13 @@ theorem concreteTransmuteCaller_execNormal {bodies : List BodyDecl}
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        3 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
@@ -1816,28 +1575,38 @@ theorem concreteTransmuteCaller_execNormal {bodies : List BodyDecl}
         rw [hL]
         refine .step rfl (.step rfl ?_)
         apply ExecNormal.step
-        · dsimp only [evalMirStep, lookupAt, List.foldr, Option.getD,
-            List.length, evalMirTerminator, concreteTransmuteCallerBody]
+        · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+            List.foldr, Option.getD, List.length, evalMirTerminator,
+            concreteTransmuteCallerBody]
           rw [hcallee]
           rfl
-        · refine .step rfl (.step rfl (.step rfl ?_))
-          dsimp only [updateLocal, bumpGen]
-          refine .step rfl (.step rfl (.step rfl (.step rfl (.step rfl ?_))))
-          dsimp only [updateLocal, bumpGen]
-          refine .step rfl (.step rfl (.step rfl (.step rfl ?_)))
-          dsimp only [updateLocal, bumpGen]
-          exact .normal rfl True.intro
+        · refine .step rfl ?_
+          apply ExecNormal.step
+          · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+              lookupAt, List.foldr, Option.getD, evalMirStmt,
+              transmuteCheckedBody, transmuteCheckedBodyAt, MirBody.subst,
+              BasicBlock.subst, Stmt.subst, Rvalue.subst, Terminator.subst,
+              MirTy.subst, mapAll, Option.bind, Option.map]
+            rw [hconst]
+            rfl
+          · refine .step rfl ?_
+            dsimp only [updateLocal, bumpGen]
+            refine .step rfl (.step rfl (.step rfl (.step rfl (.step rfl ?_))))
+            dsimp only [updateLocal, bumpGen]
+            refine .step rfl (.step rfl (.step rfl (.step rfl ?_)))
+            dsimp only [updateLocal, bumpGen]
+            exact .normal rfl True.intro
 
 /-- `concreteTransmuteCallerBody calleeId .usize` satisfies
 `FnBodySafetyVerified` for any `fn` and `body` resolving to it when `calleeId`
 and `constId` resolve in `bodies`. -/
 theorem concreteTransmuteCaller_verified_of_resolve {bodies : List BodyDecl}
-    {calleeId constId : BodyId} (fn : CapturedFn)
+    {calleeId constId : BodyId} {tcb : List TCBItem} (fn : CapturedFn)
     (body : MirBody := fn.resolveBody bodies)
     (hres : body = concreteTransmuteCallerBody calleeId .usize)
     (hcallee : findBody bodies calleeId = some (transmuteCheckedBody constId))
     (hconst : findBody bodies constId = some sizeEqConstBody) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body := by
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb := by
   have hwf : StaticBodyWf [] (concreteTransmuteCallerBody calleeId .usize) :=
     mkStaticBodyWf
       (hcount := Nat.le_succ_of_le (Nat.le_refl 2))
@@ -1846,38 +1615,77 @@ theorem concreteTransmuteCaller_verified_of_resolve {bodies : List BodyDecl}
       ContractWellFormed [] bodies fn
         (concreteTransmuteCallerBody calleeId .usize) :=
     ⟨hwf,
-     concreteTransmuteCaller_constsTotal hcallee hconst,
+     concreteTransmuteCaller_constsTotal hcallee,
      monoConstsWf_of_all_monoAdmitted hwf
-       (concreteTransmuteCaller_monoAdmitted hcallee hconst)⟩
+       (concreteTransmuteCaller_monoAdmitted hcallee)⟩
   rw [hres]
   exact execNormal_fnBodySafetyVerified fn
     (concreteTransmuteCallerBody calleeId .usize) hcwf
-    (fun s hpre => concreteTransmuteCaller_execNormal hcallee s hpre.1)
+    (fun s hpre => concreteTransmuteCaller_execNormal hcallee hconst s hpre.1)
 
 /-- Canary: instantiating `transmute_checked` at `[.usize, .bool]` (8 vs 1
-bytes) is rejected by `MonoAdmitted`, so the caller has no initial state. -/
-theorem canary_concrete_mismatched_pme_rejected (tySizes : Nat → Nat) :
+bytes) steps to `.terminated .compileTimeError` at `.evalConst` and refutes
+`CrateTheorem`. -/
+theorem canary_concrete_mismatched_pme_rejected (fnName : String) :
     let bodies : List BodyDecl := [
       { id := ⟨0⟩, body := sizeEqConstBody },
-      { id := ⟨1⟩, body := (transmuteCheckedBody ⟨0⟩) }
+      { id := ⟨1⟩, body := (transmuteCheckedBody ⟨0⟩) },
+      { id := ⟨2⟩, body := (concreteTransmuteCallerBody ⟨1⟩ .bool) }
     ]
-    ¬ MonoAdmitted [] bodies tySizes
-        (concreteTransmuteCallerBody ⟨1⟩ .bool) := by
-  intro bodies hmono
-  have hreq0 : RequiresConst bodies
-      (some (transmuteCheckedBodyAt ⟨0⟩ .usize .bool))
-      ((findBody bodies ⟨0⟩).bind (MirBody.subst [.usize, .bool])) :=
-    .direct (.head _)
-  have hreq : RequiresConst bodies
-      (some (concreteTransmuteCallerBody ⟨1⟩ .bool))
-      ((findBody bodies ⟨0⟩).bind (MirBody.subst [.usize, .bool])) :=
-    .viaCall (.head _) rfl hreq0
-  cases hmono _ hreq with
-  | intro cBody hc =>
-    have h2 : some (sizeEqConstBodyAt .usize .bool) = some cBody := hc.1
-    injection h2 with h3
-    subst h3
-    exact sizeEq_usize_bool_fails tySizes hc.2
+    ExecCompileTimeError [] bodies (concreteTransmuteCallerBody ⟨1⟩ .bool)
+      singleArgUsizeInitState ∧
+    ¬ CrateTheorem {
+      bodies := bodies
+      functions := [{ name := fnName, bodyId := ⟨2⟩ }]
+    } := by
+  intro bodies
+  have hexec :
+      ExecCompileTimeError [] bodies (concreteTransmuteCallerBody ⟨1⟩ .bool)
+        singleArgUsizeInitState := by
+    refine .step rfl (.step rfl ?_)
+    apply ExecCompileTimeError.step
+    · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+        List.foldr, Option.getD, List.length, evalMirTerminator,
+        concreteTransmuteCallerBody, findBody, List.find?, Option.map,
+        Option.bind, Option.elim, MirBody.subst, BasicBlock.subst, Stmt.subst,
+        Rvalue.subst, Terminator.subst, LayoutQuery.subst, MirTy.subst, mapAll,
+        transmuteCheckedBody, transmuteCheckedBodyAt]
+      rfl
+    · refine .step rfl ?_
+      apply ExecCompileTimeError.compileTimeError
+      dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+        List.foldr, Option.getD, evalMirStmt, findBody, List.find?, Option.map,
+        Option.bind, MirBody.subst, BasicBlock.subst, Stmt.subst, Rvalue.subst,
+        Terminator.subst, LayoutQuery.subst, MirTy.subst, mapAll,
+        sizeEqConstBody, sizeEqConstBodyAt]
+      rfl
+  refine ⟨hexec, ?_⟩
+  intro hCrate
+  have hSem := (crateTheorem_single_fnVerified hCrate).2.2.2
+  have hargs : argsMatchInv [] defaultAdtInv 3 singleArgUsizeInitState [.usize] :=
+    ⟨⟨.usize 0, rfl, True.intro⟩, fun j hj _ => updateLocal_one_gt_one j hj⟩
+  have hinit :
+      initMirState [] bodies (concreteTransmuteCallerBody ⟨1⟩ .bool)
+        singleArgUsizeInitState :=
+    ⟨mkInitEntryState hargs,
+     concreteTransmuteCaller_constsTotal rfl,
+     concreteTransmuteCaller_monoAdmitted rfl _⟩
+  have hpre :
+      SafetyPre [] bodies defaultAdtInv
+        { name := fnName, bodyId := ⟨2⟩ }
+        (concreteTransmuteCallerBody ⟨1⟩ .bool)
+        singleArgUsizeInitState [] :=
+    ⟨hinit, hargs, fun h => by cases h⟩
+  cases hSem singleArgUsizeInitState hpre with
+  | intro hdef hval =>
+    cases execCompileTimeError_reaches hexec with
+    | intro n hr =>
+      have hpfx :
+          (MirSem [] bodies (concreteTransmuteCallerBody ⟨1⟩ .bool)
+            singleArgUsizeInitState).val hdef
+            (.terminated [] .compileTimeError) :=
+        ⟨hinit, n, hr⟩
+      exact (hval _ hpfx).1.2 [] rfl
 
 /-!
 ## 5. `NonZeroUsize` Library Verification Contract Lemmas and Canaries
@@ -1885,8 +1693,9 @@ theorem canary_concrete_mismatched_pme_rejected (tySizes : Nat → Nat) :
 
 /-- Captured ADT declaration for `pub struct NonZeroUsize { val: usize }` with a
 private field (`FieldAccess.priv`) and `/// anneal:invariant val != 0`. -/
-def nonZeroAdtDecl (adtId : Nat := 0) : AdtDecl where
+def nonZeroAdtDecl (adtId : Nat := 0) (repr : AdtRepr := .rust) : AdtDecl where
   id := adtId
+  repr := repr
   fields := [{ ty := .usize, access := .priv }]
   invariant := some { ne := 0 }
 
@@ -1899,9 +1708,9 @@ def pubSafeNonZeroAdtDecl : AdtDecl where
   invariant := some { ne := 0 }
 
 /-- Standard ADT representation invariant for `NonZeroUsize` (`adtId = 0`),
-denoted from `[nonZeroAdtDecl 0]`. -/
-abbrev nonZeroAdtInv : AdtInv :=
-  denoteAdtInv [nonZeroAdtDecl 0]
+denoted from `[nonZeroAdtDecl 0 repr]`. -/
+abbrev nonZeroAdtInv (repr : AdtRepr := .rust) : AdtInv :=
+  denoteAdtInv [nonZeroAdtDecl 0 repr]
 
 /-- Standard `# Safety` precondition (`/// anneal:requires x != 0`) for
 `pub unsafe fn new_unchecked`. -/
@@ -1911,9 +1720,9 @@ abbrev newUncheckedRequires : Option RequiresSpec :=
 abbrev newUncheckedSafetyPre (s : MirState) : Prop :=
   denoteRequires newUncheckedRequires s
 
-/-- `nonZeroAdtInv` is admissible for `[nonZeroAdtDecl 0]`. -/
-theorem nonZeroAdtInv_admissible :
-    AdmissibleAdtInv [nonZeroAdtDecl 0] nonZeroAdtInv := by
+/-- `nonZeroAdtInv repr` is admissible for `[nonZeroAdtDecl 0 repr]`. -/
+theorem nonZeroAdtInv_admissible {repr : AdtRepr} :
+    AdmissibleAdtInv [nonZeroAdtDecl 0 repr] (nonZeroAdtInv repr) := by
   refine ⟨⟨True.intro, True.intro⟩, ?_⟩
   intro decl hmem hPub
   cases hmem with
@@ -1926,7 +1735,7 @@ theorem canary_pub_safe_fields_reject_nonzero_inv :
     ¬ AdmissibleAdtInv [pubSafeNonZeroAdtDecl] nonZeroAdtInv := by
   intro hAdm
   exact hAdm.2 pubSafeNonZeroAdtDecl (.head _) rfl
-    (constEntryState (fun _ => 0)) .usize (.usize 0) rfl True.intro rfl
+    (constEntryState (fun _ => 0)) (.usize 0) True.intro rfl
 
 /-- Canonical `rustc` MIR body for `pub fn make_nonzero(x: usize) -> NonZeroUsize`
 parameterized by `adtId`. -/
@@ -2039,247 +1848,306 @@ theorem nat_beq_refl (n : Nat) : (n == n) = true :=
 
 /-- `makeNonZeroBody` executes to normal completion returning a valid
 `NonZeroUsize` from any `initMirState`. -/
-theorem makeNonZeroBody_execNormal {bodies : List BodyDecl}
+theorem makeNonZeroBody_execNormal {bodies : List BodyDecl} {repr : AdtRepr}
     (s : MirState)
-    (hinit : initMirState [nonZeroAdtDecl 0] bodies makeNonZeroBody s) :
-    ExecNormal [nonZeroAdtDecl 0] bodies makeNonZeroBody s
+    (hinit : initMirState [nonZeroAdtDecl 0 repr] bodies makeNonZeroBody s)
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    ExecNormal [nonZeroAdtDecl 0 repr] bodies makeNonZeroBody s
       (fun r =>
-        r.value.valid [nonZeroAdtDecl 0] nonZeroAdtInv r.state 5 (.adt 0)) := by
-  cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
-    have hentry := hinit.1
-    have hb : block0 = 0 := hentry.1
-    have hs : stmtIdx0 = 0 := hentry.2.1
-    have hc : curBody0 = none := hentry.2.2.1
-    have hst : stack0 = [] := hentry.2.2.2.1
-    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
-    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
-    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
-    subst hb hs hc hst hfid hnfid hlg
-    cases (initEntryState_argsMatch hentry).1 with
-    | intro v hv =>
-      have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [nonZeroAdtDecl 0] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        5 .usize := hv.2
-      cases v with
-      | uninit => cases hvty
-      | bool _ => cases hvty
-      | unit => cases hvty
-      | adt _ _ => cases hvty
-      | bytes _ _ => cases hvty
-      | ref _ _ _ _ => cases hvty
-      | usize n =>
-        refine .step rfl (.step rfl ?_)
-        apply ExecNormal.step
-        · change evalMirStmt makeNonZeroBody _
-            (.assign (locPlace 3) (.use (.copy (locPlace 1))))
-            [nonZeroAdtDecl 0] = _
-          dsimp only [evalMirStmt, evalOperand, evalPlace, assignPlace,
-            locPlace, makeNonZeroBody, makeNonZeroBodyAt, updateLocal]
-          rw [hv1]
-          rfl
-        · refine .step rfl ?_
-          cases n with
-          | zero =>
-            refine .step rfl (.step rfl (.step rfl (.step rfl
-              (.step rfl (.normal rfl ⟨rfl, Nat.succ_ne_zero 0, True.intro⟩)))))
-          | succ k =>
-            refine .step rfl (.step rfl (.step rfl ?_))
-            apply ExecNormal.step
-            · change evalMirStmt makeNonZeroBody _
-                (.assign (locPlace 4) (.use (.copy (locPlace 1))))
-                [nonZeroAdtDecl 0] = _
-              dsimp only [evalMirStmt, evalOperand, evalPlace, assignPlace,
-                locPlace, makeNonZeroBody, makeNonZeroBodyAt, updateLocal]
-              rw [hv1]
-              rfl
-            · exact .step rfl (.step rfl (.step rfl (.step rfl
-                (.normal rfl ⟨rfl, Nat.succ_ne_zero k, True.intro⟩))))
+        r.value.valid [nonZeroAdtDecl 0 repr] (nonZeroAdtInv repr) r.state 5
+          (.adt 0)) := by
+  cases hrepr with
+  | inl hrepr | inr hrepr =>
+    subst hrepr
+    cases s with
+    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+      have hentry := hinit.1
+      have hb : block0 = 0 := hentry.1
+      have hs : stmtIdx0 = 0 := hentry.2.1
+      have hc : curBody0 = none := hentry.2.2.1
+      have hst : stack0 = [] := hentry.2.2.2.1
+      have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+      have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+      have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+      subst hb hs hc hst hfid hnfid hlg
+      cases (initEntryState_argsMatch hentry).1 with
+      | intro v hv =>
+        have hv1 : locals0 1 = some v := hv.1
+        have hvty := hv.2
+        cases v with
+        | uninit => cases hvty
+        | bool _ => cases hvty
+        | unit => cases hvty
+        | adt _ _ => cases hvty
+        | fieldCons _ _ => cases hvty
+        | bytes _ _ => cases hvty
+        | ref _ _ _ _ => cases hvty
+        | usize n =>
+          refine .step rfl (.step rfl ?_)
+          apply ExecNormal.step
+          · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+              List.foldr, Option.getD, evalMirStmt, evalOperand, evalPlace,
+              assignPlace, locPlace, makeNonZeroBody, makeNonZeroBodyAt,
+              updateLocal]
+            rw [hv1]
+            rfl
+          · refine .step rfl ?_
+            cases n with
+            | zero =>
+              refine .step rfl (.step rfl (.step rfl (.step rfl
+                (.step rfl (.normal rfl ⟨rfl, Nat.succ_ne_zero 0, True.intro⟩)))))
+            | succ k =>
+              refine .step rfl (.step rfl (.step rfl ?_))
+              apply ExecNormal.step
+              · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+                  lookupAt, List.foldr, Option.getD, evalMirStmt, evalOperand,
+                  evalPlace, assignPlace, locPlace, makeNonZeroBody,
+                  makeNonZeroBodyAt, updateLocal]
+                rw [hv1]
+                rfl
+              · exact .step rfl (.step rfl (.step rfl (.step rfl
+                  (.normal rfl ⟨rfl, Nat.succ_ne_zero k, True.intro⟩))))
 
 /-- `makeNonZeroBody` satisfies `FnBodySafetyVerified` for any `fn` and `body`
 whose lowered body is `makeNonZeroBody`. -/
 theorem makeNonZeroBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem} {repr : AdtRepr}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = makeNonZeroBody) :
-    FnBodySafetyVerified [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn body :=
-  execNormal_fnBodySafetyVerified_of_lowerBody fn body makeNonZeroBody hres rfl
-    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl)
-    (fun s hinitS _ _ => makeNonZeroBody_execNormal s hinitS)
+    (hres : lowerBody body = makeNonZeroBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false)
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    FnBodySafetyVerified [nonZeroAdtDecl 0 repr] bodies (nonZeroAdtInv repr) fn
+      body tcb := by
+  have hl0 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr] makeNonZeroBody
+        (fun _ => 0) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
+  have hl1 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr] makeNonZeroBody
+        (fun _ => 1) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
+  exact execNormal_fnBodySafetyVerified_of_lowerBody fn body makeNonZeroBody
+    hres rfl
+    (contractWellFormed_of_simple (mkStaticBodyWf (hl0 := hl0) (hl1 := hl1))
+      rfl rfl)
+    hpin (fun s hinitS _ _ => makeNonZeroBody_execNormal s hinitS hrepr)
 
 /-- `newUncheckedBody` executes to normal completion returning a valid
 `NonZeroUsize` from any state satisfying its `effectivePre`. -/
-theorem newUncheckedBody_execNormal {bodies : List BodyDecl}
+theorem newUncheckedBody_execNormal {bodies : List BodyDecl} {repr : AdtRepr}
     (s : MirState)
-    (hinit : initMirState [nonZeroAdtDecl 0] bodies newUncheckedBody s)
-    (hsafety : newUncheckedSafetyPre s) :
-    ExecNormal [nonZeroAdtDecl 0] bodies newUncheckedBody s
+    (hinit : initMirState [nonZeroAdtDecl 0 repr] bodies newUncheckedBody s)
+    (hsafety : newUncheckedSafetyPre s)
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    ExecNormal [nonZeroAdtDecl 0 repr] bodies newUncheckedBody s
       (fun r =>
-        r.value.valid [nonZeroAdtDecl 0] nonZeroAdtInv r.state 3 (.adt 0)) := by
-  cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
-    have hentry := hinit.1
-    have hb : block0 = 0 := hentry.1
-    have hs : stmtIdx0 = 0 := hentry.2.1
-    have hc : curBody0 = none := hentry.2.2.1
-    have hst : stack0 = [] := hentry.2.2.2.1
-    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
-    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
-    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
-    subst hb hs hc hst hfid hnfid hlg
-    cases (initEntryState_argsMatch hentry).1 with
-    | intro v hv =>
-      have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [nonZeroAdtDecl 0] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        3 .usize := hv.2
-      cases v with
-      | uninit => cases hvty
-      | bool _ => cases hvty
-      | unit => cases hvty
-      | adt _ _ => cases hvty
-      | bytes _ _ => cases hvty
-      | ref _ _ _ _ => cases hvty
-      | usize n =>
-        have hne0 : n ≠ 0 := hsafety n hv1
-        refine .step rfl ?_
-        apply ExecNormal.step
-        · change evalMirStmt newUncheckedBody _
-            (.assign (locPlace 2) (.use (.copy (locPlace 1))))
-            [nonZeroAdtDecl 0] = _
-          dsimp only [evalMirStmt, evalOperand, evalPlace, assignPlace,
-            locPlace, newUncheckedBody, newUncheckedBodyAt, updateLocal]
-          rw [hv1]
-          rfl
-        · exact .step rfl (.step rfl (.normal rfl ⟨rfl, hne0, True.intro⟩))
+        r.value.valid [nonZeroAdtDecl 0 repr] (nonZeroAdtInv repr) r.state 3
+          (.adt 0)) := by
+  cases hrepr with
+  | inl hrepr | inr hrepr =>
+    subst hrepr
+    cases s with
+    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+      have hentry := hinit.1
+      have hb : block0 = 0 := hentry.1
+      have hs : stmtIdx0 = 0 := hentry.2.1
+      have hc : curBody0 = none := hentry.2.2.1
+      have hst : stack0 = [] := hentry.2.2.2.1
+      have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+      have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+      have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+      subst hb hs hc hst hfid hnfid hlg
+      cases (initEntryState_argsMatch hentry).1 with
+      | intro v hv =>
+        have hv1 : locals0 1 = some v := hv.1
+        have hvty := hv.2
+        cases v with
+        | uninit => cases hvty
+        | bool _ => cases hvty
+        | unit => cases hvty
+        | adt _ _ => cases hvty
+        | fieldCons _ _ => cases hvty
+        | bytes _ _ => cases hvty
+        | ref _ _ _ _ => cases hvty
+        | usize n =>
+          have hne0 : n ≠ 0 := hsafety n hv1
+          refine .step rfl ?_
+          apply ExecNormal.step
+          · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+              List.foldr, Option.getD, evalMirStmt, evalOperand, evalPlace,
+              assignPlace, locPlace, newUncheckedBody, newUncheckedBodyAt,
+              updateLocal]
+            rw [hv1]
+            rfl
+          · exact .step rfl (.step rfl (.normal rfl ⟨rfl, hne0, True.intro⟩))
 
 /-- `newUncheckedBody` satisfies `FnBodySafetyVerified` for any `unsafe fn`
 (`fn.isUnsafe = true`) whose lowered body is `newUncheckedBody` with
 `requires = newUncheckedRequires`. -/
 theorem newUncheckedBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem} {repr : AdtRepr}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
     (hres : lowerBody body = newUncheckedBody)
     (hunsafe : fn.isUnsafe = true)
-    (hreq : fn.requires = newUncheckedRequires) :
-    FnBodySafetyVerified [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn body := by
+    (hreq : fn.requires = newUncheckedRequires)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false)
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    FnBodySafetyVerified [nonZeroAdtDecl 0 repr] bodies (nonZeroAdtInv repr) fn
+      body tcb := by
+  have hl0 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr] newUncheckedBody
+        (fun _ => 0) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
+  have hl1 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr] newUncheckedBody
+        (fun _ => 1) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
   refine execNormal_fnBodySafetyVerified_of_lowerBody fn body newUncheckedBody
-    hres rfl (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) ?_
+    hres rfl
+    (contractWellFormed_of_simple (mkStaticBodyWf (hl0 := hl0) (hl1 := hl1))
+      rfl rfl)
+    hpin ?_
   intro s hinitS _ hsafetyImp
   have hsafetyS : newUncheckedSafetyPre s := by
     have h1 := hsafetyImp hunsafe
     dsimp [CapturedFn.safetyPre] at h1
     rw [hreq] at h1
     exact h1
-  exact newUncheckedBody_execNormal s hinitS hsafetyS
+  exact newUncheckedBody_execNormal s hinitS hsafetyS hrepr
 
 /-- `getUncheckedNonZeroBodyAt 0 moveFinal` executes to normal completion
 from any state satisfying its `effectivePre`. -/
 theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
-    (moveFinal : Bool) (s : MirState)
-    (hinit : initMirState [nonZeroAdtDecl 0] bodies
+    {repr : AdtRepr} (moveFinal : Bool) (s : MirState)
+    (hinit : initMirState [nonZeroAdtDecl 0 repr] bodies
       (getUncheckedNonZeroBodyAt 0 moveFinal) s)
-    (hargs : argsMatchInv [nonZeroAdtDecl 0] nonZeroAdtInv 5 s [.adt 0]) :
-    ExecNormal [nonZeroAdtDecl 0] bodies
+    (hargs :
+      argsMatchInv [nonZeroAdtDecl 0 repr] (nonZeroAdtInv repr) 5 s [.adt 0])
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    ExecNormal [nonZeroAdtDecl 0 repr] bodies
       (getUncheckedNonZeroBodyAt 0 moveFinal) s (fun r =>
-        r.value.valid [nonZeroAdtDecl 0] nonZeroAdtInv r.state 5 .usize) := by
-  cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
-    have hentry := hinit.1
-    have hb : block0 = 0 := hentry.1
-    have hs : stmtIdx0 = 0 := hentry.2.1
-    have hc : curBody0 = none := hentry.2.2.1
-    have hst : stack0 = [] := hentry.2.2.2.1
-    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
-    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
-    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
-    subst hb hs hc hst hfid hnfid hlg
-    cases hargs.1 with
-    | intro v hv =>
-      have hv1 : locals0 1 = some v := hv.1
-      have hvinv : v.valid [nonZeroAdtDecl 0] nonZeroAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        5 (.adt 0) := hv.2
-      cases v with
-      | uninit => cases hvinv
-      | usize _ => cases hvinv
-      | bool _ => cases hvinv
-      | unit => cases hvinv
-      | bytes _ _ => cases hvinv
-      | ref _ _ _ _ => cases hvinv
-      | adt vAdtId inner =>
-        have hveq : vAdtId = 0 := hvinv.1
-        subst hveq
-        cases inner with
-        | uninit => cases hvinv.2.2
-        | bool _ => cases hvinv.2.2
-        | unit => cases hvinv.2.2
-        | adt _ _ => cases hvinv.2.2
-        | bytes _ _ => cases hvinv.2.2
-        | ref _ _ _ _ => cases hvinv.2.2
-        | usize n =>
-          cases n with
-          | zero => exact False.elim (hvinv.2.1 rfl)
-          | succ k =>
-            refine .step rfl (.step rfl ?_)
-            apply ExecNormal.step
-            · change evalMirStmt
-                (getUncheckedNonZeroBodyAt 0 moveFinal) _
-                (.assign (locPlace 3) (.use (.copy (field0Place 1))))
-                [nonZeroAdtDecl 0] = _
-              dsimp only [evalMirStmt, evalOperand, evalPlace, evalProj,
-                MirVal.isFullyInit, assignPlace, locPlace, field0Place,
-                getUncheckedNonZeroBodyAt, updateLocal]
-              rw [hv1]
-              rfl
-            · refine .step rfl (.step rfl (.step rfl ?_))
-              cases moveFinal with
-              | false =>
-                apply ExecNormal.step
-                · change evalMirStmt
-                    (getUncheckedNonZeroBodyAt 0 false) _
-                    (.assign (locPlace 0) (.use (.copy (field0Place 1))))
-                    [nonZeroAdtDecl 0] = _
-                  dsimp only [evalMirStmt, evalOperand, evalPlace, evalProj,
-                    MirVal.isFullyInit, assignPlace, locPlace, field0Place,
-                    getUncheckedNonZeroBodyAt, updateLocal]
-                  rw [hv1]
-                  rfl
-                · exact .step rfl (.normal rfl True.intro)
-              | true =>
-                apply ExecNormal.step
-                · change evalMirStmt
-                    (getUncheckedNonZeroBodyAt 0 true) _
-                    (.assign (locPlace 0) (.use (.move (field0Place 1))))
-                    [nonZeroAdtDecl 0] = _
-                  dsimp only [evalMirStmt, evalOperand, evalPlace, evalProj,
-                    deinitPlace, updateProj, MirVal.isFullyInit, assignPlace,
-                    locPlace, field0Place, getUncheckedNonZeroBodyAt,
-                    updateLocal]
-                  rw [hv1]
-                  rfl
-                · exact .step rfl (.normal rfl True.intro)
+        r.value.valid [nonZeroAdtDecl 0 repr] (nonZeroAdtInv repr) r.state 5
+          .usize) := by
+  cases hrepr with
+  | inl hrepr | inr hrepr =>
+    subst hrepr
+    cases s with
+    | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+      have hentry := hinit.1
+      have hb : block0 = 0 := hentry.1
+      have hs : stmtIdx0 = 0 := hentry.2.1
+      have hc : curBody0 = none := hentry.2.2.1
+      have hst : stack0 = [] := hentry.2.2.2.1
+      have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+      have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+      have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+      subst hb hs hc hst hfid hnfid hlg
+      cases hargs.1 with
+      | intro v hv =>
+        have hv1 : locals0 1 = some v := hv.1
+        have hvinv := hv.2
+        cases v with
+        | uninit => cases hvinv
+        | usize _ => cases hvinv
+        | bool _ => cases hvinv
+        | unit => cases hvinv
+        | fieldCons _ _ => cases hvinv
+        | bytes _ _ => cases hvinv
+        | ref _ _ _ _ => cases hvinv
+        | adt vAdtId inner =>
+          have hveq : vAdtId = 0 := hvinv.1
+          subst hveq
+          cases inner with
+          | uninit => cases hvinv.2.2
+          | bool _ => cases hvinv.2.2
+          | unit => cases hvinv.2.2
+          | adt _ _ => cases hvinv.2.2
+          | fieldCons _ _ => cases hvinv.2.2
+          | bytes _ _ => cases hvinv.2.2
+          | ref _ _ _ _ => cases hvinv.2.2
+          | usize n =>
+            cases n with
+            | zero => exact False.elim (hvinv.2.1 rfl)
+            | succ k =>
+              refine .step rfl (.step rfl ?_)
+              apply ExecNormal.step
+              · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+                  lookupAt, List.foldr, Option.getD, evalMirStmt, evalOperand,
+                  evalPlace, evalProj, getFieldVal, MirVal.isFullyInit,
+                  assignPlace, locPlace, field0Place, getUncheckedNonZeroBodyAt,
+                  updateLocal]
+                rw [hv1]
+                rfl
+              · refine .step rfl (.step rfl (.step rfl ?_))
+                cases moveFinal with
+                | false =>
+                  apply ExecNormal.step
+                  · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+                      lookupAt, List.foldr, Option.getD,
+                      getUncheckedNonZeroBodyAt]
+                    rw [if_false_eq (by intro h; cases h)]
+                    dsimp only [evalMirStmt, evalOperand, evalPlace, evalProj,
+                      getFieldVal, MirVal.isFullyInit, assignPlace, locPlace,
+                      field0Place, updateLocal]
+                    rw [hv1]
+                    rfl
+                  · exact .step rfl (.normal rfl True.intro)
+                | true =>
+                  apply ExecNormal.step
+                  · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+                      lookupAt, List.foldr, Option.getD,
+                      getUncheckedNonZeroBodyAt]
+                    rw [if_true_eq rfl]
+                    dsimp only [evalMirStmt, evalOperand, evalPlace, evalProj,
+                      getFieldVal, setFieldVal, deinitPlace, updateProj,
+                      MirVal.isFullyInit, assignPlace, locPlace, field0Place,
+                      updateLocal]
+                    rw [hv1]
+                    rfl
+                  · exact .step rfl (.normal rfl True.intro)
 
 /-- `getUncheckedNonZeroBodyAt 0 moveFinal` satisfies `FnBodySafetyVerified`
 for any `fn` and `body` whose lowered body is `getUncheckedNonZeroBodyAt 0
 moveFinal`. -/
 theorem getUncheckedNonZeroBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem} {repr : AdtRepr}
     (moveFinal : Bool) (fn : CapturedFn)
     (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = getUncheckedNonZeroBodyAt 0 moveFinal) :
-    FnBodySafetyVerified [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn body := by
+    (hres : lowerBody body = getUncheckedNonZeroBodyAt 0 moveFinal)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false)
+    (hrepr : repr = .rust ∨ repr = .transparent) :
+    FnBodySafetyVerified [nonZeroAdtDecl 0 repr] bodies (nonZeroAdtInv repr) fn
+      body tcb := by
+  have hl0 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr]
+        (getUncheckedNonZeroBodyAt 0 moveFinal) (fun _ => 0) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
+  have hl1 :
+      LocalLayoutsAdmitted [nonZeroAdtDecl 0 repr]
+        (getUncheckedNonZeroBodyAt 0 moveFinal) (fun _ => 1) = true := by
+    cases hrepr with
+    | inl h | inr h => subst h; rfl
   have hwf :
-      StaticBodyWf [nonZeroAdtDecl 0]
+      StaticBodyWf [nonZeroAdtDecl 0 repr]
         (getUncheckedNonZeroBodyAt 0 moveFinal) :=
     mkStaticBodyWf
       (hcount := Nat.le_succ_of_le
         (Nat.le_succ_of_le (Nat.le_succ_of_le (Nat.le_refl 2))))
       (hblocks := Nat.zero_lt_succ 2)
+      (hl0 := hl0)
+      (hl1 := hl1)
   exact execNormal_fnBodySafetyVerified_of_lowerBody fn body
     (getUncheckedNonZeroBodyAt 0 moveFinal) hres
     (by cases moveFinal <;> rfl)
     (contractWellFormed_of_simple hwf rfl (by cases moveFinal <;> rfl))
+    hpin
     (fun s hinitS hargsS _ =>
-      getUncheckedNonZeroBody_execNormal moveFinal s hinitS hargsS)
+      getUncheckedNonZeroBody_execNormal moveFinal s hinitS hargsS hrepr)
 
 /-- Canary: a safe function `buggy_zero` that returns
 `NonZeroUsize { val: 0 }` violates `SafetyPost` and refutes
@@ -2318,7 +2186,7 @@ theorem canary_buggy_zero_rejected (fnName : String) :
             (MirSem [nonZeroAdtDecl 0] bodies buggyZeroBody s0).val hdef
               (.terminated [] (.normal v)) :=
           ⟨hinit, n, hv.1⟩
-        have hinv := (hval _ hpfx).1 [] v rfl
+        have hinv := (hval _ hpfx).1.1 [] v rfl
         have hv_eq : v.value = .adt 0 (.usize 0) := hv.2
         rw [hv_eq] at hinv
         exact hinv.2.1 rfl
@@ -2370,7 +2238,7 @@ theorem canary_safe_new_unchecked_with_requires_rejected (fnName : String) :
             (MirSem [nonZeroAdtDecl 0] bodies newUncheckedBody s0).val hdef
               (.terminated [] (.normal v)) :=
           ⟨hinit, n, hv.1⟩
-        have hinv := (hval _ hpfx).1 [] v rfl
+        have hinv := (hval _ hpfx).1.1 [] v rfl
         have hv_eq : v.value = .adt 0 (.usize 0) := hv.2
         rw [hv_eq] at hinv
         exact hinv.2.1 rfl
@@ -2400,34 +2268,38 @@ theorem loopBody_reaches_running {bodies : List BodyDecl} (n : Nat) :
   | succ k ih =>
     intro s tr out hb hs hc hreach
     have hstep0 :
-        evalMirStep [] bodies loopBody s =
+        (evalMirStep [] bodies loopBody s).toStepResult (Obs := Empty) =
           StepResult.silent { s with block := 0, stmtIdx := 0 } := by
       cases s with
-      | mk locals localGens block stmtIdx tySizes curBody stack frameId nextFrameId =>
+      | mk locals localGens block stmtIdx tySizes curBody stack frameId nextFrameId adtPad ubChecks =>
         dsimp at hb hs hc
         subst hb hs hc
         rfl
     cases hreach with
     | step _ _ _ obs _ _ _ _ => nomatch obs
     | choice _ _ s' branches _ _ h1 hbr h2 =>
-      have h1' : StepResult.choice branches = evalMirStep [] bodies loopBody s := h1
+      have h1' :
+          StepResult.choice branches =
+            (evalMirStep [] bodies loopBody s).toStepResult := h1
       rw [hstep0] at h1'
       injection h1' with hbr_eq
       subst hbr_eq
       subst hbr
       exact ih { s with block := 0, stmtIdx := 0 } tr out rfl rfl hc h2
     | emptyChoice _ _ branches h1 hemp =>
-      have h1' : StepResult.choice branches = evalMirStep [] bodies loopBody s := h1
+      have h1' :
+          StepResult.choice branches =
+            (evalMirStep [] bodies loopBody s).toStepResult := h1
       rw [hstep0] at h1'
       injection h1' with hbr_eq
       subst hbr_eq
       exact False.elim (hemp ⟨{ s with block := 0, stmtIdx := 0 }, rfl⟩)
     | terminated _ _ _ h1 =>
-      have h1' : _ = evalMirStep [] bodies loopBody s := h1
+      have h1' : _ = (evalMirStep [] bodies loopBody s).toStepResult := h1
       rw [hstep0] at h1'
       cases h1'
     | failed _ _ h1 =>
-      have h1' : _ = evalMirStep [] bodies loopBody s := h1
+      have h1' : _ = (evalMirStep [] bodies loopBody s).toStepResult := h1
       rw [hstep0] at h1'
       cases h1'
     | noStep _ _ hnostep =>
@@ -2830,7 +2702,8 @@ theorem fc2_7_transmute_from_adt_to_usize_and_priv_adt_blocked :
 /-- Canary:
 1. `RefWrap` (`fields := [{ ty := .ref .usize, access := .pubSafe }]`) has a
    valid value when its inner reference resolves to a live `.usize`,
-2. a two-field struct value has no transmutation bit pattern, and
+2. an ill-typed struct value missing its second field has no transmutation bit
+   pattern, and
 3. returning an outer reference whose pointee reference was killed by
    `Stmt.storageDead` fails at `Terminator.return_`. -/
 def killTargetOfNestedRefBody : MirBody where
@@ -2897,11 +2770,12 @@ theorem holdout_A5_part2_pub_bool_restricted_inv_refuted :
     ¬ AdmissibleAdtInv [pubBoolAdtDecl] restrictedPubBoolInv := by
   intro hAdm
   have hfalse : restrictedPubBoolInv 0 (.bool false) :=
-    hAdm.2 pubBoolAdtDecl (.head _) rfl (constEntryState (fun _ => 8)) .bool
-      (.bool false) rfl True.intro
+    hAdm.2 pubBoolAdtDecl (.head _) rfl (constEntryState (fun _ => 8))
+      (.bool false) True.intro
   cases hfalse
 
-/-- A constant body with an argument is never a successful constant. -/
+/-- A constant body with an argument is never a successful constant and fails
+`.evalConst` because `evalMirStmt` requires `cBody.argTys.isEmpty`. -/
 def branchingArgConstBody : MirBody where
   localCount := 2
   argTys := [.bool]
@@ -2913,8 +2787,21 @@ def branchingArgConstBody : MirBody where
       terminator := .return_ }
   ]
 
+def evalBranchingArgConstBody : MirBody where
+  localCount := 2
+  argTys := []
+  retTy := .unit
+  blocks := [{
+    stmts := [.evalConst (locPlace 0) ⟨0⟩ []]
+    terminator := .return_
+  }]
+
 theorem holdout_B3_part1_branching_arg_const_rejected :
-    ∀ tySizes, ¬ ConstSucceeds [] [] tySizes branchingArgConstBody := by
+    let bodies : List BodyDecl := [{ id := ⟨0⟩, body := branchingArgConstBody }]
+    (∀ tySizes, ¬ ConstSucceeds [] [] tySizes branchingArgConstBody) ∧
+    evalMirStep [] bodies evalBranchingArgConstBody
+      (constEntryState (fun _ => 8)) = .failed := by
+  refine ⟨?_, rfl⟩
   intro _ h
   cases h.1
 
@@ -2976,7 +2863,7 @@ theorem canary_c1_holder_unreachable_rejected (fnName : String) :
     (bodies := bodies) (fn := { name := fnName, bodyId := ⟨0⟩ })
     holderInitState ⟨hinit, hargs, True.intro⟩ (.fail rfl)
 
-/-! ### F1: a required constant the model cannot evaluate -/
+/-! ### F1: an inline constant the model cannot evaluate -/
 
 /-- `impl Make for () { const ONE: NonZeroUsize =
 { let x: usize = 1; unsafe { core::mem::transmute_copy(&x) } }; }`. `rustc`
@@ -3000,7 +2887,7 @@ def oneConstBody : MirBody where
       terminator := .return_ }
   ]
 
-/-- `pub fn boom() -> usize { let _one = <() as Make>::ONE;
+/-- `pub fn boom() -> usize { let _one = const { ... };
 unsafe { core::hint::unreachable_unchecked() } }`. -/
 def boomBody (constId : BodyId := ⟨0⟩) : MirBody where
   argTys := []
@@ -3009,28 +2896,15 @@ def boomBody (constId : BodyId := ⟨0⟩) : MirBody where
   blocks := [
     { stmts := [
         .storageLive ⟨1⟩,
-        .assign (locPlace 1) (.use (.constVal (.adt 0 (.usize 1)))),
+        .evalConst (locPlace 1) constId [],
         .storageDead ⟨1⟩
       ]
       terminator := .unreachable }
   ]
-  requiredConsts := [(constId, [])]
 
-theorem oneConst_fails {bodies : List BodyDecl} (tySizes : Nat → Nat) :
-    ¬ ConstSucceeds [nonZeroAdtDecl 0] bodies tySizes oneConstBody := by
-  intro h
-  have hfail :
-      ExecFail [nonZeroAdtDecl 0] bodies oneConstBody
-        (constEntryState tySizes) := by
-    repeat (first | exact ExecFail.fail rfl | refine ExecFail.step rfl ?_)
-  cases h.2 with
-  | intro n hn =>
-    cases hn with
-    | intro v hr => exact execFail_not_normal hfail hr
-
-/-- Canary (F1 exploit `/tmp/fc002/a`): a function whose required constant the
-model cannot evaluate violates `ConstsTotal` (and thus `ContractWellFormed`),
-so the crate is rejected rather than vacuously accepted. -/
+/-- Canary (F1 exploit `/tmp/fc002/a`): a function whose `.evalConst` constant
+the model cannot evaluate steps to `.failed` at `.evalConst`, and the crate is
+rejected rather than vacuously accepted. -/
 theorem canary_f1_unevaluable_const_rejected (fnName : String) :
     let bodies : List BodyDecl := [
       { id := ⟨0⟩, body := oneConstBody },
@@ -3042,29 +2916,22 @@ theorem canary_f1_unevaluable_const_rejected (fnName : String) :
       functions := [{ name := fnName, bodyId := ⟨1⟩ }]
     } := by
   intro bodies
-  refine crateTheorem_single_rejects_of_not_constsTotal
-    (bodies := bodies) (fn := { name := fnName, bodyId := ⟨1⟩ }) ?_
-  intro htot
-  cases htot (fun _ => 1) _ validTySizes_one (.direct (.head _)) with
-  | intro cBody hc =>
-    have h2 : some oneConstBody = some cBody := hc.1
-    injection h2 with h3
-    subst h3
-    have hfail :
-        ExecFail [nonZeroAdtDecl 0] bodies oneConstBody
-          (constEntryState (fun _ => 1)) := by
-      repeat (first | exact ExecFail.fail rfl | refine ExecFail.step rfl ?_)
-    cases hc.2 with
-    | inl hS => exact oneConst_fails _ hS
-    | inr hU =>
-      cases hU.2 with
-      | intro n hr => exact execFail_not_unwind hfail hr
+  let s0 : MirState := { locals := fun _ => none, block := 0, stmtIdx := 0 }
+  have hargs : argsMatchInv [nonZeroAdtDecl 0] defaultAdtInv 2 s0 [] :=
+    fun _ _ _ => rfl
+  have hargsInv : argsMatchInv [nonZeroAdtDecl 0] nonZeroAdtInv 2 s0 [] :=
+    fun _ _ _ => rfl
+  have hinit : initMirState [nonZeroAdtDecl 0] bodies (boomBody ⟨0⟩) s0 :=
+    ⟨mkInitEntryState hargs, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  exact crateTheorem_single_rejects_of_fail
+    (bodies := bodies) (fn := { name := fnName, bodyId := ⟨1⟩ })
+    s0 ⟨hinit, hargsInv, True.intro⟩ (.step rfl (.fail rfl))
 
-/-! ### Pass 3: parameterized required constants must be total across `tySizes` -/
+/-! ### Pass 3: parameterized `.evalConst` must succeed across all `tySizes` -/
 
-/-- A required constant that branches on `size_of::<T0>() == 1`: when
-`tySizes 0 ≠ 1` it returns `()` normally (`ConstSucceeds`), and when
-`tySizes 0 = 1` it executes `unreachable` (stepping to `.failed`). -/
+/-- A constant that branches on `size_of::<T0>() == 1`: when
+`tySizes 0 ≠ 1` it returns `()` normally, and when `tySizes 0 = 1` it executes
+`unreachable` (stepping to `.failed`). -/
 def branchingFailConstBody : MirBody where
   argTys := []
   retTy := .unit
@@ -3086,69 +2953,56 @@ def branchingFailConstBody : MirBody where
     { stmts := []
       terminator := .unreachable }
   ]
-  requiredConsts := []
 
-/-- Generic function gated on `branchingFailConstBody`. -/
+/-- Generic function gated on `branchingFailConstBody` via `.evalConst`. -/
 def branchingFailConstFnBody (constId : BodyId := ⟨0⟩) : MirBody where
   argTys := [.param 0]
   retTy := .usize
-  localCount := 2
+  localCount := 3
   blocks := [
-    { stmts := [.assign (locPlace 0) (.use (.constVal (.usize 0)))]
+    { stmts := [
+        .evalConst (locPlace 2) constId [.param 0],
+        .assign (locPlace 0) (.use (.constVal (.usize 0)))
+      ]
       terminator := .return_ }
   ]
-  requiredConsts := [(constId, [.param 0])]
 
-/-- Negative adequacy canary: a generic function whose required constant
-succeeds on `tySizes 0 = 8` (`≠ 1`) but steps to `.failed` on `tySizes 0 = 1`
-violates `ConstsTotal`, so its `initMirState` is empty everywhere,
-`NonVacuousOn` is refuted for every `pre`, and `CrateTheorem` is rejected. -/
+/-- Negative adequacy canary: a generic function whose `.evalConst` succeeds on
+`tySizes 0 = 8` (`≠ 1`) but steps to `.failed` on `tySizes 0 = 1` fails from a
+valid entry state and refutes `CrateTheorem`. -/
 theorem canary_branching_const_fail_rejects_crate (fnName : String) :
     let bodies : List BodyDecl := [
       { id := ⟨0⟩, body := branchingFailConstBody },
       { id := ⟨1⟩, body := (branchingFailConstFnBody ⟨0⟩) }
     ]
-    ConstSucceeds [] bodies (fun _ => 8) branchingFailConstBody ∧
-    ¬ ConstsTotal [] bodies (branchingFailConstFnBody ⟨0⟩) ∧
-    (∀ pre,
-      ¬ NonVacuousOn
-        (initMirState [] bodies (branchingFailConstFnBody ⟨0⟩)) pre) ∧
+    let s1 : MirState := {
+      locals := updateLocal (fun _ => none) 1 (some (.bytes 1 0))
+      block := 0
+      stmtIdx := 0
+      tySizes := fun _ => 1
+    }
+    ExecNormal [] bodies (branchingFailConstFnBody ⟨0⟩) pmeInitState
+      (fun r => r.value = .usize 0) ∧
+    ExecFail [] bodies (branchingFailConstFnBody ⟨0⟩) s1 ∧
     ¬ CrateTheorem {
       bodies := bodies
       functions := [{ name := fnName, bodyId := ⟨1⟩ }]
     } := by
-  intro bodies
-  have hsuc8 : ConstSucceeds [] bodies (fun _ => 8) branchingFailConstBody := by
-    refine ⟨rfl, ?_⟩
-    have hexec : ExecNormal [] bodies branchingFailConstBody
-        (constEntryState (fun _ => 8)) (fun r => r.value = .unit) := by
-      repeat (first | exact ExecNormal.normal rfl rfl | refine ExecNormal.step rfl ?_)
-    cases execNormal_reaches hexec with
-    | intro n hn =>
-      cases hn with
-      | intro v hv => exact ⟨n, v, hv.1⟩
-  have hnotTot : ¬ ConstsTotal [] bodies (branchingFailConstFnBody ⟨0⟩) := by
-    intro htot
-    cases htot (fun _ => 1) _ validTySizes_one (.direct (.head _)) with
-    | intro cBody hc =>
-      have hEq : some branchingFailConstBody = some cBody := hc.1
-      injection hEq with hBody
-      subst hBody
-      have hfail : ExecFail [] bodies branchingFailConstBody
-          (constEntryState (fun _ => 1)) := by
-        repeat (first | exact ExecFail.fail rfl | refine ExecFail.step rfl ?_)
-      cases hc.2 with
-      | inl hS =>
-        cases hS.2 with
-        | intro n hn =>
-          cases hn with
-          | intro v hr => exact execFail_not_normal hfail hr
-      | inr hU =>
-        cases hU.2 with
-        | intro n hr => exact execFail_not_unwind hfail hr
-  refine ⟨hsuc8, hnotTot, fun _ ⟨_, hinit, _⟩ => hnotTot hinit.2.1, ?_⟩
-  exact crateTheorem_single_rejects_of_not_constsTotal
-    (bodies := bodies) (fn := { name := fnName, bodyId := ⟨1⟩ }) hnotTot
+  intro bodies s1
+  have hsuc8 :
+      ExecNormal [] bodies (branchingFailConstFnBody ⟨0⟩) pmeInitState
+        (fun r => r.value = .usize 0) :=
+    .step rfl (.step rfl (.normal rfl rfl))
+  have hfail1 : ExecFail [] bodies (branchingFailConstFnBody ⟨0⟩) s1 :=
+    .fail rfl
+  refine ⟨hsuc8, hfail1, ?_⟩
+  have hargs : argsMatchInv [] defaultAdtInv 3 s1 [.param 0] :=
+    ⟨⟨.bytes 1 0, rfl, rfl⟩, fun j hj _ => updateLocal_one_gt_one j hj⟩
+  have hinit : initMirState [] bodies (branchingFailConstFnBody ⟨0⟩) s1 :=
+    ⟨mkInitEntryState hargs, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  exact crateTheorem_single_rejects_of_fail
+    (bodies := bodies) (fn := { name := fnName, bodyId := ⟨1⟩ })
+    s1 ⟨hinit, hargs, True.intro⟩ hfail1
 
 /-! ### Pass 3 (`P3-M1`): user specifications restricted to `effectivePre` -/
 
@@ -3184,7 +3038,7 @@ theorem idNonZeroUnchecked_execNormal {bodies : List BodyDecl} (s : MirState)
       s.locals 1 = some r.value ∧
       r.value.valid [] defaultAdtInv r.state 4 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -3197,14 +3051,13 @@ theorem idNonZeroUnchecked_execNormal {bodies : List BodyDecl} (s : MirState)
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        4 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
@@ -3229,18 +3082,20 @@ theorem idNonZeroUnchecked_execNormal {bodies : List BodyDecl} (s : MirState)
 `unsafe fn` (`fn.isUnsafe = true`) whose lowered body is
 `idNonZeroUncheckedBody` with `fn.requires = newUncheckedRequires`. -/
 theorem idNonZeroUnchecked_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
     (hres : lowerBody body = idNonZeroUncheckedBody)
     (hunsafe : fn.isUnsafe = true)
-    (hreq : fn.requires = newUncheckedRequires) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body := by
+    (hreq : fn.requires = newUncheckedRequires)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb := by
   have hwf : StaticBodyWf [] idNonZeroUncheckedBody :=
     mkStaticBodyWf
       (hcount := Nat.le_succ_of_le (Nat.le_succ_of_le (Nat.le_refl 2)))
       (hblocks := Nat.zero_lt_succ 2)
   refine execNormal_fnBodySafetyVerified_of_lowerBody fn body
     idNonZeroUncheckedBody hres rfl
-    (contractWellFormed_of_simple hwf rfl rfl) ?_
+    (contractWellFormed_of_simple hwf rfl rfl) hpin ?_
   intro s hinitS _ hsafetyImp
   have hsafetyS : newUncheckedSafetyPre s := by
     have h1 := hsafetyImp hunsafe
@@ -3354,7 +3209,7 @@ theorem clampNonZero_execNormal {bodies : List BodyDecl} (s : MirState)
       r.value.valid [] defaultAdtInv r.state 4 .usize ∧
       (newUncheckedSafetyPre s → s.locals 1 = some r.value)) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -3367,14 +3222,13 @@ theorem clampNonZero_execNormal {bodies : List BodyDecl} (s : MirState)
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        4 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
@@ -3402,15 +3256,17 @@ theorem clampNonZero_execNormal {bodies : List BodyDecl} (s : MirState)
 /-- `clampNonZeroBody` satisfies `FnBodySafetyVerified` unconditionally for any
 `fn` and `body` whose lowered body is `clampNonZeroBody`. -/
 theorem clampNonZeroBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = clampNonZeroBody) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body := by
+    (hres : lowerBody body = clampNonZeroBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb := by
   have hwf : StaticBodyWf [] clampNonZeroBody :=
     mkStaticBodyWf
       (hcount := Nat.le_succ_of_le (Nat.le_succ_of_le (Nat.le_refl 2)))
       (hblocks := Nat.zero_lt_succ 3)
   exact execNormal_fnBodySafetyVerified_of_lowerBody fn body clampNonZeroBody
-    hres rfl (contractWellFormed_of_simple hwf rfl rfl)
+    hres rfl (contractWellFormed_of_simple hwf rfl rfl) hpin
     (fun s hinitS _ _ => (clampNonZero_execNormal s hinitS).map (fun _ h => h.1))
 
 /-- Positive canary: a safe function (`isUnsafe = false`) with body
@@ -3461,12 +3317,14 @@ theorem canary_c3_ret_inv_reads_terminal_state :
       stmtIdx := 0
     }
     let r : MirReturn := ⟨.ref 0 0 ⟨2⟩, final⟩
-    (∀ h, (EnsuresRetLibInv [] [] defaultAdtInv idRefBody (fun _ => True)
+    (∀ h, (EnsuresRetLibInv [] [] defaultAdtInv idRefBody (fun _ => True) false
       entry).val h (.terminated [] (.normal r))) ∧
     ¬ r.value.valid [] defaultAdtInv entry idRefBody.localCount idRefBody.retTy := by
   intro entry final r
   refine ⟨?_, fun h => h.2.2⟩
-  intro _ tr r' hout
+  intro _
+  refine ⟨?_, fun _ h => by cases h⟩
+  intro tr r' hout
   injection hout with _ hterm
   injection hterm with hr
   subst hr
@@ -3545,23 +3403,27 @@ def checkParam0Size8ConstBody : MirBody where
   }]
 
 def innerPmeBody (constId : BodyId := ⟨0⟩) : MirBody where
-  localCount := 2
+  localCount := 3
   argTys := [.param 0]
   retTy := .param 0
-  requiredConsts := [(constId, [.param 0])]
   blocks := [{
-    stmts := [.assign (locPlace 0) (.use (.copy (locPlace 1)))]
+    stmts := [
+      .evalConst (locPlace 2) constId [.param 0],
+      .assign (locPlace 0) (.use (.copy (locPlace 1)))
+    ]
     terminator := .return_
   }]
 
 /-- `innerPmeBody` instantiated at `[.param 1, .param 0]`. -/
 def innerPmeSwappedInst (constId : BodyId := ⟨0⟩) : MirBody where
-  localCount := 2
+  localCount := 3
   argTys := [.param 1]
   retTy := .param 1
-  requiredConsts := [(constId, [.param 1])]
   blocks := [{
-    stmts := [.assign (locPlace 0) (.use (.copy (locPlace 1)))]
+    stmts := [
+      .evalConst (locPlace 2) constId [.param 1],
+      .assign (locPlace 0) (.use (.copy (locPlace 1)))
+    ]
     terminator := .return_
   }]
 
@@ -3590,50 +3452,27 @@ def outerSwappedGenericBody (calleeId : BodyId := ⟨1⟩) : MirBody where
       terminator := .return_ }
   ]
 
-/-- Canary (ported `holdout_B3_part2`, rephrased for substitution): a swapped
-generic call carries the callee's required constant into the caller's
-parameter space (`.param 0` becomes the caller's `.param 1`), and a constant
-that cannot succeed there makes the caller inadmissible under every
-`tySizes`. -/
+/-- Canary (ported `holdout_B3_part2`, rephrased for inline `.evalConst`): a
+swapped generic call carries the callee's `.evalConst` type arguments into the
+caller's parameter space (`.param 0` becomes the caller's `.param 1`), and a
+constant that fails there makes the caller step to `.failed`. -/
 theorem holdout_B3_part2_swapped_generic_call1_rejected :
     let bodies : List BodyDecl := [
       { id := ⟨0⟩, body := checkParam0Size8ConstBody },
       { id := ⟨1⟩, body := (innerPmeBody ⟨0⟩) }
     ]
     checkParam0Size8ConstBody.subst [.param 1] = some checkParam1Inst ∧
-    ∀ tySizes,
-      ¬ MonoAdmitted [] bodies tySizes (outerSwappedGenericBody ⟨1⟩) := by
-  intro bodies
-  refine ⟨rfl, fun tySizes hmono => ?_⟩
-  have hreq0 : RequiresConst bodies
-      (some (innerPmeSwappedInst ⟨0⟩))
-      ((findBody bodies ⟨0⟩).bind (MirBody.subst [.param 1])) :=
-    .direct (.head _)
-  have hreq : RequiresConst bodies
-      (some (outerSwappedGenericBody ⟨1⟩))
-      ((findBody bodies ⟨0⟩).bind (MirBody.subst [.param 1])) :=
-    .viaCall (.head _) rfl hreq0
-  cases hmono _ hreq with
-  | intro cBody hc =>
-    have h2 : some checkParam1Inst = some cBody := hc.1
-    injection h2 with h3
-    subst h3
-    have hfail : ExecFail [] bodies checkParam1Inst (constEntryState tySizes) :=
-      .step rfl (.fail rfl)
-    cases hc.2.2 with
-    | intro n hn =>
-      cases hn with
-      | intro v hr => exact execFail_not_normal hfail hr
+    (innerPmeBody ⟨0⟩).subst [.param 1, .param 0] =
+      some (innerPmeSwappedInst ⟨0⟩) ∧
+    ExecFail [] bodies (outerSwappedGenericBody ⟨1⟩) pmeInitState :=
+  ⟨rfl, rfl, .step rfl (.fail rfl)⟩
 
 /-! ### R-2: unsupported struct shapes are local -/
 
-/-- `struct Pair { a: usize, b: bool }` (two fields: unsupported). -/
-def twoFieldAdtDecl : AdtDecl where
+/-- `struct UnmodeledWrap { f: Unmodeled }` (contains an unmodeled field). -/
+def unmodeledFieldAdtDecl : AdtDecl where
   id := 0
-  fields := [
-    { ty := .usize, access := .pubSafe },
-    { ty := .bool, access := .pubSafe }
-  ]
+  fields := [{ ty := .unmodeled, access := .pubSafe }]
 
 /-- `struct Node { next: &'static Node }` (a declaration cycle through a
 reference). -/
@@ -3646,10 +3485,10 @@ mentions it fails closed at entry, but merely declaring it does not block the
 crate-level `AdmissibleAdtInv` conjunct. A cyclic declaration is likewise ill
 formed rather than looping. -/
 theorem canary_r2_unsupported_struct_is_local :
-    MirTy.wfInAdts [twoFieldAdtDecl] (.adt 0) = false ∧
-    AdmissibleAdtInv [twoFieldAdtDecl] defaultAdtInv ∧
+    MirTy.wfInAdts [unmodeledFieldAdtDecl] (.adt 0) = false ∧
+    AdmissibleAdtInv [unmodeledFieldAdtDecl] defaultAdtInv ∧
     MirTy.wfInAdts [nodeAdtDecl] (.adt 0) = false :=
-  ⟨rfl, ⟨⟨True.intro, True.intro⟩, fun _ _ _ _ _ _ _ _ => True.intro⟩, rfl⟩
+  ⟨rfl, ⟨⟨True.intro, True.intro⟩, fun _ _ _ _ _ _ => True.intro⟩, rfl⟩
 
 /-! ### Three-stage pipeline canaries: partial moves, `placeMention`, `assert` -/
 
@@ -3732,6 +3571,538 @@ theorem canary_assert_terminator_branches_or_unwinds :
     evalMirStep [] [] assertTrueBody sFalse = .terminated .unwind :=
   ⟨⟨_, rfl, rfl⟩, rfl⟩
 
+/-! ### Forward-compatible MIR layout, padding, and TCB waiver canaries -/
+
+/-- `#[repr(C)] pub struct PairU32 { pub a: u32, pub b: u32 }` (`size = 8`,
+`align = 4`, `offset_of!(PairU32, a) = 0`, `offset_of!(PairU32, b) = 4`). -/
+def pairU32AdtDecl : AdtDecl where
+  id := 0
+  repr := .c
+  fields := [
+    { ty := .uint 32, access := .pubSafe },
+    { ty := .uint 32, access := .pubSafe }
+  ]
+
+/-- `#[repr(C)] pub struct PaddedReprC { pub a: u8, pub b: u32 }` (`size = 8`
+due to 3 bytes of internal alignment padding between `a` and `b`). -/
+def paddedReprCAdtDecl : AdtDecl where
+  id := 0
+  repr := .c
+  fields := [
+    { ty := .uint 8, access := .pubSafe },
+    { ty := .uint 32, access := .pubSafe }
+  ]
+
+/-- Canary: `#[repr(C)]` layout queries (`sizeOf`, `alignOf`, `offsetOf`)
+compute exact C layout, padding-free `PairU32` transmutes to `[u8; 8]`, and
+padded `PaddedReprC` (`size = 8 > 1 + 4`) is rejected by
+`extractTransmuteBits`. -/
+theorem canary_repr_c_layout_and_padding_guard :
+    let s : MirState := {
+      locals := fun i =>
+        if i == 1 then some (.adt 0 (.fieldCons (.usize 1) (.usize 2)))
+        else none
+      block := 0
+      stmtIdx := 0
+    }
+    evalLayoutQuery [pairU32AdtDecl] (fun _ => 8) (.sizeOf (.adt 0)) =
+      some 8 ∧
+    evalLayoutQuery [pairU32AdtDecl] (fun _ => 8) (.alignOf (.adt 0)) =
+      some 4 ∧
+    evalLayoutQuery [pairU32AdtDecl] (fun _ => 8) (.offsetOf (.adt 0) 0 0) =
+      some 0 ∧
+    evalLayoutQuery [pairU32AdtDecl] (fun _ => 8) (.offsetOf (.adt 0) 0 1) =
+      some 4 ∧
+    evalTransmuteCopy [pairU32AdtDecl] s (.adt 0) (.array (.uint 8) 8)
+      (.ref 0 0 ⟨1⟩) = some (.bytes 8 (1 + 2 * Nat.pow 2 32)) ∧
+    evalLayoutQuery [paddedReprCAdtDecl] (fun _ => 8) (.sizeOf (.adt 0)) =
+      some 8 ∧
+    evalTransmuteCopy [paddedReprCAdtDecl] s (.adt 0) (.array (.uint 8) 8)
+      (.ref 0 0 ⟨1⟩) = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Single-field public wrapper `pub struct Wrap(pub usize)` parameterized by
+`repr`. -/
+def pubWrapAdtDecl (repr : AdtRepr) : AdtDecl where
+  id := 0
+  repr := repr
+  fields := [{ ty := .usize, access := .pubSafe }]
+
+theorem pubWrapAdtInv_admissible {repr : AdtRepr} :
+    AdmissibleAdtInv [pubWrapAdtDecl repr]
+      (denoteAdtInv [pubWrapAdtDecl repr]) := by
+  refine ⟨⟨True.intro, True.intro⟩, ?_⟩
+  intro decl hmem _ _ _ _
+  cases hmem with
+  | head => exact True.intro
+  | tail _ hnil => cases hnil
+
+/-- `#[repr(Rust)] pub struct RustWrap(pub usize)` with unspecified layout
+padding `s.adtPad 0`. -/
+abbrev reprRustWrapAdtDecl : AdtDecl := pubWrapAdtDecl .rust
+
+/-- Unguarded `unsafe { core::mem::transmute::<RustWrap, usize>(x) }`. -/
+def reprRustUnguardedTransmuteBody : MirBody where
+  argTys := [.adt 0]
+  retTy := .usize
+  localCount := 2
+  blocks := [{
+    stmts := [
+      .assign (locPlace 0)
+        (.cast (.transmute (.adt 0)) (.move (locPlace 1)) .usize)
+    ]
+    terminator := .return_
+  }]
+
+/-- Const-guarded `const { assert!(size_of::<RustWrap>() ==
+size_of::<usize>()) }; unsafe { core::mem::transmute::<RustWrap, usize>(x) }`.
+-/
+def reprRustGuardedTransmuteBody (constId : BodyId := ⟨0⟩) : MirBody where
+  argTys := [.adt 0]
+  retTy := .usize
+  localCount := 3
+  blocks := [{
+    stmts := [
+      .evalConst (locPlace 2) constId [],
+      .assign (locPlace 0)
+        (.cast (.transmute (.adt 0)) (.move (locPlace 1)) .usize)
+    ]
+    terminator := .return_
+  }]
+
+/-- Canary:
+1. Unguarded `transmute` on a `#[repr(Rust)]` struct steps to `.failed` when the
+   compiler inserts padding (`s.adtPad 0 = 4`), refuting `CrateTheorem`.
+2. Adding a compile-time size assertion (`const { assert!(size_of::<RustWrap>()
+   == size_of::<usize>()) }`) converts the `s.adtPad 0 = 4` execution from UB
+   (`.failed`) into `.terminated .compileTimeError`, which is still rejected by
+   `CrateTheorem` unless `TCBItem.compileTimeGuard` is recorded in `c.tcb`. -/
+theorem canary_repr_rust_transmute_and_compile_time_guard (fnName : String) :
+    let sPadded : MirState := {
+      locals := updateLocal (fun _ => none) 1 (some (.adt 0 (.usize 7)))
+      block := 0
+      stmtIdx := 0
+      adtPad := fun _ => 4
+    }
+    let bodiesGuarded : List BodyDecl := [
+      { id := ⟨0⟩, body := (sizeEqConstBodyAt (.adt 0) .usize) },
+      { id := ⟨1⟩, body := (reprRustGuardedTransmuteBody ⟨0⟩) }
+    ]
+    evalMirStep [reprRustWrapAdtDecl] [] reprRustUnguardedTransmuteBody
+      sPadded = .failed ∧
+    ¬ CrateTheorem {
+      adts := [reprRustWrapAdtDecl]
+      bodies := [{ id := ⟨0⟩, body := reprRustUnguardedTransmuteBody }]
+      functions := [{ name := fnName, bodyId := ⟨0⟩ }]
+    } ∧
+    ExecCompileTimeError [reprRustWrapAdtDecl] bodiesGuarded
+      (reprRustGuardedTransmuteBody ⟨0⟩) sPadded ∧
+    ¬ CrateTheorem {
+      adts := [reprRustWrapAdtDecl]
+      bodies := bodiesGuarded
+      functions := [{ name := fnName, bodyId := ⟨1⟩ }]
+    } := by
+  intro sPadded bodiesGuarded
+  have hargsU :
+      argsMatchInv [reprRustWrapAdtDecl] defaultAdtInv 2 sPadded [.adt 0] :=
+    ⟨⟨.adt 0 (.usize 7), rfl, rfl, True.intro, True.intro⟩,
+     fun j hj _ => updateLocal_one_gt_one j hj⟩
+  have hinitU :
+      initMirState [reprRustWrapAdtDecl]
+        [{ id := ⟨0⟩, body := reprRustUnguardedTransmuteBody }]
+        reprRustUnguardedTransmuteBody sPadded :=
+    ⟨mkInitEntryState hargsU, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  have hRejU :
+      ¬ CrateTheorem {
+        adts := [reprRustWrapAdtDecl]
+        bodies := [{ id := ⟨0⟩, body := reprRustUnguardedTransmuteBody }]
+        functions := [{ name := fnName, bodyId := ⟨0⟩ }]
+      } :=
+    crateTheorem_single_rejects_of_fail
+      (adts := [reprRustWrapAdtDecl])
+      (bodies := [{ id := ⟨0⟩, body := reprRustUnguardedTransmuteBody }])
+      (fn := { name := fnName, bodyId := ⟨0⟩ })
+      sPadded ⟨hinitU, hargsU, True.intro⟩ (.fail rfl)
+  have hexecCte :
+      ExecCompileTimeError [reprRustWrapAdtDecl] bodiesGuarded
+        (reprRustGuardedTransmuteBody ⟨0⟩) sPadded :=
+    .compileTimeError rfl
+  refine ⟨rfl, hRejU, hexecCte, ?_⟩
+  intro hCrate
+  have hSafe := (crateTheorem_single_fnVerified hCrate).2.2.2
+  have hargsG :
+      argsMatchInv [reprRustWrapAdtDecl] defaultAdtInv 3 sPadded [.adt 0] :=
+    ⟨⟨.adt 0 (.usize 7), rfl, rfl, True.intro, True.intro⟩,
+     fun j hj _ => updateLocal_one_gt_one j hj⟩
+  have hinitG :
+      initMirState [reprRustWrapAdtDecl] bodiesGuarded
+        (reprRustGuardedTransmuteBody ⟨0⟩) sPadded :=
+    ⟨mkInitEntryState hargsG, constsTotal_and_monoAdmitted_of_simple rfl rfl⟩
+  have hpreG :
+      SafetyPre [reprRustWrapAdtDecl] bodiesGuarded defaultAdtInv
+        { name := fnName, bodyId := ⟨1⟩ } (reprRustGuardedTransmuteBody ⟨0⟩)
+        sPadded :=
+    ⟨hinitG, hargsG, fun _ => True.intro⟩
+  cases hSafe sPadded hpreG with
+  | intro hdef hval =>
+    cases execCompileTimeError_reaches hexecCte with
+    | intro n hr =>
+      have hpfx :
+          (MirSem [reprRustWrapAdtDecl] bodiesGuarded
+            (reprRustGuardedTransmuteBody ⟨0⟩) sPadded).val hdef
+            (.terminated [] .compileTimeError) :=
+        ⟨hinitG, n, hr⟩
+      exact (hval _ hpfx).1.2 [] rfl
+
+/-- `#[repr(transparent)] pub struct TransWrap { pub val: usize }`. -/
+abbrev reprTransparentWrapAdtDecl : AdtDecl := pubWrapAdtDecl .transparent
+
+abbrev reprTransparentWrapAdtInv_admissible :=
+  @pubWrapAdtInv_admissible .transparent
+
+abbrev reprRustWrapAdtInv_admissible :=
+  @pubWrapAdtInv_admissible .rust
+
+/-- Captured `Runtime(PostCleanup)` MIR body for
+`pub fn f(x: Wrap) -> usize { unsafe { core::mem::transmute::<Wrap, usize>(x) } }`. -/
+def adtTransmuteBody (adtId : Nat := 0) : MirBody where
+  argTys := [.adt adtId]
+  retTy := .usize
+  localCount := 3
+  blocks := [{
+    stmts := [
+      .storageLive ⟨2⟩,
+      .assign (locPlace 2) (.use (.move (locPlace 1))),
+      .assign (locPlace 0)
+        (.cast (.transmute (.adt adtId)) (.move (locPlace 2)) .usize),
+      .storageDead ⟨2⟩
+    ]
+    terminator := .return_
+  }]
+
+/-- Captured `Runtime(PostCleanup)` MIR body for
+`pub fn f(x: RustWrap) -> usize {
+  let () = const { assert!(size_of::<RustWrap>() == size_of::<usize>()) };
+  unsafe { core::mem::transmute::<RustWrap, usize>(x) }
+}`. -/
+def capturedGuardedAdtTransmuteBody (constId : BodyId := ⟨0⟩)
+    (adtId : Nat := 0) : MirBody where
+  argTys := [.adt adtId]
+  retTy := .usize
+  localCount := 4
+  blocks := [{
+    stmts := [
+      .storageLive ⟨2⟩,
+      .evalConst (locPlace 2) constId [],
+      .storageDead ⟨2⟩,
+      .storageLive ⟨3⟩,
+      .assign (locPlace 3) (.use (.move (locPlace 1))),
+      .assign (locPlace 0)
+        (.cast (.transmute (.adt adtId)) (.move (locPlace 3)) .usize),
+      .storageDead ⟨3⟩
+    ]
+    terminator := .return_
+  }]
+
+theorem adtTransmuteBody_transparent_execNormal {bodies : List BodyDecl}
+    (s : MirState)
+    (hinit : initMirState [reprTransparentWrapAdtDecl] bodies
+      (adtTransmuteBody 0) s) :
+    ExecNormal [reprTransparentWrapAdtDecl] bodies (adtTransmuteBody 0) s
+      (fun r =>
+        r.value.valid [reprTransparentWrapAdtDecl]
+          (denoteAdtInv [reprTransparentWrapAdtDecl]) r.state 3 .usize) := by
+  cases s with
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+    have hentry := hinit.1
+    have hb : block0 = 0 := hentry.1
+    have hs : stmtIdx0 = 0 := hentry.2.1
+    have hc : curBody0 = none := hentry.2.2.1
+    have hst : stack0 = [] := hentry.2.2.2.1
+    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+    subst hb hs hc hst hfid hnfid hlg
+    cases (initEntryState_argsMatch hentry).1 with
+    | intro v hv =>
+      have hv1 : locals0 1 = some v := hv.1
+      have hvty := hv.2
+      cases v with
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        cases hvty
+      | adt vAdtId inner =>
+        have hveq : vAdtId = 0 := hvty.1
+        subst hveq
+        cases inner with
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+          cases hvty.2.2
+        | usize n =>
+          have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
+            funext i
+            cases i with
+            | zero => rfl
+            | succ k =>
+              cases k with
+              | zero => exact hv1
+              | succ _ => rfl
+          rw [hL]
+          exact .step rfl (.step rfl (.step rfl (.step rfl (.normal rfl True.intro))))
+
+theorem adtTransmuteBody_transparent_verified_of_resolve
+    {bodies : List BodyDecl} {tcb : List TCBItem}
+    (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
+    (hres : lowerBody body = adtTransmuteBody 0)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [reprTransparentWrapAdtDecl] bodies
+      (denoteAdtInv [reprTransparentWrapAdtDecl]) fn body tcb :=
+  execNormal_fnBodySafetyVerified_of_lowerBody fn body (adtTransmuteBody 0)
+    hres rfl (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) hpin
+    (fun s hinitS _ _ => adtTransmuteBody_transparent_execNormal s hinitS)
+
+theorem adtTransmuteBody_rustPinned_execNormal {bodies : List BodyDecl}
+    (s : MirState)
+    (hinit : initMirState [reprRustWrapAdtDecl] bodies (adtTransmuteBody 0) s)
+    (hpad : s.adtPad = (fun _ => 0)) :
+    ExecNormal [reprRustWrapAdtDecl] bodies (adtTransmuteBody 0) s
+      (fun r =>
+        r.value.valid [reprRustWrapAdtDecl]
+          (denoteAdtInv [reprRustWrapAdtDecl]) r.state 3 .usize) := by
+  cases s with
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+    have hentry := hinit.1
+    have hb : block0 = 0 := hentry.1
+    have hs : stmtIdx0 = 0 := hentry.2.1
+    have hc : curBody0 = none := hentry.2.2.1
+    have hst : stack0 = [] := hentry.2.2.2.1
+    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+    dsimp at hpad
+    subst hb hs hc hst hfid hnfid hlg hpad
+    cases (initEntryState_argsMatch hentry).1 with
+    | intro v hv =>
+      have hv1 : locals0 1 = some v := hv.1
+      have hvty := hv.2
+      cases v with
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        cases hvty
+      | adt vAdtId inner =>
+        have hveq : vAdtId = 0 := hvty.1
+        subst hveq
+        cases inner with
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+          cases hvty.2.2
+        | usize n =>
+          have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
+            funext i
+            cases i with
+            | zero => rfl
+            | succ k =>
+              cases k with
+              | zero => exact hv1
+              | succ _ => rfl
+          rw [hL]
+          exact .step rfl (.step rfl (.step rfl (.step rfl (.normal rfl True.intro))))
+
+theorem adtTransmuteBody_rustPinned_verified_of_resolve
+    {bodies : List BodyDecl} {tcb : List TCBItem}
+    (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
+    (hres : body = adtTransmuteBody 0)
+    (hpin : hasPinnedCoupledWaiver fn tcb = true) :
+    FnBodySafetyVerified [reprRustWrapAdtDecl] bodies
+      (denoteAdtInv [reprRustWrapAdtDecl]) fn body tcb := by
+  subst hres
+  refine execNormal_fnBodySafetyVerified fn (adtTransmuteBody 0)
+    (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) ?_
+  intro s hpre
+  dsimp [SafetyPre] at hpre
+  rw [hpin] at hpre
+  exact adtTransmuteBody_rustPinned_execNormal s hpre.1 hpre.2.2.1
+
+/-- Overrides `adtPad 0` with `val` while delegating all other ADT indices to
+`fallback`. -/
+def padAtZero (val : Nat) (fallback : Nat → Nat) (i : Nat) : Nat :=
+  if i == 0 then val else fallback i
+
+theorem capturedGuardedAdtTransmuteBody_exec_zero {bodies : List BodyDecl}
+    {constId : BodyId}
+    (hconst :
+      findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
+    (locals0 : Nat → Option MirVal) (tySizes0 : Nat → Nat)
+    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (n : Nat) :
+    ExecNormal [reprRustWrapAdtDecl] bodies
+      (capturedGuardedAdtTransmuteBody constId 0)
+      { locals := updateLocal locals0 1 (some (.adt 0 (.usize n)))
+        localGens := fun _ => 0
+        block := 0
+        stmtIdx := 0
+        tySizes := tySizes0
+        curBody := none
+        stack := []
+        frameId := 0
+        nextFrameId := 1
+        adtPad := padAtZero 0 adtPad0
+        ubChecks := ubChecks0 }
+      (fun r =>
+        r.value.valid [reprRustWrapAdtDecl]
+          (denoteAdtInv [reprRustWrapAdtDecl]) r.state 4 .usize) := by
+  refine .step rfl ?_
+  apply ExecNormal.step
+  · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+      lookupAt, List.foldr, Option.getD, evalMirStmt,
+      capturedGuardedAdtTransmuteBody]
+    rw [hconst]
+    rfl
+  · exact .step rfl (.step rfl (.step rfl (.step rfl
+      (.step rfl (.normal rfl True.intro)))))
+
+theorem capturedGuardedAdtTransmuteBody_exec_succ {bodies : List BodyDecl}
+    {constId : BodyId}
+    (hconst :
+      findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
+    (locals0 : Nat → Option MirVal) (tySizes0 : Nat → Nat)
+    (adtPad0 : Nat → Nat) (ubChecks0 : Bool) (n k : Nat) :
+    ExecCompileTimeError [reprRustWrapAdtDecl] bodies
+      (capturedGuardedAdtTransmuteBody constId 0)
+      { locals := updateLocal locals0 1 (some (.adt 0 (.usize n)))
+        localGens := fun _ => 0
+        block := 0
+        stmtIdx := 0
+        tySizes := tySizes0
+        curBody := none
+        stack := []
+        frameId := 0
+        nextFrameId := 1
+        adtPad := padAtZero (Nat.succ k) adtPad0
+        ubChecks := ubChecks0 } := by
+  refine .step rfl (.compileTimeError ?_)
+  dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith,
+    lookupAt, List.foldr, Option.getD, evalMirStmt,
+    capturedGuardedAdtTransmuteBody]
+  rw [hconst]
+  rfl
+
+theorem capturedGuardedAdtTransmuteBody_rustGuarded_exec
+    {bodies : List BodyDecl} {constId : BodyId}
+    (hconst :
+      findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
+    (s : MirState)
+    (hinit : initMirState [reprRustWrapAdtDecl] bodies
+      (capturedGuardedAdtTransmuteBody constId 0) s) :
+    (s.adtPad = (fun _ => 0) ∧ s.tySizes = (fun _ => 8) →
+      ExecNormal [reprRustWrapAdtDecl] bodies
+        (capturedGuardedAdtTransmuteBody constId 0) s (fun r =>
+          r.value.valid [reprRustWrapAdtDecl]
+            (denoteAdtInv [reprRustWrapAdtDecl]) r.state 4 .usize)) ∧
+    (ExecNormal [reprRustWrapAdtDecl] bodies
+        (capturedGuardedAdtTransmuteBody constId 0) s (fun r =>
+          r.value.valid [reprRustWrapAdtDecl]
+            (denoteAdtInv [reprRustWrapAdtDecl]) r.state 4 .usize) ∨
+     ExecCompileTimeError [reprRustWrapAdtDecl] bodies
+        (capturedGuardedAdtTransmuteBody constId 0) s) := by
+  cases s with
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
+    have hentry := hinit.1
+    have hb : block0 = 0 := hentry.1
+    have hs : stmtIdx0 = 0 := hentry.2.1
+    have hc : curBody0 = none := hentry.2.2.1
+    have hst : stack0 = [] := hentry.2.2.2.1
+    have hfid : frameId0 = 0 := hentry.2.2.2.2.1
+    have hnfid : nextFrameId0 = 1 := hentry.2.2.2.2.2.1
+    have hlg : localGens0 = (fun _ => 0) := hentry.2.2.2.2.2.2.1
+    subst hb hs hc hst hfid hnfid hlg
+    cases (initEntryState_argsMatch hentry).1 with
+    | intro v hv =>
+      have hv1 : locals0 1 = some v := hv.1
+      have hvty := hv.2
+      cases v with
+      | uninit | usize _ | bool _ | unit | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+        cases hvty
+      | adt vAdtId inner =>
+        have hveq : vAdtId = 0 := hvty.1
+        subst hveq
+        cases inner with
+        | uninit | bool _ | unit | adt _ _ | fieldCons _ _ | bytes _ _ | ref _ _ _ _ =>
+          cases hvty.2.2
+        | usize n =>
+          have hL : locals0 = updateLocal locals0 1 (some (.adt 0 (.usize n))) := by
+            funext i
+            cases i with
+            | zero => rfl
+            | succ k =>
+              cases k with
+              | zero => exact hv1
+              | succ _ => rfl
+          have hPad : adtPad0 = padAtZero (adtPad0 0) adtPad0 := by
+            funext i
+            cases i with
+            | zero => rfl
+            | succ _ => rfl
+          refine ⟨fun h0 => ?_, ?_⟩
+          · have hp0 : adtPad0 0 = 0 := congrFun h0.1 0
+            rw [hL, hPad, hp0]
+            exact capturedGuardedAdtTransmuteBody_exec_zero hconst locals0
+              tySizes0 adtPad0 ubChecks0 n
+          · rw [hL, hPad]
+            cases adtPad0 0 with
+            | zero =>
+              exact Or.inl (capturedGuardedAdtTransmuteBody_exec_zero hconst
+                locals0 tySizes0 adtPad0 ubChecks0 n)
+            | succ k =>
+              exact Or.inr (capturedGuardedAdtTransmuteBody_exec_succ hconst
+                locals0 tySizes0 adtPad0 ubChecks0 n k)
+
+theorem capturedGuardedAdtTransmuteBody_rustGuarded_verified_of_resolve
+    {bodies : List BodyDecl} {constId : BodyId} {tcb : List TCBItem}
+    (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
+    (hres : body = capturedGuardedAdtTransmuteBody constId 0)
+    (hconst :
+      findBody bodies constId = some (sizeEqConstBodyAt (.adt 0) .usize))
+    (_hpin : hasPinnedCoupledWaiver fn tcb = false)
+    (hguard : hasCompileTimeGuardWaiver fn tcb = true) :
+    FnBodySafetyVerified [reprRustWrapAdtDecl] bodies
+      (denoteAdtInv [reprRustWrapAdtDecl]) fn body tcb := by
+  subst hres
+  have hwf :
+      StaticBodyWf [reprRustWrapAdtDecl]
+        (capturedGuardedAdtTransmuteBody constId 0) :=
+    mkStaticBodyWf
+      (hcount := Nat.le_succ_of_le (Nat.le_succ_of_le (Nat.le_refl 2)))
+      (hblocks := Nat.zero_lt_succ 0)
+  refine execNormalOrGuard_fnBodySafetyVerified fn
+    (capturedGuardedAdtTransmuteBody constId 0) hguard
+    (contractWellFormed_of_simple hwf rfl rfl) ?_
+  intro s hpre
+  exact capturedGuardedAdtTransmuteBody_rustGuarded_exec hconst s hpre.1
+
+/-- `rustc`-inserted UB check (`Operand.runtimeChecks .ubChecks` +
+`Terminator.assert ... .ub`) steps to `.failed` (UB) when `s.ubChecks = true`
+and the condition fails. -/
+def ubCheckAssertBody : MirBody where
+  argTys := [.bool]
+  retTy := .unit
+  localCount := 3
+  blocks := [
+    { stmts := [
+        .assign (locPlace 2) (.use (.runtimeChecks .ubChecks))
+      ]
+      terminator := .switchInt (.move (locPlace 2)) ⟨2⟩ ⟨1⟩ },
+    { stmts := []
+      terminator := .assert (.copy (locPlace 1)) true ⟨2⟩ .ub },
+    { stmts := [.assign (locPlace 0) (.use (.constVal .unit))]
+      terminator := .return_ }
+  ]
+
+theorem canary_ub_check_assert_fails_when_ubChecks_enabled :
+    let sFail : MirState := {
+      locals := updateLocal (fun _ => none) 1 (some (.bool false))
+      block := 0
+      stmtIdx := 0
+      ubChecks := true
+    }
+    ExecFail [] [] ubCheckAssertBody sFail :=
+  .step rfl (.step rfl (.fail rfl))
+
 /-!
 ## 9. Captured Fixtures (`alloc_passthrough` and `inline_const_transmute`)
 -/
@@ -3750,7 +4121,6 @@ def allocPassthroughBody : MirBody where
       ]
       terminator := .return_ }
   ]
-  requiredConsts := []
 
 /-- `alloc_passthrough` returns its argument through a local borrow. -/
 theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
@@ -3759,7 +4129,7 @@ theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
       s.locals 1 = some r.value ∧
       r.value.valid [] defaultAdtInv r.state 3 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -3772,14 +4142,13 @@ theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        3 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
@@ -3801,11 +4170,13 @@ theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
 /-- `alloc_passthrough` satisfies `FnBodySafetyVerified` for any `fn` and `body`
 whose lowered body is `allocPassthroughBody`. -/
 theorem allocPassthroughBody_verified_of_resolve {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body : MirBody := fn.resolveBody bodies)
-    (hres : lowerBody body = allocPassthroughBody) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body :=
+    (hres : lowerBody body = allocPassthroughBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb :=
   execNormal_fnBodySafetyVerified_of_lowerBody fn body allocPassthroughBody
-    hres rfl (contractWellFormed_of_simple mkStaticBodyWf rfl rfl)
+    hres rfl (contractWellFormed_of_simple mkStaticBodyWf rfl rfl) hpin
     (fun s hinitS _ _ =>
       (allocPassthroughBody_execNormal s hinitS).map (fun _ h => h.2))
 
@@ -3819,7 +4190,7 @@ def inlineConstTransmuteBody (constId : BodyId := ⟨0⟩) : MirBody where
   blocks := [
     { stmts := [
         .storageLive ⟨2⟩,
-        .assign (locPlace 2) (.use (.constVal .unit)),
+        .evalConst (locPlace 2) constId [],
         .storageDead ⟨2⟩,
         .storageLive ⟨3⟩,
         .storageLive ⟨4⟩,
@@ -3832,73 +4203,19 @@ def inlineConstTransmuteBody (constId : BodyId := ⟨0⟩) : MirBody where
     { stmts := [.storageDead ⟨4⟩, .storageDead ⟨3⟩]
       terminator := .return_ }
   ]
-  requiredConsts := [(constId, [])]
 
-theorem inlineConstTransmute_constsTotal {bodies : List BodyDecl}
-    {constId : BodyId}
-    (hconst :
-      findBody bodies constId = some (sizeEqConstBodyAt .usize .usize)) :
-    ConstsTotal [] bodies (inlineConstTransmuteBody constId) := by
-  intro tySizes c _ hc
-  cases hc with
-  | direct hmem =>
-    cases hmem with
-    | head =>
-      rw [hconst]
-      exact ⟨sizeEqConstBodyAt .usize .usize, rfl,
-        sizeEqConstBodyAt_total .usize .usize tySizes⟩
-    | tail _ hnil => cases hnil
-  | viaConst hmem hrest =>
-    cases hmem with
-    | head =>
-      rw [hconst] at hrest
-      change RequiresConst bodies (some (sizeEqConstBodyAt .usize .usize)) _
-        at hrest
-      exact False.elim (noRequires_of_simple rfl rfl hrest)
-    | tail _ hnil => cases hnil
-  | viaCall hbb hterm _ =>
-    have h := noCall_of_all
-      (bbs := (inlineConstTransmuteBody constId).blocks) rfl hbb
-    rw [hterm] at h
-    cases h
-
-theorem inlineConstTransmute_monoAdmitted {bodies : List BodyDecl}
+/-- `inline_const_transmute` returns its argument from every initial state when
+`constId` resolves to `sizeEqConstBodyAt .usize .usize`. -/
+theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
     {constId : BodyId}
     (hconst :
       findBody bodies constId = some (sizeEqConstBodyAt .usize .usize))
-    (tySizes : Nat → Nat) :
-    MonoAdmitted [] bodies tySizes (inlineConstTransmuteBody constId) := by
-  intro c hc
-  cases hc with
-  | direct hmem =>
-    cases hmem with
-    | head =>
-      rw [hconst]
-      exact ⟨sizeEqConstBodyAt .usize .usize, rfl,
-        sizeEq_usize_usize_succeeds tySizes⟩
-    | tail _ hnil => cases hnil
-  | viaConst hmem hrest =>
-    cases hmem with
-    | head =>
-      rw [hconst] at hrest
-      change RequiresConst bodies (some (sizeEqConstBodyAt .usize .usize)) _
-        at hrest
-      exact False.elim (noRequires_of_simple rfl rfl hrest)
-    | tail _ hnil => cases hnil
-  | viaCall hbb hterm _ =>
-    have h := noCall_of_all
-      (bbs := (inlineConstTransmuteBody constId).blocks) rfl hbb
-    rw [hterm] at h
-    cases h
-
-/-- `inline_const_transmute` returns its argument from every initial state. -/
-theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
-    {constId : BodyId} (s : MirState)
+    (s : MirState)
     (hinit : initMirState [] bodies (inlineConstTransmuteBody constId) s) :
     ExecNormal [] bodies (inlineConstTransmuteBody constId) s (fun r =>
       r.value.valid [] defaultAdtInv r.state 5 .usize) := by
   cases s with
-  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 =>
+  | mk locals0 localGens0 block0 stmtIdx0 tySizes0 curBody0 stack0 frameId0 nextFrameId0 adtPad0 ubChecks0 =>
     have hentry := hinit.1
     have hb : block0 = 0 := hentry.1
     have hs : stmtIdx0 = 0 := hentry.2.1
@@ -3911,14 +4228,13 @@ theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
     cases (initEntryState_argsMatch hentry).1 with
     | intro v hv =>
       have hv1 : locals0 1 = some v := hv.1
-      have hvty : v.valid [] defaultAdtInv
-        { locals := locals0, block := 0, stmtIdx := 0, tySizes := tySizes0 }
-        5 .usize := hv.2
+      have hvty := hv.2
       cases v with
       | uninit => cases hvty
       | bool _ => cases hvty
       | unit => cases hvty
       | adt _ _ => cases hvty
+      | fieldCons _ _ => cases hvty
       | bytes _ _ => cases hvty
       | ref _ _ _ _ => cases hvty
       | usize n =>
@@ -3931,35 +4247,37 @@ theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
             | zero => exact hv1
             | succ _ => rfl
         rw [hL]
-        refine .step rfl (.step rfl (.step rfl (.step rfl (.step rfl ?_))))
-        dsimp only [updateLocal, bumpGen]
-        repeat (first | exact ExecNormal.normal rfl True.intro |
-          refine ExecNormal.step rfl ?_)
+        refine .step rfl ?_
+        apply ExecNormal.step
+        · dsimp only [evalMirStep, evalMirStepDepth, evalMirStepWith, lookupAt,
+            List.foldr, Option.getD, evalMirStmt, inlineConstTransmuteBody]
+          rw [hconst]
+          rfl
+        · refine .step rfl (.step rfl (.step rfl ?_))
+          dsimp only [updateLocal, bumpGen]
+          repeat (first | exact ExecNormal.normal rfl True.intro |
+            refine ExecNormal.step rfl ?_)
 
 /-- `inlineConstTransmuteBody constId` satisfies `FnBodySafetyVerified` for any
 `fn` and `body` whose lowered body is `inlineConstTransmuteBody constId` when
 `constId` resolves to `sizeEqConstBodyAt .usize .usize`. -/
 theorem inlineConstTransmute_verified_of_resolve {bodies : List BodyDecl}
-    {constId : BodyId} (fn : CapturedFn)
+    {constId : BodyId} {tcb : List TCBItem} (fn : CapturedFn)
     (body : MirBody := fn.resolveBody bodies)
     (hres : lowerBody body = inlineConstTransmuteBody constId)
     (hconst :
-      findBody bodies constId = some (sizeEqConstBodyAt .usize .usize)) :
-    FnBodySafetyVerified [] bodies defaultAdtInv fn body := by
+      findBody bodies constId = some (sizeEqConstBodyAt .usize .usize))
+    (hpin : hasPinnedCoupledWaiver fn tcb = false := by rfl) :
+    FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb := by
   have hwf : StaticBodyWf [] (inlineConstTransmuteBody constId) :=
     mkStaticBodyWf
       (hcount := Nat.le_succ_of_le
         (Nat.le_succ_of_le (Nat.le_succ_of_le (Nat.le_refl 2))))
       (hblocks := Nat.zero_lt_succ 1)
-  have hcwf :
-      ContractWellFormed [] bodies fn (inlineConstTransmuteBody constId) :=
-    ⟨hwf,
-     inlineConstTransmute_constsTotal hconst,
-     monoConstsWf_of_all_monoAdmitted hwf
-       (inlineConstTransmute_monoAdmitted hconst)⟩
   exact execNormal_fnBodySafetyVerified_of_lowerBody fn body
-    (inlineConstTransmuteBody constId) hres rfl hcwf
-    (fun s hinitS _ _ => inlineConstTransmute_execNormal s hinitS)
+    (inlineConstTransmuteBody constId) hres rfl
+    (contractWellFormed_of_simple hwf rfl rfl) hpin
+    (fun s hinitS _ _ => inlineConstTransmute_execNormal hconst s hinitS)
 
 /-!
 ## 10. Fuel-Free AST Boolean Equality and Compositional Crate Proof Dispatcher
@@ -4090,14 +4408,25 @@ theorem eq_of_beqInvariantSpec {a b : InvariantSpec}
     (h : beqInvariantSpec a b = true) : a = b := by
   cases a; cases b; simp [beqInvariantSpec] at h; subst h; rfl
 
+def beqAdtRepr : AdtRepr → AdtRepr → Bool
+  | .rust, .rust => true
+  | .transparent, .transparent => true
+  | .c, .c => true
+  | _, _ => false
+
+theorem eq_of_beqAdtRepr {a b : AdtRepr} (h : beqAdtRepr a b = true) :
+    a = b := by
+  cases a <;> cases b <;> first | rfl | cases h
+
 def beqAdtDecl (a b : AdtDecl) : Bool :=
   a.id == b.id &&
+  beqAdtRepr a.repr b.repr &&
   listBeq beqFieldDecl a.fields b.fields &&
   optBeq beqInvariantSpec a.invariant b.invariant
 
 theorem eq_of_beqAdtDecl {a b : AdtDecl} (h : beqAdtDecl a b = true) : a = b := by
   cases a; cases b; simp [beqAdtDecl] at h
-  rw [h.1.1, listEq_of_beq eq_of_beqFieldDecl h.1.2,
+  rw [h.1.1.1, eq_of_beqAdtRepr h.1.1.2, listEq_of_beq eq_of_beqFieldDecl h.1.2,
     optEq_of_beq eq_of_beqInvariantSpec h.2]
 
 def beqMirVal : MirVal → MirVal → Bool
@@ -4106,6 +4435,7 @@ def beqMirVal : MirVal → MirVal → Bool
   | .bool a, .bool b => a == b
   | .unit, .unit => true
   | .adt i a, .adt j b => i == j && beqMirVal a b
+  | .fieldCons a1 a2, .fieldCons b1 b2 => beqMirVal a1 b1 && beqMirVal a2 b2
   | .bytes s1 b1, .bytes s2 b2 => s1 == s2 && b1 == b2
   | .ref d1 g1 l1 f1, .ref d2 g2 l2 f2 =>
     d1 == d2 && g1 == g2 && beqLocalId l1 l2 && f1 == f2
@@ -4121,6 +4451,9 @@ theorem eq_of_beqMirVal : ∀ {a b : MirVal}, beqMirVal a b = true → a = b
   | .adt _ _, .adt _ _, h => by
     simp [beqMirVal] at h
     rw [h.1, eq_of_beqMirVal h.2]
+  | .fieldCons _ _, .fieldCons _ _, h => by
+    simp [beqMirVal] at h
+    rw [eq_of_beqMirVal h.1, eq_of_beqMirVal h.2]
   | .bytes _ _, .bytes _ _, h => by
     simp [beqMirVal] at h
     rw [h.1, h.2]
@@ -4151,6 +4484,19 @@ theorem eq_of_beqOperand {a b : Operand} (h : beqOperand a b = true) : a = b := 
     | _ => cases h
   | _ => cases h
 
+def beqCastKind : CastKind → CastKind → Bool
+  | .transmute s1, .transmute s2 => beqMirTy s1 s2
+  | .intToInt, .intToInt => true
+  | .subtype, .subtype => true
+  | _, _ => false
+
+theorem eq_of_beqCastKind :
+    ∀ {a b : CastKind}, beqCastKind a b = true → a = b
+  | .transmute _, .transmute _, h =>
+    congrArg (fun t => CastKind.transmute t) (eq_of_beqMirTy h)
+  | .intToInt, .intToInt, _ => rfl
+  | .subtype, .subtype, _ => rfl
+
 def beqBinOp (a b : BinOp) : Bool :=
   match a with
   | .eq => match b with | .eq => true | _ => false
@@ -4162,6 +4508,11 @@ theorem eq_of_beqBinOp {a b : BinOp} (h : beqBinOp a b = true) : a = b := by
 def beqRvalue (a b : Rvalue) : Bool :=
   match a with
   | .use a1 => match b with | .use b1 => beqOperand a1 b1 | _ => false
+  | .cast k1 o1 t1 =>
+    match b with
+    | .cast k2 o2 t2 =>
+      beqCastKind k1 k2 && beqOperand o1 o2 && beqMirTy t1 t2
+    | _ => false
   | .binaryOp op1 l1 r1 =>
     match b with
     | .binaryOp op2 l2 r2 =>
@@ -4171,6 +4522,11 @@ def beqRvalue (a b : Rvalue) : Bool :=
     match b with
     | .aggregate i2 a2 => i1 == i2 && beqOperand a1 a2
     | _ => false
+  | .aggregateFields ops1 i1 =>
+    match b with
+    | .aggregateFields ops2 i2 =>
+      listBeq beqOperand ops1 ops2 && optBeq (fun x y => x == y) i1 i2
+    | _ => false
   | .ref a1 => match b with | .ref b1 => beqPlace a1 b1 | _ => false
   | _ => false
 
@@ -4179,6 +4535,12 @@ theorem eq_of_beqRvalue {a b : Rvalue} (h : beqRvalue a b = true) : a = b := by
   | use a1 =>
     cases b with
     | use b1 => exact congrArg Rvalue.use (eq_of_beqOperand h)
+    | _ => cases h
+  | cast k1 o1 t1 =>
+    cases b with
+    | cast k2 o2 t2 =>
+      simp [beqRvalue] at h
+      rw [eq_of_beqCastKind h.1.1, eq_of_beqOperand h.1.2, eq_of_beqMirTy h.2]
     | _ => cases h
   | binaryOp op1 l1 r1 =>
     cases b with
@@ -4192,6 +4554,13 @@ theorem eq_of_beqRvalue {a b : Rvalue} (h : beqRvalue a b = true) : a = b := by
       simp [beqRvalue] at h
       rw [h.1, eq_of_beqOperand h.2]
     | _ => cases h
+  | aggregateFields ops1 i1 =>
+    cases b with
+    | aggregateFields ops2 i2 =>
+      simp [beqRvalue] at h
+      rw [listEq_of_beq eq_of_beqOperand h.1,
+        optEq_of_beq (fun hxy => beq_iff_eq.mp hxy) h.2]
+    | _ => cases h
   | ref a1 =>
     cases b with
     | ref b1 => exact congrArg Rvalue.ref (eq_of_beqPlace h)
@@ -4203,6 +4572,11 @@ def beqStmt (a b : Stmt) : Bool :=
   | .assign d1 r1 =>
     match b with
     | .assign d2 r2 => beqPlace d1 d2 && beqRvalue r1 r2
+    | _ => false
+  | .evalConst d1 c1 tys1 =>
+    match b with
+    | .evalConst d2 c2 tys2 =>
+      beqPlace d1 d2 && beqBodyId c1 c2 && listBeq beqMirTy tys1 tys2
     | _ => false
   | .placeMention a1 =>
     match b with | .placeMention b1 => beqPlace a1 b1 | _ => false
@@ -4221,6 +4595,13 @@ theorem eq_of_beqStmt {a b : Stmt} (h : beqStmt a b = true) : a = b := by
     | assign d2 r2 =>
       simp [beqStmt] at h
       rw [eq_of_beqPlace h.1, eq_of_beqRvalue h.2]
+    | _ => cases h
+  | evalConst d1 c1 tys1 =>
+    cases b with
+    | evalConst d2 c2 tys2 =>
+      simp [beqStmt] at h
+      rw [eq_of_beqPlace h.1.1, eq_of_beqBodyId h.1.2,
+        listEq_of_beq eq_of_beqMirTy h.2]
     | _ => cases h
   | placeMention a1 =>
     cases b with
@@ -4253,26 +4634,54 @@ theorem eq_of_beqRcPair :
     simp [beqRcPair] at h
     rw [eq_of_beqBodyId h.1, listEq_of_beq eq_of_beqMirTy h.2]
 
+def beqLayoutQuery : LayoutQuery → LayoutQuery → Bool
+  | .sizeOf t1, .sizeOf t2 => beqMirTy t1 t2
+  | .alignOf t1, .alignOf t2 => beqMirTy t1 t2
+  | .offsetOf t1 v1 f1, .offsetOf t2 v2 f2 =>
+    beqMirTy t1 t2 && v1 == v2 && f1 == f2
+  | _, _ => false
+
+theorem eq_of_beqLayoutQuery :
+    ∀ {a b : LayoutQuery}, beqLayoutQuery a b = true → a = b
+  | .sizeOf _, .sizeOf _, h => congrArg LayoutQuery.sizeOf (eq_of_beqMirTy h)
+  | .alignOf _, .alignOf _, h => congrArg LayoutQuery.alignOf (eq_of_beqMirTy h)
+  | .offsetOf _ _ _, .offsetOf _ _ _, h => by
+    simp [beqLayoutQuery] at h
+    rw [eq_of_beqMirTy h.1.1, h.1.2, h.2]
+
+def beqAssertFailKind : AssertFailKind → AssertFailKind → Bool
+  | .unwind, .unwind => true
+  | .ub, .ub => true
+  | .abort, .abort => true
+  | _, _ => false
+
+theorem eq_of_beqAssertFailKind :
+    ∀ {a b : AssertFailKind}, beqAssertFailKind a b = true → a = b
+  | .unwind, .unwind, _ => rfl
+  | .ub, .ub, _ => rfl
+  | .abort, .abort, _ => rfl
+
 def beqTerminator (a b : Terminator) : Bool :=
   match a with
   | .return_ => match b with | .return_ => true | _ => false
   | .goto a1 => match b with | .goto b1 => beqBlockId a1 b1 | _ => false
   | .unreachable => match b with | .unreachable => true | _ => false
   | .panic c1 => match b with | .panic c2 => c1 == c2 | _ => false
-  | .assert c1 e1 t1 cl1 =>
+  | .assert c1 e1 t1 k1 cl1 =>
     match b with
-    | .assert c2 e2 t2 cl2 =>
-      beqOperand c1 c2 && e1 == e2 && beqBlockId t1 t2 && cl1 == cl2
+    | .assert c2 e2 t2 k2 cl2 =>
+      beqOperand c1 c2 && e1 == e2 && beqBlockId t1 t2 &&
+      beqAssertFailKind k1 k2 && cl1 == cl2
     | _ => false
   | .switchInt d1 f1 t1 =>
     match b with
     | .switchInt d2 f2 t2 =>
       beqOperand d1 d2 && beqBlockId f1 f2 && beqBlockId t1 t2
     | _ => false
-  | .callSizeOf d1 ty1 t1 =>
+  | .callLayout d1 q1 t1 =>
     match b with
-    | .callSizeOf d2 ty2 t2 =>
-      beqPlace d1 d2 && beqMirTy ty1 ty2 && beqBlockId t1 t2
+    | .callLayout d2 q2 t2 =>
+      beqPlace d1 d2 && beqLayoutQuery q1 q2 && beqBlockId t1 t2
     | _ => false
   | .callTransmuteCopy d1 s1 dt1 o1 t1 =>
     match b with
@@ -4303,11 +4712,12 @@ theorem eq_of_beqTerminator {a b : Terminator} (h : beqTerminator a b = true) :
       simp [beqTerminator] at h
       rw [h]
     | _ => cases h
-  | assert c1 e1 t1 cl1 =>
+  | assert c1 e1 t1 k1 cl1 =>
     cases b with
-    | assert c2 e2 t2 cl2 =>
+    | assert c2 e2 t2 k2 cl2 =>
       simp [beqTerminator] at h
-      rw [eq_of_beqOperand h.1.1.1, h.1.1.2, eq_of_beqBlockId h.1.2, h.2]
+      rw [eq_of_beqOperand h.1.1.1.1, h.1.1.1.2, eq_of_beqBlockId h.1.1.2,
+        eq_of_beqAssertFailKind h.1.2, h.2]
     | _ => cases h
   | switchInt d1 f1 t1 =>
     cases b with
@@ -4315,11 +4725,12 @@ theorem eq_of_beqTerminator {a b : Terminator} (h : beqTerminator a b = true) :
       simp [beqTerminator] at h
       rw [eq_of_beqOperand h.1.1, eq_of_beqBlockId h.1.2, eq_of_beqBlockId h.2]
     | _ => cases h
-  | callSizeOf d1 ty1 t1 =>
+  | callLayout d1 q1 t1 =>
     cases b with
-    | callSizeOf d2 ty2 t2 =>
+    | callLayout d2 q2 t2 =>
       simp [beqTerminator] at h
-      rw [eq_of_beqPlace h.1.1, eq_of_beqMirTy h.1.2, eq_of_beqBlockId h.2]
+      rw [eq_of_beqPlace h.1.1, eq_of_beqLayoutQuery h.1.2,
+        eq_of_beqBlockId h.2]
     | _ => cases h
   | callTransmuteCopy d1 s1 dt1 o1 t1 =>
     cases b with
@@ -4513,10 +4924,11 @@ theorem noDupIds_fnBody_of_names :
     exact allHold_fnBody_ne hall
 
 theorem map_obligation_id {adts : List AdtDecl} {bodies : List BodyDecl}
-    {adtInv : AdtInv} :
+    {adtInv : AdtInv} {tcb : List TCBItem} :
     ∀ (fns : List CapturedFn),
-      (fns.map (fun fn => fn.obligation adts bodies adtInv)).map Obligation.id =
-      fns.map (fun fn => ObligationId.fnBody fn.name)
+      (fns.map (fun fn => fn.obligation adts bodies adtInv tcb)).map
+          Obligation.id =
+        fns.map (fun fn => ObligationId.fnBody fn.name)
   | [] => rfl
   | fn :: rest => by
     dsimp [List.map, CapturedFn.obligation]
@@ -4525,30 +4937,31 @@ theorem map_obligation_id {adts : List AdtDecl} {bodies : List BodyDecl}
 /-! ### Compositional per-body, per-function, and per-crate verification -/
 
 abbrev BodyUserSpecsHold (adts : List AdtDecl) (bodies : List BodyDecl)
-    (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody) : Prop :=
+    (adtInv : AdtInv) (fn : CapturedFn) (body : MirBody)
+    (tcb : List TCBItem := []) : Prop :=
   MirSem adts bodies body ≤
     (MirLang adts bodies).SpecOn
-      (fun s => SafetyPre adts bodies adtInv fn body s ∧ fn.safetyPre s)
+      (fun s => SafetyPre adts bodies adtInv fn body s tcb ∧ fn.safetyPre s)
       (ContractPost adts bodies fn)
 
 abbrev UserSpecsHold (adts : List AdtDecl) (bodies : List BodyDecl)
-    (adtInv : AdtInv) (fn : CapturedFn) : Prop :=
-  BodyUserSpecsHold adts bodies adtInv fn (fn.resolveBody bodies)
+    (adtInv : AdtInv) (fn : CapturedFn) (tcb : List TCBItem := []) : Prop :=
+  BodyUserSpecsHold adts bodies adtInv fn (fn.resolveBody bodies) tcb
 
 theorem fnBodyVerified_of_safety_and_specs {adts : List AdtDecl}
     {bodies : List BodyDecl} {adtInv : AdtInv} {fn : CapturedFn}
-    {body : MirBody}
-    (hver : FnBodySafetyVerified adts bodies adtInv fn body)
-    (hspecs : BodyUserSpecsHold adts bodies adtInv fn body) :
+    {body : MirBody} {tcb : List TCBItem}
+    (hver : FnBodySafetyVerified adts bodies adtInv fn body tcb)
+    (hspecs : BodyUserSpecsHold adts bodies adtInv fn body tcb) :
     ContractWellFormed adts bodies fn body ∧
-    FnBodyVerified adts bodies adtInv fn body :=
+    FnBodyVerified adts bodies adtInv fn body tcb :=
   ⟨hver.1, verified_split hver.2 hspecs⟩
 
 theorem bodyUserSpecsHold_nil {adts : List AdtDecl} {bodies : List BodyDecl}
-    {adtInv : AdtInv} {fn : CapturedFn} {body : MirBody}
-    (hver : FnBodySafetyVerified adts bodies adtInv fn body)
+    {adtInv : AdtInv} {fn : CapturedFn} {body : MirBody} {tcb : List TCBItem}
+    (hver : FnBodySafetyVerified adts bodies adtInv fn body tcb)
     (h : fn.specs = []) :
-    BodyUserSpecsHold adts bodies adtInv fn body := by
+    BodyUserSpecsHold adts bodies adtInv fn body tcb := by
   intro s hpre
   have hsafe := hver.2.2.2 s hpre.1
   refine ⟨hsafe.1, fun out _ => ?_⟩
@@ -4557,17 +4970,19 @@ theorem bodyUserSpecsHold_nil {adts : List AdtDecl} {bodies : List BodyDecl}
   exact True.intro
 
 theorem bodyUserSpecs_ensuresEqArg1_of_lowerBody {bodies : List BodyDecl}
+    {tcb : List TCBItem}
     (fn : CapturedFn) (body target : MirBody)
     (hres : lowerBody body = target)
     (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false)
     (hspecs : fn.specs = [.ensuresEqArg 1])
     (h_exec : ∀ s, initMirState [] bodies target s → fn.safetyPre s →
       ExecNormal [] bodies target s (fun r => s.locals 1 = some r.value)) :
-    BodyUserSpecsHold [] bodies defaultAdtInv fn body := by
+    BodyUserSpecsHold [] bodies defaultAdtInv fn body tcb := by
   unfold BodyUserSpecsHold
   refine specOn_contractPost_ensuresEqArg1 hspecs (fun s hpre => ?_)
   have ⟨hinitT, _, _⟩ :=
-    (safetyPre_of_lowerBody_eq hres hcalls).mp hpre.1
+    (safetyPre_of_lowerBody_eq hres hcalls hpin).mp hpre.1
   have hcallsOrig :
       body.blocks.all (fun bb => !isCall1 bb.terminator) = true := by
     rw [← noCall_lowerBody body, hres]
@@ -4588,24 +5003,25 @@ structure ProofError where
 
 /-- Discharge either `fn.specs = []` or `fn.specs = [.ensuresEqArg 1]` for an
 identity-like intra-procedural body `target = lowerBody body`. -/
-def dispatchIdLikeSpecs {bodies : List BodyDecl} (fn : CapturedFn)
-    (body target : MirBody)
+def dispatchIdLikeSpecs {bodies : List BodyDecl} {tcb : List TCBItem}
+    (fn : CapturedFn) (body target : MirBody)
     (hres : lowerBody body = target)
     (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
-    (hver : FnBodySafetyVerified [] bodies defaultAdtInv fn body)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false)
+    (hver : FnBodySafetyVerified [] bodies defaultAdtInv fn body tcb)
     (h_exec : ∀ s, initMirState [] bodies target s → fn.safetyPre s →
       ExecNormal [] bodies target s (fun r => s.locals 1 = some r.value))
     (errMsg : String) :
     Except ProofError
       (PLift
         (ContractWellFormed [] bodies fn body ∧
-         FnBodyVerified [] bodies defaultAdtInv fn body)) :=
+         FnBodyVerified [] bodies defaultAdtInv fn body tcb)) :=
   if hs0 : listBeq beqPostSpec fn.specs [] = true then
     .ok (.up (fnBodyVerified_of_safety_and_specs hver
       (bodyUserSpecsHold_nil hver (listEq_of_beq eq_of_beqPostSpec hs0))))
   else if hs1 : listBeq beqPostSpec fn.specs [.ensuresEqArg 1] = true then
     .ok (.up (fnBodyVerified_of_safety_and_specs hver
-      (bodyUserSpecs_ensuresEqArg1_of_lowerBody fn body target hres hcalls
+      (bodyUserSpecs_ensuresEqArg1_of_lowerBody fn body target hres hcalls hpin
         (listEq_of_beq eq_of_beqPostSpec hs1) h_exec)))
   else
     .error ⟨errMsg, fn.name⟩
@@ -4619,49 +5035,63 @@ def firstCalleeId (b : MirBody) : BodyId :=
     | _ => ⟨0⟩
   | _ => ⟨0⟩
 
-/-- Extract the first required constant `BodyId` from a body, if any. -/
+/-- Extract the first `.evalConst` constant `BodyId` from a statement list. -/
+def firstEvalConstInStmts : List Stmt → Option BodyId
+  | [] => none
+  | .evalConst _ constId _ :: _ => some constId
+  | _ :: rest => firstEvalConstInStmts rest
+
+/-- Extract the first `.evalConst` or `requiredConsts` constant `BodyId` from a
+body, if any. -/
 def firstRequiredConstId (b : MirBody) : BodyId :=
-  match b.requiredConsts with
-  | (constId, _) :: _ => constId
+  match b.blocks with
+  | bb :: _ =>
+    match firstEvalConstInStmts bb.stmts with
+    | some constId => constId
+    | none =>
+      match b.requiredConsts with
+      | (constId, _) :: _ => constId
+      | _ => ⟨0⟩
   | _ => ⟨0⟩
 
 /-- Per-body proof dispatcher for crates without ADTs (`adts = []`).
 Normalizes intra-procedural bodies with `lowerBody` before matching so that
 functions containing `Stmt.nop` or forwarding `goto` chains reduce to the
 same canonical verification theorems. -/
-def proveBodyNoAdtOpt (bodies : List BodyDecl) (fn : CapturedFn)
-    (b : MirBody) :
+def proveBodyNoAdtOpt (bodies : List BodyDecl) (tcb : List TCBItem)
+    (fn : CapturedFn) (b : MirBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false) :
     Except ProofError
       (PLift
         (ContractWellFormed [] bodies fn b ∧
-         FnBodyVerified [] bodies defaultAdtInv fn b)) :=
+         FnBodyVerified [] bodies defaultAdtInv fn b tcb)) :=
   let lb := lowerBody b
   if hb : beqMirBody lb idCopyBody = true then
     have hres : lowerBody b = idCopyBody := eq_of_beqMirBody hb
-    dispatchIdLikeSpecs fn b idCopyBody hres rfl
-      (idCopyBody_verified_of_resolve fn b hres)
+    dispatchIdLikeSpecs fn b idCopyBody hres rfl hpin
+      (idCopyBody_verified_of_resolve fn b hres hpin)
       (fun s hinit _ => (idCopyBody_execNormal s hinit).map (fun _ h => h.1))
       "unsupported specs on id (copy)"
   else if hb : beqMirBody lb idMoveBody = true then
     have hres : lowerBody b = idMoveBody := eq_of_beqMirBody hb
-    dispatchIdLikeSpecs fn b idMoveBody hres rfl
-      (idMoveBody_verified_of_resolve fn b hres)
+    dispatchIdLikeSpecs fn b idMoveBody hres rfl hpin
+      (idMoveBody_verified_of_resolve fn b hres hpin)
       (fun s hinit _ => (idMoveBody_execNormal s hinit).map (fun _ h => h.1))
       "unsupported specs on id (move)"
   else if hb : beqMirBody lb allocPassthroughBody = true then
     have hres : lowerBody b = allocPassthroughBody := eq_of_beqMirBody hb
-    dispatchIdLikeSpecs fn b allocPassthroughBody hres rfl
-      (allocPassthroughBody_verified_of_resolve fn b hres)
+    dispatchIdLikeSpecs fn b allocPassthroughBody hres rfl hpin
+      (allocPassthroughBody_verified_of_resolve fn b hres hpin)
       (fun s hinit _ =>
         (allocPassthroughBody_execNormal s hinit).map (fun _ h => h.1))
       "unsupported specs on alloc_passthrough"
   else if hb : beqMirBody lb clampNonZeroBody = true then
     have hres : lowerBody b = clampNonZeroBody := eq_of_beqMirBody hb
-    have hver := clampNonZeroBody_verified_of_resolve fn b hres
+    have hver := clampNonZeroBody_verified_of_resolve fn b hres hpin
     if hreq : optBeq beqRequiresSpec fn.requires newUncheckedRequires = true then
       have hreqEq : fn.requires = newUncheckedRequires :=
         optEq_of_beq eq_of_beqRequiresSpec hreq
-      dispatchIdLikeSpecs fn b clampNonZeroBody hres rfl hver
+      dispatchIdLikeSpecs fn b clampNonZeroBody hres rfl hpin hver
         (fun s hinit hsaf => by
           have hsaf' : newUncheckedSafetyPre s := by
             dsimp [CapturedFn.safetyPre] at hsaf
@@ -4684,8 +5114,8 @@ def proveBodyNoAdtOpt (bodies : List BodyDecl) (fn : CapturedFn)
         have hreqEq : fn.requires = newUncheckedRequires :=
           optEq_of_beq eq_of_beqRequiresSpec hreq
         have hver :=
-          idNonZeroUnchecked_verified_of_resolve fn b hres hunsafe hreqEq
-        dispatchIdLikeSpecs fn b idNonZeroUncheckedBody hres rfl hver
+          idNonZeroUnchecked_verified_of_resolve fn b hres hunsafe hreqEq hpin
+        dispatchIdLikeSpecs fn b idNonZeroUncheckedBody hres rfl hpin hver
           (fun s hinit hsaf => by
             have hsaf' : newUncheckedSafetyPre s := by
               dsimp [CapturedFn.safetyPre] at hsaf
@@ -4709,7 +5139,7 @@ def proveBodyNoAdtOpt (bodies : List BodyDecl) (fn : CapturedFn)
         if hs0 : listBeq beqPostSpec fn.specs [] = true then
           have hver :=
             inlineConstTransmute_verified_of_resolve fn b hres
-              (optEq_of_beq eq_of_beqMirBody hconst)
+              (optEq_of_beq eq_of_beqMirBody hconst) hpin
           .ok (.up (fnBodyVerified_of_safety_and_specs hver
             (bodyUserSpecsHold_nil hver
               (listEq_of_beq eq_of_beqPostSpec hs0))))
@@ -4753,13 +5183,17 @@ def proveBodyNoAdtOpt (bodies : List BodyDecl) (fn : CapturedFn)
   else
     .error ⟨"unexpected requires clause", fn.name⟩
 
-/-- Per-body proof dispatcher for crates with `[nonZeroAdtDecl 0]`. -/
-def proveBodyNonZeroOpt (bodies : List BodyDecl) (fn : CapturedFn)
-    (b : MirBody) :
+/-- Per-body proof dispatcher for crates with `[nonZeroAdtDecl 0 repr]`. -/
+def proveBodyNonZeroOpt (repr : AdtRepr)
+    (hrepr : repr = .rust ∨ repr = .transparent)
+    (bodies : List BodyDecl) (tcb : List TCBItem)
+    (fn : CapturedFn) (b : MirBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false) :
     Except ProofError
       (PLift
-        (ContractWellFormed [nonZeroAdtDecl 0] bodies fn b ∧
-         FnBodyVerified [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn b)) :=
+        (ContractWellFormed [nonZeroAdtDecl 0 repr] bodies fn b ∧
+         FnBodyVerified [nonZeroAdtDecl 0 repr] bodies
+           (nonZeroAdtInv repr) fn b tcb)) :=
   let lb := lowerBody b
   if hs0 : listBeq beqPostSpec fn.specs [] = true then
     have hs0Eq : fn.specs = [] := listEq_of_beq eq_of_beqPostSpec hs0
@@ -4767,18 +5201,19 @@ def proveBodyNonZeroOpt (bodies : List BodyDecl) (fn : CapturedFn)
       if hb : beqMirBody lb makeNonZeroBody = true then
         have hver :=
           makeNonZeroBody_verified_of_resolve fn b (eq_of_beqMirBody hb)
+            hpin hrepr
         .ok (.up (fnBodyVerified_of_safety_and_specs hver
           (bodyUserSpecsHold_nil hver hs0Eq)))
       else if hb : beqMirBody lb (getUncheckedNonZeroBodyAt 0 false) = true then
         have hver :=
           getUncheckedNonZeroBody_verified_of_resolve false fn b
-            (eq_of_beqMirBody hb)
+            (eq_of_beqMirBody hb) hpin hrepr
         .ok (.up (fnBodyVerified_of_safety_and_specs hver
           (bodyUserSpecsHold_nil hver hs0Eq)))
       else if hb : beqMirBody lb (getUncheckedNonZeroBodyAt 0 true) = true then
         have hver :=
           getUncheckedNonZeroBody_verified_of_resolve true fn b
-            (eq_of_beqMirBody hb)
+            (eq_of_beqMirBody hb) hpin hrepr
         .ok (.up (fnBodyVerified_of_safety_and_specs hver
           (bodyUserSpecsHold_nil hver hs0Eq)))
       else
@@ -4791,7 +5226,7 @@ def proveBodyNonZeroOpt (bodies : List BodyDecl) (fn : CapturedFn)
         if hb : beqMirBody lb newUncheckedBody = true then
           have hver :=
             newUncheckedBody_verified_of_resolve fn b (eq_of_beqMirBody hb)
-              hunsafe hreqEq
+              hunsafe hreqEq hpin hrepr
           .ok (.up (fnBodyVerified_of_safety_and_specs hver
             (bodyUserSpecsHold_nil hver hs0Eq)))
         else
@@ -4803,21 +5238,98 @@ def proveBodyNonZeroOpt (bodies : List BodyDecl) (fn : CapturedFn)
   else
     .error ⟨"unsupported specs on NonZeroUsize function", fn.name⟩
 
+/-- Per-body proof dispatcher for `[reprTransparentWrapAdtDecl]`. -/
+def proveBodyTransWrapOpt (bodies : List BodyDecl) (tcb : List TCBItem)
+    (fn : CapturedFn) (b : MirBody)
+    (hpin : hasPinnedCoupledWaiver fn tcb = false) :
+    Except ProofError
+      (PLift
+        (ContractWellFormed [reprTransparentWrapAdtDecl] bodies fn b ∧
+         FnBodyVerified [reprTransparentWrapAdtDecl] bodies
+           (denoteAdtInv [reprTransparentWrapAdtDecl]) fn b tcb)) :=
+  let lb := lowerBody b
+  if hs0 : listBeq beqPostSpec fn.specs [] = true then
+    have hs0Eq : fn.specs = [] := listEq_of_beq eq_of_beqPostSpec hs0
+    if optBeq beqRequiresSpec fn.requires none = true then
+      if hb : beqMirBody lb (adtTransmuteBody 0) = true then
+        have hver :=
+          adtTransmuteBody_transparent_verified_of_resolve fn b
+            (eq_of_beqMirBody hb) hpin
+        .ok (.up (fnBodyVerified_of_safety_and_specs hver
+          (bodyUserSpecsHold_nil hver hs0Eq)))
+      else
+        .error ⟨"unproved #[repr(transparent)] function", fn.name⟩
+    else
+      .error ⟨"unsupported requires clause on #[repr(transparent)] function", fn.name⟩
+  else
+    .error ⟨"unsupported specs on #[repr(transparent)] function", fn.name⟩
+
+/-- Per-body proof dispatcher for `[reprRustWrapAdtDecl]`:
+- Unguarded `adtTransmuteBody 0` requires `TCBItem.pinnedCompilerCoupled`.
+- Const-guarded `capturedGuardedAdtTransmuteBody constId 0` requires
+  `TCBItem.compileTimeGuard`. -/
+def proveBodyRustWrapOpt (bodies : List BodyDecl) (tcb : List TCBItem)
+    (fn : CapturedFn) (b : MirBody) :
+    Except ProofError
+      (PLift
+        (ContractWellFormed [reprRustWrapAdtDecl] bodies fn b ∧
+         FnBodyVerified [reprRustWrapAdtDecl] bodies
+           (denoteAdtInv [reprRustWrapAdtDecl]) fn b tcb)) :=
+  if hs0 : listBeq beqPostSpec fn.specs [] = true then
+    have hs0Eq : fn.specs = [] := listEq_of_beq eq_of_beqPostSpec hs0
+    if optBeq beqRequiresSpec fn.requires none = true then
+      if hb : beqMirBody b (adtTransmuteBody 0) = true then
+        if hpin : decide (hasPinnedCoupledWaiver fn tcb = true) = true then
+          have hver :=
+            adtTransmuteBody_rustPinned_verified_of_resolve fn b
+              (eq_of_beqMirBody hb) (of_decide_eq_true hpin)
+          .ok (.up (fnBodyVerified_of_safety_and_specs hver
+            (bodyUserSpecsHold_nil hver hs0Eq)))
+        else
+          .error ⟨"missing TCBItem.pinnedCompilerCoupled waiver for unguarded #[repr(Rust)] transmute", fn.name⟩
+      else
+        let constId := firstRequiredConstId b
+        if hb : beqMirBody b (capturedGuardedAdtTransmuteBody constId 0) = true then
+          if hconst :
+              optBeq beqMirBody (findBody bodies constId)
+                (some (sizeEqConstBodyAt (.adt 0) .usize)) = true then
+            if hpin : decide (hasPinnedCoupledWaiver fn tcb = false) = true then
+              if hguard : decide (hasCompileTimeGuardWaiver fn tcb = true) = true then
+                have hver :=
+                  capturedGuardedAdtTransmuteBody_rustGuarded_verified_of_resolve
+                    fn b (eq_of_beqMirBody hb)
+                    (optEq_of_beq eq_of_beqMirBody hconst)
+                    (of_decide_eq_true hpin) (of_decide_eq_true hguard)
+                .ok (.up (fnBodyVerified_of_safety_and_specs hver
+                  (bodyUserSpecsHold_nil hver hs0Eq)))
+              else
+                .error ⟨"missing TCBItem.compileTimeGuard waiver for const-guarded #[repr(Rust)] transmute", fn.name⟩
+            else
+              .error ⟨"unexpected TCBItem.pinnedCompilerCoupled waiver on const-guarded function", fn.name⟩
+          else
+            .error ⟨"unproved required const on #[repr(Rust)] transmute", fn.name⟩
+        else
+          .error ⟨"unproved #[repr(Rust)] function", fn.name⟩
+    else
+      .error ⟨"unsupported requires clause on #[repr(Rust)] function", fn.name⟩
+  else
+    .error ⟨"unsupported specs on #[repr(Rust)] function", fn.name⟩
+
 /-- Lift a per-body prover across both `fn.bodyId` (`--release`) and optional
 `fn.debugBodyId` (`--debug`). -/
 def liftProveBodyToFn {adts : List AdtDecl} {bodies : List BodyDecl}
-    {adtInv : AdtInv}
+    {adtInv : AdtInv} {tcb : List TCBItem}
     (proveBody :
       ∀ (fn : CapturedFn) (body : MirBody),
         Except ProofError
           (PLift
             (ContractWellFormed adts bodies fn body ∧
-             FnBodyVerified adts bodies adtInv fn body)))
+             FnBodyVerified adts bodies adtInv fn body tcb)))
     (fn : CapturedFn) :
     Except ProofError
       (PLift
         (FnContractWellFormed adts bodies fn ∧
-         FnVerified adts bodies adtInv fn)) :=
+         FnVerified adts bodies adtInv fn tcb)) :=
   match proveBody fn (fn.resolveBody bodies) with
   | .error err => .error err
   | .ok pRel =>
@@ -4827,7 +5339,7 @@ def liftProveBodyToFn {adts : List AdtDecl} {bodies : List BodyDecl}
         unfold FnContractWellFormed
         rw [hdbg]
         exact ⟨pRel.down.1, True.intro⟩
-      have hver : FnVerified adts bodies adtInv fn := by
+      have hver : FnVerified adts bodies adtInv fn tcb := by
         unfold FnVerified
         rw [hdbg]
         exact ⟨pRel.down.2, True.intro⟩
@@ -4840,7 +5352,7 @@ def liftProveBodyToFn {adts : List AdtDecl} {bodies : List BodyDecl}
           unfold FnContractWellFormed
           rw [hdbg]
           exact ⟨pRel.down.1, pDbg.down.1⟩
-        have hver : FnVerified adts bodies adtInv fn := by
+        have hver : FnVerified adts bodies adtInv fn tcb := by
           unfold FnVerified
           rw [hdbg]
           exact ⟨pRel.down.2, pDbg.down.2⟩
@@ -4850,12 +5362,13 @@ def liftProveBodyToFn {adts : List AdtDecl} {bodies : List BodyDecl}
 `requiredConsts = []` (including bodies waived via `/// anneal:trusted`), or
 fall back to `proveBody` when the body has required constants or calls. -/
 def proveBodyContractWfOpt (adts : List AdtDecl) (bodies : List BodyDecl)
+    (tcb : List TCBItem)
     (proveBody :
       ∀ (fn : CapturedFn) (body : MirBody),
         Except ProofError
           (PLift
             (ContractWellFormed adts bodies fn body ∧
-             FnBodyVerified adts bodies (denoteAdtInv adts) fn body)))
+             FnBodyVerified adts bodies (denoteAdtInv adts) fn body tcb)))
     (fn : CapturedFn) (body : MirBody) :
     Except ProofError (PLift (ContractWellFormed adts bodies fn body)) :=
   if hcount : decide (1 + body.argTys.length ≤ body.localCount) = true then
@@ -4892,15 +5405,17 @@ def proveBodyContractWfOpt (adts : List AdtDecl) (bodies : List BodyDecl)
 /-- Lift `proveBodyContractWfOpt` across both `fn.bodyId` and optional
 `fn.debugBodyId`. -/
 def proveFnContractWfOpt (adts : List AdtDecl) (bodies : List BodyDecl)
+    (tcb : List TCBItem)
     (proveBody :
       ∀ (fn : CapturedFn) (body : MirBody),
         Except ProofError
           (PLift
             (ContractWellFormed adts bodies fn body ∧
-             FnBodyVerified adts bodies (denoteAdtInv adts) fn body)))
+             FnBodyVerified adts bodies (denoteAdtInv adts) fn body tcb)))
     (fn : CapturedFn) :
     Except ProofError (PLift (FnContractWellFormed adts bodies fn)) :=
-  match proveBodyContractWfOpt adts bodies proveBody fn (fn.resolveBody bodies) with
+  match proveBodyContractWfOpt adts bodies tcb proveBody fn
+      (fn.resolveBody bodies) with
   | .error err => .error err
   | .ok pRel =>
     match hdbg : fn.debugBodyId with
@@ -4911,7 +5426,7 @@ def proveFnContractWfOpt (adts : List AdtDecl) (bodies : List BodyDecl)
         exact ⟨pRel.down, True.intro⟩
       .ok (.up hcwf)
     | some dbgId =>
-      match proveBodyContractWfOpt adts bodies proveBody fn
+      match proveBodyContractWfOpt adts bodies tcb proveBody fn
           (resolveBodyById bodies dbgId) with
       | .error err => .error err
       | .ok pDbg =>
@@ -4930,18 +5445,19 @@ def proveFnsLoop (c : Crate)
         Except ProofError
           (PLift
             (ContractWellFormed c.adts c.bodies fn body ∧
-             FnBodyVerified c.adts c.bodies c.adtInv fn body))) :
+             FnBodyVerified c.adts c.bodies c.adtInv fn body c.tcb))) :
     ∀ (fns : List CapturedFn),
       Except ProofError
         (PLift
           (AllHold (fns.map (FnContractWellFormed c.adts c.bodies)) ∧
            AllHold
-             ((fns.map (fun fn => fn.obligation c.adts c.bodies c.adtInv)).map
+             ((fns.map
+               (fun fn => fn.obligation c.adts c.bodies c.adtInv c.tcb)).map
                (fun o => o.prop ∨ o.id ∈ c.tcbWaivedIds))))
   | [] => .ok (.up ⟨True.intro, True.intro⟩)
   | fn :: rest =>
     if hwaived : checkMemObligationId (.fnBody fn.name) c.tcbWaivedIds = true then
-      match proveFnContractWfOpt c.adts c.bodies proveBody fn with
+      match proveFnContractWfOpt c.adts c.bodies c.tcb proveBody fn with
       | .error err => .error err
       | .ok pCwf =>
         match proveFnsLoop c proveBody rest with
@@ -4982,7 +5498,8 @@ def proveCrateOpt (c : Crate) :
           have h_fns_nodup : NoDupIds (c.functions.map CapturedFn.name) :=
             noDupIds_of_check (fun h => of_decide_eq_false h) hfnodup
           have h_obs_ne :
-              c.functions.map (fun fn => fn.obligation c.adts c.bodies c.adtInv) ≠
+              c.functions.map
+                (fun fn => fn.obligation c.adts c.bodies c.adtInv c.tcb) ≠
                 [] := by
             intro hnil
             cases hfns : c.functions with
@@ -4991,12 +5508,40 @@ def proveCrateOpt (c : Crate) :
           have h_obs_nodup :
               NoDupIds
                 ((c.functions.map
-                  (fun fn => fn.obligation c.adts c.bodies c.adtInv)).map
+                  (fun fn => fn.obligation c.adts c.bodies c.adtInv c.tcb)).map
                   Obligation.id) := by
             rw [map_obligation_id c.functions]
             exact (noDupIds_fnBody_of_names h_fns_nodup).1
           have h_tcb_nodup : NoDupIds c.tcbWaivedIds :=
             noDupIds_of_check ne_of_beqObligationId_false htnodup
+          let finish (hadm : AdmissibleAdtInv c.adts c.adtInv)
+              (proveBody :
+                ∀ (fn : CapturedFn) (body : MirBody),
+                  Except ProofError
+                    (PLift
+                      (ContractWellFormed c.adts c.bodies fn body ∧
+                       FnBodyVerified c.adts c.bodies c.adtInv fn body c.tcb))) :
+              Except ProofError (PLift (CrateTheorem c)) :=
+            match proveFnsLoop c proveBody c.functions with
+            | .ok pFns =>
+              .ok (.up
+                ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, pFns.down.1,
+                 ⟨h_obs_ne, h_obs_nodup, h_tcb_nodup, pFns.down.2⟩⟩)
+            | .error err => .error err
+          let finishNoPin (hadm : AdmissibleAdtInv c.adts c.adtInv)
+              (proveBody :
+                ∀ (fn : CapturedFn) (body : MirBody),
+                  hasPinnedCoupledWaiver fn c.tcb = false →
+                  Except ProofError
+                    (PLift
+                      (ContractWellFormed c.adts c.bodies fn body ∧
+                       FnBodyVerified c.adts c.bodies c.adtInv fn body c.tcb))) :
+              Except ProofError (PLift (CrateTheorem c)) :=
+            finish hadm (fun fn body =>
+              if hpin : decide (hasPinnedCoupledWaiver fn c.tcb = false) = true then
+                proveBody fn body (of_decide_eq_true hpin)
+              else
+                .error ⟨"unsupported pinnedCompilerCoupled waiver", fn.name⟩)
           if hadts0 : listBeq beqAdtDecl c.adts [] = true then
             have hadtsEq : c.adts = [] :=
               listEq_of_beq eq_of_beqAdtDecl hadts0
@@ -5004,36 +5549,60 @@ def proveCrateOpt (c : Crate) :
               unfold Crate.adtInv
               rw [hadtsEq]
               exact defaultAdtInv_admissible
-            match proveFnsLoop c
-                (fun fn body => by
-                  unfold Crate.adtInv
-                  rw [hadtsEq]
-                  exact proveBodyNoAdtOpt c.bodies fn body)
-                c.functions with
-            | .ok pFns =>
-              .ok (.up
-                ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, pFns.down.1,
-                 ⟨h_obs_ne, h_obs_nodup, h_tcb_nodup, pFns.down.2⟩⟩)
-            | .error err => .error err
+            finishNoPin hadm (fun fn body hpin => by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact proveBodyNoAdtOpt c.bodies c.tcb fn body hpin)
           else if hadt1 :
-              listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0] = true then
-            have hadtsEq : c.adts = [nonZeroAdtDecl 0] :=
+              listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0 .rust] = true then
+            have hadtsEq : c.adts = [nonZeroAdtDecl 0 .rust] :=
               listEq_of_beq eq_of_beqAdtDecl hadt1
             have hadm : AdmissibleAdtInv c.adts c.adtInv := by
               unfold Crate.adtInv
               rw [hadtsEq]
               exact nonZeroAdtInv_admissible
-            match proveFnsLoop c
-                (fun fn body => by
-                  unfold Crate.adtInv
-                  rw [hadtsEq]
-                  exact proveBodyNonZeroOpt c.bodies fn body)
-                c.functions with
-            | .ok pFns =>
-              .ok (.up
-                ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, pFns.down.1,
-                 ⟨h_obs_ne, h_obs_nodup, h_tcb_nodup, pFns.down.2⟩⟩)
-            | .error err => .error err
+            finishNoPin hadm (fun fn body hpin => by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact proveBodyNonZeroOpt .rust (Or.inl rfl) c.bodies c.tcb fn body
+                hpin)
+          else if hadt2 :
+              listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0 .transparent] = true then
+            have hadtsEq : c.adts = [nonZeroAdtDecl 0 .transparent] :=
+              listEq_of_beq eq_of_beqAdtDecl hadt2
+            have hadm : AdmissibleAdtInv c.adts c.adtInv := by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact nonZeroAdtInv_admissible
+            finishNoPin hadm (fun fn body hpin => by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact proveBodyNonZeroOpt .transparent (Or.inr rfl) c.bodies c.tcb
+                fn body hpin)
+          else if hadt3 :
+              listBeq beqAdtDecl c.adts [reprTransparentWrapAdtDecl] = true then
+            have hadtsEq : c.adts = [reprTransparentWrapAdtDecl] :=
+              listEq_of_beq eq_of_beqAdtDecl hadt3
+            have hadm : AdmissibleAdtInv c.adts c.adtInv := by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact reprTransparentWrapAdtInv_admissible
+            finishNoPin hadm (fun fn body hpin => by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact proveBodyTransWrapOpt c.bodies c.tcb fn body hpin)
+          else if hadt4 :
+              listBeq beqAdtDecl c.adts [reprRustWrapAdtDecl] = true then
+            have hadtsEq : c.adts = [reprRustWrapAdtDecl] :=
+              listEq_of_beq eq_of_beqAdtDecl hadt4
+            have hadm : AdmissibleAdtInv c.adts c.adtInv := by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact reprRustWrapAdtInv_admissible
+            finish hadm (fun fn body => by
+              unfold Crate.adtInv
+              rw [hadtsEq]
+              exact proveBodyRustWrapOpt c.bodies c.tcb fn body)
           else
             .error ⟨"unsupported ADT inventory", "crate"⟩
         else
@@ -5123,7 +5692,7 @@ def inlineConstPmeCrate (fnName : String) : Crate := {
 
 /-- Expected `Crate` for the 3-function `NonZeroUsize` library crate. -/
 def nonzeroLibraryCrate (fn1Name fn2Name fn3Name : String) : Crate := {
-  adts := [nonZeroAdtDecl 0]
+  adts := [nonZeroAdtDecl 0 .transparent]
   bodies := [
     { id := ⟨0⟩, body := (makeNonZeroBodyAt 0) },
     { id := ⟨1⟩, body := (newUncheckedBodyAt 0) },
@@ -5151,7 +5720,42 @@ def clampNonZeroCrate (fnName : String) : Crate := {
   }]
 }
 
-/-- Canary confirming that `proveCrate` discharges all ten verified crate
+/-- Expected `Crate` for `#[repr(transparent)]` struct transmute. -/
+def transWrapTransmuteCrate (fnName : String) : Crate := {
+  adts := [reprTransparentWrapAdtDecl]
+  bodies := [{ id := ⟨0⟩, body := (adtTransmuteBody 0) }]
+  functions := [{ name := fnName, bodyId := ⟨0⟩ }]
+  tcb := [TCBItem.rustcLowering fnName ⟨0⟩]
+}
+
+/-- Expected `Crate` for `#[repr(Rust)]` struct transmute with
+`TCBItem.pinnedCompilerCoupled` waiver. -/
+def rustWrapPinnedCrate (fnName : String) : Crate := {
+  adts := [reprRustWrapAdtDecl]
+  bodies := [{ id := ⟨0⟩, body := (adtTransmuteBody 0) }]
+  functions := [{ name := fnName, bodyId := ⟨0⟩ }]
+  tcb := [
+    TCBItem.rustcLowering fnName ⟨0⟩,
+    TCBItem.pinnedCompilerCoupled fnName ⟨0⟩ "test"
+  ]
+}
+
+/-- Expected `Crate` for `#[repr(Rust)]` struct transmute with a compile-time
+size guard and `TCBItem.compileTimeGuard` waiver. -/
+def rustWrapGuardedCrate (fnName : String) : Crate := {
+  adts := [reprRustWrapAdtDecl]
+  bodies := [
+    { id := ⟨0⟩, body := (sizeEqConstBodyAt (.adt 0) .usize) },
+    { id := ⟨1⟩, body := (capturedGuardedAdtTransmuteBody ⟨0⟩ 0) }
+  ]
+  functions := [{ name := fnName, bodyId := ⟨1⟩ }]
+  tcb := [
+    TCBItem.rustcLowering fnName ⟨1⟩,
+    TCBItem.compileTimeGuard fnName ⟨1⟩
+  ]
+}
+
+/-- Canary confirming that `proveCrate` discharges all thirteen verified crate
 archetypes via `rfl` kernel reduction. -/
 theorem canary_proveCrate_dispatches_all_archetypes :
     CrateTheorem (idCopyEnsuresCrate "id") ∧
@@ -5164,8 +5768,14 @@ theorem canary_proveCrate_dispatches_all_archetypes :
     CrateTheorem (inlineConstPmeCrate "inline_const_transmute") ∧
     CrateTheorem (nonzeroLibraryCrate
       "make_nonzero" "new_unchecked" "get_unchecked") ∧
-    CrateTheorem (clampNonZeroCrate "clamp_nonzero") :=
+    CrateTheorem (clampNonZeroCrate "clamp_nonzero") ∧
+    CrateTheorem (transWrapTransmuteCrate "transparent_transmute") ∧
+    CrateTheorem (rustWrapPinnedCrate "unguarded_transmute") ∧
+    CrateTheorem (rustWrapGuardedCrate "guarded_transmute") :=
   ⟨proveCrate _ rfl,
+   proveCrate _ rfl,
+   proveCrate _ rfl,
+   proveCrate _ rfl,
    proveCrate _ rfl,
    proveCrate _ rfl,
    proveCrate _ rfl,
@@ -5278,7 +5888,7 @@ theorem canary_projected_field_borrow_resolves_payload :
       (fun r => r.value = .usize 1) :=
   .step rfl (.step rfl (.normal rfl rfl))
 
-/-- Canary: `Terminator.panic true` and `Terminator.assert _ _ _ true`
+/-- Canary: `Terminator.panic true` and `Terminator.assert _ _ _ .unwind true`
 (`hasCleanup := true`) fail closed (`.failed`) rather than unwinding past an
 unmodeled cleanup pad. -/
 theorem canary_cleanup_unwind_fails_closed :
@@ -5289,7 +5899,7 @@ theorem canary_cleanup_unwind_fails_closed :
     }
     evalMirTerminator [] [] idCopyBody s0 (.panic true) = .failed ∧
     evalMirTerminator [] [] idCopyBody s0
-      (.assert (.copy (locPlace 1)) true ⟨0⟩ true) = .failed :=
+      (.assert (.copy (locPlace 1)) true ⟨0⟩ .unwind true) = .failed :=
   ⟨rfl, rfl⟩
 
 end Anneal

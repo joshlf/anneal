@@ -25,6 +25,20 @@ namespace Anneal
 
 open Trusted
 
+/-- Any `StepResult.choice` produced by `RawStep.toStepResult` is inhabited. -/
+theorem RawStep.toStepResult_choice_inhabited {State Obs Val : Type}
+    {r : RawStep State Val} {branches : State → Prop}
+    (h : StepResult.choice (Obs := Obs) (Val := Val) branches =
+      r.toStepResult) :
+    ∃ s', branches s' := by
+  cases r with
+  | silent s' =>
+    injection h with hbr
+    subst hbr
+    exact ⟨s', rfl⟩
+  | terminated _ => nomatch h
+  | failed => nomatch h
+
 /-- Dominator-cut prefix concatenation: reaching `.running s_cut` in `n₁`
 silent steps and then reaching `out` with trace `tr` in `n₂` steps from `s_cut`
 yields a `(n₁ + n₂)`-step prefix execution from `s₀`. -/

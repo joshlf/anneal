@@ -89,7 +89,7 @@ theorem if_false_eq {α : Type} {P : Prop} [Decidable P] (hnp : ¬ P) (a b : α)
   | isTrue hp => exact False.elim (hnp hp)
 
 theorem silent_of_if_failed {P : Prop} [Decidable P]
-    {a : StepResult MirState Empty MirReturn} {s' : MirState}
+    {a : RawStep MirState MirReturn} {s' : MirState}
     (h : (if P then a else .failed) = .silent s') :
     P ∧ a = .silent s' := by
   cases ‹Decidable P› with
@@ -97,7 +97,7 @@ theorem silent_of_if_failed {P : Prop} [Decidable P]
   | isTrue hp => exact ⟨hp, h⟩
 
 theorem normal_of_if_failed {P : Prop} [Decidable P]
-    {a : StepResult MirState Empty MirReturn} {v : MirReturn}
+    {a : RawStep MirState MirReturn} {v : MirReturn}
     (h : (if P then a else .failed) = .terminated (.normal v)) :
     P ∧ a = .terminated (.normal v) := by
   cases ‹Decidable P› with
@@ -105,7 +105,7 @@ theorem normal_of_if_failed {P : Prop} [Decidable P]
   | isTrue hp => exact ⟨hp, h⟩
 
 theorem not_normal_of_if_failed {P : Prop} [Decidable P]
-    {a : StepResult MirState Empty MirReturn} {v : MirReturn}
+    {a : RawStep MirState MirReturn} {v : MirReturn}
     (ha : a = .terminated (.normal v) → False) :
     (if P then a else .failed) = .terminated (.normal v) → False := by
   cases ‹Decidable P› with
@@ -113,7 +113,7 @@ theorem not_normal_of_if_failed {P : Prop} [Decidable P]
   | isTrue _ => exact ha
 
 theorem not_silent_of_if_failed {P : Prop} [Decidable P]
-    {a : StepResult MirState Empty MirReturn} {s' : MirState}
+    {a : RawStep MirState MirReturn} {s' : MirState}
     (ha : a = .silent s' → False) :
     (if P then a else .failed) = .silent s' → False := by
   cases ‹Decidable P› with
@@ -121,11 +121,9 @@ theorem not_silent_of_if_failed {P : Prop} [Decidable P]
   | isTrue _ => exact ha
 
 theorem silent_inj {s₁ s₂ : MirState}
-    (h : StepResult.silent (Obs := Empty) (Val := MirReturn) s₁ = .silent s₂) :
+    (h : RawStep.silent (Val := MirReturn) s₁ = .silent s₂) :
     s₁ = s₂ := by
-  injection h with hfun
-  have heq : (s₁ = s₁) = (s₁ = s₂) := congrFun hfun s₁
-  exact heq ▸ rfl
+  injection h
 
 theorem noCall_of_all : ∀ {bbs : List BasicBlock},
     bbs.all (fun bb => !isCall1 bb.terminator) = true →
@@ -165,6 +163,33 @@ theorem resolveRef_with_stmtIdx (s : MirState) (idx frameId gen : Nat)
       resolveRef s frameId gen loc fieldDepth :=
   rfl
 
+theorem validFields_with_stmtIdx
+    {unfold1 unfold2 : MirTy → MirVal → Prop}
+    (hunf : ∀ ty v, unfold1 ty v ↔ unfold2 ty v) :
+    ∀ (fields : List FieldDecl) (v : MirVal),
+      validFields unfold1 fields v ↔ validFields unfold2 fields v
+  | [], .unit => Iff.rfl
+  | [], .uninit | [], .usize _ | [], .bool _ | [], .adt _ _
+  | [], .fieldCons _ _ | [], .bytes _ _ | [], .ref _ _ _ _ => Iff.rfl
+  | [f], v => hunf f.ty v
+  | f :: g :: rest, .fieldCons h t => by
+    dsimp [validFields]
+    have ih := validFields_with_stmtIdx hunf (g :: rest) t
+    exact ⟨fun ⟨h1, h2⟩ => ⟨(hunf f.ty h).mp h1, ih.mp h2⟩,
+           fun ⟨h1, h2⟩ => ⟨(hunf f.ty h).mpr h1, ih.mpr h2⟩⟩
+  | _ :: _ :: _, .uninit | _ :: _ :: _, .usize _ | _ :: _ :: _, .bool _
+  | _ :: _ :: _, .unit | _ :: _ :: _, .adt _ _ | _ :: _ :: _, .bytes _ _
+  | _ :: _ :: _, .ref _ _ _ _ => Iff.rfl
+
+theorem validAdtDecl_with_stmtIdx
+    {unfold1 unfold2 : MirTy → MirVal → Prop}
+    (hunf : ∀ ty v, unfold1 ty v ↔ unfold2 ty v)
+    (decl : AdtDecl) (inner : MirVal) :
+    validAdtDecl unfold1 decl inner ↔ validAdtDecl unfold2 decl inner := by
+  unfold validAdtDecl
+  cases decl.repr <;>
+    first | exact Iff.rfl | exact validFields_with_stmtIdx hunf decl.fields inner
+
 theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
     (s : MirState) (idx callerBase : Nat)
     {unfold1 unfold2 : MirTy → MirVal → Prop}
@@ -172,27 +197,48 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
     ∀ (ty : MirTy) (v : MirVal),
       validStep adts adtInv { s with stmtIdx := idx } callerBase unfold1 ty v ↔
         validStep adts adtInv s callerBase unfold2 ty v
-  | .usize, .usize _ => Iff.rfl
-  | .usize, .uninit | .usize, .bool _ | .usize, .unit
-  | .usize, .adt _ _ | .usize, .bytes _ _ | .usize, .ref _ _ _ _ => Iff.rfl
-  | .bool, .bool _ => Iff.rfl
-  | .bool, .uninit | .bool, .usize _ | .bool, .unit
-  | .bool, .adt _ _ | .bool, .bytes _ _ | .bool, .ref _ _ _ _ => Iff.rfl
-  | .unit, .unit => Iff.rfl
-  | .unit, .uninit | .unit, .usize _ | .unit, .bool _
-  | .unit, .adt _ _ | .unit, .bytes _ _ | .unit, .ref _ _ _ _ => Iff.rfl
+  | .usize, .usize _ | .usize, .uninit | .usize, .bool _ | .usize, .unit
+  | .usize, .adt _ _ | .usize, .fieldCons _ _ | .usize, .bytes _ _
+  | .usize, .ref _ _ _ _ => Iff.rfl
+  | .isize, .usize _ | .isize, .uninit | .isize, .bool _ | .isize, .unit
+  | .isize, .adt _ _ | .isize, .fieldCons _ _ | .isize, .bytes _ _
+  | .isize, .ref _ _ _ _ => Iff.rfl
+  | .uint _, .usize _ | .uint _, .uninit | .uint _, .bool _ | .uint _, .unit
+  | .uint _, .adt _ _ | .uint _, .fieldCons _ _ | .uint _, .bytes _ _
+  | .uint _, .ref _ _ _ _ => Iff.rfl
+  | .int _, .usize _ | .int _, .uninit | .int _, .bool _ | .int _, .unit
+  | .int _, .adt _ _ | .int _, .fieldCons _ _ | .int _, .bytes _ _
+  | .int _, .ref _ _ _ _ => Iff.rfl
+  | .char, .usize _ | .char, .uninit | .char, .bool _ | .char, .unit
+  | .char, .adt _ _ | .char, .fieldCons _ _ | .char, .bytes _ _
+  | .char, .ref _ _ _ _ => Iff.rfl
+  | .bool, .bool _ | .bool, .uninit | .bool, .usize _ | .bool, .unit
+  | .bool, .adt _ _ | .bool, .fieldCons _ _ | .bool, .bytes _ _
+  | .bool, .ref _ _ _ _ => Iff.rfl
+  | .unit, .unit | .unit, .uninit | .unit, .usize _ | .unit, .bool _
+  | .unit, .adt _ _ | .unit, .fieldCons _ _ | .unit, .bytes _ _
+  | .unit, .ref _ _ _ _ => Iff.rfl
   | .adt id, .adt _ inner => by
     dsimp [validStep]
-    cases (findAdtDecl adts id).bind AdtDecl.payloadTy with
+    cases findAdtDecl adts id with
     | none => exact Iff.rfl
-    | some payload =>
-      exact ⟨fun ⟨h1, h2, h3⟩ => ⟨h1, h2, (hunf payload inner).mp h3⟩,
-             fun ⟨h1, h2, h3⟩ => ⟨h1, h2, (hunf payload inner).mpr h3⟩⟩
+    | some decl =>
+      have ih := validAdtDecl_with_stmtIdx hunf decl inner
+      exact ⟨fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mp h3⟩,
+             fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
   | .adt _, .uninit | .adt _, .usize _ | .adt _, .bool _
-  | .adt _, .unit | .adt _, .bytes _ _ | .adt _, .ref _ _ _ _ => Iff.rfl
-  | .param _, .bytes _ _ => Iff.rfl
-  | .param _, .uninit | .param _, .usize _ | .param _, .bool _
-  | .param _, .unit | .param _, .adt _ _ | .param _, .ref _ _ _ _ => Iff.rfl
+  | .adt _, .unit | .adt _, .fieldCons _ _ | .adt _, .bytes _ _
+  | .adt _, .ref _ _ _ _ => Iff.rfl
+  | .param _, .bytes _ _ | .param _, .uninit | .param _, .usize _
+  | .param _, .bool _ | .param _, .unit | .param _, .adt _ _
+  | .param _, .fieldCons _ _ | .param _, .ref _ _ _ _ => Iff.rfl
+  | .array _ _, .bytes _ _ | .array _ _, .uninit | .array _ _, .usize _
+  | .array _ _, .bool _ | .array _ _, .unit | .array _ _, .adt _ _
+  | .array _ _, .fieldCons _ _ | .array _ _, .ref _ _ _ _ => Iff.rfl
+  | .arraySizeOf _ _, .bytes _ _ | .arraySizeOf _ _, .uninit
+  | .arraySizeOf _ _, .usize _ | .arraySizeOf _ _, .bool _
+  | .arraySizeOf _ _, .unit | .arraySizeOf _ _, .adt _ _
+  | .arraySizeOf _ _, .fieldCons _ _ | .arraySizeOf _ _, .ref _ _ _ _ => Iff.rfl
   | .ref inner, .ref frameId gen loc fieldDepth => by
     dsimp [validStep]
     rw [resolveRef_with_stmtIdx]
@@ -204,11 +250,24 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
       exact ⟨fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mp h3⟩,
              fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
   | .ref _, .uninit | .ref _, .usize _ | .ref _, .bool _
-  | .ref _, .unit | .ref _, .adt _ _ | .ref _, .bytes _ _ => Iff.rfl
-  | .isize, _ | .uint _, _ | .int _, _ | .float _, _
-  | .char, _ | .str, _ | .never, _ | .refMut _, _
-  | .rawPtr _ _, _ | .array _ _, _ | .slice _, _ | .tuple _, _
-  | .fnDef _, _ | .fnPtr, _ | .unmodeled, _ => Iff.rfl
+  | .ref _, .unit | .ref _, .adt _ _ | .ref _, .fieldCons _ _
+  | .ref _, .bytes _ _ => Iff.rfl
+  | .rawPtr inner _, .ref frameId gen loc fieldDepth => by
+    dsimp [validStep]
+    rw [resolveRef_with_stmtIdx]
+    cases resolveRef s frameId gen loc fieldDepth with
+    | none => exact Iff.rfl
+    | some pointee =>
+      have ih := validStep_with_stmtIdx adts adtInv s idx callerBase hunf
+        inner pointee
+      exact ⟨fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mp h3⟩,
+             fun ⟨h1, h2, h3⟩ => ⟨h1, h2, ih.mpr h3⟩⟩
+  | .rawPtr _ _, .uninit | .rawPtr _ _, .usize _ | .rawPtr _ _, .bool _
+  | .rawPtr _ _, .unit | .rawPtr _ _, .adt _ _ | .rawPtr _ _, .fieldCons _ _
+  | .rawPtr _ _, .bytes _ _ => Iff.rfl
+  | .float _, _ | .str, _ | .never, _ | .refMut _, _
+  | .slice _, _ | .tuple _, _ | .fnDef _, _ | .fnPtr, _
+  | .unmodeled, _ => Iff.rfl
 
 theorem validFuel_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
     (s : MirState) (idx callerBase : Nat) :
@@ -239,6 +298,10 @@ theorem returnRefsStep_with_stmtIdx (s : MirState) (idx localCount : Nat)
         returnRefsStep s localCount follow2 v
   | .uninit | .usize _ | .bool _ | .unit | .bytes _ _ => rfl
   | .adt _ inner => returnRefsStep_with_stmtIdx s idx localCount hf inner
+  | .fieldCons h t => by
+    dsimp [returnRefsStep]
+    rw [returnRefsStep_with_stmtIdx s idx localCount hf h,
+        returnRefsStep_with_stmtIdx s idx localCount hf t]
   | .ref frameId gen loc fieldDepth => by
     dsimp [returnRefsStep]
     rw [resolveRef_with_stmtIdx]
@@ -267,11 +330,19 @@ theorem evalProj_with_stmtIdx (s : MirState) (idx : Nat) :
     ∀ (proj : List PlaceElem) (v : MirVal),
       evalProj { s with stmtIdx := idx } proj v = evalProj s proj v
   | [], _ => rfl
-  | .field 0 :: rest, .adt _ inner => evalProj_with_stmtIdx s idx rest inner
-  | .field (_ + 1) :: _, _ => rfl
-  | .field 0 :: _, .uninit | .field 0 :: _, .usize _ | .field 0 :: _, .bool _
-  | .field 0 :: _, .unit | .field 0 :: _, .bytes _ _
-  | .field 0 :: _, .ref _ _ _ _ => rfl
+  | .field fIdx :: rest, .adt _ inner => by
+    dsimp [evalProj]
+    cases getFieldVal fIdx inner with
+    | none => rfl
+    | some fVal => exact evalProj_with_stmtIdx s idx rest fVal
+  | .field fIdx :: rest, .fieldCons h t => by
+    dsimp [evalProj]
+    cases getFieldVal fIdx (.fieldCons h t) with
+    | none => rfl
+    | some fVal => exact evalProj_with_stmtIdx s idx rest fVal
+  | .field _ :: _, .uninit | .field _ :: _, .usize _ | .field _ :: _, .bool _
+  | .field _ :: _, .unit | .field _ :: _, .bytes _ _
+  | .field _ :: _, .ref _ _ _ _ => rfl
   | .deref :: rest, .ref frameId gen loc fieldDepth => by
     dsimp [evalProj]
     rw [resolveRef_with_stmtIdx]
@@ -279,7 +350,7 @@ theorem evalProj_with_stmtIdx (s : MirState) (idx : Nat) :
     | none => rfl
     | some pointee => exact evalProj_with_stmtIdx s idx rest pointee
   | .deref :: _, .uninit | .deref :: _, .usize _ | .deref :: _, .bool _
-  | .deref :: _, .unit | .deref :: _, .adt _ _
+  | .deref :: _, .unit | .deref :: _, .adt _ _ | .deref :: _, .fieldCons _ _
   | .deref :: _, .bytes _ _ => rfl
   | .index _ :: _, _ | .constantIndex _ _ _ :: _, _
   | .subslice _ _ _ :: _, _ | .downcast _ :: _, _
@@ -305,9 +376,11 @@ theorem evalRefProj_with_stmtIdx (s : MirState) (idx : Nat) :
         evalRefProj s frameId gen loc fieldDepth proj v
   | _, _, _, _, [], _ => rfl
   | frameId, gen, loc, fieldDepth, .field 0 :: rest, .adt _ inner =>
-    evalRefProj_with_stmtIdx s idx frameId gen loc (fieldDepth + 1) rest inner
+    evalRefProj_with_stmtIdx s idx frameId gen loc (fieldDepth + 1) rest
+      (firstFieldVal inner)
   | _, _, _, _, .field 0 :: _, .uninit | _, _, _, _, .field 0 :: _, .usize _
   | _, _, _, _, .field 0 :: _, .bool _ | _, _, _, _, .field 0 :: _, .unit
+  | _, _, _, _, .field 0 :: _, .fieldCons _ _
   | _, _, _, _, .field 0 :: _, .bytes _ _
   | _, _, _, _, .field 0 :: _, .ref _ _ _ _ => rfl
   | _, _, _, _, .field (_ + 1) :: _, _ => rfl
@@ -321,8 +394,8 @@ theorem evalRefProj_with_stmtIdx (s : MirState) (idx : Nat) :
         rest pointee
   | _, _, _, _, .deref :: _, .uninit | _, _, _, _, .deref :: _, .usize _
   | _, _, _, _, .deref :: _, .bool _ | _, _, _, _, .deref :: _, .unit
-  | _, _, _, _, .deref :: _, .adt _ _ | _, _, _, _, .deref :: _, .bytes _ _ =>
-    rfl
+  | _, _, _, _, .deref :: _, .adt _ _ | _, _, _, _, .deref :: _, .fieldCons _ _
+  | _, _, _, _, .deref :: _, .bytes _ _ => rfl
   | _, _, _, _, .index _ :: _, _ | _, _, _, _, .constantIndex _ _ _ :: _, _
   | _, _, _, _, .subslice _ _ _ :: _, _ | _, _, _, _, .downcast _ :: _, _
   | _, _, _, _, .opaqueCast _ :: _, _
@@ -355,20 +428,37 @@ theorem evalOperand_with_stmtIdx (localCount : Nat) (s : MirState) (idx : Nat)
     dsimp [evalOperand]
     rw [evalPlace_with_stmtIdx]
   | constVal _ => rfl
-  | runtimeChecks _ => rfl
+  | runtimeChecks chk => cases chk <;> rfl
+
+theorem evalOperandList_with_stmtIdx (localCount : Nat) (idx : Nat) :
+    ∀ (ops : List Operand) (s : MirState),
+      evalOperandList localCount { s with stmtIdx := idx } ops =
+        evalOperandList localCount s ops
+  | [], _ => rfl
+  | op :: rest, s => by
+    dsimp [evalOperandList]
+    rw [evalOperand_with_stmtIdx localCount s idx op]
+    cases evalOperand localCount s op with
+    | none => rfl
+    | some p =>
+      dsimp [Option.bind]
+      exact congrArg (Option.map fun (vs, locals2) => (p.1 :: vs, locals2))
+        (evalOperandList_with_stmtIdx localCount idx rest
+          { s with locals := p.2 })
+
+theorem evalTransmuteVal_with_stmtIdx (adts : List AdtDecl) (s : MirState)
+    (idx : Nat) (srcTy dstTy : MirTy) (srcVal : MirVal)
+    (target : TargetLayout := defaultTargetLayout) :
+    evalTransmuteVal adts { s with stmtIdx := idx } srcTy dstTy srcVal target =
+      evalTransmuteVal adts s srcTy dstTy srcVal target :=
+  rfl
 
 theorem evalTransmuteCopy_with_stmtIdx (adts : List AdtDecl) (s : MirState)
-    (idx : Nat) (srcTy dstTy : MirTy) (argVal : MirVal) :
-    evalTransmuteCopy adts { s with stmtIdx := idx } srcTy dstTy argVal =
-      evalTransmuteCopy adts s srcTy dstTy argVal := by
-  dsimp [evalTransmuteCopy]
-  cases evalTyByteSize adts s.tySizes srcTy with
-  | none => rfl
-  | some srcSz =>
-    cases evalTyByteSize adts s.tySizes dstTy with
-    | none => rfl
-    | some dstSz =>
-      cases argVal <;> rfl
+    (idx : Nat) (srcTy dstTy : MirTy) (argVal : MirVal)
+    (target : TargetLayout := defaultTargetLayout) :
+    evalTransmuteCopy adts { s with stmtIdx := idx } srcTy dstTy argVal target =
+      evalTransmuteCopy adts s srcTy dstTy argVal target :=
+  rfl
 
 /-!
 ## 2. Pass 1: Stripping `Stmt.nop` (`stripNopsBody`) and Suffix Simulation
@@ -483,9 +573,22 @@ theorem gotoBlock_with_stmtIdx {s s' : MirState}
   cases silent_inj h
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+theorem assignNext_not_normal (localCount : Nat) (locals : Nat → Option MirVal)
+    (dst : Place) (val : MirVal) (s : MirState) {v : MirReturn} :
+    (match assignPlace localCount locals dst val with
+     | some locals' => s.nextStmt locals'
+     | none => .failed) = .terminated (.normal v) → False := by
+  cases assignPlace localCount locals dst val <;> (cases s; intro h; cases h)
+
 theorem evalMirStmt_not_normal (adts : List AdtDecl) (b : MirBody)
-    (s : MirState) (stmt : Stmt) {v : MirReturn} :
-    evalMirStmt b s stmt adts = .terminated (.normal v) → False := by
+    (s : MirState) (stmt : Stmt)
+    (bodies : List BodyDecl := [])
+    (evalConstBody : MirBody → MirState → RawStep MirState MirReturn :=
+      fun _ _ => .failed)
+    {target : TargetLayout}
+    {v : MirReturn} :
+    evalMirStmt b s stmt adts bodies evalConstBody target =
+      .terminated (.normal v) → False := by
   cases stmt with
   | assign dst rv =>
     cases rv with
@@ -493,10 +596,41 @@ theorem evalMirStmt_not_normal (adts : List AdtDecl) (b : MirBody)
       dsimp [evalMirStmt]
       cases evalOperand b.localCount s op with
       | none => intro h; cases h
+      | some p => exact assignNext_not_normal b.localCount p.2 dst p.1 s
+    | «repeat» op len =>
+      dsimp [evalMirStmt]
+      cases evalOperand b.localCount s op with
+      | none => intro h; cases h
       | some p =>
-        dsimp
-        cases assignPlace b.localCount p.2 dst p.1 <;>
-          (cases s; intro h; cases h)
+        cases p with
+        | mk pval plocals =>
+          cases pval with
+          | usize bits =>
+            exact assignNext_not_normal b.localCount plocals dst
+              (.bytes len bits) s
+          | bool bval =>
+            exact assignNext_not_normal b.localCount plocals dst
+              (.bytes len (if bval then 1 else 0)) s
+          | _ => intro h; cases h
+    | repeatSizeOf op sizedTy =>
+      dsimp [evalMirStmt]
+      cases evalOperand b.localCount s op with
+      | none => intro h; cases h
+      | some p =>
+        cases p with
+        | mk pval plocals =>
+          cases evalTyByteSize adts s.tySizes sizedTy s.adtPad target with
+          | none =>
+            cases pval <;> (intro h; cases h)
+          | some sz =>
+            cases pval with
+            | usize bits =>
+              exact assignNext_not_normal b.localCount plocals dst
+                (.bytes sz bits) s
+            | bool bval =>
+              exact assignNext_not_normal b.localCount plocals dst
+                (.bytes sz (if bval then 1 else 0)) s
+            | _ => intro h; cases h
     | binaryOp op lhs rhs =>
       dsimp [evalMirStmt]
       cases evalOperand b.localCount s lhs with
@@ -509,31 +643,93 @@ theorem evalMirStmt_not_normal (adts : List AdtDecl) (b : MirBody)
           dsimp
           cases evalBinOp op p1.1 p2.1 with
           | none => intro h; cases h
-          | some _ =>
-            dsimp
-            cases assignPlace b.localCount p2.2 dst _ <;>
-              (cases s; intro h; cases h)
+          | some outVal =>
+            exact assignNext_not_normal b.localCount p2.2 dst outVal s
+    | unaryOp op src =>
+      dsimp [evalMirStmt]
+      cases evalOperand b.localCount s src with
+      | none => intro h; cases h
+      | some p =>
+        dsimp
+        cases evalUnOp op p.1 with
+        | none => intro h; cases h
+        | some outVal =>
+          exact assignNext_not_normal b.localCount p.2 dst outVal s
     | aggregate adtId op =>
       dsimp [evalMirStmt]
-      cases (findAdtDecl adts adtId).any (fun d => d.fields.length == 1) with
-      | false => intro h; cases h
-      | true =>
-        dsimp
-        cases evalOperand b.localCount s op with
-        | none => intro h; cases h
-        | some p =>
-          dsimp
-          cases assignPlace b.localCount p.2 dst (.adt adtId p.1) <;>
-            (cases s; intro h; cases h)
+      refine not_normal_of_if_failed ?_
+      cases evalOperand b.localCount s op with
+      | none => intro h; cases h
+      | some p =>
+        exact assignNext_not_normal b.localCount p.2 dst (.adt adtId p.1) s
+    | aggregateFields ops adtIdOpt =>
+      dsimp [evalMirStmt]
+      cases evalOperandList b.localCount s ops with
+      | none => intro h; cases h
+      | some p =>
+        cases adtIdOpt with
+        | none =>
+          exact assignNext_not_normal b.localCount p.2 dst (packFields p.1) s
+        | some adtId =>
+          exact not_normal_of_if_failed
+            (assignNext_not_normal b.localCount p.2 dst
+              (.adt adtId (packFields p.1)) s)
     | ref src =>
       dsimp [evalMirStmt]
       cases evalRefPlace b.localCount s src with
       | none => intro h; cases h
       | some refVal =>
-        dsimp
-        cases assignPlace b.localCount s.locals dst refVal <;>
-          (cases s; intro h; cases h)
+        exact assignNext_not_normal b.localCount s.locals dst refVal s
+    | rawPtr _ src =>
+      dsimp [evalMirStmt]
+      cases evalRefPlace b.localCount s src with
+      | none => intro h; cases h
+      | some refVal =>
+        exact assignNext_not_normal b.localCount s.locals dst refVal s
+    | cast kind op dstTy =>
+      cases kind with
+      | transmute srcTy =>
+        dsimp [evalMirStmt]
+        cases evalOperand b.localCount s op with
+        | none => intro h; cases h
+        | some p =>
+          dsimp
+          cases evalTransmuteVal adts { s with locals := p.2 }
+              srcTy dstTy p.1 target with
+          | none => intro h; cases h
+          | some outVal =>
+            exact assignNext_not_normal b.localCount p.2 dst outVal s
+      | intToInt =>
+        dsimp [evalMirStmt]
+        refine not_normal_of_if_failed ?_
+        cases evalOperand b.localCount s op with
+        | none => intro h; cases h
+        | some p => exact assignNext_not_normal b.localCount p.2 dst p.1 s
+      | ptrToPtr =>
+        dsimp [evalMirStmt]
+        refine not_normal_of_if_failed ?_
+        cases evalOperand b.localCount s op with
+        | none => intro h; cases h
+        | some p => exact assignNext_not_normal b.localCount p.2 dst p.1 s
+      | _ => intro h; cases h
     | _ => intro h; cases h
+  | evalConst dst constId typeArgs =>
+    dsimp [evalMirStmt]
+    cases (findBody bodies constId).bind (MirBody.subst typeArgs) with
+    | none => intro h; cases h
+    | some cBody =>
+      dsimp
+      refine not_normal_of_if_failed ?_
+      cases evalConstBody cBody (constEntryState s.tySizes s.adtPad) with
+      | silent _ => intro h; cases h
+      | failed => intro h; cases h
+      | terminated t =>
+        cases t with
+        | normal ret =>
+          dsimp
+          exact not_normal_of_if_failed
+            (assignNext_not_normal b.localCount s.locals dst ret.value s)
+        | unwind | abort | compileTimeError => intro h; cases h
   | placeMention p =>
     dsimp [evalMirStmt]
     cases p.projection with
@@ -549,20 +745,43 @@ theorem evalMirStmt_not_normal (adts : List AdtDecl) (b : MirBody)
   | nop | constEvalCounter => cases s; intro h; cases h
   | _ => intro h; cases h
 
+theorem assignNext_with_stmtIdx_silent (localCount : Nat)
+    (locals : Nat → Option MirVal) (dst : Place) (val : MirVal)
+    (s s' : MirState) (idx : Nat) :
+    (match assignPlace localCount locals dst val with
+     | some locals' => s.nextStmt locals'
+     | none => .failed) = .silent s' →
+    (match assignPlace localCount locals dst val with
+     | some locals' => ({ s with stmtIdx := idx }).nextStmt locals'
+     | none => .failed) = .silent { s' with stmtIdx := idx + 1 } ∧
+    s'.block = s.block ∧
+    s'.stmtIdx = s.stmtIdx + 1 ∧
+    s'.curBody = s.curBody ∧
+    s'.stack = s.stack := by
+  cases assignPlace localCount locals dst val with
+  | none => intro h; cases h
+  | some _ => exact nextStmt_with_stmtIdx idx
+
 theorem evalMirStmt_with_stmtIdx_silent (adts : List AdtDecl)
     (b₁ b₂ : MirBody) (s s' : MirState) (idx : Nat) (stmt : Stmt)
-    (hlc : b₁.localCount = b₂.localCount) :
-    evalMirStmt b₁ s stmt adts = .silent s' →
-      evalMirStmt b₂ { s with stmtIdx := idx } stmt adts =
-        .silent { s' with stmtIdx := idx + 1 } ∧
+    (hlc : b₁.localCount = b₂.localCount)
+    (bodies : List BodyDecl := [])
+    (evalConstBody : MirBody → MirState → RawStep MirState MirReturn :=
+      fun _ _ => .failed)
+    {target : TargetLayout} :
+    evalMirStmt b₁ s stmt adts bodies evalConstBody target = .silent s' →
+      evalMirStmt b₂ { s with stmtIdx := idx } stmt adts bodies evalConstBody
+        target = .silent { s' with stmtIdx := idx + 1 } ∧
       s'.block = s.block ∧
       s'.stmtIdx = s.stmtIdx + 1 ∧
       s'.curBody = s.curBody ∧
       s'.stack = s.stack := by
   cases s with
-  | mk locals localGens block stmtIdx tySizes curBody stack frameId nextFrameId =>
+  | mk locals localGens block stmtIdx tySizes curBody stack frameId
+       nextFrameId adtPad ubChecks =>
   let s : MirState :=
-    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId, nextFrameId⟩
+    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
+     nextFrameId, adtPad, ubChecks⟩
   cases stmt with
   | assign dst rv =>
     cases rv with
@@ -572,10 +791,43 @@ theorem evalMirStmt_with_stmtIdx_silent (adts : List AdtDecl)
       cases evalOperand b₁.localCount s op with
       | none => intro h; cases h
       | some p =>
-        dsimp
-        cases assignPlace b₁.localCount p.2 dst p.1 with
-        | none => intro h; cases h
-        | some _ => exact nextStmt_with_stmtIdx idx
+        exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst p.1 s s' idx
+    | «repeat» op len =>
+      dsimp [evalMirStmt]
+      rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
+      cases evalOperand b₁.localCount s op with
+      | none => intro h; cases h
+      | some p =>
+        cases p with
+        | mk pval plocals =>
+          cases pval with
+          | usize bits =>
+            exact assignNext_with_stmtIdx_silent b₁.localCount plocals dst
+              (.bytes len bits) s s' idx
+          | bool bval =>
+            exact assignNext_with_stmtIdx_silent b₁.localCount plocals dst
+              (.bytes len (if bval then 1 else 0)) s s' idx
+          | _ => intro h; cases h
+    | repeatSizeOf op sizedTy =>
+      dsimp [evalMirStmt]
+      rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
+      cases evalOperand b₁.localCount s op with
+      | none => intro h; cases h
+      | some p =>
+        cases p with
+        | mk pval plocals =>
+          cases evalTyByteSize adts tySizes sizedTy adtPad target with
+          | none =>
+            cases pval <;> (intro h; cases h)
+          | some sz =>
+            cases pval with
+            | usize bits =>
+              exact assignNext_with_stmtIdx_silent b₁.localCount plocals dst
+                (.bytes sz bits) s s' idx
+            | bool bval =>
+              exact assignNext_with_stmtIdx_silent b₁.localCount plocals dst
+                (.bytes sz (if bval then 1 else 0)) s s' idx
+            | _ => intro h; cases h
     | binaryOp op lhs rhs =>
       dsimp [evalMirStmt]
       rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx lhs]
@@ -590,36 +842,133 @@ theorem evalMirStmt_with_stmtIdx_silent (adts : List AdtDecl)
           dsimp
           cases evalBinOp op p1.1 p2.1 with
           | none => intro h; cases h
-          | some _ =>
-            dsimp
-            cases assignPlace b₁.localCount p2.2 dst _ with
-            | none => intro h; cases h
-            | some _ => exact nextStmt_with_stmtIdx idx
+          | some outVal =>
+            exact assignNext_with_stmtIdx_silent b₁.localCount p2.2 dst
+              outVal s s' idx
+    | unaryOp op src =>
+      dsimp [evalMirStmt]
+      rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx src]
+      cases evalOperand b₁.localCount s src with
+      | none => intro h; cases h
+      | some p =>
+        dsimp
+        cases evalUnOp op p.1 with
+        | none => intro h; cases h
+        | some outVal =>
+          exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+            outVal s s' idx
     | aggregate adtId op =>
       dsimp [evalMirStmt]
       rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
-      cases (findAdtDecl adts adtId).any (fun d => d.fields.length == 1) with
-      | false => intro h; cases h
-      | true =>
-        dsimp
-        cases evalOperand b₁.localCount s op with
-        | none => intro h; cases h
-        | some p =>
+      intro h
+      have ⟨hcond, h1⟩ := silent_of_if_failed h
+      rw [if_true_eq hcond]
+      revert h1
+      cases evalOperand b₁.localCount s op with
+      | none => intro h1; cases h1
+      | some p =>
+        exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+          (.adt adtId p.1) s s' idx
+    | aggregateFields ops adtIdOpt =>
+      dsimp [evalMirStmt]
+      rw [← hlc, evalOperandList_with_stmtIdx b₁.localCount idx ops s]
+      cases evalOperandList b₁.localCount s ops with
+      | none => intro h; cases h
+      | some p =>
+        cases adtIdOpt with
+        | none =>
+          exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+            (packFields p.1) s s' idx
+        | some adtId =>
           dsimp
-          cases assignPlace b₁.localCount p.2 dst (.adt adtId p.1) with
-          | none => intro h; cases h
-          | some _ => exact nextStmt_with_stmtIdx idx
+          intro h
+          have ⟨hcond, h1⟩ := silent_of_if_failed h
+          rw [if_true_eq hcond]
+          exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+            (.adt adtId (packFields p.1)) s s' idx h1
     | ref src =>
       dsimp [evalMirStmt]
       rw [← hlc, evalRefPlace_with_stmtIdx b₁.localCount s idx src]
       cases evalRefPlace b₁.localCount s src with
       | none => intro h; cases h
       | some refVal =>
-        dsimp
-        cases assignPlace b₁.localCount s.locals dst refVal with
+        exact assignNext_with_stmtIdx_silent b₁.localCount s.locals dst
+          refVal s s' idx
+    | rawPtr _ src =>
+      dsimp [evalMirStmt]
+      rw [← hlc, evalRefPlace_with_stmtIdx b₁.localCount s idx src]
+      cases evalRefPlace b₁.localCount s src with
+      | none => intro h; cases h
+      | some refVal =>
+        exact assignNext_with_stmtIdx_silent b₁.localCount s.locals dst
+          refVal s s' idx
+    | cast kind op dstTy =>
+      cases kind with
+      | transmute srcTy =>
+        dsimp [evalMirStmt]
+        rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
+        cases evalOperand b₁.localCount s op with
         | none => intro h; cases h
-        | some _ => exact nextStmt_with_stmtIdx idx
+        | some p =>
+          dsimp
+          rw [evalTransmuteVal_with_stmtIdx adts { s with locals := p.2 } idx
+            srcTy dstTy p.1 target]
+          cases evalTransmuteVal adts { s with locals := p.2 }
+              srcTy dstTy p.1 target with
+          | none => intro h; cases h
+          | some outVal =>
+            exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+              outVal s s' idx
+      | intToInt =>
+        dsimp [evalMirStmt]
+        rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
+        intro h
+        have ⟨hcond, h1⟩ := silent_of_if_failed h
+        rw [if_true_eq hcond]
+        revert h1
+        cases evalOperand b₁.localCount s op with
+        | none => intro h1; cases h1
+        | some p =>
+          exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+            p.1 s s' idx
+      | ptrToPtr =>
+        dsimp [evalMirStmt]
+        rw [← hlc, evalOperand_with_stmtIdx b₁.localCount s idx op]
+        intro h
+        have ⟨hcond, h1⟩ := silent_of_if_failed h
+        rw [if_true_eq hcond]
+        revert h1
+        cases evalOperand b₁.localCount s op with
+        | none => intro h1; cases h1
+        | some p =>
+          exact assignNext_with_stmtIdx_silent b₁.localCount p.2 dst
+            p.1 s s' idx
+      | _ => intro h; cases h
     | _ => intro h; cases h
+  | evalConst dst constId typeArgs =>
+    dsimp [evalMirStmt]
+    rw [← hlc]
+    cases (findBody bodies constId).bind (MirBody.subst typeArgs) with
+    | none => intro h; cases h
+    | some cBody =>
+      dsimp
+      intro h
+      have ⟨hcond, h1⟩ := silent_of_if_failed h
+      rw [if_true_eq hcond]
+      revert h1
+      cases evalConstBody cBody (constEntryState tySizes adtPad) with
+      | silent _ => intro h1; cases h1
+      | failed => intro h1; cases h1
+      | terminated t =>
+        cases t with
+        | normal ret =>
+          dsimp
+          intro h1
+          have ⟨hscalar, h2⟩ := silent_of_if_failed h1
+          rw [if_true_eq hscalar]
+          exact assignNext_with_stmtIdx_silent b₁.localCount locals dst
+            ret.value s s' idx h2
+        | unwind | abort | compileTimeError => intro h1; cases h1
   | placeMention p =>
     dsimp [evalMirStmt]
     rw [← hlc]
@@ -655,17 +1004,21 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
     (hstack : s.stack = [])
     (hnocall : isCall1 term = false)
     (hP : StmtIdxInvariant P)
-    (hp : P v) :
-    evalMirTerminator adts bodies b₁ s term = .terminated (.normal v) →
+    (hp : P v)
+    {targetLayout : TargetLayout} :
+    evalMirTerminator adts bodies b₁ s term targetLayout =
+      .terminated (.normal v) →
       ∃ v',
-        evalMirTerminator adts bodies b₂ { s with stmtIdx := idx } term =
-          .terminated (.normal v') ∧ P v' := by
+        evalMirTerminator adts bodies b₂ { s with stmtIdx := idx } term
+          targetLayout = .terminated (.normal v') ∧ P v' := by
   cases s with
-  | mk locals localGens block stmtIdx tySizes curBody stack frameId nextFrameId =>
+  | mk locals localGens block stmtIdx tySizes curBody stack frameId
+       nextFrameId adtPad ubChecks =>
   dsimp at hstack
   subst hstack
   let s : MirState :=
-    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, [], frameId, nextFrameId⟩
+    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, [], frameId,
+     nextFrameId, adtPad, ubChecks⟩
   cases term with
   | return_ =>
     dsimp [evalMirTerminator]
@@ -694,7 +1047,7 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
   | panic hasCleanup =>
     dsimp [evalMirTerminator]
     cases hasCleanup <;> (intro h; cases h)
-  | assert cond expected _ hasCleanup =>
+  | assert cond expected _ onFail hasCleanup =>
     dsimp [evalMirTerminator]
     cases evalOperand b₁.localCount s cond with
     | none => intro h; cases h
@@ -707,7 +1060,8 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
           cases bval == expected with
           | false =>
             dsimp
-            cases hasCleanup <;> (intro h; cases h)
+            cases onFail <;> cases ubChecks <;> cases hasCleanup <;>
+              (intro h; cases h)
           | true =>
             dsimp
             exact fun h =>
@@ -727,14 +1081,14 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
             exact fun h =>
               False.elim (not_normal_of_if_failed (fun h1 => by cases h1) h))
         | _ => intro h; cases h
-  | callSizeOf dst ty _ =>
+  | callLayout dst query _ =>
     dsimp [evalMirTerminator]
     refine fun h => False.elim (not_normal_of_if_failed ?_ h)
-    cases evalTyByteSize adts tySizes ty with
+    cases evalLayoutQuery adts tySizes query adtPad targetLayout with
     | none => intro h1; cases h1
-    | some sz =>
+    | some val =>
       dsimp
-      cases assignPlace b₁.localCount locals dst (.usize sz) <;>
+      cases assignPlace b₁.localCount locals dst (.usize val) <;>
         (intro h1; cases h1)
   | callTransmuteCopy dst srcTy dstTy op _ =>
     dsimp [evalMirTerminator]
@@ -743,7 +1097,8 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
     | none => intro h1; cases h1
     | some p =>
       dsimp
-      cases evalTransmuteCopy adts { s with locals := p.2 } srcTy dstTy p.1 with
+      cases evalTransmuteCopy adts { s with locals := p.2 }
+          srcTy dstTy p.1 targetLayout with
       | none => intro h1; cases h1
       | some outVal =>
         dsimp
@@ -759,17 +1114,20 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
     (hlen : b₁.blocks.length = b₂.blocks.length)
     (hcur : s.curBody = none)
     (hstack : s.stack = [])
-    (hnocall : isCall1 term = false) :
-    evalMirTerminator adts bodies b₁ s term = .silent s' →
-      evalMirTerminator adts bodies b₂ { s with stmtIdx := idx } term =
-        .silent s' ∧
+    (hnocall : isCall1 term = false)
+    {targetLayout : TargetLayout} :
+    evalMirTerminator adts bodies b₁ s term targetLayout = .silent s' →
+      evalMirTerminator adts bodies b₂ { s with stmtIdx := idx } term
+        targetLayout = .silent s' ∧
       s'.stmtIdx = 0 ∧
       s'.curBody = none ∧
       s'.stack = [] := by
   cases s with
-  | mk locals localGens block stmtIdx tySizes curBody stack frameId nextFrameId =>
+  | mk locals localGens block stmtIdx tySizes curBody stack frameId
+       nextFrameId adtPad ubChecks =>
   let s : MirState :=
-    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId, nextFrameId⟩
+    ⟨locals, localGens, block, stmtIdx, tySizes, curBody, stack, frameId,
+     nextFrameId, adtPad, ubChecks⟩
   dsimp at hcur hstack
   cases term with
   | return_ =>
@@ -794,7 +1152,7 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
     dsimp [evalMirTerminator]
     rw [hstack]
     cases hasCleanup <;> (intro h; cases h)
-  | assert cond expected target hasCleanup =>
+  | assert cond expected target onFail hasCleanup =>
     dsimp [evalMirTerminator]
     rw [← hlc, ← hlen, evalOperand_with_stmtIdx b₁.localCount s idx cond]
     cases evalOperand b₁.localCount s cond with
@@ -809,7 +1167,8 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
           | false =>
             dsimp
             rw [hstack]
-            cases hasCleanup <;> (intro h; cases h)
+            cases onFail <;> cases ubChecks <;> cases hasCleanup <;>
+              (intro h; cases h)
           | true =>
             dsimp
             intro h
@@ -836,18 +1195,18 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
             have hg := gotoBlock_with_stmtIdx idx hs
             exact ⟨hg.1, hg.2.1, hg.2.2.1.trans hcur, hg.2.2.2.trans hstack⟩)
         | _ => intro h; cases h
-  | callSizeOf dst ty target =>
+  | callLayout dst query target =>
     dsimp [evalMirTerminator]
     rw [← hlc, ← hlen]
     intro h
     have ⟨hlt, h1⟩ := silent_of_if_failed h
     rw [if_true_eq hlt]
     revert h1
-    cases evalTyByteSize adts tySizes ty with
+    cases evalLayoutQuery adts tySizes query adtPad targetLayout with
     | none => intro h1; cases h1
-    | some sz =>
+    | some val =>
       dsimp
-      cases assignPlace b₁.localCount locals dst (.usize sz) with
+      cases assignPlace b₁.localCount locals dst (.usize val) with
       | none => intro h1; cases h1
       | some _ =>
         intro hs
@@ -864,8 +1223,10 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
     | none => intro h1; cases h1
     | some p =>
       dsimp
-      rw [evalTransmuteCopy_with_stmtIdx adts { s with locals := p.2 } idx srcTy dstTy p.1]
-      cases evalTransmuteCopy adts { s with locals := p.2 } srcTy dstTy p.1 with
+      rw [evalTransmuteCopy_with_stmtIdx adts { s with locals := p.2 } idx
+        srcTy dstTy p.1 targetLayout]
+      cases evalTransmuteCopy adts { s with locals := p.2 }
+          srcTy dstTy p.1 targetLayout with
       | none => intro h1; cases h1
       | some outVal =>
         dsimp
@@ -878,19 +1239,25 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
   | call1 _ _ _ _ _ => cases hnocall
   | _ => intro h; cases h
 
+abbrev evalConstAtDepth1 (adts : List AdtDecl) (bodies : List BodyDecl)
+    (target : TargetLayout := defaultTargetLayout) :
+    MirBody → MirState → RawStep MirState MirReturn :=
+  runConstSteps (evalMirStepDepth adts bodies target 1) defaultConstFuel
+
 theorem evalMirStep_at_block {adts : List AdtDecl} {bodies : List BodyDecl}
     {b : MirBody} {bb : BasicBlock} {s : MirState}
     (hcur : s.curBody = none)
     (hbb : lookupAt b.blocks s.block = some bb) :
     evalMirStep adts bodies b s =
       match lookupAt bb.stmts s.stmtIdx with
-      | some stmt => evalMirStmt b s stmt adts
+      | some stmt =>
+        evalMirStmt b s stmt adts bodies (evalConstAtDepth1 adts bodies)
       | none =>
         if s.stmtIdx == bb.stmts.length then
           evalMirTerminator adts bodies b s bb.terminator
         else
           .failed := by
-  dsimp [evalMirStep]
+  dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith]
   cases hs : s.curBody with
   | none =>
     dsimp [Option.getD]
@@ -906,7 +1273,9 @@ theorem evalMirStep_at_block_idx {adts : List AdtDecl} {bodies : List BodyDecl}
     (hbb : lookupAt b.blocks s.block = some bb) :
     evalMirStep adts bodies b { s with stmtIdx := idx } =
       match lookupAt bb.stmts idx with
-      | some stmt => evalMirStmt b { s with stmtIdx := idx } stmt adts
+      | some stmt =>
+        evalMirStmt b { s with stmtIdx := idx } stmt adts bodies
+          (evalConstAtDepth1 adts bodies)
       | none =>
         if idx == bb.stmts.length then
           evalMirTerminator adts bodies b { s with stmtIdx := idx }
@@ -995,13 +1364,15 @@ theorem stripNops_normal_suffix {adts : List AdtDecl} {bodies : List BodyDecl}
         rw [lookupAt_map, hbb]
         rfl
       have hstmtTerm :
-          evalMirStmt (stripNopsBody b) s x adts = .terminated (.normal v) := by
+          evalMirStmt (stripNopsBody b) s x adts bodies
+            (evalConstAtDepth1 adts bodies) = .terminated (.normal v) := by
         rw [evalMirStep_at_block hcur hbbLow] at hterm
         dsimp [stripNopsBlock] at hterm
         rw [hlookLow] at hterm
         exact hterm
       exact False.elim
-        (evalMirStmt_not_normal adts (stripNopsBody b) s x hstmtTerm)
+        (evalMirStmt_not_normal adts (stripNopsBody b) s x bodies
+          (evalConstAtDepth1 adts bodies) hstmtTerm)
 
 theorem stripNops_step_suffix {adts : List AdtDecl} {bodies : List BodyDecl}
     {b : MirBody} {bb : BasicBlock} {s s' : MirState}
@@ -1090,14 +1461,15 @@ theorem stripNops_step_suffix {adts : List AdtDecl} {bodies : List BodyDecl}
         rw [lookupAt_map, hbb]
         rfl
       have hstmtStep :
-          evalMirStmt (stripNopsBody b) s x adts = .silent s' := by
+          evalMirStmt (stripNopsBody b) s x adts bodies
+            (evalConstAtDepth1 adts bodies) = .silent s' := by
         rw [evalMirStep_at_block hcur hbbLow] at hstep
         dsimp [stripNopsBlock] at hstep
         rw [hlookLow] at hstep
         exact hstep
       have ⟨hstmtOrig, hs'Blk, hs'Idx, hs'Cur, hs'Stack⟩ :=
         evalMirStmt_with_stmtIdx_silent adts (stripNopsBody b) b s s'
-          k_orig x rfl hstmtStep
+          k_orig x rfl bodies (evalConstAtDepth1 adts bodies) hstmtStep
       have hstepOrig :
           evalMirStep adts bodies b { s with stmtIdx := k_orig } =
             .silent { s' with stmtIdx := k_orig + 1 } := by
@@ -1131,7 +1503,8 @@ theorem stripNopsBody_simulates_aux {adts : List AdtDecl}
     intro k_orig hcur hstack hsuf
     cases hbb : lookupAt b.blocks s.block with
     | none =>
-      dsimp [evalMirStep, stripNopsBody] at hterm
+      dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith,
+        stripNopsBody] at hterm
       rw [hcur] at hterm
       dsimp [Option.getD] at hterm
       rw [lookupAt_map, hbb] at hterm
@@ -1145,7 +1518,8 @@ theorem stripNopsBody_simulates_aux {adts : List AdtDecl}
     intro k_orig hcur hstack hsuf
     cases hbb : lookupAt b.blocks s.block with
     | none =>
-      dsimp [evalMirStep, stripNopsBody] at hstep
+      dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith,
+        stripNopsBody] at hstep
       rw [hcur] at hstep
       dsimp [Option.getD] at hstep
       rw [lookupAt_map, hbb] at hstep
@@ -1260,13 +1634,13 @@ theorem evalMirTerminator_eq_of_nocall (adts : List AdtDecl)
     rw [list_length_map]
   | unreachable => rfl
   | panic _ => rfl
-  | assert _ _ _ _ =>
+  | assert _ _ _ _ _ =>
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | switchInt _ _ _ =>
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
-  | callSizeOf _ _ _ =>
+  | callLayout _ _ _ =>
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | callTransmuteCopy _ _ _ _ _ =>
@@ -1320,12 +1694,17 @@ theorem evalMirTerminator_lowerBodyStep_normal (adts : List AdtDecl)
 
 theorem evalMirStmt_preserves_root (adts : List AdtDecl) (b : MirBody)
     (s s' : MirState) (stmt : Stmt)
-    (hcur : s.curBody = none) (hstack : s.stack = []) :
-    evalMirStmt b s stmt adts = .silent s' →
+    (hcur : s.curBody = none) (hstack : s.stack = [])
+    (bodies : List BodyDecl := [])
+    (evalConstBody : MirBody → MirState → RawStep MirState MirReturn :=
+      fun _ _ => .failed)
+    {target : TargetLayout} :
+    evalMirStmt b s stmt adts bodies evalConstBody target = .silent s' →
       s'.curBody = none ∧ s'.stack = [] := by
   intro h
   have ⟨_, _, _, hc, hst⟩ :=
-    evalMirStmt_with_stmtIdx_silent adts b b s s' 0 stmt rfl h
+    evalMirStmt_with_stmtIdx_silent adts b b s s' 0 stmt rfl bodies
+      evalConstBody h
   exact ⟨hc.trans hcur, hst.trans hstack⟩
 
 theorem evalMirTerminator_preserves_root (adts : List AdtDecl)
@@ -1390,7 +1769,7 @@ theorem evalMirTerminator_lowerBodyStep_silent (adts : List AdtDecl)
                 Or.inr ⟨{ s with block := target.index, stmtIdx := 0 }, ?_, ?_⟩⟩
               · dsimp [evalMirTerminator]
                 exact if_true_eq hlt _ _
-              · dsimp [evalMirStep]
+              · dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith]
                 rw [hcur]
                 dsimp [Option.getD]
                 rw [hlook]
@@ -1425,7 +1804,7 @@ theorem evalMirStep_lowerBodyStep_normal (adts : List AdtDecl)
     (hcur : s.curBody = none) :
     evalMirStep adts bodies (lowerBodyStep b) s = .terminated (.normal v) →
       evalMirStep adts bodies b s = .terminated (.normal v) := by
-  dsimp [evalMirStep, lowerBodyStep]
+  dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith, lowerBodyStep]
   rw [hcur]
   dsimp [Option.getD]
   rw [lookupAt_map]
@@ -1464,7 +1843,7 @@ theorem lowerBodyStep_simulates {adts : List AdtDecl} {bodies : List BodyDecl}
       (evalMirStep_lowerBodyStep_normal adts bodies b _ hcalls hcur hterm) hp
   | @step s s' P hstep _ ih =>
     revert hstep
-    dsimp [evalMirStep, lowerBodyStep]
+    dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith, lowerBodyStep]
     rw [hcur]
     dsimp [Option.getD]
     rw [lookupAt_map]
@@ -1478,9 +1857,11 @@ theorem lowerBodyStep_simulates {adts : List AdtDecl} {bodies : List BodyDecl}
       | some stmt =>
         dsimp
         intro hstep
-        have hpres := evalMirStmt_preserves_root adts b s s' stmt hcur hstack hstep
+        have hpres :=
+          evalMirStmt_preserves_root adts b s s' stmt hcur hstack bodies
+            (evalConstAtDepth1 adts bodies) hstep
         have hstepB : evalMirStep adts bodies b s = .silent s' := by
-          dsimp [evalMirStep]
+          dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith]
           rw [hcur]
           dsimp [Option.getD]
           rw [hbb]
@@ -1504,7 +1885,7 @@ theorem lowerBodyStep_simulates {adts : List AdtDecl} {bodies : List BodyDecl}
           have htermB :
               evalMirStep adts bodies b s =
                 evalMirTerminator adts bodies b s bb.terminator := by
-            dsimp [evalMirStep]
+            dsimp [evalMirStep, evalMirStepDepth, evalMirStepWith]
             rw [hcur]
             dsimp [Option.getD]
             rw [hbb]

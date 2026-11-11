@@ -43,6 +43,12 @@
 //!                                      obligation in `Crate.tcbWaivedIds`
 //! anneal:invariant IDENT != INT        on a struct; IDENT is its `usize`
 //!                                      field
+//! anneal:allow_compile_time_guard      on a function; waives
+//!                                      `TCBItem.compileTimeGuard`
+//! anneal:documented_intent RATIONALE   on a function; records
+//!                                      `TCBItem.documentedIntent`
+//! anneal:pinned_compiler_coupled WHY   on a function; waives
+//!                                      `TCBItem.pinnedCompilerCoupled`
 //! ```
 //!
 //! Tokens may be separated by any whitespace. Any other `anneal:` line is an
@@ -57,6 +63,9 @@ pub enum Directive {
     Requires { ident: String, ne: u128 },
     Trusted { reason: String },
     Invariant { ident: String, ne: u128 },
+    AllowCompileTimeGuard,
+    DocumentedIntent(String),
+    PinnedCompilerCoupled(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +180,34 @@ pub fn parse_doc(doc: &str) -> Result<Vec<Directive>, String> {
                 "`anneal:` must start the doc-comment line: `{line}`"
             ));
         };
+        if rest.trim() == "allow_compile_time_guard" {
+            out.push(Directive::AllowCompileTimeGuard);
+            continue;
+        }
+        if let Some(arg) = rest.strip_prefix("documented_intent")
+            && (arg.is_empty() || arg.starts_with(char::is_whitespace))
+        {
+            let rationale = arg.trim();
+            if rationale.is_empty() {
+                return Err(format!(
+                    "`anneal:documented_intent` requires a non-empty rationale: `{line}`"
+                ));
+            }
+            out.push(Directive::DocumentedIntent(rationale.to_string()));
+            continue;
+        }
+        if let Some(arg) = rest.strip_prefix("pinned_compiler_coupled")
+            && (arg.is_empty() || arg.starts_with(char::is_whitespace))
+        {
+            let reason = arg.trim();
+            if reason.is_empty() {
+                return Err(format!(
+                    "`anneal:pinned_compiler_coupled` requires a non-empty reason: `{line}`"
+                ));
+            }
+            out.push(Directive::PinnedCompilerCoupled(reason.to_string()));
+            continue;
+        }
         let toks = lex(rest).map_err(|e| format!("in `{line}`: {e}"))?;
         use Tok::*;
         let d = match toks.as_slice() {

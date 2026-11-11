@@ -16,10 +16,11 @@ import Init.NotationExtra
 Defines the first-order representation of `rustc`'s
 `MirPhase::Runtime(RuntimePhase::PostCleanup)` Mid-level Intermediate
 Representation (MIR) for scalar, aggregate (ADT), and polymorphic functions,
-including `Body::required_consts` for Post-Monomorphization Error (PME)
-constant-evaluation obligations and the first-order specification and crate
-descriptors (`InvariantSpec`, `RequiresSpec`, `PostSpec`, `ObligationId`,
-`BodyDecl`, `CapturedFn`, `Crate`)
+including `Stmt.evalConst` and `Body::required_consts` for compile-time constant
+evaluation, `AdtRepr` and `LayoutQuery` for representation-aware type layout,
+and the first-order specification and crate descriptors (`InvariantSpec`,
+`RequiresSpec`, `PostSpec`, `ObligationId`, `TCBItem`, `BodyDecl`, `CapturedFn`,
+`Crate`)
 (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67` and
 `rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b`).
 
@@ -53,6 +54,21 @@ operate over a flat table. -/
 structure BodyId where
   index : Nat
 
+/-- Target C ABI primitive layout parameters captured from `tcx.data_layout()`
+(`compiler/rustc_abi/src/layout.rs#L65-L95`, `src/type-layout.md#L58-L94`).
+
+Because Anneal verifies a fixed configured compilation $C$, the compilation
+target's pointer width and primitive integer ABI alignments (`i64Align`,
+`i128Align`) are crate-level syntax constants fixed for $C$. -/
+structure TargetLayout where
+  ptrByteWidth : Nat := 8
+  i64Align : Nat := 8
+  i128Align : Nat := 16
+
+/-- Default 64-bit target layout (`ptrByteWidth = 8`, `i64Align = 8`,
+`i128Align = 16`). -/
+def defaultTargetLayout : TargetLayout := ⟨8, 8, 16⟩
+
 /-- MIR type grammar for scalar, aggregate (ADT), polymorphic, reference, and
 pointer types (`src/types/numeric.md#L37-L38`, `src/types/boolean.md#L6-L7`,
 `compiler/rustc_type_ir/src/ty_kind.rs#L106-L165`):
@@ -64,7 +80,9 @@ being verified. Callee bodies are instantiated by substitution
 (`MirBody.subst`), so a `.param` that the semantics reads always refers to the
 root function's parameters. `.adt id` names the `AdtDecl` with that `id`; the
 capture monomorphizes generic ADTs into distinct declarations, so `.adt` has
-no type arguments. `.unmodeled` is the bounded leaf fallback for `rustc`
+no type arguments. `.arraySizeOf elem sizedTy` represents
+`[elem; size_of::<sizedTy>()]` whose length is evaluated symbolically against
+`sizedTy`'s layout. `.unmodeled` is the bounded leaf fallback for `rustc`
 type-checker internal types (`Dynamic`, `Alias`, `Coroutine`, `Closure`, `Pat`,
 `UnsafeBinder`, `Bound`, `Placeholder`, `Foreign`) and has no size or valid
 values in `Trusted/MirSemantics.lean`. -/
@@ -85,6 +103,7 @@ inductive MirTy where
   | refMut (inner : MirTy)
   | rawPtr (inner : MirTy) (mutable : Bool)
   | array (elem : MirTy) (len : Nat)
+  | arraySizeOf (elem : MirTy) (sizedTy : MirTy)
   | slice (elem : MirTy)
   | tuple (elems : List MirTy)
   | fnDef (name : String)
@@ -145,17 +164,33 @@ structure FieldDecl where
 structure InvariantSpec where
   ne : Nat
 
-/-- Captured ADT (struct) declaration (`rustc_middle::ty::AdtDefData`,
-`compiler/rustc_middle/src/ty/adt.rs#L140-L176`).
+/-- Layout representation attribute on an `AdtDecl`
+(`src/type-layout.md#L180-L530`, `compiler/rustc_abi/src/repr.rs#L535-L600`):
+- `.rust`: default `#[repr(Rust)]` layout (`r[layout.repr.rust]`), whose field
+  order and non-negative inter-field/trailing padding (`MirState.adtPad`) are
+  unspecified across compiler versions except that fieldless/all-ZST structs
+  have size `0` (`r[layout.repr.rust.struct-zst]`) and non-ZST structs have size
+  at least `alignUp sumFieldSizes maxKnownAlign`.
+- `.transparent`: `#[repr(transparent)]` (`r[layout.repr.transparent]`),
+  guaranteed to have the exact size, alignment, and valid bit patterns of its
+  sole non-zero-sized field alongside any 1-ZST fields.
+- `.c`: `#[repr(C)]` (`r[layout.repr.c.struct]`), using the deterministic C ABI
+  declaration-order offset algorithm when all field alignments are known.
+- `.unmodeled`: structs carrying `#[repr(align(N))]`, `#[repr(packed(N))]`, or
+  other unmodeled layout modifiers, which fail closed on layout and validity
+  queries. -/
+inductive AdtRepr where
+  | rust
+  | transparent
+  | c
+  | unmodeled
 
-Every list of fields is accepted here, but the semantics gives meaning only to
-single-field structs (`AdtDecl.payloadTy`). A fieldless struct or a struct with
-two or more fields has no modeled size or valid value, so every function whose
-signature mentions it fails closed at entry, and other functions are
-unaffected. -/
+/-- Captured ADT (struct) declaration (`rustc_middle::ty::AdtDefData`,
+`compiler/rustc_middle/src/ty/adt.rs#L140-L176`). -/
 structure AdtDecl where
   id : Nat
   fields : List FieldDecl
+  repr : AdtRepr := .rust
   invariant : Option InvariantSpec := none
 
 /-- Whether safe downstream code can construct the struct directly with a
@@ -173,13 +208,8 @@ def AdtDecl.allFieldsPubSafe (decl : AdtDecl) : Bool :=
     | .pubSafe => true
     | .priv => false)
 
-/-- The type of the single value that a `MirVal.adt` of this struct carries.
-
-`MirVal.adt id inner` stores one field value, so a single-field struct carries
-its field's type (`some f.ty`), while a fieldless struct or a struct with two
-or more fields has no payload type (`none`). Every consumer (size, validity,
-transmutation) goes through this one function, so that restriction lives in one
-place. -/
+/-- The type of the single value that a 1-field `MirVal.adt` of this struct
+carries. -/
 def AdtDecl.payloadTy (decl : AdtDecl) : Option MirTy :=
   match decl.fields with
   | [f] => some f.ty
@@ -192,10 +222,13 @@ def AdtDecl.payloadTy (decl : AdtDecl) : Option MirTy :=
 - `.uninit`: an uninitialized sub-value written by a partial move out of a
   projected place (`Operand.move`); reading any value containing `.uninit` is
   undefined behavior (`MirVal.isFullyInit`).
-- `.adt id inner`: a struct value with its single payload (see
-  `AdtDecl.payloadTy`).
-- `.bytes sz bits`: the opaque value of a generic parameter type, `sz` bytes
-  wide. The semantics never reinterprets these bits as another type.
+- `.adt id inner`: a struct value carrying `.unit` for a fieldless struct, the
+  single field value for a 1-field struct, or a right-nested `.fieldCons` spine
+  for a multi-field struct.
+- `.fieldCons head tail`: right-nested field spine for multi-field structs and
+  tuples.
+- `.bytes sz bits`: an `sz`-byte value for a generic parameter type or byte
+  array (`[u8; sz]`).
 - `.ref frameId gen loc fieldDepth`: a shared reference to `fieldDepth` nested
   `.field 0` projections of local `loc` of the activation with identifier
   `frameId`, valid only while that local's storage generation is still `gen`
@@ -206,6 +239,7 @@ inductive MirVal where
   | bool (b : Bool)
   | unit
   | adt (id : Nat) (inner : MirVal)
+  | fieldCons (head : MirVal) (tail : MirVal)
   | bytes (sz : Nat) (bits : Nat)
   | ref (frameId : Nat) (gen : Nat) (loc : LocalId) (fieldDepth : Nat := 0)
 
@@ -250,7 +284,7 @@ inductive CastKind where
   | intToFloat
   | ptrToPtr
   | fnPtrToPtr
-  | transmute
+  | transmute (srcTy : MirTy := .unmodeled)
   | subtype
 
 /-- Unary operator on `Rvalue.unaryOp` (`rustc_middle::mir::UnOp`,
@@ -297,6 +331,7 @@ inductive BinOp where
 inductive Rvalue where
   | use (op : Operand)
   | repeat (op : Operand) (len : Nat)
+  | repeatSizeOf (op : Operand) (sizedTy : MirTy)
   | ref (src : Place)
   | refMut (src : Place)
   | refFake (src : Place)
@@ -307,7 +342,7 @@ inductive Rvalue where
   | unaryOp (op : UnOp) (opnd : Operand)
   | discriminant (src : Place)
   | aggregate (adtId : Nat) (op : Operand)
-  | aggregateFields (ops : List Operand)
+  | aggregateFields (ops : List Operand) (adtId : Option Nat := none)
   | copyForDeref (src : Place)
   | wrapUnsafeBinder (op : Operand) (ty : MirTy)
   | reborrow (ty : MirTy) (mutable : Bool) (src : Place)
@@ -326,6 +361,7 @@ inductive NonDivergingIntrinsic where
 > "`PlaceMention` evaluates the `Place` without reading its value." -/
 inductive Stmt where
   | assign (dst : Place) (rv : Rvalue)
+  | evalConst (dst : Place) (constId : BodyId) (typeArgs : List MirTy := [])
   | fakeRead (place : Place)
   | setDiscriminant (place : Place) (variantIdx : Nat)
   | storageLive (loc : LocalId)
@@ -337,6 +373,31 @@ inductive Stmt where
   | constEvalCounter
   | nop
   | backwardIncompatibleDropHint (place : Place)
+
+/-- Failure action of a `Terminator.assert` check
+(`rustc_middle::mir::TerminatorKind::Assert`,
+`compiler/rustc_middle/src/mir/syntax.rs#L735-L751`):
+- `.unwind`: normal unwinding assertion (`UnwindAction::Continue` or
+  `UnwindAction::Cleanup`).
+- `.abort`: process-aborting assertion without unwinding
+  (`UnwindAction::Terminate`).
+- `.ub`: compiler-inserted undefined-behavior check
+  (`MisalignedPointerDereference`, `NullPointerDereference`,
+  `InvalidEnumConstruction`, or `UnwindAction::Unreachable` from
+  `core::ub_checks` `panic_nounwind`). -/
+inductive AssertFailKind where
+  | unwind
+  | abort
+  | ub
+
+/-- Compile-time or runtime layout query lowered from `TerminatorKind::Call`
+(`core::mem::size_of`, `core::mem::align_of`, `core::intrinsics::offset_of`,
+`library/core/src/mem/mod.rs#L308-L355`,
+`library/core/src/intrinsics/mod.rs#L2985-L2995`). -/
+inductive LayoutQuery where
+  | sizeOf (ty : MirTy)
+  | alignOf (ty : MirTy)
+  | offsetOf (containerTy : MirTy) (variantIdx : Nat) (fieldIdx : Nat)
 
 /-- Control-flow transfer at the end of a MIR basic block
 (`rustc_middle::mir::TerminatorKind`,
@@ -359,11 +420,11 @@ inductive Terminator where
   | unwindTerminate
   | drop (place : Place) (target : BlockId)
   | assert (cond : Operand) (expected : Bool) (target : BlockId)
-      (hasCleanup : Bool := false)
+      (onFail : AssertFailKind := .unwind) (hasCleanup : Bool := false)
   | switchInt (discr : Operand) (falseTarget : BlockId) (trueTarget : BlockId)
   | switchIntGeneral (discr : Operand) (targets : List (Nat × BlockId))
       (otherwise : BlockId)
-  | callSizeOf (dst : Place) (ty : MirTy) (target : BlockId)
+  | callLayout (dst : Place) (query : LayoutQuery) (target : BlockId)
   | callTransmuteCopy (dst : Place) (srcTy dstTy : MirTy) (op : Operand)
       (target : BlockId)
   | call1 (dst : Place) (callee : BodyId) (arg : Operand)
@@ -375,6 +436,11 @@ inductive Terminator where
   | falseEdge (realTarget : BlockId) (imaginaryTarget : BlockId)
   | falseUnwind (realTarget : BlockId)
   | inlineAsm
+
+/-- Shorthand for `Terminator.callLayout dst (.sizeOf ty) target`. -/
+abbrev Terminator.callSizeOf (dst : Place) (ty : MirTy)
+    (target : BlockId) : Terminator :=
+  .callLayout dst (.sizeOf ty) target
 
 /-- Basic block (`rustc_middle::mir::BasicBlockData`,
 `compiler/rustc_middle/src/mir/mod.rs#L207-L209`). -/
@@ -401,10 +467,14 @@ structure MirBody where
   requiredConsts : List (BodyId × List MirTy) := []
   requiredLayouts : List MirTy := []
 
-/-- Entry in `Crate.bodies` associating a `BodyId` with its `MirBody`. -/
+/-- Entry in `Crate.bodies` associating a `BodyId` with its `MirBody`.
+When `isTransparentDep = true`, `body` is a cross-crate dependency body whose
+MIR implementation is transparently inlined, generating a
+`TCBItem.transparentDepBody` ledger entry in `CapturedFn.obligations`. -/
 structure BodyDecl where
   id : BodyId
   body : MirBody
+  isTransparentDep : Bool := false
 
 /-- First-order precondition clause (`/// anneal:requires <arg> != <ne>`):
 argument local `argLocal` (`usize`) is not equal to `ne`.
@@ -437,6 +507,34 @@ waived. -/
 inductive ObligationId where
   | fnBody (fnName : String)
 
+/-- Identifier of an obligation or coupling entry in a crate's verification
+ledger (`Crate.tcb`):
+
+- `rustcLowering fnName bodyId`: `rustc` correctly compiles the body at
+  `bodyId` (Tier S0 baseline lowering assumption).
+- `fnVerified fnName bodyId`: the body at `bodyId` satisfies its specifications
+  on all admitted layouts and execution environments. Never waivable in
+  `defaultTrustPolicy`.
+- `compileTimeGuard fnName bodyId`: Tier S1 compilation-stability coupling for a
+  function whose soundness relies on a dominating `const` assertion or static
+  `transmute` size check rejecting non-zero `#[repr(Rust)]` struct padding on a
+  future compiler (`NoCompileTimeError`).
+- `transparentDepBody fnName calleeId`: Tier S1 SemVer compilation-stability
+  coupling when `fnName` transparently verifies against cross-crate dependency
+  body `calleeId`.
+- `documentedIntent fnName bodyId rationale`: Tier S2 reliance on documented
+  pre-normative upstream intent.
+- `pinnedCompilerCoupled fnName bodyId reason`: Tier S3 soundness coupling
+  restricting verification of `fnName` to the pinned compiler's zero-padding
+  layout (`s.adtPad = fun _ => 0`). -/
+inductive TCBItem where
+  | rustcLowering (fnName : String) (bodyId : BodyId)
+  | fnVerified (fnName : String) (bodyId : BodyId)
+  | compileTimeGuard (fnName : String) (bodyId : BodyId)
+  | transparentDepBody (fnName : String) (calleeId : BodyId)
+  | documentedIntent (fnName : String) (bodyId : BodyId) (rationale : String)
+  | pinnedCompilerCoupled (fnName : String) (bodyId : BodyId) (reason : String)
+
 /-- Captured MIR function descriptor.
 
 - `bodyId`: crate-local `BodyId` of the primary (`--release`) lowered MIR body.
@@ -455,12 +553,14 @@ structure CapturedFn where
   specs : List PostSpec := []
 
 /-- Captured Rust crate. Every field is first-order syntax data;
-`Trusted/MirSemantics.lean` denotes `adts`, `bodies`, `functions`, and
-`tcbWaivedIds` to state `Trusted.CrateTheorem`. -/
+`Trusted/MirSemantics.lean` denotes `adts`, `bodies`, `functions`, `tcb`,
+`tcbWaivedIds`, and `target` to state `Trusted.CrateTheorem`. -/
 structure Crate where
   adts : List AdtDecl := []
   bodies : List BodyDecl := []
   functions : List CapturedFn
+  tcb : List TCBItem := []
   tcbWaivedIds : List ObligationId := []
+  target : TargetLayout := defaultTargetLayout
 
 end Trusted

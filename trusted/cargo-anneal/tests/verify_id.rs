@@ -327,6 +327,114 @@ fn verifies_nonzero_library_crate_with_safe_and_unsafe_apis() {
     assert!(report.output_text.contains("verified crate `sample`"));
     let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
     assert!(mir_lean.contains("Trusted.FieldAccess.priv"));
+    assert!(mir_lean.contains("Trusted.AdtRepr.transparent"));
+
+    // A default `#[repr(Rust)]` NonZeroUsize library crate that accesses its
+    // field only via projection and struct construction (never `transmute` or
+    // `size_of`) also verifies across all `adtPad` layout worlds without extra
+    // waivers.
+    let repr_rust_src =
+        nonzero("val: usize", MAKE_OK).replace("#[repr(transparent)]\n", "");
+    let repr_rust_dir = TempCrateDir::new("nonzero-repr-rust", &repr_rust_src);
+    verify_crate(&cfg_for(&repr_rust_dir.path)).unwrap();
+    let rust_mir = capture(&cfg_for(&repr_rust_dir.path)).unwrap();
+    assert!(rust_mir.contains("Trusted.AdtRepr.rust"));
+}
+
+#[test]
+fn verifies_repr_transparent_struct_transmute() {
+    let crate_dir = TempCrateDir::new(
+        "repr-transparent-transmute",
+        "#[repr(transparent)]\n\
+         pub struct TransWrap {\n    pub val: usize,\n}\n\n\
+         pub fn unwrap_transmute(x: TransWrap) -> usize {\n    \
+         unsafe { core::mem::transmute::<TransWrap, usize>(x) }\n}\n",
+    );
+    verify_crate(&cfg_for(&crate_dir.path)).unwrap();
+    let mir_lean = capture(&cfg_for(&crate_dir.path)).unwrap();
+    assert!(mir_lean.contains("Trusted.AdtRepr.transparent"));
+    assert!(
+        mir_lean.contains(
+            "(_root_.Trusted.CastKind.transmute (_root_.Trusted.MirTy.adt 0))"
+        )
+    );
+}
+
+#[test]
+fn rejects_unguarded_repr_rust_transmute_without_waiver_and_verifies_when_pinned()
+{
+    let unguarded = "pub struct RustWrap {\n    pub val: usize,\n}\n\n\
+         pub fn unguarded_transmute(x: RustWrap) -> usize {\n    \
+         unsafe { core::mem::transmute::<RustWrap, usize>(x) }\n}\n";
+    let rejected_dir = TempCrateDir::new("repr-rust-unguarded", unguarded);
+    let err = verify_crate(&cfg_for(&rejected_dir.path)).unwrap_err();
+    assert!(
+        err.contains("lean failed"),
+        "expected unguarded #[repr(Rust)] transmute to fail verification, got: {err}"
+    );
+
+    let pinned = "pub struct RustWrap {\n    pub val: usize,\n}\n\n\
+         /// anneal:pinned_compiler_coupled relies on rustc 1.98 zero padding\n\
+         pub fn unguarded_transmute(x: RustWrap) -> usize {\n    \
+         unsafe { core::mem::transmute::<RustWrap, usize>(x) }\n}\n";
+    let pinned_dir = TempCrateDir::new("repr-rust-pinned", pinned);
+    verify_crate(&cfg_for(&pinned_dir.path)).unwrap();
+    let mir_lean = capture(&cfg_for(&pinned_dir.path)).unwrap();
+    assert!(mir_lean.contains(
+        "_root_.Trusted.TCBItem.pinnedCompilerCoupled \"unguarded_transmute\" ⟨0⟩ \
+         \"relies on rustc 1.98 zero padding\""
+    ));
+}
+
+#[test]
+fn rejects_const_guarded_repr_rust_transmute_without_waiver_and_verifies_with_guard_waiver()
+ {
+    let guarded_no_waiver = "pub struct RustWrap {\n    pub val: usize,\n}\n\n\
+         pub fn guarded_transmute(x: RustWrap) -> usize {\n    \
+         let () = const { assert!(core::mem::size_of::<RustWrap>() == core::mem::size_of::<usize>()) };\n    \
+         unsafe { core::mem::transmute::<RustWrap, usize>(x) }\n}\n";
+    let rejected_dir =
+        TempCrateDir::new("repr-rust-guarded-no-waiver", guarded_no_waiver);
+    let err = verify_crate(&cfg_for(&rejected_dir.path)).unwrap_err();
+    assert!(
+        err.contains("lean failed"),
+        "expected const-guarded #[repr(Rust)] transmute without waiver to fail \
+         NoCompileTimeError, got: {err}"
+    );
+
+    let guarded_with_waiver = "pub struct RustWrap {\n    pub val: usize,\n}\n\n\
+         /// anneal:allow_compile_time_guard\n\
+         /// anneal:documented_intent layout guard rejects padded repr(Rust) builds\n\
+         pub fn guarded_transmute(x: RustWrap) -> usize {\n    \
+         let () = const { assert!(core::mem::size_of::<RustWrap>() == core::mem::size_of::<usize>()) };\n    \
+         unsafe { core::mem::transmute::<RustWrap, usize>(x) }\n}\n";
+    let ok_dir =
+        TempCrateDir::new("repr-rust-guarded-waived", guarded_with_waiver);
+    verify_crate(&cfg_for(&ok_dir.path)).unwrap();
+    let mir_lean = capture(&cfg_for(&ok_dir.path)).unwrap();
+    assert!(mir_lean.contains("_root_.Trusted.Stmt.evalConst"));
+    assert!(mir_lean.contains(
+        "_root_.Trusted.TCBItem.compileTimeGuard \"guarded_transmute\" ⟨1⟩"
+    ));
+    assert!(mir_lean.contains(
+        "_root_.Trusted.TCBItem.documentedIntent \"guarded_transmute\" ⟨1⟩ \
+         \"layout guard rejects padded repr(Rust) builds\""
+    ));
+
+    let conflicting_waivers = "pub struct RustWrap {\n    pub val: usize,\n}\n\n\
+         /// anneal:allow_compile_time_guard\n\
+         /// anneal:pinned_compiler_coupled unguarded repr(Rust)\n\
+         pub fn guarded_transmute(x: RustWrap) -> usize {\n    \
+         unsafe { core::mem::transmute::<RustWrap, usize>(x) }\n}\n";
+    let conflict_dir =
+        TempCrateDir::new("repr-rust-conflict-waivers", conflicting_waivers);
+    let conflict_err = verify_crate(&cfg_for(&conflict_dir.path)).unwrap_err();
+    assert!(
+        conflict_err.contains(
+            "cannot combine `allow_compile_time_guard` and `pinned_compiler_coupled`"
+        ),
+        "expected conflicting layout waivers to be rejected, got: {conflict_err}"
+    );
 }
 
 #[test]

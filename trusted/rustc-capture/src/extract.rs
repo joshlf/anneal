@@ -110,6 +110,8 @@ pub fn ty<'tcx>(t: Ty<'tcx>) -> ir::Ty {
 enum Known {
     /// `core::mem::size_of::<T>()` (`library/core/src/mem/mod.rs#L373`).
     SizeOf,
+    /// `core::mem::align_of::<T>()` (`library/core/src/mem/mod.rs#L418`).
+    AlignOf,
     /// `core::mem::transmute_copy::<Src, Dst>(&Src)`
     /// (`library/core/src/mem/mod.rs#L1073`).
     TransmuteCopy,
@@ -126,6 +128,7 @@ enum Known {
 
 const KNOWN_CORE_FNS: &[(&[&str], Known)] = &[
     (&["mem", "size_of"], Known::SizeOf),
+    (&["mem", "align_of"], Known::AlignOf),
     (&["mem", "transmute_copy"], Known::TransmuteCopy),
     (&["hint", "unreachable_unchecked"], Known::UnreachableUnchecked),
     (&["panicking", "panic"], Known::Panic),
@@ -220,12 +223,17 @@ pub fn body<'tcx>(
     }
 
     let typing_env = TypingEnv::post_analysis(tcx, def);
-    let mut required_consts = Vec::new();
+    let mut expected_consts = Vec::new();
     for c in required {
-        required_consts.push(required_const(tcx, typing_env, &c.const_)?);
+        expected_consts.push(required_const(tcx, typing_env, &c.const_)?);
     }
 
-    let cx = BodyCx { tcx, body, required };
+    let cx = BodyCx {
+        tcx,
+        typing_env,
+        body,
+        required,
+    };
     let mut blocks = Vec::new();
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         // Cleanup (unwind) blocks only arise from drop glue or explicit
@@ -245,13 +253,33 @@ pub fn body<'tcx>(
         blocks.push(ir::Block { stmts, terminator });
     }
 
+    for (req_def, req_args) in &expected_consts {
+        let emitted = blocks.iter().any(|blk| {
+            blk.stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    ir::Stmt::EvalConst {
+                        const_def,
+                        type_args,
+                        ..
+                    } if const_def == req_def && type_args == req_args
+                )
+            })
+        });
+        if !emitted {
+            return reject(
+                "required constant in `Body::required_consts` was not emitted \
+                 as an `EvalConst` statement",
+            );
+        }
+    }
+
     Ok(ir::Body {
         arg_tys,
         ret_ty,
         local_count: u32::try_from(locals.len())
             .map_err(|_| "too many locals")?,
         blocks,
-        required_consts,
         required_layouts,
     })
 }
@@ -363,6 +391,7 @@ fn required_const<'tcx>(
 /// Per-body context for translating statements and terminators.
 struct BodyCx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     body: &'a mir::Body<'tcx>,
     required: &'a [mir::ConstOperand<'tcx>],
 }
@@ -387,7 +416,7 @@ fn raw_ptr_kind(k: RawPtrKind) -> ir::RawPtrKind {
     }
 }
 
-fn cast_kind(k: CastKind) -> ir::CastKind {
+fn cast_kind(k: CastKind, src_ty: ir::Ty) -> ir::CastKind {
     match k {
         CastKind::PointerExposeProvenance => {
             ir::CastKind::PointerExposeProvenance
@@ -402,7 +431,7 @@ fn cast_kind(k: CastKind) -> ir::CastKind {
         CastKind::IntToFloat => ir::CastKind::IntToFloat,
         CastKind::PtrToPtr => ir::CastKind::PtrToPtr,
         CastKind::FnPtrToPtr => ir::CastKind::FnPtrToPtr,
-        CastKind::Transmute => ir::CastKind::Transmute,
+        CastKind::Transmute => ir::CastKind::Transmute(src_ty),
         CastKind::Subtype => ir::CastKind::Subtype,
     }
 }
@@ -497,10 +526,10 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
     /// - `Val(Scalar(Int(i)), ty)` with `ty` `usize` or `bool`, and
     ///   `Val(ZeroSized, ())`: an already-evaluated literal, which is its own
     ///   value.
-    /// - `Unevaluated(uv, ())` that is listed in the body's `required_consts`:
-    ///   the value of a successfully evaluated `()` constant is `()`, and the
-    ///   success obligation is carried by `MirBody.requiredConsts`, which the
-    ///   model checks before the body runs.
+    /// - `Unevaluated(uv, ())` assigned as a statement (`_d = const ...`):
+    ///   translated in `stmt` to `ir::Stmt::EvalConst`, which evaluates the
+    ///   constant body in order at its statement position; an unevaluated `()`
+    ///   constant appearing in any other operand position is rejected here.
     /// - Any other constant translates to `ir::Val::Uninit`, which
     ///   `Trusted.evalOperand` rejects fail-closed (`isFullyInit = false`) if
     ///   evaluated.
@@ -523,13 +552,10 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 Ok(ir::Val::Unit)
             }
             mir::Const::Unevaluated(_, t) if ty(t) == ir::Ty::Unit => {
-                if self.required.iter().any(|r| r.const_ == c.const_) {
-                    Ok(ir::Val::Unit)
-                } else {
-                    reject(format!(
-                        "constant `{c:?}` is not listed in required_consts"
-                    ))
-                }
+                reject(format!(
+                    "unevaluated `()` constant `{c:?}` is only supported as a \
+                     statement assignment"
+                ))
             }
             _ => Ok(ir::Val::Uninit),
         }
@@ -574,11 +600,14 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
             mir::Rvalue::RawPtr(k, p) => {
                 Ok(ir::Rvalue::RawPtr(raw_ptr_kind(*k), self.place(p)))
             }
-            mir::Rvalue::Cast(k, op, t) => Ok(ir::Rvalue::Cast(
-                cast_kind(*k),
-                self.operand(op)?,
-                ty(*t),
-            )),
+            mir::Rvalue::Cast(k, op, t) => {
+                let src_ty = ty(op.ty(&self.body.local_decls, self.tcx));
+                Ok(ir::Rvalue::Cast(
+                    cast_kind(*k, src_ty),
+                    self.operand(op)?,
+                    ty(*t),
+                ))
+            }
             mir::Rvalue::BinaryOp(op, ops) => Ok(ir::Rvalue::BinaryOp(
                 bin_op(*op),
                 self.operand(&ops.0)?,
@@ -595,21 +624,32 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                     if did.is_local()
                         && variant.as_u32() == 0
                         && args.is_empty()
-                        && self.tcx.adt_def(did).is_struct()
-                        && ops.len() == 1 =>
+                        && self.tcx.adt_def(did).is_struct() =>
                 {
-                    let op = ops.iter().next().expect("length checked above");
-                    Ok(ir::Rvalue::Aggregate(
-                        did.index.as_u32(),
-                        self.operand(op)?,
-                    ))
+                    if ops.len() == 1 {
+                        let op =
+                            ops.iter().next().expect("length checked above");
+                        Ok(ir::Rvalue::Aggregate(
+                            did.index.as_u32(),
+                            self.operand(op)?,
+                        ))
+                    } else {
+                        let fields = ops
+                            .iter()
+                            .map(|o| self.operand(o))
+                            .collect::<Res<Vec<_>>>()?;
+                        Ok(ir::Rvalue::AggregateFields(
+                            fields,
+                            Some(did.index.as_u32()),
+                        ))
+                    }
                 }
                 _ => {
                     let fields = ops
                         .iter()
                         .map(|o| self.operand(o))
                         .collect::<Res<Vec<_>>>()?;
-                    Ok(ir::Rvalue::AggregateFields(fields))
+                    Ok(ir::Rvalue::AggregateFields(fields, None))
                 }
             },
             mir::Rvalue::CopyForDeref(p) => {
@@ -629,6 +669,26 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
         match s {
             StatementKind::Assign(b) => {
                 let (place, rv) = &**b;
+                if let mir::Rvalue::Use(mir::Operand::Constant(c), _) = rv
+                    && let mir::Const::Unevaluated(_, t) = c.const_
+                    && ty(t) == ir::Ty::Unit
+                {
+                    if !self.required.iter().any(|r| r.const_ == c.const_) {
+                        return reject(format!(
+                            "constant `{c:?}` is not listed in required_consts"
+                        ));
+                    }
+                    let (const_def, type_args) = required_const(
+                        self.tcx,
+                        self.typing_env,
+                        &c.const_,
+                    )?;
+                    return Ok(ir::Stmt::EvalConst {
+                        dst: self.place(place),
+                        const_def,
+                        type_args,
+                    });
+                }
                 Ok(ir::Stmt::Assign(self.place(place), self.rvalue(rv)?))
             }
             StatementKind::FakeRead(b) => {
@@ -700,13 +760,32 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 expected,
                 target,
                 unwind,
-                ..
-            } => Ok(ir::Terminator::Assert {
-                cond: self.operand(cond)?,
-                expected: *expected,
-                target: target.as_u32(),
-                has_cleanup: !matches!(unwind, UnwindAction::Continue),
-            }),
+                msg,
+            } => {
+                let on_fail = if matches!(unwind, UnwindAction::Unreachable)
+                    || matches!(
+                        **msg,
+                        mir::AssertKind::MisalignedPointerDereference { .. }
+                            | mir::AssertKind::NullPointerDereference
+                            | mir::AssertKind::InvalidEnumConstruction(_)
+                    ) {
+                    ir::AssertFailKind::Ub
+                } else if matches!(
+                    unwind,
+                    UnwindAction::Continue | UnwindAction::Cleanup(_)
+                ) {
+                    ir::AssertFailKind::Unwind
+                } else {
+                    ir::AssertFailKind::Abort
+                };
+                Ok(ir::Terminator::Assert {
+                    cond: self.operand(cond)?,
+                    expected: *expected,
+                    target: target.as_u32(),
+                    on_fail,
+                    has_cleanup: !matches!(unwind, UnwindAction::Continue),
+                })
+            }
             TerminatorKind::SwitchInt { discr, targets } => {
                 let values: Vec<_> = targets.iter().collect();
                 if discr.ty(&self.body.local_decls, self.tcx).is_bool()
@@ -820,9 +899,16 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 has_cleanup,
             ) {
                 (Known::SizeOf, [t], [], Some(target), false) => {
-                    ir::Terminator::SizeOf {
+                    ir::Terminator::CallLayout {
                         dst,
-                        ty: t.clone(),
+                        query: ir::LayoutQuery::SizeOf(t.clone()),
+                        target,
+                    }
+                }
+                (Known::AlignOf, [t], [], Some(target), false) => {
+                    ir::Terminator::CallLayout {
+                        dst,
+                        query: ir::LayoutQuery::AlignOf(t.clone()),
                         target,
                     }
                 }

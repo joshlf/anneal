@@ -30,10 +30,14 @@ Instantiates `Trusted.Language` for small-step operational transition systems
 
 namespace Trusted
 
-/-- Distinguishes normal return from panic/unwind completion. -/
+/-- Distinguishes normal return from panic/unwind completion, defined process
+abort, and compile-time rejection (`Stmt.evalConst` or `CastKind.transmute`
+size mismatch). -/
 inductive TerminationKind (Val : Type) where
   | normal (ret : Val)
   | unwind
+  | abort
+  | compileTimeError
 
 /-- Single-step transition outcome in a small-step operational machine. -/
 inductive StepResult (State : Type) (Obs : Type := Empty) (Val : Type) where
@@ -46,6 +50,25 @@ inductive StepResult (State : Type) (Obs : Type := Empty) (Val : Type) where
 def StepResult.silent {State Obs Val : Type}
     (next : State) : StepResult State Obs Val :=
   .choice (· = next)
+
+/-- First-order deterministic small-step outcome without observation events.
+
+Unlike `StepResult.silent` (which wraps `next` inside `StepResult.choice
+(· = next)`), `RawStep.silent` carries `next : State` as first-order data so
+bounded inner evaluators (such as `evalConstLoop` in `Trusted/MirSemantics.lean`)
+can pattern-match on successor states directly before lifting to `StepResult`
+via `RawStep.toStepResult`. -/
+inductive RawStep (State Val : Type) where
+  | silent (next : State)
+  | terminated (term : TerminationKind Val)
+  | failed
+
+/-- Lift a deterministic `RawStep` into `StepResult`. -/
+def RawStep.toStepResult {State Obs Val : Type} :
+    RawStep State Val → StepResult State Obs Val
+  | .silent s => .silent s
+  | .terminated t => .terminated t
+  | .failed => .failed
 
 /-- Outcome recorded at the end of an `n`-step execution prefix. -/
 inductive PrefixOutcome (State Val : Type) where

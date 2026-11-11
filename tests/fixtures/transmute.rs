@@ -40,7 +40,7 @@ pub fn inline_const_transmute(x: usize) -> usize {
 }
 
 // === case: public_generic_assoc_const_transmute ===
-//@ fail(capture): "reaches a `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
+//@ fail(capture): "reaches a `transmute` or `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
 
 pub trait SizeEq<Src, Dst> {
     const ASSERT: ();
@@ -57,7 +57,7 @@ pub fn transmute_checked<Src: Copy, Dst: Copy>(x: Src) -> Dst {
 }
 
 // === case: public_generic_inline_const_transmute ===
-//@ fail(capture): "reaches a `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
+//@ fail(capture): "reaches a `transmute` or `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
 
 pub fn inline_const_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {
     let () = const {
@@ -67,7 +67,7 @@ pub fn inline_const_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {
 }
 
 // === case: public_generic_unchecked_transmute ===
-//@ fail(capture): "reaches a `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
+//@ fail(capture): "reaches a `transmute` or `transmute_copy` in a required constant or with an unsupported or type-parameter source/destination type"
 
 pub fn transmute_unchecked<Src: Copy, Dst: Copy>(x: Src) -> Dst {
     unsafe { core::mem::transmute_copy(&x) }

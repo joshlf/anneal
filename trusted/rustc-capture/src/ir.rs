@@ -27,7 +27,8 @@ pub struct Crate {
     pub constants: Vec<Constant>,
     /// Free functions (both `pub` roots and private callees).
     pub functions: Vec<Function>,
-    /// `#[repr(transparent)]` single-field structs.
+    /// Captured struct declarations (`#[repr(Rust)]`, `#[repr(C)]`, or
+    /// `#[repr(transparent)]`).
     pub adts: Vec<Adt>,
 }
 
@@ -53,6 +54,21 @@ pub struct Function {
     pub kind: FnKind,
 }
 
+/// Layout-quantification waiver tier (`S0`, `S1`, or `S3`) for an exported
+/// function.
+///
+/// The three tiers are mutually exclusive: a function either verifies
+/// universally (`Universal`), relies on a compile-time `const` guard to reject
+/// non-zero `#[repr(Rust)]` padding (`CompileTimeGuard`), or restricts
+/// verification to the pinned compiler's zero-extra-padding layout
+/// (`PinnedCompilerCoupled`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutWaiver {
+    Universal,
+    CompileTimeGuard,
+    PinnedCompilerCoupled(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FnKind {
     /// Not exported from the crate. Appears in `Mir.lean` only as a `call1`
@@ -66,15 +82,32 @@ pub enum FnKind {
         requires: Option<RequiresSpec>,
         specs: Vec<Spec>,
         trusted_reason: Option<String>,
+        layout_waiver: LayoutWaiver,
+        documented_intents: Vec<String>,
     },
 }
 
-/// A `#[repr(transparent)]` single-field struct (`Trusted.AdtDecl`).
+/// `Trusted.AdtRepr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdtRepr {
+    Rust,
+    Transparent,
+    C,
+}
+
+/// `Trusted.FieldDecl`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldDecl {
+    pub ty: Ty,
+    pub access: FieldAccess,
+}
+
+/// A captured struct (`Trusted.AdtDecl`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Adt {
     pub def: DefIdx,
-    pub field_ty: Ty,
-    pub access: FieldAccess,
+    pub repr: AdtRepr,
+    pub fields: Vec<FieldDecl>,
     /// From `/// anneal:invariant <field> != <nat>`.
     pub invariant: Option<InvariantSpec>,
 }
@@ -117,8 +150,6 @@ pub struct Body {
     pub ret_ty: Ty,
     pub local_count: u32,
     pub blocks: Vec<Block>,
-    /// `(const_def, type_args)` pairs for `MirBody.requiredConsts`.
-    pub required_consts: Vec<(DefIdx, Vec<Ty>)>,
     /// Non-trivial local variable types for `MirBody.requiredLayouts`.
     pub required_layouts: Vec<Ty>,
 }
@@ -202,6 +233,48 @@ impl Ty {
             | Self::Unmodeled => {}
         }
     }
+
+    /// Replaces each `Param(i)` in `self` with `args[i]`; `None` is the
+    /// identity substitution. An out-of-range index stays a `Param(i)`.
+    pub fn subst(&self, args: Option<&[Self]>) -> Self {
+        match (self, args) {
+            (Self::Param(i), Some(a)) => {
+                a.get(*i as usize).cloned().unwrap_or_else(|| self.clone())
+            }
+            (Self::Ref(inner), _) => Self::Ref(Box::new(inner.subst(args))),
+            (Self::RefMut(inner), _) => {
+                Self::RefMut(Box::new(inner.subst(args)))
+            }
+            (Self::RawPtr(inner, m), _) => {
+                Self::RawPtr(Box::new(inner.subst(args)), *m)
+            }
+            (Self::Array(inner, len), _) => {
+                Self::Array(Box::new(inner.subst(args)), *len)
+            }
+            (Self::Slice(inner), _) => Self::Slice(Box::new(inner.subst(args))),
+            (Self::Tuple(elems), _) => {
+                Self::Tuple(elems.iter().map(|e| e.subst(args)).collect())
+            }
+            (
+                Self::Usize
+                | Self::Isize
+                | Self::Uint(_)
+                | Self::Int(_)
+                | Self::Float(_)
+                | Self::Bool
+                | Self::Char
+                | Self::Str
+                | Self::Unit
+                | Self::Never
+                | Self::Adt(_)
+                | Self::Param(_)
+                | Self::FnDef(_)
+                | Self::FnPtr
+                | Self::Unmodeled,
+                _,
+            ) => self.clone(),
+        }
+    }
 }
 
 /// `Trusted.MirVal` (the literal fragment that can appear in `Operand.constVal`,
@@ -276,7 +349,7 @@ pub enum RawPtrKind {
 }
 
 /// `Trusted.CastKind`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CastKind {
     PointerExposeProvenance,
     PointerWithExposedProvenance,
@@ -287,7 +360,7 @@ pub enum CastKind {
     IntToFloat,
     PtrToPtr,
     FnPtrToPtr,
-    Transmute,
+    Transmute(Ty),
     Subtype,
 }
 
@@ -345,7 +418,7 @@ pub enum Rvalue {
     UnaryOp(UnOp, Operand),
     Discriminant(Place),
     Aggregate(DefIdx, Operand),
-    AggregateFields(Vec<Operand>),
+    AggregateFields(Vec<Operand>, Option<DefIdx>),
     CopyForDeref(Place),
     WrapUnsafeBinder(Operand, Ty),
     Reborrow(Ty, bool, Place),
@@ -366,6 +439,11 @@ pub enum NonDivergingIntrinsic {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     Assign(Place, Rvalue),
+    EvalConst {
+        dst: Place,
+        const_def: DefIdx,
+        type_args: Vec<Ty>,
+    },
     FakeRead(Place),
     SetDiscriminant(Place, u32),
     StorageLive(u32),
@@ -377,6 +455,21 @@ pub enum Stmt {
     ConstEvalCounter,
     Nop,
     BackwardIncompatibleDropHint(Place),
+}
+
+/// `Trusted.AssertFailKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertFailKind {
+    Unwind,
+    Abort,
+    Ub,
+}
+
+/// `Trusted.LayoutQuery` (`core::mem::size_of` and `core::mem::align_of`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutQuery {
+    SizeOf(Ty),
+    AlignOf(Ty),
 }
 
 /// `Trusted.Terminator`.
@@ -398,6 +491,7 @@ pub enum Terminator {
         cond: Operand,
         expected: bool,
         target: u32,
+        on_fail: AssertFailKind,
         has_cleanup: bool,
     },
     SwitchInt {
@@ -410,9 +504,9 @@ pub enum Terminator {
         targets: Vec<(u128, u32)>,
         otherwise: u32,
     },
-    SizeOf {
+    CallLayout {
         dst: Place,
-        ty: Ty,
+        query: LayoutQuery,
         target: u32,
     },
     TransmuteCopy {

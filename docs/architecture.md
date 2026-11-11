@@ -176,10 +176,13 @@ corresponding constructor in `Trusted/MirAst.lean`:
   `Rvalue::Use`, `Rvalue::Ref`, `Rvalue::RawPtr`, `Rvalue::BinaryOp`,
   `Rvalue::Aggregate`, and `Rvalue::Cast(Transmute)` map directly to `Rvalue`
   constructors.
-- **Statements and terminators (`Stmt`, `Terminator`):** `Assign`,
-  `StorageLive`, `StorageDead`, `PlaceMention`, and `Nop` map 1-to-1 to `Stmt`;
-  `Return`, `Goto`, `SwitchInt`, `Call`, and `Assert` map 1-to-1 to
-  `Terminator`.
+- **Statements and terminators (`Stmt`, `Terminator`):** `Assign`, `EvalConst`
+  (unevaluated `()` constant evaluation from `Operand::Constant` and
+  `Body::required_consts`), `StorageLive`, `StorageDead`, `PlaceMention`, and
+  `Nop` map 1-to-1 to `Stmt`; `Return`, `Goto`, `SwitchInt`, `Call` (including
+  `CallLayout` with `LayoutQuery` for `SizeOf` and `AlignOf`, and
+  `TransmuteCopy`), and `Assert` (with `AssertFailKind` distinguishing
+  `.unwind`, `.abort`, and `.ub`) map 1-to-1 to `Terminator`.
 
 Because Stage 1 performs no control-flow restructuring or expression
 simplification, a human reviewer can audit each arm in
@@ -394,42 +397,99 @@ over `List PlaceElem` (`.deref` and `.field idx`):
   `_1.0` out of a non-`Copy` struct and subsequently reads or moves `_1` or
   `_1.0` again before reinitializing it, `MirVal.isFullyInit` detects the
   `MirVal.uninit` leaf and steps to `.failed`.
-- **Distinguishing uninitialized fields from padding bytes:** `MirVal.adt`
-  stores typed field values rather than raw padding bytes, so constructing an
-  initialized struct whose layout contains inter-field padding produces a fully
-  initialized `MirVal.adt` tree that can be borrowed or copied normally. By
-  contrast, opaque generic parameter values (`MirVal.bytes`, which may contain
-  padding or uninitialized bytes at runtime) are valid to copy or move at their
-  parameter type, whereas `extractTransmuteBits` rejects reinterpreting
-  `MirVal.bytes` or `MirVal.uninit` as a concrete integer via `transmute_copy`.
+- **Distinguishing uninitialized fields from non-deterministic padding bytes
+  (`TargetLayout`, `AdtRepr`, and `MirState.adtPad`):** `MirVal.adt` stores
+  typed field values (including multi-field records via `MirVal.fieldCons`)
+  rather than raw padding bytes, so constructing an initialized struct whose
+  layout contains inter-field or trailing padding produces a fully initialized
+  `MirVal.adt` tree that can be borrowed or copied normally. Meanwhile,
+  `evalTyByteSize` and `evalTyAlign` model target-parameterized
+  (`TargetLayout`) and representation-specific layouts via `AdtDecl.repr`
+  (`AdtRepr.transparent`, `AdtRepr.c`, and `AdtRepr.rust`) and an
+  execution-state padding environment `MirState.adtPad : AdtId → Nat`:
+  - `#[repr(transparent)]` structs have exact single-non-ZST-field size and
+    alignment with zero added padding;
+  - `#[repr(C)]` structs compute deterministic C ABI field offsets and trailing
+    alignment rounding; and
+  - `#[repr(Rust)]` structs add `s.adtPad adtId` unconstrained padding bytes,
+    universally quantified in `initMirState`.
+  If code attempts to reinterpret a `#[repr(Rust)]` struct via two-stage
+  `evalTransmuteVal` (`transmute` or `transmute_copy`) without a representation
+  guarantee, `s.adtPad adtId > 0` makes the struct contain uninitialized
+  padding bytes that `extractTransmuteBits` rejects as `.failed` (or mismatches
+  the destination byte size). Likewise, opaque generic parameter values
+  (`MirVal.bytes`, which may contain padding or uninitialized bytes at runtime)
+  are valid to copy or move at their parameter type, whereas
+  `extractTransmuteBits` rejects reinterpreting `MirVal.bytes` or
+  `MirVal.uninit` as a concrete integer.
 
-#### UB faults vs. panics (`Terminator.unreachable` vs. `assert` and `panic`)
+#### UB faults vs. runtime panics vs. compile-time errors
 
-Rust distinguishes undefined behavior (such as reaching
-`core::hint::unreachable_unchecked` or dereferencing a dangling reference) from
-clean runtime panics (`TerminatorKind::Assert` and `core::panicking::panic*`),
-and `Trusted/MirSemantics.lean` models the two distinctly:
+Rust distinguishes undefined behavior, runtime panics/aborts, and compile-time
+`const` evaluation failures. `Trusted/MirSemantics.lean` models each outcome
+distinctly via `StepResult` and `TerminationKind`:
 
 - **Undefined behavior (`.failed`):** Reaching `Terminator.unreachable`,
   reading an uninitialized or moved-out place (`MirVal.uninit`), dereferencing
-  a dead local generation, or violating `transmute_copy` validity steps to
-  `.failed`.
-- **Clean panic unwinding (`.terminated .unwind`):** `rustc` lowers checked
-  arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, and slice
-  bounds checks to `TerminatorKind::Assert` (`Terminator.assert`), and lowers
-  explicit `panic!` or `assert!` failures to `core::panicking::panic*`
-  (`Terminator.panic`). When `Terminator.assert` evaluates a boolean operand
-  that does not match `expected` (or when `Terminator.panic` executes),
-  `evalMirTerminator` steps to `.terminated [] (.unwind unwindState)` (only a
-  non-boolean or uninitialized `cond` operand or an out-of-bounds target block
-  is `.failed`). Under Anneal's baseline safety semantics (`SafetyPost`), clean
-  unwinding is permitted provided all caller-reachable `&mut` referents in
-  `unwindState` preserve `AdtInv` for all $T \notin f.\text{brokenInvariants}$
-  and `EscapingSubfieldBorrowsSafe`, whereas `#[anneal::no_panic]` and
-  `#[anneal::spec]` functions (`ContractPost`), `const` and `static`
-  initializers, contract clause evaluation (`EvalClausePure`), and
-  `RequiredConstsAdmitted` require finite-fuel normal return
-  (`.terminated [] (.normal val exitState)`).
+  a dead local generation, failing an alignment or pointer UB assertion
+  (`Terminator.assert` with `AssertFailKind.ub`, checked across both
+  `s.ubChecks = true` and `s.ubChecks = false`), or violating two-stage
+  `evalTransmuteVal` (`transmute` / `transmute_copy`) size or bit-validity
+  steps to `.failed`.
+- **Clean runtime unwinding or abort (`.terminated .unwind` /
+  `.terminated .abort`):** `rustc` lowers checked arithmetic overflow (`+`,
+  `-`, `*`), division or remainder by zero, and slice bounds checks to
+  `TerminatorKind::Assert` (`Terminator.assert` with `AssertFailKind.unwind` or
+  `AssertFailKind.abort`), and lowers explicit `panic!` or `assert!` failures to
+  `core::panicking::panic*` (`Terminator.panic`). When `Terminator.assert`
+  evaluates a boolean operand that does not match `expected` (or when
+  `Terminator.panic` executes), `evalMirTerminator` steps to
+  `.terminated [] (.unwind unwindState)` or `.terminated [] .abort` (only a
+  non-boolean or uninitialized `cond` operand, a cleanup unwind edge, or an
+  out-of-bounds target block is `.failed`). Under Anneal's baseline safety
+  semantics (`SafetyPost`), clean unwinding is permitted provided all
+  caller-reachable `&mut` referents in `unwindState` preserve `AdtInv` for all
+  $T \notin f.\text{brokenInvariants}$ and `EscapingSubfieldBorrowsSafe`,
+  whereas `#[anneal::no_panic]` and `#[anneal::spec]` functions
+  (`ContractPost`), `const` and `static` initializers, contract clause
+  evaluation (`EvalClausePure`), and `RequiredConstsAdmitted` require
+  finite-fuel normal return (`.terminated [] (.normal val exitState)`).
+- **Compile-time constant rejection (`.terminated .compileTimeError`):**
+  Inline `const { ... }` blocks and associated-constant guards lower to
+  `Stmt.evalConst dst constId args`. When `evalMirStmt` executes
+  `Stmt.evalConst`, it evaluates the referenced constant body:
+  - If the constant body returns normally, execution continues to the next
+    statement.
+  - If the constant body terminates cleanly with `.unwind`, `.abort`, or
+    `.compileTimeError`, the enclosing function steps to
+    `.terminated .compileTimeError`—mirroring `rustc`'s post-monomorphization
+    rejection of that instantiation before codegen.
+  - If the constant body triggers undefined behavior (`.failed`) or exhausts
+    fuel without terminating, the enclosing function steps to `.failed`, so a
+    constant evaluation can never mask compile-time UB.
+- **Four-tier forward-compatibility and soundness taxonomy (`S0`–`S3`):**
+  - **`S0` (Unconditionally forward-compatible):** Functions proved across all
+    valid monomorphizations (`ValidTySizes`) and all `#[repr(Rust)]` padding
+    assignments (`s.adtPad : AdtId → Nat`), such as code using
+    `#[repr(transparent)]` or `#[repr(C)]`, emit only the standard
+    `TCBItem.rustcLowering` and `TCBItem.fnVerified` items.
+  - **`S1` (`TCBItem.compileTimeGuard` /
+    `/// anneal:allow_compile_time_guard`):**
+    Functions that guard a `#[repr(Rust)]` layout assumption with a
+    compile-time `const { assert!(size_of::<S>() == ...) }` check never execute
+    UB at runtime under any layout (they step to `.compileTimeError` when
+    `s.adtPad > 0`), and record `TCBItem.compileTimeGuard` to disclose that a
+    future compiler layout change could cause compilation to fail cleanly.
+  - **`S2` (`TCBItem.documentedIntent` /
+    `/// anneal:documented_intent = "..."`):**
+    Functions that rely on a documented library or toolchain guarantee not yet
+    modeled in Lean record an auditable `TCBItem.documentedIntent` citation.
+  - **`S3` (`TCBItem.pinnedCompilerCoupled` /
+    `/// anneal:pinned_compiler_coupled = "..."`):** Functions with an
+    unguarded assumption about the pinned compiler's accidental `#[repr(Rust)]`
+    layout cannot be proved under unconstrained `s.adtPad`; they verify only
+    under the explicit waiver `s.adtPad = 0` and record
+    `TCBItem.pinnedCompilerCoupled` in `c.tcb`.
 
 ### Stage 3: In-place lowering and compositional verification (`theory/Anneal/`)
 

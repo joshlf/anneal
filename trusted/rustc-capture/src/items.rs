@@ -53,7 +53,7 @@ use rustc_abi::ExternAbi;
 use rustc_hir::def::DefKind;
 use rustc_hir::{self as hir, HirId, LangItem};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::{self, GenericParamDefKind, TyCtxt, TypingEnv};
+use rustc_middle::ty::{self, GenericParamDefKind, TyCtxt};
 use rustc_span::def_id::{CRATE_DEF_ID, LocalDefId};
 
 use crate::extract::{self, Res};
@@ -510,6 +510,8 @@ fn function(
     let mut specs = Vec::new();
     let mut requires = None;
     let mut trusted_reason = None;
+    let mut layout_waiver = ir::LayoutWaiver::Universal;
+    let mut documented_intents = Vec::new();
     for d in directives.unwrap_or_default() {
         match d {
             Directive::EnsuresRetEq(x) => match arg_local(&x) {
@@ -558,6 +560,58 @@ fn function(
                     trusted_reason = Some(reason);
                 }
             }
+            Directive::AllowCompileTimeGuard => match layout_waiver {
+                ir::LayoutWaiver::Universal => {
+                    layout_waiver = ir::LayoutWaiver::CompileTimeGuard;
+                }
+                ir::LayoutWaiver::CompileTimeGuard => {
+                    errs.push(
+                        tcx,
+                        def,
+                        "duplicate `allow_compile_time_guard` directive",
+                    );
+                }
+                ir::LayoutWaiver::PinnedCompilerCoupled(_) => {
+                    errs.push(
+                        tcx,
+                        def,
+                        "cannot combine `allow_compile_time_guard` and \
+                         `pinned_compiler_coupled` on the same function",
+                    );
+                }
+            },
+            Directive::DocumentedIntent(rationale) => {
+                if documented_intents.contains(&rationale) {
+                    errs.push(
+                        tcx,
+                        def,
+                        "duplicate `documented_intent` directive",
+                    );
+                } else {
+                    documented_intents.push(rationale);
+                }
+            }
+            Directive::PinnedCompilerCoupled(reason) => match layout_waiver {
+                ir::LayoutWaiver::Universal => {
+                    layout_waiver =
+                        ir::LayoutWaiver::PinnedCompilerCoupled(reason);
+                }
+                ir::LayoutWaiver::PinnedCompilerCoupled(_) => {
+                    errs.push(
+                        tcx,
+                        def,
+                        "at most one `pinned_compiler_coupled` directive is supported",
+                    );
+                }
+                ir::LayoutWaiver::CompileTimeGuard => {
+                    errs.push(
+                        tcx,
+                        def,
+                        "cannot combine `allow_compile_time_guard` and \
+                         `pinned_compiler_coupled` on the same function",
+                    );
+                }
+            },
             Directive::Invariant { .. } => {
                 errs.push(tcx, def, "`invariant` is only accepted on structs")
             }
@@ -567,6 +621,8 @@ fn function(
         if !specs.is_empty()
             || requires.is_some()
             || trusted_reason.is_some()
+            || layout_waiver != ir::LayoutWaiver::Universal
+            || !documented_intents.is_empty()
         {
             errs.push(
                 tcx,
@@ -580,6 +636,8 @@ fn function(
             requires,
             specs,
             trusted_reason,
+            layout_waiver,
+            documented_intents,
         }
     };
     (errs.0.len() == before).then(|| ir::Function {
@@ -616,22 +674,19 @@ fn check_signature(
     }
 }
 
-/// Classifies a struct.
+/// Classifies a struct (`Trusted.AdtDecl` in `Trusted/MirAst.lean`).
 ///
-/// `Trusted.AdtDecl` (`Trusted/MirAst.lean`) describes a struct with at most
-/// one field and no type arguments; this capture accepts exactly one field
-/// because multi-field layouts are not modeled in `Trusted/MirSemantics.lean`
-/// and fieldless structs have no aggregate form in `Rvalue.aggregate`. Field
-/// visibility and safety come from `FieldDef::vis` and `FieldDef::safety`
+/// Field visibility and safety come from `FieldDef::vis` and `FieldDef::safety`
 /// (`compiler/rustc_middle/src/ty/mod.rs#L1407-L1413`). `#[non_exhaustive]`
 /// is not recorded: treating such a struct as constructible by safe code
 /// only strengthens what `AdmissibleAdtInv` demands of its invariant.
 ///
-/// The model assumes that a single-field struct has its field's size. Rust
-/// does not guarantee that for the default representation (only
-/// `#[repr(transparent)]` does), so the capture asks `rustc` for the struct's
-/// actual layout (`layout_of`) and rejects the struct if the sizes differ. It
-/// also rejects `#[repr(align(N))]` and `#[repr(packed)]` outright.
+/// Layout representation (`AdtRepr::{Rust,Transparent,C}`) is captured from
+/// `adt.repr()` (`compiler/rustc_abi/src/repr.rs#L535-L600`) so
+/// `Trusted/MirSemantics.lean` can model deterministic `#[repr(transparent)]`
+/// and `#[repr(C)]` layouts alongside non-deterministic `#[repr(Rust)]`
+/// compiler-chosen padding (`MirState.adtPad`). `#[repr(align(N))]`,
+/// `#[repr(packed)]`, and integer representations are rejected.
 fn adt(
     tcx: TyCtxt<'_>,
     def: LocalDefId,
@@ -648,57 +703,41 @@ fn adt(
         errs.push(tcx, def, "structs with `Drop` impls are not supported");
     }
     let variant = adt.non_enum_variant();
-    let [field] = variant.fields.raw.as_slice() else {
+    let fields: Vec<ir::FieldDecl> = variant
+        .fields
+        .raw
+        .iter()
+        .map(|field| {
+            let ty = extract::ty(tcx.type_of(field.did).skip_binder());
+            let access =
+                if field.vis.is_public() && field.safety == hir::Safety::Safe {
+                    ir::FieldAccess::PubSafe
+                } else {
+                    ir::FieldAccess::Priv
+                };
+            ir::FieldDecl { ty, access }
+        })
+        .collect();
+
+    let repr_opts = adt.repr();
+    if repr_opts.align.is_some()
+        || repr_opts.pack.is_some()
+        || repr_opts.int.is_some()
+    {
         errs.push(
             tcx,
             def,
-            format!(
-                "structs must have exactly one field (found {})",
-                variant.fields.len()
-            ),
+            "`#[repr(align)]`, `#[repr(packed)]`, and `#[repr(int)]` are not \
+             supported",
         );
-        return None;
-    };
-    let field_ty = extract::ty(tcx.type_of(field.did).skip_binder());
-    let access = if field.vis.is_public() && field.safety == hir::Safety::Safe {
-        ir::FieldAccess::PubSafe
+    }
+    let repr = if repr_opts.transparent() {
+        ir::AdtRepr::Transparent
+    } else if repr_opts.c() {
+        ir::AdtRepr::C
     } else {
-        ir::FieldAccess::Priv
+        ir::AdtRepr::Rust
     };
-
-    // `#[repr(align(N))]` and `#[repr(packed)]` change size or alignment
-    // relative to the field, whereas `Trusted.evalTyByteSize` in
-    // `Trusted/MirSemantics.lean` assumes that a single-field struct has its
-    // field's size and alignment. The layout check below catches a size
-    // change; this check also excludes an alignment change that keeps the
-    // size.
-    let repr = adt.repr();
-    if repr.align.is_some() || repr.pack.is_some() {
-        errs.push(
-            tcx,
-            def,
-            "`#[repr(align)]` and `#[repr(packed)]` are not supported",
-        );
-    }
-
-    let self_ty = tcx.type_of(def).skip_binder();
-    let rustc_size = tcx
-        .layout_of(TypingEnv::fully_monomorphized().as_query_input(self_ty))
-        .map(|l| l.size.bytes());
-    let field_size = tcx
-        .layout_of(
-            TypingEnv::fully_monomorphized()
-                .as_query_input(tcx.type_of(field.did).skip_binder()),
-        )
-        .map(|l| l.size.bytes());
-    match (rustc_size, field_size) {
-        (Ok(a), Ok(b)) if a == b => {}
-        _ => errs.push(
-            tcx,
-            def,
-            "the struct's size differs from its field's size",
-        ),
-    }
 
     let mut invariant = None;
     for d in directives.unwrap_or_default() {
@@ -710,12 +749,21 @@ fn adt(
                         def,
                         "at most one `invariant` directive is supported",
                     );
-                } else if field.name.as_str() != ident
-                    || field_ty != ir::Ty::Usize
+                } else if let ([raw_field], [ir_field]) =
+                    (variant.fields.raw.as_slice(), fields.as_slice())
+                    && raw_field.name.as_str() == ident
+                    && ir_field.ty == ir::Ty::Usize
                 {
-                    errs.push(tcx, def, format!("`invariant`: `{ident}` is not the struct's `usize` field"));
-                } else {
                     invariant = Some(ir::InvariantSpec { ne });
+                } else {
+                    errs.push(
+                        tcx,
+                        def,
+                        format!(
+                            "`invariant`: `{ident}` is not the struct's sole \
+                             `usize` field"
+                        ),
+                    );
                 }
             }
             _ => errs.push(tcx, def, "only `invariant` is accepted on structs"),
@@ -723,8 +771,8 @@ fn adt(
     }
     (errs.0.len() == before).then(|| ir::Adt {
         def: def.local_def_index.as_u32(),
-        field_ty,
-        access,
+        repr,
+        fields,
         invariant,
     })
 }
@@ -794,16 +842,6 @@ fn check_references(
     for (&d, b) in bodies {
         let mut bad =
             |msg: String| errs.0.push(format!("`{}`: {msg}", name(d)));
-        for (c, args) in &b.required_consts {
-            required.insert(*c);
-            if !consts.contains(c) {
-                bad(format!(
-                    "requires constant `{}`, which was not captured",
-                    name(*c)
-                ));
-            }
-            tys.extend(args.iter().cloned());
-        }
         tys.extend(b.arg_tys.iter().cloned());
         tys.push(b.ret_ty.clone());
         tys.extend(b.required_layouts.iter().cloned());
@@ -851,8 +889,14 @@ fn check_references(
                                 push_place(&mut tys, p)
                             }
                             ir::Rvalue::ThreadLocalRef(_) => {}
-                            ir::Rvalue::Cast(_, op, t)
-                            | ir::Rvalue::WrapUnsafeBinder(op, t) => {
+                            ir::Rvalue::Cast(k, op, t) => {
+                                if let ir::CastKind::Transmute(src_ty) = k {
+                                    tys.push(src_ty.clone());
+                                }
+                                push_op(&mut tys, op);
+                                tys.push(t.clone());
+                            }
+                            ir::Rvalue::WrapUnsafeBinder(op, t) => {
                                 push_op(&mut tys, op);
                                 tys.push(t.clone());
                             }
@@ -864,7 +908,10 @@ fn check_references(
                                 tys.push(ir::Ty::Adt(*a));
                                 push_op(&mut tys, op);
                             }
-                            ir::Rvalue::AggregateFields(ops) => {
+                            ir::Rvalue::AggregateFields(ops, adt_opt) => {
+                                if let Some(a) = adt_opt {
+                                    tys.push(ir::Ty::Adt(*a));
+                                }
                                 for op in ops {
                                     push_op(&mut tys, op);
                                 }
@@ -874,6 +921,21 @@ fn check_references(
                                 push_place(&mut tys, p);
                             }
                         }
+                    }
+                    ir::Stmt::EvalConst {
+                        dst,
+                        const_def,
+                        type_args,
+                    } => {
+                        push_place(&mut tys, dst);
+                        required.insert(*const_def);
+                        if !consts.contains(const_def) {
+                            bad(format!(
+                                "requires constant `{}`, which was not captured",
+                                name(*const_def)
+                            ));
+                        }
+                        tys.extend(type_args.iter().cloned());
                     }
                     ir::Stmt::FakeRead(p)
                     | ir::Stmt::SetDiscriminant(p, _)
@@ -922,8 +984,10 @@ fn check_references(
                     }
                     tys.extend(type_args.iter().cloned());
                 }
-                ir::Terminator::SizeOf { dst, ty, .. } => {
+                ir::Terminator::CallLayout { dst, query, .. } => {
                     push_place(&mut tys, dst);
+                    let (ir::LayoutQuery::SizeOf(ty)
+                    | ir::LayoutQuery::AlignOf(ty)) = query;
                     tys.push(ty.clone());
                 }
                 ir::Terminator::TransmuteCopy {
@@ -975,7 +1039,9 @@ fn check_references(
         }
     }
     for a in adts {
-        tys.push(a.field_ty.clone());
+        for f in &a.fields {
+            tys.push(f.ty.clone());
+        }
     }
     for t in &tys {
         t.for_each_adt(&mut |a| {
@@ -1007,7 +1073,7 @@ fn check_references(
 
 /// Rejects recursive struct definitions (including cycles through `&T` field
 /// types). `Trusted.evalTyByteSize` and `Trusted.MirVal.valid` in
-/// `Trusted/MirSemantics.lean` recurse structurally over `AdtDecl.payloadTy`
+/// `Trusted/MirSemantics.lean` recurse structurally over `AdtDecl.fields`
 /// bounded by `adts.length`, so cyclic structs (such as `struct Node { next:
 /// &'static Node }`) must be rejected at capture time.
 fn check_adt_cycles(tcx: TyCtxt<'_>, adts: &[ir::Adt], errs: &mut Errors) {
@@ -1015,8 +1081,12 @@ fn check_adt_cycles(tcx: TyCtxt<'_>, adts: &[ir::Adt], errs: &mut Errors) {
         adts.iter().map(|a| (a.def, a)).collect();
     for a in adts {
         let mut seen = BTreeSet::new();
-        let mut cur = a.field_ty.referenced_adt();
-        while let Some(next) = cur {
+        let mut stack: Vec<ir::DefIdx> = a
+            .fields
+            .iter()
+            .filter_map(|f| f.ty.referenced_adt())
+            .collect();
+        while let Some(next) = stack.pop() {
             if next == a.def {
                 errs.push(
                     tcx,
@@ -1027,36 +1097,21 @@ fn check_adt_cycles(tcx: TyCtxt<'_>, adts: &[ir::Adt], errs: &mut Errors) {
                 break;
             }
             if !seen.insert(next) {
-                break;
+                continue;
             }
-            cur = map.get(&next).and_then(|na| na.field_ty.referenced_adt());
+            if let Some(na) = map.get(&next) {
+                stack.extend(
+                    na.fields.iter().filter_map(|f| f.ty.referenced_adt()),
+                );
+            }
         }
     }
 }
 
-/// Checks that every `transmute_copy` in the crate operates on concrete types
-/// supported by `Trusted.extractTransmuteBits` and `Trusted.constructTransmuteVal`
-/// in `Trusted/MirSemantics.lean`, and that no `required_consts` body executes
-/// `transmute_copy`.
-///
-/// In `Trusted/MirSemantics.lean`:
-/// - `extractTransmuteBits` and `constructTransmuteVal` only support `usize`,
-///   `()`, and single-field structs transitively wrapping `usize` or `()`; they
-///   step to `.failed` on `bool`, shared references (`&T`), and unsubstituted
-///   type parameters (`MirTy.param`).
-/// - Constant bodies exist to evaluate `assert!(...)` PME guards, not
-///   `transmute_copy`; if a constant body ran `transmute_copy` on `bool` or
-///   `&T` along a branch of a generic `size_of::<T>()` check, `rustc` CTFE
-///   would accept it while `Trusted.evalTerminator` would step to `.failed`.
-///
-/// This check therefore rejects:
-/// 1. Any `transmute_copy` inside a constant body (or reachable from a
-///    `required_consts` entry); and
-/// 2. Any `transmute_copy` in a function body whose `src_ty` or `dst_ty`
-///    (either before substitution when non-parametric, or after substituting
-///    `type_args` along every call path from a public function) is anything
-///    other than `usize`, `()`, or an acyclic single-field struct transitively
-///    wrapping `usize` or `()`.
+/// Checks that every `transmute` and `transmute_copy` in the crate operates on
+/// concrete types supported by `Trusted.extractTransmuteBits` and
+/// `Trusted.constructTransmuteVal` in `Trusted/MirSemantics.lean`, and that no
+/// constant body executes `transmute` or `transmute_copy`.
 fn check_transmutes(
     tcx: TyCtxt<'_>,
     bodies: &BTreeMap<ir::DefIdx, ir::Body>,
@@ -1079,8 +1134,11 @@ fn check_transmutes(
                 if !seen.insert(*id) {
                     return false;
                 }
-                adts.get(id)
-                    .is_some_and(|a| is_transmutable_ty(&a.field_ty, adts, seen))
+                adts.get(id).is_some_and(|a| match a.fields.as_slice() {
+                    [] => true,
+                    [f] => is_transmutable_ty(&f.ty, adts, seen),
+                    _ => false,
+                })
             }
             _ => false,
         }
@@ -1094,82 +1152,95 @@ fn check_transmutes(
             || is_transmutable_ty(ty, adts, &mut BTreeSet::new())
     }
 
-    /// Replaces each `Param(i)` in `t` by `args[i]`; `None` is the identity
-    /// (the root's own parameters). An out-of-range index stays a
-    /// parameter, which the caller then rejects.
-    fn subst(t: &ir::Ty, args: Option<&[ir::Ty]>) -> ir::Ty {
-        match (t, args) {
-            (ir::Ty::Param(i), Some(a)) => {
-                a.get(*i as usize).cloned().unwrap_or_else(|| t.clone())
-            }
-            (ir::Ty::Ref(inner), _) => {
-                ir::Ty::Ref(Box::new(subst(inner, args)))
-            }
-            (ir::Ty::RefMut(inner), _) => {
-                ir::Ty::RefMut(Box::new(subst(inner, args)))
-            }
-            (ir::Ty::RawPtr(inner, m), _) => {
-                ir::Ty::RawPtr(Box::new(subst(inner, args)), *m)
-            }
-            (ir::Ty::Array(inner, len), _) => {
-                ir::Ty::Array(Box::new(subst(inner, args)), *len)
-            }
-            (ir::Ty::Slice(inner), _) => {
-                ir::Ty::Slice(Box::new(subst(inner, args)))
-            }
-            (ir::Ty::Tuple(elems), _) => {
-                ir::Ty::Tuple(elems.iter().map(|e| subst(e, args)).collect())
-            }
-            (
-                ir::Ty::Usize
-                | ir::Ty::Isize
-                | ir::Ty::Uint(_)
-                | ir::Ty::Int(_)
-                | ir::Ty::Float(_)
-                | ir::Ty::Bool
-                | ir::Ty::Char
-                | ir::Ty::Str
-                | ir::Ty::Unit
-                | ir::Ty::Never
-                | ir::Ty::Adt(_)
-                | ir::Ty::Param(_)
-                | ir::Ty::FnDef(_)
-                | ir::Ty::FnPtr
-                | ir::Ty::Unmodeled,
-                _,
-            ) => t.clone(),
-        }
-    }
-
-    fn has_any_transmute(
+    /// Whether body `d`, instantiated at `args` (or inside a constant context
+    /// when `in_const` is `true`, where no `transmute` or `transmute_copy` is
+    /// permitted), reaches an unsupported transmute. Bodies form a DAG
+    /// (`dependency_order` rejects cycles), so the recursion terminates.
+    fn reaches_bad_transmute(
         d: ir::DefIdx,
+        args: Option<&[ir::Ty]>,
+        in_const: bool,
         bodies: &BTreeMap<ir::DefIdx, ir::Body>,
+        adts: &BTreeMap<ir::DefIdx, &ir::Adt>,
     ) -> bool {
         let Some(b) = bodies.get(&d) else { return false };
-        b.required_consts
-            .iter()
-            .any(|(c, _)| has_any_transmute(*c, bodies))
-            || b.blocks.iter().any(|blk| match &blk.terminator {
-                ir::Terminator::TransmuteCopy { .. } => true,
-                ir::Terminator::Call1 { callee, .. } => {
-                    has_any_transmute(*callee, bodies)
+        let inst = |ts: &[ir::Ty]| -> Vec<ir::Ty> {
+            ts.iter().map(|t| t.subst(args)).collect()
+        };
+        let bad_pair = |src_ty: &ir::Ty, dst_ty: &ir::Ty| -> bool {
+            in_const
+                || !is_transmutable_ty(
+                    &src_ty.subst(args),
+                    adts,
+                    &mut BTreeSet::new(),
+                )
+                || !is_transmutable_ty(
+                    &dst_ty.subst(args),
+                    adts,
+                    &mut BTreeSet::new(),
+                )
+        };
+        b.blocks.iter().any(|blk| {
+            blk.stmts.iter().any(|s| match s {
+                ir::Stmt::EvalConst { const_def, .. } => reaches_bad_transmute(
+                    *const_def,
+                    None,
+                    true,
+                    bodies,
+                    adts,
+                ),
+                ir::Stmt::Assign(
+                    _,
+                    ir::Rvalue::Cast(ir::CastKind::Transmute(src_ty), _, dst_ty),
+                ) => bad_pair(src_ty, dst_ty),
+                _ => false,
+            }) || match &blk.terminator {
+                ir::Terminator::TransmuteCopy { src_ty, dst_ty, .. } => {
+                    bad_pair(src_ty, dst_ty)
+                }
+                ir::Terminator::Call1 { callee, type_args, .. } => {
+                    reaches_bad_transmute(
+                        *callee,
+                        Some(&inst(type_args)),
+                        in_const,
+                        bodies,
+                        adts,
+                    )
                 }
                 _ => false,
-            })
+            }
+        })
     }
 
     for c in constants {
-        if has_any_transmute(c.def, bodies) {
+        if reaches_bad_transmute(c.def, None, true, bodies, &adt_map) {
             errs.push(
                 tcx,
                 LocalDefId { local_def_index: c.def.into() },
-                "`transmute_copy` inside a constant body is not supported",
+                "`transmute` or `transmute_copy` inside a constant body is not \
+                 supported",
             );
         }
     }
 
     for (&d, b) in bodies {
         for blk in &b.blocks {
+            for s in &blk.stmts {
+                if let ir::Stmt::Assign(
+                    _,
+                    ir::Rvalue::Cast(ir::CastKind::Transmute(src_ty), _, dst_ty),
+                ) = s
+                    && (!is_allowed_before_subst(src_ty, &adt_map)
+                        || !is_allowed_before_subst(dst_ty, &adt_map))
+                {
+                    errs.push(
+                        tcx,
+                        LocalDefId { local_def_index: d.into() },
+                        "`transmute` is only supported on `usize`, `()`, and \
+                         single-field structs wrapping them",
+                    );
+                }
+            }
             if let ir::Terminator::TransmuteCopy { src_ty, dst_ty, .. } =
                 &blk.terminator
                 && (!is_allowed_before_subst(src_ty, &adt_map)
@@ -1185,54 +1256,14 @@ fn check_transmutes(
         }
     }
 
-    /// Whether body `d`, instantiated at `args`, reaches a `required_consts`
-    /// body with a `transmute_copy` or a `transmute_copy` whose instantiated
-    /// source or destination is not supported by `MirSemantics`. Bodies form a
-    /// DAG (`dependency_order` rejects cycles), so the recursion terminates.
-    fn reaches_bad_transmute(
-        d: ir::DefIdx,
-        args: Option<&[ir::Ty]>,
-        bodies: &BTreeMap<ir::DefIdx, ir::Body>,
-        adts: &BTreeMap<ir::DefIdx, &ir::Adt>,
-    ) -> bool {
-        let Some(b) = bodies.get(&d) else { return false };
-        let inst = |ts: &[ir::Ty]| -> Vec<ir::Ty> {
-            ts.iter().map(|t| subst(t, args)).collect()
-        };
-        b.required_consts
-            .iter()
-            .any(|(c, _)| has_any_transmute(*c, bodies))
-            || b.blocks.iter().any(|blk| match &blk.terminator {
-                ir::Terminator::TransmuteCopy { src_ty, dst_ty, .. } => {
-                    !is_transmutable_ty(
-                        &subst(src_ty, args),
-                        adts,
-                        &mut BTreeSet::new(),
-                    ) || !is_transmutable_ty(
-                        &subst(dst_ty, args),
-                        adts,
-                        &mut BTreeSet::new(),
-                    )
-                }
-                ir::Terminator::Call1 { callee, type_args, .. } => {
-                    reaches_bad_transmute(
-                        *callee,
-                        Some(&inst(type_args)),
-                        bodies,
-                        adts,
-                    )
-                }
-                _ => false,
-            })
-    }
-
     for f in fns.iter().filter(|f| f.kind != ir::FnKind::Private) {
-        if reaches_bad_transmute(f.def, None, bodies, &adt_map) {
+        if reaches_bad_transmute(f.def, None, false, bodies, &adt_map) {
             errs.push(
                 tcx,
                 LocalDefId { local_def_index: f.def.into() },
-                "reaches a `transmute_copy` in a required constant or with an \
-                 unsupported or type-parameter source/destination type",
+                "reaches a `transmute` or `transmute_copy` in a required \
+                 constant or with an unsupported or type-parameter \
+                 source/destination type",
             );
         }
     }
@@ -1251,9 +1282,13 @@ fn dependency_order(
         Done,
     }
     fn deps(b: &ir::Body) -> Vec<ir::DefIdx> {
-        let mut out: Vec<_> =
-            b.required_consts.iter().map(|(c, _)| *c).collect();
+        let mut out = Vec::new();
         for blk in &b.blocks {
+            for s in &blk.stmts {
+                if let ir::Stmt::EvalConst { const_def, .. } = s {
+                    out.push(*const_def);
+                }
+            }
             if let ir::Terminator::Call1 { callee, .. } = &blk.terminator {
                 out.push(*callee);
             }

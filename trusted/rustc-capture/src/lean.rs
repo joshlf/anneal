@@ -186,27 +186,36 @@ impl Names {
         }
     }
 
-    fn cast_kind(k: ir::CastKind) -> &'static str {
+    fn cast_kind(&self, k: &ir::CastKind) -> String {
         match k {
             ir::CastKind::PointerExposeProvenance => {
-                "_root_.Trusted.CastKind.pointerExposeProvenance"
+                "_root_.Trusted.CastKind.pointerExposeProvenance".into()
             }
             ir::CastKind::PointerWithExposedProvenance => {
-                "_root_.Trusted.CastKind.pointerWithExposedProvenance"
+                "_root_.Trusted.CastKind.pointerWithExposedProvenance".into()
             }
             ir::CastKind::PointerCoercion => {
-                "_root_.Trusted.CastKind.pointerCoercion"
+                "_root_.Trusted.CastKind.pointerCoercion".into()
             }
-            ir::CastKind::IntToInt => "_root_.Trusted.CastKind.intToInt",
-            ir::CastKind::FloatToInt => "_root_.Trusted.CastKind.floatToInt",
+            ir::CastKind::IntToInt => "_root_.Trusted.CastKind.intToInt".into(),
+            ir::CastKind::FloatToInt => {
+                "_root_.Trusted.CastKind.floatToInt".into()
+            }
             ir::CastKind::FloatToFloat => {
-                "_root_.Trusted.CastKind.floatToFloat"
+                "_root_.Trusted.CastKind.floatToFloat".into()
             }
-            ir::CastKind::IntToFloat => "_root_.Trusted.CastKind.intToFloat",
-            ir::CastKind::PtrToPtr => "_root_.Trusted.CastKind.ptrToPtr",
-            ir::CastKind::FnPtrToPtr => "_root_.Trusted.CastKind.fnPtrToPtr",
-            ir::CastKind::Transmute => "_root_.Trusted.CastKind.transmute",
-            ir::CastKind::Subtype => "_root_.Trusted.CastKind.subtype",
+            ir::CastKind::IntToFloat => {
+                "_root_.Trusted.CastKind.intToFloat".into()
+            }
+            ir::CastKind::PtrToPtr => "_root_.Trusted.CastKind.ptrToPtr".into(),
+            ir::CastKind::FnPtrToPtr => {
+                "_root_.Trusted.CastKind.fnPtrToPtr".into()
+            }
+            ir::CastKind::Transmute(src_ty) => format!(
+                "(_root_.Trusted.CastKind.transmute {})",
+                self.ty(src_ty)
+            ),
+            ir::CastKind::Subtype => "_root_.Trusted.CastKind.subtype".into(),
         }
     }
 
@@ -283,7 +292,7 @@ impl Names {
             ),
             ir::Rvalue::Cast(k, o, t) => format!(
                 "(_root_.Trusted.Rvalue.cast {} {} {})",
-                Self::cast_kind(*k),
+                self.cast_kind(k),
                 self.operand(o),
                 self.ty(t)
             ),
@@ -307,10 +316,17 @@ impl Names {
                 self.adt[d],
                 self.operand(o)
             ),
-            ir::Rvalue::AggregateFields(ops) => format!(
-                "(_root_.Trusted.Rvalue.aggregateFields {})",
-                list(ops.iter().map(|o| self.operand(o)))
-            ),
+            ir::Rvalue::AggregateFields(ops, adt_opt) => match adt_opt {
+                Some(d) => format!(
+                    "(_root_.Trusted.Rvalue.aggregateFields {} (_root_.Option.some {}))",
+                    list(ops.iter().map(|o| self.operand(o))),
+                    self.adt[d]
+                ),
+                None => format!(
+                    "(_root_.Trusted.Rvalue.aggregateFields {})",
+                    list(ops.iter().map(|o| self.operand(o)))
+                ),
+            },
             ir::Rvalue::CopyForDeref(p) => format!(
                 "(_root_.Trusted.Rvalue.copyForDeref {})",
                 self.place(p)
@@ -335,6 +351,16 @@ impl Names {
                 "_root_.Trusted.Stmt.assign {} {}",
                 self.place(p),
                 self.rvalue(r)
+            ),
+            ir::Stmt::EvalConst {
+                dst,
+                const_def,
+                type_args,
+            } => format!(
+                "_root_.Trusted.Stmt.evalConst {} ⟨{}⟩ {}",
+                self.place(dst),
+                self.body_id[const_def],
+                self.ty_list(type_args)
             ),
             ir::Stmt::FakeRead(p) => {
                 format!("_root_.Trusted.Stmt.fakeRead {}", self.place(p))
@@ -386,6 +412,14 @@ impl Names {
         }
     }
 
+    fn assert_fail_kind(k: ir::AssertFailKind) -> &'static str {
+        match k {
+            ir::AssertFailKind::Unwind => "_root_.Trusted.AssertFailKind.unwind",
+            ir::AssertFailKind::Abort => "_root_.Trusted.AssertFailKind.abort",
+            ir::AssertFailKind::Ub => "_root_.Trusted.AssertFailKind.ub",
+        }
+    }
+
     fn terminator(&self, t: &ir::Terminator) -> String {
         match t {
             ir::Terminator::Return => {
@@ -418,23 +452,32 @@ impl Names {
                 cond,
                 expected,
                 target,
-                has_cleanup: false,
-            } => format!(
-                "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩",
-                self.operand(cond),
-                Self::bool_lit(*expected)
-            ),
-            ir::Terminator::Assert {
-                cond,
-                expected,
-                target,
-                has_cleanup: true,
-            } => format!(
-                "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩ {}",
-                self.operand(cond),
-                Self::bool_lit(*expected),
-                Self::bool_lit(true)
-            ),
+                on_fail,
+                has_cleanup,
+            } => {
+                if *on_fail == ir::AssertFailKind::Unwind && !*has_cleanup {
+                    format!(
+                        "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩",
+                        self.operand(cond),
+                        Self::bool_lit(*expected)
+                    )
+                } else if !*has_cleanup {
+                    format!(
+                        "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩ {}",
+                        self.operand(cond),
+                        Self::bool_lit(*expected),
+                        Self::assert_fail_kind(*on_fail)
+                    )
+                } else {
+                    format!(
+                        "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩ {} {}",
+                        self.operand(cond),
+                        Self::bool_lit(*expected),
+                        Self::assert_fail_kind(*on_fail),
+                        Self::bool_lit(true)
+                    )
+                }
+            }
             ir::Terminator::SwitchInt { discr, false_target, true_target } => {
                 format!(
                     "_root_.Trusted.Terminator.switchInt {} ⟨{false_target}⟩ ⟨{true_target}⟩",
@@ -454,11 +497,18 @@ impl Names {
                         .map(|(v, b)| format!("({v}, ⟨{b}⟩)"))
                 )
             ),
-            ir::Terminator::SizeOf { dst, ty, target } => format!(
-                "_root_.Trusted.Terminator.callSizeOf {} {} ⟨{target}⟩",
-                self.place(dst),
-                self.ty(ty)
-            ),
+            ir::Terminator::CallLayout { dst, query, target } => match query {
+                ir::LayoutQuery::SizeOf(ty) => format!(
+                    "_root_.Trusted.Terminator.callSizeOf {} {} ⟨{target}⟩",
+                    self.place(dst),
+                    self.ty(ty)
+                ),
+                ir::LayoutQuery::AlignOf(ty) => format!(
+                    "_root_.Trusted.Terminator.callLayout {} (_root_.Trusted.LayoutQuery.alignOf {}) ⟨{target}⟩",
+                    self.place(dst),
+                    self.ty(ty)
+                ),
+            },
             ir::Terminator::TransmuteCopy {
                 dst,
                 src_ty,
@@ -514,6 +564,14 @@ impl Names {
             ir::Terminator::InlineAsm => {
                 "_root_.Trusted.Terminator.inlineAsm".into()
             }
+        }
+    }
+
+    fn repr(r: ir::AdtRepr) -> &'static str {
+        match r {
+            ir::AdtRepr::Rust => "_root_.Trusted.AdtRepr.rust",
+            ir::AdtRepr::Transparent => "_root_.Trusted.AdtRepr.transparent",
+            ir::AdtRepr::C => "_root_.Trusted.AdtRepr.c",
         }
     }
 
@@ -631,7 +689,16 @@ pub fn render(c: &ir::Crate) -> String {
                 requires,
                 specs,
                 trusted_reason,
-            } => Some((f, requires, specs, trusted_reason)),
+                layout_waiver,
+                documented_intents,
+            } => Some((
+                f,
+                requires,
+                specs,
+                trusted_reason,
+                layout_waiver,
+                documented_intents,
+            )),
         })
         .collect();
 
@@ -640,7 +707,7 @@ pub fn render(c: &ir::Crate) -> String {
         "-- Generated by anneal-rustc-capture from rustc's Runtime(PostCleanup) \
          MIR.\n-- Do not edit.\n",
     );
-    for (f, _, _, trusted_reason) in &roots {
+    for (f, _, _, trusted_reason, _, _) in &roots {
         if let Some(reason) = trusted_reason {
             let _ = writeln!(
                 out,
@@ -681,10 +748,6 @@ pub fn render(c: &ir::Crate) -> String {
             );
         }
         out.push_str("  ]\n");
-        let rcs = b.required_consts.iter().map(|(k, args)| {
-            format!("(⟨{}⟩, {})", names.body_id[k], names.ty_list(args))
-        });
-        let _ = writeln!(out, "  requiredConsts := {}", list(rcs));
         if !b.required_layouts.is_empty() {
             let _ = writeln!(
                 out,
@@ -698,10 +761,17 @@ pub fn render(c: &ir::Crate) -> String {
     out.push_str("def crate : _root_.Trusted.Crate where\n");
     if !c.adts.is_empty() {
         let decls = c.adts.iter().enumerate().map(|(i, a)| {
+            let fields = a.fields.iter().map(|f| {
+                format!(
+                    "{{ ty := {}, access := {} }}",
+                    names.ty(&f.ty),
+                    Names::access(f.access)
+                )
+            });
             format!(
-                "\n    {{ id := {i}\n      fields := [{{ ty := {}, access := {} }}]{} }}",
-                names.ty(&a.field_ty),
-                Names::access(a.access),
+                "\n    {{ id := {i}\n      repr := {}\n      fields := {}{} }}",
+                Names::repr(a.repr),
+                list(fields),
                 Names::invariant_field(&a.invariant),
             )
         });
@@ -722,7 +792,7 @@ pub fn render(c: &ir::Crate) -> String {
         "  bodies := [{}\n  ]",
         body_decls.collect::<Vec<_>>().join(",")
     );
-    let fns = roots.iter().map(|(f, requires, specs, _)| {
+    let fns = roots.iter().map(|(f, requires, specs, _, _, _)| {
         let dbg = match f.debug_body {
             Some(dbg_def) => format!(
                 "\n      debugBodyId := _root_.Option.some ⟨{}⟩",
@@ -748,9 +818,41 @@ pub fn render(c: &ir::Crate) -> String {
         "  functions := [{}\n  ]",
         fns.collect::<Vec<_>>().join(",")
     );
+    // Emit `rustcLowering` per root function along with any explicitly opted-in
+    // `compileTimeGuard`, `documentedIntent`, and `pinnedCompilerCoupled`
+    // ledger entries.
+    let mut tcb = Vec::new();
+    for (f, _, _, _, layout_waiver, documented_intents) in &roots {
+        let fn_lit = string_lit(&f.name);
+        let body_idx = names.body_id[&f.def];
+        tcb.push(format!(
+            "\n    _root_.Trusted.TCBItem.rustcLowering {fn_lit} ⟨{body_idx}⟩"
+        ));
+        match layout_waiver {
+            ir::LayoutWaiver::Universal => {}
+            ir::LayoutWaiver::CompileTimeGuard => {
+                tcb.push(format!(
+                    "\n    _root_.Trusted.TCBItem.compileTimeGuard {fn_lit} ⟨{body_idx}⟩"
+                ));
+            }
+            ir::LayoutWaiver::PinnedCompilerCoupled(reason) => {
+                tcb.push(format!(
+                    "\n    _root_.Trusted.TCBItem.pinnedCompilerCoupled {fn_lit} ⟨{body_idx}⟩ {}",
+                    string_lit(reason)
+                ));
+            }
+        }
+        for rationale in *documented_intents {
+            tcb.push(format!(
+                "\n    _root_.Trusted.TCBItem.documentedIntent {fn_lit} ⟨{body_idx}⟩ {}",
+                string_lit(rationale)
+            ));
+        }
+    }
+    let _ = writeln!(out, "  tcb := [{}\n  ]", tcb.join(","));
     let waived: Vec<_> = roots
         .iter()
-        .filter_map(|(f, _, _, trusted_reason)| {
+        .filter_map(|(f, _, _, trusted_reason, _, _)| {
             trusted_reason.as_ref().map(|_| {
                 format!(
                     "\n    _root_.Trusted.ObligationId.fnBody {}",
