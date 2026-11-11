@@ -397,7 +397,13 @@ impl Names {
             ir::Terminator::Unreachable => {
                 "_root_.Trusted.Terminator.unreachable".into()
             }
-            ir::Terminator::Panic => "_root_.Trusted.Terminator.panic".into(),
+            ir::Terminator::Panic { has_cleanup: false } => {
+                "_root_.Trusted.Terminator.panic".into()
+            }
+            ir::Terminator::Panic { has_cleanup: true } => format!(
+                "_root_.Trusted.Terminator.panic {}",
+                Self::bool_lit(true)
+            ),
             ir::Terminator::UnwindResume => {
                 "_root_.Trusted.Terminator.unwindResume".into()
             }
@@ -408,10 +414,26 @@ impl Names {
                 "_root_.Trusted.Terminator.drop {} ⟨{target}⟩",
                 self.place(place)
             ),
-            ir::Terminator::Assert { cond, expected, target } => format!(
+            ir::Terminator::Assert {
+                cond,
+                expected,
+                target,
+                has_cleanup: false,
+            } => format!(
                 "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩",
                 self.operand(cond),
                 Self::bool_lit(*expected)
+            ),
+            ir::Terminator::Assert {
+                cond,
+                expected,
+                target,
+                has_cleanup: true,
+            } => format!(
+                "_root_.Trusted.Terminator.assert {} {} ⟨{target}⟩ {}",
+                self.operand(cond),
+                Self::bool_lit(*expected),
+                Self::bool_lit(true)
             ),
             ir::Terminator::SwitchInt { discr, false_target, true_target } => {
                 format!(

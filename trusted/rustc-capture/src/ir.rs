@@ -385,7 +385,9 @@ pub enum Terminator {
     Return,
     Goto(u32),
     Unreachable,
-    Panic,
+    Panic {
+        has_cleanup: bool,
+    },
     UnwindResume,
     UnwindTerminate,
     Drop {
@@ -396,6 +398,7 @@ pub enum Terminator {
         cond: Operand,
         expected: bool,
         target: u32,
+        has_cleanup: bool,
     },
     SwitchInt {
         discr: Operand,

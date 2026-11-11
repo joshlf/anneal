@@ -198,8 +198,10 @@ theorem evalMirTerminator_choice_inhabited (adts : List AdtDecl)
     exact choice_inhabited_of_if_failed
       (gotoBlock_choice_inhabited s _ _ branches)
   | unreachable => intro h; cases h
-  | panic => intro h; cases h
-  | assert cond expected _ =>
+  | panic hasCleanup =>
+    dsimp [evalMirTerminator]
+    cases hasCleanup || !s.stack.isEmpty <;> (intro h; cases h)
+  | assert cond expected _ hasCleanup =>
     dsimp [evalMirTerminator]
     cases evalOperand active.localCount s cond with
     | none => intro h; cases h
@@ -210,7 +212,9 @@ theorem evalMirTerminator_choice_inhabited (adts : List AdtDecl)
         | bool b =>
           dsimp
           cases b == expected with
-          | false => intro h; cases h
+          | false =>
+            dsimp
+            cases hasCleanup || !s.stack.isEmpty <;> (intro h; cases h)
           | true =>
             dsimp
             exact choice_inhabited_of_if_failed
@@ -1200,7 +1204,7 @@ theorem idCopyBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         apply ExecNormal.step
         · change evalMirStmt idCopyBody _
@@ -1262,7 +1266,7 @@ theorem idMoveBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         apply ExecNormal.step
         · change evalMirStmt idMoveBody _
@@ -1799,7 +1803,7 @@ theorem concreteTransmuteCaller_execNormal {bodies : List BodyDecl}
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -2064,7 +2068,7 @@ theorem makeNonZeroBody_execNormal {bodies : List BodyDecl}
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         refine .step rfl (.step rfl ?_)
         apply ExecNormal.step
@@ -2135,7 +2139,7 @@ theorem newUncheckedBody_execNormal {bodies : List BodyDecl}
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         have hne0 : n ≠ 0 := hsafety n hv1
         refine .step rfl ?_
@@ -2201,7 +2205,7 @@ theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
       | bool _ => cases hvinv
       | unit => cases hvinv
       | bytes _ _ => cases hvinv
-      | ref _ _ _ => cases hvinv
+      | ref _ _ _ _ => cases hvinv
       | adt vAdtId inner =>
         have hveq : vAdtId = 0 := hvinv.1
         subst hveq
@@ -2211,7 +2215,7 @@ theorem getUncheckedNonZeroBody_execNormal {bodies : List BodyDecl}
         | unit => cases hvinv.2.2
         | adt _ _ => cases hvinv.2.2
         | bytes _ _ => cases hvinv.2.2
-        | ref _ _ _ => cases hvinv.2.2
+        | ref _ _ _ _ => cases hvinv.2.2
         | usize n =>
           cases n with
           | zero => exact False.elim (hvinv.2.1 rfl)
@@ -3202,7 +3206,7 @@ theorem idNonZeroUnchecked_execNormal {bodies : List BodyDecl} (s : MirState)
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         cases n with
         | zero => exact False.elim (hsafety 0 hv1 rfl)
@@ -3372,7 +3376,7 @@ theorem clampNonZero_execNormal {bodies : List BodyDecl} (s : MirState)
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -3777,7 +3781,7 @@ theorem allocPassthroughBody_execNormal {bodies : List BodyDecl} (s : MirState)
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -3916,7 +3920,7 @@ theorem inlineConstTransmute_execNormal {bodies : List BodyDecl}
       | unit => cases hvty
       | adt _ _ => cases hvty
       | bytes _ _ => cases hvty
-      | ref _ _ _ => cases hvty
+      | ref _ _ _ _ => cases hvty
       | usize n =>
         have hL : locals0 = updateLocal locals0 1 (some (.usize n)) := by
           funext i
@@ -4103,7 +4107,8 @@ def beqMirVal : MirVal → MirVal → Bool
   | .unit, .unit => true
   | .adt i a, .adt j b => i == j && beqMirVal a b
   | .bytes s1 b1, .bytes s2 b2 => s1 == s2 && b1 == b2
-  | .ref d1 g1 l1, .ref d2 g2 l2 => d1 == d2 && g1 == g2 && beqLocalId l1 l2
+  | .ref d1 g1 l1 f1, .ref d2 g2 l2 f2 =>
+    d1 == d2 && g1 == g2 && beqLocalId l1 l2 && f1 == f2
   | _, _ => false
 
 theorem eq_of_beqMirVal : ∀ {a b : MirVal}, beqMirVal a b = true → a = b
@@ -4119,9 +4124,9 @@ theorem eq_of_beqMirVal : ∀ {a b : MirVal}, beqMirVal a b = true → a = b
   | .bytes _ _, .bytes _ _, h => by
     simp [beqMirVal] at h
     rw [h.1, h.2]
-  | .ref _ _ _, .ref _ _ _, h => by
+  | .ref _ _ _ _, .ref _ _ _ _, h => by
     simp [beqMirVal] at h
-    rw [h.1.1, h.1.2, eq_of_beqLocalId h.2]
+    rw [h.1.1.1, h.1.1.2, eq_of_beqLocalId h.1.2, h.2]
 
 def beqOperand (a b : Operand) : Bool :=
   match a with
@@ -4253,10 +4258,11 @@ def beqTerminator (a b : Terminator) : Bool :=
   | .return_ => match b with | .return_ => true | _ => false
   | .goto a1 => match b with | .goto b1 => beqBlockId a1 b1 | _ => false
   | .unreachable => match b with | .unreachable => true | _ => false
-  | .panic => match b with | .panic => true | _ => false
-  | .assert c1 e1 t1 =>
+  | .panic c1 => match b with | .panic c2 => c1 == c2 | _ => false
+  | .assert c1 e1 t1 cl1 =>
     match b with
-    | .assert c2 e2 t2 => beqOperand c1 c2 && e1 == e2 && beqBlockId t1 t2
+    | .assert c2 e2 t2 cl2 =>
+      beqOperand c1 c2 && e1 == e2 && beqBlockId t1 t2 && cl1 == cl2
     | _ => false
   | .switchInt d1 f1 t1 =>
     match b with
@@ -4291,12 +4297,17 @@ theorem eq_of_beqTerminator {a b : Terminator} (h : beqTerminator a b = true) :
     | goto b1 => exact congrArg Terminator.goto (eq_of_beqBlockId h)
     | _ => cases h
   | unreachable => cases b <;> first | rfl | cases h
-  | panic => cases b <;> first | rfl | cases h
-  | assert c1 e1 t1 =>
+  | panic c1 =>
     cases b with
-    | assert c2 e2 t2 =>
+    | panic c2 =>
       simp [beqTerminator] at h
-      rw [eq_of_beqOperand h.1.1, h.1.2, eq_of_beqBlockId h.2]
+      rw [h]
+    | _ => cases h
+  | assert c1 e1 t1 cl1 =>
+    cases b with
+    | assert c2 e2 t2 cl2 =>
+      simp [beqTerminator] at h
+      rw [eq_of_beqOperand h.1.1.1, h.1.1.2, eq_of_beqBlockId h.1.2, h.2]
     | _ => cases h
   | switchInt d1 f1 t1 =>
     cases b with
@@ -5245,5 +5256,40 @@ def crateWithNopInIdBody : Crate := {
 theorem canary_proveCrate_lowers_nop_in_id :
     CrateTheorem crateWithNopInIdBody :=
   proveCrate _ rfl
+
+/-- Canary: projected shared borrows (`&x.0`) record `fieldDepth := 1`, resolve
+to the inner field payload rather than the outer struct, and reject dangling
+reads after a partial move of field `0`. -/
+def borrowField0Body : MirBody where
+  localCount := 4
+  argTys := [.adt 0]
+  retTy := .usize
+  blocks := [{
+    stmts := [
+      .assign (locPlace 2) (.ref (field0Place 1)),
+      .assign (locPlace 0) (.use (.copy (derefPlace 2)))
+    ]
+    terminator := .return_
+  }]
+
+theorem canary_projected_field_borrow_resolves_payload :
+    let s0 : MirState := singleArgAdtNonZeroInitState 0
+    ExecNormal [nonZeroAdtDecl 0] [] borrowField0Body s0
+      (fun r => r.value = .usize 1) :=
+  .step rfl (.step rfl (.normal rfl rfl))
+
+/-- Canary: `Terminator.panic true` and `Terminator.assert _ _ _ true`
+(`hasCleanup := true`) fail closed (`.failed`) rather than unwinding past an
+unmodeled cleanup pad. -/
+theorem canary_cleanup_unwind_fails_closed :
+    let s0 : MirState := {
+      locals := fun i => if i == 1 then some (.bool false) else none
+      block := 0
+      stmtIdx := 0
+    }
+    evalMirTerminator [] [] idCopyBody s0 (.panic true) = .failed ∧
+    evalMirTerminator [] [] idCopyBody s0
+      (.assert (.copy (locPlace 1)) true ⟨0⟩ true) = .failed :=
+  ⟨rfl, rfl⟩
 
 end Anneal

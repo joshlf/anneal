@@ -196,9 +196,10 @@ def AdtDecl.payloadTy (decl : AdtDecl) : Option MirTy :=
   `AdtDecl.payloadTy`).
 - `.bytes sz bits`: the opaque value of a generic parameter type, `sz` bytes
   wide. The semantics never reinterprets these bits as another type.
-- `.ref frameId gen loc`: a shared reference to local `loc` of the activation
-  with identifier `frameId`, valid only while that local's storage generation
-  is still `gen` (see `resolveRef`). -/
+- `.ref frameId gen loc fieldDepth`: a shared reference to `fieldDepth` nested
+  `.field 0` projections of local `loc` of the activation with identifier
+  `frameId`, valid only while that local's storage generation is still `gen`
+  (see `resolveRef`). -/
 inductive MirVal where
   | uninit
   | usize (bits : Nat)
@@ -206,7 +207,7 @@ inductive MirVal where
   | unit
   | adt (id : Nat) (inner : MirVal)
   | bytes (sz : Nat) (bits : Nat)
-  | ref (depth : Nat) (gen : Nat) (loc : LocalId)
+  | ref (frameId : Nat) (gen : Nat) (loc : LocalId) (fieldDepth : Nat := 0)
 
 /-- Session runtime-check flag queried by `Operand.runtimeChecks`
 (`rustc_middle::mir::RuntimeChecks`,
@@ -353,11 +354,12 @@ inductive Terminator where
   | return_
   | goto (target : BlockId)
   | unreachable
-  | panic
+  | panic (hasCleanup : Bool := false)
   | unwindResume
   | unwindTerminate
   | drop (place : Place) (target : BlockId)
   | assert (cond : Operand) (expected : Bool) (target : BlockId)
+      (hasCleanup : Bool := false)
   | switchInt (discr : Operand) (falseTarget : BlockId) (trueTarget : BlockId)
   | switchIntGeneral (discr : Operand) (targets : List (Nat × BlockId))
       (otherwise : BlockId)

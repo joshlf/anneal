@@ -699,14 +699,14 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 cond,
                 expected,
                 target,
-                unwind: UnwindAction::Continue,
+                unwind,
                 ..
             } => Ok(ir::Terminator::Assert {
                 cond: self.operand(cond)?,
                 expected: *expected,
                 target: target.as_u32(),
+                has_cleanup: !matches!(unwind, UnwindAction::Continue),
             }),
-            TerminatorKind::Assert { .. } => Ok(ir::Terminator::UnwindTerminate),
             TerminatorKind::SwitchInt { discr, targets } => {
                 let values: Vec<_> = targets.iter().collect();
                 if discr.ty(&self.body.local_decls, self.tcx).is_bool()
@@ -796,9 +796,7 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
             target: ret_target,
         };
 
-        if !matches!(unwind, UnwindAction::Continue)
-            || !matches!(call_source, CallSource::Normal)
-        {
+        if !matches!(call_source, CallSource::Normal) {
             return Ok(fallback());
         }
         let Some((callee, gargs)) = func.const_fn_def() else {
@@ -811,6 +809,7 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 _ => return Ok(fallback()),
             }
         }
+        let has_cleanup = !matches!(unwind, UnwindAction::Continue);
 
         if let Some(known) = known_core_fn(self.tcx, callee) {
             return Ok(match (
@@ -818,29 +817,40 @@ impl<'a, 'tcx> BodyCx<'a, 'tcx> {
                 type_args.as_slice(),
                 op_args.as_slice(),
                 ret_target,
+                has_cleanup,
             ) {
-                (Known::SizeOf, [t], [], Some(target)) => {
+                (Known::SizeOf, [t], [], Some(target), false) => {
                     ir::Terminator::SizeOf {
                         dst,
                         ty: t.clone(),
                         target,
                     }
                 }
-                (Known::TransmuteCopy, [src_ty, dst_ty], [op], Some(target)) => {
-                    ir::Terminator::TransmuteCopy {
-                        dst,
-                        src_ty: src_ty.clone(),
-                        dst_ty: dst_ty.clone(),
-                        op: op.clone(),
-                        target,
-                    }
-                }
-                (Known::UnreachableUnchecked, [], [], None) => {
+                (
+                    Known::TransmuteCopy,
+                    [src_ty, dst_ty],
+                    [op],
+                    Some(target),
+                    false,
+                ) => ir::Terminator::TransmuteCopy {
+                    dst,
+                    src_ty: src_ty.clone(),
+                    dst_ty: dst_ty.clone(),
+                    op: op.clone(),
+                    target,
+                },
+                (Known::UnreachableUnchecked, [], [], None, false) => {
                     ir::Terminator::Unreachable
                 }
-                (Known::Panic, [], [_msg], None) => ir::Terminator::Panic,
+                (Known::Panic, [], [_msg], None, has_cleanup) => {
+                    ir::Terminator::Panic { has_cleanup }
+                }
                 _ => fallback(),
             });
+        }
+
+        if has_cleanup {
+            return Ok(fallback());
         }
 
         if callee.is_local()

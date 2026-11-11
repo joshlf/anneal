@@ -964,7 +964,7 @@ fn check_references(
                 ir::Terminator::Return
                 | ir::Terminator::Goto(_)
                 | ir::Terminator::Unreachable
-                | ir::Terminator::Panic
+                | ir::Terminator::Panic { .. }
                 | ir::Terminator::UnwindResume
                 | ir::Terminator::UnwindTerminate
                 | ir::Terminator::CoroutineDrop

@@ -160,9 +160,9 @@ theorem lookupAt_mem {α : Type} :
 -/
 
 theorem resolveRef_with_stmtIdx (s : MirState) (idx frameId gen : Nat)
-    (loc : LocalId) :
-    resolveRef { s with stmtIdx := idx } frameId gen loc =
-      resolveRef s frameId gen loc :=
+    (loc : LocalId) (fieldDepth : Nat) :
+    resolveRef { s with stmtIdx := idx } frameId gen loc fieldDepth =
+      resolveRef s frameId gen loc fieldDepth :=
   rfl
 
 theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
@@ -174,13 +174,13 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
         validStep adts adtInv s callerBase unfold2 ty v
   | .usize, .usize _ => Iff.rfl
   | .usize, .uninit | .usize, .bool _ | .usize, .unit
-  | .usize, .adt _ _ | .usize, .bytes _ _ | .usize, .ref _ _ _ => Iff.rfl
+  | .usize, .adt _ _ | .usize, .bytes _ _ | .usize, .ref _ _ _ _ => Iff.rfl
   | .bool, .bool _ => Iff.rfl
   | .bool, .uninit | .bool, .usize _ | .bool, .unit
-  | .bool, .adt _ _ | .bool, .bytes _ _ | .bool, .ref _ _ _ => Iff.rfl
+  | .bool, .adt _ _ | .bool, .bytes _ _ | .bool, .ref _ _ _ _ => Iff.rfl
   | .unit, .unit => Iff.rfl
   | .unit, .uninit | .unit, .usize _ | .unit, .bool _
-  | .unit, .adt _ _ | .unit, .bytes _ _ | .unit, .ref _ _ _ => Iff.rfl
+  | .unit, .adt _ _ | .unit, .bytes _ _ | .unit, .ref _ _ _ _ => Iff.rfl
   | .adt id, .adt _ inner => by
     dsimp [validStep]
     cases (findAdtDecl adts id).bind AdtDecl.payloadTy with
@@ -189,14 +189,14 @@ theorem validStep_with_stmtIdx (adts : List AdtDecl) (adtInv : AdtInv)
       exact ⟨fun ⟨h1, h2, h3⟩ => ⟨h1, h2, (hunf payload inner).mp h3⟩,
              fun ⟨h1, h2, h3⟩ => ⟨h1, h2, (hunf payload inner).mpr h3⟩⟩
   | .adt _, .uninit | .adt _, .usize _ | .adt _, .bool _
-  | .adt _, .unit | .adt _, .bytes _ _ | .adt _, .ref _ _ _ => Iff.rfl
+  | .adt _, .unit | .adt _, .bytes _ _ | .adt _, .ref _ _ _ _ => Iff.rfl
   | .param _, .bytes _ _ => Iff.rfl
   | .param _, .uninit | .param _, .usize _ | .param _, .bool _
-  | .param _, .unit | .param _, .adt _ _ | .param _, .ref _ _ _ => Iff.rfl
-  | .ref inner, .ref frameId gen loc => by
+  | .param _, .unit | .param _, .adt _ _ | .param _, .ref _ _ _ _ => Iff.rfl
+  | .ref inner, .ref frameId gen loc fieldDepth => by
     dsimp [validStep]
     rw [resolveRef_with_stmtIdx]
-    cases resolveRef s frameId gen loc with
+    cases resolveRef s frameId gen loc fieldDepth with
     | none => exact Iff.rfl
     | some pointee =>
       have ih := validStep_with_stmtIdx adts adtInv s idx callerBase hunf
@@ -239,10 +239,10 @@ theorem returnRefsStep_with_stmtIdx (s : MirState) (idx localCount : Nat)
         returnRefsStep s localCount follow2 v
   | .uninit | .usize _ | .bool _ | .unit | .bytes _ _ => rfl
   | .adt _ inner => returnRefsStep_with_stmtIdx s idx localCount hf inner
-  | .ref frameId gen loc => by
+  | .ref frameId gen loc fieldDepth => by
     dsimp [returnRefsStep]
     rw [resolveRef_with_stmtIdx]
-    cases resolveRef s frameId gen loc with
+    cases resolveRef s frameId gen loc fieldDepth with
     | none => rfl
     | some pointee =>
       dsimp [Option.any]
@@ -271,11 +271,11 @@ theorem evalProj_with_stmtIdx (s : MirState) (idx : Nat) :
   | .field (_ + 1) :: _, _ => rfl
   | .field 0 :: _, .uninit | .field 0 :: _, .usize _ | .field 0 :: _, .bool _
   | .field 0 :: _, .unit | .field 0 :: _, .bytes _ _
-  | .field 0 :: _, .ref _ _ _ => rfl
-  | .deref :: rest, .ref frameId gen loc => by
+  | .field 0 :: _, .ref _ _ _ _ => rfl
+  | .deref :: rest, .ref frameId gen loc fieldDepth => by
     dsimp [evalProj]
     rw [resolveRef_with_stmtIdx]
-    cases resolveRef s frameId gen loc with
+    cases resolveRef s frameId gen loc fieldDepth with
     | none => rfl
     | some pointee => exact evalProj_with_stmtIdx s idx rest pointee
   | .deref :: _, .uninit | .deref :: _, .usize _ | .deref :: _, .bool _
@@ -299,25 +299,34 @@ theorem evalPlace_with_stmtIdx (localCount : Nat) (s : MirState) (idx : Nat)
     | some v => exact evalProj_with_stmtIdx s idx p.projection v
 
 theorem evalRefProj_with_stmtIdx (s : MirState) (idx : Nat) :
-    ∀ (frameId gen : Nat) (loc : LocalId) (proj : List PlaceElem) (v : MirVal),
-      evalRefProj { s with stmtIdx := idx } frameId gen loc proj v =
-        evalRefProj s frameId gen loc proj v
-  | _, _, _, [], _ => rfl
-  | _, _, _, .field _ :: _, _ => rfl
-  | _, _, _, .deref :: rest, .ref frameId' gen' loc' => by
+    ∀ (frameId gen : Nat) (loc : LocalId) (fieldDepth : Nat)
+      (proj : List PlaceElem) (v : MirVal),
+      evalRefProj { s with stmtIdx := idx } frameId gen loc fieldDepth proj v =
+        evalRefProj s frameId gen loc fieldDepth proj v
+  | _, _, _, _, [], _ => rfl
+  | frameId, gen, loc, fieldDepth, .field 0 :: rest, .adt _ inner =>
+    evalRefProj_with_stmtIdx s idx frameId gen loc (fieldDepth + 1) rest inner
+  | _, _, _, _, .field 0 :: _, .uninit | _, _, _, _, .field 0 :: _, .usize _
+  | _, _, _, _, .field 0 :: _, .bool _ | _, _, _, _, .field 0 :: _, .unit
+  | _, _, _, _, .field 0 :: _, .bytes _ _
+  | _, _, _, _, .field 0 :: _, .ref _ _ _ _ => rfl
+  | _, _, _, _, .field (_ + 1) :: _, _ => rfl
+  | _, _, _, _, .deref :: rest, .ref frameId' gen' loc' fieldDepth' => by
     dsimp [evalRefProj]
     rw [resolveRef_with_stmtIdx]
-    cases resolveRef s frameId' gen' loc' with
+    cases resolveRef s frameId' gen' loc' fieldDepth' with
     | none => rfl
     | some pointee =>
-      exact evalRefProj_with_stmtIdx s idx frameId' gen' loc' rest pointee
-  | _, _, _, .deref :: _, .uninit | _, _, _, .deref :: _, .usize _
-  | _, _, _, .deref :: _, .bool _ | _, _, _, .deref :: _, .unit
-  | _, _, _, .deref :: _, .adt _ _ | _, _, _, .deref :: _, .bytes _ _ => rfl
-  | _, _, _, .index _ :: _, _ | _, _, _, .constantIndex _ _ _ :: _, _
-  | _, _, _, .subslice _ _ _ :: _, _ | _, _, _, .downcast _ :: _, _
-  | _, _, _, .opaqueCast _ :: _, _
-  | _, _, _, .unwrapUnsafeBinder _ :: _, _ => rfl
+      exact evalRefProj_with_stmtIdx s idx frameId' gen' loc' fieldDepth'
+        rest pointee
+  | _, _, _, _, .deref :: _, .uninit | _, _, _, _, .deref :: _, .usize _
+  | _, _, _, _, .deref :: _, .bool _ | _, _, _, _, .deref :: _, .unit
+  | _, _, _, _, .deref :: _, .adt _ _ | _, _, _, _, .deref :: _, .bytes _ _ =>
+    rfl
+  | _, _, _, _, .index _ :: _, _ | _, _, _, _, .constantIndex _ _ _ :: _, _
+  | _, _, _, _, .subslice _ _ _ :: _, _ | _, _, _, _, .downcast _ :: _, _
+  | _, _, _, _, .opaqueCast _ :: _, _
+  | _, _, _, _, .unwrapUnsafeBinder _ :: _, _ => rfl
 
 theorem evalRefPlace_with_stmtIdx (localCount : Nat) (s : MirState)
     (idx : Nat) (p : Place) :
@@ -332,7 +341,7 @@ theorem evalRefPlace_with_stmtIdx (localCount : Nat) (s : MirState)
     | none => rfl
     | some v =>
       exact evalRefProj_with_stmtIdx s idx s.frameId (s.localGens p.loc.index)
-        p.loc p.projection v
+        p.loc 0 p.projection v
 
 theorem evalOperand_with_stmtIdx (localCount : Nat) (s : MirState) (idx : Nat)
     (op : Operand) :
@@ -682,8 +691,10 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
     exact fun h =>
       False.elim (not_normal_of_if_failed (fun h1 => by cases h1) h)
   | unreachable => intro h; cases h
-  | panic => intro h; cases h
-  | assert cond expected _ =>
+  | panic hasCleanup =>
+    dsimp [evalMirTerminator]
+    cases hasCleanup <;> (intro h; cases h)
+  | assert cond expected _ hasCleanup =>
     dsimp [evalMirTerminator]
     cases evalOperand b₁.localCount s cond with
     | none => intro h; cases h
@@ -694,7 +705,9 @@ theorem evalMirTerminator_with_stmtIdx_normal (adts : List AdtDecl)
         | bool bval =>
           dsimp
           cases bval == expected with
-          | false => intro h; cases h
+          | false =>
+            dsimp
+            cases hasCleanup <;> (intro h; cases h)
           | true =>
             dsimp
             exact fun h =>
@@ -777,8 +790,11 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
     have hg := gotoBlock_with_stmtIdx idx hs
     exact ⟨hg.1, hg.2.1, hg.2.2.1.trans hcur, hg.2.2.2.trans hstack⟩
   | unreachable => intro h; cases h
-  | panic => intro h; cases h
-  | assert cond expected target =>
+  | panic hasCleanup =>
+    dsimp [evalMirTerminator]
+    rw [hstack]
+    cases hasCleanup <;> (intro h; cases h)
+  | assert cond expected target hasCleanup =>
     dsimp [evalMirTerminator]
     rw [← hlc, ← hlen, evalOperand_with_stmtIdx b₁.localCount s idx cond]
     cases evalOperand b₁.localCount s cond with
@@ -790,7 +806,10 @@ theorem evalMirTerminator_with_stmtIdx_silent (adts : List AdtDecl)
         | bool bval =>
           dsimp
           cases bval == expected with
-          | false => intro h; cases h
+          | false =>
+            dsimp
+            rw [hstack]
+            cases hasCleanup <;> (intro h; cases h)
           | true =>
             dsimp
             intro h
@@ -1240,8 +1259,8 @@ theorem evalMirTerminator_eq_of_nocall (adts : List AdtDecl)
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | unreachable => rfl
-  | panic => rfl
-  | assert _ _ _ =>
+  | panic _ => rfl
+  | assert _ _ _ _ =>
     dsimp [evalMirTerminator, lowerBodyStep]
     rw [list_length_map]
   | switchInt _ _ _ =>

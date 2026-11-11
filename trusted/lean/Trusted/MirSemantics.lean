@@ -180,8 +180,9 @@ def Terminator.subst (typeArgs : List MirTy) :
   | .return_ => some .return_
   | .goto target => some (.goto target)
   | .unreachable => some .unreachable
-  | .panic => some .panic
-  | .assert cond expected target => some (.assert cond expected target)
+  | .panic hasCleanup => some (.panic hasCleanup)
+  | .assert cond expected target hasCleanup =>
+    some (.assert cond expected target hasCleanup)
   | .switchInt discr f t => some (.switchInt discr f t)
   | .callSizeOf dst ty target =>
     (ty.subst typeArgs).map fun ty' => .callSizeOf dst ty' target
@@ -335,31 +336,43 @@ def StaticBodyWf (adts : List AdtDecl) (body : MirBody) : Prop :=
 `.uninit` sub-value). -/
 def MirVal.isFullyInit : MirVal → Bool
   | .uninit => false
-  | .usize _ | .bool _ | .unit | .bytes _ _ | .ref _ _ _ => true
+  | .usize _ | .bool _ | .unit | .bytes _ _ | .ref _ _ _ _ => true
   | .adt _ inner => inner.isFullyInit
 
-/-- Resolve a shared reference `.ref targetFrameId gen loc` in state `s` using
-monotonic frame IDs (`s.frameId` and `frame.callerFrameId`) and generation
-counters (`r[undefined.validity.reference]`,
+/-- Peel `d` single-field `.adt` wrappers off `v` (`d > 0` corresponds to `d`
+`.field 0` projections from a borrowed local). -/
+def peelFields : Nat → MirVal → Option MirVal
+  | 0, v => some v
+  | d + 1, .adt _ inner => peelFields d inner
+  | _ + 1, _ => none
+
+/-- Resolve a shared reference `.ref targetFrameId gen loc fieldDepth` in state
+`s` using monotonic frame IDs (`s.frameId` and `frame.callerFrameId`),
+generation counters, and nested `.field 0` projection depth
+(`r[undefined.validity.reference]`,
 `src/behavior-considered-undefined.md#L120-L125`):
 > "A reference or `Box<T>` must be aligned and non-null, it cannot be dangling
 > (it must point to a valid allocation of at least the size of the pointee type
 > `T`), and it must point to a valid value of type `T`." -/
-def resolveRef (s : MirState) (targetFrameId gen : Nat) (loc : LocalId) :
-    Option MirVal :=
-  if targetFrameId == s.frameId then
-    if s.localGens loc.index == gen then
-      s.locals loc.index
-    else
-      none
-  else
-    match s.stack.find? (fun f => f.callerFrameId == targetFrameId) with
-    | some frame =>
-      if frame.callerLocalGens loc.index == gen then
-        frame.callerLocals loc.index
+def resolveRef (s : MirState) (targetFrameId gen : Nat) (loc : LocalId)
+    (fieldDepth : Nat := 0) : Option MirVal :=
+  let raw :=
+    if targetFrameId == s.frameId then
+      if s.localGens loc.index == gen then
+        s.locals loc.index
       else
         none
-    | none => none
+    else
+      match s.stack.find? (fun f => f.callerFrameId == targetFrameId) with
+      | some frame =>
+        if frame.callerLocalGens loc.index == gen then
+          frame.callerLocals loc.index
+        else
+          none
+      | none => none
+  match fieldDepth with
+  | 0 => raw
+  | d + 1 => raw.bind (peelFields (d + 1))
 
 /-- Whether every reference reachable from `v` (through struct payloads and up
 to four reference hops) survives `Terminator.return_` from the active frame of
@@ -380,12 +393,12 @@ def returnRefsStep (s : MirState) (localCount : Nat)
   | .uninit => false
   | .usize _ | .bool _ | .unit | .bytes _ _ => true
   | .adt _ inner => returnRefsStep s localCount follow inner
-  | .ref frameId gen loc =>
+  | .ref frameId gen loc fieldDepth =>
     !(if s.frameId == 0 then
         decide (0 < frameId) || decide (loc.index < localCount)
       else
         decide (s.frameId ≤ frameId)) &&
-    (resolveRef s frameId gen loc).any follow
+    (resolveRef s frameId gen loc fieldDepth).any follow
 
 def returnRefsFuel (s : MirState) (localCount : Nat) :
     Nat → MirVal → Bool
@@ -454,10 +467,10 @@ def validStep (adts : List AdtDecl) (adtInv : AdtInv)
   | .adt _, _ => False
   | .param idx, .bytes sz _ => sz = s.tySizes idx
   | .param _, _ => False
-  | .ref inner, .ref frameId gen loc =>
+  | .ref inner, .ref frameId gen loc fieldDepth =>
     frameId = 0 ∧
     callerBase ≤ loc.index ∧
-    match resolveRef s frameId gen loc with
+    match resolveRef s frameId gen loc fieldDepth with
     | some pointee =>
       validStep adts adtInv s callerBase unfold inner pointee
     | none => False
@@ -559,7 +572,7 @@ literals. Rejecting a constant makes the step undefined behavior, which fails
 closed. -/
 def MirVal.isConstScalar : MirVal → Bool
   | .usize _ | .bool _ | .unit => true
-  | .uninit | .adt _ _ | .bytes _ _ | .ref _ _ _ => false
+  | .uninit | .adt _ _ | .bytes _ _ | .ref _ _ _ _ => false
 
 /-- Follow a projection list from `v` in state `s`, requiring the resulting
 value to be fully initialized (`MirVal.isFullyInit`). -/
@@ -567,8 +580,8 @@ def evalProj (s : MirState) :
     List PlaceElem → MirVal → Option MirVal
   | [], v => if v.isFullyInit then some v else none
   | .field 0 :: rest, .adt _ inner => evalProj s rest inner
-  | .deref :: rest, .ref frameId gen loc =>
-    match resolveRef s frameId gen loc with
+  | .deref :: rest, .ref frameId gen loc fieldDepth =>
+    match resolveRef s frameId gen loc fieldDepth with
     | some pointee => evalProj s rest pointee
     | none => none
   | _, _ => none
@@ -616,15 +629,18 @@ def deinitPlace (localCount : Nat) (locals : Nat → Option MirVal)
   else
     none
 
-/-- Follow `.deref` projections to evaluate a shared borrow `&*...*p`
+/-- Follow `.field 0` and `.deref` projections to evaluate a shared borrow `&p`
 (`Rvalue.ref`), verifying that the final pointee is live and initialized. -/
-def evalRefProj (s : MirState) (frameId gen : Nat) (loc : LocalId) :
-    List PlaceElem → MirVal → Option MirVal
+def evalRefProj (s : MirState) (frameId gen : Nat) (loc : LocalId)
+    (fieldDepth : Nat := 0) : List PlaceElem → MirVal → Option MirVal
   | [], v =>
-    if v.isFullyInit then some (.ref frameId gen loc) else none
-  | .deref :: rest, .ref frameId' gen' loc' =>
-    match resolveRef s frameId' gen' loc' with
-    | some pointee => evalRefProj s frameId' gen' loc' rest pointee
+    if v.isFullyInit then some (.ref frameId gen loc fieldDepth) else none
+  | .field 0 :: rest, .adt _ inner =>
+    evalRefProj s frameId gen loc (fieldDepth + 1) rest inner
+  | .deref :: rest, .ref frameId' gen' loc' fieldDepth' =>
+    match resolveRef s frameId' gen' loc' fieldDepth' with
+    | some pointee =>
+      evalRefProj s frameId' gen' loc' fieldDepth' rest pointee
     | none => none
   | _, _ => none
 
@@ -635,7 +651,7 @@ def evalRefPlace (localCount : Nat) (s : MirState) (p : Place) :
   if p.loc.index < localCount then
     match s.locals p.loc.index with
     | some v =>
-      evalRefProj s s.frameId (s.localGens p.loc.index) p.loc p.projection v
+      evalRefProj s s.frameId (s.localGens p.loc.index) p.loc 0 p.projection v
     | none => none
   else
     none
@@ -781,7 +797,7 @@ def extractTransmuteBits (adts : List AdtDecl) :
   | .adt adtId inner =>
     (findAdtDecl adts adtId).bind fun decl =>
       decl.payloadTy.bind fun _ => extractTransmuteBits adts inner
-  | .uninit | .bytes _ _ | .ref _ _ _ => none
+  | .uninit | .bytes _ _ | .ref _ _ _ _ => none
 
 /-- Build the `transmute_copy` result of type `ty` from `dstSz` bytes holding
 `bits`, with at most `fuel` nested struct unfoldings. Fails (`none`) unless
@@ -829,9 +845,9 @@ def evalTransmuteCopy (adts : List AdtDecl) (s : MirState)
     (srcTy dstTy : MirTy) (argVal : MirVal) : Option MirVal :=
   match evalTyByteSize adts s.tySizes srcTy,
         evalTyByteSize adts s.tySizes dstTy, argVal with
-  | some srcSz, some dstSz, .ref depth gen target =>
+  | some srcSz, some dstSz, .ref frameId gen target fieldDepth =>
     if decide (srcSz = dstSz) then
-      match resolveRef s depth gen target with
+      match resolveRef s frameId gen target fieldDepth with
       | some pointee =>
         match extractTransmuteBits adts pointee with
         | some (vSz, bits) =>
@@ -899,9 +915,12 @@ def evalMirTerminator (adts : List AdtDecl)
       .failed
   | .unreachable =>
     .failed
-  | .panic =>
-    .terminated .unwind
-  | .assert cond expected target =>
+  | .panic hasCleanup =>
+    if hasCleanup || !s.stack.isEmpty then
+      .failed
+    else
+      .terminated .unwind
+  | .assert cond expected target hasCleanup =>
     match evalOperand activeBody.localCount s cond with
     | some (.bool b, locals') =>
       if b == expected then
@@ -909,6 +928,8 @@ def evalMirTerminator (adts : List AdtDecl)
           s.gotoBlock locals' target.index
         else
           .failed
+      else if hasCleanup || !s.stack.isEmpty then
+        .failed
       else
         .terminated .unwind
     | _ => .failed
