@@ -940,8 +940,10 @@ pub fn eval_lowered_terminator(
                 check_value_well_formed(&val, ptr_width).map_err(term_err)?;
                 arg_vals.push(val);
             }
+            // The destination place is evaluated before the call, exactly as the post-call
+            // `write_place` evaluates it (a final `Deref` may overwrite a leaf union field).
             state
-                .check_place_access(destination, dest_ty)
+                .check_place_write_access(destination, dest_ty)
                 .map_err(term_err)?;
             if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
                 return Err(term_err(RvalueEvalError::TypeMismatch(

@@ -5200,7 +5200,10 @@ pub fn eval_place_write(
         let slots: Vec<LocalSlotState> =
             locals.iter().cloned().map(LocalSlotState::Init).collect();
         let state = StatementEvalState::new(local_decls, slots, ptr_width);
-        let (target_local, target_proj, index_cache) = state.resolve_deref_place(place)?;
+        // A whole-place write through a final `Deref` resolves like `write_place` (it may
+        // overwrite an inactive leaf union field).
+        let (target_local, target_proj, index_cache) =
+            state.resolve_deref_place_with_mode(place, true)?;
         let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
         return write_projected_mir_value(
             &mut locals[target_local.0],
@@ -5468,7 +5471,12 @@ pub fn eval_lowered_rvalue(
         LoweredRvalue::Cast { cast, ty } => {
             let op = cast.operand();
             let v = eval_op(op)?;
-            let decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+            // Only `PointerWithExposedProvenance` consults the frame's (value-typed) layout.
+            let decls: Vec<Ty> = if matches!(cast, LoweredCast::IntToPtr { .. }) {
+                locals.iter().map(MirValue::ty).collect()
+            } else {
+                Vec::new()
+            };
             let out =
                 eval_lowered_cast_with_decls(cast, &v, &decls, None, ptr_width, policy, tracker)?;
             if !mir_value_matches_ty(&out, ty) {
@@ -6204,6 +6212,13 @@ impl StatementEvalState {
             .checked_add(byte_len)
             .is_none_or(|end| end > self.ptr_width.max_usize())
         {
+            // Only an exact size proves the wrap; an upper bound of an unspecified layout
+            // leaves it to the layout `rustc` picks (unsupported, never undefined).
+            if pointee_ty.layout_for(self.ptr_width).is_err() {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
             return Err(RvalueEvalError::PointerRangeOverflow {
                 addr: addr as u64,
                 byte_len,
@@ -6596,6 +6611,19 @@ impl StatementEvalState {
         self.prepare_place_access(place, place_ty).map(|_| ())
     }
 
+    /// [`Self::check_place_access`] for a place about to be written as a whole (a `Call`
+    /// destination): the place is evaluated exactly as [`Self::write_place`] evaluates it, so a
+    /// final `Deref` may designate an inactive leaf union field that the write overwrites
+    /// (switching the union's active field, as a direct `u.b = v` does).
+    pub fn check_place_write_access(
+        &self,
+        place: &Place,
+        place_ty: &Ty,
+    ) -> Result<(), RvalueEvalError> {
+        self.prepare_place_access_with_mode(place, place_ty, true)
+            .map(|_| ())
+    }
+
     /// Evaluates an operand in this state: `Copy` reads the place, `Move` reads it and (for a
     /// bare local) deinitializes it (see [`StatementEvalState::move_place`]), and `Constant`
     /// is validated and evaluated.
@@ -6617,6 +6645,18 @@ impl StatementEvalState {
         place: &Place,
         place_ty: &Ty,
     ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
+        self.prepare_place_access_with_mode(place, place_ty, false)
+    }
+
+    /// [`Self::prepare_place_access`], resolving a final `Deref` for a whole-place write when
+    /// `allow_final_union_overwrite` (see [`Self::resolve_synthetic_subplace_with_mode`]).
+    #[allow(clippy::type_complexity)]
+    fn prepare_place_access_with_mode(
+        &self,
+        place: &Place,
+        place_ty: &Ty,
+        allow_final_union_overwrite: bool,
+    ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
         if self.local_decls.get(place.local.0).is_none() {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         }
@@ -6626,7 +6666,8 @@ impl StatementEvalState {
                 "statement place_ty does not match declared place type",
             ));
         }
-        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        let (target_local, target_proj, index_cache) =
+            self.resolve_deref_place_with_mode(place, allow_final_union_overwrite)?;
         let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
@@ -6938,7 +6979,8 @@ impl StatementEvalState {
         write_res
     }
 
-    /// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `(target_local, target_proj)`.
+    /// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `(target_local, target_proj)`,
+    /// cloning only the selected sub-slot.
     fn read_subplace_slot(
         &self,
         target_local: Local,
@@ -6951,15 +6993,20 @@ impl StatementEvalState {
         let root_slot = match self.slots.get(target_local.0) {
             None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
             Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(target_local)),
-            Some(LocalSlotState::Uninit) => FieldSlot::Uninit,
-            Some(LocalSlotState::PartialShell(s)) => FieldSlot::Partial(s.clone()),
-            Some(LocalSlotState::Init(v)) => FieldSlot::Init(v.clone()),
+            Some(LocalSlotState::Uninit) => SlotRef::Uninit,
+            Some(LocalSlotState::PartialShell(s)) => SlotRef::Partial(s),
+            Some(LocalSlotState::Init(v)) => SlotRef::Init(v),
         };
-        read_slot_at_proj(&root_slot, base_decl_ty, target_proj, full_place, None)
+        read_slot_at_proj(root_slot, base_decl_ty, target_proj, full_place, None)
     }
 
     /// Writes `new_slot` (`Uninit`, `Partial`, or `Init`) into `(dst_local, dst_proj)` of type
     /// `expected_ty`.
+    ///
+    /// Array elements have no per-element `Uninit` / `PartialShell` slots (`c6d2ad74`): writing
+    /// an uninitialized slot into an element of an array that is itself uninitialized leaves it
+    /// unchanged, while any other non-`Init` element write fails closed with
+    /// `UninitializedLocal` (as an element write into an uninitialized array does).
     fn write_subplace_slot(
         &mut self,
         dst_local: Local,
@@ -6985,6 +7032,15 @@ impl StatementEvalState {
                     | ProjectionElem::Subslice { .. }
             )
         }) {
+            // Uninitialized bytes copied over uninitialized bytes: nothing changes.
+            if matches!(new_slot, FieldSlot::Uninit)
+                && matches!(
+                    self.read_subplace_slot(dst_local, dst_proj, full_place)?,
+                    FieldSlot::Uninit
+                )
+            {
+                return Ok(());
+            }
             if matches!(self.slots.get(dst_local.0), Some(LocalSlotState::Uninit)) {
                 return Err(RvalueEvalError::UninitializedLocal(dst_local));
             }
@@ -8626,7 +8682,8 @@ fn deinit_in_slot(
 }
 
 /// Context of a `Statement::Retag`: the target pointer width and the storage state of every
-/// local (whose synthetic allocations references may point into, see [`synthetic_local_ptr`]).
+/// local (whose synthetic allocations references may point into, see
+/// [`local_base_addr_for_decls`]).
 #[derive(Clone, Copy)]
 struct RetagCtx<'a> {
     ptr_width: PtrWidth,
@@ -8636,10 +8693,13 @@ struct RetagCtx<'a> {
 /// Validates the reference `ptr` of type `ref_ty` (`&pointee`) for `Statement::Retag`: its
 /// address must be a valid `&T` bit pattern (non-null and within the target's pointer width:
 /// `InvalidBitPattern`), aligned to the pointee's alignment (`MisalignedPointer`; an alignment
-/// the layout model leaves unspecified is `UnsupportedLayout`), and point to an inhabited type
-/// (`UninhabitedPointee`). A reference to the synthetic allocation of a local whose storage is
-/// dead dangles (`DeadLocal`), unless its pointee is zero-sized (a zero-sized retag accesses no
-/// memory).
+/// the layout model leaves unspecified is `UnsupportedLayout`), point to an inhabited type
+/// (`UninhabitedPointee`), and its pointee range `[addr, addr + size)` must not wrap the
+/// address space (`PointerRangeOverflow` under an exact layout; when only an upper bound of an
+/// unspecified layout wraps, the verdict depends on `rustc`'s layout and the retag is
+/// `UnsupportedMemoryAccess`). A reference into the synthetic allocation of a local whose
+/// storage is dead (at its base or any sub-place offset) dangles (`DeadLocal`), unless its
+/// pointee is zero-sized (a zero-sized retag accesses no memory).
 fn check_retagged_reference(
     ptr: &PointerValue,
     ref_ty: &Ty,
@@ -8679,6 +8739,13 @@ fn check_retagged_reference(
             .checked_add(byte_len)
             .is_none_or(|end| end > ptr_width.max_usize())
         {
+            // Only an exact size proves the wrap: an upper bound of an unspecified layout
+            // (e.g. a 2-byte tagged bound of a 1-byte niche enum) leaves it to `rustc`.
+            if pointee.layout_for(ptr_width).is_err() {
+                return Err(RvalueEvalError::UnsupportedMemoryAccess(
+                    "retagged reference range may wrap the address space under an unspecified pointee layout",
+                ));
+            }
             return Err(RvalueEvalError::PointerRangeOverflow {
                 addr: addr as u64,
                 byte_len,
@@ -9081,16 +9148,16 @@ fn collect_subplace_paths_rec(
                         }
                     }
                 } else if rel == 0 {
-                    let max_start = (*len - *sub_len).min(MAX_EVAL_ARRAY_LEN);
-                    for start in 0..=max_start {
-                        cur_path.push(ProjectionElem::Subslice {
-                            from: start as u64,
-                            to: (start + *sub_len) as u64,
-                            from_end: false,
-                        });
-                        out.push(cur_path.clone());
-                        cur_path.pop();
-                    }
+                    // Zero-sized elements: every window `[start..start + sub_len]` holds equal
+                    // values in the same (per-array) state, so only `start == 0` is a candidate
+                    // (see the element case below).
+                    cur_path.push(ProjectionElem::Subslice {
+                        from: 0,
+                        to: *sub_len as u64,
+                        from_end: false,
+                    });
+                    out.push(cur_path.clone());
+                    cur_path.pop();
                 }
             }
             if *len == 0 {
@@ -9125,24 +9192,27 @@ fn collect_subplace_paths_rec(
                     cur_path.pop();
                 }
             } else if rel == 0 {
-                let limit = (*len).min(MAX_EVAL_ARRAY_LEN);
-                for idx in 0..limit {
-                    cur_path.push(ProjectionElem::ConstantIndex {
-                        offset: idx as u64,
-                        min_length: *len as u64,
-                        from_end: false,
-                    });
-                    collect_subplace_paths_rec(
-                        elem_ty,
-                        cur_off,
-                        target_off,
-                        target_ty,
-                        ptr_width,
-                        cur_path,
-                        out,
-                    );
-                    cur_path.pop();
-                }
+                // Zero-sized elements all sit at offset 0. Arrays have no per-element
+                // initialization state and all values of a zero-sized type are equal, so every
+                // element designates an equivalent sub-place: only element 0 is enumerated
+                // (canonical, see `compute_subplace_offset_and_tag`), which also keeps the
+                // enumeration bounded for huge or nested zero-sized arrays
+                // (`[[(); 1 << 20]; 1 << 20]`).
+                cur_path.push(ProjectionElem::ConstantIndex {
+                    offset: 0,
+                    min_length: *len as u64,
+                    from_end: false,
+                });
+                collect_subplace_paths_rec(
+                    elem_ty,
+                    cur_off,
+                    target_off,
+                    target_ty,
+                    ptr_width,
+                    cur_path,
+                    out,
+                );
+                cur_path.pop();
             }
         }
         Ty::Adt(def) => {
@@ -9318,6 +9388,8 @@ fn compute_subplace_offset_and_tag(
                 total_off = total_off
                     .checked_add(step_off)
                     .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                // Zero-sized elements are canonically element 0 (see `collect_subplace_paths`).
+                let i_canon = if elem_size == 0 { 0 } else { i };
                 if let (
                     Some(orig_len),
                     Some(ProjectionElem::Subslice {
@@ -9329,13 +9401,13 @@ fn compute_subplace_offset_and_tag(
                 {
                     canonical_proj.pop();
                     canonical_proj.push(ProjectionElem::ConstantIndex {
-                        offset: s_from + i as u64,
+                        offset: s_from + i_canon as u64,
                         min_length: orig_len as u64,
                         from_end: false,
                     });
                 } else {
                     canonical_proj.push(ProjectionElem::ConstantIndex {
-                        offset: i as u64,
+                        offset: i_canon as u64,
                         min_length: *len as u64,
                         from_end: false,
                     });
@@ -9368,6 +9440,8 @@ fn compute_subplace_offset_and_tag(
                 total_off = total_off
                     .checked_add(step_off)
                     .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                // Zero-sized elements are canonically element 0 (see `collect_subplace_paths`).
+                let i_canon = if elem_size == 0 { 0 } else { i };
                 if let (
                     Some(orig_len),
                     Some(ProjectionElem::Subslice {
@@ -9379,13 +9453,13 @@ fn compute_subplace_offset_and_tag(
                 {
                     canonical_proj.pop();
                     canonical_proj.push(ProjectionElem::ConstantIndex {
-                        offset: s_from + i as u64,
+                        offset: s_from + i_canon as u64,
                         min_length: orig_len as u64,
                         from_end: false,
                     });
                 } else {
                     canonical_proj.push(ProjectionElem::ConstantIndex {
-                        offset: i as u64,
+                        offset: i_canon as u64,
                         min_length: *len as u64,
                         from_end: false,
                     });
@@ -9419,6 +9493,8 @@ fn compute_subplace_offset_and_tag(
                     .checked_add(step_off)
                     .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
                 let sub_len = end - start;
+                // Zero-sized windows canonically start at element 0 (see `collect_subplace_paths`).
+                let (start, end) = if elem_size == 0 { (0, sub_len) } else { (start, end) };
                 if let (
                     Some(orig_len),
                     Some(ProjectionElem::Subslice {
@@ -9574,9 +9650,37 @@ fn value_union_path_active(
     }
 }
 
-/// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `proj` inside `slot`.
+/// Borrowed view of a slot (a local's root `LocalSlotState` or a nested [`FieldSlot`]) for
+/// [`read_slot_at_proj`], so reading a sub-slot clones only the selected part of the local.
+#[derive(Clone, Copy)]
+enum SlotRef<'a> {
+    Uninit,
+    Partial(&'a PartialAggregate),
+    Init(&'a MirValue),
+}
+
+impl<'a> SlotRef<'a> {
+    fn of_field(slot: &'a FieldSlot) -> Self {
+        match slot {
+            FieldSlot::Uninit => SlotRef::Uninit,
+            FieldSlot::Partial(shell) => SlotRef::Partial(shell),
+            FieldSlot::Init(val) => SlotRef::Init(val),
+        }
+    }
+
+    fn to_field_slot(self) -> FieldSlot {
+        match self {
+            SlotRef::Uninit => FieldSlot::Uninit,
+            SlotRef::Partial(shell) => FieldSlot::Partial(shell.clone()),
+            SlotRef::Init(val) => FieldSlot::Init(val.clone()),
+        }
+    }
+}
+
+/// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `proj` inside `slot`, cloning
+/// only the selected sub-slot (`O(proj.len())` traversal).
 fn read_slot_at_proj(
-    slot: &FieldSlot,
+    slot: SlotRef<'_>,
     declared_ty: &Ty,
     proj: &[ProjectionElem],
     full_place: &Place,
@@ -9591,10 +9695,10 @@ fn read_slot_at_proj(
                 "Downcast projection must be followed by Field",
             ));
         }
-        return Ok(slot.clone());
+        return Ok(slot.to_field_slot());
     };
     match slot {
-        FieldSlot::Uninit => {
+        SlotRef::Uninit => {
             validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
                 declared_ty,
                 proj,
@@ -9605,7 +9709,7 @@ fn read_slot_at_proj(
             )?;
             Ok(FieldSlot::Uninit)
         }
-        FieldSlot::Init(val) => {
+        SlotRef::Init(val) => {
             let (projected, _) = project_mir_value(
                 val,
                 Some(declared_ty),
@@ -9623,7 +9727,7 @@ fn read_slot_at_proj(
             };
             Ok(FieldSlot::Init(sub_val))
         }
-        FieldSlot::Partial(shell) => {
+        SlotRef::Partial(shell) => {
             if !shell_matches_declared_ty(shell, declared_ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "partial shell does not match declared type",
@@ -9691,7 +9795,13 @@ fn read_slot_at_proj(
                             field_count: shell.fields.len(),
                         });
                     };
-                    read_slot_at_proj(child_slot, &field_tys[*idx], rest, full_place, None)
+                    read_slot_at_proj(
+                        SlotRef::of_field(child_slot),
+                        &field_tys[*idx],
+                        rest,
+                        full_place,
+                        None,
+                    )
                 }
                 ProjectionElem::Index(_)
                 | ProjectionElem::ConstantIndex { .. }
@@ -10043,7 +10153,15 @@ fn eval_copy_nonoverlapping(
         }
     }
 
-    // `count > 1`: contiguous array-element window copy.
+    // `count > 1`: contiguous array-element window copy. As for `count == 1`, a resolution
+    // fault other than an unresolvable place is reported as is.
+    for resolved in [&src_resolved, &dst_resolved] {
+        if let Err(err) = resolved
+            && !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_))
+        {
+            return Err(err.clone());
+        }
+    }
     if let (
         Ok((src_local, src_elem_proj)),
         Ok((dst_local, dst_elem_proj)),
@@ -10087,7 +10205,40 @@ fn eval_copy_nonoverlapping(
             local: src_local,
             projection: src_slice_proj,
         };
-        let slice_val = state.read_place(&src_slice_place)?;
+        let slice_val = match state.read_place(&src_slice_place) {
+            Ok(val) => val,
+            // Arrays have no per-element state, so an uninitialized source window means the
+            // whole source array is uninitialized. Copying uninitialized bytes over an
+            // uninitialized destination array changes nothing, and over a whole destination
+            // array deinitializes it; a partially overwritten initialized array would hold
+            // uninitialized elements, which fails closed (`c6d2ad74`).
+            Err(RvalueEvalError::UninitializedLocal(_))
+                if matches!(
+                    state.read_subplace_slot(src_local, src_arr_proj, &dummy_place)?,
+                    FieldSlot::Uninit
+                ) =>
+            {
+                if matches!(
+                    state.read_subplace_slot(dst_local, dst_arr_proj, &dummy_place)?,
+                    FieldSlot::Uninit
+                ) {
+                    return Ok(());
+                }
+                if *dst_start == 0 && count_usize == dst_len_usize {
+                    let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+                    return state.write_subplace_slot(
+                        dst_local,
+                        dst_arr_proj,
+                        &arr_ty,
+                        FieldSlot::Uninit,
+                        src_local,
+                        &dummy_place,
+                    );
+                }
+                return Err(RvalueEvalError::UninitializedLocal(src_local));
+            }
+            Err(err) => return Err(err),
+        };
         if *dst_start == 0 && count_usize == dst_len_usize {
             let dst_arr_place = Place {
                 local: dst_local,
