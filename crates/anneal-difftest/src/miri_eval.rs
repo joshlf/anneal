@@ -394,14 +394,189 @@ const STD_PANIC_MACRO_NAMES: [&str; 12] = [
     "unimplemented",
 ];
 
-/// Staged `src/lib.rs` text indexed by the line range of each top-level `fn`
-/// item and the 1-based `(line, col)` start coordinates of every standard
-/// panic or assertion macro invocation, used by
+/// Relative `DefPath` segment of a lexical callable scope inside a staged
+/// `src/lib.rs` function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeSegment {
+    /// Named Rust item segment (`fn` or inline `mod`).
+    Named(String),
+    /// Closure body (`{closure}` / `{closure#N}` in rustc `DefPath`s).
+    Closure,
+    /// Nested item or block that introduces a separate callable/const body
+    /// (`impl`, `trait`, `const`, `static`, `async`, or `const` block) whose
+    /// `DefPath` is not reconciled here.
+    Opaque,
+}
+
+/// Half-open 1-based `(line, col)` source interval `[start, end_excl)` of a
+/// callable body (`fn`, nested `fn`, closure, or opaque body) and its relative
+/// `DefPath` segments from the crate root.
+#[derive(Debug, Clone)]
+struct LexicalScope {
+    start: (usize, usize),
+    end_excl: (usize, usize),
+    segments: Vec<ScopeSegment>,
+}
+
+fn node_span_bounds<T: quote::ToTokens>(node: &T) -> Option<((usize, usize), (usize, usize))> {
+    let mut ts = proc_macro2::TokenStream::new();
+    node.to_tokens(&mut ts);
+    let mut iter = ts.into_iter();
+    let first = iter.next()?;
+    let start = first.span().start();
+    let last = iter.last().unwrap_or(first);
+    let end = match &last {
+        proc_macro2::TokenTree::Group(g) => g.span_close().end(),
+        other => other.span().end(),
+    };
+    Some(((start.line, start.column + 1), (end.line, end.column + 1)))
+}
+
+struct ScopeVisitor {
+    stack: Vec<ScopeSegment>,
+    scopes: Vec<LexicalScope>,
+}
+
+impl ScopeVisitor {
+    fn with_segment<T: quote::ToTokens>(
+        &mut self,
+        node: &T,
+        seg: ScopeSegment,
+        inner: impl FnOnce(&mut Self),
+    ) {
+        self.stack.push(seg);
+        if let Some((start, end_excl)) = node_span_bounds(node) {
+            self.scopes.push(LexicalScope {
+                start,
+                end_excl,
+                segments: self.stack.clone(),
+            });
+        }
+        inner(self);
+        self.stack.pop();
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ScopeVisitor {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        match item {
+            syn::Item::Fn(inner_fn) => {
+                let seg = ScopeSegment::Named(inner_fn.sig.ident.to_string());
+                self.with_segment(inner_fn, seg, |v| {
+                    syn::visit::visit_block(v, &inner_fn.block);
+                });
+            }
+            syn::Item::Mod(inner_mod) => {
+                if let Some((_, items)) = &inner_mod.content {
+                    let seg = ScopeSegment::Named(inner_mod.ident.to_string());
+                    self.with_segment(inner_mod, seg, |v| {
+                        for it in items {
+                            syn::visit::visit_item(v, it);
+                        }
+                    });
+                }
+            }
+            syn::Item::Impl(_)
+            | syn::Item::Trait(_)
+            | syn::Item::Const(_)
+            | syn::Item::Static(_) => {
+                self.with_segment(item, ScopeSegment::Opaque, |v| {
+                    syn::visit::visit_item(v, item);
+                });
+            }
+            _ => syn::visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        match expr {
+            syn::Expr::Closure(closure) => {
+                self.with_segment(closure, ScopeSegment::Closure, |v| {
+                    syn::visit::visit_expr(v, &closure.body);
+                });
+            }
+            syn::Expr::Async(async_expr) => {
+                self.with_segment(async_expr, ScopeSegment::Opaque, |v| {
+                    syn::visit::visit_block(v, &async_expr.block);
+                });
+            }
+            syn::Expr::Const(const_expr) => {
+                self.with_segment(const_expr, ScopeSegment::Opaque, |v| {
+                    syn::visit::visit_block(v, &const_expr.block);
+                });
+            }
+            _ => syn::visit::visit_expr(self, expr),
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        use syn::parse::Parser;
+        if let Ok(exprs) =
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(mac.tokens.clone())
+        {
+            for expr in &exprs {
+                self.visit_expr(expr);
+            }
+        } else if let Ok(stmts) = syn::Block::parse_within.parse2(mac.tokens.clone()) {
+            for stmt in &stmts {
+                syn::visit::visit_stmt(self, stmt);
+            }
+        }
+    }
+}
+
+fn is_user_crate_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && !matches!(seg, "core" | "std" | "alloc")
+        && !seg.starts_with(|c: char| c.is_ascii_digit())
+        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_closure_def_path_segment(seg: &str) -> bool {
+    if seg == "{closure}" {
+        return true;
+    }
+    let Some(num) = seg.strip_prefix("{closure#").and_then(|s| s.strip_suffix('}')) else {
+        return false;
+    };
+    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
+}
+
+fn frame_matches_scope(frame: &str, scope_segments: &[ScopeSegment]) -> bool {
+    if scope_segments.is_empty() || scope_segments.contains(&ScopeSegment::Opaque) {
+        return false;
+    }
+    let parts: Vec<&str> = frame.split("::").collect();
+    if parts.len() <= scope_segments.len() || !is_user_crate_segment(parts[0]) {
+        return false;
+    }
+    for (seg, expected) in parts[1..=scope_segments.len()].iter().zip(scope_segments) {
+        let ok = match expected {
+            ScopeSegment::Named(name) => *seg == name,
+            ScopeSegment::Closure => is_closure_def_path_segment(seg),
+            ScopeSegment::Opaque => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    match &parts[1 + scope_segments.len()..] {
+        [] => true,
+        [shim] => shim.starts_with("panic_cold_"),
+        _ => false,
+    }
+}
+
+/// Staged `src/lib.rs` text indexed by the line range and nested callable
+/// scopes of each top-level `fn` item, plus the 1-based `(line, col)` start
+/// coordinates of every standard panic or assertion macro invocation, used by
 /// [`compare_difftest_miri_and_anneal`] to decide whether Miri's panic position
-/// is a panic-macro call site inside the evaluated function.
+/// is a panic-macro call site in the same callable frame as Anneal's panic.
 #[derive(Debug, Clone, Default)]
 pub struct StagedLibSource {
     fn_lines: BTreeMap<String, (usize, usize)>,
+    fn_scopes: BTreeMap<String, Vec<LexicalScope>>,
     panic_macro_starts: BTreeSet<(usize, usize)>,
 }
 
@@ -518,29 +693,35 @@ impl StagedLibSource {
     /// it is reconciled.
     pub fn parse(lib_rs: &str) -> Self {
         let mut panic_macro_starts = BTreeSet::new();
-        let fn_lines = match syn::parse_file(lib_rs) {
-            Ok(file) => {
-                if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
-                    collect_panic_macro_starts(ts, &mut panic_macro_starts);
-                }
-                file.items
-                    .iter()
-                    .filter_map(|item| match item {
-                        syn::Item::Fn(func) => Some((
-                            func.sig.ident.to_string(),
-                            (
-                                func.sig.fn_token.span.start().line,
-                                func.block.brace_token.span.close().end().line,
-                            ),
-                        )),
-                        _ => None,
-                    })
-                    .collect()
+        let mut fn_lines = BTreeMap::new();
+        let mut fn_scopes = BTreeMap::new();
+        if let Ok(file) = syn::parse_file(lib_rs) {
+            if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
+                collect_panic_macro_starts(ts, &mut panic_macro_starts);
             }
-            Err(_) => BTreeMap::new(),
-        };
+            for item in &file.items {
+                if let syn::Item::Fn(func) = item {
+                    let name = func.sig.ident.to_string();
+                    let first = func.sig.fn_token.span.start().line;
+                    let last = func.block.brace_token.span.close().end().line;
+                    fn_lines.insert(name.clone(), (first, last));
+
+                    let mut visitor = ScopeVisitor {
+                        stack: vec![ScopeSegment::Named(name.clone())],
+                        scopes: vec![LexicalScope {
+                            start: (first, 1),
+                            end_excl: (last + 1, 1),
+                            segments: vec![ScopeSegment::Named(name.clone())],
+                        }],
+                    };
+                    syn::visit::visit_block(&mut visitor, &func.block);
+                    fn_scopes.insert(name, visitor.scopes);
+                }
+            }
+        }
         Self {
             fn_lines,
+            fn_scopes,
             panic_macro_starts,
         }
     }
@@ -553,8 +734,15 @@ impl StagedLibSource {
 
     /// Return `true` when `pos` lies in the staged `src/lib.rs`, within the
     /// line range of `fn_name`, at the first token of an invocation of one of
-    /// [`STD_PANIC_MACRO_NAMES`].
-    fn is_panic_macro_call_site(&self, fn_name: &str, pos: &SourcePos) -> bool {
+    /// [`STD_PANIC_MACRO_NAMES`], and `frame` names the innermost callable body
+    /// (`fn`, nested `fn`, or closure) enclosing `pos` (or a compiler-generated
+    /// `panic_cold_*` shim inside that body).
+    fn is_panic_macro_call_site_in_frame(
+        &self,
+        fn_name: &str,
+        pos: &SourcePos,
+        frame: Option<&str>,
+    ) -> bool {
         let file = pos.file.replace('\\', "/");
         if file.strip_prefix("./").unwrap_or(&file) != "src/lib.rs" {
             return false;
@@ -563,7 +751,22 @@ impl StagedLibSource {
             return false;
         };
         let (line, col) = (pos.line as usize, pos.col as usize);
-        line >= first && line <= last && self.panic_macro_starts.contains(&(line, col))
+        if line < first || line > last || !self.panic_macro_starts.contains(&(line, col)) {
+            return false;
+        }
+        let Some(frame) = frame else {
+            return false;
+        };
+        let Some(scopes) = self.fn_scopes.get(fn_name) else {
+            return false;
+        };
+        let Some(innermost) = scopes
+            .iter()
+            .rfind(|s| (line, col) >= s.start && (line, col) < s.end_excl)
+        else {
+            return false;
+        };
+        frame_matches_scope(frame, &innermost.segments)
     }
 }
 
@@ -619,12 +822,14 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 ///    the first line of that message equals the message that Miri reports,
 ///    both trimmed. Miri's oracle output carries only the first line of the
 ///    message that follows `panicked at <position>:`.
-/// 5. Anneal's panic began in `fn_name` itself or in an item nested in it:
-///    `anneal_panic_frame`, the `DefPath` of the body executing the step that
-///    started unwinding, is `<crate>::<fn_name>` or `<crate>::<fn_name>::...`.
-///    Condition 3 places Miri's panic in the same function, so a run in which
-///    Anneal panics inside a different function (for example, a helper whose
-///    `panic!` carries the same message) does not reconcile.
+/// 5. Anneal's panic began in the same callable body that encloses Miri's
+///    panic position: `anneal_panic_frame`, the `DefPath` of the body executing
+///    the step that started unwinding, matches the innermost user callable
+///    (`fn_name`, a nested `fn`, or a closure) enclosing `miri_pos` in a user
+///    crate (or a compiler-synthesized `panic_cold_*` shim inside that body).
+///    A run in which Anneal panics inside a different function—including a
+///    nested `fn` or closure inside `fn_name` when Miri panicked in the outer
+///    body, or vice versa—does not reconcile.
 ///
 /// Anneal recovers the message of a panic raised by
 /// `core::panicking::{panic,panic_str_2015}`, by
@@ -648,8 +853,8 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 /// definition, so conditions 2 and 3 cannot tell two panic-macro call sites in
 /// the same function apart. Condition 4 tells them apart when they panic with
 /// different recovered messages. If Anneal panics at a different call site in
-/// the same function than Miri does but with the same message, or without a
-/// recovered message, the outcome still reconciles to `Agree`.
+/// the same callable body than Miri does but with the same message, or without
+/// a recovered message, the outcome still reconciles to `Agree`.
 pub fn compare_difftest_miri_and_anneal(
     miri: &MiriOutcome,
     anneal: &AnnealOutcome,
@@ -676,13 +881,9 @@ pub fn compare_difftest_miri_and_anneal(
     };
     let messages_match = anneal_panic_message
         .is_none_or(|message| message.lines().next().unwrap_or("").trim() == miri_message.trim());
-    // `DefPath`s have the form `<crate>::<item>[::<nested item>...]`.
-    let panicked_in_fn =
-        anneal_panic_frame.is_some_and(|frame| frame.split("::").nth(1) == Some(fn_name));
     if messages_match
-        && panicked_in_fn
         && is_std_panic_macro_file(&anneal_span.file)
-        && lib_src.is_panic_macro_call_site(fn_name, miri_pos)
+        && lib_src.is_panic_macro_call_site_in_frame(fn_name, miri_pos, anneal_panic_frame)
     {
         ComparisonVerdict::Agree
     } else {
@@ -701,10 +902,14 @@ const ANNEAL_PANIC_FRAME_PREFIX: &str = "ANNEAL_PANIC_FRAME\t";
 fn parse_anneal_panic_frames(stdout: &str) -> Result<BTreeMap<String, String>, String> {
     let mut frames = BTreeMap::new();
     for raw_line in stdout.lines() {
-        let Some(rest) = raw_line.trim().strip_prefix(ANNEAL_PANIC_FRAME_PREFIX) else {
+        let line = raw_line.trim_end_matches('\r');
+        let malformed = || format!("malformed ANNEAL_PANIC_FRAME line: '{raw_line}'");
+        if line.trim() == "ANNEAL_PANIC_FRAME" {
+            return Err(malformed());
+        }
+        let Some(rest) = line.trim_start().strip_prefix(ANNEAL_PANIC_FRAME_PREFIX) else {
             continue;
         };
-        let malformed = || format!("malformed ANNEAL_PANIC_FRAME line: '{raw_line}'");
         let (name, frame) = rest.split_once('\t').ok_or_else(malformed)?;
         let (name, frame) = (name.trim(), frame.trim());
         if name.is_empty() || frame.is_empty() {
@@ -729,11 +934,19 @@ const ANNEAL_PANIC_MESSAGE_PREFIX: &str = "ANNEAL_PANIC_MESSAGE\t";
 fn parse_anneal_panic_messages(stdout: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut messages = BTreeMap::new();
     for raw_line in stdout.lines() {
-        let Some(rest) = raw_line.trim().strip_prefix(ANNEAL_PANIC_MESSAGE_PREFIX) else {
+        let line = raw_line.trim_end_matches('\r');
+        let malformed = || format!("malformed ANNEAL_PANIC_MESSAGE line: '{raw_line}'");
+        if line.trim() == "ANNEAL_PANIC_MESSAGE" {
+            return Err(malformed());
+        }
+        let Some(rest) = line.trim_start().strip_prefix(ANNEAL_PANIC_MESSAGE_PREFIX) else {
             continue;
         };
-        let malformed = || format!("malformed ANNEAL_PANIC_MESSAGE line: '{raw_line}'");
         let (name, list) = rest.split_once('\t').ok_or_else(malformed)?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(malformed());
+        }
         let elems = list
             .trim()
             .strip_prefix('[')
@@ -748,11 +961,8 @@ fn parse_anneal_panic_messages(stdout: &str) -> Result<BTreeMap<String, Vec<u8>>
                 .collect::<Result<Vec<u8>, _>>()
                 .map_err(|_| malformed())?
         };
-        if messages.insert(name.trim().to_string(), bytes).is_some() {
-            return Err(format!(
-                "duplicate ANNEAL_PANIC_MESSAGE line for '{}'",
-                name.trim()
-            ));
+        if messages.insert(name.to_string(), bytes).is_some() {
+            return Err(format!("duplicate ANNEAL_PANIC_MESSAGE line for '{name}'"));
         }
     }
     Ok(messages)
@@ -2731,14 +2941,15 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
 
     if !report.reconciled_panic_sites.is_empty() {
         out.push_str("\n## Reconciled Panic-Macro Sites\n\n");
-        out.push_str("| Function | Miri Position | Anneal Span | Anneal Panic Message | Kernel Confirmed |\n");
-        out.push_str("| :--- | :--- | :--- | :--- | :--- |\n");
+        out.push_str("| Function | Miri Position | Anneal Span | Anneal Frame | Anneal Panic Message | Kernel Confirmed |\n");
+        out.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
         for site in &report.reconciled_panic_sites {
             out.push_str(&format!(
-                "| `{}` | `{}` | `{}` | {} | `{}` |\n",
+                "| `{}` | `{}` | `{}` | `{}` | {} | `{}` |\n",
                 site.fn_name,
                 site.batch_miri_pos.as_deref().unwrap_or("none"),
                 site.anneal_span.as_deref().unwrap_or("none"),
+                site.anneal_panic_frame.as_deref().unwrap_or("none"),
                 site.anneal_panic_message
                     .as_deref()
                     .map(|m| format!("{m:?}").replace('`', "'").replace('|', "\\|"))
@@ -3086,6 +3297,9 @@ ANNEAL_PANIC_MESSAGE\tcand_c\t[]\r\n";
             ])
         );
         for bad in [
+            "ANNEAL_PANIC_MESSAGE\n",
+            "ANNEAL_PANIC_MESSAGE\t\n",
+            "ANNEAL_PANIC_MESSAGE\t\t[104]\n",
             "ANNEAL_PANIC_MESSAGE\tcand_a\n",
             "ANNEAL_PANIC_MESSAGE\tcand_a\t104, 105\n",
             "ANNEAL_PANIC_MESSAGE\tcand_a\t[104, 256]\n",
@@ -3487,22 +3701,27 @@ pub fn cand_paths__b0_c1() {
         let verdict = |frame: Option<&str>| {
             compare_difftest_miri_and_anneal(&miri, &anneal, None, frame, &src, "cand_panic__b0_c0")
         };
-        // Anneal's panic began in the candidate or in an item nested in it, such
-        // as a closure or the `panic_cold_display` function that `panic!("{}",
-        // x)` defines.
+        // Line 3 is directly in `cand_panic__b0_c0` (not inside a closure or
+        // nested `fn`), so only `cand_panic__b0_c0` itself and its compiler
+        // `panic_cold_*` formatting shim reconcile.
         for frame in [
             "miri_diff_corpus::cand_panic__b0_c0",
-            "miri_diff_corpus::cand_panic__b0_c0::{closure#0}",
             "miri_diff_corpus::cand_panic__b0_c0::panic_cold_display",
         ] {
             assert_eq!(verdict(Some(frame)), ComparisonVerdict::Agree, "{frame}");
         }
-        // A panic that began in another function (even one whose name extends
-        // the candidate's) or in an unknown frame is a different panic than
+        // A panic that began in another function—including a nested `fn` or
+        // closure inside the candidate when Miri panicked in the outer body—or
+        // in a stdlib/empty crate or unknown frame is a different panic than
         // Miri's, whatever its message.
         for frame in [
             Some("miri_diff_corpus::helper_panics"),
             Some("miri_diff_corpus::cand_panic__b0_c0_helper"),
+            Some("miri_diff_corpus::cand_panic__b0_c0::{closure#0}"),
+            Some("miri_diff_corpus::cand_panic__b0_c0::inner_helper"),
+            Some("::cand_panic__b0_c0"),
+            Some("core::cand_panic__b0_c0"),
+            Some("std::cand_panic__b0_c0"),
             Some("cand_panic__b0_c0"),
             Some(""),
             None,
@@ -3515,6 +3734,74 @@ pub fn cand_paths__b0_c1() {
                 "{frame:?}"
             );
         }
+
+        // Nested `fn`s and closures reconcile only when `miri_pos` lies inside
+        // that exact nested callable scope, never cross-matching with the outer
+        // body or a sibling nested callable.
+        let nested_src = StagedLibSource::parse(
+            "\
+#![no_std]
+pub fn cand_nested__b0_c0() {
+    fn inner() {
+        panic!(\"same\");
+    }
+    let f = || {
+        panic!(\"same\");
+    };
+    let _ = (inner, f);
+    panic!(\"same\");
+}
+",
+        );
+        let at = |line: u32, col: u32, frame: &str| {
+            compare_difftest_miri_and_anneal(
+                &panic_at(line, col),
+                &anneal,
+                None,
+                Some(frame),
+                &nested_src,
+                "cand_nested__b0_c0",
+            )
+        };
+        let outer_frame = "miri_diff_corpus::cand_nested__b0_c0";
+        let inner_frame = "miri_diff_corpus::cand_nested__b0_c0::inner";
+        let closure_frame = "miri_diff_corpus::cand_nested__b0_c0::{closure#0}";
+        let closure_cold_frame =
+            "miri_diff_corpus::cand_nested__b0_c0::{closure#0}::panic_cold_display";
+
+        // Line 4 col 9 is inside `fn inner()`.
+        assert_eq!(at(4, 9, inner_frame), ComparisonVerdict::Agree);
+        assert!(matches!(
+            at(4, 9, outer_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            at(4, 9, closure_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+
+        // Line 7 col 9 is inside `let f = || { ... }`.
+        assert_eq!(at(7, 9, closure_frame), ComparisonVerdict::Agree);
+        assert_eq!(at(7, 9, closure_cold_frame), ComparisonVerdict::Agree);
+        assert!(matches!(
+            at(7, 9, outer_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            at(7, 9, inner_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+
+        // Line 10 col 5 is in the outer `cand_nested__b0_c0` body.
+        assert_eq!(at(10, 5, outer_frame), ComparisonVerdict::Agree);
+        assert!(matches!(
+            at(10, 5, inner_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            at(10, 5, closure_frame),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
     }
 
     #[test]
@@ -3533,6 +3820,8 @@ ANNEAL_PANIC_FRAME\tcand_c\tmiri_diff_corpus::helper\r\n";
             ])
         );
         for bad in [
+            "ANNEAL_PANIC_FRAME\n",
+            "ANNEAL_PANIC_FRAME\t\n",
             "ANNEAL_PANIC_FRAME\tcand_a\n",
             "ANNEAL_PANIC_FRAME\tcand_a\t \n",
             "ANNEAL_PANIC_FRAME\t\tmiri_diff_corpus::cand_a\n",

@@ -855,6 +855,39 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
     }
 }
 ";
+    // A panic inside a nested `fn` reconciles when both Miri and Anneal panic
+    // inside that nested `fn`, and stays a kernel-confirmed divergence when
+    // Anneal panics inside the nested `fn` while Miri panics in the outer
+    // candidate body (even with an identical message and a `DefPath` whose
+    // second segment is the candidate's name).
+    let nested_fn_agree = "\
+pub fn nested_fn_macro__b0_c14() -> u32 {
+    #[inline(never)]
+    fn inner_panic() -> u32 {
+        panic!(\"nested fn panic! message\");
+    }
+    inner_panic()
+}
+";
+    let masked_nested_fn = "\
+pub fn masked_nested_fn_divergence__b0_c15() -> u32 {
+    #[inline(never)]
+    fn inner_panics_same_message_c15() -> u32 {
+        panic!(\"identical nested panic message\");
+    }
+    let x: u32 = 4u32;
+    let r1: &u32 = &x;
+    let r2: &u32 = &x;
+    let y: &u32 = &5u32;
+    if *y == *r1 {
+        inner_panics_same_message_c15()
+    } else if *r2 == 0u32 {
+        0u32
+    } else {
+        panic!(\"identical nested panic message\");
+    }
+}
+";
     let candidates = vec![
         handwritten_candidate(
             0,
@@ -954,6 +987,20 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
             "ArithmeticCastMutator",
             masked_frame_fn,
         ),
+        handwritten_candidate(
+            14,
+            "panic_explicit_macro",
+            "nested_fn_macro__b0_c14",
+            "ArithmeticCastMutator",
+            nested_fn_agree,
+        ),
+        handwritten_candidate(
+            15,
+            "panic_explicit_macro",
+            "masked_nested_fn_divergence__b0_c15",
+            "ArithmeticCastMutator",
+            masked_nested_fn,
+        ),
     ];
 
     let findings_dir = dir.join("findings_panic_fmt");
@@ -961,19 +1008,19 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        14,
+        16,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 14);
-    assert_eq!(report.compiled_candidates, 14);
-    assert_eq!(report.compared_candidates, 14);
-    assert_eq!(report.agree_count, 11);
-    assert_eq!(report.diverge_count, 3);
+    assert_eq!(report.total_candidates, 16);
+    assert_eq!(report.compiled_candidates, 16);
+    assert_eq!(report.compared_candidates, 16);
+    assert_eq!(report.agree_count, 12);
+    assert_eq!(report.diverge_count, 4);
     assert_eq!(report.not_compared_count, 0);
-    assert_eq!(report.kernel_confirmed_divergences, 3);
+    assert_eq!(report.kernel_confirmed_divergences, 4);
     assert_eq!(
         report.not_compared_reasons.get("external_call").copied(),
         Some(0),
@@ -985,8 +1032,8 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(14));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(14));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(16));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(16));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
     // the macro's standard-library definition under Anneal. The strict
@@ -997,16 +1044,19 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         (
             "panic_fmt_macro__b0_c0",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::panic_fmt_macro__b0_c0",
             Some("panic! message from a mutated candidate"),
         ),
         (
             "assert_fmt_macro__b0_c1",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::assert_fmt_macro__b0_c1",
             Some("x must equal eight"),
         ),
         (
             "unreachable_fmt_macro__b0_c2",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::unreachable_fmt_macro__b0_c2",
             Some(
                 "internal error: entered unreachable code: \
                  unreachable! message via from_str_nonconst",
@@ -1015,42 +1065,56 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         (
             "todo_macro__b0_c4",
             "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::todo_macro__b0_c4",
             Some("not yet implemented"),
         ),
         (
             "assert_eq_macro__b0_c5",
             "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::assert_eq_macro__b0_c5",
             Some("assertion `left == right` failed"),
         ),
         (
             "assert_ne_custom_macro__b0_c6",
             "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::assert_ne_custom_macro__b0_c6",
             Some("assertion `left != right` failed: x and y must differ"),
         ),
         (
             "panic_cleanup_macro__b0_c7",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::panic_cleanup_macro__b0_c7",
             Some("panic! message unwinding through a cleanup block"),
         ),
         (
             "core_qualified_macro__b0_c9",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::core_qualified_macro__b0_c9",
             Some("core-qualified panic! message"),
         ),
         (
             "rooted_assert_macro__b0_c10",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::rooted_assert_macro__b0_c10",
             Some("rooted assert! message"),
         ),
         (
             "multiline_core_macro__b0_c11",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::multiline_core_macro__b0_c11",
             Some("multi-line core-qualified panic! message"),
         ),
         (
             "commented_assert_macro__b0_c12",
             "/library/core/src/panic.rs",
+            "miri_diff_corpus::commented_assert_macro__b0_c12",
             Some("commented assert! message"),
+        ),
+        (
+            "nested_fn_macro__b0_c14",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::nested_fn_macro__b0_c14::inner_panic",
+            Some("nested fn panic! message"),
         ),
     ];
     assert_eq!(
@@ -1059,7 +1123,7 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         "unexpected reconciled sites: {:?}",
         report.reconciled_panic_sites
     );
-    for (name, anneal_file_suffix, anneal_message) in macro_candidates {
+    for (name, anneal_file_suffix, expected_frame, anneal_message) in macro_candidates {
         let item = report
             .item_reports
             .iter()
@@ -1124,13 +1188,12 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
                 site.kernel_confirm_theorems
             );
         }
-        // Anneal's panic began in the candidate's own frame, and that frame and
-        // the recovered message are themselves kernel-checked; the snippet
-        // carries the panic-origin probe that those theorems evaluate.
-        let frame = format!("miri_diff_corpus::{name}");
+        // Anneal's panic began in the exact enclosing callable frame, and that
+        // frame and the recovered message are themselves kernel-checked; the
+        // snippet carries the panic-origin probe that those theorems evaluate.
         assert_eq!(
             site.anneal_panic_frame.as_deref(),
-            Some(frame.as_str()),
+            Some(expected_frame),
             "{name}"
         );
         assert!(
@@ -1141,7 +1204,7 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         );
         assert!(
             site.kernel_confirm_theorems
-                .contains(&format!("some \"{frame}\" := by")),
+                .contains(&format!("some \"{expected_frame}\" := by")),
             "{name}"
         );
         assert_eq!(
@@ -1161,12 +1224,23 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         "neg_ctrl_track_caller_overflow__b0_c3",
         "neg_ctrl_cleanup_track_caller__b0_c8",
     ];
-    let masked = "masked_promoted_divergence__b0_c13";
+    let masked_cases = [
+        (
+            "masked_promoted_divergence__b0_c13",
+            "miri_diff_corpus::helper_panics_same_message_c13",
+            "identical panic message",
+        ),
+        (
+            "masked_nested_fn_divergence__b0_c15",
+            "miri_diff_corpus::masked_nested_fn_divergence__b0_c15::inner_panics_same_message_c15",
+            "identical nested panic message",
+        ),
+    ];
     assert!(
-        report
-            .reconciled_panic_sites
-            .iter()
-            .all(|s| !negative_controls.contains(&s.fn_name.as_str()) && s.fn_name != masked)
+        report.reconciled_panic_sites.iter().all(|s| {
+            !negative_controls.contains(&s.fn_name.as_str())
+                && !masked_cases.iter().any(|(m, _, _)| *m == s.fn_name)
+        })
     );
 
     // (b) The non-macro mismatches stay kernel-confirmed divergences, whether
@@ -1213,77 +1287,82 @@ pub fn masked_promoted_divergence__b0_c13() -> u32 {
         assert_eq!(finding.divergence_class, "panic_site_mismatch", "{name}");
         assert!(finding.kernel_confirmed, "{name}");
     }
-    // (c) A panic that Anneal raises in another function stays a
+    // (c) A panic that Anneal raises in another callable body (whether a
+    // sibling top-level helper or a nested `fn` inside the candidate) stays a
     // kernel-confirmed divergence even though its span lies in
     // `library/core/src/panic.rs` and its message matches Miri's: the
-    // kernel-checked frame names the helper, not the candidate.
-    let masked_item = report
-        .item_reports
-        .iter()
-        .find(|r| r.name == masked)
-        .expect("missing item report for the masked candidate");
-    assert!(
-        matches!(
-            masked_item.verdict,
-            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
-        ),
-        "{masked}: unexpected verdict {:?}; if Anneal now reads promoted \
-         constants correctly, the candidate agrees and needs another divergence",
-        masked_item.verdict
-    );
-    assert!(masked_item.kernel_confirmed);
-    let MiriOutcome::Panic {
-        message: masked_miri_message,
-        ..
-    } = &masked_item.miri
-    else {
-        panic!(
-            "{masked}: expected a Miri panic, got {:?}",
-            masked_item.miri
+    // kernel-checked frame names the helper/nested `fn`, not the outer body.
+    for (masked, helper_frame, expected_msg) in masked_cases {
+        let masked_item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == masked)
+            .unwrap_or_else(|| panic!("missing item report for {masked}"));
+        assert!(
+            matches!(
+                masked_item.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{masked}: unexpected verdict {:?}; if Anneal now reads promoted \
+             constants correctly, the candidate agrees and needs another divergence",
+            masked_item.verdict
         );
-    };
-    assert_eq!(masked_miri_message, "identical panic message");
-    let AnnealOutcome::Panic {
-        span: Some(masked_span),
-    } = &masked_item.anneal
-    else {
-        panic!(
-            "{masked}: expected an Anneal panic, got {:?}",
-            masked_item.anneal
+        assert!(masked_item.kernel_confirmed, "{masked}");
+        let MiriOutcome::Panic {
+            message: masked_miri_message,
+            ..
+        } = &masked_item.miri
+        else {
+            panic!(
+                "{masked}: expected a Miri panic, got {:?}",
+                masked_item.miri
+            );
+        };
+        assert_eq!(masked_miri_message, expected_msg, "{masked}");
+        let AnnealOutcome::Panic {
+            span: Some(masked_span),
+        } = &masked_item.anneal
+        else {
+            panic!(
+                "{masked}: expected an Anneal panic, got {:?}",
+                masked_item.anneal
+            );
+        };
+        assert!(
+            masked_span.file.ends_with("/library/core/src/panic.rs"),
+            "{masked}: {masked_span:?}"
         );
-    };
-    assert!(
-        masked_span.file.ends_with("/library/core/src/panic.rs"),
-        "{masked}: {masked_span:?}"
-    );
-    let masked_finding = report
-        .findings
-        .iter()
-        .find(|f| f.fn_name == masked)
-        .expect("finding for the masked candidate");
-    assert!(masked_finding.kernel_confirmed);
-    assert!(
-        masked_finding
-            .kernel_confirm_theorems
-            .contains("some \"miri_diff_corpus::helper_panics_same_message_c13\" := by"),
-        "{}",
-        masked_finding.kernel_confirm_theorems
-    );
-    assert!(
-        masked_finding
-            .kernel_confirm_theorems
-            .contains("-- Anneal's panic message: \"identical panic message\"")
-    );
+        let masked_finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name == masked)
+            .unwrap_or_else(|| panic!("finding for {masked}"));
+        assert!(masked_finding.kernel_confirmed, "{masked}");
+        assert!(
+            masked_finding
+                .kernel_confirm_theorems
+                .contains(&format!("some \"{helper_frame}\" := by")),
+            "{}",
+            masked_finding.kernel_confirm_theorems
+        );
+        assert!(
+            masked_finding
+                .kernel_confirm_theorems
+                .contains(&format!("-- Anneal's panic message: {expected_msg:?}")),
+            "{}",
+            masked_finding.kernel_confirm_theorems
+        );
+    }
 
     assert_eq!(
         report
             .divergence_classes
             .get("panic_site_mismatch")
             .copied(),
-        Some(3)
+        Some(4)
     );
 
-    assert_eq!(report.findings.len(), 3);
+    assert_eq!(report.findings.len(), 4);
     let f = report
         .findings
         .iter()
