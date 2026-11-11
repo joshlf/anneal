@@ -2532,7 +2532,8 @@ pub fn eval_unop(
         },
         UnOp::PtrMetadata => match val {
             MirValue::Ptr { ptr, ty } if ty.is_any_ptr() => {
-                if ty.is_ref() && (u128::from(ptr.addr) & ptr_width.mask()) == 0 {
+                let addr = checked_ptr_addr(ptr, ty, ptr_width)?;
+                if ty.is_ref() && addr == 0 {
                     return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                         target_ty: ty.clone(),
                         bits: 0,
@@ -3224,10 +3225,79 @@ fn decode_mir_value(
     }
 }
 
+/// Predicts an exposed provenance for `PointerWithExposedProvenance` at `addr_bits` (with
+/// target pointer type `target_ty`) in a frame with `local_decls` and optional `slots`.
+///
+/// When multiple provenances have been exposed, prefers one whose synthetic local allocation
+/// `[base_addr, base_addr + alloc_size]` contains `addr_bits` (preferring live locals and
+/// interior addresses `[base_addr, base_addr + alloc_size)` over one-past-the-end, and
+/// matching [`decode_subplace_tag`] when multiple tags of that local were exposed), falling
+/// back to `tracker.exposed.first().copied()`.
+fn predict_exposed_provenance_for_decls(
+    addr_bits: u128,
+    target_ty: &Ty,
+    local_decls: &[Ty],
+    slots: Option<&[LocalSlotState]>,
+    ptr_width: PtrWidth,
+    tracker: &ExposedProvenanceTracker,
+) -> Option<crate::ir::Provenance> {
+    if !local_decls.is_empty() && tracker.exposed.len() > 1 {
+        let pointee_ty = target_ty.pointee_ty();
+        let mut best: Option<(u8, crate::ir::Provenance)> = None;
+        for &prov in &tracker.exposed {
+            let Some(loc) = prov
+                .alloc_id
+                .checked_sub(1)
+                .and_then(|id| usize::try_from(id).ok())
+                .filter(|&loc| loc < local_decls.len())
+            else {
+                continue;
+            };
+            let Ok(base_addr) = local_base_addr_for_decls(loc, local_decls, ptr_width) else {
+                continue;
+            };
+            let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
+                continue;
+            };
+            let end_addr = base_addr.saturating_add(alloc_size as u128);
+            if addr_bits < base_addr || addr_bits > end_addr {
+                continue;
+            }
+            let is_live = !slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead)));
+            let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
+            let tag_matches = pointee_ty
+                .and_then(|pty| decode_subplace_tag(prov.tag, pty))
+                .is_some();
+            let rank = (u8::from(is_live) << 2)
+                | (u8::from(is_interior) << 1)
+                | u8::from(tag_matches);
+            if best.is_none_or(|(best_rank, _)| rank > best_rank) {
+                best = Some((rank, prov));
+            }
+        }
+        if let Some((_, prov)) = best {
+            return Some(prov);
+        }
+    }
+    tracker.exposed.first().copied()
+}
+
 /// Evaluates a `LoweredCast` on an evaluated `MirValue` operand under `ptr_width` and `policy`.
 pub fn eval_lowered_cast(
     cast: &LoweredCast,
     val: &MirValue,
+    ptr_width: PtrWidth,
+    policy: TransmutePolicy,
+    tracker: &mut ExposedProvenanceTracker,
+) -> Result<MirValue, RvalueEvalError> {
+    eval_lowered_cast_with_decls(cast, val, &[], None, ptr_width, policy, tracker)
+}
+
+fn eval_lowered_cast_with_decls(
+    cast: &LoweredCast,
+    val: &MirValue,
+    local_decls: &[Ty],
+    slots: Option<&[LocalSlotState]>,
     ptr_width: PtrWidth,
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
@@ -3298,7 +3368,14 @@ pub fn eval_lowered_cast(
             // disabled). Predicting `None` despite exposed provenance would make valid
             // `ptr::with_exposed_provenance(addr).add(n)` programs report UB.
             let predicted = if *pick_exposed_provenance {
-                tracker.exposed.first().copied()
+                predict_exposed_provenance_for_decls(
+                    addr_bits,
+                    target_ty,
+                    local_decls,
+                    slots,
+                    ptr_width,
+                    tracker,
+                )
             } else {
                 None
             };
@@ -5328,7 +5405,7 @@ pub fn eval_lowered_rvalue(
                                 "Deref projection requires a pointer value with matching pointee type",
                             ));
                         }
-                        let masked_addr = (u128::from(ptr.addr) & ptr_width.mask()) as u64;
+                        let masked_addr = checked_ptr_addr(&ptr, &ty, ptr_width)? as u64;
                         if ty.is_ref() && masked_addr == 0 {
                             return Err(RvalueEvalError::CastEval(
                                 CastEvalError::InvalidBitPattern {
@@ -5391,7 +5468,9 @@ pub fn eval_lowered_rvalue(
         LoweredRvalue::Cast { cast, ty } => {
             let op = cast.operand();
             let v = eval_op(op)?;
-            let out = eval_lowered_cast(cast, &v, ptr_width, policy, tracker)?;
+            let decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+            let out =
+                eval_lowered_cast_with_decls(cast, &v, &decls, None, ptr_width, policy, tracker)?;
             if !mir_value_matches_ty(&out, ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Cast result runtime type does not match lowered ty",
@@ -5605,7 +5684,7 @@ pub fn eval_lowered_rvalue(
         }
         LoweredRvalue::CopyForDeref { place, ty } => match read_place(place)? {
             MirValue::Ptr { ptr, ty: val_ty } if val_ty == *ty && ty.is_any_ptr() => {
-                let masked_addr = (u128::from(ptr.addr) & ptr_width.mask()) as u64;
+                let masked_addr = checked_ptr_addr(&ptr, ty, ptr_width)? as u64;
                 if ty.is_ref() && masked_addr == 0 {
                     return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                         target_ty: ty.clone(),
@@ -6075,6 +6154,17 @@ impl StatementEvalState {
         pointee_ty: &Ty,
         full_place: &Place,
     ) -> Result<(Local, Vec<ProjectionElem>), RvalueEvalError> {
+        self.resolve_synthetic_subplace_with_mode(ptr, ptr_ty, pointee_ty, full_place, false)
+    }
+
+    pub(crate) fn resolve_synthetic_subplace_with_mode(
+        &self,
+        ptr: &PointerValue,
+        ptr_ty: &Ty,
+        pointee_ty: &Ty,
+        full_place: &Place,
+        allow_union_overwrite: bool,
+    ) -> Result<(Local, Vec<ProjectionElem>), RvalueEvalError> {
         let addr = checked_ptr_addr(ptr, ptr_ty, self.ptr_width)?;
         if addr == 0 {
             if ptr_ty.is_ref() {
@@ -6170,8 +6260,14 @@ impl StatementEvalState {
         }
         let candidates =
             collect_subplace_paths(target_decl_ty, rel_off, pointee_ty, self.ptr_width);
-        match self.select_subplace_candidate(target_local, pointee_ty, candidates, prov.tag, full_place)
-        {
+        match self.select_subplace_candidate(
+            target_local,
+            pointee_ty,
+            candidates,
+            prov.tag,
+            full_place,
+            allow_union_overwrite,
+        ) {
             Some(path) => Ok((Local(target_local), path)),
             None => Err(RvalueEvalError::UnsupportedPlaceProjection(
                 full_place.clone(),
@@ -6185,7 +6281,10 @@ impl StatementEvalState {
     /// 1. candidates inconsistent with the runtime state of the local (an inactive enum variant
     ///    or union field along the path) are discarded: a byte memory holds the active ones, so
     ///    reaching an inactive one would pun the bytes of another variant or union field
-    ///    (unsupported without a byte-level memory model, never a guessed sub-place);
+    ///    (unsupported without a byte-level memory model, never a guessed sub-place). On a
+    ///    whole-target write (`allow_union_overwrite`), overwriting a leaf union field switches
+    ///    that union's active field when designated by an uncast field-borrow tag or when no
+    ///    active candidate of `pointee_ty` exists;
     /// 2. a unique remaining candidate is the designated sub-place;
     /// 3. among several, the one whose ordinal the borrow encoded in `tag` for the same pointee
     ///    type is selected ([`decode_subplace_tag`]; a tag that survived a pointer cast to
@@ -6202,18 +6301,41 @@ impl StatementEvalState {
         mut candidates: Vec<Vec<ProjectionElem>>,
         tag: u64,
         full_place: &Place,
+        allow_union_overwrite: bool,
     ) -> Option<Vec<ProjectionElem>> {
         let slot = &self.slots[target_local];
         let decl_ty = &self.local_decls[target_local];
         let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
             Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
         };
-        let consistent: Vec<usize> = (0..candidates.len())
+        let active_consistent: Vec<usize> = (0..candidates.len())
             .filter(|&i| {
                 check_slot_projection(slot, decl_ty, &candidates[i], &no_index, full_place).is_ok()
-                    && slot_union_path_active(slot, &candidates[i])
+                    && slot_union_path_active(slot, &candidates[i], false)
             })
             .collect();
+        let overwrite_consistent: Vec<usize> = if allow_union_overwrite {
+            (0..candidates.len())
+                .filter(|&i| {
+                    check_slot_projection(slot, decl_ty, &candidates[i], &no_index, full_place)
+                        .is_ok()
+                        && slot_union_path_active(slot, &candidates[i], true)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if allow_union_overwrite
+            && let Some(ordinal) = decode_subplace_tag(tag, pointee_ty)
+            && overwrite_consistent.contains(&ordinal)
+        {
+            return Some(candidates.swap_remove(ordinal));
+        }
+        let consistent = if !active_consistent.is_empty() || !allow_union_overwrite {
+            &active_consistent
+        } else {
+            &overwrite_consistent
+        };
         let chosen = match consistent.as_slice() {
             [] => return None,
             [only] => *only,
@@ -6300,6 +6422,15 @@ impl StatementEvalState {
         &self,
         place: &Place,
     ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
+        self.resolve_deref_place_with_mode(place, false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_deref_place_with_mode(
+        &self,
+        place: &Place,
+        allow_final_union_overwrite: bool,
+    ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
         self.check_place_against_decls(place)?;
         match self.slots.get(place.local.0) {
             None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
@@ -6309,7 +6440,8 @@ impl StatementEvalState {
         let mut cur_local = place.local;
         let mut cur_proj: Vec<ProjectionElem> = Vec::new();
         let mut cur_index_cache: Vec<(Local, u128)> = Vec::new();
-        for elem in &place.projection {
+        let proj_len = place.projection.len();
+        for (idx, elem) in place.projection.iter().enumerate() {
             if matches!(elem, ProjectionElem::Deref) {
                 let ptr_val =
                     self.read_resolved_place(cur_local, &cur_proj, &cur_index_cache, place)?;
@@ -6323,8 +6455,14 @@ impl StatementEvalState {
                         "Deref projection requires a pointer-typed place",
                     ));
                 };
-                let (next_local, next_proj) =
-                    self.resolve_synthetic_subplace(&ptr, &ptr_ty, pointee_ty, place)?;
+                let allow_union_overwrite = allow_final_union_overwrite && idx + 1 == proj_len;
+                let (next_local, next_proj) = self.resolve_synthetic_subplace_with_mode(
+                    &ptr,
+                    &ptr_ty,
+                    pointee_ty,
+                    place,
+                    allow_union_overwrite,
+                )?;
                 cur_local = next_local;
                 cur_proj = next_proj;
                 cur_index_cache.clear();
@@ -6740,7 +6878,8 @@ impl StatementEvalState {
                 "assigned value runtime type does not match destination place type",
             ));
         }
-        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        let (target_local, target_proj, index_cache) =
+            self.resolve_deref_place_with_mode(place, true)?;
         let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
@@ -8534,6 +8673,18 @@ fn check_retagged_reference(
     if !pointee.is_inhabited_for(ptr_width) {
         return Err(RvalueEvalError::UninhabitedPointee(pointee.clone()));
     }
+    if let Ok((pointee_size, _)) = pointee.alloc_size_and_align(ptr_width) {
+        let byte_len = pointee_size as u128;
+        if addr
+            .checked_add(byte_len)
+            .is_none_or(|end| end > ptr_width.max_usize())
+        {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: addr as u64,
+                byte_len,
+            });
+        }
+    }
     // Unspecified layouts are never zero-sized (they store a tag), so only an exact size `0`
     // exempts a reference into a dead local.
     if let Some(local) = resolve_synthetic_alloc_local(ptr, ctx.slots.len())
@@ -9318,52 +9469,81 @@ fn compute_subplace_offset_and_tag(
 
 /// Returns whether every union `Field` step in `proj` selects the active union field of the
 /// initialized values reached in `slot` (also through partially initialized shells); steps
-/// into uninitialized parts are unconstrained.
-fn slot_union_path_active(slot: &LocalSlotState, proj: &[ProjectionElem]) -> bool {
+/// into uninitialized parts are unconstrained. When `allow_leaf_union_overwrite` is true, a
+/// final leaf `Field` step on an initialized union may select an inactive union field (so a
+/// whole-field write overwrites the union's active field).
+fn slot_union_path_active(
+    slot: &LocalSlotState,
+    proj: &[ProjectionElem],
+    allow_leaf_union_overwrite: bool,
+) -> bool {
     match slot {
-        LocalSlotState::Init(val) => value_union_path_active(val, proj),
-        LocalSlotState::PartialShell(shell) => shell_union_path_active(shell, proj),
+        LocalSlotState::Init(val) => {
+            value_union_path_active(val, proj, allow_leaf_union_overwrite)
+        }
+        LocalSlotState::PartialShell(shell) => {
+            shell_union_path_active(shell, proj, allow_leaf_union_overwrite)
+        }
         LocalSlotState::Uninit | LocalSlotState::Dead => true,
     }
 }
 
-fn shell_union_path_active(shell: &PartialAggregate, proj: &[ProjectionElem]) -> bool {
+fn shell_union_path_active(
+    shell: &PartialAggregate,
+    proj: &[ProjectionElem],
+    allow_leaf_union_overwrite: bool,
+) -> bool {
     let Some((first, rest)) = proj.split_first() else {
         return true;
     };
     match first {
-        ProjectionElem::Downcast(_) => shell_union_path_active(shell, rest),
+        ProjectionElem::Downcast(_) => {
+            shell_union_path_active(shell, rest, allow_leaf_union_overwrite)
+        }
         ProjectionElem::Field(idx, _) => match shell.fields.get(*idx) {
-            Some(FieldSlot::Init(val)) => value_union_path_active(val, rest),
-            Some(FieldSlot::Partial(child)) => shell_union_path_active(child, rest),
+            Some(FieldSlot::Init(val)) => {
+                value_union_path_active(val, rest, allow_leaf_union_overwrite)
+            }
+            Some(FieldSlot::Partial(child)) => {
+                shell_union_path_active(child, rest, allow_leaf_union_overwrite)
+            }
             Some(FieldSlot::Uninit) | None => true,
         },
         _ => true,
     }
 }
 
-fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem]) -> bool {
+fn value_union_path_active(
+    val: &MirValue,
+    proj: &[ProjectionElem],
+    allow_leaf_union_overwrite: bool,
+) -> bool {
     let Some((first, rest)) = proj.split_first() else {
         return true;
     };
     match first {
-        ProjectionElem::Downcast(_) => value_union_path_active(val, rest),
+        ProjectionElem::Downcast(_) => {
+            value_union_path_active(val, rest, allow_leaf_union_overwrite)
+        }
         ProjectionElem::Field(idx, _) => match val {
             MirValue::Tuple(fields) => fields
                 .get(*idx)
-                .is_some_and(|child| value_union_path_active(child, rest)),
+                .is_some_and(|child| value_union_path_active(child, rest, allow_leaf_union_overwrite)),
             MirValue::Adt {
                 active_field: None,
                 fields,
                 ..
             } => fields
                 .get(*idx)
-                .is_some_and(|child| value_union_path_active(child, rest)),
+                .is_some_and(|child| value_union_path_active(child, rest, allow_leaf_union_overwrite)),
             MirValue::Adt {
                 active_field: Some(active),
                 fields,
                 ..
             } => {
+                if rest.is_empty() && allow_leaf_union_overwrite {
+                    return true;
+                }
                 if *active != *idx {
                     return false;
                 }
@@ -9372,7 +9552,7 @@ fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem]) -> bool {
                 } else {
                     fields.get(*active)
                 };
-                child.is_some_and(|c| value_union_path_active(c, rest))
+                child.is_some_and(|c| value_union_path_active(c, rest, allow_leaf_union_overwrite))
             }
             _ => true,
         },
@@ -9388,7 +9568,7 @@ fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem]) -> bool {
             else {
                 return false;
             };
-            value_union_path_active(&elements[i], rest)
+            value_union_path_active(&elements[i], rest, allow_leaf_union_overwrite)
         }
         _ => true,
     }
@@ -9814,8 +9994,13 @@ fn eval_copy_nonoverlapping(
     let dst_ptr_ty = dst_val.ty();
     let src_resolved =
         state.resolve_synthetic_subplace(&src_ptr, &src_ptr_ty, elem_ty, &dummy_place);
-    let dst_resolved =
-        state.resolve_synthetic_subplace(&dst_ptr, &dst_ptr_ty, elem_ty, &dummy_place);
+    let dst_resolved = state.resolve_synthetic_subplace_with_mode(
+        &dst_ptr,
+        &dst_ptr_ty,
+        elem_ty,
+        &dummy_place,
+        count == 1,
+    );
 
     if count == 1 {
         match (src_resolved, dst_resolved) {
@@ -10318,7 +10503,8 @@ pub fn eval_lowered_rvalue_in_state(
                                 "Deref projection requires a pointer value with matching pointee type",
                             ));
                         }
-                        let masked_addr = (u128::from(ptr.addr) & state.ptr_width.mask()) as u64;
+                        let masked_addr =
+                            checked_ptr_addr(&ptr, &ty, state.ptr_width)? as u64;
                         if ty.is_ref() && masked_addr == 0 {
                             return Err(RvalueEvalError::CastEval(
                                 CastEvalError::InvalidBitPattern {
@@ -10513,8 +10699,15 @@ pub fn eval_lowered_rvalue_in_state(
         LoweredRvalue::Cast { cast, ty } => {
             let op = cast.operand();
             let v = eval_op(op, state)?;
-            let out =
-                eval_lowered_cast(cast, &v, state.ptr_width, state.policy, &mut state.tracker)?;
+            let out = eval_lowered_cast_with_decls(
+                cast,
+                &v,
+                &state.local_decls,
+                Some(&state.slots),
+                state.ptr_width,
+                state.policy,
+                &mut state.tracker,
+            )?;
             if !mir_value_matches_ty(&out, ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Cast result runtime type does not match lowered ty",
@@ -10723,7 +10916,7 @@ pub fn eval_lowered_rvalue_in_state(
         }
         LoweredRvalue::CopyForDeref { place, ty } => match state.read_place(place)? {
             MirValue::Ptr { ptr, ty: val_ty } if val_ty == *ty && ty.is_any_ptr() => {
-                let masked_addr = (u128::from(ptr.addr) & state.ptr_width.mask()) as u64;
+                let masked_addr = checked_ptr_addr(&ptr, ty, state.ptr_width)? as u64;
                 if ty.is_ref() && masked_addr == 0 {
                     return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                         target_ty: ty.clone(),
