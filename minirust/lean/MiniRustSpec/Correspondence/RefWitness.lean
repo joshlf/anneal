@@ -3290,4 +3290,79 @@ theorem transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement :
     transmuteDanglingIntToRefDiscrepancy_minirust_ub,
     transmuteDanglingIntToRefDiscrepancy_tb_direct⟩
 
+/-! #### 6. RFC 2582 `&raw` place addressing: three-way normal-return agreement
+
+The places-ptr `Trusted` semantics evaluates `Rvalue.rawPtr` by computing the
+place address alone: it neither reads the value stored at the place nor checks
+the place's alignment, matching MiniRust's `AddrOf(_, PtrType::Raw)` (and Tree
+Borrows, where a raw `AddrOf` performs no retag). Both witnesses lie outside the
+proved fragment (a misaligned pointer, resp. an address-taken non-argument
+local), so these are executable three-way agreements rather than instances of
+the simulation theorems. -/
+
+/-- `misalignedRef` with the safe reborrow `&(*_5)` replaced by the raw borrow
+`&raw const (*_5)` of the same misaligned `*const u32`: no UB on any machine,
+all three return `5`. Together with `misalignedRef_three_way_ub_agreement` this
+pins the RFC 2582 distinction: alignment is checked for safe references, never
+for raw place addressing. -/
+def misalignedRaw : CapturedMir :=
+  ptrBody "witness::misaligned_raw"
+    [u32Decl, u32Decl, ptrConstU32Decl, ptrConstU8Decl, ptrConstU8Decl,
+     ptrConstU32Decl, ptrConstU32Decl]
+    [.storageLive 2, .assign (local_ 2) (.rawPtr .not (local_ 1)),
+     .storageLive 3, .assign (local_ 3) (.cast .ptrToPtr (.copy (local_ 2)) ptrConstU8Ty),
+     .storageLive 4, .assign (local_ 4) (.binaryOp .offset (.copy (local_ 3)) (constUsize 1)),
+     .storageLive 5, .assign (local_ 5) (.cast .ptrToPtr (.copy (local_ 4)) ptrConstU32Ty),
+     .storageLive 6, .assign (local_ 6) (.rawPtr .not (derefPlace 5)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+theorem misalignedRaw_translate : (translateFn misalignedRaw).isSome = true := by decide +kernel
+
+theorem misalignedRaw_notInFragment : inFragment misalignedRaw = false := by decide +kernel
+
+theorem misalignedRaw_anneal_ret :
+    ∃ mem, ReachesRet (mirTree misalignedRaw (initMachineState misalignedRaw [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩, mem)) :=
+  ⟨_, runA_sound misalignedRaw 30 _ _ _ rfl⟩
+
+theorem misalignedRaw_three_way_agreement :
+    (∃ mem, ReachesRet (mirTree misalignedRaw (initMachineState misalignedRaw [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩, mem))) ∧
+    retAfter misalignedRaw [.scalar ⟨5, 4⟩] 13 =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) ∧
+    retAfterTB misalignedRaw [.scalar ⟨5, 4⟩] 13 = tbRetU32 5 :=
+  ⟨misalignedRaw_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-- `&raw mut` of a storage-live but *uninitialized* local
+(`_3 = &raw mut _2; *_3 = 7; _0 = Add(copy _2, copy _1)`): taking the raw
+address never reads `_2`, the write through `_3` initializes it, and all three
+machines return `12`. -/
+def rawAddrOfUninit : CapturedMir :=
+  ptrBody "witness::raw_addr_of_uninit"
+    [u32Decl, u32Decl, u32Decl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 3) (.rawPtr .mut (local_ 2)),
+     .assign (derefPlace 3) (.use (constU32 7)),
+     .assign (local_ 0) (.binaryOp .add (.copy (local_ 2)) (.copy (local_ 1)))]
+
+theorem rawAddrOfUninit_translate : (translateFn rawAddrOfUninit).isSome = true := by
+  decide +kernel
+
+theorem rawAddrOfUninit_notInFragment : inFragment rawAddrOfUninit = false := by decide +kernel
+
+theorem rawAddrOfUninit_anneal_ret :
+    ∃ mem, ReachesRet (mirTree rawAddrOfUninit
+      (initMachineState rawAddrOfUninit [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨12, 4⟩, mem)) :=
+  ⟨_, runA_sound rawAddrOfUninit 30 _ _ _ rfl⟩
+
+theorem rawAddrOfUninit_three_way_agreement :
+    (∃ mem, ReachesRet (mirTree rawAddrOfUninit
+      (initMachineState rawAddrOfUninit [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨12, 4⟩, mem))) ∧
+    retAfter rawAddrOfUninit [.scalar ⟨5, 4⟩] 7 =
+      some (some { retAlloc with data := scalarBytes u32 12 }, [1]) ∧
+    retAfterTB rawAddrOfUninit [.scalar ⟨5, 4⟩] 7 = tbRetU32 12 :=
+  ⟨rawAddrOfUninit_anneal_ret, by decide +kernel, by decide +kernel⟩
+
 end MiniRustSpec.Correspondence.RefWitness

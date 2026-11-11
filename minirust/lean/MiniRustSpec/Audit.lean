@@ -259,6 +259,12 @@ open MiniRustSpec.Correspondence in
   evalStmt_placeMention
   evalStmt_placeMention_place
   evalOperand_frag
+  tyProjTouchesUnion_false_of_all_nonUnion
+  placeTouchesUnion_false_of_all_nonUnion
+  placeTouchesUnion_false_of_tupleTypeOf
+  placeTouchesUnion_false_of_tuplePlaceSpec
+  placeTouchesUnion_false_of_placeOk
+  placeTouchesUnion_false_of_inFragment
   evalRvalue_frag
   evalScalarBinOp_frag
   signedOverflowAdd_eq
@@ -1450,6 +1456,12 @@ open MiniRustSpec.Correspondence.Witness in
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[SIMULATION-AUDIT]"
   unitPlace_eq_buildUnitPlace
+  tyProjTouchesUnion_false_of_all_nonUnion
+  placeTouchesUnion_false_of_all_nonUnion
+  placeTouchesUnion_false_of_tupleTypeOf
+  placeTouchesUnion_false_of_tuplePlaceSpec
+  placeTouchesUnion_false_of_placeOk
+  placeTouchesUnion_false_of_inFragment
   abortTerminator_eq_buildAbort
   unitType_eq_unitTy
   mapGet_eq_of_mem_nodup
@@ -3443,6 +3455,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misaligned_three_way_ub_agreement
   misalignedRef_three_way_ub_agreement
   transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement
+  misalignedRaw_translate
+  misalignedRaw_notInFragment
+  misalignedRaw_anneal_ret
+  misalignedRaw_three_way_agreement
+  rawAddrOfUninit_translate
+  rawAddrOfUninit_notInFragment
+  rawAddrOfUninit_anneal_ret
+  rawAddrOfUninit_three_way_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3883,6 +3903,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   misaligned_three_way_ub_agreement
   misalignedRef_three_way_ub_agreement
   transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement
+  misalignedRaw_translate
+  misalignedRaw_notInFragment
+  misalignedRaw_anneal_ret
+  misalignedRaw_three_way_agreement
+  rawAddrOfUninit_translate
+  rawAddrOfUninit_notInFragment
+  rawAddrOfUninit_anneal_ret
+  rawAddrOfUninit_three_way_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms
@@ -4673,6 +4701,8 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrArraySubPlaceRoundTripOk_anneal_ret
   int2ptrArraySubPlaceRoundTripOk_three_way
   int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk
+  int2ptrArraySubPlaceRoundTripOk_subPlace_static
+  int2ptrArraySubPlaceRoundTripOk_hsub_static
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 
@@ -5075,6 +5105,8 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrArraySubPlaceRoundTripOk_anneal_ret
   int2ptrArraySubPlaceRoundTripOk_three_way
   int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk
+  int2ptrArraySubPlaceRoundTripOk_subPlace_static
+  int2ptrArraySubPlaceRoundTripOk_hsub_static
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 

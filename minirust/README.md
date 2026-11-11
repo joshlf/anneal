@@ -1150,6 +1150,11 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   (`misaligned_three_way_ub_agreement`, `misalignedRef_three_way_ub_agreement`,
   `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`), and
   `exposeTwice` returns `0` on all three (`exposeTwice_three_way_agreement`).
+  RFC 2582 raw place addressing is pinned by two normal-return agreements:
+  `&raw const (*q)` of the same misaligned `*const u32` that makes
+  `misalignedRef` UB returns `5` everywhere (`misalignedRaw_three_way_agreement`),
+  and `&raw mut` of an uninitialized local followed by a write through the raw
+  pointer returns `12` everywhere (`rawAddrOfUninit_three_way_agreement`).
   They disagree on the remaining divergences listed under the gaps:
   `danglingRef`
   (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
@@ -1258,9 +1263,13 @@ proper-sub-place target-slot readiness from `FrameOkWithIntrinsics`, `BorrowsOk`
 (`expose_then_withExposed_unexposed_from_frameOk`,
 `assume_then_expose_then_withExposed_closed_unexposed_from_frameOk`)
 `NoCompetingExposedBorrow` vanishes, leaving only static `ptrDeclLayoutsOk` +
-`bodyPreservesAddrTaken` when `body` borrows proper sub-places and the sharp
-64-bit canonical-page bound `body.localDecls.length ≤ 2^47 - stackLocalAddrPageBase 8 + 1`
-(`canonicalLocalAddr_lt_two_pow_64_iff`), with `bodyPreservesAddrTaken` and the
+`bodyPreservesAddrTaken` when `body` borrows proper sub-places (exercised on
+`int2ptrArraySubPlaceRoundTripOk`, where the `by decide` default closes it:
+`int2ptrArraySubPlaceRoundTripOk_hsub_static`) and the uniform 64-bit
+canonical-page bound `body.localDecls.length ≤ 2^47 - stackLocalAddrPageBase 8 + 1`
+(`canonicalLocalAddr_lt_two_pow_64`, sized for in-local offsets below `2^63`;
+`canonicalLocalAddr_lt_two_pow_64_iff` gives the exact per-local limit for
+offsets inside one page), with `bodyPreservesAddrTaken` and the
 locals-count bound discharged automatically on `inFragmentWithIntrinsics` via
 `assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment

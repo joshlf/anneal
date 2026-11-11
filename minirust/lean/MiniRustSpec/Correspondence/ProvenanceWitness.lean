@@ -290,8 +290,10 @@ theorem int2ptrRoundTripOk_three_way :
   ⟨int2ptrRawRoundTripOk_inFragmentWithIntrinsics, int2ptrRawRoundTripOk_anneal_ret,
     int2ptrRawRoundTripOk_minirust_direct, int2ptrRawRoundTripOk_tb_direct⟩
 
-/-- Pre-exposure `MachineState` of `int2ptrRawRoundTripOk` right after
-`_2 = &raw mut _1`. -/
+/-- Pre-exposure `MachineState` of `int2ptrRawRoundTripOk`: the locals and borrow
+state right after `_2 = &raw mut _1`, built by hand from the entry state (the
+frame position is left at entry; `AnnealExposeRoundTripOk` reads only
+`s.memory` and `s.frame.locals`). -/
 def int2ptrRawRoundTripOkPreExposeState : MachineState :=
   let s0 := initMachineState int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩]
   { s0 with
@@ -393,8 +395,10 @@ theorem int2ptrArraySubPlaceRoundTripOk_three_way :
   ⟨int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics,
     int2ptrArraySubPlaceRoundTripOk_anneal_ret, by decide +kernel, by decide +kernel⟩
 
-/-- Pre-exposure `MachineState` of `int2ptrArraySubPlaceRoundTripOk` right after
-`_2 = &raw mut (_1[1 of 2])`. -/
+/-- Pre-exposure `MachineState` of `int2ptrArraySubPlaceRoundTripOk`: the locals
+and borrow state right after `_2 = &raw mut (_1[1 of 2])`, built by hand from the
+entry state (the frame position is left at entry; `AnnealExposeRoundTripOk`
+reads only `s.memory` and `s.frame.locals`). -/
 def int2ptrArraySubPlacePreExposeState : MachineState :=
   let s0 := initMachineState int2ptrArraySubPlaceRoundTripOk
     [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]]
@@ -422,6 +426,27 @@ theorem int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk :
     (fun b hb hexp _ => by
       simp [int2ptrArraySubPlacePreExposeState, initMachineState,
         MirSemantics.isExposedAllocId] at hb hexp)
+
+/-- `int2ptrArraySubPlaceRoundTripOk` exercises the non-vacuous branch of the
+static side condition `hsub_static` taken by `ExposeTargetSlotOk.of_frameOk` and
+the `ProvenanceRel.*_from_frameOk` theorems: the body borrows a proper sub-place,
+and both `ptrDeclLayoutsOk` and `bodyPreservesAddrTaken` hold. -/
+theorem int2ptrArraySubPlaceRoundTripOk_subPlace_static :
+    (bodyDirectBorrowPlaces int2ptrArraySubPlaceRoundTripOk).any
+        (fun q => !q.projection.isEmpty) = true ∧
+      ptrDeclLayoutsOk int2ptrArraySubPlaceRoundTripOk = true ∧
+      bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true := by
+  decide +kernel
+
+/-- The `hsub_static` hypothesis in exactly the form of the `by decide` default
+argument of the `ProvenanceRel.*_from_frameOk` theorems, closed by that same
+`decide` on a body that borrows a proper sub-place. -/
+theorem int2ptrArraySubPlaceRoundTripOk_hsub_static :
+    (bodyDirectBorrowPlaces int2ptrArraySubPlaceRoundTripOk).any
+        (fun q => !q.projection.isEmpty) = true →
+      ptrDeclLayoutsOk int2ptrArraySubPlaceRoundTripOk = true ∧
+        bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true := by
+  decide
 
 /-! ### `int2ptrUnexposedUb` -/
 
