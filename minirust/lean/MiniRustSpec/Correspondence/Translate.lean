@@ -4844,23 +4844,28 @@ def statementOkWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statem
 
 /-! ### Provenance-cast data-flow and aliasing discipline
 
-Anneal's MIR semantics (`trusted/lean/.../MirSemantics/Places.lean`) does not
-model exposure: `PointerExposeProvenance` returns the *encoding*
-`tag * 65536 + offsetBytes` of the pointer's borrow tag, and
-`PointerWithExposedProvenance` decodes any integer back into a pointer with tag
-`n / 65536`. MiniRust instead returns the pointer's address and resolves the
-provenance of `int2ptr` angelically among the exposed provenances. The two
-agree only when an exposed integer is used for nothing but casting it back:
+Anneal's MIR semantics (`trusted/lean/.../MirSemantics/Places.lean`) models
+exposure with canonical addresses: `PointerExposeProvenance` returns the
+canonical stack address `ptrAddress?` of the borrowed place (the same for every
+tag borrowing that place) and records the tag in `Memory.exposedAllocIds`, and
+`PointerWithExposedProvenance` recovers the highest-ranked live exposed stack
+borrow covering the address (`recoverExposedPtrValue?`), or a provenance-less
+address when none is exposed. MiniRust returns the pointer's address and
+resolves the provenance of `int2ptr` angelically among the exposed provenances.
+Under these semantics observing an exposed integer (`exposeTwice`: both return
+`0`) and forging one (`int2ptrForgedTag`: both raise UB) agree
+(`exposeTwice_three_way_agreement`, `int2ptrForgedTag_three_way_ub_agreement`),
+but the fragment still admits only the flows whose step correspondence is
+proved, i.e. an exposed integer used for nothing but casting it back:
 
-* observing it (`exposeTwice`: `(e2 - e1) as u32` is `65536` in Anneal and `0`
-  in MiniRust) makes the results differ;
-* forging one (`int2ptrForgedTag`: `65536 as *const u32` reads a borrowed
-  local in Anneal but is UB in MiniRust) makes Anneal *more* defined than
-  MiniRust;
+* observing or forging exposed integers stays outside the fragment (the step
+  simulation `ProvenanceRel.*_from_frameOk` covers only the
+  expose-then-cast-back round trip);
 * laundering mutability or pointee type through the integer (`*const u32` →
   `usize` → `*mut u32`) escapes `ptrRvalueOk`'s `PtrToPtr` rule;
-* and a round-tripped pointer is a tag-sharing copy of the exposed pointer in
-  Anneal, so it must obey the same `ptrAliasingOk` borrow discipline.
+* and a round-tripped pointer recovers the exposed pointer's borrow tag in
+  Anneal (`AnnealExposeRoundTripOk`), so it must obey the same `ptrAliasingOk`
+  borrow discipline.
 
 `provCastFlowOk` and `ptrAliasingOk (provCastAliasView body)` enforce exactly
 this. -/
@@ -4958,8 +4963,9 @@ def provCastAliasStmt (s : MirAst.Statement) : MirAst.Statement :=
 /-- The body as `ptrAliasingOk` must see it: exposed-address locals become
 pointer locals and provenance casts become pointer copies, so a reconstructed
 pointer shares the borrow tag (and `PtrLocalState`) of the exposed one, exactly
-as Anneal's `tag * 65536 + offsetBytes` encoding round-trips the tag. The
-identity on bodies without provenance casts. -/
+as Anneal's `recoverExposedPtrValue?` recovers the exposed tag from its
+canonical address (`AnnealExposeRoundTripOk`). The identity on bodies without
+provenance casts. -/
 def provCastAliasView (body : MirAst.CapturedMir) : MirAst.CapturedMir :=
   if hasProvCast body then
     let E := exposedIntLocals body

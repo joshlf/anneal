@@ -4321,9 +4321,12 @@ theorem evalStmt_assign_withExposed (s : MachineState) (decls : List LocalDecl)
        rw [hptr8, hbad, hsrc];
        simp [evalOperand, get?, hu])
 
-/-- Anneal's `expose_provenance` -> `with_exposed_provenance` round-trip identity:
-any `ProvenancePtr` with `pv.offsetBytes < 65536` (in particular `pv.offsetBytes = 0`)
-recovers `pv` identically from `pv.allocId * 65536 + pv.offsetBytes`. -/
+/-- Arithmetic round-trip identity of the former tag-encoded exposure
+(`pv.allocId * 65536 + pv.offsetBytes`, recovered as quotient and remainder):
+any `ProvenancePtr` with `pv.offsetBytes < 65536` (in particular
+`pv.offsetBytes = 0`) is recovered identically. Anneal no longer exposes this
+encoding (it exposes canonical stack addresses, `evalRvalue_expose`); its current
+round trip is `AnnealExposeRoundTripOk` (`AnnealExposeRoundTripOk.of_structural`). -/
 theorem expose_withExposed_roundtrip (pv : ProvenancePtr) (hoff : pv.offsetBytes < 65536) :
     ({ allocId := (pv.allocId * 65536 + pv.offsetBytes) / 65536,
        offsetBytes := (pv.allocId * 65536 + pv.offsetBytes) % 65536 } : ProvenancePtr) = pv := by

@@ -1658,7 +1658,8 @@ def int2ptrUnexposedDerefUb : CapturedMir :=
      .assign (local_ 0) (.use (.copy (derefPlace 3)))]
 
 /-- The forged address `256` is not an exposed-address local, so `provCastFlowOk`
-rejects the body (Anneal decodes any integer into a tag, see `int2ptrForgedTag`). -/
+rejects the body (forged integers stay outside the fragment even though Anneal
+now recovers no provenance from an unexposed address, see `int2ptrForgedTag`). -/
 theorem int2ptrUnexposedDerefUb_notInFragmentWithIntrinsics :
     inFragmentWithIntrinsics int2ptrUnexposedDerefUb = false := by decide +kernel
 

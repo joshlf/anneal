@@ -11205,9 +11205,10 @@ structure AnnealExposeRoundTripOk (body : CapturedMir) (s : MachineState)
 /-- Target-slot readiness for `entry` in `s.frame.locals`: `entry.targetLocal`
 is not `.dead`, and if `entry` borrows a proper sub-place (`entry.targetProjection
 ≠ []`), `body` satisfies `ptrDeclLayoutsOk` and `s.frame.locals[entry.targetLocal]?`
-holds a well-typed initialized value (automatic for whole-local borrows
-`entry.targetProjection = []`, and automatic for sub-place borrows whenever
-`ptrDeclLayoutsOk body = true` and `s.frame.locals` agrees with `view`). -/
+holds a well-typed initialized value. The sub-place conjunct is vacuous for
+whole-local borrows (`entry.targetProjection = []`), and the liveness conjunct
+follows from `StaleOk` whenever the MiniRust view keeps `entry.targetLocal`
+live (`ExposeTargetSlotOk.of_stale_wholeLocal`). -/
 def ExposeTargetSlotOk (body : CapturedMir) (s : MachineState)
     (entry : BorrowEntry) : Prop :=
   s.frame.locals[entry.targetLocal]? ≠ some .dead ∧
@@ -12831,6 +12832,38 @@ def AddrTakenTargetsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
       isPtrTy d.ty = false ∧
       AddrOk (ctx.addrs.getD k 0) (itOf d body.layouts) ∧
       ctx.addrs.getD k 0 + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64)
+
+/-- Whole-local `ExposeTargetSlotOk` from `StaleOk`: when `entry` borrows a whole
+local (`entry.targetProjection = []`) that the MiniRust view keeps live, the Anneal
+slot is not `.dead` either, since `StaleOk` lets the two differ only on moved-out
+locals, whose Anneal slot is `.uninit`. -/
+theorem ExposeTargetSlotOk.of_stale_wholeLocal {body : CapturedMir} {s : MachineState}
+    {view : List LocalSlot} {entry : BorrowEntry}
+    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hview : view[entry.targetLocal]? ≠ some .dead)
+    (hwhole : entry.targetProjection = []) :
+    ExposeTargetSlotOk body s entry := by
+  refine ⟨?_, fun hne => absurd hwhole hne⟩
+  intro hdead
+  by_cases heq : s.frame.locals[entry.targetLocal]? = view[entry.targetLocal]?
+  · exact hview (heq.symm.trans hdead)
+  · obtain ⟨_, hun, _⟩ := hstale.2 entry.targetLocal heq
+    simp [hdead] at hun
+
+/-- Whole-local `ExposeTargetSlotOk` for every borrow-table entry: `BorrowsOk`
+places each entry's target among the address-taken locals, which
+`AddrTakenTargetsOk` keeps live in the MiniRust view, so `StaleOk` transfers
+liveness to the Anneal slot (`ExposeTargetSlotOk.of_stale_wholeLocal`). -/
+theorem ExposeTargetSlotOk.of_addrTaken_wholeLocal {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr} {entry : BorrowEntry}
+    (hb : BorrowsOk body ctx view s lm)
+    (hat : AddrTakenTargetsOk body ctx view lm)
+    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hmem : entry ∈ s.memory.borrows)
+    (hwhole : entry.targetProjection = []) :
+    ExposeTargetSlotOk body s entry := by
+  obtain ⟨_, _, _, _, hk, _⟩ := hb.entries_ok entry hmem
+  exact ExposeTargetSlotOk.of_stale_wholeLocal hstale (hat entry.targetLocal hk).1 hwhole
 
 /-- Connecting `BorrowsOk` directly to `ExposedTargetAtAddr`: for any valid
 pointer slot `view[p]? = some (.init (.ptr ptrVal 8))` in `BorrowsOk`, its borrow
@@ -14997,11 +15030,13 @@ theorem ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
       cases hmem_nil)
     hlen_lt hty1 hbad2
 
-/-- Completely hypothesis-free closed 3-segment simulation (`Assume` ->
-`PointerExposeProvenance` -> `PointerWithExposedProvenance`) at `exposedTags = []`:
-neither `AnnealExposeRoundTripOk`, nor `NoCompetingExposedBorrow`, nor `hnoadj`,
-nor `hnd_d` appears in the hypotheses; for whole-local borrows (`entry.targetProjection
-= []`), `hsub_slot` is vacuously true. -/
+/-- Closed 3-segment simulation (`Assume` -> `PointerExposeProvenance` ->
+`PointerWithExposedProvenance`) at `exposedTags = []` without any exposure
+side condition: neither `AnnealExposeRoundTripOk`, nor `NoCompetingExposedBorrow`,
+nor `hnoadj`, nor `hnd_d` appears in the hypotheses. What remains beyond the
+frame invariants is the locals-count bound `hlen_lt` and the sub-place slot
+readiness `hsub_slot`, which is vacuously true for whole-local borrows
+(`entry.targetProjection = []`). -/
 theorem ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_frameOk
     {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}

@@ -45,8 +45,9 @@ the correspondence (`step_correspondence`) across `&raw const` / `&raw mut`,
   applies the Tree Borrows write transition to every entry
   (`invalidateDerefWriteBorrows_eq_map`); `Offset(p, n)` scales the 8-byte count
   `n` by the pointee stride, bounds-checks it, and faults on `Disabled` tags
-  (`evalRvalue_offset`); and `PointerExposeProvenance` returns
-  `tag * 65536 + offsetBytes` (`evalRvalue_expose`).
+  (`evalRvalue_offset`); and `PointerExposeProvenance` returns the canonical
+  address `ptrAddress?` of the borrowed place and records the tag in
+  `Memory.exposedAllocIds` (`evalRvalue_expose`).
 
 The two models agree on creating raw pointers and references to locals, array
 elements, or struct/tuple fields, on reborrowing and copying them, on reading
@@ -55,16 +56,14 @@ CFGs by `ptrAliasingOk` / `PtrEnvOk`, including cold `hot = false` two-phase and
 reference reborrow `.reserved` entries across foreign reads), on stride-scaled
 `BinOp::Offset` bounds checks and array element byte-offset dereferencing, on
 `PtrToPtr` casts, and on rejecting reads through dangling or uninitialized
-pointers/references. They disagree, with MiniRust as the ground truth, on:
+pointers/references. Under the places-ptr `Trusted` semantics they also agree
+on misaligned sub-scalar byte-offset dereferences (UB in both, `misaligned`)
+and on exposed addresses (two pointers to the same local expose the same
+canonical address, `exposeTwice`); both stay outside `inFragment` (they were
+divergences before the places-ptr `Trusted` semantics). They disagree, with
+MiniRust as the ground truth, on:
 
-1. **Misaligned sub-scalar byte-offset dereference**: reading a scalar (such as
-   `u32`) through a pointer offset by a non-multiple of its alignment (such as
-   `1` byte into a `u32` scalar local) returns the underlying local's value in
-   Anneal, whereas MiniRust raises UB on misaligned loads (`misaligned`).
-2. **Exposed addresses**: Anneal's address encodes the borrow tag, so two
-   pointers to the same local expose different integers; MiniRust exposes the
-   allocation's address (`exposeTwice`).
-3. **Aliasing on `BasicMemory`**: Anneal's Tree Borrows entries make a write
+1. **Aliasing on `BasicMemory`**: Anneal's Tree Borrows entries make a write
    through a `Frozen` pointer (including an `Active` entry frozen by a foreign
    read), or an access through a tag disabled by a foreign write, UB;
    `BasicMemory` has no aliasing model (`retag_ptr` is the identity) and accepts
@@ -72,8 +71,7 @@ pointers/references. They disagree, with MiniRust as the ground truth, on:
    disables every pointer local such an access could reach (`stepDerefWrite`,
    `stepForeignRead`; soundness `PtrEnvOk.foreignRead`, `PtrEnvOk.derefRead`).
 
-In 1-2 Anneal's semantics accepts executions that MiniRust rejects or runs
-differently, so a correspondence covering them would be false; in 3 Anneal is
+Here Anneal is
 merely stricter than `BasicMemory`, and `ptrAliasingOk` tracks tag liveness and
 reservation (`hot : Bool`) flow-sensitively across CFGs so safe Rust
 borrow/reborrow patterns (two-phase borrows with foreign reads, mutable reborrow

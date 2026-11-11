@@ -4658,6 +4658,8 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
   ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_frameOk
   exposeCompetingDisabledParent_annealExposeRoundTripOk
+  ExposeTargetSlotOk.of_stale_wholeLocal
+  ExposeTargetSlotOk.of_addrTaken_wholeLocal
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 
@@ -5045,6 +5047,8 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   ProvenanceRel.expose_then_withExposed_unexposed_from_frameOk
   ProvenanceRel.assume_then_expose_then_withExposed_closed_unexposed_from_frameOk
   exposeCompetingDisabledParent_annealExposeRoundTripOk
+  ExposeTargetSlotOk.of_stale_wholeLocal
+  ExposeTargetSlotOk.of_addrTaken_wholeLocal
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 
