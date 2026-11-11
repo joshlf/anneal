@@ -6805,10 +6805,16 @@ impl StatementEvalState {
     /// Writes `new_slot` (`Uninit`, `Partial`, or `Init`) into `(dst_local, dst_proj)` of type
     /// `expected_ty`.
     ///
-    /// Array elements have no per-element `Uninit` / `PartialShell` slots (`c6d2ad74`): writing
-    /// an uninitialized slot into an element of an array that is itself uninitialized leaves it
-    /// unchanged, while any other non-`Init` element write fails closed with
-    /// `UninitializedLocal` (as an element write into an uninitialized array does).
+    /// An `Init` slot is an ordinary write ([`Self::write_place`]). A non-`Init` slot that the
+    /// value tree cannot hold at the destination is never stored as a guess:
+    /// - inside a union field (a union value is one initialized field), it is
+    ///   `UnsupportedMemoryAccess`, unless an uninitialized slot lands on an already
+    ///   uninitialized destination (no change);
+    /// - in an array element (arrays have no per-element `Uninit` / `PartialShell` slots,
+    ///   `c6d2ad74`), an uninitialized slot leaves an uninitialized array unchanged and
+    ///   deinitializes a 1-element array `[T; 1]` whose element 0 it covers, while any other
+    ///   element write fails closed with `UninitializedLocal` (as an element write into an
+    ///   uninitialized array does).
     fn write_subplace_slot(
         &mut self,
         dst_local: Local,
@@ -6825,19 +6831,17 @@ impl StatementEvalState {
         if let FieldSlot::Init(val) = new_slot {
             return self.write_place(&dst_place, expected_ty, val);
         }
-        // Element `0` (or `0..1`) of a 1-element array `[T; 1]` covers the entire array, so
-        // writing `Uninit` to it deinitializes the 1-element array itself.
+        // Element `0` of a 1-element array `[T; 1]` (canonically `ConstantIndex { offset: 0,
+        // min_length: 1 }`, whose `min_length` is the array length) covers the entire array, so
+        // writing `Uninit` to it deinitializes the 1-element array itself. (A canonical
+        // `Subslice { from: 0, to: 1 }` is a proper window of a longer array, never the whole
+        // array, so it is not stripped.)
         let mut dst_proj = dst_proj;
         if matches!(new_slot, FieldSlot::Uninit) {
             while let Some((
                 ProjectionElem::ConstantIndex {
                     offset: 0,
                     min_length: 1,
-                    from_end: false,
-                }
-                | ProjectionElem::Subslice {
-                    from: 0,
-                    to: 1,
                     from_end: false,
                 },
                 prefix,
@@ -9545,6 +9549,9 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             return Err(RvalueEvalError::DeadLocal(Local(target_local)));
         }
     }
+    // As for loads and stores (`resolve_deref_place_in` resolves a `Deref` before reading the
+    // `Index` operands after it), the pointer's own faults come first: when a tail `Index`
+    // operand cannot be read, a null or storage-dead `base_ptr` is reported before it.
     let mut tail_index_cache = Vec::new();
     for elem in tail {
         if let ProjectionElem::Index(idx_local) = elem {
