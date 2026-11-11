@@ -3776,7 +3776,13 @@ root `Deinit` take a declared scalar-family or thin pointer/reference local
 `Deinit` only without projections: Anneal's `Deinit` of a projected place reads
 the projected value and leaves the slot initialized, whereas MiniRust's writes
 `Uninit` to the projected bytes). `storageDeadOk` restricts `StorageDead`
-further. -/
+further. A non-function-entry `Retag(kind, _i)` takes an unprojected declared
+thin pointer/reference local `_i`: any kind (`Default`, `TwoPhase`, `Raw`) on a
+reference local (Anneal's `evalNonFnEntryRetag` reads through and pushes a child
+tag with the same `retagPerm` for all three kinds, while MiniRust lowers it to
+`Validate(_i, false)`), but only `Retag([raw], _i)` on a raw-pointer local
+(Anneal raises UB on a `Default`/`TwoPhase` raw-pointer retag, whereas MiniRust's
+`Validate` is a no-op); `Retag([fn entry], _)` is rejected. -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
     (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
   match s.kind with

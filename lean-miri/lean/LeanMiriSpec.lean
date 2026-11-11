@@ -176,7 +176,9 @@ import LeanMiriSpec.Audit
   `wrapping`, including zero-count offsets on live/dangling/scalar pointers across all
   exact-layout pointee strides and nonzero-offset scalar UB), relational raw-pointer
   comparisons (`Eq`..`Ge` across same-allocation, `< 64` KiB cross-local `Eq`/`Ne`, and
-  null-vs-live regimes, plus cross-local ordering and page-wrapping address boundaries),
+  null-vs-live regimes; the exact two-address-model result formula
+  `step_rawPtr_cmp_ptr_ptr_exact`, with a concrete cross-local ordering divergence; and
+  page-wrapping / integer-threshold address boundaries),
   `UnOp.PtrMetadata` on thin raw pointers, `CastKind.PtrToPtr` (pointer and scalar
   operands, `.copy` and `.move`), fail-closed provenance exposure boundaries, and
   unified `WellTypedLM3_1StateStmt` / `WellTypedLM3_1StateTerminator` /

@@ -20146,6 +20146,89 @@ example :
       StateRelLM3_1 b s₅ m₅ map₅) :=
   Witness.wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps
 
+
+-- Exact two-address-model `D12` characterization and concrete cross-local ordering divergence.
+example
+    {body : CapturedMir}
+    {s : MachineState}
+    {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind₁ opKind₂ : Place → MirAst.Operand}
+    (hopKind₁ : opKind₁ = MirAst.Operand.copy ∨ opKind₁ = MirAst.Operand.move)
+    (hopKind₂ : opKind₂ = MirAst.Operand.copy ∨ opKind₂ = MirAst.Operand.move)
+    {bop : MirAst.BinOp}
+    (hbop : IsCmpBinOp bop)
+    {bb : BasicBlockData}
+    {dstIdx lhsIdx rhsIdx : Local}
+    {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩
+      (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩)
+    {dstDecl lhsDecl rhsDecl : MirAst.LocalDecl}
+    {lhsMut rhsMut : Mutability}
+    {lhsPointee rhsPointee : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
+    (hlhs_ty : lhsDecl.ty.kind = .rawPtr lhsMut lhsPointee)
+    (hrhs_ty : rhsDecl.ty.kind = .rawPtr rhsMut rhsPointee)
+    (hdst_ty : dstDecl.ty.kind = .bool)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧
+      IsImmediateFrameLocal topFrame lhsIdx ∧
+      IsImmediateFrameLocal topFrame rhsIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {ptrVal₁ ptrVal₂ : ProvenancePtr}
+    {e₁ e₂ : AllocMapEntry}
+    (hlhs_ptr : get? s.frame.locals lhsIdx = some (.init (.ptr ptrVal₁ 8)))
+    (hrhs_ptr : get? s.frame.locals rhsIdx = some (.init (.ptr ptrVal₂ 8)))
+    (he₁ : e₁ ∈ allocMap)
+    (htag₁ : e₁.tag = ptrVal₁.tag)
+    (hloc₁_lt : e₁.localIdx < 2 ^ 32)
+    (he₂ : e₂ ∈ allocMap)
+    (htag₂ : e₂.tag = ptrVal₂.tag)
+    (hloc₂_lt : e₂.localIdx < 2 ^ 32)
+    (hmove_disj : opKind₁ = MirAst.Operand.move → lhsIdx ≠ rhsIdx)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
+    (∃ s', stepMirFn body s = .step s' ∧
+      get? s'.frame.locals dstIdx = some (.init (.scalar (boolToScalar
+        (relOpBool bop (((1048576 + e₁.localIdx) * 65536 + ptrVal₁.offsetBytes : Nat) : Int)
+          (((1048576 + e₂.localIdx) * 65536 + ptrVal₂.offsetBytes : Nat) : Int)))))) ∧
+    ∃ m' tf',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool
+          (relOpBool bop ((e₁.allocId.value.toNat * 2 ^ 32 + ptrVal₁.offsetBytes : Nat) : Int)
+            ((e₂.allocId.value.toNat * 2 ^ 32 + ptrVal₂.offsetBytes : Nat) : Int))))))) :=
+  step_rawPtr_cmp_ptr_ptr_exact hstate hphase hopKind₁ hopKind₂ hbop hbb hstmt hdecl_dst
+    hdecl_lhs hdecl_rhs hlhs_ty hrhs_ty hdst_ty himm hdst_live hlhs_ptr hrhs_ptr he₁ htag₁
+    hloc₁_lt he₂ htag₂ hloc₂_lt hmove_disj hptr8
+
+open Witness in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState)
+      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (map₂ : List AllocMapEntry),
+      let b := lm31CrossLocalOrderDivergenceBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b (mkTwoU64AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkTwoU64MiriPre b boolTyLM31) = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ map₂ ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      get? s₃.frame.locals 0 = some (.init (.scalar ⟨1, 1⟩)) ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      m₃.stack.frames = #[tf₃] ∧
+      (tf₃.locals[0]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool false))))) :=
+  Witness.wit_lm3_1_d12_cross_local_order_divergence_real_steps
+
 #assert_standard_axioms
   Witness.mkTwoU64AnnealPre
   Witness.mkTwoU64MiriFramePre
@@ -20209,6 +20292,9 @@ example :
   Witness.lm31NullU64OffsetNonzeroBody
   Witness.lm31CrossLocalRawPtrCmpBody
   Witness.wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps
+  step_rawPtr_cmp_ptr_ptr_exact
+  Witness.lm31CrossLocalOrderDivergenceBody
+  Witness.wit_lm3_1_d12_cross_local_order_divergence_real_steps
 
 end Ep3Pins
 

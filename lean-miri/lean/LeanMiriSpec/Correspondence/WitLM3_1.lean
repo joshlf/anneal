@@ -11575,9 +11575,11 @@ comparison simulation regimes through unified `step_mir_lm3_1_state_simulation`:
    2-step lockstep executions (both machines' real-step equations exported) of
    `lm31RawPtrCmpPtrBody` (`_3 = Eq(copy _2, copy _2)` -> `true`; both operands are
    the SAME pointer into `_1`, so this exercises the `< 65536`-offset `Eq`/`Ne`
-   constructor only on an identical-pointer instance, NOT on pointers into two
-   distinct locals) and `lm31RawPtrCmpScalarPtrBody` (`_0 = Eq(copy _1, copy _2)` with
-   null `_1` -> `false`) preserving `StateRelLM3_1`. -/
+   constructor only on an identical-pointer instance; the genuinely cross-local
+   (distinct allocations) `Eq`/`Ne` trace is Part (4) of
+   `wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps`) and
+   `lm31RawPtrCmpScalarPtrBody` (`_0 = Eq(copy _1, copy _2)` with null `_1` -> `false`)
+   preserving `StateRelLM3_1`. -/
 theorem wit_lm3_1_d12_cmp_branch_state_simulation_real_steps :
     -- (1) 5-step same-allocation `Lt` -> `SwitchInt` on `lm31RawPtrCmpBranchBody`
     (∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState)
@@ -12769,5 +12771,141 @@ theorem wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps :
       exact ⟨e₁, e₂, he₁, he₂, hl₁, hl₂, hne (by decide)⟩
     exact ⟨s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅, map₅,
       hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, rfl, hs₄, hm₄, rfl, hs₅, hm₅, rfl, hdistinct₅, hrel₅⟩
+
+
+/-- `Runtime(PostCleanup)` MIR body taking the addresses of two distinct `u64` locals in
+the REVERSE of their MIR `Local` order and comparing them:
+```text
+bb0: _4 = &raw const _2;   // `lean-miri` allocates `_2` first (`allocId = 1`)
+     _3 = &raw const _1;   // `lean-miri` allocates `_1` second (`allocId = 2`)
+     _0 = Lt(copy _3, copy _4);
+     return;
+``` -/
+def lm31CrossLocalOrderDivergenceBody : CapturedMir where
+  defPath := "lm_3_1_witness::cross_local_order_divergence"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDeclLM31, u64Decl, u64Decl, rawPtrConstU64Decl,
+    rawPtrConstU64Decl, boolDeclLM31]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 4) (.rawPtr .not (local_ 2))),
+        mkStmt (.assign (local_ 3) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 0) (.binaryOp .lt (.copy (local_ 3)) (.copy (local_ 4))))],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_d12_cross_local_order_divergence_real_steps`**: concrete GENUINE `D12`
+address-model divergence (non-vacuity of the cross-local ordering boundary of
+`step_rawPtr_cmp_ptr_divergence`). Both machines execute `_4 = &raw const _2` and
+`_3 = &raw const _1` in lockstep (`step_rawPtr_addrOf_lm3_1_simulation`, preserving
+`StateRelLM3_1`); then `_0 = Lt(copy _3, copy _4)` steps normally in BOTH machines
+(`step_rawPtr_cmp_ptr_ptr_exact`) but Anneal stores `true`
+(`(1048576 + 1) * 65536 < (1048576 + 2) * 65536`: `_1` precedes `_2` in `Local` order)
+while `lean-miri` stores `false` (`2 * 2 ^ 32 > 1 * 2 ^ 32`: `_1` was allocated after
+`_2`), so the two machines' results for this comparison disagree. -/
+theorem wit_lm3_1_d12_cross_local_order_divergence_real_steps :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState)
+      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (map₂ : List AllocMapEntry),
+      let b := lm31CrossLocalOrderDivergenceBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b (mkTwoU64AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkTwoU64MiriPre b boolTyLM31) = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ map₂ ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      get? s₃.frame.locals 0 = some (.init (.scalar ⟨1, 1⟩)) ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      m₃.stack.frames = #[tf₃] ∧
+      (tf₃.locals[0]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool false))))) := by
+  let b := lm31CrossLocalOrderDivergenceBody
+  let s₀ := mkTwoU64AnnealPre b
+  let m₀ := mkTwoU64MiriPre b boolTyLM31
+  obtain ⟨hrel_base₀, himm_base₀⟩ := mkTwoU64_stateRel_and_imm b boolTyLM31
+    boolDeclLM31 rawPtrConstU64Decl rawPtrConstU64Decl boolDeclLM31 rfl rfl
+  have hrel₀ : StateRelLM3_1 b s₀ m₀ [] := hrel_base₀.toLM3_1
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+  let be₁ := rawPtrBorrowEntry b.localDecls b.layouts .not 2 1
+  let be₂ := rawPtrBorrowEntry b.localDecls b.layouts .not 1 2
+  -- Step 1: `_4 = &raw const _2` (tag `1`; `lean-miri` allocates `_2` first)
+  have himm₀_42 : ∀ tf, m₀.stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 4 ∧ IsImmediateFrameLocal tf 2 :=
+    fun tf htf => ⟨himm_base₀ tf htf 4, himm_base₀ tf htf 2⟩
+  have hsim₁ := step_rawPtr_addrOf_lm3_1_simulation hrel₀ hphase
+    (dstIdx := 4) (targetIdx := 2) (mutability := .not) rfl rfl
+    (dstDecl := rawPtrConstU64Decl) (targetDecl := u64Decl) (pointeeKind := .uint .u64)
+    rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀_42
+    AllocIdSupplyReady.empty
+  let s₁ := mkWitState b 1
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩), .uninit, .init ptr1, .uninit]
+    [be₁] 2
+  have hs₁ : stepMirFn b s₀ = .step s₁ := rfl
+  obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_1_of_anneal_step hsim₁ hs₁
+  obtain ⟨⟨hsupply₁, hnext₁, hsrc₁⟩, himm_s₁⟩ :=
+    step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀_42
+      AllocIdSupplyReady.empty (by change 1 + 1 < 2 ^ 32; decide) (fun h => nomatch h) hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 2 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne => himm_s₁ _ tf₁ rfl htf₁ k hne (himm_base₀ _ rfl k)
+  -- Step 2: `_3 = &raw const _1` (tag `2`; `lean-miri` allocates `_1` second)
+  have himm₁_31 : ∀ tf₁, m₁.stack.frames = #[tf₁] →
+      IsImmediateFrameLocal tf₁ 3 ∧ IsImmediateFrameLocal tf₁ 1 :=
+    fun tf₁ htf₁ => ⟨himm₁ tf₁ htf₁ 3 (by decide), himm₁ tf₁ htf₁ 1 (by decide)⟩
+  have hsim₂ := step_rawPtr_addrOf_lm3_1_simulation hrel₁ hphase
+    (dstIdx := 3) (targetIdx := 1) (mutability := .not) rfl rfl
+    (dstDecl := rawPtrConstU64Decl) (targetDecl := u64Decl) (pointeeKind := .uint .u64)
+    rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_31 hsupply₁
+  let s₂ := mkWitState b 2
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩), .init ptr2, .init ptr1, .uninit]
+    [be₂, be₁] 3
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_1_of_anneal_step hsim₂ hs₂
+  obtain ⟨_, himm_s₂⟩ :=
+    step_rawPtr_addrOf_preserves_supply hrel₁ rfl rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_31 hsupply₁
+      (by rw [hnext₁]; change 2 + 1 < 2 ^ 32; decide)
+      (by rw [hsrc₁]; intro h; cases h) hm₂
+  have himm₂ : ∀ tf₂, m₂.stack.frames = #[tf₂] → ∀ k, k ≠ 1 → k ≠ 2 →
+      IsImmediateFrameLocal tf₂ k := by
+    intro tf₂ htf₂ k hk₁ hk₂; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+    exact himm_s₂ tf₁ tf₂ htf₁ htf₂ k hk₁ (himm₁ tf₁ htf₁ k hk₂)
+  -- Step 3: `_0 = Lt(copy _3, copy _4)`: the two address models disagree
+  obtain ⟨⟨s₃, hs₃, hget₃⟩, m₃, tf₃, hm₃, htf₃, hval₃⟩ :=
+    step_rawPtr_cmp_ptr_ptr_exact hrel₂ hphase (Or.inl rfl) (Or.inl rfl)
+      (bop := .lt) (Or.inr (Or.inr (Or.inl rfl)))
+      (dstIdx := 0) (lhsIdx := 3) (rhsIdx := 4) rfl rfl
+      (dstDecl := boolDeclLM31) (lhsDecl := rawPtrConstU64Decl) (rhsDecl := rawPtrConstU64Decl)
+      rfl rfl rfl rfl rfl rfl
+      (fun tf₂ htf₂ => ⟨himm₂ tf₂ htf₂ 0 (by decide) (by decide),
+        himm₂ tf₂ htf₂ 3 (by decide) (by decide), himm₂ tf₂ htf₂ 4 (by decide) (by decide)⟩)
+      (by intro h; cases h)
+      (ptrVal₁ := { allocId := 2, offsetBytes := 0 }) (ptrVal₂ := { allocId := 1, offsetBytes := 0 })
+      rfl rfl (.head _) rfl (by show (1 : Nat) < 2 ^ 32; decide) (.tail _ (.head _)) rfl
+      (by show (2 : Nat) < 2 ^ 32; decide)
+      (fun h => absurd (congrFun h ⟨0, .nil⟩) (by nofun))
+  have hfalse :
+      relOpBool .lt (((m₁.machine.memory.nextAllocId).toNat * 2 ^ 32 + 0 : Nat) : Int)
+        (((m₀.machine.memory.nextAllocId).toNat * 2 ^ 32 + 0 : Nat) : Int) = false := by
+    rw [hnext₁]; decide +kernel
+  have htrue : relOpBool .lt (((1048576 + 1) * 65536 + 0 : Nat) : Int)
+      (((1048576 + 2) * 65536 + 0 : Nat) : Int) = true := by
+    decide +kernel
+  refine ⟨s₁, s₂, s₃, m₁, m₂, m₃, tf₃, _, hs₁, hm₁, hs₂, hm₂, hrel₂, hs₃, ?_, hm₃, htf₃, ?_⟩
+  · rw [hget₃]
+    show some (LocalSlot.init (Value.scalar (boolToScalar
+      (relOpBool .lt (((1048576 + 1) * 65536 + 0 : Nat) : Int)
+        (((1048576 + 2) * 65536 + 0 : Nat) : Int))))) = _
+    rw [htrue]; rfl
+  · rw [hval₃]; exact congrArg (fun x => some (Miri.Interpreter.LocalValue.live
+      (.immediate (.scalar (.fromScalarInt (.ofBool x)))))) hfalse
 
 end LeanMiriSpec.Correspondence.Witness
