@@ -10,7 +10,7 @@
 //! Batch compilation, live Miri + Anneal oracle execution, coverage reporting,
 //! and self-contained finding bundle generation for `miri-difftest`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -19,10 +19,14 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cargo_anneal::{
-    AnnealOutcome, ComparisonVerdict, DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS,
-    DEFAULT_ORACLE_FUEL, DifftestOracleConfig, DivergenceKind, ItemOracleReport, MiriOutcome,
-    MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
-    discover_zero_arg_pub_fns, run_difftest_oracle_pipeline, source_files_match,
+    ANNEAL_CAPTURE_FILTER_ENV, AnnealOutcome, CaptureDriverConfig, ComparisonVerdict,
+    DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
+    DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
+    MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
+    aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
+    derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
+    parse_anneal_probe_output, resolve_rustc_wrapper, run_miri_oracle,
+    scaffold_workspace_with_config, source_files_match,
 };
 
 use crate::mutators_miri::{
@@ -159,7 +163,7 @@ pub struct MiriCampaignEvalReport {
     /// Deterministic, sorted observation-path signatures observed during live
     /// oracle evaluation (`miri:<mutator_chain_or_template>:<verdict_or_outcome>:<diff_tag>`).
     pub obs_path_signatures: Vec<String>,
-    /// Per-item oracle reports from `run_difftest_oracle_pipeline`.
+    /// Per-item oracle reports from the helper-linked Miri + Anneal oracle pipeline.
     pub item_reports: Vec<ItemOracleReport>,
     /// Total wall-clock duration in milliseconds.
     pub elapsed_ms: f64,
@@ -349,10 +353,11 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
 }
 
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
+    let callees_header = "def linkedCallees : List CapturedMir :=";
     let tag_header = format!("theorem confirm_tag_{fn_name} :");
     let probe_header = format!("theorem confirm_probe_{fn_name} :");
     let mut blocks = Vec::new();
-    for header in [&tag_header, &probe_header] {
+    for header in [callees_header, tag_header.as_str(), probe_header.as_str()] {
         if let Some(start_idx) = confirm_src.find(header) {
             let rest = &confirm_src[start_idx..];
             let end_rel = rest
@@ -391,6 +396,703 @@ path = \"src/lib.rs\"
     fs::write(dir.join("Cargo.toml"), cargo_toml)
         .map_err(|e| format!("failed to write staged Cargo.toml: {e}"))?;
     Ok(dir)
+}
+
+fn escape_lean_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn resolve_lake_bin() -> PathBuf {
+    for var in ["ANNEAL_LAKE", "LAKE"] {
+        if let Ok(val) = env::var(var)
+            && !val.trim().is_empty()
+        {
+            return PathBuf::from(val.trim());
+        }
+    }
+    if let Some(toolchain_root) = cargo_anneal::setup::resolve_installed_toolchain() {
+        let bundled = toolchain_root.join("lean/bin/lake");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        for rel in [
+            ".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake",
+            ".elan/bin/lake",
+            ".anneal/toolchain/lean/bin/lake",
+        ] {
+            let candidate = home_path.join(rel);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("lake")
+}
+
+fn run_lake_build_with_bin(
+    lake_bin: &Path,
+    dot_anneal_dir: &Path,
+    targets: &[&str],
+) -> Result<(), String> {
+    let mut cmd = build_lake_build_command(lake_bin, dot_anneal_dir);
+    for target in targets {
+        cmd.arg(target);
+    }
+    let output = cmd.output().map_err(|err| {
+        format!(
+            "failed to execute '{}' in {}: {}",
+            lake_bin.display(),
+            dot_anneal_dir.display(),
+            err
+        )
+    })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+            dot_anneal_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn find_executable_in_caller_or_system_path(tool_name: &str) -> Option<PathBuf> {
+    for var in ["ANNEAL_CALLER_PATH", "PATH"] {
+        if let Some(path_var) = env::var_os(var) {
+            for dir in env::split_paths(&path_var) {
+                let candidate = dir.join(tool_name);
+                if candidate.is_file() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = fs::metadata(&candidate)
+                            && (meta.permissions().mode() & 0o111) != 0
+                        {
+                            return Some(candidate);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let cargo_bin_tool = PathBuf::from(home).join(".cargo/bin").join(tool_name);
+        if cargo_bin_tool.is_file() {
+            return Some(cargo_bin_tool);
+        }
+    }
+    None
+}
+
+fn resolve_cargo_bin() -> PathBuf {
+    if let Ok(c) = env::var("CARGO")
+        && !c.trim().is_empty()
+    {
+        return PathBuf::from(c.trim());
+    }
+    if let Ok(home) = env::var("HOME") {
+        let candidate = PathBuf::from(home).join(".cargo/bin/cargo");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("cargo")
+}
+
+fn ensure_rustc_wrapper(
+    driver_cfg: &CaptureDriverConfig,
+    anneal_repo_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_rustc_wrapper(driver_cfg);
+    if driver_cfg.rustc_wrapper.is_some() || resolved.is_file() {
+        return Ok(resolved);
+    }
+    if resolved.components().count() == 1
+        && let Some(name) = resolved.to_str()
+        && let Some(found) = find_executable_in_caller_or_system_path(name)
+    {
+        return Ok(found);
+    }
+    if let Some(root) = anneal_repo_root.or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+    }) {
+        let exe_name = format!("anneal-rustc-capture{}", env::consts::EXE_SUFFIX);
+        let built = root.join("target/debug").join(&exe_name);
+        if built.is_file() {
+            return Ok(built);
+        }
+        let cargo_bin = resolve_cargo_bin();
+        let output = Command::new(&cargo_bin)
+            .args(["build", "-p", "anneal-rustc-capture", "--locked"])
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
+        if output.status.success() && built.is_file() {
+            return Ok(built);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Partition captured `Subject` `(short_fn_name, item_module_suffix)` pairs into:
+/// 1. `captured_candidates`: map from candidate short name to its `Mir.<suffix>` suffix, and
+/// 2. `helper_module_suffixes`: deduplicated, deterministically sorted list of intra-crate
+///    helper callee suffixes (such as `MiriDiffCorpus.helper_add_ten`), strictly excluding
+///    all root candidates in `items`.
+fn partition_subject_callees(
+    crate_camel: &str,
+    subject_pairs: &[(String, String)],
+    items: &[OracleItemSpec],
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let spec_names: BTreeSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    let mut captured_candidates: BTreeMap<String, String> = BTreeMap::new();
+    let mut helpers: BTreeSet<String> = BTreeSet::new();
+
+    for (short, suffix) in subject_pairs {
+        let expected_top_suffix = format!("{crate_camel}.{short}");
+        if spec_names.contains(short.as_str()) {
+            if suffix == &expected_top_suffix || !captured_candidates.contains_key(short) {
+                captured_candidates.insert(short.clone(), suffix.clone());
+            }
+            if suffix != &expected_top_suffix {
+                helpers.insert(suffix.clone());
+            }
+        } else {
+            helpers.insert(suffix.clone());
+        }
+    }
+
+    // Never allow a root candidate's own module suffix into `linkedCallees`.
+    for cand_suffix in captured_candidates.values() {
+        helpers.remove(cand_suffix);
+    }
+
+    (captured_candidates, helpers.into_iter().collect())
+}
+
+fn render_linked_callees_expr(helper_module_suffixes: &[String]) -> String {
+    if helper_module_suffixes.is_empty() {
+        "[]".to_string()
+    } else {
+        let elems: Vec<String> = helper_module_suffixes
+            .iter()
+            .map(|s| format!("Mir.{s}.body"))
+            .collect();
+        format!("[{}]", elems.join(", "))
+    }
+}
+
+fn render_linked_anneal_probe_module(
+    crate_camel: &str,
+    items: &[(OracleItemSpec, String)],
+    helper_module_suffixes: &[String],
+) -> String {
+    let mut out = String::new();
+    out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
+    let mut imported_mir = BTreeSet::new();
+    for helper_suffix in helper_module_suffixes {
+        if imported_mir.insert(helper_suffix.clone()) {
+            out.push_str(&format!("import Mir.{helper_suffix}\n"));
+        }
+    }
+    for (item, cand_suffix) in items {
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{}", item.name)
+        } else {
+            cand_suffix.clone()
+        };
+        if imported_mir.insert(suffix.clone()) {
+            out.push_str(&format!("import Mir.{suffix}\n"));
+        }
+    }
+
+    let callees_expr = render_linked_callees_expr(helper_module_suffixes);
+    out.push_str(&format!(
+        "\nnamespace MiriOracleProbe\n\n\
+         open Trusted.Sequence\n\
+         open Trusted.Rustc.V2026_06_01.MirAst\n\
+         open Trusted.Rustc.V2026_06_01.MirSemantics\n\
+         open Trusted.VerificationResult\n\
+         open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+         def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
+         def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
+           let raw :=\n    \
+             match st with\n    \
+             | .running s =>\n      \
+               let cur := s.memory.activeCallee.getD body\n      \
+               match get? cur.basicBlocks s.frame.blockIdx with\n      \
+               | some bb =>\n        \
+                 match get? bb.statements s.frame.stmtIdx with\n        \
+                 | some stmt => stmt.span\n        \
+                 | none => bb.terminator.span\n      \
+               | none => \"none\"\n    \
+             | _ => \"none\"\n  \
+           if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
+         def probeMirDiffExecBounded\n    \
+             (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
+             MirDiffTag × String :=\n  \
+           match fuel with\n  \
+           | 0 => (.outOfFuel, activeSpan body st)\n  \
+           | fuel' + 1 =>\n    \
+             match stepMirState body st with\n    \
+             | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
+             | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
+             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
+             | .ret .panic => (.panic, activeSpan body st)\n    \
+             | .ret .abort => (.abort, activeSpan body st)\n    \
+             | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
+             | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
+             | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
+             | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
+             | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
+             | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n\
+         def formatTag : MirDiffTag → String\n  \
+           | .normalUnit => \"pass:unit\"\n  \
+           | .normalScalar bits sz => s!\"pass:scalar:{{bits}}:{{sz}}\"\n  \
+           | .normalOther => \"pass:other\"\n  \
+           | .panic => \"panic\"\n  \
+           | .abort => \"abort\"\n  \
+           | .ub => \"ub\"\n  \
+           | .unsupported => \"unsupported\"\n  \
+           | .externalCall p => s!\"externalCall:{{p}}\"\n  \
+           | .outOfFuel => \"outOfFuel\"\n\n\
+         def formatProbeLine (name : String) (fuel : Nat) (body : CapturedMir) : String :=\n  \
+           let s := initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees\n  \
+           let (tag, span) := probeMirDiffExecBounded fuel body (.running s)\n  \
+           s!\"ANNEAL_PROBE\\t{{name}}\\t{{formatTag tag}}\\t{{span}}\"\n\n"
+    ));
+    for (item, cand_suffix) in items {
+        let escaped_name = escape_lean_string(&item.name);
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{}", item.name)
+        } else {
+            cand_suffix.clone()
+        };
+        out.push_str(&format!(
+            "#eval IO.println (formatProbeLine \"{escaped_name}\" {} Mir.{suffix}.body)\n",
+            item.fuel
+        ));
+    }
+    out.push_str("\nend MiriOracleProbe\n");
+    out
+}
+
+fn render_linked_anneal_confirm_module(
+    crate_camel: &str,
+    items: &[(OracleItemSpec, String, AnnealOutcome)],
+    helper_module_suffixes: &[String],
+) -> Result<String, String> {
+    let mut out = String::new();
+    out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
+    let mut imported_mir = BTreeSet::new();
+    for helper_suffix in helper_module_suffixes {
+        if imported_mir.insert(helper_suffix.clone()) {
+            out.push_str(&format!("import Mir.{helper_suffix}\n"));
+        }
+    }
+    for (item, cand_suffix, _) in items {
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{}", item.name)
+        } else {
+            cand_suffix.clone()
+        };
+        if imported_mir.insert(suffix.clone()) {
+            out.push_str(&format!("import Mir.{suffix}\n"));
+        }
+    }
+
+    let callees_expr = render_linked_callees_expr(helper_module_suffixes);
+    out.push_str(&format!(
+        "\nset_option maxRecDepth 100000\n\
+         set_option maxHeartbeats 2000000\n\n\
+         namespace MiriOracleConfirm\n\n\
+         open Trusted.Sequence\n\
+         open Trusted.Rustc.V2026_06_01.MirAst\n\
+         open Trusted.Rustc.V2026_06_01.MirSemantics\n\
+         open Trusted.VerificationResult\n\
+         open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+         def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
+         def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
+           let raw :=\n    \
+             match st with\n    \
+             | .running s =>\n      \
+               let cur := s.memory.activeCallee.getD body\n      \
+               match get? cur.basicBlocks s.frame.blockIdx with\n      \
+               | some bb =>\n        \
+                 match get? bb.statements s.frame.stmtIdx with\n        \
+                 | some stmt => stmt.span\n        \
+                 | none => bb.terminator.span\n      \
+               | none => \"none\"\n    \
+             | _ => \"none\"\n  \
+           if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
+         def probeMirDiffExecBounded\n    \
+             (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
+             MirDiffTag × String :=\n  \
+           match fuel with\n  \
+           | 0 => (.outOfFuel, activeSpan body st)\n  \
+           | fuel' + 1 =>\n    \
+             match stepMirState body st with\n    \
+             | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
+             | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
+             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
+             | .ret .panic => (.panic, activeSpan body st)\n    \
+             | .ret .abort => (.abort, activeSpan body st)\n    \
+             | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
+             | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
+             | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
+             | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
+             | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
+             | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n"
+    ));
+
+    for (item, cand_suffix, outcome) in items {
+        let Some(tag_expr) = outcome.to_lean_mir_diff_tag() else {
+            return Err(format!(
+                "cannot render kernel confirmation theorem for '{}' with error outcome {:?}",
+                item.name, outcome
+            ));
+        };
+        let fuel = item.fuel;
+        let name = &item.name;
+        let suffix = if cand_suffix.is_empty() {
+            format!("{crate_camel}.{name}")
+        } else {
+            cand_suffix.clone()
+        };
+        out.push_str(&format!(
+            "theorem confirm_tag_{name} :\n    \
+                 evalMirDiffTagBounded {fuel} Mir.{suffix}.body\n      \
+                   (initMachineStateWithMemoryAndCallees Mir.{suffix}.body [] emptyMemory linkedCallees) =\n      \
+                 {tag_expr} := by\n  \
+               rfl\n\n"
+        ));
+        let escaped_span = outcome
+            .span()
+            .map(|span| escape_lean_string(&span.display_short()))
+            .unwrap_or_else(|| "none".to_string());
+        out.push_str(&format!(
+            "theorem confirm_probe_{name} :\n    \
+                 probeMirDiffExecBounded {fuel} Mir.{suffix}.body\n      \
+                   (.running (initMachineStateWithMemoryAndCallees Mir.{suffix}.body [] emptyMemory linkedCallees)) =\n      \
+                 ({tag_expr}, \"{escaped_span}\") := by\n  \
+               rfl\n\n"
+        ));
+    }
+
+    out.push_str("end MiriOracleConfirm\n");
+    Ok(out)
+}
+
+fn run_linked_difftest_oracle_pipeline(
+    config: &DifftestOracleConfig,
+    items: &[OracleItemSpec],
+) -> Result<DifftestOracleReport, String> {
+    let miri_cfg = MiriOracleConfig {
+        corpus_root: config.corpus_root.clone(),
+        capture_rustflags: config.capture_rustflags.clone(),
+        miri_flags: config.miri_flags.clone(),
+        toolchain: config.toolchain.clone(),
+    };
+    let miri_outcomes = run_miri_oracle(&miri_cfg, items)?;
+
+    let base_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let corpus_root = normalize_path_against(&base_dir, &config.corpus_root);
+    let units_dir = corpus_root.join("target/anneal/units");
+    if units_dir.exists() {
+        let _ = fs::remove_dir_all(&units_dir);
+    }
+    fs::create_dir_all(&units_dir).map_err(|err| {
+        format!(
+            "failed to create capture units directory {}: {}",
+            units_dir.display(),
+            err
+        )
+    })?;
+
+    let driver_cfg = CaptureDriverConfig {
+        workspace_root: corpus_root.clone(),
+        manifest_path: None,
+        units_dir: units_dir.clone(),
+        rustc_wrapper: config.rustc_wrapper.clone(),
+        filter: None,
+        extra_cargo_args: vec!["--lib".to_string()],
+    };
+    let wrapper = ensure_rustc_wrapper(&driver_cfg, config.anneal_repo_root.as_deref())?;
+    let rustflags = if config.capture_rustflags.is_empty() {
+        DEFAULT_CAPTURE_RUSTFLAGS.join(" ")
+    } else {
+        config.capture_rustflags.join(" ")
+    };
+    let cargo_bin = resolve_cargo_bin();
+    let capture_out = Command::new(&cargo_bin)
+        .current_dir(&corpus_root)
+        .arg("check")
+        .arg("--lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env("ANNEAL_CAPTURE_DIR", &units_dir)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .output()
+        .map_err(|err| format!("failed to execute cargo check on corpus: {err}"))?;
+    if !capture_out.status.success() {
+        let stderr = String::from_utf8_lossy(&capture_out.stderr);
+        return Err(format!(
+            "cargo check failed during Anneal oracle capture ({}):\n{}",
+            capture_out.status, stderr
+        ));
+    }
+
+    let (_capture_manifest, records) = aggregate_unit_manifests(&units_dir)?;
+    let scaffold_cfg = ScaffoldConfig {
+        workspace_root: corpus_root.clone(),
+        units_dir: Some(units_dir),
+        anneal_repo_root: config.anneal_repo_root.clone(),
+        init_spec_templates: false,
+        init_proof_templates: false,
+    };
+    scaffold_workspace_with_config(&scaffold_cfg, &records)?;
+
+    let subject_records: Vec<_> = records
+        .iter()
+        .filter(|r| r.item_kind.as_str() == "subject")
+        .collect();
+    if subject_records.is_empty() {
+        return Err("zero subject functions captured from corpus crate".to_string());
+    }
+
+    let sample_suffix = derive_item_module_suffix(subject_records[0]);
+    let crate_camel = sample_suffix
+        .split('.')
+        .next()
+        .ok_or_else(|| format!("invalid item suffix '{sample_suffix}'"))?
+        .to_string();
+
+    let subject_pairs: Vec<(String, String)> = subject_records
+        .iter()
+        .map(|rec| {
+            let short = rec
+                .target
+                .def_id
+                .rsplit("::")
+                .next()
+                .unwrap_or(&rec.target.def_id)
+                .to_string();
+            let suffix = derive_item_module_suffix(rec);
+            (short, suffix)
+        })
+        .collect();
+
+    let (captured_candidates, helper_module_suffixes) =
+        partition_subject_callees(&crate_camel, &subject_pairs, items);
+
+    let mut present_items: Vec<(OracleItemSpec, String)> = Vec::new();
+    let mut anneal_outcomes: BTreeMap<String, AnnealOutcome> = BTreeMap::new();
+    for item in items {
+        if let Some(cand_suffix) = captured_candidates.get(&item.name) {
+            present_items.push((item.clone(), cand_suffix.clone()));
+        } else {
+            anneal_outcomes.insert(
+                item.name.clone(),
+                AnnealOutcome::CaptureOrLeanError(format!(
+                    "item '{}' was not found among captured MIR subjects",
+                    item.name
+                )),
+            );
+        }
+    }
+
+    let dot_anneal = corpus_root.join(".anneal");
+    let oracle_dir = dot_anneal.join("oracle");
+    let lake_bin = resolve_lake_bin();
+
+    if !present_items.is_empty() {
+        run_lake_build_with_bin(
+            &lake_bin,
+            &dot_anneal,
+            &["Mir", "Anneal.Rustc.V2026_06_01.SymbolicEval"],
+        )?;
+
+        fs::create_dir_all(&oracle_dir)
+            .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+        let probe_path = oracle_dir.join("MiriOracleProbe.lean");
+        let probe_src =
+            render_linked_anneal_probe_module(&crate_camel, &present_items, &helper_module_suffixes);
+        fs::write(&probe_path, &probe_src)
+            .map_err(|err| format!("failed to write {}: {}", probe_path.display(), err))?;
+
+        let probe_out = Command::new(&lake_bin)
+            .current_dir(&dot_anneal)
+            .arg("env")
+            .arg("lean")
+            .arg("oracle/MiriOracleProbe.lean")
+            .output()
+            .map_err(|err| {
+                format!(
+                    "failed to execute '{} env lean oracle/MiriOracleProbe.lean': {}",
+                    lake_bin.display(),
+                    err
+                )
+            })?;
+        if !probe_out.status.success() {
+            let stdout = String::from_utf8_lossy(&probe_out.stdout);
+            let stderr = String::from_utf8_lossy(&probe_out.stderr);
+            return Err(format!(
+                "Lean probe evaluation failed in {} ({}):\n{}\n{}",
+                dot_anneal.display(),
+                probe_out.status,
+                stdout,
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+        let mut parsed = parse_anneal_probe_output(&stdout)?;
+        for (item, _) in &present_items {
+            if let Some(outcome) = parsed.remove(&item.name) {
+                anneal_outcomes.insert(item.name.clone(), outcome);
+            } else {
+                anneal_outcomes.insert(
+                    item.name.clone(),
+                    AnnealOutcome::CaptureOrLeanError(format!(
+                        "Lean probe output omitted ANNEAL_PROBE line for '{}'",
+                        item.name
+                    )),
+                );
+            }
+        }
+    }
+
+    let mut reports = Vec::with_capacity(items.len());
+    let mut to_confirm: Vec<(OracleItemSpec, String, AnnealOutcome)> = Vec::new();
+    let mut agree_count = 0usize;
+    let mut diverge_count = 0usize;
+    let mut not_compared_count = 0usize;
+
+    for spec in items {
+        let miri = miri_outcomes.get(&spec.name).cloned().unwrap_or_else(|| {
+            MiriOutcome::OracleError(format!("missing Miri outcome for '{}'", spec.name))
+        });
+        let anneal = anneal_outcomes
+            .get(&spec.name)
+            .cloned()
+            .unwrap_or_else(|| {
+                AnnealOutcome::CaptureOrLeanError(format!(
+                    "missing Anneal outcome for '{}'",
+                    spec.name
+                ))
+            });
+        let verdict = compare_miri_and_anneal(&miri, &anneal);
+        let should_confirm = verdict.is_diverge() && anneal.to_lean_mir_diff_tag().is_some();
+        if should_confirm {
+            let suffix = captured_candidates
+                .get(&spec.name)
+                .cloned()
+                .unwrap_or_else(|| format!("{crate_camel}.{}", spec.name));
+            to_confirm.push((spec.clone(), suffix, anneal.clone()));
+        }
+        match &verdict {
+            ComparisonVerdict::Agree => agree_count += 1,
+            ComparisonVerdict::Diverge(_) => diverge_count += 1,
+            ComparisonVerdict::NotCompared(_) => not_compared_count += 1,
+        }
+        reports.push(ItemOracleReport {
+            name: spec.name.clone(),
+            fuel: spec.fuel,
+            miri,
+            anneal,
+            verdict,
+            kernel_confirmed: should_confirm,
+        });
+    }
+
+    let confirm_module_path = if to_confirm.is_empty() {
+        None
+    } else {
+        fs::create_dir_all(&oracle_dir)
+            .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+        let confirm_path = oracle_dir.join("MiriOracleConfirm.lean");
+        let confirm_src = render_linked_anneal_confirm_module(
+            &crate_camel,
+            &to_confirm,
+            &helper_module_suffixes,
+        )?;
+        fs::write(&confirm_path, &confirm_src)
+            .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
+
+        let confirm_out = Command::new(&lake_bin)
+            .current_dir(&dot_anneal)
+            .arg("env")
+            .arg("lean")
+            .arg("oracle/MiriOracleConfirm.lean")
+            .output()
+            .map_err(|err| {
+                format!(
+                    "failed to execute '{} env lean oracle/MiriOracleConfirm.lean': {}",
+                    lake_bin.display(),
+                    err
+                )
+            })?;
+        if !confirm_out.status.success() {
+            let stdout = String::from_utf8_lossy(&confirm_out.stdout);
+            let stderr = String::from_utf8_lossy(&confirm_out.stderr);
+            return Err(format!(
+                "Lean kernel confirmation failed in {} ({}):\n{}\n{}",
+                confirm_path.display(),
+                confirm_out.status,
+                stdout,
+                stderr
+            ));
+        }
+        Some(confirm_path)
+    };
+
+    Ok(DifftestOracleReport {
+        crate_camel,
+        items: reports,
+        agree_count,
+        diverge_count,
+        not_compared_count,
+        confirm_module_path,
+    })
+}
+
+fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
+    if let Ok(parsed) = syn::parse_file(source) {
+        let mut pub_zero_arg = Vec::new();
+        for item in parsed.items {
+            if let syn::Item::Fn(func) = item
+                && matches!(func.vis, syn::Visibility::Public(_))
+                && func.sig.inputs.is_empty()
+            {
+                let name = func.sig.ident.to_string();
+                if name != "helper_add_ten" {
+                    pub_zero_arg.push(name);
+                }
+            }
+        }
+        if let Some(last) = pub_zero_arg.pop() {
+            return Some(last);
+        }
+    }
+    discover_zero_arg_pub_fns(source)
+        .into_iter()
+        .filter(|name| name != "helper_add_ten")
+        .last()
 }
 
 fn write_finding_bundle_to_dir(
@@ -454,8 +1156,8 @@ fn write_finding_bundle_to_dir(
 }
 
 /// Evaluate generated `batches` through `compile_candidates` followed by the
-/// live Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`),
-/// optionally writing finding bundles under `findings_dir`.
+/// live helper-linked Miri + Anneal oracle pipeline, optionally writing finding
+/// bundles under `findings_dir`.
 pub fn evaluate_miri_batches(
     mode: &str,
     seed: u64,
@@ -568,7 +1270,7 @@ pub fn evaluate_miri_batches(
         toolchain,
     };
 
-    let oracle_report = match run_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
+    let oracle_report = match run_linked_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
         Ok(rep) => rep,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging_dir);
@@ -845,24 +1547,20 @@ pub fn evaluate_miri_batches(
     })
 }
 
-/// Re-run a standalone `repro.rs` file through the live Miri + Anneal oracle
-/// pipeline (`run_difftest_oracle_pipeline`) and return its [`ItemOracleReport`].
+/// Re-run a standalone `repro.rs` file through the live helper-linked Miri +
+/// Anneal oracle pipeline and return its [`ItemOracleReport`].
 pub fn reproduce_miri_finding(
     repro_rs_path: &Path,
     anneal_repo_root: Option<&Path>,
 ) -> Result<ItemOracleReport, String> {
     let source = fs::read_to_string(repro_rs_path)
         .map_err(|e| format!("failed to read {}: {e}", repro_rs_path.display()))?;
-    let fn_names: Vec<String> = discover_zero_arg_pub_fns(&source)
-        .into_iter()
-        .filter(|name| name != "helper_add_ten")
-        .collect();
-    if fn_names.is_empty() {
+    let Some(cand_name) = discover_reproducer_candidate_fn(&source) else {
         return Err(format!(
             "no zero-argument candidate `pub fn` found in {}",
             repro_rs_path.display()
         ));
-    }
+    };
 
     let toolchain = MiriToolchain::resolve(None, None, None)?;
     let staging_dir = create_staging_dir("repro")?;
@@ -871,10 +1569,10 @@ pub fn reproduce_miri_finding(
         return Err(format!("failed to write staged repro src/lib.rs: {e}"));
     }
 
-    let specs: Vec<OracleItemSpec> = fn_names
-        .iter()
-        .map(|n| OracleItemSpec::with_fuel(n.clone(), MIRI_DIFFTEST_CANDIDATE_FUEL))
-        .collect();
+    let specs = vec![OracleItemSpec::with_fuel(
+        cand_name,
+        MIRI_DIFFTEST_CANDIDATE_FUEL,
+    )];
     let cfg = DifftestOracleConfig {
         corpus_root: staging_dir.clone(),
         capture_rustflags: DEFAULT_CAPTURE_RUSTFLAGS
@@ -887,7 +1585,7 @@ pub fn reproduce_miri_finding(
         toolchain,
     };
 
-    let res = run_difftest_oracle_pipeline(&cfg, &specs);
+    let res = run_linked_difftest_oracle_pipeline(&cfg, &specs);
     let _ = fs::remove_dir_all(&staging_dir);
     let mut report = res?;
     report
@@ -1158,4 +1856,113 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_subject_callees_links_helpers_sorted_and_excludes_all_root_candidates() {
+        let mut subject_pairs = vec![
+            (
+                "helper_add_ten".to_string(),
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+            ),
+            (
+                "helper_add_ten".to_string(),
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+            ),
+            (
+                "helper_alpha".to_string(),
+                "MiriDiffCorpus.helper_alpha".to_string(),
+            ),
+        ];
+        let mut specs = Vec::new();
+        for idx in 0..800 {
+            let name = format!("cand__b0_c{idx}");
+            subject_pairs.push((name.clone(), format!("MiriDiffCorpus.{name}")));
+            specs.push(OracleItemSpec::with_fuel(name, MIRI_DIFFTEST_CANDIDATE_FUEL));
+        }
+
+        let (captured_candidates, helpers) =
+            partition_subject_callees("MiriDiffCorpus", &subject_pairs, &specs);
+        assert_eq!(captured_candidates.len(), 800);
+        assert_eq!(
+            helpers,
+            vec![
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+                "MiriDiffCorpus.helper_alpha".to_string(),
+            ]
+        );
+        for spec in &specs {
+            assert!(
+                !helpers.iter().any(|h| h.ends_with(&format!(".{}", spec.name))),
+                "root candidate {} must never enter linkedCallees",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn linked_probe_and_confirm_modules_wire_callees_and_extract_confirm_theorems() {
+        let spec = OracleItemSpec::with_fuel("cand_call_helper", 256);
+        let helpers = vec!["MiriDiffCorpus.helper_add_ten".to_string()];
+
+        let probe_src = render_linked_anneal_probe_module(
+            "MiriDiffCorpus",
+            &[(spec.clone(), "MiriDiffCorpus.cand_call_helper".to_string())],
+            &helpers,
+        );
+        assert!(probe_src.contains("import Mir.MiriDiffCorpus.helper_add_ten\n"));
+        assert!(probe_src.contains("import Mir.MiriDiffCorpus.cand_call_helper\n"));
+        assert!(probe_src.contains(
+            "def linkedCallees : List CapturedMir :=\n  [Mir.MiriDiffCorpus.helper_add_ten.body]"
+        ));
+        assert!(probe_src.contains(
+            "initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees"
+        ));
+
+        let confirm_src = render_linked_anneal_confirm_module(
+            "MiriDiffCorpus",
+            &[(
+                spec,
+                "MiriDiffCorpus.cand_call_helper".to_string(),
+                AnnealOutcome::PassScalar {
+                    bits: 42,
+                    size_bytes: 4,
+                },
+            )],
+            &helpers,
+        )
+        .expect("render confirm module");
+        assert!(confirm_src.contains("import Mir.MiriDiffCorpus.helper_add_ten\n"));
+        assert!(confirm_src.contains(
+            "initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.cand_call_helper.body [] emptyMemory linkedCallees"
+        ));
+        let extracted = extract_confirm_theorems(&confirm_src, "cand_call_helper");
+        assert!(extracted.contains("def linkedCallees : List CapturedMir :="));
+        assert!(extracted.contains("theorem confirm_tag_cand_call_helper :"));
+        assert!(extracted.contains("theorem confirm_probe_cand_call_helper :"));
+        assert!(extracted.contains(":= by\n  rfl"));
+    }
+
+    #[test]
+    fn discover_reproducer_candidate_fn_handles_multiline_and_extra_helpers() {
+        let src = "\
+#![no_std]
+pub fn helper_add_ten() -> u32 { 10 }
+pub fn extra_helper() -> u32 { 5 }
+fn private_after() -> u32 { 1 }
+pub fn target_cand_with_wrapped_parens(
+) -> u32 {
+    helper_add_ten() + extra_helper() + private_after()
+}
+pub fn parameterized_after(x: u32) -> u32 { x }
+";
+        assert_eq!(
+            discover_reproducer_candidate_fn(src).as_deref(),
+            Some("target_cand_with_wrapped_parens")
+        );
+    }
 }

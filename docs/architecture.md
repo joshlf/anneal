@@ -41,7 +41,7 @@ the repository's `trusted/` and `theory/` boundary:
    thin `rustc_driver` wrapper transcribes each compiled crate's
    `Runtime(PostCleanup)` MIR, inline specification attributes (`#[anneal::...]`
    and `/// anneal:...`), and specification/assumption closures
-   ([`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-from-untrusted-repository-contents))
+   ([`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-total-defenses-over-untrusted-repository-contents))
    1-to-1 into a tactic-free, first-order Lean data module (`Mir.crate :
    Trusted.Crate`, emitted into private staging as `Mir.lean`), one of two
    static proof entrypoints (`Proof.lean`), and the crate's zero-churn TCB audit
@@ -75,9 +75,10 @@ scripts remain **outside the human-audited TCB**.
 
 For related context, see:
 
-- [`PRINCIPLES.md`](../PRINCIPLES.md) and
-  [`THREAT_MODEL.md`](../THREAT_MODEL.md) for Anneal's controlling correctness
-  promise and threat model.
+- [`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+  [`PRINCIPLES.md`](../PRINCIPLES.md), and
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md) for Anneal's controlling
+  meta-principles, correctness promise, and threat model.
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
 - [`docs/trust-model.md`](trust-model.md) for how `trusted/` and
@@ -460,6 +461,7 @@ Anneal's directory structure mirrors the trust boundary (`trusted/` vs.
 
 ```text
 anneal/
+├── META_PRINCIPLES.md              # Invariant goals governing PRINCIPLES & THREAT_MODEL
 ├── PRINCIPLES.md                   # Controlling mission & correctness promise
 ├── THREAT_MODEL.md                 # Controlling threat model & 3-layer partition
 ├── trusted/                        # Human-audited Trusted Computing Base (TCB)

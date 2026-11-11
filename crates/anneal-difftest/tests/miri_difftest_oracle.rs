@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anneal_difftest::miri_eval::evaluate_miri_batches;
+use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
     GeneratedMiriCandidate, build_standalone_candidate_source, generate_miri_corpus_batch,
 };
+use cargo_anneal::{CaptureDriverConfig, resolve_rustc_wrapper};
 
 struct TempDir(PathBuf);
 
@@ -88,7 +89,8 @@ fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     assert!(stdout.contains("## `NotCompared` Coverage Table"));
     assert!(stdout.contains("### Unmodeled External Calls"));
     assert!(!stdout.contains("`core::intrinsics::exact_div`"));
-    assert!(stdout.contains("| `miri_diff_corpus::helper_add_ten` | 1 |"));
+    assert!(!stdout.contains("miri_diff_corpus::helper_add_ten"));
+    assert!(stdout.contains("| `core::fmt::Arguments::<'a>::from_str` | 1 |"));
 
     let verify = Command::new("python3")
         .arg("-c")
@@ -107,11 +109,11 @@ assert data["mode"] == "identity"
 assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 75
-assert data["agree_count"] == 75
+assert data["compared_candidates"] == 76
+assert data["agree_count"] == 76
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
-assert data["not_compared_count"] == 2
+assert data["not_compared_count"] == 1
 assert isinstance(data.get("obs_path_signatures"), list)
 assert len(data["obs_path_signatures"]) > 0
 assert all(s.startswith("miri:") for s in data["obs_path_signatures"])
@@ -131,7 +133,7 @@ nc = data["not_compared_reasons"]
 assert nc == {
     "capture_failed": 0,
     "compile_failed": 0,
-    "external_call": 2,
+    "external_call": 1,
     "miri_oracle_error": 0,
     "out_of_fuel": 0,
     "unsupported": 0,
@@ -139,9 +141,9 @@ assert nc == {
 
 ext = data["unmodeled_external_calls"]
 assert "core::intrinsics::exact_div" not in ext, f"unexpected ext: {ext}"
-assert ext.get("core::fmt::Arguments::<'a>::from_str") == 1, f"unexpected ext: {ext}"
-assert ext.get("miri_diff_corpus::helper_add_ten") == 1, f"unexpected ext: {ext}"
-assert sum(ext.values()) == 2, f"unexpected ext sum: {ext}"
+assert "miri_diff_corpus::helper_add_ten" not in ext, f"unexpected ext: {ext}"
+assert ext == {"core::fmt::Arguments::<'a>::from_str": 1}, f"unexpected ext: {ext}"
+assert sum(ext.values()) == 1, f"unexpected ext sum: {ext}"
 
 expected_findings = {}
 
@@ -258,6 +260,9 @@ for label, d in [("seed1", d1), ("seed2", d2)]:
     assert d["diverge_count"] == d["kernel_confirmed_divergences"], label
     assert d["diverge_count"] == len(d["findings"]), label
     assert d["agree_count"] == d["compared_candidates"], label
+    assert d.get("unmodeled_external_calls", {}).get("miri_diff_corpus::helper_add_ten", 0) == 0, (
+        f"{label} unexpected helper_add_ten skip: {d.get('unmodeled_external_calls')}"
+    )
 
 # Seed sensitivity: mutator application counts and Miri/Anneal distributions
 # must change when the seed changes.
@@ -323,6 +328,10 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
     assert_eq!(neg_report.findings.len(), 1);
     let f = &neg_report.findings[0];
     assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_tag_"));
     assert!(f.kernel_confirm_theorems.contains("theorem confirm_probe_"));
     assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
@@ -438,5 +447,305 @@ fn evaluate_miri_batches_counts_compile_failures_and_rejects_zero_compiled() {
     assert!(
         err.contains("cannot perform oracle comparison: 0 of 1 candidates compiled"),
         "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn helper_add_ten_candidates_compare_confirm_and_reproduce_without_external_call_skips() {
+    let dir = unique_temp_dir("helper_callees");
+    let root = repo_root();
+    let bin = env!("CARGO_BIN_EXE_miri-difftest");
+
+    // 1. Both an agreeing mutant and a diverging negative-control mutant calling
+    // `helper_add_ten()` must step into `helper_add_ten`, confirm in the Lean 4
+    // kernel via `initMachineStateWithMemoryAndCallees`, and round-trip cleanly
+    // through `reproduce_miri_finding` and `miri-difftest --reproduce`.
+    let agree_fn = "\
+pub fn agree_helper_call__b0_c0() -> u32 {
+    let base: u32 = helper_add_ten();
+    (base * 3u32) + helper_add_ten() + 2u32
+}
+";
+    let agree_cand = GeneratedMiriCandidate {
+        id: 0,
+        seed_index: 0,
+        seed_name: "pass_direct_fn_call".to_string(),
+        fn_name: "agree_helper_call__b0_c0".to_string(),
+        seed_u64: 0x1111_2222,
+        applied_mutators: vec!["ArithmeticCastMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: agree_fn.to_string(),
+        source: build_standalone_candidate_source(agree_fn),
+    };
+
+    let div_fn = "\
+pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
+    let base: u32 = helper_add_ten();
+    let mut c: char = 'a';
+    let p: *mut u32 = (&raw mut c) as *mut u32;
+    unsafe {
+        *p = 0xD800u32;
+    }
+    base + (c as u32)
+}
+";
+    let div_cand = GeneratedMiriCandidate {
+        id: 1,
+        seed_index: 0,
+        seed_name: "pass_direct_fn_call".to_string(),
+        fn_name: "neg_ctrl_helper_call_surrogate__b0_c1".to_string(),
+        seed_u64: 0x3333_4444,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: div_fn.to_string(),
+        source: build_standalone_candidate_source(div_fn),
+    };
+
+    let findings_dir = dir.join("findings_helper");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0xCAFE_0001,
+        &[vec![agree_cand, div_cand]],
+        2,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate helper_add_ten batch");
+
+    assert_eq!(report.total_candidates, 2);
+    assert_eq!(report.compiled_candidates, 2);
+    assert_eq!(report.compared_candidates, 2);
+    assert_eq!(report.agree_count, 1);
+    assert_eq!(report.diverge_count, 1);
+    assert_eq!(report.not_compared_count, 0);
+    assert_eq!(report.kernel_confirmed_divergences, 1);
+    assert!(
+        !report
+            .unmodeled_external_calls
+            .contains_key("miri_diff_corpus::helper_add_ten"),
+        "unexpected helper_add_ten in unmodeled_external_calls: {:?}",
+        report.unmodeled_external_calls
+    );
+    assert_eq!(report.findings.len(), 1);
+
+    let f = &report.findings[0];
+    assert_eq!(f.fn_name, "neg_ctrl_helper_call_surrogate__b0_c1");
+    assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
+    assert!(f.kernel_confirm_theorems.contains("theorem confirm_tag_"));
+    assert!(f.kernel_confirm_theorems.contains("theorem confirm_probe_"));
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("initMachineStateWithMemoryAndCallees")
+    );
+    assert!(f.kernel_confirm_theorems.contains("linkedCallees"));
+    assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
+
+    let repro_path = f.repro_path.as_ref().expect("repro.rs written");
+    let direct_repro = reproduce_miri_finding(repro_path, Some(&root))
+        .expect("reproduce_miri_finding on helper_add_ten candidate");
+    assert_eq!(direct_repro.name, f.fn_name);
+    assert!(direct_repro.verdict.is_diverge());
+    assert!(direct_repro.kernel_confirmed);
+
+    let repro_json = dir.join("repro_helper.json");
+    let cli_repro = Command::new(bin)
+        .arg("--reproduce")
+        .arg(repro_path)
+        .arg("--output-json")
+        .arg(&repro_json)
+        .output()
+        .expect("run miri-difftest --reproduce on helper_add_ten candidate");
+    assert!(
+        cli_repro.status.success(),
+        "--reproduce failed:\n{}",
+        String::from_utf8_lossy(&cli_repro.stderr)
+    );
+    let cli_repro_text = fs::read_to_string(&repro_json).expect("read repro_helper.json");
+    assert!(cli_repro_text.contains("\"verdict\": \"diverge\""));
+    assert!(cli_repro_text.contains("\"kernel_confirmed\": true"));
+
+    // 2. Seeded batch containing `pass_direct_fn_call` mutants must record 0
+    // `miri_diff_corpus::helper_add_ten` skips in `unmodeled_external_calls`.
+    let mut seeded_with_helper = Vec::new();
+    for b_idx in 0..8usize {
+        let batch = generate_miri_corpus_batch(10, 0x5EED_9900 + b_idx as u64, b_idx);
+        for cand in batch {
+            if cand.seed_name == "pass_direct_fn_call" {
+                seeded_with_helper.push(cand);
+                if seeded_with_helper.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        if seeded_with_helper.len() >= 4 {
+            break;
+        }
+    }
+    assert!(
+        !seeded_with_helper.is_empty(),
+        "expected generate_miri_corpus_batch to produce pass_direct_fn_call mutants"
+    );
+    let batch_len = seeded_with_helper.len();
+    let seeded_rep = evaluate_miri_batches(
+        "seeded",
+        0x5EED_9900,
+        &[seeded_with_helper],
+        batch_len,
+        None,
+        Some(&root),
+    )
+    .expect("evaluate seeded pass_direct_fn_call mutants");
+    assert_eq!(seeded_rep.compared_candidates, seeded_rep.compiled_candidates);
+    assert_eq!(
+        seeded_rep
+            .unmodeled_external_calls
+            .get("miri_diff_corpus::helper_add_ten")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "expected 0 helper_add_ten skips in seeded batch: {:?}",
+        seeded_rep.unmodeled_external_calls
+    );
+}
+
+/// Real `lake` binary used behind the logging wrappers below (the pinned
+/// toolchain first, then the `elan` proxy).
+fn real_lake_binary() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    [
+        ".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake",
+        ".elan/bin/lake",
+    ]
+    .into_iter()
+    .map(|rel| home.join(rel))
+    .find(|p| p.is_file())
+}
+
+/// Write an executable `lake` wrapper at `path` that records its subcommand
+/// (`build`, `env`, ...) in `log` and then `exec`s `real_lake`.
+#[cfg(unix)]
+fn write_logging_lake_wrapper(path: &Path, log: &Path, real_lake: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path.parent().expect("wrapper parent")).expect("create wrapper dir");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"${{1:-}}\" >> '{}'\nexec '{}' \"$@\"\n",
+        log.display(),
+        real_lake.display()
+    );
+    fs::write(path, script).expect("write lake wrapper");
+    let mut perms = fs::metadata(path).expect("wrapper metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod lake wrapper");
+}
+
+fn logged_lake_subcommands(log: &Path) -> BTreeSet<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// The `.olean` files that `lake build` produces for `Mir` and `SymbolicEval`
+/// are only loadable by the same Lean toolchain, so the helper-linked oracle
+/// must run `lake build` and `lake env lean` (probe and confirm modules) with one
+/// and the same `lake` binary, whatever the environment selects.
+#[cfg(unix)]
+#[test]
+fn linked_oracle_runs_lake_build_and_lake_env_lean_with_the_same_lake_binary() {
+    use std::os::unix::fs::symlink;
+
+    let Some(real_lake) = real_lake_binary() else {
+        eprintln!("skipping: no lake toolchain found under $HOME/.elan");
+        return;
+    };
+    let dir = unique_temp_dir("lake_binary");
+    let bin = env!("CARGO_BIN_EXE_miri-difftest");
+    let cand_fn = "pub fn lake_binary_probe__b0_c0() -> u32 {\n    helper_add_ten() + 1u32\n}\n";
+    let repro = dir.join("repro.rs");
+    fs::write(&repro, build_standalone_candidate_source(cand_fn)).expect("write repro.rs");
+
+    // Scenario 1: an installed omnibus toolchain (`ANNEAL_TOOLCHAIN_DIR`), whose
+    // `lean/bin/lake` is what `run_lake_verify_targets` uses when `LAKE` is unset.
+    let toolchain = dir.join("omnibus");
+    let omnibus_log = dir.join("omnibus_lake.log");
+    write_logging_lake_wrapper(&toolchain.join("lean/bin/lake"), &omnibus_log, &real_lake);
+    let real_lean = real_lake.with_file_name("lean");
+    if real_lean.is_file() {
+        symlink(&real_lean, toolchain.join("lean/bin/lean")).expect("symlink lean");
+    } else {
+        fs::write(toolchain.join("lean/bin/lean"), "").expect("write lean stub");
+    }
+    fs::create_dir_all(toolchain.join("bin")).expect("create omnibus bin");
+    let capture = resolve_rustc_wrapper(&CaptureDriverConfig::new(dir.to_path_buf()));
+    if capture.is_file() {
+        symlink(&capture, toolchain.join("bin/anneal-rustc-capture")).expect("symlink capture");
+    } else {
+        fs::write(toolchain.join("bin/anneal-rustc-capture"), "").expect("write capture stub");
+    }
+    fs::create_dir_all(toolchain.join("rust/bin")).expect("create omnibus rust/bin");
+    fs::write(toolchain.join("rust/bin/rustc"), "").expect("write rustc stub");
+    fs::create_dir_all(toolchain.join("share/anneal/trusted/lean")).expect("create share dir");
+    fs::write(
+        toolchain.join("share/anneal/trusted/lean/foundation-lock.json"),
+        "{}\n",
+    )
+    .expect("write foundation lock stub");
+
+    let out1 = Command::new(bin)
+        .arg("--reproduce")
+        .arg(&repro)
+        .arg("--output-json")
+        .arg(dir.join("omnibus.json"))
+        .env("ANNEAL_TOOLCHAIN_DIR", &toolchain)
+        .env_remove("LAKE")
+        .env_remove("ANNEAL_LAKE")
+        .output()
+        .expect("run miri-difftest --reproduce with an omnibus toolchain");
+    let used1 = logged_lake_subcommands(&omnibus_log);
+    assert_eq!(
+        used1.contains("build"),
+        used1.contains("env"),
+        "`lake build` and `lake env lean` used different lake binaries with \
+         ANNEAL_TOOLCHAIN_DIR set (omnibus lake ran only {used1:?})\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        out1.status.success(),
+        "--reproduce failed with an omnibus toolchain:\n{}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Scenario 2: `ANNEAL_LAKE` set while `LAKE` is unset.
+    let anneal_lake_log = dir.join("anneal_lake.log");
+    let anneal_lake = dir.join("anneal_lake/lake");
+    write_logging_lake_wrapper(&anneal_lake, &anneal_lake_log, &real_lake);
+    let out2 = Command::new(bin)
+        .arg("--reproduce")
+        .arg(&repro)
+        .arg("--output-json")
+        .arg(dir.join("anneal_lake.json"))
+        .env("ANNEAL_LAKE", &anneal_lake)
+        .env_remove("LAKE")
+        .env_remove("ANNEAL_TOOLCHAIN_DIR")
+        .output()
+        .expect("run miri-difftest --reproduce with ANNEAL_LAKE");
+    let used2 = logged_lake_subcommands(&anneal_lake_log);
+    assert_eq!(
+        used2.contains("build"),
+        used2.contains("env"),
+        "`lake build` and `lake env lean` used different lake binaries with \
+         ANNEAL_LAKE set (ANNEAL_LAKE ran only {used2:?})\nstderr:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        out2.status.success(),
+        "--reproduce failed with ANNEAL_LAKE:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
     );
 }
