@@ -1199,7 +1199,8 @@ theorem sliceHelperPipeline_verified :
   have h_sub : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
   repeat' (first
     | ((conv => arg 3; reduce); apply SymConv.step; conv => whnf)
-    | (simp only [h_mod, h_half, h_wrap, h_neg, h_mul, h_d, h_c, h_o, h_sub, Bool.not_false];
+    | (simp only [layoutPointerBytes, Option.getD, h_mod, h_half, h_wrap, h_neg, h_mul, h_d, h_c,
+         h_o, h_sub, Bool.not_false];
        conv => whnf))
   rintro _ _ _ ⟨⟩
   have h_ble_sub : Nat.ble 18446744073709551616 (len - mid) = false :=

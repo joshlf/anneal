@@ -248,10 +248,10 @@ theorem evalRvalue_offset_of_validSliceRange
     (lhsOp rhsOp : Operand) (rp : RawPtrVal) (sz delta totalLen : Nat)
     (hRange : ValidSliceRange rp delta totalLen)
     (hLhs :
-      evalOperand locals lhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals =
+      evalOperand locals lhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls =
         .ok (.ptr rp.toProvenancePtr sz) locals)
     (hRhs :
-      evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals =
+      evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals localDecls =
         .ok (.scalar ⟨delta, 8⟩) locals)
     (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = .none)
     (hStride : pointeeElemByteStride localDecls emptyLayoutTable lhsOp = .some 1)

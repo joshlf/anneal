@@ -22,14 +22,18 @@ MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`), all three through
 1. **Why the provenance-cast fragment needs `provCastFlowOk` and the alias view**
    (`inFragmentWithIntrinsicsA1`, the extended fragment exactly as Pass A1
    defined it). That predicate admitted
-   * `exposeTwice` — Anneal returns `65536`, both MiniRust machines `0`
-     (`exposeTwice_three_way_divergence`): Anneal's `tag * 65536` encoding of an
-     exposed address is observable;
-   * `int2ptrForgedTag` — Anneal *returns `5`* while both MiniRust machines
-     raise `"dereferencing pointer without provenance"`
-     (`int2ptrForgedTag_three_way_divergence`): Anneal decodes any integer into a
-     borrow tag, so it is more defined than MiniRust and a forged
-     `PointerWithExposedProvenance` operand is unsound to admit;
+   * `exposeTwice` — formerly a divergence (Anneal returned the tag-encoded
+     `65536`); under the places-ptr `Trusted` semantics Anneal and both MiniRust
+     machines return `0` under canonical stack addresses
+     (`exposeTwice_three_way_agreement`; historical name
+     `exposeTwice_three_way_divergence`), while `provCastFlowOk = false` still
+     conservatively rejects multi-exposure flow;
+   * `int2ptrForgedTag` — formerly a divergence (Anneal resurrected a borrow tag
+     from a forged integer and returned `5`); now Anneal and both MiniRust
+     machines raise UB (`int2ptrForgedTag_three_way_ub_agreement`; historical
+     name `int2ptrForgedTag_three_way_divergence`) because `exposedAllocIds = []`
+     prevents unexposed tag resurrection, while `provCastFlowOk` still rejects
+     forged integer constants syntactically;
    * `directWrite` — Anneal UB, `Mach` returns `9`: the `ptrAliasingOk`
      discipline of `inFragment` had been dropped;
    * `exposeSharedRefWriteUb` — Anneal UB, `Mach` returns `88`: `*const u32 →
@@ -105,7 +109,7 @@ def inFragmentWithIntrinsicsA1 (body : CapturedMir) : Bool :=
 theorem inFragmentWithIntrinsics_imp_A1 {body : CapturedMir}
     (h : inFragmentWithIntrinsics body = true) : inFragmentWithIntrinsicsA1 body = true := by
   simp only [inFragmentWithIntrinsics, inFragmentWithIntrinsicsA1, Bool.and_eq_true] at h ⊢
-  obtain ⟨⟨⟨hcore, _⟩, _⟩, htr⟩ := h
+  obtain ⟨⟨⟨⟨hcore, _⟩, _⟩, _⟩, htr⟩ := h
   exact ⟨hcore, htr⟩
 
 /-! ### `exposeTwice`: an observed exposed address -/
@@ -129,17 +133,33 @@ theorem exposeTwice_intr_tb_direct :
   decide +kernel
 
 set_option maxRecDepth 200000 in
-/-- Anneal returns `65536` (the two borrow tags `1` and `2` encoded as
-`tag * 65536`), both MiniRust machines return `0` (one address). -/
+/-- **Historical name.** Recorded a divergence before the places-ptr `Trusted`
+semantics (Anneal returned the tag-encoded `65536`); it now states the three-way
+agreement `exposeTwice_three_way_agreement`: with canonical stack local page
+addresses (`ptrAddress?`), Anneal and both MiniRust machines (`Mach` and
+`MachTB`) return `0` on `exposeTwice` (while `provCastFlowOk = false` still
+conservatively rejects `exposeTwice` from `inFragmentWithIntrinsics`). -/
 theorem exposeTwice_three_way_divergence :
     (∃ mem, ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
-        (.normal (.scalar ⟨65536, 4⟩, mem))) ∧
+        (.normal (.scalar ⟨0, 4⟩, mem))) ∧
       retAfterIntr exposeTwice [.scalar ⟨5, 4⟩] 13 =
         some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
       retAfterIntrTB exposeTwice [.scalar ⟨5, 4⟩] 13 = tbRetU32 0 :=
   ⟨⟨_, exposeTwice_anneal_ret⟩, exposeTwice_intr_minirust_direct, exposeTwice_intr_tb_direct⟩
 
-/-! ### `int2ptrForgedTag`: Anneal resurrects provenance from a forged integer -/
+/-- **Three-way lockstep agreement (`exposeTwice`).** Exposing two raw borrows of
+`_1` at offset `0` yields the same canonical stack address in Anneal, so Anneal,
+`Mach`, and `MachTB` all return `0`; Anneal additionally records both tags in
+`Memory.exposedAllocIds` (`exposeTwice_anneal_ret`). -/
+theorem exposeTwice_three_way_agreement :
+    (∃ mem, ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
+        (.normal (.scalar ⟨0, 4⟩, mem))) ∧
+      retAfterIntr exposeTwice [.scalar ⟨5, 4⟩] 13 =
+        some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
+      retAfterIntrTB exposeTwice [.scalar ⟨5, 4⟩] 13 = tbRetU32 0 :=
+  ⟨⟨_, exposeTwice_anneal_ret⟩, exposeTwice_intr_minirust_direct, exposeTwice_intr_tb_direct⟩
+
+/-! ### `int2ptrForgedTag`: unexposed integer cast raises UB across all three machines -/
 
 /-- MIR of
 ```rust
@@ -149,8 +169,9 @@ fn int2ptr_forged_tag(x: u32) -> u32 {
     unsafe { *q }
 }
 ```
-Nothing is exposed, yet Anneal decodes `65536` into borrow tag `1` (the
-borrow of `x`) and reads `x`. -/
+Nothing is exposed (`exposedAllocIds = []`), so `with_exposed_provenance(65536)`
+recovers a provenance-less scalar `65536` and dereferencing `*q` raises UB in
+Anneal as well as both MiniRust machines. -/
 def int2ptrForgedTag : CapturedMir :=
   ptrBody "witness::int2ptr_forged_tag"
     [u32Decl, u32Decl, ptrConstU32Decl, ptrConstU32Decl]
@@ -165,12 +186,10 @@ theorem int2ptrForgedTag_inFragmentWithIntrinsicsA1 :
 theorem int2ptrForgedTag_notInFragmentWithIntrinsics :
     inFragmentWithIntrinsics int2ptrForgedTag = false := by decide +kernel
 
-set_option maxRecDepth 200000 in
-theorem int2ptrForgedTag_anneal_ret :
-    ∃ mem, ReachesRet (mirTree int2ptrForgedTag
-      (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩, mem)) :=
-  ⟨_, runA_sound int2ptrForgedTag 30 _ _ _ rfl⟩
+theorem int2ptrForgedTag_anneal_ub :
+    ∃ tr u, Reaches (mirTree int2ptrForgedTag
+      (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound int2ptrForgedTag 30 _ (by decide)
 
 theorem int2ptrForgedTag_minirust_direct :
     stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
@@ -182,19 +201,36 @@ theorem int2ptrForgedTag_tb_direct :
       some (.ub "dereferencing pointer without provenance") := by
   decide +kernel
 
-/-- **Anneal is more defined than MiniRust** on a body Pass A1's fragment
-admitted: Anneal returns `5`, both MiniRust machines raise UB. -/
+/-- **Historical name.** Recorded a divergence before the places-ptr `Trusted`
+semantics (Anneal returned `5`); it now states the agreement that
+`int2ptrForgedTag_three_way_ub_agreement` restates without the fragment
+conjunct: with `Memory.exposedAllocIds` enforced by `recoverExposedPtrValue?`,
+Anneal and both MiniRust machines (`Mach` and `MachTB`) raise UB on
+`int2ptrForgedTag` (while `provCastFlowOk` still excludes forged integer
+constants from `inFragmentWithIntrinsics`). -/
 theorem int2ptrForgedTag_three_way_divergence :
     inFragmentWithIntrinsicsA1 int2ptrForgedTag = true ∧
-      (∃ mem, ReachesRet (mirTree int2ptrForgedTag
-        (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) []
-        (.normal (.scalar ⟨5, 4⟩, mem))) ∧
+      (∃ tr u, Reaches (mirTree int2ptrForgedTag
+        (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
       stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
         some (.ub "dereferencing pointer without provenance") ∧
       stopAfterIntrTB int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
         some (.ub "dereferencing pointer without provenance") :=
-  ⟨int2ptrForgedTag_inFragmentWithIntrinsicsA1, int2ptrForgedTag_anneal_ret,
+  ⟨int2ptrForgedTag_inFragmentWithIntrinsicsA1, int2ptrForgedTag_anneal_ub,
     int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
+
+/-- **Three-way lockstep UB agreement (`int2ptrForgedTag`).** Nothing is exposed,
+so `with_exposed_provenance(65536)` recovers no provenance in Anneal and
+dereferencing `*q` faults in Anneal, `Mach`, and `MachTB`
+(`"dereferencing pointer without provenance"` on both MiniRust machines). -/
+theorem int2ptrForgedTag_three_way_ub_agreement :
+    (∃ tr u, Reaches (mirTree int2ptrForgedTag
+        (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+      stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
+        some (.ub "dereferencing pointer without provenance") ∧
+      stopAfterIntrTB int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
+        some (.ub "dereferencing pointer without provenance") :=
+  ⟨int2ptrForgedTag_anneal_ub, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
 
 /-! ### `directWrite` and `exposeSharedRefWriteUb`: dropped borrow discipline -/
 
@@ -254,6 +290,166 @@ theorem int2ptrRoundTripOk_three_way :
   ⟨int2ptrRawRoundTripOk_inFragmentWithIntrinsics, int2ptrRawRoundTripOk_anneal_ret,
     int2ptrRawRoundTripOk_minirust_direct, int2ptrRawRoundTripOk_tb_direct⟩
 
+/-- Pre-exposure `MachineState` of `int2ptrRawRoundTripOk`: the locals and borrow
+state right after `_2 = &raw mut _1`, built by hand from the entry state (the
+frame position is left at entry; `AnnealExposeRoundTripOk` reads only
+`s.memory` and `s.frame.locals`). -/
+def int2ptrRawRoundTripOkPreExposeState : MachineState :=
+  let s0 := initMachineState int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 1 .mut (local_ 1)]
+      nextTag := 2 } }
+
+/-- Concrete non-vacuity witness instantiating `AnnealExposeRoundTripOk` on
+`int2ptrRawRoundTripOk` (`pv = ⟨1, 0⟩`, `fullAddr = canonicalLocalAddr 1 0`) via
+`AnnealExposeRoundTripOk.of_borrows` (no manual unfolding of
+`recoverExposedPtrValue?` or `findBestExposedStackBorrow`). -/
+theorem int2ptrRawRoundTripOk_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrRawRoundTripOk int2ptrRawRoundTripOkPreExposeState
+      ⟨1, 0⟩ (canonicalLocalAddr 1 0) :=
+  AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 1 .mut (local_ 1)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun h => absurd rfl h⟩
+    (fun b hb hexp _ => by
+      simp [int2ptrRawRoundTripOkPreExposeState, initMachineState,
+        MirSemantics.isExposedAllocId] at hb hexp)
+
+/-- Multi-borrow pre-exposure state on `int2ptrRawRoundTripOk` where an older
+borrow tag `1` on `_1` is ALREADY in `exposedAllocIds` (`[1]`) with permission
+`.disabled`, while child/reborrow tag `2` on the same local `_1` is `.active`
+(built by hand from the entry state with frame position left at entry;
+`AnnealExposeRoundTripOk` reads only `s.memory` and `s.frame.locals`). -/
+def exposeCompetingDisabledParentState : MachineState :=
+  let s0 := initMachineState int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init (.ptr ⟨2, 0⟩ 8), .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 2 .mut (local_ 1),
+                  { rawPtrEntry 1 .mut (local_ 1) with perm := .disabled }]
+      nextTag := 3
+      exposedAllocIds := [1] } }
+
+/-- Structural non-vacuity witness for `NoCompetingExposedBorrow` +
+`AnnealExposeRoundTripOk.of_borrows` when `exposedAllocIds = [1]` is non-empty
+and two borrow tags share the exact same canonical stack local `_1`: tag `2`
+(`.active`, score `3`) strictly outranks the previously exposed `.disabled` tag
+`1` (score `0`), so `recoverExposedPtrValue?` recovers `.ptr ⟨2, 0⟩ 8`. -/
+theorem exposeCompetingDisabledParent_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrRawRoundTripOk exposeCompetingDisabledParentState
+      ⟨2, 0⟩ (canonicalLocalAddr 1 0) :=
+  AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 2 .mut (local_ 1)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun h => absurd rfl h⟩
+    (fun b hb _ hne => by
+      rcases List.mem_cons.mp hb with rfl | hb_tl
+      · exact absurd rfl hne
+      · rcases List.mem_singleton.mp hb_tl with rfl
+        exact .inl (by decide))
+
+/-- Proper sub-place `[u32; 2]` array-element expose-and-reconstruct round-trip
+(`_2 = &raw mut (_1[1 of 2]); _3 = expose(_2); _4 = with_exposed(_3); *_4 = 77; _1[0] + _1[1]`):
+exercises `inFragmentWithIntrinsics`, `AnnealExposeRoundTripOk.of_borrows`, and
+`ExposeTargetSlotOk` on a non-empty projection (`entry.targetProjection =
+[.constantIndex 1 2 false] ≠ []`, `relOff = 4`, `fullAddr = canonicalLocalAddr 1 4`),
+writing `77` to `_1[1]` without disturbing `_1[0] = 5` and returning `82` across
+Anneal, `Mach`, and `MachTB`. -/
+def int2ptrArraySubPlaceRoundTripOk : CapturedMir :=
+  { ptrBody "witness::int2ptr_array_subplace_round_trip_ok"
+      [u32Decl, arrU32_2Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl, u32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5, .storageLive 6,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 1 2 false)),
+       .assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy),
+       .assign (local_ 4) (.cast .pointerWithExposedProvenance (.copy (local_ 3)) ptrMutU32Ty),
+       .assign (derefPlace 4) (.use (constU32 77)),
+       .assign (local_ 5) (.use (.copy (placeConstIdx 1 0 2 false))),
+       .assign (local_ 6) (.use (.copy (placeConstIdx 1 1 2 false))),
+       .assign (local_ 0) (.binaryOp .add (.copy (local_ 5)) (.copy (local_ 6)))] with
+    fnAbi := fnAbiArrU32_2Arg }
+
+theorem int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics int2ptrArraySubPlaceRoundTripOk = true := by decide +kernel
+
+set_option maxRecDepth 200000 in
+theorem int2ptrArraySubPlaceRoundTripOk_anneal_ret :
+    ∃ mem, ReachesRet (mirTree int2ptrArraySubPlaceRoundTripOk
+      (initMachineState int2ptrArraySubPlaceRoundTripOk
+        [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]])) []
+      (.normal (.scalar ⟨82, 4⟩, mem)) :=
+  ⟨_, runA_sound int2ptrArraySubPlaceRoundTripOk 30 _ _ _ rfl⟩
+
+theorem int2ptrArraySubPlaceRoundTripOk_three_way :
+    inFragmentWithIntrinsics int2ptrArraySubPlaceRoundTripOk = true ∧
+      (∃ mem, ReachesRet (mirTree int2ptrArraySubPlaceRoundTripOk
+        (initMachineState int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]])) []
+        (.normal (.scalar ⟨82, 4⟩, mem))) ∧
+      retAfterIntr int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]] 14 =
+        some (some { retAlloc with data := scalarBytes u32 82 }, [1]) ∧
+      retAfterIntrTB int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]] 14 = tbRetU32 82 :=
+  ⟨int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics,
+    int2ptrArraySubPlaceRoundTripOk_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-- Pre-exposure `MachineState` of `int2ptrArraySubPlaceRoundTripOk`: the locals
+and borrow state right after `_2 = &raw mut (_1[1 of 2])`, built by hand from the
+entry state (the frame position is left at entry; `AnnealExposeRoundTripOk`
+reads only `s.memory` and `s.frame.locals`). -/
+def int2ptrArraySubPlacePreExposeState : MachineState :=
+  let s0 := initMachineState int2ptrArraySubPlaceRoundTripOk
+    [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]),
+                 .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit, .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 1 .mut (placeConstIdx 1 1 2 false)]
+      nextTag := 2 } }
+
+/-- Structural non-vacuity witness for `AnnealExposeRoundTripOk.of_borrows` and
+`ExposeTargetSlotOk` on a proper sub-place borrow (`entry.targetProjection =
+[.constantIndex 1 2 false] ≠ []`, `relOff = 4`, `fullAddr = canonicalLocalAddr 1 4`). -/
+theorem int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrArraySubPlaceRoundTripOk int2ptrArraySubPlacePreExposeState
+      ⟨1, 0⟩ (canonicalLocalAddr 1 4) :=
+  AnnealExposeRoundTripOk.of_borrows
+    (entry := rawPtrEntry 1 .mut (placeConstIdx 1 1 2 false)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun _ =>
+      ⟨by decide, arrU32_2Decl, .aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩],
+       rfl, rfl, ⟨rfl, by simp [ElemOk]⟩⟩⟩
+    (fun b hb hexp _ => by
+      simp [int2ptrArraySubPlacePreExposeState, initMachineState,
+        MirSemantics.isExposedAllocId] at hb hexp)
+
+/-- `int2ptrArraySubPlaceRoundTripOk` exercises the non-vacuous branch of the
+static side condition `hsub_static` taken by `ExposeTargetSlotOk.of_frameOk` and
+the `ProvenanceRel.*_from_frameOk` theorems: the body borrows a proper sub-place,
+and both `ptrDeclLayoutsOk` and `bodyPreservesAddrTaken` hold. -/
+theorem int2ptrArraySubPlaceRoundTripOk_subPlace_static :
+    (bodyDirectBorrowPlaces int2ptrArraySubPlaceRoundTripOk).any
+        (fun q => !q.projection.isEmpty) = true ∧
+      ptrDeclLayoutsOk int2ptrArraySubPlaceRoundTripOk = true ∧
+      bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true := by
+  decide +kernel
+
+/-- The `hsub_static` hypothesis in exactly the form of the `by decide` default
+argument of the `ProvenanceRel.*_from_frameOk` theorems, closed by that same
+`decide` on a body that borrows a proper sub-place. -/
+theorem int2ptrArraySubPlaceRoundTripOk_hsub_static :
+    (bodyDirectBorrowPlaces int2ptrArraySubPlaceRoundTripOk).any
+        (fun q => !q.projection.isEmpty) = true →
+      ptrDeclLayoutsOk int2ptrArraySubPlaceRoundTripOk = true ∧
+        bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true := by
+  decide
+
 /-! ### `int2ptrUnexposedUb` -/
 
 theorem int2ptrUnexposedDerefUb_anneal_ub :
@@ -263,8 +459,9 @@ theorem int2ptrUnexposedDerefUb_anneal_ub :
 
 /-- With nothing exposed, `with_exposed_provenance(256)` predicts `None`
 (`int2ptrProvenance_eq_none_iff`, the only admissible choice), so the read is UB
-on both MiniRust machines; Anneal faults too (`256 / 65536 = 0` names no
-borrow). The address is forged, so the body is outside the fragment. -/
+on both MiniRust machines; Anneal faults too (`exposedAllocIds = []` so
+`recoverExposedPtrValue?` leaves a provenance-less scalar `256`). The address is
+forged, so the body is outside the fragment. -/
 theorem int2ptrUnexposedUb_three_way :
     inFragmentWithIntrinsics int2ptrUnexposedDerefUb = false ∧
       (∃ tr u, Reaches (mirTree int2ptrUnexposedDerefUb
@@ -406,6 +603,53 @@ theorem int2ptrAmbiguityUnsupported_three_way :
   ⟨int2ptrAdjacentArgsAmbiguous_inFragmentWithIntrinsics, int2ptrAdjacentArgsAmbiguous_anneal_ret,
     int2ptrAdjacentArgsAmbiguous_minirust_direct, int2ptrAdjacentArgsAmbiguous_tb_direct⟩
 
+/-- Pre-second-exposure state of `int2ptrAdjacentArgsAmbiguous` right after
+`_3 = &raw const _1; _4 = &raw const _2; _5 = expose(_3)` (built by hand from the
+entry state with frame position left at entry; `AnnealExposeRoundTripOk` reads
+only `s.memory` and `s.frame.locals`): tag `1` on `_1` is already exposed
+(`exposedAllocIds = [1]`) with `.frozen` permission (score `1`), and tag `2` on
+`_2` also has `.frozen` permission (score `1`). -/
+def exposePriorOtherLocalState : MachineState :=
+  let s0 := initMachineState int2ptrAdjacentArgsAmbiguous [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨9, 4⟩),
+                 .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8),
+                 .init (.scalar ⟨canonicalLocalAddr 1 0, 8⟩), .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 2 .not (local_ 2), rawPtrEntry 1 .not (local_ 1)]
+      nextTag := 3
+      exposedAllocIds := [1] } }
+
+/-- Structural non-vacuity witness for `NoCompetingExposedBorrow.of_borrows_distinct`
+(and `ptrTargetPlaceSpan_lt_page`) at `exposedAllocIds = [1] ≠ []` when two
+borrows have EQUAL permission scores (`exposedPermScore .frozen = 1`) on distinct
+locals (`b.targetLocal = 1 < 2 = entry.targetLocal`, exercising Disjunct 3 of
+`NoCompetingExposedBorrow`): `_1`'s 4-byte span stays strictly inside local `1`'s
+64 KiB canonical page, so `recoverExposedPtrValue?` at `canonicalLocalAddr 2 0`
+uniquely recovers `.ptr ⟨2, 0⟩ 8`. -/
+theorem exposePriorOtherLocal_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrAdjacentArgsAmbiguous exposePriorOtherLocalState
+      ⟨2, 0⟩ (canonicalLocalAddr 2 0) :=
+  AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 2 .not (local_ 2)) (pointeeIt := u32)
+    (by decide) (by decide) (.tail _ (.head _)) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun h => absurd rfl h⟩
+    (NoCompetingExposedBorrow.of_borrows_distinct
+      (by decide) rfl rfl (fun h => absurd rfl h)
+      (fun b hb _ hne _ => by
+        rcases List.mem_cons.mp hb with rfl | hb_tl
+        · exact absurd rfl hne
+        · rcases List.mem_singleton.mp hb_tl with rfl
+          exact ⟨rfl, .head _, ⟨u32, 0, rfl⟩,
+            ⟨(fun h => by cases h), fun h => absurd rfl h⟩,
+            fun h => absurd rfl h⟩)
+      (fun b hb _ hne => by
+        rcases List.mem_cons.mp hb with rfl | hb_tl
+        · exact absurd rfl hne
+        · rcases List.mem_singleton.mp hb_tl with rfl
+          exact .inl (by decide)))
+
 /-! ### `int2ptrDeadAllocUb`: the cast after deallocation -/
 
 /-- MIR of
@@ -504,7 +748,8 @@ theorem int2ptrMultiAllocBoundaryUnsupported_anneal_ub :
 /-- Pass A1 never ran this body: the forged address `1024` lies in neither
 exposed allocation, so both MiniRust machines stop with `Stop.unsupported`
 (not the message A1's docstring cited), while Anneal faults
-(`1024 / 65536 = 0` names no borrow). -/
+(`recoverExposedPtrValue?` finds no exposed borrow covering `1024`, leaving a
+provenance-less scalar). -/
 theorem int2ptrMultiAllocBoundaryUnsupported_three_way :
     (∃ tr u, Reaches (mirTree int2ptrMultiAllocBoundaryUnsupported
         (initMachineState int2ptrMultiAllocBoundaryUnsupported [.scalar ⟨5, 4⟩])) tr u ∧
@@ -1005,11 +1250,11 @@ single MIR block into four MiniRust basic blocks (`bb0` ending in
 `Return`). -/
 def assumeReborrowExposeRoundTrip : CapturedMir :=
   ptrBody "witness::assume_reborrow_expose_round_trip"
-    [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl, u32Decl, boolDecl, usizeDecl, ptrMutU32Decl]
+    [u32Decl, u32Decl, refMutU32Decl, ptrMutU32Decl, u32Decl, boolDecl, usizeDecl, ptrMutU32Decl]
     [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
      .storageLive 6, .storageLive 7,
      .assign (local_ 2) (.ref (.mut false) (local_ 1)),
-     .assign (local_ 3) (.ref (.mut false) (derefPlace 2)),
+     .assign (local_ 3) (.rawPtr .mut (derefPlace 2)),
      .assign (derefPlace 3) (.use (constU32 42)),
      .assign (local_ 4) (.use (.copy (derefPlace 3))),
      .assign (local_ 5) (.binaryOp .eq (.copy (local_ 4)) (constU32 42)),
@@ -1665,11 +1910,15 @@ theorem callCrossFrameExposeWithExposed_three_way :
    on `.retag .fnEntry`). We prove both `progCrossFrameTranslatable_imp_B3` and
    `progInFragmentWithIntrinsics_imp_B3`, and then witness every independent
    divergence that `progInFragmentWithIntrinsicsB3` admitted:
-   * `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
-     `childReborrowWriteDisablesParent_B3_divergence`, and
-     `exposeSharedRefWriteUb_B3_divergence` (single-body `callees = []`
-     divergences, including `int2ptrForgedTag` where Anneal succeeds and returns
-     `5` while `Mach` and `MachTB` raise UB);
+   * `exposeSharedRefWriteUb_B3_divergence` (a single-body `callees = []`
+     divergence), together with the historically named single-body witnesses
+     `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`, and
+     `childReborrowWriteDisablesParent_B3_divergence`, whose divergences have
+     since been resolved in `Trusted`: all three machines now return `0` on
+     `exposeTwice` and raise UB on `int2ptrForgedTag` (programs that
+     `progInFragmentWithIntrinsicsB3` admits and `progInFragmentWithIntrinsics`
+     conservatively rejects), and return `9` on
+     `childReborrowWriteDisablesParent` (admitted by both predicates);
    * `callerRawPtrRetagFnEntry_B3_divergence` (`Retag(FnEntry)` on a `*mut u32`
      parameter attaches a strong protector in Anneal, faulting on `StorageDead`
      of an unrelated callee local, while `Mach` and `MachTB` return `7`);
@@ -1791,28 +2040,34 @@ theorem progInFragmentWithIntrinsics_imp_B3 {entry : CapturedMir} {callees : Lis
     progInFragmentWithIntrinsicsB3 entry callees = true :=
   progCrossFrameTranslatable_imp_B3 (progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable h)
 
+/-- **Historical name** (`exposeTwice` is no longer a divergence; see
+`exposeTwice_three_way_agreement`): Pass B3's predicate admits `exposeTwice`,
+the unified fragment rejects it, and all three machines return `0`. -/
 theorem exposeTwice_B3_divergence :
     progInFragmentWithIntrinsicsB3 exposeTwice [] = true ∧
     progInFragmentWithIntrinsics exposeTwice [] = false ∧
     (∃ mem, ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨65536, 4⟩, mem))) ∧
+      (.normal (.scalar ⟨0, 4⟩, mem))) ∧
     retAfterIntr exposeTwice [.scalar ⟨5, 4⟩] 13 =
       some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
     retAfterIntrTB exposeTwice [.scalar ⟨5, 4⟩] 13 = tbRetU32 0 :=
   ⟨by decide +kernel, by decide +kernel, exposeTwice_three_way_divergence⟩
 
+/-- **Historical name** (`int2ptrForgedTag` is no longer a divergence; see
+`int2ptrForgedTag_three_way_ub_agreement`): Pass B3's predicate admits
+`int2ptrForgedTag`, the unified fragment rejects it, and all three machines raise
+UB. -/
 theorem int2ptrForgedTag_B3_divergence :
     progInFragmentWithIntrinsicsB3 int2ptrForgedTag [] = true ∧
     progInFragmentWithIntrinsics int2ptrForgedTag [] = false ∧
-    (∃ mem, ReachesRet (mirTree int2ptrForgedTag
-      (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩, mem))) ∧
+    (∃ tr u, Reaches (mirTree int2ptrForgedTag
+      (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
     stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
       some (.ub "dereferencing pointer without provenance") ∧
     stopAfterIntrTB int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
       some (.ub "dereferencing pointer without provenance") :=
   ⟨by decide +kernel, by decide +kernel,
-   int2ptrForgedTag_anneal_ret, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
+   int2ptrForgedTag_anneal_ub, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
 
 /-- `childReborrowWriteDisablesParent` under the B3 and unified fragments. Before
 unstable `b076d6a3` this was a divergence (Anneal's flat borrow list faulted on
@@ -2523,5 +2778,167 @@ theorem callerLoopCallExposeCallee_three_way :
    callerLoopCallExposeCallee_anneal_79.1,
    callerLoopCallExposeCallee_anneal_79.2,
    by decide +kernel, by decide +kernel⟩
+
+/-! ## 14. Direct `ptrDeclLayoutsOk` guard on `inFragmentWithIntrinsics` and provenance-less `Transmute` vs. `PointerWithExposedProvenance` (`ep2-A3`)
+
+1. **Why `ptrAliasingOk (provCastAliasView body)` does not imply `ptrDeclLayoutsOk body`
+   (`shadowedUsizeLayoutDivergence`)**: `provCastAliasView` replaces every local in
+   `exposedIntLocals body` (`usize`) with `provCastAliasTy` (`*mut u8`,
+   `layoutIdx = 0`). When `_3 : usize` is the only `.uint .usize` declaration in
+   `body.localDecls` and carries a corrupt `layoutIdx = 1` pointing to a 16-byte
+   aligned primitive layout (`usizeAlign16Layout`), `provCastAliasView` erases
+   `_3`'s `.uint .usize` declaration, so `ptrAliasingOk (provCastAliasView body) = true`
+   and `provCastFlowOk body = true` both pass! Yet at runtime on `*_4 = 77_usize`
+   (targeting `_1[1]` of `_1 : [usize; 2]` at byte offset `8`), Anneal's
+   `resolveTyWithLocalDecls` on `body.localDecls` hits `_3` (`align = 16`) and
+   faults in `checkTargetPlaceAlign` (`8 % 16 ≠ 0`), while both MiniRust `Mach`
+   and `MachTB` succeed and return `1`. Enforcing `ptrDeclLayoutsOk body`
+   directly in `inFragmentWithIntrinsics` and `bodyInProgFragmentWithIntrinsics`
+   rejects `shadowedUsizeLayoutDivergence` and simultaneously discharges
+   `ptrDeclLayoutsOk body = true` automatically in
+   `ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`.
+2. **Provenance-faithful `Transmute` vs. `PointerWithExposedProvenance`
+   (`transmuteExposedAddrToRawPtrDerefUb`)**: replacing `PointerWithExposedProvenance`
+   in `int2ptrRawRoundTripOk` with `CastKind.transmute` (`usize -> *mut u32`)
+   leaves `exposedAllocIds = [1]` populated from `expose(_2)`, yet `Transmute`
+   encodes `_3` to provenance-less bytes and `decodeValueFromBytes` (`isRef = false`,
+   `decodeScalarBytes`) decodes a provenance-less scalar without consulting
+   `recoverExposedPtrValue?`, so `*_4 = 77` faults across Anneal, `Mach`, and
+   `MachTB` (`"dereferencing pointer without provenance"`). -/
+
+def arrUsize_2Ty : Ty := { kind := .array (.uint .usize) 2, layoutIdx := 0 }
+def arrUsize_2Decl : LocalDecl := { mutability := .mut, ty := arrUsize_2Ty, debugName := none }
+def ptrMutUsizeTy : Ty := { kind := .rawPtr .mut (.uint .usize), layoutIdx := 0 }
+def ptrMutUsizeDecl : LocalDecl := { mutability := .mut, ty := ptrMutUsizeTy, debugName := none }
+def usizeLayout1Decl : LocalDecl :=
+  { mutability := .mut, ty := { kind := .uint .usize, layoutIdx := 1 }, debugName := none }
+
+def usizeAlign16Layout : TypeLayout :=
+  { usizeLayout with align := { bytes := 16 } }
+
+def arrUsize_2Layout : TypeLayout :=
+  { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiArrUsize_2Arg : FnAbi :=
+  { args := [{ layout := arrUsize_2Layout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- Fragment-adequacy necessity witness for checking `ptrDeclLayoutsOk body`
+directly in `inFragmentWithIntrinsics` and `bodyInProgFragmentWithIntrinsics`
+rather than relying solely on `ptrAliasingOk (provCastAliasView body)`. -/
+def shadowedUsizeLayoutDivergence : CapturedMir :=
+  { ptrBody "witness::shadowed_usize_layout_divergence"
+      [u32Decl, arrUsize_2Decl, ptrMutUsizeDecl, usizeLayout1Decl, ptrMutUsizeDecl]
+      [.storageLive 2, .storageLive 3, .storageLive 4,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 1 2 false)),
+       .assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy),
+       .assign (local_ 4) (.cast .pointerWithExposedProvenance (.copy (local_ 3)) ptrMutUsizeTy),
+       .assign (derefPlace 4) (.use (constUsize 77)),
+       .assign (local_ 0) (.use (constU32 1))] with
+    fnAbi := fnAbiArrUsize_2Arg
+    layouts := { pointerBits := 64, isLittleEndian := true,
+                 entries := [u32Layout, usizeAlign16Layout] } }
+
+theorem shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad :
+    provCastFlowOk shadowedUsizeLayoutDivergence = true ∧
+    ptrAliasingOk (provCastAliasView shadowedUsizeLayoutDivergence) = true ∧
+    ptrDeclLayoutsOk shadowedUsizeLayoutDivergence = false ∧
+    inFragmentWithIntrinsics shadowedUsizeLayoutDivergence = false ∧
+    progInFragmentWithIntrinsics shadowedUsizeLayoutDivergence [] = false := by
+  decide +kernel
+
+theorem shadowedUsizeLayoutDivergence_anneal_ub :
+    ∃ tr u, Reaches (mirTree shadowedUsizeLayoutDivergence
+      (initMachineState shadowedUsizeLayoutDivergence
+        [.aggregate 0 [.scalar ⟨5, 8⟩, .scalar ⟨9, 8⟩]])) tr u ∧ FaultNow u :=
+  faultsA_sound shadowedUsizeLayoutDivergence 30 _ (by decide)
+
+theorem shadowedUsizeLayoutDivergence_three_way :
+    provCastFlowOk shadowedUsizeLayoutDivergence = true ∧
+    ptrAliasingOk (provCastAliasView shadowedUsizeLayoutDivergence) = true ∧
+    ptrDeclLayoutsOk shadowedUsizeLayoutDivergence = false ∧
+    inFragmentWithIntrinsics shadowedUsizeLayoutDivergence = false ∧
+    progInFragmentWithIntrinsics shadowedUsizeLayoutDivergence [] = false ∧
+    (∃ tr u, Reaches (mirTree shadowedUsizeLayoutDivergence
+      (initMachineState shadowedUsizeLayoutDivergence
+        [.aggregate 0 [.scalar ⟨5, 8⟩, .scalar ⟨9, 8⟩]])) tr u ∧ FaultNow u) ∧
+    retAfterIntr shadowedUsizeLayoutDivergence
+        [.aggregate 0 [.scalar ⟨5, 8⟩, .scalar ⟨9, 8⟩]] 10 =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    retAfterIntrTB shadowedUsizeLayoutDivergence
+        [.aggregate 0 [.scalar ⟨5, 8⟩, .scalar ⟨9, 8⟩]] 10 = tbRetU32 1 :=
+  ⟨shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad.1,
+   shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad.2.1,
+   shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad.2.2.1,
+   shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad.2.2.2.1,
+   shadowedUsizeLayoutDivergence_aliasOk_but_layoutBad.2.2.2.2,
+   shadowedUsizeLayoutDivergence_anneal_ub,
+   by decide +kernel, by decide +kernel⟩
+
+/-- `int2ptrRawRoundTripOk` with `PointerWithExposedProvenance` replaced by
+`CastKind.transmute` (`_2 = &raw mut _1; _3 = expose(_2); _4 = copy _3 as *mut u32
+(Transmute); *_4 = 77; _0 = copy (*_4)`): even though `_2`'s tag `1` is exposed in
+`exposedAllocIds = [1]` (and `m.intptrcast.exposed`), `Transmute` decodes
+provenance-less bytes via `decodeScalarBytes` without recovering exposed
+provenance, so `*_4 = 77` faults across Anneal, `Mach`, and `MachTB`. -/
+def transmuteExposedAddrToRawPtrDerefUb : CapturedMir :=
+  ptrBody "witness::transmute_exposed_addr_to_raw_ptr_deref_ub"
+    [u32Decl, u32Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+     .assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy),
+     .assign (local_ 4) (.cast .transmute (.copy (local_ 3)) ptrMutU32Ty),
+     .assign (derefPlace 4) (.use (constU32 77)),
+     .assign (local_ 0) (.use (.copy (derefPlace 4)))]
+
+theorem transmuteExposedAddrToRawPtrDerefUb_translateIntr :
+    (translateFnWithIntrinsics transmuteExposedAddrToRawPtrDerefUb).isSome = true := by
+  decide +kernel
+
+theorem transmuteExposedAddrToRawPtrDerefUb_notInFragmentWithIntrinsics :
+    inFragmentWithIntrinsics transmuteExposedAddrToRawPtrDerefUb = false := by
+  decide +kernel
+
+theorem transmuteExposedAddrToRawPtrDerefUb_anneal_ub :
+    ∃ tr u, Reaches (mirTree transmuteExposedAddrToRawPtrDerefUb
+      (initMachineState transmuteExposedAddrToRawPtrDerefUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound transmuteExposedAddrToRawPtrDerefUb 30 _ (by decide)
+
+theorem transmuteExposedAddrToRawPtrDerefUb_three_way :
+    inFragmentWithIntrinsics transmuteExposedAddrToRawPtrDerefUb = false ∧
+    (∃ tr u, Reaches (mirTree transmuteExposedAddrToRawPtrDerefUb
+      (initMachineState transmuteExposedAddrToRawPtrDerefUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    stopAfterIntr transmuteExposedAddrToRawPtrDerefUb [.scalar ⟨5, 4⟩] 8 =
+      some (.ub "dereferencing pointer without provenance") ∧
+    stopAfterIntrTB transmuteExposedAddrToRawPtrDerefUb [.scalar ⟨5, 4⟩] 8 =
+      some (.ub "dereferencing pointer without provenance") :=
+  ⟨transmuteExposedAddrToRawPtrDerefUb_notInFragmentWithIntrinsics,
+   transmuteExposedAddrToRawPtrDerefUb_anneal_ub,
+   by decide +kernel, by decide +kernel⟩
+
+/-- The `hsub_page` default side condition of `NoCompetingExposedBorrow.of_distinct_locals_or_lower_perm`
+and `ProvenanceRel.assume_then_expose_then_withExposed_closed_distinct_from_frameOk`
+closed by `decide` on a body that borrows a proper sub-place. -/
+theorem int2ptrArraySubPlaceRoundTripOk_hsub_page :
+    (bodyDirectBorrowPlaces int2ptrArraySubPlaceRoundTripOk).any
+        (fun q => !q.projection.isEmpty) = true →
+      ptrDeclLayoutsOk int2ptrArraySubPlaceRoundTripOk = true ∧
+        bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true ∧
+        bodyBorrowTargetsFitPage int2ptrArraySubPlaceRoundTripOk = true := by
+  decide
+
+/-- `CtxSpaced` separates spaced caller parameter placements (`ctx0_2`,
+`[128, 256, 384]`, on which `int2ptrAdjacentArgsAmbiguous` returns `9` across
+Anneal, `Mach`, and `MachTB` and
+`ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced` /
+`ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics`
+discharge `hnoadj` structurally) from boundary-touching placements (`ctxAdj`,
+`[128, 256, 260]`, on which `int2ptr` is angelically ambiguous). -/
+theorem int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff :
+    CtxSpaced int2ptrAdjacentArgsAmbiguous ctx0_2 = true ∧
+    CtxSpaced int2ptrAdjacentArgsAmbiguous ctxAdj = false ∧
+    CtxSpaced int2ptrRawRoundTripOk ctx0 = true := by
+  decide +kernel
 
 end MiniRustSpec.Correspondence.ProvenanceWitness

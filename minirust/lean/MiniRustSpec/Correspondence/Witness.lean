@@ -241,12 +241,12 @@ def u32Layout : TypeLayout :=
 @[simp] theorem tupleTypeOf_array (layouts : LayoutTable) (elem : RigidTy) (len l : Nat) :
     tupleTypeOf layouts { kind := .array elem len, layoutIdx := l } = none := rfl
 
-private theorem itOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+theorem itOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
     (layouts : LayoutTable) :
     itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
       itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
 
-private theorem tyOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+theorem tyOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
     (layouts : LayoutTable) :
     tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
       tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
@@ -12696,22 +12696,22 @@ def unitTupleLayout : TypeLayout :=
 def outerTupleLayout : TypeLayout :=
   { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
     fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }, { bytes := 10 }] [0, 1, 2],
-    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0, 1] }
+    variants := .single 0, isUninhabited := false, fieldLayouts := [1, 0, 2] }
 
 def nestedLayouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true,
-    entries := [innerTupleLayout, unitTupleLayout, outerTupleLayout] }
+    entries := [unitTupleLayout, innerTupleLayout, unitTupleLayout, outerTupleLayout] }
 
 def innerTupleKind : RigidTy := .tuple [.uint .u8, .uint .u32]
-def innerTupleTy : Ty := { kind := innerTupleKind, layoutIdx := 0 }
+def innerTupleTy : Ty := { kind := innerTupleKind, layoutIdx := 1 }
 def innerTupleDecl : LocalDecl := { mutability := .mut, ty := innerTupleTy, debugName := none }
 
 def unitTupleKind : RigidTy := .tuple []
-def unitTupleTy : Ty := { kind := unitTupleKind, layoutIdx := 1 }
+def unitTupleTy : Ty := { kind := unitTupleKind, layoutIdx := 2 }
 def unitTupleDecl : LocalDecl := { mutability := .mut, ty := unitTupleTy, debugName := none }
 
 def outerTupleKind : RigidTy := .tuple [innerTupleKind, .uint .u16, unitTupleKind]
-def outerTupleTy : Ty := { kind := outerTupleKind, layoutIdx := 2 }
+def outerTupleTy : Ty := { kind := outerTupleKind, layoutIdx := 3 }
 def outerTupleDecl : LocalDecl := { mutability := .mut, ty := outerTupleTy, debugName := none }
 
 def innerMiniRustTy : Gen.Type :=

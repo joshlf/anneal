@@ -563,6 +563,7 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d body.layouts) (itOf d body.layouts)
   baseLow : BaseLow ctx
   borrows : s.memory.borrows = []
+  nextTag_pos : 0 < s.memory.nextTag := by decide
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
   protectors : s.memory.activeProtectors = []
@@ -836,11 +837,44 @@ theorem ExposedTargetAtAddr.of_target_offset {body : CapturedMir} {ctx : Ctx} {s
     by rw [haddr]; exact Int.le_add_of_nonneg_right (Int.natCast_nonneg relOff),
     by rw [haddr]; omega⟩
 
+theorem isExposedAllocId_iff_mem (exposed : List Nat) (tag : Nat) :
+    MirSemantics.isExposedAllocId exposed tag = true ↔ tag ∈ exposed := by
+  induction exposed with
+  | nil => simp [MirSemantics.isExposedAllocId]
+  | cons h t ih =>
+    simp only [MirSemantics.isExposedAllocId, List.mem_cons]
+    cases hbeq : Nat.beq h tag with
+    | true => simp [(Nat.beq_eq.mp hbeq).symm]
+    | false =>
+      have hne : tag ≠ h := fun heq => by subst heq; simp at hbeq
+      simp [ih, hne]
+
+theorem isExposedAllocId_recordExposedAllocId_iff (exposed : List Nat)
+    {allocId : Nat} (hpos : allocId ≠ 0) (tag : Nat) :
+    MirSemantics.isExposedAllocId (MirSemantics.recordExposedAllocId exposed allocId) tag = true ↔
+      tag = allocId ∨ MirSemantics.isExposedAllocId exposed tag = true := by
+  simp only [MirSemantics.recordExposedAllocId]
+  have hb0 : Nat.beq allocId 0 = false := by
+    cases h : Nat.beq allocId 0 with
+    | false => rfl
+    | true => exact absurd (Nat.beq_eq.mp h) hpos
+  rw [hb0]
+  cases hexp : MirSemantics.isExposedAllocId exposed allocId with
+  | true =>
+    constructor
+    · exact Or.inr
+    · rintro (rfl | h) <;> assumption
+  | false =>
+    rw [isExposedAllocId_iff_mem, List.mem_cons, ← isExposedAllocId_iff_mem]
+
 /-- Synchronized provenance and exposed-set invariant relating Anneal's exposed
-borrow tags `exposedTags` and MiniRust's `m.intptrcast.exposed`. -/
+borrow tags `s.memory.exposedAllocIds` (`exposedTags`) and MiniRust's
+`m.intptrcast.exposed`. -/
 structure ProvenanceRel (body : CapturedMir) (ctx : Ctx) (s : MachineState)
     (m : Mach) (exposedTags : List Nat) : Prop where
   nodup : m.intptrcast.exposed.elems.Nodup
+  anneal_exposed : ∀ tag,
+    MirSemantics.isExposedAllocId s.memory.exposedAllocIds tag = true ↔ tag ∈ exposedTags
   sound : ∀ p, setContains m.intptrcast.exposed p = true →
     ∃ tag ∈ exposedTags, ExposedTargetOk body ctx s m.mem.memory.allocations tag p
   complete : ∀ tag ∈ exposedTags,
@@ -848,9 +882,11 @@ structure ProvenanceRel (body : CapturedMir) (ctx : Ctx) (s : MachineState)
       ExposedTargetOk body ctx s m.mem.memory.allocations tag p
 
 theorem ProvenanceRel.empty (body : CapturedMir) (ctx : Ctx) (s : MachineState) (m : Mach)
-    (hempty : m.intptrcast.exposed.elems = []) :
+    (hempty : m.intptrcast.exposed.elems = [])
+    (hemptyA : s.memory.exposedAllocIds = [] := by rfl) :
     ProvenanceRel body ctx s m [] where
   nodup := by rw [hempty]; exact List.Pairwise.nil
+  anneal_exposed tag := by simp [hemptyA, MirSemantics.isExposedAllocId]
   sound p hp := by
     rw [setContains_iff_mem, hempty] at hp
     cases hp
@@ -867,11 +903,16 @@ theorem ProvenanceRel.expose_none {body : CapturedMir} {ctx : Ctx} {s : MachineS
 theorem ProvenanceRel.expose_some {body : CapturedMir} {ctx : Ctx} {s : MachineState}
     {m : Mach} {exposedTags : List Nat} {tag : Nat} {p : Prov} (addr : Int)
     (hrel : ProvenanceRel body ctx s m exposedTags)
+    (htag_ne : tag ≠ 0)
     (htgt : ExposedTargetOk body ctx s m.mem.memory.allocations tag p) :
-    ProvenanceRel body ctx s
+    ProvenanceRel body ctx
+      { s with memory := { s.memory with
+          exposedAllocIds := MirSemantics.recordExposedAllocId s.memory.exposedAllocIds tag } }
       { m with intptrcast := IntPtrCast.expose m.intptrcast { addr := addr, provenance := some p } }
       (tag :: exposedTags) where
   nodup := IntPtrCast.expose_nodup { addr := addr, provenance := some p } hrel.nodup
+  anneal_exposed t := by
+    rw [isExposedAllocId_recordExposedAllocId_iff _ htag_ne, hrel.anneal_exposed, List.mem_cons]
   sound q hq := by
     rw [setContains_expose_some_iff] at hq
     rcases hq with rfl | hq_old
@@ -891,16 +932,32 @@ theorem ProvenanceRel.exposed_alloc_live {body : CapturedMir} {ctx : Ctx} {s : M
   obtain ⟨tag, _, htgt⟩ := hrel.sound p hp
   exact htgt.toExposedAllocOk
 
+/-- Canonical 64-bit byte address assigned by Anneal (`MirSemantics.ptrAddress?`
+/ `MirSemantics.borrowBaseAddress?` at `ptrBytes = 8`) to a stack borrow entry
+targeting `targetLocal` at sub-place byte offset `relOff`:
+`(stackLocalAddrPageBase 8 + targetLocal) * 65536 + relOff`. -/
+def canonicalLocalAddr (targetLocal relOff : Nat) : Nat :=
+  (MirSemantics.stackLocalAddrPageBase 8 + targetLocal) * 65536 + relOff
+
 /-- Coupling invariant for an exposed-address `usize` local `e` written by
-`PointerExposeProvenance`: in Anneal, slot `e` holds the encoded tag
-`.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)` with `pv.offsetBytes = 0`;
-in MiniRust, `pv.tag` satisfies `ExposedTargetOk` for `p` with
-`setContains m.intptrcast.exposed p = true`, and the MiniRust address `tAddr`
-lies within `p`'s live allocation `[a.addr, a.addr + a.size]`. -/
+`PointerExposeProvenance`: in Anneal, slot `e` holds `.init (.scalar ⟨fullAddr, 8⟩)`
+(`fullAddr < 2^64`) with `pv.allocId` recorded in `s.memory.exposedAllocIds` and
+`recoverExposedPtrValue?` recovering `.ptr pv 8` whenever borrow targets agree
+with `s.frame.locals`; in MiniRust, `pv.tag` satisfies `ExposedTargetOk` for `p`
+with `setContains m.intptrcast.exposed p = true`, and `tAddr` lies within `p`'s
+live allocation `[a.addr, a.addr + a.size]`. -/
 structure ExposedLocalRel (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
-    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov) : Prop where
-  slot_eq : view[e]? = some (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov)
+    (fullAddr : Nat) : Prop where
+  slot_eq : view[e]? = some (.init (.scalar ⟨fullAddr, 8⟩))
+  addr_lt : fullAddr < 2 ^ 64
+  recover_eq : ∀ (localsPost : List LocalSlot),
+    (∀ b ∈ s.memory.borrows, localsPost[b.targetLocal]? = s.frame.locals[b.targetLocal]?) →
+    MirSemantics.recoverExposedPtrValue? localsPost s.memory.borrows s.memory.globals
+      s.memory.callerLocals s.memory.exposedAllocIds body.localDecls body.layouts 8 fullAddr =
+      some (.ptr pv 8)
   off_zero : pv.offsetBytes = 0
+  anneal_exposed : MirSemantics.isExposedAllocId s.memory.exposedAllocIds pv.allocId = true
   target_ok : ExposedTargetOk body ctx s m.mem.memory.allocations pv.tag p
   exposed_mem : setContains m.intptrcast.exposed p = true
   in_bounds : ∃ (idx : Nat) (a : Gen.Allocation),
@@ -912,24 +969,17 @@ structure ExposedLocalRel (body : CapturedMir) (ctx : Ctx) (view : List LocalSlo
 
 theorem ExposedLocalRel.anneal_roundtrip {body : CapturedMir} {ctx : Ctx}
     {view : List LocalSlot} {s : MachineState} {m : Mach} {e : Nat}
-    {pv : ProvenancePtr} {tAddr : Int} {p : Prov}
-    (h : ExposedLocalRel body ctx view s m e pv tAddr p) :
-    ({ allocId := (pv.allocId * 65536 + pv.offsetBytes) / 65536,
-       offsetBytes := (pv.allocId * 65536 + pv.offsetBytes) % 65536 } : ProvenancePtr) = pv := by
-  have hoff := h.off_zero
-  rcases pv with ⟨allocId, offsetBytes⟩
-  change Nat at allocId
-  dsimp only at hoff ⊢
-  subst hoff
-  simp only [ProvenancePtr.mk.injEq]
-  change (allocId * 65536 + 0) / 65536 = (allocId : Nat) ∧
-    (allocId * 65536 + 0) % 65536 = 0
-  exact ⟨by omega, by omega⟩
+    {pv : ProvenancePtr} {tAddr : Int} {p : Prov} {fullAddr : Nat}
+    (h : ExposedLocalRel body ctx view s m e pv tAddr p fullAddr) :
+    MirSemantics.recoverExposedPtrValue? s.frame.locals s.memory.borrows s.memory.globals
+      s.memory.callerLocals s.memory.exposedAllocIds body.localDecls body.layouts 8 fullAddr =
+      some (.ptr pv 8) :=
+  h.recover_eq s.frame.locals (fun _ _ => rfl)
 
 theorem ExposedLocalRel.candidate_mem {body : CapturedMir} {ctx : Ctx}
     {view : List LocalSlot} {s : MachineState} {m : Mach} {e : Nat}
-    {pv : ProvenancePtr} {tAddr : Int} {p : Prov}
-    (h : ExposedLocalRel body ctx view s m e pv tAddr p) :
+    {pv : ProvenancePtr} {tAddr : Int} {p : Prov} {fullAddr : Nat}
+    (h : ExposedLocalRel body ctx view s m e pv tAddr p fullAddr) :
     p ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr := by
   obtain ⟨idx, a, rfl, ha, hlive, hlo, hhi⟩ := h.in_bounds
   simp only [int2ptrCandidates, List.mem_map, List.mem_filter, Prod.exists, Bool.and_eq_true,
@@ -938,14 +988,11 @@ theorem ExposedLocalRel.candidate_mem {body : CapturedMir} {ctx : Ctx}
 
 /-- Synchronized exposed-address local invariant (Pass A3): extends
 `ExposedLocalRel` with the MiniRust local-storage side, guaranteeing that
-loading `localName e` in `m` succeeds and returns `(.Int tAddr, .Int usizeIt)`.
-This closes the gap where `ExposedLocalRel` recorded only the Anneal slot
-`view[e]?` and not what MiniRust stored in `localName e`, allowing
-`PointerExposeProvenance` to be chained directly into
-`PointerWithExposedProvenance`. -/
+loading `localName e` in `m` succeeds and returns `(.Int tAddr, .Int usizeIt)`. -/
 structure ExposedLocalSynced (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
-    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov) :
-    Prop extends ExposedLocalRel body ctx view s m e pv tAddr p where
+    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov)
+    (fullAddr : Nat) :
+    Prop extends ExposedLocalRel body ctx view s m e pv tAddr p fullAddr where
   load_ok : ∃ m_load,
     evalValue m (.Load (.Local (localName e))) =
       .ok ((.Int tAddr, .Int usizeIt), m_load)
@@ -1207,6 +1254,7 @@ structure MultiStartRel (entry : CapturedMir) (callees : List CapturedMir)
   baseLow : BaseLow rootCtx
   calleesEq : s.memory.callees = callees
   borrows : s.memory.borrows = []
+  nextTag_pos : 0 < s.memory.nextTag := by decide
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
   protectors : s.memory.activeProtectors = []

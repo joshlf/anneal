@@ -294,6 +294,12 @@ theorem not_other_of_isPtrTy {layouts : Layout.LayoutTable} {t : MirAst.Ty}
   obtain ⟨⟨mutbl, it⟩, hp⟩ := Option.isSome_iff_exists.mp h
   exact not_other_of_ptrPointeeOf hp
 
+theorem layoutPointerBytes_of_localDeclOk_isPtrTy {layouts : Layout.LayoutTable}
+    {d : MirAst.LocalDecl} (hdok : localDeclOk layouts d = true) (hp : isPtrTy d.ty = true) :
+    MirSemantics.layoutPointerBytes layouts = 8 := by
+  obtain ⟨_, _, _, _, harr, htup, hsc⟩ := not_other_of_isPtrTy (layouts := layouts) hp
+  simpa [localDeclOk, hsc, hp, harr, htup] using hdok
+
 theorem isPtrTy_false_of_scalarTypeOf {t : MirAst.Ty} {T : Gen.Type}
     (h : scalarTypeOf t = some T) : isPtrTy t = false := by
   cases hp : isPtrTy t with

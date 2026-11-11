@@ -1144,13 +1144,25 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   symbolically by `mirCall_ret` / `mirCall_noUB` / `mirCall_progress_N`
   (`childReborrowWriteDisablesParent_minirust_ret_from_start` / `_minirust_noUB` /
   `_progress`, `retagDisabledRefDiscrepancy_minirust_ret_from_start` /
-  `_minirust_noUB` / `_progress`); they disagree on the remaining
-  divergences listed under the gaps: `misaligned` (UB in MiniRust only),
-  `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
-  `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
+  `_minirust_noUB` / `_progress`). Under the places-ptr `Trusted` semantics,
+  `misaligned`, `misalignedRef`, and `transmuteDanglingIntToRefDiscrepancy` now
+  raise UB in Anneal as well as on `BasicMemory` and `MachTB`
+  (`misaligned_three_way_ub_agreement`, `misalignedRef_three_way_ub_agreement`,
+  `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`), and
+  `exposeTwice` returns `0` on all three (`exposeTwice_three_way_agreement`).
+  RFC 2582 raw place addressing is pinned by two normal-return agreements:
+  `&raw const (*q)` of the same misaligned `*const u32` that makes
+  `misalignedRef` UB returns `5` everywhere (`misalignedRaw_three_way_agreement`),
+  and `&raw mut` of an uninitialized local followed by a write through the raw
+  pointer returns `12` everywhere (`rawAddrOfUninit_three_way_agreement`);
+  transmuting `4_usize` to `*const u32` without dereferencing likewise returns
+  `5` everywhere via provenance-less `decodeScalarBytes`
+  (`transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement`, contrasting
+  directly with `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`).
+  They disagree on the remaining divergences listed under the gaps:
+  `danglingRef`
   (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
-  without dereferencing in MiniRust, vs returning `5` in Anneal),
-  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), `directWrite` and
+  without dereferencing in MiniRust, vs returning `5` in Anneal), `directWrite` and
   `frozenWrite` (UB in Anneal only, while returning `9` on both `BasicMemory`
   and `MachTB` because `PtrType::Raw` has `safe_pointee = None` so
   `ReborrowSettings::new` is `None`), `twoPhaseForeignWriteDiscrepancy` and
@@ -1180,8 +1192,8 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `MachTB`), and `transmuteSharedRefToMutWriteDiscrepancy` /
   `transmuteDanglingIntToRefDiscrepancy` (transmuting `&u32` to `&mut u32` and
   writing faulting on `Frozen` in both Anneal and `MachTB` vs returning `77` on
-  `BasicMemory`, and transmuting `4_usize` to `&u32` without dereferencing
-  returning `5` in Anneal vs raising `"Value::Ptr: non-dereferenceable safe pointer"`
+  `BasicMemory`; transmuting `4_usize` to `&u32` without dereferencing now
+  raises UB in Anneal too, matching `"Value::Ptr: non-dereferenceable safe pointer"`
   on both `BasicMemory` and `MachTB`);
   alongside ground-truth checks `checkValue_refTy_safe_ptr_ub`,
   `transmute_refTy_machine_checks`, `validate_refTy_machine_checks`,
@@ -1241,16 +1253,64 @@ and `PointerWithExposedProvenance` casts lowered by `translateFnWithIntrinsics`
 under `provCastFlowOk` (exposed-address locals are non-argument temporaries,
 written only by `PointerExposeProvenance`, read only by
 `PointerWithExposedProvenance` at the exposed pointer's pointee and without
-adding mutability, and never otherwise observed; no forged addresses) and
-`ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
-pointer copy, as in Anneal's `tag * 65536 + offsetBytes` encoding).
+adding mutability, and never otherwise observed; no forged addresses),
+`ptrDeclLayoutsOk body` (required directly in both `inFragmentWithIntrinsics`
+and `bodyInProgFragmentWithIntrinsics` because `provCastAliasView` retypes
+exposed `usize` locals to `provCastAliasTy`, which would otherwise erase a
+corrupt `usize` `layoutIdx` that makes Anneal's `checkTargetPlaceAlign` fault
+while `Mach` and `MachTB` succeed: `shadowedUsizeLayoutDivergence_three_way`),
+and `ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
+pointer copy: Anneal exposes the canonical stack address
+`canonicalLocalAddr entry.targetLocal relOff` of the borrowed place, records the
+tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?` recovers the same
+tag; `AnnealExposeRoundTripOk.of_structural` and `ExposeTargetSlotOk.of_frameOk`
+derive this Anneal-side round-trip obligation and both whole-local and
+proper-sub-place target-slot readiness from `FrameOkWithIntrinsics`, `BorrowsOk`,
+`AddrTakenTargetsOk`, `StaleOk`, and `NoCompetingExposedBorrow`, so all
+`ProvenanceRel.*_from_frameOk` theorems eliminate opaque `hart` and dynamic
+`hsub_slot` obligations; at `exposedTags = []`
+(`expose_then_withExposed_unexposed_from_frameOk`,
+`assume_then_expose_then_withExposed_closed_unexposed_from_frameOk`)
+`NoCompetingExposedBorrow` vanishes, leaving only static `ptrDeclLayoutsOk` +
+`bodyPreservesAddrTaken` when `body` borrows proper sub-places (exercised on
+`int2ptrArraySubPlaceRoundTripOk`, where the `by decide` default closes it:
+`int2ptrArraySubPlaceRoundTripOk_hsub_static`) and the uniform 64-bit
+canonical-page bound `body.localDecls.length ≤ 2^47 - stackLocalAddrPageBase 8 + 1`
+(`canonicalLocalAddr_lt_two_pow_64`, sized for in-local offsets below `2^63`;
+`canonicalLocalAddr_lt_two_pow_64_iff` gives the exact per-local limit for
+offsets inside one page), with `ptrDeclLayoutsOk`, `bodyPreservesAddrTaken`, and
+the locals-count bound all discharged unconditionally on `inFragmentWithIntrinsics`
+via `assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`;
+for `exposedTags ≠ []`, `NoCompetingExposedBorrow.of_distinct_locals_or_lower_perm`
+and `assume_then_expose_then_withExposed_closed_distinct_from_frameOk` — via
+`NoCompetingExposedBorrow.of_borrows_distinct` and `ptrTargetPlaceSpan_lt_page`,
+witnessed at equal `.frozen` permission scores across distinct locals by
+`exposePriorOtherLocal_annealExposeRoundTripOk` and at proper sub-places by
+`int2ptrArraySubPlaceRoundTripOk_hsub_page` — derive `NoCompetingExposedBorrow`
+whenever previously exposed borrows either target distinct canonical-page-bounded
+locals under `bodyBorrowTargetsFitPage` or have strictly lower permission rank;
+`assume_then_expose_then_withExposed_closed_distinct_of_inFragmentWithIntrinsics`
+again takes the static conditions from `inFragmentWithIntrinsics`, leaving only
+`bodyBorrowTargetsFitPage` for sub-place borrows. With prior exposures the
+MiniRust-side hypothesis `hnoadj` (no other exposed allocation is an `int2ptr`
+candidate for the target address, which fails when adjacent allocations touch at
+their boundary: `int2ptrAdjacentArgsAmbiguous`) is in turn discharged
+structurally from `CtxSpaced body ctx = true` (`int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff`)
+by `ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced` and
+`assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics`).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
-without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`
-(Anneal `65536` vs. `0` on `Mach` and `MachTB`), `int2ptrForgedTag` (Anneal
-returns `5` from the forged address `65536` while both MiniRust machines raise
-UB), `directWrite`, and `exposeSharedRefWriteUb`, all rejected now; and it runs
+without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
+`int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
+now. The first two were divergences under the earlier tag-encoded addresses
+(Anneal returned `65536` and `5`); under the places-ptr `Trusted` semantics all
+three machines return `0` on `exposeTwice` and raise UB on `int2ptrForgedTag`
+(`exposeTwice_three_way_agreement`, `int2ptrForgedTag_three_way_ub_agreement`),
+while `directWrite` and `exposeSharedRefWriteUb` still diverge; and it runs
 the brief's suite across all three semantics: `int2ptrRoundTripOk_three_way`
-(`77`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
+(`77`; whereas replacing `PointerWithExposedProvenance` with `CastKind.transmute`
+decodes provenance-less scalar bytes via `decodeScalarBytes` despite
+`exposedAllocIds = [1]` and faults across all three in
+`transmuteExposedAddrToRawPtrDerefUb_three_way`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
 (two adjacent exposed arguments under `ctxAdj`: Anneal `9`, `Stop.unsupported`
 on `Mach` and `MachTB`; `9` everywhere when the arguments are apart), and
 `int2ptrDeadAllocUb_three_way` (the cast after `StorageDead`), plus
@@ -1417,10 +1477,10 @@ These are deliberate and are the first things to lift:
   Tree Borrows) diverge:
   - *Safe-pointer validity without dereferencing*: MiniRust's `checkPtr` checks
     non-null, alignment, inhabitedness, and `dereferenceable` on every load or
-    store of a `PtrType::Ref`, so forming an unused misaligned `&u32`
-    (`misalignedRef`) or copying a dangling `&u32` (`danglingRef`) is
+    store of a `PtrType::Ref`, so copying a dangling `&u32` (`danglingRef`) is
     immediate UB in MiniRust, whereas Anneal stores `(tag, offset)` pairs and
-    checks liveness only on dereference.
+    checks liveness only on dereference (forming an unused misaligned `&u32`,
+    `misalignedRef`, is now UB in both).
   - *Tree Borrows `parentTag` hierarchy vs. remaining local-teardown and direct-write
     gaps*: Anneal's `BorrowEntry` records `parentTag`, starts `&mut *_p` reborrows
     in `.reserved`, freezes overlapping foreign `.active` entries on dereference
@@ -1463,15 +1523,14 @@ These are deliberate and are the first things to lift:
     `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
     conflicting even for `!Freeze` `.reserved` entries.
   - *Misaligned sub-scalar offsets, integer-to-pointer transmutes, and provenance exposure*:
-    while stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
-    agree with MiniRust (`offsetDeref`), Anneal reads the underlying scalar local
-    on misaligned sub-scalar byte offsets (`misaligned`),
-    checks only `bits != 0` when decoding provenance-free integer bytes at `&T`
-    (`transmuteDanglingIntToRefDiscrepancy`), and encodes
-    `PointerExposeProvenance` as `tag * 65536 + offsetBytes` (`exposeTwice`;
-    conversely, exposing two distinct live `&mut` tags at one address stops with
-    `Stop.unsupported` on `MachTB`'s angelic `int2ptr` choice in
-    `exposeTwoRefMutAngelicUnsupported`),
+    stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
+    agree with MiniRust (`offsetDeref`), and under the places-ptr `Trusted`
+    semantics so do misaligned sub-scalar loads (`misaligned`), integer-to-`&T`
+    transmutes (`transmuteDanglingIntToRefDiscrepancy`), and repeated exposure
+    of one address (`exposeTwice`; conversely, exposing two distinct live `&mut`
+    tags at one address stops with `Stop.unsupported` on `MachTB`'s angelic
+    `int2ptr` choice in `exposeTwoRefMutAngelicUnsupported`); these forms stay
+    outside `inFragment`,
     while `Retag(FnEntry)` / reference arguments and reference returns remain
     outside `inFragment`. Two upstream MiniRust `TreeBorrowsMemory` edge cases
     are also exhibited and isolated (`zstWrappingSubReborrow_tb_specPanic` vs.
@@ -1529,12 +1588,13 @@ These are deliberate and are the first things to lift:
   `ptrTargetSpec_aligned_and_good` and `ptrTargetSpec_valid_withIntrinsics`),
   culminating in `ProvenanceRel.expose_step_from_frameOk`,
   `ProvenanceRel.withExposed_step_from_frameOk`, and
-  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive all
+  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive both
+  Anneal-side `ExposeTargetSlotOk` / `AnnealExposeRoundTripOk` and all
   MiniRust `evalPlace`, pointer/integer `evalValue` load, `placeStore`,
   `jumpToBlock`, and `ExposedTargetAtAddr` obligations directly from
-  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`
-  with zero external MiniRust evaluation hypotheses, while preserving
-  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
+  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, `StaleOk`, and
+  `ProvenanceRel` with zero external MiniRust evaluation hypotheses, while
+  preserving `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
   Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
   `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
@@ -1566,7 +1626,7 @@ These are deliberate and are the first things to lift:
   1. **`progInFragmentWithIntrinsics`** (`bodyInProgFragmentWithIntrinsics`): the
      sound unified correspondence fragment combining intra-frame pointers,
      references, reborrows, `Transmute`, `Assume`, `PointerExposeProvenance`, and
-     `PointerWithExposedProvenance` (`provCastFlowOk` and
+     `PointerWithExposedProvenance` (`provCastFlowOk`, `ptrDeclLayoutsOk body`, and
      `ptrAliasingProgOk (provCastAliasView body)`) with scalar-boundary `Call`
      terminators. Both `progInFragment` and `inFragmentWithIntrinsics` embed
      into it (`progInFragment_implies_progInFragmentWithIntrinsics`,
@@ -1614,11 +1674,13 @@ These are deliberate and are the first things to lift:
      can **silently return a wrong scalar with `MirNoUBTree`** when the callee's
      colliding local slot holds a same-typed scalar
      (`callerRefMutSilentWrongLocal_divergence`: Anneal returns `137` with no UB
-     while `Mach` and `MachTB` return `42`). Single-body divergences admitted by
+     while `Mach` and `MachTB` return `42`). Single-body programs admitted by
      Pass B3's unguarded predicate (`progInFragmentWithIntrinsicsB3`) are also
-     recorded in `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
-     `childReborrowWriteDisablesParent_B3_divergence`, and
-     `exposeSharedRefWriteUb_B3_divergence`.
+     recorded: `exposeSharedRefWriteUb_B3_divergence` still diverges, while the
+     historically named `exposeTwice_B3_divergence`,
+     `int2ptrForgedTag_B3_divergence`, and
+     `childReborrowWriteDisablesParent_B3_divergence` now agree across all three
+     semantics.
   Threading `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across
   the continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
@@ -1637,7 +1699,7 @@ These are deliberate and are the first things to lift:
   locals for the symbolic `multi_step_correspondence` induction, while
   `progInFragmentWithIntrinsics` (`bodyInProgFragmentWithIntrinsics` and
   `translateProgWithIntrinsics`) unifies `progInFragment` and
-  `inFragmentWithIntrinsics` under `provCastFlowOk` and
+  `inFragmentWithIntrinsics` under `provCastFlowOk`, `ptrDeclLayoutsOk body`, and
   `ptrAliasingProgOk (provCastAliasView body)` (and `progCrossFrameTranslatable`
   checks syntactic `translateProgWithIntrinsics` lowering for cross-frame
   pointer/reference witnesses). The

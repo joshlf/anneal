@@ -1477,7 +1477,7 @@ theorem loopDerefCopyCountdown_tb_direct :
     retAfterTB2 loopDerefCopyCountdown loopDerefCopyCountdownArgs 43 = tbRetU32 16 := by
   decide +kernel
 
-def stdOrderingTy : Ty := { kind := .adt "std::cmp::Ordering" [], layoutIdx := 0 }
+def stdOrderingTy : Ty := { kind := .adt "std::cmp::Ordering" [], layoutIdx := 1 }
 def refMutStdOrderingTy : Ty := { kind := .ref .mut (.adt "std::cmp::Ordering" []), layoutIdx := 0 }
 def refSharedStdOrderingTy : Ty := { kind := .ref .not (.adt "std::cmp::Ordering" []), layoutIdx := 0 }
 def stdOrderingDecl : LocalDecl := { mutability := .mut, ty := stdOrderingTy, debugName := none }
@@ -1486,8 +1486,16 @@ def refMutStdOrderingDecl : LocalDecl :=
 def refSharedStdOrderingDecl : LocalDecl :=
   { mutability := .mut, ty := refSharedStdOrderingTy, debugName := none }
 
+def stdOrderingLayout : TypeLayout :=
+  let tagSc : ScalarLayout := .initialized (.int 8 true) { start := 255, end_ := 1 }
+  { size := { bytes := 1 }, align := { bytes := 1 },
+    backendRepr := .scalar tagSc,
+    fields := .arbitrary [] [],
+    variants := .multiple tagSc 0 [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []],
+    isUninhabited := false }
+
 def stdOrderingLayouts : LayoutTable :=
-  { pointerBits := 64, isLittleEndian := true, entries := [i8Layout] }
+  { pointerBits := 64, isLittleEndian := true, entries := [i8Layout, stdOrderingLayout] }
 
 /-- `&mut std::cmp::Ordering` and `&std::cmp::Ordering` (using the `"std::cmp::Ordering"`
 `defPath` alias alongside `"core::cmp::Ordering"` in `pointeeInfoOfRigidTy` and
@@ -1640,7 +1648,8 @@ theorem int2ptrRawRoundTripOk_tb_direct :
 address (`256`, the stack address of `_1` under `ctx0`) when `exposed = ∅`:
 `IntPtrCast.int2ptr` yields `{ addr := 256, provenance := none }`, and dereferencing
 `*_3` raises `Stop.ub "dereferencing pointer without provenance"` on both `Mach`
-and `MachTB` (and faults in Anneal because `256 / 65536 = 0` has no borrow entry). -/
+and `MachTB` (and faults in Anneal because `exposedAllocIds = []` so
+`recoverExposedPtrValue?` leaves a provenance-less scalar `256`). -/
 def int2ptrUnexposedDerefUb : CapturedMir :=
   ptrBody "witness::int2ptr_unexposed_deref_ub"
     [u32Decl, u32Decl, usizeDecl, ptrConstU32Decl]
@@ -1650,7 +1659,8 @@ def int2ptrUnexposedDerefUb : CapturedMir :=
      .assign (local_ 0) (.use (.copy (derefPlace 3)))]
 
 /-- The forged address `256` is not an exposed-address local, so `provCastFlowOk`
-rejects the body (Anneal decodes any integer into a tag, see `int2ptrForgedTag`). -/
+rejects the body (forged integers stay outside the fragment even though Anneal
+now recovers no provenance from an unexposed address, see `int2ptrForgedTag`). -/
 theorem int2ptrUnexposedDerefUb_notInFragmentWithIntrinsics :
     inFragmentWithIntrinsics int2ptrUnexposedDerefUb = false := by decide +kernel
 

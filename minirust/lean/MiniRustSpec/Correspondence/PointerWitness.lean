@@ -90,16 +90,16 @@ match MiniRust: `offsetDeref 0` returns `a[0] = 5`, `offsetDeref 1` returns
 `a[1] = 7`, and `offsetDeref 2`, `offsetDeref 3`, and `offsetDeref usizeMax`
 raise UB).
 
-**Divergence, Anneal unsound.** Anneal returns a value where MiniRust, the
-ground truth, returns a different value or raises UB:
+**Out-of-fragment alignment and address-exposure agreement.**
 
-* `misaligned`: reading a `u32` through a pointer one byte into a `u32` is UB in
-  MiniRust;
-* `exposeTwice`: two `&raw const x` expose the same address in MiniRust, but
-  addresses `65536` apart in Anneal, whose exposed address encodes the borrow
-  tag. `minimize` translates `PointerExposeProvenance` into an intrinsic call
-  terminator after splitting the block, which `translateFn` does not do yet
-  (`exposeTwice_translate`); `exposeTwiceFn` spells out that translation.
+* `misaligned`: reading a `u32` through a pointer one byte into a `u32` raises UB
+  in both MiniRust and Anneal (`checkTargetPlaceAlign`);
+* `exposeTwice`: two `&raw const x` expose the same canonical stack address and
+  return `0` in both MiniRust and Anneal (`ptrAddress?`), while recording
+  `exposedAllocIds = [2, 1]`. `minimize` translates `PointerExposeProvenance`
+  into an intrinsic call terminator after splitting the block, which `translateFn`
+  leaves to `translateFnWithIntrinsics` (`exposeTwice_translate`); `exposeTwiceFn`
+  spells out that translation.
 
 **Divergence, Anneal stricter.** Anneal raises UB where MiniRust's
 `BasicMemory`, which has no aliasing model, returns a value:
@@ -254,16 +254,6 @@ theorem ptrRoundTrip_minirust_direct :
     retAfter ptrRoundTrip [.scalar ⟨5, 4⟩] 10 =
       some (some { retAlloc with data := scalarBytes u32 6 }, [1]) := by
   decide +kernel
-
-private theorem itOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
-    (layouts : LayoutTable) :
-    itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
-      itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
-
-private theorem tyOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
-    (layouts : LayoutTable) :
-    tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
-      tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
 
 theorem ptrRoundTrip_ctxOk : CtxOk ptrRoundTrip ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -2298,11 +2288,14 @@ def misaligned : CapturedMir :=
 
 theorem misaligned_notInFragment : inFragment misaligned = false := by decide +kernel
 
-/-- Anneal returns `x`. -/
-theorem misaligned_anneal_ret :
-    ∃ mem, ReachesRet (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨5, 4⟩, mem)) :=
-  ⟨_, runA_sound misaligned 30 _ _ _ rfl⟩
+/-- Anneal raises UB: `*q` has `offsetBytes = 1`, which fails `u32` alignment
+(`checkTargetPlaceAlign`), matching MiniRust (`misaligned_minirust_direct`;
+bundled across Anneal, `BasicMemory`, and `TreeBorrowsMemory` in
+`misaligned_three_way_ub_agreement` in `RefWitness.lean`). -/
+theorem misaligned_anneal_ub :
+    ∃ tr u, Reaches (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u :=
+  faultsA_sound misaligned 30 _ (by decide)
 
 /-- MiniRust raises UB: the place `*q` is based on a pointer that is not
 aligned for `u32`. -/
@@ -2341,13 +2334,15 @@ theorem exposeTwice_translate : (translateFn exposeTwice).isNone = true := by de
 theorem exposeTwice_notInFragment : inFragment exposeTwice = false := by decide +kernel
 
 set_option maxRecDepth 200000 in
-/-- Anneal returns `65536`: the two pointers carry the borrow tags `1` and `2`,
-and `PointerExposeProvenance` returns `tag * 65536 + offsetBytes`. -/
+/-- Anneal returns `0`: both `p1` (tag `1`) and `p2` (tag `2`) borrow `_1` at
+offset `0`, so `PointerExposeProvenance` exposes the same canonical stack
+address `(stackLocalAddrPageBase 8 + 1) * 65536` while recording `exposedAllocIds = [2, 1]`. -/
 theorem exposeTwice_anneal_ret :
     ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨65536, 4⟩,
+      (.normal (.scalar ⟨0, 4⟩,
         { (initMachineState exposeTwice [.scalar ⟨5, 4⟩]).memory with
           borrows := [rawPtrEntry 2 .not (local_ 1), rawPtrEntry 1 .not (local_ 1)],
+          exposedAllocIds := [2, 1],
           nextTag := 3 })) :=
   runA_sound exposeTwice 30 _ _ _ rfl
 

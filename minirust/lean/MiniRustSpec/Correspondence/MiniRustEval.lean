@@ -991,8 +991,8 @@ theorem localTy_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTable}
       simp only [ha] at hdok
       cases ht : tupleTypeOf layouts d.ty with
       | none =>
-        simp only [ht, Bool.or_false] at hdok
-        obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hdok
+        simp only [ht, Bool.or_false, Bool.and_eq_true] at hdok
+        obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hdok.1
         rw [h1, h2]
         rcases declPtrTy_cases d.ty with hraw | ⟨mutbl, it, href, h1'⟩
         · rw [hraw]; exact .rawPtr
@@ -1001,7 +1001,7 @@ theorem localTy_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTable}
         obtain ⟨fields, size, align⟩ := p
         simp only [ht] at hdok
         have hnp : isPtrTy d.ty = false := isPtrTy_false_of_tupleTypeOf ht
-        simp only [hnp, Bool.false_or] at hdok
+        simp only [hnp] at hdok
         obtain ⟨h1, h2⟩ := tyOf_tupleSpec ht
         rw [h1, h2]
         exact .tupleSpec fields size align hdok
@@ -1066,9 +1066,9 @@ theorem declSlotData_length_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
       simp only [ha] at hdok hsl
       cases ht : tupleTypeOf layouts d.ty with
       | none =>
-        simp only [ht, Bool.or_false] at hdok
-        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
-        rw [declSlotData_of_isPtrTy hdok, h1, slotData_length, tyBytes_declPtrTy]
+        simp only [ht, Bool.or_false, Bool.and_eq_true] at hdok
+        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok.1
+        rw [declSlotData_of_isPtrTy hdok.1, h1, slotData_length, tyBytes_declPtrTy]
         rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
@@ -7075,9 +7075,9 @@ theorem declSlotData_uninit_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
       simp only [ha] at hdok
       cases ht : tupleTypeOf layouts d.ty with
       | none =>
-        simp only [ht, Bool.or_false] at hdok
-        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
-        rw [declSlotData_of_isPtrTy hdok, h1, tyBytes_declPtrTy]
+        simp only [ht, Bool.or_false, Bool.and_eq_true] at hdok
+        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok.1
+        rw [declSlotData_of_isPtrTy hdok.1, h1, tyBytes_declPtrTy]
         rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
@@ -11381,7 +11381,7 @@ private theorem initFrameArgs_from {body : CapturedMir} {f : Gen.Function} {ctx 
           simp at hv'
           simpa [Nat.add_assoc, Nat.add_comm 1 r] using hin2 r v' hv'
 
-private theorem initLocalsAux_getElem? (idx : Nat) (decls : List LocalDecl) (args : List Value) :
+theorem initLocalsAux_getElem? (idx : Nat) (decls : List LocalDecl) (args : List Value) :
     (MirSemantics.initLocalsAux idx decls args).length = decls.length ∧
     ∀ k, k < decls.length →
       (MirSemantics.initLocalsAux idx decls args)[k]? =

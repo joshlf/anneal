@@ -377,6 +377,21 @@ inductive TupleSpec : Type where
 
 mutual
 
+/-- Canonical zero-initialized `MirSemantics.Value` of shape `TupleSpec`,
+matching the runtime `.aggregate 0 vals` arities of `TupleSpec.valOk`. -/
+def TupleSpec.zeroVal : TupleSpec → MirSemantics.Value
+  | .scalar it => .scalar ⟨0, it.size.bytes⟩
+  | .tuple fields _ _ => .aggregate 0 (TupleSpec.zeroFieldVals fields)
+
+/-- Pointwise `TupleSpec.zeroVal` across tuple/struct fields. -/
+def TupleSpec.zeroFieldVals : List (Nat × TupleSpec) → List MirSemantics.Value
+  | [] => []
+  | (_, s) :: rest => s.zeroVal :: TupleSpec.zeroFieldVals rest
+
+end
+
+mutual
+
 /-- Boolean equality on `TupleSpec`. -/
 def TupleSpec.beq : TupleSpec → TupleSpec → Bool
   | .scalar it1, .scalar it2 => decide (it1 = it2)
@@ -472,6 +487,14 @@ def TupleSpec.fieldsWf (size align : Nat) : List (Nat × TupleSpec) → Bool
 
 end
 
+/-- Whether a captured `TypeLayout` has non-union `FieldsShape` (`minimize` and
+`TupleSpec` only translate single-variant structs `FieldsShape.arbitrary`, never
+unions `FieldsShape.union`). -/
+def isNonUnionTypeLayout (l : Layout.TypeLayout) : Bool :=
+  match l.fields with
+  | .union _ => false
+  | _ => true
+
 mutual
 
 /-- `minimize`'s tuple and struct layout extraction (`tooling/minimize/src/ty.rs`):
@@ -518,7 +541,7 @@ def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Op
     let l ← Layout.LayoutTable.lookup layouts layoutIdx
     match l.variants, l.isUninhabited, l.fields with
     | .single 0, false, .arbitrary offsets _ =>
-      if offsets.length = fieldKinds.length then do
+      if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
         pure (.tuple fields l.size.bytes l.align.bytes)
       else none
@@ -527,7 +550,7 @@ def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Op
     let l ← Layout.LayoutTable.lookup layouts layoutIdx
     match l.variants, l.isUninhabited, l.fields with
     | .single 0, false, .arbitrary offsets _ =>
-      if offsets.length = fieldKinds.length then do
+      if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
         pure (.tuple fields l.size.bytes l.align.bytes)
       else none
@@ -4126,6 +4149,97 @@ def bodyAddrTakenLocals (body : MirAst.CapturedMir) : List Nat :=
       | .assign _ rv => (directBorrowOf rv).map (·.2.local_)
       | _ => none
 
+/-- All places `q` directly borrowed via `.rawPtr` or `.ref` anywhere in `body`. -/
+def bodyDirectBorrowPlaces (body : MirAst.CapturedMir) : List MirAst.Place :=
+  body.basicBlocks.flatMap fun bb =>
+    bb.statements.filterMap fun s =>
+      match s.kind with
+      | .assign _ rv => (directBorrowOf rv).map (·.2)
+      | _ => none
+
+/-- Canonical zero-initialized `MirSemantics.Value` for a fragment `LocalDecl`. -/
+def canonicalDeclVal (layouts : Layout.LayoutTable) (d : MirAst.LocalDecl) : MirSemantics.Value :=
+  match intTypeOf d.ty with
+  | some it => .scalar ⟨0, it.size.bytes⟩
+  | none =>
+    match arrayTypeOf d.ty with
+    | some (elemIt, count) => .aggregate 0 (List.replicate count (.scalar ⟨0, elemIt.size.bytes⟩))
+    | none =>
+      match tupleTypeOf layouts d.ty with
+      | some (fields, size, align) => (TupleSpec.tuple fields size align).zeroVal
+      | none => .unit
+
+/-- Static consistency of `body.layouts` and `body.localDecls` with `minimize`'s
+pointer, target-alignment, stride, and byte-offset rules across all pointer
+locals and directly borrowed places in `body`. -/
+def ptrDeclLayoutsOk (body : MirAst.CapturedMir) : Bool :=
+  let decls := body.localDecls
+  let layouts := body.layouts
+  let canonLocals : List MirSemantics.LocalSlot :=
+    decls.map (fun d => .init (canonicalDeclVal layouts d))
+  let borrowPlaces := bodyDirectBorrowPlaces body
+  (List.range decls.length).all (fun p =>
+    match decls[p]? with
+    | none => true
+    | some dp =>
+      match ptrPointeeOf dp.ty with
+      | none => true
+      | some (_, pointeeIt) =>
+        match MirSemantics.placeTyResolved decls layouts ⟨p, [.deref]⟩ with
+        | none => false
+        | some pTy =>
+          let rAccTy := MirSemantics.resolveTyWithLocalDecls decls layouts pTy
+          decide (MirSemantics.tyScalarBytes rAccTy = some pointeeIt.size.bytes) &&
+          decide (MirSemantics.tyByteSize decls layouts pTy = some pointeeIt.size.bytes) &&
+          decide (MirSemantics.tyByteSize decls layouts rAccTy = some pointeeIt.size.bytes) &&
+          (match rAccTy.kind with
+           | .bool | .char | .never => false
+           | _ => true) &&
+          borrowPlaces.all (fun q =>
+            match decls[q.local_]? with
+            | none => true
+            | some dk =>
+              let qEntry : MirSemantics.BorrowEntry :=
+                { tag := 0, targetLocal := q.local_, targetProjection := q.projection,
+                  perm := .active }
+              MirSemantics.checkTargetPlaceAlign decls layouts (some pTy)
+                qEntry ⟨0, 0⟩ (some (canonicalDeclVal layouts dk)) &&
+              MirSemantics.checkTargetPlaceAlign decls layouts (some rAccTy)
+                qEntry ⟨0, 0⟩ (some (canonicalDeclVal layouts dk)))) &&
+  borrowPlaces.all (fun q =>
+    match decls[q.local_]?, ptrTargetSpec layouts decls q with
+    | some dk, some (pointeeIt, relOff) =>
+      let qEntry : MirSemantics.BorrowEntry :=
+        { tag := 0, targetLocal := q.local_, targetProjection := q.projection, perm := .active }
+      decide (MirSemantics.borrowPlaceByteOffset? canonLocals [] decls layouts qEntry =
+        some relOff) &&
+      match q.projection with
+      | [] =>
+        decide (MirSemantics.tyByteSize decls layouts
+          (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty) = some pointeeIt.size.bytes)
+      | [.constantIndex _ _ _] =>
+        decide (MirSemantics.resolveSeqContainerElemByteStride decls layouts q.local_ [] [] =
+          pointeeIt.size.bytes) &&
+        match MirSemantics.placeTyResolved decls layouts q with
+        | some projTy =>
+          decide (MirSemantics.tyByteSize decls layouts projTy = some pointeeIt.size.bytes)
+        | none => false
+      | .field _ _ :: _ =>
+        (match tupleTypeOf layouts dk.ty with
+         | some (_, size, _) =>
+           decide (MirSemantics.tyByteSize decls layouts
+             (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty) = some size) &&
+           decide (MirSemantics.projectionChainByteOffset? layouts
+             (some (MirSemantics.resolveTyWithLocalDecls decls layouts dk.ty))
+             (some (canonicalDeclVal layouts dk)) none 0 decls q.projection = some relOff)
+         | none => false) &&
+        match MirSemantics.placeTyResolved decls layouts q with
+        | some projTy =>
+          decide (MirSemantics.tyByteSize decls layouts projTy = some pointeeIt.size.bytes)
+        | none => false
+      | _ => true
+    | _, _ => true)
+
 /-- Whether `s` neither directly writes/deinits/changes storage of any local in
 `addrLocals` nor moves out any local in `addrLocals`. -/
 def stmtPreservesAddrTaken (addrLocals : List Nat) (s : MirAst.Statement) : Bool :=
@@ -4568,6 +4682,7 @@ per-borrow Tree Borrows tags with MiniRust's flat byte-level `BasicMemory`
 def ptrAliasingOk (body : MirAst.CapturedMir) : Bool :=
   let addrLocals := bodyAddrTakenLocals body
   let n := body.localDecls.length
+  ptrDeclLayoutsOk body &&
   addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
   body.basicBlocks.all (fun bb =>
     bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
@@ -4588,7 +4703,8 @@ type (`scalarTypeOf`), a thin raw pointer or reference to an integer (`isPtrTy`)
 a homogeneous 1D integer array whose byte size fits in signed 64-bit `isize`
 (`< 2 ^ 63`), or a well-formed tuple / single-variant struct (`TupleSpec.wf`). -/
 def localDeclOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (d : MirAst.LocalDecl) : Bool :=
-  (scalarTypeOf d.ty).isSome || isPtrTy d.ty ||
+  (scalarTypeOf d.ty).isSome ||
+  (isPtrTy d.ty && decide (MirSemantics.layoutPointerBytes layouts = 8)) ||
   match arrayTypeOf d.ty with
   | some (elemIt, count) => decide (count * elemIt.size.bytes < 2 ^ 63)
   | none =>
@@ -4660,7 +4776,7 @@ def exposeCastOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rva
     decide (it = usizeIt) &&
     decide (intTypeOf targetTy = some usizeIt) &&
     decide (p < decls.length) &&
-    (decls[p]? >>= (ptrPointeeOf ·.ty)).isSome
+    (decls[p]? >>= (rawPtrPointeeOf ·.ty)).isSome
   | _ => false
 
 /-- Fragment rvalue check for `CastKind::PointerWithExposedProvenance(op, targetTy)`
@@ -4728,23 +4844,28 @@ def statementOkWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statem
 
 /-! ### Provenance-cast data-flow and aliasing discipline
 
-Anneal's MIR semantics (`trusted/lean/.../MirSemantics/Places.lean`) does not
-model exposure: `PointerExposeProvenance` returns the *encoding*
-`tag * 65536 + offsetBytes` of the pointer's borrow tag, and
-`PointerWithExposedProvenance` decodes any integer back into a pointer with tag
-`n / 65536`. MiniRust instead returns the pointer's address and resolves the
-provenance of `int2ptr` angelically among the exposed provenances. The two
-agree only when an exposed integer is used for nothing but casting it back:
+Anneal's MIR semantics (`trusted/lean/.../MirSemantics/Places.lean`) models
+exposure with canonical addresses: `PointerExposeProvenance` returns the
+canonical stack address `ptrAddress?` of the borrowed place (the same for every
+tag borrowing that place) and records the tag in `Memory.exposedAllocIds`, and
+`PointerWithExposedProvenance` recovers the highest-ranked live exposed stack
+borrow covering the address (`recoverExposedPtrValue?`), or a provenance-less
+address when none is exposed. MiniRust returns the pointer's address and
+resolves the provenance of `int2ptr` angelically among the exposed provenances.
+Under these semantics observing an exposed integer (`exposeTwice`: both return
+`0`) and forging one (`int2ptrForgedTag`: both raise UB) agree
+(`exposeTwice_three_way_agreement`, `int2ptrForgedTag_three_way_ub_agreement`),
+but the fragment still admits only the flows whose step correspondence is
+proved, i.e. an exposed integer used for nothing but casting it back:
 
-* observing it (`exposeTwice`: `(e2 - e1) as u32` is `65536` in Anneal and `0`
-  in MiniRust) makes the results differ;
-* forging one (`int2ptrForgedTag`: `65536 as *const u32` reads a borrowed
-  local in Anneal but is UB in MiniRust) makes Anneal *more* defined than
-  MiniRust;
+* observing or forging exposed integers stays outside the fragment (the step
+  simulation `ProvenanceRel.*_from_frameOk` covers only the
+  expose-then-cast-back round trip);
 * laundering mutability or pointee type through the integer (`*const u32` →
   `usize` → `*mut u32`) escapes `ptrRvalueOk`'s `PtrToPtr` rule;
-* and a round-tripped pointer is a tag-sharing copy of the exposed pointer in
-  Anneal, so it must obey the same `ptrAliasingOk` borrow discipline.
+* and a round-tripped pointer recovers the exposed pointer's borrow tag in
+  Anneal (`AnnealExposeRoundTripOk`), so it must obey the same `ptrAliasingOk`
+  borrow discipline.
 
 `provCastFlowOk` and `ptrAliasingOk (provCastAliasView body)` enforce exactly
 this. -/
@@ -4771,7 +4892,7 @@ def exposeSourcesOf (body : MirAst.CapturedMir) (e : Nat) :
     | .assign ⟨e', []⟩ (.cast .pointerExposeProvenance op _) =>
       if e' = e then
         some (match copyOp op with
-          | .copy ⟨p, []⟩ => body.localDecls[p]? >>= (ptrPointeeOf ·.ty)
+          | .copy ⟨p, []⟩ => body.localDecls[p]? >>= (rawPtrPointeeOf ·.ty)
           | _ => none)
       else none
     | _ => none
@@ -4842,8 +4963,9 @@ def provCastAliasStmt (s : MirAst.Statement) : MirAst.Statement :=
 /-- The body as `ptrAliasingOk` must see it: exposed-address locals become
 pointer locals and provenance casts become pointer copies, so a reconstructed
 pointer shares the borrow tag (and `PtrLocalState`) of the exposed one, exactly
-as Anneal's `tag * 65536 + offsetBytes` encoding round-trips the tag. The
-identity on bodies without provenance casts. -/
+as Anneal's `recoverExposedPtrValue?` recovers the exposed tag from its
+canonical address (`AnnealExposeRoundTripOk`). The identity on bodies without
+provenance casts. -/
 def provCastAliasView (body : MirAst.CapturedMir) : MirAst.CapturedMir :=
   if hasProvCast body then
     let E := exposedIntLocals body
@@ -4874,8 +4996,14 @@ def inFragmentWithIntrinsics (body : MirAst.CapturedMir) : Bool :=
     bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
     terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
-  provCastFlowOk body && ptrAliasingOk (provCastAliasView body) &&
+  provCastFlowOk body && ptrDeclLayoutsOk body && ptrAliasingOk (provCastAliasView body) &&
   (translateFnWithIntrinsics body).isSome
+
+theorem ptrDeclLayoutsOk_of_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
+    (h : inFragmentWithIntrinsics body = true) :
+    ptrDeclLayoutsOk body = true := by
+  simp only [inFragmentWithIntrinsics, Bool.and_eq_true] at h
+  exact h.1.1.2
 
 /-- Number of `.intrinsic` entries in a `StmtTranslation` list. -/
 def countIntrinsics : List StmtTranslation → Nat
@@ -5307,9 +5435,12 @@ theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
   have hclean : ∀ bb ∈ body.basicBlocks, bb.isCleanup = false := by
     intro bb hbb
     simpa using (h9 bb hbb).1.1
+  have hdlo : ptrDeclLayoutsOk body = true := by
+    simp only [ptrAliasingOk, Bool.and_eq_true] at h13
+    exact h13.1.1.1.1
   have hfi := translateFnWithIntrinsics_of_translateFn hclean hf
-  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩,
-    provCastFlowOk_of_not_hasProvCast hnp⟩,
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩,
+    provCastFlowOk_of_not_hasProvCast hnp⟩, hdlo⟩,
     by rw [provCastAliasView_of_not_hasProvCast hnp]; exact h13⟩, by simp [hfi]⟩
   intro bb hbb
   obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
@@ -6140,6 +6271,7 @@ with `ptrAliasingOk` when `body` contains no returning `Call` terminators
 def ptrAliasingProgOk (body : MirAst.CapturedMir) : Bool :=
   let addrLocals := bodyAddrTakenLocals body
   let n := body.localDecls.length
+  ptrDeclLayoutsOk body &&
   addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
   body.basicBlocks.all (fun bb =>
     bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
@@ -6757,12 +6889,51 @@ private theorem termPreservesAddrTaken_nil (t : MirAst.Terminator) :
     cases opMoved op <;> rfl
   | _ => rfl
 
+private theorem bodyDirectBorrowPlaces_eq_nil_of_scalar {body : MirAst.CapturedMir}
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    bodyDirectBorrowPlaces body = [] := by
+  unfold bodyDirectBorrowPlaces
+  rw [List.flatMap_eq_nil_iff]
+  intro bb hbb
+  rw [List.filterMap_eq_nil_iff]
+  intro s hs
+  have h0 := progStatementOk_not_directBorrow_of_scalar hsc (hbbs bb hbb s hs)
+  cases sk : s.kind with
+  | assign _ rv =>
+    rw [sk] at h0
+    dsimp only at h0 ⊢
+    cases hdb : directBorrowOf rv with
+    | none => rfl
+    | some _ => simp [hdb] at h0
+  | _ => rfl
+
+private theorem ptrDeclLayoutsOk_of_scalar {body : MirAst.CapturedMir}
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    ptrDeclLayoutsOk body = true := by
+  unfold ptrDeclLayoutsOk
+  rw [bodyDirectBorrowPlaces_eq_nil_of_scalar hsc hbbs]
+  simp only [List.all_nil, Bool.and_true, List.all_eq_true]
+  intro p _
+  cases hd : body.localDecls[p]? with
+  | none => rfl
+  | some dp =>
+    have hf := isPtrTy_false_of_scalarTypeOf (hsc dp (List.mem_of_getElem? hd))
+    simp only [isPtrTy] at hf
+    cases hpt : ptrPointeeOf dp.ty with
+    | none => dsimp only; rw [hpt]
+    | some _ => simp [hpt] at hf
+
 theorem ptrAliasingProgOk_of_scalar (body : MirAst.CapturedMir)
     (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
     (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
       progStatementOk body.localDecls s body.layouts = true) :
     ptrAliasingProgOk body = true := by
   dsimp only [ptrAliasingProgOk]
+  rw [ptrDeclLayoutsOk_of_scalar hsc hbbs]
   rw [bodyAddrTakenLocals_eq_nil_of_scalar hsc hbbs]
   rw [ptrProgEnvAtEntry_of_scalar 0 hsc hbbs]
   have hsub_self : subsumesPtrEnv body.localDecls.length
@@ -7038,7 +7209,7 @@ def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
     | none => true) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
   livenessOk body && tupleInitOk body &&
-  provCastFlowOk body && ptrAliasingProgOk (provCastAliasView body) &&
+  provCastFlowOk body && ptrDeclLayoutsOk body && ptrAliasingProgOk (provCastAliasView body) &&
   (translateFnInProgWithIntrinsics fnMap body).isSome
 
 /-- Decidable sound multi-function correspondence fragment unifying
@@ -7106,10 +7277,14 @@ theorem bodyInProgFragment_implies_withIntrinsics {fnMap : FnMap}
   have htr' : (translateFnInProgWithIntrinsics fnMap body).isSome = true := by
     rw [translateFnInProgWithIntrinsics_eq_of_no_provCast fnMap body hnp_stmt, hf]
     rfl
-  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hd0⟩, hdeclOk⟩, hargs⟩, htemps⟩, h5⟩, hbbs'⟩,
-    h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, provCastFlowOk_of_not_hasProvCast hnp⟩, ?_⟩, htr'⟩
+  have hptr_sc := ptrAliasingProgOk_of_scalar body hsc hbbs_stmt
+  have hdlo : ptrDeclLayoutsOk body = true := by
+    simp only [ptrAliasingProgOk, Bool.and_eq_true] at hptr_sc
+    exact hptr_sc.1.1.1.1
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hd0⟩, hdeclOk⟩, hargs⟩, htemps⟩, h5⟩, hbbs'⟩,
+    h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, provCastFlowOk_of_not_hasProvCast hnp⟩, hdlo⟩, ?_⟩, htr'⟩
   rw [provCastAliasView_of_not_hasProvCast hnp]
-  exact ptrAliasingProgOk_of_scalar body hsc hbbs_stmt
+  exact hptr_sc
 
 theorem translateProgWithIntrinsics_eq_of_progInFragment
     {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
@@ -7276,11 +7451,11 @@ theorem bodyInProgFragmentWithIntrinsics_implies_crossFrameTranslatable
     bodyCrossFrameTranslatable fnMap callees body = true := by
   simp only [bodyInProgFragmentWithIntrinsics, bodyCrossFrameTranslatable,
     Bool.and_eq_true, List.all_eq_true] at h ⊢
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, _⟩, h5⟩, _⟩, _⟩, h8⟩, hbbs⟩,
-    h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, hptr⟩, htr⟩ := h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, _⟩, h5⟩, _⟩, _⟩, h8⟩, hbbs⟩,
+    h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, _⟩, hptr⟩, htr⟩ := h
   simp only [ptrAliasingProgOk, bodyAddrTakenLocals_provCastAliasView, Bool.and_eq_true,
     List.all_eq_true] at hptr
-  obtain ⟨⟨⟨hat_arg, hpres⟩, _⟩, _⟩ := hptr
+  obtain ⟨⟨⟨⟨_, hat_arg⟩, hpres⟩, _⟩, _⟩ := hptr
   have hat_arg' : ∀ k ∈ bodyAddrTakenLocals body, decide (1 ≤ k ∧ k ≤ body.argCount) = true := by
     intro k hk
     have hk' := hat_arg k hk
