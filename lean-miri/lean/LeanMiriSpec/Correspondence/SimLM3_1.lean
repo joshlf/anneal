@@ -6551,6 +6551,14 @@ theorem step_deref_write_simulation_explicit
                 dsimp only []
                 rw [set?_eq_some_set hlt_af_t]
                 rfl
+        have hinv_lay :
+            invalidateDerefWriteBorrowsWithLayouts body.localDecls body.layouts
+              s.frame.locals s.memory.borrows ⟨ptrIdx, .cons .deref .nil⟩ .nil =
+            invalidateDerefWriteBorrows
+              s.frame.locals s.memory.borrows ⟨ptrIdx, .cons .deref .nil⟩ .nil :=
+          invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target
+            body.localDecls body.layouts s.frame.locals s.memory.borrows ptrIdx ptrVal 8 hslot_p
+            (fun b hb => by rw [hbor] at hb; obtain ⟨_, _, rfl⟩ := List.mem_map.mp hb; rfl)
         have ha_ok : evalStmt s ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use op), span⟩
             body.localDecls body.layouts =
             MirStepNode.step
@@ -6564,7 +6572,8 @@ theorem step_deref_write_simulation_explicit
           dsimp only []
           unfold evalPlaceWrite
           rw [hprot, hwrite_ok]
-          simp only [hinv_bor, hwub]
+          dsimp only [derefWriteUnionProtectorUB, Bool.or]
+          simp only [hinv_lay, hinv_bor, hwub]
         have hnext_eq : derefWriteNextAllocMap s.frame.locals allocMap ptrIdx =
             updateAllocMapOnWrite allocMap e.localIdx (some ptrVal.tag) := by
           simp only [derefWriteNextAllocMap, hslot_p,

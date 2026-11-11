@@ -1714,11 +1714,17 @@ def finishAssignStmtNode
           layouts
       with
       | .ok locals₂ =>
-        match derefWriteTreeUB locals₁ mem₁.borrows dst with
+        match
+          Bool.or
+            (derefWriteTreeUB locals₁ mem₁.borrows dst)
+            (derefWriteUnionProtectorUB
+              localDecls layouts locals₁ mem₁.borrows mem₁.activeProtectors dst restProj)
+        with
         | true => MirStepNode.fail .ub
         | false =>
           let borrows' :=
-            invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+            invalidateDerefWriteBorrowsWithLayouts
+              localDecls layouts locals₁ mem₁.borrows dst restProj
           MirStepNode.step
             (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .ub =>

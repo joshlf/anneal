@@ -6203,15 +6203,23 @@ theorem stmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
         (match resolveBorrowProjectionElems locals₁ projs with
          | .some rp => rp
          | .none => projs)) ∧
+    (placeIsZeroSized localDecls layouts { local_ := dstLoc, projection := projs } = true →
+      resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc projs =
+        (match resolveBorrowProjectionElems locals₁ projs with
+         | .some rp => rp
+         | .none => projs)) ∧
     (layouts.entries ≠ .nil →
       get? localDecls dstLoc = .some decl →
       isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts decl.ty) = true →
+      placeIsZeroSized localDecls layouts
+        { local_ := dstLoc, projection := .field writeIdx writeTy :: rest } = false →
       truncateTyProjAtUnion localDecls layouts decl.ty (.field writeIdx writeTy :: rest) = .nil ∧
       resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
         (.field writeIdx writeTy :: rest) = .nil) ∧
     (layouts.entries ≠ .nil →
       get? localDecls dstLoc = .some decl →
       isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts decl.ty) = true →
+      tyIsZeroSized writeTy = false →
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some (.init rootVal) →
       writeProjectedForLocal locals₁ localDecls layouts dstLoc
@@ -6239,15 +6247,91 @@ theorem stmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
            localDecls layouts =
          MirStepNode.fail .ub)) := by
   refine ⟨resolveBorrowWriteLocalProj_of_not_union localDecls layouts locals₁ dstLoc projs,
-    fun hEntries hDecl hUnion =>
+    resolveBorrowWriteLocalProj_of_zst localDecls layouts locals₁ dstLoc projs,
+    fun hEntries hDecl hUnion hNonZst =>
       ⟨by unfold truncateTyProjAtUnion; dsimp only; rw [hUnion],
        resolveBorrowWriteLocalProj_union_root localDecls layouts locals₁ dstLoc decl
-         writeIdx writeTy rest hEntries hDecl hUnion⟩,
-    fun hEntries hDecl hUnion hRv hInit hWrite hSet hPerm =>
+         writeIdx writeTy rest hEntries hDecl hUnion hNonZst⟩,
+    fun hEntries hDecl hUnion hNonZst hRv hInit hWrite hSet hPerm =>
       evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
         s dstLoc decl writeIdx borIdx writeTy borTy rv span localDecls layouts
         val rootVal rootVal' locals₁ locals₂ mem₁ tag protId perm
-        hEntries hDecl hUnion hRv hInit hWrite hSet hPerm⟩
+        hEntries hDecl hUnion hNonZst hRv hInit hWrite hSet hPerm⟩
+
+/--
+Correspondence theorem for frame-local dereferencing union field writes (`R1` on
+`(*ptrLoc).writeIdx = rv`): covers `resolveDerefBorrowWriteFullProj`,
+`derefWriteUnionProtectorUB`, `invalidateDerefWriteBorrowsWithLayouts`, whole-local
+pointer preservation (`invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target`),
+sibling union-field borrow invalidation, and active-protector UB.
+-/
+theorem stmt_assign_deref_union_field_sibling_borrow_invalidation_and_protector_ub
+    (s : MachineState)
+    (ptrLoc uLoc : Local)
+    (uDecl : LocalDecl)
+    (ptrVal : ProvenancePtr)
+    (ptrSz sibTag protId : Nat)
+    (writeIdx borIdx : FieldIdx)
+    (writeTy borTy : Ty)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (mem₁ : Memory)
+    (sibPerm : TreeBorrowPerm) :
+    resolveDerefBorrowWriteFullProj localDecls layouts uLoc .nil = .nil ∧
+    derefWriteUnionProtectorUB localDecls layouts locals₁ borrows .nil
+      ⟨ptrLoc, .deref :: rest⟩ rest = false ∧
+    (get? locals₁ ptrLoc = .some (.init (.ptr ptrVal ptrSz)) →
+      (∀ b ∈ borrows, b.targetProjection = .nil) →
+      invalidateDerefWriteBorrowsWithLayouts
+        localDecls layouts locals₁ borrows ⟨ptrLoc, .deref :: .nil⟩ .nil =
+      invalidateDerefWriteBorrows
+        locals₁ borrows ⟨ptrLoc, .deref :: .nil⟩ .nil) ∧
+    (layouts.entries ≠ .nil →
+      get? localDecls uLoc = .some uDecl →
+      isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts uDecl.ty) = true →
+      tyIsZeroSized writeTy = false →
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ ptrLoc = .some (.init (.ptr ptrVal ptrSz)) →
+      ptrVal.tag ≠ sibTag →
+      (sibPerm = .active ∨ sibPerm = .frozen) →
+      let writerEntry : BorrowEntry :=
+        { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
+      let dst : Place := ⟨ptrLoc, .deref :: .field writeIdx writeTy :: .nil⟩
+      (let sibEntry : BorrowEntry :=
+         { tag := sibTag, targetLocal := uLoc,
+           targetProjection := .field borIdx borTy :: .nil, perm := sibPerm }
+       mem₁.borrows = writerEntry :: sibEntry :: .nil →
+       mem₁.activeProtectors = .nil →
+       writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+       evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
+         MirStepNode.step
+           (advanceStmt s locals₂
+             { mem₁ with
+               borrows := writerEntry :: { sibEntry with perm := .disabled } :: .nil })) ∧
+      (let protEntry : BorrowEntry :=
+         { tag := sibTag, targetLocal := uLoc,
+           targetProjection := .field borIdx borTy :: .nil, perm := sibPerm,
+           protector := .some protId }
+       mem₁.borrows = writerEntry :: protEntry :: .nil →
+       mem₁.activeProtectors = protId :: .nil →
+       mem₁.callerLocals = .nil →
+       writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+       evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
+         MirStepNode.fail .ub)) := by
+  refine ⟨rfl, rfl,
+    invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target
+      localDecls layouts locals₁ borrows ptrLoc ptrVal ptrSz,
+    fun hEntries hDecl hUnion hNonZst hRv hPtr hTagNe hSibPerm =>
+      evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protector_ub
+        s ptrLoc uLoc uDecl ptrVal ptrSz sibTag protId writeIdx borIdx writeTy borTy
+        rv span localDecls layouts val locals₁ locals₂ mem₁ sibPerm
+        hEntries hDecl hUnion hNonZst hRv hPtr hTagNe hSibPerm⟩
 
 end UninitAggregateFieldWrites
 

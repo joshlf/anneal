@@ -85,7 +85,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
   evalRvalue evalRvalueWithMemory advanceStmt
   normalizeSubsliceProjectionsAux normalizeSubsliceProjections
-  projectionsOverlap truncateTyProjAtUnion resolveBorrowWriteLocalProj appendValues
+  projectionsOverlap truncateTyProjAtUnion resolveBorrowWriteLocalProj
+  resolveDerefBorrowWriteFullProj derefWriteUnionProtectorUB
+  invalidateDerefWriteBorrowsWithLayouts appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   evalStmt lookupSwitchTarget findCallee?

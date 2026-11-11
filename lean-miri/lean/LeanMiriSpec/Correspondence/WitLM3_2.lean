@@ -4897,5 +4897,181 @@ theorem wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps :
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, decl0, imm0, hs₁, hm₁, htree₁, hs₂, hm₂, htree₂', rfl,
     hs₃, hm₃, htree₃', rfl, hs₄, hm₄, htree₄', rfl, hs₅, hm₅, hdecl0, hret0, himmRel0⟩
 
+/-- `Runtime(PostCleanup)` MIR body exercising `evalRvalue_reborrow_uninit_target_divergence`:
+1. `_2 = &raw const _1` on live, uninitialized `_1 : u64`;
+2. `_3 = &*_2`: reborrowing through a raw pointer whose stack target `_1` is
+   live but `.uninit` faults with `MirStepNode.fail .ub` in Anneal while
+   `lean-miri`'s `Rvalue.Ref` + shallow `ValidityVisitor` steps cleanly. -/
+def lm32UninitTargetReborrowBody : CapturedMir where
+  defPath := "lm_3_2_witness::uninit_target_reborrow"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrConstU64Decl, refU64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 3) (.ref .shared (derefLocal 2)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Anneal pre-state for `lm32UninitTargetReborrowBody`: all four locals start `.uninit`. -/
+def lm32UninitTargetReborrowAnnealPre : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .uninit, .uninit, .uninit] }
+    memory := (initMachineState lm32UninitTargetReborrowBody []).memory }
+
+/-- `lean-miri` root frame matching `lm32UninitTargetReborrowAnnealPre`. -/
+def lm32UninitTargetReborrowMiriFramePre :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm32UninitTargetReborrowBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy u64Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+/-- `lean-miri` state matching `lm32UninitTargetReborrowAnnealPre`. -/
+def lm32UninitTargetReborrowMiriPre : AnnealStepState :=
+  { stack := ⟨#[lm32UninitTargetReborrowMiriFramePre]⟩, machine := AnnealMachine.empty }
+
+/-- `StateRel` holds between `lm32UninitTargetReborrowAnnealPre` and
+`lm32UninitTargetReborrowMiriPre`. -/
+theorem lm32UninitTargetReborrow_stateRel_pre :
+    StateRel lm32UninitTargetReborrowBody
+      lm32UninitTargetReborrowAnnealPre lm32UninitTargetReborrowMiriPre := by
+  refine StateRel.mk lm32UninitTargetReborrowMiriFramePre rfl rfl ⟨translateTy u64Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+    (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | _ + 4 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i _ slot mls hdecl hslot hmls
+  match i with
+  | 0 | 1 | 2 | 3 =>
+    have hs : slot = .uninit := by simpa [lm32UninitTargetReborrowAnnealPre, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm32UninitTargetReborrowMiriFramePre] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | _ + 4 =>
+    simp [lm32UninitTargetReborrowBody, get?] at hdecl
+
+private theorem stepRelLM3_1_of_anneal_stepLM32
+    {body : CapturedMir} {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {s' : MachineState}
+    (hsim : StepRelLM3_1 body m allocMap aRes mRes)
+    (ha : aRes = .step s') :
+    ∃ m', mRes = (m', .ok true) ∧ StateRelLM3_1 body s' m' allocMap := by
+  cases hsim with
+  | step s₁ m' hrel =>
+    injection ha with htau
+    injection htau with hs
+    subst hs
+    exact ⟨m', rfl, hrel⟩
+  | retRoot _ _ _ _ _ _ _ _ _ => cases ha
+  | ub _ _ => cases ha
+
+/-- **`wit_lm3_2_reborrow_uninit_target_divergence`**:
+Concrete end-to-end non-vacuity witness for
+`evalRvalue_reborrow_uninit_target_divergence` starting from pointer-free `StateRel`:
+1. `_2 = &raw const _1` promotes live `.uninit` `_1 : u64` to `lm31AllocId1` in
+   lockstep (`StateRelLM3_2`);
+2. `_3 = &*_2` faults with `MirStepNode.fail .ub` in Anneal (`stepMirFn`) while
+   `lean-miri` (`Miri.Interpreter.Step.step`) steps to `(m₂, .ok true)`, writes a
+   tagged pointer into `_3`, and passes shallow `annealValidityAccessCheck` on the
+   8-byte uninitialized allocation. -/
+theorem wit_lm3_2_reborrow_uninit_target_divergence :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState)
+      (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (borTag : Miri.Memory.BorTag),
+      let hooks := annealStepHooks lm32UninitTargetReborrowBody.localDecls
+        lm32UninitTargetReborrowBody.layouts
+      let entry := rawPtrAllocMapEntry lm32UninitTargetReborrowBody.localDecls
+        lm32UninitTargetReborrowBody.layouts .not 1 1 lm31AllocId1
+      stepMirFn lm32UninitTargetReborrowBody lm32UninitTargetReborrowAnnealPre = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () lm32UninitTargetReborrowMiriPre = (m₁, .ok true) ∧
+      StateRelLM3_2 lm32UninitTargetReborrowBody s₁ m₁ [entry] ∧
+      stepMirFn lm32UninitTargetReborrowBody s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      m₂.stack.frames = #[tf₂] ∧
+      (tf₂.locals[3]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+              .concrete lm31AllocId1 borTag⟩)))) ∧
+      annealValidityAccessCheck m₂.machine
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+          some (.concrete lm31AllocId1 borTag)⟩
+        (translateTy u64Ty lm32UninitTargetReborrowBody.layouts).layout.size = .ok () := by
+  have hphase : ∀ p, lm32UninitTargetReborrowBody.phase ≠ .other p := fun _ h => nomatch h
+  have himm₀_all : ∀ tf, lm32UninitTargetReborrowMiriPre.stack.frames = #[tf] →
+      ∀ k, IsImmediateFrameLocal tf k := by
+    intro tf h k mls hmls mp hmp
+    injection h with h₁; injection h₁ with h₂; subst h₂
+    match k with
+    | 0 | 1 | 2 | 3 => simp [lm32UninitTargetReborrowMiriFramePre] at hmls; subst hmls; cases hmp
+    | _ + 4 => simp [lm32UninitTargetReborrowMiriFramePre] at hmls
+  let entry := rawPtrAllocMapEntry lm32UninitTargetReborrowBody.localDecls
+    lm32UninitTargetReborrowBody.layouts .not 1 1 lm31AllocId1
+  let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  let bor := [rawPtrBorrowEntry lm32UninitTargetReborrowBody.localDecls
+    lm32UninitTargetReborrowBody.layouts .not 1 1]
+  -- Step 1: `_2 = &raw const _1`
+  let s₁ := mkWitStateLM32 lm32UninitTargetReborrowBody 1
+    [.uninit, .uninit, .init ptr0, .uninit] bor 2
+  have hs₁ : stepMirFn lm32UninitTargetReborrowBody lm32UninitTargetReborrowAnnealPre =
+      .step s₁ := rfl
+  have hsim₁ := step_rawPtr_addrOf_simulation lm32UninitTargetReborrow_stateRel_pre hphase
+    rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀_all tf htf 2, himm₀_all tf htf 1⟩) AllocIdSupplyReady.empty
+  obtain ⟨m₁, hm₁, hrel₁_raw⟩ := stepRelLM3_1_of_anneal_stepLM32 hsim₁ hs₁
+  have htag₀ : lm32UninitTargetReborrowAnnealPre.memory.nextTag = 1 := rfl
+  have hid₀ : (⟨lm32UninitTargetReborrowMiriPre.machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁_raw
+  have hrel₁ : StateRelLM3_2 lm32UninitTargetReborrowBody s₁ m₁ [entry] := hrel₁_raw.toLM3_2
+  obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_ne
+    lm32UninitTargetReborrow_stateRel_pre rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀_all tf htf 2, himm₀_all tf htf 1⟩)
+    AllocIdSupplyReady.empty hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne =>
+      himm₁_step _ tf₁ rfl htf₁ k hne (himm₀_all _ rfl k)
+  -- Step 2: `_3 = &*_2` -> UB in Anneal, `.ok true` in Miri
+  obtain ⟨hs₂, m₂, tf₂, borTag, hm₂, htf₂, hloc₃, hval₂⟩ :=
+    evalRvalue_reborrow_uninit_target_divergence hrel₁ hphase rfl rfl
+      (dstDecl := refU64Decl) (ptrDecl := rawPtrConstU64Decl)
+      rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩)))
+      (fun tf₁ htf₁ => ⟨himm₁ tf₁ htf₁ 3 (by decide), himm₁ tf₁ htf₁ 2 (by decide)⟩)
+      (fun _ h => by dsimp [s₁, mkWitStateLM32, get?, ptr0] at h; nomatch h)
+      (fun ptrVal e hp he _ => by
+        have hp' : ptrVal = { allocId := 1, offsetBytes := 0 } := ptrVal_of_some_initLM32 hp
+        cases he with
+        | tail _ h => cases h
+        | head _ =>
+          subst hp'
+          exact ⟨rfl, (fun h => nomatch h), (fun ⟨_, h⟩ => h rfl)⟩)
+      (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entry) (targetDecl := u64Decl)
+      rfl (.head _) rfl rfl (by rintro ⟨⟩) rfl
+  exact ⟨s₁, m₁, m₂, tf₂, borTag, hs₁, hm₁, hrel₁, hs₂, hm₂, htf₂, hloc₃, hval₂⟩
+
 end LeanMiriSpec.Correspondence.Witness
 

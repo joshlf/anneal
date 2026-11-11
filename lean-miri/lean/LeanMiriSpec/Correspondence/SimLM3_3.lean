@@ -1231,6 +1231,23 @@ theorem sim_lm3_3_interpreter_deref_write_step
               ⟨refIdx, .cons .deref .nil⟩ = false := by
             rw [hbor_a]
             exact derefWriteTreeUB_map_toBorrowEntry_eq_false _ _ _
+          have hinv_lay_s :
+              invalidateDerefWriteBorrowsWithLayouts body.localDecls body.layouts
+                s.frame.locals s.memory.borrows ⟨refIdx, .cons .deref .nil⟩ .nil =
+              invalidateDerefWriteBorrows
+                s.frame.locals s.memory.borrows ⟨refIdx, .cons .deref .nil⟩ .nil :=
+            invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target
+              body.localDecls body.layouts s.frame.locals s.memory.borrows refIdx ptrVal 8 hsr_full
+              (fun b hb => by rw [hbor_s] at hb; obtain ⟨_, _, rfl⟩ := List.mem_map.mp hb; rfl)
+          have hinv_lay_a :
+              invalidateDerefWriteBorrowsWithLayouts body.localDecls body.layouts
+                s.frame.locals s_act.memory.borrows ⟨refIdx, .cons .deref .nil⟩ .nil =
+              invalidateDerefWriteBorrows
+                s.frame.locals s_act.memory.borrows ⟨refIdx, .cons .deref .nil⟩ .nil :=
+            invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target
+              body.localDecls body.layouts s.frame.locals s_act.memory.borrows refIdx ptrVal 8
+              hsr_full
+              (fun b hb => by rw [hbor_a] at hb; obtain ⟨_, _, rfl⟩ := List.mem_map.mp hb; rfl)
           have ha_s :
               stepMirFn body s =
                 .step (advanceStmt s locals₂
@@ -1238,7 +1255,8 @@ theorem sim_lm3_3_interpreter_deref_write_step
             rw [hs_step]; unfold evalStmt; dsimp only []
             rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
             rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res]
-            simp only [hwub_s, hcaller]
+            dsimp only [derefWriteUnionProtectorUB, Bool.or]
+            simp only [hwub_s, hcaller, hinv_lay_s]
             rw [hinv_s]
           have ha_a :
               stepMirFn body s_act =
@@ -1249,7 +1267,8 @@ theorem sim_lm3_3_interpreter_deref_write_step
             rw [ha_step]; unfold evalStmt; rw [hfa]; dsimp only []
             rw [hrv_a, hop_res]; dsimp only [evalPlaceWrite]
             rw [hprot_a]; dsimp only []; rw [hwp_res]
-            simp only [hwub_a, hcaller_a]
+            dsimp only [derefWriteUnionProtectorUB, Bool.or]
+            simp only [hwub_a, hcaller_a, hinv_lay_a]
           rw [ha_a] at hsim; rw [ha_s]
           cases hsim with
           | step _ m' hrel_a =>

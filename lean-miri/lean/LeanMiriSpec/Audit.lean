@@ -480,6 +480,8 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_addrOf_deref_storageDead_real_steps
   Witness.wit_lm3_1_use_after_storageDead_real_steps
   Witness.wit_lm3_1_ptrToPtr_and_offset_real_steps
+  Witness.lm31OffsetDisabledBody
+  Witness.wit_lm3_1_binOp_offset_disabled_divergence
   Witness.wit_lm3_1_deref_oob_and_misaligned_real_steps
   isThinRawPtrPointee
   annealValidateScalarForTyId
@@ -4129,6 +4131,27 @@ example :
       stepMirFn lm31PtrCastOffsetBody s₃ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior msg)) :=
   Witness.wit_lm3_1_ptrToPtr_and_offset_real_steps
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      let hooks := annealStepHooks lm31OffsetDisabledBody.localDecls lm31OffsetDisabledBody.layouts
+      let entry := rawPtrAllocMapEntry lm31OffsetDisabledBody.localDecls
+        lm31OffsetDisabledBody.layouts .mut 1 1 lm31AllocId1
+      stepMirFn lm31OffsetDisabledBody (mkSixLocalAnnealPre lm31OffsetDisabledBody) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkSixLocalMiriPre lm31OffsetDisabledBody u64Ty) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 lm31OffsetDisabledBody s₁ m₁ [entry] ∧
+      stepMirFn lm31OffsetDisabledBody s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 lm31OffsetDisabledBody s₂ m₂ [entry] ∧
+      stepMirFn lm31OffsetDisabledBody s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 lm31OffsetDisabledBody s₃ m₃ [{ entry with perm := .disabled }] ∧
+      stepMirFn lm31OffsetDisabledBody s₃ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) :=
+  Witness.wit_lm3_1_binOp_offset_disabled_divergence
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
@@ -8278,6 +8301,33 @@ example :
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
 example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState)
+      (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (borTag : Miri.Memory.BorTag),
+      let hooks := annealStepHooks lm32UninitTargetReborrowBody.localDecls
+        lm32UninitTargetReborrowBody.layouts
+      let entry := rawPtrAllocMapEntry lm32UninitTargetReborrowBody.localDecls
+        lm32UninitTargetReborrowBody.layouts .not 1 1 lm31AllocId1
+      stepMirFn lm32UninitTargetReborrowBody lm32UninitTargetReborrowAnnealPre = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () lm32UninitTargetReborrowMiriPre = (m₁, .ok true) ∧
+      StateRelLM3_2 lm32UninitTargetReborrowBody s₁ m₁ [entry] ∧
+      stepMirFn lm32UninitTargetReborrowBody s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      m₂.stack.frames = #[tf₂] ∧
+      (tf₂.locals[3]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+              .concrete lm31AllocId1 borTag⟩)))) ∧
+      annealValidityAccessCheck m₂.machine
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+          some (.concrete lm31AllocId1 borTag)⟩
+        (translateTy u64Ty lm32UninitTargetReborrowBody.layouts).layout.size = .ok () :=
+  Witness.wit_lm3_2_reborrow_uninit_target_divergence
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
     lm32RunValidateRefBoolShallow none = .ok (.ok ()) ∧
     lm32RunVisitRefBoolRecursive none =
       .ok (.error (.undefinedBehavior "read of uninitialized memory")) ∧
@@ -8435,6 +8485,12 @@ open LeanMiriSpec.Correspondence in
   Witness.lm32RawPtrIntReborrowMiriPre
   Witness.lm32RawPtrIntReborrow_stateRel_pre
   Witness.wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences
+  Witness.lm32UninitTargetReborrowBody
+  Witness.lm32UninitTargetReborrowAnnealPre
+  Witness.lm32UninitTargetReborrowMiriFramePre
+  Witness.lm32UninitTargetReborrowMiriPre
+  Witness.lm32UninitTargetReborrow_stateRel_pre
+  Witness.wit_lm3_2_reborrow_uninit_target_divergence
   Witness.refBoolTyLM32
   Witness.lm32BoolPointeeAlloc?
   Witness.lm32RefBoolValidityState
