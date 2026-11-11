@@ -3841,8 +3841,7 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
     | none => false
   | .retag kind ⟨i, []⟩ =>
     !isRetagFnEntry kind && decide (i < decls.length) &&
-    ((isDeclRefLocal decls i && !isRetagRaw kind) ||
-      (!isDeclRefLocal decls i && isRetagRaw kind)) && isDeclPtrLocal decls i
+    (isDeclRefLocal decls i || (!isDeclRefLocal decls i && isRetagRaw kind)) && isDeclPtrLocal decls i
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a

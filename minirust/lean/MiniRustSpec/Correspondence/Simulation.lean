@@ -6511,9 +6511,9 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
         have hisPtr_i : isPtrTy di.ty = true := by simp [isPtrTy, hpt]
         obtain ⟨hndis, _⟩ :=
           hbo.usable_of_not_disabled hndis_env hdi hpt hvi hlk
-        rcases hbranch with ⟨href_true, hraw_false⟩ | ⟨href_false, hraw_true⟩
+        rcases hbranch with href_true | ⟨href_false, hraw_true⟩
         · obtain ⟨hAok, _⟩ := evalStmt_retag_ref_local s body.localDecls body.layouts
-            retagKind i di srcMutbl srcIt span hnotFnEntry hraw_false hdi hpt href_true hrel.protectors
+            retagKind i di srcMutbl srcIt span hnotFnEntry hdi hpt href_true hrel.protectors
           have hrub : MirSemantics.hasTreeReadUB s.memory.borrows s.memory.borrows
               s.memory.activeProtectors entry.targetLocal (some ptrVal.tag)
               entry.targetProjection entry.rangeOffset entry.rangeLen = false := by
@@ -6549,9 +6549,9 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
             hrel.retLive (hbo.advance_keep hbb hst (by simp [ptrStmtStep, href_false])) rfl rfl rfl rfl
       · have hnotA : s.frame.locals[i]? = some .uninit ∨ s.frame.locals[i]? = some .dead := by
           rw [hiAgree]; exact hnot
-        rcases hbranch with ⟨href_true, hraw_false⟩ | ⟨href_false, hraw_true⟩
+        rcases hbranch with href_true | ⟨href_false, hraw_true⟩
         · obtain ⟨_, hAub⟩ := evalStmt_retag_ref_local s body.localDecls body.layouts
-            retagKind i di srcMutbl srcIt span hnotFnEntry hraw_false hdi hpt href_true hrel.protectors
+            retagKind i di srcMutbl srcIt span hnotFnEntry hdi hpt href_true hrel.protectors
           rw [hAub hnotA]
           exact StepRelN.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
         · obtain ⟨_, hAub⟩ := evalStmt_retag_rawPtr_local s body.localDecls body.layouts

@@ -11848,4 +11848,926 @@ theorem wit_lm3_1_d12_cmp_branch_state_simulation_real_steps :
     exact ⟨s_eq₁, s_eq₂, s_np₁, s_np₂, m_eq₁, m_eq₂, m_np₁, m_np₂, map_eq₂, map_np₂,
       hs_eq₁, hm_eq₁, hs_eq₂, hm_eq₂, rfl, hrel_eq₂,
       hs_np₁, hm_np₁, hs_np₂, hm_np₂, rfl, hrel_np₂⟩
+
+private theorem constU8_wellTyped (body : CapturedMir)
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (n : Nat) (hn : n < scalarModulus 1) :
+    WellTypedScalarOperand body tf (.constant (constU8LM31 n)) u8TyLM31 :=
+  .constScalar (constU8LM31 n) ⟨n, 1⟩ rfl (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩)))
+    (Or.inl rfl) hn rfl (fun h => nomatch h) (fun h => nomatch h)
+
+private theorem step_storageDead_preserves_supply
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {loc : Local} {decl : LocalDecl} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageDead loc, span⟩)
+    (hdecl : get? body.localDecls loc = some decl)
+    (hne0 : loc ≠ 0)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    AllocIdSupplyReady m'.machine.memory ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨_, mls, _, hlt_mf, _, _, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
+  have hlive : LocalAllocLive m.machine.memory (tf.locals[loc]'hlt_mf).value := by
+    rw [hmls_eq]; exact hloc.allocLive
+  have hm : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) ()
+      (translateStmt ⟨.storageDead loc, span⟩) m =
+      ({ stack := ⟨#[{ tf with
+            locals := tf.locals.set loc
+              { tf.locals[loc]'hlt_mf with value := .dead } hlt_mf }]⟩
+         machine := { m.machine with
+            memory := deallocLocalMemory m.machine.memory (tf.locals[loc]'hlt_mf).value } },
+        .ok ()) := by
+    simp only [Miri.Interpreter.Step.evalStatement, translateStmt, translateStmtKind]
+    exact annealStepHooks_storageDead_any_eq hframes hlt_mf hne0 hlive
+  have himm := (step_storageDead_preserves hstate hbb hstmt hdecl hne0 hstep).2
+  rw [miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm rfl
+    hfr.location_eq] at hstep
+  injection hstep with hm' _
+  subst hm'
+  exact ⟨hsupply.of_deallocLocalMemory _, himm⟩
+
+private theorem annealEvalPlace_singleDeref_isMemory
+    (ld : List LocalDecl) (ly : LayoutTable) (ptrIdx : Miri.MIR.LocalId)
+    {s₀ s₁ : AnnealStepState} {sp : Miri.Interpreter.RuntimePlace AnnealProv}
+    (h : annealEvalPlace ld ly (translatePlace ⟨ptrIdx, .cons .deref .nil⟩) s₀ = .ok sp s₁) :
+    ∃ mp, sp = ⟨.memory mp, sp.layout⟩ := by
+  have hne : (!([Miri.MIR.ProjectionElem.Deref].toArray).isEmpty) = true := rfl
+  unfold translatePlace translateProjectionElem annealEvalPlace at h
+  simp only [List.map, hne, ↓reduceIte] at h
+  dsimp only [get, getThe, MonadStateOf.get, EStateM.get, bind, Bind.bind,
+    EStateM.bind, pure, Pure.pure, EStateM.pure, throw, throwThe, MonadExceptOf.throw,
+    EStateM.throw] at h
+  cases hcf : s₀.stack.currentFrame? with
+  | none =>
+    simp only [hcf, Option.isNone_none, ↓reduceIte] at h
+    dsimp only [EStateM.bind, EStateM.throw] at h
+    cases h
+  | some _ =>
+    simp only [hcf, Option.isNone_some, Bool.false_eq_true, ↓reduceIte] at h
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.throw] at h
+    cases hres : annealResolveAndCacheLocalLayout ld ly ptrIdx none s₀ with
+    | error _ _ => rw [hres] at h; cases h
+    | ok fl s_a =>
+      rw [hres] at h; dsimp only [] at h
+      cases hglo : fl.1.getLocalOperand ptrIdx with
+      | error e => rw [hglo] at h; cases e <;> cases h
+      | ok op =>
+        rw [hglo] at h; dsimp only [bind, Bind.bind, EStateM.bind, EStateM.pure] at h
+        cases hder : annealDerefOperandToMemPlace ld ly ptrIdx op fl.2 s_a with
+        | error _ _ => rw [hder] at h; cases h
+        | ok ml s_b =>
+          rw [hder] at h; dsimp only [] at h; cases h
+          exact ⟨ml.1, rfl⟩
+
+private theorem step_assign_rawPtr_deref_preserves_supply
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rawMut : Mutability} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr rawMut ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    (AllocIdSupplyReady m'.machine.memory ∧
+      m'.machine.memory.nextAllocId = m.machine.memory.nextAllocId ∧
+      m'.machine.memory.sourceAllocIdWorldActive = m.machine.memory.sourceAllocIdWorldActive) ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) := by
+  have hkind : translateRawPtrKind rawMut ≠ .FakeForPtrMetadata := by
+    cases rawMut <;> nofun
+  refine step_preserves_supply_of_rvalue hstate hbb hstmt rfl ?_ hsupply hstep
+  intro s₀ u s_out h
+  dsimp only [translateRvalue] at h
+  cases hdst : annealEvalPlace body.localDecls body.layouts (translatePlace ⟨dstIdx, .nil⟩) s₀ with
+  | error _ _ =>
+    unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks at h
+    dsimp only [bind, Bind.bind, EStateM.bind] at h
+    rw [hdst] at h; cases h
+  | ok dp s_a =>
+    obtain ⟨haddr₀, hstk₀⟩ :=
+      annealEvalPlace_preserves body.localDecls body.layouts (translatePlace ⟨dstIdx, .nil⟩) s₀ dp s_a hdst
+    cases hsrc : annealEvalPlace body.localDecls body.layouts
+        (translatePlace ⟨ptrIdx, .cons .deref .nil⟩) s_a with
+    | error _ _ =>
+      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks at h
+      dsimp only [bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure] at h
+      rw [hdst] at h; dsimp only [] at h; rw [hsrc] at h; cases h
+    | ok sp s₁ =>
+      obtain ⟨haddr₁, hstk₁⟩ :=
+        annealEvalPlace_preserves body.localDecls body.layouts
+          (translatePlace ⟨ptrIdx, .cons .deref .nil⟩) s_a sp s₁ hsrc
+      obtain ⟨mp, hsp⟩ := annealEvalPlace_singleDeref_isMemory body.localDecls body.layouts ptrIdx hsrc
+      have hforce : annealForceAllocation body.localDecls body.layouts sp s₁ = .ok mp s₁ := by
+        rw [hsp]; exact annealForceAllocation_memory_eq _ _ mp sp.layout s₁
+      cases href : mp.toRef annealTargetDataLayout with
+      | error _ =>
+        unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks at h
+        dsimp only [bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+          throw, throwThe, MonadExceptOf.throw, EStateM.throw] at h
+        rw [hdst] at h; dsimp only [] at h; rw [hsrc] at h; dsimp only [] at h
+        rw [hforce] at h; dsimp only [] at h; rw [href] at h; cases h
+      | ok imm =>
+        rw [evalRvalueIntoPlace_rawPtr_ok hkind hdst hsrc hforce href] at h
+        obtain ⟨haddr₂, hstk₂⟩ := annealWriteImmediate_preserves imm dp s₁ u s_out h
+        refine ⟨haddr₂.trans (haddr₁.trans haddr₀), fun tf htf => ?_⟩
+        obtain ⟨tf_a, htf_a, hloc₀, himm₀⟩ := hstk₀ tf htf
+        obtain ⟨tf₁, htf₁, hloc₁, himm₁⟩ := hstk₁ tf_a htf_a
+        obtain ⟨tf₂, htf₂, hloc₂, himm₂⟩ := hstk₂ tf₁ htf₁
+        exact ⟨tf₂, htf₂, hloc₂.trans (hloc₁.trans hloc₀),
+          fun k hk => himm₂ k (himm₁ k (himm₀ k hk))⟩
+
+private theorem ptrAddress_two_head_eq
+    (locals callerLocals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (b₂ b₁ : BorrowEntry) (p : ProvenancePtr) (a : Nat)
+    (htag : Nat.beq b₂.tag p.tag = true := by rfl)
+    (hproj : b₂.targetProjection = .nil := by rfl)
+    (ha : (1048576 + b₂.targetLocal) * 65536 + p.offsetBytes = a := by decide) :
+    ptrAddress? locals [b₂, b₁] callerLocals localDecls layouts 8 p = some a := by
+  have hboff : borrowPlaceByteOffset? locals callerLocals localDecls layouts b₂ = some 0 := by
+    unfold borrowPlaceByteOffset?; rw [hproj]; rfl
+  have hbase : borrowBaseAddress? locals callerLocals localDecls layouts 8 b₂ =
+      some ((1048576 + b₂.targetLocal) * 65536) := by
+    unfold borrowBaseAddress?; rw [hboff]; dsimp only [stackLocalAddrPageBase]
+    change some (((1048576 + b₂.targetLocal) * 65536) + 0) = some ((1048576 + b₂.targetLocal) * 65536)
+    rw [Nat.add_zero]
+  have hlk : lookupBorrow [b₂, b₁] p.tag = some b₂ := by
+    simp only [lookupBorrow, htag]
+  unfold ptrAddress?
+  rw [hlk]; dsimp only []
+  rw [hbase]; dsimp only []
+  exact congrArg some ha
+
+private theorem ptrAddress_two_second_eq
+    (locals callerLocals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (b₂ b₁ : BorrowEntry) (p : ProvenancePtr) (a : Nat)
+    (htag₂ : Nat.beq b₂.tag p.tag = false := by rfl)
+    (htag₁ : Nat.beq b₁.tag p.tag = true := by rfl)
+    (hproj : b₁.targetProjection = .nil := by rfl)
+    (ha : (1048576 + b₁.targetLocal) * 65536 + p.offsetBytes = a := by decide) :
+    ptrAddress? locals [b₂, b₁] callerLocals localDecls layouts 8 p = some a := by
+  have hboff : borrowPlaceByteOffset? locals callerLocals localDecls layouts b₁ = some 0 := by
+    unfold borrowPlaceByteOffset?; rw [hproj]; rfl
+  have hbase : borrowBaseAddress? locals callerLocals localDecls layouts 8 b₁ =
+      some ((1048576 + b₁.targetLocal) * 65536) := by
+    unfold borrowBaseAddress?; rw [hboff]; dsimp only [stackLocalAddrPageBase]
+    change some (((1048576 + b₁.targetLocal) * 65536) + 0) = some ((1048576 + b₁.targetLocal) * 65536)
+    rw [Nat.add_zero]
+  have hlk : lookupBorrow [b₂, b₁] p.tag = some b₁ := by
+    simp only [lookupBorrow, htag₂, htag₁]
+  unfold ptrAddress?
+  rw [hlk]; dsimp only []
+  rw [hbase]; dsimp only []
+  exact congrArg some ha
+
+/-- 6-step `Runtime(PostCleanup)` MIR body exercising D7 nonzero-offset raw-pointer
+deref reborrow (`_5 = &raw mut (*_4)` at `offsetBytes = 1` into `_1 : u64 = 42`),
+followed by narrower byte write (`*_5 = const 7_u8`, splicing `7` into byte `1` so
+`_1 = 42 + 7 * 256 = 1834`) and byte read (`_0 = copy *_5` -> `7_u8`). -/
+def lm31RawPtrDerefOffsetReadWriteBody : CapturedMir where
+  defPath := "lm_3_1_witness::raw_ptr_deref_offset_reborrow_write_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8DeclLM31, u64Decl, rawPtrMutU64Decl, rawPtrMutU8Decl,
+    rawPtrMutU8Decl, rawPtrMutU8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.assign (local_ 3) (.cast .ptrToPtr (.copy (local_ 2)) rawPtrMutU8Ty)),
+        mkStmt (.assign (local_ 4)
+          (.binaryOp .offset (.copy (local_ 3)) (.constant (constUsizeLM31 1)))),
+        mkStmt (.assign (local_ 5) (.rawPtr .mut (derefLocal 4))),
+        mkStmt (.assign (derefLocal 5) (.use (.constant (constU8LM31 7)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefLocal 5))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- 3-step `Runtime(PostCleanup)` MIR body exercising D7 raw-pointer deref reborrow
+(`_3 = &raw mut (*_2)`) after `StorageDead(_1)` disables `_2`'s tag (`e.perm = .disabled`). -/
+def lm31RawPtrDerefDisabledBody : CapturedMir where
+  defPath := "lm_3_1_witness::raw_ptr_deref_disabled_parent"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrMutU64Decl, rawPtrMutU64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.storageDead 1),
+        mkStmt (.assign (local_ 3) (.rawPtr .mut (derefLocal 2)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- `Runtime(PostCleanup)` MIR body exercising D10 nonzero-count scalar pointer
+`Offset` UB on an 8-byte stride (`*const u64`): `_2 = Offset(copy _1, const 1_usize)`
+where `_1 = 0 as *const u64`. -/
+def lm31NullU64OffsetNonzeroBody : CapturedMir where
+  defPath := "lm_3_1_witness::null_u64_offset_nonzero_ub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, rawPtrConstU64Decl, rawPtrConstU64Decl, u64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2)
+          (.binaryOp .offset (.copy (local_ 1)) (.constant (constUsizeLM31 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Multi-block `Runtime(PostCleanup)` MIR body exercising genuinely cross-local
+(two distinct promoted stack allocations `allocId = 1` for `_1` and `allocId = 2`
+for `_2`) D12 raw-pointer `Eq` and `Ne` comparisons feeding `SwitchInt`:
+```text
+bb0: _3 = &raw const _1;
+     _4 = &raw const _2;
+     _5 = Eq(copy _3, copy _4);
+     _0 = Ne(copy _3, copy _4);
+     switchInt(copy _0) -> [1: bb1, otherwise: bb0];
+bb1: return;
+``` -/
+def lm31CrossLocalRawPtrCmpBody : CapturedMir where
+  defPath := "lm_3_1_witness::cross_local_raw_ptr_cmp_eq_ne_branch"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDeclLM31, u64Decl, u64Decl, rawPtrConstU64Decl,
+    rawPtrConstU64Decl, boolDeclLM31]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 3) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 4) (.rawPtr .not (local_ 2))),
+        mkStmt (.assign (local_ 5) (.binaryOp .eq (.copy (local_ 3)) (.copy (local_ 4)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .ne (.copy (local_ 3)) (.copy (local_ 4))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 0))
+        { branches := [(1, 1)], otherwise := 0 }),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- 6-local Anneal pre-state with `_1 = 42_u64` and `_2 = 99_u64` for cross-local witnesses. -/
+def mkTwoU64AnnealPre (body : CapturedMir) : MachineState :=
+  { frame :=
+      { blockIdx := 0, stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩),
+          .uninit, .uninit, .uninit] }
+    memory := (initMachineState body []).memory }
+
+/-- `lean-miri` root frame matching `mkTwoU64AnnealPre`. -/
+def mkTwoU64MiriFramePre (body : CapturedMir) (retTy : Ty) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody body
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy retTy) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt lm31Scalar42))),
+        layout := some (translateTy u64Ty) },
+      { value := .live (.immediate (.scalar (.fromScalarInt lm31Scalar99))),
+        layout := some (translateTy u64Ty) },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+/-- `lean-miri` pre-state matching `mkTwoU64AnnealPre`. -/
+def mkTwoU64MiriPre (body : CapturedMir) (retTy : Ty) : AnnealStepState :=
+  { stack := ⟨#[mkTwoU64MiriFramePre body retTy]⟩, machine := AnnealMachine.empty }
+
+private theorem mkTwoU64_stateRel_and_imm (body : CapturedMir) (retTy : Ty)
+    (d₀ d₃ d₄ d₅ : LocalDecl)
+    (hdecls : body.localDecls = [d₀, u64Decl, u64Decl, d₃, d₄, d₅])
+    (hlay : body.layouts = emptyLayoutTable) :
+    StateRel body (mkTwoU64AnnealPre body) (mkTwoU64MiriPre body retTy) ∧
+    (∀ tf, (mkTwoU64MiriPre body retTy).stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k) := by
+  refine ⟨?_, ?_⟩
+  · refine StateRel.mk (mkTwoU64MiriFramePre body retTy) rfl rfl ⟨translateTy retTy, rfl⟩ ?_
+      rfl rfl rfl rfl rfl
+      (by intro i _ _ _ _ _ _ hi _; revert hi; match i with | 0 | 1 | 2 | 3 | 4 | 5 | _ + 6 => rintro ⟨⟩)
+    refine ⟨rfl, rfl, by simp [mkTwoU64AnnealPre, hdecls], by simp [mkTwoU64MiriFramePre, hdecls], ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    rw [hdecls] at hdecl
+    match i with
+    | 0 | 3 | 4 | 5 =>
+      have hs : slot = .uninit := by simpa [mkTwoU64AnnealPre, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [mkTwoU64MiriFramePre] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 1 =>
+      have hd : decl = u64Decl := by simpa [get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨42, 8⟩) := by simpa [mkTwoU64AnnealPre, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.immediate (.scalar (.fromScalarInt lm31Scalar42))),
+            layout := some (translateTy u64Ty) } := by
+        simpa [mkTwoU64MiriFramePre] using hmls.symm
+      subst hd hs hm; rw [hlay]
+      exact .immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
+        (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
+    | 2 =>
+      have hd : decl = u64Decl := by simpa [get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨99, 8⟩) := by simpa [mkTwoU64AnnealPre, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.immediate (.scalar (.fromScalarInt lm31Scalar99))),
+            layout := some (translateTy u64Ty) } := by
+        simpa [mkTwoU64MiriFramePre] using hmls.symm
+      subst hd hs hm; rw [hlay]
+      exact .immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
+        (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel99 rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
+    | _ + 6 => simp [get?] at hdecl
+  · intro tf h k mls hmls mp hmp
+    injection h with h₁; injection h₁ with h₂; subst h₂
+    match k with
+    | 0 | 1 | 2 | 3 | 4 | 5 => simp [mkTwoU64MiriFramePre] at hmls; subst hmls; cases hmp
+    | _ + 6 => simp [mkTwoU64MiriFramePre] at hmls
+
+private theorem allocMap_singleton_all_perm_of_stateRel
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {be : BorrowEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hbor : s.memory.borrows = [be]) :
+    ∀ e ∈ allocMap, e.perm = be.perm := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, hbor_eq, _, _⟩ := id hstate
+  rw [hbor] at hbor_eq
+  cases allocMap with
+  | nil => cases hbor_eq
+  | cons x xs =>
+    cases xs with
+    | cons _ _ => cases hbor_eq
+    | nil =>
+      injection hbor_eq with hx _
+      intro e he
+      cases he with
+      | head _ => exact (congrArg BorrowEntry.perm hx).symm
+      | tail _ h => cases h
+
+private theorem derefReadNextAllocMap_singleton_eq
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {be : BorrowEntry} (ptrIdx : Local)
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hbor : s.memory.borrows = [be]) :
+    (derefReadNextAllocMap s.frame.locals allocMap ptrIdx).map AllocMapEntry.toBorrowEntry = [be] := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, hbor_eq, _, _⟩ := id hstate
+  rw [hbor] at hbor_eq
+  cases allocMap with
+  | nil => cases hbor_eq
+  | cons x xs =>
+    cases xs with
+    | cons _ _ => cases hbor_eq
+    | nil =>
+      have hdn : derefReadNextAllocMap s.frame.locals [x] ptrIdx = [x] := by
+        unfold derefReadNextAllocMap
+        split
+        · split <;> rfl
+        · rfl
+      rw [hdn]
+      exact hbor_eq.symm
+
+private theorem allocMap_two_of_stateRel
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {be₂ be₁ : BorrowEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hbor : s.memory.borrows = [be₂, be₁]) :
+    ∃ e₁ e₂, e₁ ∈ allocMap ∧ e₂ ∈ allocMap ∧
+      e₁.tag = be₁.tag ∧ e₁.localIdx = be₁.targetLocal ∧
+      e₂.tag = be₂.tag ∧ e₂.localIdx = be₂.targetLocal ∧
+      (be₁.targetLocal ≠ be₂.targetLocal → e₁.allocId ≠ e₂.allocId) := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, hbor_eq, halloc, _⟩ := id hstate
+  rw [hbor] at hbor_eq
+  cases allocMap with
+  | nil => cases hbor_eq
+  | cons x₂ xs =>
+    cases xs with
+    | nil => cases hbor_eq
+    | cons x₁ rest =>
+      injection hbor_eq with hx₂ hrest
+      injection hrest with hx₁ _
+      have hl₁ : x₁.localIdx = be₁.targetLocal := (congrArg BorrowEntry.targetLocal hx₁).symm
+      have hl₂ : x₂.localIdx = be₂.targetLocal := (congrArg BorrowEntry.targetLocal hx₂).symm
+      exact ⟨x₁, x₂, .tail _ (.head _), .head _,
+        (congrArg BorrowEntry.tag hx₁).symm, hl₁,
+        (congrArg BorrowEntry.tag hx₂).symm, hl₂,
+        fun hne heq =>
+          hne (hl₁ ▸ hl₂ ▸ halloc.alloc_to_local_injective x₁ (.tail _ (.head _)) x₂ (.head _) heq)⟩
+
+/-- **`wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps`**:
+Extended multi-step witnesses driven through unified `step_mir_lm3_1_state_simulation`
+(with explicit `stepMirFn` AND `Miri.Interpreter.Step.step` equations at every step):
+1. **D7 nonzero-offset reborrow -> write -> read (`lm31RawPtrDerefOffsetReadWriteBody`)**:
+   6-step execution `_2 = &raw mut _1` -> `_3 = copy _2 as *mut u8` ->
+   `_4 = Offset(copy _3, 1_usize)` -> `_5 = &raw mut (*_4)` -> `*_5 = const 7_u8`
+   (splicing `7` into byte `1` of `_1`, yielding `1834_u64 = 42 + 7 * 256`) ->
+   `_0 = copy *_5` (`7_u8`), preserving `StateRelLM3_1`.
+2. **D7 `.disabled`-parent reborrow (`lm31RawPtrDerefDisabledBody`)**:
+   3-step execution `_2 = &raw mut _1` -> `StorageDead(_1)` (disabling tag `1`) ->
+   `_3 = &raw mut (*_2)` (reborrowing over `.disabled` tag `1` without dereferencing
+   memory), preserving `StateRelLM3_1` with `e.perm = .disabled`.
+3. **D10 `u64`-stride nonzero scalar offset UB (`lm31NullU64OffsetNonzeroBody`)**:
+   `_2 = Offset(copy _1, 1_usize)` on `_1 : *const u64 = 0 as *const u64` faults in
+   lockstep via `WellTypedLM3_1StateStmt.binOpOffsetScalarNonzeroUb` (`hexact`).
+4. **D12 genuinely cross-local (distinct allocations) `Eq`/`Ne` -> `SwitchInt`
+   (`lm31CrossLocalRawPtrCmpBody`)**:
+   5-step execution promoting BOTH `_1` (`allocId = 1`) and `_2` (`allocId = 2`),
+   computing cross-local `_5 = Eq(copy _3, copy _4)` -> `false` (`0`) and
+   `_0 = Ne(copy _3, copy _4)` -> `true` (`1`), and branching to `bb1` via
+   `SwitchInt(copy _0)` emitting `MirObs.event 1` in `StateRelLM3_1`. -/
+theorem wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps :
+    -- (1) D7 6-step nonzero-offset reborrow -> write -> read
+    (∃ (s₁ s₂ s₃ s₄ s₅ s₆ : MachineState) (m₁ m₂ m₃ m₄ m₅ m₆ : AnnealStepState)
+      (map₆ : List AllocMapEntry),
+      let b := lm31RawPtrDerefOffsetReadWriteBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b (mkSixLocalAnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkSixLocalMiriPre b u8TyLM31) = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨1834, 8⟩)) ∧
+      stepMirFn b s₅ = .step s₆ ∧
+      Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
+      get? s₆.frame.locals 0 = some (.init (.scalar ⟨7, 1⟩)) ∧
+      StateRelLM3_1 b s₆ m₆ map₆) ∧
+    -- (2) D7 3-step `.disabled`-parent reborrow
+    (∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState)
+      (map₃ : List AllocMapEntry),
+      let b := lm31RawPtrDerefDisabledBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let s₀ := mkFourLocalScalarAnnealPre b ⟨42, 8⟩
+      let m₀ := mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      get? s₃.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      (∀ e ∈ map₃, e.perm = .disabled) ∧
+      StateRelLM3_1 b s₃ m₃ map₃) ∧
+    -- (3) D10 `u64`-stride nonzero scalar offset UB
+    (∃ (m' : AnnealStepState) (msg : String),
+      let b := lm31NullU64OffsetNonzeroBody
+      let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+      let m₀ := mkFourLocalScalarMiriPre b u64Ty rawPtrConstU64Ty lm31Scalar0U64
+      stepMirFn b s₀ = .fail .ub ∧
+      Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m₀ =
+        (m', .error (.undefinedBehavior msg))) ∧
+    -- (4) D12 5-step genuinely cross-local (distinct allocations) `Eq`/`Ne` -> `SwitchInt`
+    (∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState)
+      (map₅ : List AllocMapEntry),
+      let b := lm31CrossLocalRawPtrCmpBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let s₀ := mkTwoU64AnnealPre b
+      let m₀ := mkTwoU64MiriPre b boolTyLM31
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      get? s₃.frame.locals 5 = some (.init (.scalar ⟨0, 1⟩)) ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      get? s₄.frame.locals 0 = some (.init (.scalar ⟨1, 1⟩)) ∧
+      stepMirFn b s₄ = .emitStep (.event 1) s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      s₅.frame.blockIdx = 1 ∧
+      (∃ e₁ e₂, e₁ ∈ map₅ ∧ e₂ ∈ map₅ ∧ e₁.localIdx = 1 ∧ e₂.localIdx = 2 ∧
+        e₁.allocId ≠ e₂.allocId) ∧
+      StateRelLM3_1 b s₅ m₅ map₅) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · -- Part (1): D7 6-step nonzero-offset reborrow -> write -> read
+    let b := lm31RawPtrDerefOffsetReadWriteBody
+    let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let ptr1 := Value.ptr { allocId := 1, offsetBytes := 1 } 8
+    have hrel₀ : StateRelLM3_1 b (mkSixLocalAnnealPre b) (mkSixLocalMiriPre b u8TyLM31) [] :=
+      (mkSixLocal_stateRel b u8TyLM31 u8DeclLM31 rawPtrMutU64Decl rawPtrMutU8Decl
+        rawPtrMutU8Decl rawPtrMutU8Decl rfl rfl).toLM3_1
+    have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+    have himm01 : ∀ tf, (mkSixLocalMiriPre b u8TyLM31).stack.frames = #[tf] →
+        IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 1 :=
+      fun tf htf => ⟨mkSixLocal_all_immediate _ _ tf htf 2, mkSixLocal_all_immediate _ _ tf htf 1⟩
+    let bor := [rawPtrBorrowEntry b.localDecls b.layouts .mut 1 1]
+    have hwt₀ : WellTypedLM3_1StateStmt b (mkSixLocalAnnealPre b) (mkSixLocalMiriPre b u8TyLM31) []
+        (mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1)))) :=
+      .rawPtrAddrOf 2 1 .mut (.uint .u64) rawPtrMutU64Decl u64Decl _
+        rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm01
+    obtain ⟨map₁, hsim₁⟩ := step_mir_lm3_1_state_simulation hrel₀ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₀⟩) AllocIdSupplyReady.empty
+    let s₁ := mkWitState b 1
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .uninit, .uninit, .uninit] bor 2
+    have hs₁ : stepMirFn b (mkSixLocalAnnealPre b) = .step s₁ := rfl
+    obtain ⟨m₁, hm₁, hrel₁⟩ := stepObsRelLM3_1_of_anneal_step hsim₁ hs₁
+    obtain ⟨⟨hsupply₁, _, _⟩, himm_s₁⟩ :=
+      step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm01
+        AllocIdSupplyReady.empty (by change 1 + 1 < 2 ^ 32; decide) (fun h => nomatch h) hm₁
+    have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+      fun tf₁ htf₁ k hne => himm_s₁ _ tf₁ rfl htf₁ k hne (mkSixLocal_all_immediate _ _ _ rfl k)
+    have hwt₁ : WellTypedLM3_1StateStmt b s₁ m₁ map₁
+        (mkStmt (.assign (local_ 3) (.cast .ptrToPtr (.copy (local_ 2)) rawPtrMutU8Ty))) :=
+      .castPtrToPtr 3 2 rawPtrMutU8Ty rawPtrMutU8Decl rawPtrMutU64Decl
+        .mut .mut .mut (.uint .u64) (.uint .u8) _ rfl rfl rfl rfl rfl rfl rfl
+        (fun tf₁ htf₁ => ⟨himm₁ tf₁ htf₁ 3 (by decide), himm₁ tf₁ htf₁ 2 (by decide)⟩)
+        (fun _ => slot_ptr_ne_scalar)
+    obtain ⟨map₂, hsim₂⟩ := step_mir_lm3_1_state_simulation hrel₁ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₁⟩) hsupply₁
+    let s₂ := mkWitState b 2
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .init ptr0, .uninit, .uninit] bor 2
+    have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+    obtain ⟨m₂, hm₂, hrel₂⟩ := stepObsRelLM3_1_of_anneal_step hsim₂ hs₂
+    obtain ⟨⟨hsupply₂, _, _⟩, himm_s₂⟩ :=
+      step_assign_cast_ptrToPtr_preserves_supply hrel₁ rfl rfl hsupply₁ hm₂
+    have himm₂ : ∀ tf₂, m₂.stack.frames = #[tf₂] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₂ k := by
+      intro tf₂ htf₂ k hne; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+      exact himm_s₂ tf₁ tf₂ htf₁ htf₂ k (himm₁ tf₁ htf₁ k hne)
+    obtain ⟨e₂, he₂, htag₂, hloc₂, hperm₂⟩ := allocMap_singleton_of_stateRel hrel₂ rfl
+    have hwt₂ : WellTypedLM3_1StateStmt b s₂ m₂ map₂
+        (mkStmt (.assign (local_ 4) (.binaryOp .offset (.copy (local_ 3)) (.constant (constUsizeLM31 1))))) :=
+      .binOpOffsetStride 4 3 MirAst.Operand.copy (.constant (constUsizeLM31 1))
+        rawPtrMutU8Decl rawPtrMutU8Decl u64Decl .mut .mut (.uint .u8) usizeTyLM31
+        { allocId := 1, offsetBytes := 0 } 1 s₂.frame.locals e₂ _
+        (Or.inl rfl) rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))) (Or.inl rfl)
+        (fun tf₂ _ => .of_wt (constUsize_wellTyped b tf₂ 1 (by decide)))
+        (fun tf₂ htf₂ => ⟨himm₂ tf₂ htf₂ 4 (by decide), himm₂ tf₂ htf₂ 3 (by decide)⟩)
+        rfl rfl (by rintro ⟨⟩) he₂ htag₂ (by rw [hperm₂]; rintro ⟨⟩) (by rw [hloc₂]; rfl)
+        (Or.inr ⟨by rw [hloc₂]; rintro ⟨⟩, by change 0 + 1 * 1 ≤ 8; decide⟩)
+    obtain ⟨map₃, hsim₃⟩ := step_mir_lm3_1_state_simulation hrel₂ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₂⟩) hsupply₂
+    let s₃ := mkWitState b 3
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .init ptr0, .init ptr1, .uninit] bor 2
+    have hs₃ : stepMirFn b s₂ = .step s₃ :=
+      stepMirFn_binOp_offset_const_eq
+        (rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1)
+        u64Decl hphase (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩)))
+    obtain ⟨m₃, hm₃, hrel₃⟩ := stepObsRelLM3_1_of_anneal_step hsim₃ hs₃
+    obtain ⟨⟨hsupply₃, _, _⟩, himm_s₃⟩ :=
+      step_assign_binOp_offset_preserves_supply hrel₂ rfl rfl hsupply₂ hm₃
+    have himm₃ : ∀ tf₃, m₃.stack.frames = #[tf₃] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₃ k := by
+      intro tf₃ htf₃ k hne; obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+      exact himm_s₃ tf₂ tf₃ htf₂ htf₃ k (himm₂ tf₂ htf₂ k hne)
+    have hwt₃ : WellTypedLM3_1StateStmt b s₃ m₃ map₃
+        (mkStmt (.assign (local_ 5) (.rawPtr .mut (derefLocal 4)))) :=
+      .rawPtrDeref 5 4 rawPtrMutU8Decl rawPtrMutU8Decl .mut .mut .mut (.uint .u8) (.uint .u8) _
+        rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩)))
+        (fun tf₃ htf₃ => ⟨himm₃ tf₃ htf₃ 5 (by decide), himm₃ tf₃ htf₃ 4 (by decide)⟩)
+    obtain ⟨map₄, hsim₄⟩ := step_mir_lm3_1_state_simulation hrel₃ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₃⟩) hsupply₃
+    let s₄ := mkWitState b 4
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .init ptr0, .init ptr1, .init ptr1] bor 2
+    have hs₄ : stepMirFn b s₃ = .step s₄ := rfl
+    obtain ⟨m₄, hm₄, hrel₄⟩ := stepObsRelLM3_1_of_anneal_step hsim₄ hs₄
+    obtain ⟨⟨hsupply₄, _, _⟩, himm_s₄⟩ :=
+      step_assign_rawPtr_deref_preserves_supply hrel₃ rfl rfl hsupply₃ hm₄
+    have himm₄ : ∀ tf₄, m₄.stack.frames = #[tf₄] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₄ k := by
+      intro tf₄ htf₄ k hne; obtain ⟨tf₃, htf₃, _⟩ := id hrel₃
+      exact himm_s₄ tf₃ tf₄ htf₃ htf₄ k (himm₃ tf₃ htf₃ k hne)
+    obtain ⟨e₄, he₄, htag₄, hloc₄, hperm₄⟩ := allocMap_singleton_of_stateRel hrel₄ rfl
+    have hwt₄ : WellTypedLM3_1StateStmt b s₄ m₄ map₄
+        (mkStmt (.assign (derefLocal 5) (.use (.constant (constU8LM31 7))))) :=
+      .derefWriteNarrower 5 (.constant (constU8LM31 7)) rawPtrMutU8Decl u64Decl .mut
+        (.uint .u8) u8TyLM31 { allocId := 1, offsetBytes := 1 } e₄ ⟨42, 8⟩ _
+        rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))) rfl
+        (fun tf₄ _ => .of_wt (constU8_wellTyped b tf₄ 7 (by decide)))
+        (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 5 (by decide))
+        rfl he₄ htag₄ (Or.inl hperm₄) (by rw [hloc₄]; rfl)
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by rw [hloc₄]; rfl)
+        (by change 1 + 1 ≤ 8; decide) (by change 1 % 1 = 0; decide)
+        ⟨(fun h => nomatch h), (fun h => nomatch h)⟩
+    obtain ⟨map₅, hsim₅⟩ := step_mir_lm3_1_state_simulation hrel₄ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₄⟩) hsupply₄
+    let s₅ := mkWitState b 5
+      [.uninit, .init (.scalar ⟨1834, 8⟩), .init ptr0, .init ptr0, .init ptr1, .init ptr1] bor 2
+    have hsp₅ : spliceScalarSlice? ⟨42, 8⟩ 1 ⟨7, 1⟩ = some ⟨1834, 8⟩ := by
+      refine (spliceScalarSlice?_eq_of_inbounds ⟨42, 8⟩ ⟨7, 1⟩ 1
+        (by decide) (by decide) (by decide)).1.trans ?_
+      exact congrArg (fun bits => some ({ bits := bits, sizeBytes := 8 } : MirAst.ScalarInt))
+        (by decide)
+    have hs₅ : stepMirFn b s₄ = .step s₅ := by
+      have hwrite₅ :
+          writePlaceValue s₄.frame.locals bor (derefLocal 5) (.scalar ⟨7, 1⟩)
+            b.localDecls b.layouts =
+          .ok [.uninit, .init (.scalar ⟨1834, 8⟩), .init ptr0, .init ptr0, .init ptr1,
+            .init ptr1] := by
+        have hderef_eq :
+            writePlaceValue s₄.frame.locals bor (derefLocal 5) (.scalar ⟨7, 1⟩)
+              b.localDecls b.layouts =
+            writeStackThinPtrTypedDeref s₄.frame.locals s₄.frame.locals
+              (rawPtrBorrowEntry b.localDecls b.layouts .mut 1 1)
+              { allocId := 1, offsetBytes := 1 } .nil (.scalar ⟨7, 1⟩)
+              b.localDecls b.layouts (some u8TyLM31) (some u8TyLM31) := rfl
+        rw [hderef_eq]; unfold writeStackThinPtrTypedDeref
+        have halign_ok :
+            Bool.and
+              (checkDerefAlign b.localDecls b.layouts
+                (some (resolveTyWithLocalDecls b.localDecls b.layouts u8TyLM31)) 1)
+              (Bool.and
+                (checkTargetPlaceAlign b.localDecls b.layouts
+                  (some (resolveTyWithLocalDecls b.localDecls b.layouts u8TyLM31))
+                  (rawPtrBorrowEntry b.localDecls b.layouts .mut 1 1)
+                  { allocId := 1, offsetBytes := 1 } (some (.scalar ⟨42, 8⟩)))
+                (validateValueForTy? b.layouts
+                  (some (resolveTyWithLocalDecls b.localDecls b.layouts u8TyLM31))
+                  (.scalar ⟨7, 1⟩))) = true := rfl
+        have hget1 : get? s₄.frame.locals 1 = some (.init (.scalar ⟨42, 8⟩)) := rfl
+        have hrp : readProjectedForLocal s₄.frame.locals b.localDecls b.layouts 1
+            (.scalar ⟨42, 8⟩) .nil = .ok (.scalar ⟨42, 8⟩) := rfl
+        dsimp only [rawPtrBorrowEntry] at halign_ok
+        dsimp only [stripTransparentProjections, rawPtrBorrowEntry]
+        rw [hget1]; dsimp only []; rw [halign_ok]; dsimp only [b, lm31RawPtrDerefOffsetReadWriteBody] at hrp ⊢
+        rw [hrp]; dsimp only []; rw [hsp₅]; rfl
+      have hbb₄ : get? b.basicBlocks s₄.frame.blockIdx = some (b.basicBlocks[0]'(by decide)) := rfl
+      have hst₄ : get? (b.basicBlocks[0]'(by decide)).statements s₄.frame.stmtIdx =
+          some (mkStmt (.assign (derefLocal 5) (.use (.constant (constU8LM31 7))))) := rfl
+      have hprot₄ : s₄.memory.activeProtectors = [] := rfl
+      have hbor₄ : s₄.memory.borrows = bor := rfl
+      rw [stepMirFn_eq_of_not_other b s₄ rfl hphase]
+      simp only [hbb₄, hst₄]
+      unfold evalStmt evalRvalue evalOperand evalPlaceWrite
+      dsimp only [mkStmt, constU8LM31, evalConstValue]
+      rw [hprot₄, hbor₄, hwrite₅]; rfl
+    obtain ⟨m₅, hm₅, hrel₅⟩ := stepObsRelLM3_1_of_anneal_step hsim₅ hs₅
+    obtain ⟨⟨hsupply₅, _, _⟩, himm_s₅⟩ :=
+      step_assign_use_preserves_supply hrel₄ rfl rfl hsupply₄ hm₅
+    have himm₅ : ∀ tf₅, m₅.stack.frames = #[tf₅] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₅ k := by
+      intro tf₅ htf₅ k hne; obtain ⟨tf₄, htf₄, _⟩ := id hrel₄
+      exact himm_s₅ tf₄ tf₅ htf₄ htf₅ k (himm₄ tf₄ htf₄ k hne)
+    obtain ⟨e₅, he₅, htag₅, hloc₅, hperm₅⟩ := allocMap_singleton_of_stateRel hrel₅ rfl
+    have hwt₅ : WellTypedLM3_1StateStmt b s₅ m₅ map₅
+        (mkStmt (.assign (local_ 0) (.use (.copy (derefLocal 5))))) :=
+      .derefReadNarrower 0 5 MirAst.Operand.copy u8DeclLM31 rawPtrMutU8Decl u64Decl .mut
+        { allocId := 1, offsetBytes := 1 } e₅ ⟨1834, 8⟩ _
+        (Or.inl rfl) rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩)))
+        (fun tf₅ htf₅ => ⟨himm₅ tf₅ htf₅ 0 (by decide), himm₅ tf₅ htf₅ 5 (by decide)⟩)
+        rfl he₅ htag₅ (by rw [hperm₅]; rintro ⟨⟩) (by rw [hloc₅]; rfl)
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by rw [hloc₅]; rfl)
+        (by change 1 + 1 ≤ 8; decide) (by change 1 % 1 = 0; decide)
+        (fun h => nomatch h) (fun h => nomatch h)
+    obtain ⟨map₆, hsim₆⟩ := step_mir_lm3_1_state_simulation hrel₅ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₅⟩) hsupply₅
+    let s₆ := mkWitState b 6
+      [.init (.scalar ⟨7, 1⟩), .init (.scalar ⟨1834, 8⟩), .init ptr0, .init ptr0, .init ptr1, .init ptr1] bor 2
+    obtain ⟨_, hs₆_fn⟩ := step_deref_read_narrower_simulation hrel₅ hphase (Or.inl rfl) rfl rfl
+      (dstDecl := u8DeclLM31) (ptrDecl := rawPtrMutU8Decl) (tgtDecl := u64Decl) rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩)))
+      (fun tf₅ htf₅ => ⟨himm₅ tf₅ htf₅ 0 (by decide), himm₅ tf₅ htf₅ 5 (by decide)⟩)
+      (ptrVal := { allocId := 1, offsetBytes := 1 }) (oldSc := ⟨1834, 8⟩)
+      rfl he₅ htag₅ (by rw [hperm₅]; rintro ⟨⟩) (by rw [hloc₅]; rfl)
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by rw [hloc₅]; rfl)
+      (by decide) (by decide) (fun h => nomatch h) (fun h => nomatch h)
+    have hs₆ : stepMirFn b s₅ = .step s₆ := by
+      have hs₆_raw := hs₆_fn (by rintro ⟨⟩); dsimp only [] at hs₆_raw
+      have hacc1 : (translateTy u8DeclLM31.ty b.layouts).layout.size.bytes.toNat = 1 := rfl
+      have hbits1 : (1834 : Nat) / 2 ^ (8 * 1) % scalarModulus 1 = 7 := by decide
+      have hbor_eq : List.map AllocMapEntry.toBorrowEntry (derefReadNextAllocMap s₅.frame.locals map₅ 5) =
+          bor :=
+        derefReadNextAllocMap_singleton_eq 5 hrel₅ rfl
+      rw [hacc1, hbits1, hbor_eq] at hs₆_raw
+      exact hs₆_raw
+    obtain ⟨m₆, hm₆, hrel₆⟩ := stepObsRelLM3_1_of_anneal_step hsim₆ hs₆
+    exact ⟨s₁, s₂, s₃, s₄, s₅, s₆, m₁, m₂, m₃, m₄, m₅, m₆, map₆,
+      hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, hs₄, hm₄, hs₅, hm₅, rfl, hs₆, hm₆, rfl, hrel₆⟩
+  · -- Part (2): D7 3-step `.disabled`-parent reborrow (`StorageDead(_1)` -> `&raw mut (*_2)`)
+    let b := lm31RawPtrDerefDisabledBody
+    let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let s₀ := mkFourLocalScalarAnnealPre b ⟨42, 8⟩
+    let m₀ := mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42
+    have hrel₀ : StateRelLM3_1 b s₀ m₀ [] :=
+      (mkFourLocalScalar_stateRel b u64Ty u64Decl u64Decl rawPtrMutU64Decl rawPtrMutU64Decl
+        ⟨42, 8⟩ lm31Scalar42 rfl rfl lm31_scalarRel42 rfl (by rintro ⟨⟩) (by rintro ⟨⟩)).toLM3_1
+    have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+    have himm₀ : ∀ tf, m₀.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 1 :=
+      fun tf htf => ⟨mkFourLocalScalar_all_immediate _ _ _ _ tf htf 2,
+        mkFourLocalScalar_all_immediate _ _ _ _ tf htf 1⟩
+    let bor := [rawPtrBorrowEntry b.localDecls b.layouts .mut 1 1]
+    have hwt₀ : WellTypedLM3_1StateStmt b s₀ m₀ []
+        (mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1)))) :=
+      .rawPtrAddrOf 2 1 .mut (.uint .u64) rawPtrMutU64Decl u64Decl _
+        rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀
+    obtain ⟨map₁, hsim₁⟩ := step_mir_lm3_1_state_simulation hrel₀ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₀⟩) AllocIdSupplyReady.empty
+    let s₁ := mkWitState b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .uninit] bor 2
+    have hs₁ : stepMirFn b s₀ = .step s₁ := rfl
+    obtain ⟨m₁, hm₁, hrel₁⟩ := stepObsRelLM3_1_of_anneal_step hsim₁ hs₁
+    obtain ⟨⟨hsupply₁, _, _⟩, himm_s₁⟩ :=
+      step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀
+        AllocIdSupplyReady.empty (by change 1 + 1 < 2 ^ 32; decide) (fun h => nomatch h) hm₁
+    have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+      fun tf₁ htf₁ k hne =>
+        himm_s₁ _ tf₁ rfl htf₁ k hne (mkFourLocalScalar_all_immediate _ _ _ _ _ rfl k)
+    have hwt₁ : WellTypedLM3_1StateStmt b s₁ m₁ map₁ (mkStmt (.storageDead 1)) :=
+      .storageDead 1 u64Decl _ rfl (by decide)
+    obtain ⟨map₂, hsim₂⟩ := step_mir_lm3_1_state_simulation hrel₁ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₁⟩) hsupply₁
+    let borDis : List BorrowEntry :=
+      [{ tag := 1, targetLocal := 1, targetProjection := .nil, perm := .disabled }]
+    let s₂ := mkWitState b 2 [.uninit, .dead, .init ptr0, .uninit] borDis 2
+    have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+    obtain ⟨m₂, hm₂, hrel₂⟩ := stepObsRelLM3_1_of_anneal_step hsim₂ hs₂
+    obtain ⟨hsupply₂, himm_s₂⟩ := step_storageDead_preserves_supply hrel₁ rfl rfl rfl (by decide) hsupply₁ hm₂
+    have himm₂ : ∀ tf₂, m₂.stack.frames = #[tf₂] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₂ k := by
+      intro tf₂ htf₂ k hne; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+      exact himm_s₂ tf₁ tf₂ htf₁ htf₂ k (himm₁ tf₁ htf₁ k hne)
+    have hwt₂ : WellTypedLM3_1StateStmt b s₂ m₂ map₂
+        (mkStmt (.assign (local_ 3) (.rawPtr .mut (derefLocal 2)))) :=
+      .rawPtrDeref 3 2 rawPtrMutU64Decl rawPtrMutU64Decl .mut .mut .mut (.uint .u64) (.uint .u64) _
+        rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩)))
+        (fun tf₂ htf₂ => ⟨himm₂ tf₂ htf₂ 3 (by decide), himm₂ tf₂ htf₂ 2 (by decide)⟩)
+    obtain ⟨map₃, hsim₃⟩ := step_mir_lm3_1_state_simulation hrel₂ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₂⟩) hsupply₂
+    let s₃ := mkWitState b 3 [.uninit, .dead, .init ptr0, .init ptr0] borDis 2
+    have hs₃ : stepMirFn b s₂ = .step s₃ := rfl
+    obtain ⟨m₃, hm₃, hrel₃⟩ := stepObsRelLM3_1_of_anneal_step hsim₃ hs₃
+    have hdis₃ : ∀ e ∈ map₃, e.perm = .disabled :=
+      allocMap_singleton_all_perm_of_stateRel hrel₃ rfl
+    exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, map₃, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, rfl, hdis₃, hrel₃⟩
+  · -- Part (3): D10 `u64`-stride nonzero scalar offset UB
+    let b := lm31NullU64OffsetNonzeroBody
+    let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+    let m₀ := mkFourLocalScalarMiriPre b u64Ty rawPtrConstU64Ty lm31Scalar0U64
+    have hrel₀ : StateRelLM3_1 b s₀ m₀ [] :=
+      (mkFourLocalScalar_stateRel b u64Ty u64Decl rawPtrConstU64Decl rawPtrConstU64Decl
+        u64Decl ⟨0, 8⟩ lm31Scalar0U64 rfl rfl lm31_scalarRel0U64 rfl
+        (by rintro ⟨⟩) (by rintro ⟨⟩)).toLM3_1
+    have hwt₀ : WellTypedLM3_1StateStmt b s₀ m₀ []
+        (mkStmt (.assign (local_ 2)
+          (.binaryOp .offset (.copy (local_ 1)) (.constant (constUsizeLM31 1))))) :=
+      .binOpOffsetScalarNonzeroUb 2 1 (.constant (constUsizeLM31 1))
+        rawPtrConstU64Decl rawPtrConstU64Decl .not (.uint .u64) usizeTyLM31 ⟨0, 8⟩ ⟨1, 8⟩
+        s₀.frame.locals _ rfl rfl rfl rfl (Or.inl rfl)
+        (fun tf _ => constUsize_wellTyped b tf 1 (by decide))
+        (fun tf htf => mkFourLocalScalar_all_immediate _ _ _ _ tf htf 1)
+        rfl rfl (by decide) (by decide) ⟨8, rfl, by decide⟩
+    obtain ⟨_, hsim₀⟩ := step_mir_lm3_1_state_simulation hrel₀ (fun _ h => nomatch h) rfl
+      (Or.inl ⟨_, rfl, hwt₀⟩) AllocIdSupplyReady.empty
+    have hs₀ : stepMirFn b s₀ = .fail .ub := rfl
+    obtain ⟨msg, hm₀⟩ := (StepObsRelLM3_1.ub_iff hsim₀).mp hs₀
+    exact ⟨(Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m₀).1,
+      msg, hs₀, Prod.ext rfl hm₀⟩
+  · -- Part (4): D12 5-step genuinely cross-local (distinct allocations) `Eq`/`Ne` -> `SwitchInt`
+    let b := lm31CrossLocalRawPtrCmpBody
+    let s₀ := mkTwoU64AnnealPre b
+    let m₀ := mkTwoU64MiriPre b boolTyLM31
+    obtain ⟨hrel_base₀, himm_base₀⟩ := mkTwoU64_stateRel_and_imm b boolTyLM31
+      boolDeclLM31 rawPtrConstU64Decl rawPtrConstU64Decl boolDeclLM31 rfl rfl
+    have hrel₀ : StateRelLM3_1 b s₀ m₀ [] := hrel_base₀.toLM3_1
+    have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+    let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+    let be₁ := rawPtrBorrowEntry b.localDecls b.layouts .not 1 1
+    let be₂ := rawPtrBorrowEntry b.localDecls b.layouts .not 2 2
+    have hbeq8 : (8 : Nat).beq 8 = true := rfl
+    -- Step 1: `_3 = &raw const _1` (`allocId = 1`, `tag = 1`)
+    have himm₀_31 : ∀ tf, m₀.stack.frames = #[tf] → IsImmediateFrameLocal tf 3 ∧ IsImmediateFrameLocal tf 1 :=
+      fun tf htf => ⟨himm_base₀ tf htf 3, himm_base₀ tf htf 1⟩
+    have hwt₀ : WellTypedLM3_1StateStmt b s₀ m₀ []
+        (mkStmt (.assign (local_ 3) (.rawPtr .not (local_ 1)))) :=
+      .rawPtrAddrOf 3 1 .not (.uint .u64) rawPtrConstU64Decl u64Decl _
+        rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀_31
+    obtain ⟨map₁, hsim₁⟩ := step_mir_lm3_1_state_simulation hrel₀ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₀⟩) AllocIdSupplyReady.empty
+    let s₁ := mkWitState b 1
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩), .init ptr1, .uninit, .uninit]
+      [be₁] 2
+    have hs₁ : stepMirFn b s₀ = .step s₁ := rfl
+    obtain ⟨m₁, hm₁, hrel₁⟩ := stepObsRelLM3_1_of_anneal_step hsim₁ hs₁
+    obtain ⟨⟨hsupply₁, hnext₁, hsrc₁⟩, himm_s₁⟩ :=
+      step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀_31
+        AllocIdSupplyReady.empty (by change 1 + 1 < 2 ^ 32; decide) (fun h => nomatch h) hm₁
+    have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+      fun tf₁ htf₁ k hne => himm_s₁ _ tf₁ rfl htf₁ k hne (himm_base₀ _ rfl k)
+    -- Step 2: `_4 = &raw const _2` (`allocId = 2`, `tag = 2`)
+    have himm₁_42 : ∀ tf₁, m₁.stack.frames = #[tf₁] → IsImmediateFrameLocal tf₁ 4 ∧ IsImmediateFrameLocal tf₁ 2 :=
+      fun tf₁ htf₁ => ⟨himm₁ tf₁ htf₁ 4 (by decide), himm₁ tf₁ htf₁ 2 (by decide)⟩
+    have hwt₁ : WellTypedLM3_1StateStmt b s₁ m₁ map₁
+        (mkStmt (.assign (local_ 4) (.rawPtr .not (local_ 2)))) :=
+      .rawPtrAddrOf 4 2 .not (.uint .u64) rawPtrConstU64Decl u64Decl _
+        rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_42
+    obtain ⟨map₂, hsim₂⟩ := step_mir_lm3_1_state_simulation hrel₁ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₁⟩) hsupply₁
+    let s₂ := mkWitState b 2
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩), .init ptr1, .init ptr2, .uninit]
+      [be₂, be₁] 3
+    have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+    obtain ⟨m₂, hm₂, hrel₂⟩ := stepObsRelLM3_1_of_anneal_step hsim₂ hs₂
+    obtain ⟨⟨hsupply₂, _, _⟩, himm_s₂⟩ :=
+      step_rawPtr_addrOf_preserves_supply hrel₁ rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_42 hsupply₁
+        (by rw [hnext₁]; change 2 + 1 < 2 ^ 32; decide)
+        (by rw [hsrc₁]; intro h; cases h) hm₂
+    have himm₂ : ∀ tf₂, m₂.stack.frames = #[tf₂] → ∀ k, k ≠ 1 → k ≠ 2 → IsImmediateFrameLocal tf₂ k := by
+      intro tf₂ htf₂ k hk₁ hk₂; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+      exact himm_s₂ tf₁ tf₂ htf₁ htf₂ k hk₂ (himm₁ tf₁ htf₁ k hk₁)
+    -- Extract `e₁, e₂ ∈ map₂` with `e₁.localIdx = 1`, `e₂.localIdx = 2`
+    obtain ⟨e₁_2, e₂_2, he₁_2, he₂_2, htag₁_2, hloc₁_2, htag₂_2, hloc₂_2, _⟩ :=
+      allocMap_two_of_stateRel hrel₂ rfl
+    -- Step 3: `_5 = Eq(copy _3, copy _4)` -> `false` (`0`)
+    have hwt₂ : WellTypedLM3_1StateStmt b s₂ m₂ map₂
+        (mkStmt (.assign (local_ 5) (.binaryOp .eq (.copy (local_ 3)) (.copy (local_ 4))))) :=
+      .rawPtrCmpCrossLocalEqNe 5 3 4 MirAst.Operand.copy MirAst.Operand.copy .eq
+        boolDeclLM31 rawPtrConstU64Decl rawPtrConstU64Decl .not .not (.uint .u64) (.uint .u64)
+        { allocId := 1, offsetBytes := 0 } { allocId := 2, offsetBytes := 0 } e₁_2 e₂_2 _
+        (Or.inl rfl) (Or.inl rfl) (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+        (fun tf₂ htf₂ => ⟨himm₂ tf₂ htf₂ 5 (by decide) (by decide),
+          himm₂ tf₂ htf₂ 3 (by decide) (by decide), himm₂ tf₂ htf₂ 4 (by decide) (by decide)⟩)
+        rfl rfl he₁_2 htag₁_2 (by rw [hloc₁_2]; decide) (by decide)
+        he₂_2 htag₂_2 (by rw [hloc₂_2]; decide) (by decide)
+        (fun h => absurd (congrFun h ⟨0, .nil⟩) (by nofun))
+    obtain ⟨map₃, hsim₃⟩ := step_mir_lm3_1_state_simulation hrel₂ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₂⟩) hsupply₂
+    let s₃ := mkWitState b 3
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩), .init ptr1, .init ptr2,
+       .init (.scalar ⟨0, 1⟩)] [be₂, be₁] 3
+    have hs₃ : stepMirFn b s₂ = .step s₃ :=
+      stepMirFn_rawPtr_cmp_copy_eq (bRes := false) 68719542272 68719607808 hphase
+        (hv₁ := Or.inr ⟨_, rfl, ptrAddress_two_second_eq _ _ _ _ _ _ _ _⟩)
+        (hv₂ := ⟨_, rfl, ptrAddress_two_head_eq _ _ _ _ _ _ _ _⟩)
+        (hcmp := by unfold evalScalarBinOp; dsimp only [hbeq8]; congr 3)
+    obtain ⟨m₃, hm₃, hrel₃⟩ := stepObsRelLM3_1_of_anneal_step hsim₃ hs₃
+    obtain ⟨⟨hsupply₃, _, _⟩, himm_s₃⟩ :=
+      step_assign_binaryOp_preserves_supply hrel₂ rfl rfl hsupply₂ hm₃
+    have himm₃ : ∀ tf₃, m₃.stack.frames = #[tf₃] → ∀ k, k ≠ 1 → k ≠ 2 → IsImmediateFrameLocal tf₃ k := by
+      intro tf₃ htf₃ k hk₁ hk₂; obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+      exact himm_s₃ tf₂ tf₃ htf₂ htf₃ k (himm₂ tf₂ htf₂ k hk₁ hk₂)
+    -- Step 4 & 5: `_0 = Ne(copy _3, copy _4)` -> `true` (`1`) -> `SwitchInt(copy _0)`
+    obtain ⟨e₁_3, e₂_3, he₁_3, he₂_3, htag₁_3, hloc₁_3, htag₂_3, hloc₂_3, _⟩ :=
+      allocMap_two_of_stateRel hrel₃ rfl
+    have hwt₃ : WellTypedLM3_1StateStmt b s₃ m₃ map₃
+        (mkStmt (.assign (local_ 0) (.binaryOp .ne (.copy (local_ 3)) (.copy (local_ 4))))) :=
+      .rawPtrCmpCrossLocalEqNe 0 3 4 MirAst.Operand.copy MirAst.Operand.copy .ne
+        boolDeclLM31 rawPtrConstU64Decl rawPtrConstU64Decl .not .not (.uint .u64) (.uint .u64)
+        { allocId := 1, offsetBytes := 0 } { allocId := 2, offsetBytes := 0 } e₁_3 e₂_3 _
+        (Or.inl rfl) (Or.inl rfl) (Or.inr rfl) rfl rfl rfl rfl rfl rfl
+        (fun tf₃ htf₃ => ⟨himm₃ tf₃ htf₃ 0 (by decide) (by decide),
+          himm₃ tf₃ htf₃ 3 (by decide) (by decide), himm₃ tf₃ htf₃ 4 (by decide) (by decide)⟩)
+        rfl rfl he₁_3 htag₁_3 (by rw [hloc₁_3]; decide) (by decide)
+        he₂_3 htag₂_3 (by rw [hloc₂_3]; decide) (by decide)
+        (fun h => absurd (congrFun h ⟨0, .nil⟩) (by nofun))
+    obtain ⟨map₄, hsim₄⟩ := step_mir_lm3_1_state_simulation hrel₃ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₃⟩) hsupply₃
+    let s₄ := mkWitState b 4
+      [.init (.scalar ⟨1, 1⟩), .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩),
+       .init ptr1, .init ptr2, .init (.scalar ⟨0, 1⟩)] [be₂, be₁] 3
+    have hs₄ : stepMirFn b s₃ = .step s₄ :=
+      stepMirFn_rawPtr_cmp_copy_eq (bRes := true) 68719542272 68719607808 hphase
+        (hv₁ := Or.inr ⟨_, rfl, ptrAddress_two_second_eq _ _ _ _ _ _ _ _⟩)
+        (hv₂ := ⟨_, rfl, ptrAddress_two_head_eq _ _ _ _ _ _ _ _⟩)
+        (hcmp := by unfold evalScalarBinOp; dsimp only [hbeq8]; congr 3)
+    obtain ⟨m₄, hm₄, hrel₄⟩ := stepObsRelLM3_1_of_anneal_step hsim₄ hs₄
+    obtain ⟨⟨hsupply₄, _, _⟩, himm_s₄⟩ :=
+      step_assign_binaryOp_preserves_supply hrel₃ rfl rfl hsupply₃ hm₄
+    have himm₄_0 : ∀ tf₄, m₄.stack.frames = #[tf₄] → IsImmediateFrameLocal tf₄ 0 := by
+      intro tf₄ htf₄; obtain ⟨tf₃, htf₃, _⟩ := id hrel₃
+      exact himm_s₄ tf₃ tf₄ htf₃ htf₄ 0 (himm₃ tf₃ htf₃ 0 (by decide) (by decide))
+    have hwt₄ : WellTypedLM3_1StateTerminator b m₄ (b.basicBlocks[0]'(by decide)) :=
+      .switchInt (.copy (local_ 0)) { branches := [(1, 1)], otherwise := 0 } boolTyLM31
+        rfl (Or.inl rfl)
+        (fun tf₄ htf₄ => .copyLocal 0 boolDeclLM31 rfl (by decide) (himm₄_0 tf₄ htf₄))
+        (fun v blk hmem => by
+          simp only [List.mem_singleton, Prod.mk.injEq] at hmem
+          rcases hmem with ⟨rfl, rfl⟩
+          exact ⟨by decide, fun _ => Or.inr rfl⟩)
+    obtain ⟨map₅, hsim₅⟩ := step_mir_lm3_1_state_simulation hrel₄ hphase rfl
+      (Or.inr ⟨rfl, rfl, hwt₄⟩) hsupply₄
+    let s₅ := mkWitBlockState b 1 0
+      [.init (.scalar ⟨1, 1⟩), .init (.scalar ⟨42, 8⟩), .init (.scalar ⟨99, 8⟩),
+       .init ptr1, .init ptr2, .init (.scalar ⟨0, 1⟩)] [be₂, be₁] 3
+    have hs₅ : stepMirFn b s₄ = .emitStep (.event 1) s₅ := rfl
+    obtain ⟨m₅, hm₅, hrel₅⟩ := stepObsRelLM3_1_of_anneal_emitStep hsim₅ hs₅
+    have hdistinct₅ : ∃ e₁ e₂, e₁ ∈ map₅ ∧ e₂ ∈ map₅ ∧ e₁.localIdx = 1 ∧ e₂.localIdx = 2 ∧
+        e₁.allocId ≠ e₂.allocId := by
+      obtain ⟨e₁, e₂, he₁, he₂, _, hl₁, _, hl₂, hne⟩ := allocMap_two_of_stateRel hrel₅ rfl
+      exact ⟨e₁, e₂, he₁, he₂, hl₁, hl₂, hne (by decide)⟩
+    exact ⟨s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅, map₅,
+      hs₁, hm₁, hs₂, hm₂, hs₃, hm₃, rfl, hs₄, hm₄, rfl, hs₅, hm₅, rfl, hdistinct₅, hrel₅⟩
+
 end LeanMiriSpec.Correspondence.Witness

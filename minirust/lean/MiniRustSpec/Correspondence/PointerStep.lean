@@ -4227,7 +4227,7 @@ theorem statementOk_retag_spec {layouts : Layout.LayoutTable} {decls : List Loca
     ∃ (i : Nat) (di : LocalDecl) (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType),
       p = ⟨i, []⟩ ∧ isRetagFnEntry kind = false ∧ decls[i]? = some di ∧
       ptrPointeeOf di.ty = some (mutbl, pointeeIt) ∧
-      ((isDeclRefLocal decls i = true ∧ isRetagRaw kind = false) ∨
+      (isDeclRefLocal decls i = true ∨
        (isDeclRefLocal decls i = false ∧ isRetagRaw kind = true)) := by
   rcases p with ⟨i, projs⟩
   cases projs with
@@ -4289,7 +4289,6 @@ theorem evalStmt_retag_ref_local (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (kind : RetagKind) (i : Nat) (di : LocalDecl)
     (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) (span : String)
     (hkind : isRetagFnEntry kind = false)
-    (hnot_raw : isRetagRaw kind = false)
     (hdi : decls[i]? = some di)
     (hi_ty : ptrPointeeOf di.ty = some (mutbl, pointeeIt))
     (href_true : isDeclRefLocal decls i = true)
@@ -4343,8 +4342,7 @@ theorem evalStmt_retag_ref_local (s : MachineState) (decls : List LocalDecl)
       refReborrowPerm (retagBorrowKind mutbl) := by
     cases kind with
     | fnEntry => simp [isRetagFnEntry] at hkind
-    | raw => simp [isRetagRaw] at hnot_raw
-    | default | twoPhase =>
+    | default | twoPhase | raw =>
       cases pointee with
       | uint _ | int _ =>
         cases mutbl <;> rfl
@@ -4364,8 +4362,7 @@ theorem evalStmt_retag_ref_local (s : MachineState) (decls : List LocalDecl)
     | unique | reservedFrz _ | reservedIM | frozen | cell =>
       cases kind with
       | fnEntry => simp [isRetagFnEntry] at hkind
-      | raw => simp [isRetagRaw] at hnot_raw
-      | default | twoPhase =>
+      | default | twoPhase | raw =>
         dsimp only [evalStmt]
         rw [hop, hpl]
         dsimp only
