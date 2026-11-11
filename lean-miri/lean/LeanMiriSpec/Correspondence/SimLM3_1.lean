@@ -23066,7 +23066,16 @@ live immediate `dstIdx ≠ loc`):
   (preserving symbolic `char` argument reflection in `SymReflect.lean`), so
   `stepMirFn` steps `_d = copy loc` to `MirStepNode.step ...` (whereas any
   typed pointer dereference `*_p_char` raises `.ub` in BOTH machines by
-  `step_raw_overwritten_deref_invalid_bool_or_char_simulation`). -/
+  `step_raw_overwritten_deref_invalid_bool_or_char_simulation`).
+
+Direction and root cause: Anneal steps where `lean-miri` reports undefined
+behavior, so this boundary admits an execution that Rust deems undefined (a
+program that launders an invalid `char` bit pattern through a raw integer write
+and then copies the local directly). Extending the `ScalarLayout.validRange`
+check of `validateLoadedValue` to `char` would not close it: `char`'s layout valid
+range is `0..=0x10FFFF`, which contains the surrogates `0xD800..=0xDFFF`, so only
+an `isValidCharCode` check on direct `char` loads gives parity with `lean-miri`'s
+`annealValidateScalarForTyId`. -/
 theorem step_raw_overwritten_direct_copy_invalid_char_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
