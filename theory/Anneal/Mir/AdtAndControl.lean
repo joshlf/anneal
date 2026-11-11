@@ -100,8 +100,9 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      `RetagTy.inhabited`, and `Deinit`-then-`Retag` failure `evalDeinitPlace_then_retag_same_false`)
      with step refinement of Trusted's `evalStmt` on `.retag`: for both reference retags
      (`evalStmt_retag_ref_refines`) and raw-pointer retags (`evalStmt_retag_raw_refines`,
-     `evalStmt_retag_raw_global_refines`), Trusted reads and retags the pointer Anneal validated
-     and steps without faulting whenever its borrow model (`active`, `reserved`, or non-`&mut`
+     `evalStmt_retag_raw_global_refines`) of non-union places (`placeTouchesUnion localDecls
+     layouts place = false`, discharged by default for bare locals), Trusted reads and retags the
+     pointer Anneal validated and steps without faulting whenever its borrow model (`active`, `reserved`, or non-`&mut`
      `frozen`) or global-allocation table grants the access (with `evalStmt_retag_disabled_ub`,
      `evalStmt_retag_ref_frozen_mut_ub`, `evalStmt_retag_raw_untracked_divergence`,
      `evalStmt_retag_raw_scalar_addr_reject`, and `evalStmt_retag_noRef_scalar_divergence`
@@ -7104,10 +7105,10 @@ theorem evalCopySingleDirect_whole_local_refines {ptrBits : Nat} {env : CopyEnv}
 /-- **Documented untyped `copy_nonoverlapping` into `bool`/`char` root-local divergence**: in
 Rust/MiniRust, `core::intrinsics::copy_nonoverlapping` is an untyped byte copy (so copying e.g.
 `2u8` into a `bool` local via raw pointers succeeds in `evalCopyNonOverlappingState` and only a
-subsequent typed load of the `bool` faults), whereas when `localDecls ≠ []` and `dl` is declared
-`bool` or `char` with `validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩) v = false`,
-Trusted's value-based `writePlaceValue` rejects the root write at `evalCopySingleDirect` with
-`.fail .ub`. -/
+subsequent typed load of the `bool` faults), whereas when `dl` is declared `bool` or `char` with
+`validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩) v = false` (which already forces
+`localDecls ≠ []`), Trusted's value-based `writePlaceValue` rejects the root write at
+`evalCopySingleDirect` with `.fail .ub`. -/
 theorem evalCopySingleDirect_whole_local_invalid_bool_char_divergence {ptrBits : Nat}
     {env : CopyEnv} {slots : List LocalSlotState} {locals₃ : List LocalSlot}
     {src dst : CopyPtr} {elemSize elemAlign sl dl : Nat} {v : Value}
@@ -7121,7 +7122,6 @@ theorem evalCopySingleDirect_whole_local_invalid_bool_char_divergence {ptrBits :
     (s : MachineState) (srcOp dstOp : Operand) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (srcPtr dstPtr : ProvenancePtr)
     (srcEntry dstEntry : BorrowEntry)
-    (hDeclsNe : localDecls ≠ [])
     (hTagNe : srcPtr.tag ≠ dstPtr.tag)
     (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = [])
     (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = [])
@@ -7155,7 +7155,7 @@ theorem evalCopySingleDirect_whole_local_invalid_bool_char_divergence {ptrBits :
   have hWriteUb :
       writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩ v localDecls layouts = .ub := by
     cases localDecls with
-    | nil => exact absurd rfl hDeclsNe
+    | nil => simp [placeTy, validateValueForTy?] at hInvalid
     | cons d ds =>
       unfold writePlaceValue
       dsimp only
@@ -7318,7 +7318,9 @@ theorem evalWrapUnsafeBinder_rejects_niche {wf : Value → Bool} {r : ScalarVali
 
 /-- **Operand evaluation refines Trusted on below-related frames**: every successful non-union
 Anneal operand evaluation (`copy`, `move`, or a constant) is matched by Trusted's `evalOperand`
-with the same value for arbitrary `localDecls`, and the frames stay related. -/
+with the same value for arbitrary `localDecls`, and the frames stay related. The default
+`localDecls := []` is not a restriction where Section 3 uses it: Trusted's `evalTerminator`
+evaluates the `switchInt` discriminant and the `assert` condition without local declarations. -/
 theorem evalOperandState_below_refines (slots slots' : List LocalSlotState)
     (locals : List LocalSlot) (op : Operand) (val : Value) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable) (callerLocals : List LocalSlot)
