@@ -829,16 +829,22 @@ impl LinkedCallees {
     }
 }
 
-/// Return `true` when `suffix` is a non-empty sequence of dot-separated
-/// identifier segments (letters, digits, and `_`), as produced for captured
+/// Return `true` when `suffix` is a sequence of at least two dot-separated
+/// ASCII identifier segments (`<Crate>.<item>`), as produced for captured
 /// `Mir.<Crate>.<item>` module names.
 fn is_lean_module_suffix(suffix: &str) -> bool {
-    !suffix.is_empty()
-        && suffix.split('.').all(|seg| {
-            !seg.is_empty()
-                && !seg.starts_with(|c: char| c.is_ascii_digit())
-                && seg.chars().all(|c| c.is_alphanumeric() || c == '_')
-        })
+    let mut segs = suffix.split('.');
+    let mut count = 0usize;
+    while let Some(seg) = segs.next() {
+        if seg.is_empty()
+            || seg.starts_with(|c: char| c.is_ascii_digit())
+            || !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 2
 }
 
 /// Header line of the `defaultCallees` definition in a scaffolded
@@ -1949,6 +1955,55 @@ mod tests {
              emptyMemory [Mir.MiriDiffCorpus.helper_add_ten.body]) =\n      \
              (MirDiffTag.externalCall \"miri_diff_corpus::helper_add_ten\")"
         ));
+
+        // Self-recursive + PassUnit + Panic + Ub + span-ratchet callee-linked shapes.
+        let self_and_helper = vec![
+            "MiriDiffCorpus.pass_direct_fn_call".to_string(),
+            "MiriDiffCorpus.helper_add_ten".to_string(),
+        ];
+        let pass_unit = entry("pass_direct_fn_call", MiriDiffVerdictSpec::PassUnit);
+        let (linked_unit, linked_unit_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            def_id,
+            &pass_unit,
+            &self_and_helper,
+        )
+        .expect("render PassUnit with self + helper callees");
+        assert!(linked_unit_cert);
+        assert_eq!(
+            linked_unit
+                .matches("import Mir.MiriDiffCorpus.pass_direct_fn_call\n")
+                .count(),
+            1,
+            "self-recursive callee must not duplicate the subject import:\n{linked_unit}"
+        );
+        assert!(linked_unit.contains("wpCoalBounded_of_evalMirDiffExecBounded_normalUnit 128"));
+
+        let panic_entry = entry("panic_with_callee", MiriDiffVerdictSpec::Panic);
+        let (linked_panic, linked_panic_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            "miri_diff_corpus::panic_with_callee",
+            &panic_entry,
+            &helpers,
+        )
+        .expect("render Panic with linked callees");
+        assert!(linked_panic_cert);
+        assert!(linked_panic.contains("Anneal.Rustc.V2026_06_01.Lower.verifyStatefulMirBounded _ 128"));
+        assert!(linked_panic.contains("wpMirBounded_of_reachesPanicBounded 128"));
+        assert!(linked_panic.contains("refuteTotalClaimByBoundedPanic _ 128 [] emptyMemory"));
+
+        let mut ub_entry = entry("ub_with_callee", MiriDiffVerdictSpec::Ub);
+        ub_entry.miri_ub_span = SourcePos::parse_rustc_pos("src/lib.rs:10:5");
+        let (linked_ub, linked_ub_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            "miri_diff_corpus::ub_with_callee",
+            &ub_entry,
+            &helpers,
+        )
+        .expect("render Ub with linked callees");
+        assert!(!linked_ub_cert);
+        assert!(linked_ub.contains("refuteStatefulClaimByStrictUB _ 128 [] emptyMemory"));
+        assert!(linked_ub.contains("refuteTotalClaimByStrictUB _ 128 [] emptyMemory"));
     }
 
     #[test]
@@ -1957,6 +2012,9 @@ mod tests {
         for bad in [
             vec!["MiriDiffCorpus.helper]".to_string()],
             vec!["".to_string()],
+            vec!["helper".to_string()],
+            vec!["MiriDiffCorpus.1helper".to_string()],
+            vec!["MiriDiffCorpus.helperα".to_string()],
             vec!["MiriDiffCorpus..helper".to_string()],
             vec![
                 "MiriDiffCorpus.helper_add_ten".to_string(),

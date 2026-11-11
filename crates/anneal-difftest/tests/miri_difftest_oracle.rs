@@ -648,8 +648,10 @@ fn panic_fmt_candidates_compare_agree_and_preserve_non_macro_panic_site_mismatch
     let root = repo_root();
 
     // `panic!("...")` and `assert!(cond, "...")` both call
-    // `core::fmt::Arguments::<'a>::from_str` and then `core::panicking::panic_fmt`
-    // from the `panic_2021` expansion in `library/core/src/panic.rs`.
+    // `core::fmt::Arguments::<'a>::from_str`, while `unreachable!("...")`
+    // inlines its nested `format_args!` and calls
+    // `core::fmt::Arguments::<'a>::from_str_nonconst`, before handing the
+    // result to `core::panicking::panic_fmt` in `library/core/src/panic.rs`.
     let panic_fn = "\
 pub fn panic_fmt_macro__b0_c0() {
     let x: u32 = 3u32;
@@ -665,6 +667,15 @@ pub fn assert_fmt_macro__b0_c1() -> u32 {
     x
 }
 ";
+    let unreachable_fn = "\
+pub fn unreachable_fmt_macro__b0_c2() -> u32 {
+    let x: u32 = 5u32;
+    if x == 5u32 {
+        unreachable!(\"unreachable! message via from_str_nonconst\");
+    }
+    x
+}
+";
     // A genuine non-macro panic-site mismatch: the overflowing `+` panics inside
     // a `#[track_caller]` helper. Miri reports the helper's call site in the
     // candidate; Anneal reports the overflow `assert` terminator inside the
@@ -677,7 +688,7 @@ pub fn track_caller_overflow_helper(x: u8) -> u8 {
     x + 250u8
 }
 
-pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
+pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
     let base: u8 = 10u8;
     track_caller_overflow_helper(base)
 }
@@ -699,8 +710,15 @@ pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
         ),
         handwritten_candidate(
             2,
+            "panic_explicit_macro",
+            "unreachable_fmt_macro__b0_c2",
+            "ArithmeticCastMutator",
+            unreachable_fn,
+        ),
+        handwritten_candidate(
+            3,
             "panic_checked_add_overflow",
-            "neg_ctrl_track_caller_overflow__b0_c2",
+            "neg_ctrl_track_caller_overflow__b0_c3",
             "ArithmeticCastMutator",
             track_caller_fn,
         ),
@@ -711,16 +729,16 @@ pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        3,
+        4,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 3);
-    assert_eq!(report.compiled_candidates, 3);
-    assert_eq!(report.compared_candidates, 3);
-    assert_eq!(report.agree_count, 2);
+    assert_eq!(report.total_candidates, 4);
+    assert_eq!(report.compiled_candidates, 4);
+    assert_eq!(report.compared_candidates, 4);
+    assert_eq!(report.agree_count, 3);
     assert_eq!(report.diverge_count, 1);
     assert_eq!(report.not_compared_count, 0);
     assert_eq!(report.kernel_confirmed_divergences, 1);
@@ -735,13 +753,17 @@ pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(3));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(3));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(4));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(4));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
     // `library/core/src/panic.rs` under Anneal. The strict comparator reports a
     // panic-site mismatch, and the difftest comparator reconciles it.
-    for name in ["panic_fmt_macro__b0_c0", "assert_fmt_macro__b0_c1"] {
+    for name in [
+        "panic_fmt_macro__b0_c0",
+        "assert_fmt_macro__b0_c1",
+        "unreachable_fmt_macro__b0_c2",
+    ] {
         let item = report
             .item_reports
             .iter()
@@ -788,7 +810,7 @@ pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
     let neg = report
         .item_reports
         .iter()
-        .find(|r| r.name == "neg_ctrl_track_caller_overflow__b0_c2")
+        .find(|r| r.name == "neg_ctrl_track_caller_overflow__b0_c3")
         .expect("missing item report for the track_caller candidate");
     assert!(
         matches!(
@@ -816,16 +838,16 @@ pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
 
     assert_eq!(report.findings.len(), 1);
     let f = &report.findings[0];
-    assert_eq!(f.fn_name, "neg_ctrl_track_caller_overflow__b0_c2");
+    assert_eq!(f.fn_name, "neg_ctrl_track_caller_overflow__b0_c3");
     assert_eq!(f.divergence_class, "panic_site_mismatch");
     assert!(f.kernel_confirmed);
     assert!(
         f.kernel_confirm_theorems
-            .contains("theorem confirm_tag_neg_ctrl_track_caller_overflow__b0_c2 :")
+            .contains("theorem confirm_tag_neg_ctrl_track_caller_overflow__b0_c3 :")
     );
     assert!(
         f.kernel_confirm_theorems
-            .contains("theorem confirm_probe_neg_ctrl_track_caller_overflow__b0_c2 :")
+            .contains("theorem confirm_probe_neg_ctrl_track_caller_overflow__b0_c3 :")
     );
     assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
     // The snippet is self-contained: `linkedCallees` names the synthetic

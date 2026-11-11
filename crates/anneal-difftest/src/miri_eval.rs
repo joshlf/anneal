@@ -69,16 +69,22 @@ pub const NOT_COMPARED_REASON_NAMES: [&str; 6] = [
 ];
 
 /// `DefPath` spellings of the `core::fmt::Arguments` constructors that
-/// `panic!("...")` and `assert!(cond, "...")` expansions call before handing
-/// the result to `core::panicking::panic_fmt`.
+/// `panic!`, `assert!`, `unreachable!`, `todo!`, and `unimplemented!`
+/// expansions call before handing the result to `core::panicking::panic_fmt`.
 ///
-/// The pinned toolchain emits `core::fmt::Arguments::<'a>::from_str`; the other
-/// spellings cover the anonymous-lifetime form and the older `new_const`
-/// constructor. Each one is linked into every oracle module as
-/// `fmtArgumentsCtorStub "<defPath>"` (see [`FMT_ARGUMENTS_CTOR_STUB_LEAN`]).
-pub const FMT_ARGUMENTS_CTOR_DEF_PATHS: [&str; 4] = [
+/// The pinned toolchain emits `core::fmt::Arguments::<'a>::from_str` for plain
+/// literal messages and `core::fmt::Arguments::<'a>::from_str_nonconst` when
+/// `format_args!` inlines constant or nested arguments (such as
+/// `unreachable!("...")`, `todo!("...")`, `unimplemented!("...")`, or
+/// `panic!("... {}", 42)`); the remaining spellings cover the anonymous-lifetime
+/// forms and the older `new_const` constructor. Each one is linked into every
+/// oracle module as `fmtArgumentsCtorStub "<defPath>"` (see
+/// [`FMT_ARGUMENTS_CTOR_STUB_LEAN`]).
+pub const FMT_ARGUMENTS_CTOR_DEF_PATHS: [&str; 6] = [
     "core::fmt::Arguments::<'a>::from_str",
     "core::fmt::Arguments::<'_>::from_str",
+    "core::fmt::Arguments::<'a>::from_str_nonconst",
+    "core::fmt::Arguments::<'_>::from_str_nonconst",
     "core::fmt::Arguments::<'a>::new_const",
     "core::fmt::Arguments::<'_>::new_const",
 ];
@@ -112,7 +118,7 @@ pub const FMT_ARGUMENTS_CTOR_STUB_LEAN: &str = "\
 open Trusted.Rustc.V2026_06_01.Layout in\n\
 def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
   { defPath := defPath\n    \
-    phase := MirPhaseTag.runtimeOptimized\n    \
+    phase := MirPhaseTag.runtimePostCleanup\n    \
     role := ContractRole.model\n    \
     argCount := 1\n    \
     localDecls :=\n      \
@@ -157,53 +163,88 @@ const STD_PANIC_MACRO_FILE_SUFFIXES: [&str; 4] = [
 
 /// Standard panic and assertion macros whose call site Miri reports for a panic
 /// raised inside their expansion.
-const STD_PANIC_MACRO_NAMES: [&str; 8] = [
+const STD_PANIC_MACRO_NAMES: [&str; 12] = [
     "panic",
     "assert",
     "assert_eq",
     "assert_ne",
+    "assert_matches",
     "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "debug_assert_matches",
     "unreachable",
     "todo",
     "unimplemented",
 ];
 
 /// Staged `src/lib.rs` text indexed by the line range of each top-level `fn`
-/// item, used by [`compare_difftest_miri_and_anneal`] to decide whether Miri's
-/// panic position is a panic-macro call site inside the evaluated function.
+/// item and the non-literal token start coordinates in the file, used by
+/// [`compare_difftest_miri_and_anneal`] to decide whether Miri's panic position
+/// is a panic-macro call site inside the evaluated function.
 #[derive(Debug, Clone, Default)]
 pub struct StagedLibSource {
     lines: Vec<String>,
     fn_lines: BTreeMap<String, (usize, usize)>,
+    token_starts: BTreeSet<(usize, usize)>,
+}
+
+fn collect_non_literal_token_starts(
+    stream: proc_macro2::TokenStream,
+    out: &mut BTreeSet<(usize, usize)>,
+) {
+    for tt in stream {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => {
+                let start = id.span().start();
+                out.insert((start.line, start.column + 1));
+            }
+            proc_macro2::TokenTree::Punct(p) => {
+                let start = p.span().start();
+                out.insert((start.line, start.column + 1));
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                collect_non_literal_token_starts(g.stream(), out);
+            }
+            proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
 }
 
 impl StagedLibSource {
     /// Index `lib_rs`, recording the 1-based inclusive line range from each
-    /// top-level `fn` keyword to its closing brace.
+    /// top-level `fn` keyword to its closing brace and the 1-based `(line, col)`
+    /// start positions of all non-literal tokens.
     ///
     /// A source that fails to parse indexes no functions, so no panic site in
     /// it is reconciled.
     pub fn parse(lib_rs: &str) -> Self {
+        let mut token_starts = BTreeSet::new();
         let fn_lines = match syn::parse_file(lib_rs) {
-            Ok(file) => file
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    syn::Item::Fn(func) => Some((
-                        func.sig.ident.to_string(),
-                        (
-                            func.sig.fn_token.span.start().line,
-                            func.block.brace_token.span.close().end().line,
-                        ),
-                    )),
-                    _ => None,
-                })
-                .collect(),
+            Ok(file) => {
+                if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
+                    collect_non_literal_token_starts(ts, &mut token_starts);
+                }
+                file.items
+                    .iter()
+                    .filter_map(|item| match item {
+                        syn::Item::Fn(func) => Some((
+                            func.sig.ident.to_string(),
+                            (
+                                func.sig.fn_token.span.start().line,
+                                func.block.brace_token.span.close().end().line,
+                            ),
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            }
             Err(_) => BTreeMap::new(),
         };
         Self {
             lines: lib_rs.lines().map(str::to_string).collect(),
             fn_lines,
+            token_starts,
         }
     }
 
@@ -214,8 +255,8 @@ impl StagedLibSource {
     }
 
     /// Return `true` when `pos` lies in the staged `src/lib.rs`, within the
-    /// line range of `fn_name`, at the start of an invocation of one of
-    /// [`STD_PANIC_MACRO_NAMES`].
+    /// line range of `fn_name`, at a real non-literal token starting an
+    /// invocation of one of [`STD_PANIC_MACRO_NAMES`].
     fn is_panic_macro_call_site(&self, fn_name: &str, pos: &SourcePos) -> bool {
         let file = pos.file.replace('\\', "/");
         if file.strip_prefix("./").unwrap_or(&file) != "src/lib.rs" {
@@ -225,7 +266,7 @@ impl StagedLibSource {
             return false;
         };
         let (line, col) = (pos.line as usize, pos.col as usize);
-        if line < first || line > last || col == 0 {
+        if line < first || line > last || col == 0 || !self.token_starts.contains(&(line, col)) {
             return false;
         }
         let Some(text) = self.lines.get(line - 1) else {
@@ -239,7 +280,8 @@ impl StagedLibSource {
 
 /// Return `true` when `text` begins with an invocation of one of
 /// [`STD_PANIC_MACRO_NAMES`], written bare (`assert!(...)`) or through
-/// `core::` / `std::` (optionally rooted with `::`).
+/// `core::` / `std::` (optionally rooted with `::`), followed by `!` and an
+/// opening macro delimiter (`(`, `[`, or `{`).
 fn starts_with_std_panic_macro_invocation(text: &str) -> bool {
     let mut rest = text;
     let rooted = rest.starts_with("::");
@@ -261,7 +303,16 @@ fn starts_with_std_panic_macro_invocation(text: &str) -> bool {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
     let (name, after_name) = rest.split_at(name_len);
-    STD_PANIC_MACRO_NAMES.contains(&name) && after_name.trim_start().starts_with('!')
+    if !STD_PANIC_MACRO_NAMES.contains(&name) {
+        return false;
+    }
+    let Some(after_bang) = after_name.trim_start().strip_prefix('!') else {
+        return false;
+    };
+    matches!(
+        after_bang.trim_start().chars().next(),
+        Some('(' | '[' | '{')
+    )
 }
 
 /// Return `true` when `file` ends with one of
@@ -2230,10 +2281,13 @@ mod tests {
              [Mir.MiriDiffCorpus.helper_add_ten.body,\n   \
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'a>::from_str\",\n   \
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::from_str\",\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'a>::from_str_nonconst\",\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::from_str_nonconst\",\n   \
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'a>::new_const\",\n   \
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::new_const\"]\n"
         ));
         assert!(probe_src.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN));
+        assert!(probe_src.contains("phase := MirPhaseTag.runtimePostCleanup"));
         assert!(probe_src.contains(
             "initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees"
         ));
@@ -2429,6 +2483,52 @@ pub fn cand_plain__b0_c2() -> u32 {
             compare_difftest_miri_and_anneal(&panic_at(3, 5), &ub, &src, "cand_panic__b0_c0"),
             ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
         ));
+
+        // A line inside a multi-line string literal or block comment that
+        // contains `panic!("...")` text does not start at a non-literal token,
+        // so it must never reconcile.
+        let spoofed_src = StagedLibSource::parse(
+            "\
+#![no_std]
+pub fn cand_spoof__b0_c0() -> u32 {
+    let _s: &str = \"
+    panic!(\\\"in_string\\\");
+\";
+    /*
+    panic!(\"in_comment\");
+    */
+    let panic: u32 = 1u32;
+    if panic != 0u32 { 2u32 } else { 3u32 }
+}
+",
+        );
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &panic_at(4, 5),
+                &anneal_panic_in(std_panic, 62),
+                &spoofed_src,
+                "cand_spoof__b0_c0"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &panic_at(7, 5),
+                &anneal_panic_in(std_panic, 62),
+                &spoofed_src,
+                "cand_spoof__b0_c0"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &panic_at(10, 8),
+                &anneal_panic_in(std_panic, 62),
+                &spoofed_src,
+                "cand_spoof__b0_c0"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
     }
 
     #[test]
@@ -2438,13 +2538,19 @@ pub fn cand_plain__b0_c2() -> u32 {
             "assert!(a == b, \"m\");",
             "assert_eq!(a, b);",
             "assert_ne!(a, b);",
+            "assert_matches!(a, 1);",
             "debug_assert!(a);",
+            "debug_assert_eq!(a, b);",
+            "debug_assert_ne!(a, b);",
+            "debug_assert_matches!(a, 1);",
             "unreachable!()",
             "todo!()",
             "unimplemented!()",
             "core::panic!(\"x\")",
             "::std::assert!(a)",
             "panic ! (\"x\")",
+            "panic![\"x\"]",
+            "panic!{\"x\"}",
         ] {
             assert!(starts_with_std_panic_macro_invocation(text), "{text}");
         }
@@ -2454,6 +2560,10 @@ pub fn cand_plain__b0_c2() -> u32 {
             "::panic!(\"x\")",
             "foo::panic!(\"x\")",
             "panic(\"x\")",
+            "panic != 0",
+            "assert != true",
+            "panic!",
+            "panic! = 1",
             "a[i] + 1u32",
             "",
         ] {
