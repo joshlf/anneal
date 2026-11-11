@@ -642,7 +642,13 @@ fn test_terminator_drop_and_call_destination_with_deref_subplaces() {
 #[test]
 fn test_copy_nonoverlapping_subplaces_partial_shells_and_array_windows() {
     let pair_ty = Ty::Tuple(vec![u32_ty(), u32_ty()]);
-    let outer_ty = Ty::Tuple(vec![u32_ty(), pair_ty.clone()]);
+    // `#[repr(C)] struct Outer { x: u32, pair: (u32, u32) }` (`pair` at offset 4). A repr(Rust)
+    // `(u32, (u32, u32))` would not do: `rustc` lays it out pair-first, so its declaration-order
+    // field offsets are unspecified.
+    let outer_def = Arc::new(
+        AdtDef::new_struct("Outer", vec![u32_ty(), pair_ty.clone()]).with_repr(repr_c()),
+    );
+    let outer_ty = Ty::Adt(outer_def.clone());
     let arr4_ty = Ty::Array(Box::new(u32_ty()), 4);
     let raw_u32_const = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
     let raw_u32_mut = Ty::RawPtr(Box::new(u32_ty()), Mutability::Mut);
@@ -650,8 +656,8 @@ fn test_copy_nonoverlapping_subplaces_partial_shells_and_array_windows() {
     let raw_pair_mut = Ty::RawPtr(Box::new(pair_ty.clone()), Mutability::Mut);
 
     let decls = vec![
-        outer_ty.clone(),       // _0: (u32, (u32, u32))
-        outer_ty.clone(),       // _1: (u32, (u32, u32))
+        outer_ty.clone(),       // _0: Outer
+        outer_ty.clone(),       // _1: Outer
         arr4_ty.clone(),        // _2: [u32; 4]
         arr4_ty.clone(),        // _3: [u32; 4]
         u32_ty(),               // _4: u32
@@ -671,10 +677,11 @@ fn test_copy_nonoverlapping_subplaces_partial_shells_and_array_windows() {
             u32v(11),
         )
         .unwrap();
-    state.slots[1] = LocalSlotState::Init(MirValue::Tuple(vec![
-        u32v(1),
-        MirValue::Tuple(vec![u32v(2), u32v(3)]),
-    ]));
+    state.slots[1] = LocalSlotState::Init(MirValue::adt(
+        &outer_def,
+        0,
+        vec![u32v(1), MirValue::Tuple(vec![u32v(2), u32v(3)])],
+    ));
     run(
         assign(
             local(7),
@@ -742,10 +749,11 @@ fn test_copy_nonoverlapping_subplaces_partial_shells_and_array_windows() {
     .unwrap();
     assert_eq!(
         state.get_init(Local(1)),
-        Some(&MirValue::Tuple(vec![
-            u32v(1),
-            MirValue::Tuple(vec![u32v(11), u32v(22)]),
-        ]))
+        Some(&MirValue::adt(
+            &outer_def,
+            0,
+            vec![u32v(1), MirValue::Tuple(vec![u32v(11), u32v(22)])],
+        ))
     );
 
     // 3. Contiguous array-window copies (`count >= 1`):
@@ -993,8 +1001,10 @@ fn test_adversarial_deref_errors_and_zst_disambiguation() {
     );
 
     // Stateless `eval_place_read`, `eval_place_write`, and `eval_lowered_rvalue` with `Deref`.
+    // (`(u32, u16, u16)` is canonical, so `_0.1` sits at its declaration offset 4; a padded
+    // `(u32, u16)` has no committed repr(Rust) field offsets.)
     let mut locals = vec![
-        MirValue::Tuple(vec![u32v(100), u16v(200)]),
+        MirValue::Tuple(vec![u32v(100), u16v(200), u16v(0)]),
         MirValue::ptr(
             PointerValue::with_provenance(0x1004, 1, 1),
             Ty::Ref(Box::new(u16_ty()), Mutability::Mut),
@@ -1005,12 +1015,15 @@ fn test_adversarial_deref_errors_and_zst_disambiguation() {
     eval_place_write(&deref1, u16v(300), &mut locals, PW).unwrap();
     assert_eq!(
         locals[0],
-        MirValue::Tuple(vec![u32v(100), u16v(300)])
+        MirValue::Tuple(vec![u32v(100), u16v(300), u16v(0)])
     );
     let mut tracker = ExposedProvenanceTracker::new();
     let rval = lower_rvalue(
         &Rvalue::Use(Operand::Copy(deref1)),
-        &[Ty::Tuple(vec![u32_ty(), u16_ty()]), Ty::Ref(Box::new(u16_ty()), Mutability::Mut)],
+        &[
+            Ty::Tuple(vec![u32_ty(), u16_ty(), u16_ty()]),
+            Ty::Ref(Box::new(u16_ty()), Mutability::Mut),
+        ],
         PW,
     )
     .unwrap();

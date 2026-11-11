@@ -1104,9 +1104,14 @@ impl Ty {
     }
 }
 
-/// Byte offset of field `idx` in a `#[repr(Rust)]` field list: the declaration-order prefix
-/// sum when the fields' tuple has a canonical byte layout, otherwise unspecified.
-fn rust_field_offset(fields: &[Ty], idx: usize, ptr_width: PtrWidth) -> Result<usize, LayoutError> {
+/// Byte offset of field `idx` in a `#[repr(Rust)]` field list (a repr(Rust) struct, or a
+/// tuple): the declaration-order prefix sum when the fields' tuple has a canonical byte layout,
+/// otherwise unspecified.
+pub(crate) fn rust_field_offset(
+    fields: &[Ty],
+    idx: usize,
+    ptr_width: PtrWidth,
+) -> Result<usize, LayoutError> {
     if !Ty::Tuple(fields.to_vec()).has_canonical_byte_layout(ptr_width) {
         return Err(LayoutError::Unspecified);
     }

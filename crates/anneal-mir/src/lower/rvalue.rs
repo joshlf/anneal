@@ -1715,9 +1715,13 @@ pub enum RvalueEvalError {
         addr: u64,
         byte_offset: i128,
     },
-    /// Place that cannot be evaluated without a byte-level memory model: a `Deref` read or
-    /// write (other than the `&(*p)` / `&raw (*p)` reborrows), the address of a projected
-    /// place, or a nested write into an inactive union field.
+    /// Place that cannot be evaluated without a byte-level memory model: a `Deref` of a pointer
+    /// that does not resolve to a unique, runtime-consistent synthetic sub-place of a local
+    /// (no synthetic provenance, an offset outside the local's allocation or inside padding or
+    /// a scalar, a pointee type matching no sub-place there, an ambiguous non-zero-sized
+    /// sub-place, or bytes of an inactive union field / enum variant), the address of a
+    /// projected place whose layout offset is unspecified, or a nested write into an inactive
+    /// union field.
     UnsupportedPlaceProjection(Place),
     /// Ill-formed `Constant` (wrong type, out-of-range bits, or null `&T`).
     InvalidConstant(&'static str),
@@ -5312,7 +5316,7 @@ pub fn eval_lowered_rvalue(
                     let addr = if locals.is_empty() {
                         ((place.local.0 as u128 + 1) * 0x1000) & ptr_width.mask()
                     } else {
-                        local_base_addr_for_values(place.local.0, locals, ptr_width)
+                        local_base_addr_for_values(place.local.0, locals, ptr_width)?
                     };
                     PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1)
                 }
@@ -6055,8 +6059,10 @@ impl StatementEvalState {
         )
     }
 
-    /// Synthetic allocation base address of `local` in this frame.
-    pub(crate) fn local_base_addr(&self, local: usize) -> u128 {
+    /// Synthetic allocation base address of `local` in this frame (see
+    /// [`local_base_addr_for_decls`]: `UnsupportedMemoryAccess` when the local's synthetic
+    /// allocation does not fit the target address space).
+    pub(crate) fn local_base_addr(&self, local: usize) -> Result<u128, RvalueEvalError> {
         local_base_addr_for_decls(local, &self.local_decls, self.ptr_width)
     }
 
@@ -6132,7 +6138,7 @@ impl StatementEvalState {
         if matches!(self.slots[target_local], LocalSlotState::Dead) {
             return Err(RvalueEvalError::DeadLocal(Local(target_local)));
         }
-        let base_addr = self.local_base_addr(target_local);
+        let base_addr = self.local_base_addr(target_local)?;
         let target_decl_ty = &self.local_decls[target_local];
         let (target_alloc_size, _) = target_decl_ty
             .alloc_size_and_align(self.ptr_width)
@@ -6162,38 +6168,83 @@ impl StatementEvalState {
         if rel_off == 0 && target_decl_ty == pointee_ty {
             return Ok((Local(target_local), Vec::new()));
         }
-        let matches = collect_subplace_paths(target_decl_ty, rel_off, pointee_ty, self.ptr_width);
-        if matches.is_empty() {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                full_place.clone(),
-            ));
-        }
-        if matches.len() == 1 {
-            return Ok((Local(target_local), matches.into_iter().next().unwrap()));
-        }
-        if let Some(ordinal) = prov.tag.checked_sub(2).and_then(|t| usize::try_from(t).ok())
-            && let Some(path) = matches.get(ordinal)
+        let candidates =
+            collect_subplace_paths(target_decl_ty, rel_off, pointee_ty, self.ptr_width);
+        match self.select_subplace_candidate(target_local, pointee_ty, candidates, prov.tag, full_place)
         {
-            return Ok((Local(target_local), path.clone()));
+            Some(path) => Ok((Local(target_local), path)),
+            None => Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            )),
         }
+    }
+
+    /// Selects, without guessing, the sub-place of `target_local` that a pointer with provenance
+    /// tag `tag` and pointee type `pointee_ty` designates among the same-offset, same-type
+    /// `candidates` produced by [`collect_subplace_paths`]:
+    /// 1. candidates inconsistent with the runtime state of the local (an inactive enum variant
+    ///    or union field along the path) are discarded: a byte memory holds the active ones, so
+    ///    reaching an inactive one would pun the bytes of another variant or union field
+    ///    (unsupported without a byte-level memory model, never a guessed sub-place);
+    /// 2. a unique remaining candidate is the designated sub-place;
+    /// 3. among several, the one whose ordinal the borrow encoded in `tag` for the same pointee
+    ///    type is selected ([`decode_subplace_tag`]; a tag that survived a pointer cast to
+    ///    another pointee type carries no usable ordinal);
+    /// 4. otherwise a zero-sized `pointee_ty` (all of whose values are equal) selects the first
+    ///    initialized remaining candidate (or the first one), and any other ambiguity (e.g.
+    ///    same-typed fields of two variants of an uninitialized enum) is `None`.
+    ///
+    /// `None` is reported as unsupported by the caller.
+    fn select_subplace_candidate(
+        &self,
+        target_local: usize,
+        pointee_ty: &Ty,
+        mut candidates: Vec<Vec<ProjectionElem>>,
+        tag: u64,
+        full_place: &Place,
+    ) -> Option<Vec<ProjectionElem>> {
+        let slot = &self.slots[target_local];
+        let decl_ty = &self.local_decls[target_local];
         let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
             Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
         };
-        for candidate in &matches {
-            if check_slot_projection(
-                &self.slots[target_local],
-                target_decl_ty,
-                candidate,
-                &no_index,
-                full_place,
-            )
-            .is_ok()
-                && slot_union_path_active(&self.slots[target_local], target_decl_ty, candidate)
-            {
-                return Ok((Local(target_local), candidate.clone()));
+        let consistent: Vec<usize> = (0..candidates.len())
+            .filter(|&i| {
+                check_slot_projection(slot, decl_ty, &candidates[i], &no_index, full_place).is_ok()
+                    && slot_union_path_active(slot, &candidates[i])
+            })
+            .collect();
+        let chosen = match consistent.as_slice() {
+            [] => return None,
+            [only] => *only,
+            [first, ..] => {
+                if let Some(ordinal) = decode_subplace_tag(tag, pointee_ty)
+                    && consistent.contains(&ordinal)
+                {
+                    ordinal
+                } else if pointee_ty
+                    .layout_for(self.ptr_width)
+                    .is_ok_and(|layout| layout.size == 0)
+                {
+                    consistent
+                        .iter()
+                        .copied()
+                        .find(|&i| {
+                            self.read_resolved_place(
+                                Local(target_local),
+                                &candidates[i],
+                                &[],
+                                full_place,
+                            )
+                            .is_ok()
+                        })
+                        .unwrap_or(*first)
+                } else {
+                    return None;
+                }
             }
-        }
-        Ok((Local(target_local), matches.into_iter().next().unwrap()))
+        };
+        Some(candidates.swap_remove(chosen))
     }
 
     /// Reads the value at the `Deref`-free `(target_local, target_proj)` from `self.slots`.
@@ -6543,6 +6594,27 @@ impl StatementEvalState {
     }
 
     /// Evaluates `Statement::Deinit(place)` (of declared type `place_ty`).
+    ///
+    /// Requires a live root local (`DeadLocal`), resolves every `Deref` step to its synthetic
+    /// target sub-place (which must be live as well, see [`Self::resolve_synthetic_subplace`])
+    /// while reading the `Index` operands in place-evaluation order, then, on the resolved
+    /// `(target_local, target_proj)`:
+    /// - a bare (or wholly dereferenced) local becomes `LocalSlotState::Uninit`; `Deinit(*p)`
+    ///   never deinitializes the pointer local `p` itself;
+    /// - a projected place through tuple/struct fields and `Downcast` variant fields demotes the
+    ///   containing values to `PartialShell`s whose target slot is `FieldSlot::Uninit`, keeping
+    ///   every disjoint sibling (and the enum tag when it is stored apart from the fields, see
+    ///   [`AdtDef::tag_survives_field_deinit`]) initialized; writing the place again re-promotes
+    ///   the shells to `Init`;
+    /// - a place inside an already uninitialized part is a no-op (after the static and dynamic
+    ///   bounds checks);
+    /// - a `Downcast` to an inactive variant of an initialized enum is
+    ///   `InactiveVariantProjection` (as for assignments); a place inside an initialized array
+    ///   element or union field is `UnsupportedPlaceProjection` (arrays and unions have no
+    ///   per-element shells).
+    ///
+    /// Deinitializing a zero-sized part still marks it uninitialized (Anneal tracks
+    /// initialization per field, like `rustc`'s move paths, rather than per byte).
     pub fn deinit_place(&mut self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
         let (target_local, target_proj, index_cache) = self.prepare_place_access(place, place_ty)?;
         if target_proj.is_empty() {
@@ -6565,6 +6637,18 @@ impl StatementEvalState {
     }
 
     /// Evaluates `Statement::Retag(kind, place)` (of declared type `place_ty`).
+    ///
+    /// Requires a live root local, resolves every `Deref` step to its (live) synthetic target
+    /// sub-place, and reads the `Index` operands. `RetagKind::Raw(m)` reads the raw pointer at
+    /// `place` (it must be initialized and its address must fit the target's pointer width; it
+    /// may be null, unaligned, or dangling).
+    /// The other kinds validate every reference reachable in `place`'s value without
+    /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, within the
+    /// target's pointer width, aligned to its pointee's alignment, point to an inhabited type,
+    /// and must not point into the synthetic allocation of a storage-dead local (at its base
+    /// address or at any sub-place offset, e.g. `&_s.1`) unless its pointee is zero-sized
+    /// (`DeadLocal`: the reference dangles). A place whose type holds no references only needs
+    /// to be live. Anneal does not model aliasing tags, so the value is unchanged.
     pub fn retag_place(
         &self,
         kind: RetagKind,
@@ -8618,43 +8702,65 @@ fn retag_shell(
 ///
 /// Preserves `(local + 1) * 0x1000` whenever every preceding local has allocation size
 /// `<= 0x1000` and alignment `<= 0x1000`, and advances past larger locals by rounding each
-/// local's allocation size up to a multiple of `0x1000` (and aligning to `align.max(0x1000)`).
+/// local's allocation size up to a multiple of `0x1000` (and aligning to `align.max(0x1000)`),
+/// so the synthetic allocations of distinct locals never overlap.
+///
+/// The allocation `[base, base + size)` of `local` (`size` the upper-bound layout size of its
+/// declared type) must fit the target address space (`base + size <= usize::MAX`, as for
+/// [`RvalueEvalError::PointerRangeOverflow`]); otherwise the frame's locals cannot all be
+/// allocated without wrapping around (and aliasing other locals' addresses), and the result is
+/// `UnsupportedMemoryAccess` rather than a masked, colliding address.
 pub(crate) fn local_base_addr_for_decls(
     local: usize,
     local_decls: &[Ty],
     ptr_width: PtrWidth,
-) -> u128 {
-    let mut cur = 0x1000u128;
-    let limit = local.min(local_decls.len());
-    for decl_ty in &local_decls[..limit] {
+) -> Result<u128, RvalueEvalError> {
+    const PAGE: u128 = 0x1000;
+    let too_large = RvalueEvalError::UnsupportedMemoryAccess(
+        "synthetic stack allocation does not fit the target address space",
+    );
+    let limit = ptr_width.max_usize();
+    let mut cur = PAGE;
+    let preceding = local.min(local_decls.len());
+    for decl_ty in &local_decls[..preceding] {
         let stride = match decl_ty.alloc_size_and_align(ptr_width) {
             Ok((size, align)) => {
-                let a = (align as u128).max(0x1000);
+                let a = (align as u128).max(PAGE);
                 cur = cur.div_ceil(a) * a;
-                (size as u128).max(1).div_ceil(0x1000) * 0x1000
+                (size as u128).max(1).div_ceil(PAGE) * PAGE
             }
-            Err(_) => 0x1000,
+            Err(_) => PAGE,
         };
-        cur = cur.saturating_add(stride);
+        cur += stride;
+        if cur > limit {
+            return Err(too_large);
+        }
     }
-    if let Some(decl_ty) = local_decls.get(local)
-        && let Ok((_, align)) = decl_ty.alloc_size_and_align(ptr_width)
-        && align > 0x1000
+    let own_layout = local_decls
+        .get(local)
+        .and_then(|decl_ty| decl_ty.alloc_size_and_align(ptr_width).ok());
+    if let Some((_, align)) = own_layout
+        && align as u128 > PAGE
     {
         let a = align as u128;
         cur = cur.div_ceil(a) * a;
     }
-    if local > limit {
-        cur = cur.saturating_add((local - limit) as u128 * 0x1000);
+    if local > preceding {
+        cur += (local - preceding) as u128 * PAGE;
     }
-    cur & ptr_width.mask()
+    let own_size = own_layout.map_or(0, |(size, _)| size as u128);
+    if cur.checked_add(own_size).is_none_or(|end| end > limit) {
+        return Err(too_large);
+    }
+    Ok(cur)
 }
 
+/// [`local_base_addr_for_decls`] for a frame whose locals are typed by their runtime values.
 fn local_base_addr_for_values(
     local: usize,
     locals: &[MirValue],
     ptr_width: PtrWidth,
-) -> u128 {
+) -> Result<u128, RvalueEvalError> {
     let decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
     local_base_addr_for_decls(local, &decls, ptr_width)
 }
@@ -8666,23 +8772,73 @@ fn resolve_synthetic_alloc_local(ptr: &PointerValue, local_count: usize) -> Opti
     (local < local_count).then_some(local)
 }
 
-/// Returns true if every field of `fields` has an exact layout under `ptr_width` and its
-/// declaration-order prefix-sum offset is aligned to the field's ABI alignment.
-fn tuple_has_aligned_decl_offsets(fields: &[Ty], ptr_width: PtrWidth) -> bool {
-    let mut off = 0usize;
-    for f in fields {
-        let Ok(layout) = f.layout_for(ptr_width) else {
-            return false;
-        };
-        if !off.is_multiple_of(layout.align) {
-            return false;
+/// Byte offset of field `idx` of variant `variant` of the tuple or ADT `container_ty` for
+/// synthetic sub-place addressing, or `None` when the layout model does not determine it.
+///
+/// ADT fields use [`AdtDef::field_offset`], and tuple fields the `#[repr(Rust)]` rule shared
+/// with repr(Rust) structs (declaration-order offsets only for canonical field tuples, see
+/// [`Ty::has_canonical_byte_layout`]): e.g. `rustc` lays out `(u32, (u32, u32))` pair-first, so
+/// its declaration-order offsets must not be committed to. In addition, a zero-sized field at a
+/// non-zero declaration offset of a field list `rustc` may reorder (tuples, `#[repr(Rust)]` and
+/// `#[repr(transparent)]` structs, and enums laid out without a tag) is unspecified: `rustc`
+/// sorts 1-ZST fields first (offset `0`), so e.g. the `()` of `(u32, ())` is not at offset `4`.
+fn subplace_field_offset(
+    container_ty: &Ty,
+    variant: usize,
+    idx: usize,
+    ptr_width: PtrWidth,
+) -> Option<usize> {
+    let (off, field_ty, reorderable) = match container_ty {
+        Ty::Tuple(fields) => (
+            crate::ir::rust_field_offset(fields, idx, ptr_width).ok()?,
+            fields.get(idx)?,
+            true,
+        ),
+        Ty::Adt(def) => {
+            let off = def.field_offset(variant, idx, ptr_width).ok()?;
+            let field_ty = def.variant_fields(variant)?.get(idx)?;
+            let reorderable = def.repr.kind != crate::ir::AdtReprKind::C
+                && matches!(
+                    def.kind,
+                    crate::ir::AdtKind::Struct { .. } | crate::ir::AdtKind::Enum { tag_ty: None, .. }
+                );
+            (off, field_ty, reorderable)
         }
-        let Some(next) = off.checked_add(layout.size) else {
-            return false;
-        };
-        off = next;
+        _ => return None,
+    };
+    if reorderable && off != 0 && field_ty.layout_for(ptr_width).ok()?.size == 0 {
+        return None;
     }
-    true
+    Some(off)
+}
+
+/// Deterministic (per-process) 32-bit fingerprint of `ty`, binding a sub-place provenance tag
+/// ordinal to the pointee type it was computed for (see [`encode_subplace_tag`]).
+fn subplace_type_fingerprint(ty: &Ty) -> u32 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    ty.hash(&mut hasher);
+    let h = hasher.finish();
+    (h ^ (h >> 32)) as u32
+}
+
+/// Provenance tag of a sub-place that is the `ordinal`-th of several same-offset candidates of
+/// type `ty` ([`collect_subplace_paths`]): `(fingerprint(ty) << 32) | (ordinal + 2)`. Tag `1`
+/// (or any tag whose low half is `< 2`) carries no ordinal.
+fn encode_subplace_tag(ty: &Ty, ordinal: usize) -> u64 {
+    match u32::try_from(ordinal).ok().and_then(|o| o.checked_add(2)) {
+        Some(low) => (u64::from(subplace_type_fingerprint(ty)) << 32) | u64::from(low),
+        None => 1,
+    }
+}
+
+/// The candidate ordinal carried by provenance tag `tag` for pointee type `ty`, if `tag` was
+/// computed by [`encode_subplace_tag`] for the same type (a tag that survived a pointer cast to
+/// another pointee type, or a type-punning transmute, carries no usable ordinal).
+fn decode_subplace_tag(tag: u64, ty: &Ty) -> Option<usize> {
+    let low = (tag & 0xFFFF_FFFF) as u32;
+    let ordinal = low.checked_sub(2)?;
+    ((tag >> 32) as u32 == subplace_type_fingerprint(ty)).then_some(ordinal as usize)
 }
 
 /// Collects all canonical projection paths inside `root_ty` whose sub-place has byte offset
@@ -8729,33 +8885,23 @@ fn collect_subplace_paths_rec(
     }
     match cur_ty {
         Ty::Tuple(fields) => {
-            if !tuple_has_aligned_decl_offsets(fields, ptr_width) {
-                return;
-            }
-            let mut field_off = cur_off;
             for (idx, field_ty) in fields.iter().enumerate() {
-                let Ok(layout) = field_ty.layout_for(ptr_width) else {
-                    return;
+                let Some(field_off) = subplace_field_offset(cur_ty, 0, idx, ptr_width)
+                    .and_then(|off| cur_off.checked_add(off))
+                else {
+                    continue;
                 };
-                if target_off >= field_off
-                    && target_off <= field_off.saturating_add(layout.size)
-                {
-                    cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
-                    collect_subplace_paths_rec(
-                        field_ty,
-                        field_off,
-                        target_off,
-                        target_ty,
-                        ptr_width,
-                        cur_path,
-                        out,
-                    );
-                    cur_path.pop();
-                }
-                let Some(next_off) = field_off.checked_add(layout.size) else {
-                    return;
-                };
-                field_off = next_off;
+                cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
+                collect_subplace_paths_rec(
+                    field_ty,
+                    field_off,
+                    target_off,
+                    target_ty,
+                    ptr_width,
+                    cur_path,
+                    out,
+                );
+                cur_path.pop();
             }
         }
         Ty::Array(elem_ty, len) => {
@@ -8855,10 +9001,9 @@ fn collect_subplace_paths_rec(
                         continue;
                     };
                     for (idx, field_ty) in fields.iter().enumerate() {
-                        let Ok(off) = def.field_offset(v, idx, ptr_width) else {
-                            continue;
-                        };
-                        let Some(field_off) = cur_off.checked_add(off) else {
+                        let Some(field_off) = subplace_field_offset(cur_ty, v, idx, ptr_width)
+                            .and_then(|off| cur_off.checked_add(off))
+                        else {
                             continue;
                         };
                         cur_path.push(ProjectionElem::Downcast(v));
@@ -8878,10 +9023,9 @@ fn collect_subplace_paths_rec(
                 }
             } else if let Some(fields) = def.variant_fields(0) {
                 for (idx, field_ty) in fields.iter().enumerate() {
-                    let Ok(off) = def.field_offset(0, idx, ptr_width) else {
-                        continue;
-                    };
-                    let Some(field_off) = cur_off.checked_add(off) else {
+                    let Some(field_off) = subplace_field_offset(cur_ty, 0, idx, ptr_width)
+                        .and_then(|off| cur_off.checked_add(off))
+                    else {
                         continue;
                     };
                     cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
@@ -8952,9 +9096,9 @@ fn compute_subplace_offset_and_tag(
                                 field_count: variant_fields.len(),
                             });
                         };
-                        let off = def.field_offset(v, *idx, ptr_width).map_err(|_| {
-                            RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
-                        })?;
+                        let off = subplace_field_offset(&cur_ty, v, *idx, ptr_width).ok_or_else(
+                            || RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()),
+                        )?;
                         total_off = total_off.checked_add(off).ok_or_else(|| {
                             RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
                         })?;
@@ -8973,22 +9117,12 @@ fn compute_subplace_offset_and_tag(
                                 field_count: fields.len(),
                             });
                         };
-                        if !tuple_has_aligned_decl_offsets(fields, ptr_width) {
-                            return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                                full_place.clone(),
-                            ));
-                        }
-                        for f in &fields[..*idx] {
-                            let f_size = f
-                                .layout_for(ptr_width)
-                                .map_err(|_| {
-                                    RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
-                                })?
-                                .size;
-                            total_off = total_off.checked_add(f_size).ok_or_else(|| {
-                                RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
-                            })?;
-                        }
+                        let off = subplace_field_offset(&cur_ty, 0, *idx, ptr_width).ok_or_else(
+                            || RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()),
+                        )?;
+                        total_off = total_off.checked_add(off).ok_or_else(|| {
+                            RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
+                        })?;
                         canonical_proj.push(ProjectionElem::Field(*idx, field_ty.clone()));
                         cur_ty = field_ty;
                     }
@@ -9175,24 +9309,37 @@ fn compute_subplace_offset_and_tag(
     let tag = if matches.len() <= 1 {
         1
     } else if let Some(ordinal) = matches.iter().position(|p| *p == canonical_proj) {
-        (ordinal as u64) + 2
+        encode_subplace_tag(&cur_ty, ordinal)
     } else {
         1
     };
     Ok((total_off, tag))
 }
 
-/// Returns whether every union `Field` step in `proj` selects the active union field in `slot`
-/// (true when `slot` is `Uninit` or contains no union steps).
-fn slot_union_path_active(
-    slot: &LocalSlotState,
-    _declared_ty: &Ty,
-    proj: &[ProjectionElem],
-) -> bool {
-    let LocalSlotState::Init(val) = slot else {
+/// Returns whether every union `Field` step in `proj` selects the active union field of the
+/// initialized values reached in `slot` (also through partially initialized shells); steps
+/// into uninitialized parts are unconstrained.
+fn slot_union_path_active(slot: &LocalSlotState, proj: &[ProjectionElem]) -> bool {
+    match slot {
+        LocalSlotState::Init(val) => value_union_path_active(val, proj),
+        LocalSlotState::PartialShell(shell) => shell_union_path_active(shell, proj),
+        LocalSlotState::Uninit | LocalSlotState::Dead => true,
+    }
+}
+
+fn shell_union_path_active(shell: &PartialAggregate, proj: &[ProjectionElem]) -> bool {
+    let Some((first, rest)) = proj.split_first() else {
         return true;
     };
-    value_union_path_active(val, proj)
+    match first {
+        ProjectionElem::Downcast(_) => shell_union_path_active(shell, rest),
+        ProjectionElem::Field(idx, _) => match shell.fields.get(*idx) {
+            Some(FieldSlot::Init(val)) => value_union_path_active(val, rest),
+            Some(FieldSlot::Partial(child)) => shell_union_path_active(child, rest),
+            Some(FieldSlot::Uninit) | None => true,
+        },
+        _ => true,
+    }
 }
 
 fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem]) -> bool {
@@ -10161,7 +10308,7 @@ pub fn eval_lowered_rvalue_in_state(
                             | LocalSlotState::Init(_),
                         ) => {}
                     }
-                    let addr = state.local_base_addr(place.local.0);
+                    let addr = state.local_base_addr(place.local.0)?;
                     PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1)
                 }
                 [ProjectionElem::Deref] => match state.read_place(&Place::from_local(place.local.0))? {
@@ -10253,21 +10400,11 @@ pub fn eval_lowered_rvalue_in_state(
                                 provenance: base_ptr.provenance,
                             }
                         } else {
-                            let mut index_cache = Vec::new();
-                            for elem in tail {
-                                if let ProjectionElem::Index(idx_local) = elem {
-                                    index_cache
-                                        .push((*idx_local, state.read_index_local(*idx_local)?));
-                                }
-                            }
-                            let (target_local, mut combined_proj) = state
-                                .resolve_synthetic_subplace(
-                                    &base_ptr,
-                                    &base_ptr_ty,
-                                    deref_ty,
-                                    place,
-                                )?;
-                            combined_proj.extend_from_slice(tail);
+                            // `&((*p).tail)` / `&raw ((*p).tail)`: resolve every `Deref` (and read
+                            // the `Index` operands) in place-evaluation order, then address the
+                            // tail inside the dereferenced synthetic allocation.
+                            let (target_local, combined_proj, index_cache) =
+                                state.resolve_deref_place(place)?;
                             let base_decl_ty = &state.local_decls[target_local.0];
                             let read_index =
                                 |idx_local: Local| cached_index(&index_cache, idx_local);
@@ -10293,8 +10430,8 @@ pub fn eval_lowered_rvalue_in_state(
                                 state.ptr_width,
                                 place,
                             )?;
-                            let addr = (state.local_base_addr(target_local.0) + off as u128)
-                                & state.ptr_width.mask();
+                            // In bounds of an allocation that fits the address space: no wrap.
+                            let addr = state.local_base_addr(target_local.0)? + off as u128;
                             PointerValue::with_provenance(
                                 addr as u64,
                                 target_local.0 as u64 + 1,
@@ -10332,8 +10469,8 @@ pub fn eval_lowered_rvalue_in_state(
                             state.ptr_width,
                             place,
                         )?;
-                        let addr = (state.local_base_addr(place.local.0) + off as u128)
-                            & state.ptr_width.mask();
+                        // In bounds of an allocation that fits the address space: no wrap.
+                        let addr = state.local_base_addr(place.local.0)? + off as u128;
                         PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, tag)
                     }
                 }
