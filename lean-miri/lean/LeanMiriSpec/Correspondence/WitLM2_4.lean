@@ -41,8 +41,10 @@ fields at offset `0`), a body that writes, copies, and reads it, and reuses the
    (`lm24_field1_write_uninit_simulation`), and a *narrower* projected field
    write `_1.0 = 0x77_u8` onto `_1 = U { b: 0x01020304_u32 }` retains the high
    bytes `[0x03, 0x02, 0x01]` in both Anneal's raw-byte overlay and `lean-miri`'s
-   allocation so `_3 = copy (_1.1: u32)` reads `0x01020377_u32` in lockstep
-   (`lm24_narrower_field_write_retains_high_bytes_simulation`);
+   allocation so `_3 = copy (_1.1: u32)` reads `0x01020377_u32` in both machines
+   (`lm24_narrower_field_write_retains_high_bytes_correspondence`; after the
+   narrower write the states are related through `UnionMemRel`, not
+   `StateRelLM2_4`);
 7. `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)` steps normally in both
    machines (`lm24_move_read_steps`);
 8. the operands `copy _1[1..3]` and `move _1[2..len - 2]` on the array agree,
@@ -196,7 +198,7 @@ def lm24FnAbi : FnAbi :=
 - `bb3`: `_1 = U { a: 5 }; _1.0 = 7; _2 = copy (_1.0: u8)`
 - `bb4`: `_1.0 = 7` (on the uninitialized `_1`)
 - `bb5`: `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)`
-- `bb6`: `_1 = U { 0: 0x01020304_u32 }; _2 = copy (_1.1: u8)`
+- `bb6`: `_1 = U { b: 0x01020304_u32 }; _2 = copy (_1.0: u8)`
 - `bb7`: `_1 = U { a: 5 }; _1.1 = 0x01020304_u32`
 - `bb8`: `_1.1 = 0x01020304_u32` (on the uninitialized `_1`)
 - `bb9`: `_1 = U { b: 0x01020304_u32 }; _1.0 = 0x77_u8; _3 = copy (_1.1: u32)` -/
@@ -1139,7 +1141,7 @@ theorem lm24_bb9_anneal₃ :
       .step (lm24AnnealState 9 3
         [.uninit, lm24USplicedSlot, .uninit, .init (.scalar ⟨0x01020377, 4⟩), .uninit]) := rfl
 
-/-- **End-to-end 3-step witness for `step_union_narrower_field_write_simulation`
+/-- **End-to-end 3-step witness for `step_union_narrower_field_write_correspondence`
 and `D13a` raw-byte overlay read-back** (contrasting projected `_1.0 = 0x77_u8`
 with unprojected `lm24_union_agg_smaller_overwrite_divergence`):
 1. `_1 = U { b: 0x01020304_u32 }` initializes all 4 bytes `[0x04, 0x03, 0x02, 0x01]`
@@ -1149,8 +1151,14 @@ with unprojected `lm24_union_agg_smaller_overwrite_divergence`):
    `[0x03, 0x02, 0x01]` in `lean-miri`, establishing `UnionMemRel` for
    `⟨0x01020377, 4⟩`;
 3. Wide read `_3 = copy (_1.1: u32)` steps both machines and decodes
-   `0x01020377_u32` into `_3` in both Anneal and `lean-miri`. -/
-theorem lm24_narrower_field_write_retains_high_bytes_simulation :
+   `0x01020377_u32` into `_3` in both Anneal and `lean-miri`
+   (`miri_step_union_field_read_of_unionMemRel`).
+
+After step 2 the states are related through `UnionMemRel` and the explicit
+facts of `step_union_narrower_field_write_correspondence`, not through
+`StateRelLM2_4` (`UnionLocalRel.union` has no case for an overlay-carrying
+union value). -/
+theorem lm24_narrower_field_write_retains_high_bytes_correspondence :
     ∃ (m₁ m₂ m₃ : AnnealStepState)
       (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (mp : Miri.Interpreter.MemPlace AnnealProv)
@@ -1195,7 +1203,7 @@ theorem lm24_narrower_field_write_retains_high_bytes_simulation :
     have h : tf₁ = tf := by simpa using htf
     subst h; exact ⟨c₁, hmls₁⟩
   -- Step 2: `_1.0 = 0x77_u8` (narrower projected write)
-  obtain ⟨_, hpost₂⟩ := step_union_narrower_field_write_simulation hst₁ hnodup₁ lm24_phase
+  obtain ⟨_, hpost₂⟩ := step_union_narrower_field_write_correspondence hst₁ hnodup₁ lm24_phase
     (u := 1) (j := 0) (bb := _) rfl rfl rfl (f := 1) lm24_wt_U rfl (by decide) (by decide)
     hu_slot₁ hu_mls₁ hmem₁ lm24_isPrim_u8
     (fun tf _ => lm24_constU8_wt 0x77 (by decide) tf) (by decide)

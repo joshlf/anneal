@@ -47,15 +47,16 @@ allocation whose bytes `[0, k)` hold `sc` and are initialized while its bytes
   `step_union_aggregate_overwrite_simulation`: whole-union copies/moves and
   same-or-wider union aggregates into already-allocated or dead destinations;
 * `step_union_field_write_simulation`,
-  `step_union_field_write_uninit_simulation`,
-  `step_union_nonzero_field_write_simulation`, and
-  `step_union_narrower_field_write_simulation`: `_u.j = op` writes into an
-  uninitialized union (`uninitFieldWriteShell?` + `forceAllocation`), rewrites
-  same-or-wider fields in place on an initialized union, and on narrower
-  projected field writes (`w_j < sc_old.sizeBytes`) retains the high bytes
-  `[w_j, sc_old.sizeBytes)` in Anneal's raw-byte overlay
-  (`finalizeUnionFieldsWithRawOverlayOpt`) and in `lean-miri`'s spliced
-  `UnionMemRel` (`unionSpliceLowScalar`) alike;
+  `step_union_field_write_uninit_simulation`, and
+  `step_union_nonzero_field_write_simulation`: `_u.j = op` writes into an
+  uninitialized union (`uninitFieldWriteShell?` + `forceAllocation`) and
+  rewrites same-or-wider fields in place on an initialized union. Narrower
+  projected field writes (`w_j < sc_old.sizeBytes`) leave the fragment:
+  `step_union_narrower_field_write_correspondence` shows both machines retain
+  the high bytes `[w_j, sc_old.sizeBytes)` (Anneal's raw-byte overlay via
+  `finalizeUnionFieldsWithRawOverlayOpt`, `lean-miri`'s spliced `UnionMemRel`
+  via `unionSpliceLowScalar`), but `StateRelLM2_4` is not re-established for the
+  overlay-carrying union value;
 * `step_repeat_union_field_simulation`: `_arr = [copy u.j; count]` (or `move`)
   for union field operands (`writeRepeat` on `annealAggregateHooksLM2_4`);
 * `step_storageLive_LM2_4_simulation` and `step_storageDead_LM2_4_simulation`:
@@ -7505,7 +7506,7 @@ private theorem allocLeBytes_unionSpliceLowScalar
             rw [Nat.div_div_eq_div_mul, ← hpow_i]
       rw [hrhs]
 
-/-- **`step_union_narrower_field_write_simulation`** (`D13a` raw-byte retention
+/-- **`step_union_narrower_field_write_correspondence`** (`D13a` raw-byte retention
 across narrower projected union field writes): unlike unprojected aggregate
 overwrite `_u = U { field_f: op }` (`step_union_aggregate_smaller_overwrite_divergence`),
 a **projected** narrower scalar field write `_u.j = op` (`w_j < sc_old.sizeBytes ≤ S`)
@@ -7523,8 +7524,16 @@ the trailing high bytes `[w_j, sc_old.sizeBytes)` in **both** machines:
      bytes `(unionAllocRaw A').extract sc'.sizeBytes S = (unionAllocRaw A).extract sc'.sizeBytes S`,
      and — for any integer/unsigned wide field `f0Ty` (`f0Ty.kind ≠ .bool`,
      `f0Ty.kind ≠ .char`) — establishes `UnionMemRel` for the spliced scalar
-     `unionSpliceLowScalar sc_old sc'`. -/
-theorem step_union_narrower_field_write_simulation
+     `unionSpliceLowScalar sc_old sc'`.
+
+This is a correspondence, not a `StateRelLM2_4` simulation: `UnionLocalRel.union`
+relates only plain union values `.aggregate 0 (unionSlotFields n f (.scalar sc))`,
+so the overlay-carrying post-state of `_u` is related to `lean-miri` memory only
+through `UnionMemRel` for `unionSpliceLowScalar sc_old sc'` and the explicit
+per-local facts above, not through `StateRelLM2_4 body s' m'`. Further union steps
+from that state (for example a second narrower write, which needs a plain
+`hu_slot`) are not covered until `UnionLocalRel` gains an overlay case. -/
+theorem step_union_narrower_field_write_correspondence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRelLM2_4 body s m)
     (hnodup : LiveAllocsNodup m.machine)
@@ -7848,7 +7857,7 @@ theorem step_union_narrower_field_write_simulation
 
 /-- Step `r = copy/move (_u.j : f0Ty)` in `lean-miri` directly from `UnionMemRel`
 for `(f0Ty, sc)` on `_u` (applicable even when Anneal's `_u` carries a `D13a`
-raw-byte overlay after `step_union_narrower_field_write_simulation`). -/
+raw-byte overlay after `step_union_narrower_field_write_correspondence`). -/
 theorem miri_step_union_field_read_of_unionMemRel
     {body : CapturedMir} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}

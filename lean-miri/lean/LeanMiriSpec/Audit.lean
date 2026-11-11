@@ -1026,13 +1026,13 @@ open LeanMiriSpec.Correspondence in
   step_union_nonzero_field_write_simulation
   writeProjectedForLocal_union_field_lt
   unionSpliceLowScalar
-  step_union_narrower_field_write_simulation
+  step_union_narrower_field_write_correspondence
   miri_step_union_field_read_of_unionMemRel
   Witness.lm24USplicedSlot
   Witness.lm24_bb9_anneal₁
   Witness.lm24_bb9_anneal₂
   Witness.lm24_bb9_anneal₃
-  Witness.lm24_narrower_field_write_retains_high_bytes_simulation
+  Witness.lm24_narrower_field_write_retains_high_bytes_correspondence
   evalSubsliceOperand_zero_uninit_indirect_characterization
   annealMemCopyOp_freshArray
   step_subslice_assign_simulation
@@ -12077,7 +12077,7 @@ example :
       m₃.stack.frames = #[tf₃] ∧
       (∃ c, tf₃.locals[3]? =
         some ⟨.live (.immediate (.scalar (.fromScalarInt msc₃))), c⟩) :=
-  Witness.lm24_narrower_field_write_retains_high_bytes_simulation
+  Witness.lm24_narrower_field_write_retains_high_bytes_correspondence
 
 example :
     ∃ m₁ m₂ m₃ : AnnealStepState,
@@ -12476,7 +12476,7 @@ example
           UnionMemRel m'.machine uDecl.ty body.layouts S f0Ty
             (unionSpliceLowScalar sc_old sc') mp) ∧
         StepPreservesHighWater m 0 (m', .ok true)) :=
-  step_union_narrower_field_write_simulation hstate hnodup hphase hbb hstmt hdecl_u hwt hfields hf
+  step_union_narrower_field_write_correspondence hstate hnodup hphase hbb hstmt hdecl_u hwt hfields hf
     hj hu_slot hu_mls hmem hprim hop hlt_width hfl0 hfl'
 
 example
