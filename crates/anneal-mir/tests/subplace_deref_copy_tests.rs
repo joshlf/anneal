@@ -1800,3 +1800,141 @@ fn a3_uninit_copy_into_union_array_field_and_one_element_array_deinitialization(
     .unwrap();
     assert_eq!(state.get_local(Local(2)), Some(&LocalSlotState::Uninit));
 }
+
+#[test]
+fn a4_copy_nonoverlapping_initializes_one_element_arrays_and_nested_single_element_containers() {
+    // Just as `copy_nonoverlapping::<u32>(src, &raw mut arr4[0], 4)` initializes an uninitialized
+    // `[u32; 4]`, `copy_nonoverlapping::<u32>(&raw const src, &raw mut arr1[0], 1)` (`count == 1 == len`)
+    // must initialize an uninitialized `[u32; 1]` (as well as `[[u32; 1]; 1]` and `[[u32; 2]; 1]`).
+    let arr1 = Ty::Array(Box::new(u32_ty()), 1);
+    let nested1 = Ty::Array(Box::new(arr1.clone()), 1);
+    let arr2 = Ty::Array(Box::new(u32_ty()), 2);
+    let nested2_1 = Ty::Array(Box::new(arr2.clone()), 1);
+    let raw_u32_const = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let raw_u32_mut = Ty::RawPtr(Box::new(u32_ty()), Mutability::Mut);
+    let decls = vec![
+        u32_ty(),        // _0: u32 (initialized source)
+        arr1.clone(),    // _1: [u32; 1] (starts Uninit)
+        nested1,         // _2: [[u32; 1]; 1] (starts Uninit)
+        arr2.clone(),    // _3: [u32; 2] (initialized source)
+        nested2_1,       // _4: [[u32; 2]; 1] (starts Uninit)
+        raw_u32_const,   // _5: *const u32
+        raw_u32_mut,     // _6: *mut u32
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    state.slots[0] = LocalSlotState::Init(u32v(42));
+    state.slots[3] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![u32v(10), u32v(20)],
+        elem_ty: u32_ty(),
+    });
+    let elem0_of_1 = ProjectionElem::ConstantIndex {
+        offset: 0,
+        min_length: 1,
+        from_end: false,
+    };
+    let elem0_of_2 = ProjectionElem::ConstantIndex {
+        offset: 0,
+        min_length: 2,
+        from_end: false,
+    };
+
+    // 1. Initialize `_1: [u32; 1]` via `count = 1` into `&raw mut _1[0]`.
+    run(
+        assign(local(5), Rvalue::RawPtr(Mutability::Not, local(0))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(6),
+            Rvalue::RawPtr(Mutability::Mut, proj(1, vec![elem0_of_1.clone()])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(5)),
+            dst: Operand::Copy(local(6)),
+            count: Operand::Constant(Constant::Int(1, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::Array {
+            elements: vec![u32v(42)],
+            elem_ty: u32_ty(),
+        })
+    );
+
+    // 2. Initialize `_2: [[u32; 1]; 1]` via `count = 1` into `&raw mut _2[0][0]`.
+    run(
+        assign(
+            local(6),
+            Rvalue::RawPtr(
+                Mutability::Mut,
+                proj(2, vec![elem0_of_1.clone(), elem0_of_1.clone()]),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(5)),
+            dst: Operand::Copy(local(6)),
+            count: Operand::Constant(Constant::Int(1, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::Array {
+            elements: vec![MirValue::Array {
+                elements: vec![u32v(42)],
+                elem_ty: u32_ty(),
+            }],
+            elem_ty: arr1,
+        })
+    );
+
+    // 3. Initialize `_4: [[u32; 2]; 1]` via `count = 2` into `&raw mut _4[0][0]`.
+    run(
+        assign(
+            local(5),
+            Rvalue::RawPtr(Mutability::Not, proj(3, vec![elem0_of_2.clone()])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(6),
+            Rvalue::RawPtr(Mutability::Mut, proj(4, vec![elem0_of_1, elem0_of_2])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(5)),
+            dst: Operand::Copy(local(6)),
+            count: Operand::Constant(Constant::Int(2, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::Array {
+            elements: vec![MirValue::Array {
+                elements: vec![u32v(10), u32v(20)],
+                elem_ty: u32_ty(),
+            }],
+            elem_ty: arr2,
+        })
+    );
+}

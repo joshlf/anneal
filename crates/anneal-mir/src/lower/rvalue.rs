@@ -6824,19 +6824,36 @@ impl StatementEvalState {
         src_local: Local,
         full_place: &Place,
     ) -> Result<(), RvalueEvalError> {
-        let dst_place = Place {
-            local: dst_local,
-            projection: dst_proj.to_vec(),
-        };
-        if let FieldSlot::Init(val) = new_slot {
-            return self.write_place(&dst_place, expected_ty, val);
-        }
         // Element `0` of a 1-element array `[T; 1]` (canonically `ConstantIndex { offset: 0,
         // min_length: 1 }`, whose `min_length` is the array length) covers the entire array, so
-        // writing `Uninit` to it deinitializes the 1-element array itself. (A canonical
-        // `Subslice { from: 0, to: 1 }` is a proper window of a longer array, never the whole
-        // array, so it is not stripped.)
+        // writing `Init(val)` or `Uninit` to it initializes or deinitializes the 1-element array
+        // itself. (A canonical `Subslice { from: 0, to: 1 }` is a proper window of a longer
+        // array, never the whole array, so it is not stripped.)
         let mut dst_proj = dst_proj;
+        if let FieldSlot::Init(mut val) = new_slot {
+            let mut cur_ty = expected_ty.clone();
+            while let Some((
+                ProjectionElem::ConstantIndex {
+                    offset: 0,
+                    min_length: 1,
+                    from_end: false,
+                },
+                prefix,
+            )) = dst_proj.split_last()
+            {
+                val = MirValue::Array {
+                    elements: vec![val],
+                    elem_ty: cur_ty.clone(),
+                };
+                cur_ty = Ty::Array(Box::new(cur_ty), 1);
+                dst_proj = prefix;
+            }
+            let dst_place = Place {
+                local: dst_local,
+                projection: dst_proj.to_vec(),
+            };
+            return self.write_place(&dst_place, &cur_ty, val);
+        }
         if matches!(new_slot, FieldSlot::Uninit) {
             while let Some((
                 ProjectionElem::ConstantIndex {
@@ -10898,37 +10915,27 @@ fn eval_copy_nonoverlapping(
                     return Ok(());
                 }
                 let src_slot = state.read_subplace_slot(src_local, &src_proj, &dummy_place)?;
-                // If `dst_proj` designates element 0 of a 1-element union array field
-                // (`[elem_ty; 1]`) whose union currently has another active field, writing the
-                // single element overwrites the entire 1-element union array field; if the
-                // array has length > 1, a 1-element write is a partial union-field write.
-                if !slot_union_path_active(&state.slots[dst_local.0], &dst_proj, false)
-                    && let Some((
-                        ProjectionElem::ConstantIndex {
-                            offset: 0,
-                            min_length,
-                            from_end: false,
-                        },
-                        dst_arr_proj,
-                    )) = dst_proj.split_last()
+                // Strip any trailing 1-element array indices (`[T; 1]` is covered as a whole by
+                // `count == 1`); if a multi-element array step remains inside an inactive union
+                // field, a 1-element write is a partial union-field write (unsupported).
+                let mut whole_dst_proj = dst_proj.as_slice();
+                while let Some((
+                    ProjectionElem::ConstantIndex {
+                        offset: 0,
+                        min_length: 1,
+                        from_end: false,
+                    },
+                    prefix,
+                )) = whole_dst_proj.split_last()
                 {
-                    if *min_length == 1
-                        && let FieldSlot::Init(elem_val) = src_slot
-                    {
-                        let arr_ty = Ty::Array(Box::new(elem_ty.clone()), 1);
-                        let arr_val = MirValue::Array {
-                            elements: vec![elem_val],
-                            elem_ty: elem_ty.clone(),
-                        };
-                        return state.write_subplace_slot(
-                            dst_local,
-                            dst_arr_proj,
-                            &arr_ty,
-                            FieldSlot::Init(arr_val),
-                            src_local,
-                            &dummy_place,
-                        );
-                    }
+                    whole_dst_proj = prefix;
+                }
+                if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
+                    && matches!(
+                        whole_dst_proj.last(),
+                        Some(ProjectionElem::ConstantIndex { .. })
+                    )
+                {
                     return Err(RvalueEvalError::UnsupportedMemoryAccess(
                         "copy_nonoverlapping outside of whole-local copies",
                     ));
@@ -11070,12 +11077,15 @@ fn eval_copy_nonoverlapping(
             Err(err) => return Err(err),
         };
         if *dst_start == 0 && count_usize == dst_len_usize {
-            let dst_arr_place = Place {
-                local: dst_local,
-                projection: dst_arr_proj.to_vec(),
-            };
             let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
-            return state.write_place(&dst_arr_place, &arr_ty, slice_val);
+            return state.write_subplace_slot(
+                dst_local,
+                dst_arr_proj,
+                &arr_ty,
+                FieldSlot::Init(slice_val),
+                src_local,
+                &dummy_place,
+            );
         }
         let mut dst_slice_proj = dst_arr_proj.to_vec();
         dst_slice_proj.push(ProjectionElem::Subslice {
