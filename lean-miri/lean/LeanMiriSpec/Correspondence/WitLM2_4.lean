@@ -36,7 +36,9 @@ fields at offset `0`), a body that writes, copies, and reads it, and reuses the
 6. `_1.0 = 7` on the uninitialized `_1` steps normally in both machines,
    initializing `_1` via `uninitFieldWriteShell?` + `writeProjectedForLocal` in
    Anneal and writing byte `0` of a fresh allocation in `lean-miri`
-   (`lm24_field_write_uninit_simulation`);
+   (`lm24_field_write_uninit_simulation`); likewise the nonzero-field write
+   `_1.1 = 0x01020304_u32` on the uninitialized `_1` writes bytes `[0, 4)`
+   (`lm24_field1_write_uninit_simulation`);
 7. `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)` steps normally in both
    machines (`lm24_move_read_steps`);
 8. the operands `copy _1[1..3]` and `move _1[2..len - 2]` on the array agree,
@@ -191,7 +193,8 @@ def lm24FnAbi : FnAbi :=
 - `bb4`: `_1.0 = 7` (on the uninitialized `_1`)
 - `bb5`: `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)`
 - `bb6`: `_1 = U { 0: 0x01020304_u32 }; _2 = copy (_1.1: u8)`
-- `bb7`: `_1 = U { a: 5 }; _1.1 = 0x01020304_u32` -/
+- `bb7`: `_1 = U { a: 5 }; _1.1 = 0x01020304_u32`
+- `bb8`: `_1.1 = 0x01020304_u32` (on the uninitialized `_1`) -/
 def lm24Body : CapturedMir where
   defPath := "lm_2_4_witness::unions"
   phase := .runtimePostCleanup
@@ -233,6 +236,8 @@ def lm24Body : CapturedMir where
     { statements := [
         lm24AggStmt 1 5,
         lm24Field1WriteU32Stmt 1 0x01020304],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [lm24Field1WriteU32Stmt 1 0x01020304],
       terminator := mkTerm .return_, isCleanup := false }]
   fnAbi := lm24FnAbi
   layouts := lm24Layouts
@@ -1059,6 +1064,45 @@ theorem lm24_nonzero_field_write_simulation :
     rw [h] at hop₂; injection hop₂ with h1 _; injection h1 with h1; exact h1.symm
   subst hsc'
   exact ⟨m₁, m₂, tf₂, mp, hstep₁, hst₁, lm24_bb7_anneal₂, hstep₂, hst₂, hframes₂, hloc₂, hmem₂⟩
+
+
+theorem lm24_bb8_anneal : stepMirFn lm24Body (lm24InitAnneal 8) =
+    .step (lm24AnnealState 8 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) := rfl
+
+/-- **Witness for `step_union_field_write_uninit_simulation` at a nonzero field**
+(`D13b`, `j = 1`): from block `8`, `_1.1 = 0x01020304_u32` on the uninitialized
+union `_1` steps both machines in lockstep (`StateRelLM2_4`): Anneal materializes
+`lm24UU32Slot` (`unionSlotFields 2 1 (.scalar ⟨0x01020304, 4⟩)`) via
+`uninitFieldWriteShell?` + `writeProjectedForLocal`, and `lean-miri` moves `_1` to
+a fresh stack allocation and writes bytes `[0, 4)` (`UnionMemRel` for
+`(lm24U32Ty, ⟨0x01020304, 4⟩)`). Together with `lm24_field_write_uninit_simulation`
+(`j = 0`), this exercises the general-`j` statement on both union fields. -/
+theorem lm24_field1_write_uninit_simulation :
+    stepMirFn lm24Body (lm24InitAnneal 8) =
+      .step (lm24AnnealState 8 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) ∧
+    ∃ (m' : AnnealStepState)
+      (tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (mp : Miri.Interpreter.MemPlace AnnealProv),
+      Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) ()
+          (lm24InitMiri 8) = (m', .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 8 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) m' ∧
+      m'.stack.frames = #[tf'] ∧
+      (∃ c', tf'.locals[1]? = some ⟨.live (.indirect mp), c'⟩) ∧
+      UnionMemRel m'.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020304, 4⟩ mp := by
+  obtain ⟨_, hpost⟩ := step_union_field_write_uninit_simulation (lm24_init_stateRel 8).toLM2_4
+    lm24_nodup_empty lm24_canReserve_empty lm24_phase (u := 1) (j := 1) (bb := _)
+    rfl rfl rfl lm24_wt_U rfl (by decide) rfl (lm24_init_frame_imm 8 1) lm24_isPrim_u32
+    (fun tf _ => lm24_constU32_wt 0x01020304 (by decide) tf) (by decide)
+  obtain ⟨sc, mp, m', tf', hstep, hop, hst', _, _, hframes', hmls', hmem', _, _, _, _, _⟩ :=
+    hpost _ lm24_bb8_anneal
+  have hsc : sc = ⟨0x01020304, 4⟩ := by
+    have h : evalOperand (lm24InitAnneal 8).frame.locals (.constant (lm24ConstU32 0x01020304)) .nil
+        (lm24InitAnneal 8).memory.globals lm24Body.layouts .nil =
+        .ok (.scalar ⟨0x01020304, 4⟩) (lm24InitAnneal 8).frame.locals := rfl
+    rw [h] at hop; injection hop with h1 _; injection h1 with h1; exact h1.symm
+  subst hsc
+  exact ⟨lm24_bb8_anneal, m', tf', mp, hstep, hst', hframes', hmls', hmem'⟩
 
 /-! ## 9. Statement-Level `Subslice` Assignments & `[T; 0]` Dichotomy -/
 

@@ -1008,6 +1008,8 @@ open LeanMiriSpec.Correspondence in
   Witness.lm24_bb5_anneal₃
   Witness.lm24_field_write_read_steps
   Witness.lm24_field_write_uninit_simulation
+  Witness.lm24_bb8_anneal
+  Witness.lm24_field1_write_uninit_simulation
   Witness.lm24_move_read_steps
   annealCheckIndirectInitialized_uninit_array_ub
   subsliceReadOperand
@@ -12022,6 +12024,22 @@ example :
       (∃ c', tf'.locals[1]? = some ⟨.live (.indirect mp), c'⟩) ∧
       UnionMemRel m'.machine Witness.lm24UTy Witness.lm24Layouts 4 Witness.lm24U8Ty ⟨7, 1⟩ mp :=
   Witness.lm24_field_write_uninit_simulation
+
+example :
+    stepMirFn Witness.lm24Body (Witness.lm24InitAnneal 8) =
+      .step (Witness.lm24AnnealState 8 1 [.uninit, Witness.lm24UU32Slot, .uninit, .uninit, .uninit]) ∧
+    ∃ (m' : AnnealStepState)
+      (tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (mp : Miri.Interpreter.MemPlace AnnealProv),
+      Miri.Interpreter.Step.step (annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts) ()
+          (Witness.lm24InitMiri 8) = (m', .ok true) ∧
+      StateRelLM2_4 Witness.lm24Body
+        (Witness.lm24AnnealState 8 1 [.uninit, Witness.lm24UU32Slot, .uninit, .uninit, .uninit]) m' ∧
+      m'.stack.frames = #[tf'] ∧
+      (∃ c', tf'.locals[1]? = some ⟨.live (.indirect mp), c'⟩) ∧
+      UnionMemRel m'.machine Witness.lm24UTy Witness.lm24Layouts 4 Witness.lm24U32Ty
+        ⟨0x01020304, 4⟩ mp :=
+  Witness.lm24_field1_write_uninit_simulation
 
 example :
     ∃ m₁ m₂ m₃ : AnnealStepState,
