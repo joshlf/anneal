@@ -44,7 +44,7 @@ fn write_executable(path: &Path, script: &str) {
     fs::set_permissions(path, perms).expect("chmod script");
 }
 
-fn write_fileutil_stub(stub: &Path, log: &Path, exit_code: i32) {
+fn write_remote_sync_stub(stub: &Path, log: &Path, exit_code: i32) {
     write_executable(
         stub,
         &format!(
@@ -60,7 +60,7 @@ spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
 runner = importlib.util.module_from_spec(spec)
 sys.modules["runner"] = runner
 spec.loader.exec_module(runner)
-runner.FILEUTIL_BIN = sys.argv[2]
+runner.REMOTE_SYNC_BIN = sys.argv[2]
 args = sys.argv[3:]
 miri_override = None
 itree_override = None
@@ -86,7 +86,7 @@ sys.exit(runner.main())
 "#;
 
 fn run_campaign_driver(
-    fileutil_stub: &Path,
+    remote_sync_stub: &Path,
     env_vars: &[(&str, &Path)],
     removed_env_vars: &[&str],
     overrides: &[String],
@@ -98,7 +98,7 @@ fn run_campaign_driver(
     cmd.arg("-c")
         .arg(RUNNER_DRIVER)
         .arg(root.join("scripts/run_diff_test_campaign.py"))
-        .arg(fileutil_stub)
+        .arg(remote_sync_stub)
         .args(overrides)
         .args(runner_args)
         .arg("--state-dir")
@@ -118,27 +118,26 @@ fn run_campaign_driver(
 fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() {
     let dir = unique_temp_dir("live_smoke");
     let state_dir = dir.join("state_dir");
-    let junit = dir.join("sponge_log.xml");
+    let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 0);
+    let remote_sync_log = dir.join("remote-sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 0);
 
     // 1. Live smoke run with default seed `0x5eed0001` and no quarantine file:
-    // must run real Miri + Anneal, separate compared/agreed/diverged/not-compared,
-    // deduplicate the 2 raw divergences into 1 distinct fingerprint, and exit
-    // with status 4 (`EXIT_DIVERGENCE_DETECTED`). The UnsafeCell mutant
-    // (`pass_tb_unsafe_cell_shared_mutation__b1_c0`) agrees with Miri since
-    // I-11 fixed `&raw const` reborrows of `!Freeze` places.
+    // must run real Miri + Anneal and real ITree + Lean `TraceCheck`, separate
+    // compared/agreed/diverged/not-compared, materialize `coverage_ratchet.json`,
+    // and exit 0 (`PASS (0 divergences)`) now that all 4 previously open corpus
+    // bugs (`DIFF-AB`, `DIFF-C`, `DIFF-D`, `DIFF-E`) are fixed in `MirSemantics`.
     let out1 = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[],
         &[
             "--profile",
             "smoke",
-            "--x20-uri",
+            "--remote-uri",
             "",
             "--junit-xml",
             &junit_arg,
@@ -149,20 +148,20 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     let stderr1 = String::from_utf8_lossy(&out1.stderr);
     assert_eq!(
         out1.status.code(),
-        Some(4),
-        "live smoke campaign with unquarantined divergences must exit 4:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
+        Some(0),
+        "live smoke campaign on 0x5eed0001 must exit 0:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
     );
     assert!(
-        !fileutil_log.exists(),
-        "campaign without --x20-uri must not invoke fileutil"
+        !remote_sync_log.exists(),
+        "campaign without --remote-uri must not invoke remote-sync"
     );
 
     let report1 =
         fs::read_to_string(state_dir.join("reports/LATEST_REPORT.md")).expect("read LATEST_REPORT");
     assert_eq!(report1.trim(), stdout1.trim());
     assert!(
-        report1.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
-        "report must announce 1 unquarantined distinct / 1 raw divergence:\n{report1}"
+        report1.contains("Status: PASS (0 divergences)."),
+        "report must announce PASS (0 divergences):\n{report1}"
     );
     assert!(
         report1.contains("| Oracle comparison | **performed** | **performed** |"),
@@ -173,18 +172,18 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "report must show 16 compared candidates for both miri-difftest and itree-difftest:\n{report1}"
     );
     assert!(
-        report1.contains("| Agreed | 15 | 16 ("),
-        "report must show 15 agreed Miri candidates and 16 agreed ITree candidates:\n{report1}"
+        report1.contains("| Agreed | 16 | 16 ("),
+        "report must show 16 agreed Miri candidates and 16 agreed ITree candidates:\n{report1}"
     );
     assert!(
         report1.contains(
-            "| Diverged (raw / distinct) | 1 (1 distinct: 1 unquarantined, 0 quarantined) | 0 (0 distinct: 0 unquarantined, 0 quarantined) |"
+            "| Diverged (raw / distinct) | 0 (0 distinct: 0 unquarantined, 0 quarantined) | 0 (0 distinct: 0 unquarantined, 0 quarantined) |"
         ),
         "report must show raw and deduplicated divergence counts:\n{report1}"
     );
     assert!(
-        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 1 | 0 ("),
-        "report must show 1 kernel-confirmed Miri divergence and 0 ITree divergences:\n{report1}"
+        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 0 | 0 ("),
+        "report must show 0 kernel-confirmed Miri and ITree divergences:\n{report1}"
     );
     assert!(
         report1.contains("| Not compared | 0 | 0 |"),
@@ -208,19 +207,97 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "itree_non_zero_compared",
         "itree_plausible_wall_clock",
         "itree_seed_sensitivity",
+        "itree_oracle_error_threshold",
     ] {
         assert!(
             report1.contains(&format!("| `{check}` | PASS |")),
             "red-flag check `{check}` must PASS in live smoke report:\n{report1}"
         );
     }
+    let ratchet_json = fs::read_to_string(state_dir.join("state/coverage_ratchet.json"))
+        .expect("read coverage_ratchet.json");
     assert!(
-        report1.contains("| `RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub` | `ub_location_mismatch` | 1 |"),
-        "report must list deduplicated RawPtrOffsetMutator ub_location_mismatch fingerprint:\n{report1}"
+        ratchet_json.contains("\"cumulative_distinct_obs_paths\":")
+            && !ratchet_json.contains("\"cumulative_distinct_obs_paths\": 0"),
+        "coverage_ratchet.json must record non-zero cumulative_distinct_obs_paths:\n{ratchet_json}"
+    );
+
+    // 2. Live kernel-confirmed Miri vs. Anneal divergence bundle + `--reproduce` +
+    // unquarantined / partial-quarantine / full-quarantine verification:
+    // Evaluate a batch with 3 corpus candidates plus a negative-control
+    // candidate (`char` surrogate written through `*mut u32`) through live
+    // `evaluate_miri_batches` to produce a real `repro.rs` bundle on disk.
+    let root = repo_root();
+    let mut div_batch =
+        anneal_difftest::mutators_miri::generate_miri_corpus_batch(3, 0x5eed_0001, 0);
+    let neg_fn = "\
+pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
+    let mut c: char = 'a';
+    let p: *mut u32 = (&raw mut c) as *mut u32;
+    unsafe {
+        *p = 0xD800u32;
+    }
+    c as u32
+}
+";
+    div_batch.push(anneal_difftest::mutators_miri::GeneratedMiriCandidate {
+        id: 3,
+        seed_index: 0,
+        seed_name: "ub_transmute_invalid_char_surrogate".to_string(),
+        fn_name: "neg_ctrl_char_surrogate_via_ptr__b0_c3".to_string(),
+        seed_u64: 0xDEAD_BEEF,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: neg_fn.to_string(),
+        source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_fn),
+    });
+    let live_findings_dir = dir.join("live_findings");
+    let live_div_eval = anneal_difftest::miri_eval::evaluate_miri_batches(
+        "seeded",
+        0x5eed_0001,
+        &[div_batch],
+        4,
+        Some(&live_findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate live divergence batch");
+    let live_div_payload = anneal_difftest::miri_eval::render_eval_report_json(&live_div_eval);
+
+    let state_dir_div = dir.join("state_dir_div");
+    let out_div = run_campaign_driver(
+        &remote_sync,
+        &[],
+        &[],
+        &[format!("miri_summary={live_div_payload}")],
+        &[
+            "--profile",
+            "smoke",
+            "--miri-only",
+            "--remote-uri",
+            "",
+            "--junit-xml",
+            &junit_arg,
+        ],
+        &state_dir_div,
+    );
+    let stdout_div = String::from_utf8_lossy(&out_div.stdout);
+    let stderr_div = String::from_utf8_lossy(&out_div.stderr);
+    assert_eq!(
+        out_div.status.code(),
+        Some(4),
+        "campaign with unquarantined divergence must exit 4:\nstdout:\n{stdout_div}\nstderr:\n{stderr_div}"
+    );
+    let report_div = fs::read_to_string(state_dir_div.join("reports/LATEST_REPORT.md"))
+        .expect("read LATEST_REPORT for div run");
+    assert!(
+        report_div.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
+        "report must announce 1 unquarantined distinct / 1 raw divergence:\n{report_div}"
     );
     assert!(
-        !report1.contains("pass_tb_unsafe_cell_shared_mutation"),
-        "fixed UnsafeCell false_positive_ub must no longer be reported:\n{report1}"
+        report_div.contains(
+            "| `BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar` | `missed_ub` | 1 |"
+        ),
+        "report must list deduplicated BitValidityTransmuteMutator missed_ub fingerprint:\n{report_div}"
     );
 
     let junit1 = fs::read_to_string(&junit).expect("read JUnit XML");
@@ -235,10 +312,12 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
 
     // Verify `LATEST_CAMPAIGN_SUMMARY.json` and reproduce each distinct finding's
     // `primary_repro_path` via `miri-difftest --reproduce`.
-    let summary_json = fs::read_to_string(state_dir.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
-        .expect("read LATEST_CAMPAIGN_SUMMARY.json");
-    assert!(summary_json.contains("\"fingerprint\": \"RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub\""));
-    assert!(!summary_json.contains("pass_tb_unsafe_cell_shared_mutation:false_positive_ub"));
+    let summary_json =
+        fs::read_to_string(state_dir_div.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
+            .expect("read LATEST_CAMPAIGN_SUMMARY.json");
+    assert!(summary_json.contains(
+        "\"fingerprint\": \"BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar\""
+    ));
 
     // Extract primary_repro_path values from the summary JSON and run `--reproduce` on each.
     let repro_paths: Vec<PathBuf> = summary_json
@@ -249,7 +328,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
             let path_str = rest.strip_suffix("\",")?;
             Some(PathBuf::from(path_str))
         })
-        .collect::< std::collections::BTreeSet<_> >()
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
     assert_eq!(
@@ -282,9 +361,9 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         );
     }
 
-    // 2. Partial quarantine (seeding a known divergence that is NOT quarantined):
-    // Quarantining only an unrelated fingerprint leaves `RawPtrOffsetMutator`
-    // unquarantined on `--miri-seed 0x5eed0001`, which must still fail with exit 4.
+    // 3. Partial quarantine (seeding a known divergence that is NOT quarantined):
+    // Quarantining only an unrelated fingerprint leaves `BitValidityTransmuteMutator`
+    // unquarantined, which must still fail with exit 4.
     let partial_quarantine = dir.join("partial_quarantine.json");
     fs::write(
         &partial_quarantine,
@@ -293,10 +372,10 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     .expect("write partial quarantine");
     let state_dir_partial = dir.join("state_dir_partial");
     let out_partial = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
-        &[],
+        &[format!("miri_summary={live_div_payload}")],
         &[
             "--profile",
             "smoke",
@@ -322,7 +401,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "partial quarantine must leave 1 unquarantined distinct divergence:\n{report_partial}"
     );
 
-    // 3. Full quarantine of the known fingerprint: when all encountered
+    // 4. Full quarantine of the known fingerprint: when all encountered
     // divergences are quarantined, the campaign must exit 0 (`EXIT_SUCCESS`)
     // and emit 0 JUnit failures.
     let full_quarantine = dir.join("full_quarantine.json");
@@ -330,20 +409,21 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         &full_quarantine,
         r#"{
             "quarantined": [
-                "RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub"
+                "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar"
             ]
         }"#,
     )
     .expect("write full quarantine");
     let state_dir_clean = dir.join("state_dir_clean");
     let out_clean = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
-        &[],
+        &[format!("miri_summary={live_div_payload}")],
         &[
             "--profile",
             "smoke",
+            "--miri-only",
             "--miri-seed",
             "0x5eed0001",
             "--quarantine-file",
@@ -382,11 +462,11 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
 fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     let dir = unique_temp_dir("no_miri_path");
     let state_dir = dir.join("state_dir");
-    let junit = dir.join("sponge_log.xml");
+    let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 1);
+    let remote_sync_log = dir.join("remote-sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     fs::create_dir_all(state_dir.join("state")).expect("create state dir");
     let initial_ledger =
@@ -417,7 +497,7 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     }
 
     let out = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[("PATH", &no_miri_bin)],
         &["ANNEAL_MIRI_BIN"],
         &[],
@@ -425,7 +505,7 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
             "--profile",
             "smoke",
             "--miri-only",
-            "--x20-uri",
+            "--remote-uri",
             "",
             "--junit-xml",
             &junit_arg,
@@ -462,9 +542,9 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
 #[test]
 fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     let dir = unique_temp_dir("red_flags");
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 1);
+    let remote_sync_log = dir.join("remote-sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     let initial_ledger = r#"{
   "last_miri_seed": "0x00000011",
@@ -641,14 +721,14 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         ),
     ] {
         let case_dir = dir.join(label);
-        let junit = case_dir.join("sponge_log.xml");
+        let junit = case_dir.join("diff_test_report.xml");
         let junit_arg = junit.to_string_lossy().into_owned();
         fs::create_dir_all(case_dir.join("state")).expect("create state dir");
         fs::write(case_dir.join("state/campaign_ledger.json"), initial_ledger)
             .expect("write ledger");
 
         let out = run_campaign_driver(
-            &fileutil,
+            &remote_sync,
             &[],
             &[],
             &[format!("miri_summary={payload}")],
@@ -656,7 +736,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "--profile",
                 "smoke",
                 "--miri-only",
-                "--x20-uri",
+                "--remote-uri",
                 "",
                 "--junit-xml",
                 &junit_arg,
@@ -802,7 +882,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     .expect("write collision quarantine");
     let collision_state = dir.join("collision_state");
     let out_coll = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={collision_payload}")],
@@ -812,7 +892,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             "--miri-only",
             "--quarantine-file",
             &collision_quarantine.to_string_lossy(),
-            "--x20-uri",
+            "--remote-uri",
             "",
         ],
         &collision_state,
@@ -899,14 +979,14 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     }"#;
     let itree_rf_dir = dir.join("itree_red_flag");
     let out_itree_rf = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[
             format!("miri_summary={clean_miri_payload}"),
             format!("itree_summary={bad_itree_payload}"),
         ],
-        &["--profile", "smoke", "--x20-uri", ""],
+        &["--profile", "smoke", "--remote-uri", ""],
         &itree_rf_dir,
     );
     let stdout_itree_rf = String::from_utf8_lossy(&out_itree_rf.stdout);
@@ -977,14 +1057,14 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
 
     let itree_div_dir = dir.join("itree_div_unquarantined");
     let out_itree_div = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[
             format!("miri_summary={clean_miri_payload}"),
             format!("itree_summary={div_itree_payload}"),
         ],
-        &["--profile", "smoke", "--x20-uri", ""],
+        &["--profile", "smoke", "--remote-uri", ""],
         &itree_div_dir,
     );
     let stdout_itree_div = String::from_utf8_lossy(&out_itree_div.stdout);
@@ -1008,7 +1088,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     .expect("write itree quarantine");
     let itree_quar_dir = dir.join("itree_div_quarantined");
     let out_itree_quar = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[
@@ -1020,7 +1100,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             "smoke",
             "--quarantine-file",
             &itree_quarantine.to_string_lossy(),
-            "--x20-uri",
+            "--remote-uri",
             "",
         ],
         &itree_quar_dir,

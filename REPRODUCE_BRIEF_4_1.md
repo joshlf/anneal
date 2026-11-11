@@ -4,7 +4,7 @@
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-1
+cd <path/to/anneal>
 git status --short --branch
 git log -n 9 --oneline
 ```
@@ -26,7 +26,7 @@ Expected branch and adversarial pass history (`A0` through `A4`):
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-1/examples && \
+cd <path/to/anneal>/examples && \
   lake build Trusted Anneal MirVerification
 ```
 
@@ -39,7 +39,7 @@ Build completed successfully (62 jobs).
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-1 && \
+cd <path/to/anneal> && \
   cargo test -p cargo-anneal --lib
 ```
 
@@ -57,7 +57,7 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-1 && \
+cd <path/to/anneal> && \
   python3 trusted/audit/check_trusted.py --fast && \
   ./ci/check_todo.sh
 ```

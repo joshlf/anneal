@@ -55,3 +55,49 @@ roots = ["Miri"]
 name = "LeanMiriSpec"
 srcDir = "../lean-miri/lean"
 
+[[lean_lib]]
+name = "AnnealMirCore"
+srcDir = "../theory"
+roots = [
+  "Anneal.Refinement",
+  "Anneal.Effect",
+  "Anneal.ITree",
+  "Anneal.Pass",
+  "Anneal.EffectWP",
+  "Anneal.ITreeWP",
+  "Anneal.MirLoops",
+  "Anneal.Scalars",
+  "Anneal.Memory",
+  "Anneal.BitValidity",
+  "Anneal.ByteCodec",
+  "Anneal.UnsafeObligations",
+  "Anneal.SepLogic",
+  "Anneal.Rustc.V2026_06_01.Lower",
+  "Anneal.Rustc.V2026_06_01.SymbolicEval",
+  "Anneal.Rustc.V2026_06_01.SymReflect",
+  "Anneal.Rustc.V2026_06_01.TraceCheck",
+  "Anneal.FunctionalTranslation",
+  "Anneal.MirFuelFree",
+  "Anneal.PureMirExec",
+  "Anneal.MirLiftCore",
+]
+
+[[lean_lib]]
+name = "MiniRustCore"
+srcDir = "../minirust/lean"
+roots = [
+  "MiniRustSpec.Generated",
+  "MiniRustSpec.Interp",
+  "MiniRustSpec.Anchors",
+  "MiniRustSpec.Correspondence.Translate",
+  "MiniRustSpec.Correspondence.Arith",
+  "MiniRustSpec.Correspondence.Relation",
+  "MiniRustSpec.Correspondence.Lemmas",
+  "MiniRustSpec.Correspondence.MiniRustEval",
+  "MiniRustSpec.Correspondence.AnnealEval",
+  "MiniRustSpec.Correspondence.Pointers",
+  "MiniRustSpec.Correspondence.PointerStep",
+  "MiniRustSpec.Correspondence.Provenance",
+  "MiniRustSpec.Correspondence.Simulation",
+  "MiniRustSpec.Correspondence.Run",
+]

@@ -20,7 +20,7 @@ Work unit `FF-4.3` delivers:
 2. **Self-Contained `zerocopy-reference` Convergence & Benchmark Report**
    (`reports/anneal-fuel-free-mir-lifting-and-alias-erasure/` on local branch
    `adv/ff-4-3-reference` in
-   `/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference`):
+   `<path/to/zerocopy-reference>`):
    synthesizes the fuel-free MIR lifting, two-tier alias-erasure, bounded range
    loop, and elaboration-scaling results with a standalone Lean `v4.34.1`
    mechanization (`support/FuelFreeMirLiftingAndLensesProbe.lean`), empirical
@@ -30,11 +30,11 @@ Work unit `FF-4.3` delivers:
 > [!WARNING]
 > **`[diversity-reduced]` 3rd-Party Audit Notice**
 >
-> Under Priority Tier `P2` (`40%` frontier reserve floor), `anneal-model-policy`
-> recorded `MODEL_X` (`opus-5.5-max`, `3p-wtu-daily`) at `4.5%` remaining (`<
-> 40%` floor) and `MODEL_Y` (`gemini-launch-candidate-high`) at `0.0%`
+> Under Priority Tier `P2` (`40%` frontier reserve floor), `model-policy-cli`
+> recorded `MODEL_X` (`model-family-x-primary`, `family-x-quota-pool`) at `4.5%` remaining (`<
+> 40%` floor) and `MODEL_Y` (`model-family-y-primary`) at `0.0%`
 > remaining. Both adversarial leaf slots (`ff43-a` and `ff43-b`) therefore
-> executed on the single-family reserve model `gemini-pro-coordinator` (`Family
+> executed on the single-family reserve model `supervisor-model-primary` (`Family
 > Z`, `DIVERSITY_REDUCED=true`). Before merging `adv/ff-4-3` into `main` or
 > publishing `adv/ff-4-3-reference` to `google/zerocopy` `refs/heads/reference`,
 > run an independent cross-family (`Model X`) or human review pass.
@@ -148,7 +148,7 @@ Work unit `FF-4.3` delivers:
 ## 2. Summary of Local `zerocopy-reference` Report Package
 
 Committed **locally only** on branch `adv/ff-4-3-reference` in
-`/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference`
+`<path/to/zerocopy-reference>`
 (`origin/reference` remains untouched at `64e9b5c4d`):
 
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/REPORT.json`:
@@ -193,13 +193,13 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
 ## 3. Exact Verification Commands
 
 Run from the worktree root
-(`/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-3`):
+(`<path/to/anneal>`):
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 # 1. Repository hygiene & TrustedBoundary audit
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-3
+cd <path/to/anneal>
 ./ci/check_todo.sh
 python3 trusted/audit/check_trusted.py --fast
 
@@ -210,7 +210,7 @@ anneal-lean-run --mode build --concurrency 1 -- cargo miri setup
 anneal-lean-run --mode build --concurrency 1 -- cargo test -p cargo-anneal
 
 # 3. Reference corpus catalog, structural check, unit tests, and Lean probe
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+cd <path/to/zerocopy-reference>
 python3 \
 reports/anneal-fuel-free-mir-lifting-and-alias-erasure/support/verify_probes.py
 python3 tools/reference.py catalog
@@ -229,7 +229,7 @@ it atomically to `google/zerocopy` `refs/heads/reference`:
 ### Step 1: Inspect the Local Candidate on the Capsule
 
 ```bash
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+cd <path/to/zerocopy-reference>
 git status --short
 git log --oneline origin/reference..adv/ff-4-3-reference
 git diff --stat origin/reference..adv/ff-4-3-reference
@@ -242,27 +242,27 @@ Confirm `origin/reference` is still `64e9b5c4d` (or the latest upstream tip) and
 that only `CATALOG.json` and
 `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/` differ.
 
-### Step 2: Export Candidate Package to Shared x20 Staging (Optional)
+### Step 2: Export Candidate Package to Shared remote-storage Staging (Optional)
 
-If publishing from your personal Cloudtop checkout of `google/zerocopy` rather
-than directly via Capsule sync, archive the validated report directory to x20
-using `fileutil` at HEAD (never `/google/data/rw/...`):
+If publishing from your personal workstations checkout of `google/zerocopy` rather
+than directly via Capsule sync, archive the validated report directory to remote-storage
+using `remote-sync` at HEAD (never `/mnt/fuse/rw/...`):
 
 ```bash
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+cd <path/to/zerocopy-reference>
 tar -czf /tmp/ff43-reference-report.tar.gz \
   reports/anneal-fuel-free-mir-lifting-and-alias-erasure
 
-/usr/bin/fileutil --x20_force_client_creation_at_head cp -f \
+/usr/bin/remote-sync --force_client_creation_at_head cp -f \
   /tmp/ff43-reference-report.tar.gz \
-  /x20/teams/anneal-agent/markdittmer/ff43-reference-report.tar.gz
+  /remote/anneal-agent
 rm -f /tmp/ff43-reference-report.tar.gz
 ```
 
 ### Step 3: Atomic Single-Parent Fast-Forward Publication to `reference`
 
 Following `zerocopy-reference/AGENTS.md` ("Publication", Steps 1–7), on your
-authenticated `google/zerocopy` `reference` worktree on Cloudtop:
+authenticated `google/zerocopy` `reference` worktree on workstations:
 
 ```bash
 # 1. Fetch and inspect the current remote reference tip
@@ -270,8 +270,8 @@ git fetch origin reference
 git checkout -B reference-publish origin/reference
 
 # 2. Materialize the report package onto the observed remote tip
-/usr/bin/fileutil --x20_force_client_creation_at_head cp -f \
-  /x20/teams/anneal-agent/markdittmer/ff43-reference-report.tar.gz \
+/usr/bin/remote-sync --force_client_creation_at_head cp -f \
+  /remote/anneal-agent \
   /tmp/ff43-reference-report.tar.gz
 tar -xzf /tmp/ff43-reference-report.tar.gz
 rm -f /tmp/ff43-reference-report.tar.gz

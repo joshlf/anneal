@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anneal_difftest::itree_eval::{
-    ITREE_SAFE_SEEDS, ItreeEvalOptions, evaluate_itree_batches_with_options,
-    reproduce_itree_finding,
+    ITREE_CONFIRM_CHUNK_SIZE, ITREE_SAFE_SEEDS, ItreeEvalOptions,
+    evaluate_itree_batches_with_options, reproduce_itree_finding,
 };
 use anneal_difftest::mutators_itree::{generate_itree_batch, generate_itree_identity_batch};
 
@@ -80,6 +80,8 @@ fn itree_difftest_live_identity_and_mutated_batches_confirm_traces_in_lean() {
     assert!(id_json.contains("\"compared_candidates\": 4"));
     assert!(id_json.contains("\"agree_candidates\": 4"));
     assert!(id_json.contains("\"diverge_candidates\": 0"));
+    assert!(id_json.contains("\"not_compared_reasons\": {"));
+    assert!(id_json.contains("\"obs_path_signatures\": ["));
 
     // Verify via the library API that per-candidate distinct trace counts vary
     // across the 4 candidates.
@@ -104,6 +106,23 @@ fn itree_difftest_live_identity_and_mutated_batches_confirm_traces_in_lean() {
     assert_eq!(
         id_summary.kernel_confirmed_traces,
         id_summary.distinct_traces_checked
+    );
+    assert!(!id_summary.obs_path_signatures.is_empty());
+    assert!(
+        id_summary
+            .obs_path_signatures
+            .windows(2)
+            .all(|w| w[0] < w[1]),
+        "obs_path_signatures must be sorted and deduplicated: {:?}",
+        id_summary.obs_path_signatures
+    );
+    assert!(
+        id_summary
+            .obs_path_signatures
+            .iter()
+            .all(|s| s.starts_with("itree:") && s.ends_with(":normal")),
+        "unexpected obs_path_signatures format: {:?}",
+        id_summary.obs_path_signatures
     );
     assert_eq!(id_summary.per_candidate_distinct_traces.len(), 4);
     let min_distinct = *id_summary
@@ -160,6 +179,59 @@ fn itree_difftest_live_identity_and_mutated_batches_confirm_traces_in_lean() {
         "distinct seeds must produce distinct evaluation reports"
     );
 
+    // 3. Multi-chunk Stage 2 confirmation (> 32 distinct traces and > 16 candidates
+    //    across multiple `ITREE_CONFIRM_CHUNK_SIZE = 16` chunks). Above 32 traces
+    //    Stage 2 kernel-confirms every divergence plus the first trace of every
+    //    candidate, and `kernel_confirmed_traces` must report exactly the traces
+    //    the kernel checked (never the full distinct-trace count).
+    let multi_chunk_batches = vec![generate_itree_batch(ITREE_SAFE_SEEDS, 20, 0x3333_4444)];
+    let multi_summary = evaluate_itree_batches_with_options(
+        "seeded",
+        0x3333_4444,
+        &multi_chunk_batches,
+        20,
+        &ItreeEvalOptions {
+            trials_per_candidate: 6,
+            anneal_repo_root: Some(root.clone()),
+            ..ItreeEvalOptions::default()
+        },
+    )
+    .expect("evaluate multi-chunk batch");
+    assert_eq!(multi_summary.compared_candidates, 20);
+    assert_eq!(multi_summary.not_compared_candidates, 0);
+    assert_eq!(
+        multi_summary.not_compared_reasons.values().sum::<usize>(),
+        0,
+        "unexpected not-compared reasons: {:?}",
+        multi_summary.not_compared_reasons
+    );
+    assert!(
+        multi_summary.distinct_traces_checked > 32,
+        "expected > 32 distinct traces across multiple Stage 2 chunks, got {}",
+        multi_summary.distinct_traces_checked
+    );
+    assert_eq!(multi_summary.diverge_candidates, 0);
+    assert_eq!(
+        multi_summary.kernel_confirmed_traces, multi_summary.compared_candidates,
+        "with 0 divergences, Stage 2 confirms exactly one trace per candidate"
+    );
+    assert!(
+        multi_summary.kernel_confirmed_traces > ITREE_CONFIRM_CHUNK_SIZE
+            && multi_summary.kernel_confirmed_traces < multi_summary.distinct_traces_checked,
+        "Stage 2 must span multiple {ITREE_CONFIRM_CHUNK_SIZE}-case chunks without \
+         over-claiming: kernel_confirmed_traces={}, distinct_traces_checked={}",
+        multi_summary.kernel_confirmed_traces,
+        multi_summary.distinct_traces_checked
+    );
+    assert!(
+        multi_summary
+            .obs_path_signatures
+            .iter()
+            .all(|s| !s.contains("b0_c")),
+        "obs_path_signatures must not depend on candidate positions: {:?}",
+        multi_summary.obs_path_signatures
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -192,6 +264,7 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
                 ".sub".to_string(),
             )],
             root_mir_swaps: Vec::new(),
+            ..ItreeEvalOptions::default()
         },
     )
     .expect("evaluate negative control A");
@@ -256,6 +329,7 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
                     "Mir.ItreeDiffStaged.b0_c0__kernel_step".to_string(),
                 ),
             ],
+            ..ItreeEvalOptions::default()
         },
     )
     .expect("evaluate negative control B");

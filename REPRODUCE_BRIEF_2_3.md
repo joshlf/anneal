@@ -1,8 +1,8 @@
 # Step-by-Step Reproduction Instructions for `BRIEF-2.3`
 
 - **Item ID**: `BRIEF-2.3` (Direct Polymorphic & Trait-Impl Emission in `anneal-rustc-capture`)
-- **Worktree**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-3`
-- **Branch**: `adv/brief-2-3` (merged into `sup/brief-2` at `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2`)
+- **Worktree**: `<path/to/anneal>`
+- **Branch**: `adv/brief-2-3` (merged into `sup/brief-2` at `<path/to/anneal>`)
 - **Base Commit (`sup/brief-2` / `BRIEF-2.1`)**: `f4e8bf6b2a3d88c25fd5adf75968a827c1c64f8a`
 - **Adversarial Round Checkpoints (`N = 4`, 9 commits)**:
   1. `A0`: `2607babb` — `[adv A0] Direct Polymorphic & Trait-Impl Emission`
@@ -18,7 +18,7 @@
 ## 1. Verify Worktree & Commit History
 
 ```bash
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-3
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -10
 ```
@@ -29,7 +29,7 @@ Expected: `git status --porcelain` is empty and `git log --oneline -10` shows al
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-3
+cd <path/to/anneal>
 cargo test -p anneal-rustc-capture
 ```
 
@@ -42,7 +42,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-3
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ```
 

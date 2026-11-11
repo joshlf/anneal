@@ -5,7 +5,7 @@
 **Objective ID**: `OBJ-1-SHRINK-UNSUPPORTED-MIR`  
 **Track**: `unstable` | **Priority**: `P1`  
 **Lead Engineer (LDAP)**: `markdittmer`  
-**Host Machine**: `cpl-nifty-canyon-4258.c.googlers.com` (`groupagent-anneal-bot`)  
+**Host Machine**: `<build-host>` (`<agent-host>`)  
 **Active Milestone**: **Workstream Complete (Episodes 1 & 2 Verified)**  
 **Active Branch**: `auto/ws-diff-rc-d` (Base: `unstable` at `a60d5c84cdfe2038f4e965c2a9c70c79f0c41009`)  
 **Last Updated**: 2026-11-08T03:02:00Z  
@@ -23,12 +23,12 @@
 
 ## 2. Resumption & Swarm UX
 
-- **Node Lease**: Leased to `cpl-nifty-canyon-4258.c.googlers.com` (`groupagent-anneal-bot`).
+- **Node Lease**: Leased to `<build-host>` (`<agent-host>`).
 - **Orchestration**: N-Round Adversarial implementation and verification with cross-family model diversity:
-  - `AGENT_A_MODEL`: `gemini-launch-candidate-high` (Model Y)
-  - `AGENT_B_MODEL`: `opus-5.5-max` (Model X)
-  - `SUPERVISOR_MODEL`: `gemini-pro-coordinator`
-  - `HELPER_MODEL`: `gemini-flash-next`
+  - `AGENT_A_MODEL`: `model-family-y-primary` (Model Y)
+  - `AGENT_B_MODEL`: `model-family-x-primary` (Model X)
+  - `SUPERVISOR_MODEL`: `supervisor-model-primary`
+  - `HELPER_MODEL`: `helper-model`
 - **Narrator / Monitor**: Active in swarm; maintaining continuous progress records across execution waves.
 
 ---

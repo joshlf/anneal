@@ -334,7 +334,7 @@ fn anchors_match_generated_items_and_cover_interp() {
             "Anchor `{file}`::{name}:{line} ({sha}) not found in generated items for `{file}`"
         );
     }
-    assert!(anchor_count >= 39, "expected at least 39 anchors, found {anchor_count}");
+    assert_eq!(anchor_count, 104, "expected 104 anchors, found {anchor_count}");
 
     let interp_path = minirust_dir().join("lean/MiniRustSpec/Interp.lean");
     let interp_text = std::fs::read_to_string(&interp_path).unwrap();
@@ -357,11 +357,26 @@ fn anchors_match_generated_items_and_cover_interp() {
         }
     }
 
-    // Every `theorem` in `Anchors.lean` and `Correspondence/Witness.lean` must be
-    // explicitly listed in `Audit.lean` so `lake build MiniRustSpec` logs its axioms.
+    // Every `theorem` in `Anchors.lean`, `Correspondence/Witness.lean`,
+    // `Correspondence/PointerWitness.lean`, `Correspondence/RefWitness.lean`,
+    // `Correspondence/TbWitness.lean`, `Correspondence/Provenance.lean`,
+    // `Correspondence/ProvenanceWitness.lean`,
+    // `Correspondence/IntrinsicFallback.lean`, and
+    // `Correspondence/IntrinsicBoundary.lean` must be explicitly listed in
+    // `Audit.lean` so `lake build MiniRustSpec` logs its axioms.
     let audit_text =
         std::fs::read_to_string(minirust_dir().join("lean/MiniRustSpec/Audit.lean")).unwrap();
-    for rel in ["lean/MiniRustSpec/Anchors.lean", "lean/MiniRustSpec/Correspondence/Witness.lean"] {
+    for rel in [
+        "lean/MiniRustSpec/Anchors.lean",
+        "lean/MiniRustSpec/Correspondence/Witness.lean",
+        "lean/MiniRustSpec/Correspondence/PointerWitness.lean",
+        "lean/MiniRustSpec/Correspondence/RefWitness.lean",
+        "lean/MiniRustSpec/Correspondence/TbWitness.lean",
+        "lean/MiniRustSpec/Correspondence/Provenance.lean",
+        "lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
+        "lean/MiniRustSpec/Correspondence/IntrinsicFallback.lean",
+        "lean/MiniRustSpec/Correspondence/IntrinsicBoundary.lean",
+    ] {
         let text = std::fs::read_to_string(minirust_dir().join(rel)).unwrap();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("theorem ") {
@@ -377,4 +392,34 @@ fn anchors_match_generated_items_and_cover_interp() {
             }
         }
     }
+
+    let sim_sec = &audit_text[audit_text.find("#check_theorem_deps \"[SIMULATION-AUDIT]\"").unwrap()..];
+    let sim_sec = &sim_sec[..sim_sec.find("\n\n").unwrap()];
+    let sim_count = sim_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(sim_count >= 369, "expected at least 369 [SIMULATION-AUDIT] theorems, found {sim_count}");
+
+    let wit_sec = &audit_text[audit_text.find("#check_theorem_deps \"[WITNESS-AUDIT]\"").unwrap()..];
+    let wit_sec = &wit_sec[..wit_sec.find("\n\n").unwrap()];
+    let wit_count = wit_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(wit_count >= 734, "expected at least 734 [WITNESS-AUDIT] theorems, found {wit_count}");
+
+    let ptr_sec = &audit_text[audit_text.find("#check_theorem_deps \"[POINTER-AUDIT]\"").unwrap()..];
+    let ptr_sec = &ptr_sec[..ptr_sec.find("\n\n").unwrap()];
+    let ptr_count = ptr_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(ptr_count >= 221, "expected at least 221 [POINTER-AUDIT] theorems, found {ptr_count}");
+
+    let ref_sec = &audit_text[audit_text.find("#check_theorem_deps \"[REF-AUDIT]\"").unwrap()..];
+    let ref_sec = &ref_sec[..ref_sec.find("\n\n").unwrap()];
+    let ref_count = ref_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(ref_count >= 434, "expected at least 434 [REF-AUDIT] theorems, found {ref_count}");
+
+    let tb_sec = &audit_text[audit_text.find("#check_theorem_deps \"[TB-AUDIT]\"").unwrap()..];
+    let tb_sec = &tb_sec[..tb_sec.find("\n\n").unwrap()];
+    let tb_count = tb_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(tb_count >= 192, "expected at least 192 [TB-AUDIT] theorems, found {tb_count}");
+
+    let prov_sec = &audit_text[audit_text.find("#check_theorem_deps \"[PROV-AUDIT]\"").unwrap()..];
+    let prov_sec = &prov_sec[..prov_sec.find("\n\n").unwrap()];
+    let prov_count = prov_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+    assert!(prov_count >= 369, "expected at least 369 [PROV-AUDIT] theorems, found {prov_count}");
 }

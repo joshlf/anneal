@@ -3,17 +3,10 @@ import Anneal.Rustc.V2026_06_01.SymReflect
 
 namespace Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
-open Trusted.Refinement
-open Trusted.Effect
-open Trusted.ITree
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Scalars
-open Anneal.Memory
-open Anneal.UnsafeObligations
-open Anneal.SepLogic
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
@@ -23,14 +16,20 @@ Kernel-checked test suite for `Anneal.Rustc.V2026_06_01.SymbolicEval`:
    `MirContractHoldsWithSafety` across panicking and non-panicking inputs).
 2. Branching (`SwitchInt`) symbolic verification paired with multi-block
    short-circuit `#[spec]` boolean companion predicates (`MirBoolPredicateHolds`),
-   plus one-call pinned `#[spec]` combinators (`dischargeRustEqU32`,
-   `dischargeRustEq2U8`).
+   plus one-call pinned `#[spec]` combinators (`dischargeRustEqU32FuelFree`,
+   `dischargeRustEq2U8FuelFree`).
 3. Stateful Tree Borrows pointer read/write verification (`StatefulClaim`,
-   `verifyStatefulMirNoPanicSym`, `dischargeStatefulEq`).
+   `verifyStatefulMirFuelFree`, `dischargeStatefulEqFuelFree`).
 4. Negative UB refutation tests (`refuteClaimByBoundedUB`,
    `refuteTotalClaimByBoundedUB`, `refuteStatefulClaimByBoundedUB`).
 5. Non-vacuity witness helpers (`proveNonVacuousPre`,
    `proveNonVacuousStatefulPre`, `proveNonVacuousBoolSpecPre`).
+
+`*VerificationResult` claims are discharged by fuel-free combinators (the
+`SymReflect` `*FuelFree` wrappers and the suite-local `SymConv` stepper below);
+explicit step bounds remain only where the API under test takes one (bounded
+refutation, point-bounded differential verdicts, `wpMirBoolSym` equivalence,
+and the polymorphic, modular, and linking combinators).
 -/
 
 /-! ## Helper Constructors for Self-Contained `CapturedMir` Test Bodies -/
@@ -139,21 +138,14 @@ def addBoundedClaim : Claim where
               .scalar { bits := b, sizeBytes := 1 }] →
       ret = .scalar { bits := a + b, sizeBytes := 1 }
 
-/-- Single-pass symbolic verification of `add_bounded` over all `10,000` `(a, b)` pairs. -/
+/-- Single-pass fuel-free symbolic verification of `add_bounded` over all `10,000` `(a, b)`. -/
 theorem addBoundedClaim_verified : VerificationResult addBoundedClaim := by
-  refine verifyWellTypedScalarArg2 addBoundedClaim 8 1 1 ?_ ?_
-  · rintro _ ⟨a, b, ha, hb, rfl⟩
-    exact ⟨a, b, by dsimp [scalarModulus, scalarPow2]; omega,
-                 by dsimp [scalarModulus, scalarPow2]; omega, rfl⟩
-  · intro a b _ _ ⟨a', b', ha', hb', heq⟩
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at heq
-    rcases heq with ⟨rfl, rfl⟩
-    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-    · simp_all; omega
-    · intro a'' b'' h_args
-      simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-      rcases h_args with ⟨rfl, rfl⟩
-      simp; omega
+  refine verifyByWPFuelFree addBoundedClaim ?_
+  rintro _ ⟨a, b, ha, hb, rfl⟩
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  · simp_all; omega
+  · rintro _ _ ⟨⟩
+    simp; omega
 
 def addBoundedTotalClaim : TotalClaim where
   body := addBoundedMir
@@ -167,14 +159,15 @@ def addBoundedTotalClaim : TotalClaim where
     (∃ s : Nat, s < 200 ∧ ret = .scalar { bits := s, sizeBytes := 1 }) ∧
     mem' = emptyMemory
 
-/-- Single-pass total-correctness (`DWP`) symbolic verification of `add_bounded`. -/
+/-- Single-pass fuel-free total-correctness (`DWP`) symbolic verification of `add_bounded`. -/
 theorem addBoundedTotalClaim_verified :
     TotalVerificationResult addBoundedTotalClaim := by
-  refine verifyTotalMirSym addBoundedTotalClaim 8 ?_
+  refine verifyTotalMirFuelFree addBoundedTotalClaim ?_
   rintro _ _ ⟨a, b, ha, hb, rfl, rfl⟩
+  rw [← wpMirSym_eq_wpMirBounded]
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · simp_all; omega
-  · exact ⟨⟨a + b, by omega, by simp; omega⟩, rfl⟩
+  · exact ⟨_, _, rfl, ⟨a + b, by omega, by simp; omega⟩, rfl⟩
 
 /--
 `pub fn advance_offset(offset: u8) -> u8 { offset + 4 }` verified across ALL 256
@@ -221,14 +214,12 @@ def advanceOffsetSymClaim : Claim where
 
 theorem advanceOffsetSymClaim_verified :
     VerificationResult advanceOffsetSymClaim := by
-  refine verifyWellTypedSafeScalarArg1 advanceOffsetSymClaim 8 1 (fun _ h => h) ?_
-  intro b hb _
+  refine verifyByWPSafeFuelFree advanceOffsetSymClaim ?_
+  rintro _ ⟨b, hb, rfl⟩
   dsimp [scalarModulus, scalarPow2] at hb
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · trivial
-  · rintro ⟨b', hb', h_pre⟩ b'' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_pre h_args
-    subst h_pre; subst h_args
+  · rintro ⟨_, hb', ⟨⟩⟩ _ ⟨⟩
     simp; omega
 
 theorem advanceOffsetSym_holdsWithSafety :
@@ -376,59 +367,30 @@ multi-block short-circuit `clampReqMir` predicate over all canonical `u8` inputs
 theorem clampReqMir_iff_arith (x : Nat) :
     MirBoolPredicateHolds clampReqMir [.scalar { bits := x, sizeBytes := 1 }] ↔
       (x < 20 ∧ x ≠ 15) := by
-  have h_iff :=
-    mirBoolPredicateHolds_iff_wpMirBoolSym 12 clampReqMir
-      [.scalar { bits := x, sizeBytes := 1 }] (by
-        ((repeat' ((conv => whnf); split)); all_goals (conv => whnf)) <;> trivial)
-  rw [h_iff]
-  constructor
-  · intro h
-    (repeat' ((conv at h => whnf); split at h))
-    all_goals (conv at h => whnf)
-    all_goals (try exact False.elim h)
-    all_goals simp_all
-    all_goals omega
-  · rintro ⟨hx20, hx15⟩
-    (repeat' ((conv => whnf); split))
-    all_goals (conv => whnf)
-    all_goals simp_all
-    all_goals omega
+  rw [mirBoolPredicateHolds_iff_wpMirBoolSym 12 clampReqMir _ (by
+    ((repeat' ((conv => whnf); split)); all_goals (conv => whnf)) <;> trivial)]
+  (repeat' ((conv => lhs; whnf); split)) <;>
+    (conv => lhs; whnf) <;>
+    simp_all <;> omega
 
 /--
 Single-pass symbolic verification of branching `clampOrStepMir` with `#[spec]`
 boolean companion `requires` (`clampReqMir`) and `ensures` (`clampEnsMir`).
 -/
 theorem clampOrStepClaim_verified : VerificationResult clampOrStepClaim := by
-  refine verifyWellTypedScalarArg1 clampOrStepClaim 12 1 (fun _ h => h.1) ?_
-  intro x hx ⟨_, h_req⟩
+  refine verifyByWPFuelFree clampOrStepClaim ?_
+  rintro _ ⟨⟨x, hx, rfl⟩, h_req⟩
   dsimp [scalarModulus, scalarPow2] at hx
-  have h_req_sym :=
-    holdBoolMirSym_of_mirBoolPredicateHolds 12 clampReqMir
-      [.scalar { bits := x, sizeBytes := 1 }] h_req
-  have hx20 : x < 20 := by
-    (repeat' ((conv at h_req_sym => whnf); split at h_req_sym))
-    all_goals (conv at h_req_sym => whnf)
-    all_goals (try exact False.elim h_req_sym)
-    all_goals simp_all
-    all_goals omega
+  have hx20 : x < 20 := ((clampReqMir_iff_arith x).1 h_req).1
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  · refine ⟨mirBoolPredicateHolds_of_wpMirSym 8 clampEnsMir _ (by
-      (repeat' ((conv => whnf); split)); all_goals (conv => whnf)), ?_⟩
-    intro x' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-    subst h_args
-    have h_not_lt : ¬ (x < 10) := by simp_all
-    simp [h_not_lt]
+  · refine ⟨mirBoolPredicateHolds_of_wp_fuelFree clampEnsMir _, ?_⟩
+    rintro _ ⟨⟩; simp_all; omega
   · simp_all; omega
-  · have h_wrap : (x + 1) % 256 = x + 1 := Nat.mod_eq_of_lt (by omega)
-    refine ⟨mirBoolPredicateHolds_of_wpMirSym 8 clampEnsMir _ (by
+  · refine ⟨mirBoolPredicateHolds_of_fuelFree clampEnsMir _ (by
+      rw [← wpMirSym_eq_wpMirBounded]
       (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-      simp_all; omega), ?_⟩
-    intro x' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-    subst h_args
-    have h_lt10 : x < 10 := by simp_all
-    simp [h_lt10, h_wrap]
+      all_goals first | (rintro _ _ ⟨⟩; rfl) | (simp_all; omega)), ?_⟩
+    rintro _ ⟨⟩; simp_all
 
 /-- Pinned 1-argument `u32` `#[spec(requires: magic == 7, ensures: ret == 7)]` test. -/
 def pinMagicMir : CapturedMir :=
@@ -472,9 +434,9 @@ def pinMagicClaim : Claim where
     MirBoolPredicateHolds pinMagicEnsMir (args ++ [ret])
 
 theorem pinMagicClaim_verified : VerificationResult pinMagicClaim :=
-  dischargeRustEqU32 pinMagicClaim 8 16 pinMagicReqMir pinMagicEnsMir 7
+  dischargeRustEqU32FuelFree pinMagicClaim pinMagicReqMir pinMagicEnsMir 7
 
-/-- Pinned 2-argument `(u8, u8)` short-circuit `&&` `#[spec]` test for `dischargeRustEq2U8`. -/
+/-- Pinned `(u8, u8)` short-circuit `&&` `#[spec]` test (`dischargeRustEq2U8FuelFree`). -/
 def totalFrameLenReqMir : CapturedMir :=
   mkMirBody "sym_test::req_total_frame_len" 2
     [ mkDecl .mut boolMirTy
@@ -533,8 +495,7 @@ def totalFrameLenClaim : Claim where
     MirBoolPredicateHolds totalFrameLenEnsMir (args ++ [ret])
 
 theorem totalFrameLenClaim_verified : VerificationResult totalFrameLenClaim :=
-  dischargeRustEq2U8 totalFrameLenClaim 16 16
-    totalFrameLenReqMir totalFrameLenEnsMir 1 2
+  dischargeRustEq2U8FuelFree totalFrameLenClaim totalFrameLenReqMir totalFrameLenEnsMir 1 2
 
 /-! ## 3. Stateful Tree Borrows Pointer Read & Mutation (`StatefulVerificationResult`) -/
 
@@ -585,12 +546,12 @@ def writeAndReadMutSymClaim : StatefulClaim where
       ret = .scalar { bits := v, sizeBytes := 1 }) ∧
     mem' = activeMutMem
 
-/-- Symbolic stateful verification for ALL `256` values of `ver: u8`. -/
+/-- Fuel-free symbolic stateful verification for ALL `256` values of `ver: u8`. -/
 theorem writeAndReadMutSymClaim_verified :
     StatefulVerificationResult writeAndReadMutSymClaim := by
-  refine verifyStatefulMirNoPanicSym writeAndReadMutSymClaim 8 ?_
-  rintro _ _ ⟨v, hv, rfl, rfl⟩
-  exact ⟨fun v' h_eq => by simp at h_eq; subst h_eq; rfl, rfl⟩
+  refine verifyStatefulMirFuelFree writeAndReadMutSymClaim ?_
+  rintro _ _ ⟨v, hv, rfl, rfl⟩ _ _ ⟨⟩
+  exact ⟨by rintro _ ⟨⟩; rfl, rfl⟩
 
 def writeAndReadMutPinnedClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -601,12 +562,11 @@ def writeAndReadMutPinnedClaim : StatefulClaim where
   post _ _ ret mem' :=
     ret = .scalar { bits := 42, sizeBytes := 1 } ∧ mem' = activeMutMem
 
-/-- Concrete pinned stateful verification via `dischargeStatefulEq` + `⟨rfl, rfl⟩`. -/
+/-- Concrete pinned stateful verification via `dischargeStatefulEqFuelFree` + `⟨rfl, rfl⟩`. -/
 theorem writeAndReadMutPinnedClaim_verified :
     StatefulVerificationResult writeAndReadMutPinnedClaim :=
-  dischargeStatefulEq
+  dischargeStatefulEqFuelFree
     writeAndReadMutPinnedClaim
-    8
     [.ptr { allocId := 1, offsetBytes := 0 } 8,
      .scalar { bits := 42, sizeBytes := 1 }]
     activeMutMem
@@ -842,8 +802,8 @@ def clampAddOne1000Claim : Claim where
   post args ret :=
     MirBoolPredicateHolds clampAddOneEns1000Mir (args ++ [ret])
 
-theorem clampAddOne1000_verified : VerificationResult clampAddOne1000Claim := by
-  exact dischargeRustSymRange1Auto
+theorem clampAddOne1000_verified : VerificationResult clampAddOne1000Claim :=
+  dischargeRustSymRange1Auto
     clampAddOne1000Claim 16 16
     clampAddOneReq1000Mir
     (.some clampAddOneEns1000Mir)
@@ -860,8 +820,6 @@ private def rawConstPtrParamTMirTy : Ty :=
   { kind := .rawPtr .not (.param 0 "T"), layoutIdx := 0 }
 private def rawMutPtrParamTMirTy : Ty :=
   { kind := .rawPtr .mut (.param 0 "T"), layoutIdx := 0 }
-private def rawMutSliceParamTMirTy : Ty :=
-  { kind := .rawPtr .mut (.slice (.param 0 "T")), layoutIdx := 0 }
 private def sliceRefU8MirTy : Ty :=
   { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }
 private def sliceMutRefU8MirTy : Ty :=
@@ -870,8 +828,6 @@ private def rawConstPtrU8MirTy : Ty :=
   { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
 private def rawMutPtrU8MirTy : Ty :=
   { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
-private def splitTupleParamTMirTy : Ty :=
-  { kind := .tuple [sliceMutRefParamTMirTy.kind, sliceMutRefParamTMirTy.kind], layoutIdx := 0 }
 private def splitTupleU8MirTy : Ty :=
   { kind := .tuple [sliceMutRefU8MirTy.kind, sliceMutRefU8MirTy.kind], layoutIdx := 0 }
 private def rangeUsizeMirTy : Ty :=
@@ -1096,478 +1052,77 @@ def sliceLenAsPtrFromRawPartsClaim : Claim where
   post args ret :=
     args = [ret]
 
-private def wpExecFast (body : CapturedMir) (post : MirOutcome → Prop) :
-    Nat → MirExecState → Prop
-  | 0, _ => False
-  | fuel' + 1, .running s =>
-    evalSymNodeTree (wpExecFast body post fuel') post (stepMirSymTree body s)
-  | _ + 1, .halted out => post out
-  | _ + 1, .faulted _ => False
+/-!
+### Fuel-Free Symbolic Convergence (`SymConv`)
 
-private theorem wpExecFast_eq
-    (fuel : Nat) (body : CapturedMir) (st : MirExecState) (post : MirOutcome → Prop) :
-    wpMirExecSym fuel body st post = wpExecFast body post fuel st := by
-  induction fuel generalizing st with
-  | zero => rfl
-  | succ fuel' ih =>
-    have h_fn : (fun st' => wpMirExecSym fuel' body st' post) = wpExecFast body post fuel' :=
-      funext (fun st' => ih st')
-    cases st with
-    | running s =>
-      dsimp only [wpMirExecSym, stepMirExecSymTree, wpExecFast]
-      rw [h_fn]
-    | halted out =>
-      dsimp only [wpMirExecSym, stepMirExecSymTree, evalSymNodeTree, wpExecFast]
-    | faulted fk =>
-      cases fk <;>
-        dsimp only [wpMirExecSym, stepMirExecSymTree, evalSymNodeTree, MirStepNode.fail, wpExecFast]
+`Anneal.MirFuelFree` and `Anneal.MirLiftCore` sit above `SymbolicEval` in the
+module DAG, and `trusted/audit/check_trusted.py` pins this suite's imports to
+`SymbolicEval` + `SymReflect`, so the suite carries the minimal fuel-free layer
+its multi-callee proofs need (their 18+ steps exceed the 16-step budget of the
+`SymReflect` `*FuelFree` wrappers): `SymConv body post st` hides the step
+budget of `wpMirExecSym` existentially, and `SymConv.step` discharges one
+call-free symbolic step whose `SymTree` is evaluated by `whnf`. The proofs
+`reduce` each intermediate state to a closed literal before stepping (so no
+`advanceStmt`/`pushCalleeFrame` chain accumulates) and rewrite only symbolic
+branch conditions; none of them states a step count.
+-/
 
-private def scalarU8TypeLayout : TypeLayout := {
-  size := { bytes := 1 }
-  align := { bytes := 1 }
-  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
-  fields := .primitive
-  variants := .single 0
-  isUninhabited := false
-}
+/-- Fuel-free convergence of `body` from `st` to `post` (`∃ fuel, wpMirExecSym ..`). -/
+private inductive SymConv (body : CapturedMir) (post : MirOutcome → Prop) :
+    MirExecState → Prop
+  | intro {st : MirExecState} (fuel : Nat) :
+      wpMirExecSym fuel body st post → SymConv body post st
 
-private def scalarPtrTypeLayout : TypeLayout := {
-  size := { bytes := 8 }
-  align := { bytes := 8 }
-  backendRepr :=
-    .scalar (.initialized (.pointer 0) { start := 0, end_ := 18446744073709551615 })
-  fields := .primitive
-  variants := .single 0
-  isUninhabited := false
-}
+/--
+One call-free symbolic step: every leaf of the step's `SymTree` either returns
+into `post` or continues as `SymConv`.
+-/
+private theorem SymConv.step {body : CapturedMir} {post : MirOutcome → Prop}
+    {st : MirExecState}
+    (h : evalSymNodeTreeNoCall (SymConv body post) post (stepMirExecSymTree body st)) :
+    SymConv body post st := by
+  have h_unfold : ∀ fuel, wpMirExecSym (fuel + 1) body st post =
+      evalNodeWP (fun st' => wpMirExecSym fuel body st' post) post
+        (stepMirState body st) := fun fuel => by
+    rw [wpMirExecSym, evalSymNodeTree_eq, stepMirExecSymTree_eval]
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h
+  cases h_st : stepMirState body st with
+  | ret out => rw [h_st] at h; exact ⟨1, by rw [h_unfold, h_st]; exact h⟩
+  | tau st' =>
+    rw [h_st] at h
+    obtain ⟨fuel, h_wp⟩ := h
+    exact ⟨fuel + 1, by rw [h_unfold, h_st]; exact h_wp⟩
+  | vis i k =>
+    rw [h_st] at h
+    rcases i with f | (e | c)
+    · exact h.elim
+    · obtain ⟨fuel, h_wp⟩ := h
+      exact ⟨fuel + 1, by rw [h_unfold, h_st]; exact h_wp⟩
+    · exact h.elim
 
-private def monomorphizedSliceLayouts : LayoutTable := {
-  pointerBits := 64
-  isLittleEndian := true
-  entries := [defaultU8TypeLayout, scalarU8TypeLayout]
-}
+/-- Discharge `VerificationResult c` from per-input fuel-free convergence. -/
+private theorem verifyMirNoPanic_of_symConv (c : Claim)
+    (h : ∀ args : List Value, c.pre args →
+      SymConv c.body (mirNormalPost fun retVal _ => c.post args retVal)
+        (.running (initMachineStateWithCallees c.body args c.callees))) :
+    VerificationResult c :=
+  verifyByDWLP c fun args h_pre => by
+    obtain ⟨_, h_wp⟩ := h args h_pre
+    exact dwlp_of_wpMirSym (s := initMachineStateWithCallees c.body args c.callees)
+      (wpMirSym_mono (fun out h_out =>
+        (mirSafePost_iff_forall_normal _ out).1 (mirNormalPost_imp_mirSafePost h_out)) h_wp)
 
-private def monomorphizedAsPtrLayouts : LayoutTable := {
-  pointerBits := 64
-  isLittleEndian := true
-  entries := [scalarPtrTypeLayout, scalarU8TypeLayout]
-}
-
-private def coreSliceLenU8Mir : CapturedMir := {
-  mkMirBody "core::slice::<impl [T]>::len" 1
-    [mkDecl .mut usizeMirTy, mkDecl .not sliceRefU8MirTy]
-    [ { statements :=
-          [ mkStmt (.assign { local_ := 0, projection := [] }
-              (.unaryOp .ptrMetadata (.move { local_ := 1, projection := [] }))) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  layouts := monomorphizedSliceLayouts
-}
-
-private def coreSliceAsPtrU8Mir : CapturedMir := {
-  mkMirBody "core::slice::<impl [T]>::as_ptr" 1
-    [ mkDecl .mut rawConstPtrU8MirTy
-    , mkDecl .not sliceRefU8MirTy ]
-    [ { statements :=
-          [ mkStmt (.assign { local_ := 0, projection := [] }
-              (.cast .ptrToPtr
-                (.move { local_ := 1, projection := [] })
-                rawConstPtrU8MirTy)) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  fnAbi := {
-    args := []
-    ret := { layout := scalarPtrTypeLayout, mode := .direct }
-    conv := .rust
-    canUnwind := true
-  }
-  layouts := monomorphizedAsPtrLayouts
-}
-
-private def coreSliceFromRawPartsMutU8Mir : CapturedMir := {
-  mkMirBody "core::slice::from_raw_parts_mut" 2
-    [ mkDecl .mut sliceMutRefU8MirTy
-    , mkDecl .not rawMutPtrU8MirTy
-    , mkDecl .not usizeMirTy ]
-    [ { statements :=
-          [ mkStmt (.assign { local_ := 0, projection := [] }
-              (.aggregate (.rawPtr { kind := .slice (.uint .u8), layoutIdx := 0 } .mut)
-                [ .copy { local_ := 1, projection := [] }
-                , .copy { local_ := 2, projection := [] } ])) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  layouts := monomorphizedSliceLayouts
-}
-
-private def sliceRoundtripCallees : List CapturedMir :=
-  [coreSliceLenMir, coreSliceAsPtrMir, coreSliceFromRawPartsMutMir]
-
-private theorem sliceCallerLayouts_pointerBits : sliceCallerLayouts.pointerBits = 64 := rfl
-private theorem sliceCallerLayouts_entries : sliceCallerLayouts.entries = [defaultU8TypeLayout] := rfl
-
-private theorem lookup_len_1 :
-    lookupCallee sliceRoundtripCallees
-      sliceCallerLayouts "core::slice::<impl [T]>::len" [.uint .u8] [] =
-    .some coreSliceLenU8Mir := rfl
-
-private theorem lookup_as_ptr_1 :
-    lookupCallee sliceRoundtripCallees
-      sliceCallerLayouts "core::slice::<impl [T]>::as_ptr" [.uint .u8] [] =
-    .some coreSliceAsPtrU8Mir := rfl
-
-private theorem lookup_from_raw_1 :
-    lookupCallee sliceRoundtripCallees
-      sliceCallerLayouts "core::slice::from_raw_parts_mut" [.uint .u8] [] =
-    .some coreSliceFromRawPartsMutU8Mir := rfl
-
-private theorem evalOperands_nil
-    (locals : List LocalSlot) (borrows : List BorrowEntry)
-    (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot)
-    (localDecls : List LocalDecl := .nil) :
-    evalOperands locals [] borrows globals layouts callerLocals localDecls = .ok [] locals := rfl
-
-private theorem evalOperands_cons
-    (locals : List LocalSlot) (op : Operand) (rest : List Operand)
-    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (layouts : LayoutTable) (callerLocals : List LocalSlot)
-    (localDecls : List LocalDecl := .nil) :
-    evalOperands locals (op :: rest) borrows globals layouts callerLocals localDecls =
-      match evalOperand locals op borrows globals layouts callerLocals localDecls with
-      | .ok v locals₁ =>
-        match evalOperands locals₁ rest borrows globals layouts callerLocals localDecls with
-        | .ok vs locals₂ => .ok (v :: vs) locals₂
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := rfl
-
-private theorem writeProjectedValue_nil
-    (locals : List LocalSlot) (v newVal : Value) :
-    writeProjectedValue locals v [] newVal = .ok newVal := rfl
-
-private theorem writeProjectedValue_field_aggregate
-    (locals : List LocalSlot) (varIdx : VariantIdx) (fields : List Value)
-    (fieldIdx : FieldIdx) (fieldTy : Ty) (rest : List ProjectionElem) (newVal : Value) :
-    writeProjectedValue locals (.aggregate varIdx fields) (.field fieldIdx fieldTy :: rest) newVal =
-      match Trusted.Sequence.get? fields fieldIdx with
-      | .some oldFieldVal =>
-        match writeProjectedValue locals oldFieldVal rest newVal with
-        | .ok updatedFieldVal =>
-          match Trusted.Sequence.set? fields fieldIdx updatedFieldVal with
-          | .some fields' => .ok (.aggregate varIdx fields')
-          | .none => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none =>
-        match writeProjectedValue locals .unit rest newVal with
-        | .ok updatedFieldVal =>
-          .ok (.aggregate varIdx (setOrExtendFields fields fieldIdx updatedFieldVal))
-        | .ub => .ub
-        | .unsupported => .unsupported := rfl
-
-private theorem evalRvalue_aggregate_tuple
-    (locals : List LocalSlot) (ops : List Operand) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.aggregate .tuple ops) mem localDecls layouts =
-      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
-      | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
-      | .ub => .ub
-      | .unsupported => .unsupported := rfl
-
-private theorem evalRvalue_aggregate_rawPtr
-    (locals : List LocalSlot) (elemTy : Ty) (mutability : Mutability)
-    (ops : List Operand) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.aggregate (.rawPtr elemTy mutability) ops) mem localDecls layouts =
-      let ptrBytes := layoutPointerBytes layouts
-      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
-      | .ok (.ptr ptrVal ptrSz :: .unit :: .nil) locals' =>
-        match isUnsizedRawPtrPointee elemTy, Nat.beq ptrSz ptrBytes with
-        | false, true => .ok (.ptr ptrVal ptrBytes) locals' mem
-        | _, _ => .ub
-      | .ok (.ptr ptrVal ptrSz :: .aggregate 0 .nil :: .nil) locals' =>
-        match isUnsizedRawPtrPointee elemTy, Nat.beq ptrSz ptrBytes with
-        | false, true => .ok (.ptr ptrVal ptrBytes) locals' mem
-        | _, _ => .ub
-      | .ok (.scalar addrSc :: .unit :: .nil) locals' =>
-        match isUnsizedRawPtrPointee elemTy, Nat.beq addrSc.sizeBytes ptrBytes with
-        | false, true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
-        | _, _ => .ub
-      | .ok (.scalar addrSc :: .aggregate 0 .nil :: .nil) locals' =>
-        match isUnsizedRawPtrPointee elemTy, Nat.beq addrSc.sizeBytes ptrBytes with
-        | false, true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
-        | _, _ => .ub
-      | .ok (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil) locals' =>
-        match wideAggregatePointeeIsDyn? elemTy with
-        | .some true => .unsupported
-        | .none => .ub
-        | .some false =>
-          match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-          | true =>
-            .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar ⟨metaSc.bits, ptrBytes⟩ :: .nil))
-              locals' mem
-          | false => .ub
-      | .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals' =>
-        match wideAggregatePointeeIsDyn? elemTy with
-        | .some true => .unsupported
-        | .none => .ub
-        | .some false =>
-          match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-          | true =>
-            let modPtr := scalarModulus ptrBytes
-            .ok
-              (.aggregate 0
-                (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
-                  .scalar ⟨wrapScalarBits metaSc.bits modPtr, ptrBytes⟩ :: .nil))
-              locals' mem
-          | false => .ub
-      | .ok (.ptr ptrVal ptrSz :: .ptr vtPtr vtSz :: .nil) locals' =>
-        match wideAggregatePointeeIsDyn? elemTy with
-        | .some true =>
-          match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq vtSz ptrBytes) with
-          | true =>
-            .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .ptr vtPtr ptrBytes :: .nil)) locals' mem
-          | false => .ub
-        | _ => .ub
-      | .ok (.scalar addrSc :: .ptr vtPtr vtSz :: .nil) locals' =>
-        match wideAggregatePointeeIsDyn? elemTy with
-        | .some true =>
-          match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq vtSz ptrBytes) with
-          | true =>
-            let modPtr := scalarModulus ptrBytes
-            .ok
-              (.aggregate 0
-                (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
-                  .ptr vtPtr ptrBytes :: .nil))
-              locals' mem
-          | false => .ub
-        | _ => .ub
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := rfl
-
-private theorem evalRvalue_unaryOp_ptrMetadata
-    (locals : List LocalSlot) (op : Operand) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
-      let ptrBytes := layoutPointerBytes layouts
-      let srcTyOpt := operandTy localDecls layouts op
-      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
-      | .ok (.aggregate 0 (.ptr _ ptrSz :: .scalar metaSc :: .nil)) locals' =>
-        match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-        | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
-        | false => .ub
-      | .ok (.aggregate 0 (.ptr _ ptrSz :: .ptr vtPtr vtSz :: .nil)) locals' =>
-        match isNonWidePtrAggregateTy srcTyOpt with
-        | true => .ok (.scalar ⟨2, ptrBytes⟩) locals' mem
-        | false =>
-          match
-            Bool.and
-              (Bool.not (isSliceOrStrPtrOrRefTy srcTyOpt))
-              (Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq vtSz ptrBytes))
-          with
-          | true => .ok (.ptr vtPtr ptrBytes) locals' mem
-          | false => .ub
-      | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
-        match isNonWidePtrAggregateTy srcTyOpt with
-        | true => .ok (.scalar ⟨2, ptrBytes⟩) locals' mem
-        | false =>
-          match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-          | true =>
-            .ok (.scalar ⟨wrapScalarBits metaSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
-          | false => .ub
-      | .ok (.aggregate 0 (.scalar addrSc :: .ptr vtPtr vtSz :: .nil)) locals' =>
-        match isNonWidePtrAggregateTy srcTyOpt with
-        | true => .ok (.scalar ⟨2, ptrBytes⟩) locals' mem
-        | false =>
-          match
-            Bool.and
-              (Bool.not (isSliceOrStrPtrOrRefTy srcTyOpt))
-              (Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq vtSz ptrBytes))
-          with
-          | true => .ok (.ptr vtPtr ptrBytes) locals' mem
-          | false => .ub
-      | .ok (.aggregate 0 elems) locals' =>
-        match isExplicitWidePtrTy srcTyOpt with
-        | true => .ub
-        | false => .ok (.scalar ⟨Trusted.Sequence.length elems, ptrBytes⟩) locals' mem
-      | .ok (.ptr _ ptrSz) locals' =>
-        match Nat.beq ptrSz ptrBytes with
-        | true => .ok .unit locals' mem
-        | false => .ub
-      | .ok (.scalar sc) locals' =>
-        match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (isThinPtrMetadataOperandTy srcTyOpt) with
-        | true => .ok .unit locals' mem
-        | false => .ub
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := rfl
-
-private theorem evalRvalue_cast_ptrToPtr
-    (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
-      let ptrBytes := layoutPointerBytes layouts
-      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
-      | .ok (.ptr ptrVal sz) locals' =>
-        match Nat.beq sz ptrBytes with
-        | false => .ub
-        | true =>
-          match thinRawPtrPointee? targetTy with
-          | .none => .ub
-          | .some dstElem =>
-            match arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem, lookupBorrow mem.borrows ptrVal.tag with
-            | .some arrLen, .some parentEntry =>
-              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen) ptrBytes
-            | _, _ => .ok (.ptr ptrVal ptrBytes) locals' mem
-      | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-        match Bool.and (Nat.beq sz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-        | false => .ub
-        | true =>
-          match isThinRawPtrTy targetTy with
-          | true =>
-            match lookupBorrow mem.borrows ptrVal.tag with
-            | .some parentEntry =>
-              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some metaSc.bits) ptrBytes
-            | .none => .ok (.ptr ptrVal ptrBytes) locals' mem
-          | false =>
-            match wideRawPtrIsDyn? targetTy with
-            | .some false =>
-              .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar metaSc :: .nil)) locals' mem
-            | .some true =>
-              match isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
-              | true => .ub
-              | false => .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar metaSc :: .nil)) locals' mem
-            | .none => .ub
-      | .ok (.aggregate 0 (.ptr ptrVal sz :: .ptr vtPtr vtSz :: .nil)) locals' =>
-        match Bool.and (Nat.beq sz ptrBytes) (Nat.beq vtSz ptrBytes) with
-        | false => .ub
-        | true =>
-          match isThinRawPtrTy targetTy with
-          | true => .ok (.ptr ptrVal ptrBytes) locals' mem
-          | false =>
-            match wideRawPtrIsDyn? targetTy, isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
-            | .some true, false =>
-              .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .ptr vtPtr ptrBytes :: .nil)) locals' mem
-            | _, _ => .ub
-      | .ok (.scalar sc) locals' =>
-        match Nat.beq sc.sizeBytes ptrBytes with
-        | false => .ub
-        | true =>
-          match isThinRawPtrTy targetTy with
-          | true =>
-            .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
-          | false => .ub
-      | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
-        match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
-        | false => .ub
-        | true =>
-          let modPtr := scalarModulus ptrBytes
-          let addrBits := wrapScalarBits addrSc.bits modPtr
-          let metaBits := wrapScalarBits metaSc.bits modPtr
-          match isThinRawPtrTy targetTy with
-          | true => .ok (.scalar ⟨addrBits, ptrBytes⟩) locals' mem
-          | false =>
-            match wideRawPtrIsDyn? targetTy with
-            | .some false =>
-              .ok (.aggregate 0 (.scalar ⟨addrBits, ptrBytes⟩ :: .scalar ⟨metaBits, ptrBytes⟩ :: .nil)) locals' mem
-            | .some true =>
-              match isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
-              | true => .ub
-              | false =>
-                .ok (.aggregate 0 (.scalar ⟨addrBits, ptrBytes⟩ :: .scalar ⟨metaBits, ptrBytes⟩ :: .nil)) locals' mem
-            | .none => .ub
-      | .ok (.aggregate 0 (.scalar addrSc :: .ptr vtPtr vtSz :: .nil)) locals' =>
-        match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq vtSz ptrBytes) with
-        | false => .ub
-        | true =>
-          let addrBits := wrapScalarBits addrSc.bits (scalarModulus ptrBytes)
-          match isThinRawPtrTy targetTy with
-          | true => .ok (.scalar ⟨addrBits, ptrBytes⟩) locals' mem
-          | false =>
-            match wideRawPtrIsDyn? targetTy, isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
-            | .some true, false =>
-              .ok (.aggregate 0 (.scalar ⟨addrBits, ptrBytes⟩ :: .ptr vtPtr ptrBytes :: .nil)) locals' mem
-            | _, _ => .ub
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := rfl
-
-set_option maxHeartbeats 800000 in
 /--
 Kernel-checked symbolic verification of `sliceLenAsPtrFromRawPartsMir` stepping
 through polymorphic `core::slice::<impl [T]>::len::<u8>`,
 `core::slice::<impl [T]>::as_ptr::<u8>`, and
-`core::slice::from_raw_parts_mut::<u8>` in a single `verifyMirNoPanicSym` pass.
+`core::slice::from_raw_parts_mut::<u8>` by fuel-free `SymConv` stepping.
 -/
 theorem sliceLenAsPtrFromRawParts_verified :
     VerificationResult sliceLenAsPtrFromRawPartsClaim := by
-  refine verifyMirNoPanicSym sliceLenAsPtrFromRawPartsClaim 24 ?_
+  refine verifyMirNoPanic_of_symConv _ ?_
   rintro _ ⟨p, len, rfl⟩
-  change wpMirSym 24 sliceLenAsPtrFromRawPartsMir
-    (initMachineStateWithCallees sliceLenAsPtrFromRawPartsMir _ sliceRoundtripCallees) _
-  have h_init :
-      initMachineStateWithCallees sliceLenAsPtrFromRawPartsMir
-        [.aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]]
-        sliceRoundtripCallees =
-      { frame :=
-          { blockIdx := 0
-            stmtIdx := 0
-            locals := initLocalsAux 0 sliceLenAsPtrFromRawPartsMir.localDecls
-              [.aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]] }
-        memory :=
-          { nextAllocId := 0
-            globals := []
-            borrows := []
-            nextTag := 1
-            callees := sliceRoundtripCallees
-            callStack := []
-            activeCallee := none
-            traitImpls := [] } } := rfl
-  rw [h_init]
-  unfold wpMirSym
-  rw [wpExecFast_eq]
-  set_option linter.unusedSimpArgs false in
-  simp only [sliceLenAsPtrFromRawPartsClaim, sliceLenAsPtrFromRawPartsMir,
-    coreSliceLenU8Mir, coreSliceAsPtrU8Mir, coreSliceFromRawPartsMutU8Mir,
-    sliceCallerLayouts_pointerBits, sliceCallerLayouts_entries,
-    monomorphizedSliceLayouts, monomorphizedAsPtrLayouts,
-    defaultU8TypeLayout, scalarU8TypeLayout, scalarPtrTypeLayout, defaultTestFnAbi,
-    usizeMirTy, sliceRefU8MirTy, sliceMutRefU8MirTy, rawConstPtrU8MirTy, rawMutPtrU8MirTy,
-    fnConstOp, mkMirBody, mkDecl, mkStmt, mkTerm, emptyLayoutTable,
-    initLocals, initLocalsAux, emptyMemory,
-    wpExecFast, evalSymNodeTree, stepMirSymTree,
-    evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTree, evalRvalueWithMemory,
-    evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
-    evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
-    isUnsizedRawPtrPointee, wideAggregatePointeeIsDyn?,
-    thinRawPtrPointee?, wideRawPtrIsDyn?, isSliceOrStrPtrOrRefTy, arrayPtrOrRefElemLen?,
-    isExplicitWidePtrTy, isNonWidePtrAggregateTy, isThinPtrMetadataOperandTy,
-    evalOperand, evalOperands_nil, evalOperands_cons, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
-    lookup_len_1, lookup_as_ptr_1, lookup_from_raw_1,
-    evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
-    resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,
-    checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
-    SymTree.bind, SymTree.run, evalNodeWP,
-    MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
-    readProjectedValue, writePlaceValue, validateValueForTy?, validateLoadedValue, isValidCharCode,
-    placeTouchesUnion, tyProjTouchesUnion, isUnionLayout, resolveTyWithLocalDecls, isUnresolvedLayoutIdx,
-    writeProjectedForLocal, writeProjectedValue_nil, writeProjectedValue_field_aggregate, setOrExtendFields,
-    ensureNestedFieldShells, uninitFieldWriteShell?,
-    resolveBorrowProjectionElems, resolveBorrowWriteLocalProj, truncateTyProjAtUnion,
-    placeIsZeroSized, tyIsZeroSized, rigidTyIsZeroSized, rigidTyKindByteSize,
-    invalidateConflictingBorrowsAtProj,
-    invalidateConflictingBorrows, disableLocalBorrows, lookupBorrow, ProvenancePtr.tag,
-    operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
-    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    Trusted.Sequence.get?, Trusted.Sequence.set?, Trusted.Sequence.length,
-    Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
-    ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-    Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+  repeat ((conv => arg 3; reduce); apply SymConv.step; conv => whnf)
 
 /--
 Caller `sliceSplitAtMutCallerMir` that invokes `core::slice::<impl [T]>::split_at_mut`
@@ -1617,130 +1172,40 @@ def sliceHelperPipelineClaim : Claim where
               [ .ptr { p with offsetBytes := p.offsetBytes + mid } 8
               , .scalar { bits := len - mid, sizeBytes := 8 } ] ]
 
-private def slicePipelineCallees : List CapturedMir :=
-  [coreSliceFromRawPartsMutMir, coreSliceLenMir, coreSliceSplitAtMutMir]
-
-private theorem lookup_split_2 :
-    lookupCallee slicePipelineCallees
-      sliceCallerLayouts "core::slice::<impl [T]>::split_at_mut" [] [] =
-    .some coreSliceSplitAtMutMir := rfl
-
-private theorem lookup_len_2 :
-    lookupCallee slicePipelineCallees
-      sliceCallerLayouts "core::slice::<impl [T]>::len" [.uint .u8] [] =
-    .some coreSliceLenU8Mir := rfl
-
-private theorem lookup_from_raw_2 :
-    lookupCallee slicePipelineCallees
-      sliceCallerLayouts "core::slice::from_raw_parts_mut" [.uint .u8] [] =
-    .some coreSliceFromRawPartsMutU8Mir := rfl
-
-set_option maxHeartbeats 800000 in
 /--
 Kernel-checked symbolic verification of `sliceSplitAtMutCallerMir` stepping
 through `split_at_mut`, `len`, and `from_raw_parts_mut` across nested
-stack frames (`callStack` depth 2) in a single `verifyMirNoPanicSym` pass.
+stack frames (`callStack` depth 2) by fuel-free `SymConv` stepping.
 -/
 theorem sliceHelperPipeline_verified :
     VerificationResult sliceHelperPipelineClaim := by
-  refine verifyMirNoPanicSym sliceHelperPipelineClaim 28 ?_
-  rintro _ ⟨⟨allocId, offsetBytes⟩, len, mid, h_alloc, h_le, h_len, rfl⟩
-  cases allocId with
-  | zero => exact False.elim (h_alloc rfl)
-  | succ allocId =>
-    dsimp only at h_len
-    have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
-    have h_mod : scalarModulus 8 = 18446744073709551616 := rfl
-    have h_half : signedHalfModulus 8 = 9223372036854775808 := rfl
-    have h_ble_mod : Nat.ble 18446744073709551616 mid = false :=
-      (nat_ble_eq_false_iff _ _).2 (by omega)
-    have h_ble_sub : Nat.ble 18446744073709551616 (len - mid) = false :=
-      (nat_ble_eq_false_iff _ _).2 (by omega)
-    have h_wrap : wrapScalarBits mid 18446744073709551616 = mid := by
-      unfold wrapScalarBits
-      rw [h_ble_mod]
-    have h1 : Nat.ble 9223372036854775808 mid = false :=
-      (nat_ble_eq_false_iff _ _).2 (by omega)
-    have h2 : Nat.ble 9223372036854775808 (Nat.mul mid 1) = false := by
-      change Nat.ble 9223372036854775808 (mid * 1) = false
-      exact (nat_ble_eq_false_iff _ _).2 (by omega)
-    have h3 : Nat.ble 9223372036854775808 (Nat.add offsetBytes (Nat.mul mid 1)) = false := by
-      change Nat.ble 9223372036854775808 (offsetBytes + mid * 1) = false
-      exact (nat_ble_eq_false_iff _ _).2 (by omega)
-    have h4 : Nat.ble 9223372036854775808 offsetBytes = false :=
-      (nat_ble_eq_false_iff _ _).2 (by omega)
-    let initArgs : List Value :=
-      [ .aggregate 0
-          [ .ptr { allocId := allocId + 1, offsetBytes := offsetBytes } 8
-          , .scalar { bits := len, sizeBytes := 8 } ]
-      , .scalar { bits := mid, sizeBytes := 8 } ]
-    have h_init :
-        initMachineStateWithCallees sliceHelperPipelineClaim.body initArgs sliceHelperPipelineClaim.callees =
-        { frame :=
-            { blockIdx := 0
-              stmtIdx := 0
-              locals := initLocalsAux 0 sliceSplitAtMutCallerMir.localDecls initArgs }
-          memory :=
-            { nextAllocId := 0
-              globals := []
-              borrows := []
-              nextTag := 1
-              callees := slicePipelineCallees
-              callStack := []
-              activeCallee := none
-              traitImpls := [] } } := rfl
-    rw [h_init]
-    unfold wpMirSym
-    rw [wpExecFast_eq]
-    set_option linter.unusedSimpArgs false in
-    simp only [initArgs, sliceHelperPipelineClaim, sliceSplitAtMutCallerMir, coreSliceSplitAtMutMir,
-      coreSliceLenU8Mir, coreSliceFromRawPartsMutU8Mir,
-      sliceCallerLayouts_pointerBits, sliceCallerLayouts_entries, monomorphizedSliceLayouts,
-      defaultU8TypeLayout, scalarU8TypeLayout, defaultTestFnAbi,
-      usizeMirTy, sliceRefU8MirTy, sliceMutRefU8MirTy, rawMutPtrU8MirTy, splitTupleU8MirTy,
-      fnConstOp, mkMirBody, mkDecl, mkStmt, mkTerm, emptyLayoutTable,
-      initLocals, initLocalsAux, emptyMemory,
-      wpExecFast, evalSymNodeTree, stepMirSymTree,
-      evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
-      evalRvalueSymTree, evalRvalueWithMemory,
-      evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
-      evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
-    isUnsizedRawPtrPointee, wideAggregatePointeeIsDyn?,
-    thinRawPtrPointee?, wideRawPtrIsDyn?, isSliceOrStrPtrOrRefTy, arrayPtrOrRefElemLen?,
-    isExplicitWidePtrTy, isNonWidePtrAggregateTy, isThinPtrMetadataOperandTy,
-      evalPtrOffsetBinOpSymTree, evalBinOpOffsetSymTree, finishBinOpOffsetSymTree,
-      pointeeElemByteStride, ptrAllocByteBound?, pointeeTyOf, elemTyOf, rigidTyKindByteSize, intCastTargetBytes,
-      rigidTyByteSize, UintTy.byteWidth, IntTy.byteWidth, FloatTy.byteWidth, lookupGlobalAlloc,
-      evalScalarBinOpSymTree, isSignedNegative, h_mod, h_half,
-      evalOperand, evalOperands_nil, evalOperands_cons, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
-      lookup_split_2, lookup_len_2, lookup_from_raw_2,
-      evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
-      resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,
-      checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
-      SymTree.bind, SymTree.run, evalNodeWP,
-      MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
-      readProjectedValue, writePlaceValue, validateValueForTy?, validateLoadedValue, isValidCharCode,
-      placeTouchesUnion, tyProjTouchesUnion, isUnionLayout, resolveTyWithLocalDecls, isUnresolvedLayoutIdx,
-      writeProjectedForLocal, writeProjectedValue_nil, writeProjectedValue_field_aggregate, setOrExtendFields,
-      ensureNestedFieldShells, uninitFieldWriteShell?,
-      resolveBorrowProjectionElems, resolveBorrowWriteLocalProj, truncateTyProjAtUnion,
-    placeIsZeroSized, tyIsZeroSized, rigidTyIsZeroSized, rigidTyKindByteSize,
-    invalidateConflictingBorrowsAtProj,
-      invalidateConflictingBorrows, disableLocalBorrows, lookupBorrow, ProvenancePtr.tag,
-      operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
-      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-      HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-      List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      Trusted.Sequence.get?, Trusted.Sequence.set?, Trusted.Sequence.length,
-      Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
-      ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-      Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq,
-      h_ble, h_ble_mod, h_ble_sub, h_wrap, h1, h2, h3, h4]
-    intro p' len' mid' h_args
-    simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-      Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-    rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
-    simp [wrapScalarBits, scalarModulus, h_ble_mod, h_ble_sub]
+  refine verifyMirNoPanic_of_symConv _ ?_
+  rintro _ ⟨⟨_ | allocId, offsetBytes⟩, len, mid, h_alloc, h_le, h_len, rfl⟩
+  · exact (h_alloc rfl).elim
+  dsimp only at h_len
+  have h_mod : scalarModulus 8 = 18446744073709551616 := rfl
+  have h_half : signedHalfModulus 8 = 9223372036854775808 := rfl
+  have h_wrap : wrapScalarBits mid 18446744073709551616 = mid :=
+    wrapScalarBits_eq_of_lt (by omega)
+  have h_d : Nat.ble 9223372036854775808 mid = false := (nat_ble_eq_false_iff _ _).2 (by omega)
+  have h_neg : isSignedNegative mid 8 = false := by
+    show Nat.ble (Nat.div (scalarModulus 8) 2) (wrapScalarBits mid (scalarModulus 8)) = false
+    rw [h_mod, h_wrap]; exact h_d
+  have h_mul : Nat.mul mid 1 = mid := Nat.mul_one mid
+  have h_c : Nat.ble 9223372036854775808 (Nat.add offsetBytes mid) = false :=
+    (nat_ble_eq_false_iff _ _).2 (by change offsetBytes + mid < _; omega)
+  have h_o : Nat.ble 9223372036854775808 offsetBytes = false :=
+    (nat_ble_eq_false_iff _ _).2 (by omega)
+  have h_sub : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
+  repeat' (first
+    | ((conv => arg 3; reduce); apply SymConv.step; conv => whnf)
+    | (simp only [layoutPointerBytes, Option.getD, h_mod, h_half, h_wrap, h_neg, h_mul, h_d, h_c,
+         h_o, h_sub, Bool.not_false];
+       conv => whnf))
+  rintro _ _ _ ⟨⟩
+  have h_ble_sub : Nat.ble 18446744073709551616 (len - mid) = false :=
+    (nat_ble_eq_false_iff _ _).2 (by omega)
+  simp [h_ble_sub]
 
 /--
 `core::ops::range::<impl RangeBounds<usize> for Range<usize>>::contains`:
@@ -1835,15 +1300,10 @@ Kernel-checked symbolic verification of trait-method dispatch through
 -/
 theorem rangeBoundsTraitDispatch_verified :
     VerificationResult rangeBoundsCallerClaim := by
-  refine verifyMirNoPanicSym rangeBoundsCallerClaim 16 ?_
+  refine verifyByWPFuelFree rangeBoundsCallerClaim ?_
   rintro _ ⟨start, end_, idx, h_lo, h_hi, rfl⟩
-  have h_ble1 : Nat.ble start idx = true := Nat.ble_eq_true_of_le h_lo
-  have h_ble2 : Nat.ble end_ idx = false := (nat_ble_eq_false_iff end_ idx).2 h_hi
-  (conv => whnf); split
-  · (conv => whnf); split
-    · rename_i h; rw [h_ble2] at h; cases h
-    · (conv => whnf)
-  · rename_i h; rw [h_ble1] at h; cases h
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  all_goals simp_all <;> omega
 
 /-! ## 9. Indirect `FnPtr` Calls (`ReifyFnPointer`, `fnPtrToPtr`, `TerminatorKind.call`, `TerminatorKind.tailCall`, `s.memory.fnPtrs`, and UB Refutation) -/
 
@@ -1921,13 +1381,9 @@ indirect `TerminatorKind.call` across all 256 `u8` inputs.
 -/
 theorem reifyAndCallFnPtr_verified :
     VerificationResult reifyAndCallFnPtrClaim := by
-  refine verifyMirNoPanicSym reifyAndCallFnPtrClaim 16 ?_
-  rintro _ ⟨x, _, rfl⟩
-  intro x' h_args
-  simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-  subst h_args
-  -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
-  simp <;> omega
+  refine verifyByWPFuelFree reifyAndCallFnPtrClaim ?_
+  rintro _ ⟨x, _, rfl⟩ _ ⟨⟩
+  simp <;> omega -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
 
 /--
 Caller `indirectFnPtrTailCallMir` taking an incoming function pointer parameter
@@ -1970,8 +1426,8 @@ through `s.memory.fnPtrs`.
 -/
 theorem indirectFnPtrTailCall_verified :
     StatefulVerificationResult indirectFnPtrTailCallClaim := by
-  refine verifyStatefulMirNoPanicSym indirectFnPtrTailCallClaim 12 ?_
-  rintro _ _ ⟨x, hx, rfl, rfl⟩
+  refine verifyStatefulMirFuelFree indirectFnPtrTailCallClaim ?_
+  rintro _ _ ⟨x, hx, rfl, rfl⟩ _ _ ⟨⟩
   exact ⟨_, rfl⟩
 
 /--
@@ -1995,8 +1451,8 @@ def indirectCallDanglingFnPtrClaim : StatefulClaim where
   post _ _ _ _ := True
 
 theorem indirectCallDanglingFnPtr_refuted :
-    ¬ indirectCallDanglingFnPtrClaim.holds := by
-  exact refuteStatefulClaimByBoundedUB
+    ¬ indirectCallDanglingFnPtrClaim.holds :=
+  refuteStatefulClaimByBoundedUB
     indirectCallDanglingFnPtrClaim 8
     [ .ptr { allocId := 99999, offsetBytes := 0 } 8
     , .scalar { bits := 7, sizeBytes := 1 } ]
@@ -2087,18 +1543,13 @@ the inlined `core::slice::<impl [T]>::len` call reduces cleanly.
 -/
 theorem guardedSliceLenSub_verified :
     VerificationResult guardedSliceLenSubClaim := by
-  refine verifyMirNoPanicSym guardedSliceLenSubClaim 16 ?_
+  refine verifyByWPFuelFree guardedSliceLenSubClaim ?_
   rintro _ ⟨p, len, mid, h_le, h_len, rfl⟩
-  have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
-  have h_sub : len - mid < 18446744073709551616 := by omega
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  · intro p' len' mid' h_args
-    simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-      Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-    rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
-    simp; exact h_sub
+  · rintro _ _ _ ⟨⟩
+    simp; omega
   · simp_all
-  · simp_all
+  · simp_all; omega
 
 /--
 `guardedPanicCallMir`: calls `core::slice::<impl [T]>::len::<u8>(_1)` and if
@@ -2178,15 +1629,11 @@ returning (`mid ≤ len`) and diverging-panic (`mid > len`) branches, plus its
 -/
 theorem guardedPanicCall_verified :
     VerificationResult guardedPanicCallClaim := by
-  refine verifyMirSym guardedPanicCallClaim 16 ?_
+  refine verifyByWPSafeFuelFree guardedPanicCallClaim ?_
   rintro _ ⟨p, len, mid, h_len, h_mid, rfl⟩
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  · intro p' len' mid' h_le h_args
-    simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-      Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-    rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
-    have h_sub : len - mid < 18446744073709551616 := by omega
-    simp; exact h_sub
+  · rintro _ _ _ h_le ⟨⟩
+    simp; omega
   · simp_all
   · trivial
 
@@ -2361,14 +1808,8 @@ theorem externalSpecSliceCaller_verified :
     "core::slice::from_raw_parts_mut"
     [.uint .u8]
     extFromRawPartsMutSidecarMir
-    (fun args =>
-      ∃ p len,
-        len < 18446744073709551616 ∧
-        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
-    (fun args ret =>
-      ∀ p len,
-        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }] →
-        ret = .aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
+    _
+    _
     externalSpecSliceCallerMir
     [coreSliceLenMir]
     externalSpecSliceCallerClaim.pre
@@ -2378,26 +1819,14 @@ theorem externalSpecSliceCaller_verified :
   rintro _ _ ⟨p, len, hp, hlen, rfl, rfl⟩
   (conv => whnf)
   refine ⟨⟨rfl, rfl, rfl, ⟨Or.inl ⟨p, 8, rfl⟩, ⟨len, hlen, rfl⟩, trivial⟩, ⟨p, len, hlen, rfl⟩⟩, ?_⟩
-  rintro ans h_post
-  cases ans with
-  | returned retVal memAfter =>
-    rcases h_post with ⟨_, _, h_ens⟩
-    have h_ret := h_ens p len rfl
-    subst h_ret
+  rintro (⟨retVal, memAfter⟩ | _ | _) h_post
+  · rcases h_post with ⟨_, _, h_ens⟩
+    obtain rfl := h_ens p len rfl
     (conv => whnf)
-    rintro retVal' mem' h_out p' len' h_args
-    injection h_out with h_pair
-    injection h_pair with h_rv _
-    subst h_rv
-    simp only [List.cons.injEq, Value.ptr.injEq, Value.scalar.injEq,
-      ScalarInt.mk.injEq, and_true] at h_args
-    rcases h_args with ⟨rfl, rfl⟩
+    rintro _ _ ⟨⟩ _ _ ⟨⟩
     rfl
-  | panicked memAfter =>
-    exact False.elim h_post
-  | aborted =>
-    intro _ _ h_eq
-    cases h_eq
+  · exact h_post.elim
+  · rintro _ _ ⟨⟩
 
 /--
 Kernel-checked compositional caller–callee linking via
@@ -2429,20 +1858,12 @@ theorem externalSpecSliceCaller_linked_verified :
     abortExternalCalls
     ?_
     ?_
-  · rintro req h_path ⟨_, h_typeArgs, _, _, ⟨p, len, h_len_lt, h_args⟩⟩
-    cases req with
-    | mk defPath typeArgs args memory =>
-      dsimp only at h_path h_typeArgs h_args ⊢
-      subst h_path h_typeArgs h_args
-      refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl, ?_, ?_⟩
-      · exact ⟨p, 8, len, h_len_lt, rfl⟩
-      · intro p' len' h_eq
-        simp only [List.cons.injEq, Value.ptr.injEq, Value.scalar.injEq,
-          ScalarInt.mk.injEq, and_true] at h_eq
-        rcases h_eq with ⟨rfl, rfl⟩
-        rfl
-  · rintro req h_ne ⟨h_eq, _⟩
-    exact False.elim (h_ne h_eq)
+  · rintro ⟨defPath, typeArgs, args, memory⟩ rfl ⟨_, rfl, _, _, ⟨p, len, h_len_lt, rfl⟩⟩
+    refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl,
+      ⟨p, 8, len, h_len_lt, rfl⟩, ?_⟩
+    rintro _ _ ⟨⟩
+    rfl
+  · exact fun _ h_ne ⟨h_eq, _⟩ => (h_ne h_eq).elim
 
 /--
 `O(1)` lookup context witness for `coreSliceLenMir` basic block `0` and
@@ -2546,8 +1967,8 @@ subject body and its `ensures` companion predicate invoke a linked callee in
 `callees` / `specCallees`.
 -/
 theorem pinnedWithSpecCallees_verified :
-    VerificationResult pinnedWithSpecCalleesClaim := by
-  exact dischargeRustPinnedContractWithSpecCalleesAuto
+    VerificationResult pinnedWithSpecCalleesClaim :=
+  dischargeRustPinnedContractWithSpecCalleesAuto
     pinnedWithSpecCalleesClaim 16 16
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
@@ -2568,8 +1989,8 @@ Kernel-checked total verification of `pinnedWithSpecCalleesTotalClaim` via
 `dischargeRustTotalPinnedContractWithSpecCalleesAuto`.
 -/
 theorem pinnedWithSpecCalleesTotal_verified :
-    TotalVerificationResult pinnedWithSpecCalleesTotalClaim := by
-  exact dischargeRustTotalPinnedContractWithSpecCalleesAuto
+    TotalVerificationResult pinnedWithSpecCalleesTotalClaim :=
+  dischargeRustTotalPinnedContractWithSpecCalleesAuto
     pinnedWithSpecCalleesTotalClaim 16 16
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
@@ -2883,7 +2304,7 @@ theorem confirm_tag_ub_transmute_invalid_enum_tag__b7_c29 :
     evalMirDiffTagBounded 64 ubTransmuteInvalidEnumTagB7C29Body
       (initMachineStateWithMemory
         ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory) =
-      MirDiffTag.normalScalar 1 1 := by
+      MirDiffTag.normalScalar 1 1 :=
   rfl
 
 /--
@@ -2896,7 +2317,7 @@ theorem confirm_probe_ub_transmute_invalid_enum_tag__b7_c29 :
       (.running
         (initMachineStateWithMemory
           ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory)) =
-      (MirDiffTag.normalScalar 1 1, "none") := by
+      (MirDiffTag.normalScalar 1 1, "none") :=
   rfl
 
 /--
@@ -2934,8 +2355,8 @@ theorem confirm_ub_transmute_invalid_enum_tag_out_of_range :
       (.running
         (initMachineStateWithMemory
           ubTransmuteInvalidEnumTagOutOfRangeBody [] emptyMemory)) =
-      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") := by
-  exact ⟨rfl, rfl⟩
+      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") :=
+  ⟨rfl, rfl⟩
 
 /--
 Adversarial edge-case bodies for scalar-represented enum return classification:
@@ -3127,8 +2548,8 @@ theorem scalar_enum_return_edge_cases_confirmed :
     probeMirDiffBounded 16 nicheOptionBoolNoneBody
       (initMachineStateWithMemory
         nicheOptionBoolNoneBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      (MirDiffTag.normalOther, "none") :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Kernel-checked `TotalVerificationResult` certification for
@@ -3461,8 +2882,8 @@ theorem scalar_enum_return_b1_hardening_confirmed :
     probeMirDiffBounded 16 outOfWidthRangeScalarEnumBody
       (initMachineStateWithMemory
         outOfWidthRangeScalarEnumBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      (MirDiffTag.normalOther, "none") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
@@ -3475,6 +2896,9 @@ Namespace-shadowing regression check verifying that generated modules (such as
 -/
 namespace MiriOracleShadowCompatCheck
 
+-- Keep in sync with the `open` header that `crates/cargo-anneal/src/miri_oracle.rs` emits
+-- for `MiriOracleProbe` / `MiriOracleConfirm` (including the otherwise-unused
+-- `Trusted.Sequence`), so this check sees the same name environment.
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
@@ -3521,7 +2945,7 @@ theorem local_and_qualified_probe_resolve :
           Anneal.Rustc.V2026_06_01.SymbolicEvalTests.ubTransmuteInvalidEnumTagB7C29Body
           []
           emptyMemory)) =
-      (MirDiffTag.normalScalar 1 1, "none") := by
-  exact ⟨rfl, rfl⟩
+      (MirDiffTag.normalScalar 1 1, "none") :=
+  ⟨rfl, rfl⟩
 
 end MiriOracleShadowCompatCheck

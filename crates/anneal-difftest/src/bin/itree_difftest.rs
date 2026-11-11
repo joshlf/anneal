@@ -357,6 +357,7 @@ fn main() {
         findings_dir: args.findings_dir.clone(),
         mir_mutations: Vec::new(),
         root_mir_swaps: Vec::new(),
+        ..ItreeEvalOptions::default()
     };
     let eval_report = match evaluate_itree_batches_with_options(
         mode,

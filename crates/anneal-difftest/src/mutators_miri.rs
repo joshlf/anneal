@@ -15,7 +15,7 @@
 //! (`ArithmeticCastMutator`, `PlaceProjectionWrapper`, `RawPtrOffsetMutator`,
 //! `TreeBorrowsRetagInterleaver`, and `BitValidityTransmuteMutator`) produce
 //! closed zero-argument mutants suitable for direct execution by both Miri and
-//! Anneal's MIR-in-Lean oracle (`cargo_anneal::run_difftest_oracle_pipeline`).
+//! Anneal's helper-linked MIR-in-Lean oracle (`crate::miri_eval`).
 
 use quote::{ToTokens, format_ident};
 use syn::visit_mut::VisitMut;
@@ -1379,11 +1379,7 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
                 Item::Fn(f) if f.sig.ident != "helper_add_ten" => Some(f.sig.ident.to_string()),
                 _ => None,
             })?;
-            if !fn_name.starts_with("panic_")
-                && !fn_name.starts_with("ub_")
-                && fn_name != "pass_direct_fn_call"
-                && fn_name != "pass_exact_div_valid"
-            {
+            if !fn_name.starts_with("panic_") && !fn_name.starts_with("ub_") {
                 Some(idx)
             } else {
                 None
@@ -1567,6 +1563,8 @@ mod tests {
             .map(|&idx| seeds[idx].name.as_str())
             .collect();
         for known_bug_seed in [
+            "pass_direct_fn_call",
+            "pass_exact_div_valid",
             "pass_ptr_offset_within_array",
             "pass_copy_nonoverlapping_uninit_bytes_to_uninit",
             "pass_tb_unsafe_cell_shared_mutation",

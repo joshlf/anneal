@@ -1,9 +1,15 @@
-//! Integration tests for MIR cast lowering and MiniRust provenance correspondence.
+//! Integration tests for MIR cast lowering, MiniRust provenance correspondence,
+//! and same-size `CastKind::Transmute` lowering and evaluation across 32-bit and 64-bit targets.
 
-use anneal_mir::ir::{CastKind, IntTy, Mutability, Operand, PointerValue, Provenance, Ty, UintTy};
+use anneal_mir::ir::{
+    CastKind, Constant, IntTy, Mutability, Operand, PointerValue, Provenance, PtrWidth, ScalarTy,
+    Ty, UintTy,
+};
 use anneal_mir::lower::{
-    CastEvalError, ExposedProvenanceTracker, LoweredCast, eval_int_to_ptr, eval_ptr_to_int,
-    lower_cast_rvalue,
+    AbstractByte, CastEvalError, CastLowerError, CastOp, ExposedProvenanceTracker, LoweredCast,
+    MirValue, ProvenanceFrag, RvalueEvalError, TransmutePolicy, TransmuteValue, eval_char_to_int,
+    eval_int_to_int, eval_int_to_ptr, eval_lowered_cast, eval_ptr_to_int, eval_transmute,
+    lower_cast_rvalue, lower_cast_rvalue_with_ptr_width, lower_char_to_int, lower_transmute,
 };
 
 #[test]
@@ -59,4 +65,1132 @@ fn test_wildcard_provenance_allowed() {
         .expect("wildcard / None provenance is always valid");
     assert_eq!(ptr.addr, 0x1234_5678);
     assert_eq!(ptr.provenance, None);
+}
+
+#[test]
+fn test_transmute_32bit_vs_64bit_pointer_width_sizes() {
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let isize_ty = Ty::Int(IntTy::Isize);
+    let raw_ptr_ty = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let op = Operand::Constant(Constant::Int(0x1234, u32_ty.clone()));
+
+    // Under Bits32: usize, isize, RawPtr are 4 bytes (match u32, mismatch u64)
+    for ptr_sized in [&usize_ty, &isize_ty, &raw_ptr_ty] {
+        assert_eq!(ptr_sized.byte_size_for(PtrWidth::Bits32), 4);
+        assert_eq!(ptr_sized.byte_size_for(PtrWidth::Bits64), 8);
+
+        let lowered_32 = lower_cast_rvalue_with_ptr_width(
+            CastKind::Transmute,
+            &op,
+            &u32_ty,
+            ptr_sized,
+            PtrWidth::Bits32,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .expect("u32 -> ptr-sized on 32-bit must succeed");
+        assert!(matches!(
+            lowered_32,
+            LoweredCast::Transmute {
+                size_bytes: 4,
+                exposes_provenance: false,
+                ..
+            }
+        ));
+
+        let mismatch_32 = lower_cast_rvalue_with_ptr_width(
+            CastKind::Transmute,
+            &op,
+            &u64_ty,
+            ptr_sized,
+            PtrWidth::Bits32,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .expect_err("u64 -> ptr-sized on 32-bit must fail");
+        assert_eq!(
+            mismatch_32,
+            CastLowerError::SizeMismatchTransmute {
+                src_ty: u64_ty.clone(),
+                target_ty: (*ptr_sized).clone(),
+                src_bytes: 8,
+                target_bytes: 4,
+            }
+        );
+
+        // Under Bits64: u64 -> ptr-sized succeeds, u32 -> ptr-sized fails
+        let lowered_64 = lower_cast_rvalue_with_ptr_width(
+            CastKind::Transmute,
+            &op,
+            &u64_ty,
+            ptr_sized,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .expect("u64 -> ptr-sized on 64-bit must succeed");
+        assert!(matches!(
+            lowered_64,
+            LoweredCast::Transmute {
+                size_bytes: 8,
+                exposes_provenance: false,
+                ..
+            }
+        ));
+
+        let mismatch_64 = lower_cast_rvalue_with_ptr_width(
+            CastKind::Transmute,
+            &op,
+            &u32_ty,
+            ptr_sized,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .expect_err("u32 -> ptr-sized on 64-bit must fail");
+        assert_eq!(
+            mismatch_64,
+            CastLowerError::SizeMismatchTransmute {
+                src_ty: u32_ty.clone(),
+                target_ty: (*ptr_sized).clone(),
+                src_bytes: 4,
+                target_bytes: 8,
+            }
+        );
+    }
+}
+
+#[test]
+fn test_transmute_inhabitation_subtlety_empty_vs_nonempty_never_array() {
+    let op = Operand::Constant(Constant::Unit);
+    let unit_ty = Ty::unit();
+    let arr_never_0 = Ty::Array(Box::new(Ty::Never), 0);
+    let arr_never_1 = Ty::Array(Box::new(Ty::Never), 1);
+    let tuple_never = Ty::Tuple(vec![Ty::Never, Ty::Uint(UintTy::U32)]);
+
+    // [!; 0] is inhabited of size 0
+    assert!(arr_never_0.is_inhabited());
+    assert_eq!(arr_never_0.checked_byte_size(PtrWidth::Bits64), Some(0));
+    let ok_lower = lower_transmute(
+        &op,
+        &unit_ty,
+        &arr_never_0,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+    )
+    .expect("() -> [!; 0] must lower cleanly");
+    assert_eq!(
+        ok_lower,
+        LoweredCast::Transmute {
+            src_ty: unit_ty.clone(),
+            target_ty: arr_never_0,
+            operand: op.clone(),
+            op: CastOp::AggregateTransmute { size_bytes: 0 },
+            size_bytes: 0,
+            exposes_provenance: false,
+        }
+    );
+
+    // !, [!; 1], and (!, u32) are uninhabited
+    for uninhabited in [Ty::Never, arr_never_1, tuple_never] {
+        assert!(!uninhabited.is_inhabited());
+        assert_eq!(uninhabited.checked_byte_size(PtrWidth::Bits64), None);
+        let err = lower_transmute(
+            &op,
+            &unit_ty,
+            &uninhabited,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .expect_err("uninhabited target must be rejected");
+        assert_eq!(
+            err,
+            CastLowerError::UninhabitedTarget {
+                target_ty: uninhabited
+            }
+        );
+    }
+}
+
+#[test]
+fn test_transmute_provenance_discipline_vs_expose_provenance() {
+    let tracker = ExposedProvenanceTracker::new();
+    let prov = Provenance {
+        alloc_id: 77,
+        tag: 9001,
+    };
+    let ptr = PointerValue::with_provenance(0x0041, prov.alloc_id, prov.tag);
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let raw_u32 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U32)), Mutability::Mut);
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let op = Operand::Constant(Constant::Ptr(ptr, raw_u8.clone()));
+
+    // 1. Default RejectPtrToInt rejects Ptr -> Int transmute
+    let err = lower_cast_rvalue(CastKind::Transmute, &op, &raw_u8, &usize_ty)
+        .expect_err("default policy must reject Ptr -> Int transmute");
+    assert_eq!(
+        err,
+        CastLowerError::PtrToIntTransmuteDisallowed {
+            src_ty: raw_u8.clone(),
+            target_ty: usize_ty.clone(),
+        }
+    );
+
+    // 2. AllowPtrToIntStripProvenance permits Ptr -> Int transmute with exposes_provenance: false,
+    //    and evaluation strips provenance WITHOUT exposing it in tracker!
+    let lowered_strip = lower_transmute(
+        &op,
+        &raw_u8,
+        &usize_ty,
+        PtrWidth::Bits64,
+        TransmutePolicy::AllowPtrToIntStripProvenance,
+    )
+    .expect("AllowPtrToIntStripProvenance must allow Ptr -> usize");
+    assert!(matches!(
+        lowered_strip,
+        LoweredCast::Transmute {
+            exposes_provenance: false,
+            ..
+        }
+    ));
+
+    let eval_stripped = eval_transmute(
+        TransmuteValue::Ptr(ptr),
+        &raw_u8,
+        &usize_ty,
+        PtrWidth::Bits64,
+        TransmutePolicy::AllowPtrToIntStripProvenance,
+        &tracker,
+    )
+    .expect("eval Ptr -> usize under strip policy");
+    assert_eq!(eval_stripped, TransmuteValue::Scalar(0x0041));
+    assert!(!tracker.is_exposed(&prov));
+
+    // Because provenance was NOT exposed by transmute, IntToPtr cannot claim `prov`!
+    let reconstruct_err = eval_int_to_ptr(0x0041, &raw_u8, &tracker, Some(prov))
+        .expect_err("provenance stripped by transmute is not exposed");
+    assert_eq!(reconstruct_err, CastEvalError::UnexposedProvenance(prov));
+
+    // 3. Ptr -> Ptr transmute preserves provenance without exposing it in tracker
+    let eval_p2p = eval_transmute(
+        TransmuteValue::Ptr(ptr),
+        &raw_u8,
+        &raw_u32,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .expect("Ptr -> Ptr transmute must succeed");
+    assert_eq!(eval_p2p, TransmuteValue::Ptr(ptr));
+    assert!(!tracker.is_exposed(&prov));
+
+    // 4. Int -> Ptr transmute produces provenance: None
+    let eval_i2p = eval_transmute(
+        TransmuteValue::Scalar(0x0041),
+        &usize_ty,
+        &raw_u8,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .expect("usize -> RawPtr transmute must succeed");
+    assert_eq!(
+        eval_i2p,
+        TransmuteValue::Ptr(PointerValue::without_provenance(0x0041))
+    );
+}
+
+#[test]
+fn test_transmute_niche_validation_bool_char_and_null_ref() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty.clone()), Mutability::Not);
+    let ref_u8 = Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not);
+
+    // Bool valid: 0 and 1; invalid: 2 and 255
+    for valid_b in [0u128, 1u128] {
+        assert!(ScalarTy::Bool.is_valid_bits(valid_b, PtrWidth::Bits64));
+        let res = eval_transmute(
+            TransmuteValue::Scalar(valid_b),
+            &u8_ty,
+            &Ty::Bool,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        )
+        .unwrap();
+        assert_eq!(res, TransmuteValue::Scalar(valid_b));
+    }
+    for invalid_b in [2u128, 255u128] {
+        assert!(!ScalarTy::Bool.is_valid_bits(invalid_b, PtrWidth::Bits64));
+        let err = eval_transmute(
+            TransmuteValue::Scalar(invalid_b),
+            &u8_ty,
+            &Ty::Bool,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        )
+        .expect_err("invalid bool discriminant must fail");
+        assert_eq!(
+            err,
+            CastEvalError::InvalidBitPattern {
+                target_ty: Ty::Bool,
+                bits: invalid_b,
+            }
+        );
+    }
+
+    // Char valid: 0, 0xD7FF, 0xE000, 0x10FFFF; invalid: surrogates 0xD800, 0xDFFF, and 0x110000
+    for valid_c in [0u128, 0xD7FF, 0xE000, 0x10FFFF] {
+        assert!(ScalarTy::Char.is_valid_bits(valid_c, PtrWidth::Bits64));
+        let res = eval_transmute(
+            TransmuteValue::Scalar(valid_c),
+            &u32_ty,
+            &Ty::Char,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        )
+        .unwrap();
+        assert_eq!(res, TransmuteValue::Scalar(valid_c));
+    }
+    for invalid_c in [0xD800u128, 0xDFFFu128, 0x110000u128] {
+        assert!(!ScalarTy::Char.is_valid_bits(invalid_c, PtrWidth::Bits64));
+        let err = eval_transmute(
+            TransmuteValue::Scalar(invalid_c),
+            &u32_ty,
+            &Ty::Char,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        )
+        .expect_err("invalid char codepoint must fail");
+        assert_eq!(
+            err,
+            CastEvalError::InvalidBitPattern {
+                target_ty: Ty::Char,
+                bits: invalid_c,
+            }
+        );
+
+        // Also test Ptr -> Char on 32-bit under AllowPtrToIntStripProvenance!
+        let bad_ptr = PointerValue::with_provenance(invalid_c as u64, 1, 1);
+        let ptr_char_err = eval_transmute(
+            TransmuteValue::Ptr(bad_ptr),
+            &raw_u8,
+            &Ty::Char,
+            PtrWidth::Bits32,
+            TransmutePolicy::AllowPtrToIntStripProvenance,
+            &tracker,
+        )
+        .expect_err("Ptr -> Char on 32-bit with invalid Unicode scalar must fail");
+        assert_eq!(
+            ptr_char_err,
+            CastEvalError::InvalidBitPattern {
+                target_ty: Ty::Char,
+                bits: invalid_c,
+            }
+        );
+    }
+
+    // Valid Ptr -> Char on 32-bit under AllowPtrToIntStripProvenance
+    let good_ptr = PointerValue::with_provenance(0xE000, 1, 1);
+    let ptr_char_ok = eval_transmute(
+        TransmuteValue::Ptr(good_ptr),
+        &raw_u8,
+        &Ty::Char,
+        PtrWidth::Bits32,
+        TransmutePolicy::AllowPtrToIntStripProvenance,
+        &tracker,
+    )
+    .expect("valid Unicode scalar address in Ptr -> Char on 32-bit must succeed");
+    assert_eq!(ptr_char_ok, TransmuteValue::Scalar(0xE000));
+
+    // Null reference rejection on both Ptr -> Ref and Int -> Ref
+    let null_ptr = PointerValue::without_provenance(0);
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Ptr(null_ptr),
+            &raw_u8,
+            &ref_u8,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: ref_u8.clone(),
+            bits: 0,
+        })
+    );
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Scalar(0),
+            &u32_ty,
+            &ref_u8,
+            PtrWidth::Bits32,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: ref_u8,
+            bits: 0,
+        })
+    );
+}
+
+#[test]
+fn test_composite_aggregate_transmute_bytes() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let arr_u8_4 = Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 4);
+    let arr_bool_4 = Ty::Array(Box::new(Ty::Bool), 4);
+    let tuple_u16_2 = Ty::Tuple(vec![Ty::Uint(UintTy::U16), Ty::Uint(UintTy::U16)]);
+
+    // u32 -> [u8; 4] -> (u16, u16) -> u32
+    let bytes_val = eval_transmute(
+        TransmuteValue::Scalar(0x0100_0100),
+        &u32_ty,
+        &arr_u8_4,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(bytes_val, TransmuteValue::Bytes(vec![0, 1, 0, 1]));
+
+    // Valid [bool; 4]
+    let bool_arr_ok = eval_transmute(
+        bytes_val.clone(),
+        &arr_u8_4,
+        &arr_bool_4,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(bool_arr_ok, TransmuteValue::Bytes(vec![0, 1, 0, 1]));
+
+    // Invalid [bool; 4] when one byte is 2
+    let bad_bool_err = eval_transmute(
+        TransmuteValue::Scalar(0x0200_0100),
+        &u32_ty,
+        &arr_bool_4,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .expect_err("transmute u32 with byte 2 to [bool; 4] must fail");
+    assert!(matches!(bad_bool_err, CastEvalError::InvalidBitPattern { .. }));
+
+    // (u16, u16) -> u32 roundtrip
+    let back_to_u32 = eval_transmute(
+        bytes_val,
+        &tuple_u16_2,
+        &u32_ty,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(back_to_u32, TransmuteValue::Scalar(0x0100_0100));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// Encodes `addr` as a thin pointer's little-endian bytes carrying ordered provenance fragments.
+fn ptr_bytes(addr: u64, prov: Option<Provenance>, ptr_width: PtrWidth) -> Vec<AbstractByte> {
+    addr.to_le_bytes()[..ptr_width.byte_size()]
+        .iter()
+        .enumerate()
+        .map(|(position, &data)| AbstractByte {
+            data,
+            provenance: prov.map(|provenance| ProvenanceFrag {
+                provenance,
+                position,
+            }),
+        })
+        .collect()
+}
+
+#[test]
+fn test_b1_tuple_layout_sizes_match_rustc_and_padded_tuples_are_not_transmutable() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let op = Operand::Constant(Constant::Unit);
+
+    // Sizes/alignments observed from rustc 1.98 on x86_64 (`size_of`/`align_of`). A0 summed
+    // field sizes and reported 5, 6, 3, 12, 4, 1 respectively.
+    let padded_cases = [
+        (Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]), 8, 4),
+        (Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone(), u8_ty.clone()]), 8, 4),
+        (Ty::Tuple(vec![u16_ty.clone(), u8_ty.clone()]), 4, 2),
+        (Ty::Tuple(vec![u64_ty.clone(), u32_ty.clone()]), 16, 8),
+        (Ty::Tuple(vec![Ty::Never, u32_ty.clone()]), 4, 4),
+        (Ty::Tuple(vec![Ty::Array(Box::new(u32_ty.clone()), 0), u8_ty.clone()]), 4, 4),
+    ];
+    for (ty, size, align) in &padded_cases {
+        assert_eq!(ty.byte_size_for(PtrWidth::Bits64), *size, "{ty:?}");
+        assert_eq!(ty.byte_size(), *size, "{ty:?}");
+        assert_eq!(ty.layout_size_for(PtrWidth::Bits64), Some(*size), "{ty:?}");
+        assert_eq!(ty.align_for(PtrWidth::Bits64), *align, "{ty:?}");
+        assert!(!ty.has_canonical_byte_layout(PtrWidth::Bits64), "{ty:?}");
+    }
+
+    // (u8, u32) -> [u8; 5] is a size mismatch in rustc (8 vs 5 bytes), A0 accepted it.
+    let padded = Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]);
+    let arr_u8_5 = Ty::Array(Box::new(u8_ty.clone()), 5);
+    assert_eq!(
+        lower_transmute(&op, &padded, &arr_u8_5, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::SizeMismatchTransmute {
+            src_ty: padded.clone(),
+            target_ty: arr_u8_5,
+            src_bytes: 8,
+            target_bytes: 5,
+        })
+    );
+    // (u8, u32) -> u64 has matching sizes, but padding bytes have no defined byte image.
+    assert_eq!(
+        lower_transmute(&op, &padded, &u64_ty, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::UnsupportedLayout { ty: padded.clone() })
+    );
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Bytes(vec![0; 8]),
+            &padded,
+            &u64_ty,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Err(CastEvalError::UnsupportedLayout { ty: padded })
+    );
+
+    // Canonical tuples round-trip little-endian, in declaration order.
+    let canon = Ty::Tuple(vec![u32_ty.clone(), u16_ty.clone(), u16_ty.clone()]);
+    assert!(canon.has_canonical_byte_layout(PtrWidth::Bits64));
+    let bytes = eval_transmute(
+        TransmuteValue::Scalar(0x4444_3333_2222_1111),
+        &u64_ty,
+        &canon,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(
+        bytes,
+        TransmuteValue::Bytes(vec![0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44])
+    );
+    let back = eval_transmute(
+        bytes,
+        &canon,
+        &u64_ty,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(back, TransmuteValue::Scalar(0x4444_3333_2222_1111));
+
+    // Tuples whose fields are not sorted by alignment group are not canonical.
+    let unsorted = Ty::Tuple(vec![u32_ty.clone(), u64_ty.clone(), u32_ty.clone()]);
+    assert_eq!(unsorted.byte_size_for(PtrWidth::Bits64), 16);
+    assert!(!unsorted.has_canonical_byte_layout(PtrWidth::Bits64));
+
+    // Mixed niche tuples are not canonical; identical-field niche tuples are, and keep validity.
+    assert!(!Ty::Tuple(vec![u8_ty, Ty::Bool]).has_canonical_byte_layout(PtrWidth::Bits64));
+    let bools = Ty::Tuple(vec![Ty::Bool, Ty::Bool]);
+    assert!(bools.has_canonical_byte_layout(PtrWidth::Bits64));
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Scalar(0x0001),
+            &u16_ty,
+            &bools,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Ok(TransmuteValue::Bytes(vec![1, 0]))
+    );
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Scalar(0x0200),
+            &u16_ty,
+            &bools,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Bool,
+            bits: 2,
+        })
+    );
+}
+
+#[test]
+fn test_b1_transmute_rejects_unrepresentable_layouts_instead_of_saturating() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let op = Operand::Constant(Constant::Unit);
+
+    // A0 saturated both sizes to usize::MAX and accepted this as a "same-size" transmute.
+    let huge_u8 = Ty::Array(Box::new(u8_ty.clone()), usize::MAX);
+    let huge_u16 = Ty::Array(Box::new(u16_ty.clone()), usize::MAX);
+    assert_eq!(huge_u8.byte_size_for(PtrWidth::Bits64), usize::MAX);
+    assert_eq!(huge_u16.byte_size_for(PtrWidth::Bits64), usize::MAX);
+    assert_eq!(huge_u8.layout_size_for(PtrWidth::Bits64), None);
+    assert_eq!(
+        lower_transmute(&op, &huge_u8, &huge_u16, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::LayoutTooLarge { ty: huge_u8 })
+    );
+
+    // On 32-bit targets objects are limited to isize::MAX = 2^31 - 1 bytes.
+    let max32 = Ty::Array(Box::new(u8_ty.clone()), (1 << 31) - 1);
+    let big32 = Ty::Array(Box::new(u8_ty.clone()), 1 << 31);
+    assert_eq!(max32.layout_size_for(PtrWidth::Bits32), Some((1 << 31) - 1));
+    assert_eq!(big32.layout_size_for(PtrWidth::Bits32), None);
+    assert_eq!(big32.checked_byte_size(PtrWidth::Bits32), None);
+    assert_eq!(big32.layout_size_for(PtrWidth::Bits64), Some(1 << 31));
+    let big32_u16 = Ty::Array(Box::new(u16_ty), 1 << 30);
+    assert_eq!(
+        lower_transmute(&op, &big32, &big32_u16, PtrWidth::Bits32, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::LayoutTooLarge { ty: big32.clone() })
+    );
+    assert!(
+        lower_transmute(&op, &big32, &big32_u16, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .is_ok()
+    );
+    // Zero-sized elements: the array length itself must fit in the target's usize.
+    let zst_arr = Ty::Array(Box::new(Ty::unit()), 1 << 32);
+    assert_eq!(zst_arr.layout_size_for(PtrWidth::Bits32), None);
+    assert_eq!(zst_arr.layout_size_for(PtrWidth::Bits64), Some(0));
+
+    // Too many pointers to analyze for the provenance policy is reported as unsupported.
+    let many_ptrs = Ty::Array(
+        Box::new(Ty::RawPtr(Box::new(u8_ty.clone()), Mutability::Not)),
+        1 << 17,
+    );
+    let many_words = Ty::Array(Box::new(Ty::Uint(UintTy::Usize)), 1 << 17);
+    assert_eq!(
+        lower_transmute(
+            &op,
+            &many_ptrs,
+            &many_words,
+            PtrWidth::Bits64,
+            TransmutePolicy::AllowPtrToIntStripProvenance
+        ),
+        Err(CastLowerError::UnsupportedLayout { ty: many_ptrs })
+    );
+}
+
+#[test]
+fn test_b1_pointer_preserving_aggregate_transmutes_keep_provenance_without_exposing() {
+    let tracker = ExposedProvenanceTracker::new();
+    let prov = Provenance { alloc_id: 3, tag: 33 };
+    let ptr = PointerValue::with_provenance(0x1000, prov.alloc_id, prov.tag);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let ref_u8 = Ty::Ref(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let arr_ref = Ty::Array(Box::new(ref_u8), 1);
+    let op = Operand::Constant(Constant::Ptr(ptr, raw_u8.clone()));
+
+    // A0 rejected this under the default policy: the target is not itself a pointer type,
+    // although the pointer lands exactly on a pointer.
+    let lowered = lower_cast_rvalue(CastKind::Transmute, &op, &raw_u8, &arr_ref)
+        .expect("*const u8 -> [&u8; 1] preserves the pointer");
+    assert!(matches!(
+        lowered,
+        LoweredCast::Transmute {
+            op: CastOp::AggregateTransmute { size_bytes: 8 },
+            exposes_provenance: false,
+            ..
+        }
+    ));
+    let out = eval_transmute(
+        TransmuteValue::Ptr(ptr),
+        &raw_u8,
+        &arr_ref,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        TransmuteValue::AbstractBytes(ptr_bytes(0x1000, Some(prov), PtrWidth::Bits64))
+    );
+    // ... and back again, still carrying the provenance (never exposed).
+    let back = eval_transmute(
+        out,
+        &arr_ref,
+        &raw_u8,
+        PtrWidth::Bits64,
+        TransmutePolicy::RejectPtrToInt,
+        &tracker,
+    )
+    .unwrap();
+    assert_eq!(back, TransmuteValue::Ptr(ptr));
+
+    // (*const u8, u64) -> (*mut u16, u64): pointer lands on a pointer at the same offset.
+    let pair = Ty::Tuple(vec![raw_u8.clone(), u64_ty.clone()]);
+    let pair_mut = Ty::Tuple(vec![
+        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U16)), Mutability::Mut),
+        u64_ty.clone(),
+    ]);
+    assert!(
+        lower_transmute(&op, &pair, &pair_mut, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .is_ok()
+    );
+    let mut pair_bytes = ptr_bytes(0x1000, Some(prov), PtrWidth::Bits64);
+    pair_bytes.extend(0x2000u64.to_le_bytes().map(AbstractByte::new));
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::AbstractBytes(pair_bytes.clone()),
+            &pair,
+            &pair_mut,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Ok(TransmuteValue::AbstractBytes(pair_bytes.clone()))
+    );
+
+    // (*const u8, u64) -> (u64, *const u8): the pointer would land on the u64 (Ptr -> Int).
+    let swapped = Ty::Tuple(vec![u64_ty, raw_u8]);
+    assert_eq!(
+        lower_transmute(&op, &pair, &swapped, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::PtrToIntTransmuteDisallowed {
+            src_ty: pair.clone(),
+            target_ty: swapped.clone(),
+        })
+    );
+    // Under the strip policy, the u64 receives the bare address and the pointer built from
+    // the old u64 bytes has no provenance; nothing is exposed.
+    let stripped = eval_transmute(
+        TransmuteValue::AbstractBytes(pair_bytes),
+        &pair,
+        &swapped,
+        PtrWidth::Bits64,
+        TransmutePolicy::AllowPtrToIntStripProvenance,
+        &tracker,
+    )
+    .unwrap();
+    let mut expected = 0x1000u64.to_le_bytes().to_vec();
+    expected.extend(0x2000u64.to_le_bytes());
+    assert_eq!(stripped, TransmuteValue::Bytes(expected));
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_b1_pointer_decode_requires_consistent_ordered_provenance_fragments() {
+    let tracker = ExposedProvenanceTracker::new();
+    let p1 = Provenance { alloc_id: 1, tag: 1 };
+    let p2 = Provenance { alloc_id: 2, tag: 2 };
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+
+    for ptr_width in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        let transmute = |bytes: Vec<AbstractByte>| {
+            eval_transmute(
+                TransmuteValue::AbstractBytes(bytes),
+                &raw_u8,
+                &raw_u8,
+                ptr_width,
+                TransmutePolicy::RejectPtrToInt,
+                &tracker,
+            )
+        };
+        // Consistent, in-order fragments keep the provenance.
+        assert_eq!(
+            transmute(ptr_bytes(0x40, Some(p1), ptr_width)),
+            Ok(TransmuteValue::Ptr(PointerValue::with_provenance(0x40, 1, 1)))
+        );
+        // Mixed provenances yield a pointer without provenance.
+        let mut mixed = ptr_bytes(0x40, Some(p1), ptr_width);
+        let last = mixed.len() - 1;
+        mixed[last].provenance = Some(ProvenanceFrag {
+            provenance: p2,
+            position: last,
+        });
+        assert_eq!(
+            transmute(mixed),
+            Ok(TransmuteValue::Ptr(PointerValue::without_provenance(0x40)))
+        );
+        // Shuffled fragments (wrong positions) also lose the provenance.
+        let mut shuffled = ptr_bytes(0x40, Some(p1), ptr_width);
+        shuffled.swap(0, 1);
+        assert_eq!(
+            transmute(shuffled),
+            Ok(TransmuteValue::Ptr(PointerValue::without_provenance(0x4000)))
+        );
+        // A partially provenance-free pointer loses the provenance.
+        let mut partial = ptr_bytes(0x40, Some(p1), ptr_width);
+        partial[0].provenance = None;
+        assert_eq!(
+            transmute(partial),
+            Ok(TransmuteValue::Ptr(PointerValue::without_provenance(0x40)))
+        );
+    }
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_b1_eval_int_to_int_validates_char_targets() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    assert_eq!(eval_int_to_int(0x41, &u8_ty, &Ty::Char, PtrWidth::Bits64), Ok(0x41));
+    assert_eq!(
+        eval_int_to_int(0xD800, &u32_ty, &Ty::Char, PtrWidth::Bits64),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Char,
+            bits: 0xD800,
+        })
+    );
+    assert_eq!(
+        eval_int_to_int(0x11_0000, &u32_ty, &Ty::Char, PtrWidth::Bits64),
+        Err(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Char,
+            bits: 0x11_0000,
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a1_tuple_canonical_layout_rejects_increasing_field_alignment_with_same_size() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `([u8; 4], u32)` has field sizes (4, 4) so `max(align, size)` is 4 for both, but
+    // `[u8; 4]` has align 1 < `u32` align 4: older `rustc` versions sorted fields by plain ABI
+    // alignment (moving the `u32` first), so this layout is not *guaranteed* to stay in
+    // declaration order across compilers. (`rustc` 1.98 happens to keep it: offsets `[0, 4]`.)
+    // Similarly `([u8; 6], u16)` (alignment-group keys (1, 1), align 1 < 2; 1.98 offsets
+    // `[0, 6]`) and `((u32, u32), u64)` (sizes (8, 8), align 4 < 8; 1.98 offsets `[0, 8]`).
+    let non_canonical = [
+        Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]),
+        Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 6), u16_ty.clone()]),
+        Ty::Tuple(vec![
+            Ty::Tuple(vec![u32_ty.clone(), u32_ty.clone()]),
+            u64_ty.clone(),
+        ]),
+    ];
+
+    for bad_tuple in &non_canonical {
+        assert!(
+            !bad_tuple.has_canonical_byte_layout(PtrWidth::Bits64),
+            "{bad_tuple:?} must not be treated as canonical declaration-order layout"
+        );
+        let size = bad_tuple.byte_size_for(PtrWidth::Bits64);
+        let byte_arr = Ty::Array(Box::new(u8_ty.clone()), size);
+        assert_eq!(
+            lower_transmute(
+                &op,
+                bad_tuple,
+                &byte_arr,
+                PtrWidth::Bits64,
+                TransmutePolicy::RejectPtrToInt,
+            ),
+            Err(CastLowerError::UnsupportedLayout {
+                ty: bad_tuple.clone(),
+            })
+        );
+        assert_eq!(
+            eval_transmute(
+                TransmuteValue::Bytes(vec![0; size]),
+                bad_tuple,
+                &byte_arr,
+                PtrWidth::Bits64,
+                TransmutePolicy::RejectPtrToInt,
+                &tracker,
+            ),
+            Err(CastEvalError::UnsupportedLayout {
+                ty: bad_tuple.clone(),
+            })
+        );
+    }
+
+    // Conversely, `(u32, [u8; 4])` and `(u64, (u32, u32))` have non-increasing alignments
+    // and zero padding, so they ARE canonical.
+    let canon_u32_arr = Ty::Tuple(vec![u32_ty.clone(), Ty::Array(Box::new(u8_ty), 4)]);
+    let canon_u64_pair = Ty::Tuple(vec![u64_ty, Ty::Tuple(vec![u32_ty.clone(), u32_ty])]);
+    assert!(canon_u32_arr.has_canonical_byte_layout(PtrWidth::Bits64));
+    assert!(canon_u64_pair.has_canonical_byte_layout(PtrWidth::Bits64));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b2_identity_transmute_lowers_for_non_canonical_layouts() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `transmute::<T, T>` (e.g. after monomorphizing generic code) is the identity whatever
+    // T's layout; A0/B1/A1 rejected these with `UnsupportedLayout` because the padded /
+    // possibly-reordered layouts have no canonical byte image.
+    let padded = Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]);
+    let unsorted = Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]);
+    for ty in [&padded, &unsorted] {
+        assert!(!ty.has_canonical_byte_layout(PtrWidth::Bits64));
+        let lowered = lower_transmute(&op, ty, ty, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .expect("identity transmute must lower");
+        assert!(matches!(
+            lowered,
+            LoweredCast::Transmute {
+                op: CastOp::AggregateTransmute { size_bytes: 8 },
+                exposes_provenance: false,
+                ..
+            }
+        ));
+    }
+    // Pointers stay on themselves, so the default policy is satisfied even for a mixed-niche
+    // tuple holding a reference.
+    let with_ref = Ty::Tuple(vec![Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not), u8_ty.clone()]);
+    assert!(
+        lower_transmute(&op, &with_ref, &with_ref, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .is_ok()
+    );
+    // Identity still requires an inhabited, representable type.
+    let uninhabited = Ty::Tuple(vec![Ty::Never, u32_ty.clone()]);
+    assert_eq!(
+        lower_transmute(&op, &uninhabited, &uninhabited, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::UninhabitedTarget {
+            target_ty: uninhabited.clone(),
+        })
+    );
+    let too_big = Ty::Array(Box::new(u8_ty), 1 << 31);
+    assert_eq!(
+        lower_transmute(&op, &too_big, &too_big, PtrWidth::Bits32, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::LayoutTooLarge { ty: too_big })
+    );
+    // Non-identity transmutes through non-canonical layouts remain unsupported.
+    assert_eq!(
+        lower_transmute(&op, &padded, &Ty::Uint(UintTy::U64), PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::UnsupportedLayout { ty: padded })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a2_eval_transmute_identity_bypasses_pointer_leaf_budget_for_canonical_arrays() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty), Mutability::Not);
+    let many_ptrs = Ty::Array(Box::new(raw_u8), 1 << 17);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `lower_transmute` accepts `many_ptrs -> many_ptrs` because `src_ty == target_ty`.
+    // `eval_transmute` must also skip `collect_pointer_offsets` when `src_ty == target_ty`
+    // rather than failing with `UnsupportedLayout` on the 65,536-pointer leaf budget.
+    assert!(
+        lower_transmute(
+            &op,
+            &many_ptrs,
+            &many_ptrs,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .is_ok()
+    );
+    let zero_bytes = vec![0u8; (1 << 17) * 8];
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Bytes(zero_bytes.clone()),
+            &many_ptrs,
+            &many_ptrs,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Ok(TransmuteValue::Bytes(zero_bytes))
+    );
+    assert!(tracker.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Episode 1 (`ep1-rust-place-proj-nullary-stmt`): `CastKind::CharToInt` tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_ep1_char_to_int_lowering_and_evaluation_all_widths_and_boundaries() {
+    let mut tracker = ExposedProvenanceTracker::new();
+    let op = Operand::Constant(Constant::Char('A'));
+    assert_eq!(CastOp::CharToInt, CastOp::CharToInt);
+
+    let all_int_targets = [
+        Ty::Uint(UintTy::U8),
+        Ty::Uint(UintTy::U16),
+        Ty::Uint(UintTy::U32),
+        Ty::Uint(UintTy::U64),
+        Ty::Uint(UintTy::U128),
+        Ty::Uint(UintTy::Usize),
+        Ty::Int(IntTy::I8),
+        Ty::Int(IntTy::I16),
+        Ty::Int(IntTy::I32),
+        Ty::Int(IntTy::I64),
+        Ty::Int(IntTy::I128),
+        Ty::Int(IntTy::Isize),
+    ];
+
+    for ptr_width in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        for target_ty in &all_int_targets {
+            let lowered = lower_cast_rvalue_with_ptr_width(
+                CastKind::CharToInt,
+                &op,
+                &Ty::Char,
+                target_ty,
+                ptr_width,
+                TransmutePolicy::RejectPtrToInt,
+            )
+            .expect("Char -> integral target must lower cleanly");
+            assert_eq!(
+                lowered,
+                LoweredCast::CharToInt {
+                    operand: op.clone(),
+                    target_ty: target_ty.clone(),
+                }
+            );
+            assert_eq!(
+                lower_char_to_int(&op, &Ty::Char, target_ty, ptr_width),
+                Ok(lowered.clone())
+            );
+
+            // Boundary Unicode scalar values: '\0', 'A', '\u{00FF}', '\u{D7FF}', '\u{E000}',
+            // '\u{1F600}', '\u{10FFFF}'.
+            for ch in ['\0', 'A', '\u{00FF}', '\u{D7FF}', '\u{E000}', '\u{1F600}', '\u{10FFFF}'] {
+                let code = u128::from(u32::from(ch));
+                let expected_bits = code & target_ty.scalar_mask(ptr_width);
+                assert_eq!(
+                    eval_char_to_int(code, target_ty, ptr_width),
+                    Ok(expected_bits)
+                );
+                let val = eval_lowered_cast(
+                    &lowered,
+                    &MirValue::Char(ch),
+                    ptr_width,
+                    TransmutePolicy::RejectPtrToInt,
+                    &mut tracker,
+                )
+                .expect("eval_lowered_cast on valid MirValue::Char must succeed");
+                assert_eq!(
+                    val,
+                    MirValue::Int {
+                        bits: expected_bits,
+                        ty: target_ty.clone(),
+                    }
+                );
+            }
+        }
+
+        // Narrow target truncation & sign reinterpretation:
+        // '\u{00FF}' as i8 -> bits 0xFF (-1i8), 'A' as u8 -> 65, '\u{1F600}' as u16 -> 0xF600
+        let lowered_i8 = lower_char_to_int(&op, &Ty::Char, &Ty::Int(IntTy::I8), ptr_width).unwrap();
+        let val_i8 = eval_lowered_cast(
+            &lowered_i8,
+            &MirValue::Char('\u{00FF}'),
+            ptr_width,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(
+            val_i8,
+            MirValue::Int {
+                bits: 0xFF,
+                ty: Ty::Int(IntTy::I8),
+            }
+        );
+        assert_eq!(val_i8.as_signed(ptr_width), Some(-1));
+
+        let lowered_u16 =
+            lower_char_to_int(&op, &Ty::Char, &Ty::Uint(UintTy::U16), ptr_width).unwrap();
+        let val_u16 = eval_lowered_cast(
+            &lowered_u16,
+            &MirValue::Char('\u{1F600}'),
+            ptr_width,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(val_u16.as_bits(), Some(0xF600));
+
+        // Invalid bit patterns in `eval_char_to_int` (surrogates and > 0x10FFFF) must fail closed.
+        for bad_bits in [0xD800u128, 0xDABCu128, 0xDFFFu128, 0x11_0000u128, 1u128 << 32] {
+            assert_eq!(
+                eval_char_to_int(bad_bits, &Ty::Uint(UintTy::U32), ptr_width),
+                Err(CastEvalError::InvalidBitPattern {
+                    target_ty: Ty::Char,
+                    bits: bad_bits,
+                })
+            );
+        }
+
+        // Non-`Char` source or non-integral target rejected during lowering.
+        for bad_src in [
+            Ty::Bool,
+            Ty::Uint(UintTy::U8),
+            Ty::Uint(UintTy::U32),
+            Ty::Int(IntTy::I32),
+            Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+        ] {
+            assert_eq!(
+                lower_char_to_int(&op, &bad_src, &Ty::Uint(UintTy::U32), ptr_width),
+                Err(CastLowerError::InvalidSourceType {
+                    expected: "char",
+                    got: bad_src,
+                })
+            );
+        }
+        for bad_dst in [
+            Ty::Bool,
+            Ty::Char,
+            Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            Ty::Ref(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            Ty::unit(),
+            Ty::Never,
+        ] {
+            assert_eq!(
+                lower_char_to_int(&op, &Ty::Char, &bad_dst, ptr_width),
+                Err(CastLowerError::InvalidTargetType {
+                    expected: "integral type",
+                    got: bad_dst.clone(),
+                })
+            );
+            assert!(matches!(
+                eval_char_to_int(0x41, &bad_dst, ptr_width),
+                Err(CastEvalError::TypeMismatch(_))
+            ));
+        }
+
+        // Non-`MirValue::Char` runtime operand rejected by `eval_lowered_cast`.
+        assert!(matches!(
+            eval_lowered_cast(
+                &lowered_i8,
+                &MirValue::unsigned(0x41, UintTy::U32, ptr_width),
+                ptr_width,
+                TransmutePolicy::RejectPtrToInt,
+                &mut tracker,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+    }
+    assert!(tracker.is_empty());
 }

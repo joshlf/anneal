@@ -6,12 +6,12 @@ This document provides copy-pasteable commands to reproduce and verify all imple
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2
+cd <path/to/anneal>
 git status --short --branch
 git log --oneline b0c981aa266df49e301989fea30f86b3c889b254..HEAD
 ```
 
-- **Worktree**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2`
+- **Worktree**: `<path/to/anneal>`
 - **Branch**: `adv/brief-2-2`
 - **Base Commit**: `b0c981aa266df49e301989fea30f86b3c889b254` (`Merge BRIEF-2.1, BRIEF-2.3, and BRIEF-1.1 into adv/brief-2-2`)
 
@@ -19,7 +19,7 @@ git log --oneline b0c981aa266df49e301989fea30f86b3c889b254..HEAD
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2/examples
+cd <path/to/anneal>/examples
 lake build Trusted Anneal Correspondence
 ```
 
@@ -29,7 +29,7 @@ Expected output: `Build completed successfully (83 jobs).` with exit code `0` an
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2/examples
+cd <path/to/anneal>/examples
 lake env lean ../theory/Correspondence/V2026_06_01/L5_ControlAndCalls.lean
 lake env lean ../theory/Correspondence/V2026_08_01/L5_ControlAndCalls.lean
 lake env lean ../theory/Correspondence/V2026_06_01/L6_WholeProgramTransition.lean
@@ -47,7 +47,7 @@ Key kernel-checked theorems in `L5_ControlAndCalls.lean` (both dialects):
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ```
 
@@ -56,8 +56,8 @@ Expected output: `PASS: 40 Trusted modules; 8233 Trusted kernel declarations` wi
 ## 5. Pinned `rustc` & Rust Reference Citation Audit
 
 ```bash
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-2
-AUDIT_BASE=8fd01641^ python3 /home/groupagent-anneal-bot/.gemini/jetski/brain/fd0946cc-f4f4-453a-baa6-f2748a0ac7fe/scratch/audit_citations.py
+cd <path/to/anneal>
+AUDIT_BASE=8fd01641^ python3 <path/to/agent-home>/.gemini/antigravity/brain/fd0946cc-f4f4-453a-baa6-f2748a0ac7fe/scratch/audit_citations.py
 ```
 
 Expected output: `Checked 36 citations across 10 files; mismatches=0`.

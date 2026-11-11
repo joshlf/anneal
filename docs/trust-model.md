@@ -13,14 +13,19 @@ those terms. -->
 > implemented differently; this document may be aspirational or stale relative
 > to the codebase.
 
-[`PRINCIPLES.md`](../PRINCIPLES.md) and [`THREAT_MODEL.md`](../THREAT_MODEL.md)
+[`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and [`THREAT_MODEL.md`](../THREAT_MODEL.md)
 are the controlling documents for Anneal's correctness promise, threat model,
 uncompromised execution-environment assumption, in-scope repository threats, and
-downstream TCB audit log (`anneal-tcb.lock`).
+downstream TCB audit log (`anneal-tcb.lock`): if the code in a verification
+result's Trusted Computing Base (TCB) audit log is correct, its assumptions are
+valid, and Anneal emits no errors in an uncompromised execution environment,
+then the verified code is sound and satisfies any stated specifications.
 
 This document specifies how Anneal's internal codebase
 ([`trusted/`](../trusted) vs. `theory/`) implements and enforces
-[`PRINCIPLES.md`](../PRINCIPLES.md) and [`THREAT_MODEL.md`](../THREAT_MODEL.md):
+[`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and [`THREAT_MODEL.md`](../THREAT_MODEL.md):
 
 - **Section 1** defines the three-layer trust partition across
   [`trusted/`](../trusted), `theory/`, and downstream user crates, enforces
@@ -36,7 +41,7 @@ This document specifies how Anneal's internal codebase
 - **Section 3** specifies how [`trusted/cargo-anneal/`](../trusted/cargo-anneal)
   and [`trusted/rustc-capture/`](../trusted/rustc-capture) enforce the Stage 1
   and orchestrator defenses of
-  [`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-from-untrusted-repository-contents)
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-total-defenses-over-untrusted-repository-contents)
   and which legacy checks are eliminated or relocated to `cargo anneal setup`.
 - **Section 4** describes how `trusted/lean/` keeps compiled `.olean` constants
   transparent for human auditing and stages work-in-progress semantic rules via
@@ -76,7 +81,8 @@ no Rust crate in Anneal's repository is permitted outside `trusted/`.
 ### Binding external and pre-compiled artifacts via manifests
 
 An auditor inspecting the Anneal repository only needs to review `trusted/` to
-verify that Anneal upholds [`PRINCIPLES.md`](../PRINCIPLES.md) and
+verify that Anneal upholds [`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and
 [`THREAT_MODEL.md`](../THREAT_MODEL.md). Because Cargo, Nix, and upstream
 toolchain artifacts live at the repository root or in the packaged toolchain
 archive, `trusted/` binds them via three manifests:
@@ -250,7 +256,7 @@ typeclass resolution inside generated `Mir.lean` definitions:
 [`trusted/cargo-anneal/`](../trusted/cargo-anneal) and
 [`trusted/rustc-capture/`](../trusted/rustc-capture) implement the artifact
 capture and TCB audit-log guarantees required by
-[`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-from-untrusted-repository-contents)
+[`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-total-defenses-over-untrusted-repository-contents)
 through a four-step verification pipeline (`cargo anneal verify [--locked]`):
 
 1. **Private staging and dependency graph resolution (`cargo metadata
@@ -282,7 +288,7 @@ through a four-step verification pipeline (`cargo anneal verify [--locked]`):
    - Emits `Mir.lean` and the static two-template `Proof.lean` into
      `<staging>/lean/`, and extracts all user-brought specification and
      assumption surfaces for the crate's TCB audit log (`anneal-tcb.lock`; see
-     [`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-from-untrusted-repository-contents)):
+     [`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-total-defenses-over-untrusted-repository-contents)):
      1. **Two-template `Proof.lean` generation:** Emits
         `<staging>/lean/Proof.lean` using **Template A** (`theorem
         Proof.verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.proveCrate
@@ -332,7 +338,7 @@ through a four-step verification pipeline (`cargo anneal verify [--locked]`):
 ### Eliminated and relocated legacy checks
 
 Under
-[`THREAT_MODEL.md`](../THREAT_MODEL.md#2-compromised-execution-environments-and-the-dev-vs-ci-boundary)'s
+[`THREAT_MODEL.md`](../THREAT_MODEL.md#1-compromised-execution-environments-and-the-dev-vs-ci-boundary)'s
 uncompromised execution-environment assumption and two-stage `.olean` boundary
 audit, six legacy checks in `cargo-anneal` and `rustc-capture` are eliminated or
 relocated out of the per-run verification path:
