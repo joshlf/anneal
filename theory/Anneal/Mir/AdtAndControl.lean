@@ -102,12 +102,13 @@ This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
      (`evalStmt_retag_ref_refines`) and raw-pointer retags (`evalStmt_retag_raw_refines`,
      `evalStmt_retag_raw_global_refines`) of non-union places (`placeTouchesUnion localDecls
      layouts place = false`, discharged by default for bare locals), Trusted reads and retags the
-     pointer Anneal validated and steps without faulting whenever its borrow model (`active`, `reserved`, or non-`&mut`
-     `frozen`) or global-allocation table grants the access (with `evalStmt_retag_disabled_ub`,
-     `evalStmt_retag_ref_frozen_mut_ub`, `evalStmt_retag_raw_untracked_divergence`,
-     `evalStmt_retag_raw_scalar_addr_reject`, and `evalStmt_retag_noRef_scalar_divergence`
-     characterizing disabled tags, `frozen` `&mut` retags, untracked `.ptr` raw pointers,
-     provenance-less `.scalar` raw-pointer addresses, and reference-free scalars),
+     pointer Anneal validated and steps without faulting whenever its borrow model (`active`,
+     `reserved`, or non-`&mut` `frozen`) or global-allocation table grants the access (with
+     `evalStmt_retag_disabled_ub`, `evalStmt_retag_ref_frozen_mut_ub`,
+     `evalStmt_retag_raw_untracked_divergence`, `evalStmt_retag_raw_scalar_addr_reject`, and
+     `evalStmt_retag_noRef_scalar_divergence` characterizing disabled tags, `frozen` `&mut` retags,
+     untracked `.ptr` raw pointers, provenance-less `.scalar` raw-pointer addresses, and
+     reference-free scalars),
      `copyNonOverlappingChecks` and the stateful `evalCopyNonOverlappingState` (agreeing with
      Trusted's `rangesDisjoint`; whole locals are resolved from the pointers themselves —
      provenance local, synthetic base address, declared element type — as `resolve_synthetic_local`
@@ -5928,7 +5929,8 @@ theorem evalStmt_retag_raw_global_refines {ctx : RetagCtx} {place : Place} {ty :
     {b : Bool} (h : evalRetagPlace ctx .raw place ty b = true) {s : MachineState}
     (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals) (span : String)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (hNotMut : ∀ inner, (placeTy localDecls layouts place).map (·.kind) ≠ some (.ref .mut inner))
+    (hNotMut : ∀ inner, (placeTy localDecls layouts place).map (·.kind) ≠ some (.ref .mut inner) := by
+      simp [placeTy])
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
       simp [placeTouchesUnion_nil_proj]) :
     ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
@@ -6029,12 +6031,12 @@ theorem evalStmt_retag_raw_global_refines {ctx : RetagCtx} {place : Place} {ty :
       dsimp only [pointeeTyOf] at hBle
       cases alloc.mutability <;> (simp only [evalStmt, hOp, hNoB, hG, hPTy, hBle]; rfl)
 
-/-- **Documented `Retag(Raw)` untracked `.ptr` divergence (`B4`, RFC 2582)**: Anneal's `Retag(Raw)`
-(matching MiniRust/Miri's `Retag([raw] place)` under RFC 2582: raw pointers created or copied
-without active borrow/allocation tracking may be dangling as long as their address fits the pointer
-width) accepts a thin `.ptr p sz` whose tag is absent from Trusted's borrow and global-allocation
-tables (`lookupBorrow = none`, `lookupGlobalAlloc = none`), whereas Trusted's `evalStmt` faults with
-`.fail .ub` (`isNonNullEmptySlice = false` on thin `.ptr`). -/
+/-- **Documented `Retag(Raw)` untracked `.ptr` divergence (`B4`)**: Anneal's `Retag(Raw)` (matching
+MiniRust/Miri's `Retag([raw] place)` Stacked/Tree Borrows raw-pointer retag rule: raw pointers do
+not require a live pointee or active borrow/allocation entry at retag time as long as their address
+fits the pointer width) accepts a thin `.ptr p sz` whose tag is absent from Trusted's borrow and
+global-allocation tables (`lookupBorrow = none`, `lookupGlobalAlloc = none`), whereas Trusted's
+`evalStmt` faults with `.fail .ub` (`isNonNullEmptySlice = false` on thin `.ptr`). -/
 theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
     {ty : RetagTy} {b : Bool} (h : evalRetagPlace ctx .raw place ty b = true)
     {s : MachineState} (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals)
@@ -6055,8 +6057,8 @@ theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
 provenance-less raw pointers (such as `0 as *const T` or integer-to-raw-ptr transmutes decoded via
 `decodeScalarBytes`) are represented as `Value.scalar sc`; both `evalRetagPlace` (`.ptr`-typed raw
 check) and Trusted's `evalStmt` (`extractDerefPtrVal? = none`) reject `.scalar sc` on `.retag .raw`
-(whereas Rust/MiniRust RFC 2582 `Retag([raw] place)` permits provenance-less raw pointers, modeled
-by `APtr { addr, provenance := none }` in Section 2h). -/
+(whereas MiniRust/Miri's `Retag([raw] place)` permits provenance-less raw pointers without
+retagging an allocation, modeled by `APtr { addr, provenance := none }` in Section 2h). -/
 theorem evalStmt_retag_raw_scalar_addr_reject {ctx : RetagCtx} {place : Place}
     {ty : RetagTy} {b : Bool} {sc : ScalarInt}
     (hRead : readPlaceState ctx.slots place = .ok (.scalar sc))
