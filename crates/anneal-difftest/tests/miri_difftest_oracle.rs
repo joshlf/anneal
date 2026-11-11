@@ -192,6 +192,7 @@ assert data["reconciled_panic_sites"] == [
         "seed_name": "panic_explicit_macro",
         "batch_miri_pos": data["reconciled_panic_sites"][0]["batch_miri_pos"],
         "anneal_span": data["reconciled_panic_sites"][0]["anneal_span"],
+        "anneal_panic_frame": "miri_diff_corpus::panic_explicit_macro",
         "anneal_panic_message": "explicit panic in corpus",
         "kernel_confirmed": True,
     }
@@ -792,6 +793,68 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
     if guard.0 == 3u32 { sum } else { 0u8 }
 }
 ";
+    // Invocations written through a crate path, rooted, split across lines, or
+    // with a comment before `!` still reconcile: Miri reports each
+    // invocation's first token, which `StagedLibSource` indexes.
+    let qualified_panic_fn = "\
+pub fn core_qualified_macro__b0_c9() -> u32 {
+    let x: u32 = 6u32;
+    if x == 6u32 {
+        core::panic!(\"core-qualified panic! message\");
+    }
+    x
+}
+";
+    let rooted_assert_fn = "\
+pub fn rooted_assert_macro__b0_c10() -> u32 {
+    let x: u32 = 1u32;
+    ::core::assert!(x == 2u32, \"rooted assert! message\");
+    x
+}
+";
+    let multiline_panic_fn = "\
+pub fn multiline_core_macro__b0_c11() -> u32 {
+    let x: u32 = 9u32;
+    if x == 9u32 {
+        core::
+            panic!(\"multi-line core-qualified panic! message\");
+    }
+    x
+}
+";
+    let commented_assert_fn = "\
+pub fn commented_assert_macro__b0_c12() -> u32 {
+    let x: u32 = 3u32;
+    assert /* why */ !(x == 4u32, \"commented assert! message\");
+    x
+}
+";
+    // A panic that Anneal raises in a different function than Miri must not
+    // reconcile, even with an identical message. Anneal currently reads `*y`
+    // through the promoted `&5u32` as `x` (its stack borrows and the promoted
+    // allocation share `allocId`s), so it calls the helper, while Miri panics
+    // at the candidate's own `panic!`. Both spans lie in
+    // `library/core/src/panic.rs`, and both messages match.
+    let masked_frame_fn = "\
+#[inline(never)]
+pub fn helper_panics_same_message_c13() -> u32 {
+    panic!(\"identical panic message\");
+}
+
+pub fn masked_promoted_divergence__b0_c13() -> u32 {
+    let x: u32 = 4u32;
+    let r1: &u32 = &x;
+    let r2: &u32 = &x;
+    let y: &u32 = &5u32;
+    if *y == *r1 {
+        helper_panics_same_message_c13()
+    } else if *r2 == 0u32 {
+        0u32
+    } else {
+        panic!(\"identical panic message\");
+    }
+}
+";
     let candidates = vec![
         handwritten_candidate(
             0,
@@ -856,6 +919,41 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
             "ArithmeticCastMutator",
             cleanup_track_caller_fn,
         ),
+        handwritten_candidate(
+            9,
+            "panic_explicit_macro",
+            "core_qualified_macro__b0_c9",
+            "ArithmeticCastMutator",
+            qualified_panic_fn,
+        ),
+        handwritten_candidate(
+            10,
+            "panic_explicit_macro",
+            "rooted_assert_macro__b0_c10",
+            "ArithmeticCastMutator",
+            rooted_assert_fn,
+        ),
+        handwritten_candidate(
+            11,
+            "panic_explicit_macro",
+            "multiline_core_macro__b0_c11",
+            "ArithmeticCastMutator",
+            multiline_panic_fn,
+        ),
+        handwritten_candidate(
+            12,
+            "panic_explicit_macro",
+            "commented_assert_macro__b0_c12",
+            "ArithmeticCastMutator",
+            commented_assert_fn,
+        ),
+        handwritten_candidate(
+            13,
+            "panic_explicit_macro",
+            "masked_promoted_divergence__b0_c13",
+            "ArithmeticCastMutator",
+            masked_frame_fn,
+        ),
     ];
 
     let findings_dir = dir.join("findings_panic_fmt");
@@ -863,19 +961,19 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        9,
+        14,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 9);
-    assert_eq!(report.compiled_candidates, 9);
-    assert_eq!(report.compared_candidates, 9);
-    assert_eq!(report.agree_count, 7);
-    assert_eq!(report.diverge_count, 2);
+    assert_eq!(report.total_candidates, 14);
+    assert_eq!(report.compiled_candidates, 14);
+    assert_eq!(report.compared_candidates, 14);
+    assert_eq!(report.agree_count, 11);
+    assert_eq!(report.diverge_count, 3);
     assert_eq!(report.not_compared_count, 0);
-    assert_eq!(report.kernel_confirmed_divergences, 2);
+    assert_eq!(report.kernel_confirmed_divergences, 3);
     assert_eq!(
         report.not_compared_reasons.get("external_call").copied(),
         Some(0),
@@ -887,8 +985,8 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(9));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(9));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(14));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(14));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
     // the macro's standard-library definition under Anneal. The strict
@@ -933,6 +1031,26 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
             "panic_cleanup_macro__b0_c7",
             "/library/core/src/panic.rs",
             Some("panic! message unwinding through a cleanup block"),
+        ),
+        (
+            "core_qualified_macro__b0_c9",
+            "/library/core/src/panic.rs",
+            Some("core-qualified panic! message"),
+        ),
+        (
+            "rooted_assert_macro__b0_c10",
+            "/library/core/src/panic.rs",
+            Some("rooted assert! message"),
+        ),
+        (
+            "multiline_core_macro__b0_c11",
+            "/library/core/src/panic.rs",
+            Some("multi-line core-qualified panic! message"),
+        ),
+        (
+            "commented_assert_macro__b0_c12",
+            "/library/core/src/panic.rs",
+            Some("commented assert! message"),
         ),
     ];
     assert_eq!(
@@ -1006,8 +1124,26 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
                 site.kernel_confirm_theorems
             );
         }
-        // The recovered message is itself kernel-checked, and the snippet
-        // carries the message probe that the theorem evaluates.
+        // Anneal's panic began in the candidate's own frame, and that frame and
+        // the recovered message are themselves kernel-checked; the snippet
+        // carries the panic-origin probe that those theorems evaluate.
+        let frame = format!("miri_diff_corpus::{name}");
+        assert_eq!(
+            site.anneal_panic_frame.as_deref(),
+            Some(frame.as_str()),
+            "{name}"
+        );
+        assert!(
+            site.kernel_confirm_theorems
+                .contains(&format!("theorem confirm_frame_{name} :")),
+            "{name}:\n{}",
+            site.kernel_confirm_theorems
+        );
+        assert!(
+            site.kernel_confirm_theorems
+                .contains(&format!("some \"{frame}\" := by")),
+            "{name}"
+        );
         assert_eq!(
             site.kernel_confirm_theorems
                 .contains(&format!("theorem confirm_message_{name} :")),
@@ -1015,10 +1151,9 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
             "{name}:\n{}",
             site.kernel_confirm_theorems
         );
-        assert_eq!(
+        assert!(
             site.kernel_confirm_theorems
-                .contains("def probePanicMessageBounded"),
-            anneal_message.is_some(),
+                .contains("def probePanicOriginBoundedFrom\n"),
             "{name}"
         );
     }
@@ -1026,11 +1161,12 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
         "neg_ctrl_track_caller_overflow__b0_c3",
         "neg_ctrl_cleanup_track_caller__b0_c8",
     ];
+    let masked = "masked_promoted_divergence__b0_c13";
     assert!(
         report
             .reconciled_panic_sites
             .iter()
-            .all(|s| !negative_controls.contains(&s.fn_name.as_str()))
+            .all(|s| !negative_controls.contains(&s.fn_name.as_str()) && s.fn_name != masked)
     );
 
     // (b) The non-macro mismatches stay kernel-confirmed divergences, whether
@@ -1077,15 +1213,77 @@ pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
         assert_eq!(finding.divergence_class, "panic_site_mismatch", "{name}");
         assert!(finding.kernel_confirmed, "{name}");
     }
+    // (c) A panic that Anneal raises in another function stays a
+    // kernel-confirmed divergence even though its span lies in
+    // `library/core/src/panic.rs` and its message matches Miri's: the
+    // kernel-checked frame names the helper, not the candidate.
+    let masked_item = report
+        .item_reports
+        .iter()
+        .find(|r| r.name == masked)
+        .expect("missing item report for the masked candidate");
+    assert!(
+        matches!(
+            masked_item.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ),
+        "{masked}: unexpected verdict {:?}; if Anneal now reads promoted \
+         constants correctly, the candidate agrees and needs another divergence",
+        masked_item.verdict
+    );
+    assert!(masked_item.kernel_confirmed);
+    let MiriOutcome::Panic {
+        message: masked_miri_message,
+        ..
+    } = &masked_item.miri
+    else {
+        panic!(
+            "{masked}: expected a Miri panic, got {:?}",
+            masked_item.miri
+        );
+    };
+    assert_eq!(masked_miri_message, "identical panic message");
+    let AnnealOutcome::Panic {
+        span: Some(masked_span),
+    } = &masked_item.anneal
+    else {
+        panic!(
+            "{masked}: expected an Anneal panic, got {:?}",
+            masked_item.anneal
+        );
+    };
+    assert!(
+        masked_span.file.ends_with("/library/core/src/panic.rs"),
+        "{masked}: {masked_span:?}"
+    );
+    let masked_finding = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == masked)
+        .expect("finding for the masked candidate");
+    assert!(masked_finding.kernel_confirmed);
+    assert!(
+        masked_finding
+            .kernel_confirm_theorems
+            .contains("some \"miri_diff_corpus::helper_panics_same_message_c13\" := by"),
+        "{}",
+        masked_finding.kernel_confirm_theorems
+    );
+    assert!(
+        masked_finding
+            .kernel_confirm_theorems
+            .contains("-- Anneal's panic message: \"identical panic message\"")
+    );
+
     assert_eq!(
         report
             .divergence_classes
             .get("panic_site_mismatch")
             .copied(),
-        Some(2)
+        Some(3)
     );
 
-    assert_eq!(report.findings.len(), 2);
+    assert_eq!(report.findings.len(), 3);
     let f = report
         .findings
         .iter()
