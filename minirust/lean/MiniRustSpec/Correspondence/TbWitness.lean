@@ -1648,7 +1648,8 @@ theorem int2ptrRawRoundTripOk_tb_direct :
 address (`256`, the stack address of `_1` under `ctx0`) when `exposed = ∅`:
 `IntPtrCast.int2ptr` yields `{ addr := 256, provenance := none }`, and dereferencing
 `*_3` raises `Stop.ub "dereferencing pointer without provenance"` on both `Mach`
-and `MachTB` (and faults in Anneal because `256 / 65536 = 0` has no borrow entry). -/
+and `MachTB` (and faults in Anneal because `exposedAllocIds = []` so
+`recoverExposedPtrValue?` leaves a provenance-less scalar `256`). -/
 def int2ptrUnexposedDerefUb : CapturedMir :=
   ptrBody "witness::int2ptr_unexposed_deref_ub"
     [u32Decl, u32Decl, usizeDecl, ptrConstU32Decl]

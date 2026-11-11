@@ -4660,6 +4660,19 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeCompetingDisabledParent_annealExposeRoundTripOk
   ExposeTargetSlotOk.of_stale_wholeLocal
   ExposeTargetSlotOk.of_addrTaken_wholeLocal
+  canonicalLocalAddr_lt_two_pow_64_iff
+  bodyPreservesAddrTaken_iff
+  bodyPreservesAddrTaken_of_ptrAliasingOk
+  bodyPreservesAddrTaken_of_inFragmentWithIntrinsics
+  localDecls_lt_of_inFragmentWithIntrinsics
+  movedBefore_not_addrTaken_of_preserves
+  StaleOk.addrTaken_eq_of_preserves
+  ExposeTargetSlotOk.of_frameOk
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics
+  int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics
+  int2ptrArraySubPlaceRoundTripOk_anneal_ret
+  int2ptrArraySubPlaceRoundTripOk_three_way
+  int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 
@@ -5049,6 +5062,19 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeCompetingDisabledParent_annealExposeRoundTripOk
   ExposeTargetSlotOk.of_stale_wholeLocal
   ExposeTargetSlotOk.of_addrTaken_wholeLocal
+  canonicalLocalAddr_lt_two_pow_64_iff
+  bodyPreservesAddrTaken_iff
+  bodyPreservesAddrTaken_of_ptrAliasingOk
+  bodyPreservesAddrTaken_of_inFragmentWithIntrinsics
+  localDecls_lt_of_inFragmentWithIntrinsics
+  movedBefore_not_addrTaken_of_preserves
+  StaleOk.addrTaken_eq_of_preserves
+  ExposeTargetSlotOk.of_frameOk
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics
+  int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics
+  int2ptrArraySubPlaceRoundTripOk_anneal_ret
+  int2ptrArraySubPlaceRoundTripOk_three_way
+  int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk
   callerLoopCallExposeCallee_anneal_79
   callerLoopCallExposeCallee_three_way
 

@@ -348,6 +348,81 @@ theorem exposeCompetingDisabledParent_annealExposeRoundTripOk :
       · rcases List.mem_singleton.mp hb_tl with rfl
         exact .inl (by decide))
 
+/-- Proper sub-place `[u32; 2]` array-element expose-and-reconstruct round-trip
+(`_2 = &raw mut (_1[1 of 2]); _3 = expose(_2); _4 = with_exposed(_3); *_4 = 77; _1[0] + _1[1]`):
+exercises `inFragmentWithIntrinsics`, `AnnealExposeRoundTripOk.of_borrows`, and
+`ExposeTargetSlotOk` on a non-empty projection (`entry.targetProjection =
+[.constantIndex 1 2 false] ≠ []`, `relOff = 4`, `fullAddr = canonicalLocalAddr 1 4`),
+writing `77` to `_1[1]` without disturbing `_1[0] = 5` and returning `82` across
+Anneal, `Mach`, and `MachTB`. -/
+def int2ptrArraySubPlaceRoundTripOk : CapturedMir :=
+  { ptrBody "witness::int2ptr_array_subplace_round_trip_ok"
+      [u32Decl, arrU32_2Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl, u32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5, .storageLive 6,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 1 2 false)),
+       .assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy),
+       .assign (local_ 4) (.cast .pointerWithExposedProvenance (.copy (local_ 3)) ptrMutU32Ty),
+       .assign (derefPlace 4) (.use (constU32 77)),
+       .assign (local_ 5) (.use (.copy (placeConstIdx 1 0 2 false))),
+       .assign (local_ 6) (.use (.copy (placeConstIdx 1 1 2 false))),
+       .assign (local_ 0) (.binaryOp .add (.copy (local_ 5)) (.copy (local_ 6)))] with
+    fnAbi := fnAbiArrU32_2Arg }
+
+theorem int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics int2ptrArraySubPlaceRoundTripOk = true := by decide +kernel
+
+set_option maxRecDepth 200000 in
+theorem int2ptrArraySubPlaceRoundTripOk_anneal_ret :
+    ∃ mem, ReachesRet (mirTree int2ptrArraySubPlaceRoundTripOk
+      (initMachineState int2ptrArraySubPlaceRoundTripOk
+        [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]])) []
+      (.normal (.scalar ⟨82, 4⟩, mem)) :=
+  ⟨_, runA_sound int2ptrArraySubPlaceRoundTripOk 30 _ _ _ rfl⟩
+
+theorem int2ptrArraySubPlaceRoundTripOk_three_way :
+    inFragmentWithIntrinsics int2ptrArraySubPlaceRoundTripOk = true ∧
+      (∃ mem, ReachesRet (mirTree int2ptrArraySubPlaceRoundTripOk
+        (initMachineState int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]])) []
+        (.normal (.scalar ⟨82, 4⟩, mem))) ∧
+      retAfterIntr int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]] 14 =
+        some (some { retAlloc with data := scalarBytes u32 82 }, [1]) ∧
+      retAfterIntrTB int2ptrArraySubPlaceRoundTripOk
+          [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]] 14 = tbRetU32 82 :=
+  ⟨int2ptrArraySubPlaceRoundTripOk_inFragmentWithIntrinsics,
+    int2ptrArraySubPlaceRoundTripOk_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-- Pre-exposure `MachineState` of `int2ptrArraySubPlaceRoundTripOk` right after
+`_2 = &raw mut (_1[1 of 2])`. -/
+def int2ptrArraySubPlacePreExposeState : MachineState :=
+  let s0 := initMachineState int2ptrArraySubPlaceRoundTripOk
+    [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]]
+  { s0 with
+    frame := { s0.frame with
+      locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]),
+                 .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit, .uninit, .uninit] }
+    memory := { s0.memory with
+      borrows := [rawPtrEntry 1 .mut (placeConstIdx 1 1 2 false)]
+      nextTag := 2 } }
+
+/-- Structural non-vacuity witness for `AnnealExposeRoundTripOk.of_borrows` and
+`ExposeTargetSlotOk` on a proper sub-place borrow (`entry.targetProjection =
+[.constantIndex 1 2 false] ≠ []`, `relOff = 4`, `fullAddr = canonicalLocalAddr 1 4`). -/
+theorem int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk :
+    AnnealExposeRoundTripOk int2ptrArraySubPlaceRoundTripOk int2ptrArraySubPlacePreExposeState
+      ⟨1, 0⟩ (canonicalLocalAddr 1 4) :=
+  AnnealExposeRoundTripOk.of_borrows
+    (entry := rawPtrEntry 1 .mut (placeConstIdx 1 1 2 false)) (pointeeIt := u32)
+    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    rfl rfl rfl
+    ⟨(fun h => by cases h), fun _ =>
+      ⟨by decide, arrU32_2Decl, .aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩],
+       rfl, rfl, ⟨rfl, by simp [ElemOk]⟩⟩⟩
+    (fun b hb hexp _ => by
+      simp [int2ptrArraySubPlacePreExposeState, initMachineState,
+        MirSemantics.isExposedAllocId] at hb hexp)
+
 /-! ### `int2ptrUnexposedUb` -/
 
 theorem int2ptrUnexposedDerefUb_anneal_ub :
@@ -357,8 +432,9 @@ theorem int2ptrUnexposedDerefUb_anneal_ub :
 
 /-- With nothing exposed, `with_exposed_provenance(256)` predicts `None`
 (`int2ptrProvenance_eq_none_iff`, the only admissible choice), so the read is UB
-on both MiniRust machines; Anneal faults too (`256 / 65536 = 0` names no
-borrow). The address is forged, so the body is outside the fragment. -/
+on both MiniRust machines; Anneal faults too (`exposedAllocIds = []` so
+`recoverExposedPtrValue?` leaves a provenance-less scalar `256`). The address is
+forged, so the body is outside the fragment. -/
 theorem int2ptrUnexposedUb_three_way :
     inFragmentWithIntrinsics int2ptrUnexposedDerefUb = false ∧
       (∃ tr u, Reaches (mirTree int2ptrUnexposedDerefUb
@@ -598,7 +674,8 @@ theorem int2ptrMultiAllocBoundaryUnsupported_anneal_ub :
 /-- Pass A1 never ran this body: the forged address `1024` lies in neither
 exposed allocation, so both MiniRust machines stop with `Stop.unsupported`
 (not the message A1's docstring cited), while Anneal faults
-(`1024 / 65536 = 0` names no borrow). -/
+(`recoverExposedPtrValue?` finds no exposed borrow covering `1024`, leaving a
+provenance-less scalar). -/
 theorem int2ptrMultiAllocBoundaryUnsupported_three_way :
     (∃ tr u, Reaches (mirTree int2ptrMultiAllocBoundaryUnsupported
         (initMachineState int2ptrMultiAllocBoundaryUnsupported [.scalar ⟨5, 4⟩])) tr u ∧

@@ -1249,15 +1249,20 @@ adding mutability, and never otherwise observed; no forged addresses) and
 pointer copy: Anneal exposes the canonical stack address
 `canonicalLocalAddr entry.targetLocal relOff` of the borrowed place, records the
 tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?` recovers the same
-tag; `AnnealExposeRoundTripOk.of_structural` derives this Anneal-side round-trip
-obligation from `BorrowsOk`, `ExposeTargetSlotOk`, and `NoCompetingExposedBorrow`,
-so the `ProvenanceRel.*_from_frameOk` theorems take these structural side
-conditions instead of an opaque `hart` hypothesis; at `exposedTags = []`
+tag; `AnnealExposeRoundTripOk.of_structural` and `ExposeTargetSlotOk.of_frameOk`
+derive this Anneal-side round-trip obligation and both whole-local and
+proper-sub-place target-slot readiness from `FrameOkWithIntrinsics`, `BorrowsOk`,
+`AddrTakenTargetsOk`, `StaleOk`, and `NoCompetingExposedBorrow`, so all
+`ProvenanceRel.*_from_frameOk` theorems eliminate opaque `hart` and dynamic
+`hsub_slot` obligations; at `exposedTags = []`
 (`expose_then_withExposed_unexposed_from_frameOk`,
 `assume_then_expose_then_withExposed_closed_unexposed_from_frameOk`)
-`NoCompetingExposedBorrow` vanishes, leaving target-slot readiness (whose
-liveness part follows from `StaleOk`, `ExposeTargetSlotOk.of_addrTaken_wholeLocal`)
-and the locals-count bound `body.localDecls.length < 2^31`).
+`NoCompetingExposedBorrow` vanishes, leaving only static `ptrDeclLayoutsOk` +
+`bodyPreservesAddrTaken` when `body` borrows proper sub-places and the sharp
+64-bit canonical-page bound `body.localDecls.length ≤ 2^47 - stackLocalAddrPageBase 8 + 1`
+(`canonicalLocalAddr_lt_two_pow_64_iff`), with `bodyPreservesAddrTaken` and the
+locals-count bound discharged automatically on `inFragmentWithIntrinsics` via
+`assume_then_expose_then_withExposed_closed_of_inFragmentWithIntrinsics`).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
 without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
 `int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
@@ -1545,12 +1550,13 @@ These are deliberate and are the first things to lift:
   `ptrTargetSpec_aligned_and_good` and `ptrTargetSpec_valid_withIntrinsics`),
   culminating in `ProvenanceRel.expose_step_from_frameOk`,
   `ProvenanceRel.withExposed_step_from_frameOk`, and
-  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive all
+  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive both
+  Anneal-side `ExposeTargetSlotOk` / `AnnealExposeRoundTripOk` and all
   MiniRust `evalPlace`, pointer/integer `evalValue` load, `placeStore`,
   `jumpToBlock`, and `ExposedTargetAtAddr` obligations directly from
-  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`
-  with zero external MiniRust evaluation hypotheses, while preserving
-  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
+  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, `StaleOk`, and
+  `ProvenanceRel` with zero external MiniRust evaluation hypotheses, while
+  preserving `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
   Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
   `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
