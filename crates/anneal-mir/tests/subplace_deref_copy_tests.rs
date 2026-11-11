@@ -1290,3 +1290,273 @@ fn a1_retag_rejects_reference_wrapping_address_space_with_pointer_range_overflow
         })
     );
 }
+
+#[test]
+fn a2_address_only_raw_reborrows_allow_misaligned_and_overhanging_raw_pointers_while_ref_enforces_alignment()
+{
+    let pair = Ty::Tuple(vec![u32_ty(), u32_ty()]);
+    let triple = Ty::Tuple(vec![u32_ty(), u32_ty(), u32_ty()]);
+    let bytes16 = Ty::Array(Box::new(u8_ty()), 16);
+    let raw_pair = Ty::RawPtr(Box::new(pair.clone()), Mutability::Not);
+    let raw_triple = Ty::RawPtr(Box::new(triple), Mutability::Not);
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let ref_u32 = Ty::Ref(Box::new(u32_ty()), Mutability::Not);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty()), Mutability::Not);
+
+    let decls = vec![
+        bytes16,           // _0 at 0x1000 (size 16)
+        pair,              // _1 at 0x2000 (size 8)
+        raw_pair.clone(),  // _2: *const (u32, u32)
+        raw_triple,        // _3: *const (u32, u32, u32)
+        raw_u32.clone(),   // _4: *const u32
+        ref_u32,           // _5: &u32
+        raw_u8.clone(),    // _6: *const u8
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    state.slots[0] = LocalSlotState::Init(MirValue::Array {
+        elements: (0..16).map(|i| u8v(i + 10)).collect(),
+        elem_ty: u8_ty(),
+    });
+    state.slots[1] = LocalSlotState::Init(MirValue::Tuple(vec![u32v(111), u32v(222)]));
+
+    // 1. Misaligned raw pointer `_2: *const (u32, u32)` at `0x1001` inside `_0: [u8; 16]`:
+    // `&raw const ((*_2).1)` computes `0x1001 + 4 = 0x1005` without requiring 4-byte alignment,
+    // while safe `&((*_2).1)` rejects the misaligned pointer with `MisalignedPointer`.
+    state.slots[2] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::with_provenance(0x1001, 1, 1),
+        raw_pair,
+    ));
+    let deref2_field1 = proj(2, vec![ProjectionElem::Deref, field(1, u32_ty())]);
+    run(
+        assign(
+            local(4),
+            Rvalue::RawPtr(Mutability::Not, deref2_field1.clone()),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::ptr(
+            PointerValue::with_provenance(0x1005, 1, 1),
+            raw_u32.clone()
+        ))
+    );
+    // Casting `_4` (`0x1005`) to `*const u8` and reading `*_6` reads `_0[5] == 15`.
+    run(
+        assign(
+            local(6),
+            Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(local(4)), raw_u8),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.read_place(&proj(6, vec![ProjectionElem::Deref])),
+        Ok(u8v(15))
+    );
+    assert_eq!(
+        run(
+            assign(local(5), Rvalue::Ref(Mutability::Not, deref2_field1)),
+            &mut state
+        ),
+        Err(RvalueEvalError::MisalignedPointer {
+            addr: 0x1001,
+            required_align: 4,
+        })
+    );
+
+    // 2. Overhanging pointee cast `_3: *const (u32, u32, u32)` (size 12) at `0x2000` (`_1: (u32, u32)`, size 8):
+    // `&raw const ((*_3).1)` only offsets by 4 bytes (`0x2004 <= 0x2008`, MiniRust `offset_inbounds`),
+    // producing a valid `*const u32` to `_1.1` (`222`).
+    run(
+        assign(local(2), Rvalue::RawPtr(Mutability::Not, local(1))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(3),
+            Rvalue::Cast(
+                CastKind::PtrToPtr,
+                Operand::Copy(local(2)),
+                Ty::RawPtr(
+                    Box::new(Ty::Tuple(vec![u32_ty(), u32_ty(), u32_ty()])),
+                    Mutability::Not,
+                ),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(4),
+            Rvalue::RawPtr(
+                Mutability::Not,
+                proj(3, vec![ProjectionElem::Deref, field(1, u32_ty())]),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.read_place(&proj(4, vec![ProjectionElem::Deref])),
+        Ok(u32v(222))
+    );
+}
+
+#[test]
+fn a2_stateless_deref_evaluators_do_not_clone_large_locals_and_validate_whole_deref_write_types() {
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty()), Mutability::Mut);
+    let mut locals = vec![
+        u32v(10),
+        MirValue::ptr(PointerValue::with_provenance(0x1000, 1, 1), raw_u32.clone()),
+    ];
+    let deref1 = proj(1, vec![ProjectionElem::Deref]);
+    // Writing a `u16` through `_1: *mut u32` (`*_1 = 7u16`) must fail with `TypeMismatch`
+    // and leave `locals[0]` unchanged as `u32v(10)`.
+    assert!(matches!(
+        eval_place_write(&deref1, u16v(7), &mut locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(locals[0], u32v(10));
+
+    // Large array local `[u32; 200_000]` at `_2`: repeated stateless `eval_place_read`,
+    // `eval_place_write`, and `eval_lowered_rvalue` with `Deref` run in `O(path)` without
+    // cloning the 200,000-element array.
+    let big_len = 200_000usize;
+    let big_arr_ty = Ty::Array(Box::new(u32_ty()), big_len);
+    let decls = vec![u32_ty(), raw_u32, big_arr_ty];
+    locals.push(MirValue::Array {
+        elements: vec![u32v(1); big_len],
+        elem_ty: u32_ty(),
+    });
+    let rval = lower_rvalue(&Rvalue::Use(Operand::Copy(deref1.clone())), &decls, PW).unwrap();
+    let mut tracker = ExposedProvenanceTracker::new();
+    for i in 0..200u128 {
+        eval_place_write(&deref1, u32v(i), &mut locals, PW).unwrap();
+        assert_eq!(eval_place_read(&deref1, &locals, PW), Ok(u32v(i)));
+        assert_eq!(
+            eval_lowered_rvalue(
+                &rval,
+                &locals,
+                PW,
+                TransmutePolicy::RejectPtrToInt,
+                &mut tracker
+            ),
+            Ok(u32v(i))
+        );
+    }
+}
+
+#[test]
+fn a2_copy_nonoverlapping_whole_union_array_overwrite_and_multi_count_zst_subplace_copy() {
+    // 1. `union U { a: u64, b: [u32; 2] }` initialized to `a = 0x1_0000_0002`:
+    // `copy_nonoverlapping::<u32>(&src[0], &raw mut (_0.b)[0], 2)` overwrites the entire
+    // `[u32; 2]` union field `b` and switches the union's active field to `b` (`Some(1)`),
+    // while `count = 1` (partial union array write) fails closed with `UnsupportedMemoryAccess`.
+    let arr2 = Ty::Array(Box::new(u32_ty()), 2);
+    let u_def = Arc::new(AdtDef::new_union("U", vec![u64_ty(), arr2.clone()]));
+    let raw_u32_const = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let raw_u32_mut = Ty::RawPtr(Box::new(u32_ty()), Mutability::Mut);
+    let raw_unit_const = Ty::RawPtr(Box::new(Ty::unit()), Mutability::Not);
+    let raw_unit_mut = Ty::RawPtr(Box::new(Ty::unit()), Mutability::Mut);
+    let decls = vec![
+        Ty::Adt(u_def.clone()), // _0: U
+        arr2.clone(),           // _1: [u32; 2]
+        raw_u32_const,          // _2: *const u32
+        raw_u32_mut,            // _3: *mut u32
+        Ty::unit(),             // _4: ()
+        Ty::unit(),             // _5: ()
+        raw_unit_const,         // _6: *const ()
+        raw_unit_mut,           // _7: *mut ()
+    ];
+    let mut state = StatementEvalState::from_local_decls(decls, PW);
+    state.slots[0] = LocalSlotState::Init(MirValue::union_value(&u_def, 0, u64v(0x1_0000_0002)));
+    state.slots[1] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![u32v(10), u32v(20)],
+        elem_ty: u32_ty(),
+    });
+    let elem0 = ProjectionElem::ConstantIndex {
+        offset: 0,
+        min_length: 2,
+        from_end: false,
+    };
+    run(
+        assign(
+            local(2),
+            Rvalue::RawPtr(Mutability::Not, proj(1, vec![elem0.clone()])),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(
+            local(3),
+            Rvalue::RawPtr(
+                Mutability::Mut,
+                proj(0, vec![field(1, arr2), elem0]),
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    // Partial overwrite (`count = 1 < 2`) of inactive union array field `_0.b` fails closed.
+    assert!(matches!(
+        run(
+            Statement::CopyNonOverlapping {
+                src: Operand::Copy(local(2)),
+                dst: Operand::Copy(local(3)),
+                count: Operand::Constant(Constant::Int(1, usize_ty())),
+            },
+            &mut state
+        ),
+        Err(RvalueEvalError::UnsupportedMemoryAccess(_))
+    ));
+    // Whole-array overwrite (`count = 2 == 2`) switches `_0`'s active union field to `b`.
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(2)),
+            dst: Operand::Copy(local(3)),
+            count: Operand::Constant(Constant::Int(2, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::union_value(
+            &u_def,
+            1,
+            MirValue::Array {
+                elements: vec![u32v(10), u32v(20)],
+                elem_ty: u32_ty(),
+            }
+        ))
+    );
+
+    // 2. Multi-count zero-sized sub-place copy (`count = 5 > 1` on non-array `()` locals `_4` and `_5`).
+    state.slots[4] = LocalSlotState::Init(MirValue::Unit);
+    state.slots[5] = LocalSlotState::Uninit;
+    run(
+        assign(local(6), Rvalue::RawPtr(Mutability::Not, local(4))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(local(7), Rvalue::RawPtr(Mutability::Mut, local(5))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::CopyNonOverlapping {
+            src: Operand::Copy(local(6)),
+            dst: Operand::Copy(local(7)),
+            count: Operand::Constant(Constant::Int(5, usize_ty())),
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(5)), Some(&MirValue::Unit));
+}
