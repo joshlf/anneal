@@ -47,7 +47,21 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    pointer (`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
    `step_deref_invalid_bool_simulation`, `step_deref_invalid_char_simulation`,
    `step_deref_write_invalid_bool_simulation`,
-   `step_placeMention_deref_uninit_simulation`).
+   `step_placeMention_deref_uninit_simulation`), together with write-side
+   out-of-bounds and misaligned UB (`step_deref_write_oob_simulation`,
+   `step_deref_write_misaligned_simulation`), narrower / type-punned reads and
+   writes at aligned byte offsets of wider scalar locals
+   (`step_deref_read_narrower_simulation`, `step_deref_write_narrower_simulation`)
+   with partial-overlap and invalid-bit-pattern UB
+   (`step_deref_read_narrower_partial_oob_simulation`,
+   `step_deref_read_narrower_invalid_bool_or_char_simulation`), invalid `char`
+   writes (`step_deref_write_invalid_char_simulation`), stale-pointer UB after
+   `StorageDead` + `StorageLive` revival (`step_deref_revived_local_ub_simulation`,
+   `step_storageDead_storageLive_deref_ub_simulation`), and raw byte overwrites
+   of `bool`/`char` locals
+   (`step_raw_overwritten_deref_invalid_bool_or_char_simulation`,
+   `step_raw_overwritten_direct_copy_invalid_bool_simulation`, with the direct
+   `char` load boundary `step_raw_overwritten_direct_copy_invalid_char_divergence`).
 3. **`BinOp.Offset`, Relational Comparisons & `UnOp.PtrMetadata`
    (`step_binOp_offset_simulation`, `step_binOp_offset_disabled_divergence`,
    `step_binOp_offset_move_simulation`,
@@ -69,14 +83,18 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    thin raw-pointer comparisons (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`), and
    uninitialized/dead/use-after-move pointer comparison UB, together with the
    Stage-1 upgrades: out-of-bounds/dangling offsets are UB in both machines
-   (`step_binOp_offset_oob_dangling_miri_ub`), non-byte strides and negative
+   (`step_binOp_offset_oob_dangling_miri_ub`,
+   `step_binOp_offset_neg_oob_ub_simulation`), non-byte strides and negative
    `isize` offsets step in lockstep (`step_binOp_offset_stride_simulation`,
    `step_binOp_offset_neg_isize_simulation`), non-zero offsets of
    provenance-less pointers are UB in both machines, and zero offsets of
    provenance-less pointers and thin `UnOp.PtrMetadata` step in both machines
    with corresponding results. Remaining boundaries: `.disabled` parent borrow
    on `BinOp.Offset` (`step_binOp_offset_disabled_divergence`: Anneal raises
-   `.ub` while `lean-miri` steps) and provenance-tracked pointer comparisons,
+   `.ub` while `lean-miri` steps), unsigned `usize` `Offset` counts of at least
+   `2 ^ 63` (`step_binOp_offset_usize_wrap_divergence`: Anneal ignores the RHS
+   signedness and steps backward while `lean-miri` raises
+   `"PointerArithOverflow"`), and provenance-tracked pointer comparisons,
    where both machines step but the theorems do not relate the results: Anneal
    orders stack addresses by `Local` index on 64-KiB pages while `lean-miri`
    orders by `AllocId` (informally agreeing on same-local comparisons and on
@@ -104,7 +122,9 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `step_mir_lm3_1_state_simulation`)**: composed real-step statement,
    root-terminator (`Goto`, scalar and raw-pointer `Return`, `Unreachable`,
    `SwitchInt`, and `Assert`), and unified statement-or-terminator simulation
-   across pointer-free `StateRel` and general `StateRelLM3_1` states.
+   across pointer-free `StateRel` and general `StateRelLM3_1` states, including
+   the lockstep UB cases for out-of-bounds, misaligned, partial-overlap, and
+   invalid-bit-pattern dereferences (`WellTypedLM3_1StateStmt`).
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -25854,6 +25874,482 @@ theorem step_binOp_offset_neg_oob_ub_simulation
       have hm_step := miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err
       exact ⟨by rw [ha_ub, hm_step]; exact .ub _ _, ha_ub, _, msg_b, hm_step⟩
 
+private theorem mulWithOverflow_usize_ovf_any_stride_eq
+    {sc : MirAst.ScalarInt} {rightInt : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc rightInt) (hsc_sz : sc.sizeBytes = 8)
+    (stride : Nat)
+    (hstride : stride = 1 ∨ stride = 2 ∨ stride = 4 ∨ stride = 8 ∨ stride = 16)
+    (hovf_sc : 2 ^ 63 ≤ sc.bits * stride) :
+    ∃ strideInt scaledInt : Miri.Memory.ScalarInt,
+      Miri.Memory.Scalar.fromInt (Prov := AnnealProv) (Int.ofNat stride)
+        (Miri.ABI.Size.ofBytes 8) = .ok (.fromScalarInt strideInt) ∧
+      ((Miri.Interpreter.IntegerOps.binary .MulWithOverflow
+          ⟨rightInt, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+          ⟨strideInt, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+          .ok (.withOverflow scaledInt true)) ∨
+       (Miri.Interpreter.IntegerOps.binary .MulWithOverflow
+          ⟨rightInt, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+          ⟨strideInt, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+          .ok (.withOverflow scaledInt false) ∧
+        ∃ off64 : Int64,
+          (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) scaledInt).toTargetIsize
+            annealPointerArithmetic.pointerSize = .ok off64 ∧
+          off64.toInt < 0)) := by
+  have hv8 : ValidScalarBytes 8 := Or.inr (Or.inr (Or.inr (Or.inl rfl)))
+  have hstride_lt : stride < scalarModulus 8 := by
+    rcases hstride with rfl | rfl | rfl | rfl | rfl <;> decide
+  have hrel_st : ScalarRel ⟨stride, 8⟩ (Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat stride)) := by
+    refine ⟨hv8, hstride_lt, ?_, ?_⟩ <;>
+      (rcases hstride with rfl | rfl | rfl | rfl | rfl <;> rfl)
+  have hfrom_st : Miri.Memory.Scalar.fromInt (Prov := AnnealProv) (Int.ofNat stride)
+      (Miri.ABI.Size.ofBytes 8) =
+      .ok (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat stride))) := by
+    rcases hstride with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hbin : Miri.Interpreter.IntegerOps.binary .MulWithOverflow
+      ⟨rightInt, ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩
+      ⟨Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat stride),
+        ⟨Miri.ABI.Size.ofBytes 8, .usize⟩⟩ =
+      arithmeticInt .MulWithOverflow
+        (decodeBitsInt Miri.MIR.IntegerKind.usize.signed sc.sizeBytes sc.bits)
+        (decodeBitsInt Miri.MIR.IntegerKind.usize.signed sc.sizeBytes stride)
+        ⟨translateSizeBytes sc.sizeBytes, .usize⟩ := by
+    have hb := integerOps_binary_sameType_eq hrel hrel_st hsc_sz .usize .MulWithOverflow rfl
+    rw [hsc_sz] at hb ⊢; exact hb
+  have hdec_l : decodeBitsInt Miri.MIR.IntegerKind.usize.signed 8 sc.bits = (sc.bits : Int) := by
+    unfold decodeBitsInt; rfl
+  have hdec_r : decodeBitsInt Miri.MIR.IntegerKind.usize.signed 8 stride = (stride : Int) := by
+    rcases hstride with rfl | rfl | rfl | rfl | rfl <;> (unfold decodeBitsInt; decide)
+  let prod := sc.bits * stride
+  obtain ⟨scaledInt, _, htr, hrel_s, hovf⟩ :=
+    truncateInt_spec hv8 .usize ((prod : Nat) : Int)
+  have hmul_eq : (sc.bits : Int) * (stride : Int) = ((prod : Nat) : Int) :=
+    (Int.natCast_mul sc.bits stride).symm
+  refine ⟨Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat stride), scaledInt, hfrom_st, ?_⟩
+  by_cases hlt64 : prod < 2 ^ 64
+  · right
+    have hcan_rep : canRepresentInt Miri.MIR.IntegerKind.usize.signed 8
+        ((prod : Nat) : Int) = true := by
+      unfold canRepresentInt
+      have hs : Miri.MIR.IntegerKind.usize.signed = false := rfl
+      rw [hs]; simp only [Bool.false_eq_true, ↓reduceIte, decide_eq_true_eq]
+      exact ⟨Int.natCast_nonneg _, by omega⟩
+    rw [hcan_rep, Bool.not_true] at hovf
+    have harith : arithmeticInt .MulWithOverflow (sc.bits : Int) (stride : Int)
+        ⟨translateSizeBytes 8, .usize⟩ = .ok (.withOverflow scaledInt false) := by
+      rw [arithmeticInt_nonDivRem_eq .MulWithOverflow _ _ 8 .usize rfl rfl, hmul_eq]
+      simp only [htr, scalarResultInt, hovf, Miri.MIR.BinOp.isUnchecked,
+        Miri.MIR.BinOp.isOverflowing, Bool.and_false, Bool.false_eq_true, ↓reduceIte,
+        bind, Except.bind, pure, Except.pure]
+    have hmod : (((prod : Nat) : Int) % (2 : Int) ^ (8 * 8)).toNat = prod := by
+      have hpow : (2 : Int) ^ (8 * 8) = ((2 ^ 64 : Nat) : Int) := by decide
+      rw [hpow, Int.emod_eq_of_lt (Int.natCast_nonneg _) (Int.ofNat_lt.mpr hlt64),
+        Int.toNat_natCast]
+    rw [hmod] at hrel_s
+    have hp_sz : annealPointerArithmetic.pointerSize = Miri.ABI.Size.ofBytes 8 := rfl
+    have hsi : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) scaledInt).toScalarInt =
+        .ok scaledInt := rfl
+    have hbz : ((Miri.ABI.Size.ofBytes 8).bytes == 0) = false := rfl
+    have hsz8 : Miri.ABI.Size.ofBytes 8 =
+        translateSizeBytes (⟨prod, 8⟩ : MirAst.ScalarInt).sizeBytes := rfl
+    have htb : scaledInt.toBits (Miri.ABI.Size.ofBytes 8) =
+        .ok (BitVec.ofNat 128 prod) := by
+      rw [hsz8]; exact hrel_s.toBits_eq
+    let v : Int := (prod : Int) - ((2 ^ 64 : Nat) : Int)
+    have hse : (Miri.ABI.Size.ofBytes 8).signExtend (BitVec.ofNat 128 prod) = .ok v := by
+      rw [hsz8, size_signExtend_translateSizeBytes hv8]
+      have hbv := bitVec_ofNat_toNat_of_valid hv8 hrel_s.canonical
+      have hlt64' : prod < 2 ^ (8 * 8) := hlt64
+      rw [hbv, Nat.mod_eq_of_lt hlt64']
+      unfold decodeBitsInt
+      have hnot : ¬ (prod < 2 ^ (8 * 8 - 1)) := by omega
+      simp only [hnot, ↓reduceIte]
+      have hpow : (2 ^ (8 * 8) : Nat) = 2 ^ 64 := rfl
+      rw [hpow]
+    refine ⟨by rw [hbin, hsc_sz, hdec_l, hdec_r]; exact harith, Int64.ofInt v, ?_, ?_⟩
+    · unfold Miri.Memory.Scalar.toTargetIsize Miri.Memory.Scalar.toInt Miri.Memory.Scalar.toBits
+      simp only [hp_sz, hbz, Bool.false_eq_true, ↓reduceIte, hsi, htb, hse,
+        Except.mapError, bind, Except.bind, pure, Except.pure]
+      have hfit : ((v < -(2 ^ 63 : Int)) || (v ≥ (2 ^ 63 : Int))) = false := by
+        rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+        exact ⟨by omega, by omega⟩
+      rw [hfit]; rfl
+    · rw [int64_toInt_ofInt_range v (by omega) (by omega)]
+      omega
+  · left
+    have hcan_rep : canRepresentInt Miri.MIR.IntegerKind.usize.signed 8
+        ((prod : Nat) : Int) = false := by
+      unfold canRepresentInt
+      have hs : Miri.MIR.IntegerKind.usize.signed = false := rfl
+      rw [hs]; simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [decide_eq_false_iff_not]
+      intro ⟨_, h2⟩; omega
+    rw [hcan_rep, Bool.not_false] at hovf
+    have harith : arithmeticInt .MulWithOverflow (sc.bits : Int) (stride : Int)
+        ⟨translateSizeBytes 8, .usize⟩ = .ok (.withOverflow scaledInt true) := by
+      rw [arithmeticInt_nonDivRem_eq .MulWithOverflow _ _ 8 .usize rfl rfl, hmul_eq]
+      simp only [htr, scalarResultInt, hovf, Miri.MIR.BinOp.isUnchecked,
+        Miri.MIR.BinOp.isOverflowing, Bool.and_false, Bool.false_eq_true, ↓reduceIte,
+        bind, Except.bind, pure, Except.pure]
+    rw [hbin, hsc_sz, hdec_l, hdec_r]; exact harith
+
+/-- `lean-miri`'s `annealPointerBinary` rejects every unsigned (`usize`) `Offset` count whose
+scaled byte offset `sc.bits * stride` reaches `2 ^ 63` with `"PointerArithOverflow"`: either
+`MulWithOverflow` overflows `u64`, or the scaled product does not fit a non-negative `isize`
+(`!signed && offset.toInt < 0`). Unlike `scalarOps_binary_offset_pos_ovf_ub_d6`, this holds for
+any canonical `usize` count, including `sc.bits ≥ 2 ^ 63`. -/
+private theorem scalarOps_binary_offset_usize_ovf_ub_d6
+    (ld : List LocalDecl) (ly : LayoutTable)
+    {ptrIdx : Local} {ptrDecl : LocalDecl}
+    {ptrTy rhsTy : Ty} {mutability : Mutability} {pointeeKind : RigidTy}
+    (hdecl_ptr : get? ld ptrIdx = some ptrDecl)
+    (hptr_decl_ty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (hptr_ty : ptrTy.kind = .rawPtr mutability pointeeKind)
+    (hprim_pt : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hrhs : rhsTy.kind = .uint .usize)
+    {sc : MirAst.ScalarInt} {rightInt : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc rightInt) (hsc_sz : sc.sizeBytes = 8)
+    (hovf_sc :
+      2 ^ 63 ≤
+        sc.bits * (translateTy { kind := pointeeKind, layoutIdx := 0 } ly).layout.size.bytes.toNat)
+    (mptr : Miri.Memory.Pointer AnnealProv) (st : AnnealStepState) :
+    Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks ld ly) () .Offset
+      ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr),
+        translateTy ptrTy ly⟩
+      ⟨.scalar (.fromScalarInt rightInt), translateTy rhsTy ly⟩ st =
+      .error (.undefinedBehavior "PointerArithOverflow") st := by
+  obtain ⟨ptId, hptId, hisSized_pt, hstride_eq, hstride_cases, _⟩ :=
+    primScalar_rawPtr_offset_props (ly := ly) (opKind := .copy) (Or.inl rfl)
+      hdecl_ptr hptr_decl_ty hprim_pt
+  generalize (translateTy { kind := pointeeKind, layoutIdx := 0 } ly).layout.size.bytes.toNat =
+    stride at *
+  have hl_cls : classifyEncodedTyId (translateTy ptrTy ly).ty = .ok .pointer := by
+    unfold translateTy encodeTyId; rw [hptr_ty]; exact classifyEncodedTyId_encodeRawPtrTyId_d6 _
+  have hptr_enc : (translateTy ptrTy ly).ty = encodeRawPtrTyId pointeeKind := by
+    unfold translateTy encodeTyId; rw [hptr_ty]
+  have htb : rightInt.toBits (Miri.ABI.Size.ofBytes 8) = .ok (BitVec.ofNat 128 sc.bits) := by
+    have hsz : Miri.ABI.Size.ofBytes 8 = translateSizeBytes sc.sizeBytes := by rw [hsc_sz]; rfl
+    rw [hsz]; exact hrel.toBits_eq
+  have hop_ne : (Miri.MIR.BinOp.Offset != .Offset) = false := rfl
+  have htoSc_l : (Miri.Interpreter.Immediate.scalar
+      (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)).toScalar =
+      .ok (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr) := rfl
+  have htoSc_r : (Miri.Interpreter.Immediate.scalar
+      (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) rightInt)).toScalar =
+      .ok (.fromScalarInt rightInt) := rfl
+  have htoSi_r : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) rightInt).toScalarInt =
+      .ok rightInt := rfl
+  have hstride_lt63 : decide (stride < 2 ^ 63) = true := by
+    rcases hstride_cases with hs | hs | hs | hs | hs <;> (rw [hs]; decide)
+  have hr_ty : (translateTy rhsTy ly).ty = 25 := by unfold translateTy encodeTyId; rw [hrhs]
+  have hr_lay : (translateTy rhsTy ly).layout = scalarLayoutData 8 false := by
+    unfold translateTy; rw [hrhs]; rfl
+  have hr_cls : classifyEncodedTyId (translateTy rhsTy ly).ty = .ok (.integer .usize) := by
+    rw [hr_ty]; rfl
+  obtain ⟨strideInt, scaledInt, hfrom_st, hovf_cases⟩ :=
+    mulWithOverflow_usize_ovf_any_stride_eq hrel hsc_sz stride hstride_cases hovf_sc
+  have htoSi_st : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) strideInt).toScalarInt =
+      .ok strideInt := rfl
+  have hisSigned : (scalarLayoutData 8 false).backendRepr.isSigned = .ok false := rfl
+  have hsz8 : (scalarLayoutData 8 false).size = Miri.ABI.Size.ofBytes 8 := rfl
+  have hbin_eq : Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks ld ly) () .Offset
+      ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr), translateTy ptrTy ly⟩
+      ⟨.scalar (.fromScalarInt rightInt), translateTy rhsTy ly⟩ st =
+      annealPointerBinary ly .Offset
+        ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr), translateTy ptrTy ly⟩
+        ⟨.scalar (.fromScalarInt rightInt), translateTy rhsTy ly⟩ st := by
+    rw [scalarOps_binary_def]; unfold annealScalarOpsHooks
+    simp only [hl_cls, hr_cls, bind, EStateM.bind, pure, EStateM.pure]
+  rw [hbin_eq]; unfold annealPointerBinary
+  rcases hovf_cases with hmul | ⟨hmul, off64, htisize, hlt0⟩
+  · simp only [hop_ne, Bool.false_eq_true, ↓reduceIte, htoSc_l,
+      scalar_fromPointer_toPointer_eq mptr, hptr_enc, hptId, hisSized_pt, hstride_eq,
+      hstride_lt63, Bool.and_self, Bool.not_true, hr_ty, hr_lay, classifyEncodedTyId,
+      htoSc_r, htoSi_r, hsz8, htb, hfrom_st, htoSi_st, hmul]
+  · have hlt0_true : decide (off64.toInt < 0) = true := decide_eq_true hlt0
+    simp only [hop_ne, Bool.false_eq_true, ↓reduceIte, htoSc_l,
+      scalar_fromPointer_toPointer_eq mptr, hptr_enc, hptId, hisSized_pt, hstride_eq,
+      hstride_lt63, Bool.and_self, Bool.not_true, hr_ty, hr_lay, classifyEncodedTyId,
+      htoSc_r, htoSi_r, hsz8, htb, hfrom_st, htoSi_st, hmul, htisize, hisSigned,
+      Bool.not_false, hlt0_true, Bool.and_self]
+
+/-- **`step_binOp_offset_usize_wrap_divergence` (`LM-3.1` D6 Unsigned `usize` Wrap-Around
+`Offset` Divergence)**: Anneal's `evalBinOpOffset` (`Places.lean`) receives only the count's
+bits (`offsetSc : ScalarInt`) and classifies it with `isSignedNegative offsetBits 8`
+regardless of whether the `Offset` RHS is `usize` or `isize`. Hence an unsigned count
+`⟨2 ^ 64 - countMag, 8⟩` (`1 ≤ countMag`, e.g. `usize::MAX` for `countMag = 1`) on a
+`rhsTy.kind = .uint .usize` operand is treated as the negative offset `-countMag`: when
+`countMag * stride ≤ ptrVal.offsetBytes ≤ tgtBytes` on a live non-disabled allocation,
+`stepMirFn` steps *backward* to `ptrVal.offsetBytes - countMag * stride`. `lean-miri`'s
+`Miri.Interpreter.Step.step` instead follows rustc's `BinOp::Offset`
+(`interpret/operator.rs`): the unsigned product `count * stride` either overflows
+`MulWithOverflow` or does not fit a non-negative `isize` (`!signed && offset < 0`), so it
+raises `"PointerArithOverflow"` undefined behavior.
+
+This is the unsound direction (Anneal accepts a program Miri rejects, e.g.
+`p.add(usize::MAX)` used as `p.sub(1)`), so no `StepRelLM3_1` relates the two results. The
+fix requires threading the `Offset` RHS signedness into `Trusted` `evalPtrOffsetBinOp` /
+`evalBinOpOffset` (`V2026_06_01` + `V2026_08_01`, with `SymbolicEval` / `PureMirExec` /
+`L5_ControlAndCalls` callers) and is out of scope for this episode; this theorem pins the
+boundary. The lockstep fragment is `step_binOp_offset_stride_simulation` (in-bounds `usize`
+counts) and `step_binOp_offset_neg_isize_simulation` (negative `isize` counts). -/
+theorem step_binOp_offset_usize_wrap_divergence
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl tgtDecl : LocalDecl}
+    {ptrMut dstMut : Mutability} {pointeeKind : RigidTy} {rhsTy : Ty}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (_hdst_ty : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hprim_pt : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (hrhs_ty : rhsTy.kind = .uint .usize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarCopyOrMoveOperand body topFrame rhsOp rhsTy)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {countMag : Nat} {locals_rhs : List LocalSlot} {e : AllocMapEntry}
+    (hptr_slot : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (hrhs_eval : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
+      .ok (.scalar ⟨2 ^ 64 - countMag, 8⟩) locals_rhs)
+    (hcount_pos : 1 ≤ countMag)
+    (hdst_live : get? locals_rhs dstIdx ≠ some .dead)
+    (he_mem : e ∈ allocMap)
+    (he_tag : e.tag = ptrVal.tag)
+    (hperm : e.perm ≠ .disabled)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead)
+    (hlo_off :
+      countMag *
+          (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat ≤
+        ptrVal.offsetBytes)
+    (hhi_off : ptrVal.offsetBytes ≤
+      (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
+    let stride :=
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat
+    stepMirFn body s =
+      MirStepNode.step
+        (advanceStmt s
+          (locals_rhs.set dstIdx
+            (.init (.ptr
+              { ptrVal with offsetBytes := ptrVal.offsetBytes - countMag * stride } 8)))
+          s.memory) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "PointerArithOverflow")) := by
+  dsimp only []
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
+  obtain ⟨slot_t, _, _, _, hslot_t, _, _, _⟩ := hfr.lookup_local hdecl_tgt
+  have ht_ne : slot_t ≠ .dead := fun hd => htgt_live (hslot_t.trans (congrArg some hd))
+  obtain ⟨td', htd', htgt_prim'⟩ := halloc.target_decl e he_mem
+  have htd_eq : td' = tgtDecl := Option.some.inj (htd'.symm.trans hdecl_tgt)
+  subst td'
+  obtain ⟨_, _, _, _, hstride_cases, hstride_op⟩ :=
+    primScalar_rawPtr_offset_props (ly := body.layouts) hopKind hdecl_ptr hptr_ty hprim_pt
+  generalize hst_def :
+    (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat =
+      stride at *
+  have hstride_pos : 1 ≤ stride := by rcases hstride_cases with hs | hs | hs | hs | hs <;> omega
+  have htgt_le16 : (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat ≤ 16 := by
+    rcases htgt_prim' with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
+    · simp only [translateTy, hk]; decide
+    · simp only [translateTy, hk]; decide
+    · cases it <;> (simp only [translateTy, hk]; decide)
+    · cases ut <;> (simp only [translateTy, hk]; decide)
+  have hscaled_pos : 1 ≤ countMag * stride := Nat.mul_le_mul hcount_pos hstride_pos
+  have hscaled_le16 : countMag * stride ≤ 16 := by omega
+  have hcount_le16 : countMag ≤ 16 := by
+    have h1 : countMag * 1 ≤ countMag * stride := Nat.mul_le_mul_left countMag hstride_pos
+    omega
+  have hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
+    rw [← he_tag]; exact (halloc.borrow_sync e he_mem).2
+  -- Anneal: `evalBinOpOffset` ignores the RHS signedness and steps backward by `countMag`.
+  have ha_off : (∀ d ∈ allocMap, get? locals_rhs d.localIdx = get? s.frame.locals d.localIdx) →
+      evalPtrOffsetBinOp locals_rhs s.memory body.localDecls body.layouts
+        (opKind ⟨ptrIdx, .nil⟩) ptrVal 8 ⟨2 ^ 64 - countMag, 8⟩ =
+      .ok (.ptr { ptrVal with offsetBytes := ptrVal.offsetBytes - countMag * stride } 8)
+        locals_rhs s.memory := by
+    intro halloc_pres
+    have hslot_t_rhs : get? locals_rhs e.localIdx = some slot_t :=
+      (halloc_pres e he_mem).trans hslot_t
+    have hbound := ptrAllocByteBound_allocMap_eq hlookup hperm hdecl_tgt htgt_prim' hslot_t_rhs
+    unfold evalPtrOffsetBinOp
+    rw [hlookup]
+    dsimp only [AllocMapEntry.toBorrowEntry]
+    cases hp : e.perm
+    all_goals first
+      | exact absurd hp hperm
+      | (dsimp only []
+         rw [hstride_op, hbound, hptr8]
+         simp only [ht_ne, ↓reduceIte]
+         unfold evalBinOpOffset; dsimp only []
+         rw [show scalarModulus 8 = 18446744073709551616 from rfl,
+           show signedHalfModulus 8 = 9223372036854775808 from rfl]
+         have hwrap : wrapScalarBits (2 ^ 64 - countMag) 18446744073709551616 =
+             2 ^ 64 - countMag := by
+           unfold wrapScalarBits
+           rw [nat_ble_eq_false_of_lt_d6 (by omega)]
+         have hneg_true : isSignedNegative (2 ^ 64 - countMag) 8 = true := by
+           unfold isSignedNegative; dsimp only []
+           rw [show scalarModulus 8 = 18446744073709551616 from rfl,
+             show Nat.div 18446744073709551616 2 = 9223372036854775808 from rfl, hwrap]
+           exact Nat.ble_eq.mpr (by omega)
+         have hsub_cm : Nat.sub 18446744073709551616 (2 ^ 64 - countMag) = countMag := by
+           change 18446744073709551616 - (2 ^ 64 - countMag) = countMag
+           omega
+         have hd_half : Nat.ble 9223372036854775808 (Nat.mul countMag stride) = false := by
+           change Nat.ble 9223372036854775808 (countMag * stride) = false
+           exact nat_ble_eq_false_of_lt_d6 (by omega)
+         have hble_lo : Nat.ble (Nat.mul countMag stride) ptrVal.offsetBytes = true := by
+           change Nat.ble (countMag * stride) ptrVal.offsetBytes = true
+           exact Nat.ble_eq.mpr hlo_off
+         have hb_half :
+             Nat.ble 9223372036854775808
+               (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat = false :=
+           nat_ble_eq_false_of_lt_d6 (by omega)
+         have hb_hi :
+             Nat.ble ptrVal.offsetBytes
+               (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat = true :=
+           Nat.ble_eq.mpr hhi_off
+         have hb_sub :
+             Nat.ble (ptrVal.offsetBytes - countMag * stride)
+               (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat = true :=
+           Nat.ble_eq.mpr (by omega)
+         rw [hwrap, hneg_true]
+         dsimp only []
+         rw [hsub_cm, hd_half, hble_lo]
+         simp [hb_half, hb_hi, hb_sub, Nat.sub_eq, Nat.mul_eq])
+  have hrhs_prim : IsPrimScalarTy rhsTy := Or.inr (Or.inr (Or.inr ⟨.usize, hrhs_ty⟩))
+  obtain ⟨himm_dst, himm_ptr⟩ := himm tf hframes
+  obtain ⟨_, mls_d, _, hlt_d, _, _, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.cachedLayout_eq
+  let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hstate_a : StateRelLM3_1 body s { m with stack := ⟨#[tfa]⟩ } allocMap :=
+    hstate.cache_layout hframes hdecl_dst hlt_d
+  have hdst_eval : annealEvalPlace body.localDecls body.layouts ⟨dstIdx, #[]⟩ m =
+      .ok ⟨.local 0 dstIdx none tf.localsIdentity, translateTy dstDecl.ty body.layouts⟩
+        { m with stack := ⟨#[tfa]⟩ } :=
+    annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  have h1_arr : ([] : List Miri.MIR.ProjectionElem).toArray = #[] := rfl
+  have hm_prefix : ∀ {α} (k : Miri.Interpreter.RuntimePlace AnnealProv →
+      EStateM Miri.Interpreter.StepError AnnealStepState α),
+      Miri.Interpreter.runRvalue
+        (annealEvalPlace body.localDecls body.layouts ⟨dstIdx, #[]⟩ >>= k) m =
+      Miri.Interpreter.runRvalue
+        (k ⟨.local 0 dstIdx none tf.localsIdentity, translateTy dstDecl.ty body.layouts⟩)
+        { m with stack := ⟨#[tfa]⟩ } := by
+    intro α k; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_ok hdst_eval]
+  let lhsOp := opKind ⟨ptrIdx, .nil⟩
+  rcases evalLhsRawPtr_lm3_1_d6 hstate_a hopKind hdecl_ptr hptr_ty
+      (himm_ptr.cache_layout hlt_d _) (some (translateTy dstDecl.ty body.layouts)) with
+    ⟨_, _, ha_ub, _⟩ | ⟨sc_bad, hbad⟩ |
+    ⟨ptrVal', mptr, tf₁, hptr_slot', _, ha_l, hm_l, hstate₁, _, hmono₁⟩
+  · have ha_ok : evalOperand s.frame.locals lhsOp s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals body.localDecls ≠ .ub := by
+      obtain ⟨_, _, hlt_p, _⟩ := hfr.lookup_local hdecl_ptr
+      dsimp only [lhsOp]
+      rcases hopKind with rfl | rfl
+      · simp [evalOperand, readProjectedValue, hptr_slot]
+      · simp [evalOperand, hptr_slot, set?_eq_some_set hlt_p]
+    exact absurd ha_ub ha_ok
+  · rw [hptr_slot] at hbad; cases hbad
+  · rw [hptr_slot] at hptr_slot'
+    injection hptr_slot' with hp1; injection hp1 with hp2; injection hp2 with hpv _; subst hpv
+    have hop_rhs₁ : WellTypedScalarCopyOrMoveOperand body tf₁ rhsOp rhsTy :=
+      (hop_rhs tf hframes).mono_immediate (fun j hj => hmono₁ j (hj.cache_layout hlt_d _))
+    rcases evalOperand_copyOrMove_with_imm_d6 hstate₁ hop_rhs₁ hrhs_prim with
+      ⟨_, _, hrhs_ub, _⟩ |
+      ⟨sc', msc, s₂, tf₂, ha_r, hm_r, _, halloc_pres₂, hstate₂, himm_rel, _, hmono₂⟩
+    · dsimp only [] at hrhs_ub
+      rw [hrhs_eval] at hrhs_ub; cases hrhs_ub
+    · dsimp only [] at ha_r
+      rw [hrhs_eval] at ha_r; injection ha_r with hv_eq hl_eq; injection hv_eq with hsc_eq
+      subst hsc_eq
+      have hs₂_locs : s₂.frame.locals = locals_rhs := hl_eq.symm
+      have halloc_pres : ∀ d ∈ allocMap,
+          get? locals_rhs d.localIdx = get? s.frame.locals d.localIdx := by
+        intro d hd
+        have hpe_ne : d.localIdx ≠ ptrIdx :=
+          hstate.immediate_not_in_allocMap hframes hptr_slot (by simp) himm_ptr d hd
+        rw [← hs₂_locs, halloc_pres₂ d hd]
+        dsimp only [offsetAfterLhsLocals]
+        rcases hopKind with rfl | rfl
+        · rfl
+        · dsimp only []
+          rw [get?_eq_getElem?, List.getElem?_set_ne hpe_ne.symm, ← get?_eq_getElem?]
+      have ha_off_val := ha_off halloc_pres
+      have hsc_rel : ScalarRel ⟨2 ^ 64 - countMag, 8⟩ msc ∧
+          (⟨2 ^ 64 - countMag, 8⟩ : MirAst.ScalarInt).sizeBytes = 8 := by
+        cases himm_rel with
+        | scalar _ _ hrel hsz _ _ =>
+          refine ⟨hrel, translateSizeBytes_inj hrel.validBytes
+            (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) ?_⟩
+          rw [← hsz]
+      -- Anneal side: the backward step.
+      have himm_d₂ : IsImmediateFrameLocal tf₂ dstIdx :=
+        hmono₂ dstIdx (hmono₁ dstIdx (himm_dst.cache_layout hlt_d _))
+      have hfr₂ := hstate₂.frame_rel_singleton rfl
+      obtain ⟨slot_d₂, _, hlt_af_d₂, _, hslot_d₂, _, _, _⟩ :=
+        hfr₂.lookup_local hdecl_dst
+      have hsd_ne : slot_d₂ ≠ .dead := by
+        intro hd; apply hdst_live; rw [← hs₂_locs]; exact hslot_d₂.trans (congrArg some hd)
+      have hnot_dst : ∀ d ∈ allocMap, d.localIdx ≠ dstIdx :=
+        hstate₂.immediate_not_in_allocMap rfl hslot_d₂ hsd_ne himm_d₂
+      have hbor_inv := invalidateConflictingBorrows_eq_of_not_mem hbor dstIdx none hnot_dst
+      have ha_step :
+          stepMirFn body s =
+            MirStepNode.step
+              (advanceStmt s
+                (locals_rhs.set dstIdx
+                  (.init (.ptr
+                    { ptrVal with offsetBytes := ptrVal.offsetBytes - countMag * stride } 8)))
+                s.memory) := by
+        rw [stepMirFn_eq_of_not_other body s hcal hphase]
+        simp only [hbb, hstmt]
+        unfold evalStmt evalRvalue; dsimp only [lhsOp]
+        rw [ha_l]; dsimp only []; rw [hrhs_eval]; dsimp only []; rw [ha_off_val]; dsimp only []
+        rw [hs₂_locs] at hlt_af_d₂ hslot_d₂
+        rw [hslot_d₂]
+        cases slot_d₂ with
+        | dead => exact absurd rfl hsd_ne
+        | uninit =>
+          simp only [set?_eq_some_set hlt_af_d₂, hprot, hbor_inv]
+          congr 2; generalize s.memory = mem at hprot ⊢; cases mem; dsimp at hprot ⊢; subst hprot; rfl
+        | init _ =>
+          simp only [set?_eq_some_set hlt_af_d₂, hprot, hbor_inv]
+          congr 2; generalize s.memory = mem at hprot ⊢; cases mem; dsimp at hprot ⊢; subst hprot; rfl
+      -- `lean-miri` side: unsigned `PointerArithOverflow`.
+      have hovf : 2 ^ 63 ≤ (2 ^ 64 - countMag) * stride :=
+        calc 2 ^ 63 ≤ 2 ^ 64 - countMag := by omega
+          _ ≤ (2 ^ 64 - countMag) * stride := Nat.le_mul_of_pos_right _ hstride_pos
+      have hm_bin := scalarOps_binary_offset_usize_ovf_ub_d6 body.localDecls body.layouts
+        hdecl_ptr hptr_ty hptr_ty hprim_pt hrhs_ty hsc_rel.1 hsc_rel.2
+        (by rw [hst_def]; exact hovf) mptr { m with stack := ⟨#[tf₂]⟩ }
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩
+            (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩) m =
+          ({ m with stack := ⟨#[tf₂]⟩ }, .error (.undefinedBehavior "PointerArithOverflow")) := by
+        rw [evalStatement_assign_binOp_offset_eq]
+        dsimp only [translatePlace, List.map]; rw [h1_arr, hm_prefix]
+        unfold Miri.Interpreter.runRvalue
+        rw [estateM_bind_assoc_d6, EStateM.bind_eq_ok hm_l,
+          estateM_bind_assoc_d6, EStateM.bind_eq_ok hm_r, EStateM.bind_eq_error hm_bin]
+      have hm_step :=
+        miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err
+      exact ⟨ha_step, _, hm_step⟩
+
 /-! ## 11. Composed `StateRelLM3_1` Statement Simulation (`step_stmt_lm3_1_state_simulation`) -/
 
 /-- Statement forms covered by `step_stmt_lm3_1_state_simulation` across
@@ -25886,21 +26382,52 @@ raw pointers and memory-backed locals):
   provenance-less raw-pointer locals
 * `binOpOffsetZeroAnyStride`: `_d = Offset((copy|move) _p, rhsOp)` with zero
   offset count across all exact-layout pointee strides (`{0, 1, 2, 4, 8, 16}`).
+* `rawPtrCmpUb`: `_d = bop((copy|move) _l, (copy|move) _r)` on a dead,
+  uninitialized, or moved-from pointer operand (UB in both machines)
+* `derefReadNarrower` / `derefWriteNarrower`: `_d = (copy|move) *_p` /
+  `*_p = .use op` at an aligned in-bounds byte offset of an initialized
+  (possibly wider) primitive-scalar local
+* `binOpOffsetStride` / `binOpOffsetNegIsize`: in-bounds
+  `_d = Offset((copy|move) _p, rhsOp)` by a `usize` / non-negative `isize` count
+  or by a negative `isize` count, across all primitive-scalar pointee strides
+* `binOpOffsetNegOobUb`: `Offset` counts that underflow byte `0`, exceed the
+  target, overflow `isize`, or target a dead local (UB in both machines)
+* `derefReadOobUb` / `derefWriteOobUb`: `_d = (copy|move) *_p` / `*_p = .use op`
+  past the end of the live allocation (UB in both machines)
+* `derefReadMisalignedUb` / `derefWriteMisalignedUb`: in-bounds but misaligned
+  dereference read / write (UB in both machines)
+* `derefReadNarrowerPartialOobUb`: dereference read whose access straddles the
+  end of the target local (UB in both machines)
+* `derefReadNarrowerInvalidUb`: `bool` / `char` dereference read of an invalid
+  bit pattern at any aligned in-bounds byte offset of an initialized
+  primitive-scalar local (UB in both machines; this subsumes the offset-`0`
+  `u8`/`i8` and `u32`/`i32` targets of `step_deref_invalid_bool_simulation` and
+  `step_deref_invalid_char_simulation`)
+* `derefWriteInvalidBoolUb` / `derefWriteInvalidCharUb`: `*_p = const c` storing
+  an invalid `bool` / `char` bit pattern (UB in both machines).
 
 Despite its name, this predicate is not a static typing judgment: besides types,
 its constructors carry state-side conditions on `(s, m, allocMap)` (pointer
-offset `0`, non-disabled permissions, in-bounds or zero `Offset` counts,
-`u8`/`i8` pointees for `Offset`, thin pointees for `PtrToPtr`, unmapped
-`StorageLive` targets). These conditions exclude the states outside the
-lockstep-step fragment of the composed simulation: states where both machines
-report undefined behavior through the dedicated UB simulations
-(`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
-`step_deref_invalid_bool_simulation`, `step_binOp_offset_oob_dangling_miri_ub`),
-states covered by the separate Stage-1 lockstep theorems
-(`step_binOp_offset_stride_simulation`,
-`step_binOp_offset_neg_isize_simulation`), and the remaining boundaries
-(`.disabled` `Offset` sources, provenance-tracked comparisons, and
-exposure casts). -/
+offsets, non-disabled permissions, in-bounds or zero `Offset` counts, thin
+pointees for `PtrToPtr`, unmapped `StorageLive` targets). Each UB constructor
+carries exactly the premises (minus `hstate`/`hphase`/`hbb`/`hstmt`) of the
+dedicated UB theorem it delegates to (`step_rawPtr_cmp_ub_lm3_1_simulation`,
+`step_binOp_offset_neg_oob_ub_simulation`, `step_deref_oob_simulation`,
+`step_deref_write_oob_simulation`, `step_deref_misaligned_simulation`,
+`step_deref_write_misaligned_simulation`,
+`step_deref_read_narrower_partial_oob_simulation`,
+`step_deref_read_narrower_invalid_bool_or_char_simulation`,
+`step_deref_write_invalid_bool_simulation`,
+`step_deref_write_invalid_char_simulation`), whose real-step witnesses in
+`WitLM3_1` show that those premises are satisfiable. The conditions exclude the
+states outside the composed fragment: use-after-`StorageDead` revival
+(`StateRelLM3_1Revived`, `step_deref_revived_local_ub_simulation`), raw byte
+overwrites of `bool`/`char` locals (`RawOverwrittenScalarState`), and the
+documented boundaries (`.disabled` `Offset` sources
+`step_binOp_offset_disabled_divergence`, unsigned wrap-around `Offset` counts
+`step_binOp_offset_usize_wrap_divergence`, direct `char` loads
+`step_raw_overwritten_direct_copy_invalid_char_divergence`, provenance-tracked
+comparisons, and exposure casts). -/
 inductive WellTypedLM3_1StateStmt
     (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
     (allocMap : List AllocMapEntry) : Statement → Prop where
@@ -26376,6 +26903,180 @@ inductive WellTypedLM3_1StateStmt
               ptrVal.offsetBytes + sc.bits * stride))) →
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (opKind ⟨ptrIdx, .nil⟩) rhsOp), span⟩
+  | derefReadOobUb
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand)
+      (dstDecl ptrDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry)
+      (localAlloc :
+        Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      IsPrimScalarTy dstDecl.ty →
+      ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      m.machine.memory.live.find? (fun x => x.1 == e.allocId) = some (e.allocId, localAlloc) →
+      localAlloc.allocation.byteSize.bytes.toNat <
+        ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨ptrIdx, .cons .deref .nil⟩)), span⟩
+  | derefWriteOobUb
+      (ptrIdx : Local) (op : MirAst.Operand) (ptrDecl : LocalDecl)
+      (mutability : Mutability) (pointeeKind : RigidTy) (valTy : Ty)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry)
+      (localAlloc :
+        Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (span : String) :
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr mutability pointeeKind →
+      IsPrimScalarTy valTy →
+      valTy.kind = pointeeKind →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        WellTypedScalarCopyOrMoveOperand body topFrame op valTy) →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      m.machine.memory.live.find? (fun x => x.1 == e.allocId) = some (e.allocId, localAlloc) →
+      localAlloc.allocation.byteSize.bytes.toNat <
+        ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use op), span⟩
+  | derefReadMisalignedUb
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand)
+      (dstDecl ptrDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry)
+      (localAlloc :
+        Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      IsPrimScalarTy dstDecl.ty →
+      ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      m.machine.memory.live.find? (fun x => x.1 == e.allocId) = some (e.allocId, localAlloc) →
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat ≤
+        localAlloc.allocation.byteSize.bytes.toNat →
+      (Miri.ABI.Size.ofBytes
+          (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes)).isAligned
+        (translateTy dstDecl.ty body.layouts).layout.align.abi = .ok false →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨ptrIdx, .cons .deref .nil⟩)), span⟩
+  | derefWriteMisalignedUb
+      (ptrIdx : Local) (op : MirAst.Operand) (ptrDecl : LocalDecl)
+      (mutability : Mutability) (pointeeKind : RigidTy) (valTy : Ty)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry)
+      (localAlloc :
+        Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
+      (span : String) :
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr mutability pointeeKind →
+      IsPrimScalarTy valTy →
+      valTy.kind = pointeeKind →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        WellTypedScalarCopyOrMoveOperand body topFrame op valTy) →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      m.machine.memory.live.find? (fun x => x.1 == e.allocId) = some (e.allocId, localAlloc) →
+      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat ≤
+        localAlloc.allocation.byteSize.bytes.toNat →
+      (Miri.ABI.Size.ofBytes
+          (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes)).isAligned
+        (translateTy valTy body.layouts).layout.align.abi = .ok false →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use op), span⟩
+  | derefReadNarrowerPartialOobUb
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand)
+      (dstDecl ptrDecl tgtDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry) (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      IsPrimScalarTy dstDecl.ty →
+      ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      get? s.frame.locals e.localIdx ≠ some .dead →
+      (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat <
+        ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨ptrIdx, .cons .deref .nil⟩)), span⟩
+  | derefReadNarrowerInvalidUb
+      (dstIdx ptrIdx : Local) (opKind : Place → MirAst.Operand)
+      (dstDecl ptrDecl tgtDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry) (oldSc : MirAst.ScalarInt)
+      (span : String) :
+      (opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move) →
+      get? body.localDecls dstIdx = some dstDecl →
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      IsPrimScalarTy tgtDecl.ty →
+      get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)) →
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat ≤
+        (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat →
+      ptrVal.offsetBytes %
+        (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat = 0 →
+      ((dstDecl.ty.kind = .bool ∧ 2 ≤ (oldSc.bits / 2 ^ (8 * ptrVal.offsetBytes)) % 256) ∨
+        (dstDecl.ty.kind = .char ∧
+          isValidCharCode ((oldSc.bits / 2 ^ (8 * ptrVal.offsetBytes)) % 2 ^ 32) = false)) →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨ptrIdx, .cons .deref .nil⟩)), span⟩
+  | derefWriteInvalidBoolUb
+      (ptrIdx : Local) (c : ConstOperand) (b : Nat)
+      (ptrDecl tgtDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry) (span : String) :
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr mutability .bool →
+      c.val = .scalar (.int ⟨b, 1⟩) →
+      c.ty.kind = .bool →
+      2 ≤ b → b < 256 →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      ptrVal.offsetBytes = 0 →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      (e.perm = .active ∨ e.perm = .reserved) →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      (tgtDecl.ty.kind = .bool ∨ tgtDecl.ty.kind = .uint .u8 ∨ tgtDecl.ty.kind = .int .i8) →
+      get? s.frame.locals e.localIdx ≠ some .dead →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩
+  | derefWriteInvalidCharUb
+      (ptrIdx : Local) (c : ConstOperand) (b : Nat)
+      (ptrDecl tgtDecl : LocalDecl) (mutability : Mutability)
+      (ptrVal : ProvenancePtr) (e : AllocMapEntry) (span : String) :
+      get? body.localDecls ptrIdx = some ptrDecl →
+      ptrDecl.ty.kind = .rawPtr mutability .char →
+      c.val = .scalar (.int ⟨b, 4⟩) →
+      c.ty.kind = .char →
+      b < 2 ^ 32 →
+      isValidCharCode b = false →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx) →
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      (e.perm = .active ∨ e.perm = .reserved) →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      IsPrimScalarTy tgtDecl.ty →
+      ptrVal.offsetBytes + 4 ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat →
+      ptrVal.offsetBytes % 4 = 0 →
+      get? s.frame.locals e.localIdx ≠ some .dead →
+      WellTypedLM3_1StateStmt body s m allocMap
+        ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩
 
 /-- **`step_stmt_lm3_1_state_simulation` (`LM-3.1` Composed `StateRelLM3_1` Step)**:
 every statement satisfying `WellTypedLM3_1StateStmt body s m allocMap` at the
@@ -26524,6 +27225,50 @@ theorem step_stmt_lm3_1_state_simulation
     exact ⟨allocMap, (step_binOp_offset_neg_oob_ub_simulation hstate hphase hopKind hbb hstmt
       hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm
       hno_int hoob hlay_coh.1).1⟩
+  | derefReadOobUb dstIdx ptrIdx opKind dstDecl ptrDecl mutability ptrVal e localAlloc span
+      hopKind hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob =>
+    exact ⟨allocMap, (step_deref_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst
+      hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob).1⟩
+  | derefWriteOobUb ptrIdx op ptrDecl mutability pointeeKind valTy ptrVal e localAlloc span
+      hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob =>
+    exact ⟨allocMap, (step_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ptr
+      hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob).1⟩
+  | derefReadMisalignedUb dstIdx ptrIdx opKind dstDecl ptrDecl mutability ptrVal e localAlloc
+      span hopKind hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la
+      hinb hmis =>
+    exact ⟨allocMap, (step_deref_misaligned_simulation hstate hphase hopKind hbb hstmt
+      hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hinb hmis
+      hlay_coh).1⟩
+  | derefWriteMisalignedUb ptrIdx op ptrDecl mutability pointeeKind valTy ptrVal e localAlloc
+      span hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la
+      hinb hmis =>
+    exact ⟨allocMap, (step_deref_write_misaligned_simulation hstate hphase hbb hstmt
+      hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hinb hmis
+      hlay_coh).1⟩
+  | derefReadNarrowerPartialOobUb dstIdx ptrIdx opKind dstDecl ptrDecl tgtDecl mutability
+      ptrVal e span hopKind hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag
+      hdecl_tgt htgt_live hoob =>
+    exact ⟨allocMap, (step_deref_read_narrower_partial_oob_simulation hstate hphase hopKind
+      hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hdecl_tgt
+      htgt_live hoob).1⟩
+  | derefReadNarrowerInvalidUb dstIdx ptrIdx opKind dstDecl ptrDecl tgtDecl mutability
+      ptrVal e oldSc span hopKind hdecl_dst hdecl_ptr hptr_ty himm_ptr hslot_p he htag
+      hdecl_tgt htgt_prim hslot_tgt hinb halign hinvalid =>
+    exact ⟨allocMap, (step_deref_read_narrower_invalid_bool_or_char_simulation hstate hphase
+      hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty himm_ptr hslot_p he htag hdecl_tgt
+      htgt_prim hslot_tgt hinb halign hinvalid hlay_coh).1⟩
+  | derefWriteInvalidBoolUb ptrIdx c b ptrDecl tgtDecl mutability ptrVal e span
+      hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm
+      hdecl_tgt htgt_1 htgt_live =>
+    exact ⟨allocMap, (step_deref_write_invalid_bool_simulation hstate hphase hbb hstmt
+      hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm
+      hdecl_tgt htgt_1 htgt_live).1⟩
+  | derefWriteInvalidCharUb ptrIdx c b ptrDecl tgtDecl mutability ptrVal e span
+      hdecl_ptr hptr_ty hc_val hc_ty hb_hi hinvalid himm_ptr hslot_p he htag hperm
+      hdecl_tgt htgt_prim hinb halign htgt_live =>
+    exact ⟨allocMap, (step_deref_write_invalid_char_simulation hstate hphase hbb hstmt
+      hdecl_ptr hptr_ty hc_val hc_ty hb_hi hinvalid himm_ptr hslot_p he htag hperm
+      hdecl_tgt htgt_prim hinb halign htgt_live hlay_coh).1⟩
 
 
 /-- State-dependent well-typedness predicate for `LM-3.1` root-frame basic-block

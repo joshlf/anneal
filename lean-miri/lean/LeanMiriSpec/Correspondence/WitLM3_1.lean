@@ -97,6 +97,24 @@ divergence theorems:
    and `Offset` (`0_usize`: corresponding results; `1_usize`: UB in both
    machines), and `UnOp.PtrMetadata` UB (`.uninit` pointer) vs. thin-pointer
    correspondence.
+10. **`wit_lm3_1_deref_write_oob_real_steps`**,
+    **`wit_lm3_1_storage_revive_read_ub_real_steps`**,
+    **`wit_lm3_1_deref_type_pun_offset4_and_write_real_steps`**,
+    **`wit_lm3_1_deref_read_narrower_partial_oob_real_steps`**,
+    **`wit_lm3_1_deref_write_misaligned_real_steps`**,
+    **`wit_lm3_1_deref_write_invalid_char_real_steps`**,
+    **`wit_lm3_1_raw_overwritten_bool_and_char_real_steps`**,
+    **`wit_lm3_1_deref_read_narrower_invalid_char_real_steps`**,
+    **`wit_lm3_1_binOp_offset_neg_stride_and_oob_real_steps`**, and
+    **`wit_lm3_1_binOp_offset_usize_wrap_divergence_real_steps`**: real-step
+    witnesses for the generalized `D1`..`D6` theorems (out-of-bounds and
+    misaligned dereference writes, stale reads after `StorageDead` +
+    `StorageLive` revival, narrower / type-punned reads and writes at byte
+    offsets `0` and `4`, partial-overlap and invalid-`char` narrower reads,
+    invalid `char` writes, raw `u8`/`u32` overwrites of `bool`/`char` locals,
+    non-byte negative `isize` strides, negative `isize` underflow UB) and the
+    unsigned `usize` wrap-around `Offset` divergence (Anneal steps backward,
+    `lean-miri` raises `"PointerArithOverflow"`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -9187,5 +9205,106 @@ theorem wit_lm3_1_binOp_offset_neg_stride_and_oob_real_steps :
           subst hp hs
           exact Or.inl ⟨rfl, by decide, Or.inr (Or.inl (by decide))⟩)
     exact ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, hs₂, hm₂⟩
+
+/-! ### 8.7 D6 Real-Step Witness (Unsigned `usize` Wrap-Around `Offset` Divergence) -/
+
+/-- `Runtime(PostCleanup)` MIR body exercising the unsigned `usize` wrap-around `Offset`
+divergence: `_3 = Offset(copy _2, const 1_usize)` advances `*const u64` to the
+one-past-the-end `offsetBytes = 8` of `_1 : u64`, then
+`_2 = Offset(copy _3, const 18446744073709551615_usize)` (`usize::MAX`). -/
+def lm31OffsetUsizeWrapBody : CapturedMir where
+  defPath := "lm_3_1_witness::binop_offset_usize_wrap_divergence"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrConstU64Decl, rawPtrConstU64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (.constant (constUsizeLM31 1)))),
+        mkStmt (.assign (local_ 2)
+          (.binaryOp .offset (.copy (local_ 3)) (.constant (constUsizeLM31 18446744073709551615))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_binOp_offset_usize_wrap_divergence_real_steps` (`LM-3.1` D6 Unsigned `usize`
+Wrap-Around `Offset` Divergence)**: 3-step real-step execution of `lm31OffsetUsizeWrapBody`
+from `StateRel`: `_2 = &raw const _1` and `_3 = Offset(copy _2, const 1_usize)` step in
+lockstep (`step_binOp_offset_stride_simulation`, landing at the one-past-the-end
+`offsetBytes = 8`), then `_2 = Offset(copy _3, const usize::MAX)` makes Anneal's `stepMirFn`
+step *backward* to `offsetBytes = 0` while `lean-miri` raises `"PointerArithOverflow"`
+(`step_binOp_offset_usize_wrap_divergence`). -/
+theorem wit_lm3_1_binOp_offset_usize_wrap_divergence_real_steps :
+    let b := lm31OffsetUsizeWrapBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let entry := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 lm31AllocId1
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
+      stepMirFn b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks ()
+        (mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      get? s₂.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      get? s₃.frame.locals 2 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      Miri.Interpreter.Step.step hooks () m₂ =
+        (m₃, .error (.undefinedBehavior "PointerArithOverflow")) := by
+  let b := lm31OffsetUsizeWrapBody
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have hrel₀ : StateRel b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩)
+      (mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) :=
+    mkFourLocalScalar_stateRel b u64Ty u64Decl u64Decl rawPtrConstU64Decl rawPtrConstU64Decl
+      ⟨42, 8⟩ lm31Scalar42 rfl rfl lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)
+  have himm₀ := mkFourLocalScalar_all_immediate b u64Ty u64Ty lm31Scalar42
+  let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  let ptr8 := Value.ptr { allocId := 1, offsetBytes := 8 } 8
+  let bor := [rawPtrBorrowEntry b.localDecls b.layouts .not 1 1]
+  let s₁ := mkWitState b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .uninit] bor 2
+  have hs₁ : stepMirFn b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ := rfl
+  obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_1_of_anneal_step
+    (step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+      (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty) hs₁
+  have htag₀ : (mkFourLocalScalarAnnealPre b ⟨42, 8⟩).memory.nextTag = 1 := rfl
+  have hid₀ : (⟨(mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42).machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨_, himm_s₁⟩ := step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
+  have himm₁ : ∀ tf, m₁.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k :=
+    fun tf htf k hne => himm_s₁ _ tf rfl htf k hne (himm₀ _ rfl k)
+  obtain ⟨hsim₂, hs₂_eq, m₂, _, _, hm₂, _, _⟩ :=
+    step_binOp_offset_stride_simulation hrel₁ hphase (Or.inl rfl) rfl rfl
+      (dstDecl := rawPtrConstU64Decl) (ptrDecl := rawPtrConstU64Decl) (tgtDecl := u64Decl)
+      (rhsTy := usizeTyLM31) rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (Or.inl rfl)
+      (fun tf _ => .of_wt (constUsize_wellTyped b tf 1 (by decide)))
+      (fun tf htf => ⟨himm₁ tf htf 3 (by decide), himm₁ tf htf 2 (by decide)⟩)
+      (ptrVal := { allocId := 1, offsetBytes := 0 }) (count := 1)
+      rfl rfl (by rintro ⟨⟩) (.head _) rfl (by rintro ⟨⟩) rfl
+      (Or.inr ⟨by rintro ⟨⟩, by decide⟩)
+  let s₂ := mkWitState b 2 [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .init ptr8] bor 2
+  have hs₂ : stepMirFn b s₁ = .step s₂ := hs₂_eq
+  obtain ⟨m₂', hm₂_eq, hrel₂⟩ := stepRelLM3_1_of_anneal_step hsim₂ hs₂
+  have hm₂_inj : m₂' = m₂ := (Prod.mk.inj (hm₂_eq.symm.trans hm₂)).1; subst m₂'
+  obtain ⟨_, himm_s₂⟩ := step_assign_binOp_offset_preserves hrel₁ (by rintro _ ⟨⟩) rfl rfl hm₂
+  have himm₂ : ∀ tf, m₂.stack.frames = #[tf] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf k := by
+    intro tf htf k hne; obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+    exact himm_s₂ tf₁ tf htf₁ htf k (himm₁ tf₁ htf₁ k hne)
+  obtain ⟨hs₃, m₃, hm₃⟩ :=
+    step_binOp_offset_usize_wrap_divergence hrel₂ hphase (Or.inl rfl) rfl rfl
+      (dstDecl := rawPtrConstU64Decl) (ptrDecl := rawPtrConstU64Decl) (tgtDecl := u64Decl)
+      (rhsTy := usizeTyLM31) rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) rfl
+      (fun tf _ => .of_wt (constUsize_wellTyped b tf 18446744073709551615 (by decide)))
+      (fun tf htf => ⟨himm₂ tf htf 2 (by decide), himm₂ tf htf 3 (by decide)⟩)
+      (ptrVal := { allocId := 1, offsetBytes := 8 }) (countMag := 1)
+      rfl rfl (by decide) (by rintro ⟨⟩) (.head _) rfl (by rintro ⟨⟩) rfl (by rintro ⟨⟩)
+      (by decide) (by decide)
+  exact ⟨s₁, s₂, _, m₁, m₂, m₃, hs₁, hm₁, hs₂, hm₂, hrel₂, rfl, hs₃, rfl, hm₃⟩
 
 end LeanMiriSpec.Correspondence.Witness
