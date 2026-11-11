@@ -747,6 +747,51 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
     track_caller_overflow_helper(base)
 }
 ";
+    // A panic that unwinds through a cleanup block (here, to drop a local whose
+    // type implements `Drop`) ends at a `resume` terminator whose span covers
+    // the whole function. Anneal must still attribute the panic to the step
+    // that started unwinding, both for the reconciled `panic!` and for the
+    // non-macro `#[track_caller]` mismatch, which would otherwise agree
+    // because the whole-function span contains Miri's position.
+    let cleanup_panic_fn = "\
+pub struct CleanupGuardC7(pub u32);
+
+impl Drop for CleanupGuardC7 {
+    fn drop(&mut self) {
+        self.0 = 0u32;
+    }
+}
+
+pub fn panic_cleanup_macro__b0_c7() -> u32 {
+    let guard = CleanupGuardC7(7u32);
+    if guard.0 == 7u32 {
+        panic!(\"panic! message unwinding through a cleanup block\");
+    }
+    guard.0
+}
+";
+    let cleanup_track_caller_fn = "\
+pub struct CleanupGuardC8(pub u32);
+
+impl Drop for CleanupGuardC8 {
+    fn drop(&mut self) {
+        self.0 = 0u32;
+    }
+}
+
+#[track_caller]
+#[inline(never)]
+pub fn track_caller_overflow_helper_c8(x: u8) -> u8 {
+    x + 250u8
+}
+
+pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
+    let guard = CleanupGuardC8(3u32);
+    let base: u8 = 10u8;
+    let sum = track_caller_overflow_helper_c8(base);
+    if guard.0 == 3u32 { sum } else { 0u8 }
+}
+";
     let candidates = vec![
         handwritten_candidate(
             0,
@@ -797,6 +842,20 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "ArithmeticCastMutator",
             assert_ne_custom_fn,
         ),
+        handwritten_candidate(
+            7,
+            "panic_explicit_macro",
+            "panic_cleanup_macro__b0_c7",
+            "ArithmeticCastMutator",
+            cleanup_panic_fn,
+        ),
+        handwritten_candidate(
+            8,
+            "panic_checked_add_overflow",
+            "neg_ctrl_cleanup_track_caller__b0_c8",
+            "ArithmeticCastMutator",
+            cleanup_track_caller_fn,
+        ),
     ];
 
     let findings_dir = dir.join("findings_panic_fmt");
@@ -804,19 +863,19 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        7,
+        9,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 7);
-    assert_eq!(report.compiled_candidates, 7);
-    assert_eq!(report.compared_candidates, 7);
-    assert_eq!(report.agree_count, 6);
-    assert_eq!(report.diverge_count, 1);
+    assert_eq!(report.total_candidates, 9);
+    assert_eq!(report.compiled_candidates, 9);
+    assert_eq!(report.compared_candidates, 9);
+    assert_eq!(report.agree_count, 7);
+    assert_eq!(report.diverge_count, 2);
     assert_eq!(report.not_compared_count, 0);
-    assert_eq!(report.kernel_confirmed_divergences, 1);
+    assert_eq!(report.kernel_confirmed_divergences, 2);
     assert_eq!(
         report.not_compared_reasons.get("external_call").copied(),
         Some(0),
@@ -828,8 +887,8 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(7));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(7));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(9));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(9));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
     // the macro's standard-library definition under Anneal. The strict
@@ -869,6 +928,11 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "assert_ne_custom_macro__b0_c6",
             "/library/core/src/macros/mod.rs",
             Some("assertion `left != right` failed: x and y must differ"),
+        ),
+        (
+            "panic_cleanup_macro__b0_c7",
+            "/library/core/src/panic.rs",
+            Some("panic! message unwinding through a cleanup block"),
         ),
     ];
     assert_eq!(
@@ -958,45 +1022,75 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "{name}"
         );
     }
+    let negative_controls = [
+        "neg_ctrl_track_caller_overflow__b0_c3",
+        "neg_ctrl_cleanup_track_caller__b0_c8",
+    ];
     assert!(
         report
             .reconciled_panic_sites
             .iter()
-            .all(|s| s.fn_name != "neg_ctrl_track_caller_overflow__b0_c3")
+            .all(|s| !negative_controls.contains(&s.fn_name.as_str()))
     );
 
-    // (b) The non-macro mismatch stays a kernel-confirmed divergence.
-    let neg = report
-        .item_reports
-        .iter()
-        .find(|r| r.name == "neg_ctrl_track_caller_overflow__b0_c3")
-        .expect("missing item report for the track_caller candidate");
-    assert!(
-        matches!(
-            neg.verdict,
-            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
-        ),
-        "unexpected verdict: {:?}",
-        neg.verdict
-    );
-    assert!(neg.kernel_confirmed);
-    let AnnealOutcome::Panic {
-        span: Some(neg_span),
-    } = &neg.anneal
-    else {
-        panic!("expected an Anneal panic with a span, got {:?}", neg.anneal);
-    };
-    assert_eq!(neg_span.file, "src/lib.rs", "unexpected span {neg_span:?}");
+    // (b) The non-macro mismatches stay kernel-confirmed divergences, whether
+    // or not the panic unwinds through a cleanup block. Anneal attributes each
+    // to the overflowing `x + 250u8` in the helper, a single-line span that
+    // does not contain Miri's call-site position.
+    for name in negative_controls {
+        let neg = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for {name}"));
+        assert!(
+            matches!(
+                neg.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{name}: unexpected verdict: {:?}",
+            neg.verdict
+        );
+        assert!(neg.kernel_confirmed, "{name}");
+        let AnnealOutcome::Panic {
+            span: Some(neg_span),
+        } = &neg.anneal
+        else {
+            panic!(
+                "{name}: expected an Anneal panic with a span, got {:?}",
+                neg.anneal
+            );
+        };
+        assert_eq!(
+            neg_span.file, "src/lib.rs",
+            "{name}: unexpected span {neg_span:?}"
+        );
+        assert_eq!(
+            neg_span.start_line, neg_span.end_line,
+            "{name}: Anneal must report the overflow, not a whole-function span: {neg_span:?}"
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name == name)
+            .unwrap_or_else(|| panic!("{name}: missing finding bundle"));
+        assert_eq!(finding.divergence_class, "panic_site_mismatch", "{name}");
+        assert!(finding.kernel_confirmed, "{name}");
+    }
     assert_eq!(
         report
             .divergence_classes
             .get("panic_site_mismatch")
             .copied(),
-        Some(1)
+        Some(2)
     );
 
-    assert_eq!(report.findings.len(), 1);
-    let f = &report.findings[0];
+    assert_eq!(report.findings.len(), 2);
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "neg_ctrl_track_caller_overflow__b0_c3")
+        .expect("finding for the track_caller candidate");
     assert_eq!(f.fn_name, "neg_ctrl_track_caller_overflow__b0_c3");
     assert_eq!(f.divergence_class, "panic_site_mismatch");
     assert!(f.kernel_confirmed);
@@ -1021,6 +1115,7 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         f.kernel_confirm_theorems
             .contains("def activeSpan (body : CapturedMir) (st : MirExecState) : String :=")
     );
+    assert!(f.kernel_confirm_theorems.contains("def unwindOrigin\n"));
     assert!(
         f.kernel_confirm_theorems
             .contains("def probeMirDiffExecBounded\n")

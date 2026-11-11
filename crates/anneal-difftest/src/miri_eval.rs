@@ -149,37 +149,115 @@ def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
           [{ size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }] }\n    \
     allocations := [] }\n";
 
+/// Lean definitions that probe a bounded Anneal run for its `MirDiffTag` and
+/// the span that decided it: `activeSpan`, `isCleanupState`, `unwindOrigin`,
+/// `probeMirDiffExecBoundedFrom`, and `probeMirDiffExecBounded`.
+///
+/// A run that panics reports the span of the step that started unwinding
+/// (`unwindOrigin`): the step that first entered a cleanup block, or the
+/// panicking step itself when no cleanup block ran. Without this, a panic that
+/// unwinds through a cleanup block (for example, to drop a local whose type
+/// implements `Drop`) would report the span of the `resume` terminator that
+/// ends the block, which rustc gives the span of the whole function. That span
+/// contains every panic position in the function, so `compare_miri_and_anneal`
+/// would accept any Miri panic site there, including a site that differs from
+/// Anneal's.
+///
+/// `MiriOracleProbe.lean` and `MiriOracleConfirm.lean` share this block, so the
+/// confirmation theorems prove the spans that the probe reported. The block
+/// contains no blank line, so finding bundles can copy it verbatim from
+/// `MiriOracleConfirm.lean`.
+const PROBE_EXEC_LEAN: &str = "\
+-- Probe a bounded run for its `MirDiffTag` and the span of the statement or\n\
+-- terminator that decided it. A panic reports the span of the step that\n\
+-- started unwinding (`unwindOrigin`): the step that first entered a cleanup\n\
+-- block, or the panicking step itself when no cleanup block ran. The `resume`\n\
+-- that ends a cleanup block carries the span of its whole function.\n\
+def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
+  let raw :=\n    \
+    match st with\n    \
+    | .running s =>\n      \
+      let cur := s.memory.activeCallee.getD body\n      \
+      match get? cur.basicBlocks s.frame.blockIdx with\n      \
+      | some bb =>\n        \
+        match get? bb.statements s.frame.stmtIdx with\n        \
+        | some stmt => stmt.span\n        \
+        | none => bb.terminator.span\n      \
+      | none => \"none\"\n    \
+    | _ => \"none\"\n  \
+  if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\
+def isCleanupState (body : CapturedMir) : MirExecState → Bool\n  \
+  | .running s =>\n    \
+    match get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with\n    \
+    | some bb => bb.isCleanup\n    \
+    | none => false\n  \
+  | _ => false\n\
+def unwindOrigin\n    \
+    (body : CapturedMir) (origin : Option MirExecState) (st st' : MirExecState) :\n    \
+    Option MirExecState :=\n  \
+  match origin with\n  \
+  | some o => some o\n  \
+  | none => if !isCleanupState body st && isCleanupState body st' then some st else none\n\
+def probeMirDiffExecBoundedFrom\n    \
+    (fuel : Nat) (body : CapturedMir) (origin : Option MirExecState) (st : MirExecState) :\n    \
+    MirDiffTag × String :=\n  \
+  match fuel with\n  \
+  | 0 => (.outOfFuel, activeSpan body st)\n  \
+  | fuel' + 1 =>\n    \
+    match stepMirState body st with\n    \
+    | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
+    | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
+    | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
+    | .ret .panic => (.panic, activeSpan body (origin.getD st))\n    \
+    | .ret .abort => (.abort, activeSpan body st)\n    \
+    | .tau st' => probeMirDiffExecBoundedFrom fuel' body (unwindOrigin body origin st st') st'\n    \
+    | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
+    | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
+    | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
+    | .vis (.inr (.inl _)) k =>\n      \
+      let st' := k PUnit.unit\n      \
+      probeMirDiffExecBoundedFrom fuel' body (unwindOrigin body origin st st') st'\n    \
+    | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\
+def probeMirDiffExecBounded\n    \
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : MirDiffTag × String :=\n  \
+  probeMirDiffExecBoundedFrom fuel body none st\n";
+
 /// Lean definitions that recover the message of the panic that ends a bounded
 /// Anneal run: `panicMessageOfSlice?`, `panicOperandVal?`,
 /// `assertFailedPrefix?`, `formatAssertFailedMessage?`, `panicMessage?`,
-/// `probePanicMessageBoundedAux`, and `probePanicMessageBounded`.
+/// `probePanicMessageBoundedFrom`, and `probePanicMessageBounded`.
 ///
 /// `probePanicMessageBounded` steps the machine exactly as
-/// `probeMirDiffExecBounded` does, threading the latest recovered panic message
-/// across `.tau` and `.vis` transitions so unwinding through `.cleanup` blocks
-/// (`TerminatorKind.resume`) preserves the message. When a step invokes an
-/// unwinding panic terminator, `panicMessage?` inspects the call:
-/// - `core::panicking::{panic,panic_str_2015}` pass the message as a `&str`
-///   operand, and `core::panicking::{panic_fmt,const_panic_fmt}` pass the
-///   message slice that [`FMT_ARGUMENTS_CTOR_STUB_LEAN`] returned; in both
-///   cases `panicOperandVal?` evaluates the operand via `evalOperand` against
-///   the active body's and caller's allocations (`cur.allocations ++
-///   s.memory.globals`) and `panicMessageOfSlice?` reads the slice bytes.
-/// - `core::panicking::panic_explicit` (0 args) yields `"explicit panic"`.
-/// - `core::panicking::{assert_failed,assert_matches_failed}` yield the first
-///   line formatted by `assert_failed_inner` (`"assertion `left <op> right`
-///   failed"`, plus `": <custom>"` when the `Option<Arguments<'_>>` operand is
-///   `Some(slice)`).
+/// `probeMirDiffExecBounded` does (see [`PROBE_EXEC_LEAN`]) and, when the run
+/// panics, reads the message from the same step whose span the probe reports:
+/// the step that started unwinding. `panicMessage?` recognizes these panicking
+/// calls:
 ///
-/// The block contains no blank line, so finding bundles can copy it verbatim
-/// from `MiriOracleConfirm.lean`.
+/// - `core::panicking::{panic,panic_str_2015}` receive the message as a
+///   `&str`, and `core::panicking::{panic_fmt,const_panic_fmt}` receive the
+///   message slice that [`FMT_ARGUMENTS_CTOR_STUB_LEAN`] returned.
+///   `panicOperandVal?` evaluates the operand with `evalOperand`, and
+///   `panicMessageOfSlice?` reads the slice's bytes from the panicking body's
+///   captured allocations or the machine's global allocations.
+/// - `core::panicking::panic_explicit` (from `panic!()`) panics with
+///   `"explicit panic"`.
+/// - `core::panicking::{assert_failed,assert_matches_failed}` panic with a
+///   message whose first line is ``"assertion `left <op> right` failed"``,
+///   followed by `": "` and the custom message when their
+///   `Option<Arguments<'_>>` operand is `Some`. These strings mirror
+///   `core::panicking::assert_failed_inner` in the pinned toolchain.
+///
+/// Every other panic (for example, an overflow `assert` terminator) has no
+/// recoverable message and yields `none`. The block uses `unwindOrigin` from
+/// [`PROBE_EXEC_LEAN`] and contains no blank line, so finding bundles can copy
+/// it verbatim from `MiriOracleConfirm.lean`.
 const PANIC_MESSAGE_PROBE_LEAN: &str = "\
--- Recover the message of the panic that ends a bounded run: the `&str` or\n\
--- `fmtArgumentsCtorStub` slice passed to `core::panicking::{panic,panic_fmt,\n\
--- panic_str_2015,const_panic_fmt}`, `\"explicit panic\"` for\n\
--- `core::panicking::panic_explicit`, or the first line formatted by\n\
--- `core::panicking::{assert_failed,assert_matches_failed}`, threaded across\n\
--- `.tau` cleanup steps.\n\
+-- Recover the message of the panic that ends a bounded run from the step that\n\
+-- started unwinding (`unwindOrigin`): the `&str` or `fmtArgumentsCtorStub`\n\
+-- slice passed to `core::panicking::{panic,panic_fmt,panic_str_2015,\n\
+-- const_panic_fmt}`, `\"explicit panic\"` for `core::panicking::panic_explicit`,\n\
+-- or the first line that `core::panicking::{assert_failed,\n\
+-- assert_matches_failed}` formats.\n\
 def panicMessageOfSlice? (allocs : List CapturedAllocation) : Value → Option (List UInt8)\n  \
   | .aggregate 0 [.ptr p _, .scalar len] =>\n    \
     match allocs.find? (fun a => a.allocId == p.allocId) with\n    \
@@ -256,24 +334,22 @@ def panicMessage? (body : CapturedMir) (st : MirExecState) : Option (List UInt8)
       | _, _ => none\n    \
     | none => none\n  \
   | _ => none\n\
-def probePanicMessageBoundedAux\n    \
-    (fuel : Nat) (body : CapturedMir) (lastMsg : Option (List UInt8)) (st : MirExecState) :\n    \
+def probePanicMessageBoundedFrom\n    \
+    (fuel : Nat) (body : CapturedMir) (origin : Option MirExecState) (st : MirExecState) :\n    \
     Option (List UInt8) :=\n  \
   match fuel with\n  \
   | 0 => none\n  \
   | fuel' + 1 =>\n    \
-    let msg :=\n      \
-      match panicMessage? body st with\n      \
-      | some m => some m\n      \
-      | none => lastMsg\n    \
     match stepMirState body st with\n    \
-    | .ret .panic => msg\n    \
-    | .tau st' => probePanicMessageBoundedAux fuel' body msg st'\n    \
-    | .vis (.inr (.inl _)) k => probePanicMessageBoundedAux fuel' body msg (k PUnit.unit)\n    \
+    | .ret .panic => panicMessage? body (origin.getD st)\n    \
+    | .tau st' => probePanicMessageBoundedFrom fuel' body (unwindOrigin body origin st st') st'\n    \
+    | .vis (.inr (.inl _)) k =>\n      \
+      let st' := k PUnit.unit\n      \
+      probePanicMessageBoundedFrom fuel' body (unwindOrigin body origin st st') st'\n    \
     | _ => none\n\
 def probePanicMessageBounded\n    \
     (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
-  probePanicMessageBoundedAux fuel body none st\n";
+  probePanicMessageBoundedFrom fuel body none st\n";
 
 /// Name of the Lean definition in [`FMT_ARGUMENTS_CTOR_STUB_LEAN`].
 const FMT_ARGUMENTS_CTOR_STUB_NAME: &str = "fmtArgumentsCtorStub";
@@ -486,10 +562,12 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 /// `core::panicking::{panic_fmt,const_panic_fmt}` called with a literal
 /// message built by a `core::fmt::Arguments` constructor stub, by
 /// `core::panicking::panic_explicit` (`"explicit panic"`), or by
-/// `core::panicking::{assert_failed,assert_matches_failed}` (`"assertion `left
-/// <op> right` failed"`, plus `": <custom>"` when `Option<Arguments<'_>>` is
-/// `Some(slice)`), threading the recovered message across `.tau` cleanup steps.
-/// Any other panic has no recovered message, and condition 4 holds trivially.
+/// `core::panicking::{assert_failed,assert_matches_failed}`
+/// (``"assertion `left <op> right` failed"``, followed by `": "` and the custom
+/// message when one is given). Any other panic has no recovered message, and
+/// condition 4 holds trivially. Anneal's span and message both come from the
+/// step that started unwinding, even when the panic then unwinds through
+/// cleanup blocks (see `probeMirDiffExecBounded`).
 ///
 /// Every other verdict is returned unchanged. In particular, a panic-site
 /// mismatch whose Anneal span lies in user code (two different panicking
@@ -907,11 +985,12 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
 /// Extract the `confirm_tag_<fn_name>`, `confirm_probe_<fn_name>`, and (when
 /// present) `confirm_message_<fn_name>` theorems from `MiriOracleConfirm.lean`
 /// source, preceded by every confirm-module definition that they use: the
-/// synthetic constructor stub (when `linkedCallees` refers to it), the panic
-/// message probe (when the message theorem is present), `linkedCallees`, and
-/// `activeSpan` and `probeMirDiffExecBounded` (when the probe theorem is
-/// present). The snippet therefore names no definition local to the confirm
-/// module that it does not also contain.
+/// synthetic constructor stub (when `linkedCallees` refers to it),
+/// `linkedCallees`, the run probe in [`PROBE_EXEC_LEAN`] (when the probe or
+/// message theorem is present), and the message probe in
+/// [`PANIC_MESSAGE_PROBE_LEAN`] (when the message theorem is present). The
+/// snippet therefore names no definition local to the confirm module that it
+/// does not also contain.
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     // Each block runs from its header to the first blank line; the generated
     // blocks contain no blank lines.
@@ -932,22 +1011,19 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
         }
         _ => None,
     };
+    let probe_exec_block = if probe_block.is_some() || message_block.is_some() {
+        extract_block(first_line(PROBE_EXEC_LEAN))
+    } else {
+        None
+    };
     let message_probe_block = message_block
         .as_ref()
         .and_then(|_| extract_block(first_line(PANIC_MESSAGE_PROBE_LEAN)));
-    let (active_span_block, probe_exec_block) = match &probe_block {
-        Some(_) => (
-            extract_block("def activeSpan (body : CapturedMir)"),
-            extract_block("def probeMirDiffExecBounded\n"),
-        ),
-        None => (None, None),
-    };
     [
         stub_block,
-        message_probe_block,
         callees_block,
-        active_span_block,
         probe_exec_block,
+        message_probe_block,
         tag_block,
         probe_block,
         message_block,
@@ -1224,39 +1300,9 @@ fn render_linked_anneal_probe_module(
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
          {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
-         {PANIC_MESSAGE_PROBE_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
-         def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
-           let raw :=\n    \
-             match st with\n    \
-             | .running s =>\n      \
-               let cur := s.memory.activeCallee.getD body\n      \
-               match get? cur.basicBlocks s.frame.blockIdx with\n      \
-               | some bb =>\n        \
-                 match get? bb.statements s.frame.stmtIdx with\n        \
-                 | some stmt => stmt.span\n        \
-                 | none => bb.terminator.span\n      \
-               | none => \"none\"\n    \
-             | _ => \"none\"\n  \
-           if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
-         def probeMirDiffExecBounded\n    \
-             (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
-             MirDiffTag × String :=\n  \
-           match fuel with\n  \
-           | 0 => (.outOfFuel, activeSpan body st)\n  \
-           | fuel' + 1 =>\n    \
-             match stepMirState body st with\n    \
-             | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
-             | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
-             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
-             | .ret .panic => (.panic, activeSpan body st)\n    \
-             | .ret .abort => (.abort, activeSpan body st)\n    \
-             | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
-             | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
-             | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
-             | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
-             | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
-             | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n\
+         {PROBE_EXEC_LEAN}\n\
+         {PANIC_MESSAGE_PROBE_LEAN}\n\
          def formatTag : MirDiffTag → String\n  \
            | .normalUnit => \"pass:unit\"\n  \
            | .normalScalar bits sz => s!\"pass:scalar:{{bits}}:{{sz}}\"\n  \
@@ -1334,39 +1380,9 @@ fn render_linked_anneal_confirm_module(
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
          {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
-         {PANIC_MESSAGE_PROBE_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
-         def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
-           let raw :=\n    \
-             match st with\n    \
-             | .running s =>\n      \
-               let cur := s.memory.activeCallee.getD body\n      \
-               match get? cur.basicBlocks s.frame.blockIdx with\n      \
-               | some bb =>\n        \
-                 match get? bb.statements s.frame.stmtIdx with\n        \
-                 | some stmt => stmt.span\n        \
-                 | none => bb.terminator.span\n      \
-               | none => \"none\"\n    \
-             | _ => \"none\"\n  \
-           if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
-         def probeMirDiffExecBounded\n    \
-             (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
-             MirDiffTag × String :=\n  \
-           match fuel with\n  \
-           | 0 => (.outOfFuel, activeSpan body st)\n  \
-           | fuel' + 1 =>\n    \
-             match stepMirState body st with\n    \
-             | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
-             | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
-             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
-             | .ret .panic => (.panic, activeSpan body st)\n    \
-             | .ret .abort => (.abort, activeSpan body st)\n    \
-             | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
-             | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
-             | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
-             | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
-             | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
-             | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n"
+         {PROBE_EXEC_LEAN}\n\
+         {PANIC_MESSAGE_PROBE_LEAN}\n"
     ));
 
     for (item, cand_suffix, outcome) in items {
@@ -2682,6 +2698,7 @@ mod tests {
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::new_const\"]\n"
         ));
         assert!(probe_src.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN));
+        assert!(probe_src.contains(PROBE_EXEC_LEAN));
         assert!(probe_src.contains(PANIC_MESSAGE_PROBE_LEAN));
         assert!(probe_src.contains("phase := MirPhaseTag.runtimePostCleanup"));
         assert!(
@@ -2736,6 +2753,9 @@ mod tests {
         )
         .expect("render confirm module");
         assert!(confirm_src.contains("import Mir.MiriDiffCorpus.helper_add_ten\n"));
+        // The confirm module proves spans and messages with the same
+        // definitions that the probe evaluated.
+        assert!(confirm_src.contains(PROBE_EXEC_LEAN));
         assert!(confirm_src.contains(PANIC_MESSAGE_PROBE_LEAN));
         assert!(confirm_src.contains(
             "initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.cand_call_helper.body [] emptyMemory linkedCallees"
@@ -2760,7 +2780,7 @@ mod tests {
         assert!(!extracted.contains("def probePanicMessageBounded"));
         // `linkedCallees` names the synthetic stub and `confirm_probe_*` calls
         // `probeMirDiffExecBounded`, so the snippet carries both definitions
-        // (and `activeSpan`) ahead of the theorems.
+        // (and the rest of the run probe) ahead of the theorems.
         let order = |snippet: &str, needles: &[&str]| {
             let positions: Vec<usize> = needles
                 .iter()
@@ -2781,28 +2801,33 @@ mod tests {
                 "def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=",
                 "def linkedCallees : List CapturedMir :=",
                 "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",
+                "def isCleanupState (body : CapturedMir)",
+                "def unwindOrigin\n",
+                "def probeMirDiffExecBoundedFrom\n",
                 "def probeMirDiffExecBounded\n",
                 "theorem confirm_tag_cand_call_helper :",
                 "theorem confirm_probe_cand_call_helper :",
             ],
         );
         assert!(extracted.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN.trim()));
+        assert!(extracted.contains(PROBE_EXEC_LEAN.trim()));
 
         let extracted_panic = extract_confirm_theorems(&confirm_src, "cand_panic_msg");
         order(
             &extracted_panic,
             &[
                 "def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=",
+                "def linkedCallees : List CapturedMir :=",
+                "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",
+                "def unwindOrigin\n",
+                "def probeMirDiffExecBounded\n",
                 "def panicMessageOfSlice? (allocs : List CapturedAllocation)",
                 "def panicOperandVal? (cur : CapturedMir)",
                 "def assertFailedPrefix? : Value → Option (List UInt8)",
                 "def formatAssertFailedMessage?",
                 "def panicMessage? (body : CapturedMir)",
-                "def probePanicMessageBoundedAux",
+                "def probePanicMessageBoundedFrom\n",
                 "def probePanicMessageBounded\n",
-                "def linkedCallees : List CapturedMir :=",
-                "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",
-                "def probeMirDiffExecBounded\n",
                 "theorem confirm_tag_cand_panic_msg :",
                 "theorem confirm_probe_cand_panic_msg :",
                 "theorem confirm_message_cand_panic_msg :",
@@ -2833,9 +2858,13 @@ mod tests {
             1
         );
         assert!(FMT_ARGUMENTS_CTOR_STUB_LEAN.contains("TerminatorKind.return_"));
-        // Both blocks are copied verbatim into finding bundles, which split
+        // These blocks are copied verbatim into finding bundles, which split
         // `MiriOracleConfirm.lean` into blocks at blank lines.
-        for block in [FMT_ARGUMENTS_CTOR_STUB_LEAN, PANIC_MESSAGE_PROBE_LEAN] {
+        for block in [
+            FMT_ARGUMENTS_CTOR_STUB_LEAN,
+            PROBE_EXEC_LEAN,
+            PANIC_MESSAGE_PROBE_LEAN,
+        ] {
             assert!(!block.trim().contains("\n\n"), "{block}");
         }
     }
