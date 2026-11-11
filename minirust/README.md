@@ -1288,7 +1288,13 @@ witnessed at equal `.frozen` permission scores across distinct locals by
 `exposePriorOtherLocal_annealExposeRoundTripOk` and at proper sub-places by
 `int2ptrArraySubPlaceRoundTripOk_hsub_page` — derive `NoCompetingExposedBorrow`
 whenever previously exposed borrows either target distinct canonical-page-bounded
-locals under `bodyBorrowTargetsFitPage` or have strictly lower permission rank).
+locals under `bodyBorrowTargetsFitPage` or have strictly lower permission rank;
+`assume_then_expose_then_withExposed_closed_distinct_of_inFragmentWithIntrinsics`
+again takes the static conditions from `inFragmentWithIntrinsics`, leaving only
+`bodyBorrowTargetsFitPage` for sub-place borrows. With prior exposures the
+MiniRust-side hypothesis `hnoadj` (no other exposed allocation is an `int2ptr`
+candidate for the target address) remains assumed, because adjacent allocations
+make `int2ptr` ambiguous: `int2ptrAdjacentArgsAmbiguous`).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
 without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
 `int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
