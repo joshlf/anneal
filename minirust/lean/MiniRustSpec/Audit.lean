@@ -4735,6 +4735,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   transmuteExposedAddrToRawPtrDerefUb_anneal_ub
   transmuteExposedAddrToRawPtrDerefUb_three_way
   int2ptrArraySubPlaceRoundTripOk_hsub_page
+  CtxSpaced_spec
+  ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics
+  int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -5157,6 +5161,10 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   transmuteExposedAddrToRawPtrDerefUb_anneal_ub
   transmuteExposedAddrToRawPtrDerefUb_three_way
   int2ptrArraySubPlaceRoundTripOk_hsub_page
+  CtxSpaced_spec
+  ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced
+  ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics
+  int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"

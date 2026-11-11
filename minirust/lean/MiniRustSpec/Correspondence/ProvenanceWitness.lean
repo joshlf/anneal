@@ -2824,9 +2824,9 @@ def fnAbiArrUsize_2Arg : FnAbi :=
   { args := [{ layout := arrUsize_2Layout, mode := .direct }],
     ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
 
-/-- Soundness necessity witness for checking `ptrDeclLayoutsOk body` directly in
-`inFragmentWithIntrinsics` and `bodyInProgFragmentWithIntrinsics` rather than
-relying solely on `ptrAliasingOk (provCastAliasView body)`. -/
+/-- Fragment-adequacy necessity witness for checking `ptrDeclLayoutsOk body`
+directly in `inFragmentWithIntrinsics` and `bodyInProgFragmentWithIntrinsics`
+rather than relying solely on `ptrAliasingOk (provCastAliasView body)`. -/
 def shadowedUsizeLayoutDivergence : CapturedMir :=
   { ptrBody "witness::shadowed_usize_layout_divergence"
       [u32Decl, arrUsize_2Decl, ptrMutUsizeDecl, usizeLayout1Decl, ptrMutUsizeDecl]
@@ -2927,5 +2927,18 @@ theorem int2ptrArraySubPlaceRoundTripOk_hsub_page :
         bodyPreservesAddrTaken int2ptrArraySubPlaceRoundTripOk = true ∧
         bodyBorrowTargetsFitPage int2ptrArraySubPlaceRoundTripOk = true := by
   decide
+
+/-- `CtxSpaced` separates spaced caller parameter placements (`ctx0_2`,
+`[128, 256, 384]`, on which `int2ptrAdjacentArgsAmbiguous` returns `9` across
+Anneal, `Mach`, and `MachTB` and
+`ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced` /
+`ProvenanceRel.assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics`
+discharge `hnoadj` structurally) from boundary-touching placements (`ctxAdj`,
+`[128, 256, 260]`, on which `int2ptr` is angelically ambiguous). -/
+theorem int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff :
+    CtxSpaced int2ptrAdjacentArgsAmbiguous ctx0_2 = true ∧
+    CtxSpaced int2ptrAdjacentArgsAmbiguous ctxAdj = false ∧
+    CtxSpaced int2ptrRawRoundTripOk ctx0 = true := by
+  decide +kernel
 
 end MiniRustSpec.Correspondence.ProvenanceWitness

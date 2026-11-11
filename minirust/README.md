@@ -1293,8 +1293,11 @@ locals under `bodyBorrowTargetsFitPage` or have strictly lower permission rank;
 again takes the static conditions from `inFragmentWithIntrinsics`, leaving only
 `bodyBorrowTargetsFitPage` for sub-place borrows. With prior exposures the
 MiniRust-side hypothesis `hnoadj` (no other exposed allocation is an `int2ptr`
-candidate for the target address) remains assumed, because adjacent allocations
-make `int2ptr` ambiguous: `int2ptrAdjacentArgsAmbiguous`).
+candidate for the target address, which fails when adjacent allocations touch at
+their boundary: `int2ptrAdjacentArgsAmbiguous`) is in turn discharged
+structurally from `CtxSpaced body ctx = true` (`int2ptrAdjacentArgsAmbiguous_ctxSpaced_iff`)
+by `ProvenanceRel.int2ptrCandidates_eq_targetProv_of_ctxSpaced` and
+`assume_then_expose_then_withExposed_closed_spaced_of_inFragmentWithIntrinsics`).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
 without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
 `int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
