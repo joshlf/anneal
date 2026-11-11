@@ -3440,6 +3440,9 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
+  misaligned_three_way_ub_agreement
+  misalignedRef_three_way_ub_agreement
+  transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3877,6 +3880,9 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagScalarDiscrepancy_tb_direct
   transmuteSharedRefToMutWriteDiscrepancy_tb_direct
   transmuteDanglingIntToRefDiscrepancy_tb_direct
+  misaligned_three_way_ub_agreement
+  misalignedRef_three_way_ub_agreement
+  transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms
@@ -4399,12 +4405,14 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeTwice_intr_minirust_direct
   exposeTwice_intr_tb_direct
   exposeTwice_three_way_divergence
+  exposeTwice_three_way_agreement
   int2ptrForgedTag_inFragmentWithIntrinsicsA1
   int2ptrForgedTag_notInFragmentWithIntrinsics
   int2ptrForgedTag_anneal_ub
   int2ptrForgedTag_minirust_direct
   int2ptrForgedTag_tb_direct
   int2ptrForgedTag_three_way_divergence
+  int2ptrForgedTag_three_way_ub_agreement
   directWrite_inFragmentWithIntrinsicsA1
   directWrite_notInFragmentWithIntrinsics
   directWrite_A1_divergence
@@ -4773,12 +4781,14 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeTwice_intr_minirust_direct
   exposeTwice_intr_tb_direct
   exposeTwice_three_way_divergence
+  exposeTwice_three_way_agreement
   int2ptrForgedTag_inFragmentWithIntrinsicsA1
   int2ptrForgedTag_notInFragmentWithIntrinsics
   int2ptrForgedTag_anneal_ub
   int2ptrForgedTag_minirust_direct
   int2ptrForgedTag_tb_direct
   int2ptrForgedTag_three_way_divergence
+  int2ptrForgedTag_three_way_ub_agreement
   directWrite_inFragmentWithIntrinsicsA1
   directWrite_notInFragmentWithIntrinsics
   directWrite_A1_divergence

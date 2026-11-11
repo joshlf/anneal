@@ -11031,7 +11031,13 @@ theorem ProvenanceRel.of_advanceStmt {body : CapturedMir} {ctx : Ctx} {s : Machi
 /-- Anneal-side canonical address and exposure recovery specification for
 `pv` (`pv.tag ≠ 0`, `fullAddr < 2^64`, `ptrAddress?` evaluates to `some fullAddr`,
 and `recoverExposedPtrValue?` after `recordExposedAllocId` recovers `.ptr pv 8`
-whenever borrow-target locals agree with `s.frame.locals`). -/
+whenever borrow-target locals agree with `s.frame.locals`).
+
+This is a hypothesis (`hart`) of the `ProvenanceRel.expose_*` simulation theorems,
+not a consequence of the frame invariants: whether `recover_eq` holds depends on
+the other exposed live stack borrows that `findBestExposedStackBorrow` ranks
+against `pv` at `fullAddr`. It is instantiated concretely by
+`int2ptrRawRoundTripOk_annealExposeRoundTripOk` (`ProvenanceWitness.lean`). -/
 structure AnnealExposeRoundTripOk (body : CapturedMir) (s : MachineState)
     (pv : ProvenancePtr) (fullAddr : Nat) : Prop where
   tag_ne_zero : pv.tag ≠ 0
@@ -12660,12 +12666,15 @@ theorem evalValue_load_local_preserves_shape {m m' : Mach} {ctx : Ctx}
         rw [placeLoad_active_thread hld, hm1, hsh.active]
   · rw [hmem, hsh.allocs]
 
-/-- Self-contained `PointerExposeProvenance` simulation step from
-`FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`:
-derives `evalPlace` (`hplace`), the pointer load (`harg`), `ExposedTargetAtAddr`
-(`htgt`), `placeStore` (`hstore`), and `jumpToBlock` (`hjump`) directly from the
-frame and borrow invariants without any external MiniRust step hypotheses, and
-preserves `FrameOkWithIntrinsics` and `AddrTakenTargetsOk`. -/
+/-- `PointerExposeProvenance` simulation step from `FrameOkWithIntrinsics`,
+`BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`: derives `evalPlace`
+(`hplace`), the pointer load (`harg`), `ExposedTargetAtAddr` (`htgt`),
+`placeStore` (`hstore`), and `jumpToBlock` (`hjump`) directly from the frame and
+borrow invariants without any external MiniRust step hypotheses, and preserves
+`FrameOkWithIntrinsics` and `AddrTakenTargetsOk`. On the Anneal side it assumes
+`hart : AnnealExposeRoundTripOk body s pv fullAddr` (the canonical address of
+`pv` and its recovery after exposure), which the frame invariants do not
+provide. -/
 theorem ProvenanceRel.expose_step_from_frameOk {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
     {m : Mach} {blk stmt : Nat} {exposedTags : List Nat}
@@ -12920,7 +12929,8 @@ from `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `Provenance
 with **zero** external MiniRust `evalPlace`, `evalValue`, `placeStore`, `jumpToBlock`,
 or `ExposedTargetAtAddr` hypotheses (eliminating all 7 manual MiniRust evaluation
 hypotheses of `ProvenanceRel.expose_then_withExposed_reconstructs`), while
-establishing `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state. -/
+establishing `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state;
+the Anneal-side `AnnealExposeRoundTripOk` hypothesis `hart` remains assumed. -/
 theorem ProvenanceRel.expose_then_withExposed_from_frameOk {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
     {m : Mach} {blk stmt : Nat} {exposedTags : List Nat}
@@ -13880,7 +13890,8 @@ theorem BorrowsOk.after_expose_withExposed {body : CapturedMir}
   }, husable2⟩
 
 /-- Closed-invariant 3-segment simulation (`Assume` -> `PointerExposeProvenance`
--> `PointerWithExposedProvenance`) plus post-state MiniRust pointer load of the
+-> `PointerWithExposedProvenance`), conditional on the Anneal-side
+`AnnealExposeRoundTripOk` hypothesis `hart`, plus post-state MiniRust pointer load of the
 reconstructed raw pointer `_d` (MR-4.3 Pass A4): restores the complete closed
 inductive invariant tuple `(ProvenanceRel, FrameOkWithIntrinsics, BorrowsOk,
 AddrTakenTargetsOk)` at `(s2, m8, view2, nb3, 0)` and evaluates

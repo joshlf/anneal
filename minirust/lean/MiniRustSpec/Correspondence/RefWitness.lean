@@ -3243,4 +3243,49 @@ theorem transmuteDanglingIntToRefDiscrepancy_tb_direct :
       some "Value::Ptr: non-dereferenceable safe pointer" := by
   decide +kernel
 
+/-! #### 5. Three-way lockstep UB agreement on divergences resolved by the places-ptr `Trusted` semantics
+
+Before the places-ptr `Trusted` semantics, Anneal *returned* `5` on `misaligned`,
+`misalignedRef`, and `transmuteDanglingIntToRefDiscrepancy` while both MiniRust
+machines raised UB. Anneal now faults at the same statement, so these witnesses
+are positive lockstep agreements across Anneal, `BasicMemory` (`Mach`), and Tree
+Borrows (`MachTB`). -/
+
+/-- `misaligned`: loading a `u32` through a pointer one byte into a `u32` is UB
+in Anneal (`checkTargetPlaceAlign`), `Mach`, and `MachTB`. -/
+theorem misaligned_three_way_ub_agreement :
+    (∃ tr u, Reaches (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    ubAfter misaligned [.scalar ⟨5, 4⟩] 10 =
+      some "loading from a place based on a misaligned pointer" ∧
+    ubAfterTB misaligned [.scalar ⟨5, 4⟩] 10 =
+      some "loading from a place based on a misaligned pointer" :=
+  ⟨misaligned_anneal_ub, misaligned_minirust_direct, by decide +kernel⟩
+
+/-- `misalignedRef`: forming `&*q` from a misaligned `*const u32` is UB in Anneal
+(`resolveRefDerefTarget?`), `Mach`, and `MachTB`
+(`"Value::Ptr: unaligned safe pointer"`). -/
+theorem misalignedRef_three_way_ub_agreement :
+    (∃ tr u, Reaches (mirTree misalignedRef (initMachineState misalignedRef [.scalar ⟨5, 4⟩]))
+      tr u ∧ FaultNow u) ∧
+    ubAfter misalignedRef [.scalar ⟨5, 4⟩] 11 = some "Value::Ptr: unaligned safe pointer" ∧
+    ubAfterTB misalignedRef [.scalar ⟨5, 4⟩] 11 = some "Value::Ptr: unaligned safe pointer" :=
+  ⟨misalignedRef_anneal_ub, misalignedRef_minirust_direct, misalignedRef_tb_direct⟩
+
+/-- `transmuteDanglingIntToRefDiscrepancy`: transmuting `4_usize` to `&u32` is UB
+in Anneal (the safe-reference image has no intact provenance), `Mach`, and
+`MachTB` (`"Value::Ptr: non-dereferenceable safe pointer"`); the witness name
+records the former discrepancy. -/
+theorem transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement :
+    (∃ tr u, Reaches (mirTree transmuteDanglingIntToRefDiscrepancy
+      (initMachineState transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    ubAfter transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩] 5 =
+      some "Value::Ptr: non-dereferenceable safe pointer" ∧
+    ubAfterTB transmuteDanglingIntToRefDiscrepancy [.scalar ⟨5, 4⟩] 5 =
+      some "Value::Ptr: non-dereferenceable safe pointer" :=
+  ⟨transmuteDanglingIntToRefDiscrepancy_anneal_ub,
+    transmuteDanglingIntToRefDiscrepancy_minirust_ub,
+    transmuteDanglingIntToRefDiscrepancy_tb_direct⟩
+
 end MiniRustSpec.Correspondence.RefWitness

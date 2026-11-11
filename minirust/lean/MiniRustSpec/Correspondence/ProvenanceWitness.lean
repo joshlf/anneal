@@ -22,11 +22,16 @@ MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`), all three through
 1. **Why the provenance-cast fragment needs `provCastFlowOk` and the alias view**
    (`inFragmentWithIntrinsicsA1`, the extended fragment exactly as Pass A1
    defined it). That predicate admitted
-   * `exposeTwice` — Anneal and both MiniRust machines return `0` under
-     canonical stack addresses (`exposeTwice_three_way_divergence`), while
-     `provCastFlowOk = false` still conservatively rejects multi-exposure flow;
-   * `int2ptrForgedTag` — Anneal and both MiniRust machines raise UB
-     (`int2ptrForgedTag_three_way_divergence`) because `exposedAllocIds = []`
+   * `exposeTwice` — formerly a divergence (Anneal returned the tag-encoded
+     `65536`); under the places-ptr `Trusted` semantics Anneal and both MiniRust
+     machines return `0` under canonical stack addresses
+     (`exposeTwice_three_way_agreement`; historical name
+     `exposeTwice_three_way_divergence`), while `provCastFlowOk = false` still
+     conservatively rejects multi-exposure flow;
+   * `int2ptrForgedTag` — formerly a divergence (Anneal resurrected a borrow tag
+     from a forged integer and returned `5`); now Anneal and both MiniRust
+     machines raise UB (`int2ptrForgedTag_three_way_ub_agreement`; historical
+     name `int2ptrForgedTag_three_way_divergence`) because `exposedAllocIds = []`
      prevents unexposed tag resurrection, while `provCastFlowOk` still rejects
      forged integer constants syntactically;
    * `directWrite` — Anneal UB, `Mach` returns `9`: the `ptrAliasingOk`
@@ -128,11 +133,25 @@ theorem exposeTwice_intr_tb_direct :
   decide +kernel
 
 set_option maxRecDepth 200000 in
-/-- With canonical stack local page addresses (`ptrAddress?`), Anneal and both
-MiniRust machines (`Mach` and `MachTB`) return `0` on `exposeTwice` (while
-`provCastFlowOk = false` still conservatively rejects `exposeTwice` from
-`inFragmentWithIntrinsics`). -/
+/-- **Historical name.** Recorded a divergence before the places-ptr `Trusted`
+semantics (Anneal returned the tag-encoded `65536`); it now states the three-way
+agreement `exposeTwice_three_way_agreement`: with canonical stack local page
+addresses (`ptrAddress?`), Anneal and both MiniRust machines (`Mach` and
+`MachTB`) return `0` on `exposeTwice` (while `provCastFlowOk = false` still
+conservatively rejects `exposeTwice` from `inFragmentWithIntrinsics`). -/
 theorem exposeTwice_three_way_divergence :
+    (∃ mem, ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
+        (.normal (.scalar ⟨0, 4⟩, mem))) ∧
+      retAfterIntr exposeTwice [.scalar ⟨5, 4⟩] 13 =
+        some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
+      retAfterIntrTB exposeTwice [.scalar ⟨5, 4⟩] 13 = tbRetU32 0 :=
+  ⟨⟨_, exposeTwice_anneal_ret⟩, exposeTwice_intr_minirust_direct, exposeTwice_intr_tb_direct⟩
+
+/-- **Three-way lockstep agreement (`exposeTwice`).** Exposing two raw borrows of
+`_1` at offset `0` yields the same canonical stack address in Anneal, so Anneal,
+`Mach`, and `MachTB` all return `0`; Anneal additionally records both tags in
+`Memory.exposedAllocIds` (`exposeTwice_anneal_ret`). -/
+theorem exposeTwice_three_way_agreement :
     (∃ mem, ReachesRet (mirTree exposeTwice (initMachineState exposeTwice [.scalar ⟨5, 4⟩])) []
         (.normal (.scalar ⟨0, 4⟩, mem))) ∧
       retAfterIntr exposeTwice [.scalar ⟨5, 4⟩] 13 =
@@ -182,10 +201,13 @@ theorem int2ptrForgedTag_tb_direct :
       some (.ub "dereferencing pointer without provenance") := by
   decide +kernel
 
-/-- With `Memory.exposedAllocIds` enforced by `recoverExposedPtrValue?`, Anneal
-and both MiniRust machines (`Mach` and `MachTB`) raise UB on `int2ptrForgedTag`
-(while `provCastFlowOk` still excludes forged integer constants from
-`inFragmentWithIntrinsics`). -/
+/-- **Historical name.** Recorded a divergence before the places-ptr `Trusted`
+semantics (Anneal returned `5`); it now states the agreement that
+`int2ptrForgedTag_three_way_ub_agreement` restates without the fragment
+conjunct: with `Memory.exposedAllocIds` enforced by `recoverExposedPtrValue?`,
+Anneal and both MiniRust machines (`Mach` and `MachTB`) raise UB on
+`int2ptrForgedTag` (while `provCastFlowOk` still excludes forged integer
+constants from `inFragmentWithIntrinsics`). -/
 theorem int2ptrForgedTag_three_way_divergence :
     inFragmentWithIntrinsicsA1 int2ptrForgedTag = true ∧
       (∃ tr u, Reaches (mirTree int2ptrForgedTag
@@ -196,6 +218,19 @@ theorem int2ptrForgedTag_three_way_divergence :
         some (.ub "dereferencing pointer without provenance") :=
   ⟨int2ptrForgedTag_inFragmentWithIntrinsicsA1, int2ptrForgedTag_anneal_ub,
     int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
+
+/-- **Three-way lockstep UB agreement (`int2ptrForgedTag`).** Nothing is exposed,
+so `with_exposed_provenance(65536)` recovers no provenance in Anneal and
+dereferencing `*q` faults in Anneal, `Mach`, and `MachTB`
+(`"dereferencing pointer without provenance"` on both MiniRust machines). -/
+theorem int2ptrForgedTag_three_way_ub_agreement :
+    (∃ tr u, Reaches (mirTree int2ptrForgedTag
+        (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+      stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
+        some (.ub "dereferencing pointer without provenance") ∧
+      stopAfterIntrTB int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
+        some (.ub "dereferencing pointer without provenance") :=
+  ⟨int2ptrForgedTag_anneal_ub, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
 
 /-! ### `directWrite` and `exposeSharedRefWriteUb`: dropped borrow discipline -/
 
@@ -1701,11 +1736,15 @@ theorem callCrossFrameExposeWithExposed_three_way :
    on `.retag .fnEntry`). We prove both `progCrossFrameTranslatable_imp_B3` and
    `progInFragmentWithIntrinsics_imp_B3`, and then witness every independent
    divergence that `progInFragmentWithIntrinsicsB3` admitted:
-   * `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
-     `childReborrowWriteDisablesParent_B3_divergence`, and
-     `exposeSharedRefWriteUb_B3_divergence` (single-body `callees = []`
-     divergences, including `int2ptrForgedTag` where Anneal succeeds and returns
-     `5` while `Mach` and `MachTB` raise UB);
+   * `exposeSharedRefWriteUb_B3_divergence` (a single-body `callees = []`
+     divergence), together with the historically named single-body witnesses
+     `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`, and
+     `childReborrowWriteDisablesParent_B3_divergence`, whose divergences have
+     since been resolved in `Trusted`: all three machines now return `0` on
+     `exposeTwice` and raise UB on `int2ptrForgedTag` (programs that
+     `progInFragmentWithIntrinsicsB3` admits and `progInFragmentWithIntrinsics`
+     conservatively rejects), and return `9` on
+     `childReborrowWriteDisablesParent` (admitted by both predicates);
    * `callerRawPtrRetagFnEntry_B3_divergence` (`Retag(FnEntry)` on a `*mut u32`
      parameter attaches a strong protector in Anneal, faulting on `StorageDead`
      of an unrelated callee local, while `Mach` and `MachTB` return `7`);
@@ -1827,6 +1866,9 @@ theorem progInFragmentWithIntrinsics_imp_B3 {entry : CapturedMir} {callees : Lis
     progInFragmentWithIntrinsicsB3 entry callees = true :=
   progCrossFrameTranslatable_imp_B3 (progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable h)
 
+/-- **Historical name** (`exposeTwice` is no longer a divergence; see
+`exposeTwice_three_way_agreement`): Pass B3's predicate admits `exposeTwice`,
+the unified fragment rejects it, and all three machines return `0`. -/
 theorem exposeTwice_B3_divergence :
     progInFragmentWithIntrinsicsB3 exposeTwice [] = true ∧
     progInFragmentWithIntrinsics exposeTwice [] = false ∧
@@ -1837,6 +1879,10 @@ theorem exposeTwice_B3_divergence :
     retAfterIntrTB exposeTwice [.scalar ⟨5, 4⟩] 13 = tbRetU32 0 :=
   ⟨by decide +kernel, by decide +kernel, exposeTwice_three_way_divergence⟩
 
+/-- **Historical name** (`int2ptrForgedTag` is no longer a divergence; see
+`int2ptrForgedTag_three_way_ub_agreement`): Pass B3's predicate admits
+`int2ptrForgedTag`, the unified fragment rejects it, and all three machines raise
+UB. -/
 theorem int2ptrForgedTag_B3_divergence :
     progInFragmentWithIntrinsicsB3 int2ptrForgedTag [] = true ∧
     progInFragmentWithIntrinsics int2ptrForgedTag [] = false ∧

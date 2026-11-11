@@ -1144,13 +1144,16 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   symbolically by `mirCall_ret` / `mirCall_noUB` / `mirCall_progress_N`
   (`childReborrowWriteDisablesParent_minirust_ret_from_start` / `_minirust_noUB` /
   `_progress`, `retagDisabledRefDiscrepancy_minirust_ret_from_start` /
-  `_minirust_noUB` / `_progress`); they disagree on the remaining
-  divergences listed under the gaps: `misaligned` (UB in MiniRust only),
-  `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
-  `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
+  `_minirust_noUB` / `_progress`). Under the places-ptr `Trusted` semantics,
+  `misaligned`, `misalignedRef`, and `transmuteDanglingIntToRefDiscrepancy` now
+  raise UB in Anneal as well as on `BasicMemory` and `MachTB`
+  (`misaligned_three_way_ub_agreement`, `misalignedRef_three_way_ub_agreement`,
+  `transmuteDanglingIntToRefDiscrepancy_three_way_ub_agreement`), and
+  `exposeTwice` returns `0` on all three (`exposeTwice_three_way_agreement`).
+  They disagree on the remaining divergences listed under the gaps:
+  `danglingRef`
   (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
-  without dereferencing in MiniRust, vs returning `5` in Anneal),
-  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), `directWrite` and
+  without dereferencing in MiniRust, vs returning `5` in Anneal), `directWrite` and
   `frozenWrite` (UB in Anneal only, while returning `9` on both `BasicMemory`
   and `MachTB` because `PtrType::Raw` has `safe_pointee = None` so
   `ReborrowSettings::new` is `None`), `twoPhaseForeignWriteDiscrepancy` and
@@ -1180,8 +1183,8 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `MachTB`), and `transmuteSharedRefToMutWriteDiscrepancy` /
   `transmuteDanglingIntToRefDiscrepancy` (transmuting `&u32` to `&mut u32` and
   writing faulting on `Frozen` in both Anneal and `MachTB` vs returning `77` on
-  `BasicMemory`, and transmuting `4_usize` to `&u32` without dereferencing
-  returning `5` in Anneal vs raising `"Value::Ptr: non-dereferenceable safe pointer"`
+  `BasicMemory`; transmuting `4_usize` to `&u32` without dereferencing now
+  raises UB in Anneal too, matching `"Value::Ptr: non-dereferenceable safe pointer"`
   on both `BasicMemory` and `MachTB`);
   alongside ground-truth checks `checkValue_refTy_safe_ptr_ub`,
   `transmute_refTy_machine_checks`, `validate_refTy_machine_checks`,
@@ -1243,12 +1246,17 @@ written only by `PointerExposeProvenance`, read only by
 `PointerWithExposedProvenance` at the exposed pointer's pointee and without
 adding mutability, and never otherwise observed; no forged addresses) and
 `ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
-pointer copy, as in Anneal's `tag * 65536 + offsetBytes` encoding).
+pointer copy: Anneal exposes the canonical stack address of the borrowed place,
+records the tag in `Memory.exposedAllocIds`, and `recoverExposedPtrValue?`
+recovers the same tag).
 `Correspondence/ProvenanceWitness.lean` records why: the extended fragment
-without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`
-(Anneal `65536` vs. `0` on `Mach` and `MachTB`), `int2ptrForgedTag` (Anneal
-returns `5` from the forged address `65536` while both MiniRust machines raise
-UB), `directWrite`, and `exposeSharedRefWriteUb`, all rejected now; and it runs
+without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`,
+`int2ptrForgedTag`, `directWrite`, and `exposeSharedRefWriteUb`, all rejected
+now. The first two were divergences under the earlier tag-encoded addresses
+(Anneal returned `65536` and `5`); under the places-ptr `Trusted` semantics all
+three machines return `0` on `exposeTwice` and raise UB on `int2ptrForgedTag`
+(`exposeTwice_three_way_agreement`, `int2ptrForgedTag_three_way_ub_agreement`),
+while `directWrite` and `exposeSharedRefWriteUb` still diverge; and it runs
 the brief's suite across all three semantics: `int2ptrRoundTripOk_three_way`
 (`77`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
 (two adjacent exposed arguments under `ctxAdj`: Anneal `9`, `Stop.unsupported`
@@ -1417,10 +1425,10 @@ These are deliberate and are the first things to lift:
   Tree Borrows) diverge:
   - *Safe-pointer validity without dereferencing*: MiniRust's `checkPtr` checks
     non-null, alignment, inhabitedness, and `dereferenceable` on every load or
-    store of a `PtrType::Ref`, so forming an unused misaligned `&u32`
-    (`misalignedRef`) or copying a dangling `&u32` (`danglingRef`) is
+    store of a `PtrType::Ref`, so copying a dangling `&u32` (`danglingRef`) is
     immediate UB in MiniRust, whereas Anneal stores `(tag, offset)` pairs and
-    checks liveness only on dereference.
+    checks liveness only on dereference (forming an unused misaligned `&u32`,
+    `misalignedRef`, is now UB in both).
   - *Tree Borrows `parentTag` hierarchy vs. remaining local-teardown and direct-write
     gaps*: Anneal's `BorrowEntry` records `parentTag`, starts `&mut *_p` reborrows
     in `.reserved`, freezes overlapping foreign `.active` entries on dereference
@@ -1463,15 +1471,14 @@ These are deliberate and are the first things to lift:
     `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
     conflicting even for `!Freeze` `.reserved` entries.
   - *Misaligned sub-scalar offsets, integer-to-pointer transmutes, and provenance exposure*:
-    while stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
-    agree with MiniRust (`offsetDeref`), Anneal reads the underlying scalar local
-    on misaligned sub-scalar byte offsets (`misaligned`),
-    checks only `bits != 0` when decoding provenance-free integer bytes at `&T`
-    (`transmuteDanglingIntToRefDiscrepancy`), and encodes
-    `PointerExposeProvenance` as `tag * 65536 + offsetBytes` (`exposeTwice`;
-    conversely, exposing two distinct live `&mut` tags at one address stops with
-    `Stop.unsupported` on `MachTB`'s angelic `int2ptr` choice in
-    `exposeTwoRefMutAngelicUnsupported`),
+    stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
+    agree with MiniRust (`offsetDeref`), and under the places-ptr `Trusted`
+    semantics so do misaligned sub-scalar loads (`misaligned`), integer-to-`&T`
+    transmutes (`transmuteDanglingIntToRefDiscrepancy`), and repeated exposure
+    of one address (`exposeTwice`; conversely, exposing two distinct live `&mut`
+    tags at one address stops with `Stop.unsupported` on `MachTB`'s angelic
+    `int2ptr` choice in `exposeTwoRefMutAngelicUnsupported`); these forms stay
+    outside `inFragment`,
     while `Retag(FnEntry)` / reference arguments and reference returns remain
     outside `inFragment`. Two upstream MiniRust `TreeBorrowsMemory` edge cases
     are also exhibited and isolated (`zstWrappingSubReborrow_tb_specPanic` vs.
@@ -1614,11 +1621,13 @@ These are deliberate and are the first things to lift:
      can **silently return a wrong scalar with `MirNoUBTree`** when the callee's
      colliding local slot holds a same-typed scalar
      (`callerRefMutSilentWrongLocal_divergence`: Anneal returns `137` with no UB
-     while `Mach` and `MachTB` return `42`). Single-body divergences admitted by
+     while `Mach` and `MachTB` return `42`). Single-body programs admitted by
      Pass B3's unguarded predicate (`progInFragmentWithIntrinsicsB3`) are also
-     recorded in `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
-     `childReborrowWriteDisablesParent_B3_divergence`, and
-     `exposeSharedRefWriteUb_B3_divergence`.
+     recorded: `exposeSharedRefWriteUb_B3_divergence` still diverges, while the
+     historically named `exposeTwice_B3_divergence`,
+     `int2ptrForgedTag_B3_divergence`, and
+     `childReborrowWriteDisablesParent_B3_divergence` now agree across all three
+     semantics.
   Threading `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across
   the continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
