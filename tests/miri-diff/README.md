@@ -25,7 +25,11 @@ Every test in [`corpus/src/lib.rs`](corpus/src/lib.rs) is a self-contained,
    - **`pass` (`TotalVerificationResult`)**: Proved via
      `verifyTotalMirUnitPointBounded` or `verifyTotalMirScalarPointBounded`,
      certifying that execution terminates normally without UB or panic and
-     returns the exact scalar or unit value produced by Miri.
+     returns the exact scalar or unit value produced by Miri. A test whose MIR
+     calls other functions captured from `corpus/` (such as
+     `pass_direct_fn_call` calling `helper_add_ten`) is instead proved via
+     `verifyTotalMirBounded` with those captured bodies linked as the claim's
+     `callees`.
    - **`panic` (`StatefulVerificationResult ∧ ¬ TotalClaim.holds`)**: Proved
      via `verifySafePanicMirPointBounded`, certifying that execution unwinds
      cleanly via `MirOutcome.panic` without exhibiting Undefined Behavior
@@ -43,6 +47,11 @@ All generated modules and their whole-crate rollup (`CrateVerify`) are checked
 by `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode (enforcing
 statement-origin isolation, zero `sorryAx`, zero unapproved axioms, and full
 Lean 4 kernel replay at `trustLevel := 0`).
+
+Every theorem and probe generated for a test links the same callee table: the
+`defaultCallees` list that scaffolding records for the test's item, which holds
+only bodies captured from `corpus/`. A call to any other function remains an
+uninterpreted external call.
 
 ## Policy on `known_anneal_bug` Entries
 
@@ -71,10 +80,7 @@ Lean 4 kernel replay at `trustLevel := 0`).
 
 | Bug Class | Suspected Component | Affected Corpus Tests | Root Cause |
 | :--- | :--- | :--- | :--- |
-| Soundness (false negative on UB) | `MirSemantics.Places` | `ub_transmute_invalid_bool_through_ptr` | Writing `3u8` through `*mut u8` cast from `&mut bool` stores an out-of-range scalar into the `bool` local without re-checking `[0, 1]` validity on write or subsequent read. |
-| UB location mismatch | `MirSemantics.Places` | `ub_ptr_offset_oob_read`, `ub_ptr_offset_oob_write` | `ptrAllocByteBound?` bounds-checks `&raw const pair.a` / `&raw mut pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with `FailureKind.ub` on `offset(base, 2isize)` instead of the subsequent dereference. |
-| Completeness (false positive UB) | `MirSemantics.Places` | `pass_ptr_offset_within_array` | Cross-struct-field pointer offset (`offset(&raw const pair.a, 1)`) leaves `BorrowEntry.targetProjection` pointing to field 0 (`pair.a`), so `resolveStackThinPtrTargetProj?` fails closed with `FailureKind.ub` on `*p1` instead of resolving adjacent field 1 (`pair.b`). |
-| Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` / `Memory` | `pass_direct_fn_call`, `panic_explicit_macro` | `core::panicking::panic_fmt` is not yet interpreted in `evalCallTerminator`, and `initMachineState` leaves `Memory.callees` empty by default. |
+| Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` | `panic_explicit_macro` | `panic!("...")` first calls `core::fmt::Arguments::<'a>::from_str`, which `Trusted` does not model and the corpus does not capture, so evaluation stops at that external call before reaching `core::panicking::panic_fmt`. |
 
 ## Running the Suite
 

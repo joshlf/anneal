@@ -19,14 +19,16 @@
 //! 2. Full 77-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 32 non-bug `pass` tests.
+//!    - Proves `TotalVerificationResult` for all 34 non-bug `pass` tests,
+//!      including `pass_direct_fn_call`, whose claim links the captured
+//!      `helper_add_ten` body as a callee.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 30 non-bug `ub` tests.
-//!    - Enforces `evalMirDiffTagBounded` / `probeMirDiffExecBounded` equality
-//!      ratchets for all 6 open Anneal bugs (`[tests.known_anneal_bug]`).
+//!      `MiriOracleProbe.lean` for all 33 non-bug `ub` tests.
+//!    - Enforces the `evalMirDiffTagBounded` equality ratchet for the single
+//!      open Anneal bug (`panic_explicit_macro`, `[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
@@ -38,11 +40,14 @@
 //!      `tb_child_write_then_parent_read`, `tb_child_write_then_parent_write`,
 //!      `safe_reborrow_then_parent_write`, `pass_exact_div_valid`,
 //!      `ub_exact_div_non_multiple`,
-//!      `pass_copy_nonoverlapping_uninit_bytes_to_uninit`, or
-//!      `pass_tb_unsafe_cell_shared_mutation`) fails to build in Lake.
+//!      `pass_copy_nonoverlapping_uninit_bytes_to_uninit`,
+//!      `pass_tb_unsafe_cell_shared_mutation`, or `pass_direct_fn_call`) fails
+//!      to build in Lake.
 //!    - Verifies that reintroducing a stale `ub_location_mismatch` ratchet on
 //!      `ub_tb_use_frozen_mut_after_parent_read` (`src/lib.rs:606:23: 606:28`)
 //!      fails to build in Lake.
+//! 4. Callee-linked certificate shapes: `panic` and `ub` certificates rendered
+//!    with a linked (unused) intra-crate callee still build in Lake.
 
 use std::env;
 use std::fs;
@@ -53,8 +58,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cargo_anneal::{
     KnownAnnealBugSpec, MiriDiffConfig, MiriDiffTestEntry, MiriDiffVerdictSpec, MiriToolchain,
     SourcePos, SourceSpan, load_miri_diff_manifest, parse_miri_diff_manifest,
-    render_miri_diff_report, render_miri_diff_verify_module, run_lake_verify_targets,
-    run_miri_diff_suite, verify_miri_diff_ub_locations,
+    render_miri_diff_report, render_miri_diff_verify_module,
+    render_miri_diff_verify_module_with_callees, run_lake_verify_targets, run_miri_diff_suite,
+    verify_miri_diff_ub_locations,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -128,7 +134,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 2);
+    assert_eq!(bug_count, 1);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -415,12 +421,20 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let report = run_miri_diff_suite(&config).expect("77-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 77);
-    assert_eq!(report.verified_pass_count, 33);
+    assert_eq!(report.verified_pass_count, 34);
     assert_eq!(report.verified_panic_count, 9);
     assert_eq!(report.verified_strict_ub_count, 33);
-    assert_eq!(report.ratcheted_known_bug_count, 2);
-    // 33 pass + 9 panic + 1 helper (`helper_add_ten`) = 43 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 43);
+    assert_eq!(report.ratcheted_known_bug_count, 1);
+    // 34 pass + 9 panic + 1 helper (`helper_add_ten`) = 44 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 44);
+    assert!(
+        report
+            .audited_certificate_modules
+            .iter()
+            .any(|m| m == "Verify.MiriDiffCorpus.pass_direct_fn_call"),
+        "pass_direct_fn_call must be an audited certificate module: {:?}",
+        report.audited_certificate_modules
+    );
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              77"));
@@ -428,6 +442,21 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let dot_anneal = temp_corpus.join(".anneal");
     let verify_dir = dot_anneal.join("generated/Verify/MiriDiffCorpus");
+
+    // The retired bug's certificate links only the captured `helper_add_ten`
+    // body, through the general bounded combinator rather than the
+    // callee-free point combinator.
+    let direct_call_verify = fs::read_to_string(verify_dir.join("pass_direct_fn_call.lean"))
+        .expect("read pass_direct_fn_call verify module");
+    assert_eq!(
+        direct_call_verify
+            .matches("callees := [Mir.MiriDiffCorpus.helper_add_ten.body]")
+            .count(),
+        2,
+        "unexpected pass_direct_fn_call certificate:\n{direct_call_verify}"
+    );
+    assert!(direct_call_verify.contains("Lower.verifyTotalMirBounded _ 128"));
+    assert!(!direct_call_verify.contains("known_anneal_bug_ratchet"));
 
     // Negative check 1: `refuteMirPointByStrictUB` must reject an item that
     // stops on `externalCall` (or normal return) rather than `FailureKind.ub`.
@@ -573,7 +602,26 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             None,
             MiriDiffVerdictSpec::Ub,
         ),
+        (
+            "pass_direct_fn_call",
+            "control_flow_and_calls",
+            "tests/pass/calls.rs",
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 42,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::ExternalCall("miri_diff_corpus::helper_add_ten".to_string()),
+        ),
     ] {
+        // Render each ratchet the way `stage_miri_diff_workspace` does, with the
+        // test's captured intra-crate callees linked. Without linking,
+        // `pass_direct_fn_call` still stops at its `helper_add_ten` call, so its
+        // stale `externalCall` ratchet would hold and the check would be vacuous.
+        let linked_callees: Vec<String> = match fixed_name {
+            "pass_direct_fn_call" => vec!["MiriDiffCorpus.helper_add_ten".to_string()],
+            _ => Vec::new(),
+        };
         let orig_path = verify_dir.join(format!("{fixed_name}.lean"));
         let orig_content = fs::read_to_string(&orig_path).expect("read original verify module");
         let stale_entry = MiriDiffTestEntry {
@@ -592,10 +640,11 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
                 summary: "Reintroduced stale bug ratchet must fail.".to_string(),
             }),
         };
-        let (stale_lean, _) = render_miri_diff_verify_module(
+        let (stale_lean, _) = render_miri_diff_verify_module_with_callees(
             "MiriDiffCorpus",
             &format!("miri_diff_corpus::{fixed_name}"),
             &stale_entry,
+            &linked_callees,
         )
         .expect("render stale bug ratchet module");
         fs::write(&orig_path, stale_lean).expect("write stale bug ratchet module");
@@ -717,6 +766,42 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         corrupted_err.contains("UB location mismatch on 'ub_unchecked_add_overflow_u32'"),
         "unexpected error: {corrupted_err}"
     );
+
+    // Positive check 6: the callee-linked `panic` and `ub` certificate shapes
+    // (which no corpus test currently needs) elaborate and kernel-check. Linking
+    // `helper_add_ten` into tests that never call it must not change their
+    // outcome.
+    let manifest = load_miri_diff_manifest(&manifest_path).expect("load checked-in manifest");
+    for linked_name in [
+        "panic_checked_add_overflow",
+        "ub_unchecked_add_overflow_u32",
+    ] {
+        let linked_entry = manifest
+            .tests
+            .iter()
+            .find(|t| t.name == linked_name)
+            .expect("find callee-linked certificate test");
+        let orig_path = verify_dir.join(format!("{linked_name}.lean"));
+        let orig_content = fs::read_to_string(&orig_path).expect("read original verify module");
+        let (linked_lean, _) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            &format!("miri_diff_corpus::{linked_name}"),
+            linked_entry,
+            &["MiriDiffCorpus.helper_add_ten".to_string()],
+        )
+        .expect("render callee-linked certificate");
+        assert!(linked_lean.contains("callees := [Mir.MiriDiffCorpus.helper_add_ten.body]"));
+        fs::write(&orig_path, linked_lean).expect("write callee-linked certificate");
+        let linked_res = run_lake_verify_targets(
+            &dot_anneal,
+            &[format!("Verify.MiriDiffCorpus.{linked_name}")],
+        );
+        fs::write(&orig_path, orig_content).expect("restore original verify module");
+        assert!(
+            linked_res.is_ok(),
+            "callee-linked certificate for `{linked_name}` must build: {linked_res:?}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

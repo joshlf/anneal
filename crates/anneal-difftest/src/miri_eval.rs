@@ -16,6 +16,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cargo_anneal::{
@@ -66,6 +67,272 @@ pub const NOT_COMPARED_REASON_NAMES: [&str; 6] = [
     "miri_oracle_error",
     "capture_failed",
 ];
+
+/// `DefPath` spellings of the `core::fmt::Arguments` constructors that
+/// `panic!("...")` and `assert!(cond, "...")` expansions call before handing
+/// the result to `core::panicking::panic_fmt`.
+///
+/// The pinned toolchain emits `core::fmt::Arguments::<'a>::from_str`; the other
+/// spellings cover the anonymous-lifetime form and the older `new_const`
+/// constructor. Each one is linked into every oracle module as
+/// `fmtArgumentsCtorStub "<defPath>"` (see [`FMT_ARGUMENTS_CTOR_STUB_LEAN`]).
+pub const FMT_ARGUMENTS_CTOR_DEF_PATHS: [&str; 4] = [
+    "core::fmt::Arguments::<'a>::from_str",
+    "core::fmt::Arguments::<'_>::from_str",
+    "core::fmt::Arguments::<'a>::new_const",
+    "core::fmt::Arguments::<'_>::new_const",
+];
+
+/// Lean definition of `fmtArgumentsCtorStub`, the synthetic `CapturedMir` body
+/// that `miri-difftest` links in place of each `core::fmt::Arguments`
+/// constructor in [`FMT_ARGUMENTS_CTOR_DEF_PATHS`].
+///
+/// `evalCallTerminator` evaluates the caller's argument operands before it
+/// pushes a linked callee frame, so the `&'static str` argument is still checked
+/// for UB. The body then assigns the placeholder `()` to `_0` and returns:
+/// `Terminator.return_` requires an initialized `_0`, and the caller's later
+/// `move` of the result into `core::panicking::panic_fmt` requires an
+/// initialized destination local. Anneal models `panic_fmt` as an unwinding
+/// panic that never reads its argument, so the placeholder cannot change any
+/// outcome on that path. A program that inspects the returned value itself
+/// diverges from Miri visibly rather than agreeing by accident.
+///
+/// These stubs appear only in `MiriOracleProbe.lean` and
+/// `MiriOracleConfirm.lean`, after every captured helper body, so a captured
+/// body with the same `DefPath` would take precedence in `findCallee?`. They
+/// never enter a `Verify` certificate. The block contains no blank line, so
+/// finding bundles can copy it verbatim from `MiriOracleConfirm.lean`.
+pub const FMT_ARGUMENTS_CTOR_STUB_LEAN: &str = "\
+-- Synthetic stand-in for the `core::fmt::Arguments` constructor `defPath`,\n\
+-- linked only by `miri-difftest` oracle modules. The caller has already\n\
+-- evaluated the `&'static str` argument; this body stores the placeholder `()`\n\
+-- in `_0` and returns, so the caller can pass the result to\n\
+-- `core::panicking::panic_fmt`, which Anneal models as an unwinding panic\n\
+-- without reading its argument.\n\
+open Trusted.Rustc.V2026_06_01.Layout in\n\
+def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
+  { defPath := defPath\n    \
+    phase := MirPhaseTag.runtimeOptimized\n    \
+    role := ContractRole.model\n    \
+    argCount := 1\n    \
+    localDecls :=\n      \
+      [{ mutability := Mutability.mut, ty := { kind := RigidTy.tuple [], layoutIdx := 0 }, debugName := Option.none },\n       \
+       { mutability := Mutability.not, ty := { kind := RigidTy.ref Mutability.not RigidTy.str, layoutIdx := 1 }, debugName := Option.none }]\n    \
+    basicBlocks :=\n      \
+      [{ statements :=\n           \
+           [{ kind := StatementKind.assign { local_ := 0, projection := [] }\n                \
+                (Rvalue.use (Operand.constant { ty := { kind := RigidTy.tuple [], layoutIdx := 0 }, val := ConstValue.zeroSized })),\n              \
+              span := \"<dummy>\" }]\n         \
+         terminator := { kind := TerminatorKind.return_, span := \"<dummy>\" }\n         \
+         isCleanup := false }]\n    \
+    fnAbi :=\n      \
+      { args := [{ layout := { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }, mode := AbiPassMode.pair }]\n        \
+        ret := { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.arbitrary [] [], variants := VariantsShape.single 0, isUninhabited := false }, mode := AbiPassMode.ignore }\n        \
+        conv := CallConv.rust\n        \
+        canUnwind := false }\n    \
+    layouts :=\n      \
+      { pointerBits := 64\n        \
+        isLittleEndian := true\n        \
+        entries :=\n          \
+          [{ size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.arbitrary [] [], variants := VariantsShape.single 0, isUninhabited := false },\n           \
+           { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }] }\n    \
+    allocations := [] }\n";
+
+/// Name of the Lean definition in [`FMT_ARGUMENTS_CTOR_STUB_LEAN`].
+const FMT_ARGUMENTS_CTOR_STUB_NAME: &str = "fmtArgumentsCtorStub";
+
+/// Path suffixes of the standard-library files that define the panic and
+/// assertion macros.
+///
+/// MIR expanded from one of these macros carries spans inside the macro's
+/// definition, so Anneal attributes a panic raised by the expansion to a span in
+/// one of these files. Miri instead reports the user's call site, because the
+/// panic entry points that the expansions call are `#[track_caller]`.
+const STD_PANIC_MACRO_FILE_SUFFIXES: [&str; 4] = [
+    "library/core/src/panic.rs",
+    "library/core/src/macros/mod.rs",
+    "library/core/src/macros/panic.rs",
+    "library/std/src/macros.rs",
+];
+
+/// Standard panic and assertion macros whose call site Miri reports for a panic
+/// raised inside their expansion.
+const STD_PANIC_MACRO_NAMES: [&str; 8] = [
+    "panic",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "unreachable",
+    "todo",
+    "unimplemented",
+];
+
+/// Staged `src/lib.rs` text indexed by the line range of each top-level `fn`
+/// item, used by [`compare_difftest_miri_and_anneal`] to decide whether Miri's
+/// panic position is a panic-macro call site inside the evaluated function.
+#[derive(Debug, Clone, Default)]
+pub struct StagedLibSource {
+    lines: Vec<String>,
+    fn_lines: BTreeMap<String, (usize, usize)>,
+}
+
+impl StagedLibSource {
+    /// Index `lib_rs`, recording the 1-based inclusive line range from each
+    /// top-level `fn` keyword to its closing brace.
+    ///
+    /// A source that fails to parse indexes no functions, so no panic site in
+    /// it is reconciled.
+    pub fn parse(lib_rs: &str) -> Self {
+        let fn_lines = match syn::parse_file(lib_rs) {
+            Ok(file) => file
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::Item::Fn(func) => Some((
+                        func.sig.ident.to_string(),
+                        (
+                            func.sig.fn_token.span.start().line,
+                            func.block.brace_token.span.close().end().line,
+                        ),
+                    )),
+                    _ => None,
+                })
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
+        Self {
+            lines: lib_rs.lines().map(str::to_string).collect(),
+            fn_lines,
+        }
+    }
+
+    /// Return the 1-based inclusive line range of the top-level `fn` item
+    /// `fn_name`, if indexed.
+    pub fn fn_line_range(&self, fn_name: &str) -> Option<(usize, usize)> {
+        self.fn_lines.get(fn_name).copied()
+    }
+
+    /// Return `true` when `pos` lies in the staged `src/lib.rs`, within the
+    /// line range of `fn_name`, at the start of an invocation of one of
+    /// [`STD_PANIC_MACRO_NAMES`].
+    fn is_panic_macro_call_site(&self, fn_name: &str, pos: &SourcePos) -> bool {
+        let file = pos.file.replace('\\', "/");
+        if file.strip_prefix("./").unwrap_or(&file) != "src/lib.rs" {
+            return false;
+        }
+        let Some((first, last)) = self.fn_line_range(fn_name) else {
+            return false;
+        };
+        let (line, col) = (pos.line as usize, pos.col as usize);
+        if line < first || line > last || col == 0 {
+            return false;
+        }
+        let Some(text) = self.lines.get(line - 1) else {
+            return false;
+        };
+        // Miri reports 1-based columns counted in characters.
+        let invocation: String = text.chars().skip(col - 1).collect();
+        starts_with_std_panic_macro_invocation(&invocation)
+    }
+}
+
+/// Return `true` when `text` begins with an invocation of one of
+/// [`STD_PANIC_MACRO_NAMES`], written bare (`assert!(...)`) or through
+/// `core::` / `std::` (optionally rooted with `::`).
+fn starts_with_std_panic_macro_invocation(text: &str) -> bool {
+    let mut rest = text;
+    let rooted = rest.starts_with("::");
+    if rooted {
+        rest = &rest[2..];
+    }
+    let mut crate_qualified = false;
+    for krate in ["core::", "std::"] {
+        if let Some(after) = rest.strip_prefix(krate) {
+            rest = after;
+            crate_qualified = true;
+            break;
+        }
+    }
+    if rooted && !crate_qualified {
+        return false;
+    }
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, after_name) = rest.split_at(name_len);
+    STD_PANIC_MACRO_NAMES.contains(&name) && after_name.trim_start().starts_with('!')
+}
+
+/// Return `true` when `file` ends with one of
+/// [`STD_PANIC_MACRO_FILE_SUFFIXES`] at a path-component boundary (or equals
+/// it).
+fn is_std_panic_macro_file(file: &str) -> bool {
+    let file = file.replace('\\', "/");
+    STD_PANIC_MACRO_FILE_SUFFIXES
+        .iter()
+        .any(|suffix| file == *suffix || file.ends_with(&format!("/{suffix}")))
+}
+
+/// Compare a candidate's Miri and Anneal outcomes with
+/// `compare_miri_and_anneal`, then reconcile the panic-site difference that the
+/// standard panic and assertion macros introduce.
+///
+/// `compare_miri_and_anneal` requires Anneal's panic span to contain Miri's
+/// panic position. For `panic!`, `assert!`, and similar macros the two
+/// legitimately differ: Anneal reports the panicking terminator's span inside
+/// the macro's standard-library definition, while Miri reports the user's call
+/// site (`#[track_caller]`). A `Diverge(PanicSiteMismatch)` therefore becomes
+/// `Agree` only when all of the following hold:
+///
+/// 1. Miri and Anneal both panicked, each with a known position.
+/// 2. Anneal's panic span lies in a standard-library panic-macro file
+///    (`library/core/src/panic.rs`, `library/core/src/macros/mod.rs`,
+///    `library/core/src/macros/panic.rs`, or `library/std/src/macros.rs`).
+/// 3. Miri's panic position lies in the staged `src/lib.rs`, within the line
+///    range of `fn_name`, at an invocation of `panic!`, `assert!`,
+///    `assert_eq!`, `assert_ne!`, `debug_assert!`, `unreachable!`, `todo!`,
+///    or `unimplemented!` (bare or through `core::` / `std::`).
+///
+/// Every other verdict is returned unchanged. In particular, a panic-site
+/// mismatch whose Anneal span lies in user code (two different panicking
+/// operations, or a `#[track_caller]` helper that Anneal attributes to its own
+/// body) remains `Diverge(PanicSiteMismatch)`.
+///
+/// Every expansion of a standard macro shares the span of the macro's
+/// definition, so these conditions cannot tell two panic-macro call sites in
+/// the same function apart: if Anneal panics at a different `panic!` than Miri
+/// does, the outcome still reconciles to `Agree`.
+pub fn compare_difftest_miri_and_anneal(
+    miri: &MiriOutcome,
+    anneal: &AnnealOutcome,
+    lib_src: &StagedLibSource,
+    fn_name: &str,
+) -> ComparisonVerdict {
+    let verdict = compare_miri_and_anneal(miri, anneal);
+    let ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. }) = &verdict else {
+        return verdict;
+    };
+    let (
+        MiriOutcome::Panic {
+            pos: Some(miri_pos),
+            ..
+        },
+        AnnealOutcome::Panic {
+            span: Some(anneal_span),
+        },
+    ) = (miri, anneal)
+    else {
+        return verdict;
+    };
+    if is_std_panic_macro_file(&anneal_span.file)
+        && lib_src.is_panic_macro_call_site(fn_name, miri_pos)
+    {
+        ComparisonVerdict::Agree
+    } else {
+        verdict
+    }
+}
 
 /// Self-contained diagnostic bundle emitted for a single Miri vs. Anneal
 /// semantic divergence.
@@ -185,12 +452,19 @@ pub fn resolve_rustc_bin() -> String {
     "rustc".to_string()
 }
 
+/// Sequence number that gives each `compile_rust_snippet` call its own scratch
+/// directory. Concurrent calls in one process (such as parallel tests) reuse
+/// labels like `"all_batches"`, and a shared directory let one call delete
+/// another's output before `rustc` wrote it.
+static SNIPPET_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Runs `rustc --edition=2024 --crate-type=lib` on an in-memory Rust source
 /// string and reports whether it compiled.
 pub fn compile_rust_snippet(label: &str, source: &str) -> bool {
     let rustc_bin = resolve_rustc_bin();
+    let seq = SNIPPET_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_miri_difftest_{}_{}",
+        "anneal_miri_difftest_{}_{seq}_{}",
         std::process::id(),
         label
     ));
@@ -352,22 +626,37 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
     }
 }
 
+/// Extract the `linkedCallees` definition and the `confirm_tag_<fn_name>` and
+/// `confirm_probe_<fn_name>` theorems from `MiriOracleConfirm.lean` source,
+/// preceded by the synthetic constructor stub definition when `linkedCallees`
+/// refers to it, so the snippet names no definition local to the confirm module
+/// that it does not also contain.
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
-    let callees_header = "def linkedCallees : List CapturedMir :=";
-    let tag_header = format!("theorem confirm_tag_{fn_name} :");
-    let probe_header = format!("theorem confirm_probe_{fn_name} :");
-    let mut blocks = Vec::new();
-    for header in [callees_header, tag_header.as_str(), probe_header.as_str()] {
-        if let Some(start_idx) = confirm_src.find(header) {
-            let rest = &confirm_src[start_idx..];
-            let end_rel = rest
-                .find("\n\n")
-                .map(|i| i + 1)
-                .unwrap_or(rest.len());
-            blocks.push(rest[..end_rel].trim().to_string());
+    // Each block runs from its header to the first blank line; the generated
+    // blocks contain no blank lines.
+    let extract_block = |header: &str| -> Option<String> {
+        let start_idx = confirm_src.find(header)?;
+        let rest = &confirm_src[start_idx..];
+        let end_rel = rest.find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
+        Some(rest[..end_rel].trim().to_string())
+    };
+    let callees_block = extract_block("def linkedCallees : List CapturedMir :=");
+    let stub_block = match &callees_block {
+        Some(callees) if callees.contains(FMT_ARGUMENTS_CTOR_STUB_NAME) => {
+            FMT_ARGUMENTS_CTOR_STUB_LEAN
+                .lines()
+                .next()
+                .and_then(&extract_block)
         }
-    }
-    blocks.join("\n\n")
+        _ => None,
+    };
+    let tag_block = extract_block(&format!("theorem confirm_tag_{fn_name} :"));
+    let probe_block = extract_block(&format!("theorem confirm_probe_{fn_name} :"));
+    [stub_block, callees_block, tag_block, probe_block]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn create_staging_dir(label: &str) -> Result<PathBuf, String> {
@@ -585,16 +874,22 @@ fn partition_subject_callees(
     (captured_candidates, helpers.into_iter().collect())
 }
 
+/// Render the Lean list of callees linked into every probed or confirmed item:
+/// each captured intra-crate helper body, followed by one
+/// `fmtArgumentsCtorStub` instance per `DefPath` in
+/// [`FMT_ARGUMENTS_CTOR_DEF_PATHS`].
 fn render_linked_callees_expr(helper_module_suffixes: &[String]) -> String {
-    if helper_module_suffixes.is_empty() {
-        "[]".to_string()
-    } else {
-        let elems: Vec<String> = helper_module_suffixes
-            .iter()
-            .map(|s| format!("Mir.{s}.body"))
-            .collect();
-        format!("[{}]", elems.join(", "))
-    }
+    let elems: Vec<String> = helper_module_suffixes
+        .iter()
+        .map(|s| format!("Mir.{s}.body"))
+        .chain(FMT_ARGUMENTS_CTOR_DEF_PATHS.iter().map(|def_path| {
+            format!(
+                "{FMT_ARGUMENTS_CTOR_STUB_NAME} \"{}\"",
+                escape_lean_string(def_path)
+            )
+        }))
+        .collect();
+    format!("[{}]", elems.join(",\n   "))
 }
 
 fn render_linked_anneal_probe_module(
@@ -629,6 +924,7 @@ fn render_linked_anneal_probe_module(
          open Trusted.Rustc.V2026_06_01.MirSemantics\n\
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+         {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
          def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
            let raw :=\n    \
@@ -726,6 +1022,7 @@ fn render_linked_anneal_confirm_module(
          open Trusted.Rustc.V2026_06_01.MirSemantics\n\
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+         {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
          def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
            let raw :=\n    \
@@ -977,6 +1274,11 @@ fn run_linked_difftest_oracle_pipeline(
         }
     }
 
+    let lib_rs_path = corpus_root.join("src/lib.rs");
+    let lib_rs = fs::read_to_string(&lib_rs_path)
+        .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
+    let lib_src = StagedLibSource::parse(&lib_rs);
+
     let mut reports = Vec::with_capacity(items.len());
     let mut to_confirm: Vec<(OracleItemSpec, String, AnnealOutcome)> = Vec::new();
     let mut agree_count = 0usize;
@@ -996,8 +1298,15 @@ fn run_linked_difftest_oracle_pipeline(
                     spec.name
                 ))
             });
-        let verdict = compare_miri_and_anneal(&miri, &anneal);
-        let should_confirm = verdict.is_diverge() && anneal.to_lean_mir_diff_tag().is_some();
+        let verdict = compare_difftest_miri_and_anneal(&miri, &anneal, &lib_src, &spec.name);
+        // A reconciled panic-macro site agrees only through the panic-site rule
+        // in `compare_difftest_miri_and_anneal`, so its Anneal outcome and span
+        // are confirmed in the kernel, like a divergence's, rather than resting
+        // on the compiled `#eval` probe alone.
+        let reconciled_panic_site =
+            verdict.is_agree() && !compare_miri_and_anneal(&miri, &anneal).is_agree();
+        let should_confirm = (verdict.is_diverge() || reconciled_panic_site)
+            && anneal.to_lean_mir_diff_tag().is_some();
         if should_confirm {
             let suffix = captured_candidates
                 .get(&spec.name)
@@ -1917,8 +2226,14 @@ mod tests {
         assert!(probe_src.contains("import Mir.MiriDiffCorpus.helper_add_ten\n"));
         assert!(probe_src.contains("import Mir.MiriDiffCorpus.cand_call_helper\n"));
         assert!(probe_src.contains(
-            "def linkedCallees : List CapturedMir :=\n  [Mir.MiriDiffCorpus.helper_add_ten.body]"
+            "def linkedCallees : List CapturedMir :=\n  \
+             [Mir.MiriDiffCorpus.helper_add_ten.body,\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'a>::from_str\",\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::from_str\",\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'a>::new_const\",\n   \
+             fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::new_const\"]\n"
         ));
+        assert!(probe_src.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN));
         assert!(probe_src.contains(
             "initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees"
         ));
@@ -1945,6 +2260,205 @@ mod tests {
         assert!(extracted.contains("theorem confirm_tag_cand_call_helper :"));
         assert!(extracted.contains("theorem confirm_probe_cand_call_helper :"));
         assert!(extracted.contains(":= by\n  rfl"));
+        // `linkedCallees` names the synthetic stub, so the snippet must carry the
+        // stub's definition ahead of it.
+        let stub_at = extracted
+            .find("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=")
+            .expect("snippet must define fmtArgumentsCtorStub");
+        let callees_at = extracted
+            .find("def linkedCallees : List CapturedMir :=")
+            .expect("snippet must define linkedCallees");
+        assert!(stub_at < callees_at);
+        assert!(extracted.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN.trim()));
+    }
+
+    fn lib_with_candidates() -> String {
+        "\
+#![no_std]
+pub fn cand_panic__b0_c0() {
+    panic!(\"boom\");
+}
+
+pub fn cand_assert__b0_c1() -> u32 {
+    let x: u32 = 7u32;
+    assert!(x == 8u32, \"x must equal eight\");
+    core::assert_eq!(x, 9u32, \"x must equal nine\");
+    x
+}
+
+pub fn cand_plain__b0_c2() -> u32 {
+    let a: [u32; 2] = [1, 2];
+    let i: usize = 5;
+    a[i] + 1u32
+}
+"
+        .to_string()
+    }
+
+    fn panic_at(line: u32, col: u32) -> MiriOutcome {
+        MiriOutcome::Panic {
+            pos: Some(SourcePos {
+                file: "src/lib.rs".to_string(),
+                line,
+                col,
+            }),
+            message: String::new(),
+        }
+    }
+
+    fn anneal_panic_in(file: &str, line: u32) -> AnnealOutcome {
+        AnnealOutcome::Panic {
+            span: Some(SourceSpan {
+                file: file.to_string(),
+                start_line: line,
+                start_col: 9,
+                end_line: line,
+                end_col: 73,
+            }),
+        }
+    }
+
+    #[test]
+    fn staged_lib_source_indexes_top_level_fn_line_ranges() {
+        let src = StagedLibSource::parse(&lib_with_candidates());
+        assert_eq!(src.fn_line_range("cand_panic__b0_c0"), Some((2, 4)));
+        assert_eq!(src.fn_line_range("cand_assert__b0_c1"), Some((6, 11)));
+        assert_eq!(src.fn_line_range("cand_plain__b0_c2"), Some((13, 17)));
+        assert_eq!(src.fn_line_range("missing"), None);
+        assert_eq!(
+            StagedLibSource::parse("pub fn broken( {").fn_line_range("broken"),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_difftest_reconciles_only_std_macro_panic_sites() {
+        let src = StagedLibSource::parse(&lib_with_candidates());
+        let std_panic = "/rustlib/src/rust/library/core/src/panic.rs";
+        let std_macros = "/rustc/abc/library/core/src/macros/mod.rs";
+
+        // `panic!` and `assert!` (bare or `core::`-qualified) call sites inside
+        // the evaluated function reconcile with an Anneal span inside the
+        // standard panic-macro definitions.
+        for (name, line, col, file) in [
+            ("cand_panic__b0_c0", 3, 5, std_panic),
+            ("cand_assert__b0_c1", 8, 5, std_panic),
+            ("cand_assert__b0_c1", 9, 5, std_macros),
+        ] {
+            let miri = panic_at(line, col);
+            let anneal = anneal_panic_in(file, 62);
+            assert!(matches!(
+                compare_miri_and_anneal(&miri, &anneal),
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ));
+            assert_eq!(
+                compare_difftest_miri_and_anneal(&miri, &anneal, &src, name),
+                ComparisonVerdict::Agree,
+                "{name} at {line}:{col}"
+            );
+        }
+
+        let mismatch = |miri: &MiriOutcome, anneal: &AnnealOutcome, name: &str| {
+            matches!(
+                compare_difftest_miri_and_anneal(miri, anneal, &src, name),
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            )
+        };
+        // Anneal span in user code: never reconciled.
+        assert!(mismatch(
+            &panic_at(3, 5),
+            &anneal_panic_in("src/lib.rs", 16),
+            "cand_panic__b0_c0"
+        ));
+        // A user file that merely shares a suffix with a standard file.
+        assert!(mismatch(
+            &panic_at(3, 5),
+            &anneal_panic_in("src/panic.rs", 1),
+            "cand_panic__b0_c0"
+        ));
+        // Miri position outside the evaluated function's line range.
+        assert!(mismatch(
+            &panic_at(8, 5),
+            &anneal_panic_in(std_panic, 62),
+            "cand_panic__b0_c0"
+        ));
+        // Miri position on a line of the function that is not a panic-macro
+        // invocation (an index expression), or at the wrong column.
+        assert!(mismatch(
+            &panic_at(16, 5),
+            &anneal_panic_in(std_panic, 62),
+            "cand_plain__b0_c2"
+        ));
+        assert!(mismatch(
+            &panic_at(3, 6),
+            &anneal_panic_in(std_panic, 62),
+            "cand_panic__b0_c0"
+        ));
+        // Miri position in another file.
+        let mut other_file = panic_at(3, 5);
+        if let MiriOutcome::Panic { pos: Some(p), .. } = &mut other_file {
+            p.file = "/rustc/abc/library/core/src/lib.rs".to_string();
+        }
+        assert!(mismatch(
+            &other_file,
+            &anneal_panic_in(std_panic, 62),
+            "cand_panic__b0_c0"
+        ));
+        // A missing Miri position stays a mismatch.
+        let no_pos = MiriOutcome::Panic {
+            pos: None,
+            message: String::new(),
+        };
+        assert!(mismatch(
+            &no_pos,
+            &anneal_panic_in(std_panic, 62),
+            "cand_panic__b0_c0"
+        ));
+
+        // Verdicts other than `PanicSiteMismatch` pass through unchanged.
+        let ub = AnnealOutcome::Ub {
+            span: Some(SourceSpan {
+                file: std_panic.to_string(),
+                start_line: 62,
+                start_col: 9,
+                end_line: 62,
+                end_col: 73,
+            }),
+        };
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(&panic_at(3, 5), &ub, &src, "cand_panic__b0_c0"),
+            ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+        ));
+    }
+
+    #[test]
+    fn std_panic_macro_invocation_recognizes_bare_and_crate_qualified_paths() {
+        for text in [
+            "panic!(\"x\");",
+            "assert!(a == b, \"m\");",
+            "assert_eq!(a, b);",
+            "assert_ne!(a, b);",
+            "debug_assert!(a);",
+            "unreachable!()",
+            "todo!()",
+            "unimplemented!()",
+            "core::panic!(\"x\")",
+            "::std::assert!(a)",
+            "panic ! (\"x\")",
+        ] {
+            assert!(starts_with_std_panic_macro_invocation(text), "{text}");
+        }
+        for text in [
+            "my_panic!(\"x\")",
+            "panicky!(\"x\")",
+            "::panic!(\"x\")",
+            "foo::panic!(\"x\")",
+            "panic(\"x\")",
+            "a[i] + 1u32",
+            "",
+        ] {
+            assert!(!starts_with_std_panic_macro_invocation(text), "{text}");
+        }
     }
 
     #[test]

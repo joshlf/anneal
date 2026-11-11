@@ -22,7 +22,10 @@ use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
     GeneratedMiriCandidate, build_standalone_candidate_source, generate_miri_corpus_batch,
 };
-use cargo_anneal::{CaptureDriverConfig, resolve_rustc_wrapper};
+use cargo_anneal::{
+    AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
+    compare_miri_and_anneal, resolve_rustc_wrapper,
+};
 
 struct TempDir(PathBuf);
 
@@ -87,10 +90,14 @@ fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     assert!(stdout.contains("# `miri-difftest` Differential Oracle Report"));
     assert!(stdout.contains("- **Oracle comparison**: PERFORMED"));
     assert!(stdout.contains("## `NotCompared` Coverage Table"));
-    assert!(stdout.contains("### Unmodeled External Calls"));
+    // Every identity candidate is compared, so the report lists no unmodeled
+    // external calls: `helper_add_ten` is linked as a captured callee, and the
+    // `core::fmt::Arguments` constructors behind `panic!("...")` are linked as
+    // synthetic stubs.
+    assert!(!stdout.contains("### Unmodeled External Calls"));
     assert!(!stdout.contains("`core::intrinsics::exact_div`"));
     assert!(!stdout.contains("miri_diff_corpus::helper_add_ten"));
-    assert!(stdout.contains("| `core::fmt::Arguments::<'a>::from_str` | 1 |"));
+    assert!(!stdout.contains("core::fmt::Arguments"));
 
     let verify = Command::new("python3")
         .arg("-c")
@@ -109,14 +116,17 @@ assert data["mode"] == "identity"
 assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 76
-assert data["agree_count"] == 76
+assert data["compared_candidates"] == 77
+assert data["agree_count"] == 77
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
-assert data["not_compared_count"] == 1
+assert data["not_compared_count"] == 0
 assert isinstance(data.get("obs_path_signatures"), list)
 assert len(data["obs_path_signatures"]) > 0
 assert all(s.startswith("miri:") for s in data["obs_path_signatures"])
+assert "miri:panic_explicit_macro@identity:panic_vs_panic:agree" in data["obs_path_signatures"], (
+    f"panic_explicit_macro must compare and agree: {data['obs_path_signatures']}"
+)
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
@@ -133,17 +143,14 @@ nc = data["not_compared_reasons"]
 assert nc == {
     "capture_failed": 0,
     "compile_failed": 0,
-    "external_call": 1,
+    "external_call": 0,
     "miri_oracle_error": 0,
     "out_of_fuel": 0,
     "unsupported": 0,
 }, f"unexpected not_compared_reasons: {nc}"
 
 ext = data["unmodeled_external_calls"]
-assert "core::intrinsics::exact_div" not in ext, f"unexpected ext: {ext}"
-assert "miri_diff_corpus::helper_add_ten" not in ext, f"unexpected ext: {ext}"
-assert ext == {"core::fmt::Arguments::<'a>::from_str": 1}, f"unexpected ext: {ext}"
-assert sum(ext.values()) == 1, f"unexpected ext sum: {ext}"
+assert ext == {}, f"unexpected ext: {ext}"
 
 expected_findings = {}
 
@@ -163,7 +170,8 @@ manifest_ext = {
     if "known_anneal_bug" in t
     and t["known_anneal_bug"].get("observed_anneal_tag", "").startswith("externalCall:")
 }
-assert len(manifest_ext) == 2, f"expected 2 externalCall entries in manifest, got {manifest_ext}"
+assert len(manifest_ext) == 1, f"expected 1 externalCall entry in manifest, got {manifest_ext}"
+assert manifest_ext == {"panic_explicit_macro"}, f"unexpected externalCall entries: {manifest_ext}"
 
 findings = data["findings"]
 assert len(findings) == 0
@@ -610,6 +618,234 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
         "expected 0 helper_add_ten skips in seeded batch: {:?}",
         seeded_rep.unmodeled_external_calls
     );
+}
+
+/// Build a seeded candidate named `fn_name` whose `fn_source` may also define
+/// intra-crate helpers.
+fn handwritten_candidate(
+    id: usize,
+    seed_name: &str,
+    fn_name: &str,
+    applied_mutator: &str,
+    fn_source: &str,
+) -> GeneratedMiriCandidate {
+    GeneratedMiriCandidate {
+        id,
+        seed_index: 0,
+        seed_name: seed_name.to_string(),
+        fn_name: fn_name.to_string(),
+        seed_u64: 0x00F0_0000 + id as u64,
+        applied_mutators: vec![applied_mutator.to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: fn_source.to_string(),
+        source: build_standalone_candidate_source(fn_source),
+    }
+}
+
+#[test]
+fn panic_fmt_candidates_compare_agree_and_preserve_non_macro_panic_site_mismatch() {
+    let dir = unique_temp_dir("panic_fmt");
+    let root = repo_root();
+
+    // `panic!("...")` and `assert!(cond, "...")` both call
+    // `core::fmt::Arguments::<'a>::from_str` and then `core::panicking::panic_fmt`
+    // from the `panic_2021` expansion in `library/core/src/panic.rs`.
+    let panic_fn = "\
+pub fn panic_fmt_macro__b0_c0() {
+    let x: u32 = 3u32;
+    if x == 3u32 {
+        panic!(\"panic! message from a mutated candidate\");
+    }
+}
+";
+    let assert_fn = "\
+pub fn assert_fmt_macro__b0_c1() -> u32 {
+    let x: u32 = 7u32;
+    assert!(x == 8u32, \"x must equal eight\");
+    x
+}
+";
+    // A genuine non-macro panic-site mismatch: the overflowing `+` panics inside
+    // a `#[track_caller]` helper. Miri reports the helper's call site in the
+    // candidate; Anneal reports the overflow `assert` terminator inside the
+    // helper's own body, a user `src/lib.rs` span that reconciliation must not
+    // accept.
+    let track_caller_fn = "\
+#[track_caller]
+#[inline(never)]
+pub fn track_caller_overflow_helper(x: u8) -> u8 {
+    x + 250u8
+}
+
+pub fn neg_ctrl_track_caller_overflow__b0_c2() -> u8 {
+    let base: u8 = 10u8;
+    track_caller_overflow_helper(base)
+}
+";
+    let candidates = vec![
+        handwritten_candidate(
+            0,
+            "panic_explicit_macro",
+            "panic_fmt_macro__b0_c0",
+            "ArithmeticCastMutator",
+            panic_fn,
+        ),
+        handwritten_candidate(
+            1,
+            "panic_explicit_macro",
+            "assert_fmt_macro__b0_c1",
+            "ArithmeticCastMutator",
+            assert_fn,
+        ),
+        handwritten_candidate(
+            2,
+            "panic_checked_add_overflow",
+            "neg_ctrl_track_caller_overflow__b0_c2",
+            "ArithmeticCastMutator",
+            track_caller_fn,
+        ),
+    ];
+
+    let findings_dir = dir.join("findings_panic_fmt");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0x00F0_0001,
+        &[candidates],
+        3,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate panic_fmt candidate batch");
+
+    assert_eq!(report.total_candidates, 3);
+    assert_eq!(report.compiled_candidates, 3);
+    assert_eq!(report.compared_candidates, 3);
+    assert_eq!(report.agree_count, 2);
+    assert_eq!(report.diverge_count, 1);
+    assert_eq!(report.not_compared_count, 0);
+    assert_eq!(report.kernel_confirmed_divergences, 1);
+    assert_eq!(
+        report.not_compared_reasons.get("external_call").copied(),
+        Some(0),
+        "unexpected external_call skips: {:?}",
+        report.not_compared_reasons
+    );
+    assert!(
+        report.unmodeled_external_calls.is_empty(),
+        "unexpected unmodeled external calls: {:?}",
+        report.unmodeled_external_calls
+    );
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(3));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(3));
+
+    // (a) The macro candidates panic at the macro call site under Miri and inside
+    // `library/core/src/panic.rs` under Anneal. The strict comparator reports a
+    // panic-site mismatch, and the difftest comparator reconciles it.
+    for name in ["panic_fmt_macro__b0_c0", "assert_fmt_macro__b0_c1"] {
+        let item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for {name}"));
+        let MiriOutcome::Panic {
+            pos: Some(miri_pos),
+            ..
+        } = &item.miri
+        else {
+            panic!(
+                "{name}: expected a Miri panic with a position, got {:?}",
+                item.miri
+            );
+        };
+        assert_eq!(miri_pos.file, "src/lib.rs", "{name}: {miri_pos:?}");
+        let AnnealOutcome::Panic {
+            span: Some(anneal_span),
+        } = &item.anneal
+        else {
+            panic!(
+                "{name}: expected an Anneal panic with a span, got {:?}",
+                item.anneal
+            );
+        };
+        assert!(
+            anneal_span.file.ends_with("/library/core/src/panic.rs"),
+            "{name}: unexpected Anneal panic span {anneal_span:?}"
+        );
+        assert!(
+            matches!(
+                compare_miri_and_anneal(&item.miri, &item.anneal),
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{name}: strict comparison must report the macro panic-site difference"
+        );
+        assert_eq!(item.verdict, ComparisonVerdict::Agree, "{name}");
+        // The reconciled outcome rests on a kernel-checked `by rfl` theorem
+        // evaluated with the linked `fmtArgumentsCtorStub` callees.
+        assert!(item.kernel_confirmed, "{name}");
+    }
+
+    // (b) The non-macro mismatch stays a kernel-confirmed divergence.
+    let neg = report
+        .item_reports
+        .iter()
+        .find(|r| r.name == "neg_ctrl_track_caller_overflow__b0_c2")
+        .expect("missing item report for the track_caller candidate");
+    assert!(
+        matches!(
+            neg.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ),
+        "unexpected verdict: {:?}",
+        neg.verdict
+    );
+    assert!(neg.kernel_confirmed);
+    let AnnealOutcome::Panic {
+        span: Some(neg_span),
+    } = &neg.anneal
+    else {
+        panic!("expected an Anneal panic with a span, got {:?}", neg.anneal);
+    };
+    assert_eq!(neg_span.file, "src/lib.rs", "unexpected span {neg_span:?}");
+    assert_eq!(
+        report
+            .divergence_classes
+            .get("panic_site_mismatch")
+            .copied(),
+        Some(1)
+    );
+
+    assert_eq!(report.findings.len(), 1);
+    let f = &report.findings[0];
+    assert_eq!(f.fn_name, "neg_ctrl_track_caller_overflow__b0_c2");
+    assert_eq!(f.divergence_class, "panic_site_mismatch");
+    assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("theorem confirm_tag_neg_ctrl_track_caller_overflow__b0_c2 :")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("theorem confirm_probe_neg_ctrl_track_caller_overflow__b0_c2 :")
+    );
+    assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
+    // The snippet is self-contained: `linkedCallees` names the synthetic
+    // `core::fmt::Arguments` stub, so its definition is included.
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("Mir.MiriDiffCorpus.track_caller_overflow_helper.body")
+    );
+    let repro_path = f.repro_path.as_ref().expect("repro.rs written");
+    let bundle_dir = repro_path.parent().expect("bundle dir");
+    let summary_md = fs::read_to_string(bundle_dir.join("SUMMARY.md")).expect("read SUMMARY.md");
+    assert!(summary_md.contains("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :="));
 }
 
 /// Real `lake` binary used behind the logging wrappers below (the pinned

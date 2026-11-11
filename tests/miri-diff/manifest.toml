@@ -598,12 +598,6 @@ category = "control_flow_and_calls"
 upstream_path = "tests/pass/calls.rs"
 miri_verdict = "pass:scalar:42:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:miri_diff_corpus::helper_add_ten"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
-summary = "initMachineState initializes emptyMemory with callees = [], and single-item verification does not automatically link intra-crate callee bodies (helper_add_ten) into Memory.callees."
 
 [[tests]]
 name = "panic_explicit_macro"
@@ -616,4 +610,4 @@ status = "open_bug"
 bug_class = "incompleteness_unmodeled_intrinsic_or_call"
 observed_anneal_tag = "externalCall:core::fmt::Arguments::<'a>::from_str"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "Explicit panic!(...) lowers to core::fmt::Arguments::from_str followed by diverging core::panicking::panic_fmt (target = none), which are not yet modeled as panicking terminators in evalCallTerminator."
+summary = "Explicit panic!(...) first calls core::fmt::Arguments::from_str, which Trusted MirSemantics does not model and the corpus crate does not capture, so evaluation stops at that external call before reaching the diverging core::panicking::panic_fmt call that evalCallTerminator models as an unwinding panic."
