@@ -969,6 +969,17 @@ impl Ty {
             .map(|info| (info.min_align, info.align))
     }
 
+    /// Upper-bound byte size and ABI alignment `(size, align)` of this type under `ptr_width`
+    /// (exact when [`Ty::layout_for`] succeeds, or the conservative upper-bound layout when
+    /// unspecified).
+    pub(crate) fn alloc_size_and_align(
+        &self,
+        ptr_width: PtrWidth,
+    ) -> Result<(usize, usize), LayoutError> {
+        self.layout_info(ptr_width)
+            .map(|info| (info.size, info.align))
+    }
+
     /// Size in bytes of this type's layout under `ptr_width`, or `None` if the type is not
     /// representable on that target: an array length exceeding the target's `usize::MAX`,
     /// or a total size exceeding the target's `isize::MAX` ([`PtrWidth::max_object_size`]).

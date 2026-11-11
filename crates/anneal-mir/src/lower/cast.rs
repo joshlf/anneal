@@ -1108,10 +1108,10 @@ pub fn eval_int_to_ptr_with_ptr_width(
         return Err(CastEvalError::TypeMismatch("target type must be raw pointer"));
     }
 
-    if let Some(prov) = predicted_prov {
-        if !tracker.is_exposed(&prov) {
-            return Err(CastEvalError::UnexposedProvenance(prov));
-        }
+    if let Some(prov) = predicted_prov
+        && !tracker.is_exposed(&prov)
+    {
+        return Err(CastEvalError::UnexposedProvenance(prov));
     }
 
     let masked_addr = (addr & ptr_width.mask()) as u64;

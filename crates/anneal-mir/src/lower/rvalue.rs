@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use crate::ir::{
     AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, LayoutError,
-    Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem, PtrWidth, RetagKind,
-    Rvalue, Statement, Ty, UintTy, UnOp,
+    Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem, PtrWidth,
+    RetagKind, Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use crate::lower::cast::{
     AbstractByte, CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast,
@@ -3745,16 +3745,40 @@ where
         return Ok(cur_ty.clone());
     };
     match first {
-        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
-            full_place.clone(),
-        )),
+        ProjectionElem::Deref => {
+            if local_decls.is_some() && read_index.is_none() {
+                if active_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Downcast projection must be followed by Field",
+                    ));
+                }
+                let Some(pointee_ty) = cur_ty.pointee_ty() else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer-typed place",
+                    ));
+                };
+                return validate_projection_tail(
+                    pointee_ty,
+                    rest,
+                    local_decls,
+                    read_index,
+                    full_place,
+                    None,
+                );
+            }
+            Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ))
+        }
         ProjectionElem::Downcast(v) => {
             if active_downcast.is_some() {
                 return Err(RvalueEvalError::TypeMismatch(
                     "consecutive Downcast projections without Field",
                 ));
             }
-            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+            if !(local_decls.is_some() && read_index.is_none())
+                && matches!(rest.first(), Some(ProjectionElem::Deref))
+            {
                 return Err(RvalueEvalError::UnsupportedPlaceProjection(
                     full_place.clone(),
                 ));
@@ -3808,12 +3832,12 @@ where
                     "array projection applied to a non-array place",
                 ));
             };
-            if let Some(decls) = local_decls {
-                if decls.get(idx_local.0) != Some(&Ty::Uint(UintTy::Usize)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "array index local must have declared type usize",
-                    ));
-                }
+            if let Some(decls) = local_decls
+                && decls.get(idx_local.0) != Some(&Ty::Uint(UintTy::Usize))
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "array index local must have declared type usize",
+                ));
             }
             if let Some(read_idx) = read_index {
                 let idx_bits = read_idx(*idx_local)?;
@@ -3890,12 +3914,12 @@ fn projected_ref_into_mir_value(
 ) -> Result<MirValue, RvalueEvalError> {
     match target {
         ProjectedRef::Value(v) => {
-            if let Some(ty) = leaf_ty {
-                if !mir_value_matches_ty(v, ty) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "projected leaf runtime value does not match expected type",
-                    ));
-                }
+            if let Some(ty) = leaf_ty
+                && !mir_value_matches_ty(v, ty)
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "projected leaf runtime value does not match expected type",
+                ));
             }
             Ok(v.clone())
         }
@@ -3928,12 +3952,12 @@ fn projected_ref_into_array_len(
                     "Len target runtime value must be MirValue::Array",
                 ));
             };
-            if let Some(ty) = leaf_ty {
-                if !mir_value_head_matches_ty(v, ty) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Len target runtime value does not match declared array type",
-                    ));
-                }
+            if let Some(ty) = leaf_ty
+                && !mir_value_head_matches_ty(v, ty)
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Len target runtime value does not match declared array type",
+                ));
             }
             Ok(elements.len())
         }
@@ -4102,13 +4126,13 @@ fn project_mir_value<'a>(
         }
         ProjectionElem::Field(idx, expected_ty) => match val {
             MirValue::Tuple(fields) => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 let Some(field_val) = fields.get(*idx) else {
                     return Err(RvalueEvalError::FieldOutOfBounds {
@@ -4124,13 +4148,13 @@ fn project_mir_value<'a>(
                 project_mir_value(field_val, Some(expected_ty), rest, read_index, full_place, None)
             }
             MirValue::Unit => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 Err(RvalueEvalError::FieldOutOfBounds {
                     field_idx: *idx,
@@ -4521,12 +4545,12 @@ fn write_projected_mir_value(
                 "Downcast projection must be followed by Field",
             ));
         }
-        if let Some(decl_ty) = declared_ty {
-            if !mir_value_matches_ty(&new_val, decl_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "written value runtime type does not match declared place type",
-                ));
-            }
+        if let Some(decl_ty) = declared_ty
+            && !mir_value_matches_ty(&new_val, decl_ty)
+        {
+            return Err(RvalueEvalError::TypeMismatch(
+                "written value runtime type does not match declared place type",
+            ));
         }
         *val = new_val;
         return Ok(());
@@ -4608,13 +4632,13 @@ fn write_projected_mir_value(
         }
         ProjectionElem::Field(idx, expected_ty) => match val {
             MirValue::Tuple(fields) => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 let field_count = fields.len();
                 let Some(field_slot) = fields.get_mut(*idx) else {
@@ -4657,13 +4681,13 @@ fn write_projected_mir_value(
                 }
             }
             MirValue::Unit => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 Err(RvalueEvalError::FieldOutOfBounds {
                     field_idx: *idx,
@@ -4955,7 +4979,21 @@ fn eval_place_array_len(
         .iter()
         .any(|p| matches!(p, ProjectionElem::Deref))
     {
-        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        let local_decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+        let slots: Vec<LocalSlotState> =
+            locals.iter().cloned().map(LocalSlotState::Init).collect();
+        let state = StatementEvalState::new(local_decls, slots, ptr_width);
+        let (target_local, target_proj, index_cache) = state.resolve_deref_place(place)?;
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        return read_projected_array_len(
+            &locals[target_local.0],
+            None,
+            &target_proj,
+            &read_index,
+            ptr_width,
+            place,
+            None,
+        );
     }
     let root_val = locals
         .get(place.local.0)
@@ -4989,9 +5027,8 @@ fn eval_place_array_len(
 
 /// Evaluates a value-tree `Place` read over an initialized `locals` slice under `ptr_width`.
 ///
-/// Supports arbitrary chains of `Field`, `Index`, `ConstantIndex`, `Subslice`, and `Downcast`
-/// projections over `MirValue::{Tuple, Array, Adt}`. Any `ProjectionElem::Deref` returns
-/// `Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()))`.
+/// Supports arbitrary chains of `Deref` (into synthetic local allocations), `Field`, `Index`,
+/// `ConstantIndex`, `Subslice`, and `Downcast` projections over `MirValue::{Tuple, Array, Adt}`.
 ///
 /// `locals` carries no declared types, so a `Field(i, ty)` annotation on an intermediate step
 /// is checked against the selected value's outermost constructor only, and the returned value
@@ -5008,7 +5045,21 @@ pub fn eval_place_read(
         .iter()
         .any(|p| matches!(p, ProjectionElem::Deref))
     {
-        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        let local_decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+        let slots: Vec<LocalSlotState> =
+            locals.iter().cloned().map(LocalSlotState::Init).collect();
+        let state = StatementEvalState::new(local_decls, slots, ptr_width);
+        let (target_local, target_proj, index_cache) = state.resolve_deref_place(place)?;
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        return read_projected_mir_value(
+            &locals[target_local.0],
+            None,
+            &target_proj,
+            &read_index,
+            ptr_width,
+            place,
+            None,
+        );
     }
     let root_val = locals
         .get(place.local.0)
@@ -5043,9 +5094,8 @@ pub fn eval_place_read(
 /// Evaluates a value-tree `Place` write of `new_val` into an initialized `locals` slice under
 /// `ptr_width`.
 ///
-/// Supports arbitrary chains of `Field`, `Index`, `ConstantIndex`, `Subslice`, and `Downcast`
-/// projections over `MirValue::{Tuple, Array, Adt}`. Any `ProjectionElem::Deref` returns
-/// `Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()))`.
+/// Supports arbitrary chains of `Deref` (into synthetic local allocations), `Field`, `Index`,
+/// `ConstantIndex`, `Subslice`, and `Downcast` projections over `MirValue::{Tuple, Array, Adt}`.
 ///
 /// A projected write never changes the type of a container along `place`: the replaced value
 /// and `new_val` must both have the projected field or element type (a union write may switch
@@ -5065,7 +5115,22 @@ pub fn eval_place_write(
         .iter()
         .any(|p| matches!(p, ProjectionElem::Deref))
     {
-        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        let local_decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+        let slots: Vec<LocalSlotState> =
+            locals.iter().cloned().map(LocalSlotState::Init).collect();
+        let state = StatementEvalState::new(local_decls, slots, ptr_width);
+        let (target_local, target_proj, index_cache) = state.resolve_deref_place(place)?;
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+        return write_projected_mir_value(
+            &mut locals[target_local.0],
+            None,
+            &target_proj,
+            new_val,
+            &read_index,
+            ptr_width,
+            place,
+            None,
+        );
     }
     if place.local.0 >= locals.len() {
         return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
@@ -5244,7 +5309,11 @@ pub fn eval_lowered_rvalue(
             let ptr = match place.projection.as_slice() {
                 [] => {
                     // Synthetic, page-aligned per-local allocation with a fresh provenance.
-                    let addr = ((place.local.0 as u128 + 1) * 0x1000) & ptr_width.mask();
+                    let addr = if locals.is_empty() {
+                        ((place.local.0 as u128 + 1) * 0x1000) & ptr_width.mask()
+                    } else {
+                        local_base_addr_for_values(place.local.0, locals, ptr_width)
+                    };
                     PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1)
                 }
                 [ProjectionElem::Deref] => match read_local(place.local)? {
@@ -5275,7 +5344,14 @@ pub fn eval_lowered_rvalue(
                         ));
                     }
                 },
-                _ => return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone())),
+                _ => {
+                    let local_decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+                    let slots: Vec<LocalSlotState> =
+                        locals.iter().cloned().map(LocalSlotState::Init).collect();
+                    let mut state =
+                        StatementEvalState::with_policy(local_decls, slots, ptr_width, policy);
+                    return eval_lowered_rvalue_in_state(rvalue, &mut state);
+                }
             };
             if ref_ty.is_ref() && ptr.addr == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -5420,7 +5496,12 @@ pub fn eval_lowered_rvalue(
                     .iter()
                     .any(|p| matches!(p, ProjectionElem::Deref))
                 {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+                    let local_decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+                    let slots: Vec<LocalSlotState> =
+                        locals.iter().cloned().map(LocalSlotState::Init).collect();
+                    let mut state =
+                        StatementEvalState::with_policy(local_decls, slots, ptr_width, policy);
+                    return eval_lowered_rvalue_in_state(rvalue, &mut state);
                 }
                 let root_val = read_local(place.local)?;
                 let read_index = |idx_local: Local| -> Result<u128, RvalueEvalError> {
@@ -5974,29 +6055,165 @@ impl StatementEvalState {
         )
     }
 
-    /// Reads the value at `place` from `self.slots` without moving it.
-    pub fn read_place(&self, place: &Place) -> Result<MirValue, RvalueEvalError> {
-        if place
-            .projection
-            .iter()
-            .any(|p| matches!(p, ProjectionElem::Deref))
-        {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+    /// Synthetic allocation base address of `local` in this frame.
+    pub(crate) fn local_base_addr(&self, local: usize) -> u128 {
+        local_base_addr_for_decls(local, &self.local_decls, self.ptr_width)
+    }
+
+    /// Maps a synthetic local or sub-place pointer `ptr` (of type `ptr_ty` with pointee
+    /// `pointee_ty`) back to `(Local(target_local), prefix_proj)` in `self.local_decls`.
+    pub(crate) fn resolve_synthetic_subplace(
+        &self,
+        ptr: &PointerValue,
+        ptr_ty: &Ty,
+        pointee_ty: &Ty,
+        full_place: &Place,
+    ) -> Result<(Local, Vec<ProjectionElem>), RvalueEvalError> {
+        let addr = checked_ptr_addr(ptr, ptr_ty, self.ptr_width)?;
+        if addr == 0 {
+            if ptr_ty.is_ref() {
+                return Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ptr_ty.clone(),
+                        bits: 0,
+                    },
+                ));
+            }
+            return Err(RvalueEvalError::NullPointerAccess);
         }
-        self.check_place_against_decls(place)?;
-        let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
+        let (min_align, max_align) = pointee_ty
+            .align_bounds(self.ptr_width)
+            .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(pointee_ty, err)))?;
+        if !addr.is_multiple_of(min_align as u128) {
+            return Err(RvalueEvalError::MisalignedPointer {
+                addr: addr as u64,
+                required_align: min_align,
+            });
+        }
+        if !addr.is_multiple_of(max_align as u128) {
+            return Err(RvalueEvalError::CastEval(
+                CastEvalError::UnsupportedLayout {
+                    ty: pointee_ty.clone(),
+                },
+            ));
+        }
+        if ptr_ty.is_ref() && !pointee_ty.is_inhabited_for(self.ptr_width) {
+            return Err(RvalueEvalError::UninhabitedPointee(pointee_ty.clone()));
+        }
+        let (pointee_size, _) = pointee_ty
+            .alloc_size_and_align(self.ptr_width)
+            .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(pointee_ty, err)))?;
+        let byte_len = pointee_size as u128;
+        if addr
+            .checked_add(byte_len)
+            .is_none_or(|end| end > self.ptr_width.max_usize())
+        {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: addr as u64,
+                byte_len,
+            });
+        }
+        let Some(prov) = ptr.provenance else {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        };
+        let local_count = self.slots.len().min(self.local_decls.len());
+        let Some(target_local) = prov
+            .alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < local_count)
+        else {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        };
+        if matches!(self.slots[target_local], LocalSlotState::Dead) {
+            return Err(RvalueEvalError::DeadLocal(Local(target_local)));
+        }
+        let base_addr = self.local_base_addr(target_local);
+        let target_decl_ty = &self.local_decls[target_local];
+        let (target_alloc_size, _) = target_decl_ty
+            .alloc_size_and_align(self.ptr_width)
+            .map_err(|err| {
+                RvalueEvalError::CastEval(cast_eval_layout_error(target_decl_ty, err))
+            })?;
+        let Some(rel_off_u128) = addr.checked_sub(base_addr) else {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        };
+        let Ok(rel_off) = usize::try_from(rel_off_u128) else {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        };
+        if rel_off
+            .checked_add(pointee_size)
+            .is_none_or(|end| end > target_alloc_size)
+        {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        }
+        // A finite `Ty` never contains a strict sub-place of the same type, so offset 0 with
+        // `target_decl_ty == pointee_ty` is uniquely the root local (even for unspecified layouts).
+        if rel_off == 0 && target_decl_ty == pointee_ty {
+            return Ok((Local(target_local), Vec::new()));
+        }
+        let matches = collect_subplace_paths(target_decl_ty, rel_off, pointee_ty, self.ptr_width);
+        if matches.is_empty() {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                full_place.clone(),
+            ));
+        }
+        if matches.len() == 1 {
+            return Ok((Local(target_local), matches.into_iter().next().unwrap()));
+        }
+        if let Some(ordinal) = prov.tag.checked_sub(2).and_then(|t| usize::try_from(t).ok())
+            && let Some(path) = matches.get(ordinal)
+        {
+            return Ok((Local(target_local), path.clone()));
+        }
+        let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
+            Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
+        };
+        for candidate in &matches {
+            if check_slot_projection(
+                &self.slots[target_local],
+                target_decl_ty,
+                candidate,
+                &no_index,
+                full_place,
+            )
+            .is_ok()
+                && slot_union_path_active(&self.slots[target_local], target_decl_ty, candidate)
+            {
+                return Ok((Local(target_local), candidate.clone()));
+            }
+        }
+        Ok((Local(target_local), matches.into_iter().next().unwrap()))
+    }
+
+    /// Reads the value at the `Deref`-free `(target_local, target_proj)` from `self.slots`.
+    fn read_resolved_place(
+        &self,
+        target_local: Local,
+        target_proj: &[ProjectionElem],
+        index_cache: &[(Local, u128)],
+        full_place: &Place,
+    ) -> Result<MirValue, RvalueEvalError> {
+        let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
-        let read_index = |loc: Local| self.read_index_local(loc);
-        match self.slots.get(place.local.0) {
+        let read_index = |loc: Local| cached_index(index_cache, loc);
+        match self.slots.get(target_local.0) {
             None => Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
-            Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(place.local)),
-            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(place.local)),
+            Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(target_local)),
+            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(target_local)),
             Some(LocalSlotState::Init(root_val)) => {
-                // A read returning the whole local checks it in full; a projected read checks
-                // only the root's outermost constructor here and leaves the selected parts to
-                // `read_projected_mir_value`, so it does not traverse the rest of the local.
-                if !projected_value_matches_ty(root_val, base_decl_ty, &place.projection) {
+                if !projected_value_matches_ty(root_val, base_decl_ty, target_proj) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "initialized local runtime value does not match local declaration type",
                     ));
@@ -6004,24 +6221,76 @@ impl StatementEvalState {
                 read_projected_mir_value(
                     root_val,
                     Some(base_decl_ty),
-                    &place.projection,
+                    target_proj,
                     &read_index,
                     self.ptr_width,
-                    place,
+                    full_place,
                     None,
                 )
             }
             Some(LocalSlotState::PartialShell(shell)) => read_from_partial_shell(
                 shell,
                 base_decl_ty,
-                &place.projection,
+                target_proj,
                 &read_index,
                 self.ptr_width,
-                place.local,
-                place,
+                target_local,
+                full_place,
                 None,
             ),
         }
+    }
+
+    /// Resolves all `ProjectionElem::Deref` steps in `place` from left to right and pre-reads any
+    /// trailing `ProjectionElem::Index(idx_local)` operands into `index_cache`, returning the
+    /// resolved `(target_local, target_proj, index_cache)`.
+    #[allow(clippy::type_complexity)]
+    fn resolve_deref_place(
+        &self,
+        place: &Place,
+    ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
+        self.check_place_against_decls(place)?;
+        match self.slots.get(place.local.0) {
+            None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
+            Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
+            Some(_) => {}
+        }
+        let mut cur_local = place.local;
+        let mut cur_proj: Vec<ProjectionElem> = Vec::new();
+        let mut cur_index_cache: Vec<(Local, u128)> = Vec::new();
+        for elem in &place.projection {
+            if matches!(elem, ProjectionElem::Deref) {
+                let ptr_val =
+                    self.read_resolved_place(cur_local, &cur_proj, &cur_index_cache, place)?;
+                let MirValue::Ptr { ptr, ty: ptr_ty } = ptr_val else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer value",
+                    ));
+                };
+                let Some(pointee_ty) = ptr_ty.pointee_ty() else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer-typed place",
+                    ));
+                };
+                let (next_local, next_proj) =
+                    self.resolve_synthetic_subplace(&ptr, &ptr_ty, pointee_ty, place)?;
+                cur_local = next_local;
+                cur_proj = next_proj;
+                cur_index_cache.clear();
+            } else {
+                if let ProjectionElem::Index(idx_local) = elem {
+                    cur_index_cache.push((*idx_local, self.read_index_local(*idx_local)?));
+                }
+                cur_proj.push(elem.clone());
+            }
+        }
+        Ok((cur_local, cur_proj, cur_index_cache))
+    }
+
+    /// Reads the value at `place` from `self.slots` without moving it.
+    pub fn read_place(&self, place: &Place) -> Result<MirValue, RvalueEvalError> {
+        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        self.read_resolved_place(target_local, &target_proj, &index_cache, place)
     }
 
     /// Resolves the runtime array length at `place` from `self.slots` in `O(place.projection.len())`
@@ -6032,13 +6301,6 @@ impl StatementEvalState {
         place: &Place,
         expected_static_len: usize,
     ) -> Result<usize, RvalueEvalError> {
-        if place
-            .projection
-            .iter()
-            .any(|p| matches!(p, ProjectionElem::Deref))
-        {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-        }
         let Ty::Array(_, decl_len) = self.check_place_against_decls(place)? else {
             return Err(RvalueEvalError::TypeMismatch(
                 "Len target place must have array type",
@@ -6049,14 +6311,15 @@ impl StatementEvalState {
                 "Len target declared array length does not match static_len",
             ));
         }
-        let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
+        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
-        let read_index = |loc: Local| self.read_index_local(loc);
-        match self.slots.get(place.local.0) {
+        let read_index = |loc: Local| cached_index(&index_cache, loc);
+        match self.slots.get(target_local.0) {
             None => Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
-            Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(place.local)),
-            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(place.local)),
+            Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(target_local)),
+            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(target_local)),
             Some(LocalSlotState::Init(root_val)) => {
                 if !mir_value_head_matches_ty(root_val, base_decl_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
@@ -6066,7 +6329,7 @@ impl StatementEvalState {
                 read_projected_array_len(
                     root_val,
                     Some(base_decl_ty),
-                    &place.projection,
+                    &target_proj,
                     &read_index,
                     self.ptr_width,
                     place,
@@ -6076,10 +6339,10 @@ impl StatementEvalState {
             Some(LocalSlotState::PartialShell(shell)) => read_array_len_from_partial_shell(
                 shell,
                 base_decl_ty,
-                &place.projection,
+                &target_proj,
                 &read_index,
                 self.ptr_width,
-                place.local,
+                target_local,
                 place,
                 None,
             ),
@@ -6090,8 +6353,8 @@ impl StatementEvalState {
     /// `Trusted.MirSemantics.evalOperand` on `.move`:
     /// - a bare local (`place.projection` empty) is read and then becomes
     ///   `LocalSlotState::Uninit`;
-    /// - a projected place (`_1.0`, `(_1 as V).0`, `_1[_2]`, ...) is read and the root local's
-    ///   slot is left unchanged, so the parent aggregate stays initialized.
+    /// - a projected place (`_1.0`, `(_1 as V).0`, `_1[_2]`, `*_p`, ...) is read and the root
+    ///   local's slot is left unchanged, so the parent aggregate stays initialized.
     ///
     /// `rustc`'s borrow checker rejects every later use of a moved-from place until it is
     /// re-initialized, so keeping projected move sources initialized only differs from a
@@ -6105,24 +6368,25 @@ impl StatementEvalState {
     }
 
     /// Returns the variant index of the enum shell designated by `place` when `place` resolves,
-    /// through `Field` / `Downcast`+`Field` steps over partially initialized shells, to a
-    /// [`PartialAggregate`] whose variant tag has been written by `SetDiscriminant`.
+    /// through `Deref` and `Field` / `Downcast`+`Field` steps over partially initialized shells,
+    /// to a [`PartialAggregate`] whose variant tag has been written by `SetDiscriminant`.
     ///
     /// `Rvalue::Discriminant` reads only the tag, so it is defined on such a shell even while
     /// some variant fields are still uninitialized.
     fn tagged_shell_variant(&self, place: &Place) -> Option<usize> {
-        let base_decl_ty = self.local_decls.get(place.local.0)?;
-        let Some(LocalSlotState::PartialShell(root)) = self.slots.get(place.local.0) else {
+        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place).ok()?;
+        let base_decl_ty = self.local_decls.get(target_local.0)?;
+        let Some(LocalSlotState::PartialShell(root)) = self.slots.get(target_local.0) else {
             return None;
         };
-        let read_index = |loc: Local| self.read_index_local(loc);
+        let read_index = |loc: Local| cached_index(&index_cache, loc);
         match project_from_partial_shell(
             root,
             base_decl_ty,
-            &place.projection,
+            &target_proj,
             &read_index,
             self.ptr_width,
-            place.local,
+            target_local,
             place,
             None,
         )
@@ -6135,10 +6399,10 @@ impl StatementEvalState {
         }
     }
 
-    /// Checks the projection of `place` against the local declarations (it must not contain
-    /// `Deref` and must have declared type `place_ty`), that the root local is live
-    /// (`DeadLocal` otherwise), and reads every `Index(idx_local)` operand in order (faulting
-    /// on dead or uninitialized index locals), without reading or changing the place itself.
+    /// Checks the projection of `place` against the local declarations (must have declared type
+    /// `place_ty`), that the root local and any dereferenced target local are live (`DeadLocal`
+    /// otherwise), and reads every `Index(idx_local)` operand in order (faulting on dead or
+    /// uninitialized index locals), without reading or changing the target place itself.
     pub fn check_place_access(&self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
         self.prepare_place_access(place, place_ty).map(|_| ())
     }
@@ -6154,67 +6418,61 @@ impl StatementEvalState {
         }
     }
 
-    /// Checks the projection of `place` against the local declarations (it must not contain
-    /// `Deref` and must have declared type `place_ty`), that the root local is live
-    /// (`DeadLocal` otherwise), and reads every `Index(idx_local)` operand in order (faulting
-    /// on dead or uninitialized index locals), returning the index values for the traversal.
+    /// Checks the projection of `place` against the local declarations (must have declared type
+    /// `place_ty`), resolves any `ProjectionElem::Deref` steps, verifies that the root and target
+    /// locals are live (`DeadLocal` otherwise), and reads every `Index(idx_local)` operand in
+    /// order, returning `(target_local, target_proj, index_cache)`.
+    #[allow(clippy::type_complexity)]
     fn prepare_place_access(
         &self,
         place: &Place,
         place_ty: &Ty,
-    ) -> Result<Vec<(Local, u128)>, RvalueEvalError> {
-        if place
-            .projection
-            .iter()
-            .any(|p| matches!(p, ProjectionElem::Deref))
-        {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-        }
-        let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
+    ) -> Result<(Local, Vec<ProjectionElem>, Vec<(Local, u128)>), RvalueEvalError> {
+        if self.local_decls.get(place.local.0).is_none() {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
-        };
+        }
         let decl_place_ty = self.check_place_against_decls(place)?;
         if decl_place_ty != *place_ty {
             return Err(RvalueEvalError::TypeMismatch(
                 "statement place_ty does not match declared place type",
             ));
         }
-        let Some(slot) = self.slots.get(place.local.0) else {
+        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
+            return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+        };
+        let Some(slot) = self.slots.get(target_local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
         if matches!(slot, LocalSlotState::Dead) {
-            return Err(RvalueEvalError::DeadLocal(place.local));
-        }
-        let mut index_cache = Vec::new();
-        for elem in &place.projection {
-            if let ProjectionElem::Index(idx_local) = elem {
-                index_cache.push((*idx_local, self.read_index_local(*idx_local)?));
-            }
+            return Err(RvalueEvalError::DeadLocal(target_local));
         }
         let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
         validate_projection_tail(
             base_decl_ty,
-            &place.projection,
+            &target_proj,
             Some(&self.local_decls),
             Some(&read_index),
             place,
             None,
         )?;
-        check_slot_projection(slot, base_decl_ty, &place.projection, &read_index, place)?;
-        Ok(index_cache)
+        check_slot_projection(slot, base_decl_ty, &target_proj, &read_index, place)?;
+        Ok((target_local, target_proj, index_cache))
     }
 
-    /// Variant index read from the tag of the typed enum at `place` for `Rvalue::Discriminant`,
-    /// without reading (or requiring initialized) variant fields: an initialized value's
-    /// variant, or a shell's variant once its tag is readable
+    /// Variant index read from the tag of the typed enum at `(target_local, target_proj)` for
+    /// `Rvalue::Discriminant`, without reading (or requiring initialized) variant fields: an
+    /// initialized value's variant, or a shell's variant once its tag is readable
     /// ([`PartialAggregate::tag_is_readable`]).
     fn typed_enum_variant(
         &self,
-        place: &Place,
+        target_local: Local,
+        target_proj: &[ProjectionElem],
+        full_place: &Place,
         place_ty: &Ty,
         index_cache: &[(Local, u128)],
     ) -> Result<usize, RvalueEvalError> {
-        let base_decl_ty = &self.local_decls[place.local.0];
+        let base_decl_ty = &self.local_decls[target_local.0];
         let read_index = |idx_local: Local| cached_index(index_cache, idx_local);
         let variant_of = |val: &MirValue| match val {
             MirValue::Adt {
@@ -6239,11 +6497,18 @@ impl StatementEvalState {
                 "Discriminant place runtime value does not match lowered place_ty",
             )),
         };
-        match &self.slots[place.local.0] {
-            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(place.local)),
-            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(place.local)),
+        match &self.slots[target_local.0] {
+            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(target_local)),
+            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(target_local)),
             LocalSlotState::Init(root) => {
-                match project_mir_value(root, Some(base_decl_ty), &place.projection, &read_index, place, None)? {
+                match project_mir_value(
+                    root,
+                    Some(base_decl_ty),
+                    target_proj,
+                    &read_index,
+                    full_place,
+                    None,
+                )? {
                     (ProjectedRef::Value(val), _) => variant_of(val),
                     (ProjectedRef::ArrayWindow { .. }, _) => Err(RvalueEvalError::TypeMismatch(
                         "Discriminant place must not be an array window",
@@ -6253,18 +6518,18 @@ impl StatementEvalState {
             LocalSlotState::PartialShell(root) => match project_from_partial_shell(
                 root,
                 base_decl_ty,
-                &place.projection,
+                target_proj,
                 &read_index,
                 self.ptr_width,
-                place.local,
-                place,
+                target_local,
+                full_place,
                 None,
             )? {
                 ProjectedShellRef::Shell(shell, _) => {
                     if shell.tag_is_readable() {
                         Ok(shell.variant_idx)
                     } else {
-                        Err(RvalueEvalError::UninitializedLocal(place.local))
+                        Err(RvalueEvalError::UninitializedLocal(target_local))
                     }
                 }
                 ProjectedShellRef::Init(ProjectedRef::Value(val), _) => variant_of(val),
@@ -6278,70 +6543,42 @@ impl StatementEvalState {
     }
 
     /// Evaluates `Statement::Deinit(place)` (of declared type `place_ty`).
-    ///
-    /// Requires a live root local (`DeadLocal`), reads the `Index` operands first, then:
-    /// - a bare local becomes `LocalSlotState::Uninit`;
-    /// - a projected place through tuple/struct fields and `Downcast` variant fields demotes the
-    ///   containing values to `PartialShell`s whose target slot is `FieldSlot::Uninit`, keeping
-    ///   every disjoint sibling (and the enum tag when it is stored apart from the fields, see
-    ///   [`AdtDef::tag_survives_field_deinit`]) initialized; writing the place again re-promotes
-    ///   the shells to `Init`;
-    /// - a place inside an already uninitialized part is a no-op (after the static and dynamic
-    ///   bounds checks);
-    /// - a `Downcast` to an inactive variant of an initialized enum is
-    ///   `InactiveVariantProjection` (as for assignments); a place inside an initialized array
-    ///   element or union field is `UnsupportedPlaceProjection` (arrays and unions have no
-    ///   per-element shells); a `Deref` is `UnsupportedPlaceProjection`.
-    ///
-    /// Deinitializing a zero-sized part still marks it uninitialized (Anneal tracks
-    /// initialization per field, like `rustc`'s move paths, rather than per byte).
     pub fn deinit_place(&mut self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
-        let index_cache = self.prepare_place_access(place, place_ty)?;
-        if place.projection.is_empty() {
-            self.slots[place.local.0] = LocalSlotState::Uninit;
+        let (target_local, target_proj, index_cache) = self.prepare_place_access(place, place_ty)?;
+        if target_proj.is_empty() {
+            self.slots[target_local.0] = LocalSlotState::Uninit;
             return Ok(());
         }
         let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
-        let mut root_slot = take_root_slot(&mut self.slots[place.local.0]);
+        let mut root_slot = take_root_slot(&mut self.slots[target_local.0]);
         let res = deinit_in_slot(
             &mut root_slot,
-            &self.local_decls[place.local.0],
-            &place.projection,
+            &self.local_decls[target_local.0],
+            &target_proj,
             &read_index,
             place,
             None,
         );
         normalize_slot(&mut root_slot);
-        self.slots[place.local.0] = root_slot_state(root_slot);
+        self.slots[target_local.0] = root_slot_state(root_slot);
         res
     }
 
     /// Evaluates `Statement::Retag(kind, place)` (of declared type `place_ty`).
-    ///
-    /// Requires a live root local and reads the `Index` operands. `RetagKind::Raw(m)` reads the
-    /// raw pointer at `place` (it must be initialized and its address must fit the target's
-    /// pointer width; it may be null, unaligned, or dangling).
-    /// The other kinds validate every reference reachable in `place`'s value without
-    /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, within the
-    /// target's pointer width, aligned to its pointee's alignment, point to an inhabited type,
-    /// and must not point into the synthetic allocation of a storage-dead local unless its
-    /// pointee is zero-sized (`DeadLocal`: the reference dangles). A place whose type holds no
-    /// references only needs to be live. Anneal does not model aliasing tags, so the value is
-    /// unchanged.
     pub fn retag_place(
         &self,
         kind: RetagKind,
         place: &Place,
         place_ty: &Ty,
     ) -> Result<(), RvalueEvalError> {
-        let index_cache = self.prepare_place_access(place, place_ty)?;
+        let (target_local, target_proj, index_cache) = self.prepare_place_access(place, place_ty)?;
         if let RetagKind::Raw(mutability) = kind {
             if !matches!(place_ty, Ty::RawPtr(_, m) if *m == mutability) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Retag(Raw) requires a raw pointer place of matching mutability",
                 ));
             }
-            return match self.read_place(place)? {
+            return match self.read_resolved_place(target_local, &target_proj, &index_cache, place)? {
                 // A raw pointer may be null, unaligned, or dangling, but its address must still
                 // be a valid bit pattern of the target's pointer width.
                 val @ MirValue::Ptr { .. } => check_value_well_formed(&val, self.ptr_width),
@@ -6353,20 +6590,20 @@ impl StatementEvalState {
         if !place_ty.contains_ref() {
             return Ok(());
         }
-        let base_decl_ty = &self.local_decls[place.local.0];
+        let base_decl_ty = &self.local_decls[target_local.0];
         let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
         let ctx = RetagCtx {
             ptr_width: self.ptr_width,
             slots: &self.slots,
         };
-        match &self.slots[place.local.0] {
-            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(place.local)),
-            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(place.local)),
+        match &self.slots[target_local.0] {
+            LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(target_local)),
+            LocalSlotState::Uninit => Err(RvalueEvalError::UninitializedLocal(target_local)),
             LocalSlotState::Init(root) => {
                 let (target, _) = project_mir_value(
                     root,
                     Some(base_decl_ty),
-                    &place.projection,
+                    &target_proj,
                     &read_index,
                     place,
                     None,
@@ -6376,15 +6613,15 @@ impl StatementEvalState {
             LocalSlotState::PartialShell(root) => match project_from_partial_shell(
                 root,
                 base_decl_ty,
-                &place.projection,
+                &target_proj,
                 &read_index,
                 self.ptr_width,
-                place.local,
+                target_local,
                 place,
                 None,
             )? {
                 ProjectedShellRef::Shell(shell, _) => {
-                    retag_shell(shell, place_ty, ctx, place.local)
+                    retag_shell(shell, place_ty, ctx, target_local)
                 }
                 ProjectedShellRef::Init(target, _) => retag_projected(target, place_ty, ctx),
             },
@@ -6400,22 +6637,15 @@ impl StatementEvalState {
         place_ty: &Ty,
         val: MirValue,
     ) -> Result<(), RvalueEvalError> {
-        if place
-            .projection
-            .iter()
-            .any(|p| matches!(p, ProjectionElem::Deref))
-        {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-        }
         let decl_place_ty = self.check_place_against_decls(place)?;
         if decl_place_ty != *place_ty {
             return Err(RvalueEvalError::TypeMismatch(
                 "destination place_ty does not match declared place type",
             ));
         }
-        let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
+        if self.local_decls.get(place.local.0).is_none() {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
-        };
+        }
         match self.slots.get(place.local.0) {
             None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
             Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
@@ -6426,40 +6656,29 @@ impl StatementEvalState {
                 "assigned value runtime type does not match destination place type",
             ));
         }
-        if place.projection.is_empty() {
+        let (target_local, target_proj, index_cache) = self.resolve_deref_place(place)?;
+        let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
+            return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+        };
+        if target_proj.is_empty() {
             if !mir_value_matches_ty(&val, base_decl_ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "assigned value runtime type does not match local declaration type",
                 ));
             }
-            self.slots[place.local.0] = LocalSlotState::Init(val);
+            self.slots[target_local.0] = LocalSlotState::Init(val);
             return Ok(());
         }
 
-        // Pre-validate any `Index(idx_local)` operands before mutating `self.slots[place.local.0]`.
-        let mut index_cache: Vec<(Local, u128)> = Vec::new();
-        for elem in &place.projection {
-            if let ProjectionElem::Index(idx_local) = elem {
-                let bits = self.read_index_local(*idx_local)?;
-                index_cache.push((*idx_local, bits));
-            }
-        }
-        let read_index = |idx_local: Local| -> Result<u128, RvalueEvalError> {
-            index_cache
-                .iter()
-                .find_map(|(loc, bits)| (*loc == idx_local).then_some(*bits))
-                .ok_or(RvalueEvalError::TypeMismatch(
-                    "index local not found in pre-validated cache",
-                ))
-        };
+        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
 
         let mut root_slot = match std::mem::replace(
-            &mut self.slots[place.local.0],
+            &mut self.slots[target_local.0],
             LocalSlotState::Uninit,
         ) {
             LocalSlotState::Dead => {
-                self.slots[place.local.0] = LocalSlotState::Dead;
-                return Err(RvalueEvalError::DeadLocal(place.local));
+                self.slots[target_local.0] = LocalSlotState::Dead;
+                return Err(RvalueEvalError::DeadLocal(target_local));
             }
             LocalSlotState::Uninit => FieldSlot::Uninit,
             LocalSlotState::PartialShell(shell) => FieldSlot::Partial(shell),
@@ -6468,17 +6687,17 @@ impl StatementEvalState {
 
         let write_res = write_to_partial_slot(
             &mut root_slot,
-            &self.local_decls[place.local.0],
-            &place.projection,
+            &self.local_decls[target_local.0],
+            &target_proj,
             val,
             &read_index,
             self.ptr_width,
-            place.local,
+            target_local,
             place,
             None,
         );
 
-        self.slots[place.local.0] = match root_slot {
+        self.slots[target_local.0] = match root_slot {
             FieldSlot::Uninit => LocalSlotState::Uninit,
             FieldSlot::Partial(shell) => {
                 if write_res.is_ok() {
@@ -6494,6 +6713,99 @@ impl StatementEvalState {
             FieldSlot::Init(v) => LocalSlotState::Init(v),
         };
         write_res
+    }
+
+    /// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `(target_local, target_proj)`.
+    fn read_subplace_slot(
+        &self,
+        target_local: Local,
+        target_proj: &[ProjectionElem],
+        full_place: &Place,
+    ) -> Result<FieldSlot, RvalueEvalError> {
+        let Some(base_decl_ty) = self.local_decls.get(target_local.0) else {
+            return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+        };
+        let root_slot = match self.slots.get(target_local.0) {
+            None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
+            Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(target_local)),
+            Some(LocalSlotState::Uninit) => FieldSlot::Uninit,
+            Some(LocalSlotState::PartialShell(s)) => FieldSlot::Partial(s.clone()),
+            Some(LocalSlotState::Init(v)) => FieldSlot::Init(v.clone()),
+        };
+        read_slot_at_proj(&root_slot, base_decl_ty, target_proj, full_place, None)
+    }
+
+    /// Writes `new_slot` (`Uninit`, `Partial`, or `Init`) into `(dst_local, dst_proj)` of type
+    /// `expected_ty`.
+    fn write_subplace_slot(
+        &mut self,
+        dst_local: Local,
+        dst_proj: &[ProjectionElem],
+        expected_ty: &Ty,
+        new_slot: FieldSlot,
+        src_local: Local,
+        full_place: &Place,
+    ) -> Result<(), RvalueEvalError> {
+        let dst_place = Place {
+            local: dst_local,
+            projection: dst_proj.to_vec(),
+        };
+        if let FieldSlot::Init(val) = new_slot {
+            return self.write_place(&dst_place, expected_ty, val);
+        }
+        // Array elements do not have per-element `Uninit` / `PartialShell` slots (`c6d2ad74`).
+        if dst_proj.iter().any(|p| {
+            matches!(
+                p,
+                ProjectionElem::Index(_)
+                    | ProjectionElem::ConstantIndex { .. }
+                    | ProjectionElem::Subslice { .. }
+            )
+        }) {
+            if matches!(self.slots.get(dst_local.0), Some(LocalSlotState::Uninit)) {
+                return Err(RvalueEvalError::UninitializedLocal(dst_local));
+            }
+            return Err(RvalueEvalError::UninitializedLocal(src_local));
+        }
+        if dst_proj.is_empty() {
+            let mut slot = new_slot;
+            normalize_slot(&mut slot);
+            self.slots[dst_local.0] = root_slot_state(slot);
+            return Ok(());
+        }
+        let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
+            Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
+        };
+        let mut root_slot = take_root_slot(&mut self.slots[dst_local.0]);
+        let res = match new_slot {
+            FieldSlot::Uninit => deinit_in_slot(
+                &mut root_slot,
+                &self.local_decls[dst_local.0],
+                dst_proj,
+                &no_index,
+                full_place,
+                None,
+            )
+            .map_err(|err| match err {
+                RvalueEvalError::UnsupportedPlaceProjection(_) => {
+                    RvalueEvalError::UninitializedLocal(src_local)
+                }
+                other => other,
+            }),
+            FieldSlot::Partial(shell) => write_partial_shell_in_slot(
+                &mut root_slot,
+                &self.local_decls[dst_local.0],
+                dst_proj,
+                shell,
+                src_local,
+                full_place,
+                None,
+            ),
+            FieldSlot::Init(_) => unreachable!(),
+        };
+        normalize_slot(&mut root_slot);
+        self.slots[dst_local.0] = root_slot_state(root_slot);
+        res
     }
 }
 
@@ -6858,7 +7170,7 @@ fn check_shell_projection(
 /// Projects `proj` through a `PartialAggregate` shell in `O(proj.len())` time without cloning
 /// or scanning sibling fields, returning either the reached `PartialAggregate` shell or a
 /// [`ProjectedRef`] inside an initialized field slot.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn project_from_partial_shell<'a>(
     shell: &'a PartialAggregate,
     declared_ty: &'a Ty,
@@ -7607,13 +7919,13 @@ fn set_discriminant_projected_mir_value(
         }
         ProjectionElem::Field(idx, expected_ty) => match val {
             MirValue::Tuple(fields) => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 let field_count = fields.len();
                 let Some(field_slot) = fields.get_mut(*idx) else {
@@ -7638,13 +7950,13 @@ fn set_discriminant_projected_mir_value(
                 )
             }
             MirValue::Unit => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
+                if let Some(v) = active_downcast
+                    && v != 0
+                {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: v,
+                        actual: 0,
+                    });
                 }
                 Err(RvalueEvalError::FieldOutOfBounds {
                     field_idx: *idx,
@@ -8140,7 +8452,7 @@ fn check_retagged_reference(
     }
     // Unspecified layouts are never zero-sized (they store a tag), so only an exact size `0`
     // exempts a reference into a dead local.
-    if let Some(local) = resolve_synthetic_local(ptr, ptr_width, ctx.slots.len())
+    if let Some(local) = resolve_synthetic_alloc_local(ptr, ctx.slots.len())
         && matches!(ctx.slots[local], LocalSlotState::Dead)
         && !pointee
             .layout_for(ptr_width)
@@ -8302,22 +8614,926 @@ fn retag_shell(
     Ok(())
 }
 
-/// Synthetic address and provenance of local `local` for `&_l` / `&raw _l` (page-aligned per
-/// local, with allocation id `local + 1`).
-pub(crate) fn synthetic_local_ptr(local: usize, ptr_width: PtrWidth) -> PointerValue {
-    let addr = ((local as u128 + 1) * 0x1000) & ptr_width.mask();
-    PointerValue::with_provenance(addr as u64, local as u64 + 1, 1)
+/// Synthetic allocation base address of `local` given `local_decls` under `ptr_width`.
+///
+/// Preserves `(local + 1) * 0x1000` whenever every preceding local has allocation size
+/// `<= 0x1000` and alignment `<= 0x1000`, and advances past larger locals by rounding each
+/// local's allocation size up to a multiple of `0x1000` (and aligning to `align.max(0x1000)`).
+pub(crate) fn local_base_addr_for_decls(
+    local: usize,
+    local_decls: &[Ty],
+    ptr_width: PtrWidth,
+) -> u128 {
+    let mut cur = 0x1000u128;
+    let limit = local.min(local_decls.len());
+    for decl_ty in &local_decls[..limit] {
+        let stride = match decl_ty.alloc_size_and_align(ptr_width) {
+            Ok((size, align)) => {
+                let a = (align as u128).max(0x1000);
+                cur = cur.div_ceil(a) * a;
+                (size as u128).max(1).div_ceil(0x1000) * 0x1000
+            }
+            Err(_) => 0x1000,
+        };
+        cur = cur.saturating_add(stride);
+    }
+    if let Some(decl_ty) = local_decls.get(local)
+        && let Ok((_, align)) = decl_ty.alloc_size_and_align(ptr_width)
+        && align > 0x1000
+    {
+        let a = align as u128;
+        cur = cur.div_ceil(a) * a;
+    }
+    if local > limit {
+        cur = cur.saturating_add((local - limit) as u128 * 0x1000);
+    }
+    cur & ptr_width.mask()
 }
 
-/// The local whose synthetic base address and provenance `ptr` carries, if any.
-fn resolve_synthetic_local(ptr: &PointerValue, ptr_width: PtrWidth, local_count: usize) -> Option<usize> {
+fn local_base_addr_for_values(
+    local: usize,
+    locals: &[MirValue],
+    ptr_width: PtrWidth,
+) -> u128 {
+    let decls: Vec<Ty> = locals.iter().map(MirValue::ty).collect();
+    local_base_addr_for_decls(local, &decls, ptr_width)
+}
+
+/// The local whose synthetic allocation id `ptr` carries, if in `0..local_count`.
+fn resolve_synthetic_alloc_local(ptr: &PointerValue, local_count: usize) -> Option<usize> {
     let alloc_id = ptr.provenance?.alloc_id;
     let local = usize::try_from(alloc_id.checked_sub(1)?).ok()?;
-    if local >= local_count {
-        return None;
+    (local < local_count).then_some(local)
+}
+
+/// Returns true if every field of `fields` has an exact layout under `ptr_width` and its
+/// declaration-order prefix-sum offset is aligned to the field's ABI alignment.
+fn tuple_has_aligned_decl_offsets(fields: &[Ty], ptr_width: PtrWidth) -> bool {
+    let mut off = 0usize;
+    for f in fields {
+        let Ok(layout) = f.layout_for(ptr_width) else {
+            return false;
+        };
+        if !off.is_multiple_of(layout.align) {
+            return false;
+        }
+        let Some(next) = off.checked_add(layout.size) else {
+            return false;
+        };
+        off = next;
     }
-    let base = synthetic_local_ptr(local, ptr_width);
-    (ptr.addr == base.addr).then_some(local)
+    true
+}
+
+/// Collects all canonical projection paths inside `root_ty` whose sub-place has byte offset
+/// `target_off` and declared type `target_ty` under `ptr_width`.
+fn collect_subplace_paths(
+    root_ty: &Ty,
+    target_off: usize,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Vec<Vec<ProjectionElem>> {
+    let mut cur_path = Vec::new();
+    let mut out = Vec::new();
+    collect_subplace_paths_rec(
+        root_ty,
+        0,
+        target_off,
+        target_ty,
+        ptr_width,
+        &mut cur_path,
+        &mut out,
+    );
+    out
+}
+
+fn collect_subplace_paths_rec(
+    cur_ty: &Ty,
+    cur_off: usize,
+    target_off: usize,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+    cur_path: &mut Vec<ProjectionElem>,
+    out: &mut Vec<Vec<ProjectionElem>>,
+) {
+    if cur_off == target_off && cur_ty == target_ty {
+        out.push(cur_path.clone());
+    }
+    if target_off < cur_off {
+        return;
+    }
+    if let Ok((cur_size, _)) = cur_ty.alloc_size_and_align(ptr_width)
+        && target_off > cur_off.saturating_add(cur_size)
+    {
+        return;
+    }
+    match cur_ty {
+        Ty::Tuple(fields) => {
+            if !tuple_has_aligned_decl_offsets(fields, ptr_width) {
+                return;
+            }
+            let mut field_off = cur_off;
+            for (idx, field_ty) in fields.iter().enumerate() {
+                let Ok(layout) = field_ty.layout_for(ptr_width) else {
+                    return;
+                };
+                if target_off >= field_off
+                    && target_off <= field_off.saturating_add(layout.size)
+                {
+                    cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
+                    collect_subplace_paths_rec(
+                        field_ty,
+                        field_off,
+                        target_off,
+                        target_ty,
+                        ptr_width,
+                        cur_path,
+                        out,
+                    );
+                    cur_path.pop();
+                }
+                let Some(next_off) = field_off.checked_add(layout.size) else {
+                    return;
+                };
+                field_off = next_off;
+            }
+        }
+        Ty::Array(elem_ty, len) => {
+            let Ok(elem_layout) = elem_ty.layout_for(ptr_width) else {
+                return;
+            };
+            let elem_size = elem_layout.size;
+            let rel = target_off - cur_off;
+            if let Ty::Array(sub_elem, sub_len) = target_ty
+                && **sub_elem == **elem_ty
+                && *sub_len < *len
+            {
+                if elem_size > 0 {
+                    if rel.is_multiple_of(elem_size) {
+                        let start = rel / elem_size;
+                        if let Some(end) = start.checked_add(*sub_len)
+                            && end <= *len
+                        {
+                            cur_path.push(ProjectionElem::Subslice {
+                                from: start as u64,
+                                to: end as u64,
+                                from_end: false,
+                            });
+                            out.push(cur_path.clone());
+                            cur_path.pop();
+                        }
+                    }
+                } else if rel == 0 {
+                    let max_start = (*len - *sub_len).min(MAX_EVAL_ARRAY_LEN);
+                    for start in 0..=max_start {
+                        cur_path.push(ProjectionElem::Subslice {
+                            from: start as u64,
+                            to: (start + *sub_len) as u64,
+                            from_end: false,
+                        });
+                        out.push(cur_path.clone());
+                        cur_path.pop();
+                    }
+                }
+            }
+            if *len == 0 {
+                return;
+            }
+            if let Some(q) = rel.checked_div(elem_size) {
+                let mut candidates = Vec::with_capacity(2);
+                if q > 0 && rel.is_multiple_of(elem_size) && q - 1 < *len {
+                    candidates.push(q - 1);
+                }
+                if q < *len {
+                    candidates.push(q);
+                }
+                for idx in candidates {
+                    let Some(elem_off) = cur_off.checked_add(idx.saturating_mul(elem_size)) else {
+                        continue;
+                    };
+                    cur_path.push(ProjectionElem::ConstantIndex {
+                        offset: idx as u64,
+                        min_length: *len as u64,
+                        from_end: false,
+                    });
+                    collect_subplace_paths_rec(
+                        elem_ty,
+                        elem_off,
+                        target_off,
+                        target_ty,
+                        ptr_width,
+                        cur_path,
+                        out,
+                    );
+                    cur_path.pop();
+                }
+            } else if rel == 0 {
+                let limit = (*len).min(MAX_EVAL_ARRAY_LEN);
+                for idx in 0..limit {
+                    cur_path.push(ProjectionElem::ConstantIndex {
+                        offset: idx as u64,
+                        min_length: *len as u64,
+                        from_end: false,
+                    });
+                    collect_subplace_paths_rec(
+                        elem_ty,
+                        cur_off,
+                        target_off,
+                        target_ty,
+                        ptr_width,
+                        cur_path,
+                        out,
+                    );
+                    cur_path.pop();
+                }
+            }
+        }
+        Ty::Adt(def) => {
+            if def.is_enum() {
+                for v in 0..def.variant_count() {
+                    let Some(fields) = def.variant_fields(v) else {
+                        continue;
+                    };
+                    for (idx, field_ty) in fields.iter().enumerate() {
+                        let Ok(off) = def.field_offset(v, idx, ptr_width) else {
+                            continue;
+                        };
+                        let Some(field_off) = cur_off.checked_add(off) else {
+                            continue;
+                        };
+                        cur_path.push(ProjectionElem::Downcast(v));
+                        cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
+                        collect_subplace_paths_rec(
+                            field_ty,
+                            field_off,
+                            target_off,
+                            target_ty,
+                            ptr_width,
+                            cur_path,
+                            out,
+                        );
+                        cur_path.pop();
+                        cur_path.pop();
+                    }
+                }
+            } else if let Some(fields) = def.variant_fields(0) {
+                for (idx, field_ty) in fields.iter().enumerate() {
+                    let Ok(off) = def.field_offset(0, idx, ptr_width) else {
+                        continue;
+                    };
+                    let Some(field_off) = cur_off.checked_add(off) else {
+                        continue;
+                    };
+                    cur_path.push(ProjectionElem::Field(idx, field_ty.clone()));
+                    collect_subplace_paths_rec(
+                        field_ty,
+                        field_off,
+                        target_off,
+                        target_ty,
+                        ptr_width,
+                        cur_path,
+                        out,
+                    );
+                    cur_path.pop();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Computes the byte offset and disambiguation provenance tag of the `Deref`-free projection
+/// `proj` from `root_ty` under `ptr_width`.
+fn compute_subplace_offset_and_tag(
+    root_ty: &Ty,
+    proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    ptr_width: PtrWidth,
+    full_place: &Place,
+) -> Result<(usize, u64), RvalueEvalError> {
+    let mut cur_ty = root_ty.clone();
+    let mut total_off = 0usize;
+    let mut active_downcast: Option<usize> = None;
+    let mut canonical_proj: Vec<ProjectionElem> = Vec::with_capacity(proj.len());
+    // Track original array length before a `Subslice` step so consecutive `Subslice`/`Index`
+    // steps coalesce into the canonical single-step form produced by `collect_subplace_paths`.
+    let mut subslice_base_len: Option<usize> = None;
+
+    for elem in proj {
+        match elem {
+            ProjectionElem::Deref => {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            ProjectionElem::Downcast(v) => {
+                if active_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "consecutive Downcast projections without Field",
+                    ));
+                }
+                active_downcast = Some(*v);
+                canonical_proj.push(ProjectionElem::Downcast(*v));
+                subslice_base_len = None;
+            }
+            ProjectionElem::Field(idx, _) => {
+                subslice_base_len = None;
+                match &cur_ty {
+                    Ty::Adt(def) => {
+                        let v = active_downcast.take().unwrap_or(0);
+                        let Some(variant_fields) = def.variant_fields(v) else {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "Field variant index out of range",
+                            ));
+                        };
+                        let Some(field_ty) = variant_fields.get(*idx).cloned() else {
+                            return Err(RvalueEvalError::FieldOutOfBounds {
+                                field_idx: *idx,
+                                field_count: variant_fields.len(),
+                            });
+                        };
+                        let off = def.field_offset(v, *idx, ptr_width).map_err(|_| {
+                            RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
+                        })?;
+                        total_off = total_off.checked_add(off).ok_or_else(|| {
+                            RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
+                        })?;
+                        canonical_proj.push(ProjectionElem::Field(*idx, field_ty.clone()));
+                        cur_ty = field_ty;
+                    }
+                    Ty::Tuple(fields) => {
+                        if active_downcast.take().is_some() {
+                            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                                full_place.clone(),
+                            ));
+                        }
+                        let Some(field_ty) = fields.get(*idx).cloned() else {
+                            return Err(RvalueEvalError::FieldOutOfBounds {
+                                field_idx: *idx,
+                                field_count: fields.len(),
+                            });
+                        };
+                        if !tuple_has_aligned_decl_offsets(fields, ptr_width) {
+                            return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                                full_place.clone(),
+                            ));
+                        }
+                        for f in &fields[..*idx] {
+                            let f_size = f
+                                .layout_for(ptr_width)
+                                .map_err(|_| {
+                                    RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
+                                })?
+                                .size;
+                            total_off = total_off.checked_add(f_size).ok_or_else(|| {
+                                RvalueEvalError::UnsupportedPlaceProjection(full_place.clone())
+                            })?;
+                        }
+                        canonical_proj.push(ProjectionElem::Field(*idx, field_ty.clone()));
+                        cur_ty = field_ty;
+                    }
+                    _ => {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Field projection requires Tuple or Adt type",
+                        ));
+                    }
+                }
+            }
+            ProjectionElem::Index(idx_local) => {
+                if active_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Downcast projection must be followed by Field",
+                    ));
+                }
+                let Ty::Array(elem_ty, len) = &cur_ty else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Index projection requires Array type",
+                    ));
+                };
+                let idx_bits = read_index(*idx_local)?;
+                let Ok(i) = usize::try_from(idx_bits) else {
+                    return Err(RvalueEvalError::IndexOutOfBounds {
+                        index: idx_bits,
+                        len: *len,
+                    });
+                };
+                if i >= *len {
+                    return Err(RvalueEvalError::IndexOutOfBounds {
+                        index: idx_bits,
+                        len: *len,
+                    });
+                }
+                let elem_size = elem_ty
+                    .layout_for(ptr_width)
+                    .map_err(|_| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?
+                    .size;
+                let step_off = i
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                total_off = total_off
+                    .checked_add(step_off)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                if let (
+                    Some(orig_len),
+                    Some(ProjectionElem::Subslice {
+                        from: s_from,
+                        from_end: false,
+                        ..
+                    }),
+                ) = (subslice_base_len.take(), canonical_proj.last().cloned())
+                {
+                    canonical_proj.pop();
+                    canonical_proj.push(ProjectionElem::ConstantIndex {
+                        offset: s_from + i as u64,
+                        min_length: orig_len as u64,
+                        from_end: false,
+                    });
+                } else {
+                    canonical_proj.push(ProjectionElem::ConstantIndex {
+                        offset: i as u64,
+                        min_length: *len as u64,
+                        from_end: false,
+                    });
+                }
+                cur_ty = (**elem_ty).clone();
+            }
+            ProjectionElem::ConstantIndex {
+                offset,
+                min_length,
+                from_end,
+            } => {
+                if active_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Downcast projection must be followed by Field",
+                    ));
+                }
+                let Ty::Array(elem_ty, len) = &cur_ty else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "ConstantIndex projection requires Array type",
+                    ));
+                };
+                let i = resolve_constant_index(*len, *offset, *min_length, *from_end)?;
+                let elem_size = elem_ty
+                    .layout_for(ptr_width)
+                    .map_err(|_| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?
+                    .size;
+                let step_off = i
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                total_off = total_off
+                    .checked_add(step_off)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                if let (
+                    Some(orig_len),
+                    Some(ProjectionElem::Subslice {
+                        from: s_from,
+                        from_end: false,
+                        ..
+                    }),
+                ) = (subslice_base_len.take(), canonical_proj.last().cloned())
+                {
+                    canonical_proj.pop();
+                    canonical_proj.push(ProjectionElem::ConstantIndex {
+                        offset: s_from + i as u64,
+                        min_length: orig_len as u64,
+                        from_end: false,
+                    });
+                } else {
+                    canonical_proj.push(ProjectionElem::ConstantIndex {
+                        offset: i as u64,
+                        min_length: *len as u64,
+                        from_end: false,
+                    });
+                }
+                cur_ty = (**elem_ty).clone();
+            }
+            ProjectionElem::Subslice {
+                from,
+                to,
+                from_end,
+            } => {
+                if active_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Downcast projection must be followed by Field",
+                    ));
+                }
+                let Ty::Array(elem_ty, len) = &cur_ty else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Subslice projection requires Array type",
+                    ));
+                };
+                let (start, end) = resolve_subslice_range(*len, *from, *to, *from_end)?;
+                let elem_size = elem_ty
+                    .layout_for(ptr_width)
+                    .map_err(|_| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?
+                    .size;
+                let step_off = start
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                total_off = total_off
+                    .checked_add(step_off)
+                    .ok_or_else(|| RvalueEvalError::UnsupportedPlaceProjection(full_place.clone()))?;
+                let sub_len = end - start;
+                if let (
+                    Some(orig_len),
+                    Some(ProjectionElem::Subslice {
+                        from: s_from,
+                        from_end: false,
+                        ..
+                    }),
+                ) = (subslice_base_len, canonical_proj.last().cloned())
+                {
+                    canonical_proj.pop();
+                    if sub_len < orig_len {
+                        canonical_proj.push(ProjectionElem::Subslice {
+                            from: s_from + start as u64,
+                            to: s_from + end as u64,
+                            from_end: false,
+                        });
+                        subslice_base_len = Some(orig_len);
+                    } else {
+                        subslice_base_len = None;
+                    }
+                } else if sub_len < *len {
+                    subslice_base_len = Some(*len);
+                    canonical_proj.push(ProjectionElem::Subslice {
+                        from: start as u64,
+                        to: end as u64,
+                        from_end: false,
+                    });
+                }
+                cur_ty = Ty::Array(elem_ty.clone(), sub_len);
+            }
+        }
+    }
+    if active_downcast.is_some() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Downcast projection must be followed by Field",
+        ));
+    }
+    let matches = collect_subplace_paths(root_ty, total_off, &cur_ty, ptr_width);
+    let tag = if matches.len() <= 1 {
+        1
+    } else if let Some(ordinal) = matches.iter().position(|p| *p == canonical_proj) {
+        (ordinal as u64) + 2
+    } else {
+        1
+    };
+    Ok((total_off, tag))
+}
+
+/// Returns whether every union `Field` step in `proj` selects the active union field in `slot`
+/// (true when `slot` is `Uninit` or contains no union steps).
+fn slot_union_path_active(
+    slot: &LocalSlotState,
+    _declared_ty: &Ty,
+    proj: &[ProjectionElem],
+) -> bool {
+    let LocalSlotState::Init(val) = slot else {
+        return true;
+    };
+    value_union_path_active(val, proj)
+}
+
+fn value_union_path_active(val: &MirValue, proj: &[ProjectionElem]) -> bool {
+    let Some((first, rest)) = proj.split_first() else {
+        return true;
+    };
+    match first {
+        ProjectionElem::Downcast(_) => value_union_path_active(val, rest),
+        ProjectionElem::Field(idx, _) => match val {
+            MirValue::Tuple(fields) => fields
+                .get(*idx)
+                .is_some_and(|child| value_union_path_active(child, rest)),
+            MirValue::Adt {
+                active_field: None,
+                fields,
+                ..
+            } => fields
+                .get(*idx)
+                .is_some_and(|child| value_union_path_active(child, rest)),
+            MirValue::Adt {
+                active_field: Some(active),
+                fields,
+                ..
+            } => {
+                if *active != *idx {
+                    return false;
+                }
+                let child = if fields.len() == 1 {
+                    fields.first()
+                } else {
+                    fields.get(*active)
+                };
+                child.is_some_and(|c| value_union_path_active(c, rest))
+            }
+            _ => true,
+        },
+        ProjectionElem::ConstantIndex {
+            offset,
+            min_length,
+            from_end,
+        } => {
+            let MirValue::Array { elements, .. } = val else {
+                return true;
+            };
+            let Ok(i) = resolve_constant_index(elements.len(), *offset, *min_length, *from_end)
+            else {
+                return false;
+            };
+            value_union_path_active(&elements[i], rest)
+        }
+        _ => true,
+    }
+}
+
+/// Reads the [`FieldSlot`] (`Uninit`, `Partial`, or `Init`) at `proj` inside `slot`.
+fn read_slot_at_proj(
+    slot: &FieldSlot,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<FieldSlot, RvalueEvalError> {
+    let no_index = |_: Local| -> Result<u128, RvalueEvalError> {
+        Err(RvalueEvalError::TypeMismatch("unexpected dynamic index"))
+    };
+    let Some((first, rest)) = proj.split_first() else {
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
+        }
+        return Ok(slot.clone());
+    };
+    match slot {
+        FieldSlot::Uninit => {
+            validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+                declared_ty,
+                proj,
+                None,
+                None,
+                full_place,
+                active_downcast,
+            )?;
+            Ok(FieldSlot::Uninit)
+        }
+        FieldSlot::Init(val) => {
+            let (projected, _) = project_mir_value(
+                val,
+                Some(declared_ty),
+                proj,
+                &no_index,
+                full_place,
+                active_downcast,
+            )?;
+            let sub_val = match projected {
+                ProjectedRef::Value(v) => v.clone(),
+                ProjectedRef::ArrayWindow { window, elem_ty } => MirValue::Array {
+                    elements: window.to_vec(),
+                    elem_ty: elem_ty.clone(),
+                },
+            };
+            Ok(FieldSlot::Init(sub_val))
+        }
+        FieldSlot::Partial(shell) => {
+            if !shell_matches_declared_ty(shell, declared_ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "partial shell does not match declared type",
+                ));
+            }
+            match first {
+                ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                )),
+                ProjectionElem::Downcast(expected_variant) => {
+                    if active_downcast.is_some() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "consecutive Downcast projections without Field",
+                        ));
+                    }
+                    if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Downcast projection must be followed by Field",
+                        ));
+                    }
+                    let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+                    if actual != *expected_variant {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: *expected_variant,
+                            actual,
+                        });
+                    }
+                    read_slot_at_proj(
+                        slot,
+                        declared_ty,
+                        rest,
+                        full_place,
+                        Some(*expected_variant),
+                    )
+                }
+                ProjectionElem::Field(idx, expected_ty) => {
+                    let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast)
+                    else {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
+                        ));
+                    };
+                    if *idx >= field_tys.len() {
+                        return Err(RvalueEvalError::FieldOutOfBounds {
+                            field_idx: *idx,
+                            field_count: field_tys.len(),
+                        });
+                    }
+                    if field_tys[*idx] != *expected_ty {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "projected field type does not match declared tuple field type",
+                        ));
+                    }
+                    let expected_variant = active_downcast.unwrap_or(0);
+                    let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+                    if actual != expected_variant {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: expected_variant,
+                            actual,
+                        });
+                    }
+                    let Some(child_slot) = shell.fields.get(*idx) else {
+                        return Err(RvalueEvalError::FieldOutOfBounds {
+                            field_idx: *idx,
+                            field_count: shell.fields.len(),
+                        });
+                    };
+                    read_slot_at_proj(child_slot, &field_tys[*idx], rest, full_place, None)
+                }
+                ProjectionElem::Index(_)
+                | ProjectionElem::ConstantIndex { .. }
+                | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::TypeMismatch(
+                    "array projection applied to a partially initialized tuple/ADT shell",
+                )),
+            }
+        }
+    }
+}
+
+/// Writes `FieldSlot::Partial(new_shell)` into `proj` inside `slot` (materializing parent
+/// shells on `FieldSlot::Uninit` or exploding `FieldSlot::Init` aggregates as needed).
+fn write_partial_shell_in_slot(
+    slot: &mut FieldSlot,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    new_shell: PartialAggregate,
+    src_local: Local,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<(), RvalueEvalError> {
+    let Some((first, rest)) = proj.split_first() else {
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
+        }
+        *slot = FieldSlot::Partial(new_shell);
+        normalize_slot(slot);
+        return Ok(());
+    };
+    if matches!(slot, FieldSlot::Init(_)) {
+        explode_init_slot(slot, full_place).map_err(|err| match err {
+            RvalueEvalError::UnsupportedPlaceProjection(_) => {
+                RvalueEvalError::UninitializedLocal(src_local)
+            }
+            other => other,
+        })?;
+    }
+    match first {
+        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
+            full_place.clone(),
+        )),
+        ProjectionElem::Downcast(expected_variant) => {
+            if active_downcast.is_some() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "consecutive Downcast projections without Field",
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
+            }
+            if !downcast_allowed(declared_ty, *expected_variant) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection requires a tuple-typed (ADT) place or an in-range enum variant",
+                ));
+            }
+            if let FieldSlot::Partial(shell) = &*slot {
+                if !shell_matches_declared_ty(shell, declared_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "partial shell does not match declared type",
+                    ));
+                }
+                let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+                if actual != *expected_variant {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: *expected_variant,
+                        actual,
+                    });
+                }
+            }
+            write_partial_shell_in_slot(
+                slot,
+                declared_ty,
+                rest,
+                new_shell,
+                src_local,
+                full_place,
+                Some(*expected_variant),
+            )
+        }
+        ProjectionElem::Field(idx, expected_ty) => {
+            let Some(field_tys) = projectable_field_tys(declared_ty, active_downcast) else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Field projection requires a tuple-typed place (or a struct/union, or a downcast enum)",
+                ));
+            };
+            if *idx >= field_tys.len() {
+                return Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count: field_tys.len(),
+                });
+            }
+            if field_tys[*idx] != *expected_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "projected field type does not match declared tuple field type",
+                ));
+            }
+            if matches!(declared_ty, Ty::Adt(def) if def.is_union()) {
+                return Err(RvalueEvalError::UninitializedLocal(src_local));
+            }
+            if matches!(slot, FieldSlot::Uninit) {
+                let shell = match declared_ty {
+                    Ty::Adt(def) => {
+                        PartialAggregate::new_uninit_adt(def, active_downcast.unwrap_or(0))
+                            .ok_or(RvalueEvalError::TypeMismatch(
+                                "ADT shell variant out of range",
+                            ))?
+                    }
+                    _ => PartialAggregate::new_uninit(
+                        field_tys.len(),
+                        active_downcast.unwrap_or(0),
+                        active_downcast.is_some(),
+                    ),
+                };
+                *slot = FieldSlot::Partial(shell);
+            }
+            let FieldSlot::Partial(shell) = &mut *slot else {
+                unreachable!()
+            };
+            if !shell_matches_declared_ty(shell, declared_ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "partial shell does not match declared type",
+                ));
+            }
+            let expected_variant = active_downcast.unwrap_or(0);
+            let actual = if shell.is_adt { shell.variant_idx } else { 0 };
+            if actual != expected_variant {
+                return Err(RvalueEvalError::InactiveVariantProjection {
+                    expected: expected_variant,
+                    actual,
+                });
+            }
+            let field_count = shell.fields.len();
+            let Some(child_slot) = shell.fields.get_mut(*idx) else {
+                return Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count,
+                });
+            };
+            write_partial_shell_in_slot(
+                child_slot,
+                &field_tys[*idx],
+                rest,
+                new_shell,
+                src_local,
+                full_place,
+                None,
+            )?;
+            normalize_slot(child_slot);
+            if active_downcast.is_some()
+                && !matches!(child_slot, FieldSlot::Init(_))
+                && !shell
+                    .adt_def
+                    .as_ref()
+                    .is_some_and(|def| def.tag_survives_field_deinit())
+            {
+                shell.discriminant_set = false;
+            }
+            normalize_slot(slot);
+            Ok(())
+        }
+        ProjectionElem::Index(_)
+        | ProjectionElem::ConstantIndex { .. }
+        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::UninitializedLocal(src_local)),
+    }
 }
 
 /// Evaluates `copy_nonoverlapping::<elem_ty>(src, dst, count)` in `state`.
@@ -8329,10 +9545,12 @@ fn resolve_synthetic_local(ptr: &PointerValue, ptr_width: PtrWidth, local_count:
 /// `isize::MAX` (`CopyLengthOverflow`), and neither range may wrap the address space
 /// (`PointerRangeOverflow`). A zero-length copy is then a no-op. A non-empty copy between
 /// pointers of the same allocation (same provenance `alloc_id`, or both without provenance)
-/// must not overlap (`CopyNonOverlappingOverlap`). Only after all of these checks, a copy of
-/// one whole local into another (both synthetic `&raw` base pointers of locals declared
-/// `elem_ty`, `count == 1`) copies the source local's state, including uninitialized parts;
-/// any other memory access is `UnsupportedMemoryAccess`.
+/// must not overlap (`CopyNonOverlappingOverlap`). After all of these checks:
+/// - `count == 1` between resolved synthetic sub-places copies the source sub-place's state
+///   (`Uninit`, `PartialShell`, or `Init`) into the destination sub-place;
+/// - `count >= 1` between resolved contiguous array element windows copies the `count`
+///   elements from the source slice into the destination slice;
+/// - any other memory access is `UnsupportedMemoryAccess`.
 #[allow(clippy::too_many_arguments)]
 fn eval_copy_nonoverlapping(
     state: &mut StatementEvalState,
@@ -8444,36 +9662,131 @@ fn eval_copy_nonoverlapping(
             return Err(RvalueEvalError::DeadLocal(Local(idx)));
         }
     }
-    if byte_len == 0 {
-        if let (Some(src_local), Some(dst_local)) = (
-            resolve_synthetic_local(&src_ptr, ptr_width, local_count),
-            resolve_synthetic_local(&dst_ptr, ptr_width, local_count),
-        )
-            && count == 1
-            && src_local != dst_local
-            && state.local_decls[src_local] == *elem_ty
-            && state.local_decls[dst_local] == *elem_ty
-        {
-            state.slots[dst_local] = state.slots[src_local].clone();
+    let dummy_place = Place::from_local(0);
+    let src_ptr_ty = src_val.ty();
+    let dst_ptr_ty = dst_val.ty();
+    let src_resolved =
+        state.resolve_synthetic_subplace(&src_ptr, &src_ptr_ty, elem_ty, &dummy_place);
+    let dst_resolved =
+        state.resolve_synthetic_subplace(&dst_ptr, &dst_ptr_ty, elem_ty, &dummy_place);
+
+    if count == 1 {
+        match (src_resolved, dst_resolved) {
+            (Ok((src_local, src_proj)), Ok((dst_local, dst_proj))) => {
+                if byte_len == 0 && src_local == dst_local && src_proj == dst_proj {
+                    let _ = state.read_subplace_slot(src_local, &src_proj, &dummy_place)?;
+                    return Ok(());
+                }
+                let src_slot = state.read_subplace_slot(src_local, &src_proj, &dummy_place)?;
+                return state.write_subplace_slot(
+                    dst_local,
+                    &dst_proj,
+                    elem_ty,
+                    src_slot,
+                    src_local,
+                    &dummy_place,
+                );
+            }
+            _ if byte_len == 0
+                && resolve_synthetic_alloc_local(&src_ptr, local_count).is_none()
+                && resolve_synthetic_alloc_local(&dst_ptr, local_count).is_none() =>
+            {
+                return Ok(());
+            }
+            (Err(err), _)
+                if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) =>
+            {
+                return Err(err);
+            }
+            (_, Err(err))
+                if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) =>
+            {
+                return Err(err);
+            }
+            _ => {
+                return Err(RvalueEvalError::UnsupportedMemoryAccess(
+                    "copy_nonoverlapping outside of whole-local copies",
+                ));
+            }
         }
+    }
+
+    // `count > 1`: contiguous array-element window copy.
+    if let (
+        Ok((src_local, src_elem_proj)),
+        Ok((dst_local, dst_elem_proj)),
+        Ok(count_u64),
+        Ok(count_usize),
+    ) = (
+        src_resolved,
+        dst_resolved,
+        u64::try_from(count),
+        usize::try_from(count),
+    )
+        && let Some((
+            ProjectionElem::ConstantIndex {
+                offset: src_start,
+                min_length: src_len,
+                from_end: false,
+            },
+            src_arr_proj,
+        )) = src_elem_proj.split_last()
+        && let Some((
+            ProjectionElem::ConstantIndex {
+                offset: dst_start,
+                min_length: dst_len,
+                from_end: false,
+            },
+            dst_arr_proj,
+        )) = dst_elem_proj.split_last()
+        && let Some(src_end) = src_start.checked_add(count_u64)
+        && src_end <= *src_len
+        && let Some(dst_end) = dst_start.checked_add(count_u64)
+        && dst_end <= *dst_len
+        && let Ok(dst_len_usize) = usize::try_from(*dst_len)
+    {
+        let mut src_slice_proj = src_arr_proj.to_vec();
+        src_slice_proj.push(ProjectionElem::Subslice {
+            from: *src_start,
+            to: src_end,
+            from_end: false,
+        });
+        let src_slice_place = Place {
+            local: src_local,
+            projection: src_slice_proj,
+        };
+        let slice_val = state.read_place(&src_slice_place)?;
+        if *dst_start == 0 && count_usize == dst_len_usize {
+            let dst_arr_place = Place {
+                local: dst_local,
+                projection: dst_arr_proj.to_vec(),
+            };
+            let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+            return state.write_place(&dst_arr_place, &arr_ty, slice_val);
+        }
+        let mut dst_slice_proj = dst_arr_proj.to_vec();
+        dst_slice_proj.push(ProjectionElem::Subslice {
+            from: *dst_start,
+            to: dst_end,
+            from_end: false,
+        });
+        let dst_slice_place = Place {
+            local: dst_local,
+            projection: dst_slice_proj,
+        };
+        let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
+        return state.write_place(&dst_slice_place, &slice_ty, slice_val);
+    }
+
+    if byte_len == 0
+        && resolve_synthetic_alloc_local(&src_ptr, local_count).is_none()
+        && resolve_synthetic_alloc_local(&dst_ptr, local_count).is_none()
+    {
         return Ok(());
     }
-    match (
-        resolve_synthetic_local(&src_ptr, ptr_width, local_count),
-        resolve_synthetic_local(&dst_ptr, ptr_width, local_count),
-    ) {
-        (Some(src_local), Some(dst_local))
-            if count == 1
-                && state.local_decls[src_local] == *elem_ty
-                && state.local_decls[dst_local] == *elem_ty =>
-        {
-            state.slots[dst_local] = state.slots[src_local].clone();
-            Ok(())
-        }
-        _ => Err(RvalueEvalError::UnsupportedMemoryAccess(
-            "copy_nonoverlapping outside of whole-local copies",
-        )),
-    }
+    Err(RvalueEvalError::UnsupportedMemoryAccess(
+        "copy_nonoverlapping outside of whole-local copies",
+    ))
 }
 
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.
@@ -8484,7 +9797,7 @@ fn eval_copy_nonoverlapping(
 /// whose fields are uninitialized (the old variant's fields do not initialize `v`'s). Typed
 /// struct/union containers along `proj` materialize shells as needed. Legacy tuple-modeled
 /// places keep the conservative rule that an uninitialized place cannot be re-tagged.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn set_discriminant_in_slot(
     slot: &mut FieldSlot,
     declared_ty: &Ty,
@@ -8848,7 +10161,7 @@ pub fn eval_lowered_rvalue_in_state(
                             | LocalSlotState::Init(_),
                         ) => {}
                     }
-                    let addr = ((place.local.0 as u128 + 1) * 0x1000) & state.ptr_width.mask();
+                    let addr = state.local_base_addr(place.local.0);
                     PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1)
                 }
                 [ProjectionElem::Deref] => match state.read_place(&Place::from_local(place.local.0))? {
@@ -8879,13 +10192,6 @@ pub fn eval_lowered_rvalue_in_state(
                     }
                 },
                 _ => {
-                    if place
-                        .projection
-                        .iter()
-                        .any(|p| matches!(p, ProjectionElem::Deref))
-                    {
-                        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-                    }
                     let leaf_ty = state.check_place_against_decls(place)?;
                     if leaf_ty != *pointee_ty {
                         return Err(RvalueEvalError::TypeMismatch(
@@ -8901,12 +10207,135 @@ pub fn eval_lowered_rvalue_in_state(
                         }
                         Some(_) => {}
                     }
-                    for elem in &place.projection {
-                        if let ProjectionElem::Index(idx_local) = elem {
-                            let _ = state.read_index_local(*idx_local)?;
+                    if let Some(last_deref_pos) = place
+                        .projection
+                        .iter()
+                        .rposition(|p| matches!(p, ProjectionElem::Deref))
+                    {
+                        let ptr_place = Place {
+                            local: place.local,
+                            projection: place.projection[..last_deref_pos].to_vec(),
+                        };
+                        let tail = &place.projection[last_deref_pos + 1..];
+                        let ptr_val = state.read_place(&ptr_place)?;
+                        let MirValue::Ptr {
+                            ptr: base_ptr,
+                            ty: base_ptr_ty,
+                        } = ptr_val
+                        else {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "Deref projection requires a pointer value",
+                            ));
+                        };
+                        let Some(deref_ty) = base_ptr_ty.pointee_ty() else {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "Deref projection requires a pointer-typed place",
+                            ));
+                        };
+                        if tail.is_empty() {
+                            if deref_ty != pointee_ty {
+                                return Err(RvalueEvalError::TypeMismatch(
+                                    "Deref projection requires a pointer value with matching pointee type",
+                                ));
+                            }
+                            let masked_addr =
+                                checked_ptr_addr(&base_ptr, &base_ptr_ty, state.ptr_width)? as u64;
+                            if base_ptr_ty.is_ref() && masked_addr == 0 {
+                                return Err(RvalueEvalError::CastEval(
+                                    CastEvalError::InvalidBitPattern {
+                                        target_ty: base_ptr_ty,
+                                        bits: 0,
+                                    },
+                                ));
+                            }
+                            PointerValue {
+                                addr: masked_addr,
+                                provenance: base_ptr.provenance,
+                            }
+                        } else {
+                            let mut index_cache = Vec::new();
+                            for elem in tail {
+                                if let ProjectionElem::Index(idx_local) = elem {
+                                    index_cache
+                                        .push((*idx_local, state.read_index_local(*idx_local)?));
+                                }
+                            }
+                            let (target_local, mut combined_proj) = state
+                                .resolve_synthetic_subplace(
+                                    &base_ptr,
+                                    &base_ptr_ty,
+                                    deref_ty,
+                                    place,
+                                )?;
+                            combined_proj.extend_from_slice(tail);
+                            let base_decl_ty = &state.local_decls[target_local.0];
+                            let read_index =
+                                |idx_local: Local| cached_index(&index_cache, idx_local);
+                            validate_projection_tail(
+                                base_decl_ty,
+                                &combined_proj,
+                                Some(&state.local_decls),
+                                Some(&read_index),
+                                place,
+                                None,
+                            )?;
+                            check_slot_projection(
+                                &state.slots[target_local.0],
+                                base_decl_ty,
+                                &combined_proj,
+                                &read_index,
+                                place,
+                            )?;
+                            let (off, tag) = compute_subplace_offset_and_tag(
+                                base_decl_ty,
+                                &combined_proj,
+                                &read_index,
+                                state.ptr_width,
+                                place,
+                            )?;
+                            let addr = (state.local_base_addr(target_local.0) + off as u128)
+                                & state.ptr_width.mask();
+                            PointerValue::with_provenance(
+                                addr as u64,
+                                target_local.0 as u64 + 1,
+                                tag,
+                            )
                         }
+                    } else {
+                        let mut index_cache = Vec::new();
+                        for elem in &place.projection {
+                            if let ProjectionElem::Index(idx_local) = elem {
+                                index_cache.push((*idx_local, state.read_index_local(*idx_local)?));
+                            }
+                        }
+                        let base_decl_ty = &state.local_decls[place.local.0];
+                        let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
+                        validate_projection_tail(
+                            base_decl_ty,
+                            &place.projection,
+                            Some(&state.local_decls),
+                            Some(&read_index),
+                            place,
+                            None,
+                        )?;
+                        check_slot_projection(
+                            &state.slots[place.local.0],
+                            base_decl_ty,
+                            &place.projection,
+                            &read_index,
+                            place,
+                        )?;
+                        let (off, tag) = compute_subplace_offset_and_tag(
+                            base_decl_ty,
+                            &place.projection,
+                            &read_index,
+                            state.ptr_width,
+                            place,
+                        )?;
+                        let addr = (state.local_base_addr(place.local.0) + off as u128)
+                            & state.ptr_width.mask();
+                        PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, tag)
                     }
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
                 }
             };
             if ref_ty.is_ref() && ptr.addr == 0 {
@@ -9066,8 +10495,15 @@ pub fn eval_lowered_rvalue_in_state(
                 // `AdtDef::univariant_index` enums) need no initialized tag when the place is
                 // uninitialized, while an initialized or partially initialized ADT still validates
                 // its runtime variant index.
-                let index_cache = state.prepare_place_access(place, place_ty)?;
-                let variant_idx = match state.typed_enum_variant(place, place_ty, &index_cache) {
+                let (target_local, target_proj, index_cache) =
+                    state.prepare_place_access(place, place_ty)?;
+                let variant_idx = match state.typed_enum_variant(
+                    target_local,
+                    &target_proj,
+                    place,
+                    place_ty,
+                    &index_cache,
+                ) {
                     Ok(v) => v,
                     Err(RvalueEvalError::UninitializedLocal(_)) if !def.requires_tag_write() => {
                         def.univariant_index().unwrap_or(0)
@@ -9075,13 +10511,6 @@ pub fn eval_lowered_rvalue_in_state(
                     Err(err) => return Err(err),
                 };
                 return discriminant_value(def, variant_idx, state.ptr_width);
-            }
-            if place
-                .projection
-                .iter()
-                .any(|p| matches!(p, ProjectionElem::Deref))
-            {
-                return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
             }
             let decl_place_ty = state.check_place_against_decls(place)?;
             if decl_place_ty != *place_ty {
@@ -9249,36 +10678,7 @@ pub fn eval_lowered_statement(
                 Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
                 Some(_) => {}
             }
-            // The mentioned place is never loaded, but it must type-check against the local
-            // declarations: the projection before the first `Deref` against the root's
-            // declared type, and the projection after it against the pointer's pointee type.
-            let first_deref = place
-                .projection
-                .iter()
-                .position(|p| matches!(p, ProjectionElem::Deref));
-            let prefix = Place {
-                local: place.local,
-                projection: place.projection[..first_deref.unwrap_or(place.projection.len())]
-                    .to_vec(),
-            };
-            let prefix_ty = state.check_place_against_decls(&prefix)?;
-            let resolved_ty = if let Some(pos) = first_deref {
-                let Some(pointee_ty) = prefix_ty.pointee_ty() else {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Deref projection requires a pointer-typed place",
-                    ));
-                };
-                validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-                    pointee_ty,
-                    &place.projection[pos + 1..],
-                    Some(&state.local_decls),
-                    None,
-                    place,
-                    None,
-                )?
-            } else {
-                prefix_ty
-            };
+            let resolved_ty = state.check_place_against_decls(place)?;
             if resolved_ty != *place_ty {
                 return Err(RvalueEvalError::TypeMismatch(
                     "PlaceMention place_ty does not match declared place type",
@@ -9290,17 +10690,22 @@ pub fn eval_lowered_statement(
                     let _ = state.read_index_local(*idx_local)?;
                 }
             }
-            // If `place.projection` contains `Deref`, the pointer sub-place before the first
-            // `Deref` is read to compute the dereferenced place's address (`D9`).
-            if let Some(first_deref_pos) = first_deref {
+            // If `place.projection` contains `Deref`, the pointer sub-place before the last
+            // `Deref` is read (recursively resolving any earlier `Deref`s) to compute the
+            // dereferenced place's address without loading the mentioned target place (`D9`).
+            if let Some(last_deref_pos) = place
+                .projection
+                .iter()
+                .rposition(|p| matches!(p, ProjectionElem::Deref))
+            {
                 let ptr_place = Place {
                     local: place.local,
-                    projection: place.projection[..first_deref_pos].to_vec(),
+                    projection: place.projection[..last_deref_pos].to_vec(),
                 };
                 let ptr_val = state.read_place(&ptr_place)?;
                 match ptr_val {
                     MirValue::Ptr { ptr, ty } if ty.is_any_ptr() => {
-                        let masked_addr = (u128::from(ptr.addr) & state.ptr_width.mask()) as u64;
+                        let masked_addr = checked_ptr_addr(&ptr, &ty, state.ptr_width)? as u64;
                         if ty.is_ref() && masked_addr == 0 {
                             return Err(RvalueEvalError::CastEval(
                                 CastEvalError::InvalidBitPattern {
@@ -9338,7 +10743,8 @@ pub fn eval_lowered_statement(
             place_ty,
             variant_index,
         } => {
-            let index_cache = state.prepare_place_access(place, place_ty)?;
+            let (target_local, target_proj, index_cache) =
+                state.prepare_place_access(place, place_ty)?;
             if !matches!(place_ty, Ty::Tuple(_) | Ty::Adt(_)) {
                 return Err(RvalueEvalError::InvalidSetDiscriminant(place.clone()));
             }
@@ -9361,22 +10767,22 @@ pub fn eval_lowered_statement(
                     }
                 }
             }
-            let base_decl_ty = state.local_decls[place.local.0].clone();
+            let base_decl_ty = state.local_decls[target_local.0].clone();
             let read_index = |idx_local: Local| cached_index(&index_cache, idx_local);
-            let mut root_slot = take_root_slot(&mut state.slots[place.local.0]);
+            let mut root_slot = take_root_slot(&mut state.slots[target_local.0]);
             let set_res = set_discriminant_in_slot(
                 &mut root_slot,
                 &base_decl_ty,
-                &place.projection,
+                &target_proj,
                 *variant_index,
                 &read_index,
                 state.ptr_width,
-                place.local,
+                target_local,
                 place,
                 None,
             );
             normalize_slot(&mut root_slot);
-            state.slots[place.local.0] = root_slot_state(root_slot);
+            state.slots[target_local.0] = root_slot_state(root_slot);
             set_res
         }
         LoweredStatement::Assign {

@@ -511,7 +511,7 @@ fn subslice_bounds(len: u64, from: u64, to: u64, from_end: bool) -> Option<(usiz
         let sum = from.checked_add(to)?;
         (sum <= len).then(|| (from as usize, (len - to) as usize))
     } else {
-        (from <= to && to <= len).then(|| (from as usize, to as usize))
+        (from <= to && to <= len).then_some((from as usize, to as usize))
     }
 }
 
@@ -3641,16 +3641,16 @@ fn test_ep1_b4_property_partial_shell_walker_matches_reference_model() {
                 )
                 .unwrap();
             written.push(leaf.clone());
-            if let Some(v) = root_variant {
-                if step + 1 == set_discr_after {
-                    let set = LoweredStatement::SetDiscriminant {
-                        place: Place::from_local(0),
-                        place_ty: ty.clone(),
-                        variant_index: v,
-                    };
-                    eval_lowered_statement(&set, &mut state).unwrap();
-                    tag = true;
-                }
+            if let Some(v) = root_variant
+                && step + 1 == set_discr_after
+            {
+                let set = LoweredStatement::SetDiscriminant {
+                    place: Place::from_local(0),
+                    place_ty: ty.clone(),
+                    variant_index: v,
+                };
+                eval_lowered_statement(&set, &mut state).unwrap();
+                tag = true;
             }
 
             for _ in 0..12 {
@@ -3658,10 +3658,9 @@ fn test_ep1_b4_property_partial_shell_walker_matches_reference_model() {
                 random_projection(&mut rng, &shape, &mut projection);
                 if let (Some(v), Some(ProjectionElem::Field(..)) | None) =
                     (root_variant, projection.first())
+                    && rng.below(4) != 0
                 {
-                    if rng.below(4) != 0 {
-                        projection.insert(0, ProjectionElem::Downcast(v));
-                    }
+                    projection.insert(0, ProjectionElem::Downcast(v));
                 }
                 let place = proj(0, projection.clone());
                 let got = state.read_place(&place);

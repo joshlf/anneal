@@ -1049,7 +1049,7 @@ fn test_b1_place_evaluation_respects_projections() {
     assert_eq!(
         eval_rv(&Rvalue::Ref(Mutability::Not, deref(2)), &local_decls, &locals, pw, policy, &mut tracker),
         Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
-            target_ty: ref_u32,
+            target_ty: ref_u32.clone(),
             bits: 0,
         }))
     );
@@ -1057,11 +1057,14 @@ fn test_b1_place_evaluation_respects_projections() {
         eval_rv(&Rvalue::RawPtr(Mutability::Not, deref(2)), &local_decls, &locals, pw, policy, &mut tracker)
             .is_ok()
     );
-    // A0 returned `&_0`'s synthetic address for `&_0.1` (and for every other projection).
+    // `&_0.1` on `_0: (u32, u32)` advances the synthetic base address `0x1000` by 4 bytes.
     let field1 = Place::with_projection(0, vec![ProjectionElem::Field(1, u32_ty)]);
     assert_eq!(
-        eval_rv(&Rvalue::Ref(Mutability::Not, field1.clone()), &local_decls, &locals, pw, policy, &mut tracker),
-        Err(RvalueEvalError::UnsupportedPlaceProjection(field1))
+        eval_rv(&Rvalue::Ref(Mutability::Not, field1), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(
+            PointerValue::with_provenance(0x1004, 1, 1),
+            ref_u32
+        ))
     );
     // A0 returned the *base local's* discriminant (3) for `discriminant(_3.0)` (truly 1).
     // Without `Downcast(3)`, projecting field 0 of `Outer` (variant 3) is an inactive-variant UB;
