@@ -430,6 +430,7 @@ open LeanMiriSpec.Correspondence in
   rawPtrPerm
   AllocIdSupplyReady
   AllocIdSupplyReady.empty
+  AllocIdSupplyReady.of_setLiveAllocation
   IsPrimScalarTy.layout_ok
   forceAllocation_promote_eq
   evalRvalueIntoPlace_rawPtr_ok
@@ -639,6 +640,17 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_binOp_offset_neg_stride_and_oob_real_steps
   Witness.lm31OffsetUsizeWrapBody
   Witness.wit_lm3_1_binOp_offset_usize_wrap_divergence_real_steps
+  Witness.MachineAddrSupplyEq
+  Witness.MachineAddrSupplyEq.refl
+  Witness.MachineAddrSupplyEq.trans
+  Witness.step_preserves_supply_of_rvalue
+  Witness.step_assign_use_preserves_supply
+  Witness.step_assign_cast_ptrToPtr_preserves_supply
+  Witness.step_assign_binOp_offset_preserves_supply
+  Witness.lm31DerefWriteInvalidBoolOffset5Body
+  Witness.lm31OffsetUsizeMaxAtZeroOobBody
+  Witness.wit_lm3_1_deref_write_invalid_bool_offset5_and_usize_oob_real_steps
+  Witness.wit_lm3_1_composed_step_mir_deref_ub_real_steps
   step_safeRef_deref_read_invalid_scalar_simulation
   evalRvalue_reborrow_safeRef_tree_simulation
   step_safeRef_deref_read_tree_simulation
@@ -5069,12 +5081,11 @@ example
     (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
     {ptrVal : ProvenancePtr} {e : AllocMapEntry}
     (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
-    (hoff0 : ptrVal.offsetBytes = 0)
     (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
     (hperm : e.perm = .active ∨ e.perm = .reserved)
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
-    (htgt_1 : tgtDecl.ty.kind = .bool ∨ tgtDecl.ty.kind = .uint .u8 ∨ tgtDecl.ty.kind = .int .i8)
-    (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead)  :
+    (hinb : ptrVal.offsetBytes + 1 ≤ (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -5082,7 +5093,7 @@ example
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "writing invalid value")) :=
-  step_deref_write_invalid_bool_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p hoff0 he htag hperm hdecl_tgt htgt_1 htgt_live
+  step_deref_write_invalid_bool_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hc_val hc_ty hb_lo hb_hi himm_ptr hslot_p he htag hperm hdecl_tgt hinb htgt_live
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -6910,7 +6921,7 @@ example
       get? body.localDecls e.localIdx = some tgtDecl →
       let stride :=
         (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat
-      (rhsTy.kind = .int .isize ∧ 2 ^ 63 ≤ sc.bits ∧
+      (2 ^ 63 ≤ sc.bits ∧
         (get? s.frame.locals e.localIdx = some .dead ∨
           ptrVal.offsetBytes < (2 ^ 64 - sc.bits) * stride ∨
           (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat < ptrVal.offsetBytes)) ∨
@@ -7444,6 +7455,145 @@ example :
       Miri.Interpreter.Step.step hooks () m₂ =
         (m₃, .error (.undefinedBehavior "PointerArithOverflow")) :=
   Witness.wit_lm3_1_binOp_offset_usize_wrap_divergence_real_steps
+
+example
+    {mem nextMem : AnnealMemory} {id : Miri.Memory.AllocId}
+    {entry :
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind}
+    {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    (h : AllocIdSupplyReady mem)
+    (present : mem.live.find? (fun row => row.1 == id) = some (id, entry))
+    (hset : mem.setLiveAllocation id alloc' = .ok nextMem) :
+    AllocIdSupplyReady nextMem ∧
+      nextMem.nextAllocId = mem.nextAllocId ∧
+      nextMem.sourceAllocIdWorldActive = mem.sourceAllocIdWorldActive :=
+  AllocIdSupplyReady.of_setLiveAllocation h present hset
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dst : Place} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.assign dst (.use op), span⟩)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    (AllocIdSupplyReady m'.machine.memory ∧
+      m'.machine.memory.nextAllocId = m.machine.memory.nextAllocId ∧
+      m'.machine.memory.sourceAllocIdWorldActive = m.machine.memory.sourceAllocIdWorldActive) ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) :=
+  Witness.step_assign_use_preserves_supply hstate hbb hstmt hsupply hstep
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dst : Place} {op : MirAst.Operand} {castTy : Ty} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign dst (.cast .ptrToPtr op castTy), span⟩)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    (AllocIdSupplyReady m'.machine.memory ∧
+      m'.machine.memory.nextAllocId = m.machine.memory.nextAllocId ∧
+      m'.machine.memory.sourceAllocIdWorldActive = m.machine.memory.sourceAllocIdWorldActive) ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) :=
+  Witness.step_assign_cast_ptrToPtr_preserves_supply hstate hbb hstmt hsupply hstep
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {dst : Place} {lhs rhs : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign dst (.binaryOp .offset lhs rhs), span⟩)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    (AllocIdSupplyReady m'.machine.memory ∧
+      m'.machine.memory.nextAllocId = m.machine.memory.nextAllocId ∧
+      m'.machine.memory.sourceAllocIdWorldActive = m.machine.memory.sourceAllocIdWorldActive) ∧
+    (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+      ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) :=
+  Witness.step_assign_binOp_offset_preserves_supply hstate hbb hstmt hsupply hstep
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    (let b := lm31DerefWriteInvalidBoolOffset5Body
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 lm31AllocId1
+     ∃ s₁ s₂ s₃ m₁ m₂ m₃ m₄,
+       stepMirFn b (mkSixLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks ()
+         (mkSixLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [entry] ∧
+       get? s₃.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 5 } 8)) ∧
+       stepMirFn b s₃ = .fail .ub ∧
+       Miri.Interpreter.Step.step hooks () m₃ =
+         (m₄, .error (.undefinedBehavior "writing invalid value"))) ∧
+    (let b := lm31OffsetUsizeMaxAtZeroOobBody
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let entry := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 lm31AllocId1
+     ∃ s₁ m₁ m₂ msg,
+       stepMirFn b (mkFourLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks ()
+         (mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [entry] ∧
+       stepMirFn b s₁ = .fail .ub ∧
+       Miri.Interpreter.Step.step hooks () m₁ =
+         (m₂, .error (.undefinedBehavior msg))) :=
+  Witness.wit_lm3_1_deref_write_invalid_bool_offset5_and_usize_oob_real_steps
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    (let b := lm31DerefWriteInvalidBoolOffset5Body
+     let hooks := annealStepHooks b.localDecls b.layouts
+     ∃ s₁ s₂ s₃ m₁ m₂ m₃ m₄ map₄ msg,
+       stepMirFn b (mkSixLocalScalarAnnealPre b ⟨42, 8⟩) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks ()
+         (mkSixLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42) = (m₁, .ok true) ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       AllocIdSupplyReady m₃.machine.memory ∧
+       StepObsRelLM3_1 b m₃ map₄ (stepMirFn b s₃) (Miri.Interpreter.Step.step hooks () m₃) ∧
+       stepMirFn b s₃ = .fail .ub ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior msg))) ∧
+    (let b := lm31NarrowerInvalidCharReadBody
+     let hooks := annealStepHooks b.localDecls b.layouts
+     ∃ s₁ s₂ s₃ m₁ m₂ m₃ m₄ map₄ msg,
+       stepMirFn b (mkSixLocalScalarAnnealPre b ⟨237494511599681, 8⟩) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks ()
+         (mkSixLocalScalarMiriPre b charTyLM31 u64Ty (Miri.Memory.ScalarInt.ofUInt64 237494511599681)) =
+         (m₁, .ok true) ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       AllocIdSupplyReady m₃.machine.memory ∧
+       StepObsRelLM3_1 b m₃ map₄ (stepMirFn b s₃) (Miri.Interpreter.Step.step hooks () m₃) ∧
+       stepMirFn b s₃ = .fail .ub ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior msg))) :=
+  Witness.wit_lm3_1_composed_step_mir_deref_ub_real_steps
 
 /-! ### `LM-3.2` statement pins -/
 
