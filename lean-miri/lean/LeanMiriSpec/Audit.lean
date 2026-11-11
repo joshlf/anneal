@@ -594,6 +594,7 @@ open LeanMiriSpec.Correspondence in
   annealWriteMemoryPlace_subrange_scalar_ok
   step_deref_read_narrower_simulation
   step_deref_read_narrower_partial_oob_simulation
+  step_deref_read_narrower_invalid_bool_or_char_simulation
   step_deref_write_narrower_simulation
   step_deref_write_invalid_char_simulation
   RawOverwrittenScalarState
@@ -630,6 +631,8 @@ open LeanMiriSpec.Correspondence in
   Witness.lm31RawOverwriteBoolBody
   Witness.lm31RawOverwriteCharBody
   Witness.wit_lm3_1_raw_overwritten_bool_and_char_real_steps
+  Witness.lm31NarrowerInvalidCharReadBody
+  Witness.wit_lm3_1_deref_read_narrower_invalid_char_real_steps
   Witness.lm31OffsetNegStrideBody
   Witness.lm31OffsetNegOobBody
   Witness.wit_lm3_1_binOp_offset_neg_stride_and_oob_real_steps
@@ -4720,7 +4723,6 @@ example
     (hrhs_eval : evalOperand (offsetAfterLhsLocals opKind s.frame.locals ptrIdx) rhsOp
       s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals body.localDecls =
       .ok (.scalar ⟨count, 8⟩) locals_rhs)
-    (hcount_lt : count < 2 ^ 32)
     (hdst_live : get? locals_rhs dstIdx ≠ some .dead)
     (he_mem : e ∈ allocMap)
     (he_tag : e.tag = ptrVal.tag)
@@ -4755,7 +4757,7 @@ example
             ⟨Miri.ABI.Size.ofBytes
               (annealStackBaseAddr e.allocId + UInt64.ofNat (ptrVal.offsetBytes + count * stride)),
               .concrete e.allocId borTag⟩)))) :=
-  step_binOp_offset_stride_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hcount_lt hdst_live he_mem he_tag hperm hdecl_tgt hinbounds hptr8
+  step_binOp_offset_stride_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hprim_pt hrhs_ty hop_rhs himm hptr_slot hrhs_eval hdst_live he_mem he_tag hperm hdecl_tgt hinbounds hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -5055,9 +5057,9 @@ example
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩)
-    {ptrDecl tgtDecl : MirAst.LocalDecl}
+    {ptrDecl tgtDecl : MirAst.LocalDecl} {mutability : Mutability}
     (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
-    (hptr_ty : ptrDecl.ty.kind = .rawPtr .mut .bool)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability .bool)
     (hc_val : c.val = .scalar (.int ⟨b, 1⟩))
     (hc_ty : c.ty.kind = .bool)
     (hb_lo : 2 ≤ b) (hb_hi : b < 256)
@@ -6844,9 +6846,9 @@ example
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩)
-    {ptrDecl tgtDecl : MirAst.LocalDecl}
+    {ptrDecl tgtDecl : MirAst.LocalDecl} {mutability : Mutability}
     (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
-    (hptr_ty : ptrDecl.ty.kind = .rawPtr .mut .char)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability .char)
     (hc_val : c.val = .scalar (.int ⟨b, 4⟩))
     (hc_ty : c.ty.kind = .char)
     (hb_hi : b < 2 ^ 32)
@@ -6934,10 +6936,10 @@ example
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use (.constant c)), span⟩)
-    {ptrDecl tgtDecl : MirAst.LocalDecl} {rawKind : RigidTy}
+    {ptrDecl tgtDecl : MirAst.LocalDecl} {mutability : Mutability} {rawKind : RigidTy}
     {ptrVal : ProvenancePtr} {e : AllocMapEntry}
     (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
-    (hptr_ty : ptrDecl.ty.kind = .rawPtr .mut rawKind)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability rawKind)
     (hc_ty : c.ty.kind = rawKind)
     (hc_val : c.val = .scalar (.int rawSc))
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
@@ -7042,10 +7044,12 @@ example
     {rawSc : MirAst.ScalarInt} {msc_raw : Miri.Memory.ScalarInt}
     (hraw : RawOverwrittenScalarState body s m allocMap loc allocId rawSc msc_raw)
     (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
     {bb : BasicBlockData} {dstIdx : Local} {span : String}
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
-      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨loc, .nil⟩)), span⟩)
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨loc, .nil⟩)), span⟩)
     {dstDecl locDecl : MirAst.LocalDecl}
     (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
     (hdecl_loc : get? body.localDecls loc = some locDecl)
@@ -7057,13 +7061,55 @@ example
     (hinvalid : isValidCharCode rawSc.bits = false) :
     stepMirFn body s =
       MirStepNode.step
-        (advanceStmt s (s.frame.locals.set dstIdx (.init (.scalar rawSc)))
+        (advanceStmt s
+          ((offsetAfterLhsLocals opKind s.frame.locals loc).set dstIdx (.init (.scalar rawSc)))
           { s.memory with
             borrows := invalidateConflictingBorrows s.memory.borrows dstIdx none }) ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) :=
-  step_raw_overwritten_direct_copy_invalid_char_divergence hraw hphase hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinvalid
+  step_raw_overwritten_direct_copy_invalid_char_divergence hraw hphase hopKind hbb hstmt hdecl_dst hdecl_loc hloc_char hdst_char hne_dst hdst_live hsz4 hb_hi hinvalid
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind : Place → MirAst.Operand}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨ptrIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl ptrDecl tgtDecl : MirAst.LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {oldSc : MirAst.ScalarInt}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
+    (htgt_prim : IsPrimScalarTy tgtDecl.ty)
+    (hslot_tgt : get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))
+    (hinb : ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat ≤
+      (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat)
+    (halign : ptrVal.offsetBytes %
+      (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat = 0)
+    (hinvalid :
+      (dstDecl.ty.kind = .bool ∧ 2 ≤ (oldSc.bits / 2 ^ (8 * ptrVal.offsetBytes)) % 256) ∨
+      (dstDecl.ty.kind = .char ∧
+        isValidCharCode ((oldSc.bits / 2 ^ (8 * ptrVal.offsetBytes)) % 2 ^ 32) = false))
+    (hlay_coh : PrimLayoutsCoherent body.layouts) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) :=
+  step_deref_read_narrower_invalid_bool_or_char_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hptr_ty himm_ptr hslot_p he htag hdecl_tgt htgt_prim hslot_tgt hinb halign hinvalid hlay_coh
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
@@ -7243,7 +7289,7 @@ example :
        stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
        stepMirFn b s₃ = .fail .ub ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior msg))) ∧
-    (let b := lm31RawOverwriteCharBody false
+    (let b := lm31RawOverwriteCharBody false false
      let hooks := annealStepHooks b.localDecls b.layouts
      ∃ s₁ s₂ s₃ s₄ m₁ m₂ m₃ m₄,
        stepMirFn b (mkSixLocalScalarAnnealPre b ⟨0x41, 4⟩) = .step s₁ ∧
@@ -7252,8 +7298,43 @@ example :
        stepMirFn b s₁ = .step s₂ ∧ Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
        stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
        stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior "reading invalid value"))) ∧
+    (let b := lm31RawOverwriteCharBody false true
+     let hooks := annealStepHooks b.localDecls b.layouts
+     ∃ s₁ s₂ s₃ s₄ m₁ m₂ m₃ m₄,
+       stepMirFn b (mkSixLocalScalarAnnealPre b ⟨0x41, 4⟩) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks ()
+         (mkSixLocalScalarMiriPre b charTyLM31 charTyLM31 (Miri.Memory.ScalarInt.ofUInt32 0x41)) = (m₁, .ok true) ∧
+       stepMirFn b s₁ = .step s₂ ∧ Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       stepMirFn b s₂ = .step s₃ ∧ Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       get? s₄.frame.locals 1 = some .uninit ∧
+       get? s₄.frame.locals 0 = some (.init (.scalar ⟨0xD800, 4⟩)) ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .error (.undefinedBehavior "reading invalid value"))) :=
   Witness.wit_lm3_1_raw_overwritten_bool_and_char_real_steps
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      let b := lm31NarrowerInvalidCharReadBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 lm31AllocId1
+      stepMirFn b (mkSixLocalScalarAnnealPre b ⟨237494511599681, 8⟩) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks ()
+        (mkSixLocalScalarMiriPre b charTyLM31 u64Ty (Miri.Memory.ScalarInt.ofUInt64 237494511599681)) =
+        (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      get? s₃.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 4 } 8)) ∧
+      StepRelLM3_1 b m₃ [entry] (stepMirFn b s₃) (Miri.Interpreter.Step.step hooks () m₃) ∧
+      stepMirFn b s₃ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₃ =
+        (m₄, .error (.undefinedBehavior "reading invalid value")) :=
+  Witness.wit_lm3_1_deref_read_narrower_invalid_char_real_steps
 
 open Trusted.Rustc.V2026_06_01.Layout in
 open Witness in
