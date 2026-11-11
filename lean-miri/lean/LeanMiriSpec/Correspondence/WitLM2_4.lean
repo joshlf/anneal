@@ -38,13 +38,13 @@ fields at offset `0`), a body that writes, copies, and reads it, and reuses the
    Anneal and writing byte `0` of a fresh allocation in `lean-miri`
    (`lm24_field_write_uninit_simulation`); likewise the nonzero-field write
    `_1.1 = 0x01020304_u32` on the uninitialized `_1` writes bytes `[0, 4)`
-   (`lm24_field1_write_uninit_simulation`), and a *narrower* projected field
-   write `_1.0 = 0x77_u8` onto `_1 = U { b: 0x01020304_u32 }` retains the high
-   bytes `[0x03, 0x02, 0x01]` in both Anneal's raw-byte overlay and `lean-miri`'s
-   allocation so `_3 = copy (_1.1: u32)` reads `0x01020377_u32` in both machines
-   (`lm24_narrower_field_write_retains_high_bytes_correspondence`; after the
-   narrower write the states are related through `UnionMemRel`, not
-   `StateRelLM2_4`);
+   (`lm24_field1_write_uninit_simulation`), and chained *narrower* projected
+   field writes `_1.0 = 0x77_u8; _1.0 = 0x88_u8` onto `_1 = U { b: 0x01020304_u32 }`
+   retain the high bytes `[0x03, 0x02, 0x01]` in both Anneal's raw-byte overlay
+   and `lean-miri`'s allocation so `_3 = copy (_1.1: u32)` reads
+   `0x01020388_u32` and `StorageDead(_1)` frees `_1`'s backing allocation with
+   `StateRelLM2_4` preserved after every step
+   (`lm24_narrower_field_write_retains_high_bytes_simulation`);
 7. `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)` steps normally in both
    machines (`lm24_move_read_steps`);
 8. the operands `copy _1[1..3]` and `move _1[2..len - 2]` on the array agree,
@@ -201,7 +201,7 @@ def lm24FnAbi : FnAbi :=
 - `bb6`: `_1 = U { b: 0x01020304_u32 }; _2 = copy (_1.0: u8)`
 - `bb7`: `_1 = U { a: 5 }; _1.1 = 0x01020304_u32`
 - `bb8`: `_1.1 = 0x01020304_u32` (on the uninitialized `_1`)
-- `bb9`: `_1 = U { b: 0x01020304_u32 }; _1.0 = 0x77_u8; _3 = copy (_1.1: u32)` -/
+- `bb9`: `_1 = U { b: 0x01020304_u32 }; _1.0 = 0x77_u8; _1.0 = 0x88_u8; _3 = copy (_1.1: u32); StorageDead(_1)` -/
 def lm24Body : CapturedMir where
   defPath := "lm_2_4_witness::unions"
   phase := .runtimePostCleanup
@@ -249,7 +249,9 @@ def lm24Body : CapturedMir where
     { statements := [
         lm24AggU32Stmt 1 0x01020304,
         lm24FieldWriteStmt 1 0x77,
-        mkStmt (.assign (local_ 3) (.use (unionFieldReadOperand false 1 1 lm24U32Ty)))],
+        lm24FieldWriteStmt 1 0x88,
+        mkStmt (.assign (local_ 3) (.use (unionFieldReadOperand false 1 1 lm24U32Ty))),
+        mkStmt (.storageDead 1)],
       terminator := mkTerm .return_, isCleanup := false }]
   fnAbi := lm24FnAbi
   layouts := lm24Layouts
@@ -1128,6 +1130,18 @@ def lm24USplicedSlot : LocalSlot :=
             ((encodeLittleEndianBytes 0x01020304 4 none).drop 1 ++
               replicateUninitBytes 0)))]))
 
+/-- Anneal `LocalSlot` for `_1 : U` after the second chained narrower projected
+write `_1.0 = 0x88_u8` onto `lm24USplicedSlot`: typed slot `0` holds `0x88_u8`
+and the `D13a` raw-byte overlay still retains high bytes `[0x03, 0x02, 0x01]`. -/
+def lm24USplicedSlot2 : LocalSlot :=
+  .init (.aggregate 0
+    (unionSlotFields 2 0 (.scalar ⟨0x88, 1⟩) ++
+      [.aggregate 0
+        (encodeRawAbstractByteVals
+          (encodeLittleEndianBytes 0x88 1 none ++
+            ((encodeLittleEndianBytes 0x01020377 4 none).drop 1 ++
+              replicateUninitBytes 0)))]))
+
 theorem lm24_bb9_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 9) =
     .step (lm24AnnealState 9 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) := rfl
 
@@ -1138,31 +1152,46 @@ theorem lm24_bb9_anneal₂ :
 theorem lm24_bb9_anneal₃ :
     stepMirFn lm24Body
       (lm24AnnealState 9 2 [.uninit, lm24USplicedSlot, .uninit, .uninit, .uninit]) =
-      .step (lm24AnnealState 9 3
-        [.uninit, lm24USplicedSlot, .uninit, .init (.scalar ⟨0x01020377, 4⟩), .uninit]) := rfl
+      .step (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) := rfl
 
-/-- **End-to-end 3-step witness for `step_union_narrower_field_write_correspondence`
-and `D13a` raw-byte overlay read-back** (contrasting projected `_1.0 = 0x77_u8`
-with unprojected `lm24_union_agg_smaller_overwrite_divergence`):
+theorem lm24_bb9_anneal₄ :
+    stepMirFn lm24Body
+      (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) =
+      .step (lm24AnnealState 9 4
+        [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) := rfl
+
+theorem lm24_bb9_anneal₅ :
+    stepMirFn lm24Body
+      (lm24AnnealState 9 4
+        [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) =
+      .step (lm24AnnealState 9 5
+        [.uninit, .dead, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) := rfl
+
+/-- **End-to-end 5-step `StateRelLM2_4` witness for
+`step_union_narrower_field_write_simulation`, `step_union_overlay_field_read_simulation`,
+and `step_storageDead_LM2_4_simulation` on `UnionLocalRel.unionOverlay`**
+(contrasting projected `_1.0 = 0x77_u8; _1.0 = 0x88_u8` with unprojected
+`lm24_union_agg_smaller_overwrite_divergence`):
 1. `_1 = U { b: 0x01020304_u32 }` initializes all 4 bytes `[0x04, 0x03, 0x02, 0x01]`
    in lockstep (`StateRelLM2_4`);
 2. Narrower projected write `_1.0 = 0x77_u8` attaches the raw-byte overlay
    `lm24USplicedSlot` in Anneal while overwriting byte `0` and retaining
-   `[0x03, 0x02, 0x01]` in `lean-miri`, establishing `UnionMemRel` for
-   `⟨0x01020377, 4⟩`;
-3. Wide read `_3 = copy (_1.1: u32)` steps both machines and decodes
-   `0x01020377_u32` into `_3` in both Anneal and `lean-miri`
-   (`miri_step_union_field_read_of_unionMemRel`).
-
-After step 2 the states are related through `UnionMemRel` and the explicit
-facts of `step_union_narrower_field_write_correspondence`, not through
-`StateRelLM2_4` (`UnionLocalRel.union` has no case for an overlay-carrying
-union value). -/
-theorem lm24_narrower_field_write_retains_high_bytes_correspondence :
-    ∃ (m₁ m₂ m₃ : AnnealStepState)
-      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+   `[0x03, 0x02, 0x01]` in `lean-miri`, re-establishing `StateRelLM2_4` via
+   `UnionLocalRel.unionOverlay` (`UnionMemRel` for `⟨0x01020377, 4⟩`);
+3. Chained narrower projected write `_1.0 = 0x88_u8` onto the overlay-carrying
+   union updates `_1` to `lm24USplicedSlot2` while preserving `StateRelLM2_4`
+   (`UnionMemRel` for `⟨0x01020388, 4⟩`);
+4. Wide cross-field read `_3 = copy (_1.1: u32)` steps both machines in
+   `StateRelLM2_4` lockstep and decodes `0x01020388_u32` into `_3`
+   (`step_union_overlay_field_read_simulation`);
+5. `StorageDead(_1)` composes directly on the overlay-carrying `StateRelLM2_4`
+   state, marking `_1` dead and freeing its stack allocation in `StateRelLM2_4`
+   (`step_storageDead_LM2_4_simulation`). -/
+theorem lm24_narrower_field_write_retains_high_bytes_simulation :
+    ∃ (m₁ m₂ m₃ m₄ m₅ : AnnealStepState)
+      (tf₄ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (mp : Miri.Interpreter.MemPlace AnnealProv)
-      (msc₃ : Miri.Memory.ScalarInt),
+      (msc₄ : Miri.Memory.ScalarInt),
       let hooks := annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts
       stepMirFn lm24Body (lm24InitAnneal 9) =
         .step (lm24AnnealState 9 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) ∧
@@ -1173,16 +1202,37 @@ theorem lm24_narrower_field_write_retains_high_bytes_correspondence :
         (lm24AnnealState 9 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) =
           .step (lm24AnnealState 9 2 [.uninit, lm24USplicedSlot, .uninit, .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 9 2 [.uninit, lm24USplicedSlot, .uninit, .uninit, .uninit]) m₂ ∧
       UnionMemRel m₂.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020377, 4⟩ mp ∧
       stepMirFn lm24Body
         (lm24AnnealState 9 2 [.uninit, lm24USplicedSlot, .uninit, .uninit, .uninit]) =
-          .step (lm24AnnealState 9 3
-            [.uninit, lm24USplicedSlot, .uninit, .init (.scalar ⟨0x01020377, 4⟩), .uninit]) ∧
+          .step (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      ScalarRel ⟨0x01020377, 4⟩ msc₃ ∧
-      m₃.stack.frames = #[tf₃] ∧
-      (∃ c, tf₃.locals[3]? =
-        some ⟨.live (.immediate (.scalar (.fromScalarInt msc₃))), c⟩) := by
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) m₃ ∧
+      UnionMemRel m₃.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020388, 4⟩ mp ∧
+      stepMirFn lm24Body
+        (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) =
+          .step (lm24AnnealState 9 4
+            [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 9 4
+          [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) m₄ ∧
+      ScalarRel ⟨0x01020388, 4⟩ msc₄ ∧
+      m₄.stack.frames = #[tf₄] ∧
+      (∃ c, tf₄.locals[3]? =
+        some ⟨.live (.immediate (.scalar (.fromScalarInt msc₄))), c⟩) ∧
+      stepMirFn lm24Body
+        (lm24AnnealState 9 4
+          [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) =
+          .step (lm24AnnealState 9 5
+            [.uninit, .dead, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 9 5
+          [.uninit, .dead, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) m₅ := by
   -- Step 1: `_1 = U { b: 0x01020304_u32 }`
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24_init_stateRel 9).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
@@ -1202,34 +1252,93 @@ theorem lm24_narrower_field_write_retains_high_bytes_correspondence :
     intro tf htf; rw [hframes₁] at htf
     have h : tf₁ = tf := by simpa using htf
     subst h; exact ⟨c₁, hmls₁⟩
-  -- Step 2: `_1.0 = 0x77_u8` (narrower projected write)
-  obtain ⟨_, hpost₂⟩ := step_union_narrower_field_write_correspondence hst₁ hnodup₁ lm24_phase
-    (u := 1) (j := 0) (bb := _) rfl rfl rfl (f := 1) lm24_wt_U rfl (by decide) (by decide)
-    hu_slot₁ hu_mls₁ hmem₁ lm24_isPrim_u8
+  have hmsc₀ : ∃ msc0 : Miri.Memory.ScalarInt,
+      ImmediateRel lm24U32Ty lm24Body.layouts (.scalar ⟨0x01020304, 4⟩)
+        (.scalar (.fromScalarInt msc0)) := by
+    cases hmem₁ with
+    | mk _ _ _ _ msc0 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ hi0 _ => exact ⟨msc0, hi0⟩
+  have hu_init₁ : UnionInitSlotRel lm24Body.layouts lm24UTy 4 2 ⟨0x01020304, 4⟩ lm24UU32Slot :=
+    .plain 1 lm24U32Ty (by decide) lm24_isPrim_u32 hmsc₀ ⟨_, rfl, rfl⟩
+  -- Step 2: `_1.0 = 0x77_u8` (narrower projected write -> `UnionLocalRel.unionOverlay`)
+  obtain ⟨_, hpost₂⟩ := step_union_narrower_field_write_simulation hst₁ hnodup₁ lm24_phase
+    (u := 1) (j := 0) (bb := _) rfl rfl rfl lm24_wt_U rfl (by decide) hu_slot₁ hu_init₁
+    hu_mls₁ hmem₁ (by intro h; cases h) (by intro h; cases h) lm24_isPrim_u8
     (fun tf _ => lm24_constU8_wt 0x77 (by decide) tf) (by decide)
-  obtain ⟨_, m₂, _, tf₂, _, _, _, hstep₂, _, hframes₂, hbody₂, hloc₂, hsize₂, hu_mls₂,
-    hother_rel₂, himm₂, _, _, hnodup₂, _, _, _, hmem_sp, _⟩ :=
-    hpost₂ ⟨0x77, 1⟩ rfl
-  have hsp_eq : unionSpliceLowScalar ⟨0x01020304, 4⟩ ⟨0x77, 1⟩ = ⟨0x01020377, 4⟩ := by
-    unfold unionSpliceLowScalar
-    rw [scalarModulus_eq_two_pow]
-    rfl
+  obtain ⟨_, _, hu_init₂_raw, m₂, _, tf₂, _, _, _, hstep₂, hst₂, _, hframes₂, hu_mls₂_eq,
+    himm₂, _, _, hnodup₂, _, _, _, hmem₂_raw, _⟩ := hpost₂ ⟨0x77, 1⟩ rfl
+  change StateRelLM2_4 lm24Body
+    (lm24AnnealState 9 2 [.uninit, lm24USplicedSlot, .uninit, .uninit, .uninit]) m₂ at hst₂
+  have hsp₁ : unionSpliceLowScalar ⟨0x01020304, 4⟩ ⟨0x77, 1⟩ = ⟨0x01020377, 4⟩ := by
+    unfold unionSpliceLowScalar; rw [scalarModulus_eq_two_pow]; rfl
   have hmem₂ : UnionMemRel m₂.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020377, 4⟩ mp :=
-    hsp_eq ▸ hmem_sp (fun h => nomatch h) (fun h => nomatch h)
-  -- Step 3: `_3 = copy (_1.1: u32)` reads `0x01020377_u32` in both machines
-  have hr_imm₂ : IsImmediateFrameLocal tf₂ 3 :=
-    himm₂ tf₁ hframes₁ 3 (himm₁ (lm24InitMiriFrame 9) rfl 3 (by decide) (lm24_init_imm 9 3))
-  have hr_rel₂ : ∀ mls, tf₂.locals[3]? = some mls →
-      UnionLocalRel m₂.machine (lm24Decl lm24U32Ty) lm24Body.layouts .uninit mls :=
-    fun mls hmls => hother_rel₂ 3 (lm24Decl lm24U32Ty) .uninit mls (by decide) rfl rfl hmls
-  obtain ⟨m₃, tf₃, msc₃, hstep₃, hrel₃, hframes₃, hc₃⟩ :=
-    miri_step_union_field_read_of_unionMemRel hnodup₂ hframes₂ hbody₂ hloc₂ hsize₂
-      (bb := _) (r := 3) (u := 1) (j := 1) (f0Ty := lm24U32Ty) (isMove := false)
-      (slot_r := .uninit)
-      rfl rfl rfl rfl rfl lm24_wt_U rfl (by decide) hu_mls₂ (fun h => nomatch h) hr_rel₂ hr_imm₂
-      hmem₂
-  exact ⟨m₁, m₂, m₃, tf₃, mp, msc₃, lm24_bb9_anneal₁, hstep₁, hst₁, lm24_bb9_anneal₂,
-    hstep₂, hmem₂, lm24_bb9_anneal₃, hstep₃, hrel₃, hframes₃, hc₃⟩
+    hsp₁ ▸ hmem₂_raw
+  have hu_init₂ : UnionInitSlotRel lm24Body.layouts lm24UTy 4 2 ⟨0x01020377, 4⟩ lm24USplicedSlot :=
+    hsp₁ ▸ hu_init₂_raw
+  have hu_mls₂ : ∀ topFrame, m₂.stack.frames = #[topFrame] →
+      ∃ c, topFrame.locals[1]? = some ⟨.live (.indirect mp), c⟩ := by
+    intro tf htf; rw [hframes₂] at htf
+    have h : tf₂ = tf := by simpa using htf
+    subst h; exact ⟨_, hu_mls₂_eq⟩
+  -- Step 3: `_1.0 = 0x88_u8` (chained narrower projected write on `UnionLocalRel.unionOverlay`)
+  obtain ⟨_, hpost₃⟩ := step_union_narrower_field_write_simulation hst₂ hnodup₂ lm24_phase
+    (u := 1) (j := 0) (bb := _) rfl rfl rfl lm24_wt_U rfl (by decide) rfl hu_init₂
+    hu_mls₂ hmem₂ (by intro h; cases h) (by intro h; cases h) lm24_isPrim_u8
+    (fun tf _ => lm24_constU8_wt 0x88 (by decide) tf) (by decide)
+  obtain ⟨_, hov₃_raw, _, m₃, _, tf₃, _, _, _, hstep₃, hst₃, _, hframes₃, hu_mls₃_eq,
+    himm₃, _, _, hnodup₃, _, _, _, hmem₃_raw, _⟩ := hpost₃ ⟨0x88, 1⟩ rfl
+  change StateRelLM2_4 lm24Body
+    (lm24AnnealState 9 3 [.uninit, lm24USplicedSlot2, .uninit, .uninit, .uninit]) m₃ at hst₃
+  have hsp₂ : unionSpliceLowScalar ⟨0x01020377, 4⟩ ⟨0x88, 1⟩ = ⟨0x01020388, 4⟩ := by
+    unfold unionSpliceLowScalar; rw [scalarModulus_eq_two_pow]; rfl
+  have hmem₃ : UnionMemRel m₃.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020388, 4⟩ mp :=
+    hsp₂ ▸ hmem₃_raw
+  have hov₃ : UnionOverlaySlotSpec lm24Body.layouts lm24UTy 4 2 0 ⟨0x01020388, 4⟩ ⟨0x88, 1⟩
+      (encodeLittleEndianBytes 0x88 1 none ++
+        ((encodeLittleEndianBytes 0x01020377 4 none).drop 1 ++ replicateUninitBytes 0)) :=
+    hsp₂ ▸ hov₃_raw
+  have hu_mls₃ : ∀ topFrame, m₃.stack.frames = #[topFrame] →
+      ∃ c, topFrame.locals[1]? = some ⟨.live (.indirect mp), c⟩ := by
+    intro tf htf; rw [hframes₃] at htf
+    have h : tf₃ = tf := by simpa using htf
+    subst h; exact ⟨_, hu_mls₃_eq⟩
+  -- Step 4: `_3 = copy (_1.1: u32)` reads `0x01020388_u32` in `StateRelLM2_4` lockstep
+  have hr_imm₃ : ∀ topFrame, m₃.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 3 := by
+    intro tf htf; rw [hframes₃] at htf
+    have h : tf₃ = tf := by simpa using htf
+    subst h
+    exact himm₃ tf₂ hframes₂ 3
+      (himm₂ tf₁ hframes₁ 3 (himm₁ (lm24InitMiriFrame 9) rfl 3 (by decide) (lm24_init_imm 9 3)))
+  obtain ⟨_, _, hpost₄⟩ := step_union_overlay_field_read_simulation hst₃ hnodup₃ lm24_phase
+    (bb := _) (r := 3) (u := 1) (j := 1) (fty := lm24U32Ty) (isMove := false)
+    rfl rfl rfl rfl rfl lm24_isPrim_u32 (Or.inr (Or.inr (Or.inl rfl))) rfl lm24_wt_U rfl
+    (by decide) hov₃ rfl hu_mls₃ hmem₃ hr_imm₃ (by decide) (by decide)
+    (fun h => nomatch h) (fun h => nomatch h)
+  obtain ⟨s₄, m₄, tf₄, msc₄, hs₄, hstep₄, hst₄, _, hmach₄, hframes₄, hrel₄, hc₄⟩ :=
+    hpost₄ (fun h => nomatch h)
+  have hs₄_eq : s₄ = lm24AnnealState 9 4
+      [.uninit, lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit] := by
+    rw [lm24_bb9_anneal₄] at hs₄; exact MirStepNode_step_inj hs₄.symm
+  subst hs₄_eq
+  have hmod₄ : (0x01020388 : Nat) % scalarModulus 4 = 0x01020388 := by
+    rw [scalarModulus_eq_two_pow]
+  dsimp only at hrel₄
+  rw [hmod₄] at hrel₄
+  -- Step 5: `StorageDead(_1)` frees `_1`'s stack allocation in `StateRelLM2_4`
+  have hnodup₄ : LiveAllocsNodup m₄.machine := hmach₄ ▸ hnodup₃
+  obtain ⟨hrel₅, _, _⟩ := step_storageDead_LM2_4_simulation hst₄ hnodup₄ lm24_phase
+    (bb := _) (loc := 1) rfl rfl rfl (by decide)
+  rw [lm24_bb9_anneal₅] at hrel₅
+  generalize hm₅_eq :
+    Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) () m₄ =
+      res₅ at hrel₅
+  cases hrel₅ with
+  | step _ m₅ hst₅ =>
+    exact ⟨m₁, m₂, m₃, m₄, m₅, tf₄, mp, msc₄,
+      lm24_bb9_anneal₁, hstep₁, hst₁,
+      lm24_bb9_anneal₂, hstep₂, hst₂, hmem₂,
+      lm24_bb9_anneal₃, hstep₃, hst₃, hmem₃,
+      lm24_bb9_anneal₄, hstep₄, hst₄, hrel₄, hframes₄, hc₄,
+      lm24_bb9_anneal₅, hm₅_eq, hst₅⟩
 
 /-! ## 9. Statement-Level `Subslice` Assignments & `[T; 0]` Dichotomy -/
 

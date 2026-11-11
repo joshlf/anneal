@@ -3496,12 +3496,17 @@ theorem array_copy_alloc_spec
 
 `StateRel`'s `MemPlaceRel` requires every byte of an initialized memory-backed
 local to be initialized (`val_consistent`), so it cannot relate a union whose
-smaller field was written. `StateRelLM2_4` is `StateRel` with one more way to
-relate a local (`UnionLocalRel.union`): an initialized `n`-field Anneal union
-`Value.aggregate 0 (unionSlotFields n f (.scalar sc))` (`f < n`, matching both
-`evalAggregateAdtUnionValue?` and `rebuildUnionFieldsAfterWriteOpt`) corresponds
-to a memory-backed union whose bytes `[0, k)` (`k = sc.sizeBytes`) hold `sc`
-and are initialized while its trailing bytes `[k, S)` are not (`UnionMemRel`).
+smaller field was written. `StateRelLM2_4` extends `StateRel` with two ways to
+relate an initialized `n`-field Anneal union to a memory-backed `UnionMemRel`
+allocation whose bytes `[0, k)` (`k = sc.sizeBytes`) hold `sc` and are
+initialized while its trailing bytes `[k, S)` are not:
+* `UnionLocalRel.union`: a plain single-active-field union
+  `Value.aggregate 0 (unionSlotFields n f (.scalar sc))` (`f < n`, matching
+  `evalAggregateAdtUnionValue?` and same-or-wider `rebuildUnionFieldsAfterWriteOpt`);
+* `UnionLocalRel.unionOverlay`: a union carrying a `D13a` raw-byte overlay
+  `Value.aggregate 0 (unionSlotFields n j (.scalar sc_low) ++ [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])`
+  after a narrower projected scalar field write (`sc_low.sizeBytes < sc.sizeBytes`,
+  `UnionOverlaySlotSpec`).
 Every `StateRel` is a `StateRelLM2_4` (`StateRel.toLM2_4`). -/
 
 /-- The `n`-slot Anneal field list of a union whose active field `f < n` holds `v`
@@ -3683,7 +3688,32 @@ inductive UnionMemRel (mach : AnnealMachine) (uTy : Ty) (layouts : LayoutTable) 
         allocLeBytes sc.bits sc.sizeBytes) :
       UnionMemRel mach uTy layouts S f0Ty sc mp
 
-/-- `LocalRel` extended with initialized unions (`UnionMemRel`). -/
+/-- Witness that typed slot `(j_low, sc_low)` and raw-byte overlay `mergedBytes`
+form a well-typed `D13a` overlay union representation for byte image
+`encodeLittleEndianBytes sc.bits sc.sizeBytes none ++ replicateUninitBytes (S - sc.sizeBytes)`. -/
+structure UnionOverlaySlotSpec
+    (layouts : LayoutTable) (uTy : Ty) (S n j_low : Nat)
+    (sc sc_low : MirAst.ScalarInt) (mergedBytes : List AbstractByte) : Prop where
+  j_lt : j_low < n
+  low_lt : sc_low.sizeBytes < sc.sizeBytes
+  field_typed :
+    ∃ (fLowTy : Ty) (msc_low : Miri.Memory.ScalarInt) (fl : Miri.Interpreter.LocalLayout),
+      IsPrimScalarTy fLowTy ∧
+      ImmediateRel fLowTy layouts (.scalar sc_low) (.scalar (.fromScalarInt msc_low)) ∧
+      unionFieldLayoutOf layouts (translateTy uTy layouts) j_low = some fl ∧
+      fl.layout.size = (translateTy fLowTy layouts).layout.size
+  low_prefix :
+    ∃ highBytes,
+      encodeLittleEndianBytes sc.bits sc.sizeBytes none =
+        encodeLittleEndianBytes sc_low.bits sc_low.sizeBytes none ++ highBytes
+  bytes_eq :
+    mergedBytes =
+      encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
+        replicateUninitBytes (S - sc.sizeBytes)
+
+/-- `LocalRel` extended with initialized unions (`UnionMemRel`), covering both
+plain single-active-field union values (`union`) and `D13a` raw-byte-overlay
+union values produced by narrower projected field writes (`unionOverlay`). -/
 inductive UnionLocalRel
     (mach : AnnealMachine)
     (decl : LocalDecl)
@@ -3707,6 +3737,23 @@ inductive UnionLocalRel
       UnionMemRel mach decl.ty layouts S f0Ty sc mp →
       UnionLocalRel mach decl layouts
         (.init (.aggregate 0 (unionSlotFields n f (.scalar sc))))
+        ⟨.live (.indirect mp), cachedLayout⟩
+  /-- An initialized `n`-field union carrying a `D13a` raw-byte overlay after a
+  narrower projected scalar field write `_u.j = sc_low` (`sc_low.sizeBytes < sc.sizeBytes ≤ S`),
+  whose initialized `[0, sc.sizeBytes)` prefix represents `sc` (`UnionMemRel`). -/
+  | unionOverlay (S n j : Nat) (f0Ty : Ty) (sc sc_low : MirAst.ScalarInt)
+      (mergedBytes : List AbstractByte)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      WellTypedUnionTy layouts decl.ty S →
+      (translateTy decl.ty layouts).layout.fields = .Union n →
+      UnionOverlaySlotSpec layouts decl.ty S n j sc sc_low mergedBytes →
+      UnionMemRel mach decl.ty layouts S f0Ty sc mp →
+      UnionLocalRel mach decl layouts
+        (.init (.aggregate 0
+          (unionSlotFields n j (.scalar sc_low) ++
+            [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])))
         ⟨.live (.indirect mp), cachedLayout⟩
 
 /-- `FrameRel` with `UnionLocalRel` in place of `LocalRel`. -/

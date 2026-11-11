@@ -2632,14 +2632,18 @@ borrows of disjoint outer struct/tuple/array fields.
 
 This is exact for borrows of whole sibling fields of nonzero size (every union
 field starts at offset `0`, so any nonzero-sized write and any nonzero-sized
-sibling field share byte `0`), while zero-sized writes (`placeIsZeroSized`) are
-exempted by `resolveBorrowWriteLocalProj` and `resolveDerefBorrowWriteFullProj`.
-It over-approximates Miri's byte-range Tree Borrows access when a nonzero-sized
-written or borrowed sub-place covers bytes disjoint from the other (for example
-a write to `_u.f.g` versus a borrow of `_u.f.h`, or a 1-byte write to `_u.a`
-versus a borrow of byte `1` of a wider sibling field), or when a sibling borrow
-targets a zero-sized union field: Anneal then disables, or reports a protector
-conflict on, a borrow that Miri's access leaves untouched.
+sibling field share byte `0`). Zero-sized writes (`placeIsZeroSized`) skip
+union-level projection truncation in `resolveBorrowWriteLocalProj` and
+`resolveDerefBorrowWriteFullProj`, retaining Anneal's untruncated projection
+overlap: sibling union-field borrows are preserved, though (unlike Miri's
+zero-byte access) foreign borrows of the ZST sub-place itself or enclosing
+whole-union `[]` borrows are still invalidated. It also over-approximates
+Miri's byte-range Tree Borrows access when a nonzero-sized written or borrowed
+sub-place covers bytes disjoint from the other (for example a write to `_u.f.g`
+versus a borrow of `_u.f.h`, or a 1-byte write to `_u.a` versus a borrow of
+byte `1` of a wider sibling field), or when a sibling borrow targets a
+zero-sized union field: Anneal then disables, or reports a protector conflict
+on, a borrow that Miri's access leaves untouched.
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):

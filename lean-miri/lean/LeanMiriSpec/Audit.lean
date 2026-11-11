@@ -1024,15 +1024,25 @@ open LeanMiriSpec.Correspondence in
   IsUnionPrefixMask.setRange_any
   step_union_type_punning_read_simulation
   step_union_nonzero_field_write_simulation
+  UnionOverlaySlotSpec
+  encodeByLayoutIdxAux_unionOverlay
+  UnionInitSlotRel
   writeProjectedForLocal_union_field_lt
+  writeProjectedForLocal_union_field_lt_of_initSlot
   unionSpliceLowScalar
-  step_union_narrower_field_write_correspondence
+  encodeLittleEndianBytes_unionSpliceLowScalar_split
+  step_union_narrower_field_write_simulation
+  evalOperand_unionOverlayFieldRead_ne_spec
+  step_union_overlay_field_read_simulation
   miri_step_union_field_read_of_unionMemRel
   Witness.lm24USplicedSlot
+  Witness.lm24USplicedSlot2
   Witness.lm24_bb9_anneal₁
   Witness.lm24_bb9_anneal₂
   Witness.lm24_bb9_anneal₃
-  Witness.lm24_narrower_field_write_retains_high_bytes_correspondence
+  Witness.lm24_bb9_anneal₄
+  Witness.lm24_bb9_anneal₅
+  Witness.lm24_narrower_field_write_retains_high_bytes_simulation
   evalSubsliceOperand_zero_uninit_indirect_characterization
   annealMemCopyOp_freshArray
   step_subslice_assign_simulation
@@ -12051,10 +12061,10 @@ example :
   Witness.lm24_field1_write_uninit_simulation
 
 example :
-    ∃ (m₁ m₂ m₃ : AnnealStepState)
-      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    ∃ (m₁ m₂ m₃ m₄ m₅ : AnnealStepState)
+      (tf₄ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (mp : Miri.Interpreter.MemPlace AnnealProv)
-      (msc₃ : Miri.Memory.ScalarInt),
+      (msc₄ : Miri.Memory.ScalarInt),
       let hooks := annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts
       stepMirFn Witness.lm24Body (Witness.lm24InitAnneal 9) =
         .step (Witness.lm24AnnealState 9 1 [.uninit, Witness.lm24UU32Slot, .uninit, .uninit, .uninit]) ∧
@@ -12066,18 +12076,43 @@ example :
           .step (Witness.lm24AnnealState 9 2
             [.uninit, Witness.lm24USplicedSlot, .uninit, .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_4 Witness.lm24Body
+        (Witness.lm24AnnealState 9 2
+          [.uninit, Witness.lm24USplicedSlot, .uninit, .uninit, .uninit]) m₂ ∧
       UnionMemRel m₂.machine Witness.lm24UTy Witness.lm24Layouts 4 Witness.lm24U32Ty
         ⟨0x01020377, 4⟩ mp ∧
       stepMirFn Witness.lm24Body
         (Witness.lm24AnnealState 9 2 [.uninit, Witness.lm24USplicedSlot, .uninit, .uninit, .uninit]) =
           .step (Witness.lm24AnnealState 9 3
-            [.uninit, Witness.lm24USplicedSlot, .uninit, .init (.scalar ⟨0x01020377, 4⟩), .uninit]) ∧
+            [.uninit, Witness.lm24USplicedSlot2, .uninit, .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      ScalarRel ⟨0x01020377, 4⟩ msc₃ ∧
-      m₃.stack.frames = #[tf₃] ∧
-      (∃ c, tf₃.locals[3]? =
-        some ⟨.live (.immediate (.scalar (.fromScalarInt msc₃))), c⟩) :=
-  Witness.lm24_narrower_field_write_retains_high_bytes_correspondence
+      StateRelLM2_4 Witness.lm24Body
+        (Witness.lm24AnnealState 9 3
+          [.uninit, Witness.lm24USplicedSlot2, .uninit, .uninit, .uninit]) m₃ ∧
+      UnionMemRel m₃.machine Witness.lm24UTy Witness.lm24Layouts 4 Witness.lm24U32Ty
+        ⟨0x01020388, 4⟩ mp ∧
+      stepMirFn Witness.lm24Body
+        (Witness.lm24AnnealState 9 3 [.uninit, Witness.lm24USplicedSlot2, .uninit, .uninit, .uninit]) =
+          .step (Witness.lm24AnnealState 9 4
+            [.uninit, Witness.lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM2_4 Witness.lm24Body
+        (Witness.lm24AnnealState 9 4
+          [.uninit, Witness.lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) m₄ ∧
+      ScalarRel ⟨0x01020388, 4⟩ msc₄ ∧
+      m₄.stack.frames = #[tf₄] ∧
+      (∃ c, tf₄.locals[3]? =
+        some ⟨.live (.immediate (.scalar (.fromScalarInt msc₄))), c⟩) ∧
+      stepMirFn Witness.lm24Body
+        (Witness.lm24AnnealState 9 4
+          [.uninit, Witness.lm24USplicedSlot2, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) =
+          .step (Witness.lm24AnnealState 9 5
+            [.uninit, .dead, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM2_4 Witness.lm24Body
+        (Witness.lm24AnnealState 9 5
+          [.uninit, .dead, .uninit, .init (.scalar ⟨0x01020388, 4⟩), .uninit]) m₅ :=
+  Witness.lm24_narrower_field_write_retains_high_bytes_simulation
 
 example :
     ∃ m₁ m₂ m₃ : AnnealStepState,
@@ -12411,37 +12446,40 @@ example
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩)
     {uDecl : MirAst.LocalDecl} (hdecl_u : get? body.localDecls u = some uDecl)
-    {S n f : Nat} (hwt : WellTypedUnionTy body.layouts uDecl.ty S)
+    {S n : Nat} (hwt : WellTypedUnionTy body.layouts uDecl.ty S)
     (hfields : (translateTy uDecl.ty body.layouts).layout.fields = .Union n)
-    (hf : f < n) (hj : j < n)
+    (hj : j < n)
     {f0Ty : Ty} {sc_old : MirAst.ScalarInt} {mp : Miri.Interpreter.MemPlace AnnealProv}
-    (hu_slot : get? s.frame.locals u =
-      some (.init (.aggregate 0 (unionSlotFields n f (.scalar sc_old)))))
+    {slot_u : LocalSlot}
+    (hu_slot : get? s.frame.locals u = some slot_u)
+    (hu_init : UnionInitSlotRel body.layouts uDecl.ty S n sc_old slot_u)
     (hu_mls : ∀ topFrame, m.stack.frames = #[topFrame] →
       ∃ c', topFrame.locals[u]? = some ⟨.live (.indirect mp), c'⟩)
     (hmem : UnionMemRel m.machine uDecl.ty body.layouts S f0Ty sc_old mp)
+    (hf0_not_bool : f0Ty.kind ≠ .bool)
+    (hf0_not_char : f0Ty.kind ≠ .char)
     (hprim : IsPrimScalarTy fty)
     (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
       WellTypedScalarOperand body topFrame op fty)
     (hlt_width : (translateTy fty body.layouts).layout.size.bytes.toNat < sc_old.sizeBytes)
-    (hfl0 : ∃ fl, unionFieldLayoutOf body.layouts (translateTy uDecl.ty body.layouts) f = some fl ∧
-      fl.layout.size = (translateTy f0Ty body.layouts).layout.size)
     (hfl' : ∃ fl, unionFieldLayoutOf body.layouts (translateTy uDecl.ty body.layouts) j = some fl ∧
       fl.layout.size = (translateTy fty body.layouts).layout.size) :
-    (evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil = .ub →
-      StepRelLM2_4 body m (stepMirFn body s)
-        (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m)) ∧
+    StepRelLM2_4 body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) ∧
     (∀ sc', evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil =
         .ok (.scalar sc') s.frame.locals →
       let mergedBytes :=
         encodeLittleEndianBytes sc'.bits sc'.sizeBytes none ++
           ((encodeLittleEndianBytes sc_old.bits sc_old.sizeBytes none).drop sc'.sizeBytes ++
             replicateUninitBytes (S - sc_old.sizeBytes))
-      let s' := advanceStmt s
-        (s.frame.locals.set u (.init (.aggregate 0
-          (unionSlotFields n j (.scalar sc') ++
-            [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])))) s.memory
+      let newSlot : LocalSlot := .init (.aggregate 0
+        (unionSlotFields n j (.scalar sc') ++
+          [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)]))
+      let s' := advanceStmt s (s.frame.locals.set u newSlot) s.memory
       stepMirFn body s = .step s' ∧
+      UnionOverlaySlotSpec body.layouts uDecl.ty S n j
+        (unionSpliceLowScalar sc_old sc') sc' mergedBytes ∧
+      UnionInitSlotRel body.layouts uDecl.ty S n (unionSpliceLowScalar sc_old sc') newSlot ∧
       ∃ (m' : AnnealStepState) (msc' : Miri.Memory.ScalarInt)
         (tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
         (allocId : Miri.Memory.AllocId)
@@ -12450,17 +12488,10 @@ example
         (A' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
         Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m =
           (m', .ok true) ∧
+        StateRelLM2_4 body s' m' ∧
         ScalarRel sc' msc' ∧
         m'.stack.frames = #[tf'] ∧
-        tf'.body = translateBody body ∧
-        tf'.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ ∧
-        tf'.locals.size = body.localDecls.length ∧
         tf'.locals[u]? = some ⟨.live (.indirect mp), some (translateTy uDecl.ty body.layouts)⟩ ∧
-        (∀ i decl slot mls, i ≠ u →
-          get? body.localDecls i = some decl →
-          get? s'.frame.locals i = some slot →
-          tf'.locals[i]? = some mls →
-          UnionLocalRel m'.machine decl body.layouts slot mls) ∧
         (∀ tf, m.stack.frames = #[tf] → ∀ k,
           IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) ∧
         (allocId, la_old) ∈ m.machine.memory.live.toList ∧
@@ -12472,12 +12503,62 @@ example
             .ok (.fromScalarInt msc') ∧
         (unionAllocRaw A').extract sc'.sizeBytes S =
           (unionAllocRaw la_old.allocation).extract sc'.sizeBytes S ∧
-        (f0Ty.kind ≠ .bool → f0Ty.kind ≠ .char →
-          UnionMemRel m'.machine uDecl.ty body.layouts S f0Ty
-            (unionSpliceLowScalar sc_old sc') mp) ∧
+        UnionMemRel m'.machine uDecl.ty body.layouts S f0Ty
+          (unionSpliceLowScalar sc_old sc') mp ∧
         StepPreservesHighWater m 0 (m', .ok true)) :=
-  step_union_narrower_field_write_correspondence hstate hnodup hphase hbb hstmt hdecl_u hwt hfields hf
-    hj hu_slot hu_mls hmem hprim hop hlt_width hfl0 hfl'
+  step_union_narrower_field_write_simulation hstate hnodup hphase hbb hstmt hdecl_u hwt hfields
+    hj hu_slot hu_init hu_mls hmem hf0_not_bool hf0_not_char hprim hop hlt_width hfl'
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m)
+    (hnodup : LiveAllocsNodup m.machine)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {r u j : Local} {fty : Ty} {isMove : Bool} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩)
+    {rDecl uDecl : MirAst.LocalDecl}
+    (hdecl_r : get? body.localDecls r = some rDecl) (hr_ty : rDecl.ty = fty)
+    (hdecl_u : get? body.localDecls u = some uDecl)
+    (hprim : IsPrimScalarTy fty) {w : Nat} (hw : ValidScalarBytes w)
+    (hsz : (translateTy fty body.layouts).layout.size = translateSizeBytes w)
+    {S n j_low : Nat} (hwt : WellTypedUnionTy body.layouts uDecl.ty S)
+    (hfields : (translateTy uDecl.ty body.layouts).layout.fields = .Union n)
+    (hj : j < n)
+    {f0Ty : Ty} {sc sc_low : MirAst.ScalarInt} {mergedBytes : List AbstractByte}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hov : UnionOverlaySlotSpec body.layouts uDecl.ty S n j_low sc sc_low mergedBytes)
+    (hu_slot : get? s.frame.locals u = some (.init (.aggregate 0
+      (unionSlotFields n j_low (.scalar sc_low) ++
+        [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)]))))
+    (hu_mls : ∀ topFrame, m.stack.frames = #[topFrame] →
+      ∃ c, topFrame.locals[u]? = some ⟨.live (.indirect mp), c⟩)
+    (hmem : UnionMemRel m.machine uDecl.ty body.layouts S f0Ty sc mp)
+    (hr_imm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame r)
+    (hjne : j ≠ j_low)
+    (hw_le : w ≤ sc.sizeBytes)
+    (hbool : fty.kind = .bool → sc.bits % scalarModulus w = 0 ∨ sc.bits % scalarModulus w = 1)
+    (hchar : fty.kind = .char → isValidCharCode (sc.bits % scalarModulus w) = true) :
+    StepRelLM2_4 body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) ∧
+    (∀ s', stepMirFn body s = .step s' →
+      get? s'.frame.locals r = some (.init (.scalar ⟨sc.bits % scalarModulus w, w⟩))) ∧
+    (get? s.frame.locals r ≠ some .dead →
+      ∃ (s' : MachineState) (m' : AnnealStepState)
+        (tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+        (msc_w : Miri.Memory.ScalarInt),
+        stepMirFn body s = .step s' ∧
+        Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        StateRelLM2_4 body s' m' ∧
+        get? s'.frame.locals r = some (.init (.scalar ⟨sc.bits % scalarModulus w, w⟩)) ∧
+        m'.machine = m.machine ∧
+        m'.stack.frames = #[tf'] ∧
+        ScalarRel ⟨sc.bits % scalarModulus w, w⟩ msc_w ∧
+        ∃ c, tf'.locals[r]? = some ⟨.live (.immediate (.scalar (.fromScalarInt msc_w))), c⟩) :=
+  step_union_overlay_field_read_simulation hstate hnodup hphase hbb hstmt hdecl_r hr_ty hdecl_u
+    hprim hw hsz hwt hfields hj hov hu_slot hu_mls hmem hr_imm hjne hw_le hbool hchar
 
 example
     {body : CapturedMir}
