@@ -93,15 +93,22 @@ pub const FMT_ARGUMENTS_CTOR_DEF_PATHS: [&str; 6] = [
 /// that `miri-difftest` links in place of each `core::fmt::Arguments`
 /// constructor in [`FMT_ARGUMENTS_CTOR_DEF_PATHS`].
 ///
-/// `evalCallTerminator` evaluates the caller's argument operands before it
-/// pushes a linked callee frame, so the `&'static str` argument is still checked
-/// for UB. The body then assigns the placeholder `()` to `_0` and returns:
-/// `Terminator.return_` requires an initialized `_0`, and the caller's later
-/// `move` of the result into `core::panicking::panic_fmt` requires an
-/// initialized destination local. Anneal models `panic_fmt` as an unwinding
-/// panic that never reads its argument, so the placeholder cannot change any
-/// outcome on that path. A program that inspects the returned value itself
-/// diverges from Miri visibly rather than agreeing by accident.
+/// Each of these constructors builds an `Arguments` value that formats as
+/// exactly its `&'static str` argument, so the stub represents the constructed
+/// value by that message slice: it copies the argument `_1` into `_0` and
+/// returns. `evalCallTerminator` evaluates the caller's argument operands
+/// before it pushes a linked callee frame, so the argument is still checked
+/// for UB. `Terminator.return_` requires an initialized `_0`, and the caller's
+/// later `move` of the result into `core::panicking::panic_fmt` requires an
+/// initialized destination local.
+///
+/// Anneal models `panic_fmt` as an unwinding panic that never reads its
+/// argument. `miri-difftest` instead reads the message slice from the state
+/// that panics (`probePanicMessageBounded`) and requires it to match the
+/// message that Miri prints before it reconciles a panic site (see
+/// [`compare_difftest_miri_and_anneal`]). Any other use of the constructed
+/// value must call a `core::fmt` method that no stub models, so the oracle
+/// reports an external call rather than a comparison.
 ///
 /// These stubs appear only in `MiriOracleProbe.lean` and
 /// `MiriOracleConfirm.lean`, after every captured helper body, so a captured
@@ -111,10 +118,9 @@ pub const FMT_ARGUMENTS_CTOR_DEF_PATHS: [&str; 6] = [
 pub const FMT_ARGUMENTS_CTOR_STUB_LEAN: &str = "\
 -- Synthetic stand-in for the `core::fmt::Arguments` constructor `defPath`,\n\
 -- linked only by `miri-difftest` oracle modules. The caller has already\n\
--- evaluated the `&'static str` argument; this body stores the placeholder `()`\n\
--- in `_0` and returns, so the caller can pass the result to\n\
--- `core::panicking::panic_fmt`, which Anneal models as an unwinding panic\n\
--- without reading its argument.\n\
+-- evaluated the `&'static str` argument; this body returns that message slice\n\
+-- as the constructed `Arguments`, which the caller passes to\n\
+-- `core::panicking::panic_fmt`.\n\
 open Trusted.Rustc.V2026_06_01.Layout in\n\
 def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
   { defPath := defPath\n    \
@@ -122,27 +128,89 @@ def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
     role := ContractRole.model\n    \
     argCount := 1\n    \
     localDecls :=\n      \
-      [{ mutability := Mutability.mut, ty := { kind := RigidTy.tuple [], layoutIdx := 0 }, debugName := Option.none },\n       \
-       { mutability := Mutability.not, ty := { kind := RigidTy.ref Mutability.not RigidTy.str, layoutIdx := 1 }, debugName := Option.none }]\n    \
+      [{ mutability := Mutability.mut, ty := { kind := RigidTy.ref Mutability.not RigidTy.str, layoutIdx := 0 }, debugName := Option.none },\n       \
+       { mutability := Mutability.not, ty := { kind := RigidTy.ref Mutability.not RigidTy.str, layoutIdx := 0 }, debugName := Option.none }]\n    \
     basicBlocks :=\n      \
       [{ statements :=\n           \
            [{ kind := StatementKind.assign { local_ := 0, projection := [] }\n                \
-                (Rvalue.use (Operand.constant { ty := { kind := RigidTy.tuple [], layoutIdx := 0 }, val := ConstValue.zeroSized })),\n              \
+                (Rvalue.use (Operand.copy { local_ := 1, projection := [] })),\n              \
               span := \"<dummy>\" }]\n         \
          terminator := { kind := TerminatorKind.return_, span := \"<dummy>\" }\n         \
          isCleanup := false }]\n    \
     fnAbi :=\n      \
       { args := [{ layout := { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }, mode := AbiPassMode.pair }]\n        \
-        ret := { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.arbitrary [] [], variants := VariantsShape.single 0, isUninhabited := false }, mode := AbiPassMode.ignore }\n        \
+        ret := { layout := { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }, mode := AbiPassMode.pair }\n        \
         conv := CallConv.rust\n        \
         canUnwind := false }\n    \
     layouts :=\n      \
       { pointerBits := 64\n        \
         isLittleEndian := true\n        \
         entries :=\n          \
-          [{ size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := FieldsShape.arbitrary [] [], variants := VariantsShape.single 0, isUninhabited := false },\n           \
-           { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }] }\n    \
+          [{ size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 }) (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 }), fields := FieldsShape.arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1], variants := VariantsShape.single 0, isUninhabited := false }] }\n    \
     allocations := [] }\n";
+
+/// Lean definitions that recover the message of the panic that ends a bounded
+/// Anneal run: `panicMessageOfSlice?`, `panicMessage?`, and
+/// `probePanicMessageBounded`.
+///
+/// `probePanicMessageBounded` steps the machine exactly as
+/// `probeMirDiffExecBounded` does. When a step panics, `panicMessage?`
+/// inspects the terminator that raised the panic. A call to
+/// `core::panicking::panic` passes the message as a `&'static str` operand,
+/// and a call to `core::panicking::panic_fmt` passes the message slice that
+/// [`FMT_ARGUMENTS_CTOR_STUB_LEAN`] returned; in both cases the message bytes
+/// are read from the panicking body's captured allocations. Every other panic
+/// has no recoverable message and yields `none`: an overflow or bounds-check
+/// `assert` terminator, or a call such as `core::panicking::assert_failed`
+/// that formats its message at run time.
+///
+/// The block contains no blank line, so finding bundles can copy it verbatim
+/// from `MiriOracleConfirm.lean`.
+const PANIC_MESSAGE_PROBE_LEAN: &str = "\
+-- Recover the message of the panic that ends a bounded run: the `&'static str`\n\
+-- operand of a call to `core::panicking::panic`, or the message slice that\n\
+-- `fmtArgumentsCtorStub` returned and the caller passed to\n\
+-- `core::panicking::panic_fmt`, read from the panicking body's captured\n\
+-- allocations. Any other panic has no recoverable message.\n\
+def panicMessageOfSlice? (cur : CapturedMir) : Value → Option (List UInt8)\n  \
+  | .aggregate 0 [.ptr p _, .scalar len] =>\n    \
+    match cur.allocations.find? (fun a => a.allocId == p.allocId) with\n    \
+    | some alloc =>\n      \
+      let window := (alloc.bytes.drop p.offsetBytes).take len.bits\n      \
+      if window.length == len.bits then window.mapM id else none\n    \
+    | none => none\n  \
+  | _ => none\n\
+def panicMessage? (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
+  match st with\n  \
+  | .running s =>\n    \
+    let cur := s.memory.activeCallee.getD body\n    \
+    match get? cur.basicBlocks s.frame.blockIdx with\n    \
+    | some bb =>\n      \
+      match get? bb.statements s.frame.stmtIdx, bb.terminator.kind with\n      \
+      | none, .call func [arg] _ _ _ =>\n        \
+        match extractCalleeDefPath? func with\n        \
+        | some \"core::panicking::panic_fmt\" | some \"core::panicking::panic\" =>\n          \
+          match arg with\n          \
+          | .move { local_ := k, projection := [] } | .copy { local_ := k, projection := [] } =>\n            \
+            match get? s.frame.locals k with\n            \
+            | some (.init v) => panicMessageOfSlice? cur v\n            \
+            | _ => none\n          \
+          | .constant c => (evalConstValue c.val c.ty).bind (panicMessageOfSlice? cur)\n          \
+          | _ => none\n        \
+        | _ => none\n      \
+      | _, _ => none\n    \
+    | none => none\n  \
+  | _ => none\n\
+def probePanicMessageBounded\n    \
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
+  match fuel with\n  \
+  | 0 => none\n  \
+  | fuel' + 1 =>\n    \
+    match stepMirState body st with\n    \
+    | .ret .panic => panicMessage? body st\n    \
+    | .tau st' => probePanicMessageBounded fuel' body st'\n    \
+    | .vis (.inr (.inl _)) k => probePanicMessageBounded fuel' body (k PUnit.unit)\n    \
+    | _ => none\n";
 
 /// Name of the Lean definition in [`FMT_ARGUMENTS_CTOR_STUB_LEAN`].
 const FMT_ARGUMENTS_CTOR_STUB_NAME: &str = "fmtArgumentsCtorStub";
@@ -341,9 +409,21 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 ///    (`library/core/src/panic.rs`, `library/core/src/macros/mod.rs`,
 ///    `library/core/src/macros/panic.rs`, or `library/std/src/macros.rs`).
 /// 3. Miri's panic position lies in the staged `src/lib.rs`, within the line
-///    range of `fn_name`, at an invocation of `panic!`, `assert!`,
-///    `assert_eq!`, `assert_ne!`, `debug_assert!`, `unreachable!`, `todo!`,
-///    or `unimplemented!` (bare or through `core::` / `std::`).
+///    range of `fn_name`, at the first token of an invocation of a standard
+///    panic or assertion macro (`panic!`, the `assert!` and `debug_assert!`
+///    families, `unreachable!`, `todo!`, or `unimplemented!`), written bare or
+///    through `core::` / `std::`.
+/// 4. If Anneal's run recovered its panic message (`anneal_panic_message`),
+///    the first line of that message equals the message that Miri reports,
+///    both trimmed. Miri's oracle output carries only the first line of the
+///    message that follows `panicked at <position>:`.
+///
+/// Anneal recovers the message of a panic raised by `core::panicking::panic`,
+/// which receives it as a `&'static str`, or by `core::panicking::panic_fmt`
+/// called with a literal message built by a `core::fmt::Arguments` constructor
+/// stub. A panic raised any other way (for example, by
+/// `core::panicking::assert_failed` for `assert_eq!`) has no recovered message,
+/// and condition 4 holds trivially.
 ///
 /// Every other verdict is returned unchanged. In particular, a panic-site
 /// mismatch whose Anneal span lies in user code (two different panicking
@@ -351,12 +431,15 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 /// body) remains `Diverge(PanicSiteMismatch)`.
 ///
 /// Every expansion of a standard macro shares the span of the macro's
-/// definition, so these conditions cannot tell two panic-macro call sites in
-/// the same function apart: if Anneal panics at a different `panic!` than Miri
-/// does, the outcome still reconciles to `Agree`.
+/// definition, so conditions 2 and 3 cannot tell two panic-macro call sites in
+/// the same function apart. Condition 4 tells them apart when they panic with
+/// different recovered messages. If Anneal panics at a different call site
+/// than Miri does but with the same message, or without a recovered message,
+/// the outcome still reconciles to `Agree`.
 pub fn compare_difftest_miri_and_anneal(
     miri: &MiriOutcome,
     anneal: &AnnealOutcome,
+    anneal_panic_message: Option<&str>,
     lib_src: &StagedLibSource,
     fn_name: &str,
 ) -> ComparisonVerdict {
@@ -367,7 +450,7 @@ pub fn compare_difftest_miri_and_anneal(
     let (
         MiriOutcome::Panic {
             pos: Some(miri_pos),
-            ..
+            message: miri_message,
         },
         AnnealOutcome::Panic {
             span: Some(anneal_span),
@@ -376,13 +459,57 @@ pub fn compare_difftest_miri_and_anneal(
     else {
         return verdict;
     };
-    if is_std_panic_macro_file(&anneal_span.file)
+    let messages_match = anneal_panic_message
+        .is_none_or(|message| message.lines().next().unwrap_or("").trim() == miri_message.trim());
+    if messages_match
+        && is_std_panic_macro_file(&anneal_span.file)
         && lib_src.is_panic_macro_call_site(fn_name, miri_pos)
     {
         ComparisonVerdict::Agree
     } else {
         verdict
     }
+}
+
+/// Prefix of the line that `MiriOracleProbe.lean` prints after an item's
+/// `ANNEAL_PROBE` line when the item panics and `probePanicMessageBounded`
+/// recovers the panic message; the line continues with the item name, a tab,
+/// and the message bytes as a Lean list (`[104, 105]`).
+const ANNEAL_PANIC_MESSAGE_PREFIX: &str = "ANNEAL_PANIC_MESSAGE\t";
+
+/// Parse the `ANNEAL_PANIC_MESSAGE` lines of `MiriOracleProbe.lean` output into
+/// a map from item name to the bytes of the panic message that Anneal's run
+/// recovered.
+fn parse_anneal_panic_messages(stdout: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut messages = BTreeMap::new();
+    for raw_line in stdout.lines() {
+        let Some(rest) = raw_line.trim().strip_prefix(ANNEAL_PANIC_MESSAGE_PREFIX) else {
+            continue;
+        };
+        let malformed = || format!("malformed ANNEAL_PANIC_MESSAGE line: '{raw_line}'");
+        let (name, list) = rest.split_once('\t').ok_or_else(malformed)?;
+        let elems = list
+            .trim()
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .ok_or_else(malformed)?;
+        let bytes = if elems.trim().is_empty() {
+            Vec::new()
+        } else {
+            elems
+                .split(',')
+                .map(|b| b.trim().parse::<u8>())
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| malformed())?
+        };
+        if messages.insert(name.trim().to_string(), bytes).is_some() {
+            return Err(format!(
+                "duplicate ANNEAL_PANIC_MESSAGE line for '{}'",
+                name.trim()
+            ));
+        }
+    }
+    Ok(messages)
 }
 
 /// Self-contained diagnostic bundle emitted for a single Miri vs. Anneal
@@ -422,15 +549,46 @@ pub struct MiriFindingBundle {
     /// Extracted neighborhood from `.anneal/generated/Mir/<Crate>/<Item>.lean`.
     pub mir_neighborhood: String,
     /// Whether the Lean 4 kernel confirmed `evalMirDiffTagBounded` and
-    /// `probeMirDiffExecBounded` via `by rfl` in `MiriOracleConfirm.lean`.
+    /// `probeMirDiffExecBounded` (and `probePanicMessageBounded`, when Anneal's
+    /// panic message was recovered) via `by rfl` in `MiriOracleConfirm.lean`.
     pub kernel_confirmed: bool,
-    /// Kernel-checked `theorem confirm_tag_<fn_name>` and
-    /// `theorem confirm_probe_<fn_name>` snippet from `MiriOracleConfirm.lean`.
+    /// Kernel-checked `theorem confirm_tag_<fn_name>`,
+    /// `theorem confirm_probe_<fn_name>`, and (when Anneal's panic message was
+    /// recovered) `theorem confirm_message_<fn_name>` snippet from
+    /// `MiriOracleConfirm.lean`, preceded by the confirm-module definitions
+    /// that those theorems use.
     pub kernel_confirm_theorems: String,
     /// Standalone `#![no_std]` Rust reproducer source (`repro.rs`).
     pub mutant_source: String,
     /// Path to `repro.rs` on disk when `--findings-dir` was provided.
     pub repro_path: Option<PathBuf>,
+}
+
+/// A candidate whose Miri and Anneal panics agree only through the panic-site
+/// reconciliation in [`compare_difftest_miri_and_anneal`], recorded so that a
+/// report lists every agreement that the strict `compare_miri_and_anneal`
+/// alone would have reported as a `PanicSiteMismatch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiriReconciledPanicSite {
+    /// Candidate function name in the staged batch `src/lib.rs`.
+    pub fn_name: String,
+    /// Seed function name in `tests/miri-diff/corpus/src/lib.rs`.
+    pub seed_name: String,
+    /// Miri's panic position (the macro call site) in the staged batch
+    /// `src/lib.rs`.
+    pub batch_miri_pos: Option<String>,
+    /// Anneal's panic span inside the standard panic-macro definition.
+    pub anneal_span: Option<String>,
+    /// Panic message recovered from Anneal's run, whose first line matched
+    /// Miri's message, or `None` when the panic carries no recoverable
+    /// message.
+    pub anneal_panic_message: Option<String>,
+    /// Whether the Lean 4 kernel confirmed the Anneal outcome, span, and
+    /// recovered message via `by rfl` in `MiriOracleConfirm.lean`.
+    pub kernel_confirmed: bool,
+    /// Kernel-checked theorem snippet from `MiriOracleConfirm.lean`, in the
+    /// same form as [`MiriFindingBundle::kernel_confirm_theorems`].
+    pub kernel_confirm_theorems: String,
 }
 
 /// Complete result of running `miri-difftest` over a set of candidate batches.
@@ -478,6 +636,9 @@ pub struct MiriCampaignEvalReport {
     pub mutator_applications: BTreeMap<String, usize>,
     /// Detailed finding bundles for every `ComparisonVerdict::Diverge` item.
     pub findings: Vec<MiriFindingBundle>,
+    /// Candidates counted in `agree_count` only through the panic-site
+    /// reconciliation in [`compare_difftest_miri_and_anneal`].
+    pub reconciled_panic_sites: Vec<MiriReconciledPanicSite>,
     /// Deterministic, sorted observation-path signatures observed during live
     /// oracle evaluation (`miri:<mutator_chain_or_template>:<verdict_or_outcome>:<diff_tag>`).
     pub obs_path_signatures: Vec<String>,
@@ -677,11 +838,14 @@ fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str
     }
 }
 
-/// Extract the `linkedCallees` definition and the `confirm_tag_<fn_name>` and
-/// `confirm_probe_<fn_name>` theorems from `MiriOracleConfirm.lean` source,
-/// preceded by the synthetic constructor stub definition when `linkedCallees`
-/// refers to it, so the snippet names no definition local to the confirm module
-/// that it does not also contain.
+/// Extract the `confirm_tag_<fn_name>`, `confirm_probe_<fn_name>`, and (when
+/// present) `confirm_message_<fn_name>` theorems from `MiriOracleConfirm.lean`
+/// source, preceded by every confirm-module definition that they use: the
+/// synthetic constructor stub (when `linkedCallees` refers to it), the panic
+/// message probe (when the message theorem is present), `linkedCallees`, and
+/// `activeSpan` and `probeMirDiffExecBounded` (when the probe theorem is
+/// present). The snippet therefore names no definition local to the confirm
+/// module that it does not also contain.
 fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     // Each block runs from its header to the first blank line; the generated
     // blocks contain no blank lines.
@@ -691,23 +855,41 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
         let end_rel = rest.find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
         Some(rest[..end_rel].trim().to_string())
     };
+    let first_line = |block: &'static str| block.lines().next().unwrap_or(block);
+    let tag_block = extract_block(&format!("theorem confirm_tag_{fn_name} :"));
+    let probe_block = extract_block(&format!("theorem confirm_probe_{fn_name} :"));
+    let message_block = extract_block(&format!("theorem confirm_message_{fn_name} :"));
     let callees_block = extract_block("def linkedCallees : List CapturedMir :=");
     let stub_block = match &callees_block {
         Some(callees) if callees.contains(FMT_ARGUMENTS_CTOR_STUB_NAME) => {
-            FMT_ARGUMENTS_CTOR_STUB_LEAN
-                .lines()
-                .next()
-                .and_then(&extract_block)
+            extract_block(first_line(FMT_ARGUMENTS_CTOR_STUB_LEAN))
         }
         _ => None,
     };
-    let tag_block = extract_block(&format!("theorem confirm_tag_{fn_name} :"));
-    let probe_block = extract_block(&format!("theorem confirm_probe_{fn_name} :"));
-    [stub_block, callees_block, tag_block, probe_block]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let message_probe_block = message_block
+        .as_ref()
+        .and_then(|_| extract_block(first_line(PANIC_MESSAGE_PROBE_LEAN)));
+    let (active_span_block, probe_exec_block) = match &probe_block {
+        Some(_) => (
+            extract_block("def activeSpan (body : CapturedMir)"),
+            extract_block("def probeMirDiffExecBounded\n"),
+        ),
+        None => (None, None),
+    };
+    [
+        stub_block,
+        message_probe_block,
+        callees_block,
+        active_span_block,
+        probe_exec_block,
+        tag_block,
+        probe_block,
+        message_block,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n")
 }
 
 fn create_staging_dir(label: &str) -> Result<PathBuf, String> {
@@ -976,6 +1158,7 @@ fn render_linked_anneal_probe_module(
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
          {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
+         {PANIC_MESSAGE_PROBE_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
          def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
            let raw :=\n    \
@@ -1021,7 +1204,13 @@ fn render_linked_anneal_probe_module(
          def formatProbeLine (name : String) (fuel : Nat) (body : CapturedMir) : String :=\n  \
            let s := initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees\n  \
            let (tag, span) := probeMirDiffExecBounded fuel body (.running s)\n  \
-           s!\"ANNEAL_PROBE\\t{{name}}\\t{{formatTag tag}}\\t{{span}}\"\n\n"
+           let line := s!\"ANNEAL_PROBE\\t{{name}}\\t{{formatTag tag}}\\t{{span}}\"\n  \
+           match tag with\n  \
+           | .panic =>\n    \
+             match probePanicMessageBounded fuel body (.running s) with\n    \
+             | some bytes => line ++ s!\"\\nANNEAL_PANIC_MESSAGE\\t{{name}}\\t{{bytes}}\"\n    \
+             | none => line\n  \
+           | _ => line\n\n"
     ));
     for (item, cand_suffix) in items {
         let escaped_name = escape_lean_string(&item.name);
@@ -1039,10 +1228,15 @@ fn render_linked_anneal_probe_module(
     out
 }
 
+/// Render `MiriOracleConfirm.lean`, which proves by `rfl` each item's
+/// `evalMirDiffTagBounded` tag and `probeMirDiffExecBounded` tag and span, plus
+/// `probePanicMessageBounded` for each panicking item whose panic message the
+/// probe recovered (`anneal_panic_messages`, keyed by item name).
 fn render_linked_anneal_confirm_module(
     crate_camel: &str,
     items: &[(OracleItemSpec, String, AnnealOutcome)],
     helper_module_suffixes: &[String],
+    anneal_panic_messages: &BTreeMap<String, Vec<u8>>,
 ) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
@@ -1074,6 +1268,7 @@ fn render_linked_anneal_confirm_module(
          open Trusted.VerificationResult\n\
          open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
          {FMT_ARGUMENTS_CTOR_STUB_LEAN}\n\
+         {PANIC_MESSAGE_PROBE_LEAN}\n\
          def linkedCallees : List CapturedMir :=\n  {callees_expr}\n\n\
          def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
            let raw :=\n    \
@@ -1140,16 +1335,43 @@ fn render_linked_anneal_confirm_module(
                  ({tag_expr}, \"{escaped_span}\") := by\n  \
                rfl\n\n"
         ));
+        if let (AnnealOutcome::Panic { .. }, Some(message)) =
+            (outcome, anneal_panic_messages.get(name))
+        {
+            let bytes = message
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let decoded = String::from_utf8_lossy(message);
+            out.push_str(&format!(
+                "theorem confirm_message_{name} :\n    \
+                     probePanicMessageBounded {fuel} Mir.{suffix}.body\n      \
+                       (.running (initMachineStateWithMemoryAndCallees Mir.{suffix}.body [] emptyMemory linkedCallees)) =\n      \
+                     some [{bytes}] := by\n  \
+                   -- Anneal's panic message: {decoded:?}\n  \
+                   rfl\n\n"
+            ));
+        }
     }
 
     out.push_str("end MiriOracleConfirm\n");
     Ok(out)
 }
 
+/// Result of [`run_linked_difftest_oracle_pipeline`].
+struct LinkedDifftestOracleRun {
+    /// Per-item oracle outcomes, verdicts, and kernel confirmation status.
+    report: DifftestOracleReport,
+    /// Bytes of each panic message that Anneal's probe recovered, keyed by item
+    /// name.
+    anneal_panic_messages: BTreeMap<String, Vec<u8>>,
+}
+
 fn run_linked_difftest_oracle_pipeline(
     config: &DifftestOracleConfig,
     items: &[OracleItemSpec],
-) -> Result<DifftestOracleReport, String> {
+) -> Result<LinkedDifftestOracleRun, String> {
     let miri_cfg = MiriOracleConfig {
         corpus_root: config.corpus_root.clone(),
         capture_rustflags: config.capture_rustflags.clone(),
@@ -1267,6 +1489,7 @@ fn run_linked_difftest_oracle_pipeline(
     let dot_anneal = corpus_root.join(".anneal");
     let oracle_dir = dot_anneal.join("oracle");
     let lake_bin = resolve_lake_bin();
+    let mut anneal_panic_messages: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
     if !present_items.is_empty() {
         run_lake_build_with_bin(
@@ -1310,6 +1533,7 @@ fn run_linked_difftest_oracle_pipeline(
 
         let stdout = String::from_utf8_lossy(&probe_out.stdout);
         let mut parsed = parse_anneal_probe_output(&stdout)?;
+        anneal_panic_messages = parse_anneal_panic_messages(&stdout)?;
         for (item, _) in &present_items {
             if let Some(outcome) = parsed.remove(&item.name) {
                 anneal_outcomes.insert(item.name.clone(), outcome);
@@ -1349,11 +1573,21 @@ fn run_linked_difftest_oracle_pipeline(
                     spec.name
                 ))
             });
-        let verdict = compare_difftest_miri_and_anneal(&miri, &anneal, &lib_src, &spec.name);
+        let anneal_panic_message = anneal_panic_messages
+            .get(&spec.name)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        let verdict = compare_difftest_miri_and_anneal(
+            &miri,
+            &anneal,
+            anneal_panic_message.as_deref(),
+            &lib_src,
+            &spec.name,
+        );
         // A reconciled panic-macro site agrees only through the panic-site rule
-        // in `compare_difftest_miri_and_anneal`, so its Anneal outcome and span
-        // are confirmed in the kernel, like a divergence's, rather than resting
-        // on the compiled `#eval` probe alone.
+        // in `compare_difftest_miri_and_anneal`, so its Anneal outcome, span,
+        // and recovered message are confirmed in the kernel, like a
+        // divergence's, rather than resting on the compiled `#eval` probe
+        // alone.
         let reconciled_panic_site =
             verdict.is_agree() && !compare_miri_and_anneal(&miri, &anneal).is_agree();
         let should_confirm = (verdict.is_diverge() || reconciled_panic_site)
@@ -1390,6 +1624,7 @@ fn run_linked_difftest_oracle_pipeline(
             &crate_camel,
             &to_confirm,
             &helper_module_suffixes,
+            &anneal_panic_messages,
         )?;
         fs::write(&confirm_path, &confirm_src)
             .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
@@ -1421,13 +1656,16 @@ fn run_linked_difftest_oracle_pipeline(
         Some(confirm_path)
     };
 
-    Ok(DifftestOracleReport {
-        crate_camel,
-        items: reports,
-        agree_count,
-        diverge_count,
-        not_compared_count,
-        confirm_module_path,
+    Ok(LinkedDifftestOracleRun {
+        report: DifftestOracleReport {
+            crate_camel,
+            items: reports,
+            agree_count,
+            diverge_count,
+            not_compared_count,
+            confirm_module_path,
+        },
+        anneal_panic_messages,
     })
 }
 
@@ -1630,8 +1868,11 @@ pub fn evaluate_miri_batches(
         toolchain,
     };
 
-    let oracle_report = match run_linked_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
-        Ok(rep) => rep,
+    let LinkedDifftestOracleRun {
+        report: oracle_report,
+        anneal_panic_messages,
+    } = match run_linked_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
+        Ok(run) => run,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging_dir);
             return Err(e);
@@ -1645,6 +1886,7 @@ pub fn evaluate_miri_batches(
         .unwrap_or_default();
 
     let mut findings = Vec::new();
+    let mut reconciled_panic_sites = Vec::new();
     let mut kernel_confirmed_divergences = 0usize;
     let mut obs_path_signatures_set = std::collections::BTreeSet::new();
 
@@ -1734,7 +1976,33 @@ pub fn evaluate_miri_batches(
         }
 
         match &item_rep.verdict {
-            ComparisonVerdict::Agree => {}
+            ComparisonVerdict::Agree => {
+                if !compare_miri_and_anneal(&item_rep.miri, &item_rep.anneal).is_agree() {
+                    let batch_miri_pos = match &item_rep.miri {
+                        MiriOutcome::Panic { pos, .. } => {
+                            pos.as_ref().map(SourcePos::display_short)
+                        }
+                        _ => None,
+                    };
+                    reconciled_panic_sites.push(MiriReconciledPanicSite {
+                        fn_name: item_rep.name.clone(),
+                        seed_name: cand_by_name
+                            .get(&item_rep.name)
+                            .map(|(cand, _)| cand.seed_name.clone())
+                            .unwrap_or_default(),
+                        batch_miri_pos,
+                        anneal_span: item_rep.anneal.span().map(SourceSpan::display_short),
+                        anneal_panic_message: anneal_panic_messages
+                            .get(&item_rep.name)
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+                        kernel_confirmed: item_rep.kernel_confirmed,
+                        kernel_confirm_theorems: extract_confirm_theorems(
+                            &confirm_src,
+                            &item_rep.name,
+                        ),
+                    });
+                }
+            }
             ComparisonVerdict::NotCompared(reason) => match reason {
                 NotComparedReason::ExternalCall(callee) => {
                     *not_compared_reasons
@@ -1901,6 +2169,7 @@ pub fn evaluate_miri_batches(
         unmodeled_external_calls,
         mutator_applications,
         findings,
+        reconciled_panic_sites,
         obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
         item_reports: oracle_report.items,
         elapsed_ms,
@@ -1947,7 +2216,7 @@ pub fn reproduce_miri_finding(
 
     let res = run_linked_difftest_oracle_pipeline(&cfg, &specs);
     let _ = fs::remove_dir_all(&staging_dir);
-    let mut report = res?;
+    let mut report = res?.report;
     report
         .items
         .drain(..)
@@ -2076,6 +2345,16 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
             .collect();
         format!("[\n{}\n  ]", items.join(",\n"))
     };
+    let reconciled_json = if report.reconciled_panic_sites.is_empty() {
+        "[]".to_string()
+    } else {
+        let items: Vec<String> = report
+            .reconciled_panic_sites
+            .iter()
+            .map(|site| render_reconciled_panic_site_json(site, 4))
+            .collect();
+        format!("[\n{}\n  ]", items.join(",\n"))
+    };
 
     format!(
         "{{\n\
@@ -2103,6 +2382,8 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
          \x20 \"obs_path_signatures\": {},\n\
          \x20 \"findings_count\": {},\n\
          \x20 \"findings\": {findings_json},\n\
+         \x20 \"reconciled_panic_sites_count\": {},\n\
+         \x20 \"reconciled_panic_sites\": {reconciled_json},\n\
          \x20 \"elapsed_ms\": {:.2}\n\
          }}\n",
         json_escape(&report.mode),
@@ -2126,7 +2407,31 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
         render_usize_map_json(&report.mutator_applications, 2),
         render_string_list_json(&report.obs_path_signatures, 2),
         report.findings.len(),
+        report.reconciled_panic_sites.len(),
         report.elapsed_ms,
+    )
+}
+
+/// Render a [`MiriReconciledPanicSite`] as a JSON object, omitting its
+/// kernel-checked theorem snippet.
+fn render_reconciled_panic_site_json(site: &MiriReconciledPanicSite, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let inner = " ".repeat(indent + 2);
+    format!(
+        "{pad}{{\n\
+         {inner}\"fn_name\": {},\n\
+         {inner}\"seed_name\": {},\n\
+         {inner}\"batch_miri_pos\": {},\n\
+         {inner}\"anneal_span\": {},\n\
+         {inner}\"anneal_panic_message\": {},\n\
+         {inner}\"kernel_confirmed\": {}\n\
+         {pad}}}",
+        json_escape(&site.fn_name),
+        json_escape(&site.seed_name),
+        render_opt_str_json(&site.batch_miri_pos),
+        render_opt_str_json(&site.anneal_span),
+        render_opt_str_json(&site.anneal_panic_message),
+        site.kernel_confirmed,
     )
 }
 
@@ -2154,6 +2459,10 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
         report.diverge_count,
         report.kernel_confirmed_divergences,
         report.not_compared_count
+    ));
+    out.push_str(&format!(
+        "- **Reconciled panic-macro sites** (counted in **Agree**): `{}`\n",
+        report.reconciled_panic_sites.len()
     ));
     out.push_str(&format!(
         "- **Wall-clock time**: `{:.2} ms`\n\n",
@@ -2196,6 +2505,25 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
     out.push_str("| Mutator | Applications |\n| :--- | ---: |\n");
     for (name, count) in &report.mutator_applications {
         out.push_str(&format!("| `{name}` | {count} |\n"));
+    }
+
+    if !report.reconciled_panic_sites.is_empty() {
+        out.push_str("\n## Reconciled Panic-Macro Sites\n\n");
+        out.push_str("| Function | Miri Position | Anneal Span | Anneal Panic Message | Kernel Confirmed |\n");
+        out.push_str("| :--- | :--- | :--- | :--- | :--- |\n");
+        for site in &report.reconciled_panic_sites {
+            out.push_str(&format!(
+                "| `{}` | `{}` | `{}` | {} | `{}` |\n",
+                site.fn_name,
+                site.batch_miri_pos.as_deref().unwrap_or("none"),
+                site.anneal_span.as_deref().unwrap_or("none"),
+                site.anneal_panic_message
+                    .as_deref()
+                    .map(|m| format!("{m:?}").replace('`', "'").replace('|', "\\|"))
+                    .unwrap_or_else(|| "none".to_string()),
+                site.kernel_confirmed
+            ));
+        }
     }
 
     if !report.findings.is_empty() {
@@ -2267,6 +2595,7 @@ mod tests {
     #[test]
     fn linked_probe_and_confirm_modules_wire_callees_and_extract_confirm_theorems() {
         let spec = OracleItemSpec::with_fuel("cand_call_helper", 256);
+        let panic_spec = OracleItemSpec::with_fuel("cand_panic_msg", 256);
         let helpers = vec!["MiriDiffCorpus.helper_add_ten".to_string()];
 
         let probe_src = render_linked_anneal_probe_module(
@@ -2287,43 +2616,184 @@ mod tests {
              fmtArgumentsCtorStub \"core::fmt::Arguments::<'_>::new_const\"]\n"
         ));
         assert!(probe_src.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN));
+        assert!(probe_src.contains(PANIC_MESSAGE_PROBE_LEAN));
         assert!(probe_src.contains("phase := MirPhaseTag.runtimePostCleanup"));
+        assert!(
+            probe_src
+                .contains("initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees")
+        );
+        // The probe prints the recovered message of a panicking item on its own
+        // line, in the format `parse_anneal_panic_messages` reads.
         assert!(probe_src.contains(
-            "initMachineStateWithMemoryAndCallees body [] emptyMemory linkedCallees"
+            "  match tag with\n  \
+             | .panic =>\n    \
+             match probePanicMessageBounded fuel body (.running s) with\n    \
+             | some bytes => line ++ s!\"\\nANNEAL_PANIC_MESSAGE\\t{name}\\t{bytes}\"\n    \
+             | none => line\n  \
+             | _ => line\n"
         ));
+        assert_eq!(ANNEAL_PANIC_MESSAGE_PREFIX, "ANNEAL_PANIC_MESSAGE\t");
 
+        let messages = BTreeMap::from([
+            ("cand_panic_msg".to_string(), b"hi \"there\"".to_vec()),
+            // A message recorded for an item whose outcome is not a panic must
+            // not produce a theorem.
+            ("cand_call_helper".to_string(), b"unused".to_vec()),
+        ]);
         let confirm_src = render_linked_anneal_confirm_module(
             "MiriDiffCorpus",
-            &[(
-                spec,
-                "MiriDiffCorpus.cand_call_helper".to_string(),
-                AnnealOutcome::PassScalar {
-                    bits: 42,
-                    size_bytes: 4,
-                },
-            )],
+            &[
+                (
+                    spec,
+                    "MiriDiffCorpus.cand_call_helper".to_string(),
+                    AnnealOutcome::PassScalar {
+                        bits: 42,
+                        size_bytes: 4,
+                    },
+                ),
+                (
+                    panic_spec,
+                    "MiriDiffCorpus.cand_panic_msg".to_string(),
+                    AnnealOutcome::Panic {
+                        span: Some(SourceSpan {
+                            file: "/rustlib/src/rust/library/core/src/panic.rs".to_string(),
+                            start_line: 62,
+                            start_col: 9,
+                            end_line: 62,
+                            end_col: 73,
+                        }),
+                    },
+                ),
+            ],
             &helpers,
+            &messages,
         )
         .expect("render confirm module");
         assert!(confirm_src.contains("import Mir.MiriDiffCorpus.helper_add_ten\n"));
+        assert!(confirm_src.contains(PANIC_MESSAGE_PROBE_LEAN));
         assert!(confirm_src.contains(
             "initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.cand_call_helper.body [] emptyMemory linkedCallees"
         ));
+        assert!(!confirm_src.contains("theorem confirm_message_cand_call_helper :"));
+        assert!(confirm_src.contains(
+            "theorem confirm_message_cand_panic_msg :\n    \
+             probePanicMessageBounded 256 Mir.MiriDiffCorpus.cand_panic_msg.body\n      \
+             (.running (initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.cand_panic_msg.body [] emptyMemory linkedCallees)) =\n      \
+             some [104, 105, 32, 34, 116, 104, 101, 114, 101, 34] := by\n  \
+             -- Anneal's panic message: \"hi \\\"there\\\"\"\n  \
+             rfl\n"
+        ));
+
         let extracted = extract_confirm_theorems(&confirm_src, "cand_call_helper");
         assert!(extracted.contains("def linkedCallees : List CapturedMir :="));
         assert!(extracted.contains("theorem confirm_tag_cand_call_helper :"));
         assert!(extracted.contains("theorem confirm_probe_cand_call_helper :"));
         assert!(extracted.contains(":= by\n  rfl"));
-        // `linkedCallees` names the synthetic stub, so the snippet must carry the
-        // stub's definition ahead of it.
-        let stub_at = extracted
-            .find("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=")
-            .expect("snippet must define fmtArgumentsCtorStub");
-        let callees_at = extracted
-            .find("def linkedCallees : List CapturedMir :=")
-            .expect("snippet must define linkedCallees");
-        assert!(stub_at < callees_at);
+        assert!(!extracted.contains("theorem confirm_tag_cand_panic_msg :"));
+        // Without a message theorem the snippet needs no message probe.
+        assert!(!extracted.contains("def probePanicMessageBounded"));
+        // `linkedCallees` names the synthetic stub and `confirm_probe_*` calls
+        // `probeMirDiffExecBounded`, so the snippet carries both definitions
+        // (and `activeSpan`) ahead of the theorems.
+        let order = |snippet: &str, needles: &[&str]| {
+            let positions: Vec<usize> = needles
+                .iter()
+                .map(|n| {
+                    snippet
+                        .find(n)
+                        .unwrap_or_else(|| panic!("snippet must contain {n:?}:\n{snippet}"))
+                })
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "out of order: {needles:?}\n{snippet}"
+            );
+        };
+        order(
+            &extracted,
+            &[
+                "def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=",
+                "def linkedCallees : List CapturedMir :=",
+                "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",
+                "def probeMirDiffExecBounded\n",
+                "theorem confirm_tag_cand_call_helper :",
+                "theorem confirm_probe_cand_call_helper :",
+            ],
+        );
         assert!(extracted.contains(FMT_ARGUMENTS_CTOR_STUB_LEAN.trim()));
+
+        let extracted_panic = extract_confirm_theorems(&confirm_src, "cand_panic_msg");
+        order(
+            &extracted_panic,
+            &[
+                "def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=",
+                "def panicMessageOfSlice? (cur : CapturedMir)",
+                "def probePanicMessageBounded\n",
+                "def linkedCallees : List CapturedMir :=",
+                "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",
+                "def probeMirDiffExecBounded\n",
+                "theorem confirm_tag_cand_panic_msg :",
+                "theorem confirm_probe_cand_panic_msg :",
+                "theorem confirm_message_cand_panic_msg :",
+            ],
+        );
+        assert!(extracted_panic.contains(PANIC_MESSAGE_PROBE_LEAN.trim()));
+        assert!(!extracted_panic.contains("theorem confirm_tag_cand_call_helper :"));
+    }
+
+    #[test]
+    fn fmt_arguments_ctor_stub_returns_its_message_slice() {
+        // The stub's `_0` and `_1` are both `&'static str`, and its only
+        // statement copies the argument into the return place.
+        assert_eq!(
+            FMT_ARGUMENTS_CTOR_STUB_LEAN
+                .matches("ty := { kind := RigidTy.ref Mutability.not RigidTy.str, layoutIdx := 0 }")
+                .count(),
+            2
+        );
+        assert!(FMT_ARGUMENTS_CTOR_STUB_LEAN.contains(
+            "StatementKind.assign { local_ := 0, projection := [] }\n                \
+             (Rvalue.use (Operand.copy { local_ := 1, projection := [] }))"
+        ));
+        assert_eq!(
+            FMT_ARGUMENTS_CTOR_STUB_LEAN
+                .matches("StatementKind.")
+                .count(),
+            1
+        );
+        assert!(FMT_ARGUMENTS_CTOR_STUB_LEAN.contains("TerminatorKind.return_"));
+        // Both blocks are copied verbatim into finding bundles, which split
+        // `MiriOracleConfirm.lean` into blocks at blank lines.
+        for block in [FMT_ARGUMENTS_CTOR_STUB_LEAN, PANIC_MESSAGE_PROBE_LEAN] {
+            assert!(!block.trim().contains("\n\n"), "{block}");
+        }
+    }
+
+    #[test]
+    fn parse_anneal_panic_messages_reads_byte_lists() {
+        let stdout = "\
+ANNEAL_PROBE\tcand_a\tpanic\t/rustlib/src/rust/library/core/src/panic.rs:62:9: 62:73\n\
+ANNEAL_PANIC_MESSAGE\tcand_a\t[104, 105]\n\
+ANNEAL_PROBE\tcand_b\tpass:unit\tnone\n\
+ANNEAL_PROBE\tcand_c\tpanic\t/rustlib/src/rust/library/core/src/panic.rs:62:9: 62:73\n\
+ANNEAL_PANIC_MESSAGE\tcand_c\t[]\r\n";
+        let messages = parse_anneal_panic_messages(stdout).expect("parse messages");
+        assert_eq!(
+            messages,
+            BTreeMap::from([
+                ("cand_a".to_string(), b"hi".to_vec()),
+                ("cand_c".to_string(), Vec::new()),
+            ])
+        );
+        for bad in [
+            "ANNEAL_PANIC_MESSAGE\tcand_a\n",
+            "ANNEAL_PANIC_MESSAGE\tcand_a\t104, 105\n",
+            "ANNEAL_PANIC_MESSAGE\tcand_a\t[104, 256]\n",
+            "ANNEAL_PANIC_MESSAGE\tcand_a\t[104,, 105]\n",
+            "ANNEAL_PANIC_MESSAGE\tcand_a\t[1]\nANNEAL_PANIC_MESSAGE\tcand_a\t[2]\n",
+        ] {
+            assert!(parse_anneal_panic_messages(bad).is_err(), "{bad:?}");
+        }
     }
 
     fn lib_with_candidates() -> String {
@@ -2406,7 +2876,7 @@ pub fn cand_plain__b0_c2() -> u32 {
                 ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
             ));
             assert_eq!(
-                compare_difftest_miri_and_anneal(&miri, &anneal, &src, name),
+                compare_difftest_miri_and_anneal(&miri, &anneal, None, &src, name),
                 ComparisonVerdict::Agree,
                 "{name} at {line}:{col}"
             );
@@ -2414,7 +2884,7 @@ pub fn cand_plain__b0_c2() -> u32 {
 
         let mismatch = |miri: &MiriOutcome, anneal: &AnnealOutcome, name: &str| {
             matches!(
-                compare_difftest_miri_and_anneal(miri, anneal, &src, name),
+                compare_difftest_miri_and_anneal(miri, anneal, None, &src, name),
                 ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
             )
         };
@@ -2480,7 +2950,7 @@ pub fn cand_plain__b0_c2() -> u32 {
             }),
         };
         assert!(matches!(
-            compare_difftest_miri_and_anneal(&panic_at(3, 5), &ub, &src, "cand_panic__b0_c0"),
+            compare_difftest_miri_and_anneal(&panic_at(3, 5), &ub, None, &src, "cand_panic__b0_c0"),
             ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
         ));
 
@@ -2506,6 +2976,7 @@ pub fn cand_spoof__b0_c0() -> u32 {
             compare_difftest_miri_and_anneal(
                 &panic_at(4, 5),
                 &anneal_panic_in(std_panic, 62),
+                None,
                 &spoofed_src,
                 "cand_spoof__b0_c0"
             ),
@@ -2515,6 +2986,7 @@ pub fn cand_spoof__b0_c0() -> u32 {
             compare_difftest_miri_and_anneal(
                 &panic_at(7, 5),
                 &anneal_panic_in(std_panic, 62),
+                None,
                 &spoofed_src,
                 "cand_spoof__b0_c0"
             ),
@@ -2524,8 +2996,100 @@ pub fn cand_spoof__b0_c0() -> u32 {
             compare_difftest_miri_and_anneal(
                 &panic_at(10, 8),
                 &anneal_panic_in(std_panic, 62),
+                None,
                 &spoofed_src,
                 "cand_spoof__b0_c0"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn compare_difftest_requires_recovered_panic_message_to_match_miri() {
+        let src = StagedLibSource::parse(&lib_with_candidates());
+        let std_panic = "/rustlib/src/rust/library/core/src/panic.rs";
+        let anneal = anneal_panic_in(std_panic, 62);
+        // `cand_assert__b0_c1` has two panic-macro call sites; Miri reports the
+        // second one (`core::assert_eq!` on line 9) with its message.
+        let miri = MiriOutcome::Panic {
+            pos: Some(SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: 9,
+                col: 5,
+            }),
+            message: "x must equal nine".to_string(),
+        };
+        let verdict = |message: Option<&str>| {
+            compare_difftest_miri_and_anneal(&miri, &anneal, message, &src, "cand_assert__b0_c1")
+        };
+
+        // No recovered message: the site conditions alone decide.
+        assert_eq!(verdict(None), ComparisonVerdict::Agree);
+        // A recovered message must match Miri's first message line, ignoring
+        // surrounding whitespace and any later lines.
+        assert_eq!(verdict(Some("x must equal nine")), ComparisonVerdict::Agree);
+        assert_eq!(
+            verdict(Some("  x must equal nine \n")),
+            ComparisonVerdict::Agree
+        );
+        assert_eq!(
+            verdict(Some("x must equal nine\nsecond line")),
+            ComparisonVerdict::Agree
+        );
+        // Anneal panicking with the first site's message is a different panic
+        // than Miri's, even though both sites share the macro's span.
+        for message in ["x must equal eight", "", "second line\nx must equal nine"] {
+            assert!(
+                matches!(
+                    verdict(Some(message)),
+                    ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+                ),
+                "{message:?}"
+            );
+        }
+
+        // An empty Miri message matches only an empty first line.
+        let miri_empty = panic_at(3, 5);
+        assert_eq!(
+            compare_difftest_miri_and_anneal(
+                &miri_empty,
+                &anneal,
+                Some("\nlater"),
+                &src,
+                "cand_panic__b0_c0"
+            ),
+            ComparisonVerdict::Agree
+        );
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &miri_empty,
+                &anneal,
+                Some("boom"),
+                &src,
+                "cand_panic__b0_c0"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+
+        // A matching message never rescues a site that fails the other
+        // conditions.
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &miri,
+                &anneal_panic_in("src/lib.rs", 9),
+                Some("x must equal nine"),
+                &src,
+                "cand_assert__b0_c1"
+            ),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        assert!(matches!(
+            compare_difftest_miri_and_anneal(
+                &miri,
+                &anneal,
+                Some("x must equal nine"),
+                &src,
+                "cand_panic__b0_c0"
             ),
             ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
         ));

@@ -98,6 +98,10 @@ fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     assert!(!stdout.contains("`core::intrinsics::exact_div`"));
     assert!(!stdout.contains("miri_diff_corpus::helper_add_ten"));
     assert!(!stdout.contains("core::fmt::Arguments"));
+    assert!(stdout.contains("- **Reconciled panic-macro sites** (counted in **Agree**): `1`"));
+    assert!(stdout.contains("## Reconciled Panic-Macro Sites"));
+    assert!(stdout.contains("| `panic_explicit_macro` |"));
+    assert!(stdout.contains("| \"explicit panic in corpus\" | `true` |"));
 
     let verify = Command::new("python3")
         .arg("-c")
@@ -177,6 +181,24 @@ findings = data["findings"]
 assert len(findings) == 0
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
+
+# `panic_explicit_macro` is the only identity candidate whose agreement rests on
+# the panic-macro reconciliation, and Anneal's recovered panic message matched
+# the message that Miri printed.
+assert data["reconciled_panic_sites_count"] == 1, data["reconciled_panic_sites"]
+assert data["reconciled_panic_sites"] == [
+    {
+        "fn_name": "panic_explicit_macro",
+        "seed_name": "panic_explicit_macro",
+        "batch_miri_pos": data["reconciled_panic_sites"][0]["batch_miri_pos"],
+        "anneal_span": data["reconciled_panic_sites"][0]["anneal_span"],
+        "anneal_panic_message": "explicit panic in corpus",
+        "kernel_confirmed": True,
+    }
+], data["reconciled_panic_sites"]
+site = data["reconciled_panic_sites"][0]
+assert site["batch_miri_pos"].startswith("src/lib.rs:"), site
+assert "/library/core/src/panic.rs:" in site["anneal_span"], site
 "#,
         )
         .arg(&json_path)
@@ -676,6 +698,30 @@ pub fn unreachable_fmt_macro__b0_c2() -> u32 {
     x
 }
 ";
+    // `todo!()` passes its message to `core::panicking::panic` as a constant,
+    // and `assert_eq!` panics through `core::panicking::assert_failed`, which
+    // formats its message at run time; both expansions come from
+    // `library/core/src/macros/mod.rs`. Both `assert_eq!` operands are locals:
+    // a literal operand would be compared through a reference to a promoted
+    // constant, which Anneal currently reads incorrectly (a separate
+    // `panic_vs_return` divergence that this test does not cover).
+    let todo_fn = "\
+pub fn todo_macro__b0_c4() -> u32 {
+    let x: u32 = 2u32;
+    if x == 2u32 {
+        todo!();
+    }
+    x
+}
+";
+    let assert_eq_fn = "\
+pub fn assert_eq_macro__b0_c5() -> u32 {
+    let x: u32 = 4u32;
+    let y: u32 = 5u32;
+    assert_eq!(x, y);
+    x
+}
+";
     // A genuine non-macro panic-site mismatch: the overflowing `+` panics inside
     // a `#[track_caller]` helper. Miri reports the helper's call site in the
     // candidate; Anneal reports the overflow `assert` terminator inside the
@@ -722,6 +768,20 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "ArithmeticCastMutator",
             track_caller_fn,
         ),
+        handwritten_candidate(
+            4,
+            "panic_explicit_macro",
+            "todo_macro__b0_c4",
+            "ArithmeticCastMutator",
+            todo_fn,
+        ),
+        handwritten_candidate(
+            5,
+            "panic_explicit_macro",
+            "assert_eq_macro__b0_c5",
+            "ArithmeticCastMutator",
+            assert_eq_fn,
+        ),
     ];
 
     let findings_dir = dir.join("findings_panic_fmt");
@@ -729,16 +789,16 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        4,
+        6,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 4);
-    assert_eq!(report.compiled_candidates, 4);
-    assert_eq!(report.compared_candidates, 4);
-    assert_eq!(report.agree_count, 3);
+    assert_eq!(report.total_candidates, 6);
+    assert_eq!(report.compiled_candidates, 6);
+    assert_eq!(report.compared_candidates, 6);
+    assert_eq!(report.agree_count, 5);
     assert_eq!(report.diverge_count, 1);
     assert_eq!(report.not_compared_count, 0);
     assert_eq!(report.kernel_confirmed_divergences, 1);
@@ -753,17 +813,51 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(4));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(4));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(6));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(6));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
-    // `library/core/src/panic.rs` under Anneal. The strict comparator reports a
-    // panic-site mismatch, and the difftest comparator reconciles it.
-    for name in [
-        "panic_fmt_macro__b0_c0",
-        "assert_fmt_macro__b0_c1",
-        "unreachable_fmt_macro__b0_c2",
-    ] {
+    // the macro's standard-library definition under Anneal. The strict
+    // comparator reports a panic-site mismatch, and the difftest comparator
+    // reconciles it. Where Anneal's run recovers the panic message, it matches
+    // Miri's.
+    let macro_candidates = [
+        (
+            "panic_fmt_macro__b0_c0",
+            "/library/core/src/panic.rs",
+            Some("panic! message from a mutated candidate"),
+        ),
+        (
+            "assert_fmt_macro__b0_c1",
+            "/library/core/src/panic.rs",
+            Some("x must equal eight"),
+        ),
+        (
+            "unreachable_fmt_macro__b0_c2",
+            "/library/core/src/panic.rs",
+            Some(
+                "internal error: entered unreachable code: \
+                 unreachable! message via from_str_nonconst",
+            ),
+        ),
+        (
+            "todo_macro__b0_c4",
+            "/library/core/src/macros/mod.rs",
+            Some("not yet implemented"),
+        ),
+        (
+            "assert_eq_macro__b0_c5",
+            "/library/core/src/macros/mod.rs",
+            None,
+        ),
+    ];
+    assert_eq!(
+        report.reconciled_panic_sites.len(),
+        macro_candidates.len(),
+        "unexpected reconciled sites: {:?}",
+        report.reconciled_panic_sites
+    );
+    for (name, anneal_file_suffix, anneal_message) in macro_candidates {
         let item = report
             .item_reports
             .iter()
@@ -771,7 +865,7 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             .unwrap_or_else(|| panic!("missing item report for {name}"));
         let MiriOutcome::Panic {
             pos: Some(miri_pos),
-            ..
+            message: miri_message,
         } = &item.miri
         else {
             panic!(
@@ -790,7 +884,7 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             );
         };
         assert!(
-            anneal_span.file.ends_with("/library/core/src/panic.rs"),
+            anneal_span.file.ends_with(anneal_file_suffix),
             "{name}: unexpected Anneal panic span {anneal_span:?}"
         );
         assert!(
@@ -801,10 +895,55 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "{name}: strict comparison must report the macro panic-site difference"
         );
         assert_eq!(item.verdict, ComparisonVerdict::Agree, "{name}");
-        // The reconciled outcome rests on a kernel-checked `by rfl` theorem
+        // The reconciled outcome rests on kernel-checked `by rfl` theorems
         // evaluated with the linked `fmtArgumentsCtorStub` callees.
         assert!(item.kernel_confirmed, "{name}");
+
+        let site = report
+            .reconciled_panic_sites
+            .iter()
+            .find(|s| s.fn_name == name)
+            .unwrap_or_else(|| panic!("{name} must be listed as a reconciled site"));
+        assert_eq!(site.seed_name, "panic_explicit_macro", "{name}");
+        assert!(site.kernel_confirmed, "{name}");
+        assert_eq!(
+            site.anneal_panic_message.as_deref(),
+            anneal_message,
+            "{name}: unexpected recovered Anneal panic message"
+        );
+        if let Some(message) = anneal_message {
+            assert_eq!(miri_message, message, "{name}");
+        }
+        for theorem in ["confirm_tag", "confirm_probe"] {
+            assert!(
+                site.kernel_confirm_theorems
+                    .contains(&format!("theorem {theorem}_{name} :")),
+                "{name}: missing {theorem}:\n{}",
+                site.kernel_confirm_theorems
+            );
+        }
+        // The recovered message is itself kernel-checked, and the snippet
+        // carries the message probe that the theorem evaluates.
+        assert_eq!(
+            site.kernel_confirm_theorems
+                .contains(&format!("theorem confirm_message_{name} :")),
+            anneal_message.is_some(),
+            "{name}:\n{}",
+            site.kernel_confirm_theorems
+        );
+        assert_eq!(
+            site.kernel_confirm_theorems
+                .contains("def probePanicMessageBounded"),
+            anneal_message.is_some(),
+            "{name}"
+        );
     }
+    assert!(
+        report
+            .reconciled_panic_sites
+            .iter()
+            .all(|s| s.fn_name != "neg_ctrl_track_caller_overflow__b0_c3")
+    );
 
     // (b) The non-macro mismatch stays a kernel-confirmed divergence.
     let neg = report
@@ -851,10 +990,24 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
     );
     assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
     // The snippet is self-contained: `linkedCallees` names the synthetic
-    // `core::fmt::Arguments` stub, so its definition is included.
+    // `core::fmt::Arguments` stub, and `confirm_probe_*` evaluates
+    // `probeMirDiffExecBounded`, so their definitions are included. The overflow
+    // panic carries no recoverable message, so no message theorem is emitted.
     assert!(
         f.kernel_confirm_theorems
             .contains("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def activeSpan (body : CapturedMir) (st : MirExecState) : String :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def probeMirDiffExecBounded\n")
+    );
+    assert!(
+        !f.kernel_confirm_theorems
+            .contains("theorem confirm_message_neg_ctrl_track_caller_overflow__b0_c3 :")
     );
     assert!(
         f.kernel_confirm_theorems
