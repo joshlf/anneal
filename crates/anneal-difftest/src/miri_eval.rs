@@ -150,67 +150,130 @@ def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=\n  \
     allocations := [] }\n";
 
 /// Lean definitions that recover the message of the panic that ends a bounded
-/// Anneal run: `panicMessageOfSlice?`, `panicMessage?`, and
-/// `probePanicMessageBounded`.
+/// Anneal run: `panicMessageOfSlice?`, `panicOperandVal?`,
+/// `assertFailedPrefix?`, `formatAssertFailedMessage?`, `panicMessage?`,
+/// `probePanicMessageBoundedAux`, and `probePanicMessageBounded`.
 ///
 /// `probePanicMessageBounded` steps the machine exactly as
-/// `probeMirDiffExecBounded` does. When a step panics, `panicMessage?`
-/// inspects the terminator that raised the panic. A call to
-/// `core::panicking::panic` passes the message as a `&'static str` operand,
-/// and a call to `core::panicking::panic_fmt` passes the message slice that
-/// [`FMT_ARGUMENTS_CTOR_STUB_LEAN`] returned; in both cases the message bytes
-/// are read from the panicking body's captured allocations. Every other panic
-/// has no recoverable message and yields `none`: an overflow or bounds-check
-/// `assert` terminator, or a call such as `core::panicking::assert_failed`
-/// that formats its message at run time.
+/// `probeMirDiffExecBounded` does, threading the latest recovered panic message
+/// across `.tau` and `.vis` transitions so unwinding through `.cleanup` blocks
+/// (`TerminatorKind.resume`) preserves the message. When a step invokes an
+/// unwinding panic terminator, `panicMessage?` inspects the call:
+/// - `core::panicking::{panic,panic_str_2015}` pass the message as a `&str`
+///   operand, and `core::panicking::{panic_fmt,const_panic_fmt}` pass the
+///   message slice that [`FMT_ARGUMENTS_CTOR_STUB_LEAN`] returned; in both
+///   cases `panicOperandVal?` evaluates the operand via `evalOperand` against
+///   the active body's and caller's allocations (`cur.allocations ++
+///   s.memory.globals`) and `panicMessageOfSlice?` reads the slice bytes.
+/// - `core::panicking::panic_explicit` (0 args) yields `"explicit panic"`.
+/// - `core::panicking::{assert_failed,assert_matches_failed}` yield the first
+///   line formatted by `assert_failed_inner` (`"assertion `left <op> right`
+///   failed"`, plus `": <custom>"` when the `Option<Arguments<'_>>` operand is
+///   `Some(slice)`).
 ///
 /// The block contains no blank line, so finding bundles can copy it verbatim
 /// from `MiriOracleConfirm.lean`.
 const PANIC_MESSAGE_PROBE_LEAN: &str = "\
--- Recover the message of the panic that ends a bounded run: the `&'static str`\n\
--- operand of a call to `core::panicking::panic`, or the message slice that\n\
--- `fmtArgumentsCtorStub` returned and the caller passed to\n\
--- `core::panicking::panic_fmt`, read from the panicking body's captured\n\
--- allocations. Any other panic has no recoverable message.\n\
-def panicMessageOfSlice? (cur : CapturedMir) : Value → Option (List UInt8)\n  \
+-- Recover the message of the panic that ends a bounded run: the `&str` or\n\
+-- `fmtArgumentsCtorStub` slice passed to `core::panicking::{panic,panic_fmt,\n\
+-- panic_str_2015,const_panic_fmt}`, `\"explicit panic\"` for\n\
+-- `core::panicking::panic_explicit`, or the first line formatted by\n\
+-- `core::panicking::{assert_failed,assert_matches_failed}`, threaded across\n\
+-- `.tau` cleanup steps.\n\
+def panicMessageOfSlice? (allocs : List CapturedAllocation) : Value → Option (List UInt8)\n  \
   | .aggregate 0 [.ptr p _, .scalar len] =>\n    \
-    match cur.allocations.find? (fun a => a.allocId == p.allocId) with\n    \
+    match allocs.find? (fun a => a.allocId == p.allocId) with\n    \
     | some alloc =>\n      \
       let window := (alloc.bytes.drop p.offsetBytes).take len.bits\n      \
       if window.length == len.bits then window.mapM id else none\n    \
+    | none => none\n  \
+  | _ => none\n\
+def panicOperandVal? (cur : CapturedMir) (s : MachineState) (op : Operand) : Option Value :=\n  \
+  match\n    \
+    evalOperand\n      \
+      s.frame.locals\n      \
+      op\n      \
+      s.memory.borrows\n      \
+      (cur.allocations ++ s.memory.globals)\n      \
+      cur.layouts\n      \
+      s.memory.callerLocals\n      \
+      cur.localDecls\n  \
+  with\n  \
+  | .ok v _ => some v\n  \
+  | _ => none\n\
+def assertFailedPrefix? : Value → Option (List UInt8)\n  \
+  | .aggregate 0 _ | .scalar ⟨0, _⟩ =>\n    \
+    some [97, 115, 115, 101, 114, 116, 105, 111, 110, 32, 96, 108, 101, 102, 116, 32, 61, 61, 32, 114, 105, 103, 104, 116, 96, 32, 102, 97, 105, 108, 101, 100]\n  \
+  | .aggregate 1 _ | .scalar ⟨1, _⟩ =>\n    \
+    some [97, 115, 115, 101, 114, 116, 105, 111, 110, 32, 96, 108, 101, 102, 116, 32, 33, 61, 32, 114, 105, 103, 104, 116, 96, 32, 102, 97, 105, 108, 101, 100]\n  \
+  | .aggregate 2 _ | .scalar ⟨2, _⟩ =>\n    \
+    some [97, 115, 115, 101, 114, 116, 105, 111, 110, 32, 96, 108, 101, 102, 116, 32, 109, 97, 116, 99, 104, 101, 115, 32, 114, 105, 103, 104, 116, 96, 32, 102, 97, 105, 108, 101, 100]\n  \
+  | _ => none\n\
+def formatAssertFailedMessage?\n    \
+    (cur : CapturedMir) (s : MachineState) (pfx : List UInt8) (argsOp : Operand) :\n    \
+    Option (List UInt8) :=\n  \
+  let allocs := cur.allocations ++ s.memory.globals\n  \
+  match panicOperandVal? cur s argsOp with\n  \
+  | some (.aggregate 0 _) | some .unit | some (.scalar ⟨0, _⟩) => some pfx\n  \
+  | some (.aggregate 1 [v]) =>\n    \
+    match panicMessageOfSlice? allocs v with\n    \
+    | some custom => some (pfx ++ [58, 32] ++ custom)\n    \
     | none => none\n  \
   | _ => none\n\
 def panicMessage? (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
   match st with\n  \
   | .running s =>\n    \
     let cur := s.memory.activeCallee.getD body\n    \
+    let allocs := cur.allocations ++ s.memory.globals\n    \
     match get? cur.basicBlocks s.frame.blockIdx with\n    \
     | some bb =>\n      \
       match get? bb.statements s.frame.stmtIdx, bb.terminator.kind with\n      \
+      | none, .call func [] _ _ _ =>\n        \
+        match extractCalleeDefPath? func with\n        \
+        | some \"core::panicking::panic_explicit\" =>\n          \
+          some [101, 120, 112, 108, 105, 99, 105, 116, 32, 112, 97, 110, 105, 99]\n        \
+        | _ => none\n      \
       | none, .call func [arg] _ _ _ =>\n        \
         match extractCalleeDefPath? func with\n        \
-        | some \"core::panicking::panic_fmt\" | some \"core::panicking::panic\" =>\n          \
-          match arg with\n          \
-          | .move { local_ := k, projection := [] } | .copy { local_ := k, projection := [] } =>\n            \
-            match get? s.frame.locals k with\n            \
-            | some (.init v) => panicMessageOfSlice? cur v\n            \
-            | _ => none\n          \
-          | .constant c => (evalConstValue c.val c.ty).bind (panicMessageOfSlice? cur)\n          \
-          | _ => none\n        \
+        | some \"core::panicking::panic_fmt\"\n        \
+        | some \"core::panicking::panic\"\n        \
+        | some \"core::panicking::panic_str_2015\"\n        \
+        | some \"core::panicking::const_panic_fmt\" =>\n          \
+          (panicOperandVal? cur s arg).bind (panicMessageOfSlice? allocs)\n        \
+        | _ => none\n      \
+      | none, .call func [_, _, argsOp] _ _ _ =>\n        \
+        match extractCalleeDefPath? func with\n        \
+        | some \"core::panicking::assert_matches_failed\" =>\n          \
+          formatAssertFailedMessage? cur s [97, 115, 115, 101, 114, 116, 105, 111, 110, 32, 96, 108, 101, 102, 116, 32, 109, 97, 116, 99, 104, 101, 115, 32, 114, 105, 103, 104, 116, 96, 32, 102, 97, 105, 108, 101, 100] argsOp\n        \
+        | _ => none\n      \
+      | none, .call func [kindOp, _, _, argsOp] _ _ _ =>\n        \
+        match extractCalleeDefPath? func with\n        \
+        | some \"core::panicking::assert_failed\" =>\n          \
+          match (panicOperandVal? cur s kindOp).bind assertFailedPrefix? with\n          \
+          | some pfx => formatAssertFailedMessage? cur s pfx argsOp\n          \
+          | none => none\n        \
         | _ => none\n      \
       | _, _ => none\n    \
     | none => none\n  \
   | _ => none\n\
-def probePanicMessageBounded\n    \
-    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
+def probePanicMessageBoundedAux\n    \
+    (fuel : Nat) (body : CapturedMir) (lastMsg : Option (List UInt8)) (st : MirExecState) :\n    \
+    Option (List UInt8) :=\n  \
   match fuel with\n  \
   | 0 => none\n  \
   | fuel' + 1 =>\n    \
+    let msg :=\n      \
+      match panicMessage? body st with\n      \
+      | some m => some m\n      \
+      | none => lastMsg\n    \
     match stepMirState body st with\n    \
-    | .ret .panic => panicMessage? body st\n    \
-    | .tau st' => probePanicMessageBounded fuel' body st'\n    \
-    | .vis (.inr (.inl _)) k => probePanicMessageBounded fuel' body (k PUnit.unit)\n    \
-    | _ => none\n";
+    | .ret .panic => msg\n    \
+    | .tau st' => probePanicMessageBoundedAux fuel' body msg st'\n    \
+    | .vis (.inr (.inl _)) k => probePanicMessageBoundedAux fuel' body msg (k PUnit.unit)\n    \
+    | _ => none\n\
+def probePanicMessageBounded\n    \
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Option (List UInt8) :=\n  \
+  probePanicMessageBoundedAux fuel body none st\n";
 
 /// Name of the Lean definition in [`FMT_ARGUMENTS_CTOR_STUB_LEAN`].
 const FMT_ARGUMENTS_CTOR_STUB_NAME: &str = "fmtArgumentsCtorStub";
@@ -418,12 +481,15 @@ fn is_std_panic_macro_file(file: &str) -> bool {
 ///    both trimmed. Miri's oracle output carries only the first line of the
 ///    message that follows `panicked at <position>:`.
 ///
-/// Anneal recovers the message of a panic raised by `core::panicking::panic`,
-/// which receives it as a `&'static str`, or by `core::panicking::panic_fmt`
-/// called with a literal message built by a `core::fmt::Arguments` constructor
-/// stub. A panic raised any other way (for example, by
-/// `core::panicking::assert_failed` for `assert_eq!`) has no recovered message,
-/// and condition 4 holds trivially.
+/// Anneal recovers the message of a panic raised by
+/// `core::panicking::{panic,panic_str_2015}`, by
+/// `core::panicking::{panic_fmt,const_panic_fmt}` called with a literal
+/// message built by a `core::fmt::Arguments` constructor stub, by
+/// `core::panicking::panic_explicit` (`"explicit panic"`), or by
+/// `core::panicking::{assert_failed,assert_matches_failed}` (`"assertion `left
+/// <op> right` failed"`, plus `": <custom>"` when `Option<Arguments<'_>>` is
+/// `Some(slice)`), threading the recovered message across `.tau` cleanup steps.
+/// Any other panic has no recovered message, and condition 4 holds trivially.
 ///
 /// Every other verdict is returned unchanged. In particular, a panic-site
 /// mismatch whose Anneal span lies in user code (two different panicking
@@ -2727,7 +2793,12 @@ mod tests {
             &extracted_panic,
             &[
                 "def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=",
-                "def panicMessageOfSlice? (cur : CapturedMir)",
+                "def panicMessageOfSlice? (allocs : List CapturedAllocation)",
+                "def panicOperandVal? (cur : CapturedMir)",
+                "def assertFailedPrefix? : Value → Option (List UInt8)",
+                "def formatAssertFailedMessage?",
+                "def panicMessage? (body : CapturedMir)",
+                "def probePanicMessageBoundedAux",
                 "def probePanicMessageBounded\n",
                 "def linkedCallees : List CapturedMir :=",
                 "def activeSpan (body : CapturedMir) (st : MirExecState) : String :=",

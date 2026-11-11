@@ -722,6 +722,14 @@ pub fn assert_eq_macro__b0_c5() -> u32 {
     x
 }
 ";
+    let assert_ne_custom_fn = "\
+pub fn assert_ne_custom_macro__b0_c6() -> u32 {
+    let x: u32 = 4u32;
+    let y: u32 = 4u32;
+    assert_ne!(x, y, \"x and y must differ\");
+    x
+}
+";
     // A genuine non-macro panic-site mismatch: the overflowing `+` panics inside
     // a `#[track_caller]` helper. Miri reports the helper's call site in the
     // candidate; Anneal reports the overflow `assert` terminator inside the
@@ -782,6 +790,13 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
             "ArithmeticCastMutator",
             assert_eq_fn,
         ),
+        handwritten_candidate(
+            6,
+            "panic_explicit_macro",
+            "assert_ne_custom_macro__b0_c6",
+            "ArithmeticCastMutator",
+            assert_ne_custom_fn,
+        ),
     ];
 
     let findings_dir = dir.join("findings_panic_fmt");
@@ -789,16 +804,16 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "seeded",
         0x00F0_0001,
         &[candidates],
-        6,
+        7,
         Some(&findings_dir),
         Some(&root),
     )
     .expect("evaluate panic_fmt candidate batch");
 
-    assert_eq!(report.total_candidates, 6);
-    assert_eq!(report.compiled_candidates, 6);
-    assert_eq!(report.compared_candidates, 6);
-    assert_eq!(report.agree_count, 5);
+    assert_eq!(report.total_candidates, 7);
+    assert_eq!(report.compiled_candidates, 7);
+    assert_eq!(report.compared_candidates, 7);
+    assert_eq!(report.agree_count, 6);
     assert_eq!(report.diverge_count, 1);
     assert_eq!(report.not_compared_count, 0);
     assert_eq!(report.kernel_confirmed_divergences, 1);
@@ -813,8 +828,8 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         "unexpected unmodeled external calls: {:?}",
         report.unmodeled_external_calls
     );
-    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(6));
-    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(6));
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(7));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(7));
 
     // (a) The macro candidates panic at the macro call site under Miri and inside
     // the macro's standard-library definition under Anneal. The strict
@@ -848,7 +863,12 @@ pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
         (
             "assert_eq_macro__b0_c5",
             "/library/core/src/macros/mod.rs",
-            None,
+            Some("assertion `left == right` failed"),
+        ),
+        (
+            "assert_ne_custom_macro__b0_c6",
+            "/library/core/src/macros/mod.rs",
+            Some("assertion `left != right` failed: x and y must differ"),
         ),
     ];
     assert_eq!(
