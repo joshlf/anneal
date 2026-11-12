@@ -10054,6 +10054,16 @@ inductive WellTypedLM3_2StateStmt
             tgtDecl.ty.kind = pointeeKind)) →
       WellTypedLM3_2StateStmt body s m allocMap
         ⟨.placeMention ⟨refIdx, .cons .deref .nil⟩, span⟩
+  | placeMentionSafeRefDerefUninit
+      (refIdx : Local) (refDecl : LocalDecl)
+      (mutability : Mutability) (pointeeKind : RigidTy) (span : String) :
+      get? body.localDecls refIdx = some refDecl →
+      refDecl.ty.kind = .ref mutability pointeeKind →
+      IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 } →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx) →
+      get? s.frame.locals refIdx = some .uninit →
+      WellTypedLM3_2StateStmt body s m allocMap
+        ⟨.placeMention ⟨refIdx, .cons .deref .nil⟩, span⟩
 
 /-- **`step_stmt_lm3_2_state_simulation` (`LM-3.2` Composed Statement Simulation)**:
 every statement satisfying `WellTypedLM3_2StateStmt body s m allocMap stmt` in a
@@ -10113,6 +10123,11 @@ theorem step_stmt_lm3_2_state_simulation
     exact ⟨allocMap,
       step_placeMention_safeRef_deref_simulation hstate hphase hbb hstmt hdecl_r href_ty hprim
         himm hval⟩
+  | placeMentionSafeRefDerefUninit _ _ _ _ _ hdecl_r href_ty hprim himm hun =>
+    obtain ⟨ha, m', hm⟩ :=
+      step_placeMention_safeRef_deref_uninit_simulation hstate hphase hbb hstmt hdecl_r href_ty
+        hprim himm hun
+    exact ⟨allocMap, by rw [ha, hm]; exact .ub m' _⟩
 
 /-- State-dependent well-typedness predicate for `LM-3.2` root-frame basic-block
 terminators (`Goto`, `Return` for any non-zero-sized immediate `_0` including
@@ -12561,6 +12576,41 @@ theorem step_placeMention_safeRef_deref_tree_simulation
       simp only [hbb, hstmt]; unfold evalStmt; dsimp only []; rw [hptr]
       dsimp only [advanceStmt, eraseBorrowParents]; rw [← htree.borrows_eq]; rfl
 
+/-- **`step_placeMention_safeRef_deref_uninit_tree_simulation` (`LM-3.2` Tree
+`PlaceMention(*_r)` Uninitialized Reference UB)**: tree-lifted counterpart of
+`step_placeMention_safeRef_deref_uninit_simulation` when `_r : &(mut) P` is `.uninit`. -/
+theorem step_placeMention_safeRef_deref_uninit_tree_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {refIdx : Local} {refDecl : LocalDecl}
+    {mutability : Mutability} {pointeeKind : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.placeMention ⟨refIdx, .cons .deref .nil⟩, span⟩)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    (hun : get? s.frame.locals refIdx = some .uninit) :
+    StepRelLM3_2Tree body m treeMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "read of uninitialized local")) := by
+  obtain ⟨_, _, _, _, _, hcal, _, _, _, _, _, _⟩ := id htree.erased_rel
+  have hcal_s : s.memory.activeCallee = none := hcal
+  obtain ⟨_, m', hm⟩ :=
+    step_placeMention_safeRef_deref_uninit_simulation htree.erased_rel hphase hbb hstmt
+      hdecl_ref href_ty hpk_prim himm_ref hun
+  have ha : stepMirFn body s = MirStepNode.fail .ub := by
+    rw [stepMirFn_eq_of_not_other body s hcal_s hphase]
+    simp only [hbb, hstmt]; unfold evalStmt; dsimp only []; rw [hun]; rfl
+  exact ⟨by rw [ha, hm]; exact .ub treeMap m' _, ha, m', hm⟩
+
 /-- **`step_scalar_use_lm3_2_tree_simulation`**: scalar assignment `_d = .use op`
 into an immediate primitive-scalar local `_d` from any `StateRelLM3_2Tree` state
 steps in lockstep preserving `treeMap`. -/
@@ -13374,6 +13424,16 @@ inductive WellTypedLM3_2TreeStateStmt
             tgtDecl.ty.kind = pointeeKind)) →
       WellTypedLM3_2TreeStateStmt body s m treeMap
         ⟨.placeMention ⟨refIdx, .cons .deref .nil⟩, span⟩
+  | placeMentionSafeRefDerefUninit
+      (refIdx : Local) (refDecl : LocalDecl)
+      (mutability : Mutability) (pointeeKind : RigidTy) (span : String) :
+      get? body.localDecls refIdx = some refDecl →
+      refDecl.ty.kind = .ref mutability pointeeKind →
+      IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 } →
+      (∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx) →
+      get? s.frame.locals refIdx = some .uninit →
+      WellTypedLM3_2TreeStateStmt body s m treeMap
+        ⟨.placeMention ⟨refIdx, .cons .deref .nil⟩, span⟩
 
 /-- **`step_stmt_lm3_2_tree_state_simulation` (`LM-3.2` Composed Tree Statement
 Simulation)**: every statement satisfying
@@ -13443,6 +13503,10 @@ theorem step_stmt_lm3_2_tree_state_simulation
     exact ⟨treeMap,
       step_placeMention_safeRef_deref_tree_simulation htree hphase hbb hstmt hdecl_r href_ty hprim
         himm hval⟩
+  | placeMentionSafeRefDerefUninit _ _ _ _ _ hdecl_r href_ty hprim himm hun =>
+    exact ⟨treeMap,
+      (step_placeMention_safeRef_deref_uninit_tree_simulation htree hphase hbb hstmt hdecl_r
+        href_ty hprim himm hun).1⟩
 
 /-- State-dependent well-typedness predicate for `LM-3.2` root-frame basic-block
 terminators (`Goto`, `Return` for any non-zero-sized immediate `_0` including
