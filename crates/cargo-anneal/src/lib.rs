@@ -1011,6 +1011,7 @@ pub fn render_lock_specs_report(
         )
     })?;
     let manifest = parse_spec_lock_manifest(&raw)?;
+    agent::verify_spec_lock_manifest_integrity(&manifest, &lock_path.display().to_string())?;
     check_specs_non_vacuous(workspace_root)?;
     let display_path = lock_path
         .strip_prefix(workspace_root)
@@ -1150,11 +1151,12 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
                 .as_deref()
                 .map(|s| vec![s.to_string()])
                 .unwrap_or_default();
-            let lock_path = lock_workspace_specs_with_options(
+            let lock_path = agent::lock_workspace_specs_with_units_dir(
                 &options.workspace_root,
                 &records,
                 &mutable_patterns,
                 options.lock_file.as_deref(),
+                Some(&options.units_dir),
             )?;
             let report = render_lock_specs_report(&options.workspace_root, &lock_path)?;
             print!("{report}");
@@ -2268,11 +2270,12 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         options.locked_specs || options.subcommand == CliSubcommand::AgentVerify;
 
     let (locked_manifest, has_locked_ub_exceptions) = if enforce_lock {
-        let lock = verify_spec_lock_with_options(
+        let lock = agent::verify_spec_lock_with_units_dir(
             &options.workspace_root,
             &records,
             options.lock_file.as_deref(),
             options.lock_git_ref.as_deref(),
+            Some(&options.units_dir),
         )?;
         let has_ub_exc = lock.locked_specs_files.iter().any(|entry| {
             fs::read_to_string(options.workspace_root.join(&entry.rel_path))
@@ -3613,6 +3616,13 @@ mod tests {
                 .all(|rec| rec.mir_fragment.as_deref() == Some("full_mir")),
             "{locked:?}"
         );
+        // The report refuses a lock file that fails its integrity check.
+        let mut forged = locked.clone();
+        forged.mutable_subjects = vec![forged.locked_records[0].def_id.clone()];
+        fs::write(&lock_path, forged.to_json_string()).expect("write forged lock");
+        let report_err =
+            render_lock_specs_report(&ws, &lock_path).expect_err("tampered lock must not report");
+        assert!(report_err.contains("manifest spec_digest mismatch"), "{report_err}");
         let _ = fs::remove_dir_all(&ws);
 
         let verify_report = render_verification_report(&VerificationReport {

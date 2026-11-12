@@ -546,12 +546,16 @@ struct RecordFragmentCertificate {
 ///
 /// Candidates, in order: `.anneal/generated/Mir/<item_rel>` with fallback to
 /// `<workspace>/target/anneal/units` (`resolve_workspace_mir_file`, the same
-/// resolution `agent-context` uses), then `rec.target.mir_module_path`
-/// interpreted relative to `workspace_root` (relative, `..`-free paths only).
+/// resolution `agent-context` uses); the CLI's (possibly custom) `units_dir`
+/// (`--units-dir`, searched like `scaffold` does); and
+/// `rec.target.mir_module_path` (relative to its unit directory, e.g.
+/// `Mir/<Crate>/<Item>.lean`) under `.anneal/generated/` and under
+/// `workspace_root` (relative, `..`-free paths only).
 fn read_certified_mir_text(
     workspace_root: &Path,
     record: &UnitTargetRecord,
     item_rel_path: &Path,
+    units_dir: Option<&Path>,
 ) -> Option<String> {
     let expected_sha = &record.target.mir_module_sha256;
     let mut candidates = Vec::new();
@@ -562,12 +566,20 @@ fn read_certified_mir_text(
     ) {
         candidates.push(path);
     }
+    if let Some(units_dir) = units_dir {
+        let mut config = crate::scaffold::ScaffoldConfig::new(workspace_root);
+        config.units_dir = Some(units_dir.to_path_buf());
+        if let Some(path) = crate::scaffold::find_source_mir_file(&config, record, item_rel_path) {
+            candidates.push(path);
+        }
+    }
     let recorded = Path::new(&record.target.mir_module_path);
     if !record.target.mir_module_path.is_empty()
         && recorded
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
     {
+        candidates.push(workspace_root.join(".anneal/generated").join(recorded));
         candidates.push(workspace_root.join(recorded));
     }
     candidates.into_iter().find_map(|path| {
@@ -588,9 +600,10 @@ fn read_certified_mir_text(
 fn compute_record_fragment_certificate(
     workspace_root: &Path,
     record: &UnitTargetRecord,
+    units_dir: Option<&Path>,
 ) -> Result<RecordFragmentCertificate, String> {
     let item_rel_path = module_suffix_to_rel_path(&derive_item_module_suffix(record));
-    let mir_text = read_certified_mir_text(workspace_root, record, &item_rel_path);
+    let mir_text = read_certified_mir_text(workspace_root, record, &item_rel_path, units_dir);
     let fragment = mir_text
         .as_deref()
         .map_or(MirFragment::FullMir, |src| classify_mir_fragment(src).inferred_fragment);
@@ -628,11 +641,12 @@ fn compute_record_fragment_certificate(
 fn build_sorted_certified_records(
     workspace_root: &Path,
     records: &[UnitTargetRecord],
+    units_dir: Option<&Path>,
 ) -> Result<(Vec<LockedUnitRecord>, BTreeSet<String>), String> {
     let mut by_def_id: BTreeMap<String, LockedUnitRecord> = BTreeMap::new();
     let mut missing_mir = BTreeSet::new();
     for rec in records {
-        let cert = compute_record_fragment_certificate(workspace_root, rec)?;
+        let cert = compute_record_fragment_certificate(workspace_root, rec, units_dir)?;
         let mut locked = LockedUnitRecord::from_unit_record(rec);
         locked.mir_fragment = Some(cert.fragment.as_str().to_string());
         locked.spec_digest = Some(cert.spec_digest);
@@ -678,6 +692,25 @@ pub fn lock_workspace_specs_with_options(
     mutable_patterns: &[String],
     external_lock_file: Option<&Path>,
 ) -> Result<PathBuf, String> {
+    lock_workspace_specs_with_units_dir(
+        workspace_root,
+        records,
+        mutable_patterns,
+        external_lock_file,
+        None,
+    )
+}
+
+/// `lock_workspace_specs_with_options` that also searches the CLI's
+/// (possibly custom, `--units-dir`) `units_dir` for each record's captured
+/// MIR when certifying its `mir_fragment`.
+pub(crate) fn lock_workspace_specs_with_units_dir(
+    workspace_root: &Path,
+    records: &[UnitTargetRecord],
+    mutable_patterns: &[String],
+    external_lock_file: Option<&Path>,
+    units_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
     let mut mutable_set = BTreeSet::new();
     for raw_pat in mutable_patterns {
         for pat in raw_pat.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -699,7 +732,7 @@ pub fn lock_workspace_specs_with_options(
     }
 
     check_specs_non_vacuous_with_records(workspace_root, records)?;
-    let (locked_records, _) = build_sorted_certified_records(workspace_root, records)?;
+    let (locked_records, _) = build_sorted_certified_records(workspace_root, records, units_dir)?;
     let locked_specs_files =
         collect_locked_file_digests(workspace_root, "anneal/proofs/Specs")?;
     let locked_assumptions_files =
@@ -776,6 +809,27 @@ pub fn verify_spec_lock_with_options(
     current_records: &[UnitTargetRecord],
     external_lock_file: Option<&Path>,
     lock_git_ref: Option<&str>,
+) -> Result<SpecLockManifest, String> {
+    verify_spec_lock_with_units_dir(
+        workspace_root,
+        current_records,
+        external_lock_file,
+        lock_git_ref,
+        None,
+    )
+}
+
+/// `verify_spec_lock_with_options` that also searches the CLI's (possibly
+/// custom, `--units-dir`) `units_dir` for each record's captured MIR when
+/// re-deriving fragment certificates. `verify_workspace_with_options` runs the
+/// lock check *before* re-scaffolding `.anneal/generated/Mir`, so this matters
+/// when the disposable generated tree was cleaned.
+pub(crate) fn verify_spec_lock_with_units_dir(
+    workspace_root: &Path,
+    current_records: &[UnitTargetRecord],
+    external_lock_file: Option<&Path>,
+    lock_git_ref: Option<&str>,
+    units_dir: Option<&Path>,
 ) -> Result<SpecLockManifest, String> {
     let workspace_lock_path = workspace_root.join(SPEC_LOCK_REL_PATH);
     let (raw, source_desc) = if let Some(git_ref) = lock_git_ref {
@@ -886,10 +940,16 @@ pub fn verify_spec_lock_with_options(
 
     // 4. Per-record `MirFragment` certificates, re-derived from the workspace.
     //    Legacy manifests (no certificates anywhere, as enforced by step 1)
-    //    skip this step and verify exactly as before.
-    if manifest.spec_digest.is_some() {
+    //    skip this step and verify exactly as before; the guard also accepts
+    //    any record-level certificate (defense in depth should step 1 change).
+    if manifest.spec_digest.is_some()
+        || manifest
+            .locked_records
+            .iter()
+            .any(LockedUnitRecord::has_fragment_certificate)
+    {
         let (current_certified, missing_mir) =
-            build_sorted_certified_records(workspace_root, current_records)?;
+            build_sorted_certified_records(workspace_root, current_records, units_dir)?;
         verify_locked_record_certificates(
             &manifest.locked_records,
             &current_certified,
@@ -916,7 +976,7 @@ pub fn verify_spec_lock_with_options(
 /// which detects modification of any locked field (records, fragments, record
 /// digests, `locked_specs_files`, `locked_assumptions_files`, or
 /// `mutable_subjects`) after `lock-specs`.
-fn verify_spec_lock_manifest_integrity(
+pub(crate) fn verify_spec_lock_manifest_integrity(
     manifest: &SpecLockManifest,
     source_desc: &str,
 ) -> Result<(), String> {
@@ -1064,6 +1124,9 @@ pub fn run_agent_sandbox(
     let pre_lock_raw = fs::read_to_string(&lock_path)
         .map_err(|err| format!("failed to read {}: {err}", lock_path.display()))?;
     let manifest = SpecLockManifest::from_json_str(&pre_lock_raw)?;
+    // `mutable_subjects` decides below whether `src/` is mounted writable, so
+    // the lock file must pass its integrity check before it is trusted.
+    verify_spec_lock_manifest_integrity(&manifest, &lock_path.display().to_string())?;
 
     let proof_dir = abs_ws.join("anneal/proofs/Proof");
     fs::create_dir_all(&proof_dir)
@@ -1289,7 +1352,7 @@ fn verify_locked_record_certificates(
         }
         let missing_hint = if missing_mir.contains(def_id) {
             format!(
-                " (no captured MIR module matching mir_module_sha256 {} was found under .anneal/generated/Mir or target/anneal/units, so the fragment was re-derived fail-closed as `full_mir`; re-run extraction before locked verification)",
+                " (no captured MIR module matching mir_module_sha256 {} was found under .anneal/generated/Mir, target/anneal/units, or --units-dir, so the fragment was re-derived fail-closed as `full_mir`; re-run extraction before locked verification)",
                 exp.mir_module_sha256
             )
         } else {
@@ -1891,6 +1954,11 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
                     prev_ch = None;
                 }
             } else {
+                // Keep line structure: a multi-line block comment must not
+                // glue the lines around it together.
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
                 i += 1;
             }
             continue;
@@ -2119,6 +2187,11 @@ pub fn render_agent_context(
             + bundle.inline_ensures.len()
             + bundle.external_specs.len();
         let fragment_class = lifting_profile.fragment_classification();
+        // `None` when no captured `Mir/<Item>.lean` body was parsed: the live
+        // fragment is then only the fail-closed `full_mir`, not a measurement.
+        let live_fragment = lifting_profile
+            .has_captured_mir
+            .then_some(fragment_class.inferred_fragment);
         let locked_fragment_line = locked_manifest.as_ref().and_then(|manifest| {
             let rec = manifest
                 .locked_records
@@ -2126,7 +2199,7 @@ pub fn render_agent_context(
                 .find(|r| r.def_id == *def_id)?;
             Some(render_locked_fragment_line(
                 rec.mir_fragment.as_deref(),
-                fragment_class.inferred_fragment,
+                live_fragment,
             ))
         });
 
@@ -2139,8 +2212,13 @@ pub fn render_agent_context(
             "- **Writable Proof Path**: `anneal/proofs/Proof/{rel_lean}`\n"
         ));
         out.push_str(&format!(
-            "- **MIR Fragment**: {}\n",
-            render_mir_fragment_label(fragment_class.inferred_fragment)
+            "- **MIR Fragment**: {}{}\n",
+            render_mir_fragment_label(fragment_class.inferred_fragment),
+            if live_fragment.is_some() {
+                ""
+            } else {
+                " (fail-closed: no parsed captured `Mir/<Item>.lean` body)"
+            }
         ));
         if let Some(line) = &locked_fragment_line {
             out.push_str(line);
@@ -2237,20 +2315,24 @@ fn render_mir_fragment_label(frag: MirFragment) -> String {
 
 /// `- **Locked MIR Fragment**` bullet for an item recorded in
 /// `.anneal/spec-lock.json`, comparing the locked certificate against the
-/// fragment of the current capture.
-fn render_locked_fragment_line(locked: Option<&str>, current: MirFragment) -> String {
+/// fragment of the current capture (`None` when no captured body was parsed).
+fn render_locked_fragment_line(locked: Option<&str>, current: Option<MirFragment>) -> String {
     const PREFIX: &str = "- **Locked MIR Fragment (`.anneal/spec-lock.json`)**:";
-    match locked.map(|tag| (tag, tag.parse::<MirFragment>())) {
-        Some((_, Ok(frag))) if frag == current => {
+    match (locked.map(|tag| (tag, tag.parse::<MirFragment>())), current) {
+        (Some((_, Ok(frag))), Some(current)) if frag == current => {
             format!("{PREFIX} {}\n", render_mir_fragment_label(frag))
         }
-        Some((_, Ok(frag))) => format!(
+        (Some((_, Ok(frag))), Some(current)) => format!(
             "{PREFIX} {} (differs from the current capture's `{}`; `cargo anneal agent-verify` accepts this only for `--allow-impl-edit` subjects)\n",
             render_mir_fragment_label(frag),
             current.as_str()
         ),
-        Some((tag, Err(_))) => format!("{PREFIX} invalid tag {tag:?}\n"),
-        None => format!(
+        (Some((_, Ok(frag))), None) => format!(
+            "{PREFIX} {} (no parsed captured `Mir/<Item>.lean` body to compare against)\n",
+            render_mir_fragment_label(frag)
+        ),
+        (Some((tag, Err(_))), _) => format!("{PREFIX} invalid tag {tag:?}\n"),
+        (None, _) => format!(
             "{PREFIX} not recorded (legacy certificate-free `anneal.spec-lock.v1` lock)\n"
         ),
     }
@@ -3846,7 +3928,7 @@ end Mir.Demo.loop_fn
             .expect("locked add");
         assert_eq!(locked_add.mir_fragment.as_deref(), Some("pure_loop_free"));
         let (current, missing) =
-            build_sorted_certified_records(&ws, &edited).expect("current certificates");
+            build_sorted_certified_records(&ws, &edited, None).expect("current certificates");
         assert!(missing.is_empty(), "{missing:?}");
         let current_add = current.iter().find(|r| r.def_id == "demo::add").expect("current add");
         assert_eq!(current_add.mir_fragment.as_deref(), Some("full_mir"));
@@ -3956,8 +4038,8 @@ end Mir.Demo.loop_fn
             ),
             (
                 "demo::ghost_fn",
-                "`full_mir` (`MirFragment.fullMir`, rank 4)",
-                Some("classified fail-closed"),
+                "`full_mir` (`MirFragment.fullMir`, rank 4) (fail-closed: no parsed captured `Mir/<Item>.lean` body)",
+                Some(crate::scaffold::NO_CAPTURED_MIR_REASON),
             ),
         ] {
             let section = item_section(&ctx, def_id);
@@ -3988,6 +4070,15 @@ end Mir.Demo.loop_fn
         assert!(ctx.contains(
             "- **Locked MIR Fragment (`.anneal/spec-lock.json`)**: `tree_borrows_local` (`MirFragment.treeBorrowsLocal`, rank 2)\n"
         ));
+        // Without a parsed captured body there is nothing to compare against.
+        let ctx = render_agent_context(&ws, &records, Some("demo::ghost_fn")).expect("ghost ctx");
+        assert!(
+            ctx.contains(
+                "- **Locked MIR Fragment (`.anneal/spec-lock.json`)**: `full_mir` (`MirFragment.fullMir`, rank 4) (no parsed captured `Mir/<Item>.lean` body to compare against)\n"
+            ),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("differs from the current capture"), "{ctx}");
         // A designated mutable subject whose edit escalated its fragment.
         write_generated_mir(
             &ws,
@@ -4017,6 +4108,109 @@ end Mir.Demo.loop_fn
             "{ctx}"
         );
         assert!(!ctx.contains("re-run `cargo anneal lock-specs`"), "{ctx}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// B1 P1#3: `verify_workspace_with_options` checks the lock *before*
+    /// re-scaffolding `.anneal/generated/Mir`, so certificates must also be
+    /// re-derivable from a custom `--units-dir`.
+    #[test]
+    fn spec_lock_certificates_resolve_custom_units_dir_without_generated_mir() {
+        let ws = unique_temp_dir("fragment-units-dir");
+        let units = ws.join("custom-units");
+        let write_unit = |rel: &str, text: &str| {
+            let path = units.join("u0").join(rel);
+            fs::create_dir_all(path.parent().expect("unit parent")).expect("create unit dir");
+            fs::write(&path, text).expect("write unit Mir module");
+            sha256_hex(text.as_bytes())
+        };
+        let mut records = sample_records();
+        records[0].target.mir_module_sha256 =
+            write_unit("Mir/Demo/add.lean", &mir_module_text("Mir.Demo.add", RET_BLOCKS));
+        records[1].target.mir_module_sha256 = write_unit(
+            "Mir/Demo/__anodized_fn_requires_add.lean",
+            &mir_module_text("Mir.Demo.__anodized_fn_requires_add", CALL_BLOCKS),
+        );
+        assert!(!ws.join(".anneal/generated").exists());
+        assert!(!ws.join("target/anneal/units").exists());
+
+        // 1. Lock and verify straight from the custom units dir.
+        let lock_path =
+            lock_workspace_specs_with_units_dir(&ws, &records, &[], None, Some(&units))
+                .expect("lock from custom units dir");
+        let manifest = parse_spec_lock_manifest(&fs::read_to_string(&lock_path).expect("read lock"))
+            .expect("parse lock");
+        let fragment_of = |m: &SpecLockManifest, def_id: &str| {
+            m.locked_records
+                .iter()
+                .find(|r| r.def_id == def_id)
+                .and_then(|r| r.mir_fragment.clone())
+        };
+        assert_eq!(fragment_of(&manifest, "demo::add").as_deref(), Some("pure_loop_free"));
+        assert_eq!(
+            fragment_of(&manifest, "demo::__anodized_fn_requires_add").as_deref(),
+            Some("full_mir")
+        );
+        verify_spec_lock_with_units_dir(&ws, &records, None, None, Some(&units))
+            .expect("custom units dir verifies");
+        // Without it the SHA-matching module is unreachable: fail closed, with a hint.
+        let err = verify_spec_lock(&ws, &records).expect_err("unreachable MIR");
+        assert!(
+            err.contains("mir_fragment for 'demo::add' changed from 'pure_loop_free' to 'full_mir'")
+                && err.contains("no captured MIR module matching mir_module_sha256"),
+            "{err}"
+        );
+
+        // 2. Lock against `.anneal/generated/Mir`, delete the disposable tree,
+        //    and verify from the custom units dir (the `agent-verify` order).
+        for (rel, src) in [
+            ("Demo/add.lean", "Mir/Demo/add.lean"),
+            ("Demo/__anodized_fn_requires_add.lean", "Mir/Demo/__anodized_fn_requires_add.lean"),
+        ] {
+            let text = fs::read_to_string(units.join("u0").join(src)).expect("read unit module");
+            write_generated_mir(&ws, rel, &text);
+        }
+        lock_workspace_specs(&ws, &records).expect("lock from generated Mir");
+        assert_eq!(
+            fs::read_to_string(&lock_path).expect("re-read lock"),
+            manifest.to_json_string(),
+            "both MIR sources certify identically"
+        );
+        fs::remove_dir_all(ws.join(".anneal/generated")).expect("delete generated tree");
+        verify_spec_lock_with_units_dir(&ws, &records, None, None, Some(&units))
+            .expect("verify from custom units dir after deleting .anneal/generated");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// B1 P2#4: lock consumers that trust `mutable_subjects` (the sandbox's
+    /// writable `src/` mount) or report on the lock check its integrity first.
+    #[test]
+    fn run_agent_sandbox_rejects_tampered_lock_before_running_the_command() {
+        let (ws, records) = certified_workspace("sandbox-integrity");
+        let lock_path = lock_workspace_specs(&ws, &records).expect("lock");
+        let raw = fs::read_to_string(&lock_path).expect("read lock");
+        let mut forged = parse_spec_lock_manifest(&raw).expect("parse lock");
+        forged.mutable_subjects = vec!["demo::add".to_string()];
+        fs::write(&lock_path, forged.to_json_string()).expect("write forged lock");
+        let marker = ws.join("sandbox-ran");
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("touch {}", marker.display()),
+        ];
+        let err = run_agent_sandbox(&ws, None, &command).expect_err("forged mutable_subjects");
+        assert!(err.contains("manifest spec_digest mismatch"), "{err}");
+        assert!(!marker.exists(), "the sandboxed command must not run on a tampered lock");
+        assert!(!ws.join("anneal/proofs/Proof").exists(), "no sandbox setup on a tampered lock");
+
+        let mut stripped = parse_spec_lock_manifest(&raw).expect("parse lock");
+        stripped.spec_digest = None;
+        fs::write(&lock_path, stripped.to_json_string()).expect("write stripped lock");
+        let err = run_agent_sandbox(&ws, None, &command).expect_err("partially stripped lock");
+        assert!(err.contains("manifest-level spec_digest is missing"), "{err}");
+        assert!(!marker.exists());
 
         let _ = fs::remove_dir_all(&ws);
     }
