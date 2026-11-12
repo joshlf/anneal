@@ -41,6 +41,9 @@ import LeanMiriSpec.Correspondence.WitLM3_2
 import LeanMiriSpec.Correspondence.TreeBorrowsRel
 import LeanMiriSpec.Correspondence.SimLM3_3
 import LeanMiriSpec.Correspondence.WitLM3_3
+import LeanMiriSpec.Correspondence.CallLM4_1
+import LeanMiriSpec.Correspondence.SimLM4_1
+import LeanMiriSpec.Correspondence.WitLM4_1
 import LeanMiriSpec.Audit
 
 /-!
@@ -230,15 +233,44 @@ import LeanMiriSpec.Audit
   (references, raw pointers, ZSTs, standard wrapper `Freeze` / ZST / uninhabited
   classification across `PhantomData`, `MaybeUninit`, `ManuallyDrop`,
   `UnsafeCell`, `SyncUnsafeCell`, `Cell`, and `RefCell`, and uninhabited vs.
-  inhabited `!`-container pointees), deref reborrows, and general 6-state
-  `Miri.Interpreter.Step.step` + `TreeBorrowsRel` lockstep (`LM-3.3`).
+  inhabited `!`-container pointees), `StorageDead`/`StorageLive` protector UB
+  vs. unprotected local-borrow disable (`sim_lm3_3_storage_dead_and_live_protector_step`),
+  deref reborrows, and general 6-state `Miri.Interpreter.Step.step` +
+  `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
-  witnesses `(a)..(n)` for reborrow hierarchies, protector conflicts and return
+  witnesses `(a)..(o)` for reborrow hierarchies, protector conflicts and return
   release, protected `Unique` disables, `UnsafeCell` (`Cell` & `ReservedIM`) vs.
   `Freeze`, non-`fnEntry`/raw retags, ZST & uninhabited-reference retags,
   disjoint vs. overlapping sub-projections, protected `Cell` chains surviving
-  under `.disabled` ancestors, and wrapper ZST/`Freeze`/uninhabited cell
-  retags (`LM-3.3`).
+  under `.disabled` ancestors, wrapper ZST/`Freeze`/uninhabited cell
+  retags, and `StorageDead` protected UB vs. unprotected local-borrow disable
+  (`LM-3.3`).
+* `LeanMiriSpec.Correspondence.CallLM4_1`: `LM-4.1` multi-frame call-stack
+  correspondence (`FrameStackRel`, `CallerDestinationRel`, `CallerStackLinksRel`,
+  `MultiFrameAllocDisjoint`, `MultiFrameStateRel` / `CallStackStateRel`,
+  `TreeBorrowsStateRel`, `BorrowTrackerStackRel`), bidirectional depth-1 bridges
+  (`StateRel.iff_multiFrameStateRel_depth1`,
+  `TreeBorrowsStateRel.iff_multiFrameStateRel_depth1`), `CallId` protector
+  lifecycle (`ActiveProtectorsValid`, `retagArgLocals_fnEntry_preserves_valid`,
+  `borrowTree_releaseProtector_full_simulation`, `releaseCallProtectors`,
+  `callerRestoredProtectors_cons_eq_restoreCallerProtectors`, and
+  `cex_end_of_call_foreign_unique_frozen_divergence`), and `annealStepHooksLM4_1` /
+  `StepRelMultiFrame`.
+* `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator
+  simulations (`step_terminator_unreachable_ub_simulation`,
+  `step_terminator_drop_noop_simulation`,
+  `canonical_drop_no_glue_preserves_local_divergence`,
+  `step_terminator_return_root_simulation`,
+  `step_terminator_return_callee_simulation`,
+  `step_terminator_call_unreachable_unchecked_ub_simulation`, and
+  `step_terminator_call_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM4_1`: ten kernel-checked `LM-4.1` witnesses
+  `(a)..(j)` covering multi-frame call/return with `GlobalState.endCall`
+  protector release, `.uninit` `_0` UB, `Drop` live vs. `.dead` UB,
+  `Unreachable` and `unreachable_unchecked` call UB, `BorrowTree.releaseProtector`
+  (`ReservedFrz true` vs. `Disabled`), ZST `()` returns, `.indirect` caller
+  destinations, `copy` + `move` call arguments, cross-frame `BorrowEntry`
+  scoping divergence, and diverging caller frame (`isDiverging = true`) return UB.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

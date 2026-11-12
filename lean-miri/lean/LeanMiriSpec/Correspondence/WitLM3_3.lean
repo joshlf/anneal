@@ -1126,4 +1126,81 @@ theorem wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps :
     rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl, rfl, rfl⟩
 
+/-! ## (o) Stage-1 `StorageDead` / `StorageLive` Protected Local Borrow UB vs. Unprotected Local Borrow Disable -/
+
+/-- Protected `StorageDead(_1)` witness body:
+```text
+bb0: _2 = &mut _1;               // tag 1: ReservedFrz false on _1 : u32
+     Retag([fn entry] _2);       // tag 2: protected ReservedFrz false (protector = some 1)
+     StorageDead(_1);            // UB! _1 has an active protected borrow (tag 2)
+     return
+``` -/
+def bodyOProtectedStorageDead : CapturedMir :=
+  witBody "lm_3_3_witness::protected_storage_dead_ub" 4
+    [declOf u32T, declOf u32T, refMutDecl (.uint .u32)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.storageDead 1)]
+
+/-- Unprotected `StorageDead(_1)` + use-after-`StorageDead` witness body:
+```text
+bb0: _2 = &mut _1;               // tag 1: ReservedFrz false on _1 : u32
+     (*_2) = const 42_u32;       // child write activates tag 1 -> Unique
+     StorageDead(_1);            // disables tag 1 -> Disabled (no active protector)
+     _0 = copy (*_2);            // UB! deref read through disabled tag 1
+     return
+``` -/
+def bodyOUnprotectedStorageDead : CapturedMir :=
+  witBody "lm_3_3_witness::unprotected_storage_dead_disable" 4
+    [declOf u32T, declOf u32T, refMutDecl (.uint .u32)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.assign (deref 2) (.use (cU32 42))),
+     stmt (.storageDead 1),
+     stmt (.assign (loc 0) (.use (.copy (deref 2))))]
+
+/-- Initial state for `bodyOProtectedStorageDead` and `bodyOUnprotectedStorageDead`. -/
+def initO : MachineState :=
+  witInit [.uninit, .init (.scalar ⟨7, 4⟩), .uninit]
+
+/-- **(o) `wit_lm3_3_storageDead_protected_ub_vs_unprotected_disable_real_steps`**:
+1. In `bodyOProtectedStorageDead`, `_2 = &mut _1` and `Retag([fn entry] _2)`
+   create protected `tag 2` (`protector = some 1`, `activeProtectors = [1]`);
+   then `StorageDead(_1)` immediately faults with `.fail .ub`
+   (`hasProtectedLocalBorrow = true`), matching Miri's
+   `BorrowTree.deallocateBorrowRange` failure (`.ProtectedDealloc ⟨0, 8⟩ ⟨1⟩`);
+2. In `bodyOUnprotectedStorageDead`, `_2 = &mut _1` and `(*_2) = const 42_u32`
+   activate unprotected `tag 1` to `.unique`; then `StorageDead(_1)` steps
+   cleanly and disables `tag 1` (`s₃.memory.borrows = [entry 1 .disabled]`,
+   satisfying `TreeBorrowsRel`), after which `_0 = copy (*_2)` faults with
+   `.fail .ub` in Anneal and `.TransitionError 0 (.ChildAccessForbidden .Disabled)`
+   in Miri. -/
+theorem wit_lm3_3_storageDead_protected_ub_vs_unprotected_disable_real_steps :
+    (∃ s₁ s₂ : MachineState,
+      stepMirFn bodyOProtectedStorageDead initO = .step s₁ ∧
+      stepMirFn bodyOProtectedStorageDead s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 (.reservedFrz false)] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn bodyOProtectedStorageDead s₂ = .fail .ub ∧
+      (∃ err,
+        ((hooksTwoNodeTree (.reservedFrz false)).deallocateBorrowRange
+          (.concrete (hooksAccessTag .foreignAccess))
+          Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+          (hooksForChildProtected true).protectedTags).status =
+            .AccessFailure err)) ∧
+    (∃ s₁ s₂ s₃ : MachineState,
+      stepMirFn bodyOUnprotectedStorageDead initO = .step s₁ ∧
+      stepMirFn bodyOUnprotectedStorageDead s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 1 .unique] ∧
+      stepMirFn bodyOUnprotectedStorageDead s₂ = .step s₃ ∧
+      get? s₃.frame.locals 1 = some .dead ∧
+      s₃.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s₃.memory.borrows [] (basedNormalTree s₃.memory.borrows []) ∧
+      stepMirFn bodyOUnprotectedStorageDead s₃ = .fail .ub ∧
+      ((basedNormalTree s₃.memory.borrows []).performAccess 0 .Read
+        .VisitChildrenOfAccessed).status =
+          .TransitionError 0 (.ChildAccessForbidden .Disabled)) := by
+  refine ⟨⟨_, _, rfl, rfl, rfl, rfl, rfl,
+      (borrowTree_deallocateBorrowRange_simulation .foreignAccess (.reservedFrz false) true).1 rfl⟩,
+    ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩, rfl, by decide⟩⟩
+
 end LeanMiriSpec.Correspondence.WitnessLM3_3

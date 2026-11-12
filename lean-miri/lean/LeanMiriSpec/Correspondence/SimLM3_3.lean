@@ -1364,4 +1364,67 @@ theorem sim_lm3_3_interpreter_reborrow_step
   | step _ m' _ htree' =>
     exact ⟨m', rfl, htree', (stateRelLM3_2Tree_treeBorrowsRel htree').2⟩
 
+/-! ## Stage-1 `StorageDead` / `StorageLive` Protector UB & Local-Borrow Disable (`Statements.lean:3270-3317`) -/
+
+/-- `StorageDead(_1)` with `_2 : &mut u64` holding borrow tag `1` on `_1`. -/
+def storageDeadBody : CapturedMir :=
+  witBody "lm_3_3_sim::storage_dead" 8
+    [declOf u64T, declOf u64T, refMutDecl (.uint .u64)]
+    [stmt (.storageDead 1)]
+
+/-- `StorageLive(_1)` with `_2 : &mut u64` holding borrow tag `1` on `_1`. -/
+def storageLiveBody : CapturedMir :=
+  witBody "lm_3_3_sim::storage_live" 8
+    [declOf u64T, declOf u64T, refMutDecl (.uint .u64)]
+    [stmt (.storageLive 1)]
+
+/-- **`sim_lm3_3_storage_dead_and_live_protector_step`**: across all 6-state
+`TreeBorrowPerm` permissions of tag `1` on `_1`:
+1. when `isProtected = true` (`activeProtectors = [1]`), both `StorageDead(_1)`
+   and `StorageLive(_1)` fault with `.fail .ub` in Stage-1 `stepMirFn`
+   (`hasProtectedLocalBorrow = true`), and for every non-`Cell` permission
+   (`perm ≠ .cell`), Miri's `BorrowTree.deallocateBorrowRange` on
+   `hooksTwoNodeTree perm` with active strong protector also fails
+   (`status ≠ .Deallocated`);
+2. when `isProtected = false` (`activeProtectors = []`), both `StorageDead(_1)`
+   and `StorageLive(_1)` step in `stepMirFn`, disabling `entry 1 perm` to
+   `[entry 1 .disabled]` (`disableLocalBorrows`) while preserving
+   `TreeBorrowsRel`, and Miri's `BorrowTree.deallocateBorrowRange` succeeds
+   (`status = .Deallocated`). -/
+theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
+    stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
+    stepMirFn storageLiveBody (childState perm true) = .fail .ub ∧
+    (perm ≠ .cell →
+      ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+        (hooksForChildProtected true).protectedTags).status ≠ .Deallocated) ∧
+    (∃ s_dead s_live : MachineState,
+      stepMirFn storageDeadBody (childState perm false) = .step s_dead ∧
+      get? s_dead.frame.locals 1 = some .dead ∧
+      s_dead.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
+      stepMirFn storageLiveBody (childState perm false) = .step s_live ∧
+      get? s_live.frame.locals 1 = some .uninit ∧
+      s_live.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s_live.memory.borrows [] (basedNormalTree s_live.memory.borrows [])) ∧
+    ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected false).protectedTags).status = .Deallocated := by
+  have hdealloc_true :=
+    (borrowTree_deallocateBorrowRange_simulation .foreignAccess perm true).2.2
+  have hdealloc_false :=
+    (borrowTree_deallocateBorrowRange_simulation .foreignAccess perm false).2.2
+  rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+    refine ⟨rfl, rfl, ?_,
+      ⟨_, _, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩,
+             rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
+      hdealloc_false.mpr ⟨by decide, Or.inl rfl⟩⟩
+  · intro hne; exact False.elim (hne rfl)
+  · intro _ hd; have h := (hdealloc_true.mp hd).2; cases h with | inl h | inr h => cases h
+  · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
+  · intro _ hd; have h := (hdealloc_true.mp hd).2; cases h with | inl h | inr h => cases h
+
 end LeanMiriSpec.Correspondence.SimLM3_3
