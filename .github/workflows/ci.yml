@@ -173,13 +173,59 @@ jobs:
 
       - name: Install exocrate toolchain from local archive
         run: |
+          set -euo pipefail
+          install_cache="$(mktemp -d "$RUNNER_TEMP/anneal-toolchain.XXXXXX")"
+          export XDG_CACHE_HOME="$install_cache"
           cargo run --locked -p cargo-anneal -- setup \
             --local-archive target/anneal-exocrate.tar.zst
+
+          # Exocrate's pinned configuration installs below anneal/toolchain.
+          # The cache was empty before setup, so exactly one directory names
+          # the artifact installed by this run, without an older-cache fallback.
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import os
+          from pathlib import Path
+
+          parent = Path(os.environ["XDG_CACHE_HOME"]) / "anneal/toolchain"
+          roots = [path for path in parent.iterdir() if path.is_dir()]
+          if len(roots) != 1 or roots[0].is_symlink():
+              raise SystemExit("setup must produce exactly one fresh installation")
+          root = roots[0].resolve()
+          for relative in ("rust/bin/rustc", "rust/bin/rustdoc", "lean/bin/lean", "bin/anneal-rustc-capture"):
+              if not (root / relative).is_file():
+                  raise SystemExit(f"installed tool is missing: {root / relative}")
+          print(f"XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}")
+          print(f"ANNEAL_TEST_INSTALL_ROOT={root}")
+          print(f"ANNEAL_TEST_RUST_SYSROOT={root / 'rust'}")
+          print(f"RUSTC={root / 'rust/bin/rustc'}")
+          print(f"RUSTDOC={root / 'rust/bin/rustdoc'}")
+          print(f"LD_LIBRARY_PATH={root / 'rust/lib'}")
+          print(f"RUSTFLAGS=-Lnative={root / 'rust/lib'} -Clink-arg=-Wl,-rpath,{root / 'rust/lib'}")
+          PY
           rm -f target/anneal-exocrate.tar.zst
+
+      - name: Smoke-test the installed compiler session
+        run: |
+          set -euo pipefail
+          driver_probe="$(mktemp -d "$RUNNER_TEMP/anneal-driver.XXXXXX")"
+          mkdir -p target/diagnostics
+          printf '%s\n' 'pub fn identity(n: u32) -> u32 { n }' > "$driver_probe/probe.rs"
+          (
+            cd "$driver_probe"
+            env -i "$ANNEAL_TEST_INSTALL_ROOT/bin/anneal-rustc-capture" \
+              --edition=2024 --crate-type=lib --emit=metadata \
+              probe.rs -o probe.rmeta
+          ) > target/diagnostics/driver-bootstrap.stdout \
+            2> target/diagnostics/driver-bootstrap.stderr
+          test -s "$driver_probe/probe.rmeta"
+          test ! -s target/diagnostics/driver-bootstrap.stdout
+          grep -Fx 'note: anneal-rustc-capture: compiler analysis callback reached; verification not performed' \
+            target/diagnostics/driver-bootstrap.stderr
 
       - name: Audit repository trusted boundary
         run: |
-          cargo run --locked -p anneal-audit
+          cargo run --locked -p anneal-audit -- \
+            --lean "$ANNEAL_TEST_INSTALL_ROOT/lean/bin/lean"
 
       - name: Test Rust workspace and crate packaging
         run: |
