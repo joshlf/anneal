@@ -162,6 +162,29 @@ def u16PrimLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- Wrapper with a `NonZero` outer backend whose `fieldLayouts := [9]` points to
+full-range `u32`. -/
+def outerNicheWrapperLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩)
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [9]
+}
+
+/-- Full-range 256-variant fieldless `#[repr(u8)]` enum (`0..=255`). -/
+def byteTag256EnumLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩)
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple (.initialized (.int 8 false) ⟨0, 255⟩) 0
+    (List.replicate 256 (.arbitrary [] []))
+  isUninhabited := false
+}
+
 def stage1Layouts : LayoutTable := {
   pointerBits := 64
   isLittleEndian := true
@@ -178,7 +201,9 @@ def stage1Layouts : LayoutTable := {
     u32PrimLayout,
     outerWrapperLayout,
     innerU16PairLayout,
-    u16PrimLayout
+    u16PrimLayout,
+    outerNicheWrapperLayout,
+    byteTag256EnumLayout
   ]
 }
 
@@ -280,5 +305,48 @@ example :=
   adt_nested_struct_fieldLayouts_isFromBytesTyped stage1Layouts "Outer" [] 10 11 12
     outerWrapperLayout innerU16PairLayout u16PrimLayout
     rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- `[u8; 4]` at its resolved array layout index (`7`) satisfies Stage-1 `FromBytes`. -/
+theorem u8x4_resolvedLayout_isFromBytesTyped :
+    IsFromBytesTyped stage1Layouts { kind := .array (.uint .u8) 4, layoutIdx := 7 } :=
+  checkBaseFromBytesKind_isFromBytesTyped stage1Layouts (.array (.uint .u8) 4) 7 rfl rfl
+
+/-- Inner `.primitive` field layout niche enforcement (`adt_fieldLayout_inner_primitive_stage1`). -/
+example :=
+  adt_fieldLayout_inner_primitive_stage1 stage1Layouts "Wrapper" [.uint .u32] 3 2
+    wrapperWithNicheFieldLayout nonZeroU32PrimLayout 0 0 32 [0] false ⟨1, scalarModulus 4 - 1⟩
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+/-- Outer niche ignored when `fieldLayouts` points to a full-range inner `.primitive` layout. -/
+theorem outerNicheWrapper_unenforced_stage1 :
+    wrappingRangeContains ⟨1, scalarModulus 4 - 1⟩ 0 = false ∧
+    decodeTypedValueFromBytes defaultCodecFuel stage1Layouts
+        { kind := .adt "OuterNiche" [.uint .u32], layoutIdx := 13 } (zeroInitBytes 4) =
+      some (.aggregate 0 [.scalar ⟨0, 4⟩]) ∧
+    IsFromZerosTyped stage1Layouts { kind := .adt "OuterNiche" [.uint .u32], layoutIdx := 13 } :=
+  adt_fieldLayout_path_outer_niche_unenforced_stage1 stage1Layouts "OuterNiche" [.uint .u32] 13 9
+    outerNicheWrapperLayout u32PrimLayout 0 0 [0]
+    rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+
+theorem byteTag256_fieldless :
+    ∀ tag < scalarModulus 1,
+      ∃ varMemOrder,
+        get? (List.replicate 256 (FieldsShape.arbitrary [] [])) tag =
+          some (.arbitrary [] varMemOrder) := by
+  intro tag hLt
+  have hLt256 : tag < 256 := by
+    rw [Anneal.Scalars.scalarModulus_eq_two_pow] at hLt
+    omega
+  refine ⟨[], ?_⟩
+  show (List.replicate 256 (FieldsShape.arbitrary [] []))[tag]? = some (.arbitrary [] [])
+  rw [List.getElem?_replicate]
+  simp [hLt256]
+
+/-- Full-range 256-variant fieldless `#[repr(u8)]` enum is Stage-1 `FromBytes`. -/
+theorem byteTag256_isFromBytesTyped :
+    IsFromBytesTyped stage1Layouts { kind := .adt "ByteTag256" [], layoutIdx := 14 } :=
+  adt_multiple_fieldless_enum_fullRange_isFromBytesTyped stage1Layouts "ByteTag256" [] 14
+    byteTag256EnumLayout 8 false ⟨0, 255⟩ (List.replicate 256 (.arbitrary [] [])) [0]
+    rfl rfl rfl rfl rfl rfl rfl (by decide) byteTag256_fieldless
 
 end Anneal.BitValidityStage1Tests
