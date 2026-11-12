@@ -331,11 +331,13 @@ theorem step_terminator_unreachable_ub_simulation
     (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
     (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
-    (hterm : bb.terminator.kind = .unreachable) :
+    (hterm : bb.terminator.kind = .unreachable)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
   rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
@@ -378,11 +380,13 @@ theorem step_terminator_drop_noop_simulation
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
     (hterm : bb.terminator.kind = .drop ⟨localId, .nil⟩ target unwind)
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
-    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId) :
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
       hcid_pos, hcid_act, hcid_bor, hbt⟩
@@ -620,11 +624,13 @@ theorem step_terminator_drop_projected_simulation
     (hroot :
       get? s.frame.locals localId = some .dead ∨
         ∃ sc₁ sc₂,
-          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
+          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂])))
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with
     ⟨topFrame, hback, hcal_root, hcal_nonroot, _, hlinks, hdisj, htb, hvalid,
       hcid_pos, hcid_act, hcid_bor, hbt⟩
@@ -741,11 +747,13 @@ theorem step_terminator_drop_projected_uninit_divergence
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
     (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
-    (huninit : get? s.frame.locals localId = some .uninit) :
+    (huninit : get? s.frame.locals localId = some .uninit)
+    (fnPtrs : List FnPtrEntry := .nil) :
     stepMirFn rootBody s = .fail .ub ∧
     ∃ m' tf',
       Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m =
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m =
         (m', .ok true) ∧
       m'.stack.frames.back? = some tf' ∧
       tf'.location = .mir ⟨target, 0⟩ ∧
@@ -1254,11 +1262,13 @@ theorem step_terminator_return_root_simulation
       (translateTy decl0.ty rootBody.layouts).layout.size = Miri.ABI.Size.ZERO →
         get? s.frame.locals 0 ≠ some .uninit)
     (hret0 : ∀ tf, m.stack.frames.back? = some tf →
-      RootIndirectRetWf m.machine rootBody s.frame tf) :
+      RootIndirectRetWf m.machine rootBody s.frame tf)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _⟩
   have hact_body : activeMirBody rootBody s = rootBody := by
     unfold activeMirBody
@@ -2317,11 +2327,13 @@ theorem step_terminator_return_callee_simulation
       get? cf.callerBody.localDecls destIdx = some destDecl →
       ∀ v imm,
         ImmediateRel decl0.ty (activeMirBody rootBody s).layouts v imm →
-        ImmediateRel destDecl.ty cf.callerBody.layouts v imm) :
+        ImmediateRel destDecl.ty cf.callerBody.layouts v imm)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with
     ⟨_, _, _, _, _, hlinks, hdisj, htb, hvalid,
       hcid_pos, hcid_act, hcid_bor, hbt⟩
@@ -3605,11 +3617,13 @@ theorem step_terminator_unwindResume_callee_simulation
     (hlive0 : get? s.frame.locals 0 ≠ some .dead)
     (hunwind :
       cf.returnUnwind = .unreachable ∨
-        ∃ cleanupBb, cf.returnUnwind = .cleanup cleanupBb) :
+        ∃ cleanupBb, cf.returnUnwind = .cleanup cleanupBb)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   rcases hstate with
     ⟨_, _, _, _, _, hlinks, hdisj, htb, hvalid,
       hcid_pos, hcid_act, hcid_bor, hbt⟩
@@ -3863,10 +3877,12 @@ theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
     (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
     (hcleanup : bb.isCleanup = true)
-    (hterm : bb.terminator.kind = .unwindResume) :
+    (hterm : bb.terminator.kind = .unwindResume)
+    (fnPtrs : List FnPtrEntry := .nil) :
     stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
     (Miri.Interpreter.Step.step
-      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s))
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+        fnPtrs)
       () m).2 =
       .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
   rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _⟩
@@ -3952,11 +3968,13 @@ theorem step_terminator_call_unreachable_unchecked_ub_simulation
     (hcallee_none :
       lookupCallee s.memory.callees (activeMirBody rootBody s).layouts
         defPath (extractCalleeTypeArgs func) s.memory.traitImpls = none := by rfl)
-    (hfind_none : findCallee? s.memory.callees defPath = none := by rfl) :
+    (hfind_none : findCallee? s.memory.callees defPath = none := by rfl)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   subst hargs
   rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
   have hforall := hlinks.toForall2
@@ -3985,7 +4003,7 @@ theorem step_terminator_call_unreachable_unchecked_ub_simulation
         rfl
       have hcall :
           annealEvalCallLM4_1 (activeMirBody rootBody s) s.memory.callees
-            (translateTerminator bb.terminator) m =
+            (translateTerminator bb.terminator) m fnPtrs =
           (m, .error (.undefinedBehavior "entering unreachable_unchecked")) := by
         unfold annealEvalCallLM4_1 Miri.Interpreter.Stack.currentFrame?
         rw [hback]
@@ -4946,6 +4964,17 @@ theorem CallerDestSlotWf.mono_evalArgs
     obtain ⟨lay₀, hdest₀⟩ := hind_sub mp lay hdest'
     exact halloc mp lay₀ allocId tag localAlloc hdest₀ hprov hlive
 
+/-- When the callee can unwind (or the call already forbids unwinding), the
+nounwind rewriting of canonical `Call.initStackFrame` leaves the call's unwind
+action unchanged. -/
+theorem nounwind_cont_eq {canUnwind : Bool} {unwind : MirAst.UnwindAction}
+    (h : canUnwind = true ∨ unwind = .unreachable) :
+    (if canUnwind then translateUnwindAction unwind else Miri.MIR.UnwindAction.Unreachable) =
+      translateUnwindAction unwind := by
+  rcases h with h | h
+  · simp [h]
+  · subst h; cases canUnwind <;> rfl
+
 inductive CallArgsAndPushSimRel
     (callerBody calleeBody : CapturedMir)
     (callerAf : StackFrame)
@@ -4985,7 +5014,9 @@ inductive CallArgsAndPushSimRel
         cf.frame = { callerAf with locals := locals' } →
         cf.destination = ⟨destIdx, .nil⟩ →
         CallerDestinationRel m.machine restMfs.length cf callerMf' calleeMf.returnPlace) →
-      calleeMf.returnContinuation = .goto targetOpt (translateUnwindAction unwind) →
+      calleeMf.returnContinuation =
+        .goto targetOpt
+          (if calleeBody.fnAbi.canUnwind then translateUnwindAction unwind else .Unreachable) →
       (∀ (i : Nat) mp lay,
         calleeMf.locals[i]? ≠
           some (Miri.Interpreter.LocalState.mk (.live (.indirect mp)) lay)) →
@@ -4997,7 +5028,8 @@ inductive CallArgsAndPushSimRel
          ⟨.ofCanonicalIndex 0, translateBody calleeBody⟩
        let fnInst : Miri.Interpreter.CallInstance := ⟨.Item 0, #[]⟩
        let cont : Miri.Interpreter.ReturnContinuation :=
-         .goto targetOpt (translateUnwindAction unwind)
+         .goto targetOpt
+           (if calleeBody.fnAbi.canUnwind then translateUnwindAction unwind else .Unreachable)
        let rawRes :=
          (⟨⟨restMfs.reverse ++ [callerMf']⟩⟩ : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit).pushStackFrameRaw
            m.machine.memory hooks loadedCallee fnInst cont calleeMf.returnPlace defaultSpanRef
@@ -5158,7 +5190,8 @@ theorem step_terminator_call_args_simulation_ok
     ⟨.ofCanonicalIndex 0, translateBody calleeBody⟩
   let fnInst : Miri.Interpreter.CallInstance := ⟨.Item 0, #[]⟩
   let cont : Miri.Interpreter.ReturnContinuation :=
-    .goto targetOpt (translateUnwindAction unwind)
+    .goto targetOpt
+      (if calleeBody.fnAbi.canUnwind then translateUnwindAction unwind else .Unreachable)
   let rawCalleeFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
     Miri.Interpreter.Frame.create loadedCallee fnInst () cont returnPlace
       defaultSpanRef (.ofAllocationToken 0)
@@ -5390,7 +5423,15 @@ At arbitrary stack depth under `MultiFrameStateRel rootBody s m`, executing
   `destIdx` is `.indirect`), pushes `SavedCallerFrame` onto `s.memory.callStack`,
   sets `s.memory.activeCallee = some calleeBody`, initializes the callee frame
   at `(0, 0)` via `Stack.pushStackFrameRaw` + `initCalleeArgLocals` +
-  `Stack.pushStackFrameDone`, and preserves `MultiFrameStateRel` at depth `d + 1`. -/
+  `Stack.pushStackFrameDone`, and preserves `MultiFrameStateRel` at depth `d + 1`.
+
+`hcallee_unwind` (`calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable`)
+excludes calls to nounwind callees with an unwinding `unwind` action, for which
+canonical `lean-miri` (`Call.initStackFrame`) rewrites the callee continuation to
+`.Unreachable` while Stage-1 keeps `returnUnwind := unwind`
+(`WitnessLM4_1.wit_lm4_1_nounwind_callee_unwind_divergence`). The statement is
+generic in the registered function pointers `fnPtrs`, so it composes with
+`annealStepHooksForState rootBody s` (`fnPtrs := s.memory.fnPtrs`). -/
 theorem step_terminator_call_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
@@ -5417,11 +5458,15 @@ theorem step_terminator_call_simulation
       CallerDestSlotWf m.machine tf destIdx destDecl)
     (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
     (hwt_args : ∀ tf, m.stack.frames.back? = some tf →
-      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls) :
+      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls)
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable :=
+      by first | exact Or.inl rfl | exact Or.inr rfl)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   have hstate_copy := hstate
   rcases hstate with
     ⟨topFrame, hback, _, _, _, hlinks, hdisj, htb, hvalid,
@@ -5468,7 +5513,7 @@ theorem step_terminator_call_simulation
       | ub m' msg =>
         have hcall :
             annealEvalCallLM4_1 (activeMirBody rootBody s) s.memory.callees
-              (translateTerminator bb.terminator) m =
+              (translateTerminator bb.terminator) m fnPtrs =
             (m', .error (.undefinedBehavior msg)) := by
           unfold annealEvalCallLM4_1 Miri.Interpreter.Stack.currentFrame?
           rw [hback]
@@ -5504,7 +5549,7 @@ theorem step_terminator_call_simulation
         obtain ⟨hraw_ok, hraw_state, rawCalleeFrame, hraw_curr, hdone_eq⟩ := hpush_spec
         have hcall :
             annealEvalCallLM4_1 (activeMirBody rootBody s) s.memory.callees
-              (translateTerminator bb.terminator) m =
+              (translateTerminator bb.terminator) m fnPtrs =
             ({ stack := ⟨⟨(callerMf' :: restMfs).reverse ++ [calleeMf]⟩⟩
                machine := m.machine }, .ok ()) := by
           unfold annealEvalCallLM4_1 Miri.Interpreter.Stack.currentFrame?
@@ -5588,7 +5633,7 @@ theorem step_terminator_call_simulation
             { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody argVals }
             savedCaller s.memory.callStack [] s.memory.activeProtectors
             calleeMf callerMf' restMfs
-            hrc_callee hdest_rel hfr_callee
+            (by rw [hrc_callee, nounwind_cont_eq hcallee_unwind] <;> rfl) hdest_rel hfr_callee
             (fun mp0 lay0 _ _ _ h0 _ _ _ => False.elim (hcallee_no_ind 0 mp0 lay0 h0))
             rfl (by intro _ h; cases h) hlinks_caller'
         have hdisj_orig : MultiFrameAllocDisjoint ⟨restMfs.reverse ++ [callerMf]⟩ := by
@@ -5707,11 +5752,15 @@ theorem step_terminator_call_diverging_simulation
       CallerDestSlotWf m.machine tf destIdx destDecl)
     (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
     (hwt_args : ∀ tf, m.stack.frames.back? = some tf →
-      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls) :
+      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls)
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable :=
+      by first | exact Or.inl rfl | exact Or.inr rfl)
+    (fnPtrs : List FnPtrEntry := .nil) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
-        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) := by
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)
+          fnPtrs) () m) := by
   have hstate_copy := hstate
   rcases hstate with
     ⟨topFrame, hback, _, _, _, hlinks, hdisj, htb, hvalid,
@@ -5758,7 +5807,7 @@ theorem step_terminator_call_diverging_simulation
       | ub m' msg =>
         have hcall :
             annealEvalCallLM4_1 (activeMirBody rootBody s) s.memory.callees
-              (translateTerminator bb.terminator) m =
+              (translateTerminator bb.terminator) m fnPtrs =
             (m', .error (.undefinedBehavior msg)) := by
           unfold annealEvalCallLM4_1 Miri.Interpreter.Stack.currentFrame?
           rw [hback]
@@ -5794,7 +5843,7 @@ theorem step_terminator_call_diverging_simulation
         obtain ⟨hraw_ok, hraw_state, rawCalleeFrame, hraw_curr, hdone_eq⟩ := hpush_spec
         have hcall :
             annealEvalCallLM4_1 (activeMirBody rootBody s) s.memory.callees
-              (translateTerminator bb.terminator) m =
+              (translateTerminator bb.terminator) m fnPtrs =
             ({ stack := ⟨⟨(callerMf' :: restMfs).reverse ++ [calleeMf]⟩⟩
                machine := m.machine }, .ok ()) := by
           unfold annealEvalCallLM4_1 Miri.Interpreter.Stack.currentFrame?
@@ -5878,7 +5927,7 @@ theorem step_terminator_call_diverging_simulation
             { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody argVals }
             savedCaller s.memory.callStack [] s.memory.activeProtectors
             calleeMf callerMf' restMfs
-            hrc_callee hdest_rel hfr_callee
+            (by rw [hrc_callee, nounwind_cont_eq hcallee_unwind] <;> rfl) hdest_rel hfr_callee
             (fun mp0 lay0 _ _ _ h0 _ _ _ => False.elim (hcallee_no_ind 0 mp0 lay0 h0))
             rfl (by intro _ h; cases h) hlinks_caller'
         have hdisj_orig : MultiFrameAllocDisjoint ⟨restMfs.reverse ++ [callerMf]⟩ := by
@@ -7677,7 +7726,9 @@ theorem step_terminator_call_fnDef_local_simulation
       CallerDestSlotWf m.machine tf destIdx destDecl)
     (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
     (hfn_slot : get? s.frame.locals fnIdx = some .dead ∨
-      get? s.frame.locals fnIdx = some (.init .unit)) :
+      get? s.frame.locals fnIdx = some (.init .unit))
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable :=
+      by first | exact Or.inl rfl | exact Or.inr rfl) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) := by
@@ -7912,7 +7963,8 @@ theorem step_terminator_call_fnDef_local_simulation
               { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody [] }
               savedCaller s.memory.callStack [] s.memory.activeProtectors
               calleeMf callerMf' restMfs
-              hrc_callee (hdest_rel_fn savedCaller rfl rfl rfl) hfr_callee
+              (by rw [hrc_callee, nounwind_cont_eq hcallee_unwind] <;> rfl)
+              (hdest_rel_fn savedCaller rfl rfl rfl) hfr_callee
               (fun mp0 lay0 _ _ _ h0 _ _ _ => False.elim (hcallee_no_ind 0 mp0 lay0 h0))
               rfl (by intro _ h; cases h) hlinks_caller'
           have hdisj_orig : MultiFrameAllocDisjoint ⟨restMfs.reverse ++ [callerMf]⟩ := by
@@ -8272,6 +8324,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
         fnIdx (by rw [cacheFrameLocalLayout_size]; exact hpre.fn_lt_mf) →
         CallerDestSlotWf m.machine tf destIdx destDecl ∧
         IsLiveFrameLocal tf destIdx) →
+      (calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable) →
       StepRelMultiFrame rootBody m
         (stepMirFn rootBody s)
         (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) := by
@@ -8509,7 +8562,7 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
     rw [hlookup_some, hop_ty]; dsimp only []; rw [habi_a, hcall_m]
     exact StepRelMultiFrame.ub _ _
   · intro fnEntry calleeBody retDecl restDecls calleeBb0 hoff0 hlookup_some htargs_nil
-      habi_a habi_m hcallee htparam hcallee_decls hcallee_bb0 hcal_abi hdest_deinit
+      habi_a habi_m hcallee htparam hcallee_decls hcallee_bb0 hcal_abi hdest_deinit hcallee_unwind
     obtain ⟨hdest_wf_d, hdest_live_d⟩ := hdest_deinit tfDeinit rfl
     have hsz_eq0 :
         (Miri.ABI.Size.ofBytes (baseAddr + UInt64.ofNat ptrVal.offsetBytes - baseAddr) !=
@@ -8661,7 +8714,8 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
           { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody [] }
           savedCaller s.memory.callStack [] s.memory.activeProtectors
           calleeMf tfDeinit restMfs
-          hrc_callee (hdest_rel_fn savedCaller rfl rfl rfl) hfr_callee
+          (by rw [hrc_callee, nounwind_cont_eq hcallee_unwind] <;> rfl)
+          (hdest_rel_fn savedCaller rfl rfl rfl) hfr_callee
           (fun mp0 lay0 _ _ _ h0 _ _ _ => False.elim (hcallee_no_ind 0 mp0 lay0 h0))
           rfl (by intro _ h; cases h) hlinks_caller'
       have hd_calleeMf : MemoryAllocDisjoint calleeMf :=

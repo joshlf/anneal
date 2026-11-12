@@ -160,7 +160,7 @@ def u8Layout : TypeLayout :=
     variants := .single 0, isUninhabited := false }
 
 def fnAbiU8 : FnAbi :=
-  { args := [], ret := { layout := u8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+  { args := [], ret := { layout := u8Layout, mode := .direct }, conv := .rust, canUnwind := true }
 
 def mkTerm (k : TerminatorKind) : MirAst.Terminator :=
   { kind := k, span := "lm-4.1-witness" }
@@ -3142,6 +3142,7 @@ theorem wit_lm4_1_nonConst_fnDef_and_indirect_fnPtr_call_and_safety_divergence :
             injection hmls with hm; subst hm; nomatch hmp
           · intro mls hmls hdead
             injection hmls with hm; subst hm; nomatch hdead)
+      (Or.inl rfl)
   · exact step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
       (witIndirectFnPtr_pre [witFnEntryUnsafe])
       (fun _ h => nomatch h)
@@ -3161,5 +3162,99 @@ theorem wit_lm4_1_nonConst_fnDef_and_indirect_fnPtr_call_and_safety_divergence :
             injection hmls with hm; subst hm; nomatch hmp
           · intro mls hmls hdead
             injection hmls with hm; subst hm; nomatch hdead)
+
+/-! ## (q) Nounwind Callee Unwinding: Stage-1 `FnAbi.canUnwind`-Blindness vs. Canonical `Call.initStackFrame` -/
+
+/-- `fn() -> u8` function item type for the nounwind callee `"crate::nounwind_callee"`. -/
+def noUnwCalleeFnTy : Ty := { kind := .fnDef "crate::nounwind_callee" [], layoutIdx := 0 }
+
+/-- Constant operand referencing `"crate::nounwind_callee"`. -/
+def noUnwCalleeFuncOp : MirAst.Operand :=
+  .constant { ty := noUnwCalleeFnTy, val := .zeroSized }
+
+/-- Callee `"crate::nounwind_callee"` whose `FnAbi` cannot unwind
+(`canUnwind := false`), but whose entry block is a cleanup block that resumes
+unwinding (`bb0` (cleanup): `UnwindResume`). -/
+def witNoUnwCalleeBody : CapturedMir where
+  defPath := "crate::nounwind_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl]
+  basicBlocks :=
+    [{ statements := [], terminator := mkTerm .unwindResume, isCleanup := true }]
+  fnAbi := { fnAbiU8 with canUnwind := false }
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Root caller `"crate::nounwind_caller"`:
+* `bb0`: `_1 = call crate::nounwind_callee() -> [return: bb1, unwind: cleanup bb2]`
+* `bb1`: `return`
+* `bb2` (cleanup): `UnwindResume` -/
+def witNoUnwCallerBody : CapturedMir where
+  defPath := "crate::nounwind_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl]
+  basicBlocks :=
+    [ { statements := []
+        terminator := mkTerm (.call noUnwCalleeFuncOp [] ⟨1, .nil⟩ (some 1) (.cleanup 2))
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false }
+    , { statements := [], terminator := mkTerm .unwindResume, isCleanup := true } ]
+  fnAbi := fnAbiU8
+  layouts := emptyLayoutTable
+  allocations := []
+
+def witNoUnwCallAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+    memory := { callees := [witNoUnwCalleeBody], nextProtector := 1 } }
+
+def witNoUnwCallMiri : AnnealStepState :=
+  { stack :=
+      ⟨#[{ body := translateBody witNoUnwCallerBody
+           bodyIdentity := .ofCanonicalIndex 0
+           functionInstance := ⟨.Item 0, #[]⟩
+           extra := ()
+           returnContinuation := .stop false
+           returnPlace :=
+             .frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0)
+           localsIdentity := .ofAllocationToken 0
+           locals := #[⟨.live (.immediate .uninit), none⟩, ⟨.live (.immediate .uninit), none⟩]
+           vaList := #[]
+           trackCallerArg := none
+           location := .mir ⟨0, 0⟩ }]⟩
+    machine := AnnealMachine.empty }
+
+/-- Return continuation of `m`'s top frame, if any. -/
+def miriTopCont (m : AnnealStepState) : Option Miri.Interpreter.ReturnContinuation :=
+  m.stack.frames.back?.map (·.returnContinuation)
+
+/-- **Witness (q)**: genuine 2-step lockstep execution (kernel evaluation via
+`decide`) of a call with `unwind = .cleanup bb2` to a callee whose `FnAbi`
+cannot unwind (`canUnwind = false`), followed by the callee's `UnwindResume`:
+1. Stage-1 `Trusted` ignores `FnAbi.canUnwind`: the pushed `SavedCallerFrame`
+   keeps `returnUnwind = .cleanup 2`, and `UnwindResume` resumes the caller at
+   its cleanup block `bb2` (`.step s₂`, `s₂.frame.blockIdx = 2`, empty call stack);
+2. `lean-miri` (`annealPushCalleeFrameLM4_1`, like canonical `Call.initStackFrame`)
+   pushes the callee with continuation `.goto (some 1) .Unreachable`, so the same
+   `UnwindResume` faults with `.undefinedBehavior "unwinding past a frame that
+   does not allow unwinding"`.
+This is why `step_terminator_call_simulation` and its siblings require
+`calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable`. -/
+theorem wit_lm4_1_nounwind_callee_unwind_divergence :
+    ∃ s₁ s₂ : MachineState,
+      stepMirFn witNoUnwCallerBody witNoUnwCallAnneal = .step s₁ ∧
+      s₁.memory.callStack.map SavedCallerFrame.returnUnwind = [.cleanup 2] ∧
+      stepMirFn witNoUnwCallerBody s₁ = .step s₂ ∧
+      s₂.frame.blockIdx = 2 ∧
+      s₂.memory.callStack = [] ∧
+      (miriNextLM4_1 witNoUnwCallerBody witNoUnwCallAnneal witNoUnwCallMiri).map
+          (fun m₁ => (miriTopCont m₁, miriStepUBMsgLM4_1 witNoUnwCallerBody s₁ m₁)) =
+        some (some (.goto (some 1) .Unreachable),
+          some "unwinding past a frame that does not allow unwinding") := by
+  refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  decide
 
 end LeanMiriSpec.Correspondence.WitnessLM4_1

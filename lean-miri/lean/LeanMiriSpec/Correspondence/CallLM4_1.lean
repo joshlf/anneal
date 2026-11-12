@@ -2472,7 +2472,16 @@ diverging call (`target = none`, return type `!`), matching Miri's
 `ReturnContinuation::Goto { ret: None, unwind }`, so that a later normal return
 from the callee hits `ControlFlow.returnToBlock none`
 (`.undefinedBehavior "Unreachable"`), exactly as Stage-1 `Trusted` faults on
-`SavedCallerFrame.isDiverging = true` (`Terminators.lean:3011-3012`). -/
+`SavedCallerFrame.isDiverging = true` (`Terminators.lean:3011-3012`).
+
+Like canonical `lean-miri`'s `Call.initStackFrame` (`Call.lean:261-264`:
+`let cont := if h.abiCanUnwind calleeFnAbi then cont else .goto ret .Unreachable`),
+the continuation's unwind action is replaced by `.Unreachable` when the callee's
+`FnAbi` cannot unwind (`calleeBody.fnAbi.canUnwind = false`), so unwinding out of
+a nounwind callee is undefined behavior. Stage-1 `Trusted` never consults
+`FnAbi.canUnwind` (`pushCalleeFrame` keeps `returnUnwind := unwind`); the
+resulting divergence is certified by
+`WitnessLM4_1.wit_lm4_1_nounwind_callee_unwind_divergence`. -/
 def annealPushCalleeFrameLM4_1
     (currentBody calleeBody : CapturedMir)
     (dest : Miri.MIR.Place)
@@ -2493,7 +2502,7 @@ def annealPushCalleeFrameLM4_1
         ⟨.ofCanonicalIndex 0, translateBody calleeBody⟩
       let fnInst : Miri.Interpreter.CallInstance := ⟨.Item 0, #[]⟩
       let cont : Miri.Interpreter.ReturnContinuation :=
-        .goto targetOpt unwind
+        .goto targetOpt (if calleeBody.fnAbi.canUnwind then unwind else .Unreachable)
       let rawRes :=
         stateAfterArgs.stack.pushStackFrameRaw
           stateAfterArgs.machine.memory

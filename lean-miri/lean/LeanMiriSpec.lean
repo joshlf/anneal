@@ -290,7 +290,7 @@ import LeanMiriSpec.Audit
   `step_terminator_call_indirect_fnPtr_move_simulation`, and
   `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`).
 * `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
-  `(a)..(p)` covering multi-frame call/return with `GlobalState.endCall`
+  `(a)..(q)` covering multi-frame call/return with `GlobalState.endCall`
   protector release, `.uninit` `_0` UB, unprojected & projected `Drop` (live vs.
   `.dead` UB on a realistic `ScalarPair` layout, projected-`.uninit` and
   unprojected canonical no-glue `Drop` divergences), `Unreachable` and
@@ -301,8 +301,9 @@ import LeanMiriSpec.Audit
   execution, step-level end-of-call foreign-`Unique` protector-release divergence,
   `UnwindResume` cleanup catch / `.unreachable` unwind ABI UB / root `.panic` vs. UB,
   3-frame `k = 2` `.continue_` unwinding + `UnwindTerminate` + `Assert` + diverging
-  panic calls, and non-constant `FnDef` local + indirect `FnPtr` calls +
-  `Safety` divergence.
+  panic calls, non-constant `FnDef` local + indirect `FnPtr` calls +
+  `Safety` divergence, and the nounwind-callee unwinding divergence (`(q)`:
+  Stage-1 ignores `FnAbi.canUnwind`, canonical `Call.initStackFrame` does not).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
