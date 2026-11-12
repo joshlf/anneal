@@ -3432,4 +3432,139 @@ theorem transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement :
     retAfterTB transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩] 7 = tbRetU32 5 :=
   ⟨transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret, by decide +kernel, by decide +kernel⟩
 
+/-- Reference-typed `Retag([raw], _2)` and `Retag([raw], _3)` (`_2 : &mut u32`,
+`_3 : &u32`): exercises `statementOk` / `evalStmt_retag_ref_local` / `Simulation`
+on `.retag .raw` applied to reference locals (`retagPerm .raw (.ref ..)` matches
+`.default`/`.twoPhase`, allocating child tags `2` and `4` in Anneal while MiniRust
+lowers both to `Validate(_, false)`), returning `5 + 7 = 12` across Anneal, `Mach`,
+and `MachTB`. -/
+def retagRawOnRefLocal : CapturedMir :=
+  ptrBody "witness::retag_raw_on_ref_local"
+    [u32Decl, u32Decl, refMutU32Decl, refSharedU32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .retag .raw (local_ 2),
+     .assign (local_ 4) (.copyForDeref (derefPlace 2)),
+     .assign (derefPlace 2) (.binaryOp .add (.copy (local_ 4)) (constU32 7)),
+     .assign (local_ 3) (.ref .shared (derefPlace 2)),
+     .retag .raw (local_ 3),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem retagRawOnRefLocal_inFragment : inFragment retagRawOnRefLocal = true := by decide
+
+def retagRawOnRefLocalFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .not u32),
+    (localName 4, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Validate (.Local (localName 2)) false,
+      .Assign (.Local (localName 4)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Constant (.Int 7) (.Int u32))),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .not u32)),
+      .Validate (.Local (localName 3)) false,
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem retagRawOnRefLocal_translate :
+    translateFn retagRawOnRefLocal = some retagRawOnRefLocalFn := rfl
+
+def retagRawOnRefLocalS0 : MachineState :=
+  initMachineState retagRawOnRefLocal [.scalar ⟨5, 4⟩]
+def retagRawOnRefLocalMInit : Mach :=
+  machine retagRawOnRefLocal retagRawOnRefLocalFn
+    retagRawOnRefLocalS0.frame.locals retagRawOnRefLocalFn.start
+
+theorem retagRawOnRefLocal_anneal_ret :
+    ReachesRet (mirTree retagRawOnRefLocal retagRawOnRefLocalS0) []
+      (.normal (.scalar ⟨12, 4⟩,
+        { retagRawOnRefLocalS0.memory with
+          borrows := [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
+                      { rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+                      { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
+          nextTag := 5 })) :=
+  runA_sound retagRawOnRefLocal 30 _ _ _ rfl
+
+theorem retagRawOnRefLocal_noUB :
+    MirNoUBTree (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) :=
+  runA_noUB retagRawOnRefLocal 30 _ _ _ rfl
+
+theorem retagRawOnRefLocal_minirust_direct :
+    retAfter retagRawOnRefLocal [.scalar ⟨5, 4⟩] 12 =
+      some (some { retAlloc with data := scalarBytes u32 12 }, [1]) := by
+  decide +kernel
+
+theorem retagRawOnRefLocal_tb_direct :
+    retAfterTB retagRawOnRefLocal [.scalar ⟨5, 4⟩] 12 = tbRetU32 12 := by
+  decide +kernel
+
+theorem retagRawOnRefLocal_ctxOk : CtxOk retagRawOnRefLocal ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : retagRawOnRefLocal.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [retagRawOnRefLocal, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [retagRawOnRefLocal, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : retagRawOnRefLocal.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [retagRawOnRefLocal, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem retagRawOnRefLocal_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n retagRawOnRefLocalMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 12 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+      retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+      rfl rfl rfl retagRawOnRefLocal_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [retagRawOnRefLocal, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem retagRawOnRefLocal_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n retagRawOnRefLocalMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k retagRawOnRefLocalMInit = .ok mRet ∧
+      ReturnRel retagRawOnRefLocal ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+    retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+    rfl rfl rfl retagRawOnRefLocal_noUB herr
+
+theorem retagRawOnRefLocal_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) retagRawOnRefLocalMInit = .ok m' ∧
+      StateRelN retagRawOnRefLocal retagRawOnRefLocalFn ctx0 s' m' ∧
+      Reaches (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr
+        (mirTree retagRawOnRefLocal s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k retagRawOnRefLocalMInit = .ok mRet ∧
+      ReturnRel retagRawOnRefLocal ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+    retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+    rfl rfl rfl retagRawOnRefLocal_noUB n
+
 end MiniRustSpec.Correspondence.RefWitness

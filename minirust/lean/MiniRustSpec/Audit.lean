@@ -3472,6 +3472,16 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
   transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
   transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
+  retagRawOnRefLocal_inFragment
+  retagRawOnRefLocal_translate
+  retagRawOnRefLocal_anneal_ret
+  retagRawOnRefLocal_noUB
+  retagRawOnRefLocal_minirust_direct
+  retagRawOnRefLocal_tb_direct
+  retagRawOnRefLocal_ctxOk
+  retagRawOnRefLocal_minirust_ret_from_start
+  retagRawOnRefLocal_minirust_noUB
+  retagRawOnRefLocal_progress
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3925,6 +3935,16 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
   transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
   transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
+  retagRawOnRefLocal_inFragment
+  retagRawOnRefLocal_translate
+  retagRawOnRefLocal_anneal_ret
+  retagRawOnRefLocal_noUB
+  retagRawOnRefLocal_minirust_direct
+  retagRawOnRefLocal_tb_direct
+  retagRawOnRefLocal_ctxOk
+  retagRawOnRefLocal_minirust_ret_from_start
+  retagRawOnRefLocal_minirust_noUB
+  retagRawOnRefLocal_progress
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms

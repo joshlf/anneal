@@ -20508,6 +20508,32 @@ example :
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .error (.undefinedBehavior msg)) :=
   Witness.wit_lm3_2_placeMention_safeRef_deref_uninit_tree_state_simulation_real_steps
 
+-- `[Ep3 A3]` pins: concrete `64`-KiB (`offsetBytes = 65536`) page-wrapping `Eq` divergence.
+example : CapturedMir := Witness.lm31PageWrapEqDivergenceBody
+
+open Witness in
+example :
+    ∃ (s₁ s₂ s₂_w s₃ : MachineState) (m₁ m₂ m₂_w m₃ : AnnealStepState)
+      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (map₂ : List AllocMapEntry),
+      let b := lm31PageWrapEqDivergenceBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b (mkTwoU64AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkTwoU64MiriPre b boolTyLM31) = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ map₂ ∧
+      get? s₂_w.frame.locals 3 = some (.init (.ptr { allocId := 1, offsetBytes := 65536 } 8)) ∧
+      get? s₂_w.frame.locals 4 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      StateRelLM3_1 b s₂_w m₂_w map₂ ∧
+      stepMirFn b s₂_w = .step s₃ ∧
+      get? s₃.frame.locals 0 = some (.init (.scalar ⟨1, 1⟩)) ∧
+      Miri.Interpreter.Step.step hooks () m₂_w = (m₃, .ok true) ∧
+      m₃.stack.frames = #[tf₃] ∧
+      (tf₃.locals[0]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool false))))) :=
+  Witness.wit_lm3_1_d12_page_wrap_eq_divergence_real_steps
+
 #assert_standard_axioms
   Witness.mkTwoU64AnnealPre
   Witness.mkTwoU64MiriFramePre
@@ -20589,6 +20615,8 @@ example :
   Witness.wit_lm3_1_d12_scalar_threshold_divergence_real_steps
   Witness.lm32PlaceMentionSafeRefUninitBody
   Witness.wit_lm3_2_placeMention_safeRef_deref_uninit_tree_state_simulation_real_steps
+  Witness.lm31PageWrapEqDivergenceBody
+  Witness.wit_lm3_1_d12_page_wrap_eq_divergence_real_steps
 
 end Ep3Pins
 
