@@ -60,7 +60,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     AssertMessage, BinOp, Body, CallTarget, CalleeSymbol, IntrinsicOp, Operand, Place,
-    PointerValue, PtrWidth, SwitchTargets, Terminator, Ty, UintTy, UnwindAction,
+    PointerValue, Provenance, PtrWidth, SwitchTargets, Terminator, Ty, UintTy, UnwindAction,
 };
 use crate::lower::cast::CastEvalError;
 use crate::lower::intrinsic::{
@@ -1311,7 +1311,7 @@ fn check_terminator_entry(
 }
 
 /// `InvalidArguments` unless `state` matches `body` (`ptr_width`, `local_decls`, one slot per
-/// local).
+/// local, and a page-aligned `frame_addr_base`).
 fn check_state_matches_body(
     body: &LoweredBody,
     state: &StatementEvalState,
@@ -1319,10 +1319,11 @@ fn check_state_matches_body(
     if state.ptr_width != body.ptr_width
         || state.local_decls != body.local_decls
         || state.slots.len() != body.local_decls.len()
+        || !state.frame_addr_base.is_multiple_of(0x1000)
     {
         return Err(CfgEvalError::InvalidArguments(
             RvalueEvalError::TypeMismatch(
-                "StatementEvalState local_decls, slots, or ptr_width do not match LoweredBody",
+                "StatementEvalState local_decls, slots, ptr_width, or frame_addr_base do not match LoweredBody",
             ),
         ));
     }
@@ -1388,14 +1389,18 @@ pub struct LinkedCallee {
 ///   `Terminated` ends the whole evaluation at once (no caller cleanup block runs). Outcomes are
 ///   re-attributed to the caller's calling block with their messages unchanged, and an error
 ///   inside a callee is reported as [`CfgEvalError::InCallee`] with the call stack.
-/// - **Frame isolation.** Every frame has its own locals, synthetic stack allocations
-///   (provenance `alloc_id = local + 1`), and exposed-provenance tracker; it inherits the
-///   caller's transmute policy and `ub_checks`. A callee frame's allocations lie above all of
-///   its caller's ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the
-///   address space is `UnsupportedMemoryAccess`), so the addresses of distinct active frames
-///   never coincide, not even as exposed integers. Because a synthetic pointer's provenance is
-///   only meaningful in its own frame, an argument or returned value holding a pointer whose
-///   provenance names a synthetic local allocation of either frame (`alloc_id` in
+/// - **Frame isolation.** Every frame has its own locals and synthetic stack allocations
+///   (provenance `alloc_id = local + 1`); it inherits the caller's transmute policy,
+///   `ub_checks`, and exposed provenances (external provenances directly, and caller-frame
+///   synthetic provenances as an opaque non-local provenance so `with_exposed_provenance`
+///   pointer arithmetic stays defined without aliasing callee locals; external provenances
+///   exposed inside a callee propagate back to the caller on return or unwind). A callee
+///   frame's allocations lie above all of its caller's
+///   ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the address space is
+///   `UnsupportedMemoryAccess`), so the addresses of distinct active frames never coincide, not
+///   even as exposed integers. Because a synthetic pointer's provenance is only meaningful in
+///   its own frame, an argument or returned value holding a pointer whose provenance names a
+///   synthetic local allocation of either frame (`alloc_id` in
 ///   `1..=max(caller_locals, callee_locals)`) is rejected with `UnsupportedMemoryAccess`
 ///   (never reinterpreted as a pointer into the other frame); pointers without provenance, or
 ///   with any other provenance, cross unchanged.
@@ -1678,6 +1683,12 @@ fn in_frames(frames: &[Frame<'_>], frame_index: usize, error: CfgEvalError) -> C
     }
 }
 
+/// Synthetic non-local `alloc_id` representing an exposed allocation from an outer caller
+/// frame inside a linked callee's [`ExposedProvenanceTracker`]: keeps `with_exposed_provenance`
+/// and `BinOp::Offset` defined across call boundaries without colliding with any frame-local
+/// allocation id (`1..=local_decls.len()`).
+const CALLER_EXPOSED_ALLOC_ID: u64 = u64::MAX;
+
 /// Creates the state of a frame of the linked `callee` called from `caller` with `args`
 /// (into a destination of type `dest_ty`, with a return target iff `has_return_target`); see
 /// [`CallTable`].
@@ -1726,6 +1737,17 @@ fn enter_callee(
     let mut state = StatementEvalState::from_body(&callee.body, args)?;
     state.policy = caller.state.policy;
     state.ub_checks = caller.state.ub_checks;
+    for &prov in &caller.state.tracker.exposed {
+        let mapped = if usize::try_from(prov.alloc_id).is_ok_and(|id| id >= 1 && id <= limit) {
+            Provenance {
+                alloc_id: CALLER_EXPOSED_ALLOC_ID,
+                tag: 0,
+            }
+        } else {
+            prov
+        };
+        state.tracker.expose(mapped);
+    }
     // The callee's synthetic allocations lie above all of its caller's, so addresses of
     // distinct active frames never coincide (also through exposed addresses).
     state.frame_addr_base = caller.state.frame_addr_end()?;
@@ -1860,7 +1882,7 @@ fn eval_frames<'a>(
                 }
                 let callee_frame = frames.pop().expect("a callee frame is above the root");
                 let callee_locals = callee_frame.state.local_decls.len();
-                drop(callee_frame);
+                let callee_exposed = callee_frame.state.tracker.exposed;
                 let caller_index = frames.len() - 1;
                 if caller_index == 0 {
                     root_call_entry = None;
@@ -1875,6 +1897,20 @@ fn eval_frames<'a>(
                 };
                 let caller = &mut frames[caller_index];
                 let bb = pending.site.bb;
+                let limit = caller.state.local_decls.len().max(callee_locals);
+                if matches!(
+                    outcome,
+                    CfgEvalOutcome::Returned(_) | CfgEvalOutcome::Panicked { .. }
+                ) {
+                    for prov in callee_exposed {
+                        if prov.alloc_id != CALLER_EXPOSED_ALLOC_ID
+                            && !usize::try_from(prov.alloc_id)
+                                .is_ok_and(|id| id >= 1 && id <= limit)
+                        {
+                            caller.state.tracker.expose(prov);
+                        }
+                    }
+                }
                 let resumed: Result<Option<CfgEvalOutcome>, CfgEvalError> = match outcome {
                     CfgEvalOutcome::Returned(ret_val) => {
                         let in_cleanup = caller
@@ -1882,7 +1918,6 @@ fn eval_frames<'a>(
                             .basic_blocks
                             .get(bb)
                             .is_some_and(|block| block.is_cleanup);
-                        let limit = caller.state.local_decls.len().max(callee_locals);
                         complete_call_return(
                             caller.body,
                             bb,

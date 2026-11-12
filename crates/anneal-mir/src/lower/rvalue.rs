@@ -3243,7 +3243,8 @@ fn decode_mir_value(
 /// `[base_addr, base_addr + alloc_size]` contains `addr_bits` (preferring live locals and
 /// interior addresses `[base_addr, base_addr + alloc_size)` over one-past-the-end, and
 /// matching [`decode_subplace_tag`] when multiple tags of that local were exposed), falling
-/// back to `tracker.exposed.first().copied()`.
+/// back to an exposed external (non-local) provenance and then to any live local provenance
+/// of this frame, while never predicting a storage-dead local's provenance.
 fn predict_exposed_provenance_for_decls(
     addr_bits: u128,
     target_ty: &Ty,
@@ -3253,16 +3254,24 @@ fn predict_exposed_provenance_for_decls(
     ptr_width: PtrWidth,
     tracker: &ExposedProvenanceTracker,
 ) -> Option<crate::ir::Provenance> {
-    if !local_decls.is_empty() && tracker.exposed.len() > 1 {
+    let local_of = |prov: crate::ir::Provenance| -> Option<usize> {
+        prov.alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < local_decls.len())
+    };
+    let is_dead_local = |prov: crate::ir::Provenance| -> bool {
+        local_of(prov)
+            .is_some_and(|loc| slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))))
+    };
+    if !local_decls.is_empty() {
         let pointee_ty = target_ty.pointee_ty();
         let mut best: Option<(u8, crate::ir::Provenance)> = None;
         for &prov in &tracker.exposed {
-            let Some(loc) = prov
-                .alloc_id
-                .checked_sub(1)
-                .and_then(|id| usize::try_from(id).ok())
-                .filter(|&loc| loc < local_decls.len())
-            else {
+            if is_dead_local(prov) {
+                continue;
+            }
+            let Some(loc) = local_of(prov) else {
                 continue;
             };
             let Ok(base_addr) =
@@ -3277,14 +3286,11 @@ fn predict_exposed_provenance_for_decls(
             if addr_bits < base_addr || addr_bits > end_addr {
                 continue;
             }
-            let is_live = !slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead)));
             let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
             let tag_matches = pointee_ty
                 .and_then(|pty| decode_subplace_tag(prov.tag, pty))
                 .is_some();
-            let rank = (u8::from(is_live) << 2)
-                | (u8::from(is_interior) << 1)
-                | u8::from(tag_matches);
+            let rank = (u8::from(is_interior) << 1) | u8::from(tag_matches);
             if best.is_none_or(|(best_rank, _)| rank > best_rank) {
                 best = Some((rank, prov));
             }
@@ -3292,8 +3298,19 @@ fn predict_exposed_provenance_for_decls(
         if let Some((_, prov)) = best {
             return Some(prov);
         }
+        if let Some(&ext) = tracker
+            .exposed
+            .iter()
+            .find(|&&prov| local_of(prov).is_none())
+        {
+            return Some(ext);
+        }
     }
-    tracker.exposed.first().copied()
+    tracker
+        .exposed
+        .iter()
+        .copied()
+        .find(|&prov| !is_dead_local(prov))
 }
 
 /// Evaluates a `LoweredCast` on an evaluated `MirValue` operand under `ptr_width` and `policy`.
@@ -8889,6 +8906,11 @@ pub(crate) fn local_base_addr_in_frame(
     frame_base: u128,
 ) -> Result<u128, RvalueEvalError> {
     const PAGE: u128 = 0x1000;
+    if !frame_base.is_multiple_of(PAGE) {
+        return Err(RvalueEvalError::TypeMismatch(
+            "StatementEvalState::frame_addr_base must be a multiple of 0x1000",
+        ));
+    }
     let too_large = RvalueEvalError::UnsupportedMemoryAccess(
         "synthetic stack allocation does not fit the target address space",
     );
@@ -11291,9 +11313,10 @@ pub(crate) fn copy_nonoverlapping_values(
 /// undefined behavior, reading them later is). The value is then stored like
 /// `copy_nonoverlapping` stores a copied value: into the resolved synthetic sub-place for
 /// `count == 1` (a whole inactive union field is overwritten), or into a resolved contiguous
-/// window of array elements. A resolution fault of `dst` (undefined behavior such as
-/// `UninhabitedPointee`) is reported before any value is decoded; any other destination is
-/// `UnsupportedMemoryAccess`.
+/// window of array elements (partially initializing an uninitialized multi-element array is
+/// `UnsupportedMemoryAccess`, as arrays have no per-element initialization state). A resolution
+/// fault of `dst` (undefined behavior such as `UninhabitedPointee`) is reported before any
+/// value is decoded; any other destination is `UnsupportedMemoryAccess`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bytes_values(
     state: &mut StatementEvalState,
@@ -11316,11 +11339,22 @@ pub(crate) fn write_bytes_values(
             "write_bytes layout does not match element type layout",
         ));
     }
-    let (dst_ptr, dst_addr) = match dst_val {
+    let (dst_ptr, dst_addr, dst_ptr_ty) = match dst_val {
         MirValue::Ptr {
             ptr,
             ty: ptr_ty @ (Ty::RawPtr(pointee, Mutability::Mut) | Ty::Ref(pointee, Mutability::Mut)),
-        } if **pointee == *elem_ty => (*ptr, checked_ptr_addr(ptr, ptr_ty, ptr_width)?),
+        } if **pointee == *elem_ty => {
+            let addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
+            if ptr_ty.is_ref() && addr == 0 {
+                return Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ptr_ty.clone(),
+                        bits: 0,
+                    },
+                ));
+            }
+            (*ptr, addr, ptr_ty.clone())
+        }
         _ => {
             return Err(RvalueEvalError::TypeMismatch(
                 "write_bytes destination must be a mutable pointer to the element type",
@@ -11359,6 +11393,9 @@ pub(crate) fn write_bytes_values(
             required_align: elem_align,
         });
     }
+    if dst_ptr_ty.is_ref() && !elem_ty.is_inhabited_for(ptr_width) {
+        return Err(RvalueEvalError::UninhabitedPointee(elem_ty.clone()));
+    }
     let byte_len = count
         .checked_mul(elem_size as u128)
         .filter(|len| *len <= ptr_width.max_object_size())
@@ -11375,6 +11412,17 @@ pub(crate) fn write_bytes_values(
                 CastEvalError::InvalidBitPattern { .. } | CastEvalError::UninhabitedTarget { .. },
             ) => RvalueEvalError::UnsupportedMemoryAccess(
                 "write_bytes stores bytes that are not a valid value of the element type",
+            ),
+            other => other,
+        })
+    };
+    // Writing bytes into only part of an uninitialized multi-element array is defined in Rust
+    // (only reading an uninitialized element later is UB), but `MirValue::Array` has no
+    // per-element initialization state, so partial array initialization fails closed.
+    let map_partial_uninit = |res: Result<(), RvalueEvalError>| {
+        res.map_err(|err| match err {
+            RvalueEvalError::UninitializedLocal(_) => RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes partially initializes an uninitialized array",
             ),
             other => other,
         })
@@ -11399,7 +11447,6 @@ pub(crate) fn write_bytes_values(
         return Ok(());
     }
     let dummy_place = Place::from_local(0);
-    let dst_ptr_ty = dst_val.ty();
     let (dst_local, dst_proj) = match state.resolve_synthetic_subplace_with_mode(
         &dst_ptr,
         &dst_ptr_ty,
@@ -11417,9 +11464,9 @@ pub(crate) fn write_bytes_values(
         Err(err) => return Err(err),
     };
     // `count > 1`: a contiguous window of array elements (also of zero-sized elements, whose
-    // whole window `[start, start + count)` is recorded when it fits the array).
+    // whole window `[start, start + count)` is recorded when it fits the array; for `byte_len
+    // == 0`, `count >= dst_len` starting at `0` covers every zero-sized element at offset `0`).
     if count > 1
-        && let (Ok(count_u64), Ok(count_usize)) = (u64::try_from(count), usize::try_from(count))
         && let Some((
             &ProjectionElem::ConstantIndex {
                 offset: dst_start,
@@ -11428,49 +11475,58 @@ pub(crate) fn write_bytes_values(
             },
             dst_arr_proj,
         )) = dst_proj.split_last()
-        && let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len)
         && let Ok(dst_len_usize) = usize::try_from(dst_len)
     {
-        if count_usize > MAX_EVAL_ARRAY_LEN {
-            return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
-        }
-        // Overwriting only part of an inactive union array field is unsupported without a byte
-        // memory model; overwriting the entire field switches the union's active field.
-        if (dst_start != 0 || count_usize != dst_len_usize)
-            && !slot_union_path_active(&state.slots[dst_local.0], dst_arr_proj, false)
+        let effective_count = if byte_len == 0 && dst_start == 0 && count >= u128::from(dst_len) {
+            u128::from(dst_len)
+        } else {
+            count
+        };
+        if let (Ok(count_u64), Ok(count_usize)) =
+            (u64::try_from(effective_count), usize::try_from(effective_count))
+            && let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len)
         {
-            return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+            if count_usize > MAX_EVAL_ARRAY_LEN {
+                return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
+            }
+            // Overwriting only part of an inactive union array field is unsupported without a byte
+            // memory model; overwriting the entire field switches the union's active field.
+            if (dst_start != 0 || count_usize != dst_len_usize)
+                && !slot_union_path_active(&state.slots[dst_local.0], dst_arr_proj, false)
+            {
+                return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+            }
+            if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+                return Ok(());
+            }
+            let window = MirValue::Array {
+                elements: vec![decode_elem()?; count_usize],
+                elem_ty: elem_ty.clone(),
+            };
+            if dst_start == 0 && count_usize == dst_len_usize {
+                let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+                return map_partial_uninit(state.write_subplace_slot(
+                    dst_local,
+                    dst_arr_proj,
+                    &arr_ty,
+                    FieldSlot::Init(window),
+                    dst_local,
+                    &dummy_place,
+                ));
+            }
+            let mut dst_slice_proj = dst_arr_proj.to_vec();
+            dst_slice_proj.push(ProjectionElem::Subslice {
+                from: dst_start,
+                to: dst_end,
+                from_end: false,
+            });
+            let dst_slice_place = Place {
+                local: dst_local,
+                projection: dst_slice_proj,
+            };
+            let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
+            return map_partial_uninit(state.write_place(&dst_slice_place, &slice_ty, window));
         }
-        if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
-            return Ok(());
-        }
-        let window = MirValue::Array {
-            elements: vec![decode_elem()?; count_usize],
-            elem_ty: elem_ty.clone(),
-        };
-        if dst_start == 0 && count_usize == dst_len_usize {
-            let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
-            return state.write_subplace_slot(
-                dst_local,
-                dst_arr_proj,
-                &arr_ty,
-                FieldSlot::Init(window),
-                dst_local,
-                &dummy_place,
-            );
-        }
-        let mut dst_slice_proj = dst_arr_proj.to_vec();
-        dst_slice_proj.push(ProjectionElem::Subslice {
-            from: dst_start,
-            to: dst_end,
-            from_end: false,
-        });
-        let dst_slice_place = Place {
-            local: dst_local,
-            projection: dst_slice_proj,
-        };
-        let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
-        return state.write_place(&dst_slice_place, &slice_ty, window);
     }
     // A single element: `count == 1`, or the one sub-place that all `count` zero-sized
     // elements share.
@@ -11500,14 +11556,14 @@ pub(crate) fn write_bytes_values(
         return Ok(());
     }
     let elem_val = decode_elem()?;
-    state.write_subplace_slot(
+    map_partial_uninit(state.write_subplace_slot(
         dst_local,
         &dst_proj,
         elem_ty,
         FieldSlot::Init(elem_val),
         dst_local,
         &dummy_place,
-    )
+    ))
 }
 
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.

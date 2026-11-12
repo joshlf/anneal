@@ -4481,3 +4481,567 @@ fn test_a1_linked_calls_from_cleanup_blocks_return_into_the_unwinding_caller() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial Round B2 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b2_write_bytes_zero_count_rejects_uninhabited_refs_and_partial_uninit_arrays_fail_closed() {
+    for pw in PWS {
+        // 1. `&mut !` and `&mut (!, u32)` are invalid reference values even when `count == 0`.
+        let uninh_pair = Ty::Tuple(vec![Ty::Never, u32_ty()]);
+        for uninh_ty in [Ty::Never, uninh_pair] {
+            let ref_mut_ty = reference(uninh_ty.clone(), Mutability::Mut);
+            let body = mk(
+                vec![unit(), ref_mut_ty.clone()],
+                vec![
+                    blk(
+                        vec![],
+                        call(
+                            intrinsic(IntrinsicOp::WriteBytes),
+                            vec![cp(1), cst(0, u8_ty()), cst(0, usize_ty())],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            );
+            let bad_ref = MirValue::ptr(PointerValue::with_provenance(0x100, 999, 0), ref_mut_ty);
+            assert_eq!(
+                term_err(eval_lowered_body_cfg(&lower(&body, pw), &[bad_ref], 4)),
+                (0, RvalueEvalError::UninhabitedPointee(uninh_ty))
+            );
+        }
+
+        // 2. Writing into only part of an uninitialized multi-element array (`count == 1` or
+        //    `count == 2` on `[u8; 4]`, or `count == 2` on `[(); 4]`) is defined in Rust, so
+        //    Anneal must fail closed with `UnsupportedMemoryAccess` rather than falsely claiming
+        //    undefined behavior (`UninitializedLocal`).
+        for (elem_ty, count) in [(u8_ty(), 1u128), (u8_ty(), 2), (unit(), 2)] {
+            let arr_ty = Ty::Array(Box::new(elem_ty.clone()), 4);
+            let ptr_ty = raw(elem_ty.clone(), Mutability::Mut);
+            let partial = mk(
+                vec![unit(), arr_ty, ptr_ty],
+                vec![
+                    blk(
+                        vec![
+                            live(1),
+                            live(2),
+                            assign(
+                                2,
+                                Rvalue::RawPtr(
+                                    Mutability::Mut,
+                                    Place {
+                                        local: Local(1),
+                                        projection: vec![ProjectionElem::ConstantIndex {
+                                            offset: 0,
+                                            min_length: 4,
+                                            from_end: false,
+                                        }],
+                                    },
+                                ),
+                            ),
+                        ],
+                        call(
+                            intrinsic(IntrinsicOp::WriteBytes),
+                            vec![cp(2), cst(0xAA, u8_ty()), cst(count, usize_ty())],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            );
+            assert!(
+                matches!(
+                    term_err(eval_lowered_body_cfg(&lower(&partial, pw), &[], 4)),
+                    (0, RvalueEvalError::UnsupportedMemoryAccess(_))
+                ),
+                "partial write_bytes({elem_ty:?}, count={count}) on {pw:?} must not report UB"
+            );
+        }
+
+        // 3. Zero-sized `count >= N` (`count == 5` at offset `0` of `[(); 4]`) covers every
+        //    zero-sized element of `[(); 4]` and initializes it cleanly.
+        let zst_arr = Ty::Array(Box::new(unit()), 4);
+        let raw_mut_unit = raw(unit(), Mutability::Mut);
+        let over_zst = mk(
+            vec![zst_arr.clone(), zst_arr, raw_mut_unit, unit()],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        assign(
+                            2,
+                            Rvalue::RawPtr(
+                                Mutability::Mut,
+                                Place {
+                                    local: Local(1),
+                                    projection: vec![ProjectionElem::ConstantIndex {
+                                        offset: 0,
+                                        min_length: 4,
+                                        from_end: false,
+                                    }],
+                                },
+                            ),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::WriteBytes),
+                        vec![cp(2), cst(0, u8_ty()), cst(5, usize_ty())],
+                        3,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(1)))], Terminator::Return),
+            ],
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&lower(&over_zst, pw), &[], 4)),
+            MirValue::Array {
+                elements: vec![MirValue::Unit; 4],
+                elem_ty: unit(),
+            }
+        );
+    }
+}
+
+#[test]
+fn test_b2_dead_local_provenance_is_never_predicted_for_caller_or_external_addresses() {
+    for pw in PWS {
+        let raw_mut_u32 = raw(u32_ty(), Mutability::Mut);
+        // Callee exposes its own `_2`, drops `_2` (`StorageDead(2)`), then casts the caller's
+        // exposed address `_1` via `PointerWithExposedProvenance` and dereferences it: must fail
+        // closed with `UnsupportedPlaceProjection`, never false UB `DeadLocal(Local(2))`.
+        let reread_after_dead = lower(
+            &exposing_fn(
+                u32_ty(),
+                vec![raw_mut_u32.clone()],
+                vec![
+                    Statement::StorageDead(Local(2)),
+                    assign(
+                        5,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_mut_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::Use(Operand::Copy(Place::with_projection(
+                            5,
+                            vec![ProjectionElem::Deref],
+                        ))),
+                    ),
+                ],
+                Terminator::Return,
+            ),
+            pw,
+        );
+        let caller = lower(
+            &exposing_fn(
+                u32_ty(),
+                vec![],
+                vec![],
+                call(
+                    callee("reread_after_dead"),
+                    vec![cp(4)],
+                    0,
+                    Some(1),
+                    UnwindAction::Continue,
+                ),
+            ),
+            pw,
+        );
+        let table = CallTable::new().with_callee("reread_after_dead", 1, reread_after_dead);
+        match eval_lowered_body_cfg_with_call_table(&caller, &[usizev(0, pw)], 4, &table) {
+            Err(CfgEvalError::InCallee { call_stack, error }) => {
+                assert_eq!(
+                    call_stack,
+                    vec![CallSite {
+                        bb: 0,
+                        callee: CalleeSymbol::new("reread_after_dead")
+                    }]
+                );
+                assert!(
+                    matches!(
+                        *error,
+                        CfgEvalError::Statement {
+                            bb: 0,
+                            error: RvalueEvalError::UnsupportedPlaceProjection(_),
+                            ..
+                        }
+                    ),
+                    "expected UnsupportedPlaceProjection, got {error:?}"
+                );
+            }
+            other => panic!("expected InCallee UnsupportedPlaceProjection, got {other:?}"),
+        }
+
+        // Single-frame: exposing `_1`, running `StorageDead(1)`, then casting an external
+        // ZST address `0x8000` via `PointerWithExposedProvenance` and calling `copy_nonoverlapping`
+        // (`count == 1`) must NOT attach `_1`'s dead provenance and falsely report `DeadLocal`.
+        let raw_const_unit = raw(unit(), Mutability::Not);
+        let raw_mut_unit = raw(unit(), Mutability::Mut);
+        let single = mk(
+            vec![
+                unit(),
+                u32_ty(),
+                raw_mut_u32,
+                usize_ty(),
+                raw_const_unit,
+                raw_mut_unit,
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        assign(1, Rvalue::Use(cst(1, u32_ty()))),
+                        assign(2, Rvalue::RawPtr(Mutability::Mut, place(1))),
+                        assign(
+                            3,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(2), usize_ty()),
+                        ),
+                        Statement::StorageDead(Local(1)),
+                        assign(
+                            4,
+                            Rvalue::Cast(
+                                CastKind::PointerWithExposedProvenance,
+                                cst(0x8000, usize_ty()),
+                                raw(unit(), Mutability::Not),
+                            ),
+                        ),
+                        assign(
+                            5,
+                            Rvalue::Cast(
+                                CastKind::PointerWithExposedProvenance,
+                                cst(0x8008, usize_ty()),
+                                raw(unit(), Mutability::Mut),
+                            ),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::CopyNonOverlapping),
+                        vec![cp(4), cp(5), cst(1, usize_ty())],
+                        0,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&lower(&single, pw), &[], 4)),
+            MirValue::Unit
+        );
+    }
+}
+
+#[test]
+fn test_b2_call_table_propagates_exposed_provenance_monotonicity_across_calls_and_unwinds() {
+    for pw in PWS {
+        let raw_const_u32 = raw(u32_ty(), Mutability::Not);
+        let pair_u32 = Ty::Tuple(vec![u32_ty(), u32_ty(), u32_ty()]);
+        let raw_pair = raw(pair_u32.clone(), Mutability::Not);
+
+        // 1. Caller exposes `&raw const pair as usize`; linked callee `offset_one` reconstructs
+        //    `*const u32` via `PointerWithExposedProvenance`, runs `BinOp::Offset(1)` (`+4`), and
+        //    returns the pointer; caller runs `BinOp::Offset(1)` (`+4`) again and exposes as `usize`.
+        let offset_one = mk(
+            vec![raw_const_u32.clone(), usize_ty(), raw_const_u32.clone()],
+            vec![blk(
+                vec![
+                    live(2),
+                    assign(
+                        2,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_const_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Offset, cp(2), cst(1, isize_ty())),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+        let caller_to_callee = mk(
+            vec![
+                usize_ty(),
+                pair_u32,
+                raw_pair,
+                usize_ty(),
+                raw_const_u32.clone(),
+                raw_const_u32,
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        assign(
+                            1,
+                            Rvalue::Aggregate(
+                                AggregateKind::Tuple,
+                                vec![cst(10, u32_ty()), cst(20, u32_ty()), cst(30, u32_ty())],
+                            ),
+                        ),
+                        assign(2, Rvalue::RawPtr(Mutability::Not, place(1))),
+                        assign(
+                            3,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(2), usize_ty()),
+                        ),
+                    ],
+                    call(
+                        callee("offset_one"),
+                        vec![cp(3)],
+                        4,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![
+                        assign(
+                            5,
+                            Rvalue::BinaryOp(BinOp::Offset, cp(4), cst(1, isize_ty())),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(5), usize_ty()),
+                        ),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        let table = CallTable::new().with_callee("offset_one", 1, lower(&offset_one, pw));
+        // `pair` is local `_1` in the root frame (`0x2000`), `+ 2 * sizeof::<u32>()` = `0x2008`.
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&caller_to_callee, pw),
+                &[],
+                8,
+                &table,
+            )),
+            usizev(0x2008, pw)
+        );
+
+        // 2. Callee exposes an external pointer (`alloc_id = 99`) and returns its address (or
+        //    unwinds after exposing it); caller reconstructs via `PointerWithExposedProvenance`
+        //    and performs `BinOp::Offset(3)` cleanly.
+        let raw_u8 = raw(u8_ty(), Mutability::Not);
+        let expose_ext = mk(
+            vec![usize_ty(), raw_u8.clone()],
+            vec![blk(
+                vec![assign(
+                    0,
+                    Rvalue::Cast(CastKind::PointerExposeProvenance, cp(1), usize_ty()),
+                )],
+                Terminator::Return,
+            )],
+        );
+        let expose_and_panic = mk(
+            vec![Ty::Never, raw_u8.clone(), usize_ty()],
+            vec![blk(
+                vec![
+                    live(2),
+                    assign(
+                        2,
+                        Rvalue::Cast(CastKind::PointerExposeProvenance, cp(1), usize_ty()),
+                    ),
+                ],
+                call(
+                    intrinsic(IntrinsicOp::PanicUnwind),
+                    vec![],
+                    0,
+                    None,
+                    UnwindAction::Continue,
+                ),
+            )],
+        );
+        let caller_from_callee = mk(
+            vec![raw_u8.clone(), raw_u8.clone(), usize_ty(), raw_u8.clone()],
+            vec![
+                blk(
+                    vec![live(2), live(3)],
+                    call(
+                        callee("expose_ext"),
+                        vec![cp(1)],
+                        2,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![
+                        assign(
+                            3,
+                            Rvalue::Cast(
+                                CastKind::PointerWithExposedProvenance,
+                                cp(2),
+                                raw_u8.clone(),
+                            ),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::BinaryOp(BinOp::Offset, cp(3), cst(3, isize_ty())),
+                        ),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        let caller_cleanup_after_callee_expose = mk(
+            vec![unit(), raw_u8.clone(), usize_ty(), raw_u8.clone(), raw_u8.clone()],
+            vec![
+                blk(
+                    vec![live(3), live(4)],
+                    call(
+                        callee("expose_and_panic"),
+                        vec![cp(1)],
+                        0,
+                        None,
+                        UnwindAction::Cleanup(1),
+                    ),
+                ),
+                cleanup_blk(
+                    vec![
+                        assign(
+                            3,
+                            Rvalue::Cast(
+                                CastKind::PointerWithExposedProvenance,
+                                cp(2),
+                                raw_u8.clone(),
+                            ),
+                        ),
+                        assign(
+                            4,
+                            Rvalue::BinaryOp(BinOp::Offset, cp(3), cst(2, isize_ty())),
+                        ),
+                    ],
+                    Terminator::UnwindResume,
+                ),
+            ],
+        );
+        let table2 = CallTable::new()
+            .with_callee("expose_ext", 1, lower(&expose_ext, pw))
+            .with_callee("expose_and_panic", 1, lower(&expose_and_panic, pw));
+        let ext_ptr = MirValue::ptr(PointerValue::with_provenance(0x50000, 99, 0), raw_u8.clone());
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&caller_from_callee, pw),
+                std::slice::from_ref(&ext_ptr),
+                8,
+                &table2,
+            )),
+            MirValue::ptr(PointerValue::with_provenance(0x50003, 99, 0), raw_u8)
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&caller_cleanup_after_callee_expose, pw),
+                &[ext_ptr, usizev(0x50000, pw)],
+                8,
+                &table2,
+            ),
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: PanicMessage::Intrinsic(IntrinsicOp::PanicUnwind),
+            })
+        );
+    }
+}
+
+#[test]
+fn test_b2_unaligned_frame_addr_base_is_rejected_and_multi_depth_out_of_fuel_resumes_cleanly() {
+    let table = table(PW);
+    let main = lower(
+        &main_fn(
+            "inc_double",
+            Some(1),
+            UnwindAction::Continue,
+            Terminator::UnwindResume,
+        ),
+        PW,
+    );
+    let mut bad_state = StatementEvalState::from_body(&main, &[u32v(5)]).unwrap();
+    bad_state.frame_addr_base = 3;
+    assert!(matches!(
+        eval_cfg_in_state(&main, bad_state.clone(), 0, 8, None),
+        Err(CfgEvalError::InvalidArguments(RvalueEvalError::TypeMismatch(_)))
+    ));
+    assert!(matches!(
+        eval_cfg_in_state_with_call_table(&main, bad_state.clone(), 0, 8, &table, None),
+        Err(CfgEvalError::InvalidArguments(RvalueEvalError::TypeMismatch(_)))
+    ));
+    let raw_stmt = LoweredStatement::Assign {
+        place: place(0),
+        place_ty: raw(u32_ty(), Mutability::Not),
+        rvalue: LoweredRvalue::Ref {
+            mutability: Mutability::Not,
+            place: place(1),
+            ty: raw(u32_ty(), Mutability::Not),
+        },
+    };
+    bad_state.local_decls[0] = raw(u32_ty(), Mutability::Not);
+    assert!(matches!(
+        eval_lowered_statement(&raw_stmt, &mut bad_state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // Resuming from `OutOfFuel` across a 2-deep linked call chain (`main -> inc_double -> double`,
+    // where `main` moves `_1` into `inc_double`) at every single intermediate fuel budget `0..=5`
+    // restores `main`'s pre-move state and converges to the exact full-fuel result `12`.
+    let move_main = lower(
+        &mk(
+            vec![u32_ty(), u32_ty()],
+            vec![
+                blk(
+                    vec![],
+                    call(
+                        callee("inc_double"),
+                        vec![mv(1)],
+                        0,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        ),
+        PW,
+    );
+    for first_fuel in 0..=5 {
+        let init = StatementEvalState::from_body(&move_main, &[u32v(5)]).unwrap();
+        let outcome =
+            eval_cfg_in_state_with_call_table(&move_main, init, 0, first_fuel, &table, None)
+                .unwrap();
+        let final_val = match outcome {
+            CfgEvalOutcome::Returned(v) => v,
+            CfgEvalOutcome::OutOfFuel { bb, state } => returned(
+                eval_cfg_in_state_with_call_table(&move_main, state, bb, 16, &table, None),
+            ),
+            other => panic!("unexpected outcome at fuel={first_fuel}: {other:?}"),
+        };
+        assert_eq!(final_val, u32v(12), "mismatch resuming from fuel={first_fuel}");
+    }
+}
