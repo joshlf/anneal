@@ -6539,7 +6539,9 @@ theorem checkFromBytesNicheAware_ignores_fieldLayouts
 `#[repr(C)] struct Packet { header: [u8; 4], tag: u32 }` (where `header`'s field
 layout is `.array ⟨1⟩ 4` pointing to a `u8` `.primitive` layout), both
 `checkFromBytesNicheAware` and the recursive `checkStage1Decodable` evaluate to
-`true` and certify `IsFromBytesTyped` and `IsFromZerosTyped`.
+`true` and certify `IsFromBytesTyped` and `IsFromZerosTyped`. The wrapper's own
+backend may be any representation that `checkBackendReprFullRange` accepts, such
+as the `.memory` backend that `rustc` gives a struct with an array field.
 -/
 theorem checkFromBytesNicheAware_composite_fieldLayouts_stage1_sound
     (layouts : LayoutTable) (defPath : DefPath)
@@ -6551,9 +6553,7 @@ theorem checkFromBytesNicheAware_composite_fieldLayouts_stage1_sound
     (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] [0, 1])
     (hFieldLayouts : l.fieldLayouts = [arrFlIdx, u32FlIdx])
     (hSz : l.size.bytes = 8)
-    (hRepr : l.backendRepr = .scalarPair
-      (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩)
-      (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩))
+    (hFull : checkBackendReprFullRange l = true)
     (hArrLookup : LayoutTable.lookup layouts arrFlIdx = some arrFl)
     (hArrInhab : arrFl.isUninhabited = false)
     (hArrVar : arrFl.variants = .single 0)
@@ -6588,12 +6588,9 @@ theorem checkFromBytesNicheAware_composite_fieldLayouts_stage1_sound
     rw [hLookup]
     rfl
   have hCheck : checkFromBytesNicheAware layouts packetTy = true := by
-    unfold checkFromBytesNicheAware checkBackendReprFullRange
+    unfold checkFromBytesNicheAware
     rw [hCFB]
-    rw [hLookup]
-    dsimp only
-    rw [hRepr]
-    rfl
+    simp only [packetTy, hLookup, Bool.true_and, hFull]
   have hStage1 : checkStage1Decodable layouts packetTy = true := by
     unfold checkStage1Decodable checkAdtStage1Decodable
     rw [hLookup]
