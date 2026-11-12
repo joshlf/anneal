@@ -1263,6 +1263,21 @@ theorem partialOraclePred_eq_false_iff (pred? : List α → Option Bool) (ys : L
   | none => simp
   | some b => cases b <;> simp
 
+/-- Soundness of `shrinkMutatorChain` under a partial oracle: even when some
+oracle queries fail (`pred? ys = none`), the returned chain is a sublist of `xs`
+with length `≤ xs.length` that the oracle positively confirmed (`some true`). -/
+theorem shrinkMutatorChain_partialOracle_sound (fuel : Nat)
+    (pred? : List α → Option Bool) (xs : List α) (h_xs : pred? xs = some true) :
+    let r := shrinkMutatorChain fuel (partialOraclePred pred?) xs
+    pred? r = some true ∧ r.Sublist xs ∧ r.length ≤ xs.length := by
+  intro r
+  have h_pred : partialOraclePred pred? xs = true :=
+    (partialOraclePred_eq_true_iff pred? xs).mpr h_xs
+  exact ⟨(partialOraclePred_eq_true_iff pred? r).mp
+      (shrinkMutatorChain_preserves_discrepancy fuel (partialOraclePred pred?) xs h_pred),
+    shrinkMutatorChain_sublist fuel (partialOraclePred pred?) xs,
+    shrinkMutatorChain_len_le fuel (partialOraclePred pred?) xs⟩
+
 /-- Soundness of `ddminReference` under a partial oracle: even when some oracle
 queries fail (`pred? ys = none`), any returned chain `r` is a sublist of `xs`
 with `r.length ≤ xs.length` that the oracle positively confirmed
@@ -1293,6 +1308,26 @@ theorem isOneMinimal_partialOracle_iff_all_some_false (pred? : List α → Optio
     · rw [hb] at hf
       contradiction
   · exact (partialOraclePred_eq_false_iff pred? ys).mpr (Or.inl (h ys hys))
+
+/-- When `shrinkMutatorChain fuel (partialOraclePred pred?) xs` runs with
+`xs.length ≤ fuel` and every single-step deletion of its result `r` was answered
+by the oracle without failure, `r` is confirmed (`pred? r = some true`) and every
+single-step deletion of `r` was confirmed to be rejected (`some false`). -/
+theorem shrinkMutatorChain_partialOracle_confirmed_one_minimal (fuel : Nat)
+    (pred? : List α → Option Bool) (xs : List α)
+    (h_xs : pred? xs = some true) (h_fuel : xs.length ≤ fuel)
+    (h_no_fail : ∀ ys ∈ dropOneCandidates
+      (shrinkMutatorChain fuel (partialOraclePred pred?) xs), ∃ b, pred? ys = some b) :
+    let r := shrinkMutatorChain fuel (partialOraclePred pred?) xs
+    pred? r = some true ∧
+      (∀ ys ∈ dropOneCandidates r, pred? ys = some false) ∧ r.Sublist xs := by
+  intro r
+  have h_pred : partialOraclePred pred? xs = true :=
+    (partialOraclePred_eq_true_iff pred? xs).mpr h_xs
+  have hmin := shrinkMutatorChain_one_minimal fuel (partialOraclePred pred?) xs h_pred h_fuel
+  obtain ⟨hr, h_all_false⟩ :=
+    (isOneMinimal_partialOracle_iff_all_some_false pred? r h_no_fail).mp hmin
+  exact ⟨hr, h_all_false, shrinkMutatorChain_sublist fuel (partialOraclePred pred?) xs⟩
 
 /-- When `ddminReference (partialOraclePred pred?)` succeeds and every single-step
 deletion of `r` was answered by the oracle without failure (in particular, when
@@ -2025,8 +2060,10 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms containsAll_shrinkers_disagree_on_repeated_step
 #print axioms coupled_window_one_minimal_not_globally_minimal
 #print axioms shrinkMutatorChain_fuel_bound_tight
+#print axioms shrinkMutatorChain_partialOracle_sound
 #print axioms ddminReference_partialOracle_sound
 #print axioms isOneMinimal_partialOracle_iff_all_some_false
+#print axioms shrinkMutatorChain_partialOracle_confirmed_one_minimal
 #print axioms ddminReference_partialOracle_confirmed_one_minimal
 #print axioms partialOracle_failure_masks_smaller_witness
 #print axioms bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false
@@ -2067,8 +2104,10 @@ export Anneal.DiffTestShrinker (
   ddminReference_globally_minimal_of_monotone
   ddminReference_containsAll_eq_some_filter
   containsAll_shrinkMutatorChain_eq_ddminReference
-  partialOraclePred ddminReference_partialOracle_sound
+  partialOraclePred shrinkMutatorChain_partialOracle_sound
+  ddminReference_partialOracle_sound
   isOneMinimal_partialOracle_iff_all_some_false
+  shrinkMutatorChain_partialOracle_confirmed_one_minimal
   ddminReference_partialOracle_confirmed_one_minimal
   bvShlSafe bvLshrSafe bvAshrSafe
   bvShlOverflowing bvLshrOverflowing bvAshrOverflowing

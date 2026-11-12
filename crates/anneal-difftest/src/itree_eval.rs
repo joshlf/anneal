@@ -2630,6 +2630,9 @@ pub struct ItreeCandidateShrinkResult {
     /// First trace of `minimized_candidate` that reproduced the signature, when
     /// shrinking reduced the chain.
     pub minimized_trace: Option<ItreeTraceVerdict>,
+    /// All divergent traces of `minimized_candidate` that reproduced the
+    /// signature, in evaluation order, when shrinking reduced the chain.
+    pub minimized_traces: Vec<ItreeTraceVerdict>,
 }
 
 impl ItreeCandidateShrinkResult {
@@ -2637,6 +2640,22 @@ impl ItreeCandidateShrinkResult {
     /// the original candidate.
     pub fn is_reduced(&self) -> bool {
         self.minimized_mutator_chain.len() < self.original_mutator_chain.len()
+    }
+
+    /// Pick the minimized trace from this shrink result that best corresponds to
+    /// `finding` (the `ordinal`-th finding of its candidate and signature):
+    /// prefers an identical `trace_hex`, then the `ordinal`-th matching trace,
+    /// and finally `minimized_trace`.
+    pub fn select_trace_for_finding(
+        &self,
+        finding: &ItreeFindingBundle,
+        ordinal: usize,
+    ) -> Option<&ItreeTraceVerdict> {
+        self.minimized_traces
+            .iter()
+            .find(|t| t.trace_hex == finding.trace_hex)
+            .or_else(|| self.minimized_traces.get(ordinal))
+            .or(self.minimized_trace.as_ref())
     }
 }
 
@@ -2661,6 +2680,7 @@ fn unshrunk_itree_result(
         status,
         minimized_candidate: cand.clone(),
         minimized_trace: None,
+        minimized_traces: Vec::new(),
     }
 }
 
@@ -2731,7 +2751,11 @@ where
     let mut compile_rejections = 0usize;
     let mut oracle_failures = 0usize;
     // Last accepted reduction, keyed by the original pass indices it retains.
-    let mut last_accepted: Option<(Vec<usize>, GeneratedItreeCandidate, ItreeTraceVerdict)> = None;
+    let mut last_accepted: Option<(
+        Vec<usize>,
+        GeneratedItreeCandidate,
+        Vec<ItreeTraceVerdict>,
+    )> = None;
 
     let outcome = shrink_mutation_chain_detailed(steps, |sub_steps: &[ItreeMutationStep]| {
         if sub_steps.len() == full_len {
@@ -2749,16 +2773,17 @@ where
             oracle_failures += 1;
             return false;
         };
-        let Some(trace) = evaluation
+        let matching_traces: Vec<ItreeTraceVerdict> = evaluation
             .divergent_traces
             .iter()
-            .find(|t| signature.matches(t))
+            .filter(|t| signature.matches(t))
             .cloned()
-        else {
+            .collect();
+        if matching_traces.is_empty() {
             return false;
-        };
+        }
         let kept: Vec<usize> = sub_steps.iter().map(|s| s.pass_index).collect();
-        last_accepted = Some((kept, sub_cand, trace));
+        last_accepted = Some((kept, sub_cand, matching_traces));
         true
     });
 
@@ -2767,7 +2792,7 @@ where
     let minimized_indices: Vec<usize> =
         outcome.minimized_steps.iter().map(|s| s.pass_index).collect();
     if minimized_indices.len() < full_len
-        && let Some((kept, min_cand, trace)) = last_accepted
+        && let Some((kept, min_cand, traces)) = last_accepted
         && kept == minimized_indices
     {
         return ItreeCandidateShrinkResult {
@@ -2780,7 +2805,8 @@ where
             oracle_failures,
             status: ItreeShrinkStatus::of_completed_shrink(true, oracle_failures),
             minimized_candidate: min_cand,
-            minimized_trace: Some(trace),
+            minimized_trace: traces.first().cloned(),
+            minimized_traces: traces,
         };
     }
     unshrunk_itree_result(
@@ -2983,7 +3009,10 @@ pub fn minimize_itree_candidate_mutations(
 /// finding's repro-facing artifacts (`repro.rs` source, trace, diagnosis, MIR,
 /// and kernel theorems) from the run that accepted the minimized candidate.
 ///
-/// Findings of one candidate with the same signature share one shrink.
+/// Findings of one candidate share a compile cache and a per-candidate live
+/// oracle cache, and findings with the same `(fn_name, diag_tag, kernel_confirmed)`
+/// signature share one shrink while selecting distinct minimized traces via
+/// [`ItreeCandidateShrinkResult::select_trace_for_finding`].
 fn shrink_itree_findings(
     report: &mut ItreeCampaignEvalReport,
     mode: &str,
@@ -2993,7 +3022,11 @@ fn shrink_itree_findings(
     options: &ItreeEvalOptions,
 ) {
     let entries = batch_entries(batches);
+    let mut compile_memo = MemoizedOracle::new(itree_candidate_passes_strict_compile);
+    let mut eval_cache_by_cand: BTreeMap<String, BTreeMap<String, Option<ItreeCandidateEvaluation>>> =
+        BTreeMap::new();
     let mut shrinks: BTreeMap<(String, String, bool), ItreeCandidateShrinkResult> = BTreeMap::new();
+    let mut ordinals: BTreeMap<(String, String, bool), usize> = BTreeMap::new();
     for finding in &mut report.findings {
         let Some(entry) = entries.iter().find(|e| e.root_fn_name() == finding.fn_name) else {
             finding.shrink_status = format!(
@@ -3008,6 +3041,12 @@ fn shrink_itree_findings(
             signature.diag_tag.clone(),
             signature.kernel_confirmed,
         );
+        let ord = {
+            let count = ordinals.entry(key.clone()).or_insert(0);
+            let cur = *count;
+            *count += 1;
+            cur
+        };
         let res = shrinks.entry(key).or_insert_with(|| {
             let ctx = ItreeShrinkContext {
                 mode,
@@ -3018,7 +3057,39 @@ fn shrink_itree_findings(
                 b_idx: entry.b_idx,
                 c_idx: entry.c_idx,
             };
-            minimize_itree_candidate_mutations(entry.cand, ITREE_SAFE_SEEDS, &signature, &ctx)
+            let cand_cache = eval_cache_by_cand
+                .entry(finding.fn_name.clone())
+                .or_default();
+            let mut distinct_queried: BTreeSet<String> = BTreeSet::new();
+            let mut sr = minimize_itree_candidate_mutations_with_compile_check(
+                entry.cand,
+                ITREE_SAFE_SEEDS,
+                &signature,
+                |sub| compile_memo.eval(sub.source.clone(), sub),
+                |sub| {
+                    distinct_queried.insert(sub.source.clone());
+                    if let Some(cached) = cand_cache.get(&sub.source) {
+                        return cached.clone();
+                    }
+                    let evaluated = match evaluate_itree_candidate_live(sub, &ctx) {
+                        Ok(evaluation) => Some(evaluation),
+                        Err(e) => {
+                            eprintln!(
+                                "itree-difftest: shrink oracle run failed for b{}_c{} ({} mutators): {}",
+                                ctx.b_idx,
+                                ctx.c_idx,
+                                sub.applied_mutators.len(),
+                                truncate_lean_diag(&e)
+                            );
+                            None
+                        }
+                    };
+                    cand_cache.insert(sub.source.clone(), evaluated.clone());
+                    evaluated
+                },
+            );
+            sr.executed_oracle_runs = distinct_queried.len();
+            sr
         });
         finding.original_mutator_chain = res.original_mutator_chain.clone();
         finding.minimized_mutator_chain = res.minimized_mutator_chain.clone();
@@ -3026,7 +3097,7 @@ fn shrink_itree_findings(
         finding.executed_oracle_runs = res.executed_oracle_runs;
         finding.shrink_status = res.status.slug().to_string();
         if res.is_reduced()
-            && let Some(trace) = &res.minimized_trace
+            && let Some(trace) = res.select_trace_for_finding(finding, ord)
         {
             finding.applied_mutators = res.minimized_mutator_chain.clone();
             finding.candidate_source = res.minimized_candidate.source.clone();
@@ -4403,5 +4474,64 @@ mod tests {
         assert!(
             summary_md.contains("- **Shrink evaluations**: `3` (live oracle runs executed: `2`)")
         );
+    }
+
+    #[test]
+    fn itree_shrink_result_retains_all_matching_traces_and_selects_distinct_finding_traces() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        let mut t0 = trace_verdict("case_b0_c0__kernel_step_t0", "outcome_mismatch", true);
+        t0.trace_hex = "aa00".to_string();
+        let mut t1 = trace_verdict("case_b0_c0__kernel_step_t1", "outcome_mismatch", true);
+        t1.trace_hex = "bb11".to_string();
+        let unrelated = trace_verdict("case_b0_c0__kernel_step_t2", "event_mismatch", true);
+        let res = minimize_itree_recorded_mutations_with_compile_check(
+            &cand,
+            &base,
+            &steps,
+            &outcome_mismatch_signature(),
+            |_| true,
+            |sub| {
+                if subsets[&sub.source] == 0b00 {
+                    divergent(vec![t0.clone(), unrelated.clone(), t1.clone()])
+                } else {
+                    divergent(Vec::new())
+                }
+            },
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+        assert_eq!(res.minimized_traces.len(), 2);
+        assert_eq!(res.minimized_trace.as_ref(), Some(&t0));
+
+        let make_finding = |case_ident: &str, trace_hex: &str| ItreeFindingBundle {
+            finding_id: format!("finding_0000_{case_ident}"),
+            fn_name: "b0_c0__kernel_step".to_string(),
+            case_ident: case_ident.to_string(),
+            seed_index: 0,
+            applied_mutators: cand.applied_mutators.clone(),
+            original_mutator_chain: cand.applied_mutators.clone(),
+            minimized_mutator_chain: Vec::new(),
+            shrink_evaluations: 0,
+            executed_oracle_runs: 0,
+            shrink_status: String::new(),
+            diag_tag: "outcome_mismatch".to_string(),
+            diag_repr: String::new(),
+            trace_hex: trace_hex.to_string(),
+            kernel_confirmed: true,
+            kernel_confirm_theorem: String::new(),
+            mir_neighborhood: String::new(),
+            checked_mir_source: String::new(),
+            checked_mir_module: String::new(),
+            candidate_source: cand.source.clone(),
+            repro_path: None,
+        };
+        let f0 = make_finding("case_b0_c0__kernel_step_t0", "ff00");
+        let f1 = make_finding("case_b0_c0__kernel_step_t1", "ff11");
+        let f_hex = make_finding("case_b0_c0__kernel_step_t9", "bb11");
+        assert_eq!(res.select_trace_for_finding(&f0, 0), Some(&t0));
+        assert_eq!(res.select_trace_for_finding(&f1, 1), Some(&t1));
+        assert_eq!(res.select_trace_for_finding(&f_hex, 0), Some(&t1));
     }
 }

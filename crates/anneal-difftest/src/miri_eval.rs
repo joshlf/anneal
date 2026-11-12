@@ -1839,10 +1839,15 @@ fn translate_pos_to_repro(
     batch_start_line: u32,
     repro_start_line: u32,
 ) -> SourcePos {
-    if source_files_match(&pos.file, "src/lib.rs") && pos.line >= batch_start_line {
+    if source_files_match(&pos.file, "src/lib.rs") {
+        let line = if pos.line >= batch_start_line {
+            pos.line - batch_start_line + repro_start_line
+        } else {
+            pos.line
+        };
         SourcePos {
             file: "src/lib.rs".to_string(),
-            line: pos.line - batch_start_line + repro_start_line,
+            line,
             col: pos.col,
         }
     } else {
@@ -1855,15 +1860,27 @@ fn translate_span_to_repro(
     batch_start_line: u32,
     repro_start_line: u32,
 ) -> SourceSpan {
-    if source_files_match(&span.file, "src/lib.rs") && span.start_line >= batch_start_line {
+    if source_files_match(&span.file, "src/lib.rs") {
         // Subtract before adding: `batch_start_line` may be smaller than
         // `repro_start_line` (for example when the span already comes from a
         // single-candidate run), and `u32` cannot represent a negative delta.
+        // Lines below `batch_start_line` (preamble lines or `end_line == 0`)
+        // stay at their original line numbers.
+        let start_line = if span.start_line >= batch_start_line {
+            span.start_line - batch_start_line + repro_start_line
+        } else {
+            span.start_line
+        };
+        let end_line = if span.end_line >= batch_start_line {
+            span.end_line - batch_start_line + repro_start_line
+        } else {
+            span.end_line
+        };
         SourceSpan {
             file: "src/lib.rs".to_string(),
-            start_line: span.start_line - batch_start_line + repro_start_line,
+            start_line,
             start_col: span.start_col,
-            end_line: span.end_line.saturating_sub(batch_start_line) + repro_start_line,
+            end_line,
             end_col: span.end_col,
         }
     } else {
@@ -5626,6 +5643,54 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         assert_eq!(
             render_item_outcomes_json(&reports),
             format!("{{\n{}\n  }}", expected_rows.join(",\n"))
+        );
+    }
+
+    #[test]
+    fn translate_pos_and_span_to_repro_preserve_preamble_and_zero_end_lines() {
+        let pos_body = SourcePos {
+            file: "/tmp/stage/src/lib.rs".to_string(),
+            line: 120,
+            col: 9,
+        };
+        assert_eq!(
+            translate_pos_to_repro(&pos_body, 100, 40),
+            SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: 60,
+                col: 9,
+            }
+        );
+        let pos_preamble = SourcePos {
+            file: "./src/lib.rs".to_string(),
+            line: 18,
+            col: 5,
+        };
+        assert_eq!(
+            translate_pos_to_repro(&pos_preamble, 100, 40),
+            SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: 18,
+                col: 5,
+            }
+        );
+
+        let span_zero_end = SourceSpan {
+            file: "/tmp/stage/src/lib.rs".to_string(),
+            start_line: 115,
+            start_col: 4,
+            end_line: 0,
+            end_col: 0,
+        };
+        assert_eq!(
+            translate_span_to_repro(&span_zero_end, 100, 40),
+            SourceSpan {
+                file: "src/lib.rs".to_string(),
+                start_line: 55,
+                start_col: 4,
+                end_line: 0,
+                end_col: 0,
+            }
         );
     }
 

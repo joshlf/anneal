@@ -149,6 +149,21 @@ fn assert_itree_findings_shrunk(
         assert!(finding_json.contains(&format!("\"shrink_status\": \"{}\"", f.shrink_status)));
         assert_eq!(fs::read_to_string(repro).expect("read repro.rs"), f.candidate_source);
     }
+    let distinct_fns: std::collections::BTreeSet<&str> =
+        findings.iter().map(|f| f.fn_name.as_str()).collect();
+    let distinct_traces: std::collections::BTreeSet<(&str, &str)> = findings
+        .iter()
+        .map(|f| (f.fn_name.as_str(), f.trace_hex.as_str()))
+        .collect();
+    if findings.len() > distinct_fns.len() {
+        assert!(
+            distinct_traces.len() > distinct_fns.len(),
+            "multi-trace candidates must retain distinct minimized traces across findings, got {} distinct traces for {} findings across {} candidate(s)",
+            distinct_traces.len(),
+            findings.len(),
+            distinct_fns.len()
+        );
+    }
     reduced
 }
 
