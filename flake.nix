@@ -242,7 +242,7 @@
               done
 
               cd "$TMPDIR/dist_staging"
-              tar -cf - bin lean rust share | zstd -T0 -6 -o "$out"
+              tar -cf - bin lean rust share | zstd -T"$NIX_BUILD_CORES" -6 -o "$out"
             '';
           };
 
