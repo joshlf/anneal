@@ -12416,6 +12416,55 @@ theorem trusted_decodePtrBytesNoForge_thin_ref_eq_none_of_not_uniform
     rw [h_uni] at hU
     nomatch hU
 
+/-- **Exact failure characterization (`iff`) for references.** At a thin pointee,
+`decodePtrBytesNoForge true pointee ptrBytes bs = none` iff `bs` fails the `ptrBytes` length check,
+fails scalar initialization (`decodeScalarBytes bs false = none`), or fails uniform provenance
+(`abstractBytesUniformProv bs = false`). -/
+theorem trusted_decodePtrBytesNoForge_thin_ref_eq_none_iff
+    (pointee : RigidTy) (ptrBytes : Nat) (bs : List AbstractByte)
+    (h_thin : isThinPointee pointee = true) :
+    decodePtrBytesNoForge true pointee ptrBytes bs = none ↔
+      Trusted.Sequence.length bs ≠ ptrBytes ∨
+      decodeScalarBytes bs false = none ∨
+      abstractBytesUniformProv bs = false := by
+  constructor
+  · intro hNone
+    by_cases hLen : Trusted.Sequence.length bs = ptrBytes
+    · right
+      cases hDec : decodeScalarBytes bs false with
+      | none => exact Or.inl rfl
+      | some svp =>
+        right
+        cases hU : abstractBytesUniformProv bs with
+        | false => rfl
+        | true =>
+          obtain ⟨sv, prov⟩ := svp
+          obtain ⟨a, t, rfl⟩ :=
+            trusted_decodeScalarBytes_prov_isSome_of_uniform bs sv prov hU hDec
+          have hSome :=
+            (trusted_decodePtrBytesNoForge_thin_ref_eq_some_iff pointee ptrBytes bs
+              (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes) h_thin).mpr
+              ⟨hLen, hU, sv, a, t, hDec, rfl⟩
+          rw [hNone] at hSome
+          nomatch hSome
+    · exact Or.inl hLen
+  · rintro (hLen | hDec | hU)
+    · cases h : decodePtrBytesNoForge true pointee ptrBytes bs with
+      | none => rfl
+      | some v =>
+        have ⟨hL, _⟩ :=
+          (trusted_decodePtrBytesNoForge_thin_ref_eq_some_iff pointee ptrBytes bs v h_thin).mp h
+        exact absurd hL hLen
+    · cases h : decodePtrBytesNoForge true pointee ptrBytes bs with
+      | none => rfl
+      | some v =>
+        obtain ⟨_, _, sv, a, t, hD, _⟩ :=
+          (trusted_decodePtrBytesNoForge_thin_ref_eq_some_iff pointee ptrBytes bs v h_thin).mp h
+        rw [hDec] at hD
+        nomatch hD
+    · exact trusted_decodePtrBytesNoForge_thin_ref_eq_none_of_not_uniform pointee ptrBytes bs
+        h_thin hU
+
 /-- References reject every provenance-free image (`abstractBytesHaveProv bs = false`), of any
 length and address. -/
 theorem trusted_decodePtrBytesNoForge_thin_ref_eq_none_of_provFree
@@ -12971,6 +13020,38 @@ theorem trusted_evalByteCast_u64_to_fnPtr_ub
   unfold evalRvalue
   exact h_bc
 
+/-- **Concrete `u64 -> *const T` / `*mut T` step-level correspondence (contrast with
+`trusted_evalByteCast_u64_to_fnPtr_ub` and `trusted_evalByteCast_u64_to_ref_ub`).** On 64-bit
+layout tables, transmuting a provenance-free `u64` operand `.scalar ⟨bits, 8⟩` into any thin
+raw-pointer type succeeds in both `evalByteCast` and `evalRvalue (.cast .transmute ...)` with the
+provenance-less address `.scalar ⟨bits, 8⟩`, matching Anneal's `.ptr ⟨0, bits⟩ none` under
+`CastVal.toTrustedValue`. -/
+theorem trusted_evalByteCast_u64_to_thin_rawPtr_strips_provenance
+    (policy : TransmutePolicy) (exposed : ExposedProvenance)
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pt : RigidTy) (srcLIdx dstLIdx bits : Nat)
+    (h_pw : layoutPointerBytes layouts = 8)
+    (h_thin : isThinPointee pt = true)
+    (h_bits : bits < scalarModulus 8)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, 8⟩) locals')
+    (h_ty : operandTy localDecls layouts op =
+      .some { kind := .uint .u64, layoutIdx := srcLIdx }) :
+    evalByteCast locals op { kind := .rawPtr m pt, layoutIdx := dstLIdx } mem localDecls layouts =
+      ok (.scalar ⟨bits, 8⟩) locals' mem ∧
+    evalRvalue locals
+        (.cast .transmute op { kind := .rawPtr m pt, layoutIdx := dstLIdx })
+        mem localDecls layouts = ok (.scalar ⟨bits, 8⟩) locals' mem ∧
+    evalTransmuteSameSize .bits64 policy .u64 .rawPtr (.scalar bits) exposed =
+      .ok (.ptr { allocId := 0, offsetBytes := bits } none) exposed := by
+  have h := trusted_evalByteCast_int_to_thin_rawPtr_transmute_correspondence policy .u64 .not m
+    .bool pt bits exposed locals locals' op mem localDecls layouts srcLIdx dstLIdx h_pw rfl rfl
+    h_thin h_bits h_op h_ty
+  refine ⟨h.1, ?_, h.2.1⟩
+  unfold evalRvalue
+  exact h.1
+
 /-- Direct `Trusted.MirSemantics` step-level correspondence for `evalByteCast` and
 `evalRvalue (.cast .transmute ...)` from any thin raw pointer to any function-pointer type on 64-bit
 layout tables, for every caller `localDecls`: the pointer `p` (allocation and offset) is preserved,
@@ -13099,18 +13180,9 @@ theorem trusted_decodeTypedValueFromBytes_adt_newtype_scalarLayout
       | true =>
         match decodeScalarLayoutBytesNoForge sl bs with
         | some v0 => some (.aggregate variantIdx [v0])
-        | none => none := by
-  cases hLen : Nat.beq (Trusted.Sequence.length bs) l.size.bytes with
-  | false =>
-    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hLen, Bool.not_false, Bool.or_true]
-  | true =>
-    have hBsLen : Trusted.Sequence.length bs = l.size.bytes := Nat.eq_of_beq_eq_true hLen
-    have hB01 : (Trusted.Sequence.length ([] : List Nat)).beq
-        (Trusted.Sequence.length [({ bytes := 0 } : Size)]) = false := rfl
-    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hLen, Bool.not_true, Bool.or_false, hVar,
-      hFields, hNoFieldLayouts, hRepr, hWidth]
-    rw [hB01, sliceAbstractBytes_zero_full bs l.size.bytes hBsLen]
-    rfl
+        | none => none :=
+  decodeTypedValueFromBytes_adt_newtype_scalarLayout fuel layouts defPath args idx l variantIdx
+    memoryOrder sl hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth bs
 
 /-- On provenance-free bytes (`abstractBytesHaveProv bs = false`), the executed scalar-layout
 decoder `decodeScalarLayoutBytesNoForge` at an initialized non-pointer layout (`.int` / `.float`)
@@ -13195,31 +13267,9 @@ theorem trusted_decodeScalarLayoutBytesNoForge_initialized_nonPtr_eq_none_of_pro
     (pk : PrimitiveKind) (range : WrappingRange) (bs : List AbstractByte)
     (hNonPtr : ByteCodec.FixedByteCodec.isNonPointerPrimitiveKind pk = true)
     (h_prov : abstractBytesHaveProv bs = true) :
-    decodeScalarLayoutBytesNoForge (.initialized pk range) bs = none := by
-  cases pk with
-  | pointer _ => nomatch hNonPtr
-  | int bw sgn =>
-    unfold decodeScalarLayoutBytesNoForge
-    cases scalarLayoutByteWidth (.initialized (.int bw sgn) range) with
-    | none => rfl
-    | some sz =>
-      dsimp only
-      cases Nat.beq (Trusted.Sequence.length bs) sz with
-      | false => rfl
-      | true =>
-        dsimp only
-        rw [h_prov]
-  | float bw =>
-    unfold decodeScalarLayoutBytesNoForge
-    cases scalarLayoutByteWidth (.initialized (.float bw) range) with
-    | none => rfl
-    | some sz =>
-      dsimp only
-      cases Nat.beq (Trusted.Sequence.length bs) sz with
-      | false => rfl
-      | true =>
-        dsimp only
-        rw [h_prov]
+    decodeScalarLayoutBytesNoForge (.initialized pk range) bs = none :=
+  decodeScalarLayoutBytesNoForge_initialized_nonPtr_of_haveProv pk range bs
+    (fun _ h => by subst h; nomatch hNonPtr) h_prov
 
 /-- **`ByteCodec.scalarNicheNewtypeNonPtr` ↔ Stage-1 `decodeTypedValueFromBytes`, for every
 `args` (exact, `char`-aware).** Let `c` be the `MirValueCodec` of a single-field non-pointer
@@ -13583,5 +13633,284 @@ theorem trusted_decodeTypedValueFromBytes_scalarNicheNewtype_charRange_surrogate
       (by rw [hSize]; decide)
     rw [hSize] at hT
     rw [show defaultCodecFuel = 15 + 1 from rfl, hT] <;> rfl
+
+/-- **Step-level `evalByteCast` / `evalRvalue (.cast .transmute ...)` ↔
+`ByteCodec.scalarNicheNewtypeNonPtr` (`char`-aware, for every `args`).** Transmuting any valid
+same-width non-pointer scalar operand `op` into
+`{ kind := .adt defPath args, layoutIdx := dstLIdx }` at a resolved (`dstLIdx ≠ 0`) single-field
+non-pointer scalar-niche newtype layout computes the codec's decode of
+`encodeLittleEndianBytes bits sz none`, filtered by `scalarLayoutNoForgeValid range sz` and mapped
+through `c.toValue` (`ok` on `some`, `ub` on `none`). -/
+theorem trusted_evalByteCast_scalarNicheNewtypeNonPtr_eq_filter
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (src : ScalarTy) (srcLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx : LayoutIdx)
+    (l : TypeLayout) (sz : Nat) (pk : PrimitiveKind) (varIdx : VariantIdx)
+    (memoryOrder : List Nat) (range : WrappingRange) (bits : Nat)
+    (hNz : 0 < sz)
+    (hSrcNp : src.isPtr = false)
+    (hSrcSz : src.sizeBytes .bits64 = sz)
+    (hValid : src.validBits .bits64 bits)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hNonPtr : ByteCodec.FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized pk range))
+    (hWidth : primitiveKindByteWidth pk = some sz)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, sz⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
+    let c := ByteCodec.MirValueCodec.scalarNicheNewtypeNonPtr layouts defPath dstLIdx l sz pk
+      varIdx memoryOrder range hNz hNonPtr hLookup hInhab hSize hFields hNoFieldLayouts hVar hRepr
+      hWidth
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    let res :=
+      match ((c.codec.decode (encodeLittleEndianBytes bits sz none)).filter
+          (fun x => scalarLayoutNoForgeValid range sz x.val)).map c.toValue with
+      | some v' => ok v' locals' mem
+      | none => ub
+    evalByteCast locals op dstTy mem localDecls layouts = res ∧
+    evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts = res := by
+  intro c dstTy res
+  have hValidAdt : layoutValidForAdt l = true := by
+    unfold layoutValidForAdt
+    rw [hFields]
+  have hLSz : l.size.bytes = src.sizeBytes .bits64 := hSize.trans hSrcSz.symm
+  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals' := by
+    rw [hSrcSz]; exact hOp
+  have hBc : evalByteCast locals op dstTy mem localDecls layouts = res := by
+    rw [trusted_evalByteCast_scalar_to_adt_eq locals locals' op mem localDecls layouts m pointee
+        src srcLIdx defPath args dstLIdx l bits hSrcNp hValid hDstLIdx hLookup hValidAdt hLSz hOp'
+        hTy,
+      hSrcSz,
+      trusted_decodeTypedValueFromBytes_scalarNicheNewtypeNonPtr_eq_filter layouts defPath args
+        dstLIdx l sz pk varIdx memoryOrder range hNz hNonPtr hLookup hInhab hSize hFields
+        hNoFieldLayouts hVar hRepr hWidth _
+        (trusted_abstractBytesHaveProv_encodeLittleEndianBytes_none bits sz)]
+  refine ⟨hBc, ?_⟩
+  unfold evalRvalue
+  exact hBc
+
+/-- **Step-level `evalByteCast` / `evalRvalue (.cast .transmute ...)` ↔
+`ByteCodec.scalarNicheNewtypeNonPtr` exact biconditionals off the `char`-shaped range.** Unless
+the layout is 4 bytes wide with valid range `0..=0x10FFFF`, transmuting a same-width non-pointer
+scalar `bits` into `{ kind := .adt defPath args, layoutIdx := dstLIdx }` (for **every** `args`)
+agrees identically with `(c.codec.decode (encodeLittleEndianBytes bits sz none)).map c.toValue`:
+both `evalByteCast` and `evalRvalue (.cast .transmute ...)` return
+`ok (.aggregate varIdx [.scalar ⟨bits, sz⟩]) locals' mem` iff `wrappingRangeContains range bits =
+true`, and return `ub` iff `wrappingRangeContains range bits = false`. -/
+theorem trusted_evalByteCast_scalarNicheNewtypeNonPtr_iff
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (src : ScalarTy) (srcLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx : LayoutIdx)
+    (l : TypeLayout) (sz : Nat) (pk : PrimitiveKind) (varIdx : VariantIdx)
+    (memoryOrder : List Nat) (range : WrappingRange) (bits : Nat)
+    (hNz : 0 < sz)
+    (hSrcNp : src.isPtr = false)
+    (hSrcSz : src.sizeBytes .bits64 = sz)
+    (hValid : src.validBits .bits64 bits)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hNonPtr : ByteCodec.FixedByteCodec.isNonPointerPrimitiveKind pk = true)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized pk range))
+    (hWidth : primitiveKindByteWidth pk = some sz)
+    (hNotChar : Bool.and (Nat.beq sz 4)
+      (Bool.and (Nat.beq range.start 0) (Nat.beq range.end_ 0x10FFFF)) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, sz⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
+    let c := ByteCodec.MirValueCodec.scalarNicheNewtypeNonPtr layouts defPath dstLIdx l sz pk
+      varIdx memoryOrder range hNz hNonPtr hLookup hInhab hSize hFields hNoFieldLayouts hVar hRepr
+      hWidth
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    evalByteCast locals op dstTy mem localDecls layouts =
+      (match (c.codec.decode (encodeLittleEndianBytes bits sz none)).map c.toValue with
+       | some v' => ok v' locals' mem
+       | none => ub) ∧
+    (evalByteCast locals op dstTy mem localDecls layouts =
+      ok (.aggregate varIdx [.scalar ⟨bits, sz⟩]) locals' mem ↔
+        wrappingRangeContains range bits = true) ∧
+    (evalByteCast locals op dstTy mem localDecls layouts = ub ↔
+      wrappingRangeContains range bits = false) ∧
+    (evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      ok (.aggregate varIdx [.scalar ⟨bits, sz⟩]) locals' mem ↔
+        wrappingRangeContains range bits = true) ∧
+    (evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts = ub ↔
+      wrappingRangeContains range bits = false) := by
+  intro c dstTy
+  have hStep := trusted_evalByteCast_scalarNicheNewtypeNonPtr_eq_filter locals locals' op mem
+    localDecls layouts m pointee src srcLIdx defPath args dstLIdx l sz pk varIdx memoryOrder range
+    bits hNz hSrcNp hSrcSz hValid hDstLIdx hNonPtr hLookup hInhab hSize hFields hNoFieldLayouts
+    hVar hRepr hWidth hOp hTy
+  have hFilter : (c.codec.decode (encodeLittleEndianBytes bits sz none)).filter
+      (fun x => scalarLayoutNoForgeValid range sz x.val) =
+      c.codec.decode (encodeLittleEndianBytes bits sz none) := by
+    cases c.codec.decode (encodeLittleEndianBytes bits sz none) with
+    | none => rfl
+    | some x =>
+      refine Option.filter_some_pos ?_
+      show scalarLayoutNoForgeValid range sz x.val = true
+      rw [scalarLayoutNoForgeValid_eq_of_not_charRange range sz x.val hNotChar]
+      exact x.property.2
+  have hBcEq : evalByteCast locals op dstTy mem localDecls layouts =
+      (match (c.codec.decode (encodeLittleEndianBytes bits sz none)).map c.toValue with
+       | some v' => ok v' locals' mem
+       | none => ub) := by
+    have h1 := hStep.1
+    rw [hFilter] at h1
+    exact h1
+  have hRvEq : evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      evalByteCast locals op dstTy mem localDecls layouts := by
+    unfold evalRvalue
+    rfl
+  have hLt : bits < 2 ^ (8 * sz) := by
+    rw [← Anneal.Scalars.scalarModulus_eq_two_pow]
+    exact hSrcSz ▸ hValid.1
+  have hc : c.codec = ByteCodec.FixedByteCodec.scalarValidRange sz hNz range := rfl
+  have hToVal : ∀ x, c.toValue x = .aggregate varIdx [.scalar ⟨x.val, sz⟩] := fun _ => rfl
+  refine ⟨hBcEq, ?_, ?_, ?_, ?_⟩
+  · rw [hBcEq]
+    cases hW : wrappingRangeContains range bits with
+    | false =>
+      have hNone : c.codec.decode (encodeLittleEndianBytes bits sz none) = none := by
+        rw [hc]
+        exact ByteCodec.FixedByteCodec.scalarValidRange_decode_rejects_out_of_range sz hNz range
+          hLt hW
+      rw [hNone]
+      simp
+    | true =>
+      have hSome : c.codec.decode (encodeLittleEndianBytes bits sz none) =
+          some ⟨bits, ⟨hLt, hW⟩⟩ := by
+        rw [hc]
+        exact (ByteCodec.FixedByteCodec.scalarValidRange sz hNz range).decode_encode
+          ⟨bits, ⟨hLt, hW⟩⟩
+      rw [hSome]
+      dsimp only [Option.map]
+      rw [hToVal]
+      simp
+  · rw [hBcEq]
+    cases hW : wrappingRangeContains range bits with
+    | false =>
+      have hNone : c.codec.decode (encodeLittleEndianBytes bits sz none) = none := by
+        rw [hc]
+        exact ByteCodec.FixedByteCodec.scalarValidRange_decode_rejects_out_of_range sz hNz range
+          hLt hW
+      rw [hNone]
+      simp
+    | true =>
+      have hSome : c.codec.decode (encodeLittleEndianBytes bits sz none) =
+          some ⟨bits, ⟨hLt, hW⟩⟩ := by
+        rw [hc]
+        exact (ByteCodec.FixedByteCodec.scalarValidRange sz hNz range).decode_encode
+          ⟨bits, ⟨hLt, hW⟩⟩
+      rw [hSome]
+      dsimp only [Option.map]
+      simp
+  · rw [hRvEq]
+    rw [hBcEq]
+    cases hW : wrappingRangeContains range bits with
+    | false =>
+      have hNone : c.codec.decode (encodeLittleEndianBytes bits sz none) = none := by
+        rw [hc]
+        exact ByteCodec.FixedByteCodec.scalarValidRange_decode_rejects_out_of_range sz hNz range
+          hLt hW
+      rw [hNone]
+      simp
+    | true =>
+      have hSome : c.codec.decode (encodeLittleEndianBytes bits sz none) =
+          some ⟨bits, ⟨hLt, hW⟩⟩ := by
+        rw [hc]
+        exact (ByteCodec.FixedByteCodec.scalarValidRange sz hNz range).decode_encode
+          ⟨bits, ⟨hLt, hW⟩⟩
+      rw [hSome]
+      dsimp only [Option.map]
+      rw [hToVal]
+      simp
+  · rw [hRvEq]
+    rw [hBcEq]
+    cases hW : wrappingRangeContains range bits with
+    | false =>
+      have hNone : c.codec.decode (encodeLittleEndianBytes bits sz none) = none := by
+        rw [hc]
+        exact ByteCodec.FixedByteCodec.scalarValidRange_decode_rejects_out_of_range sz hNz range
+          hLt hW
+      rw [hNone]
+      simp
+    | true =>
+      have hSome : c.codec.decode (encodeLittleEndianBytes bits sz none) =
+          some ⟨bits, ⟨hLt, hW⟩⟩ := by
+        rw [hc]
+        exact (ByteCodec.FixedByteCodec.scalarValidRange sz hNz range).decode_encode
+          ⟨bits, ⟨hLt, hW⟩⟩
+      rw [hSome]
+      dsimp only [Option.map]
+      simp
+
+/-- Integer specialization (`ByteCodec.MirValueCodec.scalarNicheNewtype`) of
+`trusted_evalByteCast_scalarNicheNewtypeNonPtr_iff`: step-level `evalByteCast` and
+`evalRvalue (.cast .transmute ...)` agreement with `scalarNicheNewtype` for **every** `args`
+(including monomorphized generic wrappers such as `NonZero<u32>` with `args = [.uint .u32]`). -/
+theorem trusted_evalByteCast_scalarNicheNewtype_iff
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (src : ScalarTy) (srcLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx : LayoutIdx)
+    (l : TypeLayout) (sz bitsWidth : Nat) (signed : Bool) (varIdx : VariantIdx)
+    (memoryOrder : List Nat) (range : WrappingRange) (bits : Nat)
+    (hNz : 0 < sz)
+    (hSrcNp : src.isPtr = false)
+    (hSrcSz : src.sizeBytes .bits64 = sz)
+    (hValid : src.validBits .bits64 bits)
+    (hDstLIdx : dstLIdx ≠ 0)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hSize : l.size.bytes = sz)
+    (hFields : l.fields = .arbitrary [{ bytes := 0 }] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hVar : l.variants = .single varIdx)
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) range))
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
+    (hNotChar : Bool.and (Nat.beq sz 4)
+      (Bool.and (Nat.beq range.start 0) (Nat.beq range.end_ 0x10FFFF)) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.scalar ⟨bits, sz⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
+    let c := ByteCodec.MirValueCodec.scalarNicheNewtype layouts defPath dstLIdx l sz bitsWidth
+      signed varIdx memoryOrder range hNz hLookup hInhab hSize hFields hNoFieldLayouts hVar hRepr
+      hWidth
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    evalByteCast locals op dstTy mem localDecls layouts =
+      (match (c.codec.decode (encodeLittleEndianBytes bits sz none)).map c.toValue with
+       | some v' => ok v' locals' mem
+       | none => ub) ∧
+    (evalByteCast locals op dstTy mem localDecls layouts =
+      ok (.aggregate varIdx [.scalar ⟨bits, sz⟩]) locals' mem ↔
+        wrappingRangeContains range bits = true) ∧
+    (evalByteCast locals op dstTy mem localDecls layouts = ub ↔
+      wrappingRangeContains range bits = false) ∧
+    (evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      ok (.aggregate varIdx [.scalar ⟨bits, sz⟩]) locals' mem ↔
+        wrappingRangeContains range bits = true) ∧
+    (evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts = ub ↔
+      wrappingRangeContains range bits = false) :=
+  trusted_evalByteCast_scalarNicheNewtypeNonPtr_iff locals locals' op mem localDecls layouts m
+    pointee src srcLIdx defPath args dstLIdx l sz (.int bitsWidth signed) varIdx memoryOrder range
+    bits hNz hSrcNp hSrcSz hValid hDstLIdx rfl hLookup hInhab hSize hFields hNoFieldLayouts hVar
+    hRepr hWidth hNotChar hOp hTy
 
 end Anneal.Mir.Cast

@@ -4232,7 +4232,8 @@ def checkBackendReprFullRange (l : TypeLayout) : Bool :=
   | _ => true
 
 /--
-Whenever `checkBackendReprFullRange l = true` and `l.backendRepr = .scalar (.initialized pk validRange)`,
+Whenever `checkBackendReprFullRange l = true` and
+`l.backendRepr = .scalar (.initialized pk validRange)`,
 every bit pattern `bits < scalarModulus l.size.bytes` lies inside `validRange`.
 -/
 theorem checkBackendReprFullRange_implies_wrappingRangeContains
@@ -5561,15 +5562,149 @@ theorem adt_multiple_enum_stage1_accepts_tag_provenance
     dsimp only
     rw [hGetVar]
 
+/--
+**Stage-1 positive characterization of multi-variant fieldless enums.** On an
+inhabited `#[repr(Int)]` / `#[repr(u8)]` fieldless enum layout
+(`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`, where every in-range tag `< scalarModulus l.size.bytes`
+indexes a fieldless variant `.arbitrary [] _`), for **every** list of type arguments `args`:
+1. Every provenance-free `l.size.bytes`-byte image of `bits < scalarModulus l.size.bytes`
+   decodes under Stage-1 `decodeTypedValueFromBytes` to `some (.aggregate bits [])` when
+   `wrappingRangeContains validRange bits = true` and `none` otherwise;
+2. Stage-1 `IsTryFromBytesTyped` enforces `tag < scalarModulus l.size.bytes` and
+   `wrappingRangeContains validRange tag = true`;
+3. Stage-1 `IsFromZerosTyped` holds iff `wrappingRangeContains validRange 0 = true`.
+-/
+theorem adt_multiple_fieldless_enum_stage1
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hFieldless :
+      ∀ tag < scalarModulus l.size.bytes,
+        wrappingRangeContains validRange tag = true →
+        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder)) :
+    (∀ bits < scalarModulus l.size.bytes,
+      decodeTypedValueFromBytes defaultCodecFuel layouts
+          { kind := .adt defPath args, layoutIdx := idx }
+          (encodeLittleEndianBytes bits l.size.bytes none) =
+        match wrappingRangeContains validRange bits with
+        | true => some (.aggregate bits [])
+        | false => none) ∧
+    IsTryFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx }
+      (fun v =>
+        ∃ (tag : Nat) (vals : List Value) (varOffsets : List Size) (varMemOrder : List Nat),
+          v = .aggregate tag vals ∧
+          tag < scalarModulus l.size.bytes ∧
+          wrappingRangeContains validRange tag = true ∧
+          get? variantShapes tag = some (.arbitrary varOffsets varMemOrder)) ∧
+    (IsFromZerosTyped layouts { kind := .adt defPath args, layoutIdx := idx } ↔
+      wrappingRangeContains validRange 0 = true) := by
+  have hIff := adt_multiple_stage1_iff_legacy layouts defPath args idx l
+    (.initialized (.int bitsWidth signed) validRange) 0 variantShapes
+    (fun v =>
+      ∃ (tag : Nat) (vals : List Value) (varOffsets : List Size) (varMemOrder : List Nat),
+        v = .aggregate tag vals ∧
+        tag < scalarModulus l.size.bytes ∧
+        wrappingRangeContains validRange tag = true ∧
+        get? variantShapes tag = some (.arbitrary varOffsets varMemOrder))
+    hLookup hInhab hVar
+  refine ⟨?_, hIff.1.mpr (adt_multiple_enum_scalarLayout_isTryFromBytes layouts defPath args idx l
+      bitsWidth signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hWidth),
+    ?_⟩
+  · intro bits hBits
+    have hLen := length_encodeLittleEndianBytes none l.size.bytes bits
+    rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l _ 0
+        variantShapes _ hLookup hInhab hVar hLen]
+    exact adt_multiple_enum_scalarLayout_decode_encode_eq layouts defPath args idx l bitsWidth
+      signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hNz hWidth hFieldless
+      bits none hBits
+  · rw [hIff.2]
+    have hZeroLt : 0 < scalarModulus l.size.bytes := by
+      rw [Anneal.Scalars.scalarModulus_eq_two_pow]
+      exact Nat.two_pow_pos _
+    constructor
+    · intro hFZ
+      cases hZ : wrappingRangeContains validRange 0
+      · exact absurd hFZ (adt_multiple_enum_scalarLayout_not_isFromZeros layouts defPath args idx l
+          (.int bitsWidth signed) validRange variantShapes memoryOrder hLookup hInhab hVar hFields
+          hNz hWidth hZ)
+      · rfl
+    · intro hZ
+      obtain ⟨varMemOrder0, hVar0⟩ := hFieldless 0 hZeroLt hZ
+      exact adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange layouts defPath args idx l
+        bitsWidth signed validRange variantShapes memoryOrder varMemOrder0 hLookup hInhab hVar
+        hFields hNz hWidth hZ hVar0
+
+/--
+A full-range multi-variant fieldless enum (`validRange.start = 0`,
+`scalarModulus l.size.bytes - 1 ≤ validRange.end_`, with every tag `< scalarModulus l.size.bytes`
+indexing a fieldless variant `.arbitrary [] _`, such as a 256-variant `#[repr(u8)]` enum)
+satisfies Stage-1 `IsFromBytesTyped`.
+-/
+theorem adt_multiple_fieldless_enum_fullRange_isFromBytesTyped
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hStart : validRange.start = 0)
+    (hEnd : scalarModulus l.size.bytes - 1 ≤ validRange.end_)
+    (hFieldless :
+      ∀ tag < scalarModulus l.size.bytes,
+        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder)) :
+    IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit _hProv => ?_⟩
+  have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
+    rw [hLen]; exact Nat.beq_refl _
+  have hNzBs : Nat.beq (length bs) 0 = false := by rw [hLen]; exact hNz
+  obtain ⟨sv, prov, hSc⟩ := decodeScalarBytes_of_allBytesInitialized bs false hNzBs hInit
+  have ⟨_, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+  rw [hLen] at hSvLt
+  have hInRange : wrappingRangeContains validRange sv.bits = true := by
+    rcases validRange with ⟨st, en⟩
+    dsimp only at hStart hEnd
+    subst hStart
+    exact (wrappingRangeContains_zero_max_iff en sv.bits).mpr (by omega)
+  obtain ⟨varMemOrder, hGet⟩ := hFieldless sv.bits hSvLt
+  refine ⟨.aggregate sv.bits [], ?_⟩
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+    decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l _ 0
+      variantShapes bs hLookup hInhab hVar hLen,
+    decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+      (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+      hLookup hInhab hVar hFields hWidth,
+    hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes bs
+    hWidth, hBeqLen]
+  dsimp only
+  rw [hSc]
+  dsimp only
+  rw [hInRange]
+  dsimp only
+  rw [hGet]
+
 /-! ### 7.6 Stage-1 Soundness of `checkFromBytesNicheAware` -/
 
 
 /--
-`true` when Stage-1 decodes every initialized provenance-free image of the
-field layout `fl` reached through `l.fieldLayouts`: `fl` is an inhabited
-single-variant `.primitive` layout that is zero-sized, or has a `.scalar`
-backend of exactly its size covering that width, or has another backend (raw
-integer decoding).
+`true` when Stage-1 decodes every initialized provenance-free image of an
+inhabited single-variant `.primitive` layout `fl`: `fl` is zero-sized, or has a
+`.scalar` backend of exactly its size covering that width, or has another
+backend (raw integer decoding).
 -/
 def checkStage1PrimitiveFieldLayout (fl : TypeLayout) : Bool :=
   match fl.isUninhabited, fl.variants, fl.fields with
@@ -5587,18 +5722,27 @@ def checkStage1PrimitiveFieldLayout (fl : TypeLayout) : Bool :=
 
 /--
 `true` when each field layout index of `fIdxs` resolves to a layout accepted by
-`checkStage1PrimitiveFieldLayout` that fits inside `size` bytes at its offset.
+`checkFl` that fits inside `size` bytes at its offset.
 -/
-def checkStage1FieldLayouts (layouts : LayoutTable) (size : Nat) :
-    List Size → List Nat → Bool
+def checkStage1FieldLayoutsWith (checkFl : TypeLayout → Bool) (layouts : LayoutTable)
+    (size : Nat) : List Size → List Nat → Bool
   | [], [] => true
   | off :: offs, fIdx :: fIdxs =>
     match LayoutTable.lookup layouts fIdx with
     | none => false
     | some fl =>
       Nat.ble (off.bytes + fl.size.bytes) size &&
-        (checkStage1PrimitiveFieldLayout fl && checkStage1FieldLayouts layouts size offs fIdxs)
+        (checkFl fl && checkStage1FieldLayoutsWith checkFl layouts size offs fIdxs)
   | _, _ => false
+
+/--
+`true` when each field layout index of `fIdxs` resolves to a primitive layout
+accepted by `checkStage1PrimitiveFieldLayout` that fits inside `size` bytes at
+its offset.
+-/
+def checkStage1FieldLayouts (layouts : LayoutTable) (size : Nat) :
+    List Size → List Nat → Bool :=
+  checkStage1FieldLayoutsWith checkStage1PrimitiveFieldLayout layouts size
 
 /-- `true` when the field offsets are non-decreasing and none exceeds `size`. -/
 def checkSpansSorted (size : Nat) : List Size → Bool
@@ -5613,28 +5757,87 @@ def scalarFitsAt (s : ScalarLayout) (off : Size) (size : Nat) : Bool :=
   | none => false
 
 /--
-Layout-side companion of `checkFromBytesNicheAware` for Stage-1 ADT decoding.
-`checkFromBytesNicheAware` inspects the type arguments, field offsets, and
-backend valid ranges, but Stage-1 decodes an ADT by its `l.fieldLayouts` or, when
-those do not match the offsets, by its backend scalars or raw field spans:
-- with field layouts, each one must pass `checkStage1PrimitiveFieldLayout` and
-  fit at its offset (`checkStage1FieldLayouts`);
-- otherwise a lone `.scalar` backend, or a `.scalarPair` backend over two
-  offsets, must fit at its offset(s) (`scalarFitsAt`), and any other backend needs
-  sorted offsets within the layout's size (`checkSpansSorted`).
+Fuel-bounded recursive Stage-1 decodability checker for an inhabited
+single-variant `TypeLayout` `l` under `decodeTypedValueFromBytes fuel layouts`:
+supports `.primitive` leaves, `.array stride count` layouts (zero-length or
+recursively decodable via `elemFlIdx :: _` or positive-stride raw chunks), and
+nested `.arbitrary` structs (both via `l.fieldLayouts` and via full-range
+backend scalars / sorted raw spans).
+-/
+def checkStage1LayoutAux : Nat → LayoutTable → TypeLayout → Bool
+  | 0, _, _ => false
+  | fuel + 1, layouts, l =>
+    match l.isUninhabited, l.variants with
+    | false, .single _ =>
+      match l.fields with
+      | .primitive => checkStage1PrimitiveFieldLayout l
+      | .array stride count =>
+        match Nat.beq count 0 with
+        | true => Nat.beq l.size.bytes 0
+        | false =>
+          Nat.beq l.size.bytes (stride.bytes * count) &&
+            match l.fieldLayouts with
+            | elemFlIdx :: _ =>
+              match LayoutTable.lookup layouts elemFlIdx with
+              | some elemFl =>
+                Nat.beq elemFl.size.bytes stride.bytes &&
+                  checkStage1LayoutAux fuel layouts elemFl
+              | none => false
+            | [] => Nat.blt 0 stride.bytes
+      | .arbitrary [] _ => true
+      | .arbitrary (o :: os) _ =>
+        match Nat.beq (length l.fieldLayouts) (length (o :: os)) with
+        | true =>
+          checkStage1FieldLayoutsWith (checkStage1LayoutAux fuel layouts) layouts
+            l.size.bytes (o :: os) l.fieldLayouts
+        | false =>
+          checkBackendReprFullRange l &&
+            match o :: os, l.backendRepr with
+            | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes
+            | [off0, off1], .scalarPair s0 s1 =>
+              scalarFitsAt s0 off0 l.size.bytes && scalarFitsAt s1 off1 l.size.bytes
+            | _, _ => checkSpansSorted l.size.bytes (o :: os)
+      | .union _ => false
+    | _, _ => false
+
+/--
+Layout-side companion of `checkFromBytesNicheAware` for Stage-1 ADT decoding at
+`defaultCodecFuel` (`16 = 15 + 1`). `checkFromBytesNicheAware` inspects the type
+arguments, field offsets, and outer backend valid ranges, while Stage-1 decodes
+an ADT recursively through its `l.fieldLayouts` (primitives, arrays, or nested
+structs checked by `checkStage1LayoutAux 15`) or, when `l.fieldLayouts` does not
+match `offsets`, through its backend scalars (`scalarFitsAt`) or sorted spans
+(`checkSpansSorted`).
 -/
 def checkAdtStage1Decodable (layouts : LayoutTable) (l : TypeLayout) : Bool :=
   match l.fields with
-  | .arbitrary offsets _ =>
-    match Nat.beq (length l.fieldLayouts) (length offsets) with
-    | true => checkStage1FieldLayouts layouts l.size.bytes offsets l.fieldLayouts
+  | .arbitrary [] _ => true
+  | .arbitrary (o :: os) _ =>
+    match Nat.beq (length l.fieldLayouts) (length (o :: os)) with
+    | true =>
+      checkStage1FieldLayoutsWith (checkStage1LayoutAux 15 layouts) layouts
+        l.size.bytes (o :: os) l.fieldLayouts
     | false =>
-      match offsets, l.backendRepr with
+      match o :: os, l.backendRepr with
       | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes
       | [off0, off1], .scalarPair s0 s1 =>
         scalarFitsAt s0 off0 l.size.bytes && scalarFitsAt s1 off1 l.size.bytes
-      | _, _ => checkSpansSorted l.size.bytes offsets
-  | _ => false
+      | _, _ => checkSpansSorted l.size.bytes (o :: os)
+  | .array stride count =>
+    match Nat.beq count 0 with
+    | true => Nat.beq l.size.bytes 0
+    | false =>
+      Nat.beq l.size.bytes (stride.bytes * count) &&
+        match l.fieldLayouts with
+        | elemFlIdx :: _ =>
+          match LayoutTable.lookup layouts elemFlIdx with
+          | some elemFl =>
+            Nat.beq elemFl.size.bytes stride.bytes &&
+              checkStage1LayoutAux 15 layouts elemFl
+          | none => false
+        | [] => Nat.blt 0 stride.bytes
+  | .primitive => checkStage1PrimitiveFieldLayout l
+  | .union _ => false
 
 /-- Stage-1 companion of `checkFromBytesNicheAware` for every type. -/
 def checkStage1Decodable (layouts : LayoutTable) (ty : Ty) : Bool :=
@@ -5772,38 +5975,42 @@ theorem decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout
 
 /--
 `decodeFieldsByLayoutIdxs` succeeds on every initialized provenance-free image
-whose field layouts pass `checkStage1FieldLayouts`.
+whose field layouts pass `checkStage1FieldLayoutsWith checkFl`.
 -/
-theorem decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts
-    (fuel : Nat) (layouts : LayoutTable) (bs : List AbstractByte)
+theorem decodeFieldsByLayoutIdxs_of_checkStage1FieldLayoutsWith
+    (checkFl : TypeLayout → Bool)
+    (decodeByLayout : Nat → List AbstractByte → Option Value)
+    (layouts : LayoutTable) (bs : List AbstractByte)
+    (hFlSound :
+      ∀ (fIdx : LayoutIdx) (fl : TypeLayout) (fSlice : List AbstractByte),
+        LayoutTable.lookup layouts fIdx = some fl →
+        checkFl fl = true →
+        length fSlice = fl.size.bytes →
+        allBytesInitialized fSlice = true →
+        abstractBytesHaveProv fSlice = false →
+        ∃ v, decodeByLayout fIdx fSlice = some v)
     (hInit : allBytesInitialized bs = true) (hProv : abstractBytesHaveProv bs = false) :
     ∀ (offs : List Size) (fIdxs : List Nat),
-      checkStage1FieldLayouts layouts (length bs) offs fIdxs = true →
-      ∃ vals,
-        decodeFieldsByLayoutIdxs
-          (fun fIdx fSlice =>
-            decodeTypedValueFromBytes (fuel + 1) layouts
-              { kind := .adt "" [], layoutIdx := fIdx } fSlice)
-          layouts bs offs fIdxs = some vals
+      checkStage1FieldLayoutsWith checkFl layouts (length bs) offs fIdxs = true →
+      ∃ vals, decodeFieldsByLayoutIdxs decodeByLayout layouts bs offs fIdxs = some vals
   | [], [], _ => ⟨[], rfl⟩
   | [], _ :: _, h => nomatch h
   | _ :: _, [], h => nomatch h
   | off :: offs, fIdx :: fIdxs, h => by
-    unfold checkStage1FieldLayouts at h
+    unfold checkStage1FieldLayoutsWith at h
     cases hFL : LayoutTable.lookup layouts fIdx <;> rw [hFL] at h
     · nomatch h
     case some fl =>
       simp only [Bool.and_eq_true] at h
-      obtain ⟨hFit, hPrim, hRest⟩ := h
+      obtain ⟨hFit, hOk, hRest⟩ := h
       have hIn : off.bytes + fl.size.bytes ≤ length bs := Nat.le_of_ble_eq_true hFit
       obtain ⟨v, hV⟩ :=
-        decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout fuel layouts "" [] fIdx fl
-          ((bs.drop off.bytes).take fl.size.bytes) hFL hPrim
-        (length_drop_take_of_le bs _ _ hIn)
-        (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
-        (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
-      obtain ⟨vs, hVs⟩ := decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts fuel layouts bs
-        hInit hProv offs fIdxs hRest
+        hFlSound fIdx fl ((bs.drop off.bytes).take fl.size.bytes) hFL hOk
+          (length_drop_take_of_le bs _ _ hIn)
+          (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
+          (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
+      obtain ⟨vs, hVs⟩ := decodeFieldsByLayoutIdxs_of_checkStage1FieldLayoutsWith checkFl
+        decodeByLayout layouts bs hFlSound hInit hProv offs fIdxs hRest
       refine ⟨v :: vs, ?_⟩
       unfold decodeFieldsByLayoutIdxs
       rw [hFL]
@@ -5813,6 +6020,31 @@ theorem decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts
       rw [hV]
       dsimp only
       rw [hVs]
+
+/--
+`decodeFieldsByLayoutIdxs` succeeds on every initialized provenance-free image
+whose field layouts pass `checkStage1FieldLayouts`.
+-/
+theorem decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts
+    (fuel : Nat) (layouts : LayoutTable) (bs : List AbstractByte)
+    (hInit : allBytesInitialized bs = true) (hProv : abstractBytesHaveProv bs = false)
+    (offs : List Size) (fIdxs : List Nat)
+    (h : checkStage1FieldLayouts layouts (length bs) offs fIdxs = true) :
+    ∃ vals,
+      decodeFieldsByLayoutIdxs
+        (fun fIdx fSlice =>
+          decodeTypedValueFromBytes (fuel + 1) layouts
+            { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+        layouts bs offs fIdxs = some vals :=
+  decodeFieldsByLayoutIdxs_of_checkStage1FieldLayoutsWith
+    checkStage1PrimitiveFieldLayout
+    (fun fIdx fSlice =>
+      decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+    layouts bs
+    (fun fIdx fl fSlice hFL hPrim hLen hSInit hSProv =>
+      decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout fuel layouts "" [] fIdx fl
+        fSlice hFL hPrim hLen hSInit hSProv)
+    hInit hProv offs fIdxs h
 
 theorem scalarModulus_le_of_le {w sz : Nat} (h : w ≤ sz) :
     scalarModulus w ≤ scalarModulus sz := by
@@ -5846,11 +6078,237 @@ theorem scalarLayoutCoversWidth_of_scalar_fullRange
   | union pk => simp only [hBlt, Bool.and_self]
 
 /--
-**Stage-1 `FromBytes` for single-variant `.arbitrary` ADT layouts.** An inhabited
+Stage-1 `decodeTypedValueFromBytes fuel` succeeds on every initialized
+provenance-free image of any layout accepted by `checkStage1LayoutAux fuel`,
+including nested structs and fixed-size array field layouts.
+-/
+theorem decodeTypedValueFromBytes_of_checkStage1LayoutAux :
+    ∀ (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+      (idx : LayoutIdx) (l : TypeLayout) (bs : List AbstractByte),
+      LayoutTable.lookup layouts idx = some l →
+      checkStage1LayoutAux fuel layouts l = true →
+      length bs = l.size.bytes →
+      allBytesInitialized bs = true →
+      abstractBytesHaveProv bs = false →
+      ∃ v, decodeTypedValueFromBytes fuel layouts
+        { kind := .adt defPath args, layoutIdx := idx } bs = some v
+  | 0, _, _, _, _, _, _, _, hCheck, _, _, _ => nomatch hCheck
+  | fuel + 1, layouts, defPath, args, idx, l, bs, hLookup, hCheck, hLen, hInit, hProv => by
+    have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
+      rw [hLen]; exact Nat.beq_refl _
+    unfold checkStage1LayoutAux at hCheck
+    cases hInhab : l.isUninhabited <;> rw [hInhab] at hCheck
+    · cases hVar : l.variants <;> rw [hVar] at hCheck
+      · nomatch hCheck
+      case single variantIdx =>
+        dsimp only at hCheck
+        cases hF : l.fields <;> rw [hF] at hCheck
+        · -- .primitive
+          exact decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout fuel layouts defPath
+            args idx l bs hLookup hCheck hLen hInit hProv
+        · -- .union
+          nomatch hCheck
+        case array stride count =>
+          dsimp only at hCheck
+          cases hC0 : Nat.beq count 0 <;> rw [hC0] at hCheck
+          · simp only [Bool.and_eq_true] at hCheck
+            obtain ⟨hSzMul, hArrRest⟩ := hCheck
+            have hLenMul : length bs = stride.bytes * count := by
+              rw [hLen]; exact Nat.eq_of_beq_eq_true hSzMul
+            cases hFLs : l.fieldLayouts <;> rw [hFLs] at hArrRest
+            · have hStridePos : 0 < stride.bytes := Nat.blt_eq.mp hArrRest
+              obtain ⟨vals, hVals⟩ :=
+                decodeArrayChunksWith_of_allBytesInitialized_provFree
+                  (fun chunk =>
+                    match decodeScalarBytes chunk false with
+                    | .some (sv, _) => .some (.scalar sv)
+                    | .none => .none)
+                  stride.bytes
+                  (fun chunk hl hi _ => by
+                    have hNzChunk : Nat.beq (length chunk) 0 = false := by
+                      rw [hl]
+                      cases hSb : stride.bytes with
+                      | zero => omega
+                      | succ _ => rfl
+                    obtain ⟨sv, prov, hSc⟩ :=
+                      decodeScalarBytes_of_allBytesInitialized chunk false hNzChunk hi
+                    exact ⟨.scalar sv, by rw [hSc]⟩)
+                  count bs hLenMul hInit hProv
+              refine ⟨.aggregate variantIdx vals, ?_⟩
+              unfold decodeTypedValueFromBytes
+              simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF, hC0,
+                hFLs, hProv]
+              unfold decodeValueFromBytes
+              simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF]
+              change
+                (match
+                    decodeArrayChunksWith
+                      (fun chunk =>
+                        match decodeScalarBytes chunk false with
+                        | some (sv, _) => some (.scalar sv)
+                        | none => none)
+                      stride.bytes count bs with
+                  | some vals => some (.aggregate variantIdx vals)
+                  | none => none : Option Value) = _
+              rw [hVals]
+            case cons elemFlIdx flRest =>
+              dsimp only at hArrRest
+              cases hEL : LayoutTable.lookup layouts elemFlIdx <;> rw [hEL] at hArrRest
+              · nomatch hArrRest
+              case some elemFl =>
+                simp only [Bool.and_eq_true] at hArrRest
+                obtain ⟨hESzBeq, hECheck⟩ := hArrRest
+                have hESz : elemFl.size.bytes = stride.bytes := Nat.eq_of_beq_eq_true hESzBeq
+                obtain ⟨vals, hVals⟩ :=
+                  decodeArrayChunksWith_of_allBytesInitialized_provFree
+                    (decodeTypedValueFromBytes fuel layouts
+                      { kind := .adt "" [], layoutIdx := elemFlIdx })
+                    stride.bytes
+                    (fun chunk hl hi hp =>
+                      decodeTypedValueFromBytes_of_checkStage1LayoutAux fuel layouts "" []
+                        elemFlIdx elemFl chunk hEL hECheck (by rw [hESz]; exact hl) hi hp)
+                    count bs hLenMul hInit hProv
+                refine ⟨.aggregate variantIdx vals, ?_⟩
+                unfold decodeTypedValueFromBytes
+                simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF, hC0,
+                  hFLs, hVals]
+          · have hSz0 : l.size.bytes = 0 := Nat.eq_of_beq_eq_true hCheck
+            have hBsNil : bs = [] := by
+              cases bs with
+              | nil => rfl
+              | cons _ _ => simp [length, hSz0] at hLen
+            subst hBsNil
+            refine ⟨.aggregate variantIdx [], ?_⟩
+            unfold decodeTypedValueFromBytes
+            simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF, hC0]
+        case arbitrary offsets memOrder =>
+          cases offsets with
+          | nil =>
+            refine ⟨.aggregate variantIdx [], ?_⟩
+            simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+              Bool.or_false, hVar, hF]
+          | cons o os =>
+            dsimp only at hCheck
+            cases hFL : Nat.beq (length l.fieldLayouts) (length (o :: os)) <;> rw [hFL] at hCheck
+            · simp only [Bool.and_eq_true] at hCheck
+              obtain ⟨hFull, hStage1⟩ := hCheck
+              rcases os with _ | ⟨o1, _ | ⟨o2, os''⟩⟩
+              · cases hR : l.backendRepr with
+                | scalar s0 =>
+                  rw [hR] at hStage1
+                  dsimp only at hStage1
+                  unfold scalarFitsAt at hStage1
+                  cases hW : scalarLayoutByteWidth s0 <;> rw [hW] at hStage1
+                  · nomatch hStage1
+                  case some w =>
+                    simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
+                    obtain ⟨hPos, hFit⟩ := hStage1
+                    have hIn : o.bytes + w ≤ length bs := by
+                      have := Nat.le_of_ble_eq_true hFit; omega
+                    have hCov := scalarLayoutCoversWidth_of_scalar_fullRange l s0 w hR hFull hW hPos
+                      (by omega)
+                    obtain ⟨sv, hSv⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w
+                      ((bs.drop o.bytes).take w) hCov hW (length_drop_take_of_le bs _ _ hIn)
+                      (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
+                      (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
+                    refine ⟨.aggregate variantIdx [.scalar sv], ?_⟩
+                    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                      Bool.or_false, hVar, hF, hFL, hR, hW, sliceAbstractBytes_eq_of_le bs _ _ hIn,
+                      hSv]
+                | scalarPair s0 s1 =>
+                  rw [hR] at hStage1
+                  obtain ⟨vals, hVals⟩ :=
+                    decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
+                  exact ⟨.aggregate variantIdx vals, by
+                    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                      Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
+                | memory =>
+                  rw [hR] at hStage1
+                  obtain ⟨vals, hVals⟩ :=
+                    decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
+                  exact ⟨.aggregate variantIdx vals, by
+                    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                      Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
+              · cases hR : l.backendRepr with
+                | scalar s0 =>
+                  rw [hR] at hStage1
+                  obtain ⟨vals, hVals⟩ :=
+                    decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
+                  exact ⟨.aggregate variantIdx vals, by
+                    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                      Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
+                | scalarPair s0 s1 =>
+                  rw [hR] at hStage1
+                  dsimp only at hStage1
+                  unfold scalarFitsAt at hStage1
+                  cases hW0 : scalarLayoutByteWidth s0 <;> rw [hW0] at hStage1
+                  · simp only [Bool.false_and, Bool.false_eq_true] at hStage1
+                  case some w0 =>
+                  cases hW1 : scalarLayoutByteWidth s1 <;> rw [hW1] at hStage1
+                  · simp only [Bool.and_false, Bool.false_eq_true] at hStage1
+                  case some w1 =>
+                  simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
+                  obtain ⟨⟨_, hFit0⟩, ⟨_, hFit1⟩⟩ := hStage1
+                  have hIn0 : o.bytes + w0 ≤ length bs := by
+                    have := Nat.le_of_ble_eq_true hFit0; omega
+                  have hIn1 : o1.bytes + w1 ≤ length bs := by
+                    have := Nat.le_of_ble_eq_true hFit1; omega
+                  unfold checkBackendReprFullRange at hFull
+                  rw [hR] at hFull
+                  simp only [Bool.and_eq_true] at hFull
+                  obtain ⟨sv0, hSv0⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w0
+                    ((bs.drop o.bytes).take w0) hFull.1 hW0 (length_drop_take_of_le bs _ _ hIn0)
+                    (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
+                    (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
+                  obtain ⟨sv1, hSv1⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s1 w1
+                    ((bs.drop o1.bytes).take w1) hFull.2 hW1 (length_drop_take_of_le bs _ _ hIn1)
+                    (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
+                    (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
+                  refine ⟨.aggregate variantIdx [.scalar sv0, .scalar sv1], ?_⟩
+                  simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                    Bool.or_false, hVar, hF, hFL, hR, hW0, hW1,
+                    sliceAbstractBytes_eq_of_le bs _ _ hIn0,
+                    sliceAbstractBytes_eq_of_le bs _ _ hIn1, hSv0, hSv1]
+                | memory =>
+                  rw [hR] at hStage1
+                  obtain ⟨vals, hVals⟩ :=
+                    decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
+                  exact ⟨.aggregate variantIdx vals, by
+                    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                      Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
+              · have hSorted : checkSpansSorted l.size.bytes (o :: o1 :: o2 :: os'') = true := by
+                  cases hR : l.backendRepr <;> rw [hR] at hStage1 <;> exact hStage1
+                obtain ⟨vals, hVals⟩ :=
+                  decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hSorted
+                exact ⟨.aggregate variantIdx vals, by
+                  simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
+                    Bool.or_false, hVar, hF, hFL, hProv, hVals]⟩
+            · rw [← hLen] at hCheck
+              obtain ⟨vals, hVals⟩ :=
+                decodeFieldsByLayoutIdxs_of_checkStage1FieldLayoutsWith
+                  (checkStage1LayoutAux fuel layouts)
+                  (fun fIdx fSlice =>
+                    decodeTypedValueFromBytes fuel layouts
+                      { kind := .adt "" [], layoutIdx := fIdx } fSlice)
+                  layouts bs
+                  (fun fIdx fl fSlice hFLookup hFCheck hSLen hSInit hSProv =>
+                    decodeTypedValueFromBytes_of_checkStage1LayoutAux fuel layouts "" [] fIdx fl
+                      fSlice hFLookup hFCheck hSLen hSInit hSProv)
+                  hInit hProv (o :: os) l.fieldLayouts hCheck
+              refine ⟨.aggregate variantIdx vals, ?_⟩
+              unfold decodeTypedValueFromBytes
+              simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF, hFL]
+              rw [hVals]
+      · nomatch hCheck
+    · nomatch hCheck
+
+/--
+**Stage-1 `FromBytes` for single-variant ADT layouts.** An inhabited
 single-variant ADT layout whose backend passes `checkBackendReprFullRange` and
 whose decoding shape passes `checkAdtStage1Decodable` decodes every initialized
 provenance-free image of its size under Stage-1, for every list of type
-arguments.
+arguments (including structs with nested struct or fixed-size array fields in
+`l.fieldLayouts`).
 -/
 theorem adt_isFromBytesTyped_of_checkAdtStage1Decodable
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -5861,126 +6319,30 @@ theorem adt_isFromBytesTyped_of_checkAdtStage1Decodable
     (hFull : checkBackendReprFullRange l = true)
     (hStage1 : checkAdtStage1Decodable layouts l = true) :
     IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
-  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit hProv => ?_⟩
-  have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
-    rw [hLen]; exact Nat.beq_refl _
-  rw [show defaultCodecFuel = 14 + 2 from rfl]
-  cases hF : l.fields with
-  | arbitrary offsets memOrder =>
+  have hAux : checkStage1LayoutAux defaultCodecFuel layouts l = true := by
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold checkStage1LayoutAux
+    rw [hInhab, hVar]
+    dsimp only
     unfold checkAdtStage1Decodable at hStage1
-    rw [hF] at hStage1
-    dsimp only at hStage1
-    cases offsets with
-    | nil =>
-      refine ⟨.aggregate variantIdx [], ?_⟩
-      simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-        Bool.or_false, hVar, hF]
-    | cons o os =>
-      cases hFL : Nat.beq (length l.fieldLayouts) (length (o :: os)) <;> rw [hFL] at hStage1
-      · -- backend scalars or raw spans
-        dsimp only at hStage1
-        rcases os with _ | ⟨o1, _ | ⟨o2, os''⟩⟩
-        · cases hR : l.backendRepr with
-          | scalar s0 =>
-            rw [hR] at hStage1
-            dsimp only at hStage1
-            unfold scalarFitsAt at hStage1
-            cases hW : scalarLayoutByteWidth s0 <;> rw [hW] at hStage1
-            · nomatch hStage1
-            case some w =>
-              simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
-              obtain ⟨hPos, hFit⟩ := hStage1
-              have hIn : o.bytes + w ≤ length bs := by
-                have := Nat.le_of_ble_eq_true hFit; omega
-              have hCov := scalarLayoutCoversWidth_of_scalar_fullRange l s0 w hR hFull hW hPos
-                (by omega)
-              obtain ⟨sv, hSv⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w
-                ((bs.drop o.bytes).take w) hCov hW (length_drop_take_of_le bs _ _ hIn)
-                (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
-                (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
-              refine ⟨.aggregate variantIdx [.scalar sv], ?_⟩
-              simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-                Bool.or_false, hVar, hF, hFL, hR, hW, sliceAbstractBytes_eq_of_le bs _ _ hIn, hSv]
-          | scalarPair s0 s1 =>
-            rw [hR] at hStage1
-            obtain ⟨vals, hVals⟩ :=
-              decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
-            exact ⟨.aggregate variantIdx vals, by
-              simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-                Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
-          | memory =>
-            rw [hR] at hStage1
-            obtain ⟨vals, hVals⟩ :=
-              decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
-            exact ⟨.aggregate variantIdx vals, by
-              simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-                Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
-        · cases hR : l.backendRepr with
-          | scalar s0 =>
-            rw [hR] at hStage1
-            obtain ⟨vals, hVals⟩ :=
-              decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
-            exact ⟨.aggregate variantIdx vals, by
-              simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-                Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
-          | scalarPair s0 s1 =>
-            rw [hR] at hStage1
-            dsimp only at hStage1
-            unfold scalarFitsAt at hStage1
-            cases hW0 : scalarLayoutByteWidth s0 <;> rw [hW0] at hStage1
-            · simp only [Bool.false_and, Bool.false_eq_true] at hStage1
-            case some w0 =>
-            cases hW1 : scalarLayoutByteWidth s1 <;> rw [hW1] at hStage1
-            · simp only [Bool.and_false, Bool.false_eq_true] at hStage1
-            case some w1 =>
-            simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
-            obtain ⟨⟨_, hFit0⟩, ⟨_, hFit1⟩⟩ := hStage1
-            have hIn0 : o.bytes + w0 ≤ length bs := by
-              have := Nat.le_of_ble_eq_true hFit0; omega
-            have hIn1 : o1.bytes + w1 ≤ length bs := by
-              have := Nat.le_of_ble_eq_true hFit1; omega
-            unfold checkBackendReprFullRange at hFull
-            rw [hR] at hFull
-            simp only [Bool.and_eq_true] at hFull
-            obtain ⟨sv0, hSv0⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w0
-              ((bs.drop o.bytes).take w0) hFull.1 hW0 (length_drop_take_of_le bs _ _ hIn0)
-              (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
-              (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
-            obtain ⟨sv1, hSv1⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s1 w1
-              ((bs.drop o1.bytes).take w1) hFull.2 hW1 (length_drop_take_of_le bs _ _ hIn1)
-              (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
-              (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
-            refine ⟨.aggregate variantIdx [.scalar sv0, .scalar sv1], ?_⟩
-            simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-              Bool.or_false, hVar, hF, hFL, hR, hW0, hW1, sliceAbstractBytes_eq_of_le bs _ _ hIn0,
-              sliceAbstractBytes_eq_of_le bs _ _ hIn1, hSv0, hSv1]
-          | memory =>
-            rw [hR] at hStage1
-            obtain ⟨vals, hVals⟩ :=
-              decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hStage1
-            exact ⟨.aggregate variantIdx vals, by
-              simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-                Bool.or_false, hVar, hF, hFL, hR, hProv, hVals]⟩
-        · have hSorted : checkSpansSorted l.size.bytes (o :: o1 :: o2 :: os'') = true := by
-            cases hR : l.backendRepr <;> rw [hR] at hStage1 <;> exact hStage1
-          obtain ⟨vals, hVals⟩ :=
-            decodeFieldsBySpan_of_checkSpansSorted bs l.size.bytes hLen hInit _ hSorted
-          exact ⟨.aggregate variantIdx vals, by
-            simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true,
-              Bool.or_false, hVar, hF, hFL, hProv, hVals]⟩
-      · -- field layouts
-        rw [← hLen] at hStage1
-        obtain ⟨vals, hVals⟩ :=
-          decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts 14 layouts bs hInit hProv (o :: os)
-            l.fieldLayouts hStage1
-        refine ⟨.aggregate variantIdx vals, ?_⟩
-        rw [show (14 + 2 : Nat) = 15 + 1 from rfl]
-        unfold decodeTypedValueFromBytes
-        simp only [hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false, hVar, hF, hFL]
-        rw [hVals]
-  | primitive => unfold checkAdtStage1Decodable at hStage1; rw [hF] at hStage1; nomatch hStage1
-  | union _ => unfold checkAdtStage1Decodable at hStage1; rw [hF] at hStage1; nomatch hStage1
-  | array _ _ => unfold checkAdtStage1Decodable at hStage1; rw [hF] at hStage1; nomatch hStage1
+    cases hF : l.fields <;> rw [hF] at hStage1
+    · exact hStage1
+    · nomatch hStage1
+    · exact hStage1
+    case arbitrary offsets memOrder =>
+      cases offsets with
+      | nil => rfl
+      | cons o os =>
+        dsimp only at hStage1 ⊢
+        cases hFL : Nat.beq (length l.fieldLayouts) (length (o :: os)) <;>
+          rw [hFL] at hStage1
+        · dsimp only at hStage1 ⊢
+          rw [hFull, hStage1]
+          rfl
+        · exact hStage1
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit hProv => ?_⟩
+  exact decodeTypedValueFromBytes_of_checkStage1LayoutAux defaultCodecFuel layouts defPath args
+    idx l bs hLookup hAux hLen hInit hProv
 
 /--
 **Stage-1 soundness of `checkFromBytesNicheAware`.** A type accepted by
@@ -6151,7 +6513,7 @@ theorem checkFromBytesNicheAware_ignores_fieldLayouts
         (Trusted.Sequence.length [({ bytes := 0 } : Size)]) = true := rfl
     rw [hB11]
     dsimp only
-    unfold checkStage1FieldLayouts checkStage1PrimitiveFieldLayout
+    unfold checkStage1FieldLayoutsWith checkStage1LayoutAux checkStage1PrimitiveFieldLayout
     rw [hFLookup]
     dsimp only
     rw [hFInhab, hFVar, hFFields, hFSz, hFRepr, hSz]
@@ -6170,5 +6532,178 @@ theorem checkFromBytesNicheAware_ignores_fieldLayouts
       nomatch hZeroInvalid
   exact ⟨hCheck, hStage1, hNotZ,
     fun hFB => hNotZ (isFromBytesTyped_implies_isFromZerosTyped layouts _ hFB)⟩
+
+/--
+**Composite `fieldLayouts` certification (`[u8; 4]` + `u32` struct).** When
+`rustc-capture` populates `l.fieldLayouts` for a contiguous struct such as
+`#[repr(C)] struct Packet { header: [u8; 4], tag: u32 }` (where `header`'s field
+layout is `.array ⟨1⟩ 4` pointing to a `u8` `.primitive` layout), both
+`checkFromBytesNicheAware` and the recursive `checkStage1Decodable` evaluate to
+`true` and certify `IsFromBytesTyped` and `IsFromZerosTyped`.
+-/
+theorem checkFromBytesNicheAware_composite_fieldLayouts_stage1_sound
+    (layouts : LayoutTable) (defPath : DefPath)
+    (idx arrFlIdx u8FlIdx u32FlIdx : LayoutIdx)
+    (l arrFl u8Fl u32Fl : TypeLayout)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single 0)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] [0, 1])
+    (hFieldLayouts : l.fieldLayouts = [arrFlIdx, u32FlIdx])
+    (hSz : l.size.bytes = 8)
+    (hRepr : l.backendRepr = .scalarPair
+      (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩)
+      (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩))
+    (hArrLookup : LayoutTable.lookup layouts arrFlIdx = some arrFl)
+    (hArrInhab : arrFl.isUninhabited = false)
+    (hArrVar : arrFl.variants = .single 0)
+    (hArrFields : arrFl.fields = .array ⟨1⟩ 4)
+    (hArrFL : arrFl.fieldLayouts = [u8FlIdx])
+    (hArrSz : arrFl.size.bytes = 4)
+    (hU8Lookup : LayoutTable.lookup layouts u8FlIdx = some u8Fl)
+    (hU8Inhab : u8Fl.isUninhabited = false)
+    (hU8Var : u8Fl.variants = .single 0)
+    (hU8Fields : u8Fl.fields = .primitive)
+    (hU8Sz : u8Fl.size.bytes = 1)
+    (hU8Repr : u8Fl.backendRepr = .scalar (.initialized (.int 8 false) ⟨0, 255⟩))
+    (hU32Lookup : LayoutTable.lookup layouts u32FlIdx = some u32Fl)
+    (hU32Inhab : u32Fl.isUninhabited = false)
+    (hU32Var : u32Fl.variants = .single 0)
+    (hU32Fields : u32Fl.fields = .primitive)
+    (hU32Sz : u32Fl.size.bytes = 4)
+    (hU32Repr :
+      u32Fl.backendRepr = .scalar (.initialized (.int 32 false) ⟨0, scalarModulus 4 - 1⟩)) :
+    let packetTy : Ty :=
+      { kind := .adt defPath [.array (.uint .u8) 4, .uint .u32], layoutIdx := idx }
+    checkFromBytesNicheAware layouts packetTy = true ∧
+    checkStage1Decodable layouts packetTy = true ∧
+    IsFromBytesTyped layouts packetTy ∧
+    IsFromZerosTyped layouts packetTy := by
+  intro packetTy
+  have hCFB : checkFromBytes layouts packetTy = true := by
+    rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+    dsimp only at hInhab hVar hFields hSz
+    subst hInhab hVar hFields hSz
+    unfold checkFromBytes checkAdtContiguousLayout
+    rw [hLookup]
+    rfl
+  have hCheck : checkFromBytesNicheAware layouts packetTy = true := by
+    unfold checkFromBytesNicheAware checkBackendReprFullRange
+    rw [hCFB]
+    rw [hLookup]
+    dsimp only
+    rw [hRepr]
+    rfl
+  have hStage1 : checkStage1Decodable layouts packetTy = true := by
+    unfold checkStage1Decodable checkAdtStage1Decodable
+    rw [hLookup]
+    dsimp only
+    rw [hFields, hFieldLayouts, hSz]
+    dsimp only
+    have hB22 : (Trusted.Sequence.length [arrFlIdx, u32FlIdx]).beq
+        (Trusted.Sequence.length [({ bytes := 0 } : Size), ({ bytes := 4 } : Size)]) = true := rfl
+    rw [hB22]
+    dsimp only
+    unfold checkStage1FieldLayoutsWith
+    rw [hArrLookup]
+    dsimp only
+    rw [hArrSz]
+    rw [show checkStage1LayoutAux 15 layouts arrFl = true by
+      unfold checkStage1LayoutAux
+      rw [hArrInhab, hArrVar, hArrFields, hArrFL, hArrSz]
+      dsimp only
+      rw [hU8Lookup]
+      dsimp only
+      rw [hU8Sz]
+      rw [show checkStage1LayoutAux 14 layouts u8Fl = true by
+        unfold checkStage1LayoutAux
+        rw [hU8Inhab, hU8Var, hU8Fields]
+        unfold checkStage1PrimitiveFieldLayout
+        rw [hU8Inhab, hU8Var, hU8Fields, hU8Sz, hU8Repr]
+        rfl]
+      rfl]
+    unfold checkStage1FieldLayoutsWith
+    rw [hU32Lookup]
+    dsimp only
+    rw [hU32Sz]
+    rw [show checkStage1LayoutAux 15 layouts u32Fl = true by
+      unfold checkStage1LayoutAux
+      rw [hU32Inhab, hU32Var, hU32Fields]
+      unfold checkStage1PrimitiveFieldLayout
+      rw [hU32Inhab, hU32Var, hU32Fields, hU32Sz, hU32Repr]
+      rfl]
+    rfl
+  have hSound := checkFromBytesNicheAware_stage1_sound layouts packetTy hCheck hStage1
+  exact ⟨hCheck, hStage1, hSound.1, hSound.2⟩
+
+/--
+**Nested struct `fieldLayouts` certification.** `adt_isFromBytesTyped_of_checkAdtStage1Decodable`
+also certifies nested structs whose outer `l.fieldLayouts` points to an inner
+`.arbitrary` struct layout `innerFl` with its own `innerFl.fieldLayouts`.
+-/
+theorem adt_nested_struct_fieldLayouts_isFromBytesTyped
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+    (idx innerFlIdx u16FlIdx : LayoutIdx)
+    (l innerFl u16Fl : TypeLayout)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single 0)
+    (hFields : l.fields = .arbitrary [⟨0⟩] [0])
+    (hFieldLayouts : l.fieldLayouts = [innerFlIdx])
+    (hSz : l.size.bytes = 4)
+    (hFull : checkBackendReprFullRange l = true)
+    (hInLookup : LayoutTable.lookup layouts innerFlIdx = some innerFl)
+    (hInInhab : innerFl.isUninhabited = false)
+    (hInVar : innerFl.variants = .single 0)
+    (hInFields : innerFl.fields = .arbitrary [⟨0⟩, ⟨2⟩] [0, 1])
+    (hInFL : innerFl.fieldLayouts = [u16FlIdx, u16FlIdx])
+    (hInSz : innerFl.size.bytes = 4)
+    (hU16Lookup : LayoutTable.lookup layouts u16FlIdx = some u16Fl)
+    (hU16Inhab : u16Fl.isUninhabited = false)
+    (hU16Var : u16Fl.variants = .single 0)
+    (hU16Fields : u16Fl.fields = .primitive)
+    (hU16Sz : u16Fl.size.bytes = 2)
+    (hU16Repr : u16Fl.backendRepr = .scalar (.initialized (.int 16 false) ⟨0, 65535⟩)) :
+    checkAdtStage1Decodable layouts l = true ∧
+    IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
+  have hU16Ok : checkStage1LayoutAux 14 layouts u16Fl = true := by
+    unfold checkStage1LayoutAux
+    rw [hU16Inhab, hU16Var, hU16Fields]
+    unfold checkStage1PrimitiveFieldLayout
+    rw [hU16Inhab, hU16Var, hU16Fields, hU16Sz, hU16Repr]
+    rfl
+  have hStage1 : checkAdtStage1Decodable layouts l = true := by
+    unfold checkAdtStage1Decodable
+    rw [hFields, hFieldLayouts, hSz]
+    dsimp only
+    have hB11 : (Trusted.Sequence.length [innerFlIdx]).beq
+        (Trusted.Sequence.length [({ bytes := 0 } : Size)]) = true := rfl
+    rw [hB11]
+    dsimp only
+    unfold checkStage1FieldLayoutsWith
+    rw [hInLookup]
+    dsimp only
+    rw [hInSz]
+    rw [show checkStage1LayoutAux 15 layouts innerFl = true by
+      unfold checkStage1LayoutAux
+      rw [hInInhab, hInVar, hInFields, hInFL, hInSz]
+      dsimp only
+      have hB22 : (Trusted.Sequence.length [u16FlIdx, u16FlIdx]).beq
+          (Trusted.Sequence.length [({ bytes := 0 } : Size), ({ bytes := 2 } : Size)]) = true := rfl
+      rw [hB22]
+      dsimp only
+      unfold checkStage1FieldLayoutsWith
+      rw [hU16Lookup]
+      dsimp only
+      rw [hU16Sz, hU16Ok]
+      unfold checkStage1FieldLayoutsWith
+      rw [hU16Lookup]
+      dsimp only
+      rw [hU16Sz, hU16Ok]
+      rfl]
+    rfl
+  exact ⟨hStage1,
+    adt_isFromBytesTyped_of_checkAdtStage1Decodable layouts defPath args idx l 0 hLookup hInhab
+      hVar hFull hStage1⟩
 
 end Anneal.BitValidity
