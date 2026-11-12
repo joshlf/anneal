@@ -43,6 +43,7 @@ const CASES: &[&str] = &[
     "audit-accepted",
     "audit-missing-lean",
     "audit-rejected",
+    "bundled-cargo-check",
     "cargo-arguments",
     "cargo-help",
     #[cfg(target_os = "linux")]
@@ -50,6 +51,7 @@ const CASES: &[&str] = &[
     "cargo-version",
     "driver-callback",
     "lean-file",
+    "rustdoc-html",
 ];
 
 #[test]
@@ -130,8 +132,10 @@ fn run_smoke(run: &RunDirectory) -> TestResult {
                 .as_deref()
                 .expect("installation selected above");
             match name {
+                "bundled-cargo-check" => bundled_cargo_case(case, root),
                 "lean-file" => lean_case(case, root),
                 "driver-callback" => driver_case(case, root),
+                "rustdoc-html" => rustdoc_case(case, root),
                 "audit-accepted" | "audit-rejected" | "audit-missing-lean" => {
                     audit_case(name, case, root)
                 }
@@ -290,6 +294,106 @@ fn lean_case(case: &mut CaseDirectory, root: &Path) -> TestResult {
     case.write("Small.lean", b"example (n : Nat) : n = n := rfl\n")?;
     let out = case.run(&Invocation::new(&lean, &["Small.lean"]))?;
     out.expect_code(0)
+}
+
+// The explicit workspace boundary below keeps Cargo from discovering an
+// ancestor workspace when a user places retained evidence inside one.
+fn bundled_cargo_case(case: &mut CaseDirectory, root: &Path) -> TestResult {
+    let cargo = root.join("rust/bin/cargo");
+    version(case, &cargo, "cargo ")?;
+    case.write(
+        "fixture/Cargo.toml",
+        b"[package]\nname = \"installed_probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )?;
+    case.write(
+        "fixture/src/lib.rs",
+        b"pub fn identity(n: u32) -> u32 { n }\n",
+    )?;
+    let cargo_home = case.path().join("cargo-home");
+    fs::create_dir(&cargo_home).map_err(|error| format!("create owned Cargo home: {error}"))?;
+    let target = case.path().join("target");
+    let mut command = Invocation::new(
+        &cargo,
+        &[
+            "check",
+            "--offline",
+            "--manifest-path",
+            &text_path(&case.path().join("fixture/Cargo.toml"))?,
+            "--target-dir",
+            &text_path(&target)?,
+        ],
+    );
+    // Cargo must use this installation and this case's empty cache even when
+    // the host has a different Rust toolchain or populated Cargo home.
+    for (name, path) in [
+        ("RUSTC", root.join("rust/bin/rustc")),
+        ("RUSTDOC", root.join("rust/bin/rustdoc")),
+        ("CARGO_HOME", cargo_home),
+    ] {
+        command.environment.insert(name.into(), text_path(&path)?);
+    }
+    let out = case.run(&command)?;
+    out.expect_code(0)?;
+    let dependencies = fs::read_dir(target.join("debug/deps"))
+        .map_err(|error| format!("read checked crate outputs: {error}"))?;
+    for entry in dependencies {
+        let path = entry
+            .map_err(|error| format!("read checked crate output: {error}"))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "rmeta")
+            && path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libinstalled_probe-")
+            && fs::metadata(&path)
+                .map_err(|error| format!("inspect checked metadata: {error}"))?
+                .len()
+                > 0
+        {
+            return Ok(());
+        }
+    }
+    Err("bundled Cargo check did not create nonempty crate metadata".into())
+}
+
+// A version banner does not exercise the documentation backend. Require the
+// crate page and its linked function page from this installation as well.
+fn rustdoc_case(case: &mut CaseDirectory, root: &Path) -> TestResult {
+    let rustdoc = root.join("rust/bin/rustdoc");
+    version(case, &rustdoc, "rustdoc ")?;
+    case.write(
+        "small.rs",
+        b"//! Installed documentation probe.\npub fn identity(n: u32) -> u32 { n }\n",
+    )?;
+    let documentation = case.path().join("documentation");
+    let out = case.run(&Invocation::new(
+        &rustdoc,
+        &[
+            "--sysroot",
+            &text_path(&root.join("rust"))?,
+            "--crate-name=installed_probe",
+            "--crate-type=lib",
+            "--edition=2024",
+            "--out-dir",
+            &text_path(&documentation)?,
+            "small.rs",
+        ],
+    ))?;
+    out.expect_code(0)?;
+    let index = fs::read(documentation.join("installed_probe/index.html"))
+        .map_err(|error| format!("read generated documentation: {error}"))?;
+    require_text(&index, "Installed documentation probe.", &out)?;
+    require_text(&index, "fn.identity.html", &out)?;
+    if !documentation
+        .join("installed_probe/fn.identity.html")
+        .is_file()
+    {
+        return Err("rustdoc did not create the function documentation".into());
+    }
+    Ok(())
 }
 
 fn driver_case(case: &mut CaseDirectory, root: &Path) -> TestResult {
