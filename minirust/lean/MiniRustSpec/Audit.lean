@@ -3482,6 +3482,40 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagRawOnRefLocal_minirust_ret_from_start
   retagRawOnRefLocal_minirust_noUB
   retagRawOnRefLocal_progress
+  mutableBorrowPerm_of_sharedBorrowPerm_frozen
+  placeIsZeroSized_of_deref_ptrPointeeOf
+  IsBorrowAncestorOrSelf.refl
+  IsBorrowAncestorOrSelf.of_eq
+  IsBorrowAncestorOrSelf.of_descendant
+  IsBorrowAncestorOrSelf.step
+  isBorrowDescendantOrSelfAux_trans
+  IsBorrowAncestorOrSelf.trans
+  IsBorrowAncestorOrSelf.of_lookup_sub
+  IsBorrowAncestorOrSelf.map_iff
+  IsBorrowAncestorOrSelf.cases_of_lookup
+  BorrowDagOrdered.map
+  BorrowDagOrdered.parent_lt_of_lookup
+  isBorrowDescendantOrSelfAux_cons_of_lt
+  IsBorrowAncestorOrSelf.cons_of_lt_iff
+  BorrowDagOrdered.descendant_of_ancestor
+  treeBorrowChainChildAccessUBAux_write_false
+  derefWriteTreeUB_false_of_ancestors_writable
+  subsumesPtrLocalState_freeze_right
+  freezePtrState_mono
+  BorrowsOk.entry_perm_cases
+  BorrowsOk.ancestors_not_disabled
+  BorrowsOk.ancestors_writable
+  BorrowsOk.perm_std
+  FreezeOrSelf.perm_std
+  updateBorrowPermTreeAtProj_perm_std
+  BorrowDagOrdered.ancestor_le
+  BorrowDagOrdered.anc_sub_cons
+  BorrowsOk.freezeRead_dag
+  BorrowsOk.reborrow_core
+  BorrowsOk.retagRef
+  invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
+  hasTreeReadUB_false_of_ancestors_not_disabled
+  derefReadTreeUB_false_of_ancestors_not_disabled
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3945,6 +3979,40 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagRawOnRefLocal_minirust_ret_from_start
   retagRawOnRefLocal_minirust_noUB
   retagRawOnRefLocal_progress
+  mutableBorrowPerm_of_sharedBorrowPerm_frozen
+  placeIsZeroSized_of_deref_ptrPointeeOf
+  IsBorrowAncestorOrSelf.refl
+  IsBorrowAncestorOrSelf.of_eq
+  IsBorrowAncestorOrSelf.of_descendant
+  IsBorrowAncestorOrSelf.step
+  isBorrowDescendantOrSelfAux_trans
+  IsBorrowAncestorOrSelf.trans
+  IsBorrowAncestorOrSelf.of_lookup_sub
+  IsBorrowAncestorOrSelf.map_iff
+  IsBorrowAncestorOrSelf.cases_of_lookup
+  BorrowDagOrdered.map
+  BorrowDagOrdered.parent_lt_of_lookup
+  isBorrowDescendantOrSelfAux_cons_of_lt
+  IsBorrowAncestorOrSelf.cons_of_lt_iff
+  BorrowDagOrdered.descendant_of_ancestor
+  treeBorrowChainChildAccessUBAux_write_false
+  derefWriteTreeUB_false_of_ancestors_writable
+  subsumesPtrLocalState_freeze_right
+  freezePtrState_mono
+  BorrowsOk.entry_perm_cases
+  BorrowsOk.ancestors_not_disabled
+  BorrowsOk.ancestors_writable
+  BorrowsOk.perm_std
+  FreezeOrSelf.perm_std
+  updateBorrowPermTreeAtProj_perm_std
+  BorrowDagOrdered.ancestor_le
+  BorrowDagOrdered.anc_sub_cons
+  BorrowsOk.freezeRead_dag
+  BorrowsOk.reborrow_core
+  BorrowsOk.retagRef
+  invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
+  hasTreeReadUB_false_of_ancestors_not_disabled
+  derefReadTreeUB_false_of_ancestors_not_disabled
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms
