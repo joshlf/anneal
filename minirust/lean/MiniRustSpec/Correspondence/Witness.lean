@@ -13265,6 +13265,25 @@ theorem cmpDiscrSwitch_discriminant_statementOk :
         (.discriminant (local_ 5)) = false := by
   decide
 
+/-- **`Rvalue::Discriminant` is admitted only on unprojected `Ordering` locals
+(`rvalueOk_discriminant_nonOrdering`, `rvalueOk_discriminant_proj`)**: MiniRust's
+`ValueExpr::GetDiscriminant` is well-formed only at `Type::Enum`
+(`spec/lang/well-formed.md`), and `core::cmp::Ordering` is the fragment's only enum. So the
+discriminant of a unit, scalar, tuple, or array local (which Anneal's `evalPlaceDiscriminant`
+evaluates to `0`) has no well-formed MiniRust counterpart and stays outside the fragment, as
+does every projected discriminant place. -/
+theorem rvalueOk_discriminant_nonOrdering (layouts : LayoutTable) (decls : List LocalDecl)
+    (it : Gen.IntType) {j : Nat} {d : LocalDecl} (hd : decls[j]? = some d)
+    (hno : isOrderingTy d.ty = false) :
+    rvalueOk layouts decls it (.discriminant ⟨j, []⟩) = false := by
+  simp [rvalueOk, hd, hno]
+
+/-- See `rvalueOk_discriminant_nonOrdering`. -/
+theorem rvalueOk_discriminant_proj (layouts : LayoutTable) (decls : List LocalDecl)
+    (it : Gen.IntType) (j : Nat) (pe : ProjectionElem) (rest : List ProjectionElem) :
+    rvalueOk layouts decls it (.discriminant ⟨j, pe :: rest⟩) = false := by
+  simp [rvalueOk]
+
 /-- The MiniRust function `minimize` produces for `cmpDiscrSwitch`, spelled
 out, with `Rvalue::Discriminant` lowered to `transmute::<i8>` of the load of the
 `Ordering` local (`orderingDiscrExpr`). -/
