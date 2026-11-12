@@ -7047,3 +7047,133 @@ fn test_b4_returned_caller_exposed_pointers_restore_caller_provenance_across_mul
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A4 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a4_returned_aggregates_restore_each_caller_exposed_pointer_to_its_own_local() {
+    // `pair(a, b) -> [*const u32; 2]` rebuilds both pointers from exposed addresses (the opaque
+    // caller provenance in its frame) and returns them in an array; the caller passes the
+    // addresses of its `_2` and `_1` (in that order) and reads both pointees: each element must
+    // recover the provenance of the local it points into.
+    for pw in PWS {
+        let raw_u32 = raw(u32_ty(), Mutability::Not);
+        let ptr_pair = Ty::Array(Box::new(raw_u32.clone()), 2);
+        let pair = mk(
+            vec![
+                ptr_pair.clone(),
+                usize_ty(),
+                usize_ty(),
+                raw_u32.clone(),
+                raw_u32.clone(),
+            ],
+            vec![blk(
+                vec![
+                    live(3),
+                    live(4),
+                    assign(
+                        3,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        4,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(2),
+                            raw_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::Aggregate(
+                            AggregateKind::Array(raw_u32.clone()),
+                            vec![cp(3), cp(4)],
+                        ),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+        let elem = |i: u64| {
+            Operand::Copy(Place::with_projection(
+                7,
+                vec![ProjectionElem::ConstantIndex {
+                    offset: i,
+                    min_length: 2,
+                    from_end: false,
+                }],
+            ))
+        };
+        let deref =
+            |l: usize| Operand::Copy(Place::with_projection(l, vec![ProjectionElem::Deref]));
+        let root = mk(
+            vec![
+                Ty::Tuple(vec![u32_ty(), u32_ty()]),
+                u32_ty(),
+                u32_ty(),
+                raw_u32.clone(),
+                raw_u32.clone(),
+                usize_ty(),
+                usize_ty(),
+                ptr_pair,
+                raw_u32.clone(),
+                raw_u32.clone(),
+            ],
+            vec![
+                blk(
+                    (1..=9)
+                        .map(live)
+                        .chain([
+                            assign(1, Rvalue::Use(cst(7, u32_ty()))),
+                            assign(2, Rvalue::Use(cst(9, u32_ty()))),
+                            assign(3, Rvalue::RawPtr(Mutability::Not, place(1))),
+                            assign(4, Rvalue::RawPtr(Mutability::Not, place(2))),
+                            assign(
+                                5,
+                                Rvalue::Cast(CastKind::PointerExposeProvenance, cp(3), usize_ty()),
+                            ),
+                            assign(
+                                6,
+                                Rvalue::Cast(CastKind::PointerExposeProvenance, cp(4), usize_ty()),
+                            ),
+                        ])
+                        .collect(),
+                    call(
+                        callee("pair"),
+                        vec![cp(6), cp(5)],
+                        7,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![
+                        assign(8, Rvalue::Use(elem(0))),
+                        assign(9, Rvalue::Use(elem(1))),
+                        assign(
+                            0,
+                            Rvalue::Aggregate(AggregateKind::Tuple, vec![deref(8), deref(9)]),
+                        ),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        let table = CallTable::new().with_callee("pair", 2, lower(&pair, pw));
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&root, pw),
+                &[],
+                8,
+                &table
+            )),
+            MirValue::Tuple(vec![u32v(9), u32v(7)])
+        );
+    }
+}

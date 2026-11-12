@@ -1420,14 +1420,17 @@ pub struct LinkedCallee {
 ///   re-attributed to the caller's calling block with their messages unchanged, and an error
 ///   inside a callee is reported as [`CfgEvalError::InCallee`] with the call stack.
 /// - **Frame isolation.** Every frame has its own locals and synthetic stack allocations
-///   (provenance `alloc_id = local + 1`); it inherits the caller's transmute policy,
-///   `ub_checks`, and live exposed provenances (external provenances directly unless their
-///   `alloc_id` falls in `1..=max(caller_locals, callee_locals)`, and live caller-frame
-///   synthetic provenances as an opaque non-local provenance so `with_exposed_provenance`
-///   pointer arithmetic stays defined without aliasing callee locals, while storage-dead caller
-///   locals are never exposed; external provenances exposed inside a callee propagate back to
-///   the caller on return or unwind, and pointers reconstructed in a callee with the opaque
-///   caller provenance recover the caller's provenance when returned to it). A callee
+///   (provenance `alloc_id = local + 1`); it inherits the caller's transmute policy and
+///   `ub_checks`. Of the caller's exposed provenances, those of storage-dead caller locals are
+///   dropped, external ones with `alloc_id > max(caller_locals, callee_locals)` are inherited
+///   unchanged, and the others (live caller locals, and externals whose `alloc_id` would name a
+///   callee local) become one opaque non-local provenance, so `with_exposed_provenance`
+///   pointer arithmetic stays defined without aliasing callee locals. When the callee returns
+///   or unwinds, the external provenances it exposed outside
+///   `1..=max(caller_locals, callee_locals)` become exposed in the caller, and a returned
+///   pointer with the opaque provenance gets the caller's live exposed local containing its
+///   address, else a hidden external, else any live exposed local (unless the caller itself
+///   holds an outer frame's opaque provenance, which the pointer then keeps). A callee
 ///   frame's allocations lie above all of its caller's
 ///   ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the address space is
 ///   `UnsupportedMemoryAccess`), so the addresses of distinct active frames never coincide, not
@@ -1436,7 +1439,8 @@ pub struct LinkedCallee {
 ///   synthetic local allocation of either frame (`alloc_id` in
 ///   `1..=max(caller_locals, callee_locals)`) is rejected with `UnsupportedMemoryAccess`
 ///   (never reinterpreted as a pointer into the other frame); pointers without provenance, or
-///   with any other provenance, cross unchanged.
+///   with any other provenance, cross unchanged (but for the opaque provenance of a returned
+///   pointer, as above).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallTable {
     callees: BTreeMap<CalleeSymbol, LinkedCallee>,
@@ -1799,9 +1803,11 @@ const CALLER_EXPOSED_ALLOC_ID: u64 = u64::MAX;
 /// Restores [`CALLER_EXPOSED_ALLOC_ID`] provenances in `val` when a linked callee returns to
 /// `caller_state`: pointers matching one of `caller_state`'s live exposed locals recover that
 /// local's provenance (so dereferencing, `copy_nonoverlapping`, and `write_bytes` in the caller
-/// observe the local allocation); pointers still belonging to an outer ancestor frame remain
-/// [`CALLER_EXPOSED_ALLOC_ID`] until they reach that frame; and shielded external provenances in
-/// `(caller_locals + 1)..=limit` recover their external `Provenance`.
+/// observe the local allocation); if the caller itself holds an outer frame's
+/// [`CALLER_EXPOSED_ALLOC_ID`], any other pointer keeps it until it reaches that frame;
+/// otherwise it recovers a shielded external provenance (`alloc_id` in
+/// `(caller_locals + 1)..=limit`), or else any live exposed local's provenance (the last resort
+/// of `with_exposed_provenance` prediction in a single frame).
 fn restore_caller_exposed_provenance(
     val: &mut MirValue,
     caller_state: &StatementEvalState,

@@ -11052,13 +11052,14 @@ fn eval_copy_nonoverlapping(
 /// statement).
 ///
 /// Validates target-width pointer addresses and non-null reference bit-validity
-/// (`InvalidBitPattern`), `count <= usize::MAX` (`InvalidBitPattern`), non-null raw/reference
-/// addresses (`NullPointerAccess`), `elem_align` alignment (`MisalignedPointer`), inhabited
-/// pointees for references (`UninhabitedPointee`), `count * elem_size <= isize::MAX`
-/// (`CopyLengthOverflow`), and non-wrapping `[addr, addr + byte_len]` ranges
-/// (`PointerRangeOverflow`) even when `count == 0` (mirroring `Trusted`'s
-/// `evalCopyNonOverlappingWithCount`). Non-zero copies additionally reject overlapping same-allocation
-/// ranges (`CopyNonOverlappingOverlap`) and storage-dead synthetic locals (`DeadLocal` for
+/// (`InvalidBitPattern`), `count <= usize::MAX` (`InvalidBitPattern`), non-null raw pointers
+/// (`NullPointerAccess`), `elem_align` alignment (`MisalignedPointer`), inhabited pointees for
+/// references (`UninhabitedPointee`), `count * elem_size <= isize::MAX` (`CopyLengthOverflow`),
+/// and non-wrapping `[addr, addr + byte_len]` ranges (`PointerRangeOverflow`), even when
+/// `count == 0`: the statement's pre-existing semantics, stricter than `Trusted`'s
+/// `evalCopyNonOverlappingWithCount`, which steps over a zero-count copy without any check.
+/// Non-zero copies additionally reject overlapping same-allocation ranges
+/// (`CopyNonOverlappingOverlap`) and storage-dead synthetic locals (`DeadLocal` for
 /// `byte_len > 0` or `count == 1`), then transfer initialized/uninitialized sub-places or
 /// contiguous array windows (or fail closed with `UnsupportedMemoryAccess`).
 #[allow(clippy::too_many_arguments)]
