@@ -5500,7 +5500,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   mirCall_diverges_rel_D
   resolveFieldPath_deinit_unit
   evalStatement_deinit_fieldPath
+  spliceAt_eq_self
   evalStmt_deinit_field
+  evalStmt_retag_field
+  siblingRetagOk_deinitTargetOk
+  windowStmtOk_retag
+  evalStatement_validate_field_any
+  siblingRetagOk_spec
+  step_window_retag
   length_toAbstractBytes
   toAbstractBytes_deinitBytes
   evalDeinitPlace_spec_minirust_store_simulation
@@ -5525,7 +5532,13 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedRetagRead_minirust_ret
   paddedRetagRead_stage1_parity
   paddedDeinitRead_not_inFragmentD
-  paddedRetagRead_not_inFragmentD
+  paddedRetagRead_inFragmentD
+  paddedRetagRead_minirust_ret_from_start
+  paddedRetagRead_minirust_noUB
+  paddedDeinitSiblingRetagReinit_inFragmentD
+  paddedDeinitSiblingRetagReinit_minirust_ret_from_start
+  paddedDeinitRetagHole_not_inFragmentD
+  paddedDeinitRetagHole_diverges
   deinitSiblingReinit_inFragmentD
   deinitSiblingReinit_minirust_ret_from_start
   deinitSiblingReinit_minirust_noUB

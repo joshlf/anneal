@@ -100,33 +100,41 @@ open MiniRustSpec.Interp
 
 /-! ## Erasing projected `Deinit` -/
 
-/-- A projected `Deinit(_i.proj)` becomes `PlaceMention(_i.proj)`; every other statement is
-kept. -/
+/-- A projected `Deinit(_i.proj)` or projected `Retag(_, _i.proj)` becomes
+`PlaceMention(_i.proj)`; every other statement is kept. -/
 def eraseDeinitStmt (st : MirAst.Statement) : MirAst.Statement :=
   match st.kind with
   | .deinit ⟨i, pe :: rest⟩ => { st with kind := .placeMention ⟨i, pe :: rest⟩ }
+  | .retag _ ⟨i, pe :: rest⟩ => { st with kind := .placeMention ⟨i, pe :: rest⟩ }
   | _ => st
 
 /-- `eraseDeinitStmt` on every statement of a block. -/
 def eraseDeinitBlock (bb : BasicBlockData) : BasicBlockData :=
   { bb with statements := bb.statements.map eraseDeinitStmt }
 
-/-- `body` with every projected `Deinit(p)` replaced by `PlaceMention(p)`. -/
+/-- `body` with every projected `Deinit(p)` or projected `Retag(_, p)` replaced by
+`PlaceMention(p)`. -/
 def eraseDeinit (body : CapturedMir) : CapturedMir :=
   { body with basicBlocks := body.basicBlocks.map eraseDeinitBlock }
 
-/-- Whether a statement is a projected `Deinit`. -/
+/-- Whether a statement is a projected `Deinit` or projected `Retag`. -/
 def isProjDeinit (st : MirAst.Statement) : Bool :=
   match st.kind with
   | .deinit ⟨_, _ :: _⟩ => true
+  | .retag _ ⟨_, _ :: _⟩ => true
   | _ => false
 
-/-- `eraseDeinitStmt` keeps every statement other than a projected `Deinit`. -/
+/-- `eraseDeinitStmt` keeps every statement other than a projected `Deinit` or projected `Retag`. -/
 theorem eraseDeinitStmt_of_not {st : MirAst.Statement} (h : isProjDeinit st = false) :
     eraseDeinitStmt st = st := by
   obtain ⟨kind, span⟩ := st
   cases kind with
   | deinit p =>
+    obtain ⟨i, proj⟩ := p
+    cases proj with
+    | nil => rfl
+    | cons _ _ => simp [isProjDeinit] at h
+  | retag _ p =>
     obtain ⟨i, proj⟩ := p
     cases proj with
     | nil => rfl
@@ -350,19 +358,38 @@ def binOpWindowOk (body : CapturedMir) (t r q : Nat) (op : MirAst.BinOp) (c : Co
     | _, _, _ => false
   | _, _, _ => false
 
+/-- A sibling `Retag(kind, _t.projs')` while `_t.projs` is a hole: `projs'` resolves in `_t`'s
+`TupleSpec` to a scalar leaf of positive size whose bytes are disjoint from the hole. -/
+def siblingRetagOk (body : CapturedMir) (t : Nat) (projs projs' : List ProjectionElem) : Bool :=
+  match body.localDecls[t]? with
+  | some d =>
+    match tupleTypeOf body.layouts d.ty with
+    | some (fields, size, align) =>
+      match resolveFieldPath body.layouts (.tuple fields size align) projs,
+            resolveFieldPath body.layouts (.tuple fields size align) projs' with
+      | some (off, leaf), some (off', .scalar it') =>
+        decide (0 < it'.size.bytes) &&
+          (decide (off' + it'.size.bytes ≤ off) || decide (off + leaf.size ≤ off'))
+      | _, _ => false
+    | none => false
+  | none => false
+
 /-- The statements admitted before statement `idx` of block `blk` when the hole state is
-`hole`: with no hole, any statement (a projected `Deinit` must target an admissible,
-not-moved-out `TupleSpec` local); with a hole on `_t.projs`, only a disjoint sibling read
-`_r = copy _t.projs'` (possibly through an integer cast, `_r = Cast(IntToInt, copy _t.projs', it)`),
-a hole-independent scalar local copy `_r = copy _q`, a hole-independent scalar binary operation
-`_r = BinaryOp(op, copy _q, const c)`, a constant re-initialization
-`_t.projs = const c`, a local-copy re-initialization `_t.projs = copy _r`, or a binary-operation
-re-initialization `_t.projs = BinaryOp(op, copy _q, const c)`. -/
+`hole`: with no hole, any statement (a projected `Deinit` or projected `Retag` must target an
+admissible, not-moved-out `TupleSpec` local); with a hole on `_t.projs`, only a disjoint sibling
+read `_r = copy _t.projs'` (possibly through an integer cast, `_r = Cast(IntToInt, copy _t.projs', it)`),
+a disjoint sibling `Retag(_, _t.projs')`, a hole-independent scalar local copy `_r = copy _q`, a
+hole-independent scalar binary operation `_r = BinaryOp(op, copy _q, const c)`, a constant
+re-initialization `_t.projs = const c`, a local-copy re-initialization `_t.projs = copy _r`, or a
+binary-operation re-initialization `_t.projs = BinaryOp(op, copy _q, const c)`. -/
 def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
     Option (Nat × List ProjectionElem) → MirAst.Statement → Bool
   | none, st =>
     match st.kind with
     | .deinit ⟨t, pe :: rest⟩ =>
+      deinitTargetOk body t (pe :: rest) &&
+        !(movedBefore (eraseDeinit body) blk idx).contains t
+    | .retag _ ⟨t, pe :: rest⟩ =>
       deinitTargetOk body t (pe :: rest) &&
         !(movedBefore (eraseDeinit body) blk idx).contains t
     | _ => true
@@ -384,7 +411,51 @@ def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
     | .assign ⟨t', rp :: rps⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)) =>
       decide (t' = t) && reinitBinOpOk body t q (rp :: rps) op c &&
         decide (holeRange body t (rp :: rps) = holeRange body t ps)
+    | .retag _ ⟨t', qp :: qps⟩ =>
+      decide (t' = t) && !(movedBefore (eraseDeinit body) blk idx).contains t &&
+        siblingRetagOk body t ps (qp :: qps)
     | _ => false
+
+theorem siblingRetagOk_deinitTargetOk {body : CapturedMir} {t : Nat}
+    {projs projs' : List ProjectionElem} (h : siblingRetagOk body t projs projs' = true) :
+    deinitTargetOk body t projs' = true := by
+  unfold siblingRetagOk at h
+  unfold deinitTargetOk
+  cases hd : body.localDecls[t]? with
+  | none => simp [hd] at h
+  | some d =>
+    cases ht : tupleTypeOf body.layouts d.ty with
+    | none => simp [hd, ht] at h
+    | some trip =>
+      obtain ⟨fields, size, align⟩ := trip
+      cases hres : resolveFieldPath body.layouts (.tuple fields size align) projs with
+      | none => simp [hd, ht, hres] at h
+      | some pr =>
+        cases hres' : resolveFieldPath body.layouts (.tuple fields size align) projs' with
+        | none => simp [hd, ht, hres, hres'] at h
+        | some pr' =>
+          obtain ⟨off', leaf'⟩ := pr'
+          cases leaf' with
+          | tuple _ _ _ => simp [hd, ht, hres, hres'] at h
+          | scalar it' =>
+            simp only [hd, ht, hres, hres', Bool.and_eq_true] at h ⊢
+            exact h.1
+
+theorem windowStmtOk_retag {body : CapturedMir} {blk idx : Nat}
+    {hole : Option (Nat × List ProjectionElem)} {rkind : RetagKind}
+    {t : Nat} {pe : ProjectionElem} {rest : List ProjectionElem} {span : String}
+    (h : windowStmtOk body blk idx hole ⟨.retag rkind ⟨t, pe :: rest⟩, span⟩ = true) :
+    deinitTargetOk body t (pe :: rest) = true ∧
+      t ∉ movedBefore (eraseDeinit body) blk idx := by
+  cases hole with
+  | none =>
+    simp only [windowStmtOk, Bool.and_eq_true, Bool.not_eq_true'] at h
+    exact ⟨h.1, by simpa using h.2⟩
+  | some hp =>
+    obtain ⟨t0, ps⟩ := hp
+    simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq, Bool.not_eq_true'] at h
+    obtain ⟨⟨rfl, hnm⟩, hsib⟩ := h
+    exact ⟨siblingRetagOk_deinitTargetOk hsib, by simpa using hnm⟩
 
 /-- Whether the statements `sts` (starting at index `idx` with hole state `hole`) satisfy
 `windowStmtOk` and close every hole before the terminator. -/
@@ -534,7 +605,7 @@ theorem blk_eraseDeinit {body : CapturedMir} {f : Gen.Function} (hf : translateF
   exact hstspec i st0 hst0
 
 
-/-- `statementOk` rejects every projected `Deinit`. -/
+/-- `statementOk` rejects every projected `Deinit` and projected `Retag`. -/
 theorem isProjDeinit_false_of_statementOk {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     {st : MirAst.Statement} (h : statementOk decls st layouts = true) : isProjDeinit st = false := by
   obtain ⟨kind, span⟩ := st
@@ -544,9 +615,15 @@ theorem isProjDeinit_false_of_statementOk {decls : List LocalDecl} {layouts : La
     cases proj with
     | nil => rfl
     | cons _ _ => simp [statementOk] at h
+  | retag _ p =>
+    obtain ⟨i, proj⟩ := p
+    cases proj with
+    | nil => rfl
+    | cons _ _ => simp [statementOk] at h
   | _ => rfl
 
-/-- Without projected `Deinit`, no hole ever opens and every block passes the window check. -/
+/-- Without projected `Deinit` or projected `Retag`, no hole ever opens and every block passes
+the window check. -/
 theorem blockWindowOk_of_noProjDeinit {body : CapturedMir} {blk : Nat} :
     ∀ (sts : List MirAst.Statement) (n : Nat), (∀ st ∈ sts, isProjDeinit st = false) →
       blockWindowOk body blk sts n none = true
@@ -559,6 +636,11 @@ theorem blockWindowOk_of_noProjDeinit {body : CapturedMir} {blk : Nat} :
     have hwin : windowStmtOk body blk n none ⟨kind, span⟩ = true := by
       cases kind with
       | deinit p =>
+        obtain ⟨i, proj⟩ := p
+        cases proj with
+        | nil => rfl
+        | cons _ _ => simp [isProjDeinit] at hst
+      | retag _ p =>
         obtain ⟨i, proj⟩ := p
         cases proj with
         | nil => rfl
@@ -677,11 +759,107 @@ theorem StepRelN.toStepRelD {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} 
   · exact h.elim
 
 
-/-! ## The projected `Deinit` step -/
+/-! ## The projected `Deinit` and projected `Retag` steps -/
 
-/-- **Projected `Deinit` step.** At a projected `Deinit(_t.f1...fk)` of a `TupleSpec` local
-(no hole open, `_t` not moved out), Anneal advances with unchanged locals while MiniRust stores
-`Uninit` over the field's bytes; the new states are related through the hole `_t.f1...fk`. -/
+/-- The field place `_t.projs` of a `TupleSpec` local evaluates to the field's byte offset in
+`_t`'s allocation on any machine of the right shape, whatever the allocation's bytes. -/
+theorem evalPlace_field_any {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
+    {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
+    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
+    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
+    {D : List Byte} (hD : D.length = size)
+    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
+    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
+    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
+    {off : Nat} {leaf : TupleSpec}
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, leaf)) :
+    evalPlace m pe =
+      .ok (({ ptr := { thin_pointer := offsetPtr p off, metadata := none }, aligned := true },
+        leaf.toMiniRustTy), m) := by
+  obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
+  have hloc := (hfl.2 t d hd).2
+  rw [hTd] at hloc
+  have hbound : size < 2 ^ 63 := by
+    simp only [TupleSpec.wf, Bool.and_eq_true, decide_eq_true_eq] at hrootWf
+    exact hrootWf.1.2
+  have hplaceBase := evalPlace_local_some h t _ hloc p hp
+  have hrootEval : evalPlace m (.Local (localName t)) =
+      .ok (({ ptr := { thin_pointer := offsetPtr p 0, metadata := none }, aligned := true },
+        (TupleSpec.tuple fields size align).toMiniRustTy), m) := by
+    simpa using hplaceBase
+  have hpeEval := evalPlace_ptr_fieldPath h p k hpk (itOf d body.layouts) D hA
+    (by rw [hD]; exact hbound) haddr0 (by rw [hD]; exact haddrMax)
+    (.Local (localName t)) 0 (.tuple fields size align) hrootEval hrootWf
+    (by simp [TupleSpec.size, hD]) projs pe hpe off leaf hres
+  simpa using hpeEval
+
+/-- **`Validate` (`Retag`) of a scalar field, on any allocation bytes whose field slice encodes
+the field's value**: loads the integer slice, runs `retagVal` (the identity on `Val.Int`), and
+stores back the identical bytes (`spliceAt_eq_self`), leaving `A` unchanged. -/
+theorem evalStatement_validate_field_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
+    {lm : Map Gen.LocalName Ptr} {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
+    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
+    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
+    {D : List Byte} (hD : D.length = size)
+    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
+    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
+    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
+    {off : Nat} {it : Gen.IntType}
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, .scalar it))
+    {bits : Nat} (hbits : bits < 2 ^ (8 * it.size.bytes))
+    (hslice : (D.drop off).take it.size.bytes = scalarBytes it bits)
+    (fnEntry : Bool) :
+    ∃ m', evalStatement m (.Validate pe fnEntry) = .ok m' ∧
+      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A := by
+  have hpeEval := evalPlace_field_any h hfl hd ht hrootWf hp hpk haddr0 haddrMax hD hA hpe hres
+  obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
+  have hv : (TupleSpec.scalar it).valOk (.scalar ⟨bits, it.size.bytes⟩) = true := by
+    simp [TupleSpec.valOk, hbits]
+  obtain ⟨m1, hm1, h1⟩ := typedLoad_ptr_tuple_slice h p k hpk (itOf d body.layouts) D hA off
+    (.scalar it) (.scalar ⟨bits, it.size.bytes⟩) hleafWf hv
+    (by simp [TupleSpec.size] at hrelBound ⊢; omega) (by simpa [TupleSpec.encodeVal, valBytes,
+      TupleSpec.size] using hslice)
+  have hst := typedStore_ptr_tuple_slice h1 p k hpk (itOf d body.layouts) D hA off (.scalar it)
+    (.scalar ⟨bits, it.size.bytes⟩) hleafWf hv (by simp [TupleSpec.size] at hrelBound ⊢; omega)
+  simp only [TupleSpec.toMiniRustVal, TupleSpec.toMiniRustTy, TupleSpec.encodeVal, valBytes,
+    TupleSpec.size] at hm1 hst hpeEval
+  have hwlen : (scalarBytes it bits).length = it.size.bytes := by
+    simp [scalarBytes, leBytes_length]
+  have hspl : spliceAt D off (scalarBytes it bits) = D :=
+    DeinitBridge.spliceAt_eq_self D off (scalarBytes it bits)
+      (by rw [hwlen, hD]; simpa [TupleSpec.size] using hrelBound)
+      (by rw [hwlen]; exact hslice)
+  have hset : A.set k (stackAlloc p.addr (itOf d body.layouts) D) = A :=
+    set_self_of_getElem? A k _ hA
+  rw [hspl, hset] at hst
+  have hrt : retagVal m1 fnEntry (.Int (intFromBits bits it)) (.Int it) =
+      .ok (.Int (intFromBits bits it)) := by
+    unfold retagVal; rfl
+  refine ⟨withMem m1 A ⟨.Store, .None, (offsetPtr p off).addr, ⟨it.size.bytes⟩⟩, ?_,
+    withMem_shape h1 _⟩
+  simp only [evalStatement, hpeEval, ok_bind, placeLoad, Bool.not_true, Bool.false_eq_true,
+    ↓reduceIte, hm1, hrt, placeStore, hst]
+
+/-- **Projected `Deinit` and projected `Retag` steps (from a hole-free state).**
+At a projected `Deinit(_t.f1...fk)` of a `TupleSpec` local (no hole open, `_t` not moved out),
+Anneal advances with unchanged locals while MiniRust stores `Uninit` over the field's bytes; the
+new states are related through the hole `_t.f1...fk`. At a projected `Retag(kind, _t.f1...fk)`,
+Stage-1 Anneal advances with unchanged locals and borrows while MiniRust validates and stores
+back the unchanged scalar bytes, preserving `StateRelN`. -/
 theorem step_projDeinit {body : CapturedMir} {f : Gen.Function}
     (hfrag : inFragment (eraseDeinit body) = true) (hwin : deinitWindowOk body = true)
     (hf : translateFn body = some f) {ctx : Ctx} {s : MachineState} {m : Mach}
@@ -812,49 +990,105 @@ theorem step_projDeinit {body : CapturedMir} {f : Gen.Function}
                     rw [h4.allocs, henc]
                     rfl
                 | _ => simp [resolveFieldPath] at hres
+  | retag rkind p =>
+    obtain ⟨t, proj⟩ := p
+    cases proj with
+    | nil => simp [isProjDeinit] at hpd
+    | cons pe rest =>
+      obtain ⟨htgt, hnm'⟩ := windowStmtOk_retag hwst
+      unfold deinitTargetOk at htgt
+      cases hd : body.localDecls[t]? with
+      | none => simp [hd] at htgt
+      | some d =>
+        cases ht : tupleTypeOf body.layouts d.ty with
+        | none => simp [hd, ht] at htgt
+        | some trip =>
+          obtain ⟨fields, size, align⟩ := trip
+          cases hres : resolveFieldPath body.layouts (.tuple fields size align) (pe :: rest) with
+          | none => simp [hd, ht, hres] at htgt
+          | some pr =>
+            obtain ⟨off, leaf⟩ := pr
+            cases leaf with
+            | tuple _ _ _ => simp [hd, ht, hres] at htgt
+            | scalar it =>
+              simp only [hd, ht, hres, decide_eq_true_eq] at htgt
+              cases pe with
+              | field idx fTy =>
+                have ht_lt : t < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
+                obtain ⟨slot, hsV⟩ : ∃ slot, view[t]? = some slot :=
+                  ⟨_, List.getElem?_eq_getElem (by rw [hlo.nlocals]; exact ht_lt)⟩
+                obtain ⟨⟨rootVal, rfl⟩, _⟩ := hns t d slot hd hsV
+                  (scalarTypeOf_none_of_tupleTypeOf ht) (isPtrTy_false_of_tupleTypeOf ht)
+                have hsA : s.frame.locals[t]? = some (.init rootVal) :=
+                  (hrel.stale.agree hnm').trans hsV
+                have hslotsA : SlotsOk body.layouts body.localDecls s.frame.locals :=
+                  hrel.stale.slots hlo.slots
+                -- Anneal: Stage-1 `Retag` on a `TupleSpec` scalar field is a no-op step.
+                rw [stepMirFn_stmt body s bb _ hrel.activeCallee hphase hbb hst,
+                  DeinitBridge.evalStmt_retag_field s body.localDecls rkind t d fields size align off
+                    it idx fTy rest span rootVal hd ht hslotsA hsA hres]
+                -- MiniRust: `Validate` loads, validates (`retagVal` id on `Int`), and stores back.
+                obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+                obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+                obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+                obtain ⟨pe', hpe', rfl⟩ : ∃ pe', translateFieldPlace (.Local (localName t))
+                    (.field idx fTy :: rest) = some pe' ∧
+                    st' = .Validate pe' (isRetagFnEntry rkind) := by
+                  simp only [translateStatement, translatePlace] at hst'
+                  cases hp : translateFieldPlace (.Local (localName t)) (.field idx fTy :: rest) with
+                  | none => simp [hp] at hst'
+                  | some pe' =>
+                    simp only [hp, Option.map_some, Option.some.injEq] at hst'
+                    exact ⟨pe', rfl, hst'.symm⟩
+                have hshape : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+                    [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+                      calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+                        s.frame.blockIdx s.frame.stmtIdx]
+                    m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
+                obtain ⟨ptr, hptr⟩ := hlo.some_of_live hsV (by simp)
+                obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ := hlo.storage_nonptr t d (.init rootVal)
+                  ptr hd hsV hptr (isPtrTy_false_of_tupleTypeOf ht)
+                simp only [eraseDeinit_layouts] at hA haddr haddrMax
+                rw [declSlotData_of_tupleSpec ht] at hA
+                obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
+                rw [hTd] at haddrMax
+                simp only [TupleSpec.toMiniRustTy, tyBytes] at haddrMax
+                obtain ⟨hrootWf, hrootVal⟩ :=
+                  (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hlo.slots t d _ hd hsV)
+                have hDlen : ((TupleSpec.tuple fields size align).encodeVal rootVal).length = size :=
+                  TupleSpec.encodeVal_length _ rootVal hrootWf
+                obtain ⟨leafVal, _, hleafOk, hslice, _⟩ :=
+                  resolveFieldPath_read hrootWf hrootVal hres
+                cases leafVal with
+                | scalar sc =>
+                  have hbits : sc.bits < 2 ^ (8 * it.size.bytes) := by
+                    simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hleafOk
+                    exact hleafOk.2
+                  simp only [TupleSpec.size, TupleSpec.encodeVal, valBytes] at hslice
+                  obtain ⟨m3, hev, h3⟩ := evalStatement_validate_field_any (resetPick_shape hshape)
+                    (FnLocalsSpec.of_translateFn hf) hd ht hrootWf hptr hpk haddr.nonneg haddrMax
+                    hDlen hA hpe' hres hbits hslice (isRetagFnEntry rkind)
+                  obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3
+                  have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+                    rw [hlen]; omega
+                  have hstep : Interp.step m = .ok m4 := by
+                    rw [step_callee hshape tb hgetb]
+                    simp [hne, listIndex_nat _ _ _ htst, hev, hm4, check_after h4]
+                  refine ⟨m4, hstep, .inl ?_⟩
+                  exact hrel.advanceN hfrag (eraseDeinit_block hbb) (by simpa using hlt)
+                    s.frame.locals view s.memory lm m4 h4.threads h4.active
+                    (h4.allocs.symm ▸ hlo) hns
+                    (hrel.stale.keep (eraseDeinit_block hbb) (eraseDeinitBlock_stmt hst) rfl)
+                    hrel.retLive
+                    (hbo.advance_keep (eraseDeinit_block hbb) (eraseDeinitBlock_stmt hst)
+                      (by simp [ptrStmtStep, eraseDeinitStmt]))
+                    rfl rfl rfl rfl
+                | _ => simp [TupleSpec.valOk] at hleafOk
+              | _ => simp [resolveFieldPath] at hres
   | _ => simp [isProjDeinit] at hpd
 
 
 /-! ## Window statements -/
-
-/-- The field place `_t.projs` of a `TupleSpec` local evaluates to the field's byte offset in
-`_t`'s allocation on any machine of the right shape, whatever the allocation's bytes. -/
-theorem evalPlace_field_any {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
-    {blk stmt : Nat} {A : List Gen.Allocation}
-    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
-    {body : CapturedMir} (hfl : FnLocalsSpec body f)
-    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
-    {fields : List (Nat × TupleSpec)} {size align : Nat}
-    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
-    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
-    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
-    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
-    {D : List Byte} (hD : D.length = size)
-    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
-    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
-    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
-    {off : Nat} {leaf : TupleSpec}
-    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, leaf)) :
-    evalPlace m pe =
-      .ok (({ ptr := { thin_pointer := offsetPtr p off, metadata := none }, aligned := true },
-        leaf.toMiniRustTy), m) := by
-  obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
-  have hloc := (hfl.2 t d hd).2
-  rw [hTd] at hloc
-  have hbound : size < 2 ^ 63 := by
-    simp only [TupleSpec.wf, Bool.and_eq_true, decide_eq_true_eq] at hrootWf
-    exact hrootWf.1.2
-  have hplaceBase := evalPlace_local_some h t _ hloc p hp
-  have hrootEval : evalPlace m (.Local (localName t)) =
-      .ok (({ ptr := { thin_pointer := offsetPtr p 0, metadata := none }, aligned := true },
-        (TupleSpec.tuple fields size align).toMiniRustTy), m) := by
-    simpa using hplaceBase
-  have hpeEval := evalPlace_ptr_fieldPath h p k hpk (itOf d body.layouts) D hA
-    (by rw [hD]; exact hbound) haddr0 (by rw [hD]; exact haddrMax)
-    (.Local (localName t)) 0 (.tuple fields size align) hrootEval hrootWf
-    (by simp [TupleSpec.size, hD]) projs pe hpe off leaf hres
-  simpa using hpeEval
 
 /-- **Re-initialization of a scalar field by a constant, on any allocation bytes.** -/
 theorem evalStatement_reinit_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
@@ -2909,6 +3143,171 @@ theorem step_window_binop_local {body : CapturedMir} {f : Gen.Function}
       | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _, _ =>
         nomatch htyT
 
+/-- What `siblingRetagOk` gives: both field paths resolve in `_t`'s `TupleSpec`, the retagged path
+to a scalar leaf of positive size, and the byte ranges are disjoint. -/
+theorem siblingRetagOk_spec {body : CapturedMir} {t : Nat} {ps ps' : List ProjectionElem}
+    (h : siblingRetagOk body t ps ps' = true) :
+    ∃ (d : LocalDecl) (fields : List (Nat × TupleSpec)) (size align : Nat)
+      (off : Nat) (leaf : TupleSpec) (off' : Nat) (it' : Gen.IntType),
+      body.localDecls[t]? = some d ∧
+      tupleTypeOf body.layouts d.ty = some (fields, size, align) ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps = some (off, leaf) ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps' = some (off', .scalar it') ∧
+      0 < it'.size.bytes ∧
+      (off' + it'.size.bytes ≤ off ∨ off + leaf.size ≤ off') := by
+  unfold siblingRetagOk at h
+  cases hd : body.localDecls[t]? with
+  | none => simp [hd] at h
+  | some d =>
+    cases ht : tupleTypeOf body.layouts d.ty with
+    | none => simp [hd, ht] at h
+    | some trip =>
+      obtain ⟨fields, size, align⟩ := trip
+      cases hres : resolveFieldPath body.layouts (.tuple fields size align) ps with
+      | none => simp [hd, ht, hres] at h
+      | some pr =>
+        obtain ⟨off, leaf⟩ := pr
+        cases hres' : resolveFieldPath body.layouts (.tuple fields size align) ps' with
+        | none => simp [hd, ht, hres, hres'] at h
+        | some pr' =>
+          obtain ⟨off', leaf'⟩ := pr'
+          cases leaf' with
+          | tuple _ _ _ => simp [hd, ht, hres, hres'] at h
+          | scalar it' =>
+            simp only [hd, ht, hres, hres', Bool.and_eq_true, decide_eq_true_eq,
+              Bool.or_eq_true] at h
+            obtain ⟨hpos, hdis⟩ := h
+            exact ⟨d, fields, size, align, off, leaf, off', it', rfl, ht, hres, hres', hpos, hdis⟩
+
+/-- **Sibling-`Retag` step.** While `_t.ps` is a hole, `Retag(kind, _t.ps')` on a disjoint scalar
+field validates and stores back the unchanged sibling bytes in `m` while Stage-1 Anneal advances
+with unchanged locals and borrows: the hole stays open. -/
+theorem step_window_retag {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m m0 : Mach} {t : Nat} {ps : List ProjectionElem}
+    (hhole : holeAt body s.frame.blockIdx s.frame.stmtIdx = some (t, ps))
+    (hN0 : StateRelN (eraseDeinit body) f ctx s m0)
+    (hHR : HoleRel body f ctx s.frame.blockIdx s.frame.stmtIdx t ps m0 m)
+    {bb : BasicBlockData} {rkind : RetagKind} {ps' : List ProjectionElem} {span : String}
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some ⟨.retag rkind ⟨t, ps'⟩, span⟩)
+    (hnm' : t ∉ movedBefore (eraseDeinit body) s.frame.blockIdx s.frame.stmtIdx)
+    (hsib : siblingRetagOk body t ps ps' = true) :
+    StepRelD body f ctx s (stepMirFn body s) (Interp.step m) := by
+  obtain ⟨view, lm0, hrel0, hthr0, hlo0, hns0, hbo0⟩ := hN0
+  obtain ⟨lm, p, k, a, off, sz, hthrH, hp, hpk, ha, hrng, hthrE, hactE, hallocE⟩ := hHR
+  obtain ⟨-, -, rfl⟩ := frame_pc_of_threads hthr0 hthrH
+  obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
+  have hlt : s.frame.stmtIdx < bb.statements.length := (List.getElem?_eq_some_iff.mp hst).1
+  obtain ⟨d, fields, size, align, off0, leaf, off', it', hd, ht, hres, hres', _, hdis⟩ :=
+    siblingRetagOk_spec hsib
+  have ht_lt : t < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
+  obtain ⟨slot, hsV⟩ : ∃ slot, view[t]? = some slot :=
+    ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact ht_lt)⟩
+  obtain ⟨⟨rootVal, rfl⟩, _⟩ := hns0 t d slot hd hsV
+    (scalarTypeOf_none_of_tupleTypeOf ht) (isPtrTy_false_of_tupleTypeOf ht)
+  obtain ⟨k', hpk', _, haddr, haddrMax, _, hA0⟩ := hlo0.storage_nonptr t d (.init rootVal) p hd
+    hsV hp (isPtrTy_false_of_tupleTypeOf ht)
+  simp only [eraseDeinit_layouts] at hA0 haddr haddrMax
+  rw [declSlotData_of_tupleSpec ht] at hA0
+  have hkk : k' = k := by rw [hpk] at hpk'; simp at hpk'; omega
+  subst hkk
+  rw [ha] at hA0
+  cases hA0
+  obtain ⟨hrootWf, hrootVal⟩ :=
+    (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hlo0.slots t d _ hd hsV)
+  obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
+  rw [hTd] at haddrMax
+  simp only [TupleSpec.toMiniRustTy, tyBytes] at haddrMax
+  have hD0 : ((TupleSpec.tuple fields size align).encodeVal rootVal).length = size :=
+    TupleSpec.encodeVal_length _ rootVal hrootWf
+  have hr0 : holeRange body t ps = some (off0, leaf.size) := by
+    simp [holeRange, hd, ht, hres]
+  rw [hr0] at hrng
+  simp only [Option.some.injEq, Prod.mk.injEq] at hrng
+  obtain ⟨hoff, hsz⟩ := hrng
+  subst off0
+  subst sz
+  obtain ⟨_, hrelB0⟩ := resolveFieldPath_wf hrootWf hres
+  have hoffb : off + leaf.size ≤ size := by simpa [TupleSpec.size] using hrelB0
+  obtain ⟨leafVal, _, hleafOk, hslice0, _⟩ := resolveFieldPath_read hrootWf hrootVal hres'
+  cases leafVal with
+  | scalar sc =>
+    have hbits : sc.bits < 2 ^ (8 * it'.size.bytes) := by
+      simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hleafOk
+      exact hleafOk.2
+    simp only [TupleSpec.size, TupleSpec.encodeVal, valBytes] at hslice0
+    have hsliceH : ((spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+        (List.replicate leaf.size .Uninit)).drop off').take it'.size.bytes =
+        scalarBytes it' sc.bits := by
+      rw [spliceAt_drop_take_disjoint _ _ _ _ _ (by rw [List.length_replicate, hD0]; exact hoffb)
+        (by rw [List.length_replicate]; exact hdis)]
+      exact hslice0
+    cases ps' with
+    | nil => simp [resolveFieldPath] at hres'
+    | cons pe0 rest =>
+      cases pe0 with
+      | field idx fTy =>
+        have hsA : s.frame.locals[t]? = some (.init rootVal) :=
+          (hrel0.stale.agree hnm').trans hsV
+        have hslotsA : SlotsOk body.layouts body.localDecls s.frame.locals :=
+          hrel0.stale.slots hlo0.slots
+        rw [stepMirFn_stmt body s bb _ hrel0.activeCallee hphase hbb hst,
+          DeinitBridge.evalStmt_retag_field s body.localDecls rkind t d fields size align off'
+            it' idx fTy rest span rootVal hd ht hslotsA hsA hres']
+        obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+        obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+        obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+        obtain ⟨pe, hpe, rfl⟩ : ∃ pe, translateFieldPlace (.Local (localName t))
+            (.field idx fTy :: rest) = some pe ∧
+            st' = .Validate pe (isRetagFnEntry rkind) := by
+          simp only [translateStatement, translatePlace] at hst'
+          cases hp' : translateFieldPlace (.Local (localName t)) (.field idx fTy :: rest) with
+          | none => simp [hp'] at hst'
+          | some pe =>
+            simp only [hp', Option.map_some, Option.some.injEq] at hst'
+            exact ⟨pe, rfl, hst'.symm⟩
+        have hshapeH : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+            [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+              calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm0
+                s.frame.blockIdx s.frame.stmtIdx] m.mem.memory.allocations :=
+          ⟨hthrE.trans hthr0, hactE.trans hrel0.active, rfl⟩
+        have hk_lt : k' < m0.mem.memory.allocations.length := (List.getElem?_eq_some_iff.mp ha).1
+        have hDh : (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+            (List.replicate leaf.size .Uninit)).length = size := by
+          rw [spliceAt_length _ _ _ (by rw [List.length_replicate, hD0]; omega), hD0]
+        have hAh : m.mem.memory.allocations[k']? = some (stackAlloc p.addr (itOf d body.layouts)
+            (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+              (List.replicate leaf.size .Uninit))) := by
+          rw [hallocE]
+          simp [hk_lt, stackAlloc]
+        obtain ⟨m3h, hevH, h3h⟩ := evalStatement_validate_field_any (resetPick_shape hshapeH)
+          (FnLocalsSpec.of_translateFn hf) hd ht hrootWf hp hpk' haddr.nonneg haddrMax hDh hAh hpe
+          hres' hbits hsliceH (isRetagFnEntry rkind)
+        obtain ⟨m4h, hm4h, h4h⟩ := bumpStmt_callee h3h
+        have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+          rw [hlen]; omega
+        have hstepH : Interp.step m = .ok m4h := by
+          rw [step_callee hshapeH tb hgetb]
+          simp [hne, listIndex_nat _ _ _ htst, hevH, hm4h, check_after h4h]
+        refine ⟨m4h, hstepH, .inr ⟨t, ps, setAllocs m4h m0.mem.memory.allocations, ?_, ?_, ?_⟩⟩
+        · show holeAt body s.frame.blockIdx (s.frame.stmtIdx + 1) = _
+          rw [holeAt_succ hbb hst, hhole]
+          rfl
+        · exact hrel0.advanceN hfrag (eraseDeinit_block hbb) (by simpa using hlt)
+            s.frame.locals view s.memory lm0 (setAllocs m4h m0.mem.memory.allocations)
+            h4h.threads h4h.active hlo0 hns0
+            (hrel0.stale.keep (eraseDeinit_block hbb) (eraseDeinitBlock_stmt hst) rfl)
+            hrel0.retLive
+            (hbo0.advance_keep (eraseDeinit_block hbb) (eraseDeinitBlock_stmt hst)
+              (by simp [ptrStmtStep, eraseDeinitStmt]))
+            rfl rfl rfl rfl
+        · refine ⟨lm0, p, k', _, off, leaf.size, h4h.threads, hp, hpk', ha, hr0, rfl, rfl, ?_⟩
+          rw [h4h.allocs, hallocE]
+          rfl
+      | _ => simp [resolveFieldPath] at hres'
+  | _ => simp [TupleSpec.valOk] at hleafOk
+
 /-! ## The correspondence theorem for `inFragmentD` -/
 
 /-- **Correspondence theorem for projected `Deinit` (one step, preserving `StateRelD`).**
@@ -3051,6 +3450,14 @@ theorem step_correspondence_D (body : CapturedMir) (f : Gen.Function)
             | cons _ _ => simp [windowStmtOk] at hw
           | _ => simp [windowStmtOk] at hw
       | _ => simp [windowStmtOk] at hw
+    | retag rkind q =>
+      obtain ⟨t', ps'⟩ := q
+      cases ps' with
+      | nil => simp [windowStmtOk] at hw
+      | cons qp qps =>
+        simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq, Bool.not_eq_true'] at hw
+        obtain ⟨⟨rfl, hnm⟩, hsib⟩ := hw
+        exact step_window_retag hfrag hf hhole hN0 hHR hbb hst (by simpa using hnm) hsib
     | _ => simp [windowStmtOk] at hw
 
 /-! ## Whole executions for `inFragmentD` bodies
@@ -3061,18 +3468,24 @@ theorem step_correspondence_D (body : CapturedMir) (f : Gen.Function)
 
 /-! ### The erasure keeps the storage markers, the borrows, and the entry state -/
 
-/-- `eraseDeinitStmt` only rewrites a projected `Deinit` into a `PlaceMention` of the same
-place: every other statement kind is kept. -/
+/-- `eraseDeinitStmt` only rewrites a projected `Deinit` or projected `Retag` into a `PlaceMention`
+of the same place: every other statement kind is kept. -/
 theorem eraseDeinitStmt_kind (st : MirAst.Statement) :
     (eraseDeinitStmt st).kind = st.kind ∨
-      ∃ p, st.kind = .deinit p ∧ (eraseDeinitStmt st).kind = .placeMention p := by
+      ∃ p, (st.kind = .deinit p ∨ ∃ k, st.kind = .retag k p) ∧
+        (eraseDeinitStmt st).kind = .placeMention p := by
   obtain ⟨kind, span⟩ := st
   cases kind with
   | deinit p =>
     obtain ⟨i, proj⟩ := p
     cases proj with
     | nil => exact .inl rfl
-    | cons pe rest => exact .inr ⟨_, rfl, rfl⟩
+    | cons pe rest => exact .inr ⟨_, .inl rfl, rfl⟩
+  | retag k p =>
+    obtain ⟨i, proj⟩ := p
+    cases proj with
+    | nil => exact .inl rfl
+    | cons pe rest => exact .inr ⟨_, .inr ⟨k, rfl⟩, rfl⟩
   | _ => exact .inl rfl
 
 @[simp] theorem hasStorageMarker_eraseDeinit (body : CapturedMir) (loc : Nat) :
@@ -3081,8 +3494,9 @@ theorem eraseDeinitStmt_kind (st : MirAst.Statement) :
   refine congrArg (List.any body.basicBlocks) (funext fun bb => ?_)
   simp only [Function.comp_apply, eraseDeinitBlock, List.any_map]
   refine congrArg (List.any bb.statements) (funext fun st => ?_)
-  rcases eraseDeinitStmt_kind st with h | ⟨p, h1, h2⟩
+  rcases eraseDeinitStmt_kind st with h | ⟨p, h1 | ⟨k, h1⟩, h2⟩
   · simp only [Function.comp_apply, h]
+  · simp only [Function.comp_apply, h1, h2]
   · simp only [Function.comp_apply, h1, h2]
 
 @[simp] theorem alwaysStorageLiveLocals_eraseDeinit (body : CapturedMir) :
@@ -3105,8 +3519,9 @@ theorem eraseDeinitStmt_kind (st : MirAst.Statement) :
   refine congrArg (List.flatMap · body.basicBlocks) (funext fun bb => ?_)
   simp only [eraseDeinitBlock, List.filterMap_map]
   refine congrArg (List.filterMap · bb.statements) (funext fun st => ?_)
-  rcases eraseDeinitStmt_kind st with h | ⟨p, h1, h2⟩
+  rcases eraseDeinitStmt_kind st with h | ⟨p, h1 | ⟨k, h1⟩, h2⟩
   · simp only [Function.comp_apply, h]
+  · simp only [Function.comp_apply, h1, h2]
   · simp only [Function.comp_apply, h1, h2]
 
 @[simp] theorem nonScalarSlotsInit_eraseDeinit (body : CapturedMir) (locals : List LocalSlot) :

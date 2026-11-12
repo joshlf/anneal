@@ -13434,17 +13434,13 @@ semantics and in MiniRust on a fragment `Padded(u8, u32, u16)` argument:
   requires a pointer, `evalStmt_retag_scalar_ub`), and MiniRust's
   `Statement::Validate` loads the `u32`, retags it as the identity (`retag_val`
   on `Value::Int`), and stores it back, so both return `99`
-  (`paddedRetagRead_stage1_parity`). Projected `Retag` nevertheless stays
-  outside `statementOk`: this per-statement agreement is not yet a lockstep
-  simulation case. Admitting it needs (i) a MiniRust lemma that `Validate` of a
-  `TupleSpec` integer field is a load followed by a store of the re-encoded
-  loaded integer that preserves the memory relation (MiniRust re-encodes the
-  bytes, Anneal keeps its frame), (ii) a `statementOk` case for projected
-  `Retag` threaded through every per-statement analysis of the fragment
-  (`movesOk`, `tupleInitOk`, `stmtPreservesAddrTaken`, and the pointer-aliasing
-  environment `ptrStmtOk` / `ptrStmtStep`), and (iii) the matching
-  `step_correspondence` case (and its `inFragmentD` window counterpart) under
-  the borrow-state invariant. -/
+  (`paddedRetagRead_stage1_parity`). `inFragmentD` (`DeinitWindow.lean`) admits
+  projected `Retag` on `TupleSpec` scalar fields both in hole-free states
+  (`paddedRetagRead_inFragmentD`, `paddedRetagRead_minirust_ret_from_start`) and
+  on disjoint sibling fields while a `Deinit` hole is open
+  (`paddedDeinitSiblingRetagReinit_minirust_ret_from_start`), while rejecting
+  any projected `Retag` overlapping an open `Deinit` hole
+  (`paddedDeinitRetagHole_not_inFragmentD`, `paddedDeinitRetagHole_diverges`). -/
 
 /-- `statementOk` rejects every projected `Deinit`. -/
 theorem statementOk_deinit_proj (decls : List LocalDecl) (i : Nat) (pe : ProjectionElem)
@@ -14020,19 +14016,215 @@ theorem paddedDeinitRead_not_inFragmentD :
       deinitWindowOk paddedDeinitRead = false ∧ inFragmentD paddedDeinitRead = false := by
   decide
 
-/-- Negative control for projected `Retag`: `inFragmentD` erases only projected `Deinit`s, so
-`paddedRetagRead` (`Retag(_1.1)` on a `u32` field, on which Stage-1 Anneal and MiniRust agree —
-both return `99`: `paddedRetagRead_stage1_parity`) is its own erasure, passes the (vacuous) window
-check, and is still rejected through `statementOk_retag_proj`. A `TupleSpec` has only integer
-leaves, so every projected `Retag` of a `TupleSpec` place is such a scalar `Retag`, on which
-Stage-1 Anneal's no-op (`evalStmt_retag_scalar_noop`) agrees with MiniRust's `Validate`, the
-identity on integers (`retagVal_int_id`); what admission still needs is the lockstep simulation
-case described above `statementOk_deinit_proj`. -/
-theorem paddedRetagRead_not_inFragmentD :
-    eraseDeinit paddedRetagRead = paddedRetagRead ∧
-      inFragment (eraseDeinit paddedRetagRead) = false ∧
-      deinitWindowOk paddedRetagRead = true ∧ inFragmentD paddedRetagRead = false :=
-  ⟨rfl, by decide, by decide, by decide⟩
+/-- `ctxPadded2` (callee `_0: u32` at `128`, `_1: Padded` at `256`) is well formed for a 2-local
+body with `[u32Decl, paddedStructDecl]`. -/
+theorem ctxPadded2_ok_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl])
+    (hlay : body.layouts = paddedLayouts) (hac : body.argCount = 1) : CtxOk body ctxPadded2 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd; rw [h] at hd; rw [hlay]; rw [hac] at hi
+    match i, hi, hd with
+    | 0, _, hd => simp at hd; subst hd; decide
+    | 1, _, hd => simp at hd; subst hd; decide
+    | _ + 2, hi, _ => omega
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- **`paddedRetagRead` is admitted by `inFragmentD`**: `eraseDeinit` lowers projected `Retag(_1.1)`
+to `PlaceMention(_1.1)`, `deinitWindowOk` checks `deinitTargetOk` on `_1.1` (`u32`, `4 > 0` bytes),
+and Stage-1 Anneal's no-op (`evalStmt_retag_field`) matches MiniRust's `Validate(_1.1)`
+(`evalStatement_validate_field_any`), while `statementOk` alone still rejects projected `Retag`
+(`paddedRetagRead_not_inFragment`). -/
+theorem paddedRetagRead_inFragmentD :
+    inFragment (eraseDeinit paddedRetagRead) = true ∧
+      deinitWindowOk paddedRetagRead = true ∧ inFragmentD paddedRetagRead = true := by
+  decide
+
+theorem paddedRetagRead_ctxOk : CtxOk paddedRetagRead ctxPadded2 :=
+  ctxPadded2_ok_u32 rfl rfl rfl
+
+theorem paddedRetagRead_argsOk : argsOk paddedRetagRead paddedDeinitReadArgs = true := by
+  decide
+
+theorem paddedRetagRead_anneal_noUB :
+    MirNoUBTree (mirCallTree paddedRetagRead paddedDeinitReadArgs) :=
+  runA_noUB paddedRetagRead 10 _ _ _ rfl
+
+/-- **End-to-end correspondence through `mirCall_ret_D` for `paddedRetagRead`**: Anneal's return of
+`99` (`paddedRetagRead_anneal_noop`) yields a MiniRust execution from `f.start` that pops the callee
+frame and stores `99` into the caller's return place (matching `paddedRetagRead_minirust_ret`). -/
+theorem paddedRetagRead_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n paddedRetagReadMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 99 } ∧
+      m'.threads =
+        [thread1 ctxPadded2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D paddedRetagRead_inFragmentD.2.2 paddedRetagRead_translate
+      ctxPadded2 paddedRetagRead_ctxOk paddedDeinitReadArgs
+      paddedRetagRead_argsOk paddedRetagReadMInit rfl rfl rfl
+      paddedRetagRead_anneal_noop
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [paddedRetagRead] at hd; subst hd
+  simp [retPtr, ctxPadded2] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded2] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem paddedRetagRead_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n paddedRetagReadMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k paddedRetagReadMInit = .ok mRet ∧
+      ReturnRel paddedRetagRead ctxPadded2 s' v mRet ∧
+      ReachesRet (mirCallTree paddedRetagRead paddedDeinitReadArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB_D paddedRetagRead_inFragmentD.2.2 paddedRetagRead_translate
+    ctxPadded2 paddedRetagRead_ctxOk paddedDeinitReadArgs
+    paddedRetagRead_argsOk paddedRetagReadMInit rfl rfl rfl
+    paddedRetagRead_anneal_noUB herr
+
+/-- MIR of `Deinit(_1.1); Retag(_1.0); _1.1 = const 42_u32; _0 = copy _1.1`: a projected `Retag`
+on the disjoint sibling field `_1.0` (byte `0`) while `_1.1` (bytes `4..8`) is an open `Deinit`
+hole. -/
+def paddedDeinitSiblingRetagReinit : CapturedMir where
+  defPath := "witness::padded_deinit_sibling_retag_reinit"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.retag .default (placeField 1 [(0, u8TyW)])),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (constU32 42))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+def paddedDeinitSiblingRetagReinitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Validate (.Field (.Local (localName 1)) 0) false,
+      .Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 42) (.Int u32)),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitSiblingRetagReinit_translate :
+    translateFn paddedDeinitSiblingRetagReinit = some paddedDeinitSiblingRetagReinitFn := rfl
+
+theorem paddedDeinitSiblingRetagReinit_inFragmentD :
+    siblingRetagOk paddedDeinitSiblingRetagReinit 1 [.field 1 u32Ty] [.field 0 u8TyW] = true ∧
+      inFragment (eraseDeinit paddedDeinitSiblingRetagReinit) = true ∧
+      deinitWindowOk paddedDeinitSiblingRetagReinit = true ∧
+      inFragmentD paddedDeinitSiblingRetagReinit = true := by
+  decide
+
+def paddedDeinitSiblingRetagReinitS0 : MachineState :=
+  initMachineState paddedDeinitSiblingRetagReinit paddedDeinitReadArgs
+
+def paddedDeinitSiblingRetagReinitMInit : Mach :=
+  machineWithCtx ctxPadded2 paddedDeinitSiblingRetagReinit paddedDeinitSiblingRetagReinitFn
+    paddedDeinitSiblingRetagReinitS0.frame.locals paddedDeinitSiblingRetagReinitFn.start
+
+theorem paddedDeinitSiblingRetagReinit_anneal_ret :
+    ReachesRet (mirCallTree paddedDeinitSiblingRetagReinit paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨42, 4⟩, paddedDeinitSiblingRetagReinitS0.memory)) :=
+  runA_sound paddedDeinitSiblingRetagReinit 12 _ _ _ rfl
+
+/-- **End-to-end correspondence through `mirCall_ret_D` for disjoint sibling `Retag` inside an open
+`Deinit` hole (`paddedDeinitSiblingRetagReinit_minirust_ret_from_start`).** -/
+theorem paddedDeinitSiblingRetagReinit_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n paddedDeinitSiblingRetagReinitMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads =
+        [thread1 ctxPadded2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D paddedDeinitSiblingRetagReinit_inFragmentD.2.2.2
+      paddedDeinitSiblingRetagReinit_translate ctxPadded2 (ctxPadded2_ok_u32 rfl rfl rfl)
+      paddedDeinitReadArgs (by decide) paddedDeinitSiblingRetagReinitMInit rfl rfl rfl
+      paddedDeinitSiblingRetagReinit_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [paddedDeinitSiblingRetagReinit] at hd; subst hd
+  simp [retPtr, ctxPadded2] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded2] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- Negative control for projected `Retag` overlapping an open `Deinit` hole:
+`Deinit(_1.1); Retag(_1.1); _1.1 = const 42_u32; _0 = copy _1.1`. Even though `_1.1` is
+re-initialized before `_0 = copy _1.1`, `Retag(_1.1)` runs while `_1.1` is `Uninit`: `eraseDeinit`
+is in `inFragment`, but `siblingRetagOk` (`[4, 8)` vs `[4, 8)`) rejects the overlapping `Retag`. -/
+def paddedDeinitRetagHole : CapturedMir where
+  defPath := "witness::padded_deinit_retag_hole"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.retag .default (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (constU32 42))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+def paddedDeinitRetagHoleFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Validate (.Field (.Local (localName 1)) 1) false,
+      .Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 42) (.Int u32)),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitRetagHole_not_inFragmentD :
+    translateFn paddedDeinitRetagHole = some paddedDeinitRetagHoleFn ∧
+      siblingRetagOk paddedDeinitRetagHole 1 [.field 1 u32Ty] [.field 1 u32Ty] = false ∧
+      inFragment (eraseDeinit paddedDeinitRetagHole) = true ∧
+      deinitWindowOk paddedDeinitRetagHole = false ∧
+      inFragmentD paddedDeinitRetagHole = false :=
+  ⟨rfl, by decide, by decide, by decide, by decide⟩
+
+def paddedDeinitRetagHoleS0 : MachineState :=
+  initMachineState paddedDeinitRetagHole paddedDeinitReadArgs
+
+def paddedDeinitRetagHoleMInit : Mach :=
+  machineWithCtx ctxPadded2 paddedDeinitRetagHole paddedDeinitRetagHoleFn
+    paddedDeinitRetagHoleS0.frame.locals paddedDeinitRetagHoleFn.start
+
+/-- **Overlapping `Retag(_1.1)` on an open `Deinit(_1.1)` hole diverges (`paddedDeinitRetagHole_diverges`)**:
+Stage-1 Anneal returns `42` (because `Deinit(_1.1)` keeps `_1` initialized and `Retag(_1.1)` is a
+no-op), whereas MiniRust's `Validate(_1.1)` at step `3` faults with UB loading the `Uninit` bytes
+`4..8`, justifying `siblingRetagOk`'s disjointness requirement. -/
+theorem paddedDeinitRetagHole_diverges :
+    ReachesRet (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨42, 4⟩, paddedDeinitRetagHoleS0.memory)) ∧
+    ∃ msg, Interp.steps 3 paddedDeinitRetagHoleMInit = .error (.ub msg) :=
+  ⟨runA_sound paddedDeinitRetagHole 12 _ _ _ rfl, _, rfl⟩
 
 /-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
 check used to fail): its open-hole window is the sibling read through an integer cast

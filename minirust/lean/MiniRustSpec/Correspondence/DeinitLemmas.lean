@@ -292,6 +292,23 @@ theorem evalStatement_deinit_fieldPath {body : CapturedMir} {f : Gen.Function} {
   rw [hEncUnit]
   simp [spliceAt]
 
+/-- Splicing back the exact slice `(xs.drop off).take bs.length = bs` leaves `xs` unchanged. -/
+theorem spliceAt_eq_self {α : Type} (xs : List α) (off : Nat) (bs : List α)
+    (h : off + bs.length ≤ xs.length) (hslice : (xs.drop off).take bs.length = bs) :
+    spliceAt xs off bs = xs := by
+  apply List.ext_getElem?
+  intro k
+  rw [getElem?_spliceAt xs off bs h]
+  by_cases hk1 : k < off
+  · simp [hk1]
+  · by_cases hk2 : k < off + bs.length
+    · have hsub : k - off < bs.length := by omega
+      have hget := congrArg (·[k - off]?) hslice
+      rw [getElem?_drop_take] at hget
+      simp only [hsub, ↓reduceIte, show off + (k - off) = k by omega] at hget
+      simp [hk1, hk2, ← hget]
+    · simp [hk1, hk2]
+
 /-- Trusted's `evalStmt` on a projected `TupleSpec` field `Deinit(_i.f1...fk)` steps as a frame
 no-op (`advanceStmt s s.frame.locals`) whenever `_i` holds a well-formed `TupleSpec` value. -/
 theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
@@ -310,5 +327,41 @@ theorem evalStmt_deinit_field {layouts : Trusted.Rustc.V2026_06_01.Layout.Layout
   obtain ⟨hwf, hval⟩ := (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hslots i d (.init rootVal) hd hs)
   obtain ⟨leafVal, _, _, _, hprojRead⟩ := resolveFieldPath_read hwf hval hres
   simp [evalStmt, Trusted.Sequence.get?, hs, hprojRead s.frame.locals, MirStepNode.step]
+
+/-- Stage-1 Trusted's `evalStmt` on a projected `TupleSpec` scalar field `Retag(kind, _i.f1...fk)`
+steps as a frame and memory no-op (`advanceStmt s s.frame.locals`) whenever `_i` holds a well-formed
+`TupleSpec` value. -/
+theorem evalStmt_retag_field {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable}
+    (s : MachineState) (decls : List LocalDecl) (kind : RetagKind) (i : Nat) (d : LocalDecl)
+    (rootFields : List (Nat × TupleSpec)) (rootSize rootAlign totalOff : Nat)
+    (it : Gen.IntType) (idx : Nat) (fieldTy : Ty) (rest : List ProjectionElem)
+    (span : String) (rootVal : Value)
+    (hd : decls[i]? = some d)
+    (ht : tupleTypeOf layouts d.ty = some (rootFields, rootSize, rootAlign))
+    (hslots : SlotsOk layouts decls s.frame.locals)
+    (hs : s.frame.locals[i]? = some (.init rootVal))
+    (hres : resolveFieldPath layouts (.tuple rootFields rootSize rootAlign)
+      (.field idx fieldTy :: rest) = some (totalOff, .scalar it)) :
+    evalStmt s ⟨.retag kind ⟨i, .field idx fieldTy :: rest⟩, span⟩ decls layouts =
+      .tau (.running (advanceStmt s s.frame.locals)) := by
+  obtain ⟨hwf, hval⟩ := (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (hslots i d (.init rootVal) hd hs)
+  obtain ⟨leafVal, _, hleafOk, _, hprojRead⟩ := resolveFieldPath_read hwf hval hres
+  obtain ⟨leafTy, _, hprojTy, hleafSpec⟩ := resolveFieldPath_ty (specOfRigidTy_of_tupleTypeOf ht) hres
+  have hit := intTypeOf_of_specOfRigidTy_scalar hleafSpec
+  have hnd : ∀ tl, (.field idx fieldTy :: rest) ≠ .deref :: tl := by intro _ hc; cases hc
+  have hnu := placeTouchesUnion_false_of_tupleTypeOf decls ht ⟨i, .field idx fieldTy :: rest⟩
+  cases leafVal with
+  | scalar sc =>
+    have hop : evalOperand s.frame.locals (.copy ⟨i, .field idx fieldTy :: rest⟩)
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls =
+        .ok (.scalar sc) s.frame.locals := by
+      rw [evalOperand_copy_nonDeref s.frame.locals ⟨i, .field idx fieldTy :: rest⟩ hnd
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls hnu]
+      simp [Trusted.Sequence.get?, hs, hprojRead s.frame.locals]
+    have hplTy : placeTy decls layouts ⟨i, .field idx fieldTy :: rest⟩ = some leafTy := by
+      simp [placeTy, Trusted.Sequence.get?, hd, hprojTy]
+    rcases leafTy with ⟨lkind, llidx⟩
+    cases lkind <;> simp [intTypeOf, intTyBytes] at hit <;> simp [evalStmt, hop, hplTy, MirStepNode.step]
+  | _ => simp [TupleSpec.valOk] at hleafOk
 
 end MiniRustSpec.Correspondence.DeinitBridge
