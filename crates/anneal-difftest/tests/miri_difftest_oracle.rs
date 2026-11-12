@@ -22,7 +22,7 @@ use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
     MiriAstMutator, MutationMode, PlaceProjectionWrapper, TreeBorrowsRetagInterleaver,
-    build_standalone_candidate_source, generate_miri_corpus_batch,
+    build_standalone_candidate_source, generate_miri_batch, generate_miri_corpus_batch,
 };
 use cargo_anneal::{
     AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
@@ -1599,7 +1599,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
 
     // One candidate per Episode 2 template. The `Pass` and `PerturbAst`
     // templates return normally under Miri and the `Ub` templates fault.
-    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 14] = [
+    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 16] = [
         (
             &BitValidityTransmuteMutator,
             MutationMode::Pass,
@@ -1651,6 +1651,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             "__proj_slot: Uninit<[u32; 2]>",
         ),
         (
+            &PlaceProjectionWrapper,
+            MutationMode::PerturbAst,
+            "&raw const __proj_nzm.0",
+        ),
+        (
             &TreeBorrowsRetagInterleaver,
             MutationMode::Pass,
             "&raw mut (*__rr_p).b",
@@ -1659,6 +1664,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             &TreeBorrowsRetagInterleaver,
             MutationMode::Pass,
             "&raw const (*__rr_shr).a",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "let __rr_sc_p: *mut u32 = match &mut __rr_sc",
         ),
         (
             &TreeBorrowsRetagInterleaver,
@@ -1671,7 +1681,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             "&raw mut (*__rr_fm).b",
         ),
     ];
-    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 11] = [
+    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 13] = [
         (
             &BitValidityTransmuteMutator,
             MutationMode::Ub,
@@ -1708,6 +1718,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             "__proj_half: Uninit<[u32; 2]>",
         ),
         (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "&raw const __dead_ov.word",
+        ),
+        (
             &TreeBorrowsRetagInterleaver,
             MutationMode::Ub,
             "&raw mut *__rr_y",
@@ -1726,6 +1741,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             &TreeBorrowsRetagInterleaver,
             MutationMode::Ub,
             "&raw const (*__rr_s).a",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "*__rr_sc_m = SingleC::Only",
         ),
     ];
     let mut candidates = Vec::new();
@@ -1748,7 +1768,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
         &'a str,
         [&'a dyn MiriAstMutator; 2],
     );
-    let perturbed_cases: [PerturbedCase<'_>; 6] = [
+    let perturbed_cases: [PerturbedCase<'_>; 7] = [
         (bv, MutationMode::Pass, "__single: SingleC", [tb, pp]),
         (
             bv,
@@ -1770,10 +1790,70 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
         ),
         (tb, MutationMode::Pass, "&raw mut (*__rr_p).b", [pp, arith]),
         (tb, MutationMode::Ub, "&raw mut *__rr_y", [tb, bv]),
+        (
+            tb,
+            MutationMode::Ub,
+            "let __tb_act: &mut u32 = unsafe { &mut *__tb_root };",
+            [tb, bv],
+        ),
     ];
     for (mutator, mode, marker, follow_ups) in perturbed_cases {
         let id = candidates.len();
         candidates.push(template_candidate(id, mutator, mode, marker, &follow_ups));
+    }
+    // Closed multi-parameter Episode 2 function exercising parameter seeding
+    // (`Option<bool>`, `Option<ColorTag>`, `Option<NonZeroU32>`, `SingleC`,
+    // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`) and
+    // local shadowing through real `rustc` + Miri + Anneal evaluation.
+    let param_ep2_seed = "\
+pub fn param_ep2_live(
+    s: SingleC,
+    m: MetersU32,
+    nm: NonZeroMeters,
+    o: OverlayU32,
+    ob: Option<bool>,
+    oc: core::option::Option<ColorTag>,
+    onz: core::option::Option<NonZeroU32>,
+    bytes: [u8; 4],
+    words: [u32; 2],
+) -> u32 {
+    let shadowed: u32 = 1u32;
+    let shadowed: PairU32 = PairU32 { a: words[0], b: words[1] };
+    let sc_v: u32 = match s {
+        SingleC::Only(v) => v,
+    };
+    let nzm_v: u32 = unsafe { transmute::<NonZeroU32, u32>(nm.0) };
+    let ob_v: u32 = match ob {
+        Some(true) => 1u32,
+        Some(false) => 2u32,
+        None => 3u32,
+    };
+    let oc_v: u32 = match oc {
+        Some(ColorTag::Red) => 4u32,
+        Some(ColorTag::Green) => 8u32,
+        Some(ColorTag::Blue) => 12u32,
+        None => 16u32,
+    };
+    let onz_v: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(onz) };
+    let ov_v: u32 = unsafe { o.word };
+    m.0 ^ sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ (bytes[0] as u32) ^ shadowed.a
+}
+";
+    let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);
+    assert_eq!(param_batch.len(), 2);
+    for mut cand in param_batch.drain(..) {
+        let id = candidates.len();
+        let old_fn_name = cand.fn_name;
+        let new_fn_name = format!("param_ep2_live__b0_c{id}");
+        cand.id = id;
+        cand.fn_source = cand.fn_source.replacen(
+            &format!("pub fn {old_fn_name}"),
+            &format!("pub fn {new_fn_name}"),
+            1,
+        );
+        cand.fn_name = new_fn_name;
+        cand.source = build_standalone_candidate_source(&cand.fn_source);
+        candidates.push(cand);
     }
     let template_count = candidates.len();
 
@@ -1925,14 +2005,51 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     assert_eq!(report.agree_count, template_count, "{:#?}", report.findings);
     assert_eq!(report.diverge_count, negative_controls.len());
     assert_eq!(report.kernel_confirmed_divergences, negative_controls.len());
-    // All 14 + 3 `Pass`/`PerturbAst` template candidates and four negative
-    // controls return normally in Miri; all 11 + 3 `Ub` template candidates and
-    // three negative controls fault with UB.
+    // Verify per-item Miri outcomes so a `Pass` template faulting and a `Ub`
+    // template losing its UB can never cancel out in aggregate counts:
+    // - `0..16`: `pass_cases` (`PassScalar`)
+    // - `16..29`: `ub_cases` (`Ub`)
+    // - `29..36`: `perturbed_cases` (`[Pass, Ub, Pass, Ub, Pass, Ub, Ub]`)
+    let expected_perturbed_ub = [false, true, false, true, false, true, true];
+    for id in 0..36usize {
+        let fn_name = format!("ep2_template__b0_c{id}");
+        let item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == fn_name)
+            .unwrap_or_else(|| panic!("missing item report for `{fn_name}`"));
+        let expect_ub = if id < 16 {
+            false
+        } else if id < 29 {
+            true
+        } else {
+            expected_perturbed_ub[id - 29]
+        };
+        if expect_ub {
+            assert!(
+                matches!(item.miri, MiriOutcome::Ub { .. }),
+                "expected Miri UB for `{fn_name}`, got {:?}",
+                item.miri
+            );
+        } else {
+            assert!(
+                matches!(item.miri, MiriOutcome::PassScalar { .. }),
+                "expected Miri PassScalar for `{fn_name}`, got {:?}",
+                item.miri
+            );
+        }
+    }
     let miri_pass = report.miri_verdicts.get("pass").copied().unwrap_or(0);
+    let miri_panic = report.miri_verdicts.get("panic").copied().unwrap_or(0);
     let miri_ub = report.miri_verdicts.get("ub").copied().unwrap_or(0);
-    assert_eq!(miri_pass, 14 + 3 + 4, "{:?}", report.miri_verdicts);
-    assert_eq!(miri_ub, 11 + 3 + 3, "{:?}", report.miri_verdicts);
-    assert_eq!(miri_pass + miri_ub, total, "{:?}", report.miri_verdicts);
+    assert!(miri_pass >= 16 + 3 + 4, "{:?}", report.miri_verdicts);
+    assert!(miri_ub >= 13 + 4 + 3, "{:?}", report.miri_verdicts);
+    assert_eq!(
+        miri_pass + miri_panic + miri_ub,
+        total,
+        "{:?}",
+        report.miri_verdicts
+    );
 
     let mut expected_classes = std::collections::BTreeMap::new();
     for (class, name, _) in negative_controls {
@@ -1964,7 +2081,10 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     let repro_finding = report
         .findings
         .iter()
-        .find(|f| f.fn_name.starts_with("neg_ctrl_single_c_nonzero_payload_transmute_zero"))
+        .find(|f| {
+            f.fn_name
+                .starts_with("neg_ctrl_single_c_nonzero_payload_transmute_zero")
+        })
         .expect("SingleCNonZero negative control finding");
     let repro_path = repro_finding.repro_path.as_ref().expect("repro.rs written");
     let repro_report = reproduce_miri_finding(repro_path, Some(&root))

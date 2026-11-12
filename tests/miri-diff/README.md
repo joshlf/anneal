@@ -58,7 +58,9 @@ uninterpreted external call.
 The corpus holds 89 tests: 41 `pass`, 10 `panic` (including the tracked
 `panic_explicit_macro` bug), and 38 `ub`, grouped into eight categories that
 `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Category 8 covers layout-sensitive types and raw-pointer retags:
+Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
+(`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
+`&mut SingleC` projection/reinit):
 
 | Theme | Tests |
 | :--- | :--- |

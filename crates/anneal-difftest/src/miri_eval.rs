@@ -34,9 +34,11 @@ use crate::mutators_miri::{
     GeneratedMiriCandidate, MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE,
 };
 
-/// Step fuel bound used for `miri-difftest` candidates (2 × `DEFAULT_ORACLE_FUEL`
-/// so multi-pass mutations on loop seeds do not prematurely exhaust step fuel).
-pub const MIRI_DIFFTEST_CANDIDATE_FUEL: u32 = DEFAULT_ORACLE_FUEL * 2;
+/// Step fuel bound used for `miri-difftest` candidates (`DEFAULT_ORACLE_FUEL`
+/// times 4, so 3-pass Episode 2 ADT/union/retag mutations on loop and
+/// multi-match seeds do not prematurely exhaust step fuel under
+/// `-Zmir-opt-level=0`).
+pub const MIRI_DIFFTEST_CANDIDATE_FUEL: u32 = DEFAULT_ORACLE_FUEL * 4;
 
 /// Canonical mutator names always included in `mutator_applications`.
 pub const MIRI_MUTATOR_NAMES: [&str; 5] = [

@@ -258,63 +258,80 @@ pub fn build_standalone_candidate_source(fn_source: &str) -> String {
     )
 }
 
-/// Extracts initialized local bindings and their annotated/inferred scalar
-/// types from a function signature and body block.
+/// Extracts initialized local bindings and their annotated/inferred types that
+/// remain in scope at the end of a function body.
+///
+/// Later `let` bindings of the same identifier replace earlier bindings so a
+/// shadowed integer local (for example `let x: u32 = 1; let x: PairU32 = ...;`)
+/// is never misclassified as an integer at the end of the function.
 pub fn collect_initialized_locals(func: &ItemFn) -> Vec<TrackedLocal> {
-    let mut locals = Vec::new();
+    let mut locals: Vec<TrackedLocal> = Vec::new();
+    let upsert_or_shadow =
+        |locals: &mut Vec<TrackedLocal>, entry: Option<TrackedLocal>, shadowed: Option<&str>| {
+            if let Some(name) = shadowed {
+                locals.retain(|l| l.name != name);
+            }
+            if let Some(loc) = entry {
+                locals.retain(|l| l.name != loc.name);
+                locals.push(loc);
+            }
+        };
 
     for arg in &func.sig.inputs {
         if let FnArg::Typed(pat_ty) = arg {
             let (name_opt, is_mut) = extract_pat_ident(&pat_ty.pat);
             if let Some(name) = name_opt {
-                locals.push(TrackedLocal {
-                    name,
-                    ty: pat_ty.ty.to_token_stream().to_string().replace(' ', ""),
-                    is_mut,
-                });
+                upsert_or_shadow(
+                    &mut locals,
+                    Some(TrackedLocal {
+                        name,
+                        ty: pat_ty.ty.to_token_stream().to_string().replace(' ', ""),
+                        is_mut,
+                    }),
+                    None,
+                );
             }
         }
     }
 
     for stmt in &func.block.stmts {
-        if let Stmt::Local(Local {
-            pat,
-            init: Some(local_init),
-            ..
-        }) = stmt
-        {
-            match pat {
-                Pat::Type(pat_type) => {
-                    let (name_opt, is_mut) = extract_pat_ident(&pat_type.pat);
-                    if let Some(name) = name_opt {
-                        locals.push(TrackedLocal {
-                            name,
-                            ty: pat_type.ty.to_token_stream().to_string().replace(' ', ""),
-                            is_mut,
-                        });
-                    }
-                }
-                _ => {
-                    let (name_opt, is_mut) = extract_pat_ident(pat);
-                    if let Some(name) = name_opt {
-                        let inferred = infer_expr_type_name(&local_init.expr);
-                        locals.push(TrackedLocal {
-                            name,
-                            ty: inferred,
-                            is_mut,
-                        });
-                    }
-                }
-            }
+        if let Stmt::Local(local) = stmt {
+            let pat = unwrap_pat_type_and_parens(&local.pat);
+            let (name_opt, is_mut) = extract_pat_ident(pat);
+            let Some(name) = name_opt else {
+                continue;
+            };
+            let Some(local_init) = &local.init else {
+                upsert_or_shadow(&mut locals, None, Some(&name));
+                continue;
+            };
+            let ty = if let Pat::Type(pat_type) = &local.pat {
+                pat_type.ty.to_token_stream().to_string().replace(' ', "")
+            } else {
+                infer_expr_type_name(&local_init.expr)
+            };
+            upsert_or_shadow(&mut locals, Some(TrackedLocal { name, ty, is_mut }), None);
         }
     }
 
     locals
 }
 
+fn unwrap_pat_type_and_parens(mut pat: &Pat) -> &Pat {
+    loop {
+        match pat {
+            Pat::Type(pt) => pat = &pt.pat,
+            Pat::Paren(pp) => pat = &pp.pat,
+            _ => return pat,
+        }
+    }
+}
+
 fn extract_pat_ident(pat: &Pat) -> (Option<String>, bool) {
-    match pat {
-        Pat::Ident(pi) => (Some(pi.ident.to_string()), pi.mutability.is_some()),
+    match unwrap_pat_type_and_parens(pat) {
+        Pat::Ident(pi) if pi.subpat.is_none() => {
+            (Some(pi.ident.to_string()), pi.mutability.is_some())
+        }
         _ => (None, false),
     }
 }
@@ -481,20 +498,44 @@ fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
         "NonZeroU32" | "core::num::NonZeroU32" => {
             syn::parse_quote!(unsafe { transmute::<u32, NonZeroU32>(#pick) })
         }
-        "Option<NonZeroU32>" | "Option<core::num::NonZeroU32>" => {
+        "Option<NonZeroU32>"
+        | "Option<core::num::NonZeroU32>"
+        | "core::option::Option<NonZeroU32>"
+        | "core::option::Option<core::num::NonZeroU32>" => {
             if (pick & 1) == 0 {
                 syn::parse_quote!(None)
             } else {
                 syn::parse_quote!(Some(unsafe { transmute::<u32, NonZeroU32>(#pick) }))
             }
         }
+        "Option<bool>" | "core::option::Option<bool>" => match rng.gen_range(3) {
+            0 => syn::parse_quote!(Some(true)),
+            1 => syn::parse_quote!(Some(false)),
+            _ => syn::parse_quote!(None),
+        },
+        "Option<ColorTag>" | "core::option::Option<ColorTag>" => match rng.gen_range(4) {
+            0 => syn::parse_quote!(Some(ColorTag::Red)),
+            1 => syn::parse_quote!(Some(ColorTag::Green)),
+            2 => syn::parse_quote!(Some(ColorTag::Blue)),
+            _ => syn::parse_quote!(None),
+        },
         "MetersU32" => syn::parse_quote!(MetersU32(#pick)),
         "NonZeroMeters" => {
             syn::parse_quote!(NonZeroMeters(unsafe { transmute::<u32, NonZeroU32>(#pick) }))
         }
         "SingleC" => syn::parse_quote!(SingleC::Only(#pick)),
         "PairU32" => syn::parse_quote!(PairU32 { a: #pick, b: #pick ^ 3u32 }),
+        "PaddedU8U32" => {
+            let b = (pick & 0x7F) as u8;
+            syn::parse_quote!(PaddedU8U32 { tag: #b, word: #pick })
+        }
         "OverlayU32" => syn::parse_quote!(OverlayU32 { word: #pick }),
+        "[u8;4]" => {
+            let b0 = (pick & 0xFF) as u8;
+            let b1 = ((pick >> 1) & 0xFF) as u8;
+            syn::parse_quote!([#b0, #b1, #b0 ^ #b1, 1u8])
+        }
+        "[u32;2]" => syn::parse_quote!([#pick, #pick ^ 5u32]),
         _ => syn::parse_quote!(#pick),
     }
 }
@@ -808,14 +849,43 @@ impl MiriAstMutator for ArithmeticCastMutator {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlaceProjectionWrapper;
 
+struct FieldRefCollector {
+    bases: std::collections::BTreeSet<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for FieldRefCollector {
+    fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+        if let Expr::Field(fe) = &*node.expr
+            && let syn::Member::Named(ident) = &fe.member
+            && matches!(ident.to_string().as_str(), "a" | "b")
+        {
+            let base = fe.base.to_token_stream().to_string().replace(' ', "");
+            self.bases.insert(base);
+        }
+        syn::visit::visit_expr_reference(self, node);
+    }
+}
+
 struct ProjectionAstPerturber<'a> {
     rng: &'a mut DetRng,
     in_addr_or_lhs: bool,
+    field_borrowed_bases: std::collections::BTreeSet<String>,
 }
 
 impl VisitMut for ProjectionAstPerturber<'_> {
     fn visit_type_mut(&mut self, _ty: &mut Type) {
         // Never mutate `[T; N]` array lengths in types.
+    }
+
+    fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        let prev = std::mem::take(&mut self.field_borrowed_bases);
+        let mut collector = FieldRefCollector {
+            bases: std::collections::BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_item_fn(&mut collector, func);
+        self.field_borrowed_bases = collector.bases;
+        syn::visit_mut::visit_item_fn_mut(self, func);
+        self.field_borrowed_bases = prev;
     }
 
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
@@ -868,15 +938,20 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                     && let Ok(cur_idx) = li.base10_parse::<usize>()
                     && self.rng.coin(1, 2)
                 {
-                    // For `bytes[1]` / `__pad_bytes[1]` (`PaddedU8U32` padding)
-                    // and `u.value[1]` (`ub_union_uninit_bytes_partial_read`
-                    // where `u.value[0]` is written), indices 1..=3 are the
-                    // uninitialized bytes. For `OverlayU32` `.bytes[0..4]`, all
-                    // four byte lanes are valid.
-                    let new_idx: usize = if matches!(
+                    // Partial-init `Uninit` bases (`u.value`,
+                    // `__part_slot.value`, `__proj_half.value`, `slot.value`)
+                    // initialize only lane 0, so lane 0 must remain 0 and
+                    // uninitialized lanes 1..=3 must stay in 1..=3. `bytes`
+                    // and `__pad_bytes` in `PaddedU8U32` have padding at
+                    // 1..=3. `OverlayU32` `.bytes[0..4]` has all four byte
+                    // lanes initialized.
+                    let is_partial_uninit = matches!(
                         base_clean.as_str(),
-                        "bytes" | "__pad_bytes" | "u.value"
-                    ) && (1..=3).contains(&cur_idx)
+                        "u.value" | "__part_slot.value" | "__proj_half.value" | "slot.value"
+                    );
+                    let new_idx: usize = if (is_partial_uninit
+                        || matches!(base_clean.as_str(), "bytes" | "__pad_bytes"))
+                        && (1..=3).contains(&cur_idx)
                     {
                         let choices = match cur_idx {
                             1 => [2usize, 3],
@@ -884,6 +959,8 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                             _ => [1, 2],
                         };
                         choices[self.rng.gen_range(2)]
+                    } else if is_partial_uninit && cur_idx == 0 {
+                        0
                     } else if base_clean.ends_with(".bytes") && cur_idx < 4 {
                         (cur_idx + 1 + self.rng.gen_range(3)) % 4
                     } else if cur_idx == 0 {
@@ -895,7 +972,14 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                 }
             }
             Expr::Field(field_expr) if !self.in_addr_or_lhs => {
-                if let syn::Member::Named(ident) = &mut field_expr.member {
+                let base_clean = field_expr
+                    .base
+                    .to_token_stream()
+                    .to_string()
+                    .replace(' ', "");
+                if !self.field_borrowed_bases.contains(&base_clean)
+                    && let syn::Member::Named(ident) = &mut field_expr.member
+                {
                     let name = ident.to_string();
                     if (name == "a" || name == "b") && self.rng.coin(1, 2) {
                         *ident = if name == "a" {
@@ -927,6 +1011,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
             let mut visitor = ProjectionAstPerturber {
                 rng,
                 in_addr_or_lhs: false,
+                field_borrowed_bases: std::collections::BTreeSet::new(),
             };
             visitor.visit_file_mut(file);
         }
@@ -953,7 +1038,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
                 };
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(4) {
+                MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(5) {
                     0 => {
                         let idx_lit: usize = rng.gen_range(2);
                         syn::parse_quote! {
@@ -1002,7 +1087,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
                             };
                         }
                     }
-                    _ => {
+                    3 => {
                         // Initialize both halves of an uninitialized union with
                         // partial-width writes, then read them back.
                         syn::parse_quote! {
@@ -1011,6 +1096,24 @@ impl MiriAstMutator for PlaceProjectionWrapper {
                                 __proj_slot.value[0] = #seed_val;
                                 __proj_slot.value[1] = #c1;
                                 __proj_slot.value[0] ^ __proj_slot.value[1]
+                            };
+                        }
+                    }
+                    _ => {
+                        // Project `NonZeroMeters.0` via `&raw const`, then
+                        // reinitialize an `OverlayU32` union wholesale via its
+                        // `bytes` variant (`Deinit`) and read `word` + `bytes`.
+                        let nz_u32: u32 = [1u32, 9u32, 17u32, 33u32][rng.gen_range(4)];
+                        let read_idx: usize = rng.gen_range(4);
+                        syn::parse_quote! {
+                            let __proj_nz: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(#nz_u32) };
+                            let __proj_nzm: NonZeroMeters = NonZeroMeters(__proj_nz);
+                            let __proj_nzm_ptr: *const NonZeroU32 = &raw const __proj_nzm.0;
+                            let __proj_nzm_val: u32 = unsafe { transmute::<NonZeroU32, u32>(*__proj_nzm_ptr) };
+                            let mut __proj_ov_reinit: OverlayU32 = OverlayU32 { word: #seed_val ^ __proj_nzm_val };
+                            __proj_ov_reinit = OverlayU32 { bytes: [1u8, 2u8, 3u8, 4u8] };
+                            let #probe_ident: u32 = unsafe {
+                                __proj_ov_reinit.word ^ (__proj_ov_reinit.bytes[#read_idx] as u32) ^ __proj_nzm_val
                             };
                         }
                     }
@@ -1023,7 +1126,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
                         let #probe_ident: u32 = __oob_arr[__oob_idx];
                     }
                 }
-                MutationMode::Ub => match rng.gen_range(4) {
+                MutationMode::Ub => match rng.gen_range(5) {
                     0 => syn::parse_quote! {
                         let __dangling_ptr: *mut u32 = {
                             let mut __dead_slot: u32 = #seed_val;
@@ -1047,13 +1150,20 @@ impl MiriAstMutator for PlaceProjectionWrapper {
                         };
                         let #probe_ident: u32 = unsafe { *__dangling_payload };
                     },
-                    _ => syn::parse_quote! {
+                    3 => syn::parse_quote! {
                         let mut __proj_half: Uninit<[u32; 2]> = Uninit { uninit: () };
                         let __proj_half_read: usize = 1usize;
                         let #probe_ident: u32 = unsafe {
                             __proj_half.value[0] = #seed_val;
                             __proj_half.value[__proj_half_read]
                         };
+                    },
+                    _ => syn::parse_quote! {
+                        let __dangling_ov_word: *const u32 = {
+                            let __dead_ov: OverlayU32 = OverlayU32 { word: #seed_val ^ #c1 };
+                            &raw const __dead_ov.word
+                        };
+                        let #probe_ident: u32 = unsafe { *__dangling_ov_word };
                     },
                 },
             };
@@ -1200,10 +1310,11 @@ impl MiriAstMutator for RawPtrOffsetMutator {
 pub struct TreeBorrowsRetagInterleaver;
 
 /// Visitor checking whether an expression performs a non-local control-flow
-/// exit (`return`, or an unenclosed `break` / `continue`) from the current
-/// block.
+/// exit (`return`, an unenclosed or outer-labeled `break` / `continue`, or a
+/// diverging `panic!` / `unreachable` invocation) from the current statement.
 struct ControlExitFinder {
-    loop_depth: usize,
+    unlabeled_loop_depth: usize,
+    bound_labels: Vec<String>,
     found: bool,
 }
 
@@ -1219,15 +1330,94 @@ impl<'ast> syn::visit::Visit<'ast> for ControlExitFinder {
             Expr::Return(_) => {
                 self.found = true;
             }
-            Expr::Break(_) | Expr::Continue(_) => {
-                if self.loop_depth == 0 {
+            Expr::Break(brk) => {
+                let bound = match &brk.label {
+                    Some(lbl) => self.bound_labels.contains(&lbl.ident.to_string()),
+                    None => self.unlabeled_loop_depth > 0,
+                };
+                if !bound {
+                    self.found = true;
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+            Expr::Continue(cnt) => {
+                let bound = match &cnt.label {
+                    Some(lbl) => self.bound_labels.contains(&lbl.ident.to_string()),
+                    None => self.unlabeled_loop_depth > 0,
+                };
+                if !bound {
                     self.found = true;
                 }
             }
-            Expr::While(_) | Expr::Loop(_) | Expr::ForLoop(_) => {
-                self.loop_depth += 1;
+            Expr::While(w) => {
+                self.unlabeled_loop_depth += 1;
+                if let Some(lbl) = &w.label {
+                    self.bound_labels.push(lbl.name.ident.to_string());
+                }
                 syn::visit::visit_expr(self, expr);
-                self.loop_depth -= 1;
+                if w.label.is_some() {
+                    self.bound_labels.pop();
+                }
+                self.unlabeled_loop_depth -= 1;
+            }
+            Expr::Loop(l) => {
+                self.unlabeled_loop_depth += 1;
+                if let Some(lbl) = &l.label {
+                    self.bound_labels.push(lbl.name.ident.to_string());
+                }
+                syn::visit::visit_expr(self, expr);
+                if l.label.is_some() {
+                    self.bound_labels.pop();
+                }
+                self.unlabeled_loop_depth -= 1;
+            }
+            Expr::ForLoop(f) => {
+                self.unlabeled_loop_depth += 1;
+                if let Some(lbl) = &f.label {
+                    self.bound_labels.push(lbl.name.ident.to_string());
+                }
+                syn::visit::visit_expr(self, expr);
+                if f.label.is_some() {
+                    self.bound_labels.pop();
+                }
+                self.unlabeled_loop_depth -= 1;
+            }
+            Expr::Block(b) if b.label.is_some() => {
+                if let Some(lbl) = &b.label {
+                    self.bound_labels.push(lbl.name.ident.to_string());
+                }
+                syn::visit::visit_expr(self, expr);
+                self.bound_labels.pop();
+            }
+            Expr::Macro(m) => {
+                if m.mac.path.segments.last().is_some_and(|s| {
+                    matches!(
+                        s.ident.to_string().as_str(),
+                        "panic"
+                            | "unreachable"
+                            | "todo"
+                            | "unimplemented"
+                            | "assert"
+                            | "assert_eq"
+                            | "assert_ne"
+                    )
+                }) {
+                    self.found = true;
+                }
+            }
+            Expr::Call(call) => {
+                if let Expr::Path(ep) = &*call.func
+                    && ep
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "unreachable")
+                {
+                    self.found = true;
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
             }
             _ => syn::visit::visit_expr(self, expr),
         }
@@ -1236,7 +1426,8 @@ impl<'ast> syn::visit::Visit<'ast> for ControlExitFinder {
 
 fn expr_has_control_exit(expr: &Expr) -> bool {
     let mut finder = ControlExitFinder {
-        loop_depth: 0,
+        unlabeled_loop_depth: 0,
+        bound_labels: Vec::new(),
         found: false,
     };
     syn::visit::Visit::visit_expr(&mut finder, expr);
@@ -1270,31 +1461,55 @@ fn stmts_mention_ident(stmts: &[Stmt], target: &str) -> bool {
     false
 }
 
-/// Checks whether `stmts[idx]` is a non-exiting access statement
-/// (semicolon-terminated expression statement such as `*r = 1;` /
-/// `unsafe { *p1 = 3; };` or an unused `let _ = ...;` / `let _y = ...;` read)
-/// that does not introduce a binding referenced by `stmts[idx + 1..]`.
-fn is_reordering_safe_access_stmt_at(stmts: &[Stmt], idx: usize) -> bool {
-    match &stmts[idx] {
-        Stmt::Expr(expr, Some(_)) => !expr_has_control_exit(expr),
+/// Classify `stmt` for adjacent-statement swapping:
+/// - `None` if `stmt` is not a reorderable access statement;
+/// - `Some(None)` if `stmt` is a non-exiting expression statement or wildcard
+///   `let _ [: T] = ...;` read;
+/// - `Some(Some(name))` if `stmt` is a non-exiting `let _name [: T] = ...;`
+///   binding.
+fn reorderable_stmt_bound_ident(stmt: &Stmt) -> Option<Option<String>> {
+    match stmt {
+        Stmt::Expr(expr, Some(_)) => (!expr_has_control_exit(expr)).then_some(None),
         Stmt::Local(loc) => {
-            let Some(init) = &loc.init else {
-                return false;
-            };
+            let init = loc.init.as_ref()?;
             if init.diverge.is_some() || expr_has_control_exit(&init.expr) {
-                return false;
+                return None;
             }
-            match &loc.pat {
-                Pat::Wild(_) => true,
+            match unwrap_pat_type_and_parens(&loc.pat) {
+                Pat::Wild(_) => Some(None),
                 Pat::Ident(pi) if pi.subpat.is_none() => {
                     let name = pi.ident.to_string();
-                    name.starts_with('_') && !stmts_mention_ident(&stmts[idx + 1..], &name)
+                    name.starts_with('_').then_some(Some(name))
                 }
-                _ => false,
+                _ => None,
             }
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// Checks whether swapping `stmts[idx]` and `stmts[idx + 1]` preserves lexical
+/// binding scope (neither introducing a use-before-def nor moving `stmts[idx]`
+/// into the shadow scope of a `_name` bound by `stmts[idx + 1]`).
+fn can_swap_adjacent_stmts(stmts: &[Stmt], idx: usize) -> bool {
+    let Some(bound_a) = reorderable_stmt_bound_ident(&stmts[idx]) else {
+        return false;
+    };
+    let Some(bound_b) = reorderable_stmt_bound_ident(&stmts[idx + 1]) else {
+        return false;
+    };
+    if let Some(name_a) = &bound_a
+        && stmts_mention_ident(&stmts[idx + 1..], name_a)
+    {
+        return false;
+    }
+    if let Some(name_b) = &bound_b
+        && (stmts_mention_ident(&stmts[idx + 2..], name_b)
+            || stmts_mention_ident(&stmts[idx..=idx], name_b))
+    {
+        return false;
+    }
+    true
 }
 
 struct AliasingAccessReorderer<'a> {
@@ -1309,10 +1524,7 @@ impl VisitMut for AliasingAccessReorderer<'_> {
         }
         let mut idx = 0;
         while idx + 1 < block.stmts.len() {
-            if is_reordering_safe_access_stmt_at(&block.stmts, idx)
-                && is_reordering_safe_access_stmt_at(&block.stmts, idx + 1)
-                && self.rng.coin(1, 2)
-            {
+            if can_swap_adjacent_stmts(&block.stmts, idx) && self.rng.coin(1, 2) {
                 block.stmts.swap(idx, idx + 1);
                 idx += 2;
             } else {
@@ -1357,7 +1569,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
             let write_val: u32 = [1u32, 3u32, 7u32, 15u32][rng.gen_range(4)];
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass => match rng.gen_range(3) {
+                MutationMode::Pass => match rng.gen_range(4) {
                     // Reserved `&mut` coexisting with parent read before activation.
                     0 => syn::parse_quote! {
                         let mut __tb_slot: u32 = #init_val;
@@ -1380,12 +1592,26 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     },
                     // `&raw const` field pointers derived from a frozen `&`
                     // coexist with reads through that reference.
-                    _ => syn::parse_quote! {
+                    2 => syn::parse_quote! {
                         let __rr_pair: PairU32 = PairU32 { a: #init_val, b: #write_val };
                         let __rr_shr: &PairU32 = &__rr_pair;
                         let __rr_ra: *const u32 = &raw const (*__rr_shr).a;
                         let __rr_rb: *const u32 = &raw const __rr_shr.b;
                         let #probe_ident: u32 = unsafe { (*__rr_ra) ^ (*__rr_rb) } ^ __rr_shr.a;
+                    },
+                    // `&raw mut` payload pointer derived from `&mut SingleC`
+                    // writes the payload before the parent enum is matched.
+                    _ => syn::parse_quote! {
+                        let mut __rr_sc: SingleC = SingleC::Only(#init_val);
+                        let __rr_sc_p: *mut u32 = match &mut __rr_sc {
+                            SingleC::Only(__rr_inner) => &raw mut *__rr_inner,
+                        };
+                        unsafe {
+                            *__rr_sc_p = (*__rr_sc_p) ^ #write_val;
+                        }
+                        let #probe_ident: u32 = match __rr_sc {
+                            SingleC::Only(__rr_v) => __rr_v,
+                        };
                     },
                 },
                 // Child write followed by parent read/write (legal in Tree
@@ -1439,7 +1665,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     }
                 }
                 MutationMode::Ub => {
-                    let variant = rng.gen_range(7);
+                    let variant = rng.gen_range(8);
                     match variant {
                         0 => syn::parse_quote! {
                             let __tb_imm: u32 = #init_val;
@@ -1459,11 +1685,17 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             }
                             let #probe_ident: u32 = *__tb_shr;
                         },
+                        // Keep the activating write inside its own block so
+                        // `AliasingAccessReorderer` cannot swap it after the
+                        // parent read `let _ = unsafe { *__tb_root };` (which
+                        // would leave `__tb_act` `Reserved` and erase the UB).
                         2 => syn::parse_quote! {
                             let mut __tb_x: u32 = #init_val;
                             let __tb_root: *mut u32 = &raw mut __tb_x;
                             let __tb_act: &mut u32 = unsafe { &mut *__tb_root };
-                            *__tb_act = #write_val;
+                            {
+                                *__tb_act = #write_val;
+                            }
                             let _ = unsafe { *__tb_root };
                             *__tb_act = #init_val;
                             let #probe_ident: u32 = unsafe { *__tb_root };
@@ -1515,13 +1747,30 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                         },
                         // A write to `.a` through `m` disables the frozen
                         // reborrow `s` that `&raw const (*s).a` derives from.
-                        _ => syn::parse_quote! {
+                        6 => syn::parse_quote! {
                             let mut __rr_pair: PairU32 = PairU32 { a: #init_val, b: #write_val };
                             let __rr_m: &mut PairU32 = &mut __rr_pair;
                             let __rr_s: &PairU32 = &*__rr_m;
                             let __rr_ra: *const u32 = &raw const (*__rr_s).a;
                             __rr_m.a = #write_val;
                             let #probe_ident: u32 = unsafe { *__rr_ra };
+                        },
+                        // Whole-enum reinitialization (`Deinit` + aggregate
+                        // write) through the parent `&mut SingleC` disables the
+                        // child `&raw mut` payload pointer.
+                        _ => syn::parse_quote! {
+                            let mut __rr_sc: SingleC = SingleC::Only(#init_val);
+                            let __rr_sc_m: &mut SingleC = &mut __rr_sc;
+                            let __rr_sc_p: *mut u32 = match &mut *__rr_sc_m {
+                                SingleC::Only(__rr_inner) => &raw mut *__rr_inner,
+                            };
+                            *__rr_sc_m = SingleC::Only(#init_val ^ #write_val);
+                            unsafe {
+                                *__rr_sc_p = #write_val;
+                            }
+                            let #probe_ident: u32 = match __rr_sc {
+                                SingleC::Only(__rr_v) => __rr_v,
+                            };
                         },
                     }
                 }
@@ -1624,13 +1873,62 @@ fn is_transmute_call(call: &ExprCall) -> bool {
         )
 }
 
+/// Check whether a `transmute` call's first turbofish argument `Src` (when
+/// present) is compatible with `expected_src` (`"u8"`, `"u32"`, or
+/// `"[u32;2]"`).
+///
+/// Returns `None` when `call` has no turbofish arguments at all; `Some(true)`
+/// when `Src` is `_` (`Type::Infer`) or matches `expected_src`; and
+/// `Some(false)` when `Src` names an incompatible type such as `i8` or `i32`.
+fn turbofish_src_compatible(call: &ExprCall, expected_src: &str) -> Option<bool> {
+    let Expr::Path(ep) = &*call.func else {
+        return None;
+    };
+    let PathArguments::AngleBracketed(args) = &ep.path.segments.last()?.arguments else {
+        return None;
+    };
+    let mut ty = match args.args.first()? {
+        GenericArgument::Type(Type::Infer(_)) => return Some(true),
+        GenericArgument::Type(ty) => ty,
+        _ => return Some(false),
+    };
+    loop {
+        match ty {
+            Type::Paren(p) => ty = &p.elem,
+            Type::Group(g) => ty = &g.elem,
+            _ => break,
+        }
+    }
+    Some(ty.to_token_stream().to_string().replace(' ', "") == expected_src)
+}
+
+/// Whether `expr` evaluates to a tail `transmute` call through parentheses,
+/// groups, blocks, or `unsafe` blocks.
+fn has_direct_transmute_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => is_transmute_call(call),
+        Expr::Paren(paren) => has_direct_transmute_call(&paren.expr),
+        Expr::Group(group) => has_direct_transmute_call(&group.expr),
+        Expr::Block(block_expr) => match block_expr.block.stmts.last() {
+            Some(Stmt::Expr(inner, None)) => has_direct_transmute_call(inner),
+            _ => false,
+        },
+        Expr::Unsafe(unsafe_expr) => match unsafe_expr.block.stmts.last() {
+            Some(Stmt::Expr(inner, None)) => has_direct_transmute_call(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Return the tail `transmute` call that `expr` evaluates to, looking through
-/// parentheses, blocks, and `unsafe` blocks (even multi-statement blocks whose
-/// final expression is `transmute(...)`).
+/// parentheses, groups, blocks, and `unsafe` blocks (even multi-statement
+/// blocks whose final expression is `transmute(...)`).
 fn direct_transmute_call_mut(expr: &mut Expr) -> Option<&mut ExprCall> {
     match expr {
         Expr::Call(call) if is_transmute_call(call) => Some(call),
         Expr::Paren(paren) => direct_transmute_call_mut(&mut paren.expr),
+        Expr::Group(group) => direct_transmute_call_mut(&mut group.expr),
         Expr::Block(block_expr) => match block_expr.block.stmts.last_mut()? {
             Stmt::Expr(inner, None) => direct_transmute_call_mut(inner),
             _ => None,
@@ -1649,6 +1947,16 @@ struct TransmuteValidityPerturber<'a> {
 }
 
 impl TransmuteValidityPerturber<'_> {
+    /// Return whether an integer literal with `suffix` is safe to replace with
+    /// a suffixed `expected_src` literal (`"u8"` or `"u32"`).
+    fn int_arg_compatible(call: &ExprCall, suffix: &str, expected_src: &str) -> bool {
+        match turbofish_src_compatible(call, expected_src) {
+            Some(true) => suffix.is_empty() || suffix == expected_src,
+            Some(false) => false,
+            None => suffix == expected_src,
+        }
+    }
+
     /// With probability 1/2, rewrite the integer literal argument of `call`
     /// (or the tag/payload literals of a `SingleC` array argument) to a value
     /// that is valid for `target`, or, if `inject_invalid` is set, to a value
@@ -1657,11 +1965,16 @@ impl TransmuteValidityPerturber<'_> {
         match target {
             TransmuteTarget::Unperturbed => {}
             TransmuteTarget::SingleC => {
+                let turbofish_pair = turbofish_src_compatible(call, "[u32;2]");
+                if turbofish_pair == Some(false) {
+                    return;
+                }
                 if let Expr::Array(arr) = &mut call.args[0]
                     && arr.elems.len() == 2
                     && let Some(Expr::Lit(el)) = arr.elems.first()
                     && let Lit::Int(li) = &el.lit
-                    && matches!(li.suffix(), "" | "u32")
+                    && (li.suffix() == "u32"
+                        || (li.suffix().is_empty() && turbofish_pair == Some(true)))
                     && self.rng.coin(1, 2)
                 {
                     let tag: u32 = if self.inject_invalid {
@@ -1675,8 +1988,7 @@ impl TransmuteValidityPerturber<'_> {
                         && let Lit::Int(pli) = &pel.lit
                         && matches!(pli.suffix(), "" | "u32")
                     {
-                        let payload: u32 =
-                            [0u32, 5u32, 0x40u32, u32::MAX][self.rng.gen_range(4)];
+                        let payload: u32 = [0u32, 5u32, 0x40u32, u32::MAX][self.rng.gen_range(4)];
                         arr.elems[1] = syn::parse_quote!(#payload);
                     }
                 }
@@ -1694,11 +2006,22 @@ impl TransmuteValidityPerturber<'_> {
                     // Every `u32` is valid for `MetersU32`.
                     return;
                 }
+                let expected_src = match target {
+                    TransmuteTarget::Bool | TransmuteTarget::ColorTag => "u8",
+                    TransmuteTarget::NonZeroU32
+                    | TransmuteTarget::NonZeroMeters
+                    | TransmuteTarget::MetersU32
+                    | TransmuteTarget::Char => "u32",
+                    TransmuteTarget::SingleC | TransmuteTarget::Unperturbed => return,
+                };
+                if !Self::int_arg_compatible(call, &suffix, expected_src) {
+                    return;
+                }
                 if !self.rng.coin(1, 2) {
                     return;
                 }
-                let replacement: Expr = match (target, suffix.as_str()) {
-                    (TransmuteTarget::Bool, "" | "u8") => {
+                let replacement: Expr = match target {
+                    TransmuteTarget::Bool => {
                         let v: u8 = if invalid {
                             [2u8, 3u8, 7u8, 255u8][self.rng.gen_range(4)]
                         } else {
@@ -1706,7 +2029,7 @@ impl TransmuteValidityPerturber<'_> {
                         };
                         syn::parse_quote!(#v)
                     }
-                    (TransmuteTarget::ColorTag, "" | "u8") => {
+                    TransmuteTarget::ColorTag => {
                         let v: u8 = if invalid {
                             [3u8, 5u8, 7u8, 255u8][self.rng.gen_range(4)]
                         } else {
@@ -1714,10 +2037,7 @@ impl TransmuteValidityPerturber<'_> {
                         };
                         syn::parse_quote!(#v)
                     }
-                    (
-                        TransmuteTarget::NonZeroU32 | TransmuteTarget::NonZeroMeters,
-                        "" | "u32",
-                    ) => {
+                    TransmuteTarget::NonZeroU32 | TransmuteTarget::NonZeroMeters => {
                         let v: u32 = if invalid {
                             0u32
                         } else {
@@ -1725,12 +2045,11 @@ impl TransmuteValidityPerturber<'_> {
                         };
                         syn::parse_quote!(#v)
                     }
-                    (TransmuteTarget::MetersU32, "" | "u32") => {
-                        let v: u32 =
-                            [0u32, 1u32, 41u32, 0x7FFF_0000u32][self.rng.gen_range(4)];
+                    TransmuteTarget::MetersU32 => {
+                        let v: u32 = [0u32, 1u32, 41u32, 0x7FFF_0000u32][self.rng.gen_range(4)];
                         syn::parse_quote!(#v)
                     }
-                    (TransmuteTarget::Char, "" | "u32") => {
+                    TransmuteTarget::Char => {
                         let v: u32 = if invalid {
                             [0xD800u32, 0xDFFFu32, 0x11_0000u32, 0x1F_FFFFu32]
                                 [self.rng.gen_range(4)]
@@ -1739,7 +2058,7 @@ impl TransmuteValidityPerturber<'_> {
                         };
                         syn::parse_quote!(#v)
                     }
-                    _ => return,
+                    TransmuteTarget::SingleC | TransmuteTarget::Unperturbed => return,
                 };
                 call.args[0] = replacement;
             }
@@ -1749,6 +2068,7 @@ impl TransmuteValidityPerturber<'_> {
     fn visit_non_tail_stmts(&mut self, expr: &mut Expr) {
         match expr {
             Expr::Paren(paren) => self.visit_non_tail_stmts(&mut paren.expr),
+            Expr::Group(group) => self.visit_non_tail_stmts(&mut group.expr),
             Expr::Block(b) => {
                 let n = b.block.stmts.len().saturating_sub(1);
                 for stmt in &mut b.block.stmts[..n] {
@@ -1770,26 +2090,58 @@ impl TransmuteValidityPerturber<'_> {
             _ => {}
         }
     }
+
+    fn visit_typed_tail_expr(&mut self, expr: &mut Expr, fallback_target: TransmuteTarget) -> bool {
+        if !has_direct_transmute_call(expr) {
+            return false;
+        }
+        self.visit_non_tail_stmts(expr);
+        if let Some(call) = direct_transmute_call_mut(expr) {
+            let target = TransmuteTarget::of_turbofish(call).unwrap_or(fallback_target);
+            for arg in call.args.iter_mut() {
+                self.visit_expr_mut(arg);
+            }
+            self.perturb_call(call, target);
+            return true;
+        }
+        false
+    }
 }
 
 impl VisitMut for TransmuteValidityPerturber<'_> {
+    fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if let ReturnType::Type(_, ret_ty) = &func.sig.output
+            && func
+                .block
+                .stmts
+                .last()
+                .is_some_and(|s| matches!(s, Stmt::Expr(e, None) if has_direct_transmute_call(e)))
+        {
+            let ret_target = TransmuteTarget::of_type(ret_ty);
+            let n = func.block.stmts.len().saturating_sub(1);
+            for stmt in &mut func.block.stmts[..n] {
+                self.visit_stmt_mut(stmt);
+            }
+            if let Some(Stmt::Expr(tail_expr, None)) = func.block.stmts.last_mut() {
+                self.visit_typed_tail_expr(tail_expr, ret_target);
+            }
+            return;
+        }
+        syn::visit_mut::visit_item_fn_mut(self, func);
+    }
+
     fn visit_local_mut(&mut self, local: &mut Local) {
         // `let x: Dst = unsafe { transmute(lit) };` (or `transmute::<Src, _>`)
-        // names its destination type in the `let` annotation.
+        // names its destination type in the `let` annotation. Check
+        // `has_direct_transmute_call` first so non-tail statements in blocks
+        // not ending in `transmute` are never visited twice.
         if let Pat::Type(pat_ty) = &local.pat {
             let let_target = TransmuteTarget::of_type(&pat_ty.ty);
             if let Some(init) = local.init.as_mut()
                 && init.diverge.is_none()
+                && self.visit_typed_tail_expr(&mut init.expr, let_target)
             {
-                self.visit_non_tail_stmts(&mut init.expr);
-                if let Some(call) = direct_transmute_call_mut(&mut init.expr) {
-                    let target = TransmuteTarget::of_turbofish(call).unwrap_or(let_target);
-                    for arg in call.args.iter_mut() {
-                        self.visit_expr_mut(arg);
-                    }
-                    self.perturb_call(call, target);
-                    return;
-                }
+                return;
             }
         }
         syn::visit_mut::visit_local_mut(self, local);
@@ -2001,8 +2353,7 @@ impl MiriAstMutator for BitValidityTransmuteMutator {
                             // The `#[repr(transparent)]` niche wrapper over
                             // `NonZeroU32`: a nonzero `u32` transmutes in,
                             // projects `.0`, and round-trips out.
-                            let nz_u32: u32 =
-                                [1u32, 9u32, 0x1234u32, u32::MAX][rng.gen_range(4)];
+                            let nz_u32: u32 = [1u32, 9u32, 0x1234u32, u32::MAX][rng.gen_range(4)];
                             syn::parse_quote! {
                                 let __valid_nzm: NonZeroMeters = unsafe { transmute::<u32, NonZeroMeters>(#nz_u32) };
                                 let #probe_ident: u32 = unsafe { transmute::<NonZeroU32, u32>(__valid_nzm.0) };
@@ -2580,7 +2931,7 @@ pub fn tb_fn() -> u32 {
     #[test]
     fn niche_single_c_union_and_raw_retag_templates_fire_in_every_mode() {
         let seed = "pub fn ep2_fn() -> u32 {\n    let base: u32 = 6u32;\n    base\n}\n";
-        let cases: [(&dyn MiriAstMutator, MutationMode, &str); 25] = [
+        let cases: [(&dyn MiriAstMutator, MutationMode, &str); 29] = [
             (
                 &BitValidityTransmuteMutator,
                 MutationMode::Pass,
@@ -2653,6 +3004,11 @@ pub fn tb_fn() -> u32 {
             ),
             (
                 &PlaceProjectionWrapper,
+                MutationMode::PerturbAst,
+                "&raw const __proj_nzm.0",
+            ),
+            (
+                &PlaceProjectionWrapper,
                 MutationMode::Ub,
                 "&raw const __dead_pair.b",
             ),
@@ -2667,6 +3023,11 @@ pub fn tb_fn() -> u32 {
                 "__proj_half: Uninit<[u32; 2]>",
             ),
             (
+                &PlaceProjectionWrapper,
+                MutationMode::Ub,
+                "&raw const __dead_ov.word",
+            ),
+            (
                 &TreeBorrowsRetagInterleaver,
                 MutationMode::Pass,
                 "&raw mut (*__rr_p).b",
@@ -2675,6 +3036,11 @@ pub fn tb_fn() -> u32 {
                 &TreeBorrowsRetagInterleaver,
                 MutationMode::Pass,
                 "&raw const (*__rr_shr).a",
+            ),
+            (
+                &TreeBorrowsRetagInterleaver,
+                MutationMode::Pass,
+                "let __rr_sc_p: *mut u32 = match &mut __rr_sc",
             ),
             (
                 &TreeBorrowsRetagInterleaver,
@@ -2705,6 +3071,11 @@ pub fn tb_fn() -> u32 {
                 &TreeBorrowsRetagInterleaver,
                 MutationMode::Ub,
                 "&raw const (*__rr_s).a",
+            ),
+            (
+                &TreeBorrowsRetagInterleaver,
+                MutationMode::Ub,
+                "*__rr_sc_m = SingleC::Only",
             ),
         ];
         for (mutator, mode, marker) in cases {
@@ -2918,16 +3289,23 @@ pub fn wild_reorder() -> u32 {
 
         // 2. `ProjectionAstPerturber` preserves compound-assignment LHS
         //    (`pair.a ^= ...`), explores all four `OverlayU32` `.bytes[0..4]`
-        //    lanes, and keeps `u.value[1]` within uninitialized lanes `1..=3`.
+        //    lanes, preserves `u.value[0]` (the initialized byte) as well as
+        //    keeping `u.value[1]` within uninitialized lanes `1..=3`, and
+        //    leaves `borrowed.a` untouched when `&mut borrowed.b` is borrowed
+        //    in the same function.
         let proj_seed = "\
 pub fn proj_guard() -> u32 {
     let mut pair = PairU32 { a: 1u32, b: 2u32 };
     pair.a ^= 3u32;
+    let mut borrowed = PairU32 { a: 5u32, b: 6u32 };
+    let rb: &mut u32 = &mut borrowed.b;
+    let keep_a: u32 = borrowed.a;
+    *rb = 7u32;
     let o = OverlayU32 { word: 0x0403_0201u32 };
     let mut u: Uninit<[u8; 4]> = Uninit { uninit: () };
     unsafe {
         u.value[0] = 3u8;
-        (o.bytes[0] as u32) ^ (u.value[1] as u32) ^ pair.a
+        (u.value[0] as u32) ^ (o.bytes[0] as u32) ^ (u.value[1] as u32) ^ pair.a ^ keep_a
     }
 }
 ";
@@ -2938,6 +3316,7 @@ pub fn proj_guard() -> u32 {
             ProjectionAstPerturber {
                 rng: &mut rng,
                 in_addr_or_lhs: false,
+                field_borrowed_bases: BTreeSet::new(),
             }
             .visit_file_mut(&mut f);
             let out = prettyplease::unparse(&f);
@@ -2946,7 +3325,15 @@ pub fn proj_guard() -> u32 {
                 "compound-assign LHS field must not swap:\n{out}"
             );
             assert!(
-                !out.contains("u.value[0] as u32"),
+                out.contains("let keep_a: u32 = borrowed.a;"),
+                "disjoint field access while `&mut borrowed.b` is live must not swap:\n{out}"
+            );
+            assert!(
+                out.contains("(u.value[0usize] as u32)") || out.contains("(u.value[0] as u32)"),
+                "initialized `u.value[0]` must never be rewritten to an uninit lane:\n{out}"
+            );
+            assert!(
+                !out.contains("^ u.value[0") && !out.contains("^(u.value[0"),
                 "`u.value[1]` must stay in uninitialized lanes 1..=3:\n{out}"
             );
             for lane in 0..4usize {
@@ -2962,12 +3349,26 @@ pub fn proj_guard() -> u32 {
         );
 
         // 3. `close_and_normalize_function` and `collect_initialized_locals`
-        //    handle Episode 2 parameter and constructor types.
+        //    handle Episode 2 parameter, niche `Option`, array, and shadowed
+        //    local types.
         let param_seed = "\
-pub fn param_ep2(s: SingleC, m: MetersU32, nm: NonZeroMeters, o: OverlayU32) -> u32 {
-    let s2 = SingleC::Only(1u32);
+pub fn param_ep2(
+    s: SingleC,
+    m: MetersU32,
+    nm: NonZeroMeters,
+    o: OverlayU32,
+    ob: Option<bool>,
+    oc: core::option::Option<ColorTag>,
+    onz: core::option::Option<NonZeroU32>,
+    pad: PaddedU8U32,
+    bytes: [u8; 4],
+    words: [u32; 2],
+) -> u32 {
+    let shadowed: u32 = 1u32;
+    let shadowed: PairU32 = PairU32 { a: words[0], b: pad.word };
+    let s2 = SingleC::Only(bytes[0] as u32);
     let m2 = MetersU32(2u32);
-    m.0 ^ m2.0
+    m.0 ^ m2.0 ^ shadowed.a
 }
 ";
         let batch = generate_miri_batch(&[param_seed], 4, 0xBEEF_CAFE);
@@ -2986,7 +3387,221 @@ pub fn param_ep2(s: SingleC, m: MetersU32, nm: NonZeroMeters, o: OverlayU32) -> 
                 "{:?}",
                 cand.tracked_locals
             );
+            assert!(
+                !cand
+                    .tracked_locals
+                    .contains(&("shadowed".to_string(), "u32".to_string())),
+                "shadowed integer local must not remain typed as u32: {:?}",
+                cand.tracked_locals
+            );
+            assert!(
+                cand.tracked_locals
+                    .contains(&("shadowed".to_string(), "PairU32".to_string())),
+                "{:?}",
+                cand.tracked_locals
+            );
         }
+    }
+
+    #[test]
+    fn reorderer_and_transmute_perturber_handle_shadowing_labels_src_types_and_single_visit() {
+        // 1. `AliasingAccessReorderer` must not move `*p = _x;` past a
+        //    shadowing `let _x: &PairU32 = &pair;`, must not swap an outer
+        //    labeled `break 'outer;` inside an inner `while`, DOES swap typed
+        //    `let _: u32 = ...;` and self-contained `'blk: { break 'blk; };`,
+        //    and never swaps `TreeBorrowsRetagInterleaver` `Ub` variant 2's
+        //    activating write after the parent read.
+        let shadow_and_label = "\
+pub fn guard_shadow_and_labels() -> u32 {
+    let mut slot: u32 = 1u32;
+    let p: *mut u32 = &raw mut slot;
+    let pair = PairU32 { a: 2u32, b: 3u32 };
+    let _x: u32 = 9u32;
+    unsafe { *p = _x; };
+    let _x: &PairU32 = &pair;
+    'outer: loop {
+        while slot < 10u32 {
+            break 'outer;
+        }
+        unsafe { *p = 5u32; };
+        break;
+    }
+    slot
+}
+";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(shadow_and_label).unwrap();
+            let mut rng = DetRng::new(s);
+            AliasingAccessReorderer { rng: &mut rng }.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            let write_pos = out.find("*p = _x;").expect("write _x");
+            let shadow_pos = out.find("let _x: &PairU32 = &pair;").expect("shadow _x");
+            assert!(
+                write_pos < shadow_pos,
+                "swapped use of `_x` into shadowing `let _x: &PairU32` on seed {s}:\n{out}"
+            );
+            let while_pos = out.find("while slot < 10u32").expect("while");
+            let after_while = out.find("*p = 5u32;").expect("after while");
+            assert!(
+                while_pos < after_while,
+                "outer-labeled `break 'outer` inside `while` must not reorder:\n{out}"
+            );
+        }
+
+        let typed_wild_and_block_label = "\
+pub fn allow_typed_wild_and_local_label() -> u32 {
+    let mut x: u32 = 1u32;
+    let p: *mut u32 = &raw mut x;
+    let _: u32 = unsafe { *p };
+    'blk: {
+        unsafe { *p = 2u32; };
+        break 'blk;
+    };
+    x
+}
+";
+        let mut saw_typed_wild_swap = false;
+        for s in 0..32u64 {
+            let mut f = syn::parse_file(typed_wild_and_block_label).unwrap();
+            let mut rng = DetRng::new(s);
+            AliasingAccessReorderer { rng: &mut rng }.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            if out.find("'blk:").unwrap() < out.find("let _: u32 = unsafe { *p };").unwrap() {
+                saw_typed_wild_swap = true;
+                break;
+            }
+        }
+        assert!(
+            saw_typed_wild_swap,
+            "typed `let _: u32 = ...;` and locally labeled `'blk` must be reorderable"
+        );
+
+        let ub_var2_seed = "pub fn ub2() -> u32 {\n    1u32\n}\n";
+        let ub_var2_src = first_output_containing(
+            ub_var2_seed,
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "let __tb_act: &mut u32 = unsafe { &mut *__tb_root };",
+        )
+        .expect("TreeBorrowsRetagInterleaver Ub variant 2");
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(&ub_var2_src).unwrap();
+            let mut rng = DetRng::new(s);
+            AliasingAccessReorderer { rng: &mut rng }.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            let act_write = out.find("*__tb_act =").expect("activating write");
+            let parent_read = out
+                .find("let _ = unsafe { *__tb_root };")
+                .expect("parent read");
+            assert!(
+                act_write < parent_read,
+                "follow-up reorderer erased UB in variant 2 on seed {s}:\n{out}"
+            );
+        }
+
+        // 2. `TransmuteValidityPerturber` visits non-tail statements in a typed
+        //    `let` block not ending in `transmute` exactly ONCE (matching the
+        //    RNG state of an untyped `let`), rejects incompatible turbofish
+        //    `Src` types, and perturbs typed function-return tail `transmute`s
+        //    while leaving `-> Option<NonZeroU32>` untouched.
+        let typed_non_tail = "\
+pub fn non_tail_typed() -> u32 {
+    let x: u32 = unsafe {
+        let b: bool = transmute(1u8);
+        b as u32
+    };
+    x
+}
+";
+        let untyped_non_tail = "\
+pub fn non_tail_untyped() -> u32 {
+    let x = unsafe {
+        let b: bool = transmute(1u8);
+        b as u32
+    };
+    x
+}
+";
+        for s in 0..64u64 {
+            let mut f1 = syn::parse_file(typed_non_tail).unwrap();
+            let mut f2 = syn::parse_file(untyped_non_tail).unwrap();
+            let mut rng1 = DetRng::new(s);
+            let mut rng2 = DetRng::new(s);
+            TransmuteValidityPerturber {
+                rng: &mut rng1,
+                inject_invalid: true,
+            }
+            .visit_file_mut(&mut f1);
+            TransmuteValidityPerturber {
+                rng: &mut rng2,
+                inject_invalid: true,
+            }
+            .visit_file_mut(&mut f2);
+            assert_eq!(
+                rng1.next_u64(),
+                rng2.next_u64(),
+                "double-visitation RNG skew on typed block local for seed {s}"
+            );
+        }
+
+        let incompatible_src = "\
+pub fn src_mismatch() -> u32 {
+    let b: bool = unsafe { transmute::<i8, bool>(0) };
+    let m: MetersU32 = unsafe { transmute::<i32, MetersU32>(41) };
+    let s: SingleC = unsafe { transmute::<[i32; 2], SingleC>([0, 5]) };
+    (b as u32) ^ m.0
+}
+";
+        for inject_invalid in [false, true] {
+            for s in 0..64u64 {
+                let mut f = syn::parse_file(incompatible_src).unwrap();
+                let mut rng = DetRng::new(s);
+                TransmuteValidityPerturber {
+                    rng: &mut rng,
+                    inject_invalid,
+                }
+                .visit_file_mut(&mut f);
+                let out = prettyplease::unparse(&f);
+                assert!(
+                    out.contains("transmute::<i8, bool>(0)")
+                        && out.contains("transmute::<i32, MetersU32>(41)")
+                        && out.contains("transmute::<[i32; 2], SingleC>([0, 5])"),
+                    "incompatible turbofish Src was rewritten into type error:\n{out}"
+                );
+            }
+        }
+
+        let fn_ret_seed = "\
+pub fn ret_nz() -> NonZeroU32 {
+    unsafe { transmute(7u32) }
+}
+pub fn ret_opt() -> Option<NonZeroU32> {
+    unsafe { transmute(0u32) }
+}
+";
+        let mut saw_zero_ret_nz = false;
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(fn_ret_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            TransmuteValidityPerturber {
+                rng: &mut rng,
+                inject_invalid: true,
+            }
+            .visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            let (ret_nz_src, ret_opt_src) = out.split_once("pub fn ret_opt").unwrap();
+            if ret_nz_src.contains("transmute(0u32)") {
+                saw_zero_ret_nz = true;
+            }
+            assert!(
+                ret_opt_src.contains("transmute(0u32)"),
+                "`-> Option<NonZeroU32>` return transmute must stay unperturbed:\n{out}"
+            );
+        }
+        assert!(
+            saw_zero_ret_nz,
+            "typed return `-> NonZeroU32` tail transmute must be perturbed"
+        );
     }
 
     #[test]
@@ -3014,9 +3629,11 @@ pub fn param_ep2(s: SingleC, m: MetersU32, nm: NonZeroMeters, o: OverlayU32) -> 
                     "__proj_single",
                     "__proj_overlay",
                     "__proj_slot",
+                    "__proj_nzm",
                     "__dead_pair",
                     "__dead_single",
                     "__proj_half",
+                    "__dead_ov",
                 ],
             ),
             ("TreeBorrowsRetagInterleaver", &["__rr_"]),
