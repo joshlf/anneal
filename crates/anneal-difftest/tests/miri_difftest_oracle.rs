@@ -432,7 +432,8 @@ fn evaluate_miri_batches_counts_compile_failures_and_rejects_zero_compiled() {
     let mut batch = generate_miri_corpus_batch(2, 0x1234_5678, 0);
     assert_eq!(batch.len(), 2);
 
-    let broken_fn = "pub fn broken_cand__b0_c2() -> u32 {\n    let x: u32 = \"not_an_int\";\n    x\n}\n";
+    let broken_fn =
+        "pub fn broken_cand__b0_c2() -> u32 {\n    let x: u32 = \"not_an_int\";\n    x\n}\n";
     batch.push(GeneratedMiriCandidate {
         id: 2,
         seed_index: 0,
@@ -632,7 +633,10 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
         Some(&root),
     )
     .expect("evaluate seeded pass_direct_fn_call mutants");
-    assert_eq!(seeded_rep.compared_candidates, seeded_rep.compiled_candidates);
+    assert_eq!(
+        seeded_rep.compared_candidates,
+        seeded_rep.compiled_candidates
+    );
     assert_eq!(
         seeded_rep
             .unmodeled_external_calls
@@ -1238,12 +1242,10 @@ pub fn masked_nested_fn_divergence__b0_c15() -> u32 {
             "identical nested panic message",
         ),
     ];
-    assert!(
-        report.reconciled_panic_sites.iter().all(|s| {
-            !negative_controls.contains(&s.fn_name.as_str())
-                && !masked_cases.iter().any(|(m, _, _)| *m == s.fn_name)
-        })
-    );
+    assert!(report.reconciled_panic_sites.iter().all(|s| {
+        !negative_controls.contains(&s.fn_name.as_str())
+            && !masked_cases.iter().any(|(m, _, _)| *m == s.fn_name)
+    }));
 
     // (b) The non-macro mismatches stay kernel-confirmed divergences, whether
     // or not the panic unwinds through a cleanup block. Anneal attributes each
@@ -1803,8 +1805,10 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     }
     // Closed multi-parameter Episode 2 function exercising parameter seeding
     // (`Option<bool>`, `Option<ColorTag>`, `Option<NonZeroU32>`, `SingleC`,
-    // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`) and
-    // local shadowing through real `rustc` + Miri + Anneal evaluation.
+    // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`,
+    // slice references `&[u32]` / `&mut [u8]`, and fat raw pointers
+    // `*const [u32]`), deref-borrowed field projections, and local shadowing
+    // through real `rustc` + Miri + Anneal evaluation.
     let param_ep2_seed = "\
 pub fn param_ep2_live<'a>(
     s: SingleC,
@@ -1813,6 +1817,9 @@ pub fn param_ep2_live<'a>(
     o: OverlayU32,
     r_pair: &'a mut PairU32,
     p_sc: *mut SingleC,
+    s_slice: &'a [u32],
+    s_mut_bytes: &'a mut [u8],
+    p_slice: *const [u32],
     (tup_a, tup_b): (u32, u8),
     u_word: Uninit<u32>,
     ob: Option<bool>,
@@ -1823,10 +1830,15 @@ pub fn param_ep2_live<'a>(
 ) -> u32 {
     let shadowed: u32 = 1u32;
     let (shadowed, _): (PairU32, u32) = (PairU32 { a: words[0], b: words[1] }, tup_a);
-    let mut borrowed = PairU32 { a: r_pair.a, b: r_pair.b };
+    let rb_ref: &mut u32 = &mut (*r_pair).b;
+    let r_pair_a: u32 = r_pair.a;
+    *rb_ref = tup_b as u32;
+    s_mut_bytes[0] ^= 1u8;
+    let _ = p_slice;
+    let mut borrowed = PairU32 { a: r_pair_a, b: r_pair.b };
     let rb: &mut u32 = &mut (borrowed.b);
     let keep_a: u32 = (borrowed).a;
-    *rb = tup_b as u32;
+    *rb = s_mut_bytes[0] as u32;
     let sc_v: u32 = match s {
         SingleC::Only(v) => v,
     };
@@ -1849,7 +1861,7 @@ pub fn param_ep2_live<'a>(
     };
     let onz_v: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(onz) };
     let ov_v: u32 = unsafe { o.word ^ u_word.value };
-    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ (bytes[0] as u32) ^ shadowed.a
+    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ s_slice[0] ^ (bytes[0] as u32) ^ shadowed.a
 }
 ";
     let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);

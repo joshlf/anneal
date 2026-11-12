@@ -306,7 +306,8 @@ pub fn collect_initialized_locals(func: &ItemFn) -> Vec<TrackedLocal> {
             let (name_opt, is_mut) = extract_pat_ident(pat);
             let Some(name) = name_opt else {
                 // Evict any earlier bindings shadowed by destructuring patterns
-                // (`let (x, _): (PairU32, u32) = ...;`, `let PairU32 { a: x, .. } = ...;`).
+                // (`let (x, _): (PairU32, u32) = ...;`,
+                // `let PairU32 { a: x, .. } = ...;`).
                 let mut bound = Vec::new();
                 collect_pat_bound_idents(&local.pat, &mut bound);
                 for shadowed_name in bound {
@@ -448,11 +449,28 @@ fn is_integer_type_name(ty: &str) -> bool {
     )
 }
 
-struct LifetimeEraser;
+#[derive(Clone, Copy)]
+enum LifetimeRewrite {
+    ElideForLocal,
+    StaticForReturn,
+}
+
+struct LifetimeEraser(LifetimeRewrite);
 
 impl VisitMut for LifetimeEraser {
     fn visit_type_reference_mut(&mut self, node: &mut syn::TypeReference) {
-        node.lifetime = None;
+        match self.0 {
+            LifetimeRewrite::ElideForLocal => {
+                node.lifetime = None;
+            }
+            LifetimeRewrite::StaticForReturn => {
+                let span = node
+                    .lifetime
+                    .as_ref()
+                    .map_or_else(proc_macro2::Span::call_site, syn::Lifetime::span);
+                node.lifetime = Some(syn::Lifetime::new("'static", span));
+            }
+        }
         syn::visit_mut::visit_type_reference_mut(self, node);
     }
 
@@ -460,9 +478,13 @@ impl VisitMut for LifetimeEraser {
         &mut self,
         node: &mut syn::AngleBracketedGenericArguments,
     ) {
+        let replacement = match self.0 {
+            LifetimeRewrite::ElideForLocal => "'_",
+            LifetimeRewrite::StaticForReturn => "'static",
+        };
         for arg in &mut node.args {
             if let GenericArgument::Lifetime(lt) = arg {
-                *lt = syn::Lifetime::new("'_", lt.span());
+                *lt = syn::Lifetime::new(replacement, lt.span());
             }
         }
         syn::visit_mut::visit_angle_bracketed_generic_arguments_mut(self, node);
@@ -471,8 +493,24 @@ impl VisitMut for LifetimeEraser {
 
 fn strip_type_lifetimes(ty: &Type) -> Type {
     let mut out = ty.clone();
-    LifetimeEraser.visit_type_mut(&mut out);
+    LifetimeEraser(LifetimeRewrite::ElideForLocal).visit_type_mut(&mut out);
     out
+}
+
+fn staticize_return_lifetimes(ty: &Type) -> Type {
+    let mut out = ty.clone();
+    LifetimeEraser(LifetimeRewrite::StaticForReturn).visit_type_mut(&mut out);
+    out
+}
+
+fn unwrap_type_parens_and_groups(mut ty: &Type) -> &Type {
+    loop {
+        match ty {
+            Type::Paren(p) => ty = &p.elem,
+            Type::Group(g) => ty = &g.elem,
+            _ => return ty,
+        }
+    }
 }
 
 /// Convert any function parameters into leading initialized local bindings and
@@ -497,14 +535,24 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
             func.sig.generics.lt_token = None;
             func.sig.generics.gt_token = None;
         }
+        if let Some(where_clause) = &mut func.sig.generics.where_clause {
+            where_clause.predicates = where_clause
+                .predicates
+                .iter()
+                .filter(|p| !matches!(p, syn::WherePredicate::Lifetime(_)))
+                .cloned()
+                .collect();
+            if where_clause.predicates.is_empty() {
+                func.sig.generics.where_clause = None;
+            }
+        }
         if let ReturnType::Type(_, ret_ty) = &mut func.sig.output {
-            **ret_ty = strip_type_lifetimes(ret_ty);
+            **ret_ty = staticize_return_lifetimes(ret_ty);
         }
         for arg in inputs {
             if let FnArg::Typed(pat_ty) = arg {
                 let clean_ty = strip_type_lifetimes(&pat_ty.ty);
-                let init_val =
-                    seeded_type_expr(&clean_ty, &mut init_stmts, &mut backing_idx, rng);
+                let init_val = seeded_type_expr(&clean_ty, &mut init_stmts, &mut backing_idx, rng);
                 let inner_pat = unwrap_pat_parens(&pat_ty.pat);
                 let stmt: Stmt = match inner_pat {
                     Pat::Ident(pi) if pi.subpat.is_none() => {
@@ -571,33 +619,91 @@ fn seeded_type_expr(
             }
         }
         Type::Reference(r) => {
-            let clean_elem = strip_type_lifetimes(&r.elem);
             let idx = *backing_idx;
             *backing_idx += 1;
             let backing_id = format_ident!("__arg_ref_{idx}");
-            let val = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
-            backing_stmts.push(syn::parse_quote! {
-                let mut #backing_id: #clean_elem = #val;
-            });
-            if r.mutability.is_some() {
-                syn::parse_quote!(&mut #backing_id)
-            } else {
-                syn::parse_quote!(&#backing_id)
+            match unwrap_type_parens_and_groups(&r.elem) {
+                Type::Slice(sl) => {
+                    let clean_elem = strip_type_lifetimes(&sl.elem);
+                    let v0 = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    let v1 = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    backing_stmts.push(syn::parse_quote! {
+                        let mut #backing_id: [#clean_elem; 2] = [#v0, #v1];
+                    });
+                    if r.mutability.is_some() {
+                        syn::parse_quote!(&mut #backing_id)
+                    } else {
+                        syn::parse_quote!(&#backing_id)
+                    }
+                }
+                elem_ty if type_matches_primitive_name(elem_ty, "str") => {
+                    if r.mutability.is_some() {
+                        backing_stmts.push(syn::parse_quote! {
+                            let mut #backing_id: [u8; 2] = [65u8, 66u8];
+                        });
+                        syn::parse_quote!(unsafe {
+                            transmute::<&mut [u8], &mut str>(&mut #backing_id[..])
+                        })
+                    } else {
+                        syn::parse_quote!("ab")
+                    }
+                }
+                _ => {
+                    let clean_elem = strip_type_lifetimes(&r.elem);
+                    let val = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    backing_stmts.push(syn::parse_quote! {
+                        let mut #backing_id: #clean_elem = #val;
+                    });
+                    if r.mutability.is_some() {
+                        syn::parse_quote!(&mut #backing_id)
+                    } else {
+                        syn::parse_quote!(&#backing_id)
+                    }
+                }
             }
         }
         Type::Ptr(p) => {
-            let clean_elem = strip_type_lifetimes(&p.elem);
             let idx = *backing_idx;
             *backing_idx += 1;
             let backing_id = format_ident!("__arg_ptr_{idx}");
-            let val = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
-            backing_stmts.push(syn::parse_quote! {
-                let mut #backing_id: #clean_elem = #val;
-            });
-            if p.mutability.is_some() {
-                syn::parse_quote!(&raw mut #backing_id)
-            } else {
-                syn::parse_quote!(&raw const #backing_id)
+            match unwrap_type_parens_and_groups(&p.elem) {
+                Type::Slice(sl) => {
+                    let clean_elem = strip_type_lifetimes(&sl.elem);
+                    let v0 = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    let v1 = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    backing_stmts.push(syn::parse_quote! {
+                        let mut #backing_id: [#clean_elem; 2] = [#v0, #v1];
+                    });
+                    if p.mutability.is_some() {
+                        syn::parse_quote!(&raw mut #backing_id)
+                    } else {
+                        syn::parse_quote!(&raw const #backing_id)
+                    }
+                }
+                elem_ty if type_matches_primitive_name(elem_ty, "str") => {
+                    if p.mutability.is_some() {
+                        backing_stmts.push(syn::parse_quote! {
+                            let mut #backing_id: [u8; 2] = [65u8, 66u8];
+                        });
+                        syn::parse_quote!(unsafe {
+                            transmute::<*mut [u8], *mut str>(&raw mut #backing_id)
+                        })
+                    } else {
+                        syn::parse_quote!("ab" as *const str)
+                    }
+                }
+                _ => {
+                    let clean_elem = strip_type_lifetimes(&p.elem);
+                    let val = seeded_type_expr(&clean_elem, backing_stmts, backing_idx, rng);
+                    backing_stmts.push(syn::parse_quote! {
+                        let mut #backing_id: #clean_elem = #val;
+                    });
+                    if p.mutability.is_some() {
+                        syn::parse_quote!(&raw mut #backing_id)
+                    } else {
+                        syn::parse_quote!(&raw const #backing_id)
+                    }
+                }
             }
         }
         Type::Path(tp) if tp.qself.is_none() => {
@@ -612,12 +718,8 @@ fn seeded_type_expr(
                             return if rng.coin(1, 3) {
                                 syn::parse_quote!(None)
                             } else {
-                                let inner = seeded_type_expr(
-                                    &clean_inner,
-                                    backing_stmts,
-                                    backing_idx,
-                                    rng,
-                                );
+                                let inner =
+                                    seeded_type_expr(&clean_inner, backing_stmts, backing_idx, rng);
                                 syn::parse_quote!(Some(#inner))
                             };
                         }
@@ -1083,19 +1185,42 @@ fn normalize_place_base(expr: &Expr) -> String {
             normalize_place_base(&ie.expr),
             ie.index.to_token_stream().to_string().replace(' ', "")
         ),
-        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
-            format!("*({})", normalize_place_base(&u.expr))
-        }
+        // Auto-deref makes `r_pair.a` and `(*r_pair).a` alias the exact same
+        // struct place, so normalize through dereference operators.
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => normalize_place_base(&u.expr),
         other => other.to_token_stream().to_string().replace(' ', ""),
     }
 }
 
 fn pat_has_by_ref_field(pat: &Pat, inherited_ref: bool) -> bool {
     match unwrap_pat_type_and_parens(pat) {
-        Pat::Struct(ps) => ps.fields.iter().any(|fp| match unwrap_pat_type_and_parens(&fp.pat) {
-            Pat::Ident(pi) => inherited_ref || pi.by_ref.is_some(),
-            other => pat_has_by_ref_field(other, inherited_ref),
-        }),
+        Pat::Ident(pi) => {
+            (inherited_ref || pi.by_ref.is_some())
+                || pi
+                    .subpat
+                    .as_ref()
+                    .is_some_and(|(_, sub)| pat_has_by_ref_field(sub, inherited_ref))
+        }
+        Pat::Struct(ps) => ps
+            .fields
+            .iter()
+            .any(|fp| pat_has_by_ref_field(&fp.pat, inherited_ref)),
+        Pat::TupleStruct(pts) => pts
+            .elems
+            .iter()
+            .any(|ep| pat_has_by_ref_field(ep, inherited_ref)),
+        Pat::Tuple(pt) => pt
+            .elems
+            .iter()
+            .any(|ep| pat_has_by_ref_field(ep, inherited_ref)),
+        Pat::Slice(psl) => psl
+            .elems
+            .iter()
+            .any(|ep| pat_has_by_ref_field(ep, inherited_ref)),
+        Pat::Or(po) => po
+            .cases
+            .iter()
+            .any(|cp| pat_has_by_ref_field(cp, inherited_ref)),
         Pat::Reference(pr) => pat_has_by_ref_field(&pr.pat, true),
         _ => false,
     }
@@ -1121,8 +1246,22 @@ impl FieldRefCollector {
                 Expr::Index(ie) => {
                     cur = unwrap_expr_parens_and_groups(&ie.expr);
                 }
+                Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                    cur = unwrap_expr_parens_and_groups(&u.expr);
+                }
                 _ => break,
             }
+        }
+    }
+
+    fn record_scrutinee_if_pat_borrows(&mut self, pat: &Pat, scrutinee: &Expr) {
+        let scrut_is_ref = matches!(unwrap_expr_parens_and_groups(scrutinee), Expr::Reference(_));
+        if pat_has_by_ref_field(pat, scrut_is_ref) {
+            let target = match unwrap_expr_parens_and_groups(scrutinee) {
+                Expr::Reference(r) => &*r.expr,
+                other => other,
+            };
+            self.bases.insert(normalize_place_base(target));
         }
     }
 }
@@ -1134,33 +1273,20 @@ impl<'ast> syn::visit::Visit<'ast> for FieldRefCollector {
     }
 
     fn visit_local(&mut self, node: &'ast Local) {
-        if let Some(init) = &node.init
-            && pat_has_by_ref_field(&node.pat, false)
-        {
-            let target = match unwrap_expr_parens_and_groups(&init.expr) {
-                Expr::Reference(r) => &*r.expr,
-                other => other,
-            };
-            self.bases.insert(normalize_place_base(target));
+        if let Some(init) = &node.init {
+            self.record_scrutinee_if_pat_borrows(&node.pat, &init.expr);
         }
         syn::visit::visit_local(self, node);
     }
 
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        self.record_scrutinee_if_pat_borrows(&node.pat, &node.expr);
+        syn::visit::visit_expr_let(self, node);
+    }
+
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
-        let scrut_is_ref = matches!(
-            unwrap_expr_parens_and_groups(&node.expr),
-            Expr::Reference(_)
-        );
-        if node
-            .arms
-            .iter()
-            .any(|arm| pat_has_by_ref_field(&arm.pat, scrut_is_ref))
-        {
-            let target = match unwrap_expr_parens_and_groups(&node.expr) {
-                Expr::Reference(r) => &*r.expr,
-                other => other,
-            };
-            self.bases.insert(normalize_place_base(target));
+        for arm in &node.arms {
+            self.record_scrutinee_if_pat_borrows(&arm.pat, &node.expr);
         }
         syn::visit::visit_expr_match(self, node);
     }
@@ -1808,15 +1934,43 @@ fn reorderable_stmt_bound_ident(stmt: &Stmt) -> Option<Option<String>> {
     }
 }
 
+/// Collect variable identifiers referenced or bound in `stmt`, ignoring type
+/// annotations, named struct field members (`pair.a`), and multi-segment type
+/// or enum constructor paths (`SingleC::Only`).
 fn collect_stmt_idents(stmt: &Stmt) -> std::collections::BTreeSet<String> {
-    struct AllIdentCollector(std::collections::BTreeSet<String>);
-    impl<'ast> syn::visit::Visit<'ast> for AllIdentCollector {
+    struct VarIdentCollector(std::collections::BTreeSet<String>);
+    impl<'ast> syn::visit::Visit<'ast> for VarIdentCollector {
         fn visit_item(&mut self, _item: &'ast Item) {}
-        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-            self.0.insert(ident.to_string());
+        fn visit_type(&mut self, _ty: &'ast Type) {}
+        fn visit_lifetime(&mut self, _lt: &'ast syn::Lifetime) {}
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            self.0.insert(node.ident.to_string());
+            if let Some((_, sub)) = &node.subpat {
+                self.visit_pat(sub);
+            }
+        }
+        fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+            self.visit_expr(&node.base);
+        }
+        fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+            if node.colon_token.is_none()
+                && let syn::Member::Named(id) = &node.member
+            {
+                self.0.insert(id.to_string());
+            }
+            self.visit_expr(&node.expr);
+        }
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.qself.is_none() && node.path.segments.len() == 1 {
+                let id = node.path.segments[0].ident.to_string();
+                if !id.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    self.0.insert(id);
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
         }
     }
-    let mut c = AllIdentCollector(std::collections::BTreeSet::new());
+    let mut c = VarIdentCollector(std::collections::BTreeSet::new());
     syn::visit::Visit::visit_stmt(&mut c, stmt);
     c.0
 }
@@ -1842,6 +1996,18 @@ fn is_raw_ptr_init_expr(expr: &Expr) -> bool {
             Some(Stmt::Expr(tail, None)) => is_raw_ptr_init_expr(tail),
             _ => false,
         },
+        Expr::Match(m) => m.arms.iter().any(|a| is_raw_ptr_init_expr(&a.body)),
+        Expr::If(i) => {
+            let then_raw = match i.then_branch.stmts.last() {
+                Some(Stmt::Expr(tail, None)) => is_raw_ptr_init_expr(tail),
+                _ => false,
+            };
+            let else_raw = i
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, eb)| is_raw_ptr_init_expr(eb));
+            then_raw || else_raw
+        }
         _ => false,
     }
 }
@@ -1872,22 +2038,30 @@ fn extract_place_root_ident(
     }
 }
 
-fn extract_safe_borrow_root(
+fn collect_safe_borrow_roots(
     expr: &Expr,
     raw_ptr_locals: &std::collections::BTreeSet<String>,
-) -> Option<String> {
-    match unwrap_expr_parens_and_groups(expr) {
-        Expr::Reference(r) => extract_place_root_ident(&r.expr, raw_ptr_locals),
-        Expr::Block(b) => match b.block.stmts.last() {
-            Some(Stmt::Expr(tail, None)) => extract_safe_borrow_root(tail, raw_ptr_locals),
-            _ => None,
-        },
-        Expr::Unsafe(u) => match u.block.stmts.last() {
-            Some(Stmt::Expr(tail, None)) => extract_safe_borrow_root(tail, raw_ptr_locals),
-            _ => None,
-        },
-        _ => None,
+) -> std::collections::BTreeSet<String> {
+    struct SafeRefRootVisitor<'a> {
+        raw_ptr_locals: &'a std::collections::BTreeSet<String>,
+        roots: std::collections::BTreeSet<String>,
     }
+    impl<'ast> syn::visit::Visit<'ast> for SafeRefRootVisitor<'_> {
+        fn visit_item(&mut self, _item: &'ast Item) {}
+        fn visit_expr_raw_addr(&mut self, _node: &'ast syn::ExprRawAddr) {}
+        fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+            if let Some(root) = extract_place_root_ident(&node.expr, self.raw_ptr_locals) {
+                self.roots.insert(root);
+            }
+            syn::visit::visit_expr_reference(self, node);
+        }
+    }
+    let mut v = SafeRefRootVisitor {
+        raw_ptr_locals,
+        roots: std::collections::BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_expr(&mut v, expr);
+    v.roots
 }
 
 #[derive(Default)]
@@ -1908,10 +2082,16 @@ impl SafeBorrowContext {
         let mut ctx = Self::default();
         for arg in &func.sig.inputs {
             if let FnArg::Typed(pat_ty) = arg
-                && is_raw_ptr_type(&pat_ty.ty)
                 && let (Some(name), _) = extract_pat_ident(&pat_ty.pat)
             {
-                ctx.raw_ptr_locals.insert(name);
+                if is_raw_ptr_type(&pat_ty.ty) {
+                    ctx.raw_ptr_locals.insert(name);
+                } else if matches!(
+                    unwrap_type_parens_and_groups(&pat_ty.ty),
+                    Type::Reference(_)
+                ) {
+                    ctx.direct_borrows.entry(name).or_default();
+                }
             }
         }
         syn::visit::Visit::visit_block(&mut RawPtrCollector(&mut ctx.raw_ptr_locals), &func.block);
@@ -1948,27 +2128,49 @@ impl SafeBorrowContext {
             moves: std::collections::BTreeSet<String>,
         }
         impl ValueMoveVisitor<'_> {
+            fn check_unreferenced_place_root(&mut self, expr: &Expr) {
+                let mut cur = unwrap_expr_parens_and_groups(expr);
+                loop {
+                    match cur {
+                        Expr::Field(fe) => cur = unwrap_expr_parens_and_groups(&fe.base),
+                        Expr::Index(ie) => cur = unwrap_expr_parens_and_groups(&ie.expr),
+                        Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
+                            let name = ep.path.segments[0].ident.to_string();
+                            if !name.starts_with(|c: char| c.is_ascii_uppercase())
+                                && !self.raw_ptr_locals.contains(&name)
+                            {
+                                self.moves.insert(name);
+                            }
+                            return;
+                        }
+                        _ => return,
+                    }
+                }
+            }
+
             fn check_value_expr(&mut self, expr: &Expr) {
                 match unwrap_expr_parens_and_groups(expr) {
-                    Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
-                        let name = ep.path.segments[0].ident.to_string();
-                        if !name.starts_with(|c: char| c.is_ascii_uppercase())
-                            && !self.raw_ptr_locals.contains(&name)
-                        {
-                            self.moves.insert(name);
-                        }
+                    Expr::Path(_) | Expr::Field(_) | Expr::Index(_) => {
+                        self.check_unreferenced_place_root(expr);
+                        syn::visit::visit_expr(self, expr);
                     }
                     Expr::Block(b) => {
                         for s in &b.block.stmts {
-                            syn::visit::Visit::visit_stmt(self, s);
+                            syn::visit::visit_stmt(self, s);
+                        }
+                        if let Some(Stmt::Expr(tail, None)) = b.block.stmts.last() {
+                            self.check_value_expr(tail);
                         }
                     }
                     Expr::Unsafe(u) => {
                         for s in &u.block.stmts {
                             syn::visit::Visit::visit_stmt(self, s);
                         }
+                        if let Some(Stmt::Expr(tail, None)) = u.block.stmts.last() {
+                            self.check_value_expr(tail);
+                        }
                     }
-                    other => syn::visit::Visit::visit_expr(self, other),
+                    other => syn::visit::visit_expr(self, other),
                 }
             }
         }
@@ -1986,6 +2188,13 @@ impl SafeBorrowContext {
                     }
                 }
             }
+            fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+                if !matches!(unwrap_pat_type_and_parens(&node.pat), Pat::Wild(_)) {
+                    self.check_value_expr(&node.expr);
+                } else {
+                    syn::visit::visit_expr(self, &node.expr);
+                }
+            }
             fn visit_expr(&mut self, expr: &'ast Expr) {
                 match expr {
                     Expr::Reference(_) | Expr::RawAddr(_) => {}
@@ -1998,6 +2207,33 @@ impl SafeBorrowContext {
                             self.check_value_expr(arg);
                         }
                     }
+                    Expr::MethodCall(mc) => {
+                        self.check_value_expr(&mc.receiver);
+                        for arg in &mc.args {
+                            self.check_value_expr(arg);
+                        }
+                    }
+                    Expr::Match(m) => {
+                        self.check_value_expr(&m.expr);
+                        for arm in &m.arms {
+                            if let Some((_, guard)) = &arm.guard {
+                                self.visit_expr(guard);
+                            }
+                            self.check_value_expr(&arm.body);
+                        }
+                    }
+                    Expr::If(ie) => {
+                        self.visit_expr(&ie.cond);
+                        for s in &ie.then_branch.stmts {
+                            syn::visit::visit_stmt(self, s);
+                        }
+                        if let Some(Stmt::Expr(tail, None)) = ie.then_branch.stmts.last() {
+                            self.check_value_expr(tail);
+                        }
+                        if let Some((_, eb)) = &ie.else_branch {
+                            self.check_value_expr(eb);
+                        }
+                    }
                     Expr::Tuple(t) => {
                         for elem in &t.elems {
                             self.check_value_expr(elem);
@@ -2007,6 +2243,9 @@ impl SafeBorrowContext {
                         for elem in &arr.elems {
                             self.check_value_expr(elem);
                         }
+                    }
+                    Expr::Repeat(rep) => {
+                        self.check_value_expr(&rep.expr);
                     }
                     Expr::Struct(st) => {
                         for field in &st.fields {
@@ -2055,30 +2294,32 @@ impl<'ast> syn::visit::Visit<'ast> for BorrowCollector<'_> {
 
     fn visit_local(&mut self, node: &'ast Local) {
         if let Some(init) = &node.init {
-            if let (Some(lhs), _) = extract_pat_ident(&node.pat)
-                && let Some(root) = extract_safe_borrow_root(&init.expr, &self.0.raw_ptr_locals)
-            {
-                self.0.direct_borrows.entry(lhs).or_default().insert(root);
-            }
-            if pat_has_by_ref_field(&node.pat, false)
-                || matches!(
-                    unwrap_pat_type_and_parens(&node.pat),
-                    Pat::Ident(pi) if pi.by_ref.is_some()
-                )
-            {
+            let mut bound = Vec::new();
+            collect_pat_bound_idents(&node.pat, &mut bound);
+            let mut roots = collect_safe_borrow_roots(&init.expr, &self.0.raw_ptr_locals);
+            if pat_has_by_ref_field(&node.pat, false) {
                 let scrut = match unwrap_expr_parens_and_groups(&init.expr) {
                     Expr::Reference(r) => &*r.expr,
                     other => other,
                 };
                 if let Some(root) = extract_place_root_ident(scrut, &self.0.raw_ptr_locals) {
-                    let mut bound = Vec::new();
-                    collect_pat_bound_idents(&node.pat, &mut bound);
-                    for b in bound {
+                    roots.insert(root);
+                }
+            }
+            let init_stmt = Stmt::Expr((*init.expr).clone(), None);
+            for mentioned in collect_stmt_idents(&init_stmt) {
+                if self.0.direct_borrows.contains_key(&mentioned) {
+                    roots.insert(mentioned);
+                }
+            }
+            if !roots.is_empty() {
+                for b in bound {
+                    if !self.0.raw_ptr_locals.contains(&b) {
                         self.0
                             .direct_borrows
                             .entry(b)
                             .or_default()
-                            .insert(root.clone());
+                            .extend(roots.iter().cloned());
                     }
                 }
             }
@@ -2090,10 +2331,14 @@ impl<'ast> syn::visit::Visit<'ast> for BorrowCollector<'_> {
         if let Expr::Path(ep) = unwrap_expr_parens_and_groups(&node.left)
             && ep.qself.is_none()
             && ep.path.segments.len() == 1
-            && let Some(root) = extract_safe_borrow_root(&node.right, &self.0.raw_ptr_locals)
         {
             let lhs = ep.path.segments[0].ident.to_string();
-            self.0.direct_borrows.entry(lhs).or_default().insert(root);
+            if !self.0.raw_ptr_locals.contains(&lhs) {
+                let roots = collect_safe_borrow_roots(&node.right, &self.0.raw_ptr_locals);
+                if !roots.is_empty() {
+                    self.0.direct_borrows.entry(lhs).or_default().extend(roots);
+                }
+            }
         }
         syn::visit::visit_expr_assign(self, node);
     }
@@ -2568,12 +2813,13 @@ fn type_matches_primitive_name(mut ty: &Type, expected: &str) -> bool {
 }
 
 /// Check whether a `transmute` call's first turbofish argument `Src` (when
-/// present) is compatible with `expected_src` (`"u8"`, `"u32"`, or
+/// explicitly named) is compatible with `expected_src` (`"u8"`, `"u32"`, or
 /// `"[u32;2]"`).
 ///
-/// Returns `None` when `call` has no turbofish arguments at all; `Some(true)`
-/// when `Src` is `_` (`Type::Infer`) or matches `expected_src`; and
-/// `Some(false)` when `Src` names an incompatible type such as `i8` or `i32`.
+/// Returns `None` when `call` has no turbofish arguments or specifies `_`
+/// (`Type::Infer`) for `Src`; `Some(true)` when `Src` explicitly matches
+/// `expected_src`; and `Some(false)` when `Src` names an incompatible type
+/// such as `i8` or `i32`.
 fn turbofish_src_compatible(call: &ExprCall, expected_src: &str) -> Option<bool> {
     let Expr::Path(ep) = &*call.func else {
         return None;
@@ -2582,7 +2828,7 @@ fn turbofish_src_compatible(call: &ExprCall, expected_src: &str) -> Option<bool>
         return None;
     };
     let mut ty = match args.args.first()? {
-        GenericArgument::Type(Type::Infer(_)) => return Some(true),
+        GenericArgument::Type(Type::Infer(_)) => return None,
         GenericArgument::Type(ty) => ty,
         _ => return Some(false),
     };
@@ -2612,7 +2858,8 @@ fn turbofish_src_compatible(call: &ExprCall, expected_src: &str) -> Option<bool>
 }
 
 /// Whether `expr` evaluates to at least one tail `transmute` call through
-/// parentheses, groups, blocks, `unsafe` blocks, or `if`/`else` branches.
+/// parentheses, groups, blocks, `unsafe` blocks, `if`/`else` branches, or
+/// `match` arms.
 fn has_direct_transmute_call(expr: &Expr) -> bool {
     match expr {
         Expr::Call(call) => is_transmute_call(call),
@@ -2637,27 +2884,11 @@ fn has_direct_transmute_call(expr: &Expr) -> bool {
                 .is_some_and(|(_, eb)| has_direct_transmute_call(eb));
             if_expr.else_branch.is_some() && (then_has || else_has)
         }
+        Expr::Match(match_expr) => match_expr
+            .arms
+            .iter()
+            .any(|arm| has_direct_transmute_call(&arm.body)),
         _ => false,
-    }
-}
-
-/// Return the tail `transmute` call that `expr` evaluates to, looking through
-/// parentheses, groups, blocks, and `unsafe` blocks (even multi-statement
-/// blocks whose final expression is `transmute(...)`).
-fn direct_transmute_call_mut(expr: &mut Expr) -> Option<&mut ExprCall> {
-    match expr {
-        Expr::Call(call) if is_transmute_call(call) => Some(call),
-        Expr::Paren(paren) => direct_transmute_call_mut(&mut paren.expr),
-        Expr::Group(group) => direct_transmute_call_mut(&mut group.expr),
-        Expr::Block(block_expr) => match block_expr.block.stmts.last_mut()? {
-            Stmt::Expr(inner, None) => direct_transmute_call_mut(inner),
-            _ => None,
-        },
-        Expr::Unsafe(unsafe_expr) => match unsafe_expr.block.stmts.last_mut()? {
-            Stmt::Expr(inner, None) => direct_transmute_call_mut(inner),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -2797,18 +3028,22 @@ impl TransmuteValidityPerturber<'_> {
         }
     }
 
-    fn visit_non_tail_stmts(&mut self, expr: &mut Expr) {
+    fn visit_typed_tail_expr(&mut self, expr: &mut Expr, fallback_target: TransmuteTarget) -> bool {
+        if !has_direct_transmute_call(expr) {
+            return false;
+        }
         match expr {
-            Expr::Paren(paren) => self.visit_non_tail_stmts(&mut paren.expr),
-            Expr::Group(group) => self.visit_non_tail_stmts(&mut group.expr),
+            Expr::Paren(p) => self.visit_typed_tail_expr(&mut p.expr, fallback_target),
+            Expr::Group(g) => self.visit_typed_tail_expr(&mut g.expr, fallback_target),
             Expr::Block(b) => {
                 let n = b.block.stmts.len().saturating_sub(1);
                 for stmt in &mut b.block.stmts[..n] {
                     self.visit_stmt_mut(stmt);
                 }
                 if let Some(Stmt::Expr(tail, None)) = b.block.stmts.last_mut() {
-                    self.visit_non_tail_stmts(tail);
+                    return self.visit_typed_tail_expr(tail, fallback_target);
                 }
+                false
             }
             Expr::Unsafe(u) => {
                 let n = u.block.stmts.len().saturating_sub(1);
@@ -2816,28 +3051,16 @@ impl TransmuteValidityPerturber<'_> {
                     self.visit_stmt_mut(stmt);
                 }
                 if let Some(Stmt::Expr(tail, None)) = u.block.stmts.last_mut() {
-                    self.visit_non_tail_stmts(tail);
+                    return self.visit_typed_tail_expr(tail, fallback_target);
                 }
+                false
             }
-            _ => {}
-        }
-    }
-
-    fn visit_typed_tail_expr(&mut self, expr: &mut Expr, fallback_target: TransmuteTarget) -> bool {
-        if !has_direct_transmute_call(expr) {
-            return false;
-        }
-        match expr {
-            Expr::Paren(p) => return self.visit_typed_tail_expr(&mut p.expr, fallback_target),
-            Expr::Group(g) => return self.visit_typed_tail_expr(&mut g.expr, fallback_target),
             Expr::If(if_expr) if if_expr.else_branch.is_some() => {
                 self.visit_expr_mut(&mut if_expr.cond);
                 let n = if_expr.then_branch.stmts.len();
-                let then_tail_transmute = if_expr
-                    .then_branch
-                    .stmts
-                    .last()
-                    .is_some_and(|s| matches!(s, Stmt::Expr(e, None) if has_direct_transmute_call(e)));
+                let then_tail_transmute = if_expr.then_branch.stmts.last().is_some_and(
+                    |s| matches!(s, Stmt::Expr(e, None) if has_direct_transmute_call(e)),
+                );
                 if then_tail_transmute {
                     for stmt in &mut if_expr.then_branch.stmts[..n - 1] {
                         self.visit_stmt_mut(stmt);
@@ -2848,25 +3071,35 @@ impl TransmuteValidityPerturber<'_> {
                 } else {
                     self.visit_block_mut(&mut if_expr.then_branch);
                 }
-                if let Some((_, eb)) = &mut if_expr.else_branch {
-                    if !self.visit_typed_tail_expr(eb, fallback_target) {
-                        self.visit_expr_mut(eb);
+                if let Some((_, eb)) = &mut if_expr.else_branch
+                    && !self.visit_typed_tail_expr(eb, fallback_target)
+                {
+                    self.visit_expr_mut(eb);
+                }
+                true
+            }
+            Expr::Match(match_expr) => {
+                self.visit_expr_mut(&mut match_expr.expr);
+                for arm in &mut match_expr.arms {
+                    if let Some((_, guard)) = &mut arm.guard {
+                        self.visit_expr_mut(guard);
+                    }
+                    if !self.visit_typed_tail_expr(&mut arm.body, fallback_target) {
+                        self.visit_expr_mut(&mut arm.body);
                     }
                 }
-                return true;
+                true
             }
-            _ => {}
-        }
-        self.visit_non_tail_stmts(expr);
-        if let Some(call) = direct_transmute_call_mut(expr) {
-            let target = TransmuteTarget::of_turbofish(call).unwrap_or(fallback_target);
-            for arg in call.args.iter_mut() {
-                self.visit_expr_mut(arg);
+            Expr::Call(call) if is_transmute_call(call) => {
+                let target = TransmuteTarget::of_turbofish(call).unwrap_or(fallback_target);
+                for arg in call.args.iter_mut() {
+                    self.visit_expr_mut(arg);
+                }
+                self.perturb_call(call, target);
+                true
             }
-            self.perturb_call(call, target);
-            return true;
+            _ => false,
         }
-        false
     }
 }
 
@@ -2904,6 +3137,20 @@ impl VisitMut for TransmuteValidityPerturber<'_> {
             ReturnType::Type(_, ret_ty) => Some(TransmuteTarget::of_type(ret_ty)),
             ReturnType::Default => None,
         };
+        if let Some(ret_target) = self.fn_ret_target
+            && has_direct_transmute_call(&node.body)
+        {
+            for attr in &mut node.attrs {
+                self.visit_attribute_mut(attr);
+            }
+            for input in &mut node.inputs {
+                self.visit_pat_mut(input);
+            }
+            self.visit_return_type_mut(&mut node.output);
+            self.visit_typed_tail_expr(&mut node.body, ret_target);
+            self.fn_ret_target = prev_ret;
+            return;
+        }
         syn::visit_mut::visit_expr_closure_mut(self, node);
         self.fn_ret_target = prev_ret;
     }
@@ -3427,8 +3674,7 @@ fn generate_miri_batch_with_prefix(
         // If the selected seed is already a faulting (`panic_*` or `ub_*`) seed,
         // mutate it in-place (`PerturbAst` / `Pass`) rather than appending a
         // second fault probe after the seed's own panic/UB.
-        let seed_already_faults =
-            seed_name.starts_with("panic_") || seed_name.starts_with("ub_");
+        let seed_already_faults = seed_name.starts_with("panic_") || seed_name.starts_with("ub_");
 
         let num_passes = 1 + cand_rng.gen_range(3);
         let mut applied_mutators = Vec::with_capacity(num_passes);
@@ -3490,6 +3736,23 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+
+    fn direct_transmute_call_mut(expr: &mut Expr) -> Option<&mut ExprCall> {
+        match expr {
+            Expr::Call(call) if is_transmute_call(call) => Some(call),
+            Expr::Paren(paren) => direct_transmute_call_mut(&mut paren.expr),
+            Expr::Group(group) => direct_transmute_call_mut(&mut group.expr),
+            Expr::Block(block_expr) => match block_expr.block.stmts.last_mut()? {
+                Stmt::Expr(inner, None) => direct_transmute_call_mut(inner),
+                _ => None,
+            },
+            Expr::Unsafe(unsafe_expr) => match unsafe_expr.block.stmts.last_mut()? {
+                Stmt::Expr(inner, None) => direct_transmute_call_mut(inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
     #[test]
     fn corpus_seeds_load_all_89_zero_arg_functions_and_do_not_blocklist_known_bugs() {
@@ -3610,12 +3873,20 @@ mod tests {
                 &mut locals,
             );
             let out = prettyplease::unparse(&f);
-            if out.contains("as i32") && (out.contains("as u") || out.contains("as i16") || out.contains("as i64") || out.contains("as isize")) {
+            if out.contains("as i32")
+                && (out.contains("as u")
+                    || out.contains("as i16")
+                    || out.contains("as i64")
+                    || out.contains("as isize"))
+            {
                 saw_cast_swap = true;
                 break;
             }
         }
-        assert!(saw_cast_swap, "ArithmeticCastMutator must perform Expr::Cast swaps");
+        assert!(
+            saw_cast_swap,
+            "ArithmeticCastMutator must perform Expr::Cast swaps"
+        );
 
         // 2. Invalid char and ColorTag enum transmutes in BitValidityTransmuteMutator
         let base_seed = "pub fn val_fn() -> u32 { 1u32 }\n";
@@ -3639,8 +3910,14 @@ mod tests {
                 saw_enum_ub = true;
             }
         }
-        assert!(saw_char_ub, "BitValidityTransmuteMutator must emit invalid char transmutes");
-        assert!(saw_enum_ub, "BitValidityTransmuteMutator must emit invalid ColorTag transmutes");
+        assert!(
+            saw_char_ub,
+            "BitValidityTransmuteMutator must emit invalid char transmutes"
+        );
+        assert!(
+            saw_enum_ub,
+            "BitValidityTransmuteMutator must emit invalid ColorTag transmutes"
+        );
 
         // 3. Array index perturbation in PlaceProjectionWrapper
         let idx_seed = "pub fn idx_fn() -> u32 { let arr: [u32; 4] = [1, 2, 3, 4]; arr[0] }\n";
@@ -3661,7 +3938,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_idx_perturb, "PlaceProjectionWrapper must perturb Expr::Index in place");
+        assert!(
+            saw_idx_perturb,
+            "PlaceProjectionWrapper must perturb Expr::Index in place"
+        );
 
         // 4. Aliasing statement reordering in TreeBorrowsRetagInterleaver
         let tb_seed = "\
@@ -4401,7 +4681,7 @@ pub fn ret_opt() -> Option<NonZeroU32> {
     #[test]
     fn reorderer_and_perturbers_guard_stmt_macros_safe_borrows_moves_and_complex_params() {
         // 1. `AliasingAccessReorderer` must NOT swap:
-        //    - `Stmt::Macro` (`unsafe { panic!("boom"); };`) past a pointer write;
+        //    - `Stmt::Macro` (`unsafe { panic!("boom"); };`) past a write;
         //    - a safe `&mut` write (`*r = 2u32;`) across a direct owner write
         //      (`x = 3u32;`, which would fail borrowck with `E0506`);
         //    - a non-`Copy` ADT move (`let _moved: SingleC = sc;`) ahead of an
@@ -4450,7 +4730,7 @@ pub fn guard_reorder_hazards() -> u32 {
         }
 
         // 2. `ProjectionAstPerturber` preserves `(borrowed).a` when
-        //    `&mut (borrowed.b)` or `let PairU32 { b: ref mut rb2, .. } = s_bor`
+        //    `&mut (borrowed.b)` or `PairU32 { b: ref mut rb2, .. } = s_bor`
         //    borrows a field.
         let paren_and_struct_pat = "\
 pub fn proj_paren_and_pat() -> u32 {
@@ -4664,6 +4944,241 @@ pub fn complex_params<'a>(
             assert!(
                 category_8_hits > 0,
                 "seed {seed:#X} never chose a Category 8 seed"
+            );
+        }
+    }
+
+    #[test]
+    fn ep2_a2_guards_match_borrows_moves_deref_fields_infer_src_and_slice_params() {
+        // 1. `AliasingAccessReorderer` preserves NLL borrow lifetimes across
+        //    nested `match &mut sc` borrows, tuple-struct `ref mut` patterns,
+        //    transitive reference moves (`let r2 = r1;`), and `match` /
+        //    `if let` value moves, while ignoring struct field names (`.a`)
+        //    when `r` borrows local `a`.
+        let borrow_and_move_seed = "\
+pub fn nested_match_borrow() -> u32 {
+    let mut sc = SingleC::Only(1u32);
+    let r: &mut u32 = match &mut sc {
+        SingleC::Only(inner) => inner,
+    };
+    *r = 2u32;
+    sc = SingleC::Only(3u32);
+    match sc { SingleC::Only(v) => v }
+}
+pub fn tuple_struct_ref_pat() -> u32 {
+    let mut sc = SingleC::Only(1u32);
+    let SingleC::Only(ref mut r) = sc;
+    *r = 2u32;
+    sc = SingleC::Only(3u32);
+    match sc { SingleC::Only(v) => v }
+}
+pub fn transitive_ref_move() -> u32 {
+    let mut sc = SingleC::Only(1u32);
+    let r1 = &mut sc;
+    let r2 = match r1 {
+        SingleC::Only(inner) => inner,
+    };
+    *r2 = 2u32;
+    sc = SingleC::Only(3u32);
+    match sc { SingleC::Only(v) => v }
+}
+pub fn match_and_if_let_moves() -> u32 {
+    let sc1 = SingleC::Only(4u32);
+    let _b1: u32 = match &sc1 { SingleC::Only(v) => *v };
+    let _m1: u32 = match sc1 { SingleC::Only(v) => v };
+    let sc2 = SingleC::Only(5u32);
+    let _b2: u32 = match &sc2 { SingleC::Only(v) => *v };
+    if let SingleC::Only(v) = sc2 { let _ = v; };
+    _b1 ^ _m1 ^ _b2
+}
+pub fn field_name_not_confused_with_local() -> u32 {
+    let mut a: u32 = 1u32;
+    let mut pair = PairU32 { a: 10u32, b: 20u32 };
+    let p: *mut PairU32 = &raw mut pair;
+    let r: &mut u32 = &mut a;
+    *r = 2u32;
+    unsafe { (*p).a = 5u32; };
+    a ^ pair.a
+}
+";
+        let mut saw_field_swap = false;
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(borrow_and_move_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            AliasingAccessReorderer { rng: &mut rng }.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            let (fn1, r1) = out.split_once("pub fn tuple_struct_ref_pat").unwrap();
+            let (fn2, r2) = r1.split_once("pub fn transitive_ref_move").unwrap();
+            let (fn3, r3) = r2.split_once("pub fn match_and_if_let_moves").unwrap();
+            let (fn4, fn5) = r3
+                .split_once("pub fn field_name_not_confused_with_local")
+                .unwrap();
+            assert!(
+                fn1.find("*r = 2u32;").unwrap() < fn1.find("sc = SingleC::Only(3u32);").unwrap(),
+                "`match &mut sc` borrow must not swap past `sc = ...`:\n{fn1}"
+            );
+            assert!(
+                fn2.find("*r = 2u32;").unwrap() < fn2.find("sc = SingleC::Only(3u32);").unwrap(),
+                "`SingleC::Only(ref mut r)` must not swap past `sc = ...`:\n{fn2}"
+            );
+            assert!(
+                fn3.find("*r2 = 2u32;").unwrap() < fn3.find("sc = SingleC::Only(3u32);").unwrap(),
+                "transitive `r2` from `r1` must not swap past `sc = ...`:\n{fn3}"
+            );
+            assert!(
+                fn4.find("match &sc1").unwrap() < fn4.find("match sc1").unwrap()
+                    && fn4.find("match &sc2").unwrap()
+                        < fn4.find("if let SingleC::Only(v) = sc2").unwrap(),
+                "`match` / `if let` value moves must not swap ahead of borrows:\n{fn4}"
+            );
+            if fn5.find("(*p).a = 5u32;").unwrap() < fn5.find("*r = 2u32;").unwrap() {
+                saw_field_swap = true;
+            }
+        }
+        assert!(
+            saw_field_swap,
+            "raw field access `(*p).a` must remain swappable when `r` borrows local `a`"
+        );
+
+        // 2. `ProjectionAstPerturber` normalizes deref bases
+        //    (`&mut (*r_pair).b` matches `r_pair.a`) and inspects `if let`
+        //    patterns (`Expr::Let`).
+        let deref_and_if_let_proj = "\
+pub fn deref_field_borrow(r_pair: &mut PairU32) -> u32 {
+    let rb: &mut u32 = &mut (*r_pair).b;
+    let keep_a: u32 = r_pair.a;
+    *rb = 9u32;
+    keep_a ^ r_pair.b
+}
+pub fn if_let_field_borrow() -> u32 {
+    let mut p = PairU32 { a: 1u32, b: 2u32 };
+    if let PairU32 { b: ref mut rb, .. } = p {
+        let keep_a: u32 = p.a;
+        *rb = keep_a ^ 3u32;
+    }
+    p.b
+}
+";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(deref_and_if_let_proj).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut v = ProjectionAstPerturber {
+                rng: &mut rng,
+                in_addr_or_lhs: false,
+                field_borrowed_bases: BTreeSet::new(),
+            };
+            v.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                out.contains("let keep_a: u32 = r_pair.a;")
+                    && out.contains("let keep_a: u32 = p.a;"),
+                "borrowed `.b` via `(*r_pair).b` or `if let` was swapped into `.a`:\n{out}"
+            );
+        }
+
+        // 3. `TransmuteValidityPerturber` rejects inferred `Type::Infer` source
+        //    turbofish (`transmute::<_, SingleC>([0, -5])`), propagates typed
+        //    targets through `unsafe { match ... }` and typed closures, and
+        //    keeps `Option<NonZeroU32>` `match` arms unperturbed.
+        let match_and_infer_transmute = "\
+pub fn infer_src_single() -> u32 {
+    let s: SingleC = unsafe { transmute::<_, SingleC>([0, -5]) };
+    match s { SingleC::Only(v) => v }
+}
+pub fn unsafe_match_nz(c: bool) -> NonZeroU32 {
+    let f = || -> Option<NonZeroU32> { unsafe { transmute(0u32) } };
+    let _ = f();
+    unsafe {
+        match c {
+            true => transmute(7u32),
+            false => transmute(9u32),
+        }
+    }
+}
+pub fn match_opt_nz(c: bool) -> Option<NonZeroU32> {
+    match c {
+        true => unsafe { transmute(0u32) },
+        false => None,
+    }
+}
+";
+        let mut saw_match_nz_zero = false;
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(match_and_infer_transmute).unwrap();
+            let mut rng = DetRng::new(s);
+            TransmuteValidityPerturber {
+                rng: &mut rng,
+                inject_invalid: true,
+                fn_ret_target: None,
+            }
+            .visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            let (infer_part, rest) = out.split_once("pub fn unsafe_match_nz").unwrap();
+            let (nz_part, opt_part) = rest.split_once("pub fn match_opt_nz").unwrap();
+            assert!(
+                infer_part.contains("[0, -5]"),
+                "`transmute::<_, SingleC>([0, -5])` must not treat `_` as `[u32; 2]`:\n{infer_part}"
+            );
+            assert!(
+                nz_part.contains("|| -> Option<NonZeroU32> { unsafe { transmute(0u32) } }"),
+                "typed closure returning `Option<NonZeroU32>` must remain `0u32`:\n{nz_part}"
+            );
+            if nz_part.contains("true => transmute(0u32)") {
+                saw_match_nz_zero = true;
+            }
+            assert!(
+                opt_part.contains("true => unsafe { transmute(0u32) }"),
+                "`Option<NonZeroU32>` match arm must stay unperturbed:\n{opt_part}"
+            );
+        }
+        assert!(
+            saw_match_nz_zero,
+            "`unsafe {{ match ... }}` returning `NonZeroU32` must perturb arm tails"
+        );
+
+        // 4. `close_and_normalize_function` rewrites return lifetimes to
+        //    `'static`, strips lifetime `where` predicates, and backs slice /
+        //    `str` reference and raw-pointer parameters without unsized locals.
+        let slice_and_ret_lt_seed = "\
+pub fn slice_and_ret_lt<'a, 'b>(
+    s_u32: &'a [u32],
+    s_mut_u8: &'b mut [u8],
+    p_u32: *const [u32],
+    p_mut_u8: *mut [u8],
+    s_str: &'a str,
+    s_mut_str: &'b mut str,
+    p_str: *const str,
+    p_mut_str: *mut str,
+) -> &'a u32
+where
+    'a: 'b,
+{
+    let _ = (s_u32, s_mut_u8, p_u32, p_mut_u8, s_str, s_mut_str, p_str, p_mut_str);
+    &0u32
+}
+";
+        let batch = generate_miri_batch(&[slice_and_ret_lt_seed], 2, 0xA2A2_51CE);
+        assert_eq!(batch.len(), 2);
+        for cand in &batch {
+            assert!(syn::parse_file(&cand.source).is_ok(), "{}", cand.source);
+            assert!(
+                cand.fn_source.contains("-> &'static u32"),
+                "return lifetime must become `'static`:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                !cand.fn_source.contains("'a")
+                    && !cand.fn_source.contains("'b")
+                    && !cand.fn_source.contains("where"),
+                "function lifetimes and lifetime `where` bounds must be stripped:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                !cand.fn_source.contains(": [u32] =")
+                    && !cand.fn_source.contains(": [u8] =")
+                    && !cand.fn_source.contains(": str ="),
+                "slice and `str` parameters must not emit unsized locals:\n{}",
+                cand.fn_source
             );
         }
     }
