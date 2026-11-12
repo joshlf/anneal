@@ -6,12 +6,14 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-"""Translate managed Codex review summaries into a required commit status.
+"""Evaluate managed Codex summaries and propose commit statuses.
 
-The GitHub workflow supplies serialization and a trusted checkout. This module
-uses only the standard library and never executes PR code or comment contents.
+The deployed workflow runs this standard-library adapter only as manually
+dispatched, read-only diagnostics. The former publisher and deletion recorder
+remain available for the research tracked in issue #236. Neither write mode
+runs in that workflow. PR code and comment contents are never executed.
 The default mode reads live inputs and prints proposed statuses. Explicit
---publish and --record-deletion modes perform the workflow's two write effects.
+--publish and --record-deletion retain the former gate's two write effects.
 """
 
 import argparse

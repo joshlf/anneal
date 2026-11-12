@@ -440,9 +440,10 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 github.queue_groups()
 
-    def test_rollout_ruleset_requires_the_publishers_context_from_actions(self):
+    def test_retained_ruleset_is_disabled_and_keeps_actions_context(self):
         root = Path(__file__).resolve().parent.parent
         ruleset = json.loads((root / ".github/codex-review-ruleset.json").read_text())
+        self.assertEqual(ruleset["enforcement"], "disabled")
         self.assertEqual(ruleset["conditions"]["ref_name"]["include"],
                          ["refs/heads/main"])
         required = ruleset["rules"][0]["parameters"]["required_status_checks"]
