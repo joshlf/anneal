@@ -176,6 +176,18 @@ fn main() {
         "pass_direct_fn_call" => print_u32(pass_direct_fn_call()),
         "panic_explicit_macro" => print_unit(panic_explicit_macro()),
 
+        // Category 8: Niche, transparent, univariant repr(C), union, and &raw
+        "pass_nonzero_u32_transmute_roundtrip" => print_u32(pass_nonzero_u32_transmute_roundtrip()),
+        "ub_nonzero_u32_transmute_zero" => print_u32(ub_nonzero_u32_transmute_zero()),
+        "pass_option_nonzero_none_niche" => print_u32(pass_option_nonzero_none_niche()),
+        "pass_transparent_wrapper_transmute" => print_u32(pass_transparent_wrapper_transmute()),
+        "pass_single_c_enum_match_reinit" => print_u32(pass_single_c_enum_match_reinit()),
+        "ub_single_c_enum_invalid_tag" => print_u32(ub_single_c_enum_invalid_tag()),
+        "pass_union_overlay_word_bytes" => print_u32(pass_union_overlay_word_bytes()),
+        "ub_union_uninit_bytes_partial_read" => print_u32(ub_union_uninit_bytes_partial_read()),
+        "pass_raw_ref_disjoint_fields" => print_u32(pass_raw_ref_disjoint_fields()),
+        "ub_raw_mut_after_parent_write" => print_u32(ub_raw_mut_after_parent_write()),
+
         other => {
             eprintln!("unknown test: {other}");
             std::process::exit(2);

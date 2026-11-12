@@ -53,6 +53,38 @@ Every theorem and probe generated for a test links the same callee table: the
 only bodies captured from `corpus/`. A call to any other function remains an
 uninterpreted external call.
 
+## Corpus Coverage
+
+The corpus holds 87 tests: 40 `pass`, 10 `panic` (including the tracked
+`panic_explicit_macro` bug), and 37 `ub`, grouped into eight categories that
+`// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
+Category 8 covers layout-sensitive types and raw-pointer retags:
+
+| Theme | Tests |
+| :--- | :--- |
+| Niche-encoded scalars and `#[repr(transparent)]` wrappers | `pass_nonzero_u32_transmute_roundtrip`, `ub_nonzero_u32_transmute_zero`, `pass_option_nonzero_none_niche`, `pass_transparent_wrapper_transmute` |
+| Univariant `#[repr(C)]` enums | `pass_single_c_enum_match_reinit`, `ub_single_c_enum_invalid_tag` |
+| Union overlays and uninitialized bytes | `pass_union_overlay_word_bytes`, `ub_union_uninit_bytes_partial_read` |
+| `Retag(Raw)` (`&raw const` / `&raw mut`) interleavings | `pass_raw_ref_disjoint_fields`, `ub_raw_mut_after_parent_write` |
+
+Category 8 leaves out constructs on which Anneal currently disagrees with
+Miri. The negative controls in
+[`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
+pin each of these divergences, and `miri-difftest` mutators avoid them:
+
+- `transmute` producing a valid nonzero (`Some`) `Option<NonZeroU32>`, or a
+  valid `Option<bool>` or `Option<ColorTag>`: Anneal reports UB where Miri
+  passes. Only the all-zero `None` of `Option<NonZeroU32>` decodes.
+- Writing zero into a `NonZeroU32` through a `*mut u32` and then copying it:
+  Miri reports UB at the copy, and Anneal passes.
+- Writing into a `SingleC` through a `*mut u32` or `*mut [u32; 2]`: Anneal
+  reports UB at the write, even for a valid payload. Miri passes, or for an
+  invalid tag reports UB at the next copy.
+- Writing field `f` through a `&mut *m` reborrow created after
+  `&raw mut (*m).f`, then writing through that raw pointer: Miri passes,
+  because Tree Borrows lets the raw pointer keep `m`'s tag, but Anneal reports
+  UB at the raw write. A raw pointer to the whole place, `&raw mut *m`, agrees.
+
 ## Policy on `known_anneal_bug` Entries
 
 > **Every `[tests.known_anneal_bug]` block in [`manifest.toml`](manifest.toml)

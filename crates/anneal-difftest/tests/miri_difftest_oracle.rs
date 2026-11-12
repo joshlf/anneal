@@ -20,7 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
-    GeneratedMiriCandidate, build_standalone_candidate_source, generate_miri_corpus_batch,
+    ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
+    MiriAstMutator, MutationMode, PlaceProjectionWrapper, TreeBorrowsRetagInterleaver,
+    build_standalone_candidate_source, generate_miri_corpus_batch,
 };
 use cargo_anneal::{
     AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
@@ -117,11 +119,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 77
-assert data["compiled_candidates"] == 77
+assert data["total_candidates"] == 87
+assert data["compiled_candidates"] == 87
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 77
-assert data["agree_count"] == 77
+assert data["compared_candidates"] == 87
+assert data["agree_count"] == 87
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -1551,4 +1553,386 @@ fn linked_oracle_runs_lake_build_and_lake_env_lean_with_the_same_lake_binary() {
         "--reproduce failed with ANNEAL_LAKE:\n{}",
         String::from_utf8_lossy(&out2.stderr)
     );
+}
+
+/// Run `mutator` in `mode` over a closed `u32` seed named after `id`, under
+/// the first `DetRng` seed in `0..512` whose output contains `marker`, then
+/// run each mutator in `follow_ups` in `Pass` mode, so that their in-place
+/// perturbers act on the injected template.
+fn template_candidate(
+    id: usize,
+    mutator: &dyn MiriAstMutator,
+    mode: MutationMode,
+    marker: &str,
+    follow_ups: &[&dyn MiriAstMutator],
+) -> GeneratedMiriCandidate {
+    let fn_name = format!("ep2_template__b0_c{id}");
+    let seed = format!("pub fn {fn_name}() -> u32 {{\n    let base: u32 = 6u32;\n    base\n}}\n");
+    for s in 0..512u64 {
+        let mut file = syn::parse_file(&seed).expect("parse template seed");
+        let mut rng = DetRng::new(0xE2_0000 ^ s);
+        let mut locals = Vec::new();
+        mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals);
+        if !prettyplease::unparse(&file).contains(marker) {
+            continue;
+        }
+        let mut applied = vec![mutator.name().to_string()];
+        for follow_up in follow_ups {
+            follow_up.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+            applied.push(follow_up.name().to_string());
+        }
+        let fn_source = prettyplease::unparse(&file);
+        let mut cand = handwritten_candidate(id, "ep2_template", &fn_name, "", &fn_source);
+        cand.applied_mutators = applied;
+        return cand;
+    }
+    panic!(
+        "{} never emitted `{marker}` in {mode:?} mode",
+        mutator.name()
+    );
+}
+
+#[test]
+fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
+    let dir = unique_temp_dir("ep2_templates");
+    let root = repo_root();
+
+    // One candidate per Episode 2 template. The `Pass` and `PerturbAst`
+    // templates return normally under Miri and the `Ub` templates fault.
+    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 13] = [
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<u32, NonZeroU32>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "transmute::<u32, Option<NonZeroU32>>(__niche_zero)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "__niche_ob: Option<bool>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "&raw mut __meters.0",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<[u32; 2], SingleC>([0u32,",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "__overlay: OverlayU32",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Pass,
+            "__proj_single_ref: &mut SingleC",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::PerturbAst,
+            "&raw mut __proj_overlay.bytes",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Pass,
+            "__proj_slot: Uninit<[u32; 2]>",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "&raw mut (*__rr_p).b",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "&raw const (*__rr_shr).a",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::PerturbAst,
+            "&raw mut *__rr_mut",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::PerturbAst,
+            "&raw mut (*__rr_fm).b",
+        ),
+    ];
+    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 10] = [
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<u32, NonZeroU32>(__nz_zero)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<[u32; 2], SingleC>(__bad_single_raw)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "__part_slot: Uninit<[u8; 4]>",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "&raw const __dead_pair.b",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "__dead_inner as *const u32",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "__proj_half: Uninit<[u32; 2]>",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw mut *__rr_y",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw const *__rr_frozen",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw mut (*__rr_m2).b",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw const (*__rr_s).a",
+        ),
+    ];
+    let mut candidates = Vec::new();
+    for (mutator, mode, marker) in pass_cases.into_iter().chain(ub_cases) {
+        let id = candidates.len();
+        candidates.push(template_candidate(id, mutator, mode, marker, &[]));
+    }
+    // Templates followed by two `Pass` runs of the perturbing mutators
+    // (statement reordering, field/index swaps, transmute-literal and operator
+    // rewrites), each of which also appends its own `Pass` template. Like
+    // `generate_miri_corpus_batch`, which applies at most three mutator passes,
+    // this keeps each candidate within `MIRI_DIFFTEST_CANDIDATE_FUEL` steps.
+    let tb: &dyn MiriAstMutator = &TreeBorrowsRetagInterleaver;
+    let pp: &dyn MiriAstMutator = &PlaceProjectionWrapper;
+    let bv: &dyn MiriAstMutator = &BitValidityTransmuteMutator;
+    let arith: &dyn MiriAstMutator = &ArithmeticCastMutator;
+    type PerturbedCase<'a> = (
+        &'a dyn MiriAstMutator,
+        MutationMode,
+        &'a str,
+        [&'a dyn MiriAstMutator; 2],
+    );
+    let perturbed_cases: [PerturbedCase<'_>; 6] = [
+        (bv, MutationMode::Pass, "__single: SingleC", [tb, pp]),
+        (
+            bv,
+            MutationMode::Ub,
+            "__part_slot: Uninit<[u8; 4]>",
+            [pp, arith],
+        ),
+        (
+            pp,
+            MutationMode::PerturbAst,
+            "__proj_single_ref: &mut SingleC",
+            [bv, tb],
+        ),
+        (
+            pp,
+            MutationMode::Ub,
+            "&raw const __dead_pair.b",
+            [arith, bv],
+        ),
+        (tb, MutationMode::Pass, "&raw mut (*__rr_p).b", [pp, arith]),
+        (tb, MutationMode::Ub, "&raw mut *__rr_y", [tb, bv]),
+    ];
+    for (mutator, mode, marker, follow_ups) in perturbed_cases {
+        let id = candidates.len();
+        candidates.push(template_candidate(id, mutator, mode, marker, &follow_ups));
+    }
+    let template_count = candidates.len();
+
+    // Negative controls: constructs that the templates avoid because Anneal's
+    // frozen `trusted/` semantics diverge from Miri on them. Each must stay a
+    // kernel-confirmed divergence; once `trusted/` fixes one, this test fails
+    // so that the matching template restriction can be lifted.
+    let negative_controls: [(&str, &str, &str); 6] = [
+        (
+            "false_positive_ub",
+            "neg_ctrl_option_nonzero_some_transmute",
+            "-> u32 {
+    let o: Option<NonZeroU32> = unsafe { transmute::<u32, Option<NonZeroU32>>(0x41u32) };
+    match o {
+        Some(_) => 1u32,
+        None => 2u32,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_option_bool_none_transmute",
+            "-> u32 {
+    let o: Option<bool> = unsafe { transmute::<u8, Option<bool>>(2u8) };
+    match o {
+        Some(_) => 1u32,
+        None => 2u32,
+    }
+}",
+        ),
+        (
+            "missed_ub",
+            "neg_ctrl_nonzero_ptr_write_zero",
+            "-> u32 {
+    let mut n: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(5u32) };
+    let p: *mut u32 = (&raw mut n) as *mut u32;
+    unsafe {
+        *p = 0u32;
+    }
+    unsafe { transmute::<NonZeroU32, u32>(n) }
+}",
+        ),
+        (
+            "ub_location_mismatch",
+            "neg_ctrl_single_c_ptr_write_bad_tag",
+            "-> u32 {
+    let mut s: SingleC = SingleC::Only(4u32);
+    let p: *mut u32 = (&raw mut s) as *mut u32;
+    unsafe {
+        *p = 2u32;
+    }
+    let t: SingleC = s;
+    match t {
+        SingleC::Only(v) => v,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_single_c_ptr_write_payload",
+            "-> u32 {
+    let mut s: SingleC = SingleC::Only(4u32);
+    let p: *mut [u32; 2] = (&raw mut s) as *mut [u32; 2];
+    unsafe {
+        (*p)[1] = 6u32;
+    }
+    let t: SingleC = s;
+    match t {
+        SingleC::Only(v) => v,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_raw_field_ptr_then_sibling_write",
+            "-> u32 {
+    let mut pair: PairU32 = PairU32 { a: 1u32, b: 2u32 };
+    let m: &mut PairU32 = &mut pair;
+    let rb: *mut u32 = &raw mut (*m).b;
+    let m2: &mut PairU32 = &mut *m;
+    m2.b = 7u32;
+    unsafe {
+        *rb = 9u32;
+    }
+    pair.b
+}",
+        ),
+    ];
+    for (_, name, body) in negative_controls {
+        let id = candidates.len();
+        let fn_name = format!("{name}__b0_c{id}");
+        let fn_source = format!("pub fn {fn_name}() {body}\n");
+        candidates.push(handwritten_candidate(
+            id,
+            "ep2_negative_control",
+            &fn_name,
+            "BitValidityTransmuteMutator",
+            &fn_source,
+        ));
+    }
+    let total = candidates.len();
+
+    let findings_dir = dir.join("findings_ep2");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0xE2_0001,
+        &[candidates],
+        total,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate Episode 2 template batch");
+
+    assert_eq!(report.total_candidates, total);
+    assert_eq!(report.compiled_candidates, total, "{report:#?}");
+    assert_eq!(report.compared_candidates, total, "{report:#?}");
+    assert_eq!(
+        report.not_compared_count, 0,
+        "{:?}",
+        report.not_compared_reasons
+    );
+    assert!(
+        report.unmodeled_external_calls.is_empty(),
+        "{:?}",
+        report.unmodeled_external_calls
+    );
+    for outcome in ["external_call", "unsupported", "out_of_fuel", "error"] {
+        assert_eq!(
+            report.anneal_outcomes.get(outcome).copied().unwrap_or(0),
+            0,
+            "unexpected Anneal `{outcome}` outcomes: {:?}",
+            report.anneal_outcomes
+        );
+    }
+    assert_eq!(report.agree_count, template_count, "{:#?}", report.findings);
+    assert_eq!(report.diverge_count, negative_controls.len());
+    assert_eq!(report.kernel_confirmed_divergences, negative_controls.len());
+    // The 13 + 3 `Pass`/`PerturbAst` template candidates and four negative
+    // controls return normally in Miri. The 10 `Ub` templates and two negative
+    // controls fault, as do the perturbed `Ub` templates, except that an index
+    // swap may redirect the uninitialized byte read of `__part_slot` to the
+    // written byte.
+    let miri_pass = report.miri_verdicts.get("pass").copied().unwrap_or(0);
+    let miri_ub = report.miri_verdicts.get("ub").copied().unwrap_or(0);
+    assert!(miri_pass >= 13 + 3 + 4, "{:?}", report.miri_verdicts);
+    assert!(miri_ub >= 10 + 2 + 2, "{:?}", report.miri_verdicts);
+    assert_eq!(miri_pass + miri_ub, total, "{:?}", report.miri_verdicts);
+
+    let mut expected_classes = std::collections::BTreeMap::new();
+    for (class, name, _) in negative_controls {
+        *expected_classes.entry(class.to_string()).or_insert(0usize) += 1;
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name.starts_with(name))
+            .unwrap_or_else(|| panic!("no finding for negative control `{name}`"));
+        assert_eq!(finding.divergence_class, class, "{finding:#?}");
+        assert!(finding.kernel_confirmed, "{finding:#?}");
+        assert!(
+            finding.kernel_confirm_theorems.contains(":= by\n  rfl"),
+            "{}",
+            finding.kernel_confirm_theorems
+        );
+    }
+    let observed_classes: std::collections::BTreeMap<String, usize> = report
+        .divergence_classes
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(class, count)| (class.clone(), *count))
+        .collect();
+    assert_eq!(observed_classes, expected_classes);
 }
