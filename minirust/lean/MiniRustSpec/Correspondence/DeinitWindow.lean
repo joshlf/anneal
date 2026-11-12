@@ -34,8 +34,9 @@ and every theorem stated over `inFragment` keep their meaning. Instead:
   opens a hole only when none is open, on a `TupleSpec` local `_t` that is not moved out, at a
   scalar field of positive size (`deinitTargetOk`); that while the hole is open the only
   statements are disjoint sibling reads `_r = copy _t.g` (`siblingReadOk`) and the
-  re-initialization `_t.f = const` of the hole's byte range by an integer constant of the field's
-  type (`reinitOk`); and that the hole is closed before the block's terminator;
+  re-initialization of the hole's byte range either by an integer constant of the field's type
+  (`reinitOk`: `_t.f = const c`) or by copying a distinct integer local of the field's type
+  (`reinitCopyOk`: `_t.f = copy _r`); and that the hole is closed before the block's terminator;
 * `inFragmentD body := inFragment (eraseDeinit body) && deinitWindowOk body`.
 
 The relation `StateRelD` is `StateRelN` of the erased body, or, while the hole `_t.ps` is open,
@@ -48,19 +49,28 @@ correspondence `StepRelD`:
   erased body and the *actual* translation `translateFn body`, which agree on the current
   statement and terminator (`blk_eraseDeinit`, `stepMirFn_eraseDeinit_stmt`,
   `stepMirFn_eraseDeinit_term`);
-* sibling read (`step_window_read`) and re-initialization (`step_window_reinit`) while the hole is
-  open: the MiniRust step is computed on the hole-free and on the actual machine by the
-  allocation-data-parametric `evalStatement_siblingRead_any` and `evalStatement_reinit_any`. The
-  read loads the same bytes (`spliceAt_drop_take_disjoint`) into `_r`'s allocation, which is not
-  `_t`'s, and keeps the hole; the re-initialization overwrites the hole (`spliceAt_same`), so both
-  machines agree and the hole closes.
+* sibling read (`step_window_read`) and constant or local-copy re-initialization
+  (`step_window_reinit`, `step_window_reinit_copy`) while the hole is open: the MiniRust step is
+  computed on the hole-free and on the actual machine by the allocation-data-parametric
+  `evalStatement_siblingRead_any`, `evalStatement_reinit_any`, and `evalStatement_reinitCopy_any`.
+  The read loads the same bytes (`spliceAt_drop_take_disjoint`) into `_r`'s allocation, which is
+  not `_t`'s, and keeps the hole; the re-initialization overwrites the hole (`spliceAt_same`), so
+  both machines agree and the hole closes.
 
 Every `inFragment` body is an `inFragmentD` body (`inFragment_implies_inFragmentD`: it is its own
 erasure and never opens a hole), so `step_correspondence_D` also covers the old fragment.
-`reaches_rel_D`, `run_ret_D`, `step_start_D`, `run_ret_from_start_D`, and `mirCall_ret_D` lift the
-correspondence to whole executions, exactly as `Run.lean` does for `inFragment`;
-`Witness.deinitSiblingReinit_minirust_ret_from_start` instantiates `mirCall_ret_D` on a concrete
-body (`Deinit(_1.1)`, a sibling read of `_1.0`, `_1.1 = const 42`, and a read of `_1.1`).
+`reaches_rel_D`, `run_ret_D`, `step_start_D`, `run_ret_from_start_D`, `mirCall_ret_D`, and the full
+whole-execution lift suite (`run_ub_rel_D`, `run_ub_D`, `run_ub_rel_from_start_D`,
+`run_ub_from_start_D`, `steps_error_D`, `steps_error_from_start_D`, `mirNoUB_safe_D`,
+`mirNoUB_safe_from_start_D`, `steps_outcome_D`, `steps_outcome_from_start_D`, `mirNoUB_progress_D`,
+`mirNoUB_progress_from_start_D`, `mirNoUB_diverges_steps_ok_D`, `mirNoUB_diverges_from_start_D`,
+`mirNoUB_diverges_rel_from_start_D`, `mirCall_ub_D`, `mirCall_ub_rel_D`, `mirCall_noUB_D`,
+`mirCall_steps_error_D`, `mirCall_outcome_D`, `mirCall_progress_D`, `mirCall_diverges_steps_ok_D`,
+`mirCall_diverges_rel_D`) lift the correspondence to whole executions, exactly as `Run.lean` does
+for `inFragment`; `Witness.deinitSiblingReinit_minirust_ret_from_start`,
+`Witness.deinitSiblingReinit_minirust_noUB`, `Witness.deinitSiblingCopyReinit_minirust_ret_from_start`,
+and `Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate `mirCall_ret_D`,
+`mirCall_noUB_D`, and `mirCall_ub_D` on concrete bodies.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -227,10 +237,26 @@ def reinitOk (body : CapturedMir) (t : Nat) (projs : List ProjectionElem) (c : C
         | _, _ => false
       | _ => false
 
+/-- A re-initialization `_t.projs = copy _r` from a distinct integer local `_r`: `r ≠ t`, `_r` is
+an integer local of type `it`, and `projs` resolves in `_t`'s `TupleSpec` to a scalar leaf of the
+same integer type `it` with positive size. -/
+def reinitCopyOk (body : CapturedMir) (t r : Nat) (projs : List ProjectionElem) : Bool :=
+  decide (r ≠ t) &&
+  match body.localDecls[r]?, body.localDecls[t]? with
+  | some dr, some d =>
+    match intTypeOf dr.ty, tupleTypeOf body.layouts d.ty with
+    | some it, some (fields, size, align) =>
+      match resolveFieldPath body.layouts (.tuple fields size align) projs with
+      | some (_, .scalar it') => decide (it' = it) && decide (0 < it.size.bytes)
+      | _ => false
+    | _, _ => false
+  | _, _ => false
+
 /-- The statements admitted before statement `idx` of block `blk` when the hole state is
 `hole`: with no hole, any statement (a projected `Deinit` must target an admissible,
 not-moved-out `TupleSpec` local); with a hole on `_t.projs`, only a disjoint sibling read
-`_r = copy _t.projs'` or the re-initialization `_t.projs = const`. -/
+`_r = copy _t.projs'`, a constant re-initialization `_t.projs = const c`, or a local-copy
+re-initialization `_t.projs = copy _r`. -/
 def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
     Option (Nat × List ProjectionElem) → MirAst.Statement → Bool
   | none, st =>
@@ -242,6 +268,9 @@ def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
   | some (t, ps), st =>
     match st.kind with
     | .assign ⟨r, []⟩ (.use (.copy ⟨t', ps'⟩)) => decide (t' = t) && siblingReadOk body t r ps ps'
+    | .assign ⟨t', rp :: rps⟩ (.use (.copy ⟨r, []⟩)) =>
+      decide (t' = t) && reinitCopyOk body t r (rp :: rps) &&
+        decide (holeRange body t (rp :: rps) = holeRange body t ps)
     | .assign ⟨t', ps'⟩ (.use (.constant c)) =>
       decide (t' = t) && reinitOk body t ps' c &&
         decide (holeRange body t ps' = holeRange body t ps)
@@ -1313,6 +1342,280 @@ theorem step_window_read {body : CapturedMir} {f : Gen.Function}
       | _ => simp [resolveFieldPath] at hres'
   | _ => simp [TupleSpec.valOk] at hleafOk
 
+/-- What `reinitCopyOk` gives: `r ≠ t`, `_r`'s integer type `it`, and the resolution of `ps'` in
+`_t`'s `TupleSpec` to a scalar leaf of the same integer type `it` with positive size. -/
+theorem reinitCopyOk_spec {body : CapturedMir} {t r : Nat} {ps' : List ProjectionElem}
+    (h : reinitCopyOk body t r ps' = true) :
+    r ≠ t ∧ ∃ (dr d : LocalDecl) (fields : List (Nat × TupleSpec)) (size align off' : Nat)
+      (it : Gen.IntType),
+      body.localDecls[r]? = some dr ∧ body.localDecls[t]? = some d ∧ intTypeOf dr.ty = some it ∧
+      tupleTypeOf body.layouts d.ty = some (fields, size, align) ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps' = some (off', .scalar it) ∧
+      0 < it.size.bytes := by
+  unfold reinitCopyOk at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨hrt, h⟩ := h
+  refine ⟨hrt, ?_⟩
+  cases hdr : body.localDecls[r]? with
+  | none => simp [hdr] at h
+  | some dr =>
+    cases hd : body.localDecls[t]? with
+    | none => simp [hdr, hd] at h
+    | some d =>
+      cases hit : intTypeOf dr.ty with
+      | none => simp [hdr, hd, hit] at h
+      | some it =>
+        cases ht : tupleTypeOf body.layouts d.ty with
+        | none => simp [hdr, hd, hit, ht] at h
+        | some trip =>
+          obtain ⟨fields, size, align⟩ := trip
+          cases hres' : resolveFieldPath body.layouts (.tuple fields size align) ps' with
+          | none => simp [hdr, hd, hit, ht, hres'] at h
+          | some pr' =>
+            obtain ⟨off', leaf'⟩ := pr'
+            cases leaf' with
+            | tuple _ _ _ => simp [hdr, hd, hit, ht, hres'] at h
+            | scalar it' =>
+              simp only [hdr, hd, hit, ht, hres', Bool.and_eq_true, decide_eq_true_eq] at h
+              obtain ⟨rfl, hpos⟩ := h
+              exact ⟨dr, d, fields, size, align, off', it', rfl, rfl, hit, ht, hres', hpos⟩
+
+/-- **Re-initialization `_t.projs = copy _r` of a scalar field from a distinct integer local `_r`,
+on any allocation bytes `D` of `_t`.** -/
+theorem evalStatement_reinitCopy_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
+    {lm : Map Gen.LocalName Ptr} {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
+    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
+    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
+    {D : List Byte} (hD : D.length = size)
+    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
+    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
+    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
+    {off : Nat} {it : Gen.IntType}
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, .scalar it))
+    {r : Nat} {dr : LocalDecl} (hdr : body.localDecls[r]? = some dr)
+    (hit : intTypeOf dr.ty = some it) :
+    (mapGet lm (localName r) = none →
+      evalStatement m (.Assign pe (.Load (.Local (localName r)))) =
+        .error (.ub "access to a dead local")) ∧
+    (∀ (pr : Ptr) (kr : Nat), mapGet lm (localName r) = some pr →
+      pr.provenance = some (⟨(kr : Int)⟩, ()) →
+      A[kr]? = some (stackAlloc pr.addr it (List.replicate it.size.bytes .Uninit)) →
+      ∃ msg, evalStatement m (.Assign pe (.Load (.Local (localName r)))) = .error (.ub msg)) ∧
+    (∀ (pr : Ptr) (kr : Nat) (bits : Nat), mapGet lm (localName r) = some pr →
+      pr.provenance = some (⟨(kr : Int)⟩, ()) →
+      bits < 2 ^ (8 * it.size.bytes) →
+      A[kr]? = some (stackAlloc pr.addr it (scalarBytes it bits)) →
+      ∃ m', evalStatement m (.Assign pe (.Load (.Local (localName r)))) = .ok m' ∧
+        Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt]
+          (A.set k (stackAlloc p.addr (itOf d body.layouts) (spliceAt D off (scalarBytes it bits))))) := by
+  obtain ⟨hTr, _⟩ := tyOf_int (layouts := body.layouts) hit
+  have hlocr := (hfl.2 r dr hdr).2
+  rw [hTr] at hlocr
+  have hpeEval := evalPlace_field_any h hfl hd ht hrootWf hp hpk haddr0 haddrMax hD hA hpe hres
+  obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
+  have hgood : GoodSize it.size.bytes := by
+    simp only [TupleSpec.wf] at hleafWf
+    exact (goodAlignBytes_iff it.size.bytes).mp hleafWf
+  simp only [TupleSpec.toMiniRustTy] at hpeEval
+  refine ⟨fun hnone => ?_, fun pr kr hpr hprk hAr => ?_, fun pr kr bits hpr hprk hbits hAr => ?_⟩
+  · simp [evalStatement, hpeEval, evalValue, evalPlace_local_none h r _ hlocr hnone]
+  · have hplacer := evalPlace_local_some h r _ hlocr pr hpr
+    obtain ⟨msg, hmsg⟩ := typedLoad_ptr_frag_uninit h pr kr hprk (FragTy.int it hgood) hAr
+    exact ⟨msg, by simp [evalStatement, hpeEval, evalValue, hplacer, placeLoad, hmsg]⟩
+  · have hplacer := evalPlace_local_some h r _ hlocr pr hpr
+    obtain ⟨m1, hm1, h1⟩ := typedLoad_ptr_frag h pr kr hprk (FragTy.int it hgood) bits hbits hAr
+    have hv : (TupleSpec.scalar it).valOk (.scalar ⟨bits, it.size.bytes⟩) = true := by
+      simp [TupleSpec.valOk, hbits]
+    have hst := typedStore_ptr_tuple_slice h1 p k hpk (itOf d body.layouts) D hA off (.scalar it)
+      (.scalar ⟨bits, it.size.bytes⟩) hleafWf hv (by simp [TupleSpec.size] at hrelBound ⊢; omega)
+    simp only [TupleSpec.toMiniRustVal, TupleSpec.toMiniRustTy, TupleSpec.encodeVal, valBytes,
+      TupleSpec.size] at hst
+    simp only [valOf] at hm1
+    refine ⟨withMem m1 (A.set k (stackAlloc p.addr (itOf d body.layouts)
+      (spliceAt D off (scalarBytes it bits))))
+      ⟨.Store, .None, (offsetPtr p off).addr, ⟨it.size.bytes⟩⟩, ?_, withMem_shape h1 _⟩
+    simp [evalStatement, hpeEval, evalValue, hplacer, placeLoad, hm1, placeStore, hst]
+
+/-- A `StepRelN` whose MiniRust side errors with UB gives a `StepRelD` for any MiniRust result
+that also errors with UB. -/
+theorem StepRelN.toStepRelD_ub {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {a : MirStepNode} {msg0 msg : String}
+    (h : StepRelN (eraseDeinit body) f ctx s a (.error (.ub msg0))) :
+    StepRelD body f ctx s a (.error (.ub msg)) := by
+  unfold StepRelN at h
+  unfold StepRelD
+  split at h
+  · obtain ⟨_, hr, _⟩ := h; cases hr
+  · obtain ⟨_, _, _, hr, _⟩ := h; cases hr
+  · obtain ⟨_, hr, _⟩ := h; cases hr
+  · exact ⟨msg, rfl⟩
+  · exact h.elim
+
+/-- **Local-copy re-initialization step.** While `_t.ps` is a hole, `_t.ps' = copy _r` (where
+`r ≠ t` is an integer local of the leaf's type and `ps'` has the hole's byte range) either faults
+on `_r` in both machines or stores `_r`'s bytes over the hole in both machines, closing the hole
+and restoring `StateRelN`. -/
+theorem step_window_reinit_copy {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m m0 : Mach} {t : Nat} {ps : List ProjectionElem}
+    (_hhole : holeAt body s.frame.blockIdx s.frame.stmtIdx = some (t, ps))
+    (hN0 : StateRelN (eraseDeinit body) f ctx s m0)
+    (hHR : HoleRel body f ctx s.frame.blockIdx s.frame.stmtIdx t ps m0 m)
+    {bb : BasicBlockData} {r : Nat} {ps' : List ProjectionElem} {span : String}
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some ⟨.assign ⟨t, ps'⟩ (.use (.copy ⟨r, []⟩)), span⟩)
+    (hrc : reinitCopyOk body t r ps' = true)
+    (hrange : holeRange body t ps' = holeRange body t ps) :
+    StepRelD body f ctx s (stepMirFn body s) (Interp.step m) := by
+  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
+  obtain ⟨hrt, dr, d, fields, size, align, off', it, hdr, hd, hit, ht, hres', _⟩ :=
+    reinitCopyOk_spec hrc
+  obtain ⟨view, lm, p, k, rootVal, off, sz, hthr0, hlo0, _, hp, hpk, haddr0, haddrMax, hrootWf,
+    _, hD0, hA0, hrng, hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
+  have hr' : holeRange body t ps' = some (off', it.size.bytes) := by
+    simp [holeRange, hd, ht, hres', TupleSpec.size]
+  rw [hr', hrng] at hrange
+  simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+  obtain ⟨hoff, hsz⟩ := hrange
+  subst off'
+  subst sz
+  obtain ⟨_, hrelBound⟩ := resolveFieldPath_wf hrootWf hres'
+  have hoffb : off + it.size.bytes ≤ size := by simpa [TupleSpec.size] using hrelBound
+  obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+  obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+  obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+  cases ps' with
+  | nil => simp [resolveFieldPath] at hres'
+  | cons pe0 rest =>
+    cases pe0 with
+    | field idx fTy =>
+      obtain ⟨pe, hpe, rfl⟩ : ∃ pe, translateFieldPlace (.Local (localName t))
+          (.field idx fTy :: rest) = some pe ∧
+          st' = .Assign pe (.Load (.Local (localName r))) := by
+        simp only [translateStatement, translatePlace] at hst'
+        cases hp' : translateFieldPlace (.Local (localName t)) (.field idx fTy :: rest) with
+        | none => simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace] at hst'
+        | some pe =>
+          refine ⟨pe, rfl, ?_⟩
+          simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace] at hst'
+          exact hst'.symm
+      have hshape0 : Shape m0 (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+          [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+            calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+              s.frame.blockIdx s.frame.stmtIdx] m0.mem.memory.allocations :=
+        ⟨hthr0, hrel0.active, rfl⟩
+      have hshapeH : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+          [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+            calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+              s.frame.blockIdx s.frame.stmtIdx] m.mem.memory.allocations :=
+        ⟨hthrE.trans hthr0, hactE.trans hrel0.active, rfl⟩
+      have hk_lt : k < m0.mem.memory.allocations.length := (List.getElem?_eq_some_iff.mp hA0).1
+      have hDh : (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+          (List.replicate it.size.bytes .Uninit)).length = size := by
+        rw [spliceAt_length _ _ _ (by rw [List.length_replicate, hD0]; omega), hD0]
+      have hAh : m.mem.memory.allocations[k]? = some (stackAlloc p.addr (itOf d body.layouts)
+          (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+            (List.replicate it.size.bytes .Uninit))) := by
+        rw [hallocE]; simp [hk_lt]
+      have hfl := FnLocalsSpec.of_translateFn hf
+      obtain ⟨hdead0, huninit0, hlive0⟩ := evalStatement_reinitCopy_any (resetPick_shape hshape0)
+        hfl hd ht hrootWf hp hpk haddr0 haddrMax hD0 hA0 hpe hres' hdr hit
+      obtain ⟨hdeadH, huninitH, hliveH⟩ := evalStatement_reinitCopy_any (resetPick_shape hshapeH)
+        hfl hd ht hrootWf hp hpk haddr0 haddrMax hDh hAh hpe hres' hdr hit
+      have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+        have := (List.getElem?_eq_some_iff.mp hst).1
+        rw [hlen]; omega
+      have hnd : ∀ st, bb.statements[s.frame.stmtIdx]? = some st → isProjDeinit st = false := by
+        intro st hst2; rw [hst] at hst2; cases hst2; rfl
+      have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
+        (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+      rw [stepMirFn_eraseDeinit_stmt (body := body) hrel0.activeCallee hphase hbb hst rfl]
+      cases hpr : mapGet lm (localName r) with
+      | none =>
+        have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
+          rw [step_callee hshape0 tb hgetb]
+          simp [hne, listIndex_nat _ _ _ htst, hdead0 hpr]
+        have hsH : Interp.step m = .error (.ub "access to a dead local") := by
+          rw [step_callee hshapeH tb hgetb]
+          simp [hne, listIndex_nat _ _ _ htst, hdeadH hpr]
+        rw [hs0] at hNF
+        rw [hsH]
+        exact hNF.toStepRelD
+      | some pr =>
+        have hr_lt : r < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdr).1
+        obtain ⟨slotr, hsVr⟩ : ∃ slot, view[r]? = some slot :=
+          ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact hr_lt)⟩
+        have hscr : scalarTypeOf dr.ty = some (.Int it) := scalarTypeOf_int hit
+        obtain ⟨kr, hprk, _, _, _, _, hAr⟩ := hlo0.storage_nonptr r dr slotr pr hdr hsVr hpr
+          (isPtrTy_false_of_scalarTypeOf hscr)
+        simp only [eraseDeinit_layouts] at hAr
+        obtain ⟨hTr, hIr⟩ := tyOf_int (layouts := body.layouts) hit
+        rw [hIr] at hAr
+        have hkr : kr ≠ k := by
+          intro hkk; subst hkk
+          exact hrt (hlo0.inj r t pr p hpr hp (by rw [hprk, hpk]))
+        have hArH : m.mem.memory.allocations[kr]? =
+            some (stackAlloc pr.addr it (declSlotData dr slotr body.layouts)) := by
+          rw [hallocE, List.getElem?_set_ne (Ne.symm hkr)]; exact hAr
+        have hslotr := (DeclSlotOk_of_scalarTypeOf hscr slotr).mp (hlo0.slots r dr slotr hdr hsVr)
+        simp only [eraseDeinit_layouts] at hslotr
+        rw [hTr] at hslotr
+        obtain ⟨hleafWf, _⟩ := resolveFieldPath_wf hrootWf hres'
+        have hgood : GoodSize it.size.bytes := by
+          simp only [TupleSpec.wf] at hleafWf
+          exact (goodAlignBytes_iff it.size.bytes).mp hleafWf
+        have hfragd : FragTy (tyOf dr body.layouts) (itOf dr body.layouts) :=
+          fragTy_of_scalarTypeOf hscr (FragTy.int it hgood)
+        rw [hfragd.declSlotData, hIr] at hAr hArH
+        match slotr, hslotr, hAr, hArH with
+        | .dead, _, hAr, hArH =>
+          obtain ⟨msg0, hev0⟩ := huninit0 pr kr hpr hprk hAr
+          obtain ⟨msgH, hevH⟩ := huninitH pr kr hpr hprk hArH
+          have hs0 : Interp.step m0 = .error (.ub msg0) := by
+            rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+          have hsH : Interp.step m = .error (.ub msgH) := by
+            rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+          rw [hs0] at hNF; rw [hsH]
+          exact hNF.toStepRelD_ub
+        | .uninit, _, hAr, hArH =>
+          obtain ⟨msg0, hev0⟩ := huninit0 pr kr hpr hprk hAr
+          obtain ⟨msgH, hevH⟩ := huninitH pr kr hpr hprk hArH
+          have hs0 : Interp.step m0 = .error (.ub msg0) := by
+            rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+          have hsH : Interp.step m = .error (.ub msgH) := by
+            rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+          rw [hs0] at hNF; rw [hsH]
+          exact hNF.toStepRelD_ub
+        | .init (.scalar sc), ⟨_, hbits⟩, hAr, hArH =>
+          obtain ⟨m3, hev0, h3⟩ := hlive0 pr kr sc.bits hpr hprk hbits hAr
+          obtain ⟨m3h, hevH, h3h⟩ := hliveH pr kr sc.bits hpr hprk hbits hArH
+          have hwlen : (scalarBytes it sc.bits).length = it.size.bytes := by
+            simp [scalarBytes, leBytes_length]
+          rw [spliceAt_same _ off _ _ (by rw [List.length_replicate, hD0]; omega)
+            (by rw [List.length_replicate, hwlen]), hallocE, List.set_set] at h3h
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3
+          obtain ⟨m4h, hm4h, h4h⟩ := bumpStmt_callee h3h
+          have hs0 : Interp.step m0 = .ok m4 := by
+            rw [step_callee hshape0 tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hev0, hm4, check_after h4]
+          have hsH : Interp.step m = .ok m4h := by
+            rw [step_callee hshapeH tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hevH, hm4h, check_after h4h]
+          rw [hs0] at hNF; rw [hsH]
+          exact StepRelN.toStepRelD_obs hNF (h4h.threads.trans h4.threads.symm)
+            (h4h.active.trans h4.active.symm) (h4h.allocs.trans h4.allocs.symm)
+        | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _, _ =>
+          nomatch htyT
+    | _ => simp [resolveFieldPath] at hres'
+
 /-! ## The correspondence theorem for `inFragmentD` -/
 
 /-- **Correspondence theorem for projected `Deinit` (one step, preserving `StateRelD`).**
@@ -1385,7 +1688,13 @@ theorem step_correspondence_D (body : CapturedMir) (f : Gen.Function)
             simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq] at hw
             obtain ⟨rfl, hsib⟩ := hw
             exact step_window_read hfrag hf hhole hN0 hHR hbb hst hsib
-          | cons _ _ => simp [windowStmtOk] at hw
+          | cons rp rps =>
+            cases ps' with
+            | nil =>
+              simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq] at hw
+              obtain ⟨⟨rfl, hrc⟩, hrange⟩ := hw
+              exact step_window_reinit_copy hfrag hf hhole hN0 hHR hbb hst hrc hrange
+            | cons _ _ => simp [windowStmtOk] at hw
         | constant c =>
           cases rproj with
           | nil =>
@@ -1733,5 +2042,655 @@ theorem mirCall_ret_D {body : CapturedMir} {f : Gen.Function} (hfrag : inFragmen
   run_ret_from_start_D hfrag hf ctx (initMachineState body args) mInit
     (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs) hret
     (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- No prefix step `j ≤ initLen body` of `step_start_D` can satisfy `ReturnRel`. -/
+theorem step_start_no_returnRel_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {mInit : Mach}
+    (hstart : StartRel body f ctx s mInit)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∀ j ≤ initLen body, ∀ mj, Interp.steps j mInit = .ok mj →
+      ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mj := by
+  have hkey : ∀ (b : CapturedMir), inFragment b = true → FnLocalsSpec b f →
+      (f.start = bbName b.basicBlocks.length ∧
+        mapGet f.blocks (bbName b.basicBlocks.length) = some (initBlock b)) →
+      StartRel b f ctx s mInit →
+      nonScalarSlotsInit b s.frame.locals = true →
+      ∀ k, k ≤ (alwaysStorageLiveLocals b).length → ∃ m lm,
+      Interp.steps k mInit = .ok m ∧
+      Shape m ctx [ctx.caller, calleeFrameL f ctx lm b.basicBlocks.length k]
+        m.mem.memory.allocations ∧
+      LocalsOkA b ctx ((alwaysStorageLiveLocals b).take k) s.frame.locals lm
+        m.mem.memory.allocations ∧
+      NonScalarLive b s.frame.locals lm ∧
+      (∀ j, j < b.argCount + 1 → mapGet lm (localName j) = some (localPtr ctx j)) := by
+    intro b hfrag hfl hst0 hstartB hnsB
+    obtain ⟨_, hargs, hn31, _, hdeclsOk, htemps, _, _, _, _⟩ := inFragment_spec b hfrag
+    obtain ⟨hfstart, hinit⟩ := hst0
+    have hAnd := alwaysStorageLiveLocals_nodup b
+    have hlenS : (initBlock b).statements.length = (alwaysStorageLiveLocals b).length := by
+      simp [initBlock]
+    intro k
+    induction k with
+    | zero =>
+      intro _
+      refine ⟨mInit, localsMap ctx (b.argCount + 1), rfl, ⟨?_, hstartB.active, rfl⟩,
+        by simpa using hstartB.localsOk hargs (inFragment_params_not_ptr b hfrag),
+        hstartB.nonScalarLive hfrag hnsB, fun j hj => mapGet_localsMap ctx _ j hj⟩
+      rw [hstartB.threads]
+      simp [calleeFrame, calleeFrameL, hfstart]
+    | succ k ih =>
+      intro hk
+      obtain ⟨m, lm, hm, hsh, hlo, hnsL, hlmP⟩ := ih (by omega)
+      have hkA : k < (alwaysStorageLiveLocals b).length := by omega
+      obtain ⟨hlo1, hlo2⟩ := alwaysStorageLiveLocals_spec
+        (List.getElem_mem (l := alwaysStorageLiveLocals b) hkA)
+      have hnot : (alwaysStorageLiveLocals b)[k] ∉ (alwaysStorageLiveLocals b).take k := by
+        intro hmem
+        obtain ⟨j, hj, hjk⟩ := List.getElem_of_mem hmem
+        rw [List.getElem_take] at hjk
+        have := hAnd.getElem_inj.mp hjk
+        simp at hj
+        omega
+      have hst : (initBlock b).statements[k]? =
+          some (.StorageLive (localName (alwaysStorageLiveLocals b)[k])) := by
+        simp [initBlock, List.getElem?_map, List.getElem?_eq_getElem hkA]
+      have htake : (alwaysStorageLiveLocals b).take (k + 1) =
+          (alwaysStorageLiveLocals b).take k ++ [(alwaysStorageLiveLocals b)[k]] := by
+        rw [List.take_add_one, List.getElem?_eq_getElem hkA, Option.toList_some]
+      generalize (alwaysStorageLiveLocals b)[k] = a at hnot hlo1 hlo2 hst htake
+      obtain ⟨d, hd⟩ : ∃ d, b.localDecls[a]? = some d := ⟨_, List.getElem?_eq_getElem hlo2⟩
+      have hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true := by
+        have hdrop : (b.localDecls.drop (b.argCount + 1))[a - (b.argCount + 1)]? = some d := by
+          rw [List.getElem?_drop, Nat.add_sub_cancel' hlo1, hd]
+        exact htemps d (List.mem_of_getElem? hdrop)
+      have hsa : s.frame.locals[a]? = some .dead := hstartB.tempsDead a (by omega) hlo2
+      have hpa : mapGet lm (localName a) = none := by
+        cases hp : mapGet lm (localName a) with
+        | none => rfl
+        | some p =>
+          have := (hlo.live a .dead hsa).mp (by simp [hp])
+          simp [hnot] at this
+      obtain ⟨m3, lm3, hm3, hsh3, hlo3, hns3, hlm3⟩ :=
+        evalStatement_storageLive_init hfl
+        (resetPick_shape hsh) hlo hdeclsOk hnsL a d hd hscalar hsa hpa hstartB.baseLow hn31
+      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hsh3
+      have hne : ((k : Nat) : Int) ≠ ((initBlock b).statements.length : Int) := by
+        rw [hlenS]; omega
+      have hstep : Interp.step m = .ok m4 := by
+        rw [step_callee hsh (initBlock b) hinit]
+        simp [hne, listIndex_nat _ _ _ hst, hm3, hm4, check_after h4]
+      refine ⟨m4, lm3, ?_, ⟨h4.threads, h4.active, rfl⟩, ?_, hns3,
+        fun j hj => (hlm3 j (by omega)).trans (hlmP j hj)⟩
+      · rw [steps_add, hm, ok_bind, steps_one hstep]
+      · rw [htake, h4.allocs]
+        exact hlo3
+  have hfragE := (inFragmentD_spec hfragD).1
+  have hst0 : f.start = bbName (eraseDeinit body).basicBlocks.length ∧
+      mapGet f.blocks (bbName (eraseDeinit body).basicBlocks.length) =
+        some (initBlock (eraseDeinit body)) := by
+    rw [eraseDeinit_length, initBlock_eraseDeinit]
+    exact translateFn_start body f hf
+  intro j hj mj hmj b' c' s' v
+  rcases Nat.lt_or_eq_of_le hj with hjlt | rfl
+  · obtain ⟨mk, lmk, hmk, hshk, _⟩ :=
+      hkey (eraseDeinit body) hfragE (fnLocalsSpec_eraseDeinit hf) hst0
+        hstart.toEraseDeinit (by rw [nonScalarSlotsInit_eraseDeinit]; exact hns) j
+        (by rw [alwaysStorageLiveLocals_eraseDeinit]; rw [initLen] at hjlt; omega)
+    rw [hmk] at hmj
+    cases hmj
+    exact Shape.not_returnRel_of_ne_nil (callerFrames := [ctx.caller]) hshk (by simp)
+  · obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+    rw [hm0] at hmj
+    cases hmj
+    exact hrel0.not_returnRel
+
+/-- **Localized single-body UB (`StateRelD`).** -/
+theorem run_ub_rel_D {body : CapturedMir} {f : Gen.Function} (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelD body f ctx s m) {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree body s) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n m = .ok mLast ∧ StateRelD body f ctx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) m = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k m = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨t', i, k, htau, hobs, hfi⟩ := hfault
+  obtain ⟨n1, s1, m1, h1, hrel1, rfl, hno1⟩ :=
+    reaches_rel_no_returnRel_D hfragD hf ctx hreach s m rfl hrel
+  obtain ⟨n2, s2, m2, h2, hrel2, rfl, hno2⟩ :=
+    reaches_rel_no_returnRel_D hfragD hf ctx (tauStar_reaches htau) s1 m1 rfl hrel1
+  have hsr := step_correspondence_D body f hfragD hf ctx s2 m2 hrel2
+  rw [mirTree_observe] at hobs
+  generalize stepMirFn body s2 = node at hsr hobs
+  cases node with
+  | ret r => simp [ITreeF.map] at hobs
+  | tau x => simp [ITreeF.map] at hobs
+  | vis i0 k0 =>
+    simp only [ITreeF.map] at hobs
+    injection hobs with hi _
+    subst hi
+    cases i0 with
+    | inr b =>
+      cases b with
+      | inl _ => exact False.elim hfi
+      | inr _ => exact False.elim hfi
+    | inl a =>
+      cases a with
+      | fail fk =>
+        cases fk with
+        | unsupported => exact False.elim hsr
+        | outOfFuel => exact False.elim hsr
+        | ub =>
+          obtain ⟨msg, hmsg⟩ := hsr
+          have h12 : Interp.steps (n1 + n2) m = .ok m2 := by
+            rw [steps_add, h1, ok_bind, h2]
+          refine ⟨n1 + n2, s2, m2, msg, h12, hrel2, hmsg, ?_,
+            steps_add_no_returnRel h1 hno1 hno2⟩
+          rw [steps_add, h12, ok_bind, Interp.steps, hmsg]
+          rfl
+
+/-- **Localized single-body UB from `f.start` (`inFragmentD`).** -/
+theorem run_ub_rel_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree body s) tr u) (hfault : FaultNow u)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n mInit = .ok mLast ∧ StateRelD body f ctx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) mInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k mInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  have hno0 := step_start_no_returnRel_D hfragD hf hstart hns
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrelLast, hstep, hsteps1, hno⟩ :=
+    run_ub_rel_D hfragD hf ctx s m0 hrel0 hreach hfault
+  refine ⟨initLen body + n, sLast, mLast, msg, ?_, hrelLast, hstep, ?_,
+    steps_add_no_returnRel hm0 hno0 hno⟩
+  · rw [steps_add, hm0, ok_bind, hsteps]
+  · rw [Nat.add_assoc, steps_add, hm0, ok_bind, hsteps1]
+
+/-- **UB (`StateRelD`).** -/
+theorem run_ub_D {body : CapturedMir} {f : Gen.Function} (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelD body f ctx s m) {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree body s) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n m = .error (.ub msg) := by
+  obtain ⟨n, _, _, msg, _, _, _, hsteps1, _⟩ := run_ub_rel_D hfragD hf ctx s m hrel hreach hfault
+  exact ⟨n + 1, msg, hsteps1⟩
+
+/-- **UB from `f.start` (`inFragmentD`).** -/
+theorem run_ub_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree body s) tr u) (hfault : FaultNow u)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  obtain ⟨n, msg, hsteps⟩ := run_ub_D hfragD hf ctx s m0 hrel0 hreach hfault
+  exact ⟨initLen body + n, msg, by rw [steps_add, hm0, ok_bind, hsteps]⟩
+
+/-- **Errors (`StateRelD`).** Converse error soundness for `inFragmentD`. -/
+theorem steps_error_D {body : CapturedMir} {f : Gen.Function} (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (n : Nat) :
+    ∀ (s : MachineState) (m : Mach) (e : Stop), StateRelD body f ctx s m →
+      Interp.steps n m = .error e →
+      (∃ msg, e = .ub msg ∧ ∃ tr u, Reaches (mirTree body s) tr u ∧ FaultNow u) ∨
+      (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k m = .ok mRet ∧
+        ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) := by
+  induction n with
+  | zero => intro s m e _ h; simp [Interp.steps] at h
+  | succ n ih =>
+    intro s m e hrel h
+    have hsr := step_correspondence_D body f hfragD hf ctx s m hrel
+    have hobs := mirTree_observe body s
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | tau x =>
+      simp only [ITreeF.map] at hobs
+      cases x with
+      | running s1 =>
+        obtain ⟨m1, hm1, hrel1⟩ := hsr
+        simp only [Interp.steps, hm1, ok_bind] at h
+        rcases ih s1 m1 e hrel1 h with
+          ⟨msg, he, tr, u, hr, hfault⟩ | ⟨k, s', mRet, tr, v, mem, hklt, hksteps, hretRel, u, hr, hu⟩
+        · exact .inl ⟨msg, he, tr, u, .tau hobs hr, hfault⟩
+        · exact .inr ⟨k + 1, s', mRet, tr, v, mem, by omega,
+            by simp [Interp.steps, hm1, hksteps], hretRel, u, .tau hobs hr, hu⟩
+      | halted _ => exact False.elim hsr
+      | faulted _ => exact False.elim hsr
+    | ret r =>
+      simp only [ITreeF.map] at hobs
+      cases r with
+      | normal p =>
+        obtain ⟨mRet, hmRet, hretRel⟩ := hsr
+        cases n with
+        | zero => simp [Interp.steps, hmRet] at h
+        | succ n' =>
+          exact .inr ⟨1, s, mRet, [], p.1, p.2, by omega,
+            by simp [Interp.steps, hmRet], hretRel, mirTree body s, .refl _, hobs⟩
+      | panic => exact False.elim hsr
+      | abort => exact False.elim hsr
+    | vis i0 k0 =>
+      simp only [ITreeF.map] at hobs
+      cases i0 with
+      | inl a =>
+        cases a with
+        | fail fk =>
+          cases fk with
+          | unsupported => exact False.elim hsr
+          | outOfFuel => exact False.elim hsr
+          | ub =>
+            obtain ⟨msg, hmsg⟩ := hsr
+            simp [Interp.steps, hmsg] at h
+            exact .inl ⟨msg, h.symm, [], mirTree body s, .refl _,
+              ⟨mirTree body s, _, _, .refl _, hobs, trivial⟩⟩
+      | inr b =>
+        cases b with
+        | inr _ => exact False.elim hsr
+        | inl ob =>
+          obtain ⟨s1, m1, hk1, hm1, hrel1⟩ := hsr
+          simp only [Interp.steps, hm1, ok_bind] at h
+          have hnext : ITree.cofix (stepMirState body) (k0 PUnit.unit) = mirTree body s1 := by
+            rw [hk1]; rfl
+          rcases ih s1 m1 e hrel1 h with
+            ⟨msg, he, tr, u, hr, hfault⟩ | ⟨k, s', mRet, tr, v, mem, hklt, hksteps, hretRel, u, hr, hu⟩
+          · refine .inl ⟨msg, he, ⟨.inr (.inl ob), PUnit.unit⟩ :: tr, u,
+              .vis hobs (fun h => h) PUnit.unit ?_, hfault⟩
+            rw [hnext]; exact hr
+          · refine .inr ⟨k + 1, s', mRet, ⟨.inr (.inl ob), PUnit.unit⟩ :: tr, v, mem, by omega,
+              by simp [Interp.steps, hm1, hksteps], hretRel, u,
+              .vis hobs (fun h => h) PUnit.unit ?_, hu⟩
+            rw [hnext]; exact hr
+
+/-- **Errors from `f.start` (`inFragmentD`).** -/
+theorem steps_error_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (n : Nat) (s : MachineState) (mInit : Mach) (e : Stop)
+    (hstart : StartRel body f ctx s mInit) (h : Interp.steps n mInit = .error e)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    (∃ msg, e = .ub msg ∧ ∃ tr u, Reaches (mirTree body s) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  by_cases hn : n ≤ initLen body
+  · obtain ⟨mj, hmj⟩ := steps_ok_mono hn hm0
+    rw [hmj] at h
+    cases h
+  · obtain ⟨n', rfl⟩ : ∃ n', n = initLen body + n' := ⟨n - initLen body, by omega⟩
+    rw [steps_add, hm0, ok_bind] at h
+    rcases steps_error_D hfragD hf ctx n' s m0 e hrel0 h with
+      hUb | ⟨k, s', mRet, tr, v, mem, hklt, hksteps, hretRel, hret⟩
+    · exact .inl hUb
+    · exact .inr ⟨initLen body + k, s', mRet, tr, v, mem, by omega,
+        by rw [steps_add, hm0, ok_bind, hksteps], hretRel, hret⟩
+
+/-- **UB-freedom transfer (`StateRelD`).** -/
+theorem mirNoUB_safe_D {body : CapturedMir} {f : Gen.Function} (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelD body f ctx s m) (hsafe : MirNoUBTree (mirTree body s))
+    {n : Nat} {e : Stop} (herr : Interp.steps n m = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k m = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  rcases steps_error_D hfragD hf ctx n s m e hrel herr with ⟨_, _, tr, u, hr, hfault⟩ | hret
+  · exact False.elim (hsafe tr u hr hfault)
+  · exact hret
+
+/-- **UB-freedom transfer from `f.start` (`inFragmentD`).** -/
+theorem mirNoUB_safe_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit) (hsafe : MirNoUBTree (mirTree body s))
+    {n : Nat} {e : Stop} (herr : Interp.steps n mInit = .error e)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  rcases steps_error_from_start_D hfragD hf ctx n s mInit e hstart herr hns with
+    ⟨_, _, tr, u, hr, hfault⟩ | hret
+  · exact False.elim (hsafe tr u hr hfault)
+  · exact hret
+
+/-- **Total `n`-step outcome trichotomy (`StateRelD`).** -/
+theorem steps_outcome_D {body : CapturedMir} {f : Gen.Function} (hfragD : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (n : Nat) :
+    ∀ (s : MachineState) (m : Mach), StateRelD body f ctx s m →
+      (∃ s' m' tr, Interp.steps n m = .ok m' ∧ StateRelD body f ctx s' m' ∧
+        Reaches (mirTree body s) tr (mirTree body s')) ∨
+      (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k m = .ok mRet ∧
+        ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) ∨
+      (∃ msg, Interp.steps n m = .error (.ub msg) ∧
+        ∃ tr u, Reaches (mirTree body s) tr u ∧ FaultNow u) := by
+  induction n with
+  | zero =>
+    intro s m hrel
+    exact .inl ⟨s, m, [], rfl, hrel, .refl _⟩
+  | succ n ih =>
+    intro s m hrel
+    have hsr := step_correspondence_D body f hfragD hf ctx s m hrel
+    have hobs := mirTree_observe body s
+    generalize stepMirFn body s = node at hsr hobs
+    cases node with
+    | tau x =>
+      simp only [ITreeF.map] at hobs
+      cases x with
+      | running s1 =>
+        obtain ⟨m1, hm1, hrel1⟩ := hsr
+        rcases ih s1 m1 hrel1 with
+          ⟨s', m', tr, hsteps, hrel', hr⟩ |
+          ⟨k, s', mRet, tr, v, mem, hkle, hksteps, hretRel, u, hr, hu⟩ |
+          ⟨msg, herr, tr, u, hr, hfault⟩
+        · exact .inl ⟨s', m', tr, by simp [Interp.steps, hm1, hsteps], hrel', .tau hobs hr⟩
+        · exact .inr (.inl ⟨k + 1, s', mRet, tr, v, mem, by omega,
+            by simp [Interp.steps, hm1, hksteps], hretRel, u, .tau hobs hr, hu⟩)
+        · exact .inr (.inr ⟨msg, by simp [Interp.steps, hm1, herr], tr, u, .tau hobs hr, hfault⟩)
+      | halted _ => exact False.elim hsr
+      | faulted _ => exact False.elim hsr
+    | ret r =>
+      simp only [ITreeF.map] at hobs
+      cases r with
+      | normal p =>
+        obtain ⟨mRet, hmRet, hretRel⟩ := hsr
+        exact .inr (.inl ⟨1, s, mRet, [], p.1, p.2, by omega,
+          by simp [Interp.steps, hmRet], hretRel, mirTree body s, .refl _, hobs⟩)
+      | panic => exact False.elim hsr
+      | abort => exact False.elim hsr
+    | vis i0 k0 =>
+      simp only [ITreeF.map] at hobs
+      cases i0 with
+      | inl a =>
+        cases a with
+        | fail fk =>
+          cases fk with
+          | unsupported => exact False.elim hsr
+          | outOfFuel => exact False.elim hsr
+          | ub =>
+            obtain ⟨msg, hmsg⟩ := hsr
+            exact .inr (.inr ⟨msg, by simp [Interp.steps, hmsg], [], mirTree body s, .refl _,
+              ⟨mirTree body s, _, _, .refl _, hobs, trivial⟩⟩)
+      | inr b =>
+        cases b with
+        | inr _ => exact False.elim hsr
+        | inl ob =>
+          obtain ⟨s1, m1, hk1, hm1, hrel1⟩ := hsr
+          have hnext : ITree.cofix (stepMirState body) (k0 PUnit.unit) = mirTree body s1 := by
+            rw [hk1]; rfl
+          rcases ih s1 m1 hrel1 with
+            ⟨s', m', tr, hsteps, hrel', hr⟩ |
+            ⟨k, s', mRet, tr, v, mem, hkle, hksteps, hretRel, u, hr, hu⟩ |
+            ⟨msg, herr, tr, u, hr, hfault⟩
+          · refine .inl ⟨s', m', ⟨.inr (.inl ob), PUnit.unit⟩ :: tr,
+              by simp [Interp.steps, hm1, hsteps], hrel',
+              .vis hobs (fun h => h) PUnit.unit ?_⟩
+            rw [hnext]; exact hr
+          · refine .inr (.inl ⟨k + 1, s', mRet, ⟨.inr (.inl ob), PUnit.unit⟩ :: tr,
+              v, mem, by omega, by simp [Interp.steps, hm1, hksteps], hretRel, u,
+              .vis hobs (fun h => h) PUnit.unit ?_, hu⟩)
+            rw [hnext]; exact hr
+          · refine .inr (.inr ⟨msg, by simp [Interp.steps, hm1, herr],
+              ⟨.inr (.inl ob), PUnit.unit⟩ :: tr, u,
+              .vis hobs (fun h => h) PUnit.unit ?_, hfault⟩)
+            rw [hnext]; exact hr
+
+/-- **Total `(initLen body + n)`-step outcome trichotomy from `f.start` (`StateRelD`).** -/
+theorem steps_outcome_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (n : Nat) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    (∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirTree body s) tr (mirTree body s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen body + n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen body + n) mInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirTree body s) tr u ∧ FaultNow u) := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  rcases steps_outcome_D hfragD hf ctx n s m0 hrel0 with
+    ⟨s', m', tr, hsteps, hrel', hr⟩ |
+    ⟨k, s', mRet, tr, v, mem, hkle, hksteps, hretRel, hret⟩ |
+    ⟨msg, herr, hfault⟩
+  · exact .inl ⟨s', m', tr, by rw [steps_add, hm0, ok_bind, hsteps], hrel', hr⟩
+  · exact .inr (.inl ⟨initLen body + k, s', mRet, tr, v, mem, by omega,
+      by rw [steps_add, hm0, ok_bind, hksteps], hretRel, hret⟩)
+  · exact .inr (.inr ⟨msg, by rw [steps_add, hm0, ok_bind, herr], hfault⟩)
+
+/-- **Forward progress under `MirNoUBTree` (`StateRelD`).** -/
+theorem mirNoUB_progress_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelD body f ctx s m) (hsafe : MirNoUBTree (mirTree body s)) (n : Nat) :
+    (∃ s' m' tr, Interp.steps n m = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirTree body s) tr (mirTree body s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k m = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) := by
+  rcases steps_outcome_D hfragD hf ctx n s m hrel with hrun | hret | ⟨_, _, tr, u, hr, hfault⟩
+  · exact .inl hrun
+  · exact .inr hret
+  · exact False.elim (hsafe tr u hr hfault)
+
+/-- **Forward progress from `f.start` under `MirNoUBTree` (`StateRelD`).** -/
+theorem mirNoUB_progress_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit) (hsafe : MirNoUBTree (mirTree body s)) (n : Nat)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    (∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirTree body s) tr (mirTree body s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen body + n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirTree body s) tr (.normal (v, mem))) := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  rcases mirNoUB_progress_D hfragD hf ctx s m0 hrel0 hsafe n with
+    ⟨s', m', tr, hsteps, hrel', hr⟩ | ⟨k, s', mRet, tr, v, mem, hkle, hksteps, hretRel, hret⟩
+  · exact .inl ⟨s', m', tr, by rw [steps_add, hm0, ok_bind, hsteps], hrel', hr⟩
+  · exact .inr ⟨initLen body + k, s', mRet, tr, v, mem, by omega,
+      by rw [steps_add, hm0, ok_bind, hksteps], hretRel, hret⟩
+
+/-- **Diverging UB-free execution from `StateRelD`.** -/
+theorem mirNoUB_diverges_steps_ok_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelD body f ctx s m) (hsafe : MirNoUBTree (mirTree body s))
+    (hdiv : ∀ tr o, ¬ ReachesRet (mirTree body s) tr o) (n : Nat) :
+    ∃ s' m' tr, Interp.steps n m = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirTree body s) tr (mirTree body s') := by
+  rcases mirNoUB_progress_D hfragD hf ctx s m hrel hsafe n with
+    hrun | ⟨_, _, _, tr, v, mem, _, _, _, hret⟩
+  · exact hrun
+  · exact False.elim (hdiv tr (.normal (v, mem)) hret)
+
+/-- **Diverging UB-free execution from `f.start` (`inFragmentD`).** -/
+theorem mirNoUB_diverges_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit) (hsafe : MirNoUBTree (mirTree body s))
+    (hdiv : ∀ tr o, ¬ ReachesRet (mirTree body s) tr o) (n : Nat)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ m', Interp.steps n mInit = .ok m' := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  by_cases hn : n ≤ initLen body
+  · exact steps_ok_mono hn hm0
+  · obtain ⟨n', rfl⟩ : ∃ n', n = initLen body + n' := ⟨n - initLen body, by omega⟩
+    obtain ⟨_, m', _, hsteps, _, _⟩ :=
+      mirNoUB_diverges_steps_ok_D hfragD hf ctx s m0 hrel0 hsafe hdiv n'
+    exact ⟨m', by rw [steps_add, hm0, ok_bind, hsteps]⟩
+
+/-- **Coupled diverging UB-free execution from `f.start` (`StateRelD`).** -/
+theorem mirNoUB_diverges_rel_from_start_D {body : CapturedMir} {f : Gen.Function}
+    (hfragD : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : StartRel body f ctx s mInit) (hsafe : MirNoUBTree (mirTree body s))
+    (hdiv : ∀ tr o, ¬ ReachesRet (mirTree body s) tr o) (n : Nat)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirTree body s) tr (mirTree body s') := by
+  obtain ⟨m0, hm0, hrel0⟩ := step_start_D hfragD hf hstart hns
+  obtain ⟨s', m', tr, hsteps, hrel', hr⟩ :=
+    mirNoUB_diverges_steps_ok_D hfragD hf ctx s m0 hrel0 hsafe hdiv n
+  exact ⟨s', m', tr, by rw [steps_add, hm0, ok_bind, hsteps], hrel', hr⟩
+
+/-- **Call-tree UB (`inFragmentD`).** -/
+theorem mirCall_ub_D {body : CapturedMir} {f : Gen.Function} (hfrag : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirCallTree body args) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) :=
+  run_ub_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hreach hfault (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Localized single-body call-tree UB (`inFragmentD`).** -/
+theorem mirCall_ub_rel_D {body : CapturedMir} {f : Gen.Function} (hfrag : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirCallTree body args) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n mInit = .ok mLast ∧ StateRelD body f ctx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) mInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k mInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) :=
+  run_ub_rel_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hreach hfault (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree UB-freedom transfer (`inFragmentD`).** -/
+theorem mirCall_noUB_D {body : CapturedMir} {f : Gen.Function} (hfrag : inFragmentD body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    (hsafe : MirNoUBTree (mirCallTree body args))
+    {n : Nat} {e : Stop} (herr : Interp.steps n mInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirCallTree body args) tr (.normal (v, mem)) :=
+  mirNoUB_safe_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hsafe herr (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree converse error soundness (`inFragmentD`).** -/
+theorem mirCall_steps_error_D {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (hctx : CtxOk body ctx) (args : List Value) (hargs : argsOk body args = true)
+    (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    {n : Nat} {e : Stop} (herr : Interp.steps n mInit = .error e) :
+    (∃ msg, e = .ub msg ∧ ∃ tr u, Reaches (mirCallTree body args) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirCallTree body args) tr (.normal (v, mem))) :=
+  steps_error_from_start_D hfrag hf ctx n (initMachineState body args) mInit e
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    herr (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree total `(initLen body + n)`-step outcome trichotomy (`inFragmentD`).** -/
+theorem mirCall_outcome_D {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (hctx : CtxOk body ctx) (args : List Value) (hargs : argsOk body args = true)
+    (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirCallTree body args) tr (mirTree body s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen body + n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirCallTree body args) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen body + n) mInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree body args) tr u ∧ FaultNow u) :=
+  steps_outcome_from_start_D hfrag hf ctx n (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree forward progress (`inFragmentD`).** -/
+theorem mirCall_progress_D {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (hctx : CtxOk body ctx) (args : List Value) (hargs : argsOk body args = true)
+    (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    (hsafe : MirNoUBTree (mirCallTree body args)) (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirCallTree body args) tr (mirTree body s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen body + n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel body ctx s' v mRet ∧ ReachesRet (mirCallTree body args) tr (.normal (v, mem))) :=
+  mirNoUB_progress_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hsafe n (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree diverging UB-free execution (`inFragmentD`).** -/
+theorem mirCall_diverges_steps_ok_D {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (hctx : CtxOk body ctx) (args : List Value) (hargs : argsOk body args = true)
+    (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    (hsafe : MirNoUBTree (mirCallTree body args))
+    (hdiv : ∀ tr o, ¬ ReachesRet (mirCallTree body args) tr o) (n : Nat) :
+    ∃ m', Interp.steps n mInit = .ok m' :=
+  mirNoUB_diverges_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hsafe hdiv n (initMachineState_nonScalar_D hfrag args hargs)
+
+/-- **Call-tree coupled diverging UB-free execution (`inFragmentD`).** -/
+theorem mirCall_diverges_rel_D {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragmentD body = true) (hf : translateFn body = some f)
+    (ctx : Ctx) (hctx : CtxOk body ctx) (args : List Value) (hargs : argsOk body args = true)
+    (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals body.layouts)
+    (hsafe : MirNoUBTree (mirCallTree body args))
+    (hdiv : ∀ tr o, ¬ ReachesRet (mirCallTree body args) tr o) (n : Nat) :
+    ∃ s' m' tr, Interp.steps (initLen body + n) mInit = .ok m' ∧ StateRelD body f ctx s' m' ∧
+      Reaches (mirCallTree body args) tr (mirTree body s') :=
+  mirNoUB_diverges_rel_from_start_D hfrag hf ctx (initMachineState body args) mInit
+    (initMachineState_startRel_D hfrag ctx hctx args hargs mInit hthreads hactive hallocs)
+    hsafe hdiv n (initMachineState_nonScalar_D hfrag args hargs)
 
 end MiniRustSpec.Correspondence

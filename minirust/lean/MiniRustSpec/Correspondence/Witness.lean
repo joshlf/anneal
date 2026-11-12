@@ -13961,4 +13961,249 @@ theorem deinitSiblingReinit_minirust_ret_from_start :
   refine ⟨n, m', hsteps, ?_, hthr⟩
   rw [hallocs]; rfl
 
+/-- **End-to-end UB-freedom through `mirCall_noUB_D`.** Since `mirCallTree deinitSiblingReinit` is
+UB-free (`deinitSiblingReinit_anneal_noUB`), any MiniRust error at step `n` would imply an earlier
+return. -/
+theorem deinitSiblingReinit_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n deinitSiblingReinitMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k deinitSiblingReinitMInit = .ok mRet ∧
+      ReturnRel deinitSiblingReinit ctxPadded2 s' v mRet ∧
+      ReachesRet (mirCallTree deinitSiblingReinit deinitSiblingReinitArgs) tr (.normal (v, mem)) :=
+  mirCall_noUB_D deinitSiblingReinit_inFragmentD deinitSiblingReinit_translate ctxPadded2
+    deinitSiblingReinit_ctxOk deinitSiblingReinitArgs deinitSiblingReinit_argsOk
+    deinitSiblingReinitMInit rfl rfl rfl deinitSiblingReinit_anneal_noUB herr
+
+/-- **End-to-end forward progress through `mirCall_progress_D`.** At every step `initLen + n` from
+`f.start`, MiniRust either is in a `StateRelD`-related state or has already returned. -/
+theorem deinitSiblingReinit_minirust_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen deinitSiblingReinit + n) deinitSiblingReinitMInit = .ok m' ∧
+      StateRelD deinitSiblingReinit deinitSiblingReinitFn ctxPadded2 s' m' ∧
+      Reaches (mirCallTree deinitSiblingReinit deinitSiblingReinitArgs) tr
+        (mirTree deinitSiblingReinit s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen deinitSiblingReinit + n ∧
+      Interp.steps k deinitSiblingReinitMInit = .ok mRet ∧
+      ReturnRel deinitSiblingReinit ctxPadded2 s' v mRet ∧
+      ReachesRet (mirCallTree deinitSiblingReinit deinitSiblingReinitArgs) tr (.normal (v, mem))) :=
+  mirCall_progress_D deinitSiblingReinit_inFragmentD deinitSiblingReinit_translate ctxPadded2
+    deinitSiblingReinit_ctxOk deinitSiblingReinitArgs deinitSiblingReinit_argsOk
+    deinitSiblingReinitMInit rfl rfl rfl deinitSiblingReinit_anneal_noUB n
+
+/-- `ctxPadded2` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u8`,
+and `_3: u32` (with `argCount = 1`). -/
+theorem ctxPadded2_ok_u8_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl, u8Decl, u32Decl])
+    (hlay : body.layouts = paddedLayouts) (hac : body.argCount = 1) : CtxOk body ctxPadded2 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd; rw [h] at hd; rw [hlay]; rw [hac] at hi
+    match i, hi, hd with
+    | 0, _, hd => simp at hd; subst hd; decide
+    | 1, _, hd => simp at hd; subst hd; decide
+    | _ + 2, hi, _ => omega
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR of a body exercising `reinitCopyOk` (`_1.1 = copy _3`) and live sibling-read consumption:
+```rust
+fn deinit_sibling_copy_reinit(mut s: Padded) -> u32 {
+    let t: u8;          // StorageLive(_2)
+    let r: u32;         // StorageLive(_3)
+    r = s.1 + 1;        // _3 = Add(copy _1.1, const 1_u32)  (= 100)
+    Deinit(s.1);        // Deinit(_1.1)                      [opens hole (1, [.field 1 u32])]
+    t = s.0;            // _2 = copy _1.0                    [siblingReadOk: _2 = 7_u8]
+    s.1 = r;            // _1.1 = copy _3                    [reinitCopyOk: closes hole with 100]
+    r = t as u32;       // _3 = Cast(IntToInt, copy _2, u32) [sibling read _2 = 7 flows to _3]
+    s.1 + r             // _0 = Add(copy _1.1, copy _3) = 107; StorageDead(_3); StorageDead(_2); return
+}
+```
+Unlike `deinitSiblingReinit` (where `_2 = copy _1.0` is never read and `_1.1` is re-initialized by
+a constant), here the hole `_1.1` is re-initialized by copying local `_3` (`reinitCopyOk`), and the
+sibling value read from `_1.0` while the hole was open is cast and added into the returned result
+`100 + 7 = 107`. -/
+def deinitSiblingCopyReinit : CapturedMir where
+  defPath := "witness::deinit_sibling_copy_reinit"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u8Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (constU32 1))),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.use (.copy (placeField 1 [(0, u8TyW)])))),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (.copy (local_ 3)))),
+        mkStmt (.assign (local_ 3) (.cast .intToInt (.copy (local_ 2)) u32Ty)),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (.copy (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem deinitSiblingCopyReinit_inFragmentD : inFragmentD deinitSiblingCopyReinit = true := by
+  decide
+
+theorem deinitSiblingCopyReinit_not_inFragment : inFragment deinitSiblingCopyReinit = false := by
+  decide
+
+def deinitSiblingCopyReinitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, .Int Witness.u8), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 1)) 1)) (.Constant (.Int 1) (.Int u32))),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2)) (.Load (.Field (.Local (localName 1)) 0)),
+      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 3))),
+      .Assign (.Local (localName 3))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 1)) 1)) (.Load (.Local (localName 3)))),
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem deinitSiblingCopyReinit_translate :
+    translateFn deinitSiblingCopyReinit = some deinitSiblingCopyReinitFn := rfl
+
+theorem deinitSiblingCopyReinit_ctxOk : CtxOk deinitSiblingCopyReinit ctxPadded2 :=
+  ctxPadded2_ok_u8_u32 rfl rfl rfl
+
+def deinitSiblingCopyReinitArgs : List Value := [initPaddedStruct]
+
+theorem deinitSiblingCopyReinit_argsOk :
+    argsOk deinitSiblingCopyReinit deinitSiblingCopyReinitArgs = true := by decide
+
+def deinitSiblingCopyReinitS0 : MachineState :=
+  initMachineState deinitSiblingCopyReinit deinitSiblingCopyReinitArgs
+
+def deinitSiblingCopyReinitMInit : Mach :=
+  machineWithCtx ctxPadded2 deinitSiblingCopyReinit deinitSiblingCopyReinitFn
+    deinitSiblingCopyReinitS0.frame.locals deinitSiblingCopyReinitFn.start
+
+theorem deinitSiblingCopyReinit_anneal_ret :
+    ReachesRet (mirCallTree deinitSiblingCopyReinit deinitSiblingCopyReinitArgs) []
+      (.normal (.scalar ⟨107, 4⟩, deinitSiblingCopyReinitS0.memory)) :=
+  runA_sound deinitSiblingCopyReinit 16 _ _ _ rfl
+
+theorem deinitSiblingCopyReinit_anneal_noUB :
+    MirNoUBTree (mirCallTree deinitSiblingCopyReinit deinitSiblingCopyReinitArgs) :=
+  runA_noUB deinitSiblingCopyReinit 16 _ _ _ rfl
+
+/-- **End-to-end return through `mirCall_ret_D` for `deinitSiblingCopyReinit` (`reinitCopyOk` and
+live sibling read).** Anneal's return of `107` (`100 + 7`) gives a MiniRust run from `f.start` that
+pops the callee frame and leaves `107` in the caller's return place. -/
+theorem deinitSiblingCopyReinit_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n deinitSiblingCopyReinitMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 107 } ∧
+      m'.threads =
+        [thread1 ctxPadded2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D deinitSiblingCopyReinit_inFragmentD deinitSiblingCopyReinit_translate ctxPadded2
+      deinitSiblingCopyReinit_ctxOk deinitSiblingCopyReinitArgs deinitSiblingCopyReinit_argsOk
+      deinitSiblingCopyReinitMInit rfl rfl rfl deinitSiblingCopyReinit_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [deinitSiblingCopyReinit] at hd; subst hd
+  simp [retPtr, ctxPadded2] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded2] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem deinitSiblingCopyReinit_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n deinitSiblingCopyReinitMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k deinitSiblingCopyReinitMInit = .ok mRet ∧
+      ReturnRel deinitSiblingCopyReinit ctxPadded2 s' v mRet ∧
+      ReachesRet (mirCallTree deinitSiblingCopyReinit deinitSiblingCopyReinitArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB_D deinitSiblingCopyReinit_inFragmentD deinitSiblingCopyReinit_translate ctxPadded2
+    deinitSiblingCopyReinit_ctxOk deinitSiblingCopyReinitArgs deinitSiblingCopyReinit_argsOk
+    deinitSiblingCopyReinitMInit rfl rfl rfl deinitSiblingCopyReinit_anneal_noUB herr
+
+/-- MIR of an `inFragmentD` body that executes a projected-`Deinit` window (`Deinit(_1.1)`,
+sibling read `_2 = copy _1.0`, re-initialization `_1.1 = const 42_u32`) and then faults with
+division by zero (`_0 = Div(copy _1.1, const 0_u32)`), exercising `mirCall_ub_D`. -/
+def deinitSiblingReinitUb : CapturedMir where
+  defPath := "witness::deinit_sibling_reinit_ub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.use (.copy (placeField 1 [(0, u8TyW)])))),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (constU32 42))),
+        mkStmt (.assign (local_ 0) (.binaryOp .div (.copy (placeField 1 [(1, u32Ty)])) (constU32 0))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem deinitSiblingReinitUb_inFragmentD : inFragmentD deinitSiblingReinitUb = true := by decide
+
+def deinitSiblingReinitUbFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, .Int Witness.u8)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2)) (.Load (.Field (.Local (localName 1)) 0)),
+      .Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 42) (.Int u32)),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Div) (.Load (.Field (.Local (localName 1)) 1)) (.Constant (.Int 0) (.Int u32))),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem deinitSiblingReinitUb_translate :
+    translateFn deinitSiblingReinitUb = some deinitSiblingReinitUbFn := rfl
+
+theorem deinitSiblingReinitUb_ctxOk : CtxOk deinitSiblingReinitUb ctxPadded2 :=
+  ctxPadded2_ok_u8 rfl rfl rfl
+
+def deinitSiblingReinitUbS0 : MachineState :=
+  initMachineState deinitSiblingReinitUb deinitSiblingReinitArgs
+
+def deinitSiblingReinitUbMInit : Mach :=
+  machineWithCtx ctxPadded2 deinitSiblingReinitUb deinitSiblingReinitUbFn
+    deinitSiblingReinitUbS0.frame.locals deinitSiblingReinitUbFn.start
+
+theorem deinitSiblingReinitUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree deinitSiblingReinitUb deinitSiblingReinitArgs) tr u ∧
+      FaultNow u :=
+  faultsA_sound deinitSiblingReinitUb 12 _ (by decide)
+
+/-- **End-to-end UB transfer through `mirCall_ub_D`.** Since `mirCallTree deinitSiblingReinitUb`
+faults with UB (`deinitSiblingReinitUb_anneal_ub`), MiniRust started at `f.start` raises UB after
+finitely many steps. -/
+theorem deinitSiblingReinitUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n deinitSiblingReinitUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := deinitSiblingReinitUb_anneal_ub
+  exact mirCall_ub_D deinitSiblingReinitUb_inFragmentD deinitSiblingReinitUb_translate ctxPadded2
+    deinitSiblingReinitUb_ctxOk deinitSiblingReinitArgs (by decide)
+    deinitSiblingReinitUbMInit rfl rfl rfl hr hf
+
 end MiniRustSpec.Correspondence.Witness

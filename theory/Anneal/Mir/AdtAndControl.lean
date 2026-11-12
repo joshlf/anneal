@@ -210,30 +210,35 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      `evalDerefPlaceRead_refines_evalOperand_typed`, `evalDerefPlaceRead_refines_evalRvalue_typed`,
      whose extra hypotheses are Trusted's pointee-type checks — scalar width, offset `0`, target
      alignment, no union, bit validity — while Trusted's read value is derived from Anneal's;
-     `evalRvalue_use_copy_of_evalOperand` lifts `evalOperand` to `Rvalue.use`), writes
-     (`evalDerefPlaceWrite_refines_writePlaceValue`), and assignments
-     (`evalStmt_assign_deref_refines`).
+     `evalRvalue_use_copy_of_evalOperand` lifts `evalOperand` to `Rvalue.use`), writes in untyped
+     and typed modes (`evalDerefPlaceWrite_refines_writePlaceValue`,
+     `evalDerefPlaceWrite_refines_writePlaceValue_typed`), and assignments in untyped and typed
+     modes (`evalStmt_assign_deref_refines`, `evalStmt_assign_deref_refines_typed`).
    - Sub-place and array-window `CopyNonOverlapping` (`evalCopyNonOverlappingSubplace`,
      `readSubplaceSlot`, `writeSubplaceSlot`): Read-After-Copy
-     (`evalCopyNonOverlappingSubplace_read_after_copy`), Disjoint-Frame for every copy shape
+     (`evalCopyNonOverlappingSubplace_read_after_copy`,
+     `evalCopyNonOverlappingSubplace_window_read_after_copy`), Disjoint-Frame for every copy shape
      (`evalCopyNonOverlappingSubplace_frame`, `writeSubplaceSlot_frame`), self-overlap rejection
      (`evalCopyNonOverlappingSubplace_overlap_none`), dead-provenance faults and zero-byte bulk
      no-ops (`evalCopyNonOverlappingSubplace_dead_none`,
-     `evalCopyNonOverlappingSubplace_zst_bulk_noop`), `[T; 1]` deinitialization and fail-closed
-     uninitialized element writes (`writeSubplaceSlot_uninit_unit_array`,
-     `writeSubplaceSlot_uninit_elem_init_array_none`), and refinement of Trusted's
-     `evalCopySingleDirect` and `evalStmt` (`evalCopyNonOverlappingSubplace_refines`,
-     `evalStmt_copyNonOverlapping_singleDirect`, `evalStmt_copyNonOverlapping_subplace_refines`).
+     `evalCopyNonOverlappingSubplace_zst_bulk_noop`), `[T; 1]` / `[[T; 1]; 1]` deinitialization
+     and promotion (`writeSubplaceSlot_uninit_unit_array`, `writeSubplaceSlot_uninit_nested_unit_array`,
+     `writeSubplaceSlot_init_nested_unit_array`), fail-closed uninitialized element and subslice
+     writes (`writeSubplaceSlot_uninit_elem_init_array_none`,
+     `writeSubplaceSlot_uninit_subslice_init_array_none`), `PartialShell` field copy
+     (`writeSubplaceSlot_nested_field_ok`), and refinement of Trusted's `evalCopySingleDirect`,
+     `evalCopyNonOverlappingPermOk`, and `evalStmt` for both `count = 1` sub-place copies and
+     `count ≥ 2` array-window copies (`evalCopyNonOverlappingSubplace_refines`,
+     `evalStmt_copyNonOverlapping_singleDirect`, `evalStmt_copyNonOverlapping_subplace_refines`,
+     `evalCopyNonOverlappingSubplace_window_refines`,
+     `evalStmt_copyNonOverlapping_window_refines`).
    - A concrete frame `(u32, u32)` + `*mut u32` exercising the whole pipeline (`witnessCtx_wf`,
      `witness_borrow`, `witness_resolve`, `witness_deref_read`, `witness_deref_write_put_get`,
      `witness_bases`), and the same frame under Trusted's pointer representation discharging
-     every hypothesis of the `Deref` refinement (`witnessCtxT_wf`, `witness_trusted_resolve`,
-     `witness_trusted_deref_read`) — including, with the non-empty typed declarations
-     `witnessLocalDecls`, every hypothesis of the typed refinement, so that Anneal's
-     `evalDerefPlaceRead`, Trusted's typed `evalOperand`, and Trusted's typed `evalRvalue` all
-     read `9` from `*_1` (`witness_trusted_deref_read_typed`); plus type-fingerprinted tag
-     disambiguation (`witness_tag_disambiguates_and_rejects_mismatch`) and a `count = 2`
-     array-window copy (`witness_window_copy`).
+     every hypothesis of the `Deref` and array-window refinements (`witnessCtxT_wf`,
+     `witness_trusted_resolve`, `witness_trusted_deref_read`, `witness_trusted_deref_read_typed`,
+     `witness_trusted_deref_write_typed`, `witness_trusted_window_copy`, plus
+     `witness_tag_disambiguates_and_rejects_mismatch` and `witness_window_copy`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -12003,6 +12008,197 @@ theorem evalStmt_assign_deref_refines {arityOf : Ty → VariantIdx → Bool → 
   refine ⟨locals', ?_, hRel'⟩
   simp only [evalStmt, hv, evalPlaceWrite, hprot, hWV]
 
+theorem appendProjections_nil_right :
+    ∀ (xs : List ProjectionElem), appendProjections xs [] = xs
+  | [] => rfl
+  | x :: xs => by simp [appendProjections, appendProjections_nil_right xs]
+
+/-- **Typed `Deref` writes refine Trusted's typed `writePlaceValue`
+(`evalDerefPlaceWrite_refines_writePlaceValue_typed`)**: with non-empty `localDecls`, Trusted writes
+`*_p = .scalar wSc` through `writeStackThinPtrTypedDeref` (checking `checkDerefAlign`,
+`checkTargetPlaceAlign`, `validateValueForTy?`, and splicing `wSc` into the old scalar at offset
+`0`). On below-related frames, if Anneal writes `.scalar wSc` through `*_p` into an initialized
+target whose current sub-place holds `.scalar oldSc` of the same width, and Trusted's typed checks
+pass, then Trusted's typed `writePlaceValue` succeeds and the updated frames stay related by
+`SlotsRefine SlotBelow`. -/
+theorem evalDerefPlaceWrite_refines_writePlaceValue_typed
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty}
+    {cx : SubplaceCtx} (hWF : cx.WF) {slots slots' : List LocalSlotState}
+    {locals : List LocalSlot} {p : Nat} {oldSc wSc : ScalarInt} {root : Value}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable} {pTy : Ty}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty true =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry)
+    (hPerm : entry.perm = .active ∨ entry.perm = .reserved)
+    (hTgt : slots[entry.targetLocal]? = some (.init root))
+    (hOld : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection⟩ = .ok (.scalar oldSc))
+    (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, [.deref]⟩ (.scalar wSc) = .ok slots')
+    (hDecls : localDecls ≠ [])
+    (hPTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some pTy)
+    (hPos : 1 ≤ wSc.sizeBytes)
+    (hWidth : wSc.sizeBytes = oldSc.sizeBytes)
+    (hOff : pv.offsetBytes = 0)
+    (hAlign : checkTargetPlaceAlign localDecls layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) entry pv (some root) = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar wSc) = true) :
+    ∃ locals', writePlaceValue locals borrows ⟨p, [.deref]⟩ (.scalar wSc) localDecls layouts =
+        .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨stp, hStp, hLiveP⟩ := readPlaceState_ok_live hPtr
+  have hResT : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty (true && ([] : List ProjectionElem).isEmpty) =
+      .ok (entry.targetLocal, entry.targetProjection) := by simpa using hRes
+  have hPl := resolvePlace_deref hStp hLiveP hPtr hTy hResT rfl
+  simp only [evalDerefPlaceWrite, hPl, List.append_nil] at hW
+  have hQ : projectionHasDeref entry.targetProjection = false :=
+    resolveSyntheticSubplace_noDeref hWF hRes
+  cases hWS : writePlaceState arityOf slots ⟨entry.targetLocal, entry.targetProjection⟩
+      (rootTyOf entry.targetLocal) (.scalar wSc) with
+  | ub => simp [hWS, liftWrite] at hW
+  | unsupported => simp [hWS, liftWrite] at hW
+  | ok s =>
+    simp only [hWS, liftWrite, Except.ok.injEq] at hW
+    subst hW
+    obtain ⟨root', hWr, hEq⟩ := writePlaceState_init_root_inv hTgt hQ hWS
+    subst hEq
+    have hSame := sameScalarLocals_of_slotBelow hRel
+    have hWT : evalValueProjWrite locals root entry.targetProjection (.scalar wSc) = .ok root' := by
+      rw [← evalValueProjWrite_congr_scalar_locals hSame]; exact hWr
+    have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hWT
+    obtain ⟨rootP, hp, hrp⟩ := readPlaceState_below_refines hRel hPtr
+    simp only [readProjectedValue] at hrp
+    cases hrp
+    obtain ⟨rootOld, htOld, hrOld⟩ := readPlaceState_below_refines hRel hOld
+    have hTT : locals[entry.targetLocal]? = some (.init root) := by
+      rcases SlotsRefine.get?_rel entry.targetLocal hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+      · simp only [get?_eq_getElem?] at hA; rw [hA] at hTgt; nomatch hTgt
+      · simp only [get?_eq_getElem?] at hA hT
+        rw [hA] at hTgt
+        cases hTgt
+        cases t with
+        | init w => have hvw : root = w := hAT; subst hvw; exact hT
+        | _ => simp [SlotBelow] at hAT
+    have hRootOldEq : rootOld = root := by
+      simp only [get?_eq_getElem?] at htOld
+      rw [hTT] at htOld
+      injection htOld with h1
+      injection h1 with h2
+      exact h2.symm
+    subst hRootOldEq
+    have hLtT : entry.targetLocal < locals.length := (List.getElem?_eq_some_iff.mp hTT).1
+    obtain ⟨d0, ds, hcons⟩ : ∃ d0 ds, localDecls = d0 :: ds := by
+      cases h : localDecls with
+      | nil => exact absurd h hDecls
+      | cons d0 ds => exact ⟨d0, ds, rfl⟩
+    have hsplice : spliceScalarSlice? oldSc 0 wSc = some wSc := by
+      unfold spliceScalarSlice?
+      have hb1 : Bool.and (Nat.ble 1 wSc.sizeBytes)
+          (Nat.ble (Nat.add 0 wSc.sizeBytes) oldSc.sizeBytes) = true := by
+        simp [Nat.add_eq, Nat.ble_eq, ← hWidth, hPos]
+      have hb2 : Bool.and (Nat.beq 0 0) (Nat.beq wSc.sizeBytes oldSc.sizeBytes) = true := by
+        simp [hWidth]
+      rw [hb1, hb2]
+    refine ⟨locals.set entry.targetLocal (.init root'), ?_,
+      SlotsRefine.set (a := .init root') (t := .init root') rfl _ hRel⟩
+    unfold writePlaceValue
+    dsimp only
+    rw [hp]
+    dsimp only
+    rw [hEntry]
+    dsimp only
+    rcases hPerm with hpe | hpe <;> rw [hpe]
+    all_goals
+      dsimp only
+      rw [hcons]
+      dsimp only
+      rw [← hcons]
+      unfold writeStackThinPtrTypedDeref
+      rw [hPTy, hOff, htOld]
+      dsimp only [stripTransparentProjections, checkDerefAlign, Nat.beq_refl]
+      rw [hAlign, hValid]
+      simp only [Bool.and_self]
+      rw [hcons]
+      dsimp only [stripTransparentProjections]
+      rw [← hcons]
+      cases htp : entry.targetProjection with
+      | nil =>
+        rw [htp] at hrOld hWr
+        have hRV : root' = .scalar wSc := by
+          simp only [evalValueProjWrite, ProjWriteResult.ok.injEq] at hWr
+          exact hWr.symm
+        subst hRV
+        dsimp only [readProjectedForLocal]
+        rw [hrOld]
+        dsimp only [stripTransparentProjections]
+        rw [hsplice]
+        simp [set?, hLtT]
+      | cons ph pt =>
+        rw [htp] at hrOld hWP hNoUnion
+        dsimp only [readProjectedForLocal]
+        rw [appendProjections_nil_right, hNoUnion]
+        dsimp only [stripTransparentProjections]
+        rw [hrOld]
+        dsimp only [stripTransparentProjections]
+        rw [hsplice]
+        dsimp only [writeProjectedForLocal]
+        rw [hNoUnion]
+        dsimp only [stripTransparentProjections]
+        rw [hWP]
+        simp [set?, hLtT]
+
+/-- **Typed `Deref` assignments refine Trusted's typed `evalStmt`
+(`evalStmt_assign_deref_refines_typed`)**: with non-empty `localDecls` and no active function-entry
+protector, when Trusted's typed `evalRvalue` evaluates `rv` to `.scalar wSc` without changing the
+frame, a successful Anneal write of `.scalar wSc` through `*_p` is matched by Trusted's typed
+`evalStmt` stepping the `.assign` with the written frame and deref-write borrow invalidation,
+keeping the frames related by `SlotsRefine SlotBelow`. -/
+theorem evalStmt_assign_deref_refines_typed
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty}
+    {cx : SubplaceCtx} (hWF : cx.WF) {slots slots' : List LocalSlotState}
+    (s : MachineState) {p : Nat} (rv : Rvalue) (span : String)
+    {oldSc wSc : ScalarInt} {root : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable} {pTy : Ty}
+    (hprot : s.memory.activeProtectors = [])
+    (hv : evalRvalue s.frame.locals rv s.memory localDecls layouts =
+      .ok (.scalar wSc) s.frame.locals s.memory)
+    (hRel : SlotsRefine SlotBelow slots s.frame.locals)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty true =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow s.memory.borrows pv.tag = some entry)
+    (hPerm : entry.perm = .active ∨ entry.perm = .reserved)
+    (hTgt : slots[entry.targetLocal]? = some (.init root))
+    (hOld : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection⟩ = .ok (.scalar oldSc))
+    (hW : evalDerefPlaceWrite arityOf rootTyOf cx slots ⟨p, [.deref]⟩ (.scalar wSc) = .ok slots')
+    (hDecls : localDecls ≠ [])
+    (hPTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some pTy)
+    (hPos : 1 ≤ wSc.sizeBytes)
+    (hWidth : wSc.sizeBytes = oldSc.sizeBytes)
+    (hOff : pv.offsetBytes = 0)
+    (hAlign : checkTargetPlaceAlign localDecls layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) entry pv (some root) = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar wSc) = true) :
+    ∃ locals', evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals'
+          { s.memory with
+            borrows := invalidateDerefWriteBorrows s.frame.locals s.memory.borrows
+              ⟨p, [.deref]⟩ [] }) ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨locals', hWP, hRel'⟩ := evalDerefPlaceWrite_refines_writePlaceValue_typed hWF hRel hPtr
+    hTy hRes hEntry hPerm hTgt hOld hW hDecls hPTy hPos hWidth hOff hAlign hNoUnion hValid
+  refine ⟨locals', ?_, hRel'⟩
+  simp only [evalStmt, hv, evalPlaceWrite, hprot, hWP]
+
 /-! ### Section 4g: Sub-place and array-window `CopyNonOverlapping` (`eval_copy_nonoverlapping`) -/
 
 /-- The `CopyPtr` (address and allocation id) of a synthetic pointer. -/
@@ -12802,6 +12998,249 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
     hDt h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
     hPointee hNoUnion hValid
 
+theorem appendValues_eq_append : ∀ (xs ys : List Value), appendValues xs ys = xs ++ ys
+  | [], _ => rfl
+  | x :: xs, ys => by simp [appendValues, appendValues_eq_append xs ys]
+
+theorem spliceValues_eq_take_append_drop (srcSlice dstElems : List Value) (d0 : Nat) :
+    spliceValues srcSlice d0 dstElems =
+      dstElems.take d0 ++ (srcSlice ++ dstElems.drop (d0 + srcSlice.length)) := by
+  simp [spliceValues, appendValues_eq_append, takeValues_eq_take, dropValues_eq_drop,
+    length_eq_list_length]
+
+/-- **Array-window (`count ≥ 2`) `CopyNonOverlapping` refines Trusted's `evalCopyNonOverlappingPermOk`
+(`evalCopyNonOverlappingSubplace_window_refines`)**: on below-related frames, when Anneal copies a
+contiguous window of `count ≥ 2` elements (`elemSize > 0`) from an initialized array local `sl` at
+index `s0` into a distinct initialized array local `dl` at index `d0` (`s0 + count ≤ sLen`,
+`d0 + count ≤ dLen`), and Trusted's borrow entries for `srcPtr` and `dstPtr` target `(sl, [])` at
+`offsetBytes = s0` and `(dl, [])` at `offsetBytes = d0` (with distinct tags, outside unions, on a
+non-ADT destination local), Trusted's `evalCopyNonOverlappingPermOk` steps with the exact same
+spliced array `spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems` and the
+updated frames stay related by `SlotsRefine SlotBelow`. -/
+theorem evalCopyNonOverlappingSubplace_window_refines
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {ptrBits : Nat} {slots slots' : List LocalSlotState} {locals₃ : List LocalSlot}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign sl dl s0 sLen d0 dLen : Nat} {srcElems dstElems : List Value}
+    (hRel : SlotsRefine SlotBelow slots locals₃)
+    (hCount : 2 ≤ count) (hElemSz : 0 < elemSize)
+    (hSrcR : resolve src false = .ok (sl, [.constantIndex s0 sLen false]))
+    (hDstR : resolve dst true = .ok (dl, [.constantIndex d0 dLen false]))
+    (hNe : sl ≠ dl)
+    (hSrcRoot : slots[sl]? = some (.init (.aggregate 0 srcElems)))
+    (hDstRoot : slots[dl]? = some (.init (.aggregate 0 dstElems)))
+    (hSLen : srcElems.length = sLen)
+    (hDLen : dstElems.length = dLen)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count
+      elemSize elemAlign = some slots')
+    (s : MachineState) (srcOp dstOp : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (hTagNe : srcPtr.tag ≠ dstPtr.tag)
+    (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = [])
+    (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = [])
+    (hSrcOff : srcPtr.offsetBytes = s0)
+    (hDstOff : dstPtr.offsetBytes = d0)
+    (hSrcU : resolveUnionEndpoint? localDecls layouts locals₃ srcEntry = none)
+    (hDstU : resolveUnionEndpoint? localDecls layouts locals₃ dstEntry = none)
+    (hNotAdt : ∀ fn args idx, placeTy localDecls layouts ⟨dl, []⟩ ≠ some { kind := .adt fn args, layoutIdx := idx }) :
+    let newDstVal := Value.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)
+    evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        count locals₃ =
+      .step (advanceStmt s (locals₃.set dl (.init newDstVal))
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+    SlotsRefine SlotBelow slots' (locals₃.set dl (.init newDstVal)) := by
+  unfold evalCopyNonOverlappingSubplace at h
+  split at h
+  · nomatch h
+  split at h
+  · omega
+  split at h
+  · nomatch h
+  rw [hSrcR, hDstR] at h
+  have hNot1 : ¬ (count = 1 ∨ count * elemSize = 0) := by
+    rintro (rfl | hMul)
+    · omega
+    · exact absurd hMul (Nat.ne_of_gt (Nat.mul_pos (by omega) hElemSz))
+  have hSplitS : splitLastElem [.constantIndex s0 sLen false] = some ([], s0, sLen) := rfl
+  have hSplitD : splitLastElem [.constantIndex d0 dLen false] = some ([], d0, dLen) := rfl
+  simp only [hNot1, ↓reduceIte, hSplitS, hSplitD] at h
+  split at h
+  · rename_i hBounds
+    obtain ⟨hSBound, hDBound⟩ := hBounds
+    have hSrcRead : readPlaceState slots ⟨sl, [.subslice s0 (s0 + count) false]⟩ =
+        .ok (.aggregate 0 ((srcElems.drop s0).take count)) := by
+      have hSub : extractSubslice srcElems s0 (s0 + count) false =
+          some ((srcElems.drop s0).take count) := by
+        apply (extractSubslice_eq_some_iff srcElems s0 (s0 + count) false _).mpr
+        simp [subsliceEndIdx, hSLen, hSBound]
+      simp [readPlaceState, projectionHasDeref, get?_eq_getElem?, hSrcRoot, evalValueProjRead, hSub]
+    simp only [List.nil_append] at h
+    rw [hSrcRead] at h
+    simp only at h
+    have hSpliceEq : spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems =
+        dstElems.take d0 ++ ((srcElems.drop s0).take count ++ dstElems.drop (d0 + count)) := by
+      rw [spliceValues_eq_take_append_drop, takeValues_eq_take, dropValues_eq_drop]
+      have hTakeLen : ((srcElems.drop s0).take count).length = count := by
+        rw [List.length_take, List.length_drop, hSLen]
+        omega
+      rw [hTakeLen]
+    have hSlots' : slots' =
+        slots.set dl (.init (.aggregate 0
+          (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems))) := by
+      by_cases hWhole : d0 = 0 ∧ count = dLen
+      · obtain ⟨rfl, rfl⟩ := hWhole
+        simp only [and_self, ↓reduceIte] at h
+        have hWS : writePlaceState arityOf slots ⟨dl, []⟩ (rootTyOf dl)
+            (.aggregate 0 ((srcElems.drop s0).take count)) =
+            .ok (slots.set dl (.init (.aggregate 0 ((srcElems.drop s0).take count)))) := by
+          simp [writePlaceState, projectionHasDeref, get?_eq_getElem?, hDstRoot, writeToFieldSlot,
+            fieldSlotToLocalSlotState]
+        rw [hWS] at h
+        simp only [Option.some.injEq] at h
+        rw [← h, hSpliceEq]
+        simp [← hDLen]
+      · simp only [hWhole, ↓reduceIte] at h
+        have hExtD : extractSubslice dstElems d0 (d0 + count) false =
+            some ((dstElems.drop d0).take count) := by
+          apply (extractSubslice_eq_some_iff dstElems d0 (d0 + count) false _).mpr
+          simp [subsliceEndIdx, hDLen, hDBound]
+        have hRep : replaceSubslice dstElems d0 (d0 + count) false ((srcElems.drop s0).take count) =
+            some (dstElems.take d0 ++ ((srcElems.drop s0).take count ++ dstElems.drop (d0 + count))) := by
+          apply (replaceSubslice_eq_some_iff dstElems d0 (d0 + count) false _ _).mpr
+          refine ⟨by omega, by simp [subsliceEndIdx], ?_, rfl⟩
+          simp [subsliceEndIdx, List.length_take, List.length_drop, hSLen]; omega
+        have hWS : writePlaceState arityOf slots ⟨dl, [.subslice d0 (d0 + count) false]⟩ (rootTyOf dl)
+            (.aggregate 0 ((srcElems.drop s0).take count)) =
+            .ok (slots.set dl (.init (.aggregate 0
+              (dstElems.take d0 ++ ((srcElems.drop s0).take count ++ dstElems.drop (d0 + count)))))) := by
+          simp [writePlaceState, projectionHasDeref, get?_eq_getElem?, hDstRoot, writeToFieldSlot,
+            evalValueProjWrite, hExtD, hRep, fieldSlotToLocalSlotState]
+        rw [hWS] at h
+        simp only [Option.some.injEq] at h
+        rw [← h, hSpliceEq]
+    subst hSlots'
+    have hTSrc : locals₃[sl]? = some (.init (.aggregate 0 srcElems)) := by
+      rcases SlotsRefine.get?_rel sl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+      · simp only [get?_eq_getElem?] at hA; rw [hA] at hSrcRoot; nomatch hSrcRoot
+      · simp only [get?_eq_getElem?] at hA hT
+        rw [hA] at hSrcRoot; cases hSrcRoot
+        cases t with
+        | init w => have hvw : Value.aggregate 0 srcElems = w := hAT; subst hvw; exact hT
+        | _ => simp [SlotBelow] at hAT
+    have hTDst : locals₃[dl]? = some (.init (.aggregate 0 dstElems)) := by
+      rcases SlotsRefine.get?_rel dl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+      · simp only [get?_eq_getElem?] at hA; rw [hA] at hDstRoot; nomatch hDstRoot
+      · simp only [get?_eq_getElem?] at hA hT
+        rw [hA] at hDstRoot; cases hDstRoot
+        cases t with
+        | init w => have hvw : Value.aggregate 0 dstElems = w := hAT; subst hvw; exact hT
+        | _ => simp [SlotBelow] at hAT
+    have hLtD3 : dl < locals₃.length := (List.getElem?_eq_some_iff.mp hTDst).1
+    refine ⟨?_, SlotsRefine.set (a := .init _) (t := .init _) rfl dl hRel⟩
+    unfold evalCopyNonOverlappingPermOk
+    have hBeqN1 : Nat.beq count 1 = false :=
+      ((beq_cases count 1).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
+    have hBeqTag : Nat.beq srcPtr.tag dstPtr.tag = false :=
+      ((beq_cases srcPtr.tag dstPtr.tag).resolve_left (fun ⟨_, hEq⟩ => hTagNe hEq)).1
+    have hBeqLoc : Nat.beq sl dl = false :=
+      ((beq_cases sl dl).resolve_left (fun ⟨_, hEq⟩ => hNe hEq)).1
+    have hAdtFalse : (match placeTy localDecls layouts ⟨dl, []⟩ with
+        | some { kind := .adt _ _, .. } => true
+        | _ => false) = false := by
+      cases hPT : placeTy localDecls layouts ⟨dl, []⟩ with
+      | none => rfl
+      | some ty =>
+        rcases ty with ⟨k, lidx⟩
+        cases k with
+        | adt fn args => exact absurd hPT (hNotAdt fn args lidx)
+        | _ => rfl
+    have hBleS : Nat.ble (Nat.add s0 count) (length srcElems) = true := by
+      rw [length_eq_list_length, hSLen]; exact Nat.ble_eq.mpr hSBound
+    have hBleD : Nat.ble (Nat.add d0 count) (length dstElems) = true := by
+      rw [length_eq_list_length, hDLen]; exact Nat.ble_eq.mpr hDBound
+    have hSetD : set? locals₃ dl
+        (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems))) =
+        some (locals₃.set dl
+          (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) :=
+      set?_eq_some_iff.mpr ⟨hLtD3, rfl⟩
+    have hWPV0 : writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩
+        (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) =
+        .ok (locals₃.set dl
+          (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) := by
+      unfold writePlaceValue
+      simp only [get?_eq_getElem?, hTDst, hSetD]
+    let _ := hAdtFalse
+    simp only [hSrcU, hDstU, hBeqN1, Bool.false_and, hSrcEntry.1, hSrcEntry.2, hDstEntry.1,
+      hDstEntry.2, get?_eq_getElem?, hTSrc, hTDst, readProjectedValue, hSrcOff, hDstOff,
+      Bool.not_false, hBleS, hBleD, Bool.and_self, hBeqTag, hBeqLoc,
+      commitCopyDstPlaceWrite, hWPV0]
+  · nomatch h
+
+/-- **Statement-level array-window (`count ≥ 2`) `CopyNonOverlapping` refinement
+(`evalStmt_copyNonOverlapping_window_refines`)**: lifts `evalCopyNonOverlappingSubplace_window_refines`
+through Trusted's `evalStmt` on `copy_nonoverlapping(srcOp, dstOp, countOp)`. -/
+theorem evalStmt_copyNonOverlapping_window_refines
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign sl dl s0 sLen d0 dLen : Nat} {srcElems dstElems : List Value}
+    (s : MachineState)
+    (hRel : SlotsRefine SlotBelow slots s.frame.locals)
+    (hCount : 2 ≤ count) (hElemSz : 0 < elemSize)
+    (hSrcR : resolve src false = .ok (sl, [.constantIndex s0 sLen false]))
+    (hDstR : resolve dst true = .ok (dl, [.constantIndex d0 dLen false]))
+    (hNe : sl ≠ dl)
+    (hSrcRoot : slots[sl]? = some (.init (.aggregate 0 srcElems)))
+    (hDstRoot : slots[dl]? = some (.init (.aggregate 0 dstElems)))
+    (hSLen : srcElems.length = sLen)
+    (hDLen : dstElems.length = dLen)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count
+      elemSize elemAlign = some slots')
+    (srcOp dstOp countOp : Operand) (span : String) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) {srcPtr dstPtr : ProvenancePtr} {srcSz dstSz : Nat}
+    {countSc : ScalarInt} {srcEntry dstEntry : BorrowEntry}
+    (hSrcOp : evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr srcPtr srcSz) s.frame.locals)
+    (hDstOp : evalOperand s.frame.locals dstOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.ptr dstPtr dstSz) s.frame.locals)
+    (hCnt : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals localDecls = .ok (.scalar countSc) s.frame.locals)
+    (hCountBits : countSc.bits = count)
+    (hSrcE : lookupBorrow s.memory.borrows srcPtr.tag = some srcEntry)
+    (hDstE : lookupBorrow s.memory.borrows dstPtr.tag = some dstEntry)
+    (hSrcP : srcEntry.perm ≠ .disabled)
+    (hDstP : dstEntry.perm = .active ∨ dstEntry.perm = .reserved)
+    (hTagNe : srcPtr.tag ≠ dstPtr.tag)
+    (hSrcEntry : srcEntry.targetLocal = sl ∧ srcEntry.targetProjection = [])
+    (hDstEntry : dstEntry.targetLocal = dl ∧ dstEntry.targetProjection = [])
+    (hSrcOff : srcPtr.offsetBytes = s0)
+    (hDstOff : dstPtr.offsetBytes = d0)
+    (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
+    (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
+    (hNotAdt : ∀ fn args idx, placeTy localDecls layouts ⟨dl, []⟩ ≠ some { kind := .adt fn args, layoutIdx := idx }) :
+    let newDstVal := Value.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)
+    evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
+      .step (advanceStmt s (s.frame.locals.set dl (.init newDstVal))
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag) }) ∧
+    SlotsRefine SlotBelow slots' (s.frame.locals.set dl (.init newDstVal)) := by
+  have hPermOk : evalCopyNonOverlappingWithCount s srcOp dstOp localDecls layouts
+      (.ptr srcPtr srcSz) (.ptr dstPtr dstSz) count s.frame.locals =
+      evalCopyNonOverlappingPermOk s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        count s.frame.locals := by
+    unfold evalCopyNonOverlappingWithCount
+    have hCntNe0 : Nat.beq count 0 = false :=
+      ((beq_cases count 0).resolve_left (fun ⟨_, hEq⟩ => by omega)).1
+    simp only [hCntNe0, hSrcE, hDstE]
+    cases hs : srcEntry.perm with
+    | disabled => exact absurd hs hSrcP
+    | _ => rcases hDstP with hd | hd <;> simp [hd]
+  simp only [evalStmt, evalCopyNonOverlapping, hSrcOp, hDstOp, hCnt, hCountBits, hPermOk]
+  exact evalCopyNonOverlappingSubplace_window_refines hRel hCount hElemSz hSrcR hDstR hNe hSrcRoot
+    hDstRoot hSLen hDLen h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
+    hTagNe hSrcEntry hDstEntry hSrcOff hDstOff hSrcU hDstU hNotAdt
+
 /-! ### Section 4h: Reborrows through a pointer (`&((*_p).tail)` vs `&raw ((*_p).tail)`) -/
 
 /-- The local a synthetic provenance names (`alloc_id - 1`, when it is a local of the frame). -/
@@ -13396,5 +13835,97 @@ theorem witness_window_copy :
       some [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])
            , .init (.aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]) ] := by
   with_unfolding_all rfl
+
+/-- **Non-vacuity of the typed `Deref` write refinement (`witness_trusted_deref_write_typed`)**:
+every hypothesis of `evalDerefPlaceWrite_refines_writePlaceValue_typed` holds in the witness frame
+with the non-empty typed declarations `witnessLocalDecls`, so Anneal's `evalDerefPlaceWrite` and
+Trusted's typed `writePlaceValue` (through `writeStackThinPtrTypedDeref`) both write `5` into
+`_0.1` while preserving `_0.0 = 7`. -/
+theorem witness_trusted_deref_write_typed :
+    let slots' : List LocalSlotState :=
+      [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtrT 8)]
+    let locals' : List LocalSlot :=
+      [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtrT 8)]
+    evalDerefPlaceWrite (fun _ _ _ => none) (fun _ => witnessU32) witnessCtxT witnessSlotsT
+        ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩) = .ok slots' ∧
+    writePlaceValue witnessLocalsT [witnessEntry] ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩)
+        witnessLocalDecls emptyLayoutTable = .ok locals' ∧
+    SlotsRefine SlotBelow slots' locals' := by
+  have hW : evalDerefPlaceWrite (fun _ _ _ => none) (fun _ => witnessU32) witnessCtxT witnessSlotsT
+      ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩) =
+      .ok [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtrT 8)] := by
+    with_unfolding_all rfl
+  have hRel : SlotsRefine SlotBelow witnessSlotsT witnessLocalsT := by
+    simp [witnessSlotsT, witnessLocalsT, SlotsRefine, SlotBelow]
+  have hRef : evalSubplaceRef witnessCtxT witnessSlotsT 0 [.field 1 witnessU32] 0 =
+      .ok ⟨0x1004, some (1, 0)⟩ := by with_unfolding_all rfl
+  have hPtrOf : witnessCtxT.ptrOf witnessPtrT = ⟨0x1004, some (1, 0)⟩ := by
+    simp [witnessCtxT, witnessPtrT]
+  have hResW : resolveSyntheticSubplace witnessCtxT witnessSlotsT (witnessCtxT.ptrOf witnessPtrT)
+      ⟨false, 1⟩ true = .ok (witnessEntry.targetLocal, witnessEntry.targetProjection) := by
+    rw [hPtrOf]
+    exact resolveSyntheticSubplace_evalSubplaceRef witnessCtxT_wf hRef true
+      (tl := ⟨4, 4, 4, true, true⟩) (by simp [witnessCtxT, witnessCtx]) (by decide) (by decide)
+      (by simp) (lay := .struct 8 [0, 4] [.leaf 4, .leaf 4]) (sub := .leaf 4) (off := 4)
+      (by simp [witnessCtxT, witnessCtx]) (by with_unfolding_all rfl) rfl
+      (by simp [witnessCtxT, witnessCtx]) (by simp) (by simp [witnessCtxT, witnessCtx])
+      (allocSize := 8) (align := 4) (by simp [ownLayout, witnessCtxT, witnessCtx])
+  obtain ⟨locals', hWP, hRel'⟩ := evalDerefPlaceWrite_refines_writePlaceValue_typed witnessCtxT_wf
+    hRel (pty := ⟨false, 1⟩) (borrows := [witnessEntry]) (entry := witnessEntry)
+    (localDecls := witnessLocalDecls) (layouts := emptyLayoutTable)
+    (root := .aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]) (oldSc := ⟨9, 4⟩) (pTy := witnessU32)
+    (by with_unfolding_all rfl) (by simp [witnessCtxT, witnessCtx])
+    hResW
+    (by with_unfolding_all rfl)
+    (Or.inl rfl) rfl (by with_unfolding_all rfl) hW (by decide)
+    (by with_unfolding_all rfl) (by decide) rfl rfl
+    (by with_unfolding_all rfl) (by with_unfolding_all rfl) (by with_unfolding_all rfl)
+  have hWP' : writePlaceValue witnessLocalsT [witnessEntry] ⟨1, [.deref]⟩ (.scalar ⟨5, 4⟩)
+      witnessLocalDecls emptyLayoutTable =
+      .ok [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨5, 4⟩]), .init (.ptr witnessPtrT 8)] := by
+    with_unfolding_all rfl
+  rw [hWP'] at hWP
+  injection hWP with hEq
+  subst hEq
+  exact ⟨hW, hWP', hRel'⟩
+
+/-- **Non-vacuity of the `count ≥ 2` array-window `CopyNonOverlapping` refinement
+(`witness_trusted_window_copy`)**: every hypothesis of `evalCopyNonOverlappingSubplace_window_refines`
+holds on the 4-element `u32` arrays `_0 = [10, 20, 30, 40]` and `_1 = [1, 2, 3, 4]` for `count = 2`
+(`_0[1..3]` into `_1[0..2]`), so Anneal's `evalCopyNonOverlappingSubplace` and Trusted's
+`evalCopyNonOverlappingPermOk` both produce `_1 = [20, 30, 3, 4]`. -/
+theorem witness_trusted_window_copy (s : MachineState) (srcOp dstOp : Operand) :
+    let srcElems : List Value := [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩]
+    let dstElems : List Value := [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+    let newDstElems : List Value := [.scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+    let slots' : List LocalSlotState := [.init (.aggregate 0 srcElems), .init (.aggregate 0 newDstElems)]
+    let locals₃ : List LocalSlot := [.init (.aggregate 0 srcElems), .init (.aggregate 0 dstElems)]
+    let locals₄ : List LocalSlot := [.init (.aggregate 0 srcElems), .init (.aggregate 0 newDstElems)]
+    let srcPtr : ProvenancePtr := { allocId := 1, offsetBytes := 1 }
+    let dstPtr : ProvenancePtr := { allocId := 2, offsetBytes := 0 }
+    let srcEntry : BorrowEntry := { tag := 1, targetLocal := 0, targetProjection := [], perm := .active }
+    let dstEntry : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := .active }
+    evalCopyNonOverlappingPermOk s srcOp dstOp [] emptyLayoutTable srcPtr dstPtr srcEntry dstEntry
+        2 locals₃ =
+      .step (advanceStmt s locals₄
+        { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows 1 (some 2) }) ∧
+    SlotsRefine SlotBelow slots' locals₄ := by
+  exact evalCopyNonOverlappingSubplace_window_refines
+    (arityOf := fun _ _ _ => none) (rootTyOf := fun _ => witnessU32) (ts := false) (ptrBits := 64)
+    (slots := [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])
+              , .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]) ])
+    (locals₃ := [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])
+                , .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]) ])
+    (resolve := fun p _ =>
+      if p.addr = 0x1004 then .ok (0, [.constantIndex 1 4 false])
+      else if p.addr = 0x2000 then .ok (1, [.constantIndex 0 4 false])
+      else .error .unsupported)
+    (src := ⟨0x1004, some (1, 0)⟩) (dst := ⟨0x2000, some (2, 0)⟩)
+    (by simp [SlotsRefine, SlotBelow]) (by decide) (by decide) rfl rfl (by decide) rfl rfl rfl rfl
+    witness_window_copy s srcOp dstOp [] emptyLayoutTable
+    { allocId := 1, offsetBytes := 1 } { allocId := 2, offsetBytes := 0 }
+    { tag := 1, targetLocal := 0, targetProjection := [], perm := .active }
+    { tag := 2, targetLocal := 1, targetProjection := [], perm := .active }
+    (by decide) ⟨rfl, rfl⟩ ⟨rfl, rfl⟩ rfl rfl rfl rfl (fun _ _ _ h => by nomatch h)
 
 end Anneal.Mir.AdtAndControl
