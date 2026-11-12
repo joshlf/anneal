@@ -25,6 +25,10 @@ name: Build & Tests
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '2'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -74,17 +78,39 @@ jobs:
     runs-on: ubuntu-latest
     name: Build exocrate toolchain archive
     steps:
+      # Keep event and runner identity even if checkout or startup fails;
+      # later evidence must identify the attempted build, not just its logs.
+      - name: Initialize build diagnostics
+        id: diagnostics
+        env:
+          CI_SOURCE_REVISION: ${{ github.sha }}
+          CI_RUNNER_OS: ${{ runner.os }}
+          CI_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          ANNEAL_BUILD_DIAGNOSTICS="$RUNNER_TEMP/anneal-build-diagnostics"
+          printf 'ANNEAL_BUILD_DIAGNOSTICS=%s\n' \
+            "$ANNEAL_BUILD_DIAGNOSTICS" >> "$GITHUB_ENV"
+          mkdir -p "$ANNEAL_BUILD_DIAGNOSTICS"
+          printf 'event_source_revision=%s\nrunner_os=%s\nrunner_arch=%s\n' \
+            "$CI_SOURCE_REVISION" "$CI_RUNNER_OS" "$CI_RUNNER_ARCH" \
+            > "$ANNEAL_BUILD_DIAGNOSTICS/context.txt"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           persist-credentials: false
 
       - name: Verify root TCB manifest
+        id: manifest
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
           for p in .cargo rust-toolchain rust-toolchain.toml; do
             test ! -e "$p" && test ! -L "$p"
           done
+          printf 'source_revision=%s\n' "$(git rev-parse HEAD)"
 
       - name: Restore Nix binary cache
         id: restore_nix_cache
@@ -96,30 +122,37 @@ jobs:
             anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Nix
+        id: nix
         uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
 
       - name: Build omnibus toolchain archive
+        id: build
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/nix-build.log") 2>&1
           mkdir -p target
           nix_args=()
           if [ -f target/nix-cache/nix-cache-info ]; then
             nix_args+=(--extra-substituters "file://$PWD/target/nix-cache/?trusted=1")
           fi
 
-          nix build "${nix_args[@]}" .#omnibus-archive --out-link target/omnibus-link
+          nix build --max-jobs 1 --cores 2 "${nix_args[@]}" \
+            .#omnibus-archive --out-link target/omnibus-link
           cp -f "$(readlink -f target/omnibus-link)" target/anneal-exocrate.tar.zst
           rm -f target/omnibus-link
 
       - name: Populate Nix binary cache
+        id: populate_nix_cache
         if: steps.restore_nix_cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_BUILD_DIAGNOSTICS/nix-copy.log") 2>&1
           mkdir -p target/nix-cache
           nix copy .#omnibus-archive \
             --to "file://$PWD/target/nix-cache/?compression=zstd&compression-level=1&trusted=1"
 
       - name: Save Nix binary cache
+        id: save_nix_cache
         if: steps.restore_nix_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -127,6 +160,7 @@ jobs:
           key: ${{ steps.restore_nix_cache.outputs.cache-primary-key }}
 
       - name: Upload exocrate toolchain archive
+        id: upload_archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: anneal-exocrate-archive
@@ -135,25 +169,86 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      - name: Record build step results
+        if: ${{ always() }}
+        env:
+          STEP_RESULTS_JSON: ${{ toJSON(steps) }}
+          BUILD_JOB_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p "$ANNEAL_BUILD_DIAGNOSTICS"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          steps = json.loads(os.environ["STEP_RESULTS_JSON"])
+          report = {
+              "job_status": os.environ["BUILD_JOB_STATUS"],
+              "steps": {
+                  name: {key: step[key] for key in ("outcome", "conclusion")}
+                  for name, step in steps.items()
+              },
+          }
+          destination = Path(os.environ["ANNEAL_BUILD_DIAGNOSTICS"]) / "steps.json"
+          destination.write_text(json.dumps(report, indent=2) + "\n")
+          PY
+
+      - name: Upload failed build diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anneal-build-diagnostics
+          path: ${{ env.ANNEAL_BUILD_DIAGNOSTICS }}
+          if-no-files-found: warn
+          retention-days: 7
+
   test-and-verify:
     runs-on: ubuntu-latest
     name: Toolchain setup & workspace tests
     needs: [build-exocrate]
     timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      ANNEAL_TEST_INSPECTOR: ${{ github.workspace }}/trusted/audit/TrustedBoundary.lean
+      ANNEAL_TEST_JOBS: '2'
+      ANNEAL_TEST_TIMEOUT_SECS: '120'
     steps:
+      - name: Initialize test diagnostics
+        id: diagnostics
+        env:
+          CI_SOURCE_REVISION: ${{ github.sha }}
+          CI_RUNNER_OS: ${{ runner.os }}
+          CI_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          ANNEAL_TEST_DIAGNOSTICS="$RUNNER_TEMP/anneal-diagnostics"
+          printf 'ANNEAL_TEST_DIAGNOSTICS=%s\n' \
+            "$ANNEAL_TEST_DIAGNOSTICS" >> "$GITHUB_ENV"
+          mkdir -p "$ANNEAL_TEST_DIAGNOSTICS"
+          printf 'event_source_revision=%s\nrunner_os=%s\nrunner_arch=%s\n' \
+            "$CI_SOURCE_REVISION" "$CI_RUNNER_OS" "$CI_RUNNER_ARCH" \
+            > "$ANNEAL_TEST_DIAGNOSTICS/context.txt"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           persist-credentials: false
 
       - name: Verify root TCB manifest
+        id: manifest
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/startup.log") 2>&1
           sha256sum --check --strict trusted/root-manifest.sha256
           for p in .cargo rust-toolchain rust-toolchain.toml; do
             test ! -e "$p" && test ! -L "$p"
           done
+          revision="$(git rev-parse HEAD)"
+          printf 'ANNEAL_TEST_SOURCE_REVISION=%s\n' "$revision" >> "$GITHUB_ENV"
+          printf 'source_revision=%s\n' "$revision"
 
       - name: Cache Cargo dependencies and build artifacts
+        id: cargo_cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -166,23 +261,51 @@ jobs:
             cargo-test-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Download exocrate toolchain archive
+        id: archive
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: anneal-exocrate-archive
           path: target
 
-      - name: Install exocrate toolchain from local archive
+      - name: Install current CLI for toolchain setup and smoke tests
+        id: installed_cli
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/install-cli.log") 2>&1
+          tools_root="$(mktemp -d "$RUNNER_TEMP/anneal-tools.XXXXXX")"
+          cargo install --locked --debug --path trusted/cargo-anneal \
+            --root "$tools_root"
+          printf 'ANNEAL_TEST_CARGO_ANNEAL=%s/bin/cargo-anneal\n' \
+            "$tools_root" >> "$GITHUB_ENV"
+          printf 'ANNEAL_TEST_TOOLS_ROOT=%s\n' "$tools_root" >> "$GITHUB_ENV"
+          printf 'tools_root=%s\n' "$tools_root"
+
+      - name: Install exocrate toolchain from local archive
+        id: setup
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/setup.log") 2>&1
+          archive="$(readlink -f target/anneal-exocrate.tar.zst)"
           install_cache="$(mktemp -d "$RUNNER_TEMP/anneal-toolchain.XXXXXX")"
           export XDG_CACHE_HOME="$install_cache"
-          cargo run --locked -p cargo-anneal -- setup \
-            --local-archive target/anneal-exocrate.tar.zst
+          # Setup must work as an installed command in an unrelated project.
+          # Running from the checkout could hide a source-tree dependency.
+          setup_project="$(mktemp -d "$RUNNER_TEMP/anneal-setup-project.XXXXXX")"
+          printf '%s\n' '[package]' 'name = "anneal-setup-smoke"' \
+            'version = "0.0.0"' 'edition = "2024"' \
+            > "$setup_project/Cargo.toml"
+          mkdir "$setup_project/src"
+          touch "$setup_project/src/lib.rs"
+          (
+            cd "$setup_project"
+            "$ANNEAL_TEST_CARGO_ANNEAL" setup --local-archive "$archive"
+          )
 
           # Exocrate's pinned configuration installs below anneal/toolchain.
           # The cache was empty before setup, so exactly one directory names
           # the artifact installed by this run, without an older-cache fallback.
           python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
           import os
           from pathlib import Path
 
@@ -201,40 +324,153 @@ jobs:
           print(f"RUSTDOC={root / 'rust/bin/rustdoc'}")
           print(f"LD_LIBRARY_PATH={root / 'rust/lib'}")
           print(f"RUSTFLAGS=-Lnative={root / 'rust/lib'} -Clink-arg=-Wl,-rpath,{root / 'rust/lib'}")
+          evidence = {
+              "source_revision": os.environ["ANNEAL_TEST_SOURCE_REVISION"],
+              "fresh_installation_root": str(root),
+              "rustc": str(root / "rust/bin/rustc"),
+              "rustdoc": str(root / "rust/bin/rustdoc"),
+              "lean": str(root / "lean/bin/lean"),
+              "driver": str(root / "bin/anneal-rustc-capture"),
+              "inspector_source": os.environ["ANNEAL_TEST_INSPECTOR"],
+          }
+          destination = Path(os.environ["ANNEAL_TEST_DIAGNOSTICS"])
+          (destination / "installation.json").write_text(
+              json.dumps(evidence, indent=2) + "\n"
+          )
           PY
           rm -f target/anneal-exocrate.tar.zst
 
       - name: Smoke-test the installed compiler session
+        id: bootstrap
         run: |
           set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/driver-bootstrap.log") 2>&1
           driver_probe="$(mktemp -d "$RUNNER_TEMP/anneal-driver.XXXXXX")"
-          mkdir -p target/diagnostics
           printf '%s\n' 'pub fn identity(n: u32) -> u32 { n }' > "$driver_probe/probe.rs"
           (
             cd "$driver_probe"
             env -i "$ANNEAL_TEST_INSTALL_ROOT/bin/anneal-rustc-capture" \
               --edition=2024 --crate-type=lib --emit=metadata \
               probe.rs -o probe.rmeta
-          ) > target/diagnostics/driver-bootstrap.stdout \
-            2> target/diagnostics/driver-bootstrap.stderr
+          ) > "$ANNEAL_TEST_DIAGNOSTICS/driver-bootstrap.stdout" \
+            2> "$ANNEAL_TEST_DIAGNOSTICS/driver-bootstrap.stderr"
           test -s "$driver_probe/probe.rmeta"
-          test ! -s target/diagnostics/driver-bootstrap.stdout
+          test ! -s "$ANNEAL_TEST_DIAGNOSTICS/driver-bootstrap.stdout"
           grep -Fx 'note: anneal-rustc-capture: compiler analysis callback reached; verification not performed' \
-            target/diagnostics/driver-bootstrap.stderr
+            "$ANNEAL_TEST_DIAGNOSTICS/driver-bootstrap.stderr"
+
+      - name: Install current auditor for smoke tests
+        id: installed_auditor
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/install-tools.log") 2>&1
+          cargo install --locked --debug --path trusted/audit \
+            --root "$ANNEAL_TEST_TOOLS_ROOT"
+          printf 'ANNEAL_TEST_AUDITOR=%s/bin/anneal-audit\n' \
+            "$ANNEAL_TEST_TOOLS_ROOT" >> "$GITHUB_ENV"
 
       - name: Audit repository trusted boundary
+        id: audit
         run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/boundary-audit.log") 2>&1
           cargo run --locked -p anneal-audit -- \
             --lean "$ANNEAL_TEST_INSTALL_ROOT/lean/bin/lean"
 
-      - name: Test Rust workspace and crate packaging
+      - name: Test Rust workspace
+        id: workspace
         run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/workspace.log") 2>&1
           cargo test --workspace --locked
+
+      - name: Check crate packaging
+        id: package
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/package.log") 2>&1
+          cargo metadata --locked --format-version 1 --no-deps \
+            > "$ANNEAL_TEST_DIAGNOSTICS/package-metadata.json"
           cargo publish --dry-run -p cargo-anneal
+          prepared_manifest="$(python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          diagnostics = Path(os.environ["ANNEAL_TEST_DIAGNOSTICS"])
+          metadata = json.loads((diagnostics / "package-metadata.json").read_text())
+          packages = [p for p in metadata["packages"] if p["name"] == "cargo-anneal"]
+          if len(packages) != 1:
+              raise SystemExit("expected exactly one cargo-anneal package")
+          package = packages[0]
+          prepared = Path(os.environ["CARGO_TARGET_DIR"]) / "package"
+          manifest = prepared / f"{package['name']}-{package['version']}" / "Cargo.toml"
+          if not manifest.is_file():
+              raise SystemExit(f"prepared crate manifest is missing: {manifest}")
+          print(manifest)
+          PY
+          )"
+          printf 'prepared_manifest=%s\n' "$prepared_manifest"
+          # Publication verification builds the packaged library and binaries.
+          # Compile the packaged tests too, so omitted fixtures or helpers
+          # cannot hide behind a successful source-tree test build.
+          cargo test --locked --manifest-path "$prepared_manifest" --no-run
+
+      - name: Run installed smoke suite
+        id: smoke
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/installed-smoke.log") 2>&1
+          unset ANNEAL_TEST_ARCHIVE ANNEAL_TEST_CASE
+          # Cargo also succeeds when a filter selects no tests. Prove that
+          # the intended ignored test exists before relying on its result.
+          cargo test --locked -p cargo-anneal --test installed_smoke -- \
+            --ignored --exact installed_smoke --list \
+            > "$ANNEAL_TEST_DIAGNOSTICS/installed-smoke-selection.stdout"
+          grep -Fx 'installed_smoke: test' \
+            "$ANNEAL_TEST_DIAGNOSTICS/installed-smoke-selection.stdout"
+          cargo test --locked -p cargo-anneal --test installed_smoke -- \
+            --ignored --exact installed_smoke --nocapture
 
       - name: Verify clean working tree
+        id: clean_tree
         run: |
           test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Record test step results
+        if: ${{ always() }}
+        env:
+          STEP_RESULTS_JSON: ${{ toJSON(steps) }}
+          TEST_JOB_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p "$ANNEAL_TEST_DIAGNOSTICS"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          steps = json.loads(os.environ["STEP_RESULTS_JSON"])
+          report = {
+              "job_status": os.environ["TEST_JOB_STATUS"],
+              "steps": {
+                  name: {key: step[key] for key in ("outcome", "conclusion")}
+                  for name, step in steps.items()
+              },
+          }
+          destination = Path(os.environ["ANNEAL_TEST_DIAGNOSTICS"]) / "steps.json"
+          destination.write_text(json.dumps(report, indent=2) + "\n")
+          PY
+
+      - name: Upload failed test diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anneal-test-diagnostics
+          path: ${{ env.ANNEAL_TEST_DIAGNOSTICS }}
+          if-no-files-found: warn
+          retention-days: 7
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
