@@ -2244,6 +2244,13 @@ impl IntrinsicOp {
     pub const fn accesses_memory(self) -> bool {
         matches!(self, IntrinsicOp::CopyNonOverlapping | IntrinsicOp::WriteBytes)
     }
+
+    /// Returns true for the pure value intrinsics (every [`IntrinsicOp`] that neither diverges
+    /// nor accesses memory, i.e. the exact subset accepted by
+    /// [`crate::lower::intrinsic::eval_intrinsic`]).
+    pub const fn is_pure_value(self) -> bool {
+        !self.is_diverging() && !self.accesses_memory()
+    }
 }
 
 impl std::fmt::Display for IntrinsicOp {
@@ -2298,6 +2305,52 @@ pub enum CallTarget {
     Fn(CalleeSymbol),
 }
 
+impl CallTarget {
+    /// Constructs an inline intrinsic call target.
+    pub const fn intrinsic(op: IntrinsicOp) -> Self {
+        CallTarget::Intrinsic(op)
+    }
+
+    /// Constructs an ordinary symbolic callee target.
+    pub fn callee(symbol: impl Into<CalleeSymbol>) -> Self {
+        CallTarget::Fn(symbol.into())
+    }
+
+    /// Returns the [`IntrinsicOp`] if this target is [`CallTarget::Intrinsic`].
+    pub const fn as_intrinsic(&self) -> Option<IntrinsicOp> {
+        match self {
+            CallTarget::Intrinsic(op) => Some(*op),
+            CallTarget::Fn(_) => None,
+        }
+    }
+
+    /// Returns the [`CalleeSymbol`] if this target is [`CallTarget::Fn`].
+    pub const fn as_callee(&self) -> Option<&CalleeSymbol> {
+        match self {
+            CallTarget::Fn(symbol) => Some(symbol),
+            CallTarget::Intrinsic(_) => None,
+        }
+    }
+}
+
+impl From<IntrinsicOp> for CallTarget {
+    fn from(op: IntrinsicOp) -> Self {
+        CallTarget::Intrinsic(op)
+    }
+}
+
+impl From<CalleeSymbol> for CallTarget {
+    fn from(symbol: CalleeSymbol) -> Self {
+        CallTarget::Fn(symbol)
+    }
+}
+
+impl From<CallTarget> for Constant {
+    fn from(target: CallTarget) -> Self {
+        Constant::FnDef(target)
+    }
+}
+
 /// Constant value in MIR operands.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Constant {
@@ -2349,6 +2402,27 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Constant(Constant),
+}
+
+impl Operand {
+    /// Constant function-item operand naming the inline intrinsic `op`.
+    pub fn intrinsic(op: IntrinsicOp) -> Self {
+        Operand::Constant(Constant::intrinsic(op))
+    }
+
+    /// Constant function-item operand naming the ordinary callee `symbol`.
+    pub fn callee(symbol: impl Into<CalleeSymbol>) -> Self {
+        Operand::Constant(Constant::callee(symbol))
+    }
+
+    /// Direct [`CallTarget`] if this operand is a [`Constant::FnDef`] function item (`None` for
+    /// indirect `Copy`/`Move` operands and non-function constants).
+    pub fn call_target(&self) -> Option<&CallTarget> {
+        match self {
+            Operand::Constant(constant) => constant.call_target(),
+            Operand::Copy(_) | Operand::Move(_) => None,
+        }
+    }
 }
 
 /// Cast flavor in `Rvalue::Cast`.

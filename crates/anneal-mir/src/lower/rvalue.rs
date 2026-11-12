@@ -1974,6 +1974,20 @@ pub fn eval_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<MirValu
     }
 }
 
+/// Validates that `bits` is a well-formed bit pattern of the integral type `ty` under
+/// `ptr_width` (`InvalidBitPattern` otherwise, never truncated).
+fn check_int_bits(bits: u128, ty: &Ty, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+    if !ty.is_integral() || !ty.is_valid_scalar_bits(bits, ptr_width) {
+        return Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: ty.clone(),
+                bits,
+            },
+        ));
+    }
+    Ok(())
+}
+
 /// Computes `(wrapped_bits, overflowed)` for integer `Add`, `Sub`, or `Mul` (plus `*WithOverflow` / `*Unchecked`).
 pub(crate) fn compute_int_arith_with_overflow(
     op: BinOp,
@@ -1982,6 +1996,13 @@ pub(crate) fn compute_int_arith_with_overflow(
     ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<(u128, bool), RvalueEvalError> {
+    if !ty.is_integral() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "integer arithmetic requires Int or Uint type",
+        ));
+    }
+    check_int_bits(lhs_bits, ty, ptr_width)?;
+    check_int_bits(rhs_bits, ty, ptr_width)?;
     match ty {
         Ty::Uint(ut) => {
             let mask = ut.mask(ptr_width);
@@ -2055,6 +2076,13 @@ fn compute_shift_with_overflow(
             ));
         }
     };
+    if !rhs_ty.is_integral() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "shift RHS must be Int or Uint",
+        ));
+    }
+    check_int_bits(lhs_bits, lhs_ty, ptr_width)?;
+    check_int_bits(rhs_bits, rhs_ty, ptr_width)?;
     let lhs_mask = lhs_ty.scalar_mask(ptr_width);
     let rhs_masked = rhs_bits & rhs_ty.scalar_mask(ptr_width);
 
@@ -2111,10 +2139,14 @@ pub(crate) fn compare_mir_values(
             },
         ) if lhs_ty == rhs_ty => match lhs_ty {
             Ty::Uint(ut) => {
+                check_int_bits(*a, lhs_ty, ptr_width)?;
+                check_int_bits(*b, rhs_ty, ptr_width)?;
                 let mask = ut.mask(ptr_width);
                 Ok((a & mask).cmp(&(b & mask)))
             }
             Ty::Int(it) => {
+                check_int_bits(*a, lhs_ty, ptr_width)?;
+                check_int_bits(*b, rhs_ty, ptr_width)?;
                 let sa = it.sign_extend(*a, ptr_width);
                 let sb = it.sign_extend(*b, ptr_width);
                 Ok(sa.cmp(&sb))
@@ -2133,9 +2165,8 @@ pub(crate) fn compare_mir_values(
                 ty: rhs_ty,
             },
         ) if allow_pointers && lhs_ty == rhs_ty && lhs_ty.is_any_ptr() => {
-            let mask = ptr_width.mask();
-            let aa = (pa.addr as u128) & mask;
-            let ab = (pb.addr as u128) & mask;
+            let aa = checked_ptr_addr(pa, lhs_ty, ptr_width)?;
+            let ab = checked_ptr_addr(pb, rhs_ty, ptr_width)?;
             if lhs_ty.is_ref() && (aa == 0 || ab == 0) {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: lhs_ty.clone(),
@@ -2283,6 +2314,13 @@ pub fn eval_binop(
                     "Div/Rem LHS and RHS types must match",
                 ));
             }
+            if !lt.is_integral() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Div/Rem requires Int or Uint type",
+                ));
+            }
+            check_int_bits(*a, lt, ptr_width)?;
+            check_int_bits(*b, rt, ptr_width)?;
             match lt {
                 Ty::Uint(ut) => {
                     let mask = ut.mask(ptr_width);
@@ -2335,6 +2373,8 @@ pub fn eval_binop(
             (MirValue::Int { bits: a, ty: lt }, MirValue::Int { bits: b, ty: rt })
                 if lt == rt && lt.is_integral() =>
             {
+                check_int_bits(*a, lt, ptr_width)?;
+                check_int_bits(*b, rt, ptr_width)?;
                 let mask = lt.scalar_mask(ptr_width);
                 let res = match op {
                     BinOp::BitAnd => (*a & *b) & mask,
@@ -2433,13 +2473,19 @@ pub fn eval_binop(
                     "Offset pointee layout is too large for the target",
                 ));
             };
-            let base_addr = u128::from(ptr.addr) & ptr_width.mask();
+            if !rhs_ty.is_integral() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Offset RHS must have Int or Uint type",
+                ));
+            }
+            let base_addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
             if ptr_ty.is_ref() && base_addr == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: ptr_ty.clone(),
                     bits: 0,
                 }));
             }
+            check_int_bits(*count_bits, rhs_ty, ptr_width)?;
             let overflow = |offset: i128| RvalueEvalError::PointerOffsetOverflow {
                 base_addr: ptr.addr,
                 offset,
@@ -2515,6 +2561,7 @@ pub fn eval_unop(
         UnOp::Not => match val {
             MirValue::Bool(b) => Ok(MirValue::Bool(!b)),
             MirValue::Int { bits, ty } if ty.is_integral() => {
+                check_int_bits(*bits, ty, ptr_width)?;
                 let mask = ty.scalar_mask(ptr_width);
                 Ok(MirValue::Int {
                     bits: (!*bits) & mask,
@@ -2528,8 +2575,9 @@ pub fn eval_unop(
         UnOp::Neg => match val {
             MirValue::Int {
                 bits,
-                ty: Ty::Int(it),
+                ty: ty @ Ty::Int(it),
             } => {
+                check_int_bits(*bits, ty, ptr_width)?;
                 let signed = it.sign_extend(*bits, ptr_width);
                 let negated = signed.wrapping_neg();
                 Ok(MirValue::Int {
@@ -10981,7 +11029,16 @@ pub(crate) fn copy_nonoverlapping_values(
                     ptr,
                     ty: ptr_ty @ (Ty::RawPtr(pointee, m) | Ty::Ref(pointee, m)),
                 } if **pointee == *elem_ty && (!need_mut || *m == Mutability::Mut) => {
-                    Ok((*ptr, checked_ptr_addr(ptr, ptr_ty, ptr_width)?))
+                    let addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
+                    if ptr_ty.is_ref() && addr == 0 {
+                        return Err(RvalueEvalError::CastEval(
+                            CastEvalError::InvalidBitPattern {
+                                target_ty: ptr_ty.clone(),
+                                bits: 0,
+                            },
+                        ));
+                    }
+                    Ok((*ptr, addr))
                 }
                 _ => Err(RvalueEvalError::TypeMismatch(
                     "copy_nonoverlapping pointers must point to the copied element type",
@@ -11018,6 +11075,9 @@ pub(crate) fn copy_nonoverlapping_values(
                 required_align: elem_align,
             });
         }
+    }
+    if (src_val.ty().is_ref() || dst_val.ty().is_ref()) && !elem_ty.is_inhabited_for(ptr_width) {
+        return Err(RvalueEvalError::UninhabitedPointee(elem_ty.clone()));
     }
     let byte_len = count
         .checked_mul(elem_size as u128)

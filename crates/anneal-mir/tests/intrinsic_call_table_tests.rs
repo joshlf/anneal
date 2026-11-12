@@ -5520,3 +5520,846 @@ fn test_a2_call_destinations_are_evaluated_after_the_arguments_and_before_the_ca
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pass B3: Out-of-width BinOp/UnOp parity, UB-before-layout ordering, CopyNonOverlapping
+// statement/call parity on references, and Episode 2 CallTarget/CallTable ergonomics
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b3_binops_and_checked_binops_reject_out_of_width_scalars_and_32bit_pointers_like_intrinsics()
+{
+    let is_invalid_bits = |res: Result<MirValue, RvalueEvalError>| {
+        matches!(
+            res,
+            Err(RvalueEvalError::CastEval(
+                CastEvalError::InvalidBitPattern { .. }
+            ))
+        )
+    };
+
+    for pw in PWS {
+        let bad_u8 = MirValue::Int {
+            bits: 0x101,
+            ty: u8_ty(),
+        };
+        let bad_shift = MirValue::Int {
+            bits: 0x100,
+            ty: u8_ty(),
+        };
+        let ok_u8 = iv(&u8_ty(), 3, pw);
+        let bad_i8 = MirValue::Int {
+            bits: 0x1FF,
+            ty: i8_ty(),
+        };
+        let ok_i8 = iv(&i8_ty(), 1, pw);
+
+        // Every binary op on integers rejects out-of-width LHS or RHS bits instead of truncating,
+        // matching `eval_intrinsic` (`Unchecked*`, `Wrapping*`, `ThreeWayCompare`).
+        let same_ty_ops = [
+            BinOp::Add,
+            BinOp::AddUnchecked,
+            BinOp::AddWithOverflow,
+            BinOp::Sub,
+            BinOp::SubUnchecked,
+            BinOp::SubWithOverflow,
+            BinOp::Mul,
+            BinOp::MulUnchecked,
+            BinOp::MulWithOverflow,
+            BinOp::Div,
+            BinOp::Rem,
+            BinOp::BitAnd,
+            BinOp::BitOr,
+            BinOp::BitXor,
+            BinOp::Eq,
+            BinOp::Ne,
+            BinOp::Lt,
+            BinOp::Le,
+            BinOp::Gt,
+            BinOp::Ge,
+            BinOp::Cmp,
+        ];
+        for op in same_ty_ops {
+            assert!(
+                is_invalid_bits(eval_binop(op, &bad_u8, &ok_u8, pw)),
+                "{op:?} LHS {pw:?}"
+            );
+            assert!(
+                is_invalid_bits(eval_binop(op, &ok_u8, &bad_u8, pw)),
+                "{op:?} RHS {pw:?}"
+            );
+            assert!(
+                is_invalid_bits(eval_binop(op, &bad_i8, &ok_i8, pw)),
+                "{op:?} signed LHS {pw:?}"
+            );
+        }
+        for op in [
+            BinOp::Shl,
+            BinOp::ShlUnchecked,
+            BinOp::Shr,
+            BinOp::ShrUnchecked,
+        ] {
+            // `0x100` in `u8` would truncate to shift count `0` if unvalidated!
+            assert!(
+                is_invalid_bits(eval_binop(op, &ok_u8, &bad_shift, pw)),
+                "{op:?} out-of-width shift RHS {pw:?}"
+            );
+            assert!(
+                is_invalid_bits(eval_binop(op, &bad_u8, &ok_u8, pw)),
+                "{op:?} out-of-width shift LHS {pw:?}"
+            );
+        }
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Shl, BinOp::Shr] {
+            assert!(
+                is_invalid_bits(eval_checked_binop(op, &bad_u8, &ok_u8, pw).map(|_| MirValue::Unit)),
+                "checked {op:?} LHS {pw:?}"
+            );
+            assert!(
+                is_invalid_bits(
+                    eval_checked_binop(op, &ok_u8, &bad_shift, pw).map(|_| MirValue::Unit)
+                ),
+                "checked {op:?} RHS {pw:?}"
+            );
+        }
+        assert!(is_invalid_bits(eval_unop(UnOp::Not, &bad_u8, pw)));
+        assert!(is_invalid_bits(eval_unop(UnOp::Neg, &bad_i8, pw)));
+
+        // Parity with `eval_intrinsic`: both produce `InvalidBitPattern`.
+        for (bin_op, intr_op) in [
+            (BinOp::AddUnchecked, IntrinsicOp::UncheckedAdd),
+            (BinOp::SubUnchecked, IntrinsicOp::UncheckedSub),
+            (BinOp::MulUnchecked, IntrinsicOp::UncheckedMul),
+            (BinOp::Div, IntrinsicOp::UncheckedDiv),
+            (BinOp::Rem, IntrinsicOp::UncheckedRem),
+            (BinOp::ShlUnchecked, IntrinsicOp::UncheckedShl),
+            (BinOp::ShrUnchecked, IntrinsicOp::UncheckedShr),
+            (BinOp::Cmp, IntrinsicOp::ThreeWayCompare),
+        ] {
+            let ret_ty = if intr_op == IntrinsicOp::ThreeWayCompare {
+                i8_ty()
+            } else {
+                u8_ty()
+            };
+            assert_eq!(
+                eval_binop(bin_op, &ok_u8, &bad_shift, pw),
+                eval_intrinsic(intr_op, &[ok_u8.clone(), bad_shift.clone()], &ret_ty, pw),
+                "{bin_op:?} vs {intr_op:?} on {pw:?}"
+            );
+        }
+
+        // Null references are invalid values in both `BinOp::Offset` and pointer comparisons.
+        let ref_ty = reference(u32_ty(), Mutability::Not);
+        let null_ref = MirValue::Ptr {
+            ptr: PointerValue::without_provenance(0),
+            ty: ref_ty.clone(),
+        };
+        let non_null_ref = MirValue::Ptr {
+            ptr: PointerValue::with_provenance(0x1000, 7, 1),
+            ty: ref_ty,
+        };
+        assert!(is_invalid_bits(eval_binop(
+            BinOp::Offset,
+            &null_ref,
+            &isizev(0, pw),
+            pw
+        )));
+        for cmp_op in [
+            BinOp::Eq,
+            BinOp::Ne,
+            BinOp::Lt,
+            BinOp::Le,
+            BinOp::Gt,
+            BinOp::Ge,
+        ] {
+            assert!(is_invalid_bits(eval_binop(
+                cmp_op,
+                &null_ref,
+                &non_null_ref,
+                pw
+            )));
+            assert!(is_invalid_bits(eval_binop(
+                cmp_op,
+                &non_null_ref,
+                &null_ref,
+                pw
+            )));
+        }
+    }
+
+    // On 32-bit targets, 64-bit pointer addresses above `u32::MAX` and `usize` bits above
+    // `u32::MAX` are rejected in `BinOp::Offset` and pointer comparisons, matching `ArithOffset`.
+    let raw_u32 = raw(u32_ty(), Mutability::Not);
+    let oob_ptr32 = MirValue::Ptr {
+        ptr: PointerValue::with_provenance((1u64 << 32) + 0x1000, 7, 1),
+        ty: raw_u32.clone(),
+    };
+    let ok_ptr32 = MirValue::Ptr {
+        ptr: PointerValue::with_provenance(0x1000, 7, 1),
+        ty: raw_u32.clone(),
+    };
+    let oob_usize32 = MirValue::Int {
+        bits: (1u128 << 32) + 1,
+        ty: usize_ty(),
+    };
+    assert!(is_invalid_bits(eval_binop(
+        BinOp::Offset,
+        &oob_ptr32,
+        &isizev(0, PtrWidth::Bits32),
+        PtrWidth::Bits32
+    )));
+    assert!(is_invalid_bits(eval_binop(
+        BinOp::Offset,
+        &ok_ptr32,
+        &oob_usize32,
+        PtrWidth::Bits32
+    )));
+    assert_eq!(
+        eval_binop(
+            BinOp::Offset,
+            &oob_ptr32,
+            &isizev(0, PtrWidth::Bits32),
+            PtrWidth::Bits32
+        ),
+        eval_intrinsic(
+            IntrinsicOp::ArithOffset,
+            &[oob_ptr32.clone(), isizev(0, PtrWidth::Bits32)],
+            &raw_u32,
+            PtrWidth::Bits32
+        )
+    );
+    for cmp_op in [
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+    ] {
+        assert!(is_invalid_bits(eval_binop(
+            cmp_op,
+            &oob_ptr32,
+            &ok_ptr32,
+            PtrWidth::Bits32
+        )));
+        assert!(is_invalid_bits(eval_binop(
+            cmp_op,
+            &ok_ptr32,
+            &oob_ptr32,
+            PtrWidth::Bits32
+        )));
+    }
+}
+
+#[test]
+fn test_b3_pointer_intrinsics_validate_argument_well_formedness_before_unspecified_or_too_large_layouts()
+{
+    let unspecified = AdtDef::new_enum(
+        "UnspecifiedEnum",
+        None,
+        vec![
+            VariantDef::new("A", vec![u8_ty()]),
+            VariantDef::new("B", vec![u32_ty()]),
+        ],
+    )
+    .into_ty();
+    // `[u16; usize::MAX]` overflows `isize::MAX` (`LayoutError::TooLarge`) on both pointer widths.
+    let too_large = Ty::Array(Box::new(u16_ty()), usize::MAX);
+
+    for pw in PWS {
+        let dummy_body = lower(&mk(vec![unit()], vec![blk(vec![], Terminator::Return)]), pw);
+        let mut state = StatementEvalState::from_body(&dummy_body, &[]).unwrap();
+
+        for bad_pointee in [&unspecified, &too_large] {
+            let ref_const = reference(bad_pointee.clone(), Mutability::Not);
+            let ref_mut = reference(bad_pointee.clone(), Mutability::Mut);
+            let raw_const = raw(bad_pointee.clone(), Mutability::Not);
+            let raw_mut = raw(bad_pointee.clone(), Mutability::Mut);
+
+            let null_ref_const = MirValue::Ptr {
+                ptr: PointerValue::without_provenance(0),
+                ty: ref_const.clone(),
+            };
+            let null_ref_mut = MirValue::Ptr {
+                ptr: PointerValue::without_provenance(0),
+                ty: ref_mut.clone(),
+            };
+            let valid_raw_mut = MirValue::Ptr {
+                ptr: PointerValue::with_provenance(0x1000, 9, 1),
+                ty: raw_mut.clone(),
+            };
+            let valid_raw_const = MirValue::Ptr {
+                ptr: PointerValue::with_provenance(0x1000, 9, 1),
+                ty: raw_const.clone(),
+            };
+
+            // Null `&E` / `&mut E` is immediate `InvalidBitPattern` UB, never masked as
+            // `UnsupportedLayout` or `LayoutTooLarge`!
+            for op in [IntrinsicOp::SizeOfVal, IntrinsicOp::AlignOfVal] {
+                assert_eq!(
+                    eval_intrinsic(op, std::slice::from_ref(&null_ref_const), &usize_ty(), pw),
+                    Err(RvalueEvalError::CastEval(
+                        CastEvalError::InvalidBitPattern {
+                            target_ty: ref_const.clone(),
+                            bits: 0,
+                        }
+                    ))
+                );
+                assert_eq!(
+                    eval_intrinsic_call(
+                        op,
+                        std::slice::from_ref(&null_ref_const),
+                        std::slice::from_ref(&ref_const),
+                        &usize_ty(),
+                        &mut state
+                    ),
+                    Err(RvalueEvalError::CastEval(
+                        CastEvalError::InvalidBitPattern {
+                            target_ty: ref_const.clone(),
+                            bits: 0,
+                        }
+                    ))
+                );
+            }
+            assert_eq!(
+                eval_intrinsic(
+                    IntrinsicOp::ArithOffset,
+                    &[null_ref_const.clone(), isizev(0, pw)],
+                    &raw_const,
+                    pw
+                ),
+                Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ref_const.clone(),
+                        bits: 0,
+                    }
+                ))
+            );
+            assert_eq!(
+                eval_intrinsic_call(
+                    IntrinsicOp::CopyNonOverlapping,
+                    &[
+                        null_ref_const.clone(),
+                        valid_raw_mut.clone(),
+                        usizev(0, pw)
+                    ],
+                    &[ref_const.clone(), raw_mut.clone(), usize_ty()],
+                    &unit(),
+                    &mut state,
+                ),
+                Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ref_const.clone(),
+                        bits: 0,
+                    }
+                ))
+            );
+            assert_eq!(
+                eval_intrinsic_call(
+                    IntrinsicOp::WriteBytes,
+                    &[null_ref_mut.clone(), iv(&u8_ty(), 0, pw), usizev(0, pw)],
+                    &[ref_mut.clone(), u8_ty(), usize_ty()],
+                    &unit(),
+                    &mut state,
+                ),
+                Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ref_mut.clone(),
+                        bits: 0,
+                    }
+                ))
+            );
+
+            // Runtime argument type mismatch is reported as `TypeMismatch` before layout errors.
+            assert!(matches!(
+                eval_intrinsic_call(
+                    IntrinsicOp::SizeOfVal,
+                    &[MirValue::Bool(true)],
+                    std::slice::from_ref(&raw_const),
+                    &usize_ty(),
+                    &mut state,
+                ),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+
+            // Once arguments are well-formed (e.g. non-null raw pointer), the layout error is
+            // reported cleanly (`UnsupportedLayout` vs `LayoutTooLarge`).
+            let expected_layout_err = if bad_pointee == &unspecified {
+                RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                    ty: unspecified.clone(),
+                })
+            } else {
+                RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
+                    ty: too_large.clone(),
+                })
+            };
+            assert_eq!(
+                eval_intrinsic(
+                    IntrinsicOp::SizeOfVal,
+                    std::slice::from_ref(&valid_raw_const),
+                    &usize_ty(),
+                    pw
+                ),
+                Err(expected_layout_err.clone())
+            );
+            assert_eq!(
+                eval_intrinsic_call(
+                    IntrinsicOp::WriteBytes,
+                    &[valid_raw_mut, iv(&u8_ty(), 0, pw), usizev(0, pw)],
+                    &[raw_mut, u8_ty(), usize_ty()],
+                    &unit(),
+                    &mut state,
+                ),
+                Err(expected_layout_err)
+            );
+        }
+    }
+
+    // On 32-bit targets, out-of-width pointer or count arguments also report `InvalidBitPattern`
+    // before `UnsupportedLayout`.
+    let raw_unspec = raw(unspecified.clone(), Mutability::Mut);
+    let oob_ptr32 = MirValue::Ptr {
+        ptr: PointerValue::with_provenance((1u64 << 32) + 8, 9, 1),
+        ty: raw_unspec.clone(),
+    };
+    assert_eq!(
+        eval_intrinsic(
+            IntrinsicOp::AlignOfVal,
+            std::slice::from_ref(&oob_ptr32),
+            &usize_ty(),
+            PtrWidth::Bits32
+        ),
+        Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: raw_unspec,
+                bits: u128::from((1u64 << 32) + 8),
+            }
+        ))
+    );
+}
+
+#[test]
+fn test_b3_copy_nonoverlapping_statement_and_call_forms_agree_on_null_and_uninhabited_references() {
+    let normalize = |r: Result<CfgEvalOutcome, CfgEvalError>| match r {
+        Ok(outcome) => Ok(outcome),
+        Err(CfgEvalError::Terminator { error, .. } | CfgEvalError::Statement { error, .. }) => {
+            Err(error)
+        }
+        Err(other) => panic!("unexpected error {other:?}"),
+    };
+
+    for pw in PWS {
+        let make_copy_body = |as_call: bool,
+                              src_ty: Ty,
+                              dst_ty: Ty,
+                              src: Operand,
+                              dst: Operand,
+                              count: Operand| {
+            let decls = vec![unit(), src_ty, dst_ty];
+            let mut stmts = Vec::new();
+            let bb0 = if as_call {
+                blk(
+                    stmts,
+                    call(
+                        intrinsic(IntrinsicOp::CopyNonOverlapping),
+                        vec![src, dst, count],
+                        0,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                )
+            } else {
+                stmts.push(Statement::CopyNonOverlapping { src, dst, count });
+                blk(stmts, Terminator::Goto { target: 1 })
+            };
+            mk(decls, vec![bb0, blk(vec![], Terminator::Return)])
+        };
+
+        // 1. Null `&u32` or `&mut u32` in locals read by `Statement::CopyNonOverlapping` vs
+        // `Terminator::Call(IntrinsicOp::CopyNonOverlapping)`: both report `InvalidBitPattern`
+        // (unlike null `*const u32`, which reports `NullPointerAccess`).
+        let ref_u32 = reference(u32_ty(), Mutability::Not);
+        let ref_mut_u32 = reference(u32_ty(), Mutability::Mut);
+        let raw_u32 = raw(u32_ty(), Mutability::Not);
+        let raw_mut_u32 = raw(u32_ty(), Mutability::Mut);
+
+        let null_ref_val = MirValue::Ptr {
+            ptr: PointerValue::without_provenance(0),
+            ty: ref_u32.clone(),
+        };
+        let ok_raw_mut_val = MirValue::Ptr {
+            ptr: PointerValue::with_provenance(0x2000, 99, 1),
+            ty: raw_mut_u32.clone(),
+        };
+        let ok_raw_val = MirValue::Ptr {
+            ptr: PointerValue::with_provenance(0x1000, 98, 1),
+            ty: raw_u32.clone(),
+        };
+        let null_ref_mut_val = MirValue::Ptr {
+            ptr: PointerValue::without_provenance(0),
+            ty: ref_mut_u32.clone(),
+        };
+
+        for (src_ty, dst_ty, src_val, dst_val, expected_ty) in [
+            (
+                ref_u32.clone(),
+                raw_mut_u32.clone(),
+                null_ref_val,
+                ok_raw_mut_val,
+                ref_u32.clone(),
+            ),
+            (
+                raw_u32.clone(),
+                ref_mut_u32.clone(),
+                ok_raw_val,
+                null_ref_mut_val,
+                ref_mut_u32.clone(),
+            ),
+        ] {
+            for n in [0u128, 1] {
+                let make_state = || {
+                    StatementEvalState::new(
+                        vec![unit(), src_ty.clone(), dst_ty.clone()],
+                        vec![
+                            LocalSlotState::Uninit,
+                            LocalSlotState::Init(src_val.clone()),
+                            LocalSlotState::Init(dst_val.clone()),
+                        ],
+                        pw,
+                    )
+                };
+                let via_call = normalize(eval_cfg_in_state(
+                    &lower(
+                        &make_copy_body(
+                            true,
+                            src_ty.clone(),
+                            dst_ty.clone(),
+                            cp(1),
+                            cp(2),
+                            cst(n, usize_ty()),
+                        ),
+                        pw,
+                    ),
+                    make_state(),
+                    0,
+                    4,
+                    None,
+                ));
+                let via_stmt = normalize(eval_cfg_in_state(
+                    &lower(
+                        &make_copy_body(
+                            false,
+                            src_ty.clone(),
+                            dst_ty.clone(),
+                            cp(1),
+                            cp(2),
+                            cst(n, usize_ty()),
+                        ),
+                        pw,
+                    ),
+                    make_state(),
+                    0,
+                    4,
+                    None,
+                ));
+                assert_eq!(via_call, via_stmt);
+                assert_eq!(
+                    via_stmt,
+                    Err(RvalueEvalError::CastEval(
+                        CastEvalError::InvalidBitPattern {
+                            target_ty: expected_ty.clone(),
+                            bits: 0,
+                        }
+                    ))
+                );
+            }
+        }
+
+        // 2. Non-null aligned `&!` / `&mut !`: uninhabited reference is UB (`UninhabitedPointee`)
+        // for `count = 0, 1, 3` in both statement and call forms, whereas raw `*const !` / `*mut !`
+        // with external provenance succeeds as a zero-byte no-op.
+        let ref_never = reference(Ty::Never, Mutability::Not);
+        let ref_mut_never = reference(Ty::Never, Mutability::Mut);
+        let raw_never = raw(Ty::Never, Mutability::Not);
+        let raw_mut_never = raw(Ty::Never, Mutability::Mut);
+
+        for n in [0u128, 1, 3] {
+            let via_call = normalize(eval_lowered_body_cfg(
+                &lower(
+                    &make_copy_body(
+                        true,
+                        ref_never.clone(),
+                        raw_mut_never.clone(),
+                        cp(1),
+                        cp(2),
+                        cst(n, usize_ty()),
+                    ),
+                    pw,
+                ),
+                &[
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x1000, 98, 1),
+                        ty: ref_never.clone(),
+                    },
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x2000, 99, 1),
+                        ty: raw_mut_never.clone(),
+                    },
+                ],
+                4,
+            ));
+            let via_stmt = normalize(eval_lowered_body_cfg(
+                &lower(
+                    &make_copy_body(
+                        false,
+                        ref_never.clone(),
+                        raw_mut_never.clone(),
+                        cp(1),
+                        cp(2),
+                        cst(n, usize_ty()),
+                    ),
+                    pw,
+                ),
+                &[
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x1000, 98, 1),
+                        ty: ref_never.clone(),
+                    },
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x2000, 99, 1),
+                        ty: raw_mut_never.clone(),
+                    },
+                ],
+                4,
+            ));
+            assert_eq!(via_call, via_stmt);
+            assert_eq!(via_stmt, Err(RvalueEvalError::UninhabitedPointee(Ty::Never)));
+
+            // Mutable destination `&mut !` with raw `*const !` source also reports `UninhabitedPointee`.
+            let via_stmt_mut = normalize(eval_lowered_body_cfg(
+                &lower(
+                    &make_copy_body(
+                        false,
+                        raw_never.clone(),
+                        ref_mut_never.clone(),
+                        cp(1),
+                        cp(2),
+                        cst(n, usize_ty()),
+                    ),
+                    pw,
+                ),
+                &[
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x1000, 98, 1),
+                        ty: raw_never.clone(),
+                    },
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x2000, 99, 1),
+                        ty: ref_mut_never.clone(),
+                    },
+                ],
+                4,
+            ));
+            assert_eq!(
+                via_stmt_mut,
+                Err(RvalueEvalError::UninhabitedPointee(Ty::Never))
+            );
+
+            // Raw pointers `*const !` / `*mut !` with external provenance are valid for ZST copy.
+            let raw_ok = normalize(eval_lowered_body_cfg(
+                &lower(
+                    &make_copy_body(
+                        true,
+                        raw_never.clone(),
+                        raw_mut_never.clone(),
+                        cp(1),
+                        cp(2),
+                        cst(n, usize_ty()),
+                    ),
+                    pw,
+                ),
+                &[
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x1000, 98, 1),
+                        ty: raw_never.clone(),
+                    },
+                    MirValue::Ptr {
+                        ptr: PointerValue::with_provenance(0x2000, 99, 1),
+                        ty: raw_mut_never.clone(),
+                    },
+                ],
+                4,
+            ));
+            assert_eq!(raw_ok, Ok(CfgEvalOutcome::Returned(MirValue::Unit)));
+        }
+    }
+}
+
+#[test]
+fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler() {
+    // 1. `IntrinsicOp::is_pure_value` partitions `IntrinsicOp::ALL` cleanly with
+    //    `accesses_memory` and `is_diverging` (`25 + 2 + 3 == 30`).
+    let mut pure_count = 0usize;
+    let mut mem_count = 0usize;
+    let mut div_count = 0usize;
+    for op in IntrinsicOp::ALL {
+        let flags =
+            usize::from(op.is_pure_value()) + usize::from(op.accesses_memory()) + usize::from(op.is_diverging());
+        assert_eq!(flags, 1, "{op:?} must belong to exactly one category");
+        if op.is_pure_value() {
+            pure_count += 1;
+        } else if op.accesses_memory() {
+            mem_count += 1;
+        } else {
+            div_count += 1;
+        }
+    }
+    assert_eq!((pure_count, mem_count, div_count), (25, 2, 3));
+
+    // 2. `CallTarget`, `Constant`, `Operand`, and `LoweredTerminator` constructors/extractors.
+    let intr_target = CallTarget::intrinsic(IntrinsicOp::Ctlz);
+    assert_eq!(CallTarget::from(IntrinsicOp::Ctlz), intr_target);
+    assert_eq!(intr_target.as_intrinsic(), Some(IntrinsicOp::Ctlz));
+    assert_eq!(intr_target.as_callee(), None);
+
+    let sym = CalleeSymbol::new("my_crate::helper");
+    let fn_target = CallTarget::callee("my_crate::helper");
+    assert_eq!(CallTarget::from(sym.clone()), fn_target);
+    assert_eq!(fn_target.as_callee(), Some(&sym));
+    assert_eq!(fn_target.as_intrinsic(), None);
+
+    let intr_op = Operand::intrinsic(IntrinsicOp::Ctlz);
+    let fn_op = Operand::callee("my_crate::helper");
+    assert_eq!(intr_op.call_target(), Some(&intr_target));
+    assert_eq!(fn_op.call_target(), Some(&fn_target));
+    assert_eq!(Constant::from(fn_target.clone()).call_target(), Some(&fn_target));
+    assert_eq!(cp(1).call_target(), None);
+    assert_eq!(cst(0, u32_ty()).call_target(), None);
+
+    // 3. `LoweredTerminator::call_target` and `eval_lowered_body_cfg_with_call_table_and_calls`:
+    //    root -> linked `wrapper(x)` -> unlinked external `ext_hook(x + 1)` handled by `call_handler`
+    //    (both normal return and panic unwinding through linked caller's cleanup block!).
+    for pw in PWS {
+        let wrapper = lower(
+            &mk(
+                vec![u32_ty(), u32_ty(), u32_ty()],
+                vec![
+                    blk(
+                        vec![
+                            live(2),
+                            assign(
+                                2,
+                                Rvalue::BinaryOp(BinOp::Add, cp(1), cst(1, u32_ty())),
+                            ),
+                        ],
+                        Terminator::Call {
+                            func: Operand::callee("ext_hook"),
+                            args: vec![cp(2)],
+                            destination: place(0),
+                            target: Some(1),
+                            unwind: UnwindAction::Continue,
+                        },
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            ),
+            pw,
+        );
+        assert_eq!(
+            wrapper.basic_blocks[0]
+                .terminator
+                .as_ref()
+                .and_then(LoweredTerminator::call_target),
+            Some(&CallTarget::callee("ext_hook"))
+        );
+        assert_eq!(
+            wrapper.basic_blocks[1]
+                .terminator
+                .as_ref()
+                .and_then(LoweredTerminator::call_target),
+            None
+        );
+
+        let root = lower(
+            &mk(
+                vec![u32_ty(), u32_ty(), u32_ty()],
+                vec![
+                    blk(
+                        vec![live(2), assign(2, Rvalue::Use(cst(0, u32_ty())))],
+                        Terminator::Call {
+                            func: Operand::callee("wrapper"),
+                            args: vec![cp(1)],
+                            destination: place(0),
+                            target: Some(1),
+                            unwind: UnwindAction::Cleanup(2),
+                        },
+                    ),
+                    blk(
+                        vec![assign(
+                            0,
+                            Rvalue::BinaryOp(BinOp::Add, cp(0), cp(2)),
+                        )],
+                        Terminator::Return,
+                    ),
+                    cleanup_blk(
+                        vec![assign(2, Rvalue::Use(cst(99, u32_ty())))],
+                        Terminator::UnwindResume,
+                    ),
+                ],
+            ),
+            pw,
+        );
+
+        let table = CallTable::new().with_callee("wrapper", 1, wrapper);
+
+        // Without a call handler, the unlinked `ext_hook` inside `wrapper` fails with `InCallee`
+        // wrapping `UnknownCallee`.
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(&root, &[iv(&u32_ty(), 10, pw)], 8, &table),
+            Err(CfgEvalError::InCallee {
+                call_stack: vec![CallSite {
+                    bb: 0,
+                    callee: CalleeSymbol::new("wrapper"),
+                }],
+                error: Box::new(CfgEvalError::UnknownCallee {
+                    bb: 0,
+                    callee: CalleeSymbol::new("ext_hook"),
+                }),
+            })
+        );
+
+        // With `eval_lowered_body_cfg_with_call_table_and_calls`, `call_handler` intercepts
+        // `ext_hook(11)` inside `wrapper` and returns `33`.
+        let out = eval_lowered_body_cfg_with_call_table_and_calls(
+            &root,
+            &[iv(&u32_ty(), 10, pw)],
+            8,
+            &table,
+            |bb, func_val, args| {
+                assert_eq!(bb, 0);
+                assert_eq!(func_val, &MirValue::Unit);
+                assert_eq!(args, &[iv(&u32_ty(), 11, pw)]);
+                Ok(CallOutcome::Return(iv(&u32_ty(), 33, pw)))
+            },
+        );
+        assert_eq!(returned(out), iv(&u32_ty(), 33, pw));
+
+        // When `call_handler` panics inside `wrapper`, the unwind propagates cleanly out of
+        // `wrapper` (`UnwindAction::Continue`), runs `root`'s cleanup block `bb2`, and surfaces
+        // `Panicked` with `root`'s call-site `bb: 0` and the custom panic message.
+        let panicked = eval_lowered_body_cfg_with_call_table_and_calls(
+            &root,
+            &[iv(&u32_ty(), 10, pw)],
+            8,
+            &table,
+            |_, _, _| Ok(CallOutcome::Panic("ext_hook boom".to_owned())),
+        );
+        assert_eq!(
+            panicked,
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: PanicMessage::Custom("ext_hook boom".to_owned()),
+            })
+        );
+    }
+}
+

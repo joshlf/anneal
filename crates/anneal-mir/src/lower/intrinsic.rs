@@ -272,6 +272,50 @@ pub fn check_intrinsic_call_types(
     }
 }
 
+/// Validates `check_intrinsic_call_types` and `check_value_well_formed` on `args` so signature
+/// and ill-formed ADT errors come first, then undefined-behavior bit-pattern checks on the
+/// argument values (`InvalidBitPattern`, e.g. a null `&T` or out-of-width pointer), and only
+/// then representability / unspecified-layout errors (`LayoutTooLarge` / `UnsupportedLayout`).
+fn check_intrinsic_args_and_types(
+    op: IntrinsicOp,
+    args: &[MirValue],
+    arg_tys: &[Ty],
+    dest_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<(), RvalueEvalError> {
+    if args.len() != arg_tys.len()
+        || args
+            .iter()
+            .zip(arg_tys)
+            .any(|(arg, ty)| !mir_value_matches_ty(arg, ty))
+    {
+        return Err(RvalueEvalError::TypeMismatch(
+            "intrinsic argument values do not match their static types",
+        ));
+    }
+    match check_intrinsic_call_types(op, arg_tys, dest_ty, ptr_width) {
+        Ok(()) => {
+            for arg in args {
+                check_value_well_formed(arg, ptr_width)?;
+            }
+            Ok(())
+        }
+        Err(
+            err @ (IntrinsicTypeError::Signature(_)
+            | IntrinsicTypeError::Layout {
+                error: LayoutError::IllFormed(_),
+                ..
+            }),
+        ) => Err(err.into_eval_error()),
+        Err(layout_err) => {
+            for arg in args {
+                check_value_well_formed(arg, ptr_width)?;
+            }
+            Err(layout_err.into_eval_error())
+        }
+    }
+}
+
 /// Evaluates a value intrinsic (every [`IntrinsicOp`] except the memory intrinsics
 /// `CopyNonOverlapping` / `WriteBytes` and the diverging entry points, which need a call's
 /// evaluation state: [`eval_intrinsic_call`]) on the arguments `args` returning `dest_ty`
@@ -279,26 +323,22 @@ pub fn check_intrinsic_call_types(
 ///
 /// The argument types are the arguments' runtime types, which must satisfy
 /// [`check_intrinsic_call_types`] (`TypeMismatch`, or the `CastEval` layout error); every
-/// argument and the result must be well formed (`InvalidBitPattern`). `UbChecks` returns
-/// `true` (`Trusted`'s `ubChecks`), and every other intrinsic behaves exactly as in
-/// [`eval_intrinsic_call`].
+/// argument and the result must be well formed (`InvalidBitPattern`, checked before
+/// `TooLarge`/`Unspecified` pointee layout errors). `UbChecks` returns `true` (`Trusted`'s
+/// `ubChecks`), and every other intrinsic behaves exactly as in [`eval_intrinsic_call`].
 pub fn eval_intrinsic(
     op: IntrinsicOp,
     args: &[MirValue],
     dest_ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<MirValue, RvalueEvalError> {
-    if op.is_diverging() || op.accesses_memory() {
+    if !op.is_pure_value() {
         return Err(RvalueEvalError::TypeMismatch(
             "eval_intrinsic evaluates value intrinsics only (see eval_intrinsic_call)",
         ));
     }
     let arg_tys: Vec<Ty> = args.iter().map(MirValue::ty).collect();
-    check_intrinsic_call_types(op, &arg_tys, dest_ty, ptr_width)
-        .map_err(IntrinsicTypeError::into_eval_error)?;
-    for arg in args {
-        check_value_well_formed(arg, ptr_width)?;
-    }
+    check_intrinsic_args_and_types(op, args, &arg_tys, dest_ty, ptr_width)?;
     let val = eval_value_intrinsic(op, args, dest_ty, ptr_width, true)?;
     check_value_well_formed(&val, ptr_width)?;
     Ok(val)
@@ -309,7 +349,8 @@ pub fn eval_intrinsic(
 ///
 /// The call must be well typed ([`check_intrinsic_call_types`]: `TypeMismatch`, or the
 /// `CastEval` layout error), every argument value must match its type (`TypeMismatch`) and be
-/// well formed (`InvalidBitPattern`). Then:
+/// well formed (`InvalidBitPattern`, checked before `TooLarge`/`Unspecified` pointee layout
+/// errors). Then:
 /// - the diverging entry points report their outcome without touching `state`
 ///   ([`IntrinsicOutcome::Unreachable`], [`IntrinsicOutcome::Abort`],
 ///   [`IntrinsicOutcome::Panic`]);
@@ -328,21 +369,7 @@ pub fn eval_intrinsic_call(
     state: &mut StatementEvalState,
 ) -> Result<IntrinsicOutcome, RvalueEvalError> {
     let ptr_width = state.ptr_width;
-    check_intrinsic_call_types(op, arg_tys, dest_ty, ptr_width)
-        .map_err(IntrinsicTypeError::into_eval_error)?;
-    if args.len() != arg_tys.len()
-        || args
-            .iter()
-            .zip(arg_tys)
-            .any(|(arg, ty)| !mir_value_matches_ty(arg, ty))
-    {
-        return Err(RvalueEvalError::TypeMismatch(
-            "intrinsic argument values do not match their static types",
-        ));
-    }
-    for arg in args {
-        check_value_well_formed(arg, ptr_width)?;
-    }
+    check_intrinsic_args_and_types(op, args, arg_tys, dest_ty, ptr_width)?;
     match op {
         IntrinsicOp::UnreachableUnchecked => Ok(IntrinsicOutcome::Unreachable),
         IntrinsicOp::Abort => Ok(IntrinsicOutcome::Abort),

@@ -233,6 +233,19 @@ pub enum LoweredTerminator {
     UnwindTerminate,
 }
 
+impl LoweredTerminator {
+    /// Direct [`CallTarget`] if this terminator is a `Call` of a [`Constant::FnDef`] function
+    /// item (`None` for indirect `Call`s and non-`Call` terminators).
+    ///
+    /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
+    pub fn call_target(&self) -> Option<&CallTarget> {
+        match self {
+            LoweredTerminator::Call { func, .. } => func.call_target(),
+            _ => None,
+        }
+    }
+}
+
 /// Lowers the terminator `term` of basic block `bb` of `body` under `ptr_width`.
 ///
 /// Checks every jump target against the body's blocks and `rustc`'s cleanup discipline (normal
@@ -1137,10 +1150,7 @@ fn check_goto(
 ///
 /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
 fn call_target_of(func: &Operand) -> Option<&CallTarget> {
-    match func {
-        Operand::Constant(constant) => constant.call_target(),
-        Operand::Copy(_) | Operand::Move(_) => None,
-    }
+    func.call_target()
 }
 
 /// A call's evaluated callee, arguments, and destination (see [`prepare_call`]).
@@ -1534,6 +1544,24 @@ pub fn eval_lowered_body_cfg_with_call_table(
     let state =
         StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
     eval_frames(body, state, 0, fuel, Some(table), None)
+}
+
+/// [`eval_lowered_body_cfg_with_call_table`] with `call_handler` handling every unlinked or
+/// indirect `Call` across all frames (mirroring
+/// `Trusted.VerificationResult.mirHandledTreeWithCallees`).
+pub fn eval_lowered_body_cfg_with_call_table_and_calls<F>(
+    body: &LoweredBody,
+    args: &[MirValue],
+    fuel: usize,
+    table: &CallTable,
+    mut call_handler: F,
+) -> Result<CfgEvalOutcome, CfgEvalError>
+where
+    F: FnMut(usize, &MirValue, &[MirValue]) -> Result<CallOutcome, RvalueEvalError>,
+{
+    let state =
+        StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
+    eval_frames(body, state, 0, fuel, Some(table), Some(&mut call_handler))
 }
 
 /// A linked call waiting in its caller's frame.
