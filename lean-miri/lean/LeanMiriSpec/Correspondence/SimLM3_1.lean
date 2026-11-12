@@ -32141,6 +32141,8 @@ inductive WellTypedLM3_1StateStmt
       (get? s.frame.locals ptrIdx = some .dead ∨ get? s.frame.locals ptrIdx = some .uninit) →
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .ptrMetadata (opKind ⟨ptrIdx, .nil⟩)), span⟩
+  /-- `D12`: same-allocation raw-pointer comparison (`e₁.localIdx = e₂.localIdx`), all
+  six `IsCmpBinOp` operators (`step_rawPtr_cmp_same_alloc_simulation`). -/
   | rawPtrCmpSameAlloc
       (dstIdx lhsIdx rhsIdx : Local) (opKind₁ opKind₂ : Place → MirAst.Operand)
       (bop : MirAst.BinOp) (dstDecl lhsDecl rhsDecl : LocalDecl)
@@ -32169,6 +32171,8 @@ inductive WellTypedLM3_1StateStmt
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩
           (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩
+  /-- `D12`: cross-local `Eq`/`Ne` between tracked raw pointers with offsets `< 65536`
+  (`step_rawPtr_cmp_cross_local_eq_ne_simulation`). -/
   | rawPtrCmpCrossLocalEqNe
       (dstIdx lhsIdx rhsIdx : Local) (opKind₁ opKind₂ : Place → MirAst.Operand)
       (bop : MirAst.BinOp) (dstDecl lhsDecl rhsDecl : LocalDecl)
@@ -32197,6 +32201,9 @@ inductive WellTypedLM3_1StateStmt
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩
           (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩
+  /-- `D12`: tracked raw pointer vs. ANY low integer scalar `sc₂.bits < 2 ^ 32` (null `0`,
+  `NonNull::<T>::dangling()`, ...), all six operators; despite the constructor name it is
+  not restricted to null (`step_rawPtr_cmp_ptr_low_scalar_simulation`). -/
   | rawPtrCmpPtrNull
       (dstIdx lhsIdx rhsIdx : Local) (opKind₁ opKind₂ : Place → MirAst.Operand)
       (bop : MirAst.BinOp) (dstDecl lhsDecl rhsDecl : LocalDecl)
@@ -32223,6 +32230,9 @@ inductive WellTypedLM3_1StateStmt
       WellTypedLM3_1StateStmt body s m allocMap
         ⟨.assign ⟨dstIdx, .nil⟩
           (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩
+  /-- `D12`: ANY low integer scalar `sc₁.bits < 2 ^ 32` (null `0`,
+  `NonNull::<T>::dangling()`, ...) vs. tracked raw pointer, all six operators; despite the
+  constructor name it is not restricted to null (`step_rawPtr_cmp_low_scalar_ptr_simulation`). -/
   | rawPtrCmpNullPtr
       (dstIdx lhsIdx rhsIdx : Local) (opKind₁ opKind₂ : Place → MirAst.Operand)
       (bop : MirAst.BinOp) (dstDecl lhsDecl rhsDecl : LocalDecl)
