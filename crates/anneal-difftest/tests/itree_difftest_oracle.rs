@@ -17,10 +17,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anneal_difftest::itree_eval::{
-    ITREE_CONFIRM_CHUNK_SIZE, ITREE_SAFE_SEEDS, ItreeEvalOptions,
+    ITREE_CONFIRM_CHUNK_SIZE, ITREE_SAFE_SEEDS, ItreeEvalOptions, ItreeFindingBundle,
     evaluate_itree_batches_with_options, reproduce_itree_finding,
 };
-use anneal_difftest::mutators_itree::{generate_itree_batch, generate_itree_identity_batch};
+use anneal_difftest::mutators_itree::{
+    GeneratedItreeCandidate, generate_itree_batch, generate_itree_identity_batch,
+    reconstruct_itree_mutation_steps, replay_itree_mutation_steps,
+};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -42,6 +45,78 @@ fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("repo root")
         .to_path_buf()
+}
+
+/// Checks that every finding of a seeded single-batch run was shrunk against the
+/// live oracle and that its repro-facing artifacts describe the minimized
+/// candidate, returning the number of findings whose chain shrinking reduced.
+fn assert_itree_findings_shrunk(
+    findings: &[ItreeFindingBundle],
+    batch: &[GeneratedItreeCandidate],
+) -> usize {
+    let mut reduced = 0usize;
+    for f in findings {
+        let c_idx: usize = f
+            .fn_name
+            .strip_prefix("b0_c")
+            .and_then(|rest| rest.split("__").next())
+            .and_then(|idx| idx.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected staged root `{}`", f.fn_name));
+        let cand = &batch[c_idx];
+        assert_eq!(f.original_mutator_chain, cand.applied_mutators, "{}", f.finding_id);
+        assert_eq!(f.applied_mutators, f.minimized_mutator_chain, "{}", f.finding_id);
+        assert!(
+            ["minimized", "already_one_minimal"].contains(&f.shrink_status.as_str()),
+            "{}: live shrinking must judge every reduction, got `{}`",
+            f.finding_id,
+            f.shrink_status
+        );
+        // A 1- or 2-pass chain needs at least the `[]` query; every executed run
+        // answered a distinct query.
+        assert!(f.shrink_evaluations >= 1, "{}", f.finding_id);
+        assert!(
+            (1..=f.shrink_evaluations).contains(&f.executed_oracle_runs),
+            "{}: executed_oracle_runs={} shrink_evaluations={}",
+            f.finding_id,
+            f.executed_oracle_runs,
+            f.shrink_evaluations
+        );
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(cand, ITREE_SAFE_SEEDS).expect("replayable candidate");
+        let kept: Vec<_> = steps
+            .iter()
+            .filter(|s| f.minimized_mutator_chain.contains(&s.mutator_name))
+            .cloned()
+            .collect();
+        assert_eq!(kept.len(), f.minimized_mutator_chain.len(), "{}", f.finding_id);
+        assert_eq!(
+            f.candidate_source,
+            replay_itree_mutation_steps(cand, &base, &kept).source,
+            "{}: repro.rs must be the minimized candidate's program",
+            f.finding_id
+        );
+        if f.shrink_status == "minimized" {
+            assert!(f.minimized_mutator_chain.len() < f.original_mutator_chain.len());
+            assert_ne!(f.candidate_source, cand.source, "{}", f.finding_id);
+            reduced += 1;
+        } else {
+            assert_eq!(f.candidate_source, cand.source, "{}", f.finding_id);
+        }
+        let repro = f.repro_path.as_ref().expect("repro_path");
+        let finding_json = fs::read_to_string(repro.with_file_name("finding.json"))
+            .expect("read finding.json");
+        for key in [
+            "\"original_mutator_chain\": [",
+            "\"minimized_mutator_chain\": [",
+            "\"shrink_evaluations\": ",
+            "\"executed_oracle_runs\": ",
+        ] {
+            assert!(finding_json.contains(key), "{}: finding.json lacks {key}", f.finding_id);
+        }
+        assert!(finding_json.contains(&format!("\"shrink_status\": \"{}\"", f.shrink_status)));
+        assert_eq!(fs::read_to_string(repro).expect("read repro.rs"), f.candidate_source);
+    }
+    reduced
 }
 
 #[test]
@@ -281,6 +356,13 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
     let finding_a = &summary_a.findings[0];
     assert_ne!(finding_a.diag_tag, "ok");
     assert!(finding_a.kernel_confirmed);
+    // Shrinking keeps the `.add -> .sub` fault injection: the reduced programs are
+    // staged as `b0_c0` and judged with the same MIR mutation.
+    let reduced_a = assert_itree_findings_shrunk(&summary_a.findings, &batches[0]);
+    eprintln!(
+        "negative control A: {reduced_a} of {} finding(s) minimized",
+        summary_a.findings.len()
+    );
     let repro_path_a = finding_a
         .repro_path
         .as_ref()
@@ -340,6 +422,13 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
         summary_b.diverge_traces
     );
     assert!(summary_b.findings.len() >= 2);
+    // Shrinking keeps the root swaps: each reduced program is judged against the
+    // same swapped-in root `Mir` module of an unmodified candidate.
+    let reduced_b = assert_itree_findings_shrunk(&summary_b.findings, &batches[0]);
+    eprintln!(
+        "negative control B: {reduced_b} of {} finding(s) minimized",
+        summary_b.findings.len()
+    );
     let mut reproduced_fns = std::collections::BTreeSet::new();
     for finding in &summary_b.findings {
         if !reproduced_fns.insert(finding.fn_name.clone()) {

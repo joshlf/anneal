@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
+use anneal_difftest::miri_eval::{
+    MiriEvalOptions, divergence_class_slug, evaluate_miri_batches,
+    evaluate_miri_batches_with_options, reproduce_miri_finding,
+};
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
     MiriAstMutator, MutationMode, PlaceProjectionWrapper, TreeBorrowsRetagInterleaver,
@@ -361,6 +364,13 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
     assert_eq!(neg_report.findings.len(), 1);
     let f = &neg_report.findings[0];
     assert!(f.kernel_confirmed);
+    // The hand-built candidate claims a mutator that no corpus replay reproduces,
+    // so shrinking is skipped without any compile check or oracle run.
+    assert_eq!(f.shrink_status, "skipped_replay_mismatch");
+    assert_eq!(f.original_mutator_chain, vec!["BitValidityTransmuteMutator".to_string()]);
+    assert_eq!(f.minimized_mutator_chain, f.original_mutator_chain);
+    assert_eq!(f.applied_mutators, f.original_mutator_chain);
+    assert_eq!((f.shrink_evaluations, f.executed_oracle_runs), (0, 0));
     assert!(
         f.kernel_confirm_theorems
             .contains("def linkedCallees : List CapturedMir :=")
@@ -377,6 +387,11 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
     assert!(summary_md.contains("## Lean 4 Kernel Confirmation Theorems"));
     assert!(summary_md.contains("## Captured MIR Neighborhood"));
     assert!(summary_md.contains("## Mutant Source"));
+    assert!(summary_md.contains("- **Shrink status**: `skipped_replay_mismatch`"));
+    let finding_json =
+        fs::read_to_string(bundle_dir.join("finding.json")).expect("read finding.json");
+    assert!(finding_json.contains("\"shrink_status\": \"skipped_replay_mismatch\""));
+    assert!(finding_json.contains("\"executed_oracle_runs\": 0"));
 
     let repro_json = dir.join("repro_neg.json");
     let repro_out = Command::new(bin)
@@ -2175,4 +2190,111 @@ pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
         "{repro_report:#?}"
     );
     assert!(repro_report.kernel_confirmed);
+}
+
+/// Seed whose unmutated program the live engine gets wrong: it writes the
+/// surrogate code point `0xD800` into a `char` through a `*mut u32` and loads it
+/// as `u32`. Miri reports the invalid `char`; Anneal returns `0xD800`
+/// (`missed_ub`). When the engine learns `char` validity, this test (like the
+/// negative control above) must switch to another divergent seed.
+const CHAR_SURROGATE_SEED: &str = "\
+pub fn seed_char_surrogate_via_ptr() -> u32 {
+    let mut c: char = 'a';
+    let p: *mut u32 = (&raw mut c) as *mut u32;
+    unsafe {
+        *p = 0xD800u32;
+    }
+    c as u32
+}
+";
+
+/// Live end-to-end shrinking in `evaluate_miri_batches_with_options`: mutated
+/// candidates of a divergent seed are evaluated, every finding's chain is
+/// shrunk by replaying it against the seed and re-running the live oracle, and
+/// each minimized `repro.rs` reproduces exactly the outcome tags recorded in its
+/// bundle (so no pre-shrink artifact is left on a minimized finding).
+#[test]
+fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
+    let dir = unique_temp_dir("shrink_live");
+    let root = repo_root();
+    let findings_dir = dir.join("findings_shrink");
+    let batch = generate_miri_batch(&[CHAR_SURROGATE_SEED], 8, 0x5EED_5A1F);
+    let options = MiriEvalOptions {
+        findings_dir: Some(findings_dir.clone()),
+        anneal_repo_root: Some(root.clone()),
+        shrink_seeds: Some(vec![CHAR_SURROGATE_SEED.to_string()]),
+    };
+    let report =
+        evaluate_miri_batches_with_options("seeded", 0x5EED_5A1F, &[batch.clone()], 8, &options)
+            .expect("evaluate mutated candidates of a divergent seed");
+    assert_eq!(report.findings.len(), report.diverge_count);
+    assert!(!report.findings.is_empty(), "the divergent seed must yield findings");
+
+    let mut minimized = 0usize;
+    for f in &report.findings {
+        eprintln!(
+            "{}: {} `{}` ({} -> {} mutators, {} shrink evaluations, {} live runs)",
+            f.fn_name,
+            f.divergence_class,
+            f.shrink_status,
+            f.original_mutator_chain.len(),
+            f.minimized_mutator_chain.len(),
+            f.shrink_evaluations,
+            f.executed_oracle_runs
+        );
+        let cand = batch
+            .iter()
+            .find(|c| c.fn_name == f.fn_name)
+            .expect("finding names a batch candidate");
+        assert!(!cand.applied_mutators.is_empty());
+        assert_eq!(f.original_mutator_chain, cand.applied_mutators, "{}", f.fn_name);
+        assert_eq!(f.applied_mutators, f.minimized_mutator_chain, "{}", f.fn_name);
+        assert!(
+            ["minimized", "already_one_minimal"].contains(&f.shrink_status.as_str()),
+            "{}: every reduction must be judged by a live run, got `{}`",
+            f.fn_name,
+            f.shrink_status
+        );
+        assert!(f.shrink_evaluations >= 1, "{}: `[]` is always queried", f.fn_name);
+        assert!(
+            (1..=f.shrink_evaluations).contains(&f.executed_oracle_runs),
+            "{}: executed_oracle_runs={} shrink_evaluations={}",
+            f.fn_name,
+            f.executed_oracle_runs,
+            f.shrink_evaluations
+        );
+        assert!(f.kernel_confirmed, "{}", f.fn_name);
+        if f.shrink_status == "minimized" {
+            minimized += 1;
+            assert!(f.minimized_mutator_chain.len() < f.original_mutator_chain.len());
+            assert_ne!(f.mutant_source, cand.source, "{}", f.fn_name);
+            assert!(f.mir_neighborhood.contains("def body : CapturedMir :="), "{}", f.fn_name);
+            assert!(
+                f.kernel_confirm_theorems
+                    .contains(&format!("theorem confirm_tag_{} :", f.fn_name)),
+                "{}",
+                f.fn_name
+            );
+        } else {
+            assert_eq!(f.mutant_source, cand.source, "{}", f.fn_name);
+        }
+
+        let repro_path = f.repro_path.as_ref().expect("repro_path");
+        assert_eq!(fs::read_to_string(repro_path).expect("read repro.rs"), f.mutant_source);
+        let rep = reproduce_miri_finding(repro_path, Some(&root)).expect("reproduce finding");
+        let ComparisonVerdict::Diverge(kind) = &rep.verdict else {
+            panic!("{}: repro.rs no longer diverges: {:?}", f.fn_name, rep.verdict);
+        };
+        assert_eq!(divergence_class_slug(kind), f.divergence_class, "{}", f.fn_name);
+        assert_eq!(rep.miri.summary_tag(), f.miri_outcome_tag, "{}", f.fn_name);
+        assert_eq!(rep.anneal.summary_tag(), f.anneal_outcome_tag, "{}", f.fn_name);
+        assert!(rep.kernel_confirmed, "{}", f.fn_name);
+        let finding_json = fs::read_to_string(repro_path.with_file_name("finding.json"))
+            .expect("read finding.json");
+        assert!(finding_json.contains(&format!("\"shrink_status\": \"{}\"", f.shrink_status)));
+    }
+    assert!(
+        minimized > 0,
+        "expected at least one finding whose chain shrinks (the unmutated seed itself diverges)"
+    );
 }

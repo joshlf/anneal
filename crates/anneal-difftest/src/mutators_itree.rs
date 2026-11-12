@@ -508,6 +508,147 @@ pub fn generate_itree_identity_batch(seeds: &[&str]) -> Vec<GeneratedItreeCandid
     out
 }
 
+/// The safe ITree AST mutators, in the order in which [`generate_itree_batch`]
+/// indexes them when it picks a pass's mutator.
+pub const ITREE_AST_MUTATORS: [&dyn ItreeAstMutator; 4] = [
+    &CallBoundaryOutliner,
+    &LayoutPaddingPerturber,
+    &BranchLoopWeaver,
+    &ExtOracleInjector,
+];
+
+fn itree_mutator_by_name(name: &str) -> Option<&'static dyn ItreeAstMutator> {
+    ITREE_AST_MUTATORS.into_iter().find(|m| m.name() == name)
+}
+
+/// One mutation pass of a generated ITree candidate, recorded so that any
+/// subsequence of the candidate's passes can be replayed exactly
+/// ([`replay_itree_mutation_steps`]).
+#[derive(Debug, Clone)]
+pub struct ItreeMutationStep {
+    /// Zero-based index of this pass in the candidate's mutator chain.
+    pub pass_index: usize,
+    /// Canonical mutator name (`CallBoundaryOutliner`, `LayoutPaddingPerturber`,
+    /// `BranchLoopWeaver`, or `ExtOracleInjector`).
+    pub mutator_name: String,
+    /// PRNG state immediately before this pass's `mutate` call.
+    pub rng_before_step: DetRng,
+}
+
+/// Parse `seed_src` and strip any `unsafe` items or blocks from it, as
+/// [`generate_itree_batch`] does before mutating a seed.
+fn parse_safe_itree_seed(seed_src: &str) -> Option<File> {
+    let mut parsed = syn::parse_str::<File>(seed_src).ok()?;
+    sanitize_seed_to_safe_rust(&mut parsed);
+    Some(parsed)
+}
+
+/// Draw and apply candidate `id`'s mutation passes, recording for each pass the
+/// mutator and the PRNG state that `mutate` started from. The first pass's
+/// mutator rotates with `id`; every later pass draws a different mutator.
+fn apply_itree_mutation_passes(
+    parsed: &mut File,
+    cand_rng: &mut DetRng,
+    id: usize,
+) -> Vec<ItreeMutationStep> {
+    let mutator_count = ITREE_AST_MUTATORS.len();
+    let num_passes = 1 + cand_rng.gen_range(2);
+    let first_idx = id % mutator_count;
+    let mut steps = Vec::with_capacity(num_passes);
+    for pass in 0..num_passes {
+        let m_idx = if pass == 0 {
+            first_idx
+        } else {
+            (first_idx + 1 + cand_rng.gen_range(mutator_count - 1)) % mutator_count
+        };
+        let mutator = ITREE_AST_MUTATORS[m_idx];
+        let rng_before_step = cand_rng.clone();
+        mutator.mutate(parsed, cand_rng);
+        steps.push(ItreeMutationStep {
+            pass_index: pass,
+            mutator_name: mutator.name().to_string(),
+            rng_before_step,
+        });
+    }
+    steps
+}
+
+/// Reconstruct the sanitized, unmutated seed AST and the recorded mutation
+/// passes of a candidate that [`generate_itree_batch`] produced from `seeds`, by
+/// re-running the generator's per-candidate PRNG schedule from `cand.seed_u64`
+/// with the same code the generator runs.
+///
+/// Returns `None` when `cand` cannot have come from this schedule over `seeds`:
+/// its `seed_index` is out of range or is not the seed `id % seeds.len()` that
+/// the generator mutates, or the schedule draws a different number or
+/// sequence of mutators than `cand.applied_mutators`. A `Some` result is still
+/// only a candidate history; [`itree_candidate_replay_is_faithful`] decides
+/// whether it reproduces `cand.source` byte for byte.
+pub fn reconstruct_itree_mutation_steps(
+    cand: &GeneratedItreeCandidate,
+    seeds: &[&str],
+) -> Option<(File, Vec<ItreeMutationStep>)> {
+    let base = parse_safe_itree_seed(seeds.get(cand.seed_index)?)?;
+    // The generator mutates seed `id % seeds.len()` for candidate `id`.
+    if cand.seed_index != cand.id % seeds.len() {
+        return None;
+    }
+    let mut cand_rng = DetRng::new(cand.seed_u64);
+    let mut probe = base.clone();
+    let steps = apply_itree_mutation_passes(&mut probe, &mut cand_rng, cand.id);
+    let names_match = steps.len() == cand.applied_mutators.len()
+        && steps
+            .iter()
+            .zip(&cand.applied_mutators)
+            .all(|(step, name)| step.mutator_name == *name);
+    names_match.then_some((base, steps))
+}
+
+/// Replay the subsequence `steps` of a candidate's recorded mutation passes on
+/// its sanitized seed `base`, starting each pass from its recorded PRNG state,
+/// and return the resulting candidate (with `cand`'s identity fields).
+pub fn replay_itree_mutation_steps(
+    cand: &GeneratedItreeCandidate,
+    base: &File,
+    steps: &[ItreeMutationStep],
+) -> GeneratedItreeCandidate {
+    let mut parsed = base.clone();
+    let mut applied_mutators = Vec::with_capacity(steps.len());
+    for step in steps {
+        if let Some(mutator) = itree_mutator_by_name(&step.mutator_name) {
+            let mut step_rng = step.rng_before_step.clone();
+            mutator.mutate(&mut parsed, &mut step_rng);
+            applied_mutators.push(step.mutator_name.clone());
+        }
+    }
+    GeneratedItreeCandidate {
+        id: cand.id,
+        seed_index: cand.seed_index,
+        seed_u64: cand.seed_u64,
+        applied_mutators,
+        source: prettyplease::unparse(&parsed),
+    }
+}
+
+/// Whether replaying the full recorded chain `steps` from `base` reproduces
+/// `cand` byte for byte (same `applied_mutators` and `source`) and the source
+/// contains zero `unsafe` tokens.
+///
+/// Shrinking is only meaningful when this holds: only then is every replayed
+/// subsequence a reduction of the reported program, and only then is the full
+/// chain known to reproduce the original finding without re-running the oracle.
+pub fn itree_candidate_replay_is_faithful(
+    cand: &GeneratedItreeCandidate,
+    base: &File,
+    steps: &[ItreeMutationStep],
+) -> bool {
+    if steps.len() != cand.applied_mutators.len() || contains_unsafe_token(&cand.source) {
+        return false;
+    }
+    let replayed = replay_itree_mutation_steps(cand, base, steps);
+    replayed.applied_mutators == cand.applied_mutators && replayed.source == cand.source
+}
+
 /// Generates `count` deterministic, syntactically valid, strictly safe (`0` `unsafe` tokens)
 /// ITree candidate programs from `seeds` using a PRNG keyed by `seed_u64`.
 pub fn generate_itree_batch(
@@ -519,13 +660,6 @@ pub fn generate_itree_batch(
         return Vec::new();
     }
 
-    let all_mutators: [&dyn ItreeAstMutator; 4] = [
-        &CallBoundaryOutliner,
-        &LayoutPaddingPerturber,
-        &BranchLoopWeaver,
-        &ExtOracleInjector,
-    ];
-
     let mut master_rng = DetRng::new(seed_u64);
     let mut out = Vec::with_capacity(count);
 
@@ -534,25 +668,13 @@ pub fn generate_itree_batch(
         let cand_seed = master_rng.next_u64() ^ ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut cand_rng = DetRng::new(cand_seed);
 
-        let Ok(mut parsed) = syn::parse_str::<File>(seeds[seed_index]) else {
+        let Some(mut parsed) = parse_safe_itree_seed(seeds[seed_index]) else {
             continue;
         };
-        sanitize_seed_to_safe_rust(&mut parsed);
-
-        let num_passes = 1 + cand_rng.gen_range(2);
-        let mut applied_mutators = Vec::with_capacity(num_passes);
-        let first_idx = id % all_mutators.len();
-
-        for pass in 0..num_passes {
-            let m_idx = if pass == 0 {
-                first_idx
-            } else {
-                (first_idx + 1 + cand_rng.gen_range(all_mutators.len() - 1)) % all_mutators.len()
-            };
-            let mutator = all_mutators[m_idx];
-            mutator.mutate(&mut parsed, &mut cand_rng);
-            applied_mutators.push(mutator.name().to_string());
-        }
+        let applied_mutators = apply_itree_mutation_passes(&mut parsed, &mut cand_rng, id)
+            .into_iter()
+            .map(|step| step.mutator_name)
+            .collect();
 
         let formatted = prettyplease::unparse(&parsed);
         assert!(
