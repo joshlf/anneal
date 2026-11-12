@@ -28,9 +28,7 @@ fn python() -> PathBuf {
         .output()
         .expect("Python 3 must be available on PATH for replay tests");
     assert!(output.status.success(), "{output:?}");
-    let path = PathBuf::from(
-        serde_json::from_slice::<String>(&output.stdout).unwrap(),
-    );
+    let path = PathBuf::from(serde_json::from_slice::<String>(&output.stdout).unwrap());
     assert!(path.is_absolute());
     path
 }
@@ -72,8 +70,7 @@ os.kill(os.getpid(), signum)
 
 fn check_signal(name: &str, block_replay_termination: bool) {
     let python = python();
-    let run =
-        RunDirectory::new("signal-replay", Duration::from_secs(5)).unwrap();
+    let run = RunDirectory::new("signal-replay", Duration::from_secs(5)).unwrap();
     let mut case = run.case(name).unwrap();
     let outcome = case
         .run(&Invocation::new(&python, &["-c", SIGNAL_CHILD, name]))
@@ -82,10 +79,9 @@ fn check_signal(name: &str, block_replay_termination: bool) {
         panic!("expected native signal outcome: {outcome:?}");
     };
     let signum = status.signal().expect("child must terminate by signal");
-    let metadata: Value = serde_json::from_slice(
-        &fs::read(case.path().join("commands/0000/outcome.json")).unwrap(),
-    )
-    .unwrap();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(case.path().join("commands/0000/outcome.json")).unwrap())
+            .unwrap();
     assert_eq!(metadata["kind"], "exited");
     assert!(metadata["code"].is_null());
     assert_eq!(metadata["status"], status.to_string());
@@ -119,8 +115,7 @@ fn replay_unblocks_the_reproduced_termination_signal() {
 #[test]
 fn replay_keeps_ordinary_exit_codes() {
     let python = python();
-    let run =
-        RunDirectory::new("exit-code-replay", Duration::from_secs(5)).unwrap();
+    let run = RunDirectory::new("exit-code-replay", Duration::from_secs(5)).unwrap();
     let mut case = run.case("exit-code").unwrap();
     let outcome = case
         .run(&Invocation::new(

@@ -21,10 +21,7 @@ use wait_timeout::ChildExt;
 
 pub type TestResult<T = ()> = Result<T, String>;
 
-pub fn select_cases<'a>(
-    cases: &[&'a str],
-    selection: Option<&str>,
-) -> TestResult<Vec<&'a str>> {
+pub fn select_cases<'a>(cases: &[&'a str], selection: Option<&str>) -> TestResult<Vec<&'a str>> {
     for name in cases {
         validate_case_name(name)?;
     }
@@ -75,9 +72,7 @@ impl RunDirectory {
         }
         let dir = builder
             .tempdir_in(temporary)
-            .map_err(|error| {
-                format!("create integration directory: {error}")
-            })?;
+            .map_err(|error| format!("create integration directory: {error}"))?;
         let run = Self { dir, timeout };
         write_json(
             &run.path().join("run.json"),
@@ -99,8 +94,7 @@ impl RunDirectory {
         let path = owned_path(self.path(), &Path::new("cases").join(name))?;
         fs::create_dir_all(path.parent().unwrap())
             .map_err(|error| format!("create case parent: {error}"))?;
-        fs::create_dir(&path)
-            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        fs::create_dir(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
         Ok(CaseDirectory {
             path,
             run_root: self.path(),
@@ -134,24 +128,17 @@ impl RunDirectory {
             for _ in 0..jobs.min(cases.len()) {
                 scope.spawn(|| {
                     loop {
-                        let Some((name, mut case)) =
-                            pending.lock().unwrap().next()
-                        else {
+                        let Some((name, mut case)) = pending.lock().unwrap().next() else {
                             break;
                         };
                         eprintln!("RUN installed case {name}");
-                        let result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
-                                body(name, &mut case)
-                            }),
-                        )
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            body(name, &mut case)
+                        }))
                         .unwrap_or_else(|_| Err("case panicked".into()));
                         match result {
                             Ok(()) => eprintln!("PASS installed case {name}"),
-                            Err(error) => failures
-                                .lock()
-                                .unwrap()
-                                .push(format!("{name}: {error}")),
+                            Err(error) => failures.lock().unwrap().push(format!("{name}: {error}")),
                         }
                     }
                 });
@@ -168,11 +155,7 @@ impl RunDirectory {
 
     /// Preserve the original failure if writing or exporting evidence fails.
     /// The original directory stays available if the export is incomplete.
-    pub fn finish(
-        self,
-        result: TestResult,
-        diagnostics: Option<&Path>,
-    ) -> TestResult {
+    pub fn finish(self, result: TestResult, diagnostics: Option<&Path>) -> TestResult {
         let Err(mut failure) = result else {
             return Ok(());
         };
@@ -182,10 +165,7 @@ impl RunDirectory {
             failure.push_str(&format!("\nretain failure text: {error}"));
         }
         let retained = self.dir.keep();
-        failure.push_str(&format!(
-            "\nevidence retained at {}",
-            retained.display()
-        ));
+        failure.push_str(&format!("\nevidence retained at {}", retained.display()));
         if let Some(destination) = diagnostics {
             let export = destination.join(retained.file_name().unwrap());
             if let Err(error) = export_evidence(&retained, &export) {
@@ -194,10 +174,7 @@ impl RunDirectory {
                     export.display()
                 ));
             } else {
-                failure.push_str(&format!(
-                    "\nevidence exported to {}",
-                    export.display()
-                ));
+                failure.push_str(&format!("\nevidence exported to {}", export.display()));
             }
         }
         Err(failure)
@@ -217,30 +194,18 @@ impl CaseDirectory<'_> {
         &self.path
     }
 
-    pub fn write(
-        &self,
-        relative: impl AsRef<Path>,
-        bytes: &[u8],
-    ) -> TestResult {
+    pub fn write(&self, relative: impl AsRef<Path>, bytes: &[u8]) -> TestResult {
         let path = owned_path(&self.path, relative.as_ref())?;
-        fs::create_dir_all(path.parent().unwrap()).map_err(|error| {
-            format!("create parent of {}: {error}", path.display())
-        })?;
+        fs::create_dir_all(path.parent().unwrap())
+            .map_err(|error| format!("create parent of {}: {error}", path.display()))?;
         write_file(&path, bytes)
     }
 
-    pub fn copy(
-        &self,
-        source: &Path,
-        relative: impl AsRef<Path>,
-    ) -> TestResult {
+    pub fn copy(&self, source: &Path, relative: impl AsRef<Path>) -> TestResult {
         copy_tree(source, &owned_path(&self.path, relative.as_ref())?)
     }
 
-    pub fn run(
-        &mut self,
-        invocation: &Invocation,
-    ) -> TestResult<ProcessOutcome> {
+    pub fn run(&mut self, invocation: &Invocation) -> TestResult<ProcessOutcome> {
         if !invocation.executable.is_absolute() {
             return Err(format!(
                 "tool path must be absolute: {}",
@@ -256,8 +221,7 @@ impl CaseDirectory<'_> {
             .map_err(|error| format!("create command parent: {error}"))?;
         // Command logs are fresh destinations, not reusable fixture paths.
         // Reject an existing directory before any log file can be followed.
-        fs::create_dir(&logs)
-            .map_err(|error| format!("create {}: {error}", logs.display()))?;
+        fs::create_dir(&logs).map_err(|error| format!("create {}: {error}", logs.display()))?;
         write_json(
             &logs.join("invocation.json"),
             &json!({
@@ -315,20 +279,17 @@ impl CaseDirectory<'_> {
             },
         };
         let observed = termination.describe();
-        write_json(&logs.join("outcome.json"), &termination.metadata())
-            .map_err(|error| {
-                format!(
-                    "{} {:?}: {observed}; retain process outcome: {error}",
-                    invocation.executable.display(),
-                    invocation.arguments
-                )
-            })?;
-        let stdout = fs::read(&stdout_path).map_err(|error| {
-            format!("read {} after {observed}: {error}", stdout_path.display())
+        write_json(&logs.join("outcome.json"), &termination.metadata()).map_err(|error| {
+            format!(
+                "{} {:?}: {observed}; retain process outcome: {error}",
+                invocation.executable.display(),
+                invocation.arguments
+            )
         })?;
-        let stderr = fs::read(&stderr_path).map_err(|error| {
-            format!("read {} after {observed}: {error}", stderr_path.display())
-        })?;
+        let stdout = fs::read(&stdout_path)
+            .map_err(|error| format!("read {} after {observed}: {error}", stdout_path.display()))?;
+        let stderr = fs::read(&stderr_path)
+            .map_err(|error| format!("read {} after {observed}: {error}", stderr_path.display()))?;
         Ok(ProcessOutcome {
             invocation: invocation.clone(),
             working_directory: self.path.clone(),
@@ -404,9 +365,7 @@ pub struct ProcessOutcome {
 impl ProcessOutcome {
     pub fn expect_code(&self, code: i32) -> TestResult {
         match self.termination {
-            Termination::Exited(status) if status.code() == Some(code) => {
-                Ok(())
-            }
+            Termination::Exited(status) if status.code() == Some(code) => Ok(()),
             _ => Err(format!("expected exit code {code}: {}", self.describe())),
         }
     }
@@ -437,9 +396,9 @@ pub fn write_json(path: &Path, value: &Value) -> TestResult {
 // New files keep tempfile's default permissions.
 fn write_file(path: &Path, bytes: &[u8]) -> TestResult {
     reject_symlink_components(path)?;
-    let parent = path.parent().ok_or_else(|| {
-        format!("file destination has no parent directory: {path:?}")
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("file destination has no parent directory: {path:?}"))?;
     let permissions = match fs::metadata(path) {
         Ok(metadata) => metadata.is_file().then(|| metadata.permissions()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -453,9 +412,10 @@ fn write_file(path: &Path, bytes: &[u8]) -> TestResult {
         .write_all(bytes)
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     if let Some(permissions) = permissions {
-        temporary.as_file().set_permissions(permissions).map_err(|error| {
-            format!("set permissions {}: {error}", path.display())
-        })?;
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| format!("set permissions {}: {error}", path.display()))?;
     }
     temporary
         .persist(path)
@@ -495,8 +455,7 @@ fn reject_symlink_components(path: &Path) -> TestResult {
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::NotADirectory
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) => {}
             Err(error) => {
                 return Err(format!("inspect {}: {error}", ancestor.display()));
@@ -520,8 +479,7 @@ fn validate_case_name(name: &str) -> TestResult {
 }
 
 fn create_file(path: &Path) -> TestResult<File> {
-    File::create(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))
+    File::create(path).map_err(|error| format!("create {}: {error}", path.display()))
 }
 
 fn export_evidence(source: &Path, destination: &Path) -> TestResult {
@@ -529,9 +487,7 @@ fn export_evidence(source: &Path, destination: &Path) -> TestResult {
         .map_err(|error| format!("resolve {}: {error}", source.display()))?;
     let destination = resolve_destination(destination)?;
     if destination.starts_with(&source) || source.starts_with(&destination) {
-        return Err(
-            "evidence export must be disjoint from the retained run".into()
-        );
+        return Err("evidence export must be disjoint from the retained run".into());
     }
     // Existing export roots are supported: copied file entries below are
     // replaced with fresh inodes so outside hard-link aliases stay unchanged.
@@ -561,8 +517,7 @@ fn export_evidence(source: &Path, destination: &Path) -> TestResult {
     for entry in
         fs::read_dir(&source).map_err(|error| format!("list {}: {error}", source.display()))?
     {
-        let entry =
-            entry.map_err(|error| format!("read evidence entry: {error}"))?;
+        let entry = entry.map_err(|error| format!("read evidence entry: {error}"))?;
         // Toolchains can be several GiB. Keep the owned installation in the
         // original run, but export its identity and paths rather than another
         // copy. Reproduction requires the recorded archive/build artifacts.
@@ -614,12 +569,8 @@ fn copy_tree(source: &Path, destination: &Path) -> TestResult {
     let resolved_source = fs::canonicalize(source)
         .map_err(|error| format!("resolve {}: {error}", source.display()))?;
     let destination = resolve_destination(destination)?;
-    if destination.starts_with(&resolved_source)
-        || resolved_source.starts_with(&destination)
-    {
-        return Err(
-            "fixture copy source and destination must be disjoint".into()
-        );
+    if destination.starts_with(&resolved_source) || resolved_source.starts_with(&destination) {
+        return Err("fixture copy source and destination must be disjoint".into());
     }
     copy_tree_contents(source, &destination)
 }
@@ -635,10 +586,8 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> TestResult {
         // An existing regular destination can be a hard link outside the owned
         // tree. Copy to a fresh inode, keeping the source's permissions, then
         // replace the destination entry.
-        let temporary = tempfile::NamedTempFile::new_in(
-            destination.parent().unwrap(),
-        )
-        .map_err(|error| format!("stage {}: {error}", destination.display()))?;
+        let temporary = tempfile::NamedTempFile::new_in(destination.parent().unwrap())
+            .map_err(|error| format!("stage {}: {error}", destination.display()))?;
         fs::copy(source, temporary.path()).map_err(|error| {
             format!(
                 "copy {} to {}: {error}",
@@ -646,25 +595,19 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> TestResult {
                 destination.display()
             )
         })?;
-        temporary.persist(destination).map_err(|error| {
-            format!("replace {}: {error}", destination.display())
-        })?;
+        temporary
+            .persist(destination)
+            .map_err(|error| format!("replace {}: {error}", destination.display()))?;
     } else if metadata.is_dir() {
-        fs::create_dir_all(destination).map_err(|error| {
-            format!("create {}: {error}", destination.display())
-        })?;
+        fs::create_dir_all(destination)
+            .map_err(|error| format!("create {}: {error}", destination.display()))?;
         let mut entries = fs::read_dir(source)
             .map_err(|error| format!("list {}: {error}", source.display()))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                format!("read entry in {}: {error}", source.display())
-            })?;
+            .map_err(|error| format!("read entry in {}: {error}", source.display()))?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            copy_tree_contents(
-                &entry.path(),
-                &destination.join(entry.file_name()),
-            )?;
+            copy_tree_contents(&entry.path(), &destination.join(entry.file_name()))?;
         }
     } else {
         return Err(format!(

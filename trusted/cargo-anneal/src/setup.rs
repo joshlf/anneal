@@ -86,11 +86,8 @@ mod tests {
         let archive = temp.path().join("current-run.tar.zst");
         write_archive(&archive);
         let ordinary = temp.path().join("ordinary-cache");
-        let root = install_at(
-            Some(archive),
-            exocrate::Location::Custom(ordinary.clone()),
-        )
-        .expect("install requested local archive");
+        let root = install_at(Some(archive), exocrate::Location::Custom(ordinary.clone()))
+            .expect("install requested local archive");
         assert!(root.starts_with(&ordinary), "{}", root.display());
         assert_eq!(
             fs::read(root.join("marker.txt")).expect("read installed marker"),
@@ -103,13 +100,8 @@ mod tests {
                 fs::write(&archive, contents).expect("write broken archive");
             }
             let fresh = temp.path().join(format!("{name}-cache"));
-            let error = install_at(
-                Some(archive),
-                exocrate::Location::Custom(fresh),
-            )
-            .expect_err(
-                "another location's installation must not satisfy setup",
-            );
+            let error = install_at(Some(archive), exocrate::Location::Custom(fresh))
+                .expect_err("another location's installation must not satisfy setup");
             assert!(error.contains("failed to install Anneal toolchain"));
         }
 

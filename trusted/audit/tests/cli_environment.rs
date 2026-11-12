@@ -65,9 +65,7 @@ fn reports_non_utf8_values_in_retained_environment_entries() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{key}: {output:?}");
         assert!(
-            stderr(&output).contains(&format!(
-                "environment variable {key} is not valid UTF-8"
-            )),
+            stderr(&output).contains(&format!("environment variable {key} is not valid UTF-8")),
             "{key}: {output:?}"
         );
     }

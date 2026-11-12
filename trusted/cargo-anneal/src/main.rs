@@ -132,16 +132,14 @@ mod tests {
                 &["setup", "--help"],
                 &["help", "setup"],
             ] {
-                let output =
-                    run(args(&[prefix, suffix].concat()), must_not_install)
-                        .expect("help must succeed");
+                let output = run(args(&[prefix, suffix].concat()), must_not_install)
+                    .expect("help must succeed");
                 assert!(output.contains("Usage:"), "{output}");
                 assert!(output.contains("setup"), "{output}");
             }
             for suffix in ["-V", "--version"] {
-                let output =
-                    run(args(&[prefix, &[suffix]].concat()), must_not_install)
-                        .expect("version must succeed");
+                let output = run(args(&[prefix, &[suffix]].concat()), must_not_install)
+                    .expect("version must succeed");
                 assert_eq!(
                     output,
                     format!("cargo-anneal {}\n", env!("CARGO_PKG_VERSION"))
