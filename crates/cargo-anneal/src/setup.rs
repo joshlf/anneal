@@ -201,6 +201,19 @@ pub fn resolve_installed_toolchain() -> Option<PathBuf> {
 /// for the current platform.
 pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
     let target_dir = versioned_installation_dir()?;
+    install_at(local_archive, target_dir)
+}
+
+/// Install or resolve the Anneal toolchain archive at an explicit target
+/// installation directory.
+///
+/// Unit tests pass a fresh owned `target_dir` for each synthetic local archive
+/// so an existing installation cannot mask a missing or malformed archive.
+/// Production setup passes [`versioned_installation_dir`] above.
+pub(crate) fn install_at(
+    local_archive: Option<PathBuf>,
+    target_dir: PathBuf,
+) -> Result<PathBuf, String> {
     if local_archive.is_none() && is_valid_toolchain_dir(&target_dir) {
         return Ok(target_dir);
     }
@@ -276,14 +289,21 @@ pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
     fs::create_dir_all(&extract_dir)
         .map_err(|err| format!("failed to create extract directory: {err}"))?;
 
-    let tar_status = Command::new("tar")
-        .arg("--zstd")
+    let mut tar_cmd = Command::new("tar");
+    if archive_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zst"))
+    {
+        tar_cmd.arg("--zstd");
+    }
+    let tar_status = tar_cmd
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
         .arg(&extract_dir)
         .status()
-        .map_err(|err| format!("failed to execute `tar --zstd -xf`: {err}"))?;
+        .map_err(|err| format!("failed to execute `tar -xf`: {err}"))?;
     if !tar_status.success() {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(format!(
@@ -330,13 +350,98 @@ mod tests {
         let entries =
             parse_exocrate_metadata(CARGO_TOML_TEXT).expect("parse [[package.metadata.exocrate]]");
         assert_eq!(entries.len(), 4);
-        assert!(entries.iter().any(|e| e.os == "linux" && e.arch == "x86_64"));
-        assert!(entries
-            .iter()
-            .any(|e| e.os == "linux" && e.arch == "aarch64"));
-        assert!(entries.iter().any(|e| e.os == "macos" && e.arch == "x86_64"));
-        assert!(entries
-            .iter()
-            .any(|e| e.os == "macos" && e.arch == "aarch64"));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.os == "linux" && e.arch == "x86_64")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.os == "linux" && e.arch == "aarch64")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.os == "macos" && e.arch == "x86_64")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.os == "macos" && e.arch == "aarch64")
+        );
+    }
+
+    fn write_valid_test_archive(archive_path: &Path) {
+        let src_dir = archive_path
+            .parent()
+            .expect("archive parent")
+            .join("synthetic-archive-src");
+        let _ = fs::remove_dir_all(&src_dir);
+        for rel in [
+            "bin/anneal-rustc-capture",
+            "lean/bin/lean",
+            "rust/bin/rustc",
+            "share/anneal/trusted/lean/foundation-lock.json",
+        ] {
+            let full = src_dir.join(rel);
+            fs::create_dir_all(full.parent().expect("entry parent")).expect("create entry parent");
+            fs::write(&full, b"archive under test").expect("write entry");
+        }
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(&src_dir)
+            .args(["bin", "lean", "rust", "share"])
+            .status()
+            .expect("create synthetic tar.gz archive");
+        assert!(status.success(), "tar -czf failed: {status}");
+        let _ = fs::remove_dir_all(&src_dir);
+    }
+
+    #[test]
+    fn custom_locations_install_only_the_requested_archive() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp = env::temp_dir().join(format!(
+            "cargo-anneal-setup-test-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp).expect("create owned fixture");
+
+        let archive = temp.join("current-run.tar.gz");
+        write_valid_test_archive(&archive);
+        let ordinary = temp.join("ordinary-cache/v0.1.0-test");
+        let root =
+            install_at(Some(archive), ordinary.clone()).expect("install requested local archive");
+        assert_eq!(root, ordinary);
+        assert_eq!(
+            fs::read(root.join("bin/anneal-rustc-capture")).expect("read installed marker"),
+            b"archive under test"
+        );
+
+        for (name, contents) in [("missing", None), ("broken", Some(&b"bad"[..]))] {
+            let bad_archive = temp.join(format!("{name}.tar.gz"));
+            if let Some(bytes) = contents {
+                fs::write(&bad_archive, bytes).expect("write broken archive");
+            }
+            let fresh = temp.join(format!("{name}-cache/v0.1.0-test"));
+            let error = install_at(Some(bad_archive), fresh)
+                .expect_err("another location's installation must not satisfy setup");
+            assert!(
+                error.contains("local toolchain archive does not exist")
+                    || error.contains("tar extraction failed"),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert_eq!(
+            fs::read(root.join("bin/anneal-rustc-capture")).expect("ordinary cache survives"),
+            b"archive under test"
+        );
+        let _ = fs::remove_dir_all(&temp);
     }
 }
