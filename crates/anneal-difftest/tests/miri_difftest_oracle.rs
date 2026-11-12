@@ -1806,11 +1806,15 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`) and
     // local shadowing through real `rustc` + Miri + Anneal evaluation.
     let param_ep2_seed = "\
-pub fn param_ep2_live(
+pub fn param_ep2_live<'a>(
     s: SingleC,
-    m: MetersU32,
+    MetersU32(m_inner): MetersU32,
     nm: NonZeroMeters,
     o: OverlayU32,
+    r_pair: &'a mut PairU32,
+    p_sc: *mut SingleC,
+    (tup_a, tup_b): (u32, u8),
+    u_word: Uninit<u32>,
     ob: Option<bool>,
     oc: core::option::Option<ColorTag>,
     onz: core::option::Option<NonZeroU32>,
@@ -1818,9 +1822,18 @@ pub fn param_ep2_live(
     words: [u32; 2],
 ) -> u32 {
     let shadowed: u32 = 1u32;
-    let shadowed: PairU32 = PairU32 { a: words[0], b: words[1] };
+    let (shadowed, _): (PairU32, u32) = (PairU32 { a: words[0], b: words[1] }, tup_a);
+    let mut borrowed = PairU32 { a: r_pair.a, b: r_pair.b };
+    let rb: &mut u32 = &mut (borrowed.b);
+    let keep_a: u32 = (borrowed).a;
+    *rb = tup_b as u32;
     let sc_v: u32 = match s {
         SingleC::Only(v) => v,
+    };
+    let p_sc_v: u32 = unsafe {
+        match &*p_sc {
+            SingleC::Only(v) => *v,
+        }
     };
     let nzm_v: u32 = unsafe { transmute::<NonZeroU32, u32>(nm.0) };
     let ob_v: u32 = match ob {
@@ -1835,8 +1848,8 @@ pub fn param_ep2_live(
         None => 16u32,
     };
     let onz_v: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(onz) };
-    let ov_v: u32 = unsafe { o.word };
-    m.0 ^ sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ (bytes[0] as u32) ^ shadowed.a
+    let ov_v: u32 = unsafe { o.word ^ u_word.value };
+    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ (bytes[0] as u32) ^ shadowed.a
 }
 ";
     let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);
