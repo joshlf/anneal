@@ -9154,13 +9154,9 @@ theorem evalStmt_assign_field_flat_refines
           s ⟨.assign ⟨loc, [.field i fieldTy]⟩ rv, span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
       SlotsRefine FlatSlotStateRefines slots₂ locals₂ := by
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ [.field i fieldTy] with
-         | .some rp => rp
-         | .none => [.field i fieldTy]) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   -- `_l` is declared as a tuple, so `_l.i` never takes Trusted's union-aware path.
@@ -12334,13 +12330,9 @@ theorem evalStmt_assign_field_nested_refines
           s ⟨.assign ⟨loc, [.field i fieldTy]⟩ rv, span⟩ localDecls layouts =
         MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
       SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ [.field i fieldTy] with
-         | .some rp => rp
-         | .none => [.field i fieldTy]) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   -- `_l` is declared as a tuple, so `_l.i` never takes Trusted's union-aware path.
@@ -12670,13 +12662,9 @@ theorem evalStmt_assign_init_root_nested_refines
         MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
       SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
   have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-         | .some rp => rp
-         | .none => proj :: rest) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   -- Invert the Anneal write on the initialized root.
@@ -12788,13 +12776,9 @@ theorem evalStmt_assign_two_level_field_nested_refines
   have hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, projs⟩ = false :=
     placeTouchesUnion_tuple_nested_field_false localDecls layouts loc outerFieldTys
       innerFieldTys outerLIdx innerLIdx i j leafTy hTy
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ projs with
-         | .some rp => rp
-         | .none => projs) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   unfold writePlaceState at hWrite
@@ -14420,13 +14404,9 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
   -- A tuple field chain on a tuple-declared local never takes Trusted's union-aware path.
   have hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, .field idx₀ ty₀ :: rest⟩ = false :=
     placeTouchesUnion_false_of_isTupleFieldChain localDecls layouts loc _ fieldTys lIdx hTy hChain
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ projs with
-         | .some rp => rp
-         | .none => projs) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   unfold writePlaceState at hWrite
@@ -14504,29 +14484,21 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
                 (.aggregate 0 tfs) hChain hRootRef (by intro h; nomatch h) hW
             have hSetT : set? locals₁ loc (.init tv') = .some (locals₁.set loc (.init tv')) :=
               set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-            refine ⟨locals₁.set loc (.init tv'),
-              { mem₁ with
-                borrows :=
-                  invalidateConflictingBorrowsAtProj mem₁.borrows loc .none
-                    (match resolveBorrowProjectionElems locals₁ projs with
-                     | .some rp => rp
-                     | .none => projs) },
-              ?_,
+            refine ⟨locals₁.set loc (.init tv'), _, by
+              dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt, projs]
+              rw [hRv]
+              dsimp only
+              rw [hGetT]
+              dsimp only
+              rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion, hTW]
+              dsimp only
+              rw [hSetT]
+              dsimp only
+              rw [hNoProt],
               SlotsRefine.set
                 (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
                 loc hRel⟩
-            dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt, projs]
-            rw [hRv]
-            dsimp only
-            rw [hGetT]
-            dsimp only
-            rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
-              _ _ val hNoUnion, hTW]
-            dsimp only
-            rw [hSetT]
-            dsimp only
-            rw [hNoProt]
-            rfl
       | init rootVal =>
         cases t with
         | dead => nomatch hAT
@@ -14550,29 +14522,21 @@ theorem evalStmt_assign_any_depth_field_chain_nested_refines
                 rootVal hChain rfl (by intro h; nomatch h) hW
             have hSetT : set? locals₁ loc (.init tv') = .some (locals₁.set loc (.init tv')) :=
               set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
-            refine ⟨locals₁.set loc (.init tv'),
-              { mem₁ with
-                borrows :=
-                  invalidateConflictingBorrowsAtProj mem₁.borrows loc .none
-                    (match resolveBorrowProjectionElems locals₁ projs with
-                     | .some rp => rp
-                     | .none => projs) },
-              ?_,
+            refine ⟨locals₁.set loc (.init tv'), _, by
+              dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt, projs]
+              rw [hRv]
+              dsimp only
+              rw [hGetT]
+              dsimp only
+              rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
+                _ _ val hNoUnion, hTW]
+              dsimp only
+              rw [hSetT]
+              dsimp only
+              rw [hNoProt],
               SlotsRefine.set
                 (fieldSlotToLocalSlotState_of_nestedFieldRefines nextSlot tv' hNotUninit hNextRef)
                 loc hRel⟩
-            dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt, projs]
-            rw [hRv]
-            dsimp only
-            rw [hGetT]
-            dsimp only
-            rw [writeProjectedForLocal_of_placeTouchesUnion_false locals₁ localDecls layouts loc
-              _ _ val hNoUnion, hTW]
-            dsimp only
-            rw [hSetT]
-            dsimp only
-            rw [hNoProt]
-            rfl
 
 /-- Inductive refinement for writing along an arbitrary projection `tail`
 (`Field`, `Index`, `ConstantIndex`, `Subslice`, `Downcast`+`Field`, or `.nil`)
@@ -14765,13 +14729,9 @@ theorem evalStmt_assign_partialShell_init_subslot_nested_refines
       SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
   let restProjs := fieldStepsToProjs restSteps ++ tail
   have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
-  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
-      mem₁.activeProtectors = protHead :: protTail →
-      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
-        (match resolveBorrowProjectionElems locals₁ (.field i₀ ty₀ :: restProjs) with
-         | .some rp => rp
-         | .none => .field i₀ ty₀ :: restProjs) = false := by
-    intro protHead protTail hAP
+  have hNoConflict : ∀ {P : Nat → List Nat → Prop} (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail → P protHead protTail := by
+    intro _ protHead protTail hAP
     rw [hNoProt] at hAP
     nomatch hAP
   rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩

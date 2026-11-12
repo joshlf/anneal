@@ -14714,4 +14714,159 @@ theorem paddedDeinitHoleCastRead_diverges :
       ∃ msg, Interp.steps 4 paddedDeinitHoleCastReadMInit = .error (.ub msg) :=
   ⟨runA_sound paddedDeinitHoleCastRead 12 _ _ _ rfl, _, rfl⟩
 
+/-- `ctxPadded3` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u32`,
+and `_3: u32` (with `argCount = 1`). -/
+theorem ctxPadded3_ok_u32_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl, u32Decl, u32Decl])
+    (hlay : body.layouts = paddedLayouts) (hac : body.argCount = 1) : CtxOk body ctxPadded3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd; rw [h] at hd; rw [hlay]; rw [hac] at hi
+    match i, hi, hd with
+    | 0, _, hd => simp at hd; subst hd; decide
+    | 1, _, hd => simp at hd; subst hd; decide
+    | _ + 2, hi, _ => omega
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR of a 3-statement open-hole window exercising `castSiblingReadOk`, `binOpWindowOk`
+(a hole-independent integer binary operation into a temporary local while the hole stays open), and
+`reinitBinOpOk` together:
+```rust
+fn deinit_sibling_binop_window_reinit(mut s: Padded) -> u32 {
+    let a: u32;          // StorageLive(_2)
+    let b: u32;          // StorageLive(_3)
+    Deinit(s.1);         // Deinit(_1.1)                      [opens hole (1, [.field 1 u32])]
+    a = s.0 as u32;      // _2 = Cast(IntToInt, copy _1.0, u32) [castSiblingReadOk: _2 = 7_u32]
+    b = a + 10;          // _3 = Add(copy _2, const 10_u32)   [binOpWindowOk: _3 = 17_u32]
+    s.1 = b + 25;        // _1.1 = Add(copy _3, const 25_u32) [reinitBinOpOk: closes hole with 42]
+    s.1                  // _0 = copy _1.1; StorageDead(_3, _2); return
+}
+``` -/
+def deinitSiblingBinOpWindowReinit : CapturedMir where
+  defPath := "witness::deinit_sibling_binop_window_reinit"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.cast .intToInt (.copy (placeField 1 [(0, u8TyW)])) u32Ty)),
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.copy (local_ 2)) (constU32 10))),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.binaryOp .add (.copy (local_ 3)) (constU32 25))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem deinitSiblingBinOpWindowReinit_inFragmentD :
+    inFragmentD deinitSiblingBinOpWindowReinit = true := by decide
+
+theorem deinitSiblingBinOpWindowReinit_not_inFragment :
+    inFragment deinitSiblingBinOpWindowReinit = false := by decide
+
+theorem deinitSiblingBinOpWindowReinit_window_rules :
+    castSiblingReadOk deinitSiblingBinOpWindowReinit 1 2 [.field 1 u32Ty] [.field 0 u8TyW]
+      u32Ty = true ∧
+    binOpWindowOk deinitSiblingBinOpWindowReinit 1 3 2 .add
+      { ty := u32Ty, val := .scalar (.int ⟨10, 4⟩) } = true ∧
+    reinitBinOpOk deinitSiblingBinOpWindowReinit 1 3 [.field 1 u32Ty] .add
+      { ty := u32Ty, val := .scalar (.int ⟨25, 4⟩) } = true ∧
+    (List.range 10).map (holeAt deinitSiblingBinOpWindowReinit 0) =
+      [none, none, none,
+       some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]),
+       none, none, none, none] :=
+  ⟨by decide, by decide, by decide, rfl⟩
+
+def deinitSiblingBinOpWindowReinitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, .Int u32), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Field (.Local (localName 1)) 0))),
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 2))) (.Constant (.Int 10) (.Int u32))),
+      .Assign (.Field (.Local (localName 1)) 1)
+        (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Constant (.Int 25) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1)),
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem deinitSiblingBinOpWindowReinit_translate :
+    translateFn deinitSiblingBinOpWindowReinit = some deinitSiblingBinOpWindowReinitFn := rfl
+
+theorem deinitSiblingBinOpWindowReinit_ctxOk : CtxOk deinitSiblingBinOpWindowReinit ctxPadded3 :=
+  ctxPadded3_ok_u32_u32 rfl rfl rfl
+
+theorem deinitSiblingBinOpWindowReinit_argsOk :
+    argsOk deinitSiblingBinOpWindowReinit paddedDeinitReadArgs = true := by decide
+
+def deinitSiblingBinOpWindowReinitS0 : MachineState :=
+  initMachineState deinitSiblingBinOpWindowReinit paddedDeinitReadArgs
+
+def deinitSiblingBinOpWindowReinitMInit : Mach :=
+  machineWithCtx ctxPadded3 deinitSiblingBinOpWindowReinit deinitSiblingBinOpWindowReinitFn
+    deinitSiblingBinOpWindowReinitS0.frame.locals deinitSiblingBinOpWindowReinitFn.start
+
+theorem deinitSiblingBinOpWindowReinit_anneal_ret :
+    ReachesRet (mirCallTree deinitSiblingBinOpWindowReinit paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨42, 4⟩, deinitSiblingBinOpWindowReinitS0.memory)) :=
+  runA_sound deinitSiblingBinOpWindowReinit 14 _ _ _ rfl
+
+theorem deinitSiblingBinOpWindowReinit_anneal_noUB :
+    MirNoUBTree (mirCallTree deinitSiblingBinOpWindowReinit paddedDeinitReadArgs) :=
+  runA_noUB deinitSiblingBinOpWindowReinit 14 _ _ _ rfl
+
+/-- **End-to-end return through `mirCall_ret_D` for `deinitSiblingBinOpWindowReinit`
+(`castSiblingReadOk` + `binOpWindowOk` + `reinitBinOpOk`).** Anneal's return of `42` (`7 + 10 + 25`)
+gives a MiniRust run from `f.start` that pops the callee frame and leaves `42` in the caller's
+return place. -/
+theorem deinitSiblingBinOpWindowReinit_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n deinitSiblingBinOpWindowReinitMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads =
+        [thread1 ctxPadded3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D deinitSiblingBinOpWindowReinit_inFragmentD
+      deinitSiblingBinOpWindowReinit_translate ctxPadded3 deinitSiblingBinOpWindowReinit_ctxOk
+      paddedDeinitReadArgs deinitSiblingBinOpWindowReinit_argsOk
+      deinitSiblingBinOpWindowReinitMInit rfl rfl rfl deinitSiblingBinOpWindowReinit_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [deinitSiblingBinOpWindowReinit] at hd; subst hd
+  simp [retPtr, ctxPadded3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem deinitSiblingBinOpWindowReinit_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n deinitSiblingBinOpWindowReinitMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k deinitSiblingBinOpWindowReinitMInit = .ok mRet ∧
+      ReturnRel deinitSiblingBinOpWindowReinit ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree deinitSiblingBinOpWindowReinit paddedDeinitReadArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB_D deinitSiblingBinOpWindowReinit_inFragmentD
+    deinitSiblingBinOpWindowReinit_translate ctxPadded3 deinitSiblingBinOpWindowReinit_ctxOk
+    paddedDeinitReadArgs deinitSiblingBinOpWindowReinit_argsOk
+    deinitSiblingBinOpWindowReinitMInit rfl rfl rfl deinitSiblingBinOpWindowReinit_anneal_noUB herr
+
 end MiniRustSpec.Correspondence.Witness

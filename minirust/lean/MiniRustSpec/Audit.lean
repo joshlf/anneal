@@ -5368,18 +5368,21 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   localCopyWindowOk_spec
   castSiblingReadOk_spec
   reinitBinOpOk_spec
+  binOpWindowOk_spec
   evalStatement_reinit_any
   evalStatement_siblingRead_any
   evalStatement_reinitCopy_any
   evalStatement_localCopy_any
   evalStatement_castSiblingRead_any
   evalStatement_reinitBinOp_any
+  evalStatement_binOpWindow_any
   step_window_reinit
   step_window_read
   step_window_reinit_copy
   step_window_local_copy
   step_window_cast_read
   step_window_reinit_binop
+  step_window_binop_local
   step_correspondence_D
   reaches_rel_D
   run_ret_D
@@ -5443,6 +5446,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedDeinitHoleBinOp_diverges
   paddedDeinitHoleCastRead_not_inFragmentD
   paddedDeinitHoleCastRead_diverges
+  deinitSiblingBinOpWindowReinit_inFragmentD
+  deinitSiblingBinOpWindowReinit_window_rules
+  deinitSiblingBinOpWindowReinit_minirust_ret_from_start
+  deinitSiblingBinOpWindowReinit_minirust_noUB
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

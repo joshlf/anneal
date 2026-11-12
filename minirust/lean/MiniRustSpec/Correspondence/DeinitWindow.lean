@@ -323,11 +323,34 @@ def reinitBinOpOk (body : CapturedMir) (t q : Nat) (projs : List ProjectionElem)
     | _, _ => false
   | _, _ => false
 
+/-- A hole-independent integer binary operation `_r = BinaryOp(op, copy _q, const c)` into a
+scalar local `_r` while `_t.projs` is a hole: `r ≠ t`, `q ≠ t`, `r ≠ q`, `_r` and `_q` are integer
+locals of the same integer type `it` with positive byte size and valid alignment
+(`goodAlignBytes it.size.bytes = true`), `op` is a non-relational integer binary operation, `c` is
+a non-`bool` integer constant of type `it` with an in-range bit pattern, and `_t` is a `TupleSpec`
+local. -/
+def binOpWindowOk (body : CapturedMir) (t r q : Nat) (op : MirAst.BinOp) (c : ConstOperand) : Bool :=
+  decide (r ≠ t) && decide (q ≠ t) && decide (r ≠ q) &&
+  (translateRelOp op).isNone && (translateBinOp op).isSome &&
+  match body.localDecls[r]?, body.localDecls[q]?, body.localDecls[t]? with
+  | some dr, some dq, some d =>
+    match intTypeOf dr.ty, intTypeOf dq.ty, tupleTypeOf body.layouts d.ty with
+    | some it, some it', some _ =>
+      decide (it' = it) && decide (0 < it.size.bytes) && goodAlignBytes it.size.bytes &&
+      !isBoolTy c.ty &&
+      match c.val, intTypeOf c.ty with
+      | .scalar (.int ⟨bits, sz⟩), some ic =>
+        decide (ic = it) && decide (sz = it.size.bytes) && decide (bits < 2 ^ (8 * sz))
+      | _, _ => false
+    | _, _, _ => false
+  | _, _, _ => false
+
 /-- The statements admitted before statement `idx` of block `blk` when the hole state is
 `hole`: with no hole, any statement (a projected `Deinit` must target an admissible,
 not-moved-out `TupleSpec` local); with a hole on `_t.projs`, only a disjoint sibling read
 `_r = copy _t.projs'` (possibly through an integer cast, `_r = Cast(IntToInt, copy _t.projs', it)`),
-a hole-independent scalar local copy `_r = copy _q`, a constant re-initialization
+a hole-independent scalar local copy `_r = copy _q`, a hole-independent scalar binary operation
+`_r = BinaryOp(op, copy _q, const c)`, a constant re-initialization
 `_t.projs = const c`, a local-copy re-initialization `_t.projs = copy _r`, or a binary-operation
 re-initialization `_t.projs = BinaryOp(op, copy _q, const c)`. -/
 def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
@@ -351,6 +374,8 @@ def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
         decide (holeRange body t ps' = holeRange body t ps)
     | .assign ⟨r, []⟩ (.cast .intToInt (.copy ⟨t', qp :: qps⟩) castTy) =>
       decide (t' = t) && castSiblingReadOk body t r ps (qp :: qps) castTy
+    | .assign ⟨r, []⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)) =>
+      binOpWindowOk body t r q op c
     | .assign ⟨t', rp :: rps⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)) =>
       decide (t' = t) && reinitBinOpOk body t q (rp :: rps) op c &&
         decide (holeRange body t (rp :: rps) = holeRange body t ps)
@@ -2558,6 +2583,327 @@ theorem step_window_reinit_binop {body : CapturedMir} {f : Gen.Function}
           nomatch htyT
     | _ => simp [resolveFieldPath] at hres'
 
+theorem binOpWindowOk_spec {body : CapturedMir} {t r q : Nat} {op : MirAst.BinOp}
+    {c : ConstOperand} (h : binOpWindowOk body t r q op c = true) :
+    r ≠ t ∧ q ≠ t ∧ r ≠ q ∧ translateRelOp op = none ∧
+    ∃ (dr dq d : LocalDecl) (fields : List (Nat × TupleSpec)) (size align : Nat)
+      (it : Gen.IntType) (iop : Gen.IntBinOp) (cbits : Nat),
+      body.localDecls[r]? = some dr ∧ body.localDecls[q]? = some dq ∧
+      body.localDecls[t]? = some d ∧
+      intTypeOf dr.ty = some it ∧ intTypeOf dq.ty = some it ∧
+      tupleTypeOf body.layouts d.ty = some (fields, size, align) ∧
+      0 < it.size.bytes ∧ GoodSize it.size.bytes ∧
+      translateBinOp op = some iop ∧ cbits < 2 ^ (8 * it.size.bytes) ∧
+      translateOperand body.localDecls (.constant c) =
+        some (.Constant (.Int (intFromBits cbits it)) (.Int it)) := by
+  unfold binOpWindowOk at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨⟨⟨⟨⟨hrt, hqt⟩, hrq⟩, hrel⟩, hbin⟩, h⟩ := h
+  have hrel' : translateRelOp op = none := Option.isNone_iff_eq_none.mp hrel
+  obtain ⟨iop, hiop⟩ := Option.isSome_iff_exists.mp hbin
+  refine ⟨hrt, hqt, hrq, hrel', ?_⟩
+  cases hdr : body.localDecls[r]? with
+  | none => simp [hdr] at h
+  | some dr =>
+    cases hdq : body.localDecls[q]? with
+    | none => simp [hdr, hdq] at h
+    | some dq =>
+      cases hd : body.localDecls[t]? with
+      | none => simp [hdr, hdq, hd] at h
+      | some d =>
+        cases hit : intTypeOf dr.ty with
+        | none => simp [hdr, hdq, hd, hit] at h
+        | some it =>
+          cases hitq : intTypeOf dq.ty with
+          | none => simp [hdr, hdq, hd, hit, hitq] at h
+          | some it' =>
+            cases ht : tupleTypeOf body.layouts d.ty with
+            | none => simp [hdr, hdq, hd, hit, hitq, ht] at h
+            | some trip =>
+              obtain ⟨fields, size, align⟩ := trip
+              obtain ⟨cty, cval⟩ := c
+              cases cval with
+              | scalar cs =>
+                cases cs with
+                | int sc =>
+                  obtain ⟨cbits, csz⟩ := sc
+                  cases hcit : intTypeOf cty with
+                  | none => simp [hdr, hdq, hd, hit, hitq, ht, hcit] at h
+                  | some ic =>
+                    simp only [hdr, hdq, hd, hit, hitq, ht, hcit, Bool.and_eq_true,
+                      decide_eq_true_eq, Bool.not_eq_true'] at h
+                    obtain ⟨⟨⟨⟨rfl, hpos⟩, hgood⟩, hnb⟩, ⟨rfl, rfl⟩, hcbits⟩ := h
+                    refine ⟨dr, dq, d, fields, size, align, ic, iop, cbits, rfl, rfl, rfl, hit,
+                      hitq, ht, hpos, (goodAlignBytes_iff ic.size.bytes).mp hgood, hiop,
+                      hcbits, ?_⟩
+                    simp [translateOperand, hnb, hcit, hcbits]
+                | ptr _ _ => simp [hdr, hdq, hd, hit, hitq, ht] at h
+              | _ => simp [hdr, hdq, hd, hit, hitq, ht] at h
+
+/-- **Hole-independent scalar binary operation `_r = BinOp(iop, copy _q, const c)` between two
+integer locals `_r` and `_q` of type `it` and a constant `c` of type `it`.** -/
+theorem evalStatement_binOpWindow_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
+    {lm : Map Gen.LocalName Ptr} {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {r q : Nat} {dr dq : LocalDecl} {it : Gen.IntType}
+    (hdr : body.localDecls[r]? = some dr) (hdq : body.localDecls[q]? = some dq)
+    (hit : intTypeOf dr.ty = some it) (hitq : intTypeOf dq.ty = some it)
+    (hgood : GoodSize it.size.bytes)
+    {op : MirAst.BinOp} {iop : Gen.IntBinOp} (hiop : translateBinOp op = some iop)
+    (cbits : Nat) :
+    (mapGet lm (localName r) = none →
+      evalStatement m (.Assign (.Local (localName r))
+        (.BinOp (.Int iop) (.Load (.Local (localName q)))
+          (.Constant (.Int (intFromBits cbits it)) (.Int it)))) =
+        .error (.ub "access to a dead local")) ∧
+    (∀ (pr : Ptr), mapGet lm (localName r) = some pr →
+      mapGet lm (localName q) = none →
+      evalStatement m (.Assign (.Local (localName r))
+        (.BinOp (.Int iop) (.Load (.Local (localName q)))
+          (.Constant (.Int (intFromBits cbits it)) (.Int it)))) =
+        .error (.ub "access to a dead local")) ∧
+    (∀ (pr pq : Ptr) (kq : Nat), mapGet lm (localName r) = some pr →
+      mapGet lm (localName q) = some pq →
+      pq.provenance = some (⟨(kq : Int)⟩, ()) →
+      A[kq]? = some (stackAlloc pq.addr it (List.replicate it.size.bytes .Uninit)) →
+      ∃ msg, evalStatement m (.Assign (.Local (localName r))
+        (.BinOp (.Int iop) (.Load (.Local (localName q)))
+          (.Constant (.Int (intFromBits cbits it)) (.Int it)))) =
+        .error (.ub msg)) ∧
+    (∀ (pr pq : Ptr) (kr kq : Nat) (Dr : List Byte) (bits : Nat),
+      mapGet lm (localName r) = some pr →
+      mapGet lm (localName q) = some pq →
+      pr.provenance = some (⟨(kr : Int)⟩, ()) →
+      pq.provenance = some (⟨(kq : Int)⟩, ()) →
+      bits < 2 ^ (8 * it.size.bytes) →
+      A[kq]? = some (stackAlloc pq.addr it (scalarBytes it bits)) →
+      A[kr]? = some (stackAlloc pr.addr it Dr) →
+      Dr.length = it.size.bytes →
+      (intBinEval iop (intFromBits bits it) (intFromBits cbits it) it = none →
+        ∃ msg, evalStatement m (.Assign (.Local (localName r))
+          (.BinOp (.Int iop) (.Load (.Local (localName q)))
+            (.Constant (.Int (intFromBits cbits it)) (.Int it)))) =
+          .error (.ub msg)) ∧
+      (∀ z, intBinEval iop (intFromBits bits it) (intFromBits cbits it) it = some z →
+        ∃ m', evalStatement m (.Assign (.Local (localName r))
+            (.BinOp (.Int iop) (.Load (.Local (localName q)))
+              (.Constant (.Int (intFromBits cbits it)) (.Int it)))) = .ok m' ∧
+          Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt]
+            (A.set kr (stackAlloc pr.addr it
+              (scalarBytes it (z % 2 ^ (8 * it.size.bytes)).toNat))))) := by
+  obtain ⟨hTr, _⟩ := tyOf_int (layouts := body.layouts) hit
+  obtain ⟨hTq, _⟩ := tyOf_int (layouts := body.layouts) hitq
+  have hlocr := (hfl.2 r dr hdr).2
+  have hlocq := (hfl.2 q dq hdq).2
+  rw [hTr] at hlocr
+  rw [hTq] at hlocq
+  refine ⟨fun hnone => ?_, fun pr hpr hnoneq => ?_, fun pr pq kq hpr hpq hpqk hAq => ?_,
+    fun pr pq kr kq Dr bits hpr hpq hprk hpqk hbits hAq hAr hlenr => ?_⟩
+  · simp [evalStatement, evalPlace_local_none h r _ hlocr hnone]
+  · simp [evalStatement, evalPlace_local_some h r _ hlocr pr hpr, evalValue,
+      evalPlace_local_none h q _ hlocq hnoneq]
+  · have hplacer := evalPlace_local_some h r _ hlocr pr hpr
+    have hplaceq := evalPlace_local_some h q _ hlocq pq hpq
+    obtain ⟨msg, hmsg⟩ := typedLoad_ptr_frag_uninit h pq kq hpqk (FragTy.int it hgood) hAq
+    exact ⟨msg, by simp [evalStatement, hplacer, evalValue, hplaceq, placeLoad, hmsg]⟩
+  · have hplacer := evalPlace_local_some h r _ hlocr pr hpr
+    have hplaceq := evalPlace_local_some h q _ hlocq pq hpq
+    obtain ⟨m1, hm1, h1⟩ := typedLoad_ptr_frag h pq kq hpqk (FragTy.int it hgood) bits hbits hAq
+    simp only [valOf] at hm1
+    obtain ⟨hevalOk, hevalNone⟩ :=
+      evalIntBinOp_spec op iop hiop (intFromBits bits it) (intFromBits cbits it) it
+    refine ⟨fun hz => ?_, fun z hz => ?_⟩
+    · obtain ⟨msg, hmsg⟩ := hevalNone hz
+      exact ⟨msg, by simp [evalStatement, hplacer, evalValue, hplaceq, placeLoad, hm1,
+        evalConstant, evalBinOp, hmsg]⟩
+    · have hpos := two_pow_pos (8 * it.size.bytes)
+      have hlt : (z % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+        have h0 := Int.emod_nonneg z (Int.ne_of_gt hpos)
+        have hlt' := Int.emod_lt_of_pos z hpos
+        have : ((z % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+          rw [Int.toNat_of_nonneg h0]; exact hlt'
+        exact_mod_cast this
+      have hst := typedStore_ptr_frag h1 pr kr hprk (FragTy.int it hgood) Dr
+        (z % 2 ^ (8 * it.size.bytes)).toNat hlt hAr hlenr
+      simp only [valOf] at hst
+      refine ⟨withMem m1 (A.set kr (stackAlloc pr.addr it
+        (scalarBytes it (z % 2 ^ (8 * it.size.bytes)).toNat)))
+        ⟨.Store, .None, pr.addr, it.size⟩, ?_, withMem_shape h1 _⟩
+      simp [evalStatement, hplacer, evalValue, hplaceq, placeLoad, hm1, evalConstant, evalBinOp,
+        hevalOk z hz, bringInBounds_eq_intFromBits it hgood z, placeStore, hst]
+
+/-- **Hole-independent scalar binary-operation step.** While `_t.ps` is a hole,
+`_r = BinOp(op, copy _q, const c)` (where `r ≠ t`, `q ≠ t`, `r ≠ q` are integer locals of the same
+type `it` and `c` is a constant of type `it`) either faults (dead `_r`, dead/uninitialized `_q`, or
+a UB operation such as division by zero) in both machines, or stores the computed result into `_r`'s
+allocation in both machines while leaving the open hole on `_t.ps` untouched. -/
+theorem step_window_binop_local {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m m0 : Mach} {t : Nat} {ps : List ProjectionElem}
+    (hhole : holeAt body s.frame.blockIdx s.frame.stmtIdx = some (t, ps))
+    (hN0 : StateRelN (eraseDeinit body) f ctx s m0)
+    (hHR : HoleRel body f ctx s.frame.blockIdx s.frame.stmtIdx t ps m0 m)
+    {bb : BasicBlockData} {r q : Nat} {op : MirAst.BinOp} {c : ConstOperand} {span : String}
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? =
+      some ⟨.assign ⟨r, []⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)), span⟩)
+    (hbw : binOpWindowOk body t r q op c = true) :
+    StepRelD body f ctx s (stepMirFn body s) (Interp.step m) := by
+  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
+  obtain ⟨hrt, hqt, _hrq, hrel, dr, dq, d, fields, size, align, it, iop, cbits, hdr, hdq, hd, hit,
+    hitq, ht, _, hgood, hiop, _, hcop⟩ := binOpWindowOk_spec hbw
+  obtain ⟨view, lm, p, k, rootVal, off, sz, hthr0, hlo0, _, hp, hpk, _, _, _, _, _, hA0, hrng,
+    hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
+  have hopTyQ : operandType body.layouts body.localDecls (.copy ⟨q, []⟩) = some (.Int it) := by
+    simp [operandType, hdq, scalarTypeOf_int hitq]
+  obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+  obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+  obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+  have hstEq : st' = .Assign (.Local (localName r))
+      (.BinOp (.Int iop) (.Load (.Local (localName q)))
+        (.Constant (.Int (intFromBits cbits it)) (.Int it))) := by
+    simp only [translateStatement, translatePlace, copyRv, copyOp, translateRvalue,
+      translateOperand, hrel, hiop, hopTyQ] at hst'
+    simp only [translateOperand] at hcop
+    rw [hcop] at hst'
+    simp at hst'
+    exact hst'.symm
+  subst hstEq
+  have hshape0 : Shape m0 (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+      [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+        calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+          s.frame.blockIdx s.frame.stmtIdx] m0.mem.memory.allocations :=
+    ⟨hthr0, hrel0.active, rfl⟩
+  have hshapeH : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+      [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+        calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+          s.frame.blockIdx s.frame.stmtIdx] m.mem.memory.allocations :=
+    ⟨hthrE.trans hthr0, hactE.trans hrel0.active, rfl⟩
+  have hfl := FnLocalsSpec.of_translateFn hf
+  obtain ⟨hdeadR0, hdeadQ0, huninitQ0, hlive0⟩ :=
+    evalStatement_binOpWindow_any (resetPick_shape hshape0) hfl hdr hdq hit hitq hgood hiop cbits
+  obtain ⟨hdeadRH, hdeadQH, huninitQH, hliveH⟩ :=
+    evalStatement_binOpWindow_any (resetPick_shape hshapeH) hfl hdr hdq hit hitq hgood hiop cbits
+  have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+    have := (List.getElem?_eq_some_iff.mp hst).1
+    rw [hlen]; omega
+  have hnd : ∀ st, bb.statements[s.frame.stmtIdx]? = some st → isProjDeinit st = false := by
+    intro st hst2; rw [hst] at hst2; cases hst2; rfl
+  have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
+    (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+  rw [stepMirFn_eraseDeinit_stmt (body := body) hrel0.activeCallee hphase hbb hst rfl]
+  cases hpr : mapGet lm (localName r) with
+  | none =>
+    have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
+      rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hdeadR0 hpr]
+    have hsH : Interp.step m = .error (.ub "access to a dead local") := by
+      rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hdeadRH hpr]
+    rw [hs0] at hNF; rw [hsH]
+    exact hNF.toStepRelD
+  | some pr =>
+    cases hpq : mapGet lm (localName q) with
+    | none =>
+      have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
+        rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hdeadQ0 pr hpr hpq]
+      have hsH : Interp.step m = .error (.ub "access to a dead local") := by
+        rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hdeadQH pr hpr hpq]
+      rw [hs0] at hNF; rw [hsH]
+      exact hNF.toStepRelD
+    | some pq =>
+      have hr_lt : r < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdr).1
+      have hq_lt : q < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdq).1
+      obtain ⟨slotr, hsVr⟩ : ∃ slot, view[r]? = some slot :=
+        ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact hr_lt)⟩
+      obtain ⟨slotq, hsVq⟩ : ∃ slot, view[q]? = some slot :=
+        ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact hq_lt)⟩
+      have hscr : scalarTypeOf dr.ty = some (.Int it) := scalarTypeOf_int hit
+      have hscq : scalarTypeOf dq.ty = some (.Int it) := scalarTypeOf_int hitq
+      obtain ⟨kr, hprk, _, _, _, _, hAr⟩ := hlo0.storage_nonptr r dr slotr pr hdr hsVr hpr
+        (isPtrTy_false_of_scalarTypeOf hscr)
+      obtain ⟨kq, hpqk, _, _, _, _, hAq⟩ := hlo0.storage_nonptr q dq slotq pq hdq hsVq hpq
+        (isPtrTy_false_of_scalarTypeOf hscq)
+      simp only [eraseDeinit_layouts] at hAr hAq
+      obtain ⟨hTr, hIr⟩ := tyOf_int (layouts := body.layouts) hit
+      obtain ⟨hTq, hIq⟩ := tyOf_int (layouts := body.layouts) hitq
+      rw [hIr] at hAr
+      rw [hIq] at hAq
+      have hlenr : (declSlotData dr slotr body.layouts).length = it.size.bytes := by
+        rw [declSlotData_length (by rw [hTr]; exact hscr), hTr]; rfl
+      have hkr : kr ≠ k := by
+        intro hkk; subst hkk
+        exact hrt (hlo0.inj r t pr p hpr hp (by rw [hprk, hpk]))
+      have hkq : kq ≠ k := by
+        intro hkk; subst hkk
+        exact hqt (hlo0.inj q t pq p hpq hp (by rw [hpqk, hpk]))
+      have hArH : m.mem.memory.allocations[kr]? =
+          some (stackAlloc pr.addr it (declSlotData dr slotr body.layouts)) := by
+        rw [hallocE, List.getElem?_set_ne (Ne.symm hkr)]; exact hAr
+      have hAqH : m.mem.memory.allocations[kq]? =
+          some (stackAlloc pq.addr it (declSlotData dq slotq body.layouts)) := by
+        rw [hallocE, List.getElem?_set_ne (Ne.symm hkq)]; exact hAq
+      have hslotq := (DeclSlotOk_of_scalarTypeOf hscq slotq).mp (hlo0.slots q dq slotq hdq hsVq)
+      simp only [eraseDeinit_layouts] at hslotq
+      rw [hTq] at hslotq
+      have hfragdq : FragTy (tyOf dq body.layouts) (itOf dq body.layouts) :=
+        fragTy_of_scalarTypeOf hscq (FragTy.int it hgood)
+      rw [hfragdq.declSlotData, hIq] at hAq hAqH
+      match slotq, hslotq, hAq, hAqH with
+      | .dead, _, hAq, hAqH =>
+        obtain ⟨msg0, hev0⟩ := huninitQ0 pr pq kq hpr hpq hpqk hAq
+        obtain ⟨msgH, hevH⟩ := huninitQH pr pq kq hpr hpq hpqk hAqH
+        have hs0 : Interp.step m0 = .error (.ub msg0) := by
+          rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+        have hsH : Interp.step m = .error (.ub msgH) := by
+          rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+        rw [hs0] at hNF; rw [hsH]
+        exact hNF.toStepRelD_ub
+      | .uninit, _, hAq, hAqH =>
+        obtain ⟨msg0, hev0⟩ := huninitQ0 pr pq kq hpr hpq hpqk hAq
+        obtain ⟨msgH, hevH⟩ := huninitQH pr pq kq hpr hpq hpqk hAqH
+        have hs0 : Interp.step m0 = .error (.ub msg0) := by
+          rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+        have hsH : Interp.step m = .error (.ub msgH) := by
+          rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+        rw [hs0] at hNF; rw [hsH]
+        exact hNF.toStepRelD_ub
+      | .init (.scalar sc), ⟨_, hbits⟩, hAq, hAqH =>
+        obtain ⟨hub0, hok0⟩ := hlive0 pr pq kr kq _ sc.bits hpr hpq hprk hpqk hbits hAq hAr hlenr
+        obtain ⟨hubH, hokH⟩ := hliveH pr pq kr kq _ sc.bits hpr hpq hprk hpqk hbits hAqH hArH hlenr
+        cases hz : intBinEval iop (intFromBits sc.bits it) (intFromBits cbits it) it with
+        | none =>
+          obtain ⟨msg0, hev0⟩ := hub0 hz
+          obtain ⟨msgH, hevH⟩ := hubH hz
+          have hs0 : Interp.step m0 = .error (.ub msg0) := by
+            rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+          have hsH : Interp.step m = .error (.ub msgH) := by
+            rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+          rw [hs0] at hNF; rw [hsH]
+          exact hNF.toStepRelD_ub
+        | some z =>
+          obtain ⟨m3, hev0, h3⟩ := hok0 z hz
+          obtain ⟨m3h, hevH, h3h⟩ := hokH z hz
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3
+          obtain ⟨m4h, hm4h, h4h⟩ := bumpStmt_callee h3h
+          have hs0 : Interp.step m0 = .ok m4 := by
+            rw [step_callee hshape0 tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hev0, hm4, check_after h4]
+          have hsH : Interp.step m = .ok m4h := by
+            rw [step_callee hshapeH tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hevH, hm4h, check_after h4h]
+          rw [hs0] at hNF; rw [hsH]
+          have hhole' : holeAt body s.frame.blockIdx (s.frame.stmtIdx + 1) = some (t, ps) := by
+            rw [holeAt_succ hbb hst, hhole]
+            simp [holeAfter, hrt]
+          refine StepRelN.toStepRelD_hole hNF h4.threads hhole' hp hpk
+            (by rw [h4.allocs, List.getElem?_set_ne hkr]; exact hA0) hrng
+            (h4h.threads.trans h4.threads.symm) (h4h.active.trans h4.active.symm) ?_
+          rw [h4h.allocs, h4.allocs, hallocE]
+          exact List.set_comm _ _ (Ne.symm hkr)
+      | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _, _ =>
+        nomatch htyT
+
 /-! ## The correspondence theorem for `inFragmentD` -/
 
 /-- **Correspondence theorem for projected `Deinit` (one step, preserving `StateRelD`).**
@@ -2672,7 +3018,19 @@ theorem step_correspondence_D (body : CapturedMir) (f : Gen.Function)
         | _ => simp [windowStmtOk] at hw
       | binaryOp bop a b =>
         cases rproj with
-        | nil => simp [windowStmtOk] at hw
+        | nil =>
+          cases a with
+          | copy qa =>
+            obtain ⟨q, qproj⟩ := qa
+            cases qproj with
+            | nil =>
+              cases b with
+              | constant c =>
+                simp only [windowStmtOk] at hw
+                exact step_window_binop_local hfrag hf hhole hN0 hHR hbb hst hw
+              | _ => simp [windowStmtOk] at hw
+            | cons _ _ => simp [windowStmtOk] at hw
+          | _ => simp [windowStmtOk] at hw
         | cons rp rps =>
           cases a with
           | copy qa =>
