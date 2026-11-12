@@ -13604,4 +13604,119 @@ elaborator does not unfold, so the check runs in the kernel). -/
 theorem paddedRetagRead_minirust_ret : paddedRetagReadMiniRustRet = true := by
   decide +kernel
 
+/-! ### Projected `Deinit`, sibling read, and re-initialization (`paddedDeinitSiblingReinit`)
+
+When a projected `Deinit(_1.1)` on `Padded(u8, u32, u16)` is followed by reading
+the unaffected sibling field `_1.0`, re-initializing `_1.1 = _2 + 35`, and then
+reading `_1.1`, Anneal and MiniRust agree on every step and both return `42`:
+* After `Deinit(_1.1)` (`steps 2`), bytes `4..8` of `_1` are `Uninit` while
+  sibling fields `_1.0` (`7`) and `_1.2` (`0x0605`) are preserved;
+* Reading sibling `_1.0` (`steps 3`) loads `7` without touching the `Uninit`
+  hole in `_1.1`;
+* Writing `_1.1 = 7 + 35` (`steps 4`) refills bytes `4..8` with `scalarBytes u32 42`;
+* Reading `_0 = copy _1.1` and returning (`steps 6`) returns `42` in both
+  Anneal (`paddedDeinitSiblingReinit_anneal_ret`) and MiniRust
+  (`paddedDeinitSiblingReinit_minirust_ret`). -/
+
+/-- MIR of
+```rust
+fn padded_deinit_sibling_reinit(mut s: Padded) -> u32 {
+    Deinit(s.1);
+    let a = s.0 as u32;
+    s.1 = a + 35;
+    s.1
+}
+``` -/
+def paddedDeinitSiblingReinit : CapturedMir where
+  defPath := "witness::padded_deinit_sibling_reinit"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.cast .intToInt (.copy (placeField 1 [(0, u8TyW)])) u32Ty)),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)])
+          (.binaryOp .add (.copy (local_ 2)) (constU32 35))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem paddedDeinitSiblingReinit_not_inFragment :
+    inFragment paddedDeinitSiblingReinit = false := by decide
+
+def paddedDeinitSiblingReinitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Field (.Local (localName 1)) 0))),
+      .Assign (.Field (.Local (localName 1)) 1)
+        (.BinOp (.Int .Add) (.Load (.Local (localName 2)))
+          (.Constant (.Int 35) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1)),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitSiblingReinit_translate :
+    translateFn paddedDeinitSiblingReinit = some paddedDeinitSiblingReinitFn := rfl
+
+def paddedDeinitSiblingReinitS0 : MachineState :=
+  initMachineState paddedDeinitSiblingReinit paddedDeinitReadArgs
+
+def paddedDeinitSiblingReinitMInit : Mach :=
+  machineWithCtx ctxPadded3 paddedDeinitSiblingReinit paddedDeinitSiblingReinitFn
+    paddedDeinitSiblingReinitS0.frame.locals paddedDeinitSiblingReinitFn.start
+
+/-- Anneal evaluates `paddedDeinitSiblingReinit` to `.scalar ⟨42, 4⟩`. -/
+theorem paddedDeinitSiblingReinit_anneal_ret :
+    ReachesRet (mirCallTree paddedDeinitSiblingReinit paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨42, 4⟩, paddedDeinitSiblingReinitS0.memory)) :=
+  runA_sound paddedDeinitSiblingReinit 12 _ _ _ rfl
+
+/-- Anneal evaluation of `paddedDeinitSiblingReinit` has no UB. -/
+theorem paddedDeinitSiblingReinit_noUB :
+    MirNoUBTree (mirCallTree paddedDeinitSiblingReinit paddedDeinitReadArgs) :=
+  runA_noUB paddedDeinitSiblingReinit 12 _ _ _ rfl
+
+/-- In MiniRust:
+1. After `Deinit(_1.1)` (`steps 3`), bytes `4..8` of `_1` are `Uninit` while
+   sibling fields `_1.0` (`7`) and `_1.2` (`[5, 6]`) remain initialized;
+2. Reading sibling `_1.0` (`steps 4`) stores `7` into `_2`;
+3. Re-initializing `_1.1 = _2 + 35` (`steps 5`) writes `scalarBytes u32 42` into
+   bytes `4..8` of `_1`;
+4. After `Return` (`steps 8`), the callee frame is popped and the caller's
+   return allocation holds `scalarBytes u32 42`. -/
+theorem paddedDeinitSiblingReinit_minirust_ret :
+    ((Interp.steps 3 paddedDeinitSiblingReinitMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Uninit, .Uninit, .Uninit, .Uninit,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 4 paddedDeinitSiblingReinitMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[3]?).map (·.data))) =
+      some (scalarBytes u32 7) ∧
+    ((Interp.steps 5 paddedDeinitSiblingReinitMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Init 42 none, .Init 0 none, .Init 0 none, .Init 0 none,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 8 paddedDeinitSiblingReinitMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[0]?).map (·.data))) =
+      some (scalarBytes u32 42) :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence.Witness

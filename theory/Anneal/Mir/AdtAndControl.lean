@@ -10247,6 +10247,54 @@ structure SynPtr : Type where
   prov : Option (Nat × Nat)
   deriving DecidableEq
 
+/-- **`encode_subplace_tag` (`rvalue.rs:9771-9780`)**: packs the 32-bit type fingerprint `fp ty`
+into the high 32 bits and `ordinal + 2` into the low 32 bits (returning the default untagged
+provenance tag `1` when `ordinal + 2 ≥ 2^32`). -/
+def encodeSubplaceTag (fp : Nat → Nat) (ty ordinal : Nat) : Nat :=
+  if ordinal + 2 < 2 ^ 32 then fp ty * (2 ^ 32) + (ordinal + 2)
+  else 1
+
+/-- **`decode_subplace_tag` (`rvalue.rs:9782-9792`)**: recovers `some ordinal` iff the low 32 bits
+are `≥ 2` and the high 32 bits match `fp ty`. -/
+def decodeSubplaceTag (fp : Nat → Nat) (tag ty : Nat) : Option Nat :=
+  let low := tag % (2 ^ 32)
+  let high := tag / (2 ^ 32)
+  if low < 2 then none
+  else if high ≠ fp ty then none
+  else some (low - 2)
+
+/-- **Type-fingerprinted sub-place tag round-trip (`decodeSubplaceTag_encodeSubplaceTag_same`)**:
+decoding an encoded sub-place tag at the same pointee type `ty` recovers `some ordinal` whenever
+`ordinal + 2 < 2^32`. -/
+theorem decodeSubplaceTag_encodeSubplaceTag_same (fp : Nat → Nat) (ty ordinal : Nat)
+    (hOrd : ordinal + 2 < 2 ^ 32) :
+    decodeSubplaceTag fp (encodeSubplaceTag fp ty ordinal) ty = some ordinal := by
+  simp only [encodeSubplaceTag, decodeSubplaceTag, hOrd, ↓reduceIte]
+  have hLow : (fp ty * 2 ^ 32 + (ordinal + 2)) % 2 ^ 32 = ordinal + 2 := by omega
+  have hHigh : (fp ty * 2 ^ 32 + (ordinal + 2)) / 2 ^ 32 = fp ty := by omega
+  have hNotLt : ¬ (ordinal + 2 < 2) := by omega
+  simp [hLow, hHigh, hNotLt]
+
+/-- **Default untagged provenance `1` never decodes (`decodeSubplaceTag_tag_one_none`)**. -/
+theorem decodeSubplaceTag_tag_one_none (fp : Nat → Nat) (ty : Nat) :
+    decodeSubplaceTag fp 1 ty = none := by
+  simp [decodeSubplaceTag]
+
+/-- **Cast-pointer fingerprint mismatch (`decodeSubplaceTag_mismatch_none`)**: when a pointer
+created for type `ty₁` is cast and dereferenced as `ty₂` with `fp ty₁ ≠ fp ty₂`,
+`decodeSubplaceTag` returns `none` so `resolveSyntheticSubplace` never misuses `ty₁`'s candidate
+ordinal to index `ty₂`'s candidate list. -/
+theorem decodeSubplaceTag_mismatch_none (fp : Nat → Nat) (ty₁ ty₂ ordinal : Nat)
+    (hFp : fp ty₁ ≠ fp ty₂) :
+    decodeSubplaceTag fp (encodeSubplaceTag fp ty₁ ordinal) ty₂ = none := by
+  by_cases hOrd : ordinal + 2 < 2 ^ 32
+  · simp only [encodeSubplaceTag, decodeSubplaceTag, hOrd, ↓reduceIte]
+    have hLow : (fp ty₁ * 2 ^ 32 + (ordinal + 2)) % 2 ^ 32 = ordinal + 2 := by omega
+    have hHigh : (fp ty₁ * 2 ^ 32 + (ordinal + 2)) / 2 ^ 32 = fp ty₁ := by omega
+    have hNotLt : ¬ (ordinal + 2 < 2) := by omega
+    simp [hLow, hHigh, hNotLt, hFp]
+  · simp [encodeSubplaceTag, decodeSubplaceTag, hOrd]
+
 /-- The frame-independent context of synthetic sub-place pointers: allocation layouts and the
 address-space limit (for `localBaseAddr`), byte layouts of the declared locals, type identities
 of the declared locals and the same-offset/same-type candidate paths (`collect_subplace_paths`),
@@ -11650,6 +11698,29 @@ theorem evalDerefPlaceRead_refines_evalRvalue {cx : SubplaceCtx}
     | nil => exact ⟨_, rfl⟩
     | cons b₂ bs => exact ⟨_, rfl⟩
 
+/-- **`Deref` reads refine Trusted's `evalRvalue` for arbitrary `localDecls`
+(`evalDerefPlaceRead_refines_evalRvalue_general`)**: under `SlotsRefine SlotBelow slots locals`,
+when Anneal reads `v` from `(*_p).rest` and Trusted's typed `evalOperand` (with `localDecls`)
+evaluates `Operand.copy ((*_p).rest)` to `.ok v locals` and validates `v`, Trusted's
+`evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem localDecls layouts` evaluates to
+`.ok v locals mem'` for any `localDecls : List LocalDecl`. -/
+theorem evalDerefPlaceRead_refines_evalRvalue_general {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
+    {v : Value} {mem : Memory} (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (_hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v)
+    (hOp : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
+      mem.callerLocals localDecls = .ok v locals)
+    (hValid : validateLoadedValue layouts localDecls (.copy ⟨p, .deref :: rest⟩) v = true) :
+    ∃ mem', evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem localDecls layouts =
+      .ok v locals mem' := by
+  simp only [evalRvalue, hOp, hValid]
+  cases hb : mem.borrows with
+  | nil => exact ⟨_, rfl⟩
+  | cons b₁ bs =>
+    cases bs with
+    | nil => exact ⟨_, rfl⟩
+    | cons b₂ bs => exact ⟨_, rfl⟩
+
 /-- **`Deref` writes refine Trusted's `writePlaceValue` (`evalDerefPlaceWrite_refines_writePlaceValue`)**:
 on below-related frames, if Anneal writes `v` through `(*_p).rest` into an initialized target and
 Trusted's writable (`active`/`reserved`) borrow entry for `_p`'s tag names the sub-place Anneal
@@ -11778,19 +11849,72 @@ def synthTargetDead (slots : List LocalSlotState) (p : SynPtr) : Bool :=
     | _ => false
   | _ => false
 
+/-- Whether a projection tail is structurally valid for `read_slot_at_proj` on an `.uninit` slot
+(no `.deref`, and every `.downcast` is immediately followed by `.field`, matching
+`rvalue.rs:10426-10444`). -/
+def validSubplaceUninitTail : List ProjectionElem → Bool
+  | [] => true
+  | .deref :: _ => false
+  | .downcast _ _ :: .field _ _ :: rest => validSubplaceUninitTail rest
+  | .downcast _ _ :: _ => false
+  | _ :: rest => validSubplaceUninitTail rest
+
+/-- `read_slot_at_proj` (`rvalue.rs:10416-10506`): projects a `FieldSlot` along `q`, returning
+`some .uninit` whenever an `.uninit` slot (at the root or inside a `PartialShell`) is projected
+along a valid non-`Deref` tail `q`. -/
+def readSlotAtProj (locals : List LocalSlot) : FieldSlot → List ProjectionElem → Option FieldSlot
+  | slot, [] => some slot
+  | .uninit, q => if validSubplaceUninitTail q then some .uninit else none
+  | .init v, q =>
+    match evalValueProjRead locals v q with
+    | .ok w => some (.init w)
+    | _ => none
+  | .nested var adt disc fs, .field idx _ :: rest =>
+    if shellVariant ⟨var, adt, disc, fs⟩ = 0 then
+      match fs[idx]? with
+      | some c => readSlotAtProj locals c rest
+      | none => none
+    else none
+  | .nested var adt disc fs, .downcast _ v :: .field idx _ :: rest =>
+    if shellVariant ⟨var, adt, disc, fs⟩ = v then
+      match fs[idx]? with
+      | some c => readSlotAtProj locals c rest
+      | none => none
+    else none
+  | _, _ => none
+
 /-- **`read_subplace_slot`**: the field slot (`Uninit`, `PartialShell`, or `Init`) at a sub-place
-of a live local. -/
+of a live local (`rvalue.rs:6788-6803`). -/
 def readSubplaceSlot (slots : List LocalSlotState) (l : Nat) (q : List ProjectionElem) :
     Option FieldSlot :=
   match slots[l]? with
   | none => none
   | some .dead => none
-  | some st => projectFieldSlot (slotsToTrustedLocals slots) (slotStateToFieldSlot st) q
+  | some st => readSlotAtProj (slotsToTrustedLocals slots) (slotStateToFieldSlot st) q
 
 /-- Whether a sub-place slot is (known to be) uninitialized. -/
 def isUninitSlot : Option FieldSlot → Bool
   | some .uninit => true
   | _ => false
+
+@[simp] theorem isUninitSlot_readSlotAtProj_init (locals : List LocalSlot) (v : Value)
+    (q : List ProjectionElem) :
+    isUninitSlot (readSlotAtProj locals (.init v) q) = false := by
+  cases q with
+  | nil => rfl
+  | cons a as =>
+    simp only [readSlotAtProj]
+    split <;> rfl
+
+/-- Reading any valid non-`Deref` sub-place tail `q` of an `.uninit` local yields `some .uninit`
+(`rvalue.rs:10435-10444`). -/
+theorem readSubplaceSlot_uninit_tail {slots : List LocalSlotState} {l : Nat}
+    {q : List ProjectionElem} (hU : slots[l]? = some .uninit)
+    (hTail : validSubplaceUninitTail q = true) :
+    readSubplaceSlot slots l q = some .uninit := by
+  cases q with
+  | nil => simp [readSubplaceSlot, hU, slotStateToFieldSlot, readSlotAtProj]
+  | cons a as => simp [readSubplaceSlot, hU, slotStateToFieldSlot, readSlotAtProj, hTail]
 
 /-- The element `0` of a 1-element array (`ConstantIndex { offset: 0, min_length: 1 }`), which
 covers the whole `[T; 1]`. -/
@@ -11802,39 +11926,96 @@ def isUnitElem : ProjectionElem → Bool
 def stripUnitElems (q : List ProjectionElem) : List ProjectionElem :=
   (q.reverse.dropWhile isUnitElem).reverse
 
+/-- Wrap `v` in a 1-element array aggregate (`.aggregate 0 [v]`) for each trailing
+`ConstantIndex 0 1 false` step of `q` (`rvalue.rs:6833-6856`). -/
+def wrapUnitElemsVal (q : List ProjectionElem) (v : Value) : Value :=
+  (q.reverse.takeWhile isUnitElem).foldl (fun acc _ => Value.aggregate 0 [acc]) v
+
 /-- Whether a path ends with an array element step (a forward `ConstantIndex`). -/
 def endsWithElem (q : List ProjectionElem) : Bool :=
   match q.getLast? with
   | some (.constantIndex _ _ false) => true
   | _ => false
 
-/-- **`write_subplace_slot`**: stores a copied slot at a sub-place without guessing: an initialized
-slot is an ordinary write (`writePlaceState`: partial-shell fields are initialized and their
-siblings preserved); an uninitialized slot deinitializes the destination (`evalDeinitPlace`),
-except that an element of a multi-element array (arrays have no per-element state) is a no-op on
-an uninitialized array and fails closed otherwise, while the element of a `[T; 1]` covers, and
-deinitializes, the whole array; a partially initialized shell is stored verbatim at a whole-local
-destination and fails closed elsewhere. -/
+/-- Whether a projection element is an array projection (`Index`, `ConstantIndex`, or `Subslice`,
+matching `rvalue.rs:6882-6889`). -/
+def isArrayProjElem : ProjectionElem → Bool
+  | .index _ => true
+  | .constantIndex _ _ _ => true
+  | .subslice _ _ _ => true
+  | _ => false
+
+/-- Whether a path contains any array projection (`rvalue.rs:6882-6889`). -/
+def hasArrayProj (q : List ProjectionElem) : Bool :=
+  q.any isArrayProjElem
+
+/-- `write_partial_shell_in_slot` (`rvalue.rs:10600-10726`): writes a `PartialAggregate` shell at
+sub-place `proj` of `slot` (materializing uninitialized parent shells via `arityOf`, exploding
+initialized parent aggregates via `explodeAggregate`, and normalizing via `deinitShellStep`). -/
+def writePartialShellInSlot (arityOf : Ty → VariantIdx → Bool → Option Nat) (tagSurvives : Bool) :
+    FieldSlot → Ty → List ProjectionElem → PartialAggregate → Option FieldSlot
+  | _, _, [], newShell => some (normalizeShell newShell)
+  | .uninit, curTy, .field idx fTy :: rest, newShell =>
+    match arityOf curTy 0 false with
+    | some n =>
+      deinitShellStep tagSurvives ⟨0, false, false, List.replicate n .uninit⟩ none idx
+        (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+    | none => none
+  | .uninit, curTy, .downcast _ v :: .field idx fTy :: rest, newShell =>
+    match arityOf curTy v true with
+    | some n =>
+      deinitShellStep tagSurvives ⟨v, true, false, List.replicate n .uninit⟩ (some v) idx
+        (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+    | none => none
+  | .init (.aggregate var vals), _, .field idx fTy :: rest, newShell =>
+    deinitShellStep tagSurvives (explodeAggregate var vals) none idx
+      (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+  | .init (.aggregate var vals), _, .downcast _ v :: .field idx fTy :: rest, newShell =>
+    deinitShellStep tagSurvives (explodeAggregate var vals) (some v) idx
+      (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+  | .nested var adt disc fs, _, .field idx fTy :: rest, newShell =>
+    deinitShellStep tagSurvives ⟨var, adt, disc, fs⟩ none idx
+      (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+  | .nested var adt disc fs, _, .downcast _ v :: .field idx fTy :: rest, newShell =>
+    deinitShellStep tagSurvives ⟨var, adt, disc, fs⟩ (some v) idx
+      (fun c => writePartialShellInSlot arityOf tagSurvives c fTy rest newShell)
+  | _, _, _ :: _, _ => none
+
+/-- **`write_subplace_slot` (`rvalue.rs:6818-6941`)**: stores a copied slot at a sub-place without
+guessing:
+1. an initialized slot (`.init v`) writes `v` via `writePlaceState`, promoting trailing `[T; 1]` /
+   `[[T; 1]; 1]` element steps (`stripUnitElems q`, `wrapUnitElemsVal q v`) when the enclosing
+   1-element array is `.uninit`;
+2. an uninitialized slot (`.uninit`) strips trailing `[T; 1]` steps (`stripUnitElems q`); if any
+   array projection (`Index`, `ConstantIndex`, or `Subslice`) remains (`hasArrayProj`), it is a
+   no-op when the destination sub-place is already `.uninit` and fails closed (`none`) otherwise,
+   and when no array projection remains it deinitializes `⟨l, stripUnitElems q⟩` via
+   `evalDeinitPlace`;
+3. a partially initialized shell (`.nested var adt disc fs`) strips trailing `[T; 1]` steps and
+   writes the shell at `stripUnitElems q` via `writePartialShellInSlot` (failing closed if
+   `stripUnitElems q` contains an array projection). -/
 def writeSubplaceSlot (arityOf : Ty → VariantIdx → Bool → Option Nat) (rootTyOf : Nat → Ty)
     (ts : Bool) (slots : List LocalSlotState) (l : Nat) (q : List ProjectionElem) :
     FieldSlot → Option (List LocalSlotState)
   | .init v =>
-    match writePlaceState arityOf slots ⟨l, q⟩ (rootTyOf l) v with
+    let q' := if isUninitSlot (readSubplaceSlot slots l (stripUnitElems q)) then stripUnitElems q else q
+    let v' := if isUninitSlot (readSubplaceSlot slots l (stripUnitElems q)) then wrapUnitElemsVal q v else v
+    match writePlaceState arityOf slots ⟨l, q'⟩ (rootTyOf l) v' with
     | .ok s => some s
     | _ => none
   | .uninit =>
-    if endsWithElem (stripUnitElems q) then
-      if isUninitSlot (readSubplaceSlot slots l (stripUnitElems q).dropLast) then some slots
+    if hasArrayProj (stripUnitElems q) then
+      if isUninitSlot (readSubplaceSlot slots l (stripUnitElems q)) then some slots
       else none
     else evalDeinitPlace ts slots ⟨l, stripUnitElems q⟩
   | .nested var adt disc fs =>
-    match q with
-    | [] =>
-      match slots[l]? with
-      | none => none
-      | some .dead => none
-      | some _ => some (slots.set l (fieldSlotToLocalSlotState (.nested var adt disc fs)))
-    | _ :: _ => none
+    match slots[l]? with
+    | none => none
+    | some .dead => none
+    | some st =>
+      (writePartialShellInSlot arityOf ts (slotStateToFieldSlot st) (rootTyOf l)
+        (stripUnitElems q) ⟨var, adt, disc, fs⟩).map
+        (fun s' => slots.set l (fieldSlotToLocalSlotState s'))
 
 /-- The last array-element step of a path: `(array path, start, array length)`. -/
 def splitLastElem (q : List ProjectionElem) : Option (List ProjectionElem × Nat × Nat) :=
@@ -11993,7 +12174,9 @@ theorem evalCopyNonOverlappingSubplace_read_after_copy {arityOf : Ty → Variant
           · exact h' h1
           · exact h' h2
           · exact h' h3
-        simp only [hNS, ↓reduceIte, hSrc, writeSubplaceSlot] at h
+        have hUn : isUninitSlot (readSubplaceSlot slots dl (stripUnitElems dp)) = false := by
+          simp [readSubplaceSlot, hDst, slotStateToFieldSlot]
+        simp only [hNS, ↓reduceIte, hSrc, writeSubplaceSlot, hUn, Bool.false_eq_true] at h
         cases hWS : writePlaceState arityOf slots ⟨dl, dp⟩ (rootTyOf dl) v with
         | ok s =>
           rw [hWS] at h
@@ -12038,13 +12221,11 @@ theorem writeSubplaceSlot_frame {arityOf : Ty → VariantIdx → Bool → Option
   | nested var adt disc fs =>
     simp only [writeSubplaceSlot] at h
     split at h
-    · split at h
-      · nomatch h
-      · nomatch h
-      · simp only [Option.some.injEq] at h
-        subst h
-        exact List.getElem?_set_ne (Ne.symm hj)
     · nomatch h
+    · nomatch h
+    · simp only [Option.map_eq_some_iff] at h
+      obtain ⟨_, _, rfl⟩ := h
+      exact List.getElem?_set_ne (Ne.symm hj)
 
 /-- **Disjoint-Frame (`evalCopyNonOverlappingSubplace_frame`)**: a successful sub-place or
 array-window copy changes only the destination's local (whatever the source slot, the copied
@@ -12126,7 +12307,7 @@ theorem evalCopyNonOverlappingSubplace_frame {arityOf : Ty → VariantIdx → Bo
 (no per-element state) it fails closed. -/
 theorem writeSubplaceSlot_uninit_unit_array {arityOf : Ty → VariantIdx → Bool → Option Nat}
     {rootTyOf : Nat → Ty} {ts : Bool} {slots : List LocalSlotState} {l : Nat}
-    {arr : List ProjectionElem} (hArr : endsWithElem (stripUnitElems arr) = false)
+    {arr : List ProjectionElem} (hArr : hasArrayProj (stripUnitElems arr) = false)
     (hArr' : stripUnitElems (arr ++ [.constantIndex 0 1 false]) = stripUnitElems arr) :
     writeSubplaceSlot arityOf rootTyOf ts slots l (arr ++ [.constantIndex 0 1 false]) .uninit =
       evalDeinitPlace ts slots ⟨l, stripUnitElems arr⟩ := by
@@ -12137,15 +12318,126 @@ theorem stripUnitElems_append_unit (arr : List ProjectionElem) :
     stripUnitElems (arr ++ [.constantIndex 0 1 false]) = stripUnitElems arr := by
   simp [stripUnitElems, isUnitElem, List.reverse_append]
 
-/-- An element write of an uninitialized slot into an initialized multi-element array fails
-closed (arrays have no per-element initialization state). -/
+/-- **Initialized copies into an `.uninit` `[T; 1]` initialize the whole 1-element array
+(`writeSubplaceSlot_init_unit_array`, `rvalue.rs:6833-6856`)**: when local `l` is `.uninit` (or the
+1-element array sub-place `arr` is `.uninit` with no trailing `isUnitElem`), storing `.init v` at
+`arr ++ [.constantIndex 0 1 false]` writes `.aggregate 0 [v]` at `⟨l, arr⟩`. -/
+theorem writeSubplaceSlot_init_unit_array {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {slots : List LocalSlotState} {l : Nat} {v : Value}
+    (hU : slots[l]? = some .uninit) :
+    writeSubplaceSlot arityOf rootTyOf ts slots l [.constantIndex 0 1 false] (.init v) =
+      some (slots.set l (.init (.aggregate 0 [v]))) := by
+  simp [writeSubplaceSlot, stripUnitElems, wrapUnitElemsVal, isUnitElem, readSubplaceSlot, hU,
+    slotStateToFieldSlot, readSlotAtProj, isUninitSlot, writePlaceState,
+    fieldSlotToLocalSlotState]
+
+/-- An element or subslice write of an uninitialized slot into an initialized multi-element array
+fails closed (arrays have no per-element initialization state). -/
 theorem writeSubplaceSlot_uninit_elem_init_array_none
     {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
     {slots : List LocalSlotState} {l : Nat} {q : List ProjectionElem}
-    (hElem : endsWithElem (stripUnitElems q) = true)
-    (hNotUninit : isUninitSlot (readSubplaceSlot slots l (stripUnitElems q).dropLast) = false) :
+    (hElem : hasArrayProj (stripUnitElems q) = true)
+    (hNotUninit : isUninitSlot (readSubplaceSlot slots l (stripUnitElems q)) = false) :
     writeSubplaceSlot arityOf rootTyOf ts slots l q .uninit = none := by
   simp [writeSubplaceSlot, hElem, hNotUninit]
+
+/-- **Episode 1 B4 Regression (`writeSubplaceSlot_uninit_subslice_init_array_none`)**: copying an
+uninitialized slot into a `Subslice` window (e.g., `arr[0..1]`) of an initialized array `arr` fails
+closed (`none`) instead of deinitializing `arr`. -/
+theorem writeSubplaceSlot_uninit_subslice_init_array_none
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {slots : List LocalSlotState} {l from_ to_ : Nat} {fromEnd : Bool} {droot : Value}
+    (hDst : slots[l]? = some (.init droot)) :
+    writeSubplaceSlot arityOf rootTyOf ts slots l [.subslice from_ to_ fromEnd] .uninit = none := by
+  have hUn : isUninitSlot (readSubplaceSlot slots l [.subslice from_ to_ fromEnd]) = false := by
+    simp [readSubplaceSlot, hDst, slotStateToFieldSlot]
+  simp [writeSubplaceSlot, stripUnitElems, isUnitElem, hasArrayProj, isArrayProjElem, hUn]
+
+/-- **Projected `PartialShell` sub-place copy (`writeSubplaceSlot_nested_field_ok`)**: copying a
+`PartialShell` (`FieldSlot.nested`) into field `0` of an initialized 2-field aggregate explodes the
+outer aggregate into a parent `PartialShell` whose field `0` holds the normalized inner shell and
+whose sibling field `1` preserves `sib`. -/
+theorem writeSubplaceSlot_nested_field_ok
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {slots : List LocalSlotState} {l : Nat} {fTy : Ty} {old0 sib v0 : Value}
+    (hDst : slots[l]? = some (.init (.aggregate 0 [old0, sib]))) :
+    writeSubplaceSlot arityOf rootTyOf ts slots l [.field 0 fTy]
+        (.nested 0 false false [.init v0, .uninit]) =
+      some (slots.set l (.partialShell
+        ⟨0, true, true, [.nested 0 false false [.init v0, .uninit], .init sib]⟩)) := by
+  simp [writeSubplaceSlot, hDst, slotStateToFieldSlot, stripUnitElems, isUnitElem,
+    writePartialShellInSlot, explodeAggregate, deinitShellStep, shellVariant, normalizeShell,
+    PartialAggregate.tryIntoValue?, PartialAggregate.toFieldSlot, tryFieldsIntoValues?,
+    allFieldsUninit, fieldSlotToLocalSlotState]
+
+/-- **Array-Window Read-After-Copy (`evalCopyNonOverlappingSubplace_window_read_after_copy`)**:
+copying a contiguous window of `count ≥ 2` elements from an initialized source array sub-place
+`sArr` at `s0` into an initialized destination array sub-place `dArr` at `d0` writes the `Subslice`
+window value `w` so reading `⟨dl, dArr ++ [.subslice d0 (d0 + count) false]⟩` (when proper) or
+`⟨dl, dArr⟩` (when `d0 = 0 ∧ count = dLen`) returns `.ok w`, leaving every other local untouched. -/
+theorem evalCopyNonOverlappingSubplace_window_read_after_copy
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {src dst : SynPtr}
+    {count elemSize elemAlign sl dl s0 sLen d0 dLen : Nat} {sArr dArr : List ProjectionElem}
+    {w droot : Value}
+    (hCount : 2 ≤ count) (hElemSz : 0 < elemSize)
+    (hSrcR : resolve src false = .ok (sl, sArr ++ [.constantIndex s0 sLen false]))
+    (hDstR : resolve dst true = .ok (dl, dArr ++ [.constantIndex d0 dLen false]))
+    (hSrcRead : readPlaceState slots ⟨sl, sArr ++ [.subslice s0 (s0 + count) false]⟩ = .ok w)
+    (hDst : slots[dl]? = some (.init droot))
+    (hDArr : projectionHasDeref dArr = false)
+    (h : evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots resolve src dst count
+      elemSize elemAlign = some slots') :
+    let dstPlace : Place :=
+      if d0 = 0 ∧ count = dLen then ⟨dl, dArr⟩
+      else ⟨dl, dArr ++ [.subslice d0 (d0 + count) false]⟩
+    readPlaceState slots' dstPlace = .ok w ∧ ∀ j, j ≠ dl → slots'[j]? = slots[j]? := by
+  have hFrame := evalCopyNonOverlappingSubplace_frame hDstR h
+  refine ⟨?_, hFrame⟩
+  unfold evalCopyNonOverlappingSubplace at h
+  split at h
+  · nomatch h
+  split at h
+  · omega
+  split at h
+  · nomatch h
+  rw [hSrcR, hDstR] at h
+  have hNot1 : ¬ (count = 1 ∨ count * elemSize = 0) := by
+    rintro (rfl | hMul)
+    · omega
+    · exact absurd hMul (Nat.ne_of_gt (Nat.mul_pos (by omega) hElemSz))
+  have hSplitS : splitLastElem (sArr ++ [.constantIndex s0 sLen false]) = some (sArr, s0, sLen) := by
+    simp [splitLastElem]
+  have hSplitD : splitLastElem (dArr ++ [.constantIndex d0 dLen false]) = some (dArr, d0, dLen) := by
+    simp [splitLastElem]
+  simp only [hNot1, ↓reduceIte, hSplitS, hSplitD] at h
+  split at h
+  · rw [hSrcRead] at h
+    simp only at h
+    by_cases hWhole : d0 = 0 ∧ count = dLen
+    · simp only [hWhole, and_self, ↓reduceIte] at h ⊢
+      cases hWS : writePlaceState arityOf slots ⟨dl, dArr⟩ (rootTyOf dl) w with
+      | ok s =>
+        rw [hWS] at h
+        simp only [Option.some.injEq] at h
+        subst h
+        exact writePlaceState_put_get_init hDst hDArr hWS
+      | ub => rw [hWS] at h; nomatch h
+      | unsupported => rw [hWS] at h; nomatch h
+    · simp only [hWhole, ↓reduceIte] at h ⊢
+      have hDp : projectionHasDeref (dArr ++ [.subslice d0 (d0 + count) false]) = false := by
+        rw [projectionHasDeref_append, hDArr]; rfl
+      cases hWS : writePlaceState arityOf slots
+          ⟨dl, dArr ++ [.subslice d0 (d0 + count) false]⟩ (rootTyOf dl) w with
+      | ok s =>
+        rw [hWS] at h
+        simp only [Option.some.injEq] at h
+        subst h
+        exact writePlaceState_put_get_init hDst hDp hWS
+      | ub => rw [hWS] at h; nomatch h
+      | unsupported => rw [hWS] at h; nomatch h
+  · nomatch h
 
 /-- **Single-element sub-place copies refine Trusted's `evalCopySingleDirect`
 (`evalCopyNonOverlappingSubplace_refines`)**: on below-related frames, when Anneal copies an
@@ -12201,7 +12493,9 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
       · rw [hSrcR, hDstR] at h
         simp only [true_or, ↓reduceIte] at h
         have hNS : ¬ (elemSize = 0 ∧ sl = dl ∧ sp = dh :: dt) := fun hc => hNe hc.2.1
-        simp only [hNS, ↓reduceIte, hSrcSlot, writeSubplaceSlot] at h
+        have hUn : isUninitSlot (readSubplaceSlot slots dl (stripUnitElems (dh :: dt))) = false := by
+          simp [readSubplaceSlot, hDstRoot, slotStateToFieldSlot]
+        simp only [hNS, ↓reduceIte, hSrcSlot, writeSubplaceSlot, hUn, Bool.false_eq_true] at h
         cases hWS : writePlaceState arityOf slots ⟨dl, dh :: dt⟩ (rootTyOf dl) v with
         | ub => rw [hWS] at h; nomatch h
         | unsupported => rw [hWS] at h; nomatch h
@@ -12408,7 +12702,79 @@ def evalReborrowTail (cx : SubplaceCtx) (slots : List LocalSlotState) (base : Sy
         | some (_, off) => .ok ⟨b + off, some (l + 1, tag)⟩
         | none => .error .unsupported
       | _, _ => .error .unsupported
-    | .error e => .error e
+    | .error e =>
+      if addrOnlyRaw expectedRef pty hasDowncast then
+        match synthProvLocal slots base with
+        | some l =>
+          match localBaseAddr cx.allocs l cx.limit, ownLayout cx.allocs l with
+          | some b, some (allocSize, _) =>
+            if base.addr < b ∨ b + allocSize < base.addr then
+              if tailOff = 0 then .ok base else .error .unsupported
+            else if (base.addr - b) + tailOff ≤ allocSize ∧ b + ((base.addr - b) + tailOff) ≤ cx.limit then
+              .ok ⟨b + ((base.addr - b) + tailOff), base.prov⟩
+            else .error .unsupported
+          | _, _ => .error .unsupported
+        | none => .error e
+      else .error e
+
+/-- **Resolved sub-place reborrows (`evalReborrowTail_resolved_ok`)**: when `base` resolves to a
+sub-place `(l, q)` of a live local `l` (whose synthetic allocation starts at `b`) and `q ++ tail`
+has static offset `off` inside `l`'s layout, `evalReborrowTail` produces the synthetic pointer
+`⟨b + off, some (l + 1, tag)⟩`. -/
+theorem evalReborrowTail_resolved_ok (cx : SubplaceCtx) {slots : List LocalSlotState}
+    {base : SynPtr} {pty : PtrTy} {dtl : TyLayout} {expectedRef hasDowncast : Bool}
+    {tail : List ProjectionElem} {tailOff tag l t b off : Nat} {q : List ProjectionElem}
+    {lay sub : ByteLayout} {st : LocalSlotState}
+    (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hA1 : base.addr % dtl.minAlign = 0) (hA2 : base.addr % dtl.maxAlign = 0)
+    (hInh : pty.isRef = true → dtl.inhabited = true)
+    (hProv : base.prov = some (l + 1, t)) (hLive : slots[l]? = some st) (hNotDead : st ≠ .dead)
+    (hRes : resolveSyntheticSubplace cx slots base pty false = .ok (l, q))
+    (hLay : cx.layoutOf l = some lay) (hBase : localBaseAddr cx.allocs l cx.limit = some b)
+    (hSub : subplaceAt lay 0 (q ++ tail) = some (sub, off)) :
+    evalReborrowTail cx slots base pty dtl expectedRef hasDowncast tail tailOff tag =
+      .ok ⟨b + off, some (l + 1, tag)⟩ := by
+  have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hLive).1
+  have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
+  have hDeadF : reborrowTargetDead slots (some l) = false := by
+    cases st with
+    | dead => exact absurd rfl hNotDead
+    | _ => simp [reborrowTargetDead, hLive]
+  have h1 : ¬ cx.limit < base.addr := by omega
+  have h5 : (pty.isRef && !dtl.inhabited) = false := by
+    cases hr : pty.isRef with
+    | false => rfl
+    | true => simp [hInh hr]
+  simp [evalReborrowTail, h1, hNZ, hA1, hA2, h5, hT, hDeadF, hRes, hLay, hBase, hSub]
+
+/-- **Address-only raw `offset_inbounds` fallback (`evalReborrowTail_raw_inbounds_fallback_ok`,
+`rvalue.rs:9654-9707`)**: when `resolveSyntheticSubplace` fails (e.g. a misaligned raw pointer
+`*const (u32, u32)` at byte offset `1` inside a `[u8; 16]` local `l`), an address-only raw
+reborrow (`expectedRef = false`, `pty.isRef = false`, `hasDowncast = false`) whose `base.addr` and
+`base.addr + tailOff` both lie within `[b, b + allocSize]` succeeds with
+`⟨b + ((base.addr - b) + tailOff), base.prov⟩`. -/
+theorem evalReborrowTail_raw_inbounds_fallback_ok (cx : SubplaceCtx) {slots : List LocalSlotState}
+    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem)
+    (tailOff tag : Nat) {l t b allocSize align : Nat} {st : LocalSlotState} {e : DerefErr}
+    (hRaw : pty.isRef = false) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hProv : base.prov = some (l + 1, t)) (hLive : slots[l]? = some st) (hNotDead : st ≠ .dead)
+    (hResErr : resolveSyntheticSubplace cx slots base pty false = .error e)
+    (hBase : localBaseAddr cx.allocs l cx.limit = some b)
+    (hOwn : ownLayout cx.allocs l = some (allocSize, align))
+    (hInLo : b ≤ base.addr) (hInHi : (base.addr - b) + tailOff ≤ allocSize)
+    (hFit : b + ((base.addr - b) + tailOff) ≤ cx.limit) :
+    evalReborrowTail cx slots base pty dtl false false tail tailOff tag =
+      .ok ⟨b + ((base.addr - b) + tailOff), base.prov⟩ := by
+  have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hLive).1
+  have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
+  have hDeadF : reborrowTargetDead slots (some l) = false := by
+    cases st with
+    | dead => exact absurd rfl hNotDead
+    | _ => simp [reborrowTargetDead, hLive]
+  have h1 : ¬ cx.limit < base.addr := by omega
+  have hOut : ¬ (base.addr < b ∨ b + allocSize < base.addr) := by omega
+  simp [evalReborrowTail, addrOnlyRaw, hRaw, h1, hNZ, hT, hDeadF, hResErr, hBase, hOwn, hOut,
+    hInHi, hFit]
 
 /-- **Offset-`0` raw reborrows of null pointers are valid (`evalReborrowTail_raw_null_zero`)**:
 `&raw ((*p).tail)` of a null raw pointer with a zero-offset, `Downcast`-free tail is the null
@@ -12671,5 +13037,63 @@ theorem witness_trusted_deref_read :
     (by simp [lookupBorrow, witnessEntry, witnessPtrT, ProvenancePtr.tag])
     (by simp [witnessEntry]) (by with_unfolding_all rfl) (by with_unfolding_all rfl)
     [] emptyLayoutTable []
+
+/-- Non-empty `localDecls` for the witness frame: `_0 : (u32, u32)`, `_1 : *mut u32`. -/
+def witnessLocalDecls : List LocalDecl :=
+  [ { mutability := .mut, ty := { kind := .tuple [witnessU32.kind, witnessU32.kind], layoutIdx := 0 }, debugName := none }
+  , { mutability := .mut, ty := { kind := .rawPtr .mut witnessU32.kind, layoutIdx := 0 }, debugName := none } ]
+
+/-- **Non-vacuity of `evalDerefPlaceRead_refines_evalRvalue_general` with non-empty `localDecls`
+(`witness_trusted_deref_read_typed`)**: Trusted's typed `evalRvalue` on `Rvalue.use (copy (*_1))`
+with `witnessLocalDecls` evaluates to `.ok (.scalar ⟨9, 4⟩)` matching `evalDerefPlaceRead`. -/
+theorem witness_trusted_deref_read_typed :
+    ∃ mem', evalRvalue witnessLocalsT (.use (.copy ⟨1, [.deref]⟩))
+      { borrows := [witnessEntry], globals := [], callerLocals := [], activeProtectors := [] }
+      witnessLocalDecls emptyLayoutTable = .ok (.scalar ⟨9, 4⟩) witnessLocalsT mem' :=
+  evalDerefPlaceRead_refines_evalRvalue_general witnessLocalDecls emptyLayoutTable
+    (cx := witnessCtxT) (slots := witnessSlotsT)
+    (by with_unfolding_all rfl) (by rfl) (by rfl)
+
+/-- Witness type fingerprint mapping: type `1` (`u32`) has fingerprint `1`, type `2`
+(`i32`) has fingerprint `2`. -/
+def witnessTagFp (t : Nat) : Nat :=
+  if t = 1 then 1 else 2
+
+/-- **Witness: type-fingerprinted tag disambiguates same-offset candidates in read mode
+(`witness_tag_disambiguates_read`)** and **in whole-union-field write mode
+(`witness_tag_disambiguates_union_write`)**, while a **cast-pointer fingerprint mismatch rejects
+the ambiguous offset (`witness_tag_cast_mismatch_rejects`)**. -/
+theorem witness_tag_disambiguates_and_rejects_mismatch :
+    let cands : List (List ProjectionElem) := [[.field 0 witnessU32], [.field 1 witnessU32]]
+    let cons := fun (q : List ProjectionElem) => match q with | [.field 0 _] => true | _ => false
+    let consOw := fun (_ : List ProjectionElem) => true
+    let readable := fun (_ : List ProjectionElem) => true
+    decodeSubplaceTag witnessTagFp (encodeSubplaceTag witnessTagFp 1 0) 1 = some 0 ∧
+    decodeSubplaceTag witnessTagFp (encodeSubplaceTag witnessTagFp 1 1) 1 = some 1 ∧
+    decodeSubplaceTag witnessTagFp (encodeSubplaceTag witnessTagFp 1 1) 2 = none ∧
+    selectSubplaceCandidate cands cons consOw (some 0) false readable false =
+      some [.field 0 witnessU32] ∧
+    selectSubplaceCandidate cands cons consOw (some 1) false readable true =
+      some [.field 1 witnessU32] ∧
+    selectSubplaceCandidate cands (fun _ => true) consOw none false readable false =
+      none := by
+  refine ⟨by decide, by decide, by decide, ?_, ?_, ?_⟩ <;> with_unfolding_all rfl
+
+/-- **Witness: `count = 2` array-window `CopyNonOverlapping` (`witness_window_copy`)**: copying the
+2-element window `_0[1..3]` (`[20, 30]`) of `_0 : [u32; 4] = [10, 20, 30, 40]` into `_1[0..2]` of
+`_1 : [u32; 4] = [1, 2, 3, 4]` produces `_1 = [20, 30, 3, 4]`. -/
+theorem witness_window_copy :
+    let slots : List LocalSlotState :=
+      [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])
+      , .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]) ]
+    let resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem) := fun p _ =>
+      if p.addr = 0x1004 then .ok (0, [.constantIndex 1 4 false])
+      else if p.addr = 0x2000 then .ok (1, [.constantIndex 0 4 false])
+      else .error .unsupported
+    evalCopyNonOverlappingSubplace (fun _ _ _ => none) (fun _ => witnessU32) false 64 slots resolve
+        ⟨0x1004, some (1, 0)⟩ ⟨0x2000, some (2, 0)⟩ 2 4 4 =
+      some [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩])
+           , .init (.aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]) ] := by
+  with_unfolding_all rfl
 
 end Anneal.Mir.AdtAndControl
