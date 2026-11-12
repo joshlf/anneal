@@ -25,16 +25,17 @@ local holding a pointer, so no state reached by taking an address satisfies it.
 1. **`_d = &raw (const|mut) p` (`step_rawPtr_addrOf_simulation`,
    `step_rawPtr_addrOf_lm3_1_simulation`,
    `step_rawPtr_addrOf_indirect_lm3_1_simulation`,
-   `step_rawPtr_deref_zero_offset_correspondence`,
-   `step_rawPtr_deref_null_correspondence`,
-   `step_rawPtr_deref_nonzero_offset_correspondence`,
-   `step_rawPtr_deref_perm_correspondence`)**: real-step simulation and
-   (on the Stage-1 repaired semantics) value-level correspondence of the stored
-   results for taking the raw address of an immediate local, an
-   already-promoted local, or a dereferenced pointer place `*_p`, including
-   provenance-less, non-zero-offset, and `.disabled`/`.frozen` parents
-   (together with `step_storageLive_lm3_1_simulation`,
-   `step_storageDead_lm3_1_simulation`, and
+   `step_rawPtr_deref_lm3_1_simulation`,
+   `step_rawPtr_deref_zero_offset_simulation`,
+   `step_rawPtr_deref_null_simulation`,
+   `step_rawPtr_deref_nonzero_offset_simulation`,
+   `step_rawPtr_deref_perm_simulation`)**: full `StepRelLM3_1` real-step
+   simulation (plus the preserved result-correspondence lemmas
+   `step_rawPtr_deref_*_correspondence`) for taking the raw address of an
+   immediate local, an already-promoted local, or a dereferenced pointer place
+   `*_p` (`D7`), including zero-offset, non-zero-offset, provenance-less
+   (null/integer), and `.disabled`/`.frozen` parents (together with
+   `step_storageLive_lm3_1_simulation`, `step_storageDead_lm3_1_simulation`, and
    `step_rawPtr_use_lm3_1_simulation` for copying and moving raw pointers).
 2. **`PlaceElem.Deref` (`step_deref_read_simulation`,
    `step_deref_write_simulation`, `step_deref_oob_miri_ub`,
@@ -43,10 +44,12 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    (`annealStepHooks`) and `stepMirFn` correspondence for `_d = (copy|move) *_p`
    and `*_p = .use op`, declaration/TyId pointee-layout coherence, and real-step
    UB simulations (`StepRelLM3_1.ub`) for out-of-bounds, misaligned, and invalid
-   `bool`/`char` dereferences as well as `PlaceMention(*_p)` on an `.uninit`
-   pointer (`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
-   `step_deref_invalid_bool_simulation`, `step_deref_invalid_char_simulation`,
+   `bool`/`char` dereferences as well as `PlaceMention(*_p)` across live, dead,
+   and `.uninit` pointers (`step_deref_oob_simulation`,
+   `step_deref_misaligned_simulation`, `step_deref_invalid_bool_simulation`,
+   `step_deref_invalid_char_simulation`,
    `step_deref_write_invalid_bool_simulation`,
+   `step_placeMention_deref_lm3_1_simulation`,
    `step_placeMention_deref_uninit_simulation`), together with write-side
    out-of-bounds and misaligned UB (`step_deref_write_oob_simulation`,
    `step_deref_write_misaligned_simulation`, plus `AllocId`- and `localAlloc`-free
@@ -71,56 +74,68 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `step_binOp_offset_move_simulation`,
    `step_binOp_offset_zero_any_stride_lm3_1_simulation`,
    `step_binOp_offset_oob_dangling_miri_ub`,
-   `step_binOp_offset_scalar_zero_correspondence`,
-   `step_binOp_offset_move_scalar_zero_correspondence`,
+   `step_binOp_offset_scalar_zero_op_simulation`,
+   `step_binOp_offset_scalar_zero_simulation`,
+   `step_binOp_offset_move_scalar_zero_simulation`,
+   `step_binOp_offset_scalar_nonzero_op_simulation`,
    `step_binOp_offset_scalar_nonzero_simulation`,
    `step_binOp_offset_move_scalar_nonzero_simulation`,
    `step_rawPtr_cmp_scalar_lm3_1_simulation`,
    `step_rawPtr_cmp_ub_lm3_1_simulation`,
+   `step_rawPtr_cmp_same_alloc_simulation`,
+   `step_rawPtr_cmp_cross_local_eq_ne_simulation`,
+   `step_rawPtr_cmp_ptr_low_scalar_simulation`,
+   `step_rawPtr_cmp_low_scalar_ptr_simulation`,
+   `step_rawPtr_cmp_ptr_null_simulation`,
+   `step_rawPtr_cmp_null_ptr_simulation`,
+   `step_rawPtr_cmp_ptr_ptr_exact`,
+   `step_rawPtr_cmp_scalar_ptr_exact`,
+   `step_rawPtr_cmp_ptr_scalar_exact`,
    `step_rawPtr_cmp_ptr_divergence`,
    `step_rawPtr_cmp_scalar_ptr_divergence`,
    `step_unaryOp_ptrMetadata_thin_rawPtr_ub_simulation`,
-   `step_unaryOp_ptrMetadata_thin_rawPtr_correspondence`,
-   `annealDerefValidity_nonThin_or_ref_err`)**: real-step simulation of
-   `_d = Offset((copy|move) _p, rhsOp)` (byte-sized in-bounds offsets and
-   zero-count offsets across all exact-layout pointee strides), provenance-less
-   thin raw-pointer comparisons (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`), and
-   uninitialized/dead/use-after-move pointer comparison UB, together with the
-   Stage-1 upgrades: out-of-bounds/dangling offsets are UB in both machines
+   `step_unaryOp_ptrMetadata_thin_rawPtr_simulation`,
+   `annealDerefValidity_nonThin_or_ref_err`)**: full `StepRelLM3_1` real-step
+   simulation of `_d = Offset((copy|move) _p, rhsOp)` across byte and non-byte
+   strides (`step_binOp_offset_stride_simulation`), negative `isize` offsets
+   (`step_binOp_offset_neg_isize_simulation`), out-of-bounds/dangling UB
    (`step_binOp_offset_oob_dangling_miri_ub`,
-   `step_binOp_offset_neg_oob_ub_simulation`), non-byte strides and negative
-   `isize` offsets step in lockstep (`step_binOp_offset_stride_simulation`,
-   `step_binOp_offset_neg_isize_simulation`), non-zero offsets of
-   provenance-less pointers are UB in both machines, and zero offsets of
-   provenance-less pointers and thin `UnOp.PtrMetadata` step in both machines
-   with corresponding results. Remaining boundaries: in-bounds offsets of a
-   `.disabled` parent borrow (`step_binOp_offset_disabled_divergence`,
-   generalized to all primitive strides, `copy`/`move`, and signed counts by
-   `step_binOp_offset_disabled_stride_divergence` and
+   `step_binOp_offset_neg_oob_ub_simulation`), zero-count and non-zero-count
+   offsets of provenance-less scalar pointers across all exact-layout pointee
+   strides (`D10`), thin `UnOp.PtrMetadata` (`D11`), and relational raw-pointer
+   comparisons (`D12`: `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` across two provenance-less
+   scalars, uninitialized/dead/use-after-move UB, same-allocation tracked
+   pointers, `< 65536`-offset cross-local `Eq`/`Ne`, and `< 2 ^ 32` low-integer
+   thresholds vs. tracked pointers including null `0` and `NonNull::dangling()`).
+   Remaining boundaries: in-bounds offsets of a `.disabled` parent borrow
+   (`step_binOp_offset_disabled_divergence`,
+   `step_binOp_offset_disabled_stride_divergence`,
    `step_binOp_offset_disabled_neg_isize_divergence`: Anneal raises `.ub` while
    `lean-miri` steps; a disabled `usize` count of at least `2 ^ 63` is UB in both,
    `step_binOp_offset_usize_wrap_disabled_ub_simulation`), in-bounds unsigned
    wrap-around `usize` `Offset` counts of at least `2 ^ 63`
-   (`step_binOp_offset_usize_wrap_divergence`: Anneal ignores the RHS signedness
-   and steps backward while `lean-miri` raises `"PointerArithOverflow"`), and
-   provenance-tracked pointer comparisons,
-   where both machines step but the theorems do not relate the results: Anneal
-   orders stack addresses by `Local` index on 64-KiB pages while `lean-miri`
-   orders by `AllocId` (informally agreeing on same-local comparisons and on
-   in-page `.eq`/`.ne`, and able to disagree on cross-local ordering, threshold
-   pointer-vs-integer comparisons, and offsets of at least 64 KiB).
+   (`step_binOp_offset_usize_wrap_divergence`: Anneal steps backward while
+   `lean-miri` raises `"PointerArithOverflow"`), and the three genuine
+   two-address-model `D12` divergence regimes characterized exactly by
+   `step_rawPtr_cmp_ptr_ptr_exact`, `step_rawPtr_cmp_scalar_ptr_exact`, and
+   `step_rawPtr_cmp_ptr_scalar_exact` (cross-local ordering when MIR `Local`
+   index order differs from `AllocId` creation order, `≥ 65536` 64-KiB
+   page-wrapping offsets, and `≥ 2 ^ 32` integer thresholds).
 4. **`CastKind.PtrToPtr` & Exposure Casts (`step_cast_ptrToPtr_simulation`,
-   `step_cast_ptrToPtr_move_simulation`, `step_cast_ptrToPtr_scalar_correspondence`,
-   `step_cast_ptrToPtr_move_scalar_correspondence`,
+   `step_cast_ptrToPtr_move_simulation`, `step_cast_ptrToPtr_scalar_simulation`,
+   `step_cast_ptrToPtr_move_scalar_simulation`,
+   `step_cast_ptrToPtr_full_simulation`,
+   `step_cast_ptrToPtr_move_full_simulation`,
    `step_cast_expose_provenance_scalar_simulation`,
    `step_cast_expose_provenance_ptr_unsupported`,
    `step_cast_with_exposed_provenance_divergence`,
    `evalCast_ptrToPtr_simulation`, `evalRvalue_expose_withExposed_roundtrip`)**:
-   real-step lockstep simulation of `_d = (copy|move) _s as *(const|mut) T`
-   (`PtrToPtr`) and provenance-less `PointerExposeProvenance`, value-level
-   correspondences for provenance-less `(copy|move)` `PtrToPtr` casts, and the
-   remaining fail-closed divergences for provenance-exposing / exposed-address
-   casts (Anneal steps, `lean-miri` reports `StepError.unsupported`).
+   full `StepRelLM3_1` real-step lockstep simulation of
+   `_d = (copy|move) _s as *(const|mut) T` (`PtrToPtr`, `D8`) across both
+   provenance-tracked and provenance-less scalar operands as well as
+   provenance-less `PointerExposeProvenance`, plus the fail-closed boundaries
+   for provenance-exposing / exposed-address casts (Anneal steps, `lean-miri`
+   reports `StepError.unsupported`).
 5. **Composed step & root-frame terminators (`step_stmt_lm3_1_simulation`,
    `step_stmt_lm3_1_state_simulation`,
    `step_terminator_goto_return_lm3_1_simulation`,
@@ -131,9 +146,9 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    `step_mir_lm3_1_state_simulation`)**: composed real-step statement,
    root-terminator (`Goto`, scalar and raw-pointer `Return`, `Unreachable`,
    `SwitchInt`, and `Assert`), and unified statement-or-terminator simulation
-   across pointer-free `StateRel` and general `StateRelLM3_1` states, including
-   the lockstep UB cases for out-of-bounds, misaligned, partial-overlap, and
-   invalid-bit-pattern dereferences (`WellTypedLM3_1StateStmt`).
+   across pointer-free `StateRel` and general `StateRelLM3_1` states, dispatching
+   all positive `D1..D12` lockstep normal and UB regimes via
+   `WellTypedLM3_1StateStmt` and `WellTypedLM3_1StateTerminator`.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -18146,17 +18161,22 @@ Positive `StepRelLM3_1` lockstep agreement (`aRes = b`) is proved in:
 * `step_rawPtr_cmp_same_alloc_simulation` (same-allocation `Eq..Ge`),
 * `step_rawPtr_cmp_cross_local_eq_ne_simulation` (cross-local `Eq`/`Ne` for
   offsets `< 65536`), and
-* `step_rawPtr_cmp_ptr_null_simulation` / `step_rawPtr_cmp_null_ptr_simulation`
-  (tracked pointer vs null `0` across all `Eq..Ge`).
+* `step_rawPtr_cmp_ptr_low_scalar_simulation` /
+  `step_rawPtr_cmp_low_scalar_ptr_simulation` (tracked pointer vs any low
+  integer threshold `< 2 ^ 32`, including null `0` and `NonNull::dangling()`,
+  across all `Eq..Ge`; null specializations
+  `step_rawPtr_cmp_ptr_null_simulation` / `step_rawPtr_cmp_null_ptr_simulation`).
 
 This boundary theorem remains pinned for the complementary cases where the two
 address models can disagree (`aRes ≠ b`): cross-allocation ordering comparisons
 (`Lt`/`Le`/`Gt`/`Ge` when MIR `Local` index order differs from `AllocId`
-creation order), non-null integer thresholds between the two machines' stack
-base addresses, and offsets reaching `≥ 65536`. For two tracked pointers,
-`step_rawPtr_cmp_ptr_ptr_exact` gives the exact boolean each machine stores, and
-`wit_lm3_1_d12_cross_local_order_divergence_real_steps` exhibits a concrete
-cross-local `Lt` on which Anneal stores `true` and `lean-miri` stores `false`. -/
+creation order, `wit_lm3_1_d12_cross_local_order_divergence_real_steps`),
+integer thresholds `≥ 2 ^ 32` between the two machines' stack base addresses
+(`wit_lm3_1_d12_scalar_threshold_divergence_real_steps`), and offsets reaching
+`≥ 65536` (`wit_lm3_1_d12_page_wrap_eq_divergence_real_steps`). For two tracked
+pointers, `step_rawPtr_cmp_ptr_ptr_exact` (and
+`step_rawPtr_cmp_ptr_scalar_exact` / `step_rawPtr_cmp_scalar_ptr_exact` for
+mixed pointer/scalar operands) gives the exact boolean each machine stores. -/
 theorem step_rawPtr_cmp_ptr_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -18519,8 +18539,9 @@ side condition of the lockstep core behind `step_rawPtr_cmp_same_alloc_simulatio
 `step_rawPtr_cmp_cross_local_eq_ne_simulation`) and genuinely diverge otherwise, e.g. on
 cross-local ordering when MIR `Local` order differs from `lean-miri` allocation order
 (`wit_lm3_1_d12_cross_local_order_divergence_real_steps`) or when offsets `≥ 65536` wrap
-Anneal's 64 KiB pages. This sharpens the pointer-pointer case of
-`step_rawPtr_cmp_ptr_divergence` from "both machines step" to an exact result formula. -/
+Anneal's 64 KiB pages (`wit_lm3_1_d12_page_wrap_eq_divergence_real_steps`). This sharpens the
+pointer-pointer case of `step_rawPtr_cmp_ptr_divergence` from "both machines step" to an exact
+result formula. -/
 theorem step_rawPtr_cmp_ptr_ptr_exact
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}

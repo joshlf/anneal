@@ -90,13 +90,13 @@ divergence theorems:
    `_0 = Offset(move _2, 0_usize)` on `*mut u64` (`stride = 8`), `Assert`,
    `SwitchInt` (`MirObs.event 1`), and root-frame `Return` of `_0 : *mut u64`
    (`PtrRel` return correspondence); provenance-less vs. tracked raw-pointer
-   `Eq` comparison (`(.ptr, .ptr)` and symmetric `(.scalar, .ptr)`: both
-   machines step, results unrelated), use-after-move pointer comparison UB
+   `Eq` comparison (`(.ptr, .ptr)` and symmetric `(.scalar, .ptr)`, sharpened
+   to exact boolean formulas and `< 2 ^ 32` / `< 65536` lockstep simulations in
+   item 11), use-after-move pointer comparison UB
    (`Eq(move _2, copy _2)` via `step_rawPtr_cmp_ub_lm3_1_simulation` and unified
    `step_mir_lm3_1_state_simulation`), move-operand provenance-less `PtrToPtr`
-   and `Offset` (`0_usize`: corresponding results; `1_usize`: UB in both
-   machines), and `UnOp.PtrMetadata` UB (`.uninit` pointer) vs. thin-pointer
-   correspondence.
+   and `Offset` (`0_usize` and `1_usize` UB), and `UnOp.PtrMetadata` UB
+   (`.uninit` pointer) vs. thin-pointer simulation.
 10. **`wit_lm3_1_deref_write_oob_real_steps`**,
     **`wit_lm3_1_storage_revive_read_ub_real_steps`**,
     **`wit_lm3_1_deref_type_pun_offset4_and_write_real_steps`**,
@@ -128,6 +128,24 @@ divergence theorems:
     `usize::MAX` is UB in both; after `StorageDead`, a zero-count offset of the
     dangling pointer at `offsetBytes = 8` faults in Anneal while `lean-miri`
     steps).
+11. **`wit_lm3_1_d7_d11_state_simulation_real_steps`**,
+    **`wit_lm3_1_d8_d9_d10_state_simulation_real_steps`**,
+    **`wit_lm3_1_d12_cmp_branch_state_simulation_real_steps`**,
+    **`wit_lm3_1_d7_d10_d12_extended_state_simulation_real_steps`**,
+    **`wit_lm3_1_d10_u32_and_d12_dangling_state_simulation_real_steps`**,
+    **`wit_lm3_1_d12_cross_local_order_divergence_real_steps`**,
+    **`wit_lm3_1_d12_scalar_threshold_divergence_real_steps`**, and
+    **`wit_lm3_1_d12_page_wrap_eq_divergence_real_steps`**: composed multi-step
+    `step_mir_lm3_1_state_simulation` traces for the upgraded `D7`..`D12`
+    theorems (RFC 2582 `&raw (const|mut) (*_p)` across zero/nonzero offsets,
+    `.frozen`/`.disabled` parents, and null pointers; scalar `PtrToPtr`;
+    `PlaceMention(*_p)` uninit UB; exact-layout `u8`/`u32`/`u64` scalar zero and
+    non-zero `Offset`; thin `PtrMetadata` normal and UB steps; and same-alloc,
+    cross-local `< 65536` `Eq`/`Ne`, and `< 2 ^ 32` `0` / `NonNull::dangling()`
+    raw-pointer comparisons feeding `SwitchInt`), plus concrete real-step
+    witnesses for all three genuine `D12` two-address-model divergences
+    (cross-local ordering, `≥ 2 ^ 32` integer thresholds, and `≥ 65536`
+    page-wrapping `Eq`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness

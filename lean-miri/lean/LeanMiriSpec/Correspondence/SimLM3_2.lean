@@ -50,14 +50,27 @@ reference-aware relations `StateRelLM3_2` and `StepRelLM3_2` (`RefLM3_2`).
      without provenance): Anneal fails with UB, whereas `lean-miri` steps and
      creates a reference without provenance;
    * parent-borrow permission conflict (`.disabled`, or `.frozen` for `&mut`):
-     Anneal fails with Tree Borrows UB, whereas `lean-miri` (pre-`LM-3.3`
-     retag) steps.
+     Anneal fails with Tree Borrows UB, whereas `lean-miri`'s borrow-tracker-free
+     `annealStepHooks` steps (closed to 3-way lockstep once vendored
+     `Miri.TreeBorrows.BorrowTree` hooks are active in `SimLM3_3.lean`).
 4. **Safe-Reference Copy/Move & Dereference Read/Write
    (`step_safeRef_use_simulation`, `step_safeRef_deref_read_simulation`, and
    `step_safeRef_deref_write_simulation`)**: full `StepRelLM3_2` real-step
    lockstep simulation of `_d = (copy|move) _r`, `_d = (copy|move) *_r`, and
    `*_r = op` across dead/uninitialized/null/integer references, dangling or
    uninitialized pointees, and live scalar pointees with borrow-table updates.
+5. **Parent-Preserving Tree Borrows Simulation Hierarchy (`StateRelLM3_2Tree`,
+   `StepRelLM3_2Tree`, `StepObsRelLM3_2Tree`, `WellTypedLM3_2TreeStateStmt`,
+   `WellTypedLM3_2TreeStateTerminator`, `step_stmt_lm3_2_tree_state_simulation`,
+   `step_terminator_lm3_2_tree_state_simulation`, and
+   `step_mir_lm3_2_tree_state_simulation`)**: full parent-child `treeMap`
+   lifting of statements (`nop`, `storageLive`, `storageDead`, `scalarUse`,
+   `directWritePromoted`, `refAddrOf`, `refIndirect`, `reborrowSafeRef`,
+   `safeRefUse`, `safeRefDerefRead`, `safeRefDerefWrite`, `placeMentionLocal`,
+   `placeMentionSafeRefDeref`, and `placeMentionSafeRefDerefUninit`) and
+   root-frame terminators (`Goto`, `Return` including safe references,
+   `Unreachable`, `SwitchInt`, and `Assert`), together with `D14` boundary
+   characterizations cross-referencing `SimLM3_3.lean`.
 -/
 
 namespace LeanMiriSpec.Correspondence

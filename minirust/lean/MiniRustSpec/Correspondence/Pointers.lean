@@ -72,10 +72,12 @@ MiniRust as the ground truth, on:
    `stepForeignRead`; soundness `PtrEnvOk.foreignRead`, `PtrEnvOk.derefRead`).
 
 Here Anneal is
-merely stricter than `BasicMemory`, and `ptrAliasingOk` tracks tag liveness and
-reservation (`hot : Bool`) flow-sensitively across CFGs so safe Rust
+merely stricter than `BasicMemory`, and `ptrAliasingOk` tracks tag liveness,
+reservation (`hot : Bool`), and ancestor writability (`writable : Bool`)
+flow-sensitively across CFGs so safe Rust
 borrow/reborrow patterns (two-phase borrows with foreign reads, mutable reborrow
-+ write + child use, sequential NLL borrows, and loop borrows/reborrows) stay
++ write + child use, sequential NLL borrows, `Retag([raw])`, and loop
+borrows/reborrows) stay
 inside `inFragment`. `MiniRustSpec.Correspondence.PointerWitness` and
 `RefWitness` check each case on concrete programs.
 -/

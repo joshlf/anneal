@@ -58,6 +58,16 @@ bb0: StorageLive(_1); StorageLive(_2);
    invalid-`bool` deref-read UB in both machines on real steps, and a 5-step Tree Borrows
    child-write/parent-read chain driven through the `StateRelLM3_2Tree`
    simulations.
+6. **`wit_lm3_2_composed_tree_state_simulation_real_steps`**,
+   **`wit_lm3_2_placeMention_safeRef_deref_uninit_tree_state_simulation_real_steps`**,
+   **`wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps`**, and
+   **`wit_lm3_2_reborrow_uninit_target_divergence`**: 9-step end-to-end
+   3-generation Tree Borrows execution driven uniformly through
+   `step_mir_lm3_2_tree_state_simulation` across `SwitchInt` (`MirObs.event 99`),
+   `Assert`, and safe-reference root `Return` (`&u64`), 3-step Tree Borrows
+   `PlaceMention(*_4)` uninitialized-reference lockstep UB, and concrete `D14`
+   post-copy/move validity, hook-free permission, and uninitialized-target
+   reborrow boundary traces cross-referencing `SimLM3_3.lean`.
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness

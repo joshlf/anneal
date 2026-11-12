@@ -20534,6 +20534,57 @@ example :
         some (.live (.immediate (.scalar (.fromScalarInt (.ofBool false))))) :=
   Witness.wit_lm3_1_d12_page_wrap_eq_divergence_real_steps
 
+-- `[Ep3 B4]` pins: `StepObsRelLM3_2Tree.retNormal_rel` + remaining Ep3 public `def`/`inductive` signatures.
+example :
+    CapturedMir → AnnealStepState → List ReborrowMapEntry →
+      MirStepNode → Miri.Interpreter.StepResult AnnealStepState Bool → Prop :=
+  StepObsRelLM3_2Tree
+
+example
+    {body : CapturedMir} {m : AnnealStepState} {treeMap : List ReborrowMapEntry}
+    {retVal : Value} {mem' : Memory}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRelLM3_2Tree body m treeMap (.retNormal retVal mem') mRes) :
+    ∃ decl0 imm0,
+      get? body.localDecls 0 = some decl0 ∧
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) ∧
+      ImmediateRelLM3_2 (treeMap.map ReborrowMapEntry.toAllocMapEntry)
+        decl0.ty body.layouts retVal imm0 ∧
+      mRes = ({ m with stack := ⟨#[]⟩ }, .ok true) :=
+  StepObsRelLM3_2Tree.retNormal_rel h
+
+example : List ReborrowMapEntry → Local → List ReborrowMapEntry :=
+  disableTreeMapLocal
+
+example : List ReborrowMapEntry → Local → List ReborrowMapEntry :=
+  updateTreeMapOnDirectWrite
+
+example :
+    CapturedMir → MachineState → AnnealStepState →
+      List ReborrowMapEntry → Statement → Prop :=
+  WellTypedLM3_2TreeStateStmt
+
+example : CapturedMir → AnnealStepState → BasicBlockData → Prop :=
+  WellTypedLM3_2TreeStateTerminator
+
+example : Miri.Memory.ScalarInt := Witness.lm31Scalar4U64
+example : Miri.Memory.ScalarInt := Witness.lm31Scalar8U64
+example : Miri.Memory.ScalarInt := Witness.lm31ScalarThreshold2Pow33
+
+example :
+    CapturedMir → Ty →
+      Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  Witness.mkTwoU64MiriFramePre
+
+example : MirAst.ConstOperand := Witness.constBoolTrueLM32
+example : TreeBorrowPerm → ReborrowMapEntry := Witness.lm32TreeGrandchild
+
+example :
+    CapturedMir → Ty →
+      Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout →
+      Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  Witness.mkPre6MiriFrameLM32
+
 #assert_standard_axioms
   Witness.mkTwoU64AnnealPre
   Witness.mkTwoU64MiriFramePre
