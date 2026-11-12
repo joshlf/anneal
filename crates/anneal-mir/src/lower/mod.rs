@@ -15,8 +15,9 @@ pub use cast::{
 };
 pub use cfg::{
     CallHandler, CallOutcome, CallSite, CallTable, CfgEvalError, CfgEvalOutcome, CfgStep,
-    DEFAULT_MAX_CALL_DEPTH, LinkedCallee, LoweredTerminator, PanicMessage, TerminatorLowerError,
-    UnwindState, eval_cfg_in_state, eval_cfg_in_state_with_call_table, eval_lowered_body_cfg,
+    DEFAULT_MAX_CALL_DEPTH, ExternalCall, ExternalCallHandler, LinkedCallee, LoweredTerminator,
+    PanicMessage, TerminatorLowerError, UnwindState, eval_cfg_in_state,
+    eval_cfg_in_state_with_call_table, eval_lowered_body_cfg,
     eval_lowered_body_cfg_with_call_table, eval_lowered_body_cfg_with_call_table_and_calls,
     eval_lowered_body_cfg_with_calls, eval_lowered_terminator, lower_terminator,
 };

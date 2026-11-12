@@ -6158,9 +6158,10 @@ pub struct StatementEvalState {
     pub tracker: ExposedProvenanceTracker,
     /// Value returned by `Rvalue::NullaryOp(NullOp::UbChecks, Ty::Bool)` (defaults to `true`).
     pub ub_checks: bool,
-    /// Offset of this frame's synthetic stack allocations (see [`local_base_addr_in_frame`]):
-    /// `0` for an evaluated body, and above every caller frame's allocations for a linked
-    /// callee frame (`crate::lower::cfg::CallTable`), so no two active frames share an address.
+    /// Offset of this frame's synthetic stack allocations, a multiple of `0x1000` (the frame's
+    /// first allocation starts at `frame_addr_base + 0x1000`): `0` for an evaluated body, and
+    /// above every caller frame's allocations for a linked callee frame
+    /// (`crate::lower::cfg::CallTable`), so no two active frames share an address.
     pub frame_addr_base: u128,
 }
 

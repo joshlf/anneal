@@ -26,7 +26,8 @@
 //!   the calling frame ([`eval_intrinsic_call`]); a function item of a symbol linked in a
 //!   [`CallTable`] runs the callee's body in a new frame (only under
 //!   [`eval_cfg_in_state_with_call_table`]); any other callee goes to the caller-supplied call
-//!   handler (without a handler: [`CfgEvalError::UnsupportedCall`], or
+//!   handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the [`ExternalCall`] under
+//!   a call table; without a handler: [`CfgEvalError::UnsupportedCall`], or
 //!   [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
 //!   formed and of the destination's type, and is written to the destination before jumping
 //!   to `target` (a return from a call without `target` is undefined behavior); a panicking
@@ -1360,7 +1361,13 @@ pub fn eval_cfg_in_state(
     fuel: usize,
     call_handler: Option<&mut CallHandler<'_>>,
 ) -> Result<CfgEvalOutcome, CfgEvalError> {
-    eval_frames(body, state, start_bb, fuel, None, call_handler)
+    match call_handler {
+        None => eval_frames(body, state, start_bb, fuel, None, None),
+        Some(handler) => {
+            let mut external = |call: &ExternalCall<'_>| handler(call.bb, call.func, call.args);
+            eval_frames(body, state, start_bb, fuel, None, Some(&mut external))
+        }
+    }
 }
 
 /// Default [`CallTable::max_call_depth`].
@@ -1516,19 +1523,47 @@ pub struct CallSite {
     pub callee: CalleeSymbol,
 }
 
+/// A `Call` that a call-table evaluation hands to its [`ExternalCallHandler`]: one whose
+/// callee is neither an inline intrinsic nor linked in the [`CallTable`], made in any frame.
+///
+/// It identifies the call like `Trusted`'s `MirCallReq` (whose `defPath` is
+/// [`ExternalCall::callee`]): a block index alone is ambiguous across frames, and a function
+/// item evaluates to `MirValue::Unit` whatever it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalCall<'a> {
+    /// The linked calls in progress, outermost first (empty for a call made by the evaluated
+    /// body itself).
+    pub call_stack: &'a [CallSite],
+    /// The calling block, in the body of the innermost frame.
+    pub bb: usize,
+    /// The unlinked symbol a direct call names (`None` for an indirect call through a `Copy` or
+    /// `Move` callee operand).
+    pub callee: Option<&'a CalleeSymbol>,
+    /// The evaluated callee operand.
+    pub func: &'a MirValue,
+    /// The evaluated arguments.
+    pub args: &'a [MirValue],
+}
+
+/// Caller-supplied handler of the [`ExternalCall`]s of a call-table evaluation (`Trusted`'s
+/// `ExternalCallHandler`): reports the call's outcome (or undefined behavior inside the callee),
+/// exactly like a [`CallHandler`].
+pub type ExternalCallHandler<'a> =
+    dyn FnMut(&ExternalCall<'_>) -> Result<CallOutcome, RvalueEvalError> + 'a;
+
 /// [`eval_cfg_in_state`] with the linked callees of `table` (see [`CallTable`]): a `Call` of
 /// a linked [`CallTarget::Fn`] symbol runs the callee's body in a new frame; inline intrinsics
-/// run in the calling frame; every other call (in any frame) goes to `call_handler`, which
-/// receives the calling frame's block index, or fails with [`CfgEvalError::UnknownCallee`] (an
-/// unlinked symbol) or [`CfgEvalError::UnsupportedCall`] without one. `fuel` bounds the blocks
-/// executed across all frames.
+/// run in the calling frame; every other call (in any frame) goes to `call_handler` as an
+/// [`ExternalCall`], or fails with [`CfgEvalError::UnknownCallee`] (an unlinked symbol) or
+/// [`CfgEvalError::UnsupportedCall`] without one. `fuel` bounds the blocks executed across all
+/// frames.
 pub fn eval_cfg_in_state_with_call_table(
     body: &LoweredBody,
     state: StatementEvalState,
     start_bb: usize,
     fuel: usize,
     table: &CallTable,
-    call_handler: Option<&mut CallHandler<'_>>,
+    call_handler: Option<&mut ExternalCallHandler<'_>>,
 ) -> Result<CfgEvalOutcome, CfgEvalError> {
     eval_frames(body, state, start_bb, fuel, Some(table), call_handler)
 }
@@ -1546,9 +1581,9 @@ pub fn eval_lowered_body_cfg_with_call_table(
     eval_frames(body, state, 0, fuel, Some(table), None)
 }
 
-/// [`eval_lowered_body_cfg_with_call_table`] with `call_handler` handling every unlinked or
-/// indirect `Call` across all frames (mirroring
-/// `Trusted.VerificationResult.mirHandledTreeWithCallees`).
+/// [`eval_lowered_body_cfg_with_call_table`] with `call_handler` deciding every
+/// [`ExternalCall`] (an unlinked or indirect `Call` in any frame), mirroring
+/// `Trusted.VerificationResult.mirHandledTreeWithCallees`.
 pub fn eval_lowered_body_cfg_with_call_table_and_calls<F>(
     body: &LoweredBody,
     args: &[MirValue],
@@ -1557,7 +1592,7 @@ pub fn eval_lowered_body_cfg_with_call_table_and_calls<F>(
     mut call_handler: F,
 ) -> Result<CfgEvalOutcome, CfgEvalError>
 where
-    F: FnMut(usize, &MirValue, &[MirValue]) -> Result<CallOutcome, RvalueEvalError>,
+    F: FnMut(&ExternalCall<'_>) -> Result<CallOutcome, RvalueEvalError>,
 {
     let state =
         StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
@@ -1611,11 +1646,12 @@ fn linked_call_of<'a>(frame: &Frame<'_>, table: &'a CallTable) -> Option<&'a Lin
 }
 
 /// Executes the statements and the terminator of the current block of `frame` (consuming no
-/// fuel), stopping before a linked call is entered.
+/// fuel), stopping before a linked call is entered. `callers` are the frames below `frame`.
 fn run_block<'a>(
     frame: &mut Frame<'a>,
+    callers: &[Frame<'_>],
     table: Option<&'a CallTable>,
-    call_handler: Option<&mut CallHandler<'_>>,
+    call_handler: Option<&mut ExternalCallHandler<'_>>,
 ) -> Result<BlockStep<'a>, CfgEvalError> {
     let body = frame.body;
     let bb = frame.bb;
@@ -1678,6 +1714,33 @@ fn run_block<'a>(
             _ => None,
         },
         _ => None,
+    };
+    // Any other `Call` reaching the handler is an `ExternalCall` of this frame.
+    let mut external_call;
+    let call_handler: Option<&mut CallHandler<'_>> = match call_handler {
+        None => None,
+        Some(handler) => {
+            let callee = match term {
+                LoweredTerminator::Call { func, .. } => {
+                    func.call_target().and_then(CallTarget::as_callee)
+                }
+                _ => None,
+            };
+            external_call = move |bb: usize, func: &MirValue, args: &[MirValue]| {
+                let call_stack: Vec<CallSite> = callers
+                    .iter()
+                    .filter_map(|caller| caller.pending.as_ref().map(|p| p.site.clone()))
+                    .collect();
+                handler(&ExternalCall {
+                    call_stack: &call_stack,
+                    bb,
+                    callee,
+                    func,
+                    args,
+                })
+            };
+            Some(&mut external_call)
+        }
     };
     match eval_lowered_terminator(
         body,
@@ -1820,7 +1883,7 @@ fn eval_frames<'a>(
     start_bb: usize,
     mut fuel: usize,
     table: Option<&'a CallTable>,
-    mut call_handler: Option<&mut CallHandler<'_>>,
+    mut call_handler: Option<&mut ExternalCallHandler<'_>>,
 ) -> Result<CfgEvalOutcome, CfgEvalError> {
     check_state_matches_body(body, &state)?;
     match body.basic_blocks.get(start_bb) {
@@ -1849,14 +1912,15 @@ fn eval_frames<'a>(
         }
         fuel -= 1;
         let top = frames.len() - 1;
-        let frame = &mut frames[top];
+        let (callers, top_frame) = frames.split_at_mut(top);
+        let frame = &mut top_frame[0];
         if top == 0
             && let Some(table) = table
             && linked_call_of(frame, table).is_some()
         {
             root_call_entry = Some(frame.state.clone());
         }
-        match run_block(frame, table, call_handler.as_deref_mut()) {
+        match run_block(frame, callers, table, call_handler.as_deref_mut()) {
             Err(error) => return Err(in_frames(&frames, top, error)),
             Ok(BlockStep::Continue) => {}
             Ok(BlockStep::Call {

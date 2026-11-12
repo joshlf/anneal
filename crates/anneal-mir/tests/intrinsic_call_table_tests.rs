@@ -2753,8 +2753,17 @@ fn test_call_table_validates_linkage_and_isolates_frames() {
     );
     let lowered_unknown = lower(&unknown, PW);
     let state = StatementEvalState::from_body(&lowered_unknown, &[u32v(1)]).unwrap();
-    let mut handler = |bb: usize, func: &MirValue, args: &[MirValue]| {
-        assert_eq!((bb, func, args), (0, &MirValue::Unit, &[u32v(1)][..]));
+    let mut handler = |call: &ExternalCall<'_>| {
+        assert_eq!(
+            *call,
+            ExternalCall {
+                call_stack: &[],
+                bb: 0,
+                callee: Some(&CalleeSymbol::new("nope")),
+                func: &MirValue::Unit,
+                args: &[u32v(1)],
+            }
+        );
         Ok(CallOutcome::Return(u32v(9)))
     };
     assert_eq!(
@@ -5528,7 +5537,7 @@ fn test_a2_call_destinations_are_evaluated_after_the_arguments_and_before_the_ca
 
 #[test]
 fn test_b3_binops_and_checked_binops_reject_out_of_width_scalars_and_32bit_pointers_like_intrinsics()
-{
+ {
     let is_invalid_bits = |res: Result<MirValue, RvalueEvalError>| {
         matches!(
             res,
@@ -5611,7 +5620,9 @@ fn test_b3_binops_and_checked_binops_reject_out_of_width_scalars_and_32bit_point
         }
         for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Shl, BinOp::Shr] {
             assert!(
-                is_invalid_bits(eval_checked_binop(op, &bad_u8, &ok_u8, pw).map(|_| MirValue::Unit)),
+                is_invalid_bits(
+                    eval_checked_binop(op, &bad_u8, &ok_u8, pw).map(|_| MirValue::Unit)
+                ),
                 "checked {op:?} LHS {pw:?}"
             );
             assert!(
@@ -5752,7 +5763,7 @@ fn test_b3_binops_and_checked_binops_reject_out_of_width_scalars_and_32bit_point
 
 #[test]
 fn test_b3_pointer_intrinsics_validate_argument_well_formedness_before_unspecified_or_too_large_layouts()
-{
+ {
     let unspecified = AdtDef::new_enum(
         "UnspecifiedEnum",
         None,
@@ -5837,11 +5848,7 @@ fn test_b3_pointer_intrinsics_validate_argument_well_formedness_before_unspecifi
             assert_eq!(
                 eval_intrinsic_call(
                     IntrinsicOp::CopyNonOverlapping,
-                    &[
-                        null_ref_const.clone(),
-                        valid_raw_mut.clone(),
-                        usizev(0, pw)
-                    ],
+                    &[null_ref_const.clone(), valid_raw_mut.clone(), usizev(0, pw)],
                     &[ref_const.clone(), raw_mut.clone(), usize_ty()],
                     &unit(),
                     &mut state,
@@ -5948,31 +5955,27 @@ fn test_b3_copy_nonoverlapping_statement_and_call_forms_agree_on_null_and_uninha
     };
 
     for pw in PWS {
-        let make_copy_body = |as_call: bool,
-                              src_ty: Ty,
-                              dst_ty: Ty,
-                              src: Operand,
-                              dst: Operand,
-                              count: Operand| {
-            let decls = vec![unit(), src_ty, dst_ty];
-            let mut stmts = Vec::new();
-            let bb0 = if as_call {
-                blk(
-                    stmts,
-                    call(
-                        intrinsic(IntrinsicOp::CopyNonOverlapping),
-                        vec![src, dst, count],
-                        0,
-                        Some(1),
-                        UnwindAction::Continue,
-                    ),
-                )
-            } else {
-                stmts.push(Statement::CopyNonOverlapping { src, dst, count });
-                blk(stmts, Terminator::Goto { target: 1 })
+        let make_copy_body =
+            |as_call: bool, src_ty: Ty, dst_ty: Ty, src: Operand, dst: Operand, count: Operand| {
+                let decls = vec![unit(), src_ty, dst_ty];
+                let mut stmts = Vec::new();
+                let bb0 = if as_call {
+                    blk(
+                        stmts,
+                        call(
+                            intrinsic(IntrinsicOp::CopyNonOverlapping),
+                            vec![src, dst, count],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    )
+                } else {
+                    stmts.push(Statement::CopyNonOverlapping { src, dst, count });
+                    blk(stmts, Terminator::Goto { target: 1 })
+                };
+                mk(decls, vec![bb0, blk(vec![], Terminator::Return)])
             };
-            mk(decls, vec![bb0, blk(vec![], Terminator::Return)])
-        };
 
         // 1. Null `&u32` or `&mut u32` in locals read by `Statement::CopyNonOverlapping` vs
         // `Terminator::Call(IntrinsicOp::CopyNonOverlapping)`: both report `InvalidBitPattern`
@@ -6132,7 +6135,10 @@ fn test_b3_copy_nonoverlapping_statement_and_call_forms_agree_on_null_and_uninha
                 4,
             ));
             assert_eq!(via_call, via_stmt);
-            assert_eq!(via_stmt, Err(RvalueEvalError::UninhabitedPointee(Ty::Never)));
+            assert_eq!(
+                via_stmt,
+                Err(RvalueEvalError::UninhabitedPointee(Ty::Never))
+            );
 
             // Mutable destination `&mut !` with raw `*const !` source also reports `UninhabitedPointee`.
             let via_stmt_mut = normalize(eval_lowered_body_cfg(
@@ -6202,8 +6208,9 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
     let mut mem_count = 0usize;
     let mut div_count = 0usize;
     for op in IntrinsicOp::ALL {
-        let flags =
-            usize::from(op.is_pure_value()) + usize::from(op.accesses_memory()) + usize::from(op.is_diverging());
+        let flags = usize::from(op.is_pure_value())
+            + usize::from(op.accesses_memory())
+            + usize::from(op.is_diverging());
         assert_eq!(flags, 1, "{op:?} must belong to exactly one category");
         if op.is_pure_value() {
             pure_count += 1;
@@ -6231,7 +6238,10 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
     let fn_op = Operand::callee("my_crate::helper");
     assert_eq!(intr_op.call_target(), Some(&intr_target));
     assert_eq!(fn_op.call_target(), Some(&fn_target));
-    assert_eq!(Constant::from(fn_target.clone()).call_target(), Some(&fn_target));
+    assert_eq!(
+        Constant::from(fn_target.clone()).call_target(),
+        Some(&fn_target)
+    );
     assert_eq!(cp(1).call_target(), None);
     assert_eq!(cst(0, u32_ty()).call_target(), None);
 
@@ -6246,10 +6256,7 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
                     blk(
                         vec![
                             live(2),
-                            assign(
-                                2,
-                                Rvalue::BinaryOp(BinOp::Add, cp(1), cst(1, u32_ty())),
-                            ),
+                            assign(2, Rvalue::BinaryOp(BinOp::Add, cp(1), cst(1, u32_ty()))),
                         ],
                         Terminator::Call {
                             func: Operand::callee("ext_hook"),
@@ -6294,10 +6301,7 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
                         },
                     ),
                     blk(
-                        vec![assign(
-                            0,
-                            Rvalue::BinaryOp(BinOp::Add, cp(0), cp(2)),
-                        )],
+                        vec![assign(0, Rvalue::BinaryOp(BinOp::Add, cp(0), cp(2)))],
                         Terminator::Return,
                     ),
                     cleanup_blk(
@@ -6334,10 +6338,18 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
             &[iv(&u32_ty(), 10, pw)],
             8,
             &table,
-            |bb, func_val, args| {
-                assert_eq!(bb, 0);
-                assert_eq!(func_val, &MirValue::Unit);
-                assert_eq!(args, &[iv(&u32_ty(), 11, pw)]);
+            |call| {
+                assert_eq!(
+                    call.call_stack,
+                    &[CallSite {
+                        bb: 0,
+                        callee: CalleeSymbol::new("wrapper"),
+                    }]
+                );
+                assert_eq!(call.bb, 0);
+                assert_eq!(call.callee, Some(&CalleeSymbol::new("ext_hook")));
+                assert_eq!(call.func, &MirValue::Unit);
+                assert_eq!(call.args, &[iv(&u32_ty(), 11, pw)]);
                 Ok(CallOutcome::Return(iv(&u32_ty(), 33, pw)))
             },
         );
@@ -6351,7 +6363,7 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
             &[iv(&u32_ty(), 10, pw)],
             8,
             &table,
-            |_, _, _| Ok(CallOutcome::Panic("ext_hook boom".to_owned())),
+            |_| Ok(CallOutcome::Panic("ext_hook boom".to_owned())),
         );
         assert_eq!(
             panicked,
@@ -6363,3 +6375,143 @@ fn test_b3_ep2_call_target_ergonomics_and_call_table_with_external_call_handler(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// A3 regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// An [`ExternalCall`] with its borrowed parts copied out.
+type OwnedExternalCall = (
+    Vec<CallSite>,
+    usize,
+    Option<String>,
+    MirValue,
+    Vec<MirValue>,
+);
+
+#[test]
+fn test_a3_external_call_handlers_identify_the_callee_and_frame_of_every_unlinked_call() {
+    // `root(x)`: `bb0: _2 = ext_a(x) -> bb1; bb1: _0 = mid(_2) -> bb2; bb2: return`.
+    // `mid(x)`:  `bb0: _2 = ext_a(x) -> bb1; bb1: _0 = (*fn_ptr)(_2) -> bb2; bb2: return`.
+    // Both frames call `ext_a` from their `bb0` with the same callee value (`()`): only the
+    // call stack and the symbol identify the calls (`Trusted`'s `MirCallReq.defPath`).
+    for pw in PWS {
+        let fn_ptr_ty = raw(unit(), Mutability::Not);
+        let fn_ptr = MirValue::ptr(PointerValue::without_provenance(0x40), fn_ptr_ty.clone());
+        let call_to = |func: Operand, arg: usize, dest: usize, target: usize| Terminator::Call {
+            func,
+            args: vec![cp(arg)],
+            destination: place(dest),
+            target: Some(target),
+            unwind: UnwindAction::Continue,
+        };
+        let root = mk(
+            vec![u32_ty(), u32_ty(), u32_ty()],
+            vec![
+                blk(vec![live(2)], call_to(Operand::callee("ext_a"), 1, 2, 1)),
+                blk(vec![], call_to(Operand::callee("mid"), 2, 0, 2)),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+        let mid = mk(
+            vec![u32_ty(), u32_ty(), u32_ty(), fn_ptr_ty.clone()],
+            vec![
+                blk(
+                    vec![
+                        live(2),
+                        live(3),
+                        assign(
+                            3,
+                            Rvalue::Use(Operand::Constant(Constant::Ptr(
+                                PointerValue::without_provenance(0x40),
+                                fn_ptr_ty.clone(),
+                            ))),
+                        ),
+                    ],
+                    call_to(Operand::callee("ext_a"), 1, 2, 1),
+                ),
+                blk(vec![], call_to(cp(3), 2, 0, 2)),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+        let table = CallTable::new().with_callee("mid", 1, lower(&mid, pw));
+        let root = lower(&root, pw);
+        let mut calls: Vec<OwnedExternalCall> = Vec::new();
+        let outcome = eval_lowered_body_cfg_with_call_table_and_calls(
+            &root,
+            &[u32v(5)],
+            16,
+            &table,
+            |call| {
+                calls.push((
+                    call.call_stack.to_vec(),
+                    call.bb,
+                    call.callee.map(|symbol| symbol.as_str().to_owned()),
+                    call.func.clone(),
+                    call.args.to_vec(),
+                ));
+                let MirValue::Int { bits, .. } = call.args[0] else {
+                    panic!("unexpected argument {:?}", call.args);
+                };
+                // `ext_a(x) = x + 1`, the indirect callee `x * 10`.
+                let ret = if call.callee.is_some() {
+                    bits + 1
+                } else {
+                    bits * 10
+                };
+                Ok(CallOutcome::Return(u32v(ret)))
+            },
+        );
+        assert_eq!(returned(outcome), u32v(70));
+        let in_mid = vec![CallSite {
+            bb: 1,
+            callee: CalleeSymbol::new("mid"),
+        }];
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    vec![],
+                    0,
+                    Some("ext_a".to_owned()),
+                    MirValue::Unit,
+                    vec![u32v(5)]
+                ),
+                (
+                    in_mid.clone(),
+                    0,
+                    Some("ext_a".to_owned()),
+                    MirValue::Unit,
+                    vec![u32v(6)]
+                ),
+                (in_mid, 1, None, fn_ptr.clone(), vec![u32v(7)]),
+            ]
+        );
+
+        // The same handler through `eval_cfg_in_state_with_call_table` from a resumed state.
+        let mut seen = Vec::new();
+        let mut handler = |call: &ExternalCall<'_>| {
+            seen.push((call.call_stack.len(), call.bb, call.callee.cloned()));
+            Ok(CallOutcome::Return(u32v(1)))
+        };
+        let state = StatementEvalState::from_body(&root, &[u32v(5)]).unwrap();
+        assert_eq!(
+            returned(eval_cfg_in_state_with_call_table(
+                &root,
+                state,
+                0,
+                16,
+                &table,
+                Some(&mut handler)
+            )),
+            u32v(1)
+        );
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0, Some(CalleeSymbol::new("ext_a"))),
+                (1, 0, Some(CalleeSymbol::new("ext_a"))),
+                (1, 1, None),
+            ]
+        );
+    }
+}
