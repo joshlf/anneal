@@ -137,6 +137,199 @@ fn borrow_errors_preserve_diagnostics_and_fail() {
 }
 
 #[test]
+fn warnings_allow_callback_evidence_until_promoted_to_errors() {
+    for json in [false, true] {
+        for deny_warnings in [false, true] {
+            let session = Session::new("pub fn warning() { let unused_variable = 0; }\n");
+            let mut command = session.command();
+            if json {
+                command.arg("--error-format=json");
+            }
+            if deny_warnings {
+                command.arg("-Dwarnings");
+            }
+            let output = command.output().expect("run compiler lint session");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            if deny_warnings {
+                assert_failed(&output, "unused variable");
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+            } else {
+                assert!(output.status.success(), "{output:?}");
+            }
+            let level = if deny_warnings { "error" } else { "warning" };
+            if json {
+                let diagnostics = json_diagnostics(&output);
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["level"] == level
+                            && diagnostic["code"]["code"] == "unused_variables"
+                    }),
+                    "{diagnostics:?}"
+                );
+                if !deny_warnings {
+                    assert_eq!(
+                        diagnostics
+                            .iter()
+                            .filter(|diagnostic| {
+                                diagnostic["level"] == "note" && diagnostic["message"] == CALLBACK
+                            })
+                            .count(),
+                        1,
+                        "{diagnostics:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    stderr(&output).contains(&format!("{level}: unused variable")),
+                    "{output:?}"
+                );
+                if !deny_warnings {
+                    assert_eq!(stderr(&output).matches(CALLBACK).count(), 1, "{output:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_compiler_options_use_early_diagnostics_without_callback_evidence() {
+    for (argument, diagnostic) in [
+        ("--unknown-anneal-test-flag", "Unrecognized option"),
+        ("--crate-name", "Argument to option 'crate-name' missing"),
+    ] {
+        for json in [false, true] {
+            let session = Session::new("pub fn valid() {}\n");
+            let mut command = session.command();
+            if json {
+                command.arg("--error-format=json");
+            }
+            let output = command
+                .arg(argument)
+                .output()
+                .expect("run compiler with invalid option");
+            assert_failed(&output, diagnostic);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(stderr(&output).starts_with("error: "), "{output:?}");
+        }
+    }
+}
+
+#[test]
+fn missing_response_files_use_early_diagnostics_without_callback_evidence() {
+    for json in [false, true] {
+        let session = Session::new("pub fn valid() {}\n");
+        let mut command = session.command();
+        if json {
+            command.arg("--error-format=json");
+        }
+        let output = command
+            .arg("@missing-response")
+            .output()
+            .expect("run compiler with missing response file");
+        assert_failed(&output, "failed to load argument file");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(stderr(&output).starts_with("error: "), "{output:?}");
+        assert!(stderr(&output).contains("missing-response"), "{output:?}");
+    }
+}
+
+#[test]
+fn missing_source_files_preserve_diagnostics_without_callback_evidence() {
+    for json in [false, true] {
+        let session = Session::new("pub fn valid() {}\n");
+        std::fs::remove_file(session.directory.path().join("input.rs"))
+            .expect("remove compiler fixture source");
+        let mut command = session.command();
+        if json {
+            command.arg("--error-format=json");
+        }
+        let output = command.output().expect("run compiler with missing source");
+        assert_failed(&output, "couldn't read");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(stderr(&output).contains("input.rs"), "{output:?}");
+        if json {
+            json_diagnostics(&output);
+        }
+    }
+}
+
+#[test]
+fn metadata_output_failures_emit_no_callback_evidence() {
+    for json in [false, true] {
+        let session = Session::new("pub fn valid() {}\n");
+        std::fs::write(
+            session.directory.path().join("output-parent"),
+            "regular file\n",
+        )
+        .expect("write regular file in place of output directory");
+        let mut command = session.command();
+        command.arg("--emit=metadata=output-parent/session.rmeta");
+        if json {
+            command.arg("--error-format=json");
+        }
+        let output = command.output().expect("run failing metadata output");
+        assert_failed(&output, "output-parent");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        if json {
+            json_diagnostics(&output);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_fail_without_panicking_or_callback_evidence() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for json in [false, true] {
+        let session = Session::new("pub fn valid() {}\n");
+        let mut command = session.command();
+        if json {
+            command.arg("--error-format=json");
+        }
+        let output = command
+            .arg(std::ffi::OsString::from_vec(vec![0xff]))
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("run compiler with non-UTF-8 argument");
+        assert_failed(&output, "compiler argument is not UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(stderr(&output).starts_with("error: "), "{output:?}");
+        assert!(!stderr(&output).contains("panicked"), "{output:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_program_names_fail_without_panicking_or_callback_evidence() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::process::CommandExt;
+
+    for json in [false, true] {
+        let session = Session::new("pub fn valid() {}\n");
+        let mut command = session.command();
+        if json {
+            command.arg("--error-format=json");
+        }
+        let output = command
+            .arg0(std::ffi::OsString::from_vec(vec![0xff]))
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("run compiler with non-UTF-8 program name");
+        assert_failed(&output, "compiler program name is not UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(stderr(&output).starts_with("error: "), "{output:?}");
+        assert!(!stderr(&output).contains("panicked"), "{output:?}");
+    }
+}
+
+#[test]
 fn linker_failure_after_analysis_emits_no_callback_evidence() {
     let session = Session::new("pub fn valid() {}\n");
     let missing_linker: PathBuf = session.directory.path().join("missing-linker");
@@ -218,6 +411,23 @@ fn help_and_version_do_not_claim_callback_execution() {
         assert!(output.status.success(), "{output:?}");
         assert!(stdout(&output).contains("anneal-rustc-capture"));
         assert!(!stdout(&output).contains(CALLBACK));
+    }
+}
+
+#[test]
+fn explicit_separator_routes_information_requests_to_rustc() {
+    for (option, compiler_output) in [
+        ("--help", "Usage: rustc"),
+        ("--version", "rustc 1.98.0-nightly (f8a08b688 2026-05-30)"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+            .args(["--", option])
+            .output()
+            .expect("run compiler information command through separator");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stdout(&output).starts_with(compiler_output), "{output:?}");
+        assert!(!stdout(&output).contains(CALLBACK), "{output:?}");
+        assert!(!stderr(&output).contains(CALLBACK), "{output:?}");
     }
 }
 
