@@ -63,7 +63,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1374,6 +1374,19 @@ impl Checker {
         })
     }
 
+    /// Capture a Lean child in the stage with only the selected environment.
+    ///
+    /// I/O errors remain distinct from a completed child's exit status. Each
+    /// caller applies its own diagnostic and protocol rules to the raw output.
+    fn launch_lean(&self, arguments: &[String]) -> io::Result<Output> {
+        Command::new(&self.lean)
+            .args(arguments)
+            .current_dir(&self.stage)
+            .env_clear()
+            .envs(&self.environment)
+            .output()
+    }
+
     /// Execute `self.lean` with `arguments` in the sanitized `self.environment`
     /// with `self.stage` as the working directory.
     pub fn process(
@@ -1382,15 +1395,9 @@ impl Checker {
         arguments: &[String],
     ) -> Result<String, Failure> {
         self.counter += 1;
-        let output = Command::new(&self.lean)
-            .args(arguments)
-            .current_dir(&self.stage)
-            .env_clear()
-            .envs(&self.environment)
-            .output()
-            .map_err(|e| {
-                Failure::new(2, label, format!("could not execute Lean: {e}"))
-            })?;
+        let output = self.launch_lean(arguments).map_err(|e| {
+            Failure::new(2, label, format!("could not execute Lean: {e}"))
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1515,15 +1522,9 @@ impl Checker {
             request_path.to_string_lossy().into_owned(),
             result_path.to_string_lossy().into_owned(),
         ];
-        let output = Command::new(&self.lean)
-            .args(&args)
-            .current_dir(&self.stage)
-            .env_clear()
-            .envs(&self.environment)
-            .output()
-            .map_err(|e| {
-                Failure::new(2, mode, format!("could not execute Lean: {e}"))
-            })?;
+        let output = self.launch_lean(&args).map_err(|e| {
+            Failure::new(2, mode, format!("could not execute Lean: {e}"))
+        })?;
 
         if !output.status.success() {
             if output.status.code() == Some(1)
@@ -2082,4 +2083,120 @@ fn topo_sort_modules(
     let mut order: Vec<String> = ready.into_iter().collect();
     order.extend(topo_sort_modules(remaining, imports_map, cycle_msg)?);
     Ok(order)
+}
+
+#[cfg(all(test, unix))]
+mod process_tests {
+    use super::*;
+
+    fn shell_checker(checkout: &Path) -> Checker {
+        Checker::new_with_env(checkout, Some(Path::new("/bin/sh")), []).unwrap()
+    }
+
+    #[test]
+    fn captures_successful_child_output() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checker = shell_checker(checkout.path());
+        let output = checker
+            .launch_lean(&[
+                "-c".to_string(),
+                "printf 'stdout\\000\\377'; printf 'stderr\\000\\376' >&2"
+                    .to_string(),
+            ])
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout\0\xff");
+        assert_eq!(output.stderr, b"stderr\0\xfe");
+    }
+
+    #[test]
+    fn preserves_failed_child_status_and_raw_streams() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checker = shell_checker(checkout.path());
+        let output = checker
+            .launch_lean(&[
+                "-c".to_string(),
+                "printf 'stdout\\000\\377'; printf 'stderr\\000\\376' >&2; exit 37"
+                    .to_string(),
+            ])
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(37));
+        assert_eq!(output.stdout, b"stdout\0\xff");
+        assert_eq!(output.stderr, b"stderr\0\xfe");
+    }
+
+    #[test]
+    fn returns_io_error_when_child_cannot_launch() {
+        let checkout = tempfile::tempdir().unwrap();
+        let missing = checkout.path().join("missing-lean");
+        let checker =
+            Checker::new_with_env(checkout.path(), Some(&missing), []).unwrap();
+
+        let error = checker.launch_lean(&[]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn preserves_arguments_and_stage_working_directory() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checker = shell_checker(checkout.path());
+        fs::write(checker.stage.join("marker"), b"from-stage\n").unwrap();
+        let output = checker
+            .launch_lean(&[
+                "-c".to_string(),
+                "IFS= read -r marker < marker; printf '%s\\000' \"$marker\" \"$@\""
+                    .to_string(),
+                "fixture".to_string(),
+                "space separated".to_string(),
+                String::new(),
+                "$HOME;*".to_string(),
+                "line\nbreak".to_string(),
+            ])
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"from-stage\0space separated\0\0$HOME;*\0line\nbreak\0"
+        );
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn launches_with_only_the_filtered_environment() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checker = Checker::new_with_env(
+            checkout.path(),
+            Some(Path::new("/usr/bin/env")),
+            [
+                ("HOME".to_string(), "/selected/home".to_string()),
+                ("TMPDIR".to_string(), "/selected/tmp".to_string()),
+                ("LANG".to_string(), "C".to_string()),
+                ("LC_ALL".to_string(), "C".to_string()),
+                ("PATH".to_string(), "/unselected/bin".to_string()),
+                ("LEAN_PATH".to_string(), "/unselected/lean".to_string()),
+                ("ELAN_TOOLCHAIN".to_string(), "unselected".to_string()),
+                ("LD_PRELOAD".to_string(), "/unselected.so".to_string()),
+            ],
+        )
+        .unwrap();
+        let output = checker.launch_lean(&[]).unwrap();
+
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            environment.lines().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "HOME=/selected/home",
+                "LANG=C",
+                "LC_ALL=C",
+                "PATH=/usr/bin:/bin",
+                "TMPDIR=/selected/tmp",
+            ])
+        );
+        assert!(output.stderr.is_empty());
+    }
 }
