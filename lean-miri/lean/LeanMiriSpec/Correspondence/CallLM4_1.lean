@@ -850,15 +850,19 @@ def cexForeignUniqueBorrows : List BorrowEntry :=
 /-- **Divergence Theorem (`C2`, `cex_end_of_call_foreign_unique_frozen_divergence`)**:
 On a borrow table `bs = [e{ReservedFrz false, prot = some 7}, f{Unique, prot = none}]`
 satisfying both `ActiveProtectorsValid bs [7]` and `TreeBorrowsRel bs [7] (basedNormalTree bs [7])`:
-1. Miri's end-of-call implicit protector access (`annealAssociatedAccess e.perm = some .Read`,
-   `NormalTreeState.performAccess 0 .Read .SkipChildrenOfAccessed`) succeeds
+1. Canonical Miri's Tree Borrows end-of-call implicit protector access, evaluated
+   on the separately constructed `basedNormalTree bs [7]` (`annealAssociatedAccess e.perm = some .Read`,
+   `NormalTreeState.performAccess 0 .Read .SkipChildrenOfAccessed`), succeeds
    (`.status = .Completed`) and acts as a foreign read on the sibling `f`,
    freezing `f` from `Unique` to `Frozen`
    (`normalTreePerms res.tree 2 = [some (.reservedFrz false), some .frozen] ≠ [some (.reservedFrz false), some .unique]`);
-2. Anneal's `Trusted` `TerminatorKind.return_` (`Terminators.lean:3005-3039`,
-   `restoreCallerProtectors` at `Terminators.lean:468`)
-   restores `activeProtectors` without running an end-of-call `performAccess`
-   pass on `s.memory.borrows`, leaving `f.perm = .unique`. -/
+2. Stage-1 `Trusted` `TerminatorKind.return_` (`Terminators.lean:3005-3039`,
+   `restoreCallerProtectors` at `Terminators.lean:468`) restores `activeProtectors`
+   without running an end-of-call `performAccess` pass on `s.memory.borrows`,
+   leaving `f.perm = .unique`. (Note that `AnnealMachine` stores no per-allocation
+   `BorrowTree`s—only `GlobalState` protector IDs—so `annealStepHooksLM4_1`
+   steps in lockstep with Stage-1; this divergence is specifically against
+   canonical Miri's Tree Borrows engine.) -/
 theorem cex_end_of_call_foreign_unique_frozen_divergence :
     ActiveProtectorsValid cexForeignUniqueBorrows [7] ∧
     TreeBorrowsRel cexForeignUniqueBorrows [7]
@@ -987,18 +991,24 @@ theorem unwindFromCallStack_running_releaseCallProtectors
       exact ⟨1, Nat.le_refl 1, by simp only [List.length_cons]; omega, rfl, rfl⟩
 
 /-- Multi-node 3-level chain (`[g, c, r]`) and 3-node branching (`[c₀, c₁, p]`)
-protector release correspondence on `basedNormalTree`:
+protector release correspondence on canonical Tree Borrows (`basedNormalTree`,
+constructed from the `BorrowEntry` table since `AnnealMachine` stores no
+per-allocation `BorrowTree`s):
 1. On a 3-level reborrow chain `[g{perm, prot = some 1, parent = some 2},
-   c{Unique, parent = some 1}, r{Unique, parent = none}]`, Miri's end-of-call
-   protector access at grandchild `g` (`performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed`
+   c{Unique, parent = some 1}, r{Unique, parent = none}]`, canonical Tree Borrows'
+   end-of-call protector access at grandchild `g`
+   (`performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed`
    for `perm ≠ .cell`) succeeds iff `perm ≠ .disabled`, and when `perm ≠ .disabled`
    preserves all 3 permissions (`[some perm, some .unique, some .unique]`) because
-   both parent `c` and root `r` are *ancestors* (`.LocalAccess`) of `g`;
+   both parent `c` and root `r` are *ancestors* (`.LocalAccess`) of `g`—matching
+   Stage-1 `restoreCallerProtectors`;
 2. On a 3-node branching tree `[c₀{ReservedFrz false, prot = some 1, parent = some 1},
-   c₁{Unique, prot = none, parent = some 1}, p{Unique, parent = none}]`, Miri's
-   end-of-call protector access at `c₀` (`performAccess 0 .Read .SkipChildrenOfAccessed`)
-   preserves ancestor `p` at `some .unique` (`.LocalAccess`) while freezing
-   foreign sibling `c₁` from `.unique` to `.frozen` (`.ForeignAccess`). -/
+   c₁{Unique, prot = none, parent = some 1}, p{Unique, parent = none}]`, canonical
+   Tree Borrows' end-of-call protector access at `c₀`
+   (`performAccess 0 .Read .SkipChildrenOfAccessed`) preserves ancestor `p` at
+   `some .unique` (`.LocalAccess`) while freezing foreign sibling `c₁` from
+   `.unique` to `.frozen` (`.ForeignAccess`), diverging from Stage-1
+   `restoreCallerProtectors` (which performs no tree access and leaves `c₁` `.unique`). -/
 theorem basedNormalTree_releaseProtector_chain3_and_branch3_simulation
     (perm : TreeBorrowPerm) :
     let chain3 : List BorrowEntry :=
@@ -1481,12 +1491,12 @@ and `activeProtectors : List Nat` to `lean-miri`'s `m.stack.frames.toList.revers
   - `FrameRel rootBody mach curAf rootMf`
 * Inductive step (`cf :: cs`, callee frame `calleeMf` above `callerMf :: restMfs`
   where `callerFrameIdx = restMfs.length`):
-  - `calleeMf.returnContinuation = .goto (some cf.returnTarget) unwind`
+  - `calleeMf.returnContinuation = .goto (if cf.isDiverging then none else some cf.returnTarget) (translateUnwindAction cf.returnUnwind)`
   - `CallerDestinationRel mach restMfs.length cf callerMf calleeMf.returnPlace`
   - `FrameRel curBody mach curAf calleeMf`
   - `CalleeIndirectRetWf mach curBody curAf cf calleeMf`
   - `activeProtectors` decomposes as `curFrameProts ++ callerProts` where
-    `cf.calleeProtectors = callerProts` and every `cid ∈ curFrameProts` is absent
+    `restoreCallerProtectors cf = callerProts` and every `cid ∈ curFrameProts` is absent
     from `callerProts` (`∀ cid ∈ curFrameProts, natListContainsBool callerProts cid = false`). -/
 inductive CallerStackLinksRel
     (rootBody : CapturedMir) (mach : AnnealMachine) :
@@ -1507,8 +1517,7 @@ inductive CallerStackLinksRel
       (cf : SavedCallerFrame) (cs : List SavedCallerFrame)
       (curFrameProts callerProts : List Nat)
       (calleeMf callerMf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-      (restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit))
-      (unwind : Miri.MIR.UnwindAction := translateUnwindAction cf.returnUnwind) :
+      (restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)) :
       calleeMf.returnContinuation =
         .goto (if cf.isDiverging then none else some cf.returnTarget)
           (translateUnwindAction cf.returnUnwind) →
@@ -1536,7 +1545,7 @@ theorem CallerStackLinksRel.toForall2
   induction h with
   | root _ _ _ _ _ hfr =>
     exact .cons hfr .nil
-  | cons _ _ _ _ _ _ _ _ _ _ _ _ hfr _ _ _ _ ih =>
+  | cons _ _ _ _ _ _ _ _ _ _ _ hfr _ _ _ _ ih =>
     exact .cons hfr ih
 
 /-- Every `CallerStackLinksRel` implies `FrameStackRel`. -/
@@ -1637,6 +1646,23 @@ inductive MultiFrameStateRel
 
 /-- Alias `CallStackStateRel` for `MultiFrameStateRel`. -/
 abbrev CallStackStateRel := MultiFrameStateRel
+
+/-- Intermediate multi-frame unwinding relation (`UnwindingStateRel`) between a
+Stage-1 `MachineState` `s` (holding the remaining `callStack` and restored
+`activeProtectors` at an intermediate step of `unwindFromCallStack`) and
+`lean-miri`'s `AnnealStepState` `m` whose active top frame sits at
+`location = .unwinding span` (`ControlFlow.unwindToBlock` at `ControlFlow.lean:54`,
+dispatched on the next step by `Step.step` at `Step.lean:90`). -/
+def UnwindingStateRel
+    (rootBody : CapturedMir)
+    (s : MachineState)
+    (m : AnnealStepState) : Prop :=
+  ∃ (m_mir : AnnealStepState)
+    (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (span : Miri.MIR.SpanRef),
+    m_mir.stack.frames.back? = some topFrame ∧
+    m = { m_mir with stack := ⟨m_mir.stack.frames.pop.push { topFrame with location := .unwinding span }⟩ } ∧
+    MultiFrameStateRel rootBody s m_mir
 
 /-! ### Bidirectional Depth-1 Bridge Theorems (`StateRel` ↔ `TreeBorrowsStateRel` ↔ `MultiFrameStateRel`) -/
 
@@ -2501,27 +2527,187 @@ def annealPushCalleeFrameLM4_1
           | .ok () => (finalState, .ok ())
           | .error e => (finalState, .error (.stack e))
 
+/-- Runtime `FnAbi` compatibility check between a function-pointer registry
+entry `fnEntry` and the call site's `RigidTy.fnPtr callerInputs callerOutput _ callerAbi`
+signature (`Call.evalCalleeAndArgs` / `Call.initStackFrame` at `Call.lean:190-197, 254-264`).
+Unlike Stage-1 `fnEntryCompatibleWithCallSite` (`Terminators.lean:244-280`),
+canonical `lean-miri` checks runtime `FnAbi` convention, arity, and argument/return
+types without enforcing HIR/MIR `Safety` (`safetyCompatible`), because `unsafe fn()`
+and `fn()` share an identical runtime `FnAbi` in `rustc`. -/
+def annealFnPtrAbiCompatible
+    (fnEntry : FnPtrEntry)
+    (callerInputs : List RigidTy)
+    (callerOutput : RigidTy)
+    (callerAbi : CallConv)
+    (argCount : Nat) : Bool :=
+  let entryArityOk :=
+    match fnEntry.fnSig with
+    | .none => true
+    | .some (.fnPtr sigInputs _ _ sigAbi) =>
+      Bool.and
+        (Bool.not (callConvEq sigAbi .rustIntrinsic))
+        (Nat.beq (length sigInputs) argCount)
+    | .some _ => false
+  let callerSigOk :=
+    Bool.and
+      (Bool.not (callConvEq callerAbi .rustIntrinsic))
+      (Bool.and
+        (Nat.beq (length callerInputs) argCount)
+        (match fnEntry.fnSig with
+         | .none => true
+         | .some (.fnPtr sigInputs sigOutput _ sigAbi) =>
+           Bool.and
+             (Nat.beq (length callerInputs) (length sigInputs))
+             (Bool.and
+               (callConvEq callerAbi sigAbi)
+               (Bool.and
+                 (rigidTyListEq callerInputs sigInputs)
+                 (rigidTyEq callerOutput sigOutput)))
+         | .some _ => false))
+  Bool.and entryArityOk callerSigOk
+
+/-- Runtime `FnAbi` compatibility between a resolved `fnEntry : FnPtrEntry` and
+the linked `calleeBody : CapturedMir` (`Call.initStackFrame` at `Call.lean:254-264`,
+matching Stage-1 `checkCalleeTargetCompatible` at `Terminators.lean:411-437`). -/
+def annealCalleeAbiCompatible
+    (fnEntry : FnPtrEntry)
+    (calleeBody : CapturedMir)
+    (argCount : Nat) : Bool :=
+  Bool.and
+    (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+    (Bool.and
+      (Nat.beq calleeBody.argCount argCount)
+      (match fnEntry.fnSig with
+       | .none => true
+       | .some (.fnPtr sigInputs sigOut _ sigAbi) =>
+         Bool.and
+           (Nat.beq (length sigInputs) calleeBody.argCount)
+           (Bool.and
+             (callConvEq sigAbi calleeBody.fnAbi.conv)
+             (calleeLocalDeclsCompatible
+               fnEntry.typeArgs
+               calleeBody.localDecls
+               calleeBody.argCount
+               sigInputs
+               sigOut))
+       | .some _ => false))
+
+/-- Evaluate a `Terminator.Call` with a non-constant `func` operand (`extractCalleeDefPath? func = none`),
+following canonical `lean-miri`'s `Call.evalCalleeAndArgs` (`Call.lean:183-206`),
+`FunctionPointers.allocation` / `getPtrFn` (`FunctionPointers.lean:122-145`), and
+`Call.initStackFrame` (`Call.lean:254-264`):
+1. Evaluates `func` (`annealEvalOperand`), faulting with UB on a `.dead` local
+   and deinitializing on `.Move`;
+2. Evaluates `argOps` left-to-right (`annealEvalCallArgsLM4_1`);
+3. Dispatches on `func`'s declared type (`operandTy`):
+   * Monomorphic ZST function item (`RigidTy.fnDef defPath []`): resolves
+     `findCallee? callees defPath` and pushes `calleeBody` (or faults with UB on
+     a diverging call to `isUnreachableCallTarget defPath`);
+   * Indirect function pointer (`RigidTy.fnPtr callerInputs callerOutput _ callerAbi`):
+     reads the pointer scalar (`annealReadImmediate` -> `toScalar` -> `toPointer`),
+     faulting with UB on `.uninit`, provenance-free integer pointers
+     (`intoPointerOrAddr = .error _` -> `DanglingIntPointer`), unmapped addresses
+     (`annealResolvePtr = .error _` -> `DanglingIntPointer`), non-zero offsets
+     (`offset != .ZERO` -> `InvalidFunctionPointer`), or non-function allocations
+     (`lookupFnPtr fnPtrs allocId = none` -> `InvalidFunctionPointer`), then
+     validates runtime `FnAbi` compatibility (`annealFnPtrAbiCompatible` and
+     `annealCalleeAbiCompatible`, without checking HIR/MIR `Safety`) and pushes
+     `calleeBody` via `annealPushCalleeFrameLM4_1`. -/
+def annealEvalNonConstCallLM4_1
+    (currentBody : CapturedMir)
+    (callees : List CapturedMir)
+    (fnPtrs : List FnPtrEntry)
+    (func : MirAst.Operand)
+    (argOps : List MirAst.Operand)
+    (dest : Miri.MIR.Place)
+    (targetOpt : Option Miri.MIR.BasicBlockId)
+    (unwind : Miri.MIR.UnwindAction)
+    (state : AnnealStepState) :
+    Miri.Interpreter.StepResult AnnealStepState Unit :=
+  let mirFunc := translateOperand func
+  let mirArgOps := argOps.map translateOperand
+  match Miri.Interpreter.runRvalue
+      (do
+        let funcOp ← annealEvalOperand currentBody.localDecls currentBody.layouts mirFunc none
+        let argImms ← annealEvalCallArgsLM4_1 currentBody.localDecls currentBody.layouts mirArgOps
+        return (funcOp, argImms))
+      state with
+  | (stateAfterArgs, .error err) => (stateAfterArgs, .error err)
+  | (stateAfterArgs, .ok (funcOp, argImms)) =>
+    match operandTy currentBody.localDecls currentBody.layouts func with
+    | .some { kind := .fnDef defPath .nil, .. } =>
+      match findCallee? callees defPath with
+      | some calleeBody =>
+        annealPushCalleeFrameLM4_1 currentBody calleeBody dest targetOpt unwind
+          argImms stateAfterArgs
+      | none =>
+        if targetOpt.isNone && isUnreachableCallTarget defPath then
+          (stateAfterArgs, .error (.undefinedBehavior "entering unreachable_unchecked"))
+        else
+          (stateAfterArgs, .error (.unsupported "unresolved external call"))
+    | .some { kind := .fnPtr callerInputs callerOutput _ callerAbi, .. } =>
+      match Miri.Interpreter.runRvalue (annealReadImmediate funcOp) stateAfterArgs with
+      | (stateAfterPtr, .error err) => (stateAfterPtr, .error err)
+      | (stateAfterPtr, .ok fnImm) =>
+        match fnImm.imm.toScalar with
+        | .error err =>
+          (stateAfterPtr, .error (Miri.Interpreter.ScalarOps.immediateError err))
+        | .ok sc =>
+          match sc.toPointer annealTargetDataLayout with
+          | .error err =>
+            (stateAfterPtr, .error (Miri.Interpreter.ScalarOps.scalarError err))
+          | .ok ptr =>
+            match ptr.intoPointerOrAddr with
+            | .error _ =>
+              (stateAfterPtr, .error (.undefinedBehavior "DanglingIntPointer"))
+            | .ok _ =>
+              match annealResolvePtr stateAfterPtr.machine ptr 0 with
+              | .error _ =>
+                (stateAfterPtr, .error (.undefinedBehavior "DanglingIntPointer"))
+              | .ok resolved =>
+                if resolved.offset != Miri.ABI.Size.ZERO then
+                  (stateAfterPtr, .error (.undefinedBehavior "InvalidFunctionPointer"))
+                else
+                  match lookupFnPtr fnPtrs resolved.allocId.value.toNat with
+                  | .none =>
+                    (stateAfterPtr, .error (.undefinedBehavior "InvalidFunctionPointer"))
+                  | .some fnEntry =>
+                    if !fnEntry.typeArgs.isEmpty then
+                      (stateAfterPtr, .error (.unsupported "polymorphic indirect fnPtr"))
+                    else if !annealFnPtrAbiCompatible fnEntry callerInputs callerOutput callerAbi argImms.length then
+                      (stateAfterPtr, .error (.undefinedBehavior "indirect call ABI mismatch"))
+                    else
+                      match findCallee? callees fnEntry.defPath with
+                      | .none =>
+                        (stateAfterPtr, .error (.unsupported "unresolved indirect external call"))
+                      | .some calleeBody =>
+                        if !annealCalleeAbiCompatible fnEntry calleeBody argImms.length then
+                          (stateAfterPtr, .error (.undefinedBehavior "callee ABI mismatch"))
+                        else
+                          annealPushCalleeFrameLM4_1 currentBody calleeBody dest targetOpt unwind
+                            argImms stateAfterPtr
+    | _ =>
+      (stateAfterArgs, .error (.unsupported "non-constant polymorphic or closure call"))
+
 /-- Evaluate a `Terminator.Call` in `LM-4.1`, mirroring Stage-1 `Trusted`
-`evalTerminator (.call ..)` (`Terminators.lean:3067-3246`) for constant
-function-item callees:
-1. Looks up the active basic block in `currentBody` to extract the callee
-   `DefPath` (`extractCalleeDefPath?`);
-2. Evaluates the argument operands left-to-right via `annealEvalCallArgsLM4_1`
-   (Stage-1 `evalOperands`);
-3. When `calleeBody` is linked in `callees` (`findCallee?`), pushes its frame via
-   `annealPushCalleeFrameLM4_1` with continuation `.goto (some targetBb) unwind`
-   for a returning call (Stage-1 `pushCalleeFrame`) or `.goto none unwind` for a
-   diverging call (`target = none`; Stage-1 `pushDivergingCalleeFrame`,
-   `Terminators.lean:3201-3217`);
-4. When the callee is not linked, a diverging call to an unreachable call target
-   (`isUnreachableCallTarget defPath`, Stage-1 `Terminators.lean:3227-3228`)
-   faults with `StepError.undefinedBehavior`; every other unlinked call
-   (external calls, aborting/unwinding panics) is `.unsupported`. -/
+`evalTerminator (.call ..)` (`Terminators.lean:3067-3246`) and canonical
+`lean-miri`'s `Call.evalCalleeAndArgs` + `FunctionPointers.getPtrFn`:
+1. Looks up the active basic block in `currentBody`:
+   * For constant function-item callees (`extractCalleeDefPath? func = some defPath`),
+     evaluates `argOps` left-to-right via `annealEvalCallArgsLM4_1` and pushes
+     `calleeBody` when linked in `callees` (`findCallee?`), or faults with UB on
+     a diverging call to `isUnreachableCallTarget defPath`;
+   * For non-constant `func` operands (`extractCalleeDefPath? func = none`: local
+     ZST `FnDef` items and indirect `FnPtr` function pointers), delegates to
+     `annealEvalNonConstCallLM4_1` (`callees`, `fnPtrs`).
+2. Every other unlinked call (external calls, unlinked `core::panicking` panic
+   lang items) returns `.unsupported`. -/
 def annealEvalCallLM4_1
     (currentBody : CapturedMir)
     (callees : List CapturedMir)
     (terminator : Miri.MIR.Terminator)
-    (state : AnnealStepState) :
+    (state : AnnealStepState)
+    (fnPtrs : List FnPtrEntry := .nil) :
     Miri.Interpreter.StepResult AnnealStepState Unit :=
   match state.stack.currentFrame? with
   | none => (state, .error (.stack .emptyStack))
@@ -2536,7 +2722,8 @@ def annealEvalCallLM4_1
         | .call func argOps _ (.none) _, .Call _ _ dest .none unwind _ _ =>
           match extractCalleeDefPath? func with
           | none =>
-            (state, .error (.unsupported "diverging call with non-constant callee"))
+            annealEvalNonConstCallLM4_1 currentBody callees fnPtrs func argOps
+              dest none unwind state
           | some defPath =>
             let mirArgOps := argOps.map translateOperand
             match Miri.Interpreter.runRvalue
@@ -2556,7 +2743,9 @@ def annealEvalCallLM4_1
                    .error (.unsupported "diverging call to unlinked non-unreachable callee"))
         | .call func argOps _ (.some targetBb) _, .Call _ _ dest (.some _) unwind _ _ =>
           match extractCalleeDefPath? func with
-          | none => (state, .error (.unsupported "call with non-constant callee"))
+          | none =>
+            annealEvalNonConstCallLM4_1 currentBody callees fnPtrs func argOps
+              dest (some targetBb) unwind state
           | some defPath =>
             let mirArgOps := argOps.map translateOperand
             match Miri.Interpreter.runRvalue
@@ -2572,11 +2761,17 @@ def annealEvalCallLM4_1
         | _, _ => (state, .error (.invalidProgram "mismatched call terminator"))
 
 /-- `TerminatorHooks` for `LM-4.1`, extending `annealTerminatorHooks` with
-`annealControlHooksLM4_1`, `annealEvalCallLM4_1`, and `annealEvalDropLM4_1`. -/
+`annealControlHooksLM4_1`, `annealEvalCallLM4_1` (including non-constant `FnDef`
+and indirect `FnPtr` calls), `annealEvalDropLM4_1`, and `assertPanic` returning
+`.unsupported` (rather than `Translate.lean`'s depth-1 scalar-fragment stub
+`.undefinedBehavior "assert panic"`, matching `Panic.lean:6-7`: a failed
+assertion invokes the `core::panicking` lang item rather than causing UB, and
+`core` panic lang items are unlinked here). -/
 def annealTerminatorHooksLM4_1
     (currentBody : CapturedMir)
     (callees : List CapturedMir := .nil)
-    (poppedFrame : Miri.TreeBorrows.FrameState := {}) :
+    (poppedFrame : Miri.TreeBorrows.FrameState := {})
+    (fnPtrs : List FnPtrEntry := .nil) :
     Miri.Interpreter.TerminatorHooks
       AnnealProv
       Miri.Interpreter.LocalLayout
@@ -2587,17 +2782,21 @@ def annealTerminatorHooksLM4_1
       (Miri.Interpreter.RvalueImmTy AnnealProv) :=
   { annealTerminatorHooks currentBody.localDecls currentBody.layouts with
     toControlHooks := annealControlHooksLM4_1 currentBody.localDecls currentBody.layouts poppedFrame
-    call := fun _ term state => annealEvalCallLM4_1 currentBody callees term state
-    drop := fun _ place target unwind state => annealEvalDropLM4_1 place target unwind state }
+    call := fun _ term state => annealEvalCallLM4_1 currentBody callees term state fnPtrs
+    drop := fun _ place target unwind state => annealEvalDropLM4_1 place target unwind state
+    assertPanic := fun _ _ _ state =>
+      (state, .error (.unsupported "assert panic without linked panic lang item")) }
 
 /-- `StepHooks` for `LM-4.1`, parameterized by the active `CapturedMir` body
 `currentBody` (`activeMirBody rootBody s`), available `callees`
-(`s.memory.callees`), and the popped callee frame's `FrameState`
-(`poppedFrame := annealPoppedFrameState s`). -/
+(`s.memory.callees`), the popped callee frame's `FrameState`
+(`poppedFrame := annealPoppedFrameState s`), and optional registered function
+pointers `fnPtrs` (`s.memory.fnPtrs`). -/
 def annealStepHooksLM4_1
     (currentBody : CapturedMir)
     (callees : List CapturedMir := .nil)
-    (poppedFrame : Miri.TreeBorrows.FrameState := {}) :
+    (poppedFrame : Miri.TreeBorrows.FrameState := {})
+    (fnPtrs : List FnPtrEntry := .nil) :
     Miri.Interpreter.StepHooks
       AnnealProv
       Miri.Interpreter.LocalLayout
@@ -2612,8 +2811,42 @@ def annealStepHooksLM4_1
         choice unwinding state
     terminator := fun choice term state =>
       Miri.Interpreter.ControlFlow.evalTerminator
-        (annealTerminatorHooksLM4_1 currentBody callees poppedFrame)
+        (annealTerminatorHooksLM4_1 currentBody callees poppedFrame fnPtrs)
         choice term state }
+
+/-- Canonical `LM-4.1` `StepHooks` instantiated at Stage-1 `MachineState` `s`
+rooted at `rootBody` (`activeMirBody rootBody s`, `s.memory.callees`,
+`annealPoppedFrameState s`, and `s.memory.fnPtrs`). -/
+def annealStepHooksForState (rootBody : CapturedMir) (s : MachineState) :
+    Miri.Interpreter.StepHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees
+    (annealPoppedFrameState s) s.memory.fnPtrs
+
+/-- A `k`-step (`k ≥ 1`) execution trace of `Miri.Interpreter.Step.step` for
+multi-frame stack unwinding where every step `i` uses the exact
+`annealStepHooksForState rootBody s_i` of the corresponding Stage-1 state `s_i`
+along `unwindFromCallStack`, and every intermediate step (`cons`) transitions
+through an `UnwindingStateRel rootBody s_i m_i` state (`topFrame.location = .unwinding span`). -/
+inductive MiriUnwindSteps (rootBody : CapturedMir) :
+    Nat → MachineState → AnnealStepState →
+    Miri.Interpreter.StepResult AnnealStepState Bool → Prop where
+  | single (s₀ : MachineState) (m₀ m₁ : AnnealStepState)
+      (out : Except Miri.Interpreter.StepError Bool) :
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s₀) () m₀ = (m₁, out) →
+      MiriUnwindSteps rootBody 1 s₀ m₀ (m₁, out)
+  | cons {k : Nat} (s₀ s₁ : MachineState) (m₀ m₁ : AnnealStepState)
+      (res : Miri.Interpreter.StepResult AnnealStepState Bool) :
+      s₀.memory.callStack ≠ [] →
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s₀) () m₀ = (m₁, .ok true) →
+      UnwindingStateRel rootBody s₁ m₁ →
+      MiriUnwindSteps rootBody k s₁ m₁ res →
+      MiriUnwindSteps rootBody (k + 1) s₀ m₀ res
 
 /-- Multi-frame one-step outcome correspondence (`StepRelMultiFrame`) between
 Anneal's `stepMirFn rootBody s` and `lean-miri`'s

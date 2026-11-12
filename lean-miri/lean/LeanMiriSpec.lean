@@ -251,7 +251,8 @@ import LeanMiriSpec.Audit
   correspondence (`FrameStackRel`, `CallerDestinationRel`, `CallerStackLinksRel`
   linking `returnTarget`, `isDiverging`, and `returnUnwind`,
   `MultiFrameAllocDisjoint`, `MultiFrameStateRel` / `CallStackStateRel`,
-  `TreeBorrowsStateRel`, `BorrowTrackerStackRel`), bidirectional depth-1 bridges
+  `UnwindingStateRel`, `MiriUnwindSteps`, `TreeBorrowsStateRel`,
+  `BorrowTrackerStackRel`), bidirectional depth-1 bridges
   (`StateRel.iff_multiFrameStateRel_depth1`,
   `TreeBorrowsStateRel.iff_multiFrameStateRel_depth1`), arbitrary-depth `CallId`
   protector lifecycle (`ActiveProtectorsValid`, `ActiveProtectorsValid.push_fresh_callId`,
@@ -261,8 +262,10 @@ import LeanMiriSpec.Audit
   `unwindFromCallStack_running_releaseCallProtectors`,
   `borrowTree_releaseProtector_full_simulation`,
   `basedNormalTree_releaseProtector_chain3_and_branch3_simulation`, and
-  `cex_end_of_call_foreign_unique_frozen_divergence`), and `annealStepHooksLM4_1` /
-  `StepRelMultiFrame`.
+  `cex_end_of_call_foreign_unique_frozen_divergence`), indirect `FnPtr` ABI checks
+  (`annealFnPtrAbiCompatible`, `annealCalleeAbiCompatible`,
+  `annealEvalNonConstCallLM4_1`), and `annealStepHooksLM4_1` /
+  `annealStepHooksForState` / `StepRelMultiFrame`.
 * `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator
   simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
@@ -274,11 +277,20 @@ import LeanMiriSpec.Audit
   `step_terminator_return_callee_simulation`,
   `step_terminator_unwindResume_callee_simulation`,
   `step_terminator_unwindResume_root_panic_vs_ub_divergence`,
+  `unwindFromCallStack_miri_multiStep_simulation`,
+  `step_terminator_unwindResume_multiFrame_simulation`,
+  `step_terminator_unwindTerminate_abort_vs_unsupported`,
+  `step_terminator_assert_local_simulation`,
+  `step_terminator_call_diverging_panic_vs_unlinked`,
   `step_terminator_call_unreachable_unchecked_ub_simulation`,
-  `step_terminator_call_simulation`, and the Stage-1 diverging-call push
-  `step_terminator_call_diverging_simulation`).
+  `step_terminator_call_simulation`,
+  `step_terminator_call_diverging_simulation`,
+  `step_terminator_call_fnDef_local_simulation`,
+  `step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation`,
+  `step_terminator_call_indirect_fnPtr_move_simulation`, and
+  `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`).
 * `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
-  `(a)..(n)` covering multi-frame call/return with `GlobalState.endCall`
+  `(a)..(p)` covering multi-frame call/return with `GlobalState.endCall`
   protector release, `.uninit` `_0` UB, unprojected & projected `Drop` (live vs.
   `.dead` UB on a realistic `ScalarPair` layout, projected-`.uninit` and
   unprojected canonical no-glue `Drop` divergences), `Unreachable` and
@@ -287,7 +299,10 @@ import LeanMiriSpec.Audit
   `move` call arguments, cross-frame `BorrowEntry` scoping divergence,
   diverging caller frame (`isDiverging = true`) return UB, 3-step diverging call
   execution, step-level end-of-call foreign-`Unique` protector-release divergence,
-  and `UnwindResume` cleanup catch vs. `.unreachable` unwind ABI UB.
+  `UnwindResume` cleanup catch / `.unreachable` unwind ABI UB / root `.panic` vs. UB,
+  3-frame `k = 2` `.continue_` unwinding + `UnwindTerminate` + `Assert` + diverging
+  panic calls, and non-constant `FnDef` local + indirect `FnPtr` calls +
+  `Safety` divergence.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
