@@ -47,6 +47,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Every way to pick `chain` as an ordered subsequence of `names`, as increasing
+/// index lists into `names`. A finding records only mutator names, which do not
+/// say which pass was kept when a mutator ran more than once.
+fn ordered_name_embeddings(names: &[&str], chain: &[String]) -> Vec<Vec<usize>> {
+    fn extend(
+        names: &[&str],
+        chain: &[String],
+        from: usize,
+        picked: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        let Some(want) = chain.get(picked.len()) else {
+            out.push(picked.clone());
+            return;
+        };
+        for (i, name) in names.iter().enumerate().skip(from) {
+            if *name == want.as_str() {
+                picked.push(i);
+                extend(names, chain, i + 1, picked, out);
+                picked.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    extend(names, chain, 0, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Checks that every finding of a seeded single-batch run was shrunk against the
 /// live oracle and that its repro-facing artifacts describe the minimized
 /// candidate, returning the number of findings whose chain shrinking reduced.
@@ -83,25 +111,20 @@ fn assert_itree_findings_shrunk(
         );
         let (base, steps) =
             reconstruct_itree_mutation_steps(cand, ITREE_SAFE_SEEDS).expect("replayable candidate");
-        let mut chain_iter = f.minimized_mutator_chain.iter().peekable();
-        let mut kept = Vec::with_capacity(f.minimized_mutator_chain.len());
-        for s in &steps {
-            if chain_iter.peek().is_some_and(|want| *want == &s.mutator_name) {
-                kept.push(s.clone());
-                chain_iter.next();
-            }
-        }
+        let names: Vec<&str> = steps.iter().map(|s| s.mutator_name.as_str()).collect();
+        let embeddings = ordered_name_embeddings(&names, &f.minimized_mutator_chain);
         assert!(
-            chain_iter.peek().is_none(),
+            !embeddings.is_empty(),
             "{}: minimized_mutator_chain {:?} is not an ordered subsequence of {:?}",
             f.finding_id,
             f.minimized_mutator_chain,
             cand.applied_mutators
         );
-        assert_eq!(kept.len(), f.minimized_mutator_chain.len(), "{}", f.finding_id);
-        assert_eq!(
-            f.candidate_source,
-            replay_itree_mutation_steps(cand, &base, &kept).source,
+        assert!(
+            embeddings.iter().any(|kept_idx| {
+                let kept: Vec<_> = kept_idx.iter().map(|&i| steps[i].clone()).collect();
+                replay_itree_mutation_steps(cand, &base, &kept).source == f.candidate_source
+            }),
             "{}: repro.rs must be the minimized candidate's program",
             f.finding_id
         );
@@ -393,7 +416,9 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
         summary_a.findings.len() >= 2,
         "expected findings for both b0_c0 and b0_c1 from MIR mutation"
     );
-    // Shrinking keeps the `.add -> .sub` and `0x5A -> 0x5B` fault injections.
+    // Shrinking keeps both injected faults: the `.add -> .sub` mutation of `b0_c0`
+    // and the `aligned_word` mutation of `b0_c1` apply to every reduction whose
+    // captured MIR still contains the mutated pattern (and are skipped otherwise).
     let reduced_a = assert_itree_findings_shrunk(&summary_a.findings, &batches[0]);
     eprintln!(
         "negative control A: {reduced_a} of {} finding(s) minimized",

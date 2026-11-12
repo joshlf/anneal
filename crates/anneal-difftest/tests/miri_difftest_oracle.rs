@@ -71,6 +71,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Every way to pick `chain` as an ordered subsequence of `names`, as increasing
+/// index lists into `names`. A finding records only mutator names, which do not
+/// say which pass was kept when a mutator ran more than once.
+fn ordered_name_embeddings(names: &[&str], chain: &[String]) -> Vec<Vec<usize>> {
+    fn extend(
+        names: &[&str],
+        chain: &[String],
+        from: usize,
+        picked: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        let Some(want) = chain.get(picked.len()) else {
+            out.push(picked.clone());
+            return;
+        };
+        for (i, name) in names.iter().enumerate().skip(from) {
+            if *name == want.as_str() {
+                picked.push(i);
+                extend(names, chain, i + 1, picked, out);
+                picked.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    extend(names, chain, 0, &mut Vec::new(), &mut out);
+    out
+}
+
 #[test]
 fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     let dir = unique_temp_dir("identity");
@@ -188,6 +216,25 @@ assert len(findings) == 0
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
 
+# `item_outcomes` gives every manifest entry its live per-item outcome (the
+# `known_anneal_bug` ratchet audits manifest entries against it), and every
+# identity item agrees.
+outcomes = data["item_outcomes"]
+manifest_names = {t["name"] for t in manifest["tests"]}
+assert set(outcomes) == manifest_names, sorted(set(outcomes) ^ manifest_names)
+assert len(outcomes) == data["compiled_candidates"], len(outcomes)
+for name, outcome in outcomes.items():
+    assert set(outcome) == {"verdict", "miri_outcome", "anneal_outcome", "anneal_lean_tag"}, (
+        name,
+        outcome,
+    )
+    assert outcome["verdict"] == "agree", (name, outcome)
+    assert outcome["anneal_lean_tag"].startswith(("MirDiffTag.", "(MirDiffTag.")), (name, outcome)
+macro_outcome = outcomes["panic_explicit_macro"]
+assert macro_outcome["miri_outcome"].startswith("panic@"), macro_outcome
+assert macro_outcome["anneal_outcome"].startswith("panic@"), macro_outcome
+assert macro_outcome["anneal_lean_tag"] == "MirDiffTag.panic", macro_outcome
+
 # `panic_explicit_macro` is the only identity candidate whose agreement rests on
 # the panic-macro reconciliation, and Anneal's recovered panic message matched
 # the message that Miri printed.
@@ -300,6 +347,20 @@ for label, d in [("seed1", d1), ("seed2", d2)]:
     assert d.get("unmodeled_external_calls", {}).get("miri_diff_corpus::helper_add_ten", 0) == 0, (
         f"{label} unexpected helper_add_ten skip: {d.get('unmodeled_external_calls')}"
     )
+    # Every compiled candidate has a per-item outcome consistent with the
+    # aggregate counts and the findings.
+    outcomes = d["item_outcomes"]
+    assert len(outcomes) == d["compiled_candidates"], (label, len(outcomes))
+    verdicts = [o["verdict"] for o in outcomes.values()]
+    assert verdicts.count("agree") == d["agree_count"], (label, verdicts)
+    assert verdicts.count("diverge") == d["diverge_count"], (label, verdicts)
+    assert (
+        verdicts.count("not_compared")
+        == d["not_compared_count"] - d["compile_failed_candidates"]
+    ), (label, verdicts)
+    assert {f["fn_name"] for f in d["findings"]} == {
+        name for name, o in outcomes.items() if o["verdict"] == "diverge"
+    }, label
 
 # Seed sensitivity: mutator application counts and Miri/Anneal distributions
 # must change when the seed changes.
@@ -2334,18 +2395,14 @@ fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
 
         let (base, steps) =
             reconstruct_miri_mutation_steps(cand, &seeds).expect("replayable Miri candidate");
-        let mut chain_iter = f.minimized_mutator_chain.iter().peekable();
-        let mut kept = Vec::with_capacity(f.minimized_mutator_chain.len());
-        for s in &steps {
-            if chain_iter.peek().is_some_and(|want| *want == &s.mutator_name) {
-                kept.push(s.clone());
-                chain_iter.next();
-            }
-        }
-        assert!(chain_iter.peek().is_none(), "{}: subsequence order", f.fn_name);
-        assert_eq!(
-            f.mutant_source,
-            replay_miri_mutation_steps(cand, &base, &kept).source,
+        let names: Vec<&str> = steps.iter().map(|s| s.mutator_name.as_str()).collect();
+        let embeddings = ordered_name_embeddings(&names, &f.minimized_mutator_chain);
+        assert!(!embeddings.is_empty(), "{}: subsequence order", f.fn_name);
+        assert!(
+            embeddings.iter().any(|kept_idx| {
+                let kept: Vec<_> = kept_idx.iter().map(|&i| steps[i].clone()).collect();
+                replay_miri_mutation_steps(cand, &base, &kept).source == f.mutant_source
+            }),
             "{}: repro.rs must match replayed minimized chain",
             f.fn_name
         );

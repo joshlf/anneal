@@ -2790,26 +2790,33 @@ where
     )
 }
 
-/// Sequence number that gives each [`itree_candidate_passes_strict_compile`]
-/// call its own `rustc` scratch directories.
-static ITREE_SHRINK_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
-
 /// The compile pre-check that ITree shrinking runs on every replayed reduction
-/// before the trace + Lean oracle: zero `unsafe` tokens, a stageable `kernel_step`
-/// root function, and a clean compile under `#![forbid(unsafe_code)]` at both
-/// `-C opt-level=0` and `-C opt-level=2`, as [`compile_itree_candidates`]
-/// requires of generated candidates.
+/// before the trace + Lean oracle: everything that [`compile_itree_candidates`]
+/// requires of generated candidates (zero `unsafe` tokens, a clean compile under
+/// `#![forbid(unsafe_code)]` at both `-C opt-level=0` and `-C opt-level=2`, and
+/// a clean `anneal-mir-instrument` compile of the
+/// `#[anneal_trace::external]`-annotated copy at both levels), plus a stageable
+/// `kernel_step` root function.
+///
+/// A reduction that fails the pre-check is rejected without an oracle query; one
+/// that passes is a program the batch evaluation would compare, so the oracle
+/// reporting it as not compared is a genuine oracle failure.
 pub fn itree_candidate_passes_strict_compile(cand: &GeneratedItreeCandidate) -> bool {
     if contains_unsafe_token(&cand.source)
         || stage_itree_candidate_items(&cand.source, "shrink__", "kernel_step").is_err()
     {
         return false;
     }
-    let seq = ITREE_SHRINK_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let label = format!("shrink{seq}");
+    let Ok((annotated, _)) = annotate_itree_external_callees(&cand.source, "kernel_step") else {
+        return false;
+    };
     let safe_src = format!("#![forbid(unsafe_code)]\n{}", cand.source);
-    compile_rust_strict_opt(&label, "0", &safe_src)
-        && compile_rust_strict_opt(&label, "2", &safe_src)
+    let inst_src =
+        format!("#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{annotated}");
+    compile_rust_strict_opt("shrink", "0", &safe_src)
+        && compile_rust_strict_opt("shrink", "2", &safe_src)
+        && compile_rust_mir_instrumented("shrink_inst", "0", &inst_src)
+        && compile_rust_mir_instrumented("shrink_inst", "2", &inst_src)
 }
 
 /// Minimize a divergent [`GeneratedItreeCandidate`]'s mutator chain using a
@@ -4275,8 +4282,9 @@ mod tests {
         assert_eq!(res.minimized_candidate, cand);
     }
 
-    /// `minimize_itree_candidate_mutations_with` runs the real strict `-O0` and
-    /// `-O2` compile pre-check (memoized by source) before every oracle query.
+    /// `minimize_itree_candidate_mutations_with` runs the real compile pre-check
+    /// (strict `-O0` and `-O2` plus the instrumented `-O0` and `-O2` compiles that
+    /// batch evaluation requires, memoized by source) before every oracle query.
     #[test]
     fn itree_minimize_with_runs_the_real_strict_compile_precheck() {
         let cand = generated_itree_candidate_with_passes(2);
@@ -4293,6 +4301,17 @@ mod tests {
                                magic ^ payload_len\n}\n"
             .to_string();
         assert!(!itree_candidate_passes_strict_compile(&missing_root));
+        // On programs with a `kernel_step` root, the pre-check accepts exactly
+        // what batch compilation accepts.
+        let batch = vec![cand.clone(), broken.clone(), with_unsafe.clone()];
+        let compiled = compile_itree_candidates(std::slice::from_ref(&batch));
+        assert_eq!(
+            compiled[0]
+                .iter()
+                .map(|c| c.opt0 && c.opt2 && c.instrumented)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
 
         let (base, steps) =
             reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");

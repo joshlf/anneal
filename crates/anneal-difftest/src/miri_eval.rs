@@ -1393,6 +1393,26 @@ pub fn discrepancy_signatures_match(
         && (!original.kernel_confirmed || candidate.kernel_confirmed)
 }
 
+/// Whether the oracle failed to judge the program behind `report`: Miri itself
+/// failed (`NotCompared(MiriOracleError)`), or MIR capture, scaffolding, or the
+/// Lean probe failed (`NotCompared(CaptureFailed)`).
+///
+/// Shrinking counts such a report as an oracle failure, exactly like a pipeline
+/// run that produced no report: the program's behavior is unknown, so the report
+/// neither reproduces nor refutes the discrepancy signature, and treating it as
+/// a rejection could let an unjudged reduction license a 1-minimality claim. The
+/// other `NotCompared` reasons (an uninterpreted external call, an unsupported
+/// construct, or exhausted step fuel) are deterministic judgments of the program
+/// by Anneal under the original fuel, and they rule the signature out.
+pub fn miri_report_is_oracle_failure(report: &ItemOracleReport) -> bool {
+    matches!(
+        report.verdict,
+        ComparisonVerdict::NotCompared(
+            NotComparedReason::MiriOracleError(_) | NotComparedReason::CaptureFailed(_)
+        )
+    )
+}
+
 /// Outcome of attempting to shrink a divergent Miri candidate's mutator chain.
 pub type MiriShrinkStatus = MutatorChainShrinkStatus;
 
@@ -1419,9 +1439,10 @@ pub struct MiriCandidateShrinkResult {
     /// `oracle_evaluations` unless the evaluator is memoized ([`MemoizedOracle`]),
     /// in which case repeated queries of an identical program are cache hits.
     pub executed_oracle_runs: usize,
-    /// Number of oracle queries that produced no report (for example a failed
-    /// live pipeline run). Any failure makes `status`
-    /// [`MutatorChainShrinkStatus::Inconclusive`].
+    /// Number of oracle queries that produced no judgment: no report at all (for
+    /// example a failed live pipeline run) or a report whose verdict is an
+    /// oracle failure ([`miri_report_is_oracle_failure`]). Any failure makes
+    /// `status` [`MutatorChainShrinkStatus::Inconclusive`].
     pub oracle_failures: usize,
     /// Whether shrinking ran and what it concluded.
     pub status: MiriShrinkStatus,
@@ -1509,8 +1530,11 @@ where
 /// Shrinking runs [`shrink_mutation_chain_detailed`] over the candidate's
 /// recorded mutation passes ([`reconstruct_miri_mutation_steps`] over `seeds`,
 /// the seeds the candidate was generated from) with the predicate "the replayed
-/// subsequence compiles, the oracle returns a report, and
-/// [`discrepancy_signatures_match`] holds against `original_report`". The
+/// subsequence compiles, the oracle judges it, and
+/// [`discrepancy_signatures_match`] holds against `original_report`". A query
+/// that returns no report, or a report of an oracle failure
+/// ([`miri_report_is_oracle_failure`]), is rejected and counted in
+/// `oracle_failures`, which withholds any 1-minimality claim. The
 /// unmutated seed `[]` is evaluated like any other subsequence, so a seed that
 /// already diverges with the same signature shrinks to `[]`. Shrinking is
 /// skipped (status `SkippedReplayMismatch`, with no compile check or oracle
@@ -1571,7 +1595,8 @@ where
             return false;
         }
         oracle_evaluations += 1;
-        let Some(rep) = eval_fn(&sub_cand) else {
+        let Some(rep) = eval_fn(&sub_cand).filter(|rep| !miri_report_is_oracle_failure(rep))
+        else {
             oracle_failures += 1;
             return false;
         };
@@ -1723,6 +1748,15 @@ pub fn minimize_miri_candidate_mutations(
                 return None;
             }
         };
+        if miri_report_is_oracle_failure(&live.report) {
+            let verdict = format!("{:?}", live.report.verdict);
+            eprintln!(
+                "miri-difftest: shrink oracle could not judge `{}` ({} mutators): {}",
+                sub_cand.fn_name,
+                sub_cand.applied_mutators.len(),
+                verdict.chars().take(400).collect::<String>()
+            );
+        }
         if discrepancy_signatures_match(original_report, &live.report) {
             artifacts_by_source.insert(
                 sub_cand.fn_source.clone(),
@@ -5452,6 +5486,147 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         assert_eq!(res.oracle_failures, res.oracle_evaluations);
         assert_eq!(res.minimized_candidate, cand);
         assert_eq!(res.minimized_report, original);
+    }
+
+    /// Report of a program that the oracle did not compare for `reason`, with
+    /// Miri and Anneal outcomes that `compare_miri_and_anneal` maps to exactly
+    /// that verdict.
+    fn not_compared_report(name: &str, reason: &NotComparedReason) -> ItemOracleReport {
+        let (miri, anneal) = match reason {
+            NotComparedReason::MiriOracleError(msg) => {
+                (MiriOutcome::OracleError(msg.clone()), AnnealOutcome::PassUnit)
+            }
+            NotComparedReason::CaptureFailed(msg) => (
+                MiriOutcome::PassUnit,
+                AnnealOutcome::CaptureOrLeanError(msg.clone()),
+            ),
+            NotComparedReason::ExternalCall(def_path) => (
+                MiriOutcome::PassUnit,
+                AnnealOutcome::ExternalCall {
+                    def_path: def_path.clone(),
+                    span: None,
+                },
+            ),
+            NotComparedReason::Unsupported(span) => (
+                MiriOutcome::PassUnit,
+                AnnealOutcome::Unsupported { span: span.clone() },
+            ),
+            NotComparedReason::OutOfFuel(span) => (
+                MiriOutcome::PassUnit,
+                AnnealOutcome::OutOfFuel { span: span.clone() },
+            ),
+        };
+        let verdict = compare_miri_and_anneal(&miri, &anneal);
+        assert_eq!(verdict, ComparisonVerdict::NotCompared(reason.clone()));
+        ItemOracleReport {
+            name: name.to_string(),
+            fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+            miri,
+            anneal,
+            verdict,
+            kernel_confirmed: false,
+        }
+    }
+
+    /// A report of an oracle failure (Miri or the capture / Lean pipeline
+    /// failed) counts as an oracle failure, like a missing report, so it never
+    /// licenses a 1-minimality claim. Anneal's deterministic `NotCompared`
+    /// judgments (an external call, an unsupported construct, exhausted fuel)
+    /// rule the signature out and stay ordinary rejections.
+    #[test]
+    fn not_compared_oracle_errors_are_failures_and_anneal_judgments_are_rejections() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand, subsets) = find_candidate_with_distinct_subsets(2, &seed_refs);
+        let msg = "constructing invalid value: encountered 0x02, but expected a boolean";
+        let original = missed_ub_report(&cand.fn_name, 50, msg, AnnealOutcome::PassUnit, true);
+        let failures = [
+            NotComparedReason::MiriOracleError("Miri did not emit 'MIRI_START'".to_string()),
+            NotComparedReason::CaptureFailed("Lean probe execution failed".to_string()),
+        ];
+        let judgments = [
+            NotComparedReason::ExternalCall("core::intrinsics::exact_div".to_string()),
+            NotComparedReason::Unsupported(Some(lib_span(40))),
+            NotComparedReason::OutOfFuel(Some(lib_span(41))),
+        ];
+        for reason in failures.iter().chain(&judgments) {
+            let is_failure = failures.contains(reason);
+            let report = not_compared_report(&cand.fn_name, reason);
+            assert_eq!(miri_report_is_oracle_failure(&report), is_failure, "{reason:?}");
+
+            // `[]` is not compared, `{1}` reproduces the signature, and `{0}`
+            // agrees.
+            let res = minimize_miri_candidate_mutations_with_compile_check(
+                &cand,
+                &seed_refs,
+                &original,
+                |_| true,
+                |sub| {
+                    Some(match subsets[&sub.fn_source] {
+                        0b00 => not_compared_report(&sub.fn_name, reason),
+                        0b10 => missed_ub_report(
+                            &sub.fn_name,
+                            31,
+                            msg,
+                            AnnealOutcome::PassUnit,
+                            true,
+                        ),
+                        _ => agree_report(&sub.fn_name),
+                    })
+                },
+            );
+            assert!(res.is_reduced(), "{reason:?}");
+            assert_eq!(res.minimized_mutator_chain, vec![cand.applied_mutators[1].clone()]);
+            assert_eq!(subsets[&res.minimized_candidate.fn_source], 0b10);
+            assert_eq!((res.shrink_evaluations, res.oracle_evaluations), (2, 2), "{reason:?}");
+            if is_failure {
+                assert_eq!(res.status, MiriShrinkStatus::Inconclusive, "{reason:?}");
+                assert_eq!(res.oracle_failures, 1, "{reason:?}");
+            } else {
+                assert_eq!(res.status, MiriShrinkStatus::Minimized, "{reason:?}");
+                assert_eq!(res.oracle_failures, 0, "{reason:?}");
+            }
+        }
+    }
+
+    /// `"item_outcomes"` maps every evaluated item, in report order, to its
+    /// verdict, Miri and Anneal outcome tags, and Lean `MirDiffTag` (`"none"`
+    /// when the Anneal side failed), with JSON-escaped strings.
+    #[test]
+    fn item_outcomes_json_maps_each_item_to_its_verdict_and_outcome_tags() {
+        assert_eq!(render_item_outcomes_json(&[]), "{}");
+        let msg = "constructing invalid value: encountered 0x02, but expected a boolean";
+        let reports = [
+            agree_report("agree_fn"),
+            missed_ub_report(
+                "diverge_fn",
+                12,
+                msg,
+                AnnealOutcome::PassScalar {
+                    bits: 2,
+                    size_bytes: 1,
+                },
+                true,
+            ),
+            not_compared_report(
+                "external_fn",
+                &NotComparedReason::ExternalCall("core::intrinsics::exact_div".to_string()),
+            ),
+            not_compared_report(
+                "capture_fn",
+                &NotComparedReason::CaptureFailed("`lake build` failed: \"x\"".to_string()),
+            ),
+        ];
+        let expected_rows = [
+            r#"    "agree_fn": {"verdict": "agree", "miri_outcome": "pass:scalar:10:4", "anneal_outcome": "pass:scalar:10:4", "anneal_lean_tag": "(MirDiffTag.normalScalar 10 4)"}"#,
+            r#"    "diverge_fn": {"verdict": "diverge", "miri_outcome": "ub@src/lib.rs:12:14", "anneal_outcome": "pass:scalar:2:1", "anneal_lean_tag": "(MirDiffTag.normalScalar 2 1)"}"#,
+            r#"    "external_fn": {"verdict": "not_compared", "miri_outcome": "pass:unit", "anneal_outcome": "externalCall:core::intrinsics::exact_div", "anneal_lean_tag": "(MirDiffTag.externalCall \"core::intrinsics::exact_div\")"}"#,
+            r#"    "capture_fn": {"verdict": "not_compared", "miri_outcome": "pass:unit", "anneal_outcome": "capture_error:`lake build` failed: \"x\"", "anneal_lean_tag": "none"}"#,
+        ];
+        assert_eq!(
+            render_item_outcomes_json(&reports),
+            format!("{{\n{}\n  }}", expected_rows.join(",\n"))
+        );
     }
 
     #[test]

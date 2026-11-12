@@ -70,10 +70,10 @@ pub use miri_eval::{
     compile_candidates, compile_rust_snippet, discrepancy_signatures_match, divergence_class_slug,
     evaluate_candidate_live, evaluate_miri_batches, evaluate_miri_batches_with_options,
     json_escape, minimize_miri_candidate_mutations, minimize_miri_candidate_mutations_with,
-    minimize_miri_candidate_mutations_with_compile_check, normalize_anneal_outcome_tag,
-    normalize_diagnostic_message, normalize_miri_outcome_family, render_eval_report_json,
-    render_eval_report_markdown, render_finding_bundle_json, reproduce_miri_finding,
-    resolve_rustc_bin,
+    minimize_miri_candidate_mutations_with_compile_check, miri_report_is_oracle_failure,
+    normalize_anneal_outcome_tag, normalize_diagnostic_message, normalize_miri_outcome_family,
+    render_eval_report_json, render_eval_report_markdown, render_finding_bundle_json,
+    reproduce_miri_finding, resolve_rustc_bin,
 };
 pub use mutators_itree::{
     BranchLoopWeaver, CallBoundaryOutliner, ExtOracleInjector, GeneratedItreeCandidate,
