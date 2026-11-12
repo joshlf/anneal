@@ -23,8 +23,8 @@
 use std::cmp::Ordering;
 
 use crate::ir::{
-    AdtKind, BinOp, IntTy, IntrinsicOp, LayoutError, Mutability, PointerValue, PtrWidth, Ty,
-    TyLayout, UintTy, sign_extend_bits, width_mask,
+    AdtKind, BinOp, IntTy, IntrinsicOp, LayoutError, Mutability, PointerValue, PtrWidth, ScalarTy,
+    Ty, TyLayout, UintTy, sign_extend_bits, width_mask,
 };
 use crate::lower::cast::cast_eval_layout_error;
 use crate::lower::rvalue::{
@@ -99,30 +99,33 @@ const COPY_SIGNATURE: &str =
     "copy_nonoverlapping requires (*const T | &T, *mut T | &mut T, usize) -> ()";
 const WRITE_BYTES_SIGNATURE: &str = "write_bytes requires (*mut T | &mut T, u8, usize) -> ()";
 
-/// Variant of the `Ordering`-shaped enum `ty` whose discriminant is `code`: an enum with
-/// exactly three fieldless variants whose signed discriminants are `-1`, `0`, and `1` (as
-/// `core::cmp::Ordering`, `#[repr(i8)] enum { Less = -1, Equal = 0, Greater = 1 }`). `None`
-/// if `ty` is not such an enum. The shape is recognized structurally, never by `DefPath`.
+/// Variant of the `Ordering`-shaped enum `ty` whose discriminant is `code`: a valid 1-byte
+/// `#[repr(i8)]` enum (`TyLayout { size: 1, align: 1 }`) with explicit `i8` tag, no niche
+/// range, and exactly three fieldless variants whose signed discriminants are `-1`, `0`, and
+/// `1` (as `core::cmp::Ordering`, `#[repr(i8)] enum { Less = -1, Equal = 0, Greater = 1 }`).
+/// `None` if `ty` is not such an enum. The shape is recognized structurally, never by
+/// `DefPath`.
 pub fn ordering_variant(ty: &Ty, code: i8, ptr_width: PtrWidth) -> Option<usize> {
     let Ty::Adt(def) = ty else {
         return None;
     };
-    let AdtKind::Enum { variants, .. } = &def.kind else {
+    let AdtKind::Enum { tag_ty, variants } = &def.kind else {
         return None;
     };
-    if variants.len() != 3 || variants.iter().any(|v| !v.fields.is_empty()) {
+    if *tag_ty != Some(ScalarTy::Int(IntTy::I8))
+        || variants.len() != 3
+        || variants.iter().any(|v| !v.fields.is_empty())
+    {
         return None;
     }
-    let discr_ty = def.discr_ty();
-    if !discr_ty.is_signed_int() {
+    if ty.layout_for(ptr_width) != Ok(TyLayout { size: 1, align: 1 }) {
         return None;
     }
-    let width = discr_ty.scalar_bit_width(ptr_width)?;
     let values: Vec<i128> = def
         .discriminants(ptr_width)
         .ok()?
         .iter()
-        .map(|bits| sign_extend_bits(*bits, width))
+        .map(|bits| sign_extend_bits(*bits, 8))
         .collect();
     let mut sorted = values.clone();
     sorted.sort_unstable();

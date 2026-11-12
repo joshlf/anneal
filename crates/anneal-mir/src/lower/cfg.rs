@@ -112,7 +112,10 @@ pub enum TerminatorLowerError {
     CleanupEntryBlock,
     /// `Call` of the inline intrinsic `op` whose argument or destination types do not match
     /// `op`'s signature (see [`IntrinsicOp`] and [`check_intrinsic_call_types`]).
-    InvalidIntrinsicCall { op: IntrinsicOp, reason: &'static str },
+    InvalidIntrinsicCall {
+        op: IntrinsicOp,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for TerminatorLowerError {
@@ -645,7 +648,10 @@ impl std::fmt::Display for CfgEvalError {
                 )
             }
             CfgEvalError::UnknownCallee { bb, callee } => {
-                write!(f, "bb{bb} calls `{callee}`, which is not linked in the call table")
+                write!(
+                    f,
+                    "bb{bb} calls `{callee}`, which is not linked in the call table"
+                )
             }
             CfgEvalError::CallDepthExceeded { bb, max_call_depth } => {
                 write!(
@@ -717,22 +723,23 @@ enum PanicFlow {
     Done(CfgEvalOutcome),
 }
 
-/// Applies the unwind action `unwind` to a panic `msg` raised in block `bb`.
+/// Applies the unwind action `unwind` to a panic `msg` raised in block `bb`, validating
+/// `unwind` against `basic_blocks` before updating `unwinding` so a failed `Cleanup` edge
+/// never leaves `unwinding` partially mutated.
 fn start_panic(
     bb: usize,
     msg: PanicMessage,
     unwind: UnwindAction,
+    basic_blocks: &[LoweredBasicBlock],
     unwinding: &mut UnwindState,
 ) -> Result<PanicFlow, CfgEvalError> {
+    check_unwind_action(bb, unwind, unwinding.is_some(), basic_blocks)?;
     match unwind {
         UnwindAction::Unreachable => Err(CfgEvalError::UnwindIntoUnreachable {
             bb,
             msg: Box::new(msg),
         }),
         UnwindAction::Terminate => Ok(PanicFlow::Done(CfgEvalOutcome::Terminated { bb, msg })),
-        UnwindAction::Continue | UnwindAction::Cleanup(_) if unwinding.is_some() => {
-            Err(CfgEvalError::InvalidUnwind { bb })
-        }
         UnwindAction::Continue => Ok(PanicFlow::Done(CfgEvalOutcome::Panicked { bb, msg })),
         UnwindAction::Cleanup(target) => {
             *unwinding = Some((bb, msg));
@@ -851,9 +858,10 @@ fn check_unwind_action(
         UnwindAction::Cleanup(_) if in_cleanup => Err(CfgEvalError::InvalidUnwind { bb }),
         UnwindAction::Cleanup(target) => match basic_blocks.get(target) {
             None => Err(CfgEvalError::InvalidBlock { bb: target }),
-            Some(target_block) if !target_block.is_cleanup => {
-                Err(CfgEvalError::InvalidEdge { from: bb, to: target })
-            }
+            Some(target_block) if !target_block.is_cleanup => Err(CfgEvalError::InvalidEdge {
+                from: bb,
+                to: target,
+            }),
             Some(_) => Ok(()),
         },
     }
@@ -974,7 +982,7 @@ pub fn eval_lowered_terminator(
                 *target
             } else {
                 let panic_msg = eval_panic_message(msg, state).map_err(term_err)?;
-                match start_panic(bb, panic_msg, *unwind, unwinding)? {
+                match start_panic(bb, panic_msg, *unwind, &body.basic_blocks, unwinding)? {
                     PanicFlow::Cleanup(target) => target,
                     PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
                 }
@@ -1007,7 +1015,9 @@ pub fn eval_lowered_terminator(
             )?;
             if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
                 let op = *op;
-                match eval_intrinsic_call(op, &arg_vals, arg_tys, dest_ty, state).map_err(term_err)? {
+                match eval_intrinsic_call(op, &arg_vals, arg_tys, dest_ty, state)
+                    .map_err(term_err)?
+                {
                     IntrinsicOutcome::Return(ret_val) => complete_call_return(
                         body,
                         bb,
@@ -1034,7 +1044,13 @@ pub fn eval_lowered_terminator(
                         }));
                     }
                     IntrinsicOutcome::Panic => {
-                        match start_panic(bb, PanicMessage::Intrinsic(op), *unwind, unwinding)? {
+                        match start_panic(
+                            bb,
+                            PanicMessage::Intrinsic(op),
+                            *unwind,
+                            &body.basic_blocks,
+                            unwinding,
+                        )? {
                             PanicFlow::Cleanup(target) => target,
                             PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
                         }
@@ -1060,7 +1076,13 @@ pub fn eval_lowered_terminator(
                         state,
                     )?,
                     CallOutcome::Panic(text) => {
-                        match start_panic(bb, PanicMessage::Custom(text), *unwind, unwinding)? {
+                        match start_panic(
+                            bb,
+                            PanicMessage::Custom(text),
+                            *unwind,
+                            &body.basic_blocks,
+                            unwinding,
+                        )? {
                             PanicFlow::Cleanup(target) => target,
                             PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
                         }
@@ -1240,9 +1262,26 @@ fn frame_local_pointer(val: &MirValue, limit: usize) -> Option<PointerValue> {
         MirValue::Array { elements, .. } => elements
             .iter()
             .find_map(|element| frame_local_pointer(element, limit)),
-        MirValue::Tuple(fields) | MirValue::Adt { fields, .. } => fields
+        MirValue::Tuple(fields)
+        | MirValue::Adt {
+            active_field: None,
+            fields,
+            ..
+        } => fields
             .iter()
             .find_map(|field| frame_local_pointer(field, limit)),
+        MirValue::Adt {
+            active_field: Some(active),
+            fields,
+            ..
+        } => {
+            let active_val = if fields.len() == 1 {
+                fields.first()
+            } else {
+                fields.get(*active)
+            };
+            active_val.and_then(|field| frame_local_pointer(field, limit))
+        }
         MirValue::Int { .. } | MirValue::Bool(_) | MirValue::Char(_) | MirValue::Unit => None,
     }
 }
@@ -1326,8 +1365,10 @@ pub struct LinkedCallee {
 /// - **Arguments.** After the caller has evaluated the callee, the arguments, and the
 ///   destination exactly as for any call, the callee frame starts with `_1..=arg_count` set to
 ///   the arguments, which must match the parameter types and be well formed; the argument
-///   count must be `arg_count`, the callee's return type the destination's type, and its
-///   pointer width the caller's (`Terminator` errors of the calling block otherwise).
+///   count must be `arg_count`, the callee's return type must match the destination's type (or,
+///   on a diverging `target: None` call, be uninhabited, e.g. `-> !` coerced into an inhabited
+///   caller destination), and its pointer width must match the caller's (`Terminator` errors of
+///   the calling block otherwise).
 /// - **Fuel.** All frames share one fuel counter: every block executed in any frame consumes
 ///   one unit, so the whole call tree executes at most `fuel` blocks; when it runs out inside a
 ///   callee, the evaluation ends with [`CfgEvalOutcome::OutOfFuel`] at the evaluated body's
@@ -1534,11 +1575,8 @@ fn run_block<'a>(
         return Err(CfgEvalError::InvalidBlock { bb });
     };
     for (index, stmt) in block.statements.iter().enumerate() {
-        eval_lowered_statement(stmt, &mut frame.state).map_err(|error| CfgEvalError::Statement {
-            bb,
-            index,
-            error,
-        })?;
+        eval_lowered_statement(stmt, &mut frame.state)
+            .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
     }
     let Some(term) = &block.terminator else {
         return Err(CfgEvalError::MissingTerminator { bb });
@@ -1633,12 +1671,14 @@ fn in_frames(frames: &[Frame<'_>], frame_index: usize, error: CfgEvalError) -> C
 }
 
 /// Creates the state of a frame of the linked `callee` called from `caller` with `args`
-/// (into a destination of type `dest_ty`); see [`CallTable`].
+/// (into a destination of type `dest_ty`, with a return target iff `has_return_target`); see
+/// [`CallTable`].
 fn enter_callee(
     caller: &Frame<'_>,
     callee: &LinkedCallee,
     args: &[MirValue],
     dest_ty: &Ty,
+    has_return_target: bool,
 ) -> Result<StatementEvalState, RvalueEvalError> {
     if callee.body.ptr_width != caller.body.ptr_width {
         return Err(RvalueEvalError::TypeMismatch(
@@ -1650,7 +1690,14 @@ fn enter_callee(
             "argument count does not match the linked callee's arg_count",
         ));
     }
-    if callee.body.local_decls.first() != Some(dest_ty) {
+    let Some(callee_ret_ty) = callee.body.local_decls.first() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "linked callee body has no return local _0",
+        ));
+    };
+    let ret_ty_compatible = callee_ret_ty == dest_ty
+        || (!has_return_target && !callee_ret_ty.is_inhabited_for(caller.body.ptr_width));
+    if !ret_ty_compatible {
         return Err(RvalueEvalError::TypeMismatch(
             "linked callee return type does not match the call destination type",
         ));
@@ -1664,7 +1711,9 @@ fn enter_callee(
         .iter()
         .any(|arg| frame_local_pointer(arg, limit).is_some())
     {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(CROSS_FRAME_POINTER));
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(
+            CROSS_FRAME_POINTER,
+        ));
     }
     let mut state = StatementEvalState::from_body(&callee.body, args)?;
     state.policy = caller.state.policy;
@@ -1757,11 +1806,21 @@ fn eval_frames<'a>(
                         },
                     ));
                 }
-                let callee_state = match enter_callee(&frames[top], callee, &args, &pending.dest_ty) {
+                let callee_state = match enter_callee(
+                    &frames[top],
+                    callee,
+                    &args,
+                    &pending.dest_ty,
+                    pending.target.is_some(),
+                ) {
                     Ok(callee_state) => callee_state,
                     Err(error) => {
                         let bb = pending.site.bb;
-                        return Err(in_frames(&frames, top, CfgEvalError::Terminator { bb, error }));
+                        return Err(in_frames(
+                            &frames,
+                            top,
+                            CfgEvalError::Terminator { bb, error },
+                        ));
                     }
                 };
                 frames[top].pending = Some(pending);
@@ -1833,7 +1892,13 @@ fn eval_frames<'a>(
                         })
                     }
                     CfgEvalOutcome::Panicked { msg, .. } => {
-                        match start_panic(bb, msg, pending.unwind, &mut caller.unwinding) {
+                        match start_panic(
+                            bb,
+                            msg,
+                            pending.unwind,
+                            &caller.body.basic_blocks,
+                            &mut caller.unwinding,
+                        ) {
                             Ok(PanicFlow::Cleanup(cleanup)) => {
                                 check_goto(caller.body, bb, cleanup, &caller.unwinding).map(
                                     |next| {

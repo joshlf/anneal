@@ -11308,27 +11308,13 @@ pub(crate) fn write_bytes_values(
         return Ok(());
     }
     let local_count = state.slots.len().min(state.local_decls.len());
+    let dst_alloc_local = resolve_synthetic_alloc_local(&dst_ptr, local_count);
     if (byte_len > 0 || count == 1)
-        && let Some(idx) = resolve_synthetic_alloc_local(&dst_ptr, local_count)
+        && let Some(idx) = dst_alloc_local
         && matches!(state.slots[idx], LocalSlotState::Dead)
     {
         return Err(RvalueEvalError::DeadLocal(Local(idx)));
     }
-    let elem_val = if elem_ty.has_canonical_byte_layout(ptr_width) {
-        let bytes = vec![AbstractByte::new(byte as u8); elem_size];
-        decode_mir_value(&bytes, elem_ty, ptr_width).map_err(|err| match err {
-            RvalueEvalError::CastEval(
-                CastEvalError::InvalidBitPattern { .. } | CastEvalError::UninhabitedTarget { .. },
-            ) => RvalueEvalError::UnsupportedMemoryAccess(
-                "write_bytes stores bytes that are not a valid value of the element type",
-            ),
-            other => other,
-        })?
-    } else {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(
-            "write_bytes into an element type without a canonical byte layout",
-        ));
-    };
     let dummy_place = Place::from_local(0);
     let dst_ptr_ty = dst_val.ty();
     let dst_resolved = state.resolve_synthetic_subplace_with_mode(
@@ -11338,11 +11324,24 @@ pub(crate) fn write_bytes_values(
         &dummy_place,
         true,
     );
-    let unresolved_zst_no_op = byte_len == 0
-        && resolve_synthetic_alloc_local(&dst_ptr, local_count).is_none();
-    // A zero-byte write (`count > 1`, zero-sized elements) stores into the single resolved
-    // sub-place all `count` elements share, exactly as `count == 1` does.
-    if count == 1 || byte_len == 0 {
+    let decode_elem = || -> Result<MirValue, RvalueEvalError> {
+        if !elem_ty.has_canonical_byte_layout(ptr_width) {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes into an element type without a canonical byte layout",
+            ));
+        }
+        let bytes = vec![AbstractByte::new(byte as u8); elem_size];
+        decode_mir_value(&bytes, elem_ty, ptr_width).map_err(|err| match err {
+            RvalueEvalError::CastEval(
+                CastEvalError::InvalidBitPattern { .. } | CastEvalError::UninhabitedTarget { .. },
+            ) => RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes stores bytes that are not a valid value of the element type",
+            ),
+            other => other,
+        })
+    };
+
+    if count == 1 {
         return match dst_resolved {
             Ok((dst_local, dst_proj)) => {
                 // As for `copy_nonoverlapping`: a single element written into part of an
@@ -11367,6 +11366,10 @@ pub(crate) fn write_bytes_values(
                 {
                     return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
                 }
+                if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+                    return Ok(());
+                }
+                let elem_val = decode_elem()?;
                 state.write_subplace_slot(
                     dst_local,
                     &dst_proj,
@@ -11376,22 +11379,21 @@ pub(crate) fn write_bytes_values(
                     &dummy_place,
                 )
             }
-            Err(_) if unresolved_zst_no_op => Ok(()),
             Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => {
                 Err(err)
             }
+            Err(_) if byte_len == 0 && dst_alloc_local.is_none() => Ok(()),
             Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
         };
     }
-    // `count > 1` non-zero-sized elements: a contiguous window of array elements.
-    let (dst_local, dst_elem_proj) = match dst_resolved {
-        Ok(resolved) => resolved,
-        Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => {
-            return Err(err);
-        }
-        Err(_) => return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
-    };
-    let Some((
+
+    // `count > 1`: first handle a resolved contiguous window of array elements (including
+    // zero-sized element arrays such as `[(); N]`, matching `copy_nonoverlapping_values`).
+    if let (Ok((dst_local, dst_elem_proj)), Ok(count_u64), Ok(count_usize)) = (
+        dst_resolved.as_ref(),
+        u64::try_from(count),
+        usize::try_from(count),
+    ) && let Some((
         &ProjectionElem::ConstantIndex {
             offset: dst_start,
             min_length: dst_len,
@@ -11399,56 +11401,106 @@ pub(crate) fn write_bytes_values(
         },
         dst_arr_proj,
     )) = dst_elem_proj.split_last()
-    else {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
-    };
-    let (Ok(count_u64), Ok(count_usize), Ok(dst_len_usize)) = (
-        u64::try_from(count),
-        usize::try_from(count),
-        usize::try_from(dst_len),
-    ) else {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
-    };
-    let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len) else {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
-    };
-    if count_usize > MAX_EVAL_ARRAY_LEN {
-        return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
-    }
-    // Overwriting only part of an inactive union array field is unsupported without a byte
-    // memory model; overwriting the entire field switches the union's active field.
-    if (dst_start != 0 || count_usize != dst_len_usize)
-        && !slot_union_path_active(&state.slots[dst_local.0], dst_arr_proj, false)
+        && let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len)
+        && let Ok(dst_len_usize) = usize::try_from(dst_len)
     {
-        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+        let dst_local = *dst_local;
+        if count_usize > MAX_EVAL_ARRAY_LEN {
+            return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
+        }
+        // Overwriting only part of an inactive union array field is unsupported without a byte
+        // memory model; overwriting the entire field switches the union's active field.
+        if (dst_start != 0 || count_usize != dst_len_usize)
+            && !slot_union_path_active(&state.slots[dst_local.0], dst_arr_proj, false)
+        {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+        }
+        if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+            return Ok(());
+        }
+        let elem_val = decode_elem()?;
+        let window = MirValue::Array {
+            elements: vec![elem_val; count_usize],
+            elem_ty: elem_ty.clone(),
+        };
+        if dst_start == 0 && count_usize == dst_len_usize {
+            let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+            return state.write_subplace_slot(
+                dst_local,
+                dst_arr_proj,
+                &arr_ty,
+                FieldSlot::Init(window),
+                dst_local,
+                &dummy_place,
+            );
+        }
+        let mut dst_slice_proj = dst_arr_proj.to_vec();
+        dst_slice_proj.push(ProjectionElem::Subslice {
+            from: dst_start,
+            to: dst_end,
+            from_end: false,
+        });
+        let dst_slice_place = Place {
+            local: dst_local,
+            projection: dst_slice_proj,
+        };
+        let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
+        return state.write_place(&dst_slice_place, &slice_ty, window);
     }
-    let window = MirValue::Array {
-        elements: vec![elem_val; count_usize],
-        elem_ty: elem_ty.clone(),
-    };
-    if dst_start == 0 && count_usize == dst_len_usize {
-        let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
-        return state.write_subplace_slot(
-            dst_local,
-            dst_arr_proj,
-            &arr_ty,
-            FieldSlot::Init(window),
-            dst_local,
-            &dummy_place,
-        );
+
+    // Zero-byte `count > 1` write outside an in-bounds array window: writes into a resolved
+    // single ZST sub-place (e.g. a bare `()` local or `[(); 1]`), while leaving uninhabited
+    // ZSTs, storage-dead ZST bulk writes, and external non-null ZST pointers as no-ops.
+    if byte_len == 0 {
+        return match dst_resolved {
+            Ok((dst_local, dst_proj)) => {
+                let mut whole_dst_proj = dst_proj.as_slice();
+                while let Some((
+                    ProjectionElem::ConstantIndex {
+                        offset: 0,
+                        min_length: 1,
+                        from_end: false,
+                    },
+                    prefix,
+                )) = whole_dst_proj.split_last()
+                {
+                    whole_dst_proj = prefix;
+                }
+                if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
+                    && matches!(
+                        whole_dst_proj.last(),
+                        Some(ProjectionElem::ConstantIndex { .. })
+                    )
+                {
+                    return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+                }
+                if !elem_ty.is_inhabited_for(ptr_width) {
+                    return Ok(());
+                }
+                let elem_val = decode_elem()?;
+                state.write_subplace_slot(
+                    dst_local,
+                    &dst_proj,
+                    elem_ty,
+                    FieldSlot::Init(elem_val),
+                    dst_local,
+                    &dummy_place,
+                )
+            }
+            Err(RvalueEvalError::DeadLocal(_)) => Ok(()),
+            Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => {
+                Err(err)
+            }
+            Err(_) if dst_alloc_local.is_none() => Ok(()),
+            Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
+        };
     }
-    let mut dst_slice_proj = dst_arr_proj.to_vec();
-    dst_slice_proj.push(ProjectionElem::Subslice {
-        from: dst_start,
-        to: dst_end,
-        from_end: false,
-    });
-    let dst_slice_place = Place {
-        local: dst_local,
-        projection: dst_slice_proj,
-    };
-    let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
-    state.write_place(&dst_slice_place, &slice_ty, window)
+
+    match dst_resolved {
+        Ok(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
+        Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => Err(err),
+        Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
+    }
 }
 
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.

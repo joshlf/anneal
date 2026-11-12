@@ -3232,3 +3232,761 @@ fn test_call_table_entry_points_validate_the_initial_state_and_block() {
         Err(CfgEvalError::InvalidArguments(_))
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial Round B1 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b1_ordering_variant_rejects_tagless_wider_padded_and_ill_formed_enums() {
+    let variants_for_width = |w: u32| {
+        let neg_one = width_mask(w);
+        vec![
+            VariantDef::new("Less", vec![]).with_discriminant(neg_one),
+            VariantDef::new("Equal", vec![]).with_discriminant(0),
+            VariantDef::new("Greater", vec![]).with_discriminant(1),
+        ]
+    };
+
+    for pw in PWS {
+        let isize_w = width(&isize_ty(), pw);
+        let tagless = AdtDef::new_enum("TaglessOrd", None, variants_for_width(isize_w)).into_ty();
+        let i16_ord = AdtDef::new_enum(
+            "I16Ord",
+            Some(ScalarTy::Int(IntTy::I16)),
+            variants_for_width(16),
+        )
+        .into_ty();
+        let i32_ord = AdtDef::new_enum(
+            "I32Ord",
+            Some(ScalarTy::Int(IntTy::I32)),
+            variants_for_width(32),
+        )
+        .into_ty();
+        let i64_ord = AdtDef::new_enum(
+            "I64Ord",
+            Some(ScalarTy::Int(IntTy::I64)),
+            variants_for_width(64),
+        )
+        .into_ty();
+        let i128_ord = AdtDef::new_enum(
+            "I128Ord",
+            Some(ScalarTy::Int(IntTy::I128)),
+            variants_for_width(128),
+        )
+        .into_ty();
+        let isize_ord = AdtDef::new_enum(
+            "IsizeOrd",
+            Some(ScalarTy::Int(IntTy::Isize)),
+            variants_for_width(isize_w),
+        )
+        .into_ty();
+        let mut padded_def = AdtDef::new_enum(
+            "PaddedOrd",
+            Some(ScalarTy::Int(IntTy::I8)),
+            variants_for_width(8),
+        );
+        padded_def.repr.align = Some(4);
+        let padded_ord = padded_def.into_ty();
+
+        let mut transparent_def = AdtDef::new_enum(
+            "TransparentOrd",
+            Some(ScalarTy::Int(IntTy::I8)),
+            variants_for_width(8),
+        );
+        transparent_def.repr = AdtRepr::transparent();
+        let transparent_ord = transparent_def.into_ty();
+
+        let mut niche_enum_def = AdtDef::new_enum(
+            "NicheEnumOrd",
+            Some(ScalarTy::Int(IntTy::I8)),
+            variants_for_width(8),
+        );
+        niche_enum_def.scalar_valid_range = Some(ScalarValidRange { start: 0, end: 255 });
+        let niche_enum_ord = niche_enum_def.into_ty();
+
+        for bad_ty in [
+            tagless,
+            i16_ord,
+            i32_ord,
+            i64_ord,
+            i128_ord,
+            isize_ord,
+            padded_ord,
+            transparent_ord,
+            niche_enum_ord,
+        ] {
+            for code in [-1i8, 0, 1] {
+                assert_eq!(
+                    ordering_variant(&bad_ty, code, pw),
+                    None,
+                    "bad enum {bad_ty:?} accepted for code {code} on {pw:?}"
+                );
+            }
+            assert!(
+                check_intrinsic_call_types(
+                    IntrinsicOp::ThreeWayCompare,
+                    &[u32_ty(), u32_ty()],
+                    &bad_ty,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                eval_intrinsic(
+                    IntrinsicOp::ThreeWayCompare,
+                    &[iv(&u32_ty(), 1, pw), iv(&u32_ty(), 2, pw)],
+                    &bad_ty,
+                    pw,
+                ),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+            let body = intrinsic_fn(
+                IntrinsicOp::ThreeWayCompare,
+                vec![u32_ty(), u32_ty()],
+                bad_ty.clone(),
+            );
+            let err = lower_err(&body, pw);
+            if matches!(bad_ty.layout_for(pw), Err(LayoutError::IllFormed(_))) {
+                assert!(matches!(err, RvalueLowerError::InvalidAdtDef { .. }));
+            } else {
+                assert!(matches!(
+                    err,
+                    RvalueLowerError::InvalidTerminator {
+                        error: TerminatorLowerError::InvalidIntrinsicCall {
+                            op: IntrinsicOp::ThreeWayCompare,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+            }
+        }
+
+        // A valid `#[repr(C, i8)]` fieldless 3-variant enum still has `size == 1, align == 1`.
+        let mut repr_c_i8 = AdtDef::new_enum(
+            "ReprCI8Ord",
+            Some(ScalarTy::Int(IntTy::I8)),
+            variants_for_width(8),
+        );
+        repr_c_i8.repr = AdtRepr::c();
+        let repr_c_i8_ty = repr_c_i8.into_ty();
+        assert_eq!(ordering_variant(&repr_c_i8_ty, -1, pw), Some(0));
+        assert_eq!(ordering_variant(&repr_c_i8_ty, 0, pw), Some(1));
+        assert_eq!(ordering_variant(&repr_c_i8_ty, 1, pw), Some(2));
+        assert_eq!(ordering_variant(&repr_c_i8_ty, 2, pw), None);
+        assert_eq!(
+            eval_intrinsic(
+                IntrinsicOp::ThreeWayCompare,
+                &[MirValue::Char('z'), MirValue::Char('a')],
+                &repr_c_i8_ty,
+                pw,
+            ),
+            Ok(MirValue::adt(adt_def(&repr_c_i8_ty), 2, vec![]))
+        );
+    }
+}
+
+#[test]
+fn test_b1_write_bytes_preserves_ub_ordering_and_zst_dead_or_uninhabited_semantics() {
+    for pw in PWS {
+        // 1. `&mut (!, u32)` has non-canonical layout AND uninhabited pointee: `UninhabitedPointee`
+        //    (undefined behavior) must win over `UnsupportedMemoryAccess` for both `count == 1`
+        //    and `count > 1`.
+        let uninh_pair = Ty::Tuple(vec![Ty::Never, u32_ty()]);
+        let ref_mut_uninh = reference(uninh_pair.clone(), Mutability::Mut);
+        for count in [1u128, 2] {
+            let body = mk(
+                vec![unit(), ref_mut_uninh.clone()],
+                vec![
+                    blk(
+                        vec![],
+                        call(
+                            intrinsic(IntrinsicOp::WriteBytes),
+                            vec![cp(1), cst(0, u8_ty()), cst(count, usize_ty())],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            );
+            let bad_ref = MirValue::ptr(
+                PointerValue::with_provenance(0x100, 999, 0),
+                ref_mut_uninh.clone(),
+            );
+            assert_eq!(
+                term_err(eval_lowered_body_cfg(&lower(&body, pw), &[bad_ref], 4)),
+                (0, RvalueEvalError::UninhabitedPointee(uninh_pair.clone()))
+            );
+        }
+
+        // `&mut !` with `count == 1` and `count == 3` must also report `UninhabitedPointee`.
+        let ref_mut_never = reference(Ty::Never, Mutability::Mut);
+        for count in [1u128, 3] {
+            let body = mk(
+                vec![unit(), ref_mut_never.clone()],
+                vec![
+                    blk(
+                        vec![],
+                        call(
+                            intrinsic(IntrinsicOp::WriteBytes),
+                            vec![cp(1), cst(0, u8_ty()), cst(count, usize_ty())],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            );
+            let bad_ref = MirValue::ptr(PointerValue::without_provenance(8), ref_mut_never.clone());
+            assert_eq!(
+                term_err(eval_lowered_body_cfg(&lower(&body, pw), &[bad_ref], 4)),
+                (0, RvalueEvalError::UninhabitedPointee(Ty::Never))
+            );
+        }
+
+        // 2. Storage-dead ZST local: `count == 1` faults with `DeadLocal`, whereas `count > 1`
+        //    (`byte_len == 0`) is a bulk zero-byte no-op (matching `copy_nonoverlapping`).
+        let raw_mut_unit = raw(unit(), Mutability::Mut);
+        let dead_zst_body = |count: u128| {
+            mk(
+                vec![unit(), unit(), raw_mut_unit.clone()],
+                vec![
+                    blk(
+                        vec![
+                            live(1),
+                            live(2),
+                            assign(2, Rvalue::RawPtr(Mutability::Mut, place(1))),
+                            Statement::StorageDead(Local(1)),
+                        ],
+                        call(
+                            intrinsic(IntrinsicOp::WriteBytes),
+                            vec![cp(2), cst(0xAB, u8_ty()), cst(count, usize_ty())],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            )
+        };
+        assert_eq!(
+            term_err(eval_lowered_body_cfg(&lower(&dead_zst_body(1), pw), &[], 4)),
+            (0, RvalueEvalError::DeadLocal(Local(1)))
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&lower(&dead_zst_body(3), pw), &[], 4)),
+            MirValue::Unit
+        );
+
+        // 3. Zero-byte `write_bytes` on external non-null pointers succeeds even for `!` and
+        //    non-canonical 2-field ZST unions (`0` bytes written, no synthetic local touched).
+        let zst_union =
+            AdtDef::new_union("TwoZst", vec![unit(), Ty::Array(Box::new(u8_ty()), 0)]).into_ty();
+        for zst_ty in [Ty::Never, zst_union] {
+            let ptr_ty = raw(zst_ty, Mutability::Mut);
+            for count in [1u128, 5] {
+                let body = mk(
+                    vec![unit(), ptr_ty.clone()],
+                    vec![
+                        blk(
+                            vec![],
+                            call(
+                                intrinsic(IntrinsicOp::WriteBytes),
+                                vec![cp(1), cst(0xFF, u8_ty()), cst(count, usize_ty())],
+                                0,
+                                Some(1),
+                                UnwindAction::Continue,
+                            ),
+                        ),
+                        blk(vec![], Terminator::Return),
+                    ],
+                );
+                let dangling = MirValue::ptr(PointerValue::without_provenance(8), ptr_ty.clone());
+                assert_eq!(
+                    returned(eval_lowered_body_cfg(&lower(&body, pw), &[dangling], 4)),
+                    MirValue::Unit
+                );
+            }
+        }
+
+        // 4. `write_bytes::<!>` into an uninhabited ZST field of a live union writes `0` bytes
+        //    and preserves the active `u32` field.
+        let u_def = Arc::new(AdtDef::new_union("U", vec![u32_ty(), Ty::Never]));
+        let u_ty = Ty::Adt(Arc::clone(&u_def));
+        let never_ptr_ty = raw(Ty::Never, Mutability::Mut);
+        let union_never_write = mk(
+            vec![u32_ty(), u_ty, never_ptr_ty, unit()],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        assign(
+                            1,
+                            Rvalue::Aggregate(
+                                AggregateKind::Adt {
+                                    def_path: "U".to_string(),
+                                    variant_idx: 0,
+                                    active_field: Some(0),
+                                    adt_def: Some(Arc::clone(&u_def)),
+                                },
+                                vec![cst(0xCAFE_BABE, u32_ty())],
+                            ),
+                        ),
+                        assign(
+                            2,
+                            Rvalue::RawPtr(
+                                Mutability::Mut,
+                                Place {
+                                    local: Local(1),
+                                    projection: vec![ProjectionElem::Field(1, Ty::Never)],
+                                },
+                            ),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::WriteBytes),
+                        vec![cp(2), cst(0xFF, u8_ty()), cst(1, usize_ty())],
+                        3,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![assign(
+                        0,
+                        Rvalue::Use(Operand::Copy(Place {
+                            local: Local(1),
+                            projection: vec![ProjectionElem::Field(0, u32_ty())],
+                        })),
+                    )],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(
+                &lower(&union_never_write, pw),
+                &[],
+                4
+            )),
+            MirValue::unsigned(0xCAFE_BABE, UintTy::U32, pw)
+        );
+
+        // 5a. Tagged `&raw mut _1[0]` on `[(); 4]` with `count == 4` initializes the entire
+        //     zero-sized array window `[0..4]` to `[(), (), (), ()]`.
+        let zst_arr = Ty::Array(Box::new(unit()), 4);
+        let init_zst_arr = mk(
+            vec![
+                zst_arr.clone(),
+                zst_arr.clone(),
+                raw_mut_unit.clone(),
+                unit(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        assign(
+                            2,
+                            Rvalue::RawPtr(
+                                Mutability::Mut,
+                                Place {
+                                    local: Local(1),
+                                    projection: vec![ProjectionElem::ConstantIndex {
+                                        offset: 0,
+                                        min_length: 4,
+                                        from_end: false,
+                                    }],
+                                },
+                            ),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::WriteBytes),
+                        vec![cp(2), cst(0, u8_ty()), cst(4, usize_ty())],
+                        3,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(1)))], Terminator::Return),
+            ],
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&lower(&init_zst_arr, pw), &[], 4)),
+            MirValue::Array {
+                elements: vec![MirValue::Unit; 4],
+                elem_ty: unit(),
+            }
+        );
+
+        // 5b. A ZST pointer at an interior byte offset (`+2`) of a live `u32` local resolves to
+        //     no `()` sub-place (`dst_alloc_local == Some(1)`), failing closed with
+        //     `UnsupportedMemoryAccess`.
+        let raw_mut_u32 = raw(u32_ty(), Mutability::Mut);
+        let raw_mut_u8 = raw(u8_ty(), Mutability::Mut);
+        let interior_zst = mk(
+            vec![
+                unit(),
+                u32_ty(),
+                raw_mut_u32,
+                raw_mut_u8.clone(),
+                raw_mut_u8,
+                raw_mut_unit.clone(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        assign(1, Rvalue::Use(cst(0x1122_3344, u32_ty()))),
+                        assign(2, Rvalue::RawPtr(Mutability::Mut, place(1))),
+                        assign(
+                            3,
+                            Rvalue::Cast(CastKind::PtrToPtr, cp(2), raw(u8_ty(), Mutability::Mut)),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::ArithOffset),
+                        vec![cp(3), cst(2, isize_ty())],
+                        4,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![assign(
+                        5,
+                        Rvalue::Cast(CastKind::PtrToPtr, cp(4), raw_mut_unit.clone()),
+                    )],
+                    call(
+                        intrinsic(IntrinsicOp::WriteBytes),
+                        vec![cp(5), cst(0, u8_ty()), cst(2, usize_ty())],
+                        0,
+                        Some(2),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+        assert!(matches!(
+            term_err(eval_lowered_body_cfg(&lower(&interior_zst, pw), &[], 8)),
+            (1, RvalueEvalError::UnsupportedMemoryAccess(_))
+        ));
+    }
+}
+
+#[test]
+fn test_b1_call_table_supports_diverging_never_callees_into_coerced_caller_destinations() {
+    for pw in PWS {
+        let diverge_never = |op: IntrinsicOp| {
+            mk(
+                vec![Ty::Never, u32_ty()],
+                vec![blk(
+                    vec![],
+                    call(intrinsic(op), vec![], 0, None, UnwindAction::Continue),
+                )],
+            )
+        };
+        let wrong_u64 = mk(
+            vec![u64_ty(), u32_ty()],
+            vec![blk(
+                vec![assign(0, Rvalue::Use(cst(9, u64_ty())))],
+                Terminator::Return,
+            )],
+        );
+        let table = CallTable::new()
+            .with_callee(
+                "panic_never",
+                1,
+                lower(&diverge_never(IntrinsicOp::PanicUnwind), pw),
+            )
+            .with_callee(
+                "abort_never",
+                1,
+                lower(&diverge_never(IntrinsicOp::Abort), pw),
+            )
+            .with_callee(
+                "ub_never",
+                1,
+                lower(&diverge_never(IntrinsicOp::UnreachableUnchecked), pw),
+            )
+            .with_callee("wrong_u64", 1, lower(&wrong_u64, pw));
+
+        // Caller coerces `fn(u32) -> !` into `_0: u32` with `target: None` (as `rustc`'s
+        // `NeverToAny` + `DestinationPropagation` emits).
+        let caller = |sym: &str, target: Option<usize>, unwind: UnwindAction| {
+            mk(
+                vec![u32_ty(), u32_ty()],
+                vec![
+                    blk(vec![], call(callee(sym), vec![cp(1)], 0, target, unwind)),
+                    blk(vec![], Terminator::Return),
+                    cleanup_blk(vec![], Terminator::UnwindResume),
+                ],
+            )
+        };
+
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&caller("panic_never", None, UnwindAction::Cleanup(2)), pw),
+                &[MirValue::unsigned(7, UintTy::U32, pw)],
+                8,
+                &table,
+            ),
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: PanicMessage::Intrinsic(IntrinsicOp::PanicUnwind),
+            })
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&caller("abort_never", None, UnwindAction::Cleanup(2)), pw),
+                &[MirValue::unsigned(7, UintTy::U32, pw)],
+                2,
+                &table,
+            ),
+            Ok(CfgEvalOutcome::Terminated {
+                bb: 0,
+                msg: PanicMessage::Intrinsic(IntrinsicOp::Abort),
+            })
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&caller("ub_never", None, UnwindAction::Continue), pw),
+                &[MirValue::unsigned(7, UintTy::U32, pw)],
+                8,
+                &table,
+            ),
+            Err(CfgEvalError::InCallee {
+                call_stack: vec![CallSite {
+                    bb: 0,
+                    callee: CalleeSymbol::new("ub_never"),
+                }],
+                error: Box::new(CfgEvalError::UnreachableReached { bb: 0 }),
+            })
+        );
+
+        // Converging calls (`target: Some(1)`) to `-> !` into `_0: u32`, and diverging calls
+        // (`target: None`) to an inhabited mismatched return type `-> u64`, still fail with
+        // `TypeMismatch`.
+        assert!(matches!(
+            term_err(eval_lowered_body_cfg_with_call_table(
+                &lower(&caller("panic_never", Some(1), UnwindAction::Continue), pw),
+                &[MirValue::unsigned(7, UintTy::U32, pw)],
+                8,
+                &table,
+            )),
+            (0, RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            term_err(eval_lowered_body_cfg_with_call_table(
+                &lower(&caller("wrong_u64", None, UnwindAction::Continue), pw),
+                &[MirValue::unsigned(7, UintTy::U32, pw)],
+                8,
+                &table,
+            )),
+            (0, RvalueEvalError::TypeMismatch(_))
+        ));
+    }
+}
+
+#[test]
+fn test_b1_call_table_union_active_field_isolation_and_union_destination_write() {
+    let raw_u32 = raw(u32_ty(), Mutability::Not);
+    // Legacy tuple-modeled multi-slot union (`adt_def: None`, declared as `Ty::Tuple` of its
+    // union fields).
+    let legacy_u_ty = Ty::Tuple(vec![u64_ty(), raw_u32.clone()]);
+
+    // `id(u: PtrOrInt) -> PtrOrInt { _0 = move _1; return }`
+    let id_body = mk(
+        vec![legacy_u_ty.clone(), legacy_u_ty.clone()],
+        vec![blk(vec![assign(0, Rvalue::Use(mv(1)))], Terminator::Return)],
+    );
+    let caller_body = mk(
+        vec![legacy_u_ty.clone(), legacy_u_ty.clone()],
+        vec![
+            blk(
+                vec![],
+                call(
+                    callee("id"),
+                    vec![mv(1)],
+                    0,
+                    Some(1),
+                    UnwindAction::Continue,
+                ),
+            ),
+            blk(vec![], Terminator::Return),
+        ],
+    );
+    let table = CallTable::new().with_callee("id", 1, lower(&id_body, PW));
+    let lowered_caller = lower(&caller_body, PW);
+
+    // Multi-slot union `MirValue::Adt` with `active_field: Some(0)` (`u64`) and a stale synthetic
+    // pointer in inactive slot `1`: only the active field is inspected, matching
+    // `check_value_well_formed`.
+    let stale_local_ptr = MirValue::ptr(PointerValue::with_provenance(0x100, 1, 0), raw_u32);
+    let active_int_union = MirValue::Adt {
+        def_path: "PtrOrInt".to_string(),
+        adt_def: None,
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u64v(0xDEAD_BEEF), stale_local_ptr.clone()],
+    };
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_call_table(
+            &lowered_caller,
+            std::slice::from_ref(&active_int_union),
+            4,
+            &table,
+        )),
+        active_int_union
+    );
+
+    // When the synthetic local pointer IS in the active union field (`active_field: Some(1)`),
+    // frame isolation rejects it with `UnsupportedMemoryAccess`.
+    let active_ptr_union = MirValue::Adt {
+        def_path: "PtrOrInt".to_string(),
+        adt_def: None,
+        variant_idx: 0,
+        active_field: Some(1),
+        fields: vec![u64v(0), stale_local_ptr],
+    };
+    assert!(matches!(
+        term_err(eval_lowered_body_cfg_with_call_table(
+            &lowered_caller,
+            &[active_ptr_union],
+            4,
+            &table,
+        )),
+        (0, RvalueEvalError::UnsupportedMemoryAccess(_))
+    ));
+
+    // Direct call destination into an inactive union field (`_1.1 = make_u32()`) switches the
+    // union's active field cleanly on return.
+    let u2_def = Arc::new(AdtDef::new_union("IntOrU32", vec![u64_ty(), u32_ty()]));
+    let u2_ty = Ty::Adt(Arc::clone(&u2_def));
+    let make_u32 = mk(
+        vec![u32_ty()],
+        vec![blk(
+            vec![assign(0, Rvalue::Use(cst(0x1234_5678, u32_ty())))],
+            Terminator::Return,
+        )],
+    );
+    let table2 = CallTable::new().with_callee("make_u32", 0, lower(&make_u32, PW));
+    let write_union_dest = mk(
+        vec![u32_ty(), u2_ty],
+        vec![
+            blk(
+                vec![
+                    live(1),
+                    assign(
+                        1,
+                        Rvalue::Aggregate(
+                            AggregateKind::Adt {
+                                def_path: "IntOrU32".to_string(),
+                                variant_idx: 0,
+                                active_field: Some(0),
+                                adt_def: Some(Arc::clone(&u2_def)),
+                            },
+                            vec![cst(99, u64_ty())],
+                        ),
+                    ),
+                ],
+                Terminator::Call {
+                    func: Operand::Constant(callee("make_u32")),
+                    args: vec![],
+                    destination: Place {
+                        local: Local(1),
+                        projection: vec![ProjectionElem::Field(1, u32_ty())],
+                    },
+                    target: Some(1),
+                    unwind: UnwindAction::Continue,
+                },
+            ),
+            blk(
+                vec![assign(
+                    0,
+                    Rvalue::Use(Operand::Copy(Place {
+                        local: Local(1),
+                        projection: vec![ProjectionElem::Field(1, u32_ty())],
+                    })),
+                )],
+                Terminator::Return,
+            ),
+        ],
+    );
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_call_table(
+            &lower(&write_union_dest, PW),
+            &[],
+            4,
+            &table2,
+        )),
+        u32v(0x1234_5678)
+    );
+}
+
+#[test]
+fn test_b1_eval_lowered_terminator_invalid_cleanup_edge_preserves_unwinding_state() {
+    let body = LoweredBody {
+        ptr_width: PW,
+        local_decls: vec![unit()],
+        basic_blocks: vec![
+            LoweredBasicBlock {
+                statements: vec![],
+                terminator: None,
+                is_cleanup: false,
+            },
+            LoweredBasicBlock {
+                statements: vec![],
+                terminator: Some(LoweredTerminator::Return { ret_ty: unit() }),
+                is_cleanup: false,
+            },
+        ],
+    };
+    let mut state = StatementEvalState::from_body(&body, &[]).unwrap();
+
+    for (unwind, expected_err) in [
+        (
+            UnwindAction::Cleanup(99),
+            CfgEvalError::InvalidBlock { bb: 99 },
+        ),
+        (
+            UnwindAction::Cleanup(1),
+            CfgEvalError::InvalidEdge { from: 0, to: 1 },
+        ),
+    ] {
+        let term = LoweredTerminator::Call {
+            func: Operand::Constant(intrinsic(IntrinsicOp::PanicUnwind)),
+            func_ty: Ty::unit(),
+            args: vec![],
+            arg_tys: vec![],
+            destination: place(0),
+            dest_ty: unit(),
+            target: None,
+            unwind,
+        };
+        let mut unwinding: UnwindState = None;
+        assert_eq!(
+            eval_lowered_terminator(&body, 0, &term, &mut state, &mut unwinding, None),
+            Err(expected_err)
+        );
+        assert_eq!(
+            unwinding, None,
+            "failed Cleanup edge must not leave UnwindState mutated"
+        );
+    }
+}
