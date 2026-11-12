@@ -20684,6 +20684,7 @@ open LeanMiriSpec.Correspondence in
   ActiveProtectorsValid.cons_of_ne_disabled
   ActiveProtectorsValid.push_fresh_callId
   annealAssociatedAccess
+  protectorEndAccessKind
   borrowTree_protectorEndAccess_simulation
   borrowTree_releaseProtector_full_simulation
   cexProtectedReservedFrzEntry
@@ -20691,18 +20692,24 @@ open LeanMiriSpec.Correspondence in
   cexForeignUniqueBorrows
   cex_end_of_call_foreign_unique_frozen_divergence
   callerRestoredProtectors
-  releaseCallProtectors
   callerRestoredProtectors_cons_eq_restoreCallerProtectors
+  releaseCallProtectors
+  releaseCallProtectors_one_cons
+  releaseCallProtectors_full_clear
+  ActiveProtectorsValid.of_releaseCallProtectors
+  basedNormalTree_releaseProtector_chain3_and_branch3_simulation
   protectedTagsContainsNat
   poppedCalleeFrameState
   annealPoppedFrameState
   popFrameBorrowTracker
+  popFrameBorrowTrackerAtDepth
   BorrowTrackerStackRel
   BorrowTrackerStackRel.of_none
   BorrowTrackerStackRel.of_borrows_nil
   BorrowTrackerStackRel.of_popFrame
   BorrowTrackerStackRel.current_spec
   BorrowTrackerStackRel.of_pushFrame
+  BorrowTrackerStackRel.of_releaseCallProtectors
   TreeBorrowsStateRel
   activeMirBody
   annealFrameStackBottomUp
@@ -20733,6 +20740,7 @@ open LeanMiriSpec.Correspondence in
   SlotsAllocDisjoint
   cleanupStackFrame_root_stop
   cleanupStackFrame_callee_goto
+  cleanupStackFrame_callee_goto_any_unwinding
   FrameRel.allSlotsAllocLive
   MemoryAllocDisjoint.slotsAllocDisjoint
   FrameRel.of_deallocFrameLocals
@@ -20760,14 +20768,21 @@ open LeanMiriSpec.Correspondence in
   step_terminator_unreachable_ub_simulation
   step_terminator_drop_noop_simulation
   canonical_drop_no_glue_preserves_local_divergence
+  step_terminator_drop_projected_simulation
+  step_terminator_drop_canonical_no_glue_step_divergence
+  annealControlHooks_returnOperand_cleanup_live_back
   step_terminator_return_root_simulation
   MultiFrameAllocDisjoint.pop_top
   MultiFrameAllocDisjoint.disjoint_with_popped_top
   CallerDestinationRel.of_deallocFrameLocals
   CallerStackLinksRel.of_deallocFrameLocals
   returnFromCurrentFrame_lm4_1_callee_div_ub
+  returnFromCurrentFrame_of_unwind_error_back
+  returnFromCurrentFrame_lm4_1_unwind_cleanup_ok
+  returnFromCurrentFrame_lm4_1_unwind_unreachable_ub
   step_terminator_return_callee_simulation
   step_terminator_return_callee_immediate_simulation
+  step_terminator_unwindResume_callee_simulation
   lookupCallee_nil_eq_of_findCallee_some
   lookupCallee_nil_eq_none_of_findCallee_none
   step_terminator_call_unreachable_unchecked_ub_simulation
@@ -20804,6 +20819,12 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_1.miriStepUBMsgLM4_1
   WitnessLM4_1.miriTopIsDivergingWithInitRet
   WitnessLM4_1.wit_lm4_1_diverging_call_then_return_ub
+  WitnessLM4_1.witCexCalleeReturnAnneal
+  WitnessLM4_1.wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence
+  WitnessLM4_1.witProjDropBody
+  WitnessLM4_1.wit_lm4_1_drop_projected_and_canonical_divergence
+  WitnessLM4_1.witUnwindCalleeBody
+  WitnessLM4_1.wit_lm4_1_unwindResume_cleanup_and_unreachable_ub_simulation
   SimLM3_3.storageDeadBody
   SimLM3_3.storageLiveBody
   SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step
@@ -20984,7 +21005,6 @@ example
     (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
     (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
     (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
-    (harity : argOps.length = calleeBody.argCount)
     (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
       CallerDestSlotWf m.machine tf destIdx destDecl)
     (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
@@ -20996,7 +21016,7 @@ example
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
   step_terminator_call_simulation
     hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
-    hcallee_decls hcallee_bb0 harity hdest_wf hdest_live hwt_args
+    hcallee_decls hcallee_bb0 hdest_wf hdest_live hwt_args
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -21033,9 +21053,114 @@ example
     hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
     hcallee_decls hcallee_bb0 hdest_wf hdest_live hwt_args
 
-example (cf : SavedCallerFrame) (cs : List SavedCallerFrame) :
-    releaseCallProtectors (cf :: cs) = restoreCallerProtectors cf :=
-  callerRestoredProtectors_cons_eq_restoreCallerProtectors cf cs
+example (cf : SavedCallerFrame) (cs : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors 1 (cf :: cs) activeProtectors = restoreCallerProtectors cf :=
+  releaseCallProtectors_one_cons cf cs activeProtectors
+
+example (callStack : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors (callStack.length + 1) callStack activeProtectors = [] :=
+  releaseCallProtectors_full_clear callStack activeProtectors
+
+example
+    {borrows : List BorrowEntry}
+    (k : Nat) (callStack : List SavedCallerFrame) (activeProtectors : List Nat)
+    (hcur : ActiveProtectorsValid borrows activeProtectors)
+    (hstack : ∀ cf ∈ callStack, ActiveProtectorsValid borrows (restoreCallerProtectors cf)) :
+    ActiveProtectorsValid borrows (releaseCallProtectors k callStack activeProtectors) :=
+  ActiveProtectorsValid.of_releaseCallProtectors k callStack activeProtectors hcur hstack
+
+example
+    {borrows : List BorrowEntry}
+    (k : Nat) {activeProtectors : List Nat}
+    {callStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (h : BorrowTrackerStackRel borrows activeProtectors callStack bt)
+    (hk : k ≤ callStack.length) :
+    BorrowTrackerStackRel borrows
+      (releaseCallProtectors k callStack activeProtectors)
+      (callStack.drop k)
+      (popFrameBorrowTrackerAtDepth k borrows activeProtectors callStack bt) :=
+  BorrowTrackerStackRel.of_releaseCallProtectors k h hk
+
+example (perm : TreeBorrowPerm) :
+    let chain3 : List BorrowEntry :=
+      [{ tag := 3, targetLocal := 1, targetProjection := [], perm := perm,
+         protector := some 1, parentTag := some 2 },
+       { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let branch3 : List BorrowEntry :=
+      [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .reservedFrz false,
+         protector := some 1, parentTag := some 1 },
+       { tag := 3, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let nresChain :=
+      (basedNormalTree chain3 [1]).performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed
+    let nresBranch :=
+      (basedNormalTree branch3 [1]).performAccess 0 .Read .SkipChildrenOfAccessed
+    TreeBorrowsRel chain3 [] (basedNormalTree chain3 []) ∧
+    (perm ≠ .cell →
+      (nresChain.status = .Completed ↔ perm ≠ .disabled) ∧
+      (perm ≠ .disabled →
+        normalTreePerms nresChain.tree 3 = [some perm, some .unique, some .unique])) ∧
+    nresBranch.status = .Completed ∧
+    normalTreePerms nresBranch.tree 3 =
+      [some (.reservedFrz false), some .frozen, some .unique] :=
+  basedNormalTree_releaseProtector_chain3_and_branch3_simulation perm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
+    {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .field fieldIdx fieldTy :: .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (hpair : ∀ v imm,
+      ImmediateRel decl.ty (activeMirBody rootBody s).layouts v imm →
+      ∃ sc₁ sc₂ msc₁ msc₂,
+        v = .aggregate 0 [.scalar sc₁, .scalar sc₂] ∧
+        imm = .scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂)) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
+  step_terminator_drop_projected_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hpair
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = cf :: restStack)
+    (hva : ∀ tf, m.stack.frames.back? = some tf → tf.vaList = #[])
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume)
+    (hdecl0 : get? (activeMirBody rootBody s).localDecls 0 = some decl0)
+    (hlive0 : get? s.frame.locals 0 ≠ some .dead)
+    (hunwind :
+      cf.returnUnwind = .unreachable ∨
+        ∃ cleanupBb, cf.returnUnwind = .cleanup cleanupBb) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
+  step_terminator_unwindResume_callee_simulation
+    hstate hstack hva hphase hbb hstmt_none hstmt_len hcleanup hterm hdecl0 hlive0 hunwind
 
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example (perm : TreeBorrowPerm) :

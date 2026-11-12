@@ -410,7 +410,9 @@ private theorem hooksExpectedNormalProjSkip_eq (perm : TreeBorrowPerm) (isProtec
       Miri.TreeBorrows.ProtectedTags.insert, retagParentTag, retagChildTag,
       Miri.Memory.BorTag.one]
 
-private def protectorEndAccessKind : TreeBorrowPerm → Miri.TreeBorrows.AccessKind
+/-- Access kind performed by Miri's end-of-call protector release for any
+non-`Cell` permission (`.Write` for `.unique`, `.Read` otherwise). -/
+def protectorEndAccessKind : TreeBorrowPerm → Miri.TreeBorrows.AccessKind
   | .unique => .Write
   | _ => .Read
 
@@ -884,11 +886,6 @@ def callerRestoredProtectors : List SavedCallerFrame → List Nat
     | some protId => protId :: cf.calleeProtectors
     | none => cf.calleeProtectors
 
-/-- Alias `releaseCallProtectors` for `callerRestoredProtectors` (`LM-4.1`
-call-frame protector release). -/
-abbrev releaseCallProtectors : List SavedCallerFrame → List Nat :=
-  callerRestoredProtectors
-
 /-- Stage-1 `Trusted` bridge: for a non-empty call stack `cf :: cs`,
 `callerRestoredProtectors (cf :: cs)` is definitionally equal to
 `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors cf`. -/
@@ -896,6 +893,103 @@ abbrev releaseCallProtectors : List SavedCallerFrame → List Nat :=
 theorem callerRestoredProtectors_cons_eq_restoreCallerProtectors
     (cf : SavedCallerFrame) (cs : List SavedCallerFrame) :
     callerRestoredProtectors (cf :: cs) = restoreCallerProtectors cf := rfl
+
+/-- Arbitrary-depth `CallId` protector release (`releaseCallProtectors`):
+returning or unwinding across `k` call frames on `callStack` starting from
+`activeProtectors` iteratively applies Stage-1 `restoreCallerProtectors cf`
+(`Terminators.lean:468`, `3022`, `639`) for each popped `SavedCallerFrame`, and
+clears `activeProtectors` to `[]` if the root frame (`callStack = []`) is popped. -/
+def releaseCallProtectors : Nat → List SavedCallerFrame → List Nat → List Nat
+  | 0, _, activeProtectors => activeProtectors
+  | _ + 1, [], _ => []
+  | k + 1, cf :: rest, _ =>
+    releaseCallProtectors k rest (restoreCallerProtectors cf)
+
+/-- Single-step (`k = 1`) specialization of `releaseCallProtectors` on a
+non-empty call stack `cf :: cs` equals Stage-1 `restoreCallerProtectors cf`. -/
+@[simp]
+theorem releaseCallProtectors_one_cons
+    (cf : SavedCallerFrame) (cs : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors 1 (cf :: cs) activeProtectors = restoreCallerProtectors cf := rfl
+
+/-- Unwinding or returning through all `callStack.length + 1` frames (callee frames
+plus root frame) clears `activeProtectors` to `[]`. -/
+theorem releaseCallProtectors_full_clear
+    (callStack : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors (callStack.length + 1) callStack activeProtectors = [] := by
+  induction callStack generalizing activeProtectors with
+  | nil => rfl
+  | cons cf rest ih =>
+    dsimp only [List.length_cons, releaseCallProtectors]
+    exact ih (restoreCallerProtectors cf)
+
+/-- `ActiveProtectorsValid` is preserved across `releaseCallProtectors k callStack activeProtectors`
+at arbitrary stack depth `k` whenever `ActiveProtectorsValid borrows activeProtectors`
+holds initially and every saved caller frame `cf ∈ callStack` has valid restored
+protectors `ActiveProtectorsValid borrows (restoreCallerProtectors cf)`. -/
+theorem ActiveProtectorsValid.of_releaseCallProtectors
+    {borrows : List BorrowEntry}
+    (k : Nat) (callStack : List SavedCallerFrame) (activeProtectors : List Nat)
+    (hcur : ActiveProtectorsValid borrows activeProtectors)
+    (hstack : ∀ cf ∈ callStack, ActiveProtectorsValid borrows (restoreCallerProtectors cf)) :
+    ActiveProtectorsValid borrows (releaseCallProtectors k callStack activeProtectors) := by
+  induction k generalizing callStack activeProtectors with
+  | zero => exact hcur
+  | succ k' ih =>
+    cases callStack with
+    | nil => exact ActiveProtectorsValid.nil borrows
+    | cons cf rest =>
+      dsimp only [releaseCallProtectors]
+      exact ih rest (restoreCallerProtectors cf)
+        (hstack cf List.mem_cons_self)
+        (fun cf' hcf' => hstack cf' (List.mem_cons_of_mem _ hcf'))
+
+/-- Multi-node 3-level chain (`[g, c, r]`) and 3-node branching (`[c₀, c₁, p]`)
+protector release correspondence on `basedNormalTree`:
+1. On a 3-level reborrow chain `[g{perm, prot = some 1, parent = some 2},
+   c{Unique, parent = some 1}, r{Unique, parent = none}]`, Miri's end-of-call
+   protector access at grandchild `g` (`performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed`
+   for `perm ≠ .cell`) succeeds iff `perm ≠ .disabled`, and when `perm ≠ .disabled`
+   preserves all 3 permissions (`[some perm, some .unique, some .unique]`) because
+   both parent `c` and root `r` are *ancestors* (`.LocalAccess`) of `g`;
+2. On a 3-node branching tree `[c₀{ReservedFrz false, prot = some 1, parent = some 1},
+   c₁{Unique, prot = none, parent = some 1}, p{Unique, parent = none}]`, Miri's
+   end-of-call protector access at `c₀` (`performAccess 0 .Read .SkipChildrenOfAccessed`)
+   preserves ancestor `p` at `some .unique` (`.LocalAccess`) while freezing
+   foreign sibling `c₁` from `.unique` to `.frozen` (`.ForeignAccess`). -/
+theorem basedNormalTree_releaseProtector_chain3_and_branch3_simulation
+    (perm : TreeBorrowPerm) :
+    let chain3 : List BorrowEntry :=
+      [{ tag := 3, targetLocal := 1, targetProjection := [], perm := perm,
+         protector := some 1, parentTag := some 2 },
+       { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let branch3 : List BorrowEntry :=
+      [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .reservedFrz false,
+         protector := some 1, parentTag := some 1 },
+       { tag := 3, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let nresChain :=
+      (basedNormalTree chain3 [1]).performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed
+    let nresBranch :=
+      (basedNormalTree branch3 [1]).performAccess 0 .Read .SkipChildrenOfAccessed
+    TreeBorrowsRel chain3 [] (basedNormalTree chain3 []) ∧
+    (perm ≠ .cell →
+      (nresChain.status = .Completed ↔ perm ≠ .disabled) ∧
+      (perm ≠ .disabled →
+        normalTreePerms nresChain.tree 3 = [some perm, some .unique, some .unique])) ∧
+    nresBranch.status = .Completed ∧
+    normalTreePerms nresBranch.tree 3 =
+      [some (.reservedFrz false), some .frozen, some .unique] := by
+  rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;>
+    exact ⟨⟨rfl, by decide, rfl, rfl, rfl⟩,
+      fun hne => by decide,
+      by decide,
+      by decide⟩
 
 /-- Whether `pt : Miri.TreeBorrows.ProtectedTags` contains the borrow tag `tag : Nat`
 (via `Miri.Memory.BorTag.ofUInt64 (UInt64.ofNat tag)`). -/
@@ -1061,6 +1155,45 @@ theorem BorrowTrackerStackRel.of_pushFrame
   refine .cons activeProtectors savedCaller callStack bt h.current_spec ?_
   rw [hrestored, poppedCalleeFrameState_self, popFrameBorrowTracker_empty]
   exact h
+
+/-- Iteratively release the popped frames' `FrameState`s across `k` frame pops in
+`m.machine.borrowTracker` via `popFrameBorrowTracker` (`GlobalState.endCall`). -/
+def popFrameBorrowTrackerAtDepth :
+    Nat → List BorrowEntry → List Nat → List SavedCallerFrame →
+    Option Miri.Interpreter.MachineHooks.BorrowState →
+    Option Miri.Interpreter.MachineHooks.BorrowState
+  | 0, _, _, _, bt => bt
+  | _ + 1, _, _, [], bt => bt
+  | k + 1, borrows, activeProtectors, cf :: rest, bt =>
+    popFrameBorrowTrackerAtDepth k borrows (restoreCallerProtectors cf) rest
+      (popFrameBorrowTracker
+        (poppedCalleeFrameState borrows activeProtectors (restoreCallerProtectors cf))
+        bt)
+
+/-- Arbitrary-depth `BorrowTrackerStackRel` preservation across `k` consecutive
+frame pops (`k ≤ callStack.length`): popping `k` frames from `callStack` updates
+`activeProtectors` to `releaseCallProtectors k callStack activeProtectors` and
+`bt` to `popFrameBorrowTrackerAtDepth k borrows activeProtectors callStack bt`,
+preserving `BorrowTrackerStackRel` on the remaining call stack `callStack.drop k`. -/
+theorem BorrowTrackerStackRel.of_releaseCallProtectors
+    {borrows : List BorrowEntry}
+    (k : Nat) {activeProtectors : List Nat}
+    {callStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (h : BorrowTrackerStackRel borrows activeProtectors callStack bt)
+    (hk : k ≤ callStack.length) :
+    BorrowTrackerStackRel borrows
+      (releaseCallProtectors k callStack activeProtectors)
+      (callStack.drop k)
+      (popFrameBorrowTrackerAtDepth k borrows activeProtectors callStack bt) := by
+  induction k generalizing activeProtectors callStack bt with
+  | zero => exact h
+  | succ k' ih =>
+    cases callStack with
+    | nil => cases hk
+    | cons cf rest =>
+      dsimp only [releaseCallProtectors, List.drop_succ_cons, popFrameBorrowTrackerAtDepth]
+      exact ih h.of_popFrame (Nat.le_of_succ_le_succ hk)
 
 /-! ## 2. Depth-1 `TreeBorrowsStateRel` -/
 
@@ -1333,9 +1466,10 @@ inductive CallerStackLinksRel
       (curFrameProts callerProts : List Nat)
       (calleeMf callerMf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit))
-      (unwind : Miri.MIR.UnwindAction) :
+      (unwind : Miri.MIR.UnwindAction := translateUnwindAction cf.returnUnwind) :
       calleeMf.returnContinuation =
-        .goto (if cf.isDiverging then none else some cf.returnTarget) unwind →
+        .goto (if cf.isDiverging then none else some cf.returnTarget)
+          (translateUnwindAction cf.returnUnwind) →
       CallerDestinationRel mach restMfs.length cf callerMf calleeMf.returnPlace →
       FrameRel curBody mach curAf calleeMf →
       CalleeIndirectRetWf mach curBody curAf cf calleeMf →
@@ -1801,6 +1935,30 @@ theorem cleanupStackFrame_callee_goto
   · rfl
   · intro _ _; rfl
 
+/-- On a callee frame with `returnContinuation = .goto ret unwind` and `vaList = #[]`,
+`Stack.cleanupStackFrame` deallocates every `.live (.indirect mp)` local of
+`frame` (`deallocFrameLocals mem frame`) and returns `.ok .normal` for both
+normal return (`unwinding = false`) and stack unwinding (`unwinding = true`). -/
+theorem cleanupStackFrame_callee_goto_any_unwinding
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (stack : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (mem : AnnealMemory)
+    (unwinding : Bool)
+    (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    {ret : Option Miri.MIR.BasicBlockId} {unwind : Miri.MIR.UnwindAction}
+    (hcont : frame.returnContinuation = .goto ret unwind)
+    (hva : frame.vaList = #[])
+    (hlive : AllSlotsAllocLive mem frame.locals.toList)
+    (hdisj : SlotsAllocDisjoint frame.locals.toList) :
+    stack.cleanupStackFrame mem (annealStackLifecycleHooksLM4_1 localDecls layouts) unwinding frame =
+      ⟨stack, deallocFrameLocals mem frame, .ok .normal⟩ := by
+  unfold Miri.Interpreter.Stack.cleanupStackFrame deallocFrameLocals
+  rw [hcont, hva]
+  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, ← Array.forIn_toList]
+  rw [forIn_deallocateLocal_list_eq localDecls layouts stack frame.locals.toList mem hlive hdisj]
+  · rfl
+  · intro _ _; rfl
+
 /-- `FrameRel` implies `AllSlotsAllocLive` for `mf.locals.toList`. -/
 theorem FrameRel.allSlotsAllocLive
     {body : CapturedMir} {mach : AnnealMachine}
@@ -1952,7 +2110,18 @@ def annealReturnOperandLM4_1
           if lay.layout.size == Miri.ABI.Size.ZERO then
             (state, .ok (.immediate .uninit))
           else
-            (state, .error (.undefinedBehavior "return with uninitialized or dead _0"))
+            match frame.location with
+            | .mir loc =>
+              match frame.body.basicBlocks[loc.block]? with
+              | some block =>
+                if block.cleanup then
+                  (state, .ok (.immediate .uninit))
+                else
+                  (state, .error (.undefinedBehavior "return with uninitialized or dead _0"))
+              | none =>
+                (state, .error (.undefinedBehavior "return with uninitialized or dead _0"))
+            | .unwinding _ =>
+              (state, .ok (.immediate .uninit))
         | none =>
           (state, .error (.undefinedBehavior "return with uninitialized or dead _0"))
       | .live op => (state, .ok op)
@@ -2090,18 +2259,23 @@ def annealControlHooksLM4_1
   unwindTerminate := fun _ _ state => (state, .error (.unsupported "unwindTerminate"))
 
 /-- Evaluate a `Terminator.Drop` in `LM-4.1` (`annealEvalDropLM4_1`):
-for an unprojected live immediate local `place = ⟨localId, #[]⟩`, deinitializes
-`localId` to `.live (.immediate .uninit)` and jumps to `(target, 0)`, faulting
-with `StepError.undefinedBehavior` when `localId` is `.dead`.
+* for an unprojected live immediate local `place = ⟨localId, #[]⟩`, deinitializes
+  `localId` to `.live (.immediate .uninit)` and jumps to `(target, 0)`, faulting
+  with `StepError.undefinedBehavior` when `localId` is `.dead`;
+* for a projected place (`!place.projection.isEmpty`), faults with
+  `StepError.undefinedBehavior` when `localId` is `.dead` or `.live (.immediate .uninit)`
+  (matching Stage-1 `Terminators.lean:3044, 3066`), and on an initialized
+  2-field tuple/struct immediate `.live (.immediate (.scalarPair _ _))` with
+  projection `[.Field 0 _]` or `[.Field 1 _]` advances to `(target, 0)` via
+  `ControlFlow.goToBlock target state` without deinitializing `localId`
+  (matching both Stage-1 `Terminators.lean:3055-3066` and canonical `lean-miri`'s
+  `ExecutionMachine.stepHooks.drop` at `ExecutionMachine.lean:327-335`).
 
-Note on `Trusted` vs. canonical `lean-miri` (`H3`): Anneal's `Trusted`
-`evalTerminator (.drop place target _)` (`Terminators.lean:3041-3066`)
-deinitializes an unprojected dropped local (`set? s.frame.locals place.local_ .uninit`)
-before advancing to `(target, 0)`, and `annealEvalDropLM4_1` mirrors that
-transition. In contrast, canonical `lean-miri`'s `ExecutionMachine.stepHooks.drop`
-(`Miri/Interpreter/ExecutionMachine.lean:327-335`) treats `TerminatorKind.Drop`
-with `dropGlue = none` as a plain `ControlFlow.goToBlock target` that leaves the
-local's value intact (certified in `canonical_drop_no_glue_preserves_local_divergence`). -/
+Note on `Trusted` vs. canonical `lean-miri` (`H3`): on an *unprojected* drop
+`place = ⟨localId, .nil⟩`, Stage-1 `Trusted` deinitializes `localId` to `.uninit`
+whereas canonical `lean-miri` with `dropGlue = none` leaves `localId`'s value
+intact (certified in `canonical_drop_no_glue_preserves_local_divergence` and
+`step_terminator_drop_canonical_no_glue_step_divergence`). -/
 def annealEvalDropLM4_1
     (place : Miri.MIR.Place)
     (target : Miri.MIR.BasicBlockId)
@@ -2109,7 +2283,24 @@ def annealEvalDropLM4_1
     (state : AnnealStepState) :
     Miri.Interpreter.StepResult AnnealStepState Unit :=
   if !place.projection.isEmpty then
-    (state, .error (.unsupported "projected drop terminator"))
+    match state.stack.currentFrame? with
+    | none => (state, .error (.stack .emptyStack))
+    | some frame =>
+      match frame.getLocal place.localId with
+      | .error e => (state, .error (.stack e))
+      | .ok ls =>
+        match ls.value with
+        | .dead => (state, .error (.undefinedBehavior "drop of dead local"))
+        | .live (.immediate .uninit) =>
+          (state, .error (.undefinedBehavior "projected drop of uninitialized local"))
+        | .live (.immediate (.scalarPair _ _)) =>
+          match place.projection.toList with
+          | [.Field 0 _] | [.Field 1 _] =>
+            Miri.Interpreter.ControlFlow.goToBlock target state
+          | _ =>
+            (state, .error (.unsupported "projected drop terminator"))
+        | .live _ =>
+          (state, .error (.unsupported "projected drop terminator"))
   else
     match state.stack.currentFrame? with
     | none => (state, .error (.stack .emptyStack))
