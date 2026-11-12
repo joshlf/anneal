@@ -43,9 +43,11 @@ theorems and witnesses), `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
 dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
 witnesses), `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
 witnesses), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
-of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
-sub-place audit hook `subplace_audit_closure`, and their witnesses), ending in
-`sorry_free=true`. A group that depends on `sorryAx` or
+of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, and
+their witnesses), ending in `sorry_free=true`. `Correspondence.DeinitBridge`,
+the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`, is a
+separate build root that audits itself (`[SUBPLACE-AUDIT]`), so that this
+module and `MiniRustSpec` do not depend on `Anneal.Mir.*`. A group that depends on `sorryAx` or
 on any other non-standard axiom fails the build instead.
 -/
 
@@ -5346,12 +5348,13 @@ open MiniRustSpec.Correspondence in
 
 `[DEINIT-AUDIT]` pins the projected-`Deinit` fragment `inFragmentD` of
 `Correspondence.DeinitWindow` (its window rules, the one-step correspondence
-`step_correspondence_D`, and the whole-execution lifts), the byte-store bridge of
-`Correspondence.DeinitLemmas` / `Correspondence.DeinitBridge` (including
-`subplace_audit_closure`, whose proof term mentions every Episode 2 theorem of
-`Anneal.Mir.AdtAndControl` Section 4), the `Rvalue::Discriminant` lowering and its
-gating characterizations, and the concrete projected-`Deinit` and `Discriminant`
-witnesses of `Correspondence.Witness`, including the negative controls. -/
+`step_correspondence_D`, and the whole-execution lifts), the byte-store lemmas of
+`Correspondence.DeinitLemmas`, the `Rvalue::Discriminant` lowering and its gating
+characterizations, and the concrete projected-`Deinit` and `Discriminant` witnesses of
+`Correspondence.Witness`, including the negative controls. The `Anneal`-side bridge
+`Correspondence.DeinitBridge` (and its hook `subplace_audit_closure`, whose proof term
+mentions every Episode 2 theorem of `Anneal.Mir.AdtAndControl` Section 4) is audited by its
+own `[SUBPLACE-AUDIT]` group. -/
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   MiniRustSpec.Correspondence.Witness in
@@ -5409,9 +5412,6 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   resolveFieldPath_deinit_unit
   evalStatement_deinit_fieldPath
   evalStmt_deinit_field
-  evalDeinitPlace_spec_minirust_store_simulation
-  paddedDeinitSiblingReinit_anneal_shell_agreement
-  subplace_audit_closure
   translateRvalue_discriminant
   evalValue_orderingDiscrExpr
   evalValue_orderingDiscrExpr_ub
@@ -5427,6 +5427,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedRetagRead_anneal_ub
   paddedRetagRead_minirust_ret
   paddedDeinitRead_not_inFragmentD
+  paddedRetagRead_not_inFragmentD
   deinitSiblingReinit_inFragmentD
   deinitSiblingReinit_minirust_ret_from_start
   deinitSiblingReinit_minirust_noUB

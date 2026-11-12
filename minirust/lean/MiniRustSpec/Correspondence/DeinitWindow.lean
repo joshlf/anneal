@@ -35,7 +35,8 @@ and every theorem stated over `inFragment` keep their meaning. Instead:
   scalar field of positive size (`deinitTargetOk`); that while the hole is open the only
   statements are disjoint sibling reads `_r = copy _t.g` (`siblingReadOk`), possibly through an
   integer cast (`castSiblingReadOk`: `_r = Cast(IntToInt, copy _t.g, it)`), hole-independent scalar
-  local copies `_r = copy _q` (`localCopyWindowOk`), and the re-initialization of the hole's byte
+  local copies `_r = copy _q` (`localCopyWindowOk`) and binary operations
+  `_r = BinaryOp(op, copy _q, const c)` (`binOpWindowOk`), and the re-initialization of the hole's byte
   range by an integer constant of the field's type (`reinitOk`: `_t.f = const c`), by copying a
   distinct integer local of the field's type (`reinitCopyOk`: `_t.f = copy _r`), or by an integer
   binary operation of a distinct integer local and a constant (`reinitBinOpOk`:
@@ -53,13 +54,14 @@ correspondence `StepRelD`:
   erased body and the *actual* translation `translateFn body`, which agree on the current
   statement and terminator (`blk_eraseDeinit`, `stepMirFn_eraseDeinit_stmt`,
   `stepMirFn_eraseDeinit_term`);
-* sibling read (`step_window_read`, `step_window_cast_read`), local copy
-  (`step_window_local_copy`), and constant, local-copy, or binary-operation re-initialization
-  (`step_window_reinit`, `step_window_reinit_copy`, `step_window_reinit_binop`) while the hole is
-  open: the MiniRust step is computed on the hole-free and on the actual machine by the
-  allocation-data-parametric `evalStatement_siblingRead_any`, `evalStatement_castSiblingRead_any`,
-  `evalStatement_localCopy_any`, `evalStatement_reinit_any`, `evalStatement_reinitCopy_any`, and
-  `evalStatement_reinitBinOp_any`.
+* sibling read (`step_window_read`, `step_window_cast_read`), local copy or binary operation
+  (`step_window_local_copy`, `step_window_binop_local`), and constant, local-copy, or
+  binary-operation re-initialization (`step_window_reinit`, `step_window_reinit_copy`,
+  `step_window_reinit_binop`) while the hole is open: the MiniRust step is computed on the
+  hole-free and on the actual machine by the allocation-data-parametric
+  `evalStatement_siblingRead_any`, `evalStatement_castSiblingRead_any`,
+  `evalStatement_localCopy_any`, `evalStatement_binOpWindow_any`, `evalStatement_reinit_any`,
+  `evalStatement_reinitCopy_any`, and `evalStatement_reinitBinOp_any`.
   The read loads the same bytes (`spliceAt_drop_take_disjoint`) into `_r`'s allocation, which is
   not `_t`'s, and keeps the hole; the re-initialization overwrites the hole (`spliceAt_same`), so
   both machines agree and the hole closes.
@@ -78,7 +80,10 @@ for `inFragment`; `Witness.deinitSiblingReinit_minirust_ret_from_start`,
 `Witness.deinitSiblingReinit_minirust_noUB`, `Witness.deinitSiblingCopyReinit_minirust_ret_from_start`,
 `Witness.deinitSiblingRelayReinit_minirust_ret_from_start`,
 `Witness.paddedDeinitSiblingReinit_minirust_ret_from_start` (cast sibling read and `BinaryOp`
-re-initialization), and `Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate
+re-initialization), `Witness.deinitSiblingBinOpWindowReinit_minirust_ret_from_start` (a
+hole-independent `BinaryOp` into a local inside the window),
+`Witness.paddedDeinitBinOpDivZero_minirust_ub_from_start`, and
+`Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate
 `mirCall_ret_D`, `mirCall_noUB_D`, and `mirCall_ub_D` on concrete bodies.
 -/
 

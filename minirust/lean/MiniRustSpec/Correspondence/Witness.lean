@@ -13960,6 +13960,19 @@ theorem paddedDeinitRead_not_inFragmentD :
       deinitWindowOk paddedDeinitRead = false ∧ inFragmentD paddedDeinitRead = false := by
   decide
 
+/-- Negative control for projected `Retag`: `inFragmentD` erases only projected `Deinit`s, so
+`paddedRetagRead` (`Retag(_1.1)` on a `u32` field, where Anneal faults while MiniRust's `Validate`
+succeeds and returns `99`: `paddedRetagRead_anneal_ub`, `paddedRetagRead_minirust_ret`) is its own
+erasure, passes the (vacuous) window check, and is still rejected through `statementOk_retag_proj`.
+A `TupleSpec` has only integer leaves, so every projected `Retag` of a `TupleSpec` place is such a
+scalar `Retag`; admitting projected `Retag` needs Anneal's scalar `Retag` to agree with MiniRust's
+`Validate`, which is the identity on integers (`retagVal_int_id`). -/
+theorem paddedRetagRead_not_inFragmentD :
+    eraseDeinit paddedRetagRead = paddedRetagRead ∧
+      inFragment (eraseDeinit paddedRetagRead) = false ∧
+      deinitWindowOk paddedRetagRead = true ∧ inFragmentD paddedRetagRead = false :=
+  ⟨rfl, by decide, by decide, by decide⟩
+
 /-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
 check used to fail): its open-hole window is the sibling read through an integer cast
 `_2 = Cast(IntToInt, copy _1.0, u32)` (`castSiblingReadOk`: the `u8` field `_1.0` at byte `0` is

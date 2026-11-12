@@ -11,6 +11,7 @@ those terms.
 import Anneal.Mir.AdtAndControl
 import MiniRustSpec.Correspondence.AnnealEval
 import MiniRustSpec.Correspondence.DeinitLemmas
+import MiniRustSpec.Audit
 
 /-!
 # Projected `Deinit`: Anneal's `PartialShell` model and MiniRust's byte-slice `Uninit` store
@@ -34,6 +35,12 @@ operation, without any flow-sensitive overwrite guard:
   `deinitBytes img off len`, which represents Anneal's post-`Deinit` `PartialShell`
   (`Anneal.Mir.AdtAndControl.evalDeinitPlace_spec_bytes_simulation`), while every byte outside the
   slice is unchanged.
+
+This is the only `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`. It is a separate
+build root (`lake build MiniRustSpec.Correspondence.DeinitBridge`), outside the import closure of
+`MiniRustSpec` and `MiniRustSpec.Audit`, so that `lake build MiniRustSpec` does not depend on
+`Anneal.Mir.*` (which is not part of the default `Anneal` target); it imports `MiniRustSpec.Audit`
+and audits itself (`[SUBPLACE-AUDIT]` at the end of this module).
 -/
 
 namespace MiniRustSpec.Correspondence.DeinitBridge
@@ -185,14 +192,13 @@ theorem paddedDeinitSiblingReinit_anneal_shell_agreement :
       .ok (.scalar ⟨42, 4⟩) := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> with_unfolding_all rfl
 
-/-- **Axiom-audit hook for Episode 2's sub-place model (`subplace_audit_closure`)**:
-`MiniRustSpec.Audit`'s `#assert_all_minirustspec_standard_axioms` checks every declaration of
-the imported `MiniRustSpec.*` modules (this one included, see `IntrinsicBoundary`'s import), but
-not the `Anneal.*` theorems of `Anneal.Mir.AdtAndControl` Section 4 (synthetic sub-place
-pointers, `Deref` places, sub-place `CopyNonOverlapping`, and their Trusted refinement and
-non-vacuity witnesses). This theorem's proof term mentions each of them, so its axioms are the
-union of theirs and that exhaustive audit fails unless every one uses only the standard axioms
-(in particular no `sorryAx` and no `Lean.ofReduceBool`). -/
+/-- **Axiom-audit hook for Episode 2's sub-place model (`subplace_audit_closure`)**: the `Anneal.*`
+theorems of `Anneal.Mir.AdtAndControl` Section 4 (synthetic sub-place pointers, `Deref` places,
+sub-place `CopyNonOverlapping`, `move` through `Deref`, two-level `Deref` chains, and their Trusted
+refinement and non-vacuity witnesses) are not `MiniRustSpec.*` declarations. This theorem's proof
+term mentions each of them, so its axioms are the union of theirs, and the `[SUBPLACE-AUDIT]` group
+at the end of this module fails unless every one uses only the standard axioms (in particular no
+`sorryAx` and no `Lean.ofReduceBool`). -/
 theorem subplace_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.localBaseAddr_eq_some
   let _ := @Anneal.Mir.AdtAndControl.localBaseAddr_fits
@@ -343,5 +349,17 @@ theorem subplace_audit_closure : True :=
   let _ := @evalStmt_deinit_field
   let _ := @paddedDeinitSiblingReinit_anneal_shell_agreement
   trivial
+
+/-! ## Self-audit
+
+`[SUBPLACE-AUDIT]`: every theorem of this module, including `subplace_audit_closure`, depends only
+on the standard axioms. -/
+
+#check_theorem_deps "[SUBPLACE-AUDIT]"
+  length_toAbstractBytes
+  toAbstractBytes_deinitBytes
+  evalDeinitPlace_spec_minirust_store_simulation
+  paddedDeinitSiblingReinit_anneal_shell_agreement
+  subplace_audit_closure
 
 end MiniRustSpec.Correspondence.DeinitBridge
