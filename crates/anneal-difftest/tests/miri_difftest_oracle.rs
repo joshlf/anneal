@@ -176,8 +176,11 @@ manifest_ext = {
     if "known_anneal_bug" in t
     and t["known_anneal_bug"].get("observed_anneal_tag", "").startswith("externalCall:")
 }
-assert len(manifest_ext) == 1, f"expected 1 externalCall entry in manifest, got {manifest_ext}"
-assert manifest_ext == {"panic_explicit_macro"}, f"unexpected externalCall entries: {manifest_ext}"
+# `panic_explicit_macro` no longer carries an `externalCall` bug: its `Verify`
+# module proves a modular safe-panic certificate instead. The oracle below still
+# reconciles its panic site through the `fmtArgumentsCtorStub` link.
+assert len(manifest_ext) == 0, f"expected 0 externalCall entries in manifest, got {manifest_ext}"
+assert manifest_ext == set(), f"unexpected externalCall entries: {manifest_ext}"
 
 findings = data["findings"]
 assert len(findings) == 0

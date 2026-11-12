@@ -34,6 +34,20 @@ Every test in [`corpus/src/lib.rs`](corpus/src/lib.rs) is a self-contained,
      via `verifySafePanicMirPointBounded`, certifying that execution unwinds
      cleanly via `MirOutcome.panic` without exhibiting Undefined Behavior
      while refuting total normal termination.
+   - **`panic` after an external call
+     (`ModularVerificationResult ∧ ¬ TotalClaim.holds`)**: A test whose MIR
+     calls a function that `corpus/` does not capture before it panics (such
+     as `panic_explicit_macro`, whose `panic!("...")` calls
+     `core::fmt::Arguments::<'a>::from_str` before
+     `core::panicking::panic_fmt`) is proved via
+     `verifyModularSafePanicMirBounded`. Its `StatefulClaim` is false, because
+     the claim lets the external call return a memory with a corrupted call
+     frame on which the caller can fault. The certificate instead assumes only
+     that every external call returns or unwinds to the caller's call frame
+     (`callFramePreserved`), or aborts, and certifies that under that
+     assumption execution never faults and never returns normally. The
+     statement spells out that frame-preserving contract with `Trusted.*`
+     constants only.
    - **`ub` (`¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds`)**: Proved via
      `refuteMirPointByStrictUB`, which requires
      `reachesStrictUBBounded = true` (`MirOutcome.fault .ub`), and checked
@@ -55,9 +69,12 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 89 tests: 41 `pass`, 10 `panic` (including the tracked
-`panic_explicit_macro` bug), and 38 `ub`, grouped into eight categories that
-`// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
+The corpus holds 89 tests: 41 `pass`, 10 `panic` (9 certified via
+`verifySafePanicMirPointBounded` and `panic_explicit_macro` via
+`verifyModularSafePanicMirBounded`), and 38 `ub`, grouped into eight categories
+that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
+Anneal agrees with Miri on all 89 tests: `manifest.toml` records no open
+`known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
 `&mut SingleC` projection/reinit):
@@ -109,16 +126,18 @@ pin each of these divergences, and `miri-difftest` mutators avoid them:
    an Anneal bug is fixed so that Anneal agrees with Miri,
    `known_anneal_bug_ratchet` fails to compile until the `known_anneal_bug`
    block is deleted from `manifest.toml`, ratcheting the open bug count down
-   toward zero. Also, `parse_miri_diff_manifest` rejects any `known_anneal_bug`
-   whose `observed_anneal_tag` already matches `miri_verdict` (or whose
+   toward zero. Because `evalMirDiffTagBounded` stops at the first external
+   call, the ratchet of a `panic` test also asserts
+   `reachesModularSafePanicBounded ... = false`, so it fails to compile as soon
+   as `verifyModularSafePanicMirBounded` can certify the test. Also,
+   `parse_miri_diff_manifest` rejects any `known_anneal_bug` whose
+   `observed_anneal_tag` already matches `miri_verdict` (or whose
    `ub_location_mismatch` `observed_anneal_ub_span` already contains
    `miri_ub_span`).
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-| Bug Class | Suspected Component | Affected Corpus Tests | Root Cause |
-| :--- | :--- | :--- | :--- |
-| Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` | `panic_explicit_macro` | `panic!("...")` first calls `core::fmt::Arguments::<'a>::from_str`, which `Trusted` does not model and the corpus does not capture, so evaluation stops at that external call before reaching `core::panicking::panic_fmt`. |
+The suite currently exposes no open Anneal bug: all 89 tests agree with Miri.
 
 ## Running the Suite
 

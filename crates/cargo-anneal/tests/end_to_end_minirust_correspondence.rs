@@ -61,11 +61,11 @@ mod anneal_specr_lean {
 
 use anneal_rustc_capture::sha256_hex;
 use cargo_anneal::{
-    CliSubcommand, DeclChangeKind, FileIssueOptions, FileIssueOutcome, cross_check_miri_diff,
-    diff_snapshot_directories, file_github_issue, format_github_issue, load_miri_diff_manifest,
-    parse_cli_args, parse_correspondence_bugs_args, parse_correspondence_gaps,
-    parse_minirust_sync_args, render_snapshot_diff_markdown, run_correspondence_bugs_cli,
-    run_minirust_sync_cli,
+    CliSubcommand, DeclChangeKind, FileIssueOptions, FileIssueOutcome, KnownAnnealBugSpec,
+    MiriDiffVerdictSpec, cross_check_miri_diff, diff_snapshot_directories, file_github_issue,
+    format_github_issue, load_miri_diff_manifest, parse_cli_args, parse_correspondence_bugs_args,
+    parse_correspondence_gaps, parse_minirust_sync_args, render_snapshot_diff_markdown,
+    run_correspondence_bugs_cli, run_minirust_sync_cli,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -491,29 +491,35 @@ fn gate3_cross_check_real_miri_diff_manifest() {
         "expected non-empty test corpus in tests/miri-diff/manifest.toml"
     );
 
-    // Valid cross-ref (`panic_explicit_macro` has an open known_anneal_bug in manifest.toml).
-    let valid_xref_toml = baseline_valid_gaps_toml().replace(
+    // The real manifest records no open Anneal bug, so a "closed" gap may
+    // cross-reference the retired `panic_explicit_macro` bug.
+    let closed_xref_toml = baseline_valid_gaps_toml().replace(
+        "status = \"open\"",
+        "status = \"closed\"",
+    ).replace(
         "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
         "miri_diff_cross_ref = \"panic_explicit_macro\"",
     );
-    let valid_registry = parse_correspondence_gaps(&valid_xref_toml).unwrap();
-    let cross_report = cross_check_miri_diff(&miri_manifest, &valid_registry)
-        .expect("valid cross-reference against real manifest.toml must succeed");
-    assert_eq!(cross_report.total_miri_known_bugs, 1);
+    let closed_xref_reg = parse_correspondence_gaps(&closed_xref_toml).unwrap();
+    let closed_report = cross_check_miri_diff(&miri_manifest, &closed_xref_reg)
+        .expect("closed cross-reference to a retired Miri bug must succeed");
+    assert_eq!(closed_report.total_miri_known_bugs, 0);
+    assert!(closed_report.unlinked_miri_bugs.is_empty());
     assert_eq!(
-        cross_report.matched_cross_refs,
+        closed_report.matched_cross_refs,
         vec![(
             "GAP-MR-0001".to_string(),
             "panic_explicit_macro".to_string()
         )]
     );
 
-    // Cross-referencing `pass_tb_unsafe_cell_shared_mutation` or
-    // `pass_direct_fn_call` (both now fixed!) or `pass_integer_arith_basic` as
-    // an `"open"` gap must fail!
+    // Cross-referencing `pass_tb_unsafe_cell_shared_mutation`,
+    // `pass_direct_fn_call`, or `panic_explicit_macro` (all now fixed!) or
+    // `pass_integer_arith_basic` as an `"open"` gap must fail!
     for passing_test in [
         "pass_tb_unsafe_cell_shared_mutation",
         "pass_direct_fn_call",
+        "panic_explicit_macro",
         "pass_integer_arith_basic",
         "pass_ptr_offset_within_array",
     ] {
@@ -530,16 +536,43 @@ fn gate3_cross_check_real_miri_diff_manifest() {
         );
     }
 
-    // Cross-referencing an open known_anneal_bug from a "closed" gap must fail!
-    let closed_xref_toml = baseline_valid_gaps_toml().replace(
-        "status = \"open\"",
-        "status = \"closed\"",
-    ).replace(
+    // With an open Anneal bug recorded on `panic_explicit_macro` (as the
+    // manifest did before the modular safe-panic certificate retired it), an
+    // "open" gap may cross-reference it and a "closed" gap must not.
+    let mut open_bug_manifest = miri_manifest.clone();
+    open_bug_manifest
+        .tests
+        .iter_mut()
+        .find(|t| t.name == "panic_explicit_macro")
+        .expect("find panic_explicit_macro")
+        .known_anneal_bug = Some(KnownAnnealBugSpec {
+        status: "open_bug".to_string(),
+        bug_class: "incompleteness_unmodeled_intrinsic_or_call".to_string(),
+        observed_anneal_tag: MiriDiffVerdictSpec::ExternalCall(
+            "core::fmt::Arguments::<'a>::from_str".to_string(),
+        ),
+        observed_anneal_ub_span: None,
+        suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators".to_string(),
+        summary: "Synthetic open bug for the Gate 3 cross-check.".to_string(),
+    });
+    let valid_xref_toml = baseline_valid_gaps_toml().replace(
         "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
         "miri_diff_cross_ref = \"panic_explicit_macro\"",
     );
-    let closed_xref_reg = parse_correspondence_gaps(&closed_xref_toml).unwrap();
-    let closed_xref_err = cross_check_miri_diff(&miri_manifest, &closed_xref_reg)
+    let valid_registry = parse_correspondence_gaps(&valid_xref_toml).unwrap();
+    let cross_report = cross_check_miri_diff(&open_bug_manifest, &valid_registry)
+        .expect("valid cross-reference against an open Miri bug must succeed");
+    assert_eq!(cross_report.total_miri_known_bugs, 1);
+    assert_eq!(
+        cross_report.matched_cross_refs,
+        vec![(
+            "GAP-MR-0001".to_string(),
+            "panic_explicit_macro".to_string()
+        )]
+    );
+
+    // Cross-referencing an open known_anneal_bug from a "closed" gap must fail!
+    let closed_xref_err = cross_check_miri_diff(&open_bug_manifest, &closed_xref_reg)
         .expect_err("cross-referencing an open Miri test from a closed gap must fail");
     assert!(
         closed_xref_err.contains("panic_explicit_macro") && closed_xref_err.contains("still carries a known_anneal_bug"),

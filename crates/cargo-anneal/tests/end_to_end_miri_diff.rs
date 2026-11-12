@@ -23,12 +23,16 @@
 //!      including `pass_direct_fn_call`, whose claim links the captured
 //!      `helper_add_ten` body as a callee.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
-//!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
+//!      `¬ TotalClaim.holds` for the 9 `panic` tests that panic without an
+//!      external call, and `ModularVerificationResult` (`post := False` under
+//!      a frame-preserving rely contract on external calls) and
+//!      `¬ TotalClaim.holds` for `panic_explicit_macro`, which panics after
+//!      calling the uncaptured `core::fmt::Arguments::<'a>::from_str`.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
 //!      `MiriOracleProbe.lean` for all 38 non-bug `ub` tests.
-//!    - Enforces the `evalMirDiffTagBounded` equality ratchet for the single
-//!      open Anneal bug (`panic_explicit_macro`, `[tests.known_anneal_bug]`).
+//!    - Records no open Anneal bug (`[tests.known_anneal_bug]`), so the
+//!      corpus agrees with Miri on all 89 tests.
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
@@ -41,13 +45,17 @@
 //!      `safe_reborrow_then_parent_write`, `pass_exact_div_valid`,
 //!      `ub_exact_div_non_multiple`,
 //!      `pass_copy_nonoverlapping_uninit_bytes_to_uninit`,
-//!      `pass_tb_unsafe_cell_shared_mutation`, or `pass_direct_fn_call`) fails
-//!      to build in Lake.
+//!      `pass_tb_unsafe_cell_shared_mutation`, `pass_direct_fn_call`, or
+//!      `panic_explicit_macro`) fails to build in Lake.
+//!    - Verifies that a `StatefulVerificationResult` certificate for
+//!      `panic_explicit_macro` fails to build in Lake, so that test needs the
+//!      modular certificate.
 //!    - Verifies that reintroducing a stale `ub_location_mismatch` ratchet on
 //!      `ub_tb_use_frozen_mut_after_parent_read` (`src/lib.rs:606:23: 606:28`)
 //!      fails to build in Lake.
-//! 4. Callee-linked certificate shapes: `panic` and `ub` certificates rendered
-//!    with a linked (unused) intra-crate callee still build in Lake.
+//! 4. Callee-linked certificate shapes: stateful and modular `panic` and `ub`
+//!    certificates rendered with a linked (unused) intra-crate callee still
+//!    build in Lake.
 
 use std::env;
 use std::fs;
@@ -56,11 +64,12 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cargo_anneal::{
-    KnownAnnealBugSpec, MiriDiffConfig, MiriDiffTestEntry, MiriDiffVerdictSpec, MiriToolchain,
-    SourcePos, SourceSpan, load_miri_diff_manifest, parse_miri_diff_manifest,
-    render_miri_diff_report, render_miri_diff_verify_module,
-    render_miri_diff_verify_module_with_callees, run_lake_verify_targets, run_miri_diff_suite,
-    verify_miri_diff_ub_locations,
+    KnownAnnealBugSpec, MiriDiffConfig, MiriDiffPanicCertificate, MiriDiffTestEntry,
+    MiriDiffVerdictSpec, MiriToolchain, SourcePos, SourceSpan, load_miri_diff_manifest,
+    parse_miri_diff_manifest, render_miri_diff_report, render_miri_diff_verify_module,
+    render_miri_diff_verify_module_with_callees,
+    render_miri_diff_verify_module_with_panic_certificate, run_lake_verify_targets,
+    run_miri_diff_suite, verify_miri_diff_ub_locations,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -128,13 +137,14 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
     assert_eq!(manifest.tests.len(), 89);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
-    // `miri_verdict` (either by tag or by `ub_location_mismatch`).
+    // `miri_verdict` (either by tag or by `ub_location_mismatch`); none remain
+    // open.
     let bug_count = manifest
         .tests
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 1);
+    assert_eq!(bug_count, 0);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -422,18 +432,25 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     let report = run_miri_diff_suite(&config).expect("89-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 89);
     assert_eq!(report.verified_pass_count, 41);
-    assert_eq!(report.verified_panic_count, 9);
+    assert_eq!(report.verified_panic_count, 10);
     assert_eq!(report.verified_strict_ub_count, 38);
-    assert_eq!(report.ratcheted_known_bug_count, 1);
-    // 41 pass + 9 panic + 1 helper (`helper_add_ten`) = 51 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 51);
-    assert!(
-        report
-            .audited_certificate_modules
-            .iter()
-            .any(|m| m == "Verify.MiriDiffCorpus.pass_direct_fn_call"),
-        "pass_direct_fn_call must be an audited certificate module: {:?}",
-        report.audited_certificate_modules
+    assert_eq!(report.ratcheted_known_bug_count, 0);
+    // 41 pass + 10 panic + 1 helper (`helper_add_ten`) = 52 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 52);
+    for module in [
+        "Verify.MiriDiffCorpus.pass_direct_fn_call",
+        "Verify.MiriDiffCorpus.panic_explicit_macro",
+    ] {
+        assert!(
+            report.audited_certificate_modules.iter().any(|m| m == module),
+            "{module} must be an audited certificate module: {:?}",
+            report.audited_certificate_modules
+        );
+    }
+    // Only `panic_explicit_macro` reaches an external call before panicking.
+    assert_eq!(
+        report.modular_panic_certificate_modules,
+        vec!["Verify.MiriDiffCorpus.panic_explicit_macro".to_string()]
     );
 
     let summary = render_miri_diff_report(&report);
@@ -457,6 +474,30 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
     assert!(direct_call_verify.contains("Lower.verifyTotalMirBounded _ 128"));
     assert!(!direct_call_verify.contains("known_anneal_bug_ratchet"));
+
+    // `panic_explicit_macro` panics after an external call, so its certificate
+    // is a `ModularVerificationResult` whose statement spells out the
+    // frame-preserving contract with `Trusted.*` constants only. A panic
+    // without an external call keeps the stateful certificate.
+    let macro_verify = fs::read_to_string(verify_dir.join("panic_explicit_macro.lean"))
+        .expect("read panic_explicit_macro verify module");
+    assert!(macro_verify.contains("-- @anneal-miri-diff-kind: panic_modular\n"));
+    assert!(macro_verify.contains(
+        "theorem verified :\n    ModularVerificationResult {\n      \
+         body := Mir.MiriDiffCorpus.panic_explicit_macro.body\n      \
+         envAssumed := MirCallContract.holdsOn {\n"
+    ));
+    assert!(macro_verify.contains(
+        "(verifyModularSafePanicMirBounded Mir.MiriDiffCorpus.panic_explicit_macro.body \
+         [] 128 [] emptyMemory).1"
+    ));
+    assert!(!macro_verify.contains("known_anneal_bug_ratchet"));
+    assert!(!macro_verify.contains("framePreservingCallContract"));
+    let assert_panic_verify = fs::read_to_string(verify_dir.join("panic_checked_add_overflow.lean"))
+        .expect("read panic_checked_add_overflow verify module");
+    assert!(assert_panic_verify.contains("theorem verified :\n    StatefulVerificationResult {"));
+    assert!(assert_panic_verify.contains("verifySafePanicMirPointBounded"));
+    assert!(!assert_panic_verify.contains("ModularVerificationResult"));
 
     // Negative check 1: `refuteMirPointByStrictUB` must reject an item that
     // stops on `externalCall` (or normal return) rather than `FailureKind.ub`.
@@ -613,6 +654,17 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             None,
             MiriDiffVerdictSpec::ExternalCall("miri_diff_corpus::helper_add_ten".to_string()),
         ),
+        // `evalMirDiffTagBounded` still stops at this external call, so only
+        // the ratchet's `reachesModularSafePanicBounded ... = false` conjunct
+        // rejects the reintroduced entry.
+        (
+            "panic_explicit_macro",
+            "control_flow_and_calls",
+            "tests/panic/panic1.rs",
+            MiriDiffVerdictSpec::Panic,
+            None,
+            MiriDiffVerdictSpec::ExternalCall("core::fmt::Arguments::<'a>::from_str".to_string()),
+        ),
     ] {
         // Render each ratchet the way `stage_miri_diff_workspace` does, with the
         // test's captured intra-crate callees linked. Without linking,
@@ -658,6 +710,74 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             "reintroducing fixed known_anneal_bug ratchet for `{fixed_name}` must fail in Lake"
         );
     }
+
+    // Control for negative check 2: the bare `evalMirDiffTagBounded` equality
+    // (the ratchet shape of a non-`panic` verdict) still builds for
+    // `panic_explicit_macro`, so the reintroduced `panic` ratchet above fails
+    // only because of its `reachesModularSafePanicBounded ... = false` conjunct.
+    // Negative check 2b: the stateful certificate cannot certify
+    // `panic_explicit_macro`, because `StatefulClaim.holds` lets the external
+    // call return a memory on which the caller can fault.
+    let macro_path = verify_dir.join("panic_explicit_macro.lean");
+    let macro_content = fs::read_to_string(&macro_path).expect("read panic_explicit_macro module");
+    let macro_entry = MiriDiffTestEntry {
+        name: "panic_explicit_macro".to_string(),
+        category: "control_flow_and_calls".to_string(),
+        upstream_path: "tests/panic/panic1.rs".to_string(),
+        miri_verdict: MiriDiffVerdictSpec::Panic,
+        miri_ub_span: None,
+        fuel: 128,
+        known_anneal_bug: None,
+    };
+    let bare_tag_entry = MiriDiffTestEntry {
+        miri_verdict: MiriDiffVerdictSpec::PassUnit,
+        known_anneal_bug: Some(KnownAnnealBugSpec {
+            status: "open_bug".to_string(),
+            bug_class: "incompleteness_unmodeled_intrinsic_or_call".to_string(),
+            observed_anneal_tag: MiriDiffVerdictSpec::ExternalCall(
+                "core::fmt::Arguments::<'a>::from_str".to_string(),
+            ),
+            observed_anneal_ub_span: None,
+            suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics".to_string(),
+            summary: "Bare tag equality control.".to_string(),
+        }),
+        ..macro_entry.clone()
+    };
+    let (bare_tag_lean, _) = render_miri_diff_verify_module(
+        "MiriDiffCorpus",
+        "miri_diff_corpus::panic_explicit_macro",
+        &bare_tag_entry,
+    )
+    .expect("render bare tag equality control");
+    assert!(!bare_tag_lean.contains("reachesModularSafePanicBounded"));
+    fs::write(&macro_path, bare_tag_lean).expect("write bare tag equality control");
+    let bare_tag_res = run_lake_verify_targets(
+        &dot_anneal,
+        &["Verify.MiriDiffCorpus.panic_explicit_macro".to_string()],
+    );
+    let (stateful_lean, stateful_cert) = render_miri_diff_verify_module_with_panic_certificate(
+        "MiriDiffCorpus",
+        "miri_diff_corpus::panic_explicit_macro",
+        &macro_entry,
+        &[],
+        MiriDiffPanicCertificate::Stateful,
+    )
+    .expect("render stateful panic certificate");
+    assert!(stateful_cert && stateful_lean.contains("StatefulVerificationResult"));
+    fs::write(&macro_path, stateful_lean).expect("write stateful panic certificate");
+    let stateful_res = run_lake_verify_targets(
+        &dot_anneal,
+        &["Verify.MiriDiffCorpus.panic_explicit_macro".to_string()],
+    );
+    fs::write(&macro_path, macro_content).expect("restore panic_explicit_macro module");
+    assert!(
+        bare_tag_res.is_ok(),
+        "bare evalMirDiffTagBounded equality for panic_explicit_macro must still build: {bare_tag_res:?}"
+    );
+    assert!(
+        stateful_res.is_err(),
+        "a StatefulVerificationResult certificate for panic_explicit_macro must fail in Lake"
+    );
 
     // Negative check 3: If an open Anneal bug changes behavior (e.g., is fixed
     // to return 300 instead of 100), the `known_anneal_bug_ratchet` theorem
@@ -767,14 +887,15 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "unexpected error: {corrupted_err}"
     );
 
-    // Positive check 6: the callee-linked `panic` and `ub` certificate shapes
-    // (which no corpus test currently needs) elaborate and kernel-check. Linking
-    // `helper_add_ten` into tests that never call it must not change their
-    // outcome.
+    // Positive check 6: the callee-linked stateful `panic`, modular `panic`, and
+    // `ub` certificate shapes (which no corpus test currently needs) elaborate
+    // and kernel-check. Linking `helper_add_ten` into tests that never call it
+    // must not change their outcome.
     let manifest = load_miri_diff_manifest(&manifest_path).expect("load checked-in manifest");
-    for linked_name in [
-        "panic_checked_add_overflow",
-        "ub_unchecked_add_overflow_u32",
+    for (linked_name, panic_certificate) in [
+        ("panic_checked_add_overflow", MiriDiffPanicCertificate::Stateful),
+        ("panic_explicit_macro", MiriDiffPanicCertificate::Modular),
+        ("ub_unchecked_add_overflow_u32", MiriDiffPanicCertificate::Stateful),
     ] {
         let linked_entry = manifest
             .tests
@@ -783,11 +904,12 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             .expect("find callee-linked certificate test");
         let orig_path = verify_dir.join(format!("{linked_name}.lean"));
         let orig_content = fs::read_to_string(&orig_path).expect("read original verify module");
-        let (linked_lean, _) = render_miri_diff_verify_module_with_callees(
+        let (linked_lean, _) = render_miri_diff_verify_module_with_panic_certificate(
             "MiriDiffCorpus",
             &format!("miri_diff_corpus::{linked_name}"),
             linked_entry,
             &["MiriDiffCorpus.helper_add_ten".to_string()],
+            panic_certificate,
         )
         .expect("render callee-linked certificate");
         assert!(linked_lean.contains("callees := [Mir.MiriDiffCorpus.helper_add_ten.body]"));

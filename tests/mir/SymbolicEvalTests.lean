@@ -2885,6 +2885,310 @@ theorem scalar_enum_return_b1_hardening_confirmed :
       (MirDiffTag.normalOther, "none") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! ## 13. Safe Panics Across Uninterpreted External Calls (`verifyModularSafePanicMirBounded`) -/
+
+private def unitMirTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+private def neverMirTy : Ty := { kind := .never, layoutIdx := 0 }
+private def fmtArgumentsMirTy : Ty :=
+  { kind := .adt "core::fmt::Arguments" [], layoutIdx := 0 }
+
+/--
+Calls the unlinked `core::fmt::Arguments::<'a>::from_str` into `_1` and then
+`core::panicking::panic_fmt(move _1)` (`target = .none`), as the expansion of
+`panic!("...")` does.
+-/
+def fmtPanicMir : CapturedMir :=
+  mkMirBody "sym_test::fmt_panic" 0
+    [ mkDecl .mut unitMirTy
+    , mkDecl .mut fmtArgumentsMirTy
+    , mkDecl .not neverMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1), mkStmt (.storageLive 2) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "core::fmt::Arguments::<'a>::from_str")
+            [u32ConstOperand 7]
+            { local_ := 1, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "core::panicking::panic_fmt")
+            [.move { local_ := 1, projection := [] }]
+            { local_ := 2, projection := [] }
+            .none
+            .continue_)
+        isCleanup := false } ]
+
+/--
+The pure differential classifier stops at the external call, so a
+`known_anneal_bug_ratchet` for `fmtPanicMir` must also check
+`reachesModularSafePanicBounded`, which continues past it.
+-/
+theorem fmtPanic_classifier_stops_at_external_call :
+    evalMirDiffTagBounded 16 fmtPanicMir
+        (initMachineStateWithMemory fmtPanicMir [] emptyMemory) =
+      .externalCall "core::fmt::Arguments::<'a>::from_str" ∧
+    reachesPanicBounded 16 fmtPanicMir
+        (initMachineStateWithMemory fmtPanicMir [] emptyMemory) = false ∧
+    reachesModularSafePanicBounded 16 fmtPanicMir
+        (initMachineStateWithMemory fmtPanicMir [] emptyMemory) = true :=
+  ⟨rfl, rfl, rfl⟩
+
+/--
+Modular safe-panic certificate for `fmtPanicMir`, stated as generated `Verify`
+certificates state it: the frame-preserving contract is spelled out with
+`Trusted.*` constants only.
+-/
+theorem fmtPanic_modular_safe_panic_verified :
+    ModularVerificationResult
+      { body := fmtPanicMir
+        envAssumed := MirCallContract.holdsOn
+          { pre := fun _ => True
+            post := fun req ans =>
+              match ans with
+              | .returned _ memAfter => callFramePreserved req.memory memAfter
+              | .panicked memAfter => callFramePreserved req.memory memAfter
+              | .aborted => True }
+        pre := fun args mem => args = [] ∧ mem = emptyMemory
+        post := fun _ _ _ _ => False } ∧
+    ¬ ({ body := fmtPanicMir
+         pre := fun args mem => args = [] ∧ mem = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds :=
+  verifyModularSafePanicMirBounded fmtPanicMir [] 16 [] emptyMemory
+
+/--
+Panics without any external call (`255 + 4` overflows `u8`): the modular
+checker agrees with `reachesPanicBounded` on call-free bodies.
+-/
+theorem advanceOffset_modular_safe_panic_verified :
+    ModularVerificationResult
+      { body := advanceOffsetSymMir
+        envAssumed := framePreservingCallContract.holdsOn
+        pre := fun a m =>
+          a = [.scalar { bits := 255, sizeBytes := 1 }] ∧ m = emptyMemory
+        post := fun _ _ _ _ => False } ∧
+    ¬ ({ body := advanceOffsetSymMir
+         pre := fun a m =>
+           a = [.scalar { bits := 255, sizeBytes := 1 }] ∧ m = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds :=
+  verifyModularSafePanicMirBounded advanceOffsetSymMir [] 8
+    [.scalar { bits := 255, sizeBytes := 1 }] emptyMemory
+
+/-- Linked helper that panics through `core::panicking::panic`. -/
+def panickingHelperMir : CapturedMir :=
+  mkMirBody "sym_test::panicking_helper" 0
+    [ mkDecl .mut unitMirTy, mkDecl .not neverMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "core::panicking::panic")
+            []
+            { local_ := 1, projection := [] }
+            .none
+            .continue_)
+        isCleanup := false } ]
+
+/--
+Calls the unlinked `sym_test::external_log` and then the linked
+`sym_test::panicking_helper`, which panics. Resolving the helper after the
+external call requires the restored callee table.
+-/
+def extCallThenLinkedPanicMir : CapturedMir :=
+  mkMirBody "sym_test::ext_call_then_linked_panic" 0
+    [ mkDecl .mut unitMirTy, mkDecl .mut u32MirTy, mkDecl .mut unitMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1), mkStmt (.storageLive 2) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_log")
+            []
+            { local_ := 1, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::panicking_helper")
+            []
+            { local_ := 2, projection := [] }
+            (.some 2)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Modular safe-panic certificate with a linked `callees` table. -/
+theorem extCallThenLinkedPanic_modular_safe_panic_verified :
+    ModularVerificationResult
+      { body := extCallThenLinkedPanicMir
+        envAssumed := framePreservingCallContract.holdsOn
+        pre := fun a m => a = [] ∧ m = emptyMemory
+        post := fun _ _ _ _ => False
+        callees := [panickingHelperMir] } ∧
+    ¬ ({ body := extCallThenLinkedPanicMir
+         pre := fun a m => a = [] ∧ m = emptyMemory
+         post := fun _ _ _ _ => True
+         callees := [panickingHelperMir] } : TotalClaim).holds :=
+  verifyModularSafePanicMirBounded extCallThenLinkedPanicMir
+    [panickingHelperMir] 24 [] emptyMemory
+
+/--
+Calls the unlinked `sym_test::external_get` into `_0` and returns it: an
+external call that returns normally admits no modular safe-panic certificate,
+and no path that returns from the call panics.
+-/
+def extCallReturnsMir : CapturedMir :=
+  mkMirBody "sym_test::ext_call_returns" 0
+    [ mkDecl .mut u32MirTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_get")
+            []
+            { local_ := 0, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+theorem extCallReturns_modular_safe_panic_rejected :
+    ¬ (∀ answers : MirCallAnswerStream,
+        reachesModularSafePanicExecBounded 8 extCallReturnsMir answers
+          (.running
+            (initMachineStateWithMemory extCallReturnsMir [] emptyMemory)) =
+          true) ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        extCallReturnsMir
+        (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
+      false := by
+  refine ⟨fun h_all => ?_, rfl⟩
+  have h_true := h_all MirCallAnswerStream.unitEmpty
+  have h_false :
+      reachesModularSafePanicExecBounded 8 extCallReturnsMir
+        MirCallAnswerStream.unitEmpty
+        (.running
+          (initMachineStateWithMemory extCallReturnsMir [] emptyMemory)) =
+          false := rfl
+  rw [h_false] at h_true
+  nomatch h_true
+
+/--
+Aborts through `core::panicking::panic_nounwind` without any external call. The
+modular checker accepts it, because an abort never returns normally, but no
+path panics, so `verifyModularSafePanicMirBounded` cannot certify it and its
+closed instance `reachesModularSafePanicBounded` is `false`. A
+`known_anneal_bug_ratchet` can therefore still record a Miri `panic` test on
+which Anneal aborts.
+-/
+def abortOnlyMir : CapturedMir :=
+  mkMirBody "sym_test::abort_only" 0
+    [ mkDecl .mut unitMirTy, mkDecl .not neverMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "core::panicking::panic_nounwind")
+            []
+            { local_ := 1, projection := [] }
+            .none
+            .continue_)
+        isCleanup := false } ]
+
+theorem abortOnly_modular_safe_panic_rejected :
+    (∀ answers : MirCallAnswerStream,
+      reachesModularSafePanicExecBounded 8 abortOnlyMir answers
+        (.running (initMachineStateWithMemory abortOnlyMir [] emptyMemory)) =
+        true) ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        abortOnlyMir (initMachineStateWithMemory abortOnlyMir [] emptyMemory) =
+      false ∧
+    reachesModularSafePanicBounded 8 abortOnlyMir
+        (initMachineStateWithMemory abortOnlyMir [] emptyMemory) = false :=
+  ⟨fun _ => rfl, rfl, rfl⟩
+
+/--
+Calls the unlinked `sym_test::external_flag` into `_1` and branches on it,
+returning normally when it is nonzero: the checker rejects a body whose outcome
+depends on a returned value.
+-/
+def extCallBranchesMir : CapturedMir :=
+  mkMirBody "sym_test::ext_call_branches" 0
+    [ mkDecl .mut unitMirTy, mkDecl .mut boolMirTy, mkDecl .not neverMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1), mkStmt (.storageLive 2) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_flag")
+            []
+            { local_ := 1, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.switchInt
+            (.copy { local_ := 1, projection := [] })
+            { branches := [(0, 2)], otherwise := 3 })
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "core::panicking::panic")
+            []
+            { local_ := 2, projection := [] }
+            .none
+            .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.aggregate .tuple [])) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+theorem extCallBranches_modular_safe_panic_rejected :
+    reachesModularSafePanicExecBounded 16 extCallBranchesMir
+        (fun _ => (.scalar { bits := 1, sizeBytes := 1 }, emptyMemory))
+        (.running
+          (initMachineStateWithMemory extCallBranchesMir [] emptyMemory)) =
+      false ∧
+    reachesModularSafePanicBounded 16 extCallBranchesMir
+        (initMachineStateWithMemory extCallBranchesMir [] emptyMemory) =
+      false :=
+  ⟨rfl, rfl⟩
+
+/--
+Reaches `unreachable` (undefined behavior) after the external call returns:
+the checker rejects a fault on any answer path.
+-/
+def extCallThenUbMir : CapturedMir :=
+  mkMirBody "sym_test::ext_call_then_ub" 0
+    [ mkDecl .mut unitMirTy, mkDecl .mut u32MirTy ]
+    [ { statements := [ mkStmt (.storageLive 1) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_get")
+            []
+            { local_ := 1, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .unreachable
+        isCleanup := false } ]
+
+theorem extCallThenUb_modular_safe_panic_rejected :
+    reachesModularSafePanicBounded 8 extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false :=
+  ⟨rfl, rfl⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!

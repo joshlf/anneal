@@ -358,7 +358,7 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
 /// Extract all `.fnDef "<def_id>"` and `implPath := "<def_id>"` references from
 /// a placed `.anneal/generated/Mir/<Item>.lean` module in deterministic
 /// first-appearance order.
-fn extract_called_fn_defs(mir_text: &str) -> Vec<String> {
+pub(crate) fn extract_called_fn_defs(mir_text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for marker in [".fnDef \"", "RigidTy.fnDef \"", "implPath := \""] {
