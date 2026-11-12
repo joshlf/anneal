@@ -5435,14 +5435,15 @@ open MiniRustSpec.Correspondence in
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 
-`[DEINIT-AUDIT]` pins the projected-`Deinit` fragment `inFragmentD` of
+`[DEINIT-AUDIT]` pins the projected-`Deinit` / projected-`Retag` fragment `inFragmentD` of
 `Correspondence.DeinitWindow` (its window rules, the one-step correspondence
 `step_correspondence_D`, and the whole-execution lifts), the byte-store bridge of
 `Correspondence.DeinitLemmas` / `Correspondence.DeinitBridge` (including
 `subplace_audit_closure`, whose proof term mentions every Episode 2 theorem of
 `Anneal.Mir.AdtAndControl` Section 4 and its Stage-1 `Retag` reconciliation), the
 `Rvalue::Discriminant` lowering and its gating characterizations, and the concrete
-projected-`Deinit`, projected-`Retag` (Stage-1 parity), and `Discriminant` witnesses of
+projected-`Deinit`, projected-`Retag` (Stage-1 parity and `inFragmentD` admission), and
+`Discriminant` witnesses of
 `Correspondence.Witness`, including the negative controls. -/
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge

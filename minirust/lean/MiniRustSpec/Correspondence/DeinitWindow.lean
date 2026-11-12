@@ -12,7 +12,7 @@ import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.DeinitLemmas
 
 /-!
-# Projected `Deinit`: the fragment `inFragmentD` and its lockstep simulation
+# Projected `Deinit` and projected `Retag`: the fragment `inFragmentD` and its lockstep simulation
 
 `Trusted.MirSemantics.evalStmt` on a projected `Deinit(_t.f1...fk)` only checks that `_t` is
 initialized and that the projected value is readable, and then advances with unchanged locals
@@ -20,13 +20,18 @@ initialized and that the projected value is readable, and then advances with unc
 `Statement::Deinit` stores `AbstractByte::Uninit` over the field's bytes and keeps every sibling
 byte (`DeinitBridge.evalStatement_deinit_fieldPath`). The two models disagree on the field until
 it is written again. The fragment below admits programs that never observe the disagreement and
-proves a full lockstep simulation for them.
+proves a full lockstep simulation for them. It also admits projected `Retag(_, _t.f1...fk)` on
+`TupleSpec` scalar fields, on which the two models agree: Stage-1 Trusted's retag of the field is a
+frame and memory no-op (`DeinitBridge.evalStmt_retag_field`), and MiniRust's `Validate` loads the
+integer and stores it back unchanged (`evalStatement_validate_field_any`, `spliceAt_eq_self`).
 
-`inFragment` is unchanged: it still rejects every projected `Deinit`, so the inclusions
-`inFragment_implies_inFragmentWithIntrinsics` and `inFragment_implies_progInFragmentWithIntrinsics`
-and every theorem stated over `inFragment` keep their meaning. Instead:
+`inFragment` is unchanged: it still rejects every projected `Deinit` and projected `Retag`, so the
+inclusions `inFragment_implies_inFragmentWithIntrinsics` and
+`inFragment_implies_progInFragmentWithIntrinsics` and every theorem stated over `inFragment` keep
+their meaning. Instead:
 
-* `eraseDeinit body` replaces every projected `Deinit(p)` by `PlaceMention(p)`;
+* `eraseDeinit body` replaces every projected `Deinit(p)` and every projected `Retag(_, p)` by
+  `PlaceMention(p)`;
 * `holeAt body blk stmt` is the per-block forward dataflow of the open *hole*: a projected
   `Deinit(_t.ps)` opens the hole `(t, ps)`, and an assignment to a place of `_t` with the hole's
   byte range (`holeRange`) closes it;
@@ -40,8 +45,10 @@ and every theorem stated over `inFragment` keep their meaning. Instead:
   range by an integer constant of the field's type (`reinitOk`: `_t.f = const c`), by copying a
   distinct integer local of the field's type (`reinitCopyOk`: `_t.f = copy _r`), or by an integer
   binary operation of a distinct integer local and a constant (`reinitBinOpOk`:
-  `_t.f = BinaryOp(op, copy _q, const c)`); and that the hole is closed before the block's
-  terminator;
+  `_t.f = BinaryOp(op, copy _q, const c)`); that a projected `Retag` targets an admissible field
+  of a not-moved-out `TupleSpec` local (`deinitTargetOk`) and, while a hole is open, only a
+  sibling field of positive size disjoint from the hole (`siblingRetagOk`); and that the hole is
+  closed before the block's terminator;
 * `inFragmentD body := inFragment (eraseDeinit body) && deinitWindowOk body`.
 
 The relation `StateRelD` is `StateRelN` of the erased body, or, while the hole `_t.ps` is open,
@@ -49,12 +56,14 @@ The relation `StateRelD` is `StateRelN` of the erased body, or, while the hole `
 differs only in the hole's `Uninit` bytes (`HoleRel`). `step_correspondence_D` proves the one-step
 correspondence `StepRelD`:
 
-* projected `Deinit` (`step_projDeinit`): Anneal keeps the locals and MiniRust writes the hole;
+* projected `Deinit` and projected `Retag` (`step_projDeinit`): Anneal keeps the locals, and
+  MiniRust writes the hole (`Deinit`) or stores the loaded field back unchanged (`Retag`);
 * any other statement or terminator while no hole is open: `step_correspondence_NF` applied to the
   erased body and the *actual* translation `translateFn body`, which agree on the current
   statement and terminator (`blk_eraseDeinit`, `stepMirFn_eraseDeinit_stmt`,
   `stepMirFn_eraseDeinit_term`);
-* sibling read (`step_window_read`, `step_window_cast_read`), local copy or binary operation
+* sibling `Retag` (`step_window_retag`), sibling read (`step_window_read`,
+  `step_window_cast_read`), local copy or binary operation
   (`step_window_local_copy`, `step_window_binop_local`), and constant, local-copy, or
   binary-operation re-initialization (`step_window_reinit`, `step_window_reinit_copy`,
   `step_window_reinit_binop`) while the hole is open: the MiniRust step is computed on the
@@ -82,7 +91,9 @@ for `inFragment`; `Witness.deinitSiblingReinit_minirust_ret_from_start`,
 `Witness.paddedDeinitSiblingReinit_minirust_ret_from_start` (cast sibling read and `BinaryOp`
 re-initialization), `Witness.deinitSiblingBinOpWindowReinit_minirust_ret_from_start` (a
 hole-independent `BinaryOp` into a local inside the window),
-`Witness.paddedDeinitBinOpDivZero_minirust_ub_from_start`, and
+`Witness.paddedRetagRead_minirust_ret_from_start` (projected `Retag` without a hole),
+`Witness.paddedDeinitSiblingRetagReinit_minirust_ret_from_start` (a sibling `Retag` inside the
+window), `Witness.paddedDeinitBinOpDivZero_minirust_ub_from_start`, and
 `Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate
 `mirCall_ret_D`, `mirCall_noUB_D`, and `mirCall_ub_D` on concrete bodies.
 -/

@@ -214,10 +214,15 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   `evalStmt_retag_scalar_noop`, and MiniRust's `Validate` stores back the
   integer it loaded: both return `99`, `paddedRetagRead_stage1_parity`);
   `statementOk` still rejects both (`statementOk_deinit_proj`,
-  `statementOk_retag_proj`); projected `Deinit` is admitted only by the separate
-  fragment `inFragmentD` (`MiniRustSpec.Correspondence.DeinitWindow`), which
-  rejects `paddedDeinitRead` (`paddedDeinitRead_not_inFragmentD`) and
-  `paddedRetagRead` (`paddedRetagRead_not_inFragmentD`).
+  `statementOk_retag_proj`); both are handled by the separate fragment
+  `inFragmentD` (`MiniRustSpec.Correspondence.DeinitWindow`), which rejects
+  `paddedDeinitRead` (`paddedDeinitRead_not_inFragmentD`) and admits
+  `paddedRetagRead` with an end-to-end correspondence
+  (`paddedRetagRead_inFragmentD`, `paddedRetagRead_minirust_ret_from_start`),
+  together with a projected `Retag` of a disjoint sibling inside an open
+  `Deinit` hole (`paddedDeinitSiblingRetagReinit_minirust_ret_from_start`) and
+  the negative control of a `Retag` overlapping the hole
+  (`paddedDeinitRetagHole_not_inFragmentD`, `paddedDeinitRetagHole_diverges`).
 * `deinitSiblingReinit`: witness #1 for projected `Deinit`
   (`StorageLive(_2); Deinit(_1.1); _2 = copy _1.0; _1.1 = const 42; _0 = copy _1.1;
   StorageDead(_2)` on `Padded(u8, u32, u16)`), admitted by `inFragmentD`

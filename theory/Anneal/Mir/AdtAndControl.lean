@@ -108,7 +108,11 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      access on places where Stage-1 retags keep the frame (`retagKeepsFrameTy`: unknown type, as
      in Trusted's untyped mode, or neither a reference nor, for non-raw retags, a raw pointer;
      raw retags of raw-pointer-typed places step unconditionally), while on typed reference
-     locals Stage-1 Trusted reborrows, minting a child tag (`evalStmt_retag_ref_typed_reborrow`,
+     locals Stage-1 Trusted reborrows, minting a child tag that the new borrow table exposes
+     (`evalStmt_retag_ref_typed_reborrow`, `evalStmt_retag_ref_fnEntry_reborrow`, which also installs
+     the function-entry protector), and Anneal's reference retag refines that reborrow with the frames
+     related up to pointer tags (`SlotBelowUpToTag`, `SlotsRefine_reborrow_upToTag`,
+     `evalStmt_retag_ref_typed_refines_upToTag`, `evalStmt_retag_ref_fnEntry_refines_upToTag`,
      `evalStmt_retag_ref_frozen_mut_reborrows`); `evalStmt_retag_disabled_ub`,
      `evalStmt_retag_fat_frozen_mut_ub`, `evalStmt_retag_raw_untracked_divergence`,
      `evalStmt_retag_raw_scalar_addr_reject`, `evalStmt_retag_raw_scalar_rawPtr_conservative`,
@@ -214,7 +218,9 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      `witness_trusted_deref_move_proj_typed`), two-level chains `(**_pp).rest` resolved through
      the intermediate pointer exactly as runtime MIR's `CopyForDeref` split through a temporary
      (`resolvePlace_deref_deref_split`, `evalDerefPlaceRead_deref_deref`,
-     `witness_deref_deref_split`), `evalRetagDerefPlace`
+     `witness_deref_deref_split`; the intermediate pointer read refines Stage-1 Trusted's
+     `Rvalue.copyForDeref`: `evalRvalue_copyForDeref_of_evalOperand`,
+     `evalDerefPlaceRead_refines_copyForDeref`), `evalRetagDerefPlace`
      and dangling sub-place references (`retag_subplace_ref_dead_local`), with Get-Put, Put-Get,
      and frame laws (`writePlaceState_get_put_init`, `writePlaceState_put_get_init`,
      `evalDerefPlaceWrite_get_put`, `evalDerefPlaceWrite_put_get`, `evalDerefPlaceWrite_frame`,
@@ -264,8 +270,13 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      parent makes Stage-1 Trusted fault on the very write Anneal performs
      (`witness_trusted_deref_read_typed_tree`, `witness_trusted_assign_deref_tree`); Stage-1
      `Retag` agreement on a typed `u32` field against the residual untyped divergence
-     (`witness_trusted_retag_u32_field`); and typed reference reborrows, including through a
-     `frozen` tag (`witness_trusted_retag_ref_reborrow`).
+     (`witness_trusted_retag_u32_field`); typed reference reborrows, including through a `frozen`
+     tag, a function-entry reborrow related up to tags, and a zero-sized pointee whose skipped initial
+     read would otherwise be Tree Borrows UB (`witness_trusted_retag_ref_reborrow`,
+     `witness_trusted_retag_ref_fnEntry_and_upToTag`, `witness_trusted_retag_ref_zst_skips_read_ub`);
+     and Anneal's accepting reference retag of `_1` instantiating `evalStmt_retag_ref_refines` (untyped
+     mode), `evalStmt_retag_ref_typed_refines_upToTag` (`_1 : &mut u32`), and
+     `evalStmt_retag_disabled_ub` (`disabled` child tag) (`witness_trusted_retag_ref_anneal`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -6331,6 +6342,124 @@ theorem evalStmt_retag_ref_frozen_mut_reborrows {ctx : RetagCtx} {kind : RetagKi
     · simp only [get?_eq_getElem?] at hT; exact (List.getElem?_eq_some_iff.mp hT).1
   obtain ⟨borrows', hStep, hChild⟩ := evalStmt_retag_ref_typed_reborrow s hKind loc span localDecls
     layouts hOp hMutTy hInhab hLook (by rw [hFrz]; exact fun h => by cases h) hNoReadUB hLt
+  exact ⟨borrows', hStep, hChild, SlotsRefine_reborrow_upToTag loc hRel hSt'⟩
+
+/-- **Reference `Retag` refines Stage-1 Trusted's reborrow on typed reference locals, up to tags
+(`evalStmt_retag_ref_typed_refines_upToTag`)**: the typed-reference counterpart of
+`evalStmt_retag_ref_refines`. On below-related frames, a successful `default` / `two-phase` Anneal
+retag of an unprojected local `_loc` read and validated the thin pointer `p` stored there
+(`retagRefOk`); when `_loc`'s Trusted type is a reference `&T` / `&mut T` (inhabited `T`) and
+Trusted tracks `p`'s tag with any non-`disabled` permission (a `disabled` tag faults:
+`evalStmt_retag_disabled_ub`), Stage-1 Trusted's retag does not fault whenever the reborrow's
+initial read is skipped (`Cell` or zero-sized pointee) or is not Tree Borrows UB: it mints the
+child tag `s.memory.nextTag` (exposed in the new borrow table) and rewrites `_loc` to `p` re-tagged,
+and the frames stay related up to pointer tags (`SlotsRefine SlotBelowUpToTag`). -/
+theorem evalStmt_retag_ref_typed_refines_upToTag {ctx : RetagCtx} {kind : RetagKind} {loc : Nat}
+    {pt : RetagPointee} {b : Bool} (hKind : kind = .default ∨ kind = .twoPhase)
+    (h : evalRetagPlace ctx kind ⟨loc, []⟩ (.ref pt) b = true) {s : MachineState}
+    (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) {m : Mutability} {inner : RigidTy}
+    {lIdx : Nat}
+    (hTy : placeTy localDecls layouts ⟨loc, []⟩ = some { kind := .ref m inner, layoutIdx := lIdx })
+    (hInhab : rigidTyIsUninhabited 16 inner = false) :
+    ∃ p sz, readPlaceState ctx.slots ⟨loc, []⟩ = .ok (.ptr p sz) ∧ retagRefOk ctx pt p = true ∧
+      ∀ entry, lookupBorrow s.memory.borrows p.tag = some entry → entry.perm ≠ .disabled →
+        (retagPerm kind m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
+          hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
+            entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset
+            entry.rangeLen = false) →
+        ∃ borrows', evalStmt s ⟨.retag kind ⟨loc, []⟩, span⟩ localDecls layouts =
+            .step (advanceStmt s
+              (s.frame.locals.set loc
+                (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := p.offsetBytes } sz)))
+              { s.memory with borrows := borrows', nextTag := s.memory.nextTag + 1 }) ∧
+          lookupBorrow borrows' s.memory.nextTag = some
+            { tag := s.memory.nextTag
+              targetLocal := entry.targetLocal
+              targetProjection := entry.targetProjection
+              perm := retagPerm kind m inner
+              rangeOffset := entry.rangeOffset
+              rangeLen := entry.rangeLen
+              protector := none
+              parentTag := some p.tag } ∧
+          SlotsRefine SlotBelowUpToTag ctx.slots
+            (s.frame.locals.set loc
+              (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := p.offsetBytes } sz))) := by
+  have hKind' : kind ≠ .raw := by rcases hKind with rfl | rfl <;> exact fun h => by cases h
+  obtain ⟨st, p, sz, hSt, hLive, hProj, hChecks⟩ := evalRetagPlace_ref_sound hKind' h
+  have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
+  have hStInit : st = .init (.ptr p sz) := by
+    cases st <;> simp [projectFieldSlot, slotStateToFieldSlot, PartialAggregate.toFieldSlot] at hProj
+    exact congrArg LocalSlotState.init hProj
+  refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
+    fun entry hLook hPerm hNoReadUB => ?_⟩
+  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls
+  have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
+  have hLt : loc < s.frame.locals.length := by
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
+    · simp only [get?_eq_getElem?] at hA; rw [hA] at hSt'; nomatch hSt'
+    · simp only [get?_eq_getElem?] at hT; exact (List.getElem?_eq_some_iff.mp hT).1
+  obtain ⟨borrows', hStep, hChild⟩ := evalStmt_retag_ref_typed_reborrow s hKind loc span localDecls
+    layouts hOp hTy hInhab hLook hPerm hNoReadUB hLt
+  exact ⟨borrows', hStep, hChild, SlotsRefine_reborrow_upToTag loc hRel hSt'⟩
+
+/-- **Function-entry reference `Retag` refines Stage-1 Trusted's protected reborrow on typed
+reference locals, up to tags (`evalStmt_retag_ref_fnEntry_refines_upToTag`)**: the `FnEntry`
+analogue of `evalStmt_retag_ref_typed_refines_upToTag` — Stage-1 Trusted additionally installs the
+function-entry protector `s.memory.nextProtector` on the minted child (`evalFnEntryRetag`). -/
+theorem evalStmt_retag_ref_fnEntry_refines_upToTag {ctx : RetagCtx} {loc : Nat}
+    {pt : RetagPointee} {b : Bool}
+    (h : evalRetagPlace ctx .fnEntry ⟨loc, []⟩ (.ref pt) b = true) {s : MachineState}
+    (hRel : SlotsRefine SlotBelow ctx.slots s.frame.locals) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) {m : Mutability} {inner : RigidTy}
+    {lIdx : Nat}
+    (hTy : placeTy localDecls layouts ⟨loc, []⟩ = some { kind := .ref m inner, layoutIdx := lIdx })
+    (hInhab : rigidTyIsUninhabited 16 inner = false) :
+    ∃ p sz, readPlaceState ctx.slots ⟨loc, []⟩ = .ok (.ptr p sz) ∧ retagRefOk ctx pt p = true ∧
+      ∀ entry, lookupBorrow s.memory.borrows p.tag = some entry → entry.perm ≠ .disabled →
+        (fnEntryRetagPerm m inner ≠ .cell → rigidTyIsZeroSized 16 inner = false →
+          hasTreeReadUB s.memory.borrows s.memory.borrows s.memory.activeProtectors
+            entry.targetLocal (some p.tag) entry.targetProjection entry.rangeOffset
+            entry.rangeLen = false) →
+        ∃ borrows', evalStmt s ⟨.retag .fnEntry ⟨loc, []⟩, span⟩ localDecls layouts =
+            .step (advanceStmt s
+              (s.frame.locals.set loc
+                (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := p.offsetBytes } sz)))
+              { s.memory with
+                borrows := borrows'
+                nextTag := s.memory.nextTag + 1
+                activeProtectors := s.memory.nextProtector :: s.memory.activeProtectors
+                nextProtector := s.memory.nextProtector + 1 }) ∧
+          lookupBorrow borrows' s.memory.nextTag = some
+            { tag := s.memory.nextTag
+              targetLocal := entry.targetLocal
+              targetProjection := entry.targetProjection
+              perm := fnEntryRetagPerm m inner
+              rangeOffset := entry.rangeOffset
+              rangeLen := entry.rangeLen
+              protector := some s.memory.nextProtector
+              parentTag := some p.tag } ∧
+          SlotsRefine SlotBelowUpToTag ctx.slots
+            (s.frame.locals.set loc
+              (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := p.offsetBytes } sz))) := by
+  obtain ⟨st, p, sz, hSt, hLive, hProj, hChecks⟩ :=
+    evalRetagPlace_ref_sound (fun h => by cases h) h
+  have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
+  have hStInit : st = .init (.ptr p sz) := by
+    cases st <;> simp [projectFieldSlot, slotStateToFieldSlot, PartialAggregate.toFieldSlot] at hProj
+    exact congrArg LocalSlotState.init hProj
+  refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
+    fun entry hLook hPerm hNoReadUB => ?_⟩
+  have hOp := readPlaceState_below_evalOperand_copy hRel hRead s.memory.borrows s.memory.globals
+    layouts s.memory.callerLocals localDecls
+  have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
+  have hLt : loc < s.frame.locals.length := by
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
+    · simp only [get?_eq_getElem?] at hA; rw [hA] at hSt'; nomatch hSt'
+    · simp only [get?_eq_getElem?] at hT; exact (List.getElem?_eq_some_iff.mp hT).1
+  obtain ⟨borrows', hStep, hChild⟩ := evalStmt_retag_ref_fnEntry_reborrow s loc span localDecls
+    layouts hOp hTy hInhab hLook hPerm hNoReadUB hLt
   exact ⟨borrows', hStep, hChild, SlotsRefine_reborrow_upToTag loc hRel hSt'⟩
 
 /-- **`Retag(Raw)` refines Stage-1 Trusted's `evalStmt` (`.retag .raw`, `B4`)**: on below-related
@@ -16363,5 +16492,73 @@ theorem witness_trusted_retag_ref_zst_skips_read_ub :
     (by with_unfolding_all rfl) (by with_unfolding_all rfl) (by decide)
     (by with_unfolding_all rfl) (fun h => by cases h)
     (fun _ hZst => by simp [rigidTyIsZeroSized] at hZst) (by decide)
+
+/-- The Anneal retag context of the witness frame (`witnessCtxT`'s synthetic addresses). -/
+def witnessRetagCtx : RetagCtx := synthRetagCtx witnessCtxT 64 witnessSlotsT
+
+/-- A `u32` pointee: `4`-aligned, not zero-sized, inhabited. -/
+def witnessU32Pointee : RetagPointee := { align := some 4, zeroSized := false, inhabited := true }
+
+/-- **Non-vacuity of the Anneal-side reference `Retag` refinements on every Stage-1 place type
+(`witness_trusted_retag_ref_anneal`)**: Anneal's retag of `_1 = witnessPtrT` (`&raw _0.1`, address
+`0x1004`) as a `u32` reference succeeds; every hypothesis of `evalStmt_retag_ref_refines` holds in
+Trusted's untyped mode (the retag keeps the frame), every hypothesis of
+`evalStmt_retag_ref_typed_refines_upToTag` holds with `_1 : &mut u32` (Stage-1 Trusted re-tags
+`_1` to `nextTag = 1` and the frames stay related up to tags), and with the child tag `disabled`
+`evalStmt_retag_disabled_ub` makes Stage-1 Trusted fault on the very retag Anneal accepts. -/
+theorem witness_trusted_retag_ref_anneal :
+    evalRetagPlace witnessRetagCtx .default ⟨1, []⟩ (.ref witnessU32Pointee) false = true ∧
+    (∃ mem', evalStmt witnessTreeState ⟨.retag .default ⟨1, []⟩, ""⟩ [] emptyLayoutTable =
+      .step (advanceStmt witnessTreeState witnessTreeState.frame.locals mem')) ∧
+    (∃ borrows', evalStmt witnessTreeState ⟨.retag .default ⟨1, []⟩, ""⟩ witnessRefLocalDecls
+        emptyLayoutTable =
+        .step (advanceStmt witnessTreeState
+          (witnessTreeState.frame.locals.set 1
+            (.init (.ptr { allocId := witnessTreeState.memory.nextTag, offsetBytes := 0 } 8)))
+          { witnessTreeState.memory with
+            borrows := borrows', nextTag := witnessTreeState.memory.nextTag + 1 }) ∧
+      SlotsRefine SlotBelowUpToTag witnessSlotsT
+        (witnessTreeState.frame.locals.set 1
+          (.init (.ptr { allocId := witnessTreeState.memory.nextTag, offsetBytes := 0 } 8)))) ∧
+    evalStmt (witnessReborrowState .disabled) ⟨.retag .default ⟨1, []⟩, ""⟩ witnessRefLocalDecls
+      emptyLayoutTable = .fail .ub := by
+  have hA : evalRetagPlace witnessRetagCtx .default ⟨1, []⟩ (.ref witnessU32Pointee) false = true := by
+    with_unfolding_all decide
+  have hRelT : SlotsRefine SlotBelow witnessRetagCtx.slots witnessTreeState.frame.locals := by
+    simp [witnessRetagCtx, synthRetagCtx, witnessTreeState, witnessSlotsT, witnessLocalsT,
+      SlotsRefine, SlotBelow]
+  have hReadP : readPlaceState witnessRetagCtx.slots ⟨1, []⟩ = .ok (.ptr witnessPtrT 8) := by
+    with_unfolding_all rfl
+  have hNotRaw : (.default : RetagKind) ≠ .raw := fun h => by cases h
+  refine ⟨hA, ?_, ?_, ?_⟩
+  · obtain ⟨p, sz, hRead, _, hStep⟩ := evalStmt_retag_ref_refines hNotRaw hA hRelT ""
+      [] emptyLayoutTable (retagKeepsFrameTy_nil _ _ _)
+    rw [hReadP] at hRead
+    cases hRead
+    exact hStep witnessChildEntry
+      (by simp [witnessTreeState, witnessTreeBorrows, lookupBorrow, witnessChildEntry, witnessPtrT,
+        ProvenancePtr.tag])
+      (fun h => by cases h)
+  · obtain ⟨p, sz, hRead, _, hStep⟩ := evalStmt_retag_ref_typed_refines_upToTag (Or.inl rfl) hA
+      hRelT "" witnessRefLocalDecls emptyLayoutTable (m := .mut) (inner := witnessU32.kind)
+      (lIdx := 0) (by with_unfolding_all rfl) (by decide)
+    rw [hReadP] at hRead
+    cases hRead
+    obtain ⟨borrows', hS, -, hUp⟩ := hStep witnessChildEntry
+      (by simp [witnessTreeState, witnessTreeBorrows, lookupBorrow, witnessChildEntry, witnessPtrT,
+        ProvenancePtr.tag])
+      (fun h => by cases h) (fun _ _ => by decide)
+    exact ⟨borrows', hS, hUp⟩
+  · have hRelD : SlotsRefine SlotBelow witnessRetagCtx.slots
+        (witnessReborrowState .disabled).frame.locals := by
+      simp [witnessRetagCtx, synthRetagCtx, witnessReborrowState, witnessSlotsT, witnessLocalsT,
+        SlotsRefine, SlotBelow]
+    obtain ⟨p, sz, hRead, hUB⟩ := evalStmt_retag_disabled_ub hNotRaw hA hRelD ""
+      witnessRefLocalDecls emptyLayoutTable (entry := { witnessChildEntry with perm := .disabled })
+      rfl (by with_unfolding_all rfl)
+    rw [hReadP] at hRead
+    cases hRead
+    exact hUB (by simp [witnessReborrowState, lookupBorrow, witnessChildEntry, witnessPtrT,
+      ProvenancePtr.tag])
 
 end Anneal.Mir.AdtAndControl

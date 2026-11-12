@@ -352,6 +352,7 @@ theorem subplace_audit_closure : True :=
   let _ := @evalStmt_deinit_field
   let _ := @evalStmt_retag_field
   let _ := @paddedDeinitSiblingReinit_anneal_shell_agreement
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_uninit_or_dead_ub
   let _ := @Anneal.Mir.AdtAndControl.retagKeepsFrameTy_nil
   let _ := @Anneal.Mir.AdtAndControl.evalNonFnEntryRetag_of_not_ref
   let _ := @Anneal.Mir.AdtAndControl.evalFnEntryRetag_of_not_ref
@@ -383,6 +384,9 @@ theorem subplace_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_reborrow
   let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_fnEntry_and_upToTag
   let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_zst_skips_read_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_typed_refines_upToTag
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_fnEntry_refines_upToTag
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_anneal
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge
