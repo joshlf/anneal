@@ -449,27 +449,47 @@ fn is_integer_type_name(ty: &str) -> bool {
     )
 }
 
-#[derive(Clone, Copy)]
-enum LifetimeRewrite {
-    ElideForLocal,
-    StaticForReturn,
+struct LifetimeEraser<'a> {
+    only_names: Option<&'a std::collections::BTreeSet<String>>,
+    shadowed: Vec<String>,
 }
 
-struct LifetimeEraser(LifetimeRewrite);
+impl LifetimeEraser<'_> {
+    fn should_erase(&self, lt: &syn::Lifetime) -> bool {
+        let name = lt.ident.to_string();
+        if name == "static" || name == "_" || self.shadowed.contains(&name) {
+            return false;
+        }
+        match self.only_names {
+            Some(names) => names.contains(&name),
+            None => true,
+        }
+    }
+}
 
-impl VisitMut for LifetimeEraser {
+impl VisitMut for LifetimeEraser<'_> {
+    fn visit_item_mut(&mut self, _item: &mut Item) {}
+
+    fn visit_bound_lifetimes_mut(&mut self, node: &mut syn::BoundLifetimes) {
+        let pushed: Vec<String> = node
+            .lifetimes
+            .iter()
+            .filter_map(|gp| match gp {
+                syn::GenericParam::Lifetime(lt) => Some(lt.lifetime.ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        let prev_len = self.shadowed.len();
+        self.shadowed.extend(pushed);
+        syn::visit_mut::visit_bound_lifetimes_mut(self, node);
+        self.shadowed.truncate(prev_len);
+    }
+
     fn visit_type_reference_mut(&mut self, node: &mut syn::TypeReference) {
-        match self.0 {
-            LifetimeRewrite::ElideForLocal => {
-                node.lifetime = None;
-            }
-            LifetimeRewrite::StaticForReturn => {
-                let span = node
-                    .lifetime
-                    .as_ref()
-                    .map_or_else(proc_macro2::Span::call_site, syn::Lifetime::span);
-                node.lifetime = Some(syn::Lifetime::new("'static", span));
-            }
+        if let Some(lt) = &node.lifetime
+            && self.should_erase(lt)
+        {
+            node.lifetime = None;
         }
         syn::visit_mut::visit_type_reference_mut(self, node);
     }
@@ -478,13 +498,11 @@ impl VisitMut for LifetimeEraser {
         &mut self,
         node: &mut syn::AngleBracketedGenericArguments,
     ) {
-        let replacement = match self.0 {
-            LifetimeRewrite::ElideForLocal => "'_",
-            LifetimeRewrite::StaticForReturn => "'static",
-        };
         for arg in &mut node.args {
-            if let GenericArgument::Lifetime(lt) = arg {
-                *lt = syn::Lifetime::new(replacement, lt.span());
+            if let GenericArgument::Lifetime(lt) = arg
+                && self.should_erase(lt)
+            {
+                *lt = syn::Lifetime::new("'_", lt.span());
             }
         }
         syn::visit_mut::visit_angle_bracketed_generic_arguments_mut(self, node);
@@ -493,14 +511,80 @@ impl VisitMut for LifetimeEraser {
 
 fn strip_type_lifetimes(ty: &Type) -> Type {
     let mut out = ty.clone();
-    LifetimeEraser(LifetimeRewrite::ElideForLocal).visit_type_mut(&mut out);
+    LifetimeEraser {
+        only_names: None,
+        shadowed: Vec::new(),
+    }
+    .visit_type_mut(&mut out);
     out
 }
 
-fn staticize_return_lifetimes(ty: &Type) -> Type {
-    let mut out = ty.clone();
-    LifetimeEraser(LifetimeRewrite::StaticForReturn).visit_type_mut(&mut out);
-    out
+fn type_contains_reference_or_lifetime(
+    ty: &Type,
+    removed_lifetimes: &std::collections::BTreeSet<String>,
+) -> bool {
+    struct RefOrLtFinder<'a> {
+        removed_lifetimes: &'a std::collections::BTreeSet<String>,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for RefOrLtFinder<'_> {
+        fn visit_type_reference(&mut self, _node: &'ast syn::TypeReference) {
+            self.found = true;
+        }
+        fn visit_lifetime(&mut self, node: &'ast syn::Lifetime) {
+            if self.removed_lifetimes.contains(&node.ident.to_string()) {
+                self.found = true;
+            }
+        }
+    }
+    let mut finder = RefOrLtFinder {
+        removed_lifetimes,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut finder, ty);
+    finder.found
+}
+
+fn block_has_fn_level_return(block: &Block) -> bool {
+    struct ReturnFinder(bool);
+    impl<'ast> syn::visit::Visit<'ast> for ReturnFinder {
+        fn visit_item(&mut self, _item: &'ast Item) {}
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if self.0 {
+                return;
+            }
+            match expr {
+                Expr::Closure(_) | Expr::Async(_) | Expr::Const(_) => {}
+                Expr::Return(_) => self.0 = true,
+                _ => syn::visit::visit_expr(self, expr),
+            }
+        }
+    }
+    let mut finder = ReturnFinder(false);
+    syn::visit::Visit::visit_block(&mut finder, block);
+    finder.0
+}
+
+fn rewrite_fn_returns_to_labeled_break(block: &mut Block, label: &syn::Lifetime) {
+    struct ReturnRewriter<'a>(&'a syn::Lifetime);
+    impl VisitMut for ReturnRewriter<'_> {
+        fn visit_item_mut(&mut self, _item: &mut Item) {}
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            match expr {
+                Expr::Closure(_) | Expr::Async(_) | Expr::Const(_) => return,
+                _ => {}
+            }
+            syn::visit_mut::visit_expr_mut(self, expr);
+            if let Expr::Return(ret) = expr {
+                let lbl = self.0;
+                *expr = match &ret.expr {
+                    Some(val) => syn::parse_quote!(break #lbl (#val)),
+                    None => syn::parse_quote!(break #lbl ()),
+                };
+            }
+        }
+    }
+    ReturnRewriter(label).visit_block_mut(block);
 }
 
 fn unwrap_type_parens_and_groups(mut ty: &Type) -> &Type {
@@ -513,12 +597,29 @@ fn unwrap_type_parens_and_groups(mut ty: &Type) -> &Type {
     }
 }
 
-/// Convert any function parameters into leading initialized local bindings and
-/// rewrite method calls (`.wrapping_add`, `.wrapping_sub`, `.wrapping_mul`,
-/// `.rotate_left`) into primitive operators so every candidate is closed,
-/// zero-argument, and free of unmodeled method calls.
+/// Convert any function parameters into leading initialized local bindings,
+/// lower reference-returning signatures and early `return`s so closed zero-arg
+/// candidates never return stack borrows or dead-code injected probes, and
+/// rewrite method calls into primitive operators.
 fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
-    if !func.sig.inputs.is_empty() {
+    let removed_lifetimes: std::collections::BTreeSet<String> = func
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Lifetime(lt) => Some(lt.lifetime.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    let sink_ref_return = match &func.sig.output {
+        ReturnType::Type(_, ret_ty) => {
+            type_contains_reference_or_lifetime(ret_ty, &removed_lifetimes)
+        }
+        ReturnType::Default => false,
+    };
+
+    if !func.sig.inputs.is_empty() || !removed_lifetimes.is_empty() || sink_ref_return {
         let mut init_stmts = Vec::new();
         let mut backing_idx = 0usize;
         let inputs: Vec<FnArg> = func.sig.inputs.iter().cloned().collect();
@@ -546,8 +647,12 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
                 func.sig.generics.where_clause = None;
             }
         }
-        if let ReturnType::Type(_, ret_ty) = &mut func.sig.output {
-            **ret_ty = staticize_return_lifetimes(ret_ty);
+        if !removed_lifetimes.is_empty() {
+            LifetimeEraser {
+                only_names: Some(&removed_lifetimes),
+                shadowed: Vec::new(),
+            }
+            .visit_block_mut(&mut func.block);
         }
         for arg in inputs {
             if let FnArg::Typed(pat_ty) = arg {
@@ -555,7 +660,7 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
                 let init_val = seeded_type_expr(&clean_ty, &mut init_stmts, &mut backing_idx, rng);
                 let inner_pat = unwrap_pat_parens(&pat_ty.pat);
                 let stmt: Stmt = match inner_pat {
-                    Pat::Ident(pi) if pi.subpat.is_none() => {
+                    Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
                         let ident = &pi.ident;
                         syn::parse_quote! {
                             let mut #ident: #clean_ty = #init_val;
@@ -571,7 +676,35 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
                 init_stmts.push(stmt);
             }
         }
+        if sink_ref_return {
+            if let ReturnType::Type(_, ret_ty) = &func.sig.output {
+                let clean_ret_ty = strip_type_lifetimes(ret_ty);
+                let ret_label = syn::Lifetime::new("'__anneal_ret", proc_macro2::Span::call_site());
+                rewrite_fn_returns_to_labeled_break(&mut func.block, &ret_label);
+                let orig_block = (*func.block).clone();
+                let sunk_stmts: Vec<Stmt> = syn::parse_quote! {
+                    let __closed_ret: #clean_ret_ty = #ret_label: #orig_block;
+                    let _ = __closed_ret;
+                };
+                func.block.stmts = sunk_stmts;
+                func.sig.output = ReturnType::Default;
+            }
+        }
         func.block.stmts.splice(0..0, init_stmts);
+    }
+
+    if block_has_fn_level_return(&func.block) {
+        let ret_label = syn::Lifetime::new("'__anneal_ret", proc_macro2::Span::call_site());
+        rewrite_fn_returns_to_labeled_break(&mut func.block, &ret_label);
+        let orig_block = (*func.block).clone();
+        let wrapped: Stmt = match &func.sig.output {
+            ReturnType::Type(_, _) => {
+                let expr: Expr = syn::parse_quote!(#ret_label: #orig_block);
+                Stmt::Expr(expr, None)
+            }
+            ReturnType::Default => syn::parse_quote!(#ret_label: #orig_block;),
+        };
+        func.block.stmts = vec![wrapped];
     }
 
     let mut normalizer = MethodCallNormalizer;
@@ -862,7 +995,17 @@ impl VisitMut for MethodCallNormalizer {
         if let Expr::MethodCall(mc) = expr {
             let method = mc.method.to_string();
             let recv = &mc.receiver;
-            if mc.args.len() == 1 {
+            if mc.args.is_empty() {
+                match method.as_str() {
+                    "wrapping_neg" => {
+                        *expr = syn::parse_quote!((!(#recv)));
+                    }
+                    "swap_bytes" | "to_le" | "to_be" => {
+                        *expr = syn::parse_quote!((#recv));
+                    }
+                    _ => {}
+                }
+            } else if mc.args.len() == 1 {
                 let arg = &mc.args[0];
                 match method.as_str() {
                     "wrapping_add" | "saturating_add" => {
@@ -871,13 +1014,13 @@ impl VisitMut for MethodCallNormalizer {
                     "wrapping_sub" | "saturating_sub" => {
                         *expr = syn::parse_quote!(((#recv) ^ (#arg)));
                     }
-                    "wrapping_mul" => {
+                    "wrapping_mul" | "saturating_mul" => {
                         *expr = syn::parse_quote!(((#recv) | (#arg)));
                     }
-                    "rotate_left" => {
+                    "rotate_left" | "wrapping_shl" => {
                         *expr = syn::parse_quote!(((#recv) << ((#arg) & 7u32)));
                     }
-                    "rotate_right" => {
+                    "rotate_right" | "wrapping_shr" => {
                         *expr = syn::parse_quote!(((#recv) >> ((#arg) & 7u32)));
                     }
                     _ => {}
@@ -966,10 +1109,46 @@ impl VisitMut for ArithAstPerturber<'_> {
         // Never mutate array lengths `[T; N]` inside type annotations.
     }
 
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {
+        // Never mutate literal or range patterns (`1u32..=5u32` -> `E0579`).
+    }
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {
+        // Never mutate explicit enum discriminant literals (`E0081`).
+    }
+
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        // Preserve synthetic fault-probe local initializers injected by earlier
+        // passes so `+` / `-` / `&` inside `Panic` or `Ub` probes are not
+        // rewritten into non-faulting `^` expressions.
+        if let Stmt::Local(loc) = stmt
+            && let (Some(name), _) = extract_pat_ident(&loc.pat)
+            && (name.starts_with("__ovf_")
+                || name.starts_with("__udf_")
+                || name.starts_with("__div_")
+                || name.starts_with("__shl_")
+                || name.starts_with("__ub_")
+                || name.starts_with("__tb_ovf")
+                || name.starts_with("__miri_"))
+        {
+            return;
+        }
+        syn::visit_mut::visit_stmt_mut(self, stmt);
+    }
+
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        // Preserve loop termination conditions, array index expressions, and
-        // intrinsic precondition arguments (`assume`, `exact_div`, shifts).
-        if matches!(expr, Expr::While(_) | Expr::Index(_)) {
+        // Preserve loop termination conditions, array index/repeat expressions,
+        // and intrinsic precondition arguments (`assume`, `exact_div`, shifts).
+        if matches!(
+            expr,
+            Expr::While(_) | Expr::ForLoop(_) | Expr::Index(_) | Expr::Repeat(_)
+        ) {
             return;
         }
         if let Expr::Call(call) = expr
@@ -1292,10 +1471,98 @@ impl<'ast> syn::visit::Visit<'ast> for FieldRefCollector {
     }
 }
 
+fn extract_array_type_len(mut ty: &Type) -> Option<usize> {
+    loop {
+        match ty {
+            Type::Paren(p) => ty = &p.elem,
+            Type::Group(g) => ty = &g.elem,
+            Type::Reference(r) => ty = &r.elem,
+            _ => break,
+        }
+    }
+    if let Type::Array(arr) = ty
+        && let Expr::Lit(el) = unwrap_expr_parens_and_groups(&arr.len)
+        && let Lit::Int(li) = &el.lit
+    {
+        return li.base10_parse::<usize>().ok();
+    }
+    None
+}
+
+fn struct_item_has_asymmetric_ab(st: &syn::ItemStruct) -> bool {
+    let syn::Fields::Named(named) = &st.fields else {
+        return false;
+    };
+    let mut ty_a = None;
+    let mut ty_b = None;
+    for f in &named.named {
+        if let Some(id) = &f.ident {
+            let s = id.to_string();
+            let t = f.ty.to_token_stream().to_string().replace(' ', "");
+            if s == "a" {
+                ty_a = Some(t);
+            } else if s == "b" {
+                ty_b = Some(t);
+            }
+        }
+    }
+    match (ty_a, ty_b) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
+struct ArrayAndStructContextCollector {
+    array_lens: std::collections::BTreeMap<String, usize>,
+    has_asymmetric_ab_struct: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ArrayAndStructContextCollector {
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if struct_item_has_asymmetric_ab(node) {
+            self.has_asymmetric_ab_struct = true;
+        }
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let (Some(name), _) = extract_pat_ident(&node.pat) {
+            let ty_len = extract_outer_pat_type(&node.pat).and_then(extract_array_type_len);
+            let init_len = node
+                .init
+                .as_ref()
+                .and_then(|init| match unwrap_expr_parens_and_groups(&init.expr) {
+                    Expr::Array(arr) => Some(arr.elems.len()),
+                    _ => None,
+                });
+            if let Some(len) = ty_len.or(init_len) {
+                self.array_lens.insert(name, len);
+            } else {
+                self.array_lens.remove(&name);
+            }
+        }
+        syn::visit::visit_local(self, node);
+    }
+}
+
 struct ProjectionAstPerturber<'a> {
     rng: &'a mut DetRng,
     in_addr_or_lhs: bool,
     field_borrowed_bases: std::collections::BTreeSet<String>,
+    known_array_lens: std::collections::BTreeMap<String, usize>,
+    has_asymmetric_ab_struct: bool,
+}
+
+impl<'a> ProjectionAstPerturber<'a> {
+    fn new(rng: &'a mut DetRng) -> Self {
+        Self {
+            rng,
+            in_addr_or_lhs: false,
+            field_borrowed_bases: std::collections::BTreeSet::new(),
+            known_array_lens: std::collections::BTreeMap::new(),
+            has_asymmetric_ab_struct: false,
+        }
+    }
 }
 
 impl VisitMut for ProjectionAstPerturber<'_> {
@@ -1303,15 +1570,51 @@ impl VisitMut for ProjectionAstPerturber<'_> {
         // Never mutate `[T; N]` array lengths in types.
     }
 
+    fn visit_file_mut(&mut self, file: &mut File) {
+        let prev_asym = self.has_asymmetric_ab_struct;
+        for item in &file.items {
+            if let Item::Struct(st) = item
+                && struct_item_has_asymmetric_ab(st)
+            {
+                self.has_asymmetric_ab_struct = true;
+            }
+        }
+        syn::visit_mut::visit_file_mut(self, file);
+        self.has_asymmetric_ab_struct = prev_asym;
+    }
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        let prev = std::mem::take(&mut self.field_borrowed_bases);
+        let prev_borrowed = std::mem::take(&mut self.field_borrowed_bases);
+        let prev_lens = std::mem::take(&mut self.known_array_lens);
+        let prev_asym = self.has_asymmetric_ab_struct;
+
         let mut collector = FieldRefCollector {
             bases: std::collections::BTreeSet::new(),
         };
         syn::visit::Visit::visit_item_fn(&mut collector, func);
         self.field_borrowed_bases = collector.bases;
+
+        let mut ctx_collector = ArrayAndStructContextCollector {
+            array_lens: std::collections::BTreeMap::new(),
+            has_asymmetric_ab_struct: self.has_asymmetric_ab_struct,
+        };
+        for arg in &func.sig.inputs {
+            if let FnArg::Typed(pat_ty) = arg
+                && let (Some(name), _) = extract_pat_ident(&pat_ty.pat)
+                && let Some(len) = extract_array_type_len(&pat_ty.ty)
+            {
+                ctx_collector.array_lens.insert(name, len);
+            }
+        }
+        syn::visit::Visit::visit_block(&mut ctx_collector, &func.block);
+        self.known_array_lens = ctx_collector.array_lens;
+        self.has_asymmetric_ab_struct = ctx_collector.has_asymmetric_ab_struct;
+
         syn::visit_mut::visit_item_fn_mut(self, func);
-        self.field_borrowed_bases = prev;
+
+        self.field_borrowed_bases = prev_borrowed;
+        self.known_array_lens = prev_lens;
+        self.has_asymmetric_ab_struct = prev_asym;
     }
 
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
@@ -1375,6 +1678,7 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                         base_clean.as_str(),
                         "u.value" | "__part_slot.value" | "__proj_half.value" | "slot.value"
                     );
+                    let known_len = self.known_array_lens.get(&base_clean).copied();
                     let new_idx: usize = if (is_partial_uninit
                         || matches!(base_clean.as_str(), "bytes" | "__pad_bytes"))
                         && (1..=3).contains(&cur_idx)
@@ -1389,6 +1693,14 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                         0
                     } else if base_clean.ends_with(".bytes") && cur_idx < 4 {
                         (cur_idx + 1 + self.rng.gen_range(3)) % 4
+                    } else if let Some(len) = known_len {
+                        if len <= 1 || cur_idx >= len {
+                            cur_idx
+                        } else if cur_idx == 0 {
+                            1
+                        } else {
+                            0
+                        }
                     } else if cur_idx == 0 {
                         1
                     } else {
@@ -1397,7 +1709,7 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                     idx_expr.index = Box::new(syn::parse_quote!(#new_idx));
                 }
             }
-            Expr::Field(field_expr) if !self.in_addr_or_lhs => {
+            Expr::Field(field_expr) if !self.in_addr_or_lhs && !self.has_asymmetric_ab_struct => {
                 let base_clean = normalize_place_base(&field_expr.base);
                 if !self.field_borrowed_bases.contains(&base_clean)
                     && let syn::Member::Named(ident) = &mut field_expr.member
@@ -1430,11 +1742,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
         locals_log: &mut Vec<(String, String)>,
     ) {
         if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
-            let mut visitor = ProjectionAstPerturber {
-                rng,
-                in_addr_or_lhs: false,
-                field_borrowed_bases: std::collections::BTreeSet::new(),
-            };
+            let mut visitor = ProjectionAstPerturber::new(rng);
             visitor.visit_file_mut(file);
         }
 
@@ -1606,6 +1914,25 @@ struct OffsetArgPerturber<'a> {
     allow_oob: bool,
 }
 
+fn offset_arg_lit_suffix(expr: &Expr) -> Option<&str> {
+    match unwrap_expr_parens_and_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Int(li) => Some(li.suffix()),
+            _ => None,
+        },
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+            match unwrap_expr_parens_and_groups(&u.expr) {
+                Expr::Lit(el) => match &el.lit {
+                    Lit::Int(li) => Some(li.suffix()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl VisitMut for OffsetArgPerturber<'_> {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
@@ -1613,16 +1940,29 @@ impl VisitMut for OffsetArgPerturber<'_> {
             && let Expr::Path(ep) = &*call.func
             && ep.path.segments.last().is_some_and(|s| s.ident == "offset")
             && call.args.len() == 2
+            && let Some(suffix) = offset_arg_lit_suffix(&call.args[1])
+            && matches!(suffix, "" | "isize" | "usize")
             && self.rng.coin(1, 2)
         {
-            let step: isize = if self.allow_oob {
-                let choices: [isize; 4] = [0, 1, 2, -1];
-                choices[self.rng.gen_range(choices.len())]
+            if suffix == "usize" {
+                let step: usize = if self.allow_oob {
+                    let choices: [usize; 3] = [0, 1, 2];
+                    choices[self.rng.gen_range(choices.len())]
+                } else {
+                    let choices: [usize; 2] = [0, 1];
+                    choices[self.rng.gen_range(choices.len())]
+                };
+                call.args[1] = syn::parse_quote!(#step);
             } else {
-                let choices: [isize; 2] = [0, 1];
-                choices[self.rng.gen_range(choices.len())]
-            };
-            call.args[1] = syn::parse_quote!(#step);
+                let step: isize = if self.allow_oob {
+                    let choices: [isize; 4] = [0, 1, 2, -1];
+                    choices[self.rng.gen_range(choices.len())]
+                } else {
+                    let choices: [isize; 2] = [0, 1];
+                    choices[self.rng.gen_range(choices.len())]
+                };
+                call.args[1] = syn::parse_quote!(#step);
+            }
         }
     }
 }
@@ -1698,17 +2038,20 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                         1 => syn::parse_quote! {
                             let __oob_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                             let __oob_base: *const u32 = &raw const __oob_pair.a;
-                            let #probe_ident: u32 = unsafe { *offset(__oob_base, 2isize) };
+                            let __oob_step: isize = 2isize;
+                            let #probe_ident: u32 = unsafe { *offset(__oob_base, __oob_step) };
                         },
                         2 => syn::parse_quote! {
                             let __neg_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                             let __neg_base: *const u32 = &raw const __neg_pair.a;
-                            let #probe_ident: u32 = unsafe { *offset(__neg_base, -1isize) };
+                            let __neg_step: isize = -1isize;
+                            let #probe_ident: u32 = unsafe { *offset(__neg_base, __neg_step) };
                         },
                         _ => syn::parse_quote! {
                             let __unaligned_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                             let __u8_base: *const u8 = (&raw const __unaligned_pair.a) as *const u8;
-                            let #probe_ident: u32 = unsafe { *(offset(__u8_base, 1isize) as *const u32) };
+                            let __unaligned_step: isize = 1isize;
+                            let #probe_ident: u32 = unsafe { *(offset(__u8_base, __unaligned_step) as *const u32) };
                         },
                     }
                 }
@@ -2606,10 +2949,10 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             }
                             let #probe_ident: u32 = *__tb_shr;
                         },
-                        // Keep the activating write inside its own block so
-                        // `AliasingAccessReorderer` cannot swap it after the
-                        // parent read `let _ = unsafe { *__tb_root };` (which
-                        // would leave `__tb_act` `Reserved` and erase the UB).
+                        // Keep both writes to `__tb_act` inside their own
+                        // blocks so `AliasingAccessReorderer` cannot swap
+                        // either one across `let _ = unsafe { *__tb_root };`
+                        // and erase the `Frozen` write UB.
                         2 => syn::parse_quote! {
                             let mut __tb_x: u32 = #init_val;
                             let __tb_root: *mut u32 = &raw mut __tb_x;
@@ -2618,7 +2961,9 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                                 *__tb_act = #write_val;
                             }
                             let _ = unsafe { *__tb_root };
-                            *__tb_act = #init_val;
+                            {
+                                *__tb_act = #init_val;
+                            }
                             let #probe_ident: u32 = unsafe { *__tb_root };
                         },
                         // A write through the parent of the reborrow that
@@ -3576,7 +3921,7 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(idx, src)| {
             let parsed = syn::parse_str::<File>(src).ok()?;
-            let fn_name = parsed.items.iter().find_map(|it| match it {
+            let fn_name = parsed.items.iter().rev().find_map(|it| match it {
                 Item::Fn(f) if f.sig.ident != "helper_add_ten" => Some(f.sig.ident.to_string()),
                 _ => None,
             })?;
@@ -3664,6 +4009,17 @@ fn generate_miri_batch_with_prefix(
                 false
             }
         });
+        // Normalize method calls across any preceding helper functions too so
+        // multi-function seeds do not hit `ExternalCall` skips in helpers.
+        let fn_count = parsed.items.len();
+        if fn_count > 1 {
+            let mut normalizer = MethodCallNormalizer;
+            for item in &mut parsed.items[..fn_count - 1] {
+                if let Item::Fn(helper_fn) = item {
+                    normalizer.visit_item_fn_mut(helper_fn);
+                }
+            }
+        }
         if let Some(Item::Fn(func)) = parsed.items.last_mut() {
             seed_name = func.sig.ident.to_string();
             fn_name = format!("{seed_name}__{batch_prefix}_c{id}");
@@ -4383,12 +4739,7 @@ pub fn proj_guard() -> u32 {
         for s in 0..128u64 {
             let mut f = syn::parse_file(proj_seed).unwrap();
             let mut rng = DetRng::new(s);
-            ProjectionAstPerturber {
-                rng: &mut rng,
-                in_addr_or_lhs: false,
-                field_borrowed_bases: BTreeSet::new(),
-            }
-            .visit_file_mut(&mut f);
+            ProjectionAstPerturber::new(&mut rng).visit_file_mut(&mut f);
             let out = prettyplease::unparse(&f);
             assert!(
                 out.contains("pair.a ^= 3u32;"),
@@ -4748,12 +5099,7 @@ pub fn proj_paren_and_pat() -> u32 {
         for s in 0..64u64 {
             let mut f = syn::parse_file(paren_and_struct_pat).unwrap();
             let mut rng = DetRng::new(s);
-            ProjectionAstPerturber {
-                rng: &mut rng,
-                in_addr_or_lhs: false,
-                field_borrowed_bases: BTreeSet::new(),
-            }
-            .visit_file_mut(&mut f);
+            ProjectionAstPerturber::new(&mut rng).visit_file_mut(&mut f);
             let out = prettyplease::unparse(&f);
             assert!(
                 out.contains(".a;") && !out.contains("keep1: u32 = (borrowed).b;"),
@@ -5062,11 +5408,7 @@ pub fn if_let_field_borrow() -> u32 {
         for s in 0..64u64 {
             let mut f = syn::parse_file(deref_and_if_let_proj).unwrap();
             let mut rng = DetRng::new(s);
-            let mut v = ProjectionAstPerturber {
-                rng: &mut rng,
-                in_addr_or_lhs: false,
-                field_borrowed_bases: BTreeSet::new(),
-            };
+            let mut v = ProjectionAstPerturber::new(&mut rng);
             v.visit_file_mut(&mut f);
             let out = prettyplease::unparse(&f);
             assert!(
@@ -5136,9 +5478,11 @@ pub fn match_opt_nz(c: bool) -> Option<NonZeroU32> {
             "`unsafe {{ match ... }}` returning `NonZeroU32` must perturb arm tails"
         );
 
-        // 4. `close_and_normalize_function` rewrites return lifetimes to
-        //    `'static`, strips lifetime `where` predicates, and backs slice /
-        //    `str` reference and raw-pointer parameters without unsized locals.
+        // 4. `close_and_normalize_function` sinks reference-returning
+        //    signatures via `'__anneal_ret`, strips lifetime `where`
+        //    predicates and body lifetime annotations, and backs slice / `str`
+        //    reference and raw-pointer parameters without unsized locals or
+        //    `IndexMut` slicing calls.
         let slice_and_ret_lt_seed = "\
 pub fn slice_and_ret_lt<'a, 'b>(
     s_u32: &'a [u32],
@@ -5153,8 +5497,9 @@ pub fn slice_and_ret_lt<'a, 'b>(
 where
     'a: 'b,
 {
-    let _ = (s_u32, s_mut_u8, p_u32, p_mut_u8, s_str, s_mut_str, p_str, p_mut_str);
-    &0u32
+    let local_ref: &'a u32 = &s_u32[0];
+    let _ = (s_mut_u8, p_u32, p_mut_u8, s_str, s_mut_str, p_str, p_mut_str);
+    local_ref
 }
 ";
         let batch = generate_miri_batch(&[slice_and_ret_lt_seed], 2, 0xA2A2_51CE);
@@ -5162,15 +5507,16 @@ where
         for cand in &batch {
             assert!(syn::parse_file(&cand.source).is_ok(), "{}", cand.source);
             assert!(
-                cand.fn_source.contains("-> &'static u32"),
-                "return lifetime must become `'static`:\n{}",
+                !cand.fn_source.contains("-> &") && cand.fn_source.contains("'__anneal_ret:"),
+                "reference return must sink into `'__anneal_ret` local:\n{}",
                 cand.fn_source
             );
             assert!(
                 !cand.fn_source.contains("'a")
                     && !cand.fn_source.contains("'b")
-                    && !cand.fn_source.contains("where"),
-                "function lifetimes and lifetime `where` bounds must be stripped:\n{}",
+                    && !cand.fn_source.contains("where")
+                    && !cand.fn_source.contains("[..]"),
+                "lifetimes, `where` bounds, and `[..]` slicing must be absent:\n{}",
                 cand.fn_source
             );
             assert!(
@@ -5180,6 +5526,182 @@ where
                 "slice and `str` parameters must not emit unsized locals:\n{}",
                 cand.fn_source
             );
+        }
+    }
+
+    #[test]
+    fn ep2_a3_guards_body_lifetimes_early_returns_len1_arrays_range_pats_and_multipass_ub() {
+        // 1. `close_and_normalize_function` preserves `'static`, erases
+        //    removed signature lifetimes inside `func.block`, wraps early
+        //    `return`s in `'__anneal_ret`, normalizes helper method calls in
+        //    multi-function seeds, and classifies multi-function seeds by the
+        //    target (last) function.
+        let multi_fn_early_ret_seed = "\
+pub fn helper_mix(v: u32) -> u32 {
+    v.wrapping_neg().wrapping_shl(3u32)
+}
+pub fn early_ret_and_static<'a>(
+    x: &'a mut u32,
+    lit_s: &'static str,
+    flag: bool,
+) -> u32 {
+    let keep_static: &'static str = lit_s;
+    let alias: &'a mut u32 = x;
+    let _ = keep_static;
+    *alias ^= 7u32;
+    if flag {
+        return helper_mix(*alias);
+    }
+    return 99u32;
+}
+";
+        let fault_last_seed = "\
+pub fn innocent_helper() -> u32 { 1u32 }
+pub fn ub_target_fn() -> u32 { 2u32 }
+";
+        let non_fault = collect_non_fault_seed_indices(&[multi_fn_early_ret_seed, fault_last_seed]);
+        assert_eq!(
+            non_fault,
+            vec![0],
+            "`collect_non_fault_seed_indices` must classify by the last `Item::Fn`"
+        );
+        let batch = generate_miri_batch(&[multi_fn_early_ret_seed], 2, 0xA3A3_0001);
+        for cand in &batch {
+            assert!(syn::parse_file(&cand.source).is_ok(), "{}", cand.source);
+            assert!(
+                cand.fn_source.contains("&'static str")
+                    && !cand.fn_source.contains("'a")
+                    && !cand.fn_source.contains("wrapping_neg")
+                    && !cand.fn_source.contains("wrapping_shl")
+                    && !cand.fn_source.contains("\n    return "),
+                "unexpected lifetime/return/method residue:\n{}",
+                cand.fn_source
+            );
+        }
+
+        // 2. `ArithAstPerturber` never mutates `match` range patterns
+        //    (`1u32..=5u32`) or Pass 0 `Panic`/`Ub` local initializers.
+        let range_and_probe_seed = "\
+pub fn range_pat_and_probe(x: u32) -> u32 {
+    let m: u32 = match x {
+        1u32..=5u32 => 10u32,
+        _ => 20u32,
+    };
+    let __ub_zero: u32 = x & 0u32;
+    let __ovf_b: u32 = 1u32 + (x & 1u32);
+    m ^ __ub_zero ^ __ovf_b
+}
+";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(range_and_probe_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            ArithAstPerturber { rng: &mut rng }.visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                out.contains("1u32..=5u32"),
+                "range pattern mutated (`E0579` risk):\n{out}"
+            );
+            assert!(
+                out.contains("let __ub_zero: u32 = x & 0u32;")
+                    && out.contains("let __ovf_b: u32 = 1u32 + (x & 1u32);"),
+                "synthetic fault-probe initializer mutated by `ArithAstPerturber`:\n{out}"
+            );
+        }
+
+        // 3. `ProjectionAstPerturber` keeps `[T; 1]` indices at `0` and skips
+        //    files defining asymmetric `.a` / `.b` structs.
+        let len1_and_asym_seed = "\
+pub struct OnlyA {
+    pub a: u32,
+    pub other: u32,
+}
+pub fn len1_and_asym(arr_param: [u32; 1]) -> u32 {
+    let single_elem = [42u32];
+    let s = OnlyA { a: 7u32, other: 9u32 };
+    arr_param[0] ^ single_elem[0] ^ s.a
+}
+";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(len1_and_asym_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            ProjectionAstPerturber::new(&mut rng).visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                out.contains("arr_param[0") && out.contains("single_elem[0") && out.contains("s.a"),
+                "1-element array OOB or asymmetric `.a` swapped:\n{out}"
+            );
+        }
+
+        // 4. `OffsetArgPerturber` preserves `usize` offset suffixes, and
+        //    follow-up `Pass` passes never erase `RawPtrOffsetMutator::Ub` or
+        //    `TreeBorrowsRetagInterleaver::Ub` variant 2 probes.
+        let usize_offset_seed = "\
+pub fn usize_off() -> u32 {
+    let pair = PairU32 { a: 1u32, b: 2u32 };
+    let base: *const u32 = &raw const pair.a;
+    unsafe { *offset::<*const u32, usize>(base, 1usize) }
+}
+";
+        let mut saw_zero_usize = false;
+        for s in 0..32u64 {
+            let mut f = syn::parse_file(usize_offset_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            OffsetArgPerturber {
+                rng: &mut rng,
+                allow_oob: false,
+            }
+            .visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                !out.contains("isize"),
+                "`usize` offset literal rewritten to `isize` (`E0308`):\n{out}"
+            );
+            if out.contains("0usize") {
+                saw_zero_usize = true;
+            }
+        }
+        assert!(saw_zero_usize);
+
+        let trivial_seed = "pub fn base() -> u32 { 1u32 }\n";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(trivial_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            RawPtrOffsetMutator.mutate_with_mode(&mut f, &mut rng, MutationMode::Ub, &mut locals);
+            RawPtrOffsetMutator.mutate_with_mode(&mut f, &mut rng, MutationMode::Pass, &mut locals);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                out.contains("__null_p")
+                    || out.contains("let __oob_step: isize = 2isize;")
+                    || out.contains("let __neg_step: isize = -1isize;")
+                    || out.contains("let __unaligned_step: isize = 1isize;"),
+                "follow-up `RawPtrOffsetMutator::Pass` erased Pass 0 UB:\n{out}"
+            );
+        }
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(trivial_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            TreeBorrowsRetagInterleaver.mutate_with_mode(
+                &mut f,
+                &mut rng,
+                MutationMode::Ub,
+                &mut locals,
+            );
+            let pre = prettyplease::unparse(&f);
+            if pre.contains("__tb_act") {
+                for s2 in 0..16u64 {
+                    let mut f2 = f.clone();
+                    let mut rng2 = DetRng::new(s2);
+                    AliasingAccessReorderer { rng: &mut rng2 }.visit_file_mut(&mut f2);
+                    let post = prettyplease::unparse(&f2);
+                    assert!(
+                        post.find("let _ = unsafe { *__tb_root };").unwrap()
+                            < post.rfind("*__tb_act =").unwrap(),
+                        "Frozen write swapped ahead of parent read in variant 2:\n{post}"
+                    );
+                }
+            }
         }
     }
 }

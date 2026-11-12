@@ -1803,14 +1803,17 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
         let id = candidates.len();
         candidates.push(template_candidate(id, mutator, mode, marker, &follow_ups));
     }
-    // Closed multi-parameter Episode 2 function exercising parameter seeding
+    // Closed multi-parameter Episode 2 functions exercising parameter seeding
     // (`Option<bool>`, `Option<ColorTag>`, `Option<NonZeroU32>`, `SingleC`,
     // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`,
-    // slice references `&[u32]` / `&mut [u8]`, and fat raw pointers
-    // `*const [u32]`), deref-borrowed field projections, and local shadowing
-    // through real `rustc` + Miri + Anneal evaluation.
+    // `[u32; 1]`, slice/`str` references `&[u32]` / `&mut [u8]` / `&str` /
+    // `&mut str`, and fat raw pointers `*const [u32]` / `*mut [u8]` /
+    // `*const str` / `*mut str`), reference-returning signatures
+    // (`-> &'a mut u32`), body `'a` annotations, early `return`s,
+    // deref-borrowed field projections, and local shadowing through real
+    // `rustc` + Miri + Anneal evaluation.
     let param_ep2_seed = "\
-pub fn param_ep2_live<'a>(
+pub fn param_ep2_live<'a, 'b>(
     s: SingleC,
     MetersU32(m_inner): MetersU32,
     nm: NonZeroMeters,
@@ -1818,8 +1821,14 @@ pub fn param_ep2_live<'a>(
     r_pair: &'a mut PairU32,
     p_sc: *mut SingleC,
     s_slice: &'a [u32],
-    s_mut_bytes: &'a mut [u8],
+    s_mut_bytes: &'b mut [u8],
     p_slice: *const [u32],
+    p_mut_bytes: *mut [u8],
+    s_str: &'a str,
+    s_mut_str: &'b mut str,
+    p_str: *const str,
+    p_mut_str: *mut str,
+    one_elem: [u32; 1],
     (tup_a, tup_b): (u32, u8),
     u_word: Uninit<u32>,
     ob: Option<bool>,
@@ -1827,14 +1836,17 @@ pub fn param_ep2_live<'a>(
     onz: core::option::Option<NonZeroU32>,
     bytes: [u8; 4],
     words: [u32; 2],
-) -> u32 {
+) -> u32
+where
+    'a: 'b,
+{
     let shadowed: u32 = 1u32;
     let (shadowed, _): (PairU32, u32) = (PairU32 { a: words[0], b: words[1] }, tup_a);
     let rb_ref: &mut u32 = &mut (*r_pair).b;
     let r_pair_a: u32 = r_pair.a;
     *rb_ref = tup_b as u32;
     s_mut_bytes[0] ^= 1u8;
-    let _ = p_slice;
+    let _ = (p_slice, p_mut_bytes, s_str, s_mut_str, p_str, p_mut_str);
     let mut borrowed = PairU32 { a: r_pair_a, b: r_pair.b };
     let rb: &mut u32 = &mut (borrowed.b);
     let keep_a: u32 = (borrowed).a;
@@ -1861,11 +1873,29 @@ pub fn param_ep2_live<'a>(
     };
     let onz_v: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(onz) };
     let ov_v: u32 = unsafe { o.word ^ u_word.value };
-    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ s_slice[0] ^ (bytes[0] as u32) ^ shadowed.a
+    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ s_slice[0] ^ one_elem[0] ^ (bytes[0] as u32) ^ shadowed.a
+}
+";
+    let ref_ret_ep2_seed = "\
+pub fn ref_ret_ep2_live<'a>(
+    x: &'a mut u32,
+    y: &'a mut u32,
+    flag: bool,
+) -> &'a mut u32 {
+    let chosen: &'a mut u32 = if flag {
+        *x ^= 3u32;
+        return x;
+    } else {
+        *y ^= 5u32;
+        y
+    };
+    chosen
 }
 ";
     let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);
     assert_eq!(param_batch.len(), 2);
+    param_batch.extend(generate_miri_batch(&[ref_ret_ep2_seed], 2, 0xE2A3_0001));
+    assert_eq!(param_batch.len(), 4);
     for mut cand in param_batch.drain(..) {
         let id = candidates.len();
         let old_fn_name = cand.fn_name;
