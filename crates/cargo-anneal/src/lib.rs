@@ -42,6 +42,7 @@ use anneal_rustc_capture::{CaptureManifest, CapturedItemKind, UnitTargetRecord};
 pub use agent::{
     LockedFileDigest, LockedUnitRecord, SPEC_LOCK_REL_PATH, SPEC_LOCK_SCHEMA_V1,
     SpecLockManifest, check_specs_non_vacuous, check_specs_non_vacuous_with_records,
+    compute_spec_lock_manifest_digest, is_canonical_mir_fragment_tag, is_lowercase_sha256_hex,
     lock_workspace_specs, lock_workspace_specs_with_mutable, lock_workspace_specs_with_options,
     parse_spec_lock_manifest, render_agent_context, run_agent_sandbox,
     serialize_spec_lock_manifest, verify_spec_lock, verify_spec_lock_with_options,
@@ -97,11 +98,13 @@ pub use obligations::{
     render_verify_module_with_options,
 };
 pub use scaffold::{
-    LEAN_TOOLCHAIN, MirLiftingProfile, ScaffoldConfig, ScaffoldReport,
-    analyze_mir_lifting_profile, analyze_workspace_lifting_profile, detect_authored_item_modules,
-    refresh_workspace_assembly, render_lakefile_toml, render_proof_template_with_hints,
-    render_scaffold_lifting_hints, scaffold_init_proof_templates, scaffold_init_spec_templates,
-    scaffold_workspace, scaffold_workspace_with_config,
+    LEAN_TOOLCHAIN, MirFragment, MirFragmentClassification, MirLiftingProfile, ScaffoldConfig,
+    ScaffoldReport, analyze_mir_lifting_profile, analyze_workspace_lifting_profile,
+    classify_mir_fragment, compute_fragment_spec_digest, detect_authored_item_modules,
+    refresh_workspace_assembly, render_lakefile_toml, render_mir_fragment_diagnostic,
+    render_proof_template_with_hints, render_scaffold_lifting_hints,
+    scaffold_init_proof_templates, scaffold_init_spec_templates, scaffold_workspace,
+    scaffold_workspace_with_config,
 };
 pub use trace_observer::{
     __anneal_mir_rt_branch, __anneal_mir_rt_call_begin, __anneal_mir_rt_call_end_normal,
@@ -3595,6 +3598,21 @@ mod tests {
         assert!(lock_report.contains("Locked Specs files: 0"));
         assert!(lock_report.contains("Locked Assumptions files: 0"));
         assert!(lock_report.contains("Non-vacuity check: PASS"));
+        // The tutor-rendered report format is unchanged; the fragment
+        // certificates live in `.anneal/spec-lock.json` (records without a
+        // SHA-matching captured MIR module are certified fail-closed).
+        assert!(!lock_report.contains("spec_digest"), "{lock_report}");
+        let locked = parse_spec_lock_manifest(&fs::read_to_string(&lock_path).expect("read lock"))
+            .expect("parse lock");
+        let digest = locked.spec_digest.clone().expect("manifest spec_digest");
+        assert_eq!(digest, compute_spec_lock_manifest_digest(&locked));
+        assert!(
+            locked
+                .locked_records
+                .iter()
+                .all(|rec| rec.mir_fragment.as_deref() == Some("full_mir")),
+            "{locked:?}"
+        );
         let _ = fs::remove_dir_all(&ws);
 
         let verify_report = render_verification_report(&VerificationReport {

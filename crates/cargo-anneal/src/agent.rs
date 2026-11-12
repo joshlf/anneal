@@ -10,31 +10,36 @@
 //!    records SHA-256 digests of all captured MIR modules, every authored
 //!    specification override under `anneal/proofs/Specs/`, and every authored
 //!    assumption module under `anneal/proofs/Assumptions/` in
-//!    `.anneal/spec-lock.json`.
+//!    `.anneal/spec-lock.json`, together with each record's `MirFragment`
+//!    certificate (`mir_fragment` + `spec_digest`) and a manifest-level
+//!    `spec_digest` over the whole locked payload.
 //! 2. **Pre-build lock verification (`verify_spec_lock`,
 //!    `check_specs_non_vacuous`)**: rejects verification runs before invoking
 //!    Lake if captured items were filtered or altered, if any `Specs` or
 //!    `Assumptions` file was added, removed, or modified relative to
-//!    `.anneal/spec-lock.json`, or if a `Specs` file introduces a vacuous
-//!    `False` precondition.
+//!    `.anneal/spec-lock.json`, if a recorded fragment certificate no longer
+//!    matches, or if a `Specs` file introduces a vacuous `False` precondition.
 //! 3. **Structured agent context (`render_agent_context`)**: assembles a
 //!    Markdown report containing each target item's obligation module, active
-//!    specification override, lowered MIR body, and starter proof template.
+//!    specification override, `MirFragment` classification (with a boundary
+//!    diagnostic above `pure_bounded_loop`), lowered MIR body, and starter
+//!    proof template.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anneal_rustc_capture::manifest::{escape_json, sha256_hex};
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord};
 
 use crate::obligations::{
-    AuthoredItemModules, SubjectObligationBundle, group_subject_obligations,
-    render_obligations_module_with_options,
+    AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
+    group_subject_obligations, module_suffix_to_rel_path, render_obligations_module_with_options,
 };
 use crate::scaffold::{
-    MirLiftingProfile, analyze_workspace_lifting_profile, detect_authored_item_modules,
-    render_proof_template_with_hints,
+    MirFragment, MirLiftingProfile, analyze_workspace_lifting_profile,
+    classify_mir_fragment, compute_fragment_spec_digest, detect_authored_item_modules,
+    render_mir_fragment_diagnostic, render_proof_template_with_hints,
 };
 
 /// Schema identifier stored in `.anneal/spec-lock.json`.
@@ -42,6 +47,29 @@ pub const SPEC_LOCK_SCHEMA_V1: &str = "anneal.spec-lock.v1";
 
 /// Default workspace-relative path to the specification lock manifest.
 pub const SPEC_LOCK_REL_PATH: &str = ".anneal/spec-lock.json";
+
+/// Versioned domain-separation tag of the manifest-level `spec_digest`
+/// (`compute_spec_lock_manifest_digest`).
+const SPEC_LOCK_MANIFEST_DIGEST_DOMAIN: &str = "anneal-spec-lock-manifest-digest-v1";
+
+/// Returns `true` when `tag` is a canonical `MirFragment::as_str()` tag
+/// (`"pure_loop_free"`, `"pure_bounded_loop"`, `"tree_borrows_local"`,
+/// `"intrinsic_copy"`, or `"full_mir"`), rejecting the Lean constructor
+/// aliases accepted by `MirFragment::from_str` (`"fullMir"`,
+/// `"MirFragment.fullMir"`) and any surrounding whitespace.
+pub fn is_canonical_mir_fragment_tag(tag: &str) -> bool {
+    tag.parse::<MirFragment>()
+        .is_ok_and(|frag| frag.as_str() == tag)
+}
+
+/// Returns `true` when `digest` is exactly 64 lowercase ASCII hex characters
+/// (the canonical `sha256_hex` rendering used by every `spec_digest`).
+pub fn is_lowercase_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Locked metadata for a single captured compilation-unit target record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,10 +84,21 @@ pub struct LockedUnitRecord {
     pub associated_subject_def_id: Option<String>,
     /// Lowercase hex SHA-256 digest of the generated `Mir/<Item>.lean` file.
     pub mir_module_sha256: String,
+    /// Canonical `MirFragment::as_str()` tag (`"pure_loop_free"` ..
+    /// `"full_mir"`) of the locked `Mir/<Item>.lean` body, classified by
+    /// `classify_mir_fragment` (fail-closed `"full_mir"` when no captured
+    /// module matching `mir_module_sha256` is on disk). `None` on legacy
+    /// `anneal.spec-lock.v1` manifests written before fragment certificates.
+    pub mir_fragment: Option<String>,
+    /// 64-char lowercase hex `compute_fragment_spec_digest(def_id,
+    /// mir_module_sha256, authored Specs/<Item>.lean source, mir_fragment)`
+    /// certificate. `None` on legacy manifests.
+    pub spec_digest: Option<String>,
 }
 
 impl LockedUnitRecord {
-    /// Project a `UnitTargetRecord` into its locked manifest representation.
+    /// Project a `UnitTargetRecord` into its legacy (certificate-free) locked
+    /// manifest representation (`mir_fragment` and `spec_digest` are `None`).
     pub fn from_unit_record(record: &UnitTargetRecord) -> Self {
         Self {
             def_id: record.target.def_id.clone(),
@@ -67,7 +106,15 @@ impl LockedUnitRecord {
             item_kind: record.item_kind.as_str().to_string(),
             associated_subject_def_id: record.associated_subject_def_id.clone(),
             mir_module_sha256: record.target.mir_module_sha256.clone(),
+            mir_fragment: None,
+            spec_digest: None,
         }
+    }
+
+    /// Whether this record carries a fragment certificate (`mir_fragment` or
+    /// `spec_digest`).
+    pub fn has_fragment_certificate(&self) -> bool {
+        self.mir_fragment.is_some() || self.spec_digest.is_some()
     }
 }
 
@@ -100,6 +147,12 @@ pub struct SpecLockManifest {
     /// `subject` MIR digests, never their `#[spec]` companions or `Specs/**`)
     /// are explicitly designated mutable via `lock-specs --allow-impl-edit`.
     pub mutable_subjects: Vec<String>,
+    /// 64-char lowercase hex `compute_spec_lock_manifest_digest` over the
+    /// manifest payload itself (`schema`, sorted `locked_records` including
+    /// their `mir_fragment` / `spec_digest`, `locked_specs_files`,
+    /// `locked_assumptions_files`, and `mutable_subjects`), fixed at
+    /// `lock-specs` time. `None` on legacy manifests.
+    pub spec_digest: Option<String>,
 }
 
 impl SpecLockManifest {
@@ -119,12 +172,20 @@ impl SpecLockManifest {
 
 /// Serialize a `SpecLockManifest` to deterministic JSON without external crate
 /// dependencies.
+///
+/// The optional `spec_digest` (manifest) and `mir_fragment` / `spec_digest`
+/// (record) keys are omitted when `None`, so a certificate-free manifest
+/// serializes bit-for-bit identically to the legacy `anneal.spec-lock.v1`
+/// shape, and are emitted in a fixed position when `Some(..)`.
 pub fn serialize_spec_lock_manifest(manifest: &SpecLockManifest) -> String {
     let mut out = String::from("{\n");
     out.push_str(&format!(
         "  \"schema\": \"{}\",\n",
         escape_json(&manifest.schema)
     ));
+    if let Some(digest) = &manifest.spec_digest {
+        out.push_str(&format!("  \"spec_digest\": \"{}\",\n", escape_json(digest)));
+    }
 
     if !manifest.mutable_subjects.is_empty() {
         out.push_str("  \"mutable_subjects\": [\n");
@@ -166,10 +227,20 @@ pub fn serialize_spec_lock_manifest(manifest: &SpecLockManifest) -> String {
             )),
             None => out.push_str("      \"associated_subject_def_id\": null,\n"),
         }
-        out.push_str(&format!(
-            "      \"mir_module_sha256\": \"{}\"\n",
+        let mut trailing = vec![format!(
+            "\"mir_module_sha256\": \"{}\"",
             escape_json(&rec.mir_module_sha256)
-        ));
+        )];
+        if let Some(frag) = &rec.mir_fragment {
+            trailing.push(format!("\"mir_fragment\": \"{}\"", escape_json(frag)));
+        }
+        if let Some(digest) = &rec.spec_digest {
+            trailing.push(format!("\"spec_digest\": \"{}\"", escape_json(digest)));
+        }
+        for (j, field) in trailing.iter().enumerate() {
+            let sep = if j + 1 < trailing.len() { "," } else { "" };
+            out.push_str(&format!("      {field}{sep}\n"));
+        }
         out.push_str(&format!("    }}{comma}\n"));
     }
     out.push_str("  ],\n");
@@ -217,6 +288,14 @@ pub fn serialize_spec_lock_manifest(manifest: &SpecLockManifest) -> String {
 }
 
 /// Parse a `SpecLockManifest` from its JSON text representation.
+///
+/// Backward compatible with legacy `anneal.spec-lock.v1` manifests: a missing
+/// or `null` `mir_fragment` / `spec_digest` key parses as `None`. Present
+/// values are validated strictly: `mir_fragment` must be a canonical
+/// `MirFragment::as_str()` tag (`is_canonical_mir_fragment_tag`) and every
+/// `spec_digest` must be 64 lowercase hex characters
+/// (`is_lowercase_sha256_hex`). Duplicate object keys are rejected so the
+/// manifest cannot mean different things to different JSON readers.
 pub fn parse_spec_lock_manifest(input: &str) -> Result<SpecLockManifest, String> {
     let root = parse_json(input)?;
     let obj = root
@@ -224,6 +303,7 @@ pub fn parse_spec_lock_manifest(input: &str) -> Result<SpecLockManifest, String>
         .ok_or_else(|| "expected top-level JSON object in spec-lock manifest".to_string())?;
 
     let schema = get_string_field(obj, "schema")?;
+    let spec_digest = parse_optional_spec_digest(obj, "spec-lock manifest")?;
     let records_val = get_field(obj, "locked_records")
         .ok_or_else(|| "missing field 'locked_records' in spec-lock manifest".to_string())?;
     let records_arr = records_val
@@ -248,12 +328,30 @@ pub fn parse_spec_lock_manifest(input: &str) -> Result<SpecLockManifest, String>
             }
         };
         let mir_module_sha256 = get_string_field(item_obj, "mir_module_sha256")?;
+        let mir_fragment = match get_field(item_obj, "mir_fragment") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::Str(s)) if is_canonical_mir_fragment_tag(s) => Some(s.clone()),
+            Some(JsonValue::Str(s)) => {
+                return Err(format!(
+                    "field 'mir_fragment' of locked record '{def_id}' must be a canonical MirFragment tag (pure_loop_free, pure_bounded_loop, tree_borrows_local, intrinsic_copy, or full_mir), got {s:?}"
+                ));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "field 'mir_fragment' of locked record '{def_id}' must be a canonical MirFragment tag string or null"
+                ));
+            }
+        };
+        let spec_digest =
+            parse_optional_spec_digest(item_obj, &format!("locked record '{def_id}'"))?;
         locked_records.push(LockedUnitRecord {
             def_id,
             lean_module_name,
             item_kind,
             associated_subject_def_id,
             mir_module_sha256,
+            mir_fragment,
+            spec_digest,
         });
     }
 
@@ -286,7 +384,27 @@ pub fn parse_spec_lock_manifest(input: &str) -> Result<SpecLockManifest, String>
         locked_specs_files,
         locked_assumptions_files,
         mutable_subjects,
+        spec_digest,
     })
+}
+
+/// Parse an optional `"spec_digest"` key of `obj` (`owner` names the manifest
+/// or record in error messages): missing / `null` is `None`; otherwise the
+/// value must be a 64-char lowercase hex string.
+fn parse_optional_spec_digest(
+    obj: &[(String, JsonValue)],
+    owner: &str,
+) -> Result<Option<String>, String> {
+    match get_field(obj, "spec_digest") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Str(s)) if is_lowercase_sha256_hex(s) => Ok(Some(s.clone())),
+        Some(JsonValue::Str(s)) => Err(format!(
+            "field 'spec_digest' of {owner} must be 64 lowercase hex characters, got {s:?}"
+        )),
+        Some(_) => Err(format!(
+            "field 'spec_digest' of {owner} must be a 64-char lowercase hex string or null"
+        )),
+    }
 }
 
 fn parse_digest_list(
@@ -308,6 +426,224 @@ fn parse_digest_list(
         out.push(LockedFileDigest { rel_path, sha256 });
     }
     Ok(out)
+}
+
+/// Compute the manifest-level `spec_digest`: a deterministic 64-char
+/// lowercase hex SHA-256 over a versioned, length-prefixed canonical encoding
+/// of the manifest payload — `schema`, every `locked_records` entry (all of
+/// its fields, with explicit `none` markers for absent `mir_fragment` /
+/// `spec_digest` / `associated_subject_def_id`), `locked_specs_files`,
+/// `locked_assumptions_files`, and `mutable_subjects` — excluding only
+/// `manifest.spec_digest` itself.
+///
+/// Records, file digests, and subjects are sorted inside the encoding, so the
+/// digest depends only on the locked *content*, never on JSON key order or
+/// whitespace; any change to any field (including adding a `mutable_subjects`
+/// entry, flipping a record's `mir_fragment`, or dropping a certificate)
+/// changes it.
+///
+/// **Invariant (`--allow-impl-edit`)**: the digest commits to the manifest as
+/// written by `lock-specs`, not to the live workspace. Editing the Rust body of
+/// a `mutable_subjects` entry changes that subject's *current* MIR digest,
+/// fragment, and record certificate, but never `.anneal/spec-lock.json`, so the
+/// manifest digest stays valid while `verify_locked_records_match` and
+/// `verify_locked_record_certificates` skip exactly that subject.
+///
+/// This is an unkeyed integrity checksum: it detects corrupted or naively
+/// hand-edited lock files, but an adversary able to rewrite
+/// `.anneal/spec-lock.json` can recompute it. Tamper-resistance against such an
+/// adversary comes from verifying against an out-of-workspace copy
+/// (`--lock-file`, `--lock-git-ref`) and from `agent-sandbox`'s read-only
+/// mount of the lock file; the per-record certificates are additionally
+/// re-derived from the workspace on every `verify_spec_lock`.
+pub fn compute_spec_lock_manifest_digest(manifest: &SpecLockManifest) -> String {
+    fn put(out: &mut String, key: &str, val: &str) {
+        out.push_str(&format!("{key}:{}:{val}\n", val.len()));
+    }
+    fn put_opt(out: &mut String, key: &str, val: Option<&str>) {
+        match val {
+            Some(v) => out.push_str(&format!("{key}:some:{}:{v}\n", v.len())),
+            None => out.push_str(&format!("{key}:none\n")),
+        }
+    }
+    fn put_blocks(out: &mut String, key: &str, mut blocks: Vec<String>) {
+        blocks.sort();
+        out.push_str(&format!("{key}:{}\n", blocks.len()));
+        for block in blocks {
+            out.push_str(&format!("entry:{}\n{block}", block.len()));
+        }
+    }
+    let file_blocks = |files: &[LockedFileDigest]| -> Vec<String> {
+        files
+            .iter()
+            .map(|f| {
+                let mut block = String::new();
+                put(&mut block, "rel_path", &f.rel_path);
+                put(&mut block, "sha256", &f.sha256);
+                block
+            })
+            .collect()
+    };
+
+    let mut canonical = format!("{SPEC_LOCK_MANIFEST_DIGEST_DOMAIN}\n");
+    put(&mut canonical, "schema", &manifest.schema);
+    let record_blocks = manifest
+        .locked_records
+        .iter()
+        .map(|rec| {
+            let mut block = String::new();
+            put(&mut block, "def_id", &rec.def_id);
+            put(&mut block, "lean_module_name", &rec.lean_module_name);
+            put(&mut block, "item_kind", &rec.item_kind);
+            put_opt(
+                &mut block,
+                "associated_subject_def_id",
+                rec.associated_subject_def_id.as_deref(),
+            );
+            put(&mut block, "mir_module_sha256", &rec.mir_module_sha256);
+            put_opt(&mut block, "mir_fragment", rec.mir_fragment.as_deref());
+            put_opt(&mut block, "spec_digest", rec.spec_digest.as_deref());
+            block
+        })
+        .collect();
+    put_blocks(&mut canonical, "locked_records", record_blocks);
+    put_blocks(
+        &mut canonical,
+        "locked_specs_files",
+        file_blocks(&manifest.locked_specs_files),
+    );
+    put_blocks(
+        &mut canonical,
+        "locked_assumptions_files",
+        file_blocks(&manifest.locked_assumptions_files),
+    );
+    let subject_blocks = manifest
+        .mutable_subjects
+        .iter()
+        .map(|subj| {
+            let mut block = String::new();
+            put(&mut block, "subject", subj);
+            block
+        })
+        .collect();
+    put_blocks(&mut canonical, "mutable_subjects", subject_blocks);
+    sha256_hex(canonical.as_bytes())
+}
+
+/// Re-derived `MirFragment` certificate of one captured record.
+struct RecordFragmentCertificate {
+    fragment: MirFragment,
+    spec_digest: String,
+    /// Whether a captured MIR module whose bytes hash to `mir_module_sha256`
+    /// was found (otherwise `fragment` is the fail-closed `FullMir`).
+    mir_module_found: bool,
+}
+
+/// Locate and read the captured `Mir/<Item>.lean` text whose SHA-256 equals
+/// `record.target.mir_module_sha256` (any existing candidate when the recorded
+/// digest is empty), so the certified fragment is always classified from the
+/// exact bytes the record's `mir_module_sha256` commits to.
+///
+/// Candidates, in order: `.anneal/generated/Mir/<item_rel>` with fallback to
+/// `<workspace>/target/anneal/units` (`resolve_workspace_mir_file`, the same
+/// resolution `agent-context` uses), then `rec.target.mir_module_path`
+/// interpreted relative to `workspace_root` (relative, `..`-free paths only).
+fn read_certified_mir_text(
+    workspace_root: &Path,
+    record: &UnitTargetRecord,
+    item_rel_path: &Path,
+) -> Option<String> {
+    let expected_sha = &record.target.mir_module_sha256;
+    let mut candidates = Vec::new();
+    if let Some(path) = crate::scaffold::resolve_workspace_mir_file(
+        &workspace_root.join(".anneal/generated/Mir"),
+        record,
+        item_rel_path,
+    ) {
+        candidates.push(path);
+    }
+    let recorded = Path::new(&record.target.mir_module_path);
+    if !record.target.mir_module_path.is_empty()
+        && recorded
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        candidates.push(workspace_root.join(recorded));
+    }
+    candidates.into_iter().find_map(|path| {
+        let bytes = fs::read(&path).ok()?;
+        if !expected_sha.is_empty() && sha256_hex(&bytes) != *expected_sha {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    })
+}
+
+/// Re-derive `record`'s fragment certificate from the workspace: classify its
+/// SHA-matching captured MIR (`classify_mir_fragment`, fail-closed
+/// `MirFragment::FullMir` when no such module is on disk — e.g. synthetic
+/// records in unit tests — identically at lock and verify time) and digest it
+/// together with `def_id`, `mir_module_sha256`, and the authored
+/// `anneal/proofs/Specs/<item_rel>` source when present.
+fn compute_record_fragment_certificate(
+    workspace_root: &Path,
+    record: &UnitTargetRecord,
+) -> Result<RecordFragmentCertificate, String> {
+    let item_rel_path = module_suffix_to_rel_path(&derive_item_module_suffix(record));
+    let mir_text = read_certified_mir_text(workspace_root, record, &item_rel_path);
+    let fragment = mir_text
+        .as_deref()
+        .map_or(MirFragment::FullMir, |src| classify_mir_fragment(src).inferred_fragment);
+    let spec_path = workspace_root
+        .join("anneal/proofs/Specs")
+        .join(&item_rel_path);
+    let spec_src = if spec_path.is_file() {
+        Some(fs::read_to_string(&spec_path).map_err(|err| {
+            format!(
+                "failed to read authored specification {}: {}",
+                spec_path.display(),
+                err
+            )
+        })?)
+    } else {
+        None
+    };
+    let spec_digest = compute_fragment_spec_digest(
+        &record.target.def_id,
+        &record.target.mir_module_sha256,
+        spec_src.as_deref(),
+        fragment,
+    );
+    Ok(RecordFragmentCertificate {
+        fragment,
+        spec_digest,
+        mir_module_found: mir_text.is_some(),
+    })
+}
+
+/// Like `build_sorted_locked_records`, but attaches each record's re-derived
+/// fragment certificate (`mir_fragment` + `spec_digest`). Also returns the
+/// `def_id`s whose SHA-matching MIR module could not be found (fail-closed
+/// `full_mir`), for verification diagnostics.
+fn build_sorted_certified_records(
+    workspace_root: &Path,
+    records: &[UnitTargetRecord],
+) -> Result<(Vec<LockedUnitRecord>, BTreeSet<String>), String> {
+    let mut by_def_id: BTreeMap<String, LockedUnitRecord> = BTreeMap::new();
+    let mut missing_mir = BTreeSet::new();
+    for rec in records {
+        let cert = compute_record_fragment_certificate(workspace_root, rec)?;
+        let mut locked = LockedUnitRecord::from_unit_record(rec);
+        locked.mir_fragment = Some(cert.fragment.as_str().to_string());
+        locked.spec_digest = Some(cert.spec_digest);
+        if cert.mir_module_found {
+            missing_mir.remove(&locked.def_id);
+        } else {
+            missing_mir.insert(locked.def_id.clone());
+        }
+        by_def_id.insert(locked.def_id.clone(), locked);
+    }
+    Ok((by_def_id.into_values().collect(), missing_mir))
 }
 
 /// Scan `anneal/proofs/Specs` and `anneal/proofs/Assumptions` under
@@ -342,7 +678,7 @@ pub fn lock_workspace_specs_with_options(
     mutable_patterns: &[String],
     external_lock_file: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let mut mutable_set = std::collections::BTreeSet::new();
+    let mut mutable_set = BTreeSet::new();
     for raw_pat in mutable_patterns {
         for pat in raw_pat.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let mut matched_any = false;
@@ -362,20 +698,22 @@ pub fn lock_workspace_specs_with_options(
         }
     }
 
-    let locked_records = build_sorted_locked_records(records);
     check_specs_non_vacuous_with_records(workspace_root, records)?;
+    let (locked_records, _) = build_sorted_certified_records(workspace_root, records)?;
     let locked_specs_files =
         collect_locked_file_digests(workspace_root, "anneal/proofs/Specs")?;
     let locked_assumptions_files =
         collect_locked_file_digests(workspace_root, "anneal/proofs/Assumptions")?;
 
-    let manifest = SpecLockManifest {
+    let mut manifest = SpecLockManifest {
         schema: SPEC_LOCK_SCHEMA_V1.to_string(),
         locked_records,
         locked_specs_files,
         locked_assumptions_files,
         mutable_subjects: mutable_set.into_iter().collect(),
+        spec_digest: None,
     };
+    manifest.spec_digest = Some(compute_spec_lock_manifest_digest(&manifest));
 
     let dot_anneal = workspace_root.join(".anneal");
     fs::create_dir_all(&dot_anneal).map_err(|err| {
@@ -521,9 +859,14 @@ pub fn verify_spec_lock_with_options(
         ));
     }
 
+    // 1. Integrity of the lock file itself (manifest-level `spec_digest`).
+    verify_spec_lock_manifest_integrity(&manifest, &source_desc)?;
+
+    // 2. Captured records (identity, roles, and MIR digests).
     let current_locked = build_sorted_locked_records(current_records);
     verify_locked_records_match(&manifest.locked_records, &current_locked, &manifest.mutable_subjects)?;
 
+    // 3. Authored `Specs/**` and `Assumptions/**` trees.
     let current_specs = collect_locked_file_digests(workspace_root, "anneal/proofs/Specs")?;
     verify_file_digests_match(
         "Specs",
@@ -541,9 +884,99 @@ pub fn verify_spec_lock_with_options(
         &current_assumptions,
     )?;
 
+    // 4. Per-record `MirFragment` certificates, re-derived from the workspace.
+    //    Legacy manifests (no certificates anywhere, as enforced by step 1)
+    //    skip this step and verify exactly as before.
+    if manifest.spec_digest.is_some() {
+        let (current_certified, missing_mir) =
+            build_sorted_certified_records(workspace_root, current_records)?;
+        verify_locked_record_certificates(
+            &manifest.locked_records,
+            &current_certified,
+            &manifest.mutable_subjects,
+            &missing_mir,
+        )?;
+    }
+
     check_specs_non_vacuous_with_records(workspace_root, current_records)?;
 
     Ok(manifest)
+}
+
+/// Verify the manifest-level certificate of a parsed `.anneal/spec-lock.json`.
+///
+/// Certificates are all-or-nothing: either the manifest is a legacy
+/// certificate-free `anneal.spec-lock.v1` lock (no manifest `spec_digest` and no
+/// record `mir_fragment` / `spec_digest`), which verifies exactly as before, or
+/// it carries a manifest `spec_digest` *and* every record carries both
+/// `mir_fragment` and `spec_digest` — the only two shapes `lock-specs` writes.
+/// A mixed shape means certificates were partially stripped (a downgrade
+/// attempt) and is rejected. When present, the manifest `spec_digest` must
+/// equal `compute_spec_lock_manifest_digest` recomputed from the parsed payload,
+/// which detects modification of any locked field (records, fragments, record
+/// digests, `locked_specs_files`, `locked_assumptions_files`, or
+/// `mutable_subjects`) after `lock-specs`.
+fn verify_spec_lock_manifest_integrity(
+    manifest: &SpecLockManifest,
+    source_desc: &str,
+) -> Result<(), String> {
+    // `lock-specs` never writes duplicate entries (records are keyed by
+    // `def_id`, files by `rel_path`); a duplicate would be silently collapsed
+    // by the map-based comparisons below, so reject it outright.
+    let mut seen_def_ids = BTreeSet::new();
+    for rec in &manifest.locked_records {
+        if !seen_def_ids.insert(rec.def_id.as_str()) {
+            return Err(format!(
+                "spec-lock violation: duplicate locked record '{}' in {source_desc}",
+                rec.def_id
+            ));
+        }
+    }
+    for (key, files) in [
+        ("locked_specs_files", &manifest.locked_specs_files),
+        ("locked_assumptions_files", &manifest.locked_assumptions_files),
+    ] {
+        let mut seen_paths = BTreeSet::new();
+        for entry in files {
+            if !seen_paths.insert(entry.rel_path.as_str()) {
+                return Err(format!(
+                    "spec-lock violation: duplicate '{key}' entry '{}' in {source_desc}",
+                    entry.rel_path
+                ));
+            }
+        }
+    }
+
+    let Some(recorded) = &manifest.spec_digest else {
+        if let Some(rec) = manifest
+            .locked_records
+            .iter()
+            .find(|r| r.has_fragment_certificate())
+        {
+            return Err(format!(
+                "spec-lock violation: locked record '{}' in {source_desc} carries a mir_fragment/spec_digest certificate but the manifest-level spec_digest is missing (certificates were partially stripped or tampered after `cargo anneal lock-specs`)",
+                rec.def_id
+            ));
+        }
+        return Ok(());
+    };
+    if let Some(rec) = manifest
+        .locked_records
+        .iter()
+        .find(|r| r.mir_fragment.is_none() || r.spec_digest.is_none())
+    {
+        return Err(format!(
+            "spec-lock violation: locked record '{}' in {source_desc} lacks its mir_fragment/spec_digest certificate although the manifest carries a spec_digest (certificates were partially stripped or tampered after `cargo anneal lock-specs`)",
+            rec.def_id
+        ));
+    }
+    let recomputed = compute_spec_lock_manifest_digest(manifest);
+    if *recorded != recomputed {
+        return Err(format!(
+            "spec-lock violation: manifest spec_digest mismatch in {source_desc} (recorded {recorded}, recomputed {recomputed}); the lock file was modified after `cargo anneal lock-specs`"
+        ));
+    }
+    Ok(())
 }
 
 fn load_spec_lock_from_git_ref(workspace_root: &Path, git_ref: &str) -> Result<String, String> {
@@ -782,9 +1215,7 @@ fn verify_locked_records_match(
                 exp.associated_subject_def_id, act.associated_subject_def_id
             ));
         }
-        let is_designated_mutable = exp.item_kind == "subject"
-            && act.item_kind == "subject"
-            && mutable_subjects.iter().any(|s| s == def_id);
+        let is_designated_mutable = is_designated_mutable_subject(exp, act, mutable_subjects);
         if !is_designated_mutable && exp.mir_module_sha256 != act.mir_module_sha256 {
             return Err(format!(
                 "spec-lock violation: MIR digest for '{def_id}' changed (expected {}, got {}); Rust source or contract annotations may not be modified while specs are locked",
@@ -801,6 +1232,86 @@ fn verify_locked_records_match(
         }
     }
 
+    Ok(())
+}
+
+/// Whether `exp` / `act` is a `subject` record designated mutable by
+/// `lock-specs --allow-impl-edit` (`mutable_subjects`). Only the subject's own
+/// implementation body may change: its `#[spec]` companions, external specs,
+/// `Specs/**`, and `Assumptions/**` stay strictly locked.
+fn is_designated_mutable_subject(
+    exp: &LockedUnitRecord,
+    act: &LockedUnitRecord,
+    mutable_subjects: &[String],
+) -> bool {
+    exp.item_kind == "subject"
+        && act.item_kind == "subject"
+        && mutable_subjects.iter().any(|s| *s == exp.def_id)
+}
+
+/// Compare each locked record's `mir_fragment` / `spec_digest` certificate
+/// against the certificate re-derived from the current workspace (`actual`,
+/// from `build_sorted_certified_records`).
+///
+/// Runs after `verify_locked_records_match` (record identity, roles, and MIR
+/// digests) and the `Specs/**` / `Assumptions/**` digest checks, so for every
+/// non-mutable record the MIR bytes and authored spec are already known to be
+/// unchanged, and a mismatch here means the certified fragment itself diverged
+/// (a recorded fragment that the locked MIR does not support, a classifier
+/// change, or a SHA-matching MIR module missing from disk — listed in
+/// `missing_mir`).
+///
+/// `mutable_subjects` interplay: a designated mutable subject's *current* MIR
+/// digest may legitimately differ from the locked one, so its current fragment
+/// and `spec_digest` may differ too and are not compared — mirroring the
+/// `mir_module_sha256` exemption in `verify_locked_records_match`. The lock
+/// file itself is untouched by such an implementation edit, so the
+/// manifest-level `spec_digest` (which signs the manifest as written at
+/// `lock-specs` time, including the subject's locked certificate and the
+/// `mutable_subjects` list) still verifies.
+fn verify_locked_record_certificates(
+    expected: &[LockedUnitRecord],
+    actual: &[LockedUnitRecord],
+    mutable_subjects: &[String],
+    missing_mir: &BTreeSet<String>,
+) -> Result<(), String> {
+    let actual_map: BTreeMap<&str, &LockedUnitRecord> =
+        actual.iter().map(|r| (r.def_id.as_str(), r)).collect();
+    for exp in expected {
+        let def_id = exp.def_id.as_str();
+        let Some(act) = actual_map.get(def_id) else {
+            return Err(format!(
+                "spec-lock violation: locked item '{def_id}' is missing from current capture records (narrowing targets with `--filter` or deleting items is forbidden)"
+            ));
+        };
+        if is_designated_mutable_subject(exp, act, mutable_subjects) {
+            continue;
+        }
+        let missing_hint = if missing_mir.contains(def_id) {
+            format!(
+                " (no captured MIR module matching mir_module_sha256 {} was found under .anneal/generated/Mir or target/anneal/units, so the fragment was re-derived fail-closed as `full_mir`; re-run extraction before locked verification)",
+                exp.mir_module_sha256
+            )
+        } else {
+            String::new()
+        };
+        if let Some(locked_frag) = &exp.mir_fragment
+            && act.mir_fragment.as_ref() != Some(locked_frag)
+        {
+            return Err(format!(
+                "spec-lock violation: mir_fragment for '{def_id}' changed from '{locked_frag}' to '{}'{missing_hint}",
+                act.mir_fragment.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if let Some(locked_digest) = &exp.spec_digest
+            && act.spec_digest.as_ref() != Some(locked_digest)
+        {
+            return Err(format!(
+                "spec-lock violation: spec_digest for '{def_id}' changed (expected {locked_digest}, got {}); the locked (def_id, mir_module_sha256, authored Specs/<Item>.lean, mir_fragment) certificate no longer matches{missing_hint}",
+                act.spec_digest.as_deref().unwrap_or("<none>")
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1503,6 +2014,16 @@ pub fn render_agent_context(
     let generated_root = workspace_root.join(".anneal/generated");
     let spec_lock_path = workspace_root.join(SPEC_LOCK_REL_PATH);
     let spec_lock_active = spec_lock_path.is_file();
+    // Best-effort read of the lock file for each item's locked `mir_fragment`
+    // (an unreadable or malformed lock file is reported by `agent-verify`,
+    // not by the context renderer).
+    let locked_manifest = if spec_lock_active {
+        fs::read_to_string(&spec_lock_path)
+            .ok()
+            .and_then(|raw| parse_spec_lock_manifest(&raw).ok())
+    } else {
+        None
+    };
 
     let mut present_proofs = 0usize;
     let mut missing_proofs = 0usize;
@@ -1597,6 +2118,17 @@ pub fn render_agent_context(
         let companion_count = bundle.inline_requires.len()
             + bundle.inline_ensures.len()
             + bundle.external_specs.len();
+        let fragment_class = lifting_profile.fragment_classification();
+        let locked_fragment_line = locked_manifest.as_ref().and_then(|manifest| {
+            let rec = manifest
+                .locked_records
+                .iter()
+                .find(|r| r.def_id == *def_id)?;
+            Some(render_locked_fragment_line(
+                rec.mir_fragment.as_deref(),
+                fragment_class.inferred_fragment,
+            ))
+        });
 
         out.push_str(&format!("## Item `{def_id}` (`{suffix}`)\n\n"));
         out.push_str(&format!("- **`def_id`**: `{def_id}`\n"));
@@ -1607,11 +2139,26 @@ pub fn render_agent_context(
             "- **Writable Proof Path**: `anneal/proofs/Proof/{rel_lean}`\n"
         ));
         out.push_str(&format!(
+            "- **MIR Fragment**: {}\n",
+            render_mir_fragment_label(fragment_class.inferred_fragment)
+        ));
+        if let Some(line) = &locked_fragment_line {
+            out.push_str(line);
+        }
+        out.push_str(&format!(
             "- **Companion Spec Count**: {companion_count} (requires: {}, ensures: {}, external: {})\n\n",
             bundle.inline_requires.len(),
             bundle.inline_ensures.len(),
             bundle.external_specs.len()
         ));
+        if fragment_class.inferred_fragment > MirFragment::PureBoundedLoop
+            && let Some(diagnostic) = render_mir_fragment_diagnostic(def_id, &fragment_class)
+        {
+            out.push_str(&format!(
+                "### MIR Fragment Boundary Diagnostic\n\n```text\n{}\n```\n\n",
+                diagnostic.trim_end()
+            ));
+        }
 
         let obligations_disk = generated_root.join("Obligations").join(&bundle.item_rel_path);
         let obligations_text = if obligations_disk.is_file() {
@@ -1676,6 +2223,37 @@ pub fn render_agent_context(
     }
 
     Ok(out)
+}
+
+/// `` `<tag>` (`<lean_ctor>`, rank <rank>) `` label of a `MirFragment`.
+fn render_mir_fragment_label(frag: MirFragment) -> String {
+    format!(
+        "`{}` (`{}`, rank {})",
+        frag.as_str(),
+        frag.lean_ctor(),
+        frag.to_rank()
+    )
+}
+
+/// `- **Locked MIR Fragment**` bullet for an item recorded in
+/// `.anneal/spec-lock.json`, comparing the locked certificate against the
+/// fragment of the current capture.
+fn render_locked_fragment_line(locked: Option<&str>, current: MirFragment) -> String {
+    const PREFIX: &str = "- **Locked MIR Fragment (`.anneal/spec-lock.json`)**:";
+    match locked.map(|tag| (tag, tag.parse::<MirFragment>())) {
+        Some((_, Ok(frag))) if frag == current => {
+            format!("{PREFIX} {}\n", render_mir_fragment_label(frag))
+        }
+        Some((_, Ok(frag))) => format!(
+            "{PREFIX} {} (differs from the current capture's `{}`; `cargo anneal agent-verify` accepts this only for `--allow-impl-edit` subjects)\n",
+            render_mir_fragment_label(frag),
+            current.as_str()
+        ),
+        Some((tag, Err(_))) => format!("{PREFIX} invalid tag {tag:?}\n"),
+        None => format!(
+            "{PREFIX} not recorded (legacy certificate-free `anneal.spec-lock.v1` lock)\n"
+        ),
+    }
 }
 
 fn render_lifting_strategy_guide_section() -> &'static str {
@@ -1880,7 +2458,13 @@ impl<'a> SimpleJsonParser<'a> {
             return Ok(JsonValue::Object(entries));
         }
         loop {
+            let key_pos = self.pos;
             let key = self.parse_string()?;
+            // Duplicate keys are ambiguous (readers disagree on first- vs.
+            // last-wins), so a spec-lock manifest must never contain them.
+            if entries.iter().any(|(k, _): &(String, JsonValue)| *k == key) {
+                return Err(format!("duplicate JSON object key '{key}' at byte {key_pos}"));
+            }
             if self.peek() != Some(b':') {
                 return Err(format!("expected ':' after key at byte {}", self.pos));
             }
@@ -2355,6 +2939,7 @@ mod tests {
             locked_specs_files: Vec::new(),
             locked_assumptions_files: Vec::new(),
             mutable_subjects: Vec::new(),
+            spec_digest: None,
         };
         fs::write(&ws_lock, tampered_manifest.to_json_string()).expect("overwrite ws lock");
 
@@ -2887,5 +3472,552 @@ end Mir.Demo.loop_fn
         let prime_stripped = strip_lean_comments(prime_src);
         assert!(!prime_stripped.contains("strip me"));
         assert!(prime_stripped.contains("pre := False"));
+    }
+
+    /// Single `return` block (`pure_loop_free`).
+    const RET_BLOCKS: &str =
+        "[{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }]";
+    /// Self-loop `goto 0` (`pure_bounded_loop`).
+    const LOOP_BLOCKS: &str =
+        "[{ statements := [], terminator := { kind := .goto 0, span := \"\" }, isCleanup := false }]";
+    /// `ProjectionElem.deref` read (`tree_borrows_local`).
+    const DEREF_BLOCKS: &str = "[{ statements := [{ kind := .assign { local_ := 0, projection := [] } (.use (.copy { local_ := 1, projection := [.deref] })), span := \"\" }], terminator := { kind := .return_, span := \"\" }, isCleanup := false }]";
+    /// `TerminatorKind.call` (`full_mir`).
+    const CALL_BLOCKS: &str = "[{ statements := [], terminator := { kind := .call (.constant { ty := { kind := .fnDef \"demo::f\" [], layoutIdx := 0 }, val := .zeroSized }) [] { local_ := 0, projection := [] } (some 1) .continue_, span := \"\" }, isCleanup := false }, { statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }]";
+
+    fn mir_module_text(module: &str, blocks: &str) -> String {
+        format!(
+            "import Trusted\nnamespace {module}\ndef body : CapturedMir := {{ defPath := \"{module}\", localDecls := [], basicBlocks := {blocks} }}\nend {module}\n"
+        )
+    }
+
+    /// Write `.anneal/generated/Mir/<rel>` and return its SHA-256.
+    fn write_generated_mir(ws: &Path, rel: &str, text: &str) -> String {
+        let path = ws.join(".anneal/generated/Mir").join(rel);
+        fs::create_dir_all(path.parent().expect("Mir parent")).expect("create Mir dir");
+        fs::write(&path, text).expect("write generated Mir module");
+        sha256_hex(text.as_bytes())
+    }
+
+    /// `sample_records()` whose MIR digests commit to real captured modules:
+    /// `demo::add` is `pure_loop_free`, its `requires` companion `full_mir`.
+    fn certified_workspace(prefix: &str) -> (PathBuf, Vec<UnitTargetRecord>) {
+        let ws = unique_temp_dir(prefix);
+        let mut records = sample_records();
+        records[0].target.mir_module_sha256 = write_generated_mir(
+            &ws,
+            "Demo/add.lean",
+            &mir_module_text("Mir.Demo.add", RET_BLOCKS),
+        );
+        records[1].target.mir_module_sha256 = write_generated_mir(
+            &ws,
+            "Demo/__anodized_fn_requires_add.lean",
+            &mir_module_text("Mir.Demo.__anodized_fn_requires_add", CALL_BLOCKS),
+        );
+        (ws, records)
+    }
+
+    const ADD_SPEC_TEXT: &str = "prelude\nimport Trusted\nnamespace Specs.Demo.add\ninstance : ItemSpec \"demo::add\" where\n  pre _ := True\n  post _ _ := True\nend Specs.Demo.add\n";
+
+    #[test]
+    fn spec_lock_legacy_manifests_without_certificates_still_verify() {
+        let (ws, records) = certified_workspace("legacy-lock");
+        let lock_path = ws.join(SPEC_LOCK_REL_PATH);
+        fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("create .anneal");
+
+        // Verbatim shape written by the pre-certificate serializer.
+        let legacy_json = format!(
+            "{{\n  \"schema\": \"anneal.spec-lock.v1\",\n  \"locked_records\": [\n    {{\n      \"def_id\": \"demo::__anodized_fn_requires_add\",\n      \"lean_module_name\": \"Mir.Demo.__anodized_fn_requires_add\",\n      \"item_kind\": \"{}\",\n      \"associated_subject_def_id\": \"demo::add\",\n      \"mir_module_sha256\": \"{}\"\n    }},\n    {{\n      \"def_id\": \"demo::add\",\n      \"lean_module_name\": \"Mir.Demo.add\",\n      \"item_kind\": \"{}\",\n      \"associated_subject_def_id\": null,\n      \"mir_module_sha256\": \"{}\"\n    }}\n  ],\n  \"locked_specs_files\": [\n  ],\n  \"locked_assumptions_files\": [\n  ]\n}}\n",
+            records[1].item_kind.as_str(),
+            records[1].target.mir_module_sha256,
+            records[0].item_kind.as_str(),
+            records[0].target.mir_module_sha256,
+        );
+        let legacy = parse_spec_lock_manifest(&legacy_json).expect("parse legacy manifest");
+        assert_eq!(legacy.spec_digest, None);
+        assert!(legacy.locked_records.iter().all(|r| !r.has_fragment_certificate()));
+        assert_eq!(
+            serialize_spec_lock_manifest(&legacy),
+            legacy_json,
+            "certificate-free manifests must serialize bit-for-bit in the legacy shape"
+        );
+        fs::write(&lock_path, &legacy_json).expect("write legacy lock");
+        let verified = verify_spec_lock(&ws, &records).expect("legacy lock must verify unchanged");
+        assert_eq!(verified, legacy);
+
+        // Explicit `null` certificates are equally legacy.
+        let null_json = legacy_json
+            .replace(
+                "  \"schema\": \"anneal.spec-lock.v1\",\n",
+                "  \"schema\": \"anneal.spec-lock.v1\",\n  \"spec_digest\": null,\n",
+            )
+            .replace(
+                "\"associated_subject_def_id\": null,\n",
+                "\"associated_subject_def_id\": null,\n      \"mir_fragment\": null,\n      \"spec_digest\": null,\n",
+            );
+        assert_ne!(null_json, legacy_json);
+        assert_eq!(parse_spec_lock_manifest(&null_json).expect("parse nulls"), legacy);
+        fs::write(&lock_path, &null_json).expect("write null-certificate lock");
+        verify_spec_lock(&ws, &records).expect("null certificates must verify as legacy");
+
+        // Legacy `--allow-impl-edit` locks keep their mutable-subject semantics.
+        let mutable_json = legacy_json.replace(
+            "  \"locked_records\": [\n",
+            "  \"mutable_subjects\": [\n    \"demo::add\"\n  ],\n  \"locked_records\": [\n",
+        );
+        fs::write(&lock_path, &mutable_json).expect("write legacy mutable lock");
+        let mut edited = records.clone();
+        edited[0].target.mir_module_sha256 = write_generated_mir(
+            &ws,
+            "Demo/add.lean",
+            &mir_module_text("Mir.Demo.add", CALL_BLOCKS),
+        );
+        verify_spec_lock(&ws, &edited).expect("legacy mutable subject edit must verify");
+        let mut edited_companion = records.clone();
+        edited_companion[1].target.mir_module_sha256 = "e".repeat(64);
+        let err = verify_spec_lock(&ws, &edited_companion)
+            .expect_err("legacy companion edit must stay locked");
+        assert!(err.contains("__anodized_fn_requires_add"), "{err}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn spec_lock_certifies_mir_fragments_and_rejects_certificate_tampering() {
+        let (ws, records) = certified_workspace("fragment-certs");
+        let spec_file = ws.join("anneal/proofs/Specs/Demo/add.lean");
+        fs::create_dir_all(spec_file.parent().expect("Specs parent")).expect("create Specs/Demo");
+        fs::write(&spec_file, ADD_SPEC_TEXT).expect("write spec");
+
+        let lock_path = lock_workspace_specs(&ws, &records).expect("lock_workspace_specs");
+        let raw = fs::read_to_string(&lock_path).expect("read lock");
+        let manifest = parse_spec_lock_manifest(&raw).expect("parse certified lock");
+        let idx = |m: &SpecLockManifest, def_id: &str| {
+            m.locked_records
+                .iter()
+                .position(|r| r.def_id == def_id)
+                .expect("locked record")
+        };
+        let (add_idx, req_idx) = (idx(&manifest, "demo::add"), idx(&manifest, "demo::__anodized_fn_requires_add"));
+        let add = &manifest.locked_records[add_idx];
+        let req = &manifest.locked_records[req_idx];
+        assert_eq!(add.mir_fragment.as_deref(), Some("pure_loop_free"));
+        assert_eq!(
+            add.spec_digest.as_deref(),
+            Some(
+                compute_fragment_spec_digest(
+                    "demo::add",
+                    &records[0].target.mir_module_sha256,
+                    Some(ADD_SPEC_TEXT),
+                    MirFragment::PureLoopFree,
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(req.mir_fragment.as_deref(), Some("full_mir"));
+        assert_eq!(
+            req.spec_digest.as_deref(),
+            Some(
+                compute_fragment_spec_digest(
+                    "demo::__anodized_fn_requires_add",
+                    &records[1].target.mir_module_sha256,
+                    None,
+                    MirFragment::FullMir,
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            manifest.spec_digest.as_deref(),
+            Some(compute_spec_lock_manifest_digest(&manifest).as_str())
+        );
+        assert!(manifest.spec_digest.as_deref().is_some_and(is_lowercase_sha256_hex));
+        // The manifest digest commits to locked content, not to entry order.
+        let mut reordered = manifest.clone();
+        reordered.locked_records.reverse();
+        assert_eq!(
+            compute_spec_lock_manifest_digest(&reordered),
+            compute_spec_lock_manifest_digest(&manifest)
+        );
+        // ...but it excludes only itself: the recorded digest never feeds back.
+        let mut unsigned = manifest.clone();
+        unsigned.spec_digest = None;
+        assert_eq!(
+            compute_spec_lock_manifest_digest(&unsigned),
+            compute_spec_lock_manifest_digest(&manifest)
+        );
+        assert!(raw.contains("\"mir_fragment\": \"pure_loop_free\""), "{raw}");
+        assert_eq!(serialize_spec_lock_manifest(&manifest), raw, "deterministic round trip");
+        let verified = verify_spec_lock(&ws, &records).expect("certified lock must verify");
+        assert_eq!(verified, manifest);
+        // Locking twice is deterministic.
+        lock_workspace_specs(&ws, &records).expect("re-lock");
+        assert_eq!(fs::read_to_string(&lock_path).expect("re-read lock"), raw);
+
+        let expect_violation = |json: &str, needle: &str| {
+            fs::write(&lock_path, json).expect("write tampered lock");
+            let err = verify_spec_lock(&ws, &records)
+                .expect_err(&format!("tampered lock must be rejected with `{needle}`"));
+            assert!(err.contains(needle), "expected `{needle}` in: {err}");
+            fs::write(&lock_path, &raw).expect("restore lock");
+        };
+        let resigned = |mut m: SpecLockManifest| {
+            m.spec_digest = Some(compute_spec_lock_manifest_digest(&m));
+            m.to_json_string()
+        };
+
+        // 1. Naive edits of any locked field invalidate the manifest digest.
+        expect_violation(
+            &raw.replacen(
+                "\"mir_fragment\": \"pure_loop_free\"",
+                "\"mir_fragment\": \"full_mir\"",
+                1,
+            ),
+            "manifest spec_digest mismatch",
+        );
+        let mut m = manifest.clone();
+        m.mutable_subjects = vec!["demo::add".to_string()];
+        expect_violation(&m.to_json_string(), "manifest spec_digest mismatch");
+        let mut m = manifest.clone();
+        m.locked_specs_files[0].sha256 = "0".repeat(64);
+        expect_violation(&m.to_json_string(), "manifest spec_digest mismatch");
+        let mut m = manifest.clone();
+        m.locked_assumptions_files.push(LockedFileDigest {
+            rel_path: "anneal/proofs/Assumptions/Demo/add.lean".to_string(),
+            sha256: "1".repeat(64),
+        });
+        expect_violation(&m.to_json_string(), "manifest spec_digest mismatch");
+        let mut m = manifest.clone();
+        m.locked_records[add_idx].associated_subject_def_id = Some("demo::other".to_string());
+        expect_violation(&m.to_json_string(), "manifest spec_digest mismatch");
+        let mut m = manifest.clone();
+        m.locked_records[req_idx].spec_digest = Some("b".repeat(64));
+        expect_violation(&m.to_json_string(), "manifest spec_digest mismatch");
+
+        // 2. Re-signed forgeries are still caught by re-deriving certificates.
+        let mut m = manifest.clone();
+        m.locked_records[add_idx].mir_fragment = Some("tree_borrows_local".to_string());
+        expect_violation(
+            &resigned(m),
+            "mir_fragment for 'demo::add' changed from 'tree_borrows_local' to 'pure_loop_free'",
+        );
+        let mut m = manifest.clone();
+        m.locked_records[add_idx].spec_digest = Some("a".repeat(64));
+        expect_violation(&resigned(m), "spec_digest for 'demo::add' changed");
+
+        // 3. Partial certificate stripping (downgrade attempts) is rejected.
+        let mut m = manifest.clone();
+        m.spec_digest = None;
+        expect_violation(&m.to_json_string(), "manifest-level spec_digest is missing");
+        let mut m = manifest.clone();
+        m.locked_records[req_idx].spec_digest = None;
+        expect_violation(&resigned(m), "lacks its mir_fragment/spec_digest certificate");
+        let mut m = manifest.clone();
+        m.locked_records[req_idx].mir_fragment = None;
+        expect_violation(&resigned(m), "lacks its mir_fragment/spec_digest certificate");
+        let mut m = manifest.clone();
+        let dup = m.locked_records[add_idx].clone();
+        m.locked_records.push(dup);
+        expect_violation(&resigned(m), "duplicate locked record 'demo::add'");
+
+        // 4. A full downgrade to the legacy shape is indistinguishable from a
+        //    legacy lock in-workspace (backward compatibility), but an
+        //    out-of-workspace `--lock-file` copy rejects it byte-for-byte.
+        let mut legacy = manifest.clone();
+        legacy.spec_digest = None;
+        for rec in &mut legacy.locked_records {
+            rec.mir_fragment = None;
+            rec.spec_digest = None;
+        }
+        fs::write(&lock_path, legacy.to_json_string()).expect("write downgraded lock");
+        verify_spec_lock(&ws, &records).expect("fully downgraded lock verifies as legacy");
+        let ext_lock = ws.join("external/spec-lock.json");
+        fs::write(&lock_path, &raw).expect("restore lock");
+        lock_workspace_specs_with_options(&ws, &records, &[], Some(&ext_lock))
+            .expect("lock with external copy");
+        assert_eq!(fs::read_to_string(&ext_lock).expect("read external lock"), raw);
+        fs::write(&lock_path, legacy.to_json_string()).expect("write downgraded lock");
+        let ext_err = verify_spec_lock_with_options(&ws, &records, Some(&ext_lock), None)
+            .expect_err("external lock must reject a downgraded on-disk lock");
+        assert!(ext_err.contains("differs from external lock file"), "{ext_err}");
+        fs::write(&lock_path, &raw).expect("restore lock");
+        verify_spec_lock_with_options(&ws, &records, Some(&ext_lock), None)
+            .expect("restored lock verifies against the external copy");
+
+        // 5. Workspace edits: non-mutable MIR digests and `Specs/**` keep their
+        //    precise (pre-existing) diagnostics, and a missing SHA-matching
+        //    MIR module re-derives the fail-closed `full_mir` with a hint.
+        let mut edited = records.clone();
+        edited[0].target.mir_module_sha256 = "c".repeat(64);
+        let err = verify_spec_lock(&ws, &edited).expect_err("non-mutable MIR edit");
+        assert!(err.contains("MIR digest for 'demo::add' changed"), "{err}");
+        fs::write(&spec_file, format!("{ADD_SPEC_TEXT}-- tampered\n")).expect("tamper spec");
+        let err = verify_spec_lock(&ws, &records).expect_err("tampered Specs file");
+        assert!(
+            err.contains("locked Specs file 'anneal/proofs/Specs/Demo/add.lean' was modified"),
+            "{err}"
+        );
+        fs::write(&spec_file, ADD_SPEC_TEXT).expect("restore spec");
+        let add_mir = ws.join(".anneal/generated/Mir/Demo/add.lean");
+        let add_text = fs::read_to_string(&add_mir).expect("read add MIR");
+        fs::remove_file(&add_mir).expect("remove add MIR");
+        let err = verify_spec_lock(&ws, &records).expect_err("missing SHA-matching MIR");
+        assert!(
+            err.contains("mir_fragment for 'demo::add' changed from 'pure_loop_free' to 'full_mir'")
+                && err.contains("no captured MIR module matching mir_module_sha256"),
+            "{err}"
+        );
+        fs::write(&add_mir, &add_text).expect("restore add MIR");
+        verify_spec_lock(&ws, &records).expect("restored workspace verifies");
+
+        // 6. Strict parsing of certificate values and duplicate keys.
+        let sha = &records[0].target.mir_module_sha256;
+        for (from, to, needle) in [
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \"pureLoopFree\"", "canonical MirFragment tag"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \"MirFragment.pureLoopFree\"", "canonical MirFragment tag"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \" pure_loop_free\"", "canonical MirFragment tag"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \"PURE_LOOP_FREE\"", "canonical MirFragment tag"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \"bogus\"", "canonical MirFragment tag"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": [\"pure_loop_free\"]", "canonical MirFragment tag string or null"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": {}", "canonical MirFragment tag string or null"),
+            ("\"mir_fragment\": \"pure_loop_free\"", "\"mir_fragment\": \"pure_loop_free\",\n      \"mir_fragment\": \"full_mir\"", "duplicate JSON object key 'mir_fragment'"),
+            ("  \"schema\": \"anneal.spec-lock.v1\",\n", "  \"schema\": \"anneal.spec-lock.v1\",\n  \"schema\": \"anneal.spec-lock.v1\",\n", "duplicate JSON object key 'schema'"),
+        ] {
+            let tampered = raw.replacen(from, to, 1);
+            assert_ne!(tampered, raw, "{to}");
+            let err = parse_spec_lock_manifest(&tampered).expect_err(to);
+            assert!(err.contains(needle), "expected `{needle}` for `{to}`: {err}");
+        }
+        let manifest_digest = manifest.spec_digest.clone().expect("manifest digest");
+        for bad in [
+            manifest_digest.to_uppercase(),
+            manifest_digest[..63].to_string(),
+            format!("{}g", &manifest_digest[..63]),
+            format!("{manifest_digest}0"),
+            sha.clone() + " ",
+        ] {
+            let tampered = raw.replacen(&manifest_digest, &bad, 1);
+            assert_ne!(tampered, raw);
+            let err = parse_spec_lock_manifest(&tampered).expect_err(&bad);
+            assert!(err.contains("64 lowercase hex characters"), "{bad}: {err}");
+        }
+        let tampered = raw.replacen(
+            &format!("\"spec_digest\": \"{manifest_digest}\""),
+            "\"spec_digest\": []",
+            1,
+        );
+        let err = parse_spec_lock_manifest(&tampered).expect_err("array manifest digest");
+        assert!(err.contains("64-char lowercase hex string or null"), "{err}");
+        assert!(is_canonical_mir_fragment_tag("full_mir") && !is_canonical_mir_fragment_tag("fullMir"));
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn spec_lock_fragment_certificates_respect_allow_impl_edit_mutable_subjects() {
+        let (ws, records) = certified_workspace("fragment-mutable");
+        let lock_path =
+            lock_workspace_specs_with_mutable(&ws, &records, &["demo::add".to_string()])
+                .expect("lock with --allow-impl-edit demo::add");
+        let raw = fs::read_to_string(&lock_path).expect("read lock");
+        let manifest = parse_spec_lock_manifest(&raw).expect("parse lock");
+        assert_eq!(manifest.mutable_subjects, vec!["demo::add".to_string()]);
+        assert_eq!(
+            manifest.spec_digest.as_deref(),
+            Some(compute_spec_lock_manifest_digest(&manifest).as_str())
+        );
+
+        // 1. Editing the designated subject's body escalates its *current*
+        //    fragment (`pure_loop_free` -> `full_mir`) and changes its MIR
+        //    digest and record certificate; all three are exempt, and the lock
+        //    file (hence the manifest digest) is untouched by the edit.
+        let mut edited = records.clone();
+        edited[0].target.mir_module_sha256 = write_generated_mir(
+            &ws,
+            "Demo/add.lean",
+            &mir_module_text("Mir.Demo.add", CALL_BLOCKS),
+        );
+        let verified = verify_spec_lock(&ws, &edited).expect("designated mutable edit must verify");
+        assert_eq!(fs::read_to_string(&lock_path).expect("re-read lock"), raw);
+        let locked_add = verified
+            .locked_records
+            .iter()
+            .find(|r| r.def_id == "demo::add")
+            .expect("locked add");
+        assert_eq!(locked_add.mir_fragment.as_deref(), Some("pure_loop_free"));
+        let (current, missing) =
+            build_sorted_certified_records(&ws, &edited).expect("current certificates");
+        assert!(missing.is_empty(), "{missing:?}");
+        let current_add = current.iter().find(|r| r.def_id == "demo::add").expect("current add");
+        assert_eq!(current_add.mir_fragment.as_deref(), Some("full_mir"));
+        assert_ne!(current_add.spec_digest, locked_add.spec_digest);
+
+        // 2. The subject's `#[spec]` companion stays locked (MIR digest first).
+        let mut edited_companion = edited.clone();
+        edited_companion[1].target.mir_module_sha256 = write_generated_mir(
+            &ws,
+            "Demo/__anodized_fn_requires_add.lean",
+            &mir_module_text("Mir.Demo.__anodized_fn_requires_add", RET_BLOCKS),
+        );
+        let err = verify_spec_lock(&ws, &edited_companion).expect_err("companion edit");
+        assert!(
+            err.contains("MIR digest for 'demo::__anodized_fn_requires_add' changed"),
+            "{err}"
+        );
+
+        // 3. Forging `mutable_subjects` is detected by the manifest digest, and
+        //    even a re-signed forgery cannot make a companion mutable (only
+        //    `subject` records are ever exempt).
+        let mut forged = manifest.clone();
+        forged
+            .mutable_subjects
+            .push("demo::__anodized_fn_requires_add".to_string());
+        fs::write(&lock_path, forged.to_json_string()).expect("write forged lock");
+        let err = verify_spec_lock(&ws, &edited_companion).expect_err("forged mutable_subjects");
+        assert!(err.contains("manifest spec_digest mismatch"), "{err}");
+        forged.spec_digest = Some(compute_spec_lock_manifest_digest(&forged));
+        fs::write(&lock_path, forged.to_json_string()).expect("write re-signed forged lock");
+        let err = verify_spec_lock(&ws, &edited_companion).expect_err("re-signed forgery");
+        assert!(
+            err.contains("MIR digest for 'demo::__anodized_fn_requires_add' changed"),
+            "{err}"
+        );
+
+        // 4. A forged certificate on the *mutable* subject is not re-derived
+        //    (exempt), but it is still covered by the manifest digest.
+        let mut forged = manifest.clone();
+        forged.locked_records.iter_mut().for_each(|r| {
+            if r.def_id == "demo::add" {
+                r.mir_fragment = Some("intrinsic_copy".to_string());
+            }
+        });
+        fs::write(&lock_path, forged.to_json_string()).expect("write forged certificate");
+        let err = verify_spec_lock(&ws, &edited).expect_err("forged mutable certificate");
+        assert!(err.contains("manifest spec_digest mismatch"), "{err}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn render_agent_context_surfaces_mir_fragment_and_boundary_diagnostic() {
+        let ws = unique_temp_dir("fragment-context");
+        let mk = |name: &str, blocks: Option<&str>| {
+            let module = format!("Mir.Demo.{name}");
+            let sha = match blocks {
+                Some(b) => write_generated_mir(
+                    &ws,
+                    &format!("Demo/{name}.lean"),
+                    &mir_module_text(&module, b),
+                ),
+                None => "0".repeat(64),
+            };
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: format!("demo::{name}"),
+                    mir_module_path: format!("Mir/Demo/{name}.lean"),
+                    mir_module_sha256: sha,
+                },
+                lean_module_name: module,
+                item_kind: CapturedItemKind::Subject,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            }
+        };
+        let records = vec![
+            mk("pure_fn", Some(RET_BLOCKS)),
+            mk("loop_fn", Some(LOOP_BLOCKS)),
+            mk("deref_fn", Some(DEREF_BLOCKS)),
+            mk("call_fn", Some(CALL_BLOCKS)),
+            mk("ghost_fn", None),
+        ];
+        fn item_section<'a>(ctx: &'a str, def_id: &str) -> &'a str {
+            let header = format!("## Item `{def_id}`");
+            let start = ctx.find(&header).unwrap_or_else(|| panic!("missing {header}"));
+            let rest = &ctx[start..];
+            let end = rest[header.len()..]
+                .find("\n## Item `")
+                .map_or(rest.len(), |e| e + header.len());
+            &rest[..end]
+        }
+
+        let ctx = render_agent_context(&ws, &records, None).expect("render context");
+        for (def_id, label, diagnostic) in [
+            ("demo::pure_fn", "`pure_loop_free` (`MirFragment.pureLoopFree`, rank 0)", None),
+            ("demo::loop_fn", "`pure_bounded_loop` (`MirFragment.pureBoundedLoop`, rank 1)", None),
+            (
+                "demo::deref_fn",
+                "`tree_borrows_local` (`MirFragment.treeBorrowsLocal`, rank 2)",
+                Some("ProjectionElem.deref"),
+            ),
+            (
+                "demo::call_fn",
+                "`full_mir` (`MirFragment.fullMir`, rank 4)",
+                Some("TerminatorKind.call"),
+            ),
+            (
+                "demo::ghost_fn",
+                "`full_mir` (`MirFragment.fullMir`, rank 4)",
+                Some("classified fail-closed"),
+            ),
+        ] {
+            let section = item_section(&ctx, def_id);
+            assert!(
+                section.contains(&format!("- **MIR Fragment**: {label}\n")),
+                "{def_id}: {section}"
+            );
+            assert!(!section.contains("Locked MIR Fragment"), "{def_id}: unlocked workspace");
+            match diagnostic {
+                Some(needle) => {
+                    assert!(section.contains("### MIR Fragment Boundary Diagnostic"), "{def_id}");
+                    assert!(
+                        section.contains(&format!("MIR fragment boundary crossed for `{def_id}`")),
+                        "{def_id}: {section}"
+                    );
+                    assert!(section.contains(needle), "{def_id}: {section}");
+                }
+                None => assert!(
+                    !section.contains("MIR fragment boundary crossed"),
+                    "{def_id}: {section}"
+                ),
+            }
+        }
+
+        // Locked workspaces surface the certified fragment next to the live one.
+        lock_workspace_specs(&ws, &records).expect("lock specs");
+        let ctx = render_agent_context(&ws, &records, Some("demo::deref_fn")).expect("locked ctx");
+        assert!(ctx.contains(
+            "- **Locked MIR Fragment (`.anneal/spec-lock.json`)**: `tree_borrows_local` (`MirFragment.treeBorrowsLocal`, rank 2)\n"
+        ));
+        // A designated mutable subject whose edit escalated its fragment.
+        write_generated_mir(
+            &ws,
+            "Demo/deref_fn.lean",
+            &mir_module_text("Mir.Demo.deref_fn", CALL_BLOCKS),
+        );
+        let mut edited = records.clone();
+        edited[2].target.mir_module_sha256 = sha256_hex(
+            mir_module_text("Mir.Demo.deref_fn", CALL_BLOCKS).as_bytes(),
+        );
+        let ctx = render_agent_context(&ws, &edited, Some("demo::deref_fn")).expect("edited ctx");
+        assert!(ctx.contains("- **MIR Fragment**: `full_mir` (`MirFragment.fullMir`, rank 4)\n"));
+        assert!(ctx.contains("differs from the current capture's `full_mir`"), "{ctx}");
+        // Legacy certificate-free locks say so explicitly.
+        let legacy = SpecLockManifest {
+            schema: SPEC_LOCK_SCHEMA_V1.to_string(),
+            locked_records: build_sorted_locked_records(&records),
+            locked_specs_files: Vec::new(),
+            locked_assumptions_files: Vec::new(),
+            mutable_subjects: Vec::new(),
+            spec_digest: None,
+        };
+        fs::write(ws.join(SPEC_LOCK_REL_PATH), legacy.to_json_string()).expect("write legacy lock");
+        let ctx = render_agent_context(&ws, &records, Some("demo::pure_fn")).expect("legacy ctx");
+        assert!(
+            ctx.contains("not recorded (legacy certificate-free `anneal.spec-lock.v1` lock)"),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("re-run `cargo anneal lock-specs`"), "{ctx}");
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

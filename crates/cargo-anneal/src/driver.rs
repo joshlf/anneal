@@ -1747,6 +1747,77 @@ mod tests {
             );
         }
 
+        // 6. Real-MIR Lean <-> Rust `MirFragment` parity: for every captured
+        // `Mir/**/*.lean` body (`CrateA`, `CrateB`, and sysroot `Core` callees),
+        // the emitter output stays inside the scanner's closed `MirAst`
+        // vocabulary, and the interpreter-evaluated
+        // `Anneal.PureMirExec.inferMinFragment` / `hasCfgBackedge` agree exactly
+        // with `classify_mir_fragment` (Lean is the arbiter; one `#guard` per
+        // fact, so every mismatch is reported).
+        let mut parity_imports = String::from("import Anneal.PureMirExec\n");
+        let mut parity_guards = String::new();
+        let mut parity_bodies = 0usize;
+        let mut parity_histogram: BTreeMap<crate::scaffold::MirFragment, usize> = BTreeMap::new();
+        for mir_file in &scaffold_report.generated_mir_files {
+            let src = fs::read_to_string(mir_file).expect("read generated Mir module");
+            let Some((frag, has_back_edge, has_unscannable)) =
+                crate::scaffold::mir_fragment_parity_facts(&src)
+            else {
+                continue;
+            };
+            assert!(
+                !has_unscannable,
+                "rustc-capture emitter output must stay inside the closed MirAst scanner vocabulary: {}",
+                mir_file.display()
+            );
+            let module = mir_file
+                .strip_prefix(&gen_dir)
+                .expect("generated Mir module under .anneal/generated")
+                .with_extension("")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(".");
+            parity_imports.push_str(&format!("import {module}\n"));
+            parity_guards.push_str(&format!(
+                "#guard Anneal.PureMirExec.inferMinFragment {module}.body == Anneal.PureMirExec.{}\n\
+                 #guard Anneal.PureMirExec.hasCfgBackedge {module}.body == {has_back_edge}\n",
+                frag.lean_ctor()
+            ));
+            parity_bodies += 1;
+            *parity_histogram.entry(frag).or_default() += 1;
+        }
+        assert!(
+            parity_bodies >= 3,
+            "expected captured CrateA / CrateB / Core MIR bodies for the fragment parity check"
+        );
+        let parity_path = gen_dir.join("MirFragmentParityCheck.lean");
+        fs::write(&parity_path, format!("{parity_imports}\n{parity_guards}"))
+            .expect("write MirFragmentParityCheck.lean");
+        let out = Command::new(&lean_bin)
+            .current_dir(&gen_dir)
+            .env("LEAN_PATH", &lean_path_env)
+            .arg("-R")
+            .arg(&gen_dir)
+            .arg(&parity_path)
+            .output()
+            .expect("run lean on MirFragmentParityCheck.lean");
+        assert!(
+            out.status.success(),
+            "Lean <-> Rust MirFragment parity failed on real captured MIR ({parity_bodies} bodies):\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!(
+            "MirFragment real-MIR parity: {parity_bodies} captured bodies agree with \
+             Anneal.PureMirExec.inferMinFragment / hasCfgBackedge ({})",
+            parity_histogram
+                .iter()
+                .map(|(frag, count)| format!("{frag}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
