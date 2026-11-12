@@ -12,7 +12,9 @@ cargo-anneal = { path = "../cargo-anneal" }
 syn = { version = "2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
 quote = "1.0.47"
 prettyplease = "0.2.37"
-proc-macro2 = "1.0.107"
+# `span-locations` gives parsed items line numbers, which `miri_eval` uses to
+# locate the evaluated function in a staged `src/lib.rs`.
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 
 [[bin]]
 name = "miri-difftest"

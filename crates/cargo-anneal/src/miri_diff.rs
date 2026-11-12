@@ -26,7 +26,9 @@
 //!
 //! 1. Every test without `known_anneal_bug` must agree 100% with Miri:
 //!    - `pass`: proved via `verifyTotalMirUnitPointBounded` or
-//!      `verifyTotalMirScalarPointBounded` (`TotalVerificationResult`).
+//!      `verifyTotalMirScalarPointBounded` (`TotalVerificationResult`), or via
+//!      `verifyTotalMirBounded` when the test links intra-crate callees (see
+//!      below).
 //!    - `panic`: proved via `verifySafePanicMirPointBounded`
 //!      (`StatefulVerificationResult` with `post := False` and `¬ TotalClaim.holds`).
 //!    - `ub`: refuted via `refuteMirPointByStrictUB`
@@ -40,6 +42,17 @@
 //!    Anneal agrees with Miri (in both tag and UB fault location), the
 //!    `known_anneal_bug_ratchet` theorem fails to type-check until the entry
 //!    is removed from `manifest.toml`.
+//!
+//! ## Linked Intra-Crate Callees
+//!
+//! A test whose MIR calls other functions captured from the corpus crate (such
+//! as `pass_direct_fn_call` calling `helper_add_ten`) is evaluated with those
+//! captured bodies linked as callees. Its certificate, refutation, or
+//! `known_anneal_bug_ratchet`, and its UB-location probe, all start from
+//! `initMachineStateWithMemoryAndCallees` with the item's scaffolded
+//! `defaultCallees` table, and the certificate claims carry the same table in
+//! `callees`. Only bodies captured from the corpus crate are ever linked; a call
+//! to any other function remains an uninterpreted external call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -54,7 +67,7 @@ use crate::driver::{
 };
 use crate::miri_oracle::{
     ComparisonVerdict, MiriOutcome, OracleItemSpec, SourcePos, SourceSpan, compare_miri_and_anneal,
-    parse_anneal_probe_output, render_anneal_probe_module,
+    parse_anneal_probe_output,
 };
 use crate::obligations::{derive_item_module_suffix, module_suffix_to_rel_path};
 use crate::scaffold::{ScaffoldConfig, scaffold_workspace_with_config};
@@ -716,25 +729,256 @@ fn parse_toml_string_array(raw: &str, line_no: usize) -> Result<Vec<String>, Str
     Ok(items)
 }
 
-/// Render the `.anneal/generated/Verify/<Crate>/<test.name>.lean` module for a
-/// single differential test entry.
+/// Lean definitions of `activeSpan` and `probeMirDiffExecBounded`, which
+/// evaluate a body like `evalMirDiffTagBounded` and additionally report the
+/// span of the statement or terminator at which execution panicked, aborted,
+/// faulted, or stopped at an external call (`"none"` on normal return).
 ///
-/// Returns `(module_source, is_trusted_certificate_module)` where
-/// `is_trusted_certificate_module` is `true` for non-bug `pass` and `panic`
-/// entries whose `theorem verified` has head type `TotalVerificationResult` or
-/// `StatefulVerificationResult`.
+/// Every rendered use must `open Trusted.Sequence` (for `get?`),
+/// `Trusted.Rustc.V2026_06_01.MirSemantics`, and
+/// `Anneal.Rustc.V2026_06_01.SymbolicEval` first.
+const MIR_DIFF_PROBE_LEAN_DEFS: &str = "\
+def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
+  let raw :=\n    \
+    match st with\n    \
+    | .running s =>\n      \
+      let cur := s.memory.activeCallee.getD body\n      \
+      match get? cur.basicBlocks s.frame.blockIdx with\n      \
+      | some bb =>\n        \
+        match get? bb.statements s.frame.stmtIdx with\n        \
+        | some stmt => stmt.span\n        \
+        | none => bb.terminator.span\n      \
+      | none => \"none\"\n    \
+    | _ => \"none\"\n  \
+  if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
+def probeMirDiffExecBounded\n    \
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
+    MirDiffTag × String :=\n  \
+  match fuel with\n  \
+  | 0 => (.outOfFuel, activeSpan body st)\n  \
+  | fuel' + 1 =>\n    \
+    match stepMirState body st with\n    \
+    | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
+    | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
+    | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
+    | .ret .panic => (.panic, activeSpan body st)\n    \
+    | .ret .abort => (.abort, activeSpan body st)\n    \
+    | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
+    | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
+    | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
+    | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
+    | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
+    | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n";
+
+/// Lean expression for the intra-crate callee table linked into a manifest
+/// test's initial machine state.
+///
+/// An empty table renders the callee-free `initMachineStateWithMemory` form,
+/// which `initMachineStateWithMemoryAndCallees` reduces to definitionally, so
+/// tests without intra-crate calls keep their original statements.
+struct LinkedCallees {
+    /// Lean list literal `[Mir.<suffix>.body, ...]`, or `None` for an empty
+    /// table.
+    list_expr: Option<String>,
+    /// Module suffixes (`<Crate>.<item>`) to import, in table order.
+    suffixes: Vec<String>,
+}
+
+impl LinkedCallees {
+    /// Validate `helper_module_suffixes` and build the callee table.
+    ///
+    /// Each suffix must name a captured `Mir.<suffix>` module, so it may contain
+    /// only dot-separated identifier segments; anything else could inject Lean
+    /// syntax into the generated certificate. Duplicates are rejected because a
+    /// duplicated suffix indicates a caller bug rather than a meaningful table.
+    fn new(helper_module_suffixes: &[String]) -> Result<Self, String> {
+        let mut seen = BTreeSet::new();
+        for suffix in helper_module_suffixes {
+            if !is_lean_module_suffix(suffix) {
+                return Err(format!(
+                    "invalid linked callee module suffix '{suffix}': expected \
+                     dot-separated Lean identifier segments"
+                ));
+            }
+            if !seen.insert(suffix.as_str()) {
+                return Err(format!("duplicate linked callee module suffix '{suffix}'"));
+            }
+        }
+        let list_expr = (!helper_module_suffixes.is_empty()).then(|| {
+            let elems: Vec<String> = helper_module_suffixes
+                .iter()
+                .map(|s| format!("Mir.{s}.body"))
+                .collect();
+            format!("[{}]", elems.join(", "))
+        });
+        Ok(Self {
+            list_expr,
+            suffixes: helper_module_suffixes.to_vec(),
+        })
+    }
+
+    /// Lean expression for the initial `MachineState` of `Mir.{item}.body` on
+    /// zero arguments and `emptyMemory` with this callee table linked.
+    fn init_state_expr(&self, item: &str) -> String {
+        match &self.list_expr {
+            None => format!("initMachineStateWithMemory Mir.{item}.body [] emptyMemory"),
+            Some(list) => format!(
+                "initMachineStateWithMemoryAndCallees Mir.{item}.body [] emptyMemory {list}"
+            ),
+        }
+    }
+}
+
+/// Return `true` when `suffix` is a sequence of at least two dot-separated
+/// ASCII identifier segments (`<Crate>.<item>`), as produced for captured
+/// `Mir.<Crate>.<item>` module names.
+fn is_lean_module_suffix(suffix: &str) -> bool {
+    let mut segs = suffix.split('.');
+    let mut count = 0usize;
+    while let Some(seg) = segs.next() {
+        if seg.is_empty()
+            || seg.starts_with(|c: char| c.is_ascii_digit())
+            || !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 2
+}
+
+/// Header line of the `defaultCallees` definition in a scaffolded
+/// `Obligations/<Item>.lean` module.
+const DEFAULT_CALLEES_HEADER: &str = "def defaultCallees : List CapturedMir :=";
+
+/// Read the `defaultCallees` table that scaffolding wrote for the item with
+/// module suffix `item_suffix` into
+/// `<dot_anneal>/generated/Obligations/<Item>.lean`, returning the module
+/// suffixes of the linked bodies in table order.
+///
+/// Scaffolding computes this table as the cycle-safe transitive closure of the
+/// captured MIR bodies reachable from the item's `.fnDef` references, so it
+/// names only bodies captured from the corpus crate (including the item itself
+/// when it is recursive) and never an uncaptured or synthetic body. Reusing it
+/// keeps every differential theorem for a test linked to exactly the callees
+/// that `cargo anneal verify` would link for the same item.
+fn read_scaffolded_default_callees(
+    dot_anneal: &Path,
+    item_suffix: &str,
+) -> Result<Vec<String>, String> {
+    let obligation_path = dot_anneal
+        .join("generated")
+        .join("Obligations")
+        .join(module_suffix_to_rel_path(item_suffix));
+    let text = fs::read_to_string(&obligation_path).map_err(|err| {
+        format!(
+            "failed to read scaffolded obligations {}: {}",
+            obligation_path.display(),
+            err
+        )
+    })?;
+    parse_default_callees_table(&text)
+        .map_err(|err| format!("{}: {err}", obligation_path.display()))
+}
+
+/// Parse the `defaultCallees` table from scaffolded obligations source.
+///
+/// Scaffolding renders the table on the line after [`DEFAULT_CALLEES_HEADER`]
+/// as either `.nil` or `[Mir.<suffix>.body, ...]`. Any other shape is an error
+/// rather than an empty table, so a change to that rendering cannot silently
+/// drop linked callees.
+fn parse_default_callees_table(obligation_src: &str) -> Result<Vec<String>, String> {
+    let mut lines = obligation_src.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != DEFAULT_CALLEES_HEADER {
+            continue;
+        }
+        let value = lines
+            .next()
+            .map(str::trim)
+            .ok_or_else(|| format!("`{DEFAULT_CALLEES_HEADER}` has no value line"))?;
+        if value == ".nil" {
+            return Ok(Vec::new());
+        }
+        let inner = value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| format!("unexpected `defaultCallees` value `{value}`"))?;
+        return inner
+            .split(',')
+            .map(|elem| {
+                let elem = elem.trim();
+                elem.strip_prefix("Mir.")
+                    .and_then(|rest| rest.strip_suffix(".body"))
+                    .filter(|suffix| is_lean_module_suffix(suffix))
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("unexpected `defaultCallees` entry `{elem}`"))
+            })
+            .collect();
+    }
+    Err(format!("missing `{DEFAULT_CALLEES_HEADER}`"))
+}
+
+/// Render the `.anneal/generated/Verify/<Crate>/<test.name>.lean` module for a
+/// single differential test entry whose MIR calls no captured intra-crate
+/// function.
+///
+/// Equivalent to [`render_miri_diff_verify_module_with_callees`] with an empty
+/// callee table.
 pub fn render_miri_diff_verify_module(
     crate_camel: &str,
     def_id: &str,
     entry: &MiriDiffTestEntry,
 ) -> Result<(String, bool), String> {
+    render_miri_diff_verify_module_with_callees(crate_camel, def_id, entry, &[])
+}
+
+/// Render the `.anneal/generated/Verify/<Crate>/<test.name>.lean` module for a
+/// single differential test entry, linking the captured intra-crate bodies
+/// `Mir.<suffix>.body` for every `suffix` in `helper_module_suffixes` as
+/// callees of the entry's initial machine state.
+///
+/// `helper_module_suffixes` must list only captured `Mir.*` modules (for
+/// example `MiriDiffCorpus.helper_add_ten`); `stage_miri_diff_workspace` passes
+/// the entry's scaffolded `defaultCallees` table. With an empty table the module
+/// is identical to the callee-free rendering. With a non-empty table:
+///
+/// - `pass` entries prove `TotalVerificationResult` with
+///   `callees := [Mir.<suffix>.body, ...]` via `verifyTotalMirBounded`;
+/// - `panic` entries prove `StatefulVerificationResult` (`post := False`) and
+///   refute `TotalClaim.holds` with the same callees;
+/// - `ub` entries refute both `StatefulClaim.holds` and `TotalClaim.holds`
+///   with the same callees; and
+/// - `known_anneal_bug` ratchets evaluate the entry with the callees linked, so
+///   a ratchet recorded before linking fails once linking fixes the bug.
+///
+/// Returns `(module_source, is_trusted_certificate_module)` where
+/// `is_trusted_certificate_module` is `true` for non-bug `pass` and `panic`
+/// entries whose `theorem verified` has head type `TotalVerificationResult` or
+/// `StatefulVerificationResult`. Returns an error for an invalid or duplicated
+/// callee suffix, or for a non-bug entry whose Miri verdict has no certificate
+/// shape.
+pub fn render_miri_diff_verify_module_with_callees(
+    crate_camel: &str,
+    def_id: &str,
+    entry: &MiriDiffTestEntry,
+    helper_module_suffixes: &[String],
+) -> Result<(String, bool), String> {
     let item = format!("{crate_camel}.{}", entry.name);
     let fuel = entry.fuel;
+    let callees = LinkedCallees::new(helper_module_suffixes)?;
+    let init_state = callees.init_state_expr(&item);
     let mut out = String::new();
+    out.push_str(&format!("-- @anneal-def-id: {def_id}\nimport Mir.{item}\n"));
+    for suffix in &callees.suffixes {
+        // A self-recursive entry links its own body, which `import Mir.{item}`
+        // above already provides.
+        if *suffix != item {
+            out.push_str(&format!("import Mir.{suffix}\n"));
+        }
+    }
     out.push_str(&format!(
-        "-- @anneal-def-id: {def_id}\n\
-         import Mir.{item}\n\
-         import Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+        "import Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
          namespace Verify.{item}\n\n\
          open Trusted.Rustc.V2026_06_01.MirAst\n\
          open Trusted.Rustc.V2026_06_01.MirSemantics\n\
@@ -762,40 +1006,10 @@ pub fn render_miri_diff_verify_module(
                  -- Observed Anneal tag:    `{}`\n\
                  -- Observed Anneal UB span: `{}`\n\
                  open Trusted.Sequence\n\n\
-                 def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
-                   let raw :=\n    \
-                     match st with\n    \
-                     | .running s =>\n      \
-                       let cur := s.memory.activeCallee.getD body\n      \
-                       match get? cur.basicBlocks s.frame.blockIdx with\n      \
-                       | some bb =>\n        \
-                         match get? bb.statements s.frame.stmtIdx with\n        \
-                         | some stmt => stmt.span\n        \
-                         | none => bb.terminator.span\n      \
-                       | none => \"none\"\n    \
-                     | _ => \"none\"\n  \
-                   if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
-                 def probeMirDiffExecBounded\n    \
-                     (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
-                     MirDiffTag × String :=\n  \
-                   match fuel with\n  \
-                   | 0 => (.outOfFuel, activeSpan body st)\n  \
-                   | fuel' + 1 =>\n    \
-                     match stepMirState body st with\n    \
-                     | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
-                     | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
-                     | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
-                     | .ret .panic => (.panic, activeSpan body st)\n    \
-                     | .ret .abort => (.abort, activeSpan body st)\n    \
-                     | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
-                     | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
-                     | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
-                     | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
-                     | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
-                     | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n\
+                 {MIR_DIFF_PROBE_LEAN_DEFS}\
                  theorem known_anneal_bug_ratchet :\n    \
                      probeMirDiffExecBounded {fuel} Mir.{item}.body\n      \
-                       (.running (initMachineStateWithMemory Mir.{item}.body [] emptyMemory)) =\n      \
+                       (.running ({init_state})) =\n      \
                      ({tag_expr}, \"{escaped_span}\") := by\n  \
                    rfl\n\n\
                  end Verify.{item}\n",
@@ -816,7 +1030,7 @@ pub fn render_miri_diff_verify_module(
              -- Observed Anneal tag:    `{}`\n\
              theorem known_anneal_bug_ratchet :\n    \
                  evalMirDiffTagBounded {fuel} Mir.{item}.body\n      \
-                   (initMachineStateWithMemory Mir.{item}.body [] emptyMemory) =\n      \
+                   ({init_state}) =\n      \
                  {tag_expr} := by\n  \
                rfl\n\n\
              end Verify.{item}\n",
@@ -829,6 +1043,21 @@ pub fn render_miri_diff_verify_module(
         return Ok((out, false));
     }
 
+    let Some(ref callees_expr) = callees.list_expr else {
+        return render_callee_free_certificate(&mut out, &item, fuel, entry)
+            .map(|cert| (out, cert));
+    };
+    render_linked_certificate(&mut out, &item, fuel, entry, callees_expr).map(|cert| (out, cert))
+}
+
+/// Append the certificate or refutation for a non-bug entry that links no
+/// callees, returning whether it is a trusted certificate module.
+fn render_callee_free_certificate(
+    out: &mut String,
+    item: &str,
+    fuel: u32,
+    entry: &MiriDiffTestEntry,
+) -> Result<bool, String> {
     match &entry.miri_verdict {
         MiriDiffVerdictSpec::PassUnit => {
             out.push_str(&format!(
@@ -848,7 +1077,7 @@ pub fn render_miri_diff_verify_module(
                    }}\n\n\
                  end Verify.{item}\n"
             ));
-            Ok((out, true))
+            Ok(true)
         }
         MiriDiffVerdictSpec::PassScalar { bits, size_bytes } => {
             out.push_str(&format!(
@@ -870,7 +1099,7 @@ pub fn render_miri_diff_verify_module(
                    }}\n\n\
                  end Verify.{item}\n"
             ));
-            Ok((out, true))
+            Ok(true)
         }
         MiriDiffVerdictSpec::Panic => {
             out.push_str(&format!(
@@ -904,7 +1133,7 @@ pub fn render_miri_diff_verify_module(
                    And.intro verified total_refuted\n\n\
                  end Verify.{item}\n"
             ));
-            Ok((out, true))
+            Ok(true)
         }
         MiriDiffVerdictSpec::Ub => {
             out.push_str(&format!(
@@ -924,7 +1153,146 @@ pub fn render_miri_diff_verify_module(
                    refuteMirPointByStrictUB Mir.{item}.body {fuel} [] emptyMemory\n\n\
                  end Verify.{item}\n"
             ));
-            Ok((out, false))
+            Ok(false)
+        }
+        other => Err(format!(
+            "test '{}' has unsupported reference Miri verdict '{}' without a [tests.known_anneal_bug] entry",
+            entry.name,
+            other.as_tag_str()
+        )),
+    }
+}
+
+/// Append the certificate or refutation for a non-bug entry whose claims link
+/// the callee table `callees_expr`, returning whether it is a trusted
+/// certificate module.
+///
+/// The point combinators used by [`render_callee_free_certificate`] fix
+/// `callees := []`, so these proofs instead instantiate the general bounded
+/// combinators (`verifyTotalMirBounded`, `verifyStatefulMirBounded`,
+/// `refuteTotalClaimByBoundedPanic`, and the strict-UB refutations), each of
+/// which evaluates `initMachineStateWithMemoryAndCallees body args mem
+/// c.callees`.
+fn render_linked_certificate(
+    out: &mut String,
+    item: &str,
+    fuel: u32,
+    entry: &MiriDiffTestEntry,
+    callees_expr: &str,
+) -> Result<bool, String> {
+    let pre = "fun args mem => args = [] ∧ mem = emptyMemory";
+    let init_running = format!(
+        "(.running (initMachineStateWithMemoryAndCallees Mir.{item}.body [] emptyMemory {callees_expr}))"
+    );
+    match &entry.miri_verdict {
+        MiriDiffVerdictSpec::PassUnit | MiriDiffVerdictSpec::PassScalar { .. } => {
+            let (kind, post, wp_lemma) = match &entry.miri_verdict {
+                MiriDiffVerdictSpec::PassScalar { bits, size_bytes } => (
+                    "pass_scalar",
+                    format!("retVal = .scalar {{ bits := {bits}, sizeBytes := {size_bytes} }}"),
+                    format!(
+                        "wpCoalBounded_of_evalMirDiffExecBounded_normalScalar {fuel} Mir.{item}.body\n      \
+                           {init_running}\n      \
+                           {bits} {size_bytes} (by rfl)"
+                    ),
+                ),
+                _ => (
+                    "pass_unit",
+                    "retVal = .unit".to_string(),
+                    format!(
+                        "wpCoalBounded_of_evalMirDiffExecBounded_normalUnit {fuel} Mir.{item}.body\n      \
+                           {init_running}\n      \
+                           (by rfl)"
+                    ),
+                ),
+            };
+            out.push_str(&format!(
+                "-- @anneal-miri-diff-kind: {kind}\n\
+                 theorem verified :\n    \
+                     TotalVerificationResult {{\n      \
+                       body := Mir.{item}.body\n      \
+                       pre := {pre}\n      \
+                       post := fun _ _ retVal _ => {post}\n      \
+                       callees := {callees_expr}\n    \
+                     }} :=\n  \
+                   Anneal.Rustc.V2026_06_01.Lower.verifyTotalMirBounded _ {fuel} (by\n    \
+                     rintro args mem ⟨rfl, rfl⟩\n    \
+                     exact {wp_lemma})\n\n\
+                 abbrev Certificate : Prop :=\n  \
+                   TotalVerificationResult {{\n    \
+                     body := Mir.{item}.body\n    \
+                     pre := {pre}\n    \
+                     post := fun _ _ retVal _ => {post}\n    \
+                     callees := {callees_expr}\n  \
+                   }}\n\n\
+                 end Verify.{item}\n"
+            ));
+            Ok(true)
+        }
+        MiriDiffVerdictSpec::Panic => {
+            out.push_str(&format!(
+                "-- @anneal-miri-diff-kind: panic\n\
+                 theorem verified :\n    \
+                     StatefulVerificationResult {{\n      \
+                       body := Mir.{item}.body\n      \
+                       pre := {pre}\n      \
+                       post := fun _ _ _ _ => False\n      \
+                       callees := {callees_expr}\n    \
+                     }} :=\n  \
+                   Anneal.Rustc.V2026_06_01.Lower.verifyStatefulMirBounded _ {fuel} (by\n    \
+                     rintro args mem ⟨rfl, rfl⟩\n    \
+                     exact wpMirBounded_of_reachesPanicBounded {fuel} Mir.{item}.body\n      \
+                       (initMachineStateWithMemoryAndCallees Mir.{item}.body [] emptyMemory {callees_expr})\n      \
+                       (by rfl))\n\n\
+                 theorem total_refuted :\n    \
+                     ¬ ({{\n      \
+                       body := Mir.{item}.body\n      \
+                       pre := {pre}\n      \
+                       post := fun _ _ _ _ => True\n      \
+                       callees := {callees_expr}\n    \
+                     }} : TotalClaim).holds :=\n  \
+                   refuteTotalClaimByBoundedPanic _ {fuel} [] emptyMemory ⟨rfl, rfl⟩\n\n\
+                 abbrev Certificate : Prop :=\n  \
+                   StatefulVerificationResult {{\n    \
+                     body := Mir.{item}.body\n    \
+                     pre := {pre}\n    \
+                     post := fun _ _ _ _ => False\n    \
+                     callees := {callees_expr}\n  \
+                   }} ∧\n  \
+                   ¬ ({{\n    \
+                     body := Mir.{item}.body\n    \
+                     pre := {pre}\n    \
+                     post := fun _ _ _ _ => True\n    \
+                     callees := {callees_expr}\n  \
+                   }} : TotalClaim).holds\n\n\
+                 theorem full_panic_certificate : Certificate :=\n  \
+                   And.intro verified total_refuted\n\n\
+                 end Verify.{item}\n"
+            ));
+            Ok(true)
+        }
+        MiriDiffVerdictSpec::Ub => {
+            out.push_str(&format!(
+                "-- @anneal-miri-diff-kind: strict_ub\n\
+                 abbrev Certificate : Prop :=\n  \
+                   ¬ ({{\n    \
+                     body := Mir.{item}.body\n    \
+                     pre := {pre}\n    \
+                     post := fun _ _ _ _ => True\n    \
+                     callees := {callees_expr}\n  \
+                   }} : StatefulClaim).holds ∧\n  \
+                   ¬ ({{\n    \
+                     body := Mir.{item}.body\n    \
+                     pre := {pre}\n    \
+                     post := fun _ _ _ _ => True\n    \
+                     callees := {callees_expr}\n  \
+                   }} : TotalClaim).holds\n\n\
+                 theorem strict_ub_refuted : Certificate :=\n  \
+                   ⟨refuteStatefulClaimByStrictUB _ {fuel} [] emptyMemory ⟨rfl, rfl⟩,\n   \
+                    refuteTotalClaimByStrictUB _ {fuel} [] emptyMemory ⟨rfl, rfl⟩⟩\n\n\
+                 end Verify.{item}\n"
+            ));
+            Ok(false)
         }
         other => Err(format!(
             "test '{}' has unsupported reference Miri verdict '{}' without a [tests.known_anneal_bug] entry",
@@ -940,7 +1308,7 @@ pub fn render_miri_diff_verify_module(
 /// and `ub` test (plus any helper items in the crate) using pure `Trusted.*` /
 /// `Mir.*` statement propositions, while `CrateVerify.verified`'s proof term
 /// also binds every `known_anneal_bug_ratchet` theorem so `TrustedBoundary`'s
-/// transitive constant closure and kernel replay audit all 74 tests.
+/// transitive constant closure and kernel replay audit every manifest test.
 pub fn render_miri_diff_crate_verify_module(
     crate_name: &str,
     crate_camel: &str,
@@ -1054,6 +1422,11 @@ pub fn render_miri_diff_crate_verify_module(
 /// Capture MIR for `config.corpus_root` with the manifest's `capture_rustflags`,
 /// scaffold `.anneal/`, and write the Miri differential `Verify` and
 /// `CrateVerify` Lean modules.
+///
+/// Each test's `Verify` module links the scaffolded `defaultCallees` table of
+/// its item (`.anneal/generated/Obligations/<Item>.lean`), so a test that calls
+/// another captured function of the corpus crate is evaluated with that
+/// function's captured MIR rather than stopping at an external call.
 pub fn stage_miri_diff_workspace(
     config: &MiriDiffConfig,
     manifest: &MiriDiffManifest,
@@ -1110,6 +1483,7 @@ pub fn stage_miri_diff_workspace(
         init_proof_templates: false,
     };
     scaffold_workspace_with_config(&scaffold_cfg, &records)?;
+    let dot_anneal = corpus_root.join(".anneal");
 
     let subject_records: Vec<&UnitTargetRecord> = records
         .iter()
@@ -1176,8 +1550,13 @@ pub fn stage_miri_diff_workspace(
         let suffix = derive_item_module_suffix(rec);
         let rel_path = module_suffix_to_rel_path(&suffix);
         let verify_path = verify_root.join(rel_path);
-        let (content, is_cert) =
-            render_miri_diff_verify_module(&crate_camel, &rec.target.def_id, entry)?;
+        let linked_callees = read_scaffolded_default_callees(&dot_anneal, &suffix)?;
+        let (content, is_cert) = render_miri_diff_verify_module_with_callees(
+            &crate_camel,
+            &rec.target.def_id,
+            entry,
+            &linked_callees,
+        )?;
         fs::write(&verify_path, content).map_err(|err| {
             format!(
                 "failed to write differential Verify module {}: {}",
@@ -1268,10 +1647,67 @@ pub fn run_miri_diff_suite(config: &MiriDiffConfig) -> Result<MiriDiffReport, St
     Ok(report)
 }
 
+/// Render `oracle/MiriOracleProbe.lean`, which prints one
+/// `ANNEAL_PROBE\t<name>\t<tag>\t<span>` line (the format read by
+/// `parse_anneal_probe_output`) for each `(item, linked_callees)` pair, starting
+/// each item from zero arguments and `emptyMemory` with its callee table linked.
+fn render_linked_probe_module(
+    crate_camel: &str,
+    items: &[(OracleItemSpec, Vec<String>)],
+) -> Result<String, String> {
+    let mut out = String::from("import Anneal.Rustc.V2026_06_01.SymbolicEval\n");
+    let mut imported = BTreeSet::new();
+    for (item, linked_callees) in items {
+        let item_suffix = format!("{crate_camel}.{}", item.name);
+        for suffix in std::iter::once(&item_suffix).chain(linked_callees) {
+            if imported.insert(suffix.clone()) {
+                out.push_str(&format!("import Mir.{suffix}\n"));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\nnamespace MiriOracleProbe\n\n\
+         open Trusted.Sequence\n\
+         open Trusted.Rustc.V2026_06_01.MirAst\n\
+         open Trusted.Rustc.V2026_06_01.MirSemantics\n\
+         open Trusted.VerificationResult\n\
+         open Anneal.Rustc.V2026_06_01.SymbolicEval\n\n\
+         {MIR_DIFF_PROBE_LEAN_DEFS}\
+         def formatTag : MirDiffTag → String\n  \
+           | .normalUnit => \"pass:unit\"\n  \
+           | .normalScalar bits sz => s!\"pass:scalar:{{bits}}:{{sz}}\"\n  \
+           | .normalOther => \"pass:other\"\n  \
+           | .panic => \"panic\"\n  \
+           | .abort => \"abort\"\n  \
+           | .ub => \"ub\"\n  \
+           | .unsupported => \"unsupported\"\n  \
+           | .externalCall p => s!\"externalCall:{{p}}\"\n  \
+           | .outOfFuel => \"outOfFuel\"\n\n\
+         def formatProbeLine (name : String) (fuel : Nat) (body : CapturedMir) (s : MachineState) : String :=\n  \
+           let (tag, span) := probeMirDiffExecBounded fuel body (.running s)\n  \
+           s!\"ANNEAL_PROBE\\t{{name}}\\t{{formatTag tag}}\\t{{span}}\"\n\n"
+    ));
+    for (item, linked_callees) in items {
+        let item_suffix = format!("{crate_camel}.{}", item.name);
+        let init_state = LinkedCallees::new(linked_callees)?.init_state_expr(&item_suffix);
+        let escaped_name = item.name.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(
+            "#eval IO.println (formatProbeLine \"{escaped_name}\" {} Mir.{item_suffix}.body\n  \
+               ({init_state}))\n",
+            item.fuel
+        ));
+    }
+    out.push_str("\nend MiriOracleProbe\n");
+    Ok(out)
+}
+
 /// Evaluate `MiriOracleProbe.lean` via `lake env lean` inside `dot_anneal` and
 /// verify that every `known_anneal_bug` entry with `observed_anneal_ub_span`
 /// matches Anneal's fault span and every non-bug `ub` entry's Anneal fault span
 /// contains `miri_ub_span`.
+///
+/// Each probed entry is evaluated with its scaffolded `defaultCallees` table
+/// linked, matching the initial state of the entry's `Verify` module.
 pub fn verify_miri_diff_ub_locations(
     dot_anneal: &Path,
     crate_camel: &str,
@@ -1285,7 +1721,12 @@ pub fn verify_miri_diff_ub_locations(
                 .as_ref()
                 .is_some_and(|b| b.observed_anneal_ub_span.is_some());
         if needs_ub_probe {
-            probe_items.push(OracleItemSpec::with_fuel(&entry.name, entry.fuel));
+            let item_suffix = format!("{crate_camel}.{}", entry.name);
+            let linked_callees = read_scaffolded_default_callees(dot_anneal, &item_suffix)?;
+            probe_items.push((
+                OracleItemSpec::with_fuel(&entry.name, entry.fuel),
+                linked_callees,
+            ));
         }
     }
     if probe_items.is_empty() {
@@ -1296,7 +1737,7 @@ pub fn verify_miri_diff_ub_locations(
     fs::create_dir_all(&oracle_dir)
         .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
     let probe_path = oracle_dir.join("MiriOracleProbe.lean");
-    let probe_src = render_anneal_probe_module(crate_camel, &probe_items);
+    let probe_src = render_linked_probe_module(crate_camel, &probe_items)?;
     fs::write(&probe_path, &probe_src)
         .map_err(|err| format!("failed to write {}: {}", probe_path.display(), err))?;
 
@@ -1402,4 +1843,194 @@ pub fn render_miri_diff_report(report: &MiriDiffReport) -> String {
         report.verified_strict_ub_count,
         report.ratcheted_known_bug_count
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, miri_verdict: MiriDiffVerdictSpec) -> MiriDiffTestEntry {
+        MiriDiffTestEntry {
+            name: name.to_string(),
+            category: "control_flow_and_calls".to_string(),
+            upstream_path: "tests/pass/calls.rs".to_string(),
+            miri_verdict,
+            miri_ub_span: None,
+            fuel: 128,
+            known_anneal_bug: None,
+        }
+    }
+
+    #[test]
+    fn parse_default_callees_table_reads_scaffolded_tables_and_rejects_other_shapes() {
+        let linked = "/-- Default transitive callee table. -/\n\
+                      def defaultCallees : List CapturedMir :=\n  \
+                        [Mir.MiriDiffCorpus.helper_add_ten.body, Mir.MiriDiffCorpus.helper_b.body]\n\n";
+        assert_eq!(
+            parse_default_callees_table(linked).expect("parse linked table"),
+            vec![
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+                "MiriDiffCorpus.helper_b".to_string()
+            ]
+        );
+        let empty = "def defaultCallees : List CapturedMir :=\n  .nil\n";
+        assert_eq!(
+            parse_default_callees_table(empty).expect("parse empty table"),
+            Vec::<String>::new()
+        );
+        for malformed in [
+            "def defaultCallees : List CapturedMir :=\n  []\n",
+            "def defaultCallees : List CapturedMir :=\n  [helper.body]\n",
+            "def defaultCallees : List CapturedMir :=\n  [Mir.Bad Name.body]\n",
+            "def defaultCallees : List CapturedMir :=\n",
+            "def other : List CapturedMir :=\n  .nil\n",
+        ] {
+            assert!(
+                parse_default_callees_table(malformed).is_err(),
+                "malformed table must be rejected: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_module_without_callees_is_unchanged_and_with_callees_links_captured_bodies() {
+        let pass = entry(
+            "pass_direct_fn_call",
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 42,
+                size_bytes: 4,
+            },
+        );
+        let def_id = "miri_diff_corpus::pass_direct_fn_call";
+        let (plain, plain_cert) =
+            render_miri_diff_verify_module("MiriDiffCorpus", def_id, &pass).expect("render");
+        let (empty, empty_cert) =
+            render_miri_diff_verify_module_with_callees("MiriDiffCorpus", def_id, &pass, &[])
+                .expect("render with empty callee table");
+        assert_eq!(plain, empty);
+        assert!(plain_cert && empty_cert);
+        assert!(plain.contains("verifyTotalMirScalarPointBounded"));
+        assert!(!plain.contains("callees :="));
+
+        let helpers = vec!["MiriDiffCorpus.helper_add_ten".to_string()];
+        let (linked, linked_cert) =
+            render_miri_diff_verify_module_with_callees("MiriDiffCorpus", def_id, &pass, &helpers)
+                .expect("render with linked callees");
+        assert!(linked_cert);
+        assert!(linked.contains(
+            "import Mir.MiriDiffCorpus.pass_direct_fn_call\n\
+             import Mir.MiriDiffCorpus.helper_add_ten\n\
+             import Anneal.Rustc.V2026_06_01.SymbolicEval\n"
+        ));
+        assert_eq!(
+            linked
+                .matches("callees := [Mir.MiriDiffCorpus.helper_add_ten.body]")
+                .count(),
+            2,
+            "theorem `verified` and `Certificate` must both carry the callee table:\n{linked}"
+        );
+        assert!(linked.contains("Anneal.Rustc.V2026_06_01.Lower.verifyTotalMirBounded _ 128"));
+        assert!(linked.contains("wpCoalBounded_of_evalMirDiffExecBounded_normalScalar 128"));
+        assert!(!linked.contains("sorry"));
+
+        // A ratchet recorded before linking must evaluate with the callees
+        // linked so that it fails once linking resolves the external call.
+        let mut stale = pass.clone();
+        stale.known_anneal_bug = Some(KnownAnnealBugSpec {
+            status: "open_bug".to_string(),
+            bug_class: "incompleteness_unmodeled_intrinsic_or_call".to_string(),
+            observed_anneal_tag: MiriDiffVerdictSpec::ExternalCall(
+                "miri_diff_corpus::helper_add_ten".to_string(),
+            ),
+            observed_anneal_ub_span: None,
+            suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics.Memory".to_string(),
+            summary: "Stale ratchet.".to_string(),
+        });
+        let (ratchet, ratchet_cert) =
+            render_miri_diff_verify_module_with_callees("MiriDiffCorpus", def_id, &stale, &helpers)
+                .expect("render stale ratchet");
+        assert!(!ratchet_cert);
+        assert!(ratchet.contains(
+            "(initMachineStateWithMemoryAndCallees Mir.MiriDiffCorpus.pass_direct_fn_call.body [] \
+             emptyMemory [Mir.MiriDiffCorpus.helper_add_ten.body]) =\n      \
+             (MirDiffTag.externalCall \"miri_diff_corpus::helper_add_ten\")"
+        ));
+
+        // Self-recursive + PassUnit + Panic + Ub + span-ratchet callee-linked shapes.
+        let self_and_helper = vec![
+            "MiriDiffCorpus.pass_direct_fn_call".to_string(),
+            "MiriDiffCorpus.helper_add_ten".to_string(),
+        ];
+        let pass_unit = entry("pass_direct_fn_call", MiriDiffVerdictSpec::PassUnit);
+        let (linked_unit, linked_unit_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            def_id,
+            &pass_unit,
+            &self_and_helper,
+        )
+        .expect("render PassUnit with self + helper callees");
+        assert!(linked_unit_cert);
+        assert_eq!(
+            linked_unit
+                .matches("import Mir.MiriDiffCorpus.pass_direct_fn_call\n")
+                .count(),
+            1,
+            "self-recursive callee must not duplicate the subject import:\n{linked_unit}"
+        );
+        assert!(linked_unit.contains("wpCoalBounded_of_evalMirDiffExecBounded_normalUnit 128"));
+
+        let panic_entry = entry("panic_with_callee", MiriDiffVerdictSpec::Panic);
+        let (linked_panic, linked_panic_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            "miri_diff_corpus::panic_with_callee",
+            &panic_entry,
+            &helpers,
+        )
+        .expect("render Panic with linked callees");
+        assert!(linked_panic_cert);
+        assert!(linked_panic.contains("Anneal.Rustc.V2026_06_01.Lower.verifyStatefulMirBounded _ 128"));
+        assert!(linked_panic.contains("wpMirBounded_of_reachesPanicBounded 128"));
+        assert!(linked_panic.contains("refuteTotalClaimByBoundedPanic _ 128 [] emptyMemory"));
+
+        let mut ub_entry = entry("ub_with_callee", MiriDiffVerdictSpec::Ub);
+        ub_entry.miri_ub_span = SourcePos::parse_rustc_pos("src/lib.rs:10:5");
+        let (linked_ub, linked_ub_cert) = render_miri_diff_verify_module_with_callees(
+            "MiriDiffCorpus",
+            "miri_diff_corpus::ub_with_callee",
+            &ub_entry,
+            &helpers,
+        )
+        .expect("render Ub with linked callees");
+        assert!(!linked_ub_cert);
+        assert!(linked_ub.contains("refuteStatefulClaimByStrictUB _ 128 [] emptyMemory"));
+        assert!(linked_ub.contains("refuteTotalClaimByStrictUB _ 128 [] emptyMemory"));
+    }
+
+    #[test]
+    fn verify_module_rejects_unsafe_or_duplicate_callee_suffixes() {
+        let pass = entry("pass_direct_fn_call", MiriDiffVerdictSpec::PassUnit);
+        for bad in [
+            vec!["MiriDiffCorpus.helper]".to_string()],
+            vec!["".to_string()],
+            vec!["helper".to_string()],
+            vec!["MiriDiffCorpus.1helper".to_string()],
+            vec!["MiriDiffCorpus.helperα".to_string()],
+            vec!["MiriDiffCorpus..helper".to_string()],
+            vec![
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+                "MiriDiffCorpus.helper_add_ten".to_string(),
+            ],
+        ] {
+            assert!(
+                render_miri_diff_verify_module_with_callees(
+                    "MiriDiffCorpus",
+                    "miri_diff_corpus::pass_direct_fn_call",
+                    &pass,
+                    &bad
+                )
+                .is_err(),
+                "callee table {bad:?} must be rejected"
+            );
+        }
+    }
 }

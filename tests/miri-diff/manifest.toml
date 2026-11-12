@@ -598,12 +598,6 @@ category = "control_flow_and_calls"
 upstream_path = "tests/pass/calls.rs"
 miri_verdict = "pass:scalar:42:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:miri_diff_corpus::helper_add_ten"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
-summary = "initMachineState initializes emptyMemory with callees = [], and single-item verification does not automatically link intra-crate callee bodies (helper_add_ten) into Memory.callees."
 
 [[tests]]
 name = "panic_explicit_macro"
@@ -616,4 +610,93 @@ status = "open_bug"
 bug_class = "incompleteness_unmodeled_intrinsic_or_call"
 observed_anneal_tag = "externalCall:core::fmt::Arguments::<'a>::from_str"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "Explicit panic!(...) lowers to core::fmt::Arguments::from_str followed by diverging core::panicking::panic_fmt (target = none), which are not yet modeled as panicking terminators in evalCallTerminator."
+summary = "Explicit panic!(...) first calls core::fmt::Arguments::from_str, which Trusted MirSemantics does not model and the corpus crate does not capture, so evaluation stops at that external call before reaching the diverging core::panicking::panic_fmt call that evalCallTerminator models as an unwinding panic."
+
+[[tests]]
+name = "pass_nonzero_u32_transmute_roundtrip"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/integer-ops.rs"
+miri_verdict = "pass:scalar:7:4"
+fuel = 128
+
+[[tests]]
+name = "ub_nonzero_u32_transmute_zero"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/nonzero.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:758:34"
+fuel = 128
+
+[[tests]]
+name = "pass_option_nonzero_none_niche"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/enums.rs"
+miri_verdict = "pass:scalar:2:4"
+fuel = 128
+
+[[tests]]
+name = "pass_transparent_wrapper_transmute"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/transmute_ptr.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+
+[[tests]]
+name = "pass_single_c_enum_match_reinit"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/enums.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128
+
+[[tests]]
+name = "ub_single_c_enum_invalid_tag"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/invalid_enum_tag.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:792:31"
+fuel = 128
+
+[[tests]]
+name = "pass_union_overlay_word_bytes"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/union.rs"
+miri_verdict = "pass:scalar:67305993:4"
+fuel = 128
+
+[[tests]]
+name = "ub_union_uninit_bytes_partial_read"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/uninit/uninit_byte_read.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:813:29"
+fuel = 128
+
+[[tests]]
+name = "pass_raw_ref_disjoint_fields"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/tree-borrows.rs"
+miri_verdict = "pass:scalar:6:4"
+fuel = 128
+
+[[tests]]
+name = "ub_raw_mut_after_parent_write"
+category = "tree_borrows"
+upstream_path = "tests/fail/tree_borrows/write-during-2phase.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:841:9"
+fuel = 128
+
+[[tests]]
+name = "ub_transparent_nonzero_wrapper_zero"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/nonzero.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:852:37"
+fuel = 128
+
+[[tests]]
+name = "pass_option_some_niche_and_single_c_mut"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/enums.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128

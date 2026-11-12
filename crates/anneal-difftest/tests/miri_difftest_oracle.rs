@@ -20,9 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
-    GeneratedMiriCandidate, build_standalone_candidate_source, generate_miri_corpus_batch,
+    ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
+    MiriAstMutator, MutationMode, PlaceProjectionWrapper, TreeBorrowsRetagInterleaver,
+    build_standalone_candidate_source, generate_miri_batch, generate_miri_corpus_batch,
 };
-use cargo_anneal::{CaptureDriverConfig, resolve_rustc_wrapper};
+use cargo_anneal::{
+    AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
+    compare_miri_and_anneal, resolve_rustc_wrapper,
+};
 
 struct TempDir(PathBuf);
 
@@ -87,10 +92,18 @@ fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     assert!(stdout.contains("# `miri-difftest` Differential Oracle Report"));
     assert!(stdout.contains("- **Oracle comparison**: PERFORMED"));
     assert!(stdout.contains("## `NotCompared` Coverage Table"));
-    assert!(stdout.contains("### Unmodeled External Calls"));
+    // Every identity candidate is compared, so the report lists no unmodeled
+    // external calls: `helper_add_ten` is linked as a captured callee, and the
+    // `core::fmt::Arguments` constructors behind `panic!("...")` are linked as
+    // synthetic stubs.
+    assert!(!stdout.contains("### Unmodeled External Calls"));
     assert!(!stdout.contains("`core::intrinsics::exact_div`"));
     assert!(!stdout.contains("miri_diff_corpus::helper_add_ten"));
-    assert!(stdout.contains("| `core::fmt::Arguments::<'a>::from_str` | 1 |"));
+    assert!(!stdout.contains("core::fmt::Arguments"));
+    assert!(stdout.contains("- **Reconciled panic-macro sites** (counted in **Agree**): `1`"));
+    assert!(stdout.contains("## Reconciled Panic-Macro Sites"));
+    assert!(stdout.contains("| `panic_explicit_macro` |"));
+    assert!(stdout.contains("| \"explicit panic in corpus\" | `true` |"));
 
     let verify = Command::new("python3")
         .arg("-c")
@@ -106,17 +119,20 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 77
-assert data["compiled_candidates"] == 77
+assert data["total_candidates"] == 89
+assert data["compiled_candidates"] == 89
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 76
-assert data["agree_count"] == 76
+assert data["compared_candidates"] == 89
+assert data["agree_count"] == 89
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
-assert data["not_compared_count"] == 1
+assert data["not_compared_count"] == 0
 assert isinstance(data.get("obs_path_signatures"), list)
 assert len(data["obs_path_signatures"]) > 0
 assert all(s.startswith("miri:") for s in data["obs_path_signatures"])
+assert "miri:panic_explicit_macro@identity:panic_vs_panic:agree" in data["obs_path_signatures"], (
+    f"panic_explicit_macro must compare and agree: {data['obs_path_signatures']}"
+)
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
@@ -133,17 +149,14 @@ nc = data["not_compared_reasons"]
 assert nc == {
     "capture_failed": 0,
     "compile_failed": 0,
-    "external_call": 1,
+    "external_call": 0,
     "miri_oracle_error": 0,
     "out_of_fuel": 0,
     "unsupported": 0,
 }, f"unexpected not_compared_reasons: {nc}"
 
 ext = data["unmodeled_external_calls"]
-assert "core::intrinsics::exact_div" not in ext, f"unexpected ext: {ext}"
-assert "miri_diff_corpus::helper_add_ten" not in ext, f"unexpected ext: {ext}"
-assert ext == {"core::fmt::Arguments::<'a>::from_str": 1}, f"unexpected ext: {ext}"
-assert sum(ext.values()) == 1, f"unexpected ext sum: {ext}"
+assert ext == {}, f"unexpected ext: {ext}"
 
 expected_findings = {}
 
@@ -163,12 +176,32 @@ manifest_ext = {
     if "known_anneal_bug" in t
     and t["known_anneal_bug"].get("observed_anneal_tag", "").startswith("externalCall:")
 }
-assert len(manifest_ext) == 2, f"expected 2 externalCall entries in manifest, got {manifest_ext}"
+assert len(manifest_ext) == 1, f"expected 1 externalCall entry in manifest, got {manifest_ext}"
+assert manifest_ext == {"panic_explicit_macro"}, f"unexpected externalCall entries: {manifest_ext}"
 
 findings = data["findings"]
 assert len(findings) == 0
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
+
+# `panic_explicit_macro` is the only identity candidate whose agreement rests on
+# the panic-macro reconciliation, and Anneal's recovered panic message matched
+# the message that Miri printed.
+assert data["reconciled_panic_sites_count"] == 1, data["reconciled_panic_sites"]
+assert data["reconciled_panic_sites"] == [
+    {
+        "fn_name": "panic_explicit_macro",
+        "seed_name": "panic_explicit_macro",
+        "batch_miri_pos": data["reconciled_panic_sites"][0]["batch_miri_pos"],
+        "anneal_span": data["reconciled_panic_sites"][0]["anneal_span"],
+        "anneal_panic_frame": "miri_diff_corpus::panic_explicit_macro",
+        "anneal_panic_message": "explicit panic in corpus",
+        "kernel_confirmed": True,
+    }
+], data["reconciled_panic_sites"]
+site = data["reconciled_panic_sites"][0]
+assert site["batch_miri_pos"].startswith("src/lib.rs:"), site
+assert "/library/core/src/panic.rs:" in site["anneal_span"], site
 "#,
         )
         .arg(&json_path)
@@ -399,7 +432,8 @@ fn evaluate_miri_batches_counts_compile_failures_and_rejects_zero_compiled() {
     let mut batch = generate_miri_corpus_batch(2, 0x1234_5678, 0);
     assert_eq!(batch.len(), 2);
 
-    let broken_fn = "pub fn broken_cand__b0_c2() -> u32 {\n    let x: u32 = \"not_an_int\";\n    x\n}\n";
+    let broken_fn =
+        "pub fn broken_cand__b0_c2() -> u32 {\n    let x: u32 = \"not_an_int\";\n    x\n}\n";
     batch.push(GeneratedMiriCandidate {
         id: 2,
         seed_index: 0,
@@ -599,7 +633,10 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
         Some(&root),
     )
     .expect("evaluate seeded pass_direct_fn_call mutants");
-    assert_eq!(seeded_rep.compared_candidates, seeded_rep.compiled_candidates);
+    assert_eq!(
+        seeded_rep.compared_candidates,
+        seeded_rep.compiled_candidates
+    );
     assert_eq!(
         seeded_rep
             .unmodeled_external_calls
@@ -610,6 +647,776 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
         "expected 0 helper_add_ten skips in seeded batch: {:?}",
         seeded_rep.unmodeled_external_calls
     );
+}
+
+/// Build a seeded candidate named `fn_name` whose `fn_source` may also define
+/// intra-crate helpers.
+fn handwritten_candidate(
+    id: usize,
+    seed_name: &str,
+    fn_name: &str,
+    applied_mutator: &str,
+    fn_source: &str,
+) -> GeneratedMiriCandidate {
+    GeneratedMiriCandidate {
+        id,
+        seed_index: 0,
+        seed_name: seed_name.to_string(),
+        fn_name: fn_name.to_string(),
+        seed_u64: 0x00F0_0000 + id as u64,
+        applied_mutators: vec![applied_mutator.to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: fn_source.to_string(),
+        source: build_standalone_candidate_source(fn_source),
+    }
+}
+
+#[test]
+fn panic_fmt_candidates_compare_agree_and_preserve_non_macro_panic_site_mismatch() {
+    let dir = unique_temp_dir("panic_fmt");
+    let root = repo_root();
+
+    // `panic!("...")` and `assert!(cond, "...")` both call
+    // `core::fmt::Arguments::<'a>::from_str`, while `unreachable!("...")`
+    // inlines its nested `format_args!` and calls
+    // `core::fmt::Arguments::<'a>::from_str_nonconst`, before handing the
+    // result to `core::panicking::panic_fmt` in `library/core/src/panic.rs`.
+    let panic_fn = "\
+pub fn panic_fmt_macro__b0_c0() {
+    let x: u32 = 3u32;
+    if x == 3u32 {
+        panic!(\"panic! message from a mutated candidate\");
+    }
+}
+";
+    let assert_fn = "\
+pub fn assert_fmt_macro__b0_c1() -> u32 {
+    let x: u32 = 7u32;
+    assert!(x == 8u32, \"x must equal eight\");
+    x
+}
+";
+    let unreachable_fn = "\
+pub fn unreachable_fmt_macro__b0_c2() -> u32 {
+    let x: u32 = 5u32;
+    if x == 5u32 {
+        unreachable!(\"unreachable! message via from_str_nonconst\");
+    }
+    x
+}
+";
+    // `todo!()` passes its message to `core::panicking::panic` as a constant,
+    // and `assert_eq!` panics through `core::panicking::assert_failed`, which
+    // formats its message at run time; both expansions come from
+    // `library/core/src/macros/mod.rs`. Both `assert_eq!` operands are locals:
+    // a literal operand would be compared through a reference to a promoted
+    // constant, which Anneal currently reads incorrectly (a separate
+    // `panic_vs_return` divergence that this test does not cover).
+    let todo_fn = "\
+pub fn todo_macro__b0_c4() -> u32 {
+    let x: u32 = 2u32;
+    if x == 2u32 {
+        todo!();
+    }
+    x
+}
+";
+    let assert_eq_fn = "\
+pub fn assert_eq_macro__b0_c5() -> u32 {
+    let x: u32 = 4u32;
+    let y: u32 = 5u32;
+    assert_eq!(x, y);
+    x
+}
+";
+    let assert_ne_custom_fn = "\
+pub fn assert_ne_custom_macro__b0_c6() -> u32 {
+    let x: u32 = 4u32;
+    let y: u32 = 4u32;
+    assert_ne!(x, y, \"x and y must differ\");
+    x
+}
+";
+    // A genuine non-macro panic-site mismatch: the overflowing `+` panics inside
+    // a `#[track_caller]` helper. Miri reports the helper's call site in the
+    // candidate; Anneal reports the overflow `assert` terminator inside the
+    // helper's own body, a user `src/lib.rs` span that reconciliation must not
+    // accept.
+    let track_caller_fn = "\
+#[track_caller]
+#[inline(never)]
+pub fn track_caller_overflow_helper(x: u8) -> u8 {
+    x + 250u8
+}
+
+pub fn neg_ctrl_track_caller_overflow__b0_c3() -> u8 {
+    let base: u8 = 10u8;
+    track_caller_overflow_helper(base)
+}
+";
+    // A panic that unwinds through a cleanup block (here, to drop a local whose
+    // type implements `Drop`) ends at a `resume` terminator whose span covers
+    // the whole function. Anneal must still attribute the panic to the step
+    // that started unwinding, both for the reconciled `panic!` and for the
+    // non-macro `#[track_caller]` mismatch, which would otherwise agree
+    // because the whole-function span contains Miri's position.
+    let cleanup_panic_fn = "\
+pub struct CleanupGuardC7(pub u32);
+
+impl Drop for CleanupGuardC7 {
+    fn drop(&mut self) {
+        self.0 = 0u32;
+    }
+}
+
+pub fn panic_cleanup_macro__b0_c7() -> u32 {
+    let guard = CleanupGuardC7(7u32);
+    if guard.0 == 7u32 {
+        panic!(\"panic! message unwinding through a cleanup block\");
+    }
+    guard.0
+}
+";
+    let cleanup_track_caller_fn = "\
+pub struct CleanupGuardC8(pub u32);
+
+impl Drop for CleanupGuardC8 {
+    fn drop(&mut self) {
+        self.0 = 0u32;
+    }
+}
+
+#[track_caller]
+#[inline(never)]
+pub fn track_caller_overflow_helper_c8(x: u8) -> u8 {
+    x + 250u8
+}
+
+pub fn neg_ctrl_cleanup_track_caller__b0_c8() -> u8 {
+    let guard = CleanupGuardC8(3u32);
+    let base: u8 = 10u8;
+    let sum = track_caller_overflow_helper_c8(base);
+    if guard.0 == 3u32 { sum } else { 0u8 }
+}
+";
+    // Invocations written through a crate path, rooted, split across lines, or
+    // with a comment before `!` still reconcile: Miri reports each
+    // invocation's first token, which `StagedLibSource` indexes.
+    let qualified_panic_fn = "\
+pub fn core_qualified_macro__b0_c9() -> u32 {
+    let x: u32 = 6u32;
+    if x == 6u32 {
+        core::panic!(\"core-qualified panic! message\");
+    }
+    x
+}
+";
+    let rooted_assert_fn = "\
+pub fn rooted_assert_macro__b0_c10() -> u32 {
+    let x: u32 = 1u32;
+    ::core::assert!(x == 2u32, \"rooted assert! message\");
+    x
+}
+";
+    let multiline_panic_fn = "\
+pub fn multiline_core_macro__b0_c11() -> u32 {
+    let x: u32 = 9u32;
+    if x == 9u32 {
+        core::
+            panic!(\"multi-line core-qualified panic! message\");
+    }
+    x
+}
+";
+    let commented_assert_fn = "\
+pub fn commented_assert_macro__b0_c12() -> u32 {
+    let x: u32 = 3u32;
+    assert /* why */ !(x == 4u32, \"commented assert! message\");
+    x
+}
+";
+    // A panic that Anneal raises in a different function than Miri must not
+    // reconcile, even with an identical message. Anneal currently reads `*y`
+    // through the promoted `&5u32` as `x` (its stack borrows and the promoted
+    // allocation share `allocId`s), so it calls the helper, while Miri panics
+    // at the candidate's own `panic!`. Both spans lie in
+    // `library/core/src/panic.rs`, and both messages match.
+    let masked_frame_fn = "\
+#[inline(never)]
+pub fn helper_panics_same_message_c13() -> u32 {
+    panic!(\"identical panic message\");
+}
+
+pub fn masked_promoted_divergence__b0_c13() -> u32 {
+    let x: u32 = 4u32;
+    let r1: &u32 = &x;
+    let r2: &u32 = &x;
+    let y: &u32 = &5u32;
+    if *y == *r1 {
+        helper_panics_same_message_c13()
+    } else if *r2 == 0u32 {
+        0u32
+    } else {
+        panic!(\"identical panic message\");
+    }
+}
+";
+    // A panic inside a nested `fn` reconciles when both Miri and Anneal panic
+    // inside that nested `fn`, and stays a kernel-confirmed divergence when
+    // Anneal panics inside the nested `fn` while Miri panics in the outer
+    // candidate body (even with an identical message and a `DefPath` whose
+    // second segment is the candidate's name).
+    let nested_fn_agree = "\
+pub fn nested_fn_macro__b0_c14() -> u32 {
+    #[inline(never)]
+    fn inner_panic() -> u32 {
+        panic!(\"nested fn panic! message\");
+    }
+    inner_panic()
+}
+";
+    let masked_nested_fn = "\
+pub fn masked_nested_fn_divergence__b0_c15() -> u32 {
+    #[inline(never)]
+    fn inner_panics_same_message_c15() -> u32 {
+        panic!(\"identical nested panic message\");
+    }
+    let x: u32 = 4u32;
+    let r1: &u32 = &x;
+    let r2: &u32 = &x;
+    let y: &u32 = &5u32;
+    if *y == *r1 {
+        inner_panics_same_message_c15()
+    } else if *r2 == 0u32 {
+        0u32
+    } else {
+        panic!(\"identical nested panic message\");
+    }
+}
+";
+    let candidates = vec![
+        handwritten_candidate(
+            0,
+            "panic_explicit_macro",
+            "panic_fmt_macro__b0_c0",
+            "ArithmeticCastMutator",
+            panic_fn,
+        ),
+        handwritten_candidate(
+            1,
+            "panic_explicit_macro",
+            "assert_fmt_macro__b0_c1",
+            "ArithmeticCastMutator",
+            assert_fn,
+        ),
+        handwritten_candidate(
+            2,
+            "panic_explicit_macro",
+            "unreachable_fmt_macro__b0_c2",
+            "ArithmeticCastMutator",
+            unreachable_fn,
+        ),
+        handwritten_candidate(
+            3,
+            "panic_checked_add_overflow",
+            "neg_ctrl_track_caller_overflow__b0_c3",
+            "ArithmeticCastMutator",
+            track_caller_fn,
+        ),
+        handwritten_candidate(
+            4,
+            "panic_explicit_macro",
+            "todo_macro__b0_c4",
+            "ArithmeticCastMutator",
+            todo_fn,
+        ),
+        handwritten_candidate(
+            5,
+            "panic_explicit_macro",
+            "assert_eq_macro__b0_c5",
+            "ArithmeticCastMutator",
+            assert_eq_fn,
+        ),
+        handwritten_candidate(
+            6,
+            "panic_explicit_macro",
+            "assert_ne_custom_macro__b0_c6",
+            "ArithmeticCastMutator",
+            assert_ne_custom_fn,
+        ),
+        handwritten_candidate(
+            7,
+            "panic_explicit_macro",
+            "panic_cleanup_macro__b0_c7",
+            "ArithmeticCastMutator",
+            cleanup_panic_fn,
+        ),
+        handwritten_candidate(
+            8,
+            "panic_checked_add_overflow",
+            "neg_ctrl_cleanup_track_caller__b0_c8",
+            "ArithmeticCastMutator",
+            cleanup_track_caller_fn,
+        ),
+        handwritten_candidate(
+            9,
+            "panic_explicit_macro",
+            "core_qualified_macro__b0_c9",
+            "ArithmeticCastMutator",
+            qualified_panic_fn,
+        ),
+        handwritten_candidate(
+            10,
+            "panic_explicit_macro",
+            "rooted_assert_macro__b0_c10",
+            "ArithmeticCastMutator",
+            rooted_assert_fn,
+        ),
+        handwritten_candidate(
+            11,
+            "panic_explicit_macro",
+            "multiline_core_macro__b0_c11",
+            "ArithmeticCastMutator",
+            multiline_panic_fn,
+        ),
+        handwritten_candidate(
+            12,
+            "panic_explicit_macro",
+            "commented_assert_macro__b0_c12",
+            "ArithmeticCastMutator",
+            commented_assert_fn,
+        ),
+        handwritten_candidate(
+            13,
+            "panic_explicit_macro",
+            "masked_promoted_divergence__b0_c13",
+            "ArithmeticCastMutator",
+            masked_frame_fn,
+        ),
+        handwritten_candidate(
+            14,
+            "panic_explicit_macro",
+            "nested_fn_macro__b0_c14",
+            "ArithmeticCastMutator",
+            nested_fn_agree,
+        ),
+        handwritten_candidate(
+            15,
+            "panic_explicit_macro",
+            "masked_nested_fn_divergence__b0_c15",
+            "ArithmeticCastMutator",
+            masked_nested_fn,
+        ),
+    ];
+
+    let findings_dir = dir.join("findings_panic_fmt");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0x00F0_0001,
+        &[candidates],
+        16,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate panic_fmt candidate batch");
+
+    assert_eq!(report.total_candidates, 16);
+    assert_eq!(report.compiled_candidates, 16);
+    assert_eq!(report.compared_candidates, 16);
+    assert_eq!(report.agree_count, 12);
+    assert_eq!(report.diverge_count, 4);
+    assert_eq!(report.not_compared_count, 0);
+    assert_eq!(report.kernel_confirmed_divergences, 4);
+    assert_eq!(
+        report.not_compared_reasons.get("external_call").copied(),
+        Some(0),
+        "unexpected external_call skips: {:?}",
+        report.not_compared_reasons
+    );
+    assert!(
+        report.unmodeled_external_calls.is_empty(),
+        "unexpected unmodeled external calls: {:?}",
+        report.unmodeled_external_calls
+    );
+    assert_eq!(report.miri_verdicts.get("panic").copied(), Some(16));
+    assert_eq!(report.anneal_outcomes.get("panic").copied(), Some(16));
+
+    // (a) The macro candidates panic at the macro call site under Miri and inside
+    // the macro's standard-library definition under Anneal. The strict
+    // comparator reports a panic-site mismatch, and the difftest comparator
+    // reconciles it. Where Anneal's run recovers the panic message, it matches
+    // Miri's.
+    let macro_candidates = [
+        (
+            "panic_fmt_macro__b0_c0",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::panic_fmt_macro__b0_c0",
+            Some("panic! message from a mutated candidate"),
+        ),
+        (
+            "assert_fmt_macro__b0_c1",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::assert_fmt_macro__b0_c1",
+            Some("x must equal eight"),
+        ),
+        (
+            "unreachable_fmt_macro__b0_c2",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::unreachable_fmt_macro__b0_c2",
+            Some(
+                "internal error: entered unreachable code: \
+                 unreachable! message via from_str_nonconst",
+            ),
+        ),
+        (
+            "todo_macro__b0_c4",
+            "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::todo_macro__b0_c4",
+            Some("not yet implemented"),
+        ),
+        (
+            "assert_eq_macro__b0_c5",
+            "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::assert_eq_macro__b0_c5",
+            Some("assertion `left == right` failed"),
+        ),
+        (
+            "assert_ne_custom_macro__b0_c6",
+            "/library/core/src/macros/mod.rs",
+            "miri_diff_corpus::assert_ne_custom_macro__b0_c6",
+            Some("assertion `left != right` failed: x and y must differ"),
+        ),
+        (
+            "panic_cleanup_macro__b0_c7",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::panic_cleanup_macro__b0_c7",
+            Some("panic! message unwinding through a cleanup block"),
+        ),
+        (
+            "core_qualified_macro__b0_c9",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::core_qualified_macro__b0_c9",
+            Some("core-qualified panic! message"),
+        ),
+        (
+            "rooted_assert_macro__b0_c10",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::rooted_assert_macro__b0_c10",
+            Some("rooted assert! message"),
+        ),
+        (
+            "multiline_core_macro__b0_c11",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::multiline_core_macro__b0_c11",
+            Some("multi-line core-qualified panic! message"),
+        ),
+        (
+            "commented_assert_macro__b0_c12",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::commented_assert_macro__b0_c12",
+            Some("commented assert! message"),
+        ),
+        (
+            "nested_fn_macro__b0_c14",
+            "/library/core/src/panic.rs",
+            "miri_diff_corpus::nested_fn_macro__b0_c14::inner_panic",
+            Some("nested fn panic! message"),
+        ),
+    ];
+    assert_eq!(
+        report.reconciled_panic_sites.len(),
+        macro_candidates.len(),
+        "unexpected reconciled sites: {:?}",
+        report.reconciled_panic_sites
+    );
+    for (name, anneal_file_suffix, expected_frame, anneal_message) in macro_candidates {
+        let item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for {name}"));
+        let MiriOutcome::Panic {
+            pos: Some(miri_pos),
+            message: miri_message,
+        } = &item.miri
+        else {
+            panic!(
+                "{name}: expected a Miri panic with a position, got {:?}",
+                item.miri
+            );
+        };
+        assert_eq!(miri_pos.file, "src/lib.rs", "{name}: {miri_pos:?}");
+        let AnnealOutcome::Panic {
+            span: Some(anneal_span),
+        } = &item.anneal
+        else {
+            panic!(
+                "{name}: expected an Anneal panic with a span, got {:?}",
+                item.anneal
+            );
+        };
+        assert!(
+            anneal_span.file.ends_with(anneal_file_suffix),
+            "{name}: unexpected Anneal panic span {anneal_span:?}"
+        );
+        assert!(
+            matches!(
+                compare_miri_and_anneal(&item.miri, &item.anneal),
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{name}: strict comparison must report the macro panic-site difference"
+        );
+        assert_eq!(item.verdict, ComparisonVerdict::Agree, "{name}");
+        // The reconciled outcome rests on kernel-checked `by rfl` theorems
+        // evaluated with the linked `fmtArgumentsCtorStub` callees.
+        assert!(item.kernel_confirmed, "{name}");
+
+        let site = report
+            .reconciled_panic_sites
+            .iter()
+            .find(|s| s.fn_name == name)
+            .unwrap_or_else(|| panic!("{name} must be listed as a reconciled site"));
+        assert_eq!(site.seed_name, "panic_explicit_macro", "{name}");
+        assert!(site.kernel_confirmed, "{name}");
+        assert_eq!(
+            site.anneal_panic_message.as_deref(),
+            anneal_message,
+            "{name}: unexpected recovered Anneal panic message"
+        );
+        if let Some(message) = anneal_message {
+            assert_eq!(miri_message, message, "{name}");
+        }
+        for theorem in ["confirm_tag", "confirm_probe"] {
+            assert!(
+                site.kernel_confirm_theorems
+                    .contains(&format!("theorem {theorem}_{name} :")),
+                "{name}: missing {theorem}:\n{}",
+                site.kernel_confirm_theorems
+            );
+        }
+        // Anneal's panic began in the exact enclosing callable frame, and that
+        // frame and the recovered message are themselves kernel-checked; the
+        // snippet carries the panic-origin probe that those theorems evaluate.
+        assert_eq!(
+            site.anneal_panic_frame.as_deref(),
+            Some(expected_frame),
+            "{name}"
+        );
+        assert!(
+            site.kernel_confirm_theorems
+                .contains(&format!("theorem confirm_frame_{name} :")),
+            "{name}:\n{}",
+            site.kernel_confirm_theorems
+        );
+        assert!(
+            site.kernel_confirm_theorems
+                .contains(&format!("some \"{expected_frame}\" := by")),
+            "{name}"
+        );
+        assert_eq!(
+            site.kernel_confirm_theorems
+                .contains(&format!("theorem confirm_message_{name} :")),
+            anneal_message.is_some(),
+            "{name}:\n{}",
+            site.kernel_confirm_theorems
+        );
+        assert!(
+            site.kernel_confirm_theorems
+                .contains("def probePanicOriginBoundedFrom\n"),
+            "{name}"
+        );
+    }
+    let negative_controls = [
+        "neg_ctrl_track_caller_overflow__b0_c3",
+        "neg_ctrl_cleanup_track_caller__b0_c8",
+    ];
+    let masked_cases = [
+        (
+            "masked_promoted_divergence__b0_c13",
+            "miri_diff_corpus::helper_panics_same_message_c13",
+            "identical panic message",
+        ),
+        (
+            "masked_nested_fn_divergence__b0_c15",
+            "miri_diff_corpus::masked_nested_fn_divergence__b0_c15::inner_panics_same_message_c15",
+            "identical nested panic message",
+        ),
+    ];
+    assert!(report.reconciled_panic_sites.iter().all(|s| {
+        !negative_controls.contains(&s.fn_name.as_str())
+            && !masked_cases.iter().any(|(m, _, _)| *m == s.fn_name)
+    }));
+
+    // (b) The non-macro mismatches stay kernel-confirmed divergences, whether
+    // or not the panic unwinds through a cleanup block. Anneal attributes each
+    // to the overflowing `x + 250u8` in the helper, a single-line span that
+    // does not contain Miri's call-site position.
+    for name in negative_controls {
+        let neg = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for {name}"));
+        assert!(
+            matches!(
+                neg.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{name}: unexpected verdict: {:?}",
+            neg.verdict
+        );
+        assert!(neg.kernel_confirmed, "{name}");
+        let AnnealOutcome::Panic {
+            span: Some(neg_span),
+        } = &neg.anneal
+        else {
+            panic!(
+                "{name}: expected an Anneal panic with a span, got {:?}",
+                neg.anneal
+            );
+        };
+        assert_eq!(
+            neg_span.file, "src/lib.rs",
+            "{name}: unexpected span {neg_span:?}"
+        );
+        assert_eq!(
+            neg_span.start_line, neg_span.end_line,
+            "{name}: Anneal must report the overflow, not a whole-function span: {neg_span:?}"
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name == name)
+            .unwrap_or_else(|| panic!("{name}: missing finding bundle"));
+        assert_eq!(finding.divergence_class, "panic_site_mismatch", "{name}");
+        assert!(finding.kernel_confirmed, "{name}");
+    }
+    // (c) A panic that Anneal raises in another callable body (whether a
+    // sibling top-level helper or a nested `fn` inside the candidate) stays a
+    // kernel-confirmed divergence even though its span lies in
+    // `library/core/src/panic.rs` and its message matches Miri's: the
+    // kernel-checked frame names the helper/nested `fn`, not the outer body.
+    for (masked, helper_frame, expected_msg) in masked_cases {
+        let masked_item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == masked)
+            .unwrap_or_else(|| panic!("missing item report for {masked}"));
+        assert!(
+            matches!(
+                masked_item.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+            ),
+            "{masked}: unexpected verdict {:?}; if Anneal now reads promoted \
+             constants correctly, the candidate agrees and needs another divergence",
+            masked_item.verdict
+        );
+        assert!(masked_item.kernel_confirmed, "{masked}");
+        let MiriOutcome::Panic {
+            message: masked_miri_message,
+            ..
+        } = &masked_item.miri
+        else {
+            panic!(
+                "{masked}: expected a Miri panic, got {:?}",
+                masked_item.miri
+            );
+        };
+        assert_eq!(masked_miri_message, expected_msg, "{masked}");
+        let AnnealOutcome::Panic {
+            span: Some(masked_span),
+        } = &masked_item.anneal
+        else {
+            panic!(
+                "{masked}: expected an Anneal panic, got {:?}",
+                masked_item.anneal
+            );
+        };
+        assert!(
+            masked_span.file.ends_with("/library/core/src/panic.rs"),
+            "{masked}: {masked_span:?}"
+        );
+        let masked_finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name == masked)
+            .unwrap_or_else(|| panic!("finding for {masked}"));
+        assert!(masked_finding.kernel_confirmed, "{masked}");
+        assert!(
+            masked_finding
+                .kernel_confirm_theorems
+                .contains(&format!("some \"{helper_frame}\" := by")),
+            "{}",
+            masked_finding.kernel_confirm_theorems
+        );
+        assert!(
+            masked_finding
+                .kernel_confirm_theorems
+                .contains(&format!("-- Anneal's panic message: {expected_msg:?}")),
+            "{}",
+            masked_finding.kernel_confirm_theorems
+        );
+    }
+
+    assert_eq!(
+        report
+            .divergence_classes
+            .get("panic_site_mismatch")
+            .copied(),
+        Some(4)
+    );
+
+    assert_eq!(report.findings.len(), 4);
+    let f = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "neg_ctrl_track_caller_overflow__b0_c3")
+        .expect("finding for the track_caller candidate");
+    assert_eq!(f.fn_name, "neg_ctrl_track_caller_overflow__b0_c3");
+    assert_eq!(f.divergence_class, "panic_site_mismatch");
+    assert!(f.kernel_confirmed);
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("theorem confirm_tag_neg_ctrl_track_caller_overflow__b0_c3 :")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("theorem confirm_probe_neg_ctrl_track_caller_overflow__b0_c3 :")
+    );
+    assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
+    // The snippet is self-contained: `linkedCallees` names the synthetic
+    // `core::fmt::Arguments` stub, and `confirm_probe_*` evaluates
+    // `probeMirDiffExecBounded`, so their definitions are included. The overflow
+    // panic carries no recoverable message, so no message theorem is emitted.
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def activeSpan (body : CapturedMir) (st : MirExecState) : String :=")
+    );
+    assert!(f.kernel_confirm_theorems.contains("def unwindOrigin\n"));
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def probeMirDiffExecBounded\n")
+    );
+    assert!(
+        !f.kernel_confirm_theorems
+            .contains("theorem confirm_message_neg_ctrl_track_caller_overflow__b0_c3 :")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("def linkedCallees : List CapturedMir :=")
+    );
+    assert!(
+        f.kernel_confirm_theorems
+            .contains("Mir.MiriDiffCorpus.track_caller_overflow_helper.body")
+    );
+    let repro_path = f.repro_path.as_ref().expect("repro.rs written");
+    let bundle_dir = repro_path.parent().expect("bundle dir");
+    let summary_md = fs::read_to_string(bundle_dir.join("SUMMARY.md")).expect("read SUMMARY.md");
+    assert!(summary_md.contains("def fmtArgumentsCtorStub (defPath : String) : CapturedMir :="));
 }
 
 /// Real `lake` binary used behind the logging wrappers below (the pinned
@@ -748,4 +1555,624 @@ fn linked_oracle_runs_lake_build_and_lake_env_lean_with_the_same_lake_binary() {
         "--reproduce failed with ANNEAL_LAKE:\n{}",
         String::from_utf8_lossy(&out2.stderr)
     );
+}
+
+/// Run `mutator` in `mode` over a closed `u32` seed named after `id`, under
+/// the first `DetRng` seed in `0..512` whose output contains `marker`, then
+/// run each mutator in `follow_ups` in `Pass` mode, so that their in-place
+/// perturbers act on the injected template.
+fn template_candidate(
+    id: usize,
+    mutator: &dyn MiriAstMutator,
+    mode: MutationMode,
+    marker: &str,
+    follow_ups: &[&dyn MiriAstMutator],
+) -> GeneratedMiriCandidate {
+    let fn_name = format!("ep2_template__b0_c{id}");
+    let seed = format!("pub fn {fn_name}() -> u32 {{\n    let base: u32 = 6u32;\n    base\n}}\n");
+    for s in 0..512u64 {
+        let mut file = syn::parse_file(&seed).expect("parse template seed");
+        let mut rng = DetRng::new(0xE2_0000 ^ s);
+        let mut locals = Vec::new();
+        mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals);
+        if !prettyplease::unparse(&file).contains(marker) {
+            continue;
+        }
+        let mut applied = vec![mutator.name().to_string()];
+        for follow_up in follow_ups {
+            follow_up.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+            applied.push(follow_up.name().to_string());
+        }
+        let fn_source = prettyplease::unparse(&file);
+        let mut cand = handwritten_candidate(id, "ep2_template", &fn_name, "", &fn_source);
+        cand.applied_mutators = applied;
+        return cand;
+    }
+    panic!(
+        "{} never emitted `{marker}` in {mode:?} mode",
+        mutator.name()
+    );
+}
+
+#[test]
+fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
+    let dir = unique_temp_dir("ep2_templates");
+    let root = repo_root();
+
+    // One candidate per Episode 2 template. The `Pass` and `PerturbAst`
+    // templates return normally under Miri and the `Ub` templates fault.
+    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 16] = [
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<u32, NonZeroU32>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "transmute::<u32, Option<NonZeroU32>>(__niche_zero)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "__niche_ob: Option<bool>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "&raw mut __meters.0",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<[u32; 2], SingleC>([0u32,",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::PerturbAst,
+            "__overlay: OverlayU32",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<u32, NonZeroMeters>",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Pass,
+            "__proj_single_ref: &mut SingleC",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::PerturbAst,
+            "&raw mut __proj_overlay.bytes",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Pass,
+            "__proj_slot: Uninit<[u32; 2]>",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::PerturbAst,
+            "&raw const __proj_nzm.0",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "&raw mut (*__rr_p).b",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "&raw const (*__rr_shr).a",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Pass,
+            "let __rr_sc_p: *mut u32 = match &mut __rr_sc",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::PerturbAst,
+            "&raw mut *__rr_mut",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::PerturbAst,
+            "&raw mut (*__rr_fm).b",
+        ),
+    ];
+    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 13] = [
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<u32, NonZeroU32>(__nz_zero)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<[u32; 2], SingleC>(__bad_single_raw)",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "__part_slot: Uninit<[u8; 4]>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<u32, NonZeroMeters>(__nzm_zero)",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "&raw const __dead_pair.b",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "__dead_inner as *const u32",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "__proj_half: Uninit<[u32; 2]>",
+        ),
+        (
+            &PlaceProjectionWrapper,
+            MutationMode::Ub,
+            "&raw const __dead_ov.word",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw mut *__rr_y",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw const *__rr_frozen",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw mut (*__rr_m2).b",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "&raw const (*__rr_s).a",
+        ),
+        (
+            &TreeBorrowsRetagInterleaver,
+            MutationMode::Ub,
+            "*__rr_sc_m = SingleC::Only",
+        ),
+    ];
+    let mut candidates = Vec::new();
+    for (mutator, mode, marker) in pass_cases.into_iter().chain(ub_cases) {
+        let id = candidates.len();
+        candidates.push(template_candidate(id, mutator, mode, marker, &[]));
+    }
+    // Templates followed by two `Pass` runs of the perturbing mutators
+    // (statement reordering, field/index swaps, transmute-literal and operator
+    // rewrites), each of which also appends its own `Pass` template. Like
+    // `generate_miri_corpus_batch`, which applies at most three mutator passes,
+    // this keeps each candidate within `MIRI_DIFFTEST_CANDIDATE_FUEL` steps.
+    let tb: &dyn MiriAstMutator = &TreeBorrowsRetagInterleaver;
+    let pp: &dyn MiriAstMutator = &PlaceProjectionWrapper;
+    let bv: &dyn MiriAstMutator = &BitValidityTransmuteMutator;
+    let arith: &dyn MiriAstMutator = &ArithmeticCastMutator;
+    type PerturbedCase<'a> = (
+        &'a dyn MiriAstMutator,
+        MutationMode,
+        &'a str,
+        [&'a dyn MiriAstMutator; 2],
+    );
+    let perturbed_cases: [PerturbedCase<'_>; 7] = [
+        (bv, MutationMode::Pass, "__single: SingleC", [tb, pp]),
+        (
+            bv,
+            MutationMode::Ub,
+            "__part_slot: Uninit<[u8; 4]>",
+            [pp, arith],
+        ),
+        (
+            pp,
+            MutationMode::PerturbAst,
+            "__proj_single_ref: &mut SingleC",
+            [bv, tb],
+        ),
+        (
+            pp,
+            MutationMode::Ub,
+            "&raw const __dead_pair.b",
+            [arith, bv],
+        ),
+        (tb, MutationMode::Pass, "&raw mut (*__rr_p).b", [pp, arith]),
+        (tb, MutationMode::Ub, "&raw mut *__rr_y", [tb, bv]),
+        (
+            tb,
+            MutationMode::Ub,
+            "let __tb_act: &mut u32 = unsafe { &mut *__tb_root };",
+            [tb, bv],
+        ),
+    ];
+    for (mutator, mode, marker, follow_ups) in perturbed_cases {
+        let id = candidates.len();
+        candidates.push(template_candidate(id, mutator, mode, marker, &follow_ups));
+    }
+    // Closed multi-parameter Episode 2 functions exercising parameter seeding
+    // (`Option<bool>`, `Option<ColorTag>`, `Option<NonZeroU32>`, `SingleC`,
+    // `MetersU32`, `NonZeroMeters`, `OverlayU32`, `[u8; 4]`, `[u32; 2]`,
+    // `[u32; 1]`, slice/`str` references `&[u32]` / `&mut [u8]` / `&str` /
+    // `&mut str`, and fat raw pointers `*const [u32]` / `*mut [u8]` /
+    // `*const str` / `*mut str`), reference-returning signatures
+    // (`-> &'a mut u32`), body `'a` annotations, early `return`s,
+    // deref-borrowed field projections, and local shadowing through real
+    // `rustc` + Miri + Anneal evaluation.
+    let param_ep2_seed = "\
+pub fn param_ep2_live<'a, 'b>(
+    s: SingleC,
+    MetersU32(m_inner): MetersU32,
+    nm: NonZeroMeters,
+    o: OverlayU32,
+    r_pair: &'a mut PairU32,
+    p_sc: *mut SingleC,
+    s_slice: &'a [u32],
+    s_mut_bytes: &'b mut [u8],
+    p_slice: *const [u32],
+    p_mut_bytes: *mut [u8],
+    s_str: &'a str,
+    s_mut_str: &'b mut str,
+    p_str: *const str,
+    p_mut_str: *mut str,
+    one_elem: [u32; 1],
+    (tup_a, tup_b): (u32, u8),
+    u_word: Uninit<u32>,
+    ob: Option<bool>,
+    oc: core::option::Option<ColorTag>,
+    onz: core::option::Option<NonZeroU32>,
+    bytes: [u8; 4],
+    words: [u32; 2],
+) -> u32
+where
+    'a: 'b,
+{
+    let shadowed: u32 = 1u32;
+    let (shadowed, _): (PairU32, u32) = (PairU32 { a: words[0], b: words[1] }, tup_a);
+    let rb_ref: &mut u32 = &mut (*r_pair).b;
+    let r_pair_a: u32 = r_pair.a;
+    *rb_ref = tup_b as u32;
+    s_mut_bytes[0] ^= 1u8;
+    let _ = (p_slice, p_mut_bytes, s_str, s_mut_str, p_str, p_mut_str);
+    let mut borrowed = PairU32 { a: r_pair_a, b: r_pair.b };
+    let rb: &mut u32 = &mut (borrowed.b);
+    let keep_a: u32 = (borrowed).a;
+    *rb = s_mut_bytes[0] as u32;
+    let sc_v: u32 = match s {
+        SingleC::Only(v) => v,
+    };
+    let p_sc_v: u32 = unsafe {
+        match &*p_sc {
+            SingleC::Only(v) => *v,
+        }
+    };
+    let nzm_v: u32 = unsafe { transmute::<NonZeroU32, u32>(nm.0) };
+    let ob_v: u32 = match ob {
+        Some(true) => 1u32,
+        Some(false) => 2u32,
+        None => 3u32,
+    };
+    let oc_v: u32 = match oc {
+        Some(ColorTag::Red) => 4u32,
+        Some(ColorTag::Green) => 8u32,
+        Some(ColorTag::Blue) => 12u32,
+        None => 16u32,
+    };
+    let onz_v: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(onz) };
+    let ov_v: u32 = unsafe { o.word ^ u_word.value };
+    m_inner ^ sc_v ^ p_sc_v ^ nzm_v ^ ob_v ^ oc_v ^ onz_v ^ ov_v ^ keep_a ^ s_slice[0] ^ one_elem[0] ^ (bytes[0] as u32) ^ shadowed.a
+}
+";
+    let ref_ret_ep2_seed = "\
+pub fn ref_ret_ep2_live<'a>(
+    x: &'a mut u32,
+    y: &'a mut u32,
+    s_static: &'static u32,
+    flag: bool,
+) -> &'a mut u32 {
+    let chosen: &'a mut u32 = if flag {
+        *x ^= 3u32 ^ *s_static;
+        return x;
+    } else {
+        *y ^= 5u32;
+        y
+    };
+    chosen
+}
+";
+    // A raw-pointer return sinks into a local (Miri and Anneal cannot compare
+    // host addresses), and early `return`s in a scalar-returning function
+    // lower to `break '__anneal_ret` while the `&'static [u8]` parameter is
+    // backed by a stack array.
+    let ptr_ret_ep2_seed = "\
+pub fn ptr_ret_ep2_live(p_static: &'static u32, flag: bool) -> *const u32 {
+    if flag {
+        return p_static as *const u32;
+    }
+    &raw const *p_static
+}
+";
+    let early_ret_ep2_seed = "\
+pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
+    if flag {
+        return (b_static[0] as u32) ^ 1u32;
+    }
+    (b_static[1] as u32) ^ 7u32
+}
+";
+    let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);
+    assert_eq!(param_batch.len(), 2);
+    param_batch.extend(generate_miri_batch(&[ref_ret_ep2_seed], 2, 0xE2A3_0001));
+    param_batch.extend(generate_miri_batch(&[ptr_ret_ep2_seed], 2, 0xE2A4_0001));
+    param_batch.extend(generate_miri_batch(&[early_ret_ep2_seed], 2, 0xE2A4_0002));
+    assert_eq!(param_batch.len(), 8);
+    for mut cand in param_batch.drain(..) {
+        let id = candidates.len();
+        let old_fn_name = cand.fn_name;
+        let new_fn_name = format!("param_ep2_live__b0_c{id}");
+        cand.id = id;
+        cand.fn_source = cand.fn_source.replacen(
+            &format!("pub fn {old_fn_name}"),
+            &format!("pub fn {new_fn_name}"),
+            1,
+        );
+        cand.fn_name = new_fn_name;
+        cand.source = build_standalone_candidate_source(&cand.fn_source);
+        candidates.push(cand);
+    }
+    let template_count = candidates.len();
+
+    // Negative controls: constructs that the templates avoid because Anneal's
+    // frozen `trusted/` semantics diverge from Miri on them. Each must stay a
+    // kernel-confirmed divergence; once `trusted/` fixes one, this test fails
+    // so that the matching template restriction can be lifted.
+    let negative_controls: [(&str, &str, &str); 7] = [
+        (
+            "false_positive_ub",
+            "neg_ctrl_option_nonzero_some_transmute",
+            "-> u32 {
+    let o: Option<NonZeroU32> = unsafe { transmute::<u32, Option<NonZeroU32>>(0x41u32) };
+    match o {
+        Some(_) => 1u32,
+        None => 2u32,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_option_bool_none_transmute",
+            "-> u32 {
+    let o: Option<bool> = unsafe { transmute::<u8, Option<bool>>(2u8) };
+    match o {
+        Some(_) => 1u32,
+        None => 2u32,
+    }
+}",
+        ),
+        (
+            "missed_ub",
+            "neg_ctrl_single_c_nonzero_payload_transmute_zero",
+            "-> u32 {
+    #[repr(C)]
+    enum SingleCNonZero {
+        Only(NonZeroU32),
+    }
+    let s: SingleCNonZero = unsafe { transmute::<[u32; 2], SingleCNonZero>([0u32, 0u32]) };
+    match s {
+        SingleCNonZero::Only(v) => unsafe { transmute::<NonZeroU32, u32>(v) },
+    }
+}",
+        ),
+        (
+            "missed_ub",
+            "neg_ctrl_nonzero_ptr_write_zero",
+            "-> u32 {
+    let mut n: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(5u32) };
+    let p: *mut u32 = (&raw mut n) as *mut u32;
+    unsafe {
+        *p = 0u32;
+    }
+    unsafe { transmute::<NonZeroU32, u32>(n) }
+}",
+        ),
+        (
+            "ub_location_mismatch",
+            "neg_ctrl_single_c_ptr_write_bad_tag",
+            "-> u32 {
+    let mut s: SingleC = SingleC::Only(4u32);
+    let p: *mut u32 = (&raw mut s) as *mut u32;
+    unsafe {
+        *p = 2u32;
+    }
+    let t: SingleC = s;
+    match t {
+        SingleC::Only(v) => v,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_single_c_ptr_write_payload",
+            "-> u32 {
+    let mut s: SingleC = SingleC::Only(4u32);
+    let p: *mut [u32; 2] = (&raw mut s) as *mut [u32; 2];
+    unsafe {
+        (*p)[1] = 6u32;
+    }
+    let t: SingleC = s;
+    match t {
+        SingleC::Only(v) => v,
+    }
+}",
+        ),
+        (
+            "false_positive_ub",
+            "neg_ctrl_raw_field_ptr_then_sibling_write",
+            "-> u32 {
+    let mut pair: PairU32 = PairU32 { a: 1u32, b: 2u32 };
+    let m: &mut PairU32 = &mut pair;
+    let rb: *mut u32 = &raw mut (*m).b;
+    let m2: &mut PairU32 = &mut *m;
+    m2.b = 7u32;
+    unsafe {
+        *rb = 9u32;
+    }
+    pair.b
+}",
+        ),
+    ];
+    for (_, name, body) in negative_controls {
+        let id = candidates.len();
+        let fn_name = format!("{name}__b0_c{id}");
+        let fn_source = format!("pub fn {fn_name}() {body}\n");
+        candidates.push(handwritten_candidate(
+            id,
+            "ep2_negative_control",
+            &fn_name,
+            "BitValidityTransmuteMutator",
+            &fn_source,
+        ));
+    }
+    let total = candidates.len();
+
+    let findings_dir = dir.join("findings_ep2");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0xE2_0001,
+        &[candidates],
+        total,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate Episode 2 template batch");
+
+    assert_eq!(report.total_candidates, total);
+    assert_eq!(report.compiled_candidates, total, "{report:#?}");
+    assert_eq!(report.compared_candidates, total, "{report:#?}");
+    assert_eq!(
+        report.not_compared_count, 0,
+        "{:?}",
+        report.not_compared_reasons
+    );
+    assert!(
+        report.unmodeled_external_calls.is_empty(),
+        "{:?}",
+        report.unmodeled_external_calls
+    );
+    for outcome in ["external_call", "unsupported", "out_of_fuel", "error"] {
+        assert_eq!(
+            report.anneal_outcomes.get(outcome).copied().unwrap_or(0),
+            0,
+            "unexpected Anneal `{outcome}` outcomes: {:?}",
+            report.anneal_outcomes
+        );
+    }
+    assert_eq!(report.agree_count, template_count, "{:#?}", report.findings);
+    assert_eq!(report.diverge_count, negative_controls.len());
+    assert_eq!(report.kernel_confirmed_divergences, negative_controls.len());
+    // Verify per-item Miri outcomes so a `Pass` template faulting and a `Ub`
+    // template losing its UB can never cancel out in aggregate counts:
+    // - `0..16`: `pass_cases` (`PassScalar`)
+    // - `16..29`: `ub_cases` (`Ub`)
+    // - `29..36`: `perturbed_cases` (`[Pass, Ub, Pass, Ub, Pass, Ub, Ub]`)
+    let expected_perturbed_ub = [false, true, false, true, false, true, true];
+    for id in 0..36usize {
+        let fn_name = format!("ep2_template__b0_c{id}");
+        let item = report
+            .item_reports
+            .iter()
+            .find(|r| r.name == fn_name)
+            .unwrap_or_else(|| panic!("missing item report for `{fn_name}`"));
+        let expect_ub = if id < 16 {
+            false
+        } else if id < 29 {
+            true
+        } else {
+            expected_perturbed_ub[id - 29]
+        };
+        if expect_ub {
+            assert!(
+                matches!(item.miri, MiriOutcome::Ub { .. }),
+                "expected Miri UB for `{fn_name}`, got {:?}",
+                item.miri
+            );
+        } else {
+            assert!(
+                matches!(item.miri, MiriOutcome::PassScalar { .. }),
+                "expected Miri PassScalar for `{fn_name}`, got {:?}",
+                item.miri
+            );
+        }
+    }
+    let miri_pass = report.miri_verdicts.get("pass").copied().unwrap_or(0);
+    let miri_panic = report.miri_verdicts.get("panic").copied().unwrap_or(0);
+    let miri_ub = report.miri_verdicts.get("ub").copied().unwrap_or(0);
+    assert!(miri_pass >= 16 + 3 + 4, "{:?}", report.miri_verdicts);
+    assert!(miri_ub >= 13 + 4 + 3, "{:?}", report.miri_verdicts);
+    assert_eq!(
+        miri_pass + miri_panic + miri_ub,
+        total,
+        "{:?}",
+        report.miri_verdicts
+    );
+
+    let mut expected_classes = std::collections::BTreeMap::new();
+    for (class, name, _) in negative_controls {
+        *expected_classes.entry(class.to_string()).or_insert(0usize) += 1;
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.fn_name.starts_with(name))
+            .unwrap_or_else(|| panic!("no finding for negative control `{name}`"));
+        assert_eq!(finding.divergence_class, class, "{finding:#?}");
+        assert!(finding.kernel_confirmed, "{finding:#?}");
+        assert!(
+            finding.kernel_confirm_theorems.contains(":= by\n  rfl"),
+            "{}",
+            finding.kernel_confirm_theorems
+        );
+    }
+    let observed_classes: std::collections::BTreeMap<String, usize> = report
+        .divergence_classes
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(class, count)| (class.clone(), *count))
+        .collect();
+    assert_eq!(observed_classes, expected_classes);
+
+    // Verify standalone `repro.rs` round-tripping on an Episode 2 finding
+    // bundle exercising `MIRI_CORPUS_MODULE_PREAMBLE` types (`NonZeroU32` /
+    // `SingleCNonZero`).
+    let repro_finding = report
+        .findings
+        .iter()
+        .find(|f| {
+            f.fn_name
+                .starts_with("neg_ctrl_single_c_nonzero_payload_transmute_zero")
+        })
+        .expect("SingleCNonZero negative control finding");
+    let repro_path = repro_finding.repro_path.as_ref().expect("repro.rs written");
+    let repro_report = reproduce_miri_finding(repro_path, Some(&root))
+        .expect("reproduce Episode 2 finding bundle standalone");
+    assert!(
+        matches!(
+            repro_report.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::MissedUb { .. })
+        ),
+        "{repro_report:#?}"
+    );
+    assert!(repro_report.kernel_confirmed);
 }

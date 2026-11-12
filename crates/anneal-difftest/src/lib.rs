@@ -51,10 +51,12 @@ pub use itree_eval::{
     render_itree_finding_bundle_json, reproduce_itree_finding, resolve_itree_lean_jobs,
 };
 pub use miri_eval::{
-    DIVERGENCE_CLASS_NAMES, MIRI_MUTATOR_NAMES, MiriCampaignEvalReport, MiriFindingBundle,
-    NOT_COMPARED_REASON_NAMES, compile_candidates, compile_rust_snippet, divergence_class_slug,
-    evaluate_miri_batches, json_escape, render_eval_report_json, render_eval_report_markdown,
-    render_finding_bundle_json, reproduce_miri_finding, resolve_rustc_bin,
+    DIVERGENCE_CLASS_NAMES, FMT_ARGUMENTS_CTOR_DEF_PATHS, FMT_ARGUMENTS_CTOR_STUB_LEAN,
+    MIRI_MUTATOR_NAMES, MiriCampaignEvalReport, MiriFindingBundle, MiriReconciledPanicSite,
+    NOT_COMPARED_REASON_NAMES, StagedLibSource, compare_difftest_miri_and_anneal,
+    compile_candidates, compile_rust_snippet, divergence_class_slug, evaluate_miri_batches,
+    json_escape, render_eval_report_json, render_eval_report_markdown, render_finding_bundle_json,
+    reproduce_miri_finding, resolve_rustc_bin,
 };
 pub use mutators_itree::{
     BranchLoopWeaver, CallBoundaryOutliner, ExtOracleInjector, GeneratedItreeCandidate,
