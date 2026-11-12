@@ -6515,3 +6515,535 @@ fn test_a3_external_call_handlers_identify_the_callee_and_frame_of_every_unlinke
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pass B4: Dead caller-local provenance isolation and returned caller-exposed provenance
+// restoration across multi-frame CallTable chains
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b4_dead_caller_local_provenance_is_never_exposed_to_linked_callees() {
+    for pw in PWS {
+        let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
+        let raw_arr = raw(arr_ty.clone(), Mutability::Not);
+        let raw_u32 = raw(u32_ty(), Mutability::Not);
+
+        // `offset_inbounds(addr)`: casts `addr as *const u32` and runs in-bounds `BinOp::Offset(1)`.
+        let offset_inbounds = mk(
+            vec![raw_u32.clone(), usize_ty(), raw_u32.clone()],
+            vec![blk(
+                vec![
+                    live(2),
+                    assign(
+                        2,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Offset, cp(2), cst(1, isize_ty())),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+
+        // `wrapping_offset_dead(addr)`: casts `addr as *const u32` and runs wrapping `ArithOffset(1)`.
+        let wrapping_offset_dead = mk(
+            vec![raw_u32.clone(), usize_ty(), raw_u32.clone()],
+            vec![
+                blk(
+                    vec![
+                        live(2),
+                        assign(
+                            2,
+                            Rvalue::Cast(
+                                CastKind::PointerWithExposedProvenance,
+                                cp(1),
+                                raw_u32.clone(),
+                            ),
+                        ),
+                    ],
+                    call(
+                        intrinsic(IntrinsicOp::ArithOffset),
+                        vec![cp(2), cst(1, isize_ty())],
+                        0,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+
+        let make_caller = |callee_name: &str| {
+            mk(
+                vec![raw_u32.clone(), arr_ty.clone(), raw_arr.clone(), usize_ty()],
+                vec![
+                    blk(
+                        vec![
+                            live(1),
+                            live(2),
+                            live(3),
+                            assign(
+                                1,
+                                Rvalue::Aggregate(
+                                    AggregateKind::Array(u32_ty()),
+                                    vec![cst(10, u32_ty()), cst(20, u32_ty())],
+                                ),
+                            ),
+                            assign(2, Rvalue::RawPtr(Mutability::Not, place(1))),
+                            assign(
+                                3,
+                                Rvalue::Cast(CastKind::PointerExposeProvenance, cp(2), usize_ty()),
+                            ),
+                            Statement::StorageDead(Local(1)),
+                        ],
+                        call(
+                            callee(callee_name),
+                            vec![cp(3)],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            )
+        };
+
+        let table = CallTable::new()
+            .with_callee("offset_inbounds", 1, lower(&offset_inbounds, pw))
+            .with_callee("wrapping_offset_dead", 1, lower(&wrapping_offset_dead, pw));
+
+        // `_1` is already `StorageDead` before calling `offset_inbounds`, so `BinOp::Offset(1)`
+        // inside the callee must fault with `PointerArithmeticWithoutProvenance` UB, never succeed
+        // via a leaked `CALLER_EXPOSED_ALLOC_ID`.
+        let err = eval_lowered_body_cfg_with_call_table(
+            &lower(&make_caller("offset_inbounds"), pw),
+            &[],
+            8,
+            &table,
+        );
+        match err {
+            Err(CfgEvalError::InCallee { call_stack, error }) => {
+                assert_eq!(
+                    call_stack,
+                    vec![CallSite {
+                        bb: 0,
+                        callee: CalleeSymbol::new("offset_inbounds"),
+                    }]
+                );
+                assert!(
+                    matches!(
+                        *error,
+                        CfgEvalError::Statement {
+                            bb: 0,
+                            index: 2,
+                            error: RvalueEvalError::PointerArithmeticWithoutProvenance { .. },
+                        }
+                    ),
+                    "expected PointerArithmeticWithoutProvenance, got {error:?}"
+                );
+            }
+            other => panic!("expected InCallee PointerArithmeticWithoutProvenance, got {other:?}"),
+        }
+
+        // Wrapping `ArithOffset` on the dangling provenance-free pointer remains defined (`0x2004`).
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&make_caller("wrapping_offset_dead"), pw),
+                &[],
+                8,
+                &table,
+            )),
+            MirValue::Ptr {
+                ptr: PointerValue::without_provenance(0x2004),
+                ty: raw_u32,
+            }
+        );
+    }
+}
+
+#[test]
+fn test_b4_returned_caller_exposed_pointers_restore_caller_provenance_across_multi_frame_chains() {
+    for pw in PWS {
+        let triple_u32 = Ty::Tuple(vec![u32_ty(), u32_ty(), u32_ty()]);
+        let raw_triple = raw(triple_u32.clone(), Mutability::Not);
+        let raw_u32 = raw(u32_ty(), Mutability::Not);
+        let wrapped_ptr = Ty::Tuple(vec![raw_u32.clone()]);
+
+        // 1. Two-deep chain `root -> mid -> leaf`: `root` exposes `_1 = (10, 20, 30)`; `leaf`
+        //    reconstructs `*const u32` and offsets `+1`; `mid` offsets `+1` and wraps the pointer
+        //    in a tuple `(ptr,)`; `root` unwraps and dereferences `*ptr` to read `30u32`.
+        let leaf = mk(
+            vec![raw_u32.clone(), usize_ty(), raw_u32.clone()],
+            vec![blk(
+                vec![
+                    live(2),
+                    assign(
+                        2,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_u32.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Offset, cp(2), cst(1, isize_ty())),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+        let mid = mk(
+            vec![
+                wrapped_ptr.clone(),
+                usize_ty(),
+                raw_u32.clone(),
+                raw_u32.clone(),
+            ],
+            vec![
+                blk(
+                    vec![live(2), live(3)],
+                    call(
+                        callee("leaf"),
+                        vec![cp(1)],
+                        2,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![
+                        assign(
+                            3,
+                            Rvalue::BinaryOp(BinOp::Offset, cp(2), cst(1, isize_ty())),
+                        ),
+                        assign(0, Rvalue::Aggregate(AggregateKind::Tuple, vec![cp(3)])),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        let root_deref = mk(
+            vec![
+                u32_ty(),
+                triple_u32,
+                raw_triple,
+                usize_ty(),
+                wrapped_ptr,
+                raw_u32.clone(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        assign(
+                            1,
+                            Rvalue::Aggregate(
+                                AggregateKind::Tuple,
+                                vec![cst(10, u32_ty()), cst(20, u32_ty()), cst(30, u32_ty())],
+                            ),
+                        ),
+                        assign(2, Rvalue::RawPtr(Mutability::Not, place(1))),
+                        assign(
+                            3,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(2), usize_ty()),
+                        ),
+                    ],
+                    call(
+                        callee("mid"),
+                        vec![cp(3)],
+                        4,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![
+                        assign(
+                            5,
+                            Rvalue::Use(Operand::Copy(Place::with_projection(
+                                4,
+                                vec![ProjectionElem::Field(0, raw_u32)],
+                            ))),
+                        ),
+                        assign(
+                            0,
+                            Rvalue::Use(Operand::Copy(Place::with_projection(
+                                5,
+                                vec![ProjectionElem::Deref],
+                            ))),
+                        ),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+        );
+        let table = CallTable::new()
+            .with_callee("leaf", 1, lower(&leaf, pw))
+            .with_callee("mid", 1, lower(&mid, pw));
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&root_deref, pw),
+                &[],
+                12,
+                &table,
+            )),
+            u32v(30)
+        );
+
+        // 2. ZST `write_bytes` and `copy_nonoverlapping` in the caller through a callee-returned
+        //    pointer: `write_bytes` initializes the caller's uninitialized `_1: ()`, and
+        //    `copy_nonoverlapping` from uninitialized `_1: ()` into initialized `_2: ()`
+        //    deinitializes `_2` so reading `_2` faults with `UninitializedLocal(Local(2))`.
+        let raw_const_unit = raw(unit(), Mutability::Not);
+        let raw_mut_unit = raw(unit(), Mutability::Mut);
+        let to_mut_unit = mk(
+            vec![raw_mut_unit.clone(), usize_ty()],
+            vec![blk(
+                vec![assign(
+                    0,
+                    Rvalue::Cast(
+                        CastKind::PointerWithExposedProvenance,
+                        cp(1),
+                        raw_mut_unit.clone(),
+                    ),
+                )],
+                Terminator::Return,
+            )],
+        );
+        let to_const_unit = mk(
+            vec![raw_const_unit.clone(), usize_ty()],
+            vec![blk(
+                vec![assign(
+                    0,
+                    Rvalue::Cast(
+                        CastKind::PointerWithExposedProvenance,
+                        cp(1),
+                        raw_const_unit.clone(),
+                    ),
+                )],
+                Terminator::Return,
+            )],
+        );
+        let zst_init_via_callee = mk(
+            vec![
+                unit(),
+                unit(),
+                raw_mut_unit.clone(),
+                usize_ty(),
+                raw_mut_unit.clone(),
+                unit(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        assign(2, Rvalue::RawPtr(Mutability::Mut, place(1))),
+                        assign(
+                            3,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(2), usize_ty()),
+                        ),
+                    ],
+                    call(
+                        callee("to_mut_unit"),
+                        vec![cp(3)],
+                        4,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![],
+                    call(
+                        intrinsic(IntrinsicOp::WriteBytes),
+                        vec![cp(4), cst(0, u8_ty()), cst(1, usize_ty())],
+                        5,
+                        Some(2),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(1)))], Terminator::Return),
+            ],
+        );
+        let zst_copy_uninit_via_callee = mk(
+            vec![
+                unit(),
+                unit(),
+                unit(),
+                raw_const_unit.clone(),
+                raw_mut_unit.clone(),
+                usize_ty(),
+                usize_ty(),
+                raw_const_unit,
+                raw_mut_unit,
+                unit(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(1),
+                        live(2),
+                        live(3),
+                        live(4),
+                        live(5),
+                        live(6),
+                        live(7),
+                        live(8),
+                        live(9),
+                        assign(2, Rvalue::Use(Operand::Constant(Constant::Unit))),
+                        assign(3, Rvalue::RawPtr(Mutability::Not, place(1))),
+                        assign(4, Rvalue::RawPtr(Mutability::Mut, place(2))),
+                        assign(
+                            5,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(3), usize_ty()),
+                        ),
+                        assign(
+                            6,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(4), usize_ty()),
+                        ),
+                    ],
+                    call(
+                        callee("to_const_unit"),
+                        vec![cp(5)],
+                        7,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![],
+                    call(
+                        callee("to_mut_unit"),
+                        vec![cp(6)],
+                        8,
+                        Some(2),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![],
+                    call(
+                        intrinsic(IntrinsicOp::CopyNonOverlapping),
+                        vec![cp(7), cp(8), cst(1, usize_ty())],
+                        9,
+                        Some(3),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(2)))], Terminator::Return),
+            ],
+        );
+        let zst_table = CallTable::new()
+            .with_callee("to_mut_unit", 1, lower(&to_mut_unit, pw))
+            .with_callee("to_const_unit", 1, lower(&to_const_unit, pw));
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&zst_init_via_callee, pw),
+                &[],
+                12,
+                &zst_table,
+            )),
+            MirValue::Unit
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&zst_copy_uninit_via_callee, pw),
+                &[],
+                12,
+                &zst_table,
+            ),
+            Err(CfgEvalError::Statement {
+                bb: 3,
+                index: 0,
+                error: RvalueEvalError::UninitializedLocal(Local(2)),
+            })
+        );
+
+        // 3. Shielded external provenance in `(caller_locals + 1)..=callee_locals`: `root` has 3
+        //    locals (`1..=3`), exposes external `alloc_id = 4` (`tag = 7`), and calls `wide_callee`
+        //    with 6 locals (`1..=6`); the returned pointer recovers `Provenance { alloc_id: 4, tag: 7 }`.
+        let raw_u8 = raw(u8_ty(), Mutability::Not);
+        let wide_callee = mk(
+            vec![
+                raw_u8.clone(),
+                usize_ty(),
+                raw_u8.clone(),
+                u32_ty(),
+                u32_ty(),
+                u32_ty(),
+            ],
+            vec![blk(
+                vec![
+                    live(2),
+                    assign(
+                        2,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw_u8.clone(),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Offset, cp(2), cst(5, isize_ty())),
+                    ),
+                ],
+                Terminator::Return,
+            )],
+        );
+        let narrow_caller = mk(
+            vec![raw_u8.clone(), raw_u8.clone(), usize_ty()],
+            vec![
+                blk(
+                    vec![
+                        live(2),
+                        assign(
+                            2,
+                            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(1), usize_ty()),
+                        ),
+                    ],
+                    call(
+                        callee("wide_callee"),
+                        vec![cp(2)],
+                        0,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(vec![], Terminator::Return),
+            ],
+        );
+        let ext_table = CallTable::new().with_callee("wide_callee", 1, lower(&wide_callee, pw));
+        let ext_in = MirValue::Ptr {
+            ptr: PointerValue::with_provenance(0x50000, 4, 7),
+            ty: raw_u8.clone(),
+        };
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &lower(&narrow_caller, pw),
+                &[ext_in],
+                8,
+                &ext_table,
+            )),
+            MirValue::Ptr {
+                ptr: PointerValue::with_provenance(0x50005, 4, 7),
+                ty: raw_u8,
+            }
+        );
+    }
+}

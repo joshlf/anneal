@@ -24,11 +24,12 @@
 //!   deinitializes it), checks the destination place, and then runs the callee: a function
 //!   item of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`]) executes in
 //!   the calling frame ([`eval_intrinsic_call`]); a function item of a symbol linked in a
-//!   [`CallTable`] runs the callee's body in a new frame (only under
-//!   [`eval_cfg_in_state_with_call_table`]); any other callee goes to the caller-supplied call
-//!   handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the [`ExternalCall`] under
-//!   a call table; without a handler: [`CfgEvalError::UnsupportedCall`], or
-//!   [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
+//!   [`CallTable`] runs the callee's body in a new frame (under
+//!   [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], or
+//!   [`eval_lowered_body_cfg_with_call_table_and_calls`]); any other callee goes to the
+//!   caller-supplied call handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the
+//!   [`ExternalCall`] under a call table; without a handler: [`CfgEvalError::UnsupportedCall`],
+//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
 //!   formed and of the destination's type, and is written to the destination before jumping
 //!   to `target` (a return from a call without `target` is undefined behavior); a panicking
 //!   call leaves the destination unchanged. `UnreachableUnchecked` is undefined behavior
@@ -51,11 +52,12 @@
 //!
 //! # Linked calls
 //!
-//! [`eval_cfg_in_state_with_call_table`] and [`eval_lowered_body_cfg_with_call_table`] run
-//! the callees of a [`CallTable`] on an explicit frame stack that shares one fuel counter and
-//! is bounded by [`CallTable::max_call_depth`]; see [`CallTable`] for argument passing, outcome
-//! propagation across frames, and frame isolation. [`eval_cfg_in_state`] is the single-frame
-//! special case (no table).
+//! [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], and
+//! [`eval_lowered_body_cfg_with_call_table_and_calls`] run the callees of a [`CallTable`] on an
+//! explicit frame stack that shares one fuel counter and is bounded by
+//! [`CallTable::max_call_depth`]; see [`CallTable`] for argument passing, outcome propagation
+//! across frames, and frame isolation. [`eval_cfg_in_state`] is the single-frame special case
+//! (no table).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,7 +70,7 @@ use crate::lower::intrinsic::{
     IntrinsicOutcome, IntrinsicTypeError, check_intrinsic_call_types, eval_intrinsic_call,
 };
 use crate::lower::rvalue::{
-    LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
+    LocalSlotState, LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
     StatementEvalState, check_value_well_formed, eval_lowered_statement, lower_layout_error,
     lower_operand_ty, mir_value_matches_ty, resolve_place_ty,
 };
@@ -1262,8 +1264,12 @@ fn complete_call_return(
             CROSS_FRAME_POINTER,
         )));
     }
+    let mut ret_val = ret.ret_val;
+    if let Some(limit) = ret.cross_frame_limit {
+        restore_caller_exposed_provenance(&mut ret_val, state, limit);
+    }
     state
-        .write_place(ret.destination, ret.dest_ty, ret.ret_val)
+        .write_place(ret.destination, ret.dest_ty, ret_val)
         .map_err(term_err)?;
     Ok(target)
 }
@@ -1415,10 +1421,13 @@ pub struct LinkedCallee {
 ///   inside a callee is reported as [`CfgEvalError::InCallee`] with the call stack.
 /// - **Frame isolation.** Every frame has its own locals and synthetic stack allocations
 ///   (provenance `alloc_id = local + 1`); it inherits the caller's transmute policy,
-///   `ub_checks`, and exposed provenances (external provenances directly, and caller-frame
+///   `ub_checks`, and live exposed provenances (external provenances directly unless their
+///   `alloc_id` falls in `1..=max(caller_locals, callee_locals)`, and live caller-frame
 ///   synthetic provenances as an opaque non-local provenance so `with_exposed_provenance`
-///   pointer arithmetic stays defined without aliasing callee locals; external provenances
-///   exposed inside a callee propagate back to the caller on return or unwind). A callee
+///   pointer arithmetic stays defined without aliasing callee locals, while storage-dead caller
+///   locals are never exposed; external provenances exposed inside a callee propagate back to
+///   the caller on return or unwind, and pointers reconstructed in a callee with the opaque
+///   caller provenance recover the caller's provenance when returned to it). A callee
 ///   frame's allocations lie above all of its caller's
 ///   ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the address space is
 ///   `UnsupportedMemoryAccess`), so the addresses of distinct active frames never coincide, not
@@ -1536,8 +1545,8 @@ pub struct ExternalCall<'a> {
     pub call_stack: &'a [CallSite],
     /// The calling block, in the body of the innermost frame.
     pub bb: usize,
-    /// The unlinked symbol a direct call names (`None` for an indirect call through a `Copy` or
-    /// `Move` callee operand).
+    /// The unlinked symbol a direct call names (`None` when the callee operand is not a direct
+    /// `Constant::FnDef(CallTarget::Fn(_))`, e.g. an indirect `Copy`/`Move` or pointer constant).
     pub callee: Option<&'a CalleeSymbol>,
     /// The evaluated callee operand.
     pub func: &'a MirValue,
@@ -1787,6 +1796,91 @@ fn in_frames(frames: &[Frame<'_>], frame_index: usize, error: CfgEvalError) -> C
 /// allocation id (`1..=local_decls.len()`).
 const CALLER_EXPOSED_ALLOC_ID: u64 = u64::MAX;
 
+/// Restores [`CALLER_EXPOSED_ALLOC_ID`] provenances in `val` when a linked callee returns to
+/// `caller_state`: pointers matching one of `caller_state`'s live exposed locals recover that
+/// local's provenance (so dereferencing, `copy_nonoverlapping`, and `write_bytes` in the caller
+/// observe the local allocation); pointers still belonging to an outer ancestor frame remain
+/// [`CALLER_EXPOSED_ALLOC_ID`] until they reach that frame; and shielded external provenances in
+/// `(caller_locals + 1)..=limit` recover their external `Provenance`.
+fn restore_caller_exposed_provenance(
+    val: &mut MirValue,
+    caller_state: &StatementEvalState,
+    limit: usize,
+) {
+    match val {
+        MirValue::Ptr { ptr, ty }
+            if ptr
+                .provenance
+                .is_some_and(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID) =>
+        {
+            if let Some(local_prov) =
+                caller_state.match_exposed_local_provenance(u128::from(ptr.addr), ty)
+            {
+                ptr.provenance = Some(local_prov);
+            } else if caller_state
+                .tracker
+                .exposed
+                .iter()
+                .any(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID)
+            {
+                // Keep `CALLER_EXPOSED_ALLOC_ID` for an outer caller frame lower on the stack.
+            } else if let Some(&ext_prov) = caller_state.tracker.exposed.iter().find(|prov| {
+                usize::try_from(prov.alloc_id)
+                    .is_ok_and(|id| id > caller_state.local_decls.len() && id <= limit)
+            }) {
+                ptr.provenance = Some(ext_prov);
+            } else {
+                ptr.provenance = caller_state.tracker.exposed.iter().copied().find(|prov| {
+                    prov.alloc_id
+                        .checked_sub(1)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .is_some_and(|loc| {
+                            loc < caller_state.local_decls.len()
+                                && !matches!(
+                                    caller_state.slots.get(loc),
+                                    Some(LocalSlotState::Dead)
+                                )
+                        })
+                });
+            }
+        }
+        MirValue::Array { elements, .. } => {
+            for element in elements {
+                restore_caller_exposed_provenance(element, caller_state, limit);
+            }
+        }
+        MirValue::Tuple(fields)
+        | MirValue::Adt {
+            active_field: None,
+            fields,
+            ..
+        } => {
+            for field in fields {
+                restore_caller_exposed_provenance(field, caller_state, limit);
+            }
+        }
+        MirValue::Adt {
+            active_field: Some(active),
+            fields,
+            ..
+        } => {
+            let active_val = if fields.len() == 1 {
+                fields.first_mut()
+            } else {
+                fields.get_mut(*active)
+            };
+            if let Some(field) = active_val {
+                restore_caller_exposed_provenance(field, caller_state, limit);
+            }
+        }
+        MirValue::Ptr { .. }
+        | MirValue::Int { .. }
+        | MirValue::Bool(_)
+        | MirValue::Char(_)
+        | MirValue::Unit => {}
+    }
+}
+
 /// Creates the state of a frame of the linked `callee` called from `caller` with `args`
 /// (into a destination of type `dest_ty`, with a return target iff `has_return_target`); see
 /// [`CallTable`].
@@ -1836,6 +1930,17 @@ fn enter_callee(
     state.policy = caller.state.policy;
     state.ub_checks = caller.state.ub_checks;
     for &prov in &caller.state.tracker.exposed {
+        if prov
+            .alloc_id
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .is_some_and(|loc| {
+                loc < caller.state.local_decls.len()
+                    && matches!(caller.state.slots.get(loc), Some(LocalSlotState::Dead))
+            })
+        {
+            continue;
+        }
         let mapped = if usize::try_from(prov.alloc_id).is_ok_and(|id| id >= 1 && id <= limit) {
             Provenance {
                 alloc_id: CALLER_EXPOSED_ALLOC_ID,

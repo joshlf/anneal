@@ -3287,6 +3287,58 @@ fn decode_mir_value(
 /// Predicts an exposed provenance for `PointerWithExposedProvenance` at `addr_bits` (with
 /// target pointer type `target_ty`) in a frame with `local_decls` and optional `slots`.
 ///
+/// Best matching live synthetic local provenance in `tracker` whose `[base_addr, end_addr]`
+/// contains `addr_bits` (preferring interior addresses over one-past-the-end and matching
+/// [`decode_subplace_tag`] when multiple tags of that local were exposed).
+pub(crate) fn match_exposed_local_provenance_for_decls(
+    addr_bits: u128,
+    target_ty: &Ty,
+    local_decls: &[Ty],
+    slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
+    ptr_width: PtrWidth,
+    tracker: &ExposedProvenanceTracker,
+) -> Option<crate::ir::Provenance> {
+    if local_decls.is_empty() {
+        return None;
+    }
+    let pointee_ty = target_ty.pointee_ty();
+    let mut best: Option<(u8, crate::ir::Provenance)> = None;
+    for &prov in &tracker.exposed {
+        let Some(loc) = prov
+            .alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < local_decls.len())
+        else {
+            continue;
+        };
+        if slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))) {
+            continue;
+        }
+        let Ok(base_addr) = local_base_addr_in_frame(loc, local_decls, ptr_width, frame_addr_base)
+        else {
+            continue;
+        };
+        let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
+            continue;
+        };
+        let end_addr = base_addr.saturating_add(alloc_size as u128);
+        if addr_bits < base_addr || addr_bits > end_addr {
+            continue;
+        }
+        let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
+        let tag_matches = pointee_ty
+            .and_then(|pty| decode_subplace_tag(prov.tag, pty))
+            .is_some();
+        let rank = (u8::from(is_interior) << 1) | u8::from(tag_matches);
+        if best.is_none_or(|(best_rank, _)| rank > best_rank) {
+            best = Some((rank, prov));
+        }
+    }
+    best.map(|(_, prov)| prov)
+}
+
 /// When multiple provenances have been exposed, prefers one whose synthetic local allocation
 /// `[base_addr, base_addr + alloc_size]` contains `addr_bits` (preferring live locals and
 /// interior addresses `[base_addr, base_addr + alloc_size)` over one-past-the-end, and
@@ -3313,37 +3365,15 @@ fn predict_exposed_provenance_for_decls(
             .is_some_and(|loc| slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))))
     };
     if !local_decls.is_empty() {
-        let pointee_ty = target_ty.pointee_ty();
-        let mut best: Option<(u8, crate::ir::Provenance)> = None;
-        for &prov in &tracker.exposed {
-            if is_dead_local(prov) {
-                continue;
-            }
-            let Some(loc) = local_of(prov) else {
-                continue;
-            };
-            let Ok(base_addr) =
-                local_base_addr_in_frame(loc, local_decls, ptr_width, frame_addr_base)
-            else {
-                continue;
-            };
-            let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
-                continue;
-            };
-            let end_addr = base_addr.saturating_add(alloc_size as u128);
-            if addr_bits < base_addr || addr_bits > end_addr {
-                continue;
-            }
-            let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
-            let tag_matches = pointee_ty
-                .and_then(|pty| decode_subplace_tag(prov.tag, pty))
-                .is_some();
-            let rank = (u8::from(is_interior) << 1) | u8::from(tag_matches);
-            if best.is_none_or(|(best_rank, _)| rank > best_rank) {
-                best = Some((rank, prov));
-            }
-        }
-        if let Some((_, prov)) = best {
+        if let Some(prov) = match_exposed_local_provenance_for_decls(
+            addr_bits,
+            target_ty,
+            local_decls,
+            slots,
+            frame_addr_base,
+            ptr_width,
+            tracker,
+        ) {
             return Some(prov);
         }
         if let Some(&ext) = tracker
@@ -6254,6 +6284,24 @@ impl StatementEvalState {
         }
     }
 
+    /// Best matching live synthetic local provenance in this frame's exposed tracker whose
+    /// `[base_addr, end_addr]` contains `addr_bits`.
+    pub(crate) fn match_exposed_local_provenance(
+        &self,
+        addr_bits: u128,
+        target_ty: &Ty,
+    ) -> Option<crate::ir::Provenance> {
+        match_exposed_local_provenance_for_decls(
+            addr_bits,
+            target_ty,
+            &self.local_decls,
+            Some(&self.slots),
+            self.frame_addr_base,
+            self.ptr_width,
+            &self.tracker,
+        )
+    }
+
     /// Reads an index local as a `usize` bit pattern, returning `TypeMismatch` if the local is
     /// out of bounds or not declared as `usize`, and `DeadLocal` or `UninitializedLocal` if its
     /// slot is not initialized.
@@ -6727,7 +6775,7 @@ impl StatementEvalState {
     /// Evaluates `Statement::Deinit(place)` (of declared type `place_ty`).
     ///
     /// Requires a live root local (`DeadLocal`), resolves every `Deref` step to its synthetic
-    /// target sub-place (which must be live as well, see [`Self::resolve_synthetic_subplace`])
+    /// target sub-place (which must be live as well, see `Self::resolve_synthetic_subplace`)
     /// while reading the `Index` operands in place-evaluation order, then, on the resolved
     /// `(target_local, target_proj)`:
     /// - a bare (or wholly dereferenced) local becomes `LocalSlotState::Uninit`; `Deinit(*p)`
@@ -11002,6 +11050,17 @@ fn eval_copy_nonoverlapping(
 /// (shared by `Statement::CopyNonOverlapping` and the call form
 /// [`IntrinsicOp::CopyNonOverlapping`], which `rustc`'s `LowerIntrinsics` pass turns into the
 /// statement).
+///
+/// Validates target-width pointer addresses and non-null reference bit-validity
+/// (`InvalidBitPattern`), `count <= usize::MAX` (`InvalidBitPattern`), non-null raw/reference
+/// addresses (`NullPointerAccess`), `elem_align` alignment (`MisalignedPointer`), inhabited
+/// pointees for references (`UninhabitedPointee`), `count * elem_size <= isize::MAX`
+/// (`CopyLengthOverflow`), and non-wrapping `[addr, addr + byte_len]` ranges
+/// (`PointerRangeOverflow`) even when `count == 0` (mirroring `Trusted`'s
+/// `evalCopyNonOverlappingWithCount`). Non-zero copies additionally reject overlapping same-allocation
+/// ranges (`CopyNonOverlappingOverlap`) and storage-dead synthetic locals (`DeadLocal` for
+/// `byte_len > 0` or `count == 1`), then transfer initialized/uninitialized sub-places or
+/// contiguous array windows (or fail closed with `UnsupportedMemoryAccess`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn copy_nonoverlapping_values(
     state: &mut StatementEvalState,

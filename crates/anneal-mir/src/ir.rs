@@ -2081,15 +2081,16 @@ impl PointerValue {
 /// - `ExactDiv`, `WrappingAdd`/`Sub`/`Mul`, `SaturatingAdd`/`Sub`, `UncheckedAdd`/`Sub`/`Mul`,
 ///   `UncheckedDiv`, `UncheckedRem`: `(T, T) -> T`;
 /// - `UncheckedShl`, `UncheckedShr`: `(T, U) -> T`;
-/// - `ThreeWayCompare`: `(T, T) -> i8` for `T` an integer or `char`, or an `Ordering`-shaped
-///   enum result (three fieldless variants with the signed discriminants `-1`, `0`, `1`);
+/// - `ThreeWayCompare`: `(T, T) -> i8` for `T` an integer or `char`, or a 1-byte `#[repr(i8)]`
+///   `Ordering`-shaped enum result (three fieldless variants with the signed discriminants
+///   `-1`, `0`, `1`);
 /// - `UbChecks`: `() -> bool`;
 /// - `ArithOffset`: `(P, isize) -> *const E | *mut E`;
 /// - `SizeOfVal`, `AlignOfVal`: `(P) -> usize`;
 /// - `CopyNonOverlapping`: `(*const E | *mut E | &E | &mut E, *mut E | &mut E, usize) -> ()`;
 /// - `WriteBytes`: `(*mut E | &mut E, u8, usize) -> ()`;
 /// - `UnreachableUnchecked`, `Abort`, `PanicUnwind`: any arguments (evaluated, then ignored)
-///   and any destination; they never return.
+///   and any destination (inhabited if the call has a return `target`); they never return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IntrinsicOp {
     /// Leading zero bits of `x` (`bit_width(T)` for `0`), as a `u32`.
