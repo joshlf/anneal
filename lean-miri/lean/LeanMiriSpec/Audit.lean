@@ -20744,6 +20744,7 @@ open LeanMiriSpec.Correspondence in
   annealEvalCallArgsLM4_1
   initCalleeArgLocals
   resolveCallerDestinationPlace
+  annealPushCalleeFrameLM4_1
   annealEvalCallLM4_1
   annealTerminatorHooksLM4_1
   annealStepHooksLM4_1
@@ -20778,6 +20779,7 @@ open LeanMiriSpec.Correspondence in
   CallerDestSlotWf
   CallerDestSlotWf.of_immediate
   step_terminator_call_simulation
+  step_terminator_call_diverging_simulation
   WitnessLM4_1.witCalleeReadyToReturn_borrowTrackerRel
   WitnessLM4_1.witCalleeReadyToReturn_rel
   WitnessLM4_1.wit_lm4_1_callee_return_simulation
@@ -20794,9 +20796,18 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_1.wit_lm4_1_call_with_copy_and_move_args_simulation
   WitnessLM4_1.wit_lm4_1_unscoped_borrow_cross_frame_divergence
   WitnessLM4_1.wit_lm4_1_return_from_diverging_callee_ub
+  WitnessLM4_1.witDivCalleeBody
+  WitnessLM4_1.witDivCallerBody
+  WitnessLM4_1.witDivCall_rel
+  WitnessLM4_1.wit_lm4_1_diverging_call_push_simulation
+  WitnessLM4_1.miriNextLM4_1
+  WitnessLM4_1.miriStepUBMsgLM4_1
+  WitnessLM4_1.miriTopIsDivergingWithInitRet
+  WitnessLM4_1.wit_lm4_1_diverging_call_then_return_ub
   SimLM3_3.storageDeadBody
   SimLM3_3.storageLiveBody
   SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step
+  SimLM3_3.sim_lm3_3_storage_dead_protected_cell_divergence
   WitnessLM3_3.bodyOProtectedStorageDead
   WitnessLM3_3.bodyOUnprotectedStorageDead
   WitnessLM3_3.initO
@@ -20942,13 +20953,14 @@ example
     (hargs : argOps = .nil)
     (hcallee_none :
       lookupCallee s.memory.callees (activeMirBody rootBody s).layouts
-        defPath (extractCalleeTypeArgs func) s.memory.traitImpls = none) :
+        defPath (extractCalleeTypeArgs func) s.memory.traitImpls = none)
+    (hfind_none : findCallee? s.memory.callees defPath = none) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
   step_terminator_call_unreachable_unchecked_ub_simulation
-    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hunreach hargs hcallee_none
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hunreach hargs hcallee_none hfind_none
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -20986,6 +20998,41 @@ example
     hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
     hcallee_decls hcallee_bb0 harity hdest_wf hdest_live hwt_args
 
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {argOps : List MirAst.Operand}
+    {destIdx : Local} {destDecl : MirAst.LocalDecl}
+    {unwind : MirAst.UnwindAction}
+    {defPath : DefPath} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl}
+    {calleeBb0 : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func argOps ⟨destIdx, .nil⟩ none unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hcallee : findCallee? s.memory.callees defPath = some calleeBody)
+    (htypeArgs : extractCalleeTypeArgs func = .nil)
+    (htparam : calleeBody.typeParamCount = 0)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
+      CallerDestSlotWf m.machine tf destIdx destDecl)
+    (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
+    (hwt_args : ∀ tf, m.stack.frames.back? = some tf →
+      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
+  step_terminator_call_diverging_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
+    hcallee_decls hcallee_bb0 hdest_wf hdest_live hwt_args
+
 example (cf : SavedCallerFrame) (cs : List SavedCallerFrame) :
     releaseCallProtectors (cf :: cs) = restoreCallerProtectors cf :=
   callerRestoredProtectors_cons_eq_restoreCallerProtectors cf cs
@@ -21011,6 +21058,15 @@ example (perm : TreeBorrowPerm) :
       Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
       (hooksForChildProtected false).protectedTags).status = .Deallocated :=
   sim_lm3_3_storage_dead_and_live_protector_step perm
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example :
+    stepMirFn storageDeadBody (childState .cell true) = .fail .ub ∧
+    stepMirFn storageLiveBody (childState .cell true) = .fail .ub ∧
+    ((hooksTwoNodeTree .cell).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected true).protectedTags).status = .Deallocated :=
+  sim_lm3_3_storage_dead_protected_cell_divergence
 
 open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
 example :
@@ -21059,6 +21115,38 @@ example :
           (annealPoppedFrameState witDivergingCalleeReturnAnneal))
         () witDivergingCalleeReturnMiri).2 = .error (.undefinedBehavior msg) :=
   wit_lm4_1_return_from_diverging_callee_ub
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    StepRelMultiFrame witDivCallerBody witDivCallMiri
+      (stepMirFn witDivCallerBody witDivCallAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1
+          (activeMirBody witDivCallerBody witDivCallAnneal)
+          witDivCallAnneal.memory.callees
+          (annealPoppedFrameState witDivCallAnneal))
+        () witDivCallMiri) ∧
+    ∃ s₁,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      s₁.memory.activeCallee = some witDivCalleeBody ∧
+      s₁.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      s₁.memory.callStack.map SavedCallerFrame.returnUnwind = [.continue_] ∧
+      get? s₁.frame.locals 0 = some .uninit :=
+  wit_lm4_1_diverging_call_push_simulation
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    ∃ s₁ s₂ : MachineState,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      stepMirFn witDivCallerBody s₁ = .step s₂ ∧
+      s₂.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      get? s₂.frame.locals 0 = some (.init (.scalar sc1)) ∧
+      stepMirFn witDivCallerBody s₂ = .fail .ub ∧
+      ((miriNextLM4_1 witDivCallerBody witDivCallAnneal witDivCallMiri).bind
+          (miriNextLM4_1 witDivCallerBody s₁)).map
+        (fun m₂ => (miriTopIsDivergingWithInitRet m₂, miriStepUBMsgLM4_1 witDivCallerBody s₂ m₂)) =
+        some (true, some "Unreachable") :=
+  wit_lm4_1_diverging_call_then_return_ub
 
 end StatementPins
 

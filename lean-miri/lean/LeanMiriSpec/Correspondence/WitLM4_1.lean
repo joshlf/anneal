@@ -61,6 +61,14 @@ local deallocation & `CallId` protector release and root-frame return),
   no frame identifier and persists in `s.memory.borrows` across `TerminatorKind.return_`,
   whereas `lean-miri`'s `Stack.cleanupStackFrame` deallocates the popped callee's
   `.indirect` stack allocation (`deallocFrameLocals`).
+* (j) `wit_lm4_1_return_from_diverging_callee_ub`: returning from a callee whose
+  saved caller frame has `isDiverging = true` faults with UB in both machines.
+* (k) `wit_lm4_1_diverging_call_push_simulation` and
+  `wit_lm4_1_diverging_call_then_return_ub`: Stage-1 diverging call to a linked
+  callee (`pushDivergingCalleeFrame`) is simulated by
+  `step_terminator_call_diverging_simulation` from a concrete related state, and
+  a genuine 3-step lockstep run (push, `_0 = const 1_u8`, `return`) faults with
+  UB in both machines (`isDiverging = true` vs. `ControlFlow.returnToBlock none`).
 -/
 
 namespace LeanMiriSpec.Correspondence.WitnessLM4_1
@@ -1611,5 +1619,207 @@ theorem wit_lm4_1_return_from_diverging_callee_ub :
           injection hdecl_d with hdd; subst hdd
           exact himm)
   exact ⟨hsim, rfl, (hsim.ub_iff).mp rfl⟩
+
+/-! ## (k) Stage-1 Diverging Call to a Linked Callee: Push, `_0` Write, Return UB -/
+
+/-- `fn() -> u8` function item type for the linked callee `"crate::div_callee"`,
+invoked through a *diverging* call (`target = none`). -/
+def divCalleeFnTy : Ty := { kind := .fnDef "crate::div_callee" [], layoutIdx := 0 }
+
+/-- Constant operand referencing `"crate::div_callee"`. -/
+def divCalleeFuncOp : MirAst.Operand :=
+  .constant { ty := divCalleeFnTy, val := .zeroSized }
+
+/-- Linked callee body `"crate::div_callee"`:
+`bb0`: `_0 = const 1_u8; return`, so that `_0` is initialized and its final
+`return` faults only because the saved caller frame is diverging. -/
+def witDivCalleeBody : CapturedMir where
+  defPath := "crate::div_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl]
+  basicBlocks :=
+    [{ statements :=
+         [{ kind := .assign ⟨0, .nil⟩ (.use (.constant { ty := u8Ty, val := .scalar (.int sc1) }))
+            span := "lm-4.1-witness" }]
+       terminator := mkTerm .return_
+       isCleanup := false }]
+  fnAbi := fnAbiU8
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Root caller body `"crate::div_caller"`:
+`bb0`: `_1 = call crate::div_callee() -> [return: none, unwind: continue]`. -/
+def witDivCallerBody : CapturedMir where
+  defPath := "crate::div_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl]
+  basicBlocks :=
+    [{ statements := []
+       terminator := mkTerm (.call divCalleeFuncOp [] ⟨1, .nil⟩ none .continue_)
+       isCleanup := false }]
+  fnAbi := fnAbiU8
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Root `lean-miri` frame for `witDivCallerBody` at `(bb0, 0)`. -/
+def witDivCallerMiriFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody witDivCallerBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := ⟨.Item 0, #[]⟩
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace :=
+      .frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[⟨.live (.immediate .uninit), none⟩, ⟨.live (.immediate .uninit), none⟩]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def witDivCallAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+    memory := { callees := [witDivCalleeBody], nextProtector := 1 } }
+
+def witDivCallMiri : AnnealStepState :=
+  { stack := ⟨#[witDivCallerMiriFrame]⟩
+    machine := AnnealMachine.empty }
+
+theorem witDivCall_rel :
+    MultiFrameStateRel witDivCallerBody witDivCallAnneal witDivCallMiri := by
+  have hfr_caller :
+      FrameRel witDivCallerBody AnnealMachine.empty witDivCallAnneal.frame witDivCallerMiriFrame := by
+    refine ⟨rfl, rfl, rfl, rfl, fun i decl slot mls hdecl hslot hmls => ?_⟩
+    rcases i with _ | ⟨_ | i⟩
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · cases hdecl
+  have hstate0 : StateRel witDivCallerBody witDivCallAnneal witDivCallMiri :=
+    .mk _ rfl rfl ⟨translateTy u8Ty emptyLayoutTable, rfl⟩ hfr_caller
+      rfl rfl rfl rfl rfl
+      (by
+        intro i j mp₁ mp₂ lay₁ lay₂ _ hi _
+        rcases i with _ | ⟨_ | i⟩ <;> cases hi)
+  exact (StateRel.iff_multiFrameStateRel_depth1 rfl rfl rfl rfl rfl (by decide)).mp hstate0
+
+/-- **Witness (k.1)**: the premises of `step_terminator_call_diverging_simulation`
+are satisfiable: executing the diverging call
+`_1 = call crate::div_callee() -> [return: none, unwind: continue]` of
+`witDivCallerBody` from `witDivCallAnneal` / `witDivCallMiri` steps both machines
+to `MultiFrameStateRel`-related depth-2 states, where Stage-1 `Trusted` has pushed
+a diverging `SavedCallerFrame` (`pushDivergingCalleeFrame`, `isDiverging = true`,
+`returnUnwind = .continue_`) and `lean-miri`'s callee frame carries the return
+continuation `.goto none .Continue`. -/
+theorem wit_lm4_1_diverging_call_push_simulation :
+    StepRelMultiFrame witDivCallerBody witDivCallMiri
+      (stepMirFn witDivCallerBody witDivCallAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1
+          (activeMirBody witDivCallerBody witDivCallAnneal)
+          witDivCallAnneal.memory.callees
+          (annealPoppedFrameState witDivCallAnneal))
+        () witDivCallMiri) ∧
+    ∃ s₁,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      s₁.memory.activeCallee = some witDivCalleeBody ∧
+      s₁.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      s₁.memory.callStack.map SavedCallerFrame.returnUnwind = [.continue_] ∧
+      get? s₁.frame.locals 0 = some .uninit := by
+  have hsim :
+      StepRelMultiFrame witDivCallerBody witDivCallMiri
+        (stepMirFn witDivCallerBody witDivCallAnneal)
+        (Miri.Interpreter.Step.step
+          (annealStepHooksLM4_1
+            (activeMirBody witDivCallerBody witDivCallAnneal)
+            witDivCallAnneal.memory.callees
+            (annealPoppedFrameState witDivCallAnneal))
+          () witDivCallMiri) := by
+    apply step_terminator_call_diverging_simulation
+      witDivCall_rel (fun _ h => nomatch h)
+      (bb := { statements := []
+               terminator := mkTerm (.call divCalleeFuncOp [] ⟨1, .nil⟩ none .continue_)
+               isCleanup := false })
+      (destDecl := u8Decl)
+      (calleeBody := witDivCalleeBody)
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (by intro tf htf
+          apply CallerDestSlotWf.of_immediate
+          intro mls hmls mp hmp
+          injection htf with h; subst h
+          injection hmls with hm; subst hm; nomatch hmp)
+      (by intro tf htf mls hmls hdead
+          injection htf with h; subst h
+          injection hmls with hm; subst hm; nomatch hdead)
+      (fun _ _ => .nil [])
+  exact ⟨hsim, _, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `lean-miri` successor of `m` under the `LM-4.1` hooks paired with the
+lockstep Anneal state `s` (`annealStepHooksLM4_1 (activeMirBody rootBody s)
+s.memory.callees (annealPoppedFrameState s)`), for steps that continue
+(`.ok true`). -/
+def miriNextLM4_1 (rootBody : CapturedMir) (s : MachineState) (m : AnnealStepState) :
+    Option AnnealStepState :=
+  match Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s))
+      () m with
+  | (m', .ok true) => some m'
+  | _ => none
+
+/-- The `StepError.undefinedBehavior` message of `lean-miri`'s next step from `m`
+(under the `LM-4.1` hooks paired with the lockstep Anneal state `s`), if that step
+reports undefined behavior. -/
+def miriStepUBMsgLM4_1 (rootBody : CapturedMir) (s : MachineState) (m : AnnealStepState) :
+    Option String :=
+  match Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s))
+      () m with
+  | (_, .error (.undefinedBehavior msg)) => some msg
+  | _ => none
+
+/-- Whether `m`'s top frame is a callee frame with diverging return continuation
+`.goto none .Continue` whose return place `_0` holds an initialized immediate
+scalar (so a normal return from it can only fault on `returnToBlock none`). -/
+def miriTopIsDivergingWithInitRet (m : AnnealStepState) : Bool :=
+  match m.stack.frames.back? with
+  | some tf =>
+    match tf.returnContinuation, tf.locals[0]? with
+    | .goto none .Continue,
+      some (Miri.Interpreter.LocalState.mk (.live (.immediate (.scalar _))) _) => true
+    | _, _ => false
+  | none => false
+
+/-- **Witness (k.2)**: genuine 3-step lockstep execution of both machines from
+`witDivCallAnneal` / `witDivCallMiri` (kernel evaluation via `decide`, no
+hand-built intermediate states):
+1. the diverging call pushes `witDivCalleeBody` (Stage-1
+   `pushDivergingCalleeFrame`, `isDiverging = true`; `lean-miri` continuation
+   `.goto none .Continue`; cf. `wit_lm4_1_diverging_call_push_simulation`);
+2. the callee executes `_0 = const 1_u8` in both machines;
+3. the callee's normal `return` faults with undefined behavior in both machines
+   although `_0` is initialized: Stage-1 `Trusted` on
+   `SavedCallerFrame.isDiverging = true` (`Terminators.lean:3011-3012`), and
+   `lean-miri` on `ControlFlow.returnToBlock none` (Miri's `throw_ub!(Unreachable)`). -/
+theorem wit_lm4_1_diverging_call_then_return_ub :
+    ∃ s₁ s₂ : MachineState,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      stepMirFn witDivCallerBody s₁ = .step s₂ ∧
+      s₂.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      get? s₂.frame.locals 0 = some (.init (.scalar sc1)) ∧
+      stepMirFn witDivCallerBody s₂ = .fail .ub ∧
+      ((miriNextLM4_1 witDivCallerBody witDivCallAnneal witDivCallMiri).bind
+          (miriNextLM4_1 witDivCallerBody s₁)).map
+        (fun m₂ => (miriTopIsDivergingWithInitRet m₂, miriStepUBMsgLM4_1 witDivCallerBody s₂ m₂)) =
+        some (true, some "Unreachable") := by
+  refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  decide
 
 end LeanMiriSpec.Correspondence.WitnessLM4_1

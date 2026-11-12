@@ -1390,7 +1390,10 @@ def storageLiveBody : CapturedMir :=
    and `StorageLive(_1)` step in `stepMirFn`, disabling `entry 1 perm` to
    `[entry 1 .disabled]` (`disableLocalBorrows`) while preserving
    `TreeBorrowsRel`, and Miri's `BorrowTree.deallocateBorrowRange` succeeds
-   (`status = .Deallocated`). -/
+   (`status = .Deallocated`).
+The protected `Cell` case excluded by `perm ≠ .cell` is a genuine residual
+divergence, certified separately by
+`sim_lm3_3_storage_dead_protected_cell_divergence`. -/
 theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
     stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
     stepMirFn storageLiveBody (childState perm true) = .fail .ub ∧
@@ -1426,5 +1429,26 @@ theorem sim_lm3_3_storage_dead_and_live_protector_step (perm : TreeBorrowPerm) :
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
   · intro _ hd; have h := (hdealloc_true.mp hd).1; cases h
   · intro _ hd; have h := (hdealloc_true.mp hd).2; cases h with | inl h | inr h => cases h
+
+/-- **`sim_lm3_3_storage_dead_protected_cell_divergence`** (residual Stage-1
+divergence excluded by the `perm ≠ .cell` premise of
+`sim_lm3_3_storage_dead_and_live_protector_step`): when the only borrow of `_1`
+is a *protected* `Cell` (`&UnsafeCell<T>`) tag,
+1. Stage-1 `Trusted` `StorageDead(_1)` / `StorageLive(_1)` fault with `.fail .ub`,
+   because `hasProtectedLocalBorrow` (`Statements.lean:1842-1856`) treats every
+   protected borrow of the local alike, with no `UnsafeCell` exemption;
+2. Miri's `BorrowTree.deallocateBorrowRange` succeeds
+   (`status = .Deallocated`), because the foreign write leaves `Cell`
+   unchanged and the strong-protector `ProtectedDealloc` scan exempts `Cell`
+   (`I-11`). -/
+theorem sim_lm3_3_storage_dead_protected_cell_divergence :
+    stepMirFn storageDeadBody (childState .cell true) = .fail .ub ∧
+    stepMirFn storageLiveBody (childState .cell true) = .fail .ub ∧
+    ((hooksTwoNodeTree .cell).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected true).protectedTags).status = .Deallocated :=
+  ⟨rfl, rfl,
+    (borrowTree_deallocateBorrowRange_simulation .foreignAccess .cell true).2.2.mpr
+      ⟨by decide, Or.inr rfl⟩⟩
 
 end LeanMiriSpec.Correspondence.SimLM3_3

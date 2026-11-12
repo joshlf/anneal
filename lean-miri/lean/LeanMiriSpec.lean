@@ -234,7 +234,9 @@ import LeanMiriSpec.Audit
   classification across `PhantomData`, `MaybeUninit`, `ManuallyDrop`,
   `UnsafeCell`, `SyncUnsafeCell`, `Cell`, and `RefCell`, and uninhabited vs.
   inhabited `!`-container pointees), `StorageDead`/`StorageLive` protector UB
-  vs. unprotected local-borrow disable (`sim_lm3_3_storage_dead_and_live_protector_step`),
+  vs. unprotected local-borrow disable (`sim_lm3_3_storage_dead_and_live_protector_step`,
+  with the protected-`Cell` residual divergence
+  `sim_lm3_3_storage_dead_protected_cell_divergence`),
   deref reborrows, and general 6-state `Miri.Interpreter.Step.step` +
   `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
@@ -251,7 +253,7 @@ import LeanMiriSpec.Audit
   `TreeBorrowsStateRel`, `BorrowTrackerStackRel`), bidirectional depth-1 bridges
   (`StateRel.iff_multiFrameStateRel_depth1`,
   `TreeBorrowsStateRel.iff_multiFrameStateRel_depth1`), `CallId` protector
-  lifecycle (`ActiveProtectorsValid`, `retagArgLocals_fnEntry_preserves_valid`,
+  lifecycle (`ActiveProtectorsValid`, `ActiveProtectorsValid.push_fresh_callId`,
   `borrowTree_releaseProtector_full_simulation`, `releaseCallProtectors`,
   `callerRestoredProtectors_cons_eq_restoreCallerProtectors`, and
   `cex_end_of_call_foreign_unique_frozen_divergence`), and `annealStepHooksLM4_1` /
@@ -262,15 +264,18 @@ import LeanMiriSpec.Audit
   `canonical_drop_no_glue_preserves_local_divergence`,
   `step_terminator_return_root_simulation`,
   `step_terminator_return_callee_simulation`,
-  `step_terminator_call_unreachable_unchecked_ub_simulation`, and
-  `step_terminator_call_simulation`).
-* `LeanMiriSpec.Correspondence.WitLM4_1`: ten kernel-checked `LM-4.1` witnesses
-  `(a)..(j)` covering multi-frame call/return with `GlobalState.endCall`
+  `step_terminator_call_unreachable_unchecked_ub_simulation`,
+  `step_terminator_call_simulation`, and the Stage-1 diverging-call push
+  `step_terminator_call_diverging_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
+  `(a)..(k)` covering multi-frame call/return with `GlobalState.endCall`
   protector release, `.uninit` `_0` UB, `Drop` live vs. `.dead` UB,
   `Unreachable` and `unreachable_unchecked` call UB, `BorrowTree.releaseProtector`
   (`ReservedFrz true` vs. `Disabled`), ZST `()` returns, `.indirect` caller
   destinations, `copy` + `move` call arguments, cross-frame `BorrowEntry`
-  scoping divergence, and diverging caller frame (`isDiverging = true`) return UB.
+  scoping divergence, diverging caller frame (`isDiverging = true`) return UB,
+  and a genuine 3-step lockstep run of a diverging call to a linked callee
+  (push, `_0` write, return UB in both machines).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

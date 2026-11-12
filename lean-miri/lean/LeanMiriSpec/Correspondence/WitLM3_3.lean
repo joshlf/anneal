@@ -1166,8 +1166,11 @@ def initO : MachineState :=
 1. In `bodyOProtectedStorageDead`, `_2 = &mut _1` and `Retag([fn entry] _2)`
    create protected `tag 2` (`protector = some 1`, `activeProtectors = [1]`);
    then `StorageDead(_1)` immediately faults with `.fail .ub`
-   (`hasProtectedLocalBorrow = true`), matching Miri's
-   `BorrowTree.deallocateBorrowRange` failure (`.ProtectedDealloc ⟨0, 8⟩ ⟨1⟩`);
+   (`hasProtectedLocalBorrow = true`), matching the failure of Miri's
+   `BorrowTree.deallocateBorrowRange` through the foreign (parent) tag on the
+   protected 2-node tree `hooksTwoNodeTree (.reservedFrz false)`, which already
+   fails in its initial foreign-write stage (`.AccessFailure _`: a foreign write
+   to a protected `ReservedFrz false` child is UB);
 2. In `bodyOUnprotectedStorageDead`, `_2 = &mut _1` and `(*_2) = const 42_u32`
    activate unprotected `tag 1` to `.unique`; then `StorageDead(_1)` steps
    cleanly and disables `tag 1` (`s₃.memory.borrows = [entry 1 .disabled]`,

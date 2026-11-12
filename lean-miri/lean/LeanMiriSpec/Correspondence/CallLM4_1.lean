@@ -19,7 +19,7 @@ import Miri.Interpreter.Call
 
 Formal correspondence between Anneal's multi-frame call stack
 (`s.memory.callStack`, `s.memory.activeCallee`, `s.memory.callees`,
-`s.memory.activeProtectors`, `s.memory.nextProtectorId`, `s.memory.callerLocals`
+`s.memory.activeProtectors`, `s.memory.nextProtector`, `s.memory.callerLocals`
 in `Trusted/Rustc/V2026_06_01/MirSemantics/{State,Terminators,Machine}.lean`)
 and `lean-miri`'s `Miri/Interpreter/{Stack,Call,Step,ControlFlow}.lean` +
 `Miri/TreeBorrows/{TreeState,GlobalState}.lean`:
@@ -42,8 +42,9 @@ and `lean-miri`'s `Miri/Interpreter/{Stack,Call,Step,ControlFlow}.lean` +
    * On general multi-node trees containing a foreign (sibling/ancestor) `Unique`
      node, Miri's end-of-call access acts as a foreign access to non-descendant
      nodes and freezes foreign `Unique` nodes to `Frozen`, whereas Anneal's
-     `Trusted` `TerminatorKind.return_` (`Terminators.lean:247-281`) restores
-     `activeProtectors` without running an end-of-call `performAccess` pass on
+     Stage-1 `Trusted` `TerminatorKind.return_` (`Terminators.lean:3005-3039`,
+     `restoreCallerProtectors`) restores `activeProtectors` without running an
+     end-of-call `performAccess` pass on
      `s.memory.borrows` (certified as a divergence in
      `cex_end_of_call_foreign_unique_frozen_divergence`).
    * At the global borrow-tracker layer (`Miri.TreeBorrows.GlobalState`),
@@ -67,8 +68,11 @@ and `lean-miri`'s `Miri/Interpreter/{Stack,Call,Step,ControlFlow}.lean` +
    * `CallerDestinationRel` and `CallerStackLinksRel` relate every caller frame's
      `destination`, `returnTarget`, `callerProtector`, and `calleeProtectors` to
      the corresponding Miri frame's `returnPlace` (both `.frameLocal` immediate
-     and `.memory` indirect places) and `returnContinuation` (`.goto (some bb)`
-     for non-root frames, `.stop false` for the root frame).
+     and `.memory` indirect places) and `returnContinuation`
+     (`.goto (some cf.returnTarget)` for frames pushed by a returning call,
+     `.goto none` for frames pushed by a diverging call with
+     `cf.isDiverging = true` (Stage-1 `pushDivergingCalleeFrame`), and
+     `.stop false` for the root frame).
    * `MultiFrameAllocDisjoint` ensures that all live `.indirect` stack allocations
      across the entire call stack have pairwise distinct `AllocId`s, so popping
      and deallocating a callee frame's `.indirect` locals preserves every caller
@@ -2190,17 +2194,91 @@ def resolveCallerDestinationPlace
         | .live (.indirect mp) =>
           .ok (.memory ⟨mp, destLay⟩)
 
-/-- Evaluate a `Terminator.Call` in `LM-4.1`:
+/-- Push the linked callee `calleeBody`'s `lean-miri` frame in `LM-4.1` once the
+call's argument immediates `argImms` have been evaluated in the caller frame of
+`stateAfterArgs`: resolves the caller destination `dest`
+(`resolveCallerDestinationPlace`), pushes the callee frame via
+`Stack.pushStackFrameRaw` with return continuation `.goto targetOpt unwind`,
+initializes argument locals `1..=argImms.length` via `initCalleeArgLocals`, and
+finishes frame setup via `Stack.pushStackFrameDone` (making `_0` live and setting
+`location = .mir .start`).
+
+`targetOpt = some targetBb` for a returning call and `targetOpt = none` for a
+diverging call (`target = none`, return type `!`), matching Miri's
+`ReturnContinuation::Goto { ret: None, unwind }`, so that a later normal return
+from the callee hits `ControlFlow.returnToBlock none`
+(`.undefinedBehavior "Unreachable"`), exactly as Stage-1 `Trusted` faults on
+`SavedCallerFrame.isDiverging = true` (`Terminators.lean:3011-3012`). -/
+def annealPushCalleeFrameLM4_1
+    (currentBody calleeBody : CapturedMir)
+    (dest : Miri.MIR.Place)
+    (targetOpt : Option Miri.MIR.BasicBlockId)
+    (unwind : Miri.MIR.UnwindAction)
+    (argImms : List (Miri.Interpreter.RvalueImmTy AnnealProv))
+    (stateAfterArgs : AnnealStepState) :
+    Miri.Interpreter.StepResult AnnealStepState Unit :=
+  match stateAfterArgs.stack.currentFrame? with
+  | none => (stateAfterArgs, .error (.stack .emptyStack))
+  | some callerFrameAfterArgs =>
+    let callerFrameIdx := stateAfterArgs.stack.frames.size - 1
+    match resolveCallerDestinationPlace currentBody callerFrameIdx callerFrameAfterArgs dest with
+    | .error err => (stateAfterArgs, .error err)
+    | .ok returnPlace =>
+      let hooks := annealStackLifecycleHooksLM4_1 calleeBody.localDecls calleeBody.layouts
+      let loadedCallee : Miri.Interpreter.LoadedBody :=
+        ⟨.ofCanonicalIndex 0, translateBody calleeBody⟩
+      let fnInst : Miri.Interpreter.CallInstance := ⟨.Item 0, #[]⟩
+      let cont : Miri.Interpreter.ReturnContinuation :=
+        .goto targetOpt unwind
+      let rawRes :=
+        stateAfterArgs.stack.pushStackFrameRaw
+          stateAfterArgs.machine.memory
+          hooks
+          loadedCallee
+          fnInst
+          cont
+          returnPlace
+          defaultSpanRef
+      match rawRes.outcome with
+      | .error e =>
+        ({ stack := rawRes.stack
+           machine := { stateAfterArgs.machine with memory := rawRes.state } },
+         .error (.stack e))
+      | .ok () =>
+        match rawRes.stack.currentFrame? with
+        | none =>
+          ({ stack := rawRes.stack
+             machine := { stateAfterArgs.machine with memory := rawRes.state } },
+           .error (.stack .emptyStack))
+        | some rawCalleeFrame =>
+          let calleeWithArgs := initCalleeArgLocals 1 argImms rawCalleeFrame
+          let stackWithArgs : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit :=
+            ⟨rawRes.stack.frames.pop.push calleeWithArgs⟩
+          let doneRes :=
+            stackWithArgs.pushStackFrameDone rawRes.state hooks
+          let finalState : AnnealStepState :=
+            { stack := doneRes.stack
+              machine := { stateAfterArgs.machine with memory := doneRes.state } }
+          match doneRes.outcome with
+          | .ok () => (finalState, .ok ())
+          | .error e => (finalState, .error (.stack e))
+
+/-- Evaluate a `Terminator.Call` in `LM-4.1`, mirroring Stage-1 `Trusted`
+`evalTerminator (.call ..)` (`Terminators.lean:3067-3246`) for constant
+function-item callees:
 1. Looks up the active basic block in `currentBody` to extract the callee
    `DefPath` (`extractCalleeDefPath?`);
-2. On a diverging call (`target = none`), faults with `StepError.undefinedBehavior`
-   when the callee is `"core::hint::unreachable_unchecked"`;
-3. On a returning call (`target = some targetBb`), evaluates the argument
-   operands left-to-right via `annealEvalCallArgsLM4_1`, resolves `calleeBody`
-   in `callees` via `findCallee?`, pushes the callee frame via
-   `Stack.pushStackFrameRaw`, initializes argument locals `1..=argImms.length`
-   via `initCalleeArgLocals`, and finishes frame setup via
-   `Stack.pushStackFrameDone` (making `_0` live and setting `location = .mir .start`). -/
+2. Evaluates the argument operands left-to-right via `annealEvalCallArgsLM4_1`
+   (Stage-1 `evalOperands`);
+3. When `calleeBody` is linked in `callees` (`findCallee?`), pushes its frame via
+   `annealPushCalleeFrameLM4_1` with continuation `.goto (some targetBb) unwind`
+   for a returning call (Stage-1 `pushCalleeFrame`) or `.goto none unwind` for a
+   diverging call (`target = none`; Stage-1 `pushDivergingCalleeFrame`,
+   `Terminators.lean:3201-3217`);
+4. When the callee is not linked, a diverging call to an unreachable call target
+   (`isUnreachableCallTarget defPath`, Stage-1 `Terminators.lean:3227-3228`)
+   faults with `StepError.undefinedBehavior`; every other unlinked call
+   (external calls, aborting/unwinding panics) is `.unsupported`. -/
 def annealEvalCallLM4_1
     (currentBody : CapturedMir)
     (callees : List CapturedMir)
@@ -2217,15 +2295,27 @@ def annealEvalCallLM4_1
       | none => (state, .error (.invalidBlock loc.block))
       | some bb =>
         match bb.terminator.kind, terminator.kind with
-        | .call func _ _ (.none) _, .Call _ _ _ .none _ _ _ =>
+        | .call func argOps _ (.none) _, .Call _ _ dest .none unwind _ _ =>
           match extractCalleeDefPath? func with
-          | some defPath =>
-            if isUnreachableCallTarget defPath then
-              (state, .error (.undefinedBehavior "entering unreachable_unchecked"))
-            else
-              (state, .error (.unsupported "diverging call to non-unreachable_unchecked"))
           | none =>
-            (state, .error (.unsupported "diverging call to non-unreachable_unchecked"))
+            (state, .error (.unsupported "diverging call with non-constant callee"))
+          | some defPath =>
+            let mirArgOps := argOps.map translateOperand
+            match Miri.Interpreter.runRvalue
+                (annealEvalCallArgsLM4_1 currentBody.localDecls currentBody.layouts mirArgOps)
+                state with
+            | (stateAfterArgs, .error err) => (stateAfterArgs, .error err)
+            | (stateAfterArgs, .ok argImms) =>
+              match findCallee? callees defPath with
+              | some calleeBody =>
+                annealPushCalleeFrameLM4_1 currentBody calleeBody dest none unwind
+                  argImms stateAfterArgs
+              | none =>
+                if isUnreachableCallTarget defPath then
+                  (stateAfterArgs, .error (.undefinedBehavior "entering unreachable_unchecked"))
+                else
+                  (stateAfterArgs,
+                   .error (.unsupported "diverging call to unlinked non-unreachable callee"))
         | .call func argOps _ (.some targetBb) _, .Call _ _ dest (.some _) unwind _ _ =>
           match extractCalleeDefPath? func with
           | none => (state, .error (.unsupported "call with non-constant callee"))
@@ -2239,51 +2329,8 @@ def annealEvalCallLM4_1
               match findCallee? callees defPath with
               | none => (stateAfterArgs, .error (.unsupported "unresolved external call"))
               | some calleeBody =>
-                match stateAfterArgs.stack.currentFrame? with
-                | none => (stateAfterArgs, .error (.stack .emptyStack))
-                | some callerFrameAfterArgs =>
-                  let callerFrameIdx := stateAfterArgs.stack.frames.size - 1
-                  match resolveCallerDestinationPlace currentBody callerFrameIdx callerFrameAfterArgs dest with
-                  | .error err => (stateAfterArgs, .error err)
-                  | .ok returnPlace =>
-                    let hooks := annealStackLifecycleHooksLM4_1 calleeBody.localDecls calleeBody.layouts
-                    let loadedCallee : Miri.Interpreter.LoadedBody :=
-                      ⟨.ofCanonicalIndex 0, translateBody calleeBody⟩
-                    let fnInst : Miri.Interpreter.CallInstance := ⟨.Item 0, #[]⟩
-                    let cont : Miri.Interpreter.ReturnContinuation :=
-                      .goto (some targetBb) unwind
-                    let rawRes :=
-                      stateAfterArgs.stack.pushStackFrameRaw
-                        stateAfterArgs.machine.memory
-                        hooks
-                        loadedCallee
-                        fnInst
-                        cont
-                        returnPlace
-                        defaultSpanRef
-                    match rawRes.outcome with
-                    | .error e =>
-                      ({ stack := rawRes.stack
-                         machine := { stateAfterArgs.machine with memory := rawRes.state } },
-                       .error (.stack e))
-                    | .ok () =>
-                      match rawRes.stack.currentFrame? with
-                      | none =>
-                        ({ stack := rawRes.stack
-                           machine := { stateAfterArgs.machine with memory := rawRes.state } },
-                         .error (.stack .emptyStack))
-                      | some rawCalleeFrame =>
-                        let calleeWithArgs := initCalleeArgLocals 1 argImms rawCalleeFrame
-                        let stackWithArgs : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit :=
-                          ⟨rawRes.stack.frames.pop.push calleeWithArgs⟩
-                        let doneRes :=
-                          stackWithArgs.pushStackFrameDone rawRes.state hooks
-                        let finalState : AnnealStepState :=
-                          { stack := doneRes.stack
-                            machine := { stateAfterArgs.machine with memory := doneRes.state } }
-                        match doneRes.outcome with
-                        | .ok () => (finalState, .ok ())
-                        | .error e => (finalState, .error (.stack e))
+                annealPushCalleeFrameLM4_1 currentBody calleeBody dest (some targetBb) unwind
+                  argImms stateAfterArgs
         | _, _ => (state, .error (.invalidProgram "mismatched call terminator"))
 
 /-- `TerminatorHooks` for `LM-4.1`, extending `annealTerminatorHooks` with
