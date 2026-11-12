@@ -4839,6 +4839,130 @@ theorem mirWpConverges_of_runCfgToBlock
   MirWpConverges.of_noCall
     (mirNoCallWpConverges_of_runCfgToBlock body post h_phase target s h_wp)
 
+/--
+Fuel-bounded partial-correctness (`mirSafePost`) state-to-state symbolic stepper
+over alias-erased `PureState` (permitting clean panics/aborts while forbidding UB;
+defaults `post` to `fun _ => False` matching `wpPureMirSteps`).
+-/
+def wpPureMirSafeSteps
+    (fuel : Nat) (body : CapturedMir) (ps : PureState)
+    (mid : PureState → Prop)
+    (post : Value → Prop := fun _ => False) : Prop :=
+  wpMirStepsSym fuel body (ps.toMachineState emptyMemory)
+    (fun ms' => mid (PureState.ofMachineState ms'))
+    (mirSafePost (fun retVal _ => post retVal))
+
+/--
+Fuel-free partial-correctness (`mirSafePost`) intermediate state convergence
+over alias-erased `PureState` (defaults `post` to `fun _ => False` matching
+`PureMirStepsConverges`).
+-/
+def PureMirSafeStepsConverges
+    (body : CapturedMir) (ps : PureState)
+    (mid : PureState → Prop)
+    (post : Value → Prop := fun _ => False) : Prop :=
+  ∃ fuel : Nat, wpPureMirSafeSteps fuel body ps mid post
+
+/-- Zero-step reflexivity for `PureMirSafeStepsConverges`. -/
+theorem PureMirSafeStepsConverges.refl
+    {body : CapturedMir} {ps : PureState}
+    {mid : PureState → Prop} {post : Value → Prop}
+    (h : mid ps) :
+    PureMirSafeStepsConverges body ps mid post :=
+  ⟨0, h⟩
+
+/-- Lift a panic-forbidding `PureMirStepsConverges` step into `PureMirSafeStepsConverges`. -/
+theorem PureMirSafeStepsConverges.of_steps
+    {body : CapturedMir} {ps : PureState}
+    {mid : PureState → Prop} {post : Value → Prop}
+    (h : PureMirStepsConverges body ps mid post) :
+    PureMirSafeStepsConverges body ps mid post := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirStepsSym_mono (fun _ hm => hm) (fun _ => mirNormalPost_imp_mirSafePost) h_wp⟩
+
+/--
+Sequential composition (`bind`) for partial-correctness `PureMirSafeConverges`
+over alias-erased `PureState`.
+-/
+theorem PureMirSafeConverges.bind
+    {body : CapturedMir} {ps : PureState}
+    {mid : PureState → Prop} {post : Value → Prop}
+    (h₁ : PureMirSafeStepsConverges body ps mid post)
+    (h₂ : ∀ ps', mid ps' → PureMirSafeConverges body ps' post)
+    (h_pure : checkPureMir body = true) :
+    PureMirSafeConverges body ps post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  have h_steps :
+      MirStepsConverges body (ps.toMachineState emptyMemory)
+        (fun ms' =>
+          mid (PureState.ofMachineState ms') ∧
+          ms' = (PureState.ofMachineState ms').toMachineState emptyMemory)
+        (mirSafePost (fun retVal _ => post retVal)) := by
+    suffices ∀ (f : Nat) (st : MirExecState),
+        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
+          (fun
+            | .running s' => mid (PureState.ofMachineState s')
+            | .halted out => mirSafePost (fun retVal _ => post retVal) out
+            | .faulted _ => False)
+          (mirSafePost (fun retVal _ => post retVal)) →
+        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
+          (fun
+            | .running s' =>
+              mid (PureState.ofMachineState s') ∧
+              s' = (PureState.ofMachineState s').toMachineState emptyMemory
+            | .halted out => mirSafePost (fun retVal _ => post retVal) out
+            | .faulted _ => False)
+          (mirSafePost (fun retVal _ => post retVal)) from
+      ⟨f₁, this f₁ (.running (ps.toMachineState emptyMemory)) hf₁⟩
+    intro f
+    induction f with
+    | zero =>
+      intro st h_st
+      cases st with
+      | running s' => exact ⟨h_st, rfl⟩
+      | halted out => exact h_st
+      | faulted _ => exact False.elim h_st
+    | succ f' ih =>
+      intro st h_st
+      cases st with
+      | halted _ =>
+        unfold wpMirExecStepsSym at h_st ⊢
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+        exact h_st
+      | faulted _ =>
+        unfold wpMirExecStepsSym at h_st
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st
+        exact False.elim h_st
+      | running s =>
+        unfold wpMirExecStepsSym at h_st ⊢
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+        dsimp only [MirExecState.withMem, stepMirState] at h_st ⊢
+        have h_eq :=
+          stepMirFn_toMachineState_eq_withMem (mem₀ := emptyMemory)
+            (PureState.ofMachineState s) h_pure rootActiveMemory_emptyMemory
+        dsimp only [PureState.toMachineState_ofMachineState] at h_eq
+        rw [h_eq] at h_st ⊢
+        cases h_step : stepMirFn body { s with memory := emptyMemory } with
+        | ret _ =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          exact h_st
+        | tau st' =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          exact ih st' h_st
+        | vis i k =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          cases i with
+          | inl _ => exact False.elim h_st
+          | inr i2 => cases i2 with
+            | inl _ => exact ih (k PUnit.unit) h_st
+            | inr _ => exact False.elim h_st
+  exact MirWpConverges.bind h_steps (fun ms' ⟨h_mid, h_eq⟩ => by
+    rw [h_eq]
+    exact h₂ (PureState.ofMachineState ms') h_mid)
+
 end Anneal.PureMirExec
 
 namespace Anneal.MirLiftCore
@@ -5407,14 +5531,206 @@ theorem lift_PureMirConverges_of_inferMinFragment_le_pureBoundedLoop
     h_lift
 
 /--
-**Backwards Topological DAG Lifting (`liftBlock_of_mirLiftDagReady_induct`)**:
-Because `checkMirLiftDagReady body = true` enforces `hasCfgBackedge body = false`,
-every CFG edge `bbIdx → succ` strictly increases block index (`bbIdx < succ`) and
-therefore strictly decreases `body.basicBlocks.length - bbIdx`. A caller can lift
-an arbitrary multi-block branching DAG from entry block `0` by giving a block
-invariant `BlockInv : BasicBlockIdx → PureEnv → Prop` and stepping each block to
-its outgoing `CfgEdge` successors—requiring neither manual fuel arithmetic nor a
+Partial-correctness (`mirSafePost`) block-lifting judgment over alias-erased
+`PureEnv`: forbids UB while permitting clean panics/aborts, and guarantees `post`
+on any normal return within `fuel` steps.
+-/
+def LiftSafeBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv)
+    (post : Value → Prop) (fuel : Nat) : Prop :=
+  wpPureMirSafeExec fuel body { bb := bbIdx, stmtIdx := 0, env := env } post
+
+/-- Every panic-forbidding `LiftBlock` proof implies `LiftSafeBlock`. -/
+theorem LiftSafeBlock.of_liftBlock
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv}
+    {post : Value → Prop} {fuel : Nat}
+    (h : LiftBlock body bbIdx env post fuel) :
+    LiftSafeBlock body bbIdx env post fuel := by
+  unfold LiftBlock wpPureMirExec at h
+  unfold LiftSafeBlock wpPureMirSafeExec
+  exact wpMirExecSym_mono_post (fun _ h_out => mirNormalPost_imp_mirSafePost h_out) h
+
+theorem liftSafe_PureMirSafeConverges_of_mirLiftReady
+    {body : CapturedMir} {args : List Value} {post : Value → Prop} {fuel : Nat}
+    (_h_ready : checkMirLiftReady body = true)
+    (h_lift : LiftSafeBlock body 0 (initPureEnv body args) post fuel) :
+    PureMirSafeConverges body (initPureState body args) post :=
+  ⟨fuel, h_lift⟩
+
+theorem liftSafe_PureMirSafeConverges_of_mirLiftDagReady
+    {body : CapturedMir} {args : List Value} {post : Value → Prop} {fuel : Nat}
+    (_h_ready : checkMirLiftDagReady body = true)
+    (h_lift : LiftSafeBlock body 0 (initPureEnv body args) post fuel) :
+    PureMirSafeConverges body (initPureState body args) post :=
+  ⟨fuel, h_lift⟩
+
+private def maxRankBoundAux (rank : Nat → Nat) : Nat → Nat
+  | 0 => 1
+  | k + 1 => max (maxRankBoundAux rank k) (rank k + 1)
+
+private theorem rank_lt_maxRankBoundAux (rank : Nat → Nat) :
+    ∀ (n i : Nat), i < n → rank i < maxRankBoundAux rank n
+  | 0, _, hi => nomatch hi
+  | k + 1, i, hi => by
+    dsimp only [maxRankBoundAux]
+    if h_eq : i = k then
+      subst h_eq
+      omega
+    else
+      have h_lt : rank i < maxRankBoundAux rank k :=
+        rank_lt_maxRankBoundAux rank k i (by omega)
+      omega
+
+/--
+**General Rank-Certificate DAG Block Induction (`dagBlockInduct_of_hasRankViolation_false`)**:
+Along any violation-free rank certificate `hasRankViolation rank body = false`,
+every in-range edge `bbIdx → succ` strictly increases `rank` and strictly
+decreases `maxRankBoundAux rank body.basicBlocks.length - rank bbIdx` (with
+out-of-bounds targets given measure `0`). Proves `Goal 0 env₀` for any
+`Goal : BasicBlockIdx → PureEnv → Prop` from per-block `CfgEdge` stepping
+without requiring any user-supplied loop measure or in-bounds invariant side
+condition.
+-/
+theorem dagBlockInduct_of_hasRankViolation_false
+    {body : CapturedMir} {rank : Nat → Nat} {env₀ : PureEnv}
+    (h_no : hasRankViolation rank body = false)
+    (BlockInv Goal : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' → Goal succ env') →
+      Goal bbIdx env) :
+    Goal 0 env₀ := by
+  let n := body.basicBlocks.length
+  let M := maxRankBoundAux rank n
+  let mu : BasicBlockIdx → Nat := fun idx =>
+    if idx < n then M - rank idx else 0
+  have h_gen :
+      ∀ d bbIdx env,
+        mu bbIdx = d →
+        BlockInv bbIdx env →
+        Goal bbIdx env := by
+    apply nat_strong_induction
+      (fun d => ∀ bbIdx env, mu bbIdx = d → BlockInv bbIdx env → Goal bbIdx env)
+    intro d ih bbIdx env h_eq h_inv
+    refine h_step bbIdx env h_inv (fun succ env' h_edge h_succ_inv => ?_)
+    have h_u_lt : bbIdx < n := lt_length_of_cfgEdge h_edge
+    have h_ru_lt : rank bbIdx < M := rank_lt_maxRankBoundAux rank n bbIdx h_u_lt
+    have h_mu_lt : mu succ < d := by
+      dsimp only [mu] at h_eq ⊢
+      simp only [h_u_lt, ↓reduceIte] at h_eq
+      if h_v_lt : succ < n then
+        have h_rv_lt : rank succ < M := rank_lt_maxRankBoundAux rank n succ h_v_lt
+        have h_edge_rk : rank bbIdx < rank succ :=
+          cfgEdge_rank_lt_of_hasRankViolation_false h_no h_edge h_v_lt
+        simp only [h_v_lt, ↓reduceIte]
+        omega
+      else
+        simp only [h_v_lt, ↓reduceIte]
+        omega
+    exact ih (mu succ) h_mu_lt succ env' rfl h_succ_inv
+  exact h_gen (mu 0) 0 env₀ rfl h_init
+
+/--
+Index-order specialization of `dagBlockInduct_of_hasRankViolation_false` under
+`hasCfgBackedge body = false` (`rank = id`).
+-/
+theorem dagBlockInduct_of_hasCfgBackedge_false
+    {body : CapturedMir} {env₀ : PureEnv}
+    (h_no_be : hasCfgBackedge body = false)
+    (BlockInv Goal : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' → Goal succ env') →
+      Goal bbIdx env) :
+    Goal 0 env₀ :=
+  dagBlockInduct_of_hasRankViolation_false
+    ((hasRankViolation_id_eq_hasCfgBackedge body).trans h_no_be)
+    BlockInv Goal h_init h_step
+
+/--
+General DAG specialization of `dagBlockInduct_of_hasRankViolation_false` under
+`isCfgDag body = true` (`rank = dagRank body`), handling acyclic MIR bodies with
+non-topological block numbering (such as `rustc`'s shared-return blocks).
+-/
+theorem dagBlockInduct_of_isCfgDag
+    {body : CapturedMir} {env₀ : PureEnv}
+    (h_dag : isCfgDag body = true)
+    (BlockInv Goal : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' → Goal succ env') →
+      Goal bbIdx env) :
+    Goal 0 env₀ :=
+  dagBlockInduct_of_hasRankViolation_false
+    (by simpa [isCfgDag] using h_dag)
+    BlockInv Goal h_init h_step
+
+/--
+Rank-certificate `LiftBlock` DAG induction (`hasRankViolation rank body = false`):
+eliminates global path-fuel bounds and loop ranking functions (each block steps
+locally and composes its step count with the existential fuel of its `CfgEdge`
+successors).
+-/
+theorem liftBlock_of_hasRankViolation_false_induct
+    {body : CapturedMir} {rank : Nat → Nat} {env₀ : PureEnv} {post : Value → Prop}
+    (h_no : hasRankViolation rank body = false)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftBlock body succ env' post fuel) →
+      ∃ fuel, LiftBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_hasRankViolation_false h_no BlockInv
+    (fun bbIdx env => ∃ fuel, LiftBlock body bbIdx env post fuel)
+    h_init h_step
+
+/--
+CFG-only `LiftBlock` DAG induction (`hasCfgBackedge body = false`): lifts any
+multi-block index-order DAG from block `0` without global path-fuel bounds or
+user-supplied ranking functions (per-block fuel still composes existentially
+with successor fuel).
+-/
+theorem liftBlock_of_hasCfgBackedge_false_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_no_be : hasCfgBackedge body = false)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftBlock body succ env' post fuel) →
+      ∃ fuel, LiftBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_hasCfgBackedge_false h_no_be BlockInv
+    (fun bbIdx env => ∃ fuel, LiftBlock body bbIdx env post fuel)
+    h_init h_step
+
+/--
+General-DAG `LiftBlock` induction (`isCfgDag body = true`): lifts any acyclic
+CFG (including non-topologically numbered `rustc` MIR with shared return blocks)
+from block `0` using `dagRank body`, without global path-fuel bounds or a
 user-supplied ranking function.
+-/
+theorem liftBlock_of_isCfgDag_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_dag : isCfgDag body = true)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftBlock body succ env' post fuel) →
+      ∃ fuel, LiftBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_isCfgDag h_dag BlockInv
+    (fun bbIdx env => ∃ fuel, LiftBlock body bbIdx env post fuel)
+    h_init h_step
+
+/--
+**Backwards Topological DAG Lifting (`liftBlock_of_mirLiftDagReady_induct`)**:
+Specialization of `liftBlock_of_hasCfgBackedge_false_induct` to
+`checkMirLiftDagReady body = true`. Eliminates global path-fuel bounds and
+user-supplied ranking functions when lifting multi-block branching DAGs from
+entry block `0` (while each single block still composes its local step count
+with the existential fuel of its outgoing `CfgEdge` successors).
 -/
 theorem liftBlock_of_mirLiftDagReady_induct
     {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
@@ -5425,24 +5741,66 @@ theorem liftBlock_of_mirLiftDagReady_induct
       (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
         ∃ fuel, LiftBlock body succ env' post fuel) →
       ∃ fuel, LiftBlock body bbIdx env post fuel) :
-    ∃ fuel, LiftBlock body 0 env₀ post fuel := by
-  have h_gen :
-      ∀ d bbIdx env,
-        body.basicBlocks.length - bbIdx = d →
-        BlockInv bbIdx env →
-        ∃ fuel, LiftBlock body bbIdx env post fuel := by
-    apply nat_strong_induction
-      (fun d => ∀ bbIdx env,
-        body.basicBlocks.length - bbIdx = d →
-        BlockInv bbIdx env →
-        ∃ fuel, LiftBlock body bbIdx env post fuel)
-    intro d ih bbIdx env h_eq h_inv
-    refine h_step bbIdx env h_inv (fun succ env' h_edge h_succ_inv => ?_)
-    have h_u_lt : bbIdx < body.basicBlocks.length := lt_length_of_cfgEdge h_edge
-    have h_edge_lt : bbIdx < succ := cfgEdge_lt_of_mirLiftDagReady h_ready h_edge
-    have h_sub_lt : body.basicBlocks.length - succ < d := by omega
-    exact ih (body.basicBlocks.length - succ) h_sub_lt succ env' rfl h_succ_inv
-  exact h_gen (body.basicBlocks.length - 0) 0 env₀ rfl h_init
+    ∃ fuel, LiftBlock body 0 env₀ post fuel :=
+  liftBlock_of_hasCfgBackedge_false_induct
+    (hasCfgBackedge_false_of_mirLiftDagReady h_ready)
+    BlockInv h_init h_step
+
+theorem liftSafeBlock_of_hasRankViolation_false_induct
+    {body : CapturedMir} {rank : Nat → Nat} {env₀ : PureEnv} {post : Value → Prop}
+    (h_no : hasRankViolation rank body = false)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftSafeBlock body succ env' post fuel) →
+      ∃ fuel, LiftSafeBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftSafeBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_hasRankViolation_false h_no BlockInv
+    (fun bbIdx env => ∃ fuel, LiftSafeBlock body bbIdx env post fuel)
+    h_init h_step
+
+theorem liftSafeBlock_of_hasCfgBackedge_false_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_no_be : hasCfgBackedge body = false)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftSafeBlock body succ env' post fuel) →
+      ∃ fuel, LiftSafeBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftSafeBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_hasCfgBackedge_false h_no_be BlockInv
+    (fun bbIdx env => ∃ fuel, LiftSafeBlock body bbIdx env post fuel)
+    h_init h_step
+
+theorem liftSafeBlock_of_isCfgDag_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_dag : isCfgDag body = true)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftSafeBlock body succ env' post fuel) →
+      ∃ fuel, LiftSafeBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftSafeBlock body 0 env₀ post fuel :=
+  dagBlockInduct_of_isCfgDag h_dag BlockInv
+    (fun bbIdx env => ∃ fuel, LiftSafeBlock body bbIdx env post fuel)
+    h_init h_step
+
+theorem liftSafeBlock_of_mirLiftDagReady_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_ready : checkMirLiftDagReady body = true)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftSafeBlock body succ env' post fuel) →
+      ∃ fuel, LiftSafeBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftSafeBlock body 0 env₀ post fuel :=
+  liftSafeBlock_of_hasCfgBackedge_false_induct
+    (hasCfgBackedge_false_of_mirLiftDagReady h_ready)
+    BlockInv h_init h_step
 
 /--
 Readiness-discharged `cons_eval` step rule: extracts `h_phase` and
@@ -5716,8 +6074,8 @@ theorem verifyMirNoPanic_of_mirLiftDagReady_fuel
 Backwards-topological DAG induction gate (`verifyMirNoPanic_of_mirLiftDagReady_induct`):
 discharges `VerificationResult c` for any `checkMirLiftDagReady c.body = true`
 body by stepping each `BlockInv` block to its outgoing `CfgEdge` successors,
-using `hasCfgBackedge c.body = false` instead of manual fuel arithmetic or loop
-ranking functions.
+removing any global path-fuel bound or user-supplied loop ranking function
+(each block composes its local step fuel with its successor's existential fuel).
 -/
 theorem verifyMirNoPanic_of_mirLiftDagReady_induct
     (c : Claim)
@@ -5733,6 +6091,28 @@ theorem verifyMirNoPanic_of_mirLiftDagReady_induct
     liftBlock_of_mirLiftDagReady_induct h_ready (BlockInv args)
       (h_init args h_pre) (h_step args h_pre))
 
+/--
+General-DAG induction gate (`verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct`):
+discharges `VerificationResult c` for any `checkMirLiftReady c.body = true` body
+certified acyclic by `isCfgDag c.body = true` (including non-topological `rustc`
+MIR with shared return blocks), removing global path-fuel bounds and user-supplied
+ranking functions.
+-/
+theorem verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct
+    (c : Claim)
+    (h_ready : checkMirLiftReady c.body = true)
+    (h_dag : isCfgDag c.body = true := by decide)
+    (BlockInv : List Value → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args, c.pre args → BlockInv args 0 (initPureEnv c.body args))
+    (h_step : ∀ args, c.pre args → ∀ bbIdx env, BlockInv args bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args succ env' →
+        ∃ fuel, LiftBlock c.body succ env' (c.post args) fuel) →
+      ∃ fuel, LiftBlock c.body bbIdx env (c.post args) fuel) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_mirLiftReady c h_ready (fun args h_pre =>
+    liftBlock_of_isCfgDag_induct h_dag (BlockInv args)
+      (h_init args h_pre) (h_step args h_pre))
+
 theorem verifyMirSafe_of_mirLiftDagReady
     (c : Claim)
     (h_ready : checkMirLiftDagReady c.body = true)
@@ -5742,6 +6122,27 @@ theorem verifyMirSafe_of_mirLiftDagReady
   verifyMirSafe_of_mirLiftReady c
     (checkMirLiftReady_of_dagReady h_ready)
     h_exec
+
+/--
+Partial-correctness (`mirSafePost`) backwards-topological DAG induction gate
+(`verifyMirSafe_of_mirLiftDagReady_induct`) over `LiftSafeBlock`, removing
+global path-fuel bounds and loop ranking functions while permitting clean panics.
+-/
+theorem verifyMirSafe_of_mirLiftDagReady_induct
+    (c : Claim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (BlockInv : List Value → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args, c.pre args → BlockInv args 0 (initPureEnv c.body args))
+    (h_step : ∀ args, c.pre args → ∀ bbIdx env, BlockInv args bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args succ env' →
+        ∃ fuel, LiftSafeBlock c.body succ env' (c.post args) fuel) →
+      ∃ fuel, LiftSafeBlock c.body bbIdx env (c.post args) fuel) :
+    VerificationResult c :=
+  verifyMirSafe_of_mirLiftDagReady c h_ready (fun args h_pre =>
+    let ⟨_, hf⟩ :=
+      liftSafeBlock_of_mirLiftDagReady_induct h_ready (BlockInv args)
+        (h_init args h_pre) (h_step args h_pre)
+    liftSafe_PureMirSafeConverges_of_mirLiftDagReady h_ready hf)
 
 theorem verifyStatefulMirNoPanic_of_mirLiftReady
     (c : StatefulClaim)
@@ -5762,6 +6163,22 @@ theorem verifyStatefulMirNoPanic_of_mirLiftReady
       let ⟨_, hf⟩ := h_lift args mem hp
       lift_PureMirConverges_of_mirLiftReady h_ready hf)
 
+theorem verifyStatefulMirSafe_of_mirLiftReady
+    (c : StatefulClaim)
+    (h_ready : checkMirLiftReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (h_exec : ∀ args mem, c.pre args mem →
+      PureMirSafeConverges c.body (initPureState c.body args)
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_pureExec c
+    (checkPureMir_of_mirLiftReady h_ready)
+    h_root
+    h_exec
+
 theorem verifyStatefulMirNoPanic_of_mirLiftDagReady
     (c : StatefulClaim)
     (h_ready : checkMirLiftDagReady c.body = true)
@@ -5778,6 +6195,85 @@ theorem verifyStatefulMirNoPanic_of_mirLiftDagReady
     (checkMirLiftReady_of_dagReady h_ready)
     h_root
     h_lift
+
+/--
+Stateful panic-forbidding backwards-topological DAG induction gate
+(`verifyStatefulMirNoPanic_of_mirLiftDagReady_induct`), removing global path-fuel
+bounds and user-supplied ranking functions while framing initial memory.
+-/
+theorem verifyStatefulMirNoPanic_of_mirLiftDagReady_induct
+    (c : StatefulClaim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (BlockInv : List Value → Memory → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args mem, c.pre args mem →
+      BlockInv args mem 0 (initPureEnv c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ bbIdx env, BlockInv args mem bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args mem succ env' →
+        ∃ fuel, LiftBlock c.body succ env'
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)
+          fuel) →
+      ∃ fuel, LiftBlock c.body bbIdx env
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)
+        fuel) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_of_mirLiftDagReady c h_ready h_root (fun args mem hp =>
+    liftBlock_of_mirLiftDagReady_induct h_ready (BlockInv args mem)
+      (h_init args mem hp) (h_step args mem hp))
+
+theorem verifyStatefulMirSafe_of_mirLiftDagReady
+    (c : StatefulClaim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (h_exec : ∀ args mem, c.pre args mem →
+      PureMirSafeConverges c.body (initPureState c.body args)
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_mirLiftReady c
+    (checkMirLiftReady_of_dagReady h_ready)
+    h_root
+    h_exec
+
+/--
+Stateful partial-correctness (`mirSafePost`) backwards-topological DAG induction
+gate (`verifyStatefulMirSafe_of_mirLiftDagReady_induct`) over `LiftSafeBlock`.
+-/
+theorem verifyStatefulMirSafe_of_mirLiftDagReady_induct
+    (c : StatefulClaim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (BlockInv : List Value → Memory → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args mem, c.pre args mem →
+      BlockInv args mem 0 (initPureEnv c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ bbIdx env, BlockInv args mem bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args mem succ env' →
+        ∃ fuel, LiftSafeBlock c.body succ env'
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)
+          fuel) →
+      ∃ fuel, LiftSafeBlock c.body bbIdx env
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)
+        fuel) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_mirLiftDagReady c h_ready h_root (fun args mem hp =>
+    let ⟨_, hf⟩ :=
+      liftSafeBlock_of_mirLiftDagReady_induct h_ready (BlockInv args mem)
+        (h_init args mem hp) (h_step args mem hp)
+    liftSafe_PureMirSafeConverges_of_mirLiftDagReady h_ready hf)
 
 theorem verifyTotalMir_of_mirLiftReady
     (c : TotalClaim)
@@ -5814,6 +6310,37 @@ theorem verifyTotalMir_of_mirLiftDagReady
     (checkMirLiftReady_of_dagReady h_ready)
     h_root
     h_lift
+
+/--
+Total-correctness (`TotalVerificationResult`) backwards-topological DAG induction
+gate (`verifyTotalMir_of_mirLiftDagReady_induct`), removing global path-fuel
+bounds and user-supplied ranking functions while framing initial memory.
+-/
+theorem verifyTotalMir_of_mirLiftDagReady_induct
+    (c : TotalClaim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (BlockInv : List Value → Memory → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args mem, c.pre args mem →
+      BlockInv args mem 0 (initPureEnv c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ bbIdx env, BlockInv args mem bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args mem succ env' →
+        ∃ fuel, LiftBlock c.body succ env'
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)
+          fuel) →
+      ∃ fuel, LiftBlock c.body bbIdx env
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)
+        fuel) :
+    TotalVerificationResult c :=
+  verifyTotalMir_of_mirLiftDagReady c h_ready h_root (fun args mem hp =>
+    liftBlock_of_mirLiftDagReady_induct h_ready (BlockInv args mem)
+      (h_init args mem hp) (h_step args mem hp))
 
 /--
 Alias-erased well-founded `while`-loop convergence over `PureState`:
@@ -5970,120 +6497,6 @@ theorem verifyMirNoPanic_of_mirLoopLiftReady {α : Type}
         (initPureState c.body args) (a₀ args) (c.post args)
         (checkPureMir_of_mirLoopLiftReady h_ready)
         (h_init args hp) (h_step args hp))
-
-/--
-Fuel-bounded partial-correctness (`mirSafePost`) state-to-state symbolic stepper
-over alias-erased `PureState` (permitting clean panics/aborts while forbidding UB).
--/
-def wpPureMirSafeSteps
-    (fuel : Nat) (body : CapturedMir) (ps : PureState)
-    (mid : PureState → Prop)
-    (post : Value → Prop := fun _ => True) : Prop :=
-  wpMirStepsSym fuel body (ps.toMachineState emptyMemory)
-    (fun ms' => mid (PureState.ofMachineState ms'))
-    (mirSafePost (fun retVal _ => post retVal))
-
-/--
-Fuel-free partial-correctness (`mirSafePost`) intermediate state convergence
-over alias-erased `PureState`.
--/
-def PureMirSafeStepsConverges
-    (body : CapturedMir) (ps : PureState)
-    (mid : PureState → Prop)
-    (post : Value → Prop := fun _ => True) : Prop :=
-  ∃ fuel : Nat, wpPureMirSafeSteps fuel body ps mid post
-
-/-- Lift a panic-forbidding `PureMirStepsConverges` step into `PureMirSafeStepsConverges`. -/
-theorem PureMirSafeStepsConverges.of_steps
-    {body : CapturedMir} {ps : PureState}
-    {mid : PureState → Prop} {post : Value → Prop}
-    (h : PureMirStepsConverges body ps mid post) :
-    PureMirSafeStepsConverges body ps mid post := by
-  rcases h with ⟨fuel, h_wp⟩
-  exact ⟨fuel, wpMirStepsSym_mono (fun _ hm => hm) (fun _ => mirNormalPost_imp_mirSafePost) h_wp⟩
-
-/--
-Sequential composition (`bind`) for partial-correctness `PureMirSafeConverges`
-over alias-erased `PureState`.
--/
-theorem PureMirSafeConverges.bind
-    {body : CapturedMir} {ps : PureState}
-    {mid : PureState → Prop} {post : Value → Prop}
-    (h₁ : PureMirSafeStepsConverges body ps mid post)
-    (h₂ : ∀ ps', mid ps' → PureMirSafeConverges body ps' post)
-    (h_pure : checkPureMir body = true) :
-    PureMirSafeConverges body ps post := by
-  rcases h₁ with ⟨f₁, hf₁⟩
-  have h_steps :
-      MirStepsConverges body (ps.toMachineState emptyMemory)
-        (fun ms' =>
-          mid (PureState.ofMachineState ms') ∧
-          ms' = (PureState.ofMachineState ms').toMachineState emptyMemory)
-        (mirSafePost (fun retVal _ => post retVal)) := by
-    suffices ∀ (f : Nat) (st : MirExecState),
-        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
-          (fun
-            | .running s' => mid (PureState.ofMachineState s')
-            | .halted out => mirSafePost (fun retVal _ => post retVal) out
-            | .faulted _ => False)
-          (mirSafePost (fun retVal _ => post retVal)) →
-        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
-          (fun
-            | .running s' =>
-              mid (PureState.ofMachineState s') ∧
-              s' = (PureState.ofMachineState s').toMachineState emptyMemory
-            | .halted out => mirSafePost (fun retVal _ => post retVal) out
-            | .faulted _ => False)
-          (mirSafePost (fun retVal _ => post retVal)) from
-      ⟨f₁, this f₁ (.running (ps.toMachineState emptyMemory)) hf₁⟩
-    intro f
-    induction f with
-    | zero =>
-      intro st h_st
-      cases st with
-      | running s' => exact ⟨h_st, rfl⟩
-      | halted out => exact h_st
-      | faulted _ => exact False.elim h_st
-    | succ f' ih =>
-      intro st h_st
-      cases st with
-      | halted out =>
-        unfold wpMirExecStepsSym at h_st ⊢
-        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
-        exact h_st
-      | faulted _ =>
-        unfold wpMirExecStepsSym at h_st
-        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st
-        exact False.elim h_st
-      | running s =>
-        unfold wpMirExecStepsSym at h_st ⊢
-        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
-        dsimp only [MirExecState.withMem, stepMirState] at h_st ⊢
-        have h_eq :=
-          stepMirFn_toMachineState_eq_withMem (mem₀ := emptyMemory)
-            (PureState.ofMachineState s) h_pure rootActiveMemory_emptyMemory
-        dsimp only [PureState.toMachineState_ofMachineState] at h_eq
-        rw [h_eq] at h_st ⊢
-        cases h_step : stepMirFn body { s with memory := emptyMemory } with
-        | ret _ =>
-          rw [h_step] at h_st
-          dsimp only [MirStepNode.withMem] at h_st
-          exact h_st
-        | tau st' =>
-          rw [h_step] at h_st
-          dsimp only [MirStepNode.withMem] at h_st
-          exact ih st' h_st
-        | vis i k =>
-          rw [h_step] at h_st
-          dsimp only [MirStepNode.withMem] at h_st
-          cases i with
-          | inl _ => exact False.elim h_st
-          | inr i2 => cases i2 with
-            | inl _ => exact ih (k PUnit.unit) h_st
-            | inr _ => exact False.elim h_st
-  exact MirWpConverges.bind h_steps (fun ms' ⟨h_mid, h_eq⟩ => by
-    rw [h_eq]
-    exact h₂ (PureState.ofMachineState ms') h_mid)
 
 /--
 Alias-erased partial-correctness (`mirSafePost`) well-founded `while`-loop
@@ -6729,6 +7142,160 @@ theorem verifyTotal_witnessCountdownAccumLoop :
             stmtIdx := 0
             env := [.init (.scalar ⟨x - (r + 1), 4⟩), .init (.scalar ⟨r + 1, 4⟩)] }
         rw [h_acc_wrap, h_rem_wrap]
+
+/--
+Non-topologically-numbered shared-return DAG witness (`argCount := 1`, `_1 : u32`):
+- `bb0`: `switchInt(Copy(_1)) [0 => bb2, otherwise => bb3]`
+- `bb1`: `return_` (shared return block numbered BEFORE `bb2` and `bb3`)
+- `bb2`: `_0 = const 10u32; goto -> bb1` (index back-edge `2 -> 1`, `1 ≤ 2`)
+- `bb3`: `_0 = const 20u32; goto -> bb1` (index back-edge `3 -> 1`, `1 ≤ 3`)
+Here `hasCfgBackedge = true` (`checkMirLiftDagReady = false`), yet `isCfgDag = true`
+and `checkMirLiftReady = true`.
+-/
+def witnessSharedReturnDag : CapturedMir where
+  defPath := "Anneal::MirLiftCore::witness_shared_return_dag"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := witnessU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := witnessU32Ty, debugName := some "x" }
+  ]
+  basicBlocks := [
+    -- bb0
+    { statements := []
+      terminator := {
+        kind := .switchInt (.copy { local_ := 1, projection := [] })
+          { branches := [(0, 2)], otherwise := 3 }
+        span := "sw"
+      }
+      isCleanup := false },
+    -- bb1 (shared return numbered before arms!)
+    { statements := []
+      terminator := { kind := .return_, span := "ret" }
+      isCleanup := false },
+    -- bb2 (x == 0)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] } (.use (witnessConstU32 10)), span := "c10" }
+      ]
+      terminator := { kind := .goto 1, span := "g1a" }
+      isCleanup := false },
+    -- bb3 (x != 0)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] } (.use (witnessConstU32 20)), span := "c20" }
+      ]
+      terminator := { kind := .goto 1, span := "g1b" }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [{ layout := witnessU32Layout, mode := .direct }]
+    ret := { layout := witnessU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := witnessLayouts
+  allocations := []
+
+theorem hasCfgBackedge_witnessSharedReturnDag :
+    hasCfgBackedge witnessSharedReturnDag = true := rfl
+
+theorem checkMirLiftDagReady_witnessSharedReturnDag :
+    checkMirLiftDagReady witnessSharedReturnDag = false := rfl
+
+theorem isCfgDag_witnessSharedReturnDag :
+    isCfgDag witnessSharedReturnDag = true := rfl
+
+theorem checkMirLiftReady_witnessSharedReturnDag :
+    checkMirLiftReady witnessSharedReturnDag = true := rfl
+
+def witnessSharedReturnDagPre (args : List Value) : Prop :=
+  ∃ x : Nat, args = [.scalar { bits := x, sizeBytes := 4 }]
+
+theorem witnessSharedReturnDagPre_nonVacuous :
+    ∃ args, witnessSharedReturnDagPre args :=
+  ⟨[.scalar { bits := 7, sizeBytes := 4 }], 7, rfl⟩
+
+private def witnessSharedReturnBlockInv
+    (args : List Value) (bbIdx : BasicBlockIdx) (env : PureEnv) : Prop :=
+  ∃ x : Nat,
+    args = [.scalar { bits := x, sizeBytes := 4 }] ∧
+    match bbIdx with
+    | 0 => env = [.uninit, .init (.scalar ⟨x, 4⟩)]
+    | 1 => env = [.init (.scalar ⟨if x = 0 then 10 else 20, 4⟩), .init (.scalar ⟨x, 4⟩)]
+    | 2 => x = 0 ∧ env = [.uninit, .init (.scalar ⟨0, 4⟩)]
+    | 3 => x ≠ 0 ∧ env = [.uninit, .init (.scalar ⟨x, 4⟩)]
+    | _ => False
+
+/--
+End-to-end symbolic `VerificationResult` for `witnessSharedReturnDag` (where
+`hasCfgBackedge = true` and `isCfgDag = true`), proved via
+`verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct` with no user-supplied rank
+function.
+-/
+theorem verify_witnessSharedReturnDag_via_isCfgDag_induct :
+    VerificationResult
+      { body := witnessSharedReturnDag
+        pre := witnessSharedReturnDagPre
+        post := fun args retVal =>
+          ∀ x : Nat,
+            args = [.scalar { bits := x, sizeBytes := 4 }] →
+            retVal = .scalar { bits := if x = 0 then 10 else 20, sizeBytes := 4 }
+        callees := [] } := by
+  have h_r := checkMirLiftReady_witnessSharedReturnDag
+  refine verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct _
+    h_r isCfgDag_witnessSharedReturnDag witnessSharedReturnBlockInv
+    (fun args hp => by
+      rcases hp with ⟨x, rfl⟩
+      exact ⟨x, rfl, rfl⟩)
+    (fun args _ bbIdx env h_inv ih => ?_)
+  rcases h_inv with ⟨x, h_args, h_env⟩
+  subst h_args
+  match bbIdx with
+  | 0 =>
+    subst h_env
+    cases x with
+    | zero =>
+      have h_edge : CfgEdge witnessSharedReturnDag 0 2 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+      obtain ⟨f, hf⟩ := ih 2 _ h_edge ⟨0, rfl, rfl, rfl⟩
+      refine ⟨f + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+      exact LiftStmtsTerminator.term_switchInt_ready (sc := ⟨0, 4⟩)
+        h_r (by rfl) rfl rfl (by rfl) rfl hf
+    | succ x' =>
+      have h_edge : CfgEdge witnessSharedReturnDag 0 3 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+      obtain ⟨f, hf⟩ := ih 3 _ h_edge ⟨x' + 1, rfl, Nat.succ_ne_zero x', rfl⟩
+      refine ⟨f + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+      exact LiftStmtsTerminator.term_switchInt_ready (sc := ⟨x' + 1, 4⟩)
+        h_r (by rfl) rfl rfl (by rfl) rfl hf
+  | 1 =>
+    subst h_env
+    refine ⟨1, LiftBlock.of_lookup (by rfl) ?_⟩
+    refine LiftStmtsTerminator.term_return_ready h_r (by rfl) rfl rfl (by rfl) ?_
+    intro x' h_eq
+    injection h_eq with h_sc _
+    injection h_sc with h_v
+    cases h_v
+    rfl
+  | 2 =>
+    rcases h_env with ⟨rfl, h_e⟩
+    subst h_e
+    have h_edge : CfgEdge witnessSharedReturnDag 2 1 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ := ih 1 _ h_edge ⟨0, rfl, rfl⟩
+    refine ⟨f + 1 + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+    exact LiftStmtsTerminator.eval_rest_ready h_r (by rfl) (by rfl)
+      (LiftStmtsTerminator.term_goto_ready h_r (by rfl) rfl rfl hf)
+  | 3 =>
+    rcases h_env with ⟨hx_ne, h_e⟩
+    subst h_e
+    have h_if : (if x = 0 then 10 else 20) = 20 := if_neg hx_ne
+    have h_edge : CfgEdge witnessSharedReturnDag 3 1 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ :=
+      ih 1 [.init (.scalar ⟨20, 4⟩), .init (.scalar ⟨x, 4⟩)]
+        h_edge ⟨x, rfl, by rw [h_if]; rfl⟩
+    refine ⟨f + 1 + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+    exact LiftStmtsTerminator.eval_rest_ready h_r (by rfl) (by rfl)
+      (LiftStmtsTerminator.term_goto_ready h_r (by rfl) rfl rfl hf)
+  | n + 4 =>
+    exact False.elim h_env
 
 end MirLiftReadyWitness
 

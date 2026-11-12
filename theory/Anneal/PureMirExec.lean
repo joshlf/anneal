@@ -25002,19 +25002,16 @@ end MirFragment.Witness
 protected abbrev witnessExposeProvenanceCast : CapturedMir :=
   MirFragment.Witness.witnessExposeProvenanceCast
 
-protected theorem inferMinFragment_witnessExposeProvenanceCast :
-    inferMinFragment MirFragment.Witness.witnessExposeProvenanceCast = .fullMir :=
-  rfl
+protected abbrev inferMinFragment_witnessExposeProvenanceCast :=
+  @MirFragment.Witness.inferMinFragment_witnessExposeProvenanceCast
 
 protected abbrev witnessPtrRelAssign : CapturedMir :=
   MirFragment.Witness.witnessPtrRelAssign
 
-protected theorem inferMinFragment_witnessPtrRelAssign :
-    inferMinFragment MirFragment.Witness.witnessPtrRelAssign = .pureLoopFree :=
-  rfl
+protected abbrev inferMinFragment_witnessPtrRelAssign :=
+  @MirFragment.Witness.inferMinFragment_witnessPtrRelAssign
 
-protected theorem inferBorrowFreeMinFragment_witnessPtrRelAssign :
-    inferBorrowFreeMinFragment MirFragment.Witness.witnessPtrRelAssign = .treeBorrowsLocal :=
-  rfl
+protected abbrev inferBorrowFreeMinFragment_witnessPtrRelAssign :=
+  @MirFragment.Witness.inferBorrowFreeMinFragment_witnessPtrRelAssign
 
 end Anneal.PureMirExec
