@@ -6101,13 +6101,13 @@ ranking functions.
 theorem verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct
     (c : Claim)
     (h_ready : checkMirLiftReady c.body = true)
-    (h_dag : isCfgDag c.body = true := by decide)
     (BlockInv : List Value → BasicBlockIdx → PureEnv → Prop)
     (h_init : ∀ args, c.pre args → BlockInv args 0 (initPureEnv c.body args))
     (h_step : ∀ args, c.pre args → ∀ bbIdx env, BlockInv args bbIdx env →
       (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args succ env' →
         ∃ fuel, LiftBlock c.body succ env' (c.post args) fuel) →
-      ∃ fuel, LiftBlock c.body bbIdx env (c.post args) fuel) :
+      ∃ fuel, LiftBlock c.body bbIdx env (c.post args) fuel)
+    (h_dag : isCfgDag c.body = true := by decide) :
     VerificationResult c :=
   verifyMirNoPanic_of_mirLiftReady c h_ready (fun args h_pre =>
     liftBlock_of_isCfgDag_induct h_dag (BlockInv args)
@@ -7243,7 +7243,7 @@ theorem verify_witnessSharedReturnDag_via_isCfgDag_induct :
         callees := [] } := by
   have h_r := checkMirLiftReady_witnessSharedReturnDag
   refine verifyMirNoPanic_of_isCfgDag_mirLiftReady_induct _
-    h_r isCfgDag_witnessSharedReturnDag witnessSharedReturnBlockInv
+    h_r witnessSharedReturnBlockInv
     (fun args hp => by
       rcases hp with ⟨x, rfl⟩
       exact ⟨x, rfl, rfl⟩)
