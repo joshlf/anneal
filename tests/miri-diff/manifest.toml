@@ -685,3 +685,18 @@ upstream_path = "tests/fail/tree_borrows/write-during-2phase.rs"
 miri_verdict = "ub"
 miri_ub_span = "src/lib.rs:841:9"
 fuel = 128
+
+[[tests]]
+name = "ub_transparent_nonzero_wrapper_zero"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/nonzero.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:852:37"
+fuel = 128
+
+[[tests]]
+name = "pass_option_some_niche_and_single_c_mut"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/enums.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128

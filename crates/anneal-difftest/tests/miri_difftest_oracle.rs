@@ -119,11 +119,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 87
-assert data["compiled_candidates"] == 87
+assert data["total_candidates"] == 89
+assert data["compiled_candidates"] == 89
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 87
-assert data["agree_count"] == 87
+assert data["compared_candidates"] == 89
+assert data["agree_count"] == 89
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -1599,7 +1599,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
 
     // One candidate per Episode 2 template. The `Pass` and `PerturbAst`
     // templates return normally under Miri and the `Ub` templates fault.
-    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 13] = [
+    let pass_cases: [(&dyn MiriAstMutator, MutationMode, &str); 14] = [
         (
             &BitValidityTransmuteMutator,
             MutationMode::Pass,
@@ -1629,6 +1629,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             &BitValidityTransmuteMutator,
             MutationMode::PerturbAst,
             "__overlay: OverlayU32",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Pass,
+            "transmute::<u32, NonZeroMeters>",
         ),
         (
             &PlaceProjectionWrapper,
@@ -1666,7 +1671,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             "&raw mut (*__rr_fm).b",
         ),
     ];
-    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 10] = [
+    let ub_cases: [(&dyn MiriAstMutator, MutationMode, &str); 11] = [
         (
             &BitValidityTransmuteMutator,
             MutationMode::Ub,
@@ -1681,6 +1686,11 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
             &BitValidityTransmuteMutator,
             MutationMode::Ub,
             "__part_slot: Uninit<[u8; 4]>",
+        ),
+        (
+            &BitValidityTransmuteMutator,
+            MutationMode::Ub,
+            "transmute::<u32, NonZeroMeters>(__nzm_zero)",
         ),
         (
             &PlaceProjectionWrapper,
@@ -1771,7 +1781,7 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     // frozen `trusted/` semantics diverge from Miri on them. Each must stay a
     // kernel-confirmed divergence; once `trusted/` fixes one, this test fails
     // so that the matching template restriction can be lifted.
-    let negative_controls: [(&str, &str, &str); 6] = [
+    let negative_controls: [(&str, &str, &str); 7] = [
         (
             "false_positive_ub",
             "neg_ctrl_option_nonzero_some_transmute",
@@ -1791,6 +1801,20 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     match o {
         Some(_) => 1u32,
         None => 2u32,
+    }
+}",
+        ),
+        (
+            "missed_ub",
+            "neg_ctrl_single_c_nonzero_payload_transmute_zero",
+            "-> u32 {
+    #[repr(C)]
+    enum SingleCNonZero {
+        Only(NonZeroU32),
+    }
+    let s: SingleCNonZero = unsafe { transmute::<[u32; 2], SingleCNonZero>([0u32, 0u32]) };
+    match s {
+        SingleCNonZero::Only(v) => unsafe { transmute::<NonZeroU32, u32>(v) },
     }
 }",
         ),
@@ -1901,15 +1925,13 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
     assert_eq!(report.agree_count, template_count, "{:#?}", report.findings);
     assert_eq!(report.diverge_count, negative_controls.len());
     assert_eq!(report.kernel_confirmed_divergences, negative_controls.len());
-    // The 13 + 3 `Pass`/`PerturbAst` template candidates and four negative
-    // controls return normally in Miri. The 10 `Ub` templates and two negative
-    // controls fault, as do the perturbed `Ub` templates, except that an index
-    // swap may redirect the uninitialized byte read of `__part_slot` to the
-    // written byte.
+    // All 14 + 3 `Pass`/`PerturbAst` template candidates and four negative
+    // controls return normally in Miri; all 11 + 3 `Ub` template candidates and
+    // three negative controls fault with UB.
     let miri_pass = report.miri_verdicts.get("pass").copied().unwrap_or(0);
     let miri_ub = report.miri_verdicts.get("ub").copied().unwrap_or(0);
-    assert!(miri_pass >= 13 + 3 + 4, "{:?}", report.miri_verdicts);
-    assert!(miri_ub >= 10 + 2 + 2, "{:?}", report.miri_verdicts);
+    assert_eq!(miri_pass, 14 + 3 + 4, "{:?}", report.miri_verdicts);
+    assert_eq!(miri_ub, 11 + 3 + 3, "{:?}", report.miri_verdicts);
     assert_eq!(miri_pass + miri_ub, total, "{:?}", report.miri_verdicts);
 
     let mut expected_classes = std::collections::BTreeMap::new();
@@ -1935,4 +1957,24 @@ fn niche_single_c_union_and_raw_retag_templates_compile_and_agree_with_miri() {
         .map(|(class, count)| (class.clone(), *count))
         .collect();
     assert_eq!(observed_classes, expected_classes);
+
+    // Verify standalone `repro.rs` round-tripping on an Episode 2 finding
+    // bundle exercising `MIRI_CORPUS_MODULE_PREAMBLE` types (`NonZeroU32` /
+    // `SingleCNonZero`).
+    let repro_finding = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name.starts_with("neg_ctrl_single_c_nonzero_payload_transmute_zero"))
+        .expect("SingleCNonZero negative control finding");
+    let repro_path = repro_finding.repro_path.as_ref().expect("repro.rs written");
+    let repro_report = reproduce_miri_finding(repro_path, Some(&root))
+        .expect("reproduce Episode 2 finding bundle standalone");
+    assert!(
+        matches!(
+            repro_report.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::MissedUb { .. })
+        ),
+        "{repro_report:#?}"
+    );
+    assert!(repro_report.kernel_confirmed);
 }

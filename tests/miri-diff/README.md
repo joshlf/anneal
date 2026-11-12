@@ -55,15 +55,15 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 87 tests: 40 `pass`, 10 `panic` (including the tracked
-`panic_explicit_macro` bug), and 37 `ub`, grouped into eight categories that
+The corpus holds 89 tests: 41 `pass`, 10 `panic` (including the tracked
+`panic_explicit_macro` bug), and 38 `ub`, grouped into eight categories that
 `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
 Category 8 covers layout-sensitive types and raw-pointer retags:
 
 | Theme | Tests |
 | :--- | :--- |
-| Niche-encoded scalars and `#[repr(transparent)]` wrappers | `pass_nonzero_u32_transmute_roundtrip`, `ub_nonzero_u32_transmute_zero`, `pass_option_nonzero_none_niche`, `pass_transparent_wrapper_transmute` |
-| Univariant `#[repr(C)]` enums | `pass_single_c_enum_match_reinit`, `ub_single_c_enum_invalid_tag` |
+| Niche-encoded scalars and `#[repr(transparent)]` wrappers | `pass_nonzero_u32_transmute_roundtrip`, `ub_nonzero_u32_transmute_zero`, `pass_option_nonzero_none_niche`, `pass_transparent_wrapper_transmute`, `ub_transparent_nonzero_wrapper_zero`, `pass_option_some_niche_and_single_c_mut` |
+| Univariant `#[repr(C)]` enums | `pass_single_c_enum_match_reinit`, `ub_single_c_enum_invalid_tag`, `pass_option_some_niche_and_single_c_mut` |
 | Union overlays and uninitialized bytes | `pass_union_overlay_word_bytes`, `ub_union_uninit_bytes_partial_read` |
 | `Retag(Raw)` (`&raw const` / `&raw mut`) interleavings | `pass_raw_ref_disjoint_fields`, `ub_raw_mut_after_parent_write` |
 
@@ -75,6 +75,10 @@ pin each of these divergences, and `miri-difftest` mutators avoid them:
 - `transmute` producing a valid nonzero (`Some`) `Option<NonZeroU32>`, or a
   valid `Option<bool>` or `Option<ColorTag>`: Anneal reports UB where Miri
   passes. Only the all-zero `None` of `Option<NonZeroU32>` decodes.
+- `transmute` producing a univariant `#[repr(C)]` enum whose `ScalarPair`
+  payload violates a niche `valid_range` (such as `SingleCNonZero::Only` with
+  valid tag `0` and invalid `NonZeroU32` payload `0`): Miri reports UB at the
+  `transmute`, and Anneal passes (`missed_ub`).
 - Writing zero into a `NonZeroU32` through a `*mut u32` and then copying it:
   Miri reports UB at the copy, and Anneal passes.
 - Writing into a `SingleC` through a `*mut u32` or `*mut [u32; 2]`: Anneal

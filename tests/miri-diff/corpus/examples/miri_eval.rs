@@ -187,6 +187,12 @@ fn main() {
         "ub_union_uninit_bytes_partial_read" => print_u32(ub_union_uninit_bytes_partial_read()),
         "pass_raw_ref_disjoint_fields" => print_u32(pass_raw_ref_disjoint_fields()),
         "ub_raw_mut_after_parent_write" => print_u32(ub_raw_mut_after_parent_write()),
+        "ub_transparent_nonzero_wrapper_zero" => {
+            print_u32(ub_transparent_nonzero_wrapper_zero())
+        }
+        "pass_option_some_niche_and_single_c_mut" => {
+            print_u32(pass_option_some_niche_and_single_c_mut())
+        }
 
         other => {
             eprintln!("unknown test: {other}");

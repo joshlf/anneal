@@ -16,17 +16,17 @@
 //!    spurious `miri_ub_span` fields, and `ub_location_mismatch` entries whose
 //!    `observed_anneal_ub_span` already contains `miri_ub_span`, plus live Miri
 //!    oracle verification via `tests/miri-diff/sync_miri_suite.py --eval-miri`.
-//! 2. Full 87-test differential execution (`run_miri_diff_suite`):
+//! 2. Full 89-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 40 non-bug `pass` tests,
+//!    - Proves `TotalVerificationResult` for all 41 non-bug `pass` tests,
 //!      including `pass_direct_fn_call`, whose claim links the captured
 //!      `helper_add_ten` body as a callee.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 37 non-bug `ub` tests.
+//!      `MiriOracleProbe.lean` for all 38 non-bug `ub` tests.
 //!    - Enforces the `evalMirDiffTagBounded` equality ratchet for the single
 //!      open Anneal bug (`panic_explicit_macro`, `[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
@@ -125,7 +125,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         manifest.rustc_commit,
         "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
     );
-    assert_eq!(manifest.tests.len(), 87);
+    assert_eq!(manifest.tests.len(), 89);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
     // `miri_verdict` (either by tag or by `ub_location_mismatch`).
@@ -419,14 +419,14 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         rustc_wrapper: Some(wrapper_bin.clone()),
     };
 
-    let report = run_miri_diff_suite(&config).expect("87-test Miri differential suite must pass");
-    assert_eq!(report.total_tests, 87);
-    assert_eq!(report.verified_pass_count, 40);
+    let report = run_miri_diff_suite(&config).expect("89-test Miri differential suite must pass");
+    assert_eq!(report.total_tests, 89);
+    assert_eq!(report.verified_pass_count, 41);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 37);
+    assert_eq!(report.verified_strict_ub_count, 38);
     assert_eq!(report.ratcheted_known_bug_count, 1);
-    // 40 pass + 9 panic + 1 helper (`helper_add_ten`) = 50 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 50);
+    // 41 pass + 9 panic + 1 helper (`helper_add_ten`) = 51 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 51);
     assert!(
         report
             .audited_certificate_modules
@@ -437,7 +437,7 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
 
     let summary = render_miri_diff_report(&report);
-    assert!(summary.contains("Total corpus tests:              87"));
+    assert!(summary.contains("Total corpus tests:              89"));
     assert!(summary.contains("TrustedBoundary kernel replay:   PASS"));
 
     let dot_anneal = temp_corpus.join(".anneal");

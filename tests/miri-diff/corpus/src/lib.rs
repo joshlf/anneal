@@ -842,3 +842,41 @@ pub fn ub_raw_mut_after_parent_write() -> u32 {
     }
     slot
 }
+
+#[repr(transparent)]
+pub struct NonZeroMeters(pub NonZeroU32);
+
+/// `#[repr(transparent)]` niche validity: transmuting `0` into `NonZeroMeters`
+/// violates its inner `NonZeroU32` valid range.
+pub fn ub_transparent_nonzero_wrapper_zero() -> u32 {
+    let m: NonZeroMeters = unsafe { transmute::<u32, NonZeroMeters>(0u32) };
+    unsafe { transmute::<NonZeroU32, u32>(m.0) }
+}
+
+/// Niche encoding and `&mut` univariant `#[repr(C)]` projection: encode a
+/// `Some(NonZeroU32)` via `transmute`, match `Option<ColorTag>`, and mutate a
+/// `SingleC` payload through `&mut SingleC` before whole-value reinit.
+pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
+    let nz: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(7u32) };
+    let some_bits: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(Some(nz)) };
+    let none_bits: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(None) };
+    let oc: Option<ColorTag> = Some(ColorTag::Green);
+    let color_val: u32 = match oc {
+        Some(ColorTag::Red) => 1u32,
+        Some(ColorTag::Green) => 2u32,
+        Some(ColorTag::Blue) => 3u32,
+        None => 4u32,
+    };
+    let mut s = SingleC::Only(some_bits ^ none_bits ^ color_val);
+    match &mut s {
+        SingleC::Only(p) => {
+            *p ^= 12u32;
+        }
+    }
+    s = SingleC::Only(match s {
+        SingleC::Only(v) => v ^ 3u32,
+    });
+    match s {
+        SingleC::Only(v) => v,
+    }
+}
