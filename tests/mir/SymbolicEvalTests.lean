@@ -2959,11 +2959,11 @@ theorem fmtPanic_modular_safe_panic_verified :
   verifyModularSafePanicMirBounded fmtPanicMir [] 16 [] emptyMemory
 
 /--
-`refuteTotalClaimByBoundedPanicAcrossCalls` refutes the `TotalClaim` of
-`fmtPanicMir` along either answer under which execution panics: the callee
-returns (execution then reaches `core::panicking::panic_fmt`) or the callee
-unwinds. An aborting callee yields `.ret .abort`, which the panic detector does
-not count as a panic.
+Execution of `fmtPanicMir` panics whether the uninterpreted callee returns
+(execution then reaches `core::panicking::panic_fmt`) or unwinds, and either
+panic witness refutes the `TotalClaim` through
+`refuteTotalClaimByBoundedPanicAcrossCalls`. An aborting callee yields
+`.ret .abort`, which the panic detector does not count as a panic.
 -/
 theorem fmtPanic_total_refuted_along_returned_and_panicked :
     reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 16
@@ -3081,6 +3081,14 @@ def extCallReturnsMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
+/--
+The modular checker rejects `extCallReturnsMir`, and returning from the external
+call yields no panic witness. An unwinding callee still refutes the
+`TotalClaim`, because `¬ TotalClaim.holds` says only that some execution does
+not return normally: in a safe-panic certificate, the
+`ModularVerificationResult` conjunct with `post := False` is what rules out a
+normal return.
+-/
 theorem extCallReturns_modular_safe_panic_rejected :
     ¬ (∀ answers : MirCallAnswerStream,
         reachesModularSafePanicExecBounded 8 extCallReturnsMir answers

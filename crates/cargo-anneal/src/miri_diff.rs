@@ -1833,10 +1833,10 @@ pub fn stage_miri_diff_workspace(
 /// `isDirectExactDivTarget`, and `classifyRustIntrinsic?` other than
 /// `const_eval_select`, whose runtime target may be unlinked).
 ///
-/// `Terminators` handles the panic, abort, and unreachable entry points inline
-/// only in a diverging call (`target = .none`), which is how `rustc` calls
-/// these `!`-returning functions; a returning call to one of them would still
-/// be an external call. The unit test
+/// `Terminators` handles a direct call to a panic, abort, or unreachable entry
+/// point inline only when the call diverges (`target = .none`), which is how
+/// `rustc` calls these `!`-returning functions; a returning call to one of them
+/// would still be an external call. The unit test
 /// `trusted_inline_call_def_paths_match_trusted_terminators` fails when this
 /// list and those `Trusted` definitions diverge, and a stale list cannot make
 /// [`classify_panic_certificate`] unsound.
@@ -2639,21 +2639,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Collect the string literals compared by `stringEq` inside the body of
-    /// each Lean definition `def <name> ` in `lean_src`, stopping at the next
-    /// top-level declaration or doc comment.
+    /// Collect the string literal compared by each `stringEq` call inside the
+    /// body of each Lean definition `def <name> ` in `lean_src`.
+    ///
+    /// A body ends at the first later line that starts in column 0, which is
+    /// where the next top-level command, attribute, or doc comment begins. A
+    /// line may hold several calls, and a call may span lines.
     fn trusted_string_eq_literals(lean_src: &str, names: &[&str]) -> BTreeSet<String> {
-        const TOP_LEVEL_BOUNDARIES: &[&str] = &[
-            "\n/--",
-            "\n@[",
-            "\ndef ",
-            "\nprivate ",
-            "\nabbrev ",
-            "\ntheorem ",
-            "\ninductive ",
-            "\nstructure ",
-            "\nend ",
-        ];
         let mut literals = BTreeSet::new();
         for name in names {
             let pat = format!("def {name} ");
@@ -2661,26 +2653,57 @@ mod tests {
                 .find(&pat)
                 .unwrap_or_else(|| panic!("missing `{pat}` in Terminators.lean"));
             let after_header = &lean_src[start + pat.len()..];
-            let end_offset = TOP_LEVEL_BOUNDARIES
-                .iter()
-                .filter_map(|marker| after_header.find(marker))
-                .min()
-                .unwrap_or(after_header.len());
-            let body = &after_header[..end_offset];
-            for line in body.lines() {
-                let Some(pos) = line.find("stringEq ") else {
+            let mut end = after_header.len();
+            let mut offset = after_header.find('\n').map_or(after_header.len(), |i| i + 1);
+            while offset < after_header.len() {
+                let rest = &after_header[offset..];
+                let line_len = rest.find('\n').map_or(rest.len(), |i| i + 1);
+                if !rest[..line_len].trim().is_empty() && !rest.starts_with(char::is_whitespace) {
+                    end = offset;
+                    break;
+                }
+                offset += line_len;
+            }
+            for call in after_header[..end].split("stringEq").skip(1) {
+                let Some(open) = call.find('"') else {
                     continue;
                 };
-                let after = &line[pos..];
-                let Some(open) = after.find('"') else {
-                    continue;
-                };
-                let literal = &after[open + 1..];
+                let literal = &call[open + 1..];
                 let close = literal.find('"').expect("unterminated string literal");
                 literals.insert(literal[..close].to_string());
             }
         }
         literals
+    }
+
+    #[test]
+    fn trusted_string_eq_literals_reads_whole_definition_bodies() {
+        let lean_src = "\
+/-- Inline targets. -/
+def isInlineTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"a\" || stringEq defPath \"b\" ||
+
+  stringEq defPath
+    \"c\"
+@[inline]
+def isOtherTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"d\"
+set_option maxRecDepth 1000 in
+def isLastTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"e\"
+";
+        let expect = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            trusted_string_eq_literals(lean_src, &["isInlineTarget"]),
+            expect(&["a", "b", "c"])
+        );
+        assert_eq!(trusted_string_eq_literals(lean_src, &["isOtherTarget"]), expect(&["d"]));
+        assert_eq!(
+            trusted_string_eq_literals(lean_src, &["isLastTarget", "isInlineTarget"]),
+            expect(&["a", "b", "c", "e"])
+        );
     }
 
     #[test]
