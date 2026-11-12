@@ -455,6 +455,9 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              89"));
+    assert!(summary.contains("Verified `panic` (SafePanic):    10"));
+    assert!(summary.contains("of which modular (frame rely): 1"));
+    assert!(summary.contains("Open Anneal bugs (ratcheted):    0"));
     assert!(summary.contains("TrustedBoundary kernel replay:   PASS"));
 
     let dot_anneal = temp_corpus.join(".anneal");

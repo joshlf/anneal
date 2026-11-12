@@ -1826,84 +1826,94 @@ pub fn stage_miri_diff_workspace(
     Ok((report, certificate_modules))
 }
 
-/// Return `true` when `def_id` is modeled inline by
-/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators` without emitting an
-/// external `MirCallE` interaction (`isUnwindingPanicDefPath`,
+/// `def_id`s of the call targets that
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators` models inline without
+/// emitting an external `MirCallE` interaction (`isUnwindingPanicDefPath`,
 /// `isAbortingPanicDefPath`, `isUnreachableCallTarget`,
-/// `isDirectExactDivTarget`, or `classifyRustIntrinsic?` other than
+/// `isDirectExactDivTarget`, and `classifyRustIntrinsic?` other than
 /// `const_eval_select`, whose runtime target may be unlinked).
+///
+/// `Terminators` handles the panic, abort, and unreachable entry points inline
+/// only in a diverging call (`target = .none`), which is how `rustc` calls
+/// these `!`-returning functions; a returning call to one of them would still
+/// be an external call. The unit test
+/// `trusted_inline_call_def_paths_match_trusted_terminators` fails when this
+/// list and those `Trusted` definitions diverge, and a stale list cannot make
+/// [`classify_panic_certificate`] unsound.
+const TRUSTED_INLINE_CALL_DEF_PATHS: &[&str] = &[
+    // `isUnwindingPanicDefPath`
+    "core::panicking::panic",
+    "core::panicking::panic_fmt",
+    "core::panicking::panic_fmt::panic_impl",
+    "core::panicking::const_panic_fmt",
+    "core::panicking::assert_failed",
+    "core::panicking::assert_failed_inner",
+    "core::panicking::assert_matches_failed",
+    "core::slice::index::slice_index_fail",
+    "core::panicking::panic_bounds_check",
+    "core::panicking::panic_explicit",
+    "core::panicking::panic_display",
+    "core::panicking::panic_str_2015",
+    "core::panicking::unreachable_display",
+    "core::option::unwrap_failed",
+    "core::option::expect_failed",
+    "core::result::unwrap_failed",
+    "core::panicking::panic_const::panic_const_add_overflow",
+    "core::panicking::panic_const::panic_const_sub_overflow",
+    "core::panicking::panic_const::panic_const_mul_overflow",
+    "core::panicking::panic_const::panic_const_div_overflow",
+    "core::panicking::panic_const::panic_const_rem_overflow",
+    "core::panicking::panic_const::panic_const_neg_overflow",
+    "core::panicking::panic_const::panic_const_shr_overflow",
+    "core::panicking::panic_const::panic_const_shl_overflow",
+    "core::panicking::panic_const::panic_const_div_by_zero",
+    "core::panicking::panic_const::panic_const_rem_by_zero",
+    // `isAbortingPanicDefPath`
+    "core::panicking::panic_nounwind",
+    "core::panicking::panic_nounwind_fmt",
+    "core::panicking::panic_nounwind_fmt::panic_impl",
+    "core::panicking::panic_nounwind_nobacktrace",
+    "core::panicking::panic_in_cleanup",
+    "core::panicking::panic_cannot_unwind",
+    "core::panicking::panic_misaligned_pointer_dereference",
+    "core::panicking::panic_null_pointer_dereference",
+    "core::panicking::panic_invalid_enum_construction",
+    "core::intrinsics::abort",
+    // `isUnreachableCallTarget`
+    "core::hint::unreachable_unchecked",
+    "std::hint::unreachable_unchecked",
+    "core::intrinsics::unreachable",
+    // `isDirectExactDivTarget` and non-dispatching `classifyRustIntrinsic?`
+    "core::intrinsics::exact_div",
+    "core::intrinsics::ub_checks",
+    "core::intrinsics::arith_offset",
+    "core::intrinsics::ctlz",
+    "core::intrinsics::ctlz_nonzero",
+    "core::intrinsics::cttz",
+    "core::intrinsics::cttz_nonzero",
+    "core::intrinsics::ctpop",
+    "core::intrinsics::bswap",
+    "core::intrinsics::bitreverse",
+    "core::intrinsics::wrapping_add",
+    "core::intrinsics::wrapping_sub",
+    "core::intrinsics::wrapping_mul",
+    "core::intrinsics::saturating_add",
+    "core::intrinsics::saturating_sub",
+    "core::intrinsics::unchecked_shl",
+    "core::intrinsics::unchecked_shr",
+    "core::intrinsics::unchecked_add",
+    "core::intrinsics::unchecked_sub",
+    "core::intrinsics::unchecked_mul",
+    "core::intrinsics::unchecked_div",
+    "core::intrinsics::unchecked_rem",
+    "core::intrinsics::three_way_compare",
+    "core::intrinsics::size_of_val",
+    "core::intrinsics::align_of_val",
+];
+
+/// Return `true` when `def_id` is one of [`TRUSTED_INLINE_CALL_DEF_PATHS`].
 fn is_trusted_inline_call_def_path(def_id: &str) -> bool {
-    matches!(
-        def_id,
-        // `isUnwindingPanicDefPath`
-        "core::panicking::panic"
-            | "core::panicking::panic_fmt"
-            | "core::panicking::panic_fmt::panic_impl"
-            | "core::panicking::const_panic_fmt"
-            | "core::panicking::assert_failed"
-            | "core::panicking::assert_failed_inner"
-            | "core::panicking::assert_matches_failed"
-            | "core::slice::index::slice_index_fail"
-            | "core::panicking::panic_bounds_check"
-            | "core::panicking::panic_explicit"
-            | "core::panicking::panic_display"
-            | "core::panicking::panic_str_2015"
-            | "core::panicking::unreachable_display"
-            | "core::option::unwrap_failed"
-            | "core::option::expect_failed"
-            | "core::result::unwrap_failed"
-            | "core::panicking::panic_const::panic_const_add_overflow"
-            | "core::panicking::panic_const::panic_const_sub_overflow"
-            | "core::panicking::panic_const::panic_const_mul_overflow"
-            | "core::panicking::panic_const::panic_const_div_overflow"
-            | "core::panicking::panic_const::panic_const_rem_overflow"
-            | "core::panicking::panic_const::panic_const_neg_overflow"
-            | "core::panicking::panic_const::panic_const_shr_overflow"
-            | "core::panicking::panic_const::panic_const_shl_overflow"
-            | "core::panicking::panic_const::panic_const_div_by_zero"
-            | "core::panicking::panic_const::panic_const_rem_by_zero"
-            // `isAbortingPanicDefPath`
-            | "core::panicking::panic_nounwind"
-            | "core::panicking::panic_nounwind_fmt"
-            | "core::panicking::panic_nounwind_fmt::panic_impl"
-            | "core::panicking::panic_nounwind_nobacktrace"
-            | "core::panicking::panic_in_cleanup"
-            | "core::panicking::panic_cannot_unwind"
-            | "core::panicking::panic_misaligned_pointer_dereference"
-            | "core::panicking::panic_null_pointer_dereference"
-            | "core::panicking::panic_invalid_enum_construction"
-            | "core::intrinsics::abort"
-            // `isUnreachableCallTarget`
-            | "core::hint::unreachable_unchecked"
-            | "std::hint::unreachable_unchecked"
-            | "core::intrinsics::unreachable"
-            // `isDirectExactDivTarget` and non-dispatching `classifyRustIntrinsic?`
-            | "core::intrinsics::exact_div"
-            | "core::intrinsics::ub_checks"
-            | "core::intrinsics::arith_offset"
-            | "core::intrinsics::ctlz"
-            | "core::intrinsics::ctlz_nonzero"
-            | "core::intrinsics::cttz"
-            | "core::intrinsics::cttz_nonzero"
-            | "core::intrinsics::ctpop"
-            | "core::intrinsics::bswap"
-            | "core::intrinsics::bitreverse"
-            | "core::intrinsics::wrapping_add"
-            | "core::intrinsics::wrapping_sub"
-            | "core::intrinsics::wrapping_mul"
-            | "core::intrinsics::saturating_add"
-            | "core::intrinsics::saturating_sub"
-            | "core::intrinsics::unchecked_shl"
-            | "core::intrinsics::unchecked_shr"
-            | "core::intrinsics::unchecked_add"
-            | "core::intrinsics::unchecked_sub"
-            | "core::intrinsics::unchecked_mul"
-            | "core::intrinsics::unchecked_div"
-            | "core::intrinsics::unchecked_rem"
-            | "core::intrinsics::three_way_compare"
-            | "core::intrinsics::size_of_val"
-            | "core::intrinsics::align_of_val"
-    )
+    TRUSTED_INLINE_CALL_DEF_PATHS.contains(&def_id)
 }
 
 /// Choose the certificate shape of the non-bug `panic` entry whose captured
@@ -1920,6 +1930,12 @@ fn is_trusted_inline_call_def_path(def_id: &str) -> bool {
 /// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators`
 /// ([`is_trusted_inline_call_def_path`]), and the
 /// [`MiriDiffPanicCertificate::Stateful`] certificate otherwise.
+///
+/// The classification only selects which certificate the Lean kernel checks,
+/// so a misclassification cannot produce an unsound certificate: a `Stateful`
+/// certificate for a body that reaches an external call fails to build, and a
+/// `Modular` certificate still holds for a body that panics without reaching
+/// one (it then costs only the stronger-looking `Stateful` statement).
 fn classify_panic_certificate(
     dot_anneal: &Path,
     item_suffix: &str,
@@ -2171,18 +2187,25 @@ pub fn verify_miri_diff_ub_locations(
 
 /// Render a deterministic human-readable summary of a completed Miri
 /// differential test run.
+///
+/// The summary lists separately the `panic` certificates that are
+/// `ModularVerificationResult`s: `TrustedBoundary` reports them as
+/// unconditional because they use no `Assumptions.*` axiom, but each one holds
+/// only for external callees that return or unwind to the caller's call frame.
 pub fn render_miri_diff_report(report: &MiriDiffReport) -> String {
     format!(
         "Anneal <-> Miri Differential Testing Summary:\n\
          \x20 Total corpus tests:              {}\n\
          \x20 Verified `pass` (TotalClaim):    {}\n\
          \x20 Verified `panic` (SafePanic):    {}\n\
+         \x20   of which modular (frame rely): {}\n\
          \x20 Refuted `ub` (StrictUB):         {}\n\
          \x20 Open Anneal bugs (ratcheted):    {}\n\
          \x20 TrustedBoundary kernel replay:   PASS\n",
         report.total_tests,
         report.verified_pass_count,
         report.verified_panic_count,
+        report.modular_panic_certificate_modules.len(),
         report.verified_strict_ub_count,
         report.ratcheted_known_bug_count
     )
@@ -2614,5 +2637,67 @@ mod tests {
         // Missing MIR modules and unknown suffixes fail closed.
         assert!(classify("missing_item", &[]).is_err());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Collect the string literals compared by `stringEq` inside the body of
+    /// each Lean definition `def <name> ` in `lean_src`, up to the next
+    /// documentation comment.
+    fn trusted_string_eq_literals(lean_src: &str, names: &[&str]) -> BTreeSet<String> {
+        let mut literals = BTreeSet::new();
+        for name in names {
+            let start = lean_src
+                .find(&format!("def {name} "))
+                .unwrap_or_else(|| panic!("missing `def {name}` in Terminators.lean"));
+            let body = &lean_src[start..];
+            let body = &body[..body.find("\n/--").unwrap_or(body.len())];
+            for line in body.lines() {
+                let Some(pos) = line.find("stringEq ") else {
+                    continue;
+                };
+                let after = &line[pos..];
+                let Some(open) = after.find('"') else {
+                    continue;
+                };
+                let literal = &after[open + 1..];
+                let close = literal.find('"').expect("unterminated string literal");
+                literals.insert(literal[..close].to_string());
+            }
+        }
+        literals
+    }
+
+    #[test]
+    fn trusted_inline_call_def_paths_match_trusted_terminators() {
+        let terminators = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean");
+        let lean_src = fs::read_to_string(&terminators).expect("read Trusted Terminators.lean");
+        let mut trusted = trusted_string_eq_literals(
+            &lean_src,
+            &[
+                "isUnwindingPanicDefPath",
+                "isAbortingPanicDefPath",
+                "isUnreachableCallTarget",
+                "isDirectExactDivTarget",
+                "classifyRustIntrinsic?",
+            ],
+        );
+        // `const_eval_select` dispatches to a runtime target that may itself be
+        // an external call, so it is deliberately not treated as inline.
+        assert!(trusted.remove("core::intrinsics::const_eval_select"));
+        let listed: BTreeSet<String> = TRUSTED_INLINE_CALL_DEF_PATHS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            listed.len(),
+            TRUSTED_INLINE_CALL_DEF_PATHS.len(),
+            "TRUSTED_INLINE_CALL_DEF_PATHS has duplicates"
+        );
+        assert_eq!(
+            listed, trusted,
+            "TRUSTED_INLINE_CALL_DEF_PATHS must match the inline call targets of Terminators.lean"
+        );
+        assert!(!is_trusted_inline_call_def_path("core::intrinsics::const_eval_select"));
+        assert!(!is_trusted_inline_call_def_path("core::fmt::Arguments::<'a>::from_str"));
     }
 }

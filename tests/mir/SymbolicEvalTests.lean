@@ -2959,6 +2959,28 @@ theorem fmtPanic_modular_safe_panic_verified :
   verifyModularSafePanicMirBounded fmtPanicMir [] 16 [] emptyMemory
 
 /--
+`refuteTotalClaimByBoundedPanicAcrossCalls` refutes the `TotalClaim` of
+`fmtPanicMir` along either answer under which execution panics: the callee
+returns (execution then reaches `core::panicking::panic_fmt`) or the callee
+unwinds. An aborting callee yields `.ret .abort`, which the panic detector does
+not count as a panic.
+-/
+theorem fmtPanic_total_refuted_along_returned_and_panicked :
+    ¬ ({ body := fmtPanicMir
+         pre := fun args mem => args = [] ∧ mem = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds ∧
+    ¬ ({ body := fmtPanicMir
+         pre := fun args mem => args = [] ∧ mem = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds ∧
+    reachesPanicAcrossCallsBounded (fun _ => .aborted) 16 fmtPanicMir
+        (initMachineStateWithMemory fmtPanicMir [] emptyMemory) = false :=
+  ⟨refuteTotalClaimByBoundedPanicAcrossCalls _ 16 [] emptyMemory ⟨rfl, rfl⟩
+      (fun req => .returned .unit req.memory),
+   refuteTotalClaimByBoundedPanicAcrossCalls _ 16 [] emptyMemory ⟨rfl, rfl⟩
+      (fun req => .panicked req.memory),
+   rfl⟩
+
+/--
 Panics without any external call (`255 + 4` overflows `u8`): the modular
 checker agrees with `reachesPanicBounded` on call-free bodies.
 -/
