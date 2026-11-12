@@ -642,7 +642,7 @@ fn seeded_type_expr(
                             let mut #backing_id: [u8; 2] = [65u8, 66u8];
                         });
                         syn::parse_quote!(unsafe {
-                            transmute::<&mut [u8], &mut str>(&mut #backing_id[..])
+                            transmute::<&mut [u8], &mut str>(&mut #backing_id)
                         })
                     } else {
                         syn::parse_quote!("ab")
