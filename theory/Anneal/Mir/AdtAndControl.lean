@@ -179,10 +179,16 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      `pathRange` (`subplaceAt_of_pathRange`); synthetic borrows `&_l.proj` / `&raw _l.proj`
      (`evalSubplaceRef`, `evalSubplaceRef_inbounds`, `evalSubplaceRef_disjoint_locals`,
      `evalSubplaceRef_disjoint_siblings`, `evalSubplaceRef_dead`); and reborrows
-     `&((*p).tail)` / `&raw ((*p).tail)` (`evalReborrowTail`: alignment and liveness for
-     references, address-only raw reborrows valid at offset `0` on null, dangling, or
-     provenance-free pointers: `evalReborrowTail_raw_null_zero`, `evalReborrowTail_raw_dangling`,
-     `evalReborrowTail_ref_null`, `evalReborrowTail_ref_misaligned`, `evalReborrowTail_ref_dead`).
+     `&((*p).tail)` / `&raw ((*p).tail)` (`evalReborrowTail`: resolved sub-place results
+     (`evalReborrowTail_resolved_ok`), alignment and liveness for references, address-only raw
+     reborrows valid at offset `0` on null, dangling, or provenance-free pointers
+     (`evalReborrowTail_raw_null_zero`, `evalReborrowTail_raw_dangling`,
+     `evalReborrowTail_ref_null`, `evalReborrowTail_ref_misaligned`, `evalReborrowTail_ref_dead`),
+     and the in-bounds `offset_inbounds` fallback of an unresolvable raw base, whose result
+     carries its target local's provenance re-tagged by `reborrowFallbackTag`
+     (`evalReborrowTail_raw_inbounds_fallback_ok`; untagged for a unique candidate:
+     `evalReborrowTail_raw_inbounds_fallback_unique_tag`, `reborrowFallbackTag_unique`,
+     `reborrowFallbackTag_decoded`, `reborrowFallbackTag_stale`)).
    - No-guess resolution `resolveSyntheticSubplace` (`resolve_synthetic_subplace_in` /
      `select_subplace_candidate_in`): fault characterizations (`resolveSyntheticSubplace_null`,
      `_misaligned`, `_rangeOverflow`, `_dead`, `_no_provenance`), soundness
@@ -198,8 +204,15 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      and frame laws (`writePlaceState_get_put_init`, `writePlaceState_put_get_init`,
      `evalDerefPlaceWrite_get_put`, `evalDerefPlaceWrite_put_get`, `evalDerefPlaceWrite_frame`,
      `evalDerefPlaceWrite_read_sibling`, `evalDerefPlaceDeinit_target`) and step refinement of
-     Trusted (`evalDerefPlaceRead_refines_evalOperand`, `evalDerefPlaceRead_refines_evalRvalue`,
-     `evalDerefPlaceWrite_refines_writePlaceValue`, `evalStmt_assign_deref_refines`).
+     Trusted: reads in Trusted's untyped mode (`evalDerefPlaceRead_refines_evalOperand`,
+     `evalDerefPlaceRead_refines_evalRvalue`) and scalar reads of `*_p` in its typed mode
+     (non-empty `localDecls`, read through `evalStackThinPtrTypedDerefRead`:
+     `evalDerefPlaceRead_refines_evalOperand_typed`, `evalDerefPlaceRead_refines_evalRvalue_typed`,
+     whose extra hypotheses are Trusted's pointee-type checks — scalar width, offset `0`, target
+     alignment, no union, bit validity — while Trusted's read value is derived from Anneal's;
+     `evalRvalue_use_copy_of_evalOperand` lifts `evalOperand` to `Rvalue.use`), writes
+     (`evalDerefPlaceWrite_refines_writePlaceValue`), and assignments
+     (`evalStmt_assign_deref_refines`).
    - Sub-place and array-window `CopyNonOverlapping` (`evalCopyNonOverlappingSubplace`,
      `readSubplaceSlot`, `writeSubplaceSlot`): Read-After-Copy
      (`evalCopyNonOverlappingSubplace_read_after_copy`), Disjoint-Frame for every copy shape
@@ -214,7 +227,13 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
    - A concrete frame `(u32, u32)` + `*mut u32` exercising the whole pipeline (`witnessCtx_wf`,
      `witness_borrow`, `witness_resolve`, `witness_deref_read`, `witness_deref_write_put_get`,
      `witness_bases`), and the same frame under Trusted's pointer representation discharging
-     every hypothesis of the `Deref` refinement (`witnessCtxT_wf`, `witness_trusted_deref_read`).
+     every hypothesis of the `Deref` refinement (`witnessCtxT_wf`, `witness_trusted_resolve`,
+     `witness_trusted_deref_read`) — including, with the non-empty typed declarations
+     `witnessLocalDecls`, every hypothesis of the typed refinement, so that Anneal's
+     `evalDerefPlaceRead`, Trusted's typed `evalOperand`, and Trusted's typed `evalRvalue` all
+     read `9` from `*_1` (`witness_trusted_deref_read_typed`); plus type-fingerprinted tag
+     disambiguation (`witness_tag_disambiguates_and_rejects_mismatch`) and a `count = 2`
+     array-window copy (`witness_window_copy`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -10299,7 +10318,9 @@ theorem decodeSubplaceTag_mismatch_none (fp : Nat → Nat) (ty₁ ty₂ ordinal 
 address-space limit (for `localBaseAddr`), byte layouts of the declared locals, type identities
 of the declared locals and the same-offset/same-type candidate paths (`collect_subplace_paths`),
 type layouts, the pointer type stored at every `Deref`-free place, Anneal's synthetic reading of
-a pointer value (`addr`, `provenance`), `decode_subplace_tag`, and `slot_union_path_active`. -/
+a pointer value (`addr`, `provenance`), `decode_subplace_tag`, `slot_union_path_active`, and
+`encode_subplace_tag` (`encodeTag ty ordinal`, by pointee type identity; it defaults to the
+untagged provenance tag `1`). -/
 structure SubplaceCtx : Type where
   allocs : AllocLayouts
   limit : Nat
@@ -10311,6 +10332,7 @@ structure SubplaceCtx : Type where
   ptrOf : ProvenancePtr → SynPtr
   decodeTag : Nat → Nat → Option Nat
   unionActive : LocalSlotState → List ProjectionElem → Bool → Bool := fun _ _ _ => true
+  encodeTag : Nat → Nat → Nat := fun _ _ => 1
 
 /-- Well-formed contexts: every local's byte layout is well formed and fits its synthetic
 allocation, and every candidate path of a pointee type at offset `off` of local `l` addresses a
@@ -11577,7 +11599,10 @@ below relate the two through the pointer correspondence "Trusted's borrow entry 
 tag names exactly the sub-place that Anneal's address-based resolution designates", and show that
 every successful Anneal `Deref` access of runtime MIR's shape `⟨p, .deref :: rest⟩` is matched by
 Trusted (`evalOperand`, `writePlaceValue`, and `evalStmt` `.assign`) with the same value, keeping
-the frames related by `SlotsRefine SlotBelow`. -/
+the frames related by `SlotsRefine SlotBelow`. Reads are refined in Trusted's untyped mode (empty
+`localDecls`) and, for scalar reads of `*_p`, in its typed mode (non-empty `localDecls`, read through
+`evalStackThinPtrTypedDerefRead`), whose extra pointee-type checks (scalar width, offset, target
+alignment, no union, bit validity) are hypotheses about Trusted's types and frame. -/
 
 theorem appendProjections_eq_append :
     ∀ (xs ys : List ProjectionElem), appendProjections xs ys = xs ++ ys
@@ -11698,16 +11723,127 @@ theorem evalDerefPlaceRead_refines_evalRvalue {cx : SubplaceCtx}
     | nil => exact ⟨_, rfl⟩
     | cons b₂ bs => exact ⟨_, rfl⟩
 
-/-- **`Deref` reads refine Trusted's `evalRvalue` for arbitrary `localDecls`
-(`evalDerefPlaceRead_refines_evalRvalue_general`)**: under `SlotsRefine SlotBelow slots locals`,
-when Anneal reads `v` from `(*_p).rest` and Trusted's typed `evalOperand` (with `localDecls`)
-evaluates `Operand.copy ((*_p).rest)` to `.ok v locals` and validates `v`, Trusted's
-`evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem localDecls layouts` evaluates to
-`.ok v locals mem'` for any `localDecls : List LocalDecl`. -/
-theorem evalDerefPlaceRead_refines_evalRvalue_general {cx : SubplaceCtx}
-    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
-    {v : Value} {mem : Memory} (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (_hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v)
+/-- Trusted's scalar widths (`tyScalarBytes`) are positive. -/
+theorem tyScalarBytes_pos {ty : Ty} {n : Nat} (h : tyScalarBytes ty = some n) : 1 ≤ n := by
+  unfold tyScalarBytes at h
+  split at h
+  · simp only [Option.some.injEq] at h; omega
+  · simp only [Option.some.injEq] at h; omega
+  · unfold intCastTargetBytes at h
+    split at h <;> simp only [Option.some.injEq, reduceCtorEq] at h <;> omega
+
+/-- **Typed `Deref` reads refine Trusted's typed `evalOperand`
+(`evalDerefPlaceRead_refines_evalOperand_typed`)**: with non-empty `localDecls`, Trusted reads
+`Operand.copy (*_p)` through `evalStackThinPtrTypedDerefRead` (pointee-type alignment, scalar
+width slicing at the pointer's offset, and bit validity). Under the correspondence hypotheses of
+`evalDerefPlaceRead_refines_evalOperand` (below-related frames; Trusted's non-disabled borrow
+entry for `_p`'s tag names the sub-place Anneal resolves `*_p` to), if Anneal reads the scalar `sc`
+from `*_p`, then Trusted's typed `evalOperand` reads the same `sc` without changing the frame,
+provided Trusted's typed checks pass: the resolved pointee type `pTy` is a scalar type of `sc`'s
+width, the pointer sits at offset `0` of its borrow target, the target place is aligned for `pTy`
+(`checkTargetPlaceAlign` on Trusted's target root) and touches no union, and `sc` is a valid value
+of `pTy` (`validateValueForTy?`). Trusted's target value is derived from Anneal's read through
+`readPlaceState_below_refines`, not assumed. -/
+theorem evalDerefPlaceRead_refines_evalOperand_typed {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {sc : ScalarInt}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable} {pTy : Ty}
+    {n : Nat} (hRel : SlotsRefine SlotBelow slots locals)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, [.deref]⟩ = .ok (.scalar sc))
+    (hDecls : localDecls ≠ [])
+    (hPTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some pTy)
+    (hScalar : tyScalarBytes (resolveTyWithLocalDecls localDecls layouts pTy) = some n)
+    (hWidth : sc.sizeBytes = n) (hOff : pv.offsetBytes = 0)
+    (hAlign : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign localDecls layouts
+        (some (resolveTyWithLocalDecls localDecls layouts pTy)) entry pv (some rootVal) = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar sc) = true)
+    (globals : List CapturedAllocation) (callerLocals : List LocalSlot) :
+    evalOperand locals (.copy ⟨p, [.deref]⟩) borrows globals layouts callerLocals localDecls =
+      .ok (.scalar sc) locals := by
+  obtain ⟨stp, hStp, hLiveP⟩ := readPlaceState_ok_live hPtr
+  rw [evalDerefPlaceRead_deref hStp hLiveP hPtr hTy hRes rfl, List.append_nil] at hRead
+  have hTR : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection⟩ =
+      .ok (.scalar sc) := by
+    cases hRS : readPlaceState slots ⟨entry.targetLocal, entry.targetProjection⟩ with
+    | ok w => rw [hRS] at hRead; simp only [liftRead, Except.ok.injEq] at hRead; rw [hRead]
+    | ub => rw [hRS] at hRead; nomatch hRead
+    | unsupported => rw [hRS] at hRead; nomatch hRead
+  obtain ⟨rootVal, ht, hr⟩ := readPlaceState_below_refines hRel hTR
+  obtain ⟨rootP, hp, hrp⟩ := readPlaceState_below_refines hRel hPtr
+  simp only [readProjectedValue] at hrp
+  cases hrp
+  obtain ⟨d0, ds, hcons⟩ : ∃ d0 ds, localDecls = d0 :: ds := by
+    cases h : localDecls with
+    | nil => exact absurd h hDecls
+    | cons d0 ds => exact ⟨d0, ds, rfl⟩
+  have hAl := hAlign rootVal ht
+  have hextract : extractScalarSlice? sc 0 n = some sc := by
+    have hpos := tyScalarBytes_pos hScalar
+    unfold extractScalarSlice?
+    have hb1 : Bool.and (Nat.ble 1 n) (Nat.ble (Nat.add 0 n) sc.sizeBytes) = true := by
+      simp [Nat.ble_eq, hpos, hWidth]
+    have hb2 : Bool.and (Nat.beq 0 0) (Nat.beq n sc.sizeBytes) = true := by
+      simp [hWidth]
+    rw [hb1, hb2]
+  unfold evalOperand
+  dsimp only
+  rw [hp]
+  dsimp only
+  rw [hcons]
+  dsimp only
+  rw [← hcons, hEntry]
+  dsimp only
+  cases hpe : entry.perm with
+  | disabled => exact absurd hpe hPerm
+  | _ =>
+    dsimp only
+    rw [ht]
+    dsimp only
+    unfold evalStackThinPtrTypedDerefRead
+    rw [hPTy, hOff]
+    dsimp only [stripTransparentProjections, checkDerefAlign, Nat.beq_refl]
+    rw [hAl]
+    simp only [Bool.and_self]
+    rw [hcons]
+    dsimp only [stripTransparentProjections]
+    rw [← hcons, hScalar]
+    dsimp only [stripTransparentProjections]
+    cases hproj : entry.targetProjection with
+    | nil =>
+      rw [hproj] at hr
+      dsimp only [readProjectedForLocal]
+      rw [hr]
+      dsimp only
+      rw [hextract]
+      dsimp only
+      rw [hValid]
+    | cons ph pt =>
+      rw [hproj] at hr hNoUnion
+      simp only [appendProjections_eq_append, List.append_nil]
+      dsimp only [readProjectedForLocal]
+      rw [hNoUnion]
+      dsimp only
+      rw [hr]
+      dsimp only
+      rw [hextract]
+      dsimp only
+      rw [hValid]
+
+/-- **`Rvalue.use` of a `Deref` copy (`evalRvalue_use_copy_of_evalOperand`)**: for any
+`localDecls`, Trusted's `evalRvalue` of `Rvalue.use (copy (*_p).rest)` returns the value and frame
+of `evalOperand` once `validateLoadedValue` accepts the value (Trusted may only freeze the read
+tags of its borrow table). -/
+theorem evalRvalue_use_copy_of_evalOperand {locals : List LocalSlot} {p : Nat}
+    {rest : List ProjectionElem} {v : Value} {mem : Memory} {localDecls : List LocalDecl}
+    {layouts : LayoutTable}
     (hOp : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
       mem.callerLocals localDecls = .ok v locals)
     (hValid : validateLoadedValue layouts localDecls (.copy ⟨p, .deref :: rest⟩) v = true) :
@@ -11720,6 +11856,39 @@ theorem evalDerefPlaceRead_refines_evalRvalue_general {cx : SubplaceCtx}
     cases bs with
     | nil => exact ⟨_, rfl⟩
     | cons b₂ bs => exact ⟨_, rfl⟩
+
+/-- **Typed `Deref` reads refine Trusted's typed `evalRvalue`
+(`evalDerefPlaceRead_refines_evalRvalue_typed`)**: under the hypotheses of
+`evalDerefPlaceRead_refines_evalOperand_typed` and Trusted's load validation of the read scalar
+(`validateLoadedValue`), Trusted's typed `Rvalue.use (copy (*_p))` evaluates to the scalar Anneal
+reads from `*_p`, without changing the frame. -/
+theorem evalDerefPlaceRead_refines_evalRvalue_typed {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {sc : ScalarInt}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable} {pTy : Ty}
+    {n : Nat} (hRel : SlotsRefine SlotBelow slots locals)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow mem.borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, [.deref]⟩ = .ok (.scalar sc))
+    (hDecls : localDecls ≠ [])
+    (hPTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some pTy)
+    (hScalar : tyScalarBytes (resolveTyWithLocalDecls localDecls layouts pTy) = some n)
+    (hWidth : sc.sizeBytes = n) (hOff : pv.offsetBytes = 0)
+    (hAlign : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign localDecls layouts
+        (some (resolveTyWithLocalDecls localDecls layouts pTy)) entry pv (some rootVal) = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar sc) = true)
+    (hLoad : validateLoadedValue layouts localDecls (.copy ⟨p, [.deref]⟩) (.scalar sc) = true) :
+    ∃ mem', evalRvalue locals (.use (.copy ⟨p, [.deref]⟩)) mem localDecls layouts =
+      .ok (.scalar sc) locals mem' :=
+  evalRvalue_use_copy_of_evalOperand
+    (evalDerefPlaceRead_refines_evalOperand_typed hRel hPtr hTy hRes hEntry hPerm hRead hDecls
+      hPTy hScalar hWidth hOff hAlign hNoUnion hValid mem.globals mem.callerLocals) hLoad
 
 /-- **`Deref` writes refine Trusted's `writePlaceValue` (`evalDerefPlaceWrite_refines_writePlaceValue`)**:
 on below-related frames, if Anneal writes `v` through `(*_p).rest` into an initialized target and
@@ -12658,9 +12827,59 @@ def reborrowDeadErr : Option Nat → Except DerefErr SynPtr
 def addrOnlyRaw (expectedRef : Bool) (pty : PtrTy) (hasDowncast : Bool) : Bool :=
   !expectedRef && !pty.isRef && !hasDowncast
 
+/-- The provenance tag of a synthetic pointer (the untagged `1` without provenance). -/
+def synthProvTag (p : SynPtr) : Nat :=
+  match p.prov with
+  | some (_, t) => t
+  | none => 1
+
+/-- **The provenance tag of an in-bounds `offset_inbounds` reborrow fallback**
+(`rvalue.rs:9693-9701`): the untagged `1` when at most one sub-place of local `l` of the result's
+pointee type `resTy` sits at offset `off` (`collect_subplace_paths`); otherwise the base tag's
+candidate ordinal re-encoded for `resTy` (`encode_subplace_tag`) when it decodes for `resTy` to an
+in-range ordinal (`decode_subplace_tag`), and `1` when it does not. -/
+def reborrowFallbackTag (cx : SubplaceCtx) (resTy l off baseTag : Nat) : Nat :=
+  if (cx.candidates resTy l off).length ≤ 1 then 1
+  else
+    match cx.decodeTag baseTag resTy with
+    | some ord => if ord < (cx.candidates resTy l off).length then cx.encodeTag resTy ord else 1
+    | none => 1
+
+/-- A unique (or absent) fallback candidate gives the untagged provenance `1`. -/
+theorem reborrowFallbackTag_unique {cx : SubplaceCtx} {resTy l off baseTag : Nat}
+    (h : (cx.candidates resTy l off).length ≤ 1) :
+    reborrowFallbackTag cx resTy l off baseTag = 1 := by
+  simp [reborrowFallbackTag, h]
+
+/-- With several fallback candidates, a base tag that decodes for `resTy` to an in-range ordinal
+is re-encoded for `resTy`. -/
+theorem reborrowFallbackTag_decoded {cx : SubplaceCtx} {resTy l off baseTag ord : Nat}
+    (hMany : 1 < (cx.candidates resTy l off).length)
+    (hDec : cx.decodeTag baseTag resTy = some ord) (hOrd : ord < (cx.candidates resTy l off).length) :
+    reborrowFallbackTag cx resTy l off baseTag = cx.encodeTag resTy ord := by
+  have hNot : ¬ (cx.candidates resTy l off).length ≤ 1 := by omega
+  simp [reborrowFallbackTag, hNot, hDec, hOrd]
+
+/-- With several fallback candidates, a base tag without a usable ordinal for `resTy` (it does not
+decode, e.g. after a cast to another pointee type, or its ordinal is out of range) gives `1`. -/
+theorem reborrowFallbackTag_stale {cx : SubplaceCtx} {resTy l off baseTag : Nat}
+    (hStale : ∀ ord, cx.decodeTag baseTag resTy = some ord →
+      (cx.candidates resTy l off).length ≤ ord) :
+    reborrowFallbackTag cx resTy l off baseTag = 1 := by
+  unfold reborrowFallbackTag
+  split
+  · rfl
+  · cases hDec : cx.decodeTag baseTag resTy with
+    | none => rfl
+    | some ord =>
+      have hLe := hStale ord hDec
+      have hNot : ¬ ord < (cx.candidates resTy l off).length := by omega
+      simp [hNot]
+
 /-- **`resolve_reborrow_with_tail_in`**: `&((*p).tail)` (`expectedRef`) or `&raw ((*p).tail)` of a
 base pointer `p` of type `pty` whose pointee has layout `dtl`, where `tail` (with `Downcast` steps
-iff `hasDowncast`) has static offset `tailOff` inside the pointee:
+iff `hasDowncast`) has static offset `tailOff` inside the pointee and the result's pointee type
+(`pointee_ty`, the type of `(*p).tail`) is `resTy`:
 1. a reference result or a reference base needs a non-null base (`InvalidBitPattern` for `&T`,
    `NullPointerAccess` otherwise) aligned to the pointee (`MisalignedPointer`,
    `UnsupportedLayout`) with an inhabited pointee for a reference base;
@@ -12670,10 +12889,15 @@ iff `hasDowncast`) has static offset `tailOff` inside the pointee:
    offset `0` (it keeps the base pointer), and otherwise faults or is unsupported (MiniRust's
    `offset_inbounds`);
 4. otherwise the base resolves to a sub-place `(l, q)` (`resolveSyntheticSubplace`), and the result
-   addresses `q ++ tail` inside `l`'s synthetic allocation with provenance `(l + 1, tag)`. -/
+   addresses `q ++ tail` inside `l`'s synthetic allocation with provenance `(l + 1, tag)`;
+5. when that resolution fails, an address-only raw reborrow of a base with the provenance of a live
+   local `l` falls back to `offset_inbounds`: a base outside `l`'s allocation is kept at offset `0`
+   (and is unsupported otherwise), and an in-bounds base at relative offset `rel` yields the address
+   at `rel + tailOff` (when that is still in bounds) with provenance
+   `(l + 1, reborrowFallbackTag cx resTy l (rel + tailOff) baseTag)` (`rvalue.rs:9654-9706`). -/
 def evalReborrowTail (cx : SubplaceCtx) (slots : List LocalSlotState) (base : SynPtr)
     (pty : PtrTy) (dtl : TyLayout) (expectedRef hasDowncast : Bool) (tail : List ProjectionElem)
-    (tailOff tag : Nat) : Except DerefErr SynPtr :=
+    (tailOff tag resTy : Nat) : Except DerefErr SynPtr :=
   if cx.limit < base.addr then .error .invalidBitPattern
   else if (expectedRef || pty.isRef) && base.addr = 0 then
     (if pty.isRef then .error .invalidBitPattern else .error .nullPointer)
@@ -12711,7 +12935,9 @@ def evalReborrowTail (cx : SubplaceCtx) (slots : List LocalSlotState) (base : Sy
             if base.addr < b ∨ b + allocSize < base.addr then
               if tailOff = 0 then .ok base else .error .unsupported
             else if (base.addr - b) + tailOff ≤ allocSize ∧ b + ((base.addr - b) + tailOff) ≤ cx.limit then
-              .ok ⟨b + ((base.addr - b) + tailOff), base.prov⟩
+              .ok ⟨b + ((base.addr - b) + tailOff),
+                some (l + 1, reborrowFallbackTag cx resTy l ((base.addr - b) + tailOff)
+                  (synthProvTag base))⟩
             else .error .unsupported
           | _, _ => .error .unsupported
         | none => .error e
@@ -12723,7 +12949,7 @@ has static offset `off` inside `l`'s layout, `evalReborrowTail` produces the syn
 `⟨b + off, some (l + 1, tag)⟩`. -/
 theorem evalReborrowTail_resolved_ok (cx : SubplaceCtx) {slots : List LocalSlotState}
     {base : SynPtr} {pty : PtrTy} {dtl : TyLayout} {expectedRef hasDowncast : Bool}
-    {tail : List ProjectionElem} {tailOff tag l t b off : Nat} {q : List ProjectionElem}
+    {tail : List ProjectionElem} {tailOff tag resTy l t b off : Nat} {q : List ProjectionElem}
     {lay sub : ByteLayout} {st : LocalSlotState}
     (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
     (hA1 : base.addr % dtl.minAlign = 0) (hA2 : base.addr % dtl.maxAlign = 0)
@@ -12732,7 +12958,7 @@ theorem evalReborrowTail_resolved_ok (cx : SubplaceCtx) {slots : List LocalSlotS
     (hRes : resolveSyntheticSubplace cx slots base pty false = .ok (l, q))
     (hLay : cx.layoutOf l = some lay) (hBase : localBaseAddr cx.allocs l cx.limit = some b)
     (hSub : subplaceAt lay 0 (q ++ tail) = some (sub, off)) :
-    evalReborrowTail cx slots base pty dtl expectedRef hasDowncast tail tailOff tag =
+    evalReborrowTail cx slots base pty dtl expectedRef hasDowncast tail tailOff tag resTy =
       .ok ⟨b + off, some (l + 1, tag)⟩ := by
   have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hLive).1
   have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
@@ -12748,14 +12974,16 @@ theorem evalReborrowTail_resolved_ok (cx : SubplaceCtx) {slots : List LocalSlotS
   simp [evalReborrowTail, h1, hNZ, hA1, hA2, h5, hT, hDeadF, hRes, hLay, hBase, hSub]
 
 /-- **Address-only raw `offset_inbounds` fallback (`evalReborrowTail_raw_inbounds_fallback_ok`,
-`rvalue.rs:9654-9707`)**: when `resolveSyntheticSubplace` fails (e.g. a misaligned raw pointer
+`rvalue.rs:9654-9706`)**: when `resolveSyntheticSubplace` fails (e.g. a misaligned raw pointer
 `*const (u32, u32)` at byte offset `1` inside a `[u8; 16]` local `l`), an address-only raw
 reborrow (`expectedRef = false`, `pty.isRef = false`, `hasDowncast = false`) whose `base.addr` and
-`base.addr + tailOff` both lie within `[b, b + allocSize]` succeeds with
-`⟨b + ((base.addr - b) + tailOff), base.prov⟩`. -/
+`base.addr + tailOff` both lie within `[b, b + allocSize]` succeeds with the address
+`b + ((base.addr - b) + tailOff)` and the provenance `(l + 1, tag')` of local `l`, where `tag'` is
+`reborrowFallbackTag` of the result's pointee type `resTy` at that offset and the base's tag `t`
+(`with_provenance(local_base + total_off, target_local + 1, tag)`). -/
 theorem evalReborrowTail_raw_inbounds_fallback_ok (cx : SubplaceCtx) {slots : List LocalSlotState}
     {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem)
-    (tailOff tag : Nat) {l t b allocSize align : Nat} {st : LocalSlotState} {e : DerefErr}
+    (tailOff tag resTy : Nat) {l t b allocSize align : Nat} {st : LocalSlotState} {e : DerefErr}
     (hRaw : pty.isRef = false) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
     (hProv : base.prov = some (l + 1, t)) (hLive : slots[l]? = some st) (hNotDead : st ≠ .dead)
     (hResErr : resolveSyntheticSubplace cx slots base pty false = .error e)
@@ -12763,8 +12991,9 @@ theorem evalReborrowTail_raw_inbounds_fallback_ok (cx : SubplaceCtx) {slots : Li
     (hOwn : ownLayout cx.allocs l = some (allocSize, align))
     (hInLo : b ≤ base.addr) (hInHi : (base.addr - b) + tailOff ≤ allocSize)
     (hFit : b + ((base.addr - b) + tailOff) ≤ cx.limit) :
-    evalReborrowTail cx slots base pty dtl false false tail tailOff tag =
-      .ok ⟨b + ((base.addr - b) + tailOff), base.prov⟩ := by
+    evalReborrowTail cx slots base pty dtl false false tail tailOff tag resTy =
+      .ok ⟨b + ((base.addr - b) + tailOff),
+        some (l + 1, reborrowFallbackTag cx resTy l ((base.addr - b) + tailOff) t)⟩ := by
   have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hLive).1
   have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
   have hDeadF : reborrowTargetDead slots (some l) = false := by
@@ -12773,28 +13002,52 @@ theorem evalReborrowTail_raw_inbounds_fallback_ok (cx : SubplaceCtx) {slots : Li
     | _ => simp [reborrowTargetDead, hLive]
   have h1 : ¬ cx.limit < base.addr := by omega
   have hOut : ¬ (base.addr < b ∨ b + allocSize < base.addr) := by omega
+  have hTag : synthProvTag base = t := by simp [synthProvTag, hProv]
   simp [evalReborrowTail, addrOnlyRaw, hRaw, h1, hNZ, hT, hDeadF, hResErr, hBase, hOwn, hOut,
-    hInHi, hFit]
+    hInHi, hFit, hTag]
+
+/-- **A unique-candidate `offset_inbounds` fallback is untagged
+(`evalReborrowTail_raw_inbounds_fallback_unique_tag`)**: under the hypotheses of
+`evalReborrowTail_raw_inbounds_fallback_ok`, when at most one sub-place of `l` of the result's
+pointee type `resTy` sits at the fallback offset (`collect_subplace_paths(..).len() <= 1`), the
+fallback pointer carries the untagged provenance `(l + 1, 1)`, whatever the base's tag `t`. -/
+theorem evalReborrowTail_raw_inbounds_fallback_unique_tag (cx : SubplaceCtx)
+    {slots : List LocalSlotState} {base : SynPtr} {pty : PtrTy} (dtl : TyLayout)
+    (tail : List ProjectionElem) (tailOff tag resTy : Nat) {l t b allocSize align : Nat}
+    {st : LocalSlotState} {e : DerefErr}
+    (hRaw : pty.isRef = false) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (hProv : base.prov = some (l + 1, t)) (hLive : slots[l]? = some st) (hNotDead : st ≠ .dead)
+    (hResErr : resolveSyntheticSubplace cx slots base pty false = .error e)
+    (hBase : localBaseAddr cx.allocs l cx.limit = some b)
+    (hOwn : ownLayout cx.allocs l = some (allocSize, align))
+    (hInLo : b ≤ base.addr) (hInHi : (base.addr - b) + tailOff ≤ allocSize)
+    (hFit : b + ((base.addr - b) + tailOff) ≤ cx.limit)
+    (hUniq : (cx.candidates resTy l ((base.addr - b) + tailOff)).length ≤ 1) :
+    evalReborrowTail cx slots base pty dtl false false tail tailOff tag resTy =
+      .ok ⟨b + ((base.addr - b) + tailOff), some (l + 1, 1)⟩ := by
+  rw [evalReborrowTail_raw_inbounds_fallback_ok cx dtl tail tailOff tag resTy hRaw hW hNZ hProv
+    hLive hNotDead hResErr hBase hOwn hInLo hInHi hFit, reborrowFallbackTag_unique hUniq]
 
 /-- **Offset-`0` raw reborrows of null pointers are valid (`evalReborrowTail_raw_null_zero`)**:
 `&raw ((*p).tail)` of a null raw pointer with a zero-offset, `Downcast`-free tail is the null
 pointer itself. -/
 theorem evalReborrowTail_raw_null_zero (cx : SubplaceCtx) (slots : List LocalSlotState)
-    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag : Nat)
+    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag resTy : Nat)
     (hRaw : pty.isRef = false) (h0 : base.addr = 0) :
-    evalReborrowTail cx slots base pty dtl false false tail 0 tag = .ok base := by
+    evalReborrowTail cx slots base pty dtl false false tail 0 tag resTy = .ok base := by
   simp [evalReborrowTail, addrOnlyRaw, hRaw, h0]
 
 /-- **Offset-`0` raw reborrows of dangling pointers are valid; non-zero offsets fault
 (`evalReborrowTail_raw_dangling`)**: an address-only raw reborrow of a pointer into a storage-dead
 local keeps the pointer at offset `0` and is `DeadLocal` at any non-zero tail offset. -/
 theorem evalReborrowTail_raw_dangling (cx : SubplaceCtx) {slots : List LocalSlotState}
-    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag : Nat)
+    {base : SynPtr} {pty : PtrTy} (dtl : TyLayout) (tail : List ProjectionElem) (tag resTy : Nat)
     {l t : Nat} (hRaw : pty.isRef = false) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
     (hProv : base.prov = some (l + 1, t)) (hDead : slots[l]? = some .dead) :
-    evalReborrowTail cx slots base pty dtl false false tail 0 tag = .ok base ∧
+    evalReborrowTail cx slots base pty dtl false false tail 0 tag resTy = .ok base ∧
       ∀ tailOff, tailOff ≠ 0 →
-        evalReborrowTail cx slots base pty dtl false false tail tailOff tag = .error (.deadLocal l) := by
+        evalReborrowTail cx slots base pty dtl false false tail tailOff tag resTy =
+          .error (.deadLocal l) := by
   have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hDead).1
   have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
   have h1 : ¬ cx.limit < base.addr := by omega
@@ -12807,8 +13060,8 @@ theorem evalReborrowTail_raw_dangling (cx : SubplaceCtx) {slots : List LocalSlot
 /-- **Reference reborrows of null pointers fault (`evalReborrowTail_ref_null`)**, whatever the tail. -/
 theorem evalReborrowTail_ref_null (cx : SubplaceCtx) (slots : List LocalSlotState)
     {base : SynPtr} (pty : PtrTy) (dtl : TyLayout) (hasDowncast : Bool) (tail : List ProjectionElem)
-    (tailOff tag : Nat) (h0 : base.addr = 0) :
-    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag =
+    (tailOff tag resTy : Nat) (h0 : base.addr = 0) :
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag resTy =
       .error (if pty.isRef then .invalidBitPattern else .nullPointer) := by
   simp only [evalReborrowTail, h0]
   cases pty.isRef <;> simp
@@ -12816,9 +13069,10 @@ theorem evalReborrowTail_ref_null (cx : SubplaceCtx) (slots : List LocalSlotStat
 /-- **Reference reborrows enforce the pointee's alignment (`evalReborrowTail_ref_misaligned`)**. -/
 theorem evalReborrowTail_ref_misaligned (cx : SubplaceCtx) (slots : List LocalSlotState)
     {base : SynPtr} (pty : PtrTy) {dtl : TyLayout} (hasDowncast : Bool) (tail : List ProjectionElem)
-    (tailOff tag : Nat) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (tailOff tag resTy : Nat) (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
     (hMis : base.addr % dtl.minAlign ≠ 0) :
-    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag = .error .misaligned := by
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag resTy =
+      .error .misaligned := by
   have h1 : ¬ cx.limit < base.addr := by omega
   simp [evalReborrowTail, h1, hNZ, hMis]
 
@@ -12826,11 +13080,12 @@ theorem evalReborrowTail_ref_misaligned (cx : SubplaceCtx) (slots : List LocalSl
 aligned pointer into a storage-dead local is `DeadLocal`. -/
 theorem evalReborrowTail_ref_dead (cx : SubplaceCtx) {slots : List LocalSlotState}
     {base : SynPtr} {pty : PtrTy} {dtl : TyLayout} (hasDowncast : Bool) (tail : List ProjectionElem)
-    (tailOff tag : Nat) {l t : Nat} (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
+    (tailOff tag resTy : Nat) {l t : Nat} (hW : base.addr ≤ cx.limit) (hNZ : base.addr ≠ 0)
     (hA1 : base.addr % dtl.minAlign = 0) (hA2 : base.addr % dtl.maxAlign = 0)
     (hInh : pty.isRef = true → dtl.inhabited = true)
     (hProv : base.prov = some (l + 1, t)) (hDead : slots[l]? = some .dead) :
-    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag = .error (.deadLocal l) := by
+    evalReborrowTail cx slots base pty dtl true hasDowncast tail tailOff tag resTy =
+      .error (.deadLocal l) := by
   have hlt : l < slots.length := (List.getElem?_eq_some_iff.mp hDead).1
   have hT : synthProvLocal slots base = some l := by simp [synthProvLocal, hProv, hlt]
   have h1 : ¬ cx.limit < base.addr := by omega
@@ -13010,30 +13265,36 @@ def witnessEntry : BorrowEntry :=
 
 theorem witnessCtxT_wf : witnessCtxT.WF := ⟨witnessCtx_wf.layout, witnessCtx_wf.candidates⟩
 
+/-- **Witness: Anneal resolves Trusted's pointer to Trusted's borrow target
+(`witness_trusted_resolve`)**: under `witnessCtxT`, the no-guess resolution of Trusted's pointer
+value `witnessPtrT` (pointee `u32`) is exactly the sub-place `_0.1` named by Trusted's borrow entry
+`witnessEntry` — an instance of `resolveSyntheticSubplace_evalSubplaceRef`. -/
+theorem witness_trusted_resolve :
+    resolveSyntheticSubplace witnessCtxT witnessSlotsT (witnessCtxT.ptrOf witnessPtrT)
+      ⟨false, 1⟩ false = .ok (witnessEntry.targetLocal, witnessEntry.targetProjection) := by
+  have hRef : evalSubplaceRef witnessCtxT witnessSlotsT 0 [.field 1 witnessU32] 0 =
+      .ok ⟨0x1004, some (1, 0)⟩ := by with_unfolding_all rfl
+  have hPtrOf : witnessCtxT.ptrOf witnessPtrT = ⟨0x1004, some (1, 0)⟩ := by
+    simp [witnessCtxT, witnessPtrT]
+  rw [hPtrOf]
+  exact resolveSyntheticSubplace_evalSubplaceRef witnessCtxT_wf hRef false
+    (tl := ⟨4, 4, 4, true, true⟩) (by simp [witnessCtxT, witnessCtx]) (by decide) (by decide)
+    (by simp) (lay := .struct 8 [0, 4] [.leaf 4, .leaf 4]) (sub := .leaf 4) (off := 4)
+    (by simp [witnessCtxT, witnessCtx]) (by with_unfolding_all rfl) rfl
+    (by simp [witnessCtxT, witnessCtx]) (by simp) (by simp [witnessCtxT, witnessCtx])
+    (allocSize := 8) (align := 4) (by simp [ownLayout, witnessCtxT, witnessCtx])
+
 /-- **Non-vacuity of the `Deref` refinement (`witness_trusted_deref_read`)**: every hypothesis of
 `evalDerefPlaceRead_refines_evalOperand` holds in the witness frame (below-related slots, Anneal's
 no-guess resolution of `*_1` agreeing with Trusted's borrow entry), so Trusted's
 `Operand.copy (*_1)` reads `9`, exactly as Anneal does. -/
 theorem witness_trusted_deref_read :
     evalOperand witnessLocalsT (.copy ⟨1, [.deref]⟩) [witnessEntry] [] emptyLayoutTable [] =
-      .ok (.scalar ⟨9, 4⟩) witnessLocalsT := by
-  have hRef : evalSubplaceRef witnessCtxT witnessSlotsT 0 [.field 1 witnessU32] 0 =
-      .ok ⟨0x1004, some (1, 0)⟩ := by with_unfolding_all rfl
-  have hPtrOf : witnessCtxT.ptrOf witnessPtrT = ⟨0x1004, some (1, 0)⟩ := by
-    simp [witnessCtxT, witnessPtrT]
-  have hRes : resolveSyntheticSubplace witnessCtxT witnessSlotsT (witnessCtxT.ptrOf witnessPtrT)
-      ⟨false, 1⟩ false = .ok (witnessEntry.targetLocal, witnessEntry.targetProjection) := by
-    rw [hPtrOf]
-    exact resolveSyntheticSubplace_evalSubplaceRef witnessCtxT_wf hRef false
-      (tl := ⟨4, 4, 4, true, true⟩) (by simp [witnessCtxT, witnessCtx]) (by decide) (by decide)
-      (by simp) (lay := .struct 8 [0, 4] [.leaf 4, .leaf 4]) (sub := .leaf 4) (off := 4)
-      (by simp [witnessCtxT, witnessCtx]) (by with_unfolding_all rfl) rfl
-      (by simp [witnessCtxT, witnessCtx]) (by simp) (by simp [witnessCtxT, witnessCtx])
-      (allocSize := 8) (align := 4) (by simp [ownLayout, witnessCtxT, witnessCtx])
-  exact evalDerefPlaceRead_refines_evalOperand (cx := witnessCtxT) (pty := ⟨false, 1⟩)
+      .ok (.scalar ⟨9, 4⟩) witnessLocalsT :=
+  evalDerefPlaceRead_refines_evalOperand (cx := witnessCtxT) (pty := ⟨false, 1⟩)
     (sz := 8) (rest := [])
     (by simp [witnessSlotsT, witnessLocalsT, SlotsRefine, SlotBelow]) rfl
-    (by with_unfolding_all rfl) (by simp [witnessCtxT, witnessCtx]) hRes
+    (by with_unfolding_all rfl) (by simp [witnessCtxT, witnessCtx]) witness_trusted_resolve
     (by simp [lookupBorrow, witnessEntry, witnessPtrT, ProvenancePtr.tag])
     (by simp [witnessEntry]) (by with_unfolding_all rfl) (by with_unfolding_all rfl)
     [] emptyLayoutTable []
@@ -13043,16 +13304,56 @@ def witnessLocalDecls : List LocalDecl :=
   [ { mutability := .mut, ty := { kind := .tuple [witnessU32.kind, witnessU32.kind], layoutIdx := 0 }, debugName := none }
   , { mutability := .mut, ty := { kind := .rawPtr .mut witnessU32.kind, layoutIdx := 0 }, debugName := none } ]
 
-/-- **Non-vacuity of `evalDerefPlaceRead_refines_evalRvalue_general` with non-empty `localDecls`
-(`witness_trusted_deref_read_typed`)**: Trusted's typed `evalRvalue` on `Rvalue.use (copy (*_1))`
-with `witnessLocalDecls` evaluates to `.ok (.scalar ⟨9, 4⟩)` matching `evalDerefPlaceRead`. -/
+/-- **Non-vacuity of the typed `Deref` refinement (`witness_trusted_deref_read_typed`)**: every
+hypothesis of `evalDerefPlaceRead_refines_evalOperand_typed` and
+`evalDerefPlaceRead_refines_evalRvalue_typed` holds in the witness frame with the non-empty typed
+declarations `witnessLocalDecls` (pointee `u32`: 4-byte scalar, offset `0`, aligned target `_0.1`,
+no union, valid value), so Anneal's `evalDerefPlaceRead`, Trusted's typed `evalOperand` (through
+`evalStackThinPtrTypedDerefRead`), and Trusted's typed `evalRvalue` all read `9` from `*_1`. -/
 theorem witness_trusted_deref_read_typed :
+    evalDerefPlaceRead witnessCtxT witnessSlotsT ⟨1, [.deref]⟩ = .ok (.scalar ⟨9, 4⟩) ∧
+    evalOperand witnessLocalsT (.copy ⟨1, [.deref]⟩) [witnessEntry] [] emptyLayoutTable []
+      witnessLocalDecls = .ok (.scalar ⟨9, 4⟩) witnessLocalsT ∧
     ∃ mem', evalRvalue witnessLocalsT (.use (.copy ⟨1, [.deref]⟩))
       { borrows := [witnessEntry], globals := [], callerLocals := [], activeProtectors := [] }
-      witnessLocalDecls emptyLayoutTable = .ok (.scalar ⟨9, 4⟩) witnessLocalsT mem' :=
-  evalDerefPlaceRead_refines_evalRvalue_general witnessLocalDecls emptyLayoutTable
-    (cx := witnessCtxT) (slots := witnessSlotsT)
-    (by with_unfolding_all rfl) (by rfl) (by rfl)
+      witnessLocalDecls emptyLayoutTable = .ok (.scalar ⟨9, 4⟩) witnessLocalsT mem' := by
+  have hRead : evalDerefPlaceRead witnessCtxT witnessSlotsT ⟨1, [.deref]⟩ =
+      .ok (.scalar ⟨9, 4⟩) := by
+    with_unfolding_all rfl
+  have hRel : SlotsRefine SlotBelow witnessSlotsT witnessLocalsT := by
+    simp [witnessSlotsT, witnessLocalsT, SlotsRefine, SlotBelow]
+  have hPtr : readPlaceState witnessSlotsT ⟨1, []⟩ = .ok (.ptr witnessPtrT 8) := by
+    with_unfolding_all rfl
+  have hTy : witnessCtxT.ptrTyAt 1 [] = some ⟨false, 1⟩ := by simp [witnessCtxT, witnessCtx]
+  have hEntry : lookupBorrow [witnessEntry] witnessPtrT.tag = some witnessEntry := by
+    simp [lookupBorrow, witnessEntry, witnessPtrT, ProvenancePtr.tag]
+  have hPerm : witnessEntry.perm ≠ .disabled := by simp [witnessEntry]
+  have hDecls : witnessLocalDecls ≠ [] := by simp [witnessLocalDecls]
+  have hPTy : placeTyResolved witnessLocalDecls emptyLayoutTable ⟨1, [.deref]⟩ =
+      some witnessU32 := by with_unfolding_all rfl
+  have hScalar : tyScalarBytes
+      (resolveTyWithLocalDecls witnessLocalDecls emptyLayoutTable witnessU32) = some 4 := by
+    with_unfolding_all rfl
+  have hAlign : ∀ rootVal, get? witnessLocalsT witnessEntry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign witnessLocalDecls emptyLayoutTable
+        (some (resolveTyWithLocalDecls witnessLocalDecls emptyLayoutTable witnessU32))
+        witnessEntry witnessPtrT (some rootVal) = true := by
+    intro rootVal h
+    cases h
+    with_unfolding_all rfl
+  have hNoUnion : placeTouchesUnion witnessLocalDecls emptyLayoutTable
+      ⟨witnessEntry.targetLocal, witnessEntry.targetProjection⟩ = false := by
+    with_unfolding_all rfl
+  have hValid : validateValueForTy? emptyLayoutTable
+      (some (resolveTyWithLocalDecls witnessLocalDecls emptyLayoutTable witnessU32))
+      (.scalar ⟨9, 4⟩) = true := by with_unfolding_all rfl
+  have hLoad : validateLoadedValue emptyLayoutTable witnessLocalDecls (.copy ⟨1, [.deref]⟩)
+      (.scalar ⟨9, 4⟩) = true := by with_unfolding_all rfl
+  refine ⟨hRead, ?_, ?_⟩
+  · exact evalDerefPlaceRead_refines_evalOperand_typed hRel hPtr hTy witness_trusted_resolve
+      hEntry hPerm hRead hDecls hPTy hScalar rfl rfl hAlign hNoUnion hValid [] []
+  · exact evalDerefPlaceRead_refines_evalRvalue_typed hRel hPtr hTy witness_trusted_resolve
+      hEntry hPerm hRead hDecls hPTy hScalar rfl rfl hAlign hNoUnion hValid hLoad
 
 /-- Witness type fingerprint mapping: type `1` (`u32`) has fingerprint `1`, type `2`
 (`i32`) has fingerprint `2`. -/

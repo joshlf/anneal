@@ -4707,12 +4707,27 @@ private theorem writePlaceValue_deref_of_ptrTargetSpec {body : CapturedMir}
 
 /-! ## The theorem -/
 
-/-- **Correspondence theorem (one step, preserving `StateRelN`).** For a
-fragment body `body`, its `minimize`-style translation `f`, and related states
-(`StateRelN`), one Anneal MIR step and one MiniRust `Machine::step` correspond
-in the sense of `StepRelN`. -/
-theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
-    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+/-- **Correspondence theorem (one step, preserving `StateRelN`), for any MiniRust
+function agreeing with the translation where the step looks.** For a fragment
+body `body` and related states (`StateRelN`), one Anneal MIR step and one
+MiniRust `Machine::step` correspond in the sense of `StepRelN`, for every
+MiniRust function `f` whose local declarations are those of `translateFn`
+(`FnLocalsSpec`) and whose block at the current program counter has as many
+statements as Anneal's block, the translation of Anneal's current statement at
+the current index, and the translation of Anneal's terminator (`hblk`). The
+function `translateFn body` satisfies both (`step_correspondence_N`); so does
+the translation of a body that differs from `body` only in statements other
+than the current one (used for projected `Deinit` in
+`MiniRustSpec.Correspondence.DeinitWindow`). -/
+theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+    (hfl : FnLocalsSpec body f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hblk : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb →
+      ∃ tb, mapGet f.blocks (bbName s.frame.blockIdx) = some tb ∧
+        tb.statements.length = bb.statements.length ∧
+        (∀ st, bb.statements[s.frame.stmtIdx]? = some st →
+          ∃ st', translateStatement body.localDecls st body.layouts = some st' ∧
+            tb.statements[s.frame.stmtIdx]? = some st') ∧
+        translateTerminator body.layouts body.localDecls bb.terminator = some tb.terminator)
     (hrel : StateRelN body f ctx s m) :
     StepRelN body f ctx s (stepMirFn body s) (Interp.step m) := by
   obtain ⟨view, lm, hrel, hthr, hlo, hns, hbo⟩ := hrel
@@ -4720,13 +4735,11 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
     inFragment_spec body hfrag
   obtain ⟨hpa, _⟩ := inFragment_ptr body hfrag
   obtain ⟨_, hpresAll, _⟩ := ptrAliasingOk_spec hpa
-  have hspec := translateFn_spec body f hf
   obtain ⟨bb, hbb⟩ : ∃ bb, body.basicBlocks[s.frame.blockIdx]? = some bb :=
     ⟨_, List.getElem?_eq_getElem hrel.blk⟩
   have hbbmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
   obtain ⟨_, hstmts, hterm⟩ := hbbs bb hbbmem
-  obtain ⟨tb, htb, hgetb⟩ := hspec.2.2 _ bb hbb
-  obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ _ bb tb htb
+  obtain ⟨tb, hgetb, hlen, hstspec, htermspec⟩ := hblk bb hbb
   obtain ⟨hmvS, hmvT, hmvEdge⟩ := movesOk_spec hmvOk hbb
   have hshape : Shape m (ctxWithBorrows body ctx s.memory.borrows)
       [(ctxWithBorrows body ctx s.memory.borrows).caller,
@@ -4735,7 +4748,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
       m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
   have hframe : FrameOk body f (ctxWithBorrows body ctx s.memory.borrows) view lm (resetPick m)
       s.frame.blockIdx s.frame.stmtIdx :=
-    ⟨FnLocalsSpec.of_translateFn hf, resetPick_shape hshape, hlo, hdeclsOk, hns⟩
+    ⟨hfl, resetPick_shape hshape, hlo, hdeclsOk, hns⟩
   have hslotsA : SlotsOk body.layouts body.localDecls s.frame.locals := hrel.stale.slots hlo.slots
   have hnA : s.frame.locals.length = body.localDecls.length := hrel.stale.1.trans hlo.nlocals
   have hdlo : ptrDeclLayoutsOk body = true := ptrDeclLayoutsOk_of_ptrAliasingOk hpa
@@ -4748,7 +4761,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
     obtain ⟨st, hst⟩ : ∃ st, bb.statements[s.frame.stmtIdx]? = some st :=
       ⟨_, List.getElem?_eq_getElem hlt⟩
     have hstmem : st ∈ bb.statements := List.mem_of_getElem? hst
-    obtain ⟨st', hst', htst⟩ := hstspec _ st hst
+    obtain ⟨st', hst', htst⟩ := hstspec st hst
     rw [stepMirFn_stmt body s bb st hrel.activeCallee hphase hbb hst]
     have hok := hstmts st hstmem
     have hreads := hmvS _ st hst
@@ -5077,7 +5090,7 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                 have he' := translateRvalue_derefRead hdp hpt he
                 subst he'
                 have hgood := hframe.decl_good i d hdi
-                have hspecF := (translateFn_spec body f hf).2.1 i d hdi
+                have hspecF := hfl.2 i d hdi
                 let memFrz : MirSemantics.Memory :=
                   { s.memory with
                     borrows := MirSemantics.freezeDerefReadBorrowsAt s.frame.locals p []
@@ -6479,6 +6492,21 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
         exact StepRelN.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
           ⟨r0, a0, d0, R, hd0, hv0', hp, hr0, hs'.threads, hs'.allocs, hR⟩
 
+/-- **Correspondence theorem (one step, preserving `StateRelN`).** For a
+fragment body `body`, its `minimize`-style translation `f`, and related states
+(`StateRelN`), one Anneal MIR step and one MiniRust `Machine::step` correspond
+in the sense of `StepRelN`. -/
+theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hrel : StateRelN body f ctx s m) :
+    StepRelN body f ctx s (stepMirFn body s) (Interp.step m) :=
+  step_correspondence_NF body f hfrag (FnLocalsSpec.of_translateFn hf) ctx s m
+    (fun bb hbb => by
+      obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+      obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ _ bb tb htb
+      exact ⟨tb, hgetb, hlen, fun st hst => hstspec _ st hst, htermspec⟩)
+    hrel
+
 /-- **Correspondence theorem (one step).** For a fragment body `body`, its
 `minimize`-style translation `f`, and related states (`StateRel`, when all
 local declarations of `body` are scalar-family; see `step_correspondence_N` for
@@ -6718,8 +6746,10 @@ theorem step_initBlock {body : CapturedMir} {f : Gen.Function} (hf : translateFn
 `k` of `minimize`'s init block, the first `k` temporaries are allocated, and
 `NonScalarLive` and the argument locals map are preserved. -/
 private theorem step_start_key {body : CapturedMir} {f : Gen.Function}
-    (hfrag : inFragment body = true)
-    (hf : translateFn body = some f) {ctx : Ctx} {s : MachineState} {mInit : Mach}
+    (hfrag : inFragment body = true) (hfl : FnLocalsSpec body f)
+    (hst0 : f.start = bbName body.basicBlocks.length ∧
+      mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body))
+    {ctx : Ctx} {s : MachineState} {mInit : Mach}
     (hstart : StartRel body f ctx s mInit)
     (hns : nonScalarSlotsInit body s.frame.locals = true) :
     ∀ k, k ≤ (alwaysStorageLiveLocals body).length → ∃ m lm,
@@ -6731,7 +6761,7 @@ private theorem step_start_key {body : CapturedMir} {f : Gen.Function}
     NonScalarLive body s.frame.locals lm ∧
     (∀ j, j < body.argCount + 1 → mapGet lm (localName j) = some (localPtr ctx j)) := by
   obtain ⟨_, hargs, hn31, _, hdeclsOk, htemps, _, _, _, _⟩ := inFragment_spec body hfrag
-  obtain ⟨hfstart, hinit⟩ := translateFn_start body f hf
+  obtain ⟨hfstart, hinit⟩ := hst0
   have hAnd := alwaysStorageLiveLocals_nodup body
   have hlenS : (initBlock body).statements.length = (alwaysStorageLiveLocals body).length := by
     simp [initBlock]
@@ -6775,7 +6805,7 @@ private theorem step_start_key {body : CapturedMir} {f : Gen.Function}
         have := (hlo.live a .dead hsa).mp (by simp [hp])
         simp [hnot] at this
     obtain ⟨m3, lm3, hm3, hsh3, hlo3, hns3, hlm3⟩ :=
-      evalStatement_storageLive_init (FnLocalsSpec.of_translateFn hf)
+      evalStatement_storageLive_init hfl
       (resetPick_shape hsh) hlo hdeclsOk hnsL a d hd hscalar hsa hpa hstart.baseLow hn31
     obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hsh3
     have hne : ((k : Nat) : Int) ≠ ((initBlock body).statements.length : Int) := by
@@ -6789,20 +6819,27 @@ private theorem step_start_key {body : CapturedMir} {f : Gen.Function}
     · rw [htake, h4.allocs]
       exact hlo3
 
-/-- **Init block (`StateRelN`).** From `StartRel` (Anneal at `(0, 0)` and
-MiniRust at `f.start`), `initLen body` MiniRust steps execute `minimize`'s init
-block (`StorageLive` of each temporary of `alwaysStorageLiveLocals`, then
-`Goto(bb0)`) and land in `StateRelN`. -/
-theorem step_start_N {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
-    (hf : translateFn body = some f) {ctx : Ctx} {s : MachineState} {mInit : Mach}
+/-- **Init block (`StateRelN`), for any MiniRust function with the translated
+locals and entry block.** From `StartRel` (Anneal at `(0, 0)` and MiniRust at
+`f.start`), `initLen body` MiniRust steps execute `minimize`'s init block
+(`StorageLive` of each temporary of `alwaysStorageLiveLocals`, then
+`Goto(bb0)`) and land in `StateRelN`, for every `f` whose local declarations
+are those of `translateFn` (`FnLocalsSpec`) and whose start block is `initBlock
+body` (`hst0`, as for `translateFn body`; see `step_start_N`). -/
+theorem step_start_NF {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hfl : FnLocalsSpec body f)
+    (hst0 : f.start = bbName body.basicBlocks.length ∧
+      mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body))
+    {ctx : Ctx} {s : MachineState} {mInit : Mach}
     (hstart : StartRel body f ctx s mInit)
     (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
     ∃ m0, Interp.steps (initLen body) mInit = .ok m0 ∧ StateRelN body f ctx s m0 := by
   obtain ⟨_, hargs, _, _, _, _, _, _, _, _⟩ := inFragment_spec body hfrag
-  obtain ⟨_, hinit⟩ := translateFn_start body f hf
+  have hinit := hst0.2
   have hlenS : (initBlock body).statements.length = (alwaysStorageLiveLocals body).length := by
     simp [initBlock]
-  obtain ⟨m, lm, hm, hsh, hlo, hnsL, hlmP⟩ := step_start_key hfrag hf hstart hns _ (Nat.le_refl _)
+  obtain ⟨m, lm, hm, hsh, hlo, hnsL, hlmP⟩ :=
+    step_start_key hfrag hfl hst0 hstart hns _ (Nat.le_refl _)
   rw [List.take_length] at hlo
   obtain ⟨m0, hm0, h0⟩ := jumpToBlock_callee (resetPick_shape hsh) 0
   have hif : (((alwaysStorageLiveLocals body).length : Nat) : Int) =
@@ -6871,6 +6908,17 @@ theorem step_start_N {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment
     protectors := hstart.protectors
     callerLocals := hstart.callerLocals }
 
+/-- **Init block (`StateRelN`).** From `StartRel` (Anneal at `(0, 0)` and
+MiniRust at `f.start`), `initLen body` MiniRust steps execute `minimize`'s init
+block (`StorageLive` of each temporary of `alwaysStorageLiveLocals`, then
+`Goto(bb0)`) and land in `StateRelN`. -/
+theorem step_start_N {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) {ctx : Ctx} {s : MachineState} {mInit : Mach}
+    (hstart : StartRel body f ctx s mInit)
+    (hns : nonScalarSlotsInit body s.frame.locals = true := by decide) :
+    ∃ m0, Interp.steps (initLen body) mInit = .ok m0 ∧ StateRelN body f ctx s m0 :=
+  step_start_NF hfrag (FnLocalsSpec.of_translateFn hf) (translateFn_start body f hf) hstart hns
+
 /-- **Init block.** From `StartRel` (Anneal at `(0, 0)` and MiniRust at
 `f.start`), `initLen body` MiniRust steps execute `minimize`'s init block
 (`StorageLive` of each temporary of `alwaysStorageLiveLocals`, then
@@ -6900,7 +6948,8 @@ theorem step_start_with_no_returnRel {body : CapturedMir} {f : Gen.Function}
   refine ⟨⟨m0, hm0Steps, hrel0⟩, fun j hj mj hmj b' c' s' v => ?_⟩
   rcases Nat.lt_or_eq_of_le hj with hjlt | rfl
   · obtain ⟨mk, lmk, hmk, hshk, _⟩ :=
-      step_start_key hfrag hf hstart hns j (by rw [initLen] at hjlt; omega)
+      step_start_key hfrag (FnLocalsSpec.of_translateFn hf) (translateFn_start body f hf)
+        hstart hns j (by rw [initLen] at hjlt; omega)
     rw [hmk] at hmj
     cases hmj
     exact Shape.not_returnRel_of_ne_nil (callerFrames := [ctx.caller]) hshk (by simp)
