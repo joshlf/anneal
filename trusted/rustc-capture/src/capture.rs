@@ -1,0 +1,706 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
+//! Compiler observation, complete inventory, and exact input reads. The host
+//! authenticates the compiler/sysroot distribution and stages declared inputs;
+//! these checks do not defend against a compromised execution environment.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use rustc_abi::Endian;
+use rustc_data_structures::steal::Steal;
+use rustc_driver::Compilation;
+use rustc_hir::def::DefKind;
+use rustc_interface::interface;
+use rustc_middle::mir;
+use rustc_middle::ty::TyCtxt;
+use rustc_middle::util::Providers;
+use rustc_span::FileName;
+use rustc_span::def_id::LocalDefId;
+use rustc_span::source_map::{FileLoader, RealFileLoader};
+use sha2::{Digest, Sha256};
+
+use crate::{Args, Failure, extract, ir};
+
+// rustc query providers are function pointers, so the hook cannot borrow a
+// callback instance. These cells hold one process's session authority and owned
+// snapshots. They are initialized once before queries and never reused for a
+// second capture, avoiding stale bodies or selectors from another compilation.
+type Provider = for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> &'tcx Steal<mir::Body<'tcx>>;
+static DEFAULT_PROVIDER: OnceLock<Provider> = OnceLock::new();
+static SELECTION: OnceLock<Selection> = OnceLock::new();
+static CAPTURED: Mutex<BTreeMap<u32, extract::Result<ir::Body>>> = Mutex::new(BTreeMap::new());
+
+struct Selection {
+    whole_crate: bool,
+    paths: BTreeSet<String>,
+}
+
+/// The query returns `Steal<Body>` and later queries consume it. Call the
+/// original provider, copy the admitted syntax while it is available, and
+/// return the exact original result. The compiler explicitly supports this:
+/// "can be overridden by custom rustc drivers".
+/// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_mir_transform/src/lib.rs#L567-L598
+///
+/// Early snapshots do not decide coverage. The independent compiler census is
+/// enumerated in full before selecting or assembling any output program.
+fn hook<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx Steal<mir::Body<'tcx>> {
+    let provider = DEFAULT_PROVIDER
+        .get()
+        .expect("provider installed before queries");
+    let original = provider(tcx, def);
+    let selection = SELECTION.get().expect("selection installed before queries");
+    if callable(tcx.def_kind(def))
+        && (selection.whole_crate || selection.paths.contains(&tcx.def_path_str(def)))
+    {
+        let result = extract::body(tcx, def, &original.borrow());
+        CAPTURED
+            .lock()
+            .expect("capture mutex poisoned")
+            .insert(def.local_def_index.as_u32(), result);
+    }
+    original
+}
+
+fn override_queries(_: &rustc_session::Session, providers: &mut Providers) {
+    DEFAULT_PROVIDER
+        .set(providers.queries.mir_drops_elaborated_and_const_checked)
+        .expect("one compiler session per capture process");
+    providers.queries.mir_drops_elaborated_and_const_checked = hook;
+}
+
+#[derive(Default)]
+struct Reads {
+    files: BTreeMap<PathBuf, ir::SourceFile>,
+    refusals: Vec<String>,
+}
+
+struct RecordingLoader {
+    reads: Arc<Mutex<Reads>>,
+    allowed: BTreeSet<PathBuf>,
+    directories: BTreeSet<PathBuf>,
+}
+
+impl RecordingLoader {
+    fn new(reads: Arc<Mutex<Reads>>, allowed: BTreeSet<PathBuf>) -> Self {
+        // Directories are derived authority, not another ambient inventory.
+        // Requiring every original parent prefix preserves normal ../ lookup
+        // through declared ancestors without admitting missing/../file when an
+        // unrelated ambient directory happens to appear.
+        let directories = allowed
+            .iter()
+            .flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
+            .collect();
+        Self {
+            reads,
+            allowed,
+            directories,
+        }
+    }
+
+    /// Resolve within the declared file-and-ancestor namespace. The standard
+    /// normalizer works "without traversing the filesystem" and warns that
+    /// lexical .. can differ when an intermediate component is a symlink.
+    /// Check every parent prefix against derived directories, then open only
+    /// the admitted normalized name. Neither missing prefixes nor undeclared
+    /// aliases may acquire authority from ambient filesystem state.
+    /// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/library/std/src/path.rs#L3407-L3422
+    ///
+    /// This is a configured source namespace, not evidence that undeclared
+    /// alternatives were absent in the original tree. The CLI stages regular
+    /// files; direct capture callers must keep declared canonical inputs and
+    /// their ancestors unchanged throughout the compiler session. These checks
+    /// do not make filesystem mutation by a compromised host atomic or safe.
+    fn lookup(&self, path: &Path) -> io::Result<PathBuf> {
+        let absolute = std::path::absolute(path)?;
+        for parent in absolute.ancestors().skip(1) {
+            let parent = parent.normalize_lexically().map_err(io::Error::other)?;
+            if !self.directories.contains(&parent) {
+                return Err(io::Error::other("undeclared source directory"));
+            }
+        }
+        let path = absolute.normalize_lexically().map_err(io::Error::other)?;
+        if !self.allowed.contains(&path) {
+            return Err(io::Error::other("undeclared source filename"));
+        }
+        // Membership must precede filesystem queries: even a symlink to an
+        // allowed target is invisible under an undeclared name. The canonical
+        // name itself must still denote the declared regular file.
+        if path.canonicalize()? != path || !path.is_file() {
+            return Err(io::Error::other(
+                "declared source is not a canonical regular file",
+            ));
+        }
+        Ok(path)
+    }
+
+    fn read_path(&self, path: &Path) -> io::Result<PathBuf> {
+        match self.lookup(path) {
+            Ok(path) => Ok(path),
+            Err(cause) => {
+                let error = format!("undeclared compiler read: {}: {cause}", path.display());
+                // Missing module candidates are normal negative probes. An
+                // actual denied read is different: compiler recovery must not
+                // publish a capture after handling this I/O error.
+                let mut reads = self
+                    .reads
+                    .lock()
+                    .map_err(|_| io::Error::other("input read mutex poisoned"))?;
+                reads.refusals.push(error.clone());
+                Err(io::Error::other(error))
+            }
+        }
+    }
+
+    fn record(&self, path: &Path, bytes: &[u8], read_kind: &'static str) -> io::Result<()> {
+        let path = path.canonicalize()?;
+        let mut reads = self
+            .reads
+            .lock()
+            .map_err(|_| io::Error::other("input read mutex poisoned"))?;
+        // Membership, not an empty-list convention, authorizes the read. Keep
+        // refusals separately so a compiler recovery path cannot turn a denied
+        // input into success merely by handling the loader's I/O error.
+        if !self.allowed.contains(&path) {
+            let error = format!("undeclared compiler read: {}", path.display());
+            reads.refusals.push(error.clone());
+            return Err(io::Error::other(error));
+        }
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        if let Some(previous) = reads.files.get(&path) {
+            if previous.sha256 != sha256 {
+                let error = format!("input changed between compiler reads: {}", path.display());
+                reads.refusals.push(error.clone());
+                return Err(io::Error::other(error));
+            }
+        } else {
+            reads.files.insert(
+                path.clone(),
+                ir::SourceFile {
+                    path,
+                    sha256,
+                    read_kind,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Hash the exact bytes returned to rustc, before SourceMap normalization.
+/// `FileLoader::read_file` must "return a String because we normalize source
+/// files"; binary inputs have a separate read method and are recorded too.
+/// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_span/src/source_map.rs#L81-L96
+impl FileLoader for RecordingLoader {
+    fn file_exists(&self, path: &Path) -> bool {
+        // FileLoader asks to "Query the existence of a file." rustc probes
+        // both name.rs and name/mod.rs and rejects two visible candidates.
+        // Answer in the same closed namespace as reads: ambient alternatives
+        // must not change module choice or ambiguity without a declaration.
+        // A negative probe is not a refused read and needs no recorded input.
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_span/src/source_map.rs#L81-L84
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_expand/src/module.rs#L246-L264
+        self.lookup(path).is_ok()
+    }
+
+    fn read_file(&self, path: &Path) -> io::Result<String> {
+        let path = self.read_path(path)?;
+        let text = RealFileLoader.read_file(&path)?;
+        self.record(&path, text.as_bytes(), "text")?;
+        Ok(text)
+    }
+
+    fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
+        let path = self.read_path(path)?;
+        let bytes = RealFileLoader.read_binary_file(&path)?;
+        self.record(&path, &bytes, "binary")?;
+        Ok(bytes)
+    }
+
+    fn current_directory(&self) -> io::Result<PathBuf> {
+        RealFileLoader.current_directory()
+    }
+}
+
+fn callable(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Fn | DefKind::AssocFn)
+}
+
+// Census policy is independent of successful body translation. Rust calls
+// `hir_body_owners` an iterator over "all body-owners in this crate". Every
+// such owner is required, including closures and anonymous/inline constants.
+// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_middle/src/hir/map.rs#L362-L367
+//
+// Functions (including declarations), statics, named constants, datatype and
+// trait/impl owners, and global assembly also require explicit admission even
+// without a HIR body. The initial adapter rejects unsupported owners instead
+// of silently dropping their contracts or layout obligations.
+//
+// Other definitions describe names, parameters, or components of these owners;
+// absent a body they add no separate obligation in this adapter. In particular,
+// `Ctor` "Refers to the struct or enum variant's constructor", while the type
+// owner is separately required. Unused `AnonConst` entries can be "unused and
+// incomplete", with queries that "ICE when using this `DefId`". Use the body
+// inventory rather than demanding a body query from every definition.
+// https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_hir/src/def.rs#L99-L205
+//
+// Keep this match exhaustive: a compiler upgrade must classify each new kind.
+fn required(kind: DefKind, has_body: bool) -> bool {
+    match kind {
+        DefKind::Fn
+        | DefKind::AssocFn
+        | DefKind::Static { .. }
+        | DefKind::Const { .. }
+        | DefKind::AssocConst { .. }
+        | DefKind::Struct
+        | DefKind::Enum
+        | DefKind::Union
+        | DefKind::Trait
+        | DefKind::Impl { .. }
+        | DefKind::GlobalAsm => true,
+        DefKind::Mod
+        | DefKind::Variant
+        | DefKind::TyAlias
+        | DefKind::ForeignTy
+        | DefKind::TraitAlias
+        | DefKind::AssocTy
+        | DefKind::TyParam
+        | DefKind::ConstParam
+        | DefKind::Ctor(..)
+        | DefKind::Macro(..)
+        | DefKind::ExternCrate
+        | DefKind::Use
+        | DefKind::ForeignMod
+        | DefKind::AnonConst
+        | DefKind::InlineConst
+        | DefKind::OpaqueTy
+        | DefKind::Field
+        | DefKind::LifetimeParam
+        | DefKind::Closure
+        | DefKind::SyntheticCoroutineBody => has_body,
+    }
+}
+
+// Required does not mean supported. Whole-crate capture must admit every
+// required owner, including owners with no runtime body. A fieldless enum is
+// admitted through its type/discriminant adapter; no callable body is fabricated
+// for it. Other required owner classes remain explicit refusals.
+fn whole_crate_item(tcx: TyCtxt<'_>, def: LocalDefId, has_body: bool) -> extract::Result<()> {
+    match tcx.def_kind(def) {
+        DefKind::Fn | DefKind::AssocFn if has_body => Ok(()),
+        DefKind::Enum => {
+            extract::ty(tcx, tcx.type_of(def).instantiate_identity().skip_norm_wip()).map(|_| ())
+        }
+        other => Err(format!("whole-crate obligation is unsupported: {other:?}")),
+    }
+}
+
+struct Callbacks<'a> {
+    args: &'a Args,
+    reads: Arc<Mutex<Reads>>,
+    result: Option<Result<ir::Manifest, Failure>>,
+}
+
+impl rustc_driver::Callbacks for Callbacks<'_> {
+    fn config(&mut self, config: &mut interface::Config) {
+        crate::driver::configure(config);
+        config.override_queries = Some(override_queries);
+        config.file_loader = Some(Box::new(RecordingLoader::new(
+            self.reads.clone(),
+            self.args.source_file.iter().cloned().collect(),
+        )));
+    }
+
+    fn after_analysis<'tcx>(&mut self, _: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        self.result = Some(collect(tcx, self.args, &self.reads));
+        // Continue through metadata/object emission and rustc's final check.
+        // A candidate manifest is published only after the session returns
+        // successfully, so errors after this callback still prohibit capture.
+        // `run_compiler` finishes with "sess.dcx().abort_if_errors()".
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/interface.rs#L491-L509
+        Compilation::Continue
+    }
+}
+
+/// Keep source-to-contract lookup unambiguous even if the pinned printer maps
+/// two distinct compiler items to the same text. Sharing a restrictive caller
+/// predicate could make a different unsafe function's obligation vacuous.
+///
+/// The runner authenticates this generated Capture source before checking the
+/// canonical root. Capture therefore owns the identity-to-body association and
+/// must reject ambiguity here, before either capture artifact is published.
+fn reserve_identity(identities: &mut BTreeSet<String>, identity: &str) -> Result<(), Failure> {
+    if identities.insert(identity.to_owned()) {
+        Ok(())
+    } else {
+        Err(Failure::unsupported(format!(
+            "ambiguous captured function identity: {identity}"
+        )))
+    }
+}
+
+fn collect(
+    tcx: TyCtxt<'_>,
+    args: &Args,
+    reads: &Arc<Mutex<Reads>>,
+) -> Result<ir::Manifest, Failure> {
+    if tcx.dcx().has_errors().is_some() {
+        return Err(Failure::compiler("compiler diagnostics prohibit capture"));
+    }
+    // `pointer_size` is the compiler's "pointer size in the default data
+    // address space". The owned syntax fixes both that width and endianness;
+    // neither a host-width guess nor a target-name heuristic supplies it.
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_abi/src/lib.rs#L674-L678
+    if tcx.data_layout.pointer_size().bits() != 64 || tcx.data_layout.endian != Endian::Little {
+        return Err(Failure::unsupported(
+            "only 64-bit little-endian targets are modeled",
+        ));
+    }
+    let sysroot = tcx.sess.opts.sysroot.path().to_path_buf();
+    crate::check_compiler(&sysroot)?;
+
+    // `iter_local_def_id` finishes analysis and visits all definitions,
+    // including definitions created during enumeration: "Recompute the number of
+    // definitions each time, because our caller may be creating new ones."
+    // `hir_body_owners` independently identifies bodies, including uncalled and
+    // unsupported ones. Neither list comes from walking successfully translated
+    // selected bodies.
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_middle/src/ty/context.rs#L1353-L1371
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_middle/src/hir/map.rs
+    let body_owners: BTreeSet<_> = tcx
+        .hir_body_owners()
+        .map(|def| def.local_def_index.as_u32())
+        .collect();
+    let defs: Vec<_> = tcx.iter_local_def_id().collect();
+    let requested: BTreeSet<_> = args.select.iter().cloned().collect();
+    let mut found = BTreeSet::new();
+    let mut census = Vec::new();
+    let mut selected_defs = Vec::new();
+    let mut unsupported = Vec::new();
+    for def in defs {
+        let path = tcx.def_path_str(def);
+        let kind = tcx.def_kind(def);
+        let has_body = body_owners.contains(&def.local_def_index.as_u32());
+        let is_required = required(kind, has_body);
+        // Selected-unit claims cover only the requested callable bodies. Keep
+        // every other item visible in the census without pretending to verify
+        // it. Whole-crate mode instead requires admission of every required
+        // item, so an unsupported owner cannot disappear with its body.
+        let selected = if args.scope.is_some() {
+            is_required
+        } else {
+            requested.contains(&path)
+        };
+        if requested.contains(&path) {
+            found.insert(path.clone());
+        }
+        census.push(ir::CensusItem {
+            def_id: def.local_def_index.as_u32(),
+            path: path.clone(),
+            kind: format!("{kind:?}"),
+            has_body,
+            selected,
+            required: is_required,
+        });
+        if !selected {
+            continue;
+        }
+        let admission = if args.scope.is_some() {
+            whole_crate_item(tcx, def, has_body)
+        } else if callable(kind) && has_body {
+            Ok(())
+        } else {
+            Err("selected roots must be callable definitions with bodies".into())
+        };
+        match admission {
+            Ok(()) if callable(kind) => selected_defs.push(def),
+            Ok(()) => {}
+            Err(reason) => unsupported.push(ir::Unsupported {
+                def_id: def.local_def_index.as_u32(),
+                path,
+                reason,
+            }),
+        }
+    }
+    if found != requested {
+        return Err(Failure::unsupported(format!(
+            "selected definitions not found: {:?}",
+            requested.difference(&found).collect::<Vec<_>>()
+        )));
+    }
+    // A provider is only called when a query is demanded. Force every selected
+    // body before code generation, with no incremental cache or fallback to
+    // optimized MIR. The hook records bodies before later stealing.
+    let mut bodies = Vec::new();
+    let mut identities = BTreeSet::new();
+    let mut selected = Vec::new();
+    for def in selected_defs {
+        let key = def.local_def_index.as_u32();
+        let _ = tcx.mir_drops_elaborated_and_const_checked(def);
+        let result = CAPTURED
+            .lock()
+            .map_err(|_| Failure::tool("capture mutex poisoned"))?
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| Err("compiler did not provide Runtime(PostCleanup) MIR".into()));
+        match result {
+            Ok(body) => {
+                reserve_identity(&mut identities, &body.identity)?;
+                selected.push(ir::SelectedBody {
+                    def_id: key,
+                    path: tcx.def_path_str(def),
+                    body_index: bodies.len(),
+                });
+                bodies.push(body);
+            }
+            Err(reason) => unsupported.push(ir::Unsupported {
+                def_id: key,
+                path: tcx.def_path_str(def),
+                reason,
+            }),
+        }
+    }
+    if tcx.dcx().has_errors().is_some() {
+        return Err(Failure::compiler(
+            "late compiler diagnostics prohibit capture",
+        ));
+    }
+    if !unsupported.is_empty() {
+        return Err(Failure::unsupported_items(unsupported));
+    }
+    // The manifest binds file bytes and explicit flags, not ambient environment
+    // values. rustc records "Environment variables accessed during the build
+    // and their values when they exist"; accepting these would leave part of
+    // the compilation subject outside the input binding.
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_session/src/session.rs#L155-L159
+    if !tcx.sess.env_depinfo.borrow().is_empty() {
+        return Err(Failure::unsupported(
+            "environment-dependent source inputs are unsupported",
+        ));
+    }
+    let reads = reads
+        .lock()
+        .map_err(|_| Failure::tool("input read mutex poisoned"))?;
+    // Cross-check rustc's input inventories against the loader instead of
+    // assuming that installing a loader intercepted every source dependency.
+    // Imported source-map entries describe precompiled dependency source;
+    // authenticating that distribution belongs to the host, while local source
+    // reads must all have records here.
+    for file in tcx.sess.source_map().files().iter() {
+        if file.is_imported() {
+            continue;
+        }
+        let FileName::Real(real) = &file.name else {
+            return Err(Failure::unsupported(
+                "non-file compiler source input is unsupported",
+            ));
+        };
+        let path = real
+            .local_path()
+            .ok_or_else(|| Failure::unsupported("source input lacks a local path"))?
+            .canonicalize()
+            .map_err(Failure::io)?;
+        if !reads.files.contains_key(&path) {
+            return Err(Failure::unsupported(format!(
+                "source input bypassed read recording: {}",
+                path.display()
+            )));
+        }
+    }
+    // SourceMap alone is insufficient: rustc also records "File paths accessed
+    // during the build". Binary include inputs must have the same byte binding
+    // as textual source, even when they have no source-map entry.
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_session/src/session.rs#L158-L159
+    for file in tcx.sess.file_depinfo.borrow().iter() {
+        let path = Path::new(file.as_str())
+            .canonicalize()
+            .map_err(Failure::io)?;
+        if !reads.files.contains_key(&path) {
+            return Err(Failure::unsupported(format!(
+                "dependency input bypassed read recording: {}",
+                path.display()
+            )));
+        }
+    }
+    check_current_inputs(&reads)?;
+    let roots = args.select.clone();
+    Ok(ir::Manifest {
+        schema_version: ir::SCHEMA_VERSION,
+        compiler: ir::Compiler {
+            commit: ir::COMPILER_COMMIT,
+            version: ir::COMPILER_VERSION,
+            sysroot,
+        },
+        configuration: ir::Configuration {
+            crate_root: args.crate_root.clone(),
+            crate_name: args.crate_name.clone(),
+            edition: args.edition.clone(),
+            target: args.target.clone(),
+            cfg: args.cfg.clone(),
+            opt_level: 0,
+            debug_assertions: false,
+            overflow_checks: false,
+            pointer_bits: 64,
+            endian: "little",
+            declared_source_files: args.source_file.clone(),
+        },
+        scope: if args.scope.is_some() {
+            ir::Scope::Crate { roots }
+        } else {
+            ir::Scope::SelectedUnit { roots }
+        },
+        source_files: reads.files.values().cloned().collect(),
+        census,
+        selected,
+        unsupported,
+        program: ir::Program {
+            scope: if args.scope.is_some() {
+                ir::VerificationScope::Crate
+            } else {
+                ir::VerificationScope::Unit
+            },
+            bodies,
+        },
+    })
+}
+
+// The compiler continues through object emission after analysis. Recheck the
+// observed bytes after that work as well as when constructing the manifest.
+fn check_current_inputs(reads: &Reads) -> Result<(), Failure> {
+    for file in reads.files.values() {
+        let current = std::fs::read(&file.path).map_err(Failure::io)?;
+        if format!("{:x}", Sha256::digest(&current)) != file.sha256 {
+            return Err(Failure::unsupported(format!(
+                "compiler input changed after reading: {}",
+                file.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn run(args: &Args) -> Result<ir::Manifest, Failure> {
+    SELECTION
+        .set(Selection {
+            whole_crate: args.scope.is_some(),
+            paths: args.select.iter().cloned().collect(),
+        })
+        .map_err(|_| Failure::tool("one capture invocation per process is required"))?;
+    let mut compiler_args = vec![
+        "anneal-rustc-capture".into(),
+        compiler_path(&args.crate_root)?.to_string(),
+        "--crate-type=lib".into(),
+        format!("--crate-name={}", args.crate_name),
+        format!("--edition={}", args.edition),
+        format!("--target={}", args.target),
+        // Metadata alone skips monomorphization and can miss a failing generic
+        // inline constant. rustc skips crate items when `should_codegen` is
+        // false: "Skip crate items and just output metadata in -Z no-codegen
+        // mode." Request object output to reach normal code generation without a
+        // linker; these outputs remain in the private publication staging area.
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_interface/src/passes.rs#L1308-L1318
+        //
+        // The collector says: "Always visit all `required_consts`, so that we
+        // evaluate them and abort compilation if any of them errors."
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_monomorphize/src/collector.rs#L1347-L1353
+        "--emit=metadata,obj".into(),
+        // This explicit profile belongs to the captured configuration, rather
+        // than inheriting Cargo or host defaults. rustc says debug-assertions
+        // controls "cfg(debug_assertions)" and overflow-checks controls "runtime
+        // integer overflow". This subject uses both disabled; explicit MIR
+        // checks are still translated or refused, never silently removed here.
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/src/doc/rustc/src/codegen-options/index.md#L65-L76
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/src/doc/rustc/src/codegen-options/index.md#L463-L474
+        "-Copt-level=0".into(),
+        "-Cdebug-assertions=no".into(),
+        "-Coverflow-checks=no".into(),
+        format!("--out-dir={}", compiler_path(&args.out_dir)?),
+    ];
+    if let Some(sysroot) = &args.sysroot {
+        compiler_args.push(format!("--sysroot={}", compiler_path(sysroot)?));
+    }
+    // The pinned driver expands argument files before parsing compiler options:
+    // "Replaces any `@file` arguments with the contents of `file`, with each
+    // line of `file` as a separate argument." Keep cfg text attached to its
+    // option so a leading @ stays literal instead of reading unauthenticated
+    // bytes or introducing compiler flags. Expander::arg checks the argv prefix;
+    // rustc itself remains responsible for parsing the complete cfg grammar.
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L171-L187
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L14-L32
+    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L94-L108
+    for cfg in &args.cfg {
+        compiler_args.push(format!("--cfg={cfg}"));
+    }
+    let reads = Arc::new(Mutex::new(Reads::default()));
+    let mut callbacks = Callbacks {
+        args,
+        reads: reads.clone(),
+        result: None,
+    };
+    let compiler_result = rustc_driver::catch_fatal_errors(|| {
+        crate::driver::install_ice_hook();
+        rustc_driver::run_compiler(&compiler_args, &mut callbacks);
+    });
+    let reads = reads
+        .lock()
+        .map_err(|_| Failure::tool("input read mutex poisoned"))?;
+    if !reads.refusals.is_empty() {
+        return Err(Failure::unsupported(reads.refusals.join("; ")));
+    }
+    if compiler_result.is_err() {
+        return Err(Failure::compiler(
+            "rustc rejected the compilation; see stderr diagnostics",
+        ));
+    }
+    let manifest = callbacks
+        .result
+        .unwrap_or_else(|| Err(Failure::compiler("rustc did not reach after_analysis")))?;
+    // Continuing after analysis must not leave later compiler reads out of
+    // the source binding. Reject a changed read set rather than completing
+    // an earlier snapshot with inputs that its compiler census never checked.
+    if manifest.source_files.len() != reads.files.len()
+        || !manifest
+            .source_files
+            .iter()
+            .zip(reads.files.values())
+            .all(|(captured, final_read)| {
+                captured.path == final_read.path
+                    && captured.sha256 == final_read.sha256
+                    && captured.read_kind == final_read.read_kind
+            })
+    {
+        return Err(Failure::unsupported(
+            "compiler inputs changed after the analysis snapshot",
+        ));
+    }
+    check_current_inputs(&reads)?;
+    Ok(manifest)
+}
+
+fn compiler_path(path: &Path) -> Result<&str, Failure> {
+    path.to_str().ok_or_else(|| {
+        Failure::unsupported("non-UTF-8 paths cannot be passed to the compiler driver")
+    })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_function_identities_are_refused() {
+        let mut identities = BTreeSet::new();
+        reserve_identity(&mut identities, "rust-path-v1::entry").unwrap();
+        let failure = reserve_identity(&mut identities, "rust-path-v1::entry").unwrap_err();
+        assert_eq!(failure.status, "unsupported");
+        assert!(failure.diagnostics[0].contains("ambiguous captured function identity"));
+    }
+}

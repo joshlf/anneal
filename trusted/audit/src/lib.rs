@@ -140,6 +140,7 @@ pub enum CandidateFeature {
     MirAst,
     MirSemantics,
     RustcCapture,
+    Mvp,
 }
 
 impl CandidateFeature {
@@ -152,6 +153,7 @@ impl CandidateFeature {
             "mir_ast" => Some(Self::MirAst),
             "mir_semantics" => Some(Self::MirSemantics),
             "rustc_capture" => Some(Self::RustcCapture),
+            "mvp" => Some(Self::Mvp),
             _ => None,
         }
     }
@@ -165,6 +167,7 @@ impl CandidateFeature {
             Self::MirAst => "mir_ast",
             Self::MirSemantics => "mir_semantics",
             Self::RustcCapture => "rustc_capture",
+            Self::Mvp => "mvp",
         }
     }
 }
