@@ -2098,28 +2098,165 @@ impl Checker {
 /// Topologically sort the module set `pending` according to `imports_map`,
 /// returning a policy rejection (`code == 1`) with `cycle_msg` if `pending`
 /// contains an import cycle.
+///
+/// Emit each ready layer in sorted order. Imports outside `pending` are assumed
+/// to be available.
+///
+/// Use iteration so deep import chains do not consume one Rust stack frame
+/// per module. Sorted layers keep staging and checking order deterministic.
 fn topo_sort_modules(
-    pending: BTreeSet<String>,
+    mut pending: BTreeSet<String>,
     imports_map: &BTreeMap<String, Vec<ImportEdge>>,
     cycle_msg: &str,
 ) -> Result<Vec<String>, Failure> {
-    if pending.is_empty() {
-        return Ok(Vec::new());
+    let mut order = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        // Snapshot the whole ready layer before removing modules so newly
+        // unlocked modules cannot interleave with its sorted order.
+        let ready: Vec<_> = pending
+            .iter()
+            .filter(|module| {
+                imports_map[*module]
+                    .iter()
+                    .all(|edge| !pending.contains(&edge.module))
+            })
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            return Err(Failure::policy("preflight", cycle_msg));
+        }
+        for module in ready {
+            pending.remove(&module);
+            order.push(module);
+        }
     }
-    let (ready, remaining): (BTreeSet<String>, BTreeSet<String>) = pending
-        .iter()
-        .cloned()
-        .partition(|n| {
-            imports_map[n]
-                .iter()
-                .all(|e| !pending.contains(&e.module))
-        });
-    if ready.is_empty() {
-        return Err(Failure::policy("preflight", cycle_msg));
-    }
-    let mut order: Vec<String> = ready.into_iter().collect();
-    order.extend(topo_sort_modules(remaining, imports_map, cycle_msg)?);
     Ok(order)
+}
+
+#[cfg(test)]
+mod module_order_tests {
+    use super::*;
+
+    fn import(module: &str) -> ImportEdge {
+        ImportEdge {
+            module: module.to_string(),
+            import_all: false,
+            is_exported: true,
+            is_meta: false,
+        }
+    }
+
+    fn sort(modules: &[(&str, &[&str])]) -> Result<Vec<String>, Failure> {
+        let imports: BTreeMap<_, _> = modules
+            .iter()
+            .map(|(module, dependencies)| {
+                (
+                    module.to_string(),
+                    dependencies.iter().map(|name| import(name)).collect(),
+                )
+            })
+            .collect();
+        topo_sort_modules(
+            imports.keys().cloned().collect(),
+            &imports,
+            "fixture import cycle",
+        )
+    }
+
+    #[test]
+    fn empty_module_set_has_no_ordering_work() {
+        assert_eq!(sort(&[]).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn independent_roots_are_sorted() {
+        assert_eq!(
+            sort(&[("Z", &[]), ("A", &[]), ("M", &[])]).unwrap(),
+            ["A", "M", "Z"]
+        );
+    }
+
+    #[test]
+    fn branching_graph_preserves_sorted_ready_layers() {
+        assert_eq!(
+            sort(&[
+                ("Final", &["AChild", "ZChild"]),
+                ("ZRoot", &[]),
+                ("AChild", &["ZRoot"]),
+                ("ARoot", &[]),
+                ("ZChild", &["ARoot"]),
+            ])
+            .unwrap(),
+            ["ARoot", "ZRoot", "AChild", "ZChild", "Final"]
+        );
+    }
+
+    #[test]
+    fn imports_outside_the_pending_set_are_already_available() {
+        let imports = BTreeMap::from([
+            (
+                "Trusted.Child".to_string(),
+                vec![import("Trusted.Root"), import("External.Ready")],
+            ),
+            (
+                "Trusted.Root".to_string(),
+                vec![import("Init.Prelude"), import("Init.Notation")],
+            ),
+            ("External.Ready".to_string(), Vec::new()),
+        ]);
+        assert_eq!(
+            topo_sort_modules(
+                BTreeSet::from([
+                    "Trusted.Child".to_string(),
+                    "Trusted.Root".to_string(),
+                ]),
+                &imports,
+                "fixture import cycle",
+            )
+            .unwrap(),
+            ["Trusted.Root", "Trusted.Child"]
+        );
+    }
+
+    #[test]
+    fn cycles_reject_with_the_selected_policy_message() {
+        let expected =
+            Err(Failure::policy("preflight", "fixture import cycle"));
+        assert_eq!(sort(&[("Self", &["Self"])]), expected);
+        assert_eq!(
+            sort(&[("Root", &[]), ("A", &["B"]), ("B", &["A"])]),
+            expected
+        );
+    }
+
+    #[test]
+    fn deep_dependency_chain_fits_a_small_thread_stack() {
+        let modules: Vec<_> =
+            (0..512).map(|i| format!("Module{i:03}")).collect();
+        let imports = modules
+            .iter()
+            .enumerate()
+            .map(|(index, module)| {
+                let dependencies = if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![import(&modules[index - 1])]
+                };
+                (module.clone(), dependencies)
+            })
+            .collect();
+        let pending = modules.iter().cloned().collect();
+        let order = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                topo_sort_modules(pending, &imports, "fixture import cycle")
+            })
+            .expect("spawn module ordering thread")
+            .join()
+            .expect("module ordering thread panicked")
+            .unwrap();
+        assert_eq!(order, modules);
+    }
 }
 
 #[cfg(all(test, unix))]
