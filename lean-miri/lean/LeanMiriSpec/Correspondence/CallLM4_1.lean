@@ -895,10 +895,18 @@ theorem callerRestoredProtectors_cons_eq_restoreCallerProtectors
     callerRestoredProtectors (cf :: cs) = restoreCallerProtectors cf := rfl
 
 /-- Arbitrary-depth `CallId` protector release (`releaseCallProtectors`):
-returning or unwinding across `k` call frames on `callStack` starting from
+popping `k` saved caller frames off `callStack` starting from
 `activeProtectors` iteratively applies Stage-1 `restoreCallerProtectors cf`
-(`Terminators.lean:468`, `3022`, `639`) for each popped `SavedCallerFrame`, and
-clears `activeProtectors` to `[]` if the root frame (`callStack = []`) is popped. -/
+(`Terminators.lean:468`; used by `TerminatorKind.return_` at `Terminators.lean:3022`
+and by every pop of `unwindFromCallStack` at `Terminators.lean:639`) for each popped
+`SavedCallerFrame`. Stage-1 pops several frames in a *single* step when unwinding
+through `UnwindAction.continue_` callers, and
+`unwindFromCallStack_running_releaseCallProtectors` proves that the protectors it
+leaves active are exactly `releaseCallProtectors k callStack activeProtectors`.
+
+Popping past the root frame (`k > callStack.length`) never yields a running Stage-1
+state (`unwindFromCallStack [] _ = .halted .panic`, and a root `return_` halts with
+`.retNormal`), so the `[]` result in that case is only a totalizing convention. -/
 def releaseCallProtectors : Nat → List SavedCallerFrame → List Nat → List Nat
   | 0, _, activeProtectors => activeProtectors
   | _ + 1, [], _ => []
@@ -912,8 +920,9 @@ theorem releaseCallProtectors_one_cons
     (cf : SavedCallerFrame) (cs : List SavedCallerFrame) (activeProtectors : List Nat) :
     releaseCallProtectors 1 (cf :: cs) activeProtectors = restoreCallerProtectors cf := rfl
 
-/-- Unwinding or returning through all `callStack.length + 1` frames (callee frames
-plus root frame) clears `activeProtectors` to `[]`. -/
+/-- Totalizing convention of `releaseCallProtectors`: requesting
+`callStack.length + 1` pops (past the root frame, which Stage-1 never resumes)
+yields `[]`. -/
 theorem releaseCallProtectors_full_clear
     (callStack : List SavedCallerFrame) (activeProtectors : List Nat) :
     releaseCallProtectors (callStack.length + 1) callStack activeProtectors = [] := by
@@ -943,6 +952,39 @@ theorem ActiveProtectorsValid.of_releaseCallProtectors
       exact ih rest (restoreCallerProtectors cf)
         (hstack cf List.mem_cons_self)
         (fun cf' hcf' => hstack cf' (List.mem_cons_of_mem _ hcf'))
+
+/-- **Stage-1 grounding of `releaseCallProtectors`**
+(`unwindFromCallStack_running_releaseCallProtectors`): whenever Stage-1
+`unwindFromCallStack callStack mem` (`Terminators.lean:632-653`, executed by
+`TerminatorKind.unwindResume` and by `applyUnwindAction .continue_`) resumes in a
+caller frame (`.running s'`), it has popped some `k` saved caller frames
+(`1 ≤ k ≤ callStack.length`; every popped frame but the last unwinds with
+`.continue_`) in that single step, restoring each popped frame's protectors, so
+that `s'.memory.activeProtectors = releaseCallProtectors k callStack mem.activeProtectors`
+and `s'.memory.callStack = callStack.drop k`. -/
+theorem unwindFromCallStack_running_releaseCallProtectors
+    (callStack : List SavedCallerFrame) (mem : Memory) (s' : MachineState)
+    (h : unwindFromCallStack callStack mem = .running s') :
+    ∃ k, 1 ≤ k ∧ k ≤ callStack.length ∧
+      s'.memory.activeProtectors = releaseCallProtectors k callStack mem.activeProtectors ∧
+      s'.memory.callStack = callStack.drop k := by
+  induction callStack generalizing mem with
+  | nil => simp [unwindFromCallStack] at h
+  | cons cf rest ih =>
+    cases hru : cf.returnUnwind with
+    | unreachable => simp [unwindFromCallStack, hru] at h
+    | terminate => simp [unwindFromCallStack, hru] at h
+    | continue_ =>
+      simp only [unwindFromCallStack, hru] at h
+      obtain ⟨k, hk1, hk2, hprot, hcs⟩ := ih _ h
+      refine ⟨k + 1, by omega, by simp only [List.length_cons]; omega, ?_, ?_⟩
+      · rw [hprot]; rfl
+      · rw [hcs]; rfl
+    | cleanup bb =>
+      simp only [unwindFromCallStack, hru] at h
+      injection h with h'
+      subst h'
+      exact ⟨1, Nat.le_refl 1, by simp only [List.length_cons]; omega, rfl, rfl⟩
 
 /-- Multi-node 3-level chain (`[g, c, r]`) and 3-node branching (`[c₀, c₁, p]`)
 protector release correspondence on `basedNormalTree`:
@@ -2262,20 +2304,27 @@ def annealControlHooksLM4_1
 * for an unprojected live immediate local `place = ⟨localId, #[]⟩`, deinitializes
   `localId` to `.live (.immediate .uninit)` and jumps to `(target, 0)`, faulting
   with `StepError.undefinedBehavior` when `localId` is `.dead`;
-* for a projected place (`!place.projection.isEmpty`), faults with
-  `StepError.undefinedBehavior` when `localId` is `.dead` or `.live (.immediate .uninit)`
-  (matching Stage-1 `Terminators.lean:3044, 3066`), and on an initialized
-  2-field tuple/struct immediate `.live (.immediate (.scalarPair _ _))` with
-  projection `[.Field 0 _]` or `[.Field 1 _]` advances to `(target, 0)` via
-  `ControlFlow.goToBlock target state` without deinitializing `localId`
-  (matching both Stage-1 `Terminators.lean:3055-3066` and canonical `lean-miri`'s
-  `ExecutionMachine.stepHooks.drop` at `ExecutionMachine.lean:327-335`).
+* for a projected place (`!place.projection.isEmpty`), keeps canonical
+  `lean-miri`'s no-glue `Drop` behavior (`ExecutionMachine.stepHooks.drop` at
+  `ExecutionMachine.lean:327-335`: `PlaceDynamic.evalPlace` followed by
+  `ControlFlow.goToBlock target`, which never reads the dropped value): faults
+  with `StepError.undefinedBehavior` when `localId` is `.dead` (Miri's dead-local
+  place evaluation; Stage-1 `Terminators.lean:3044` agrees), and on a live
+  immediate local holding a 2-field tuple/struct (`.scalarPair _ _`) or an
+  uninitialized value (`.uninit`) with projection `[.Field 0 _]` or `[.Field 1 _]`
+  advances to `(target, 0)` via `ControlFlow.goToBlock target state` without
+  deinitializing `localId`.
 
-Note on `Trusted` vs. canonical `lean-miri` (`H3`): on an *unprojected* drop
-`place = ⟨localId, .nil⟩`, Stage-1 `Trusted` deinitializes `localId` to `.uninit`
-whereas canonical `lean-miri` with `dropGlue = none` leaves `localId`'s value
-intact (certified in `canonical_drop_no_glue_preserves_local_divergence` and
-`step_terminator_drop_canonical_no_glue_step_divergence`). -/
+Notes on Stage-1 `Trusted` vs. canonical `lean-miri`:
+* (`H3`) on an *unprojected* drop `place = ⟨localId, .nil⟩`, Stage-1 `Trusted`
+  deinitializes `localId` to `.uninit` whereas canonical `lean-miri` with
+  `dropGlue = none` leaves `localId`'s value intact (certified in
+  `canonical_drop_no_glue_preserves_local_divergence` and
+  `step_terminator_drop_canonical_no_glue_step_divergence`);
+* on a *projected* drop of an uninitialized root local, Stage-1 `Trusted`
+  faults (`Terminators.lean:3066`: the root slot must be `.init`), whereas
+  canonical `lean-miri` (and this hook) only evaluates the place and jumps
+  (certified in `step_terminator_drop_projected_uninit_divergence`). -/
 def annealEvalDropLM4_1
     (place : Miri.MIR.Place)
     (target : Miri.MIR.BasicBlockId)
@@ -2291,9 +2340,7 @@ def annealEvalDropLM4_1
       | .ok ls =>
         match ls.value with
         | .dead => (state, .error (.undefinedBehavior "drop of dead local"))
-        | .live (.immediate .uninit) =>
-          (state, .error (.undefinedBehavior "projected drop of uninitialized local"))
-        | .live (.immediate (.scalarPair _ _)) =>
+        | .live (.immediate .uninit) | .live (.immediate (.scalarPair _ _)) =>
           match place.projection.toList with
           | [.Field 0 _] | [.Field 1 _] =>
             Miri.Interpreter.ControlFlow.goToBlock target state

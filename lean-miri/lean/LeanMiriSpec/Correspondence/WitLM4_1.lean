@@ -1958,10 +1958,23 @@ def u8PairTy : Ty := { kind := .tuple [.uint .u8, .uint .u8], layoutIdx := 0 }
 
 def u8PairDecl : MirAst.LocalDecl := { mutability := .mut, ty := u8PairTy, debugName := none }
 
+/-- Realistic `rustc` layout of `(u8, u8)`: size `2`, alignment `1`,
+`BackendRepr::ScalarPair(u8, u8)` with fields at offsets `0` and `1`. -/
+def u8PairLayout : TypeLayout :=
+  { size := { bytes := 2 }
+    align := { bytes := 1 }
+    backendRepr :=
+      .scalarPair
+        (.initialized (.int 8 false) { start := 0, end_ := 255 })
+        (.initialized (.int 8 false) { start := 0, end_ := 255 })
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 1 }] [0, 1]
+    variants := .single 0
+    isUninhabited := false }
+
 def witProjDropLayouts : LayoutTable :=
   { pointerBits := 64
     isLittleEndian := true
-    entries := [{ u8Layout with size := { bytes := 24 } }] }
+    entries := [u8PairLayout] }
 
 def witProjDropBody : CapturedMir where
   defPath := "crate::proj_drop"
@@ -2006,34 +2019,17 @@ def mkWitProjDropMiri (ls1 : Miri.Interpreter.LocalState AnnealProv Miri.Interpr
   { stack := ⟨#[mkWitProjDropMiriFrame 0 ls1]⟩
     machine := AnnealMachine.empty }
 
-private theorem u8Pair_immRel_inv (v : Value) (imm : Miri.Interpreter.Immediate AnnealProv)
-    (h : ImmediateRel u8PairTy witProjDropLayouts v imm) :
-    ∃ sc₁ sc₂ msc₁ msc₂,
-      v = .aggregate 0 [.scalar sc₁, .scalar sc₂] ∧
-      imm = .scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂) := by
-  cases h with
-  | unit hz =>
-    exfalso
-    exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ Miri.ABI.Size.ZERO) hz
-  | scalar sc msc hrel hsz _ _ =>
-    exfalso
-    rcases hrel.validBytes with h1 | h2 | h4 | h8 | h16
-    · rw [h1] at hsz; exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ translateSizeBytes 1) hsz
-    · rw [h2] at hsz; exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ translateSizeBytes 2) hsz
-    · rw [h4] at hsz; exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ translateSizeBytes 4) hsz
-    · rw [h8] at hsz; exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ translateSizeBytes 8) hsz
-    · rw [h16] at hsz; exact (by decide : (translateTy u8PairTy witProjDropLayouts).layout.size ≠ translateSizeBytes 16) hsz
-  | scalarPair sc₁ sc₂ msc₁ msc₂ _ _ _ _ =>
-    exact ⟨sc₁, sc₂, msc₁, msc₂, rfl, rfl⟩
-
-/-- **Witness (m)**:
-1. `step_terminator_drop_projected_simulation` on `Drop(_1.0)` in `witProjDropBody`:
-   * faults with UB in both machines when `_1` is `.dead`;
-   * faults with UB in both machines when `_1` is `.uninit`;
-   * when `_1` holds `(1_u8, 1_u8)` (`.aggregate 0 [.scalar sc1, .scalar sc1]` ↔
-     `.scalarPair`), advances to `(bb1, 0)` in both machines without
-     deinitializing `_1`;
-2. `step_terminator_drop_canonical_no_glue_step_divergence` on unprojected
+/-- **Witness (m)** on `Drop(_1.0)` in `witProjDropBody`, where `_1 : (u8, u8)` has
+the realistic `ScalarPair` layout `u8PairLayout`:
+1. `step_terminator_drop_projected_simulation` applies (initial-state
+   satisfiability of its premises) and both machines fault with UB when `_1`
+   is `.dead`;
+2. when `_1` holds `(1_u8, 1_u8)` (`.aggregate 0 [.scalar sc1, .scalar sc1]` ↔
+   `.scalarPair`), both machines advance to `(bb1, 0)` without deinitializing `_1`;
+3. when `_1` is `.uninit`, `step_terminator_drop_projected_uninit_divergence`
+   certifies the residual Stage-1 divergence: Stage-1 faults (`.fail .ub`)
+   while `lean-miri` (canonical no-glue `Drop`) jumps to `(bb1, 0)`;
+4. `step_terminator_drop_canonical_no_glue_step_divergence` on unprojected
    `Drop(_1)` in `witCallerBody` (`witCallerAtDropLiveAnneal` / `witCallerAtDropLiveMiri`):
    Stage-1 `stepMirFn` deinitializes `_1` to `.uninit`, whereas canonical
    `lean-miri`'s no-glue `Drop` step (`ControlFlow.goToBlock`) leaves `_1`
@@ -2047,11 +2043,6 @@ theorem wit_lm4_1_drop_projected_and_canonical_divergence :
       (Miri.Interpreter.Step.step (annealStepHooksLM4_1 witProjDropBody) ()
         (mkWitProjDropMiri ⟨.dead, none⟩)) ∧
     stepMirFn witProjDropBody (mkWitProjDropAnneal .dead) = .fail .ub ∧
-    StepRelMultiFrame witProjDropBody (mkWitProjDropMiri ⟨.live (.immediate .uninit), none⟩)
-      (stepMirFn witProjDropBody (mkWitProjDropAnneal .uninit))
-      (Miri.Interpreter.Step.step (annealStepHooksLM4_1 witProjDropBody) ()
-        (mkWitProjDropMiri ⟨.live (.immediate .uninit), none⟩)) ∧
-    stepMirFn witProjDropBody (mkWitProjDropAnneal .uninit) = .fail .ub ∧
     StepRelMultiFrame witProjDropBody (mkWitProjDropMiri pairLs)
       (stepMirFn witProjDropBody (mkWitProjDropAnneal (.init pairVal)))
       (Miri.Interpreter.Step.step (annealStepHooksLM4_1 witProjDropBody) ()
@@ -2060,6 +2051,13 @@ theorem wit_lm4_1_drop_projected_and_canonical_divergence :
       stepMirFn witProjDropBody (mkWitProjDropAnneal (.init pairVal)) = .step s' ∧
       s'.frame.blockIdx = 1 ∧
       get? s'.frame.locals 1 = some (.init pairVal)) ∧
+    stepMirFn witProjDropBody (mkWitProjDropAnneal .uninit) = .fail .ub ∧
+    (∃ m' tf',
+      Miri.Interpreter.Step.step (annealStepHooksLM4_1 witProjDropBody) ()
+        (mkWitProjDropMiri ⟨.live (.immediate .uninit), none⟩) = (m', .ok true) ∧
+      m'.stack.frames.back? = some tf' ∧
+      tf'.location = .mir ⟨1, 0⟩ ∧
+      ∃ lay, tf'.locals[1]? = some ⟨.live (.immediate .uninit), lay⟩) ∧
     (∃ s',
       stepMirFn witCallerBody witCallerAtDropLiveAnneal = .step s' ∧
       get? s'.frame.locals 1 = some .uninit) ∧
@@ -2128,33 +2126,35 @@ theorem wit_lm4_1_drop_projected_and_canonical_divergence :
       ⟨.live (.immediate (.scalarPair (.fromScalarInt msc1) (.fromScalarInt msc1))), none⟩
       (fun _ h => nomatch h)
       (.immediate _ _ none (fun _ h => nomatch h) (Or.inr ⟨_, rfl, hpair_rel⟩))
+  have himm_of :
+      ∀ (ls1 : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout),
+        (∀ mp, ls1.value ≠ .live (.indirect mp)) →
+        ∀ tf, (mkWitProjDropMiri ls1).stack.frames.back? = some tf → IsImmediateFrameLocal tf 1 := by
+    intro ls1 hno_ind tf htf mls hmls mp hmp
+    injection htf with h; subst h
+    injection hmls with hm; subst hm
+    exact hno_ind mp hmp
   have hsim_dead :=
     step_terminator_drop_projected_simulation hst_dead (fun _ h => nomatch h)
       (bb := { statements := [], terminator := mkTerm (.drop ⟨1, [.field 0 u8Ty]⟩ 1 .continue_), isCleanup := false })
       (decl := u8PairDecl)
       rfl rfl rfl rfl rfl (Or.inl rfl)
-      (by intro tf htf mls hmls mp hmp
-          injection htf with h; subst h
-          injection hmls with hm; subst hm; nomatch hmp)
-      u8Pair_immRel_inv
-  have hsim_uninit :=
-    step_terminator_drop_projected_simulation hst_uninit (fun _ h => nomatch h)
-      (bb := { statements := [], terminator := mkTerm (.drop ⟨1, [.field 0 u8Ty]⟩ 1 .continue_), isCleanup := false })
-      (decl := u8PairDecl)
-      rfl rfl rfl rfl rfl (Or.inl rfl)
-      (by intro tf htf mls hmls mp hmp
-          injection htf with h; subst h
-          injection hmls with hm; subst hm; nomatch hmp)
-      u8Pair_immRel_inv
+      (himm_of _ (fun _ h => nomatch h))
+      (Or.inl rfl)
   have hsim_live :=
     step_terminator_drop_projected_simulation hst_live (fun _ h => nomatch h)
       (bb := { statements := [], terminator := mkTerm (.drop ⟨1, [.field 0 u8Ty]⟩ 1 .continue_), isCleanup := false })
       (decl := u8PairDecl)
       rfl rfl rfl rfl rfl (Or.inl rfl)
-      (by intro tf htf mls hmls mp hmp
-          injection htf with h; subst h
-          injection hmls with hm; subst hm; nomatch hmp)
-      u8Pair_immRel_inv
+      (himm_of _ (fun _ h => nomatch h))
+      (Or.inr ⟨sc1, sc1, rfl⟩)
+  have hdiv_uninit :=
+    step_terminator_drop_projected_uninit_divergence hst_uninit (fun _ h => nomatch h)
+      (bb := { statements := [], terminator := mkTerm (.drop ⟨1, [.field 0 u8Ty]⟩ 1 .continue_), isCleanup := false })
+      (decl := u8PairDecl)
+      rfl rfl rfl rfl rfl (Or.inl rfl)
+      (himm_of _ (fun _ h => nomatch h))
+      rfl
   have hrel0 :
       LocalRel AnnealMachine.empty u8Decl emptyLayoutTable .uninit
         ⟨.live (.immediate .uninit), none⟩ :=
@@ -2178,7 +2178,8 @@ theorem wit_lm4_1_drop_projected_and_canonical_divergence :
       (by intro tf htf mls hmls mp hmp
           injection htf with h; subst h
           injection hmls with hm; subst hm; nomatch hmp)
-  exact ⟨hsim_dead, rfl, hsim_uninit, rfl, hsim_live, ⟨_, rfl, rfl, rfl⟩, hdiv.2.1, hdiv.2.2⟩
+  exact ⟨hsim_dead, rfl, hsim_live, ⟨_, rfl, rfl, rfl⟩, hdiv_uninit.1, hdiv_uninit.2,
+    hdiv.2.1, hdiv.2.2⟩
 
 /-! ## (n) `Terminator.UnwindResume` Cleanup Catch & `.unreachable` Unwind ABI UB Witness -/
 

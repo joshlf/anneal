@@ -257,6 +257,8 @@ import LeanMiriSpec.Audit
   protector lifecycle (`ActiveProtectorsValid`, `ActiveProtectorsValid.push_fresh_callId`,
   `ActiveProtectorsValid.of_releaseCallProtectors`, `releaseCallProtectors`,
   `popFrameBorrowTrackerAtDepth`, `BorrowTrackerStackRel.of_releaseCallProtectors`,
+  the Stage-1 multi-frame unwinding grounding
+  `unwindFromCallStack_running_releaseCallProtectors`,
   `borrowTree_releaseProtector_full_simulation`,
   `basedNormalTree_releaseProtector_chain3_and_branch3_simulation`, and
   `cex_end_of_call_foreign_unique_frozen_divergence`), and `annealStepHooksLM4_1` /
@@ -265,18 +267,21 @@ import LeanMiriSpec.Audit
   simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
   `step_terminator_drop_projected_simulation`,
+  `step_terminator_drop_projected_uninit_divergence`,
   `canonical_drop_no_glue_preserves_local_divergence`,
   `step_terminator_drop_canonical_no_glue_step_divergence`,
   `step_terminator_return_root_simulation`,
   `step_terminator_return_callee_simulation`,
   `step_terminator_unwindResume_callee_simulation`,
+  `step_terminator_unwindResume_root_panic_vs_ub_divergence`,
   `step_terminator_call_unreachable_unchecked_ub_simulation`,
   `step_terminator_call_simulation`, and the Stage-1 diverging-call push
   `step_terminator_call_diverging_simulation`).
 * `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
   `(a)..(n)` covering multi-frame call/return with `GlobalState.endCall`
-  protector release, `.uninit` `_0` UB, unprojected & projected `Drop` live vs.
-  `.dead`/`.uninit` UB and canonical no-glue `Drop` divergence, `Unreachable` and
+  protector release, `.uninit` `_0` UB, unprojected & projected `Drop` (live vs.
+  `.dead` UB on a realistic `ScalarPair` layout, projected-`.uninit` and
+  unprojected canonical no-glue `Drop` divergences), `Unreachable` and
   `unreachable_unchecked` call UB, `BorrowTree.releaseProtector` (`ReservedFrz true`
   vs. `Disabled`), ZST `()` returns, `.indirect` caller destinations, `copy` +
   `move` call arguments, cross-frame `BorrowEntry` scoping divergence,

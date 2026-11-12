@@ -30,7 +30,11 @@ scalar-pair, unit, and array fragment (`ImmediateRel` / `MemPlaceRel`):
    active frame's PC to `(target, 0)` at arbitrary stack depth (`annealEvalDropLM4_1`),
    whereas canonical `lean-miri`'s `ExecutionMachine.stepHooks.drop` with
    `dropGlue = none` performs a plain `ControlFlow.goToBlock target` that
-   preserves the local's value.
+   preserves the local's value. Projected drops `⟨localId, [.field i _]⟩` keep
+   canonical no-glue behavior in the hooks (`step_terminator_drop_projected_simulation`
+   for `.dead` and initialized scalar-pair roots;
+   `step_terminator_drop_projected_uninit_divergence` for the residual Stage-1
+   fault on an `.uninit` root).
 3. `step_terminator_return_root_simulation`: `TerminatorKind.return_` from the
    root frame (`s.memory.callStack = []`) faults with UB on `.dead`/`.uninit` `_0`
    and produces the terminal `.retNormal retVal s.memory` outcome in Anneal and
@@ -561,16 +565,22 @@ theorem canonical_drop_no_glue_preserves_local_divergence
 /-- **Theorem 2b (`step_terminator_drop_projected_simulation`)**:
 At arbitrary stack depth under `MultiFrameStateRel rootBody s m`, executing a
 projected `TerminatorKind.drop ⟨localId, .field fieldIdx :: .nil⟩ target unwind`
-on a declared immediate local `localId` (`fieldIdx = 0 ∨ fieldIdx = 1`):
-* faults with undefined behavior in both machines if `localId` is `.dead` or
-  `.uninit`;
-* when `localId` holds a live 2-field tuple/struct aggregate
-  (`ImmediateRel` to `.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂)`),
-  both Stage-1 `Trusted` (`Terminators.lean:3055-3066`, `readProjectedValue`) and
+(`fieldIdx = 0 ∨ fieldIdx = 1`) on a declared immediate local `localId` whose
+Stage-1 slot is either `.dead` or an initialized 2-field scalar aggregate
+`.init (.aggregate 0 [.scalar sc₁, .scalar sc₂])` (`hroot`):
+* faults with undefined behavior in both machines if `localId` is `.dead`
+  (Stage-1 `Terminators.lean:3044`; Miri's dead-local place evaluation);
+* when `localId` holds the 2-field aggregate (necessarily related by
+  `ImmediateRel.scalarPair` to a `lean-miri` `.scalarPair` immediate), both
+  Stage-1 `Trusted` (`Terminators.lean:3055-3066`, `readProjectedValue`) and
   `lean-miri` (`annealEvalDropLM4_1` / `ControlFlow.goToBlock target m`, matching
   canonical `ExecutionMachine.stepHooks.drop` at `ExecutionMachine.lean:327-335`)
-  advance `(blockIdx, stmtIdx)` to `(target, 0)` without deinitializing `localId`,
-  preserving `MultiFrameStateRel`. -/
+  advance `(blockIdx, stmtIdx)` to `(target, 0)` without deinitializing
+  `localId`, preserving `MultiFrameStateRel`.
+
+The remaining `.uninit` root case is a genuine Stage-1 divergence (Stage-1
+faults, canonical `lean-miri` jumps), certified separately by
+`step_terminator_drop_projected_uninit_divergence`. -/
 theorem step_terminator_drop_projected_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
@@ -585,11 +595,10 @@ theorem step_terminator_drop_projected_simulation
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
     (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
-    (hpair : ∀ v imm,
-      ImmediateRel decl.ty (activeMirBody rootBody s).layouts v imm →
-      ∃ sc₁ sc₂ msc₁ msc₂,
-        v = .aggregate 0 [.scalar sc₁, .scalar sc₂] ∧
-        imm = .scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂)) :
+    (hroot :
+      get? s.frame.locals localId = some .dead ∨
+        ∃ sc₁ sc₂,
+          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
@@ -636,9 +645,20 @@ theorem step_terminator_drop_projected_simulation
         exact False.elim (himm' mp rfl)
       | immediate _ imm cachedLayout hcache hval =>
         rcases hval with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
-        · dsimp only [Except.map]
-          exact StepRelMultiFrame.ub _ _
-        · obtain ⟨sc₁, sc₂, msc₁, msc₂, rfl, rfl⟩ := hpair v imm himmRel
+        · exfalso
+          rcases hroot with hdead | ⟨_, _, hpair⟩
+          · rw [hslot] at hdead; cases hdead
+          · rw [hslot] at hpair; cases hpair
+        · have hv : ∃ sc₁ sc₂, v = .aggregate 0 [.scalar sc₁, .scalar sc₂] := by
+            rcases hroot with hdead | ⟨sc₁, sc₂, hpair⟩
+            · rw [hslot] at hdead; cases hdead
+            · rw [hslot] at hpair
+              injection hpair with hpair'
+              injection hpair' with hv
+              exact ⟨sc₁, sc₂, hv⟩
+          obtain ⟨sc₁, sc₂, rfl⟩ := hv
+          cases himmRel with
+          | scalarPair _ _ msc₁ msc₂ _ _ _ _ =>
           have hpush_go :
               m.stack.frames.pop.push { topFrame with location := .mir ⟨target, 0⟩ } =
                 ⟨restMfs.reverse ++ [{ topFrame with location := .mir ⟨target, 0⟩ }]⟩ := by
@@ -672,6 +692,122 @@ theorem step_terminator_drop_projected_simulation
               (by simpa [FrameStackRel, annealFrameStackTopDown, activeMirBody] using hlinks'.toForall2)
               (by simpa [activeMirBody] using hlinks')
               hdisj' htb hvalid hcid_pos hcid_act hcid_bor hbt
+
+/-- **Divergence (`step_terminator_drop_projected_uninit_divergence`)**: on a
+projected `TerminatorKind.drop ⟨localId, .field fieldIdx :: .nil⟩ target unwind`
+(`fieldIdx = 0 ∨ fieldIdx = 1`) whose immediate root local `localId` is
+uninitialized (`get? s.frame.locals localId = some .uninit`) under
+`MultiFrameStateRel rootBody s m`:
+1. Stage-1 `Trusted` faults (`stepMirFn rootBody s = .fail .ub`), because a
+   projected drop requires an `.init` root slot (`Terminators.lean:3055-3066`);
+2. `lean-miri` (`annealEvalDropLM4_1`, keeping canonical
+   `ExecutionMachine.stepHooks.drop`'s no-glue behavior: place evaluation then
+   `ControlFlow.goToBlock`, which never reads the dropped value) steps normally
+   (`.ok true`) to a state whose top frame sits at `(target, 0)` and still holds
+   the uninitialized `localId`. -/
+theorem step_terminator_drop_projected_uninit_divergence
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
+    {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .field fieldIdx fieldTy :: .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (huninit : get? s.frame.locals localId = some .uninit) :
+    stepMirFn rootBody s = .fail .ub ∧
+    ∃ m' tf',
+      Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m =
+        (m', .ok true) ∧
+      m'.stack.frames.back? = some tf' ∧
+      tf'.location = .mir ⟨target, 0⟩ ∧
+      ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ := by
+  rcases hstate with ⟨topFrame, hback, _, _, _, hlinks, _, _, _, _, _, _, _⟩
+  have hforall := hlinks.toForall2
+  rcases hmfs : m.stack.frames.toList.reverse with _ | ⟨topFrame₀, restMfs⟩
+  · rw [hmfs] at hforall; cases hforall
+  · rw [hmfs] at hlinks hforall
+    cases hforall with
+    | cons hframe _ =>
+      dsimp only at hframe
+      have harr := array_eq_of_toList_reverse_cons hmfs
+      have hback_tf : m.stack.frames.back? = some topFrame₀ := by rw [harr]; simp
+      have htf_eq : topFrame = topFrame₀ := Option.some.inj (hback.symm.trans hback_tf)
+      subst htf_eq
+      obtain ⟨slot, mls, hlt_af, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
+      have hslot_eq : slot = .uninit := Option.some.inj (hslot.symm.trans huninit)
+      subst hslot_eq
+      have himm' := himm topFrame hback mls hmls
+      have hmls_uninit :
+          ∃ lay, topFrame.locals[localId]'hlt_mf = ⟨.live (.immediate .uninit), lay⟩ := by
+        cases hloc with
+        | indirect _ mp _ _ _ _ => exact False.elim (himm' mp rfl)
+        | immediate _ imm cachedLayout _ hval =>
+          rcases hval with ⟨_, rfl⟩ | ⟨v, hv, _⟩
+          · exact ⟨cachedLayout, hmls_eq⟩
+          · cases hv
+      obtain ⟨lay, hmls_u⟩ := hmls_uninit
+      have hget : topFrame.getLocal localId = .ok ⟨.live (.immediate .uninit), lay⟩ := by
+        unfold Miri.Interpreter.Frame.getLocal
+        simp [hlt_mf, hmls_u, pure, Except.pure]
+      refine ⟨?_, ?_⟩
+      · rw [stepMirFn_activeMirBody_eq rootBody s hphase]
+        have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+        simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+        unfold evalTerminator
+        rw [hterm]
+        dsimp only
+        rw [huninit]
+      · have hpush_go :
+            m.stack.frames.pop.push { topFrame with location := .mir ⟨target, 0⟩ } =
+              ⟨restMfs.reverse ++ [{ topFrame with location := .mir ⟨target, 0⟩ }]⟩ := by
+          apply Array.ext'
+          simp [harr]
+        have hcurr : m.stack.currentFrame? = some topFrame := hback
+        have hdrop :
+            annealEvalDropLM4_1 (translatePlace ⟨localId, .field fieldIdx fieldTy :: .nil⟩) target
+                (translateUnwindAction unwind) m =
+              ({ m with stack := ⟨⟨restMfs.reverse ++ [{ topFrame with location := .mir ⟨target, 0⟩ }]⟩⟩ },
+               .ok ()) := by
+          have hproj_ne :
+              (!(translatePlace ⟨localId, .field fieldIdx fieldTy :: .nil⟩).projection.isEmpty) = true :=
+            rfl
+          have hgo :
+              annealEvalDropLM4_1 (translatePlace ⟨localId, .field fieldIdx fieldTy :: .nil⟩) target
+                  (translateUnwindAction unwind) m =
+                Miri.Interpreter.ControlFlow.goToBlock target m := by
+            unfold annealEvalDropLM4_1
+            simp only [hproj_ne, ↓reduceIte]
+            rw [hcurr]
+            dsimp only
+            have hloc_id :
+                (translatePlace ⟨localId, .field fieldIdx fieldTy :: .nil⟩).localId = localId := rfl
+            rw [hloc_id, hget]
+            rcases hfield with rfl | rfl <;> rfl
+          rw [hgo]
+          unfold Miri.Interpreter.ControlFlow.goToBlock Miri.Interpreter.ControlFlow.setLocation
+          rw [hcurr]
+          dsimp only
+          rw [hpush_go]
+        refine ⟨{ m with stack := ⟨⟨restMfs.reverse ++ [{ topFrame with location := .mir ⟨target, 0⟩ }]⟩⟩ },
+          { topFrame with location := .mir ⟨target, 0⟩ }, ?_,
+          array_back?_append_singleton restMfs.reverse _, rfl, lay, ?_⟩
+        · rw [miri_step_at_terminator_multiFrame hback hframe.body_eq hframe.location_eq hbb hstmt_none]
+          unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+            annealTerminatorHooksLM4_1
+          rw [hterm]
+          dsimp only [translateTerminatorKind, Option.isSome_none, Bool.false_eq_true, ↓reduceIte,
+            Id.run]
+          rw [hdrop]
+          rfl
+        · dsimp only
+          rw [Array.getElem?_eq_getElem hlt_mf, hmls_u]
 
 /-- **Theorem 2c (`step_terminator_drop_canonical_no_glue_step_divergence`)**:
 Bi-side step-level divergence between Stage-1 `Trusted` `stepMirFn` (mirrored by
@@ -3406,8 +3542,9 @@ abbrev step_terminator_return_callee_immediate_simulation :=
 At arbitrary stack depth (`s.memory.callStack = cf :: restStack`) under
 `MultiFrameStateRel rootBody s m`, executing `TerminatorKind.unwindResume` at a
 cleanup basic block (`bb.isCleanup = true`) of the active callee frame:
-* if `_0` is `.dead`, faults with UB in `lean-miri`; when `_0` is live
-  (`get? s.frame.locals 0 ≠ some .dead`), `returnOperand` succeeds even if `_0`
+* `_0` is required to be live (`hlive0`): Stage-1 never inspects `_0` while
+  unwinding, whereas `lean-miri`'s `returnOperand` (canonical `localToOp 0`)
+  faults on a `.dead` `_0`; with `_0` live, `returnOperand` succeeds even if `_0`
   is `.uninit` on a non-ZST return type;
 * when `cf.returnUnwind = .unreachable`, both Stage-1 `Trusted`
   (`unwindFromCallStack` at `Terminators.lean:642`, `.faulted .ub`) and
@@ -3421,7 +3558,14 @@ cleanup basic block (`bb.isCleanup = true`) of the active callee frame:
   locals (`deallocFrameLocals`), release its active `CallId` protectors
   (`restoreCallerProtectors cf` = `releaseCallProtectors 1 (cf :: restStack) s.memory.activeProtectors`
   and `popFrameBorrowTracker`), leave `cf.destination` untouched, and step to
-  `MultiFrameStateRel`-related states at `(cleanupBb, 0)` in `cf.callerBody`. -/
+  `MultiFrameStateRel`-related states at `(cleanupBb, 0)` in `cf.callerBody`.
+
+Not covered here: `cf.returnUnwind = .continue_` (Stage-1 pops through several
+frames in a single step, see `unwindFromCallStack_running_releaseCallProtectors`,
+whereas `lean-miri` unwinds one frame per step) and `.terminate` (Stage-1
+`.halted .abort` vs. the hooks' unsupported `unwindTerminate`); unwinding out of
+the root frame is a certified divergence
+(`step_terminator_unwindResume_root_panic_vs_ub_divergence`). -/
 theorem step_terminator_unwindResume_callee_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
@@ -3645,6 +3789,99 @@ theorem step_terminator_unwindResume_callee_simulation
         hdisj_post htb_post
         hvalid_post' hcid_pos hcid_act_post' hcid_bor hbt_post
 
+
+/-- On a single-frame `lean-miri` stack (`m.stack.frames = #[rootMf]`) whose top
+frame sits in a cleanup block, `ControlFlow.returnFromCurrentFrame hooks () true m`
+(the `UnwindResume` transition) faults with
+`.undefinedBehavior "unwinding past the topmost stack frame"` for any control hooks. -/
+theorem returnFromCurrentFrame_unwind_root_ub
+    (hooks : Miri.Interpreter.ControlHooks AnnealProv Miri.Interpreter.LocalLayout Unit
+      AnnealMachine Unit (Miri.Interpreter.Operand AnnealProv))
+    {body : CapturedMir} {m : AnnealStepState}
+    {rootMf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {blockIdx stmtIdx : Nat} {bb : BasicBlockData}
+    (hframes : m.stack.frames = #[rootMf])
+    (hbody : rootMf.body = translateBody body)
+    (hloc : rootMf.location = .mir ⟨blockIdx, stmtIdx⟩)
+    (hbb : get? body.basicBlocks blockIdx = some bb)
+    (hcleanup : bb.isCleanup = true) :
+    Miri.Interpreter.ControlFlow.returnFromCurrentFrame hooks () true m =
+      (m, .error (.undefinedBehavior "unwinding past the topmost stack frame")) := by
+  have hback : m.stack.frames.back? = some rootMf := by rw [hframes]; rfl
+  have hsize : (m.stack.frames.size == 1) = true := by rw [hframes]; rfl
+  unfold Miri.Interpreter.ControlFlow.returnFromCurrentFrame Miri.Interpreter.Stack.currentFrame?
+  rw [hback]
+  dsimp only
+  rw [hloc, hbody]
+  dsimp only
+  rw [translateBody_basicBlocks_getElem?, hbb]
+  dsimp only [Option.map, translateBasicBlockData]
+  simp only [Id.run, Bind.bind, Pure.pure, bne_self_eq_false, Bool.true_and,
+    Bool.false_eq_true, ↓reduceIte, hcleanup, hsize]
+
+/-- **Divergence (`step_terminator_unwindResume_root_panic_vs_ub_divergence`)**:
+executing `TerminatorKind.unwindResume` in a cleanup block of the *root* frame
+(`s.memory.callStack = []`) under `MultiFrameStateRel rootBody s m`:
+1. Stage-1 `Trusted` halts with a panic outcome
+   (`unwindFromCallStack [] _ = .halted .panic`, `Terminators.lean:633`, so
+   `stepMirFn rootBody s = MirStepNode.retOutcome .panic`);
+2. `lean-miri` faults with undefined behavior, because
+   `ControlFlow.returnFromCurrentFrame` refuses to unwind a single-frame stack
+   (`.undefinedBehavior "unwinding past the topmost stack frame"`).
+This complements `step_terminator_unwindResume_callee_simulation`, which covers
+non-root callee frames whose saved caller catches (`.cleanup`) or forbids
+(`.unreachable`) the unwind. -/
+theorem step_terminator_unwindResume_root_panic_vs_ub_divergence
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s))
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") := by
+  rcases hstate with ⟨topFrame, hback, hcal_root, _, _, hlinks, _, _, _, _, _, _, _⟩
+  have hact_body : activeMirBody rootBody s = rootBody := by
+    unfold activeMirBody
+    rcases hcal_root hstack with hnone | hsome
+    · simp [hnone]
+    · simp [hsome]
+  generalize hmfs : m.stack.frames.toList.reverse = mfs at hlinks
+  rw [hstack, hact_body] at hlinks
+  cases hlinks with
+  | root _ rootMf _ _ _ hframe =>
+    have hframes : m.stack.frames = #[rootMf] := by
+      have h := array_eq_of_toList_reverse_cons hmfs
+      simpa using h
+    have hback_root : m.stack.frames.back? = some rootMf := by rw [hframes]; rfl
+    have htf_eq : rootMf = topFrame := Option.some.inj (hback_root.symm.trans hback)
+    subst htf_eq
+    have hphase' : ∀ p, (activeMirBody rootBody s).phase ≠ .other p := by
+      rw [hact_body]; exact hphase
+    have hbb' : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb := by
+      rw [hact_body]; exact hbb
+    refine ⟨?_, ?_⟩
+    · rw [stepMirFn_activeMirBody_eq rootBody s hphase']
+      have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+      simp only [hbb', hstmt_none, hbeq_len, ↓reduceIte]
+      unfold evalTerminator
+      rw [hterm, hstack]
+      rfl
+    · rw [miri_step_at_terminator_multiFrame hback (by rw [hact_body]; exact hframe.body_eq)
+        hframe.location_eq hbb' hstmt_none]
+      unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+      rw [hterm]
+      dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+      rw [returnFromCurrentFrame_unwind_root_ub _ hframes hframe.body_eq hframe.location_eq hbb
+        hcleanup]
+      rfl
 
 /-! ## 5. `Terminator.Call` Simulation at Arbitrary Stack Depth (`step_terminator_call_simulation`) -/
 

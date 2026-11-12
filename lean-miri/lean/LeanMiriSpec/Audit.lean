@@ -20697,6 +20697,7 @@ open LeanMiriSpec.Correspondence in
   releaseCallProtectors_one_cons
   releaseCallProtectors_full_clear
   ActiveProtectorsValid.of_releaseCallProtectors
+  unwindFromCallStack_running_releaseCallProtectors
   basedNormalTree_releaseProtector_chain3_and_branch3_simulation
   protectedTagsContainsNat
   poppedCalleeFrameState
@@ -20769,6 +20770,7 @@ open LeanMiriSpec.Correspondence in
   step_terminator_drop_noop_simulation
   canonical_drop_no_glue_preserves_local_divergence
   step_terminator_drop_projected_simulation
+  step_terminator_drop_projected_uninit_divergence
   step_terminator_drop_canonical_no_glue_step_divergence
   annealControlHooks_returnOperand_cleanup_live_back
   step_terminator_return_root_simulation
@@ -20783,6 +20785,8 @@ open LeanMiriSpec.Correspondence in
   step_terminator_return_callee_simulation
   step_terminator_return_callee_immediate_simulation
   step_terminator_unwindResume_callee_simulation
+  returnFromCurrentFrame_unwind_root_ub
+  step_terminator_unwindResume_root_panic_vs_ub_divergence
   lookupCallee_nil_eq_of_findCallee_some
   lookupCallee_nil_eq_none_of_findCallee_none
   step_terminator_call_unreachable_unchecked_ub_simulation
@@ -20821,6 +20825,7 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_1.wit_lm4_1_diverging_call_then_return_ub
   WitnessLM4_1.witCexCalleeReturnAnneal
   WitnessLM4_1.wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence
+  WitnessLM4_1.u8PairLayout
   WitnessLM4_1.witProjDropBody
   WitnessLM4_1.wit_lm4_1_drop_projected_and_canonical_divergence
   WitnessLM4_1.witUnwindCalleeBody
@@ -21125,17 +21130,68 @@ example
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
     (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
-    (hpair : ∀ v imm,
-      ImmediateRel decl.ty (activeMirBody rootBody s).layouts v imm →
-      ∃ sc₁ sc₂ msc₁ msc₂,
-        v = .aggregate 0 [.scalar sc₁, .scalar sc₂] ∧
-        imm = .scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂)) :
+    (hroot :
+      get? s.frame.locals localId = some .dead ∨
+        ∃ sc₁ sc₂,
+          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m) :=
   step_terminator_drop_projected_simulation
-    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hpair
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
+    {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .field fieldIdx fieldTy :: .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (huninit : get? s.frame.locals localId = some .uninit) :
+    stepMirFn rootBody s = .fail .ub ∧
+    ∃ m' tf',
+      Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s)) () m =
+        (m', .ok true) ∧
+      m'.stack.frames.back? = some tf' ∧
+      tf'.location = .mir ⟨target, 0⟩ ∧
+      ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ :=
+  step_terminator_drop_projected_uninit_divergence
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm huninit
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s))
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") :=
+  step_terminator_unwindResume_root_panic_vs_ub_divergence
+    hstate hstack hphase hbb hstmt_none hstmt_len hcleanup hterm
+
+example (callStack : List SavedCallerFrame) (mem : Memory) (s' : MachineState)
+    (h : unwindFromCallStack callStack mem = .running s') :
+    ∃ k, 1 ≤ k ∧ k ≤ callStack.length ∧
+      s'.memory.activeProtectors = releaseCallProtectors k callStack mem.activeProtectors ∧
+      s'.memory.callStack = callStack.drop k :=
+  unwindFromCallStack_running_releaseCallProtectors callStack mem s' h
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
