@@ -4879,12 +4879,41 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         tampered_standalone.source.push_str("\n// standalone tampered\n");
         assert!(!miri_candidate_replay_is_faithful(&tampered_standalone, &base, &steps));
 
+        // 6. Non-canonical `pass_index` on recorded steps: refuse.
+        let mut non_canonical_steps = steps.clone();
+        non_canonical_steps[0].pass_index = 99;
+        assert!(!miri_candidate_replay_is_faithful(
+            &cand,
+            &base,
+            &non_canonical_steps
+        ));
+
+        // 7. A candidate whose PRNG schedule draws `MiriSeedDraw::NonFault` (`Pass` or `Panic`
+        //    primary mode) cannot have mutated a faulting (`ub_*` / `panic_*`) corpus seed.
+        let fault_seed_idx = seed_refs
+            .iter()
+            .position(|s| s.contains("pub fn ub_") || s.contains("pub fn panic_"))
+            .expect("faulting corpus seed");
+        let non_fault_cand = batch
+            .iter()
+            .find(|c| {
+                !c.seed_name.starts_with("ub_")
+                    && !c.seed_name.starts_with("panic_")
+                    && (c.id + crate::mutators_miri::DetRng::new(c.seed_u64).gen_range(4)) % 4 < 2
+            })
+            .expect("candidate with Pass/Panic primary mode")
+            .clone();
+        let mut spoofed_fault_seed = non_fault_cand;
+        spoofed_fault_seed.seed_index = fault_seed_idx;
+        assert!(reconstruct_miri_mutation_steps(&spoofed_fault_seed, &seed_refs).is_none());
+
         for victim in [
             &tampered,
             &tampered_standalone,
             &hand_built,
             &bad_seed,
             &mismatched_seed_name,
+            &spoofed_fault_seed,
         ] {
             let res = minimize_miri_candidate_mutations_with_compile_check(
                 victim,
@@ -5540,11 +5569,12 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         );
     }
 
-    /// Probes for a semantic-mutant self-check: each exercises one UB or panic
-    /// check of Anneal's semantics (`bool` validity, `StorageDead`, division by
-    /// zero, and wide shift exponents) on which the live engine agrees with Miri,
-    /// so a mutant of the semantics that omits that check diverges from Miri.
-    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 4] = [
+    /// Probes for the 5-family semantic-mutant self-check: each exercises one UB or
+    /// panic check of Anneal's semantics (`bool` validity, `StorageDead`, pointer
+    /// provenance invalidation on byte-array overwrite, division by zero, and wide
+    /// shift exponents) on which the live engine agrees with Miri, so a mutant of
+    /// the semantics that omits that check diverges from Miri.
+    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 5] = [
         (
             "bool_valid_range",
             r#"pub fn probe_bool_valid_range() -> u32 {
@@ -5563,6 +5593,19 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         &raw const dead_local
     };
     unsafe { *dangling }
+}
+"#,
+        ),
+        (
+            "provenance_frag",
+            r#"pub fn probe_provenance_frag() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let byte_ptr: *mut [u8; 8] = (&raw mut p) as *mut [u8; 8];
+    unsafe {
+        *byte_ptr = [4u8, 0, 0, 0, 0, 0, 0, 0];
+        *p
+    }
 }
 "#,
         ),
@@ -5586,9 +5629,32 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         ),
     ];
 
-    /// Overwrites one byte of a stored pointer with the integer `0u8` and then
-    /// dereferences the pointer. Miri strips the pointer's provenance; the live
-    /// engine still dereferences it and returns `7`.
+    /// Partial-pointer-byte provenance variants on which the live engine currently
+    /// diverges from Miri, pinned as known engine gaps:
+    /// 1. `probe_gap_provenance_overwritten_byte`: overwrites one byte of a stored
+    ///    pointer with `0u8` and dereferences it (`missed_ub`, returns `7`, because
+    ///    `mergeByteProvenance` retains provenance from the remaining 7 bytes).
+    /// 2. `probe_gap_provenance_u8_roundtrip`: loads one byte of a stored pointer as
+    ///    `u8`, stores it back, and dereferences it (`ub_location_mismatch`: the
+    ///    engine flags the `u8` load of a pointer byte, Miri the later dereference).
+    /// 3. `probe_gap_provenance_mixed_fragments`: copies one byte of a pointer to `y`
+    ///    over the first byte of a pointer to `x` and dereferences the mixed pointer
+    ///    (`missed_ub`, returns `y`'s value `9`).
+    const KNOWN_PROVENANCE_GAP_PROBES: [(&str, &str); 3] = [
+        (
+            "probe_gap_provenance_overwritten_byte",
+            PROVENANCE_OVERWRITTEN_BYTE_PROBE,
+        ),
+        (
+            "probe_gap_provenance_u8_roundtrip",
+            PROVENANCE_U8_ROUNDTRIP_PROBE,
+        ),
+        (
+            "probe_gap_provenance_mixed_fragments",
+            PROVENANCE_MIXED_FRAGMENTS_PROBE,
+        ),
+    ];
+
     const PROVENANCE_OVERWRITTEN_BYTE_PROBE: &str = r#"pub fn probe_gap_provenance_overwritten_byte() -> u32 {
     let x: u32 = 7u32;
     let mut p: *const u32 = &raw const x;
@@ -5600,10 +5666,6 @@ pub fn parameterized_after(x: u32) -> u32 { x }
 }
 "#;
 
-    /// Loads one byte of a stored pointer as `u8`, stores it back, and then
-    /// dereferences the pointer. Miri reports UB only at the dereference (the
-    /// store-back stripped the provenance); the live engine reports UB already at
-    /// the `u8` load of a pointer byte.
     const PROVENANCE_U8_ROUNDTRIP_PROBE: &str = r#"pub fn probe_gap_provenance_u8_roundtrip() -> u32 {
     let x: u32 = 7u32;
     let mut p: *const u32 = &raw const x;
@@ -5616,9 +5678,6 @@ pub fn parameterized_after(x: u32) -> u32 { x }
 }
 "#;
 
-    /// Copies one byte of a pointer to `y` over the first byte of a pointer to `x`
-    /// and then dereferences the mixed pointer. Miri reports UB; the live engine
-    /// dereferences it and returns `y`'s value `9`.
     const PROVENANCE_MIXED_FRAGMENTS_PROBE: &str = r#"pub fn probe_gap_provenance_mixed_fragments() -> u32 {
     let x: u32 = 7u32;
     let y: u32 = 9u32;
@@ -5703,17 +5762,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// the pin must be updated (a ratchet, like a `known_anneal_bug` entry).
     #[test]
     fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
-        let gap_probes = [
-            (
-                "probe_gap_provenance_overwritten_byte",
-                PROVENANCE_OVERWRITTEN_BYTE_PROBE,
-            ),
-            ("probe_gap_provenance_u8_roundtrip", PROVENANCE_U8_ROUNDTRIP_PROBE),
-            (
-                "probe_gap_provenance_mixed_fragments",
-                PROVENANCE_MIXED_FRAGMENTS_PROBE,
-            ),
-        ];
+        let gap_probes = KNOWN_PROVENANCE_GAP_PROBES;
         let fn_sources: Vec<&str> = SEMANTIC_MUTANT_PROBES
             .iter()
             .map(|(_, src)| *src)

@@ -631,8 +631,8 @@ pub fn replay_itree_mutation_steps(
 }
 
 /// Whether replaying the full recorded chain `steps` from `base` reproduces
-/// `cand` byte for byte (same `applied_mutators` and `source`) and the source
-/// contains zero `unsafe` tokens.
+/// `cand` byte for byte (canonical `0..steps.len()` `pass_index`es, same
+/// `applied_mutators` and `source`) and the source contains zero `unsafe` tokens.
 ///
 /// Shrinking is only meaningful when this holds: only then is every replayed
 /// subsequence a reduction of the reported program, and only then is the full
@@ -642,7 +642,10 @@ pub fn itree_candidate_replay_is_faithful(
     base: &File,
     steps: &[ItreeMutationStep],
 ) -> bool {
-    if steps.len() != cand.applied_mutators.len() || contains_unsafe_token(&cand.source) {
+    if steps.len() != cand.applied_mutators.len()
+        || !steps.iter().enumerate().all(|(i, s)| s.pass_index == i)
+        || contains_unsafe_token(&cand.source)
+    {
         return false;
     }
     let replayed = replay_itree_mutation_steps(cand, base, steps);

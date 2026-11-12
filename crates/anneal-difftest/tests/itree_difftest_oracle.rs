@@ -83,11 +83,21 @@ fn assert_itree_findings_shrunk(
         );
         let (base, steps) =
             reconstruct_itree_mutation_steps(cand, ITREE_SAFE_SEEDS).expect("replayable candidate");
-        let kept: Vec<_> = steps
-            .iter()
-            .filter(|s| f.minimized_mutator_chain.contains(&s.mutator_name))
-            .cloned()
-            .collect();
+        let mut chain_iter = f.minimized_mutator_chain.iter().peekable();
+        let mut kept = Vec::with_capacity(f.minimized_mutator_chain.len());
+        for s in &steps {
+            if chain_iter.peek().is_some_and(|want| *want == &s.mutator_name) {
+                kept.push(s.clone());
+                chain_iter.next();
+            }
+        }
+        assert!(
+            chain_iter.peek().is_none(),
+            "{}: minimized_mutator_chain {:?} is not an ordered subsequence of {:?}",
+            f.finding_id,
+            f.minimized_mutator_chain,
+            cand.applied_mutators
+        );
         assert_eq!(kept.len(), f.minimized_mutator_chain.len(), "{}", f.finding_id);
         assert_eq!(
             f.candidate_source,
@@ -317,73 +327,127 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
     let root = repo_root();
     let bin = env!("CARGO_BIN_EXE_itree-difftest");
 
-    let batches = vec![generate_itree_batch(ITREE_SAFE_SEEDS, 4, 0xCAFE_1234)];
+    let batch_seed = (0u64..)
+        .map(|off| 0xCAFE_1234u64.wrapping_add(off))
+        .find(|&s| {
+            let b = generate_itree_batch(ITREE_SAFE_SEEDS, 4, s);
+            b[0].applied_mutators.len() == 2 && b[1].applied_mutators.len() == 2
+        })
+        .expect("find seed where b0_c0 and b0_c1 both have 2 mutator passes");
+    let batches = vec![generate_itree_batch(ITREE_SAFE_SEEDS, 4, batch_seed)];
+    assert_eq!(batches[0][1].applied_mutators[0], "LayoutPaddingPerturber");
+    let init_word: u32 = batches[0][1]
+        .source
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("aligned_word:")?.trim();
+            rest.strip_suffix("u32,")?.parse().ok()
+        })
+        .expect("extract LayoutPaddingPerturber aligned_word literal from b0_c1");
 
-    // Negative control A: Mutating `.add` -> `.sub` in `b0_c0__kernel_step`'s
-    // captured Lean MIR while keeping the real observed execution trace from
-    // `b0_c0__kernel_step` must produce a kernel-confirmed divergence and a
-    // reproducible finding bundle.
+    // Negative control A:
+    // 1. Mutating `.add` -> `.sub` in `b0_c0__kernel_step`'s captured Lean MIR
+    //    injects a seed-level fault (present even on `[]`), so live shrinking
+    //    reduces `b0_c0`'s 2-mutator chain all the way to `[]` (`2 -> 0`).
+    // 2. Mutating `aligned_word`'s `{ bits := <init_word>, sizeBytes := 4 }` ->
+    //    `{ bits := 0, sizeBytes := 4 }` (injected only by `LayoutPaddingPerturber`
+    //    in pass 0 of `b0_c1__kernel_step`, causing `if __itree_pad_fold == 0` to
+    //    short-circuit to `0u32` in Lean MIR) leaves `[]` and pass 1 alone agreeing
+    //    via `MirMutationPolicy::SkipAbsent`, so live shrinking reduces `b0_c1`'s
+    //    2-mutator chain to the non-empty 1-minimal chain
+    //    `["LayoutPaddingPerturber"]` (`2 -> 1`).
     let findings_a = dir.join("findings_mir_mutation");
     let summary_a = evaluate_itree_batches_with_options(
         "seeded",
-        0xCAFE_1234,
+        batch_seed,
         &batches,
         4,
         &ItreeEvalOptions {
             trials_per_candidate: 6,
             anneal_repo_root: Some(root.clone()),
             findings_dir: Some(findings_a.clone()),
-            mir_mutations: vec![(
-                "b0_c0__kernel_step".to_string(),
-                ".add".to_string(),
-                ".sub".to_string(),
-            )],
+            mir_mutations: vec![
+                (
+                    "b0_c0__kernel_step".to_string(),
+                    ".add".to_string(),
+                    ".sub".to_string(),
+                ),
+                (
+                    "b0_c1__kernel_step".to_string(),
+                    format!("{{ bits := {init_word}, sizeBytes := 4 }}"),
+                    "{ bits := 0, sizeBytes := 4 }".to_string(),
+                ),
+            ],
             root_mir_swaps: Vec::new(),
             ..ItreeEvalOptions::default()
         },
     )
     .expect("evaluate negative control A");
-    assert_eq!(summary_a.diverge_candidates, 1);
-    assert!(summary_a.diverge_traces >= 1);
+    assert_eq!(summary_a.diverge_candidates, 2);
+    assert!(summary_a.diverge_traces >= 2);
     assert_eq!(
         summary_a.kernel_confirmed_divergences,
         summary_a.diverge_traces
     );
     assert!(
-        !summary_a.findings.is_empty(),
-        "expected at least 1 finding bundle from MIR mutation"
+        summary_a.findings.len() >= 2,
+        "expected findings for both b0_c0 and b0_c1 from MIR mutation"
     );
-    let finding_a = &summary_a.findings[0];
-    assert_ne!(finding_a.diag_tag, "ok");
-    assert!(finding_a.kernel_confirmed);
-    // Shrinking keeps the `.add -> .sub` fault injection: the reduced programs are
-    // staged as `b0_c0` and judged with the same MIR mutation.
+    // Shrinking keeps the `.add -> .sub` and `0x5A -> 0x5B` fault injections.
     let reduced_a = assert_itree_findings_shrunk(&summary_a.findings, &batches[0]);
     eprintln!(
         "negative control A: {reduced_a} of {} finding(s) minimized",
         summary_a.findings.len()
     );
-    let repro_path_a = finding_a
-        .repro_path
-        .as_ref()
-        .expect("repro_path set when findings_dir is Some");
-
-    let repro_out = Command::new(bin)
-        .current_dir(&root)
-        .arg("--reproduce")
-        .arg(repro_path_a)
-        .output()
-        .expect("run itree-difftest --reproduce");
+    let c0_finding = summary_a
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "b0_c0__kernel_step")
+        .expect("b0_c0 finding");
+    assert_eq!(c0_finding.shrink_status, "minimized");
     assert!(
-        repro_out.status.success(),
-        "--reproduce failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&repro_out.stdout),
-        String::from_utf8_lossy(&repro_out.stderr)
+        c0_finding.minimized_mutator_chain.is_empty(),
+        "b0_c0 seed-level MIR fault must shrink 2 -> 0, got {:?}",
+        c0_finding.minimized_mutator_chain
     );
-    let repro_stdout = String::from_utf8_lossy(&repro_out.stdout);
-    assert!(repro_stdout.contains("\"verdict\": \"diverge\""));
-    assert!(repro_stdout.contains(&format!("\"diag_tag\": \"{}\"", finding_a.diag_tag)));
-    assert!(repro_stdout.contains("\"kernel_confirmed\": true"));
+    let c1_finding = summary_a
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "b0_c1__kernel_step")
+        .expect("b0_c1 finding");
+    assert_eq!(c1_finding.shrink_status, "minimized");
+    assert_eq!(
+        c1_finding.minimized_mutator_chain,
+        vec!["LayoutPaddingPerturber".to_string()],
+        "b0_c1 mutator-specific MIR fault must shrink 2 -> 1"
+    );
+
+    for finding_a in [c0_finding, c1_finding] {
+        assert_ne!(finding_a.diag_tag, "ok");
+        assert!(finding_a.kernel_confirmed);
+        let repro_path_a = finding_a
+            .repro_path
+            .as_ref()
+            .expect("repro_path set when findings_dir is Some");
+
+        let repro_out = Command::new(bin)
+            .current_dir(&root)
+            .arg("--reproduce")
+            .arg(repro_path_a)
+            .output()
+            .expect("run itree-difftest --reproduce");
+        assert!(
+            repro_out.status.success(),
+            "--reproduce failed for {}:\nstdout:\n{}\nstderr:\n{}",
+            finding_a.fn_name,
+            String::from_utf8_lossy(&repro_out.stdout),
+            String::from_utf8_lossy(&repro_out.stderr)
+        );
+        let repro_stdout = String::from_utf8_lossy(&repro_out.stdout);
+        assert!(repro_stdout.contains("\"verdict\": \"diverge\""));
+        assert!(repro_stdout.contains(&format!("\"diag_tag\": \"{}\"", finding_a.diag_tag)));
+        assert!(repro_stdout.contains("\"kernel_confirmed\": true"));
+    }
 
     // Negative control B (I-06 Acceptance Criterion 3): Swapping the root function
     // in `b0_c0__kernel_step` with `Mir.ItreeDiffStaged.b0_c2__kernel_step` and
@@ -393,7 +457,7 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
     let findings_b = dir.join("findings_root_swap");
     let summary_b = evaluate_itree_batches_with_options(
         "seeded",
-        0xCAFE_1234,
+        batch_seed,
         &batches,
         4,
         &ItreeEvalOptions {

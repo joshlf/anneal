@@ -4086,6 +4086,18 @@ impl MiriSeedDraw {
             Self::Any(draw) => (seed_offset + id.wrapping_mul(13) + draw) % seeds_len,
         }
     }
+
+    fn allows_seed_index(
+        &self,
+        seed_index: usize,
+        seeds_len: usize,
+        non_fault_seed_indices: &[usize],
+    ) -> bool {
+        match *self {
+            Self::NonFault(_) => non_fault_seed_indices.contains(&seed_index),
+            Self::Rotate | Self::Any(_) => seed_index < seeds_len,
+        }
+    }
 }
 
 /// Close a parsed seed in place: keep only its function items other than
@@ -4214,15 +4226,19 @@ pub fn reconstruct_miri_mutation_steps(
     let non_fault_seed_indices = collect_non_fault_seed_indices(seeds);
     let mut cand_rng = DetRng::new(cand.seed_u64);
     let primary_mode = draw_primary_mode(&mut cand_rng, cand.id);
-    let _ = MiriSeedDraw::draw(
+    let seed_draw = MiriSeedDraw::draw(
         &mut cand_rng,
         primary_mode,
         seeds.len(),
         non_fault_seed_indices.len(),
     );
+    if !seed_draw.allows_seed_index(cand.seed_index, seeds.len(), &non_fault_seed_indices) {
+        return None;
+    }
 
     let mut base = syn::parse_str::<File>(seed_src).ok()?;
-    let (seed_name, _) = close_miri_seed(&mut base, &mut cand_rng, |_| cand.fn_name.clone())?;
+    let (seed_name, _) = close_miri_seed(&mut base, &mut cand_rng, |_| cand.fn_name.clone())
+        .unwrap_or_else(|| (format!("seed_{}", cand.seed_index), cand.fn_name.clone()));
     if seed_name != cand.seed_name {
         return None;
     }
@@ -4284,8 +4300,8 @@ pub fn replay_miri_mutation_steps(
 }
 
 /// Whether replaying the full recorded chain `steps` from `base` reproduces
-/// `cand` byte for byte: the same `applied_mutators`, `fn_source`, and
-/// standalone `source`.
+/// `cand` byte for byte: canonical `0..steps.len()` `pass_index`es, the same
+/// `applied_mutators`, `fn_source`, and standalone `source`.
 ///
 /// Shrinking is only meaningful when this holds: only then is every replayed
 /// subsequence a reduction of the reported program, and only then is the full
@@ -4296,7 +4312,9 @@ pub fn miri_candidate_replay_is_faithful(
     base: &File,
     steps: &[RecordedMutationStep],
 ) -> bool {
-    if steps.len() != cand.applied_mutators.len() {
+    if steps.len() != cand.applied_mutators.len()
+        || !steps.iter().enumerate().all(|(i, s)| s.pass_index == i)
+    {
         return false;
     }
     let replayed = replay_miri_mutation_steps(cand, base, steps);

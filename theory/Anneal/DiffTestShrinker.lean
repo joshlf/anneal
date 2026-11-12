@@ -1221,6 +1221,109 @@ theorem shrinkMutatorChain_fuel_bound_tight :
   have h_nil := h.2 [] (by simp [dropOneCandidates])
   exact absurd h_nil (by simp)
 
+/-! ### Partial / Fallible Oracle Shrinking (`MutatorChainShrinkStatus::Inconclusive`)
+
+Both `miri-difftest` (`minimize_miri_candidate_mutations_with_compile_check`) and
+`itree-difftest` (`minimize_itree_recorded_mutations_with_compile_check`) query a
+fallible oracle `pred? : List α → Option Bool`, where `some true` means the
+replayed subsequence compiled and reproduced the discrepancy signature,
+`some false` means it was judged and rejected, and `none` means the oracle
+pipeline failed to produce a judgment (`oracle_failures += 1`).
+
+The Rust shrinker passes `partialOraclePred pred?` (`pred? ys == some true`) to
+`shrink_mutation_chain_detailed` and classifies the completed run via
+`MutatorChainShrinkStatus::of_completed_shrink`:
+- Any accepted reduction `r` is sound (`pred? r = some true` and `r <+ xs`) even
+  when some intermediate queries returned `none` (`ddminReference_partialOracle_sound`).
+- When every single-step deletion of `r` produced a judgment (`some b`), 1-minimality
+  under `partialOraclePred pred?` guarantees that every single-step deletion was
+  genuinely judged and rejected with `some false`
+  (`isOneMinimal_partialOracle_iff_all_some_false`,
+  `ddminReference_partialOracle_confirmed_one_minimal`).
+- Conversely, a single `none` failure on a 1-step deletion can mask a strictly
+  smaller satisfying subsequence (`partialOracle_failure_masks_smaller_witness`),
+  which is why `oracle_failures > 0` reports `Inconclusive` instead of claiming
+  1-minimality. -/
+
+/-- Boolean predicate passed to `ddmin` when wrapping a partial/fallible oracle
+`pred? : List α → Option Bool`: only confirmed `some true` answers are accepted,
+while both `some false` and oracle failures (`none`) return `false`. -/
+def partialOraclePred (pred? : List α → Option Bool) (ys : List α) : Bool :=
+  pred? ys == some true
+
+@[simp]
+theorem partialOraclePred_eq_true_iff (pred? : List α → Option Bool) (ys : List α) :
+    partialOraclePred pred? ys = true ↔ pred? ys = some true := by
+  simp [partialOraclePred]
+
+theorem partialOraclePred_eq_false_iff (pred? : List α → Option Bool) (ys : List α) :
+    partialOraclePred pred? ys = false ↔ pred? ys = some false ∨ pred? ys = none := by
+  unfold partialOraclePred
+  cases h : pred? ys with
+  | none => simp
+  | some b => cases b <;> simp
+
+/-- Soundness of `ddminReference` under a partial oracle: even when some oracle
+queries fail (`pred? ys = none`), any returned chain `r` is a sublist of `xs`
+with `r.length ≤ xs.length` that the oracle positively confirmed
+(`pred? r = some true`). -/
+theorem ddminReference_partialOracle_sound (pred? : List α → Option Bool) (fuel : Nat)
+    (xs r : List α) (h : ddminReference (partialOraclePred pred?) fuel xs = some r) :
+    pred? xs = some true ∧ pred? r = some true ∧ r.Sublist xs ∧ r.length ≤ xs.length := by
+  obtain ⟨hxs, hmin, hsub⟩ := ddminReference_one_minimal (partialOraclePred pred?) fuel xs r h
+  exact ⟨(partialOraclePred_eq_true_iff pred? xs).mp hxs,
+    (partialOraclePred_eq_true_iff pred? r).mp hmin.1,
+    hsub, hsub.length_le⟩
+
+/-- When no single-step deletion of `r` failed the oracle (`∀ ys ∈ dropOneCandidates r,
+∃ b, pred? ys = some b`), 1-minimality under `partialOraclePred pred?` is equivalent
+to `pred? r = some true` together with confirmed `some false` rejection of every
+single-step deletion of `r`. -/
+theorem isOneMinimal_partialOracle_iff_all_some_false (pred? : List α → Option Bool)
+    (r : List α) (h_no_fail : ∀ ys ∈ dropOneCandidates r, ∃ b, pred? ys = some b) :
+    IsOneMinimal (partialOraclePred pred?) r ↔
+      pred? r = some true ∧ ∀ ys ∈ dropOneCandidates r, pred? ys = some false := by
+  unfold IsOneMinimal
+  rw [partialOraclePred_eq_true_iff]
+  refine and_congr_right fun _ => ⟨fun h ys hys => ?_, fun h ys hys => ?_⟩
+  · obtain ⟨b, hb⟩ := h_no_fail ys hys
+    have hf := (partialOraclePred_eq_false_iff pred? ys).mp (h ys hys)
+    rcases hf with hf | hf
+    · exact hf
+    · rw [hb] at hf
+      contradiction
+  · exact (partialOraclePred_eq_false_iff pred? ys).mpr (Or.inl (h ys hys))
+
+/-- When `ddminReference (partialOraclePred pred?)` succeeds and every single-step
+deletion of `r` was answered by the oracle without failure (in particular, when
+`oracle_failures == 0`), `r` is confirmed (`pred? r = some true`) and every
+single-step deletion of `r` was confirmed to be rejected (`some false`). -/
+theorem ddminReference_partialOracle_confirmed_one_minimal
+    (pred? : List α → Option Bool) (fuel : Nat) (xs r : List α)
+    (h : ddminReference (partialOraclePred pred?) fuel xs = some r)
+    (h_no_fail : ∀ ys ∈ dropOneCandidates r, ∃ b, pred? ys = some b) :
+    pred? xs = some true ∧ pred? r = some true ∧
+      (∀ ys ∈ dropOneCandidates r, pred? ys = some false) ∧ r.Sublist xs := by
+  obtain ⟨hxs, hmin, hsub⟩ := ddminReference_one_minimal (partialOraclePred pred?) fuel xs r h
+  obtain ⟨hr, h_all_false⟩ :=
+    (isOneMinimal_partialOracle_iff_all_some_false pred? r h_no_fail).mp hmin
+  exact ⟨(partialOraclePred_eq_true_iff pred? xs).mp hxs, hr, h_all_false, hsub⟩
+
+/-- Concrete witness justifying `MutatorChainShrinkStatus::Inconclusive`: the true
+discrepancy predicate holds on `[1, 2]` and on `[2]`, so `[1, 2]` is not 1-minimal
+for the true predicate, but if the oracle fails (`none`) when querying `[2]`,
+`ddminReference (partialOraclePred ...)` stops at `[1, 2]`. -/
+theorem partialOracle_failure_masks_smaller_witness :
+    let truePred := fun xs : List Nat => xs == [1, 2] || xs == [2]
+    let fallibleOracle := fun xs : List Nat =>
+      if xs == [2] then none else some (truePred xs)
+    ddminReference (partialOraclePred fallibleOracle) 10 [1, 2] = some [1, 2] ∧
+      truePred [2] = true ∧
+      ¬ IsOneMinimal truePred [1, 2] := by
+  refine ⟨by rfl, by rfl, fun h => ?_⟩
+  have h2 := h.2 [2] (by simp [dropOneCandidates])
+  exact absurd h2 (by decide)
+
 /-! ## Part 2: Wide `BitVec` Shift-Exponent Bounds Guard -/
 
 /-- Guarded left shift that checks `rhs.toNat < w` before invoking `lhs <<< rhs.toNat`,
@@ -1922,6 +2025,10 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms containsAll_shrinkers_disagree_on_repeated_step
 #print axioms coupled_window_one_minimal_not_globally_minimal
 #print axioms shrinkMutatorChain_fuel_bound_tight
+#print axioms ddminReference_partialOracle_sound
+#print axioms isOneMinimal_partialOracle_iff_all_some_false
+#print axioms ddminReference_partialOracle_confirmed_one_minimal
+#print axioms partialOracle_failure_masks_smaller_witness
 #print axioms bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false
 #print axioms ddminReference_coupled_pair_witness
 #print axioms bvShlOverflowing_shift_bound
@@ -1960,6 +2067,9 @@ export Anneal.DiffTestShrinker (
   ddminReference_globally_minimal_of_monotone
   ddminReference_containsAll_eq_some_filter
   containsAll_shrinkMutatorChain_eq_ddminReference
+  partialOraclePred ddminReference_partialOracle_sound
+  isOneMinimal_partialOracle_iff_all_some_false
+  ddminReference_partialOracle_confirmed_one_minimal
   bvShlSafe bvLshrSafe bvAshrSafe
   bvShlOverflowing bvLshrOverflowing bvAshrOverflowing
   bvShlSafe_some_shift_lt_two_pow_32 bvLshrSafe_some_shift_lt_two_pow_32

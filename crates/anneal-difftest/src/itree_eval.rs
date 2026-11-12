@@ -745,12 +745,19 @@ pub struct ItreeReproReport {
     pub kernel_confirmed: bool,
 }
 
+/// Sequence number that gives each `compile_rust_strict_opt` and
+/// `compile_rust_mir_instrumented` call its own scratch directory, so
+/// concurrent calls in one process sharing a label never delete each other's
+/// `.rlib` output.
+static ITREE_SNIPPET_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Runs `rustc --edition=2024 --crate-type=lib -D warnings -C opt-level=<level>`
 /// on `source` and reports whether it compiled.
 pub fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bool {
     let rustc_bin = resolve_rustc_bin();
+    let seq = ITREE_SNIPPET_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_difftest_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{seq}_{}_o{}",
         std::process::id(),
         label,
         opt_level
@@ -807,8 +814,9 @@ pub fn compile_rust_mir_instrumented(label: &str, opt_level: &str, source: &str)
         };
         bin
     };
+    let seq = ITREE_SNIPPET_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_difftest_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{seq}_{}_o{}",
         std::process::id(),
         label,
         opt_level
@@ -873,6 +881,11 @@ struct ItreeEvalEntry<'a> {
     b_idx: usize,
     c_idx: usize,
     cand: &'a GeneratedItreeCandidate,
+    /// When `true`, the candidate is staged into `src/candidates.rs` so that
+    /// `run_cargo_capture` emits its `Mir.ItreeDiffStaged.*` module (referenced by
+    /// another candidate's `root_mir_swaps`), without running native trace
+    /// collection or Lean `TraceCheck` on its own traces.
+    capture_only: bool,
 }
 
 impl ItreeEvalEntry<'_> {
@@ -895,7 +908,12 @@ fn batch_entries(batches: &[Vec<GeneratedItreeCandidate>]) -> Vec<ItreeEvalEntry
             batch
                 .iter()
                 .enumerate()
-                .map(move |(c_idx, cand)| ItreeEvalEntry { b_idx, c_idx, cand })
+                .map(move |(c_idx, cand)| ItreeEvalEntry {
+                    b_idx,
+                    c_idx,
+                    cand,
+                    capture_only: false,
+                })
         })
         .collect()
 }
@@ -1894,7 +1912,7 @@ fn evaluate_itree_entries(
     let staging_dir = create_itree_staging_dir(mode, &repo_root)?;
     let eval_res = (|| -> Result<ItreeCampaignEvalReport, String> {
         let mut combined_candidates_rs = String::new();
-        let mut staged_candidates: Vec<(&GeneratedItreeCandidate, StagedItreeCandidate)> =
+        let mut staged_candidates: Vec<(&GeneratedItreeCandidate, StagedItreeCandidate, bool)> =
             Vec::with_capacity(opt_level_0_and_2_compiled);
         let mut cand_meta: BTreeMap<String, (&GeneratedItreeCandidate, StagedItreeCandidate)> =
             BTreeMap::new();
@@ -1923,7 +1941,7 @@ fn evaluate_itree_entries(
             combined_candidates_rs.push('\n');
             fn_prefix_map.insert(staged.root_fn_name.clone(), prefix);
             cand_meta.insert(staged.root_fn_name.clone(), (cand, staged.clone()));
-            staged_candidates.push((cand, staged));
+            staged_candidates.push((cand, staged, entry.capture_only));
         }
         if staged_candidates.is_empty() {
             return Err(format!(
@@ -1981,13 +1999,16 @@ fn evaluate_itree_entries(
         }
 
         // Now that Lean MIR is scaffolded, build MIR-guided initial inputs and
-        // `EnvScheduleGenerator` schedules per candidate using both the Rust
-        // source and the extracted Lean MIR (`MirInputDictionary::from_lean_mir`).
+        // `EnvScheduleGenerator` schedules per evaluated candidate using both the
+        // Rust source and the extracted Lean MIR (`MirInputDictionary::from_lean_mir`).
         let mut staged_with_trials: Vec<(
             StagedItreeCandidate,
             Vec<CandidateTrialInput>,
         )> = Vec::with_capacity(staged_candidates.len());
-        for (cand, staged) in staged_candidates {
+        for (cand, staged, capture_only) in staged_candidates {
+            if capture_only {
+                continue;
+            }
             let mir_file = mir_dir.join(format!("{}.lean", staged.root_fn_name));
             let lean_mir_src = fs::read_to_string(&mir_file).ok();
             let trials = build_candidate_trial_inputs(
@@ -2774,11 +2795,14 @@ where
 static ITREE_SHRINK_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// The compile pre-check that ITree shrinking runs on every replayed reduction
-/// before the trace + Lean oracle: zero `unsafe` tokens and a clean compile under
-/// `#![forbid(unsafe_code)]` at both `-C opt-level=0` and `-C opt-level=2`, as
-/// [`compile_itree_candidates`] requires of generated candidates.
+/// before the trace + Lean oracle: zero `unsafe` tokens, a stageable `kernel_step`
+/// root function, and a clean compile under `#![forbid(unsafe_code)]` at both
+/// `-C opt-level=0` and `-C opt-level=2`, as [`compile_itree_candidates`]
+/// requires of generated candidates.
 pub fn itree_candidate_passes_strict_compile(cand: &GeneratedItreeCandidate) -> bool {
-    if contains_unsafe_token(&cand.source) {
+    if contains_unsafe_token(&cand.source)
+        || stage_itree_candidate_items(&cand.source, "shrink__", "kernel_step").is_err()
+    {
         return false;
     }
     let seq = ITREE_SHRINK_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2838,9 +2862,9 @@ pub struct ItreeShrinkContext<'a> {
 ///
 /// `sub` is staged under the original candidate's item prefix, so `ctx`'s MIR
 /// mutations and root-module swaps that target it apply unchanged. The
-/// evaluation also stages the original candidates whose MIR modules the
-/// candidate's root swap names; MIR mutations of any other candidate cannot
-/// affect it and are dropped, and a requested mutation whose pattern the
+/// evaluation also stages (as `capture_only`) the original candidates whose MIR
+/// modules the candidate's root swap names; MIR mutations of any other candidate
+/// cannot affect it and are dropped, and a requested mutation whose pattern the
 /// reduced program no longer contains is skipped (the injected fault does not
 /// apply to it). Returns an error when `sub` could not be compared.
 pub fn evaluate_itree_candidate_live(
@@ -2851,6 +2875,7 @@ pub fn evaluate_itree_candidate_live(
         b_idx: ctx.b_idx,
         c_idx: ctx.c_idx,
         cand: sub,
+        capture_only: false,
     };
     let target_fn = target.root_fn_name();
     let root_mir_swaps: Vec<(String, String)> = ctx
@@ -2863,11 +2888,12 @@ pub fn evaluate_itree_candidate_live(
     let mut entries = vec![target];
     for (_, module) in &root_mir_swaps {
         let staged_item = module.strip_prefix("Mir.ItreeDiffStaged.").unwrap_or(module);
-        for other in batch_entries(ctx.batches) {
+        for mut other in batch_entries(ctx.batches) {
             let already_staged = entries
                 .iter()
                 .any(|e| (e.b_idx, e.c_idx) == (other.b_idx, other.c_idx));
             if !already_staged && staged_item.starts_with(&other.prefix()) {
+                other.capture_only = true;
                 entries.push(other);
             }
         }
@@ -3960,6 +3986,24 @@ mod tests {
             reconstruct_itree_mutation_steps(&tampered, ITREE_SAFE_SEEDS).expect("reconstruct");
         assert!(!itree_candidate_replay_is_faithful(&tampered, &base, &steps));
 
+        let mut non_canonical_steps = steps.clone();
+        non_canonical_steps[1].pass_index = 0;
+        assert!(!itree_candidate_replay_is_faithful(
+            &cand,
+            &base,
+            &non_canonical_steps
+        ));
+        let bad_idx_res = minimize_itree_recorded_mutations_with_compile_check(
+            &cand,
+            &base,
+            &non_canonical_steps,
+            &signature,
+            |_| panic!("compile check must not run for non-canonical step indices"),
+            |_| panic!("oracle must not run for non-canonical step indices"),
+        );
+        assert_eq!(bad_idx_res.status, ItreeShrinkStatus::SkippedReplayMismatch);
+        assert_eq!(bad_idx_res.shrink_evaluations, 0);
+
         let mut with_unsafe = cand.clone();
         with_unsafe.source = format!("{}\npub fn sneaky() {{ unsafe {{}} }}\n", cand.source);
         let mut out_of_range_seed = cand.clone();
@@ -4244,6 +4288,11 @@ mod tests {
         let mut with_unsafe = cand.clone();
         with_unsafe.source = format!("{}\npub fn f() {{ unsafe {{}} }}\n", cand.source);
         assert!(!itree_candidate_passes_strict_compile(&with_unsafe));
+        let mut missing_root = cand.clone();
+        missing_root.source = "pub fn not_kernel_step(magic: u32, payload_len: u32) -> u32 {\n    \
+                               magic ^ payload_len\n}\n"
+            .to_string();
+        assert!(!itree_candidate_passes_strict_compile(&missing_root));
 
         let (base, steps) =
             reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
