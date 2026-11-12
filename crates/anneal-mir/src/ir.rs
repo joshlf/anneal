@@ -2064,6 +2064,240 @@ impl PointerValue {
     }
 }
 
+/// Inline compiler intrinsic or diverging entry point that the evaluator executes in the
+/// caller's frame (`rustc`'s `core::intrinsics::*` and the panic/abort entry points of
+/// `core`), independent of any `rustc` version's `DefPath` spelling.
+///
+/// Version-specific recognition of callee paths lives in thin adapters such as
+/// [`crate::rustc_v2026_06_01::lower_intrinsic_kind_v2026_06_01`]; the semantics of every
+/// variant are defined once, by [`crate::lower::intrinsic::eval_intrinsic_call`], and mirror
+/// `Trusted.Rustc.V2026_06_01.MirSemantics` (`evalNonSelectIntrinsicCall`, `evalExactDiv`,
+/// `isUnreachableCallTarget`, `isAbortingPanicDefPath`, `isUnwindingPanicDefPath`).
+///
+/// Signatures (`T` an integer type, `U` any integer type, `P` a raw pointer or reference to a
+/// type `E` with an exact layout):
+/// - `Ctlz`, `CtlzNonzero`, `Cttz`, `CttzNonzero`, `Ctpop`: `(T) -> u32`;
+/// - `Bswap`, `Bitreverse`: `(T) -> T`;
+/// - `ExactDiv`, `WrappingAdd`/`Sub`/`Mul`, `SaturatingAdd`/`Sub`, `UncheckedAdd`/`Sub`/`Mul`,
+///   `UncheckedDiv`, `UncheckedRem`: `(T, T) -> T`;
+/// - `UncheckedShl`, `UncheckedShr`: `(T, U) -> T`;
+/// - `ThreeWayCompare`: `(T, T) -> i8` for `T` an integer or `char`, or an `Ordering`-shaped
+///   enum result (three fieldless variants with the signed discriminants `-1`, `0`, `1`);
+/// - `UbChecks`: `() -> bool`;
+/// - `ArithOffset`: `(P, isize) -> *const E | *mut E`;
+/// - `SizeOfVal`, `AlignOfVal`: `(P) -> usize`;
+/// - `CopyNonOverlapping`: `(*const E | *mut E | &E | &mut E, *mut E | &mut E, usize) -> ()`;
+/// - `WriteBytes`: `(*mut E | &mut E, u8, usize) -> ()`;
+/// - `UnreachableUnchecked`, `Abort`, `PanicUnwind`: any arguments (evaluated, then ignored)
+///   and any destination; they never return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IntrinsicOp {
+    /// Leading zero bits of `x` (`bit_width(T)` for `0`), as a `u32`.
+    Ctlz,
+    /// Like `Ctlz`, but undefined behavior for `x == 0`.
+    CtlzNonzero,
+    /// Trailing zero bits of `x` (`bit_width(T)` for `0`), as a `u32`.
+    Cttz,
+    /// Like `Cttz`, but undefined behavior for `x == 0`.
+    CttzNonzero,
+    /// Number of set bits of `x`, as a `u32`.
+    Ctpop,
+    /// `x` with its bytes reversed.
+    Bswap,
+    /// `x` with its bits reversed.
+    Bitreverse,
+    /// `x / y`; undefined behavior for `y == 0`, signed `T::MIN / -1`, or `x % y != 0`.
+    ExactDiv,
+    /// `(x + y) mod 2^bit_width(T)`.
+    WrappingAdd,
+    /// `(x - y) mod 2^bit_width(T)`.
+    WrappingSub,
+    /// `(x * y) mod 2^bit_width(T)`.
+    WrappingMul,
+    /// `x + y` clamped to `[T::MIN, T::MAX]`.
+    SaturatingAdd,
+    /// `x - y` clamped to `[T::MIN, T::MAX]`.
+    SaturatingSub,
+    /// `x + y`; undefined behavior on overflow (as [`BinOp::AddUnchecked`]).
+    UncheckedAdd,
+    /// `x - y`; undefined behavior on overflow (as [`BinOp::SubUnchecked`]).
+    UncheckedSub,
+    /// `x * y`; undefined behavior on overflow (as [`BinOp::MulUnchecked`]).
+    UncheckedMul,
+    /// `x / y`; undefined behavior for `y == 0` or signed `T::MIN / -1` (as [`BinOp::Div`]).
+    UncheckedDiv,
+    /// `x % y`; undefined behavior for `y == 0` or signed `T::MIN % -1` (as [`BinOp::Rem`]).
+    UncheckedRem,
+    /// `x << y`; undefined behavior for `y < 0` or `y >= bit_width(T)` (as
+    /// [`BinOp::ShlUnchecked`]).
+    UncheckedShl,
+    /// `x >> y` (arithmetic for signed `T`); undefined behavior for `y < 0` or
+    /// `y >= bit_width(T)` (as [`BinOp::ShrUnchecked`]).
+    UncheckedShr,
+    /// `-1`, `0`, or `1` as `x` is less than, equal to, or greater than `y`.
+    ThreeWayCompare,
+    /// Whether runtime undefined-behavior checks are enabled (`true` by default; the value
+    /// of `Rvalue::NullaryOp(NullOp::UbChecks, bool)` in the same evaluation state).
+    UbChecks,
+    /// Wrapping pointer offset by `count * size_of::<E>()` bytes, keeping provenance.
+    ArithOffset,
+    /// `size_of::<E>()` of the pointee.
+    SizeOfVal,
+    /// `align_of::<E>()` of the pointee.
+    AlignOfVal,
+    /// `copy_nonoverlapping::<E>(src, dst, count)` (the call form of
+    /// `Statement::CopyNonOverlapping`, with identical semantics).
+    CopyNonOverlapping,
+    /// `write_bytes::<E>(dst, val, count)`: sets `count * size_of::<E>()` bytes at `dst` to
+    /// `val`.
+    WriteBytes,
+    /// Reaching this call is undefined behavior (`unreachable_unchecked`).
+    UnreachableUnchecked,
+    /// Aborts the program without unwinding (`abort`, non-unwinding panics).
+    Abort,
+    /// Starts unwinding (a panic) along the call's `UnwindAction`.
+    PanicUnwind,
+}
+
+impl IntrinsicOp {
+    /// Every intrinsic, in declaration order.
+    pub const ALL: [IntrinsicOp; 30] = [
+        IntrinsicOp::Ctlz,
+        IntrinsicOp::CtlzNonzero,
+        IntrinsicOp::Cttz,
+        IntrinsicOp::CttzNonzero,
+        IntrinsicOp::Ctpop,
+        IntrinsicOp::Bswap,
+        IntrinsicOp::Bitreverse,
+        IntrinsicOp::ExactDiv,
+        IntrinsicOp::WrappingAdd,
+        IntrinsicOp::WrappingSub,
+        IntrinsicOp::WrappingMul,
+        IntrinsicOp::SaturatingAdd,
+        IntrinsicOp::SaturatingSub,
+        IntrinsicOp::UncheckedAdd,
+        IntrinsicOp::UncheckedSub,
+        IntrinsicOp::UncheckedMul,
+        IntrinsicOp::UncheckedDiv,
+        IntrinsicOp::UncheckedRem,
+        IntrinsicOp::UncheckedShl,
+        IntrinsicOp::UncheckedShr,
+        IntrinsicOp::ThreeWayCompare,
+        IntrinsicOp::UbChecks,
+        IntrinsicOp::ArithOffset,
+        IntrinsicOp::SizeOfVal,
+        IntrinsicOp::AlignOfVal,
+        IntrinsicOp::CopyNonOverlapping,
+        IntrinsicOp::WriteBytes,
+        IntrinsicOp::UnreachableUnchecked,
+        IntrinsicOp::Abort,
+        IntrinsicOp::PanicUnwind,
+    ];
+
+    /// Version-independent `snake_case` name (diagnostics only; never parsed).
+    pub const fn name(self) -> &'static str {
+        match self {
+            IntrinsicOp::Ctlz => "ctlz",
+            IntrinsicOp::CtlzNonzero => "ctlz_nonzero",
+            IntrinsicOp::Cttz => "cttz",
+            IntrinsicOp::CttzNonzero => "cttz_nonzero",
+            IntrinsicOp::Ctpop => "ctpop",
+            IntrinsicOp::Bswap => "bswap",
+            IntrinsicOp::Bitreverse => "bitreverse",
+            IntrinsicOp::ExactDiv => "exact_div",
+            IntrinsicOp::WrappingAdd => "wrapping_add",
+            IntrinsicOp::WrappingSub => "wrapping_sub",
+            IntrinsicOp::WrappingMul => "wrapping_mul",
+            IntrinsicOp::SaturatingAdd => "saturating_add",
+            IntrinsicOp::SaturatingSub => "saturating_sub",
+            IntrinsicOp::UncheckedAdd => "unchecked_add",
+            IntrinsicOp::UncheckedSub => "unchecked_sub",
+            IntrinsicOp::UncheckedMul => "unchecked_mul",
+            IntrinsicOp::UncheckedDiv => "unchecked_div",
+            IntrinsicOp::UncheckedRem => "unchecked_rem",
+            IntrinsicOp::UncheckedShl => "unchecked_shl",
+            IntrinsicOp::UncheckedShr => "unchecked_shr",
+            IntrinsicOp::ThreeWayCompare => "three_way_compare",
+            IntrinsicOp::UbChecks => "ub_checks",
+            IntrinsicOp::ArithOffset => "arith_offset",
+            IntrinsicOp::SizeOfVal => "size_of_val",
+            IntrinsicOp::AlignOfVal => "align_of_val",
+            IntrinsicOp::CopyNonOverlapping => "copy_nonoverlapping",
+            IntrinsicOp::WriteBytes => "write_bytes",
+            IntrinsicOp::UnreachableUnchecked => "unreachable_unchecked",
+            IntrinsicOp::Abort => "abort",
+            IntrinsicOp::PanicUnwind => "panic_unwind",
+        }
+    }
+
+    /// Returns true for the entry points that never return (`UnreachableUnchecked`, `Abort`,
+    /// `PanicUnwind`).
+    pub const fn is_diverging(self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::UnreachableUnchecked | IntrinsicOp::Abort | IntrinsicOp::PanicUnwind
+        )
+    }
+
+    /// Returns true for the intrinsics that access memory (`CopyNonOverlapping`,
+    /// `WriteBytes`), which need an evaluation state.
+    pub const fn accesses_memory(self) -> bool {
+        matches!(self, IntrinsicOp::CopyNonOverlapping | IntrinsicOp::WriteBytes)
+    }
+}
+
+impl std::fmt::Display for IntrinsicOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Opaque, version-independent name of an ordinary (non-intrinsic) callee: the key under
+/// which a [`crate::lower::cfg::CallTable`] links the callee's body. Anneal never interprets
+/// the text (version adapters typically use the callee's `DefPath`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CalleeSymbol(pub String);
+
+impl CalleeSymbol {
+    /// Constructs a symbol from its name.
+    pub fn new(name: impl Into<String>) -> Self {
+        CalleeSymbol(name.into())
+    }
+
+    /// The symbol's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CalleeSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for CalleeSymbol {
+    fn from(name: &str) -> Self {
+        CalleeSymbol::new(name)
+    }
+}
+
+impl From<String> for CalleeSymbol {
+    fn from(name: String) -> Self {
+        CalleeSymbol(name)
+    }
+}
+
+/// Declarative target of a direct call (the callee of a [`Constant::FnDef`] function item).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallTarget {
+    /// An inline intrinsic or diverging entry point, executed in the caller's frame.
+    Intrinsic(IntrinsicOp),
+    /// An ordinary function, linked by symbol through a [`crate::lower::cfg::CallTable`] (or
+    /// left to a caller-supplied call handler).
+    Fn(CalleeSymbol),
+}
+
 /// Constant value in MIR operands.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Constant {
@@ -2072,6 +2306,10 @@ pub enum Constant {
     Char(char),
     Ptr(PointerValue, Ty),
     Unit,
+    /// Zero-sized function item naming a direct call's target (`rustc`'s `FnDef` constant).
+    /// Anneal has no function types, so it is typed and evaluated as the unit `()`; only a
+    /// `Terminator::Call` interprets its target.
+    FnDef(CallTarget),
 }
 
 impl Constant {
@@ -2082,7 +2320,25 @@ impl Constant {
             Constant::Bool(_) => Ty::Bool,
             Constant::Char(_) => Ty::Char,
             Constant::Ptr(_, ty) => ty.clone(),
-            Constant::Unit => Ty::unit(),
+            Constant::Unit | Constant::FnDef(_) => Ty::unit(),
+        }
+    }
+
+    /// The function item of the inline intrinsic `op`.
+    pub fn intrinsic(op: IntrinsicOp) -> Self {
+        Constant::FnDef(CallTarget::Intrinsic(op))
+    }
+
+    /// The function item of the ordinary callee `symbol`.
+    pub fn callee(symbol: impl Into<CalleeSymbol>) -> Self {
+        Constant::FnDef(CallTarget::Fn(symbol.into()))
+    }
+
+    /// The call target of a function item (`None` for every other constant).
+    pub fn call_target(&self) -> Option<&CallTarget> {
+        match self {
+            Constant::FnDef(target) => Some(target),
+            _ => None,
         }
     }
 }
