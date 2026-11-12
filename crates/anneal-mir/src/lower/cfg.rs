@@ -1159,6 +1159,13 @@ struct PreparedCall {
 /// checks that a call with a `target` has an inhabited destination type. Shared by every
 /// kind of callee (intrinsic, call handler, or linked), so all of them observe the same
 /// operand evaluation order and faults before the callee runs.
+///
+/// `Trusted`'s `evalTerminator` evaluates the destination only when it writes the returned
+/// value (`writePlaceValue` on the post-argument locals). No callee that `Trusted` models
+/// changes the caller's frame (linked callees are frame-isolated and value intrinsics are
+/// pure), so both orders write the same place; they differ only for an invalid destination,
+/// which faults here even when the call never returns (it panics, aborts, or diverges), as
+/// with MiniRust's eager `eval_place`: an extra error, never a different outcome.
 #[allow(clippy::too_many_arguments)]
 fn prepare_call(
     bb: usize,

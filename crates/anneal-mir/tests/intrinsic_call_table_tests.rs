@@ -4912,7 +4912,13 @@ fn test_b2_call_table_propagates_exposed_provenance_monotonicity_across_calls_an
             ],
         );
         let caller_cleanup_after_callee_expose = mk(
-            vec![unit(), raw_u8.clone(), usize_ty(), raw_u8.clone(), raw_u8.clone()],
+            vec![
+                unit(),
+                raw_u8.clone(),
+                usize_ty(),
+                raw_u8.clone(),
+                raw_u8.clone(),
+            ],
             vec![
                 blk(
                     vec![live(3), live(4)],
@@ -4946,7 +4952,10 @@ fn test_b2_call_table_propagates_exposed_provenance_monotonicity_across_calls_an
         let table2 = CallTable::new()
             .with_callee("expose_ext", 1, lower(&expose_ext, pw))
             .with_callee("expose_and_panic", 1, lower(&expose_and_panic, pw));
-        let ext_ptr = MirValue::ptr(PointerValue::with_provenance(0x50000, 99, 0), raw_u8.clone());
+        let ext_ptr = MirValue::ptr(
+            PointerValue::with_provenance(0x50000, 99, 0),
+            raw_u8.clone(),
+        );
         assert_eq!(
             returned(eval_lowered_body_cfg_with_call_table(
                 &lower(&caller_from_callee, pw),
@@ -4987,11 +4996,15 @@ fn test_b2_unaligned_frame_addr_base_is_rejected_and_multi_depth_out_of_fuel_res
     bad_state.frame_addr_base = 3;
     assert!(matches!(
         eval_cfg_in_state(&main, bad_state.clone(), 0, 8, None),
-        Err(CfgEvalError::InvalidArguments(RvalueEvalError::TypeMismatch(_)))
+        Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(_)
+        ))
     ));
     assert!(matches!(
         eval_cfg_in_state_with_call_table(&main, bad_state.clone(), 0, 8, &table, None),
-        Err(CfgEvalError::InvalidArguments(RvalueEvalError::TypeMismatch(_)))
+        Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(_)
+        ))
     ));
     let raw_stmt = LoweredStatement::Assign {
         place: place(0),
@@ -5037,11 +5050,473 @@ fn test_b2_unaligned_frame_addr_base_is_rejected_and_multi_depth_out_of_fuel_res
                 .unwrap();
         let final_val = match outcome {
             CfgEvalOutcome::Returned(v) => v,
-            CfgEvalOutcome::OutOfFuel { bb, state } => returned(
-                eval_cfg_in_state_with_call_table(&move_main, state, bb, 16, &table, None),
-            ),
+            CfgEvalOutcome::OutOfFuel { bb, state } => returned(eval_cfg_in_state_with_call_table(
+                &move_main, state, bb, 16, &table, None,
+            )),
             other => panic!("unexpected outcome at fuel={first_fuel}: {other:?}"),
         };
-        assert_eq!(final_val, u32v(12), "mismatch resuming from fuel={first_fuel}");
+        assert_eq!(
+            final_val,
+            u32v(12),
+            "mismatch resuming from fuel={first_fuel}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A2 regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// The string literals of the Lean definition `def <name>` in `Terminators.lean` (up to the
+/// next top-level declaration or doc comment).
+fn trusted_def_strings(source: &str, name: &str) -> Vec<String> {
+    let header = format!("\ndef {name} ");
+    let start = source
+        .find(&header)
+        .unwrap_or_else(|| panic!("`def {name}` not found in Terminators.lean"));
+    let body = &source[start + header.len()..];
+    let end = ["\n/--", "\ndef ", "\ntheorem ", "\n@["]
+        .iter()
+        .filter_map(|marker| body.find(marker))
+        .min()
+        .unwrap_or(body.len());
+    body[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean"
+    );
+    let source =
+        std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+    let set = |paths: Vec<String>| paths.into_iter().collect::<std::collections::BTreeSet<_>>();
+    let table_set = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    // `classifyRustIntrinsic?`: every path but `const_eval_select` (not modeled: `rustc` removes
+    // it before `optimized_mir`) is the intrinsic of the same name.
+    let classify = trusted_def_strings(&source, "classifyRustIntrinsic?");
+    assert_eq!(classify.len(), 25);
+    let mut expected_intrinsics = std::collections::BTreeSet::new();
+    for path in &classify {
+        let name = path.rsplit("::").next().unwrap();
+        if name == "const_eval_select" {
+            assert_eq!(lower_intrinsic_kind_v2026_06_01(path), None);
+            continue;
+        }
+        let op = IntrinsicOp::ALL
+            .into_iter()
+            .find(|op| op.name() == name)
+            .unwrap_or_else(|| panic!("no IntrinsicOp named {name}"));
+        assert_eq!(lower_intrinsic_kind_v2026_06_01(path), Some(op), "{path}");
+        expected_intrinsics.insert(path.clone());
+    }
+    // `isDirectExactDivTarget`.
+    let exact_div = trusted_def_strings(&source, "isDirectExactDivTarget");
+    assert_eq!(exact_div, vec!["core::intrinsics::exact_div".to_string()]);
+    assert_eq!(
+        lower_intrinsic_kind_v2026_06_01(&exact_div[0]),
+        Some(IntrinsicOp::ExactDiv)
+    );
+    expected_intrinsics.insert(exact_div[0].clone());
+    // The only additions: the call forms of the memory intrinsics (statements in `Trusted`).
+    expected_intrinsics.insert("core::intrinsics::copy_nonoverlapping".into());
+    expected_intrinsics.insert("core::intrinsics::write_bytes".into());
+    let intrinsic_table: std::collections::BTreeSet<String> = RUST_INTRINSIC_DEF_PATHS_V2026_06_01
+        .iter()
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert_eq!(intrinsic_table, expected_intrinsics);
+    // The diverging entry points, exactly.
+    assert_eq!(
+        set(trusted_def_strings(&source, "isUnreachableCallTarget")),
+        table_set(UNREACHABLE_DEF_PATHS_V2026_06_01)
+    );
+    assert_eq!(
+        set(trusted_def_strings(&source, "isAbortingPanicDefPath")),
+        table_set(ABORTING_PANIC_DEF_PATHS_V2026_06_01)
+    );
+    assert_eq!(
+        set(trusted_def_strings(&source, "isUnwindingPanicDefPath")),
+        table_set(UNWINDING_PANIC_DEF_PATHS_V2026_06_01)
+    );
+}
+
+#[test]
+fn test_a2_fuel_counts_every_block_of_the_call_tree_exactly() {
+    for pw in PWS {
+        let fact = lower(&fact_fn(), pw);
+        let table = CallTable::new().with_callee("fact", 1, fact.clone());
+        for n in 0..6u128 {
+            // `fact(0)` runs bb0, bb1; `fact(n)` runs bb0, bb2, `fact(n - 1)`, bb3.
+            let blocks = (3 * n + 2) as usize;
+            let expected: u128 = (1..=n).product();
+            assert_eq!(
+                returned(eval_lowered_body_cfg_with_call_table(
+                    &fact,
+                    &[MirValue::unsigned(n, UintTy::U64, pw)],
+                    blocks,
+                    &table
+                )),
+                MirValue::unsigned(expected, UintTy::U64, pw)
+            );
+            if n == 0 {
+                continue;
+            }
+            // One unit short: every callee completes and the body stops before its last block.
+            match eval_lowered_body_cfg_with_call_table(
+                &fact,
+                &[MirValue::unsigned(n, UintTy::U64, pw)],
+                blocks - 1,
+                &table,
+            ) {
+                Ok(CfgEvalOutcome::OutOfFuel { bb: 3, state }) => {
+                    assert_eq!(
+                        returned(eval_cfg_in_state_with_call_table(
+                            &fact, state, 3, 1, &table, None
+                        )),
+                        MirValue::unsigned(expected, UintTy::U64, pw)
+                    );
+                }
+                other => panic!("fact({n}) with {} fuel: {other:?}", blocks - 1),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_a2_out_of_fuel_in_a_callee_resumes_without_replaying_side_effects_twice() {
+    // `main(x) { _2 = x + 100; _3 = inc_double(_2) -> bb1; bb1: _0 = _3 + _2 }`: the calling
+    // block's statement runs again on resumption from the reported entry state, exactly once.
+    let main = lower(
+        &mk(
+            vec![u32_ty(), u32_ty(), u32_ty(), u32_ty()],
+            vec![
+                blk(
+                    vec![
+                        live(2),
+                        live(3),
+                        assign(2, Rvalue::BinaryOp(BinOp::Add, cp(1), cst(100, u32_ty()))),
+                    ],
+                    call(
+                        callee("inc_double"),
+                        vec![cp(2)],
+                        3,
+                        Some(1),
+                        UnwindAction::Continue,
+                    ),
+                ),
+                blk(
+                    vec![assign(0, Rvalue::BinaryOp(BinOp::Add, cp(3), cp(2)))],
+                    Terminator::Return,
+                ),
+            ],
+        ),
+        PW,
+    );
+    let table = table(PW);
+    // (5 + 100 + 1) * 2 + 105 = 317, in five blocks.
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_call_table(
+            &main,
+            &[u32v(5)],
+            5,
+            &table
+        )),
+        u32v(317)
+    );
+    for fuel in 1..=3 {
+        match eval_lowered_body_cfg_with_call_table(&main, &[u32v(5)], fuel, &table) {
+            Ok(CfgEvalOutcome::OutOfFuel { bb: 0, state }) => {
+                assert_eq!(state.slots[2], LocalSlotState::Dead);
+                assert_eq!(
+                    returned(eval_cfg_in_state_with_call_table(
+                        &main, state, 0, 5, &table, None
+                    )),
+                    u32v(317)
+                );
+            }
+            other => panic!("fuel {fuel}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_a2_arguments_are_moved_before_a_panicking_callee_or_intrinsic_runs() {
+    // `bb0: _2 = <callee>(move _1) -> [bb1, unwind bb2]; bb2 (cleanup): _3 = copy _1; resume`:
+    // the cleanup block observes `_1` moved out by the call (Trusted: `applyUnwindAction` on
+    // the post-argument locals).
+    let body = |func: Constant| {
+        mk(
+            vec![u32_ty(), u32_ty(), u32_ty(), u32_ty()],
+            vec![
+                blk(
+                    vec![live(2), live(3)],
+                    call(func, vec![mv(1)], 2, Some(1), UnwindAction::Cleanup(2)),
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(2)))], Terminator::Return),
+                cleanup_blk(
+                    vec![assign(3, Rvalue::Use(cp(1)))],
+                    Terminator::UnwindResume,
+                ),
+            ],
+        )
+    };
+    let moved = Err(CfgEvalError::Statement {
+        bb: 2,
+        index: 0,
+        error: RvalueEvalError::UninitializedLocal(Local(1)),
+    });
+    let boom = mk(
+        vec![u32_ty(), u32_ty(), Ty::Never],
+        vec![blk(
+            vec![live(2)],
+            call(
+                intrinsic(IntrinsicOp::PanicUnwind),
+                vec![],
+                2,
+                None,
+                UnwindAction::Continue,
+            ),
+        )],
+    );
+    let table = CallTable::new().with_callee("boom", 1, lower(&boom, PW));
+    assert_eq!(
+        eval_lowered_body_cfg_with_call_table(
+            &lower(&body(callee("boom")), PW),
+            &[u32v(1)],
+            8,
+            &table
+        ),
+        moved
+    );
+    assert_eq!(
+        eval_lowered_body_cfg(
+            &lower(&body(intrinsic(IntrinsicOp::PanicUnwind)), PW),
+            &[u32v(1)],
+            8
+        ),
+        moved
+    );
+    // With a copied argument the cleanup block reads `_1` and the panic resumes.
+    let mut copied = body(intrinsic(IntrinsicOp::PanicUnwind));
+    if let Some(Terminator::Call { args, .. }) = &mut copied.basic_blocks[0].terminator {
+        args[0] = cp(1);
+    }
+    assert_eq!(
+        eval_lowered_body_cfg(&lower(&copied, PW), &[u32v(1)], 8),
+        Ok(CfgEvalOutcome::Panicked {
+            bb: 0,
+            msg: PanicMessage::Intrinsic(IntrinsicOp::PanicUnwind)
+        })
+    );
+}
+
+#[test]
+fn test_a2_mutual_recursion_depth_errors_report_the_alternating_call_stack() {
+    let parity = CallTable::new()
+        .with_callee("is_even", 1, lower(&parity_fn("is_odd", true), PW))
+        .with_callee("is_odd", 1, lower(&parity_fn("is_even", false), PW))
+        .with_max_call_depth(5);
+    let is_even = parity
+        .get(&CalleeSymbol::new("is_even"))
+        .unwrap()
+        .body
+        .clone();
+    // `is_even(5)` needs five callee frames, `is_even(6)` six.
+    assert_eq!(
+        returned(eval_lowered_body_cfg_with_call_table(
+            &is_even,
+            &[u32v(5)],
+            1000,
+            &parity
+        )),
+        MirValue::Bool(false)
+    );
+    match eval_lowered_body_cfg_with_call_table(&is_even, &[u32v(6)], 1000, &parity) {
+        Err(CfgEvalError::InCallee { call_stack, error }) => {
+            let names: Vec<&str> = call_stack.iter().map(|s| s.callee.as_str()).collect();
+            assert_eq!(names, ["is_odd", "is_even", "is_odd", "is_even", "is_odd"]);
+            assert!(call_stack.iter().all(|s| s.bb == 2));
+            assert_eq!(
+                *error,
+                CfgEvalError::CallDepthExceeded {
+                    bb: 2,
+                    max_call_depth: 5
+                }
+            );
+        }
+        other => panic!("expected CallDepthExceeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_a2_call_destinations_are_evaluated_after_the_arguments_and_before_the_call() {
+    // `bb0: _2 = copy _1; _3 = [10, 20]; _3[_2] = <func>(<arg>, 1) -> [bb1, unwind bb2];
+    //  bb1: _0 = copy _3; return; bb2 (cleanup): resume`.
+    for pw in PWS {
+        let arr = Ty::Array(Box::new(usize_ty()), 2);
+        let arr_val = |a: u128, b: u128| MirValue::Array {
+            elements: vec![usizev(a, pw), usizev(b, pw)],
+            elem_ty: usize_ty(),
+        };
+        let body = |func: Constant, arg: Operand| {
+            mk(
+                vec![arr.clone(), usize_ty(), usize_ty(), arr.clone()],
+                vec![
+                    blk(
+                        vec![
+                            live(2),
+                            live(3),
+                            assign(2, Rvalue::Use(cp(1))),
+                            assign(
+                                3,
+                                Rvalue::Aggregate(
+                                    AggregateKind::Array(usize_ty()),
+                                    vec![cst(10, usize_ty()), cst(20, usize_ty())],
+                                ),
+                            ),
+                        ],
+                        Terminator::Call {
+                            func: Operand::Constant(func),
+                            args: vec![arg, cst(1, usize_ty())],
+                            destination: Place::with_projection(
+                                3,
+                                vec![ProjectionElem::Index(Local(2))],
+                            ),
+                            target: Some(1),
+                            unwind: UnwindAction::Cleanup(2),
+                        },
+                    ),
+                    blk(vec![assign(0, Rvalue::Use(cp(3)))], Terminator::Return),
+                    cleanup_blk(vec![], Terminator::UnwindResume),
+                ],
+            )
+        };
+        let add = mk(
+            vec![usize_ty(), usize_ty(), usize_ty()],
+            vec![blk(
+                vec![assign(0, Rvalue::BinaryOp(BinOp::Add, cp(1), cp(2)))],
+                Terminator::Return,
+            )],
+        );
+        let boom = mk(
+            vec![usize_ty(), usize_ty(), usize_ty(), Ty::Never],
+            vec![blk(
+                vec![live(3)],
+                call(
+                    intrinsic(IntrinsicOp::PanicUnwind),
+                    vec![],
+                    3,
+                    None,
+                    UnwindAction::Continue,
+                ),
+            )],
+        );
+        let table = CallTable::new()
+            .with_callee("add", 2, lower(&add, pw))
+            .with_callee("boom", 2, lower(&boom, pw));
+        let run = |func: Constant, arg: Operand| {
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&body(func, arg), pw),
+                &[usizev(1, pw)],
+                8,
+                &table,
+            )
+        };
+        // The index operand is read after the arguments: copied, `_3[1] = 1 + 1`.
+        for func in [intrinsic(IntrinsicOp::WrappingAdd), callee("add")] {
+            assert_eq!(returned(run(func, cp(2))), arr_val(10, 2));
+        }
+        // Moved by the call, the index local is uninitialized when the destination is
+        // evaluated (`Trusted`: `writePlaceValue` on the post-argument locals; Miri:
+        // `eval_place(destination)` after `eval_callee_and_args`), so the call faults in the
+        // caller's block, before any callee frame exists (no `InCallee` wrapper).
+        for func in [
+            intrinsic(IntrinsicOp::WrappingAdd),
+            callee("add"),
+            callee("boom"),
+        ] {
+            assert_eq!(
+                run(func, mv(2)),
+                Err(CfgEvalError::Terminator {
+                    bb: 0,
+                    error: RvalueEvalError::UninitializedLocal(Local(2)),
+                })
+            );
+        }
+        // A valid destination of a callee that panics is never written: the panic unwinds
+        // through the caller's cleanup block.
+        assert_eq!(
+            run(callee("boom"), cp(2)),
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: PanicMessage::Intrinsic(IntrinsicOp::PanicUnwind),
+            })
+        );
+
+        // A memory intrinsic that overwrites the destination's index local writes to the
+        // destination as evaluated before the call (MiniRust / Miri): `_4[_2]` with the old
+        // `_2 == 1`, although `_2` is `usize::MAX` (out of bounds) afterwards.
+        let units = Ty::Array(Box::new(unit()), 2);
+        let write_index = mk(
+            vec![
+                usize_ty(),
+                usize_ty(),
+                usize_ty(),
+                raw(usize_ty(), Mutability::Mut),
+                units.clone(),
+            ],
+            vec![
+                blk(
+                    vec![
+                        live(2),
+                        live(3),
+                        live(4),
+                        assign(2, Rvalue::Use(cp(1))),
+                        assign(3, Rvalue::RawPtr(Mutability::Mut, place(2))),
+                        assign(
+                            4,
+                            Rvalue::Aggregate(
+                                AggregateKind::Array(unit()),
+                                vec![
+                                    Operand::Constant(Constant::Unit),
+                                    Operand::Constant(Constant::Unit),
+                                ],
+                            ),
+                        ),
+                    ],
+                    Terminator::Call {
+                        func: Operand::Constant(intrinsic(IntrinsicOp::WriteBytes)),
+                        args: vec![cp(3), cst(0xFF, u8_ty()), cst(1, usize_ty())],
+                        destination: Place::with_projection(
+                            4,
+                            vec![ProjectionElem::Index(Local(2))],
+                        ),
+                        target: Some(1),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                blk(vec![assign(0, Rvalue::Use(cp(2)))], Terminator::Return),
+            ],
+        );
+        assert_eq!(
+            returned(eval_lowered_body_cfg(
+                &lower(&write_index, pw),
+                &[usizev(1, pw)],
+                4
+            )),
+            usizev(pw.max_usize(), pw)
+        );
     }
 }
