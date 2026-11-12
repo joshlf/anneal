@@ -543,7 +543,16 @@ fn is_closure_def_path_segment(seg: &str) -> bool {
     !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
 }
 
-fn frame_matches_scope(frame: &str, scope_segments: &[ScopeSegment]) -> bool {
+/// Return `true` when `frame` names the callable body with relative `DefPath`
+/// `scope_segments` in a user crate, or a compiler-generated `panic_cold_*`
+/// shim (such as the `panic_cold_display` that `panic!("{}", x)` defines) inside
+/// it. `user_children` lists the names of the `fn` items written directly in
+/// that body; a frame that names one of them is that user `fn`, not a shim.
+fn frame_matches_scope(
+    frame: &str,
+    scope_segments: &[ScopeSegment],
+    user_children: &[&str],
+) -> bool {
     if scope_segments.is_empty() || scope_segments.contains(&ScopeSegment::Opaque) {
         return false;
     }
@@ -563,7 +572,7 @@ fn frame_matches_scope(frame: &str, scope_segments: &[ScopeSegment]) -> bool {
     }
     match &parts[1 + scope_segments.len()..] {
         [] => true,
-        [shim] => shim.starts_with("panic_cold_"),
+        [shim] => shim.starts_with("panic_cold_") && !user_children.contains(shim),
         _ => false,
     }
 }
@@ -766,7 +775,18 @@ impl StagedLibSource {
         else {
             return false;
         };
-        frame_matches_scope(frame, &innermost.segments)
+        let user_children: Vec<&str> = scopes
+            .iter()
+            .filter(|s| {
+                s.segments.len() == innermost.segments.len() + 1
+                    && s.segments.starts_with(&innermost.segments)
+            })
+            .filter_map(|s| match s.segments.last() {
+                Some(ScopeSegment::Named(name)) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        frame_matches_scope(frame, &innermost.segments, &user_children)
     }
 }
 
@@ -3802,6 +3822,59 @@ pub fn cand_nested__b0_c0() {
             at(10, 5, closure_frame),
             ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn compare_difftest_rejects_user_fns_named_like_panic_shims() {
+        // A user `fn` whose name merely starts with `panic_cold_` is a separate
+        // callable: a panic that Anneal begins there does not match Miri's
+        // panic in the outer body, although the compiler's own shim does.
+        let src = StagedLibSource::parse(
+            "\
+#![no_std]
+pub fn cand_shadow__b0_c0() {
+    fn panic_cold_user() {
+        panic!(\"same\");
+    }
+    let _ = panic_cold_user;
+    panic!(\"same\");
+}
+",
+        );
+        let anneal = anneal_panic_in("/rustlib/src/rust/library/core/src/panic.rs", 62);
+        let verdict = |line: u32, col: u32, frame: &str| {
+            let miri = MiriOutcome::Panic {
+                pos: Some(SourcePos {
+                    file: "src/lib.rs".to_string(),
+                    line,
+                    col,
+                }),
+                message: "same".to_string(),
+            };
+            compare_difftest_miri_and_anneal(
+                &miri,
+                &anneal,
+                Some("same"),
+                Some(frame),
+                &src,
+                "cand_shadow__b0_c0",
+            )
+        };
+        let outer = "miri_diff_corpus::cand_shadow__b0_c0";
+        assert_eq!(verdict(7, 5, outer), ComparisonVerdict::Agree);
+        assert_eq!(
+            verdict(7, 5, &format!("{outer}::panic_cold_display")),
+            ComparisonVerdict::Agree
+        );
+        assert!(matches!(
+            verdict(7, 5, &format!("{outer}::panic_cold_user")),
+            ComparisonVerdict::Diverge(DivergenceKind::PanicSiteMismatch { .. })
+        ));
+        // Inside the user `fn`, its own frame matches exactly.
+        assert_eq!(
+            verdict(4, 9, &format!("{outer}::panic_cold_user")),
+            ComparisonVerdict::Agree
+        );
     }
 
     #[test]
