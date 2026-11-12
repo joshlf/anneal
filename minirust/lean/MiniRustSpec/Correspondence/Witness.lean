@@ -14225,4 +14225,168 @@ theorem deinitSiblingReinitUb_minirust_ub_from_start :
     deinitSiblingReinitUb_ctxOk deinitSiblingReinitArgs (by decide)
     deinitSiblingReinitUbMInit rfl rfl rfl hr hf
 
+/-- `ctxPadded2` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u8`,
+`_3: u32`, and `_4: u32` (with `argCount = 1`). -/
+theorem ctxPadded2_ok_u8_u32_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl, u8Decl, u32Decl, u32Decl])
+    (hlay : body.layouts = paddedLayouts) (hac : body.argCount = 1) : CtxOk body ctxPadded2 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd; rw [h] at hd; rw [hlay]; rw [hac] at hi
+    match i, hi, hd with
+    | 0, _, hd => simp at hd; subst hd; decide
+    | 1, _, hd => simp at hd; subst hd; decide
+    | _ + 2, hi, _ => omega
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR of a 4-statement open-hole window exercising `siblingReadOk`, `localCopyWindowOk`, and
+`reinitCopyOk` together:
+```rust
+fn deinit_sibling_relay_reinit(mut s: Padded) -> u32 {
+    let t: u8;          // StorageLive(_2)
+    let q: u32;         // StorageLive(_3)
+    let r: u32;         // StorageLive(_4)
+    q = s.1 + 1;        // _3 = Add(copy _1.1, const 1_u32)  (= 100)
+    Deinit(s.1);        // Deinit(_1.1)                      [opens hole (1, [.field 1 u32])]
+    t = s.0;            // _2 = copy _1.0                    [siblingReadOk: _2 = 7_u8]
+    r = q;              // _4 = copy _3                      [localCopyWindowOk: _4 = 100_u32]
+    s.1 = r;            // _1.1 = copy _4                    [reinitCopyOk: closes hole with 100]
+    q = t as u32;       // _3 = Cast(IntToInt, copy _2, u32) [sibling read _2 = 7 flows to _3]
+    s.1 + q             // _0 = Add(copy _1.1, copy _3) = 107; StorageDead(_4.._2); return
+}
+```
+While the hole `(1, [.field 1 u32])` is open, both a disjoint sibling read (`_2 = copy _1.0`) and a
+hole-independent local-to-local copy (`_4 = copy _3`) execute before `_1.1 = copy _4` closes the
+hole from `_4`. Both values computed while the hole was open (`_2 = 7` and `_4 = 100`) flow into the
+returned value `100 + 7 = 107`. -/
+def deinitSiblingRelayReinit : CapturedMir where
+  defPath := "witness::deinit_sibling_relay_reinit"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u8Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (constU32 1))),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.use (.copy (placeField 1 [(0, u8TyW)])))),
+        mkStmt (.assign (local_ 4) (.use (.copy (local_ 3)))),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (.copy (local_ 4)))),
+        mkStmt (.assign (local_ 3) (.cast .intToInt (.copy (local_ 2)) u32Ty)),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (.copy (local_ 3)))),
+        mkStmt (.storageDead 4),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem deinitSiblingRelayReinit_inFragmentD : inFragmentD deinitSiblingRelayReinit = true := by
+  decide
+
+theorem deinitSiblingRelayReinit_not_inFragment : inFragment deinitSiblingRelayReinit = false := by
+  decide
+
+def deinitSiblingRelayReinitFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, .Int Witness.u8), (localName 3, .Int u32), (localName 4, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 1)) 1)) (.Constant (.Int 1) (.Int u32))),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2)) (.Load (.Field (.Local (localName 1)) 0)),
+      .Assign (.Local (localName 4)) (.Load (.Local (localName 3))),
+      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 4))),
+      .Assign (.Local (localName 3))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 1)) 1)) (.Load (.Local (localName 3)))),
+      .StorageDead (localName 4),
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem deinitSiblingRelayReinit_translate :
+    translateFn deinitSiblingRelayReinit = some deinitSiblingRelayReinitFn := rfl
+
+theorem deinitSiblingRelayReinit_ctxOk : CtxOk deinitSiblingRelayReinit ctxPadded2 :=
+  ctxPadded2_ok_u8_u32_u32 rfl rfl rfl
+
+def deinitSiblingRelayReinitArgs : List Value := [initPaddedStruct]
+
+theorem deinitSiblingRelayReinit_argsOk :
+    argsOk deinitSiblingRelayReinit deinitSiblingRelayReinitArgs = true := by decide
+
+def deinitSiblingRelayReinitS0 : MachineState :=
+  initMachineState deinitSiblingRelayReinit deinitSiblingRelayReinitArgs
+
+def deinitSiblingRelayReinitMInit : Mach :=
+  machineWithCtx ctxPadded2 deinitSiblingRelayReinit deinitSiblingRelayReinitFn
+    deinitSiblingRelayReinitS0.frame.locals deinitSiblingRelayReinitFn.start
+
+theorem deinitSiblingRelayReinit_anneal_ret :
+    ReachesRet (mirCallTree deinitSiblingRelayReinit deinitSiblingRelayReinitArgs) []
+      (.normal (.scalar ⟨107, 4⟩, deinitSiblingRelayReinitS0.memory)) :=
+  runA_sound deinitSiblingRelayReinit 19 _ _ _ rfl
+
+theorem deinitSiblingRelayReinit_anneal_noUB :
+    MirNoUBTree (mirCallTree deinitSiblingRelayReinit deinitSiblingRelayReinitArgs) :=
+  runA_noUB deinitSiblingRelayReinit 19 _ _ _ rfl
+
+/-- The hole `(1, [.field 1 u32])` stays open across the 3-statement window (`_2 = copy _1.0`,
+`_4 = copy _3`, `_1.1 = copy _4` at indices `5`, `6`, `7`) and closes at index `8`. -/
+theorem deinitSiblingRelayReinit_holeAt :
+    (List.range 14).map (holeAt deinitSiblingRelayReinit 0) =
+      [none, none, none, none, none,
+       some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]),
+       none, none, none, none, none, none] :=
+  rfl
+
+/-- **End-to-end return through `mirCall_ret_D` for `deinitSiblingRelayReinit` (`siblingReadOk` +
+`localCopyWindowOk` + `reinitCopyOk`).** Anneal's return of `107` (`100 + 7`) gives a MiniRust run
+from `f.start` that pops the callee frame and leaves `107` in the caller's return place. -/
+theorem deinitSiblingRelayReinit_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n deinitSiblingRelayReinitMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 107 } ∧
+      m'.threads =
+        [thread1 ctxPadded2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D deinitSiblingRelayReinit_inFragmentD deinitSiblingRelayReinit_translate ctxPadded2
+      deinitSiblingRelayReinit_ctxOk deinitSiblingRelayReinitArgs deinitSiblingRelayReinit_argsOk
+      deinitSiblingRelayReinitMInit rfl rfl rfl deinitSiblingRelayReinit_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [deinitSiblingRelayReinit] at hd; subst hd
+  simp [retPtr, ctxPadded2] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded2] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem deinitSiblingRelayReinit_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n deinitSiblingRelayReinitMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k deinitSiblingRelayReinitMInit = .ok mRet ∧
+      ReturnRel deinitSiblingRelayReinit ctxPadded2 s' v mRet ∧
+      ReachesRet (mirCallTree deinitSiblingRelayReinit deinitSiblingRelayReinitArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB_D deinitSiblingRelayReinit_inFragmentD deinitSiblingRelayReinit_translate ctxPadded2
+    deinitSiblingRelayReinit_ctxOk deinitSiblingRelayReinitArgs deinitSiblingRelayReinit_argsOk
+    deinitSiblingRelayReinitMInit rfl rfl rfl deinitSiblingRelayReinit_anneal_noUB herr
+
 end MiniRustSpec.Correspondence.Witness
