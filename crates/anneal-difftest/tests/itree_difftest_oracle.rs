@@ -99,11 +99,12 @@ fn assert_itree_findings_shrunk(
             f.finding_id,
             f.shrink_status
         );
-        // A 1- or 2-pass chain needs at least the `[]` query; every executed run
-        // answered a distinct query.
+        // A 1- or 2-pass chain needs at least the `[]` query. A shrink executes at
+        // most one live run per query, and none for a program that an earlier
+        // shrink of the same candidate (another signature) already judged.
         assert!(f.shrink_evaluations >= 1, "{}", f.finding_id);
         assert!(
-            (1..=f.shrink_evaluations).contains(&f.executed_oracle_runs),
+            f.executed_oracle_runs <= f.shrink_evaluations,
             "{}: executed_oracle_runs={} shrink_evaluations={}",
             f.finding_id,
             f.executed_oracle_runs,
@@ -163,6 +164,17 @@ fn assert_itree_findings_shrunk(
             findings.len(),
             distinct_fns.len()
         );
+    }
+    // Each candidate's first shrink starts from an empty live-oracle memo, so it
+    // executes at least one live run (on the unmutated seed `[]`).
+    for fn_name in &distinct_fns {
+        let executed = findings
+            .iter()
+            .filter(|f| f.fn_name == *fn_name)
+            .map(|f| f.executed_oracle_runs)
+            .max()
+            .unwrap_or(0);
+        assert!(executed >= 1, "`{fn_name}`: shrinking executed no live oracle run");
     }
     reduced
 }
