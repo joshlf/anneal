@@ -1826,26 +1826,100 @@ pub fn stage_miri_diff_workspace(
     Ok((report, certificate_modules))
 }
 
+/// Return `true` when `def_id` is modeled inline by
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators` without emitting an
+/// external `MirCallE` interaction (`isUnwindingPanicDefPath`,
+/// `isAbortingPanicDefPath`, `isUnreachableCallTarget`,
+/// `isDirectExactDivTarget`, or `classifyRustIntrinsic?` other than
+/// `const_eval_select`, whose runtime target may be unlinked).
+fn is_trusted_inline_call_def_path(def_id: &str) -> bool {
+    matches!(
+        def_id,
+        // `isUnwindingPanicDefPath`
+        "core::panicking::panic"
+            | "core::panicking::panic_fmt"
+            | "core::panicking::panic_fmt::panic_impl"
+            | "core::panicking::const_panic_fmt"
+            | "core::panicking::assert_failed"
+            | "core::panicking::assert_failed_inner"
+            | "core::panicking::assert_matches_failed"
+            | "core::slice::index::slice_index_fail"
+            | "core::panicking::panic_bounds_check"
+            | "core::panicking::panic_explicit"
+            | "core::panicking::panic_display"
+            | "core::panicking::panic_str_2015"
+            | "core::panicking::unreachable_display"
+            | "core::option::unwrap_failed"
+            | "core::option::expect_failed"
+            | "core::result::unwrap_failed"
+            | "core::panicking::panic_const::panic_const_add_overflow"
+            | "core::panicking::panic_const::panic_const_sub_overflow"
+            | "core::panicking::panic_const::panic_const_mul_overflow"
+            | "core::panicking::panic_const::panic_const_div_overflow"
+            | "core::panicking::panic_const::panic_const_rem_overflow"
+            | "core::panicking::panic_const::panic_const_neg_overflow"
+            | "core::panicking::panic_const::panic_const_shr_overflow"
+            | "core::panicking::panic_const::panic_const_shl_overflow"
+            | "core::panicking::panic_const::panic_const_div_by_zero"
+            | "core::panicking::panic_const::panic_const_rem_by_zero"
+            // `isAbortingPanicDefPath`
+            | "core::panicking::panic_nounwind"
+            | "core::panicking::panic_nounwind_fmt"
+            | "core::panicking::panic_nounwind_fmt::panic_impl"
+            | "core::panicking::panic_nounwind_nobacktrace"
+            | "core::panicking::panic_in_cleanup"
+            | "core::panicking::panic_cannot_unwind"
+            | "core::panicking::panic_misaligned_pointer_dereference"
+            | "core::panicking::panic_null_pointer_dereference"
+            | "core::panicking::panic_invalid_enum_construction"
+            | "core::intrinsics::abort"
+            // `isUnreachableCallTarget`
+            | "core::hint::unreachable_unchecked"
+            | "std::hint::unreachable_unchecked"
+            | "core::intrinsics::unreachable"
+            // `isDirectExactDivTarget` and non-dispatching `classifyRustIntrinsic?`
+            | "core::intrinsics::exact_div"
+            | "core::intrinsics::ub_checks"
+            | "core::intrinsics::arith_offset"
+            | "core::intrinsics::ctlz"
+            | "core::intrinsics::ctlz_nonzero"
+            | "core::intrinsics::cttz"
+            | "core::intrinsics::cttz_nonzero"
+            | "core::intrinsics::ctpop"
+            | "core::intrinsics::bswap"
+            | "core::intrinsics::bitreverse"
+            | "core::intrinsics::wrapping_add"
+            | "core::intrinsics::wrapping_sub"
+            | "core::intrinsics::wrapping_mul"
+            | "core::intrinsics::saturating_add"
+            | "core::intrinsics::saturating_sub"
+            | "core::intrinsics::unchecked_shl"
+            | "core::intrinsics::unchecked_shr"
+            | "core::intrinsics::unchecked_add"
+            | "core::intrinsics::unchecked_sub"
+            | "core::intrinsics::unchecked_mul"
+            | "core::intrinsics::unchecked_div"
+            | "core::intrinsics::unchecked_rem"
+            | "core::intrinsics::three_way_compare"
+            | "core::intrinsics::size_of_val"
+            | "core::intrinsics::align_of_val"
+    )
+}
+
 /// Choose the certificate shape of the non-bug `panic` entry whose captured
 /// body has module suffix `item_suffix` and links the callee table
 /// `linked_callees`, using `def_id_by_suffix` to map captured module suffixes
 /// to `def_id`s.
 ///
 /// Direct evaluation (`reachesPanicBounded`) stops at the first call to a
-/// function that is not linked. The entry therefore gets the
-/// [`MiriDiffPanicCertificate::Modular`] certificate when its body or the body
-/// of a linked callee references a function (as scaffolding collects callee
-/// references, from `.fnDef "<def_id>"`) that is neither the entry itself nor a
-/// linked callee, and the [`MiriDiffPanicCertificate::Stateful`] certificate
-/// otherwise.
-///
-/// The classification only selects which certificate the Lean kernel checks,
-/// so a misclassification cannot produce an unsound certificate: a `Stateful`
-/// certificate for a body that reaches an external call fails to build, and a
-/// `Modular` certificate still holds for a body that panics before reaching
-/// one. The second case can arise from a reference that is not a call (or a
-/// call that `Trusted` models inline, such as a panic entry point), and it
-/// costs only the stronger-looking statement of the `Stateful` shape.
+/// function that is neither linked nor modeled inline by `Trusted`. The entry
+/// therefore gets the [`MiriDiffPanicCertificate::Modular`] certificate when
+/// its body or the body of a linked callee references a function (as
+/// scaffolding collects callee references, from `.fnDef "<def_id>"`) that is
+/// not the entry itself, not a linked callee, and not modeled inline by
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators`
+/// ([`is_trusted_inline_call_def_path`]), and the
+/// [`MiriDiffPanicCertificate::Stateful`] certificate otherwise.
 fn classify_panic_certificate(
     dot_anneal: &Path,
     item_suffix: &str,
@@ -1872,10 +1946,10 @@ fn classify_panic_certificate(
                 err
             )
         })?;
-        if extract_called_fn_defs(&mir_text)
-            .iter()
-            .any(|def_id| !linked_def_ids.contains(def_id.as_str()))
-        {
+        if extract_called_fn_defs(&mir_text).iter().any(|def_id| {
+            !linked_def_ids.contains(def_id.as_str())
+                && !is_trusted_inline_call_def_path(def_id.as_str())
+        }) {
             return Ok(MiriDiffPanicCertificate::Modular);
         }
     }
@@ -2477,15 +2551,26 @@ mod tests {
         };
         write_mir("panic_assert", &[]);
         write_mir(
+            "panic_inline_trusted_calls",
+            &[
+                "core::intrinsics::exact_div",
+                "core::intrinsics::wrapping_add",
+                "core::panicking::panic_explicit",
+                "core::panicking::panic_bounds_check",
+                "core::option::unwrap_failed",
+            ],
+        );
+        write_mir(
             "panic_fmt_macro",
             &["core::fmt::Arguments::<'a>::from_str", "core::panicking::panic_fmt"],
         );
         write_mir("panic_via_helper", &["miri_diff_corpus::helper"]);
-        write_mir("helper", &[]);
+        write_mir("helper", &["core::panicking::panic"]);
         write_mir("helper_calling_external", &["core::fmt::Arguments::<'a>::from_str"]);
         write_mir("panic_via_external_helper", &["miri_diff_corpus::helper_calling_external"]);
         let def_id_by_suffix: BTreeMap<String, String> = [
             "panic_assert",
+            "panic_inline_trusted_calls",
             "panic_fmt_macro",
             "panic_via_helper",
             "helper",
@@ -2507,9 +2592,16 @@ mod tests {
         };
 
         assert_eq!(classify("panic_assert", &[]), Ok(MiriDiffPanicCertificate::Stateful));
+        // Inline-modeled `Trusted` panic entrypoints and intrinsics never emit
+        // an external call, so they keep the stronger `Stateful` certificate.
+        assert_eq!(
+            classify("panic_inline_trusted_calls", &[]),
+            Ok(MiriDiffPanicCertificate::Stateful)
+        );
         assert_eq!(classify("panic_fmt_macro", &[]), Ok(MiriDiffPanicCertificate::Modular));
-        // A linked callee is not an external call, but an external call inside
-        // a linked callee is, and an unlinked captured function is too.
+        // A linked callee (even one that calls an inline-modeled `Trusted`
+        // panic entrypoint) is not an external call, but an external call
+        // inside a linked callee is, and an unlinked captured function is too.
         assert_eq!(
             classify("panic_via_helper", &["helper"]),
             Ok(MiriDiffPanicCertificate::Stateful)

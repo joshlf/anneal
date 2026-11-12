@@ -3189,6 +3189,71 @@ theorem extCallThenUb_modular_safe_panic_rejected :
       false :=
   ⟨rfl, rfl⟩
 
+/--
+Calls the linked callee `sym_test::fmt_panic`, which itself performs an external
+call (`core::fmt::Arguments::<'a>::from_str`) while `callStack` is non-empty and
+then panics via `core::panicking::panic_fmt`, unwinding back through the
+restored caller frame on `callStack`.
+-/
+def callerOfFmtPanicMir : CapturedMir :=
+  mkMirBody "sym_test::caller_of_fmt_panic" 0
+    [ mkDecl .mut unitMirTy, mkDecl .mut unitMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::fmt_panic")
+            []
+            { local_ := 1, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+theorem callerOfFmtPanic_modular_safe_panic_verified :
+    ModularVerificationResult
+      { body := callerOfFmtPanicMir
+        envAssumed := framePreservingCallContract.holdsOn
+        pre := fun a m => a = [] ∧ m = emptyMemory
+        post := fun _ _ _ _ => False
+        callees := [fmtPanicMir] } ∧
+    ¬ ({ body := callerOfFmtPanicMir
+         pre := fun a m => a = [] ∧ m = emptyMemory
+         post := fun _ _ _ _ => True
+         callees := [fmtPanicMir] } : TotalClaim).holds :=
+  verifyModularSafePanicMirBounded callerOfFmtPanicMir
+    [fmtPanicMir] 24 [] emptyMemory
+
+/--
+Calls an unlinked diverging function (`target = .none` that is not a built-in
+panic or abort entrypoint): `framePreservingCallContract` permits `.returned`,
+on which `resumeExternalDivergingCall` faults with `.ub`, so the modular
+safe-panic checker rejects it.
+-/
+def divergingExtCallMir : CapturedMir :=
+  mkMirBody "sym_test::diverging_ext_call" 0
+    [ mkDecl .mut unitMirTy, mkDecl .not neverMirTy ]
+    [ { statements := [ mkStmt (.storageLive 1) ]
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_diverging")
+            []
+            { local_ := 1, projection := [] }
+            .none
+            .continue_)
+        isCleanup := false } ]
+
+theorem divergingExtCall_modular_safe_panic_rejected :
+    reachesModularSafePanicBounded 8 divergingExtCallMir
+        (initMachineStateWithMemory divergingExtCallMir [] emptyMemory) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        divergingExtCallMir
+        (initMachineStateWithMemory divergingExtCallMir [] emptyMemory) =
+      false :=
+  ⟨rfl, rfl⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!
