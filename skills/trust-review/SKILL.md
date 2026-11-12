@@ -214,7 +214,7 @@ affected components against these requirements:
   forbidden `.cargo` and `rust-toolchain*` paths, runs
   `cargo run --locked -p anneal-audit`, and requires every job in the
   fail-closed `all-jobs-succeed` gate (enforced by
-  [`ci/check_job_dependencies.sh`](../../ci/check_job_dependencies.sh)).
+  [`ci/check_workflow_dependencies.py`](../../ci/check_workflow_dependencies.py)).
 - **Privilege, action pinning, and cache isolation:** Ensure workflows keep
   `permissions: contents: read`, pin third-party GitHub Actions to full
   40-character commit SHAs, strip `ACTIONS_CACHE_URL`, `ACTIONS_RESULTS_URL`,

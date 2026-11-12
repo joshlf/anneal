@@ -44,10 +44,6 @@ jobs:
       ACTIONS_RESULTS_URL: ''
       ACTIONS_RUNTIME_TOKEN: ''
     steps:
-      - name: Install ripgrep
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -58,24 +54,8 @@ jobs:
           sha256sum --check --strict trusted/root-manifest.sha256
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
-      - name: Run todo check
-        run: ./ci/check_todo.sh
-      - name: Test release tooling and the Codex review gate
-        # The review-gate tests use fake GitHub responses and make no status
-        # writes.
-        run: >-
-          nix shell .#release-check-python --max-jobs 1 --cores 2 --command
-          python3 -B -m unittest discover -s ci -p 'test_*.py' -v
-      - name: Run job dependency check
-        run: ./ci/check_job_dependencies.sh
-      - name: Run GitHub Actions validator
-        run: ./ci/check_actions.sh
-      - name: Check Nix flake evaluation across all platforms
-        run: ./ci/check_flake_eval.sh
-      # FIXME(#87): We must address all blockers listed in #87 before permitting
-      # stable releases.
-      - name: Check non-stable cargo-anneal version
-        run: ./ci/check_non_stable_version.sh
+      - name: Run static checks with pinned tools
+        run: nix develop .#static --max-jobs 1 --cores 2 --command ./ci/check_static.sh
 
   build-exocrate:
     runs-on: ubuntu-latest

@@ -6,20 +6,272 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-"""Exercise the release workflow's authority and data handoff boundaries."""
+"""Exercise static gates and the release workflow's authority boundaries."""
 
 import os
 from pathlib import Path
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 
 from workflow_yaml import load_workflow_yaml
 
 
 SOURCE = Path(__file__).resolve().parent
+
+
+class CheckScriptFixture(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="anneal-check-scripts-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "ci").mkdir()
+        for name in (
+            "check_non_stable_version.sh",
+            "check_workflow_dependencies.py",
+            "workflow_yaml.py",
+        ):
+            shutil.copyfile(SOURCE / name, self.root / "ci" / name)
+        self.workflows = self.root / ".github/workflows"
+        self.workflows.mkdir(parents=True)
+        self.manifest = self.root / "trusted/cargo-anneal/Cargo.toml"
+        self.manifest.parent.mkdir(parents=True)
+
+    def run_check(self, name):
+        environment = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(self.root),
+            "GITHUB_STEP_SUMMARY": str(self.root / "step-summary"),
+        }
+        return subprocess.run(
+            ([sys.executable, "-B"] if name.endswith(".py") else ["bash"])
+            + [str(self.root / "ci" / name)],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def assert_accepted(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def assert_rejected(self, result, message=None):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(result.stderr.strip(), "rejection needs a diagnostic")
+        if message is not None:
+            self.assertIn(message, result.stderr)
+
+
+class PrereleaseVersionTests(CheckScriptFixture):
+    def check_manifest(self, text):
+        self.manifest.write_text(text, encoding="utf-8")
+        return self.run_check("check_non_stable_version.sh")
+
+    def test_accepts_prerelease_versions(self):
+        for version in ("0.1.0-alpha.1", "1.2.3-rc.2", "10.20.30-dev"):
+            with self.subTest(version=version):
+                result = self.check_manifest(
+                    f'[package]\nversion = "{version}"\n'
+                )
+                self.assert_accepted(result)
+                self.assertIn(version, result.stdout)
+
+    def test_rejects_stable_and_non_version_values(self):
+        for version in ("0.1.0", "1.0.0", "not-a-version"):
+            with self.subTest(version=version):
+                result = self.check_manifest(
+                    f'[package]\nversion = "{version}"\n'
+                )
+                self.assert_rejected(result, "not a pre-release version")
+
+    def test_rejects_missing_package_version(self):
+        for text in (
+            "",
+            "[package]\nname = 'fixture'\n",
+            "[package]\nversion = ''\n",
+        ):
+            with self.subTest(manifest=text):
+                self.assert_rejected(
+                    self.check_manifest(text),
+                    "does not specify package.version",
+                )
+
+    def test_rejects_missing_and_malformed_manifest(self):
+        self.assert_rejected(
+            self.run_check("check_non_stable_version.sh"), "Error reading"
+        )
+        self.assert_rejected(self.check_manifest("[package\n"), "Error reading")
+
+
+class WorkflowDependencyTests(CheckScriptFixture):
+    # GitHub accepts scalar, sequence, and mapping event declarations, and
+    # either a scalar or sequence of prerequisite jobs:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#on
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idneeds
+    PR_EVENTS = (
+        "on: pull_request",
+        "on: [push, pull_request]",
+        "on:\n  push:\n  pull_request:",
+        "'on':\n  pull_request:\n    branches: [main]",
+    )
+
+    def write_workflow(self, trigger, needs="[build, test]", gate=True,
+                       jobs=("build", "test"), filename="fixture.yml"):
+        content = trigger + "\njobs:\n"
+        for job in jobs:
+            content += textwrap.indent(
+                f"{job}:\n  runs-on: ubuntu-latest\n"
+                "  steps:\n    - run: 'true'\n",
+                "  ",
+            )
+        if gate:
+            content += "  all-jobs-succeed:\n"
+            if needs is not None:
+                content += f"    needs: {needs}\n"
+            content += (
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n      - run: 'true'\n"
+            )
+        (self.workflows / filename).write_text(content, encoding="utf-8")
+
+    def check(self):
+        return self.run_check("check_workflow_dependencies.py")
+
+    def test_accepts_complete_gate_for_every_event_form(self):
+        for trigger in self.PR_EVENTS:
+            with self.subTest(trigger=trigger):
+                self.write_workflow(trigger)
+                self.assert_accepted(self.check())
+
+    def test_accepts_scalar_needs_for_one_prerequisite(self):
+        self.write_workflow(
+            "on:\n  pull_request:", needs="build", jobs=("build",)
+        )
+        self.assert_accepted(self.check())
+
+    def test_rejects_missing_gate_for_every_event_form(self):
+        for trigger in self.PR_EVENTS:
+            with self.subTest(trigger=trigger):
+                self.write_workflow(trigger, gate=False)
+                self.assert_rejected(self.check(), "all-jobs-succeed")
+
+    def test_rejects_incomplete_or_absent_needs(self):
+        for needs in ("[build]", "[]", None):
+            with self.subTest(needs=needs):
+                self.write_workflow("on:\n  pull_request:", needs=needs)
+                self.assert_rejected(self.check(), "test")
+
+    def test_rejects_malformed_event_and_needs_containers(self):
+        for trigger in ("on: [[pull_request]]", "on: [pull_request, {}]"):
+            with self.subTest(trigger=trigger):
+                self.write_workflow(trigger)
+                self.assert_rejected(self.check(), "on")
+        for needs in ("{}", "[[build], test]"):
+            with self.subTest(needs=needs):
+                self.write_workflow("on: pull_request", needs=needs)
+                self.assert_rejected(self.check(), "needs")
+
+    def test_checks_both_workflow_extensions(self):
+        self.write_workflow("on:\n  pull_request:")
+        self.write_workflow(
+            "on:\n  pull_request:", gate=False, filename="other.yaml"
+        )
+        self.assert_rejected(self.check(), "other.yaml")
+
+    def test_does_not_require_pr_gate_for_other_events(self):
+        for trigger in (
+            "on: push", "on: [push, workflow_dispatch]", "on:\n  push:"
+        ):
+            with self.subTest(trigger=trigger):
+                self.write_workflow(trigger, gate=False)
+                self.assert_accepted(self.check())
+
+    def test_accepts_no_workflow_files(self):
+        self.assert_accepted(self.check())
+
+    def test_rejects_malformed_yaml(self):
+        (self.workflows / "fixture.yml").write_text(
+            "on: [\njobs:\n", encoding="utf-8"
+        )
+        self.assert_rejected(self.check())
+
+    def test_rejects_invalid_workflow_encoding(self):
+        (self.workflows / "fixture.yml").write_bytes(b"on: pull_request\n\xff")
+        self.assert_rejected(self.check())
+
+    def test_rejects_malformed_workflow_shapes(self):
+        for content in (
+            "[]\n",
+            "on: [[pull_request]]\njobs: {}\n",
+            "on: [pull_request, {}]\njobs: {}\n",
+            "on: {}\njobs: {}\n",
+            "jobs: {}\n",
+            "on:\n  pull_request:\njobs: []\n",
+            "on:\n  pull_request:\njobs: null\n",
+        ):
+            with self.subTest(workflow=content):
+                (self.workflows / "fixture.yml").write_text(
+                    content, encoding="utf-8"
+                )
+                self.assert_rejected(self.check())
+
+    def test_rejects_duplicate_keys_and_multiple_documents(self):
+        for content in (
+            "on: push\non: pull_request\njobs: {}\n",
+            "on: pull_request\njobs: {}\njobs: {}\n",
+            "on: push\njobs: {}\n---\non: pull_request\njobs: {}\n",
+        ):
+            with self.subTest(workflow=content):
+                (self.workflows / "fixture.yml").write_text(
+                    content, encoding="utf-8"
+                )
+                self.assert_rejected(self.check())
+
+    def test_accepts_aliased_events_and_dependencies(self):
+        self.write_workflow(
+            "run-name: &event pull_request\non: *event",
+            needs="*dependency", jobs=("build",),
+        )
+        path = self.workflows / "fixture.yml"
+        path.write_text(path.read_text().replace(
+            "  build:\n", "  build:\n    name: &dependency build\n"
+        ))
+        self.assert_accepted(self.check())
+
+    def test_preserves_names_that_yaml_11_treats_as_booleans_or_null(self):
+        self.write_workflow(
+            "on: pull_request", needs="[on, yes, null]",
+            jobs=("on", "yes", "null"),
+        )
+        self.assert_accepted(self.check())
+
+    def test_rejects_nonscalar_merge_and_recursive_yaml_keys(self):
+        for content, message in (
+            ("? [one, two]\n: value\non: push\n", "keys must be scalars"),
+            ("on: push\n<<: {jobs: {}}\n", "merge keys"),
+            ("on: push\n'<<': {jobs: {}}\n", "merge keys"),
+            ("on: &events [*events]\n", "recursive node"),
+            ("on: &events {pull_request: *events}\n", "recursive node"),
+        ):
+            with self.subTest(content=content):
+                (self.workflows / "fixture.yml").write_text(content)
+                result = self.check()
+                self.assert_rejected(result, message)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_reports_missing_job_in_workflow_summary(self):
+        self.write_workflow("on:\n  pull_request:", needs="[build]")
+        result = self.check()
+        self.assert_rejected(result, "test")
+        self.assertEqual(
+            (self.root / "step-summary").read_text(encoding="utf-8"),
+            result.stderr,
+        )
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

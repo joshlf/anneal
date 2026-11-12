@@ -18,6 +18,75 @@ The runtime workflow below has been validated on `x86_64-linux`. Nix also
 evaluates the flake for `aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin`;
 that evaluation does not establish that the installed tools run on those hosts.
 
+## Run static checks
+
+Run the same static entry point used by CI from the checkout root:
+
+```bash
+nix develop .#static --max-jobs 1 --cores 2 --command ./ci/check_static.sh
+```
+
+The static shell supplies the tools pinned by `flake.lock`, including Python
+with the YAML and Markdown parsers, ripgrep, action-validator, actionlint, and
+Rust's formatter. It uses a standalone Cargo for formatting and does not
+build Anneal's Rust distribution, Lean distribution, or capture driver. The
+formatter is a development tool and adds no files to the shipped archive.
+
+The entry point verifies the root TCB manifest, checks source headers and
+Action pins (full Git commit SHAs or Docker SHA-2 content digests), and checks
+local Markdown link and image targets.
+Header validation checks structure and a positive year with four digits.
+Authors and reviewers must establish each file's actual creation year and
+preserve existing attribution; the checker does not infer dates from Git or the
+clock. The registered binary formats are PNG, JPEG (`.jpg` and `.jpeg`), GIF,
+WebP, ICO, and `.bin` fixtures. These files are exempt from text checks; other
+formats still need a registered header format or an explicit exemption.
+
+The link check follows
+[GitHub's repository-file link rules](https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#relative-links):
+ordinary paths resolve against the Markdown file's directory, and `/README.md`
+resolves from the repository root. External URLs and heading anchors are outside
+its scope. The entry point also runs the Python fixture tests and the marker,
+job dependency, workflow validation, Rust formatting, flake evaluation, and
+non-stable version checks. These static checks do not replace the boundary audit
+or workspace tests below.
+
+To apply Rust formatting with the same formatter:
+
+```bash
+nix develop .#static --max-jobs 1 --cores 2 --command cargo fmt --all
+```
+
+After reviewing intended changes to files covered by
+[`trusted/root-manifest.sha256`](../trusted/root-manifest.sha256), explicitly
+refresh their hashes:
+
+```bash
+nix develop .#static --max-jobs 1 --cores 2 \
+  --command python3 -B ci/update_root_manifest.py
+git diff -- trusted/root-manifest.sha256
+```
+
+The updater preserves the manifest's file list, order, comments, and formatting.
+Review its diff with the covered changes, then rerun the static checks. Builds
+and checks verify the manifest without refreshing it automatically.
+
+## Use the development shell
+
+For compiler-driver development, enter the default shell:
+
+```bash
+nix develop --max-jobs 1 --cores 2
+```
+
+This shell includes the static tools, the pinned Rust and Lean distributions,
+and the capture driver. Cargo comes from the pinned Rust distribution.
+`RUSTC` and `RUSTDOC` use wrappers that share the driver's build environment;
+on Linux, they select Nix's loader, runtime libraries, and the pinned sysroot.
+The shell also sets `RUSTFLAGS`, the Rust library search paths, and
+`ANNEAL_TEST_RUST_SYSROOT` for compiler-session tests. Workspace tests that find
+Lean through the setup cache still need the installation described below.
+
 ## Build and install the current archive
 
 Use Bash on Linux with Nix flakes, Python 3, a host C linker, and an existing
