@@ -91,9 +91,10 @@ structure CorrespondenceScorecard : Prop where
       (updateBorrowPerm entry targetLocal writerTag).tag = entry.tag ∧
       (updateBorrowPerm entry targetLocal writerTag).targetLocal = entry.targetLocal) ∧
     (∀ (snap : MiniRustSnap) (perm : TreeBorrowPerm) (loc : TbLocality)
-        (acc : TbAccessKind) (prot : Bool),
-      annealStepTreeBorrowPerm perm loc acc prot =
-        mrStepTreeBorrowPerm snap false perm loc acc prot)
+        (acc : TbAccessKind),
+      perm ≠ .reservedFrz true →
+      annealStepTreeBorrowPerm perm loc acc false =
+        mrStepTreeBorrowPerm snap false perm loc acc false)
   /-- M4 (`L5_ControlAndCalls`): Universal statement PC, `lookupSwitchTarget`, `findCallee?`, and terminator correspondence over `MirSemantics.{Statements,Terminators}` vs. `Generated.Ops`. -/
   l5_control_and_calls_corresponds :
     (∀ (s : MachineState) (locals' : List LocalSlot) (mem' : Memory),

@@ -206,15 +206,18 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   (`cmpDiscrSwitch_translate`), with Anneal runs for all three outcomes, the
   end-to-end MiniRust return through `mirCall_ret`
   (`cmpDiscrLess_minirust_ret_from_start`), and direct MiniRust runs.
-* `paddedDeinitRead` and `paddedRetagRead`: kernel-computed divergences of a
+* `paddedDeinitRead` and `paddedRetagRead`: the kernel-computed divergence of a
   projected `Deinit(_1.1)` (Anneal keeps the field readable and returns `99`,
-  MiniRust writes `Uninit` and the later load is UB) and of a projected
-  `Retag(_1.1)` on a `u32` field (Anneal faults, MiniRust's `Validate`
-  succeeds and returns `99`), which is why `statementOk` rejects both
-  (`statementOk_deinit_proj`, `statementOk_retag_proj`); projected `Deinit` is
-  admitted only by the separate fragment `inFragmentD`
-  (`MiniRustSpec.Correspondence.DeinitWindow`), which rejects `paddedDeinitRead`
-  (`paddedDeinitRead_not_inFragmentD`).
+  MiniRust writes `Uninit` and the later load is UB), and the kernel-computed
+  Stage-1 agreement on a projected `Retag(_1.1)` of a `u32` field (Stage-1
+  Trusted's retag of a typed non-pointer place is a no-op,
+  `evalStmt_retag_scalar_noop`, and MiniRust's `Validate` stores back the
+  integer it loaded: both return `99`, `paddedRetagRead_stage1_parity`);
+  `statementOk` still rejects both (`statementOk_deinit_proj`,
+  `statementOk_retag_proj`); projected `Deinit` is admitted only by the separate
+  fragment `inFragmentD` (`MiniRustSpec.Correspondence.DeinitWindow`), which
+  rejects `paddedDeinitRead` (`paddedDeinitRead_not_inFragmentD`) and
+  `paddedRetagRead` (`paddedRetagRead_not_inFragmentD`).
 * `deinitSiblingReinit`: witness #1 for projected `Deinit`
   (`StorageLive(_2); Deinit(_1.1); _2 = copy _1.0; _1.1 = const 42; _0 = copy _1.1;
   StorageDead(_2)` on `Padded(u8, u32, u16)`), admitted by `inFragmentD`
@@ -13414,22 +13417,34 @@ theorem cmpDiscrGreater_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
 
-/-! ## Projected `Deinit` and `Retag` outside the fragment (kernel-checked divergences)
+/-! ## Projected `Deinit` and `Retag` outside the fragment (kernel-checked witnesses)
 
 `statementOk` admits `Deinit` and `Retag` only on unprojected locals
 (`statementOk_deinit_proj`, `statementOk_retag_proj`). The two witnesses below
-compute, inside the kernel, why each projected form diverges between Anneal's
-MIR semantics and MiniRust on a fragment `Padded(u8, u32, u16)` argument, so
-that neither can be admitted without changing the state relation:
+compute, inside the kernel, how each projected form behaves in Anneal's MIR
+semantics and in MiniRust on a fragment `Padded(u8, u32, u16)` argument:
 
-* `Deinit(_1.1)`: Anneal only checks that `_1` is initialized and `_1.1`
-  readable and keeps the slot, so a later read of `_1.1` returns the old field,
-  whereas MiniRust's `Statement::Deinit` writes `Uninit` over bytes `4..8` and
-  the later read is UB.
-* `Retag(_1.1)`: Anneal's `Retag` reads `_1.1` and requires a pointer
-  (`extractDerefPtrVal?`), so it is UB on the `u32` field, whereas MiniRust's
-  `Statement::Validate` loads the `u32`, retags it as the identity
-  (`retag_val` on `Value::Int`), and stores it back. -/
+* `Deinit(_1.1)` diverges: Anneal only checks that `_1` is initialized and
+  `_1.1` readable and keeps the slot, so a later read of `_1.1` returns the old
+  field, whereas MiniRust's `Statement::Deinit` writes `Uninit` over bytes
+  `4..8` and the later read is UB.
+* `Retag(_1.1)` agrees under Stage-1 Trusted: Stage-1 Trusted's `Retag` of a
+  place whose type is known and is neither a reference nor a raw pointer is a
+  no-op step (`evalStmt_retag_scalar_noop`; only a place of unknown type still
+  requires a pointer, `evalStmt_retag_scalar_ub`), and MiniRust's
+  `Statement::Validate` loads the `u32`, retags it as the identity (`retag_val`
+  on `Value::Int`), and stores it back, so both return `99`
+  (`paddedRetagRead_stage1_parity`). Projected `Retag` nevertheless stays
+  outside `statementOk`: this per-statement agreement is not yet a lockstep
+  simulation case. Admitting it needs (i) a MiniRust lemma that `Validate` of a
+  `TupleSpec` integer field is a load followed by a store of the re-encoded
+  loaded integer that preserves the memory relation (MiniRust re-encodes the
+  bytes, Anneal keeps its frame), (ii) a `statementOk` case for projected
+  `Retag` threaded through every per-statement analysis of the fragment
+  (`movesOk`, `tupleInitOk`, `stmtPreservesAddrTaken`, and the pointer-aliasing
+  environment `ptrStmtOk` / `ptrStmtStep`), and (iii) the matching
+  `step_correspondence` case (and its `inFragmentD` window counterpart) under
+  the borrow-state invariant. -/
 
 /-- `statementOk` rejects every projected `Deinit`. -/
 theorem statementOk_deinit_proj (decls : List LocalDecl) (i : Nat) (pe : ProjectionElem)
@@ -13441,18 +13456,43 @@ theorem statementOk_retag_proj (decls : List LocalDecl) (kind : RetagKind) (i : 
     (pe : ProjectionElem) (rest : List ProjectionElem) (span : String) (layouts : LayoutTable) :
     statementOk decls ⟨.retag kind ⟨i, pe :: rest⟩, span⟩ layouts = false := rfl
 
-/-- Anneal's `Retag` of any place that evaluates to a scalar faults. Every
-projected place of the fragment holds a scalar (a tuple/struct or `(Int, bool)`
-scalar field, an array element, or an integer pointee `*_p`), whereas MiniRust's
-`Statement::Validate` of an integer place stores back the integer it loaded
-(`retagVal_int_id`), so no projected `Retag` can be simulated in lockstep. -/
+/-- Stage-1 Anneal's `Retag` of a place of unknown type (`placeTy = none`, e.g.
+an undeclared local) that evaluates to a scalar faults: without a type, Stage-1
+Trusted requires the retagged value to be a pointer. On typed non-pointer places
+the retag is a no-op (`evalStmt_retag_scalar_noop`). -/
 theorem evalStmt_retag_scalar_ub (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (k : RetagKind) (place : Place) (span : String)
     (sc : ScalarInt) (L : List LocalSlot)
     (h : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
-      s.memory.callerLocals decls = .ok (.scalar sc) L) :
+      s.memory.callerLocals decls = .ok (.scalar sc) L)
+    (hUntyped : placeTy decls layouts place = none) :
     evalStmt s ⟨.retag k place, span⟩ decls layouts = MirStepNode.fail .ub := by
-  simp [evalStmt, h]
+  simp [evalStmt, h, hUntyped]
+
+/-- **Stage-1 scalar `Retag` is a no-op (`evalStmt_retag_scalar_noop`)**: Stage-1
+Anneal's `Retag` (of any kind) of a place whose type is known and is neither a
+reference nor a raw pointer — every projected place of the fragment holds such a
+scalar: a tuple/struct or `(Int, bool)` scalar field, an array element, or an
+integer pointee `*_p` — that evaluates to a scalar steps to the next statement
+with the frame its read leaves and the memory unchanged, exactly as MiniRust's
+`Statement::Validate` of an integer place stores back the integer it loaded
+(`retagVal_int_id`). -/
+theorem evalStmt_retag_scalar_noop (s : MachineState) (decls : List LocalDecl)
+    (layouts : LayoutTable) (k : RetagKind) (place : Place) (span : String)
+    (sc : ScalarInt) (L : List LocalSlot) {ty : Ty}
+    (h : evalOperand s.frame.locals (.copy place) s.memory.borrows s.memory.globals layouts
+      s.memory.callerLocals decls = .ok (.scalar sc) L)
+    (hTy : placeTy decls layouts place = some ty)
+    (hNotPtr : ∀ m inner, ty.kind ≠ .ref m inner ∧ ty.kind ≠ .rawPtr m inner) :
+    evalStmt s ⟨.retag k place, span⟩ decls layouts = MirStepNode.step (advanceStmt s L) := by
+  simp only [evalStmt, h]
+  split
+  · rename_i m inner l heq
+    rw [hTy] at heq; cases heq; exact absurd rfl (hNotPtr m inner).2
+  · rename_i m pointee l heq
+    rw [hTy] at heq; cases heq; exact absurd rfl (hNotPtr m pointee).1
+  · rename_i heq; rw [hTy] at heq; nomatch heq
+  · rfl
 
 /-- Anneal's `Deinit` of a projected place whose root is initialized and whose
 projected value is readable keeps every slot (it steps to the next statement
@@ -13618,11 +13658,22 @@ def paddedRetagReadMInit : Mach :=
   machineWithCtx ctxPadded2 paddedRetagRead paddedRetagReadFn paddedRetagReadS0.frame.locals
     paddedRetagReadFn.start
 
-/-- Anneal's `Retag(_1.1)` faults: the `u32` field is not a pointer (computed
-by the kernel). -/
-theorem paddedRetagRead_anneal_ub :
-    ∃ tr u, Reaches (mirTree paddedRetagRead paddedRetagReadS0) tr u ∧ FaultNow u :=
-  faultsA_sound paddedRetagRead 2 _ (by decide)
+/-- Stage-1 Anneal's `Retag(_1.1)` of the `u32` field of the initial state is a
+no-op step: the field reads `99` and its declared type `u32` is neither a
+reference nor a raw pointer (`evalStmt_retag_scalar_noop`). -/
+theorem paddedRetagRead_retag_noop :
+    evalStmt paddedRetagReadS0 (mkStmt (.retag .default (placeField 1 [(1, u32Ty)])))
+        paddedRetagRead.localDecls paddedRetagRead.layouts =
+      MirStepNode.step (advanceStmt paddedRetagReadS0 paddedRetagReadS0.frame.locals) :=
+  evalStmt_retag_scalar_noop _ _ _ _ _ _ ⟨99, 4⟩ _ (ty := u32Ty) rfl rfl
+    (fun m inner => ⟨fun h => (by cases h), fun h => (by cases h)⟩)
+
+/-- **Stage-1 Anneal's `Retag(_1.1)` is a no-op (`paddedRetagRead_anneal_noop`)**:
+the function returns the field `99` (computed by the kernel). -/
+theorem paddedRetagRead_anneal_noop :
+    ReachesRet (mirCallTree paddedRetagRead paddedDeinitReadArgs) []
+      (.normal (.scalar ⟨99, 4⟩, paddedRetagReadS0.memory)) :=
+  runA_sound paddedRetagRead 10 _ _ _ rfl
 
 /-- MiniRust's `retag_val` is the identity on `Value::Int`
 ("(Value::Int(..) | Value::Bool(..) | Value::Union(..), _) => val"), so
@@ -13645,6 +13696,15 @@ def paddedRetagReadMiniRustRet : Bool :=
 elaborator does not unfold, so the check runs in the kernel). -/
 theorem paddedRetagRead_minirust_ret : paddedRetagReadMiniRustRet = true := by
   decide +kernel
+
+/-- **Stage-1 `paddedRetagRead` parity (`paddedRetagRead_stage1_parity`)**: Stage-1
+Anneal and MiniRust agree on the projected `Retag(_1.1)` of a `u32` field — both
+return `99` (`paddedRetagRead_anneal_noop`, `paddedRetagRead_minirust_ret`). -/
+theorem paddedRetagRead_stage1_parity :
+    ReachesRet (mirCallTree paddedRetagRead paddedDeinitReadArgs) []
+        (.normal (.scalar ⟨99, 4⟩, paddedRetagReadS0.memory)) ∧
+      paddedRetagReadMiniRustRet = true :=
+  ⟨paddedRetagRead_anneal_noop, paddedRetagRead_minirust_ret⟩
 
 /-! ### Projected `Deinit`, sibling read, and re-initialization (`paddedDeinitSiblingReinit`)
 
@@ -13961,12 +14021,13 @@ theorem paddedDeinitRead_not_inFragmentD :
   decide
 
 /-- Negative control for projected `Retag`: `inFragmentD` erases only projected `Deinit`s, so
-`paddedRetagRead` (`Retag(_1.1)` on a `u32` field, where Anneal faults while MiniRust's `Validate`
-succeeds and returns `99`: `paddedRetagRead_anneal_ub`, `paddedRetagRead_minirust_ret`) is its own
-erasure, passes the (vacuous) window check, and is still rejected through `statementOk_retag_proj`.
-A `TupleSpec` has only integer leaves, so every projected `Retag` of a `TupleSpec` place is such a
-scalar `Retag`; admitting projected `Retag` needs Anneal's scalar `Retag` to agree with MiniRust's
-`Validate`, which is the identity on integers (`retagVal_int_id`). -/
+`paddedRetagRead` (`Retag(_1.1)` on a `u32` field, on which Stage-1 Anneal and MiniRust agree —
+both return `99`: `paddedRetagRead_stage1_parity`) is its own erasure, passes the (vacuous) window
+check, and is still rejected through `statementOk_retag_proj`. A `TupleSpec` has only integer
+leaves, so every projected `Retag` of a `TupleSpec` place is such a scalar `Retag`, on which
+Stage-1 Anneal's no-op (`evalStmt_retag_scalar_noop`) agrees with MiniRust's `Validate`, the
+identity on integers (`retagVal_int_id`); what admission still needs is the lockstep simulation
+case described above `statementOk_deinit_proj`. -/
 theorem paddedRetagRead_not_inFragmentD :
     eraseDeinit paddedRetagRead = paddedRetagRead ∧
       inFragment (eraseDeinit paddedRetagRead) = false ∧

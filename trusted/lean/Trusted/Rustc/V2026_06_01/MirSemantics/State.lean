@@ -104,23 +104,88 @@ structure StackFrame : Type where
 /--
 Tree Borrows permission state for a reference or raw-pointer provenance tag.
 
-Constructors `.active`, `.reserved`, `.frozen`, and `.disabled` model the four
-permission states of the Tree Borrows aliasing discipline for references (`&T`,
-`&mut T`) and raw borrows (`&raw const`, `&raw mut`):
-- `.active` (`PermissionUnprot::Unique`) and `.reserved`
-  (`PermissionUnprot::Reserved` / `ReservedIm`) permit both reads and writes
-  through the tag;
-- `.frozen` (`PermissionUnprot::Frozen`) permits reads and rejects writes as
-  undefined behavior; and
-- `.disabled` (`PermissionUnprot::Disabled`) rejects both reads and writes as
-  undefined behavior.
+The six constructors are exactly the six activation states of Miri's Tree
+Borrows `PermissionPriv` (and MiniRust's `PermissionUnprot`), so a tag's state
+here is in one-to-one correspondence with Miri's per-location permission:
+- `.cell` (`Cell`) is a shared reference to interior-mutable data
+  (`&UnsafeCell<T>`). It is isolated: every child or foreign read or write
+  leaves it `.cell`, and no access through it is undefined behavior.
+- `.reservedFrz conflicted` (`ReservedFrz { conflicted }`) is a mutable
+  reference that has not been written through yet, created for `Freeze`
+  pointees and for every function-entry-protected mutable reference. A
+  foreign read while protected sets `conflicted := true`; a child write while
+  protected and conflicted is undefined behavior; any other child write
+  activates it to `.unique`; a foreign write disables it.
+- `.reservedIM` (`ReservedIM`) is a mutable reference that has not been
+  written through yet, created for unprotected `!Freeze` pointees. Unlike
+  `.reservedFrz`, it tolerates foreign writes; a child write activates it to
+  `.unique`. Miri never creates it under a protector.
+- `.unique` (`Unique`, formerly called `Active`) is an activated mutable
+  reference. A foreign read freezes it (or disables it while protected, which
+  is undefined behavior); a foreign write disables it.
+- `.frozen` (`Frozen`) permits reads and rejects child writes as undefined
+  behavior; a foreign write disables it.
+- `.disabled` (`Disabled`) rejects every child access as undefined behavior.
+
+`.cell` and `.reservedIM` are distinct states even though both tolerate
+foreign writes: `.reservedIM` becomes `.unique` on its first child write and
+then follows `.unique → .frozen → .disabled`, whereas `.cell` never changes.
+Encoding `.cell` as `.frozen` plus an interior-mutability flag would conflate
+these behaviors.
 
 Modeling choice vs. stable Rust Reference: The stable Rust Reference specifies
 that breaking pointer aliasing rules or mutating immutable bytes is undefined
 behavior, but does not mandate a single operational aliasing automaton. Anneal
 models pointer aliasing operationally using Tree Borrows (Villani et al., PLDI
 2025), matching Miri's `-Zmiri-tree-borrows` implementation (`perms.rs`,
-`tree.rs`) and MiniRust's `spec/mem/tree_borrows/` state machine.
+`tree.rs`) and MiniRust's `spec/mem/tree_borrows/` state machine. The transition
+function over these states is `treeBorrowPermTransition` in `Places.lean`.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L10-L53>
+
+> "enum PermissionPriv {
+>     /// represents: a shared reference to interior mutable data.
+>     /// allows: all foreign and child accesses;
+>     /// rejects: nothing
+>     Cell,
+>     /// represents: a local mutable reference that has not yet been written to;
+>     /// allows: child reads, foreign reads;
+>     /// affected by: child writes (becomes Unique),
+>     /// rejects: foreign writes (Disabled).
+>     ///
+>     /// `ReservedFrz` is mostly for types that are `Freeze` (no interior mutability).
+>     /// If the type has interior mutability, see `ReservedIM` instead.
+>     /// (Note: since the discovery of `tests/fail/tree_borrows/reservedim_spurious_write.rs`,
+>     /// we also use `ReservedFreeze` for mutable references that were retagged with a protector
+>     /// independently of interior mutability)
+>     ///
+>     /// special case: behaves differently when protected, which is where `conflicted`
+>     /// is relevant
+>     /// - `conflicted` is set on foreign reads,
+>     /// - `conflicted` must not be set on child writes (there is UB otherwise).
+>     ...
+>     ReservedFrz { conflicted: bool },
+>     /// Alternative version of `ReservedFrz` made for types with interior mutability.
+>     /// allows: child reads, foreign reads, foreign writes (extra);
+>     /// affected by: child writes (becomes Unique);
+>     /// rejects: nothing.
+>     ReservedIM,
+>     /// represents: a unique pointer;
+>     /// allows: child reads, child writes;
+>     /// rejects: foreign reads (Frozen), foreign writes (Disabled).
+>     Unique,
+>     /// represents: a shared pointer;
+>     /// allows: all read accesses;
+>     /// rejects child writes (UB), foreign writes (Disabled).
+>     Frozen,
+>     /// represents: a dead pointer;
+>     /// allows: all foreign accesses;
+>     /// rejects: all child accesses (UB).
+>     Disabled,
+> }"
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -166,14 +231,38 @@ Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
 <https://doi.org/10.1145/3729338>
 -/
 inductive TreeBorrowPerm : Type where
-  /-- Mutable borrow with active read/write permission (`Active`). -/
-  | active : TreeBorrowPerm
-  /-- Mutable borrow in reserved state prior to first write (`Reserved`). -/
-  | reserved : TreeBorrowPerm
+  /-- Shared reference to interior-mutable data; isolated (`Cell`). -/
+  | cell : TreeBorrowPerm
+  /-- Unwritten mutable reference for `Freeze` or protected pointees, with the
+      protector-conflict latch `conflicted` (`ReservedFrz { conflicted }`). -/
+  | reservedFrz (conflicted : Bool) : TreeBorrowPerm
+  /-- Unwritten, unprotected mutable reference to `!Freeze` data
+      (`ReservedIM`). -/
+  | reservedIM : TreeBorrowPerm
+  /-- Activated (written-through) mutable reference (`Unique`). -/
+  | unique : TreeBorrowPerm
   /-- Shared or immutable borrow with read-only permission (`Frozen`). -/
   | frozen : TreeBorrowPerm
-  /-- Invalidated borrow tag; any access is undefined behavior (`Disabled`). -/
+  /-- Invalidated borrow tag; any child access is undefined behavior
+      (`Disabled`). -/
   | disabled : TreeBorrowPerm
+
+/--
+Legacy name for `TreeBorrowPerm.unique`, retained so that earlier proofs and
+specifications that mention an activated borrow as `.active` keep their
+meaning. It is a pattern-matchable abbreviation, not a seventh state.
+-/
+@[match_pattern, reducible]
+def TreeBorrowPerm.active : TreeBorrowPerm := .unique
+
+/--
+Legacy name for the unconflicted `Freeze` reservation
+`TreeBorrowPerm.reservedFrz false`, retained so that earlier proofs and
+specifications that mention a fresh mutable reborrow as `.reserved` keep their
+meaning. It is a pattern-matchable abbreviation, not a seventh state.
+-/
+@[match_pattern, reducible]
+def TreeBorrowPerm.reserved : TreeBorrowPerm := .reservedFrz false
 
 /--
 0-based local variable index alias for borrow-table target references.

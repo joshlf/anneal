@@ -47,6 +47,15 @@ name = "MiniRustSpec"
 srcDir = "../minirust/lean"
 
 [[lean_lib]]
+name = "Miri"
+srcDir = "../lean-miri/vendor"
+roots = ["Miri"]
+
+[[lean_lib]]
+name = "LeanMiriSpec"
+srcDir = "../lean-miri/lean"
+
+[[lean_lib]]
 name = "AnnealMirCore"
 srcDir = "../theory"
 roots = [

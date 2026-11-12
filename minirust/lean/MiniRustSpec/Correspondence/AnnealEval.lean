@@ -3110,7 +3110,8 @@ theorem validateLoadedValue_deref_of_ptrPointeeOf {layouts : Layout.LayoutTable}
   exact ⟨validateLoadedValue_of_not_bool hnb, validateLoadedValue_of_not_bool hnb⟩
 
 /-- `Rvalue.use` on any operand (including a dereferencing read `copy (*_p)…`
-or `move (*_p)…`) whose loaded value passes `validateLoadedValue` and whose
+or `move (*_p)…`) whose loaded value passes `validateLoadedValue`, whose
+Tree Borrows read UB check (`derefReadTreeUB`) is `false`, and whose
 read freezes no borrows (`freezeDerefReadBorrowsAt ... = mem.borrows`) returns
 `v` and `locals'` with `mem` unchanged. When the read may freeze foreign
 `.active` borrows, use the exact characterization `evalRvalue_use_deref`. -/
@@ -3119,9 +3120,13 @@ theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
     {v : Value} {locals' : List LocalSlot}
     (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls = .ok v locals')
     (hval : MirSemantics.validateLoadedValue layouts decls op v = true)
+    (hdub : ∀ ptrLoc restProj,
+      (op = .copy ⟨ptrLoc, .deref :: restProj⟩ ∨ op = .move ⟨ptrLoc, .deref :: restProj⟩) →
+      MirSemantics.derefReadTreeUB locals ptrLoc restProj mem.borrows mem.activeProtectors = false)
     (hfr : ∀ ptrLoc restProj,
       (op = .copy ⟨ptrLoc, .deref :: restProj⟩ ∨ op = .move ⟨ptrLoc, .deref :: restProj⟩) →
-      MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj mem.borrows = mem.borrows) :
+      MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj mem.borrows
+        mem.activeProtectors = mem.borrows) :
     evalRvalue locals (.use op) mem decls layouts = .ok v locals' mem := by
   match op, hop, hval with
   | .constant c, hop, _ => simp [evalRvalue, hop]
@@ -3134,11 +3139,15 @@ theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
     | nil => rfl
     | cons e rest =>
       cases e <;> try rfl
-      have hf := hfr j rest (.inl rfl)
       obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
         activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ := mem
-      dsimp only at hf
-      rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩ <;> simp [hf]
+      rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
+      · rfl
+      · rfl
+      · have hd := hdub j rest (.inl rfl)
+        have hf := hfr j rest (.inl rfl)
+        dsimp only at hd hf
+        simp [hd, hf]
   | .move ⟨j, projs⟩, hop, hval =>
     rw [evalRvalue, hop]
     dsimp only
@@ -3148,11 +3157,15 @@ theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
     | nil => rfl
     | cons e rest =>
       cases e <;> try rfl
-      have hf := hfr j rest (.inr rfl)
       obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
         activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ := mem
-      dsimp only at hf
-      rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩ <;> simp [hf]
+      rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
+      · rfl
+      · rfl
+      · have hd := hdub j rest (.inr rfl)
+        have hf := hfr j rest (.inr rfl)
+        dsimp only at hd hf
+        simp [hd, hf]
 
 /-- `Rvalue.wrapUnsafeBinder op ty` evaluates identically to `Rvalue.use op`. -/
 theorem evalRvalue_wrapUnsafeBinder_eq_use (locals : List LocalSlot) (op : Operand)
@@ -3257,16 +3270,17 @@ theorem FreezeOrSelf.lookupBorrow_map {f : BorrowEntry → BorrowEntry} (hf : Fr
     · exact ih
     · rfl
 
-/-- `updateBorrowPermOnReadAtProj` leaves an entry unchanged or freezes an
-`.active` entry. -/
+/-- `updateBorrowPermOnReadAtProj` with no active protectors leaves an entry
+unchanged or freezes an `.active` entry. -/
 theorem updateBorrowPermOnReadAtProj_freezeOrSelf (all : List BorrowEntry) (t : Nat)
     (r : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
     FreezeOrSelf (fun e => MirSemantics.updateBorrowPermOnReadAtProj all e t r proj off len) := by
   intro e
   dsimp only
   unfold MirSemantics.updateBorrowPermOnReadAtProj
-  dsimp only
-  cases e.perm <;> dsimp only <;> (repeat' split) <;>
+  simp only [MirSemantics.isBorrowProtected_nil]
+  rcases e with ⟨tag, tl, tp, perm, ro, rl, prot, pt⟩
+  cases perm <;> dsimp only <;> (repeat' split) <;>
     first | exact .inl rfl | exact .inr ⟨rfl, rfl⟩ | contradiction
 
 /-- A read at another local leaves an entry unchanged. -/
@@ -3348,15 +3362,17 @@ theorem isBorrowDescendantOrSelf_self (bs : List BorrowEntry) (t : Nat) :
   isBorrowDescendantOrSelfAux_self _ _ _
 
 theorem freezeDerefReadBorrowsAt_nil (locals : List LocalSlot) (ptrLoc : Nat)
-    (restProj : List ProjectionElem) :
-    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [] = [] := by
-  obtain ⟨f, _, h⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj []
-  rw [h, List.map_nil]
+    (restProj : List ProjectionElem) (activeProtectors : List Nat := .nil) :
+    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [] activeProtectors = [] := by
+  unfold MirSemantics.freezeDerefReadBorrowsAt
+  split
+  · simp [lookupBorrow]
+  · rfl
 
 /-- A single borrow entry is never foreign to a read through its own tag. -/
 theorem freezeDerefReadBorrowsAt_singleton (locals : List LocalSlot) (ptrLoc : Nat)
-    (restProj : List ProjectionElem) (b : BorrowEntry) :
-    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [b] = [b] := by
+    (restProj : List ProjectionElem) (b : BorrowEntry) (activeProtectors : List Nat := .nil) :
+    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [b] activeProtectors = [b] := by
   unfold MirSemantics.freezeDerefReadBorrowsAt
   split
   · rename_i ptrVal _ _
@@ -3370,6 +3386,75 @@ theorem freezeDerefReadBorrowsAt_singleton (locals : List LocalSlot) (ptrLoc : N
       split <;> rfl
   · rfl
 
+/-- When no protectors are active, a read through `rTag` raises no
+`borrowEntryReadUB` on `entry` (returns `false`) provided `entry` is
+non-`.disabled` whenever `rTag` descends from (or equals) `entry.tag`. -/
+theorem borrowEntryReadUB_nil_protectors (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry) (targetLocal rTag : Nat) (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (hlive : MirSemantics.isBorrowDescendantOrSelf allBorrows rTag entry.tag = true →
+      entry.perm ≠ .disabled) :
+    MirSemantics.borrowEntryReadUB allBorrows [] entry targetLocal (.some rTag)
+      readProj readRangeOff readRangeLen = false := by
+  unfold MirSemantics.borrowEntryReadUB
+  dsimp only
+  simp only [MirSemantics.isBorrowProtected_nil]
+  rcases entry with ⟨_, _, _, perm, _, _, _, _⟩
+  cases Nat.beq _ targetLocal
+  · rfl
+  · dsimp only
+    cases MirSemantics.borrowEntryOverlapsWrite _ readProj readRangeOff readRangeLen
+    · rfl
+    · dsimp only
+      cases hd : MirSemantics.isBorrowDescendantOrSelf allBorrows rTag _
+      · cases perm <;> rfl
+      · have hnd := hlive hd
+        cases perm <;> first | exact absurd rfl hnd | rfl
+
+/-- `hasTreeReadUB` returns `false` when `activeProtectors = []` and every
+ancestor-or-self entry of `rTag` in `borrows` is non-`.disabled`. -/
+theorem hasTreeReadUB_false_of_ancestors_live (allBorrows borrows : List BorrowEntry)
+    (targetLocal rTag : Nat) (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (hlive : ∀ e ∈ borrows, MirSemantics.isBorrowDescendantOrSelf allBorrows rTag e.tag = true →
+      e.perm ≠ .disabled) :
+    MirSemantics.hasTreeReadUB allBorrows borrows [] targetLocal (.some rTag)
+      readProj readRangeOff readRangeLen = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    unfold MirSemantics.hasTreeReadUB
+    rw [borrowEntryReadUB_nil_protectors allBorrows entry targetLocal rTag readProj
+      readRangeOff readRangeLen (hlive entry (.head _))]
+    exact ih (fun e he => hlive e (.tail _ he))
+
+/-- `derefReadTreeUB` returns `false` when `activeProtectors = []` and every
+ancestor-or-self borrow entry of the pointer's tag is non-`.disabled`. -/
+theorem derefReadTreeUB_false_of_ancestors_live (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) (borrows : List BorrowEntry)
+    (hlive : ∀ ptrVal sz, locals[ptrLoc]? = some (.init (.ptr ptrVal sz)) →
+      ∀ anc ∈ borrows, MirSemantics.isBorrowDescendantOrSelf borrows ptrVal.tag anc.tag = true →
+        anc.perm ≠ .disabled) :
+    MirSemantics.derefReadTreeUB locals ptrLoc restProj borrows [] = false := by
+  unfold MirSemantics.derefReadTreeUB
+  simp only [get?]
+  cases hloc : locals[ptrLoc]? with
+  | none => rfl
+  | some slot =>
+    cases slot with
+    | uninit | dead => rfl
+    | init val =>
+      cases val with
+      | ptr ptrVal sz =>
+        dsimp only
+        cases lookupBorrow borrows ptrVal.tag with
+        | none => rfl
+        | some readerEntry =>
+          exact hasTreeReadUB_false_of_ancestors_live borrows borrows readerEntry.targetLocal
+            ptrVal.tag (MirSemantics.appendProjections readerEntry.targetProjection restProj)
+            readerEntry.rangeOffset readerEntry.rangeLen (hlive ptrVal sz hloc)
+      | unit | scalar _ | aggregate _ _ => rfl
+
 /-- `validateLoadedValue` reads only the operand's place type, which `copy` and
 `move` share. -/
 theorem validateLoadedValue_move_eq_copy (layouts : Layout.LayoutTable)
@@ -3378,19 +3463,23 @@ theorem validateLoadedValue_move_eq_copy (layouts : Layout.LayoutTable)
       MirSemantics.validateLoadedValue layouts decls (.copy pl) v := rfl
 
 /-- Exact characterization of a dereference read `Use(copy (*_p).rest)` or
-`Use(move (*_p).rest)`: after typed-load validation, Anneal returns the loaded
-value and the post-read slots, and updates the borrow table by the Tree Borrows
-foreign-read freeze `freezeDerefReadBorrowsAt` (the identity on tables with fewer
-than two entries, `freezeDerefReadBorrowsAt_nil`/`_singleton`). -/
+`Use(move (*_p).rest)`: after typed-load validation and assuming no Tree Borrows
+read UB (`derefReadTreeUB ... = false`), Anneal returns the loaded value and the
+post-read slots, and updates the borrow table by the Tree Borrows foreign-read
+freeze `freezeDerefReadBorrowsAt` (the identity on tables with fewer than two
+entries, `freezeDerefReadBorrowsAt_nil`/`_singleton`). -/
 theorem evalRvalue_use_deref {locals : List LocalSlot} {op : Operand} {p : Nat}
     {rest : List ProjectionElem}
     (hform : op = .copy ⟨p, .deref :: rest⟩ ∨ op = .move ⟨p, .deref :: rest⟩)
     {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     {v : Value} {locals' : List LocalSlot}
     (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls = .ok v locals')
-    (hval : MirSemantics.validateLoadedValue layouts decls op v = true) :
+    (hval : MirSemantics.validateLoadedValue layouts decls op v = true)
+    (hdub : MirSemantics.derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
     evalRvalue locals (.use op) mem decls layouts =
-      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+      .ok v locals' { mem with
+        borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows
+          mem.activeProtectors } := by
   rcases hform with rfl | rfl <;>
   · rw [evalRvalue, hop]
     dsimp only
@@ -3398,28 +3487,33 @@ theorem evalRvalue_use_deref {locals : List LocalSlot} {op : Operand} {p : Nat}
     dsimp only
     obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
       activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ := mem
+    dsimp only at hdub
     rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
-    · rw [freezeDerefReadBorrowsAt_nil]
-    · rw [freezeDerefReadBorrowsAt_singleton]
-    · rfl
+    · rw [freezeDerefReadBorrowsAt_nil locals p rest activeProtectors]
+    · rw [freezeDerefReadBorrowsAt_singleton locals p rest b1 activeProtectors]
+    · dsimp only; rw [hdub]
 
 /-- `CopyForDeref((*_p).rest)` (no typed-load validation) returns the loaded value
-and updates the borrow table by `freezeDerefReadBorrowsAt`. -/
+and updates the borrow table by `freezeDerefReadBorrowsAt` when `derefReadTreeUB = false`. -/
 theorem evalRvalue_copyForDeref_deref {locals : List LocalSlot} {p : Nat}
     {rest : List ProjectionElem} {mem : MirSemantics.Memory} {decls : List LocalDecl}
     {layouts : Layout.LayoutTable} {v : Value} {locals' : List LocalSlot}
     (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
-      mem.callerLocals decls = .ok v locals') :
+      mem.callerLocals decls = .ok v locals')
+    (hdub : MirSemantics.derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
     evalRvalue locals (.copyForDeref ⟨p, .deref :: rest⟩) mem decls layouts =
-      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+      .ok v locals' { mem with
+        borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows
+          mem.activeProtectors } := by
   rw [evalRvalue, hop]
   dsimp only
   obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
     activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ := mem
+  dsimp only at hdub
   rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
-  · rw [freezeDerefReadBorrowsAt_nil]
-  · rw [freezeDerefReadBorrowsAt_singleton]
-  · rfl
+  · rw [freezeDerefReadBorrowsAt_nil locals p rest activeProtectors]
+  · rw [freezeDerefReadBorrowsAt_singleton locals p rest b1 activeProtectors]
+  · dsimp only; rw [hdub]
 
 /-- `CopyForDeref(pl)` of a place that does not start with a dereference returns
 the loaded value with `mem` unchanged. -/
@@ -3464,21 +3558,23 @@ theorem copyRv_eq_use_copy_deref {rv : Rvalue} {p : Nat} {rest : List Projection
 (`Use(copy …)`, `Use(move …)`, or `CopyForDeref(…)`) returns the value loaded by
 `copy (*_p).rest` and freezes foreign `.active` borrows overlapping the read
 (`freezeDerefReadBorrowsAt`), provided the loaded value passes typed-load
-validation (`validateLoadedValue_deref_of_ptrPointeeOf` discharges it for integer
-pointees). -/
+validation and `derefReadTreeUB = false`. -/
 theorem evalRvalue_derefRead_freeze {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
     {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
     {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     {v : Value} {locals' : List LocalSlot}
     (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
       mem.callerLocals decls = .ok v locals')
-    (hval : MirSemantics.validateLoadedValue layouts decls (.copy ⟨p, .deref :: rest⟩) v = true) :
+    (hval : MirSemantics.validateLoadedValue layouts decls (.copy ⟨p, .deref :: rest⟩) v = true)
+    (hdub : MirSemantics.derefReadTreeUB locals p rest mem.borrows mem.activeProtectors = false) :
     evalRvalue locals rv mem decls layouts =
-      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+      .ok v locals' { mem with
+        borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows
+          mem.activeProtectors } := by
   rcases copyRv_eq_use_copy_deref hcrv with rfl | rfl | rfl
-  · exact evalRvalue_use_deref (.inl rfl) hop hval
-  · exact evalRvalue_use_deref (.inr rfl) hop hval
-  · exact evalRvalue_copyForDeref_deref hop
+  · exact evalRvalue_use_deref (.inl rfl) hop hval hdub
+  · exact evalRvalue_use_deref (.inr rfl) hop hval hdub
+  · exact evalRvalue_copyForDeref_deref hop hdub
 
 /-- A dereference read (any `copyRv` form of `Use(copy (*_p).rest)`) is UB when
 evaluating `copy (*_p).rest` is UB (named apart from Episode 2's
@@ -8246,17 +8342,15 @@ theorem updateBorrowPermAtProj_preserves_fields (e : BorrowEntry) (t : Nat) (w :
     (MirSemantics.updateBorrowPermAtProj e t w proj off len).protector = e.protector ∧
     (MirSemantics.updateBorrowPermAtProj e t w proj off len).parentTag = e.parentTag := by
   unfold MirSemantics.updateBorrowPermAtProj
-  cases Nat.beq e.targetLocal t <;> dsimp only
+  cases Nat.beq e.targetLocal t
   · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-  · cases w <;> dsimp only
-    · cases MirSemantics.borrowEntryOverlapsWrite e proj off len <;> dsimp only
+  · dsimp only
+    cases MirSemantics.treeBorrowWriterRelatedness e w
+    · exact MirSemantics.applyTreeBorrowTransition_fields e _
+    · dsimp only
+      cases MirSemantics.borrowEntryOverlapsWrite e proj off len
       · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-      · cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-    · rename_i tag
-      cases Nat.beq e.tag tag <;> dsimp only
-      · cases MirSemantics.borrowEntryOverlapsWrite e proj off len <;>
-          exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-      · cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      · exact MirSemantics.applyTreeBorrowTransition_fields e _
 
 theorem updateBorrowPermTreeAtProj_fields (all : List BorrowEntry) (e : BorrowEntry)
     (t : Nat) (w : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
@@ -8285,13 +8379,20 @@ theorem updateBorrowPermTreeAtProj_of_descendant (all : List BorrowEntry) {e : B
     MirSemantics.updateBorrowPermTreeAtProj all e t (some wTag) proj off len =
       (if Nat.beq e.targetLocal t then
         match e.perm with
-        | .reserved => { e with perm := .active }
+        | .reservedFrz _ => { e with perm := .active }
+        | .reservedIM => { e with perm := .active }
         | _ => e
       else e) := by
   unfold MirSemantics.updateBorrowPermTreeAtProj MirSemantics.resolveTreeBorrowWriterTag
-    MirSemantics.updateBorrowPermAtProj
+    MirSemantics.updateBorrowPermAtProj MirSemantics.treeBorrowWriterRelatedness
   simp only [h, Nat.beq_refl]
-  cases Nat.beq e.targetLocal t <;> rfl
+  cases Nat.beq e.targetLocal t
+  · simp only [Bool.false_eq_true, ↓reduceIte]
+  · simp only [↓reduceIte]
+    rcases e with ⟨_, _, _, perm, _, _, _, _⟩
+    cases perm with
+    | reservedFrz conflicted => cases conflicted <;> rfl
+    | _ => rfl
 
 theorem evalRvalue_ptrToPtr_of_rawPtrPointeeOf (locals : List LocalSlot) (p : Nat)
     (targetTy : MirAst.Ty) (mem : MirSemantics.Memory) (decls : List LocalDecl)

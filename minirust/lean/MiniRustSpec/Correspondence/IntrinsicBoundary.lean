@@ -9,6 +9,7 @@ those terms.
 -/
 
 import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.DeinitBridge
 import Trusted.VerificationResult
 
 /-!
@@ -49,6 +50,15 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
 5. `core::hint::unreachable_unchecked()`: Anneal raises UB, like MiniRust's
    `Terminator::Unreachable`; the fragment rejects the call form but covers
    MIR's own `TerminatorKind::Unreachable`.
+
+This module also imports `Correspondence.DeinitBridge` (projected `Deinit`:
+`crates/anneal-mir`'s `PartialShell` model, formalized in
+`Anneal.Mir.AdtAndControl` next to its sub-place `CopyNonOverlapping` model
+`evalCopyNonOverlappingSubplace`, against MiniRust's byte-slice `Uninit`
+store), so that `lake build MiniRustSpec` builds it together with
+`Anneal.Mir.AdtAndControl` (guarding both against drift of the Trusted
+semantics they refine) and `MiniRustSpec.Audit` audits it together with the
+`Anneal.Mir.AdtAndControl` theorems that its `subplace_audit_closure` mentions.
 -/
 
 namespace MiniRustSpec.Correspondence

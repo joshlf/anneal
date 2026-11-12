@@ -75,7 +75,8 @@ pub use miri_diff::{
     KnownAnnealBugSpec, MiriDiffConfig, MiriDiffManifest, MiriDiffReport, MiriDiffTestEntry,
     MiriDiffVerdictSpec, load_miri_diff_manifest, parse_miri_diff_manifest,
     render_miri_diff_crate_verify_module, render_miri_diff_report, render_miri_diff_verify_module,
-    run_miri_diff_suite, stage_miri_diff_workspace, verify_miri_diff_ub_locations,
+    render_miri_diff_verify_module_with_callees, run_miri_diff_suite, stage_miri_diff_workspace,
+    verify_miri_diff_ub_locations,
 };
 pub use miri_oracle::{
     ALLOW_MISSING_MIRI_ENV, AnnealOracleConfig, AnnealOutcome, ComparisonVerdict,
@@ -732,7 +733,7 @@ where
                     .get(i)
                     .ok_or_else(|| "missing value for --local-archive".to_string())?;
                 let trimmed = val.trim();
-                if trimmed.is_empty() {
+                if trimmed.is_empty() || trimmed.starts_with('-') {
                     return Err("missing value for --local-archive".to_string());
                 }
                 local_archive = Some(PathBuf::from(trimmed));
@@ -776,6 +777,9 @@ where
                     return Err(format!(
                         "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', 'vendor-fuchsia', 'correspondence-bugs', 'minirust-sync', or 'generate-external-spec')"
                     ));
+                }
+                if subcommand == Some(CliSubcommand::Setup) {
+                    return Err(format!("unknown setup argument '{other}'"));
                 }
                 extra_cargo_args.push(other.to_string());
                 i += 1;
@@ -3281,6 +3285,57 @@ mod tests {
         let err =
             parse_cli_args(["cargo-anneal", "anneal", "bogus"]).expect_err("must reject bogus");
         assert!(err.contains("unknown subcommand 'bogus'"));
+    }
+
+    #[test]
+    fn cli_setup_and_help_argument_validation() {
+        for prefix in [&["cargo-anneal"][..], &["cargo-anneal", "anneal"]] {
+            for suffix in [
+                &[][..],
+                &["help"],
+                &["-h"],
+                &["--help"],
+                &["setup", "-h"],
+                &["setup", "--help"],
+                &["help", "setup"],
+            ] {
+                let opts = parse_cli_args([prefix, suffix].concat()).expect("help must parse");
+                assert_eq!(opts.subcommand, CliSubcommand::Help);
+            }
+            for suffix in ["-V", "--version", "version"] {
+                let opts = parse_cli_args([prefix, &[suffix]].concat()).expect("version must parse");
+                assert_eq!(opts.subcommand, CliSubcommand::Version);
+            }
+        }
+
+        let setup_default = parse_cli_args(["cargo-anneal", "setup"]).expect("parse setup");
+        assert_eq!(setup_default.subcommand, CliSubcommand::Setup);
+        assert_eq!(setup_default.local_archive, None);
+
+        let setup_local = parse_cli_args([
+            "cargo-anneal",
+            "anneal",
+            "setup",
+            "--local-archive",
+            "/tmp/local archive.tar.zst",
+        ])
+        .expect("parse setup --local-archive");
+        assert_eq!(setup_local.subcommand, CliSubcommand::Setup);
+        assert_eq!(
+            setup_local.local_archive,
+            Some(PathBuf::from("/tmp/local archive.tar.zst"))
+        );
+
+        for malformed in [
+            &["unknown"][..],
+            &["--unknown"],
+            &["setup", "--unknown"],
+            &["setup", "--local-archive"],
+            &["setup", "--local-archive", "--unknown"],
+        ] {
+            parse_cli_args([&["cargo-anneal"], malformed].concat())
+                .expect_err("malformed setup/CLI arguments must fail");
+        }
     }
 
     #[test]

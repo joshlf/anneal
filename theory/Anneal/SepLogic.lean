@@ -578,13 +578,7 @@ private theorem updateBorrowPerm_tag
   unfold updateBorrowPerm
   cases Nat.beq entry.targetLocal targetLocal
   · rfl
-  · cases writerTag with
-    | none => cases entry.perm <;> rfl
-    | some wtag =>
-      dsimp only
-      cases Nat.beq entry.tag wtag
-      · rfl
-      · cases entry.perm <;> rfl
+  · exact (applyTreeBorrowTransition_fields _ _).1
 
 /--
 Looking up `tag` in `invalidateConflictingBorrows borrows targetLocal writerTag`

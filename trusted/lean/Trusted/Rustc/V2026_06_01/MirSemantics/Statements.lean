@@ -835,7 +835,9 @@ def commitCopyDstPlaceWrite
     (dstTargetLocal : LocalIdx)
     (dstTag : Nat)
     (locals₃ : List LocalSlot)
-    (newVal : Value) :
+    (newVal : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
   match
     writePlaceValue
@@ -843,6 +845,8 @@ def commitCopyDstPlaceWrite
       s.memory.borrows
       dstPlace
       newVal
+      localDecls
+      layouts
   with
   | .ok locals₄ =>
     let borrows' :=
@@ -1260,6 +1264,8 @@ def evalCopyUnionBytes
                       dstPtr.tag
                       locals₃
                       decodedVal
+                      localDecls
+                      layouts
                   | .none => MirStepNode.fail .ub
               | .none => MirStepNode.fail .ub
             | _, _, _ => MirStepNode.fail .ub
@@ -1294,6 +1300,8 @@ def evalCopyUnionBytes
                         dstPtr.tag
                         locals₃
                         decodedVal
+                        localDecls
+                        layouts
                     | .none => MirStepNode.fail .ub
                 | .none => MirStepNode.fail .ub
               | _, _ => MirStepNode.fail .ub
@@ -1352,6 +1360,8 @@ def evalCopyUnionBytes
                         dstPtr.tag
                         locals₃
                         decodedVal
+                        localDecls
+                        layouts
                     | .none => MirStepNode.fail .ub
                 | .none =>
                   match spliceBytesToDstArray with
@@ -1363,6 +1373,8 @@ def evalCopyUnionBytes
                       dstPtr.tag
                       locals₃
                       splicedVal
+                      localDecls
+                      layouts
                   | .none => MirStepNode.fail .ub
               | .none =>
                 match spliceBytesToDstArray with
@@ -1374,6 +1386,8 @@ def evalCopyUnionBytes
                     dstPtr.tag
                     locals₃
                     splicedVal
+                    localDecls
+                    layouts
                 | .none => MirStepNode.fail .ub
 
 /--
@@ -1490,6 +1504,8 @@ def evalCopyNonOverlappingPermOk
             dstPtr.tag
             locals₃
             newVal
+            localDecls
+            layouts
         let copyViaBytes
             (srcSubVal dstSubVal : Value) :
             MirStepNode :=
@@ -2374,6 +2390,661 @@ def uninitFieldWriteShell?
   | _ => .none
 
 /--
+Execute a function-entry retag (`RetagKind::FnEntry`) of the reference stored
+in `place`, whose current value is `.ptr ptrVal sz` with live borrow entry
+`parentEntry`, after `evalOperand` produced `locals'`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L276-L287>
+
+> "pub enum RetagKind {
+>     /// The initial retag of arguments when entering a function.
+>     FnEntry,"
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L211-L216>
+
+> "protector: is_protected.then_some(if ref_mutability.is_some() {
+>     // Strong protector for references
+>     ProtectorKind::StrongProtector"
+-/
+def evalFnEntryRetag
+    (s : MachineState)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    MirStepNode :=
+  let protId := s.memory.nextProtector
+  let attachOnly :=
+    MirStepNode.step
+      (advanceStmt
+        s
+        locals'
+        { s.memory with
+          borrows := attachBorrowProtector s.memory.borrows ptrVal.tag protId
+          activeProtectors := protId :: s.memory.activeProtectors
+          nextProtector := Nat.add protId 1 })
+  match placeTy localDecls layouts place with
+  | .none => attachOnly
+  | .some ty =>
+    match ty.kind with
+    | .ref mutability pointee =>
+      match rigidTyIsUninhabited 16 pointee with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let childPerm := fnEntryRetagPerm mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
+          match skipInitRead with
+          | true => false
+          | false =>
+            hasTreeReadUB
+              s.memory.borrows
+              s.memory.borrows
+              s.memory.activeProtectors
+              parentEntry.targetLocal
+              (.some ptrVal.tag)
+              parentEntry.targetProjection
+              parentEntry.rangeOffset
+              parentEntry.rangeLen
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .some protId
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1
+                    activeProtectors := protId :: s.memory.activeProtectors
+                    nextProtector := Nat.add protId 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
+    | _ => attachOnly
+
+/--
+Execute a non-function-entry MIR retag (`RetagKind.default`, `.twoPhase`, or
+`.raw`) on `place`, whose value in `s.frame.locals` is `(.ptr ptrVal sz)` with
+existing non-disabled `parentEntry`.
+
+When `place` resolves in `localDecls` / `layouts` to a reference `&T` or
+`&mut T`, an uninhabited `pointee` (`rigidTyIsUninhabited 16 pointee = true`)
+faults immediately with `MirStepNode.fail .ub`; otherwise Miri's
+`tb_retag_ptr_value` / `tb_reborrow` allocates a fresh
+unprotected child tag under `ptrVal.tag` with `retagPerm retagKind mutability
+pointee`, performs an initial child read through `ptrVal.tag` unless the new
+permission is `.cell` (`Permission::associated_access`) or the pointee is
+zero-sized (`rigidTyIsZeroSized 16 pointee`), and writes the new provenance
+back into `place`. When `place`'s type is unknown or non-reference, falls back
+to advancing without creating a child tag.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L198-L212>
+
+> "let associated_access = perm.associated_access();"
+-/
+def evalNonFnEntryRetag
+    (retagKind : RetagKind)
+    (s : MachineState)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    MirStepNode :=
+  match placeTy localDecls layouts place with
+  | .none => MirStepNode.step (advanceStmt s locals')
+  | .some ty =>
+    match ty.kind with
+    | .ref mutability pointee =>
+      match rigidTyIsUninhabited 16 pointee with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let childPerm := retagPerm retagKind mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
+          match skipInitRead with
+          | true => false
+          | false =>
+            hasTreeReadUB
+              s.memory.borrows
+              s.memory.borrows
+              s.memory.activeProtectors
+              parentEntry.targetLocal
+              (.some ptrVal.tag)
+              parentEntry.targetProjection
+              parentEntry.rangeOffset
+              parentEntry.rangeLen
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .none
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
+    | _ => MirStepNode.step (advanceStmt s locals')
+
+/--
+Truncate a resolved local projection path at the first `.field` projection whose
+container type resolves to a `FieldsShape.union` layout (`isUnionLayout`).
+
+Because all fields of a Rust `union` alias at byte offset `0` (`FieldsShape::Union`),
+a projected write into `_u.f` (or `(s.u).f` inside an outer struct/tuple `s`) is
+conservatively treated as overlapping the entire union sub-place (`[]` for
+`_u.f`, `[.field idxU unionTy]` for `(s.u).f`), invalidating or
+protector-conflicting with borrows of any sibling union field while preserving
+borrows of disjoint outer struct/tuple/array fields.
+
+This is exact for borrows of whole sibling fields of nonzero size (every union
+field starts at offset `0`, so any nonzero-sized write and any nonzero-sized
+sibling field share byte `0`). Zero-sized writes (`placeIsZeroSized`) skip
+union-level projection truncation in `resolveBorrowWriteLocalProj` and
+`resolveDerefBorrowWriteFullProj`, retaining Anneal's untruncated projection
+overlap: sibling union-field borrows are preserved, though (unlike Miri's
+zero-byte access) foreign borrows of the ZST sub-place itself or enclosing
+whole-union `[]` borrows are still invalidated. It also over-approximates
+Miri's byte-range Tree Borrows access when a nonzero-sized written or borrowed
+sub-place covers bytes disjoint from the other (for example a write to `_u.f.g`
+versus a borrow of `_u.f.h`, or a 1-byte write to `_u.a` versus a borrow of
+byte `1` of a wider sibling field), or when a sibling borrow targets a
+zero-sized union field: Anneal then disables, or reports a protector conflict
+on, a borrow that Miri's access leaves untouched.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1649-L1650>
+
+> "/// All fields start at no offset. The `usize` is the field count.
+> Union(NonZeroUsize),"
+-/
+@[reducible]
+def truncateTyProjAtUnion
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (baseTy : Ty) :
+    List ProjectionElem → List ProjectionElem
+  | .nil => .nil
+  | .deref :: rest => .deref :: rest
+  | .field fieldIdx fieldTy :: rest =>
+    let rBase := resolveTyWithLocalDecls localDecls layouts baseTy
+    match isUnionLayout layouts rBase with
+    | true => .nil
+    | false =>
+      let nextTy : Ty :=
+        match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+        | false => fieldTy
+        | true =>
+          match LayoutTable.lookup layouts rBase.layoutIdx with
+          | .some l =>
+            match l.variants with
+            | .single _ =>
+              match get? l.fieldLayouts fieldIdx with
+              | .some flIdx => { fieldTy with layoutIdx := flIdx }
+              | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+            | _ => resolveTyWithLocalDecls localDecls layouts fieldTy
+          | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+      .field fieldIdx fieldTy ::
+        truncateTyProjAtUnion localDecls layouts nextTy rest
+  | .opaqueCast castTy :: rest =>
+    .opaqueCast castTy ::
+      truncateTyProjAtUnion
+        localDecls
+        layouts
+        (resolveTyWithLocalDecls localDecls layouts castTy)
+        rest
+  | .unwrapUnsafeBinder innerTy :: rest =>
+    .unwrapUnsafeBinder innerTy ::
+      truncateTyProjAtUnion
+        localDecls
+        layouts
+        (resolveTyWithLocalDecls localDecls layouts innerTy)
+        rest
+  | .index idxLocal :: rest =>
+    let rBase := resolveTyWithLocalDecls localDecls layouts baseTy
+    match elemTyOf rBase with
+    | .some { kind := ek, .. } =>
+      let elemTy : Ty :=
+        match LayoutTable.lookup layouts rBase.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          { kind := ek, layoutIdx := flIdx }
+        | _ =>
+          resolveTyWithLocalDecls
+            localDecls
+            layouts
+            { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+      .index idxLocal ::
+        truncateTyProjAtUnion localDecls layouts elemTy rest
+    | .none => .index idxLocal :: rest
+  | .constantIndex off minLen fromEnd :: rest =>
+    let rBase := resolveTyWithLocalDecls localDecls layouts baseTy
+    match elemTyOf rBase with
+    | .some { kind := ek, .. } =>
+      let elemTy : Ty :=
+        match LayoutTable.lookup layouts rBase.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          { kind := ek, layoutIdx := flIdx }
+        | _ =>
+          resolveTyWithLocalDecls
+            localDecls
+            layouts
+            { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+      .constantIndex off minLen fromEnd ::
+        truncateTyProjAtUnion localDecls layouts elemTy rest
+    | .none => .constantIndex off minLen fromEnd :: rest
+  | .subslice fromIdx toIdx fromEnd :: rest =>
+    .subslice fromIdx toIdx fromEnd ::
+      truncateTyProjAtUnion localDecls layouts baseTy rest
+  | .downcast variantName variantIdx :: rest =>
+    .downcast variantName variantIdx ::
+      truncateTyProjAtUnion localDecls layouts baseTy rest
+
+/--
+Resolve the effective borrow-invalidation and protector-conflict projection path
+for a non-dereference projected local write `dst = ⟨dstLoc, projs⟩`.
+
+When `placeTouchesUnion localDecls layouts ⟨dstLoc, projs⟩` is `false` (all
+non-union struct/tuple/enum/array writes, or when `localDecls` / `layouts` is
+empty) or `placeIsZeroSized localDecls layouts ⟨dstLoc, projs⟩` is `true` (a
+zero-byte write, which touches no storage bytes), returns the
+dynamic-index-resolved projection path unchanged. Otherwise truncates at the
+enclosing union container via `truncateTyProjAtUnion` so nonzero-sized writes to
+one union field overlap borrows of all sibling union fields.
+
+Frame-local dereferencing writes (`(*p).f = v`, or `*p = v` where `p` borrows a
+union field) apply the same truncation via `resolveDerefBorrowWriteFullProj`,
+`derefWriteUnionProtectorUB`, and `invalidateDerefWriteBorrowsWithLayouts`
+(whereas writes to `callerLocals` carry no caller `LocalDecl` table in `Memory`
+and remain untyped).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def resolveBorrowWriteLocalProj
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (dstLoc : Local)
+    (projs : List ProjectionElem) :
+    List ProjectionElem :=
+  let resolvedLocalProj :=
+    match resolveBorrowProjectionElems locals projs with
+    | .some rp => rp
+    | .none => projs
+  match
+    Bool.and
+      (placeTouchesUnion
+        localDecls
+        layouts
+        { local_ := dstLoc, projection := projs })
+      (Bool.not
+        (placeIsZeroSized
+          localDecls
+          layouts
+          { local_ := dstLoc, projection := projs }))
+  with
+  | false => resolvedLocalProj
+  | true =>
+    match get? localDecls dstLoc with
+    | .some decl =>
+      truncateTyProjAtUnion localDecls layouts decl.ty resolvedLocalProj
+    | .none => resolvedLocalProj
+
+/--
+Non-union identity for `resolveBorrowWriteLocalProj`: whenever
+`placeTouchesUnion localDecls layouts ⟨dstLoc, projs⟩ = false`,
+`resolveBorrowWriteLocalProj` reduces to `resolveBorrowProjectionElems` with
+fallback `projs`.
+-/
+theorem resolveBorrowWriteLocalProj_of_not_union
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (dstLoc : Local)
+    (projs : List ProjectionElem)
+    (hNoUnion :
+      placeTouchesUnion localDecls layouts { local_ := dstLoc, projection := projs } = false) :
+    resolveBorrowWriteLocalProj localDecls layouts locals dstLoc projs =
+      (match resolveBorrowProjectionElems locals projs with
+       | .some rp => rp
+       | .none => projs) := by
+  unfold resolveBorrowWriteLocalProj
+  rw [hNoUnion]
+  rfl
+
+/--
+Zero-sized write identity for `resolveBorrowWriteLocalProj`: whenever
+`placeIsZeroSized localDecls layouts ⟨dstLoc, projs⟩ = true`, a zero-byte write
+does not truncate at an enclosing union container.
+-/
+theorem resolveBorrowWriteLocalProj_of_zst
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (dstLoc : Local)
+    (projs : List ProjectionElem)
+    (hZst :
+      placeIsZeroSized localDecls layouts { local_ := dstLoc, projection := projs } = true) :
+    resolveBorrowWriteLocalProj localDecls layouts locals dstLoc projs =
+      (match resolveBorrowProjectionElems locals projs with
+       | .some rp => rp
+       | .none => projs) := by
+  unfold resolveBorrowWriteLocalProj
+  rw [hZst]
+  cases placeTouchesUnion localDecls layouts { local_ := dstLoc, projection := projs } <;> rfl
+
+/--
+Resolve the effective borrow-invalidation and protector-conflict projection path
+for a frame-local dereferencing write whose resolved target sub-place on
+`targetLocal` is `fullProj` (`resolveDerefWriteFullProj`).
+
+Short-circuits definitionally to `.nil` when `fullProj = .nil`. When `fullProj`
+is non-empty, truncates at the first enclosing `FieldsShape.union` container via
+`truncateTyProjAtUnion` whenever `placeTouchesUnion` is `true` and
+`placeIsZeroSized` is `false`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def resolveDerefBorrowWriteFullProj
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (targetLocal : Local)
+    (fullProj : List ProjectionElem) :
+    List ProjectionElem :=
+  match fullProj with
+  | .nil => .nil
+  | pHead :: pTail =>
+    match
+      Bool.and
+        (placeTouchesUnion
+          localDecls
+          layouts
+          { local_ := targetLocal, projection := pHead :: pTail })
+        (Bool.not
+          (placeIsZeroSized
+            localDecls
+            layouts
+            { local_ := targetLocal, projection := pHead :: pTail }))
+    with
+    | false => pHead :: pTail
+    | true =>
+      match get? localDecls targetLocal with
+      | .some decl =>
+        truncateTyProjAtUnion localDecls layouts decl.ty (pHead :: pTail)
+      | .none => pHead :: pTail
+
+/--
+Test whether a frame-local dereferencing write to `dst` (`dst = ⟨ptrLoc, .deref :: restProj⟩`)
+conflicts with an active function-entry protector after union-container
+truncation (`resolveDerefBorrowWriteFullProj`), catching sibling union-field
+protector conflicts on `(*p).f = val` and `*p = val` (`p = &mut _u.f`).
+Short-circuits definitionally to `false` when `activeProtectors = .nil` or when
+`fullProj = .nil` (already checked by `evalPlaceWrite`).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def derefWriteUnionProtectorUB
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals₁ : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (dst : Place)
+    (restProj : List ProjectionElem) :
+    Bool :=
+  match activeProtectors with
+  | .nil => false
+  | pH :: pT =>
+    let prots := pH :: pT
+    match get? locals₁ dst.local_ with
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          let fullProj :=
+            resolveDerefWriteFullProj locals₁ locals₁ ptrOrFatVal entry restProj
+          match fullProj with
+          | .nil => false
+          | fHead :: fTail =>
+            let effProj :=
+              resolveDerefBorrowWriteFullProj
+                localDecls layouts entry.targetLocal (fHead :: fTail)
+            match borrows with
+            | b₁ :: b₂ :: restBorrows =>
+              let allBorrows := b₁ :: b₂ :: restBorrows
+              hasProtectedTreeWriteConflict
+                allBorrows
+                allBorrows
+                prots
+                entry.targetLocal
+                (.some ptrVal.tag)
+                effProj
+                entry.rangeOffset
+                entry.rangeLen
+            | _ =>
+              hasProtectedWriteConflict
+                borrows
+                prots
+                entry.targetLocal
+                (.some ptrVal.tag)
+                effProj
+                entry.rangeOffset
+                entry.rangeLen
+        | .none => false
+      | .none => false
+    | _ => false
+
+/--
+Layout-aware counterpart of `invalidateDerefWriteBorrows` for frame-local
+dereferencing writes in `evalStmt`: resolves `fullProj` via
+`resolveDerefWriteFullProj`, truncates nonzero-sized union field paths via
+`resolveDerefBorrowWriteFullProj` (`R1`), and updates Tree Borrows permissions
+across `borrows`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def invalidateDerefWriteBorrowsWithLayouts
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals₁ : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (dst : Place)
+    (restProj : List ProjectionElem) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | single :: .nil =>
+    let b := single :: .nil
+    match get? locals₁ dst.local_ with
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow b ptrVal.tag with
+        | .some entry =>
+          let fullProj :=
+            resolveDerefWriteFullProj
+              locals₁
+              locals₁
+              ptrOrFatVal
+              entry
+              restProj
+          let effProj :=
+            resolveDerefBorrowWriteFullProj
+              localDecls
+              layouts
+              entry.targetLocal
+              fullProj
+          match effProj with
+          | .nil =>
+            match Nat.beq entry.rangeLen 0 with
+            | true =>
+              invalidateConflictingBorrows
+                b
+                entry.targetLocal
+                (.some ptrVal.tag)
+            | false =>
+              invalidateConflictingBorrowsAtProj
+                b
+                entry.targetLocal
+                (.some ptrVal.tag)
+                .nil
+                entry.rangeOffset
+                entry.rangeLen
+          | pHead :: pTail =>
+            invalidateConflictingBorrowsAtProj
+              b
+              entry.targetLocal
+              (.some ptrVal.tag)
+              (pHead :: pTail)
+              entry.rangeOffset
+              entry.rangeLen
+        | .none => b
+      | .none => b
+    | _ => b
+  | b₁ :: b₂ :: restBorrows =>
+    let allBorrows := b₁ :: b₂ :: restBorrows
+    match get? locals₁ dst.local_ with
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow allBorrows ptrVal.tag with
+        | .some entry =>
+          let fullProj :=
+            resolveDerefWriteFullProj
+              locals₁
+              locals₁
+              ptrOrFatVal
+              entry
+              restProj
+          let effProj :=
+            resolveDerefBorrowWriteFullProj
+              localDecls
+              layouts
+              entry.targetLocal
+              fullProj
+          invalidateTreeBorrowsAtProj
+            allBorrows
+            allBorrows
+            entry.targetLocal
+            (.some ptrVal.tag)
+            effProj
+            entry.rangeOffset
+            entry.rangeLen
+        | .none => allBorrows
+      | .none => allBorrows
+    | _ => allBorrows
+
+/--
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
 
@@ -2445,91 +3116,155 @@ def evalStmt
         s.memory.callerLocals
         localDecls
     with
-    | .ok ptrOrFatVal locals' =>
-      match extractDerefPtrVal? ptrOrFatVal with
-      | .some ptrVal =>
-        let placeTyOpt := placeTy localDecls layouts place
-        let isMutRefPlace :=
-          match placeTyOpt with
-          | .some { kind := .ref .mut _, .. } => true
-          | _ => false
-        match lookupBorrow s.memory.borrows ptrVal.tag with
-        | .some entry =>
-          let permOk :=
-            match entry.perm, isMutRefPlace with
-            | .disabled, _ => false
-            | .frozen, true => false
+    | .ok val locals' =>
+      let placeTyOpt := placeTy localDecls layouts place
+      let isMutRefPlace :=
+        match placeTyOpt with
+        | .some { kind := .ref .mut _, .. } => true
+        | _ => false
+      let checkGlobalRetag (ptrOrFatVal : Value) (ptrVal : ProvenancePtr) : MirStepNode :=
+        match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
+        | .some alloc =>
+          let mutOk :=
+            match isMutRefPlace, alloc.mutability with
+            | true, .not => false
             | _, _ => true
-          match permOk with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match retagKind with
-            | .fnEntry =>
-              let protId := s.memory.nextProtector
-              let borrows' :=
-                attachBorrowProtector s.memory.borrows ptrVal.tag protId
-              let mem' : Memory := {
-                s.memory with
-                borrows := borrows'
-                activeProtectors := protId :: s.memory.activeProtectors
-                nextProtector := Nat.add protId 1
-              }
-              MirStepNode.step (advanceStmt s locals' mem')
-            | _ => MirStepNode.step (advanceStmt s locals')
-        | .none =>
-          match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
-          | .some alloc =>
-            let mutOk :=
-              match isMutRefPlace, alloc.mutability with
-              | true, .not => false
-              | _, _ => true
-            let boundsOk :=
-              match ptrOrFatVal with
-              | .aggregate 0 (.ptr p 8 :: .scalar lenSc :: .nil) =>
-                let elemSz :=
-                  match placeTyOpt with
-                  | .some { kind := .ref _ (.slice ek), .. } =>
-                    match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
+          let boundsOk :=
+            match ptrOrFatVal with
+            | .aggregate 0 (.ptr p 8 :: .scalar lenSc :: .nil) =>
+              let elemSz :=
+                match placeTyOpt with
+                | .some { kind := .ref _ (.slice ek), .. } =>
+                  match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
+                  | .some n => n
+                  | .none => 1
+                | .some { kind := .rawPtr _ (.slice ek), .. } =>
+                  match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
+                  | .some n => n
+                  | .none => 1
+                | _ => 1
+              Nat.ble
+                (Nat.add p.offsetBytes (Nat.mul lenSc.bits elemSz))
+                (length alloc.bytes)
+            | _ =>
+              let pointeeBytes :=
+                match placeTyOpt with
+                | .some pTy =>
+                  match pointeeTyOf pTy with
+                  | .some innerTy =>
+                    match rigidTyByteSize layouts innerTy with
                     | .some n => n
-                    | .none => 1
-                  | .some { kind := .rawPtr _ (.slice ek), .. } =>
-                    match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
-                    | .some n => n
-                    | .none => 1
-                  | _ => 1
-                Nat.ble
-                  (Nat.add p.offsetBytes (Nat.mul lenSc.bits elemSz))
-                  (length alloc.bytes)
-              | _ =>
-                let pointeeBytes :=
-                  match placeTyOpt with
-                  | .some pTy =>
-                    match pointeeTyOf pTy with
-                    | .some innerTy =>
-                      match rigidTyByteSize layouts innerTy with
-                      | .some n => n
-                      | .none => 0
                     | .none => 0
                   | .none => 0
-                Nat.ble (Nat.add ptrVal.offsetBytes pointeeBytes) (length alloc.bytes)
-            match Bool.and mutOk boundsOk with
+                | .none => 0
+              Nat.ble (Nat.add ptrVal.offsetBytes pointeeBytes) (length alloc.bytes)
+          match Bool.and mutOk boundsOk with
+          | true => MirStepNode.step (advanceStmt s locals')
+          | false => MirStepNode.fail .ub
+        | .none =>
+          let isNonNullEmptySlice :=
+            match ptrOrFatVal with
+            | .aggregate 0 (.ptr p 8 :: .scalar ⟨0, 8⟩ :: .nil) =>
+              Bool.and
+                (Bool.not isMutRefPlace)
+                (Bool.not
+                  (Bool.and
+                    (Nat.beq p.allocId 0)
+                    (Nat.beq p.offsetBytes 0)))
+            | _ => false
+          match isNonNullEmptySlice with
+          | true => MirStepNode.step (advanceStmt s locals')
+          | false => MirStepNode.fail .ub
+      let retagPtrVal
+          (ptrVal : ProvenancePtr)
+          (sz : Nat)
+          (allowGlobal : Bool) :
+          MirStepNode :=
+        match lookupBorrow s.memory.borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => MirStepNode.fail .ub
+          | _ =>
+            match retagKind with
+            | .fnEntry =>
+              evalFnEntryRetag
+                s localDecls layouts place ptrVal sz entry locals'
+            | .default | .twoPhase | .raw =>
+              evalNonFnEntryRetag
+                retagKind s localDecls layouts place ptrVal sz entry locals'
+        | .none =>
+          match allowGlobal with
+          | true => checkGlobalRetag val ptrVal
+          | false => MirStepNode.fail .ub
+      match placeTyOpt with
+      | .some { kind := .rawPtr _ _, .. } =>
+        match retagKind with
+        | .raw => MirStepNode.step (advanceStmt s locals')
+        | .default | .twoPhase | .fnEntry => MirStepNode.fail .ub
+      | .some { kind := .ref _ pointee, .. } =>
+        match rigidTyIsUninhabited 16 pointee with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match val with
+          | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+          | .scalar sc =>
+            match
+              Bool.and
+                (rigidTyIsZeroSized 16 pointee)
+                (Bool.not (Nat.beq sc.bits 0))
+            with
             | true => MirStepNode.step (advanceStmt s locals')
             | false => MirStepNode.fail .ub
-          | .none =>
-            let isNonNullEmptySlice :=
-              match ptrOrFatVal with
-              | .aggregate 0 (.ptr p 8 :: .scalar ⟨0, 8⟩ :: .nil) =>
-                Bool.and
-                  (Bool.not isMutRefPlace)
-                  (Bool.not
-                    (Bool.and
-                      (Nat.beq p.allocId 0)
-                      (Nat.beq p.offsetBytes 0)))
-              | _ => false
-            match isNonNullEmptySlice with
-            | true => MirStepNode.step (advanceStmt s locals')
-            | false => MirStepNode.fail .ub
-      | .none => MirStepNode.fail .ub
+          | .aggregate 0 (.ptr ptrVal 8 :: .scalar _ :: .nil) =>
+            match lookupBorrow s.memory.borrows ptrVal.tag with
+            | .some entry =>
+              match entry.perm, isMutRefPlace with
+              | .disabled, _ => MirStepNode.fail .ub
+              | .frozen, true => MirStepNode.fail .ub
+              | _, _ =>
+                match retagKind with
+                | .fnEntry =>
+                  let protId := s.memory.nextProtector
+                  let borrows' :=
+                    attachBorrowProtector s.memory.borrows ptrVal.tag protId
+                  let mem' : Memory := {
+                    s.memory with
+                    borrows := borrows'
+                    activeProtectors := protId :: s.memory.activeProtectors
+                    nextProtector := Nat.add protId 1
+                  }
+                  MirStepNode.step (advanceStmt s locals' mem')
+                | _ => MirStepNode.step (advanceStmt s locals')
+            | .none => checkGlobalRetag val ptrVal
+          | _ => MirStepNode.fail .ub
+      | .none =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz false
+        | .aggregate 0 (.ptr ptrVal 8 :: .scalar _ :: .nil) =>
+          match lookupBorrow s.memory.borrows ptrVal.tag with
+          | .some entry =>
+            match entry.perm with
+            | .disabled => MirStepNode.fail .ub
+            | _ =>
+              match retagKind with
+              | .fnEntry =>
+                let protId := s.memory.nextProtector
+                let borrows' :=
+                  attachBorrowProtector s.memory.borrows ptrVal.tag protId
+                let mem' : Memory := {
+                  s.memory with
+                  borrows := borrows'
+                  activeProtectors := protId :: s.memory.activeProtectors
+                  nextProtector := Nat.add protId 1
+                }
+                MirStepNode.step (advanceStmt s locals' mem')
+              | _ => MirStepNode.step (advanceStmt s locals')
+          | .none => checkGlobalRetag val ptrVal
+        | _ => MirStepNode.fail .ub
+      | .some _ =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+        | _ => MirStepNode.step (advanceStmt s locals')
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .storageLive loc =>
@@ -2703,10 +3438,30 @@ def evalStmt
             layouts
         with
         | .ok locals₂ =>
-          let borrows' :=
-            invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-          MirStepNode.step
-            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+          match
+            Bool.or
+              (derefWriteTreeUB locals₁ mem₁.borrows dst)
+              (derefWriteUnionProtectorUB
+                localDecls
+                layouts
+                locals₁
+                mem₁.borrows
+                mem₁.activeProtectors
+                dst
+                restProj)
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateDerefWriteBorrowsWithLayouts
+                localDecls
+                layouts
+                locals₁
+                mem₁.borrows
+                dst
+                restProj
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .ub =>
           match mem₁.callerLocals with
           | .nil => MirStepNode.fail .ub
@@ -2721,20 +3476,23 @@ def evalStmt
                 mem₁.activeProtectors
             with
             | .ok callerLocals' =>
-              let borrows' :=
-                invalidateDerefWriteBorrows
-                  locals₁
-                  mem₁.borrows
-                  dst
-                  restProj
-                  mem₁.callerLocals
-              MirStepNode.step
-                (advanceStmt
-                  s
-                  locals₁
-                  { mem₁ with
-                    borrows := borrows'
-                    callerLocals := callerLocals' })
+              match derefWriteTreeUB locals₁ mem₁.borrows dst with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let borrows' :=
+                  invalidateDerefWriteBorrows
+                    locals₁
+                    mem₁.borrows
+                    dst
+                    restProj
+                    mem₁.callerLocals
+                MirStepNode.step
+                  (advanceStmt
+                    s
+                    locals₁
+                    { mem₁ with
+                      borrows := borrows'
+                      callerLocals := callerLocals' })
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
         | .unsupported => MirStepNode.unsupported
@@ -2755,9 +3513,12 @@ def evalStmt
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
               let resolvedLocalProj :=
-                match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                | .some rp => rp
-                | .none => proj :: rest
+                resolveBorrowWriteLocalProj
+                  localDecls
+                  layouts
+                  locals₁
+                  dst.local_
+                  (proj :: rest)
               match mem₁.activeProtectors with
               | .nil =>
                 let borrows' :=
@@ -2807,9 +3568,12 @@ def evalStmt
               match set? locals₁ dst.local_ (.init rootVal') with
               | .some locals₂ =>
                 let resolvedLocalProj :=
-                  match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                  | .some rp => rp
-                  | .none => proj :: rest
+                  resolveBorrowWriteLocalProj
+                    localDecls
+                    layouts
+                    locals₁
+                    dst.local_
+                    (proj :: rest)
                 match mem₁.activeProtectors with
                 | .nil =>
                   let borrows' :=
@@ -3024,8 +3788,13 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     evalPlaceWrite localsAfter borrowsAfter derefPlace writeVal activeProtectors localDecls layouts = .ub ∧
     evalRvalue localsAfter (.ref borrowKind derefPlace)
       { mem with borrows := borrowsAfter } localDecls layouts = .ub ∧
-    evalStmt sAfter ⟨.retag retagKind ⟨ptrLoc, .nil⟩, span⟩ localDecls layouts =
-      MirStepNode.fail .ub ∧
+    (match placeTy localDecls layouts ⟨ptrLoc, .nil⟩, retagKind with
+     | .some { kind := .rawPtr _ _, .. }, .raw =>
+       evalStmt sAfter ⟨.retag retagKind ⟨ptrLoc, .nil⟩, span⟩ localDecls layouts =
+         MirStepNode.step (advanceStmt sAfter localsAfter)
+     | _, _ =>
+       evalStmt sAfter ⟨.retag retagKind ⟨ptrLoc, .nil⟩, span⟩ localDecls layouts =
+         MirStepNode.fail .ub) ∧
     evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
       MirStepNode.fail .ub ∧
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
@@ -3065,7 +3834,27 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     split
     · rfl
     · rw [hDis]
-  · simp [evalStmt, evalOperand, readProjectedValue, hPtrSlot, hDis]
+  · unfold evalStmt evalOperand readProjectedValue
+    dsimp only
+    rw [hPtrSlot]
+    dsimp only
+    cases hPlaceTy : placeTy localDecls layouts ⟨ptrLoc, .nil⟩ with
+    | none =>
+      dsimp only
+      rw [hDis]
+    | some ty =>
+      rcases ty with ⟨kind, layIdx⟩
+      cases kind with
+      | rawPtr m p =>
+        cases retagKind <;> rfl
+      | ref m p =>
+        dsimp only
+        cases rigidTyIsUninhabited 16 p
+        · dsimp only; rw [hDis]
+        · rfl
+      | _ =>
+        dsimp only
+        rw [hDis]
   · cases localDecls <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
@@ -3376,18 +4165,16 @@ theorem evalStmt_assign_uninit_aggregate_field_step
     (hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
-        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-         | .some rp => rp
-         | .none => .field fieldIdx fieldTy :: rest) = false) :
+        (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+          (.field fieldIdx fieldTy :: rest)) = false) :
     evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
         (advanceStmt s locals₂
           { mem₁ with
             borrows :=
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-                 | .some rp => rp
-                 | .none => .field fieldIdx fieldTy :: rest) }) := by
+                (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                  (.field fieldIdx fieldTy :: rest)) }) := by
   have hEval :
       evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
         match mem₁.activeProtectors with
@@ -3397,15 +4184,13 @@ theorem evalStmt_assign_uninit_aggregate_field_step
               { mem₁ with
                 borrows :=
                   invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                    (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-                     | .some rp => rp
-                     | .none => .field fieldIdx fieldTy :: rest) })
+                    (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                      (.field fieldIdx fieldTy :: rest)) })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
-              (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-               | .some rp => rp
-               | .none => .field fieldIdx fieldTy :: rest)
+              (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                (.field fieldIdx fieldTy :: rest))
           with
           | true => MirStepNode.fail .ub
           | false =>
@@ -3414,9 +4199,8 @@ theorem evalStmt_assign_uninit_aggregate_field_step
                 { mem₁ with
                   borrows :=
                     invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                      (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-                       | .some rp => rp
-                       | .none => .field fieldIdx fieldTy :: rest) }) := by
+                      (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                        (.field fieldIdx fieldTy :: rest)) }) := by
     unfold evalStmt
     dsimp only
     rw [hRv]
@@ -3468,9 +4252,8 @@ theorem evalStmt_assign_uninit_aggregate_field_protected_conflict_ub
     (hAP : mem₁.activeProtectors = protHead :: protTail)
     (hConflict :
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
-        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
-         | .some rp => rp
-         | .none => .field fieldIdx fieldTy :: rest) = true) :
+        (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+          (.field fieldIdx fieldTy :: rest)) = true) :
     evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalStmt
@@ -3538,10 +4321,14 @@ theorem evalStmt_assign_uninit_union_field_ok
     unfold writeProjectedForLocal
     rw [hNoUnion]
     cases fieldIdx <;> rfl
-  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
-    localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
-    (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
-    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  have hStep :=
+    evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
+      localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
+      (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  rw [resolveBorrowWriteLocalProj_of_not_union localDecls layouts locals₁ dstLoc
+    (.field fieldIdx fieldTy :: .nil) hNoUnion] at hStep
+  exact hStep
 
 /--
 `D13b` tuple field initialization (`evalStmt_assign_uninit_tuple_field_ok`):
@@ -3621,10 +4408,14 @@ theorem evalStmt_assign_uninit_tuple_field_ok
     unfold writeProjectedForLocal
     rw [hNoUnion]
     cases fieldIdx <;> rfl
-  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
-    localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
-    (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
-    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  have hStep :=
+    evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
+      localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
+      (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  rw [resolveBorrowWriteLocalProj_of_not_union localDecls layouts locals₁ dstLoc
+    (.field fieldIdx fieldTy :: .nil) hNoUnion] at hStep
+  exact hStep
 
 /--
 `D13b` nested aggregate field initialization (`evalStmt_assign_uninit_nested_field_ok`):
@@ -3742,10 +4533,14 @@ theorem evalStmt_assign_uninit_nested_field_ok
     dsimp only [writeProjectedValue]
     rw [hSetExt outerIdx (.aggregate 0 .nil)
       (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
-  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc outerIdx outerTy
-    [.field innerIdx innerTy] rv span localDecls layouts val locals₁ mem₁ shell rootVal'
-    locals₂ hRv hUninit hShell hWrite hSet
-    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  have hStep :=
+    evalStmt_assign_uninit_aggregate_field_step s dstLoc outerIdx outerTy
+      [.field innerIdx innerTy] rv span localDecls layouts val locals₁ mem₁ shell rootVal'
+      locals₂ hRv hUninit hShell hWrite hSet
+      (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+  rw [resolveBorrowWriteLocalProj_of_not_union localDecls layouts locals₁ dstLoc
+    [.field outerIdx outerTy, .field innerIdx innerTy] hNoUnion] at hStep
+  exact hStep
 
 /--
 `D13b` boundary (`evalStmt_assign_uninit_non_aggregate_ub`): a projected
@@ -3922,18 +4717,16 @@ theorem evalStmt_assign_init_projected_step
     (hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
-        (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-         | .some rp => rp
-         | .none => proj :: rest) = false) :
+        (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+          (proj :: rest)) = false) :
     evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
         (advanceStmt s locals₂
           { mem₁ with
             borrows :=
               invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                 | .some rp => rp
-                 | .none => proj :: rest) }) := by
+                (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                  (proj :: rest)) }) := by
   have hWriteShell :
       writeProjectedForLocal locals₁ localDecls layouts dstLoc
         (ensureNestedFieldShells rootVal (proj :: rest))
@@ -3950,15 +4743,13 @@ theorem evalStmt_assign_init_projected_step
               { mem₁ with
                 borrows :=
                   invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                    (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                     | .some rp => rp
-                     | .none => proj :: rest) })
+                    (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                      (proj :: rest)) })
         | protHead :: protTail =>
           match
             hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
-              (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-               | .some rp => rp
-               | .none => proj :: rest)
+              (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                (proj :: rest))
           with
           | true => MirStepNode.fail .ub
           | false =>
@@ -3967,9 +4758,8 @@ theorem evalStmt_assign_init_projected_step
                 { mem₁ with
                   borrows :=
                     invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                      (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                       | .some rp => rp
-                       | .none => proj :: rest) }) := by
+                      (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
+                        (proj :: rest)) }) := by
     cases proj with
     | deref => exact False.elim (hNotDeref rfl)
     | _ =>
@@ -4141,7 +4931,9 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
   dsimp only
   rw [hEns, hWrite]
   dsimp only
-  rw [hSet, hProt]
+  rw [hSet, hProt,
+    resolveBorrowWriteLocalProj_of_not_union localDecls layouts locals₁ dstLoc
+      [.field outerIdx outerTy, .field innerIdx innerTy] hNoUnion]
 
 private theorem writeProjectedForLocal_uninit_non_field_subproj_ub
     (locals₁ : List LocalSlot)
@@ -4285,5 +5077,405 @@ theorem evalStmt_assign_uninit_array_field_elem_ub
     s dstLoc fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
     (.index idxLocal) rest rv span localDecls layouts val locals₁ mem₁
     hRv hUninit (Or.inl ⟨idxLocal, rfl⟩)
+
+/--
+`R1` union-field overlap truncation (`resolveBorrowWriteLocalProj_union_root`):
+when `dstLoc`'s declared type resolves to a `FieldsShape.union` layout
+(`isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts decl.ty) = true`)
+and `layouts.entries` is non-empty, `resolveBorrowWriteLocalProj` truncates any
+direct `.field fieldIdx fieldTy :: rest` write on `dstLoc` to `.nil`, so
+`borrowEntryOverlapsWrite` treats the write as overlapping every sibling union
+field borrow `&_u.other`.
+-/
+theorem resolveBorrowWriteLocalProj_union_root
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (dstLoc : Local)
+    (decl : LocalDecl)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem)
+    (hEntries : layouts.entries ≠ .nil)
+    (hDecl : get? localDecls dstLoc = .some decl)
+    (hUnion : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts decl.ty) = true)
+    (hNonZst :
+      placeIsZeroSized
+        localDecls
+        layouts
+        { local_ := dstLoc, projection := .field fieldIdx fieldTy :: rest } = false) :
+    resolveBorrowWriteLocalProj localDecls layouts locals dstLoc
+      (.field fieldIdx fieldTy :: rest) = .nil := by
+  cases localDecls with
+  | nil => cases hDecl
+  | cons d ds =>
+    rcases layouts with ⟨pB, lE, entries⟩
+    cases entries with
+    | nil => exact False.elim (hEntries rfl)
+    | cons e es =>
+      unfold resolveBorrowWriteLocalProj placeTouchesUnion
+      rw [hNonZst]
+      dsimp only
+      rw [hDecl]
+      dsimp only [tyProjTouchesUnion]
+      rw [hUnion]
+      dsimp only
+      cases hRes : resolveBorrowProjectionElems locals rest with
+      | none =>
+        dsimp only [resolveBorrowProjectionElems]
+        rw [hRes]
+        dsimp only [truncateTyProjAtUnion]
+        rw [hUnion]
+        rfl
+      | some rp =>
+        dsimp only [resolveBorrowProjectionElems]
+        rw [hRes]
+        dsimp only [truncateTyProjAtUnion]
+        rw [hUnion]
+        rfl
+
+/--
+`R1` union sibling-field borrow invalidation and active-protector UB
+(`evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub`):
+when `dstLoc` is a `FieldsShape.union` local (`isUnionLayout = true`) and
+`writeTy` is nonzero-sized (`tyIsZeroSized writeTy = false`), writing to
+`.field writeIdx writeTy` overlaps a borrow targeting ANY sibling field
+`.field borIdx borTy` (`borIdx ≠ writeIdx` included):
+1. With no active protectors (`mem₁.activeProtectors = .nil`), an `.active` or
+   `.frozen` borrow targeting `.field borIdx borTy` of `dstLoc` transitions to
+   `.disabled`.
+2. When that sibling borrow is protected by `mem₁.activeProtectors` (`protId`)
+   and is `.active` or `.frozen`, `evalStmt` faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (decl : LocalDecl)
+    (writeIdx borIdx : FieldIdx)
+    (writeTy borTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val rootVal rootVal' : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (mem₁ : Memory)
+    (tag protId : Nat)
+    (perm : TreeBorrowPerm)
+    (hEntries : layouts.entries ≠ .nil)
+    (hDecl : get? localDecls dstLoc = .some decl)
+    (hUnion : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts decl.ty) = true)
+    (hNonZst : tyIsZeroSized writeTy = false)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hInit : get? locals₁ dstLoc = .some (.init rootVal))
+    (hWrite :
+      writeProjectedForLocal locals₁ localDecls layouts dstLoc
+        (ensureNestedFieldShells rootVal (.field writeIdx writeTy :: .nil))
+        (.field writeIdx writeTy :: .nil) val = .ok rootVal')
+    (hSet : set? locals₁ dstLoc (.init rootVal') = .some locals₂)
+    (hPerm : perm = .active ∨ perm = .frozen) :
+    (let sibEntry : BorrowEntry :=
+       { tag := tag, targetLocal := dstLoc,
+         targetProjection := .field borIdx borTy :: .nil, perm := perm }
+     mem₁.borrows = sibEntry :: .nil →
+     mem₁.activeProtectors = .nil →
+     evalStmt s ⟨.assign ⟨dstLoc, .field writeIdx writeTy :: .nil⟩ rv, span⟩
+         localDecls layouts =
+       MirStepNode.step
+         (advanceStmt s locals₂
+           { mem₁ with borrows := { sibEntry with perm := .disabled } :: .nil })) ∧
+    (let protEntry : BorrowEntry :=
+       { tag := tag, targetLocal := dstLoc,
+         targetProjection := .field borIdx borTy :: .nil, perm := perm,
+         protector := .some protId }
+     mem₁.borrows = protEntry :: .nil →
+     mem₁.activeProtectors = protId :: .nil →
+     evalStmt s ⟨.assign ⟨dstLoc, .field writeIdx writeTy :: .nil⟩ rv, span⟩
+         localDecls layouts =
+       MirStepNode.fail .ub) := by
+  have hPlaceNonZst :
+      placeIsZeroSized
+        localDecls
+        layouts
+        { local_ := dstLoc, projection := .field writeIdx writeTy :: .nil } = false := by
+    unfold placeIsZeroSized placeTy
+    rw [hDecl]
+    exact hNonZst
+  have hTrunc :=
+    resolveBorrowWriteLocalProj_union_root
+      localDecls layouts locals₁ dstLoc decl writeIdx writeTy .nil
+      hEntries hDecl hUnion hPlaceNonZst
+  refine ⟨?_, ?_⟩
+  · intro sibEntry hBor hAP
+    unfold evalStmt
+    dsimp only
+    rw [hRv]
+    dsimp only
+    rw [hInit]
+    dsimp only
+    rw [hWrite]
+    dsimp only
+    rw [hSet, hAP, hBor, hTrunc]
+    rcases hPerm with rfl | rfl <;>
+      simp [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj,
+        treeBorrowWriterRelatedness, borrowEntryOverlapsWrite,
+        projectionsOverlap, stripTransparentProjections,
+        normalizeSubsliceProjections, projectionsOverlapAux,
+        treeBorrowNodeAccess, treeBorrowPermTransition, applyTreeBorrowTransition,
+        sibEntry]
+  · intro protEntry hBor hAP
+    unfold evalStmt
+    dsimp only
+    rw [hRv]
+    dsimp only
+    rw [hInit]
+    dsimp only
+    rw [hWrite]
+    dsimp only
+    rw [hSet, hAP, hBor, hTrunc]
+    rcases hPerm with rfl | rfl <;>
+      simp [hasProtectedWriteConflict,
+        borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections,
+        normalizeSubsliceProjections, projectionsOverlapAux,
+        isBorrowProtected, natListContainsBool, borrowEntryWriteConflicts,
+        protEntry]
+
+private theorem lookupBorrow_mem_of_some
+    {borrows : List BorrowEntry} {tag : Nat} {entry : BorrowEntry}
+    (h : lookupBorrow borrows tag = .some entry) : entry ∈ borrows := by
+  induction borrows with
+  | nil => cases h
+  | cons b bs ih =>
+    unfold lookupBorrow at h
+    cases hEq : Nat.beq b.tag tag with
+    | true =>
+      rw [hEq] at h
+      injection h with hb
+      subst hb
+      exact .head _
+    | false =>
+      rw [hEq] at h
+      exact .tail _ (ih h)
+
+private theorem nat_beq_eq_false_of_ne {a b : Nat} (hne : a ≠ b) : Nat.beq a b = false := by
+  cases h : Nat.beq a b with
+  | false => rfl
+  | true => exact False.elim (hne (Nat.eq_of_beq_eq_true h))
+
+/--
+Whole-local pointer dereference identity for `invalidateDerefWriteBorrowsWithLayouts`:
+when `ptrLoc` holds a thin pointer `.ptr ptrVal sz`, `restProj = .nil`, and every
+entry in `borrows` has `targetProjection = .nil`, `invalidateDerefWriteBorrowsWithLayouts`
+reduces identically to `invalidateDerefWriteBorrows`.
+-/
+theorem invalidateDerefWriteBorrowsWithLayouts_eq_of_thinPtr_nil_target
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals₁ : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (hPtr : get? locals₁ ptrLoc = .some (.init (.ptr ptrVal sz)))
+    (hNilTargets : ∀ b ∈ borrows, b.targetProjection = .nil) :
+    invalidateDerefWriteBorrowsWithLayouts
+      localDecls layouts locals₁ borrows ⟨ptrLoc, .deref :: .nil⟩ .nil =
+    invalidateDerefWriteBorrows
+      locals₁ borrows ⟨ptrLoc, .deref :: .nil⟩ .nil := by
+  cases borrows with
+  | nil => rfl
+  | cons b₁ rest =>
+    cases rest with
+    | nil =>
+      unfold invalidateDerefWriteBorrowsWithLayouts invalidateDerefWriteBorrows
+      rw [hPtr]
+      dsimp only [extractDerefPtrVal?]
+      cases hLook : lookupBorrow (b₁ :: .nil) ptrVal.tag with
+      | none => rfl
+      | some entry =>
+        have hTgt : entry.targetProjection = .nil :=
+          hNilTargets entry (lookupBorrow_mem_of_some hLook)
+        have hFull :
+            resolveDerefWriteFullProj locals₁ locals₁ (.ptr ptrVal sz) entry .nil = .nil := by
+          unfold resolveDerefWriteFullProj
+          rw [hTgt]
+          rfl
+        dsimp only []
+        rw [hFull]
+        rfl
+    | cons b₂ rest₂ =>
+      unfold invalidateDerefWriteBorrowsWithLayouts invalidateDerefWriteBorrows
+      rw [hPtr]
+      dsimp only [extractDerefPtrVal?]
+      cases hLook : lookupBorrow (b₁ :: b₂ :: rest₂) ptrVal.tag with
+      | none => rfl
+      | some entry =>
+        have hTgt : entry.targetProjection = .nil :=
+          hNilTargets entry (lookupBorrow_mem_of_some hLook)
+        have hFull :
+            resolveDerefWriteFullProj locals₁ locals₁ (.ptr ptrVal sz) entry .nil = .nil := by
+          unfold resolveDerefWriteFullProj
+          rw [hTgt]
+          rfl
+        dsimp only []
+        rw [hFull]
+
+/--
+`R1` dereferencing union field write sibling-borrow invalidation and
+active-protector UB
+(`evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protector_ub`):
+when `ptrLoc` holds an `.active` root pointer/reference `writerEntry` targeting
+union local `uLoc` (`isUnionLayout = true`), and `sibEntry` (`sibTag ≠ ptrVal.tag`)
+is a foreign `.active` or `.frozen` borrow targeting ANY sibling union field
+`.field borIdx borTy` (`borIdx ≠ writeIdx` included), a frame-local dereferencing
+write `(*ptrLoc).writeIdx = rv` to nonzero-sized field `writeTy`
+(`tyIsZeroSized writeTy = false`) overlaps `sibEntry`:
+1. With `mem₁.activeProtectors = .nil`, `sibEntry` transitions to `.disabled`
+   while `writerEntry` stays `.active`.
+2. When `sibEntry` carries active protector `protId` (`mem₁.activeProtectors = protId :: .nil`)
+   and `mem₁.callerLocals = .nil`, `evalStmt` faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_assign_deref_union_field_sibling_borrow_invalidation_and_protector_ub
+    (s : MachineState)
+    (ptrLoc uLoc : Local)
+    (uDecl : LocalDecl)
+    (ptrVal : ProvenancePtr)
+    (ptrSz sibTag protId : Nat)
+    (writeIdx borIdx : FieldIdx)
+    (writeTy borTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (mem₁ : Memory)
+    (sibPerm : TreeBorrowPerm)
+    (hEntries : layouts.entries ≠ .nil)
+    (hDecl : get? localDecls uLoc = .some uDecl)
+    (hUnion : isUnionLayout layouts (resolveTyWithLocalDecls localDecls layouts uDecl.ty) = true)
+    (hNonZst : tyIsZeroSized writeTy = false)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hPtr : get? locals₁ ptrLoc = .some (.init (.ptr ptrVal ptrSz)))
+    (hTagNe : ptrVal.tag ≠ sibTag)
+    (hSibPerm : sibPerm = .active ∨ sibPerm = .frozen) :
+    let writerEntry : BorrowEntry :=
+      { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
+    let dst : Place := ⟨ptrLoc, .deref :: .field writeIdx writeTy :: .nil⟩
+    (let sibEntry : BorrowEntry :=
+       { tag := sibTag, targetLocal := uLoc,
+         targetProjection := .field borIdx borTy :: .nil, perm := sibPerm }
+     mem₁.borrows = writerEntry :: sibEntry :: .nil →
+     mem₁.activeProtectors = .nil →
+     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+     evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
+       MirStepNode.step
+         (advanceStmt s locals₂
+           { mem₁ with
+             borrows := writerEntry :: { sibEntry with perm := .disabled } :: .nil })) ∧
+    (let protEntry : BorrowEntry :=
+       { tag := sibTag, targetLocal := uLoc,
+         targetProjection := .field borIdx borTy :: .nil, perm := sibPerm,
+         protector := .some protId }
+     mem₁.borrows = writerEntry :: protEntry :: .nil →
+     mem₁.activeProtectors = protId :: .nil →
+     mem₁.callerLocals = .nil →
+     writePlaceValue locals₁ mem₁.borrows dst val localDecls layouts = .ok locals₂ →
+     evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
+       MirStepNode.fail .ub) := by
+  intro writerEntry dst
+  have hEffNil :
+      resolveDerefBorrowWriteFullProj
+        localDecls layouts uLoc (.field writeIdx writeTy :: .nil) = .nil := by
+    cases localDecls with
+    | nil => cases hDecl
+    | cons d ds =>
+      rcases layouts with ⟨pB, lE, entries⟩
+      cases entries with
+      | nil => exact False.elim (hEntries rfl)
+      | cons e es =>
+        unfold resolveDerefBorrowWriteFullProj placeTouchesUnion placeIsZeroSized placeTy
+        dsimp only []
+        rw [hDecl]
+        dsimp only [tyProjTouchesUnion, resolveProjectedTy]
+        rw [hUnion, hNonZst]
+        dsimp only [truncateTyProjAtUnion]
+        rw [hUnion]
+        rfl
+  have hBeqNe : Nat.beq sibTag ptrVal.tag = false :=
+    nat_beq_eq_false_of_ne hTagNe.symm
+  have hBeqNeSym : Nat.beq ptrVal.tag sibTag = false :=
+    nat_beq_eq_false_of_ne hTagNe
+  refine ⟨?_, ?_⟩
+  · intro sibEntry hBor hAP hWOk
+    unfold evalStmt
+    dsimp only [dst]
+    rw [hRv]
+    dsimp only [evalPlaceWrite]
+    rw [hAP]
+    dsimp only
+    rw [hWOk]
+    dsimp only [derefWriteTreeUB, derefWriteUnionProtectorUB,
+      invalidateDerefWriteBorrowsWithLayouts]
+    rw [hBor, hPtr]
+    dsimp only [lookupBorrow, extractDerefPtrVal?, writerEntry]
+    simp only [Nat.beq_refl]
+    have hFull :
+        resolveDerefWriteFullProj
+          locals₁ locals₁ (.ptr ptrVal ptrSz)
+          { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
+          (.field writeIdx writeTy :: .nil) = (.field writeIdx writeTy :: .nil) := rfl
+    rw [hFull, hEffNil]
+    dsimp only [treeBorrowAncestorsChildAccessUB, Bool.or]
+    rcases hSibPerm with rfl | rfl <;>
+    · dsimp only [invalidateTreeBorrowsAtProj, updateBorrowPermTreeAtProj,
+        updateBorrowPermAtProj, resolveTreeBorrowWriterTag, lookupBorrow,
+        isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, length, sibEntry]
+      simp [lookupBorrow, isBorrowDescendantOrSelfAux, hBeqNe, hBeqNeSym,
+        borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections,
+        normalizeSubsliceProjections, projectionsOverlapAux,
+        treeBorrowWriterRelatedness, treeBorrowNodeAccess,
+        treeBorrowPermTransition, applyTreeBorrowTransition]
+  · intro protEntry hBor hAP hCaller hWOk
+    unfold evalStmt
+    dsimp only [dst]
+    rw [hRv]
+    dsimp only
+    cases hEPW : evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts with
+    | ub =>
+      dsimp only
+      rw [hCaller]
+    | unsupported =>
+      exfalso
+      unfold evalPlaceWrite at hEPW
+      rw [hAP] at hEPW
+      dsimp only at hEPW
+      split at hEPW
+      · cases hEPW
+      · rw [hWOk] at hEPW; cases hEPW
+    | ok locs₂ =>
+      dsimp only [derefWriteTreeUB, derefWriteUnionProtectorUB]
+      rw [hAP, hBor, hPtr]
+      dsimp only [lookupBorrow, extractDerefPtrVal?, writerEntry]
+      simp only [Nat.beq_refl]
+      have hFull :
+          resolveDerefWriteFullProj
+            locals₁ locals₁ (.ptr ptrVal ptrSz)
+            { tag := ptrVal.tag, targetLocal := uLoc, targetProjection := .nil, perm := .active }
+            (.field writeIdx writeTy :: .nil) = (.field writeIdx writeTy :: .nil) := rfl
+      rw [hFull]
+      dsimp only []
+      rw [hEffNil]
+      dsimp only [treeBorrowAncestorsChildAccessUB]
+      rcases hSibPerm with rfl | rfl <;>
+      · dsimp only [hasProtectedTreeWriteConflict, resolveTreeBorrowWriterTag,
+          lookupBorrow, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux,
+          length, protEntry]
+        simp [lookupBorrow, isBorrowDescendantOrSelfAux, hBeqNe, hBeqNeSym,
+          borrowEntryOverlapsWrite, projectionsOverlap,
+          stripTransparentProjections, normalizeSubsliceProjections, projectionsOverlapAux,
+          isBorrowProtected, natListContainsBool, borrowEntryWriteConflicts,
+          treeBorrowWriterRelatedness, treeBorrowNodeAccess, treeBorrowPermTransition,
+          treeBorrowTransitionIsUB]
 
 end Trusted.Rustc.V2026_06_01.MirSemantics

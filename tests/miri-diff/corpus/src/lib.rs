@@ -727,3 +727,156 @@ pub fn pass_direct_fn_call() -> u32 {
 pub fn panic_explicit_macro() {
     panic!("explicit panic in corpus");
 }
+
+// Category 8: Niche-encoded scalars, `#[repr(transparent)]` wrappers,
+// univariant `#[repr(C)]` enums, union overlays, and `&raw` reborrows.
+
+use core::num::NonZeroU32;
+
+#[repr(transparent)]
+pub struct MetersU32(pub u32);
+
+#[repr(C)]
+pub enum SingleC {
+    Only(u32),
+}
+
+#[repr(C)]
+pub union OverlayU32 {
+    pub word: u32,
+    pub bytes: [u8; 4],
+}
+
+/// Niche validity: a nonzero `u32` round-trips through `NonZeroU32`.
+pub fn pass_nonzero_u32_transmute_roundtrip() -> u32 {
+    let n: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(7u32) };
+    unsafe { transmute::<NonZeroU32, u32>(n) }
+}
+
+/// Niche validity: transmuting `0` into `NonZeroU32` violates its valid range.
+pub fn ub_nonzero_u32_transmute_zero() -> u32 {
+    let n: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(0u32) };
+    unsafe { transmute::<NonZeroU32, u32>(n) }
+}
+
+/// Niche encoding: an all-zero `Option<NonZeroU32>` reads back as `None`.
+pub fn pass_option_nonzero_none_niche() -> u32 {
+    let o: Option<NonZeroU32> = unsafe { transmute::<u32, Option<NonZeroU32>>(0u32) };
+    match o {
+        Some(_) => 1u32,
+        None => 2u32,
+    }
+}
+
+/// `#[repr(transparent)]` wrapper: transmute a `u32` into `MetersU32` and read
+/// its field.
+pub fn pass_transparent_wrapper_transmute() -> u32 {
+    let m: MetersU32 = unsafe { transmute::<u32, MetersU32>(41u32) };
+    m.0 + 1u32
+}
+
+/// Univariant `#[repr(C)]` enum: match its payload and reinitialize the whole
+/// value.
+pub fn pass_single_c_enum_match_reinit() -> u32 {
+    let mut s = SingleC::Only(9u32);
+    s = SingleC::Only(match s {
+        SingleC::Only(v) => v + 1u32,
+    });
+    match s {
+        SingleC::Only(v) => v,
+    }
+}
+
+/// Univariant `#[repr(C)]` enum: a tag other than `0` is an invalid value.
+pub fn ub_single_c_enum_invalid_tag() -> u32 {
+    let s: SingleC = unsafe { transmute::<[u32; 2], SingleC>([1u32, 5u32]) };
+    match s {
+        SingleC::Only(v) => v,
+    }
+}
+
+/// Union overlay: a byte write through `bytes` changes the `word` read back.
+pub fn pass_union_overlay_word_bytes() -> u32 {
+    let mut o = OverlayU32 { word: 0x0403_0201 };
+    unsafe {
+        o.bytes[0] = 9u8;
+        o.word
+    }
+}
+
+/// Union overlay: after one partial byte write, reading another byte reads
+/// uninitialized memory.
+pub fn ub_union_uninit_bytes_partial_read() -> u32 {
+    let mut u: Uninit<[u8; 4]> = Uninit { uninit: () };
+    unsafe {
+        u.value[0] = 3u8;
+        u.value[0] as u32 + u.value[1] as u32
+    }
+}
+
+/// `Retag(Raw)`: `&raw const` and `&raw mut` reborrows of disjoint fields
+/// coexist.
+pub fn pass_raw_ref_disjoint_fields() -> u32 {
+    let mut pair = PairU32 { a: 1u32, b: 2u32 };
+    let p: *mut PairU32 = &mut pair;
+    unsafe {
+        let ra: *const u32 = &raw const (*p).a;
+        let rb: *mut u32 = &raw mut (*p).b;
+        *rb = 5u32;
+        *ra + *rb
+    }
+}
+
+/// `Retag(Raw)`: a parent write disables the child that a `&raw mut` pointer
+/// shares.
+pub fn ub_raw_mut_after_parent_write() -> u32 {
+    let mut slot: u32 = 1u32;
+    let x: &mut u32 = &mut slot;
+    let y: &mut u32 = &mut *x;
+    let r: *mut u32 = &raw mut *y;
+    *y = 2u32;
+    let y_seen: u32 = *y;
+    *x = y_seen + 1u32;
+    unsafe {
+        *r = 4u32;
+    }
+    slot
+}
+
+#[repr(transparent)]
+pub struct NonZeroMeters(pub NonZeroU32);
+
+/// `#[repr(transparent)]` niche validity: transmuting `0` into `NonZeroMeters`
+/// violates its inner `NonZeroU32` valid range.
+pub fn ub_transparent_nonzero_wrapper_zero() -> u32 {
+    let m: NonZeroMeters = unsafe { transmute::<u32, NonZeroMeters>(0u32) };
+    unsafe { transmute::<NonZeroU32, u32>(m.0) }
+}
+
+/// Niche encoding and `&mut` univariant `#[repr(C)]` projection: encode a
+/// `Some(NonZeroU32)` via `transmute`, match `Option<ColorTag>`, and mutate a
+/// `SingleC` payload through `&mut SingleC` before whole-value reinit.
+pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
+    let nz: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(7u32) };
+    let some_bits: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(Some(nz)) };
+    let none_bits: u32 = unsafe { transmute::<Option<NonZeroU32>, u32>(None) };
+    let oc: Option<ColorTag> = Some(ColorTag::Green);
+    let color_val: u32 = match oc {
+        Some(ColorTag::Red) => 1u32,
+        Some(ColorTag::Green) => 2u32,
+        Some(ColorTag::Blue) => 3u32,
+        None => 4u32,
+    };
+    let mut s = SingleC::Only(some_bits ^ none_bits ^ color_val);
+    match &mut s {
+        SingleC::Only(p) => {
+            *p ^= 12u32;
+        }
+    }
+    s = SingleC::Only(match s {
+        SingleC::Only(v) => v ^ 3u32,
+    });
+    match s {
+        SingleC::Only(v) => v,
+    }
+}

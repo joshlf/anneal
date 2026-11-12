@@ -743,13 +743,28 @@ fn has_sysroot_arg(args: &[String]) -> bool {
 
 fn detect_sysroot(rustc_bin: &str) -> Option<String> {
     // First check whether `rustc_bin` is an explicit path under
-    // `<sysroot>/bin/rustc`.
+    // `<sysroot>/bin/rustc` or an omnibus archive wrapper under
+    // `<install_root>/bin/anneal-rustc-capture` (where the packaged sysroot is
+    // `<install_root>/rust`).
     let bin_path = Path::new(rustc_bin);
     if bin_path.components().count() > 1 {
         if let Some(parent) = bin_path.parent().and_then(|p| p.parent()) {
             if parent.join("lib").join("rustlib").exists() {
                 return Some(parent.to_string_lossy().into_owned());
             }
+            let packaged_rust = parent.join("rust");
+            if packaged_rust.join("lib").join("rustlib").exists() {
+                return Some(packaged_rust.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    if let Ok(exe) = env::current_exe()
+        && let Some(install_root) = exe.parent().and_then(|p| p.parent())
+    {
+        let packaged_rust = install_root.join("rust");
+        if packaged_rust.join("lib").join("rustlib").exists() {
+            return Some(packaged_rust.to_string_lossy().into_owned());
         }
     }
 

@@ -11,7 +11,6 @@ those terms.
 import Anneal.Mir.AdtAndControl
 import MiniRustSpec.Correspondence.AnnealEval
 import MiniRustSpec.Correspondence.DeinitLemmas
-import MiniRustSpec.Audit
 
 /-!
 # Projected `Deinit`: Anneal's `PartialShell` model and MiniRust's byte-slice `Uninit` store
@@ -36,11 +35,12 @@ operation, without any flow-sensitive overwrite guard:
   (`Anneal.Mir.AdtAndControl.evalDeinitPlace_spec_bytes_simulation`), while every byte outside the
   slice is unchanged.
 
-This is the only `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`. It is a separate
-build root (`lake build MiniRustSpec.Correspondence.DeinitBridge`), outside the import closure of
-`MiniRustSpec` and `MiniRustSpec.Audit`, so that `lake build MiniRustSpec` does not depend on
-`Anneal.Mir.*` (which is not part of the default `Anneal` target); it imports `MiniRustSpec.Audit`
-and audits itself (`[SUBPLACE-AUDIT]` at the end of this module).
+This is the only `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`.
+`Correspondence.IntrinsicBoundary` imports it, so `lake build MiniRustSpec` builds this module and
+`Anneal.Mir.AdtAndControl` (which is not part of the default `Anneal` target), and
+`MiniRustSpec.Audit` audits it: `#assert_all_minirustspec_standard_axioms` covers every declaration
+of this module, and its `[DEINIT-AUDIT]` group pins its theorems, including
+`subplace_audit_closure`.
 -/
 
 namespace MiniRustSpec.Correspondence.DeinitBridge
@@ -192,13 +192,15 @@ theorem paddedDeinitSiblingReinit_anneal_shell_agreement :
       .ok (.scalar ⟨42, 4⟩) := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> with_unfolding_all rfl
 
-/-- **Axiom-audit hook for Episode 2's sub-place model (`subplace_audit_closure`)**: the `Anneal.*`
-theorems of `Anneal.Mir.AdtAndControl` Section 4 (synthetic sub-place pointers, `Deref` places,
-sub-place `CopyNonOverlapping`, `move` through `Deref`, two-level `Deref` chains, and their Trusted
-refinement and non-vacuity witnesses) are not `MiniRustSpec.*` declarations. This theorem's proof
-term mentions each of them, so its axioms are the union of theirs, and the `[SUBPLACE-AUDIT]` group
-at the end of this module fails unless every one uses only the standard axioms (in particular no
-`sorryAx` and no `Lean.ofReduceBool`). -/
+/-- **Axiom-audit hook for Episode 2's sub-place model (`subplace_audit_closure`)**:
+`MiniRustSpec.Audit`'s `#assert_all_minirustspec_standard_axioms` checks every declaration of the
+imported `MiniRustSpec.*` modules (this one included, see `IntrinsicBoundary`'s import), but not the
+`Anneal.*` theorems of `Anneal.Mir.AdtAndControl` Section 4 (synthetic sub-place pointers, `Deref`
+places, sub-place `CopyNonOverlapping`, `move` through `Deref`, two-level `Deref` chains, their
+Stage-1 Trusted refinement and non-vacuity witnesses) and of its Stage-1 `Retag` reconciliation
+(Section 2). This theorem's proof term mentions each of them, so its axioms are the union of theirs,
+and `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` group fails unless every one uses only the standard
+axioms (in particular no `sorryAx` and no `Lean.ofReduceBool`). -/
 theorem subplace_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.localBaseAddr_eq_some
   let _ := @Anneal.Mir.AdtAndControl.localBaseAddr_fits
@@ -348,18 +350,28 @@ theorem subplace_audit_closure : True :=
   let _ := @evalStatement_deinit_fieldPath
   let _ := @evalStmt_deinit_field
   let _ := @paddedDeinitSiblingReinit_anneal_shell_agreement
+  let _ := @Anneal.Mir.AdtAndControl.retagKeepsFrameTy_nil
+  let _ := @Anneal.Mir.AdtAndControl.evalNonFnEntryRetag_of_not_ref
+  let _ := @Anneal.Mir.AdtAndControl.evalFnEntryRetag_of_not_ref
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_disabled_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_fat_frozen_mut_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_typed_reborrow
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_frozen_mut_reborrows
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_rawPtr_steps
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_rawPtr_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_global_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_untracked_divergence
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_scalar_addr_reject
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_raw_scalar_rawPtr_conservative
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_noRef_scalar_divergence
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_noRef_scalar_agree
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_tree_preconditions
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_deref_read_typed_tree
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_assign_deref_tree
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_u32_field
+  let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_reborrow
   trivial
-
-/-! ## Self-audit
-
-`[SUBPLACE-AUDIT]`: every theorem of this module, including `subplace_audit_closure`, depends only
-on the standard axioms. -/
-
-#check_theorem_deps "[SUBPLACE-AUDIT]"
-  length_toAbstractBytes
-  toAbstractBytes_deinitBytes
-  evalDeinitPlace_spec_minirust_store_simulation
-  paddedDeinitSiblingReinit_anneal_shell_agreement
-  subplace_audit_closure
 
 end MiniRustSpec.Correspondence.DeinitBridge

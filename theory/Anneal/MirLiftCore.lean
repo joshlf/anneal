@@ -667,9 +667,12 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
         match set? locals dst.local_ (.init rootVal') with
         | some locals' =>
           let resolvedLocalProj :=
-            match resolveBorrowProjectionElems locals (proj :: rest) with
-            | some rp => rp
-            | none => proj :: rest
+            resolveBorrowWriteLocalProj
+              localDecls
+              layouts
+              locals
+              dst.local_
+              (proj :: rest)
           some (locals',
             invalidateConflictingBorrowsAtProj borrows dst.local_ .none
               resolvedLocalProj)
@@ -2387,11 +2390,17 @@ def evalRvalueFast
       | true =>
         match op, mem.borrows with
         | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          .ok v locals'
-            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+          match derefReadTreeUB locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors with
+          | true => .ub
+          | false =>
+            .ok v locals'
+              { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors }
         | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          .ok v locals'
-            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+          match derefReadTreeUB locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors with
+          | true => .ub
+          | false =>
+            .ok v locals'
+              { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors }
         | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
@@ -2591,11 +2600,17 @@ def evalRvalueSymTreeFast
       | true =>
         match op, mem.borrows with
         | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          .ok v locals'
-            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+          match derefReadTreeUB locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors with
+          | true => .ub
+          | false =>
+            .ok v locals'
+              { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors }
         | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-          .ok v locals'
-            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+          match derefReadTreeUB locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors with
+          | true => .ub
+          | false =>
+            .ok v locals'
+              { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) mem.activeProtectors }
         | _, _ => .ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported

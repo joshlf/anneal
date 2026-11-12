@@ -44,8 +44,14 @@ private theorem cursor_sepLensStateInv
     subst hRp hV
     refine ⟨rfl, Nat.le_refl _, ?_, ?_⟩
     · rw [h_caller]; rfl
-    · refine ⟨rfl, ⟨activeCursorBorrow rootCursorPtr, ?_, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
+    · refine ⟨rfl, ⟨activeCursorBorrow rootCursorPtr, ?_, rfl, rfl, rfl, rfl, rfl⟩, ?_, ?_⟩
       · rw [h_borrows]; rfl
+      · intro e he
+        rw [h_borrows] at he
+        simp [lookupBorrow, activeCursorBorrow, rootCursorPtr] at he
+        subst he
+        rw [h_borrows]
+        rfl
       · intro b hb _
         rw [h_borrows] at hb
         rcases List.mem_singleton.mp hb with rfl

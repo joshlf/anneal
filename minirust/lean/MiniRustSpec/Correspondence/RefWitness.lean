@@ -1049,7 +1049,8 @@ theorem refLoopCountdown_inFragment : inFragment refLoopCountdown = true := by d
 /-- At `bb3` of `refLoopCountdown`, forward CFG borrow dataflow (`ptrEnvAtEntry`)
 propagates the live `&mut _1` borrow `_5` across `bb2 -> bb3` inside the loop. -/
 theorem refLoopCountdown_ptrEnvAtEntry_bb3 :
-    (ptrEnvAtEntry refLoopCountdown 3)[5]? = some (.live (some (1, [])) [5]) := by
+    (ptrEnvAtEntry refLoopCountdown 3)[5]? =
+      some (.live (some (1, [])) [5] false true) := by
   decide
 
 def refLoopCountdownFn : Gen.Function where
@@ -1699,16 +1700,20 @@ theorem twoPhaseForeignWriteDiscrepancy_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 99 }, [1]) := by
   decide +kernel
 
-/-- Direct-write modeling gap between Anneal's `updateBorrowPerm` (`writerTag = .none`)
-and upstream Tree Borrows on `Freeze` two-phase borrows
+/-- Direct write to a local with an unprotected `Freeze` two-phase borrow
 (`_2 = &two_phase mut _1; _1 = 99; _0 = copy (*_2)`):
 `inFragment` rejects this body because `stmtPreservesAddrTaken` forbids direct
-writes to address-taken locals. Both Anneal (`updateBorrowPerm` keeps `.reserved`
-unchanged when `writerTag = .none`, as if every `.reserved` borrow were interior-mutable
-`ReservedIm`) and MiniRust's `BasicMemory` return `99`, whereas ground-truth
-`TreeBorrowsMemory` (`Permission.foreign_write_unprot_reserved_iff.1` and
-`treeBorrowsDirectWriteDisablesUnprotReserved` below) transitions unprotected
-`Freeze` `Reserved -> Disabled` on foreign writes so reading `*_2` raises UB. -/
+writes to address-taken locals. Under the merged `LM-3.3` `Trusted` semantics
+the former Anneal/Tree Borrows gap is closed: `&two_phase mut _1` records
+`.reservedFrz false` (`TreeBorrowPerm.reserved`), and `updateBorrowPerm` with
+`writerTag = .none` (the direct write `_1 = 99`) disables an unprotected
+`.reservedFrz false` entry, so reading `*_2` raises UB in Anneal
+(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`), agreeing with ground-truth
+`TreeBorrowsMemory` (`Permission.foreign_write_unprot_reserved_iff.1`,
+`treeBorrowsDirectWriteDisablesUnprotReserved`, and
+`twoPhaseDirectWriteTreeBorrowsGap_tb_direct`), which transitions unprotected
+`Freeze` `Reserved -> Disabled` on foreign writes. Only MiniRust's `BasicMemory`
+(no aliasing model) returns `99`. -/
 def twoPhaseDirectWriteTreeBorrowsGap : CapturedMir :=
   ptrBody "witness::two_phase_direct_write_tree_borrows_gap"
     [u32Decl, u32Decl, refMutU32Decl]
@@ -1723,14 +1728,10 @@ theorem twoPhaseDirectWriteTreeBorrowsGap_translate :
 theorem twoPhaseDirectWriteTreeBorrowsGap_notInFragment :
     inFragment twoPhaseDirectWriteTreeBorrowsGap = false := by decide +kernel
 
-theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ret :
-    ReachesRet (mirTree twoPhaseDirectWriteTreeBorrowsGap
-      (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) []
-      (.normal (.scalar ⟨99, 4⟩,
-        { (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 1 .mut (local_ 1) with perm := .reserved }],
-          nextTag := 2 })) :=
-  runA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ _ _ rfl
+theorem twoPhaseDirectWriteTreeBorrowsGap_anneal_ub :
+    ∃ tr u, Reaches (mirTree twoPhaseDirectWriteTreeBorrowsGap
+      (initMachineState twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound twoPhaseDirectWriteTreeBorrowsGap 20 _ (by decide)
 
 theorem twoPhaseDirectWriteTreeBorrowsGap_minirust_direct :
     retAfter twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 6 =
@@ -1738,8 +1739,8 @@ theorem twoPhaseDirectWriteTreeBorrowsGap_minirust_direct :
   decide +kernel
 
 /-- Mutably reborrowing `&mut (*_2)` from a `Frozen` shared reference `_2 = &_1`:
-Anneal faults on the permission check (`parentEntry.perm == .active`), while
-MiniRust's `BasicMemory` returns `5`. -/
+Anneal faults on the reborrow permission check (a `.frozen` parent entry rejects a
+`.mut` borrow kind), while MiniRust's `BasicMemory` returns `5`. -/
 def frozenRefMutReborrow : CapturedMir :=
   ptrBody "witness::frozen_ref_mut_reborrow" [u32Decl, u32Decl, refSharedU32Decl, refMutU32Decl]
     [.storageLive 2, .storageLive 3,
@@ -2145,10 +2146,15 @@ theorem retagRefReborrowChain_anneal_ret :
     ReachesRet (mirTree retagRefReborrowChain retagRefReborrowChainS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRefReborrowChainS0.memory with
-          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+          borrows := [{ rawPtrEntry 7 .not (local_ 1) with parentTag := some 6 },
+                      { rawPtrEntry 6 .not (local_ 1) with parentTag := some 5 },
+                      { rawPtrEntry 5 .mut (local_ 1) with
+                        perm := .reservedFrz false, parentTag := some 4 },
+                      { rawPtrEntry 4 .mut (local_ 1) with parentTag := some 3 },
+                      { rawPtrEntry 3 .mut (local_ 1) with parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 4 })) :=
+          nextTag := 8 })) :=
   runA_sound retagRefReborrowChain 40 _ _ _ rfl
 
 theorem retagRefReborrowChain_noUB :
@@ -2366,9 +2372,12 @@ theorem retagDisabledRefDiscrepancy_anneal_ret :
       (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,
         { (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]).memory with
-          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+          borrows := [{ rawPtrEntry 3 .mut (local_ 1) with
+                        perm := .reservedFrz false, parentTag := some 1 },
+                      { rawPtrEntry 2 .mut (local_ 1) with
+                        perm := .frozen, parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
-          nextTag := 3 })) :=
+          nextTag := 4 })) :=
   runA_sound retagDisabledRefDiscrepancy 25 _ _ _ rfl
 
 theorem retagDisabledRefDiscrepancy_minirust_direct :
@@ -2476,11 +2485,16 @@ theorem retagDisabledRefDiscrepancy_progress (n : Nat) :
     [.scalar ⟨5, 4⟩] (by decide) retagDisabledRefDiscrepancyMInit
     rfl rfl rfl retagDisabledRefDiscrepancy_noUB n
 
-/-- Scalar `Retag([default], _1)` discrepancy on `u32` parameter `_1`:
+/-- Scalar `Retag([default], _1)` on `u32` parameter `_1`:
 `translateFn` lowers `Retag` to `Statement::Validate`, while `statementOk`
-restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Anneal's
-`evalStmt` `.retag` rejects non-`.ptr` scalar values with `.ub`, whereas
-MiniRust's `Machine::retag_val` treats `Value::Int` as a no-op and returns `5`. -/
+restricts `Retag` to pointer/reference locals (`isDeclPtrLocal`). Under the
+merged `LM-3.3` `Trusted` `evalStmt` `.retag` dispatch (from `05658250`, kept by
+the `9ffc1853` merge; `314c4453`'s `extractDerefPtrVal?` dispatch instead faulted
+on scalars), a place whose type is neither `.rawPtr` nor `.ref` holding a
+non-pointer scalar value is a no-op, so Anneal returns `5`, now agreeing with
+MiniRust's `Machine::retag_val` (`Value::Int` no-op) on both `BasicMemory`
+(`retagScalarDiscrepancy_minirust_direct`) and `MachTB`
+(`retagScalarDiscrepancy_tb_direct`). -/
 def retagScalarDiscrepancy : CapturedMir :=
   ptrBody "witness::retag_scalar_discrepancy" [u32Decl, u32Decl]
     [.retag .default (local_ 1),
@@ -2492,10 +2506,12 @@ theorem retagScalarDiscrepancy_translate :
 theorem retagScalarDiscrepancy_notInFragment :
     inFragment retagScalarDiscrepancy = false := by decide +kernel
 
-theorem retagScalarDiscrepancy_anneal_ub :
-    ∃ tr u, Reaches (mirTree retagScalarDiscrepancy
-      (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound retagScalarDiscrepancy 15 _ (by decide)
+theorem retagScalarDiscrepancy_anneal_ret :
+    ReachesRet (mirTree retagScalarDiscrepancy
+      (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨5, 4⟩,
+        (initMachineState retagScalarDiscrepancy [.scalar ⟨5, 4⟩]).memory)) :=
+  runA_sound retagScalarDiscrepancy 15 _ _ _ rfl
 
 theorem retagScalarDiscrepancy_minirust_direct :
     retAfter retagScalarDiscrepancy [.scalar ⟨5, 4⟩] 4 =
@@ -3076,18 +3092,19 @@ theorem twoPhaseForeignWriteDiscrepancy_tb_direct :
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
 
-/-- End-to-end translated-MIR proof of the direct-write two-phase borrow gap:
-both Anneal (`writerTag = .none` leaves `.reserved` unchanged) and `BasicMemory`
-return `99`, whereas `MachTB` transitions unprotected `Freeze` `Reserved` to
-`Disabled` on `_1 = 99` and raises `"Tree Borrows: local read of Disabled reference"`
-at `_0 = copy (*_2)`. -/
+/-- End-to-end translated-MIR ground truth for the direct-write two-phase borrow
+witness: `MachTB` transitions unprotected `Freeze` `Reserved` to `Disabled` on
+`_1 = 99` and raises `"Tree Borrows: local read of Disabled reference"` at
+`_0 = copy (*_2)`, agreeing with Anneal's UB under the `LM-3.3` `updateBorrowPerm`
+(`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`: `writerTag = .none` disables the
+unprotected `.reservedFrz false` entry), whereas `BasicMemory` returns `99`. -/
 theorem twoPhaseDirectWriteTreeBorrowsGap_tb_direct :
     ubAfterTB twoPhaseDirectWriteTreeBorrowsGap [.scalar ⟨5, 4⟩] 5 =
       some "Tree Borrows: local read of Disabled reference" := by
   decide +kernel
 
 /-- Read-only mutable reborrow `_3 = &mut (*_2)` from shared `_2 = &_1`:
-Anneal faults eagerly at `&mut (*_2)` (`parentEntry.perm == .active`), whereas
+Anneal faults eagerly at `&mut (*_2)` (a `.frozen` parent rejects `.mut`), whereas
 `MachTB` creates `_3` lazily in `Reserved` (`init_access = Some(Read)`) and
 returns `5` because `_3` is only read and never written. -/
 theorem frozenRefMutReborrow_tb_direct :
@@ -3414,5 +3431,140 @@ theorem transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement :
       some (some { retAlloc with data := scalarBytes u32 5 }, [1]) ∧
     retAfterTB transmuteDanglingIntToRawPtrNoDerefOk [.scalar ⟨5, 4⟩] 7 = tbRetU32 5 :=
   ⟨transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret, by decide +kernel, by decide +kernel⟩
+
+/-- Reference-typed `Retag([raw], _2)` and `Retag([raw], _3)` (`_2 : &mut u32`,
+`_3 : &u32`): exercises `statementOk` / `evalStmt_retag_ref_local` / `Simulation`
+on `.retag .raw` applied to reference locals (`retagPerm .raw (.ref ..)` matches
+`.default`/`.twoPhase`, allocating child tags `2` and `4` in Anneal while MiniRust
+lowers both to `Validate(_, false)`), returning `5 + 7 = 12` across Anneal, `Mach`,
+and `MachTB`. -/
+def retagRawOnRefLocal : CapturedMir :=
+  ptrBody "witness::retag_raw_on_ref_local"
+    [u32Decl, u32Decl, refMutU32Decl, refSharedU32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .retag .raw (local_ 2),
+     .assign (local_ 4) (.copyForDeref (derefPlace 2)),
+     .assign (derefPlace 2) (.binaryOp .add (.copy (local_ 4)) (constU32 7)),
+     .assign (local_ 3) (.ref .shared (derefPlace 2)),
+     .retag .raw (local_ 3),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem retagRawOnRefLocal_inFragment : inFragment retagRawOnRefLocal = true := by decide
+
+def retagRawOnRefLocalFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .not u32),
+    (localName 4, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Validate (.Local (localName 2)) false,
+      .Assign (.Local (localName 4)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Constant (.Int 7) (.Int u32))),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .not u32)),
+      .Validate (.Local (localName 3)) false,
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem retagRawOnRefLocal_translate :
+    translateFn retagRawOnRefLocal = some retagRawOnRefLocalFn := rfl
+
+def retagRawOnRefLocalS0 : MachineState :=
+  initMachineState retagRawOnRefLocal [.scalar ⟨5, 4⟩]
+def retagRawOnRefLocalMInit : Mach :=
+  machine retagRawOnRefLocal retagRawOnRefLocalFn
+    retagRawOnRefLocalS0.frame.locals retagRawOnRefLocalFn.start
+
+theorem retagRawOnRefLocal_anneal_ret :
+    ReachesRet (mirTree retagRawOnRefLocal retagRawOnRefLocalS0) []
+      (.normal (.scalar ⟨12, 4⟩,
+        { retagRawOnRefLocalS0.memory with
+          borrows := [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
+                      { rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+                      { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
+          nextTag := 5 })) :=
+  runA_sound retagRawOnRefLocal 30 _ _ _ rfl
+
+theorem retagRawOnRefLocal_noUB :
+    MirNoUBTree (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) :=
+  runA_noUB retagRawOnRefLocal 30 _ _ _ rfl
+
+theorem retagRawOnRefLocal_minirust_direct :
+    retAfter retagRawOnRefLocal [.scalar ⟨5, 4⟩] 12 =
+      some (some { retAlloc with data := scalarBytes u32 12 }, [1]) := by
+  decide +kernel
+
+theorem retagRawOnRefLocal_tb_direct :
+    retAfterTB retagRawOnRefLocal [.scalar ⟨5, 4⟩] 12 = tbRetU32 12 := by
+  decide +kernel
+
+theorem retagRawOnRefLocal_ctxOk : CtxOk retagRawOnRefLocal ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : retagRawOnRefLocal.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [retagRawOnRefLocal, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [retagRawOnRefLocal, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : retagRawOnRefLocal.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [retagRawOnRefLocal, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem retagRawOnRefLocal_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n retagRawOnRefLocalMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 12 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+      retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+      rfl rfl rfl retagRawOnRefLocal_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [retagRawOnRefLocal, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem retagRawOnRefLocal_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n retagRawOnRefLocalMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k retagRawOnRefLocalMInit = .ok mRet ∧
+      ReturnRel retagRawOnRefLocal ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+    retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+    rfl rfl rfl retagRawOnRefLocal_noUB herr
+
+theorem retagRawOnRefLocal_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) retagRawOnRefLocalMInit = .ok m' ∧
+      StateRelN retagRawOnRefLocal retagRawOnRefLocalFn ctx0 s' m' ∧
+      Reaches (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr
+        (mirTree retagRawOnRefLocal s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k retagRawOnRefLocalMInit = .ok mRet ∧
+      ReturnRel retagRawOnRefLocal ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree retagRawOnRefLocal [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N retagRawOnRefLocal_inFragment retagRawOnRefLocal_translate ctx0
+    retagRawOnRefLocal_ctxOk [.scalar ⟨5, 4⟩] (by decide) retagRawOnRefLocalMInit
+    rfl rfl rfl retagRawOnRefLocal_noUB n
 
 end MiniRustSpec.Correspondence.RefWitness

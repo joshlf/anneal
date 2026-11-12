@@ -1987,10 +1987,10 @@ private theorem lookupBorrow_invalidate_self_active
   dsimp only [Option.map]
   refine ⟨updateBorrowPerm entry entry.targetLocal (some tag), rfl, ?_, ?_⟩
   · unfold updateBorrowPerm
-    simp only [Nat.beq_refl, h_etag]
-    cases entry.perm <;> rfl
+    simp only [Nat.beq_refl]
+    exact (applyTreeBorrowTransition_fields _ _).2.1
   · unfold updateBorrowPerm
-    simp only [Nat.beq_refl, h_etag]
+    simp only [Nat.beq_refl, treeBorrowWriterRelatedness, h_etag]
     rcases h_perm with hp | hp <;> simp [hp]
 
 @[simp]

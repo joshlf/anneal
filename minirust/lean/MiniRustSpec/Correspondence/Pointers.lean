@@ -72,10 +72,12 @@ MiniRust as the ground truth, on:
    `stepForeignRead`; soundness `PtrEnvOk.foreignRead`, `PtrEnvOk.derefRead`).
 
 Here Anneal is
-merely stricter than `BasicMemory`, and `ptrAliasingOk` tracks tag liveness and
-reservation (`hot : Bool`) flow-sensitively across CFGs so safe Rust
+merely stricter than `BasicMemory`, and `ptrAliasingOk` tracks tag liveness,
+reservation (`hot : Bool`), and ancestor writability (`writable : Bool`)
+flow-sensitively across CFGs so safe Rust
 borrow/reborrow patterns (two-phase borrows with foreign reads, mutable reborrow
-+ write + child use, sequential NLL borrows, and loop borrows/reborrows) stay
++ write + child use, sequential NLL borrows, `Retag([raw])`, and loop
+borrows/reborrows) stay
 inside `inFragment`. `MiniRustSpec.Correspondence.PointerWitness` and
 `RefWitness` check each case on concrete programs.
 -/
@@ -700,6 +702,21 @@ theorem sharedBorrowPerm_of_ptrTargetSpec {layouts : Layout.LayoutTable}
       · simp at h
     | _ => simp [ptrTargetSpec] at h
 
+theorem mutableBorrowPerm_of_sharedBorrowPerm_frozen {decls : List LocalDecl}
+    {layouts : Layout.LayoutTable} {place : Place}
+    (h : sharedBorrowPerm decls layouts place = .frozen) :
+    MirSemantics.mutableBorrowPerm decls layouts place = .reserved := by
+  unfold sharedBorrowPerm at h
+  unfold MirSemantics.mutableBorrowPerm
+  cases hpt : MirSemantics.placeTy decls layouts place with
+  | none => rfl
+  | some ty =>
+    rw [hpt] at h
+    dsimp only at h ⊢
+    cases hfr : MirSemantics.tyIsFreeze ty
+    · rw [hfr] at h; cases h
+    · rfl
+
 theorem sharedBorrowPerm_of_deref_ptrPointeeOf {layouts : Layout.LayoutTable}
     {decls : List LocalDecl} {p : Nat} {dp : LocalDecl}
     {srcMutbl : MirAst.Mutability} {pointeeIt : Gen.IntType}
@@ -717,13 +734,32 @@ theorem sharedBorrowPerm_of_deref_ptrPointeeOf {layouts : Layout.LayoutTable}
     simp [sharedBorrowPerm, placeTy_eq, resolveProjectedTy, get?, hdp, hpt, hfr]
   | _ => simp [hk] at hp
 
+theorem placeIsZeroSized_of_deref_ptrPointeeOf {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {p : Nat} {dp : LocalDecl}
+    {srcMutbl : MirAst.Mutability} {pointeeIt : Gen.IntType}
+    (hdp : decls[p]? = some dp) (hp : ptrPointeeOf dp.ty = some (srcMutbl, pointeeIt)) :
+    MirSemantics.placeIsZeroSized decls layouts ⟨p, [.deref]⟩ = false := by
+  unfold ptrPointeeOf at hp
+  cases hk : dp.ty.kind with
+  | rawPtr m inner | ref m inner =>
+    rw [hk] at hp
+    simp only [Option.map_eq_some_iff] at hp
+    obtain ⟨⟨s, nb⟩, hb, _⟩ := hp
+    have hpt : pointeeTyOf dp.ty = some ⟨inner, 0⟩ := by simp [pointeeTyOf, hk]
+    have hpl : MirSemantics.placeTy decls layouts ⟨p, [.deref]⟩ = some ⟨inner, 0⟩ := by
+      simp [placeTy_eq, resolveProjectedTy, get?, hdp, hpt]
+    simp only [MirSemantics.placeIsZeroSized, hpl, MirSemantics.tyIsZeroSized]
+    cases inner with
+    | int w => cases w <;> rfl
+    | uint w => cases w <;> rfl
+    | _ => simp [intTyBytes] at hb
+  | _ => simp [hk] at hp
+
 /-- The Tree Borrows permission of Anneal's `&place` (`Frozen` on `Freeze`
-targets), `&mut place` (`Active`), and two-phase `&two_phase mut place`
-(`Reserved`). -/
+targets) and `&mut place` / `&two_phase mut place` (`Reserved`). -/
 def refBorrowPerm : MirAst.BorrowKind → TreeBorrowPerm
   | .shared => .frozen
-  | .mut false => .active
-  | .mut true => .reserved
+  | .mut _ => .reserved
 
 /-- The Tree Borrows entry that Anneal's `&place` / `&mut place` /
 `&two_phase mut place` records on a `Freeze` place that neither starts with
@@ -738,16 +774,12 @@ theorem refBorrowEntry_cases (tag : Nat) (bkind : MirAst.BorrowKind) (place : Pl
       refBorrowEntry tag bkind place = { rawPtrEntry tag .mut place with perm := .reserved }) := by
   cases bkind with
   | shared => exact .inl rfl
-  | «mut» twoPhase =>
-    cases twoPhase with
-    | false => exact .inl rfl
-    | true => exact .inr ⟨rfl, rfl⟩
+  | «mut» _ => exact .inr ⟨rfl, rfl⟩
 
 /-- Anneal's `&place`, `&mut place`, or `&two_phase mut place` on a live local
 in the fragment: for any target place with `ptrTargetSpec` (all of whose leaf
-types are integer and therefore `Freeze`), `.shared` records `.frozen`,
-`.mut false` records `.active`, and `.mut true` records `.reserved`, matching
-`refBorrowEntry mem.nextTag bkind place`. -/
+types are integer and therefore `Freeze`), `.shared` records `.frozen` and
+`.mut _` records `.reserved`, matching `refBorrowEntry mem.nextTag bkind place`. -/
 theorem evalRvalue_ref_local (locals : List LocalSlot) (bkind : MirAst.BorrowKind)
     (place : Place)
     (mem : MirSemantics.Memory) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -760,6 +792,7 @@ theorem evalRvalue_ref_local (locals : List LocalSlot) (bkind : MirAst.BorrowKin
         { mem with borrows := refBorrowEntry mem.nextTag bkind place :: mem.borrows,
                    nextTag := mem.nextTag + 1 } := by
   have hsh := sharedBorrowPerm_of_ptrTargetSpec hspec
+  have hmut_p := mutableBorrowPerm_of_sharedBorrowPerm_frozen hsh
   obtain ⟨x, proj⟩ := place
   have hres := resolveBorrowProjectionElems_noIndex locals proj hni
   have hsub := projHasSubslice_of_noIndexProj proj hni
@@ -785,8 +818,8 @@ theorem evalRvalue_ref_local (locals : List LocalSlot) (bkind : MirAst.BorrowKin
     | nil =>
       cases slot with
       | dead => exact absurd rfl hlive
-      | uninit => simp [evalRvalue, get?, hs, refBorrowEntry, refBorrowPerm]
-      | init v => simp [evalRvalue, get?, hs, refBorrowEntry, refBorrowPerm]
+      | uninit => simp [evalRvalue, get?, hs, refBorrowEntry, refBorrowPerm, hmut_p]
+      | init v => simp [evalRvalue, get?, hs, refBorrowEntry, refBorrowPerm, hmut_p]
     | cons e rest =>
       cases e with
       | deref => exact absurd rfl (hnd rest)
@@ -801,7 +834,9 @@ theorem evalRvalue_ref_local (locals : List LocalSlot) (bkind : MirAst.BorrowKin
 records `Active`; `&raw const` inherits `Reserved` from a `Reserved` parent and
 records `Frozen` otherwise. -/
 def rawReborrowPerm : MirAst.Mutability → TreeBorrowPerm → TreeBorrowPerm
-  | .not, .reserved => .reserved
+  | .not, .reservedFrz c => .reservedFrz c
+  | .not, .reservedIM => .reservedIM
+  | .not, .cell => .cell
   | .not, _ => .frozen
   | .mut, _ => .active
 
@@ -880,6 +915,10 @@ theorem evalRvalue_ref_reborrow (locals : List LocalSlot) (bkind : MirAst.Borrow
         layouts (MirSemantics.placeTyResolved decls layouts ⟨p, [.deref]⟩)
         (MirSemantics.placeTyResolved decls layouts ⟨p, [.deref]⟩) false decls =
         some (some (parentEntry.targetProjection, 0)))
+    (hrub :
+      MirSemantics.hasTreeReadUB mem.borrows mem.borrows mem.activeProtectors
+        parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
+        parentEntry.rangeOffset parentEntry.rangeLen = false)
     (hptr8 : MirSemantics.layoutPointerBytes layouts = 8 := by rfl) :
     evalRvalue locals (.ref bkind ⟨p, [.deref]⟩) mem decls layouts =
       .ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8) locals
@@ -887,10 +926,14 @@ theorem evalRvalue_ref_reborrow (locals : List LocalSlot) (bkind : MirAst.Borrow
           borrows := refReborrowEntry mem.nextTag bkind parentEntry parentPtr.tag ::
             MirSemantics.freezeTreeBorrowsOnReadAtProj mem.borrows mem.borrows
               parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
-              parentEntry.rangeOffset parentEntry.rangeLen,
+              parentEntry.rangeOffset parentEntry.rangeLen mem.activeProtectors,
           nextTag := mem.nextTag + 1 } := by
   have hsh : sharedBorrowPerm decls layouts ⟨p, [.deref]⟩ = .frozen :=
     sharedBorrowPerm_of_deref_ptrPointeeOf hdp hp_ty
+  have hmut_p : MirSemantics.mutableBorrowPerm decls layouts ⟨p, [.deref]⟩ = .reserved :=
+    mutableBorrowPerm_of_sharedBorrowPerm_frozen hsh
+  have hzst : MirSemantics.placeIsZeroSized decls layouts ⟨p, [.deref]⟩ = false :=
+    placeIsZeroSized_of_deref_ptrPointeeOf hdp hp_ty
   unfold evalRvalue MirSemantics.evalRvalueRefDeref
   rw [hptr8]
   dsimp only [get?, MirSemantics.stripTransparentProjections, resolveBorrowProjectionElems]
@@ -905,14 +948,34 @@ theorem evalRvalue_ref_reborrow (locals : List LocalSlot) (bkind : MirAst.Borrow
   rw [hres]
   cases bkind with
   | shared =>
-    rw [hsh]
+    rw [hsh, hzst]
     cases hpe : parentEntry.perm with
     | disabled => exact absurd hpe hndis
-    | _ => rfl
+    | cell | reservedFrz _ | reservedIM | unique | frozen =>
+      dsimp only
+      cases hbs : mem.borrows with
+      | nil => rfl
+      | cons b1 rest =>
+        cases rest with
+        | nil => rfl
+        | cons b2 bs =>
+          rw [hbs] at hrub
+          rw [hrub]
+          rfl
   | «mut» twoPhase =>
+    rw [hmut_p, hzst]
     rcases hmut rfl with hpe | hpe <;>
     cases twoPhase <;>
-      (rw [hpe]; rfl)
+      (rw [hpe]; dsimp only;
+       cases hbs : mem.borrows with
+       | nil => rfl
+       | cons b1 rest =>
+         cases rest with
+         | nil => rfl
+         | cons b2 bs =>
+           rw [hbs] at hrub
+           rw [hrub]
+           rfl)
 
 theorem rigidTyByteSize_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirAst.Ty}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
@@ -2015,48 +2078,49 @@ theorem updateBorrowPermAtProj_fields (e : BorrowEntry) (targetLocal : Nat)
     (updateBorrowPermAtProj e targetLocal writerTag writeProj off len).protector = e.protector ∧
     (updateBorrowPermAtProj e targetLocal writerTag writeProj off len).rangeOffset = e.rangeOffset ∧
     (updateBorrowPermAtProj e targetLocal writerTag writeProj off len).rangeLen = e.rangeLen := by
-  unfold updateBorrowPermAtProj
-  cases Nat.beq e.targetLocal targetLocal
-  · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-  · cases writerTag with
-    | none =>
-      dsimp only []
-      cases borrowEntryOverlapsWrite e writeProj off len <;>
-        cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-    | some tag =>
-      dsimp only []
-      cases Nat.beq e.tag tag <;>
-        cases borrowEntryOverlapsWrite e writeProj off len <;>
-        cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  have h := updateBorrowPermAtProj_preserves_fields e targetLocal writerTag writeProj off len
+  exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.2.2.1, h.2.2.2.1, h.2.2.2.2.1⟩
 
 theorem updateBorrowPermAtProj_cases (e : BorrowEntry)
     (targetLocal tag : Nat) (writeProj : List ProjectionElem) :
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = e ∨
-    (e.perm = .reserved ∧
+    ((e.perm = .reserved ∨ e.perm = .reservedFrz true ∨ e.perm = .reservedIM) ∧
       updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = { e with perm := .active }) ∨
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = { e with perm := .disabled } := by
-  unfold updateBorrowPermAtProj
+  unfold updateBorrowPermAtProj MirSemantics.treeBorrowWriterRelatedness
   dsimp only []
-  cases Nat.beq e.targetLocal targetLocal
+  rcases e with ⟨_, _, _, perm, _, _, _, _⟩
+  cases Nat.beq _ targetLocal
   · exact .inl rfl
   · dsimp only []
-    cases Nat.beq e.tag tag
+    cases Nat.beq _ tag
     · dsimp only []
-      cases borrowEntryOverlapsWrite e writeProj 0 0
+      cases borrowEntryOverlapsWrite _ writeProj 0 0
       · exact .inl rfl
-      · exact .inr (.inr rfl)
+      · dsimp only []
+        cases perm with
+        | cell | reservedIM => exact .inl rfl
+        | reservedFrz c => cases c <;> exact .inr (.inr rfl)
+        | unique | frozen | disabled => exact .inr (.inr rfl)
     · dsimp only []
-      cases hpe : e.perm with
-      | reserved => exact .inr (.inl ⟨rfl, rfl⟩)
-      | _ => exact .inl rfl
+      cases perm with
+      | reservedFrz c =>
+        cases c
+        · exact .inr (.inl ⟨.inl rfl, rfl⟩)
+        · exact .inr (.inl ⟨.inr (.inl rfl), rfl⟩)
+      | reservedIM => exact .inr (.inl ⟨.inr (.inr rfl), rfl⟩)
+      | cell | unique | frozen | disabled => exact .inl rfl
 
-theorem updateBorrowPermAtProj_cases_of_ne_reserved {e : BorrowEntry} (hnr : e.perm ≠ .reserved)
+theorem updateBorrowPermAtProj_cases_of_ne_reserved {e : BorrowEntry}
+    (hnr : e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM)
     (targetLocal tag : Nat) (writeProj : List ProjectionElem) :
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = e ∨
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = { e with perm := .disabled } := by
-  rcases updateBorrowPermAtProj_cases e targetLocal tag writeProj with h | ⟨hr, _⟩ | h
+  rcases updateBorrowPermAtProj_cases e targetLocal tag writeProj with h | ⟨hr | hr | hr, _⟩ | h
   · exact .inl h
-  · exact absurd hr hnr
+  · exact absurd hr hnr.1
+  · exact absurd hr hnr.2.1
+  · exact absurd hr hnr.2.2
   · exact .inr h
 
 theorem updateBorrowPermAtProj_self_or_disjoint_keep (e : BorrowEntry) (targetLocal tag : Nat)
@@ -2066,21 +2130,23 @@ theorem updateBorrowPermAtProj_self_or_disjoint_keep (e : BorrowEntry) (targetLo
       (e.tag ≠ tag ∧ MirSemantics.projectionsOverlap e.targetProjection writeProj = false)) :
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = e ∨
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = { e with perm := .active } := by
-  unfold updateBorrowPermAtProj
-  cases hloc : Nat.beq e.targetLocal targetLocal with
+  rcases e with ⟨etag, etloc, etproj, perm, eroff, erlen, eprot, eptag⟩
+  unfold updateBorrowPermAtProj MirSemantics.treeBorrowWriterRelatedness
+  cases hloc : Nat.beq etloc targetLocal with
   | false => exact .inl rfl
   | true =>
     rcases h (Nat.beq_eq.mp hloc) with heqTag | ⟨hneTag, hdisj⟩
-    · have htag : Nat.beq e.tag tag = true := Nat.beq_eq.mpr heqTag
+    · have htag : Nat.beq etag tag = true := Nat.beq_eq.mpr heqTag
       simp only [htag]
-      cases e.perm with
-      | reserved => exact .inr rfl
-      | _ => exact .inl rfl
-    · have htag : Nat.beq e.tag tag = false := by
-        cases hb : Nat.beq e.tag tag with
+      cases perm with
+      | reservedFrz c => cases c <;> exact .inr rfl
+      | reservedIM => exact .inr rfl
+      | cell | unique | frozen | disabled => exact .inl rfl
+    · have htag : Nat.beq etag tag = false := by
+        cases hb : Nat.beq etag tag with
         | false => rfl
         | true => exact False.elim (hneTag (Nat.beq_eq.mp hb))
-      have hov : borrowEntryOverlapsWrite e writeProj 0 0 = false := by
+      have hov : borrowEntryOverlapsWrite ⟨etag, etloc, etproj, perm, eroff, erlen, eprot, eptag⟩ writeProj 0 0 = false := by
         simpa [borrowEntryOverlapsWrite] using hdisj
       simp [htag, hov]
 
@@ -2092,6 +2158,8 @@ theorem updateBorrowPermAtProj_nil_eq (e : BorrowEntry) (targetLocal : Nat)
     simpa [borrowEntryOverlapsWrite] using projectionsOverlap_nil_right e.targetProjection
   unfold updateBorrowPermAtProj updateBorrowPerm
   rw [hov]
+  cases Nat.beq e.targetLocal targetLocal <;>
+    cases MirSemantics.treeBorrowWriterRelatedness e writerTag <;> rfl
 
 theorem invalidateConflictingBorrows_eq_map (borrows : List BorrowEntry)
     (targetLocal : Nat) (writerTag : Option Nat) :
@@ -2143,18 +2211,28 @@ theorem lookupBorrow_mem_and_tag {borrows : List BorrowEntry} {tag : Nat} {entry
       exact ⟨.tail _ hmem, htag⟩
 
 theorem updateBorrowPerm_self_or_other (e : BorrowEntry) (targetLocal tag : Nat)
-    (h : e.targetLocal = targetLocal → e.tag = tag ∧ e.perm ≠ .reserved) :
+    (h : e.targetLocal = targetLocal →
+      e.tag = tag ∧ e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM) :
     updateBorrowPerm e targetLocal (some tag) = e := by
-  unfold updateBorrowPerm
-  cases hloc : Nat.beq e.targetLocal targetLocal with
+  rcases e with ⟨etag, etloc, etproj, perm, eroff, erlen, eprot, eptag⟩
+  unfold updateBorrowPerm MirSemantics.treeBorrowWriterRelatedness
+  cases hloc : Nat.beq etloc targetLocal with
   | false => rfl
   | true =>
-    obtain ⟨heqTag, _⟩ := h (Nat.beq_eq.mp hloc)
-    have htag : Nat.beq e.tag tag = true := Nat.beq_eq.mpr heqTag
+    obtain ⟨heqTag, hnr1, hnr2, hnr3⟩ := h (Nat.beq_eq.mp hloc)
+    have htag : Nat.beq etag tag = true := Nat.beq_eq.mpr heqTag
     simp only [htag]
+    cases perm with
+    | reservedFrz c =>
+      cases c
+      · exact absurd rfl hnr1
+      · exact absurd rfl hnr2
+    | reservedIM => exact absurd rfl hnr3
+    | cell | unique | frozen | disabled => rfl
 
 theorem invalidateConflictingBorrows_self (borrows : List BorrowEntry) (targetLocal tag : Nat)
-    (h : ∀ e ∈ borrows, e.targetLocal = targetLocal → e.tag = tag ∧ e.perm ≠ .reserved) :
+    (h : ∀ e ∈ borrows, e.targetLocal = targetLocal →
+      e.tag = tag ∧ e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM) :
     invalidateConflictingBorrows borrows targetLocal (some tag) = borrows := by
   induction borrows with
   | nil => rfl
@@ -2166,28 +2244,36 @@ theorem invalidateConflictingBorrows_self (borrows : List BorrowEntry) (targetLo
 theorem updateBorrowPermAtProj_self_or_disjoint (e : BorrowEntry) (targetLocal tag : Nat)
     (writeProj : List ProjectionElem)
     (h : e.targetLocal = targetLocal →
-      (e.tag = tag ∧ e.perm ≠ .reserved) ∨
+      (e.tag = tag ∧ e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM) ∨
       (e.tag ≠ tag ∧ MirSemantics.projectionsOverlap e.targetProjection writeProj = false)) :
     updateBorrowPermAtProj e targetLocal (some tag) writeProj 0 0 = e := by
-  unfold updateBorrowPermAtProj
-  cases hloc : Nat.beq e.targetLocal targetLocal with
+  rcases e with ⟨etag, etloc, etproj, perm, eroff, erlen, eprot, eptag⟩
+  unfold updateBorrowPermAtProj MirSemantics.treeBorrowWriterRelatedness
+  cases hloc : Nat.beq etloc targetLocal with
   | false => rfl
   | true =>
-    rcases h (Nat.beq_eq.mp hloc) with ⟨heqTag, _⟩ | ⟨hneTag, hdisj⟩
-    · have htag : Nat.beq e.tag tag = true := Nat.beq_eq.mpr heqTag
+    rcases h (Nat.beq_eq.mp hloc) with ⟨heqTag, hnr1, hnr2, hnr3⟩ | ⟨hneTag, hdisj⟩
+    · have htag : Nat.beq etag tag = true := Nat.beq_eq.mpr heqTag
       simp only [htag]
-    · have htag : Nat.beq e.tag tag = false := by
-        cases hb : Nat.beq e.tag tag with
+      cases perm with
+      | reservedFrz c =>
+        cases c
+        · exact absurd rfl hnr1
+        · exact absurd rfl hnr2
+      | reservedIM => exact absurd rfl hnr3
+      | cell | unique | frozen | disabled => rfl
+    · have htag : Nat.beq etag tag = false := by
+        cases hb : Nat.beq etag tag with
         | false => rfl
         | true => exact False.elim (hneTag (Nat.beq_eq.mp hb))
-      have hov : borrowEntryOverlapsWrite e writeProj 0 0 = false := by
+      have hov : borrowEntryOverlapsWrite ⟨etag, etloc, etproj, perm, eroff, erlen, eprot, eptag⟩ writeProj 0 0 = false := by
         simpa [borrowEntryOverlapsWrite] using hdisj
       simp [htag, hov]
 
 theorem invalidateConflictingBorrowsAtProj_self_or_disjoint (borrows : List BorrowEntry)
     (targetLocal tag : Nat) (writeProj : List ProjectionElem)
     (h : ∀ e ∈ borrows, e.targetLocal = targetLocal →
-      (e.tag = tag ∧ e.perm ≠ .reserved) ∨
+      (e.tag = tag ∧ e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM) ∨
       (e.tag ≠ tag ∧ MirSemantics.projectionsOverlap e.targetProjection writeProj = false)) :
     invalidateConflictingBorrowsAtProj borrows targetLocal (some tag) writeProj 0 0 = borrows := by
   induction borrows with
@@ -2265,7 +2351,7 @@ theorem invalidateDerefWriteBorrows_noop (locals : List LocalSlot) (borrows : Li
     (hfull : MirSemantics.resolveDerefWriteFullProj locals locals (.ptr ptrVal 8) entry [] =
       entry.targetProjection)
     (hdisj : ∀ e ∈ borrows, e.targetLocal = entry.targetLocal →
-      (e.tag = ptrVal.tag ∧ e.perm ≠ .reserved) ∨
+      (e.tag = ptrVal.tag ∧ e.perm ≠ .reserved ∧ e.perm ≠ .reservedFrz true ∧ e.perm ≠ .reservedIM) ∨
       (MirSemantics.isBorrowDescendantOrSelf borrows ptrVal.tag e.tag = false ∧
         MirSemantics.projectionsOverlap e.targetProjection entry.targetProjection = false)) :
     invalidateDerefWriteBorrows locals borrows ⟨p, [.deref]⟩ [] = borrows := by
@@ -2727,14 +2813,339 @@ theorem isBorrowDescendantOrSelf_cons_child {entry : BorrowEntry} {bs : List Bor
     rw [hp]
     exact isBorrowDescendantOrSelfAux_of_lookup_sub hext bs.length pTag a h
 
+/-- `a` is reachable from `c` along `BorrowEntry.parentTag` links in `borrows`
+for some finite fuel. -/
+def IsBorrowAncestorOrSelf (borrows : List BorrowEntry) (c a : Nat) : Prop :=
+  ∃ fuel, MirSemantics.isBorrowDescendantOrSelfAux fuel borrows c a = true
+
+theorem IsBorrowAncestorOrSelf.refl (borrows : List BorrowEntry) (t : Nat) :
+    IsBorrowAncestorOrSelf borrows t t :=
+  ⟨1, isBorrowDescendantOrSelfAux_self 1 borrows t⟩
+
+theorem IsBorrowAncestorOrSelf.of_eq {borrows : List BorrowEntry} {c a : Nat} (h : c = a) :
+    IsBorrowAncestorOrSelf borrows c a :=
+  h ▸ IsBorrowAncestorOrSelf.refl borrows c
+
+theorem IsBorrowAncestorOrSelf.of_descendant {borrows : List BorrowEntry} {c a : Nat}
+    (h : MirSemantics.isBorrowDescendantOrSelf borrows c a = true) :
+    IsBorrowAncestorOrSelf borrows c a :=
+  ⟨length borrows, h⟩
+
+theorem IsBorrowAncestorOrSelf.step {borrows : List BorrowEntry} {c pTag a : Nat}
+    {entry : BorrowEntry} (hlk : lookupBorrow borrows c = some entry)
+    (hp : entry.parentTag = some pTag)
+    (h : IsBorrowAncestorOrSelf borrows pTag a) :
+    IsBorrowAncestorOrSelf borrows c a := by
+  obtain ⟨fuel, hf⟩ := h
+  refine ⟨fuel + 1, ?_⟩
+  unfold MirSemantics.isBorrowDescendantOrSelfAux
+  cases Nat.beq c a with
+  | true => rfl
+  | false =>
+    rw [hlk]
+    dsimp only
+    rw [hp]
+    exact hf
+
+theorem isBorrowDescendantOrSelfAux_trans {borrows : List BorrowEntry} :
+    ∀ {f1 c b a : Nat},
+      MirSemantics.isBorrowDescendantOrSelfAux f1 borrows c b = true →
+      IsBorrowAncestorOrSelf borrows b a →
+      IsBorrowAncestorOrSelf borrows c a
+  | 0, _, _, _, h1, h2 => by
+    unfold MirSemantics.isBorrowDescendantOrSelfAux at h1
+    rw [Nat.beq_eq.mp h1]
+    exact h2
+  | f1 + 1, c, b, a, h1, h2 => by
+    unfold MirSemantics.isBorrowDescendantOrSelfAux at h1
+    cases hcb : Nat.beq c b with
+    | true =>
+      have heq : c = b := Nat.beq_eq.mp hcb
+      subst heq
+      exact h2
+    | false =>
+      rw [hcb] at h1
+      dsimp only at h1
+      cases hlk : lookupBorrow borrows c with
+      | none => rw [hlk] at h1; cases h1
+      | some e =>
+        rw [hlk] at h1
+        dsimp only at h1
+        cases hp : e.parentTag with
+        | none => rw [hp] at h1; cases h1
+        | some pTag =>
+          rw [hp] at h1
+          exact IsBorrowAncestorOrSelf.step hlk hp (isBorrowDescendantOrSelfAux_trans h1 h2)
+
+theorem IsBorrowAncestorOrSelf.trans {borrows : List BorrowEntry} {c b a : Nat}
+    (h1 : IsBorrowAncestorOrSelf borrows c b) (h2 : IsBorrowAncestorOrSelf borrows b a) :
+    IsBorrowAncestorOrSelf borrows c a := by
+  obtain ⟨f1, hf1⟩ := h1
+  exact isBorrowDescendantOrSelfAux_trans hf1 h2
+
+theorem IsBorrowAncestorOrSelf.of_lookup_sub {bs bs' : List BorrowEntry}
+    (hext : ∀ tag e, lookupBorrow bs tag = some e → lookupBorrow bs' tag = some e)
+    {c a : Nat} (h : IsBorrowAncestorOrSelf bs c a) :
+    IsBorrowAncestorOrSelf bs' c a := by
+  obtain ⟨fuel, hf⟩ := h
+  exact ⟨fuel, isBorrowDescendantOrSelfAux_of_lookup_sub hext fuel c a hf⟩
+
+theorem IsBorrowAncestorOrSelf.map_iff {bs : List BorrowEntry} {f : BorrowEntry → BorrowEntry}
+    (hf_tag : ∀ e, (f e).tag = e.tag) (hf_parent : ∀ e, (f e).parentTag = e.parentTag)
+    {c a : Nat} :
+    IsBorrowAncestorOrSelf (bs.map f) c a ↔ IsBorrowAncestorOrSelf bs c a := by
+  constructor <;> (rintro ⟨fuel, hf⟩; refine ⟨fuel, ?_⟩)
+  · rwa [isBorrowDescendantOrSelfAux_map_eq hf_tag hf_parent] at hf
+  · rwa [isBorrowDescendantOrSelfAux_map_eq hf_tag hf_parent]
+
+theorem IsBorrowAncestorOrSelf.cases_of_lookup {bs : List BorrowEntry} {c a : Nat}
+    {entry : BorrowEntry} (hlk : lookupBorrow bs c = some entry)
+    (h : IsBorrowAncestorOrSelf bs c a) :
+    c = a ∨ ∃ pTag, entry.parentTag = some pTag ∧ IsBorrowAncestorOrSelf bs pTag a := by
+  obtain ⟨fuel, hf⟩ := h
+  cases fuel with
+  | zero =>
+    unfold MirSemantics.isBorrowDescendantOrSelfAux at hf
+    exact .inl (Nat.beq_eq.mp hf)
+  | succ f =>
+    unfold MirSemantics.isBorrowDescendantOrSelfAux at hf
+    cases hbeq : Nat.beq c a with
+    | true => exact .inl (Nat.beq_eq.mp hbeq)
+    | false =>
+      rw [hbeq, hlk] at hf
+      dsimp only at hf
+      cases hp : entry.parentTag with
+      | none => rw [hp] at hf; cases hf
+      | some pTag =>
+        rw [hp] at hf
+        exact .inr ⟨pTag, rfl, f, hf⟩
+
+private theorem lookupBorrow_cons_of_ne (e : BorrowEntry) (rest : List BorrowEntry) (tag : Nat)
+    (h : e.tag ≠ tag) : lookupBorrow (e :: rest) tag = lookupBorrow rest tag := by
+  have hb : Nat.beq e.tag tag = false := by
+    cases hb : Nat.beq e.tag tag with
+    | false => rfl
+    | true => exact absurd (Nat.beq_eq.mp hb) h
+  simp only [lookupBorrow, hb]
+
+/-- Reverse-chronological borrow-tree ordering: every entry `e` prepended before
+`rest` has `b.tag < e.tag` for all `b ∈ rest`, and any `e.parentTag = some pt`
+resolves via `lookupBorrow rest pt`. -/
+def BorrowDagOrdered : List BorrowEntry → Prop
+  | [] => True
+  | e :: rest =>
+    (∀ pt, e.parentTag = some pt → ∃ b, lookupBorrow rest pt = some b) ∧
+    (∀ b ∈ rest, b.tag < e.tag) ∧
+    BorrowDagOrdered rest
+
+theorem BorrowDagOrdered.map {bs : List BorrowEntry} {f : BorrowEntry → BorrowEntry}
+    (hf_tag : ∀ e, (f e).tag = e.tag) (hf_parent : ∀ e, (f e).parentTag = e.parentTag)
+    (hdag : BorrowDagOrdered bs) : BorrowDagOrdered (bs.map f) := by
+  induction bs with
+  | nil => trivial
+  | cons e rest ih =>
+    obtain ⟨hpt, hlt, hrest⟩ := hdag
+    refine ⟨fun pt hp => ?_, fun b hb => ?_, ih hrest⟩
+    · rw [hf_parent e] at hp
+      obtain ⟨b, hlk⟩ := hpt pt hp
+      exact ⟨f b, by rw [lookupBorrow_map_eq hf_tag, hlk]; rfl⟩
+    · obtain ⟨b0, hb0, rfl⟩ := List.mem_map.mp hb
+      rw [hf_tag b0, hf_tag e]
+      exact hlt b0 hb0
+
+theorem BorrowDagOrdered.parent_lt_of_lookup {bs : List BorrowEntry}
+    (hdag : BorrowDagOrdered bs) :
+    ∀ {c pt : Nat} {b : BorrowEntry},
+      lookupBorrow bs c = some b → b.parentTag = some pt →
+      ∃ p, lookupBorrow bs pt = some p ∧ pt < b.tag := by
+  induction bs with
+  | nil => intro _ _ _ hlk _; simp [lookupBorrow] at hlk
+  | cons e rest ih =>
+    intro c pt b hlk hp
+    obtain ⟨hpt, hlt, hrest⟩ := hdag
+    unfold lookupBorrow at hlk
+    cases hb : Nat.beq e.tag c with
+    | true =>
+      rw [hb] at hlk
+      injection hlk with heq
+      subst heq
+      obtain ⟨p, hlk_p⟩ := hpt pt hp
+      obtain ⟨hp_mem, hp_tag⟩ := lookupBorrow_mem_and_tag hlk_p
+      have hpt_lt : pt < e.tag := hp_tag ▸ hlt p hp_mem
+      have hne : e.tag ≠ pt := by omega
+      exact ⟨p, by rw [lookupBorrow_cons_of_ne e rest pt hne]; exact hlk_p, hpt_lt⟩
+    | false =>
+      rw [hb] at hlk
+      obtain ⟨p, hlk_p, hpt_lt⟩ := ih hrest hlk hp
+      obtain ⟨hb_mem, _⟩ := lookupBorrow_mem_and_tag hlk
+      have hb_lt : b.tag < e.tag := hlt b hb_mem
+      have hne : e.tag ≠ pt := by omega
+      exact ⟨p, by rw [lookupBorrow_cons_of_ne e rest pt hne]; exact hlk_p, hpt_lt⟩
+
+theorem isBorrowDescendantOrSelfAux_cons_of_lt {e : BorrowEntry} {rest : List BorrowEntry}
+    (hdag : BorrowDagOrdered (e :: rest)) :
+    ∀ (fuel : Nat) {c : Nat} (a : Nat),
+      c < e.tag →
+      MirSemantics.isBorrowDescendantOrSelfAux fuel (e :: rest) c a =
+        MirSemantics.isBorrowDescendantOrSelfAux fuel rest c a
+  | 0, _, _, _ => rfl
+  | fuel + 1, c, a, hlt_c => by
+    unfold MirSemantics.isBorrowDescendantOrSelfAux
+    cases Nat.beq c a with
+    | true => rfl
+    | false =>
+      have hne : e.tag ≠ c := by omega
+      rw [lookupBorrow_cons_of_ne e rest c hne]
+      cases hlk : lookupBorrow rest c with
+      | none => rfl
+      | some b =>
+        dsimp only
+        cases hp : b.parentTag with
+        | none => rfl
+        | some pt =>
+          obtain ⟨_, _, hpt_lt⟩ := hdag.2.2.parent_lt_of_lookup hlk hp
+          have hlt_b : b.tag < e.tag := hdag.2.1 b (lookupBorrow_mem_and_tag hlk).1
+          exact isBorrowDescendantOrSelfAux_cons_of_lt hdag fuel a (by omega)
+
+theorem IsBorrowAncestorOrSelf.cons_of_lt_iff {e : BorrowEntry} {rest : List BorrowEntry}
+    (hdag : BorrowDagOrdered (e :: rest)) {c a : Nat} (hlt_c : c < e.tag) :
+    IsBorrowAncestorOrSelf (e :: rest) c a ↔ IsBorrowAncestorOrSelf rest c a := by
+  constructor <;> (rintro ⟨fuel, hf⟩; refine ⟨fuel, ?_⟩)
+  · rwa [isBorrowDescendantOrSelfAux_cons_of_lt hdag fuel a hlt_c] at hf
+  · rwa [isBorrowDescendantOrSelfAux_cons_of_lt hdag fuel a hlt_c]
+
+theorem BorrowDagOrdered.descendant_of_ancestor {bs : List BorrowEntry}
+    (hdag : BorrowDagOrdered bs) :
+    ∀ {c a : Nat} {ec : BorrowEntry},
+      lookupBorrow bs c = some ec →
+      IsBorrowAncestorOrSelf bs c a →
+      MirSemantics.isBorrowDescendantOrSelf bs c a = true := by
+  induction bs with
+  | nil => intro _ _ _ hlk _; simp [lookupBorrow] at hlk
+  | cons e rest ih =>
+    intro c a ec hlk ⟨fuel, hf⟩
+    unfold MirSemantics.isBorrowDescendantOrSelf
+    rw [trusted_length_eq]
+    simp only [List.length_cons]
+    cases fuel with
+    | zero =>
+      unfold MirSemantics.isBorrowDescendantOrSelfAux at hf ⊢
+      rw [hf]
+    | succ f =>
+      unfold MirSemantics.isBorrowDescendantOrSelfAux at hf ⊢
+      cases hca : Nat.beq c a with
+      | true => rfl
+      | false =>
+        rw [hca] at hf
+        dsimp only at hf ⊢
+        have hlk' := hlk
+        unfold lookupBorrow at hlk'
+        cases hec : Nat.beq e.tag c with
+        | true =>
+          rw [hec] at hlk'
+          injection hlk' with heq
+          subst heq
+          have htag_eq : e.tag = c := Nat.beq_eq.mp hec
+          rw [hlk] at hf ⊢
+          dsimp only at hf ⊢
+          cases hp : e.parentTag with
+          | none => rw [hp] at hf; cases hf
+          | some pt =>
+            rw [hp] at hf
+            dsimp only at hf ⊢
+            obtain ⟨b, hlk_pt⟩ := hdag.1 pt hp
+            have hpt_lt : pt < e.tag :=
+              (lookupBorrow_mem_and_tag hlk_pt).2 ▸ hdag.2.1 b (lookupBorrow_mem_and_tag hlk_pt).1
+            rw [isBorrowDescendantOrSelfAux_cons_of_lt hdag f a hpt_lt] at hf
+            have hih := ih hdag.2.2 hlk_pt ⟨f, hf⟩
+            unfold MirSemantics.isBorrowDescendantOrSelf at hih
+            rw [trusted_length_eq] at hih
+            rw [isBorrowDescendantOrSelfAux_cons_of_lt hdag rest.length a hpt_lt]
+            exact hih
+        | false =>
+          rw [hec] at hlk'
+          have hc_lt : c < e.tag :=
+            (lookupBorrow_mem_and_tag hlk').2 ▸ hdag.2.1 ec (lookupBorrow_mem_and_tag hlk').1
+          have hf_full : MirSemantics.isBorrowDescendantOrSelfAux (f + 1) (e :: rest) c a = true := by
+            unfold MirSemantics.isBorrowDescendantOrSelfAux
+            rw [hca]
+            exact hf
+          rw [isBorrowDescendantOrSelfAux_cons_of_lt hdag (f + 1) a hc_lt] at hf_full
+          have hih := ih hdag.2.2 hlk' ⟨f + 1, hf_full⟩
+          unfold MirSemantics.isBorrowDescendantOrSelf at hih
+          rw [trusted_length_eq] at hih
+          have hih' : MirSemantics.isBorrowDescendantOrSelfAux (rest.length + 1) (e :: rest) c a = true := by
+            rw [isBorrowDescendantOrSelfAux_cons_of_lt hdag (rest.length + 1) a hc_lt]
+            exact isBorrowDescendantOrSelfAux_mono (Nat.le_succ _) hih
+          unfold MirSemantics.isBorrowDescendantOrSelfAux at hih'
+          rw [hca] at hih'
+          exact hih'
+
+theorem treeBorrowChainChildAccessUBAux_write_false {borrows : List BorrowEntry} :
+    ∀ (fuel : Nat) (pOpt : Option Nat),
+      (∀ tag, pOpt = some tag →
+        ∀ anc ∈ borrows, IsBorrowAncestorOrSelf borrows tag anc.tag →
+          anc.perm ≠ .disabled ∧ anc.perm ≠ .frozen) →
+      MirSemantics.treeBorrowChainChildAccessUBAux .write fuel borrows pOpt = false
+  | 0, _, _ => rfl
+  | fuel + 1, none, _ => rfl
+  | fuel + 1, some tag, hok => by
+    unfold MirSemantics.treeBorrowChainChildAccessUBAux
+    cases hlk : lookupBorrow borrows tag with
+    | none => rfl
+    | some anc =>
+      dsimp only
+      obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlk
+      obtain ⟨hndis, hnf⟩ := hok tag rfl anc hmem (IsBorrowAncestorOrSelf.of_eq htag.symm)
+      have hub : MirSemantics.treeBorrowTransitionIsUB
+          (MirSemantics.treeBorrowPermTransition .write .localAccess anc.perm false) = false := by
+        cases hpe : anc.perm with
+        | disabled => exact absurd hpe hndis
+        | frozen => exact absurd hpe hnf
+        | cell | reservedIM | unique => rfl
+        | reservedFrz c => cases c <;> rfl
+      rw [hub]
+      exact treeBorrowChainChildAccessUBAux_write_false fuel anc.parentTag
+        (fun pTag hp a ha hanc =>
+          hok tag rfl a ha (IsBorrowAncestorOrSelf.step hlk hp hanc))
+
+theorem derefWriteTreeUB_false_of_ancestors_writable (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (w : Nat)
+    (hw : ∀ ptrVal sz, locals[w]? = some (.init (.ptr ptrVal sz)) →
+      ∀ anc ∈ borrows, IsBorrowAncestorOrSelf borrows ptrVal.tag anc.tag →
+        anc.perm ≠ .disabled ∧ anc.perm ≠ .frozen) :
+    MirSemantics.derefWriteTreeUB locals borrows ⟨w, [.deref]⟩ = false := by
+  unfold MirSemantics.derefWriteTreeUB
+  rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
+  · rfl
+  · rfl
+  · simp only [get?]
+    cases hloc : locals[w]? with
+    | none => rfl
+    | some slot =>
+      cases slot with
+      | uninit | dead => rfl
+      | init val =>
+        cases val with
+        | ptr ptrVal sz =>
+          dsimp only
+          cases hlk : lookupBorrow (b1 :: b2 :: bs) ptrVal.tag with
+          | none => rfl
+          | some entry =>
+            exact treeBorrowChainChildAccessUBAux_write_false _ entry.parentTag
+              (fun pTag hp anc hmem hanc =>
+                hw ptrVal sz hloc anc hmem (IsBorrowAncestorOrSelf.step hlk hp hanc))
+        | unit | scalar _ | aggregate _ _ => rfl
+
 /-- Concrete meaning of `PtrLocalState` for local `p` at runtime slots `view`
 and Anneal borrow table `borrows`:
 * `.empty` (`⊥`): `p` holds no initialized 8-byte pointer;
-* `.live target peers hot`: if `p` holds an initialized pointer `pv`, its borrow
-  entry is not `.disabled`, is not `.frozen` when `p` is a mutable
-  pointer/reference local (`isMutPtrLocal`; Tree Borrows foreign reads freeze
-  `.active` entries, `stepForeignRead`), is not `.active` when `hot = false`,
-  matches `target` (when `some`), and has a tag in the Tree Borrows subtree of
+* `.live target peers hot writable`: if `p` holds an initialized pointer `pv`,
+  its borrow entry and every ancestor `anc` in `borrows` (`IsBorrowAncestorOrSelf`)
+  are not `.disabled`, are not `.frozen` when `writable = true` and `p` is a
+  mutable pointer/reference local (`isMutPtrLocal`), are not `.active` when
+  `hot = false` and `p` is a mutable local, share the same static target place,
+  match `target` (when `some`), and `pv.tag` is in the Tree Borrows subtree of
   every initialized pointer/reference local in `peers`
   (`isBorrowDescendantOrSelf borrows pv.tag pv_r.tag = true`);
 * `.disabled` (`⊤`): unconstrained (`True`). -/
@@ -2743,13 +3154,19 @@ def PtrLocalOk (body : CapturedMir) (view : List LocalSlot) (borrows : List Borr
   | .empty =>
     ∀ dp pv, body.localDecls[p]? = some dp → isPtrTy dp.ty = true →
       view[p]? ≠ some (.init (.ptr pv 8))
-  | .live target peers hot =>
+  | .live target peers hot writable =>
     ∀ dp pv, body.localDecls[p]? = some dp → isPtrTy dp.ty = true →
       view[p]? = some (.init (.ptr pv 8)) →
       (∃ entry, lookupBorrow borrows pv.tag = some entry ∧ entry.perm ≠ .disabled ∧
-        (isMutPtrLocal body.localDecls p = true → entry.perm ≠ .frozen) ∧
+        (writable = true → isMutPtrLocal body.localDecls p = true → entry.perm ≠ .frozen) ∧
         (isMutPtrLocal body.localDecls p = true → hot = false → entry.perm ≠ .active) ∧
-        (∀ q, target = some q → (entry.targetLocal, borrowProjSteps entry.targetProjection) = q)) ∧
+        (∀ q, target = some q → (entry.targetLocal, borrowProjSteps entry.targetProjection) = q) ∧
+        (∀ anc ∈ borrows, IsBorrowAncestorOrSelf borrows pv.tag anc.tag →
+          anc.perm ≠ .disabled ∧
+          (writable = true → isMutPtrLocal body.localDecls p = true → anc.perm ≠ .frozen) ∧
+          (isMutPtrLocal body.localDecls p = true → hot = false → anc.perm ≠ .active) ∧
+          (anc.targetLocal, borrowProjSteps anc.targetProjection) =
+            (entry.targetLocal, borrowProjSteps entry.targetProjection))) ∧
       (∀ r ∈ peers, ∀ dr pv_r, body.localDecls[r]? = some dr → isPtrTy dr.ty = true →
         view[r]? = some (.init (.ptr pv_r 8)) →
         MirSemantics.isBorrowDescendantOrSelf borrows pv.tag pv_r.tag = true)
@@ -2766,7 +3183,7 @@ theorem PtrLocalOk.of_empty {body : CapturedMir} {view : List LocalSlot}
     PtrLocalOk body view borrows p s := by
   cases s with
   | empty => exact h
-  | live _ _ _ =>
+  | live _ _ _ _ =>
     intro dp pv hdp hpty hv
     exact False.elim (h dp pv hdp hpty hv)
   | disabled => trivial
@@ -2780,22 +3197,31 @@ theorem PtrLocalOk.of_subsumes {body : CapturedMir} {view : List LocalSlot}
   | empty => exact hok.of_empty s2
   | disabled =>
     cases s2 <;> first | trivial | (simp [subsumesPtrLocalState] at hsub)
-  | live t1 ps1 h1 =>
+  | live t1 ps1 h1 w1 =>
     cases s2 with
     | empty => simp [subsumesPtrLocalState] at hsub
     | disabled => trivial
-    | live t2 ps2 h2 =>
+    | live t2 ps2 h2 w2 =>
       simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
         List.contains_iff_mem] at hsub
-      obtain ⟨⟨hh, ht⟩, hps⟩ := hsub
+      obtain ⟨⟨⟨hh, hw⟩, ht⟩, hps⟩ := hsub
       intro dp pv hdp hpty hv
-      obtain ⟨⟨entry, hlk, hndis, hnf, hnact1, ht1⟩, hpeers1⟩ := hok dp pv hdp hpty hv
-      refine ⟨⟨entry, hlk, hndis, hnf, fun hm hh2 => hnact1 hm (by subst hh2; cases h1 <;> simp_all),
-        fun q hq => ?_⟩, fun r hr dr pv_r hdr hptr hvr =>
-        hpeers1 r (hps r hr) dr pv_r hdr hptr hvr⟩
-      rw [hq] at ht
-      simp only [decide_eq_true_eq] at ht
-      exact ht1 q ht
+      obtain ⟨⟨entry, hlk, hndis, hnf1, hnact1, ht1, hanc1⟩, hpeers1⟩ := hok dp pv hdp hpty hv
+      have hw1 : w2 = true → w1 = true := fun hw2 => by subst hw2; cases w1 <;> simp_all
+      have hh1 : h2 = false → h1 = false := fun hh2 => by subst hh2; cases h1 <;> simp_all
+      refine ⟨⟨entry, hlk, hndis,
+        fun hw2 hm => hnf1 (hw1 hw2) hm,
+        fun hm hh2 => hnact1 hm (hh1 hh2),
+        fun q hq => ?_,
+        fun anc hmem hanc => ?_⟩,
+        fun r hr dr pv_r hdr hptr hvr =>
+          hpeers1 r (hps r hr) dr pv_r hdr hptr hvr⟩
+      · rw [hq] at ht
+        simp only [decide_eq_true_eq] at ht
+        exact ht1 q ht
+      · obtain ⟨ha_ndis, ha_nf, ha_nact, ha_tgt⟩ := hanc1 anc hmem hanc
+        exact ⟨ha_ndis, fun hw2 hm => ha_nf (hw1 hw2) hm,
+          fun hm hh2 => ha_nact hm (hh1 hh2), ha_tgt⟩
 
 theorem PtrEnvOk.of_subsumes {body : CapturedMir} {view : List LocalSlot}
     {borrows : List BorrowEntry} {e1 e2 : List PtrLocalState}
@@ -2907,12 +3333,35 @@ theorem subsumesPtrLocalState_refl (s : PtrLocalState) :
     subsumesPtrLocalState s s = true := by
   cases s with
   | empty | disabled => rfl
-  | live t ps hot =>
-    cases hot <;> cases t <;> simp [subsumesPtrLocalState]
+  | live t ps hot writable =>
+    cases hot <;> cases writable <;> cases t <;> simp [subsumesPtrLocalState]
 
 theorem subsumesPtrLocalState_disabled_right (s : PtrLocalState) :
     subsumesPtrLocalState s .disabled = true := by
   cases s <;> rfl
+
+theorem subsumesPtrLocalState_freeze_right (s : PtrLocalState) :
+    subsumesPtrLocalState s (freezePtrState s) = true := by
+  cases s with
+  | empty | disabled => rfl
+  | live t ps hot writable =>
+    cases hot <;> cases writable <;> cases t <;> simp [freezePtrState, subsumesPtrLocalState]
+
+theorem freezePtrState_mono {s1 s2 : PtrLocalState}
+    (h : subsumesPtrLocalState s1 s2 = true) :
+    subsumesPtrLocalState (freezePtrState s1) (freezePtrState s2) = true := by
+  cases s1 with
+  | empty => rfl
+  | disabled =>
+    cases s2 <;> simp_all [freezePtrState, subsumesPtrLocalState]
+  | live t1 ps1 h1 w1 =>
+    cases s2 with
+    | empty => simp [subsumesPtrLocalState] at h
+    | disabled => rfl
+    | live t2 ps2 h2 w2 =>
+      simp only [freezePtrState, subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
+        List.contains_iff_mem] at h ⊢
+      exact ⟨⟨⟨h.1.1.1, rfl⟩, h.1.2⟩, h.2⟩
 
 theorem subsumesPtrLocalState_trans {s1 s2 s3 : PtrLocalState}
     (h12 : subsumesPtrLocalState s1 s2 = true)
@@ -2922,19 +3371,20 @@ theorem subsumesPtrLocalState_trans {s1 s2 s3 : PtrLocalState}
   | empty => rfl
   | disabled =>
     cases s2 <;> cases s3 <;> simp_all [subsumesPtrLocalState]
-  | live t1 ps1 hh1 =>
+  | live t1 ps1 hh1 ww1 =>
     cases s2 with
     | empty => simp [subsumesPtrLocalState] at h12
     | disabled =>
       cases s3 <;> simp_all [subsumesPtrLocalState]
-    | live t2 ps2 hh2 =>
+    | live t2 ps2 hh2 ww2 =>
       cases s3 with
       | empty => simp [subsumesPtrLocalState] at h23
       | disabled => rfl
-      | live t3 ps3 hh3 =>
+      | live t3 ps3 hh3 ww3 =>
         simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
           List.contains_iff_mem] at h12 h23 ⊢
-        refine ⟨⟨by cases hh1 <;> cases hh2 <;> cases hh3 <;> simp_all, ?_⟩,
+        refine ⟨⟨⟨by cases hh1 <;> cases hh2 <;> cases hh3 <;> simp_all,
+                  by cases ww1 <;> cases ww2 <;> cases ww3 <;> simp_all⟩, ?_⟩,
           fun r hr => h12.2 r (h23.2 r hr)⟩
         cases t3 with
         | none => trivial
@@ -2948,14 +3398,15 @@ theorem joinPtrLocalState_subsumes_left (s1 s2 : PtrLocalState) :
   cases s1 with
   | empty => rfl
   | disabled => cases s2 <;> rfl
-  | live t1 ps1 h1 =>
+  | live t1 ps1 h1 w1 =>
     cases s2 with
     | empty => exact subsumesPtrLocalState_refl _
     | disabled => rfl
-    | live t2 ps2 h2 =>
+    | live t2 ps2 h2 w2 =>
       simp only [joinPtrLocalState, subsumesPtrLocalState, Bool.and_eq_true,
         List.all_eq_true, List.mem_filter, List.contains_iff_mem]
-      refine ⟨⟨by cases h1 <;> cases h2 <;> rfl, ?_⟩, fun r hr => hr.1⟩
+      refine ⟨⟨⟨by cases h1 <;> cases h2 <;> rfl, by cases w1 <;> cases w2 <;> rfl⟩, ?_⟩,
+        fun r hr => hr.1⟩
       by_cases h : (t1 == t2) = true
       · simp only [h, ↓reduceIte]
         cases t1 <;> simp
@@ -2966,14 +3417,15 @@ theorem joinPtrLocalState_subsumes_right (s1 s2 : PtrLocalState) :
   cases s1 with
   | empty => exact subsumesPtrLocalState_refl _
   | disabled => cases s2 <;> rfl
-  | live t1 ps1 h1 =>
+  | live t1 ps1 h1 w1 =>
     cases s2 with
     | empty => rfl
     | disabled => rfl
-    | live t2 ps2 h2 =>
+    | live t2 ps2 h2 w2 =>
       simp only [joinPtrLocalState, subsumesPtrLocalState, Bool.and_eq_true,
         List.all_eq_true, List.mem_filter, List.contains_iff_mem]
-      refine ⟨⟨by cases h1 <;> cases h2 <;> rfl, ?_⟩, fun r hr => hr.2⟩
+      refine ⟨⟨⟨by cases h1 <;> cases h2 <;> rfl, by cases w1 <;> cases w2 <;> rfl⟩, ?_⟩,
+        fun r hr => hr.2⟩
       by_cases h : (t1 == t2) = true
       · have heq : t1 = t2 := eq_of_beq h
         subst heq
@@ -2989,19 +3441,20 @@ theorem joinPtrLocalState_least {s1 s2 u : PtrLocalState}
   | empty => exact h2
   | disabled =>
     cases s2 <;> cases u <;> simp_all [joinPtrLocalState, subsumesPtrLocalState]
-  | live t1 ps1 hh1 =>
+  | live t1 ps1 hh1 ww1 =>
     cases s2 with
     | empty => exact h1
     | disabled =>
       cases u <;> simp_all [joinPtrLocalState, subsumesPtrLocalState]
-    | live t2 ps2 hh2 =>
+    | live t2 ps2 hh2 ww2 =>
       cases u with
       | empty => simp [subsumesPtrLocalState] at h1
       | disabled => rfl
-      | live tu psu hhu =>
+      | live tu psu hhu wwu =>
         simp only [joinPtrLocalState, subsumesPtrLocalState, Bool.and_eq_true,
           List.all_eq_true, List.mem_filter, List.contains_iff_mem] at h1 h2 ⊢
-        refine ⟨⟨by cases hh1 <;> cases hh2 <;> cases hhu <;> simp_all, ?_⟩,
+        refine ⟨⟨⟨by cases hh1 <;> cases hh2 <;> cases hhu <;> simp_all,
+                  by cases ww1 <;> cases ww2 <;> cases wwu <;> simp_all⟩, ?_⟩,
           fun r hr => ⟨h1.2 r hr, h2.2 r hr⟩⟩
         cases tu with
         | none => trivial
@@ -3067,11 +3520,11 @@ theorem removePeerFromState_mono (i : Nat) {s1 s2 : PtrLocalState}
   | empty => rfl
   | disabled =>
     cases s2 <;> simp_all [removePeerFromState, subsumesPtrLocalState]
-  | live t1 ps1 h1 =>
+  | live t1 ps1 h1 w1 =>
     cases s2 with
     | empty => simp [subsumesPtrLocalState] at h
     | disabled => rfl
-    | live t2 ps2 h2 =>
+    | live t2 ps2 h2 w2 =>
       simp only [removePeerFromState, subsumesPtrLocalState, Bool.and_eq_true,
         List.all_eq_true, List.mem_filter, List.contains_iff_mem] at h ⊢
       exact ⟨h.1, fun r hr => ⟨h.2 r hr.1, hr.2⟩⟩
@@ -3083,11 +3536,11 @@ theorem addPeerToState_mono (i : Nat) {s1 s2 : PtrLocalState}
   | empty => rfl
   | disabled =>
     cases s2 <;> simp_all [addPeerToState, subsumesPtrLocalState]
-  | live t1 ps1 h1 =>
+  | live t1 ps1 h1 w1 =>
     cases s2 with
     | empty => simp [subsumesPtrLocalState] at h
     | disabled => rfl
-    | live t2 ps2 h2 =>
+    | live t2 ps2 h2 w2 =>
       simp only [addPeerToState]
       by_cases hc2 : ps2.contains i = true
       · have hc1 : ps1.contains i = true := by
@@ -3143,6 +3596,13 @@ theorem ptrStmtStep_length (decls : List LocalDecl) (env : List PtrLocalState)
           cases ptrDerefReadSrc rv <;> (simp only [stepDerefWrite]; split <;> simp)
         | cons _ _ => simp [ptrStmtStep]
       | _ => simp [ptrStmtStep]
+  | retag _ p =>
+    obtain ⟨i, projs⟩ := p
+    cases projs with
+    | nil =>
+      simp only [ptrStmtStep]
+      split <;> simp [stepReborrow, setPtrLocal]
+    | cons _ _ => simp [ptrStmtStep]
   | storageLive i | storageDead i =>
     simp only [ptrStmtStep]
     split <;> simp [setPtrLocal]
@@ -3173,37 +3633,37 @@ private theorem stepDerefWrite_mono (n : Nat) {e1 e2 : List PtrLocalState}
     | disabled =>
       rw [getD_map_range _ _ _ hq]
       exact subsumesPtrLocalState_disabled_right _
-    | live wT2 wP2 _ =>
+    | live wT2 wP2 _ _ =>
       rw [getD_map_range _ _ _ hq]
       have hq_sub := hall q
       cases hq2 : e2.getD q .disabled with
       | empty => rw [hq2] at hq_sub; exact hq_sub
       | disabled => exact subsumesPtrLocalState_disabled_right _
-      | live qT2 qP2 qH2 =>
+      | live qT2 qP2 qH2 qW2 =>
         rw [hq2] at hq_sub
         by_cases hc : (wP2.contains q || targetsDefinitelyDisjoint qT2 wT2) = true
         · simp only [hc, ↓reduceIte]
           refine subsumesPtrLocalState_trans hq_sub ?_
           simp only [subsumesPtrLocalState, Bool.or_true, Bool.true_and, Bool.and_eq_true,
             List.all_eq_true, List.contains_iff_mem]
-          exact ⟨by cases qT2 <;> simp, fun r hr => hr⟩
+          exact ⟨⟨by cases qW2 <;> rfl, by cases qT2 <;> simp⟩, fun r hr => hr⟩
         · simp only [hc, Bool.false_eq_true, ↓reduceIte]
           exact subsumesPtrLocalState_disabled_right _
   | disabled =>
     rw [hw1] at hw
     cases hw2 : e2.getD w .disabled with
-    | empty | live _ _ _ => rw [hw2] at hw; simp [subsumesPtrLocalState] at hw
+    | empty | live _ _ _ _ => rw [hw2] at hw; simp [subsumesPtrLocalState] at hw
     | disabled =>
       rw [getD_map_range _ _ _ hq]
       rfl
-  | live wT1 wP1 _ =>
+  | live wT1 wP1 _ _ =>
     rw [hw1] at hw
     cases hw2 : e2.getD w .disabled with
     | empty => rw [hw2] at hw; simp [subsumesPtrLocalState] at hw
     | disabled =>
       rw [getD_map_range _ _ _ hq, getD_map_range _ _ _ hq]
       exact subsumesPtrLocalState_disabled_right _
-    | live wT2 wP2 _ =>
+    | live wT2 wP2 _ _ =>
       rw [hw2] at hw
       simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
         List.contains_iff_mem] at hw
@@ -3214,14 +3674,14 @@ private theorem stepDerefWrite_mono (n : Nat) {e1 e2 : List PtrLocalState}
       | disabled =>
         rw [hq1] at hq_sub
         cases hq2 : e2.getD q .disabled with
-        | empty | live _ _ _ => rw [hq2] at hq_sub; simp [subsumesPtrLocalState] at hq_sub
+        | empty | live _ _ _ _ => rw [hq2] at hq_sub; simp [subsumesPtrLocalState] at hq_sub
         | disabled => rfl
-      | live qT1 qP1 qH1 =>
+      | live qT1 qP1 qH1 qW1 =>
         rw [hq1] at hq_sub
         cases hq2 : e2.getD q .disabled with
         | empty => rw [hq2] at hq_sub; simp [subsumesPtrLocalState] at hq_sub
         | disabled => exact subsumesPtrLocalState_disabled_right _
-        | live qT2 qP2 qH2 =>
+        | live qT2 qP2 qH2 qW2 =>
           rw [hq2] at hq_sub
           by_cases hkeep2 : (wP2.contains q || targetsDefinitelyDisjoint qT2 wT2) = true
           · have hkeep1 : (wP1.contains q || targetsDefinitelyDisjoint qT1 wT1) = true := by
@@ -3247,7 +3707,7 @@ private theorem stepDerefWrite_mono (n : Nat) {e1 e2 : List PtrLocalState}
             simp only [hkeep2, hkeep1, ↓reduceIte]
             simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
               List.contains_iff_mem] at hq_sub ⊢
-            exact ⟨⟨rfl, hq_sub.1.2⟩, hq_sub.2⟩
+            exact ⟨⟨⟨rfl, hq_sub.1.1.2⟩, hq_sub.1.2⟩, hq_sub.2⟩
           · simp only [hkeep2, Bool.false_eq_true, ↓reduceIte]
             exact subsumesPtrLocalState_disabled_right _
 
@@ -3255,7 +3715,7 @@ theorem stepForeignRead_getD {decls : List LocalDecl} {n : Nat} {env : List PtrL
     {r q : Nat} (hq : q < n) :
     (stepForeignRead decls n env r).getD q .disabled =
       if isMutPtrLocal decls q && isHotPtrState (env.getD q .disabled) && !foreignReadKeeps env r q then
-        .disabled
+        freezePtrState (env.getD q .disabled)
       else env.getD q .disabled := by
   unfold stepForeignRead
   rw [getD_map_range _ _ _ hq]
@@ -3272,17 +3732,20 @@ theorem stepForeignRead_length (decls : List LocalDecl) (n : Nat) (env : List Pt
   simp [stepForeignRead]
 
 private theorem subsumes_live_inv {t1 : Option (Nat × List BorrowProjStep)} {ps1 : List Nat}
-    {h1 : Bool} {s2 : PtrLocalState} (h : subsumesPtrLocalState (.live t1 ps1 h1) s2 = true) :
-    s2 = .disabled ∨ ∃ t2 ps2 h2, s2 = .live t2 ps2 h2 ∧ (!h1 || h2) = true ∧
-      (∀ q2, t2 = some q2 → t1 = some q2) ∧ (∀ r ∈ ps2, r ∈ ps1) := by
+    {h1 w1 : Bool} {s2 : PtrLocalState}
+    (h : subsumesPtrLocalState (.live t1 ps1 h1 w1) s2 = true) :
+    s2 = .disabled ∨ ∃ t2 ps2 h2 w2, s2 = .live t2 ps2 h2 w2 ∧ (!h1 || h2) = true ∧
+      (!w2 || w1) = true ∧ (∀ q2, t2 = some q2 → t1 = some q2) ∧ (∀ r ∈ ps2, r ∈ ps1) := by
   cases s2 with
   | empty => simp [subsumesPtrLocalState] at h
   | disabled => exact .inl rfl
-  | live t2 ps2 h2 =>
+  | live t2 ps2 h2 w2 =>
     right
-    refine ⟨t2, ps2, h2, rfl, ?_, fun q2 hq2 => ?_, fun r hr => ?_⟩
+    refine ⟨t2, ps2, h2, w2, rfl, ?_, ?_, fun q2 hq2 => ?_, fun r hr => ?_⟩
     · simp only [subsumesPtrLocalState, Bool.and_eq_true] at h
-      exact h.1.1
+      exact h.1.1.1
+    · simp only [subsumesPtrLocalState, Bool.and_eq_true] at h
+      exact h.1.1.2
     · subst hq2
       simp only [subsumesPtrLocalState, Bool.and_eq_true, decide_eq_true_eq] at h
       exact h.1.2
@@ -3304,13 +3767,13 @@ private theorem foreignReadKeeps_mono {e1 e2 : List PtrLocalState}
     generalize e1.getD q .disabled = b1 at hq h1
     generalize e2.getD r .disabled = a2 at hr h2
     generalize e2.getD q .disabled = b2 at hq h2 ⊢
-    rcases a1 with _ | ⟨rT1, rP1, rH1⟩ | _ <;> rcases b1 with _ | ⟨qT1, qP1, qH1⟩ | _ <;>
+    rcases a1 with _ | ⟨rT1, rP1, rH1, rW1⟩ | _ <;> rcases b1 with _ | ⟨qT1, qP1, qH1, qW1⟩ | _ <;>
       simp only [Bool.true_eq_false] at h1
     · -- a1 = live, b1 = live
-      rcases subsumes_live_inv hq with hb2 | ⟨qT2, qP2, qH2, rfl, _, hqT, _⟩
+      rcases subsumes_live_inv hq with hb2 | ⟨qT2, qP2, qH2, qW2, rfl, _, _, hqT, _⟩
       · exact hb2
       · exfalso
-        rcases subsumes_live_inv hr with rfl | ⟨rT2, rP2, rH2, rfl, _, hrT, hrP⟩
+        rcases subsumes_live_inv hr with rfl | ⟨rT2, rP2, rH2, rW2, rfl, _, _, hrT, hrP⟩
         · simp at h2
         · simp only [Bool.or_eq_false_iff] at h1
           simp only [Bool.or_eq_true] at h2
@@ -3330,9 +3793,9 @@ private theorem foreignReadKeeps_mono {e1 e2 : List PtrLocalState}
     · -- a1 = disabled, b1 = live
       cases a2 with
       | empty => simp [subsumesPtrLocalState] at hr
-      | live _ _ _ => simp [subsumesPtrLocalState] at hr
+      | live _ _ _ _ => simp [subsumesPtrLocalState] at hr
       | disabled =>
-        rcases subsumes_live_inv hq with hb2 | ⟨qT2, qP2, qH2, rfl, _, _, _⟩
+        rcases subsumes_live_inv hq with hb2 | ⟨qT2, qP2, qH2, qW2, rfl, _, _, _, _⟩
         · exact hb2
         · simp at h2
 
@@ -3349,7 +3812,9 @@ theorem stepForeignRead_mono (decls : List LocalDecl) (n : Nat) {e1 e2 : List Pt
       · cases hk2 : foreignReadKeeps e2 r p with
         | false =>
           simp only [hm, hh2, Bool.not_false, Bool.and_self, ↓reduceIte]
-          exact subsumesPtrLocalState_disabled_right _
+          split
+          · exact freezePtrState_mono (hall p)
+          · exact subsumesPtrLocalState_trans (hall p) (subsumesPtrLocalState_freeze_right _)
         | true =>
           simp only [hm, hh2, Bool.not_true, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
           by_cases hh1 : isHotPtrState (e1.getD p .disabled) = true
@@ -3368,20 +3833,21 @@ theorem stepForeignRead_mono (decls : List LocalDecl) (n : Nat) {e1 e2 : List Pt
         simp only [hm, hh2, Bool.and_false, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
         have hsub_p := hall p
         cases he2 : e2.getD p .disabled with
-        | disabled => exact subsumesPtrLocalState_disabled_right _
+        | disabled =>
+          split <;> exact subsumesPtrLocalState_disabled_right _
         | empty =>
           rw [he2] at hsub_p
           cases he1 : e1.getD p .disabled with
           | empty => simp [isHotPtrState]; rfl
-          | live _ _ _ | disabled => rw [he1] at hsub_p; simp [subsumesPtrLocalState] at hsub_p
-        | live t2 ps2 b2 =>
+          | live _ _ _ _ | disabled => rw [he1] at hsub_p; simp [subsumesPtrLocalState] at hsub_p
+        | live t2 ps2 b2 w2 =>
           rw [he2] at hh2 hsub_p
           simp only [isHotPtrState] at hh2
           subst hh2
           cases he1 : e1.getD p .disabled with
           | empty => simp [isHotPtrState]; rfl
           | disabled => rw [he1] at hsub_p; simp [subsumesPtrLocalState] at hsub_p
-          | live t1 ps1 b1 =>
+          | live t1 ps1 b1 w1 =>
             rw [he1] at hsub_p
             have hb1 : b1 = false := by
               cases b1
@@ -3465,18 +3931,19 @@ theorem ptrStmtStep_mono (decls : List LocalDecl) {e1 e2 : List PtrLocalState}
             | disabled =>
               rw [h1] at hp
               cases h2 : (stepReborrowRead decls decls.length e2 rv).getD p .disabled with
-              | empty | live _ _ _ => rw [h2] at hp; simp [subsumesPtrLocalState] at hp
+              | empty | live _ _ _ _ => rw [h2] at hp; simp [subsumesPtrLocalState] at hp
               | disabled => rfl
-            | live t1 ps1 _ =>
+            | live t1 ps1 h1p w1p =>
               rw [h1] at hp
               cases h2 : (stepReborrowRead decls decls.length e2 rv).getD p .disabled with
               | empty => rw [h2] at hp; simp [subsumesPtrLocalState] at hp
               | disabled => rfl
-              | live t2 ps2 _ =>
+              | live t2 ps2 h2p w2p =>
                 rw [h2] at hp
                 simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
                   List.contains_iff_mem] at hp ⊢
-                refine ⟨⟨by cases borrowStartsHot rv <;> rfl, hp.1.2⟩, fun r hr => ?_⟩
+                refine ⟨⟨⟨by cases borrowStartsHot rv <;> cases h1p <;> cases h2p <;> simp_all,
+                          hp.1.1.2⟩, hp.1.2⟩, fun r hr => ?_⟩
                 rcases List.mem_cons.mp hr with rfl | hrf
                 · exact .head _
                 · obtain ⟨hr2, hne⟩ := List.mem_filter.mp hrf
@@ -3501,14 +3968,14 @@ theorem ptrStmtStep_mono (decls : List LocalDecl) {e1 e2 : List PtrLocalState}
                   | disabled =>
                     rw [h1] at hr
                     cases h2 : removePeerFromState i (e2.getD q .disabled) with
-                    | empty | live _ _ _ => rw [h2] at hr; simp [subsumesPtrLocalState] at hr
+                    | empty | live _ _ _ _ => rw [h2] at hr; simp [subsumesPtrLocalState] at hr
                     | disabled => rfl
-                  | live t1 ps1 qH1 =>
+                  | live t1 ps1 qH1 qW1 =>
                     rw [h1] at hr
                     cases h2 : removePeerFromState i (e2.getD q .disabled) with
                     | empty => rw [h2] at hr; simp [subsumesPtrLocalState] at hr
                     | disabled => exact subsumesPtrLocalState_disabled_right _
-                    | live t2 ps2 qH2 =>
+                    | live t2 ps2 qH2 qW2 =>
                       rw [h2] at hr
                       have hr0 := hr
                       simp only [subsumesPtrLocalState, Bool.and_eq_true, List.all_eq_true,
@@ -3543,6 +4010,39 @@ theorem ptrStmtStep_mono (decls : List LocalDecl) {e1 e2 : List PtrLocalState}
           | none => exact stepDerefWrite_mono decls.length hall i
         | cons _ _ => exact hid
       | _ => exact hid
+  | retag _ pl =>
+    obtain ⟨i, projs⟩ := pl
+    cases projs with
+    | nil =>
+      simp only [ptrStmtStep]
+      by_cases hi_ref : (isDeclPtrLocal decls i && isDeclRefLocal decls i) = true
+      · simp only [hi_ref, ↓reduceIte, stepReborrow]
+        have hallR := stepForeignRead_mono decls decls.length hall i
+        apply hsetG _ _ hallR i
+        have hp := hallR i
+        cases h1 : (stepForeignRead decls decls.length e1 i).getD i .disabled with
+        | empty => rfl
+        | disabled =>
+          rw [h1] at hp
+          cases h2 : (stepForeignRead decls decls.length e2 i).getD i .disabled with
+          | empty | live _ _ _ _ => rw [h2] at hp; simp [subsumesPtrLocalState] at hp
+          | disabled => rfl
+        | live t1 ps1 h1p w1p =>
+          rw [h1] at hp
+          cases h2 : (stepForeignRead decls decls.length e2 i).getD i .disabled with
+          | empty => rw [h2] at hp; simp [subsumesPtrLocalState] at hp
+          | disabled => rfl
+          | live t2 ps2 h2p w2p =>
+            rw [h2] at hp
+            simp only [subsumesPtrLocalState, Bool.false_or, Bool.and_eq_true, List.all_eq_true,
+              List.contains_iff_mem] at hp ⊢
+            refine ⟨hp.1, fun r hr => ?_⟩
+            rcases List.mem_cons.mp hr with rfl | hrf
+            · exact .head _
+            · obtain ⟨hr2, hne⟩ := List.mem_filter.mp hrf
+              exact .tail _ (List.mem_filter.mpr ⟨hp.2 r hr2, hne⟩)
+      · simp only [hi_ref, Bool.false_eq_true, ↓reduceIte]; exact hid
+    | cons _ _ => exact hid
   | storageLive i | storageDead i =>
     simp only [ptrStmtStep]
     by_cases hi_ptr : isDeclPtrLocal decls i = true
@@ -3584,6 +4084,7 @@ to the read, disjoint targets do not overlap it, and a freeze never disables). -
 theorem PtrEnvOk.foreignRead {body : CapturedMir} {view : List LocalSlot}
     {borrows : List BorrowEntry} {env : List PtrLocalState}
     (hok : PtrEnvOk body view borrows env)
+    (hdag : BorrowDagOrdered borrows)
     (hranges : ∀ e ∈ borrows, e.rangeLen = 0)
     {r : Nat} {dr : LocalDecl} (hdr : body.localDecls[r]? = some dr)
     (hr_ptr : isPtrTy dr.ty = true)
@@ -3603,109 +4104,155 @@ theorem PtrEnvOk.foreignRead {body : CapturedMir} {view : List LocalSlot}
       rEntry.targetLocal (some rv.tag) rEntry.targetProjection rEntry.rangeOffset
       rEntry.rangeLen := fun e => by rw [← hfdef]
   have hr_tag : rEntry.tag = rv.tag := (lookupBorrow_mem_and_tag hrlk).2
-  have hfr : f rEntry = rEntry := by
-    rw [hfapp]
-    exact updateBorrowPermOnReadAtProj_of_descendant _ _ _ _
-      (by rw [hr_tag]; exact isBorrowDescendantOrSelf_self _ _)
   have hr_lt : r < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdr).1
   have hr_ok := hok r hr_lt
   intro q hq
   have hq_ok := hok q hq
   rw [stepForeignRead_getD hq]
+  have hbase : ∀ qT qP qHot qWritable,
+      env.getD q .disabled = .live qT qP qHot qWritable →
+      PtrLocalOk body view (borrows.map f) q (.live qT qP qHot false) := by
+    intro qT qP qHot qWritable hst dq pvq hdq hqptr hvq
+    rw [hst] at hq_ok
+    obtain ⟨⟨eq, hlkq, hndisq, _, hnactq, htgtq, hancq⟩, hpeersq⟩ := hq_ok dq pvq hdq hqptr hvq
+    refine ⟨⟨f eq, by rw [hf.lookupBorrow_map, hlkq]; rfl,
+      fun hdis => hndisq ((hf.perm_eq_disabled_iff eq).mp hdis),
+      fun hw => Bool.noConfusion hw,
+      fun hmut hqHot => by
+        rw [hf.eq_of_perm_ne_active (hnactq hmut hqHot)]
+        exact hnactq hmut hqHot,
+      fun qq hqq => by
+        rw [hf.targetLocal, hf.targetProjection]
+        exact htgtq qq hqq,
+      fun anc' hmem' hanc' => ?_⟩,
+      fun r' hr' dr' pv_r' hdr' hptr' hvr' => by
+        rw [isBorrowDescendantOrSelf_map_eq hf.tag hf.parentTag]
+        exact hpeersq r' hr' dr' pv_r' hdr' hptr' hvr'⟩
+    obtain ⟨anc, hanc_mem, rfl⟩ := List.mem_map.mp hmem'
+    rw [hf.tag] at hanc'
+    have hanc0 := (IsBorrowAncestorOrSelf.map_iff hf.tag hf.parentTag).mp hanc'
+    obtain ⟨ha_ndis, _, ha_nact, ha_tgt⟩ := hancq anc hanc_mem hanc0
+    refine ⟨fun hdis => ha_ndis ((hf.perm_eq_disabled_iff anc).mp hdis),
+      fun hw => Bool.noConfusion hw,
+      fun hmut hqHot => by
+        rw [hf.eq_of_perm_ne_active (ha_nact hmut hqHot)]
+        exact ha_nact hmut hqHot,
+      by rw [hf.targetLocal, hf.targetProjection, hf.targetLocal, hf.targetProjection]; exact ha_tgt⟩
   split
-  · trivial
+  · cases hst : env.getD q .disabled with
+    | empty => rw [hst] at hq_ok; exact hq_ok
+    | disabled => trivial
+    | live qT qP qHot qWritable => exact hbase qT qP qHot qWritable hst
   · rename_i hkeep
     cases hst : env.getD q .disabled with
     | empty => rw [hst] at hq_ok; exact hq_ok
     | disabled => trivial
-    | live qT qP qHot =>
-      rw [hst] at hq_ok
-      intro dq pvq hdq hqptr hvq
-      obtain ⟨⟨eq, hlkq, hndisq, hnfq, hnactq, htgtq⟩, hpeersq⟩ := hq_ok dq pvq hdq hqptr hvq
-      refine ⟨⟨f eq, by rw [hf.lookupBorrow_map, hlkq]; rfl, ?_, ?_, ?_, ?_⟩,
-        fun r' hr' dr' pv_r' hdr' hptr' hvr' => by
-          rw [isBorrowDescendantOrSelf_map_eq hf.tag hf.parentTag]
-          exact hpeersq r' hr' dr' pv_r' hdr' hptr' hvr'⟩
-      · intro hdis
-        exact hndisq ((hf.perm_eq_disabled_iff eq).mp hdis)
-      · intro hmut
-        cases qHot with
-        | false =>
-          rw [hf.eq_of_perm_ne_active (hnactq hmut rfl)]
-          exact hnfq hmut
-        | true =>
-          have hk : foreignReadKeeps env r q = true := by
-            revert hkeep
-            rw [hst]
-            cases foreignReadKeeps env r q <;> simp [hmut, isHotPtrState]
-          suffices hfe : f eq = eq by rw [hfe]; exact hnfq hmut
-          unfold foreignReadKeeps at hk
-          rw [hst] at hk
-          by_cases hqr : q = r
-          · subst hqr
-            rw [hvr] at hvq
-            simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvq
-            obtain ⟨rfl, _⟩ := hvq
-            rw [hrlk] at hlkq
-            injection hlkq with h
-            subst h
-            exact hfr
-          · have hqr' : (q == r) = false := beq_false_of_ne hqr
-            simp only [hqr', Bool.false_or] at hk
-            cases hrst : env.getD r .disabled with
-            | empty =>
-              rw [hrst] at hr_ok
-              exact absurd hvr (hr_ok dr rv hdr hr_ptr)
-            | disabled =>
-              rw [hrst] at hk
-              simp at hk
-            | live rT rP rHot =>
-              rw [hrst] at hk hr_ok
-              obtain ⟨⟨eR, hlkR, _, _, _, htgtR⟩, hpeersR⟩ := hr_ok dr rv hdr hr_ptr hvr
-              rw [hrlk] at hlkR
-              injection hlkR with h
-              subst h
-              simp only [Bool.or_eq_true] at hk
-              rcases hk with hpeer | hdisj
-              · have hdesc := hpeersR q (List.contains_iff_mem.mp hpeer) dq pvq hdq hqptr hvq
-                have heq_tag : eq.tag = pvq.tag := (lookupBorrow_mem_and_tag hlkq).2
-                rw [hfapp]
-                exact updateBorrowPermOnReadAtProj_of_descendant _ _ _ _ (heq_tag.symm ▸ hdesc)
-              · cases qT with
-                | none => simp [targetsDefinitelyDisjoint] at hdisj
-                | some qp =>
-                  cases rT with
+    | live qT qP qHot qWritable =>
+      cases qWritable with
+      | false => exact hbase qT qP qHot false hst
+      | true =>
+        have hst_ok := hq_ok
+        rw [hst] at hst_ok
+        intro dq pvq hdq hqptr hvq
+        obtain ⟨⟨eq, hlkq, hndisq, hnfq, hnactq, htgtq, hancq⟩, hpeersq⟩ := hst_ok dq pvq hdq hqptr hvq
+        obtain ⟨hb0, hpeers'⟩ := hbase qT qP qHot true hst dq pvq hdq hqptr hvq
+        obtain ⟨_, hlkq', hndisq', _, hnactq', htgtq', hancq'⟩ := hb0
+        have hfe_anc : isMutPtrLocal body.localDecls q = true →
+            ∀ anc ∈ borrows, IsBorrowAncestorOrSelf borrows pvq.tag anc.tag →
+              (f anc).perm ≠ .frozen := by
+          intro hmut anc hanc_mem hanc0
+          obtain ⟨_, ha_nf, ha_nact, ha_tgt⟩ := hancq anc hanc_mem hanc0
+          cases qHot with
+          | false =>
+            rw [hf.eq_of_perm_ne_active (ha_nact hmut rfl)]
+            exact ha_nf rfl hmut
+          | true =>
+            have hk : foreignReadKeeps env r q = true := by
+              revert hkeep
+              rw [hst]
+              cases foreignReadKeeps env r q <;> simp [hmut, isHotPtrState]
+            suffices hfe : f anc = anc by rw [hfe]; exact ha_nf rfl hmut
+            unfold foreignReadKeeps at hk
+            rw [hst] at hk
+            by_cases hqr : q = r
+            · subst hqr
+              rw [hvr] at hvq
+              simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvq
+              obtain ⟨rfl, _⟩ := hvq
+              rw [hfapp]
+              exact updateBorrowPermOnReadAtProj_of_descendant _ _ _ _
+                (hdag.descendant_of_ancestor hrlk hanc0)
+            · have hqr' : (q == r) = false := beq_false_of_ne hqr
+              simp only [hqr', Bool.false_or] at hk
+              cases hrst : env.getD r .disabled with
+              | empty =>
+                rw [hrst] at hr_ok
+                exact absurd hvr (hr_ok dr rv hdr hr_ptr)
+              | disabled =>
+                rw [hrst] at hk
+                simp at hk
+              | live rT rP rHot rWritable =>
+                rw [hrst] at hk hr_ok
+                obtain ⟨⟨eR, hlkR, _, _, _, htgtR, _⟩, hpeersR⟩ := hr_ok dr rv hdr hr_ptr hvr
+                rw [hrlk] at hlkR
+                injection hlkR with h
+                subst h
+                simp only [Bool.or_eq_true] at hk
+                rcases hk with hpeer | hdisj
+                · have hdesc := hpeersR q (List.contains_iff_mem.mp hpeer) dq pvq hdq hqptr hvq
+                  have hanc_r := (IsBorrowAncestorOrSelf.of_descendant hdesc).trans hanc0
+                  rw [hfapp]
+                  exact updateBorrowPermOnReadAtProj_of_descendant _ _ _ _
+                    (hdag.descendant_of_ancestor hrlk hanc_r)
+                · cases qT with
                   | none => simp [targetsDefinitelyDisjoint] at hdisj
-                  | some rp =>
-                    have h1 := htgtq qp rfl
-                    have h2 := htgtR rp rfl
-                    obtain ⟨k1, p1⟩ := qp
-                    obtain ⟨k2, p2⟩ := rp
-                    simp only [Prod.mk.injEq] at h1 h2
-                    obtain ⟨hk1, hp1⟩ := h1
-                    obtain ⟨hk2, hp2⟩ := h2
-                    rw [hfapp]
-                    by_cases hloc : eq.targetLocal = rEntry.targetLocal
-                    · have hov : borrowProjOverlap p1 p2 = false := by
-                        have hk12 : k1 = k2 := by rw [← hk1, ← hk2, hloc]
-                        simpa [targetsDefinitelyDisjoint, hk12] using hdisj
-                      rw [← hp1, ← hp2] at hov
-                      exact updateBorrowPermOnReadAtProj_of_not_overlap _ _ _ _
-                        (hranges eq (lookupBorrow_mem_and_tag hlkq).1)
-                        (borrowProjOverlap_borrowProjSteps hov)
-                    · exact updateBorrowPermOnReadAtProj_of_targetLocal_ne _ _ _ _ hloc
-      · intro hmut hqHot
-        rw [hf.eq_of_perm_ne_active (hnactq hmut hqHot)]
-        exact hnactq hmut hqHot
-      · intro qq hqq
-        rw [hf.targetLocal, hf.targetProjection]
-        exact htgtq qq hqq
+                  | some qp =>
+                    cases rT with
+                    | none => simp [targetsDefinitelyDisjoint] at hdisj
+                    | some rp =>
+                      have h1 : (anc.targetLocal, borrowProjSteps anc.targetProjection) = qp :=
+                        ha_tgt.trans (htgtq qp rfl)
+                      have h2 := htgtR rp rfl
+                      obtain ⟨k1, p1⟩ := qp
+                      obtain ⟨k2, p2⟩ := rp
+                      simp only [Prod.mk.injEq] at h1 h2
+                      obtain ⟨hk1, hp1⟩ := h1
+                      obtain ⟨hk2, hp2⟩ := h2
+                      rw [hfapp]
+                      by_cases hloc : anc.targetLocal = rEntry.targetLocal
+                      · have hov : borrowProjOverlap p1 p2 = false := by
+                          have hk12 : k1 = k2 := by rw [← hk1, ← hk2, hloc]
+                          simpa [targetsDefinitelyDisjoint, hk12] using hdisj
+                        rw [← hp1, ← hp2] at hov
+                        exact updateBorrowPermOnReadAtProj_of_not_overlap _ _ _ _
+                          (hranges anc hanc_mem)
+                          (borrowProjOverlap_borrowProjSteps hov)
+                      · exact updateBorrowPermOnReadAtProj_of_targetLocal_ne _ _ _ _ hloc
+        obtain ⟨heq_mem, heq_tag⟩ := lookupBorrow_mem_and_tag hlkq
+        refine ⟨⟨f eq, by rw [hf.lookupBorrow_map, hlkq]; rfl,
+          fun hdis => hndisq ((hf.perm_eq_disabled_iff eq).mp hdis),
+          fun _ hmut => hfe_anc hmut eq heq_mem (IsBorrowAncestorOrSelf.of_eq heq_tag.symm),
+          fun hmut hqHot => by
+            rw [hf.eq_of_perm_ne_active (hnactq hmut hqHot)]
+            exact hnactq hmut hqHot,
+          fun qq hqq => by
+            rw [hf.targetLocal, hf.targetProjection]
+            exact htgtq qq hqq,
+          fun anc' hmem' hanc' => ?_⟩, hpeers'⟩
+        obtain ⟨ha_ndis, _, ha_nact, _⟩ := hancq' anc' hmem' hanc'
+        obtain ⟨anc, hanc_mem, rfl⟩ := List.mem_map.mp hmem'
+        rw [hf.tag] at hanc'
+        have hanc0 := (IsBorrowAncestorOrSelf.map_iff hf.tag hf.parentTag).mp hanc'
+        obtain ⟨_, _, _, ha_tgt0⟩ := hancq anc hanc_mem hanc0
+        exact ⟨ha_ndis, fun _ hmut => hfe_anc hmut anc hanc_mem hanc0, ha_nact,
+          by rw [hf.targetLocal, hf.targetProjection, hf.targetLocal, hf.targetProjection]; exact ha_tgt0⟩
 
 /-- `PtrEnvOk.foreignRead` for a dereference read `*_r` (`freezeDerefReadBorrowsAt`,
 `evalRvalue_derefRead_freeze` with an empty post-dereference projection). -/
 theorem PtrEnvOk.derefRead {body : CapturedMir} {view : List LocalSlot}
     {borrows : List BorrowEntry} {env : List PtrLocalState}
     (hok : PtrEnvOk body view borrows env)
+    (hdag : BorrowDagOrdered borrows)
     (hranges : ∀ e ∈ borrows, e.rangeLen = 0)
     {r : Nat} {dr : LocalDecl} (hdr : body.localDecls[r]? = some dr)
     (hr_ptr : isPtrTy dr.ty = true)
@@ -3721,27 +4268,27 @@ theorem PtrEnvOk.derefRead {body : CapturedMir} {view : List LocalSlot}
     intro q hq
     rw [stepForeignRead_getD hq]
     split
-    · exact subsumesPtrLocalState_disabled_right _
+    · exact subsumesPtrLocalState_freeze_right _
     · exact subsumesPtrLocalState_refl _
   | some rEntry =>
     simp only [appendProjections_nil_right]
-    exact hok.foreignRead hranges hdr hr_ptr hvr hlk
+    exact hok.foreignRead hdag hranges hdr hr_ptr hvr hlk
 
 /-- Well-formedness of a `PtrLocalState` at width `n`: peer lists have no
 duplicates and contain only local indices `< n`. -/
 def PtrStateWf (n : Nat) : PtrLocalState → Prop
   | .empty => True
-  | .live _ ps _ => ps.Nodup ∧ ∀ r ∈ ps, r < n
+  | .live _ ps _ _ => ps.Nodup ∧ ∀ r ∈ ps, r < n
   | .disabled => True
 
 /-- Strictly decreasing height rank on `PtrLocalState` at width `n`, bounded by
-`n + 4` (`Translate.lean`: `ptrEnvAtEntry`). -/
+`n + 5` (`Translate.lean`: `ptrEnvAtEntry`). -/
 def ptrStateRank (n : Nat) : PtrLocalState → Nat
-  | .empty => n + 4
-  | .live (some _) ps true => ps.length + 2
-  | .live (some _) ps false => ps.length + 3
-  | .live none ps true => ps.length + 1
-  | .live none ps false => ps.length + 2
+  | .empty => n + 5
+  | .live (some _) ps hot writable =>
+    ps.length + 2 + (if hot then 0 else 1) + (if writable then 1 else 0)
+  | .live none ps hot writable =>
+    ps.length + 1 + (if hot then 0 else 1) + (if writable then 1 else 0)
   | .disabled => 0
 
 def ptrEnvRank (n : Nat) (env : List PtrLocalState) : Nat :=
@@ -3769,7 +4316,7 @@ private theorem nodup_length_le_of_subset {xs ys : List Nat}
     omega
 
 private theorem ptrStateWf_peers_length_le {n : Nat} {t : Option (Nat × List BorrowProjStep)}
-    {ps : List Nat} {hot : Bool} (hwf : PtrStateWf n (.live t ps hot)) :
+    {ps : List Nat} {hot writable : Bool} (hwf : PtrStateWf n (.live t ps hot writable)) :
     ps.length ≤ n := by
   simpa using nodup_length_le_of_subset hwf.1 (fun r hr => List.mem_range.mpr (hwf.2 r hr))
 
@@ -3795,11 +4342,11 @@ theorem joinPtrLocalState_wf {n : Nat} {s1 s2 : PtrLocalState}
   cases s1 with
   | empty => exact h2
   | disabled => cases s2 <;> trivial
-  | live t1 ps1 _ =>
+  | live t1 ps1 _ _ =>
     cases s2 with
     | empty => exact h1
     | disabled => trivial
-    | live t2 ps2 _ =>
+    | live t2 ps2 _ _ =>
       exact ⟨h1.1.sublist List.filter_sublist,
         fun r hr => h1.2 r (List.mem_filter.mp hr).1⟩
 
@@ -3812,20 +4359,22 @@ theorem joinPtrLocalState_eq_or_rank_lt {n : Nat} {s1 s2 : PtrLocalState}
     cases s2 with
     | empty => exact .inl rfl
     | disabled => right; simp [joinPtrLocalState, ptrStateRank]
-    | live t2 ps2 h2b =>
+    | live t2 ps2 h2b w2b =>
       right
       have hlen := ptrStateWf_peers_length_le h2
-      cases t2 <;> cases h2b <;> simp only [joinPtrLocalState, ptrStateRank] <;> omega
+      cases t2 <;> cases h2b <;> cases w2b <;>
+        simp only [joinPtrLocalState, ptrStateRank, Bool.false_eq_true, ↓reduceIte] <;> omega
   | disabled =>
     left
     cases s2 <;> rfl
-  | live t1 ps1 h1b =>
+  | live t1 ps1 h1b w1b =>
     cases s2 with
     | empty => exact .inl rfl
     | disabled =>
       right
-      cases t1 <;> cases h1b <;> simp only [joinPtrLocalState, ptrStateRank] <;> omega
-    | live t2 ps2 h2b =>
+      cases t1 <;> cases h1b <;> cases w1b <;>
+        simp only [joinPtrLocalState, ptrStateRank, Bool.false_eq_true, ↓reduceIte] <;> omega
+    | live t2 ps2 h2b w2b =>
       simp only [joinPtrLocalState]
       have hflt := filter_eq_or_length_lt (fun r => ps2.contains r) ps1
       have hle : (ps1.filter (fun r => ps2.contains r)).length ≤ ps1.length :=
@@ -3837,38 +4386,43 @@ theorem joinPtrLocalState_eq_or_rank_lt {n : Nat} {s1 s2 : PtrLocalState}
           by_cases hb : (none == t2) = true <;> simp [hb]
         rw [hif]
         rcases hflt with heq | hlt
-        · cases h1b <;> cases h2b
-          · left; rw [heq]; rfl
-          · right; dsimp only [ptrStateRank, Bool.or]; omega
-          · left; rw [heq]; rfl
-          · left; rw [heq]; rfl
-        · right; cases h1b <;> cases h2b <;> dsimp only [ptrStateRank, Bool.or] <;> omega
+        · rw [heq]
+          cases h1b <;> cases h2b <;> cases w1b <;> cases w2b <;>
+            first
+            | exact .inl rfl
+            | (right; simp only [ptrStateRank, Bool.or, Bool.and, Bool.false_eq_true, ↓reduceIte]; omega)
+        · right
+          cases h1b <;> cases h2b <;> cases w1b <;> cases w2b <;>
+            simp only [ptrStateRank, Bool.or, Bool.and, Bool.false_eq_true, ↓reduceIte] <;> omega
       | some x =>
         by_cases hbeq : (some x == t2) = true
         · simp only [hbeq, ↓reduceIte]
           rcases hflt with heq | hlt
-          · cases h1b <;> cases h2b
-            · left; rw [heq]; rfl
-            · right; dsimp only [ptrStateRank, Bool.or]; omega
-            · left; rw [heq]; rfl
-            · left; rw [heq]; rfl
-          · right; cases h1b <;> cases h2b <;> dsimp only [ptrStateRank, Bool.or] <;> omega
+          · rw [heq]
+            cases h1b <;> cases h2b <;> cases w1b <;> cases w2b <;>
+              first
+              | exact .inl rfl
+              | (right; simp only [ptrStateRank, Bool.or, Bool.and, Bool.false_eq_true, ↓reduceIte]; omega)
+          · right
+            cases h1b <;> cases h2b <;> cases w1b <;> cases w2b <;>
+              simp only [ptrStateRank, Bool.or, Bool.and, Bool.false_eq_true, ↓reduceIte] <;> omega
         · right
           simp only [hbeq, Bool.false_eq_true, ↓reduceIte]
-          cases h1b <;> cases h2b <;> dsimp only [ptrStateRank, Bool.or] <;> omega
+          cases h1b <;> cases h2b <;> cases w1b <;> cases w2b <;>
+            simp only [ptrStateRank, Bool.or, Bool.and, Bool.false_eq_true, ↓reduceIte] <;> omega
 
 private theorem ptrStateWf_removePeer {n : Nat} (i : Nat) {s : PtrLocalState}
     (h : PtrStateWf n s) : PtrStateWf n (removePeerFromState i s) := by
   cases s with
   | empty | disabled => trivial
-  | live t ps _ =>
+  | live t ps _ _ =>
     exact ⟨h.1.sublist List.filter_sublist, fun r hr => h.2 r (List.mem_filter.mp hr).1⟩
 
 private theorem ptrStateWf_addPeer {n i : Nat} (hi : i < n) {s : PtrLocalState}
     (h : PtrStateWf n s) : PtrStateWf n (addPeerToState i s) := by
   cases s with
   | empty | disabled => trivial
-  | live t ps _ =>
+  | live t ps _ _ =>
     simp only [addPeerToState]
     by_cases hc : ps.contains i = true
     · simp only [hc, ↓reduceIte]; exact h
@@ -3880,8 +4434,8 @@ private theorem ptrStateWf_addPeer {n i : Nat} (hi : i < n) {s : PtrLocalState}
       · exact h.2 r hrm
 
 private theorem ptrStateWf_singleton {n i : Nat} (hi : i < n)
-    (t : Option (Nat × List BorrowProjStep)) (hot : Bool) :
-    PtrStateWf n (.live t [i] hot) :=
+    (t : Option (Nat × List BorrowProjStep)) (hot writable : Bool) :
+    PtrStateWf n (.live t [i] hot writable) :=
   ⟨List.nodup_cons.mpr ⟨List.not_mem_nil, List.Pairwise.nil⟩,
     fun r hr => by rcases List.mem_cons.mp hr with rfl | hnil; exact hi; cases hnil⟩
 
@@ -3892,13 +4446,13 @@ private theorem stepDerefWrite_wf {n : Nat} {env : List PtrLocalState}
   cases hw : env.getD w .disabled with
   | empty => rw [getD_map_range _ _ _ hp]; exact hwf p
   | disabled => rw [getD_map_range _ _ _ hp]; trivial
-  | live wT wP _ =>
+  | live wT wP _ _ =>
     rw [getD_map_range _ _ _ hp]
     have hp_wf := hwf p
     cases hp_eq : env.getD p .disabled with
     | empty => trivial
     | disabled => trivial
-    | live qT qP _ =>
+    | live qT qP _ _ =>
       rw [hp_eq] at hp_wf
       by_cases hc : (wP.contains p || targetsDefinitelyDisjoint qT wT) = true
       · simp only [hc, ↓reduceIte]; exact ⟨hp_wf.1, hp_wf.2⟩
@@ -3911,7 +4465,8 @@ theorem stepForeignRead_wf {n : Nat} {decls : List LocalDecl} {env : List PtrLoc
   by_cases hp : p < n
   · rw [stepForeignRead_getD hp]
     split
-    · simp [PtrStateWf]
+    · have hp_wf := hwf p
+      cases h : env.getD p .disabled <;> rw [h] at hp_wf <;> exact hp_wf
     · exact hwf p
   · rw [stepForeignRead_getD_of_le (Nat.le_of_not_lt hp)]
     simp [PtrStateWf]
@@ -3953,7 +4508,7 @@ theorem ptrStmtStep_wf (decls : List LocalDecl) (env : List PtrLocalState)
             | some _ => exact (List.getElem?_eq_some_iff.mp hd).1
           cases directBorrowOf rv with
           | some bp =>
-            exact hset i _ (ptrStateWf_singleton hi_lt _ _)
+            exact hset i _ (ptrStateWf_singleton hi_lt _ _ _)
           | none =>
             cases reborrowParentOf rv with
             | some par =>
@@ -3964,7 +4519,7 @@ theorem ptrStmtStep_wf (decls : List LocalDecl) (env : List PtrLocalState)
                 cases hpar : (stepReborrowRead decls decls.length env rv).getD par .disabled with
                 | empty => trivial
                 | disabled => trivial
-                | live t pPs _ =>
+                | live t pPs _ _ =>
                   have hp_wf : PtrStateWf decls.length
                       (removePeerFromState i
                         ((stepReborrowRead decls decls.length env rv).getD par .disabled)) :=
@@ -3994,11 +4549,11 @@ theorem ptrStmtStep_wf (decls : List LocalDecl) (env : List PtrLocalState)
                     cases hr_eq : removePeerFromState i (env.getD p .disabled) with
                     | empty => trivial
                     | disabled => trivial
-                    | live t ps qHot =>
+                    | live t ps qHot qWritable =>
                       rw [hr_eq] at hr_wf
                       by_cases hcs : ps.contains src = true
                       · simp only [hcs, ↓reduceIte]
-                        change PtrStateWf decls.length (addPeerToState i (.live t ps qHot))
+                        change PtrStateWf decls.length (addPeerToState i (.live t ps qHot qWritable))
                         exact ptrStateWf_addPeer hi_lt hr_wf
                       · simp only [hcs, Bool.false_eq_true, ↓reduceIte]
                         exact hr_wf
@@ -4018,6 +4573,41 @@ theorem ptrStmtStep_wf (decls : List LocalDecl) (env : List PtrLocalState)
             | none => exact stepDerefWrite_wf hwf i p hp
           | cons _ _ => rw [ptrStmtStep, getD_map_range _ _ _ hp]; exact hwf p
         | _ => rw [ptrStmtStep, getD_map_range _ _ _ hp]; exact hwf p
+    | retag _ pl =>
+      obtain ⟨i, projs⟩ := pl
+      cases projs with
+      | nil =>
+        simp only [ptrStmtStep]
+        by_cases hi_ref : (isDeclPtrLocal decls i && isDeclRefLocal decls i) = true
+        · simp only [hi_ref, ↓reduceIte, stepReborrow]
+          have hi_lt : i < decls.length := by
+            simp only [Bool.and_eq_true, isDeclPtrLocal] at hi_ref
+            cases hd : decls[i]? with
+            | none => simp [hd] at hi_ref
+            | some _ => exact (List.getElem?_eq_some_iff.mp hd).1
+          rw [setPtrLocal, getD_map_range _ _ _ hp]
+          by_cases hpi : (p == i) = true
+          · simp only [hpi, ↓reduceIte]
+            cases hpar : (stepForeignRead decls decls.length env i).getD i .disabled with
+            | empty => trivial
+            | disabled => trivial
+            | live t pPs _ _ =>
+              have hp_wf : PtrStateWf decls.length
+                  (removePeerFromState i
+                    ((stepForeignRead decls decls.length env i).getD i .disabled)) :=
+                ptrStateWf_removePeer i (stepForeignRead_wf hwf i i)
+              rw [hpar] at hp_wf
+              dsimp only [removePeerFromState] at hp_wf
+              have hni : i ∉ pPs.filter (· != i) := by
+                simp [List.mem_filter]
+              refine ⟨List.nodup_cons.mpr ⟨hni, hp_wf.1⟩, fun r hr => ?_⟩
+              rcases List.mem_cons.mp hr with rfl | hrm
+              · exact hi_lt
+              · exact hp_wf.2 r hrm
+          · simp only [hpi, Bool.false_eq_true, ↓reduceIte]
+            exact ptrStateWf_removePeer i (stepForeignRead_wf hwf i p)
+        · simp only [hi_ref, Bool.false_eq_true, ↓reduceIte, getD_map_range _ _ _ hp]; exact hwf p
+      | cons _ _ => rw [ptrStmtStep, getD_map_range _ _ _ hp]; exact hwf p
     | storageLive i | storageDead i =>
       simp only [ptrStmtStep]
       by_cases hi_ptr : isDeclPtrLocal decls i = true
@@ -4204,11 +4794,11 @@ private theorem getElem_eq_getD {α : Type} (xs : List α) (i : Nat) (hi : i < x
   simp [List.getD, List.getElem?_eq_getElem hi]
 
 private theorem ptrEntriesRank_init (b n : Nat) :
-    ptrEntriesRank b n (initPtrEntries b n) = b * n * (n + 4) := by
-  have henv : ptrEnvRank n (initPtrEnv n) = n * (n + 4) := by
+    ptrEntriesRank b n (initPtrEntries b n) = b * n * (n + 5) := by
+  have henv : ptrEnvRank n (initPtrEnv n) = n * (n + 5) := by
     unfold ptrEnvRank
     have hmap : (List.range n).map (fun q => ptrStateRank n ((initPtrEnv n).getD q .disabled)) =
-        List.replicate n (n + 4) := by
+        List.replicate n (n + 5) := by
       apply List.ext_getElem (by simp)
       intro q hq1 hq2
       have hq : q < n := by simpa using hq1
@@ -4219,7 +4809,7 @@ private theorem ptrEntriesRank_init (b n : Nat) :
   unfold ptrEntriesRank
   have hmap2 : (List.range b).map
       (fun dst => ptrEnvRank n ((initPtrEntries b n).getD dst (initPtrEnv n))) =
-      List.replicate b (n * (n + 4)) := by
+      List.replicate b (n * (n + 5)) := by
     apply List.ext_getElem (by simp)
     intro dst hd1 hd2
     have hdst : dst < b := by simpa using hd1
@@ -4228,13 +4818,13 @@ private theorem ptrEntriesRank_init (b n : Nat) :
   rw [hmap2, sum_replicate_nat, Nat.mul_assoc]
 
 /-- Unconditional finite-fuel convergence of `iterPtrAliasEntries` (proving the
-`B * n * (n + 4) + 1` height bound stated on `ptrEnvAtEntry` in `Translate.lean`):
+`B * n * (n + 5) + 1` height bound stated on `ptrEnvAtEntry` in `Translate.lean`):
 on any `decls` and any CFG `bbs`, `iterPtrAliasEntries` reaches an exact fixed
 point of `stepPtrAliasEntries decls bbs`. -/
 theorem iterPtrAliasEntries_stabilizes (decls : List LocalDecl) (bbs : List BasicBlockData) :
     let n := decls.length
     let b := bbs.length
-    let fuel := b * n * (n + 4) + 1
+    let fuel := b * n * (n + 5) + 1
     let init := initPtrEntries b n
     stepPtrAliasEntries decls bbs (iterPtrAliasEntries fuel decls bbs init) =
       iterPtrAliasEntries fuel decls bbs init := by
@@ -4244,7 +4834,7 @@ theorem iterPtrAliasEntries_stabilizes (decls : List LocalDecl) (bbs : List Basi
       ptrEntriesRank bbs.length decls.length entries < fuel →
       stepPtrAliasEntries decls bbs (iterPtrAliasEntries fuel decls bbs entries) =
         iterPtrAliasEntries fuel decls bbs entries by
-    apply this (bbs.length * decls.length * (decls.length + 4) + 1)
+    apply this (bbs.length * decls.length * (decls.length + 5) + 1)
       (initPtrEntries bbs.length decls.length) (initPtrEntries_shape bbs.length decls.length)
     rw [ptrEntriesRank_init]
     omega
@@ -4315,7 +4905,7 @@ theorem ptrEnvAtEntry_fixed (body : CapturedMir) {src dst : Nat} {bb : BasicBloc
       (ptrEnvAtEntry body dst) = true := by
   let n := body.localDecls.length
   let b := body.basicBlocks.length
-  let fuel := b * n * (n + 4) + 1
+  let fuel := b * n * (n + 5) + 1
   let entries := iterPtrAliasEntries fuel body.localDecls body.basicBlocks (initPtrEntries b n)
   have hfix : stepPtrAliasEntries body.localDecls body.basicBlocks entries = entries :=
     iterPtrAliasEntries_stabilizes body.localDecls body.basicBlocks
@@ -4478,7 +5068,7 @@ theorem ptrEnvAtEntry_least {body : CapturedMir} {entries' : List (List PtrLocal
         subsumesPtrEnv n
           ((iterPtrAliasEntries fuel body.localDecls body.basicBlocks entries).getD d (initPtrEnv n))
           (entries'.getD d (initPtrEnv n)) = true from
-    this (b * n * (n + 4) + 1) (initPtrEntries b n) (initPtrEntries_shape b n)
+    this (b * n * (n + 5) + 1) (initPtrEntries b n) (initPtrEntries_shape b n)
       (fun blk hblk => by
         rw [initPtrEntries, getD_map_range _ _ _ hblk]
         exact subsumesPtrEnv_initPtrEnv n _)
@@ -4649,6 +5239,7 @@ structure BorrowsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
   tags_pos : ∀ e ∈ s.memory.borrows, 0 < e.tag
   tags_lt : ∀ e ∈ s.memory.borrows, e.tag < s.memory.nextTag
   tags_nodup : (s.memory.borrows.map (·.tag)).Nodup
+  dag_ordered : BorrowDagOrdered s.memory.borrows
   entries_ok : ∀ e ∈ s.memory.borrows,
     ∃ (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) (relOff : Nat),
       (e = { rawPtrEntry e.tag mutbl ⟨e.targetLocal, e.targetProjection⟩ with
@@ -4685,6 +5276,16 @@ structure BorrowsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
       ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
         some (pointeeIt, relOff)
 
+theorem BorrowsOk.entry_perm_cases {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    (hb : BorrowsOk body ctx view s lm) {e : BorrowEntry} (he : e ∈ s.memory.borrows) :
+    e.perm = .active ∨ e.perm = .reserved ∨ e.perm = .frozen ∨ e.perm = .disabled := by
+  obtain ⟨mutbl, _, _, hform, _, _⟩ := hb.entries_ok e he
+  rcases hform with h | ⟨_, h⟩ | h <;> rw [h]
+  · cases mutbl <;> simp [rawPtrEntry, rawPtrPerm]
+  · exact .inr (.inl rfl)
+  · exact .inr (.inr (.inr rfl))
+
 theorem BorrowsOk.target_ne_of_not_addrTaken {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
     {s : MachineState} {lm : Map Gen.LocalName Ptr}
     (hb : BorrowsOk body ctx view s lm) {i : Nat} (hi : i ∉ bodyAddrTakenLocals body) :
@@ -4695,8 +5296,8 @@ theorem BorrowsOk.target_ne_of_not_addrTaken {body : CapturedMir} {ctx : Ctx} {v
 
 /-- Any initialized pointer or reference local `p` whose static `ptrEnvBefore`
 entry is not `.disabled` resolves to a live (non-`.disabled`) `BorrowEntry` in
-`s.memory.borrows`, and to `.active` or `.reserved` whenever `p` has mutable
-pointer/reference type (`mutbl = .mut`). -/
+`s.memory.borrows`, and to `.active` or `.reserved` whenever `p` is writable
+(`isWritablePtrState`) and has mutable pointer/reference type (`mutbl = .mut`). -/
 theorem BorrowsOk.usable_of_not_disabled {body : CapturedMir} {ctx : Ctx}
     {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
     (hb : BorrowsOk body ctx view s lm)
@@ -4707,7 +5308,9 @@ theorem BorrowsOk.usable_of_not_disabled {body : CapturedMir} {ctx : Ctx}
     (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt))
     (hvp : view[p]? = some (.init (.ptr ptrVal 8)))
     (hlk : lookupBorrow s.memory.borrows ptrVal.tag = some entry) :
-    entry.perm ≠ .disabled ∧ (srcMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved) := by
+    entry.perm ≠ .disabled ∧
+      (isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) = true →
+        srcMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved) := by
   have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
   have hisPtr : isPtrTy dp.ty = true := by simp [isPtrTy, hp_ty]
   have hp_ok := hb.alias_ok p hp_lt
@@ -4717,22 +5320,73 @@ theorem BorrowsOk.usable_of_not_disabled {body : CapturedMir} {ctx : Ctx}
     exact False.elim (hp_ok dp ptrVal hdp hisPtr hvp)
   | disabled =>
     exact False.elim (hndis_env hst)
-  | live target peers hot =>
+  | live target peers hot writable =>
     rw [hst] at hp_ok
-    obtain ⟨⟨entry', hlk', hndis', hnf', _, _⟩, _⟩ := hp_ok dp ptrVal hdp hisPtr hvp
+    obtain ⟨⟨entry', hlk', hndis', hnf', _, _, _⟩, _⟩ := hp_ok dp ptrVal hdp hisPtr hvp
     rw [hlk] at hlk'
     injection hlk' with heq
     subst heq
-    refine ⟨hndis', fun hm => ?_⟩
+    refine ⟨hndis', fun hw hm => ?_⟩
+    dsimp only [isWritablePtrState] at hw
     have hmut : isMutPtrLocal body.localDecls p = true := by
       subst hm
       simp [isMutPtrLocal, hdp, hp_ty]
-    have hnf := hnf' hmut
-    cases hpe : entry.perm with
-    | active => exact .inl rfl
-    | reserved => exact .inr rfl
-    | frozen => exact absurd hpe hnf
-    | disabled => exact absurd hpe hndis'
+    have hnf := hnf' hw hmut
+    rcases hb.entry_perm_cases (lookupBorrow_mem_and_tag hlk).1 with hpe | hpe | hpe | hpe
+    · exact .inl hpe
+    · exact .inr hpe
+    · exact absurd hpe hnf
+    · exact absurd hpe hndis'
+
+theorem BorrowsOk.ancestors_not_disabled {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    (hb : BorrowsOk body ctx view s lm)
+    {p : Nat} {dp : LocalDecl} {ptrVal : ProvenancePtr}
+    (hndis_env : (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled ≠ .disabled)
+    (hdp : body.localDecls[p]? = some dp) (hisPtr : isPtrTy dp.ty = true)
+    (hvp : view[p]? = some (.init (.ptr ptrVal 8))) :
+    ∀ anc ∈ s.memory.borrows,
+      MirSemantics.isBorrowDescendantOrSelf s.memory.borrows ptrVal.tag anc.tag = true →
+      anc.perm ≠ .disabled := by
+  have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
+  have hp_ok := hb.alias_ok p hp_lt
+  cases hst : (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled with
+  | empty =>
+    rw [hst] at hp_ok
+    exact False.elim (hp_ok dp ptrVal hdp hisPtr hvp)
+  | disabled => exact False.elim (hndis_env hst)
+  | live target peers hot writable =>
+    rw [hst] at hp_ok
+    obtain ⟨⟨_, _, _, _, _, _, hanc⟩, _⟩ := hp_ok dp ptrVal hdp hisPtr hvp
+    intro anc hmem hdesc
+    exact (hanc anc hmem (IsBorrowAncestorOrSelf.of_descendant hdesc)).1
+
+theorem BorrowsOk.ancestors_writable {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    (hb : BorrowsOk body ctx view s lm)
+    {p : Nat} {dp : LocalDecl} {srcIt : Gen.IntType} {ptrVal : ProvenancePtr}
+    (hw_env : isWritablePtrState ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled) = true)
+    (hdp : body.localDecls[p]? = some dp)
+    (hp_ty : ptrPointeeOf dp.ty = some (.mut, srcIt))
+    (hvp : view[p]? = some (.init (.ptr ptrVal 8))) :
+    ∀ anc ∈ s.memory.borrows, IsBorrowAncestorOrSelf s.memory.borrows ptrVal.tag anc.tag →
+      anc.perm ≠ .disabled ∧ anc.perm ≠ .frozen := by
+  have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
+  have hisPtr : isPtrTy dp.ty = true := by simp [isPtrTy, hp_ty]
+  have hmut : isMutPtrLocal body.localDecls p = true := by simp [isMutPtrLocal, hdp, hp_ty]
+  have hp_ok := hb.alias_ok p hp_lt
+  cases hst : (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled with
+  | empty =>
+    rw [hst] at hp_ok
+    exact False.elim (hp_ok dp ptrVal hdp hisPtr hvp)
+  | disabled => rw [hst] at hw_env; cases hw_env
+  | live target peers hot writable =>
+    rw [hst] at hp_ok hw_env
+    dsimp only [isWritablePtrState] at hw_env
+    obtain ⟨⟨_, _, _, _, _, _, hanc⟩, _⟩ := hp_ok dp ptrVal hdp hisPtr hvp
+    intro anc hmem ha
+    obtain ⟨hnd, hnf, _, _⟩ := hanc anc hmem ha
+    exact ⟨hnd, hnf hw_env hmut⟩
 
 theorem lookupBorrow_split_of_nodup {borrows : List BorrowEntry} {tag : Nat} {entry : BorrowEntry}
     (hnd : (borrows.map (·.tag)).Nodup)
@@ -4797,6 +5451,7 @@ theorem BorrowsOk.start {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
   tags_pos e he := by simp [hbor] at he
   tags_lt e he := by simp [hbor] at he
   tags_nodup := by simp [hbor]
+  dag_ordered := by rw [hbor]; trivial
   entries_ok e he := by simp [hbor] at he
   entries_place e he := by simp [hbor] at he
   target_init := hinit
@@ -4821,6 +5476,7 @@ theorem BorrowsOk.advance_keep {body : CapturedMir} {ctx : Ctx} {view : List Loc
   tags_pos := hb.tags_pos
   tags_lt := hb.tags_lt
   tags_nodup := hb.tags_nodup
+  dag_ordered := hb.dag_ordered
   entries_ok := hb.entries_ok
   entries_place := hb.entries_place
   target_init := hb.target_init
@@ -4860,7 +5516,7 @@ theorem PtrEnvOk.set_nonptr {body : CapturedMir} {view : List LocalSlot}
     intro dp pv hdp hpty hv
     exact hp_ok dp pv hdp hpty (hv_eq p dp pv hdp hpty hv)
   | disabled => trivial
-  | live target peers hot =>
+  | live target peers hot writable =>
     rw [hst] at hp_ok
     intro dp pv hdp hpty hv
     obtain ⟨hent, hpeers⟩ := hp_ok dp pv hdp hpty (hv_eq p dp pv hdp hpty hv)
@@ -4888,6 +5544,7 @@ theorem BorrowsOk.advance_set_nonptr {body : CapturedMir} {ctx : Ctx} {view : Li
     tags_pos := hb'.tags_pos
     tags_lt := hb'.tags_lt
     tags_nodup := hb'.tags_nodup
+    dag_ordered := hb'.dag_ordered
     entries_ok := hb'.entries_ok
     entries_place := hb'.entries_place
     target_init := fun hfrag k hk => by
@@ -4956,6 +5613,7 @@ theorem BorrowsOk.jump {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
     tags_pos := hb.tags_pos
     tags_lt := hb.tags_lt
     tags_nodup := hb.tags_nodup
+    dag_ordered := hb.dag_ordered
     entries_ok := hb.entries_ok
     entries_place := hb.entries_place
     target_init := hb.target_init
@@ -7717,7 +8375,8 @@ immediately lifting every `BasicMemory` correspondence theorem (`mirCall_ret`,
 theorem stepsM_bm_eq : ∀ (n : Nat) (m : Mach), stepsM (M := BM) n m = steps n m
   | 0, _ => rfl
   | n + 1, m => by
-    simp only [stepsM, steps, stepM_bm_eq m]
+    unfold stepsM steps
+    rw [stepM_bm_eq m]
     cases step m with
     | error _ => rfl
     | ok m' => exact stepsM_bm_eq n m'

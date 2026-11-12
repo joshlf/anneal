@@ -11,34 +11,47 @@ operational `MirSemantics` agreement theorems for `theory/Anneal/` (`#100`,
 `#101`, `#103`).
 -/
 
-/-- Abstract Tree Borrows permission state of a pointer tag. -/
+/-- Abstract Tree Borrows permission state of a pointer tag, mirroring the six
+states of `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm` (`active` is
+Miri's `Unique`). -/
 inductive AbstractPerm : Type where
+  | cell
+  | reservedFrz (conflicted : Bool)
+  | reservedIM
   | active
-  | reserved
   | frozen
   | disabled
   deriving DecidableEq, Repr, Inhabited
+
+/-- The unconflicted `Freeze` reservation. -/
+@[match_pattern, reducible]
+def AbstractPerm.reserved : AbstractPerm := .reservedFrz false
 
 /-- Whether `perm` permits reading through the associated pointer tag. -/
 def permAllowsRead : AbstractPerm → Bool
   | .disabled => false
   | _ => true
 
-/-- Whether `perm` permits writing through the associated pointer tag. -/
+/-- Whether `perm` permits an unprotected write through the associated pointer
+tag (a child write that is not undefined behavior). -/
 def permAllowsWrite : AbstractPerm → Bool
-  | .active | .reserved => true
+  | .cell | .reservedFrz _ | .reservedIM | .active => true
   | .frozen | .disabled => false
 
-/-- Updated permission of the writing tag itself after a self-write. -/
+/-- Updated permission of the writing tag itself after an unprotected
+self-write (child write): reservations activate and `.cell` is unchanged. -/
 def permAfterSelfWrite : AbstractPerm → AbstractPerm
-  | .reserved => .active
+  | .reservedFrz _ => .active
+  | .reservedIM => .active
   | other => other
 
-/-- Updated permission of a child borrow tag when a parent write occurs. -/
+/-- Updated permission of a child borrow tag when an unprotected parent write
+(foreign write) occurs: `.cell` and `.reservedIM` are unchanged and every other
+state becomes `.disabled`. -/
 def permAfterParentWrite : AbstractPerm → AbstractPerm
-  | .active | .frozen => .disabled
-  | .reserved => .reserved
-  | .disabled => .disabled
+  | .cell => .cell
+  | .reservedIM => .reservedIM
+  | _ => .disabled
 
 /-- Updated permission of a sibling borrow tag when another tag writes. -/
 def permAfterSiblingWrite : AbstractPerm → AbstractPerm
@@ -61,8 +74,12 @@ theorem self_write_preserves_write_permission (p : AbstractPerm)
     permAfterParentWrite .active = .disabled := rfl
 @[simp] theorem parent_write_disables_frozen :
     permAfterParentWrite .frozen = .disabled := rfl
-@[simp] theorem parent_write_preserves_reserved :
-    permAfterParentWrite .reserved = .reserved := rfl
+@[simp] theorem parent_write_disables_reserved :
+    permAfterParentWrite .reserved = .disabled := rfl
+@[simp] theorem parent_write_preserves_reservedIM :
+    permAfterParentWrite .reservedIM = .reservedIM := rfl
+@[simp] theorem parent_write_preserves_cell :
+    permAfterParentWrite .cell = .cell := rfl
 @[simp] theorem sibling_write_forbids_subsequent_read (p : AbstractPerm) :
     permAllowsRead (permAfterSiblingWrite p) = false := rfl
 @[simp] theorem sibling_write_forbids_subsequent_write (p : AbstractPerm) :
@@ -136,6 +153,7 @@ def stepForeignWriteByteRange (ps : ProtectorSet) (entry : ByteRangePerm)
     if entry.isProtected ps then
       match entry.perm with
       | .disabled => some entry
+      | .cell => some entry
       | _ => none
     else
       some { entry with perm := permAfterParentWrite entry.perm }
@@ -156,7 +174,8 @@ theorem protector_forbids_conflicting_foreign_write
     (writeAlloc writeOffset writeLen : Nat)
     (h_overlap : byteRangeOverlapsWrite entry writeAlloc writeOffset writeLen = true)
     (h_prot : entry.isProtected ps = true)
-    (h_live : entry.perm ≠ .disabled) :
+    (h_live : entry.perm ≠ .disabled)
+    (h_not_cell : entry.perm ≠ .cell) :
     stepForeignWriteByteRange ps entry writeAlloc writeOffset writeLen = none := by
   unfold stepForeignWriteByteRange
   rw [h_overlap, h_prot]
@@ -180,14 +199,18 @@ theorem different_alloc_foreign_write_non_interference
 /-! ## Operational Bridge to `Trusted.Rustc.V2026_06_01.MirSemantics` -/
 
 def TreeBorrowPerm.toAbstractPerm : TreeBorrowPerm → AbstractPerm
-  | .active => .active
-  | .reserved => .reserved
+  | .cell => .cell
+  | .reservedFrz conflicted => .reservedFrz conflicted
+  | .reservedIM => .reservedIM
+  | .unique => .active
   | .frozen => .frozen
   | .disabled => .disabled
 
 def AbstractPerm.toTreeBorrowPerm : AbstractPerm → TreeBorrowPerm
-  | .active => .active
-  | .reserved => .reserved
+  | .cell => .cell
+  | .reservedFrz conflicted => .reservedFrz conflicted
+  | .reservedIM => .reservedIM
+  | .active => .unique
   | .frozen => .frozen
   | .disabled => .disabled
 
@@ -277,11 +300,11 @@ theorem stepForeignWriteByteRange_none_of_hasProtectedWriteConflict
         dsimp [Bool.and]
         unfold borrowEntryWriteConflicts at h_conflict
         unfold BorrowEntry.toByteRangePerm TreeBorrowPerm.toAbstractPerm
-        cases hp : entry.perm
-        · rfl
-        · rfl
-        · rfl
-        · rw [hp] at h_conflict; exact nomatch h_conflict
+        cases hp : entry.perm <;>
+          simp [hp, treeBorrowNodeAccess, treeBorrowWriterRelatedness,
+            treeBorrowPermTransition, treeBorrowForeignWrite,
+            treeBorrowProtectorCheck, treeBorrowTransitionIsUB,
+            hasProtectedWriteConflict] at h_conflict ⊢
 
 @[simp]
 theorem updateBorrowPermAtProj_non_overlapping_unchanged
@@ -292,7 +315,8 @@ theorem updateBorrowPermAtProj_non_overlapping_unchanged
     updateBorrowPermAtProj entry targetLocal none writeProj
       writeRangeOff writeRangeLen = entry := by
   unfold updateBorrowPermAtProj
-  cases Nat.beq entry.targetLocal targetLocal <;> simp [h_disjoint]
+  cases Nat.beq entry.targetLocal targetLocal <;>
+    simp [h_disjoint, treeBorrowWriterRelatedness]
 
 theorem stepForeignWriteByteRange_agrees_with_updateBorrowPermAtProj
     (entry : BorrowEntry) (activeProtectors : List Nat)
@@ -345,5 +369,6 @@ theorem disjoint_byte_range_operational_non_interference
     simp only [Bool.true_and] at h_disjoint
     dsimp only
     rw [h_disjoint]
+    rfl
 
 end Anneal.Memory

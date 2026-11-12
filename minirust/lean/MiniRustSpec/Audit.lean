@@ -43,11 +43,10 @@ theorems and witnesses), `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
 dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
 witnesses), `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
 witnesses), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
-of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, and
-their witnesses), ending in `sorry_free=true`. `Correspondence.DeinitBridge`,
-the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`, is a
-separate build root that audits itself (`[SUBPLACE-AUDIT]`), so that this
-module and `MiniRustSpec` do not depend on `Anneal.Mir.*`. A group that depends on `sorryAx` or
+of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
+sub-place audit hook `subplace_audit_closure` of `Correspondence.DeinitBridge`
+— the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl` — and
+their witnesses), ending in `sorry_free=true`. A group that depends on `sorryAx` or
 on any other non-standard axiom fails the build instead.
 -/
 
@@ -3224,7 +3223,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_minirust_direct
   twoPhaseDirectWriteTreeBorrowsGap_translate
   twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ret
+  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
   twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
@@ -3307,7 +3306,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   ptrAliasingOk_iff_blockPtrAliasOk
   ptrEnvAtEntry_least
   statementOk_retag_spec
-  evalStmt_retag_local
+  evalStmt_retag_rawPtr_local
+  evalStmt_retag_ref_local
   evalStatement_validate_local_mr
   retagRefReborrowChain_inFragment
   retagRefReborrowChain_translate
@@ -3342,7 +3342,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
-  retagScalarDiscrepancy_anneal_ub
+  retagScalarDiscrepancy_anneal_ret
   retagScalarDiscrepancy_minirust_direct
   transmute_declPtrTy_ok
   evalCastOp_transmute_declPtrTy_ok
@@ -3476,6 +3476,50 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
   transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
   transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
+  retagRawOnRefLocal_inFragment
+  retagRawOnRefLocal_translate
+  retagRawOnRefLocal_anneal_ret
+  retagRawOnRefLocal_noUB
+  retagRawOnRefLocal_minirust_direct
+  retagRawOnRefLocal_tb_direct
+  retagRawOnRefLocal_ctxOk
+  retagRawOnRefLocal_minirust_ret_from_start
+  retagRawOnRefLocal_minirust_noUB
+  retagRawOnRefLocal_progress
+  mutableBorrowPerm_of_sharedBorrowPerm_frozen
+  placeIsZeroSized_of_deref_ptrPointeeOf
+  IsBorrowAncestorOrSelf.refl
+  IsBorrowAncestorOrSelf.of_eq
+  IsBorrowAncestorOrSelf.of_descendant
+  IsBorrowAncestorOrSelf.step
+  isBorrowDescendantOrSelfAux_trans
+  IsBorrowAncestorOrSelf.trans
+  IsBorrowAncestorOrSelf.of_lookup_sub
+  IsBorrowAncestorOrSelf.map_iff
+  IsBorrowAncestorOrSelf.cases_of_lookup
+  BorrowDagOrdered.map
+  BorrowDagOrdered.parent_lt_of_lookup
+  isBorrowDescendantOrSelfAux_cons_of_lt
+  IsBorrowAncestorOrSelf.cons_of_lt_iff
+  BorrowDagOrdered.descendant_of_ancestor
+  treeBorrowChainChildAccessUBAux_write_false
+  derefWriteTreeUB_false_of_ancestors_writable
+  subsumesPtrLocalState_freeze_right
+  freezePtrState_mono
+  BorrowsOk.entry_perm_cases
+  BorrowsOk.ancestors_not_disabled
+  BorrowsOk.ancestors_writable
+  BorrowsOk.perm_std
+  FreezeOrSelf.perm_std
+  updateBorrowPermTreeAtProj_perm_std
+  BorrowDagOrdered.ancestor_le
+  BorrowDagOrdered.anc_sub_cons
+  BorrowsOk.freezeRead_dag
+  BorrowsOk.reborrow_core
+  BorrowsOk.retagRef
+  invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
+  hasTreeReadUB_false_of_ancestors_not_disabled
+  derefReadTreeUB_false_of_ancestors_not_disabled
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness MiniRustSpec.Correspondence.RefWitness in
 #check_theorem_deps "[REF-AUDIT]"
@@ -3676,7 +3720,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   twoPhaseForeignWriteDiscrepancy_minirust_direct
   twoPhaseDirectWriteTreeBorrowsGap_translate
   twoPhaseDirectWriteTreeBorrowsGap_notInFragment
-  twoPhaseDirectWriteTreeBorrowsGap_anneal_ret
+  twoPhaseDirectWriteTreeBorrowsGap_anneal_ub
   twoPhaseDirectWriteTreeBorrowsGap_minirust_direct
   frozenRefMutReborrow_notInFragment
   frozenRefMutReborrow_anneal_ub
@@ -3759,7 +3803,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   ptrAliasingOk_iff_blockPtrAliasOk
   ptrEnvAtEntry_least
   statementOk_retag_spec
-  evalStmt_retag_local
+  evalStmt_retag_rawPtr_local
+  evalStmt_retag_ref_local
   evalStatement_validate_local_mr
   retagRefReborrowChain_inFragment
   retagRefReborrowChain_translate
@@ -3794,7 +3839,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagDisabledRefDiscrepancy_progress
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
-  retagScalarDiscrepancy_anneal_ub
+  retagScalarDiscrepancy_anneal_ret
   retagScalarDiscrepancy_minirust_direct
   transmute_declPtrTy_ok
   evalCastOp_transmute_declPtrTy_ok
@@ -3928,6 +3973,50 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   transmuteDanglingIntToRawPtrNoDerefOk_notInFragment
   transmuteDanglingIntToRawPtrNoDerefOk_anneal_ret
   transmuteDanglingIntToRawPtrNoDerefOk_three_way_agreement
+  retagRawOnRefLocal_inFragment
+  retagRawOnRefLocal_translate
+  retagRawOnRefLocal_anneal_ret
+  retagRawOnRefLocal_noUB
+  retagRawOnRefLocal_minirust_direct
+  retagRawOnRefLocal_tb_direct
+  retagRawOnRefLocal_ctxOk
+  retagRawOnRefLocal_minirust_ret_from_start
+  retagRawOnRefLocal_minirust_noUB
+  retagRawOnRefLocal_progress
+  mutableBorrowPerm_of_sharedBorrowPerm_frozen
+  placeIsZeroSized_of_deref_ptrPointeeOf
+  IsBorrowAncestorOrSelf.refl
+  IsBorrowAncestorOrSelf.of_eq
+  IsBorrowAncestorOrSelf.of_descendant
+  IsBorrowAncestorOrSelf.step
+  isBorrowDescendantOrSelfAux_trans
+  IsBorrowAncestorOrSelf.trans
+  IsBorrowAncestorOrSelf.of_lookup_sub
+  IsBorrowAncestorOrSelf.map_iff
+  IsBorrowAncestorOrSelf.cases_of_lookup
+  BorrowDagOrdered.map
+  BorrowDagOrdered.parent_lt_of_lookup
+  isBorrowDescendantOrSelfAux_cons_of_lt
+  IsBorrowAncestorOrSelf.cons_of_lt_iff
+  BorrowDagOrdered.descendant_of_ancestor
+  treeBorrowChainChildAccessUBAux_write_false
+  derefWriteTreeUB_false_of_ancestors_writable
+  subsumesPtrLocalState_freeze_right
+  freezePtrState_mono
+  BorrowsOk.entry_perm_cases
+  BorrowsOk.ancestors_not_disabled
+  BorrowsOk.ancestors_writable
+  BorrowsOk.perm_std
+  FreezeOrSelf.perm_std
+  updateBorrowPermTreeAtProj_perm_std
+  BorrowDagOrdered.ancestor_le
+  BorrowDagOrdered.anc_sub_cons
+  BorrowsOk.freezeRead_dag
+  BorrowsOk.reborrow_core
+  BorrowsOk.retagRef
+  invalidateDerefWriteBorrowsWithLayouts_eq_of_not_union
+  hasTreeReadUB_false_of_ancestors_not_disabled
+  derefReadTreeUB_false_of_ancestors_not_disabled
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #assert_standard_axioms
@@ -4009,7 +4098,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_minirust_direct
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
-  unsafeCellProtectedInteriorMut_anneal_ub
+  unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
   exposeSingleRefMutRoundTrip_translateIntr
@@ -4204,7 +4293,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unsafeCellUnprotInteriorMut_minirust_direct
   unsafeCellUnprotInteriorMut_tb_direct
   unsafeCellProtectedInteriorMut_translate
-  unsafeCellProtectedInteriorMut_anneal_ub
+  unsafeCellProtectedInteriorMut_anneal_ret
   unsafeCellProtectedInteriorMut_minirust_direct
   unsafeCellProtectedInteriorMut_tb_direct
   exposeSingleRefMutRoundTrip_translateIntr
@@ -5348,13 +5437,13 @@ open MiniRustSpec.Correspondence in
 
 `[DEINIT-AUDIT]` pins the projected-`Deinit` fragment `inFragmentD` of
 `Correspondence.DeinitWindow` (its window rules, the one-step correspondence
-`step_correspondence_D`, and the whole-execution lifts), the byte-store lemmas of
-`Correspondence.DeinitLemmas`, the `Rvalue::Discriminant` lowering and its gating
-characterizations, and the concrete projected-`Deinit` and `Discriminant` witnesses of
-`Correspondence.Witness`, including the negative controls. The `Anneal`-side bridge
-`Correspondence.DeinitBridge` (and its hook `subplace_audit_closure`, whose proof term
-mentions every Episode 2 theorem of `Anneal.Mir.AdtAndControl` Section 4) is audited by its
-own `[SUBPLACE-AUDIT]` group. -/
+`step_correspondence_D`, and the whole-execution lifts), the byte-store bridge of
+`Correspondence.DeinitLemmas` / `Correspondence.DeinitBridge` (including
+`subplace_audit_closure`, whose proof term mentions every Episode 2 theorem of
+`Anneal.Mir.AdtAndControl` Section 4 and its Stage-1 `Retag` reconciliation), the
+`Rvalue::Discriminant` lowering and its gating characterizations, and the concrete
+projected-`Deinit`, projected-`Retag` (Stage-1 parity), and `Discriminant` witnesses of
+`Correspondence.Witness`, including the negative controls. -/
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   MiniRustSpec.Correspondence.Witness in
@@ -5412,6 +5501,11 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   resolveFieldPath_deinit_unit
   evalStatement_deinit_fieldPath
   evalStmt_deinit_field
+  length_toAbstractBytes
+  toAbstractBytes_deinitBytes
+  evalDeinitPlace_spec_minirust_store_simulation
+  paddedDeinitSiblingReinit_anneal_shell_agreement
+  subplace_audit_closure
   translateRvalue_discriminant
   evalValue_orderingDiscrExpr
   evalValue_orderingDiscrExpr_ub
@@ -5423,9 +5517,13 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   cmpDiscrLess_minirust_ret_from_start
   statementOk_deinit_proj
   statementOk_retag_proj
+  evalStmt_retag_scalar_ub
+  evalStmt_retag_scalar_noop
   paddedDeinitRead_minirust_ub
-  paddedRetagRead_anneal_ub
+  paddedRetagRead_retag_noop
+  paddedRetagRead_anneal_noop
   paddedRetagRead_minirust_ret
+  paddedRetagRead_stage1_parity
   paddedDeinitRead_not_inFragmentD
   paddedRetagRead_not_inFragmentD
   deinitSiblingReinit_inFragmentD

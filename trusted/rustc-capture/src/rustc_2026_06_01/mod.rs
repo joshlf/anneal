@@ -304,6 +304,28 @@ pub fn MyCounter(val: u32) -> bool {
             "metadata=4f9a1c".to_owned(),
         ];
         assert_eq!(derive_unit_id("demo", &with_meta), "demo-4f9a1c");
+
+        let temp_install = unique_temp_dir("packaged-sysroot");
+        let bin_dir = temp_install.join("bin");
+        let rustlib_dir = temp_install.join("rust/lib/rustlib");
+        fs::create_dir_all(&bin_dir).expect("create packaged bin dir");
+        fs::create_dir_all(&rustlib_dir).expect("create packaged rustlib dir");
+        let direct_driver = bin_dir.join("anneal-rustc-capture");
+        let direct_args = vec![
+            direct_driver.to_string_lossy().into_owned(),
+            "--crate-name".to_owned(),
+            "my_crate".to_owned(),
+            "src/lib.rs".to_owned(),
+        ];
+        let normalized_direct = normalize_wrapper_args(&direct_args);
+        let expected_sysroot = temp_install.join("rust").to_string_lossy().into_owned();
+        assert!(
+            normalized_direct
+                .windows(2)
+                .any(|w| w[0] == "--sysroot" && w[1] == expected_sysroot),
+            "expected packaged sysroot {expected_sysroot} in {normalized_direct:?}"
+        );
+        let _ = fs::remove_dir_all(&temp_install);
     }
 
     #[test]

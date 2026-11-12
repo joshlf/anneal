@@ -1714,10 +1714,19 @@ def finishAssignStmtNode
           layouts
       with
       | .ok locals₂ =>
-        let borrows' :=
-          invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-        MirStepNode.step
-          (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        match
+          Bool.or
+            (derefWriteTreeUB locals₁ mem₁.borrows dst)
+            (derefWriteUnionProtectorUB
+              localDecls layouts locals₁ mem₁.borrows mem₁.activeProtectors dst restProj)
+        with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrows' :=
+            invalidateDerefWriteBorrowsWithLayouts
+              localDecls layouts locals₁ mem₁.borrows dst restProj
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .ub =>
         match mem₁.callerLocals with
         | .nil => MirStepNode.fail .ub
@@ -1732,20 +1741,23 @@ def finishAssignStmtNode
               mem₁.activeProtectors
           with
           | .ok callerLocals' =>
-            let borrows' :=
-              invalidateDerefWriteBorrows
-                locals₁
-                mem₁.borrows
-                dst
-                restProj
-                mem₁.callerLocals
-            MirStepNode.step
-              (advanceStmt
-                s
-                locals₁
-                { mem₁ with
-                  borrows := borrows'
-                  callerLocals := callerLocals' })
+            match derefWriteTreeUB locals₁ mem₁.borrows dst with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateDerefWriteBorrows
+                  locals₁
+                  mem₁.borrows
+                  dst
+                  restProj
+                  mem₁.callerLocals
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals₁
+                  { mem₁ with
+                    borrows := borrows'
+                    callerLocals := callerLocals' })
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
       | .unsupported => MirStepNode.unsupported
@@ -1766,9 +1778,12 @@ def finishAssignStmtNode
           match set? locals₁ dst.local_ (.init rootVal') with
           | .some locals₂ =>
             let resolvedLocalProj :=
-              match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-              | .some rp => rp
-              | .none => proj :: rest
+              resolveBorrowWriteLocalProj
+                localDecls
+                layouts
+                locals₁
+                dst.local_
+                (proj :: rest)
             match mem₁.activeProtectors with
             | .nil =>
               let borrows' :=
@@ -1809,9 +1824,12 @@ def finishAssignStmtNode
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
               let resolvedLocalProj :=
-                match resolveBorrowProjectionElems locals₁ (proj :: rest) with
-                | .some rp => rp
-                | .none => proj :: rest
+                resolveBorrowWriteLocalProj
+                  localDecls
+                  layouts
+                  locals₁
+                  dst.local_
+                  (proj :: rest)
               match mem₁.activeProtectors with
               | .nil =>
                 let borrows' :=
