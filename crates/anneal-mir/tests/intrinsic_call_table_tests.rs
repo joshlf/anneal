@@ -2058,7 +2058,7 @@ fn test_write_bytes_sets_every_byte_of_the_written_elements() {
 }
 
 #[test]
-fn test_write_bytes_checks_pointer_validity_even_for_empty_writes() {
+fn test_write_bytes_checks_alignment_even_for_empty_writes_and_validity_for_non_empty_ones() {
     let mp = raw(u32_ty(), Mutability::Mut);
     let wb = |dst: PointerValue, n: u128| {
         let body = mk(
@@ -2080,8 +2080,15 @@ fn test_write_bytes_checks_pointer_validity_even_for_empty_writes() {
         eval_lowered_body_cfg(&lower(&body, PW), &[MirValue::ptr(dst, mp.clone())], 4)
     };
     let p = |addr: u64| PointerValue::with_provenance(addr, 1000, 0);
+    // Every (aligned) pointer, even null, is valid for a zero-byte write (A1); a non-empty
+    // write through null is UB.
+    assert_eq!(returned(wb(p(0), 0)), MirValue::Unit);
     assert_eq!(
-        term_err(wb(p(0), 0)),
+        returned(wb(PointerValue::without_provenance(0), 0)),
+        MirValue::Unit
+    );
+    assert_eq!(
+        term_err(wb(p(0), 1)),
         (0, RvalueEvalError::NullPointerAccess)
     );
     assert_eq!(
@@ -3448,8 +3455,9 @@ fn test_b1_write_bytes_preserves_ub_ordering_and_zst_dead_or_uninhabited_semanti
             );
         }
 
-        // 2. Storage-dead ZST local: `count == 1` faults with `DeadLocal`, whereas `count > 1`
-        //    (`byte_len == 0`) is a bulk zero-byte no-op (matching `copy_nonoverlapping`).
+        // 2. Storage-dead ZST local: a zero-byte write accesses no memory, so it is a no-op for
+        //    any `count` (A1: Rust's rule that every pointer is valid for a zero-sized access;
+        //    B1 had made `count == 1` a `DeadLocal` fault).
         let raw_mut_unit = raw(unit(), Mutability::Mut);
         let dead_zst_body = |count: u128| {
             mk(
@@ -3474,14 +3482,16 @@ fn test_b1_write_bytes_preserves_ub_ordering_and_zst_dead_or_uninhabited_semanti
                 ],
             )
         };
-        assert_eq!(
-            term_err(eval_lowered_body_cfg(&lower(&dead_zst_body(1), pw), &[], 4)),
-            (0, RvalueEvalError::DeadLocal(Local(1)))
-        );
-        assert_eq!(
-            returned(eval_lowered_body_cfg(&lower(&dead_zst_body(3), pw), &[], 4)),
-            MirValue::Unit
-        );
+        for count in [1u128, 3] {
+            assert_eq!(
+                returned(eval_lowered_body_cfg(
+                    &lower(&dead_zst_body(count), pw),
+                    &[],
+                    4
+                )),
+                MirValue::Unit
+            );
+        }
 
         // 3. Zero-byte `write_bytes` on external non-null pointers succeeds even for `!` and
         //    non-canonical 2-field ZST unions (`0` bytes written, no synthetic local touched).
@@ -3630,8 +3640,8 @@ fn test_b1_write_bytes_preserves_ub_ordering_and_zst_dead_or_uninhabited_semanti
         );
 
         // 5b. A ZST pointer at an interior byte offset (`+2`) of a live `u32` local resolves to
-        //     no `()` sub-place (`dst_alloc_local == Some(1)`), failing closed with
-        //     `UnsupportedMemoryAccess`.
+        //     no `()` sub-place; the zero-byte write accesses no memory and is a no-op (A1;
+        //     B1 had failed closed with `UnsupportedMemoryAccess`).
         let raw_mut_u32 = raw(u32_ty(), Mutability::Mut);
         let raw_mut_u8 = raw(u8_ty(), Mutability::Mut);
         let interior_zst = mk(
@@ -3682,10 +3692,10 @@ fn test_b1_write_bytes_preserves_ub_ordering_and_zst_dead_or_uninhabited_semanti
                 blk(vec![], Terminator::Return),
             ],
         );
-        assert!(matches!(
-            term_err(eval_lowered_body_cfg(&lower(&interior_zst, pw), &[], 8)),
-            (1, RvalueEvalError::UnsupportedMemoryAccess(_))
-        ));
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&lower(&interior_zst, pw), &[], 8)),
+            MirValue::Unit
+        );
     }
 }
 
@@ -3987,6 +3997,487 @@ fn test_b1_eval_lowered_terminator_invalid_cleanup_edge_preserves_unwinding_stat
         assert_eq!(
             unwinding, None,
             "failed Cleanup edge must not leave UnwindState mutated"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A1 regression tests
+// ---------------------------------------------------------------------------------------------
+
+/// Deterministic `xorshift64*` generator for sampled (non-exhaustive) parity sweeps.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// A `w`-bit pattern biased towards boundary values: uniform bits, truncated to a random
+    /// bit length, and occasionally negated (so small, huge, and near-`MIN`/`MAX` values all
+    /// occur).
+    fn bits(&mut self, w: u32) -> u128 {
+        let raw = (u128::from(self.next()) << 64) | u128::from(self.next());
+        let len = (self.next() % u64::from(w + 1)) as u32;
+        let v = raw & width_mask(len);
+        let v = if self.next().is_multiple_of(3) {
+            v.wrapping_neg()
+        } else {
+            v
+        };
+        v & width_mask(w)
+    }
+}
+
+const ARITH_OPS: [IntrinsicOp; 11] = [
+    IntrinsicOp::ExactDiv,
+    IntrinsicOp::WrappingAdd,
+    IntrinsicOp::WrappingSub,
+    IntrinsicOp::WrappingMul,
+    IntrinsicOp::SaturatingAdd,
+    IntrinsicOp::SaturatingSub,
+    IntrinsicOp::UncheckedAdd,
+    IntrinsicOp::UncheckedSub,
+    IntrinsicOp::UncheckedMul,
+    IntrinsicOp::UncheckedDiv,
+    IntrinsicOp::UncheckedRem,
+];
+
+/// Checks every two-operand intrinsic, both unchecked shifts, `three_way_compare`, and the
+/// `*WithOverflow` / checked `BinOp`s on `(a, b)` against the native reference model.
+fn check_pair(ty: &Ty, rhs_tys: &[Ty], a: u128, b: u128, pw: PtrWidth) {
+    let w = width(ty, pw);
+    let signed = ty.is_signed_int();
+    let (x, y) = (iv(ty, a, pw), iv(ty, b, pw));
+    for op in ARITH_OPS {
+        let got = eval_intrinsic(op, &[x.clone(), y.clone()], ty, pw);
+        match native2(op, signed, w, a, b) {
+            Some(expected) => {
+                assert_eq!(got, Ok(iv(ty, expected, pw)), "{op}({ty:?} {a:#x}, {b:#x})")
+            }
+            None => assert!(
+                got.is_err(),
+                "{op}({ty:?} {a:#x}, {b:#x}) must be UB, got {got:?}"
+            ),
+        }
+    }
+    for (binop, checked) in [
+        (BinOp::AddWithOverflow, BinOp::Add),
+        (BinOp::SubWithOverflow, BinOp::Sub),
+        (BinOp::MulWithOverflow, BinOp::Mul),
+    ] {
+        let unchecked = match binop {
+            BinOp::AddWithOverflow => IntrinsicOp::UncheckedAdd,
+            BinOp::SubWithOverflow => IntrinsicOp::UncheckedSub,
+            _ => IntrinsicOp::UncheckedMul,
+        };
+        let pair = eval_binop(binop, &x, &y, pw)
+            .unwrap()
+            .as_checked_pair()
+            .unwrap();
+        assert_eq!(eval_checked_binop(checked, &x, &y, pw), Ok(pair));
+        assert_eq!(pair.1, native2(unchecked, signed, w, a, b).is_none());
+    }
+    let ord = eval_intrinsic(
+        IntrinsicOp::ThreeWayCompare,
+        &[x.clone(), y.clone()],
+        &i8_ty(),
+        pw,
+    );
+    let expected: i8 = if signed {
+        sign_extend(a, w).cmp(&sign_extend(b, w)) as i8
+    } else {
+        a.cmp(&b) as i8
+    };
+    assert_eq!(
+        ord,
+        Ok(MirValue::signed(i128::from(expected), IntTy::I8, pw))
+    );
+    for rhs_ty in rhs_tys {
+        let rw = width(rhs_ty, pw);
+        let amount_bits = b & width_mask(rw);
+        let amount = if rhs_ty.is_signed_int() {
+            let s = sign_extend(amount_bits, rw);
+            (s >= 0).then_some(s as u128)
+        } else {
+            Some(amount_bits)
+        };
+        let z = iv(rhs_ty, amount_bits, pw);
+        for (op, binop) in [
+            (IntrinsicOp::UncheckedShl, BinOp::ShlUnchecked),
+            (IntrinsicOp::UncheckedShr, BinOp::ShrUnchecked),
+        ] {
+            let got = eval_intrinsic(op, &[x.clone(), z.clone()], ty, pw);
+            assert_eq!(got, eval_binop(binop, &x, &z, pw));
+            match native_shift(op, signed, w, a, amount) {
+                Some(expected) => assert_eq!(got, Ok(iv(ty, expected, pw))),
+                None => assert!(got.is_err()),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_a1_exhaustive_8_bit_parity_with_native_reference_and_binops() {
+    let rhs_tys = [u8_ty(), i8_ty()];
+    for ty in [u8_ty(), i8_ty()] {
+        for a in 0..=255u128 {
+            for op in [IntrinsicOp::Ctlz, IntrinsicOp::Cttz, IntrinsicOp::Ctpop] {
+                assert_eq!(
+                    eval_intrinsic(op, &[iv(&ty, a, PW)], &u32_ty(), PW),
+                    Ok(u32v(u128::from(native_count(op, 8, a))))
+                );
+            }
+            for op in [IntrinsicOp::Bswap, IntrinsicOp::Bitreverse] {
+                assert_eq!(
+                    eval_intrinsic(op, &[iv(&ty, a, PW)], &ty, PW),
+                    Ok(iv(&ty, native_perm(op, 8, a), PW))
+                );
+            }
+            for b in 0..=255u128 {
+                check_pair(&ty, &rhs_tys, a, b, PW);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_a1_sampled_parity_on_every_wider_width_and_both_pointer_widths() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for pw in PWS {
+        let rhs_tys = int_tys();
+        for ty in int_tys().into_iter().filter(|t| width(t, pw) > 8) {
+            let w = width(&ty, pw);
+            for _ in 0..1500 {
+                let (a, b) = (rng.bits(w), rng.bits(w));
+                check_pair(&ty, &rhs_tys, a, b, pw);
+                for op in [IntrinsicOp::Ctlz, IntrinsicOp::Cttz, IntrinsicOp::Ctpop] {
+                    assert_eq!(
+                        eval_intrinsic(op, &[iv(&ty, a, pw)], &u32_ty(), pw),
+                        Ok(MirValue::unsigned(
+                            u128::from(native_count(op, w, a)),
+                            UintTy::U32,
+                            pw
+                        ))
+                    );
+                }
+                for op in [IntrinsicOp::Bswap, IntrinsicOp::Bitreverse] {
+                    assert_eq!(
+                        eval_intrinsic(op, &[iv(&ty, a, pw)], &ty, pw),
+                        Ok(iv(&ty, native_perm(op, w, a), pw))
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `fn(_1: usize) -> R { _2 = 7u32; _3 = &raw mut _2; _4 = _3 as usize (exposed); <rest> }`.
+fn exposing_fn(ret_ty: Ty, extra_decls: Vec<Ty>, rest: Vec<Statement>, term: Terminator) -> Body {
+    let mut decls = vec![
+        ret_ty,
+        usize_ty(),
+        u32_ty(),
+        raw(u32_ty(), Mutability::Mut),
+        usize_ty(),
+    ];
+    decls.extend(extra_decls);
+    let mut stmts = (2..decls.len()).map(live).collect::<Vec<_>>();
+    stmts.extend([
+        assign(2, Rvalue::Use(cst(7, u32_ty()))),
+        assign(3, Rvalue::RawPtr(Mutability::Mut, place(2))),
+        assign(
+            4,
+            Rvalue::Cast(CastKind::PointerExposeProvenance, cp(3), usize_ty()),
+        ),
+    ]);
+    stmts.extend(rest);
+    mk(
+        decls,
+        vec![blk(stmts, term), blk(vec![], Terminator::Return)],
+    )
+}
+
+#[test]
+fn test_a1_linked_frames_have_disjoint_synthetic_addresses() {
+    for pw in PWS {
+        // `same_addr(n) == (&raw mut its own _2 as usize == n)`.
+        let same_addr = lower(
+            &exposing_fn(
+                Ty::Bool,
+                vec![],
+                vec![assign(0, Rvalue::BinaryOp(BinOp::Eq, cp(4), cp(1)))],
+                Terminator::Return,
+            ),
+            pw,
+        );
+        // As an evaluated body, its `_2` lives at the frame-relative address 0x3000 ...
+        assert_eq!(
+            returned(eval_lowered_body_cfg(&same_addr, &[usizev(0x3000, pw)], 2)),
+            MirValue::Bool(true)
+        );
+        // ... and so does the `_2` of an identically laid-out caller, but in a callee frame the
+        // allocations lie above the caller's, so the exposed addresses differ.
+        let caller = lower(
+            &exposing_fn(
+                Ty::Bool,
+                vec![],
+                vec![],
+                call(
+                    callee("same_addr"),
+                    vec![cp(4)],
+                    0,
+                    Some(1),
+                    UnwindAction::Continue,
+                ),
+            ),
+            pw,
+        );
+        let table = CallTable::new().with_callee("same_addr", 1, same_addr.clone());
+        assert_eq!(
+            returned(eval_lowered_body_cfg_with_call_table(
+                &caller,
+                &[usizev(0, pw)],
+                4,
+                &table
+            )),
+            MirValue::Bool(false)
+        );
+        // An exposed caller address cast back to a pointer in the callee never designates one
+        // of the callee's locals (it would read the callee's `_2 = 7`, never the caller's).
+        let reread = lower(
+            &exposing_fn(
+                u32_ty(),
+                vec![raw(u32_ty(), Mutability::Mut)],
+                vec![
+                    assign(
+                        5,
+                        Rvalue::Cast(
+                            CastKind::PointerWithExposedProvenance,
+                            cp(1),
+                            raw(u32_ty(), Mutability::Mut),
+                        ),
+                    ),
+                    assign(
+                        0,
+                        Rvalue::Use(Operand::Copy(Place::with_projection(
+                            5,
+                            vec![ProjectionElem::Deref],
+                        ))),
+                    ),
+                ],
+                Terminator::Return,
+            ),
+            pw,
+        );
+        let caller = lower(
+            &exposing_fn(
+                u32_ty(),
+                vec![],
+                vec![],
+                call(
+                    callee("reread"),
+                    vec![cp(4)],
+                    0,
+                    Some(1),
+                    UnwindAction::Continue,
+                ),
+            ),
+            pw,
+        );
+        let table = CallTable::new().with_callee("reread", 1, reread);
+        match eval_lowered_body_cfg_with_call_table(&caller, &[usizev(0, pw)], 4, &table) {
+            Err(CfgEvalError::InCallee { call_stack, error }) => {
+                assert_eq!(
+                    call_stack,
+                    vec![CallSite {
+                        bb: 0,
+                        callee: CalleeSymbol::new("reread")
+                    }]
+                );
+                assert!(
+                    matches!(
+                        *error,
+                        CfgEvalError::Statement {
+                            bb: 0,
+                            error: RvalueEvalError::UnsupportedPlaceProjection(_),
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                );
+            }
+            other => panic!("expected an unsupported cross-frame dereference, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_a1_abort_and_callee_aborts_still_reject_ill_formed_unwind_edges() {
+    let hand_abort = |unwind: UnwindAction| LoweredBody {
+        local_decls: vec![unit(), Ty::Never],
+        basic_blocks: vec![
+            LoweredBasicBlock {
+                statements: vec![LoweredStatement::StorageLive(Local(1))],
+                terminator: Some(LoweredTerminator::Call {
+                    func: Operand::Constant(intrinsic(IntrinsicOp::Abort)),
+                    func_ty: unit(),
+                    args: vec![],
+                    arg_tys: vec![],
+                    destination: place(1),
+                    dest_ty: Ty::Never,
+                    target: None,
+                    unwind,
+                }),
+                is_cleanup: false,
+            },
+            LoweredBasicBlock {
+                statements: vec![],
+                terminator: Some(LoweredTerminator::UnwindResume),
+                is_cleanup: true,
+            },
+            LoweredBasicBlock {
+                statements: vec![],
+                terminator: Some(LoweredTerminator::Goto { target: 0 }),
+                is_cleanup: false,
+            },
+        ],
+        ptr_width: PW,
+    };
+    let abort_msg = PanicMessage::Intrinsic(IntrinsicOp::Abort);
+    assert_eq!(
+        eval_lowered_body_cfg(&hand_abort(UnwindAction::Cleanup(1)), &[], 2),
+        Ok(CfgEvalOutcome::Terminated {
+            bb: 0,
+            msg: abort_msg.clone()
+        })
+    );
+    assert_eq!(
+        eval_lowered_body_cfg(&hand_abort(UnwindAction::Cleanup(9)), &[], 2),
+        Err(CfgEvalError::InvalidBlock { bb: 9 })
+    );
+    assert_eq!(
+        eval_lowered_body_cfg(&hand_abort(UnwindAction::Cleanup(2)), &[], 2),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 2 })
+    );
+    // The same for a linked callee that aborts: the caller's call edge is still checked.
+    let die = lower(
+        &mk(
+            vec![Ty::Never, Ty::Never],
+            vec![blk(
+                vec![live(1)],
+                call(
+                    intrinsic(IntrinsicOp::Abort),
+                    vec![],
+                    1,
+                    None,
+                    UnwindAction::Continue,
+                ),
+            )],
+        ),
+        PW,
+    );
+    let table = CallTable::new().with_callee("die", 0, die);
+    let mut caller = hand_abort(UnwindAction::Cleanup(2));
+    if let Some(LoweredTerminator::Call { func, .. }) = &mut caller.basic_blocks[0].terminator {
+        *func = Operand::Constant(callee("die"));
+    }
+    assert_eq!(
+        eval_lowered_body_cfg_with_call_table(&caller, &[], 4, &table),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 2 })
+    );
+    if let Some(LoweredTerminator::Call { unwind, .. }) = &mut caller.basic_blocks[0].terminator {
+        *unwind = UnwindAction::Cleanup(1);
+    }
+    assert_eq!(
+        eval_lowered_body_cfg_with_call_table(&caller, &[], 4, &table),
+        Ok(CfgEvalOutcome::Terminated {
+            bb: 0,
+            msg: abort_msg
+        })
+    );
+}
+
+#[test]
+fn test_a1_linked_calls_from_cleanup_blocks_return_into_the_unwinding_caller() {
+    for pw in PWS {
+        let table = table(pw);
+        // `bb0: assert(false) -> unwind bb2; bb2 (cleanup): _2 = <callee>(_1) -> [bb3, unwind
+        // terminate]; bb3 (cleanup): resume`.
+        let body = |name: &str| {
+            mk(
+                vec![u32_ty(), u32_ty(), u32_ty()],
+                vec![
+                    blk(
+                        vec![live(2)],
+                        Terminator::Assert {
+                            cond: Operand::Constant(Constant::Bool(false)),
+                            expected: true,
+                            msg: AssertMessage::Custom("first".into()),
+                            target: 1,
+                            unwind: UnwindAction::Cleanup(2),
+                        },
+                    ),
+                    blk(vec![assign(0, Rvalue::Use(cp(2)))], Terminator::Return),
+                    cleanup_blk(
+                        vec![],
+                        call(
+                            callee(name),
+                            vec![cp(1)],
+                            2,
+                            Some(3),
+                            UnwindAction::Terminate,
+                        ),
+                    ),
+                    cleanup_blk(vec![], Terminator::UnwindResume),
+                ],
+            )
+        };
+        let first = PanicMessage::Custom("first".into());
+        let lowered = lower(&body("double"), pw);
+        // bb0, bb2, double.bb0, bb3.
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(&lowered, &[iv(&u32_ty(), 21, pw)], 4, &table),
+            Ok(CfgEvalOutcome::Panicked {
+                bb: 0,
+                msg: first.clone()
+            })
+        );
+        match eval_lowered_body_cfg_with_call_table(&lowered, &[iv(&u32_ty(), 21, pw)], 3, &table) {
+            Ok(CfgEvalOutcome::OutOfFuel { bb: 3, state }) => {
+                assert_eq!(state.slots[2], LocalSlotState::Init(iv(&u32_ty(), 42, pw)));
+            }
+            other => panic!("expected OutOfFuel at the cleanup block bb3, got {other:?}"),
+        }
+        // A callee panic during cleanup takes the call's `Terminate` edge.
+        let boom = mk(
+            vec![u32_ty(), u32_ty(), Ty::Never],
+            vec![blk(
+                vec![live(2)],
+                call(
+                    intrinsic(IntrinsicOp::PanicUnwind),
+                    vec![],
+                    2,
+                    None,
+                    UnwindAction::Continue,
+                ),
+            )],
+        );
+        let table = table.with_callee("boom", 1, lower(&boom, pw));
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower(&body("boom"), pw),
+                &[iv(&u32_ty(), 1, pw)],
+                8,
+                &table
+            ),
+            Ok(CfgEvalOutcome::Terminated {
+                bb: 2,
+                msg: PanicMessage::Intrinsic(IntrinsicOp::PanicUnwind)
+            })
         );
     }
 }

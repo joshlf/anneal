@@ -554,10 +554,11 @@ pub enum CfgEvalOutcome {
     /// ending in `UnwindTerminate`), or block `bb` called [`IntrinsicOp::Abort`].
     Terminated { bb: usize, msg: PanicMessage },
     /// Fuel ran out before block `bb` could execute; `state` is the state at that point, from
-    /// which [`eval_cfg_in_state`] (or [`eval_cfg_in_state_with_call_table`]) can resume. When
-    /// fuel runs out inside a linked callee, `bb` is the evaluated body's calling block and
-    /// `state` the body's state when that block was entered (callee frames are discarded, and
-    /// resuming re-executes the block and the call).
+    /// which [`eval_cfg_in_state`] (or [`eval_cfg_in_state_with_call_table`]) can resume unless
+    /// `bb` is a cleanup block (the unwinding panic is not part of `state`). When fuel runs out
+    /// inside a linked callee, `bb` is the evaluated body's calling block and `state` the body's
+    /// state when that block was entered (callee frames are discarded, and resuming re-executes
+    /// the block and the call).
     OutOfFuel {
         bb: usize,
         state: StatementEvalState,
@@ -1036,8 +1037,11 @@ pub fn eval_lowered_terminator(
                         return Err(CfgEvalError::UnreachableReached { bb });
                     }
                     // An abort ends the program at once: no cleanup block runs, whatever the
-                    // call's `target` and `unwind` (`Trusted`'s `retOutcome .abort`).
+                    // call's `target` and `unwind` (`Trusted`'s `retOutcome .abort`). As for
+                    // every completed call, an ill-formed unwind action of a hand-built body
+                    // is still rejected.
                     IntrinsicOutcome::Abort => {
+                        check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
                         return Ok(CfgStep::Done(CfgEvalOutcome::Terminated {
                             bb,
                             msg: PanicMessage::Intrinsic(op),
@@ -1385,8 +1389,11 @@ pub struct LinkedCallee {
 ///   re-attributed to the caller's calling block with their messages unchanged, and an error
 ///   inside a callee is reported as [`CfgEvalError::InCallee`] with the call stack.
 /// - **Frame isolation.** Every frame has its own locals, synthetic stack allocations
-///   (addresses and provenance `alloc_id = local + 1`), and exposed-provenance tracker; it
-///   inherits the caller's transmute policy and `ub_checks`. Because a synthetic pointer is
+///   (provenance `alloc_id = local + 1`), and exposed-provenance tracker; it inherits the
+///   caller's transmute policy and `ub_checks`. A callee frame's allocations lie above all of
+///   its caller's ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the
+///   address space is `UnsupportedMemoryAccess`), so the addresses of distinct active frames
+///   never coincide, not even as exposed integers. Because a synthetic pointer's provenance is
 ///   only meaningful in its own frame, an argument or returned value holding a pointer whose
 ///   provenance names a synthetic local allocation of either frame (`alloc_id` in
 ///   `1..=max(caller_locals, callee_locals)`) is rejected with `UnsupportedMemoryAccess`
@@ -1489,9 +1496,10 @@ pub struct CallSite {
 
 /// [`eval_cfg_in_state`] with the linked callees of `table` (see [`CallTable`]): a `Call` of
 /// a linked [`CallTarget::Fn`] symbol runs the callee's body in a new frame; inline intrinsics
-/// run in the calling frame; every other call goes to `call_handler`, or fails with
-/// [`CfgEvalError::UnknownCallee`] (an unlinked symbol) or [`CfgEvalError::UnsupportedCall`]
-/// without one. `fuel` bounds the blocks executed across all frames.
+/// run in the calling frame; every other call (in any frame) goes to `call_handler`, which
+/// receives the calling frame's block index, or fails with [`CfgEvalError::UnknownCallee`] (an
+/// unlinked symbol) or [`CfgEvalError::UnsupportedCall`] without one. `fuel` bounds the blocks
+/// executed across all frames.
 pub fn eval_cfg_in_state_with_call_table(
     body: &LoweredBody,
     state: StatementEvalState,
@@ -1718,6 +1726,10 @@ fn enter_callee(
     let mut state = StatementEvalState::from_body(&callee.body, args)?;
     state.policy = caller.state.policy;
     state.ub_checks = caller.state.ub_checks;
+    // The callee's synthetic allocations lie above all of its caller's, so addresses of
+    // distinct active frames never coincide (also through exposed addresses).
+    state.frame_addr_base = caller.state.frame_addr_end()?;
+    state.frame_addr_end()?;
     Ok(state)
 }
 
@@ -1911,10 +1923,16 @@ fn eval_frames<'a>(
                             Err(error) => Err(error),
                         }
                     }
-                    // An abort ends the program: no caller cleanup block runs.
-                    CfgEvalOutcome::Terminated { msg, .. } => {
-                        Ok(Some(CfgEvalOutcome::Terminated { bb, msg }))
-                    }
+                    // An abort ends the program: no caller cleanup block runs (an ill-formed
+                    // unwind action of a hand-built caller is still rejected, as for every
+                    // completed call).
+                    CfgEvalOutcome::Terminated { msg, .. } => check_unwind_action(
+                        bb,
+                        pending.unwind,
+                        caller.unwinding.is_some(),
+                        &caller.body.basic_blocks,
+                    )
+                    .map(|()| Some(CfgEvalOutcome::Terminated { bb, msg })),
                     // Frames never finish out of fuel (the loop checks fuel before each block).
                     CfgEvalOutcome::OutOfFuel { .. } => Ok(Some(outcome)),
                 };

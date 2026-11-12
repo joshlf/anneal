@@ -3249,6 +3249,7 @@ fn predict_exposed_provenance_for_decls(
     target_ty: &Ty,
     local_decls: &[Ty],
     slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
     ptr_width: PtrWidth,
     tracker: &ExposedProvenanceTracker,
 ) -> Option<crate::ir::Provenance> {
@@ -3264,7 +3265,9 @@ fn predict_exposed_provenance_for_decls(
             else {
                 continue;
             };
-            let Ok(base_addr) = local_base_addr_for_decls(loc, local_decls, ptr_width) else {
+            let Ok(base_addr) =
+                local_base_addr_in_frame(loc, local_decls, ptr_width, frame_addr_base)
+            else {
                 continue;
             };
             let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
@@ -3301,14 +3304,16 @@ pub fn eval_lowered_cast(
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
 ) -> Result<MirValue, RvalueEvalError> {
-    eval_lowered_cast_with_decls(cast, val, &[], None, ptr_width, policy, tracker)
+    eval_lowered_cast_with_decls(cast, val, &[], None, 0, ptr_width, policy, tracker)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_lowered_cast_with_decls(
     cast: &LoweredCast,
     val: &MirValue,
     local_decls: &[Ty],
     slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
     ptr_width: PtrWidth,
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
@@ -3384,6 +3389,7 @@ fn eval_lowered_cast_with_decls(
                     target_ty,
                     local_decls,
                     slots,
+                    frame_addr_base,
                     ptr_width,
                     tracker,
                 )
@@ -5527,7 +5533,7 @@ pub fn eval_lowered_rvalue(
                 Vec::new()
             };
             let out =
-                eval_lowered_cast_with_decls(cast, &v, &decls, None, ptr_width, policy, tracker)?;
+                eval_lowered_cast_with_decls(cast, &v, &decls, None, 0, ptr_width, policy, tracker)?;
             if !mir_value_matches_ty(&out, ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Cast result runtime type does not match lowered ty",
@@ -6087,6 +6093,10 @@ pub struct StatementEvalState {
     pub tracker: ExposedProvenanceTracker,
     /// Value returned by `Rvalue::NullaryOp(NullOp::UbChecks, Ty::Bool)` (defaults to `true`).
     pub ub_checks: bool,
+    /// Offset of this frame's synthetic stack allocations (see [`local_base_addr_in_frame`]):
+    /// `0` for an evaluated body, and above every caller frame's allocations for a linked
+    /// callee frame (`crate::lower::cfg::CallTable`), so no two active frames share an address.
+    pub frame_addr_base: u128,
 }
 
 /// Type alias for [`StatementEvalState`].
@@ -6107,6 +6117,7 @@ impl StatementEvalState {
             policy: TransmutePolicy::RejectPtrToInt,
             tracker: ExposedProvenanceTracker::new(),
             ub_checks: true,
+            frame_addr_base: 0,
         }
     }
 
@@ -6124,6 +6135,7 @@ impl StatementEvalState {
             policy,
             tracker: ExposedProvenanceTracker::new(),
             ub_checks: true,
+            frame_addr_base: 0,
         }
     }
 
@@ -6238,7 +6250,18 @@ impl StatementEvalState {
     /// [`local_base_addr_for_decls`]: `UnsupportedMemoryAccess` when the local's synthetic
     /// allocation does not fit the target address space).
     pub(crate) fn local_base_addr(&self, local: usize) -> Result<u128, RvalueEvalError> {
-        local_base_addr_for_decls(local, &self.local_decls, self.ptr_width)
+        local_base_addr_in_frame(local, &self.local_decls, self.ptr_width, self.frame_addr_base)
+    }
+
+    /// End of this frame's synthetic stack allocations (the address after the page-rounded
+    /// allocation of its last local), from which a callee frame's allocations may start.
+    pub(crate) fn frame_addr_end(&self) -> Result<u128, RvalueEvalError> {
+        local_base_addr_in_frame(
+            self.local_decls.len(),
+            &self.local_decls,
+            self.ptr_width,
+            self.frame_addr_base,
+        )
     }
 
     /// Maps a synthetic local or sub-place pointer `ptr` (of type `ptr_ty` with pointee
@@ -8852,12 +8875,27 @@ pub(crate) fn local_base_addr_for_decls(
     local_decls: &[Ty],
     ptr_width: PtrWidth,
 ) -> Result<u128, RvalueEvalError> {
+    local_base_addr_in_frame(local, local_decls, ptr_width, 0)
+}
+
+/// [`local_base_addr_for_decls`] for a frame whose synthetic allocations start `frame_base`
+/// bytes higher (a page multiple; see [`StatementEvalState::frame_addr_base`]): the frame's
+/// first allocation starts at `frame_base + 0x1000`, and every allocation must still fit the
+/// target address space (`UnsupportedMemoryAccess` otherwise).
+pub(crate) fn local_base_addr_in_frame(
+    local: usize,
+    local_decls: &[Ty],
+    ptr_width: PtrWidth,
+    frame_base: u128,
+) -> Result<u128, RvalueEvalError> {
     const PAGE: u128 = 0x1000;
     let too_large = RvalueEvalError::UnsupportedMemoryAccess(
         "synthetic stack allocation does not fit the target address space",
     );
     let limit = ptr_width.max_usize();
-    let mut cur = PAGE;
+    let Some(mut cur) = frame_base.checked_add(PAGE).filter(|start| *start <= limit) else {
+        return Err(too_large);
+    };
     let preceding = local.min(local_decls.len());
     for decl_ty in &local_decls[..preceding] {
         let stride = match decl_ty.alloc_size_and_align(ptr_width) {
@@ -8930,6 +8968,8 @@ trait FrameView {
     fn frame_slot(&self, local: usize) -> Option<FrameSlot<'_>>;
     /// Reads the `usize` operand of a `ProjectionElem::Index(idx_local)` step.
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError>;
+    /// Offset of the frame's synthetic allocations ([`local_base_addr_in_frame`]).
+    fn frame_addr_base(&self) -> u128;
 }
 
 impl FrameView for StatementEvalState {
@@ -8956,6 +8996,10 @@ impl FrameView for StatementEvalState {
 
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError> {
         self.read_index_local(idx_local)
+    }
+
+    fn frame_addr_base(&self) -> u128 {
+        self.frame_addr_base
     }
 }
 
@@ -8997,6 +9041,10 @@ impl FrameView for ValuesFrame<'_> {
 
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError> {
         read_index_in_values(idx_local, self.locals, &self.decls, self.ptr_width)
+    }
+
+    fn frame_addr_base(&self) -> u128 {
+        0
     }
 }
 
@@ -9204,7 +9252,12 @@ fn resolve_synthetic_subplace_in<F: FrameView + ?Sized>(
     if matches!(frame.frame_slot(target_local), Some(FrameSlot::Dead)) {
         return Err(RvalueEvalError::DeadLocal(Local(target_local)));
     }
-    let base_addr = local_base_addr_for_decls(target_local, frame.frame_decls(), ptr_width)?;
+    let base_addr = local_base_addr_in_frame(
+        target_local,
+        frame.frame_decls(),
+        ptr_width,
+        frame.frame_addr_base(),
+    )?;
     let target_decl_ty = &frame.frame_decls()[target_local];
     let (target_alloc_size, _) = target_decl_ty
         .alloc_size_and_align(ptr_width)
@@ -9539,7 +9592,9 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
         place,
     )?;
     // In bounds of an allocation that fits the address space: no wrap.
-    let addr = local_base_addr_for_decls(place.local.0, decls, ptr_width)? + off as u128;
+    let addr =
+        local_base_addr_in_frame(place.local.0, decls, ptr_width, frame.frame_addr_base())?
+            + off as u128;
     Ok(PointerValue::with_provenance(
         addr as u64,
         place.local.0 as u64 + 1,
@@ -9705,7 +9760,12 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
                 ptr_width,
                 place,
             )?;
-            let addr = local_base_addr_for_decls(resolved_local.0, decls, ptr_width)? + off as u128;
+            let addr = local_base_addr_in_frame(
+                resolved_local.0,
+                decls,
+                ptr_width,
+                frame.frame_addr_base(),
+            )? + off as u128;
             Ok(PointerValue::with_provenance(
                 addr as u64,
                 resolved_local.0 as u64 + 1,
@@ -9726,7 +9786,8 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             )?;
             let (tail_off, _) =
                 compute_subplace_offset_and_tag(deref_ty, tail, &read_index, ptr_width, place)?;
-            let local_base = local_base_addr_for_decls(target_local, decls, ptr_width)?;
+            let local_base =
+                local_base_addr_in_frame(target_local, decls, ptr_width, frame.frame_addr_base())?;
             let target_decl_ty = &decls[target_local];
             let (target_alloc_size, _) = target_decl_ty
                 .alloc_size_and_align(ptr_width)
@@ -11208,24 +11269,31 @@ pub(crate) fn copy_nonoverlapping_values(
 /// `write_bytes::<elem_ty>(dst_val, byte_val, count_val)` ([`IntrinsicOp::WriteBytes`]) on
 /// evaluated operands: sets the `count * elem_size` bytes at `dst` to `byte_val`.
 ///
-/// The undefined-behavior checks mirror [`copy_nonoverlapping_values`] (which `write_bytes`
-/// shares its safety contract with): `dst` must be a `*mut elem_ty` / `&mut elem_ty` whose
-/// address fits the target and `count` a `usize` that does (`InvalidBitPattern` otherwise,
-/// never truncated); even when nothing is written, `dst` must be non-null
-/// (`NullPointerAccess`) and aligned to `elem_align` (`MisalignedPointer`), `count *
-/// elem_size` must not exceed `isize::MAX` (`CopyLengthOverflow`), and the range must not
-/// wrap the address space (`PointerRangeOverflow`). A zero-count write is then a no-op, and a
-/// non-empty or `count == 1` write must not touch a storage-dead local (`DeadLocal`).
+/// `dst` must be a `*mut elem_ty` / `&mut elem_ty` whose address fits the target and `count`
+/// a `usize` that does (`InvalidBitPattern` otherwise, never truncated). Then `dst` must be
+/// aligned to `elem_align` even when nothing is written (`MisalignedPointer`), and `count *
+/// elem_size` must not exceed `isize::MAX` (`CopyLengthOverflow`).
 ///
-/// The written element value is the canonical decoding of `elem_size` copies of the byte
-/// (MiniRust `decode`): an element type without a canonical byte layout, or bytes that are no
-/// valid element value (`bool` from `2`, a null `&T`, ...), cannot be stored in the value
-/// tree and are `UnsupportedMemoryAccess` (writing such bytes is not itself undefined
-/// behavior, reading them later is). The value is then stored like `copy_nonoverlapping`
-/// stores a copied value: into the resolved synthetic sub-place for `count == 1` (a whole
-/// inactive union field is overwritten), into a resolved contiguous window of array elements
-/// for `count >= 1`, and, for zero-sized elements whose pointer resolves to no synthetic
-/// local, nowhere (no memory is accessed). Any other destination is `UnsupportedMemoryAccess`.
+/// A write of zero bytes (`count == 0`, or zero-sized elements) accesses no memory, so every
+/// aligned pointer is valid for it, including null and dangling ones (Rust's rule for
+/// zero-sized accesses, which `core::ptr::write_bytes`'s `maybe_is_aligned_and_not_null`
+/// check applies with `zero_size = T::IS_ZST || count == 0`); a reference to an uninhabited
+/// type is still an invalid value (`UninhabitedPointee`). When it designates a live zero-sized
+/// sub-place, the (unique) element value is recorded there (or in its whole window of array
+/// elements); otherwise the write is a no-op.
+///
+/// A non-empty write requires a non-null `dst` (`NullPointerAccess`) whose range does not
+/// wrap the address space (`PointerRangeOverflow`) and does not touch a storage-dead local
+/// (`DeadLocal`). The written element value is the canonical decoding of `elem_size` copies of
+/// the byte (MiniRust `decode`): an element type without a canonical byte layout, or bytes
+/// that are no valid element value (`bool` from `2`, a null `&T`, ...), cannot be stored in
+/// the value tree and are `UnsupportedMemoryAccess` (writing such bytes is not itself
+/// undefined behavior, reading them later is). The value is then stored like
+/// `copy_nonoverlapping` stores a copied value: into the resolved synthetic sub-place for
+/// `count == 1` (a whole inactive union field is overwritten), or into a resolved contiguous
+/// window of array elements. A resolution fault of `dst` (undefined behavior such as
+/// `UninhabitedPointee`) is reported before any value is decoded; any other destination is
+/// `UnsupportedMemoryAccess`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bytes_values(
     state: &mut StatementEvalState,
@@ -11285,9 +11353,6 @@ pub(crate) fn write_bytes_values(
             bits: count,
         }));
     }
-    if dst_addr == 0 {
-        return Err(RvalueEvalError::NullPointerAccess);
-    }
     if !dst_addr.is_multiple_of(elem_align as u128) {
         return Err(RvalueEvalError::MisalignedPointer {
             addr: dst_addr as u64,
@@ -11298,32 +11363,6 @@ pub(crate) fn write_bytes_values(
         .checked_mul(elem_size as u128)
         .filter(|len| *len <= ptr_width.max_object_size())
         .ok_or(RvalueEvalError::CopyLengthOverflow { count, elem_size })?;
-    if dst_addr + byte_len > ptr_width.max_usize() {
-        return Err(RvalueEvalError::PointerRangeOverflow {
-            addr: dst_addr as u64,
-            byte_len,
-        });
-    }
-    if count == 0 {
-        return Ok(());
-    }
-    let local_count = state.slots.len().min(state.local_decls.len());
-    let dst_alloc_local = resolve_synthetic_alloc_local(&dst_ptr, local_count);
-    if (byte_len > 0 || count == 1)
-        && let Some(idx) = dst_alloc_local
-        && matches!(state.slots[idx], LocalSlotState::Dead)
-    {
-        return Err(RvalueEvalError::DeadLocal(Local(idx)));
-    }
-    let dummy_place = Place::from_local(0);
-    let dst_ptr_ty = dst_val.ty();
-    let dst_resolved = state.resolve_synthetic_subplace_with_mode(
-        &dst_ptr,
-        &dst_ptr_ty,
-        elem_ty,
-        &dummy_place,
-        true,
-    );
     let decode_elem = || -> Result<MirValue, RvalueEvalError> {
         if !elem_ty.has_canonical_byte_layout(ptr_width) {
             return Err(RvalueEvalError::UnsupportedMemoryAccess(
@@ -11340,71 +11379,58 @@ pub(crate) fn write_bytes_values(
             other => other,
         })
     };
-
-    if count == 1 {
-        return match dst_resolved {
-            Ok((dst_local, dst_proj)) => {
-                // As for `copy_nonoverlapping`: a single element written into part of an
-                // inactive union array field is a partial union-field write (unsupported).
-                let mut whole_dst_proj = dst_proj.as_slice();
-                while let Some((
-                    ProjectionElem::ConstantIndex {
-                        offset: 0,
-                        min_length: 1,
-                        from_end: false,
-                    },
-                    prefix,
-                )) = whole_dst_proj.split_last()
-                {
-                    whole_dst_proj = prefix;
-                }
-                if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
-                    && matches!(
-                        whole_dst_proj.last(),
-                        Some(ProjectionElem::ConstantIndex { .. })
-                    )
-                {
-                    return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
-                }
-                if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
-                    return Ok(());
-                }
-                let elem_val = decode_elem()?;
-                state.write_subplace_slot(
-                    dst_local,
-                    &dst_proj,
-                    elem_ty,
-                    FieldSlot::Init(elem_val),
-                    dst_local,
-                    &dummy_place,
-                )
-            }
-            Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => {
-                Err(err)
-            }
-            Err(_) if byte_len == 0 && dst_alloc_local.is_none() => Ok(()),
-            Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
-        };
+    if byte_len > 0 {
+        if dst_addr == 0 {
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        if dst_addr + byte_len > ptr_width.max_usize() {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: dst_addr as u64,
+                byte_len,
+            });
+        }
+        let local_count = state.slots.len().min(state.local_decls.len());
+        if let Some(idx) = resolve_synthetic_alloc_local(&dst_ptr, local_count)
+            && matches!(state.slots[idx], LocalSlotState::Dead)
+        {
+            return Err(RvalueEvalError::DeadLocal(Local(idx)));
+        }
+    } else if count == 0 || dst_addr == 0 {
+        return Ok(());
     }
-
-    // `count > 1`: first handle a resolved contiguous window of array elements (including
-    // zero-sized element arrays such as `[(); N]`, matching `copy_nonoverlapping_values`).
-    if let (Ok((dst_local, dst_elem_proj)), Ok(count_u64), Ok(count_usize)) = (
-        dst_resolved.as_ref(),
-        u64::try_from(count),
-        usize::try_from(count),
-    ) && let Some((
-        &ProjectionElem::ConstantIndex {
-            offset: dst_start,
-            min_length: dst_len,
-            from_end: false,
-        },
-        dst_arr_proj,
-    )) = dst_elem_proj.split_last()
+    let dummy_place = Place::from_local(0);
+    let dst_ptr_ty = dst_val.ty();
+    let (dst_local, dst_proj) = match state.resolve_synthetic_subplace_with_mode(
+        &dst_ptr,
+        &dst_ptr_ty,
+        elem_ty,
+        &dummy_place,
+        true,
+    ) {
+        Ok(resolved) => resolved,
+        // A zero-byte write needs no memory: only an invalid reference value is an error.
+        Err(err @ RvalueEvalError::UninhabitedPointee(_)) => return Err(err),
+        Err(_) if byte_len == 0 => return Ok(()),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(_)) => {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+        }
+        Err(err) => return Err(err),
+    };
+    // `count > 1`: a contiguous window of array elements (also of zero-sized elements, whose
+    // whole window `[start, start + count)` is recorded when it fits the array).
+    if count > 1
+        && let (Ok(count_u64), Ok(count_usize)) = (u64::try_from(count), usize::try_from(count))
+        && let Some((
+            &ProjectionElem::ConstantIndex {
+                offset: dst_start,
+                min_length: dst_len,
+                from_end: false,
+            },
+            dst_arr_proj,
+        )) = dst_proj.split_last()
         && let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len)
         && let Ok(dst_len_usize) = usize::try_from(dst_len)
     {
-        let dst_local = *dst_local;
         if count_usize > MAX_EVAL_ARRAY_LEN {
             return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
         }
@@ -11418,9 +11444,8 @@ pub(crate) fn write_bytes_values(
         if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
             return Ok(());
         }
-        let elem_val = decode_elem()?;
         let window = MirValue::Array {
-            elements: vec![elem_val; count_usize],
+            elements: vec![decode_elem()?; count_usize],
             elem_ty: elem_ty.clone(),
         };
         if dst_start == 0 && count_usize == dst_len_usize {
@@ -11447,60 +11472,42 @@ pub(crate) fn write_bytes_values(
         let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
         return state.write_place(&dst_slice_place, &slice_ty, window);
     }
-
-    // Zero-byte `count > 1` write outside an in-bounds array window: writes into a resolved
-    // single ZST sub-place (e.g. a bare `()` local or `[(); 1]`), while leaving uninhabited
-    // ZSTs, storage-dead ZST bulk writes, and external non-null ZST pointers as no-ops.
-    if byte_len == 0 {
-        return match dst_resolved {
-            Ok((dst_local, dst_proj)) => {
-                let mut whole_dst_proj = dst_proj.as_slice();
-                while let Some((
-                    ProjectionElem::ConstantIndex {
-                        offset: 0,
-                        min_length: 1,
-                        from_end: false,
-                    },
-                    prefix,
-                )) = whole_dst_proj.split_last()
-                {
-                    whole_dst_proj = prefix;
-                }
-                if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
-                    && matches!(
-                        whole_dst_proj.last(),
-                        Some(ProjectionElem::ConstantIndex { .. })
-                    )
-                {
-                    return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
-                }
-                if !elem_ty.is_inhabited_for(ptr_width) {
-                    return Ok(());
-                }
-                let elem_val = decode_elem()?;
-                state.write_subplace_slot(
-                    dst_local,
-                    &dst_proj,
-                    elem_ty,
-                    FieldSlot::Init(elem_val),
-                    dst_local,
-                    &dummy_place,
-                )
-            }
-            Err(RvalueEvalError::DeadLocal(_)) => Ok(()),
-            Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => {
-                Err(err)
-            }
-            Err(_) if dst_alloc_local.is_none() => Ok(()),
-            Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
-        };
+    // A single element: `count == 1`, or the one sub-place that all `count` zero-sized
+    // elements share.
+    if count > 1 && byte_len > 0 {
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
     }
-
-    match dst_resolved {
-        Ok(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
-        Err(err) if !matches!(err, RvalueEvalError::UnsupportedPlaceProjection(_)) => Err(err),
-        Err(_) => Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST)),
+    // As for `copy_nonoverlapping`: a single element written into part of an inactive union
+    // array field is a partial union-field write (unsupported).
+    let mut whole_dst_proj = dst_proj.as_slice();
+    while let Some((
+        ProjectionElem::ConstantIndex {
+            offset: 0,
+            min_length: 1,
+            from_end: false,
+        },
+        prefix,
+    )) = whole_dst_proj.split_last()
+    {
+        whole_dst_proj = prefix;
     }
+    if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
+        && matches!(whole_dst_proj.last(), Some(ProjectionElem::ConstantIndex { .. }))
+    {
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+    }
+    if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+        return Ok(());
+    }
+    let elem_val = decode_elem()?;
+    state.write_subplace_slot(
+        dst_local,
+        &dst_proj,
+        elem_ty,
+        FieldSlot::Init(elem_val),
+        dst_local,
+        &dummy_place,
+    )
 }
 
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.
@@ -11951,6 +11958,7 @@ pub fn eval_lowered_rvalue_in_state(
                 &v,
                 &state.local_decls,
                 Some(&state.slots),
+                state.frame_addr_base,
                 state.ptr_width,
                 state.policy,
                 &mut state.tracker,
