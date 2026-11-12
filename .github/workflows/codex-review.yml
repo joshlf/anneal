@@ -6,72 +6,20 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-name: Codex review gate
+name: Codex review diagnostics
 
 'on':
-  # Event payloads select when to reconcile, never which code to execute.
-  # Every job below explicitly checks out main, including for fork PRs.
-  pull_request_target:
-    types: [opened, synchronize, reopened, edited, closed, ready_for_review,
-            converted_to_draft]
-  issue_comment:
-    types: [created, edited, deleted]
-  merge_group:
-    types: [checks_requested]
-  # Reconcile existing PRs when the adapter itself lands or changes on main.
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
+  statuses: read
 
 jobs:
-  record-deletion:
-    # Do not put workflow-level concurrency above these jobs. Every deletion
-    # must reach durable storage before GitHub can coalesce evaluator jobs.
-    if: >-
-      github.event_name == 'issue_comment' &&
-      github.event.action == 'deleted' &&
-      github.event.issue.pull_request
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      statuses: write
-    env:
-      ACTIONS_CACHE_URL: ''
-      ACTIONS_RESULTS_URL: ''
-      ACTIONS_RUNTIME_TOKEN: ''
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/heads/main
-          persist-credentials: false
-      - name: Preserve a deleted summary's identity
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B ci/codex_review.py --record-deletion
-
-  reconcile:
-    needs: [record-deletion]
-    if: >-
-      always() && !cancelled() &&
-      (needs.record-deletion.result == 'success' ||
-       needs.record-deletion.result == 'skipped') &&
-      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
-    # The output is shared by commits, including commits used in several PRs.
-    # Serialize all evaluations. Each retained run reads every open PR and live
-    # queue entry, so coalescing a pending evaluator does not lose its work.
-    concurrency:
-      group: codex-review-gate
-      cancel-in-progress: false
+  diagnose:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: read
-      statuses: write
     env:
       ACTIONS_CACHE_URL: ''
       ACTIONS_RESULTS_URL: ''
@@ -79,13 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This branch is the policy owner. Event refs and dispatch refs must
-          # not select the executable code that receives the status token.
+          # Dispatch refs must not select code that receives the read token.
           ref: refs/heads/main
           persist-credentials: false
-      - name: Publish the current Code Review verdicts
+      - name: Inspect proposed Code Review verdicts without publishing
         env:
           GH_TOKEN: ${{ github.token }}
-        # Isolated Python ignores user site packages and PYTHONPATH. PR text is
-        # read through the API as data; it never becomes a command or a path.
-        run: python3 -I -B ci/codex_review.py --publish
+        # Isolated Python ignores user site packages and PYTHONPATH. The default
+        # mode reads GitHub data and prints verdicts without writing statuses.
+        run: python3 -I -B ci/codex_review.py
