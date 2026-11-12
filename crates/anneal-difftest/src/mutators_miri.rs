@@ -455,9 +455,13 @@ struct LifetimeEraser<'a> {
 }
 
 impl LifetimeEraser<'_> {
+    /// Whether to elide `lt`. Closed parameter types (`only_names: None`)
+    /// elide every named lifetime, including `'static`, because the stack
+    /// locals that back them never live for `'static`. Function bodies erase
+    /// only the removed signature lifetimes, which never include `'static`.
     fn should_erase(&self, lt: &syn::Lifetime) -> bool {
         let name = lt.ident.to_string();
-        if name == "static" || name == "_" || self.shadowed.contains(&name) {
+        if name == "_" || self.shadowed.contains(&name) {
             return false;
         }
         match self.only_names {
@@ -519,16 +523,25 @@ fn strip_type_lifetimes(ty: &Type) -> Type {
     out
 }
 
-fn type_contains_reference_or_lifetime(
+/// Whether returning a value of type `ty` from a closed candidate would expose
+/// a host address (a reference, raw pointer, or function pointer, whose values
+/// Miri and Anneal cannot compare) or name a removed signature lifetime.
+fn type_carries_address_or_lifetime(
     ty: &Type,
     removed_lifetimes: &std::collections::BTreeSet<String>,
 ) -> bool {
-    struct RefOrLtFinder<'a> {
+    struct AddressOrLtFinder<'a> {
         removed_lifetimes: &'a std::collections::BTreeSet<String>,
         found: bool,
     }
-    impl<'ast> syn::visit::Visit<'ast> for RefOrLtFinder<'_> {
+    impl<'ast> syn::visit::Visit<'ast> for AddressOrLtFinder<'_> {
         fn visit_type_reference(&mut self, _node: &'ast syn::TypeReference) {
+            self.found = true;
+        }
+        fn visit_type_ptr(&mut self, _node: &'ast syn::TypePtr) {
+            self.found = true;
+        }
+        fn visit_type_bare_fn(&mut self, _node: &'ast syn::TypeBareFn) {
             self.found = true;
         }
         fn visit_lifetime(&mut self, node: &'ast syn::Lifetime) {
@@ -537,7 +550,7 @@ fn type_contains_reference_or_lifetime(
             }
         }
     }
-    let mut finder = RefOrLtFinder {
+    let mut finder = AddressOrLtFinder {
         removed_lifetimes,
         found: false,
     };
@@ -598,9 +611,10 @@ fn unwrap_type_parens_and_groups(mut ty: &Type) -> &Type {
 }
 
 /// Convert any function parameters into leading initialized local bindings,
-/// lower reference-returning signatures and early `return`s so closed zero-arg
-/// candidates never return stack borrows or dead-code injected probes, and
-/// rewrite method calls into primitive operators.
+/// sink address-returning signatures into a local and wrap early `return`s in
+/// a labeled block so closed zero-arg candidates never return host addresses
+/// or dead-code injected probes, and rewrite method calls into primitive
+/// operators.
 fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
     let removed_lifetimes: std::collections::BTreeSet<String> = func
         .sig
@@ -612,15 +626,14 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
             _ => None,
         })
         .collect();
-    let sink_ref_return = match &func.sig.output {
-        ReturnType::Type(_, ret_ty) => {
-            type_contains_reference_or_lifetime(ret_ty, &removed_lifetimes)
-        }
+    let sink_address_return = match &func.sig.output {
+        ReturnType::Type(_, ret_ty) => type_carries_address_or_lifetime(ret_ty, &removed_lifetimes),
         ReturnType::Default => false,
     };
+    let ret_label = syn::Lifetime::new("'__anneal_ret", proc_macro2::Span::call_site());
+    let mut init_stmts = Vec::new();
 
-    if !func.sig.inputs.is_empty() || !removed_lifetimes.is_empty() || sink_ref_return {
-        let mut init_stmts = Vec::new();
+    if !func.sig.inputs.is_empty() || !removed_lifetimes.is_empty() || sink_address_return {
         let mut backing_idx = 0usize;
         let inputs: Vec<FnArg> = func.sig.inputs.iter().cloned().collect();
         func.sig.inputs.clear();
@@ -676,25 +689,29 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
                 init_stmts.push(stmt);
             }
         }
-        if sink_ref_return {
-            if let ReturnType::Type(_, ret_ty) = &func.sig.output {
-                let clean_ret_ty = strip_type_lifetimes(ret_ty);
-                let ret_label = syn::Lifetime::new("'__anneal_ret", proc_macro2::Span::call_site());
+        if sink_address_return && let ReturnType::Type(_, ret_ty) = &func.sig.output {
+            let clean_ret_ty = strip_type_lifetimes(ret_ty);
+            // Label the sunk block only when it has `return`s to lower, so
+            // that it never trips `unused_labels`.
+            let sunk_value: Expr = if block_has_fn_level_return(&func.block) {
                 rewrite_fn_returns_to_labeled_break(&mut func.block, &ret_label);
                 let orig_block = (*func.block).clone();
-                let sunk_stmts: Vec<Stmt> = syn::parse_quote! {
-                    let __closed_ret: #clean_ret_ty = #ret_label: #orig_block;
-                    let _ = __closed_ret;
-                };
-                func.block.stmts = sunk_stmts;
-                func.sig.output = ReturnType::Default;
-            }
+                syn::parse_quote!(#ret_label: #orig_block)
+            } else {
+                let orig_block = (*func.block).clone();
+                syn::parse_quote!(#orig_block)
+            };
+            func.block.stmts = syn::parse_quote! {
+                let __closed_ret: #clean_ret_ty = #sunk_value;
+                let _ = __closed_ret;
+            };
+            func.sig.output = ReturnType::Default;
         }
-        func.block.stmts.splice(0..0, init_stmts);
     }
 
+    // Wrap only the original body, so that the parameter bindings spliced in
+    // below stay visible to `collect_initialized_locals`.
     if block_has_fn_level_return(&func.block) {
-        let ret_label = syn::Lifetime::new("'__anneal_ret", proc_macro2::Span::call_site());
         rewrite_fn_returns_to_labeled_break(&mut func.block, &ret_label);
         let orig_block = (*func.block).clone();
         let wrapped: Stmt = match &func.sig.output {
@@ -706,6 +723,7 @@ fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
         };
         func.block.stmts = vec![wrapped];
     }
+    func.block.stmts.splice(0..0, init_stmts);
 
     let mut normalizer = MethodCallNormalizer;
     normalizer.visit_item_fn_mut(func);
@@ -1094,9 +1112,9 @@ pub trait MiriAstMutator {
     );
 }
 
-/// 1. Mutates integer binary operations, literals, and `as` casts (signedness
-/// and width swaps) or unchecked arithmetic intrinsics over initialized integer
-/// locals.
+/// 1. Mutates integer binary operations, literals, and `as` casts
+///    (signedness and width swaps) or unchecked arithmetic intrinsics over
+///    initialized integer locals.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArithmeticCastMutator;
 
@@ -1514,8 +1532,25 @@ fn struct_item_has_asymmetric_ab(st: &syn::ItemStruct) -> bool {
 }
 
 struct ArrayAndStructContextCollector {
-    array_lens: std::collections::BTreeMap<String, usize>,
+    /// Literal array length per local name: `Some(len)` is the shortest length
+    /// among the name's array bindings, and `None` marks a name that is also
+    /// bound to a value of unknown length, whose indices must stay untouched.
+    array_lens: std::collections::BTreeMap<String, Option<usize>>,
     has_asymmetric_ab_struct: bool,
+}
+
+impl ArrayAndStructContextCollector {
+    fn record(&mut self, name: String, len: Option<usize>) {
+        match (self.array_lens.get_mut(&name), len) {
+            (Some(Some(cur)), Some(len)) => *cur = (*cur).min(len),
+            (Some(entry), None) => *entry = None,
+            (Some(None), Some(_)) => {}
+            (None, Some(len)) => {
+                self.array_lens.insert(name, Some(len));
+            }
+            (None, None) => {}
+        }
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for ArrayAndStructContextCollector {
@@ -1533,13 +1568,16 @@ impl<'ast> syn::visit::Visit<'ast> for ArrayAndStructContextCollector {
                 .as_ref()
                 .and_then(|init| match unwrap_expr_parens_and_groups(&init.expr) {
                     Expr::Array(arr) => Some(arr.elems.len()),
+                    Expr::Repeat(rep) => match unwrap_expr_parens_and_groups(&rep.len) {
+                        Expr::Lit(el) => match &el.lit {
+                            Lit::Int(li) => li.base10_parse::<usize>().ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
                     _ => None,
                 });
-            if let Some(len) = ty_len.or(init_len) {
-                self.array_lens.insert(name, len);
-            } else {
-                self.array_lens.remove(&name);
-            }
+            self.record(name, ty_len.or(init_len));
         }
         syn::visit::visit_local(self, node);
     }
@@ -1549,7 +1587,7 @@ struct ProjectionAstPerturber<'a> {
     rng: &'a mut DetRng,
     in_addr_or_lhs: bool,
     field_borrowed_bases: std::collections::BTreeSet<String>,
-    known_array_lens: std::collections::BTreeMap<String, usize>,
+    known_array_lens: std::collections::BTreeMap<String, Option<usize>>,
     has_asymmetric_ab_struct: bool,
 }
 
@@ -1601,9 +1639,8 @@ impl VisitMut for ProjectionAstPerturber<'_> {
         for arg in &func.sig.inputs {
             if let FnArg::Typed(pat_ty) = arg
                 && let (Some(name), _) = extract_pat_ident(&pat_ty.pat)
-                && let Some(len) = extract_array_type_len(&pat_ty.ty)
             {
-                ctx_collector.array_lens.insert(name, len);
+                ctx_collector.record(name, extract_array_type_len(&pat_ty.ty));
             }
         }
         syn::visit::Visit::visit_block(&mut ctx_collector, &func.block);
@@ -1693,20 +1730,20 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                         0
                     } else if base_clean.ends_with(".bytes") && cur_idx < 4 {
                         (cur_idx + 1 + self.rng.gen_range(3)) % 4
-                    } else if let Some(len) = known_len {
-                        if len <= 1 || cur_idx >= len {
-                            cur_idx
-                        } else if cur_idx == 0 {
-                            1
-                        } else {
-                            0
+                    } else if let Some(known_len) = known_len {
+                        // Keep indices of length-1 arrays, of names also bound
+                        // to unknown-length values, and of intentionally
+                        // out-of-bounds (panicking) accesses.
+                        match known_len {
+                            Some(len) if len > 1 && cur_idx < len => usize::from(cur_idx == 0),
+                            _ => cur_idx,
                         }
                     } else if cur_idx == 0 {
                         1
                     } else {
                         0
                     };
-                    idx_expr.index = Box::new(syn::parse_quote!(#new_idx));
+                    *idx_expr.index = syn::parse_quote!(#new_idx);
                 }
             }
             Expr::Field(field_expr) if !self.in_addr_or_lhs && !self.has_asymmetric_ab_struct => {
@@ -1903,9 +1940,9 @@ impl MiriAstMutator for PlaceProjectionWrapper {
 }
 
 /// 3. Perturbs `core::intrinsics::offset` arguments in place and synthesizes
-/// raw pointer address-of and `offset` dereferences across in-bounds (`0isize`,
-/// `1isize`), out-of-bounds (`2isize`, `-1isize`), null, and unaligned
-/// addresses.
+///    raw pointer address-of and `offset` dereferences across in-bounds
+///    (`0isize`, `1isize`), out-of-bounds (`2isize`, `-1isize`), null, and
+///    unaligned addresses.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RawPtrOffsetMutator;
 
@@ -1940,29 +1977,32 @@ impl VisitMut for OffsetArgPerturber<'_> {
             && let Expr::Path(ep) = &*call.func
             && ep.path.segments.last().is_some_and(|s| s.ident == "offset")
             && call.args.len() == 2
-            && let Some(suffix) = offset_arg_lit_suffix(&call.args[1])
-            && matches!(suffix, "" | "isize" | "usize")
+            && let Some(suffix) = offset_arg_lit_suffix(&call.args[1]).map(str::to_owned)
+            && matches!(suffix.as_str(), "" | "isize" | "usize")
             && self.rng.coin(1, 2)
         {
-            if suffix == "usize" {
-                let step: usize = if self.allow_oob {
-                    let choices: [usize; 3] = [0, 1, 2];
-                    choices[self.rng.gen_range(choices.len())]
+            // Preserve the literal's suffix. Only an explicit `isize` literal
+            // may become negative, since an unsuffixed literal may be inferred
+            // as `usize`.
+            let step: i64 = if self.allow_oob {
+                let choices: &[i64] = if suffix == "isize" {
+                    &[0, 1, 2, -1]
                 } else {
-                    let choices: [usize; 2] = [0, 1];
-                    choices[self.rng.gen_range(choices.len())]
+                    &[0, 1, 2]
                 };
-                call.args[1] = syn::parse_quote!(#step);
+                choices[self.rng.gen_range(choices.len())]
             } else {
-                let step: isize = if self.allow_oob {
-                    let choices: [isize; 4] = [0, 1, 2, -1];
-                    choices[self.rng.gen_range(choices.len())]
-                } else {
-                    let choices: [isize; 2] = [0, 1];
-                    choices[self.rng.gen_range(choices.len())]
-                };
-                call.args[1] = syn::parse_quote!(#step);
-            }
+                [0i64, 1][self.rng.gen_range(2)]
+            };
+            let lit = syn::LitInt::new(
+                &format!("{}{suffix}", step.unsigned_abs()),
+                proc_macro2::Span::call_site(),
+            );
+            call.args[1] = if step < 0 {
+                syn::parse_quote!(-#lit)
+            } else {
+                syn::parse_quote!(#lit)
+            };
         }
     }
 }
@@ -3508,6 +3548,21 @@ impl VisitMut for TransmuteValidityPerturber<'_> {
             return;
         }
         syn::visit_mut::visit_expr_return_mut(self, node);
+    }
+
+    fn visit_expr_break_mut(&mut self, node: &mut syn::ExprBreak) {
+        // `close_and_normalize_function` lowers early `return`s in closed
+        // candidates to `break '__anneal_ret (value)`, whose value still has
+        // the function's return type.
+        if let Some(label) = &node.label
+            && label.ident == "__anneal_ret"
+            && let Some(ret_target) = self.fn_ret_target
+            && let Some(value) = node.expr.as_mut()
+            && self.visit_typed_tail_expr(value, ret_target)
+        {
+            return;
+        }
+        syn::visit_mut::visit_expr_break_mut(self, node);
     }
 
     fn visit_local_mut(&mut self, local: &mut Local) {
@@ -5479,7 +5534,7 @@ pub fn match_opt_nz(c: bool) -> Option<NonZeroU32> {
         );
 
         // 4. `close_and_normalize_function` sinks reference-returning
-        //    signatures via `'__anneal_ret`, strips lifetime `where`
+        //    signatures into a `__closed_ret` local, strips lifetime `where`
         //    predicates and body lifetime annotations, and backs slice / `str`
         //    reference and raw-pointer parameters without unsized locals or
         //    `IndexMut` slicing calls.
@@ -5507,8 +5562,11 @@ where
         for cand in &batch {
             assert!(syn::parse_file(&cand.source).is_ok(), "{}", cand.source);
             assert!(
-                !cand.fn_source.contains("-> &") && cand.fn_source.contains("'__anneal_ret:"),
-                "reference return must sink into `'__anneal_ret` local:\n{}",
+                !cand.fn_source.contains("-> &")
+                    && cand.fn_source.contains("let __closed_ret: &u32 = {")
+                    && !cand.fn_source.contains("'__anneal_ret"),
+                "return-free reference return must sink into an unlabeled \
+                 `__closed_ret` block:\n{}",
                 cand.fn_source
             );
             assert!(
@@ -5703,5 +5761,149 @@ pub fn usize_off() -> u32 {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ep2_a4_elides_static_params_sinks_pointer_returns_and_types_lowered_returns() {
+        // 1. Closed `&'static` parameters are backed by stack locals, so their
+        //    closed types elide `'static` (`E0597` otherwise), while body
+        //    annotations keep it. Raw-pointer returns sink into a
+        //    `'__anneal_ret` local, since Miri and Anneal cannot compare host
+        //    addresses.
+        let static_and_ptr_seed = "\
+pub fn static_and_ptr(x: &'static u32, b: &'static [u8], flag: bool) -> *const u32 {
+    let keep: &'static str = \"k\";
+    let _ = (keep, b);
+    if flag {
+        return x as *const u32;
+    }
+    &raw const *x
+}
+";
+        let mut f = syn::parse_file(static_and_ptr_seed).unwrap();
+        let Item::Fn(func) = &mut f.items[0] else {
+            panic!("expected a function");
+        };
+        close_and_normalize_function(func, &mut DetRng::new(0));
+        let out = prettyplease::unparse(&f);
+        for expected in [
+            "pub fn static_and_ptr() {",
+            "let mut x: &u32 = &__arg_ref_0;",
+            "let mut b: &[u8] = &__arg_ref_1;",
+            "let keep: &'static str = \"k\";",
+            "let __closed_ret: *const u32 = '__anneal_ret: {",
+            "break '__anneal_ret (x as *const u32);",
+        ] {
+            assert!(out.contains(expected), "missing `{expected}`:\n{out}");
+        }
+        assert!(!out.contains("return"), "{out}");
+
+        // 2. Early `return`s wrap only the original body, so parameter locals
+        //    stay visible to `collect_initialized_locals`, and lowered
+        //    `break '__anneal_ret (value)` expressions keep their typed
+        //    `transmute` destination.
+        let early_ret_seed = "\
+pub fn early_ret_nz(v: u32, flag: bool) -> NonZeroU32 {
+    if flag {
+        return unsafe { transmute(7u32) };
+    }
+    let _ = v;
+    unsafe { transmute(9u32) }
+}
+";
+        let mut saw_break_zero = false;
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(early_ret_seed).unwrap();
+            let Item::Fn(func) = &mut f.items[0] else {
+                panic!("expected a function");
+            };
+            let mut rng = DetRng::new(s);
+            close_and_normalize_function(func, &mut rng);
+            let local_names: Vec<String> = collect_initialized_locals(func)
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
+            assert!(
+                local_names.contains(&"v".to_string()) && local_names.contains(&"flag".to_string()),
+                "{local_names:?}"
+            );
+            TransmuteValidityPerturber {
+                rng: &mut rng,
+                inject_invalid: true,
+                fn_ret_target: None,
+            }
+            .visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(!out.contains("return"), "{out}");
+            let (_, after_break) = out.split_once("break '__anneal_ret").unwrap();
+            let (break_value, _) = after_break.split_once(';').unwrap();
+            if break_value.contains("transmute(0u32)") {
+                saw_break_zero = true;
+            }
+        }
+        assert!(
+            saw_break_zero,
+            "typed `break '__anneal_ret` transmute must be perturbed"
+        );
+
+        // 3. `ProjectionAstPerturber` keeps the shortest length among shadowed
+        //    array bindings, handles repeat-expression arrays, never rewrites
+        //    an intentionally out-of-bounds index, and leaves indices of names
+        //    also bound to unknown-length values untouched.
+        let shadowed_len_seed = "\
+pub fn shadowed_lens() -> u32 {
+    let arr = [1u32, 2u32, 3u32, 4u32];
+    let first: u32 = arr[0];
+    let arr: [u32; 1] = [first];
+    let rep = [5u32; 1];
+    let oob: [u32; 2] = [6u32, 7u32];
+    let mixed: [u32; 2] = [8u32, 9u32];
+    let keep_mixed: u32 = mixed[0];
+    let mixed: &[u32] = &arr;
+    arr[0] ^ rep[0] ^ oob[2] ^ keep_mixed ^ mixed[0]
+}
+";
+        for s in 0..64u64 {
+            let mut f = syn::parse_file(shadowed_len_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            ProjectionAstPerturber::new(&mut rng).visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                !out.contains("arr[1")
+                    && !out.contains("rep[1")
+                    && !out.contains("mixed[1")
+                    && out.contains("oob[2"),
+                "unsafe index rewrite on seed {s}:\n{out}"
+            );
+        }
+
+        // 4. `OffsetArgPerturber` keeps unsuffixed offsets unsuffixed and
+        //    non-negative, since they may be inferred as `usize`.
+        let unsuffixed_offset_seed = "\
+pub fn unsuffixed_off() -> u32 {
+    let pair = PairU32 { a: 1u32, b: 2u32 };
+    let base: *const u32 = &raw const pair.a;
+    unsafe { *offset(base, 1) }
+}
+";
+        let mut saw_two = false;
+        for s in 0..32u64 {
+            let mut f = syn::parse_file(unsuffixed_offset_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            OffsetArgPerturber {
+                rng: &mut rng,
+                allow_oob: true,
+            }
+            .visit_file_mut(&mut f);
+            let out = prettyplease::unparse(&f);
+            assert!(
+                !out.contains("size)") && !out.contains("offset(base, -"),
+                "unsuffixed offset gained a suffix or sign on seed {s}:\n{out}"
+            );
+            if out.contains("offset(base, 2)") {
+                saw_two = true;
+            }
+        }
+        assert!(saw_two);
     }
 }

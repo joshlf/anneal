@@ -797,7 +797,7 @@ pub fn ub_single_c_enum_invalid_tag() -> u32 {
 
 /// Union overlay: a byte write through `bytes` changes the `word` read back.
 pub fn pass_union_overlay_word_bytes() -> u32 {
-    let mut o = OverlayU32 { word: 0x0403_0201u32 };
+    let mut o = OverlayU32 { word: 0x0403_0201 };
     unsafe {
         o.bytes[0] = 9u8;
         o.word

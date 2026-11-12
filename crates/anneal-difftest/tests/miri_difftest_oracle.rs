@@ -1880,10 +1880,11 @@ where
 pub fn ref_ret_ep2_live<'a>(
     x: &'a mut u32,
     y: &'a mut u32,
+    s_static: &'static u32,
     flag: bool,
 ) -> &'a mut u32 {
     let chosen: &'a mut u32 = if flag {
-        *x ^= 3u32;
+        *x ^= 3u32 ^ *s_static;
         return x;
     } else {
         *y ^= 5u32;
@@ -1892,10 +1893,32 @@ pub fn ref_ret_ep2_live<'a>(
     chosen
 }
 ";
+    // A raw-pointer return sinks into a local (Miri and Anneal cannot compare
+    // host addresses), and early `return`s in a scalar-returning function
+    // lower to `break '__anneal_ret` while the `&'static [u8]` parameter is
+    // backed by a stack array.
+    let ptr_ret_ep2_seed = "\
+pub fn ptr_ret_ep2_live(p_static: &'static u32, flag: bool) -> *const u32 {
+    if flag {
+        return p_static as *const u32;
+    }
+    &raw const *p_static
+}
+";
+    let early_ret_ep2_seed = "\
+pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
+    if flag {
+        return (b_static[0] as u32) ^ 1u32;
+    }
+    (b_static[1] as u32) ^ 7u32
+}
+";
     let mut param_batch = generate_miri_batch(&[param_ep2_seed], 2, 0xE2A1_0001);
     assert_eq!(param_batch.len(), 2);
     param_batch.extend(generate_miri_batch(&[ref_ret_ep2_seed], 2, 0xE2A3_0001));
-    assert_eq!(param_batch.len(), 4);
+    param_batch.extend(generate_miri_batch(&[ptr_ret_ep2_seed], 2, 0xE2A4_0001));
+    param_batch.extend(generate_miri_batch(&[early_ret_ep2_seed], 2, 0xE2A4_0002));
+    assert_eq!(param_batch.len(), 8);
     for mut cand in param_batch.drain(..) {
         let id = candidates.len();
         let old_fn_name = cand.fn_name;
