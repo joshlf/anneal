@@ -12264,7 +12264,8 @@ theorem evalByteCast_ok_of_checkIntoFromBytesNicheAware
 scalar layouts (`.initialized (.pointer _) vr` and `.union (.pointer _)`). Intact pointer images
 (`abstractBytesUniformProv`) are exactly the provenance-carrying results; every other image is
 rejected (references) or decoded to a provenance-less scalar (raw pointers and pointer scalar
-layouts, range-checked against `vr` in the initialized case). -/
+layouts, range-checked against `vr` in the initialized case). `tests/mir/CastStage1Tests.lean`
+instantiates the theorems of Sections 8.5-8.7 on a concrete layout table. -/
 
 /-- A byte list carrying no pointer provenance (`abstractBytesHaveProv bs = false`) is never an
 intact pointer image. -/

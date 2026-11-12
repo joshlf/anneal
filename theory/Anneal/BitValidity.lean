@@ -4324,6 +4324,9 @@ union reads, and transmutes (`evalByteCast`) is the Stage-1 decoder
 layout-side companion `checkStage1Decodable`
 (`checkFromBytesNicheAware_stage1_sound`), but not on its own
 (`checkFromBytesNicheAware_ignores_fieldLayouts`).
+
+`tests/mir/BitValidityStage1Tests.lean` instantiates these theorems on a
+concrete layout table, which shows that their hypotheses are satisfiable.
 -/
 
 
