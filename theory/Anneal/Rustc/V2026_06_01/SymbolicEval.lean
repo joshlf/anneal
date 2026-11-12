@@ -59,6 +59,13 @@ refutation combinators, and non-vacuity witness helpers for
    `refuteStatefulClaimByBoundedUB`, `refuteTotalClaimByBoundedUB`,
    `proveNonVacuousPre`, `proveNonVacuousStatefulPre`, and
    `proveNonVacuousBoolSpecPre`.
+5. **Safe Panics Across Uninterpreted External Calls**:
+   `reachesModularSafePanicExecBounded` and
+   `verifyModularSafePanicMirBounded` certify a body that panics after an
+   uninterpreted external call with a `ModularVerificationResult` under the
+   frame-preserving rely contract `framePreservingCallContract`, and
+   `refuteTotalClaimByBoundedPanicAcrossCalls` refutes its `TotalClaim` along an
+   explicit answer to each external call.
 -/
 
 /-! ## 1. Coinductive Completeness of `DWLP mirDefaultWP` & Contract Equivalences -/
@@ -6118,6 +6125,424 @@ theorem verifySafePanicMirPointBounded
         pre := fun a m => a = args ∧ m = mem
         post := fun _ _ _ _ => True }
       fuel args mem ⟨rfl, rfl⟩ h_panic
+
+/-! ### Safe Panics Across Uninterpreted External Calls -/
+
+/--
+Frame-preserving rely contract for the external calls of a modular safe-panic
+certificate (`verifyModularSafePanicMirBounded`). It places no requirement on a
+call request, and it assumes only that the callee returns or unwinds to the
+same call frame (`callFramePreserved`) or aborts. It assumes nothing about the
+returned value or about the rest of the post-call memory.
+
+A `StatefulVerificationResult` cannot certify a body that panics after an
+uninterpreted external call: `mirDefaultWP` lets that call return any answer,
+including one whose memory carries a corrupted call stack or callee table, and
+the caller can then fault. This contract rules out exactly those answers.
+
+`TrustedBoundary.checkStatementOrigins` rejects a `Verify.*` certificate whose
+statement mentions an `Anneal.*` constant, so generated certificates spell out
+this structure with `Trusted.*` constants only. That spelling and this
+definition agree by unfolding.
+-/
+def framePreservingCallContract : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter => callFramePreserved req.memory memAfter
+    | .panicked memAfter => callFramePreserved req.memory memAfter
+    | .aborted => True
+
+/--
+Every answer that `framePreservingCallContract` permits preserves the caller's
+call frame, so `wpMirFrameModularSym` may restore that frame after the call.
+-/
+theorem framePreservingCallContract_framePreserved :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      framePreservingCallContract.post req ans →
+        ans.framePreserved req.memory := by
+  intro req ans h_post
+  cases ans <;> exact h_post
+
+/--
+`framePreservingCallContract` is satisfiable, so a certificate that assumes it
+is not vacuous: the handler under which every external call returns `retVal`
+and leaves memory unchanged implements it.
+-/
+theorem framePreservingCallContract_holdsOn_returnUnchanged (retVal : Value) :
+    framePreservingCallContract.holdsOn
+      (fun req => ITree.ret (.returned retVal req.memory)) :=
+  holdsOn_of_envSatisfiesContract _ _ fun _ _ _ h_post =>
+    DWLP.ret (h_post _ ⟨rfl, rfl, rfl, rfl, [], rfl⟩)
+
+/--
+Answers to the uninterpreted external calls along one execution path: the
+`n`-th external call on the path returns `(answers n).1` or unwinds, in both
+cases with post-call memory `(answers n).2` under the caller's restored call
+frame.
+-/
+abbrev MirCallAnswerStream : Type := Nat → Value × Memory
+
+/-- Prepend `answer` to `answers`. -/
+def MirCallAnswerStream.cons
+    (answer : Value × Memory) (answers : MirCallAnswerStream) :
+    MirCallAnswerStream
+  | 0 => answer
+  | n + 1 => answers n
+
+/-- Answer stream that returns `()` with `emptyMemory` at every call. -/
+def MirCallAnswerStream.unitEmpty : MirCallAnswerStream :=
+  fun _ => (.unit, emptyMemory)
+
+/--
+Computable bounded modular safe-panic checker over `MirExecState`: returns
+`true` when every execution path from `st` stops within `fuel` steps at
+`.ret .panic` or `.ret .abort`, without faulting and without returning
+normally.
+
+Unlike `reachesPanicExecBounded`, which stops at the first uninterpreted
+external call `req`, it continues past the call on all three kinds of answer:
+the callee returns `(answers 0).1`, the callee unwinds, or the callee aborts.
+The returned and unwound branches resume with post-call memory
+`restoreCallFrame req.memory (answers 0).2`, and every branch passes the rest of
+the stream to later calls.
+
+Proving `∀ answers, reachesModularSafePanicExecBounded fuel body answers st =
+true` by kernel evaluation with `answers` free shows that no path inspects a
+returned value or the non-frame part of a post-call memory. Such a proof yields
+the modular certificate of
+`wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded`, which covers
+every answer that `framePreservingCallContract` permits.
+
+Every branch carries the full remaining `fuel`, so a body with `n` reachable
+external calls evaluates up to `3 ^ n` paths.
+-/
+def reachesModularSafePanicExecBounded
+    (fuel : Nat)
+    (body : CapturedMir)
+    (answers : MirCallAnswerStream)
+    (st : MirExecState) :
+    Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret .panic => true
+    | .ret .abort => true
+    | .ret (.normal _) => false
+    | .tau st' => reachesModularSafePanicExecBounded fuel' body answers st'
+    | .vis (.inl _) _ => false
+    | .vis (.inr (.inl _)) k =>
+      reachesModularSafePanicExecBounded fuel' body answers (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) k =>
+      let rest : MirCallAnswerStream := fun n => answers (n + 1)
+      let memAfter := restoreCallFrame req.memory (answers 0).2
+      Bool.and
+        (reachesModularSafePanicExecBounded fuel' body rest
+          (k (.returned (answers 0).1 memAfter)))
+        (Bool.and
+          (reachesModularSafePanicExecBounded fuel' body rest
+            (k (.panicked memAfter)))
+          (reachesModularSafePanicExecBounded fuel' body rest (k .aborted)))
+
+/--
+Soundness of `reachesModularSafePanicExecBounded`: if it returns `true` on every
+answer stream, then the frame-restoring modular weakest precondition under
+`framePreservingCallContract` holds with the vacuous normal-return
+postcondition, so no answer that the contract permits leads to a fault or to a
+normal return.
+
+At an external call, the weakest precondition quantifies over each permitted
+answer `ans` and resumes with `ans.restoreFrame req.memory`. The proof
+instantiates the stream so that its head is the value and memory of `ans`,
+which reproduces exactly that continuation; this is why the checker must
+succeed on every stream rather than on one.
+-/
+theorem wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_check :
+      ∀ answers : MirCallAnswerStream,
+        reachesModularSafePanicExecBounded fuel body answers st = true) :
+    wpMirExecFrameModularSym framePreservingCallContract fuel body st
+      (fun out => ∀ retVal mem', out = .normal (retVal, mem') → False) := by
+  induction fuel generalizing st with
+  | zero => nomatch h_check MirCallAnswerStream.unitEmpty
+  | succ fuel ih =>
+    unfold wpMirExecFrameModularSym
+    rw [evalSymNodeTreeFrameModular_eq, stepMirExecSymTree_eval]
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal _ =>
+        have h := h_check MirCallAnswerStream.unitEmpty
+        unfold reachesModularSafePanicExecBounded at h
+        simp only [h_step] at h
+        nomatch h
+      | panic => intro _ _ h_eq; nomatch h_eq
+      | abort => intro _ _ h_eq; nomatch h_eq
+    | tau st' =>
+      refine ih st' (fun answers => ?_)
+      have h := h_check answers
+      unfold reachesModularSafePanicExecBounded at h
+      simp only [h_step] at h
+      exact h
+    | vis i k =>
+      rcases i with f | (e | c)
+      · have h := h_check MirCallAnswerStream.unitEmpty
+        unfold reachesModularSafePanicExecBounded at h
+        simp only [h_step] at h
+        nomatch h
+      · cases e
+        refine ih (k PUnit.unit) (fun answers => ?_)
+        have h := h_check answers
+        unfold reachesModularSafePanicExecBounded at h
+        simp only [h_step] at h
+        exact h
+      · rcases c with ⟨req⟩
+        refine ⟨trivial, fun ans _ => ?_⟩
+        cases ans with
+        | returned retVal memAfter =>
+          refine ih _ (fun answers => ?_)
+          have h :=
+            h_check (MirCallAnswerStream.cons (retVal, memAfter) answers)
+          unfold reachesModularSafePanicExecBounded at h
+          simp only [h_step, Bool.and_eq_true] at h
+          exact h.1
+        | panicked memAfter =>
+          refine ih _ (fun answers => ?_)
+          have h := h_check (MirCallAnswerStream.cons (.unit, memAfter) answers)
+          unfold reachesModularSafePanicExecBounded at h
+          simp only [h_step, Bool.and_eq_true] at h
+          exact h.2.1
+        | aborted =>
+          refine ih _ (fun answers => ?_)
+          have h :=
+            h_check (MirCallAnswerStream.cons (.unit, emptyMemory) answers)
+          unfold reachesModularSafePanicExecBounded at h
+          simp only [h_step, Bool.and_eq_true] at h
+          exact h.2.2
+
+/--
+Computable bounded panic detector across external calls over `MirExecState`:
+returns `true` when the execution path from `st` in which every uninterpreted
+external call `req` answers `pick req` reaches `.ret .panic` within `fuel` steps
+without faulting.
+
+Unlike `reachesPanicExecBounded`, it does not stop at an external call. The
+interaction tree constrains no answer, so the path it follows is a genuine path
+of the tree for every `pick`.
+-/
+def reachesPanicAcrossCallsExecBounded
+    (pick : MirCallReq → MirCallAns)
+    (fuel : Nat)
+    (body : CapturedMir)
+    (st : MirExecState) :
+    Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret .panic => true
+    | .ret (.normal _) => false
+    | .ret .abort => false
+    | .tau st' => reachesPanicAcrossCallsExecBounded pick fuel' body st'
+    | .vis (.inl _) _ => false
+    | .vis (.inr (.inl _)) k =>
+      reachesPanicAcrossCallsExecBounded pick fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) k =>
+      reachesPanicAcrossCallsExecBounded pick fuel' body (k (pick req))
+
+/--
+Computable bounded panic detector across external calls starting from
+`s : MachineState`.
+-/
+def reachesPanicAcrossCallsBounded
+    (pick : MirCallReq → MirCallAns)
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : Bool :=
+  reachesPanicAcrossCallsExecBounded pick fuel body (.running s)
+
+/--
+Closed instance of both hypotheses of `verifyModularSafePanicMirBounded` from
+`s : MachineState`, which `rfl` and `decide` can compute: the modular checker on
+the answer stream `MirCallAnswerStream.unitEmpty`, and the panic detector on the
+path where every external call returns `()` with unchanged memory.
+
+Those hypotheses imply this check (`reachesModularSafePanicBounded_of_forall`),
+so a `false` result shows that `verifyModularSafePanicMirBounded` cannot certify
+`body` from `s` at this `fuel`. A `known_anneal_bug_ratchet` for a Miri `panic`
+test requires such a result, so it fails to build once the certificate applies,
+but it can still record a body that aborts or faults instead of panicking.
+-/
+def reachesModularSafePanicBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : Bool :=
+  Bool.and
+    (reachesModularSafePanicExecBounded fuel body MirCallAnswerStream.unitEmpty
+      (.running s))
+    (reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory)
+      fuel body s)
+
+/--
+The hypotheses of `verifyModularSafePanicMirBounded` imply their closed instance
+`reachesModularSafePanicBounded`.
+-/
+theorem reachesModularSafePanicBounded_of_forall
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (h_modular :
+      ∀ answers : MirCallAnswerStream,
+        reachesModularSafePanicExecBounded fuel body answers (.running s) =
+          true)
+    (h_panic :
+      ∀ retVal : Value,
+        reachesPanicAcrossCallsBounded (fun req => .returned retVal req.memory)
+          fuel body s = true) :
+    reachesModularSafePanicBounded fuel body s = true := by
+  unfold reachesModularSafePanicBounded
+  rw [h_modular, h_panic]
+  rfl
+
+/--
+Soundness of `reachesPanicAcrossCallsExecBounded`: if it returns `true`, then
+`ITree.cofix (stepMirState body) st` reaches `.ret .panic` along a finite trace
+whose external-call events carry the answers `pick` chose.
+-/
+theorem reachesPanicAcrossCallsExecBounded_reachesRet
+    (pick : MirCallReq → MirCallAns)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_panic : reachesPanicAcrossCallsExecBounded pick fuel body st = true) :
+    ∃ tr, ReachesRet (ITree.cofix (stepMirState body) st) tr .panic := by
+  induction fuel generalizing st with
+  | zero => nomatch h_panic
+  | succ fuel' ih =>
+    unfold reachesPanicAcrossCallsExecBounded at h_panic
+    have h_obs :
+        (ITree.cofix (stepMirState body) st).observe =
+          (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
+      ITree.observe_cofix (stepMirState body) st
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal _ =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+      | panic =>
+        rw [h_step] at h_obs
+        dsimp only [ITreeF.map] at h_obs
+        exact ⟨[], _, Reaches.refl _, h_obs⟩
+      | abort =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+    | tau st' =>
+      simp only [h_step] at h_panic
+      rw [h_step] at h_obs
+      dsimp only [ITreeF.map] at h_obs
+      rcases ih st' h_panic with ⟨tr, u, h_reach, h_u⟩
+      exact ⟨tr, u, Reaches.tau h_obs h_reach, h_u⟩
+    | vis i k =>
+      rcases i with f | (e | c)
+      · simp only [h_step] at h_panic
+        nomatch h_panic
+      · simp only [h_step] at h_panic
+        rw [h_step] at h_obs
+        dsimp only [ITreeF.map] at h_obs
+        rcases ih (k PUnit.unit) h_panic with ⟨tr, u, h_reach, h_u⟩
+        exact ⟨⟨.inr (.inl e), PUnit.unit⟩ :: tr, u,
+          Reaches.vis h_obs False.elim PUnit.unit h_reach, h_u⟩
+      · rcases c with ⟨req⟩
+        simp only [h_step] at h_panic
+        rw [h_step] at h_obs
+        dsimp only [ITreeF.map] at h_obs
+        rcases ih (k (pick req)) h_panic with ⟨tr, u, h_reach, h_u⟩
+        exact ⟨⟨.inr (.inr (.call req)), pick req⟩ :: tr, u,
+          Reaches.vis h_obs False.elim (pick req) h_reach, h_u⟩
+
+/--
+Refute a total-correctness `c : TotalClaim` (`¬ c.holds`) by exhibiting a
+concrete `(args, mem)` satisfying `c.pre args mem` whose bounded execution
+unwinds to `.ret .panic` within `fuel` steps when each uninterpreted external
+call `req` answers `pick req`. Like `refuteTotalClaimByBoundedPanic`, it assumes
+nothing about external callees: `TotalClaim.holds` constrains every path of the
+interaction tree, including the one that `pick` selects.
+-/
+theorem refuteTotalClaimByBoundedPanicAcrossCalls
+    (c : TotalClaim)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_pre : c.pre args mem)
+    (pick : MirCallReq → MirCallAns)
+    (h_panic :
+      reachesPanicAcrossCallsBounded pick fuel c.body
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) =
+          true := by
+      rfl) :
+    ¬ c.holds := by
+  intro h_holds
+  rcases reachesPanicAcrossCallsExecBounded_reachesRet pick fuel c.body _ h_panic
+    with ⟨tr, h_ret⟩
+  rcases (h_holds args mem h_pre).2.2.2 tr .panic h_ret with ⟨_, _, h_eq, _⟩
+  nomatch h_eq
+
+/--
+Certify a Miri `panic` test whose execution passes through uninterpreted
+external calls, with linked `callees`, at `(args, mem)`. It proves both
+1. `ModularVerificationResult` with `post := False` under
+   `framePreservingCallContract.holdsOn`: for every external-call handler that
+   returns or unwinds to the caller's call frame (or aborts), execution never
+   faults and never returns normally; and
+2. `¬ TotalClaim.holds`, refuting total correctness.
+
+`h_modular` discharges the first conjunct
+(`wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded`). `h_panic`
+discharges the second: for every returned value, the path on which each
+external call returns that value and leaves memory unchanged unwinds to
+`.ret .panic` (`refuteTotalClaimByBoundedPanicAcrossCalls`).
+
+A body that panics without an external call satisfies both hypotheses as well,
+but `verifySafePanicMirPointBounded` certifies it with the stronger-looking
+`StatefulVerificationResult`, which quantifies over every call answer.
+-/
+theorem verifyModularSafePanicMirBounded
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_modular :
+      ∀ answers : MirCallAnswerStream,
+        reachesModularSafePanicExecBounded fuel body answers
+          (.running (initMachineStateWithMemoryAndCallees body args mem callees)) =
+            true := by
+      intro _; rfl)
+    (h_panic :
+      ∀ retVal : Value,
+        reachesPanicAcrossCallsBounded (fun req => .returned retVal req.memory)
+          fuel body (initMachineStateWithMemoryAndCallees body args mem callees) =
+            true := by
+      intro _; rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := framePreservingCallContract.holdsOn
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ _ _ => False
+        callees := callees } ∧
+    ¬ ({ body := body
+         pre := fun a m => a = args ∧ m = mem
+         post := fun _ _ _ _ => True
+         callees := callees } : TotalClaim).holds := by
+  refine ⟨?_, ?_⟩
+  · refine verifyModularFrameContractWithCalleesMirSym
+      framePreservingCallContract framePreservingCallContract_framePreserved
+      body callees _ _ fuel ?_
+    rintro a m ⟨rfl, rfl⟩
+    exact wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
+      fuel body _ h_modular
+  · exact refuteTotalClaimByBoundedPanicAcrossCalls
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ _ _ => True
+        callees := callees }
+      fuel args mem ⟨rfl, rfl⟩ (fun req => .returned .unit req.memory)
+      (h_panic .unit)
 
 /--
 If `(evalMirDiffExecBounded fuel body st).toTag = .normalUnit`, then
