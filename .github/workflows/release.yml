@@ -95,8 +95,59 @@ jobs:
       - name: Smoke-test remote exocrate toolchain installation
         run: |
           set -euo pipefail
-          cargo run --locked -p cargo-anneal -- setup
-          cargo test --workspace --locked
+          install_cache="$(mktemp -d "$RUNNER_TEMP/anneal-release-cache.XXXXXX")"
+          export XDG_CACHE_HOME="$install_cache"
+          cargo run --locked --jobs 2 -p cargo-anneal -- setup
+
+          # Exocrate installs below anneal/toolchain. The cache was empty, so
+          # exactly one root must identify this run's downloaded installation.
+          install_root="$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          parent = Path(os.environ["XDG_CACHE_HOME"]) / "anneal/toolchain"
+          roots = [path for path in parent.iterdir() if path.is_dir()]
+          if len(roots) != 1 or roots[0].is_symlink():
+              raise SystemExit("setup must produce exactly one fresh installation")
+          root = roots[0].resolve()
+          for relative in ("rust/bin/rustc", "rust/bin/rustdoc", "lean/bin/lean", "bin/anneal-rustc-capture"):
+              tool = root / relative
+              if not tool.is_file() or not os.access(tool, os.X_OK):
+                  raise SystemExit(f"installed executable is missing: {tool}")
+          for relative in ("share/anneal/trusted/lean/foundation-lock.json", "share/anneal/trusted/lean/lean-toolchain"):
+              if not (root / relative).is_file():
+                  raise SystemExit(f"installed foundation metadata is missing: {relative}")
+          print(root)
+          PY
+          )"
+          probe="$(mktemp -d "$RUNNER_TEMP/anneal-release-probe.XXXXXX")"
+          (
+            cd "$probe"
+            expected_rust='1.98.0-nightly (f8a08b688 2026-05-30)'
+            env -i "$install_root/rust/bin/rustc" --version > rustc.version
+            grep -Fx "rustc $expected_rust" rustc.version
+            env -i "$install_root/rust/bin/rustdoc" --version > rustdoc.version
+            grep -Fx "rustdoc $expected_rust" rustdoc.version
+            env -i "$install_root/lean/bin/lean" --version > lean.version
+            grep -F 'Lean (version 4.34.1,' lean.version
+            printf '%s\n' 'example (n : Nat) : n = n := rfl' > Small.lean
+            env -i "$install_root/lean/bin/lean" Small.lean
+            printf '%s\n' 'pub fn identity(n: u32) -> u32 { n }' > small.rs
+            env -i "$install_root/bin/anneal-rustc-capture" \
+              --edition=2024 --crate-type=lib --emit=metadata \
+              small.rs -o small.rmeta > driver.stdout 2> driver.stderr
+            test -s small.rmeta
+            test ! -s driver.stdout
+            grep -Fx 'note: anneal-rustc-capture: compiler analysis callback reached; verification not performed' \
+              driver.stderr
+          )
+
+          export RUSTC="$install_root/rust/bin/rustc"
+          export RUSTDOC="$install_root/rust/bin/rustdoc"
+          export LD_LIBRARY_PATH="$install_root/rust/lib"
+          export RUSTFLAGS="-Lnative=$install_root/rust/lib -Clink-arg=-Wl,-rpath,$install_root/rust/lib"
+          export ANNEAL_TEST_RUST_SYSROOT="$install_root/rust"
+          cargo test --workspace --locked --jobs 2 -- --test-threads=2
 
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
