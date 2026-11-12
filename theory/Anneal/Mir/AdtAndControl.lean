@@ -199,7 +199,16 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
    - `Deref` places (`derefTarget`, `resolvePlace`): `evalDerefPlaceRead`, `evalDerefPlaceWrite`
      (`PartialShell` field initialization and sibling preservation through `writePlaceState`),
      `evalDerefPlaceDeinit`, `evalDerefOperand` (Move-Deref Non-Deinit:
-     `evalDerefOperand_move_deref`, `evalDerefOperand_move_deref_slots`), `evalRetagDerefPlace`
+     `evalDerefOperand_move_deref`, `evalDerefOperand_move_deref_slots`, refining Trusted's
+     `move` through `Deref`, which Trusted also evaluates as a frame-preserving read:
+     `evalOperand_move_deref_eq_copy`, `evalRvalue_use_move_deref_eq_copy`,
+     `evalDerefOperand_move_refines_evalOperand` and its typed / projected-typed variants,
+     `evalDerefPlaceRead_refines_evalRvalue_move`,
+     `evalDerefPlaceRead_refines_evalRvalue_typed_proj_move`,
+     `witness_trusted_deref_move_proj_typed`), two-level chains `(**_pp).rest` resolved through
+     the intermediate pointer exactly as runtime MIR's `CopyForDeref` split through a temporary
+     (`resolvePlace_deref_deref_split`, `evalDerefPlaceRead_deref_deref`,
+     `witness_deref_deref_split`), `evalRetagDerefPlace`
      and dangling sub-place references (`retag_subplace_ref_dead_local`), with Get-Put, Put-Get,
      and frame laws (`writePlaceState_get_put_init`, `writePlaceState_put_get_init`,
      `evalDerefPlaceWrite_get_put`, `evalDerefPlaceWrite_put_get`, `evalDerefPlaceWrite_frame`,
@@ -14895,5 +14904,430 @@ theorem witness_trusted_window_copy_resolved_and_same_local (s : MachineState) (
     (by decide) (Or.inr (Or.inl (by decide))) ⟨rfl, rfl⟩ ⟨rfl, rfl⟩ rfl rfl rfl rfl
     (fun _ _ _ h => by nomatch h)).1
   exact ⟨⟨hCross, hCrossRef⟩, ⟨hSame, hSameRef⟩⟩
+
+/-! ### Section 4j: `Operand.move` through `Deref` (`move (*_p).rest`) -/
+
+/-- **Trusted moves through a `Deref` by reading (`evalOperand_move_deref_eq_copy`)**: in both its
+untyped (`localDecls = []`) and typed modes, Trusted's `evalOperand` evaluates
+`Operand.move ((*_p).rest)` exactly like `Operand.copy ((*_p).rest)` — it reads the pointee through
+the borrow table and returns the frame unchanged; only a `move` of a bare local deinitializes its
+slot. This is the Trusted counterpart of `evalDerefOperand_move_deref`. -/
+theorem evalOperand_move_deref_eq_copy (locals : List LocalSlot) (p : Nat)
+    (rest : List ProjectionElem) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) (localDecls : List LocalDecl) :
+    evalOperand locals (.move ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals localDecls =
+      evalOperand locals (.copy ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals
+        localDecls := rfl
+
+/-- **`Rvalue.use (move (*_p).rest)` is `Rvalue.use (copy (*_p).rest)` in Trusted
+(`evalRvalue_use_move_deref_eq_copy`)**: the load validation and the Tree-Borrows read freeze of
+`evalRvalue` treat a `Deref` move like a `Deref` copy. -/
+theorem evalRvalue_use_move_deref_eq_copy (locals : List LocalSlot) (p : Nat)
+    (rest : List ProjectionElem) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    evalRvalue locals (.use (.move ⟨p, .deref :: rest⟩)) mem localDecls layouts =
+      evalRvalue locals (.use (.copy ⟨p, .deref :: rest⟩)) mem localDecls layouts := by
+  simp only [evalRvalue, evalOperand_move_deref_eq_copy]
+  rcases hb : mem.borrows with _ | ⟨b₁, _ | ⟨b₂, bs⟩⟩ <;> rfl
+
+/-- **`Operand.move` through `Deref` refines Trusted (`evalDerefOperand_move_refines_evalOperand`)**:
+under the pointer correspondence of `evalDerefPlaceRead_refines_evalOperand`, if Anneal's
+`evalDerefOperand` reads `v` from `Operand.move ((*_p).rest)` and returns the slots `slots'`, then
+`slots'` is the unchanged frame `slots` (neither the target local nor `_p` is deinitialized),
+Trusted's `Operand.move ((*_p).rest)` reads the same `v` and also keeps its frame, and the frames
+stay related by `SlotsRefine SlotBelow`. -/
+theorem evalDerefOperand_move_refines_evalOperand {cx : SubplaceCtx}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot} {p : Nat}
+    {rest : List ProjectionElem} {v : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy}
+    {borrows : List BorrowEntry} {entry : BorrowEntry} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hMove : evalDerefOperand cx slots (.move ⟨p, .deref :: rest⟩) = (.ok v, slots'))
+    (globals : List CapturedAllocation) (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    slots' = slots ∧
+      evalOperand locals (.move ⟨p, .deref :: rest⟩) borrows globals layouts callerLocals =
+        .ok v locals ∧
+      SlotsRefine SlotBelow slots' locals := by
+  rw [(evalDerefOperand_move_deref cx slots ⟨p, .deref :: rest⟩ rfl).1] at hMove
+  simp only [Prod.mk.injEq] at hMove
+  obtain ⟨hRead, rfl⟩ := hMove
+  refine ⟨rfl, ?_, hRel⟩
+  rw [evalOperand_move_deref_eq_copy]
+  exact evalDerefPlaceRead_refines_evalOperand hRel hRest hPtr hTy hRes hEntry hPerm hThin hRead
+    globals layouts callerLocals
+
+/-- **Typed `Operand.move (*_p)` refines Trusted's typed `evalOperand`
+(`evalDerefOperand_move_refines_evalOperand_typed`)**: the `move` analogue of
+`evalDerefPlaceRead_refines_evalOperand_typed` (scalar pointee, typed mode); both frames are
+unchanged by the move. -/
+theorem evalDerefOperand_move_refines_evalOperand_typed {cx : SubplaceCtx}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {sc : ScalarInt}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable} {pTy : Ty}
+    {n : Nat} (hRel : SlotsRefine SlotBelow slots locals)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hMove : evalDerefOperand cx slots (.move ⟨p, [.deref]⟩) = (.ok (.scalar sc), slots'))
+    (hDecls : localDecls ≠ [])
+    (hPTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some pTy)
+    (hScalar : tyScalarBytes (resolveTyWithLocalDecls localDecls layouts pTy) = some n)
+    (hWidth : sc.sizeBytes = n) (hOff : pv.offsetBytes = 0)
+    (hAlign : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign localDecls layouts
+        (some (resolveTyWithLocalDecls localDecls layouts pTy)) entry pv (some rootVal) = true)
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts pTy)) (.scalar sc) = true)
+    (globals : List CapturedAllocation) (callerLocals : List LocalSlot) :
+    slots' = slots ∧
+      evalOperand locals (.move ⟨p, [.deref]⟩) borrows globals layouts callerLocals localDecls =
+        .ok (.scalar sc) locals ∧
+      SlotsRefine SlotBelow slots' locals := by
+  rw [(evalDerefOperand_move_deref cx slots ⟨p, [.deref]⟩ rfl).1] at hMove
+  simp only [Prod.mk.injEq] at hMove
+  obtain ⟨hRead, rfl⟩ := hMove
+  refine ⟨rfl, ?_, hRel⟩
+  rw [evalOperand_move_deref_eq_copy]
+  exact evalDerefPlaceRead_refines_evalOperand_typed hRel hPtr hTy hRes hEntry hPerm hRead hDecls
+    hPTy hScalar hWidth hOff hAlign hNoUnion hValid globals callerLocals
+
+/-- **Projected typed `Operand.move (*_p).(rHead :: rTail)` refines Trusted's typed `evalOperand`
+(`evalDerefOperand_move_refines_evalOperand_typed_proj`)**: the `move` analogue of
+`evalDerefPlaceRead_refines_evalOperand_typed_proj`; both frames are unchanged by the move. -/
+theorem evalDerefOperand_move_refines_evalOperand_typed_proj {cx : SubplaceCtx}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot} {p : Nat}
+    {rHead : ProjectionElem} {rTail : List ProjectionElem} {sc : ScalarInt}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {borrows : List BorrowEntry}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {ptTy accTy : Ty} {n : Nat}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref (rHead :: rTail) = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow borrows pv.tag = some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hMove : evalDerefOperand cx slots (.move ⟨p, .deref :: rHead :: rTail⟩) =
+      (.ok (.scalar sc), slots'))
+    (hDecls : localDecls ≠ [])
+    (hPtTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some ptTy)
+    (hAccTy : placeTyResolved localDecls layouts ⟨p, .deref :: rHead :: rTail⟩ = some accTy)
+    (hPtNotScalar : isScalarRigidTy ptTy.kind = false)
+    (hAccNotNever : (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .never)
+    (hAccNotUnitTuple : (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .tuple [])
+    (hAccNotFnDef : ∀ fn args,
+      (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .fnDef fn args)
+    (hScalar : tyScalarBytes (resolveTyWithLocalDecls localDecls layouts accTy) = some n)
+    (hWidth : n = sc.sizeBytes)
+    (hDerefAlign : checkDerefAlign localDecls layouts
+      (some (resolveTyWithLocalDecls localDecls layouts ptTy)) pv.offsetBytes = true)
+    (hAlign : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign localDecls layouts
+        (some (resolveTyWithLocalDecls localDecls layouts ptTy)) entry pv (some rootVal) = true)
+    (hResT : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      resolveStackThinPtrTargetProjWithResidual? locals rootVal entry pv (rHead :: rTail)
+        localDecls layouts (some (resolveTyWithLocalDecls localDecls layouts ptTy)) none =
+        some (entry.targetProjection ++ (rHead :: rTail), 0))
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection ++ (rHead :: rTail)⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts accTy)) (.scalar sc) = true)
+    (globals : List CapturedAllocation) (callerLocals : List LocalSlot) :
+    slots' = slots ∧
+      evalOperand locals (.move ⟨p, .deref :: rHead :: rTail⟩) borrows globals layouts
+          callerLocals localDecls =
+        .ok (.scalar sc) locals ∧
+      SlotsRefine SlotBelow slots' locals := by
+  rw [(evalDerefOperand_move_deref cx slots ⟨p, .deref :: rHead :: rTail⟩ rfl).1] at hMove
+  simp only [Prod.mk.injEq] at hMove
+  obtain ⟨hRead, rfl⟩ := hMove
+  refine ⟨rfl, ?_, hRel⟩
+  rw [evalOperand_move_deref_eq_copy]
+  exact evalDerefPlaceRead_refines_evalOperand_typed_proj hRel hRest hPtr hTy hRes hEntry hPerm
+    hRead hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hAccNotUnitTuple hAccNotFnDef hScalar
+    hWidth hDerefAlign hAlign hResT hNoUnion hValid globals callerLocals
+
+/-- **`Rvalue.use (move (*_p).rest)` refines Trusted's `evalRvalue`
+(`evalDerefPlaceRead_refines_evalRvalue_move`)**: the `move` analogue of
+`evalDerefPlaceRead_refines_evalRvalue`. -/
+theorem evalDerefPlaceRead_refines_evalRvalue_move {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat} {rest : List ProjectionElem}
+    {v : Value} {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
+    {entry : BorrowEntry} (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref rest = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz)) (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow mem.borrows pv.tag = some entry) (hPerm : entry.perm ≠ .disabled)
+    (hThin : needsThinPtrElemResolution entry.targetProjection pv.offsetBytes = false)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rest⟩ = .ok v) (layouts : LayoutTable) :
+    ∃ mem', evalRvalue locals (.use (.move ⟨p, .deref :: rest⟩)) mem [] layouts =
+      .ok v locals mem' := by
+  rw [evalRvalue_use_move_deref_eq_copy]
+  exact evalDerefPlaceRead_refines_evalRvalue hRel hRest hPtr hTy hRes hEntry hPerm hThin hRead
+    layouts
+
+/-- **Projected typed `Rvalue.use (move (*_p).(rHead :: rTail))` refines Trusted's typed
+`evalRvalue` (`evalDerefPlaceRead_refines_evalRvalue_typed_proj_move`)**. -/
+theorem evalDerefPlaceRead_refines_evalRvalue_typed_proj_move {cx : SubplaceCtx}
+    {slots : List LocalSlotState} {locals : List LocalSlot} {p : Nat}
+    {rHead : ProjectionElem} {rTail : List ProjectionElem} {sc : ScalarInt}
+    {pv : ProvenancePtr} {sz : Nat} {pty : PtrTy} {mem : Memory}
+    {entry : BorrowEntry} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {ptTy accTy : Ty} {n : Nat}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hRest : projectionHasDeref (rHead :: rTail) = false)
+    (hPtr : readPlaceState slots ⟨p, []⟩ = .ok (.ptr pv sz))
+    (hTy : cx.ptrTyAt p [] = some pty)
+    (hRes : resolveSyntheticSubplace cx slots (cx.ptrOf pv) pty false =
+      .ok (entry.targetLocal, entry.targetProjection))
+    (hEntry : lookupBorrow mem.borrows pv.tag = some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hRead : evalDerefPlaceRead cx slots ⟨p, .deref :: rHead :: rTail⟩ = .ok (.scalar sc))
+    (hDecls : localDecls ≠ [])
+    (hPtTy : placeTyResolved localDecls layouts ⟨p, [.deref]⟩ = some ptTy)
+    (hAccTy : placeTyResolved localDecls layouts ⟨p, .deref :: rHead :: rTail⟩ = some accTy)
+    (hPtNotScalar : isScalarRigidTy ptTy.kind = false)
+    (hAccNotNever : (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .never)
+    (hAccNotUnitTuple : (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .tuple [])
+    (hAccNotFnDef : ∀ fn args,
+      (resolveTyWithLocalDecls localDecls layouts accTy).kind ≠ .fnDef fn args)
+    (hScalar : tyScalarBytes (resolveTyWithLocalDecls localDecls layouts accTy) = some n)
+    (hWidth : n = sc.sizeBytes)
+    (hDerefAlign : checkDerefAlign localDecls layouts
+      (some (resolveTyWithLocalDecls localDecls layouts ptTy)) pv.offsetBytes = true)
+    (hAlign : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      checkTargetPlaceAlign localDecls layouts
+        (some (resolveTyWithLocalDecls localDecls layouts ptTy)) entry pv (some rootVal) = true)
+    (hResT : ∀ rootVal, get? locals entry.targetLocal = some (.init rootVal) →
+      resolveStackThinPtrTargetProjWithResidual? locals rootVal entry pv (rHead :: rTail)
+        localDecls layouts (some (resolveTyWithLocalDecls localDecls layouts ptTy)) none =
+        some (entry.targetProjection ++ (rHead :: rTail), 0))
+    (hNoUnion : placeTouchesUnion localDecls layouts
+      ⟨entry.targetLocal, entry.targetProjection ++ (rHead :: rTail)⟩ = false)
+    (hValid : validateValueForTy? layouts
+      (some (resolveTyWithLocalDecls localDecls layouts accTy)) (.scalar sc) = true)
+    (hLoad : validateLoadedValue layouts localDecls (.move ⟨p, .deref :: rHead :: rTail⟩)
+      (.scalar sc) = true) :
+    ∃ mem', evalRvalue locals (.use (.move ⟨p, .deref :: rHead :: rTail⟩)) mem localDecls
+        layouts = .ok (.scalar sc) locals mem' := by
+  rw [evalRvalue_use_move_deref_eq_copy]
+  exact evalDerefPlaceRead_refines_evalRvalue_typed_proj hRel hRest hPtr hTy hRes hEntry hPerm
+    hRead hDecls hPtTy hAccTy hPtNotScalar hAccNotNever hAccNotUnitTuple hAccNotFnDef hScalar
+    hWidth hDerefAlign hAlign hResT hNoUnion hValid hLoad
+
+/-- **Non-vacuity of the `move`-through-`Deref` refinement
+(`witness_trusted_deref_move_proj_typed`)**: on the projected witness frame of
+`witness_trusted_deref_proj_typed` (`_0 : (u32, u32) = (7, 9)`, `_1 : *mut (u32, u32) = &raw _0`),
+Anneal's `move (*_1).1` reads `9` and keeps every slot; Trusted's typed `move (*_1).1` reads `9`
+and keeps its frame (both `_0` and `_1` stay initialized), whereas Trusted's `move _0` of the bare
+target local deinitializes `_0`. -/
+theorem witness_trusted_deref_move_proj_typed :
+    evalDerefOperand witnessPairCtxT witnessSlotsT (.move ⟨1, [.deref, .field 1 witnessU32]⟩) =
+      (.ok (.scalar ⟨9, 4⟩), witnessSlotsT) ∧
+    evalOperand witnessLocalsT (.move ⟨1, [.deref, .field 1 witnessU32]⟩) [witnessPairEntry] []
+      emptyLayoutTable [] witnessPairLocalDecls = .ok (.scalar ⟨9, 4⟩) witnessLocalsT ∧
+    evalOperand witnessLocalsT (.move ⟨0, []⟩) [witnessPairEntry] [] emptyLayoutTable []
+      witnessPairLocalDecls =
+      .ok (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]) (witnessLocalsT.set 0 .uninit) := by
+  obtain ⟨hRead, hOp, -⟩ := witness_trusted_deref_proj_typed
+  refine ⟨?_, ?_, by with_unfolding_all rfl⟩
+  · rw [(evalDerefOperand_move_deref witnessPairCtxT witnessSlotsT
+      ⟨1, [.deref, .field 1 witnessU32]⟩ rfl).1, hRead]
+  · rw [evalOperand_move_deref_eq_copy]
+    exact hOp
+
+/-! ### Section 4k: Two-level `Deref` chains (`**_pp`) and runtime MIR's `CopyForDeref` split -/
+
+/-- A live root's `Deref`-free read of the root itself is its value. -/
+theorem readPlaceState_set_init_root {slots : List LocalSlotState} {t : Nat} (v : Value)
+    (ht : t < slots.length) :
+    readPlaceState (slots.set t (.init v)) ⟨t, []⟩ = .ok v := by
+  simp [readPlaceState, projectionHasDeref, get?_eq_getElem?, List.getElem?_set_self ht,
+    evalValueProjRead]
+
+/-- **Two-level `Deref` chains are resolved through the intermediate pointer, exactly as runtime
+MIR's `CopyForDeref` split (`resolvePlace_deref_deref_split`)**: runtime MIR never dereferences twice
+in one place — it first copies the intermediate pointer into a fresh temporary
+(`_t = CopyForDeref(*_pp)`) and then dereferences `_t`. Anneal's direct resolution of
+`(**_pp).rest` (`derefTarget`, `resolve_deref_place_in`) agrees with that split: when `*_pp`
+designates the sub-place `l.q` holding the pointer `pv₂` of type `pty₂`, which resolves to
+`l₂.q₂`, then `(**_pp).rest` resolves to `l₂.(q₂ ++ rest)` in `slots`, and so does `(*_t).rest` in
+the frame `slots.set t (.init (.ptr pv₂ sz₂))` after the `CopyForDeref`, for any temporary `_t` of
+pointer type `pty₂` whose write keeps `pv₂`'s resolution. -/
+theorem resolvePlace_deref_deref_split {cx : SubplaceCtx} {slots : List LocalSlotState} {ow : Bool}
+    {pp t : Nat} {rest : List ProjectionElem} {stp : LocalSlotState} {pv₁ pv₂ : ProvenancePtr}
+    {sz₁ sz₂ : Nat} {pty₁ pty₂ : PtrTy} {l l₂ : Nat} {q q₂ : List ProjectionElem}
+    (hSt : slots[pp]? = some stp) (hLive : stp ≠ .dead)
+    (hPtr₁ : readPlaceState slots ⟨pp, []⟩ = .ok (.ptr pv₁ sz₁))
+    (hTy₁ : cx.ptrTyAt pp [] = some pty₁)
+    (hRes₁ : resolveSyntheticSubplace cx slots (cx.ptrOf pv₁) pty₁ false = .ok (l, q))
+    (hPtr₂ : readPlaceState slots ⟨l, q⟩ = .ok (.ptr pv₂ sz₂))
+    (hTy₂ : cx.ptrTyAt l q = some pty₂)
+    (hRes₂ : resolveSyntheticSubplace cx slots (cx.ptrOf pv₂) pty₂ (ow && rest.isEmpty) =
+      .ok (l₂, q₂))
+    (hRest : projectionHasDeref rest = false)
+    (ht : t < slots.length) (hTyT : cx.ptrTyAt t [] = some pty₂)
+    (hRes₂' : resolveSyntheticSubplace cx (slots.set t (.init (.ptr pv₂ sz₂))) (cx.ptrOf pv₂) pty₂
+      (ow && rest.isEmpty) = .ok (l₂, q₂)) :
+    resolvePlace cx slots ⟨pp, .deref :: .deref :: rest⟩ ow = .ok ⟨l₂, q₂ ++ rest⟩ ∧
+      resolvePlace cx (slots.set t (.init (.ptr pv₂ sz₂))) ⟨t, .deref :: rest⟩ ow =
+        .ok ⟨l₂, q₂ ++ rest⟩ := by
+  have hOw₁ : (ow && (.deref :: rest : List ProjectionElem).isEmpty) = false := by
+    cases ow <;> rfl
+  constructor
+  · unfold resolvePlace
+    simp only [hSt]
+    cases stp with
+    | dead => exact absurd rfl hLive
+    | _ =>
+      rw [derefTarget_deref hPtr₁ hTy₁ (by rw [hOw₁]; exact hRes₁),
+        derefTarget_deref hPtr₂ hTy₂ hRes₂, derefTarget_noDeref cx slots ow _ _ _ hRest]
+  · unfold resolvePlace
+    have hSt' : (slots.set t (.init (.ptr pv₂ sz₂)))[t]? = some (.init (.ptr pv₂ sz₂)) :=
+      List.getElem?_set_self ht
+    simp only [hSt']
+    rw [derefTarget_deref (readPlaceState_set_init_root _ ht) hTyT hRes₂',
+      derefTarget_noDeref _ _ ow _ _ _ hRest]
+
+/-- **Reading a two-level `Deref` chain (`evalDerefPlaceRead_deref_deref`)**: under the hypotheses of
+`resolvePlace_deref_deref_split` (read mode), reading `(**_pp).rest` reads `l₂.(q₂ ++ rest)`, the
+place `(*_t).rest` designates after the `CopyForDeref` split. -/
+theorem evalDerefPlaceRead_deref_deref {cx : SubplaceCtx} {slots : List LocalSlotState}
+    {pp : Nat} {rest : List ProjectionElem} {stp : LocalSlotState} {pv₁ pv₂ : ProvenancePtr}
+    {sz₁ sz₂ : Nat} {pty₁ pty₂ : PtrTy} {l l₂ : Nat} {q q₂ : List ProjectionElem}
+    (hSt : slots[pp]? = some stp) (hLive : stp ≠ .dead)
+    (hPtr₁ : readPlaceState slots ⟨pp, []⟩ = .ok (.ptr pv₁ sz₁))
+    (hTy₁ : cx.ptrTyAt pp [] = some pty₁)
+    (hRes₁ : resolveSyntheticSubplace cx slots (cx.ptrOf pv₁) pty₁ false = .ok (l, q))
+    (hPtr₂ : readPlaceState slots ⟨l, q⟩ = .ok (.ptr pv₂ sz₂))
+    (hTy₂ : cx.ptrTyAt l q = some pty₂)
+    (hRes₂ : resolveSyntheticSubplace cx slots (cx.ptrOf pv₂) pty₂ false = .ok (l₂, q₂))
+    (hRest : projectionHasDeref rest = false) :
+    evalDerefPlaceRead cx slots ⟨pp, .deref :: .deref :: rest⟩ =
+      liftRead (readPlaceState slots ⟨l₂, q₂ ++ rest⟩) := by
+  have hOw₁ : (false && (.deref :: rest : List ProjectionElem).isEmpty) = false := rfl
+  have hOw₂ : (false && rest.isEmpty) = false := rfl
+  unfold evalDerefPlaceRead resolvePlace
+  simp only [hSt]
+  cases stp with
+  | dead => exact absurd rfl hLive
+  | _ =>
+    rw [derefTarget_deref hPtr₁ hTy₁ (by rw [hOw₁]; exact hRes₁),
+      derefTarget_deref hPtr₂ hTy₂ (by rw [hOw₂]; exact hRes₂),
+      derefTarget_noDeref cx slots false _ _ _ hRest]
+
+/-- Witness context for two-level chains: `_0 : u32` (type `1`, at `0x1000`), `_1 : *mut u32`
+(type `2`, at `0x2000`), `_2 : *mut *mut u32` (type `3`, at `0x3000`), and a `*mut u32`
+temporary `_3` (at `0x4000`); every pointer designates a whole local (offset `0` with the local's
+own type), so no candidate list is consulted. -/
+def witnessChainCtx : SubplaceCtx where
+  allocs := [some (4, 4), some (8, 8), some (8, 8), some (8, 8)]
+  limit := 2 ^ 64 - 1
+  layoutOf l := if l = 0 then some (.leaf 4) else if l ≤ 3 then some (.leaf 8) else none
+  declTy l := if l = 0 then some 1 else if l = 1 then some 2 else if l = 2 then some 3
+    else if l = 3 then some 2 else none
+  candidates _ _ _ := []
+  tyLayout t := if t = 1 then some ⟨4, 4, 4, true, true⟩
+    else if t = 2 ∨ t = 3 then some ⟨8, 8, 8, true, true⟩ else none
+  ptrTyAt l q := if q = [] then
+      (if l = 1 ∨ l = 3 then some ⟨false, 1⟩ else if l = 2 then some ⟨false, 2⟩ else none)
+    else none
+  ptrOf pv := ⟨pv.offsetBytes, some (pv.allocId, 0)⟩
+  decodeTag _ _ := none
+
+/-- `_1 = &raw _0` and `_2 = &raw _1` as Trusted-style provenance pointers. -/
+def witnessChainP0 : ProvenancePtr := { allocId := 1, offsetBytes := 0x1000 }
+def witnessChainP1 : ProvenancePtr := { allocId := 2, offsetBytes := 0x2000 }
+
+/-- The frame `_0 = 5`, `_1 = &raw _0`, `_2 = &raw _1`, `_3` uninitialized. -/
+def witnessChainSlots : List LocalSlotState :=
+  [.init (.scalar ⟨5, 4⟩), .init (.ptr witnessChainP0 8), .init (.ptr witnessChainP1 8), .uninit]
+
+/-- `*_2` (the pointer `&raw _1`) resolves to the whole local `_1`. -/
+theorem witnessChainCtx_resolve_P1 :
+    resolveSyntheticSubplace witnessChainCtx witnessChainSlots
+      (witnessChainCtx.ptrOf witnessChainP1) ⟨false, 2⟩ false = .ok (1, []) := by
+  have hPtrOf : witnessChainCtx.ptrOf witnessChainP1 = ⟨0x2000, some (2, 0)⟩ := rfl
+  rw [hPtrOf]
+  have hP : PtrPrechecks witnessChainCtx ⟨0x2000, some (2, 0)⟩ ⟨false, 2⟩ ⟨8, 8, 8, true, true⟩ :=
+    ⟨by decide, by decide, rfl, by decide, by decide, (fun h => by nomatch h), by decide⟩
+  rw [resolveSyntheticSubplace_of_prechecks hP]
+  have hNot : ¬ min witnessChainSlots.length witnessChainCtx.allocs.length ≤ 1 := by decide
+  have hSt : witnessChainSlots[1]? = some (.init (.ptr witnessChainP0 8)) := rfl
+  have hBase : localBaseAddr witnessChainCtx.allocs 1 witnessChainCtx.limit = some 0x2000 := by
+    with_unfolding_all decide
+  have hOwn : ownLayout witnessChainCtx.allocs 1 = some (8, 8) := rfl
+  have hRoot : (0x2000 - 0x2000 = 0 ∧ witnessChainCtx.declTy 1 = some 2) := ⟨rfl, rfl⟩
+  have hLt1 : ¬ (0x2000 < 0x2000) := by decide
+  have hLt2 : ¬ (8 < 0x2000 - 0x2000 + 8) := by decide
+  simp only [hNot, ↓reduceIte, hSt, hBase, hOwn, hLt1, hLt2, hRoot]
+  rfl
+
+/-- `&raw _0` resolves to the whole local `_0` in any frame of four slots whose `_0` is initialized
+(in particular before and after the `CopyForDeref` into `_3`). -/
+theorem witnessChainCtx_resolve_P0 (slots : List LocalSlotState) (hLen : slots.length = 4)
+    (h0 : slots[0]? = some (.init (.scalar ⟨5, 4⟩))) :
+    resolveSyntheticSubplace witnessChainCtx slots
+      (witnessChainCtx.ptrOf witnessChainP0) ⟨false, 1⟩ false = .ok (0, []) := by
+  have hPtrOf : witnessChainCtx.ptrOf witnessChainP0 = ⟨0x1000, some (1, 0)⟩ := rfl
+  rw [hPtrOf]
+  have hP : PtrPrechecks witnessChainCtx ⟨0x1000, some (1, 0)⟩ ⟨false, 1⟩ ⟨4, 4, 4, true, true⟩ :=
+    ⟨by decide, by decide, rfl, by decide, by decide, (fun h => by nomatch h), by decide⟩
+  rw [resolveSyntheticSubplace_of_prechecks hP]
+  have hNot : ¬ min slots.length witnessChainCtx.allocs.length ≤ 0 := by
+    rw [hLen]; decide
+  have hBase : localBaseAddr witnessChainCtx.allocs 0 witnessChainCtx.limit = some 0x1000 := by
+    with_unfolding_all decide
+  have hOwn : ownLayout witnessChainCtx.allocs 0 = some (4, 4) := rfl
+  have hRoot : (0x1000 - 0x1000 = 0 ∧ witnessChainCtx.declTy 0 = some 1) := ⟨rfl, rfl⟩
+  have hLt1 : ¬ (0x1000 < 0x1000) := by decide
+  have hLt2 : ¬ (4 < 0x1000 - 0x1000 + 4) := by decide
+  simp only [hNot, ↓reduceIte, h0, hBase, hOwn, hLt1, hLt2, hRoot]
+  rfl
+
+/-- **Non-vacuity of the two-level chain split (`witness_deref_deref_split`)**: on the frame
+`_0 = 5`, `_1 = &raw _0`, `_2 = &raw _1`, Anneal reads `**_2 = 5` directly, the `CopyForDeref`
+of `*_2` yields `_1`'s pointer, and after storing it into the temporary `_3`, `*_3` reads the same
+`5`; both places resolve to `_0`. -/
+theorem witness_deref_deref_split :
+    resolvePlace witnessChainCtx witnessChainSlots ⟨2, [.deref, .deref]⟩ false = .ok ⟨0, []⟩ ∧
+    evalDerefPlaceRead witnessChainCtx witnessChainSlots ⟨2, [.deref, .deref]⟩ =
+      .ok (.scalar ⟨5, 4⟩) ∧
+    evalDerefPlaceRead witnessChainCtx witnessChainSlots ⟨2, [.deref]⟩ =
+      .ok (.ptr witnessChainP0 8) ∧
+    resolvePlace witnessChainCtx (witnessChainSlots.set 3 (.init (.ptr witnessChainP0 8)))
+      ⟨3, [.deref]⟩ false = .ok ⟨0, []⟩ ∧
+    evalDerefPlaceRead witnessChainCtx (witnessChainSlots.set 3 (.init (.ptr witnessChainP0 8)))
+      ⟨3, [.deref]⟩ = .ok (.scalar ⟨5, 4⟩) := by
+  have hR1 := witnessChainCtx_resolve_P1
+  have hR0 := witnessChainCtx_resolve_P0 witnessChainSlots rfl rfl
+  have hR0' := witnessChainCtx_resolve_P0 (witnessChainSlots.set 3 (.init (.ptr witnessChainP0 8)))
+    rfl rfl
+  have hP2 : readPlaceState witnessChainSlots ⟨2, []⟩ = .ok (.ptr witnessChainP1 8) := by
+    with_unfolding_all rfl
+  have hP1 : readPlaceState witnessChainSlots ⟨1, []⟩ = .ok (.ptr witnessChainP0 8) := by
+    with_unfolding_all rfl
+  obtain ⟨hS1, hS2⟩ := resolvePlace_deref_deref_split (cx := witnessChainCtx)
+    (slots := witnessChainSlots) (ow := false) (pp := 2) (t := 3) (rest := [])
+    (stp := .init (.ptr witnessChainP1 8)) (l := 1) (q := []) (l₂ := 0) (q₂ := [])
+    rfl (by intro h; nomatch h) hP2 rfl hR1 hP1 rfl hR0 rfl (by decide) rfl hR0'
+  refine ⟨hS1, ?_, ?_, hS2, ?_⟩
+  · rw [evalDerefPlaceRead_deref_deref (cx := witnessChainCtx) rfl (by intro h; nomatch h) hP2
+      rfl hR1 hP1 rfl hR0 rfl]
+    with_unfolding_all rfl
+  · rw [evalDerefPlaceRead_deref rfl (by intro h; nomatch h) hP2 rfl hR1 rfl]
+    with_unfolding_all rfl
+  · unfold evalDerefPlaceRead
+    rw [hS2]
+    with_unfolding_all rfl
 
 end Anneal.Mir.AdtAndControl

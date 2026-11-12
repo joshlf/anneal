@@ -41,8 +41,11 @@ reborrowing, safe-pointer validity, and Tree Borrows `ReborrowSettings`
 theorems and witnesses), `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
 `wfLive` / `no_specPanic` invariants, dereference-`move` and pointer-to-pointer
 dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
-witnesses), or `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
-witnesses), ending in `sorry_free=true`. A group that depends on `sorryAx` or
+witnesses), `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
+witnesses), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
+of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
+sub-place audit hook `subplace_audit_closure`, and their witnesses), ending in
+`sorry_free=true`. A group that depends on `sorryAx` or
 on any other non-standard axiom fails the build instead.
 -/
 
@@ -5338,6 +5341,108 @@ open MiniRustSpec.Correspondence in
   bdPolymorphicCallee_rejected
   bdPolymorphicCall_anneal_failClosed
   bdUnmonoParamAliasBody_failClosed
+
+/-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
+
+`[DEINIT-AUDIT]` pins the projected-`Deinit` fragment `inFragmentD` of
+`Correspondence.DeinitWindow` (its window rules, the one-step correspondence
+`step_correspondence_D`, and the whole-execution lifts), the byte-store bridge of
+`Correspondence.DeinitLemmas` / `Correspondence.DeinitBridge` (including
+`subplace_audit_closure`, whose proof term mentions every Episode 2 theorem of
+`Anneal.Mir.AdtAndControl` Section 4), the `Rvalue::Discriminant` lowering and its
+gating characterizations, and the concrete projected-`Deinit` and `Discriminant`
+witnesses of `Correspondence.Witness`, including the negative controls. -/
+
+open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
+  MiniRustSpec.Correspondence.Witness in
+#check_theorem_deps "[DEINIT-AUDIT]"
+  inFragment_implies_inFragmentD
+  inFragmentD_spec
+  deinitWindowOk_spec
+  blockWindowOk_spec
+  holeAt_succ
+  step_projDeinit
+  reinitOk_spec
+  siblingReadOk_spec
+  reinitCopyOk_spec
+  localCopyWindowOk_spec
+  castSiblingReadOk_spec
+  reinitBinOpOk_spec
+  evalStatement_reinit_any
+  evalStatement_siblingRead_any
+  evalStatement_reinitCopy_any
+  evalStatement_localCopy_any
+  evalStatement_castSiblingRead_any
+  evalStatement_reinitBinOp_any
+  step_window_reinit
+  step_window_read
+  step_window_reinit_copy
+  step_window_local_copy
+  step_window_cast_read
+  step_window_reinit_binop
+  step_correspondence_D
+  reaches_rel_D
+  run_ret_D
+  step_start_D
+  run_ret_from_start_D
+  mirCall_ret_D
+  run_ub_rel_D
+  run_ub_D
+  run_ub_from_start_D
+  steps_error_D
+  mirNoUB_safe_D
+  steps_outcome_D
+  mirNoUB_progress_D
+  mirNoUB_diverges_steps_ok_D
+  mirNoUB_diverges_rel_from_start_D
+  mirCall_ub_D
+  mirCall_ub_rel_D
+  mirCall_noUB_D
+  mirCall_steps_error_D
+  mirCall_outcome_D
+  mirCall_progress_D
+  mirCall_diverges_steps_ok_D
+  mirCall_diverges_rel_D
+  resolveFieldPath_deinit_unit
+  evalStatement_deinit_fieldPath
+  evalStmt_deinit_field
+  evalDeinitPlace_spec_minirust_store_simulation
+  paddedDeinitSiblingReinit_anneal_shell_agreement
+  subplace_audit_closure
+  translateRvalue_discriminant
+  evalValue_orderingDiscrExpr
+  evalValue_orderingDiscrExpr_ub
+  orderingDiscrExpr_eq_getDiscriminant
+  rvalueOk_discriminant_nonOrdering
+  rvalueOk_discriminant_proj
+  cmpDiscrSwitch_inFragment
+  cmpDiscrSwitch_translate
+  cmpDiscrLess_minirust_ret_from_start
+  statementOk_deinit_proj
+  statementOk_retag_proj
+  paddedDeinitRead_minirust_ub
+  paddedRetagRead_anneal_ub
+  paddedRetagRead_minirust_ret
+  paddedDeinitRead_not_inFragmentD
+  deinitSiblingReinit_inFragmentD
+  deinitSiblingReinit_minirust_ret_from_start
+  deinitSiblingReinit_minirust_noUB
+  deinitSiblingReinit_minirust_progress
+  deinitSiblingCopyReinit_minirust_ret_from_start
+  deinitSiblingCopyReinit_minirust_noUB
+  deinitSiblingReinitUb_minirust_ub_from_start
+  deinitSiblingRelayReinit_minirust_ret_from_start
+  deinitSiblingRelayReinit_minirust_noUB
+  paddedDeinitSiblingReinit_inFragmentD
+  paddedDeinitSiblingReinit_window_rules
+  paddedDeinitSiblingReinit_minirust_ret_from_start
+  paddedDeinitSiblingReinit_minirust_noUB
+  paddedDeinitBinOpDivZero_minirust_ub_from_start
+  paddedDeinitBinOpDivZero_minirust_ub_direct
+  paddedDeinitHoleBinOp_not_inFragmentD
+  paddedDeinitHoleBinOp_diverges
+  paddedDeinitHoleCastRead_not_inFragmentD
+  paddedDeinitHoleCastRead_diverges
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

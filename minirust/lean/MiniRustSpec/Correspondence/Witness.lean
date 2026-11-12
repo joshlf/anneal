@@ -222,9 +222,18 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   end-to-end MiniRust return of `42` through `mirCall_ret_D`
   (`deinitSiblingReinit_minirust_ret_from_start`), a direct MiniRust run showing the
   `Uninit` hole over bytes `4..8` and its re-initialization
-  (`deinitSiblingReinit_minirust_direct`), and the negative control
-  `paddedDeinitSiblingReinit_not_inFragmentD` (a `Cast` read and a `BinOp`
-  re-initialization inside the window are outside the window rule).
+  (`deinitSiblingReinit_minirust_direct`).
+* `paddedDeinitSiblingReinit`: a projected-`Deinit` window with a sibling read
+  through an integer cast and a `BinOp` re-initialization (`_2 = copy _1.0 as u32;
+  _1.1 = _2 + 35`), admitted by `inFragmentD` through `castSiblingReadOk` and
+  `reinitBinOpOk` (`paddedDeinitSiblingReinit_inFragmentD`), with the end-to-end
+  MiniRust return of `42` through `mirCall_ret_D`
+  (`paddedDeinitSiblingReinit_minirust_ret_from_start`); `paddedDeinitBinOpDivZero`
+  transfers a division-by-zero `BinOp` re-initialization's UB through `mirCall_ub_D`;
+  and the negative controls `paddedDeinitHoleBinOp` (a `BinOp` re-initialization
+  reading the hole: Anneal returns `100`, MiniRust is UB) and
+  `paddedDeinitHoleCastRead` (a cast read of the hole: Anneal returns `99`, MiniRust
+  is UB) are rejected by the window check alone.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -13951,12 +13960,89 @@ theorem paddedDeinitRead_not_inFragmentD :
       deinitWindowOk paddedDeinitRead = false ∧ inFragmentD paddedDeinitRead = false := by
   decide
 
-/-- The committed `paddedDeinitSiblingReinit` (sibling read through a `Cast`, re-init by
-`_2 + 35`) is outside `inFragmentD`: only its window check fails. -/
-theorem paddedDeinitSiblingReinit_not_inFragmentD :
+/-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
+check used to fail): its open-hole window is the sibling read through an integer cast
+`_2 = Cast(IntToInt, copy _1.0, u32)` (`castSiblingReadOk`: the `u8` field `_1.0` at byte `0` is
+disjoint from the hole `4..8`) followed by the re-initialization `_1.1 = Add(copy _2, const 35_u32)`
+(`reinitBinOpOk`), while the old fragment still rejects the body
+(`paddedDeinitSiblingReinit_not_inFragment`). -/
+theorem paddedDeinitSiblingReinit_inFragmentD :
     inFragment (eraseDeinit paddedDeinitSiblingReinit) = true ∧
-      deinitWindowOk paddedDeinitSiblingReinit = false := by
+      deinitWindowOk paddedDeinitSiblingReinit = true ∧
+      inFragmentD paddedDeinitSiblingReinit = true := by
   decide
+
+/-- The two window statements of `paddedDeinitSiblingReinit` pass exactly the new window rules,
+and the hole `(1, [.field 1 u32])` is open exactly before them. -/
+theorem paddedDeinitSiblingReinit_window_rules :
+    castSiblingReadOk paddedDeinitSiblingReinit 1 2 [.field 1 u32Ty] [.field 0 u8TyW] u32Ty = true ∧
+    reinitBinOpOk paddedDeinitSiblingReinit 1 2 [.field 1 u32Ty] .add
+      { ty := u32Ty, val := .scalar (.int ⟨35, 4⟩) } = true ∧
+    (List.range 7).map (holeAt paddedDeinitSiblingReinit 0) =
+      [none, none, some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]), none, none, none] :=
+  ⟨by decide, by decide, rfl⟩
+
+/-- `ctxPadded3` (callee `_0: u32` at `128`, `_1: Padded` at `256`) is well formed for a body whose
+locals are `_0: u32`, the argument `_1: Padded`, and a `u32` temporary `_2` (temporaries get no
+caller address). -/
+theorem ctxPadded3_ok_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl, u32Decl])
+    (hlay : body.layouts = paddedLayouts) (hac : body.argCount = 1) : CtxOk body ctxPadded3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd; rw [h] at hd; rw [hlay]; rw [hac] at hi
+    match i, hi, hd with
+    | 0, _, hd => simp at hd; subst hd; decide
+    | 1, _, hd => simp at hd; subst hd; decide
+    | _ + 2, hi, _ => omega
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem paddedDeinitSiblingReinit_ctxOk : CtxOk paddedDeinitSiblingReinit ctxPadded3 :=
+  ctxPadded3_ok_u32 rfl rfl rfl
+
+theorem paddedDeinitSiblingReinit_argsOk :
+    argsOk paddedDeinitSiblingReinit paddedDeinitReadArgs = true := by
+  decide
+
+/-- **End to end through `mirCall_ret_D` for `paddedDeinitSiblingReinit` (`castSiblingReadOk` and
+`reinitBinOpOk`).** Anneal's return of `42` (`paddedDeinitSiblingReinit_anneal_ret`) gives, by the
+projected-`Deinit` correspondence, a MiniRust run from `f.start` that pops the callee frame and
+leaves `42` in the caller's return place (agreeing with the direct computation
+`paddedDeinitSiblingReinit_minirust_ret`). -/
+theorem paddedDeinitSiblingReinit_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n paddedDeinitSiblingReinitMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads =
+        [thread1 ctxPadded3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret_D paddedDeinitSiblingReinit_inFragmentD.2.2 paddedDeinitSiblingReinit_translate
+      ctxPadded3 paddedDeinitSiblingReinit_ctxOk paddedDeinitReadArgs
+      paddedDeinitSiblingReinit_argsOk paddedDeinitSiblingReinitMInit rfl rfl rfl
+      paddedDeinitSiblingReinit_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [paddedDeinitSiblingReinit] at hd; subst hd
+  simp [retPtr, ctxPadded3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- **End-to-end UB-freedom through `mirCall_noUB_D` for `paddedDeinitSiblingReinit`.** Since
+`mirCallTree paddedDeinitSiblingReinit` is UB-free (`paddedDeinitSiblingReinit_noUB`), any MiniRust
+error at step `n` would imply an earlier return. -/
+theorem paddedDeinitSiblingReinit_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n paddedDeinitSiblingReinitMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k paddedDeinitSiblingReinitMInit = .ok mRet ∧
+      ReturnRel paddedDeinitSiblingReinit ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree paddedDeinitSiblingReinit paddedDeinitReadArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB_D paddedDeinitSiblingReinit_inFragmentD.2.2 paddedDeinitSiblingReinit_translate
+    ctxPadded3 paddedDeinitSiblingReinit_ctxOk paddedDeinitReadArgs
+    paddedDeinitSiblingReinit_argsOk paddedDeinitSiblingReinitMInit rfl rfl rfl
+    paddedDeinitSiblingReinit_noUB herr
 
 /-- **End to end through `mirCall_ret_D`.** Anneal's return of `42`
 (`deinitSiblingReinit_anneal_ret`) gives, by the projected-`Deinit` correspondence, a MiniRust
@@ -14388,5 +14474,244 @@ theorem deinitSiblingRelayReinit_minirust_noUB {n : Nat} {e : Stop}
   mirCall_noUB_D deinitSiblingRelayReinit_inFragmentD deinitSiblingRelayReinit_translate ctxPadded2
     deinitSiblingRelayReinit_ctxOk deinitSiblingRelayReinitArgs deinitSiblingRelayReinit_argsOk
     deinitSiblingRelayReinitMInit rfl rfl rfl deinitSiblingRelayReinit_anneal_noUB herr
+
+/-! ### New window rules: a UB transfer and negative controls
+
+`paddedDeinitBinOpDivZero` re-initializes the hole by a division by zero (`reinitBinOpOk` admits
+the statement; both machines fault), and `mirCall_ub_D` transfers Anneal's fault to MiniRust.
+`paddedDeinitHoleBinOp` and `paddedDeinitHoleCastRead` read the hole itself inside the window (as a
+`BinOp` operand and through a cast); Anneal reads the stale field while MiniRust's load of the
+`Uninit` bytes is UB, and the window check alone rejects both (their erasures are in the old
+fragment). -/
+
+/-- MIR of
+```rust
+fn padded_deinit_binop_div_zero(mut s: Padded) -> u32 {
+    let a: u32;          // StorageLive(_2)
+    Deinit(s.1);         // Deinit(_1.1)                      [opens hole (1, [.field 1 u32])]
+    a = s.0 as u32;      // _2 = Cast(IntToInt, copy _1.0, u32) [castSiblingReadOk]
+    s.1 = a / 0;         // _1.1 = Div(copy _2, const 0_u32)    [reinitBinOpOk: division by zero]
+    s.1                  // _0 = copy _1.1; StorageDead(_2); return
+}
+``` -/
+def paddedDeinitBinOpDivZero : CapturedMir where
+  defPath := "witness::padded_deinit_binop_div_zero"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.cast .intToInt (.copy (placeField 1 [(0, u8TyW)])) u32Ty)),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)])
+          (.binaryOp .div (.copy (local_ 2)) (constU32 0))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+theorem paddedDeinitBinOpDivZero_inFragmentD : inFragmentD paddedDeinitBinOpDivZero = true := by
+  decide
+
+def paddedDeinitBinOpDivZeroFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Field (.Local (localName 1)) 0))),
+      .Assign (.Field (.Local (localName 1)) 1)
+        (.BinOp (.Int .Div) (.Load (.Local (localName 2))) (.Constant (.Int 0) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1)),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitBinOpDivZero_translate :
+    translateFn paddedDeinitBinOpDivZero = some paddedDeinitBinOpDivZeroFn := rfl
+
+def paddedDeinitBinOpDivZeroS0 : MachineState :=
+  initMachineState paddedDeinitBinOpDivZero paddedDeinitReadArgs
+
+def paddedDeinitBinOpDivZeroMInit : Mach :=
+  machineWithCtx ctxPadded3 paddedDeinitBinOpDivZero paddedDeinitBinOpDivZeroFn
+    paddedDeinitBinOpDivZeroS0.frame.locals paddedDeinitBinOpDivZeroFn.start
+
+/-- Anneal faults on the division by zero (computed by the kernel). -/
+theorem paddedDeinitBinOpDivZero_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree paddedDeinitBinOpDivZero paddedDeinitReadArgs) tr u ∧
+      FaultNow u :=
+  faultsA_sound paddedDeinitBinOpDivZero 12 _ (by decide)
+
+/-- **End-to-end UB transfer through `mirCall_ub_D` for a `BinOp` re-initialization of the hole.**
+Since Anneal faults (`paddedDeinitBinOpDivZero_anneal_ub`), MiniRust started at `f.start` raises UB
+after finitely many steps (the `intBinEval = none` branch of `step_window_reinit_binop`). -/
+theorem paddedDeinitBinOpDivZero_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n paddedDeinitBinOpDivZeroMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := paddedDeinitBinOpDivZero_anneal_ub
+  exact mirCall_ub_D paddedDeinitBinOpDivZero_inFragmentD paddedDeinitBinOpDivZero_translate
+    ctxPadded3 (ctxPadded3_ok_u32 rfl rfl rfl) paddedDeinitReadArgs (by decide)
+    paddedDeinitBinOpDivZeroMInit rfl rfl rfl hr hf
+
+/-- The direct MiniRust run agrees: the fifth step (init `Goto`, `StorageLive(_2)`, `Deinit`, the
+cast read, and the division) is UB (computed by the kernel). -/
+theorem paddedDeinitBinOpDivZero_minirust_ub_direct :
+    ∃ msg, Interp.steps 5 paddedDeinitBinOpDivZeroMInit = .error (.ub msg) :=
+  ⟨_, rfl⟩
+
+/-- MIR of
+```rust
+fn padded_deinit_hole_binop(mut s: Padded) -> u32 {
+    Deinit(s.1);         // Deinit(_1.1)
+    s.1 = s.1 + 1;       // _1.1 = Add(copy _1.1, const 1_u32)   [reads the hole]
+    s.1                  // _0 = copy _1.1; return
+}
+``` -/
+def paddedDeinitHoleBinOp : CapturedMir where
+  defPath := "witness::padded_deinit_hole_binop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)])
+          (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (constU32 1))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+/-- Negative control: the `BinOp` re-initialization reads the hole, so `reinitBinOpOk` (which needs
+a bare local `copy _q` with `q ≠ t`) does not apply and the window check alone rejects the body. -/
+theorem paddedDeinitHoleBinOp_not_inFragmentD :
+    inFragment (eraseDeinit paddedDeinitHoleBinOp) = true ∧
+      deinitWindowOk paddedDeinitHoleBinOp = false ∧ inFragmentD paddedDeinitHoleBinOp = false := by
+  decide
+
+def paddedDeinitHoleBinOpFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Field (.Local (localName 1)) 1)
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 1)) 1))
+          (.Constant (.Int 1) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitHoleBinOp_translate :
+    translateFn paddedDeinitHoleBinOp = some paddedDeinitHoleBinOpFn := rfl
+
+def paddedDeinitHoleBinOpS0 : MachineState :=
+  initMachineState paddedDeinitHoleBinOp paddedDeinitReadArgs
+
+def paddedDeinitHoleBinOpMInit : Mach :=
+  machineWithCtx ctxPadded2 paddedDeinitHoleBinOp paddedDeinitHoleBinOpFn
+    paddedDeinitHoleBinOpS0.frame.locals paddedDeinitHoleBinOpFn.start
+
+/-- The divergence the window check prevents (computed by the kernel): Anneal's projected `Deinit`
+keeps `_1.1 = 99`, so Anneal returns `100`, whereas MiniRust's `BinOp` loads the `Uninit` hole and
+the third step (init `Goto`, `Deinit`, the re-initialization) is UB. -/
+theorem paddedDeinitHoleBinOp_diverges :
+    ReachesRet (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) []
+        (.normal (.scalar ⟨100, 4⟩, paddedDeinitHoleBinOpS0.memory)) ∧
+      ∃ msg, Interp.steps 3 paddedDeinitHoleBinOpMInit = .error (.ub msg) :=
+  ⟨runA_sound paddedDeinitHoleBinOp 10 _ _ _ rfl, _, rfl⟩
+
+/-- MIR of
+```rust
+fn padded_deinit_hole_cast_read(mut s: Padded) -> u32 {
+    let a: u32;          // StorageLive(_2)
+    Deinit(s.1);         // Deinit(_1.1)
+    a = s.1 as u32;      // _2 = Cast(IntToInt, copy _1.1, u32)   [reads the hole]
+    s.1 = a;             // _1.1 = copy _2
+    s.1                  // _0 = copy _1.1; StorageDead(_2); return
+}
+``` -/
+def paddedDeinitHoleCastRead : CapturedMir where
+  defPath := "witness::padded_deinit_hole_cast_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, paddedStructDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.deinit (placeField 1 [(1, u32Ty)])),
+        mkStmt (.assign (local_ 2) (.cast .intToInt (.copy (placeField 1 [(1, u32Ty)])) u32Ty)),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)]) (.use (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedOne
+  layouts := paddedLayouts
+  allocations := []
+
+/-- Negative control: the cast reads the hole's own bytes, so `castSiblingReadOk`'s disjointness
+check fails and the window check alone rejects the body. -/
+theorem paddedDeinitHoleCastRead_not_inFragmentD :
+    inFragment (eraseDeinit paddedDeinitHoleCastRead) = true ∧
+      castSiblingReadOk paddedDeinitHoleCastRead 1 2 [.field 1 u32Ty] [.field 1 u32Ty] u32Ty =
+        false ∧
+      deinitWindowOk paddedDeinitHoleCastRead = false ∧
+      inFragmentD paddedDeinitHoleCastRead = false := by
+  decide
+
+def paddedDeinitHoleCastReadFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Deinit (.Field (.Local (localName 1)) 1),
+      .Assign (.Local (localName 2))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Field (.Local (localName 1)) 1))),
+      .Assign (.Field (.Local (localName 1)) 1) (.Load (.Local (localName 2))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1)),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedDeinitHoleCastRead_translate :
+    translateFn paddedDeinitHoleCastRead = some paddedDeinitHoleCastReadFn := rfl
+
+def paddedDeinitHoleCastReadS0 : MachineState :=
+  initMachineState paddedDeinitHoleCastRead paddedDeinitReadArgs
+
+def paddedDeinitHoleCastReadMInit : Mach :=
+  machineWithCtx ctxPadded3 paddedDeinitHoleCastRead paddedDeinitHoleCastReadFn
+    paddedDeinitHoleCastReadS0.frame.locals paddedDeinitHoleCastReadFn.start
+
+/-- The divergence the disjointness check prevents (computed by the kernel): Anneal reads the stale
+`_1.1 = 99` through the cast and returns `99`, whereas MiniRust's cast loads the `Uninit` hole and
+the fourth step (init `Goto`, `StorageLive(_2)`, `Deinit`, the cast read) is UB. -/
+theorem paddedDeinitHoleCastRead_diverges :
+    ReachesRet (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) []
+        (.normal (.scalar ⟨99, 4⟩, paddedDeinitHoleCastReadS0.memory)) ∧
+      ∃ msg, Interp.steps 4 paddedDeinitHoleCastReadMInit = .error (.ub msg) :=
+  ⟨runA_sound paddedDeinitHoleCastRead 12 _ _ _ rfl, _, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

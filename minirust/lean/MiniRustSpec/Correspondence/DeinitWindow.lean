@@ -33,10 +33,14 @@ and every theorem stated over `inFragment` keep their meaning. Instead:
 * `deinitWindowOk body` (`blockWindowOk`, `windowStmtOk`) requires that a projected `Deinit`
   opens a hole only when none is open, on a `TupleSpec` local `_t` that is not moved out, at a
   scalar field of positive size (`deinitTargetOk`); that while the hole is open the only
-  statements are disjoint sibling reads `_r = copy _t.g` (`siblingReadOk`) and the
-  re-initialization of the hole's byte range either by an integer constant of the field's type
-  (`reinitOk`: `_t.f = const c`) or by copying a distinct integer local of the field's type
-  (`reinitCopyOk`: `_t.f = copy _r`); and that the hole is closed before the block's terminator;
+  statements are disjoint sibling reads `_r = copy _t.g` (`siblingReadOk`), possibly through an
+  integer cast (`castSiblingReadOk`: `_r = Cast(IntToInt, copy _t.g, it)`), hole-independent scalar
+  local copies `_r = copy _q` (`localCopyWindowOk`), and the re-initialization of the hole's byte
+  range by an integer constant of the field's type (`reinitOk`: `_t.f = const c`), by copying a
+  distinct integer local of the field's type (`reinitCopyOk`: `_t.f = copy _r`), or by an integer
+  binary operation of a distinct integer local and a constant (`reinitBinOpOk`:
+  `_t.f = BinaryOp(op, copy _q, const c)`); and that the hole is closed before the block's
+  terminator;
 * `inFragmentD body := inFragment (eraseDeinit body) && deinitWindowOk body`.
 
 The relation `StateRelD` is `StateRelN` of the erased body, or, while the hole `_t.ps` is open,
@@ -49,10 +53,13 @@ correspondence `StepRelD`:
   erased body and the *actual* translation `translateFn body`, which agree on the current
   statement and terminator (`blk_eraseDeinit`, `stepMirFn_eraseDeinit_stmt`,
   `stepMirFn_eraseDeinit_term`);
-* sibling read (`step_window_read`) and constant or local-copy re-initialization
-  (`step_window_reinit`, `step_window_reinit_copy`) while the hole is open: the MiniRust step is
-  computed on the hole-free and on the actual machine by the allocation-data-parametric
-  `evalStatement_siblingRead_any`, `evalStatement_reinit_any`, and `evalStatement_reinitCopy_any`.
+* sibling read (`step_window_read`, `step_window_cast_read`), local copy
+  (`step_window_local_copy`), and constant, local-copy, or binary-operation re-initialization
+  (`step_window_reinit`, `step_window_reinit_copy`, `step_window_reinit_binop`) while the hole is
+  open: the MiniRust step is computed on the hole-free and on the actual machine by the
+  allocation-data-parametric `evalStatement_siblingRead_any`, `evalStatement_castSiblingRead_any`,
+  `evalStatement_localCopy_any`, `evalStatement_reinit_any`, `evalStatement_reinitCopy_any`, and
+  `evalStatement_reinitBinOp_any`.
   The read loads the same bytes (`spliceAt_drop_take_disjoint`) into `_r`'s allocation, which is
   not `_t`'s, and keeps the hole; the re-initialization overwrites the hole (`spliceAt_same`), so
   both machines agree and the hole closes.
@@ -69,8 +76,10 @@ whole-execution lift suite (`run_ub_rel_D`, `run_ub_D`, `run_ub_rel_from_start_D
 `mirCall_diverges_rel_D`) lift the correspondence to whole executions, exactly as `Run.lean` does
 for `inFragment`; `Witness.deinitSiblingReinit_minirust_ret_from_start`,
 `Witness.deinitSiblingReinit_minirust_noUB`, `Witness.deinitSiblingCopyReinit_minirust_ret_from_start`,
-and `Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate `mirCall_ret_D`,
-`mirCall_noUB_D`, and `mirCall_ub_D` on concrete bodies.
+`Witness.deinitSiblingRelayReinit_minirust_ret_from_start`,
+`Witness.paddedDeinitSiblingReinit_minirust_ret_from_start` (cast sibling read and `BinaryOp`
+re-initialization), and `Witness.deinitSiblingReinitUb_minirust_ub_from_start` instantiate
+`mirCall_ret_D`, `mirCall_noUB_D`, and `mirCall_ub_D` on concrete bodies.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -266,11 +275,61 @@ def localCopyWindowOk (body : CapturedMir) (t r q : Nat) : Bool :=
     | _, _, _ => false
   | _, _, _ => false
 
+/-- A sibling read through an integer cast `_r = Cast(IntToInt, copy _t.projs', castTy)` while
+`_t.projs` is a hole: `_r` is an integer local other than `_t` whose integer type `it` is the cast's
+target type `castTy` (with a valid size and alignment), the operand translates as an integer operand
+(`operandType` is `Int`), and `projs'` resolves in `_t`'s `TupleSpec` to a scalar leaf of some
+integer type `it'` (the cast's source) whose bytes are disjoint from the hole. -/
+def castSiblingReadOk (body : CapturedMir) (t r : Nat) (projs projs' : List ProjectionElem)
+    (castTy : MirAst.Ty) : Bool :=
+  decide (r ≠ t) &&
+  (match operandType body.layouts body.localDecls (.copy ⟨t, projs'⟩) with
+   | some (.Int _) => true
+   | _ => false) &&
+  match body.localDecls[r]?, body.localDecls[t]? with
+  | some dr, some d =>
+    match intTypeOf dr.ty, intTypeOf castTy, tupleTypeOf body.layouts d.ty with
+    | some it, some ct, some (fields, size, align) =>
+      decide (ct = it) && goodAlignBytes it.size.bytes &&
+      match resolveFieldPath body.layouts (.tuple fields size align) projs,
+            resolveFieldPath body.layouts (.tuple fields size align) projs' with
+      | some (off, leaf), some (off', .scalar it') =>
+        decide (off' + it'.size.bytes ≤ off) || decide (off + leaf.size ≤ off')
+      | _, _ => false
+    | _, _, _ => false
+  | _, _ => false
+
+/-- A re-initialization `_t.projs = BinaryOp(op, copy _q, const c)` of the hole by an integer
+arithmetic or bitwise operation (`translateRelOp op = none`, `translateBinOp op = some _`) of a
+hole-independent integer local `_q` (`q ≠ t`) and a constant: `projs` resolves in `_t`'s `TupleSpec`
+to a scalar leaf of positive size whose integer type `it` is `_q`'s type, and `c` is a non-`bool`
+integer constant of type `it` with an in-range bit pattern (so that `translateOperand` lowers it to
+`Constant::Int`). -/
+def reinitBinOpOk (body : CapturedMir) (t q : Nat) (projs : List ProjectionElem)
+    (op : MirAst.BinOp) (c : ConstOperand) : Bool :=
+  decide (q ≠ t) && (translateRelOp op).isNone && (translateBinOp op).isSome &&
+  match body.localDecls[q]?, body.localDecls[t]? with
+  | some dq, some d =>
+    match intTypeOf dq.ty, tupleTypeOf body.layouts d.ty with
+    | some it, some (fields, size, align) =>
+      match resolveFieldPath body.layouts (.tuple fields size align) projs with
+      | some (_, .scalar it') =>
+        decide (it' = it) && decide (0 < it.size.bytes) && !isBoolTy c.ty &&
+        match c.val, intTypeOf c.ty with
+        | .scalar (.int ⟨bits, sz⟩), some ic =>
+          decide (ic = it) && decide (sz = it.size.bytes) && decide (bits < 2 ^ (8 * sz))
+        | _, _ => false
+      | _ => false
+    | _, _ => false
+  | _, _ => false
+
 /-- The statements admitted before statement `idx` of block `blk` when the hole state is
 `hole`: with no hole, any statement (a projected `Deinit` must target an admissible,
 not-moved-out `TupleSpec` local); with a hole on `_t.projs`, only a disjoint sibling read
-`_r = copy _t.projs'`, a hole-independent scalar local copy `_r = copy _q`, a constant
-re-initialization `_t.projs = const c`, or a local-copy re-initialization `_t.projs = copy _r`. -/
+`_r = copy _t.projs'` (possibly through an integer cast, `_r = Cast(IntToInt, copy _t.projs', it)`),
+a hole-independent scalar local copy `_r = copy _q`, a constant re-initialization
+`_t.projs = const c`, a local-copy re-initialization `_t.projs = copy _r`, or a binary-operation
+re-initialization `_t.projs = BinaryOp(op, copy _q, const c)`. -/
 def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
     Option (Nat × List ProjectionElem) → MirAst.Statement → Bool
   | none, st =>
@@ -290,6 +349,11 @@ def windowStmtOk (body : CapturedMir) (blk idx : Nat) :
     | .assign ⟨t', ps'⟩ (.use (.constant c)) =>
       decide (t' = t) && reinitOk body t ps' c &&
         decide (holeRange body t ps' = holeRange body t ps)
+    | .assign ⟨r, []⟩ (.cast .intToInt (.copy ⟨t', qp :: qps⟩) castTy) =>
+      decide (t' = t) && castSiblingReadOk body t r ps (qp :: qps) castTy
+    | .assign ⟨t', rp :: rps⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)) =>
+      decide (t' = t) && reinitBinOpOk body t q (rp :: rps) op c &&
+        decide (holeRange body t (rp :: rps) = holeRange body t ps)
     | _ => false
 
 /-- Whether the statements `sts` (starting at index `idx` with hole state `hole`) satisfy
@@ -1877,6 +1941,623 @@ theorem step_window_local_copy {body : CapturedMir} {f : Gen.Function}
       | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _, _ =>
         nomatch htyT
 
+/-! ## Cast sibling reads and binary-operation re-initializations
+
+A sibling read through an integer cast (`castSiblingReadOk`) loads the same disjoint field bytes from
+the hole-free and the actual machine and casts them alike (`evalStatement_castSiblingRead_any`); a
+binary-operation re-initialization (`reinitBinOpOk`) loads the same hole-independent local `_q`
+(whose allocation is not `_t`'s) on both machines, computes the same `intBinEval` result or the same
+UB, and stores the same bytes over the hole (`evalStatement_reinitBinOp_any`, `spliceAt_same`). -/
+
+theorem castSiblingReadOk_spec {body : CapturedMir} {t r : Nat} {ps ps' : List ProjectionElem}
+    {castTy : MirAst.Ty} (h : castSiblingReadOk body t r ps ps' castTy = true) :
+    r ≠ t ∧ (∃ it'', operandType body.layouts body.localDecls (.copy ⟨t, ps'⟩) = some (.Int it'')) ∧
+    ∃ (dr d : LocalDecl) (fields : List (Nat × TupleSpec)) (size align : Nat)
+      (it it' : Gen.IntType) (off : Nat) (leaf : TupleSpec) (off' : Nat),
+      body.localDecls[r]? = some dr ∧ body.localDecls[t]? = some d ∧ intTypeOf dr.ty = some it ∧
+      intTypeOf castTy = some it ∧
+      tupleTypeOf body.layouts d.ty = some (fields, size, align) ∧ GoodSize it.size.bytes ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps = some (off, leaf) ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps' = some (off', .scalar it') ∧
+      (off' + it'.size.bytes ≤ off ∨ off + leaf.size ≤ off') := by
+  unfold castSiblingReadOk at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨⟨hrt, hop⟩, h⟩ := h
+  refine ⟨hrt, ?_, ?_⟩
+  · revert hop
+    cases operandType body.layouts body.localDecls (.copy ⟨t, ps'⟩) with
+    | none => intro hop; simp at hop
+    | some T =>
+      cases T with
+      | Int it'' => intro _; exact ⟨it'', rfl⟩
+      | _ => intro hop; simp at hop
+  cases hdr : body.localDecls[r]? with
+  | none => simp [hdr] at h
+  | some dr =>
+    cases hd : body.localDecls[t]? with
+    | none => simp [hdr, hd] at h
+    | some d =>
+      cases hit : intTypeOf dr.ty with
+      | none => simp [hdr, hd, hit] at h
+      | some it =>
+        cases hct : intTypeOf castTy with
+        | none => simp [hdr, hd, hit, hct] at h
+        | some ct =>
+          cases ht : tupleTypeOf body.layouts d.ty with
+          | none => simp [hdr, hd, hit, hct, ht] at h
+          | some trip =>
+            obtain ⟨fields, size, align⟩ := trip
+            cases hres : resolveFieldPath body.layouts (.tuple fields size align) ps with
+            | none => simp [hdr, hd, hit, hct, ht, hres] at h
+            | some pr =>
+              obtain ⟨off, leaf⟩ := pr
+              cases hres' : resolveFieldPath body.layouts (.tuple fields size align) ps' with
+              | none => simp [hdr, hd, hit, hct, ht, hres, hres'] at h
+              | some pr' =>
+                obtain ⟨off', leaf'⟩ := pr'
+                cases leaf' with
+                | tuple _ _ _ => simp [hdr, hd, hit, hct, ht, hres, hres'] at h
+                | scalar it' =>
+                  simp only [hdr, hd, hit, hct, ht, hres, hres', Bool.and_eq_true,
+                    decide_eq_true_eq, Bool.or_eq_true] at h
+                  obtain ⟨⟨rfl, hgood⟩, hdis⟩ := h
+                  exact ⟨dr, d, fields, size, align, ct, it', off, leaf, off', rfl, rfl, hit, rfl,
+                    ht, (goodAlignBytes_iff ct.size.bytes).mp hgood, hres, hres', hdis⟩
+
+theorem reinitBinOpOk_spec {body : CapturedMir} {t q : Nat} {ps' : List ProjectionElem}
+    {op : MirAst.BinOp} {c : ConstOperand} (h : reinitBinOpOk body t q ps' op c = true) :
+    q ≠ t ∧ translateRelOp op = none ∧
+    ∃ (dq d : LocalDecl) (fields : List (Nat × TupleSpec)) (size align off' : Nat)
+      (it : Gen.IntType) (iop : Gen.IntBinOp) (cbits : Nat),
+      body.localDecls[q]? = some dq ∧ body.localDecls[t]? = some d ∧ intTypeOf dq.ty = some it ∧
+      tupleTypeOf body.layouts d.ty = some (fields, size, align) ∧
+      resolveFieldPath body.layouts (.tuple fields size align) ps' = some (off', .scalar it) ∧
+      0 < it.size.bytes ∧ translateBinOp op = some iop ∧ cbits < 2 ^ (8 * it.size.bytes) ∧
+      translateOperand body.localDecls (.constant c) =
+        some (.Constant (.Int (intFromBits cbits it)) (.Int it)) := by
+  unfold reinitBinOpOk at h
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨⟨⟨hqt, hrel⟩, hbin⟩, h⟩ := h
+  have hrel' : translateRelOp op = none := Option.isNone_iff_eq_none.mp hrel
+  obtain ⟨iop, hiop⟩ := Option.isSome_iff_exists.mp hbin
+  refine ⟨hqt, hrel', ?_⟩
+  cases hdq : body.localDecls[q]? with
+  | none => simp [hdq] at h
+  | some dq =>
+    cases hd : body.localDecls[t]? with
+    | none => simp [hdq, hd] at h
+    | some d =>
+      cases hit : intTypeOf dq.ty with
+      | none => simp [hdq, hd, hit] at h
+      | some it =>
+        cases ht : tupleTypeOf body.layouts d.ty with
+        | none => simp [hdq, hd, hit, ht] at h
+        | some trip =>
+          obtain ⟨fields, size, align⟩ := trip
+          cases hres' : resolveFieldPath body.layouts (.tuple fields size align) ps' with
+          | none => simp [hdq, hd, hit, ht, hres'] at h
+          | some pr' =>
+            obtain ⟨off', leaf'⟩ := pr'
+            cases leaf' with
+            | tuple _ _ _ => simp [hdq, hd, hit, ht, hres'] at h
+            | scalar it' =>
+              obtain ⟨cty, cval⟩ := c
+              cases cval with
+              | scalar cs =>
+                cases cs with
+                | int sc =>
+                  obtain ⟨cbits, csz⟩ := sc
+                  cases hcit : intTypeOf cty with
+                  | none => simp [hdq, hd, hit, ht, hres', hcit] at h
+                  | some ic =>
+                    simp only [hdq, hd, hit, ht, hres', hcit, Bool.and_eq_true, decide_eq_true_eq,
+                      Bool.not_eq_true'] at h
+                    obtain ⟨⟨⟨rfl, hpos⟩, hnb⟩, ⟨rfl, rfl⟩, hcbits⟩ := h
+                    refine ⟨dq, d, fields, size, align, off', _, iop, cbits, rfl, rfl, hit, ht,
+                      hres', hpos, hiop, hcbits, ?_⟩
+                    simp [translateOperand, hnb, hcit, hcbits]
+                | ptr _ _ => simp [hdq, hd, hit, ht, hres'] at h
+              | _ => simp [hdq, hd, hit, ht, hres'] at h
+
+/-- **Sibling read through an integer cast `_r = Cast(IntToInt, copy _t.projs, it)` of a scalar
+field of integer type `it'`, on any allocation bytes `D` whose field slice encodes the field's
+value**: `_r`'s place is evaluated first (a dead `_r` is UB), then the field is loaded, cast to
+`it` (`bring_in_bounds`), and stored into `_r`'s allocation. -/
+theorem evalStatement_castSiblingRead_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
+    {lm : Map Gen.LocalName Ptr} {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
+    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
+    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
+    {D : List Byte} (hD : D.length = size)
+    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
+    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
+    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
+    {off : Nat} {it' : Gen.IntType}
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, .scalar it'))
+    {bits : Nat} (hbits : bits < 2 ^ (8 * it'.size.bytes))
+    (hslice : (D.drop off).take it'.size.bytes = scalarBytes it' bits)
+    {r : Nat} {dr : LocalDecl} (hdr : body.localDecls[r]? = some dr) {it : Gen.IntType}
+    (hit : intTypeOf dr.ty = some it) (hgood : GoodSize it.size.bytes) :
+    (mapGet lm (localName r) = none →
+      evalStatement m (.Assign (.Local (localName r)) (.UnOp (.Cast (.IntToInt it)) (.Load pe))) =
+        .error (.ub "access to a dead local")) ∧
+    (∀ (pr : Ptr) (kr : Nat) (Dr : List Byte), mapGet lm (localName r) = some pr →
+      pr.provenance = some (⟨(kr : Int)⟩, ()) →
+      A[kr]? = some (stackAlloc pr.addr it Dr) → Dr.length = it.size.bytes →
+      ∃ m', evalStatement m
+          (.Assign (.Local (localName r)) (.UnOp (.Cast (.IntToInt it)) (.Load pe))) = .ok m' ∧
+        Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt]
+          (A.set kr (stackAlloc pr.addr it
+            (scalarBytes it (intFromBits bits it' % 2 ^ (8 * it.size.bytes)).toNat)))) := by
+  obtain ⟨hTr, _⟩ := tyOf_int (layouts := body.layouts) hit
+  have hlocr := (hfl.2 r dr hdr).2
+  rw [hTr] at hlocr
+  have hpeEval := evalPlace_field_any h hfl hd ht hrootWf hp hpk haddr0 haddrMax hD hA hpe hres
+  obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
+  have hv : (TupleSpec.scalar it').valOk (.scalar ⟨bits, it'.size.bytes⟩) = true := by
+    simp [TupleSpec.valOk, hbits]
+  obtain ⟨m1, hm1, h1⟩ := typedLoad_ptr_tuple_slice h p k hpk (itOf d body.layouts) D hA off
+    (.scalar it') (.scalar ⟨bits, it'.size.bytes⟩) hleafWf hv
+    (by simp [TupleSpec.size] at hrelBound ⊢; omega) (by simpa [TupleSpec.encodeVal, valBytes,
+      TupleSpec.size] using hslice)
+  simp only [TupleSpec.toMiniRustVal, TupleSpec.toMiniRustTy] at hm1 hpeEval
+  have hpos := two_pow_pos (8 * it.size.bytes)
+  have hlt : (intFromBits bits it' % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+    have h0 := Int.emod_nonneg (intFromBits bits it') (Int.ne_of_gt hpos)
+    have hlt' := Int.emod_lt_of_pos (intFromBits bits it') hpos
+    have : (((intFromBits bits it' % 2 ^ (8 * it.size.bytes)).toNat : Int)) <
+        2 ^ (8 * it.size.bytes) := by
+      rw [Int.toNat_of_nonneg h0]; exact hlt'
+    exact_mod_cast this
+  refine ⟨fun hnone => ?_, fun pr kr Dr hpr hprk hAr hlen => ?_⟩
+  · rw [evalStatement, evalPlace_local_none h r _ hlocr hnone]
+    rfl
+  · have hst := typedStore_ptr_frag h1 pr kr hprk (FragTy.int it hgood) Dr _ hlt hAr hlen
+    refine ⟨withMem m1 (A.set kr (stackAlloc pr.addr it
+      (scalarBytes it (intFromBits bits it' % 2 ^ (8 * it.size.bytes)).toNat)))
+      ⟨.Store, .None, pr.addr, it.size⟩, ?_, withMem_shape h1 _⟩
+    simp only [valOf] at hst
+    simp [evalStatement, evalPlace_local_some h r _ hlocr pr hpr, evalValue, hpeEval, placeLoad,
+      hm1, evalUnOp, evalCastOp, bringInBounds_eq_intFromBits it hgood, placeStore, hst]
+
+/-- **Re-initialization `_t.projs = BinOp(iop, copy _q, const c)` of a scalar field of integer type
+`it` by an integer operation of a distinct integer local `_q` of type `it` and a constant of type
+`it`, on any allocation bytes `D` of `_t`**: `_t.projs` is evaluated first, then `_q` is loaded (a
+dead or uninitialized `_q` is UB), the operation is evaluated (`intBinEval`: UB exactly when it is
+`none`), and the in-bounds result is stored over the field's bytes. -/
+theorem evalStatement_reinitBinOp_any {m : Mach} {ctx : Ctx} {f : Gen.Function}
+    {lm : Map Gen.LocalName Ptr} {blk stmt : Nat} {A : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] A)
+    {body : CapturedMir} (hfl : FnLocalsSpec body f)
+    {t : Nat} {d : LocalDecl} (hd : body.localDecls[t]? = some d)
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (hrootWf : (TupleSpec.tuple fields size align).wf = true)
+    {p : Ptr} (hp : mapGet lm (localName t) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (haddr0 : 0 ≤ p.addr)
+    (haddrMax : p.addr + (size : Int) < 2 ^ 64)
+    {D : List Byte} (hD : D.length = size)
+    (hA : A[k]? = some (stackAlloc p.addr (itOf d body.layouts) D))
+    {projs : List ProjectionElem} {pe : Gen.PlaceExpr}
+    (hpe : translateFieldPlace (.Local (localName t)) projs = some pe)
+    {off : Nat} {it : Gen.IntType}
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) projs = some (off, .scalar it))
+    {q : Nat} {dq : LocalDecl} (hdq : body.localDecls[q]? = some dq)
+    (hitq : intTypeOf dq.ty = some it)
+    {op : MirAst.BinOp} {iop : Gen.IntBinOp} (hiop : translateBinOp op = some iop)
+    (cbits : Nat) :
+    (mapGet lm (localName q) = none →
+      evalStatement m (.Assign pe (.BinOp (.Int iop) (.Load (.Local (localName q)))
+        (.Constant (.Int (intFromBits cbits it)) (.Int it)))) =
+        .error (.ub "access to a dead local")) ∧
+    (∀ (pq : Ptr) (kq : Nat), mapGet lm (localName q) = some pq →
+      pq.provenance = some (⟨(kq : Int)⟩, ()) →
+      A[kq]? = some (stackAlloc pq.addr it (List.replicate it.size.bytes .Uninit)) →
+      ∃ msg, evalStatement m (.Assign pe (.BinOp (.Int iop) (.Load (.Local (localName q)))
+        (.Constant (.Int (intFromBits cbits it)) (.Int it)))) = .error (.ub msg)) ∧
+    (∀ (pq : Ptr) (kq : Nat) (bits : Nat), mapGet lm (localName q) = some pq →
+      pq.provenance = some (⟨(kq : Int)⟩, ()) →
+      bits < 2 ^ (8 * it.size.bytes) →
+      A[kq]? = some (stackAlloc pq.addr it (scalarBytes it bits)) →
+      (intBinEval iop (intFromBits bits it) (intFromBits cbits it) it = none →
+        ∃ msg, evalStatement m (.Assign pe (.BinOp (.Int iop) (.Load (.Local (localName q)))
+          (.Constant (.Int (intFromBits cbits it)) (.Int it)))) = .error (.ub msg)) ∧
+      (∀ z, intBinEval iop (intFromBits bits it) (intFromBits cbits it) it = some z →
+        ∃ m', evalStatement m (.Assign pe (.BinOp (.Int iop) (.Load (.Local (localName q)))
+            (.Constant (.Int (intFromBits cbits it)) (.Int it)))) = .ok m' ∧
+          Shape m' ctx [ctx.caller, calleeFrameL f ctx lm blk stmt]
+            (A.set k (stackAlloc p.addr (itOf d body.layouts)
+              (spliceAt D off (scalarBytes it (z % 2 ^ (8 * it.size.bytes)).toNat)))))) := by
+  obtain ⟨hTq, _⟩ := tyOf_int (layouts := body.layouts) hitq
+  have hlocq := (hfl.2 q dq hdq).2
+  rw [hTq] at hlocq
+  have hpeEval := evalPlace_field_any h hfl hd ht hrootWf hp hpk haddr0 haddrMax hD hA hpe hres
+  obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
+  have hgood : GoodSize it.size.bytes := by
+    simp only [TupleSpec.wf] at hleafWf
+    exact (goodAlignBytes_iff it.size.bytes).mp hleafWf
+  simp only [TupleSpec.toMiniRustTy] at hpeEval
+  refine ⟨fun hnone => ?_, fun pq kq hpq hpqk hAq => ?_, fun pq kq bits hpq hpqk hbits hAq => ?_⟩
+  · simp [evalStatement, hpeEval, evalValue, evalPlace_local_none h q _ hlocq hnone]
+  · have hplaceq := evalPlace_local_some h q _ hlocq pq hpq
+    obtain ⟨msg, hmsg⟩ := typedLoad_ptr_frag_uninit h pq kq hpqk (FragTy.int it hgood) hAq
+    exact ⟨msg, by simp [evalStatement, hpeEval, evalValue, hplaceq, placeLoad, hmsg]⟩
+  · have hplaceq := evalPlace_local_some h q _ hlocq pq hpq
+    obtain ⟨m1, hm1, h1⟩ := typedLoad_ptr_frag h pq kq hpqk (FragTy.int it hgood) bits hbits hAq
+    simp only [valOf] at hm1
+    obtain ⟨hevalOk, hevalNone⟩ :=
+      evalIntBinOp_spec op iop hiop (intFromBits bits it) (intFromBits cbits it) it
+    refine ⟨fun hz => ?_, fun z hz => ?_⟩
+    · obtain ⟨msg, hmsg⟩ := hevalNone hz
+      exact ⟨msg, by simp [evalStatement, hpeEval, evalValue, hplaceq, placeLoad, hm1,
+        evalConstant, evalBinOp, hmsg]⟩
+    · have hpos := two_pow_pos (8 * it.size.bytes)
+      have hlt : (z % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+        have h0 := Int.emod_nonneg z (Int.ne_of_gt hpos)
+        have hlt' := Int.emod_lt_of_pos z hpos
+        have : ((z % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+          rw [Int.toNat_of_nonneg h0]; exact hlt'
+        exact_mod_cast this
+      have hv : (TupleSpec.scalar it).valOk
+          (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) = true := by
+        simp [TupleSpec.valOk, hlt]
+      have hst := typedStore_ptr_tuple_slice h1 p k hpk (itOf d body.layouts) D hA off (.scalar it)
+        (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) hleafWf hv
+        (by simp [TupleSpec.size] at hrelBound ⊢; omega)
+      simp only [TupleSpec.toMiniRustVal, TupleSpec.toMiniRustTy, TupleSpec.encodeVal, valBytes,
+        TupleSpec.size] at hst
+      refine ⟨withMem m1 (A.set k (stackAlloc p.addr (itOf d body.layouts)
+        (spliceAt D off (scalarBytes it (z % 2 ^ (8 * it.size.bytes)).toNat))))
+        ⟨.Store, .None, (offsetPtr p off).addr, ⟨it.size.bytes⟩⟩, ?_, withMem_shape h1 _⟩
+      simp [evalStatement, hpeEval, evalValue, hplaceq, placeLoad, hm1, evalConstant, evalBinOp,
+        hevalOk z hz, bringInBounds_eq_intFromBits it hgood z, placeStore, hst]
+
+/-- **Cast sibling-read step.** While `_t.ps` is a hole, `_r = Cast(IntToInt, copy _t.ps', it)` of a
+disjoint scalar field reads the same bytes from the hole-free machine and from the machine with the
+hole, casts them alike, and stores into `_r`'s allocation, which is not `_t`'s: the hole stays
+open. -/
+theorem step_window_cast_read {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m m0 : Mach} {t : Nat} {ps : List ProjectionElem}
+    (hhole : holeAt body s.frame.blockIdx s.frame.stmtIdx = some (t, ps))
+    (hN0 : StateRelN (eraseDeinit body) f ctx s m0)
+    (hHR : HoleRel body f ctx s.frame.blockIdx s.frame.stmtIdx t ps m0 m)
+    {bb : BasicBlockData} {r : Nat} {ps' : List ProjectionElem} {castTy : MirAst.Ty}
+    {span : String}
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? =
+      some ⟨.assign ⟨r, []⟩ (.cast .intToInt (.copy ⟨t, ps'⟩) castTy), span⟩)
+    (hcsib : castSiblingReadOk body t r ps ps' castTy = true) :
+    StepRelD body f ctx s (stepMirFn body s) (Interp.step m) := by
+  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
+  obtain ⟨hrt, ⟨it'', hopTy⟩, dr, d, fields, size, align, it, it', off0, leaf, off', hdr, hd, hit,
+    hct, ht, hgood, hres, hres', hdis⟩ := castSiblingReadOk_spec hcsib
+  obtain ⟨view, lm, p, k, rootVal, off, sz, hthr0, hlo0, _, hp, hpk, haddr0, haddrMax, hrootWf,
+    hrootVal, hD0, hA0, hrng, hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
+  have hr0 : holeRange body t ps = some (off0, leaf.size) := by
+    simp [holeRange, hd, ht, hres]
+  rw [hr0] at hrng
+  simp only [Option.some.injEq, Prod.mk.injEq] at hrng
+  obtain ⟨hoff, hsz⟩ := hrng
+  subst off0
+  subst sz
+  obtain ⟨_, hrelB0⟩ := resolveFieldPath_wf hrootWf hres
+  have hoffb : off + leaf.size ≤ size := by simpa [TupleSpec.size] using hrelB0
+  obtain ⟨leafVal, _, hleafOk, hslice0, _⟩ := resolveFieldPath_read hrootWf hrootVal hres'
+  cases leafVal with
+  | scalar sc =>
+    have hbits : sc.bits < 2 ^ (8 * it'.size.bytes) := by
+      simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hleafOk
+      exact hleafOk.2
+    simp only [TupleSpec.size, TupleSpec.encodeVal, valBytes] at hslice0
+    have hsliceH : ((spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+        (List.replicate leaf.size .Uninit)).drop off').take it'.size.bytes =
+        scalarBytes it' sc.bits := by
+      rw [spliceAt_drop_take_disjoint _ _ _ _ _ (by rw [List.length_replicate, hD0]; exact hoffb)
+        (by rw [List.length_replicate]; exact hdis)]
+      exact hslice0
+    obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+    obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+    obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+    cases ps' with
+    | nil => simp [resolveFieldPath] at hres'
+    | cons pe0 rest =>
+      cases pe0 with
+      | field idx fTy =>
+        obtain ⟨pe, hpe, rfl⟩ : ∃ pe, translateFieldPlace (.Local (localName t))
+            (.field idx fTy :: rest) = some pe ∧
+            st' = .Assign (.Local (localName r)) (.UnOp (.Cast (.IntToInt it)) (.Load pe)) := by
+          simp only [translateStatement, translatePlace] at hst'
+          cases hp' : translateFieldPlace (.Local (localName t)) (.field idx fTy :: rest) with
+          | none =>
+            simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace] at hst'
+          | some pe =>
+            refine ⟨pe, rfl, ?_⟩
+            simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace, hct,
+              hopTy] at hst'
+            exact hst'.symm
+        have hshape0 : Shape m0 (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+            [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+              calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+                s.frame.blockIdx s.frame.stmtIdx] m0.mem.memory.allocations :=
+          ⟨hthr0, hrel0.active, rfl⟩
+        have hshapeH : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+            [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+              calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+                s.frame.blockIdx s.frame.stmtIdx] m.mem.memory.allocations :=
+          ⟨hthrE.trans hthr0, hactE.trans hrel0.active, rfl⟩
+        have hk_lt : k < m0.mem.memory.allocations.length := (List.getElem?_eq_some_iff.mp hA0).1
+        have hDh : (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+            (List.replicate leaf.size .Uninit)).length = size := by
+          rw [spliceAt_length _ _ _ (by rw [List.length_replicate, hD0]; omega), hD0]
+        have hAh : m.mem.memory.allocations[k]? = some (stackAlloc p.addr (itOf d body.layouts)
+            (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+              (List.replicate leaf.size .Uninit))) := by
+          rw [hallocE]
+          simp [hk_lt]
+        have hfl := FnLocalsSpec.of_translateFn hf
+        obtain ⟨hdead0, hlive0⟩ := evalStatement_castSiblingRead_any (resetPick_shape hshape0) hfl
+          hd ht hrootWf hp hpk haddr0 haddrMax hD0 hA0 hpe hres' hbits hslice0 hdr hit hgood
+        obtain ⟨hdeadH, hliveH⟩ := evalStatement_castSiblingRead_any (resetPick_shape hshapeH) hfl
+          hd ht hrootWf hp hpk haddr0 haddrMax hDh hAh hpe hres' hbits hsliceH hdr hit hgood
+        have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+          have := (List.getElem?_eq_some_iff.mp hst).1
+          rw [hlen]
+          omega
+        have hnd : ∀ st, bb.statements[s.frame.stmtIdx]? = some st →
+            isProjDeinit st = false := by
+          intro st hst2
+          rw [hst] at hst2
+          cases hst2
+          rfl
+        have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
+          (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+        rw [stepMirFn_eraseDeinit_stmt (body := body) hrel0.activeCallee hphase hbb hst rfl]
+        cases hpr : mapGet lm (localName r) with
+        | none =>
+          have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
+            rw [step_callee hshape0 tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hdead0 hpr]
+          have hsH : Interp.step m = .error (.ub "access to a dead local") := by
+            rw [step_callee hshapeH tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hdeadH hpr]
+          rw [hs0] at hNF
+          rw [hsH]
+          exact hNF.toStepRelD
+        | some pr =>
+          have hr_lt : r < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdr).1
+          obtain ⟨slotr, hsVr⟩ : ∃ slot, view[r]? = some slot :=
+            ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact hr_lt)⟩
+          have hscr : scalarTypeOf dr.ty = some (.Int it) := scalarTypeOf_int hit
+          obtain ⟨kr, hprk, _, _, _, _, hAr⟩ := hlo0.storage_nonptr r dr slotr pr hdr hsVr hpr
+            (isPtrTy_false_of_scalarTypeOf hscr)
+          simp only [eraseDeinit_layouts] at hAr
+          obtain ⟨hTr, hIr⟩ := tyOf_int (layouts := body.layouts) hit
+          rw [hIr] at hAr
+          have hlenr : (declSlotData dr slotr body.layouts).length = it.size.bytes := by
+            rw [declSlotData_length (by rw [hTr]; exact hscr), hTr]
+            rfl
+          have hkr : kr ≠ k := by
+            intro hkk
+            subst hkk
+            exact hrt (hlo0.inj r t pr p hpr hp (by rw [hprk, hpk]))
+          have hArH : m.mem.memory.allocations[kr]? =
+              some (stackAlloc pr.addr it (declSlotData dr slotr body.layouts)) := by
+            rw [hallocE, List.getElem?_set_ne (Ne.symm hkr)]
+            exact hAr
+          obtain ⟨m3, hev0, h3⟩ := hlive0 pr kr _ hpr hprk hAr hlenr
+          obtain ⟨m3h, hevH, h3h⟩ := hliveH pr kr _ hpr hprk hArH hlenr
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3
+          obtain ⟨m4h, hm4h, h4h⟩ := bumpStmt_callee h3h
+          have hs0 : Interp.step m0 = .ok m4 := by
+            rw [step_callee hshape0 tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hev0, hm4, check_after h4]
+          have hsH : Interp.step m = .ok m4h := by
+            rw [step_callee hshapeH tb hgetb]
+            simp [hne, listIndex_nat _ _ _ htst, hevH, hm4h, check_after h4h]
+          rw [hs0] at hNF
+          rw [hsH]
+          have hhole' : holeAt body s.frame.blockIdx (s.frame.stmtIdx + 1) = some (t, ps) := by
+            rw [holeAt_succ hbb hst, hhole]
+            simp [holeAfter, hrt]
+          refine StepRelN.toStepRelD_hole hNF h4.threads hhole' hp hpk
+            (by rw [h4.allocs, List.getElem?_set_ne hkr]; exact hA0) hr0
+            (h4h.threads.trans h4.threads.symm) (h4h.active.trans h4.active.symm) ?_
+          rw [h4h.allocs, h4.allocs, hallocE]
+          exact List.set_comm _ _ (Ne.symm hkr)
+      | _ => simp [resolveFieldPath] at hres'
+  | _ => simp [TupleSpec.valOk] at hleafOk
+
+/-- **Binary-operation re-initialization step.** While `_t.ps` is a hole,
+`_t.ps' = BinOp(op, copy _q, const c)` (where `q ≠ t` is an integer local of the leaf's type, `c` a
+constant of the leaf's type, and `ps'` has the hole's byte range) either faults (dead or
+uninitialized `_q`, or a UB operation such as division by zero) in both machines, or stores the same
+result over the hole in both machines, closing the hole and restoring `StateRelN`. -/
+theorem step_window_reinit_binop {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment (eraseDeinit body) = true) (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m m0 : Mach} {t : Nat} {ps : List ProjectionElem}
+    (_hhole : holeAt body s.frame.blockIdx s.frame.stmtIdx = some (t, ps))
+    (hN0 : StateRelN (eraseDeinit body) f ctx s m0)
+    (hHR : HoleRel body f ctx s.frame.blockIdx s.frame.stmtIdx t ps m0 m)
+    {bb : BasicBlockData} {q : Nat} {ps' : List ProjectionElem} {op : MirAst.BinOp}
+    {c : ConstOperand} {span : String}
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? =
+      some ⟨.assign ⟨t, ps'⟩ (.binaryOp op (.copy ⟨q, []⟩) (.constant c)), span⟩)
+    (hrb : reinitBinOpOk body t q ps' op c = true)
+    (hrange : holeRange body t ps' = holeRange body t ps) :
+    StepRelD body f ctx s (stepMirFn body s) (Interp.step m) := by
+  obtain ⟨_, _, hrel0, _, _, _, _⟩ := id hN0
+  obtain ⟨hphase, _, _, _, _, _, _, _, _, _⟩ := inFragment_spec _ hfrag
+  obtain ⟨hqt, hrel, dq, d, fields, size, align, off', it, iop, cbits, hdq, hd, hitq, ht, hres',
+    _, hiop, _, hcop⟩ := reinitBinOpOk_spec hrb
+  obtain ⟨view, lm, p, k, rootVal, off, sz, hthr0, hlo0, _, hp, hpk, haddr0, haddrMax, hrootWf,
+    _, hD0, hA0, hrng, hthrE, hactE, hallocE⟩ := holeLocal_spec hN0 hHR hd ht
+  have hr' : holeRange body t ps' = some (off', it.size.bytes) := by
+    simp [holeRange, hd, ht, hres', TupleSpec.size]
+  rw [hr', hrng] at hrange
+  simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+  obtain ⟨hoff, hsz⟩ := hrange
+  subst off'
+  subst sz
+  obtain ⟨_, hrelBound⟩ := resolveFieldPath_wf hrootWf hres'
+  have hoffb : off + it.size.bytes ≤ size := by simpa [TupleSpec.size] using hrelBound
+  have hopTyQ : operandType body.layouts body.localDecls (.copy ⟨q, []⟩) = some (.Int it) := by
+    simp [operandType, hdq, scalarTypeOf_int hitq]
+  obtain ⟨tb, htb, hgetb⟩ := (translateFn_spec body f hf).2.2 _ bb hbb
+  obtain ⟨hlen, hstspec, _⟩ := translateBlock_spec _ _ bb tb htb
+  obtain ⟨st', hst', htst⟩ := hstspec _ _ hst
+  cases ps' with
+  | nil => simp [resolveFieldPath] at hres'
+  | cons pe0 rest =>
+    cases pe0 with
+    | field idx fTy =>
+      obtain ⟨pe, hpe, rfl⟩ : ∃ pe, translateFieldPlace (.Local (localName t))
+          (.field idx fTy :: rest) = some pe ∧
+          st' = .Assign pe (.BinOp (.Int iop) (.Load (.Local (localName q)))
+            (.Constant (.Int (intFromBits cbits it)) (.Int it))) := by
+        simp only [translateStatement, translatePlace] at hst'
+        cases hp' : translateFieldPlace (.Local (localName t)) (.field idx fTy :: rest) with
+        | none =>
+          simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace] at hst'
+        | some pe =>
+          refine ⟨pe, rfl, ?_⟩
+          simp [hp', copyRv, copyOp, translateRvalue, translateOperand, translatePlace, hrel,
+            hiop, hopTyQ] at hst'
+          simp only [translateOperand] at hcop
+          rw [hcop] at hst'
+          simp at hst'
+          exact hst'.symm
+      have hshape0 : Shape m0 (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+          [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+            calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+              s.frame.blockIdx s.frame.stmtIdx] m0.mem.memory.allocations :=
+        ⟨hthr0, hrel0.active, rfl⟩
+      have hshapeH : Shape m (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows)
+          [(ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows).caller,
+            calleeFrameL f (ctxWithBorrows (eraseDeinit body) ctx s.memory.borrows) lm
+              s.frame.blockIdx s.frame.stmtIdx] m.mem.memory.allocations :=
+        ⟨hthrE.trans hthr0, hactE.trans hrel0.active, rfl⟩
+      have hk_lt : k < m0.mem.memory.allocations.length := (List.getElem?_eq_some_iff.mp hA0).1
+      have hDh : (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+          (List.replicate it.size.bytes .Uninit)).length = size := by
+        rw [spliceAt_length _ _ _ (by rw [List.length_replicate, hD0]; omega), hD0]
+      have hAh : m.mem.memory.allocations[k]? = some (stackAlloc p.addr (itOf d body.layouts)
+          (spliceAt ((TupleSpec.tuple fields size align).encodeVal rootVal) off
+            (List.replicate it.size.bytes .Uninit))) := by
+        rw [hallocE]; simp [hk_lt]
+      have hfl := FnLocalsSpec.of_translateFn hf
+      obtain ⟨hdead0, huninit0, hlive0⟩ := evalStatement_reinitBinOp_any (resetPick_shape hshape0)
+        hfl hd ht hrootWf hp hpk haddr0 haddrMax hD0 hA0 hpe hres' hdq hitq hiop cbits
+      obtain ⟨hdeadH, huninitH, hliveH⟩ := evalStatement_reinitBinOp_any (resetPick_shape hshapeH)
+        hfl hd ht hrootWf hp hpk haddr0 haddrMax hDh hAh hpe hres' hdq hitq hiop cbits
+      have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
+        have := (List.getElem?_eq_some_iff.mp hst).1
+        rw [hlen]; omega
+      have hnd : ∀ st, bb.statements[s.frame.stmtIdx]? = some st → isProjDeinit st = false := by
+        intro st hst2; rw [hst] at hst2; cases hst2; rfl
+      have hNF := step_correspondence_NF (eraseDeinit body) f hfrag
+        (fnLocalsSpec_eraseDeinit hf) ctx s m0 (blk_eraseDeinit hf hbb hnd) hN0
+      rw [stepMirFn_eraseDeinit_stmt (body := body) hrel0.activeCallee hphase hbb hst rfl]
+      cases hpq : mapGet lm (localName q) with
+      | none =>
+        have hs0 : Interp.step m0 = .error (.ub "access to a dead local") := by
+          rw [step_callee hshape0 tb hgetb]
+          simp [hne, listIndex_nat _ _ _ htst, hdead0 hpq]
+        have hsH : Interp.step m = .error (.ub "access to a dead local") := by
+          rw [step_callee hshapeH tb hgetb]
+          simp [hne, listIndex_nat _ _ _ htst, hdeadH hpq]
+        rw [hs0] at hNF
+        rw [hsH]
+        exact hNF.toStepRelD
+      | some pq =>
+        have hq_lt : q < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdq).1
+        obtain ⟨slotq, hsVq⟩ : ∃ slot, view[q]? = some slot :=
+          ⟨_, List.getElem?_eq_getElem (by rw [hlo0.nlocals]; exact hq_lt)⟩
+        have hscq : scalarTypeOf dq.ty = some (.Int it) := scalarTypeOf_int hitq
+        obtain ⟨kq, hpqk, _, _, _, _, hAq⟩ := hlo0.storage_nonptr q dq slotq pq hdq hsVq hpq
+          (isPtrTy_false_of_scalarTypeOf hscq)
+        simp only [eraseDeinit_layouts] at hAq
+        obtain ⟨hTq, hIq⟩ := tyOf_int (layouts := body.layouts) hitq
+        rw [hIq] at hAq
+        have hkq : kq ≠ k := by
+          intro hkk; subst hkk
+          exact hqt (hlo0.inj q t pq p hpq hp (by rw [hpqk, hpk]))
+        have hAqH : m.mem.memory.allocations[kq]? =
+            some (stackAlloc pq.addr it (declSlotData dq slotq body.layouts)) := by
+          rw [hallocE, List.getElem?_set_ne (Ne.symm hkq)]; exact hAq
+        have hslotq := (DeclSlotOk_of_scalarTypeOf hscq slotq).mp (hlo0.slots q dq slotq hdq hsVq)
+        simp only [eraseDeinit_layouts] at hslotq
+        rw [hTq] at hslotq
+        obtain ⟨hleafWf, _⟩ := resolveFieldPath_wf hrootWf hres'
+        have hgood : GoodSize it.size.bytes := by
+          simp only [TupleSpec.wf] at hleafWf
+          exact (goodAlignBytes_iff it.size.bytes).mp hleafWf
+        have hfragd : FragTy (tyOf dq body.layouts) (itOf dq body.layouts) :=
+          fragTy_of_scalarTypeOf hscq (FragTy.int it hgood)
+        rw [hfragd.declSlotData, hIq] at hAq hAqH
+        match slotq, hslotq, hAq, hAqH with
+        | .dead, _, hAq, hAqH =>
+          obtain ⟨msg0, hev0⟩ := huninit0 pq kq hpq hpqk hAq
+          obtain ⟨msgH, hevH⟩ := huninitH pq kq hpq hpqk hAqH
+          have hs0 : Interp.step m0 = .error (.ub msg0) := by
+            rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+          have hsH : Interp.step m = .error (.ub msgH) := by
+            rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+          rw [hs0] at hNF; rw [hsH]
+          exact hNF.toStepRelD_ub
+        | .uninit, _, hAq, hAqH =>
+          obtain ⟨msg0, hev0⟩ := huninit0 pq kq hpq hpqk hAq
+          obtain ⟨msgH, hevH⟩ := huninitH pq kq hpq hpqk hAqH
+          have hs0 : Interp.step m0 = .error (.ub msg0) := by
+            rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+          have hsH : Interp.step m = .error (.ub msgH) := by
+            rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+          rw [hs0] at hNF; rw [hsH]
+          exact hNF.toStepRelD_ub
+        | .init (.scalar sc), ⟨_, hbits⟩, hAq, hAqH =>
+          obtain ⟨hub0, hok0⟩ := hlive0 pq kq sc.bits hpq hpqk hbits hAq
+          obtain ⟨hubH, hokH⟩ := hliveH pq kq sc.bits hpq hpqk hbits hAqH
+          cases hz : intBinEval iop (intFromBits sc.bits it) (intFromBits cbits it) it with
+          | none =>
+            obtain ⟨msg0, hev0⟩ := hub0 hz
+            obtain ⟨msgH, hevH⟩ := hubH hz
+            have hs0 : Interp.step m0 = .error (.ub msg0) := by
+              rw [step_callee hshape0 tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hev0]
+            have hsH : Interp.step m = .error (.ub msgH) := by
+              rw [step_callee hshapeH tb hgetb]; simp [hne, listIndex_nat _ _ _ htst, hevH]
+            rw [hs0] at hNF; rw [hsH]
+            exact hNF.toStepRelD_ub
+          | some z =>
+            obtain ⟨m3, hev0, h3⟩ := hok0 z hz
+            obtain ⟨m3h, hevH, h3h⟩ := hokH z hz
+            have hwlen : (scalarBytes it (z % 2 ^ (8 * it.size.bytes)).toNat).length =
+                it.size.bytes := by
+              simp [scalarBytes, leBytes_length]
+            rw [spliceAt_same _ off _ _ (by rw [List.length_replicate, hD0]; omega)
+              (by rw [List.length_replicate, hwlen]), hallocE, List.set_set] at h3h
+            obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3
+            obtain ⟨m4h, hm4h, h4h⟩ := bumpStmt_callee h3h
+            have hs0 : Interp.step m0 = .ok m4 := by
+              rw [step_callee hshape0 tb hgetb]
+              simp [hne, listIndex_nat _ _ _ htst, hev0, hm4, check_after h4]
+            have hsH : Interp.step m = .ok m4h := by
+              rw [step_callee hshapeH tb hgetb]
+              simp [hne, listIndex_nat _ _ _ htst, hevH, hm4h, check_after h4h]
+            rw [hs0] at hNF; rw [hsH]
+            exact StepRelN.toStepRelD_obs hNF (h4h.threads.trans h4.threads.symm)
+              (h4h.active.trans h4.active.symm) (h4h.allocs.trans h4.allocs.symm)
+        | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _, _ =>
+          nomatch htyT
+    | _ => simp [resolveFieldPath] at hres'
+
 /-! ## The correspondence theorem for `inFragmentD` -/
 
 /-- **Correspondence theorem for projected `Deinit` (one step, preserving `StateRelD`).**
@@ -1972,6 +2653,40 @@ theorem step_correspondence_D (body : CapturedMir) (f : Gen.Function)
             obtain ⟨⟨rfl, hre⟩, hrange⟩ := hw
             exact step_window_reinit hfrag hf hhole hN0 hHR hbb hst hre hrange
         | move _ => simp [windowStmtOk] at hw
+      | cast ck op castTy =>
+        cases ck with
+        | intToInt =>
+          cases op with
+          | copy q =>
+            obtain ⟨t', ps'⟩ := q
+            cases rproj with
+            | nil =>
+              cases ps' with
+              | nil => simp [windowStmtOk] at hw
+              | cons qp qps =>
+                simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq] at hw
+                obtain ⟨rfl, hcsib⟩ := hw
+                exact step_window_cast_read hfrag hf hhole hN0 hHR hbb hst hcsib
+            | cons _ _ => simp [windowStmtOk] at hw
+          | _ => simp [windowStmtOk] at hw
+        | _ => simp [windowStmtOk] at hw
+      | binaryOp bop a b =>
+        cases rproj with
+        | nil => simp [windowStmtOk] at hw
+        | cons rp rps =>
+          cases a with
+          | copy qa =>
+            obtain ⟨q, qproj⟩ := qa
+            cases qproj with
+            | nil =>
+              cases b with
+              | constant c =>
+                simp only [windowStmtOk, Bool.and_eq_true, decide_eq_true_eq] at hw
+                obtain ⟨⟨rfl, hrb⟩, hrange⟩ := hw
+                exact step_window_reinit_binop hfrag hf hhole hN0 hHR hbb hst hrb hrange
+              | _ => simp [windowStmtOk] at hw
+            | cons _ _ => simp [windowStmtOk] at hw
+          | _ => simp [windowStmtOk] at hw
       | _ => simp [windowStmtOk] at hw
     | _ => simp [windowStmtOk] at hw
 
