@@ -2966,18 +2966,21 @@ unwinds. An aborting callee yields `.ret .abort`, which the panic detector does
 not count as a panic.
 -/
 theorem fmtPanic_total_refuted_along_returned_and_panicked :
-    ¬ ({ body := fmtPanicMir
-         pre := fun args mem => args = [] ∧ mem = emptyMemory
-         post := fun _ _ _ _ => True } : TotalClaim).holds ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 16
+        fmtPanicMir (initMachineStateWithMemory fmtPanicMir [] emptyMemory) =
+      true ∧
+    reachesPanicAcrossCallsBounded (fun req => .panicked req.memory) 16
+        fmtPanicMir (initMachineStateWithMemory fmtPanicMir [] emptyMemory) =
+      true ∧
     ¬ ({ body := fmtPanicMir
          pre := fun args mem => args = [] ∧ mem = emptyMemory
          post := fun _ _ _ _ => True } : TotalClaim).holds ∧
     reachesPanicAcrossCallsBounded (fun _ => .aborted) 16 fmtPanicMir
         (initMachineStateWithMemory fmtPanicMir [] emptyMemory) = false :=
-  ⟨refuteTotalClaimByBoundedPanicAcrossCalls _ 16 [] emptyMemory ⟨rfl, rfl⟩
-      (fun req => .returned .unit req.memory),
+  ⟨rfl,
+   rfl,
    refuteTotalClaimByBoundedPanicAcrossCalls _ 16 [] emptyMemory ⟨rfl, rfl⟩
-      (fun req => .panicked req.memory),
+     (fun req => .panicked req.memory),
    rfl⟩
 
 /--
@@ -3087,8 +3090,13 @@ theorem extCallReturns_modular_safe_panic_rejected :
     reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
         extCallReturnsMir
         (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
-      false := by
-  refine ⟨fun h_all => ?_, rfl⟩
+      false ∧
+    ¬ ({ body := extCallReturnsMir
+         pre := fun args mem => args = [] ∧ mem = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds := by
+  refine ⟨fun h_all => ?_, rfl,
+    refuteTotalClaimByBoundedPanicAcrossCalls _ 8 [] emptyMemory ⟨rfl, rfl⟩
+      (fun req => .panicked req.memory)⟩
   have h_true := h_all MirCallAnswerStream.unitEmpty
   have h_false :
       reachesModularSafePanicExecBounded 8 extCallReturnsMir

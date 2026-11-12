@@ -2640,16 +2640,33 @@ mod tests {
     }
 
     /// Collect the string literals compared by `stringEq` inside the body of
-    /// each Lean definition `def <name> ` in `lean_src`, up to the next
-    /// documentation comment.
+    /// each Lean definition `def <name> ` in `lean_src`, stopping at the next
+    /// top-level declaration or doc comment.
     fn trusted_string_eq_literals(lean_src: &str, names: &[&str]) -> BTreeSet<String> {
+        const TOP_LEVEL_BOUNDARIES: &[&str] = &[
+            "\n/--",
+            "\n@[",
+            "\ndef ",
+            "\nprivate ",
+            "\nabbrev ",
+            "\ntheorem ",
+            "\ninductive ",
+            "\nstructure ",
+            "\nend ",
+        ];
         let mut literals = BTreeSet::new();
         for name in names {
+            let pat = format!("def {name} ");
             let start = lean_src
-                .find(&format!("def {name} "))
-                .unwrap_or_else(|| panic!("missing `def {name}` in Terminators.lean"));
-            let body = &lean_src[start..];
-            let body = &body[..body.find("\n/--").unwrap_or(body.len())];
+                .find(&pat)
+                .unwrap_or_else(|| panic!("missing `{pat}` in Terminators.lean"));
+            let after_header = &lean_src[start + pat.len()..];
+            let end_offset = TOP_LEVEL_BOUNDARIES
+                .iter()
+                .filter_map(|marker| after_header.find(marker))
+                .min()
+                .unwrap_or(after_header.len());
+            let body = &after_header[..end_offset];
             for line in body.lines() {
                 let Some(pos) = line.find("stringEq ") else {
                     continue;
