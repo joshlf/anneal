@@ -21164,13 +21164,18 @@ their syntactic and borrow-free operational requirements:
    Syntactically pure MIR with no index-order CFG back-edges
    (`hasCfgBackedge body = false`). Under the borrow-free layer
    (`checkBorrowFreeBodyFragment .pureLoopFree body`), equals
-   `checkPureMir body && !hasCfgBackedge body` and discharges in a single pass
-   via `Anneal.MirLiftCore` (`checkMirLiftDagReady`).
+   `checkPureMir body && !hasCfgBackedge body`. When paired with runtime-phase
+   and non-cleanup checks (`Anneal.MirLiftCore.checkMirLiftDagReady`), certifies
+   strictly forward CFG transitions (`cfgEdge_lt_of_mirLiftDagReady`) and
+   loop-rank-free backwards topological `LiftBlock` induction
+   (`liftBlock_of_mirLiftDagReady_induct`).
 2. **`MirFragment.pureBoundedLoop`** (`1`):
    Syntactically pure MIR permitting arbitrary pure `goto` / `switchInt` /
    `assert` / `drop` control-flow loops. Under the borrow-free layer
    (`checkBorrowFreeBodyFragment .pureBoundedLoop body`), equals
-   `Anneal.PureMirExec.checkPureMir body` and discharges via `Anneal.MirLoops`
+   `Anneal.PureMirExec.checkPureMir body`, enabling loop convergence proofs via
+   `Anneal.MirLoops` (`mirWpConverges_whileRank` / `mirWpConverges_forRangeUp`)
+   and the alias-erased loop bridges in `Anneal.MirLiftCore`
    (`checkMirLoopLiftReady` / `mirWpConverges_of_mirLoopLiftReady`).
 3. **`MirFragment.treeBorrowsLocal`** (`2`):
    Extends `.pureBoundedLoop` with local references (`Rvalue.ref`), raw pointers
@@ -21216,7 +21221,7 @@ inductive MirFragment : Type where
 
 /--
 Fail-closed default: an unclassified body is only claimed to belong to `.fullMir`
-(matching `MirFragment::default()` in `crates/cargo-anneal/src/scaffold.rs`).
+(canonical fail-closed default for downstream Rust fragment classification).
 -/
 instance : Inhabited MirFragment := ⟨.fullMir⟩
 
@@ -21227,7 +21232,7 @@ namespace MirFragment
 theorem default_eq_fullMir : (default : MirFragment) = .fullMir :=
   rfl
 
-/-- Canonical `snake_case` identifier matching `.anneal/spec-lock.json` (`mir_fragment`). -/
+/-- Canonical `snake_case` identifier for serialized fragment metadata (e.g., `.anneal/spec-lock.json` target tag). -/
 @[simp]
 def asStr : MirFragment → String
   | .pureLoopFree => "pure_loop_free"
@@ -21236,7 +21241,7 @@ def asStr : MirFragment → String
   | .intrinsicCopy => "intrinsic_copy"
   | .fullMir => "full_mir"
 
-/-- Canonical qualified Lean constructor name emitted by `cargo-anneal`. -/
+/-- Canonical qualified Lean constructor string for generated obligation modules. -/
 @[simp]
 def leanCtor : MirFragment → String
   | .pureLoopFree => "MirFragment.pureLoopFree"
@@ -21341,20 +21346,16 @@ instance : DecidableRel (α := MirFragment) (· < ·) :=
   fun a b => Nat.decLt a.toRank b.toRank
 
 /-- Bottom element of the `MirFragment` lattice (`.pureLoopFree`). -/
-@[simp]
 def bot : MirFragment := .pureLoopFree
 
 /-- Top element of the `MirFragment` lattice (`.fullMir`). -/
-@[simp]
 def top : MirFragment := .fullMir
 
 /-- Least upper bound (`a ⊔ b`) in the `MirFragment` lattice. -/
-@[simp]
 def join (a b : MirFragment) : MirFragment :=
   if a ≤ b then b else a
 
 /-- Greatest lower bound (`a ⊓ b`) in the `MirFragment` lattice. -/
-@[simp]
 def meet (a b : MirFragment) : MirFragment :=
   if a ≤ b then a else b
 
@@ -21404,9 +21405,15 @@ theorem lt_of_lt_of_le {a b c : MirFragment} (hab : a < b) (hbc : b ≤ c) : a <
 theorem lt_of_le_of_lt {a b c : MirFragment} (hab : a ≤ b) (hbc : b < c) : a < c :=
   Nat.lt_of_le_of_lt hab hbc
 
+@[simp]
 theorem bot_le (a : MirFragment) : bot ≤ a := by
   cases a <;> decide
 
+@[simp]
+theorem pureLoopFree_le (a : MirFragment) : .pureLoopFree ≤ a := by
+  cases a <;> decide
+
+@[simp]
 theorem le_top (a : MirFragment) : a ≤ top := by
   cases a <;> decide
 
@@ -21428,6 +21435,7 @@ theorem join_comm (a b : MirFragment) : a.join b = b.join a := by
 theorem join_assoc (a b c : MirFragment) : (a.join b).join c = a.join (b.join c) := by
   cases a <;> cases b <;> cases c <;> rfl
 
+@[simp]
 theorem join_idem (a : MirFragment) : a.join a = a := by
   cases a <;> rfl
 
@@ -21440,11 +21448,27 @@ theorem join_bot (a : MirFragment) : a.join bot = a := by
   cases a <;> rfl
 
 @[simp]
+theorem pureLoopFree_join (a : MirFragment) : MirFragment.pureLoopFree.join a = a := by
+  cases a <;> rfl
+
+@[simp]
+theorem join_pureLoopFree (a : MirFragment) : a.join .pureLoopFree = a := by
+  cases a <;> rfl
+
+@[simp]
 theorem top_join (a : MirFragment) : top.join a = top := by
   cases a <;> rfl
 
 @[simp]
 theorem join_top (a : MirFragment) : a.join top = top := by
+  cases a <;> rfl
+
+@[simp]
+theorem fullMir_join (a : MirFragment) : MirFragment.fullMir.join a = .fullMir := by
+  cases a <;> rfl
+
+@[simp]
+theorem join_fullMir (a : MirFragment) : a.join .fullMir = .fullMir := by
   cases a <;> rfl
 
 theorem meet_le_left (a b : MirFragment) : a.meet b ≤ a := by
@@ -21465,6 +21489,7 @@ theorem meet_comm (a b : MirFragment) : a.meet b = b.meet a := by
 theorem meet_assoc (a b c : MirFragment) : (a.meet b).meet c = a.meet (b.meet c) := by
   cases a <;> cases b <;> cases c <;> rfl
 
+@[simp]
 theorem meet_idem (a : MirFragment) : a.meet a = a := by
   cases a <;> rfl
 
@@ -21477,11 +21502,27 @@ theorem meet_bot (a : MirFragment) : a.meet bot = bot := by
   cases a <;> rfl
 
 @[simp]
+theorem pureLoopFree_meet (a : MirFragment) : MirFragment.pureLoopFree.meet a = .pureLoopFree := by
+  cases a <;> rfl
+
+@[simp]
+theorem meet_pureLoopFree (a : MirFragment) : a.meet .pureLoopFree = .pureLoopFree := by
+  cases a <;> rfl
+
+@[simp]
 theorem top_meet (a : MirFragment) : top.meet a = a := by
   cases a <;> rfl
 
 @[simp]
 theorem meet_top (a : MirFragment) : a.meet top = a := by
+  cases a <;> rfl
+
+@[simp]
+theorem fullMir_meet (a : MirFragment) : MirFragment.fullMir.meet a = a := by
+  cases a <;> rfl
+
+@[simp]
+theorem meet_fullMir (a : MirFragment) : a.meet .fullMir = a := by
   cases a <;> rfl
 
 theorem join_meet_self (a b : MirFragment) : a.join (a.meet b) = a := by
@@ -21498,14 +21539,21 @@ theorem meet_join_distrib_left (a b c : MirFragment) :
     a.meet (b.join c) = (a.meet b).join (a.meet c) := by
   cases a <;> cases b <;> cases c <;> rfl
 
-end MirFragment
+/-- Kernel-checked `simp`-set confluence regression over `bot`, `top`, `join`, and `meet`. -/
+theorem simp_confluence (a : MirFragment) :
+    bot.join a = a ∧
+    a.join bot = a ∧
+    top.join a = top ∧
+    a.join top = top ∧
+    bot.meet a = bot ∧
+    a.meet bot = bot ∧
+    top.meet a = a ∧
+    a.meet top = a ∧
+    a.join a = a ∧
+    a.meet a = a := by
+  simp
 
-export MirFragment (
-  toRank_injective le_refl le_trans le_antisymm le_total lt_iff_le_not_le
-  bot_le le_top
-  le_join_left le_join_right join_le join_le_iff join_comm join_assoc join_idem
-  meet_le_left meet_le_right le_meet le_meet_iff meet_comm meet_assoc meet_idem
-)
+end MirFragment
 
 /-! ### 11B. CFG Successor Extraction, Back-Edge Analysis & DAG Acyclicity -/
 
@@ -22046,8 +22094,8 @@ def checkBlockFragment (f : MirFragment) (bb : BasicBlockData) : Bool :=
 
 /--
 Computable $O(|B|)$ syntactic fragment membership checker over `body.basicBlocks`
-(1-to-1 with `crates/cargo-anneal`'s `basicBlocks` scanner and invariant under
-arbitrary `CapturedMir.instantiate`):
+(the `basicBlocks`-only syntactic specification targeted by Episode 2's Rust
+fragment scanner, invariant under arbitrary `CapturedMir.instantiate`):
 - For `.pureLoopFree`, requires every basic block to satisfy
   `checkBlockFragment .pureLoopFree` AND `hasCfgBackedge body = false`.
 - For all `f ≥ .pureBoundedLoop`, requires every basic block to satisfy
@@ -22764,8 +22812,8 @@ def minBlockFragment (bb : BasicBlockData) : MirFragment :=
     (minTerminatorFragment bb.terminator.kind)
 
 /--
-Single-pass bottom-up syntactic fragment inference over `body : CapturedMir`,
-mirroring `scan_captured_mir_body` in `crates/cargo-anneal/src/scaffold.rs`.
+Single-pass bottom-up syntactic fragment inference over `body : CapturedMir`
+(canonical reference fold for Episode 2's single-pass Rust body scanner).
 -/
 def inferMinFragmentSinglePass (body : CapturedMir) : MirFragment :=
   let blocksFrag := joinList minBlockFragment body.basicBlocks
@@ -24257,15 +24305,14 @@ theorem inferMinFragmentSinglePass_instantiate
     inferMinFragmentSinglePass_eq_inferMinFragment,
     inferMinFragment_instantiate]
 
-@[simp]
-theorem BasicBlockData.instantiateList_length
+private theorem instantiateList_list_length
     (tbl : LayoutTable) (args : TypeSubst) :
     ∀ (bbs : List BasicBlockData),
       (BasicBlockData.instantiateList tbl args bbs).length = bbs.length
   | [] => rfl
-  | _ :: rest => by
-    simp only [BasicBlockData.instantiateList, List.length_cons,
-      BasicBlockData.instantiateList_length tbl args rest]
+  | bb :: rest => by
+    dsimp only [BasicBlockData.instantiateList, List.length_cons]
+    rw [instantiateList_list_length tbl args rest]
 
 @[simp]
 theorem hasBlockRankViolation_instantiate
@@ -24292,7 +24339,7 @@ theorem hasRankViolation_instantiate
     (rank : Nat → Nat) (body : CapturedMir) (args : TypeSubst) :
     hasRankViolation rank (body.instantiate args) = hasRankViolation rank body := by
   dsimp only [CapturedMir.instantiate, hasRankViolation]
-  rw [BasicBlockData.instantiateList_length, hasRankViolationAux_instantiate]
+  rw [instantiateList_list_length, hasRankViolationAux_instantiate]
 
 @[simp]
 theorem cfgEdgeListAux_instantiate
@@ -24312,7 +24359,7 @@ theorem cfgEdgeList_instantiate
     (body : CapturedMir) (args : TypeSubst) :
     cfgEdgeList (body.instantiate args) = cfgEdgeList body := by
   dsimp only [CapturedMir.instantiate, cfgEdgeList]
-  rw [BasicBlockData.instantiateList_length, cfgEdgeListAux_instantiate]
+  rw [instantiateList_list_length, cfgEdgeListAux_instantiate]
 
 @[simp]
 theorem dagRanks_instantiate
@@ -24321,7 +24368,7 @@ theorem dagRanks_instantiate
   unfold dagRanks
   rw [cfgEdgeList_instantiate]
   dsimp only [CapturedMir.instantiate]
-  rw [BasicBlockData.instantiateList_length]
+  rw [instantiateList_list_length]
 
 @[simp]
 theorem dagRank_instantiate
@@ -24350,6 +24397,8 @@ theorem isCfgDag_instantiate
 
 /-! ### 11I. Concrete `CapturedMir` Witnesses & `rfl` Regression Theorems -/
 
+namespace MirFragment.Witness
+
 private def dummyU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
 
 private def dummyU32Layout : TypeLayout := {
@@ -24372,9 +24421,9 @@ private def dummyFnAbi : FnAbi := {
 Shared non-`basicBlocks` fields of the synthetic witness bodies below. Every
 witness is written as `{ protoBase with defPath := .., basicBlocks := [..] }`
 with a fully inline `basicBlocks` literal (no helper identifiers and no blank
-lines inside the definition), so downstream Rust witness-parity tests can
-classify the verbatim text of each witness against the kernel-checked
-`inferMinFragment` / `hasCfgBackedge` theorems in this section.
+lines inside the definition) so Episode 2's Rust witness-parity test can extract
+and classify the verbatim text of each witness against the kernel-checked
+`inferMinFragment` / `hasCfgBackedge` theorems in this namespace.
 -/
 private def protoBase : CapturedMir := {
   defPath := "proto::base"
@@ -24677,11 +24726,16 @@ def witnessAlignedAndInterpCharDefPath : CapturedMir :=
 
 /--
 Call-free `CastKind.pointerExposeProvenance` witness (`.fullMir`): exposing
-pointer provenance escalates a single-block call-free body to `.fullMir`.
+pointer provenance (`_2 : *const u8` -> `_1 : usize`) escalates a single-block
+call-free body to `.fullMir`.
 -/
 def witnessExposeProvenanceCast : CapturedMir :=
   { protoBase with
     defPath := "proto::witness_expose_provenance_cast"
+    localDecls :=
+      [{ mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none },
+       { mutability := .mut, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := none },
+       { mutability := .not, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }, debugName := none }]
     basicBlocks :=
       [{ statements :=
            [{ kind := .assign { local_ := 1, projection := [] }
@@ -24693,12 +24747,16 @@ def witnessExposeProvenanceCast : CapturedMir :=
 
 /--
 Call-free `CastKind.pointerWithExposedProvenance` witness (`.fullMir`):
-reconstructing a pointer from an exposed address escalates a single-block
-call-free body to `.fullMir`.
+reconstructing a pointer from an exposed address (`_2 : usize` -> `_1 : *const u8`)
+escalates a single-block call-free body to `.fullMir`.
 -/
 def witnessWithExposedProvenanceCast : CapturedMir :=
   { protoBase with
     defPath := "proto::witness_with_exposed_provenance_cast"
+    localDecls :=
+      [{ mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none },
+       { mutability := .mut, ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }, debugName := none },
+       { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := none }]
     basicBlocks :=
       [{ statements :=
            [{ kind := .assign { local_ := 1, projection := [] }
@@ -24938,5 +24996,25 @@ theorem prototypeGuard_fromStr?_leading_space_none :
 
 theorem prototypeGuard_default_eq_fullMir :
     ((default : MirFragment) == .fullMir) = true := rfl
+
+end MirFragment.Witness
+
+protected abbrev witnessExposeProvenanceCast : CapturedMir :=
+  MirFragment.Witness.witnessExposeProvenanceCast
+
+protected theorem inferMinFragment_witnessExposeProvenanceCast :
+    inferMinFragment MirFragment.Witness.witnessExposeProvenanceCast = .fullMir :=
+  rfl
+
+protected abbrev witnessPtrRelAssign : CapturedMir :=
+  MirFragment.Witness.witnessPtrRelAssign
+
+protected theorem inferMinFragment_witnessPtrRelAssign :
+    inferMinFragment MirFragment.Witness.witnessPtrRelAssign = .pureLoopFree :=
+  rfl
+
+protected theorem inferBorrowFreeMinFragment_witnessPtrRelAssign :
+    inferBorrowFreeMinFragment MirFragment.Witness.witnessPtrRelAssign = .treeBorrowsLocal :=
+  rfl
 
 end Anneal.PureMirExec

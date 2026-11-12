@@ -5045,6 +5045,29 @@ theorem checkMirLoopLiftReady_iff (body : CapturedMir) :
   unfold checkMirLoopLiftReady
   simp only [Bool.and_eq_true, and_assoc]
 
+/--
+Exact lattice characterization of `checkMirLiftReady` in terms of
+`inferBorrowFreeMinFragment body ≤ .pureBoundedLoop`.
+-/
+theorem checkMirLiftReady_iff_inferBorrowFreeMinFragment (body : CapturedMir) :
+    checkMirLiftReady body = true ↔
+      inferBorrowFreeMinFragment body ≤ .pureBoundedLoop ∧
+      isMirLiftPhase body = true ∧
+      hasNoCleanupBlocks body = true := by
+  rw [checkMirLiftReady_iff, inferBorrowFreeMinFragment_le_pureBoundedLoop_iff_checkPureMir]
+
+/--
+Exact lattice characterization of `checkMirLiftDagReady` in terms of
+`inferBorrowFreeMinFragment body = .pureLoopFree`.
+-/
+theorem checkMirLiftDagReady_iff_inferBorrowFreeMinFragment (body : CapturedMir) :
+    checkMirLiftDagReady body = true ↔
+      inferBorrowFreeMinFragment body = .pureLoopFree ∧
+      isMirLiftPhase body = true ∧
+      hasNoCleanupBlocks body = true := by
+  rw [checkMirLiftDagReady_iff, inferBorrowFreeMinFragment_eq_pureLoopFree_iff]
+  simp only [and_assoc]
+
 /-- Every DAG-ready body (`checkMirLiftDagReady`) is lift-ready (`checkMirLiftReady`). -/
 theorem checkMirLiftReady_of_dagReady {body : CapturedMir}
     (h : checkMirLiftDagReady body = true) :
@@ -5214,6 +5237,39 @@ theorem no_cfg_cycle_of_mirLiftDagReady {body : CapturedMir}
     ¬ CfgPath body u u :=
   no_cfg_cycle_of_hasCfgBackedge_false (hasCfgBackedge_false_of_mirLiftDagReady h) u
 
+/--
+Every directed CFG edge `u → v` in a DAG-ready body (`checkMirLiftDagReady body = true`)
+strictly increases basic-block index (`u < v`).
+-/
+theorem cfgEdge_lt_of_mirLiftDagReady {body : CapturedMir} {u v : BasicBlockIdx}
+    (h : checkMirLiftDagReady body = true)
+    (h_edge : CfgEdge body u v) :
+    u < v :=
+  cfgEdge_lt_of_hasCfgBackedge_false (hasCfgBackedge_false_of_mirLiftDagReady h) h_edge
+
+/--
+Every non-empty directed CFG path `u →⁺ v` in a DAG-ready body strictly increases
+basic-block index (`u < v`).
+-/
+theorem cfgPath_lt_of_mirLiftDagReady {body : CapturedMir} {u v : BasicBlockIdx}
+    (h : checkMirLiftDagReady body = true)
+    (h_path : CfgPath body u v) :
+    u < v :=
+  cfgPath_lt_of_hasCfgBackedge_false (hasCfgBackedge_false_of_mirLiftDagReady h) h_path
+
+/--
+Every outgoing successor `succ ∈ blockTargets bb` of an in-bounds block
+`Trusted.Sequence.get? body.basicBlocks bbIdx = some bb` in a DAG-ready body
+strictly increases basic-block index (`bbIdx < succ`).
+-/
+theorem blockTarget_lt_of_mirLiftDagReady
+    {body : CapturedMir} {bbIdx succ : BasicBlockIdx} {bb : BasicBlockData}
+    (h : checkMirLiftDagReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_succ : succ ∈ blockTargets bb) :
+    bbIdx < succ :=
+  cfgEdge_lt_of_mirLiftDagReady h ⟨bb, h_bb, h_succ⟩
+
 /-- Extract `isMirLiftPhase body = true` from `checkMirLiftDagReady body = true`. -/
 theorem isMirLiftPhase_of_mirLiftDagReady {body : CapturedMir}
     (h : checkMirLiftDagReady body = true) :
@@ -5351,6 +5407,122 @@ theorem lift_PureMirConverges_of_inferMinFragment_le_pureBoundedLoop
     h_lift
 
 /--
+**Backwards Topological DAG Lifting (`liftBlock_of_mirLiftDagReady_induct`)**:
+Because `checkMirLiftDagReady body = true` enforces `hasCfgBackedge body = false`,
+every CFG edge `bbIdx → succ` strictly increases block index (`bbIdx < succ`) and
+therefore strictly decreases `body.basicBlocks.length - bbIdx`. A caller can lift
+an arbitrary multi-block branching DAG from entry block `0` by giving a block
+invariant `BlockInv : BasicBlockIdx → PureEnv → Prop` and stepping each block to
+its outgoing `CfgEdge` successors—requiring neither manual fuel arithmetic nor a
+user-supplied ranking function.
+-/
+theorem liftBlock_of_mirLiftDagReady_induct
+    {body : CapturedMir} {env₀ : PureEnv} {post : Value → Prop}
+    (h_ready : checkMirLiftDagReady body = true)
+    (BlockInv : BasicBlockIdx → PureEnv → Prop)
+    (h_init : BlockInv 0 env₀)
+    (h_step : ∀ bbIdx env, BlockInv bbIdx env →
+      (∀ succ env', CfgEdge body bbIdx succ → BlockInv succ env' →
+        ∃ fuel, LiftBlock body succ env' post fuel) →
+      ∃ fuel, LiftBlock body bbIdx env post fuel) :
+    ∃ fuel, LiftBlock body 0 env₀ post fuel := by
+  have h_gen :
+      ∀ d bbIdx env,
+        body.basicBlocks.length - bbIdx = d →
+        BlockInv bbIdx env →
+        ∃ fuel, LiftBlock body bbIdx env post fuel := by
+    apply nat_strong_induction
+      (fun d => ∀ bbIdx env,
+        body.basicBlocks.length - bbIdx = d →
+        BlockInv bbIdx env →
+        ∃ fuel, LiftBlock body bbIdx env post fuel)
+    intro d ih bbIdx env h_eq h_inv
+    refine h_step bbIdx env h_inv (fun succ env' h_edge h_succ_inv => ?_)
+    have h_u_lt : bbIdx < body.basicBlocks.length := lt_length_of_cfgEdge h_edge
+    have h_edge_lt : bbIdx < succ := cfgEdge_lt_of_mirLiftDagReady h_ready h_edge
+    have h_sub_lt : body.basicBlocks.length - succ < d := by omega
+    exact ih (body.basicBlocks.length - succ) h_sub_lt succ env' rfl h_succ_inv
+  exact h_gen (body.basicBlocks.length - 0) 0 env₀ rfl h_init
+
+/--
+Readiness-discharged `cons_eval` step rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.cons_eval_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) :=
+  LiftStmtsTerminator.cons_eval
+    (lookup_cleanup_false_of_mirLiftReady h_ready h_bb)
+    (phase_of_mirLiftReady h_ready)
+    h_get
+    h_eval
+    h_next
+
+/--
+Readiness-discharged `cons` (`LiftStmt`) step rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.cons_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_stmt : LiftStmt body bbIdx stmtIdx env stmt (fun e => e = env'))
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) :=
+  LiftStmtsTerminator.cons
+    (lookup_cleanup_false_of_mirLiftReady h_ready h_bb)
+    (phase_of_mirLiftReady h_ready)
+    h_get
+    h_stmt
+    h_next
+
+/--
+Readiness-discharged `cons_eval_norm` step rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.cons_eval_norm_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {stmt : Statement} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_get : Trusted.Sequence.get? bb.statements stmtIdx = some stmt)
+    (h_eval : evalPureStmtNorm body bbIdx stmtIdx env stmt = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) :=
+  LiftStmtsTerminator.cons_eval_norm
+    (lookup_cleanup_false_of_mirLiftReady h_ready h_bb)
+    (phase_of_mirLiftReady h_ready)
+    h_get
+    h_eval
+    h_next
+
+/--
+Readiness-discharged `eval_n` multi-statement step rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.eval_n_ready {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {n stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {post : Value → Prop} {fuel : Nat}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_eval : evalPureStmtsN body bbIdx bb.statements n stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + n) env' bb.statements bb.terminator post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + n) :=
+  LiftStmtsTerminator.eval_n
+    (lookup_cleanup_false_of_mirLiftReady h_ready h_bb)
+    (phase_of_mirLiftReady h_ready)
+    h_eval
+    h_next
+
+/--
 Readiness-discharged `eval_rest` step rule: extracts `h_phase` and
 `bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
 -/
@@ -5406,6 +5578,72 @@ theorem LiftStmtsTerminator.term_goto_ready {body : CapturedMir}
   have h_bb' := lookup_cleanup_false_of_mirLiftReady h_ready h_bb
   rw [h_term] at h_bb' ⊢
   exact LiftStmtsTerminator.term_goto h_bb' (phase_of_mirLiftReady h_ready) h_end h_lift
+
+/--
+Readiness-discharged `term_switchInt` rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.term_switchInt_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {discr : Operand} {targets : SwitchTargets}
+    {span : String} {post : Value → Prop} {fuel : Nat} {sc : ScalarInt}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .switchInt discr targets, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env discr = .ok (.scalar sc) env')
+    (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
+    (h_next : LiftBlock body target env' post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) := by
+  have h_bb' := lookup_cleanup_false_of_mirLiftReady h_ready h_bb
+  rw [h_term] at h_bb' ⊢
+  exact LiftStmtsTerminator.term_switchInt h_bb' (phase_of_mirLiftReady h_ready)
+    h_end h_eval h_target h_next
+
+/--
+Readiness-discharged `term_assert` rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.term_assert_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {cond : Operand} {expected : Bool}
+    {unwind : UnwindAction} {span : String} {post : Value → Prop}
+    {fuel : Nat} {sc : ScalarInt}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .assert cond expected target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_eval : MirLiftCore.evalPureOperand body env cond = .ok (.scalar sc) env')
+    (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
+    (h_next : LiftBlock body target env' post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) := by
+  have h_bb' := lookup_cleanup_false_of_mirLiftReady h_ready h_bb
+  rw [h_term] at h_bb' ⊢
+  exact LiftStmtsTerminator.term_assert h_bb' (phase_of_mirLiftReady h_ready)
+    h_end h_eval (by cases expected <;> simpa using h_cond) h_next
+
+/--
+Readiness-discharged `term_drop` rule: extracts `h_phase` and
+`bb.isCleanup = false` directly from `checkMirLiftReady body = true`.
+-/
+theorem LiftStmtsTerminator.term_drop_ready {body : CapturedMir}
+    {bbIdx target : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {bb : BasicBlockData} {place : Place} {unwind : UnwindAction}
+    {span : String} {post : Value → Prop} {fuel : Nat} {slot : LocalSlot}
+    (h_ready : checkMirLiftReady body = true)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+    (h_term : bb.terminator = { kind := .drop place target unwind, span := span })
+    (h_end : stmtIdx = List.length bb.statements)
+    (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+    (h_not_dead : slot ≠ .dead)
+    (h_proj : place.projection = [])
+    (h_set : Trusted.Sequence.set? env place.local_ .uninit = some env')
+    (h_next : LiftBlock body target env' post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env bb.statements bb.terminator post (fuel + 1) := by
+  have h_bb' := lookup_cleanup_false_of_mirLiftReady h_ready h_bb
+  rw [h_term] at h_bb' ⊢
+  exact LiftStmtsTerminator.term_drop h_bb' (phase_of_mirLiftReady h_ready)
+    h_end h_get h_not_dead h_proj h_set h_next
 
 /--
 Stateless panic-forbidding verification gate bridge from
@@ -5473,6 +5711,27 @@ theorem verifyMirNoPanic_of_mirLiftDagReady_fuel
       LiftBlock c.body 0 (initPureEnv c.body args) (c.post args) fuel) :
     VerificationResult c :=
   verifyMirNoPanic_of_mirLiftDagReady c h_ready (fun args hp => ⟨fuel, h_lift args hp⟩)
+
+/--
+Backwards-topological DAG induction gate (`verifyMirNoPanic_of_mirLiftDagReady_induct`):
+discharges `VerificationResult c` for any `checkMirLiftDagReady c.body = true`
+body by stepping each `BlockInv` block to its outgoing `CfgEdge` successors,
+using `hasCfgBackedge c.body = false` instead of manual fuel arithmetic or loop
+ranking functions.
+-/
+theorem verifyMirNoPanic_of_mirLiftDagReady_induct
+    (c : Claim)
+    (h_ready : checkMirLiftDagReady c.body = true)
+    (BlockInv : List Value → BasicBlockIdx → PureEnv → Prop)
+    (h_init : ∀ args, c.pre args → BlockInv args 0 (initPureEnv c.body args))
+    (h_step : ∀ args, c.pre args → ∀ bbIdx env, BlockInv args bbIdx env →
+      (∀ succ env', CfgEdge c.body bbIdx succ → BlockInv args succ env' →
+        ∃ fuel, LiftBlock c.body succ env' (c.post args) fuel) →
+      ∃ fuel, LiftBlock c.body bbIdx env (c.post args) fuel) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_mirLiftDagReady c h_ready (fun args h_pre =>
+    liftBlock_of_mirLiftDagReady_induct h_ready (BlockInv args)
+      (h_init args h_pre) (h_step args h_pre))
 
 theorem verifyMirSafe_of_mirLiftDagReady
     (c : Claim)
@@ -5712,7 +5971,296 @@ theorem verifyMirNoPanic_of_mirLoopLiftReady {α : Type}
         (checkPureMir_of_mirLoopLiftReady h_ready)
         (h_init args hp) (h_step args hp))
 
+/--
+Fuel-bounded partial-correctness (`mirSafePost`) state-to-state symbolic stepper
+over alias-erased `PureState` (permitting clean panics/aborts while forbidding UB).
+-/
+def wpPureMirSafeSteps
+    (fuel : Nat) (body : CapturedMir) (ps : PureState)
+    (mid : PureState → Prop)
+    (post : Value → Prop := fun _ => True) : Prop :=
+  wpMirStepsSym fuel body (ps.toMachineState emptyMemory)
+    (fun ms' => mid (PureState.ofMachineState ms'))
+    (mirSafePost (fun retVal _ => post retVal))
+
+/--
+Fuel-free partial-correctness (`mirSafePost`) intermediate state convergence
+over alias-erased `PureState`.
+-/
+def PureMirSafeStepsConverges
+    (body : CapturedMir) (ps : PureState)
+    (mid : PureState → Prop)
+    (post : Value → Prop := fun _ => True) : Prop :=
+  ∃ fuel : Nat, wpPureMirSafeSteps fuel body ps mid post
+
+/-- Lift a panic-forbidding `PureMirStepsConverges` step into `PureMirSafeStepsConverges`. -/
+theorem PureMirSafeStepsConverges.of_steps
+    {body : CapturedMir} {ps : PureState}
+    {mid : PureState → Prop} {post : Value → Prop}
+    (h : PureMirStepsConverges body ps mid post) :
+    PureMirSafeStepsConverges body ps mid post := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirStepsSym_mono (fun _ hm => hm) (fun _ => mirNormalPost_imp_mirSafePost) h_wp⟩
+
+/--
+Sequential composition (`bind`) for partial-correctness `PureMirSafeConverges`
+over alias-erased `PureState`.
+-/
+theorem PureMirSafeConverges.bind
+    {body : CapturedMir} {ps : PureState}
+    {mid : PureState → Prop} {post : Value → Prop}
+    (h₁ : PureMirSafeStepsConverges body ps mid post)
+    (h₂ : ∀ ps', mid ps' → PureMirSafeConverges body ps' post)
+    (h_pure : checkPureMir body = true) :
+    PureMirSafeConverges body ps post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  have h_steps :
+      MirStepsConverges body (ps.toMachineState emptyMemory)
+        (fun ms' =>
+          mid (PureState.ofMachineState ms') ∧
+          ms' = (PureState.ofMachineState ms').toMachineState emptyMemory)
+        (mirSafePost (fun retVal _ => post retVal)) := by
+    suffices ∀ (f : Nat) (st : MirExecState),
+        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
+          (fun
+            | .running s' => mid (PureState.ofMachineState s')
+            | .halted out => mirSafePost (fun retVal _ => post retVal) out
+            | .faulted _ => False)
+          (mirSafePost (fun retVal _ => post retVal)) →
+        wpMirExecStepsSym f body (MirExecState.withMem emptyMemory st)
+          (fun
+            | .running s' =>
+              mid (PureState.ofMachineState s') ∧
+              s' = (PureState.ofMachineState s').toMachineState emptyMemory
+            | .halted out => mirSafePost (fun retVal _ => post retVal) out
+            | .faulted _ => False)
+          (mirSafePost (fun retVal _ => post retVal)) from
+      ⟨f₁, this f₁ (.running (ps.toMachineState emptyMemory)) hf₁⟩
+    intro f
+    induction f with
+    | zero =>
+      intro st h_st
+      cases st with
+      | running s' => exact ⟨h_st, rfl⟩
+      | halted out => exact h_st
+      | faulted _ => exact False.elim h_st
+    | succ f' ih =>
+      intro st h_st
+      cases st with
+      | halted out =>
+        unfold wpMirExecStepsSym at h_st ⊢
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+        exact h_st
+      | faulted _ =>
+        unfold wpMirExecStepsSym at h_st
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st
+        exact False.elim h_st
+      | running s =>
+        unfold wpMirExecStepsSym at h_st ⊢
+        rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+        dsimp only [MirExecState.withMem, stepMirState] at h_st ⊢
+        have h_eq :=
+          stepMirFn_toMachineState_eq_withMem (mem₀ := emptyMemory)
+            (PureState.ofMachineState s) h_pure rootActiveMemory_emptyMemory
+        dsimp only [PureState.toMachineState_ofMachineState] at h_eq
+        rw [h_eq] at h_st ⊢
+        cases h_step : stepMirFn body { s with memory := emptyMemory } with
+        | ret _ =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          exact h_st
+        | tau st' =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          exact ih st' h_st
+        | vis i k =>
+          rw [h_step] at h_st
+          dsimp only [MirStepNode.withMem] at h_st
+          cases i with
+          | inl _ => exact False.elim h_st
+          | inr i2 => cases i2 with
+            | inl _ => exact ih (k PUnit.unit) h_st
+            | inr _ => exact False.elim h_st
+  exact MirWpConverges.bind h_steps (fun ms' ⟨h_mid, h_eq⟩ => by
+    rw [h_eq]
+    exact h₂ (PureState.ofMachineState ms') h_mid)
+
+/--
+Alias-erased partial-correctness (`mirSafePost`) well-founded `while`-loop
+convergence over `PureState`, permitting panicking assertions inside the loop.
+-/
+theorem pureMirSafeConverges_whileRank {α : Type}
+    (rank : α → Nat)
+    (body : CapturedMir)
+    (LoopInv : α → PureState → Prop)
+    (ps₀ : PureState)
+    (a₀ : α)
+    (post : Value → Prop)
+    (h_pure : checkPureMir body = true)
+    (h_init : LoopInv a₀ ps₀)
+    (h_step : ∀ a ps, LoopInv a ps →
+      PureMirSafeStepsConverges body ps
+        (fun ps' => ∃ a', LoopInv a' ps' ∧ rank a' < rank a)
+        post) :
+    PureMirSafeConverges body ps₀ post := by
+  have h_gen : ∀ r a ps, rank a = r → LoopInv a ps → PureMirSafeConverges body ps post := by
+    apply nat_strong_induction
+      (fun r => ∀ a ps, rank a = r → LoopInv a ps → PureMirSafeConverges body ps post)
+    intro r ih a ps h_eq h_inv
+    refine PureMirSafeConverges.bind (h_step a ps h_inv) (fun ps' h_mid => ?_) h_pure
+    rcases h_mid with ⟨a', h_inv', h_lt⟩
+    exact ih (rank a') (h_eq ▸ h_lt) a' ps' rfl h_inv'
+  exact h_gen (rank a₀) a₀ ps₀ rfl h_init
+
+/--
+Stateless partial-correctness (`mirSafePost`) verification gate bridge for
+loop-ready pure MIR (`checkMirLoopLiftReady`), permitting clean panics inside
+loop iterations.
+-/
+theorem verifyMirSafe_of_mirLoopLiftReady {α : Type}
+    (c : Claim)
+    (h_ready : checkMirLoopLiftReady c.body = true)
+    (rank : List Value → α → Nat)
+    (LoopInv : List Value → α → PureState → Prop)
+    (a₀ : List Value → α)
+    (h_init : ∀ args, c.pre args → LoopInv args (a₀ args) (initPureState c.body args))
+    (h_step : ∀ args, c.pre args → ∀ a ps, LoopInv args a ps →
+      PureMirSafeStepsConverges c.body ps
+        (fun ps' => ∃ a', LoopInv args a' ps' ∧ rank args a' < rank args a)
+        (c.post args)) :
+    VerificationResult c :=
+  verifyMirSafe_of_pureExec c
+    (checkPureMir_of_mirLoopLiftReady h_ready)
+    (fun args hp =>
+      pureMirSafeConverges_whileRank (rank args) c.body (LoopInv args)
+        (initPureState c.body args) (a₀ args) (c.post args)
+        (checkPureMir_of_mirLoopLiftReady h_ready)
+        (h_init args hp) (h_step args hp))
+
+/--
+Stateful panic-forbidding verification gate bridge for loop-ready pure MIR
+(`checkMirLoopLiftReady`), automatically framing initial memory.
+-/
+theorem verifyStatefulMirNoPanic_of_mirLoopLiftReady {α : Type}
+    (c : StatefulClaim)
+    (h_ready : checkMirLoopLiftReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (rank : List Value → Memory → α → Nat)
+    (LoopInv : List Value → Memory → α → PureState → Prop)
+    (a₀ : List Value → Memory → α)
+    (h_init : ∀ args mem, c.pre args mem →
+      LoopInv args mem (a₀ args mem) (initPureState c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ a ps, LoopInv args mem a ps →
+      PureMirStepsConverges c.body ps
+        (fun ps' => ∃ a', LoopInv args mem a' ps' ∧ rank args mem a' < rank args mem a)
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_of_pureExec c
+    (checkPureMir_of_mirLoopLiftReady h_ready)
+    h_root
+    (fun args mem hp =>
+      pureMirConverges_whileRank (rank args mem) c.body (LoopInv args mem)
+        (initPureState c.body args) (a₀ args mem) _
+        (checkPureMir_of_mirLoopLiftReady h_ready)
+        (h_init args mem hp) (h_step args mem hp))
+
+/--
+Stateful partial-correctness (`mirSafePost`) verification gate bridge for
+loop-ready pure MIR (`checkMirLoopLiftReady`).
+-/
+theorem verifyStatefulMirSafe_of_mirLoopLiftReady {α : Type}
+    (c : StatefulClaim)
+    (h_ready : checkMirLoopLiftReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (rank : List Value → Memory → α → Nat)
+    (LoopInv : List Value → Memory → α → PureState → Prop)
+    (a₀ : List Value → Memory → α)
+    (h_init : ∀ args mem, c.pre args mem →
+      LoopInv args mem (a₀ args mem) (initPureState c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ a ps, LoopInv args mem a ps →
+      PureMirSafeStepsConverges c.body ps
+        (fun ps' => ∃ a', LoopInv args mem a' ps' ∧ rank args mem a' < rank args mem a)
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_pureExec c
+    (checkPureMir_of_mirLoopLiftReady h_ready)
+    h_root
+    (fun args mem hp =>
+      pureMirSafeConverges_whileRank (rank args mem) c.body (LoopInv args mem)
+        (initPureState c.body args) (a₀ args mem) _
+        (checkPureMir_of_mirLoopLiftReady h_ready)
+        (h_init args mem hp) (h_step args mem hp))
+
+/--
+Total-correctness (`TotalVerificationResult`) gate bridge for loop-ready pure MIR
+(`checkMirLoopLiftReady`), automatically framing initial memory while proving
+termination, UB-freedom, and panic-freedom.
+-/
+theorem verifyTotalMir_of_mirLoopLiftReady {α : Type}
+    (c : TotalClaim)
+    (h_ready : checkMirLoopLiftReady c.body = true)
+    (h_root : ∀ args mem, c.pre args mem → RootActiveMemory mem)
+    (rank : List Value → Memory → α → Nat)
+    (LoopInv : List Value → Memory → α → PureState → Prop)
+    (a₀ : List Value → Memory → α)
+    (h_init : ∀ args mem, c.pre args mem →
+      LoopInv args mem (a₀ args mem) (initPureState c.body args))
+    (h_step : ∀ args mem, c.pre args mem → ∀ a ps, LoopInv args mem a ps →
+      PureMirStepsConverges c.body ps
+        (fun ps' => ∃ a', LoopInv args mem a' ps' ∧ rank args mem a' < rank args mem a)
+        (fun retVal =>
+          c.post args mem retVal
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              c.body args mem c.callees).memory)) :
+    TotalVerificationResult c :=
+  verifyTotalMir_of_pureExec c
+    (checkPureMir_of_mirLoopLiftReady h_ready)
+    h_root
+    (fun args mem hp =>
+      pureMirConverges_whileRank (rank args mem) c.body (LoopInv args mem)
+        (initPureState c.body args) (a₀ args mem) _
+        (checkPureMir_of_mirLoopLiftReady h_ready)
+        (h_init args mem hp) (h_step args mem hp))
+
+/--
+Stateless bounded-range (`forRangeUp`) verification gate bridge for loop-ready
+pure MIR (`checkMirLoopLiftReady`).
+-/
+theorem verifyMirNoPanic_forRangeUp_of_mirLoopLiftReady {α : Type}
+    (c : Claim)
+    (h_ready : checkMirLoopLiftReady c.body = true)
+    (lo hi : List Value → Nat)
+    (init : List Value → α)
+    (step : (args : List Value) → (i : Nat) → lo args ≤ i → i < hi args → α → α)
+    (LoopInv : List Value → Nat → α → PureState → Prop)
+    (h_init : ∀ args, c.pre args →
+      LoopInv args (lo args) (init args) (initPureState c.body args))
+    (h_body : ∀ args, c.pre args → ∀ i h_le h_lt a ps, LoopInv args i a ps →
+      PureMirStepsConverges c.body ps
+        (fun ps' => LoopInv args (i + 1) (step args i h_le h_lt a) ps')
+        (c.post args))
+    (h_exit : ∀ args, c.pre args → ∀ i a ps, hi args ≤ i → LoopInv args i a ps →
+      PureMirConverges c.body ps (c.post args)) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_pureExec c
+    (checkPureMir_of_mirLoopLiftReady h_ready)
+    (fun args hp =>
+      pureMirConverges_forRangeUp (lo args) (hi args) (init args) (step args)
+        c.body (LoopInv args) (initPureState c.body args) (c.post args)
+        (checkPureMir_of_mirLoopLiftReady h_ready)
+        (h_init args hp) (h_body args hp) (h_exit args hp))
+
 /-! ### Kernel-Checked Readiness & Lifting Regression Witnesses -/
+
+namespace MirLiftReadyWitness
+
+open MirFragment.Witness
 
 theorem checkMirLiftDagReady_witnessPureLoopFree :
     checkMirLiftDagReady witnessPureLoopFree = true := rfl
@@ -5761,5 +6309,427 @@ theorem verify_witnessPureLoopFree_via_mirLiftDagReady :
     checkMirLiftReady_witnessPureLoopFree (by rfl) (by rfl)
   exact LiftStmtsTerminator.term_return_ready
     checkMirLiftReady_witnessPureLoopFree (by rfl) rfl rfl (by rfl) rfl
+
+private def witnessBoolLayout : TypeLayout :=
+  { size := { bytes := 1 }
+    align := { bytes := 1 }
+    backendRepr := .memory
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+private def witnessU32Layout : TypeLayout :=
+  { size := { bytes := 4 }
+    align := { bytes := 4 }
+    backendRepr := .memory
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+private def witnessBoolTy : Ty := { kind := .bool, layoutIdx := 0 }
+private def witnessU32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
+
+private def witnessLayouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries := [witnessBoolLayout, witnessU32Layout] }
+
+private def witnessConstU32 (n : Nat) : Operand :=
+  .constant { ty := witnessU32Ty, val := .scalar (.int ⟨n, 4⟩) }
+
+private theorem wrapScalarBits_u32_of_lt {v : Nat} (h : v < 4294967296) :
+    wrapScalarBits v (scalarModulus 4) = v := by
+  unfold wrapScalarBits
+  have hm : scalarModulus 4 = 4294967296 := rfl
+  rw [hm]
+  cases h_b : Nat.ble 4294967296 v
+  · rfl
+  · exact False.elim (Nat.not_le_of_lt h (Nat.le_of_ble_eq_true h_b))
+
+/--
+Multi-block branching DAG witness (`argCount := 2`: `_1 : bool`, `_2 : u32`):
+- `bb0`: `StorageLive(_3); _3 = Copy(_2); assert(Copy(_1) == true) -> bb1`
+- `bb1`: `drop(_3) -> bb2`
+- `bb2`: `switchInt(Copy(_2)) [0 => bb3, otherwise => bb4]`
+- `bb3`: `_0 = const 1u32; goto -> bb5`
+- `bb4`: `_0 = Add(Copy(_2), const 1u32); goto -> bb5`
+- `bb5`: `return_`
+-/
+def witnessDagBranching : CapturedMir where
+  defPath := "Anneal::MirLiftCore::witness_dag_branching"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := witnessU32Ty, debugName := some "_0" },
+    { mutability := .not, ty := witnessBoolTy, debugName := some "ok" },
+    { mutability := .not, ty := witnessU32Ty, debugName := some "x" },
+    { mutability := .mut, ty := witnessU32Ty, debugName := some "tmp" }
+  ]
+  basicBlocks := [
+    -- bb0
+    { statements := [
+        { kind := .storageLive 3, span := "s0" },
+        { kind := .assign { local_ := 3, projection := [] } (.use (.copy { local_ := 2, projection := [] })), span := "s1" }
+      ]
+      terminator := {
+        kind := .assert (.copy { local_ := 1, projection := [] }) true 1 .continue_
+        span := "t0"
+      }
+      isCleanup := false },
+    -- bb1
+    { statements := []
+      terminator := {
+        kind := .drop { local_ := 3, projection := [] } 2 .continue_
+        span := "t1"
+      }
+      isCleanup := false },
+    -- bb2
+    { statements := []
+      terminator := {
+        kind := .switchInt (.copy { local_ := 2, projection := [] })
+          { branches := [(0, 3)], otherwise := 4 }
+        span := "t2"
+      }
+      isCleanup := false },
+    -- bb3 (x == 0)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] } (.use (witnessConstU32 1)), span := "s3" }
+      ]
+      terminator := { kind := .goto 5, span := "t3" }
+      isCleanup := false },
+    -- bb4 (x != 0)
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.binaryOp .add (.copy { local_ := 2, projection := [] }) (witnessConstU32 1)),
+          span := "s4" }
+      ]
+      terminator := { kind := .goto 5, span := "t4" }
+      isCleanup := false },
+    -- bb5 (join & return)
+    { statements := []
+      terminator := { kind := .return_, span := "t5" }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [
+      { layout := witnessBoolLayout, mode := .direct },
+      { layout := witnessU32Layout, mode := .direct }
+    ]
+    ret := { layout := witnessU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := witnessLayouts
+  allocations := []
+
+theorem checkMirLiftDagReady_witnessDagBranching :
+    checkMirLiftDagReady witnessDagBranching = true := rfl
+
+theorem checkMirLiftReady_witnessDagBranching :
+    checkMirLiftReady witnessDagBranching = true := rfl
+
+/-- Precondition for `witnessDagBranching`: `ok = true` and `x < 100`. -/
+def witnessDagBranchingPre (args : List Value) : Prop :=
+  ∃ x : Nat, x < 100 ∧
+    args = [.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := x, sizeBytes := 4 }]
+
+theorem witnessDagBranchingPre_nonVacuous :
+    ∃ args, witnessDagBranchingPre args :=
+  ⟨[.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := 42, sizeBytes := 4 }],
+   42, by decide, rfl⟩
+
+/--
+Block invariant for `witnessDagBranching` used by
+`verifyMirNoPanic_of_mirLiftDagReady_induct` (no fuel or rank annotations).
+-/
+def witnessDagBlockInv (args : List Value) (bbIdx : BasicBlockIdx) (env : PureEnv) : Prop :=
+  ∃ x : Nat, x < 100 ∧
+    args = [.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := x, sizeBytes := 4 }] ∧
+    match bbIdx with
+    | 0 => env = [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .dead]
+    | 1 => env = [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨x, 4⟩)]
+    | 2 => env = [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit]
+    | 3 => x = 0 ∧ env = [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0, 4⟩), .uninit]
+    | 4 => x ≠ 0 ∧ env = [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit]
+    | 5 => env = [.init (.scalar ⟨if x = 0 then 1 else x + 1, 4⟩),
+                  .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit]
+    | _ => False
+
+/--
+End-to-end symbolic `VerificationResult` for `witnessDagBranching` over all `x < 100`,
+exercising `verifyMirNoPanic_of_mirLiftDagReady_induct` together with
+`eval_n_ready`, `cons_eval_norm_ready`, `eval_rest_ready`, `term_assert_ready`,
+`term_drop_ready`, `term_switchInt_ready`, `term_goto_ready`, and `term_return_ready`.
+-/
+theorem verify_witnessDagBranching_via_induct :
+    VerificationResult
+      { body := witnessDagBranching
+        pre := witnessDagBranchingPre
+        post := fun args retVal =>
+          ∀ x : Nat,
+            args = [.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := x, sizeBytes := 4 }] →
+            retVal = .scalar { bits := if x = 0 then 1 else x + 1, sizeBytes := 4 }
+        callees := [] } := by
+  have h_r := checkMirLiftReady_witnessDagBranching
+  refine verifyMirNoPanic_of_mirLiftDagReady_induct _
+    checkMirLiftDagReady_witnessDagBranching
+    witnessDagBlockInv
+    (fun args hp => by
+      rcases hp with ⟨x, hx, rfl⟩
+      exact ⟨x, hx, rfl, rfl⟩)
+    (fun args _ bbIdx env h_inv ih => ?_)
+  rcases h_inv with ⟨x, hx, h_args, h_env⟩
+  subst h_args
+  match bbIdx with
+  | 0 =>
+    subst h_env
+    have h_edge : CfgEdge witnessDagBranching 0 1 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ := ih 1 _ h_edge ⟨x, hx, rfl, rfl⟩
+    refine ⟨f + 1 + 2, LiftBlock.of_lookup (by rfl) ?_⟩
+    exact LiftStmtsTerminator.eval_n_ready (n := 2) h_r (by rfl) (by rfl)
+      (LiftStmtsTerminator.term_assert_ready h_r (by rfl) rfl rfl (by rfl) rfl hf)
+  | 1 =>
+    subst h_env
+    have h_edge : CfgEdge witnessDagBranching 1 2 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ := ih 2 _ h_edge ⟨x, hx, rfl, rfl⟩
+    refine ⟨f + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+    exact LiftStmtsTerminator.term_drop_ready h_r (by rfl) rfl rfl (by rfl)
+      (by intro h_dead; nomatch h_dead) rfl (by rfl) hf
+  | 2 =>
+    subst h_env
+    cases x with
+    | zero =>
+      have h_edge : CfgEdge witnessDagBranching 2 3 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+      obtain ⟨f, hf⟩ := ih 3 _ h_edge ⟨0, hx, rfl, rfl, rfl⟩
+      refine ⟨f + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+      exact LiftStmtsTerminator.term_switchInt_ready (sc := ⟨0, 4⟩)
+        h_r (by rfl) rfl rfl (by rfl) rfl hf
+    | succ x' =>
+      have h_edge : CfgEdge witnessDagBranching 2 4 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+      obtain ⟨f, hf⟩ := ih 4 _ h_edge ⟨x' + 1, hx, rfl, Nat.succ_ne_zero x', rfl⟩
+      refine ⟨f + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+      exact LiftStmtsTerminator.term_switchInt_ready (sc := ⟨x' + 1, 4⟩)
+        h_r (by rfl) rfl rfl (by rfl) rfl hf
+  | 3 =>
+    rcases h_env with ⟨rfl, h_e⟩
+    subst h_e
+    have h_edge : CfgEdge witnessDagBranching 3 5 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ := ih 5 _ h_edge ⟨0, hx, rfl, rfl⟩
+    refine ⟨f + 1 + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+    exact LiftStmtsTerminator.cons_eval_norm_ready h_r (by rfl) (by rfl) (by rfl)
+      (LiftStmtsTerminator.term_goto_ready h_r (by rfl) rfl rfl hf)
+  | 4 =>
+    rcases h_env with ⟨hx_ne, h_e⟩
+    subst h_e
+    have h_wrap : wrapScalarBits (x + 1) (scalarModulus 4) = x + 1 :=
+      wrapScalarBits_u32_of_lt (by omega)
+    have h_if : (if x = 0 then 1 else x + 1) = x + 1 := if_neg hx_ne
+    have h_edge : CfgEdge witnessDagBranching 4 5 := ⟨_, rfl, by simp [blockTargets, terminatorTargets]⟩
+    obtain ⟨f, hf⟩ :=
+      ih 5 [.init (.scalar ⟨x + 1, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit]
+        h_edge ⟨x, hx, rfl, by rw [h_if]; rfl⟩
+    refine ⟨f + 1 + 1, LiftBlock.of_lookup (by rfl) ?_⟩
+    refine LiftStmtsTerminator.eval_rest_ready h_r (by rfl) ?_
+      (LiftStmtsTerminator.term_goto_ready h_r (by rfl) rfl rfl hf)
+    change (some [.init (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩),
+                  .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit] : Option PureEnv) =
+      some [.init (.scalar ⟨x + 1, 4⟩),
+            .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨x, 4⟩), .uninit]
+    rw [h_wrap]
+  | 5 =>
+    subst h_env
+    refine ⟨1, LiftBlock.of_lookup (by rfl) ?_⟩
+    refine LiftStmtsTerminator.term_return_ready h_r (by rfl) rfl rfl (by rfl) ?_
+    intro x' h_eq
+    injection h_eq with _ h_tl
+    injection h_tl with h_sc _
+    injection h_sc with h_v
+    cases h_v
+    rfl
+  | n + 6 =>
+    exact False.elim h_env
+
+/--
+Pure bounded-loop witness (`fn countdown_accum(mut x: u32) -> u32`):
+initializes `_0 = 0`, loops while `_1 != 0` performing `_0 = Add(_0, 1); _1 = Sub(_1, 1)`,
+and returns `_0` (`= x`).
+-/
+def witnessCountdownAccumLoop : CapturedMir where
+  defPath := "Anneal::MirLiftCore::witness_countdown_accum_loop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := witnessU32Ty, debugName := some "_0" },
+    { mutability := .mut, ty := witnessU32Ty, debugName := some "x" }
+  ]
+  basicBlocks := [
+    -- bb0: _0 = 0; goto bb1
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] } (.use (witnessConstU32 0)), span := "init" }
+      ]
+      terminator := { kind := .goto 1, span := "goto_hdr" }
+      isCleanup := false },
+    -- bb1: switchInt(Copy(_1)) [0 => bb3, otherwise => bb2]
+    { statements := []
+      terminator := {
+        kind := .switchInt (.copy { local_ := 1, projection := [] })
+          { branches := [(0, 3)], otherwise := 2 }
+        span := "hdr_sw"
+      }
+      isCleanup := false },
+    -- bb2: _0 = Add(Copy(_0), 1); _1 = Sub(Copy(_1), 1); goto bb1
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] }
+            (.binaryOp .add (.copy { local_ := 0, projection := [] }) (witnessConstU32 1)),
+          span := "inc_acc" },
+        { kind := .assign { local_ := 1, projection := [] }
+            (.binaryOp .sub (.copy { local_ := 1, projection := [] }) (witnessConstU32 1)),
+          span := "dec_x" }
+      ]
+      terminator := { kind := .goto 1, span := "backedge" }
+      isCleanup := false },
+    -- bb3: return_
+    { statements := []
+      terminator := { kind := .return_, span := "ret" }
+      isCleanup := false }
+  ]
+  fnAbi := {
+    args := [{ layout := witnessU32Layout, mode := .direct }]
+    ret := { layout := witnessU32Layout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := witnessLayouts
+  allocations := []
+
+theorem checkMirLoopLiftReady_witnessCountdownAccumLoop :
+    checkMirLoopLiftReady witnessCountdownAccumLoop = true := rfl
+
+theorem checkMirLiftReady_witnessCountdownAccumLoop :
+    checkMirLiftReady witnessCountdownAccumLoop = true := rfl
+
+theorem checkMirLiftDagReady_witnessCountdownAccumLoop :
+    checkMirLiftDagReady witnessCountdownAccumLoop = false := rfl
+
+theorem inferBorrowFreeMinFragment_witnessCountdownAccumLoop :
+    inferBorrowFreeMinFragment witnessCountdownAccumLoop = .pureBoundedLoop := rfl
+
+/-- Stateful precondition for `witnessCountdownAccumLoop` over all `x < 2^32` and root-active `mem`. -/
+def witnessCountdownLoopPre (args : List Value) (mem : Memory) : Prop :=
+  (∃ x : Nat, x < 4294967296 ∧ args = [.scalar { bits := x, sizeBytes := 4 }]) ∧
+  RootActiveMemory mem
+
+theorem witnessCountdownLoopPre_nonVacuous :
+    NonVacuousStatefulPre witnessCountdownLoopPre :=
+  ⟨[.scalar { bits := 17, sizeBytes := 4 }],
+   emptyMemory,
+   ⟨17, by decide, rfl⟩,
+   rootActiveMemory_emptyMemory⟩
+
+private def countdownRank : Sum Nat Nat → Nat
+  | .inl x => x + 1
+  | .inr rem => rem
+
+private def countdownInv (args : List Value) (st : Sum Nat Nat) (ps : PureState) : Prop :=
+  ∃ x : Nat, x < 4294967296 ∧
+    args = [.scalar { bits := x, sizeBytes := 4 }] ∧
+    match st with
+    | .inl x₀ =>
+      x₀ = x ∧ ps = { bb := 0, stmtIdx := 0, env := [.uninit, .init (.scalar ⟨x, 4⟩)] }
+    | .inr rem =>
+      rem ≤ x ∧
+      ps = { bb := 1
+             stmtIdx := 0
+             env := [.init (.scalar ⟨x - rem, 4⟩), .init (.scalar ⟨rem, 4⟩)] }
+
+/--
+End-to-end symbolic `TotalVerificationResult` for `witnessCountdownAccumLoop`
+over all `x < 2^32` and arbitrary `RootActiveMemory mem`, proved via
+`verifyTotalMir_of_mirLoopLiftReady`. Certifies termination, UB-freedom,
+panic-freedom, exact return value `retVal = .scalar ⟨x, 4⟩`, and exact memory
+framing `mem' = mem`.
+-/
+theorem verifyTotal_witnessCountdownAccumLoop :
+    TotalVerificationResult
+      { body := witnessCountdownAccumLoop
+        pre := witnessCountdownLoopPre
+        post := fun args mem retVal mem' =>
+          mem' = mem ∧
+          ∀ x : Nat,
+            args = [.scalar { bits := x, sizeBytes := 4 }] →
+            retVal = .scalar { bits := x, sizeBytes := 4 }
+        callees := [] } := by
+  refine verifyTotalMir_of_mirLoopLiftReady _
+    checkMirLoopLiftReady_witnessCountdownAccumLoop
+    (fun _ _ hp => hp.2)
+    (fun _ _ => countdownRank)
+    (fun args _ => countdownInv args)
+    (fun args _ => match args with
+      | [.scalar sc] => .inl sc.bits
+      | _ => .inl 0)
+    (fun args _ hp => by
+      rcases hp.1 with ⟨x, hx, rfl⟩
+      exact ⟨x, hx, rfl, rfl, rfl⟩)
+    (fun args mem hp a ps h_inv => ?_)
+  rcases h_inv with ⟨x, hx, h_args, h_st⟩
+  subst h_args
+  cases a with
+  | inl x₀ =>
+    rcases h_st with ⟨h_x₀, rfl⟩
+    subst x₀
+    refine ⟨2, .inr x, ⟨x, hx, rfl, Nat.le_refl x, ?_⟩, by dsimp [countdownRank]; omega⟩
+    change ({ bb := 1
+              stmtIdx := 0
+              env := [.init (.scalar ⟨0, 4⟩), .init (.scalar ⟨x, 4⟩)] } : PureState) =
+      { bb := 1
+        stmtIdx := 0
+        env := [.init (.scalar ⟨x - x, 4⟩), .init (.scalar ⟨x, 4⟩)] }
+    rw [Nat.sub_self]
+  | inr rem =>
+    rcases h_st with ⟨h_rem_le, rfl⟩
+    cases rem with
+    | zero =>
+      refine ⟨2, ?_⟩
+      have h_sub0 : x - 0 = x := Nat.sub_zero x
+      rw [h_sub0]
+      refine ⟨rfl, ?_⟩
+      intro x' h_eq
+      injection h_eq with h_sc _
+    | succ rem' =>
+      cases rem' with
+      | zero =>
+        have h_acc_wrap : wrapScalarBits (x - 1 + 1) (scalarModulus 4) = x - 0 := by
+          have h_eq : x - 1 + 1 = x - 0 := by omega
+          rw [h_eq]
+          exact wrapScalarBits_u32_of_lt (by omega)
+        refine ⟨4, .inr 0, ⟨x, hx, rfl, Nat.zero_le x, ?_⟩, by dsimp [countdownRank]; omega⟩
+        change ({ bb := 1
+                  stmtIdx := 0
+                  env := [.init (.scalar ⟨wrapScalarBits (x - 1 + 1) (scalarModulus 4), 4⟩),
+                          .init (.scalar ⟨0, 4⟩)] } : PureState) =
+          { bb := 1
+            stmtIdx := 0
+            env := [.init (.scalar ⟨x - 0, 4⟩), .init (.scalar ⟨0, 4⟩)] }
+        rw [h_acc_wrap]
+      | succ r =>
+        have h_acc_wrap : wrapScalarBits (x - (r + 1 + 1) + 1) (scalarModulus 4) = x - (r + 1) := by
+          have h_eq : x - (r + 1 + 1) + 1 = x - (r + 1) := by omega
+          rw [h_eq]
+          exact wrapScalarBits_u32_of_lt (by omega)
+        have h_rem_wrap : wrapScalarBits (r + 1) (scalarModulus 4) = r + 1 :=
+          wrapScalarBits_u32_of_lt (by omega)
+        refine ⟨4, .inr (r + 1), ⟨x, hx, rfl, by omega, ?_⟩, by dsimp [countdownRank]; omega⟩
+        change ({ bb := 1
+                  stmtIdx := 0
+                  env := [.init (.scalar ⟨wrapScalarBits (x - (r + 1 + 1) + 1) (scalarModulus 4), 4⟩),
+                          .init (.scalar ⟨wrapScalarBits (r + 1) (scalarModulus 4), 4⟩)] } : PureState) =
+          { bb := 1
+            stmtIdx := 0
+            env := [.init (.scalar ⟨x - (r + 1), 4⟩), .init (.scalar ⟨r + 1, 4⟩)] }
+        rw [h_acc_wrap, h_rem_wrap]
+
+end MirLiftReadyWitness
 
 end Anneal.MirLiftCore
