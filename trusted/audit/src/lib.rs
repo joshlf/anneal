@@ -62,6 +62,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -1292,10 +1294,38 @@ struct PreflightResult {
     headers: Vec<PreflightHeader>,
 }
 
+fn is_retained_environment_key(key: &str) -> bool {
+    matches!(key, "HOME" | "TMPDIR" | "LANG" | "LC_ALL")
+}
+
 impl Checker {
     /// Create a new [`Checker`] with a fresh private staging directory.
+    ///
+    /// Discard unlisted environment entries before decoding their values. A
+    /// retained value that is not valid UTF-8 returns an `InvalidInput` error.
     pub fn new(checkout: &Path, lean: Option<&Path>) -> io::Result<Self> {
-        Self::new_with_env(checkout, lean, env::vars())
+        // Unforwarded host settings have no bearing on the Lean child, so
+        // they impose no UTF-8 requirement. Validate retained values without
+        // lossy conversion before admitting them to the child environment.
+        let environment = env::vars_os()
+            .filter_map(|(key, value)| {
+                let key = key.to_str()?;
+                is_retained_environment_key(key)
+                    .then(|| (key.to_owned(), value))
+            })
+            .map(|(key, value)| {
+                let value = value.into_string().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "environment variable {key} is not valid UTF-8"
+                        ),
+                    )
+                })?;
+                Ok((key, value))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::new_with_env(checkout, lean, environment)
     }
 
     /// Create a new [`Checker`] using a closed environment allowlist.
@@ -1324,16 +1354,18 @@ impl Checker {
         } else {
             env::current_dir()?.join(lean_raw)
         };
-        let stage_dir = tempfile::Builder::new()
-            .prefix("anneal-trusted-")
-            .tempdir()?;
+        let mut stage_builder = tempfile::Builder::new();
+        stage_builder.prefix("anneal-trusted-");
+        // Staged sources and proofs must not be readable by other Unix users.
+        // Set permissions at creation, before any inputs reach the directory.
+        #[cfg(unix)]
+        stage_builder.permissions(fs::Permissions::from_mode(0o700));
+        let stage_dir = stage_builder.tempdir()?;
         let stage = stage_dir.path().to_path_buf();
 
         let mut environment: BTreeMap<String, String> = ambient_env
             .into_iter()
-            .filter(|(k, _)| {
-                matches!(k.as_str(), "HOME" | "TMPDIR" | "LANG" | "LC_ALL")
-            })
+            .filter(|(k, _)| is_retained_environment_key(k))
             .collect();
         environment.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
 
@@ -1603,7 +1635,12 @@ impl Checker {
                 )
             })?;
         }
-        fs::create_dir_all(&self.stage).map_err(|e| {
+        let mut stage_builder = fs::DirBuilder::new();
+        // Recreating the stage must preserve its owner-only Unix permissions.
+        // A pre-existing replacement directory must cause creation to fail.
+        #[cfg(unix)]
+        stage_builder.mode(0o700);
+        stage_builder.create(&self.stage).map_err(|e| {
             Failure::new(
                 2,
                 "snapshot",
@@ -2091,6 +2128,51 @@ mod process_tests {
 
     fn shell_checker(checkout: &Path) -> Checker {
         Checker::new_with_env(checkout, Some(Path::new("/bin/sh")), []).unwrap()
+    }
+
+    #[test]
+    fn keeps_staging_private_at_creation_and_after_reset() {
+        const PROBE: &str = "ANNEAL_AUDIT_STAGE_PERMISSION_PROBE";
+        if env::var_os(PROBE).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let checkout = tempfile::tempdir().unwrap();
+            let mut checker = shell_checker(checkout.path());
+            assert_eq!(
+                fs::metadata(&checker.stage).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "initial staging directory exposes its contents to other users"
+            );
+            fs::write(checker.stage.join("input"), b"private source bytes").unwrap();
+            checker.reset_stage().unwrap();
+            assert_eq!(
+                fs::metadata(&checker.stage).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "reset staging directory exposes its contents to other users"
+            );
+            assert!(!checker.stage.join("input").exists());
+            return;
+        }
+
+        // Change only the child's umask; other tests may run concurrently.
+        let output = Command::new("/bin/sh")
+            .args(["-c", "umask 022 && exec \"$@\"", "stage-permissions"])
+            .arg(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_tests::keeps_staging_private_at_creation_and_after_reset",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "permission probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]

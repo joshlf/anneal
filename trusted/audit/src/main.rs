@@ -10,6 +10,7 @@
 //! repository trust boundary (`trusted/` vs. `theory/`) in CI.
 
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -40,7 +41,9 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    match run(env::args().collect()) {
+    // Paths are native OS values. Let clap validate each argument instead of
+    // making an unrelated non-UTF-8 path panic before argument handling.
+    match run(env::args_os().collect()) {
         Ok(code) => ExitCode::from(code),
         Err((code, msg)) => {
             eprintln!("{msg}");
@@ -60,7 +63,7 @@ fn failure_message(err: &Failure, checker: Option<&Checker>) -> (u8, String) {
     )
 }
 
-fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
+fn run(raw_args: Vec<OsString>) -> Result<u8, (u8, String)> {
     let cli = match Cli::try_parse_from(raw_args) {
         Ok(c) => c,
         Err(e) => {
