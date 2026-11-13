@@ -4005,7 +4005,7 @@ theorem step_terminator_call_unreachable_unchecked_ub_simulation
       rw [miri_step_at_terminator_multiFrame hback hframe.body_eq hframe.location_eq hbb hstmt_none]
       have htk :
           (translateTerminator bb.terminator).kind =
-            .Call (translateOperand func)
+            .Call (translateCalleeOperand func)
               ((List.nil : List MirAst.Operand).map fun a => ⟨defaultSpanRef, translateOperand a⟩).toArray
               (translatePlace destination) none (translateUnwindAction unwind)
               .Normal defaultSpanRef := by
@@ -5507,7 +5507,7 @@ theorem step_terminator_call_simulation
       rw [miri_step_at_terminator_multiFrame hback hframe.body_eq hframe.location_eq hbb hstmt_none]
       have htk :
           (translateTerminator bb.terminator).kind =
-            .Call (translateOperand func)
+            .Call (translateCalleeOperand func)
               (argOps.map fun a => ⟨defaultSpanRef, translateOperand a⟩).toArray
               (translatePlace ⟨destIdx, .nil⟩) (some targetBb) (translateUnwindAction unwind)
               .Normal defaultSpanRef := by
@@ -5801,7 +5801,7 @@ theorem step_terminator_call_diverging_simulation
       rw [miri_step_at_terminator_multiFrame hback hframe.body_eq hframe.location_eq hbb hstmt_none]
       have htk :
           (translateTerminator bb.terminator).kind =
-            .Call (translateOperand func)
+            .Call (translateCalleeOperand func)
               (argOps.map fun a => ⟨defaultSpanRef, translateOperand a⟩).toArray
               (translatePlace ⟨destIdx, .nil⟩) none (translateUnwindAction unwind)
               .Normal defaultSpanRef := by
@@ -7670,7 +7670,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
         rfl
       have htk :
           (translateTerminator bb.terminator).kind =
-            .Call (translateOperand func)
+            .Call (translateCalleeOperand func)
               ((List.nil : List MirAst.Operand).map fun a => ⟨defaultSpanRef, translateOperand a⟩).toArray
               (translatePlace destination) none (translateUnwindAction unwind)
               .Normal defaultSpanRef := by
@@ -9896,7 +9896,7 @@ theorem step_terminator_call_linked_panic_unwind_simulation
             obtain ⟨hraw_ok, hraw_state, rawCalleeFrame, hraw_curr, hdone_eq⟩ := hpush_spec
             have htk :
                 (translateTerminator bb.terminator).kind =
-                  .Call (translateOperand func) #[] (translatePlace ⟨destIdx, .nil⟩)
+                  .Call (translateCalleeOperand func) #[] (translatePlace ⟨destIdx, .nil⟩)
                     none (translateUnwindAction unwind) .Normal defaultSpanRef := by
               unfold translateTerminator; rw [hterm]; rfl
             have hcall :
