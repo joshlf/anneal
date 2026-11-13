@@ -154,6 +154,13 @@ pub fn helper_reborrow_mid(_r: &mut u32, _extra: u32) -> u32 {
 }
 
 #[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_return: &str = \"helper_reborrow_return\";
+#[inline(never)]
+pub fn helper_reborrow_return(r: &mut u32) -> &mut u32 {
+    &mut *r
+}
+
+#[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_shared_leaf: &str = \"helper_shared_leaf\";
 #[inline(never)]
 pub fn helper_shared_leaf(v: u32) -> u32 {
@@ -168,9 +175,10 @@ pub fn helper_shared_mid(_r: &u32, _bonus: u32) -> u32 {
 }
 
 #[allow(non_upper_case_globals)]
-pub const __ANNEAL_MODEL_helper_violate_fn_entry_protector: &str = \"helper_violate_fn_entry_protector\";
+pub const __ANNEAL_MODEL_helper_frozen_reborrow_write_in_callee: &str =
+    \"helper_frozen_reborrow_write_in_callee\";
 #[inline(never)]
-pub fn helper_violate_fn_entry_protector(mut slot: u32) -> u32 {
+pub fn helper_frozen_reborrow_write_in_callee(mut slot: u32) -> u32 {
     let raw: *mut u32 = &raw mut slot;
     let r: &mut u32 = unsafe { &mut *raw };
     *r = helper_reborrow_leaf(55u32);
@@ -191,6 +199,20 @@ pub const __ANNEAL_MODEL_helper_unwind_mid: &str = \"helper_unwind_mid\";
 #[inline(never)]
 pub fn helper_unwind_mid(_protected: &u32, _base: u32) -> u32 {
     helper_unwind_leaf(u32::MAX, 1u32)
+}
+
+pub struct UnwindCleanupGuard(pub u32);
+
+impl Drop for UnwindCleanupGuard {
+    fn drop(&mut self) {}
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_guarded: &str = \"helper_unwind_guarded\";
+#[inline(never)]
+pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {
+    let _guard = UnwindCleanupGuard(base);
+    helper_unwind_leaf(base, delta)
 }
 ";
 
@@ -300,25 +322,45 @@ impl DetRng {
     }
 }
 
-/// Extract the 106 closed zero-argument test functions from
+/// Extract the 108 closed zero-argument test functions from
 /// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten` and model
 /// helpers).
 pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
     extract_closed_corpus_seeds(RAW_MIRI_DIFF_CORPUS_RS)
 }
 
+/// Names of the corpus call-chain helpers: every `<name>` for which
+/// `tests/miri-diff/corpus/src/lib.rs` declares an Anneal model marker
+/// `const __ANNEAL_MODEL_<name>: &str`.
+fn corpus_model_helper_names() -> &'static std::collections::BTreeSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        syn::parse_file(RAW_MIRI_DIFF_CORPUS_RS)
+            .map(|file| {
+                file.items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Const(c) => c
+                            .ident
+                            .to_string()
+                            .strip_prefix("__ANNEAL_MODEL_")
+                            .map(str::to_string),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `name` is a corpus helper rather than a test entry point:
+/// `helper_add_ten`, an `__ANNEAL_MODEL_*` marker, or a model-marked call-chain
+/// helper ([`corpus_model_helper_names`]).
 fn is_corpus_helper_fn_name(name: &str) -> bool {
-    matches!(
-        name,
-        "helper_add_ten"
-            | "helper_reborrow_leaf"
-            | "helper_reborrow_mid"
-            | "helper_shared_leaf"
-            | "helper_shared_mid"
-            | "helper_violate_fn_entry_protector"
-            | "helper_unwind_leaf"
-            | "helper_unwind_mid"
-    ) || name.starts_with("__ANNEAL_MODEL_")
+    name == "helper_add_ten"
+        || name.starts_with("__ANNEAL_MODEL_")
+        || corpus_model_helper_names().contains(name)
 }
 
 /// Parse `corpus_source` and extract all zero-argument `pub fn` items other
@@ -3123,7 +3165,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
             let write_val: u32 = [1u32, 3u32, 7u32, 15u32][rng.gen_range(4)];
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass => match rng.gen_range(8) {
+                MutationMode::Pass => match rng.gen_range(10) {
                     // Reserved `&mut` coexisting with parent read before activation.
                     0 => syn::parse_quote! {
                         let mut __tb_slot: u32 = #init_val;
@@ -3205,12 +3247,33 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     },
                     // Multi-callee shared reference reborrow chain (`&u32`) with
                     // `RetagKind::FnEntry` protector release followed by parent write.
-                    _ => syn::parse_quote! {
+                    7 => syn::parse_quote! {
                         let mut __fns_slot: u32 = #init_val;
                         let __fns_shr: &u32 = &__fns_slot;
                         let __fns_seen: u32 = helper_shared_mid(__fns_shr, #write_val);
                         __fns_slot = __fns_seen ^ #write_val;
                         let #probe_ident: u32 = __fns_slot;
+                    },
+                    // `Operand::Copy` contrast to variant 4's `Operand::Move`: a
+                    // by-value copy of the `Copy` parent is a foreign read that
+                    // leaves the prior `Reserved` `&mut u32` writable.
+                    8 => syn::parse_quote! {
+                        let mut __cp_x: u32 = #init_val;
+                        let __cp_root: *mut u32 = &raw mut __cp_x;
+                        let __cp_res: &mut u32 = unsafe { &mut *__cp_root };
+                        let __cp_copied: u32 = __cp_x;
+                        *__cp_res = __cp_copied ^ #write_val;
+                        let #probe_ident: u32 = (*__cp_res) ^ __cp_copied;
+                    },
+                    // A reborrowed child returned from an `FnEntry`-protected
+                    // `&mut u32` argument outlives the callee frame; a later
+                    // parent write disables the dead child without UB.
+                    _ => syn::parse_quote! {
+                        let mut __rt_slot: u32 = #init_val;
+                        let __rt_child: &mut u32 = helper_reborrow_return(&mut __rt_slot);
+                        *__rt_child = (*__rt_child) ^ #write_val;
+                        __rt_slot = __rt_slot ^ #init_val;
+                        let #probe_ident: u32 = __rt_slot;
                     },
                 },
                 // Child write followed by parent read/write (legal in Tree
@@ -3279,14 +3342,22 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                         let #probe_ident: u32 = unsafe { *__fn_raw };
                     },
                 },
-                MutationMode::Panic => match rng.gen_range(2) {
+                MutationMode::Panic => match rng.gen_range(3) {
                     0 => syn::parse_quote! {
                         let __tb_ovf: u32 = u32::MAX;
                         let #probe_ident: u32 = __tb_ovf + #write_val;
                     },
-                    _ => syn::parse_quote! {
+                    // Overflow panic two `#[inline(never)]` frames deep, unwinding
+                    // past an `FnEntry`-protected `&u32` argument.
+                    1 => syn::parse_quote! {
                         let __tb_u_slot: u32 = #init_val;
                         let #probe_ident: u32 = helper_unwind_mid(&__tb_u_slot, u32::MAX);
+                    },
+                    // Overflow panic whose call edge is `UnwindAction::Cleanup`
+                    // (a live `UnwindCleanupGuard` is dropped while unwinding).
+                    _ => syn::parse_quote! {
+                        let __tb_g_base: u32 = u32::MAX;
+                        let #probe_ident: u32 = helper_unwind_guarded(__tb_g_base, #write_val);
                     },
                 },
                 MutationMode::Ub => {
@@ -3416,7 +3487,9 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             }
                             let #probe_ident: u32 = __ub_nc.0;
                         },
-                        // Multi-callee reborrow chain followed by frozen write UB during call.
+                        // After the `helper_reborrow_mid` chain returns, a by-value
+                        // call whose callee writes through a frozen callee-local
+                        // reborrow (UB inside the callee frame).
                         _ => syn::parse_quote! {
                             let mut __ub_prot_x: u32 = #init_val;
                             let __ub_prot_raw: *mut u32 = &raw mut __ub_prot_x;
@@ -3425,7 +3498,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                                 *__ub_prot_raw = __ub_prot_d;
                             }
                             let #probe_ident: u32 =
-                                helper_violate_fn_entry_protector(unsafe { *__ub_prot_raw });
+                                helper_frozen_reborrow_write_in_callee(unsafe { *__ub_prot_raw });
                         },
                     }
                 }
@@ -4773,12 +4846,12 @@ mod tests {
     }
 
     #[test]
-    fn corpus_seeds_load_all_106_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+    fn corpus_seeds_load_all_108_zero_arg_functions_and_do_not_blocklist_known_bugs() {
         let seeds = load_miri_diff_corpus_seeds();
         assert_eq!(
             seeds.len(),
-            106,
-            "expected 106 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+            108,
+            "expected 108 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
         );
         assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
         assert!(
@@ -4816,17 +4889,28 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "panic_multi_callee_unwind_chain")
         );
+        for name in [
+            "pass_fn_entry_returns_reborrowed_child",
+            "panic_multi_callee_unwind_cleanup_guard",
+            "ub_frozen_reborrow_write_in_callee_frame",
+        ] {
+            assert!(seeds.iter().any(|s| s.name == name), "missing seed {name}");
+        }
+        // Every model-marked call-chain helper is excluded from the seeds.
+        for helper in corpus_model_helper_names() {
+            assert!(
+                !seeds.iter().any(|s| &s.name == helper),
+                "helper {helper} leaked"
+            );
+        }
+        assert!(corpus_model_helper_names().contains("helper_unwind_guarded"));
         assert!(
             seeds
                 .iter()
                 .any(|s| s.name == "pass_intrinsics_bit_count_and_reverse")
         );
         assert!(!seeds.iter().any(|s| s.name == "helper_add_ten"));
-        assert!(
-            !seeds
-                .iter()
-                .any(|s| s.name.starts_with("__ANNEAL_MODEL_"))
-        );
+        assert!(!seeds.iter().any(|s| s.name.starts_with("__ANNEAL_MODEL_")));
 
         let raw_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
         let non_fault_indices = collect_non_fault_seed_indices(&raw_refs);
@@ -6540,6 +6624,95 @@ pub fn unsuffixed_off() -> u32 {
         assert!(saw_two);
     }
 
+    /// Every non-seed item of `tests/miri-diff/corpus/src/lib.rs` (types,
+    /// macros, model markers, helper functions, and trait impls) must appear,
+    /// token for token up to doc comments, in `MIRI_CORPUS_MODULE_PREAMBLE`, and
+    /// every name the corpus imports must be imported by the preamble, so a
+    /// standalone `repro.rs` never misses an item that a corpus seed uses.
+    #[test]
+    fn module_preamble_mirrors_every_corpus_helper_item_and_import() {
+        fn item_key(mut item: Item) -> String {
+            let strip =
+                |attrs: &mut Vec<syn::Attribute>| attrs.retain(|a| !a.path().is_ident("doc"));
+            match &mut item {
+                Item::Const(i) => strip(&mut i.attrs),
+                Item::Enum(i) => strip(&mut i.attrs),
+                Item::Fn(i) => strip(&mut i.attrs),
+                Item::Impl(i) => strip(&mut i.attrs),
+                Item::Macro(i) => strip(&mut i.attrs),
+                Item::Struct(i) => strip(&mut i.attrs),
+                Item::Union(i) => strip(&mut i.attrs),
+                _ => {}
+            }
+            item.to_token_stream().to_string()
+        }
+        fn imported_names(tree: &syn::UseTree, prefix: &str, out: &mut BTreeSet<String>) {
+            match tree {
+                syn::UseTree::Path(p) => {
+                    imported_names(&p.tree, &format!("{prefix}{}::", p.ident), out);
+                }
+                syn::UseTree::Name(n) => {
+                    out.insert(format!("{prefix}{}", n.ident));
+                }
+                syn::UseTree::Rename(r) => {
+                    out.insert(format!("{prefix}{} as {}", r.ident, r.rename));
+                }
+                syn::UseTree::Glob(_) => {
+                    out.insert(format!("{prefix}*"));
+                }
+                syn::UseTree::Group(g) => {
+                    for t in &g.items {
+                        imported_names(t, prefix, out);
+                    }
+                }
+            }
+        }
+        let corpus = syn::parse_file(RAW_MIRI_DIFF_CORPUS_RS).expect("corpus parses");
+        let preamble = syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE).expect("preamble parses");
+        let seeds: BTreeSet<String> = load_miri_diff_corpus_seeds()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let mut preamble_items = BTreeSet::new();
+        let mut preamble_imports = BTreeSet::new();
+        for item in preamble.items {
+            match item {
+                Item::Use(u) => imported_names(&u.tree, "", &mut preamble_imports),
+                other => {
+                    preamble_items.insert(item_key(other));
+                }
+            }
+        }
+        let mut checked = 0usize;
+        for item in corpus.items {
+            match item {
+                Item::Use(u) => {
+                    let mut names = BTreeSet::new();
+                    imported_names(&u.tree, "", &mut names);
+                    for name in names {
+                        assert!(
+                            preamble_imports.contains(&name),
+                            "MIRI_CORPUS_MODULE_PREAMBLE does not import `{name}`"
+                        );
+                    }
+                }
+                Item::Fn(ref f) if seeds.contains(&f.sig.ident.to_string()) => {}
+                other => {
+                    let key = item_key(other);
+                    assert!(
+                        preamble_items.contains(&key),
+                        "MIRI_CORPUS_MODULE_PREAMBLE is missing corpus item:\n{key}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 20,
+            "expected the corpus to declare helper items: {checked}"
+        );
+    }
+
     #[test]
     fn ep1_a0_synthesizes_category9_intrinsics_move_borrows_and_multi_callee_chains() {
         let base_seed = "pub fn probe(x: u32) -> u32 {\n    let a = x.leading_zeros() + x.trailing_zeros() + x.count_ones();\n    let b = x.swap_bytes().reverse_bits();\n    a.saturating_add(b).wrapping_add(1u32)\n}\n";
@@ -6619,7 +6792,10 @@ pub fn unsuffixed_off() -> u32 {
                     "helper_reborrow_mid(",
                     "helper_shared_mid(",
                     "helper_unwind_mid(",
-                    "helper_violate_fn_entry_protector(",
+                    "helper_frozen_reborrow_write_in_callee(",
+                    "let __cp_copied: u32 = __cp_x;",
+                    "helper_reborrow_return(",
+                    "helper_unwind_guarded(",
                 ] {
                     if src_t.contains(needle) {
                         tb_seen.insert(needle);
@@ -6660,7 +6836,10 @@ pub fn unsuffixed_off() -> u32 {
             "helper_reborrow_mid(",
             "helper_shared_mid(",
             "helper_unwind_mid(",
-            "helper_violate_fn_entry_protector(",
+            "helper_frozen_reborrow_write_in_callee(",
+            "let __cp_copied: u32 = __cp_x;",
+            "helper_reborrow_return(",
+            "helper_unwind_guarded(",
         ] {
             assert!(
                 tb_seen.contains(expected),

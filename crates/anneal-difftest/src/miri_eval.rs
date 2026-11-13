@@ -81,42 +81,76 @@ pub const WITNESS_POLARITY_NAMES: [&str; 4] = [
     "harness_or_extraction_error",
 ];
 
-/// Soundness direction of a `(MiriOutcome, AnnealOutcome)` comparison result.
+/// Soundness direction ("witness polarity") of a `(MiriOutcome, AnnealOutcome)`
+/// comparison result.
 ///
-/// Partitions every non-agreement into one of four mutually exclusive classes:
+/// Anneal's `MirSemantics` is meant to be a sound conservative abstraction of
+/// Miri (`-Zmiri-tree-borrows`): it may reject (`ub`) or refuse to model
+/// (`unsupported`) an execution that Miri accepts, but it must never accept an
+/// execution in which Miri faults. Every non-agreement is partitioned into
+/// exactly one of the four classes below, and agreement maps to `None`:
+///
 /// - [`WitnessPolarity::UnsoundMissedFault`] (`"unsound_missed_fault"`): Miri
-///   faults (`ub` or `panic`) while Anneal returns normally (`pass`), indicating
-///   a P0 soundness bug (`missed_ub`, `panic_vs_return`).
+///   faults (`ub` or `panic`) and Anneal does not report that fault: it returns
+///   normally, or (for Miri `ub`) panics or aborts instead (`missed_ub`,
+///   `panic_vs_return`). This is the P0 soundness direction.
 /// - [`WitnessPolarity::SoundConservativeAbstraction`]
-///   (`"sound_conservative_abstraction"`): Miri returns normally (`pass`) while
-///   Anneal conservatively rejects the execution with `ub` (`false_positive_ub`)
-///   or `unsupported` (`D1..D15` over-approximation).
-/// - [`WitnessPolarity::ValueMismatch`] (`"value_mismatch"`): Both Miri and
-///   Anneal terminate with conflicting normal values, fault classes, or fault
-///   locations (`wrong_value`, `return_vs_panic`, `ub_location_mismatch`,
-///   `panic_site_mismatch`, or `ub` vs `panic`/`abort`).
+///   (`"sound_conservative_abstraction"`): Miri does not report UB, while
+///   Anneal rejects the execution with `ub` (`false_positive_ub`, including Miri
+///   `panic` vs Anneal `ub`), or Miri returns normally and Anneal reports
+///   `unsupported` (`D1..D15` over-approximation).
+/// - [`WitnessPolarity::ValueMismatch`] (`"value_mismatch"`): Miri returns
+///   normally and Anneal returns a different value, returns `pass:other`,
+///   aborts, or panics (`wrong_value`, `return_vs_panic`), or both report the
+///   same fault class at incompatible (or missing) source locations
+///   (`ub_location_mismatch`, `panic_site_mismatch`).
 /// - [`WitnessPolarity::HarnessOrExtractionError`]
-///   (`"harness_or_extraction_error"`): Capture failure, Miri oracle error,
-///   out-of-fuel exhaustion, unmodeled external call, compile failure, or
-///   `unsupported` when Miri itself did not return normally.
+///   (`"harness_or_extraction_error"`): no semantic comparison was possible: a
+///   candidate compile failure, Miri oracle error, MIR capture or Lean probe
+///   failure, exhausted step fuel, an uninterpreted external call, or
+///   `unsupported` when Miri itself faulted (`panic` or `ub`), where Anneal's
+///   refusal neither confirms nor contradicts Miri's fault.
+///
+/// The map is total over the strict comparator [`compare_miri_and_anneal`]
+/// (rows: Miri outcome; columns: Anneal outcome; a Miri `oracle_error` row maps
+/// every column to `HarnessOrExtractionError`):
+///
+/// | Miri \ Anneal | `pass:unit` / `pass:scalar` | `pass:other`, `abort` | `panic` | `ub` | `unsupported` | `externalCall`, `outOfFuel`, `capture_error` |
+/// | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+/// | `pass` | `None` if unit/bits/width are equal, else `ValueMismatch` | `ValueMismatch` | `ValueMismatch` | `SoundConservativeAbstraction` | `SoundConservativeAbstraction` | `HarnessOrExtractionError` |
+/// | `panic` | `UnsoundMissedFault` | `UnsoundMissedFault` | `None` if Miri's site lies in Anneal's span, else `ValueMismatch` | `SoundConservativeAbstraction` | `HarnessOrExtractionError` | `HarnessOrExtractionError` |
+/// | `ub` | `UnsoundMissedFault` | `UnsoundMissedFault` | `UnsoundMissedFault` | `None` if Miri's site lies in Anneal's span, else `ValueMismatch` | `HarnessOrExtractionError` | `HarnessOrExtractionError` |
+///
+/// Miri `panic` vs Anneal `abort` is `panic_vs_return` and therefore
+/// `UnsoundMissedFault`: Anneal claims that no unwinding (and so no cleanup
+/// code) runs, which is flagged for triage rather than hidden as a mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WitnessPolarity {
-    /// Miri reports `ub` or `panic` while Anneal reports `pass` (`missed_ub`,
-    /// `panic_vs_return`).
+    /// Miri reports `ub` or `panic` while Anneal does not report that fault
+    /// (`missed_ub`, `panic_vs_return`).
     UnsoundMissedFault,
-    /// Miri reports `pass` while Anneal conservatively reports `ub` or
-    /// `unsupported` (`false_positive_ub`, or `unsupported` when Miri passes).
+    /// Miri reports no UB while Anneal reports `ub` (`false_positive_ub`), or
+    /// Miri returns normally while Anneal reports `unsupported`.
     SoundConservativeAbstraction,
-    /// Both Miri and Anneal terminate with conflicting return values, fault
-    /// classes, or fault locations (`wrong_value`, `return_vs_panic`,
-    /// `ub_location_mismatch`, `panic_site_mismatch`).
+    /// Miri returns normally and Anneal returns a different value, aborts, or
+    /// panics (`wrong_value`, `return_vs_panic`), or both report the same fault
+    /// class at incompatible locations (`ub_location_mismatch`,
+    /// `panic_site_mismatch`).
     ValueMismatch,
-    /// Capture error, Miri oracle error, out-of-fuel, external call, compile
-    /// failure, or `unsupported` when Miri did not pass.
+    /// Compile failure, Miri oracle error, capture or Lean failure, out-of-fuel,
+    /// external call, or `unsupported` when Miri faulted.
     HarnessOrExtractionError,
 }
 
 impl WitnessPolarity {
+    /// Every polarity class, in [`WITNESS_POLARITY_NAMES`] order.
+    pub const ALL: [WitnessPolarity; 4] = [
+        Self::UnsoundMissedFault,
+        Self::SoundConservativeAbstraction,
+        Self::ValueMismatch,
+        Self::HarnessOrExtractionError,
+    ];
+
     /// Canonical JSON / CLI slug for this polarity class.
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -129,13 +163,8 @@ impl WitnessPolarity {
 
     /// Parse a canonical witness polarity slug back into [`WitnessPolarity`].
     pub fn from_str_slug(slug: &str) -> Option<Self> {
-        match slug.trim() {
-            "unsound_missed_fault" => Some(Self::UnsoundMissedFault),
-            "sound_conservative_abstraction" => Some(Self::SoundConservativeAbstraction),
-            "value_mismatch" => Some(Self::ValueMismatch),
-            "harness_or_extraction_error" => Some(Self::HarnessOrExtractionError),
-            _ => None,
-        }
+        let slug = slug.trim();
+        Self::ALL.into_iter().find(|p| p.as_str() == slug)
     }
 
     /// Whether this polarity represents an unsound missed fault (`missed_ub` or
@@ -165,36 +194,47 @@ pub fn classify_divergence_kind_polarity(kind: &DivergenceKind) -> WitnessPolari
     }
 }
 
+/// Classify a [`NotComparedReason`] into its [`WitnessPolarity`]: `unsupported`
+/// is a [`WitnessPolarity::SoundConservativeAbstraction`] exactly when Miri
+/// returned normally, and every other case (including `unsupported` when Miri
+/// faulted or failed) is a [`WitnessPolarity::HarnessOrExtractionError`].
+pub fn classify_not_compared_polarity(
+    miri: &MiriOutcome,
+    reason: &NotComparedReason,
+) -> WitnessPolarity {
+    match reason {
+        NotComparedReason::Unsupported(_)
+            if matches!(miri, MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. }) =>
+        {
+            WitnessPolarity::SoundConservativeAbstraction
+        }
+        NotComparedReason::ExternalCall(_)
+        | NotComparedReason::Unsupported(_)
+        | NotComparedReason::OutOfFuel(_)
+        | NotComparedReason::MiriOracleError(_)
+        | NotComparedReason::CaptureFailed(_) => WitnessPolarity::HarnessOrExtractionError,
+    }
+}
+
 /// Classify a `(MiriOutcome, AnnealOutcome)` pair together with its precomputed
 /// [`ComparisonVerdict`] (such as the panic-site reconciled verdict from
 /// [`compare_difftest_miri_and_anneal`]) into its [`WitnessPolarity`], returning
 /// `None` on agreement.
+///
+/// The polarity is a function of the verdict and of whether Miri returned
+/// normally; `_anneal` is accepted so callers can pass the full comparison
+/// triple.
 pub fn classify_verdict_witness_polarity(
     miri: &MiriOutcome,
-    anneal: &AnnealOutcome,
+    _anneal: &AnnealOutcome,
     verdict: &ComparisonVerdict,
 ) -> Option<WitnessPolarity> {
     match verdict {
         ComparisonVerdict::Agree => None,
         ComparisonVerdict::Diverge(kind) => Some(classify_divergence_kind_polarity(kind)),
-        ComparisonVerdict::NotCompared(reason) => match reason {
-            NotComparedReason::Unsupported(_)
-                if matches!(
-                    miri,
-                    MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. }
-                ) =>
-            {
-                Some(WitnessPolarity::SoundConservativeAbstraction)
-            }
-            NotComparedReason::ExternalCall(_)
-            | NotComparedReason::Unsupported(_)
-            | NotComparedReason::OutOfFuel(_)
-            | NotComparedReason::MiriOracleError(_)
-            | NotComparedReason::CaptureFailed(_) => {
-                let _ = anneal;
-                Some(WitnessPolarity::HarnessOrExtractionError)
-            }
-        },
+        ComparisonVerdict::NotCompared(reason) => {
+            Some(classify_not_compared_polarity(miri, reason))
+        }
     }
 }
 
@@ -209,94 +249,211 @@ pub fn classify_witness_polarity(
     classify_verdict_witness_polarity(miri, anneal, &verdict)
 }
 
-/// Classify serialized outcome tags (`miri_outcome`, `anneal_outcome`) and an
-/// optional `divergence_class` or `not_compared` reason slug into
-/// [`WitnessPolarity`], returning `None` when the outcomes agree.
+/// Split a located outcome tag `<family>` or `<family>@<location>` into its
+/// optional location, or return `None` when `tag` belongs to another family.
+fn split_located_outcome_tag<'a>(tag: &'a str, family: &str) -> Option<Option<&'a str>> {
+    if tag == family {
+        return Some(None);
+    }
+    tag.strip_prefix(family)?.strip_prefix('@').map(Some)
+}
+
+/// Parse the `<bits>:<size_bytes>` suffix of a `pass:scalar:` outcome tag.
+fn parse_scalar_tag_fields(rest: &str) -> Option<(u128, u32)> {
+    let (bits, size) = rest.split_once(':')?;
+    Some((bits.trim().parse().ok()?, size.trim().parse().ok()?))
+}
+
+/// Parse a [`MiriOutcome::summary_tag`] (`pass:unit`,
+/// `pass:scalar:<bits>:<size_bytes>`, `panic[@<file>:<line>:<col>]`,
+/// `ub[@<file>:<line>:<col>]`, or `oracle_error:<message>`) back into a
+/// [`MiriOutcome`].
+///
+/// Summary tags omit Miri's diagnostic text, so a parsed `Panic` or `Ub`
+/// carries an empty `message`. Returns `None` for any other spelling, including
+/// a malformed location.
+pub fn parse_miri_summary_tag(tag: &str) -> Option<MiriOutcome> {
+    let tag = tag.trim();
+    if tag == "pass:unit" {
+        return Some(MiriOutcome::PassUnit);
+    }
+    if let Some(rest) = tag.strip_prefix("pass:scalar:") {
+        let (bits, size_bytes) = parse_scalar_tag_fields(rest)?;
+        return Some(MiriOutcome::PassScalar { bits, size_bytes });
+    }
+    if let Some(message) = tag.strip_prefix("oracle_error:") {
+        return Some(MiriOutcome::OracleError(message.to_string()));
+    }
+    let parse_pos = |loc: Option<&str>| -> Option<Option<SourcePos>> {
+        match loc {
+            None => Some(None),
+            Some(raw) => SourcePos::parse_rustc_pos(raw).map(Some),
+        }
+    };
+    if let Some(loc) = split_located_outcome_tag(tag, "panic") {
+        return Some(MiriOutcome::Panic {
+            pos: parse_pos(loc)?,
+            message: String::new(),
+        });
+    }
+    if let Some(loc) = split_located_outcome_tag(tag, "ub") {
+        return Some(MiriOutcome::Ub {
+            pos: parse_pos(loc)?,
+            message: String::new(),
+        });
+    }
+    None
+}
+
+/// Parse an [`AnnealOutcome::summary_tag`] (`pass:unit`,
+/// `pass:scalar:<bits>:<size_bytes>`, `pass:other`, `panic[@<span>]`,
+/// `abort[@<span>]`, `ub[@<span>]`, `unsupported[@<span>]`,
+/// `externalCall:<def_path>`, `outOfFuel`, or `capture_error:<message>`) back
+/// into an [`AnnealOutcome`].
+///
+/// Summary tags omit the spans of `externalCall` and `outOfFuel`, which parse
+/// with `span: None`. Returns `None` for any other spelling, including a
+/// malformed span.
+pub fn parse_anneal_summary_tag(tag: &str) -> Option<AnnealOutcome> {
+    let tag = tag.trim();
+    match tag {
+        "pass:unit" => return Some(AnnealOutcome::PassUnit),
+        "pass:other" => return Some(AnnealOutcome::PassOther),
+        "outOfFuel" => return Some(AnnealOutcome::OutOfFuel { span: None }),
+        _ => {}
+    }
+    if let Some(rest) = tag.strip_prefix("pass:scalar:") {
+        let (bits, size_bytes) = parse_scalar_tag_fields(rest)?;
+        return Some(AnnealOutcome::PassScalar { bits, size_bytes });
+    }
+    if let Some(def_path) = tag.strip_prefix("externalCall:") {
+        return Some(AnnealOutcome::ExternalCall {
+            def_path: def_path.to_string(),
+            span: None,
+        });
+    }
+    if let Some(message) = tag.strip_prefix("capture_error:") {
+        return Some(AnnealOutcome::CaptureOrLeanError(message.to_string()));
+    }
+    let parse_span = |loc: Option<&str>| -> Option<Option<SourceSpan>> {
+        match loc {
+            None => Some(None),
+            Some(raw) => SourceSpan::parse_anneal_span(raw).map(Some),
+        }
+    };
+    if let Some(loc) = split_located_outcome_tag(tag, "panic") {
+        return Some(AnnealOutcome::Panic {
+            span: parse_span(loc)?,
+        });
+    }
+    if let Some(loc) = split_located_outcome_tag(tag, "abort") {
+        return Some(AnnealOutcome::Abort {
+            span: parse_span(loc)?,
+        });
+    }
+    if let Some(loc) = split_located_outcome_tag(tag, "ub") {
+        return Some(AnnealOutcome::Ub {
+            span: parse_span(loc)?,
+        });
+    }
+    if let Some(loc) = split_located_outcome_tag(tag, "unsupported") {
+        return Some(AnnealOutcome::Unsupported {
+            span: parse_span(loc)?,
+        });
+    }
+    None
+}
+
+/// Classify serialized outcome tags ([`MiriOutcome::summary_tag`],
+/// [`AnnealOutcome::summary_tag`]) and an optional verdict slug (`"agree"`, a
+/// [`DIVERGENCE_CLASS_NAMES`] class, or a [`NOT_COMPARED_REASON_NAMES`] reason,
+/// optionally prefixed with `not_compared_`) into [`WitnessPolarity`],
+/// returning `None` on agreement.
+///
+/// A recognized slug decides the class (so a panic-site reconciled `"agree"`
+/// stays an agreement); the slug `unsupported` additionally consults the Miri
+/// tag. Without a recognized slug, both tags are parsed back into outcomes
+/// ([`parse_miri_summary_tag`], [`parse_anneal_summary_tag`]) and classified
+/// with [`classify_witness_polarity`], including source-site containment for
+/// `panic` and `ub`. Tags that do not parse cannot be compared semantically and
+/// classify as [`WitnessPolarity::HarnessOrExtractionError`].
 pub fn classify_outcome_tags_polarity(
     miri_tag: &str,
     anneal_tag: &str,
     divergence_or_reason: Option<&str>,
 ) -> Option<WitnessPolarity> {
-    let m = miri_tag.trim();
-    let a = anneal_tag.trim();
-    if let Some(tag) = divergence_or_reason.map(str::trim).filter(|s| !s.is_empty()) {
-        match tag {
+    let miri = parse_miri_summary_tag(miri_tag);
+    if let Some(slug) = divergence_or_reason.map(str::trim).filter(|s| !s.is_empty()) {
+        let slug = slug.strip_prefix("not_compared_").unwrap_or(slug);
+        match slug {
             "agree" => return None,
             "missed_ub" | "panic_vs_return" => return Some(WitnessPolarity::UnsoundMissedFault),
             "false_positive_ub" => return Some(WitnessPolarity::SoundConservativeAbstraction),
             "wrong_value" | "return_vs_panic" | "ub_location_mismatch" | "panic_site_mismatch" => {
                 return Some(WitnessPolarity::ValueMismatch);
             }
-            "unsupported" | "not_compared_unsupported" => {
-                if m.starts_with("pass") {
-                    return Some(WitnessPolarity::SoundConservativeAbstraction);
-                }
-                return Some(WitnessPolarity::HarnessOrExtractionError);
+            "unsupported" => {
+                return Some(
+                    if matches!(
+                        miri,
+                        Some(MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. })
+                    ) {
+                        WitnessPolarity::SoundConservativeAbstraction
+                    } else {
+                        WitnessPolarity::HarnessOrExtractionError
+                    },
+                );
             }
-            "compile_failed"
-            | "external_call"
-            | "out_of_fuel"
-            | "miri_oracle_error"
-            | "capture_failed"
-            | "not_compared_external_call"
-            | "not_compared_out_of_fuel"
-            | "not_compared_miri_oracle_error"
-            | "not_compared_capture_failed" => {
-                return Some(WitnessPolarity::HarnessOrExtractionError);
-            }
+            "compile_failed" | "external_call" | "out_of_fuel" | "miri_oracle_error"
+            | "capture_failed" => return Some(WitnessPolarity::HarnessOrExtractionError),
             _ => {}
         }
     }
+    match (miri, parse_anneal_summary_tag(anneal_tag)) {
+        (Some(miri), Some(anneal)) => classify_witness_polarity(&miri, &anneal),
+        _ => Some(WitnessPolarity::HarnessOrExtractionError),
+    }
+}
 
-    let miri_is_pass = m.starts_with("pass");
-    let miri_is_ub = m == "ub" || m.starts_with("ub@") || m.starts_with("ub:");
-    let miri_is_panic = m == "panic" || m.starts_with("panic@") || m.starts_with("panic:");
-    let miri_is_error = m.starts_with("oracle_error") || m == "error";
-
-    let anneal_is_pass = a.starts_with("pass");
-    let anneal_is_ub = a == "ub" || a.starts_with("ub@") || a.starts_with("ub:");
-    let anneal_is_panic = a == "panic" || a.starts_with("panic@") || a.starts_with("panic:");
-    let anneal_is_abort = a == "abort" || a.starts_with("abort@") || a.starts_with("abort:");
-    let anneal_is_unsupported = a == "unsupported" || a.starts_with("unsupported@");
-    let anneal_is_harness = a.starts_with("externalCall")
-        || a.starts_with("external_call")
-        || a.starts_with("outOfFuel")
-        || a.starts_with("out_of_fuel")
-        || a.starts_with("capture_or_lean_error")
-        || a.starts_with("capture_error")
-        || a == "error";
-
-    if miri_is_error || anneal_is_harness {
-        return Some(WitnessPolarity::HarnessOrExtractionError);
-    }
-    if anneal_is_unsupported {
-        if miri_is_pass {
-            return Some(WitnessPolarity::SoundConservativeAbstraction);
-        }
-        return Some(WitnessPolarity::HarnessOrExtractionError);
-    }
-    if miri_is_ub && !anneal_is_ub {
-        return Some(WitnessPolarity::UnsoundMissedFault);
-    }
-    if miri_is_panic && (anneal_is_pass || anneal_is_abort) {
-        return Some(WitnessPolarity::UnsoundMissedFault);
-    }
-    if (miri_is_pass || miri_is_panic) && anneal_is_ub {
-        return Some(WitnessPolarity::SoundConservativeAbstraction);
-    }
-    if miri_is_pass && anneal_is_pass {
-        if m == a {
-            return None;
-        }
-        return Some(WitnessPolarity::ValueMismatch);
-    }
-    if (miri_is_ub && anneal_is_ub) || (miri_is_panic && anneal_is_panic) {
-        if m == a || !m.contains('@') || !a.contains('@') {
-            return None;
-        }
-        return Some(WitnessPolarity::ValueMismatch);
-    }
-    Some(WitnessPolarity::ValueMismatch)
+/// Check the accounting identities that tie `witness_polarity_counts` to the
+/// rest of a [`MiriCampaignEvalReport`]:
+///
+/// 1. the keys are exactly [`WITNESS_POLARITY_NAMES`];
+/// 2. the counts sum to `diverge_count + not_compared_count` (every
+///    non-agreement, including compile failures, has exactly one polarity);
+/// 3. `unsound_missed_fault` = `missed_ub` + `panic_vs_return`, and
+///    `value_mismatch` = `wrong_value` + `return_vs_panic` +
+///    `ub_location_mismatch` + `panic_site_mismatch`;
+/// 4. `sound_conservative_abstraction` = `false_positive_ub` + (the
+///    `unsupported` not-compared candidates on which Miri returned normally),
+///    so it lies between `false_positive_ub` and `false_positive_ub` +
+///    `not_compared_reasons["unsupported"]`, and together with
+///    `harness_or_extraction_error` it accounts for every `false_positive_ub`
+///    divergence and every not-compared candidate.
+pub fn witness_polarity_accounting_holds(report: &MiriCampaignEvalReport) -> bool {
+    let count = |map: &BTreeMap<String, usize>, key: &str| map.get(key).copied().unwrap_or(0);
+    let pol = |p: WitnessPolarity| count(&report.witness_polarity_counts, p.as_str());
+    let div = |class: &str| count(&report.divergence_classes, class);
+    let keys_ok = report.witness_polarity_counts.len() == WITNESS_POLARITY_NAMES.len()
+        && WITNESS_POLARITY_NAMES
+            .iter()
+            .all(|k| report.witness_polarity_counts.contains_key(*k));
+    let total: usize = report.witness_polarity_counts.values().sum();
+    let not_compared_total: usize = report.not_compared_reasons.values().sum();
+    let conservative = pol(WitnessPolarity::SoundConservativeAbstraction);
+    let conservative_unsupported = conservative.checked_sub(div("false_positive_ub"));
+    keys_ok
+        && total == report.diverge_count + report.not_compared_count
+        && pol(WitnessPolarity::UnsoundMissedFault) == div("missed_ub") + div("panic_vs_return")
+        && pol(WitnessPolarity::ValueMismatch)
+            == div("wrong_value")
+                + div("return_vs_panic")
+                + div("ub_location_mismatch")
+                + div("panic_site_mismatch")
+        && conservative_unsupported
+            .is_some_and(|n| n <= count(&report.not_compared_reasons, "unsupported"))
+        && conservative + pol(WitnessPolarity::HarnessOrExtractionError)
+            == div("false_positive_ub") + not_compared_total
 }
 
 /// `DefPath` spellings of the `core::fmt::Arguments` constructors that
@@ -2202,6 +2359,70 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     .join("\n\n")
 }
 
+/// Collect every identifier token in `tokens`, recursing into delimited groups.
+fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+    for tt in tokens {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => {
+                out.insert(id.to_string());
+            }
+            proc_macro2::TokenTree::Group(g) => collect_ident_tokens(g.stream(), out),
+            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
+}
+
+/// Names of the top-level functions of a staged `src/lib.rs` that its
+/// candidates reach, transitively.
+///
+/// The candidates are the text after [`MIRI_CORPUS_MODULE_PREAMBLE`] when the
+/// staged crate embeds it (generated batches and reproducers), and the whole
+/// crate otherwise (the identity corpus). A function is reached when its name
+/// occurs as an identifier token in a candidate or in the body of a reached
+/// function, so a depth-`k` model-helper chain (`helper_reborrow_mid` calling
+/// `helper_reborrow_leaf`) is linked without a hard-coded helper list.
+fn staged_helper_fns_reachable_from_candidates(lib_rs: &str) -> BTreeSet<String> {
+    let candidate_portion = lib_rs
+        .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
+        .map_or(lib_rs, |(_, rest)| rest);
+    let mut mentioned = BTreeSet::new();
+    if let Ok(tokens) = candidate_portion.parse::<proc_macro2::TokenStream>() {
+        collect_ident_tokens(tokens, &mut mentioned);
+    }
+    let fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = syn::parse_file(lib_rs)
+        .map(|file| {
+            file.items
+                .into_iter()
+                .filter_map(|item| match item {
+                    syn::Item::Fn(func) => Some((
+                        func.sig.ident.to_string(),
+                        quote::ToTokens::to_token_stream(&func.block),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut reached = BTreeSet::new();
+    let mut worklist: Vec<String> = mentioned
+        .into_iter()
+        .filter(|name| fn_bodies.contains_key(name))
+        .collect();
+    while let Some(name) = worklist.pop() {
+        if !reached.insert(name.clone()) {
+            continue;
+        }
+        let mut callees = BTreeSet::new();
+        collect_ident_tokens(fn_bodies[&name].clone(), &mut callees);
+        worklist.extend(
+            callees
+                .into_iter()
+                .filter(|callee| fn_bodies.contains_key(callee) && !reached.contains(callee)),
+        );
+    }
+    reached
+}
+
 fn create_staging_dir(label: &str) -> Result<PathBuf, String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2730,19 +2951,9 @@ fn run_linked_difftest_oracle_pipeline(
     let lib_rs_path = corpus_root.join("src/lib.rs");
     let lib_rs = fs::read_to_string(&lib_rs_path)
         .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
-    let candidate_portion = lib_rs
-        .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
-        .map(|(_, rest)| rest)
-        .unwrap_or(lib_rs.as_str());
-    let uses_reborrow_mid = candidate_portion.contains("helper_reborrow_mid");
-    let uses_violate_prot = candidate_portion.contains("helper_violate_fn_entry_protector");
-    let uses_reborrow_leaf = candidate_portion.contains("helper_reborrow_leaf")
-        || uses_reborrow_mid
-        || uses_violate_prot;
-    let uses_shared_mid = candidate_portion.contains("helper_shared_mid");
-    let uses_shared_leaf = candidate_portion.contains("helper_shared_leaf") || uses_shared_mid;
-    let uses_unwind_mid = candidate_portion.contains("helper_unwind_mid");
-    let uses_unwind_leaf = candidate_portion.contains("helper_unwind_leaf") || uses_unwind_mid;
+    // Model-marked (`__ANNEAL_MODEL_<name>`) helper functions are linked as
+    // intra-crate callees exactly when the staged candidates reach them.
+    let reachable_helpers = staged_helper_fns_reachable_from_candidates(&lib_rs);
 
     let subject_records: Vec<_> = records
         .iter()
@@ -2757,16 +2968,7 @@ fn run_linked_difftest_oracle_pipeline(
                     .rsplit("::")
                     .next()
                     .unwrap_or(&r.target.def_id);
-                return match short {
-                    "helper_reborrow_leaf" => uses_reborrow_leaf,
-                    "helper_reborrow_mid" => uses_reborrow_mid,
-                    "helper_shared_leaf" => uses_shared_leaf,
-                    "helper_shared_mid" => uses_shared_mid,
-                    "helper_unwind_leaf" => uses_unwind_leaf,
-                    "helper_unwind_mid" => uses_unwind_mid,
-                    "helper_violate_fn_entry_protector" => uses_violate_prot,
-                    other => candidate_portion.contains(other),
-                };
+                return reachable_helpers.contains(short);
             }
             false
         })
@@ -3607,7 +3809,7 @@ pub fn evaluate_miri_batches_with_options(
     let not_compared_count = compile_failed_candidates + oracle_report.not_compared_count;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    Ok(MiriCampaignEvalReport {
+    let report = MiriCampaignEvalReport {
         mode: mode.to_string(),
         seed,
         batches: batches.len(),
@@ -3633,7 +3835,23 @@ pub fn evaluate_miri_batches_with_options(
         obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
         item_reports: oracle_report.items,
         elapsed_ms,
-    })
+    };
+    // Fail closed: Episode 2 consumers read `witness_polarity_counts` as a
+    // partition of every non-agreement, so an accounting drift must never be
+    // reported as a clean campaign.
+    if !witness_polarity_accounting_holds(&report) {
+        return Err(format!(
+            "witness polarity accounting identity violated: witness_polarity_counts={:?}, \
+             divergence_classes={:?}, not_compared_reasons={:?}, diverge_count={}, \
+             not_compared_count={}",
+            report.witness_polarity_counts,
+            report.divergence_classes,
+            report.not_compared_reasons,
+            report.diverge_count,
+            report.not_compared_count
+        ));
+    }
+    Ok(report)
 }
 
 /// Re-run a standalone `repro.rs` file through the live helper-linked Miri +
@@ -6973,5 +7191,406 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             classify_outcome_tags_polarity("pass:unit", "externalCall:foo", Some("external_call")),
             Some(WitnessPolarity::HarnessOrExtractionError)
         );
+    }
+
+    /// Independent restatement of the documented [`WitnessPolarity`] total map,
+    /// written directly from the table in its doc comment rather than through
+    /// [`compare_miri_and_anneal`].
+    fn documented_witness_polarity(
+        miri: &MiriOutcome,
+        anneal: &AnnealOutcome,
+    ) -> Option<WitnessPolarity> {
+        use WitnessPolarity::*;
+        let miri_returns = matches!(miri, MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. });
+        if matches!(miri, MiriOutcome::OracleError(_)) {
+            return Some(HarnessOrExtractionError);
+        }
+        match anneal {
+            AnnealOutcome::ExternalCall { .. }
+            | AnnealOutcome::OutOfFuel { .. }
+            | AnnealOutcome::CaptureOrLeanError(_) => return Some(HarnessOrExtractionError),
+            AnnealOutcome::Unsupported { .. } => {
+                return Some(if miri_returns {
+                    SoundConservativeAbstraction
+                } else {
+                    HarnessOrExtractionError
+                });
+            }
+            _ => {}
+        }
+        let site_in_span = |pos: &Option<SourcePos>, span: &Option<SourceSpan>| {
+            matches!((pos, span), (Some(p), Some(s)) if s.contains_pos(p))
+        };
+        match (miri, anneal) {
+            (MiriOutcome::PassUnit, AnnealOutcome::PassUnit) => None,
+            (
+                MiriOutcome::PassScalar { bits, size_bytes },
+                AnnealOutcome::PassScalar {
+                    bits: a_bits,
+                    size_bytes: a_size,
+                },
+            ) if bits == a_bits && size_bytes == a_size => None,
+            (_, AnnealOutcome::Ub { .. }) if miri_returns => Some(SoundConservativeAbstraction),
+            (_, _) if miri_returns => Some(ValueMismatch),
+            (MiriOutcome::Panic { pos, .. }, AnnealOutcome::Panic { span }) => {
+                (!site_in_span(pos, span)).then_some(ValueMismatch)
+            }
+            (MiriOutcome::Panic { .. }, AnnealOutcome::Ub { .. }) => {
+                Some(SoundConservativeAbstraction)
+            }
+            (MiriOutcome::Panic { .. }, _) => Some(UnsoundMissedFault),
+            (MiriOutcome::Ub { pos, .. }, AnnealOutcome::Ub { span }) => {
+                (!site_in_span(pos, span)).then_some(ValueMismatch)
+            }
+            (MiriOutcome::Ub { .. }, _) => Some(UnsoundMissedFault),
+            _ => unreachable!("every Miri row is covered: {miri:?} vs {anneal:?}"),
+        }
+    }
+
+    /// The verdict slug that a campaign report records for `verdict`: `agree`,
+    /// the divergence class, or the not-compared reason key.
+    fn verdict_slug(verdict: &ComparisonVerdict) -> &'static str {
+        match verdict {
+            ComparisonVerdict::Agree => "agree",
+            ComparisonVerdict::Diverge(kind) => divergence_class_slug(kind),
+            ComparisonVerdict::NotCompared(reason) => match reason {
+                NotComparedReason::ExternalCall(_) => "external_call",
+                NotComparedReason::Unsupported(_) => "unsupported",
+                NotComparedReason::OutOfFuel(_) => "out_of_fuel",
+                NotComparedReason::MiriOracleError(_) => "miri_oracle_error",
+                NotComparedReason::CaptureFailed(_) => "capture_failed",
+            },
+        }
+    }
+
+    #[test]
+    fn witness_polarity_total_map_matches_documented_table_and_tag_roundtrip() {
+        let pos = |line: u32, col: u32| SourcePos {
+            file: "src/lib.rs".to_string(),
+            line,
+            col,
+        };
+        let span = |line: u32, start_col: u32, end_col: u32| SourceSpan {
+            file: "src/lib.rs".to_string(),
+            start_line: line,
+            start_col,
+            end_line: line,
+            end_col,
+        };
+        let miri_outcomes = vec![
+            MiriOutcome::PassUnit,
+            MiriOutcome::PassScalar {
+                bits: 42,
+                size_bytes: 4,
+            },
+            MiriOutcome::PassScalar {
+                bits: 42,
+                size_bytes: 8,
+            },
+            MiriOutcome::Panic {
+                pos: Some(pos(10, 5)),
+                message: "attempt to add with overflow".to_string(),
+            },
+            MiriOutcome::Panic {
+                pos: None,
+                message: "panicked".to_string(),
+            },
+            MiriOutcome::Ub {
+                pos: Some(pos(10, 5)),
+                message: "Undefined Behavior: protected tag".to_string(),
+            },
+            MiriOutcome::Ub {
+                pos: None,
+                message: "Undefined Behavior".to_string(),
+            },
+            MiriOutcome::OracleError("driver failed".to_string()),
+        ];
+        let anneal_outcomes = vec![
+            AnnealOutcome::PassUnit,
+            AnnealOutcome::PassScalar {
+                bits: 42,
+                size_bytes: 4,
+            },
+            AnnealOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4,
+            },
+            AnnealOutcome::PassOther,
+            AnnealOutcome::Panic {
+                span: Some(span(10, 1, 20)),
+            },
+            AnnealOutcome::Panic {
+                span: Some(span(20, 1, 20)),
+            },
+            AnnealOutcome::Panic { span: None },
+            AnnealOutcome::Abort {
+                span: Some(span(10, 1, 20)),
+            },
+            AnnealOutcome::Ub {
+                span: Some(span(10, 1, 20)),
+            },
+            AnnealOutcome::Ub {
+                span: Some(span(20, 1, 20)),
+            },
+            AnnealOutcome::Ub { span: None },
+            AnnealOutcome::Unsupported {
+                span: Some(span(10, 1, 20)),
+            },
+            AnnealOutcome::Unsupported { span: None },
+            AnnealOutcome::ExternalCall {
+                def_path: "core::panicking::panic_fmt".to_string(),
+                span: None,
+            },
+            AnnealOutcome::OutOfFuel { span: None },
+            AnnealOutcome::CaptureOrLeanError("lake failed".to_string()),
+        ];
+
+        let mut seen: BTreeSet<Option<WitnessPolarity>> = BTreeSet::new();
+        for miri in &miri_outcomes {
+            // Summary tags parse back into an outcome with the same tag.
+            let miri_tag = miri.summary_tag();
+            let reparsed_miri = parse_miri_summary_tag(&miri_tag)
+                .unwrap_or_else(|| panic!("Miri tag `{miri_tag}` must parse"));
+            assert_eq!(reparsed_miri.summary_tag(), miri_tag);
+            for anneal in &anneal_outcomes {
+                let anneal_tag = anneal.summary_tag();
+                let reparsed_anneal = parse_anneal_summary_tag(&anneal_tag)
+                    .unwrap_or_else(|| panic!("Anneal tag `{anneal_tag}` must parse"));
+                assert_eq!(reparsed_anneal.summary_tag(), anneal_tag);
+
+                let expected = documented_witness_polarity(miri, anneal);
+                seen.insert(expected);
+                let verdict = compare_miri_and_anneal(miri, anneal);
+                assert_eq!(
+                    classify_witness_polarity(miri, anneal),
+                    expected,
+                    "structured classifier disagrees with the documented map for \
+                     ({miri_tag}, {anneal_tag}) with verdict {verdict:?}"
+                );
+                assert_eq!(
+                    classify_verdict_witness_polarity(miri, anneal, &verdict),
+                    expected
+                );
+                assert_eq!(expected.is_none(), verdict.is_agree());
+                // Tag-only classification (no verdict slug) recovers the same
+                // polarity, including source-site containment for `panic`/`ub`.
+                assert_eq!(
+                    classify_outcome_tags_polarity(&miri_tag, &anneal_tag, None),
+                    expected,
+                    "tag classifier (no slug) disagrees for ({miri_tag}, {anneal_tag})"
+                );
+                // So does classification with the verdict slug a report records,
+                // with and without the `not_compared_` prefix.
+                let slug = verdict_slug(&verdict);
+                assert_eq!(
+                    classify_outcome_tags_polarity(&miri_tag, &anneal_tag, Some(slug)),
+                    expected,
+                    "tag classifier (slug `{slug}`) disagrees for ({miri_tag}, {anneal_tag})"
+                );
+                if verdict.is_not_compared() {
+                    let prefixed = format!("not_compared_{slug}");
+                    assert_eq!(
+                        classify_outcome_tags_polarity(&miri_tag, &anneal_tag, Some(&prefixed)),
+                        expected
+                    );
+                }
+            }
+        }
+        // The sample product reaches agreement and all four polarity classes.
+        assert!(seen.contains(&None));
+        for pol in WitnessPolarity::ALL {
+            assert!(seen.contains(&Some(pol)), "sample product never produced {pol}");
+        }
+
+        // `ALL` and `WITNESS_POLARITY_NAMES` list the same slugs in order.
+        assert_eq!(
+            WitnessPolarity::ALL.map(|p| p.as_str()),
+            WITNESS_POLARITY_NAMES
+        );
+
+        // A Miri site inside Anneal's span agrees even though the tags differ
+        // as strings; a missing location on either side is a mismatch.
+        assert_eq!(
+            classify_outcome_tags_polarity("ub@src/lib.rs:10:5", "ub@src/lib.rs:10:1: 10:20", None),
+            None
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("ub@src/lib.rs:10:5", "ub@src/lib.rs:11:1: 11:20", None),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("ub", "ub@src/lib.rs:10:1: 10:20", None),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("panic@src/lib.rs:10:5", "panic", None),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        // Unparseable tags cannot be compared semantically.
+        for (m, a) in [
+            ("pass", "pass:unit"),
+            ("pass:unit", "passed"),
+            ("ub@not-a-position", "ub@src/lib.rs:10:1: 10:20"),
+            ("panicked", "panic"),
+            ("pass:scalar:1", "pass:scalar:1:4"),
+        ] {
+            assert_eq!(
+                classify_outcome_tags_polarity(m, a, None),
+                Some(WitnessPolarity::HarnessOrExtractionError),
+                "unparseable tags ({m}, {a}) must be a harness error"
+            );
+        }
+        // A recognized slug wins over the tags (panic-site reconciliation keeps
+        // a reconciled `agree`), and an unknown slug falls back to the tags.
+        assert_eq!(
+            classify_outcome_tags_polarity("panic@src/lib.rs:3:1", "panic@src/lib.rs:9:1: 9:5", Some("agree")),
+            None
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("ub@src/lib.rs:10:5", "pass:unit", Some("not_a_slug")),
+            Some(WitnessPolarity::UnsoundMissedFault)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("panic@src/lib.rs:10:5", "unsupported", Some("unsupported")),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:unit", "unsupported", Some("compile_failed")),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
+    }
+
+    #[test]
+    fn staged_helper_reachability_links_transitive_model_helper_chains_only() {
+        // Generated batches and reproducers embed the preamble: only helpers that
+        // the candidates reach (directly or through other helpers) are linked.
+        let staged = format!(
+            "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n\
+             pub fn cand__b0_c0() -> u32 {{\n    \
+                 let mut s: u32 = 1u32;\n    \
+                 helper_reborrow_mid(&mut s, 2u32)\n\
+             }}\n"
+        );
+        let reached = staged_helper_fns_reachable_from_candidates(&staged);
+        for helper in ["helper_reborrow_mid", "helper_reborrow_leaf"] {
+            assert!(reached.contains(helper), "missing {helper}: {reached:?}");
+        }
+        for helper in [
+            "helper_shared_mid",
+            "helper_shared_leaf",
+            "helper_unwind_mid",
+            "helper_unwind_leaf",
+            "helper_add_ten",
+        ] {
+            assert!(!reached.contains(helper), "unexpected {helper}: {reached:?}");
+        }
+        // A substring of a helper name is not a mention of the helper.
+        let staged_substring = format!(
+            "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n\
+             pub fn helper_shared_mid_like() -> u32 {{ 3u32 }}\n"
+        );
+        let reached = staged_helper_fns_reachable_from_candidates(&staged_substring);
+        assert!(!reached.contains("helper_shared_mid"), "{reached:?}");
+        assert!(reached.contains("helper_shared_mid_like"), "{reached:?}");
+        // The identity corpus does not embed the preamble verbatim, so every
+        // function it mentions is reachable from its candidates.
+        let corpus_reached = staged_helper_fns_reachable_from_candidates(
+            crate::mutators_miri::RAW_MIRI_DIFF_CORPUS_RS,
+        );
+        for helper in ["helper_add_ten", "helper_reborrow_mid", "helper_reborrow_leaf"] {
+            assert!(corpus_reached.contains(helper), "corpus misses {helper}");
+        }
+    }
+
+    #[test]
+    fn witness_polarity_accounting_identity_detects_drift() {
+        let zeros = |names: &[&str]| -> BTreeMap<String, usize> {
+            names.iter().map(|k| (k.to_string(), 0)).collect()
+        };
+        let mut report = MiriCampaignEvalReport {
+            mode: "seeded".to_string(),
+            seed: 1,
+            batches: 1,
+            batch_size: 9,
+            total_candidates: 9,
+            compiled_candidates: 8,
+            compile_failed_candidates: 1,
+            compile_pass_rate_pct: 88.9,
+            compared_candidates: 6,
+            agree_count: 2,
+            diverge_count: 4,
+            not_compared_count: 3,
+            kernel_confirmed_divergences: 4,
+            miri_verdicts: BTreeMap::new(),
+            anneal_outcomes: BTreeMap::new(),
+            divergence_classes: zeros(&DIVERGENCE_CLASS_NAMES),
+            witness_polarity_counts: zeros(&WITNESS_POLARITY_NAMES),
+            not_compared_reasons: zeros(&NOT_COMPARED_REASON_NAMES),
+            unmodeled_external_calls: BTreeMap::new(),
+            mutator_applications: BTreeMap::new(),
+            findings: Vec::new(),
+            reconciled_panic_sites: Vec::new(),
+            obs_path_signatures: Vec::new(),
+            item_reports: Vec::new(),
+            elapsed_ms: 0.0,
+        };
+        // 4 divergences: missed_ub, panic_vs_return, false_positive_ub,
+        // wrong_value; 3 not compared: compile_failed, unsupported (Miri pass),
+        // and unsupported (Miri ub).
+        for class in ["missed_ub", "panic_vs_return", "false_positive_ub", "wrong_value"] {
+            *report.divergence_classes.get_mut(class).unwrap() += 1;
+        }
+        *report.not_compared_reasons.get_mut("compile_failed").unwrap() += 1;
+        *report.not_compared_reasons.get_mut("unsupported").unwrap() += 2;
+        for (pol, n) in [
+            (WitnessPolarity::UnsoundMissedFault, 2),
+            (WitnessPolarity::SoundConservativeAbstraction, 2),
+            (WitnessPolarity::ValueMismatch, 1),
+            (WitnessPolarity::HarnessOrExtractionError, 2),
+        ] {
+            report
+                .witness_polarity_counts
+                .insert(pol.as_str().to_string(), n);
+        }
+        assert!(witness_polarity_accounting_holds(&report));
+
+        // Each single-count drift breaks one identity.
+        let mut drifted = report.clone();
+        *drifted
+            .witness_polarity_counts
+            .get_mut("unsound_missed_fault")
+            .unwrap() -= 1;
+        *drifted.witness_polarity_counts.get_mut("value_mismatch").unwrap() += 1;
+        assert!(!witness_polarity_accounting_holds(&drifted));
+
+        let mut drifted = report.clone();
+        *drifted
+            .witness_polarity_counts
+            .get_mut("sound_conservative_abstraction")
+            .unwrap() += 2;
+        *drifted
+            .witness_polarity_counts
+            .get_mut("harness_or_extraction_error")
+            .unwrap() -= 2;
+        assert!(
+            !witness_polarity_accounting_holds(&drifted),
+            "more conservative `unsupported` than `unsupported` candidates"
+        );
+
+        let mut drifted = report.clone();
+        drifted.witness_polarity_counts.insert("unknown".to_string(), 0);
+        assert!(!witness_polarity_accounting_holds(&drifted));
+
+        let mut drifted = report.clone();
+        drifted.not_compared_count += 1;
+        assert!(!witness_polarity_accounting_holds(&drifted));
+
+        // The rendered JSON and Markdown expose every canonical polarity key.
+        let json = render_eval_report_json(&report);
+        let md = render_eval_report_markdown(&report);
+        for slug in WITNESS_POLARITY_NAMES {
+            assert!(json.contains(&format!("\"{slug}\"")), "JSON missing {slug}");
+            assert!(md.contains(&format!("| `{slug}` |")), "Markdown missing {slug}");
+        }
     }
 }

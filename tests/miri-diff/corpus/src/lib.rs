@@ -883,8 +883,21 @@ pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
 
 // ============================================================================
 // Category 9: `Operand::Move` Deinitialization Borrow-Tree Invariance,
-// Two-Stage `RetagKind::FnEntry` Call Protector Release, Multi-Callee Chains,
-// and Inline Scalar & Memory Intrinsics.
+// `RetagKind::FnEntry` Reference Arguments Across `#[inline(never)]`
+// Multi-Callee Chains (Including an `UnwindAction::Cleanup` Unwind Edge), and
+// Inline Scalar & Memory Intrinsics.
+//
+// The call-chain helpers below carry `__ANNEAL_MODEL_<name>` markers, so the
+// differential suite links their captured bodies as intra-crate callees rather
+// than treating them as standalone zero-argument test entry points.
+//
+// Anneal currently mishandles memory that a reference argument points into
+// across a call boundary (see "Category 9 engine gaps" in
+// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins those it can
+// kernel-confirm). Every helper here therefore takes its `FnEntry`-protected
+// reference without dereferencing it, and only forwards or returns reborrows
+// of it: these seeds check reference-argument passing, reborrow return, frame
+// cleanup, and unwinding, not Anneal's protector enforcement.
 // ============================================================================
 
 use core::intrinsics::{
@@ -901,6 +914,13 @@ pub struct NonCopyPairU32 {
     pub b: u32,
 }
 
+/// Byte-fill emulation of `write_bytes(dst, val, count)` for `*mut u32`
+/// destinations, built from `transmute`, `offset`, and `copy_nonoverlapping`.
+///
+/// `core::intrinsics::write_bytes` is not one of the intrinsics that Anneal's
+/// `MirSemantics` interprets inline (`classifyRustIntrinsic?`), so a direct call
+/// would stop at an uninterpreted external call; the emulation keeps the byte
+/// pattern observable to both Miri and Anneal.
 #[allow(unused_macros)]
 macro_rules! write_bytes {
     ($dst:expr, $val:expr, $count:expr) => {{
@@ -919,6 +939,7 @@ macro_rules! write_bytes {
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_reborrow_leaf: &str = "helper_reborrow_leaf";
+/// Depth-2 leaf of the `helper_reborrow_mid` chain.
 #[inline(never)]
 pub fn helper_reborrow_leaf(v: u32) -> u32 {
     v
@@ -926,16 +947,27 @@ pub fn helper_reborrow_leaf(v: u32) -> u32 {
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_reborrow_mid: &str = "helper_reborrow_mid";
+/// Takes an `FnEntry`-protected `&mut u32` (Miri retags and protects it on
+/// entry and releases the protector on return) and calls `helper_reborrow_leaf`
+/// while the protector is active. It does not dereference `_r` (see the
+/// Category 9 header).
 #[inline(never)]
 pub fn helper_reborrow_mid(_r: &mut u32, _extra: u32) -> u32 {
-    // Two-stage FnEntry protector release across helper_reborrow_mid ->
-    // helper_reborrow_leaf without callee-local StorageDead index collisions.
     helper_reborrow_leaf(22u32)
-    // Returns 22u32 to caller after releasing FnEntry protector.
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_return: &str = "helper_reborrow_return";
+/// Returns a reborrowed child of its `FnEntry`-protected `&mut u32` argument;
+/// the child outlives the callee frame and its protector.
+#[inline(never)]
+pub fn helper_reborrow_return(r: &mut u32) -> &mut u32 {
+    &mut *r
 }
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_shared_leaf: &str = "helper_shared_leaf";
+/// Depth-2 leaf of the `helper_shared_mid` chain.
 #[inline(never)]
 pub fn helper_shared_leaf(v: u32) -> u32 {
     v
@@ -943,17 +975,22 @@ pub fn helper_shared_leaf(v: u32) -> u32 {
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_shared_mid: &str = "helper_shared_mid";
+/// Takes an `FnEntry`-protected `&u32` and calls `helper_shared_leaf` while the
+/// protector is active, without dereferencing `_r`.
 #[inline(never)]
 pub fn helper_shared_mid(_r: &u32, _bonus: u32) -> u32 {
-    // Shared FnEntry protector release across helper_shared_mid ->
-    // helper_shared_leaf.
     helper_shared_leaf(25u32)
 }
 
 #[allow(non_upper_case_globals)]
-pub const __ANNEAL_MODEL_helper_violate_fn_entry_protector: &str = "helper_violate_fn_entry_protector";
+pub const __ANNEAL_MODEL_helper_frozen_reborrow_write_in_callee: &str =
+    "helper_frozen_reborrow_write_in_callee";
+/// Tree Borrows UB confined to the callee's own frame: a `&mut` reborrow of
+/// the by-value parameter `slot` is activated by a write, frozen by a read
+/// through the parent raw pointer, and then written again. No reference
+/// argument or `FnEntry` protector is involved.
 #[inline(never)]
-pub fn helper_violate_fn_entry_protector(mut slot: u32) -> u32 {
+pub fn helper_frozen_reborrow_write_in_callee(mut slot: u32) -> u32 {
     let raw: *mut u32 = &raw mut slot;
     let r: &mut u32 = unsafe { &mut *raw };
     *r = helper_reborrow_leaf(55u32);
@@ -964,6 +1001,7 @@ pub fn helper_violate_fn_entry_protector(mut slot: u32) -> u32 {
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_unwind_leaf: &str = "helper_unwind_leaf";
+/// Panics (`attempt to add with overflow`) when `base + delta` overflows.
 #[inline(never)]
 pub fn helper_unwind_leaf(base: u32, delta: u32) -> u32 {
     base + delta
@@ -971,10 +1009,29 @@ pub fn helper_unwind_leaf(base: u32, delta: u32) -> u32 {
 
 #[allow(non_upper_case_globals)]
 pub const __ANNEAL_MODEL_helper_unwind_mid: &str = "helper_unwind_mid";
+/// Calls the overflowing `helper_unwind_leaf(u32::MAX, 1)` while holding an
+/// `FnEntry`-protected `&u32`, so the panic unwinds through two frames.
 #[inline(never)]
 pub fn helper_unwind_mid(_protected: &u32, _base: u32) -> u32 {
-    // Unwind across helper_unwind_mid -> helper_unwind_leaf.
     helper_unwind_leaf(u32::MAX, 1u32)
+}
+
+/// Guard with an (empty) `Drop` impl: while one is live, a call's unwind edge
+/// is `UnwindAction::Cleanup` into a landing pad that drops the guard.
+pub struct UnwindCleanupGuard(pub u32);
+
+impl Drop for UnwindCleanupGuard {
+    fn drop(&mut self) {}
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_guarded: &str = "helper_unwind_guarded";
+/// Calls `helper_unwind_leaf(base, delta)` while an `UnwindCleanupGuard` is
+/// live, so the call unwinds through an `UnwindAction::Cleanup` landing pad.
+#[inline(never)]
+pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {
+    let _guard = UnwindCleanupGuard(base);
+    helper_unwind_leaf(base, delta)
 }
 
 /// `Operand::Move` deinitialization borrow-tree invariance: moving a non-`Copy`
@@ -1001,8 +1058,15 @@ pub fn pass_move_deinit_subplace_preserves_sibling_frozen() -> u32 {
     moved_a.0 + *r_b
 }
 
-/// `Operand::Move` deinitialization: reading the source place through a raw
-/// pointer after moving `x` out of its scope is UB.
+/// Reading a moved-from source place through a raw pointer once its storage is
+/// dead is UB in both Miri and Anneal.
+///
+/// Miri evaluates `Operand::Move` like `Operand::Copy` and leaves the source
+/// bytes initialized, while Anneal de-initializes them, so a raw read of `x`
+/// while `x` is still in scope (after `let moved = x;`) passes in Miri but is UB
+/// in Anneal (a sound conservative `false_positive_ub`, pinned in
+/// `miri_difftest_oracle.rs`). Ending `x`'s scope (`StorageDead`) before the
+/// read makes the read UB under both semantics.
 pub fn ub_move_deinit_read_source_uninit() -> u32 {
     let (raw, moved) = {
         let x = NonCopyU32(15u32);
@@ -1029,9 +1093,11 @@ pub fn ub_assign_after_reborrow_disables_child() -> u32 {
     x.0
 }
 
-/// Two-stage call protector release across a depth-2 `#[inline(never)]` callee
-/// chain: `RetagKind::FnEntry` protectors on `&mut u32` parameters are released
-/// on return while callee stack locals are deallocated cleanly.
+/// A raw-derived `&mut u32` is reborrowed into the depth-2 `#[inline(never)]`
+/// chain `helper_reborrow_mid` -> `helper_reborrow_leaf` (Miri protects the
+/// reborrow for the duration of the call and releases the protector on return),
+/// then written through the child and the parent raw pointer after the callee
+/// frames are gone.
 pub fn pass_fn_entry_protector_two_stage_reborrow_chain() -> u32 {
     let mut x: u32 = 10u32;
     let raw: *mut u32 = &raw mut x;
@@ -1044,8 +1110,9 @@ pub fn pass_fn_entry_protector_two_stage_reborrow_chain() -> u32 {
     }
 }
 
-/// Multi-callee shared reference reborrow chain (`&u32`) with `RetagKind::FnEntry`
-/// protector release followed by post-return parent mutation.
+/// A shared `&u32` passes through the `FnEntry`-protected depth-2 chain
+/// `helper_shared_mid` -> `helper_shared_leaf`; once the call returns, writing
+/// the parent local is legal.
 pub fn pass_fn_entry_shared_reborrow_chain() -> u32 {
     let mut x: u32 = 19u32;
     let r_shared: &u32 = &x;
@@ -1054,21 +1121,43 @@ pub fn pass_fn_entry_shared_reborrow_chain() -> u32 {
     x
 }
 
-/// Multi-callee reborrow chain followed by frozen write UB during call across
-/// `helper_reborrow_mid` -> `helper_reborrow_leaf` -> `helper_violate_fn_entry_protector`.
-pub fn ub_fn_entry_protector_violation_during_call() -> u32 {
+/// After the `helper_reborrow_mid` chain returns (releasing its protector), the
+/// result is passed by value to `helper_frozen_reborrow_write_in_callee`, whose
+/// write through a frozen callee-local reborrow is UB inside the callee frame.
+pub fn ub_frozen_reborrow_write_in_callee_frame() -> u32 {
     let mut x: u32 = 10u32;
     let raw_alias: *mut u32 = &raw mut x;
     let delta: u32 = helper_reborrow_mid(unsafe { &mut *raw_alias }, 1u32);
-    unsafe { *raw_alias = delta; }
-    helper_violate_fn_entry_protector(unsafe { *raw_alias })
+    unsafe {
+        *raw_alias = delta;
+    }
+    helper_frozen_reborrow_write_in_callee(unsafe { *raw_alias })
 }
 
 /// Unwinding panic across a depth-2 `#[inline(never)]` helper call chain with
-/// `FnEntry`-protected reference arguments.
+/// an `FnEntry`-protected reference argument (`UnwindAction::Continue` edges).
 pub fn panic_multi_callee_unwind_chain() -> u32 {
     let x: u32 = 1u32;
     helper_unwind_mid(&x, u32::MAX)
+}
+
+/// A reborrowed child returned by `helper_reborrow_return` outlives the callee
+/// frame and its released `FnEntry` protector: the caller writes through the
+/// child, and a later parent write disables the (dead) child without UB.
+pub fn pass_fn_entry_returns_reborrowed_child() -> u32 {
+    let mut x: u32 = 3u32;
+    let child: &mut u32 = helper_reborrow_return(&mut x);
+    *child = *child + 4u32;
+    x = x + 1u32;
+    x
+}
+
+/// Unwinding panic whose depth-2 call edge `helper_unwind_guarded` ->
+/// `helper_unwind_leaf` is `UnwindAction::Cleanup`: the landing pad drops the
+/// live `UnwindCleanupGuard` before the panic propagates to the caller.
+pub fn panic_multi_callee_unwind_cleanup_guard() -> u32 {
+    let start: u32 = u32::MAX;
+    helper_unwind_guarded(start, 1u32)
 }
 
 /// Inline bit-counting and byte/bit-reversal intrinsics (`ctlz`, `ctlz_nonzero`,

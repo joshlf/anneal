@@ -819,6 +819,40 @@ mod tests {
         }
     }
 
+    /// The live ITree oracle test (`itree_difftest_oracle.rs`) evaluates
+    /// `generate_itree_batch(ITREE_SAFE_SEEDS, 20, 0x3333_4444)` and requires 0
+    /// not-compared candidates (no unmodeled external call at `-O0` or `-O2`),
+    /// so that batch must contain the depth-2 multi-callee outline (including
+    /// its nested leaf `fn`) and the bit/saturating loop variant, and every
+    /// candidate must replay faithfully from its recorded steps.
+    #[test]
+    fn live_itree_oracle_batch_covers_multi_callee_and_bit_sat_variants() {
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let batch = generate_itree_batch(seeds, 20, 0x3333_4444);
+        assert_eq!(batch.len(), 20);
+        assert!(
+            batch.iter().any(|c| c.source.contains("__anneal_itree_outlined_stage2_")
+                && c.source.contains("__anneal_itree_leaf_")),
+            "live ITree batch lacks the depth-2 multi-callee outline variant"
+        );
+        assert!(
+            batch
+                .iter()
+                .any(|c| c.source.contains("__bit_mix") && c.source.contains("__sat_step")),
+            "live ITree batch lacks the bit/saturating loop variant"
+        );
+        for cand in &batch {
+            assert!(!contains_unsafe_token(&cand.source));
+            let (base, steps) = reconstruct_itree_mutation_steps(cand, seeds)
+                .expect("reconstruct ITree steps");
+            assert!(
+                itree_candidate_replay_is_faithful(cand, &base, &steps),
+                "ITree replay mismatch on candidate {}",
+                cand.id
+            );
+        }
+    }
+
     #[test]
     fn call_boundary_outliner_and_branch_loop_weaver_emit_multi_callee_and_safe_bit_sat_variants() {
         let mut saw_multi_callee = false;

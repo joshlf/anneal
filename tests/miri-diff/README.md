@@ -69,11 +69,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 106 tests: 49 `pass`, 11 `panic` (10 certified via
+The corpus holds 108 tests: 50 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
 `verifyModularSafePanicMirBounded`), and 46 `ub`, grouped into nine categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 106 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 108 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -108,6 +108,50 @@ pin each of these divergences, and `miri-difftest` mutators avoid them:
   because Tree Borrows lets the raw pointer keep `m`'s tag, but Anneal reports
   UB at the raw write. A raw pointer to the whole place, `&raw mut *m`, agrees.
 
+Category 9 adds 19 tests covering `Operand::Move` deinitialization, reference
+arguments across `#[inline(never)]` multi-callee chains, and inline scalar and
+memory intrinsics:
+
+| Theme | Tests |
+| :--- | :--- |
+| `Operand::Move` vs. explicit assignment | `pass_move_deinit_preserves_reserved_child`, `pass_move_deinit_subplace_preserves_sibling_frozen`, `ub_move_deinit_read_source_uninit`, `ub_assign_after_reborrow_disables_child` |
+| Reference arguments, reborrow return, and unwinding across call chains | `pass_fn_entry_protector_two_stage_reborrow_chain`, `pass_fn_entry_shared_reborrow_chain`, `pass_fn_entry_returns_reborrowed_child`, `ub_frozen_reborrow_write_in_callee_frame`, `panic_multi_callee_unwind_chain`, `panic_multi_callee_unwind_cleanup_guard` (`UnwindAction::Cleanup`) |
+| Scalar intrinsics | `pass_intrinsics_bit_count_and_reverse`, `pass_intrinsics_saturating_and_wrapping`, `pass_intrinsics_three_way_compare_and_exact_div`, `ub_ctlz_nonzero_zero`, `ub_cttz_nonzero_zero`, `ub_exact_div_non_exact_u32`, `ub_exact_div_signed_min_overflow_i8` |
+| Memory intrinsics | `pass_intrinsics_write_bytes_copy_and_arith_offset` (`write_bytes!` emulation: `core::intrinsics::write_bytes` is not interpreted inline), `ub_copy_nonoverlapping_partial_overlap_array` |
+
+### Category 9 engine gaps
+
+Category 9 leaves out the following constructs, on which Anneal currently
+disagrees with Miri. `ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live`
+in [`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
+pins the first four, kernel-confirmed, as `sound_conservative_abstraction`
+divergences. `miri-difftest` mutators avoid all five: no Category 9 helper
+dereferences a reference argument, so the call-chain tests check reference
+passing, reborrow return, frame cleanup, and unwinding, but not Anneal's
+`FnEntry` protector enforcement.
+
+- A callee that dereferences a reference argument pointing into its caller's
+  frame (`fn f(r: &u32) -> u32 { *r }` called as `f(&x)`): Miri passes, and
+  Anneal reports UB at the dereference.
+- A callee that writes caller memory through a raw pointer while the caller
+  holds a shared borrow of it, even one that is never used again or passed:
+  Miri passes, and Anneal reports UB at the write.
+- A write to `x` through a raw pointer in the caller after a callee that
+  received `&x` has returned: Miri passes (the callee's protector is released
+  on return), and Anneal reports UB at the write.
+- A raw-pointer read of a moved-from local that is still in scope: Miri passes
+  (it evaluates `Operand::Move` like `Operand::Copy`), and Anneal reports UB
+  because it de-initializes the moved-from place.
+- A foreign write, during the call, to a reference argument reborrowed from a
+  raw pointer (`f(&*raw, raw)` or `f(&mut *raw, raw)`, where `f` writes through
+  `raw`): Miri reports a protector violation at the write, and Anneal passes
+  (`missed_ub`, an `unsound_missed_fault`) because it puts no `FnEntry`
+  protector on such a reborrow. This gap has no live pin yet: the Lean kernel
+  confirmation of these candidates (`MiriOracleConfirm.lean`) exceeds the
+  `anneal-lean-run` memory limit. Passing `&x` or `&mut x` directly agrees
+  (both report UB at the write), but by the second item Anneal reports that UB
+  even without a protector.
+
 ## Policy on `known_anneal_bug` Entries
 
 > **Every `[tests.known_anneal_bug]` block in [`manifest.toml`](manifest.toml)
@@ -137,7 +181,7 @@ pin each of these divergences, and `miri-difftest` mutators avoid them:
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 106 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 108 tests agree with Miri.
 
 ## Running the Suite
 

@@ -208,10 +208,16 @@ fn main() {
             print_u32(pass_fn_entry_protector_two_stage_reborrow_chain())
         }
         "pass_fn_entry_shared_reborrow_chain" => print_u32(pass_fn_entry_shared_reborrow_chain()),
-        "ub_fn_entry_protector_violation_during_call" => {
-            print_u32(ub_fn_entry_protector_violation_during_call())
+        "ub_frozen_reborrow_write_in_callee_frame" => {
+            print_u32(ub_frozen_reborrow_write_in_callee_frame())
         }
         "panic_multi_callee_unwind_chain" => print_u32(panic_multi_callee_unwind_chain()),
+        "pass_fn_entry_returns_reborrowed_child" => {
+            print_u32(pass_fn_entry_returns_reborrowed_child())
+        }
+        "panic_multi_callee_unwind_cleanup_guard" => {
+            print_u32(panic_multi_callee_unwind_cleanup_guard())
+        }
         "pass_intrinsics_bit_count_and_reverse" => {
             print_u32(pass_intrinsics_bit_count_and_reverse())
         }
