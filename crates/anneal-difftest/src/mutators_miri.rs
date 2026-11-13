@@ -3989,6 +3989,340 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
         .collect()
 }
 
+/// The Miri AST mutators, in the order in which [`generate_miri_batch`] indexes
+/// them when it draws a pass's mutator.
+pub const MIRI_AST_MUTATORS: [&dyn MiriAstMutator; 5] = [
+    &ArithmeticCastMutator,
+    &PlaceProjectionWrapper,
+    &RawPtrOffsetMutator,
+    &TreeBorrowsRetagInterleaver,
+    &BitValidityTransmuteMutator,
+];
+
+fn miri_mutator_by_name(name: &str) -> Option<&'static dyn MiriAstMutator> {
+    MIRI_AST_MUTATORS.into_iter().find(|m| m.name() == name)
+}
+
+/// One mutation pass of a generated Miri candidate, recorded so that any
+/// subsequence of the candidate's passes can be replayed exactly
+/// ([`replay_miri_mutation_steps`]).
+#[derive(Debug, Clone)]
+pub struct RecordedMutationStep {
+    /// Zero-based index of this pass in the candidate's mutator chain.
+    pub pass_index: usize,
+    /// Canonical mutator name (`ArithmeticCastMutator`, `PlaceProjectionWrapper`,
+    /// and so on).
+    pub mutator_name: String,
+    /// Mutation regime this pass ran with.
+    pub mode: MutationMode,
+    /// PRNG state immediately before this pass's `mutate_with_mode` call.
+    pub rng_before_step: DetRng,
+}
+
+/// Draw a candidate's target mutation regime: the first PRNG draws that
+/// [`generate_miri_batch_with_prefix`] makes for every candidate, so that each
+/// batch mixes `pass`, `panic`, and `ub` outcomes.
+fn draw_primary_mode(cand_rng: &mut DetRng, id: usize) -> MutationMode {
+    let bucket = (id + cand_rng.gen_range(4)) % 4;
+    match bucket {
+        0 => MutationMode::Pass,
+        1 => MutationMode::Panic,
+        2 => MutationMode::Ub,
+        _ => match cand_rng.gen_range(4) {
+            0 => MutationMode::Pass,
+            1 => MutationMode::Panic,
+            2 => MutationMode::Ub,
+            _ => MutationMode::PerturbAst,
+        },
+    }
+}
+
+/// The PRNG draw with which [`generate_miri_batch_with_prefix`] picks a
+/// candidate's seed. The seed index also depends on the batch's seed offset and
+/// the candidate id ([`MiriSeedDraw::seed_index`]), but the draw alone fixes how
+/// the candidate's PRNG advances.
+enum MiriSeedDraw {
+    /// A non-faulting seed, offset by the drawn value.
+    NonFault(usize),
+    /// Seeds rotate with the candidate id (`seeds.len() <= 8`); nothing is drawn.
+    Rotate,
+    /// Any seed, offset by the drawn value.
+    Any(usize),
+}
+
+impl MiriSeedDraw {
+    fn draw(
+        cand_rng: &mut DetRng,
+        primary_mode: MutationMode,
+        seeds_len: usize,
+        non_fault_len: usize,
+    ) -> Self {
+        if (primary_mode == MutationMode::Pass
+            || primary_mode == MutationMode::Panic
+            || (primary_mode == MutationMode::Ub && cand_rng.coin(1, 2)))
+            && non_fault_len > 0
+        {
+            Self::NonFault(cand_rng.gen_range(non_fault_len))
+        } else if seeds_len <= 8 {
+            Self::Rotate
+        } else {
+            Self::Any(cand_rng.gen_range(seeds_len))
+        }
+    }
+
+    fn seed_index(
+        &self,
+        seed_offset: usize,
+        id: usize,
+        seeds_len: usize,
+        non_fault_seed_indices: &[usize],
+    ) -> usize {
+        match *self {
+            Self::NonFault(draw) => {
+                let pick = (seed_offset + id.wrapping_mul(7) + draw) % non_fault_seed_indices.len();
+                non_fault_seed_indices[pick]
+            }
+            Self::Rotate => (id + seed_offset) % seeds_len,
+            Self::Any(draw) => (seed_offset + id.wrapping_mul(13) + draw) % seeds_len,
+        }
+    }
+
+    fn allows_seed_index(
+        &self,
+        seed_index: usize,
+        seeds_len: usize,
+        non_fault_seed_indices: &[usize],
+    ) -> bool {
+        match *self {
+            Self::NonFault(_) => non_fault_seed_indices.contains(&seed_index),
+            Self::Rotate | Self::Any(_) => seed_index < seeds_len,
+        }
+    }
+}
+
+/// Close a parsed seed in place: keep only its function items other than
+/// `helper_add_ten`, rewrite method calls in every helper function that precedes
+/// the last one (so multi-function seeds do not hit `ExternalCall` skips in
+/// helpers), and rename the last function to `fn_name_for(seed_name)` before
+/// closing it (`close_and_normalize_function` draws any parameter initializers
+/// from `cand_rng`). Returns `(seed_name, fn_name)`, or `None` when the seed has
+/// no function item.
+fn close_miri_seed(
+    parsed: &mut File,
+    cand_rng: &mut DetRng,
+    fn_name_for: impl FnOnce(&str) -> String,
+) -> Option<(String, String)> {
+    parsed.attrs.clear();
+    parsed.items.retain(|item| {
+        if let Item::Fn(f) = item {
+            f.sig.ident != "helper_add_ten"
+        } else {
+            false
+        }
+    });
+    let fn_count = parsed.items.len();
+    if fn_count > 1 {
+        let mut normalizer = MethodCallNormalizer;
+        for item in &mut parsed.items[..fn_count - 1] {
+            if let Item::Fn(helper_fn) = item {
+                normalizer.visit_item_fn_mut(helper_fn);
+            }
+        }
+    }
+    let Some(Item::Fn(func)) = parsed.items.last_mut() else {
+        return None;
+    };
+    let seed_name = func.sig.ident.to_string();
+    let fn_name = fn_name_for(&seed_name);
+    func.sig.ident = format_ident!("{}", fn_name);
+    close_and_normalize_function(func, cand_rng);
+    Some((seed_name, fn_name))
+}
+
+/// Draw and apply a candidate's mutation passes, recording for each pass the
+/// mutator, the regime, and the PRNG state that `mutate_with_mode` started from.
+///
+/// If the seed is already a faulting (`panic_*` or `ub_*`) seed, its first pass
+/// mutates it in place (`PerturbAst`) rather than appending a second fault probe
+/// after the seed's own panic or UB.
+fn apply_miri_mutation_passes(
+    parsed: &mut File,
+    cand_rng: &mut DetRng,
+    id: usize,
+    primary_mode: MutationMode,
+    seed_already_faults: bool,
+    raw_locals: &mut Vec<(String, String)>,
+) -> Vec<RecordedMutationStep> {
+    let num_passes = 1 + cand_rng.gen_range(3);
+    let mut steps = Vec::with_capacity(num_passes);
+    for pass in 0..num_passes {
+        let m_idx = if pass == 0 {
+            (id + cand_rng.gen_range(MIRI_AST_MUTATORS.len())) % MIRI_AST_MUTATORS.len()
+        } else {
+            cand_rng.gen_range(MIRI_AST_MUTATORS.len())
+        };
+        let pass_mode = if pass == 0 && !seed_already_faults {
+            primary_mode
+        } else if pass == 0 && seed_already_faults {
+            MutationMode::PerturbAst
+        } else {
+            MutationMode::Pass
+        };
+        let mutator = MIRI_AST_MUTATORS[m_idx];
+        let rng_before_step = cand_rng.clone();
+        mutator.mutate_with_mode(parsed, cand_rng, pass_mode, raw_locals);
+        steps.push(RecordedMutationStep {
+            pass_index: pass,
+            mutator_name: mutator.name().to_string(),
+            mode: pass_mode,
+            rng_before_step,
+        });
+    }
+    steps
+}
+
+/// Collect the tracked locals of a mutated file (the mutators' `raw_locals`
+/// followed by every function's initialized locals, deduplicated in order) and
+/// render its `fn_source` and standalone `source`.
+fn finish_miri_candidate(
+    parsed: &File,
+    mut raw_locals: Vec<(String, String)>,
+) -> (Vec<(String, String)>, String, String) {
+    for item in &parsed.items {
+        if let Item::Fn(func) = item {
+            for loc in collect_initialized_locals(func) {
+                raw_locals.push((loc.name, loc.ty));
+            }
+        }
+    }
+    let mut tracked_locals = Vec::new();
+    for pair in raw_locals {
+        if !tracked_locals.contains(&pair) {
+            tracked_locals.push(pair);
+        }
+    }
+    let fn_source = prettyplease::unparse(parsed);
+    let source = build_standalone_candidate_source(&fn_source);
+    (tracked_locals, fn_source, source)
+}
+
+/// Reconstruct the closed, unmutated seed AST and the recorded mutation passes
+/// of a candidate that [`generate_miri_batch`] or [`generate_miri_corpus_batch`]
+/// produced from `seeds`, by re-running the generator's per-candidate PRNG
+/// schedule from `cand.seed_u64` with the same code the generator runs.
+///
+/// Returns `None` when `cand` cannot have come from this schedule over `seeds`:
+/// its `seed_index` is out of range, the seed function's name is not
+/// `cand.seed_name`, or the schedule draws a different number or sequence of
+/// mutators than `cand.applied_mutators`. A `Some` result is still only a
+/// candidate history; [`miri_candidate_replay_is_faithful`] decides whether it
+/// reproduces `cand.fn_source` and `cand.source` byte for byte, which a caller
+/// must check before treating it as the program's real history.
+pub fn reconstruct_miri_mutation_steps(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+) -> Option<(File, Vec<RecordedMutationStep>)> {
+    let seed_src = seeds.get(cand.seed_index).copied()?;
+    let non_fault_seed_indices = collect_non_fault_seed_indices(seeds);
+    let mut cand_rng = DetRng::new(cand.seed_u64);
+    let primary_mode = draw_primary_mode(&mut cand_rng, cand.id);
+    let seed_draw = MiriSeedDraw::draw(
+        &mut cand_rng,
+        primary_mode,
+        seeds.len(),
+        non_fault_seed_indices.len(),
+    );
+    if !seed_draw.allows_seed_index(cand.seed_index, seeds.len(), &non_fault_seed_indices) {
+        return None;
+    }
+
+    let mut base = syn::parse_str::<File>(seed_src).ok()?;
+    let (seed_name, _) = close_miri_seed(&mut base, &mut cand_rng, |_| cand.fn_name.clone())
+        .unwrap_or_else(|| (format!("seed_{}", cand.seed_index), cand.fn_name.clone()));
+    if seed_name != cand.seed_name {
+        return None;
+    }
+    let seed_already_faults = seed_name.starts_with("panic_") || seed_name.starts_with("ub_");
+
+    let mut probe = base.clone();
+    let mut raw_locals = Vec::new();
+    let steps = apply_miri_mutation_passes(
+        &mut probe,
+        &mut cand_rng,
+        cand.id,
+        primary_mode,
+        seed_already_faults,
+        &mut raw_locals,
+    );
+    let names_match = steps.len() == cand.applied_mutators.len()
+        && steps
+            .iter()
+            .zip(&cand.applied_mutators)
+            .all(|(step, name)| step.mutator_name == *name);
+    names_match.then_some((base, steps))
+}
+
+/// Replay the subsequence `steps` of a candidate's recorded mutation passes on
+/// its closed seed `base`, starting each pass from its recorded PRNG state and
+/// regime, and return the resulting candidate (with `cand`'s identity fields).
+///
+/// Replaying a candidate's full recorded chain reproduces the candidate exactly
+/// (see [`reconstruct_miri_mutation_steps`]); a proper subsequence yields the
+/// program that the generator would have produced had it skipped the other
+/// passes.
+pub fn replay_miri_mutation_steps(
+    cand: &GeneratedMiriCandidate,
+    base: &File,
+    steps: &[RecordedMutationStep],
+) -> GeneratedMiriCandidate {
+    let mut parsed = base.clone();
+    let mut raw_locals = Vec::new();
+    let mut applied_mutators = Vec::with_capacity(steps.len());
+    for step in steps {
+        if let Some(mutator) = miri_mutator_by_name(&step.mutator_name) {
+            let mut step_rng = step.rng_before_step.clone();
+            mutator.mutate_with_mode(&mut parsed, &mut step_rng, step.mode, &mut raw_locals);
+            applied_mutators.push(step.mutator_name.clone());
+        }
+    }
+    let (tracked_locals, fn_source, source) = finish_miri_candidate(&parsed, raw_locals);
+    GeneratedMiriCandidate {
+        id: cand.id,
+        seed_index: cand.seed_index,
+        seed_name: cand.seed_name.clone(),
+        fn_name: cand.fn_name.clone(),
+        seed_u64: cand.seed_u64,
+        applied_mutators,
+        tracked_locals,
+        fn_source,
+        source,
+    }
+}
+
+/// Whether replaying the full recorded chain `steps` from `base` reproduces
+/// `cand` byte for byte: canonical `0..steps.len()` `pass_index`es, the same
+/// `applied_mutators`, `fn_source`, and standalone `source`.
+///
+/// Shrinking is only meaningful when this holds: only then is every replayed
+/// subsequence a reduction of the reported program, and only then is the full
+/// chain known to reproduce the original oracle report without re-running the
+/// oracle on it.
+pub fn miri_candidate_replay_is_faithful(
+    cand: &GeneratedMiriCandidate,
+    base: &File,
+    steps: &[RecordedMutationStep],
+) -> bool {
+    if steps.len() != cand.applied_mutators.len()
+        || !steps.iter().enumerate().all(|(i, s)| s.pass_index == i)
+    {
+        return false;
+    }
+    let replayed = replay_miri_mutation_steps(cand, base, steps);
+    replayed.applied_mutators == cand.applied_mutators
+        && replayed.fn_source == cand.fn_source
+        && replayed.source == cand.source
+}
+
 fn generate_miri_batch_with_prefix(
     seeds: &[&str],
     count: usize,
@@ -3998,14 +4332,6 @@ fn generate_miri_batch_with_prefix(
     if seeds.is_empty() || count == 0 {
         return Vec::new();
     }
-
-    let all_mutators: [&dyn MiriAstMutator; 5] = [
-        &ArithmeticCastMutator,
-        &PlaceProjectionWrapper,
-        &RawPtrOffsetMutator,
-        &TreeBorrowsRetagInterleaver,
-        &BitValidityTransmuteMutator,
-    ];
 
     let non_fault_seed_indices = collect_non_fault_seed_indices(seeds);
 
@@ -4019,34 +4345,14 @@ fn generate_miri_batch_with_prefix(
 
         // Choose the candidate's target mutation regime so every batch produces
         // a balanced, seed-dependent mix of `pass`, `panic`, and `ub` outcomes.
-        let bucket = (id + cand_rng.gen_range(4)) % 4;
-        let primary_mode = match bucket {
-            0 => MutationMode::Pass,
-            1 => MutationMode::Panic,
-            2 => MutationMode::Ub,
-            _ => match cand_rng.gen_range(4) {
-                0 => MutationMode::Pass,
-                1 => MutationMode::Panic,
-                2 => MutationMode::Ub,
-                _ => MutationMode::PerturbAst,
-            },
-        };
-
-        let seed_index = if (primary_mode == MutationMode::Pass
-            || primary_mode == MutationMode::Panic
-            || (primary_mode == MutationMode::Ub && cand_rng.coin(1, 2)))
-            && !non_fault_seed_indices.is_empty()
-        {
-            let pick = (seed_offset
-                + id.wrapping_mul(7)
-                + cand_rng.gen_range(non_fault_seed_indices.len()))
-                % non_fault_seed_indices.len();
-            non_fault_seed_indices[pick]
-        } else if seeds.len() <= 8 {
-            (id + seed_offset) % seeds.len()
-        } else {
-            (seed_offset + id.wrapping_mul(13) + cand_rng.gen_range(seeds.len())) % seeds.len()
-        };
+        let primary_mode = draw_primary_mode(&mut cand_rng, id);
+        let seed_index = MiriSeedDraw::draw(
+            &mut cand_rng,
+            primary_mode,
+            seeds.len(),
+            non_fault_seed_indices.len(),
+        )
+        .seed_index(seed_offset, id, seeds.len(), &non_fault_seed_indices);
 
         let Ok(mut parsed) = syn::parse_str::<File>(seeds[seed_index]) else {
             continue;
@@ -4054,78 +4360,28 @@ fn generate_miri_batch_with_prefix(
 
         // Close and rename the last function item in `parsed.items` (leaving
         // any preceding helper functions in a multi-function seed intact).
-        let mut seed_name = format!("seed_{seed_index}");
-        let mut fn_name = format!("cand_{batch_prefix}_c{id}");
-        parsed.attrs.clear();
-        parsed.items.retain(|item| {
-            if let Item::Fn(f) = item {
-                f.sig.ident != "helper_add_ten"
-            } else {
-                false
-            }
+        let (seed_name, fn_name) = close_miri_seed(&mut parsed, &mut cand_rng, |seed_name| {
+            format!("{seed_name}__{batch_prefix}_c{id}")
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("seed_{seed_index}"),
+                format!("cand_{batch_prefix}_c{id}"),
+            )
         });
-        // Normalize method calls across any preceding helper functions too so
-        // multi-function seeds do not hit `ExternalCall` skips in helpers.
-        let fn_count = parsed.items.len();
-        if fn_count > 1 {
-            let mut normalizer = MethodCallNormalizer;
-            for item in &mut parsed.items[..fn_count - 1] {
-                if let Item::Fn(helper_fn) = item {
-                    normalizer.visit_item_fn_mut(helper_fn);
-                }
-            }
-        }
-        if let Some(Item::Fn(func)) = parsed.items.last_mut() {
-            seed_name = func.sig.ident.to_string();
-            fn_name = format!("{seed_name}__{batch_prefix}_c{id}");
-            func.sig.ident = format_ident!("{}", fn_name);
-            close_and_normalize_function(func, &mut cand_rng);
-        }
 
-        // If the selected seed is already a faulting (`panic_*` or `ub_*`) seed,
-        // mutate it in-place (`PerturbAst` / `Pass`) rather than appending a
-        // second fault probe after the seed's own panic/UB.
         let seed_already_faults = seed_name.starts_with("panic_") || seed_name.starts_with("ub_");
-
-        let num_passes = 1 + cand_rng.gen_range(3);
-        let mut applied_mutators = Vec::with_capacity(num_passes);
         let mut raw_locals = Vec::new();
-
-        for pass in 0..num_passes {
-            let m_idx = if pass == 0 {
-                (id + cand_rng.gen_range(all_mutators.len())) % all_mutators.len()
-            } else {
-                cand_rng.gen_range(all_mutators.len())
-            };
-            let pass_mode = if pass == 0 && !seed_already_faults {
-                primary_mode
-            } else if pass == 0 && seed_already_faults {
-                MutationMode::PerturbAst
-            } else {
-                MutationMode::Pass
-            };
-            let mutator = all_mutators[m_idx];
-            mutator.mutate_with_mode(&mut parsed, &mut cand_rng, pass_mode, &mut raw_locals);
-            applied_mutators.push(mutator.name().to_string());
-        }
-
-        for item in &parsed.items {
-            if let Item::Fn(func) = item {
-                for loc in collect_initialized_locals(func) {
-                    raw_locals.push((loc.name, loc.ty));
-                }
-            }
-        }
-
-        let mut tracked_locals = Vec::new();
-        for pair in raw_locals {
-            if !tracked_locals.contains(&pair) {
-                tracked_locals.push(pair);
-            }
-        }
-
-        let fn_source = prettyplease::unparse(&parsed);
-        let source = build_standalone_candidate_source(&fn_source);
+        let steps = apply_miri_mutation_passes(
+            &mut parsed,
+            &mut cand_rng,
+            id,
+            primary_mode,
+            seed_already_faults,
+            &mut raw_locals,
+        );
+        let applied_mutators = steps.into_iter().map(|s| s.mutator_name).collect();
+        let (tracked_locals, fn_source, source) = finish_miri_candidate(&parsed, raw_locals);
         out.push(GeneratedMiriCandidate {
             id,
             seed_index,

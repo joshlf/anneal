@@ -19,6 +19,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arbitrary::Unstructured;
@@ -37,10 +38,12 @@ use crate::input_gen::{
 use crate::instrument::EnvSchedule;
 use crate::miri_eval::{json_escape, resolve_rustc_bin};
 use crate::mutators_itree::{
-    GeneratedItreeCandidate, StagedItreeCandidate, annotate_itree_external_callees,
-    contains_unsafe_token, stage_itree_candidate_items,
+    GeneratedItreeCandidate, ItreeMutationStep, StagedItreeCandidate,
+    annotate_itree_external_callees, contains_unsafe_token, itree_candidate_replay_is_faithful,
+    reconstruct_itree_mutation_steps, replay_itree_mutation_steps, stage_itree_candidate_items,
 };
 use crate::mutators_miri::DetRng;
+use crate::shrink::{MemoizedOracle, MutatorChainShrinkStatus, shrink_mutation_chain_detailed};
 
 /// Strictly safe seed programs with target root function `kernel_step` and
 /// external boundary callee `ext_oracle`.
@@ -607,8 +610,29 @@ pub struct ItreeFindingBundle {
     pub case_ident: String,
     /// Index of the seed program from `ITREE_SAFE_SEEDS`.
     pub seed_index: usize,
-    /// Ordered list of safe AST mutators applied to produce this candidate.
+    /// Ordered list of safe AST mutators applied to produce the program in
+    /// `repro.rs`: `minimized_mutator_chain` (equal to `original_mutator_chain`
+    /// unless shrinking minimized the chain).
     pub applied_mutators: Vec<String>,
+    /// Ordered list of safe AST mutators of the candidate as the batch generated
+    /// it.
+    pub original_mutator_chain: Vec<String>,
+    /// Shortest mutator chain that the live oracle confirmed to reproduce the
+    /// finding's `diag_tag` and kernel confirmation (1-minimal when
+    /// `shrink_status` is `minimized` or `already_one_minimal`), or
+    /// `original_mutator_chain` when shrinking did not reduce it.
+    pub minimized_mutator_chain: Vec<String>,
+    /// Number of shrinker predicate evaluations on proper subsequences of
+    /// `original_mutator_chain` (each one a replay followed by the strict compile
+    /// pre-check and, if that passes, an oracle query).
+    pub shrink_evaluations: usize,
+    /// Number of live ITree oracle runs that shrinking actually executed (oracle
+    /// queries answered by [`MemoizedOracle`] are not counted).
+    pub executed_oracle_runs: usize,
+    /// Outcome of mutator-chain shrinking ([`MutatorChainShrinkStatus::slug`]).
+    /// Findings of one candidate with the same `diag_tag` and kernel
+    /// confirmation share one shrink.
+    pub shrink_status: String,
     /// `TraceReplayDiag.tagName` reported by Lean (e.g., `"outcome_mismatch"`).
     pub diag_tag: String,
     /// Full Lean `reprStr` of the `TraceReplayDiag` value.
@@ -721,12 +745,19 @@ pub struct ItreeReproReport {
     pub kernel_confirmed: bool,
 }
 
+/// Sequence number that gives each `compile_rust_strict_opt` and
+/// `compile_rust_mir_instrumented` call its own scratch directory, so
+/// concurrent calls in one process sharing a label never delete each other's
+/// `.rlib` output.
+static ITREE_SNIPPET_COMPILE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Runs `rustc --edition=2024 --crate-type=lib -D warnings -C opt-level=<level>`
 /// on `source` and reports whether it compiled.
 pub fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bool {
     let rustc_bin = resolve_rustc_bin();
+    let seq = ITREE_SNIPPET_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_difftest_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{seq}_{}_o{}",
         std::process::id(),
         label,
         opt_level
@@ -783,8 +814,9 @@ pub fn compile_rust_mir_instrumented(label: &str, opt_level: &str, source: &str)
         };
         bin
     };
+    let seq = ITREE_SNIPPET_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_difftest_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{seq}_{}_o{}",
         std::process::id(),
         label,
         opt_level
@@ -834,35 +866,84 @@ pub fn compile_rust_mir_instrumented(label: &str, opt_level: &str, source: &str)
 pub fn compile_itree_candidates(
     batches: &[Vec<GeneratedItreeCandidate>],
 ) -> Vec<Vec<CandidateCompile>> {
+    let entries = batch_entries(batches);
+    let mut flat = compile_itree_entries(&entries).into_iter();
+    batches
+        .iter()
+        .map(|b| flat.by_ref().take(b.len()).collect())
+        .collect()
+}
+
+/// One candidate of an ITree evaluation, identified by its position in the
+/// batches (which fixes its staged item prefix `b{b_idx}_c{c_idx}__`).
+#[derive(Debug, Clone, Copy)]
+struct ItreeEvalEntry<'a> {
+    b_idx: usize,
+    c_idx: usize,
+    cand: &'a GeneratedItreeCandidate,
+    /// When `true`, the candidate is staged into `src/candidates.rs` so that
+    /// `run_cargo_capture` emits its `Mir.ItreeDiffStaged.*` module (referenced by
+    /// another candidate's `root_mir_swaps`), without running native trace
+    /// collection or Lean `TraceCheck` on its own traces.
+    capture_only: bool,
+}
+
+impl ItreeEvalEntry<'_> {
+    /// Staged item prefix of this candidate.
+    fn prefix(&self) -> String {
+        format!("b{}_c{}__", self.b_idx, self.c_idx)
+    }
+
+    /// Staged root function of this candidate (`b{b_idx}_c{c_idx}__kernel_step`).
+    fn root_fn_name(&self) -> String {
+        format!("{}kernel_step", self.prefix())
+    }
+}
+
+fn batch_entries(batches: &[Vec<GeneratedItreeCandidate>]) -> Vec<ItreeEvalEntry<'_>> {
+    batches
+        .iter()
+        .enumerate()
+        .flat_map(|(b_idx, batch)| {
+            batch
+                .iter()
+                .enumerate()
+                .map(move |(c_idx, cand)| ItreeEvalEntry {
+                    b_idx,
+                    c_idx,
+                    cand,
+                    capture_only: false,
+                })
+        })
+        .collect()
+}
+
+/// [`compile_itree_candidates`] over an arbitrary set of entries, returning one
+/// result per entry in order.
+fn compile_itree_entries(entries: &[ItreeEvalEntry<'_>]) -> Vec<CandidateCompile> {
     let repo_root = default_repo_root();
     let _ = ensure_mir_instrument_bin(&repo_root);
-    let mut results: Vec<Vec<CandidateCompile>> = batches
-        .iter()
-        .map(|b| vec![CandidateCompile::default(); b.len()])
-        .collect();
+    let mut results = vec![CandidateCompile::default(); entries.len()];
 
     let mut combined_safe = String::from("#![forbid(unsafe_code)]\n");
     let mut combined_inst =
         String::from("#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n");
-    let mut inst_sources: Vec<Vec<Option<String>>> = Vec::with_capacity(batches.len());
-    for (b_idx, batch) in batches.iter().enumerate() {
-        let mut batch_inst = Vec::with_capacity(batch.len());
-        for (c_idx, cand) in batch.iter().enumerate() {
-            combined_safe.push_str(&format!(
-                "pub mod b{b_idx}_c{c_idx} {{\n{}\n}}\n",
-                cand.source
-            ));
-            let inst = annotate_itree_external_callees(&cand.source, "kernel_step")
-                .ok()
-                .map(|(annotated, _)| annotated);
-            if let Some(src) = &inst {
-                combined_inst.push_str(&format!("pub mod inst_b{b_idx}_c{c_idx} {{\n{src}\n}}\n"));
-            }
-            batch_inst.push(inst);
+    let mut inst_sources: Vec<Option<String>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (b_idx, c_idx, cand) = (entry.b_idx, entry.c_idx, entry.cand);
+        combined_safe.push_str(&format!(
+            "pub mod b{b_idx}_c{c_idx} {{\n{}\n}}\n",
+            cand.source
+        ));
+        let inst = annotate_itree_external_callees(&cand.source, "kernel_step")
+            .ok()
+            .map(|(annotated, _)| annotated);
+        if let Some(src) = &inst {
+            combined_inst.push_str(&format!("pub mod inst_b{b_idx}_c{c_idx} {{\n{src}\n}}\n"));
         }
-        inst_sources.push(batch_inst);
+        inst_sources.push(inst);
     }
-    let any_inst_failed = inst_sources.iter().flatten().any(Option::is_none);
+    let any_inst_failed = inst_sources.iter().any(Option::is_none);
 
     let (o0_all, o2_all, inst_all) = std::thread::scope(|s| {
         let h0 = s.spawn(|| compile_rust_strict_opt("all_safe", "0", &combined_safe));
@@ -880,29 +961,22 @@ pub fn compile_itree_candidates(
         )
     });
 
-    for (b_idx, batch) in batches.iter().enumerate() {
-        for (c_idx, cand) in batch.iter().enumerate() {
-            let safe_src = format!("#![forbid(unsafe_code)]\n{}", cand.source);
-            let label = format!("b{b_idx}_c{c_idx}");
-            let entry = &mut results[b_idx][c_idx];
-            entry.opt0 = o0_all || compile_rust_strict_opt(&label, "0", &safe_src);
-            entry.opt2 = o2_all || compile_rust_strict_opt(&label, "2", &safe_src);
-            entry.instrumented = match &inst_sources[b_idx][c_idx] {
-                None => false,
-                Some(src) => {
-                    let inst_src = format!(
-                        "#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{src}"
-                    );
-                    inst_all
-                        || (compile_rust_mir_instrumented(&format!("{label}_inst"), "0", &inst_src)
-                            && compile_rust_mir_instrumented(
-                                &format!("{label}_inst"),
-                                "2",
-                                &inst_src,
-                            ))
-                }
-            };
-        }
+    for ((entry, inst_src), result) in entries.iter().zip(&inst_sources).zip(&mut results) {
+        let safe_src = format!("#![forbid(unsafe_code)]\n{}", entry.cand.source);
+        let label = format!("b{}_c{}", entry.b_idx, entry.c_idx);
+        result.opt0 = o0_all || compile_rust_strict_opt(&label, "0", &safe_src);
+        result.opt2 = o2_all || compile_rust_strict_opt(&label, "2", &safe_src);
+        result.instrumented = match inst_src {
+            None => false,
+            Some(src) => {
+                let inst_src = format!(
+                    "#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{src}"
+                );
+                inst_all
+                    || (compile_rust_mir_instrumented(&format!("{label}_inst"), "0", &inst_src)
+                        && compile_rust_mir_instrumented(&format!("{label}_inst"), "2", &inst_src))
+            }
+        };
     }
     results
 }
@@ -1629,6 +1703,15 @@ fn extract_itree_confirm_theorem(confirm_src: &str, case_ident: &str) -> String 
     blocks.join("\n\n")
 }
 
+/// Render a mutator chain for `SUMMARY.md` (`"identity (none)"` when empty).
+fn render_itree_mutator_chain_md(chain: &[String]) -> String {
+    if chain.is_empty() {
+        "identity (none)".to_string()
+    } else {
+        chain.join(", ")
+    }
+}
+
 fn write_itree_finding_bundle_to_dir(
     findings_dir: &Path,
     finding: &mut ItreeFindingBundle,
@@ -1655,6 +1738,10 @@ fn write_itree_finding_bundle_to_dir(
          - **Candidate function**: `{}`\n\
          - **Seed index**: `{}`\n\
          - **Applied mutators**: `{}`\n\
+         - **Original mutator chain**: `{}`\n\
+         - **Minimized mutator chain**: `{}`\n\
+         - **Shrink status**: `{}`\n\
+         - **Shrink evaluations**: `{}` (live oracle runs executed: `{}`)\n\
          - **Lean `TraceReplayDiag` tag**: `{}`\n\
          - **Lean `TraceReplayDiag` repr**: `{}`\n\
          - **Checked MIR module**: `{}`\n\
@@ -1669,11 +1756,12 @@ fn write_itree_finding_bundle_to_dir(
         finding.finding_id,
         finding.fn_name,
         finding.seed_index,
-        if finding.applied_mutators.is_empty() {
-            "identity (none)".to_string()
-        } else {
-            finding.applied_mutators.join(", ")
-        },
+        render_itree_mutator_chain_md(&finding.applied_mutators),
+        render_itree_mutator_chain_md(&finding.original_mutator_chain),
+        render_itree_mutator_chain_md(&finding.minimized_mutator_chain),
+        finding.shrink_status,
+        finding.shrink_evaluations,
+        finding.executed_oracle_runs,
         finding.diag_tag,
         finding.diag_repr,
         finding.checked_mir_module,
@@ -1716,6 +1804,12 @@ pub fn evaluate_itree_batches(
 
 /// Evaluates `batches` with explicit [`ItreeEvalOptions`] (including trial
 /// counts and optional negative-control MIR mutation / root-swap hooks).
+///
+/// Every finding's mutator chain is then shrunk against the live oracle to a
+/// 1-minimal chain that reproduces the finding's `TraceReplayDiag` tag and
+/// kernel confirmation ([`minimize_itree_candidate_mutations`], honoring the same
+/// MIR mutations and root swaps), and finding bundles describe the minimized
+/// candidate's run.
 pub fn evaluate_itree_batches_with_options(
     mode: &str,
     seed: u64,
@@ -1724,20 +1818,62 @@ pub fn evaluate_itree_batches_with_options(
     options: &ItreeEvalOptions,
 ) -> Result<ItreeCampaignEvalReport, String> {
     let start = Instant::now();
+    let entries = batch_entries(batches);
+    let mut report = evaluate_itree_entries(
+        mode,
+        seed,
+        batches.len(),
+        batch_size,
+        &entries,
+        options,
+        MirMutationPolicy::Require,
+    )?;
+    shrink_itree_findings(&mut report, mode, seed, batches, batch_size, options);
+    if let Some(dir) = &options.findings_dir {
+        for finding in &mut report.findings {
+            write_itree_finding_bundle_to_dir(dir, finding)?;
+        }
+    }
+    report.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(report)
+}
+
+/// How [`evaluate_itree_entries`] treats a requested MIR mutation whose target
+/// module or pattern is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirMutationPolicy {
+    /// Fail the evaluation: a caller's negative control must apply.
+    Require,
+    /// Skip the mutation: shrinking replays reductions of a candidate that may
+    /// lack the mutated construct, and the injected fault does not apply to them.
+    SkipAbsent,
+}
+
+/// Core of [`evaluate_itree_batches_with_options`] over an arbitrary set of
+/// entries (each staged under its own `b{b_idx}_c{c_idx}__` prefix), without
+/// shrinking or writing finding bundles.
+fn evaluate_itree_entries(
+    mode: &str,
+    seed: u64,
+    batch_count: usize,
+    batch_size: usize,
+    entries: &[ItreeEvalEntry<'_>],
+    options: &ItreeEvalOptions,
+    mir_mutation_policy: MirMutationPolicy,
+) -> Result<ItreeCampaignEvalReport, String> {
+    let start = Instant::now();
     let repo_root = options
         .anneal_repo_root
         .clone()
         .unwrap_or_else(default_repo_root);
 
-    let total_candidates: usize = batches.iter().map(Vec::len).sum();
-    let unsafe_token_violations = batches
+    let total_candidates = entries.len();
+    let unsafe_token_violations = entries
         .iter()
-        .flatten()
-        .filter(|cand| contains_unsafe_token(&cand.source))
+        .filter(|entry| contains_unsafe_token(&entry.cand.source))
         .count();
 
-    let compile_results = compile_itree_candidates(batches);
-    let flat_compile: Vec<CandidateCompile> = compile_results.iter().flatten().copied().collect();
+    let flat_compile = compile_itree_entries(entries);
     let opt_level_0_compiled = flat_compile.iter().filter(|c| c.opt0).count();
     let opt_level_2_compiled = flat_compile.iter().filter(|c| c.opt2).count();
     let opt_level_0_and_2_compiled = flat_compile.iter().filter(|c| c.opt0 && c.opt2).count();
@@ -1752,8 +1888,8 @@ pub fn evaluate_itree_batches_with_options(
         .iter()
         .map(|m| (m.to_string(), 0))
         .collect();
-    for cand in batches.iter().flatten() {
-        for m in &cand.applied_mutators {
+    for entry in entries {
+        for m in &entry.cand.applied_mutators {
             *mutator_applications.entry(m.clone()).or_insert(0) += 1;
         }
     }
@@ -1776,40 +1912,36 @@ pub fn evaluate_itree_batches_with_options(
     let staging_dir = create_itree_staging_dir(mode, &repo_root)?;
     let eval_res = (|| -> Result<ItreeCampaignEvalReport, String> {
         let mut combined_candidates_rs = String::new();
-        let mut staged_candidates: Vec<(&GeneratedItreeCandidate, StagedItreeCandidate)> =
+        let mut staged_candidates: Vec<(&GeneratedItreeCandidate, StagedItreeCandidate, bool)> =
             Vec::with_capacity(opt_level_0_and_2_compiled);
         let mut cand_meta: BTreeMap<String, (&GeneratedItreeCandidate, StagedItreeCandidate)> =
             BTreeMap::new();
         let mut fn_prefix_map: BTreeMap<String, String> = BTreeMap::new();
 
-        for (b_idx, batch) in batches.iter().enumerate() {
-            for (c_idx, cand) in batch.iter().enumerate() {
-                let comp = compile_results[b_idx][c_idx];
-                if !(comp.opt0 && comp.opt2 && comp.instrumented)
-                    || contains_unsafe_token(&cand.source)
-                {
+        for (entry, comp) in entries.iter().zip(&flat_compile) {
+            let cand = entry.cand;
+            if !(comp.opt0 && comp.opt2 && comp.instrumented) || contains_unsafe_token(&cand.source)
+            {
+                *not_compared_reasons
+                    .entry("compile_failed".to_string())
+                    .or_insert(0) += 1;
+                continue;
+            }
+            let prefix = entry.prefix();
+            let staged = match stage_itree_candidate_items(&cand.source, &prefix, "kernel_step") {
+                Ok(s) => s,
+                Err(_) => {
                     *not_compared_reasons
-                        .entry("compile_failed".to_string())
+                        .entry("staging_failed".to_string())
                         .or_insert(0) += 1;
                     continue;
                 }
-                let prefix = format!("b{b_idx}_c{c_idx}__");
-                let staged = match stage_itree_candidate_items(&cand.source, &prefix, "kernel_step")
-                {
-                    Ok(s) => s,
-                    Err(_) => {
-                        *not_compared_reasons
-                            .entry("staging_failed".to_string())
-                            .or_insert(0) += 1;
-                        continue;
-                    }
-                };
-                combined_candidates_rs.push_str(&staged.staged_source);
-                combined_candidates_rs.push('\n');
-                fn_prefix_map.insert(staged.root_fn_name.clone(), prefix);
-                cand_meta.insert(staged.root_fn_name.clone(), (cand, staged.clone()));
-                staged_candidates.push((cand, staged));
-            }
+            };
+            combined_candidates_rs.push_str(&staged.staged_source);
+            combined_candidates_rs.push('\n');
+            fn_prefix_map.insert(staged.root_fn_name.clone(), prefix);
+            cand_meta.insert(staged.root_fn_name.clone(), (cand, staged.clone()));
+            staged_candidates.push((cand, staged, entry.capture_only));
         }
         if staged_candidates.is_empty() {
             return Err(format!(
@@ -1847,10 +1979,16 @@ pub fn evaluate_itree_batches_with_options(
             .join("ItreeDiffStaged");
         for (target_fn, from_s, to_s) in &options.mir_mutations {
             let mir_file = mir_dir.join(format!("{target_fn}.lean"));
-            let orig = fs::read_to_string(&mir_file)
-                .map_err(|e| format!("failed to read {}: {e}", mir_file.display()))?;
+            let orig = match fs::read_to_string(&mir_file) {
+                Ok(orig) => orig,
+                Err(_) if mir_mutation_policy == MirMutationPolicy::SkipAbsent => continue,
+                Err(e) => return Err(format!("failed to read {}: {e}", mir_file.display())),
+            };
             let mutated = orig.replace(from_s, to_s);
             if orig == mutated {
+                if mir_mutation_policy == MirMutationPolicy::SkipAbsent {
+                    continue;
+                }
                 return Err(format!(
                     "MIR mutation pattern `{from_s}` not found in {}",
                     mir_file.display()
@@ -1861,13 +1999,16 @@ pub fn evaluate_itree_batches_with_options(
         }
 
         // Now that Lean MIR is scaffolded, build MIR-guided initial inputs and
-        // `EnvScheduleGenerator` schedules per candidate using both the Rust
-        // source and the extracted Lean MIR (`MirInputDictionary::from_lean_mir`).
+        // `EnvScheduleGenerator` schedules per evaluated candidate using both the
+        // Rust source and the extracted Lean MIR (`MirInputDictionary::from_lean_mir`).
         let mut staged_with_trials: Vec<(
             StagedItreeCandidate,
             Vec<CandidateTrialInput>,
         )> = Vec::with_capacity(staged_candidates.len());
-        for (cand, staged) in staged_candidates {
+        for (cand, staged, capture_only) in staged_candidates {
+            if capture_only {
+                continue;
+            }
             let mir_file = mir_dir.join(format!("{}.lean", staged.root_fn_name));
             let lean_mir_src = fs::read_to_string(&mir_file).ok();
             let trials = build_candidate_trial_inputs(
@@ -2305,12 +2446,17 @@ pub fn evaluate_itree_batches_with_options(
                         .cloned()
                         .unwrap_or_default();
                     let finding_id = format!("finding_{:04}_{}", findings.len(), case.case_ident);
-                    let mut bundle = ItreeFindingBundle {
+                    findings.push(ItreeFindingBundle {
                         finding_id,
                         fn_name: fn_name.clone(),
                         case_ident: case.case_ident.clone(),
                         seed_index: cand.seed_index,
                         applied_mutators: cand.applied_mutators.clone(),
+                        original_mutator_chain: cand.applied_mutators.clone(),
+                        minimized_mutator_chain: cand.applied_mutators.clone(),
+                        shrink_evaluations: 0,
+                        executed_oracle_runs: 0,
+                        shrink_status: String::new(),
                         diag_tag: tag,
                         diag_repr,
                         trace_hex: encode_recorded_raw_trace_hex(&case.trace),
@@ -2321,11 +2467,7 @@ pub fn evaluate_itree_batches_with_options(
                         checked_mir_module: case.config.root_mir_module.clone(),
                         candidate_source: cand.source.clone(),
                         repro_path: None,
-                    };
-                    if let Some(ref dir) = options.findings_dir {
-                        write_itree_finding_bundle_to_dir(dir, &mut bundle)?;
-                    }
-                    findings.push(bundle);
+                    });
                 }
             }
         }
@@ -2339,7 +2481,7 @@ pub fn evaluate_itree_batches_with_options(
         Ok(ItreeCampaignEvalReport {
             mode: mode.to_string(),
             seed,
-            batches: batches.len(),
+            batches: batch_count,
             batch_size,
             trials_per_candidate: options.trials_per_candidate,
             total_candidates,
@@ -2372,6 +2514,671 @@ pub fn evaluate_itree_batches_with_options(
 
     release_itree_staging_dir(&staging_dir);
     eval_res
+}
+
+/// Outcome of attempting to shrink a divergent ITree candidate's mutator chain.
+pub type ItreeShrinkStatus = MutatorChainShrinkStatus;
+
+/// The part of an ITree finding that a reduction of its candidate must
+/// reproduce: the `TraceReplayDiag` tag and at least the original's kernel
+/// confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItreeDiscrepancySignature {
+    /// `TraceReplayDiag.tagName` of the finding's trace (never `"ok"`).
+    pub diag_tag: String,
+    /// Whether the Lean 4 kernel confirmed the finding's trace.
+    pub kernel_confirmed: bool,
+}
+
+impl ItreeDiscrepancySignature {
+    /// Signature of `finding`.
+    pub fn of_finding(finding: &ItreeFindingBundle) -> Self {
+        Self {
+            diag_tag: finding.diag_tag.clone(),
+            kernel_confirmed: finding.kernel_confirmed,
+        }
+    }
+
+    /// Whether `trace` reproduces this signature: it diverges with the same tag,
+    /// and the kernel confirmed it if the kernel confirmed the original.
+    pub fn matches(&self, trace: &ItreeTraceVerdict) -> bool {
+        trace.diag_tag != "ok"
+            && trace.diag_tag == self.diag_tag
+            && (trace.kernel_confirmed || !self.kernel_confirmed)
+    }
+}
+
+/// One divergent trace of an ITree candidate as judged by the Lean `TraceCheck`
+/// oracle, with the artifacts that a finding bundle records for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItreeTraceVerdict {
+    /// Lean case identifier of the trace.
+    pub case_ident: String,
+    /// `TraceReplayDiag.tagName` reported by Lean.
+    pub diag_tag: String,
+    /// Full Lean `reprStr` of the `TraceReplayDiag` value.
+    pub diag_repr: String,
+    /// Encoded hex line of the trace.
+    pub trace_hex: String,
+    /// Whether the Lean 4 kernel confirmed the trace's diagnosis.
+    pub kernel_confirmed: bool,
+    /// Kernel-checked theorems about the trace.
+    pub kernel_confirm_theorem: String,
+    /// Root `Mir` module checked against the trace.
+    pub checked_mir_module: String,
+    /// Extracted neighborhood of `checked_mir_module`.
+    pub mir_neighborhood: String,
+    /// Full Lean source of `checked_mir_module`.
+    pub checked_mir_source: String,
+}
+
+impl ItreeTraceVerdict {
+    fn of_finding(finding: &ItreeFindingBundle) -> Self {
+        Self {
+            case_ident: finding.case_ident.clone(),
+            diag_tag: finding.diag_tag.clone(),
+            diag_repr: finding.diag_repr.clone(),
+            trace_hex: finding.trace_hex.clone(),
+            kernel_confirmed: finding.kernel_confirmed,
+            kernel_confirm_theorem: finding.kernel_confirm_theorem.clone(),
+            checked_mir_module: finding.checked_mir_module.clone(),
+            mir_neighborhood: finding.mir_neighborhood.clone(),
+            checked_mir_source: finding.checked_mir_source.clone(),
+        }
+    }
+}
+
+/// The live oracle's judgment of one compared ITree candidate program.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItreeCandidateEvaluation {
+    /// Every trace of the candidate whose `TraceReplayDiag` tag is not `"ok"`,
+    /// in case order; traces that replayed with `"ok"` are omitted.
+    pub divergent_traces: Vec<ItreeTraceVerdict>,
+}
+
+/// Result of shrinking a divergent [`GeneratedItreeCandidate`]'s mutator chain.
+#[derive(Debug, Clone)]
+pub struct ItreeCandidateShrinkResult {
+    /// Original mutator sequence before shrinking.
+    pub original_mutator_chain: Vec<String>,
+    /// Mutator sequence of `minimized_candidate`: 1-minimal when `status` is
+    /// `Minimized` or `AlreadyOneMinimal`, and the original sequence when
+    /// shrinking did not reduce it.
+    pub minimized_mutator_chain: Vec<String>,
+    /// Number of shrinker predicate evaluations on proper subsequences of the
+    /// original chain (each one a replay followed by the strict compile
+    /// pre-check and, if that passes, an oracle query). The full chain is never
+    /// re-evaluated: its divergence is the original finding.
+    pub shrink_evaluations: usize,
+    /// Number of oracle queries (`eval_fn` calls) made while shrinking.
+    pub oracle_evaluations: usize,
+    /// Number of replayed subsequences rejected by the compile pre-check without
+    /// querying the oracle.
+    pub compile_rejections: usize,
+    /// Number of oracle queries that actually executed the oracle. Equals
+    /// `oracle_evaluations` unless the evaluator is memoized ([`MemoizedOracle`]);
+    /// when several shrinks of one candidate share a memo, it counts only the
+    /// runs that this shrink executed, so it can be `0` when every query was
+    /// answered by runs of an earlier shrink.
+    pub executed_oracle_runs: usize,
+    /// Number of oracle queries that produced no judgment (the candidate was not
+    /// compared or the pipeline failed). Any failure makes `status`
+    /// [`MutatorChainShrinkStatus::Inconclusive`].
+    pub oracle_failures: usize,
+    /// Whether shrinking ran and what it concluded.
+    pub status: ItreeShrinkStatus,
+    /// Shortest candidate that the oracle confirmed to reproduce the signature
+    /// (the original candidate when shrinking did not reduce the chain).
+    pub minimized_candidate: GeneratedItreeCandidate,
+    /// First trace of `minimized_candidate` that reproduced the signature, when
+    /// shrinking reduced the chain.
+    pub minimized_trace: Option<ItreeTraceVerdict>,
+    /// All divergent traces of `minimized_candidate` that reproduced the
+    /// signature, in evaluation order, when shrinking reduced the chain.
+    pub minimized_traces: Vec<ItreeTraceVerdict>,
+}
+
+impl ItreeCandidateShrinkResult {
+    /// Whether `minimized_candidate` has a strictly shorter mutator chain than
+    /// the original candidate.
+    pub fn is_reduced(&self) -> bool {
+        self.minimized_mutator_chain.len() < self.original_mutator_chain.len()
+    }
+
+    /// Assign one of `minimized_traces` to each finding that this shrink
+    /// minimized, given the findings' original `trace_hex`es in finding order.
+    ///
+    /// A finding whose own trace the minimized candidate reproduced gets that
+    /// trace; the other findings get the remaining traces in order; and traces
+    /// are reused (round-robin from the first) only when the minimized candidate
+    /// has fewer matching traces than there are findings, so that the findings'
+    /// bundles stay distinct whenever enough witnesses exist. Every finding gets
+    /// `None` when shrinking did not reduce the chain.
+    pub fn assign_minimized_traces(
+        &self,
+        finding_trace_hexes: &[&str],
+    ) -> Vec<Option<&ItreeTraceVerdict>> {
+        let traces = &self.minimized_traces;
+        if !self.is_reduced() || traces.is_empty() {
+            return vec![None; finding_trace_hexes.len()];
+        }
+        let mut used = vec![false; traces.len()];
+        let mut assigned: Vec<Option<usize>> = finding_trace_hexes
+            .iter()
+            .map(|hex| {
+                let t = (0..traces.len()).find(|&t| !used[t] && traces[t].trace_hex == *hex)?;
+                used[t] = true;
+                Some(t)
+            })
+            .collect();
+        let mut unused = (0..traces.len()).filter(|&t| !used[t]).collect::<Vec<_>>().into_iter();
+        let mut reused = (0..traces.len()).cycle();
+        for slot in assigned.iter_mut().filter(|slot| slot.is_none()) {
+            *slot = unused.next().or_else(|| reused.next());
+        }
+        assigned.into_iter().map(|t| t.map(|t| &traces[t])).collect()
+    }
+}
+
+fn unshrunk_itree_result(
+    cand: &GeneratedItreeCandidate,
+    status: ItreeShrinkStatus,
+    (shrink_evaluations, oracle_evaluations, compile_rejections, oracle_failures): (
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+) -> ItreeCandidateShrinkResult {
+    ItreeCandidateShrinkResult {
+        original_mutator_chain: cand.applied_mutators.clone(),
+        minimized_mutator_chain: cand.applied_mutators.clone(),
+        shrink_evaluations,
+        oracle_evaluations,
+        compile_rejections,
+        executed_oracle_runs: oracle_evaluations,
+        oracle_failures,
+        status,
+        minimized_candidate: cand.clone(),
+        minimized_trace: None,
+        minimized_traces: Vec::new(),
+    }
+}
+
+/// Core of [`minimize_itree_candidate_mutations_with`] with an injectable compile
+/// pre-check `compile_fn` (so unit tests can exercise compile rejection without
+/// spawning `rustc`).
+///
+/// Shrinking runs [`shrink_mutation_chain_detailed`] over the candidate's
+/// recorded mutation passes ([`reconstruct_itree_mutation_steps`] over `seeds`,
+/// the seeds the candidate was generated from) with the predicate "the replayed
+/// subsequence passes `compile_fn`, the oracle judges it, and one of its
+/// divergent traces matches `signature`". The unmutated seed `[]` is evaluated
+/// like any other subsequence. Shrinking is skipped (status
+/// `SkippedReplayMismatch`, with no compile check or oracle query) unless
+/// replaying the full recorded chain reproduces the candidate byte for byte
+/// with zero `unsafe` tokens ([`itree_candidate_replay_is_faithful`]), and
+/// skipped as `SkippedNotApplicable` for identity candidates and non-divergent
+/// signatures.
+pub fn minimize_itree_candidate_mutations_with_compile_check<C, F>(
+    cand: &GeneratedItreeCandidate,
+    seeds: &[&str],
+    signature: &ItreeDiscrepancySignature,
+    compile_fn: C,
+    eval_fn: F,
+) -> ItreeCandidateShrinkResult
+where
+    C: FnMut(&GeneratedItreeCandidate) -> bool,
+    F: FnMut(&GeneratedItreeCandidate) -> Option<ItreeCandidateEvaluation>,
+{
+    if cand.applied_mutators.is_empty() || signature.diag_tag == "ok" {
+        return unshrunk_itree_result(cand, ItreeShrinkStatus::SkippedNotApplicable, (0, 0, 0, 0));
+    }
+    let Some((base, steps)) = reconstruct_itree_mutation_steps(cand, seeds) else {
+        return unshrunk_itree_result(cand, ItreeShrinkStatus::SkippedReplayMismatch, (0, 0, 0, 0));
+    };
+    minimize_itree_recorded_mutations_with_compile_check(
+        cand, &base, &steps, signature, compile_fn, eval_fn,
+    )
+}
+
+/// [`minimize_itree_candidate_mutations_with_compile_check`] for a candidate
+/// whose mutation history (`base` seed and recorded `steps`) the caller already
+/// has, for example a chain longer than [`crate::mutators_itree::generate_itree_batch`]
+/// draws. The history must reproduce `cand` byte for byte
+/// ([`itree_candidate_replay_is_faithful`]); otherwise shrinking is skipped
+/// (`SkippedReplayMismatch`) with no compile check or oracle query.
+pub fn minimize_itree_recorded_mutations_with_compile_check<C, F>(
+    cand: &GeneratedItreeCandidate,
+    base: &syn::File,
+    steps: &[ItreeMutationStep],
+    signature: &ItreeDiscrepancySignature,
+    mut compile_fn: C,
+    mut eval_fn: F,
+) -> ItreeCandidateShrinkResult
+where
+    C: FnMut(&GeneratedItreeCandidate) -> bool,
+    F: FnMut(&GeneratedItreeCandidate) -> Option<ItreeCandidateEvaluation>,
+{
+    if cand.applied_mutators.is_empty() || signature.diag_tag == "ok" {
+        return unshrunk_itree_result(cand, ItreeShrinkStatus::SkippedNotApplicable, (0, 0, 0, 0));
+    }
+    if !itree_candidate_replay_is_faithful(cand, base, steps) {
+        return unshrunk_itree_result(cand, ItreeShrinkStatus::SkippedReplayMismatch, (0, 0, 0, 0));
+    }
+
+    let full_len = steps.len();
+    let mut oracle_evaluations = 0usize;
+    let mut compile_rejections = 0usize;
+    let mut oracle_failures = 0usize;
+    // Last accepted reduction, keyed by the original pass indices it retains.
+    let mut last_accepted: Option<(
+        Vec<usize>,
+        GeneratedItreeCandidate,
+        Vec<ItreeTraceVerdict>,
+    )> = None;
+
+    let outcome = shrink_mutation_chain_detailed(steps, |sub_steps: &[ItreeMutationStep]| {
+        if sub_steps.len() == full_len {
+            // The faithful full replay is byte-identical to `cand`, whose
+            // divergence is the original finding.
+            return true;
+        }
+        let sub_cand = replay_itree_mutation_steps(cand, base, sub_steps);
+        if contains_unsafe_token(&sub_cand.source) || !compile_fn(&sub_cand) {
+            compile_rejections += 1;
+            return false;
+        }
+        oracle_evaluations += 1;
+        let Some(evaluation) = eval_fn(&sub_cand) else {
+            oracle_failures += 1;
+            return false;
+        };
+        let matching_traces: Vec<ItreeTraceVerdict> = evaluation
+            .divergent_traces
+            .iter()
+            .filter(|t| signature.matches(t))
+            .cloned()
+            .collect();
+        if matching_traces.is_empty() {
+            return false;
+        }
+        let kept: Vec<usize> = sub_steps.iter().map(|s| s.pass_index).collect();
+        last_accepted = Some((kept, sub_cand, matching_traces));
+        true
+    });
+
+    // The initial full-chain predicate call is free (see above) and not counted.
+    let shrink_evaluations = outcome.predicate_evaluations.saturating_sub(1);
+    let minimized_indices: Vec<usize> =
+        outcome.minimized_steps.iter().map(|s| s.pass_index).collect();
+    if minimized_indices.len() < full_len
+        && let Some((kept, min_cand, traces)) = last_accepted
+        && kept == minimized_indices
+    {
+        return ItreeCandidateShrinkResult {
+            original_mutator_chain: cand.applied_mutators.clone(),
+            minimized_mutator_chain: min_cand.applied_mutators.clone(),
+            shrink_evaluations,
+            oracle_evaluations,
+            compile_rejections,
+            executed_oracle_runs: oracle_evaluations,
+            oracle_failures,
+            status: ItreeShrinkStatus::of_completed_shrink(true, oracle_failures),
+            minimized_candidate: min_cand,
+            minimized_trace: traces.first().cloned(),
+            minimized_traces: traces,
+        };
+    }
+    unshrunk_itree_result(
+        cand,
+        ItreeShrinkStatus::of_completed_shrink(false, oracle_failures),
+        (shrink_evaluations, oracle_evaluations, compile_rejections, oracle_failures),
+    )
+}
+
+/// The compile pre-check that ITree shrinking runs on every replayed reduction
+/// before the trace + Lean oracle: everything that [`compile_itree_candidates`]
+/// requires of generated candidates (zero `unsafe` tokens, a clean compile under
+/// `#![forbid(unsafe_code)]` at both `-C opt-level=0` and `-C opt-level=2`, and
+/// a clean `anneal-mir-instrument` compile of the
+/// `#[anneal_trace::external]`-annotated copy at both levels), plus a stageable
+/// `kernel_step` root function.
+///
+/// A reduction that fails the pre-check is rejected without an oracle query; one
+/// that passes is a program the batch evaluation would compare, so the oracle
+/// reporting it as not compared is a genuine oracle failure.
+pub fn itree_candidate_passes_strict_compile(cand: &GeneratedItreeCandidate) -> bool {
+    if contains_unsafe_token(&cand.source)
+        || stage_itree_candidate_items(&cand.source, "shrink__", "kernel_step").is_err()
+    {
+        return false;
+    }
+    let Ok((annotated, _)) = annotate_itree_external_callees(&cand.source, "kernel_step") else {
+        return false;
+    };
+    let safe_src = format!("#![forbid(unsafe_code)]\n{}", cand.source);
+    let inst_src =
+        format!("#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{annotated}");
+    compile_rust_strict_opt("shrink", "0", &safe_src)
+        && compile_rust_strict_opt("shrink", "2", &safe_src)
+        && compile_rust_mir_instrumented("shrink_inst", "0", &inst_src)
+        && compile_rust_mir_instrumented("shrink_inst", "2", &inst_src)
+}
+
+/// Minimize a divergent [`GeneratedItreeCandidate`]'s mutator chain using a
+/// caller-supplied oracle `eval_fn`, pre-checking every replayed reduction with
+/// [`itree_candidate_passes_strict_compile`] (memoized by source).
+pub fn minimize_itree_candidate_mutations_with<F>(
+    cand: &GeneratedItreeCandidate,
+    seeds: &[&str],
+    signature: &ItreeDiscrepancySignature,
+    eval_fn: F,
+) -> ItreeCandidateShrinkResult
+where
+    F: FnMut(&GeneratedItreeCandidate) -> Option<ItreeCandidateEvaluation>,
+{
+    let mut compile_memo = MemoizedOracle::new(itree_candidate_passes_strict_compile);
+    minimize_itree_candidate_mutations_with_compile_check(
+        cand,
+        seeds,
+        signature,
+        |sub_cand| compile_memo.eval(sub_cand.source.clone(), sub_cand),
+        eval_fn,
+    )
+}
+
+/// Where an ITree finding's candidate sits in the evaluation that produced it,
+/// so that the live oracle can re-run reductions of it faithfully.
+#[derive(Debug, Clone, Copy)]
+pub struct ItreeShrinkContext<'a> {
+    /// Evaluation mode (`"identity"` or `"seeded"`).
+    pub mode: &'a str,
+    /// Batch seed (it seeds every candidate's native trial inputs).
+    pub seed: u64,
+    /// The evaluated batches.
+    pub batches: &'a [Vec<GeneratedItreeCandidate>],
+    /// Target candidate count per batch.
+    pub batch_size: usize,
+    /// Options of the evaluation, including any negative-control MIR mutations
+    /// and root-module swaps.
+    pub options: &'a ItreeEvalOptions,
+    /// Batch index of the candidate.
+    pub b_idx: usize,
+    /// Index of the candidate within its batch.
+    pub c_idx: usize,
+}
+
+/// Judge `sub` (a reduction of the candidate at `ctx`'s position) with the live
+/// ITree oracle: compile, capture, native trace collection, and Lean
+/// `TraceCheck` probing and kernel confirmation, exactly as
+/// [`evaluate_itree_batches_with_options`] judges batch candidates.
+///
+/// `sub` is staged under the original candidate's item prefix, so `ctx`'s MIR
+/// mutations and root-module swaps that target it apply unchanged. The
+/// evaluation also stages (as `capture_only`) the original candidates whose MIR
+/// modules the candidate's root swap names; MIR mutations of any other candidate
+/// cannot affect it and are dropped, and a requested mutation whose pattern the
+/// reduced program no longer contains is skipped (the injected fault does not
+/// apply to it). Returns an error when `sub` could not be compared.
+pub fn evaluate_itree_candidate_live(
+    sub: &GeneratedItreeCandidate,
+    ctx: &ItreeShrinkContext<'_>,
+) -> Result<ItreeCandidateEvaluation, String> {
+    let target = ItreeEvalEntry {
+        b_idx: ctx.b_idx,
+        c_idx: ctx.c_idx,
+        cand: sub,
+        capture_only: false,
+    };
+    let target_fn = target.root_fn_name();
+    let root_mir_swaps: Vec<(String, String)> = ctx
+        .options
+        .root_mir_swaps
+        .iter()
+        .filter(|(staged_fn, _)| *staged_fn == target_fn)
+        .cloned()
+        .collect();
+    let mut entries = vec![target];
+    for (_, module) in &root_mir_swaps {
+        let staged_item = module.strip_prefix("Mir.ItreeDiffStaged.").unwrap_or(module);
+        for mut other in batch_entries(ctx.batches) {
+            let already_staged = entries
+                .iter()
+                .any(|e| (e.b_idx, e.c_idx) == (other.b_idx, other.c_idx));
+            if !already_staged && staged_item.starts_with(&other.prefix()) {
+                other.capture_only = true;
+                entries.push(other);
+            }
+        }
+    }
+    let prefixes: Vec<String> = entries.iter().map(ItreeEvalEntry::prefix).collect();
+    let options = ItreeEvalOptions {
+        trials_per_candidate: ctx.options.trials_per_candidate,
+        confirm_chunk_size: ctx.options.confirm_chunk_size,
+        anneal_repo_root: ctx.options.anneal_repo_root.clone(),
+        findings_dir: None,
+        mir_mutations: ctx
+            .options
+            .mir_mutations
+            .iter()
+            .filter(|(staged_fn, _, _)| prefixes.iter().any(|p| staged_fn.starts_with(p.as_str())))
+            .cloned()
+            .collect(),
+        root_mir_swaps,
+    };
+    let report = evaluate_itree_entries(
+        ctx.mode,
+        ctx.seed,
+        ctx.batches.len(),
+        ctx.batch_size,
+        &entries,
+        &options,
+        MirMutationPolicy::SkipAbsent,
+    )?;
+    if !report.per_candidate_distinct_traces.contains_key(&target_fn) {
+        return Err(format!(
+            "`{target_fn}` was not compared (not-compared reasons: {:?})",
+            report.not_compared_reasons
+        ));
+    }
+    Ok(ItreeCandidateEvaluation {
+        divergent_traces: report
+            .findings
+            .iter()
+            .filter(|f| f.fn_name == target_fn)
+            .map(ItreeTraceVerdict::of_finding)
+            .collect(),
+    })
+}
+
+/// One live-oracle query of an ITree shrink: [`evaluate_itree_candidate_live`],
+/// with a run that could not compare `sub` logged and answered `None` (an oracle
+/// failure).
+fn query_itree_shrink_oracle(
+    sub: &GeneratedItreeCandidate,
+    ctx: &ItreeShrinkContext<'_>,
+) -> Option<ItreeCandidateEvaluation> {
+    match evaluate_itree_candidate_live(sub, ctx) {
+        Ok(evaluation) => Some(evaluation),
+        Err(e) => {
+            eprintln!(
+                "itree-difftest: shrink oracle run failed for b{}_c{} ({} mutators): {}",
+                ctx.b_idx,
+                ctx.c_idx,
+                sub.applied_mutators.len(),
+                truncate_lean_diag(&e)
+            );
+            None
+        }
+    }
+}
+
+/// Minimize the mutator chain of `cand`, the divergent candidate at `ctx`'s
+/// position, against the live ITree oracle ([`evaluate_itree_candidate_live`]),
+/// with a [`MemoizedOracle`] keyed by candidate source so that repeated queries
+/// of one program never re-run the pipeline (`executed_oracle_runs` counts only
+/// the runs that executed).
+pub fn minimize_itree_candidate_mutations(
+    cand: &GeneratedItreeCandidate,
+    seeds: &[&str],
+    signature: &ItreeDiscrepancySignature,
+    ctx: &ItreeShrinkContext<'_>,
+) -> ItreeCandidateShrinkResult {
+    let mut memo =
+        MemoizedOracle::new(|sub: &GeneratedItreeCandidate| query_itree_shrink_oracle(sub, ctx));
+    let mut res = minimize_itree_candidate_mutations_with(cand, seeds, signature, |sub| {
+        memo.eval(sub.source.clone(), sub)
+    });
+    res.executed_oracle_runs = memo.executed_runs;
+    res
+}
+
+/// Shrink the divergent candidate `cand` once for each of its distinct
+/// `signatures`, pre-checking reductions with `compile_fn` and judging them with
+/// the live oracle `live`, which all of the shrinks share.
+///
+/// A program that one shrink judged is never re-run by a later shrink (its
+/// query is a cache hit), and each result's `executed_oracle_runs` counts only
+/// the runs that its own shrink executed, so summing it over the results counts
+/// every executed run exactly once.
+fn shrink_itree_candidate_signatures<C, F>(
+    cand: &GeneratedItreeCandidate,
+    seeds: &[&str],
+    signatures: &[ItreeDiscrepancySignature],
+    mut compile_fn: C,
+    live: &mut MemoizedOracle<String, Option<ItreeCandidateEvaluation>, F>,
+) -> Vec<ItreeCandidateShrinkResult>
+where
+    C: FnMut(&GeneratedItreeCandidate) -> bool,
+    F: FnMut(&GeneratedItreeCandidate) -> Option<ItreeCandidateEvaluation>,
+{
+    signatures
+        .iter()
+        .map(|signature| {
+            let executed_before = live.executed_runs;
+            let mut res = minimize_itree_candidate_mutations_with_compile_check(
+                cand,
+                seeds,
+                signature,
+                &mut compile_fn,
+                |sub| live.eval(sub.source.clone(), sub),
+            );
+            res.executed_oracle_runs = live.executed_runs - executed_before;
+            res
+        })
+        .collect()
+}
+
+/// Shrink every finding of `report` against the live oracle and refresh the
+/// finding's repro-facing artifacts (`repro.rs` source, trace, diagnosis, MIR,
+/// and kernel theorems) from the run that accepted the minimized candidate.
+///
+/// Findings of one candidate with the same signature (`diag_tag` and original
+/// `kernel_confirmed`) share one shrink, and their bundles get distinct traces
+/// of the minimized candidate whenever it has enough matching traces
+/// ([`ItreeCandidateShrinkResult::assign_minimized_traces`]). All shrinks share
+/// one memoized compile pre-check, and the shrinks of one candidate share one
+/// [`MemoizedOracle`] for the live oracle, so no program is compiled or judged
+/// twice; each shrink's `executed_oracle_runs` counts only the live runs that it
+/// executed itself.
+fn shrink_itree_findings(
+    report: &mut ItreeCampaignEvalReport,
+    mode: &str,
+    seed: u64,
+    batches: &[Vec<GeneratedItreeCandidate>],
+    batch_size: usize,
+    options: &ItreeEvalOptions,
+) {
+    type ShrinkKey = (String, String, bool);
+    let shrink_key = |f: &ItreeFindingBundle| -> ShrinkKey {
+        (f.fn_name.clone(), f.diag_tag.clone(), f.kernel_confirmed)
+    };
+    // Findings (by index) of each shrink, and each candidate's distinct
+    // signatures, in finding order.
+    let mut members: BTreeMap<ShrinkKey, Vec<usize>> = BTreeMap::new();
+    let mut signatures_by_fn: Vec<(String, Vec<ItreeDiscrepancySignature>)> = Vec::new();
+    for (idx, finding) in report.findings.iter().enumerate() {
+        members.entry(shrink_key(finding)).or_default().push(idx);
+        let signature = ItreeDiscrepancySignature::of_finding(finding);
+        match signatures_by_fn.iter_mut().find(|(f, _)| *f == finding.fn_name) {
+            Some((_, signatures)) if signatures.contains(&signature) => {}
+            Some((_, signatures)) => signatures.push(signature),
+            None => signatures_by_fn.push((finding.fn_name.clone(), vec![signature])),
+        }
+    }
+
+    let entries = batch_entries(batches);
+    let mut compile_memo = MemoizedOracle::new(itree_candidate_passes_strict_compile);
+    let mut shrinks: BTreeMap<ShrinkKey, ItreeCandidateShrinkResult> = BTreeMap::new();
+    for (fn_name, signatures) in &signatures_by_fn {
+        let Some(entry) = entries.iter().find(|e| e.root_fn_name() == *fn_name) else {
+            continue;
+        };
+        let ctx = ItreeShrinkContext {
+            mode,
+            seed,
+            batches,
+            batch_size,
+            options,
+            b_idx: entry.b_idx,
+            c_idx: entry.c_idx,
+        };
+        let mut live = MemoizedOracle::new(|sub: &GeneratedItreeCandidate| {
+            query_itree_shrink_oracle(sub, &ctx)
+        });
+        let results = shrink_itree_candidate_signatures(
+            entry.cand,
+            ITREE_SAFE_SEEDS,
+            signatures,
+            |sub| compile_memo.eval(sub.source.clone(), sub),
+            &mut live,
+        );
+        for (signature, res) in signatures.iter().zip(results) {
+            let key = (
+                fn_name.clone(),
+                signature.diag_tag.clone(),
+                signature.kernel_confirmed,
+            );
+            shrinks.insert(key, res);
+        }
+    }
+
+    for (key, idxs) in members {
+        let Some(res) = shrinks.get(&key) else {
+            for idx in idxs {
+                report.findings[idx].shrink_status = format!(
+                    "skipped_shrinker_error: `{}` names no evaluated candidate",
+                    key.0
+                );
+            }
+            continue;
+        };
+        let original_hexes: Vec<String> =
+            idxs.iter().map(|&idx| report.findings[idx].trace_hex.clone()).collect();
+        let hex_refs: Vec<&str> = original_hexes.iter().map(String::as_str).collect();
+        let traces = res.assign_minimized_traces(&hex_refs);
+        for (&idx, trace) in idxs.iter().zip(traces) {
+            let finding = &mut report.findings[idx];
+            finding.original_mutator_chain = res.original_mutator_chain.clone();
+            finding.minimized_mutator_chain = res.minimized_mutator_chain.clone();
+            finding.shrink_evaluations = res.shrink_evaluations;
+            finding.executed_oracle_runs = res.executed_oracle_runs;
+            finding.shrink_status = res.status.slug().to_string();
+            if let Some(trace) = trace {
+                finding.applied_mutators = res.minimized_mutator_chain.clone();
+                finding.candidate_source = res.minimized_candidate.source.clone();
+                finding.case_ident = trace.case_ident.clone();
+                finding.diag_repr = trace.diag_repr.clone();
+                finding.trace_hex = trace.trace_hex.clone();
+                finding.kernel_confirmed = trace.kernel_confirmed;
+                finding.kernel_confirm_theorem = trace.kernel_confirm_theorem.clone();
+                finding.checked_mir_module = trace.checked_mir_module.clone();
+                finding.mir_neighborhood = trace.mir_neighborhood.clone();
+                finding.checked_mir_source = trace.checked_mir_source.clone();
+            }
+        }
+    }
 }
 
 /// Re-runs a standalone ITree finding bundle (or `repro.rs` inside a finding
@@ -2588,12 +3395,16 @@ fn render_string_list_json(items: &[String], indent: usize) -> String {
 pub fn render_itree_finding_bundle_json(finding: &ItreeFindingBundle, indent: usize) -> String {
     let pad = " ".repeat(indent);
     let inner = " ".repeat(indent + 2);
-    let mutators_json = finding
-        .applied_mutators
-        .iter()
-        .map(|m| json_escape(m))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let chain_json = |chain: &[String]| {
+        chain
+            .iter()
+            .map(|m| json_escape(m))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mutators_json = chain_json(&finding.applied_mutators);
+    let orig_mutators_json = chain_json(&finding.original_mutator_chain);
+    let min_mutators_json = chain_json(&finding.minimized_mutator_chain);
     let repro_path_json = finding
         .repro_path
         .as_ref()
@@ -2607,6 +3418,11 @@ pub fn render_itree_finding_bundle_json(finding: &ItreeFindingBundle, indent: us
          {inner}\"case_ident\": {},\n\
          {inner}\"seed_index\": {},\n\
          {inner}\"applied_mutators\": [{mutators_json}],\n\
+         {inner}\"original_mutator_chain\": [{orig_mutators_json}],\n\
+         {inner}\"minimized_mutator_chain\": [{min_mutators_json}],\n\
+         {inner}\"shrink_evaluations\": {},\n\
+         {inner}\"executed_oracle_runs\": {},\n\
+         {inner}\"shrink_status\": {},\n\
          {inner}\"diag_tag\": {},\n\
          {inner}\"diag_repr\": {},\n\
          {inner}\"trace_hex\": {},\n\
@@ -2621,6 +3437,9 @@ pub fn render_itree_finding_bundle_json(finding: &ItreeFindingBundle, indent: us
         json_escape(&finding.fn_name),
         json_escape(&finding.case_ident),
         finding.seed_index,
+        finding.shrink_evaluations,
+        finding.executed_oracle_runs,
+        json_escape(&finding.shrink_status),
         json_escape(&finding.diag_tag),
         json_escape(&finding.diag_repr),
         json_escape(&finding.trace_hex),
@@ -2784,12 +3603,21 @@ pub fn render_itree_eval_report_markdown(report: &ItreeCampaignEvalReport) -> St
 
     if !report.findings.is_empty() {
         out.push_str("\n## Divergences Detected\n\n");
-        out.push_str("| Finding ID | Function | Case | `TraceReplayDiag` | Kernel Confirmed |\n");
-        out.push_str("| :--- | :--- | :--- | :--- | :--- |\n");
+        out.push_str(
+            "| Finding ID | Function | Case | `TraceReplayDiag` | Kernel Confirmed | Shrink |\n",
+        );
+        out.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
         for f in &report.findings {
             out.push_str(&format!(
-                "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
-                f.finding_id, f.fn_name, f.case_ident, f.diag_tag, f.kernel_confirmed
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` ({} -> {} mutators) |\n",
+                f.finding_id,
+                f.fn_name,
+                f.case_ident,
+                f.diag_tag,
+                f.kernel_confirmed,
+                f.shrink_status,
+                f.original_mutator_chain.len(),
+                f.minimized_mutator_chain.len()
             ));
         }
     }
@@ -2799,10 +3627,12 @@ pub fn render_itree_eval_report_markdown(report: &ItreeCampaignEvalReport) -> St
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
+    use crate::mutators_itree::{generate_itree_batch, generate_itree_identity_batch};
 
     const GIB_KIB: u64 = 1024 * 1024;
 
@@ -3141,5 +3971,677 @@ mod tests {
             "5 chunks + {ITREE_FALLBACK_CIRCUIT_BREAKER} fallback attempts before tripping"
         );
         assert!(stage.errors.iter().any(|e| e.contains("skipped")));
+    }
+
+    // ---- Mutator-chain shrinking of ITree findings ----
+
+    fn trace_verdict(case: &str, tag: &str, kernel_confirmed: bool) -> ItreeTraceVerdict {
+        ItreeTraceVerdict {
+            case_ident: case.to_string(),
+            diag_tag: tag.to_string(),
+            diag_repr: format!("TraceReplayDiag.{tag} (case {case})"),
+            trace_hex: format!("hex-{case}"),
+            kernel_confirmed,
+            kernel_confirm_theorem: if kernel_confirmed {
+                format!("theorem {case}_diag_tag : ... := by\n  rfl")
+            } else {
+                String::new()
+            },
+            checked_mir_module: format!("Mir.ItreeDiffStaged.{case}"),
+            mir_neighborhood: format!("-- neighborhood of {case}"),
+            checked_mir_source: format!("namespace Mir.ItreeDiffStaged.{case}\nend"),
+        }
+    }
+
+    fn divergent(traces: Vec<ItreeTraceVerdict>) -> Option<ItreeCandidateEvaluation> {
+        Some(ItreeCandidateEvaluation {
+            divergent_traces: traces,
+        })
+    }
+
+    fn outcome_mismatch_signature() -> ItreeDiscrepancySignature {
+        ItreeDiscrepancySignature {
+            diag_tag: "outcome_mismatch".to_string(),
+            kernel_confirmed: true,
+        }
+    }
+
+    /// Replays every subset of `steps` and maps each replayed source to its
+    /// subset bitmask (bit `i` = pass `i` kept), asserting that the replays are
+    /// pairwise distinct so a mock oracle can tell them apart.
+    fn itree_subset_source_map(
+        cand: &GeneratedItreeCandidate,
+        base: &syn::File,
+        steps: &[ItreeMutationStep],
+    ) -> BTreeMap<String, u32> {
+        let mut map = BTreeMap::new();
+        for mask in 0u32..(1u32 << steps.len()) {
+            let sub: Vec<ItreeMutationStep> = steps
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (mask >> i) & 1 == 1)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let src = replay_itree_mutation_steps(cand, base, &sub).source;
+            assert!(!contains_unsafe_token(&src), "subset {mask:#b} emitted `unsafe`");
+            assert!(
+                map.insert(src, mask).is_none(),
+                "subset replays must be pairwise distinct"
+            );
+        }
+        map
+    }
+
+    /// First generated candidate with exactly `n` passes.
+    fn generated_itree_candidate_with_passes(n: usize) -> GeneratedItreeCandidate {
+        for seed in [0xCAFE_1234u64, 0x3333_4444, 0x1111_2222, 0x9999_AAAA] {
+            if let Some(c) = generate_itree_batch(ITREE_SAFE_SEEDS, 16, seed)
+                .into_iter()
+                .find(|c| c.applied_mutators.len() == n)
+            {
+                return c;
+            }
+        }
+        panic!("no generated ITree candidate with {n} passes");
+    }
+
+    /// A candidate with a recorded 3-pass history (the generator draws at most 2
+    /// passes): a generated 2-pass candidate's history plus a third
+    /// `BranchLoopWeaver` pass, with the subset-to-bitmask map of its replays.
+    fn three_pass_itree_candidate() -> (
+        GeneratedItreeCandidate,
+        syn::File,
+        Vec<ItreeMutationStep>,
+        BTreeMap<String, u32>,
+    ) {
+        let cand2 = generated_itree_candidate_with_passes(2);
+        let (base, mut steps) =
+            reconstruct_itree_mutation_steps(&cand2, ITREE_SAFE_SEEDS).expect("reconstruct");
+        steps.push(ItreeMutationStep {
+            pass_index: 2,
+            mutator_name: "BranchLoopWeaver".to_string(),
+            rng_before_step: DetRng::new(0x5EED_3333),
+        });
+        let cand3 = replay_itree_mutation_steps(&cand2, &base, &steps);
+        assert_eq!(cand3.applied_mutators.len(), 3);
+        let subsets = itree_subset_source_map(&cand3, &base, &steps);
+        (cand3, base, steps, subsets)
+    }
+
+    /// Mock oracle for the 3-pass scenario (bit `i` = pass `i` kept):
+    /// `{0}` diverges with a different tag, `{2}` diverges with the original tag
+    /// but without kernel confirmation, `{1, 2}` and `{1}` reproduce the
+    /// signature (`{1}` after a non-matching trace), and every other subset
+    /// agrees. `{0, 1}` never compiles (see the tests' compile checks).
+    fn three_pass_oracle(mask: u32) -> Option<ItreeCandidateEvaluation> {
+        match mask {
+            0b001 => divergent(vec![trace_verdict("c_t0", "call_arg_mismatch", true)]),
+            0b100 => divergent(vec![trace_verdict("c_t1", "outcome_mismatch", false)]),
+            0b110 => divergent(vec![trace_verdict("c_t2", "outcome_mismatch", true)]),
+            0b010 => divergent(vec![
+                trace_verdict("c_t3", "branch_tag_mismatch", true),
+                trace_verdict("c_t4", "outcome_mismatch", true),
+            ]),
+            _ => divergent(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn itree_full_chain_replay_matches_generated_batches_identically() {
+        let mut checked = 0usize;
+        let mut multi_pass = 0usize;
+        for seed in [
+            0xCAFE_1234u64,
+            0x3333_4444,
+            0x1111_2222,
+            0x9999_AAAA,
+            0x0123_4567_89AB_CDEF,
+        ] {
+            for cand in generate_itree_batch(ITREE_SAFE_SEEDS, 16, seed) {
+                let (base, steps) = reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS)
+                    .expect("reconstruct a generated candidate's history");
+                assert_eq!(steps.len(), cand.applied_mutators.len());
+                assert!(steps.iter().enumerate().all(|(i, s)| s.pass_index == i));
+                let replayed = replay_itree_mutation_steps(&cand, &base, &steps);
+                assert_eq!(
+                    replayed, cand,
+                    "full-chain replay must reproduce candidate {} byte for byte",
+                    cand.id
+                );
+                assert!(itree_candidate_replay_is_faithful(&cand, &base, &steps));
+                // Every subset replays to a strictly safe program.
+                let _ = itree_subset_source_map(&cand, &base, &steps);
+                if steps.len() >= 2 {
+                    multi_pass += 1;
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 80);
+        assert!(multi_pass > 0, "expected multi-pass candidates across 80 candidates");
+    }
+
+    #[test]
+    fn itree_replay_fidelity_rejects_tampered_hand_built_and_identity_candidates() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let signature = outcome_mismatch_signature();
+
+        let mut tampered = cand.clone();
+        tampered.source.push_str("\n// tampered\n");
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&tampered, ITREE_SAFE_SEEDS).expect("reconstruct");
+        assert!(!itree_candidate_replay_is_faithful(&tampered, &base, &steps));
+
+        let mut non_canonical_steps = steps.clone();
+        non_canonical_steps[1].pass_index = 0;
+        assert!(!itree_candidate_replay_is_faithful(
+            &cand,
+            &base,
+            &non_canonical_steps
+        ));
+        let bad_idx_res = minimize_itree_recorded_mutations_with_compile_check(
+            &cand,
+            &base,
+            &non_canonical_steps,
+            &signature,
+            |_| panic!("compile check must not run for non-canonical step indices"),
+            |_| panic!("oracle must not run for non-canonical step indices"),
+        );
+        assert_eq!(bad_idx_res.status, ItreeShrinkStatus::SkippedReplayMismatch);
+        assert_eq!(bad_idx_res.shrink_evaluations, 0);
+
+        let mut with_unsafe = cand.clone();
+        with_unsafe.source = format!("{}\npub fn sneaky() {{ unsafe {{}} }}\n", cand.source);
+        let mut out_of_range_seed = cand.clone();
+        out_of_range_seed.seed_index = ITREE_SAFE_SEEDS.len() + 3;
+        assert!(reconstruct_itree_mutation_steps(&out_of_range_seed, ITREE_SAFE_SEEDS).is_none());
+        // An in-range seed that the generator would not have mutated for this id.
+        let mut other_seed = cand.clone();
+        other_seed.seed_index = (cand.seed_index + 1) % ITREE_SAFE_SEEDS.len();
+        assert!(reconstruct_itree_mutation_steps(&other_seed, ITREE_SAFE_SEEDS).is_none());
+        let mut wrong_chain = cand.clone();
+        wrong_chain.applied_mutators = vec!["ExtOracleInjector".to_string(); 3];
+        assert!(reconstruct_itree_mutation_steps(&wrong_chain, ITREE_SAFE_SEEDS).is_none());
+        let hand_built = GeneratedItreeCandidate {
+            id: 1,
+            seed_index: 0,
+            seed_u64: 0x9999,
+            applied_mutators: vec!["BranchLoopWeaver".to_string()],
+            source: "pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {\n    \
+                     magic ^ payload_len\n}\n"
+                .to_string(),
+        };
+
+        for victim in [
+            &tampered,
+            &with_unsafe,
+            &out_of_range_seed,
+            &other_seed,
+            &wrong_chain,
+            &hand_built,
+        ] {
+            let res = minimize_itree_candidate_mutations_with_compile_check(
+                victim,
+                ITREE_SAFE_SEEDS,
+                &signature,
+                |_| panic!("compile check must not run for an unfaithful replay"),
+                |_| panic!("oracle must not run for an unfaithful replay"),
+            );
+            assert_eq!(res.status, ItreeShrinkStatus::SkippedReplayMismatch);
+            assert_eq!(res.minimized_candidate, *victim);
+            assert_eq!(res.minimized_mutator_chain, victim.applied_mutators);
+            assert!(res.minimized_trace.is_none() && !res.is_reduced());
+            assert_eq!(
+                (
+                    res.shrink_evaluations,
+                    res.oracle_evaluations,
+                    res.compile_rejections,
+                    res.executed_oracle_runs
+                ),
+                (0, 0, 0, 0)
+            );
+        }
+
+        // Identity candidates and non-divergent signatures are never shrunk.
+        let identity = generate_itree_identity_batch(ITREE_SAFE_SEEDS)[0].clone();
+        let ok_signature = ItreeDiscrepancySignature {
+            diag_tag: "ok".to_string(),
+            kernel_confirmed: true,
+        };
+        for (victim, sig) in [(&identity, &signature), (&cand, &ok_signature)] {
+            let res = minimize_itree_candidate_mutations_with_compile_check(
+                victim,
+                ITREE_SAFE_SEEDS,
+                sig,
+                |_| panic!("no compile check expected"),
+                |_| panic!("no oracle run expected"),
+            );
+            assert_eq!(res.status, ItreeShrinkStatus::SkippedNotApplicable);
+            assert_eq!(res.shrink_evaluations, 0);
+        }
+    }
+
+    #[test]
+    fn itree_signature_requires_same_tag_and_at_least_original_kernel_confirmation() {
+        let confirmed = outcome_mismatch_signature();
+        assert!(confirmed.matches(&trace_verdict("t", "outcome_mismatch", true)));
+        assert!(!confirmed.matches(&trace_verdict("t", "outcome_mismatch", false)));
+        assert!(!confirmed.matches(&trace_verdict("t", "event_mismatch", true)));
+        assert!(!confirmed.matches(&trace_verdict("t", "ok", true)));
+        let unconfirmed = ItreeDiscrepancySignature {
+            diag_tag: "outcome_mismatch".to_string(),
+            kernel_confirmed: false,
+        };
+        assert!(unconfirmed.matches(&trace_verdict("t", "outcome_mismatch", false)));
+        assert!(unconfirmed.matches(&trace_verdict("t", "outcome_mismatch", true)));
+        let ok_tag = ItreeDiscrepancySignature {
+            diag_tag: "ok".to_string(),
+            kernel_confirmed: false,
+        };
+        assert!(!ok_tag.matches(&trace_verdict("t", "ok", true)));
+    }
+
+    #[test]
+    fn itree_shrinks_3_mutator_chain_to_1_rejecting_compile_tag_and_unconfirmed_changes() {
+        let (cand3, base, steps, subsets) = three_pass_itree_candidate();
+        let names = cand3.applied_mutators.clone();
+        let compile_calls = RefCell::new(Vec::<u32>::new());
+        let oracle_calls = RefCell::new(Vec::<u32>::new());
+        let res = minimize_itree_recorded_mutations_with_compile_check(
+            &cand3,
+            &base,
+            &steps,
+            &outcome_mismatch_signature(),
+            |sub| {
+                let mask = subsets[&sub.source];
+                compile_calls.borrow_mut().push(mask);
+                mask != 0b011
+            },
+            |sub| {
+                let mask = subsets[&sub.source];
+                assert_ne!(mask, 0b011, "a non-compiling subsequence reached the oracle");
+                assert_ne!(mask, 0b111, "the full chain must never be re-evaluated");
+                oracle_calls.borrow_mut().push(mask);
+                three_pass_oracle(mask)
+            },
+        );
+
+        assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+        assert!(res.is_reduced());
+        assert_eq!(res.original_mutator_chain, names);
+        assert_eq!(res.minimized_mutator_chain, vec![names[1].clone()]);
+        assert_eq!(res.minimized_candidate.applied_mutators, res.minimized_mutator_chain);
+        assert_eq!(subsets[&res.minimized_candidate.source], 0b010);
+        // The finding is refreshed from the first trace that reproduces the
+        // signature, not from the non-matching trace listed before it.
+        assert_eq!(
+            res.minimized_trace,
+            Some(trace_verdict("c_t4", "outcome_mismatch", true))
+        );
+
+        let compile_calls = compile_calls.into_inner();
+        let oracle_calls = oracle_calls.into_inner();
+        assert_eq!(
+            compile_calls,
+            vec![0b000, 0b100, 0b001, 0b011, 0b110, 0b100, 0b010],
+            "ddmin query order"
+        );
+        assert_eq!(oracle_calls, vec![0b000, 0b100, 0b001, 0b110, 0b100, 0b010]);
+        assert!(oracle_calls.contains(&0b001), "tag-changing {{0}} is judged and rejected");
+        assert!(oracle_calls.contains(&0b100), "unconfirmed {{2}} is judged and rejected");
+        assert_eq!(
+            (
+                res.shrink_evaluations,
+                res.oracle_evaluations,
+                res.compile_rejections,
+                res.executed_oracle_runs,
+                res.oracle_failures
+            ),
+            (7, 6, 1, 6, 0)
+        );
+        assert_eq!(res.shrink_evaluations, res.oracle_evaluations + res.compile_rejections);
+    }
+
+    #[test]
+    fn itree_memoized_oracle_is_transparent_and_runs_each_distinct_program_once() {
+        let (cand3, base, steps, subsets) = three_pass_itree_candidate();
+        let compiles = |sub: &GeneratedItreeCandidate| subsets[&sub.source] != 0b011;
+        let mut queried: Vec<u32> = Vec::new();
+        let plain = minimize_itree_recorded_mutations_with_compile_check(
+            &cand3,
+            &base,
+            &steps,
+            &outcome_mismatch_signature(),
+            compiles,
+            |sub| {
+                queried.push(subsets[&sub.source]);
+                three_pass_oracle(subsets[&sub.source])
+            },
+        );
+
+        let mut executed: Vec<u32> = Vec::new();
+        let mut memo = MemoizedOracle::new(|sub: &GeneratedItreeCandidate| {
+            executed.push(subsets[&sub.source]);
+            three_pass_oracle(subsets[&sub.source])
+        });
+        let memoized = minimize_itree_recorded_mutations_with_compile_check(
+            &cand3,
+            &base,
+            &steps,
+            &outcome_mismatch_signature(),
+            compiles,
+            |sub| memo.eval(sub.source.clone(), sub),
+        );
+        let (executed_runs, cache_hits) = (memo.executed_runs, memo.cache_hits);
+        drop(memo);
+
+        assert_eq!(plain.status, ItreeShrinkStatus::Minimized);
+        assert_eq!(memoized.status, plain.status);
+        assert_eq!(memoized.minimized_candidate, plain.minimized_candidate);
+        assert_eq!(memoized.minimized_trace, plain.minimized_trace);
+        assert_eq!(
+            (memoized.shrink_evaluations, memoized.oracle_evaluations, memoized.compile_rejections),
+            (plain.shrink_evaluations, plain.oracle_evaluations, plain.compile_rejections)
+        );
+        let distinct: BTreeSet<u32> = queried.iter().copied().collect();
+        assert!(
+            distinct.len() < queried.len(),
+            "the scenario must re-query an identical program: {queried:?}"
+        );
+        assert_eq!(executed.len(), distinct.len(), "a program was executed twice: {executed:?}");
+        assert_eq!(executed.iter().copied().collect::<BTreeSet<u32>>(), distinct);
+        assert_eq!((executed_runs, cache_hits), (5, 1));
+        assert_eq!(executed_runs + cache_hits, memoized.oracle_evaluations);
+    }
+
+    #[test]
+    fn itree_unmutated_seed_with_same_signature_shrinks_to_empty_chain_after_one_oracle_run() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        let res = minimize_itree_candidate_mutations_with_compile_check(
+            &cand,
+            ITREE_SAFE_SEEDS,
+            &outcome_mismatch_signature(),
+            |_| true,
+            |sub| {
+                assert_eq!(subsets[&sub.source], 0, "only `[]` should be evaluated");
+                divergent(vec![trace_verdict("seed_t0", "outcome_mismatch", true)])
+            },
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+        assert!(res.minimized_mutator_chain.is_empty());
+        assert_eq!(subsets[&res.minimized_candidate.source], 0);
+        assert_eq!(
+            res.minimized_candidate.source,
+            replay_itree_mutation_steps(&cand, &base, &[]).source
+        );
+        assert_eq!(
+            (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn itree_oracle_failures_make_the_shrink_inconclusive() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        // `[]` cannot be judged; `[s1]` reproduces the signature.
+        let res = minimize_itree_candidate_mutations_with_compile_check(
+            &cand,
+            ITREE_SAFE_SEEDS,
+            &outcome_mismatch_signature(),
+            |_| true,
+            |sub| match subsets[&sub.source] {
+                0b00 => None,
+                0b10 => divergent(vec![trace_verdict("s1_t0", "outcome_mismatch", true)]),
+                _ => divergent(Vec::new()),
+            },
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Inconclusive);
+        assert!(res.is_reduced(), "the confirmed reduction is still reported");
+        assert_eq!(res.minimized_mutator_chain, vec![cand.applied_mutators[1].clone()]);
+        assert_eq!(res.oracle_failures, 1);
+        assert!(res.minimized_trace.is_some());
+
+        // A shrink whose every query fails never claims 1-minimality.
+        let res = minimize_itree_candidate_mutations_with_compile_check(
+            &cand,
+            ITREE_SAFE_SEEDS,
+            &outcome_mismatch_signature(),
+            |_| true,
+            |_| None,
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Inconclusive);
+        assert!(!res.is_reduced());
+        assert_eq!(res.oracle_failures, res.oracle_evaluations);
+        assert_eq!(res.minimized_candidate, cand);
+    }
+
+    /// `minimize_itree_candidate_mutations_with` runs the real compile pre-check
+    /// (strict `-O0` and `-O2` plus the instrumented `-O0` and `-O2` compiles that
+    /// batch evaluation requires, memoized by source) before every oracle query.
+    #[test]
+    fn itree_minimize_with_runs_the_real_strict_compile_precheck() {
+        let cand = generated_itree_candidate_with_passes(2);
+        assert!(itree_candidate_passes_strict_compile(&cand));
+        let mut broken = cand.clone();
+        broken.source = "pub fn kernel_step(magic: u32, payload_len: u32) -> u32 { magic + true }\n"
+            .to_string();
+        assert!(!itree_candidate_passes_strict_compile(&broken));
+        let mut with_unsafe = cand.clone();
+        with_unsafe.source = format!("{}\npub fn f() {{ unsafe {{}} }}\n", cand.source);
+        assert!(!itree_candidate_passes_strict_compile(&with_unsafe));
+        let mut missing_root = cand.clone();
+        missing_root.source = "pub fn not_kernel_step(magic: u32, payload_len: u32) -> u32 {\n    \
+                               magic ^ payload_len\n}\n"
+            .to_string();
+        assert!(!itree_candidate_passes_strict_compile(&missing_root));
+        // On programs with a `kernel_step` root, the pre-check accepts exactly
+        // what batch compilation accepts.
+        let batch = vec![cand.clone(), broken.clone(), with_unsafe.clone()];
+        let compiled = compile_itree_candidates(std::slice::from_ref(&batch));
+        assert_eq!(
+            compiled[0]
+                .iter()
+                .map(|c| c.opt0 && c.opt2 && c.instrumented)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        let mut oracle_masks: Vec<u32> = Vec::new();
+        let res = minimize_itree_candidate_mutations_with(
+            &cand,
+            ITREE_SAFE_SEEDS,
+            &outcome_mismatch_signature(),
+            |sub| {
+                let mask = subsets[&sub.source];
+                oracle_masks.push(mask);
+                if mask == 0b01 {
+                    divergent(vec![trace_verdict("s0_t0", "outcome_mismatch", true)])
+                } else {
+                    divergent(Vec::new())
+                }
+            },
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+        assert_eq!(res.minimized_mutator_chain, vec![cand.applied_mutators[0].clone()]);
+        assert!(oracle_masks.contains(&0b00), "the unmutated seed `[]` must be evaluated");
+        assert_eq!(res.compile_rejections, 0, "every proper subsequence compiles");
+        assert_eq!(res.oracle_evaluations, oracle_masks.len());
+        assert_eq!(res.shrink_evaluations, oracle_masks.len());
+    }
+
+    #[test]
+    fn itree_finding_bundle_json_and_summary_serialize_shrink_metadata() {
+        let dir = env::temp_dir().join(format!(
+            "anneal_itree_bundle_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut bundle = ItreeFindingBundle {
+            finding_id: "finding_0000_case_b0_c0__kernel_step_t3".to_string(),
+            fn_name: "b0_c0__kernel_step".to_string(),
+            case_ident: "case_b0_c0__kernel_step_t1".to_string(),
+            seed_index: 0,
+            applied_mutators: vec!["BranchLoopWeaver".to_string()],
+            original_mutator_chain: vec![
+                "CallBoundaryOutliner".to_string(),
+                "BranchLoopWeaver".to_string(),
+            ],
+            minimized_mutator_chain: vec!["BranchLoopWeaver".to_string()],
+            shrink_evaluations: 3,
+            executed_oracle_runs: 2,
+            shrink_status: ItreeShrinkStatus::Minimized.slug().to_string(),
+            diag_tag: "outcome_mismatch".to_string(),
+            diag_repr: "TraceReplayDiag.outcomeMismatch ...".to_string(),
+            trace_hex: "00ff".to_string(),
+            kernel_confirmed: true,
+            kernel_confirm_theorem: "theorem case_b0_c0__kernel_step_t1_diag_tag : ... := by\n  rfl"
+                .to_string(),
+            mir_neighborhood: "def body : CapturedMir := ...".to_string(),
+            checked_mir_source: "namespace Mir.ItreeDiffStaged.b0_c0__kernel_step\nend".to_string(),
+            checked_mir_module: "Mir.ItreeDiffStaged.b0_c0__kernel_step".to_string(),
+            candidate_source: "pub fn kernel_step(magic: u32, payload_len: u32) -> u32 { 0 }\n"
+                .to_string(),
+            repro_path: None,
+        };
+        write_itree_finding_bundle_to_dir(&dir, &mut bundle).expect("write finding bundle");
+        let bundle_dir = dir.join(&bundle.finding_id);
+        let finding_json =
+            fs::read_to_string(bundle_dir.join("finding.json")).expect("read finding.json");
+        let summary_md =
+            fs::read_to_string(bundle_dir.join("SUMMARY.md")).expect("read SUMMARY.md");
+        let repro = fs::read_to_string(bundle_dir.join("repro.rs")).expect("read repro.rs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(repro, bundle.candidate_source);
+        assert!(finding_json.contains("\"applied_mutators\": [\"BranchLoopWeaver\"]"));
+        assert!(finding_json.contains(
+            "\"original_mutator_chain\": [\"CallBoundaryOutliner\", \"BranchLoopWeaver\"]"
+        ));
+        assert!(finding_json.contains("\"minimized_mutator_chain\": [\"BranchLoopWeaver\"]"));
+        assert!(finding_json.contains("\"shrink_evaluations\": 3"));
+        assert!(finding_json.contains("\"executed_oracle_runs\": 2"));
+        assert!(finding_json.contains("\"shrink_status\": \"minimized\""));
+        assert!(finding_json.contains("\"case_ident\": \"case_b0_c0__kernel_step_t1\""));
+        assert!(summary_md.contains(
+            "- **Original mutator chain**: `CallBoundaryOutliner, BranchLoopWeaver`"
+        ));
+        assert!(summary_md.contains("- **Minimized mutator chain**: `BranchLoopWeaver`"));
+        assert!(summary_md.contains("- **Shrink status**: `minimized`"));
+        assert!(
+            summary_md.contains("- **Shrink evaluations**: `3` (live oracle runs executed: `2`)")
+        );
+    }
+
+    #[test]
+    fn itree_shrink_result_retains_all_matching_traces_and_selects_distinct_finding_traces() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        let mut t0 = trace_verdict("case_b0_c0__kernel_step_t0", "outcome_mismatch", true);
+        t0.trace_hex = "aa00".to_string();
+        let mut t1 = trace_verdict("case_b0_c0__kernel_step_t1", "outcome_mismatch", true);
+        t1.trace_hex = "bb11".to_string();
+        let unrelated = trace_verdict("case_b0_c0__kernel_step_t2", "event_mismatch", true);
+        let res = minimize_itree_recorded_mutations_with_compile_check(
+            &cand,
+            &base,
+            &steps,
+            &outcome_mismatch_signature(),
+            |_| true,
+            |sub| {
+                if subsets[&sub.source] == 0b00 {
+                    divergent(vec![t0.clone(), unrelated.clone(), t1.clone()])
+                } else {
+                    divergent(Vec::new())
+                }
+            },
+        );
+        assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+        assert_eq!(res.minimized_traces.len(), 2);
+        assert_eq!(res.minimized_trace.as_ref(), Some(&t0));
+
+        // A finding keeps its own trace when the minimized candidate reproduced
+        // it, the other findings take the remaining traces in order, and traces
+        // are reused (round-robin) only once every trace has been assigned.
+        assert_eq!(res.assign_minimized_traces(&["ff00", "ff11"]), vec![Some(&t0), Some(&t1)]);
+        assert_eq!(res.assign_minimized_traces(&["ff00", "aa00"]), vec![Some(&t1), Some(&t0)]);
+        assert_eq!(res.assign_minimized_traces(&["aa00", "aa00"]), vec![Some(&t0), Some(&t1)]);
+        assert_eq!(
+            res.assign_minimized_traces(&["bb11", "ff00", "ff11"]),
+            vec![Some(&t1), Some(&t0), Some(&t0)]
+        );
+        assert_eq!(
+            res.assign_minimized_traces(&["f1", "f2", "f3", "f4", "f5"]),
+            vec![Some(&t0), Some(&t1), Some(&t0), Some(&t1), Some(&t0)]
+        );
+        assert!(res.assign_minimized_traces(&[]).is_empty());
+
+        // A shrink that did not reduce the chain refreshes no finding.
+        let unreduced =
+            unshrunk_itree_result(&cand, ItreeShrinkStatus::AlreadyOneMinimal, (3, 3, 0, 0));
+        assert_eq!(unreduced.assign_minimized_traces(&["aa00", "ff11"]), vec![None, None]);
+    }
+
+    /// The shrinks of one candidate's distinct signatures share one live-oracle
+    /// memo: a program that the first shrink judged is a cache hit for the
+    /// second, and each shrink reports only the live runs that it executed.
+    #[test]
+    fn itree_signature_shrinks_share_the_live_memo_and_count_their_own_runs() {
+        let cand = generated_itree_candidate_with_passes(2);
+        let (base, steps) =
+            reconstruct_itree_mutation_steps(&cand, ITREE_SAFE_SEEDS).expect("reconstruct");
+        let subsets = itree_subset_source_map(&cand, &base, &steps);
+        let outcome_trace = trace_verdict("seed_t0", "outcome_mismatch", true);
+        let event_trace = trace_verdict("seed_t1", "event_mismatch", true);
+        let event_signature = ItreeDiscrepancySignature {
+            diag_tag: "event_mismatch".to_string(),
+            kernel_confirmed: true,
+        };
+        let mut judged: Vec<u32> = Vec::new();
+        let mut live = MemoizedOracle::new(|sub: &GeneratedItreeCandidate| {
+            judged.push(subsets[&sub.source]);
+            if subsets[&sub.source] == 0b00 {
+                divergent(vec![outcome_trace.clone(), event_trace.clone()])
+            } else {
+                divergent(Vec::new())
+            }
+        });
+        let results = shrink_itree_candidate_signatures(
+            &cand,
+            ITREE_SAFE_SEEDS,
+            &[outcome_mismatch_signature(), event_signature],
+            |_| true,
+            &mut live,
+        );
+        let (executed_runs, cache_hits) = (live.executed_runs, live.cache_hits);
+        drop(live);
+
+        assert_eq!(results.len(), 2);
+        for (res, trace) in results.iter().zip([&outcome_trace, &event_trace]) {
+            assert_eq!(res.status, ItreeShrinkStatus::Minimized);
+            assert!(res.minimized_mutator_chain.is_empty());
+            assert_eq!(res.minimized_traces, vec![trace.clone()]);
+            assert_eq!((res.shrink_evaluations, res.oracle_evaluations), (1, 1));
+        }
+        assert_eq!(judged, vec![0b00], "`[]` must be judged exactly once");
+        assert_eq!((executed_runs, cache_hits), (1, 1));
+        assert_eq!(
+            results.iter().map(|r| r.executed_oracle_runs).collect::<Vec<_>>(),
+            vec![1, 0],
+            "the second shrink's `[]` query is answered by the first shrink's run"
+        );
     }
 }
