@@ -304,6 +304,8 @@ class LeanSourceAuditTests(unittest.TestCase):
             "not_lawfulMutLens_fieldLens_laidOutPair_typedAt", "applyFieldWrites_fieldsTyped_spec",
             "stage1_write_release_observable_ub_separation",
             "reborrow_return_after_parent_write_stage2Only_unique_write_perm",
+            "applySlotUpdates_eq_of_live?", "update_localRead_eq_self", "update_foreignRead_eq_self",
+            "applyReleaseProtector_read_latchEquiv", "applyReleaseProtector_read_same_verdicts",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
@@ -318,6 +320,18 @@ class LeanSourceAuditTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIn("(Trusted.Sequence.set? env u.1 u.2).bind forceSpine?", m.group(0))
         self.assertIn("applySlotUpdates_eq_of_twoPass", bench.proof("local_slots", "live_two_pass_rfl", 5))
+
+    def test_live_set_only_ablation_isolates_forcing_pass(self):
+        """`local_slots/ablation_live_set_only_rfl` must be the live chain minus the forcing pass,
+        so that against `live_two_pass_rfl` it isolates the cost/necessity of `forcePureEnv?`."""
+        variants = bench.FAMILIES["local_slots"]
+        self.assertLess(variants.index("ablation_live_set_only_rfl"), variants.index("live_two_pass_rfl"))
+        self.assertEqual(bench.proof("local_slots", "ablation_live_set_only_rfl", 5),
+                         "applySlotUpdates_eq_of_live? rfl")
+        m = re.search(r"def applySlotUpdatesLive\? .*?\n\n", self.code, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("match Trusted.Sequence.set? env u.1 u.2 with", m.group(0))
+        self.assertNotIn("forceSpine?", m.group(0))
 
     def test_checked_single_pass_variant_and_stage1_separation(self):
         """`local_slots/checked_single_pass_rfl` must measure bounds-checked `setSpineChecked?`

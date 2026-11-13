@@ -2019,6 +2019,16 @@ theorem applySlotUpdates_eq_of_checked {α : Type} {ups : List (Nat × α)} {env
   rw [applySlotUpdatesChecked_eq_live?, ← applySlotUpdatesTwoPass_eq_live?] at h
   exact applySlotUpdates_eq_of_twoPass h
 
+/-- **Soundness of the bare live chain** (`Trusted.Sequence.set?` without the
+`forcePureEnv?` pass of `evalPureStmtNorm`): benchmarked as
+`local_slots/ablation_live_set_only_rfl` to test whether the bounds check's
+`env.length` traversal alone keeps `rfl` linear, i.e. whether the live forcing pass is
+necessary. -/
+theorem applySlotUpdates_eq_of_live? {α : Type} {ups : List (Nat × α)} {env flat : List α}
+    (h : applySlotUpdatesLive? ups env = some flat) : applySlotUpdates env ups = flat := by
+  rw [← applySlotUpdatesTwoPass_eq_live?] at h
+  exact applySlotUpdates_eq_of_twoPass h
+
 end ForcePureEnv
 
 /-! ## 8. Relational `TypedAt` / `DisjointSlice` lenses over trusted abstract bytes -/
@@ -6265,6 +6275,86 @@ theorem stage1_vs_stage2Only_two_arg_release_same_verdicts (r : ByteRange) (star
       TreeAccessNoUB tree2 start kind range (removeActiveProtector active1 0) mode :=
   (stage1_vs_stage2Only_two_arg_release_unobservable r).noUB_iff start kind range mode
 
+theorem update_localRead_eq_self (prot : Bool) {st : LocationState} (h : st.accessed = true) :
+    (match performTransition .read .localAccess prot st with
+      | some st' => st' | none => st) = st := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> first | (cases prot <;> rfl) | cases h
+
+theorem update_foreignRead_eq_self (prot : Bool) {st : LocationState} (h₁ : st.perm ≠ .active)
+    (h₂ : st.perm ≠ .reservedFrz false) :
+    (match performTransition .read .foreignAccess prot st with
+      | some st' => st' | none => st) = st := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;>
+    first | (cases prot <;> rfl) | exact absurd rfl h₁ | exact absurd rfl h₂
+
+theorem nodeAccessRelatedness_skip_not_desc_of_foreign {tree : BorrowTree} {start n : BorTag}
+    (h : nodeAccessRelatedness tree start .skipChildrenOfAccessed n = some .foreignAccess) :
+    tree.isAnc start n = false := by
+  cases hd : tree.isAnc start n with
+  | false => rfl
+  | true =>
+    cases hA : tree.isAnc n start with
+    | true => rw [nodeAccessRelatedness_anc hA] at h; cases h
+    | false => rw [nodeAccessRelatedness_skip_desc hA hd] at h; cases h
+
+/-- **General read-release unobservability (Round A3)**: if the released tag is not
+`Active` wherever it is accessed (so stage 1 is an implicit *read*), its ancestors are
+already accessed there, no foreign tag is `Active` there, and no foreign non-descendant
+tag that stays protected after the call (`active'`) is an unconflicted `ReservedFrz`
+there, then stage-1 release is latch-equivalent under `active'` to skipping it.  These
+are exactly the side conditions under which stage-2-only release is observationally
+identical (contrast the write case, `stage1_write_release_observable_ub_separation`). -/
+theorem applyReleaseProtector_read_latchEquiv {tree : BorrowTree} {t_rel : BorTag}
+    {active active' : ActiveProtectors}
+    (hRead : ∀ b, (tree.locState t_rel b).accessed = true → (tree.locState t_rel b).perm ≠ .active)
+    (hLocal : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = true → (tree.locState n b).accessed = true)
+    (hForeign : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = false → (tree.locState n b).perm ≠ .active)
+    (hOutlive : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = false → tree.isAnc t_rel n = false →
+      tree.isTagProtected n active' = true → (tree.locState n b).perm ≠ .reservedFrz false) :
+    LatchEquiv (applyReleaseProtector tree t_rel active) tree active' := by
+  refine ⟨rfl, rfl, rfl, applyReleaseProtector_read_eraseLatch hRead hLocal hForeign, ?_⟩
+  intro n b hn
+  have hn' : tree.isTagProtected n active' = true := hn
+  cases hP : tree.present n with
+  | false => exact applyReleaseProtector_locState_absent _ _ _ _ _ hP
+  | true =>
+    cases hA : (tree.locState t_rel b).accessed with
+    | false => exact applyReleaseProtector_locState_unacc _ _ _ _ _ hA
+    | true =>
+      rw [applyReleaseProtector_locState_acc _ _ _ _ _ hP hA,
+        Permission.associatedAccess_of_ne_active (hRead b hA)]
+      cases hR : nodeAccessRelatedness tree t_rel .skipChildrenOfAccessed n with
+      | none => rfl
+      | some rel =>
+        cases rel with
+        | localAccess =>
+          exact update_localRead_eq_self _
+            (hLocal n b hP hA (nodeAccessRelatedness_isAnc_of_local hR))
+        | foreignAccess =>
+          have hNotAnc := nodeAccessRelatedness_not_isAnc_of_foreign hR
+          exact update_foreignRead_eq_self _ (hForeign n b hP hA hNotAnc)
+            (hOutlive n b hP hA hNotAnc (nodeAccessRelatedness_skip_not_desc_of_foreign hR) hn')
+
+/-- Consequence of `applyReleaseProtector_read_latchEquiv`: under its side conditions,
+every later access has the same UB verdict after stage-1 release as without it. -/
+theorem applyReleaseProtector_read_same_verdicts {tree : BorrowTree} {t_rel : BorTag}
+    {active active' : ActiveProtectors}
+    (hRead : ∀ b, (tree.locState t_rel b).accessed = true → (tree.locState t_rel b).perm ≠ .active)
+    (hLocal : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = true → (tree.locState n b).accessed = true)
+    (hForeign : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = false → (tree.locState n b).perm ≠ .active)
+    (hOutlive : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = false → tree.isAnc t_rel n = false →
+      tree.isTagProtected n active' = true → (tree.locState n b).perm ≠ .reservedFrz false)
+    (start : BorTag) (kind : AccessKind) (range : ByteRange) (mode : ChildrenVisitMode) :
+    TreeAccessNoUB (applyReleaseProtector tree t_rel active) start kind range active' mode ↔
+      TreeAccessNoUB tree start kind range active' mode :=
+  (applyReleaseProtector_read_latchEquiv hRead hLocal hForeign hOutlive).noUB_iff start kind range mode
+
 /-- **Shared (`Mutability.not`) `reborrowFootprint` soundness**: when a
 `TrustedFnSpec` declares two overlapping shared `&` reborrows `[(r, .not), (r, .not)]`,
 both returned references emerge `Frozen` (`⟨.frozen, true⟩`) on `r`, reading
@@ -7016,6 +7106,14 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms runMirToBlock_reached_iff_step_and_live
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_not_reached_iff_live_runMirToBlock_none' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runUntilTarget_not_reached_iff_live_runMirToBlock_none
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_conflates_halt_stuck_outOfFuel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_conflates_halt_stuck_outOfFuel
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.blockTargets_toMirBlock' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
 #print axioms blockTargets_toMirBlock
@@ -7203,6 +7301,30 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_eq_bind_forceSpine?' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalPureStmtNorm_eq_bind_forceSpine?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_set?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_eq_live_set?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_eq_live_bind_forcePureEnv?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_symbolic_slot_rfl' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_symbolic_slot_rfl
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesChecked_eq_live?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesChecked_eq_live?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdates_eq_of_checked' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdates_eq_of_checked
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdates_eq_of_live?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdates_eq_of_live?
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.length_splice' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -7435,6 +7557,22 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_of_fieldsValid' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms fieldsTyped_of_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_nested_init_padding_not_fieldsValid' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms fieldsTyped_nested_init_padding_not_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.not_lawfulMutLens_fieldLens_laidOutPair_typedAt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms not_lawfulMutLens_fieldLens_laidOutPair_typedAt
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyFieldWrites_fieldsTyped_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyFieldWrites_fieldsTyped_spec
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.ByteRange.contains_iff' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -7884,6 +8022,26 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms stage1_vs_stage2Only_two_arg_release_same_verdicts
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.update_localRead_eq_self' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms update_localRead_eq_self
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.update_foreignRead_eq_self' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms update_foreignRead_eq_self
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_skip_not_desc_of_foreign' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_skip_not_desc_of_foreign
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_read_latchEquiv' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyReleaseProtector_read_latchEquiv
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_read_same_verdicts' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyReleaseProtector_read_same_verdicts
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.shared_reborrowFootprint_read_ok_write_ub' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms shared_reborrowFootprint_read_ok_write_ub
@@ -7903,50 +8061,6 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.restoreCallerProtectors_eq_live' depends on axioms: [Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms restoreCallerProtectors_eq_live
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_not_reached_iff_live_runMirToBlock_none' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runUntilTarget_not_reached_iff_live_runMirToBlock_none
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_conflates_halt_stuck_outOfFuel' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms live_runMirToBlock_conflates_halt_stuck_outOfFuel
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_set?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setSpineChecked?_eq_live_set?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setSpineChecked?_eq_live_bind_forcePureEnv?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_symbolic_slot_rfl' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms setSpineChecked?_symbolic_slot_rfl
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesChecked_eq_live?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms applySlotUpdatesChecked_eq_live?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdates_eq_of_checked' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms applySlotUpdates_eq_of_checked
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_of_fieldsValid' depends on axioms: [Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms fieldsTyped_of_fieldsValid
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_nested_init_padding_not_fieldsValid' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms fieldsTyped_nested_init_padding_not_fieldsValid
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.not_lawfulMutLens_fieldLens_laidOutPair_typedAt' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms not_lawfulMutLens_fieldLens_laidOutPair_typedAt
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyFieldWrites_fieldsTyped_spec' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms applyFieldWrites_fieldsTyped_spec
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_write_release_observable_ub_separation' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in

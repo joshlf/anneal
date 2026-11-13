@@ -69,8 +69,8 @@ BENCH_END = "<!-- BENCH:END -->"
 DECISIONS = ("GO", "CONDITIONAL GO", "NO-GO")
 
 FAMILIES: dict[str, tuple[str, ...]] = {
-    "local_slots": ("naive_rfl", "naive_simp", "ablation_projection_rfl", "live_two_pass_rfl",
-                    "checked_single_pass_rfl", "optimized_forcePureEnv"),
+    "local_slots": ("naive_rfl", "naive_simp", "ablation_projection_rfl", "ablation_live_set_only_rfl",
+                    "live_two_pass_rfl", "checked_single_pass_rfl", "optimized_forcePureEnv"),
     "struct_fields": ("naive_rfl", "naive_simp", "optimized_typedAt_lens"),
     "loop_trip": ("naive_fuel_rfl", "naive_fuel_simp", "optimized_runCfgToBlock_forRangeUp"),
 }
@@ -205,6 +205,10 @@ def proof(family: str, variant: str, k: int) -> str:
         if variant == "ablation_projection_rfl":
             return ("eq_of_forcePureEnv (n := 8)\n"
                     "    (by simp only [length_applySlotUpdates, List.length_cons, List.length_nil]) rfl")
+        if variant == "ablation_live_set_only_rfl":
+            # The live bounds-checked `Trusted.Sequence.set?` chain *without* the forcing pass:
+            # does the `env.length` traversal of the bounds check alone keep `rfl` linear?
+            return "applySlotUpdates_eq_of_live? rfl"
         if variant == "live_two_pass_rfl":
             # The live `evalPureStmtNorm` strategy: bounds-checked `Trusted.Sequence.set?`
             # followed by a full spine-forcing pass after every update.
