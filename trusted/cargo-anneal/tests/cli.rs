@@ -42,8 +42,7 @@ fn command(route: Route, workdir: &Path) -> Command {
             }
             command.env(
                 "PATH",
-                env::join_paths(paths)
-                    .expect("construct subcommand search path"),
+                env::join_paths(paths).expect("construct subcommand search path"),
             );
             command
         }
@@ -68,8 +67,7 @@ fn assert_result(output: &Output, code: i32, stdout: &str, stderr: &str) {
 
 #[test]
 fn help_and_version_work_through_direct_and_cargo_invocation() {
-    let project =
-        tempfile::tempdir().expect("create external working directory");
+    let project = tempfile::tempdir().expect("create external working directory");
     for route in [Route::Direct, Route::Cargo] {
         for args in [
             &[][..],
@@ -104,8 +102,7 @@ fn help_and_version_work_through_direct_and_cargo_invocation() {
 
 #[test]
 fn malformed_arguments_fail_through_direct_and_cargo_invocation() {
-    let project =
-        tempfile::tempdir().expect("create external working directory");
+    let project = tempfile::tempdir().expect("create external working directory");
     for route in [Route::Direct, Route::Cargo] {
         for args in [
             &["unknown"][..],
@@ -146,8 +143,7 @@ fn local_archive(path: &Path) {
 #[cfg(target_os = "linux")]
 #[test]
 fn setup_uses_fresh_child_cache_for_each_invocation() {
-    let project =
-        tempfile::tempdir().expect("create external working directory");
+    let project = tempfile::tempdir().expect("create external working directory");
     let archive = project.path().join("local archive.tar.zst");
     local_archive(&archive);
     for route in [Route::Direct, Route::Cargo] {
@@ -175,8 +171,7 @@ fn setup_uses_fresh_child_cache_for_each_invocation() {
             installed.display()
         );
         assert_eq!(
-            std::fs::read(installed.join("marker.txt"))
-                .expect("read installed current-run marker"),
+            std::fs::read(installed.join("marker.txt")).expect("read installed current-run marker"),
             b"current-run CLI archive"
         );
 
@@ -184,8 +179,7 @@ fn setup_uses_fresh_child_cache_for_each_invocation() {
             let failed_cache = tempfile::tempdir().expect("create fresh cache");
             let bad_archive = project.path().join(format!("{name}.tar.zst"));
             if name == "broken" {
-                std::fs::write(&bad_archive, b"invalid archive")
-                    .expect("write broken archive");
+                std::fs::write(&bad_archive, b"invalid archive").expect("write broken archive");
             }
             let output = command(route, project.path())
                 .env("XDG_CACHE_HOME", failed_cache.path())
@@ -193,12 +187,7 @@ fn setup_uses_fresh_child_cache_for_each_invocation() {
                 .arg(&bad_archive)
                 .output()
                 .unwrap_or_else(|error| panic!("launch {route:?}: {error}"));
-            assert_result(
-                &output,
-                1,
-                "",
-                "error: failed to install Anneal toolchain:",
-            );
+            assert_result(&output, 1, "", "error: failed to install Anneal toolchain:");
             assert!(output.stdout.is_empty(), "{output:?}");
         }
         assert!(installed.join("marker.txt").is_file());

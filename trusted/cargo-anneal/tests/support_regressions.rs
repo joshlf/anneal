@@ -33,9 +33,7 @@ fn python() -> PathBuf {
         .output()
         .expect("Python 3 must be available on PATH for replay tests");
     assert!(output.status.success());
-    let path = PathBuf::from(
-        serde_json::from_slice::<String>(&output.stdout).unwrap(),
-    );
+    let path = PathBuf::from(serde_json::from_slice::<String>(&output.stdout).unwrap());
     assert!(path.is_absolute());
     path
 }
@@ -123,10 +121,7 @@ fn case_creation_failure_prevents_every_case_body() {
             .unwrap_err();
         assert!(error.contains(existing.path().to_str().unwrap()), "{error}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            fs::read(existing.path().join("sentinel")).unwrap(),
-            b"keep"
-        );
+        assert_eq!(fs::read(existing.path().join("sentinel")).unwrap(), b"keep");
     }
 }
 
@@ -148,8 +143,7 @@ fn case_names_follow_the_host_filesystems_alias_rules() {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         for name in ["foo", "FOO"] {
             assert_eq!(
-                fs::read(run.path().join("cases").join(name).join("value"))
-                    .unwrap(),
+                fs::read(run.path().join("cases").join(name).join("value")).unwrap(),
                 name.as_bytes()
             );
         }
@@ -160,8 +154,7 @@ fn case_names_follow_the_host_filesystems_alias_rules() {
 fn replay_tolerates_a_wrapper_that_closes_stdin() {
     let fixture = tempfile::tempdir().unwrap();
     let script = fixture.path().join("close-stdin.py");
-    fs::write(&script, b"import os\nos.close(0)\nprint('stdin closed')\n")
-        .unwrap();
+    fs::write(&script, b"import os\nos.close(0)\nprint('stdin closed')\n").unwrap();
     let output = replay(&python(), &script, &vec![b'x'; 1024 * 1024]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"stdin closed\n");
@@ -172,11 +165,7 @@ fn replay_tolerates_a_wrapper_that_closes_stdin() {
 fn relative_tmpdir_records_absolute_paths_and_replays_moved_evidence() {
     let fixture = tempfile::tempdir().unwrap();
     fs::create_dir(fixture.path().join("actual-temp")).unwrap();
-    std::os::unix::fs::symlink(
-        "actual-temp",
-        fixture.path().join("relative-temp"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink("actual-temp", fixture.path().join("relative-temp")).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -211,8 +200,7 @@ fn relative_tmpdir_records_absolute_paths_and_replays_moved_evidence() {
 #[ignore = "internal subprocess fixture"]
 fn relative_tmpdir_child_fixture() {
     assert_eq!(std::env::temp_dir(), Path::new("relative-temp"));
-    let python =
-        PathBuf::from(std::env::var_os("ANNEAL_SUPPORT_PYTHON").unwrap());
+    let python = PathBuf::from(std::env::var_os("ANNEAL_SUPPORT_PYTHON").unwrap());
     let run = run_directory();
     let root = run.path().to_path_buf();
     assert!(root.is_absolute(), "{}", root.display());
@@ -237,8 +225,7 @@ fn relative_tmpdir_child_fixture() {
     assert_eq!(recorded["working_directory"], case.path().to_str().unwrap());
     assert_eq!(recorded["arguments"][2], input.to_str().unwrap());
     let metadata: Value =
-        serde_json::from_slice(&fs::read(root.join("run.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&fs::read(root.join("run.json")).unwrap()).unwrap();
     assert_eq!(metadata["original_run_root"], root.to_str().unwrap());
 
     let cwd = std::env::current_dir().unwrap();
@@ -312,11 +299,7 @@ fn diagnostic_export_checks_resolve_directory_aliases() {
     let run = run_directory();
     let alias = aliases.path().join("existing-export-alias");
     fs::create_dir(&alias).unwrap();
-    std::os::unix::fs::symlink(
-        run.path(),
-        alias.join(run.path().file_name().unwrap()),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(run.path(), alias.join(run.path().file_name().unwrap())).unwrap();
     let root = run.path().to_path_buf();
     let error = run
         .finish(Err("original".into()), Some(&alias))
@@ -465,17 +448,13 @@ fn replay_preserves_an_external_executable_with_a_similar_prefix() {
         b"",
     );
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains(missing.to_str().unwrap())
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains(missing.to_str().unwrap()));
 }
 
 #[test]
 fn replay_reapplies_the_recorded_process_deadline() {
     let python = python();
-    let run = RunDirectory::new("replay-timeout", Duration::from_millis(200))
-        .unwrap();
+    let run = RunDirectory::new("replay-timeout", Duration::from_millis(200)).unwrap();
     let mut case = run.case("timeout").unwrap();
     let outcome = case
         .run(&Invocation::new(
@@ -484,10 +463,9 @@ fn replay_reapplies_the_recorded_process_deadline() {
         ))
         .unwrap();
     assert!(matches!(outcome.termination, Termination::TimedOut(_)));
-    let metadata: Value = serde_json::from_slice(
-        &fs::read(case.path().join("commands/0000/outcome.json")).unwrap(),
-    )
-    .unwrap();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(case.path().join("commands/0000/outcome.json")).unwrap())
+            .unwrap();
     assert_eq!(metadata["kind"], "timed_out");
     let output = replay(
         &python,
@@ -516,8 +494,7 @@ runpy.run_path(str(script), run_name='__main__')
 "#,
     )
     .unwrap();
-    let output =
-        replay(&python, &case.path().join("remaining-timeout.py"), b"");
+    let output = replay(&python, &case.path().join("remaining-timeout.py"), b"");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(124), "replay stderr: {stderr}");
     assert!(

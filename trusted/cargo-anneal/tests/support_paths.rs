@@ -16,8 +16,7 @@ use std::time::Duration;
 use support::{Invocation, RunDirectory};
 
 fn run_directory() -> RunDirectory {
-    RunDirectory::new("fixture-path-regression", Duration::from_secs(2))
-        .unwrap()
+    RunDirectory::new("fixture-path-regression", Duration::from_secs(2)).unwrap()
 }
 
 #[test]
@@ -106,7 +105,11 @@ fn copies_replace_direct_and_nested_hard_links_without_changing_targets() {
         fs::hard_link(&sentinel, &destination).unwrap();
 
         case.copy(
-            if copy_directory { fixture.path() } else { &source },
+            if copy_directory {
+                fixture.path()
+            } else {
+                &source
+            },
             "copied",
         )
         .unwrap();
@@ -123,8 +126,7 @@ fn copied_replacements_keep_source_permissions_without_chmoding_aliases() {
 
     let fixture = tempfile::NamedTempFile::new().unwrap();
     fs::write(fixture.path(), b"source").unwrap();
-    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o751))
-        .unwrap();
+    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o751)).unwrap();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, b"keep").unwrap();
@@ -149,21 +151,25 @@ fn copied_replacements_keep_source_permissions_without_chmoding_aliases() {
 
 #[test]
 fn json_writes_to_an_empty_destination_return_an_error() {
-    assert!(support::write_json(
-        std::path::Path::new(""),
-        &serde_json::json!({"result": "unused"}),
-    )
-    .is_err());
+    assert!(
+        support::write_json(
+            std::path::Path::new(""),
+            &serde_json::json!({"result": "unused"}),
+        )
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn json_writes_to_a_root_destination_return_an_error() {
-    assert!(support::write_json(
-        std::path::Path::new("/"),
-        &serde_json::json!({"result": "unused"}),
-    )
-    .is_err());
+    assert!(
+        support::write_json(
+            std::path::Path::new("/"),
+            &serde_json::json!({"result": "unused"}),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -181,10 +187,8 @@ fn json_replacements_preserve_external_hard_link_targets() {
     )
     .unwrap();
     assert_eq!(fs::read(sentinel).unwrap(), b"keep");
-    let summary: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join("summary.json")).unwrap(),
-    )
-    .unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["result"], "replacement");
 }
 
@@ -197,7 +201,9 @@ fn failure_text_replacements_preserve_external_hard_link_targets() {
     let root = run.path().to_path_buf();
     fs::hard_link(&sentinel, root.join("failure.txt")).unwrap();
 
-    let error = run.finish(Err("original failure".into()), None).unwrap_err();
+    let error = run
+        .finish(Err("original failure".into()), None)
+        .unwrap_err();
 
     assert!(error.contains("original failure"), "{error}");
     assert!(error.contains("evidence retained at"), "{error}");
@@ -262,8 +268,7 @@ fn copy_rejects_equal_and_reverse_overlaps_without_changing_sources() {
     let case = run.case("overlap").unwrap();
     case.write("fixture/nested/sentinel", b"keep").unwrap();
     for source in ["fixture", "fixture/nested"] {
-        let error =
-            case.copy(&case.path().join(source), "fixture").unwrap_err();
+        let error = case.copy(&case.path().join(source), "fixture").unwrap_err();
         assert!(error.contains("must be disjoint"), "{error}");
         assert_eq!(
             fs::read(case.path().join("fixture/nested/sentinel")).unwrap(),
@@ -283,8 +288,7 @@ fn writes_reject_directory_file_and_dangling_symlinks() {
     let case = run.case("write-links").unwrap();
     symlink(outside.path(), case.path().join("directory")).unwrap();
     symlink(outside.path().join("sentinel"), case.path().join("file")).unwrap();
-    symlink(outside.path().join("absent"), case.path().join("dangling"))
-        .unwrap();
+    symlink(outside.path().join("absent"), case.path().join("dangling")).unwrap();
     for relative in [
         "directory/sentinel",
         "directory/new/file",
@@ -313,8 +317,7 @@ fn copies_reject_linked_destinations_including_nested_existing_entries() {
     let case = run.case("copy-links").unwrap();
     symlink(outside.path(), case.path().join("directory")).unwrap();
     symlink(outside.path().join("sentinel"), case.path().join("file")).unwrap();
-    symlink(outside.path().join("absent"), case.path().join("dangling"))
-        .unwrap();
+    symlink(outside.path().join("absent"), case.path().join("dangling")).unwrap();
     for relative in ["directory/new", "file", "dangling"] {
         let error = case
             .copy(&fixture.path().join("nested/value"), relative)
@@ -464,10 +467,9 @@ fn child_created_outcome_hard_links_preserve_external_files_and_status() {
 
     outcome.expect_code(23).unwrap();
     assert_eq!(fs::read(sentinel).unwrap(), b"keep");
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &fs::read(case.path().join("commands/0000/outcome.json")).unwrap(),
-    )
-    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(case.path().join("commands/0000/outcome.json")).unwrap())
+            .unwrap();
     assert_eq!(metadata["kind"], "exited");
     assert_eq!(metadata["code"], 23);
 }

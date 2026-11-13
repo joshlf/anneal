@@ -36,8 +36,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::{
-    CaseDirectory, Invocation, ProcessOutcome, RunDirectory, TestResult,
-    select_cases, write_json,
+    CaseDirectory, Invocation, ProcessOutcome, RunDirectory, TestResult, select_cases, write_json,
 };
 
 const CASES: &[&str] = &[
@@ -84,10 +83,7 @@ fn run_smoke(run: &RunDirectory) -> TestResult {
         "ANNEAL_TEST_DIAGNOSTICS",
     ]
     .into_iter()
-    .filter_map(|key| {
-        env::var_os(key)
-            .map(|value| (key, value.to_string_lossy().into_owned()))
-    })
+    .filter_map(|key| env::var_os(key).map(|value| (key, value.to_string_lossy().into_owned())))
     .collect();
     write_json(&run.path().join("supplied-inputs.json"), &json!(supplied))?;
     let selection = env::var("ANNEAL_TEST_CASE").ok();
@@ -117,14 +113,10 @@ fn run_smoke(run: &RunDirectory) -> TestResult {
         .map_err(|error| error.to_string())?
         .starts_with(checkout)
     {
-        return Err(
-            "installed smoke working directories must be outside the checkout"
-                .into(),
-        );
+        return Err("installed smoke working directories must be outside the checkout".into());
     }
 
-    let needs_installation =
-        selected.iter().any(|name| !name.starts_with("cargo-"));
+    let needs_installation = selected.iter().any(|name| !name.starts_with("cargo-"));
     let installation = if needs_installation {
         Some(installation(run)?)
     } else {
@@ -235,9 +227,7 @@ fn cargo_case(name: &str, case: &mut CaseDirectory) -> TestResult {
     version(case, &cargo, "cargo-anneal")?;
     match name {
         "cargo-help" => {
-            for arguments in
-                [&["--help"][..], &["anneal", "--help"], &["setup", "--help"]]
-            {
+            for arguments in [&["--help"][..], &["anneal", "--help"], &["setup", "--help"]] {
                 let out = case.run(&Invocation::new(&cargo, arguments))?;
                 out.expect_code(0)?;
                 require_text(&out.stdout, "setup", &out)?;
@@ -253,8 +243,7 @@ fn cargo_case(name: &str, case: &mut CaseDirectory) -> TestResult {
             Ok(())
         }
         "cargo-arguments" => {
-            let out = case
-                .run(&Invocation::new(&cargo, &["unknown-scaffold-command"]))?;
+            let out = case.run(&Invocation::new(&cargo, &["unknown-scaffold-command"]))?;
             out.expect_code(2)?;
             require_text(&out.stderr, "unknown-scaffold-command", &out)
         }
@@ -268,12 +257,8 @@ fn cargo_case(name: &str, case: &mut CaseDirectory) -> TestResult {
 fn cargo_setup_failure(case: &mut CaseDirectory, cargo: &Path) -> TestResult {
     case.write("invalid.tar.zst", b"invalid local toolchain archive")?;
     let cache = case.path().join("cache");
-    fs::create_dir(&cache)
-        .map_err(|error| format!("create fresh setup cache: {error}"))?;
-    let mut command = Invocation::new(
-        cargo,
-        &["setup", "--local-archive", "invalid.tar.zst"],
-    );
+    fs::create_dir(&cache).map_err(|error| format!("create fresh setup cache: {error}"))?;
+    let mut command = Invocation::new(cargo, &["setup", "--local-archive", "invalid.tar.zst"]);
     // Exocrate's user-global location honors XDG_CACHE_HOME on Linux. A
     // fresh child cache prevents an existing installation from hiding failure.
     command
@@ -386,16 +371,10 @@ fn audit_case(name: &str, case: &mut CaseDirectory, root: &Path) -> TestResult {
     match name {
         "audit-accepted" => {
             out.expect_code(0)?;
-            let report: Value =
-                serde_json::from_slice(&out.stdout).map_err(|error| {
-                    format!(
-                        "read accepted audit report: {error}; {}",
-                        out.describe()
-                    )
-                })?;
-            if report["replay"] != true
-                || report["kernelDeclarations"].as_u64().unwrap_or(0) < 30
-            {
+            let report: Value = serde_json::from_slice(&out.stdout).map_err(|error| {
+                format!("read accepted audit report: {error}; {}", out.describe())
+            })?;
+            if report["replay"] != true || report["kernelDeclarations"].as_u64().unwrap_or(0) < 30 {
                 return Err(format!(
                     "positive fixture did not reach kernel replay: {report}"
                 ));
@@ -404,41 +383,25 @@ fn audit_case(name: &str, case: &mut CaseDirectory, root: &Path) -> TestResult {
         }
         "audit-rejected" => {
             out.expect_code(1)?;
-            require_text(
-                &out.stderr,
-                "Trusted check failed (preflight)",
-                &out,
-            )?;
+            require_text(&out.stderr, "Trusted check failed (preflight)", &out)?;
             require_text(&out.stderr, "Target execution began: false", &out)
         }
         "audit-missing-lean" => {
             out.expect_code(2)?;
-            require_text(
-                &out.stderr,
-                "Trusted check failed (toolchain)",
-                &out,
-            )?;
+            require_text(&out.stderr, "Trusted check failed (toolchain)", &out)?;
             require_text(&out.stderr, "absent-lean", &out)
         }
         _ => Err(format!("unknown audit case {name}")),
     }
 }
 
-fn version(
-    case: &mut CaseDirectory,
-    tool: &Path,
-    expected: &str,
-) -> TestResult {
+fn version(case: &mut CaseDirectory, tool: &Path, expected: &str) -> TestResult {
     let out = case.run(&Invocation::new(tool, &["--version"]))?;
     out.expect_code(0)?;
     require_text(&out.stdout, expected, &out)
 }
 
-fn require_text(
-    bytes: &[u8],
-    expected: &str,
-    outcome: &ProcessOutcome,
-) -> TestResult {
+fn require_text(bytes: &[u8], expected: &str, outcome: &ProcessOutcome) -> TestResult {
     if String::from_utf8_lossy(bytes).contains(expected) {
         Ok(())
     } else {
@@ -450,14 +413,13 @@ fn require_text(
 }
 
 fn text_path(path: &Path) -> TestResult<String> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        format!("test artifact path is not UTF-8: {}", path.display())
-    })
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("test artifact path is not UTF-8: {}", path.display()))
 }
 
 fn required_path(name: &str) -> TestResult<PathBuf> {
-    let value = env::var_os(name)
-        .ok_or_else(|| format!("selected case requires {name}"))?;
+    let value = env::var_os(name).ok_or_else(|| format!("selected case requires {name}"))?;
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(format!(
@@ -479,7 +441,5 @@ fn setting(name: &str, default: usize, maximum: usize) -> TestResult<usize> {
         .to_str()
         .and_then(|text| text.parse::<usize>().ok())
         .filter(|number| (1..=maximum).contains(number));
-    parsed.ok_or_else(|| {
-        format!("{name} must be an integer in 1..={maximum}, got {value:?}")
-    })
+    parsed.ok_or_else(|| format!("{name} must be an integer in 1..={maximum}, got {value:?}"))
 }

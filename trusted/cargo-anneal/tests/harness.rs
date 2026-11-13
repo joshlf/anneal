@@ -108,8 +108,7 @@ fn workers_bound_concurrency_and_keep_case_directories_distinct() {
     assert!((1..=2).contains(&peak.load(Ordering::SeqCst)));
     for name in names {
         assert_eq!(
-            fs::read(run.path().join("cases").join(name).join("generated"))
-                .unwrap(),
+            fs::read(run.path().join("cases").join(name).join("generated")).unwrap(),
             name.as_bytes()
         );
     }
@@ -189,15 +188,13 @@ fn runner_preserves_launch_failures_and_raw_child_output() {
             .unwrap()
             .ends_with(b"\xff\n")
     );
-    let launch: serde_json::Value = serde_json::from_slice(
-        &fs::read(evidence.join("commands/0001/outcome.json")).unwrap(),
-    )
-    .unwrap();
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("commands/0001/outcome.json")).unwrap())
+            .unwrap();
     assert_eq!(launch["kind"], "launch_failed");
-    let invocation: serde_json::Value = serde_json::from_slice(
-        &fs::read(evidence.join("commands/0001/invocation.json")).unwrap(),
-    )
-    .unwrap();
+    let invocation: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("commands/0001/invocation.json")).unwrap())
+            .unwrap();
     assert_eq!(invocation["executable"], missing.to_str().unwrap());
     assert!(evidence.join("commands/0000/reproduce.py").is_file());
     assert!(
@@ -221,10 +218,7 @@ fn requested_environment_and_working_directory_reach_the_child() {
     invocation.environment.insert("KEPT".into(), "yes".into());
     let out = case.run(&invocation).unwrap();
     out.expect_code(0).unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout)
-            .contains(case.path().to_str().unwrap())
-    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(case.path().to_str().unwrap()));
     let replay = case.path().join("commands/0000/reproduce.py");
     // The runner requires absolute tool paths and clears PATH. Ask the Python
     // on the test process's PATH for its executable before entering the runner.
@@ -242,9 +236,7 @@ fn requested_environment_and_working_directory_reach_the_child() {
         .run(&Invocation::new(python, &[replay.to_str().unwrap()]))
         .unwrap();
     out.expect_code(0).unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("runner-test-revision")
-    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("runner-test-revision"));
     assert!(
         case.run(&Invocation::new("relative-tool", &[]))
             .unwrap_err()
@@ -254,8 +246,7 @@ fn requested_environment_and_working_directory_reach_the_child() {
 
 #[test]
 fn timeout_fails_visibly_and_retains_available_output() {
-    let run =
-        RunDirectory::new("timeout-test", Duration::from_millis(150)).unwrap();
+    let run = RunDirectory::new("timeout-test", Duration::from_millis(150)).unwrap();
     let mut case = run.case("timeout").unwrap();
     let started = Instant::now();
     let out = case.run(&helper("slow")).unwrap();
@@ -267,8 +258,7 @@ fn timeout_fails_visibly_and_retains_available_output() {
     assert_eq!(out.stdout, fs::read(logs.join("stdout")).unwrap());
     assert_eq!(out.stderr, fs::read(logs.join("stderr")).unwrap());
     let outcome: serde_json::Value =
-        serde_json::from_slice(&fs::read(logs.join("outcome.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&fs::read(logs.join("outcome.json")).unwrap()).unwrap();
     assert_eq!(outcome["kind"], "timed_out");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
