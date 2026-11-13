@@ -23333,6 +23333,91 @@ example :
          (m', .error (.unsupported "pointee of TyId 80 is not encoded"))) :=
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
 
+open WitnessLM4_2 in
+example :
+    let b := copyStage1RawPtrCastLockstepBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ s₅_stage1 : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      stepMirFn b s₄ = .step s₅_stage1 ∧
+      get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+      Miri.Interpreter.Step.step hooks () m₄ =
+        (m₅, .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl decl_s decl_d : MirAst.LocalDecl} {srcMut dstMut : Mutability}
+    {pointeeTy countTy : Ty} {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    {srcPtr dstPtr : ProvenancePtr} {countSc srcSc dstSc : MirAst.ScalarInt}
+    {e_s e_d : AllocMapEntry} {srcKind dstKind : Miri.MIR.IntegerKind}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hprim : IsPrimScalarTy pointeeTy)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (hsrc_val : get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)))
+    (hdst_val : get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)))
+    (hoff0_s : srcPtr.offsetBytes = 0)
+    (hoff0_d : dstPtr.offsetBytes = 0)
+    (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc)
+    (hcnt_pos : 0 < countSc.bits)
+    (he_s : e_s ∈ allocMap) (het_s : e_s.tag = srcPtr.tag)
+    (he_d : e_d ∈ allocMap) (het_d : e_d.tag = dstPtr.tag)
+    (hperm_s : e_s.perm ≠ .disabled)
+    (hperm_d : e_d.perm = .active ∨ e_d.perm = .reserved)
+    (hne_loc : e_s.localIdx ≠ e_d.localIdx)
+    (hunion_s : unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none)
+    (hunion_d : unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hslot_s : get? s.frame.locals e_s.localIdx = some (.init (.scalar srcSc)))
+    (hslot_d : get? s.frame.locals e_d.localIdx = some (.init (.scalar dstSc)))
+    (hdecl_s : get? body.localDecls e_s.localIdx = some decl_s)
+    (hsrcInt : IsIntegralTy decl_s.ty srcKind)
+    (hdecl_d : get? body.localDecls e_d.localIdx = some decl_d)
+    (hdstInt : IsIntegralTy decl_d.ty dstKind)
+    (hw_eq : integerKindByteWidth dstKind = integerKindByteWidth srcKind)
+    (hfull : countSc.bits * elemBytes = integerKindByteWidth srcKind)
+    (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
+    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
+    hstate hphase hbb hstmt hprim hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos
+    he_s het_s he_d het_d hperm_s hperm_d hne_loc hunion_s hunion_d
+    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt
+
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
   sliceScalarBytes
@@ -23402,6 +23487,9 @@ open LeanMiriSpec.Correspondence in
   decodeValueFromBytes_encodeLittleEndianBytes_int
   evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
   stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+  stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
+  stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2
+  step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
   stepMirFnLM4_2
   stepMirFnLM4_2_eq_of_not_other
   evalTerminator_stage1_bitcount_call
@@ -23492,6 +23580,8 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
   WitnessLM4_2.copyStage1RawPtrBoundaryBody
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
+  WitnessLM4_2.copyStage1RawPtrCastLockstepBody
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary
 
 end StatementPins
 

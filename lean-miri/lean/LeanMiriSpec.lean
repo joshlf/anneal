@@ -383,29 +383,36 @@ import LeanMiriSpec.Audit
   `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
   distinct-local multi-element `copyViaBytes` evaluation
   (`evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq`,
-  `stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq`), Stage-1
+  `stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq`,
+  `stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq`,
+  `stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2`,
+  `step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`), Stage-1
   uninitialized-source and Tree Borrows divergences
   (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
   `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1
   provenance preservation across `evalCopySingleDirect` and byte-codec `copyViaBytes`
   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
   `encodeUntypedValueToBytes_ptr_decode_roundtrip`) plus the `TyId 80` boundary
-  (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`), and reference-model
-  multi-byte range simulations (`LM-4.2`).
+  (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`: `encodeRawPtrTyId`
+  collapses pointer-to-pointer types to `TyId 80` and `StackScalarAllocShape` is
+  scalar-only), and reference-model multi-byte range simulations (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.SimLM4_2`: unified `LM-4.2` simulation theorems,
   over Stage-1 `stepMirFn` for `Assume`, `CopyNonOverlapping` (single-element /
   aligned zero-count fragment), `exact_div`, `arith_offset`, integer
   bit-manipulation / saturating intrinsics, and the `rotate_left` / `rotate_right`
   boundary, and over the pre-Stage-1 reference model for multi-element / sub-range
-  `CopyNonOverlapping`, `write_bytes`, and the offset aliases.
+  `CopyNonOverlapping`, `write_bytes`, and the non-canonical offset aliases
+  (`core::intrinsics::wrapping_offset` and `std::intrinsics::*`, which
+  `rustc-capture` never emits and Stage-1 routes to `MirStepNode.extCall`).
 * `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep (including
   full-byte multi-element `copyViaBytes`), Stage-1 boundary (`extCall`,
-  `Stage1ExtraIntrinsic`, and `TyId 80` pointer-valued `copy_nonoverlapping`), and
-  Stage-1 divergence witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count
-  misaligned and out-of-bounds `copy_nonoverlapping`, rejects same-tag disjoint
-  copies, stores ill-sized values on cross-type copies, clobbers the whole
-  destination on partial distinct-local copies in 5-step lockstep, and rejects
-  provenance-free `.scalar` pointers in `arith_offset`).
+  `Stage1ExtraIntrinsic`, and 5-step lockstep `TyId 80` pointer-valued
+  `copy_nonoverlapping` on initialized pointer operands), and Stage-1 divergence
+  witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned and
+  out-of-bounds `copy_nonoverlapping`, rejects same-tag disjoint copies, stores
+  ill-sized values on cross-type copies, clobbers the whole destination on partial
+  distinct-local copies in 5-step lockstep, and rejects provenance-free `.scalar`
+  pointers in `arith_offset`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
