@@ -359,33 +359,46 @@ import LeanMiriSpec.Audit
   for signed and unsigned `exact_div` (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.CallLM4_2`: `TerminatorKind.Call` intrinsic
   plumbing, Stage-1 `evalTerminator` reductions (`evalTerminator_stage1_bitcount_call`,
-  `evalTerminator_stage1_saturating_call`, `evalTerminator_stage1_exactDiv_call`), the
-  Stage-1 external-call boundary for intrinsics Stage-1 does not evaluate inline
+  `evalTerminator_stage1_saturating_call`, `evalTerminator_stage1_exactDiv_call`,
+  `evalTerminator_stage1_wrappingAdd_call`), the Stage-1 external-call boundary for
+  intrinsics Stage-1 does not evaluate inline
   (`evalTerminator_stage1_unclassified_call_extCall`,
-  `stepMirFn_stage1_unmodeled_intrinsic_extCall`), the **pre-Stage-1 reference
-  model** `stepMirFnLM4_2` (not Stage-1 `Trusted`), and `StateRelLM3_1`
-  return-place write lemmas (`LM-4.2`).
+  `stepMirFn_stage1_unmodeled_intrinsic_extCall`,
+  `stepMirFn_stage1_std_offset_alias_extCall`), the `Stage1ExtraIntrinsic`
+  classification and `step_call_nonAnnealIntrinsic_miri_unsupported` boundary, the
+  **pre-Stage-1 reference model** `stepMirFnLM4_2` (not Stage-1 `Trusted`), and
+  `StateRelLM3_1` return-place write lemmas (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.OffsetLM4_2`: real-step `StateRelLM3_1`
-  simulation for `arith_offset` over Stage-1 `stepMirFn`
-  (`call_intrinsic_arithOffset_stage1_simulation`) and, over the pre-Stage-1
-  reference model only, `call_intrinsic_offset_simulation` (`LM-4.2`).
+  simulation and provenance-free `.scalar` pointer divergence for `arith_offset`
+  over Stage-1 `stepMirFn` (`call_intrinsic_arithOffset_stage1_simulation`,
+  `call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`) and, over the
+  pre-Stage-1 reference model only, `call_intrinsic_offset_simulation` (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.WriteBytesLM4_2`: `write_bytes` simulation and
   Tree Borrows divergence over the pre-Stage-1 reference model only (Stage-1 turns
   `write_bytes` into an external call) (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.CopyLM4_2`: `NonDivergingIntrinsic.CopyNonOverlapping`
-  simulation and uninitialized-source / Tree Borrows divergences over the
-  pre-Stage-1 reference model, plus the Anneal-side Stage-1 provenance lemma
-  `stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance` (`LM-4.2`).
+  Stage-1 bridge (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`), Stage-1
+  lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
+  `step_intrinsic_copyNonOverlapping_stage1_simulation`,
+  `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
+  uninitialized-source and Tree Borrows divergences
+  (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
+  `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Anneal-side
+  Stage-1 provenance preservation
+  (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`), and reference-model
+  multi-byte range simulations (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.SimLM4_2`: unified `LM-4.2` simulation theorems,
-  over Stage-1 `stepMirFn` for `Assume`, `exact_div`, `arith_offset`, integer
+  over Stage-1 `stepMirFn` for `Assume`, `CopyNonOverlapping` (single-element /
+  aligned zero-count fragment), `exact_div`, `arith_offset`, integer
   bit-manipulation / saturating intrinsics, and the `rotate_left` / `rotate_right`
-  boundary, and over the pre-Stage-1 reference model for `CopyNonOverlapping`,
-  `write_bytes`, and the offset aliases.
+  boundary, and over the pre-Stage-1 reference model for multi-element / sub-range
+  `CopyNonOverlapping`, `write_bytes`, and the offset aliases.
 * `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep, Stage-1
-  boundary (`extCall`), and Stage-1 divergence witnesses for `LM-4.2` (Stage-1
-  `Trusted` accepts zero-count misaligned and out-of-bounds `copy_nonoverlapping`,
-  rejects same-tag disjoint copies, and stores ill-sized values on cross-type
-  copies).
+  boundary (`extCall` and `Stage1ExtraIntrinsic`), and Stage-1 divergence witnesses
+  for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned and out-of-bounds
+  `copy_nonoverlapping`, rejects same-tag disjoint copies, stores ill-sized values
+  on cross-type copies, and rejects provenance-free `.scalar` pointers in
+  `arith_offset`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

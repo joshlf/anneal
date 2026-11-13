@@ -1366,4 +1366,166 @@ theorem call_intrinsic_arithOffset_stage1_simulation
               option_frameLocation_beq_false hprog, Bool.and_false, Except.map]
             exact .step _ _ hstate₄
 
+/-- **`call_intrinsic_arithOffset_stage1_scalar_ptr_divergence` (`LM-4.2`,
+Stage-1 vs. `lean-miri` divergence)**: when `ptrIdx` holds a provenance-free
+8-byte `.scalar addr` (`LocalRelLM3_1.base`, e.g., `0x1000 as *const T`),
+`countOp` evaluates to an `isize` scalar `countSc`, and `dstIdx` is live:
+* Stage-1 `stepMirFn` (`evalTerminator_stage1_arithOffset_call`) requires a
+  provenance-carrying `.ptr ptrVal 8` argument and fails with
+  `MirStepNode.fail .ub`;
+* `lean-miri`'s `Miri.Interpreter.Step.step` (`annealArithOffsetEval`) offsets
+  `Pointer.withoutProvenance addr` modulo `2 ^ 64` and steps with `.ok true` to
+  a `StateRelLM3_1`-related post-state storing
+  `.scalar ⟨(addr.bits + countSc.bits * elemBytes) % scalarModulus 8, 8⟩` in
+  `dstIdx`. -/
+theorem call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {pointeeKind : RigidTy} {c : ConstOperand} {ptrIdx : Local} {countOp : MirAst.Operand}
+    {dstIdx : Local} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [.copy ⟨ptrIdx, []⟩, countOp] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef "core::intrinsics::arith_offset" [pointeeKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts "core::intrinsics::arith_offset"
+      [pointeeKind] s.memory.traitImpls = none)
+    (hcallee_find : findCallee? s.memory.callees "core::intrinsics::arith_offset" = none)
+    (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
+    {ptrDecl : LocalDecl} {ptrMut : Mutability}
+    (hptrDecl : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptrTy : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hptrImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf ptrIdx)
+    {addr : MirAst.ScalarInt}
+    (hptr_scalar : get? s.frame.locals ptrIdx = some (.init (.scalar addr)))
+    {countTy : Ty} (hcountInt : IsIntegralTy countTy .isize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    {countSc : MirAst.ScalarInt}
+    (hcount_pre : ScalarOperandPreVal s.frame.locals countOp countSc)
+    {dstDecl : LocalDecl} {dstMut : Mutability}
+    (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {elemBytes : Nat}
+    (helem_anneal : rigidTyKindByteSize pointeeKind = some elemBytes)
+    (helem_miri : (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes)
+    (helem_lt : elemBytes < 2 ^ 63) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      StateRelLM3_1 body
+        { frame :=
+            { s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := s.frame.locals.set dstIdx
+                (.init (.scalar ⟨(addr.bits + countSc.bits * elemBytes) % scalarModulus 8, 8⟩)) }
+          memory := s.memory }
+        m' allocMap := by
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
+  have ha₁ : evalOperand s.frame.locals (.copy ⟨ptrIdx, []⟩) s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals = .ok (.scalar addr) s.frame.locals := by
+    unfold evalOperand; dsimp only; rw [hptr_scalar]; rfl
+  have ha₂ : evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals = .ok (.scalar countSc) s.frame.locals := by
+    rcases hcount_pre with ⟨cc, rfl, hv⟩ | ⟨idx, rfl, hsl⟩
+    · unfold evalOperand; dsimp only; rw [hv]; rfl
+    · unfold evalOperand; dsimp only; rw [hsl]; rfl
+  have hevals : evalOperands s.frame.locals [.copy ⟨ptrIdx, []⟩, countOp] s.memory.borrows
+      s.memory.globals body.layouts s.memory.callerLocals =
+      .ok [.scalar addr, .scalar countSc] s.frame.locals := by
+    simp only [evalOperands, ha₁, ha₂]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+  have hstage1_ub : stepMirFn body s = MirStepNode.fail .ub := by
+    rw [stepMirFn_eq_of_not_other body s hcal hphase]
+    simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+    rw [evalTerminator_stage1_arithOffset_call hterm hc hcallee helem_anneal, hevals]
+  refine ⟨hstage1_ub, ?_⟩
+  rcases annealEvalOperand_rawPtr_copy_lm3_1 hstate hframes hptrDecl hptrTy (hptrImm tf hframes) with
+    ⟨_, _, ha₁', _⟩ | ⟨_, ha₁', _⟩ |
+    ⟨addr', _, _, _, haddr8, _, ha₁', _, _, _⟩ |
+    ⟨_, _, _, hslot_ptr, _⟩
+  · rw [ha₁] at ha₁'; cases ha₁'
+  · rw [ha₁] at ha₁'; cases ha₁'
+  · rw [ha₁] at ha₁'; injection ha₁' with h _; injection h with h; subst h
+    rcases annealEvalOperand_scalar_lm3_1 hstate hframes (hcountOp tf hframes) hcountInt.prim with
+      ⟨_, _, ha₂', _⟩ | ⟨_, ha₂', _⟩ |
+      ⟨countSc', mcount, _, ha₂', _, _, hrel₂, _⟩
+    · rw [ha₂] at ha₂'; cases ha₂'
+    · rw [ha₂] at ha₂'; cases ha₂'
+    · rw [ha₂] at ha₂'; injection ha₂' with h _; injection h with h; subst h
+      cases hrel₂ with
+      | scalar _ _ hrel_c hsz_c _ _ =>
+        have hcount8 : countSc.sizeBytes = 8 :=
+          translateSizeBytes_inj hrel_c.validBytes (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+            (hsz_c.symm.trans (hcountInt.size_eq body.layouts))
+        obtain ⟨dslot, _, hlt_af, _, hdslot, _, _, _⟩ := hfr.lookup_local hdst
+        have hne_dead : dslot ≠ .dead := fun h => hdst_live (hdslot.trans (congrArg some h))
+        let retVal : Value :=
+          .scalar ⟨(addr.bits + countSc.bits * elemBytes) % scalarModulus 8, 8⟩
+        have hwrite_a : writePlaceValue s.frame.locals s.memory.borrows ⟨dstIdx, []⟩ retVal =
+            .ok (s.frame.locals.set dstIdx (.init retVal)) := by
+          have hset : set? s.frame.locals dstIdx (.init retVal) =
+              some (s.frame.locals.set dstIdx (.init retVal)) := set?_eq_some_set hlt_af _
+          unfold writePlaceValue
+          dsimp only
+          rw [hdslot, hset]
+          cases dslot with
+          | dead => exact absurd rfl hne_dead
+          | uninit | init _ => rfl
+        have hop_bytes :
+            operandPointeeBytes? body.localDecls body.layouts (.copy ⟨ptrIdx, []⟩) =
+              some elemBytes := by
+          simp [operandPointeeBytes?, operandTy, placeTy, hptrDecl, resolveProjectedTy,
+            pointeeTyOf, hptrTy, helem_anneal]
+        have hpath : AnnealIntrinsic.ofDefPath? "core::intrinsics::arith_offset" =
+            some .arithOffset := rfl
+        have hlm42_step : stepMirFnLM4_2 body s =
+            .step
+              { frame :=
+                  { s.frame with
+                    blockIdx := targetBb
+                    stmtIdx := 0
+                    locals := s.frame.locals.set dstIdx (.init retVal) }
+                memory := s.memory } := by
+          rw [stepMirFnLM4_2_eq_of_not_other body s hcal hphase]
+          simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+          rw [evalTerminator_inline_intrinsic_call_ofDefPath? hterm hc hcallee_find hpath (by nofun)]
+          have hinline :
+              evalInlineIntrinsicCall? s "core::intrinsics::arith_offset"
+                [.copy ⟨ptrIdx, []⟩, countOp] [.scalar addr, .scalar countSc]
+                s.frame.locals ⟨dstIdx, []⟩ targetBb body.localDecls body.layouts =
+              some (evalArithOffsetCall s (.copy ⟨ptrIdx, []⟩) (.scalar addr) (.scalar countSc)
+                s.frame.locals ⟨dstIdx, []⟩ targetBb body.localDecls body.layouts) := rfl
+          simp only [hevals, hinline]
+          have hbeq8 : Nat.beq 8 8 = true := rfl
+          unfold evalArithOffsetCall
+          simp only [hop_bytes, hcount8, haddr8, hbeq8, intrinsicWriteReturn,
+            intrinsicReturnTo]
+          change (match writePlaceValue s.frame.locals s.memory.borrows ⟨dstIdx, []⟩ retVal with
+            | .ok updatedLocals =>
+              MirStepNode.step
+                { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+                  memory := s.memory }
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported) = _
+          rw [hwrite_a]
+        have hsim := call_intrinsic_offset_simulation hstate hphase hbb hstmt_none hstmt_len
+          (Or.inl rfl) hterm hc hcallee_find hpath hprog hptrDecl hptrTy hptrImm
+          hcountInt hcountOp hdst hdstTy hdstImm helem_anneal helem_miri helem_lt
+          (fun p _ hp => by rw [hptr_scalar] at hp; cases hp)
+        rw [hlm42_step] at hsim
+        revert hsim
+        generalize Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mr
+        intro h
+        cases h with
+        | step _ m' hrel' => exact ⟨m', rfl, hrel'⟩
+  · rw [hptr_scalar] at hslot_ptr; cases hslot_ptr
+
 end LeanMiriSpec.Correspondence

@@ -25,9 +25,18 @@ intrinsic statements and the inline intrinsic calls of `LM-4.2`.
 **Over Stage-1 `Trusted` `stepMirFn`:**
 
 * `step_intrinsic_assume_simulation`: `StatementKind.intrinsic (.assume op)`.
+* `step_intrinsic_copyNonOverlapping_stage1_simulation` (with explicit `allocMap'`
+  counterpart `step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
+  same-`allocMap` specialization
+  `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`, Stage-1
+  bridge `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`, and Stage-1 divergence
+  theorems `step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence` and
+  `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`; proved in
+  `CopyLM4_2`).
 * `call_intrinsic_exact_div_simulation`: `core::intrinsics::exact_div`.
-* `call_intrinsic_arithOffset_stage1_simulation`: `core::intrinsics::arith_offset`
-  (proved in `OffsetLM4_2`).
+* `call_intrinsic_arithOffset_stage1_simulation` and
+  `call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`:
+  `core::intrinsics::arith_offset` (proved in `OffsetLM4_2`).
 * `call_intrinsic_bitcount_simulation` (`ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
   `cttz_nonzero`, `bswap`, `bitreverse`) and `call_intrinsic_saturating_simulation`
   (`saturating_add`, `saturating_sub`), bundled in
@@ -35,18 +44,20 @@ intrinsic statements and the inline intrinsic calls of `LM-4.2`.
 * `call_intrinsic_rotate_stage1_boundary`: `rotate_left` / `rotate_right`, which
   Stage-1 turns into an external call while `lean-miri` fails closed (both
   machines leave the intrinsic to their environment / fallback boundary).
+* `step_call_nonAnnealIntrinsic_miri_unsupported` and
+  `evalTerminator_stage1_wrappingAdd_call` (`CallLM4_2`): Stage-1 inline
+  intrinsics outside `AnnealIntrinsic` (`Stage1ExtraIntrinsic`), where Stage-1
+  evaluates the intrinsic inline while `annealCallHooks` fails closed.
 
 **Over the pre-Stage-1 reference model `stepMirFnLM4_2` only** (see
-`CallLM4_2.lean`; these do **not** describe Stage-1):
+`CallLM4_2.lean`; these do **not** describe Stage-1 outside the fragment bridged
+by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
 
 * `step_intrinsic_copyNonOverlapping_simulation` (with explicit `allocMap'`
   counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`; proved in
   `CopyLM4_2`). Stage-1 `evalCopyNonOverlapping` diverges from the reference
-  model, see `WitLM4_2.lean` §6. The characterized divergences
-  `step_intrinsic_copyNonOverlapping_uninit_src_divergence` and
-  `step_intrinsic_copyNonOverlapping_perm_divergence` persist on Stage-1
-  (`wit_lm4_2_copy_nonoverlapping_uninit_src_divergence`,
-  `wit_lm4_2_copy_nonoverlapping_perm_divergence`).
+  model on zero-count misaligned, multi-element out-of-bounds, same-tag disjoint
+  sub-range, and cross-type copies; see `WitLM4_2.lean` §6.
 * `call_intrinsic_write_bytes_simulation` (with
   `call_intrinsic_write_bytes_simulation_explicit` and
   `call_intrinsic_write_bytes_perm_divergence`; proved in `WriteBytesLM4_2`):

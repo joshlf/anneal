@@ -2043,6 +2043,60 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
   obtain ⟨hcls, hexact⟩ := AnnealIntrinsic.stage1Unmodeled_classify hk
   exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
 
+/-- The 11 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
+(`exact_div`, `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
+`cttz_nonzero`, `bswap`, `bitreverse`, `saturating_add`, `saturating_sub`). -/
+def AnnealIntrinsic.stage1Modeled (k : AnnealIntrinsic) : Bool :=
+  !k.stage1Unmodeled
+
+/-- Stage-1 `evalTerminator` recognizes `k.defPath` as an inline intrinsic
+(`classifyRustIntrinsic?` or `exact_div`) if and only if `k.stage1Modeled = true`. -/
+theorem AnnealIntrinsic.stage1Modeled_classify (k : AnnealIntrinsic) :
+    ((classifyRustIntrinsic? k.defPath).isSome ||
+      stringEq k.defPath "core::intrinsics::exact_div") = k.stage1Modeled := by
+  cases k <;> rfl
+
+/-- **`stepMirFn_stage1_std_offset_alias_extCall` (`LM-4.2`, Stage-1 boundary)**:
+one real Stage-1 `stepMirFn` step at an unlinked call to either non-canonical
+`std::intrinsics::{arith_offset, wrapping_offset}` alias (which
+`AnnealIntrinsic.ofDefPath?` maps to `.arithOffset` / `.wrappingOffset` only to
+support the pre-Stage-1 reference theorems of `OffsetLM4_2` §3) is an external
+call (`MirStepNode.extCall`) after argument evaluation. -/
+theorem stepMirFn_stage1_std_offset_alias_extCall
+    {body : CapturedMir} {s : MachineState}
+    (hcal : s.memory.activeCallee = none)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {defPath : DefPath} {argKind : RigidTy}
+    (halias : defPath = "std::intrinsics::arith_offset" ∨
+      defPath = "std::intrinsics::wrapping_offset")
+    (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef defPath [argKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
+      s.memory.traitImpls = none) :
+    stepMirFn body s =
+      match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        MirStepNode.extCall
+          { defPath := defPath, typeArgs := [argKind], args := vs, memory := s.memory }
+          (resumeExternalCall s locals' destination targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported := by
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rcases halias with rfl | rfl
+  · obtain ⟨⟨hcls, hexact⟩, _⟩ := stage1_std_offset_aliases_unclassified
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+  · obtain ⟨_, ⟨hcls, hexact⟩⟩ := stage1_std_offset_aliases_unclassified
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+
 /-! ## 3. `rotate_left` / `rotate_right`
 
 `lean-miri`'s pinned dispatcher `Intrinsics.eval` has no arm for
@@ -2317,5 +2371,274 @@ theorem ImmediateRel.integral_sizeBytes {ty : Ty} {kind : Miri.MIR.IntegerKind}
     have hvalid : ValidScalarBytes (integerKindByteWidth kind) := by
       unfold ValidScalarBytes; cases kind <;> simp [integerKindByteWidth]
     exact translateSizeBytes_inj hrel.validBytes hvalid (hsz.symm.trans (hint.size_eq layouts))
+
+/-! ## 4. Stage-1 inline intrinsics outside `AnnealIntrinsic`
+
+Stage-1 `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes 15 additional
+`core::intrinsics::*` `DefPath`s (`Stage1ExtraIntrinsic`) that are not in
+`AnnealIntrinsic`:
+* `wrapping_add/sub/mul`, `unchecked_add/sub/mul/div/rem/shl/shr`, and
+  `three_way_compare`, which `rustc` lowers to `Rvalue.binaryOp` or for which
+  `lean-miri`'s `Intrinsics.eval` (`Intrinsics.lean:535-537`) returns `false` so
+  they enter their MIR fallback bodies;
+* `ub_checks`, `const_eval_select`, `size_of_val`, and `align_of_val`.
+
+Because `AnnealIntrinsic.ofDefPath?` returns `none` on each of these paths,
+`translateCalleeOperand` translates the callee constant as a generic zero-sized
+function item (`TyId = 51`), and `annealCallHooks.functionSignature` fails closed
+with `StepError.unsupported "call of a function other than an AnnealIntrinsic"`. -/
+
+/-- The 15 `core::intrinsics::*` items recognized by Stage-1
+`classifyRustIntrinsic?` (`Terminators.lean:898`) that lie outside
+`AnnealIntrinsic`. -/
+inductive Stage1ExtraIntrinsic where
+  | ubChecks
+  | constEvalSelect
+  | wrappingAdd
+  | wrappingSub
+  | wrappingMul
+  | uncheckedShl
+  | uncheckedShr
+  | uncheckedAdd
+  | uncheckedSub
+  | uncheckedMul
+  | uncheckedDiv
+  | uncheckedRem
+  | threeWayCompare
+  | sizeOfVal
+  | alignOfVal
+  deriving DecidableEq, Repr
+
+/-- Canonical `DefPath` of each `Stage1ExtraIntrinsic`. -/
+def Stage1ExtraIntrinsic.defPath : Stage1ExtraIntrinsic → DefPath
+  | .ubChecks => "core::intrinsics::ub_checks"
+  | .constEvalSelect => "core::intrinsics::const_eval_select"
+  | .wrappingAdd => "core::intrinsics::wrapping_add"
+  | .wrappingSub => "core::intrinsics::wrapping_sub"
+  | .wrappingMul => "core::intrinsics::wrapping_mul"
+  | .uncheckedShl => "core::intrinsics::unchecked_shl"
+  | .uncheckedShr => "core::intrinsics::unchecked_shr"
+  | .uncheckedAdd => "core::intrinsics::unchecked_add"
+  | .uncheckedSub => "core::intrinsics::unchecked_sub"
+  | .uncheckedMul => "core::intrinsics::unchecked_mul"
+  | .uncheckedDiv => "core::intrinsics::unchecked_div"
+  | .uncheckedRem => "core::intrinsics::unchecked_rem"
+  | .threeWayCompare => "core::intrinsics::three_way_compare"
+  | .sizeOfVal => "core::intrinsics::size_of_val"
+  | .alignOfVal => "core::intrinsics::align_of_val"
+
+/-- Stage-1 `RustIntrinsicKind` corresponding to each `Stage1ExtraIntrinsic`. -/
+def Stage1ExtraIntrinsic.toRustIntrinsicKind : Stage1ExtraIntrinsic → RustIntrinsicKind
+  | .ubChecks => .ubChecks
+  | .constEvalSelect => .constEvalSelect
+  | .wrappingAdd => .wrappingAdd
+  | .wrappingSub => .wrappingSub
+  | .wrappingMul => .wrappingMul
+  | .uncheckedShl => .uncheckedShl
+  | .uncheckedShr => .uncheckedShr
+  | .uncheckedAdd => .uncheckedAdd
+  | .uncheckedSub => .uncheckedSub
+  | .uncheckedMul => .uncheckedMul
+  | .uncheckedDiv => .uncheckedDiv
+  | .uncheckedRem => .uncheckedRem
+  | .threeWayCompare => .threeWayCompare
+  | .sizeOfVal => .sizeOfVal
+  | .alignOfVal => .alignOfVal
+
+/-- Every `Stage1ExtraIntrinsic` is recognized by Stage-1 `classifyRustIntrinsic?`
+and excluded by `AnnealIntrinsic.ofDefPath?`. -/
+theorem Stage1ExtraIntrinsic.classify_eq (k : Stage1ExtraIntrinsic) :
+    classifyRustIntrinsic? k.defPath = some k.toRustIntrinsicKind ∧
+      stringEq k.defPath "core::intrinsics::exact_div" = false ∧
+      AnnealIntrinsic.ofDefPath? k.defPath = none := by
+  cases k <;> exact ⟨rfl, rfl, rfl⟩
+
+/-- The zero-sized constant `Miri.MIR.ConstOperand` of `TyId = 51` produced by
+`translateCalleeOperand` on a function item outside `AnnealIntrinsic`. -/
+def nonAnnealFnItemConst : Miri.MIR.ConstOperand :=
+  { span := defaultSpanRef
+    userType := none
+    value := .Val .ZeroSized 51 }
+
+theorem translateTerminator_nonAnnealIntrinsic_call
+    {term : Terminator} {c : ConstOperand} {args : List MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {calleePath : DefPath} {argKind : RigidTy}
+    (hterm : term.kind = .call (.constant c) args ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [argKind])
+    (hval : c.val = .zeroSized)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = none) :
+    translateTerminator term =
+      { sourceInfo := defaultSourceInfo
+        kind := .Call
+          (.Constant nonAnnealFnItemConst)
+          (args.map fun a =>
+            ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
+          ⟨dstIdx, #[]⟩ (some targetBb) (translateUnwindAction unwind) .Normal
+          defaultSpanRef } := by
+  unfold translateTerminator
+  rw [hterm]
+  rcases c with ⟨⟨ckind, cidx⟩, cval⟩
+  dsimp only at hc hval
+  subst hc hval
+  simp only [translateTerminatorKind, translateCalleeOperand, hpath, translateOperand,
+    translateConstOperand, translateConstValue, encodeTyId, nonAnnealFnItemConst]
+  rfl
+
+theorem annealEvalOperand_nonAnnealFnItemConst (ld : List LocalDecl) (ly : LayoutTable) :
+    annealEvalOperand ld ly (.Constant nonAnnealFnItemConst) none =
+      (do
+        let st ← get
+        if st.stack.currentFrame?.isNone then
+          throw (.stack .emptyStack)
+        pure ⟨.immediate .uninit, layoutOfEncodedTyId 51 ly⟩) :=
+  rfl
+
+theorem annealEvalOperand_nonAnnealFnItemConst_ok (ld : List LocalDecl) (ly : LayoutTable)
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) :
+    annealEvalOperand ld ly (.Constant nonAnnealFnItemConst) none m =
+      .ok ⟨.immediate .uninit, layoutOfEncodedTyId 51 ly⟩ m := by
+  rw [annealEvalOperand_nonAnnealFnItemConst]
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+    stack_currentFrame?_singleton m.stack tf hframes, Option.isNone_some, Bool.false_eq_true,
+    ↓reduceIte, pure, EStateM.pure]
+
+theorem evalCallTerminator_nonAnnealIntrinsic
+    (ld : List LocalDecl) (ly : LayoutTable)
+    (o₁ o₂ : Miri.MIR.Operand) (hno₁ : ∀ p, o₁ ≠ .Move p) (hno₂ : ∀ p, o₂ ≠ .Move p)
+    (dest : Miri.MIR.Place) (target : Option Miri.MIR.BasicBlockId)
+    (unwind : Miri.MIR.UnwindAction) :
+    Miri.Interpreter.Call.evalCallTerminator (annealCallHooks ld ly) () annealCallBudget
+      { sourceInfo := defaultSourceInfo
+        kind := .Call (.Constant nonAnnealFnItemConst)
+          #[⟨defaultSpanRef, o₁⟩, ⟨defaultSpanRef, o₂⟩] dest target unwind .Normal
+          defaultSpanRef } =
+    (do
+      let _ ← (annealPlaceHooks ld ly).frameIndex
+      let _ ← (annealPlaceHooks ld ly).getFrame
+      let _ ← annealEvalPlace ld ly dest
+      let _ ← annealEvalOperand ld ly (.Constant nonAnnealFnItemConst) none
+      let _ ← annealEvalOperand ld ly o₁ none
+      let _ ← annealEvalOperand ld ly o₂ none
+      annealUnsupportedLeaf "call of a function other than an AnnealIntrinsic") := by
+  have hdec : annealDecodeFnItemTyId 51 = none := rfl
+  simp only [Miri.Interpreter.Call.evalCallTerminator, Miri.Interpreter.Call.evalCalleeAndArgs,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Array.size, List.length_cons,
+    List.length_nil, Nat.reduceAdd, Nat.reduceSub, Nat.reduceDiv, List.range'_succ,
+    List.range'_zero, List.forIn_cons, List.forIn_nil, List.getElem?_toArray,
+    List.getElem?_cons_zero, List.getElem?_cons_succ,
+    evalFnCallArgumentAt_nonMove _ _ o₁ hno₁, evalFnCallArgumentAt_nonMove _ _ o₂ hno₂,
+    annealCallHooks, annealEvalOperand_nonAnnealFnItemConst, bind_assoc, pure_bind,
+    layoutOfEncodedTyId_ty, hdec,
+    ite_bind_distrib, annealUnsupportedLeaf_bind, estate_throw_bind]
+
+/-- **`step_call_nonAnnealIntrinsic_miri_unsupported` (`LM-4.2`)**: from any
+`StateRelLM3_1`-related state at a two-argument call to a zero-sized function item
+constant whose `DefPath` is not in `AnnealIntrinsic` (`AnnealIntrinsic.ofDefPath? = none`)
+with live well-typed primitive scalar operands `op₁, op₂`,
+`lean-miri`'s `Miri.Interpreter.Step.step` under `annealStepHooks` fails closed at
+`annealCallHooks.functionSignature` with
+`StepError.unsupported "call of a function other than an AnnealIntrinsic is outside Anneal's intrinsic fragment"`. -/
+theorem step_call_nonAnnealIntrinsic_miri_unsupported
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    {calleePath : DefPath} {argKind : RigidTy}
+    {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [argKind])
+    (hval : c.val = .zeroSized)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = none)
+    {ty₁ ty₂ : Ty}
+    (hop₁ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty₁)
+    (hop₂ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ ty₂)
+    (hprim₁ : IsPrimScalarTy ty₁) (hprim₂ : IsPrimScalarTy ty₂)
+    {vs : List Value} {locals' : List LocalSlot}
+    (hops_ok : evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals = .ok vs locals')
+    {dstDecl : LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl) :
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.unsupported "call of a function other than an AnnealIntrinsic is outside Anneal's intrinsic fragment")) := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨_, _, _, hlt_mf, _, _, hdmls_eq, hdloc⟩ := hfr.lookup_local hdst
+  have hplace := annealEvalPlace_unprojected (body := body) hframes hlt_mf hdst
+    (by intro l hl; rw [hdmls_eq] at hl; exact hdloc.cachedLayout_eq l hl)
+  have hstate₁ := hstate.cache_layout hframes hdst hlt_mf
+  have hcallee := annealEvalOperand_nonAnnealFnItemConst_ok body.localDecls body.layouts
+    (m := { m with stack := ⟨#[cacheFrameLocalLayout tf dstIdx hlt_mf
+      (translateTy dstDecl.ty body.layouts)]⟩ }) rfl
+  have himm₁ : ∀ j, IsImmediateFrameLocal tf j →
+      IsImmediateFrameLocal (cacheFrameLocalLayout tf dstIdx hlt_mf
+        (translateTy dstDecl.ty body.layouts)) j :=
+    fun j hj => hj.cache_layout hlt_mf _
+  rcases annealEvalOperand_scalar_lm3_1 hstate₁ rfl ((hop₁ tf hframes).mono_immediate himm₁)
+      hprim₁ with
+    ⟨_, _, ha₁, _⟩ | ⟨_, ha₁, _, _, _⟩ | ⟨_, _, tf₂, ha₁, hm₁, hstate₂, _, hvals₂⟩
+  · unfold evalOperands at hops_ok; rw [ha₁] at hops_ok; cases hops_ok
+  · unfold evalOperands at hops_ok; rw [ha₁] at hops_ok; cases hops_ok
+  · have himm₂ : ∀ j, IsImmediateFrameLocal tf j → IsImmediateFrameLocal tf₂ j :=
+      fun j hj => IsImmediateFrameLocal.of_values_eq hvals₂ (himm₁ j hj)
+    rcases annealEvalOperand_scalar_lm3_1 hstate₂ rfl ((hop₂ tf hframes).mono_immediate himm₂)
+        hprim₂ with
+      ⟨_, _, ha₂, _⟩ | ⟨_, ha₂, _, _, _⟩ | ⟨_, _, tf₃, _, hm₂, _, _, _⟩
+    · unfold evalOperands at hops_ok; rw [ha₁] at hops_ok; dsimp only at hops_ok
+      unfold evalOperands at hops_ok; rw [ha₂] at hops_ok; cases hops_ok
+    · unfold evalOperands at hops_ok; rw [ha₁] at hops_ok; dsimp only at hops_ok
+      unfold evalOperands at hops_ok; rw [ha₂] at hops_ok; cases hops_ok
+    · refine ⟨{ m with stack := ⟨#[tf₃]⟩ }, ?_⟩
+      rw [miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
+        translateTerminator_nonAnnealIntrinsic_call hterm hc hval hpath]
+      simp only [List.map_cons, List.map_nil]
+      rw [controlFlow_evalTerminator_call _ _ _ rfl,
+        evalCallTerminator_nonAnnealIntrinsic _ _ _ _ ((hop₁ tf hframes).translate_ne_move)
+          ((hop₂ tf hframes).translate_ne_move),
+        EStateM.bind_eq_ok (annealPlaceHooks_frameIndex_eq hframes),
+        EStateM.bind_eq_ok (annealPlaceHooks_getFrame_eq hframes),
+        EStateM.bind_eq_ok hplace,
+        EStateM.bind_eq_ok hcallee,
+        EStateM.bind_eq_ok hm₁,
+        EStateM.bind_eq_ok hm₂]
+      unfold annealUnsupportedLeaf
+      rfl
+
+/-- Stage-1 `evalTerminator` on an unlinked call of `core::intrinsics::wrapping_add`
+evaluates `evalWrappingAdd lhs rhs` inline and writes the scalar result to `dstIdx`. -/
+theorem evalTerminator_stage1_wrappingAdd_call
+    {s : MachineState} {body : CapturedMir} {term : Terminator}
+    {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {argKind : RigidTy}
+    (hterm : term.kind = .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef "core::intrinsics::wrapping_add" [argKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts "core::intrinsics::wrapping_add"
+      [argKind] s.memory.traitImpls = none) :
+    evalTerminator s term (some body) =
+      match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        match vs with
+        | .scalar lhs :: .scalar rhs :: .nil =>
+          writeIntrinsicScalarResult s locals' ⟨dstIdx, []⟩ targetBb (evalWrappingAdd lhs rhs)
+        | _ => MirStepNode.fail .ub
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported := by
+  unfold evalTerminator
+  rw [hterm]
+  simp only [resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs, hc]
+  cases evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals with
+  | ok vs locals' =>
+    simp only [hcallee]
+    rfl
+  | ub => rfl
+  | unsupported => rfl
 
 end LeanMiriSpec.Correspondence
