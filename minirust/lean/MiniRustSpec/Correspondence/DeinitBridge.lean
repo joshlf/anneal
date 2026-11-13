@@ -1441,6 +1441,13 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.witnessSignWidth_bodyCorr
   let _ := @Anneal.Mir.AdtAndControl.witness_intrinsic_signedness_width_cfg_refines_trusted
   let _ := @Anneal.Mir.AdtAndControl.witness_signed_shift_overflow_ub_parity
+  -- `[adv ep2-B2]` Section 5h: depth-limit checkpoints, callee-shadowing non-vacuity,
+  -- concrete Trusted traces, and multi-frame unwinding / diverging linked-call witnesses.
+  let _ := @Anneal.Mir.AdtAndControl.trustedIter_run
+  let _ := @Anneal.Mir.AdtAndControl.terminateLCallStack_eq_some
+  let _ := @Anneal.Mir.AdtAndControl.lookupCallee_none_of_lowerIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.witness_multi_frame_unwind_and_diverging_calls
+  let _ := @Anneal.Mir.AdtAndControl.witness_maxCallDepth_checkpoint
   -- `[adv ep2-A1]` Stage 1 + Section 5g: projected & `PartialShell` call destinations,
   -- exact `.ub` fault parity (`IntrinsicResolvedInBody`), target-presence boundary,
   -- `Ordering` ADT encoding (`orderingVariant?`), call-form `write_bytes` / `copy_nonoverlapping`

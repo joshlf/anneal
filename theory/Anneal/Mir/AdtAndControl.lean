@@ -19335,11 +19335,35 @@ inductive LMultiCfgStep : Type where
   | next (st : LMultiFrameState) : LMultiCfgStep
   | done (out : LMultiCfgOutcome) : LMultiCfgStep
 
+/-- Propagate an abort raised at block `bb` up `stack` (`eval_frames`'s `Terminated` arm in
+`cfg.rs`): no caller cleanup block runs, but, exactly as in Episode 1, every caller frame's unwind
+action must still be well formed (`check_unwind_action` on each `pending.unwind`, `none`
+otherwise), and the reported block is the outermost call site (`[adv ep2-B2]`: `A0` stopped at
+the callee's block without checking any caller frame). -/
+def terminateLCallStack (bb : Nat) : List LCallerFrame → Option LMultiCfgStep
+  | [] => some (.done (.terminated bb))
+  | caller :: restStack =>
+    if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none
+    else terminateLCallStack caller.callBb restStack
+
+/-- `terminateLCallStack` only ever terminates. -/
+theorem terminateLCallStack_eq_some : ∀ {bb : Nat} {stack : List LCallerFrame}
+    {m : LMultiCfgStep}, terminateLCallStack bb stack = some m → ∃ bb', m = .done (.terminated bb')
+  | bb, [], m, h => by
+    simp only [terminateLCallStack, Option.some.injEq] at h
+    exact ⟨bb, h.symm⟩
+  | _, caller :: restStack, m, h => by
+    unfold terminateLCallStack at h
+    split at h
+    · nomatch h
+    · exact terminateLCallStack_eq_some h
+
 /-- Unwind out of a panicking frame across `stack` (`eval_frames`'s `Panicked` loop in `cfg.rs`,
 mirroring `Trusted.unwindFromCallStack`):
 - empty stack -> `.done (.panicked panicBb)`;
 - `returnUnwind = .unreachable` -> `none` (UB);
-- `returnUnwind = .terminate` -> `.done (.terminated caller.callBb)` (after `unwindActionOk`);
+- `returnUnwind = .terminate` -> abort, propagated through the remaining frames by
+  `terminateLCallStack` (after `unwindActionOk`);
 - `returnUnwind = .cleanup c` -> enters cleanup block `c` in `caller` (`unwinding = some caller.callBb`);
 - `returnUnwind = .continue_` -> pops `caller` (when `!caller.inCleanup && !caller.unwinding.isSome`)
   and continues unwinding up `restStack`. -/
@@ -19349,7 +19373,7 @@ def unwindLCallStack (panicBb : Nat) : List LCallerFrame → Option LMultiCfgSte
     if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none else
     match caller.returnUnwind with
     | .unreachable => none
-    | .terminate => some (.done (.terminated caller.callBb))
+    | .terminate => terminateLCallStack caller.callBb restStack
     | .continue_ =>
       if caller.unwinding.isSome then none
       else unwindLCallStack caller.callBb restStack
@@ -19366,8 +19390,9 @@ def unwindLCallStack (panicBb : Nat) : List LCallerFrame → Option LMultiCfgSte
   and `stack.length < table.maxCallDepth` (reporting `.done (.maxCallDepthExceeded ...)` if
   exceeded), check `avs.length = callee.argCount` and non-cleanup `bb0`, and push `LCallerFrame`;
 - All other terminators run via `evalLoweredTerminator`, popping `st.stack` on `.returned` (faulting
-  with `none` if `caller.returnTarget = none` on a diverging call!) or unwinding via
-  `unwindLCallStack` on `.panicked`. -/
+  with `none` if `caller.returnTarget = none` on a diverging call!), unwinding via
+  `unwindLCallStack` on `.panicked`, or propagating an abort through `terminateLCallStack` on
+  `.terminated`. -/
 def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Option LMultiCfgStep :=
   match st.activeBody.blocks[st.bb]? with
   | none => none
@@ -19443,7 +19468,7 @@ def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Opti
                   | _ => none
                 | _ => none
           | some (.panicked pbb) => unwindLCallStack pbb st.stack
-          | some (.terminated pbb) => some (.done (.terminated pbb))
+          | some (.terminated pbb) => terminateLCallStack pbb st.stack
       | _ =>
         match evalLoweredTerminator st.activeEnv st.activeBody st.bb slots1 st.unwinding with
         | none => none
@@ -19467,7 +19492,7 @@ def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Opti
                 | _ => none
               | _ => none
         | some (.panicked pbb) => unwindLCallStack pbb st.stack
-        | some (.terminated pbb) => some (.done (.terminated pbb))
+        | some (.terminated pbb) => terminateLCallStack pbb st.stack
 
 /-- Fuel-bounded multi-callee CFG evaluation sharing one `fuel` counter across all active caller
 and callee frames (`eval_frames` in `crates/anneal-mir/src/lower/cfg.rs`). -/
@@ -19678,8 +19703,8 @@ theorem unwindLCallStack_refines_unwindFromCallStack
         | unreachable => rw [hU] at hUnw; nomatch hUnw
         | terminate =>
           rw [hU] at hUnw
-          simp only [Option.some.injEq] at hUnw
-          subst hUnw
+          dsimp only at hUnw
+          obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some hUnw
           simp [unwindFromCallStack, ← hFrame.unwindEq, hU]
         | continue_ =>
           rw [hU] at hUnw
@@ -19906,7 +19931,12 @@ private theorem returnPop_refines_trusted
                     tableCorr := hCorr.tableCorr
                   }
 
-/-- Single-step refinement postcondition for `stepLoweredWithCallTable`. -/
+/-- Single-step refinement postcondition for `stepLoweredWithCallTable`.
+
+`[adv ep2-B2]`: an explicit `maxCallDepthExceeded` stop is no longer vacuous (`A0` concluded
+`True`): Trusted reaches, fault-free, a state corresponding to an Anneal state at the stopping
+block whose call stack already holds `maxCallDepth` frames, so the depth limit only fires where
+Trusted's own `Memory.callStack` is genuinely that deep. -/
 def MultiStepRefines (table : LCallTable) (rootCm : CapturedMir)
     (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
     (s : MachineState) (mStep : LMultiCfgStep) : Prop :=
@@ -19922,9 +19952,14 @@ def MultiStepRefines (table : LCallTable) (rootCm : CapturedMir)
   | .done (.terminated _) =>
     ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .abort
   | .done (.outOfFuel _) => False
-  | .done (.maxCallDepthExceeded _ _) => True
+  | .done (.maxCallDepthExceeded bb d) =>
+    ∃ s' activeCm' st',
+      TrustedRun rootCm s s' ∧
+      MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm' ∧
+      st'.bb = bb ∧ d = table.maxCallDepth ∧ table.maxCallDepth ≤ s'.memory.callStack.length
 
-/-- Multi-step outcome refinement postcondition for `runLoweredWithCallTable`. -/
+/-- Multi-step outcome refinement postcondition for `runLoweredWithCallTable` (an explicit
+`maxCallDepthExceeded` stop is a checkpoint like `outOfFuel`, see `MultiStepRefines`). -/
 def MultiOutcomeRefines (table : LCallTable) (rootCm : CapturedMir)
     (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
     (s : MachineState) (out : LMultiCfgOutcome) : Prop :=
@@ -19939,15 +19974,20 @@ def MultiOutcomeRefines (table : LCallTable) (rootCm : CapturedMir)
     ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .panic
   | .terminated _ =>
     ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .abort
-  | .maxCallDepthExceeded _ _ => True
+  | .maxCallDepthExceeded bb d =>
+    ∃ s' activeCm' st',
+      TrustedRun rootCm s s' ∧
+      MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm' ∧
+      st'.bb = bb ∧ d = table.maxCallDepth ∧ table.maxCallDepth ≤ s'.memory.callStack.length
 
 /-- **`stepLoweredWithCallTable` refines `TrustedRun rootCm` (`stepLoweredWithCallTable_refines_trusted`)**:
-every single-block step of `stepLoweredWithCallTable` (unless it halts early with explicit
-`maxCallDepthExceeded`) is matched by a fault-free `TrustedRun rootCm` across the block's statements
-followed by the matching `stepMirFn rootCm` transition — pushing a normal or diverging callee frame,
-popping a returning callee frame (`writePlaceValue` + `restoreCallerProtectors`), unwinding across
-caller frames (`unwindFromCallStack`), jumping within the active frame, or halting with
-`.retNormal` / `.retOutcome .panic` / `.retOutcome .abort`. -/
+every single-block step of `stepLoweredWithCallTable` is matched by a fault-free `TrustedRun rootCm`
+across the block's statements followed by the matching `stepMirFn rootCm` transition — pushing a
+normal or diverging callee frame, popping a returning callee frame (`writePlaceValue` +
+`restoreCallerProtectors`), unwinding across caller frames (`unwindFromCallStack`), jumping within
+the active frame, or halting with `.retNormal` / `.retOutcome .panic` / `.retOutcome .abort`; an
+explicit `maxCallDepthExceeded` stop is a corresponding checkpoint whose Trusted call stack already
+holds `maxCallDepth` frames (`[adv ep2-B2]`). -/
 theorem stepLoweredWithCallTable_refines_trusted
     {table : LCallTable} {rootCm activeCm : CapturedMir}
     {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation}
@@ -20002,7 +20042,7 @@ theorem stepLoweredWithCallTable_refines_trusted
             | terminated _ =>
               exact ⟨sEnd, hRun1, by rw [hStepEnd, hEqMatch, hURef]⟩
             | returned _ | outOfFuel _ => exact absurd hURef id
-            | maxCallDepthExceeded _ _ => trivial
+            | maxCallDepthExceeded _ _ => exact absurd hURef id
         cases hT : block.terminator with
         | goto t =>
           rw [hT] at h hStepEnd
@@ -20136,8 +20176,8 @@ theorem stepLoweredWithCallTable_refines_trusted
                     | terminate =>
                       simp only [startPanic, Option.some.injEq] at hEvT
                       subst hEvT
-                      simp only [Option.some.injEq] at h
-                      subst h
+                      simp only at h
+                      obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
                       refine ⟨sEnd, hRun1, ?_⟩
                       rw [hStepEnd]
                       simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
@@ -20179,8 +20219,8 @@ theorem stepLoweredWithCallTable_refines_trusted
                     | terminate =>
                       simp only [startPanic, Option.some.injEq] at hEvT
                       subst hEvT
-                      simp only [Option.some.injEq] at h
-                      subst h
+                      simp only at h
+                      obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
                       refine ⟨sEnd, hRun1, ?_⟩
                       rw [hStepEnd]
                       simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
@@ -20250,8 +20290,8 @@ theorem stepLoweredWithCallTable_refines_trusted
           | none => rw [hUnw] at h; nomatch h
           | some pbb =>
             rw [hUnw] at h
-            simp only [Option.some.injEq] at h
-            subst h
+            simp only at h
+            obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
             exact ⟨sEnd, hRun1, by rw [hStepEnd]; rfl⟩
         | call func args dest destTy target unwind =>
           have hDestOk : dest.projection = [] ∨ st.activeEnv.arityOf = fun _ _ _ => none := by
@@ -20285,9 +20325,11 @@ theorem stepLoweredWithCallTable_refines_trusted
                   · split at h
                     · nomatch h
                     · split at h
-                      · simp only [Option.some.injEq] at h
+                      · rename_i hDepth
+                        simp only [Option.some.injEq] at h
                         subst h
-                        trivial
+                        exact ⟨s, activeCm, st, .refl s, hCorr, rfl, rfl, by
+                          rw [← CallStackCorr.length_eq hCorr.stack]; exact hDepth⟩
                       · split at h
                         · nomatch h
                         · cases hEntry : callee.body.blocks[0]? with
@@ -20504,8 +20546,8 @@ theorem stepLoweredWithCallTable_refines_trusted
                             | none =>
                               simp only [Option.some.injEq] at hIntrEval
                               subst hIntrEval
-                              simp only [Option.some.injEq] at h
-                              subst h
+                              simp only at h
+                              obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
                               obtain ⟨_, _, hUnrF, hAbT⟩ := hSupp
                               refine ⟨sEnd, hRun1, ?_⟩
                               rw [hStepEnd]
@@ -20523,8 +20565,8 @@ theorem stepLoweredWithCallTable_refines_trusted
                               | terminate =>
                                 simp only [startPanic, Option.some.injEq] at hIntrEval
                                 subst hIntrEval
-                                simp only [Option.some.injEq] at h
-                                subst h
+                                simp only at h
+                                obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
                                 refine ⟨sEnd, hRun1, ?_⟩
                                 rw [hStepEnd]
                                 simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
@@ -20661,7 +20703,9 @@ theorem runLoweredWithCallTable_refines_trusted
         | returned _ | panicked _ | terminated _ =>
           obtain ⟨s2, hRun2, hFinal⟩ := hSub
           exact ⟨s2, hRun1.trans hRun2, hFinal⟩
-        | maxCallDepthExceeded _ _ => trivial
+        | maxCallDepthExceeded _ _ =>
+          obtain ⟨s2, activeCm2, st2, hRun2, hCorr2, hBb, hD, hLen⟩ := hSub
+          exact ⟨s2, activeCm2, st2, hRun1.trans hRun2, hCorr2, hBb, hD, hLen⟩
       | done doneOut =>
         simp only [Option.some.injEq] at h
         subst h
@@ -23873,5 +23917,587 @@ theorem witness_wide_ptr_char_and_bodyCorr_ub_parity :
           (Or.inr ⟨.alignOfVal, rfl⟩) rfl rfl hCorrHugeAl (ep2b1_consts_nonDeref _ rfl)
           (by with_unfolding_all rfl) ⟨.slice (.uint .u32), rfl, ⟨⟨4, rfl⟩, ⟨4, rfl⟩⟩⟩
           (by with_unfolding_all rfl) "").2⟩
+
+
+/-! ### Section 5h: `[adv ep2-B2]` Multi-Frame Unwinding, Diverging Linked Calls, Depth-Limit Checkpoints, and Callee-Shadowing Non-Vacuity
+
+`[adv ep2-B2]` hardening of the multi-callee `LCallTable` refinement (Section 5d):
+- **Depth-limit checkpoints.** `MultiStepRefines` / `MultiOutcomeRefines` concluded `True` on an
+  explicit `maxCallDepthExceeded` stop, so `runLoweredWithCallTable_refines_trusted` said nothing
+  about the run that led to it. They now require a fault-free `TrustedRun` to a corresponding state
+  at the stopping block whose Trusted `Memory.callStack` already holds `maxCallDepth` frames
+  (`witness_maxCallDepth_checkpoint`).
+- **Callee shadowing.** `lookupCallee_none_of_lowerIntrinsicKind` discharges
+  `CallTableCorr.unlinkedIntrinsic` (and the analogous `StateCorr.noIntrinsicCallee`) for every
+  callee list none of whose `DefPath`s the adapter lowers.
+- **Concrete Trusted traces.** `trustedIter` / `trustedIter_run` turn a kernel-computed Trusted
+  execution into a `TrustedRun` ending in a non-silent node (used for UB negative controls).
+- **Abort propagation.** A callee abort (or a caller's `.terminate`) now propagates through the
+  remaining caller frames via `terminateLCallStack`, checking every frame's unwind action and
+  reporting the outermost call site, as Episode 1's `eval_frames` does (`A0` stopped at the
+  callee-local block without checking any caller frame).
+- **Witness Suite 9.** `A0`'s multi-callee witnesses only used returning calls (`pushCalleeFrame`)
+  and a single caller frame catching a panic with `.cleanup`; nothing exercised
+  `pushDivergingCalleeFrame`, unwinding through an intermediate frame (`.continue_`), a caller's
+  `.terminate` / `.unreachable`, a diverging callee that returns, a callee `abort` under a caller
+  cleanup edge, or multi-frame abort propagation
+  (`witness_multi_frame_unwind_and_diverging_calls`). -/
+
+/-- `true` exactly on Trusted's silent continuing step `MirStepNode.step s'`. -/
+def isSilentStep : MirStepNode → Bool
+  | .tau (.running _) => true
+  | _ => false
+
+/-- Iterate Trusted's `stepMirFn` through silent steps for at most `n` further steps, returning
+the first node that is not a silent step (or the `n + 1`-st node). -/
+def trustedIter (cm : CapturedMir) : Nat → MachineState → MirStepNode
+  | 0, s => stepMirFn cm s
+  | n + 1, s =>
+    match stepMirFn cm s with
+    | .tau (.running s') => trustedIter cm n s'
+    | node => node
+
+/-- A `trustedIter` result that is not a silent step is reached by a fault-free `TrustedRun`. -/
+theorem trustedIter_run {cm : CapturedMir} :
+    ∀ (n : Nat) (s : MachineState) (node : MirStepNode),
+      trustedIter cm n s = node → isSilentStep node = false →
+      ∃ s', TrustedRun cm s s' ∧ stepMirFn cm s' = node := by
+  intro n
+  induction n with
+  | zero =>
+    intro s node h _
+    exact ⟨s, .refl s, h⟩
+  | succ n ih =>
+    intro s node h hNS
+    simp only [trustedIter] at h
+    split at h
+    · rename_i s1 hStep
+      obtain ⟨s', hRun, hFin⟩ := ih s1 node h hNS
+      exact ⟨s', .step (Or.inl hStep) hRun, hFin⟩
+    · exact ⟨s, .refl s, h⟩
+
+/-- **Callee-shadowing non-vacuity (`lookupCallee_none_of_lowerIntrinsicKind`)**: Trusted's
+`lookupCallee` finds no body for an intrinsic `DefPath` whenever no captured callee's `DefPath` is
+itself lowered by the adapter (and no trait implementation is registered), so
+`CallTableCorr.unlinkedIntrinsic` and `StateCorr.noIntrinsicCallee` hold for any realistic callee
+list rather than only the empty one. -/
+theorem lookupCallee_none_of_lowerIntrinsicKind {callees : List CapturedMir}
+    {layouts : LayoutTable} {dp : DefPath} {tys : List RigidTy} {op : LIntrinsicOp}
+    (hCallees : ∀ c ∈ callees, lowerIntrinsicKind_V2026_06_01 c.defPath = none)
+    (hTraits : flatMapTraitImpls callees = [])
+    (hIntr : lowerIntrinsicKind_V2026_06_01 dp = some op) :
+    lookupCallee callees layouts dp tys [] = none := by
+  have hFind : findCallee? callees dp = none := by
+    induction callees with
+    | nil => rfl
+    | cons c cs ih =>
+      simp only [findCallee?]
+      cases hEq : stringEq c.defPath dp with
+      | true =>
+        have hdp : c.defPath = dp := stringEq_eq_true_iff.mp hEq
+        have hc := hCallees c (.head cs)
+        rw [hdp, hIntr] at hc
+        nomatch hc
+      | false =>
+        exact ih (fun c' hc' => hCallees c' (.tail c hc'))
+          (by simp only [flatMapTraitImpls] at hTraits; exact (List.append_eq_nil_iff.mp hTraits).2)
+  exact lookupCallee_eq_none_of_findCallee_none hFind hTraits
+
+/-- `MultiBodyCorr` for a statement-free body over its own captured blocks (`ep2MakeCaptured`). -/
+private theorem ep2b2_multiBodyCorr {table : LCallTable} {rootCm : CapturedMir}
+    (decls : List LocalDecl) (body : LBody) (cmDefPath : DefPath) (argCount : Nat)
+    (callTargetOf : Operand → Option LCallTarget)
+    (hCT : callTargetOf = extractLinkedLCallTarget_V2026_06_01? table)
+    (hBlocks : ∀ b ∈ body.blocks, b.statements = [] ∧ b.terminator.MultiRefinable table) :
+    MultiBodyCorr table rootCm emptyLayoutTable []
+      { ep2MakeEnv decls with callTargetOf := callTargetOf } body
+      (ep2MakeCaptured cmDefPath argCount decls body) where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := hCT
+  block i b hb := by
+    have hMem : b ∈ body.blocks := List.mem_of_getElem? hb
+    obtain ⟨hNil, hRef⟩ := hBlocks b hMem
+    refine ⟨hRef, [], "", ?_, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+    · simp [ep2MakeCaptured, ep2LToCapturedBlocks, List.getElem?_map, hb, hNil]
+    · rw [hNil] at hEv
+      simp only [ep2MakeEnv, List.isEmpty_nil, ↓reduceIte, Option.some.injEq] at hEv
+      subst hEv
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      have hEq : { s with frame := ⟨i, ([] : List Statement).length, s.frame.locals⟩ } = s := by
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
+        simp only at hB hS
+        subst hB hS
+        rfl
+      rw [hEq]
+      exact .refl s
+
+/-- A linked direct call with constant arguments and a bare destination is `MultiRefinable`. -/
+private theorem ep2b2_linkedCall_multiRefinable {table : LCallTable} {sym : DefPath}
+    {args : List Operand} {dest : Place} {destTy : Ty} {t : Option Nat} {u : UnwindAction}
+    (hLinked : (table.lookup sym []).isSome = true)
+    (hArgs : args.all (fun a => match a with | .constant _ => true | _ => false) = true)
+    (hDest : dest.projection = []) :
+    (LTerminator.call (ep2FnOp sym []) args dest destTy t u).MultiRefinable table := by
+  refine ⟨fun arg hMem => ?_, by rw [hDest]; rfl, sym, [], 0, rfl, Or.inl hLinked⟩
+  have := List.all_eq_true.mp hArgs arg hMem
+  cases arg with
+  | constant _ => trivial
+  | copy _ | move _ => nomatch this
+
+/-! #### Witness Suite 9 (`[adv ep2-B2]`): Multi-Frame Unwinding & Diverging Linked Calls -/
+
+/-- `mid_unwind() -> u32`: a **diverging** linked call of `panic_callee()` with `.continue_`. -/
+def witnessMidUnwindBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::panic_callee" []) [] ⟨0, []⟩ ep2TyNever none .continue_,
+       false⟩ ]⟩
+
+/-- `abort_callee() -> !`: `core::intrinsics::abort()`. -/
+def witnessAbortCalleeBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::abort" []) [] ⟨0, []⟩ ep2TyNever none .continue_,
+       false⟩ ]⟩
+
+/-- `mid_abort() -> !`: a diverging linked call of `abort_callee()` with `.continue_`. -/
+def witnessMidAbortBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::abort_callee" []) [] ⟨0, []⟩ ep2TyNever none .continue_,
+       false⟩ ]⟩
+
+/-- (a) `div_catch_root() -> !`: diverging linked call of `panic_callee()` caught by `.cleanup 1`. -/
+def witnessDivCatchRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::panic_callee" []) [] ⟨0, []⟩ ep2TyNever none (.cleanup 1),
+       false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+/-- (b) `deep_catch_root() -> u32`: calls `mid_unwind()` with `.cleanup 2`; the panic raised two
+frames down unwinds through `mid_unwind`'s `.continue_` frame into `bb2`. -/
+def witnessDeepCatchRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::mid_unwind" []) [] ⟨0, []⟩ ep2TyU32 (some 1) (.cleanup 2),
+       false⟩
+   , ⟨[], .return_, false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+/-- (c) `term_root() -> !`: diverging call of `panic_callee()` with `.terminate`. -/
+def witnessTermRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::panic_callee" []) [] ⟨0, []⟩ ep2TyNever none .terminate,
+       false⟩ ]⟩
+
+/-- (d) `unreach_root() -> !`: diverging call of `panic_callee()` with `.unreachable`. -/
+def witnessUnreachRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::panic_callee" []) [] ⟨0, []⟩ ep2TyNever none .unreachable,
+       false⟩ ]⟩
+
+/-- (e) `div_return_root() -> u32`: a diverging call of the returning `leaf(7_u32)`. -/
+def witnessDivReturnRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::leaf" []) [ep2ConstSc ep2TyU32 7 4] ⟨0, []⟩ ep2TyU32 none
+       .continue_, false⟩ ]⟩
+
+/-- (f) `abort_catch_root() -> !`: diverging call of `abort_callee()` with `.cleanup 1`. -/
+def witnessAbortCatchRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::abort_callee" []) [] ⟨0, []⟩ ep2TyNever none (.cleanup 1),
+       false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+/-- (g) `abort_deep_root() -> u32`: `bb0: goto bb1`; `bb1` calls `mid_abort()` with `.cleanup 3`;
+the abort raised two frames down propagates through both caller frames (checking each unwind
+action) and is reported at the outermost call site `bb1`. -/
+def witnessAbortDeepRootBody : LBody :=
+  ⟨[ ⟨[], .goto 1, false⟩
+   , ⟨[], .call (ep2FnOp "witness::mid_abort" []) [] ⟨0, []⟩ ep2TyU32 (some 2) (.cleanup 3),
+       false⟩
+   , ⟨[], .return_, false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+/-- (h) `abort_bad_unwind_root() -> !`: diverging call of `abort_callee()` whose unwind action
+`.cleanup 0` names a non-cleanup block: Episode 1 rejects it (`check_unwind_action`) when the
+callee's abort reaches this frame, so Anneal fails closed even though Trusted aborts. -/
+def witnessAbortBadUnwindRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::abort_callee" []) [] ⟨0, []⟩ ep2TyNever none (.cleanup 0),
+       false⟩ ]⟩
+
+/-- Linked symbols of `witnessUnwindTable`. -/
+def witnessUnwindSyms : List DefPath :=
+  ["witness::leaf", "witness::panic_callee", "witness::mid_unwind", "witness::abort_callee",
+   "witness::mid_abort"]
+
+private def witnessUnwindCallTargetOf (func : Operand) : Option LCallTarget :=
+  match extractCalleeDefPath? func with
+  | some defPath =>
+    let typeArgs := extractCalleeTypeArgs func
+    some (classifyLinkedCallTarget_V2026_06_01
+      (typeArgs.isEmpty && witnessUnwindSyms.any (stringEq defPath)) defPath typeArgs)
+  | none => none
+
+/-- Environment of every body linked against `witnessUnwindTable`. -/
+def witnessUEnv (decls : List LocalDecl) : CfgEnv :=
+  { ep2MakeEnv decls with callTargetOf := witnessUnwindCallTargetOf }
+
+/-- Call table linking `leaf`, `panic_callee`, `mid_unwind`, `abort_callee`, and `mid_abort`. -/
+def witnessUnwindTable (maxDepth : Nat := 8) : LCallTable where
+  maxCallDepth := maxDepth
+  lookup sym typeArgs :=
+    if !typeArgs.isEmpty then none
+    else if stringEq sym "witness::leaf" then
+      some ⟨1, 2, witnessUEnv witnessDecls2U32, witnessLeafBody⟩
+    else if stringEq sym "witness::panic_callee" then
+      some ⟨0, 1, witnessUEnv witnessDivergingDecls, witnessPanicCalleeBody⟩
+    else if stringEq sym "witness::mid_unwind" then
+      some ⟨0, 1, witnessUEnv witnessDecls1U32, witnessMidUnwindBody⟩
+    else if stringEq sym "witness::abort_callee" then
+      some ⟨0, 1, witnessUEnv witnessDivergingDecls, witnessAbortCalleeBody⟩
+    else if stringEq sym "witness::mid_abort" then
+      some ⟨0, 1, witnessUEnv witnessDivergingDecls, witnessMidAbortBody⟩
+    else none
+
+private theorem witnessUnwindCallTargetOf_eq (maxDepth : Nat) :
+    witnessUnwindCallTargetOf =
+      extractLinkedLCallTarget_V2026_06_01? (witnessUnwindTable maxDepth) := by
+  funext func
+  unfold witnessUnwindCallTargetOf extractLinkedLCallTarget_V2026_06_01?
+  cases extractCalleeDefPath? func with
+  | none => rfl
+  | some dp =>
+    dsimp only
+    have hIsSome :
+        ((witnessUnwindTable maxDepth).lookup dp (extractCalleeTypeArgs func)).isSome =
+          ((extractCalleeTypeArgs func).isEmpty && witnessUnwindSyms.any (stringEq dp)) := by
+      unfold witnessUnwindTable witnessUnwindSyms
+      simp only [List.any_cons, List.any_nil, Bool.or_false]
+      cases (extractCalleeTypeArgs func).isEmpty <;>
+        cases stringEq dp "witness::leaf" <;>
+        cases stringEq dp "witness::panic_callee" <;>
+        cases stringEq dp "witness::mid_unwind" <;>
+        cases stringEq dp "witness::abort_callee" <;>
+        cases stringEq dp "witness::mid_abort" <;> rfl
+    rw [hIsSome]
+
+private theorem witnessUnwindCallee_multiBodyCorrs (rootCm : CapturedMir) (maxDepth : Nat) :
+    MultiBodyCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable []
+        (witnessUEnv witnessDecls2U32) witnessLeafBody
+        (ep2MakeCaptured "witness::leaf" 1 witnessDecls2U32 witnessLeafBody) ∧
+    MultiBodyCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable []
+        (witnessUEnv witnessDivergingDecls) witnessPanicCalleeBody
+        (ep2MakeCaptured "witness::panic_callee" 0 witnessDivergingDecls witnessPanicCalleeBody) ∧
+    MultiBodyCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable []
+        (witnessUEnv witnessDecls1U32) witnessMidUnwindBody
+        (ep2MakeCaptured "witness::mid_unwind" 0 witnessDecls1U32 witnessMidUnwindBody) ∧
+    MultiBodyCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable []
+        (witnessUEnv witnessDivergingDecls) witnessAbortCalleeBody
+        (ep2MakeCaptured "witness::abort_callee" 0 witnessDivergingDecls witnessAbortCalleeBody) ∧
+    MultiBodyCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable []
+        (witnessUEnv witnessDivergingDecls) witnessMidAbortBody
+        (ep2MakeCaptured "witness::mid_abort" 0 witnessDivergingDecls witnessMidAbortBody) := by
+  refine ⟨ep2b2_multiBodyCorr _ _ _ _ _ (witnessUnwindCallTargetOf_eq maxDepth) ?_,
+    ep2b2_multiBodyCorr _ _ _ _ _ (witnessUnwindCallTargetOf_eq maxDepth) ?_,
+    ep2b2_multiBodyCorr _ _ _ _ _ (witnessUnwindCallTargetOf_eq maxDepth) ?_,
+    ep2b2_multiBodyCorr _ _ _ _ _ (witnessUnwindCallTargetOf_eq maxDepth) ?_,
+    ep2b2_multiBodyCorr _ _ _ _ _ (witnessUnwindCallTargetOf_eq maxDepth) ?_⟩
+  · intro b hb
+    simp only [witnessLeafBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+    rcases hb with rfl | rfl
+    · refine ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+        (by decide) ?_ rfl⟩
+      intro arg hm
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+      rcases hm with rfl | rfl <;> first | trivial | (intro _ hc; nomatch hc)
+    · exact ⟨rfl, trivial⟩
+  · intro b hb
+    simp only [witnessPanicCalleeBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+    subst hb
+    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+      (by decide) (fun _ hm => nomatch hm) rfl⟩
+  · intro b hb
+    simp only [witnessMidUnwindBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+    subst hb
+    exact ⟨rfl, ep2b2_linkedCall_multiRefinable rfl rfl rfl⟩
+  · intro b hb
+    simp only [witnessAbortCalleeBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+    subst hb
+    exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+      (by decide) (fun _ hm => nomatch hm) rfl⟩
+  · intro b hb
+    simp only [witnessMidAbortBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+    subst hb
+    exact ⟨rfl, ep2b2_linkedCall_multiRefinable rfl rfl rfl⟩
+
+private def witnessUnwindCallees : List CapturedMir :=
+  [ ep2MakeCaptured "witness::leaf" 1 witnessDecls2U32 witnessLeafBody
+  , ep2MakeCaptured "witness::panic_callee" 0 witnessDivergingDecls witnessPanicCalleeBody
+  , ep2MakeCaptured "witness::mid_unwind" 0 witnessDecls1U32 witnessMidUnwindBody
+  , ep2MakeCaptured "witness::abort_callee" 0 witnessDivergingDecls witnessAbortCalleeBody
+  , ep2MakeCaptured "witness::mid_abort" 0 witnessDivergingDecls witnessMidAbortBody ]
+
+private theorem witnessUnwindTable_corr (rootCm : CapturedMir) (maxDepth : Nat) :
+    CallTableCorr (witnessUnwindTable maxDepth) rootCm emptyLayoutTable [] witnessUnwindCallees
+      [] where
+  linked dp tys callee hLk := by
+    obtain ⟨hLeaf, hPan, hMid, hAb, hMAb⟩ := witnessUnwindCallee_multiBodyCorrs rootCm maxDepth
+    unfold witnessUnwindTable at hLk
+    cases hE : tys.isEmpty with
+    | false => simp [hE] at hLk
+    | true =>
+      have hNil : tys = [] := List.isEmpty_iff.mp hE
+      subst hNil
+      simp only [List.isEmpty_nil, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hLk
+      by_cases h1 : stringEq dp "witness::leaf" = true
+      · obtain rfl := stringEq_eq_true_iff.mp h1
+        simp only [h1, ↓reduceIte, Option.some.injEq] at hLk
+        subst hLk
+        exact ⟨_, by with_unfolding_all rfl, rfl, hLeaf⟩
+      · simp only [Bool.not_eq_true] at h1
+        simp only [h1, Bool.false_eq_true, ↓reduceIte] at hLk
+        by_cases h2 : stringEq dp "witness::panic_callee" = true
+        · obtain rfl := stringEq_eq_true_iff.mp h2
+          simp only [h2, ↓reduceIte, Option.some.injEq] at hLk
+          subst hLk
+          exact ⟨_, by with_unfolding_all rfl, rfl, hPan⟩
+        · simp only [Bool.not_eq_true] at h2
+          simp only [h2, Bool.false_eq_true, ↓reduceIte] at hLk
+          by_cases h3 : stringEq dp "witness::mid_unwind" = true
+          · obtain rfl := stringEq_eq_true_iff.mp h3
+            simp only [h3, ↓reduceIte, Option.some.injEq] at hLk
+            subst hLk
+            exact ⟨_, by with_unfolding_all rfl, rfl, hMid⟩
+          · simp only [Bool.not_eq_true] at h3
+            simp only [h3, Bool.false_eq_true, ↓reduceIte] at hLk
+            by_cases h4 : stringEq dp "witness::abort_callee" = true
+            · obtain rfl := stringEq_eq_true_iff.mp h4
+              simp only [h4, ↓reduceIte, Option.some.injEq] at hLk
+              subst hLk
+              exact ⟨_, by with_unfolding_all rfl, rfl, hAb⟩
+            · simp only [Bool.not_eq_true] at h4
+              simp only [h4, Bool.false_eq_true, ↓reduceIte] at hLk
+              by_cases h5 : stringEq dp "witness::mid_abort" = true
+              · obtain rfl := stringEq_eq_true_iff.mp h5
+                simp only [h5, ↓reduceIte, Option.some.injEq] at hLk
+                subst hLk
+                exact ⟨_, by with_unfolding_all rfl, rfl, hMAb⟩
+              · simp only [Bool.not_eq_true] at h5
+                simp [h5] at hLk
+  unlinkedIntrinsic _ _ _ _ hIntr :=
+    lookupCallee_none_of_lowerIntrinsicKind (by decide) rfl hIntr
+
+def witnessDivCatchRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::div_catch_root" 0 witnessDivergingDecls witnessDivCatchRootBody
+def witnessDeepCatchRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::deep_catch_root" 0 witnessDecls1U32 witnessDeepCatchRootBody
+def witnessTermRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::term_root" 0 witnessDivergingDecls witnessTermRootBody
+def witnessUnreachRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::unreach_root" 0 witnessDivergingDecls witnessUnreachRootBody
+def witnessDivReturnRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::div_return_root" 0 witnessDecls1U32 witnessDivReturnRootBody
+def witnessAbortCatchRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::abort_catch_root" 0 witnessDivergingDecls witnessAbortCatchRootBody
+def witnessAbortDeepRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::abort_deep_root" 0 witnessDecls1U32 witnessAbortDeepRootBody
+def witnessAbortBadUnwindRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::abort_bad_unwind_root" 0 witnessDivergingDecls
+    witnessAbortBadUnwindRootBody
+
+/-- The initial multi-frame state of an argument-less root body over `witnessUnwindTable`. -/
+def witnessUnwindSt (decls : List LocalDecl) (body : LBody) : LMultiFrameState :=
+  { activeEnv := witnessUEnv decls
+    activeBody := body
+    bb := 0
+    slots := initLCalleeSlots decls.length []
+    unwinding := none
+    stack := [] }
+
+private theorem witnessUnwindRoot_corr (decls : List LocalDecl) (body : LBody) (name : DefPath)
+    (hBlocks : ∀ b ∈ body.blocks,
+      b.statements = [] ∧ b.terminator.MultiRefinable (witnessUnwindTable 8)) :
+    MultiFrameStateCorr (witnessUnwindTable 8) (ep2MakeCaptured name 0 decls body)
+      emptyLayoutTable [] (witnessUnwindSt decls body)
+      (initMachineStateWithCallees (ep2MakeCaptured name 0 decls body) [] witnessUnwindCallees)
+      (ep2MakeCaptured name 0 decls body) :=
+  { block := rfl
+    stmt := rfl
+    slots := initLCalleeSlots_below_initLocals (ep2MakeCaptured name 0 decls body) []
+    active := rfl
+    body := ep2b2_multiBodyCorr decls body name 0 _ (witnessUnwindCallTargetOf_eq 8) hBlocks
+    stack := trivial
+    globals := rfl
+    tableCorr := witnessUnwindTable_corr _ 8 }
+
+/-- **Concrete Non-Vacuity Witness 9 (`witness_multi_frame_unwind_and_diverging_calls`)**: eight
+root bodies over the 5-callee `witnessUnwindTable` (`leaf`, `panic_callee`, `mid_unwind`,
+`abort_callee`, `mid_abort`), each run through `runLoweredWithCallTable` and matched against Trusted's
+`stepMirFn` on the corresponding captured body:
+- (a) a **diverging** linked call (`pushDivergingCalleeFrame`) whose callee panics, caught by the
+  caller's `.cleanup 1` and resumed to `.panicked` / `.retOutcome .panic`;
+- (b) a **2-deep unwind**: `deep_catch_root -> mid_unwind -> panic_callee`, where the panic crosses
+  `mid_unwind`'s diverging `.continue_` frame (recursive `unwindLCallStack` / `unwindFromCallStack`)
+  into `deep_catch_root`'s cleanup `bb2`;
+- (c) a caller `.terminate` turns the callee's panic into `.terminated` / `.retOutcome .abort`;
+- (d) a caller `.unreachable` is UB in both (`runLoweredWithCallTable = none`, Trusted
+  `.fail .ub`);
+- (e) a diverging call of the returning `leaf` is UB in both (`isDiverging` return);
+- (f) a callee `abort` bypasses the caller's `.cleanup 1` (`.terminated` / `.retOutcome .abort`);
+- (g) an abort raised two frames down (`abort_deep_root -> mid_abort -> abort_callee`) propagates
+  through both caller frames (`terminateLCallStack`) and is reported at the outermost call site
+  `bb1`, as Episode 1's `eval_frames` does;
+- (h) an abort reaching a caller frame with an ill-formed unwind action (`.cleanup 0` naming a
+  non-cleanup block) fails closed (Episode 1's `check_unwind_action`), although Trusted aborts. -/
+theorem witness_multi_frame_unwind_and_diverging_calls :
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDivergingDecls witnessDivCatchRootBody) = some (.panicked 0) ∧
+      ∃ s', TrustedRun witnessDivCatchRootCm
+          (initMachineStateWithCallees witnessDivCatchRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessDivCatchRootCm s' = .retOutcome .panic) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 8
+        (witnessUnwindSt witnessDecls1U32 witnessDeepCatchRootBody) = some (.panicked 0) ∧
+      ∃ s', TrustedRun witnessDeepCatchRootCm
+          (initMachineStateWithCallees witnessDeepCatchRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessDeepCatchRootCm s' = .retOutcome .panic) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDivergingDecls witnessTermRootBody) = some (.terminated 0) ∧
+      ∃ s', TrustedRun witnessTermRootCm
+          (initMachineStateWithCallees witnessTermRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessTermRootCm s' = .retOutcome .abort) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDivergingDecls witnessUnreachRootBody) = none ∧
+      ∃ s', TrustedRun witnessUnreachRootCm
+          (initMachineStateWithCallees witnessUnreachRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessUnreachRootCm s' = .fail .ub) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDecls1U32 witnessDivReturnRootBody) = none ∧
+      ∃ s', TrustedRun witnessDivReturnRootCm
+          (initMachineStateWithCallees witnessDivReturnRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessDivReturnRootCm s' = .fail .ub) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDivergingDecls witnessAbortCatchRootBody) = some (.terminated 0) ∧
+      ∃ s', TrustedRun witnessAbortCatchRootCm
+          (initMachineStateWithCallees witnessAbortCatchRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessAbortCatchRootCm s' = .retOutcome .abort) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 8
+        (witnessUnwindSt witnessDecls1U32 witnessAbortDeepRootBody) = some (.terminated 1) ∧
+      ∃ s', TrustedRun witnessAbortDeepRootCm
+          (initMachineStateWithCallees witnessAbortDeepRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessAbortDeepRootCm s' = .retOutcome .abort) ∧
+    (runLoweredWithCallTable (witnessUnwindTable 8) 6
+        (witnessUnwindSt witnessDivergingDecls witnessAbortBadUnwindRootBody) = none ∧
+      ∃ s', TrustedRun witnessAbortBadUnwindRootCm
+          (initMachineStateWithCallees witnessAbortBadUnwindRootCm [] witnessUnwindCallees) s' ∧
+        stepMirFn witnessAbortBadUnwindRootCm s' = .retOutcome .abort) := by
+  have hLinkedRoot : ∀ (sym : DefPath) (dty : Ty) (t : Option Nat) (u : UnwindAction),
+      ((witnessUnwindTable 8).lookup sym []).isSome = true →
+      (⟨[], .call (ep2FnOp sym []) [] ⟨0, []⟩ dty t u, false⟩ : LBlock).statements = [] ∧
+        (LTerminator.call (ep2FnOp sym []) [] ⟨0, []⟩ dty t u).MultiRefinable
+          (witnessUnwindTable 8) :=
+    fun _ _ _ _ hL => ⟨rfl, ep2b2_linkedCall_multiRefinable hL rfl rfl⟩
+  have hA : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDivergingDecls witnessDivCatchRootBody) = some (.panicked 0) := by
+    with_unfolding_all rfl
+  have hB : runLoweredWithCallTable (witnessUnwindTable 8) 8
+      (witnessUnwindSt witnessDecls1U32 witnessDeepCatchRootBody) = some (.panicked 0) := by
+    with_unfolding_all rfl
+  have hC : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDivergingDecls witnessTermRootBody) = some (.terminated 0) := by
+    with_unfolding_all rfl
+  have hD : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDivergingDecls witnessUnreachRootBody) = none := by
+    with_unfolding_all rfl
+  have hE : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDecls1U32 witnessDivReturnRootBody) = none := by
+    with_unfolding_all rfl
+  have hF : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDivergingDecls witnessAbortCatchRootBody) = some (.terminated 0) := by
+    with_unfolding_all rfl
+  have hG : runLoweredWithCallTable (witnessUnwindTable 8) 8
+      (witnessUnwindSt witnessDecls1U32 witnessAbortDeepRootBody) = some (.terminated 1) := by
+    with_unfolding_all rfl
+  have hH : runLoweredWithCallTable (witnessUnwindTable 8) 6
+      (witnessUnwindSt witnessDivergingDecls witnessAbortBadUnwindRootBody) = none := by
+    with_unfolding_all rfl
+  have cG := witnessUnwindRoot_corr witnessDecls1U32 witnessAbortDeepRootBody
+    "witness::abort_deep_root" (by
+      intro b hb
+      simp only [witnessAbortDeepRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl | rfl | rfl
+      · exact ⟨rfl, trivial⟩
+      · exact hLinkedRoot _ _ _ _ rfl
+      · exact ⟨rfl, trivial⟩
+      · exact ⟨rfl, trivial⟩)
+  have cA := witnessUnwindRoot_corr witnessDivergingDecls witnessDivCatchRootBody
+    "witness::div_catch_root" (by
+      intro b hb
+      simp only [witnessDivCatchRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact hLinkedRoot _ _ _ _ rfl
+      · exact ⟨rfl, trivial⟩)
+  have cB := witnessUnwindRoot_corr witnessDecls1U32 witnessDeepCatchRootBody
+    "witness::deep_catch_root" (by
+      intro b hb
+      simp only [witnessDeepCatchRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl | rfl
+      · exact hLinkedRoot _ _ _ _ rfl
+      · exact ⟨rfl, trivial⟩
+      · exact ⟨rfl, trivial⟩)
+  have cC := witnessUnwindRoot_corr witnessDivergingDecls witnessTermRootBody
+    "witness::term_root" (by
+      intro b hb
+      simp only [witnessTermRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      subst hb
+      exact hLinkedRoot _ _ _ _ rfl)
+  have cF := witnessUnwindRoot_corr witnessDivergingDecls witnessAbortCatchRootBody
+    "witness::abort_catch_root" (by
+      intro b hb
+      simp only [witnessAbortCatchRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact hLinkedRoot _ _ _ _ rfl
+      · exact ⟨rfl, trivial⟩)
+  exact ⟨⟨hA, runLoweredWithCallTable_refines_trusted 6 _ _ _ _ cA hA⟩,
+    ⟨hB, runLoweredWithCallTable_refines_trusted 8 _ _ _ _ cB hB⟩,
+    ⟨hC, runLoweredWithCallTable_refines_trusted 6 _ _ _ _ cC hC⟩,
+    ⟨hD, trustedIter_run 4 _ _ (by with_unfolding_all rfl) rfl⟩,
+    ⟨hE, trustedIter_run 6 _ _ (by with_unfolding_all rfl) rfl⟩,
+    ⟨hF, runLoweredWithCallTable_refines_trusted 6 _ _ _ _ cF hF⟩,
+    ⟨hG, runLoweredWithCallTable_refines_trusted 8 _ _ _ _ cG hG⟩,
+    ⟨hH, trustedIter_run 4 _ _ (by with_unfolding_all rfl) rfl⟩⟩
+
+/-- **Depth-limit checkpoint witness (`witness_maxCallDepth_checkpoint`)**: Witness 4's
+`root(84_u32) -> mid -> leaf` under `maxCallDepth := 1` stops with `maxCallDepthExceeded 1 1`, and
+the strengthened `runLoweredWithCallTable_refines_trusted` now yields a fault-free `TrustedRun` to a
+corresponding state at `bb1` (inside `mid`, at its call of `leaf`) whose Trusted call stack already
+holds `root`'s saved frame. -/
+theorem witness_maxCallDepth_checkpoint :
+    let stRoot : LMultiFrameState :=
+      { activeEnv := witnessRootEnv
+        activeBody := witnessRootBody
+        bb := 0
+        slots := initLCalleeSlots 2 [.scalar ⟨84, 4⟩]
+        unwinding := none
+        stack := [] }
+    let sRoot : MachineState :=
+      initMachineStateWithCallees witnessRootCm [.scalar ⟨84, 4⟩] witnessTrustedCallees
+    runLoweredWithCallTable (witnessLinkedTable 1) 12 stRoot = some (.maxCallDepthExceeded 1 1) ∧
+      ∃ s' activeCm' st',
+        TrustedRun witnessRootCm sRoot s' ∧
+        MultiFrameStateCorr (witnessLinkedTable 1) witnessRootCm emptyLayoutTable [] st' s'
+          activeCm' ∧
+        st'.bb = 1 ∧ 1 ≤ s'.memory.callStack.length := by
+  intro stRoot sRoot
+  have hDepth1 :
+      runLoweredWithCallTable (witnessLinkedTable 1) 12 stRoot =
+        some (.maxCallDepthExceeded 1 1) := by
+    with_unfolding_all rfl
+  have hCorr :
+      MultiFrameStateCorr (witnessLinkedTable 1) witnessRootCm emptyLayoutTable []
+        stRoot sRoot witnessRootCm :=
+    { block := rfl
+      stmt := rfl
+      slots := initLCalleeSlots_below_initLocals witnessRootCm [.scalar ⟨84, 4⟩]
+      active := rfl
+      body := witnessRoot_multiBodyCorr 1
+      stack := trivial
+      globals := rfl
+      tableCorr := witnessLinkedTable_corr witnessRootCm 1 }
+  obtain ⟨s', activeCm', st', hRun, hC, hBb, _, hLen⟩ :=
+    runLoweredWithCallTable_refines_trusted 12 stRoot sRoot witnessRootCm _ hCorr hDepth1
+  exact ⟨hDepth1, s', activeCm', st', hRun, hC, hBb, hLen⟩
 
 end Anneal.Mir.AdtAndControl
