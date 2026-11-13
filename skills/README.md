@@ -14,6 +14,10 @@ rules and the routing table that maps tasks to these skills.
 
 ## Provenance
 
+Vendor only documents used to run a skill, including the references its
+instructions load. Keep supporting material, such as bibliographies and
+development notes, upstream. The provenance links below retain access to it.
+
 | Skill | Source | Upstream path & revision |
 | :--- | :--- | :--- |
 | [`authorship-disclosure`](authorship-disclosure/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`authorship_disclosure/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/authorship_disclosure) |
@@ -35,6 +39,14 @@ rules and the routing table that maps tasks to these skills.
 Most vendored `joshlf/skills` packages are kept byte-for-byte identical to
 upstream. The following packages carry intentional, documented local
 modifications:
+
+- The reference documents in `robust-code/` and `tech-lead/` carry the
+  repository copyright and license header. Their upstream bodies remain
+  unchanged.
+
+- **`skills/williams-style/`:** The copy omits the upstream
+  `references/SOURCES.md` document and removes its optional link from
+  `SKILL.md`.
 
 - **`skills/robust-code/`:**
   - **Omitted file:** `references/agent-scaffolding.md`. (This reference file
