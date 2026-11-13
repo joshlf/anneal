@@ -14,6 +14,9 @@ Anneal is a verification framework for Rust under active development. See
 [`META_PRINCIPLES.md`](META_PRINCIPLES.md) for the invariant goals that govern
 them.
 
+See the [experimental scalar verifier guide](docs/mvp.md) for installation,
+configured verification requests, supported scope and the Starnix proof fixture.
+
 ## Correctness policy and `trusted/`
 
 [`PRINCIPLES.md`](PRINCIPLES.md) promises that if the code in a verification
