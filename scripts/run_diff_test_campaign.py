@@ -779,6 +779,58 @@ def itree_signature_for_seed_check(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# The `TraceReplayDiag` constructor behind each `TraceReplayDiag.tagName`
+# (`theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean`). A finding's `diag_repr` is
+# Lean's `reprStr` of the value, which names the constructor, not the tag.
+ITREE_DIAG_TAG_CONSTRUCTORS: dict[str, str] = {
+    "ok": "ok",
+    "decode_arg_failed": "decodeArgFailed",
+    "decode_event_failed": "decodeEventFailed",
+    "decode_outcome_failed": "decodeOutcomeFailed",
+    "impure_ext_call_ptr_arg": "impureExtCallPtrArg",
+    "step_faulted": "stepFaulted",
+    "unexpected_ext_call": "unexpectedExtCall",
+    "call_arg_mismatch": "callArgMismatch",
+    "branch_tag_mismatch": "branchTagMismatch",
+    "unconsumed_events": "unconsumedEventsRemaining",
+    "outcome_mismatch": "outcomeMismatch",
+    "out_of_fuel": "outOfFuel",
+}
+
+
+def _itree_diag_repr_matches_tag(diag_repr: str, tag: str) -> bool:
+    """Whether `diag_repr`, Lean's `reprStr` of a `TraceReplayDiag` (for example
+    `TraceReplayDiag.unconsumedEventsRemaining 2`, possibly parenthesized or cut
+    after the constructor), names the constructor whose `tagName` is `tag`
+    (`ITREE_DIAG_TAG_CONSTRUCTORS`). The tag spelling `TraceReplayDiag.<tag>` used
+    by synthetic reports is accepted too."""
+    clean = diag_repr.strip()
+    while clean.startswith("(") and clean.endswith(")"):
+        clean = clean[1:-1].strip()
+    names = {tag, ITREE_DIAG_TAG_CONSTRUCTORS.get(tag, tag)}
+    return any(
+        re.fullmatch(rf"TraceReplayDiag\.{re.escape(name)}(?:\s.*)?", clean, re.DOTALL)
+        for name in names
+    )
+
+
+def _itree_finding_trace_was_shrunk(finding: dict[str, Any]) -> bool:
+    """Whether `itree-difftest` may have replaced this finding's batch trace with a
+    trace of its shrink's re-run (`assign_minimized_traces`). That happens whenever
+    the shrink shortened the mutator chain: under `shrink_status == "minimized"`, and
+    also under `inconclusive_oracle_failure` when some queries failed but a shorter
+    chain still reproduced the signature."""
+    if finding.get("shrink_status") == "minimized":
+        return True
+    original = finding.get("original_mutator_chain")
+    minimized = finding.get("minimized_mutator_chain")
+    return (
+        isinstance(original, list)
+        and isinstance(minimized, list)
+        and len(minimized) < len(original)
+    )
+
+
 def evaluate_itree_red_flags(
     summary: dict[str, Any],
     itree_seed: int,
@@ -915,17 +967,21 @@ def evaluate_itree_red_flags(
     # `itree-difftest` emits one finding per diverging distinct trace, tagged with
     # that trace's `TraceReplayDiag` tag, so the findings must reproduce the
     # non-`ok` `diag_tag_counts` exactly, cover `diverge_candidates` distinct
-    # `fn_name`s, carry distinct `finding_id`s, and name each batch trace
-    # (`case_ident`) once unless `assign_minimized_traces` reused a shrunk
-    # witness trace across findings of the same `(fn_name, diag_tag)` with
-    # `shrink_status == "minimized"`.
+    # `fn_name`s, carry distinct `finding_id`s, and carry a `diag_repr` of their
+    # tag's constructor (`_itree_diag_repr_matches_tag`). A finding names its trace
+    # by `case_ident` (`case_<fn_name>_t<i>`, so no two candidates ever share one).
+    # Findings that kept their batch trace name distinct traces. A shrink that
+    # shortened the chain instead substitutes traces of its own staged re-run of
+    # the candidate (`assign_minimized_traces`), numbered afresh in the same
+    # namespace and reused round-robin when the re-run has fewer witnesses than
+    # findings, so such a finding may repeat any `case_ident` of its own candidate
+    # (`_itree_finding_trace_was_shrunk`).
     finding_tags: dict[str, int] = {}
     finding_fns: set[str] = set()
     seen_finding_ids: set[str] = set()
     duplicate_finding_ids: set[str] = set()
-    seen_unminimized_cases: set[str] = set()
-    seen_minimized_case_owner: dict[str, tuple[str, str]] = {}
-    duplicate_cases: set[str] = set()
+    case_fns: dict[str, set[str]] = {}
+    batch_trace_cases: dict[str, int] = {}
     repr_mismatches: list[str] = []
     for f in findings:
         if not isinstance(f, dict):
@@ -942,36 +998,16 @@ def evaluate_itree_red_flags(
         if isinstance(tag, str):
             finding_tags[tag] = finding_tags.get(tag, 0) + 1
             diag_repr = f.get("diag_repr")
-            if isinstance(diag_repr, str):
-                clean_repr = diag_repr.strip()
-                while clean_repr.startswith("(") and clean_repr.endswith(")"):
-                    clean_repr = clean_repr[1:-1].strip()
-                expected_prefix = f"TraceReplayDiag.{tag}"
-                if clean_repr != expected_prefix and not clean_repr.startswith(
-                    f"{expected_prefix} "
-                ):
-                    repr_mismatches.append(f"{fid}:{tag}!={diag_repr!r}")
+            if isinstance(diag_repr, str) and not _itree_diag_repr_matches_tag(diag_repr, tag):
+                repr_mismatches.append(f"{fid}:{tag}!={diag_repr!r}")
         case_ident = f.get("case_ident")
         if isinstance(case_ident, str):
-            if (
-                f.get("shrink_status") == "minimized"
-                and isinstance(fn_name, str)
-                and isinstance(tag, str)
-            ):
-                owner = (fn_name, tag)
-                prev_owner = seen_minimized_case_owner.get(case_ident)
-                if case_ident in seen_unminimized_cases or (
-                    prev_owner is not None and prev_owner != owner
-                ):
-                    duplicate_cases.add(case_ident)
-                seen_minimized_case_owner[case_ident] = owner
-            else:
-                if (
-                    case_ident in seen_unminimized_cases
-                    or case_ident in seen_minimized_case_owner
-                ):
-                    duplicate_cases.add(case_ident)
-                seen_unminimized_cases.add(case_ident)
+            case_fns.setdefault(case_ident, set()).add(str(fn_name))
+            if not _itree_finding_trace_was_shrunk(f):
+                batch_trace_cases[case_ident] = batch_trace_cases.get(case_ident, 0) + 1
+    duplicate_cases = {c for c, fns in case_fns.items() if len(fns) > 1} | {
+        c for c, count in batch_trace_cases.items() if count > 1
+    }
     tag_mismatches = {
         tag: (finding_tags.get(tag, 0), int(diag_counts.get(tag, 0)))
         for tag in sorted(set(diag_counts) | set(finding_tags))
@@ -2216,11 +2252,21 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
 def load_known_corpus_bug_seeds(
     repo_root: Path, manifest_path: Path | None = None
 ) -> set[str]:
-    """Names of the manifest tests whose findings are quarantined as open Anneal
-    bugs: every `[[tests]]` entry with a `[tests.known_anneal_bug]` table. A
-    non-table `known_anneal_bug` value quarantines nothing (fail closed; the stale
-    ratchet reports it), and an unreadable manifest or a non-array `tests` key yields
-    no seeds instead of crashing the campaign."""
+    """Names of the manifest tests documented as open Anneal bugs: every
+    `[[tests]]` entry with a `[tests.known_anneal_bug]` table.
+
+    These names never quarantine anything. Unless the fault lies on a line that a
+    mutator introduced, `infer_finding_cause` attributes a divergence of such a seed
+    to the seed itself instead of to its first mutator, which fixes the finding's
+    fingerprint and keeps mutator-level quarantine tokens from matching it; manifest
+    entries excuse findings only through `load_quarantine_rules`, which applies just
+    the entries in force. Attribution therefore ignores an entry's metadata and
+    `expires` date: a lapsed or incomplete entry still documents a seed that diverges
+    on its own, and reattributing its divergences to a mutator would change their
+    fingerprints and widen the quarantine tokens that match them (the stale ratchet
+    reports such entries). A non-table `known_anneal_bug` value documents nothing,
+    and an unreadable manifest or a non-array `tests` key yields no seeds instead of
+    crashing the campaign."""
     eff_path = (
         manifest_path
         if manifest_path is not None
@@ -2235,15 +2281,12 @@ def load_known_corpus_bug_seeds(
     tests = data.get("tests", [])
     if not isinstance(tests, list):
         return set()
-    today = utc_date_prefix()
     seeds: set[str] = set()
-    for idx, entry in enumerate(tests):
+    for entry in tests:
         if isinstance(entry, dict) and isinstance(entry.get("known_anneal_bug"), dict):
-            q_entry = _quarantine_known_bug_entry(f"tests[{idx}]", entry)
-            if q_entry.in_force(today):
-                name = entry.get("name")
-                if isinstance(name, str) and name.strip():
-                    seeds.add(name.strip())
+            name = entry.get("name")
+            if isinstance(name, str) and name.strip():
+                seeds.add(name.strip())
     return seeds
 
 

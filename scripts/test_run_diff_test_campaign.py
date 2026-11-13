@@ -5414,7 +5414,7 @@ class PassA1AdversarialRegressionTest(unittest.TestCase):
                 'name = "plain_test"\n',
                 encoding="utf-8",
             )
-            # `known_anneal_bug = false` must not quarantine `flag_bug`'s findings.
+            # `known_anneal_bug = false` does not document `flag_bug` as an open bug.
             self.assertEqual(
                 campaign.load_known_corpus_bug_seeds(Path(tmp), m_file), {"table_bug"}
             )
@@ -5639,7 +5639,7 @@ class PassB2AdversarialRegressionTest(unittest.TestCase):
                 nc_audit["stale_known_anneal_bugs"][0]["reason"],
             )
 
-    def test_load_known_corpus_bug_seeds_requires_in_force_entry_and_utc_offset_expiry(self) -> None:
+    def test_known_bug_quarantine_requires_in_force_entry_and_utc_offset_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             m_file = Path(tmp) / "manifest.toml"
             m_file.write_text(
@@ -5662,8 +5662,13 @@ class PassB2AdversarialRegressionTest(unittest.TestCase):
                 'expires = 2020-01-01\n',
                 encoding="utf-8",
             )
+            # Only the in-force entry excuses findings (the manifest read as a
+            # quarantine file); every documented seed keeps its divergences
+            # attributed to itself (`load_known_corpus_bug_seeds` never quarantines).
+            self.assertEqual(campaign.load_quarantine_rules(m_file), {"active_bug"})
             self.assertEqual(
-                campaign.load_known_corpus_bug_seeds(Path(tmp), m_file), {"active_bug"}
+                campaign.load_known_corpus_bug_seeds(Path(tmp), m_file),
+                {"active_bug", "incomplete_bug", "expired_bug"},
             )
             # Offset-aware TOML datetime `2026-11-13T01:00:00+05:00` is `2026-11-12T20:00:00Z`
             # in UTC, so on UTC reference date `2026-11-13` it is expired.
@@ -5683,6 +5688,188 @@ class PassB2AdversarialRegressionTest(unittest.TestCase):
                 audit["stale_quarantine_entries"][0]["reason"],
                 "expired_quarantine_entry: expires 2026-11-12 < 2026-11-13",
             )
+
+
+TRACE_CHECK_LEAN = REPO_ROOT / "theory" / "Anneal" / "Rustc" / "V2026_06_01" / "TraceCheck.lean"
+
+
+def _one_candidate_shrunk_itree_report(state_dir: Path) -> dict:
+    """A healthy `itree-difftest` summary whose single diverging candidate has 4
+    diverging batch traces with 3 signatures, as `shrink_itree_findings` leaves them:
+    the `outcome_mismatch` shrink (`minimized`) and the `unconsumed_events` shrink
+    (`inconclusive_oracle_failure`, yet with a shorter chain) substituted traces of
+    their own re-runs, which number traces afresh under the candidate's name (the
+    latter reusing its single witness for both findings), while the
+    `step_faulted` finding kept its batch trace. All four name `..._t0`, and each
+    `diag_repr` is Lean's `reprStr` (constructor names, not tags)."""
+    fp = "CallBoundaryOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+    report = make_healthy_itree_report(state_dir, fingerprints=[fp] * 4)
+    fn = "b0_c0__kernel_step"
+    report["diverge_candidates"] = 1
+    report["agree_candidates"] = report["compared_candidates"] - 1
+    report["diag_tag_counts"]["outcome_mismatch"] = 1
+    report["diag_tag_counts"]["step_faulted"] = 1
+    report["diag_tag_counts"]["unconsumed_events"] = 2
+    long_chain = ["CallBoundaryOutliner", "IdentityMutator"]
+    short_chain = ["CallBoundaryOutliner"]
+    specs = (
+        (
+            "outcome_mismatch",
+            "TraceReplayDiag.outcomeMismatch (MirOutcome.returned (Value.scalar "
+            "(ScalarInt.mk 1 4))) (ObservedOutcome.returned (Value.scalar (ScalarInt.mk 2 4)))",
+            "minimized",
+            long_chain,
+            short_chain,
+        ),
+        (
+            "step_faulted",
+            "TraceReplayDiag.stepFaulted (FailureKind.ub) 2 0",
+            "already_one_minimal",
+            short_chain,
+            short_chain,
+        ),
+        (
+            "unconsumed_events",
+            "TraceReplayDiag.unconsumedEventsRemaining 2",
+            "inconclusive_oracle_failure",
+            long_chain,
+            short_chain,
+        ),
+        (
+            "unconsumed_events",
+            "(TraceReplayDiag.unconsumedEventsRemaining\n  2)",
+            "inconclusive_oracle_failure",
+            long_chain,
+            short_chain,
+        ),
+    )
+    for finding, (tag, diag_repr, status, original, minimized) in zip(report["findings"], specs):
+        finding.update(
+            fn_name=fn,
+            case_ident=f"case_{fn}_t0",
+            diag_tag=tag,
+            diag_repr=diag_repr,
+            shrink_status=status,
+            original_mutator_chain=list(original),
+            minimized_mutator_chain=list(minimized),
+            applied_mutators=list(minimized),
+        )
+    return report
+
+
+class PassA2AdversarialRegressionTest(unittest.TestCase):
+    """Regression tests for issues found in adversarial pass A2."""
+
+    def test_itree_shrink_substituted_traces_and_lean_reprs_pass_red_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = _one_candidate_shrunk_itree_report(Path(tmp))
+            self.assertEqual(campaign.validate_performed_itree_summary(report), (True, "ok"))
+            red = campaign.evaluate_itree_red_flags(report, 0x20020002, {}, 50.0)
+            self.assertTrue(red.passed, red.failure_reasons)
+
+            # Findings that kept their batch traces still name distinct traces.
+            unshrunk = _one_candidate_shrunk_itree_report(Path(tmp))
+            for finding in unshrunk["findings"][2:]:
+                finding.update(
+                    shrink_status="already_one_minimal",
+                    minimized_mutator_chain=list(finding["original_mutator_chain"]),
+                )
+            red = campaign.evaluate_itree_red_flags(unshrunk, 0x20020002, {}, 50.0)
+            self.assertFalse(red.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("repeat traces ['case_b0_c0__kernel_step_t0']" in r for r in red.failure_reasons),
+                red.failure_reasons,
+            )
+
+            # A `case_ident` is never shared by two candidates, shrunk or not.
+            shared = _one_candidate_shrunk_itree_report(Path(tmp))
+            shared["findings"][3]["fn_name"] = "b0_c1__kernel_step"
+            shared["diverge_candidates"] = 2
+            shared["agree_candidates"] = shared["compared_candidates"] - 2
+            red = campaign.evaluate_itree_red_flags(shared, 0x20020002, {}, 50.0)
+            self.assertFalse(red.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("repeat traces ['case_b0_c0__kernel_step_t0']" in r for r in red.failure_reasons),
+                red.failure_reasons,
+            )
+
+            # A Lean repr of another constructor is still a mismatch.
+            wrong_ctor = _one_candidate_shrunk_itree_report(Path(tmp))
+            wrong_ctor["findings"][1]["diag_repr"] = (
+                "TraceReplayDiag.outcomeMismatch (MirOutcome.panicked) (ObservedOutcome.panicked)"
+            )
+            red = campaign.evaluate_itree_red_flags(wrong_ctor, 0x20020002, {}, 50.0)
+            self.assertFalse(red.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("mismatch diag_repr" in r and "step_faulted" in r for r in red.failure_reasons),
+                red.failure_reasons,
+            )
+
+    def test_itree_diag_repr_constructors_match_trace_check_tag_names(self) -> None:
+        # `TraceReplayDiag.tagName`'s clauses (`| .stepFaulted _ _ _ => "step_faulted"`)
+        # are the ground truth for which constructor `reprStr` prints for each tag.
+        src = TRACE_CHECK_LEAN.read_text(encoding="utf-8")
+        start = src.index("def TraceReplayDiag.tagName")
+        block = src[start : src.index("\n\n", start)]
+        lean_map = {
+            tag: ctor for ctor, tag in re.findall(r"\|\s*\.(\w+)[^=]*=>\s*\"(\w+)\"", block)
+        }
+        self.assertEqual(lean_map, campaign.ITREE_DIAG_TAG_CONSTRUCTORS)
+        self.assertLessEqual(
+            set(campaign.VALID_ITREE_DIAG_TAGS), set(campaign.ITREE_DIAG_TAG_CONSTRUCTORS)
+        )
+        matches = campaign._itree_diag_repr_matches_tag
+        for repr_text, tag, expected in (
+            ("TraceReplayDiag.outcomeMismatch (MirOutcome.panicked) (x)", "outcome_mismatch", True),
+            ("TraceReplayDiag.outcomeMismatch", "outcome_mismatch", True),
+            ("TraceReplayDiag.outcomeMismatch\n  (MirOutcome.panicked)", "outcome_mismatch", True),
+            ("(TraceReplayDiag.outOfFuel 3 4)", "out_of_fuel", True),
+            ("TraceReplayDiag.unconsumedEventsRemaining 3", "unconsumed_events", True),
+            ("TraceReplayDiag.outcome_mismatch", "outcome_mismatch", True),
+            ("TraceReplayDiag.unconsumedEvents 3", "unconsumed_events", False),
+            ("TraceReplayDiag.outcomeMismatchX", "outcome_mismatch", False),
+            ("TraceReplayDiag.stepFaulted (FailureKind.ub) 0 1", "outcome_mismatch", False),
+            ("", "outcome_mismatch", False),
+        ):
+            with self.subTest(repr_text=repr_text, tag=tag):
+                self.assertEqual(matches(repr_text, tag), expected)
+
+    def test_known_bug_seed_attribution_ignores_lapsed_metadata_and_mutator_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "expired_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.normalUnit"\n'
+                'summary = "lapsed"\n'
+                'expires = 2020-01-01\n',
+                encoding="utf-8",
+            )
+            seeds = campaign.load_known_corpus_bug_seeds(Path(tmp), m_file)
+            self.assertEqual(seeds, {"expired_bug"})
+            # The lapsed entry excuses nothing...
+            self.assertEqual(campaign.load_quarantine_rules(m_file), set())
+            finding = {
+                "fn_name": "expired_bug__b0_c1",
+                "seed_name": "expired_bug",
+                "applied_mutators": ["RawPtrOffsetMutator"],
+                "divergence_class": "missed_ub",
+                "miri_outcome": "ub@src/lib.rs:4:14",
+                "anneal_outcome": "pass:unit",
+                "anneal_lean_tag": "MirDiffTag.normalUnit",
+                "repro_path": str(Path(tmp) / "repro.rs"),
+                "kernel_confirmed": True,
+            }
+            # ...and the seed's own divergence keeps its seed fingerprint, so a
+            # mutator-level quarantine token cannot hide it.
+            fp, keys = campaign.quarantine_match_keys_for_miri_finding(finding, seeds)
+            self.assertEqual(fp, "expired_bug:missed_ub:MirDiffTag.normalUnit")
+            self.assertFalse(keys & {"RawPtrOffsetMutator", "RawPtrOffsetMutator:missed_ub"})
+            _, unquarantined, quarantined = campaign.deduplicate_and_quarantine_findings(
+                [finding], seeds, {"RawPtrOffsetMutator", "RawPtrOffsetMutator:missed_ub"}
+            )
+            self.assertEqual((len(unquarantined), len(quarantined)), (1, 0))
 
 
 if __name__ == "__main__":
