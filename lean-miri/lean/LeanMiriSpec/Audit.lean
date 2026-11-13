@@ -43,6 +43,22 @@ import LeanMiriSpec.Correspondence.WitLM3_2
 import LeanMiriSpec.Correspondence.TreeBorrowsRel
 import LeanMiriSpec.Correspondence.SimLM3_3
 import LeanMiriSpec.Correspondence.WitLM3_3
+import LeanMiriSpec.Correspondence.CallLM4_1
+import LeanMiriSpec.Correspondence.SimLM4_1
+import LeanMiriSpec.Correspondence.WitLM4_1
+import LeanMiriSpec.Correspondence.BitsLM4_2
+import LeanMiriSpec.Correspondence.IntrinsicLM4_2
+import LeanMiriSpec.Correspondence.NumericLM4_2
+import LeanMiriSpec.Correspondence.SaturatingLM4_2
+import LeanMiriSpec.Correspondence.ExactDivLM4_2
+import LeanMiriSpec.Correspondence.CallLM4_2
+import LeanMiriSpec.Correspondence.OffsetLM4_2
+import LeanMiriSpec.Correspondence.WriteBytesLM4_2
+import LeanMiriSpec.Correspondence.CopyLM4_2
+import LeanMiriSpec.Correspondence.SimLM4_2
+import LeanMiriSpec.Correspondence.WitLM4_2
+import LeanMiriSpec.Correspondence.Safety
+import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -82,7 +98,22 @@ weakened theorem keeps its name:
   `forceAllocation_preserves_StateRel`, together with the `WitLM1_4` witnesses
   showing that these premises can be met, that `forceAllocation` really
   promotes an immediate local to memory, and that storage statements then free
-  that memory in lockstep.
+  that memory in lockstep;
+* `LM-4.3`: the whole-program `RunLoop` semantics `miriSystem` (its transition is
+  one `RunLoop.iteration`, and every state can progress), the step-closed
+  simulation engine (`step_universal_simulation`, `step_faultClass_simulation`,
+  `runLoop_universal_simulation`, `treeSafe_iff_miriSafe`,
+  `reachesUB_iff_miriReachesUB`, `reachesFault_iff_miriReachesClass`,
+  `partialCorrect_iff_annealPostcondition`, `infiniteRun_iff_anneal_forever`)
+  over Stage-1 `mirTree`, the unconditional closed fragment `InSafeScalarFragment`
+  (`WellTypedBodyExt`), the step-relation bridges and entry relations, and the
+  `MiriDiffWitnesses` whole-program witness suite, including the Stage-1 lockstep
+  upgrades (`w3_deref_oob_ub`, `w3_deref_misaligned_ub`,
+  `w4_invalid_bool_ref_read_ub`) and the Stage-1 boundary and divergence
+  witnesses (`w1_tail_call_class_divergence`, `anneal_extCall_boundary`,
+  `w6_rotate_left_extCall_boundary`, `w6_write_bytes_extCall_boundary`,
+  `w6_write_bytes_oob_extCall_divergence`,
+  `w6_write_bytes_read_extCall_divergence`).
 -/
 
 namespace LeanMiriSpec.Audit
@@ -20670,6 +20701,4508 @@ example :
   Witness.wit_lm3_1_d12_page_wrap_eq_divergence_real_steps
 
 end Ep3Pins
+
+/-! ### `LM-4.1`: Multi-Frame Call Stack, Terminators & `CallId` Protectors -/
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  ActiveProtectorsValid
+  ActiveProtectorsValid.nil
+  ActiveProtectorsValid.mono_protectors
+  ActiveProtectorsValid.cons_of_ne_disabled
+  ActiveProtectorsValid.push_fresh_callId
+  annealAssociatedAccess
+  protectorEndAccessKind
+  borrowTree_protectorEndAccess_simulation
+  borrowTree_releaseProtector_full_simulation
+  cexProtectedReservedFrzEntry
+  cexForeignUniqueSiblingEntry
+  cexForeignUniqueBorrows
+  cex_end_of_call_foreign_unique_frozen_divergence
+  callerRestoredProtectors
+  callerRestoredProtectors_cons_eq_restoreCallerProtectors
+  releaseCallProtectors
+  releaseCallProtectors_one_cons
+  releaseCallProtectors_full_clear
+  ActiveProtectorsValid.of_releaseCallProtectors
+  unwindFromCallStack_running_releaseCallProtectors
+  basedNormalTree_releaseProtector_chain3_and_branch3_simulation
+  protectedTagsContainsNat
+  poppedCalleeFrameState
+  annealPoppedFrameState
+  popFrameBorrowTracker
+  popFrameBorrowTrackerAtDepth
+  BorrowTrackerStackRel
+  BorrowTrackerStackRel.of_none
+  BorrowTrackerStackRel.of_borrows_nil
+  BorrowTrackerStackRel.of_popFrame
+  BorrowTrackerStackRel.current_spec
+  BorrowTrackerStackRel.of_pushFrame
+  BorrowTrackerStackRel.of_releaseCallProtectors
+  TreeBorrowsStateRel
+  activeMirBody
+  annealFrameStackBottomUp
+  annealFrameStackTopDown
+  FrameStackRel
+  frameStackRel_iff_bottomUp
+  CallerDestinationRel
+  RootIndirectRetWf
+  RootIndirectRetWf.of_immediate
+  CalleeIndirectRetWf
+  CallerStackLinksRel
+  CallerStackLinksRel.toForall2
+  CallerStackLinksRel.toFrameStackRel
+  MultiFrameAllocDisjoint
+  MultiFrameStateRel
+  CallStackStateRel
+  StateRel.toTreeBorrowsStateRel
+  TreeBorrowsStateRel.toStateRel_of_empty
+  TreeBorrowsStateRel.toMultiFrameStateRel
+  MultiFrameStateRel.toTreeBorrowsStateRel_of_depth1
+  TreeBorrowsStateRel.iff_multiFrameStateRel_depth1
+  StateRel.iff_multiFrameStateRel_depth1
+  stateRelLM3_2Tree_to_treeBorrowsRel_and_activeProtectorsValid
+  deallocFrameLocalsList
+  deallocFrameLocals
+  annealStackLifecycleHooksLM4_1
+  AllSlotsAllocLive
+  SlotsAllocDisjoint
+  cleanupStackFrame_root_stop
+  cleanupStackFrame_callee_goto
+  cleanupStackFrame_callee_goto_any_unwinding
+  FrameRel.allSlotsAllocLive
+  MemoryAllocDisjoint.slotsAllocDisjoint
+  FrameRel.of_deallocFrameLocals
+  annealReturnOperandLM4_1
+  annealPopFrameLM4_1
+  annealCopyReturnLM4_1
+  annealControlHooksLM4_1
+  annealEvalDropLM4_1
+  annealEvalCallArgsLM4_1
+  initCalleeArgLocals
+  resolveCallerDestinationPlace
+  annealPushCalleeFrameLM4_1
+  annealEvalCallLM4_1
+  annealTerminatorHooksLM4_1
+  annealStepHooksLM4_1
+  StepRelMultiFrame
+  StepRelMultiFrame.step_iff
+  StepRelMultiFrame.retNormal_iff
+  StepRelMultiFrame.retNormal_rel
+  StepRelMultiFrame.ub_iff
+  stepMirFn_activeMirBody_eq
+  miri_step_at_terminator_multiFrame
+  MultiFrameAllocDisjoint.replace_top
+  CallerStackLinksRel.update_top_frame
+  step_terminator_unreachable_ub_simulation
+  step_terminator_drop_noop_simulation
+  canonical_drop_no_glue_preserves_local_divergence
+  step_terminator_drop_projected_simulation
+  step_terminator_drop_projected_uninit_divergence
+  step_terminator_drop_canonical_no_glue_step_divergence
+  annealControlHooks_returnOperand_cleanup_live_back
+  step_terminator_return_root_simulation
+  MultiFrameAllocDisjoint.pop_top
+  MultiFrameAllocDisjoint.disjoint_with_popped_top
+  CallerDestinationRel.of_deallocFrameLocals
+  CallerStackLinksRel.of_deallocFrameLocals
+  returnFromCurrentFrame_lm4_1_callee_div_ub
+  returnFromCurrentFrame_of_unwind_error_back
+  returnFromCurrentFrame_lm4_1_unwind_cleanup_ok
+  returnFromCurrentFrame_lm4_1_unwind_unreachable_ub
+  step_terminator_return_callee_simulation
+  step_terminator_return_callee_immediate_simulation
+  step_terminator_unwindResume_callee_simulation
+  returnFromCurrentFrame_unwind_root_ub
+  step_terminator_unwindResume_root_panic_vs_ub_divergence
+  lookupCallee_nil_eq_of_findCallee_some
+  lookupCallee_nil_eq_none_of_findCallee_none
+  step_terminator_call_unreachable_unchecked_ub_simulation
+  WellTypedCallArgOperand
+  WellTypedCallArgs
+  CalleeArgsRel
+  evalCallArgOperand_simulation
+  evalCallArgs_simulation
+  CallerDestSlotWf
+  CallerDestSlotWf.of_immediate
+  nounwind_cont_eq
+  step_terminator_call_simulation
+  step_terminator_call_diverging_simulation
+  WitnessLM4_1.witCalleeReadyToReturn_borrowTrackerRel
+  WitnessLM4_1.witCalleeReadyToReturn_rel
+  WitnessLM4_1.wit_lm4_1_callee_return_simulation
+  WitnessLM4_1.witCallerAtCall_rel
+  WitnessLM4_1.wit_lm4_1_call_push_simulation
+  WitnessLM4_1.wit_lm4_1_root_return_simulation
+  WitnessLM4_1.wit_lm4_1_return_callee_uninit_ub
+  WitnessLM4_1.wit_lm4_1_drop_live_and_dead_ub
+  WitnessLM4_1.wit_lm4_1_unreachable_ub
+  WitnessLM4_1.wit_lm4_1_call_unreachable_unchecked_ub
+  WitnessLM4_1.wit_lm4_1_releaseProtector_conflicted_reservedFrz_ok_vs_disabled_ub
+  WitnessLM4_1.wit_lm4_1_zst_unit_return_simulation
+  WitnessLM4_1.wit_lm4_1_indirect_dest_call_and_return_simulation
+  WitnessLM4_1.wit_lm4_1_call_with_copy_and_move_args_simulation
+  WitnessLM4_1.wit_lm4_1_unscoped_borrow_cross_frame_divergence
+  WitnessLM4_1.wit_lm4_1_return_from_diverging_callee_ub
+  WitnessLM4_1.witDivCalleeBody
+  WitnessLM4_1.witDivCallerBody
+  WitnessLM4_1.witDivCall_rel
+  WitnessLM4_1.wit_lm4_1_diverging_call_push_simulation
+  WitnessLM4_1.miriNextLM4_1
+  WitnessLM4_1.miriStepUBMsgLM4_1
+  WitnessLM4_1.miriTopIsDivergingWithInitRet
+  WitnessLM4_1.wit_lm4_1_diverging_call_then_return_ub
+  WitnessLM4_1.witCexCalleeReturnAnneal
+  WitnessLM4_1.wit_lm4_1_end_of_call_foreign_unique_frozen_step_divergence
+  WitnessLM4_1.u8PairLayout
+  WitnessLM4_1.witProjDropBody
+  WitnessLM4_1.wit_lm4_1_drop_projected_and_canonical_divergence
+  WitnessLM4_1.witUnwindCalleeBody
+  WitnessLM4_1.wit_lm4_1_unwindResume_cleanup_and_unreachable_ub_simulation
+  SimLM3_3.storageDeadBody
+  SimLM3_3.storageLiveBody
+  SimLM3_3.sim_lm3_3_storage_dead_and_live_protector_step
+  SimLM3_3.sim_lm3_3_storage_dead_protected_cell_divergence
+  WitnessLM3_3.bodyOProtectedStorageDead
+  WitnessLM3_3.bodyOUnprotectedStorageDead
+  WitnessLM3_3.initO
+  WitnessLM3_3.wit_lm3_3_storageDead_protected_ub_vs_unprotected_disable_real_steps
+  UnwindingStateRel
+  annealStepHooksForState
+  MiriUnwindSteps
+  annealFnPtrAbiCompatible
+  annealCalleeAbiCompatible
+  annealEvalNonConstCallLM4_1
+  UnwindChainWf
+  step_unwinding_state_single_frame
+  unwindFromCallStack_miri_multiStep_simulation
+  step_terminator_unwindResume_multiFrame_simulation
+  step_terminator_unwindTerminate_abort_vs_unsupported
+  step_terminator_assert_local_simulation
+  step_terminator_call_diverging_panic_vs_unlinked
+  step_terminator_call_fnDef_local_simulation
+  step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
+  IndirectFnPtrMovePre
+  step_terminator_call_indirect_fnPtr_move_simulation
+  step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
+  WitnessLM4_1.wit_lm4_1_unwindResume_root_panic_vs_ub_divergence
+  WitnessLM4_1.wit_lm4_1_multiFrame_continue_unwind_and_assert_terminate
+  WitnessLM4_1.wit_lm4_1_nonConst_fnDef_and_indirect_fnPtr_call_and_safety_divergence
+  WitnessLM4_1.witNoUnwCalleeBody
+  WitnessLM4_1.witNoUnwCallerBody
+  WitnessLM4_1.miriTopCont
+  WitnessLM4_1.wit_lm4_1_nounwind_callee_unwind_divergence
+  annealIntAbiOfRigidTy
+  isTrivial1ZstRigidTy
+  isTrivial1ZstRigidTy.isTrivial1ZstRigidTyList
+  isThinRawPtrRigidTy
+  isThinPtrRigidTy
+  annealWidePtrMetadata
+  annealRigidTyLayoutCompat
+  annealRigidTyListLayoutCompat
+  annealRigidTyLayoutCompat_of_rigidTyEq
+  annealRigidTyListLayoutCompat_of_rigidTyListEq
+  annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq
+  annealRigidTyLayoutCompat_canonical_cases
+  annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite
+  annealFnPtrRegistry
+  annealFnPtrRegistry_singleton_find_eq
+  annealFnPtrRegistry_find_eq
+  annealReifyFnPointerAlloc
+  annealCastHooksLM4_1
+  annealRvalueHooksLM4_1
+  annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast
+  annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer
+  annealControlHooksWithDirectUnwind
+  annealTerminatorHooksWithDirectUnwind
+  annealStepHooksWithDirectUnwind
+  step_terminator_call_indirect_layoutCompat_fnPtr_divergence
+  step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
+  step_terminator_call_linked_panic_unwind_simulation
+  step_terminator_unwindTerminate_termination_abort_simulation
+  step_terminator_assert_failed_directUnwind_simulation
+  WitnessLM4_1.witFnEntryU64
+  WitnessLM4_1.witU64CalleeBody
+  WitnessLM4_1.witUsizeIndirectCallerBody
+  WitnessLM4_1.witUsizeIndirectFnPtr_pre
+  WitnessLM4_1.witReifyCallerBody
+  WitnessLM4_1.witReifyCallerAnneal0
+  WitnessLM4_1.witReifyCallerMiriFrame0
+  WitnessLM4_1.witReifyAllocId
+  WitnessLM4_1.witReifyFnPtrVal
+  WitnessLM4_1.witReifyFnEntry
+  WitnessLM4_1.witReifyMachine
+  WitnessLM4_1.witReifyCallerMiri0
+  WitnessLM4_1.witReifyCaller0_rel
+  WitnessLM4_1.witLinkedPanicBody
+  WitnessLM4_1.witLinkedPanicCall_rel
+  WitnessLM4_1.wit_lm4_1_reifyFnPointer_chain_layoutCompat_and_directUnwind
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hcal : s.memory.activeCallee = none)
+    (hst : s.memory.callStack = .nil)
+    (hbor : s.memory.borrows = .nil)
+    (hprot : s.memory.activeProtectors = .nil)
+    (hcaller : s.memory.callerLocals = .nil)
+    (hcid_pos : 0 < s.memory.nextProtector) :
+    StateRel body s m ↔ MultiFrameStateRel body s m :=
+  StateRel.iff_multiFrameStateRel_depth1 hcal hst hbor hprot hcaller hcid_pos
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hst : s.memory.callStack = .nil)
+    (hcaller : s.memory.callerLocals = .nil)
+    (hcid_pos : 0 < s.memory.nextProtector)
+    (hcid_act : ∀ cid ∈ s.memory.activeProtectors, cid < s.memory.nextProtector)
+    (hcid_bor : ∀ e ∈ s.memory.borrows, ∀ cid, e.protector = some cid → cid < s.memory.nextProtector) :
+    TreeBorrowsStateRel body s m ↔ MultiFrameStateRel body s m :=
+  TreeBorrowsStateRel.iff_multiFrameStateRel_depth1 hst hcaller hcid_pos hcid_act hcid_bor
+
+example
+    (perm : TreeBorrowPerm) :
+    let tree := hooksTwoNodeTree perm
+    let res := tree.releaseProtector retagChildTag (hooksForChildProtected true).protectedTags
+    (res.status = .Released ↔ perm ≠ .disabled) ∧
+    (perm ≠ .disabled → res.tree = tree) ∧
+    (perm = .disabled →
+      res.status =
+        .AccessFailure ⟨0, 8⟩
+          (.AccessFailure ⟨0, 8⟩ (.TransitionError 1 (.ChildAccessForbidden .Disabled)))) ∧
+    ((hooksTwoNodeTree perm).releaseProtector ⟨99, by decide⟩
+        (hooksForChildProtected true).protectedTags).status =
+      .MissingTag ⟨99, by decide⟩ :=
+  borrowTree_releaseProtector_full_simulation perm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .unreachable) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_unreachable_ub_simulation hstate hphase hbb hstmt_none hstmt_len hterm fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_drop_noop_simulation hstate hphase hbb hstmt_none hstmt_len hterm hdecl himm fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : MirAst.LocalDecl}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hterm : bb.terminator.kind = .return_)
+    (hdecl0 : get? rootBody.localDecls 0 = some decl0)
+    (hzst_init :
+      (translateTy decl0.ty rootBody.layouts).layout.size = Miri.ABI.Size.ZERO →
+        get? s.frame.locals 0 ≠ some .uninit)
+    (hret0 : ∀ tf, m.stack.frames.back? = some tf →
+      RootIndirectRetWf m.machine rootBody s.frame tf) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_return_root_simulation
+    hstate hstack hphase hbb hstmt_none hstmt_len hcleanup hterm hdecl0 hzst_init hret0 fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = cf :: restStack)
+    (hva : ∀ tf, m.stack.frames.back? = some tf → tf.vaList = #[])
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hterm : bb.terminator.kind = .return_)
+    (hdecl0 : get? (activeMirBody rootBody s).localDecls 0 = some decl0)
+    (hzst_init :
+      (translateTy decl0.ty (activeMirBody rootBody s).layouts).layout.size = Miri.ABI.Size.ZERO →
+        get? s.frame.locals 0 ≠ some .uninit)
+    (hty_compat : ∀ destIdx destDecl,
+      cf.destination = ⟨destIdx, .nil⟩ →
+      get? cf.callerBody.localDecls destIdx = some destDecl →
+      ∀ v imm,
+        ImmediateRel decl0.ty (activeMirBody rootBody s).layouts v imm →
+        ImmediateRel destDecl.ty cf.callerBody.layouts v imm) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_return_callee_simulation
+    hstate hstack hva hphase hbb hstmt_none hstmt_len hcleanup hterm hdecl0 hzst_init hty_compat fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {argOps : List MirAst.Operand}
+    {destination : Place} {unwind : MirAst.UnwindAction}
+    {defPath : DefPath}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func argOps destination .none unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hunreach : isUnreachableCallTarget defPath = true)
+    (hargs : argOps = .nil)
+    (hcallee_none :
+      lookupCallee s.memory.callees (activeMirBody rootBody s).layouts
+        defPath (extractCalleeTypeArgs func) s.memory.traitImpls = none)
+    (hfind_none : findCallee? s.memory.callees defPath = none) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_call_unreachable_unchecked_ub_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hunreach hargs hcallee_none hfind_none fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {argOps : List MirAst.Operand}
+    {destIdx : Local} {destDecl : MirAst.LocalDecl}
+    {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {defPath : DefPath} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl}
+    {calleeBb0 : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func argOps ⟨destIdx, .nil⟩ (some targetBb) unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hcallee : findCallee? s.memory.callees defPath = some calleeBody)
+    (htypeArgs : extractCalleeTypeArgs func = .nil)
+    (htparam : calleeBody.typeParamCount = 0)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
+      CallerDestSlotWf m.machine tf destIdx destDecl)
+    (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
+    (hwt_args : ∀ tf, m.stack.frames.back? = some tf →
+      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls)
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_call_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
+    hcallee_decls hcallee_bb0 hdest_wf hdest_live hwt_args hcallee_unwind fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {argOps : List MirAst.Operand}
+    {destIdx : Local} {destDecl : MirAst.LocalDecl}
+    {unwind : MirAst.UnwindAction}
+    {defPath : DefPath} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl}
+    {calleeBb0 : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func argOps ⟨destIdx, .nil⟩ none unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hcallee : findCallee? s.memory.callees defPath = some calleeBody)
+    (htypeArgs : extractCalleeTypeArgs func = .nil)
+    (htparam : calleeBody.typeParamCount = 0)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
+      CallerDestSlotWf m.machine tf destIdx destDecl)
+    (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
+    (hwt_args : ∀ tf, m.stack.frames.back? = some tf →
+      WellTypedCallArgs (activeMirBody rootBody s) calleeBody tf argOps restDecls)
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_call_diverging_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam hdest_decl
+    hcallee_decls hcallee_bb0 hdest_wf hdest_live hwt_args hcallee_unwind fnPtrs
+
+example (cf : SavedCallerFrame) (cs : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors 1 (cf :: cs) activeProtectors = restoreCallerProtectors cf :=
+  releaseCallProtectors_one_cons cf cs activeProtectors
+
+example (callStack : List SavedCallerFrame) (activeProtectors : List Nat) :
+    releaseCallProtectors (callStack.length + 1) callStack activeProtectors = [] :=
+  releaseCallProtectors_full_clear callStack activeProtectors
+
+example
+    {borrows : List BorrowEntry}
+    (k : Nat) (callStack : List SavedCallerFrame) (activeProtectors : List Nat)
+    (hcur : ActiveProtectorsValid borrows activeProtectors)
+    (hstack : ∀ cf ∈ callStack, ActiveProtectorsValid borrows (restoreCallerProtectors cf)) :
+    ActiveProtectorsValid borrows (releaseCallProtectors k callStack activeProtectors) :=
+  ActiveProtectorsValid.of_releaseCallProtectors k callStack activeProtectors hcur hstack
+
+example
+    {borrows : List BorrowEntry}
+    (k : Nat) {activeProtectors : List Nat}
+    {callStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (h : BorrowTrackerStackRel borrows activeProtectors callStack bt)
+    (hk : k ≤ callStack.length) :
+    BorrowTrackerStackRel borrows
+      (releaseCallProtectors k callStack activeProtectors)
+      (callStack.drop k)
+      (popFrameBorrowTrackerAtDepth k borrows activeProtectors callStack bt) :=
+  BorrowTrackerStackRel.of_releaseCallProtectors k h hk
+
+example (perm : TreeBorrowPerm) :
+    let chain3 : List BorrowEntry :=
+      [{ tag := 3, targetLocal := 1, targetProjection := [], perm := perm,
+         protector := some 1, parentTag := some 2 },
+       { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let branch3 : List BorrowEntry :=
+      [{ tag := 2, targetLocal := 1, targetProjection := [], perm := .reservedFrz false,
+         protector := some 1, parentTag := some 1 },
+       { tag := 3, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := some 1 },
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+         protector := none, parentTag := none }]
+    let nresChain :=
+      (basedNormalTree chain3 [1]).performAccess 0 (protectorEndAccessKind perm) .SkipChildrenOfAccessed
+    let nresBranch :=
+      (basedNormalTree branch3 [1]).performAccess 0 .Read .SkipChildrenOfAccessed
+    TreeBorrowsRel chain3 [] (basedNormalTree chain3 []) ∧
+    (perm ≠ .cell →
+      (nresChain.status = .Completed ↔ perm ≠ .disabled) ∧
+      (perm ≠ .disabled →
+        normalTreePerms nresChain.tree 3 = [some perm, some .unique, some .unique])) ∧
+    nresBranch.status = .Completed ∧
+    normalTreePerms nresBranch.tree 3 =
+      [some (.reservedFrz false), some .frozen, some .unique] :=
+  basedNormalTree_releaseProtector_chain3_and_branch3_simulation perm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
+    {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .field fieldIdx fieldTy :: .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (hroot :
+      get? s.frame.locals localId = some .dead ∨
+        ∃ sc₁ sc₂,
+          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_drop_projected_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
+    {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {decl : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .drop ⟨localId, .field fieldIdx fieldTy :: .nil⟩ target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
+    (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
+    (huninit : get? s.frame.locals localId = some .uninit) :
+    stepMirFn rootBody s = .fail .ub ∧
+    ∃ m' tf',
+      Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m =
+        (m', .ok true) ∧
+      m'.stack.frames.back? = some tf' ∧
+      tf'.location = .mir ⟨target, 0⟩ ∧
+      ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ :=
+  step_terminator_drop_projected_uninit_divergence
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm huninit fnPtrs
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = .nil)
+    (hphase : ∀ p, rootBody.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? rootBody.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .panic ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs)
+      () m).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") :=
+  step_terminator_unwindResume_root_panic_vs_ub_divergence
+    hstate hstack hphase hbb hstmt_none hstmt_len hcleanup hterm fnPtrs
+
+example (callStack : List SavedCallerFrame) (mem : Memory) (s' : MachineState)
+    (h : unwindFromCallStack callStack mem = .running s') :
+    ∃ k, 1 ≤ k ∧ k ≤ callStack.length ∧
+      s'.memory.activeProtectors = releaseCallProtectors k callStack mem.activeProtectors ∧
+      s'.memory.callStack = callStack.drop k :=
+  unwindFromCallStack_running_releaseCallProtectors callStack mem s' h
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {fnPtrs : List FnPtrEntry}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = cf :: restStack)
+    (hva : ∀ tf, m.stack.frames.back? = some tf → tf.vaList = #[])
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume)
+    (hdecl0 : get? (activeMirBody rootBody s).localDecls 0 = some decl0)
+    (hlive0 : get? s.frame.locals 0 ≠ some .dead)
+    (hunwind :
+      cf.returnUnwind = .unreachable ∨
+        ∃ cleanupBb, cf.returnUnwind = .cleanup cleanupBb) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
+  step_terminator_unwindResume_callee_simulation
+    hstate hstack hva hphase hbb hstmt_none hstmt_len hcleanup hterm hdecl0 hlive0 hunwind fnPtrs
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (perm : TreeBorrowPerm) :
+    stepMirFn storageDeadBody (childState perm true) = .fail .ub ∧
+    stepMirFn storageLiveBody (childState perm true) = .fail .ub ∧
+    (perm ≠ .cell →
+      ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+        (hooksForChildProtected true).protectedTags).status ≠ .Deallocated) ∧
+    (∃ s_dead s_live : MachineState,
+      stepMirFn storageDeadBody (childState perm false) = .step s_dead ∧
+      get? s_dead.frame.locals 1 = some .dead ∧
+      s_dead.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
+      stepMirFn storageLiveBody (childState perm false) = .step s_live ∧
+      get? s_live.frame.locals 1 = some .uninit ∧
+      s_live.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s_live.memory.borrows [] (basedNormalTree s_live.memory.borrows [])) ∧
+    ((hooksTwoNodeTree perm).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected false).protectedTags).status = .Deallocated :=
+  sim_lm3_3_storage_dead_and_live_protector_step perm
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example :
+    stepMirFn storageDeadBody (childState .cell true) = .fail .ub ∧
+    stepMirFn storageLiveBody (childState .cell true) = .fail .ub ∧
+    ((hooksTwoNodeTree .cell).deallocateBorrowRange (.concrete (hooksAccessTag .foreignAccess))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected true).protectedTags).status = .Deallocated :=
+  sim_lm3_3_storage_dead_protected_cell_divergence
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ : MachineState,
+      stepMirFn bodyOProtectedStorageDead initO = .step s₁ ∧
+      stepMirFn bodyOProtectedStorageDead s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 (.reservedFrz false)] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn bodyOProtectedStorageDead s₂ = .fail .ub ∧
+      (∃ err,
+        ((hooksTwoNodeTree (.reservedFrz false)).deallocateBorrowRange
+          (.concrete (hooksAccessTag .foreignAccess))
+          Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+          (hooksForChildProtected true).protectedTags).status =
+            .AccessFailure err)) ∧
+    (∃ s₁ s₂ s₃ : MachineState,
+      stepMirFn bodyOUnprotectedStorageDead initO = .step s₁ ∧
+      stepMirFn bodyOUnprotectedStorageDead s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 1 .unique] ∧
+      stepMirFn bodyOUnprotectedStorageDead s₂ = .step s₃ ∧
+      get? s₃.frame.locals 1 = some .dead ∧
+      s₃.memory.borrows = [entry 1 .disabled] ∧
+      TreeBorrowsRel s₃.memory.borrows [] (basedNormalTree s₃.memory.borrows []) ∧
+      stepMirFn bodyOUnprotectedStorageDead s₃ = .fail .ub ∧
+      ((basedNormalTree s₃.memory.borrows []).performAccess 0 .Read
+        .VisitChildrenOfAccessed).status =
+          .TransitionError 0 (.ChildAccessForbidden .Disabled)) :=
+  wit_lm3_3_storageDead_protected_ub_vs_unprotected_disable_real_steps
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    StepRelMultiFrame witCallerBody witDivergingCalleeReturnMiri
+      (stepMirFn witCallerBody witDivergingCalleeReturnAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1
+          (activeMirBody witCallerBody witDivergingCalleeReturnAnneal)
+          witDivergingCalleeReturnAnneal.memory.callees
+          (annealPoppedFrameState witDivergingCalleeReturnAnneal))
+        () witDivergingCalleeReturnMiri) ∧
+    stepMirFn witCallerBody witDivergingCalleeReturnAnneal = .fail .ub ∧
+    ∃ msg,
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1
+          (activeMirBody witCallerBody witDivergingCalleeReturnAnneal)
+          witDivergingCalleeReturnAnneal.memory.callees
+          (annealPoppedFrameState witDivergingCalleeReturnAnneal))
+        () witDivergingCalleeReturnMiri).2 = .error (.undefinedBehavior msg) :=
+  wit_lm4_1_return_from_diverging_callee_ub
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    StepRelMultiFrame witDivCallerBody witDivCallMiri
+      (stepMirFn witDivCallerBody witDivCallAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM4_1
+          (activeMirBody witDivCallerBody witDivCallAnneal)
+          witDivCallAnneal.memory.callees
+          (annealPoppedFrameState witDivCallAnneal))
+        () witDivCallMiri) ∧
+    ∃ s₁,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      s₁.memory.activeCallee = some witDivCalleeBody ∧
+      s₁.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      s₁.memory.callStack.map SavedCallerFrame.returnUnwind = [.continue_] ∧
+      get? s₁.frame.locals 0 = some .uninit :=
+  wit_lm4_1_diverging_call_push_simulation
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    ∃ s₁ s₂ : MachineState,
+      stepMirFn witDivCallerBody witDivCallAnneal = .step s₁ ∧
+      stepMirFn witDivCallerBody s₁ = .step s₂ ∧
+      s₂.memory.callStack.map SavedCallerFrame.isDiverging = [true] ∧
+      get? s₂.frame.locals 0 = some (.init (.scalar sc1)) ∧
+      stepMirFn witDivCallerBody s₂ = .fail .ub ∧
+      ((miriNextLM4_1 witDivCallerBody witDivCallAnneal witDivCallMiri).bind
+          (miriNextLM4_1 witDivCallerBody s₁)).map
+        (fun m₂ => (miriTopIsDivergingWithInitRet m₂, miriStepUBMsgLM4_1 witDivCallerBody s₂ m₂)) =
+        some (true, some "Unreachable") :=
+  wit_lm4_1_diverging_call_then_return_ub
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hunw : UnwindingStateRel rootBody s m)
+    (hwf : UnwindChainWf rootBody s m) :
+    (∀ s', unwindFromCallStack s.memory.callStack s.memory = .running s' →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        s'.memory.activeProtectors =
+          releaseCallProtectors k s.memory.callStack s.memory.activeProtectors ∧
+        MiriUnwindSteps rootBody k s m (m', .ok true) ∧
+        MultiFrameStateRel rootBody s' m') ∧
+    (unwindFromCallStack s.memory.callStack s.memory = .faulted .ub →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        MiriUnwindSteps rootBody k s m
+          (m', .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) ∧
+    (unwindFromCallStack s.memory.callStack s.memory = .halted .panic →
+      ∃ m',
+        MiriUnwindSteps rootBody (s.memory.callStack.length + 1) s m
+          (m', .error (.undefinedBehavior "unwinding past the topmost stack frame"))) ∧
+    (unwindFromCallStack s.memory.callStack s.memory = .halted .abort →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        MiriUnwindSteps rootBody k s m (m', .error (.unsupported "unwindTerminate"))) :=
+  unwindFromCallStack_miri_multiStep_simulation hunw hwf
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hwf : UnwindChainWf rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = true)
+    (hterm : bb.terminator.kind = .unwindResume) :
+    (∀ s', stepMirFn rootBody s = .step s' →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        s'.memory.activeProtectors =
+          releaseCallProtectors k s.memory.callStack s.memory.activeProtectors ∧
+        MiriUnwindSteps rootBody k s m (m', .ok true) ∧
+        MultiFrameStateRel rootBody s' m') ∧
+    (stepMirFn rootBody s = .fail .ub →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        MiriUnwindSteps rootBody k s m
+          (m', .error (.undefinedBehavior "unwinding past a frame that does not allow unwinding"))) ∧
+    (stepMirFn rootBody s = .retOutcome .panic →
+      ∃ m',
+        MiriUnwindSteps rootBody (s.memory.callStack.length + 1) s m
+          (m', .error (.undefinedBehavior "unwinding past the topmost stack frame"))) ∧
+    (stepMirFn rootBody s = .retOutcome .abort →
+      ∃ k m', 1 ≤ k ∧ k ≤ s.memory.callStack.length ∧
+        MiriUnwindSteps rootBody k s m (m', .error (.unsupported "unwindTerminate"))) :=
+  step_terminator_unwindResume_multiFrame_simulation
+    hstate hwf hphase hbb hstmt_none hstmt_len hcleanup hterm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .unwindTerminate) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .abort ∧
+    Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m =
+      (m, .error (.unsupported "unwindTerminate")) :=
+  step_terminator_unwindTerminate_abort_vs_unsupported hstate hphase hbb hstmt_none hstmt_len hterm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {condIdx : MirAst.Local} {condDecl : MirAst.LocalDecl}
+    {expected : Bool} {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .assert (.copy ⟨condIdx, .nil⟩) expected target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls condIdx = some condDecl)
+    (hbool_ty : condDecl.ty.kind = .bool)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf condIdx) :
+    ((get? s.frame.locals condIdx = some .dead ∨ get? s.frame.locals condIdx = some .uninit) →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ sc, get? s.frame.locals condIdx = some (.init (.scalar sc)) →
+      decide (sc.bits ≠ 0) = expected →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ sc, get? s.frame.locals condIdx = some (.init (.scalar sc)) →
+      decide (sc.bits ≠ 0) ≠ expected →
+      stepMirFn rootBody s =
+        (match applyUnwindAction s s.frame.locals s.memory unwind with
+         | .running nextState => .step nextState
+         | .halted out => .retOutcome out
+         | .faulted fk => .fail fk) ∧
+      (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m).2 =
+        .error (.unsupported "assert panic without linked panic lang item")) :=
+  step_terminator_assert_local_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hbool_ty himm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {destination : MirAst.Place} {unwind : MirAst.UnwindAction}
+    {defPath : DefPath}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func .nil destination .none unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hnot_unreach : isUnreachableCallTarget defPath = false)
+    (hcallee_none :
+      lookupCallee s.memory.callees (activeMirBody rootBody s).layouts
+        defPath (extractCalleeTypeArgs func) s.memory.traitImpls = none)
+    (hfind_none : findCallee? s.memory.callees defPath = none) :
+    (isAbortingPanicDefPath defPath = true →
+      stepMirFn rootBody s = MirStepNode.retOutcome .abort) ∧
+    (isAbortingPanicDefPath defPath = false →
+      isUnwindingPanicDefPath defPath = true →
+      stepMirFn rootBody s =
+        match applyUnwindAction s s.frame.locals s.memory unwind with
+        | .running nextState => .step nextState
+        | .halted out => .retOutcome out
+        | .faulted fk => .fail fk) ∧
+    (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m).2 =
+      .error (.unsupported "diverging call to unlinked non-unreachable callee") :=
+  step_terminator_call_diverging_panic_vs_unlinked
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hnot_unreach hcallee_none hfind_none
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {fnIdx destIdx : MirAst.Local} {fnDecl destDecl : MirAst.LocalDecl}
+    {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {defPath : DefPath} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl}
+    {calleeBb0 : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call (.copy ⟨fnIdx, .nil⟩) .nil ⟨destIdx, .nil⟩ (some targetBb) unwind)
+    (hfn_decl : get? (activeMirBody rootBody s).localDecls fnIdx = some fnDecl)
+    (hfn_ty : fnDecl.ty.kind = .fnDef defPath .nil)
+    (hfn_imm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf fnIdx)
+    (hcallee : findCallee? s.memory.callees defPath = some calleeBody)
+    (htparam : calleeBody.typeParamCount = 0)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
+      CallerDestSlotWf m.machine tf destIdx destDecl)
+    (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
+    (hfn_slot : get? s.frame.locals fnIdx = some .dead ∨
+      get? s.frame.locals fnIdx = some (.init .unit))
+    (hcallee_unwind : calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) :=
+  step_terminator_call_fnDef_local_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfn_decl hfn_ty hfn_imm
+    hcallee htparam hdest_decl hcallee_decls hcallee_bb0 hdest_wf hdest_live hfn_slot
+    hcallee_unwind
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {fnIdx : MirAst.Local} {fnDecl : MirAst.LocalDecl}
+    {callerInputs : List RigidTy} {callerOut : RigidTy}
+    {callerSafety : Safety} {callerAbi : Layout.CallConv}
+    {destination : MirAst.Place} {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call (.copy ⟨fnIdx, .nil⟩) .nil destination (some targetBb) unwind)
+    (hfn_decl : get? (activeMirBody rootBody s).localDecls fnIdx = some fnDecl)
+    (hfn_ty : fnDecl.ty.kind = .fnPtr callerInputs callerOut callerSafety callerAbi)
+    (hfn_imm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf fnIdx) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) :=
+  step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfn_decl hfn_ty hfn_imm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)}
+    {fnIdx destIdx : MirAst.Local} {fnDecl destDecl : MirAst.LocalDecl}
+    {ptrVal : ProvenancePtr} {mAllocId : Miri.Memory.AllocId}
+    {mTag : Miri.Memory.BorTag} {baseAddr : UInt64}
+    {callerInputs : List RigidTy} {callerOut : RigidTy}
+    {callerSafety : Safety} {callerAbi : Layout.CallConv}
+    {bb : BasicBlockData} {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    (hpre : IndirectFnPtrMovePre rootBody s m topFrame restMfs fnIdx fnDecl ptrVal mAllocId mTag baseAddr)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call (.move ⟨fnIdx, .nil⟩) .nil ⟨destIdx, .nil⟩ (some targetBb) unwind)
+    (hfn_ty : fnDecl.ty.kind = .fnPtr callerInputs callerOut callerSafety callerAbi)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl) :
+    (ptrVal.offsetBytes ≠ 0 →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (ptrVal.offsetBytes = 0 →
+      lookupFnPtr s.memory.fnPtrs ptrVal.allocId = none →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ fnEntry,
+      ptrVal.offsetBytes = 0 →
+      lookupFnPtr s.memory.fnPtrs ptrVal.allocId = some fnEntry →
+      fnEntry.typeArgs = [] →
+      annealFnPtrAbiCompatible fnEntry callerInputs callerOut callerAbi 0 = false →
+      fnEntryCompatibleWithCallSite fnEntry 0 (some fnDecl.ty) = false →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) ∧
+    (∀ fnEntry calleeBody retDecl restDecls calleeBb0,
+      ptrVal.offsetBytes = 0 →
+      lookupFnPtr s.memory.fnPtrs ptrVal.allocId = some fnEntry →
+      fnEntry.typeArgs = [] →
+      fnEntryCompatibleWithCallSite fnEntry 0 (some fnDecl.ty) = true →
+      annealFnPtrAbiCompatible fnEntry callerInputs callerOut callerAbi 0 = true →
+      findCallee? s.memory.callees fnEntry.defPath = some calleeBody →
+      calleeBody.typeParamCount = 0 →
+      calleeBody.localDecls = retDecl :: restDecls →
+      get? calleeBody.basicBlocks 0 = some calleeBb0 →
+      annealCalleeAbiCompatible fnEntry calleeBody 0 = true →
+      (∀ tf, tf = deinitFrameLocal
+        (cacheFrameLocalLayout topFrame fnIdx hpre.fn_lt_mf
+          (translateTy fnDecl.ty (activeMirBody rootBody s).layouts))
+        fnIdx (by rw [cacheFrameLocalLayout_size]; exact hpre.fn_lt_mf) →
+        CallerDestSlotWf m.machine tf destIdx destDecl ∧
+        IsLiveFrameLocal tf destIdx) →
+      (calleeBody.fnAbi.canUnwind = true ∨ unwind = .unreachable) →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m)) :=
+  step_terminator_call_indirect_fnPtr_move_simulation
+    hpre hphase hbb hstmt_none hstmt_len hterm hfn_ty hdest_decl
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)}
+    {fnIdx destIdx : MirAst.Local} {fnDecl destDecl : MirAst.LocalDecl}
+    {ptrVal : ProvenancePtr} {mAllocId : Miri.Memory.AllocId}
+    {mTag : Miri.Memory.BorTag} {baseAddr : UInt64}
+    {callerOut : RigidTy} {callerAbi : Layout.CallConv}
+    {bb : BasicBlockData} {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {fnEntry : FnPtrEntry} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl} {calleeBb0 : BasicBlockData}
+    (hpre : IndirectFnPtrMovePre rootBody s m topFrame restMfs fnIdx fnDecl ptrVal mAllocId mTag baseAddr)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call (.move ⟨fnIdx, .nil⟩) .nil ⟨destIdx, .nil⟩ (some targetBb) unwind)
+    (hfn_ty : fnDecl.ty.kind = .fnPtr .nil callerOut .safe callerAbi)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (hlookup_some : lookupFnPtr s.memory.fnPtrs ptrVal.allocId = some fnEntry)
+    (htargs_nil : fnEntry.typeArgs = [])
+    (hsig : fnEntry.fnSig = some (.fnPtr .nil callerOut .unsafe_ callerAbi))
+    (habi_m : annealFnPtrAbiCompatible fnEntry .nil callerOut callerAbi 0 = true)
+    (hcallee : findCallee? s.memory.callees fnEntry.defPath = some calleeBody)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hcal_abi : annealCalleeAbiCompatible fnEntry calleeBody 0 = true)
+    (hdest_deinit : ∀ tf, tf = deinitFrameLocal
+      (cacheFrameLocalLayout topFrame fnIdx hpre.fn_lt_mf
+        (translateTy fnDecl.ty (activeMirBody rootBody s).layouts))
+      fnIdx (by rw [cacheFrameLocalLayout_size]; exact hpre.fn_lt_mf) →
+      CallerDestSlotWf m.machine tf destIdx destDecl ∧
+      IsLiveFrameLocal tf destIdx) :
+    stepMirFn rootBody s = .fail .ub ∧
+    ∃ m' calleeMf,
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m = (m', .ok true) ∧
+      m'.stack.frames.size = m.stack.frames.size + 1 ∧
+      m'.stack.frames.back? = some calleeMf ∧
+      calleeMf.body = translateBody calleeBody ∧
+      calleeMf.location = .mir ⟨0, 0⟩ :=
+  step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence
+    hpre hphase hbb hstmt_none hstmt_len hterm hfn_ty hdest_decl
+    hoff0 hlookup_some htargs_nil hsig habi_m hcallee hcallee_decls hcallee_bb0
+    hcal_abi hdest_deinit
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    stepMirFn witUnwindCalleeBody witUnwindRootAnneal = .retOutcome .panic ∧
+    (Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1
+        (activeMirBody witUnwindCalleeBody witUnwindRootAnneal)
+        witUnwindRootAnneal.memory.callees
+        (annealPoppedFrameState witUnwindRootAnneal))
+      () witUnwindRootMiri).2 =
+      .error (.undefinedBehavior "unwinding past the topmost stack frame") :=
+  wit_lm4_1_unwindResume_root_panic_vs_ub_divergence
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    (∃ s_caught m',
+      stepMirFn witCallerBody witUnwind3Anneal = .step s_caught ∧
+      s_caught.memory.callStack = [] ∧
+      s_caught.frame.blockIdx = 1 ∧
+      s_caught.memory.activeProtectors = [] ∧
+      MiriUnwindSteps witCallerBody 2 witUnwind3Anneal witUnwind3Miri (m', .ok true) ∧
+      MultiFrameStateRel witCallerBody s_caught m') ∧
+    (stepMirFn witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit) = .retOutcome .abort ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit))
+        () (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩) =
+        (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩,
+         .error (.unsupported "unwindTerminate"))) ∧
+    StepRelMultiFrame witAssertTermPanicBody
+      (mkWitAssertTermPanicMiri 1 ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩)
+      (stepMirFn witAssertTermPanicBody (mkWitAssertTermPanicAnneal 1 (.init (.scalar sc1))))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody
+          (mkWitAssertTermPanicAnneal 1 (.init (.scalar sc1))))
+        () (mkWitAssertTermPanicMiri 1 ⟨.live (.immediate (.scalar (.fromScalarInt msc1))), none⟩)) ∧
+    (stepMirFn witAssertTermPanicBody
+        (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))) =
+      .step { frame := { blockIdx := 0, stmtIdx := 0,
+                         locals := [.uninit, .init (.scalar (boolToScalar false))] },
+              memory := { nextProtector := 1 } } ∧
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody
+          (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))))
+        () (mkWitAssertTermPanicMiri 1
+          ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩)).2 =
+      .error (.unsupported "assert panic without linked panic lang item")) ∧
+    (stepMirFn witAssertTermPanicBody (mkWitAssertTermPanicAnneal 2 .uninit) =
+      .step { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] },
+              memory := { nextProtector := 1 } } ∧
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody (mkWitAssertTermPanicAnneal 2 .uninit))
+        () (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩)).2 =
+      .error (.unsupported "diverging call to unlinked non-unreachable callee")) :=
+  wit_lm4_1_multiFrame_continue_unwind_and_assert_terminate
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    StepRelMultiFrame witIndirectCallerBody
+      (mkWitIndirectCallerMiri 0 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩)
+      (stepMirFn witIndirectCallerBody (mkWitIndirectCallerAnneal 0 (.init .unit) .uninit []))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witIndirectCallerBody
+          (mkWitIndirectCallerAnneal 0 (.init .unit) .uninit []))
+        () (mkWitIndirectCallerMiri 0 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩)) ∧
+    StepRelMultiFrame witIndirectCallerBody
+      (mkWitIndirectCallerMiri 1 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩)
+      (stepMirFn witIndirectCallerBody (mkWitIndirectCallerAnneal 1 .uninit .uninit []))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witIndirectCallerBody
+          (mkWitIndirectCallerAnneal 1 .uninit .uninit []))
+        () (mkWitIndirectCallerMiri 1 ⟨.live (.immediate .uninit), none⟩ ⟨.live (.immediate .uninit), none⟩)) ∧
+    StepRelMultiFrame witIndirectCallerBody
+      (mkWitIndirectCallerMiri 2
+        ⟨.live (.immediate .uninit), none⟩
+        ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)
+      (stepMirFn witIndirectCallerBody
+        (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntrySafe]))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witIndirectCallerBody
+          (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntrySafe]))
+        () (mkWitIndirectCallerMiri 2
+          ⟨.live (.immediate .uninit), none⟩
+          ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)) ∧
+    (stepMirFn witIndirectCallerBody
+        (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryUnsafe]) = .fail .ub ∧
+      ∃ m' calleeMf,
+        Miri.Interpreter.Step.step
+          (annealStepHooksForState witIndirectCallerBody
+            (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryUnsafe]))
+          () (mkWitIndirectCallerMiri 2
+            ⟨.live (.immediate .uninit), none⟩
+            ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩) = (m', .ok true) ∧
+        m'.stack.frames.size = 2 ∧
+        m'.stack.frames.back? = some calleeMf ∧
+        calleeMf.body = translateBody witCalleeBody ∧
+        calleeMf.location = .mir ⟨0, 0⟩) :=
+  wit_lm4_1_nonConst_fnDef_and_indirect_fnPtr_call_and_safety_divergence
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    ∃ s₁ s₂ : MachineState,
+      stepMirFn witNoUnwCallerBody witNoUnwCallAnneal = .step s₁ ∧
+      s₁.memory.callStack.map SavedCallerFrame.returnUnwind = [.cleanup 2] ∧
+      stepMirFn witNoUnwCallerBody s₁ = .step s₂ ∧
+      s₂.frame.blockIdx = 2 ∧
+      s₂.memory.callStack = [] ∧
+      (miriNextLM4_1 witNoUnwCallerBody witNoUnwCallAnneal witNoUnwCallMiri).map
+          (fun m₁ => (miriTopCont m₁, miriStepUBMsgLM4_1 witNoUnwCallerBody s₁ m₁)) =
+        some (some (.goto (some 1) .Unreachable),
+          some "unwinding past a frame that does not allow unwinding") :=
+  wit_lm4_1_nounwind_callee_unwind_divergence
+
+-- Hook coherence: every `LM-4.1` step theorem quantifies over the registered
+-- function pointers `fnPtrs`, so instantiating it at `s.memory.fnPtrs` yields exactly
+-- the canonical per-state hooks `annealStepHooksForState rootBody s` used by the
+-- `FnDef`/`FnPtr` call, `Assert`, and multi-frame unwinding theorems.
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {cf : SavedCallerFrame} {restStack : List SavedCallerFrame}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hstack : s.memory.callStack = cf :: restStack)
+    (hva : ∀ tf, m.stack.frames.back? = some tf → tf.vaList = #[])
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : MirAst.LocalDecl}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hterm : bb.terminator.kind = .return_)
+    (hdecl0 : get? (activeMirBody rootBody s).localDecls 0 = some decl0)
+    (hzst_init :
+      (translateTy decl0.ty (activeMirBody rootBody s).layouts).layout.size = Miri.ABI.Size.ZERO →
+        get? s.frame.locals 0 ≠ some .uninit)
+    (hty_compat : ∀ destIdx destDecl,
+      cf.destination = ⟨destIdx, .nil⟩ →
+      get? cf.callerBody.localDecls destIdx = some destDecl →
+      ∀ v imm,
+        ImmediateRel decl0.ty (activeMirBody rootBody s).layouts v imm →
+        ImmediateRel destDecl.ty cf.callerBody.layouts v imm) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) :=
+  step_terminator_return_callee_simulation
+    hstate hstack hva hphase hbb hstmt_none hstmt_len hcleanup hterm hdecl0 hzst_init hty_compat
+    s.memory.fnPtrs
+
+example :
+    (annealRigidTyLayoutCompat (.uint .usize) (.uint .u64) = true ∧
+      rigidTyEq (.uint .usize) (.uint .u64) = false) ∧
+    (annealRigidTyLayoutCompat (.int .isize) (.int .i64) = true ∧
+      rigidTyEq (.int .isize) (.int .i64) = false) ∧
+    (annealRigidTyLayoutCompat (.rawPtr .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = true ∧
+      rigidTyEq (.rawPtr .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = false) ∧
+    annealRigidTyLayoutCompat (.uint .u8) (.uint .u64) = false ∧
+    annealRigidTyLayoutCompat (.int .i32) (.uint .u32) = false :=
+  annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq
+
+example :
+    annealRigidTyLayoutCompat .char (.uint .u32) = true ∧
+    annealRigidTyLayoutCompat .char (.int .i32) = false ∧
+    annealRigidTyLayoutCompat (.array (.uint .u64) 0) (.tuple []) = false ∧
+    annealRigidTyLayoutCompat (.array (.uint .u8) 0) (.tuple []) = false ∧
+    annealRigidTyLayoutCompat (.tuple [.tuple [], .never]) (.array (.tuple []) 3) = true ∧
+    annealRigidTyLayoutCompat (.ref .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = true ∧
+    annealRigidTyLayoutCompat (.fnPtr [] (.tuple []) .safe .rust) (.rawPtr .not (.uint .u8)) = true ∧
+    annealRigidTyLayoutCompat (.ref .not .str) (.rawPtr .mut (.slice (.uint .u32))) = true ∧
+    annealRigidTyLayoutCompat (.ref .not (.slice (.uint .u8))) (.ref .not (.uint .u8)) = false ∧
+    annealRigidTyLayoutCompat (.ref .not (.dynamic "A")) (.ref .not (.dynamic "B")) = false ∧
+    annealRigidTyLayoutCompat (.ref .not (.dynamic "A")) (.rawPtr .mut (.dynamic "A")) = true :=
+  annealRigidTyLayoutCompat_canonical_cases
+
+example
+    {fnEntry : FnPtrEntry} {argCount : Nat} {fnTy : Ty}
+    {callerInputs : List RigidTy} {callerOutput : RigidTy}
+    {callerSafety : Safety} {callerAbi : Layout.CallConv}
+    (hty : fnTy.kind = .fnPtr callerInputs callerOutput callerSafety callerAbi)
+    (hcompat : fnEntryCompatibleWithCallSite fnEntry argCount (some fnTy) = true) :
+    annealFnPtrAbiCompatible fnEntry callerInputs callerOutput callerAbi argCount = true :=
+  annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite hty hcompat
+
+example
+    (e : FnPtrEntry) (mAllocId : Miri.Memory.AllocId)
+    (h : mAllocId.value.toNat = e.allocId) :
+    ((annealFnPtrRegistry [e]).extras.find? (·.1 == mAllocId)).map Prod.snd =
+      lookupFnPtr [e] mAllocId.value.toNat :=
+  annealFnPtrRegistry_singleton_find_eq e mAllocId h
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {restMfs : List (Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)}
+    {fnIdx destIdx : MirAst.Local} {fnDecl destDecl : MirAst.LocalDecl}
+    {ptrVal : ProvenancePtr} {mAllocId : Miri.Memory.AllocId}
+    {mTag : Miri.Memory.BorTag} {baseAddr : UInt64}
+    {callerInputs : List RigidTy} {callerOut : RigidTy}
+    {callerSafety : Safety} {callerAbi : Layout.CallConv}
+    {bb : BasicBlockData} {targetBb : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {fnEntry : FnPtrEntry} {calleeBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {restDecls : List MirAst.LocalDecl} {calleeBb0 : BasicBlockData}
+    (hpre : IndirectFnPtrMovePre rootBody s m topFrame restMfs fnIdx fnDecl ptrVal mAllocId mTag baseAddr)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call (.move ⟨fnIdx, .nil⟩) .nil ⟨destIdx, .nil⟩ (some targetBb) unwind)
+    (hfn_ty : fnDecl.ty.kind = .fnPtr callerInputs callerOut callerSafety callerAbi)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (hlookup_some : lookupFnPtr s.memory.fnPtrs ptrVal.allocId = some fnEntry)
+    (htargs_nil : fnEntry.typeArgs = [])
+    (hsyn_false : fnEntryCompatibleWithCallSite fnEntry 0 (some fnDecl.ty) = false)
+    (habi_true : annealFnPtrAbiCompatible fnEntry callerInputs callerOut callerAbi 0 = true)
+    (hcallee : findCallee? s.memory.callees fnEntry.defPath = some calleeBody)
+    (hcallee_decls : calleeBody.localDecls = retDecl :: restDecls)
+    (hcallee_bb0 : get? calleeBody.basicBlocks 0 = some calleeBb0)
+    (hcal_abi : annealCalleeAbiCompatible fnEntry calleeBody 0 = true)
+    (hdest_deinit : ∀ tf, tf = deinitFrameLocal
+      (cacheFrameLocalLayout topFrame fnIdx hpre.fn_lt_mf
+        (translateTy fnDecl.ty (activeMirBody rootBody s).layouts))
+      fnIdx (by rw [cacheFrameLocalLayout_size]; exact hpre.fn_lt_mf) →
+      CallerDestSlotWf m.machine tf destIdx destDecl ∧
+      IsLiveFrameLocal tf destIdx) :
+    stepMirFn rootBody s = .fail .ub ∧
+    ∃ m' calleeMf,
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m = (m', .ok true) ∧
+      m'.stack.frames.size = m.stack.frames.size + 1 ∧
+      m'.stack.frames.back? = some calleeMf ∧
+      calleeMf.body = translateBody calleeBody ∧
+      calleeMf.location = .mir ⟨0, 0⟩ :=
+  step_terminator_call_indirect_layoutCompat_fnPtr_divergence
+    hpre hphase hbb hstmt_none hstmt_len hterm hfn_ty hdest_decl
+    hoff0 hlookup_some htargs_nil hsyn_false habi_true hcallee
+    hcallee_decls hcallee_bb0 hcal_abi hdest_deinit
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {fnIdx : MirAst.Local} {fnDecl : MirAst.LocalDecl}
+    {defPath : DefPath} {span : String}
+    {callerInputs : List RigidTy} {callerOut : RigidTy}
+    {callerAbi : Layout.CallConv}
+    {allocId : Nat} {mAllocId : Miri.Memory.AllocId} {baseAddr : UInt64}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt :
+      get? bb.statements s.frame.stmtIdx =
+        some
+          { kind :=
+              .assign ⟨fnIdx, .nil⟩
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant { ty := { kind := .fnDef defPath .nil, layoutIdx := 0 }, val := .zeroSized })
+                  fnDecl.ty)
+            span := span })
+    (hfn_decl : get? (activeMirBody rootBody s).localDecls fnIdx = some fnDecl)
+    (hfn_ty : fnDecl.ty.kind = .fnPtr callerInputs callerOut .safe callerAbi)
+    (hnot_intr : callConvEq callerAbi .rustIntrinsic = false)
+    (hcheck_sig : checkCalleeSig s.memory.callees defPath callerInputs callerOut callerAbi .nil .nil = true)
+    (htraits_nil : s.memory.traitImpls = .nil)
+    (hbor_nil : s.memory.borrows = .nil)
+    (hfn_imm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf fnIdx)
+    (hfn_live : get? s.frame.locals fnIdx ≠ some .dead)
+    (hfind_none : findFnPtrEntry? s.memory.fnPtrs defPath .nil (some fnDecl.ty.kind) = none)
+    (halloc_id : nextFnPtrAllocId s.memory.fnPtrs = allocId)
+    (hmAlloc_eq : mAllocId.value.toNat = allocId)
+    (hbase_lookup : m.machine.lookupBaseAddr mAllocId = some baseAddr) :
+    ∃ s₁ m₁ topFrame₁ restMfs,
+      stepMirFn rootBody s = .step s₁ ∧
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m = (m₁, .ok true) ∧
+      s₁.frame.blockIdx = s.frame.blockIdx ∧
+      s₁.frame.stmtIdx = s.frame.stmtIdx + 1 ∧
+      s₁.memory.callees = s.memory.callees ∧
+      activeMirBody rootBody s₁ = activeMirBody rootBody s ∧
+      lookupFnPtr s₁.memory.fnPtrs allocId =
+        some
+          { allocId := allocId
+            defPath := defPath
+            typeArgs := .nil
+            fnSig := some fnDecl.ty.kind } ∧
+      (∀ j,
+        (∀ tf, m.stack.frames.back? = some tf →
+          IsImmediateFrameLocal tf j ∧ IsLiveFrameLocal tf j) →
+        IsImmediateFrameLocal topFrame₁ j ∧ IsLiveFrameLocal topFrame₁ j) ∧
+      IndirectFnPtrMovePre rootBody s₁ m₁ topFrame₁ restMfs fnIdx fnDecl
+        { allocId := allocId, offsetBytes := 0 }
+        mAllocId Miri.Memory.BorTag.one baseAddr :=
+  step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
+    hstate hphase hbb hstmt hfn_decl hfn_ty hnot_intr hcheck_sig htraits_nil
+    hbor_nil hfn_imm hfn_live hfind_none halloc_id hmAlloc_eq hbase_lookup
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    {func : MirAst.Operand} {destIdx : MirAst.Local} {destDecl : MirAst.LocalDecl}
+    {unwind : MirAst.UnwindAction}
+    {defPath : DefPath} {panicBody : CapturedMir}
+    {retDecl : MirAst.LocalDecl} {panicBb0 : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .call func .nil ⟨destIdx, .nil⟩ .none unwind)
+    (hfunc : extractCalleeDefPath? func = some defPath)
+    (hcallee : findCallee? s.memory.callees defPath = some panicBody)
+    (htypeArgs : extractCalleeTypeArgs func = .nil)
+    (htparam : panicBody.typeParamCount = 0)
+    (hdest_decl : get? (activeMirBody rootBody s).localDecls destIdx = some destDecl)
+    (hpanic_decls : panicBody.localDecls = [retDecl])
+    (hpanic_bb0 : get? panicBody.basicBlocks 0 = some panicBb0)
+    (hpanic_stmts : panicBb0.statements = .nil)
+    (hpanic_clean : panicBb0.isCleanup = true)
+    (hpanic_term : panicBb0.terminator.kind = .unwindResume)
+    (hpanic_phase : ∀ p, panicBody.phase ≠ .other p)
+    (hpanic_unwind : panicBody.fnAbi.canUnwind = true)
+    (hdest_wf : ∀ tf, m.stack.frames.back? = some tf →
+      CallerDestSlotWf m.machine tf destIdx destDecl)
+    (hdest_live : ∀ tf, m.stack.frames.back? = some tf → IsLiveFrameLocal tf destIdx)
+    (hunwind : unwind = .unreachable ∨ ∃ cleanupBb, unwind = .cleanup cleanupBb) :
+    StepRelMultiFrame rootBody m
+      (stepMirFn rootBody s)
+      (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m) ∧
+    ∃ s₁ m₁,
+      stepMirFn rootBody s = .step s₁ ∧
+      Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m = (m₁, .ok true) ∧
+      MultiFrameStateRel rootBody s₁ m₁ ∧
+      StepRelMultiFrame rootBody m₁
+        (stepMirFn rootBody s₁)
+        (Miri.Interpreter.Step.step (annealStepHooksForState rootBody s₁) () m₁) :=
+  step_terminator_call_linked_panic_unwind_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hfunc hcallee htypeArgs htparam
+    hdest_decl hpanic_decls hpanic_bb0 hpanic_stmts hpanic_clean hpanic_term
+    hpanic_phase hpanic_unwind hdest_wf hdest_live hunwind
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .unwindTerminate) :
+    stepMirFn rootBody s = MirStepNode.retOutcome .abort ∧
+    Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m =
+      (m, .error (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").report =
+      .abnormalTermination ∧
+    (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").isUbReport =
+      false :=
+  step_terminator_unwindTerminate_termination_abort_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm
+
+example
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : MultiFrameStateRel rootBody s m)
+    (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
+    {bb : BasicBlockData} {condIdx : MirAst.Local} {condDecl : MirAst.LocalDecl}
+    {expected : Bool} {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
+    {sc : MirAst.ScalarInt}
+    (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .assert (.copy ⟨condIdx, .nil⟩) expected target unwind)
+    (hdecl : get? (activeMirBody rootBody s).localDecls condIdx = some condDecl)
+    (hbool_ty : condDecl.ty.kind = .bool)
+    (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf condIdx)
+    (hsc : get? s.frame.locals condIdx = some (.init (.scalar sc)))
+    (hne_exp : decide (sc.bits ≠ 0) ≠ expected) :
+    (∀ cleanupBb, unwind = .cleanup cleanupBb →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m)) ∧
+    (unwind = .unreachable →
+      StepRelMultiFrame rootBody m
+        (stepMirFn rootBody s)
+        (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m)) ∧
+    (unwind = .terminate →
+      stepMirFn rootBody s = MirStepNode.retOutcome .abort ∧
+      (Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m).2 =
+        .error (.termination (.abort "panic in a function that cannot unwind"))) ∧
+    (unwind = .continue_ →
+      stepMirFn rootBody s =
+        (match unwindFromCallStack s.memory.callStack s.memory with
+         | .running nextState => .step nextState
+         | .halted out => .retOutcome out
+         | .faulted fk => .fail fk) ∧
+      ∃ m₁,
+        Miri.Interpreter.Step.step (annealStepHooksWithDirectUnwind rootBody s) () m =
+          (m₁, .ok true) ∧
+        UnwindingStateRel rootBody s m₁) :=
+  step_terminator_assert_failed_directUnwind_simulation
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hbool_ty himm hsc hne_exp
+
+example (fnPtrs : List FnPtrEntry) (mAllocId : Miri.Memory.AllocId)
+    (hrange : ∀ e ∈ fnPtrs, e.allocId < UInt64.size) :
+    ((annealFnPtrRegistry fnPtrs).extras.find? (·.1 == mAllocId)).map Prod.snd =
+      lookupFnPtr fnPtrs mAllocId.value.toNat :=
+  annealFnPtrRegistry_find_eq fnPtrs mAllocId hrange
+
+example (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry) :
+    { annealRvalueHooksLM4_1 currentBody fnPtrs with
+        cast := (annealRvalueHooks currentBody.localDecls currentBody.layouts).cast } =
+      annealRvalueHooks currentBody.localDecls currentBody.layouts :=
+  annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast currentBody fnPtrs
+
+example (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry)
+    (c : Unit) (src : Miri.Interpreter.OpTy AnnealProv) (kind : Miri.MIR.CastKind)
+    (ty : Miri.MIR.TyId) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (hkind : ∀ sf cs, kind ≠ .PointerCoercion (.ReifyFnPointer sf) cs) :
+    (annealRvalueHooksLM4_1 currentBody fnPtrs).cast c src kind ty dest =
+      (annealRvalueHooks currentBody.localDecls currentBody.layouts).cast c src kind ty dest :=
+  annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer currentBody fnPtrs c src kind ty dest hkind
+
+open LeanMiriSpec.Correspondence.WitnessLM4_1 in
+example :
+    (∃ s₁ m₁ topFrame₁ restMfs,
+      stepMirFn witReifyCallerBody witReifyCallerAnneal0 = .step s₁ ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksForState witReifyCallerBody witReifyCallerAnneal0)
+        () witReifyCallerMiri0 = (m₁, .ok true) ∧
+      lookupFnPtr s₁.memory.fnPtrs fnPtrAllocBase = some witReifyFnEntry ∧
+      IndirectFnPtrMovePre witReifyCallerBody s₁ m₁ topFrame₁ restMfs 3 safeFnPtrDecl
+        witReifyFnPtrVal witReifyAllocId Miri.Memory.BorTag.one Witness.witnessBaseAddr ∧
+      StepRelMultiFrame witReifyCallerBody m₁
+        (stepMirFn witReifyCallerBody s₁)
+        (Miri.Interpreter.Step.step
+          (annealStepHooksForState witReifyCallerBody s₁) () m₁)) ∧
+    StepRelMultiFrame witIndirectCallerBody
+      (mkWitIndirectCallerMiri 2
+        ⟨.live (.immediate .uninit), none⟩
+        ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)
+      (stepMirFn witIndirectCallerBody
+        (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryU64]))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witIndirectCallerBody
+          (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryU64]))
+        () (mkWitIndirectCallerMiri 2
+          ⟨.live (.immediate .uninit), none⟩
+          ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)) ∧
+    (stepMirFn witUsizeIndirectCallerBody witUsizeIndirectCallerAnneal = .fail .ub ∧
+      ∃ m' calleeMf,
+        Miri.Interpreter.Step.step
+          (annealStepHooksForState witUsizeIndirectCallerBody witUsizeIndirectCallerAnneal)
+          () witUsizeIndirectCallerMiri = (m', .ok true) ∧
+        m'.stack.frames.size = 2 ∧
+        m'.stack.frames.back? = some calleeMf ∧
+        calleeMf.body = translateBody witU64CalleeBody ∧
+        calleeMf.location = .mir ⟨0, 0⟩) ∧
+    ((annealFnPtrRegistry [witFnEntrySafe]).extras.find? (·.1 == Witness.witnessAllocId)).map Prod.snd = some witFnEntrySafe ∧
+    (StepRelMultiFrame witAssertTermPanicBody
+      (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩)
+      (stepMirFn witAssertTermPanicBody witLinkedPanicCallAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody witLinkedPanicCallAnneal)
+        () (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩)) ∧
+      ∃ s₁ m₁,
+        stepMirFn witAssertTermPanicBody witLinkedPanicCallAnneal = .step s₁ ∧
+        Miri.Interpreter.Step.step
+          (annealStepHooksForState witAssertTermPanicBody witLinkedPanicCallAnneal)
+          () (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩) = (m₁, .ok true) ∧
+        MultiFrameStateRel witAssertTermPanicBody s₁ m₁ ∧
+        StepRelMultiFrame witAssertTermPanicBody m₁
+          (stepMirFn witAssertTermPanicBody s₁)
+          (Miri.Interpreter.Step.step (annealStepHooksForState witAssertTermPanicBody s₁) () m₁)) ∧
+    (stepMirFn witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit) = .retOutcome .abort ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksWithDirectUnwind witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit))
+        () (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩) =
+        (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩,
+         .error (.termination (.abort "panic in a function that cannot unwind"))) ∧
+      (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").report =
+        .abnormalTermination ∧
+      (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").isUbReport =
+        false) ∧
+    StepRelMultiFrame witAssertTermPanicBody
+      (mkWitAssertTermPanicMiri 1
+        ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩)
+      (stepMirFn witAssertTermPanicBody
+        (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksWithDirectUnwind witAssertTermPanicBody
+          (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))))
+        () (mkWitAssertTermPanicMiri 1
+          ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩)) :=
+  wit_lm4_1_reifyFnPointer_chain_layoutCompat_and_directUnwind
+
+-- `LM-4.2` statement pins: non-diverging & terminator intrinsics.
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {op : Operand} {span : String} {ty : Ty}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.intrinsic (.assume op), span⟩)
+    (hop : ∀ topFrame, m.stack.frames = #[topFrame] → WellTypedScalarOperand body topFrame op ty)
+    (hprim : IsPrimScalarTy ty)
+    (hsz1 : (translateTy ty body.layouts).layout.size = Miri.ABI.Size.ofBytes 1) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_assume_simulation hstate hphase hbb hstmt hop hprim hsz1
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (htgt_compat : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      0 < elemBytes →
+      CopyTargetCompatible decl_s decl_d pointeeTy.kind)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d decl_s decl_d srcBytes dstBytes,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits * elemBytes →
+      countSc.bits * elemBytes ≤ isizeMaxBytes →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      rigidTyByteSize body.layouts decl_s.ty = some srcBytes →
+      rigidTyByteSize body.layouts decl_d.ty = some dstBytes →
+      srcPtr.offsetBytes + countSc.bits * elemBytes ≤ srcBytes →
+      dstPtr.offsetBytes + countSc.bits * elemBytes ≤ dstBytes →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit ∧
+        ((dstPtr.offsetBytes = 0 ∧ countSc.bits * elemBytes = dstBytes) ∨
+          get? s.frame.locals e_d.localIdx ≠ some .uninit)) :
+    ∃ allocMap',
+      StepRelLM3_1 body m allocMap'
+        (stepMirFnLM4_2 body s)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_simulation hstate hphase hbb hstmt
+    hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt
+    htgt_compat hlive_ok
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    {ty : Ty} {kind : Miri.MIR.IntegerKind} (hint : IsIntegralTy ty kind)
+    (hc : c.ty.kind = .fnDef AnnealIntrinsic.exactDiv.defPath [ty.kind])
+    (hcallee : lookupCallee s.memory.callees body.layouts AnnealIntrinsic.exactDiv.defPath
+      [ty.kind] s.memory.traitImpls = none)
+    (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
+    (hop₁ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty)
+    (hop₂ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ ty)
+    {dstDecl : MirAst.LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hdstInt : IsIntegralTy dstDecl.ty kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx) :
+    StepRelLM3_1 body m allocMap (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  call_intrinsic_exact_div_simulation hstate hphase hbb hstmt_none hstmt_len
+    hterm hint hc hcallee hprog hop₁ hop₂ hdst hdstInt hdstImm
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {c : ConstOperand} {ptrIdx dstIdx : Local} {valOp countOp : MirAst.Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {pointeeTy : Ty}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [.copy ⟨ptrIdx, []⟩, valOp, countOp] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef AnnealIntrinsic.writeBytes.defPath [pointeeTy.kind])
+    (hcallee : findCallee? s.memory.callees AnnealIntrinsic.writeBytes.defPath = none)
+    (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
+    {ptrDecl : MirAst.LocalDecl} {ptrMut : Mutability}
+    (hptrDecl : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptrTy : ptrDecl.ty.kind = .rawPtr ptrMut pointeeTy.kind)
+    (hptrImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf ptrIdx)
+    {valTy countTy : Ty}
+    (hvalInt : IsIntegralTy valTy .u8)
+    (hvalOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf valOp valTy)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    {dstDecl : MirAst.LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl)
+    {ptId : Miri.MIR.TyId} {elemBytes : Nat}
+    (hpt : WriteBytesPointee body.layouts pointeeTy.kind ptId elemBytes)
+    (htgt_int : ∀ ptrVal e tgtDecl,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      ∃ tgtKind, IsIntegralTy tgtDecl.ty tgtKind)
+    (hlive_inbounds : ∀ ptrVal countSc e tgtDecl tgtKind,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits * elemBytes →
+      countSc.bits * elemBytes ≤ isizeMaxBytes →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      IsIntegralTy tgtDecl.ty tgtKind →
+      get? s.frame.locals e.localIdx ≠ some .dead →
+      ptrVal.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind →
+      (∀ x ∈ allocMap, x.localIdx = e.localIdx →
+        (x.tag = ptrVal.tag ∧ x.perm = .active) ∨ (x.tag ≠ ptrVal.tag ∧ x.perm = .disabled)) ∧
+      ((ptrVal.offsetBytes = 0 ∧ countSc.bits * elemBytes = integerKindByteWidth tgtKind) ∨
+        ∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFnLM4_2 body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  call_intrinsic_write_bytes_simulation hstate hphase hbb hstmt_none hstmt_len
+    hterm hc hcallee hprog hptrDecl hptrTy hptrImm hvalInt hvalOp hcountInt hcountOp
+    hdst hpt htgt_int hlive_inbounds
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {calleePath : DefPath} {k : AnnealIntrinsic} (hk : k = .arithOffset ∨ k = .wrappingOffset)
+    {pointeeKind : RigidTy} {c : ConstOperand} {ptrIdx : Local} {countOp : MirAst.Operand}
+    {dstIdx : Local} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [.copy ⟨ptrIdx, []⟩, countOp] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [pointeeKind])
+    (hcallee : findCallee? s.memory.callees calleePath = none)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = some k)
+    (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
+    {ptrDecl : MirAst.LocalDecl} {ptrMut : Mutability}
+    (hptrDecl : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptrTy : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hptrImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf ptrIdx)
+    {countTy : Ty} (hcountInt : IsIntegralTy countTy .isize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    {dstDecl : MirAst.LocalDecl} {dstMut : Mutability}
+    (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    {elemBytes : Nat}
+    (helem_anneal :
+      rigidTyKindByteSize pointeeKind = some elemBytes)
+    (helem_miri :
+      (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes)
+    (helem_lt : elemBytes < 2 ^ 63)
+    (hrange : ∀ p countSc,
+      get? s.frame.locals ptrIdx = some (.init (.ptr p 8)) →
+      ScalarOperandPreVal s.frame.locals countOp countSc →
+      get? s.frame.locals dstIdx ≠ some .dead →
+      (p.offsetBytes + countSc.bits * elemBytes) % 2 ^ 64 < 2 ^ 32) :
+    StepRelLM3_1 body m allocMap (stepMirFnLM4_2 body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  call_intrinsic_offset_simulation hstate hphase hbb hstmt_none hstmt_len hk
+    hterm hc hcallee hpath hprog hptrDecl hptrTy hptrImm hcountInt hcountOp hdst hdstTy hdstImm
+    helem_anneal helem_miri helem_lt hrange
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example :
+    (∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+      {allocMap : List AllocMapEntry},
+      StateRelLM3_1 body s m allocMap →
+      (∀ p, body.phase ≠ .other p) →
+      ∀ {bb : BasicBlockData},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = none →
+        s.frame.stmtIdx = length bb.statements →
+        ∀ (op : IntegerBitIntrinsic) {c : ConstOperand} {op₁ : MirAst.Operand}
+          {dstIdx : Local} {targetBb : BasicBlockIdx} {unwind : UnwindAction},
+          bb.terminator.kind = .call (.constant c) [op₁] ⟨dstIdx, []⟩ (some targetBb) unwind →
+          ∀ {ty : Ty} {kind : Miri.MIR.IntegerKind},
+            IsIntegralTy ty kind →
+            c.ty.kind = .fnDef (AnnealIntrinsic.ofBit op).defPath [ty.kind] →
+            lookupCallee s.memory.callees body.layouts (AnnealIntrinsic.ofBit op).defPath
+              [ty.kind] s.memory.traitImpls = none →
+            (targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0) →
+            (∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty) →
+            ∀ {dstDecl : MirAst.LocalDecl} {dstKind : Miri.MIR.IntegerKind},
+              get? body.localDecls dstIdx = some dstDecl →
+              IsIntegralTy dstDecl.ty dstKind →
+              ((op = .bswap ∨ op = .bitreverse) ∨ dstKind = .u32) →
+              ((op = .bswap ∨ op = .bitreverse) → dstKind = kind) →
+              (∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx) →
+              StepRelLM3_1 body m allocMap (stepMirFn body s)
+                (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m)) ∧
+    (∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+      {allocMap : List AllocMapEntry},
+      StateRelLM3_1 body s m allocMap →
+      (∀ p, body.phase ≠ .other p) →
+      ∀ {bb : BasicBlockData},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = none →
+        s.frame.stmtIdx = length bb.statements →
+        ∀ {k : AnnealIntrinsic} {isAdd : Bool},
+          ((k = .saturatingAdd ∧ isAdd = true) ∨ (k = .saturatingSub ∧ isAdd = false)) →
+          ∀ {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local}
+            {targetBb : BasicBlockIdx} {unwind : UnwindAction},
+            bb.terminator.kind =
+              .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind →
+            ∀ {ty : Ty} {kind : Miri.MIR.IntegerKind},
+              IsIntegralTy ty kind →
+              c.ty.kind = .fnDef k.defPath [ty.kind] →
+              lookupCallee s.memory.callees body.layouts k.defPath [ty.kind]
+                s.memory.traitImpls = none →
+              (targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0) →
+              (∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty) →
+              (∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ ty) →
+              ∀ {dstDecl : MirAst.LocalDecl},
+                get? body.localDecls dstIdx = some dstDecl →
+                IsIntegralTy dstDecl.ty kind →
+                (∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx) →
+                StepRelLM3_1 body m allocMap (stepMirFn body s)
+                  (Miri.Interpreter.Step.step
+                    (annealStepHooks body.localDecls body.layouts) () m)) ∧
+    (∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+      {allocMap : List AllocMapEntry},
+      StateRelLM3_1 body s m allocMap →
+      (∀ p, body.phase ≠ .other p) →
+      ∀ {bb : BasicBlockData},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = none →
+        s.frame.stmtIdx = length bb.statements →
+        ∀ {k : AnnealIntrinsic} {isLeft : Bool},
+          ((k = .rotateLeft ∧ isLeft = true) ∨ (k = .rotateRight ∧ isLeft = false)) →
+          ∀ {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local}
+            {targetBb : BasicBlockIdx} {unwind : UnwindAction},
+            bb.terminator.kind =
+              .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind →
+            ∀ {ty shiftTy : Ty} {kind : Miri.MIR.IntegerKind},
+              IsIntegralTy ty kind →
+              IsIntegralTy shiftTy .u32 →
+              c.ty.kind = .fnDef k.defPath [ty.kind] →
+              findCallee? s.memory.callees k.defPath = none →
+              (∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty) →
+              (∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ shiftTy) →
+              ∀ {dstDecl : MirAst.LocalDecl},
+                get? body.localDecls dstIdx = some dstDecl →
+                (((∃ m' msg,
+                    Miri.Interpreter.Step.step
+                      (annealStepHooks body.localDecls body.layouts) () m =
+                      (m', .error (.unsupported msg))) ∧
+                  ((evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+                      body.layouts s.memory.callerLocals = .ub ∧
+                    stepMirFnLM4_2 body s = MirStepNode.fail .ub) ∨
+                    ∃ x shift mr,
+                      evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+                        body.layouts s.memory.callerLocals =
+                        .ok [.scalar x, .scalar shift] s.frame.locals ∧
+                      stepMirFnLM4_2 body s =
+                        intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb
+                          (.scalar (evalRotate isLeft x shift)) ∧
+                      (evalRotate isLeft x shift).sizeBytes = x.sizeBytes ∧
+                      (evalRotate isLeft x shift).bits < scalarModulus x.sizeBytes ∧
+                      (evalRotate isLeft x shift).bits =
+                        (if isLeft then
+                          (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateLeft shift.bits
+                        else
+                          (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateRight shift.bits).toNat ∧
+                      ScalarRel (evalRotate isLeft x shift) mr ∧
+                      ∃ b, Miri.Memory.ScalarInt.truncateFromUInt
+                        (BitVec.ofNat 128 (evalRotate isLeft x shift).bits)
+                        (translateSizeBytes x.sizeBytes) = .ok (mr, b))) ∨
+                (∃ m' msg,
+                  Miri.Interpreter.Step.step
+                    (annealStepHooks body.localDecls body.layouts) () m =
+                    (m', .error (.undefinedBehavior msg)) ∧
+                  stepMirFnLM4_2 body s = MirStepNode.fail .ub))) :=
+  call_intrinsic_bitops_simulation
+
+open WitnessLM4_2 in
+example :
+    ∃ m', stepMirFn (assumeBody (.constant (constBool true)))
+        (assumeAnnealPre (.constant (constBool true))) =
+        .step (advanceStmt (assumeAnnealPre (.constant (constBool true)))
+          (assumeAnnealPre (.constant (constBool true))).frame.locals) ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooks (assumeBody (.constant (constBool true))).localDecls
+          (assumeBody (.constant (constBool true))).layouts) ()
+        (assumeMiriPre (.constant (constBool true))) = (m', .ok true) ∧
+      StateRelLM3_1 (assumeBody (.constant (constBool true)))
+        (advanceStmt (assumeAnnealPre (.constant (constBool true)))
+          (assumeAnnealPre (.constant (constBool true))).frame.locals) m' [] :=
+  WitnessLM4_2.wit_lm4_2_assume_true
+
+open WitnessLM4_2 in
+example :
+    stepMirFn (assumeBody (.copy (local42 1))) (assumeAnnealPre (.copy (local42 1))) = .fail .ub ∧
+      ∃ m' msg, Miri.Interpreter.Step.step
+        (annealStepHooks (assumeBody (.copy (local42 1))).localDecls
+          (assumeBody (.copy (local42 1))).layouts) ()
+        (assumeMiriPre (.copy (local42 1))) = (m', .error (.undefinedBehavior msg)) :=
+  WitnessLM4_2.wit_lm4_2_assume_invalid_bool
+
+open WitnessLM4_2 in
+example :
+    stepMirFn (callBody "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K)
+        (callAnnealPre "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K) =
+        .step (callAnnealPost "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K
+          (.scalar ⟨4294967290, 4⟩)) ∧
+      ∃ m', Miri.Interpreter.Step.step
+          (annealStepHooks (callBody "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K).localDecls
+            (callBody "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K).layouts) ()
+          (callMiriPre "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K) = (m', .ok true) ∧
+        StateRelLM3_1 (callBody "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K)
+          (callAnnealPost "core::intrinsics::exact_div" i32K (binArgs i32K 4294967254 7 4) i32K (.scalar ⟨4294967290, 4⟩)) m' [] :=
+  WitnessLM4_2.wit_lm4_2_exact_div_signed
+
+open WitnessLM4_2 in
+example :
+    stepMirFn (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K)
+        (callAnnealPre "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K) =
+        callStage1ExtCall "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K
+          [.scalar ⟨2147483649, 4⟩, .scalar ⟨1, 4⟩] ∧
+      ∃ m' msg, Miri.Interpreter.Step.step
+          (annealStepHooks (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K).localDecls
+            (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K).layouts) ()
+          (callMiriPre "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 1 4) u32K) =
+        (m', .error (.unsupported msg)) :=
+  WitnessLM4_2.wit_lm4_2_rotate_left_boundary
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      let b := arithOffsetNegBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b rawMutU64K) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [entry] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_1 b s₅ m₅ [entry] ∧
+      get? s₅.frame.locals 0 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) :=
+  WitnessLM4_2.wit_lm4_2_arith_offset_neg
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := writeBytesMutBody 0xAB 1
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
+        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
+        get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_write_bytes_boundary
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
+      let b := copyDistinctBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+      stepMirFn b (copy6AnnealPre b true) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (copy6MiriPre b true) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      get? s₃.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      (∃ la msc,
+        m₃.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId2) =
+          some (Witness.lm31AllocId2, la) ∧
+        ScalarRel ⟨42, 8⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 8)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
+      let b := copySingleMutBody 1
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overlap_ub
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      let b := writeBytesPartialBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      stepMirFn b s₃ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u8K s₃
+        [.ptr { allocId := 1, offsetBytes := 2 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩] ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      (∃ s₄, StateRelLM3_1 b s₄ m₄ [entry] ∧
+        get? s₄.frame.locals 1 = some (.init (.scalar ⟨0x00000000ABAB002A, 8⟩))) ∧
+      (∃ la msc,
+        m₄.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId1) =
+          some (Witness.lm31AllocId1, la) ∧
+        ScalarRel ⟨0x00000000ABAB002A, 8⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 8)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_write_bytes_partial_boundary
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := wrappingOffsetPosBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b rawMutU64K) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ =
+        .extCall
+          { defPath := "core::intrinsics::wrapping_offset", typeArgs := [u64K],
+            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨5, 8⟩],
+            memory := s₁.memory }
+          (resumeExternalCall s₁ s₁.frame.locals (local42 0) 1 .unreachable) ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
+        get? s₂.frame.locals 0 = some (.init (.ptr { allocId := 1, offsetBytes := 40 } 8)) :=
+  WitnessLM4_2.wit_lm4_2_wrapping_offset_boundary
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := stdWrappingOffsetPosBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b rawMutU64K) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ =
+        .extCall
+          { defPath := "std::intrinsics::wrapping_offset", typeArgs := [u64K],
+            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨5, 8⟩],
+            memory := s₁.memory }
+          (resumeExternalCall s₁ s₁.frame.locals (local42 0) 1 .unreachable) ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
+        get? s₂.frame.locals 0 = some (.init (.ptr { allocId := 1, offsetBytes := 40 } 8)) :=
+  WitnessLM4_2.wit_lm4_2_std_wrapping_offset_boundary
+
+open WitnessLM4_2 in
+example :
+    stepMirFn (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K)
+        (callAnnealPre "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K) =
+      callStage1ExtCall "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K
+        [.scalar ⟨2147483649, 4⟩, .scalar ⟨33, 4⟩] ∧
+    (∃ m' msg, Miri.Interpreter.Step.step
+        (annealStepHooks (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K).localDecls
+          (callBody "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K).layouts) ()
+        (callMiriPre "core::intrinsics::rotate_left" u32K (binArgs u32K 2147483649 33 4) u32K) =
+      (m', .error (.unsupported msg))) ∧
+    ∃ mr,
+      (BitVec.ofNat 32 2147483649).rotateLeft 33 = BitVec.ofNat 32 3 ∧
+      ScalarRel ⟨3, 4⟩ mr ∧
+      ∃ b, Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofNat 128 3) (translateSizeBytes 4) = .ok (mr, b) :=
+  WitnessLM4_2.wit_lm4_2_rotate_left_mod_mask
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      let b := copyDisjointSubrangeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr6AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr6MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [entry] ∧
+      stepMirFn b s₄ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      (∃ s₅, StateRelLM3_1 b s₅ m₅ [entry] ∧
+        get? s₅.frame.locals 1 = some (.init (.scalar ⟨0x00000000002A002A, 8⟩))) ∧
+      (∃ la msc,
+        m₅.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId1) =
+          some (Witness.lm31AllocId1, la) ∧
+        ScalarRel ⟨0x00000000002A002A, 8⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 8)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      let b := copyCrossTypeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+      stepMirFn b (ptr6AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr6MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      (∃ s₄', stepMirFn b s₃ = .step s₄' ∧
+        get? s₄'.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      get? b.localDecls 2 = some (declOf u32K) ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      (∃ s₄, StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+        get? s₄.frame.locals 2 = some (.init (.scalar ⟨42, 4⟩))) ∧
+      (∃ la msc,
+        m₄.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId2) =
+          some (Witness.lm31AllocId2, la) ∧
+        ScalarRel ⟨42, 4⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 4)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_divergence
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState) (msg : String),
+      let b := copyMisalignedZeroBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [entry] ∧
+      stepMirFn b s₄ = .step (advanceStmt s₄ s₄.frame.locals) ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .error (.undefinedBehavior msg)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState) (msg : String),
+      let b := copyDistinctOobBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+      stepMirFn b (copy6AnnealPre b true) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (copy6MiriPre b true) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      (∃ s₃, stepMirFn b s₂ = .step s₃ ∧
+        get? s₃.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .error (.undefinedBehavior msg)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
+
+open Trusted.Rustc.V2026_06_01.MirSemantics in
+example :
+    (∃ s', evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts
+        (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8) 1 WitnessLM4_2.adtPointeeState.frame.locals = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.aggregate 0 [.scalar ⟨7, 4⟩]))) ∧
+    evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8)
+      1000 WitnessLM4_2.adtPointeeState.frame.locals = MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts (.ptr ⟨99, 0⟩ 8) (.scalar ⟨0, 8⟩)
+      1 WitnessLM4_2.adtPointeeState.frame.locals = MirStepNode.fail .ub ∧
+    (∃ s', stepMirFn WitnessLM4_2.adtArithOffsetBody WitnessLM4_2.adtPointeeState = .step s' ∧
+      get? s'.frame.locals 5 = some (.init (.ptr ⟨1, 4⟩ 8))) :=
+  WitnessLM4_2.wit_lm4_2_adt_pointee_stage1_copy_offset
+
+open Trusted.Rustc.V2026_06_01.MirSemantics in
+example :
+    ∃ s' : MachineState,
+      evalCopyNonOverlapping WitnessLM4_2.u8Array4ToU32PreState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 4 8)) WitnessLM4_2.u8Array4ToU32Decls
+        emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x04030201, 4⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
+
+open WitnessLM4_2 in
+example :
+    let b := copyStage1RawPtrBody
+    let e_p := rawPtrAllocMapEntry b.localDecls b.layouts .mut 0 9 Witness.lm31AllocId1
+    let e_s := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e_d := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+    let s : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.ptr p 8), .uninit,
+          .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+          .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] }
+      memory := {
+        emptyMemory with
+        borrows := [e_s.toBorrowEntry, e_d.toBorrowEntry, e_p.toBorrowEntry]
+        nextTag := 10 } }
+    ∃ s',
+      stepMirFn b s = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr p 8)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok
+
+open WitnessLM4_2 in
+example :
+    let decls := [declOf unitK, declOf .bool, declOf .bool,
+      declOf (.rawPtr .not .bool), declOf (.rawPtr .mut .bool)]
+    let st : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0, 1⟩),
+          .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+      memory := {
+        emptyMemory with
+        borrows :=
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+           { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
+        nextTag := 3 } }
+    (∃ s', evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨1, 1⟩))) ∧
+    evalCopyNonOverlappingLM4_2 st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
+
+open WitnessLM4_2 in
+example :
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+
+example {s : MachineState} {body : CapturedMir} {term : Terminator}
+    {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {defPath : DefPath} {typeArgs : List RigidTy}
+    (hcls : classifyRustIntrinsic? defPath = none)
+    (hexact : stringEq defPath "core::intrinsics::exact_div" = false)
+    (hterm : term.kind = .call (.constant c) argOps destination (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef defPath typeArgs)
+    (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
+      s.memory.traitImpls = none) :
+    evalTerminator s term (some body) =
+      match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        MirStepNode.extCall
+          { defPath := defPath, typeArgs := typeArgs, args := vs, memory := s.memory }
+          (resumeExternalCall s locals' destination targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported :=
+  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+
+example {body : CapturedMir} {s : MachineState}
+    (hcal : s.memory.activeCallee = none)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {k : AnnealIntrinsic} {argKind : RigidTy}
+    (hk : k.stage1Unmodeled = true)
+    (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef k.defPath [argKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [argKind]
+      s.memory.traitImpls = none) :
+    stepMirFn body s =
+      match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        MirStepNode.extCall
+          { defPath := k.defPath, typeArgs := [argKind], args := vs, memory := s.memory }
+          (resumeExternalCall s locals' destination targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported :=
+  stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len hk hterm hc
+    hcallee
+
+example {body : CapturedMir} {s : MachineState}
+    (hcal : s.memory.activeCallee = none)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {defPath : DefPath} {argKind : RigidTy}
+    (halias : defPath = "std::intrinsics::arith_offset" ∨
+      defPath = "std::intrinsics::wrapping_offset")
+    (hterm : bb.terminator.kind = .call (.constant c) argOps destination (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef defPath [argKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts defPath [argKind]
+      s.memory.traitImpls = none) :
+    stepMirFn body s =
+      match evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        MirStepNode.extCall
+          { defPath := defPath, typeArgs := [argKind], args := vs, memory := s.memory }
+          (resumeExternalCall s locals' destination targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported :=
+  stepMirFn_stage1_std_offset_alias_extCall hcal hphase hbb hstmt_none hstmt_len halias hterm hc
+    hcallee
+
+example (k : Stage1ExtraIntrinsic) :
+    classifyRustIntrinsic? k.defPath = some k.toRustIntrinsicKind ∧
+      stringEq k.defPath "core::intrinsics::exact_div" = false ∧
+      AnnealIntrinsic.ofDefPath? k.defPath = none :=
+  Stage1ExtraIntrinsic.classify_eq k
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    {calleePath : DefPath} {argKind : RigidTy}
+    {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [argKind])
+    (hval : c.val = .zeroSized)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = none)
+    {ty₁ ty₂ : Ty}
+    (hop₁ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty₁)
+    (hop₂ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ ty₂)
+    (hprim₁ : IsPrimScalarTy ty₁) (hprim₂ : IsPrimScalarTy ty₂)
+    {vs : List Value} {locals' : List LocalSlot}
+    (hops_ok : evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals = .ok vs locals')
+    {dstDecl : MirAst.LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl) :
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.unsupported "call of a function other than an AnnealIntrinsic is outside Anneal's intrinsic fragment")) :=
+  step_call_nonAnnealIntrinsic_miri_unsupported hstate hbb hstmt_none hterm hc hval hpath
+    hop₁ hop₂ hprim₁ hprim₂ hops_ok hdst
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {pointeeKind : RigidTy} {c : ConstOperand} {ptrIdx : Local} {countOp : MirAst.Operand}
+    {dstIdx : Local} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [.copy ⟨ptrIdx, []⟩, countOp] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef "core::intrinsics::arith_offset" [pointeeKind])
+    (hcallee : lookupCallee s.memory.callees body.layouts "core::intrinsics::arith_offset"
+      [pointeeKind] s.memory.traitImpls = none)
+    (hcallee_find : findCallee? s.memory.callees "core::intrinsics::arith_offset" = none)
+    (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
+    {ptrDecl : MirAst.LocalDecl} {ptrMut : Mutability}
+    (hptrDecl : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptrTy : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hptrImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf ptrIdx)
+    {addr : MirAst.ScalarInt}
+    (hptr_scalar : get? s.frame.locals ptrIdx = some (.init (.scalar addr)))
+    {countTy : Ty} (hcountInt : IsIntegralTy countTy .isize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    {countSc : MirAst.ScalarInt}
+    (hcount_pre : ScalarOperandPreVal s.frame.locals countOp countSc)
+    {dstDecl : MirAst.LocalDecl} {dstMut : Mutability}
+    (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeKind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {elemBytes : Nat}
+    (helem_anneal : rigidTyKindByteSize pointeeKind = some elemBytes)
+    (helem_miri : (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes)
+    (helem_lt : elemBytes < 2 ^ 63) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      StateRelLM3_1 body
+        { frame :=
+            { s.frame with
+              blockIdx := targetBb
+              stmtIdx := 0
+              locals := s.frame.locals.set dstIdx
+                (.init (.scalar ⟨(addr.bits + countSc.bits * elemBytes) % scalarModulus 8, 8⟩)) }
+          memory := s.memory }
+        m' allocMap :=
+  call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
+    hstate hphase hbb hstmt_none hstmt_len hterm hc hcallee hcallee_find hprog
+    hptrDecl hptrTy hptrImm hptr_scalar hcountInt hcountOp hcount_pre
+    hdst hdstTy hdstImm hdst_live helem_anneal helem_miri helem_lt
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut : Mutability} {pointeeTy countTy : Ty}
+    {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (helem_pos : 0 < elemBytes)
+    (hzero_align : ∀ srcVal dstVal countSc,
+      get? s.frame.locals srcIdx = some (.init srcVal) →
+      get? s.frame.locals dstIdx = some (.init dstVal) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      countSc.bits = 0 →
+      ptrValueAligned elemAlign srcVal = true ∧
+        ptrValueAligned elemAlign dstVal = true)
+    (htgt_same : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      decl_s.ty.kind = pointeeTy.kind ∧
+        decl_d.ty.kind = pointeeTy.kind ∧
+        unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none ∧
+        unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hptr_single : ∀ srcPtr dstPtr countSc,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      countSc.bits = 1 ∧
+        srcPtr.offsetBytes = 0 ∧
+        dstPtr.offsetBytes = 0)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
+      get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      WriteBytesScalarPreVal s.frame.locals countOp countSc →
+      0 < countSc.bits →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
+      e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? s.frame.locals e_s.localIdx ≠ some .dead →
+      get? s.frame.locals e_d.localIdx ≠ some .dead →
+      e_s.perm ≠ .disabled ∧
+        (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
+        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
+    hstate hphase hbb hstmt hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt helem_pos hzero_align htgt_same hptr_single hlive_ok
+
+open WitnessLM4_2 in
+example :
+    let b := arithOffsetScalarPtrBody
+    stepMirFn b (ptr4ScalarPtrAnnealPre b) = .fail .ub ∧
+    ∃ (s₁ : MachineState) (m₁ : AnnealStepState),
+      Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+        (ptr4ScalarPtrMiriPre b rawMutU64K) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [] ∧
+      get? s₁.frame.locals 0 = some (.init (.scalar ⟨82, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_arith_offset_stage1_scalar_ptr_divergence
+
+open WitnessLM4_2 in
+example :
+    let b := wrappingAddExtraBody
+    (∃ s₁, stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
+      get? s₁.frame.locals 0 = some (.init (.scalar ⟨50, 8⟩))) ∧
+    (∃ m₁,
+      Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+        (ptr4MiriPre b u64K) =
+        (m₁, .error (.unsupported "call of a function other than an AnnealIntrinsic is outside Anneal's intrinsic fragment"))) :=
+  WitnessLM4_2.wit_lm4_2_wrapping_add_stage1_extra_boundary
+
+example (p : ProvenancePtr) (hoff : p.offsetBytes < scalarModulus 8)
+    (mutability : Mutability) (pk : RigidTy) (idx : Nat) (layouts : Layout.LayoutTable)
+    (hthin : (match pk with | .slice _ => true | .str => true | .dynamic _ => true | _ => false) =
+      false) :
+    ∃ bs,
+      encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
+      decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .rawPtr mutability pk, layoutIdx := idx } bs = some (.ptr p 8) :=
+  encodeUntypedValueToBytes_ptr_decode_roundtrip p hoff mutability pk idx layouts
+    (by cases pk <;> exact hthin)
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut mutability : Mutability} {pk : RigidTy}
+    {countTy : Ty} {countSc : MirAst.ScalarInt}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut (.rawPtr mutability pk))
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hsrc_live : get? s.frame.locals srcIdx ≠ some .dead)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut (.rawPtr mutability pk))
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc) :
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
+    hstate hbb hstmt hsrcDecl hsrcTy hsrcImm hsrc_live
+    hdstDecl hdstTy hdstImm hdst_live hcountInt hcountOp hcnt_pre
+
+open WitnessLM4_2 in
+example :
+    (let b := partialCopyLockstepBody 2
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (let b := partialCopyLockstepBody 1
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0xFFFFFFFFFFFFFFFF) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarMax) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+
+open WitnessLM4_2 in
+example :
+    let b := partialCopyLockstepBody 8
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_1 b s₅ m₅ [e₂, e₁] ∧
+      get? s₅.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok
+
+open WitnessLM4_2 in
+example :
+    let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+    ∃ bs,
+      encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
+      decodeValueFromBytes defaultCodecFuel emptyLayoutTable
+        { kind := rawMutU64K, layoutIdx := 0 } bs = some (.ptr p 8) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
+
+open WitnessLM4_2 in
+example :
+    (let b := copyStage1RawPtrBody
+     let e_p := rawPtrAllocMapEntry b.localDecls b.layouts .mut 0 9 Witness.lm31AllocId1
+     let e_s := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e_d := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+     let s : MachineState := {
+       frame := {
+         blockIdx := 0
+         stmtIdx := 0
+         locals := [.uninit, .init (.ptr p 8), .uninit,
+           .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+           .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] }
+       memory := {
+         emptyMemory with
+         borrows := [e_s.toBorrowEntry, e_d.toBorrowEntry, e_p.toBorrowEntry]
+         nextTag := 10 } }
+     ∃ s', stepMirFn b s = .step s' ∧ get? s'.frame.locals 2 = some (.init (.ptr p 8))) ∧
+    (let b := copyStage1RawPtrBoundaryBody
+     stepMirFn b (ptr4AnnealPre b) = .fail .ub ∧
+     ∃ m',
+       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+         (ptr4MiriPre b unitK) =
+         (m', .error (.unsupported "pointee of TyId 80 is not encoded"))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
+
+open WitnessLM4_2 in
+example :
+    let b := copyStage1RawPtrCastLockstepBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ s₅_stage1 : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      stepMirFn b s₄ = .step s₅_stage1 ∧
+      get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+      Miri.Interpreter.Step.step hooks () m₄ =
+        (m₅, .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl decl_s decl_d : MirAst.LocalDecl} {srcMut dstMut : Mutability}
+    {pointeeTy countTy : Ty} {ptId : Miri.MIR.TyId} {elemBytes elemAlign : Nat}
+    {srcPtr dstPtr : ProvenancePtr} {countSc srcSc dstSc : MirAst.ScalarInt}
+    {e_s e_d : AllocMapEntry} {srcKind dstKind : Miri.MIR.IntegerKind}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hprim : IsPrimScalarTy pointeeTy)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut pointeeTy.kind)
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
+    (hsrc_val : get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)))
+    (hdst_val : get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)))
+    (hoff0_s : srcPtr.offsetBytes = 0)
+    (hoff0_d : dstPtr.offsetBytes = 0)
+    (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc)
+    (hcnt_pos : 0 < countSc.bits)
+    (he_s : e_s ∈ allocMap) (het_s : e_s.tag = srcPtr.tag)
+    (he_d : e_d ∈ allocMap) (het_d : e_d.tag = dstPtr.tag)
+    (hperm_s : e_s.perm ≠ .disabled)
+    (hperm_d : e_d.perm = .active ∨ e_d.perm = .reserved)
+    (hne_loc : e_s.localIdx ≠ e_d.localIdx)
+    (hunion_s : unionLocalByteSize? body.localDecls body.layouts e_s.localIdx = none)
+    (hunion_d : unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
+    (hslot_s : get? s.frame.locals e_s.localIdx = some (.init (.scalar srcSc)))
+    (hslot_d : get? s.frame.locals e_d.localIdx = some (.init (.scalar dstSc)))
+    (hdecl_s : get? body.localDecls e_s.localIdx = some decl_s)
+    (hsrcInt : IsIntegralTy decl_s.ty srcKind)
+    (hdecl_d : get? body.localDecls e_d.localIdx = some decl_d)
+    (hdstInt : IsIntegralTy decl_d.ty dstKind)
+    (hw_eq : integerKindByteWidth dstKind = integerKindByteWidth srcKind)
+    (hfull : countSc.bits * elemBytes = integerKindByteWidth srcKind)
+    (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
+    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
+    StepRelLM3_1 body m
+      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
+    hstate hphase hbb hstmt hprim hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
+    hcountInt hcountOp hpt hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos
+    he_s het_s he_d het_d hperm_s hperm_d hne_loc hunion_s hunion_d
+    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  sliceScalarBytes
+  spliceScalarBytes
+  stage1_evalIntegerBitIntrinsic_eq
+  stage1_evalSaturating_eq
+  stage1_evalArithOffset_eq
+  AnnealIntrinsic
+  AnnealIntrinsic.ofBit
+  AnnealIntrinsic.defPath
+  AnnealIntrinsic.ofDefPath?
+  AnnealIntrinsic.ofDefPath?_cases
+  AnnealIntrinsic.name
+  intrinsics_eval_wrappingOffset
+  evalRotate_sizeBytes
+  evalRotate_canonical
+  evalRotate_bits_eq_bitVec
+  evalRotate_scalarRel
+  spliceRepeatedBytes
+  spliceRepeatedBytes_lt_scalarModulus
+  spliceRepeatedBytes_byte
+  StackScalarAllocShape.writeRepeatedByte_partial
+  sliceScalarBytes_lt_scalarModulus
+  sliceScalarBytes_byte
+  spliceScalarBytes_lt_scalarModulus
+  spliceScalarBytes_byte
+  IsIntegralTy
+  WriteBytesPointee
+  WriteBytesScalarPreVal
+  ScalarOperandPreVal
+  ValidCopyAlign
+  CopyPointee
+  CopyTargetCompatible
+  copyNextAllocMap
+  copyNextAllocMap_eq_self
+  step_intrinsic_assume_simulation
+  call_intrinsic_bitcount_simulation
+  call_intrinsic_rotate_simulation
+  call_intrinsic_saturating_simulation
+  call_intrinsic_exact_div_simulation
+  call_intrinsic_bitops_simulation
+  call_intrinsic_offset_simulation
+  call_intrinsic_arithOffset_stage1_simulation
+  call_intrinsic_arithOffset_stage1_scalar_ptr_divergence
+  call_intrinsic_write_bytes_simulation_explicit
+  call_intrinsic_write_bytes_simulation
+  call_intrinsic_write_bytes_perm_divergence
+  step_intrinsic_copyNonOverlapping_simulation_explicit
+  step_intrinsic_copyNonOverlapping_simulation
+  step_intrinsic_copyNonOverlapping_simulation_same_allocMap
+  step_intrinsic_copyNonOverlapping_uninit_src_divergence
+  step_intrinsic_copyNonOverlapping_perm_divergence
+  step_intrinsic_copyNonOverlapping_uninit_src_range_divergence
+  step_intrinsic_copyNonOverlapping_perm_range_divergence
+  evalCopySingleDirect_rawPtr_distinct_ok
+  stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
+  mergeByteProvenance_some_left
+  decodeLittleEndianBytes_encodeLittleEndianBytes_some
+  encodeUntypedValueToBytes_ptr_decode_roundtrip
+  step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
+  stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
+  step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
+  step_intrinsic_copyNonOverlapping_stage1_simulation
+  step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap
+  step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence
+  step_intrinsic_copyNonOverlapping_stage1_perm_divergence
+  decodeValueFromBytes_encodeLittleEndianBytes_int
+  evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
+  stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+  stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
+  stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2
+  step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
+  stepMirFnLM4_2
+  stepMirFnLM4_2_eq_of_not_other
+  evalTerminator_stage1_bitcount_call
+  evalTerminator_stage1_saturating_call
+  evalTerminator_stage1_exactDiv_call
+  evalTerminator_stage1_arithOffset_call
+  evalTerminator_stage1_unclassified_call_extCall
+  evalTerminator_stage1_wrappingAdd_call
+  AnnealIntrinsic.stage1Unmodeled
+  AnnealIntrinsic.stage1Unmodeled_classify
+  AnnealIntrinsic.stage1Modeled
+  AnnealIntrinsic.stage1Modeled_classify
+  stage1_std_offset_aliases_unclassified
+  stepMirFn_stage1_unmodeled_intrinsic_extCall
+  stepMirFn_stage1_std_offset_alias_extCall
+  Stage1ExtraIntrinsic
+  Stage1ExtraIntrinsic.defPath
+  Stage1ExtraIntrinsic.toRustIntrinsicKind
+  Stage1ExtraIntrinsic.classify_eq
+  step_call_nonAnnealIntrinsic_miri_unsupported
+  call_intrinsic_rotate_stage1_boundary
+  WitnessLM4_2.callStage1ExtCall
+  WitnessLM4_2.ptr4Stage1ExtCall
+  WitnessLM4_2.wit_lm4_2_assume_true
+  WitnessLM4_2.wit_lm4_2_assume_false
+  WitnessLM4_2.wit_lm4_2_assume_invalid_bool
+  WitnessLM4_2.wit_lm4_2_ctpop
+  WitnessLM4_2.wit_lm4_2_ctlz
+  WitnessLM4_2.wit_lm4_2_cttz
+  WitnessLM4_2.wit_lm4_2_bswap
+  WitnessLM4_2.wit_lm4_2_bitreverse
+  WitnessLM4_2.wit_lm4_2_ctlz_nonzero_zero_ub
+  WitnessLM4_2.wit_lm4_2_cttz_nonzero_zero_ub
+  WitnessLM4_2.wit_lm4_2_ctlz_nonzero_ok
+  WitnessLM4_2.wit_lm4_2_cttz_nonzero_ok
+  WitnessLM4_2.wit_lm4_2_saturating_add
+  WitnessLM4_2.wit_lm4_2_saturating_add_max
+  WitnessLM4_2.wit_lm4_2_saturating_add_signed_max
+  WitnessLM4_2.wit_lm4_2_saturating_sub
+  WitnessLM4_2.wit_lm4_2_saturating_sub_zero
+  WitnessLM4_2.wit_lm4_2_saturating_sub_min
+  WitnessLM4_2.wit_lm4_2_exact_div_signed
+  WitnessLM4_2.wit_lm4_2_exact_div_unsigned
+  WitnessLM4_2.wit_lm4_2_exact_div_by_zero_ub
+  WitnessLM4_2.wit_lm4_2_exact_div_min_neg_one_ub
+  WitnessLM4_2.wit_lm4_2_exact_div_remainder_ub
+  WitnessLM4_2.wit_lm4_2_rotate_left_boundary
+  WitnessLM4_2.wit_lm4_2_rotate_right_boundary
+  WitnessLM4_2.wit_lm4_2_rotate_left_mod_mask
+  WitnessLM4_2.wit_lm4_2_rotate_right_mod_mask
+  WitnessLM4_2.wit_lm4_2_arith_offset_pos
+  WitnessLM4_2.wit_lm4_2_arith_offset_neg
+  WitnessLM4_2.wit_lm4_2_arith_offset_uninit_ub
+  WitnessLM4_2.wit_lm4_2_arith_offset_stage1_scalar_ptr_divergence
+  WitnessLM4_2.wit_lm4_2_wrapping_offset_boundary
+  WitnessLM4_2.wit_lm4_2_std_wrapping_offset_boundary
+  WitnessLM4_2.wit_lm4_2_wrapping_add_stage1_extra_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_partial_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_oob_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_overflow_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_frozen_boundary
+  WitnessLM4_2.wit_lm4_2_write_bytes_zero_misaligned_boundary
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overlap_ub
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_oob_ub
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overflow_ub
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_uninit_src_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_uninit_src_range_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_range_divergence
+  WitnessLM4_2.wit_lm4_2_adt_pointee_stage1_copy_offset
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
+  WitnessLM4_2.partialCopyDecls
+  WitnessLM4_2.partialCopyState
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+  WitnessLM4_2.partialCopyLockstepBody
+  WitnessLM4_2.partialCopyLockstep_steps4_and_sim
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
+  WitnessLM4_2.copyStage1RawPtrBoundaryBody
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
+  WitnessLM4_2.copyStage1RawPtrCastLockstepBody
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary
+
+/-! ### `LM-4.3`: whole-program safety equivalence and `RunLoop` simulation -/
+
+open LeanMiriSpec.Correspondence.Safety in
+example (H : AnnealMiriHooks) (m m' : AnnealStepState) :
+    (miriSystem H).step m m' ↔
+      Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks H) () m = (m', .ok ()) ∧
+        m'.stack.frames ≠ #[] :=
+  Iff.rfl
+
+open LeanMiriSpec.Correspondence.Safety in
+example (H : AnnealMiriHooks) (m : AnnealStepState) (o : MiriSafetyOutcome) :
+    (miriSystem H).terminal m o ↔
+      ((∃ e, (Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks H) () m).2 = .error e ∧
+          o = classifyError e) ∨
+        ((Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks H) () m).2 = .ok () ∧
+          (Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks H) () m).1.stack.frames = #[] ∧
+          o = rootPopOutcome H m)) :=
+  Iff.rfl
+
+open LeanMiriSpec.Correspondence.Safety in
+example (H : AnnealMiriHooks) (m : AnnealStepState) :
+    rootPopOutcome H m =
+      match (H.returnOperand () m).2 with
+      | .ok v => .returned v
+      | .error e => classifyError e :=
+  rfl
+
+open LeanMiriSpec.Correspondence.Safety in
+example (H : AnnealMiriHooks) (m : AnnealStepState) :
+    (miriSystem H).CanProgress m ∧ (miriSystem H).CompleteFrom m ∧
+      ((miriSystem H).Safe m ↔ ∀ o, (miriSystem H).ReachesOutcome m o → o.isReturn) :=
+  ⟨miriSystem_canProgress m, miriSystem_completeFrom m, miriSystem_safe_iff m⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) {m' : AnnealStepState} (hemp : m'.stack.frames = #[]) :
+    (annealMiriHooks body).coreStep () m' = (m', .ok false) ∧
+    Miri.Interpreter.RunLoop.runOnStackEmpty (annealRunLoopHooks (annealMiriHooks body)) () m' =
+      (m', .ok .ready) ∧
+    Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks (annealMiriHooks body)) () m' =
+      (m', .error (.termination (.exit 0 true))) ∧
+    Miri.Interpreter.RunLoop.reportsUB (.termination (.exit 0 true)) = false :=
+  miriIter_after_root_pop body hemp
+
+open LeanMiriSpec.Correspondence.Safety in
+example {e e' : Miri.Interpreter.StepError} :
+    (classifyError e = .unsupported e' ↔
+      Miri.Interpreter.RunLoop.reportsUB e = false ∧ isUnsupportedError e = true ∧ e' = e) ∧
+    (classifyError e = .blocked e' ↔
+      Miri.Interpreter.RunLoop.reportsUB e = false ∧ isUnsupportedError e = false ∧ e' = e) :=
+  ⟨classifyError_eq_unsupported_iff, classifyError_eq_blocked_iff⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example (k : Trusted.Effect.FailureKind) (e : Miri.Interpreter.StepError) :
+    FaultAgrees k e ↔ annealFaultClass k = miriErrorClass e :=
+  Iff.rfl
+
+open LeanMiriSpec.Correspondence.Safety in
+example (H : AnnealMiriHooks) (m : AnnealStepState) :
+    Miri.Interpreter.RunLoop.iteration (annealRunLoopHooks H) () m =
+      stepToIteration (H.coreStep () m) :=
+  miriIter_eq H m
+
+open LeanMiriSpec.Correspondence.Safety in
+example {e e' : Miri.Interpreter.StepError} :
+    classifyError e = .undefinedBehavior e' ↔
+      Miri.Interpreter.RunLoop.reportsUB e = true ∧ e' = e :=
+  classifyError_eq_ub_iff
+
+open LeanMiriSpec.Correspondence.Safety in
+example (e : Miri.Interpreter.StepError) : ¬ (classifyError e).isReturn :=
+  classifyError_not_isReturn e
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {E : Trusted.Effect.Effect} {R S : Type} [Trusted.Effect.FaultEffect E]
+    {step : S → ITreeF E R S} {x : S} :
+    TreeSafe (ITree.cofix step x) ↔ ∀ y, CoReach step x y → ¬ IsFaultNode (step y) :=
+  treeSafe_cofix_iff
+
+open LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) (H : AnnealMiriHooks)
+    (Inv : MachineState → AnnealStepState → Prop)
+    (RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop) :
+    StepClosedSim body H Inv RetRel ↔
+      ∀ s m, Inv s m → Lockstep H Inv RetRel m (stepMirFn body s) (H.coreStep () m) :=
+  ⟨fun h => h.lockstep, fun h => ⟨h⟩⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {Inv : MachineState → AnnealStepState → Prop}
+    {RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop}
+    (hsim : StepClosedSim body H Inv RetRel) {s : MachineState} {m : AnnealStepState}
+    (hinv : Inv s m) :
+    (∀ y, CoStep (stepMirState body) (.running s) y →
+      ∃ s' m', y = .running s' ∧ Inv s' m' ∧ (miriSystem H).step m m') ∧
+    (∀ m', (miriSystem H).step m m' →
+      ∃ s', CoStep (stepMirState body) (.running s) (.running s') ∧ Inv s' m') ∧
+    ((∃ k, stepMirFn body s = .fail k) ↔
+      ∃ o, (miriSystem H).terminal m o ∧ ¬ o.isReturn) ∧
+    (stepMirFn body s = .fail .ub ↔
+      ∃ e, (miriSystem H).terminal m (.undefinedBehavior e)) ∧
+    ((∃ retVal mem, stepMirFn body s = .retNormal retVal mem) ↔
+      ∃ v, (miriSystem H).terminal m (.returned v)) ∧
+    (∀ v, (miriSystem H).terminal m (.returned v) →
+      ∃ retVal mem, stepMirFn body s = .retNormal retVal mem ∧ RetRel retVal v) :=
+  step_universal_simulation hsim hinv
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {Inv : MachineState → AnnealStepState → Prop}
+    {RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop}
+    (hsim : StepClosedSim body H Inv RetRel) (fuel : Nat) {s : MachineState}
+    {m : AnnealStepState} (hinv : Inv s m) :
+    RunLoopRel Inv RetRel (runAnnealBounded body fuel s) (runLoopFuel H fuel m) :=
+  runLoop_universal_simulation hsim fuel hinv
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {Inv : MachineState → AnnealStepState → Prop}
+    {RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop}
+    (hsim : StepClosedSim body H Inv RetRel) {s : MachineState} {m : AnnealStepState}
+    (hinv : Inv s m) :
+    (TreeSafe (mirTree body s) ↔ (miriSystem H).Safe m) ∧
+    (MirNoUBTree (mirTree body s) ↔ (miriSystem H).Safe m) ∧
+    (TreeSafe (mirTree body s) → (miriSystem H).NoUndefinedBehavior m) ∧
+    (MirReachesUB (mirTree body s) ↔
+      ∃ e, (miriSystem H).ReachesOutcome m (.undefinedBehavior e)) ∧
+    (∀ fuel, runAnnealBounded body fuel s = .faulted .ub ↔
+      ∃ m' e, runLoopFuel H fuel m = .stopped m' e ∧
+        Miri.Interpreter.RunLoop.reportsUB e = true) ∧
+    (Miri.OperationalSafety.InfiniteRun (miriSystem H) m ↔
+      ∀ n, ∃ s', runAnnealBounded body n s = .running s') :=
+  ⟨treeSafe_iff_miriSafe hsim hinv, mirNoUBTree_iff_miriSafe hsim hinv,
+    treeSafe_imp_noUndefinedBehavior hsim hinv, reachesUB_iff_miriReachesUB hsim hinv,
+    fun fuel => runLoop_ub_iff hsim fuel hinv, infiniteRun_iff_anneal_forever hsim hinv⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {Inv : MachineState → AnnealStepState → Prop}
+    {RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop}
+    (hsim : StepClosedSim body H Inv RetRel) {s : MachineState} {m : AnnealStepState}
+    (hinv : Inv s m) (postA : Value → Prop)
+    (postM : Miri.Interpreter.Operand AnnealProv → Prop)
+    (hpost : ∀ retVal v, RetRel retVal v → (postA retVal ↔ postM v)) :
+    (miriSystem H).PartialCorrect m postM ↔
+      ∀ tr retVal mem, ReachesRet (mirTree body s) tr (.normal (retVal, mem)) → postA retVal :=
+  partialCorrect_iff_annealPostcondition hsim hinv postA postM hpost
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {Inv : MachineState → AnnealStepState → Prop}
+    {RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop}
+    (hsim : StepClosedSim body H Inv RetRel) {s : MachineState} {m : AnnealStepState}
+    (hinv : Inv s m) (k : Trusted.Effect.FailureKind) :
+    (stepMirFn body s = .fail k ↔
+      ∃ o, (miriSystem H).terminal m o ∧ outcomeFaultClass o = some (annealFaultClass k)) ∧
+    (MirReachesFault (mirTree body s) k ↔
+      ∃ o, (miriSystem H).ReachesOutcome m o ∧
+        outcomeFaultClass o = some (annealFaultClass k)) ∧
+    (UBOnlyFaults body Inv →
+      ∀ o, (miriSystem H).ReachesOutcome m o → o.isReturn ∨ ∃ e, o = .undefinedBehavior e) :=
+  ⟨step_faultClass_simulation hsim hinv k, reachesFault_iff_miriReachesClass hsim hinv k,
+    fun hub => miri_outcomes_of_ubOnly hsim hub hinv⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    (hbody : WellTypedBody body nonAddrTaken) :
+    StepClosedSim body (annealMiriHooks body) (ScalarFragmentInv body nonAddrTaken)
+      (ImmediateRetRel body) :=
+  scalarFragment_stepClosedSim hbody
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    (hbody : WellTypedBodyExt body nonAddrTaken) :
+    StepClosedSim body (annealMiriHooks body) (ScalarFragmentInv body nonAddrTaken)
+      (ImmediateRetRel body) ∧ UBOnlyFaults body (ScalarFragmentInv body nonAddrTaken) :=
+  ⟨scalarFragmentExt_stepClosedSim hbody, scalarFragmentExt_ubOnly hbody⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) :
+    StateRelLM2_2 body emptyStructTypeEnv {} 0 (initMachineState body []) (miriEntryState body) ∧
+    StateRelLM2_4 body (initMachineState body []) (miriEntryState body) ∧
+    StateRelLM3_1 body (initMachineState body []) (miriEntryState body) [] ∧
+    StateRelLM3_2 body (initMachineState body []) (miriEntryState body) [] ∧
+    StateRelLM3_2Tree body (initMachineState body []) (miriEntryState body) [] ∧
+    MultiFrameStateRel body (initMachineState body []) (miriEntryState body) :=
+  ⟨stateRelLM2_2_entry body, stateRelLM2_4_entry body, stateRelLM3_1_entry body,
+    stateRelLM3_2_entry body, stateRelLM3_2Tree_entry body, multiFrameStateRel_entry body⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) : StateRel body (initMachineState body []) (miriEntryState body) :=
+  stateRel_entry body
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} (hfrag : InSafeScalarFragment body) :
+    (TreeSafe (mirCallTree body []) ↔
+      (miriSystem (annealMiriHooks body)).Safe (miriEntryState body)) ∧
+    (MirReachesUB (mirCallTree body []) ↔
+      ∃ e, (miriSystem (annealMiriHooks body)).ReachesOutcome (miriEntryState body)
+        (.undefinedBehavior e)) ∧
+    (Miri.OperationalSafety.InfiniteRun (miriSystem (annealMiriHooks body))
+        (miriEntryState body) ↔
+      ∀ n, ∃ s', runAnnealBounded body n (initMachineState body []) = .running s') ∧
+    (∀ fuel, RunLoopRel (ScalarFragmentInv body (fun _ => True)) (ImmediateRetRel body)
+      (runAnnealBounded body fuel (initMachineState body []))
+      (runLoopFuel (annealMiriHooks body) fuel (miriEntryState body))) :=
+  ⟨scalarFragment_treeSafe_iff_miriSafe hfrag, scalarFragment_reachesUB_iff hfrag,
+    scalarFragment_infiniteRun_iff hfrag, scalarFragment_runLoop_simulation hfrag⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {rootBody : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m, MultiFrameStateRel rootBody s m → Frag s m →
+      StepRelMultiFrame rootBody m (stepMirFn rootBody s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → MultiFrameStateRel rootBody s' m' → Frag s' m') :
+    StepClosedSim rootBody (multiFrameHooks rootBody core)
+      (fun s m => MultiFrameStateRel rootBody s m ∧ Frag s m) (MultiFrameRetRel rootBody) :=
+  stepClosedSim_of_stepRelMultiFrame h
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    Miri.OperationalSafety.InfiniteRun (miriSystem (annealMiriHooks loopBody))
+      (miriEntryState loopBody) ∧
+    (miriSystem (annealMiriHooks loopBody)).Safe (miriEntryState loopBody) ∧
+    (∀ o, ¬ (miriSystem (annealMiriHooks loopBody)).ReachesOutcome (miriEntryState loopBody) o) ∧
+    TreeSafe (mirCallTree loopBody []) ∧
+    (∀ tr r, ¬ ReachesRet (mirCallTree loopBody []) tr r) :=
+  w1_loop_diverges_safely
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (d : Nat) (hd : d < 256) :
+    TreeSafe (mirCallTree (Witness.divBody d) []) ↔
+      (miriSystem (annealMiriHooks (Witness.divBody d))).Safe (miriEntryState (Witness.divBody d)) :=
+  w1_div_treeSafe_iff_miriSafe d hd
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    TreeSafe (mirCallTree assertContinueBody []) ∧
+    (∃ e, (miriSystem (annealMiriHooks assertContinueBody)).ReachesOutcome
+      (miriEntryState assertContinueBody) (.undefinedBehavior e)) ∧
+    ¬ (miriSystem (annealMiriHooks assertContinueBody)).Safe (miriEntryState assertContinueBody) :=
+  w1_assert_continue_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturns Witness.lm31AddrOfBody (annealMiriHooks Witness.lm31AddrOfBody)
+      (initMachineState Witness.lm31AddrOfBody []) (miriEntryState Witness.lm31AddrOfBody)
+      (.scalar ⟨99, 8⟩) (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar99))) ∧
+    AgreeUB Witness.lm31DanglingBody (annealMiriHooks Witness.lm31DanglingBody)
+      (initMachineState Witness.lm31DanglingBody []) (miriEntryState Witness.lm31DanglingBody) :=
+  ⟨w3_rawPtr_write_read_returns, w3_use_after_storageDead_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturnsBits callFiveBody (callHooks callFiveBody [fiveBody])
+      (initMachineStateWithCallees callFiveBody [] [fiveBody]) (miriEntryState callFiveBody) 1 5 :=
+  w5_call_return
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
+    (entryM : AnnealStepState) (sz b : Nat) :
+    AgreeReturnsBits body H entryA entryM sz b ↔
+      (TreeSafe (mirTree body entryA) ∧
+        (∃ tr mem, ReachesRet (mirTree body entryA) tr (.normal (.scalar ⟨b, sz⟩, mem))) ∧
+        (miriSystem H).Safe entryM ∧
+        (∃ v, (miriSystem H).ReachesOutcome entryM (.returned v) ∧
+          operandScalarBits? sz v = some b) ∧
+        (miriSystem H).PartialCorrect entryM (fun v => operandScalarBits? sz v = some b)) :=
+  Iff.rfl
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
+    (entryM : AnnealStepState) :
+    AgreeUB body H entryA entryM ↔
+      (MirReachesUB (mirTree body entryA) ∧ ¬ TreeSafe (mirTree body entryA) ∧
+        (∃ e, (miriSystem H).ReachesOutcome entryM (.undefinedBehavior e)) ∧
+        ¬ (miriSystem H).Safe entryM) :=
+  Iff.rfl
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturnsBits countLoopBody (annealMiriHooks countLoopBody)
+      (initMachineState countLoopBody []) (miriEntryState countLoopBody) 1 3 ∧
+    InSafeScalarFragment countLoopBody ∧
+    (∀ d, d < 256 → InSafeScalarFragment (Witness.lm12SwitchBody d)) ∧
+    InSafeScalarFragment Witness.lm12CastBody :=
+  ⟨w1_count_loop_returns.1, countLoop_inFragment, w1_switch_inFragment, w1_cast_inFragment⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturns Witness.lm21FullFnBody (annealMiriHooks Witness.lm21FullFnBody)
+      (initMachineState Witness.lm21FullFnBody []) (miriEntryState Witness.lm21FullFnBody)
+      (.scalar ⟨22, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22)))) ∧
+    AgreeUB arrayIndexOobEntryBody (annealMiriHooks arrayIndexOobEntryBody)
+      (initMachineState arrayIndexOobEntryBody []) (miriEntryState arrayIndexOobEntryBody) :=
+  ⟨w2_array_index_returns, w2_array_index_oob_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeUB arithOffsetUninitBody (annealMiriHooks arithOffsetUninitBody)
+      (initMachineState arithOffsetUninitBody [])
+      (miriEntryState arithOffsetUninitBody) ∧
+    AgreeUB copyOverlapEntryBody (annealMiriHooks copyOverlapEntryBody)
+      (initMachineState copyOverlapEntryBody [])
+      (miriEntryState copyOverlapEntryBody) ∧
+    AgreeUB (exactDivBody 43) (annealMiriHooks (exactDivBody 43))
+      (initMachineState (exactDivBody 43) []) (miriEntryState (exactDivBody 43)) ∧
+    AgreeUB (assumeBody false) (annealMiriHooks (assumeBody false))
+      (initMachineState (assumeBody false) []) (miriEntryState (assumeBody false)) :=
+  ⟨w3_arith_offset_uninit_ub, w6_copy_nonoverlapping_overlap_ub,
+   w6_exact_div_non_multiple_ub, w6_assume_false_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} (hfrag : InSafeScalarFragment body) (postA : Value → Prop)
+    (postM : Miri.Interpreter.Operand AnnealProv → Prop)
+    (hpost : ∀ retVal v, ImmediateRetRel body retVal v → (postA retVal ↔ postM v))
+    (k : Trusted.Effect.FailureKind) :
+    ((miriSystem (annealMiriHooks body)).PartialCorrect (miriEntryState body) postM ↔
+      ∀ tr retVal mem, ReachesRet (mirCallTree body []) tr (.normal (retVal, mem)) →
+        postA retVal) ∧
+    (∀ o, (miriSystem (annealMiriHooks body)).ReachesOutcome (miriEntryState body) o →
+      o.isReturn ∨ ∃ e, o = .undefinedBehavior e) ∧
+    (MirReachesFault (mirCallTree body []) k → k = .ub) ∧
+    (MirReachesFault (mirCallTree body []) k ↔
+      ∃ o, (miriSystem (annealMiriHooks body)).ReachesOutcome (miriEntryState body) o ∧
+        outcomeFaultClass o = some (annealFaultClass k)) :=
+  ⟨scalarFragment_partialCorrect_iff hfrag postA postM hpost, scalarFragment_outcomes hfrag,
+    scalarFragment_faults_ub hfrag, scalarFragment_reachesFault_iff hfrag k⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m a, StateRelLM3_1 body s m a → Frag s m → ∃ a',
+      StepObsRelLM3_1 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_1 body s' m' a' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_1 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, PtrRetRel body a r v) :=
+  stepClosedSim_of_stepObsRelLM3_1 h
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {env : StructTypeEnv} {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m stEnv b, StateRelLM2_2 body env stEnv b s m → Frag s m →
+      (∃ stEnv' b', StepRelLM2_2 body env stEnv' b' m (stepMirFn body s) (core () m) ∧
+        ∀ s' m', core () m = (m', .ok true) → StateRelLM2_2 body env stEnv' b' s' m' →
+          Frag s' m') ∨
+      StepRelStructReturnLM2_2 body fields paths m (stepMirFn body s) (core () m) ∨
+      ((∃ retVal mem, stepMirFn body s = .retNormal retVal mem) ∧
+        StepRel body m (stepMirFn body s) (core () m))) :
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ stEnv b, StateRelLM2_2 body env stEnv b s m) ∧ Frag s m)
+      (fun r v => ImmediateRetRel body r v ∨ StructRetRel body fields paths r v) :=
+  stepClosedSim_of_stepRelLM2_2 h
+
+open LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) (env : StructTypeEnv) (immLocals : List Local) {env' : EnumTypeEnv}
+    (henv_valid : ∀ ty tb vs, env' ty = some (tb, vs) → ValidEnumLayout ty body.layouts tb vs)
+    {b : Nat} (hb : b = 0 ∨ 1 + b < 2 ^ 32) :
+    StateRelLM2_2 body env { initLocals := [], immLocals := immLocals } b
+      (initMachineState body []) (miriEntryState body) ∧
+    StateRelLM2_3 body env' b (initMachineState body []) (miriEntryState body) :=
+  ⟨stateRelLM2_2_entry_env body env immLocals hb,
+    stateRelLM2_3_entry_of_budget body henv_valid hb⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example (m' : AnnealStepState)
+    (r : Except Miri.Interpreter.StepError (Miri.Interpreter.Operand AnnealProv)) :
+    popOutcome m' r = match r with
+      | .ok v => .returned m' v
+      | .error e => .stopped m' e :=
+  by cases r <;> rfl
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ e, (miriSystem (annealMiriHooks tailCallBody)).ReachesOutcome
+      (miriEntryState tailCallBody) (.unsupported e)) ∧
+    ¬ (miriSystem (annealMiriHooks tailCallBody)).Safe (miriEntryState tailCallBody) ∧
+    MirReachesUB (mirCallTree tailCallBody []) ∧
+    ¬ TreeSafe (mirCallTree tailCallBody []) :=
+  w1_tail_call_class_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (miriSystem (annealMiriHooks storageDeadZeroBody)).ReachesOutcome
+      (miriEntryState storageDeadZeroBody) (.blocked (.stack .cannotMakeReturnPlaceDead)) ∧
+    ¬ (miriSystem (annealMiriHooks storageDeadZeroBody)).Safe (miriEntryState storageDeadZeroBody) ∧
+    MirReachesUB (mirCallTree storageDeadZeroBody []) ∧
+    ¬ TreeSafe (mirCallTree storageDeadZeroBody []) :=
+  w1_storageDead_returnPlace_class_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturnsBits ctlzBody (annealMiriHooks ctlzBody) (initMachineState ctlzBody [])
+      (miriEntryState ctlzBody) 4 31 ∧
+    AgreeReturnsBits saturatingAddBody (annealMiriHooks saturatingAddBody)
+      (initMachineState saturatingAddBody []) (miriEntryState saturatingAddBody) 1 255 ∧
+    AgreeReturnsBits (exactDivBody 42) (annealMiriHooks (exactDivBody 42))
+      (initMachineState (exactDivBody 42) []) (miriEntryState (exactDivBody 42)) 4 6 ∧
+    AgreeReturnsBits (assumeBody true) (annealMiriHooks (assumeBody true))
+      (initMachineState (assumeBody true) []) (miriEntryState (assumeBody true)) 1 7 :=
+  ⟨w6_ctlz_returns, w6_saturating_add_returns, w6_exact_div_valid, w6_assume_true⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ tr mem, ReachesRet (mirCallTree rotateLeftBody []) tr (.normal (.scalar ⟨3, 4⟩, mem))) ∧
+    MirReachesUB (mirCallTree rotateLeftBody []) ∧
+    ¬ TreeSafe (mirCallTree rotateLeftBody []) ∧
+    (∃ msg, (miriSystem (annealMiriHooks rotateLeftBody)).ReachesOutcome
+      (miriEntryState rotateLeftBody) (.unsupported (.unsupported msg))) ∧
+    ¬ (miriSystem (annealMiriHooks rotateLeftBody)).Safe (miriEntryState rotateLeftBody) :=
+  w6_rotate_left_extCall_boundary
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ imm0, AgreeReturns Witness.lm23Body (.ofHooks Witness.lm23Hooks annealControlHooks)
+        (Witness.lm23InitAnneal 0) (Witness.lm23InitMiri 0) (.scalar ⟨99, 8⟩) (.immediate imm0) ∧
+      ImmediateRel Witness.lm23U64Ty Witness.lm23Layouts (.scalar ⟨99, 8⟩) imm0) ∧
+    (∃ v, AgreeReturns Witness.lm22PaddedBody
+        (rootHooks (Miri.Interpreter.Step.step
+          (annealStepHooksLM2_2 Witness.lm22PaddedBody.localDecls Witness.lm22PaddedBody.layouts)))
+        (initMachineState Witness.lm22PaddedBody [])
+        (miriEntryState Witness.lm22PaddedBody) (.scalar ⟨99, 4⟩) v ∧
+      operandScalarBits? 4 v = some 99) ∧
+    AgreeUB Witness.lm24Body
+      (.ofHooks (annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts)
+        annealControlHooks)
+      (Witness.lm24InitAnneal 2) (Witness.lm24InitMiri 2) :=
+  ⟨w2_enum_downcast_switch_returns, w2_padded_struct_returns, w2_union_uninit_bytes_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns arithOffsetPosEntryBody (annealMiriHooks arithOffsetPosEntryBody)
+        (initMachineState arithOffsetPosEntryBody [])
+        (miriEntryState arithOffsetPosEntryBody)
+        (.ptr { allocId := 1, offsetBytes := 40 } 8) (.immediate imm0) ∧
+      get? arithOffsetPosEntryBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_1
+        [rawPtrAllocMapEntry arithOffsetPosEntryBody.localDecls
+          arithOffsetPosEntryBody.layouts .mut 1 1 Witness.lm31AllocId1]
+        decl0.ty arithOffsetPosEntryBody.layouts
+        (.ptr { allocId := 1, offsetBytes := 40 } 8) imm0) ∧
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns retCopyBody (annealMiriHooks retCopyBody)
+        (initMachineState retCopyBody []) (miriEntryState retCopyBody)
+        (.scalar ⟨42, 8⟩) (.immediate imm0) ∧
+      get? retCopyBody.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty retCopyBody.layouts (.scalar ⟨42, 8⟩) imm0) :=
+  ⟨w3_arith_offset_returns, w6_copy_nonoverlapping_disjoint_returns⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (rhs : Nat) (hrhs : rhs < 65536) :
+    StepClosedSim (checkedAddBody rhs) (annealMiriHooks (checkedAddBody rhs)) (CheckedAddInv rhs)
+      (ImmediateRetRel (checkedAddBody rhs)) ∧
+    (TreeSafe (mirCallTree (checkedAddBody rhs) []) ↔
+      (miriSystem (annealMiriHooks (checkedAddBody rhs))).Safe (miriEntryState (checkedAddBody rhs))) :=
+  ⟨checkedAdd_stepClosedSim rhs hrhs, checkedAdd_treeSafe_iff_miriSafe rhs hrhs⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements) (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_) {decl0 : MirAst.LocalDecl}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (himm0 : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) :=
+  step_terminator_return_lm2_4_simulation hstate hphase hbb hstmt_none hstmt_len hcleanup hret
+    hdecl0 hsz0 himm0
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h₄ : ∀ s m, StateRelLM2_4 body s m → Frag s m →
+      (StepRelLM2_4 body m (stepMirFn body s) (core () m) ∨
+        StepRel body m (stepMirFn body s) (core () m)) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM2_4 body s' m' → Frag s' m')
+    (h₃ : ∀ s m a, StateRelLM3_2 body s m a → Frag s m → ∃ a',
+      StepRelLM3_2 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2 body s' m' a' → Frag s' m')
+    (ht : ∀ s m t, StateRelLM3_2Tree body s m t → Frag s m → ∃ t',
+      StepRelLM3_2Tree body m t' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2Tree body s' m' t' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => StateRelLM2_4 body s m ∧ Frag s m)
+      (ImmediateRetRel body) ∧
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_2 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, RefRetRel body a r v) ∧
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ t, StateRelLM3_2Tree body s m t) ∧ Frag s m)
+      (fun r v => ∃ t : List ReborrowMapEntry,
+        RefRetRel body (t.map ReborrowMapEntry.toAllocMapEntry) r v) :=
+  ⟨stepClosedSim_of_stepRelLM2_4 h₄, stepClosedSim_of_stepRelLM3_2 h₃,
+    stepClosedSim_of_stepRelLM3_2Tree ht⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {env : EnumTypeEnv}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m b, StateRelLM2_3 body env b s m → Frag s m →
+      (∃ b', StepRelLM2_3 body env b' m (stepMirFn body s) (core () m) ∧
+        ∀ s' m', core () m = (m', .ok true) → StateRelLM2_3 body env b' s' m' → Frag s' m') ∨
+      StepRelEnumReturnLM2_3 body env m (stepMirFn body s) (core () m)) :
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ b, StateRelLM2_3 body env b s m) ∧ Frag s m)
+      (fun r v => ImmediateRetRel body r v ∨ EnumRetRel body env r v) :=
+  stepClosedSim_of_stepRelLM2_3_enumReturn h
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ imm0,
+      AgreeReturns unionRetBody
+        (.ofHooks (annealStepHooksLM2_4 unionRetBody.localDecls unionRetBody.layouts)
+          annealControlHooks)
+        (initMachineState unionRetBody []) (miriEntryState unionRetBody)
+        (.scalar ⟨5, 1⟩) (.immediate imm0) ∧
+      ImmediateRel Witness.lm24U8Ty Witness.lm24Layouts (.scalar ⟨5, 1⟩) imm0) ∧
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns rawPtrReturnBody (annealMiriHooks rawPtrReturnBody)
+        (initMachineState rawPtrReturnBody [])
+        (miriEntryState rawPtrReturnBody)
+        (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
+      get? rawPtrReturnBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_1
+        [rawPtrAllocMapEntry rawPtrReturnBody.localDecls rawPtrReturnBody.layouts .mut 1 1
+          Witness.lm31AllocId1]
+        decl0.ty rawPtrReturnBody.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0) :=
+  ⟨w2_union_init_prefix_returns, w3_rawPtr_return⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ v, AgreeReturns protCallerBody protWholeHooks protReadyAnneal protReadyMiri
+        (.scalar WitnessLM4_1.sc1) v ∧
+      MultiFrameRetRel protCallerBody (.scalar WitnessLM4_1.sc1) v) ∧
+    ∃ s₁ m₁ tracker',
+      AgreeReaches protCallerBody protWholeHooks protReadyAnneal s₁ protReadyMiri m₁ ∧
+      MultiFrameStateRel protCallerBody s₁ m₁ ∧
+      s₁.memory.activeProtectors = [] ∧ s₁.memory.callStack = [] ∧
+      m₁.machine.borrowTracker = some tracker' ∧
+      tracker'.global.protectedTags.entries = #[] ∧
+      tracker'.global.rootPointerTags = #[(⟨1, by decide⟩, ⟨5, by decide⟩)] :=
+  w5_protector_release_returns
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ imm0 decl0,
+      AgreeReturns Witness.lm32ReborrowTreeBody (annealMiriHooks Witness.lm32ReborrowTreeBody)
+        (Witness.mkPre4AnnealLM32 Witness.lm32ReborrowTreeBody (.init (.scalar ⟨42, 8⟩)))
+        (Witness.mkPre4MiriLM32 Witness.lm32ReborrowTreeBody Witness.u64Ty Witness.lm32Mls42)
+        (.scalar ⟨99, 8⟩) (.immediate imm0) ∧
+      get? Witness.lm32ReborrowTreeBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_2
+        ([Witness.lm32TreeChild .frozen, Witness.lm32TreeRoot .active].map
+          ReborrowMapEntry.toAllocMapEntry)
+        decl0.ty Witness.lm32ReborrowTreeBody.layouts (.scalar ⟨99, 8⟩) imm0) ∧
+    (MirReachesUB (mirCallTree disabledReadEntryBody []) ∧
+      ¬ TreeSafe (mirCallTree disabledReadEntryBody []) ∧
+      (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+        (miriEntryState disabledReadEntryBody) ∧
+      (∃ msc, ScalarRel ⟨77, 8⟩ msc ∧
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).ReachesOutcome
+          (miriEntryState disabledReadEntryBody)
+          (.returned (.immediate (.scalar (.fromScalarInt msc)))) ∧
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).PartialCorrect
+          (miriEntryState disabledReadEntryBody)
+          (· = .immediate (.scalar (.fromScalarInt msc)))) ∧
+      ¬ (TreeSafe (mirCallTree disabledReadEntryBody []) ↔
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+          (miriEntryState disabledReadEntryBody))) :=
+  ⟨w4_child_write_then_parent_read_returns, w4_disabled_read_divergence⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns safeRefReturnBody (annealMiriHooks safeRefReturnBody)
+        (initMachineState safeRefReturnBody []) (miriEntryState safeRefReturnBody)
+        (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
+      get? safeRefReturnBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_2
+        [refAllocMapEntry safeRefReturnBody.localDecls safeRefReturnBody.layouts .shared 1 1
+          Witness.lm31AllocId1]
+        decl0.ty safeRefReturnBody.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0 :=
+  w4_safe_ref_return
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ((TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD) ∧
+      ∃ tr mem, ReachesRet (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD)
+        tr (.normal (.scalar ⟨7, 4⟩, mem))) ∧
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) s₂ = .step s₃ ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status = .Completed) ∧
+    ((MirReachesUB (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD) ∧
+      ¬ TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD)) ∧
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₂ = .step s₃ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₃ = .fail .ub ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .frozen] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .disabled] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled)) :=
+  w4_unsafe_cell_vs_freeze
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (MirReachesUB (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC) ∧
+      ¬ TreeSafe (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC)) ∧
+    ∃ s₂ s₃ s₄ : MachineState,
+      AnnealPath WitnessLM3_3.bodyB WitnessLM3_3.initBC s₂ ∧
+      stepMirFn WitnessLM3_3.bodyB s₂ = .step s₃ ∧ stepMirFn WitnessLM3_3.bodyB s₃ = .step s₄ ∧
+      stepMirFn WitnessLM3_3.bodyB s₄ = .fail .ub ∧
+      s₂.memory.activeProtectors = [1] ∧
+      s₄.memory.borrows =
+        [SimLM3_3.entry 3 .frozen, SimLM3_3.entry 2 (.reservedFrz true) (some 1) (some 1),
+          SimLM3_3.entry 1 .reserved] ∧
+      TreeBorrowsRel s₃.memory.borrows [1] (basedNormalTree s₃.memory.borrows [1]) ∧
+      ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows [1]
+        ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Write
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden (.ReservedFrz true)) :=
+  w4_protected_reservedFrz_conflict_ub
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (TreeSafe (mirCallTree (transmuteBoolBody 1) []) ∧
+      (∃ tr mem, ReachesRet (mirCallTree (transmuteBoolBody 1) []) tr (.normal (.scalar ⟨1, 1⟩, mem))) ∧
+      (∃ e, (miriSystem (annealMiriHooks (transmuteBoolBody 1))).ReachesOutcome
+        (miriEntryState (transmuteBoolBody 1)) (.unsupported e)) ∧
+      ¬ (miriSystem (annealMiriHooks (transmuteBoolBody 1))).Safe
+        (miriEntryState (transmuteBoolBody 1))) ∧
+    (MirReachesUB (mirCallTree (transmuteBoolBody 2) []) ∧
+      (∃ e, (miriSystem (annealMiriHooks (transmuteBoolBody 2))).ReachesOutcome
+        (miriEntryState (transmuteBoolBody 2)) (.unsupported e)) ∧
+      ¬ (miriSystem (annealMiriHooks (transmuteBoolBody 2))).Safe
+        (miriEntryState (transmuteBoolBody 2))) :=
+  w1_transmute_bool_divergence
+
+open LeanMiriSpec.Correspondence.Safety in
+example :
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryRead mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) ∧
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryWrite mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) :=
+  annealMemoryCopyHooks_access_ok
+
+open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+#assert_standard_axioms
+  CoStep
+  CoReach
+  IsFaultNode
+  reaches_cofix_inv
+  tauStar_cofix_inv
+  reaches_cofix_of_coReach
+  treeSafe_cofix_iff
+  reachesRet_cofix_iff
+  AnnealMiriHooks
+  annealMiriHooks
+  annealRunLoopHooks
+  miriIter
+  miriIter_eq
+  classifyError
+  classifyError_not_isReturn
+  classifyError_eq_ub_iff
+  miriSystem
+  miriSystem_step_det
+  MirReachesUB
+  FaultAgrees
+  Lockstep
+  StepClosedSim
+  lockstep_shapes
+  forward_step
+  backward_step
+  coReach_to_miri
+  miri_to_coReach
+  step_universal_simulation
+  treeSafe_imp_miriSafe
+  miriSafe_imp_treeSafe
+  treeSafe_iff_miriSafe
+  mirNoUBTree_iff_miriSafe
+  treeSafe_imp_noUndefinedBehavior
+  reachesUB_iff_miriReachesUB
+  not_reachesUB_of_treeSafe
+  partialCorrect_iff_annealPostcondition
+  runLoopFuel
+  RunLoopRel
+  runLoop_universal_simulation
+  runLoop_ub_iff
+  runLoop_returned_iff
+  runLoopFuel_add
+  miri_safe_of_runLoopFuel_returned
+  miri_outcome_of_runLoopFuel_stopped
+  miri_infinite_of_forall_running
+  forall_running_of_lasso
+  forall_running_of_infiniteRun
+  miri_returns_of_observation
+  miri_ub_of_observation
+  MiriPath
+  MiriPath.of_runLoopFuel
+  miri_safe_of_path_return
+  miri_outcome_of_path_error
+  frames_ne_of_step_ok_true
+  AnnealPath
+  anneal_safe_of_path_return
+  anneal_fault_of_path
+  anneal_safe_of_closed
+  anneal_step_classify
+  anneal_safe_of_runAnnealBounded_returned
+  anneal_fault_of_runAnnealBounded_faulted
+  anneal_safe_of_forall_running
+  anneal_forall_running_of_lasso
+  runAnnealBounded_add
+  wholeProgram_returns
+  wholeProgram_ub
+  runLoop_forever_iff
+  miri_infiniteRun_of_anneal_forever
+  infiniteRun_iff_anneal_forever
+  miriEntryState
+  stateRel_entry
+  entry_immediate
+  ScalarFragmentInv
+  ImmediateRetRel
+  StepRel.toLockstep
+  scalarFragment_stepClosedSim
+  InSafeScalarFragment
+  scalarFragment_entry
+  scalarFragment_treeSafe_iff_miriSafe
+  scalarFragment_reachesUB_iff
+  scalarFragment_partialCorrect_iff
+  scalarFragment_runLoop_simulation
+  scalarFragment_infiniteRun_iff
+  StepObsRel.toLockstep
+  StepRelLM2_2.toLockstep
+  StepRelLM2_3.toLockstep
+  StepRelLM2_4.toLockstep
+  StepRelLM3_1.toLockstep
+  StepRelLM3_2.toLockstep
+  StepRelMultiFrame.toLockstep
+  stepClosedSim_of_lockstep
+  stepClosedSim_of_stepRelLM2_3
+  stepClosedSim_of_stepRelLM3_1
+  stepClosedSim_of_stepRelMultiFrame
+  Lockstep.emitStep_lift
+  AgreeReturns
+  AgreeUB
+  w1_div_returns
+  w1_div_by_zero_ub
+  w1_div_inFragment
+  w1_div_treeSafe_iff_miriSafe
+  w1_switch_case
+  w1_switch_otherwise
+  w1_cast_sign_extend
+  w1_checked_add_no_overflow
+  w1_checked_add_overflow_ub
+  loop_inFragment
+  w1_loop_diverges_safely
+  w1_assert_continue_divergence
+  w2_enum_downcast_switch_returns
+  w2_padded_struct_returns
+  w2_array_index_oob_ub
+  w2_union_uninit_bytes_ub
+  w3_rawPtr_write_read_returns
+  w3_use_after_storageDead_ub
+  w4_child_write_then_parent_read_returns
+  w4_unsafe_cell_vs_freeze
+  w4_protected_reservedFrz_conflict_ub
+  callHooks
+  w5_call_return
+  w5_callee_unreachable_ub
+  w5_callee_uninit_return_ub
+  w6_assume_true
+  w6_assume_false_ub
+  w6_exact_div_valid
+  w6_exact_div_non_multiple_ub
+  w6_copy_nonoverlapping_overlap_ub
+  classifyError_eq_unsupported_iff
+  classifyError_eq_blocked_iff
+  rootPopOutcome
+  rootPopOutcome_eq_returned_iff
+  miriSystem_terminal_of_pop
+  miriSystem_terminal_of_ok_empty
+  miriSystem_canProgress
+  miriSystem_completeFrom
+  miriSystem_safe_iff
+  miriSystem_terminal_det
+  miriSystem_step_of_coreStep
+  runOnStackEmpty_annealRunLoopHooks
+  stepCurrentThread_of_coreStep_false
+  miriIter_of_coreStep_false
+  step_of_frames_empty
+  miriIter_after_root_pop
+  MirReachesFault
+  FaultClass
+  annealFaultClass
+  miriErrorClass
+  outcomeFaultClass
+  FaultAgrees.ub_iff
+  FaultAgrees.unsupported_iff
+  FaultAgrees.outcomeFaultClass
+  step_faultClass_simulation
+  reachesFault_iff_miriReachesClass
+  UBOnlyFaults
+  miri_outcomes_of_ubOnly
+  anneal_faults_ub_of_ubOnly
+  MiriPath.reaches
+  WellTypedScalarStmtExt
+  WellTypedTerminatorExt
+  WellTypedBasicBlockExt
+  WellTypedBodyExt
+  WellTypedBody.toExt
+  step_terminator_switchInt_simulation_imm
+  step_terminator_assert_unreachable_simulation
+  step_assign_lm1_2_simulation_ext
+  step_assign_move_simulation_ext
+  step_stmtExt_simulation_ext
+  step_wellTypedBodyExt_simulation
+  ValidFrameLocation.preservedExt
+  NonAddrTakenImmediate.preservedExt
+  StepObsRel.toLockstepExt
+  scalarFragmentExt_stepClosedSim
+  scalarFragmentExt_entry
+  scalarFragmentExt_ubOnly
+  scalarFragment_outcomes
+  scalarFragment_faults_ub
+  scalarFragment_reachesFault_iff
+  Lockstep.mono
+  StepRel.toLockstepRoot
+  StructRetRel
+  StepRelStructReturnLM2_2.toLockstep
+  stepClosedSim_of_stepRelLM2_2
+  EnumRetRel
+  StepRelEnumReturnLM2_3.toLockstep
+  stepClosedSim_of_stepRelLM2_3_enumReturn
+  stepClosedSim_of_stepRelLM2_4
+  stepClosedSim_of_stepRelLM3_2
+  StepRelLM3_2Tree.toLockstep
+  stepClosedSim_of_stepRelLM3_2Tree
+  stateRelLM2_2_entry
+  stateRelLM2_3_entry
+  stateRelLM2_4_entry
+  stateRelLM3_1_entry
+  stateRelLM3_2_entry
+  stateRelLM3_2Tree_entry
+  multiFrameStateRel_entry
+  AgreeReturnsBits
+  AgreeReaches
+  agreeReturnsBits_of_obs
+  agreeUB_of_obs
+  agreeReaches_of_paths
+  w1_switch_inFragment
+  w1_switch_treeSafe_iff_miriSafe
+  w1_cast_inFragment
+  w1_cast_treeSafe_iff_miriSafe
+  countLoop_inFragment
+  w1_count_loop_returns
+  runLoopFuel_of_runMiriBounded
+  w2_array_index_returns
+  w2_union_init_prefix_lockstep
+  retArithOffsetCall_preserves_imm
+  retArithOffset_trace
+  w3_arith_offset_returns
+  w3_arith_offset_uninit_ub
+  w4_safe_ref_return
+  protCallerBody
+  protWholeHooks
+  protReady_rel
+  w5_protector_release_returns
+  w6_copy_nonoverlapping_disjoint_lockstep
+  w6_write_bytes_extCall_boundary
+  popOutcome
+  PtrRetRel
+  StepObsRelLM3_1.toLockstep
+  stepClosedSim_of_stepObsRelLM3_1
+  StepRel.toLockstepOfRet
+  stateRelLM2_3_entry_of_budget
+  stateRelLM2_2_entry_env
+  anneal_reachesFault_of_runAnnealBounded_faulted
+  rawPtrReturnBody
+  w3_rawPtr_return
+  storageDeadZeroBody
+  w1_storageDead_returnPlace_class_divergence
+  tailCallBody
+  w1_tail_call_class_divergence
+  ctlzBody
+  w6_ctlz_returns
+  saturatingAddBody
+  w6_saturating_add_returns
+  rotateLeftBody
+  w6_rotate_left_extCall_boundary
+  w6_write_bytes_oob_extCall_divergence
+  retWriteBytesCall_preserves_imm
+  retWriteBytesReadBody
+  retWriteBytesRead_ref_trace
+  w6_write_bytes_read_extCall_divergence
+  retCopy_copyStep_preserves_imm
+  retCopyBody
+  retCopy_trace
+  w6_copy_nonoverlapping_disjoint_returns
+  CheckedAddInv
+  checkedAdd_stepClosedSim
+  checkedAdd_entry
+  checkedAdd_treeSafe_iff_miriSafe
+  checkedAdd_reachesUB_iff
+  checkedAdd_partialCorrect_iff
+  w1_checked_add_treeSafe_iff_miriSafe
+  miri_step_at_terminator_lm2_4
+  step_terminator_return_lm2_4_simulation
+  annealMemoryCopyHooks_access_ok
+  unionRetBody
+  unionRet_prefix_anneal
+  unionRet_prefix_miri
+  unionRet_pre_stateRel
+  unionRet_pre_imm
+  w2_union_init_prefix_returns
+  transmuteBoolBody
+  miri_unsupported_of_obs
+  w1_transmute_bool_divergence
+  safeRefReturnBody
+  safeRef_prefix_anneal
+  safeRef_prefix_miri
+  safeRef_pre_stateRel_and_imm
+  disabledReadEntryBody
+  disabledRead_prefix_anneal
+  disabledRead_prefix_miri
+  disabledRead_pre_stateRel_and_imm
+  w4_disabled_read_divergence
+  coStep_of_extCall
+  anneal_ub_of_coReach
+  anneal_reachesRet_of_coReach
+  anneal_extCall_boundary
+  wbAddrOfState
+  w3_deref_oob_ub
+  w3_deref_type_pun_returns
+  w3_storage_revive_stale_deref_ub
+  derefMisalignedEntryBody
+  w3_deref_misaligned_ub
+  derefOobWriteEntryBody
+  ptrOffsetNegOobEntryBody
+  invalidBoolPtrDerefEntryBody
+  w3_deref_oob_write_ub
+  w3_ptr_offset_neg_before_start_ub
+  w3_invalid_bool_ptr_deref_ub
+  ptrOffsetStrideEntryBody
+  w3_ptr_offset_stride_read_returns
+  retCopyFullBytesEntryBody
+  w6_copy_nonoverlapping_full_bytes_returns
+  copyRawPtrDerefEntryBody
+  w6_copy_nonoverlapping_rawPtr_tyId80_boundary
+  invalidBoolRefEntryBody
+  w4_invalid_bool_ref_read_ub
+  unionValReturnBody
+  w2_union_return
+  unionOverlayPunBody
+  w2_union_overlay_type_punning_returns
+  w4_storage_dead_protected_ub
+  unwindLeafBody
+  unwindMidBody
+  unwindCatchRootBody
+  w5_unwind_cleanup_returns
+  unwindUnreachableRootBody
+  w5_unwind_unreachable_ub
+  unwindPastRootBody
+  w5_unwind_root_panic_vs_ub_divergence
+  indirectCallFiveBody
+  w5_indirect_fnPtr_call_returns
+  UnionRetRel
+  StepRelUnionReturnLM2_4
+  step_terminator_return_union_lm2_4_simulation
+  step_terminator_return_wellTypedUnion_lm2_4_simulation
+  StepRelUnionReturnLM2_4.toLockstep
+  stepClosedSim_of_stepRelLM2_4_unionReturn
+  StepObsRelLM3_2.toLockstep
+  stepClosedSim_of_stepObsRelLM3_2
+  StepObsRelLM3_2Tree.toLockstep
+  stepClosedSim_of_stepObsRelLM3_2Tree
+  UnwindingStateRel.frames_ne_empty
+  MiriUnwindSteps.toMiriPath_ok
+  MiriUnwindSteps.toMiriOutcome_error
+  treeBorrowsStateRel_entry
+  step_assign_pairField0_simulation_ext
+  coReach_of_runAnnealBounded_running
+  anneal_extCall_boundary_of_prefix
+  retWriteBytesReadPreAnneal
+  retWriteBytesReadPreMiriFrame
+  retWriteBytesReadPreMiri
+  retWriteBytesRead_prefix_anneal
+  retWriteBytesRead_prefix_miri
+  retWriteBytesRead_stateRel
+  indirectCallFive_reify_fnPtrs
+  retWriteBytesOobTerm
+  retWriteBytesOobBody
+  retWriteBytesOobPreAnneal
+  retWriteBytesOobPreMiriFrame
+  retWriteBytesOobPreMiri
+  retWriteBytesOob_prefix_anneal
+  retWriteBytesOob_prefix_miri
+  retWriteBytesOob_stateRel
+  ptr4EntryBody
+  ptr4EntryPreAnneal
+  ptr4EntryPreMiriFrame
+  ptr4EntryPreMiri
+  ptr4Entry_stateRel_and_imm
+  arithOffsetEntryTerm
+  arithOffsetUninitBody
+  copyOverlapEntryBody
+  arithOffsetPosEntryBody
+  retCopy_prefix_anneal
+  retCopy_prefix_miri
+  agreeReaches_of_prefix_paths
+  writeBytesEntryTerm
+  writeBytesEntryBody
+  writeBytesEntry_prefix_anneal
+  writeBytesEntry_prefix_miri
+  nullPtrReadEntryBody
+  w3_deref_null_ptr_read_ub
+  nullPtrWriteEntryBody
+  w3_deref_null_ptr_write_ub
+  nullPtrRawReborrowEntryBody
+  w3_rawPtr_deref_null_reborrow_returns
+  reborrowDanglingSafeRefEntryBody
+  reborrowDanglingSafeRef_prefix_anneal
+  reborrowDanglingSafeRef_prefix_miri
+  w4_reborrow_dangling_safeRef_ub
+  copyStage1RawPtrCastEntryBody
+  copyStage1RawPtrCastEntryPreAnneal
+  copyStage1RawPtrCastEntryPreMiriFrame
+  copyStage1RawPtrCastEntryPreMiri
+  copyStage1RawPtrCastEntry_prefix_anneal
+  copyStage1RawPtrCastEntry_prefix_miri
+  copyStage1RawPtrCastEntry_stateRel_and_imm
+  copyStage1RawPtrCastEntry_trace
+  arrayIndexOobEntryBody
+  arrayIndexOobPreAnneal
+  arrayIndexOobPreMiriFrame
+  arrayIndexOobPreMiri
+  arrayIndexOob_prefix_anneal
+  arrayIndexOob_prefix_miri
+  arrayIndexOob_pre_stateRel_and_imm
+  fmtFromStrFnTy
+  panicFmtFnTy
+  panicExplicitMacroBody
+  w5_panic_explicit_macro_extCall_boundary
+  anneal_extCall_continue_unwind_ub
+
+/-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {s sₙ sᵣ sₖ : MachineState}
+    {req : MirCallReq} {locals : List LocalSlot} {dest : Place} {targetBb : BasicBlockIdx}
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .unreachable))
+    {retVal v : Value} {mem memR : Memory}
+    (hres : resumeExternalCall sₙ locals dest targetBb .unreachable (.returned retVal mem) =
+      .running sᵣ)
+    (hAr : AnnealPath body sᵣ sₖ)
+    (hret : stepMirFn body sₖ = MirStepNode.retNormal v memR) (memP : Memory) :
+    (∃ tr, ReachesRet (mirTree body s) tr (.normal (v, memR))) ∧
+    MirReachesUB (mirTree body s) ∧ ¬ TreeSafe (mirTree body s) :=
+  anneal_extCall_boundary hA hs hres hAr hret memP
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeUB Witness.lm31OffsetDerefBody (annealMiriHooks Witness.lm31OffsetDerefBody)
+      (initMachineState Witness.lm31OffsetDerefBody [])
+      (miriEntryState Witness.lm31OffsetDerefBody) ∧
+    AgreeUB derefMisalignedEntryBody (annealMiriHooks derefMisalignedEntryBody)
+      (initMachineState derefMisalignedEntryBody [])
+      (miriEntryState derefMisalignedEntryBody) ∧
+    AgreeUB derefOobWriteEntryBody (annealMiriHooks derefOobWriteEntryBody)
+      (initMachineState derefOobWriteEntryBody [])
+      (miriEntryState derefOobWriteEntryBody) ∧
+    AgreeUB ptrOffsetNegOobEntryBody (annealMiriHooks ptrOffsetNegOobEntryBody)
+      (initMachineState ptrOffsetNegOobEntryBody [])
+      (miriEntryState ptrOffsetNegOobEntryBody) ∧
+    AgreeUB invalidBoolPtrDerefEntryBody (annealMiriHooks invalidBoolPtrDerefEntryBody)
+      (initMachineState invalidBoolPtrDerefEntryBody [])
+      (miriEntryState invalidBoolPtrDerefEntryBody) ∧
+    AgreeUB invalidBoolRefEntryBody (annealMiriHooks invalidBoolRefEntryBody)
+      (initMachineState invalidBoolRefEntryBody [])
+      (miriEntryState invalidBoolRefEntryBody) ∧
+    AgreeUB Witness.lm31ReviveBody (annealMiriHooks Witness.lm31ReviveBody)
+      (initMachineState Witness.lm31ReviveBody [])
+      (miriEntryState Witness.lm31ReviveBody) :=
+  ⟨w3_deref_oob_ub, w3_deref_misaligned_ub, w3_deref_oob_write_ub,
+   w3_ptr_offset_neg_before_start_ub, w3_invalid_bool_ptr_deref_ub,
+   w4_invalid_bool_ref_read_ub, w3_storage_revive_stale_deref_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturns Witness.lm31TypePunBody (annealMiriHooks Witness.lm31TypePunBody)
+      (initMachineState Witness.lm31TypePunBody [])
+      (miriEntryState Witness.lm31TypePunBody)
+      (.scalar ⟨5, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 5)))) ∧
+    AgreeReturns ptrOffsetStrideEntryBody (annealMiriHooks ptrOffsetStrideEntryBody)
+      (initMachineState ptrOffsetStrideEntryBody [])
+      (miriEntryState ptrOffsetStrideEntryBody)
+      (.scalar ⟨300, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 300)))) ∧
+    (∃ mp0,
+      AgreeReturns unionValReturnBody
+        (.ofHooks (annealStepHooksLM2_4 unionValReturnBody.localDecls unionValReturnBody.layouts)
+          annealControlHooks)
+        (initMachineState unionValReturnBody [])
+        (miriEntryState unionValReturnBody)
+        (.aggregate 0 [.scalar ⟨5, 1⟩, .unit])
+        (.indirect mp0) ∧
+      UnionRetRel unionValReturnBody (.aggregate 0 [.scalar ⟨5, 1⟩, .unit]) (.indirect mp0)) ∧
+    (∃ imm0,
+      AgreeReturns unionOverlayPunBody
+        (.ofHooks (annealStepHooksLM2_4 unionOverlayPunBody.localDecls unionOverlayPunBody.layouts)
+          annealControlHooks)
+        (initMachineState unionOverlayPunBody [])
+        (miriEntryState unionOverlayPunBody)
+        (.scalar ⟨0x04030209, 4⟩)
+        (.immediate imm0) ∧
+      ImmediateRel Witness.lm24U32Ty Witness.lm24Layouts (.scalar ⟨0x04030209, 4⟩) imm0) ∧
+    AgreeReturnsBits unwindCatchRootBody
+      (callHooks unwindCatchRootBody [unwindMidBody, unwindLeafBody])
+      (initMachineStateWithCallees unwindCatchRootBody [] [unwindMidBody, unwindLeafBody])
+      (miriEntryState unwindCatchRootBody) 1 77 ∧
+    AgreeUB unwindUnreachableRootBody
+      (callHooks unwindUnreachableRootBody [unwindMidBody, unwindLeafBody])
+      (initMachineStateWithCallees unwindUnreachableRootBody [] [unwindMidBody, unwindLeafBody])
+      (miriEntryState unwindUnreachableRootBody) ∧
+    AgreeReturnsBits indirectCallFiveBody
+      (callHooks indirectCallFiveBody [fiveBody] [fiveFnPtrEntry])
+      (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody])
+      (miriEntryState indirectCallFiveBody) 1 5 :=
+  ⟨w3_deref_type_pun_returns, w3_ptr_offset_stride_read_returns, w2_union_return,
+   w2_union_overlay_type_punning_returns, w5_unwind_cleanup_returns,
+   w5_unwind_unreachable_ub, w5_indirect_fnPtr_call_returns⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns retCopyFullBytesEntryBody (annealMiriHooks retCopyFullBytesEntryBody)
+        (initMachineState retCopyFullBytesEntryBody [])
+        (miriEntryState retCopyFullBytesEntryBody)
+        (.scalar ⟨0x0102030405060708, 8⟩) (.immediate imm0) ∧
+      get? retCopyFullBytesEntryBody.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty retCopyFullBytesEntryBody.layouts
+        (.scalar ⟨0x0102030405060708, 8⟩) imm0) ∧
+    ((TreeSafe (mirCallTree copyRawPtrDerefEntryBody []) ∧
+      ∃ tr mem, ReachesRet (mirCallTree copyRawPtrDerefEntryBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+     (let b := copyStage1RawPtrCastEntryBody
+      ∃ s₄ m₄,
+        AgreeReaches b (annealMiriHooks b) (initMachineState b []) s₄ (miriEntryState b) m₄ ∧
+        get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+        get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+        TreeSafe (mirCallTree b []) ∧
+        (∃ tr mem, ReachesRet (mirCallTree b []) tr
+          (.normal (.ptr { allocId := 1, offsetBytes := 0 } 8, mem))) ∧
+        (miriSystem (annealMiriHooks b)).ReachesOutcome (miriEntryState b)
+          (.unsupported (.unsupported "pointee of TyId 80 is not encoded")) ∧
+        ¬ (miriSystem (annealMiriHooks b)).Safe (miriEntryState b))) ∧
+    (TreeSafe (mirTree unwindPastRootBody
+      (initMachineStateWithCallees unwindPastRootBody [] [unwindMidBody, unwindLeafBody])) ∧
+     (∃ e, (miriSystem (callHooks unwindPastRootBody [unwindMidBody, unwindLeafBody])).ReachesOutcome
+       (miriEntryState unwindPastRootBody) (.undefinedBehavior e)) ∧
+     ¬ (miriSystem (callHooks unwindPastRootBody [unwindMidBody, unwindLeafBody])).Safe
+       (miriEntryState unwindPastRootBody)) ∧
+    (∀ body : CapturedMir,
+      TreeBorrowsStateRel body (initMachineState body []) (miriEntryState body)) :=
+  ⟨w6_copy_nonoverlapping_full_bytes_returns,
+   w6_copy_nonoverlapping_rawPtr_tyId80_boundary,
+   w5_unwind_root_panic_vs_ub_divergence,
+   treeBorrowsStateRel_entry⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ∃ m₁ m₂,
+      AgreeReaches writeBytesEntryBody (annealMiriHooks writeBytesEntryBody)
+        (initMachineState writeBytesEntryBody []) (wbAddrOfState writeBytesEntryBody)
+        (miriEntryState writeBytesEntryBody) m₁ ∧
+      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) =
+        MirStepNode.extCall
+          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
+            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
+            memory := (wbAddrOfState writeBytesEntryBody).memory }
+          (resumeExternalCall (wbAddrOfState writeBytesEntryBody)
+            (wbAddrOfState writeBytesEntryBody).frame.locals (WitnessLM4_2.local42 0) 2
+            .unreachable) ∧
+      (∃ tr mem, ReachesRet (mirCallTree writeBytesEntryBody []) tr (.normal (.unit, mem))) ∧
+      MirReachesUB (mirCallTree writeBytesEntryBody []) ∧
+      ¬ TreeSafe (mirCallTree writeBytesEntryBody []) ∧
+      (miriSystem (annealMiriHooks writeBytesEntryBody)).Reaches
+        (miriEntryState writeBytesEntryBody) m₂ ∧
+      ∃ s₂, StateRelLM3_1 writeBytesEntryBody s₂ m₂
+          [rawPtrAllocMapEntry writeBytesEntryBody.localDecls writeBytesEntryBody.layouts .mut 1 1
+            Witness.lm31AllocId1] ∧
+        get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
+  w6_write_bytes_extCall_boundary
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ e, (miriSystem (annealMiriHooks retWriteBytesOobBody)).ReachesOutcome
+        (miriEntryState retWriteBytesOobBody) (.undefinedBehavior e)) ∧
+    ¬ (miriSystem (annealMiriHooks retWriteBytesOobBody)).Safe
+        (miriEntryState retWriteBytesOobBody) ∧
+    (∃ tr mem, ReachesRet (mirCallTree retWriteBytesOobBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+    MirReachesUB (mirCallTree retWriteBytesOobBody []) ∧
+    ¬ TreeSafe (mirCallTree retWriteBytesOobBody []) :=
+  w6_write_bytes_oob_extCall_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      (miriSystem (annealMiriHooks retWriteBytesReadBody)).Safe
+        (miriEntryState retWriteBytesReadBody) ∧
+      (miriSystem (annealMiriHooks retWriteBytesReadBody)).ReachesOutcome
+        (miriEntryState retWriteBytesReadBody) (.returned (.immediate imm0)) ∧
+      (miriSystem (annealMiriHooks retWriteBytesReadBody)).PartialCorrect
+        (miriEntryState retWriteBytesReadBody) (· = .immediate imm0) ∧
+      get? retWriteBytesReadBody.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 ∧
+      (∃ tr mem, ReachesRet (mirCallTree retWriteBytesReadBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+      MirReachesUB (mirCallTree retWriteBytesReadBody []) ∧
+      ¬ TreeSafe (mirCallTree retWriteBytesReadBody []) :=
+  w6_write_bytes_read_extCall_divergence
+
+/-! ### `LM-4.3` Stage-1 whole-program bridges: union returns, `LM-3.2` observations, unwinding -/
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : MirAst.LocalDecl}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (hnot_uninit_ind :
+      ¬ (get? s.frame.locals 0 = some .uninit ∧
+          ∃ topFrame mp0 c0,
+            m.stack.frames = #[topFrame] ∧
+            topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
+    StepRelUnionReturnLM2_4 body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) :=
+  step_terminator_return_union_lm2_4_simulation hstate hphase hbb hstmt_none hstmt_len hcleanup
+    hret hdecl0 hsz0 hnot_uninit_ind
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m, StateRelLM2_4 body s m → Frag s m →
+      (((StepRelLM2_4 body m (stepMirFn body s) (core () m) ∨
+          StepRel body m (stepMirFn body s) (core () m)) ∧
+        ∀ s' m', core () m = (m', .ok true) → StateRelLM2_4 body s' m' → Frag s' m') ∨
+       StepRelUnionReturnLM2_4 body m (stepMirFn body s) (core () m))) :
+    StepClosedSim body (rootHooks core)
+      (fun s m => StateRelLM2_4 body s m ∧ Frag s m)
+      (fun r v => ImmediateRetRel body r v ∨ UnionRetRel body r v) :=
+  stepClosedSim_of_stepRelLM2_4_unionReturn h
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h₃ : ∀ s m a, StateRelLM3_2 body s m a → Frag s m → ∃ a',
+      StepObsRelLM3_2 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2 body s' m' a' → Frag s' m')
+    (ht : ∀ s m t, StateRelLM3_2Tree body s m t → Frag s m → ∃ t',
+      StepObsRelLM3_2Tree body m t' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2Tree body s' m' t' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_2 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, RefRetRel body a r v) ∧
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ t, StateRelLM3_2Tree body s m t) ∧ Frag s m)
+      (fun r v => ∃ t : List ReborrowMapEntry,
+        RefRetRel body (t.map ReborrowMapEntry.toAllocMapEntry) r v) :=
+  ⟨stepClosedSim_of_stepObsRelLM3_2 h₃, stepClosedSim_of_stepObsRelLM3_2Tree ht⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {rootBody : CapturedMir} {H : AnnealMiriHooks} {k : Nat}
+    {s : MachineState} {m m' : AnnealStepState} {e : Miri.Interpreter.StepError}
+    (hok : MiriUnwindSteps rootBody k s m (m', .ok true))
+    (herr : MiriUnwindSteps rootBody k s m (m', .error e))
+    (hne : m'.stack.frames ≠ #[])
+    (hhooks : ∀ sᵢ mᵢ,
+      ((sᵢ = s ∧ mᵢ = m) ∨ UnwindingStateRel rootBody sᵢ mᵢ) →
+      H.coreStep () mᵢ =
+        Miri.Interpreter.Step.step (annealStepHooksForState rootBody sᵢ) () mᵢ) :
+    MiriPath H m m' ∧
+    ∃ mₙ, MiriPath H m mₙ ∧ H.coreStep () mₙ = (m', .error e) ∧
+      (miriSystem H).ReachesOutcome m (classifyError e) ∧ ¬ (miriSystem H).Safe m :=
+  ⟨MiriUnwindSteps.toMiriPath_ok hok hne hhooks, MiriUnwindSteps.toMiriOutcome_error herr hhooks⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (perm : TreeBorrowPerm) :
+    (MirReachesUB (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true)) ∧
+      ¬ TreeSafe (mirTree SimLM3_3.storageDeadBody (SimLM3_3.childState perm true))) ∧
+    (perm ≠ .cell →
+      ((hooksTwoNodeTree perm).deallocateBorrowRange
+        (.concrete (hooksAccessTag .foreignAccess))
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+        (hooksForChildProtected true).protectedTags).status ≠
+          Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
+    (∃ s_dead : MachineState,
+      stepMirFn SimLM3_3.storageDeadBody (SimLM3_3.childState perm false) = .step s_dead ∧
+      s_dead.memory.borrows = [SimLM3_3.entry 1 .disabled] ∧
+      TreeBorrowsRel s_dead.memory.borrows [] (basedNormalTree s_dead.memory.borrows []) ∧
+      ((hooksTwoNodeTree perm).deallocateBorrowRange
+        (.concrete (hooksAccessTag .foreignAccess))
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+        (hooksForChildProtected false).protectedTags).status =
+          Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) ∧
+    (((hooksTwoNodeTree .cell).deallocateBorrowRange
+        (.concrete (hooksAccessTag .foreignAccess))
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+        (hooksForChildProtected true).protectedTags).status =
+          Miri.TreeBorrows.BorrowTree.BorrowTreeDeallocStatus.Deallocated) :=
+  w4_storage_dead_protected_ub perm
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {s₀ s sₙ sᵣ sₖ : MachineState}
+    {p : Nat} {req : MirCallReq} {locals : List LocalSlot} {dest : Place}
+    {targetBb : BasicBlockIdx}
+    (hpa : runAnnealBounded body p s₀ = .running s)
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .unreachable))
+    {retVal v : Value} {mem memR : Memory}
+    (hres : resumeExternalCall sₙ locals dest targetBb .unreachable (.returned retVal mem) =
+      .running sᵣ)
+    (hAr : AnnealPath body sᵣ sₖ)
+    (hret : stepMirFn body sₖ = MirStepNode.retNormal v memR) (memP : Memory) :
+    (∃ tr, ReachesRet (mirTree body s₀) tr (.normal (v, memR))) ∧
+    MirReachesUB (mirTree body s₀) ∧ ¬ TreeSafe (mirTree body s₀) :=
+  anneal_extCall_boundary_of_prefix hpa hA hs hres hAr hret memP
+
+open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    runAnnealBounded retWriteBytesReadBody 5 (initMachineState retWriteBytesReadBody []) =
+      .running retWriteBytesReadPreAnneal ∧
+    runLoopFuel (annealMiriHooks retWriteBytesReadBody) 5 (miriEntryState retWriteBytesReadBody) =
+      .running retWriteBytesReadPreMiri :=
+  ⟨retWriteBytesRead_prefix_anneal, retWriteBytesRead_prefix_miri⟩
+
+open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ∃ s, runAnnealBounded indirectCallFiveBody 3
+        (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody]) = .running s ∧
+      s.memory.fnPtrs = [fiveFnPtrEntry] :=
+  indirectCallFive_reify_fnPtrs
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false) (hret : bb.terminator.kind = .return_)
+    {decl0 : MirAst.LocalDecl} {S : Nat} (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
+    (hnot_uninit_ind :
+      ¬ (get? s.frame.locals 0 = some .uninit ∧
+          ∃ topFrame mp0 c0,
+            m.stack.frames = #[topFrame] ∧
+            topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
+    StepRelUnionReturnLM2_4 body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) :=
+  step_terminator_return_wellTypedUnion_lm2_4_simulation hstate hphase hbb hstmt_none hstmt_len
+    hcleanup hret hdecl0 hwt0 hnot_uninit_ind
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} (hbody : WellTypedBodyExt body) (hne : body.basicBlocks ≠ [])
+    (d : Nat) (hd : d < 256) (rhs : Nat) (hrhs : rhs < 65536) :
+    (TreeSafe (mirCallTree body []) ↔
+      (miriSystem (annealMiriHooks body)).Safe (miriEntryState body)) ∧
+    (TreeSafe (mirCallTree (Witness.lm12SwitchBody d) []) ↔
+      (miriSystem (annealMiriHooks (Witness.lm12SwitchBody d))).Safe
+        (miriEntryState (Witness.lm12SwitchBody d))) ∧
+    (TreeSafe (mirCallTree Witness.lm12CastBody []) ↔
+      (miriSystem (annealMiriHooks Witness.lm12CastBody)).Safe
+        (miriEntryState Witness.lm12CastBody)) ∧
+    ((TreeSafe (mirCallTree (checkedAddBody rhs) []) ↔
+      (miriSystem (annealMiriHooks (checkedAddBody rhs))).Safe
+        (miriEntryState (checkedAddBody rhs))) ∧
+     (MirReachesUB (mirCallTree (checkedAddBody rhs) []) ↔
+      ∃ e, (miriSystem (annealMiriHooks (checkedAddBody rhs))).ReachesOutcome
+        (miriEntryState (checkedAddBody rhs)) (.undefinedBehavior e))) ∧
+    AgreeUB callStuckBody (callHooks callStuckBody [stuckBody])
+      (initMachineStateWithCallees callStuckBody [] [stuckBody]) (miriEntryState callStuckBody) ∧
+    AgreeUB callNoRetBody (callHooks callNoRetBody [noRetBody])
+      (initMachineStateWithCallees callNoRetBody [] [noRetBody]) (miriEntryState callNoRetBody) :=
+  ⟨scalarFragmentExt_treeSafe_iff_miriSafe hbody hne,
+   w1_switch_treeSafe_iff_miriSafe d hd,
+   w1_cast_treeSafe_iff_miriSafe,
+   w1_checked_add_treeSafe_iff_miriSafe rhs hrhs,
+   w5_callee_unreachable_ub,
+   w5_callee_uninit_return_ub⟩
+
+/-! ### `LM-4.3` from-entry prefixes: `ptr4EntryBody`, `retCopyBody`, `AgreeReaches` -/
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (b : CapturedMir) (defPath : String) (d₀ d₂ d₃ : RigidTy)
+    (stmts : List MirAst.Statement) (term1 : TerminatorKind)
+    (hb : b = ptr4EntryBody defPath d₀ d₂ d₃ stmts term1) :
+    StateRel b (ptr4EntryPreAnneal b) (ptr4EntryPreMiri b) ∧
+    ∀ tf, (ptr4EntryPreMiri b).stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k :=
+  ptr4Entry_stateRel_and_imm b defPath d₀ d₂ d₃ stmts term1 hb
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    runAnnealBounded retCopyBody 7 (initMachineState retCopyBody []) =
+      .running retCopyAnnealPre ∧
+    runLoopFuel (annealMiriHooks retCopyBody) 7 (miriEntryState retCopyBody) =
+      .running retCopyMiriPre ∧
+    runAnnealBounded writeBytesEntryBody 5 (initMachineState writeBytesEntryBody []) =
+      .running (ptr4EntryPreAnneal writeBytesEntryBody) ∧
+    runLoopFuel (annealMiriHooks writeBytesEntryBody) 5 (miriEntryState writeBytesEntryBody) =
+      .running (ptr4EntryPreMiri writeBytesEntryBody) :=
+  ⟨retCopy_prefix_anneal, retCopy_prefix_miri, writeBytesEntry_prefix_anneal,
+   writeBytesEntry_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA preA sA : MachineState} {entryM preM mB : AnnealStepState} {p : Nat}
+    (hpa : runAnnealBounded body p entryA = .running preA)
+    (hpm : runLoopFuel H p entryM = .running preM)
+    (hA : AnnealPath body preA sA) (hM : MiriPath H preM mB) :
+    AgreeReaches body H entryA sA entryM mB :=
+  agreeReaches_of_prefix_paths hpa hpm hA hM
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeUB nullPtrReadEntryBody (annealMiriHooks nullPtrReadEntryBody)
+      (initMachineState nullPtrReadEntryBody []) (miriEntryState nullPtrReadEntryBody) ∧
+    AgreeUB nullPtrWriteEntryBody (annealMiriHooks nullPtrWriteEntryBody)
+      (initMachineState nullPtrWriteEntryBody []) (miriEntryState nullPtrWriteEntryBody) ∧
+    AgreeReturnsBits nullPtrRawReborrowEntryBody (annealMiriHooks nullPtrRawReborrowEntryBody)
+      (initMachineState nullPtrRawReborrowEntryBody [])
+      (miriEntryState nullPtrRawReborrowEntryBody) 8 0 ∧
+    AgreeUB reborrowDanglingSafeRefEntryBody (annealMiriHooks reborrowDanglingSafeRefEntryBody)
+      (initMachineState reborrowDanglingSafeRefEntryBody [])
+      (miriEntryState reborrowDanglingSafeRefEntryBody) ∧
+    runAnnealBounded copyStage1RawPtrCastEntryBody 8
+      (initMachineState copyStage1RawPtrCastEntryBody []) =
+      .running copyStage1RawPtrCastEntryPreAnneal ∧
+    runLoopFuel (annealMiriHooks copyStage1RawPtrCastEntryBody) 8
+      (miriEntryState copyStage1RawPtrCastEntryBody) =
+      .running copyStage1RawPtrCastEntryPreMiri :=
+  ⟨w3_deref_null_ptr_read_ub, w3_deref_null_ptr_write_ub,
+   w3_rawPtr_deref_null_reborrow_returns, w4_reborrow_dangling_safeRef_ub,
+   copyStage1RawPtrCastEntry_prefix_anneal, copyStage1RawPtrCastEntry_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (StateRel copyStage1RawPtrCastEntryBody
+        copyStage1RawPtrCastEntryPreAnneal copyStage1RawPtrCastEntryPreMiri ∧
+      ∀ tf, copyStage1RawPtrCastEntryPreMiri.stack.frames = #[tf] →
+        ∀ k, IsImmediateFrameLocal tf k) ∧
+    runAnnealBounded reborrowDanglingSafeRefEntryBody 5
+        (initMachineState reborrowDanglingSafeRefEntryBody []) =
+      .running (ptr4EntryPreAnneal reborrowDanglingSafeRefEntryBody) ∧
+    runLoopFuel (annealMiriHooks reborrowDanglingSafeRefEntryBody) 5
+        (miriEntryState reborrowDanglingSafeRefEntryBody) =
+      .running (ptr4EntryPreMiri reborrowDanglingSafeRefEntryBody) :=
+  ⟨copyStage1RawPtrCastEntry_stateRel_and_imm, reborrowDanglingSafeRef_prefix_anneal,
+   reborrowDanglingSafeRef_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    let b := copyStage1RawPtrCastEntryBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b copyStage1RawPtrCastEntryPreAnneal = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () copyStage1RawPtrCastEntryPreMiri = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      Miri.Interpreter.Step.step hooks () m₄ =
+        (m₅, .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  copyStage1RawPtrCastEntry_trace
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ s₁ req k,
+      stepMirFn panicExplicitMacroBody (initMachineState panicExplicitMacroBody []) = .step s₁ ∧
+      stepMirFn panicExplicitMacroBody s₁ = MirStepNode.extCall req k ∧
+      req.defPath = "core::fmt::Arguments::<'a>::from_str") ∧
+    (∃ tr, ReachesRet (mirCallTree panicExplicitMacroBody []) tr .panic) ∧
+    MirReachesUB (mirCallTree panicExplicitMacroBody []) ∧
+    ¬ TreeSafe (mirCallTree panicExplicitMacroBody []) ∧
+    (∃ e, (miriSystem (annealMiriHooks panicExplicitMacroBody)).ReachesOutcome
+      (miriEntryState panicExplicitMacroBody) (.unsupported e)) ∧
+    ¬ (miriSystem (annealMiriHooks panicExplicitMacroBody)).Safe
+      (miriEntryState panicExplicitMacroBody) :=
+  w5_panic_explicit_macro_extCall_boundary
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (StateRel arrayIndexOobEntryBody arrayIndexOobPreAnneal arrayIndexOobPreMiri ∧
+      ∀ tf, arrayIndexOobPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k) ∧
+    runAnnealBounded arrayIndexOobEntryBody 3 (initMachineState arrayIndexOobEntryBody []) =
+      .running arrayIndexOobPreAnneal ∧
+    runLoopFuel (annealMiriHooks arrayIndexOobEntryBody) 3
+      (miriEntryState arrayIndexOobEntryBody) = .running arrayIndexOobPreMiri :=
+  ⟨arrayIndexOob_pre_stateRel_and_imm, arrayIndexOob_prefix_anneal, arrayIndexOob_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {s sₙ : MachineState}
+    {req : MirCallReq} {locals : List LocalSlot} {dest : Place} {targetBb : BasicBlockIdx}
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .continue_))
+    {memP : Memory} {caller : SavedCallerFrame} {rest : List SavedCallerFrame}
+    (hstack : memP.callStack = caller :: rest) (hcaller : caller.returnUnwind = .unreachable) :
+    MirReachesUB (mirTree body s) ∧ ¬ TreeSafe (mirTree body s) :=
+  anneal_extCall_continue_unwind_ub hA hs hstack hcaller
 
 end StatementPins
 

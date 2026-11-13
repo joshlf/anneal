@@ -41,6 +41,22 @@ import LeanMiriSpec.Correspondence.WitLM3_2
 import LeanMiriSpec.Correspondence.TreeBorrowsRel
 import LeanMiriSpec.Correspondence.SimLM3_3
 import LeanMiriSpec.Correspondence.WitLM3_3
+import LeanMiriSpec.Correspondence.CallLM4_1
+import LeanMiriSpec.Correspondence.SimLM4_1
+import LeanMiriSpec.Correspondence.WitLM4_1
+import LeanMiriSpec.Correspondence.BitsLM4_2
+import LeanMiriSpec.Correspondence.IntrinsicLM4_2
+import LeanMiriSpec.Correspondence.NumericLM4_2
+import LeanMiriSpec.Correspondence.SaturatingLM4_2
+import LeanMiriSpec.Correspondence.ExactDivLM4_2
+import LeanMiriSpec.Correspondence.CallLM4_2
+import LeanMiriSpec.Correspondence.OffsetLM4_2
+import LeanMiriSpec.Correspondence.WriteBytesLM4_2
+import LeanMiriSpec.Correspondence.CopyLM4_2
+import LeanMiriSpec.Correspondence.SimLM4_2
+import LeanMiriSpec.Correspondence.WitLM4_2
+import LeanMiriSpec.Correspondence.Safety
+import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Audit
 
 /-!
@@ -230,15 +246,206 @@ import LeanMiriSpec.Audit
   (references, raw pointers, ZSTs, standard wrapper `Freeze` / ZST / uninhabited
   classification across `PhantomData`, `MaybeUninit`, `ManuallyDrop`,
   `UnsafeCell`, `SyncUnsafeCell`, `Cell`, and `RefCell`, and uninhabited vs.
-  inhabited `!`-container pointees), deref reborrows, and general 6-state
-  `Miri.Interpreter.Step.step` + `TreeBorrowsRel` lockstep (`LM-3.3`).
+  inhabited `!`-container pointees), `StorageDead`/`StorageLive` protector UB
+  vs. unprotected local-borrow disable (`sim_lm3_3_storage_dead_and_live_protector_step`,
+  with the protected-`Cell` residual divergence
+  `sim_lm3_3_storage_dead_protected_cell_divergence`),
+  deref reborrows, and general 6-state `Miri.Interpreter.Step.step` +
+  `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
-  witnesses `(a)..(n)` for reborrow hierarchies, protector conflicts and return
+  witnesses `(a)..(o)` for reborrow hierarchies, protector conflicts and return
   release, protected `Unique` disables, `UnsafeCell` (`Cell` & `ReservedIM`) vs.
   `Freeze`, non-`fnEntry`/raw retags, ZST & uninhabited-reference retags,
   disjoint vs. overlapping sub-projections, protected `Cell` chains surviving
-  under `.disabled` ancestors, and wrapper ZST/`Freeze`/uninhabited cell
-  retags (`LM-3.3`).
+  under `.disabled` ancestors, wrapper ZST/`Freeze`/uninhabited cell
+  retags, and `StorageDead` protected UB vs. unprotected local-borrow disable
+  (`LM-3.3`).
+* `LeanMiriSpec.Correspondence.CallLM4_1`: `LM-4.1` multi-frame call-stack
+  correspondence (`FrameStackRel`, `CallerDestinationRel`, `CallerStackLinksRel`
+  linking `returnTarget`, `isDiverging`, and `returnUnwind`,
+  `MultiFrameAllocDisjoint`, `MultiFrameStateRel` / `CallStackStateRel`,
+  `UnwindingStateRel`, `MiriUnwindSteps`, `TreeBorrowsStateRel`,
+  `BorrowTrackerStackRel`), bidirectional depth-1 bridges
+  (`StateRel.iff_multiFrameStateRel_depth1`,
+  `TreeBorrowsStateRel.iff_multiFrameStateRel_depth1`), arbitrary-depth `CallId`
+  protector lifecycle (`ActiveProtectorsValid`, `ActiveProtectorsValid.push_fresh_callId`,
+  `ActiveProtectorsValid.of_releaseCallProtectors`, `releaseCallProtectors`,
+  `popFrameBorrowTrackerAtDepth`, `BorrowTrackerStackRel.of_releaseCallProtectors`,
+  the Stage-1 multi-frame unwinding grounding
+  `unwindFromCallStack_running_releaseCallProtectors`,
+  `borrowTree_releaseProtector_full_simulation`,
+  `basedNormalTree_releaseProtector_chain3_and_branch3_simulation`, and
+  `cex_end_of_call_foreign_unique_frozen_divergence`), indirect `FnPtr` ABI
+  and layout-compatibility checks ((`annealRigidTyLayoutCompat`,
+  `annealRigidTyListLayoutCompat`,
+  `annealRigidTyLayoutCompat_of_rigidTyEq`,
+  `annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq`,
+  `annealRigidTyLayoutCompat_canonical_cases`: trivial-ABI 1-ZSTs, thin and wide
+  pointers, and same-width integers including `char` ↔ `u32`, following canonical
+  `LayoutCompat.layoutCompat` on the non-ADT fragment),
+  `annealFnPtrAbiCompatible`,
+  `annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite`,
+  `annealCalleeAbiCompatible`, `annealEvalNonConstCallLM4_1`), canonical
+  `Miri.Interpreter.FunctionPointers.Registry` bridging (`annealFnPtrRegistry`,
+  `annealFnPtrRegistry_singleton_find_eq`, and the general
+  `annealFnPtrRegistry_find_eq` for every `UInt64`-ranged table), `ReifyFnPointer` coercion hooks
+  (`annealReifyFnPointerAlloc`, which, like canonical `Cast.cast`, performs no
+  Stage-1 reify-time signature/safety validation; `annealCastHooksLM4_1`; and
+  `annealRvalueHooksLM4_1`, which differs from `annealRvalueHooks` only on
+  `ReifyFnPointer` casts: `annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast`,
+  `annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer`), and
+  `annealStepHooksLM4_1` / `annealStepHooksForState` / `StepRelMultiFrame`, plus the
+  explicitly non-canonical, lang-item-free `annealStepHooksWithDirectUnwind`
+  (failed `Assert` unwinds directly and `UnwindTerminate` aborts directly, instead
+  of calling the `core::panicking` lang items as canonical `lean-miri` does).
+* `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator and
+  `ReifyFnPointer` simulations (`step_terminator_unreachable_ub_simulation`,
+  `step_terminator_drop_noop_simulation`,
+  `step_terminator_drop_projected_simulation`,
+  `step_terminator_drop_projected_uninit_divergence`,
+  `canonical_drop_no_glue_preserves_local_divergence`,
+  `step_terminator_drop_canonical_no_glue_step_divergence`,
+  `step_terminator_return_root_simulation`,
+  `step_terminator_return_callee_simulation`,
+  `step_terminator_unwindResume_callee_simulation`,
+  `step_terminator_unwindResume_root_panic_vs_ub_divergence`,
+  `unwindFromCallStack_miri_multiStep_simulation`,
+  `step_terminator_unwindResume_multiFrame_simulation`,
+  `step_terminator_unwindTerminate_abort_vs_unsupported`,
+  `step_terminator_unwindTerminate_termination_abort_simulation`,
+  `step_terminator_assert_local_simulation`,
+  `step_terminator_assert_failed_directUnwind_simulation`,
+  `step_terminator_call_diverging_panic_vs_unlinked`,
+  `step_terminator_call_linked_panic_unwind_simulation`,
+  `step_terminator_call_unreachable_unchecked_ub_simulation`,
+  `step_terminator_call_simulation`,
+  `step_terminator_call_diverging_simulation`,
+  `step_terminator_call_fnDef_local_simulation`,
+  `step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation`,
+  `step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation`,
+  `step_terminator_call_indirect_fnPtr_move_simulation`,
+  `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`, and
+  `step_terminator_call_indirect_layoutCompat_fnPtr_divergence`).
+* `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
+  `(a)..(r)` covering multi-frame call/return with `GlobalState.endCall`
+  protector release, `.uninit` `_0` UB, unprojected & projected `Drop` (live vs.
+  `.dead` UB on a realistic `ScalarPair` layout, projected-`.uninit` and
+  unprojected canonical no-glue `Drop` divergences), `Unreachable` and
+  `unreachable_unchecked` call UB, `BorrowTree.releaseProtector` (`ReservedFrz true`
+  vs. `Disabled`), ZST `()` returns, `.indirect` caller destinations, `copy` +
+  `move` call arguments, cross-frame `BorrowEntry` scoping divergence,
+  diverging caller frame (`isDiverging = true`) return UB, 3-step diverging call
+  execution, step-level end-of-call foreign-`Unique` protector-release divergence,
+  `UnwindResume` cleanup catch / `.unreachable` unwind ABI UB / root `.panic` vs. UB,
+  3-frame `k = 2` `.continue_` unwinding + `UnwindTerminate` + `Assert` + diverging
+  panic calls, non-constant `FnDef` local + indirect `FnPtr` calls +
+  `Safety` divergence, the nounwind-callee unwinding divergence (`(q)`:
+  Stage-1 ignores `FnAbi.canUnwind`, canonical `Call.initStackFrame` does not),
+  and 2-step `MultiFrameStateRel` → `ReifyFnPointer` → `IndirectFnPtrMovePre` →
+  indirect `FnPtr` call → `MultiFrameStateRel` + ABI mismatch UB +
+  `LayoutCompat` (`usize` vs. `u64`) divergence + `FunctionPointers.Registry`
+  bridge + linked `"core::panicking::panic"` unwind & direct-unwind failed
+  `Assert` / `UnwindTerminate` (`(r)`).
+* `LeanMiriSpec.Correspondence.BitsLM4_2`: `BitVec.ofNat` bit-level lemmas for
+  `ctpop`, `ctlz`, `cttz`, `bswap`, and `bitreverse`, plus `stage1_evalIntegerBitIntrinsic_eq`
+  equating Stage-1 `evalCtpop`..`evalBitreverse` to `evalIntegerBitIntrinsic` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.IntrinsicLM4_2`: `AnnealIntrinsic` catalog,
+  function-item type encoding (`encodeTyId`, `decodeFnItemIntrinsic?`), and
+  `annealStepHooks` intrinsic wiring (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.NumericLM4_2`: `ScalarRel` agreement for integer
+  bit-manipulation intrinsics across all 12 integer widths (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.SaturatingLM4_2`: `ScalarRel` agreement for
+  signed and unsigned `saturating_add` and `saturating_sub`, plus `stage1_evalSaturating_eq`
+  equating Stage-1 `evalSaturatingAdd`/`evalSaturatingSub` to `evalSaturatingArith` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.ExactDivLM4_2`: `ScalarRel` and UB equivalence
+  for signed and unsigned `exact_div` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.CallLM4_2`: `TerminatorKind.Call` intrinsic
+  plumbing, Stage-1 `evalTerminator` reductions (`evalTerminator_stage1_bitcount_call`,
+  `evalTerminator_stage1_saturating_call`, `evalTerminator_stage1_exactDiv_call`,
+  `evalTerminator_stage1_wrappingAdd_call`), the Stage-1 external-call boundary for
+  intrinsics Stage-1 does not evaluate inline
+  (`evalTerminator_stage1_unclassified_call_extCall`,
+  `stepMirFn_stage1_unmodeled_intrinsic_extCall`,
+  `stepMirFn_stage1_std_offset_alias_extCall`), the `Stage1ExtraIntrinsic`
+  classification and `step_call_nonAnnealIntrinsic_miri_unsupported` boundary, the
+  **pre-Stage-1 reference model** `stepMirFnLM4_2` (not Stage-1 `Trusted`), and
+  `StateRelLM3_1` return-place write lemmas (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.OffsetLM4_2`: real-step `StateRelLM3_1`
+  simulation and provenance-free `.scalar` pointer divergence for `arith_offset`
+  over Stage-1 `stepMirFn` (`call_intrinsic_arithOffset_stage1_simulation`,
+  `call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`) and, over the
+  pre-Stage-1 reference model only, `call_intrinsic_offset_simulation` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.WriteBytesLM4_2`: `write_bytes` simulation and
+  Tree Borrows divergence over the pre-Stage-1 reference model only (Stage-1 turns
+  `write_bytes` into an external call) (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.CopyLM4_2`: `NonDivergingIntrinsic.CopyNonOverlapping`
+  Stage-1 bridge (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`), Stage-1
+  lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
+  `step_intrinsic_copyNonOverlapping_stage1_simulation`,
+  `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
+  distinct-local multi-element `copyViaBytes` evaluation
+  (`evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq`,
+  `stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq`,
+  `stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq`,
+  `stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2`,
+  `step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`), Stage-1
+  uninitialized-source and Tree Borrows divergences
+  (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
+  `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1
+  provenance preservation across `evalCopySingleDirect` and byte-codec `copyViaBytes`
+  (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
+  `encodeUntypedValueToBytes_ptr_decode_roundtrip`) plus the `TyId 80` boundary
+  (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`: `encodeRawPtrTyId`
+  collapses pointer-to-pointer types to `TyId 80` and `StackScalarAllocShape` is
+  scalar-only), and reference-model multi-byte range simulations (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.SimLM4_2`: unified `LM-4.2` simulation theorems,
+  over Stage-1 `stepMirFn` for `Assume`, `CopyNonOverlapping` (single-element /
+  aligned zero-count fragment), `exact_div`, `arith_offset`, integer
+  bit-manipulation / saturating intrinsics, and the `rotate_left` / `rotate_right`
+  boundary, and over the pre-Stage-1 reference model for multi-element / sub-range
+  `CopyNonOverlapping`, `write_bytes`, and the non-canonical offset aliases
+  (`core::intrinsics::wrapping_offset` and `std::intrinsics::*`, which
+  `rustc-capture` never emits and Stage-1 routes to `MirStepNode.extCall`).
+* `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep (including
+  full-byte multi-element `copyViaBytes`), Stage-1 boundary (`extCall`,
+  `Stage1ExtraIntrinsic`, and 5-step lockstep `TyId 80` pointer-valued
+  `copy_nonoverlapping` on initialized pointer operands), and Stage-1 divergence
+  witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned and
+  out-of-bounds `copy_nonoverlapping`, rejects same-tag disjoint copies, stores
+  ill-sized values on cross-type copies, clobbers the whole destination on partial
+  distinct-local copies in 5-step lockstep, and rejects provenance-free `.scalar`
+  pointers in `arith_offset`).
+* `LeanMiriSpec.Correspondence.Safety`: whole-program `Miri.OperationalSafety.System`
+  semantics of `lean-miri`'s `RunLoop` (`miriSystem`), the step-closed simulation
+  engine (`StepClosedSim`) with `step_universal_simulation`,
+  `runLoop_universal_simulation`, `treeSafe_iff_miriSafe`,
+  `reachesUB_iff_miriReachesUB`, and `partialCorrect_iff_annealPostcondition`
+  over Stage-1 `mirTree`, the unconditional closed fragment `InSafeScalarFragment`,
+  bridges from the `LM-1` … `LM-4.2` step relations (including `StepRelUnionReturnLM2_4` /
+  `stepClosedSim_of_stepRelLM2_4_unionReturn`, `StepObsRelLM3_2` / `StepObsRelLM3_2Tree`,
+  `treeBorrowsStateRel_entry`, and `MiriUnwindSteps.toMiriPath_ok` /
+  `MiriUnwindSteps.toMiriOutcome_error`), and the Stage-1 correspondence scope and
+  divergence ledger (`LM-4.3`).
+* `LeanMiriSpec.Correspondence.MiriDiffWitnesses`: kernel-checked whole-program
+  safe, partial-correctness, undefined-behavior, infinite-run, and divergence
+  witnesses (each witness of the `Safety` divergence ledger runs from program entry)
+  across scalars, aggregates, unions (`w2_union_return`,
+  `w2_union_overlay_type_punning_returns`), raw pointers (from-entry Stage-1
+  `BinOp.Offset` stride `w3_ptr_offset_stride_read_returns`, RFC 2582 null
+  place-to-pointer `w3_rawPtr_deref_null_reborrow_returns`, narrowing type-pun
+  `w3_deref_type_pun_returns`, storage revive `w3_storage_revive_stale_deref_ub`,
+  and null / out-of-bounds / misaligned / negative-offset / invalid-`bool` deref UB),
+  references and Tree Borrows (`w4_reborrow_dangling_safeRef_ub`,
+  `w4_invalid_bool_ref_read_ub`, `w4_storage_dead_protected_ub`,
+  `w4_disabled_read_divergence`), multi-frame calls, unwinding, and indirect `FnPtr`
+  calls (`w5_call_return`, `w5_unwind_cleanup_returns`, `w5_unwind_unreachable_ub`,
+  `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`,
+  `w5_panic_explicit_macro_extCall_boundary`), and
+  intrinsics (`w6_copy_nonoverlapping_full_bytes_returns`,
+  `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, and the Stage-1 external-call
+  boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
+  `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
+  `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
