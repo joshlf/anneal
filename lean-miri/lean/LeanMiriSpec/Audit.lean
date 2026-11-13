@@ -23326,6 +23326,7 @@ example :
          nextTag := 10 } }
      ∃ s', stepMirFn b s = .step s' ∧ get? s'.frame.locals 2 = some (.init (.ptr p 8))) ∧
     (let b := copyStage1RawPtrBoundaryBody
+     stepMirFn b (ptr4AnnealPre b) = .fail .ub ∧
      ∃ m',
        Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
          (ptr4MiriPre b unitK) =

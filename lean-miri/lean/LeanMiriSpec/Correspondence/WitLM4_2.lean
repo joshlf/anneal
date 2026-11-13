@@ -4812,15 +4812,25 @@ def copyStage1RawPtrBoundaryBody : CapturedMir :=
   ptr4Body unitK (.rawPtr .not rawMutU64K) (.rawPtr .mut rawMutU64K)
     [copyStmt 2 3 1] .return_
 
-/-- **`wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary`**: two-machine boundary
-for `copy_nonoverlapping::<*mut u64>`:
-* Stage-1 `stepMirFn` on `copyStage1RawPtrBody` copies `.init (.ptr ⟨9, 16⟩ 8)`
-  into `_2` with its `ProvenancePtr` intact (`wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok`);
-* From the `StateRelLM3_1`-related pre-state `(ptr4AnnealPre b, ptr4MiriPre b unitK)`
-  of `copyStage1RawPtrBoundaryBody`, `lean-miri`'s `Miri.Interpreter.Step.step`
-  under `annealStepHooks` fails closed at `annealPointeeTypeOf 80`
-  (`rawPtrPointeeEncodedTyId? 80 = none` in `Translate.lean:320`) with
-  `StepError.unsupported "pointee of TyId 80 is not encoded"`. -/
+/-- **`wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary`**: why no two-machine
+lockstep exists for `copy_nonoverlapping::<*mut u64>`. The two conjuncts concern
+**different** states:
+* Stage-1 `stepMirFn` on the hand-built (not `StateRelLM3_1`-related) state of
+  `copyStage1RawPtrBody` copies `.init (.ptr ⟨9, 16⟩ 8)` into `_2` with its
+  `ProvenancePtr` intact (`wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok`). No
+  `StateRelLM3_1`-related counterpart exists, because memory-backed raw-pointer
+  locals lie outside the scalar-only `StackScalarAllocShape`;
+* on the `StateRelLM3_1`-related pre-state `(ptr4AnnealPre b, ptr4MiriPre b unitK)`
+  of `copyStage1RawPtrBoundaryBody`, whose pointer operands `_2` / `_3` are
+  uninitialized, Stage-1 `stepMirFn` reports undefined behavior (it reads the
+  uninitialized `_2`). `lean-miri`'s `Miri.Interpreter.Step.step` fails closed
+  earlier, at `annealPointeeTypeOf 80` (`rawPtrPointeeEncodedTyId? 80 = none` in
+  `Translate.lean:320`), with
+  `StepError.unsupported "pointee of TyId 80 is not encoded"`. rustc's
+  `copy_intrinsic` also computes the pointee layout before reading the pointers,
+  but here `encodeTyId` collapses every pointer-to-pointer type to `TyId 80`.
+  `lean-miri` therefore never reaches the pointer reads of any pointer-valued
+  copy. -/
 theorem wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary :
     (let b := copyStage1RawPtrBody
      let e_p := rawPtrAllocMapEntry b.localDecls b.layouts .mut 0 9 Witness.lm31AllocId1
@@ -4840,6 +4850,7 @@ theorem wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary :
          nextTag := 10 } }
      ∃ s', stepMirFn b s = .step s' ∧ get? s'.frame.locals 2 = some (.init (.ptr p 8))) ∧
     (let b := copyStage1RawPtrBoundaryBody
+     stepMirFn b (ptr4AnnealPre b) = .fail .ub ∧
      ∃ m',
        Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
          (ptr4MiriPre b unitK) =
@@ -4848,6 +4859,7 @@ theorem wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary :
   let b := copyStage1RawPtrBoundaryBody
   have hrel₀ := (ptr4_stateRel unitK (.rawPtr .not rawMutU64K) (.rawPtr .mut rawMutU64K)
     [copyStmt 2 3 1] .return_).toLM3_1
+  refine ⟨rfl, ?_⟩
   exact step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
     hrel₀ rfl rfl rfl rfl (fun tf htf => ptr4_all_immediate b unitK tf htf 2) (by nofun)
     rfl rfl (fun tf htf => ptr4_all_immediate b unitK tf htf 3) (by nofun)
