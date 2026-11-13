@@ -245,13 +245,14 @@ pub enum LoweredTerminator {
 }
 
 impl LoweredTerminator {
-    /// Direct [`CallTarget`] if this terminator is a `Call` of a [`Constant::FnDef`] function
-    /// item (`None` for indirect `Call`s and non-`Call` terminators).
+    /// Direct [`CallTarget`] if this terminator is a `Call` of a function item: a
+    /// [`Constant::FnDef`] or a function item value of type [`Ty::FnDef`] (`None` for calls
+    /// through function pointers and non-`Call` terminators).
     ///
     /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
     pub fn call_target(&self) -> Option<&CallTarget> {
         match self {
-            LoweredTerminator::Call { func, .. } => func.call_target(),
+            LoweredTerminator::Call { func, func_ty, .. } => call_target_of(func, func_ty),
             _ => None,
         }
     }
@@ -500,7 +501,7 @@ pub fn lower_terminator(
                 check_normal_edge(*target)?;
             }
             check_unwind(*unwind)?;
-            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func, &func_ty) {
                 check_intrinsic_call_types(*op, &arg_tys, &dest_ty, ptr_width).map_err(|err| {
                     match err {
                         IntrinsicTypeError::Signature(reason) => {
@@ -1057,7 +1058,7 @@ pub fn eval_lowered_terminator(
                 *target,
                 state,
             )?;
-            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func, func_ty) {
                 let op = *op;
                 match eval_intrinsic_call(op, &arg_vals, arg_tys, dest_ty, state)
                     .map_err(term_err)?
@@ -1176,11 +1177,16 @@ fn check_goto(
     }
 }
 
-/// The call target of a function-item callee operand ([`Constant::FnDef`]).
+/// The call target of a function-item callee operand `func` of type `func_ty`: a
+/// [`Constant::FnDef`], or a `Copy`/`Move` of a zero-sized function item value, whose type
+/// [`Ty::FnDef`] names its callee (a direct call either way).
 ///
 /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
-fn call_target_of(func: &Operand) -> Option<&CallTarget> {
-    func.call_target()
+fn call_target_of<'a>(func: &'a Operand, func_ty: &'a Ty) -> Option<&'a CallTarget> {
+    func.call_target().or(match func_ty {
+        Ty::FnDef(target) => Some(target),
+        _ => None,
+    })
 }
 
 /// A call's evaluated callee, arguments, and destination (see [`prepare_call`]).
@@ -1664,9 +1670,10 @@ pub struct ExternalCall<'a> {
     pub call_stack: &'a [CallSite],
     /// The calling block, in the body of the innermost frame.
     pub bb: usize,
-    /// The unlinked symbol the call names: a direct `Constant::FnDef(CallTarget::Fn(_))`
-    /// callee, or the target of the function pointer an indirect call evaluated its callee to
-    /// (`None` for any other callee, e.g. a pointer constant).
+    /// The unlinked symbol the call names: a direct function item callee (a
+    /// `Constant::FnDef(CallTarget::Fn(_))`, or a function item value of type
+    /// `Ty::FnDef(CallTarget::Fn(_))`), or the target of the function pointer an indirect call
+    /// evaluated its callee to (`None` for any other callee).
     pub callee: Option<&'a CalleeSymbol>,
     /// The evaluated callee operand.
     pub func: &'a MirValue,
@@ -1775,7 +1782,7 @@ fn may_call_linked(frame: &Frame<'_>, table: &CallTable) -> bool {
     else {
         return false;
     };
-    match call_target_of(func) {
+    match call_target_of(func, func_ty) {
         Some(CallTarget::Fn(symbol)) => table.contains(symbol),
         Some(CallTarget::Intrinsic(_)) => false,
         None => func_ty.is_fn_ptr() && !table.is_empty(),
@@ -1820,7 +1827,7 @@ fn run_block<'a>(
             // The linked symbol a direct call names, or that the function pointer an indirect
             // call reads designates (peeked without side effects; `prepare_call` evaluates
             // the callee operand for real, faulting on an invalid one).
-            let (symbol, indirect) = match call_target_of(func) {
+            let (symbol, indirect) = match call_target_of(func, func_ty) {
                 Some(CallTarget::Fn(symbol)) => (Some(symbol.clone()), false),
                 Some(CallTarget::Intrinsic(_)) => (None, false),
                 None if func_ty.is_fn_ptr() => match peek_operand(func, &frame.state) {
@@ -1892,8 +1899,8 @@ fn run_block<'a>(
         None => None,
         Some(handler) => {
             let callee = match term {
-                LoweredTerminator::Call { func, .. } => {
-                    func.call_target().and_then(CallTarget::as_callee)
+                LoweredTerminator::Call { func, func_ty, .. } => {
+                    call_target_of(func, func_ty).and_then(CallTarget::as_callee)
                 }
                 _ => None,
             };
