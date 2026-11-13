@@ -2,6 +2,7 @@
 
 pub mod cast;
 pub mod cfg;
+pub mod intrinsic;
 pub mod rvalue;
 
 pub use cast::{
@@ -13,9 +14,16 @@ pub use cast::{
     lower_transmute,
 };
 pub use cfg::{
-    CallHandler, CallOutcome, CfgEvalError, CfgEvalOutcome, CfgStep, LoweredTerminator,
-    PanicMessage, TerminatorLowerError, UnwindState, eval_cfg_in_state, eval_lowered_body_cfg,
+    CallHandler, CallOutcome, CallSite, CallTable, CfgEvalError, CfgEvalOutcome, CfgStep,
+    DEFAULT_MAX_CALL_DEPTH, ExternalCall, ExternalCallHandler, LinkedCallee, LoweredTerminator,
+    PanicMessage, TerminatorLowerError, UnwindState, eval_cfg_in_state,
+    eval_cfg_in_state_with_call_table, eval_lowered_body_cfg,
+    eval_lowered_body_cfg_with_call_table, eval_lowered_body_cfg_with_call_table_and_calls,
     eval_lowered_body_cfg_with_calls, eval_lowered_terminator, lower_terminator,
+};
+pub use intrinsic::{
+    IntrinsicOutcome, IntrinsicTypeError, check_intrinsic_call_types, eval_intrinsic,
+    eval_intrinsic_call, ordering_variant,
 };
 pub use rvalue::{
     FieldSlot, LocalFrame, LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue,

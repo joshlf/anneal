@@ -14,9 +14,9 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::ir::{
-    AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, LayoutError,
-    Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem, PtrWidth,
-    RetagKind, Rvalue, Statement, Ty, UintTy, UnOp,
+    AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, IntrinsicOp,
+    LayoutError, Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem,
+    PtrWidth, RetagKind, Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use crate::lower::cast::{
     AbstractByte, CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast,
@@ -648,7 +648,7 @@ fn check_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<(), &'stat
             }
             Ok(())
         }
-        Constant::Bool(_) | Constant::Char(_) | Constant::Unit => Ok(()),
+        Constant::Bool(_) | Constant::Char(_) | Constant::Unit | Constant::FnDef(_) => Ok(()),
     }
 }
 
@@ -1794,6 +1794,14 @@ pub enum RvalueEvalError {
     UninhabitedEnumVariant {
         variant_index: usize,
     },
+    /// A precondition of the inline intrinsic `op` was violated (undefined behavior), e.g.
+    /// `ctlz_nonzero(0)` or `exact_div` with a non-zero remainder. Preconditions shared with a
+    /// `BinOp` report that `BinOp`'s error instead (`DivisionByZero`, `ArithmeticOverflow`,
+    /// ...).
+    IntrinsicUb {
+        op: IntrinsicOp,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for RvalueEvalError {
@@ -1921,6 +1929,9 @@ impl std::fmt::Display for RvalueEvalError {
             RvalueEvalError::UninhabitedEnumVariant { variant_index } => {
                 write!(f, "discriminant of uninhabited enum variant {variant_index} (UB)")
             }
+            RvalueEvalError::IntrinsicUb { op, reason } => {
+                write!(f, "intrinsic {op}: {reason} (UB)")
+            }
         }
     }
 }
@@ -1959,18 +1970,39 @@ pub fn eval_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<MirValu
             ptr: *ptr,
             ty: ty.clone(),
         }),
-        Constant::Unit => Ok(MirValue::Unit),
+        Constant::Unit | Constant::FnDef(_) => Ok(MirValue::Unit),
     }
 }
 
+/// Validates that `bits` is a well-formed bit pattern of the integral type `ty` under
+/// `ptr_width` (`InvalidBitPattern` otherwise, never truncated).
+fn check_int_bits(bits: u128, ty: &Ty, ptr_width: PtrWidth) -> Result<(), RvalueEvalError> {
+    if !ty.is_integral() || !ty.is_valid_scalar_bits(bits, ptr_width) {
+        return Err(RvalueEvalError::CastEval(
+            CastEvalError::InvalidBitPattern {
+                target_ty: ty.clone(),
+                bits,
+            },
+        ));
+    }
+    Ok(())
+}
+
 /// Computes `(wrapped_bits, overflowed)` for integer `Add`, `Sub`, or `Mul` (plus `*WithOverflow` / `*Unchecked`).
-fn compute_int_arith_with_overflow(
+pub(crate) fn compute_int_arith_with_overflow(
     op: BinOp,
     lhs_bits: u128,
     rhs_bits: u128,
     ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<(u128, bool), RvalueEvalError> {
+    if !ty.is_integral() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "integer arithmetic requires Int or Uint type",
+        ));
+    }
+    check_int_bits(lhs_bits, ty, ptr_width)?;
+    check_int_bits(rhs_bits, ty, ptr_width)?;
     match ty {
         Ty::Uint(ut) => {
             let mask = ut.mask(ptr_width);
@@ -2044,6 +2076,13 @@ fn compute_shift_with_overflow(
             ));
         }
     };
+    if !rhs_ty.is_integral() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "shift RHS must be Int or Uint",
+        ));
+    }
+    check_int_bits(lhs_bits, lhs_ty, ptr_width)?;
+    check_int_bits(rhs_bits, rhs_ty, ptr_width)?;
     let lhs_mask = lhs_ty.scalar_mask(ptr_width);
     let rhs_masked = rhs_bits & rhs_ty.scalar_mask(ptr_width);
 
@@ -2080,7 +2119,7 @@ fn compute_shift_with_overflow(
 }
 
 /// Compares two matching scalar/pointer `MirValue`s under `ptr_width`.
-fn compare_mir_values(
+pub(crate) fn compare_mir_values(
     lhs: &MirValue,
     rhs: &MirValue,
     ptr_width: PtrWidth,
@@ -2100,10 +2139,14 @@ fn compare_mir_values(
             },
         ) if lhs_ty == rhs_ty => match lhs_ty {
             Ty::Uint(ut) => {
+                check_int_bits(*a, lhs_ty, ptr_width)?;
+                check_int_bits(*b, rhs_ty, ptr_width)?;
                 let mask = ut.mask(ptr_width);
                 Ok((a & mask).cmp(&(b & mask)))
             }
             Ty::Int(it) => {
+                check_int_bits(*a, lhs_ty, ptr_width)?;
+                check_int_bits(*b, rhs_ty, ptr_width)?;
                 let sa = it.sign_extend(*a, ptr_width);
                 let sb = it.sign_extend(*b, ptr_width);
                 Ok(sa.cmp(&sb))
@@ -2122,9 +2165,8 @@ fn compare_mir_values(
                 ty: rhs_ty,
             },
         ) if allow_pointers && lhs_ty == rhs_ty && lhs_ty.is_any_ptr() => {
-            let mask = ptr_width.mask();
-            let aa = (pa.addr as u128) & mask;
-            let ab = (pb.addr as u128) & mask;
+            let aa = checked_ptr_addr(pa, lhs_ty, ptr_width)?;
+            let ab = checked_ptr_addr(pb, rhs_ty, ptr_width)?;
             if lhs_ty.is_ref() && (aa == 0 || ab == 0) {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: lhs_ty.clone(),
@@ -2272,6 +2314,13 @@ pub fn eval_binop(
                     "Div/Rem LHS and RHS types must match",
                 ));
             }
+            if !lt.is_integral() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Div/Rem requires Int or Uint type",
+                ));
+            }
+            check_int_bits(*a, lt, ptr_width)?;
+            check_int_bits(*b, rt, ptr_width)?;
             match lt {
                 Ty::Uint(ut) => {
                     let mask = ut.mask(ptr_width);
@@ -2324,6 +2373,8 @@ pub fn eval_binop(
             (MirValue::Int { bits: a, ty: lt }, MirValue::Int { bits: b, ty: rt })
                 if lt == rt && lt.is_integral() =>
             {
+                check_int_bits(*a, lt, ptr_width)?;
+                check_int_bits(*b, rt, ptr_width)?;
                 let mask = lt.scalar_mask(ptr_width);
                 let res = match op {
                     BinOp::BitAnd => (*a & *b) & mask,
@@ -2422,13 +2473,19 @@ pub fn eval_binop(
                     "Offset pointee layout is too large for the target",
                 ));
             };
-            let base_addr = u128::from(ptr.addr) & ptr_width.mask();
+            if !rhs_ty.is_integral() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Offset RHS must have Int or Uint type",
+                ));
+            }
+            let base_addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
             if ptr_ty.is_ref() && base_addr == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: ptr_ty.clone(),
                     bits: 0,
                 }));
             }
+            check_int_bits(*count_bits, rhs_ty, ptr_width)?;
             let overflow = |offset: i128| RvalueEvalError::PointerOffsetOverflow {
                 base_addr: ptr.addr,
                 offset,
@@ -2504,6 +2561,7 @@ pub fn eval_unop(
         UnOp::Not => match val {
             MirValue::Bool(b) => Ok(MirValue::Bool(!b)),
             MirValue::Int { bits, ty } if ty.is_integral() => {
+                check_int_bits(*bits, ty, ptr_width)?;
                 let mask = ty.scalar_mask(ptr_width);
                 Ok(MirValue::Int {
                     bits: (!*bits) & mask,
@@ -2517,8 +2575,9 @@ pub fn eval_unop(
         UnOp::Neg => match val {
             MirValue::Int {
                 bits,
-                ty: Ty::Int(it),
+                ty: ty @ Ty::Int(it),
             } => {
+                check_int_bits(*bits, ty, ptr_width)?;
                 let signed = it.sign_extend(*bits, ptr_width);
                 let negated = signed.wrapping_neg();
                 Ok(MirValue::Int {
@@ -3228,58 +3287,108 @@ fn decode_mir_value(
 /// Predicts an exposed provenance for `PointerWithExposedProvenance` at `addr_bits` (with
 /// target pointer type `target_ty`) in a frame with `local_decls` and optional `slots`.
 ///
+/// Best matching live synthetic local provenance in `tracker` whose `[base_addr, end_addr]`
+/// contains `addr_bits` (preferring interior addresses over one-past-the-end and matching
+/// [`decode_subplace_tag`] when multiple tags of that local were exposed).
+pub(crate) fn match_exposed_local_provenance_for_decls(
+    addr_bits: u128,
+    target_ty: &Ty,
+    local_decls: &[Ty],
+    slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
+    ptr_width: PtrWidth,
+    tracker: &ExposedProvenanceTracker,
+) -> Option<crate::ir::Provenance> {
+    if local_decls.is_empty() {
+        return None;
+    }
+    let pointee_ty = target_ty.pointee_ty();
+    let mut best: Option<(u8, crate::ir::Provenance)> = None;
+    for &prov in &tracker.exposed {
+        let Some(loc) = prov
+            .alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < local_decls.len())
+        else {
+            continue;
+        };
+        if slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))) {
+            continue;
+        }
+        let Ok(base_addr) = local_base_addr_in_frame(loc, local_decls, ptr_width, frame_addr_base)
+        else {
+            continue;
+        };
+        let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
+            continue;
+        };
+        let end_addr = base_addr.saturating_add(alloc_size as u128);
+        if addr_bits < base_addr || addr_bits > end_addr {
+            continue;
+        }
+        let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
+        let tag_matches = pointee_ty
+            .and_then(|pty| decode_subplace_tag(prov.tag, pty))
+            .is_some();
+        let rank = (u8::from(is_interior) << 1) | u8::from(tag_matches);
+        if best.is_none_or(|(best_rank, _)| rank > best_rank) {
+            best = Some((rank, prov));
+        }
+    }
+    best.map(|(_, prov)| prov)
+}
+
 /// When multiple provenances have been exposed, prefers one whose synthetic local allocation
 /// `[base_addr, base_addr + alloc_size]` contains `addr_bits` (preferring live locals and
 /// interior addresses `[base_addr, base_addr + alloc_size)` over one-past-the-end, and
 /// matching [`decode_subplace_tag`] when multiple tags of that local were exposed), falling
-/// back to `tracker.exposed.first().copied()`.
+/// back to an exposed external (non-local) provenance and then to any live local provenance
+/// of this frame, while never predicting a storage-dead local's provenance.
 fn predict_exposed_provenance_for_decls(
     addr_bits: u128,
     target_ty: &Ty,
     local_decls: &[Ty],
     slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
     ptr_width: PtrWidth,
     tracker: &ExposedProvenanceTracker,
 ) -> Option<crate::ir::Provenance> {
-    if !local_decls.is_empty() && tracker.exposed.len() > 1 {
-        let pointee_ty = target_ty.pointee_ty();
-        let mut best: Option<(u8, crate::ir::Provenance)> = None;
-        for &prov in &tracker.exposed {
-            let Some(loc) = prov
-                .alloc_id
-                .checked_sub(1)
-                .and_then(|id| usize::try_from(id).ok())
-                .filter(|&loc| loc < local_decls.len())
-            else {
-                continue;
-            };
-            let Ok(base_addr) = local_base_addr_for_decls(loc, local_decls, ptr_width) else {
-                continue;
-            };
-            let Ok((alloc_size, _)) = local_decls[loc].alloc_size_and_align(ptr_width) else {
-                continue;
-            };
-            let end_addr = base_addr.saturating_add(alloc_size as u128);
-            if addr_bits < base_addr || addr_bits > end_addr {
-                continue;
-            }
-            let is_live = !slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead)));
-            let is_interior = addr_bits < end_addr || (alloc_size == 0 && addr_bits == base_addr);
-            let tag_matches = pointee_ty
-                .and_then(|pty| decode_subplace_tag(prov.tag, pty))
-                .is_some();
-            let rank = (u8::from(is_live) << 2)
-                | (u8::from(is_interior) << 1)
-                | u8::from(tag_matches);
-            if best.is_none_or(|(best_rank, _)| rank > best_rank) {
-                best = Some((rank, prov));
-            }
-        }
-        if let Some((_, prov)) = best {
+    let local_of = |prov: crate::ir::Provenance| -> Option<usize> {
+        prov.alloc_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .filter(|&loc| loc < local_decls.len())
+    };
+    let is_dead_local = |prov: crate::ir::Provenance| -> bool {
+        local_of(prov)
+            .is_some_and(|loc| slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))))
+    };
+    if !local_decls.is_empty() {
+        if let Some(prov) = match_exposed_local_provenance_for_decls(
+            addr_bits,
+            target_ty,
+            local_decls,
+            slots,
+            frame_addr_base,
+            ptr_width,
+            tracker,
+        ) {
             return Some(prov);
         }
+        if let Some(&ext) = tracker
+            .exposed
+            .iter()
+            .find(|&&prov| local_of(prov).is_none())
+        {
+            return Some(ext);
+        }
     }
-    tracker.exposed.first().copied()
+    tracker
+        .exposed
+        .iter()
+        .copied()
+        .find(|&prov| !is_dead_local(prov))
 }
 
 /// Evaluates a `LoweredCast` on an evaluated `MirValue` operand under `ptr_width` and `policy`.
@@ -3290,14 +3399,16 @@ pub fn eval_lowered_cast(
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
 ) -> Result<MirValue, RvalueEvalError> {
-    eval_lowered_cast_with_decls(cast, val, &[], None, ptr_width, policy, tracker)
+    eval_lowered_cast_with_decls(cast, val, &[], None, 0, ptr_width, policy, tracker)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_lowered_cast_with_decls(
     cast: &LoweredCast,
     val: &MirValue,
     local_decls: &[Ty],
     slots: Option<&[LocalSlotState]>,
+    frame_addr_base: u128,
     ptr_width: PtrWidth,
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
@@ -3373,6 +3484,7 @@ fn eval_lowered_cast_with_decls(
                     target_ty,
                     local_decls,
                     slots,
+                    frame_addr_base,
                     ptr_width,
                     tracker,
                 )
@@ -3545,7 +3657,7 @@ fn eval_lowered_cast_with_decls(
 /// The address of the pointer `ptr` of type `ty` for a memory-access or validity check, which
 /// must fit `ptr_width`: an address beyond the target's pointer width is an ill-formed value
 /// (`InvalidBitPattern` naming `ty`) that a check must not truncate into a valid one.
-fn checked_ptr_addr(
+pub(crate) fn checked_ptr_addr(
     ptr: &PointerValue,
     ty: &Ty,
     ptr_width: PtrWidth,
@@ -5516,7 +5628,7 @@ pub fn eval_lowered_rvalue(
                 Vec::new()
             };
             let out =
-                eval_lowered_cast_with_decls(cast, &v, &decls, None, ptr_width, policy, tracker)?;
+                eval_lowered_cast_with_decls(cast, &v, &decls, None, 0, ptr_width, policy, tracker)?;
             if !mir_value_matches_ty(&out, ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Cast result runtime type does not match lowered ty",
@@ -6076,6 +6188,11 @@ pub struct StatementEvalState {
     pub tracker: ExposedProvenanceTracker,
     /// Value returned by `Rvalue::NullaryOp(NullOp::UbChecks, Ty::Bool)` (defaults to `true`).
     pub ub_checks: bool,
+    /// Offset of this frame's synthetic stack allocations, a multiple of `0x1000` (the frame's
+    /// first allocation starts at `frame_addr_base + 0x1000`): `0` for an evaluated body, and
+    /// above every caller frame's allocations for a linked callee frame
+    /// (`crate::lower::cfg::CallTable`), so no two active frames share an address.
+    pub frame_addr_base: u128,
 }
 
 /// Type alias for [`StatementEvalState`].
@@ -6096,6 +6213,7 @@ impl StatementEvalState {
             policy: TransmutePolicy::RejectPtrToInt,
             tracker: ExposedProvenanceTracker::new(),
             ub_checks: true,
+            frame_addr_base: 0,
         }
     }
 
@@ -6113,6 +6231,7 @@ impl StatementEvalState {
             policy,
             tracker: ExposedProvenanceTracker::new(),
             ub_checks: true,
+            frame_addr_base: 0,
         }
     }
 
@@ -6163,6 +6282,24 @@ impl StatementEvalState {
             Some(LocalSlotState::Init(v)) => Some(v),
             _ => None,
         }
+    }
+
+    /// Best matching live synthetic local provenance in this frame's exposed tracker whose
+    /// `[base_addr, end_addr]` contains `addr_bits`.
+    pub(crate) fn match_exposed_local_provenance(
+        &self,
+        addr_bits: u128,
+        target_ty: &Ty,
+    ) -> Option<crate::ir::Provenance> {
+        match_exposed_local_provenance_for_decls(
+            addr_bits,
+            target_ty,
+            &self.local_decls,
+            Some(&self.slots),
+            self.frame_addr_base,
+            self.ptr_width,
+            &self.tracker,
+        )
     }
 
     /// Reads an index local as a `usize` bit pattern, returning `TypeMismatch` if the local is
@@ -6227,7 +6364,18 @@ impl StatementEvalState {
     /// [`local_base_addr_for_decls`]: `UnsupportedMemoryAccess` when the local's synthetic
     /// allocation does not fit the target address space).
     pub(crate) fn local_base_addr(&self, local: usize) -> Result<u128, RvalueEvalError> {
-        local_base_addr_for_decls(local, &self.local_decls, self.ptr_width)
+        local_base_addr_in_frame(local, &self.local_decls, self.ptr_width, self.frame_addr_base)
+    }
+
+    /// End of this frame's synthetic stack allocations (the address after the page-rounded
+    /// allocation of its last local), from which a callee frame's allocations may start.
+    pub(crate) fn frame_addr_end(&self) -> Result<u128, RvalueEvalError> {
+        local_base_addr_in_frame(
+            self.local_decls.len(),
+            &self.local_decls,
+            self.ptr_width,
+            self.frame_addr_base,
+        )
     }
 
     /// Maps a synthetic local or sub-place pointer `ptr` (of type `ptr_ty` with pointee
@@ -6426,6 +6574,56 @@ impl StatementEvalState {
             .map(|_| ())
     }
 
+    /// [`Self::check_place_write_access`] that also returns `place` evaluated into an
+    /// equivalent place without `Deref` or `Index` steps: every dereferenced pointer and index
+    /// operand is read now (`Index(i)` becomes the canonical `ConstantIndex { offset: i,
+    /// min_length: len }`), so a later [`Self::write_place`] of the result designates the same
+    /// sub-place even if those pointers or index locals have changed in between. A call's
+    /// destination is evaluated this way before the call and written after it (MiniRust's
+    /// and Miri's `Call`), which matters for a callee that changes the caller's state (the
+    /// memory intrinsics).
+    pub(crate) fn resolve_write_place(
+        &self,
+        place: &Place,
+        place_ty: &Ty,
+    ) -> Result<Place, RvalueEvalError> {
+        let (target_local, target_proj, index_cache) =
+            self.prepare_place_access_with_mode(place, place_ty, true)?;
+        let mut projection: Vec<ProjectionElem> = Vec::with_capacity(target_proj.len());
+        for elem in target_proj {
+            let elem = match elem {
+                ProjectionElem::Index(idx_local) => {
+                    let index = cached_index(&index_cache, idx_local)?;
+                    let prefix = Place {
+                        local: target_local,
+                        projection: projection.clone(),
+                    };
+                    let Ok(Ty::Array(_, len)) = resolve_place_ty(&prefix, &self.local_decls) else {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Index projection on a place that is not an array",
+                        ));
+                    };
+                    match (u64::try_from(index), u64::try_from(len)) {
+                        (Ok(offset), Ok(min_length)) if offset < min_length => {
+                            ProjectionElem::ConstantIndex {
+                                offset,
+                                min_length,
+                                from_end: false,
+                            }
+                        }
+                        _ => return Err(RvalueEvalError::IndexOutOfBounds { index, len }),
+                    }
+                }
+                other => other,
+            };
+            projection.push(elem);
+        }
+        Ok(Place {
+            local: target_local,
+            projection,
+        })
+    }
+
     /// Evaluates an operand in this state: `Copy` reads the place, `Move` reads it and (for a
     /// bare local) deinitializes it (see [`StatementEvalState::move_place`]), and `Constant`
     /// is validated and evaluated.
@@ -6577,7 +6775,7 @@ impl StatementEvalState {
     /// Evaluates `Statement::Deinit(place)` (of declared type `place_ty`).
     ///
     /// Requires a live root local (`DeadLocal`), resolves every `Deref` step to its synthetic
-    /// target sub-place (which must be live as well, see [`Self::resolve_synthetic_subplace`])
+    /// target sub-place (which must be live as well, see `Self::resolve_synthetic_subplace`)
     /// while reading the `Index` operands in place-evaluation order, then, on the resolved
     /// `(target_local, target_proj)`:
     /// - a bare (or wholly dereferenced) local becomes `LocalSlotState::Uninit`; `Deinit(*p)`
@@ -8791,12 +8989,32 @@ pub(crate) fn local_base_addr_for_decls(
     local_decls: &[Ty],
     ptr_width: PtrWidth,
 ) -> Result<u128, RvalueEvalError> {
+    local_base_addr_in_frame(local, local_decls, ptr_width, 0)
+}
+
+/// [`local_base_addr_for_decls`] for a frame whose synthetic allocations start `frame_base`
+/// bytes higher (a page multiple; see [`StatementEvalState::frame_addr_base`]): the frame's
+/// first allocation starts at `frame_base + 0x1000`, and every allocation must still fit the
+/// target address space (`UnsupportedMemoryAccess` otherwise).
+pub(crate) fn local_base_addr_in_frame(
+    local: usize,
+    local_decls: &[Ty],
+    ptr_width: PtrWidth,
+    frame_base: u128,
+) -> Result<u128, RvalueEvalError> {
     const PAGE: u128 = 0x1000;
+    if !frame_base.is_multiple_of(PAGE) {
+        return Err(RvalueEvalError::TypeMismatch(
+            "StatementEvalState::frame_addr_base must be a multiple of 0x1000",
+        ));
+    }
     let too_large = RvalueEvalError::UnsupportedMemoryAccess(
         "synthetic stack allocation does not fit the target address space",
     );
     let limit = ptr_width.max_usize();
-    let mut cur = PAGE;
+    let Some(mut cur) = frame_base.checked_add(PAGE).filter(|start| *start <= limit) else {
+        return Err(too_large);
+    };
     let preceding = local.min(local_decls.len());
     for decl_ty in &local_decls[..preceding] {
         let stride = match decl_ty.alloc_size_and_align(ptr_width) {
@@ -8869,6 +9087,8 @@ trait FrameView {
     fn frame_slot(&self, local: usize) -> Option<FrameSlot<'_>>;
     /// Reads the `usize` operand of a `ProjectionElem::Index(idx_local)` step.
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError>;
+    /// Offset of the frame's synthetic allocations ([`local_base_addr_in_frame`]).
+    fn frame_addr_base(&self) -> u128;
 }
 
 impl FrameView for StatementEvalState {
@@ -8895,6 +9115,10 @@ impl FrameView for StatementEvalState {
 
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError> {
         self.read_index_local(idx_local)
+    }
+
+    fn frame_addr_base(&self) -> u128 {
+        self.frame_addr_base
     }
 }
 
@@ -8936,6 +9160,10 @@ impl FrameView for ValuesFrame<'_> {
 
     fn frame_index_operand(&self, idx_local: Local) -> Result<u128, RvalueEvalError> {
         read_index_in_values(idx_local, self.locals, &self.decls, self.ptr_width)
+    }
+
+    fn frame_addr_base(&self) -> u128 {
+        0
     }
 }
 
@@ -9143,7 +9371,12 @@ fn resolve_synthetic_subplace_in<F: FrameView + ?Sized>(
     if matches!(frame.frame_slot(target_local), Some(FrameSlot::Dead)) {
         return Err(RvalueEvalError::DeadLocal(Local(target_local)));
     }
-    let base_addr = local_base_addr_for_decls(target_local, frame.frame_decls(), ptr_width)?;
+    let base_addr = local_base_addr_in_frame(
+        target_local,
+        frame.frame_decls(),
+        ptr_width,
+        frame.frame_addr_base(),
+    )?;
     let target_decl_ty = &frame.frame_decls()[target_local];
     let (target_alloc_size, _) = target_decl_ty
         .alloc_size_and_align(ptr_width)
@@ -9478,7 +9711,9 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
         place,
     )?;
     // In bounds of an allocation that fits the address space: no wrap.
-    let addr = local_base_addr_for_decls(place.local.0, decls, ptr_width)? + off as u128;
+    let addr =
+        local_base_addr_in_frame(place.local.0, decls, ptr_width, frame.frame_addr_base())?
+            + off as u128;
     Ok(PointerValue::with_provenance(
         addr as u64,
         place.local.0 as u64 + 1,
@@ -9644,7 +9879,12 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
                 ptr_width,
                 place,
             )?;
-            let addr = local_base_addr_for_decls(resolved_local.0, decls, ptr_width)? + off as u128;
+            let addr = local_base_addr_in_frame(
+                resolved_local.0,
+                decls,
+                ptr_width,
+                frame.frame_addr_base(),
+            )? + off as u128;
             Ok(PointerValue::with_provenance(
                 addr as u64,
                 resolved_local.0 as u64 + 1,
@@ -9665,7 +9905,8 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
             )?;
             let (tail_off, _) =
                 compute_subplace_offset_and_tag(deref_ty, tail, &read_index, ptr_width, place)?;
-            let local_base = local_base_addr_for_decls(target_local, decls, ptr_width)?;
+            let local_base =
+                local_base_addr_in_frame(target_local, decls, ptr_width, frame.frame_addr_base())?;
             let target_decl_ty = &decls[target_local];
             let (target_alloc_size, _) = target_decl_ty
                 .alloc_size_and_align(ptr_width)
@@ -10783,6 +11024,9 @@ fn write_partial_shell_in_slot(
 /// - a zero-byte copy with `count > 1` copies the state between resolved sub-places and is
 ///   otherwise a no-op (it accesses no memory, not even of storage-dead locals);
 /// - any other memory access is `UnsupportedMemoryAccess`.
+///
+/// The checks and effects after operand evaluation are [`copy_nonoverlapping_values`], which
+/// the call form ([`IntrinsicOp::CopyNonOverlapping`]) shares.
 #[allow(clippy::too_many_arguments)]
 fn eval_copy_nonoverlapping(
     state: &mut StatementEvalState,
@@ -10793,16 +11037,41 @@ fn eval_copy_nonoverlapping(
     elem_size: usize,
     elem_align: usize,
 ) -> Result<(), RvalueEvalError> {
-    let mut eval_op = |op: &Operand| -> Result<MirValue, RvalueEvalError> {
-        match op {
-            Operand::Copy(place) => state.read_place(place),
-            Operand::Move(place) => state.move_place(place),
-            Operand::Constant(c) => eval_constant(c, state.ptr_width),
-        }
-    };
-    let src_val = eval_op(src)?;
-    let dst_val = eval_op(dst)?;
-    let count_val = eval_op(count)?;
+    let src_val = state.eval_operand(src)?;
+    let dst_val = state.eval_operand(dst)?;
+    let count_val = state.eval_operand(count)?;
+    copy_nonoverlapping_values(
+        state, &src_val, &dst_val, &count_val, elem_ty, elem_size, elem_align,
+    )
+}
+
+/// `copy_nonoverlapping::<elem_ty>(src_val, dst_val, count_val)` on evaluated operands: every
+/// check and effect of [`eval_copy_nonoverlapping`] after its operands have been evaluated
+/// (shared by `Statement::CopyNonOverlapping` and the call form
+/// [`IntrinsicOp::CopyNonOverlapping`], which `rustc`'s `LowerIntrinsics` pass turns into the
+/// statement).
+///
+/// Validates target-width pointer addresses and non-null reference bit-validity
+/// (`InvalidBitPattern`), `count <= usize::MAX` (`InvalidBitPattern`), non-null raw pointers
+/// (`NullPointerAccess`), `elem_align` alignment (`MisalignedPointer`), inhabited pointees for
+/// references (`UninhabitedPointee`), `count * elem_size <= isize::MAX` (`CopyLengthOverflow`),
+/// and non-wrapping `[addr, addr + byte_len]` ranges (`PointerRangeOverflow`), even when
+/// `count == 0`: the statement's pre-existing semantics, stricter than `Trusted`'s
+/// `evalCopyNonOverlappingWithCount`, which steps over a zero-count copy without any check.
+/// Non-zero copies additionally reject overlapping same-allocation ranges
+/// (`CopyNonOverlappingOverlap`) and storage-dead synthetic locals (`DeadLocal` for
+/// `byte_len > 0` or `count == 1`), then transfer initialized/uninitialized sub-places or
+/// contiguous array windows (or fail closed with `UnsupportedMemoryAccess`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_nonoverlapping_values(
+    state: &mut StatementEvalState,
+    src_val: &MirValue,
+    dst_val: &MirValue,
+    count_val: &MirValue,
+    elem_ty: &Ty,
+    elem_size: usize,
+    elem_align: usize,
+) -> Result<(), RvalueEvalError> {
     let ptr_width = state.ptr_width;
     let Ok(layout) = elem_ty.layout_for(ptr_width) else {
         return Err(RvalueEvalError::TypeMismatch(
@@ -10821,16 +11090,25 @@ fn eval_copy_nonoverlapping(
                     ptr,
                     ty: ptr_ty @ (Ty::RawPtr(pointee, m) | Ty::Ref(pointee, m)),
                 } if **pointee == *elem_ty && (!need_mut || *m == Mutability::Mut) => {
-                    Ok((*ptr, checked_ptr_addr(ptr, ptr_ty, ptr_width)?))
+                    let addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
+                    if ptr_ty.is_ref() && addr == 0 {
+                        return Err(RvalueEvalError::CastEval(
+                            CastEvalError::InvalidBitPattern {
+                                target_ty: ptr_ty.clone(),
+                                bits: 0,
+                            },
+                        ));
+                    }
+                    Ok((*ptr, addr))
                 }
                 _ => Err(RvalueEvalError::TypeMismatch(
                     "copy_nonoverlapping pointers must point to the copied element type",
                 )),
             }
         };
-    let (src_ptr, src_addr) = pointer(&src_val, false)?;
-    let (dst_ptr, dst_addr) = pointer(&dst_val, true)?;
-    let MirValue::Int {
+    let (src_ptr, src_addr) = pointer(src_val, false)?;
+    let (dst_ptr, dst_addr) = pointer(dst_val, true)?;
+    let &MirValue::Int {
         bits: count,
         ty: Ty::Uint(UintTy::Usize),
     } = count_val
@@ -10858,6 +11136,9 @@ fn eval_copy_nonoverlapping(
                 required_align: elem_align,
             });
         }
+    }
+    if (src_val.ty().is_ref() || dst_val.ty().is_ref()) && !elem_ty.is_inhabited_for(ptr_width) {
+        return Err(RvalueEvalError::UninhabitedPointee(elem_ty.clone()));
     }
     let byte_len = count
         .checked_mul(elem_size as u128)
@@ -11125,6 +11406,284 @@ fn eval_copy_nonoverlapping(
     }
     Err(RvalueEvalError::UnsupportedMemoryAccess(
         "copy_nonoverlapping outside of whole-local copies",
+    ))
+}
+
+/// `write_bytes::<elem_ty>(dst_val, byte_val, count_val)` ([`IntrinsicOp::WriteBytes`]) on
+/// evaluated operands: sets the `count * elem_size` bytes at `dst` to `byte_val`.
+///
+/// `dst` must be a `*mut elem_ty` / `&mut elem_ty` whose address fits the target and `count`
+/// a `usize` that does (`InvalidBitPattern` otherwise, never truncated). Then `dst` must be
+/// aligned to `elem_align` even when nothing is written (`MisalignedPointer`), and `count *
+/// elem_size` must not exceed `isize::MAX` (`CopyLengthOverflow`).
+///
+/// A write of zero bytes (`count == 0`, or zero-sized elements) accesses no memory, so every
+/// aligned pointer is valid for it, including null and dangling ones (Rust's rule for
+/// zero-sized accesses, which `core::ptr::write_bytes`'s `maybe_is_aligned_and_not_null`
+/// check applies with `zero_size = T::IS_ZST || count == 0`); a reference to an uninhabited
+/// type is still an invalid value (`UninhabitedPointee`). When it designates a live zero-sized
+/// sub-place, the (unique) element value is recorded there (or in its whole window of array
+/// elements); otherwise the write is a no-op.
+///
+/// A non-empty write requires a non-null `dst` (`NullPointerAccess`) whose range does not
+/// wrap the address space (`PointerRangeOverflow`) and does not touch a storage-dead local
+/// (`DeadLocal`). The written element value is the canonical decoding of `elem_size` copies of
+/// the byte (MiniRust `decode`): an element type without a canonical byte layout, or bytes
+/// that are no valid element value (`bool` from `2`, a null `&T`, ...), cannot be stored in
+/// the value tree and are `UnsupportedMemoryAccess` (writing such bytes is not itself
+/// undefined behavior, reading them later is). The value is then stored like
+/// `copy_nonoverlapping` stores a copied value: into the resolved synthetic sub-place for
+/// `count == 1` (a whole inactive union field is overwritten), or into a resolved contiguous
+/// window of array elements (partially initializing an uninitialized multi-element array is
+/// `UnsupportedMemoryAccess`, as arrays have no per-element initialization state). A resolution
+/// fault of `dst` (undefined behavior such as `UninhabitedPointee`) is reported before any
+/// value is decoded; any other destination is `UnsupportedMemoryAccess`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_bytes_values(
+    state: &mut StatementEvalState,
+    dst_val: &MirValue,
+    byte_val: &MirValue,
+    count_val: &MirValue,
+    elem_ty: &Ty,
+    elem_size: usize,
+    elem_align: usize,
+) -> Result<(), RvalueEvalError> {
+    const UNSUPPORTED_DST: &str = "write_bytes outside of resolvable sub-places";
+    let ptr_width = state.ptr_width;
+    let Ok(layout) = elem_ty.layout_for(ptr_width) else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "write_bytes element type must have an exact layout",
+        ));
+    };
+    if layout.size != elem_size || layout.align != elem_align {
+        return Err(RvalueEvalError::TypeMismatch(
+            "write_bytes layout does not match element type layout",
+        ));
+    }
+    let (dst_ptr, dst_addr, dst_ptr_ty) = match dst_val {
+        MirValue::Ptr {
+            ptr,
+            ty: ptr_ty @ (Ty::RawPtr(pointee, Mutability::Mut) | Ty::Ref(pointee, Mutability::Mut)),
+        } if **pointee == *elem_ty => {
+            let addr = checked_ptr_addr(ptr, ptr_ty, ptr_width)?;
+            if ptr_ty.is_ref() && addr == 0 {
+                return Err(RvalueEvalError::CastEval(
+                    CastEvalError::InvalidBitPattern {
+                        target_ty: ptr_ty.clone(),
+                        bits: 0,
+                    },
+                ));
+            }
+            (*ptr, addr, ptr_ty.clone())
+        }
+        _ => {
+            return Err(RvalueEvalError::TypeMismatch(
+                "write_bytes destination must be a mutable pointer to the element type",
+            ));
+        }
+    };
+    let &MirValue::Int {
+        bits: byte,
+        ty: Ty::Uint(UintTy::U8),
+    } = byte_val
+    else {
+        return Err(RvalueEvalError::TypeMismatch("write_bytes value must be a u8"));
+    };
+    if byte > u128::from(u8::MAX) {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Uint(UintTy::U8),
+            bits: byte,
+        }));
+    }
+    let &MirValue::Int {
+        bits: count,
+        ty: Ty::Uint(UintTy::Usize),
+    } = count_val
+    else {
+        return Err(RvalueEvalError::TypeMismatch("write_bytes count must be a usize"));
+    };
+    if count > ptr_width.max_usize() {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Uint(UintTy::Usize),
+            bits: count,
+        }));
+    }
+    if !dst_addr.is_multiple_of(elem_align as u128) {
+        return Err(RvalueEvalError::MisalignedPointer {
+            addr: dst_addr as u64,
+            required_align: elem_align,
+        });
+    }
+    if dst_ptr_ty.is_ref() && !elem_ty.is_inhabited_for(ptr_width) {
+        return Err(RvalueEvalError::UninhabitedPointee(elem_ty.clone()));
+    }
+    let byte_len = count
+        .checked_mul(elem_size as u128)
+        .filter(|len| *len <= ptr_width.max_object_size())
+        .ok_or(RvalueEvalError::CopyLengthOverflow { count, elem_size })?;
+    let decode_elem = || -> Result<MirValue, RvalueEvalError> {
+        if !elem_ty.has_canonical_byte_layout(ptr_width) {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes into an element type without a canonical byte layout",
+            ));
+        }
+        let bytes = vec![AbstractByte::new(byte as u8); elem_size];
+        decode_mir_value(&bytes, elem_ty, ptr_width).map_err(|err| match err {
+            RvalueEvalError::CastEval(
+                CastEvalError::InvalidBitPattern { .. } | CastEvalError::UninhabitedTarget { .. },
+            ) => RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes stores bytes that are not a valid value of the element type",
+            ),
+            other => other,
+        })
+    };
+    // Writing bytes into only part of an uninitialized multi-element array is defined in Rust
+    // (only reading an uninitialized element later is UB), but `MirValue::Array` has no
+    // per-element initialization state, so partial array initialization fails closed.
+    let map_partial_uninit = |res: Result<(), RvalueEvalError>| {
+        res.map_err(|err| match err {
+            RvalueEvalError::UninitializedLocal(_) => RvalueEvalError::UnsupportedMemoryAccess(
+                "write_bytes partially initializes an uninitialized array",
+            ),
+            other => other,
+        })
+    };
+    if byte_len > 0 {
+        if dst_addr == 0 {
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        if dst_addr + byte_len > ptr_width.max_usize() {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: dst_addr as u64,
+                byte_len,
+            });
+        }
+        let local_count = state.slots.len().min(state.local_decls.len());
+        if let Some(idx) = resolve_synthetic_alloc_local(&dst_ptr, local_count)
+            && matches!(state.slots[idx], LocalSlotState::Dead)
+        {
+            return Err(RvalueEvalError::DeadLocal(Local(idx)));
+        }
+    } else if count == 0 || dst_addr == 0 {
+        return Ok(());
+    }
+    let dummy_place = Place::from_local(0);
+    let (dst_local, dst_proj) = match state.resolve_synthetic_subplace_with_mode(
+        &dst_ptr,
+        &dst_ptr_ty,
+        elem_ty,
+        &dummy_place,
+        true,
+    ) {
+        Ok(resolved) => resolved,
+        // A zero-byte write needs no memory: only an invalid reference value is an error.
+        Err(err @ RvalueEvalError::UninhabitedPointee(_)) => return Err(err),
+        Err(_) if byte_len == 0 => return Ok(()),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(_)) => {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+        }
+        Err(err) => return Err(err),
+    };
+    // `count > 1`: a contiguous window of array elements (also of zero-sized elements, whose
+    // whole window `[start, start + count)` is recorded when it fits the array; for `byte_len
+    // == 0`, `count >= dst_len` starting at `0` covers every zero-sized element at offset `0`).
+    if count > 1
+        && let Some((
+            &ProjectionElem::ConstantIndex {
+                offset: dst_start,
+                min_length: dst_len,
+                from_end: false,
+            },
+            dst_arr_proj,
+        )) = dst_proj.split_last()
+        && let Ok(dst_len_usize) = usize::try_from(dst_len)
+    {
+        let effective_count = if byte_len == 0 && dst_start == 0 && count >= u128::from(dst_len) {
+            u128::from(dst_len)
+        } else {
+            count
+        };
+        if let (Ok(count_u64), Ok(count_usize)) =
+            (u64::try_from(effective_count), usize::try_from(effective_count))
+            && let Some(dst_end) = dst_start.checked_add(count_u64).filter(|end| *end <= dst_len)
+        {
+            if count_usize > MAX_EVAL_ARRAY_LEN {
+                return Err(RvalueEvalError::EvaluationLimit { len: count_usize });
+            }
+            // Overwriting only part of an inactive union array field is unsupported without a byte
+            // memory model; overwriting the entire field switches the union's active field.
+            if (dst_start != 0 || count_usize != dst_len_usize)
+                && !slot_union_path_active(&state.slots[dst_local.0], dst_arr_proj, false)
+            {
+                return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+            }
+            if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+                return Ok(());
+            }
+            let window = MirValue::Array {
+                elements: vec![decode_elem()?; count_usize],
+                elem_ty: elem_ty.clone(),
+            };
+            if dst_start == 0 && count_usize == dst_len_usize {
+                let arr_ty = Ty::Array(Box::new(elem_ty.clone()), dst_len_usize);
+                return map_partial_uninit(state.write_subplace_slot(
+                    dst_local,
+                    dst_arr_proj,
+                    &arr_ty,
+                    FieldSlot::Init(window),
+                    dst_local,
+                    &dummy_place,
+                ));
+            }
+            let mut dst_slice_proj = dst_arr_proj.to_vec();
+            dst_slice_proj.push(ProjectionElem::Subslice {
+                from: dst_start,
+                to: dst_end,
+                from_end: false,
+            });
+            let dst_slice_place = Place {
+                local: dst_local,
+                projection: dst_slice_proj,
+            };
+            let slice_ty = Ty::Array(Box::new(elem_ty.clone()), count_usize);
+            return map_partial_uninit(state.write_place(&dst_slice_place, &slice_ty, window));
+        }
+    }
+    // A single element: `count == 1`, or the one sub-place that all `count` zero-sized
+    // elements share.
+    if count > 1 && byte_len > 0 {
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+    }
+    // As for `copy_nonoverlapping`: a single element written into part of an inactive union
+    // array field is a partial union-field write (unsupported).
+    let mut whole_dst_proj = dst_proj.as_slice();
+    while let Some((
+        ProjectionElem::ConstantIndex {
+            offset: 0,
+            min_length: 1,
+            from_end: false,
+        },
+        prefix,
+    )) = whole_dst_proj.split_last()
+    {
+        whole_dst_proj = prefix;
+    }
+    if !slot_union_path_active(&state.slots[dst_local.0], whole_dst_proj, false)
+        && matches!(whole_dst_proj.last(), Some(ProjectionElem::ConstantIndex { .. }))
+    {
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(UNSUPPORTED_DST));
+    }
+    if byte_len == 0 && !elem_ty.is_inhabited_for(ptr_width) {
+        return Ok(());
+    }
+    let elem_val = decode_elem()?;
+    map_partial_uninit(state.write_subplace_slot(
+        dst_local,
+        &dst_proj,
+        elem_ty,
+        FieldSlot::Init(elem_val),
+        dst_local,
+        &dummy_place,
     ))
 }
 
@@ -11576,6 +12135,7 @@ pub fn eval_lowered_rvalue_in_state(
                 &v,
                 &state.local_decls,
                 Some(&state.slots),
+                state.frame_addr_base,
                 state.ptr_width,
                 state.policy,
                 &mut state.tracker,

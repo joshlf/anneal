@@ -21,13 +21,24 @@
 //! - `Assert` jumps to its target when `cond == expected`, otherwise it panics with the
 //!   evaluated message;
 //! - `Call` evaluates the callee and arguments left to right (a `Move` of a bare local
-//!   deinitializes it), checks the destination place, and asks the caller-supplied call
-//!   handler for the outcome (without a handler: [`CfgEvalError::UnsupportedCall`]); a
-//!   returned value must be well formed and of the destination's type, and is written to the
-//!   destination before jumping to `target` (a return from a call without `target` is
-//!   undefined behavior); a panicking call leaves the destination unchanged.
+//!   deinitializes it), checks the destination place, and then runs the callee: a function
+//!   item of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`]) executes in
+//!   the calling frame ([`eval_intrinsic_call`]); a function item of a symbol linked in a
+//!   [`CallTable`] runs the callee's body in a new frame (under
+//!   [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], or
+//!   [`eval_lowered_body_cfg_with_call_table_and_calls`]); any other callee goes to the
+//!   caller-supplied call handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the
+//!   [`ExternalCall`] under a call table; without a handler: [`CfgEvalError::UnsupportedCall`],
+//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
+//!   formed and of the destination's type, and is written to the destination before jumping
+//!   to `target` (a return from a call without `target` is undefined behavior); a panicking
+//!   call leaves the destination unchanged. `UnreachableUnchecked` is undefined behavior
+//!   ([`CfgEvalError::UnreachableReached`]), `Abort` ends the evaluation with
+//!   [`CfgEvalOutcome::Terminated`] without running any cleanup block, and `PanicUnwind`
+//!   panics.
 //!
-//! A panic (failed `Assert`, or a handler reporting [`CallOutcome::Panic`]) follows the
+//! A panic (failed `Assert`, a handler reporting [`CallOutcome::Panic`], a `PanicUnwind`
+//! call, or a panicking linked callee) follows the
 //! terminator's [`UnwindAction`]: `Continue` leaves the body ([`CfgEvalOutcome::Panicked`]),
 //! `Terminate` aborts ([`CfgEvalOutcome::Terminated`]), `Unreachable` is undefined behavior
 //! ([`CfgEvalError::UnwindIntoUnreachable`], the panic unwinds into an edge that must never
@@ -38,18 +49,30 @@
 //! is undefined behavior with `Unreachable`). Edges that break the cleanup discipline are
 //! rejected by [`lower_terminator`], and again (for hand-built bodies) at runtime with
 //! [`CfgEvalError::InvalidEdge`] / [`CfgEvalError::InvalidUnwind`].
+//!
+//! # Linked calls
+//!
+//! [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], and
+//! [`eval_lowered_body_cfg_with_call_table_and_calls`] run the callees of a [`CallTable`] on an
+//! explicit frame stack that shares one fuel counter and is bounded by
+//! [`CallTable::max_call_depth`]; see [`CallTable`] for argument passing, outcome propagation
+//! across frames, and frame isolation. [`eval_cfg_in_state`] is the single-frame special case
+//! (no table).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
-    AssertMessage, BinOp, Body, Operand, Place, PtrWidth, SwitchTargets, Terminator, Ty, UintTy,
-    UnwindAction,
+    AssertMessage, BinOp, Body, CallTarget, CalleeSymbol, IntrinsicOp, Operand, Place,
+    PointerValue, Provenance, PtrWidth, SwitchTargets, Terminator, Ty, UintTy, UnwindAction,
 };
 use crate::lower::cast::CastEvalError;
+use crate::lower::intrinsic::{
+    IntrinsicOutcome, IntrinsicTypeError, check_intrinsic_call_types, eval_intrinsic_call,
+};
 use crate::lower::rvalue::{
-    LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
-    StatementEvalState, check_value_well_formed, eval_lowered_statement, lower_operand_ty,
-    mir_value_matches_ty, resolve_place_ty,
+    LocalSlotState, LoweredBasicBlock, LoweredBody, MirValue, RvalueEvalError, RvalueLowerError,
+    StatementEvalState, check_value_well_formed, eval_lowered_statement, lower_layout_error,
+    lower_operand_ty, mir_value_matches_ty, resolve_place_ty,
 };
 
 /// Terminator-specific static lowering error (wrapped in
@@ -90,6 +113,12 @@ pub enum TerminatorLowerError {
     CallToUninhabitedDestinationWithTarget(Ty),
     /// The entry block `bb0` is a cleanup block.
     CleanupEntryBlock,
+    /// `Call` of the inline intrinsic `op` whose argument or destination types do not match
+    /// `op`'s signature (see [`IntrinsicOp`] and [`check_intrinsic_call_types`]).
+    InvalidIntrinsicCall {
+        op: IntrinsicOp,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for TerminatorLowerError {
@@ -150,6 +179,9 @@ impl std::fmt::Display for TerminatorLowerError {
             TerminatorLowerError::CleanupEntryBlock => {
                 write!(f, "entry block bb0 is a cleanup block")
             }
+            TerminatorLowerError::InvalidIntrinsicCall { op, reason } => {
+                write!(f, "ill-typed call of intrinsic {op}: {reason}")
+            }
         }
     }
 }
@@ -204,6 +236,19 @@ pub enum LoweredTerminator {
     UnwindTerminate,
 }
 
+impl LoweredTerminator {
+    /// Direct [`CallTarget`] if this terminator is a `Call` of a [`Constant::FnDef`] function
+    /// item (`None` for indirect `Call`s and non-`Call` terminators).
+    ///
+    /// [`Constant::FnDef`]: crate::ir::Constant::FnDef
+    pub fn call_target(&self) -> Option<&CallTarget> {
+        match self {
+            LoweredTerminator::Call { func, .. } => func.call_target(),
+            _ => None,
+        }
+    }
+}
+
 /// Lowers the terminator `term` of basic block `bb` of `body` under `ptr_width`.
 ///
 /// Checks every jump target against the body's blocks and `rustc`'s cleanup discipline (normal
@@ -214,7 +259,10 @@ pub enum LoweredTerminator {
 /// discriminant of type `bool`/`char`/integer with distinct values valid for that type, an
 /// `Assert` condition of type `bool` and well-typed message operands, a well-formed `Drop`
 /// place, a `Call` whose destination is inhabited when it has a target, and an inhabited
-/// return place `_0` for `Return`.
+/// return place `_0` for `Return`. A `Call` of an inline intrinsic
+/// ([`CallTarget::Intrinsic`]) must also match the intrinsic's signature
+/// ([`check_intrinsic_call_types`]: [`TerminatorLowerError::InvalidIntrinsicCall`], or the
+/// layout error of a pointee without an exact layout).
 pub fn lower_terminator(
     term: &Terminator,
     bb: usize,
@@ -444,6 +492,16 @@ pub fn lower_terminator(
                 check_normal_edge(*target)?;
             }
             check_unwind(*unwind)?;
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+                check_intrinsic_call_types(*op, &arg_tys, &dest_ty, ptr_width).map_err(|err| {
+                    match err {
+                        IntrinsicTypeError::Signature(reason) => {
+                            invalid(TerminatorLowerError::InvalidIntrinsicCall { op: *op, reason })
+                        }
+                        IntrinsicTypeError::Layout { ty, error } => lower_layout_error(&ty, error),
+                    }
+                })?;
+            }
             Ok(LoweredTerminator::Call {
                 func: func.clone(),
                 func_ty,
@@ -492,9 +550,15 @@ pub enum PanicMessage {
     InvalidEnumConstruction(MirValue),
     /// Free-form message.
     Custom(String),
+    /// A call of the diverging entry point `op` ([`IntrinsicOp::PanicUnwind`] panics,
+    /// [`IntrinsicOp::Abort`] aborts); its arguments are not interpreted.
+    Intrinsic(IntrinsicOp),
 }
 
 /// Clean (non-UB) result of a control-flow evaluation.
+///
+/// Block indices refer to the evaluated body: an outcome that a linked callee frame produced
+/// (see [`CallTable`]) is attributed to the caller's calling block, with its message unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CfgEvalOutcome {
     /// `Return` with the initialized return value `_0`.
@@ -503,9 +567,14 @@ pub enum CfgEvalOutcome {
     /// path ending in `UnwindResume`).
     Panicked { bb: usize, msg: PanicMessage },
     /// A panic in block `bb` aborted the program (`UnwindAction::Terminate`, or a cleanup path
-    /// ending in `UnwindTerminate`).
+    /// ending in `UnwindTerminate`), or block `bb` called [`IntrinsicOp::Abort`].
     Terminated { bb: usize, msg: PanicMessage },
-    /// Fuel ran out before block `bb` could execute; `state` is the state at that point.
+    /// Fuel ran out before block `bb` could execute; `state` is the state at that point, from
+    /// which [`eval_cfg_in_state`] (or [`eval_cfg_in_state_with_call_table`]) can resume unless
+    /// `bb` is a cleanup block (the unwinding panic is not part of `state`). When fuel runs out
+    /// inside a linked callee, `bb` is the evaluated body's calling block and `state` the body's
+    /// state when that block was entered (callee frames are discarded, and resuming re-executes
+    /// the block and the call).
     OutOfFuel {
         bb: usize,
         state: StatementEvalState,
@@ -541,8 +610,24 @@ pub enum CfgEvalError {
     /// `UnwindTerminate` while not unwinding, `Return` while unwinding, or
     /// `Continue`/`Cleanup` unwinding from a cleanup block).
     InvalidUnwind { bb: usize },
-    /// Block `bb` calls a function, but no call handler was provided.
+    /// Block `bb` calls a function that is neither an inline intrinsic nor linked, but no
+    /// call handler was provided.
     UnsupportedCall { bb: usize },
+    /// Block `bb` calls the ordinary function `callee`, which the [`CallTable`] does not link
+    /// (and no call handler was provided).
+    UnknownCallee { bb: usize, callee: CalleeSymbol },
+    /// Block `bb` calls a linked callee while [`CallTable::max_call_depth`] linked callee
+    /// frames are already active. This is an evaluation limit (like fuel), not undefined
+    /// behavior; it is raised deterministically, before the callee frame is created.
+    CallDepthExceeded { bb: usize, max_call_depth: usize },
+    /// `error` occurred in a linked callee frame. `call_stack[0]` is the call made by the
+    /// evaluated body and `call_stack[i + 1]` the call made by the callee of `call_stack[i]`;
+    /// block indices inside `error` refer to the innermost callee's body. (The stack is flat,
+    /// so even a deep recursion's error stays shallow.)
+    InCallee {
+        call_stack: Vec<CallSite>,
+        error: Box<CfgEvalError>,
+    },
 }
 
 impl std::fmt::Display for CfgEvalError {
@@ -579,6 +664,25 @@ impl std::fmt::Display for CfgEvalError {
                     "bb{bb} calls a function but no call handler was provided"
                 )
             }
+            CfgEvalError::UnknownCallee { bb, callee } => {
+                write!(
+                    f,
+                    "bb{bb} calls `{callee}`, which is not linked in the call table"
+                )
+            }
+            CfgEvalError::CallDepthExceeded { bb, max_call_depth } => {
+                write!(
+                    f,
+                    "bb{bb} exceeds the maximum depth of {max_call_depth} linked callee frames"
+                )
+            }
+            CfgEvalError::InCallee { call_stack, error } => {
+                write!(f, "in callee")?;
+                for site in call_stack {
+                    write!(f, " -> `{}` (called from bb{})", site.callee, site.bb)?;
+                }
+                write!(f, ": {error}")
+            }
         }
     }
 }
@@ -600,7 +704,8 @@ pub type CallHandler<'a> =
     dyn FnMut(usize, &MirValue, &[MirValue]) -> Result<CallOutcome, RvalueEvalError> + 'a;
 
 /// Evaluates `body` on `args` with at most `fuel` executed basic blocks, without a call
-/// handler (every `Call` is [`CfgEvalError::UnsupportedCall`]). See the module documentation.
+/// handler (every `Call` of anything but an inline intrinsic is
+/// [`CfgEvalError::UnsupportedCall`]). See the module documentation.
 pub fn eval_lowered_body_cfg(
     body: &LoweredBody,
     args: &[MirValue],
@@ -611,7 +716,8 @@ pub fn eval_lowered_body_cfg(
     eval_cfg_in_state(body, state, 0, fuel, None)
 }
 
-/// [`eval_lowered_body_cfg`] with a call handler deciding the outcome of every `Call`.
+/// [`eval_lowered_body_cfg`] with a call handler deciding the outcome of every `Call` that is
+/// not an inline intrinsic.
 pub fn eval_lowered_body_cfg_with_calls<F>(
     body: &LoweredBody,
     args: &[MirValue],
@@ -634,22 +740,23 @@ enum PanicFlow {
     Done(CfgEvalOutcome),
 }
 
-/// Applies the unwind action `unwind` to a panic `msg` raised in block `bb`.
+/// Applies the unwind action `unwind` to a panic `msg` raised in block `bb`, validating
+/// `unwind` against `basic_blocks` before updating `unwinding` so a failed `Cleanup` edge
+/// never leaves `unwinding` partially mutated.
 fn start_panic(
     bb: usize,
     msg: PanicMessage,
     unwind: UnwindAction,
+    basic_blocks: &[LoweredBasicBlock],
     unwinding: &mut UnwindState,
 ) -> Result<PanicFlow, CfgEvalError> {
+    check_unwind_action(bb, unwind, unwinding.is_some(), basic_blocks)?;
     match unwind {
         UnwindAction::Unreachable => Err(CfgEvalError::UnwindIntoUnreachable {
             bb,
             msg: Box::new(msg),
         }),
         UnwindAction::Terminate => Ok(PanicFlow::Done(CfgEvalOutcome::Terminated { bb, msg })),
-        UnwindAction::Continue | UnwindAction::Cleanup(_) if unwinding.is_some() => {
-            Err(CfgEvalError::InvalidUnwind { bb })
-        }
         UnwindAction::Continue => Ok(PanicFlow::Done(CfgEvalOutcome::Panicked { bb, msg })),
         UnwindAction::Cleanup(target) => {
             *unwinding = Some((bb, msg));
@@ -768,9 +875,10 @@ fn check_unwind_action(
         UnwindAction::Cleanup(_) if in_cleanup => Err(CfgEvalError::InvalidUnwind { bb }),
         UnwindAction::Cleanup(target) => match basic_blocks.get(target) {
             None => Err(CfgEvalError::InvalidBlock { bb: target }),
-            Some(target_block) if !target_block.is_cleanup => {
-                Err(CfgEvalError::InvalidEdge { from: bb, to: target })
-            }
+            Some(target_block) if !target_block.is_cleanup => Err(CfgEvalError::InvalidEdge {
+                from: bb,
+                to: target,
+            }),
             Some(_) => Ok(()),
         },
     }
@@ -791,8 +899,9 @@ pub enum CfgStep {
 }
 
 /// Evaluates the terminator `term` of block `bb` of `body` (whose statements have run) in
-/// `state` and unwinding mode `unwinding`, using `call_handler` (if any) for a `Call`; see the
-/// module documentation. `state` must match `body` (`ptr_width`, `local_decls`, one slot per
+/// `state` and unwinding mode `unwinding`, executing an inline intrinsic `Call` in place and
+/// using `call_handler` (if any) for any other `Call` (this single-frame step never enters a
+/// linked callee); see the module documentation. `state` must match `body` (`ptr_width`, `local_decls`, one slot per
 /// local: `InvalidArguments`), and `bb` must be a block of `body` that is a cleanup block iff
 /// the evaluation is unwinding (`InvalidBlock` / `InvalidUnwind`). A panic updates `unwinding`
 /// when it enters a cleanup block, and `UnwindResume`/`UnwindTerminate` end the unwinding. A
@@ -812,24 +921,8 @@ pub fn eval_lowered_terminator(
     unwinding: &mut UnwindState,
     mut call_handler: Option<&mut CallHandler<'_>>,
 ) -> Result<CfgStep, CfgEvalError> {
-    if state.ptr_width != body.ptr_width
-        || state.local_decls != body.local_decls
-        || state.slots.len() != body.local_decls.len()
-    {
-        return Err(CfgEvalError::InvalidArguments(
-            RvalueEvalError::TypeMismatch(
-                "StatementEvalState local_decls, slots, or ptr_width do not match LoweredBody",
-            ),
-        ));
-    }
-    let Some(block) = body.basic_blocks.get(bb) else {
-        return Err(CfgEvalError::InvalidBlock { bb });
-    };
-    if block.is_cleanup != unwinding.is_some() {
-        return Err(CfgEvalError::InvalidUnwind { bb });
-    }
+    let in_cleanup = check_terminator_entry(body, bb, state, unwinding)?;
     let ptr_width = state.ptr_width;
-    let in_cleanup = block.is_cleanup;
     let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
     let next = match term {
         LoweredTerminator::Goto { target } => *target,
@@ -906,7 +999,7 @@ pub fn eval_lowered_terminator(
                 *target
             } else {
                 let panic_msg = eval_panic_message(msg, state).map_err(term_err)?;
-                match start_panic(bb, panic_msg, *unwind, unwinding)? {
+                match start_panic(bb, panic_msg, *unwind, &body.basic_blocks, unwinding)? {
                     PanicFlow::Cleanup(target) => target,
                     PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
                 }
@@ -922,53 +1015,97 @@ pub fn eval_lowered_terminator(
             target,
             unwind,
         } => {
-            let func_val = state.eval_operand(func).map_err(term_err)?;
-            if !mir_value_matches_ty(&func_val, func_ty) || args.len() != arg_tys.len() {
-                return Err(term_err(RvalueEvalError::TypeMismatch(
-                    "Call callee runtime type does not match lowered type",
-                )));
-            }
-            check_value_well_formed(&func_val, ptr_width).map_err(term_err)?;
-            let mut arg_vals = Vec::with_capacity(args.len());
-            for (arg, arg_ty) in args.iter().zip(arg_tys) {
-                let val = state.eval_operand(arg).map_err(term_err)?;
-                if !mir_value_matches_ty(&val, arg_ty) {
-                    return Err(term_err(RvalueEvalError::TypeMismatch(
-                        "Call argument runtime type does not match lowered type",
-                    )));
-                }
-                check_value_well_formed(&val, ptr_width).map_err(term_err)?;
-                arg_vals.push(val);
-            }
-            // The destination place is evaluated before the call, exactly as the post-call
-            // `write_place` evaluates it (a final `Deref` may overwrite a leaf union field).
-            state
-                .check_place_write_access(destination, dest_ty)
-                .map_err(term_err)?;
-            if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
-                return Err(term_err(RvalueEvalError::TypeMismatch(
-                    "Call with an uninhabited destination type must not have a return target",
-                )));
-            }
-            let Some(handler) = call_handler.as_mut() else {
-                return Err(CfgEvalError::UnsupportedCall { bb });
-            };
-            match handler(bb, &func_val, &arg_vals).map_err(term_err)? {
-                CallOutcome::Return(ret_val) => {
-                    check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
-                    let Some(target) = target else {
+            let PreparedCall {
+                func_val,
+                arg_vals,
+                dest_place,
+            } = prepare_call(
+                bb,
+                func,
+                func_ty,
+                args,
+                arg_tys,
+                destination,
+                dest_ty,
+                *target,
+                state,
+            )?;
+            if let Some(CallTarget::Intrinsic(op)) = call_target_of(func) {
+                let op = *op;
+                match eval_intrinsic_call(op, &arg_vals, arg_tys, dest_ty, state)
+                    .map_err(term_err)?
+                {
+                    IntrinsicOutcome::Return(ret_val) => complete_call_return(
+                        body,
+                        bb,
+                        in_cleanup,
+                        CallReturn {
+                            ret_val,
+                            destination: &dest_place,
+                            dest_ty,
+                            target: *target,
+                            unwind: *unwind,
+                            cross_frame_limit: None,
+                        },
+                        state,
+                    )?,
+                    IntrinsicOutcome::Unreachable => {
                         return Err(CfgEvalError::UnreachableReached { bb });
-                    };
-                    check_value_well_formed(&ret_val, ptr_width).map_err(term_err)?;
-                    state
-                        .write_place(destination, dest_ty, ret_val)
-                        .map_err(term_err)?;
-                    *target
+                    }
+                    // An abort ends the program at once: no cleanup block runs, whatever the
+                    // call's `target` and `unwind` (`Trusted`'s `retOutcome .abort`). As for
+                    // every completed call, an ill-formed unwind action of a hand-built body
+                    // is still rejected.
+                    IntrinsicOutcome::Abort => {
+                        check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
+                        return Ok(CfgStep::Done(CfgEvalOutcome::Terminated {
+                            bb,
+                            msg: PanicMessage::Intrinsic(op),
+                        }));
+                    }
+                    IntrinsicOutcome::Panic => {
+                        match start_panic(
+                            bb,
+                            PanicMessage::Intrinsic(op),
+                            *unwind,
+                            &body.basic_blocks,
+                            unwinding,
+                        )? {
+                            PanicFlow::Cleanup(target) => target,
+                            PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
+                        }
+                    }
                 }
-                CallOutcome::Panic(text) => {
-                    match start_panic(bb, PanicMessage::Custom(text), *unwind, unwinding)? {
-                        PanicFlow::Cleanup(target) => target,
-                        PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
+            } else {
+                let Some(handler) = call_handler.as_mut() else {
+                    return Err(CfgEvalError::UnsupportedCall { bb });
+                };
+                match handler(bb, &func_val, &arg_vals).map_err(term_err)? {
+                    CallOutcome::Return(ret_val) => complete_call_return(
+                        body,
+                        bb,
+                        in_cleanup,
+                        CallReturn {
+                            ret_val,
+                            destination: &dest_place,
+                            dest_ty,
+                            target: *target,
+                            unwind: *unwind,
+                            cross_frame_limit: None,
+                        },
+                        state,
+                    )?,
+                    CallOutcome::Panic(text) => {
+                        match start_panic(
+                            bb,
+                            PanicMessage::Custom(text),
+                            *unwind,
+                            &body.basic_blocks,
+                            unwinding,
+                        )? {
+                            PanicFlow::Cleanup(target) => target,
+                            PanicFlow::Done(outcome) => return Ok(CfgStep::Done(outcome)),
+                        }
                     }
                 }
             }
@@ -992,13 +1129,229 @@ pub fn eval_lowered_terminator(
             }));
         }
     };
+    check_goto(body, bb, next, unwinding).map(CfgStep::Goto)
+}
+
+/// Checks that `next` is a block of `body` that is a cleanup block iff the evaluation is
+/// unwinding (`InvalidBlock` / `InvalidEdge` from `from`), and returns it.
+fn check_goto(
+    body: &LoweredBody,
+    from: usize,
+    next: usize,
+    unwinding: &UnwindState,
+) -> Result<usize, CfgEvalError> {
     match body.basic_blocks.get(next) {
         None => Err(CfgEvalError::InvalidBlock { bb: next }),
         Some(next_block) if next_block.is_cleanup != unwinding.is_some() => {
-            Err(CfgEvalError::InvalidEdge { from: bb, to: next })
+            Err(CfgEvalError::InvalidEdge { from, to: next })
         }
-        Some(_) => Ok(CfgStep::Goto(next)),
+        Some(_) => Ok(next),
     }
+}
+
+/// The call target of a function-item callee operand ([`Constant::FnDef`]).
+///
+/// [`Constant::FnDef`]: crate::ir::Constant::FnDef
+fn call_target_of(func: &Operand) -> Option<&CallTarget> {
+    func.call_target()
+}
+
+/// A call's evaluated callee, arguments, and destination (see [`prepare_call`]).
+struct PreparedCall {
+    func_val: MirValue,
+    arg_vals: Vec<MirValue>,
+    /// The destination evaluated before the call, without `Deref` or `Index` steps.
+    dest_place: Place,
+}
+
+/// Evaluates the callee and then the arguments of a `Call` in block `bb` left to right (a
+/// `Move` of a bare local deinitializes it), checking each value against its lowered type
+/// and for well-formedness, then evaluates the destination place for a whole-place write
+/// (reading its pointers and index operands now, so the result is written to the place as
+/// evaluated before the call, see [`StatementEvalState::check_place_write_access`]) and
+/// checks that a call with a `target` has an inhabited destination type. Shared by every
+/// kind of callee (intrinsic, call handler, or linked), so all of them observe the same
+/// operand evaluation order and faults before the callee runs.
+///
+/// `Trusted`'s `evalTerminator` evaluates the destination only when it writes the returned
+/// value (`writePlaceValue` on the post-argument locals). No callee that `Trusted` models
+/// changes the caller's frame (linked callees are frame-isolated and value intrinsics are
+/// pure), so both orders write the same place; they differ only for an invalid destination,
+/// which faults here even when the call never returns (it panics, aborts, or diverges), as
+/// with MiniRust's eager `eval_place`: an extra error, never a different outcome.
+#[allow(clippy::too_many_arguments)]
+fn prepare_call(
+    bb: usize,
+    func: &Operand,
+    func_ty: &Ty,
+    args: &[Operand],
+    arg_tys: &[Ty],
+    destination: &Place,
+    dest_ty: &Ty,
+    target: Option<usize>,
+    state: &mut StatementEvalState,
+) -> Result<PreparedCall, CfgEvalError> {
+    let ptr_width = state.ptr_width;
+    let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
+    let func_val = state.eval_operand(func).map_err(term_err)?;
+    if !mir_value_matches_ty(&func_val, func_ty) || args.len() != arg_tys.len() {
+        return Err(term_err(RvalueEvalError::TypeMismatch(
+            "Call callee runtime type does not match lowered type",
+        )));
+    }
+    check_value_well_formed(&func_val, ptr_width).map_err(term_err)?;
+    let mut arg_vals = Vec::with_capacity(args.len());
+    for (arg, arg_ty) in args.iter().zip(arg_tys) {
+        let val = state.eval_operand(arg).map_err(term_err)?;
+        if !mir_value_matches_ty(&val, arg_ty) {
+            return Err(term_err(RvalueEvalError::TypeMismatch(
+                "Call argument runtime type does not match lowered type",
+            )));
+        }
+        check_value_well_formed(&val, ptr_width).map_err(term_err)?;
+        arg_vals.push(val);
+    }
+    // The destination place is evaluated before the call, as a whole-place write evaluates
+    // it (a final `Deref` may overwrite a leaf union field).
+    let dest_place = state
+        .resolve_write_place(destination, dest_ty)
+        .map_err(term_err)?;
+    if target.is_some() && !dest_ty.is_inhabited_for(ptr_width) {
+        return Err(term_err(RvalueEvalError::TypeMismatch(
+            "Call with an uninhabited destination type must not have a return target",
+        )));
+    }
+    Ok(PreparedCall {
+        func_val,
+        arg_vals,
+        dest_place,
+    })
+}
+
+/// The value a call returned and where it goes (see [`complete_call_return`]).
+struct CallReturn<'c> {
+    ret_val: MirValue,
+    destination: &'c Place,
+    dest_ty: &'c Ty,
+    target: Option<usize>,
+    unwind: UnwindAction,
+    /// `Some(limit)` when the value crosses a frame boundary (a linked callee's `_0`): it must
+    /// not hold a pointer into a frame-local synthetic allocation (`alloc_id` in `1..=limit`).
+    cross_frame_limit: Option<usize>,
+}
+
+/// Completes a call in block `bb` (a cleanup block iff `in_cleanup`) that returned: checks
+/// the call's unwind action, requires a return target (a call without one must not return:
+/// `UnreachableReached`), checks the returned value for well-formedness (and frame
+/// isolation), and writes it to the destination. Returns the target block.
+fn complete_call_return(
+    body: &LoweredBody,
+    bb: usize,
+    in_cleanup: bool,
+    ret: CallReturn<'_>,
+    state: &mut StatementEvalState,
+) -> Result<usize, CfgEvalError> {
+    let term_err = |error: RvalueEvalError| CfgEvalError::Terminator { bb, error };
+    check_unwind_action(bb, ret.unwind, in_cleanup, &body.basic_blocks)?;
+    let Some(target) = ret.target else {
+        return Err(CfgEvalError::UnreachableReached { bb });
+    };
+    check_value_well_formed(&ret.ret_val, state.ptr_width).map_err(term_err)?;
+    if let Some(limit) = ret.cross_frame_limit
+        && frame_local_pointer(&ret.ret_val, limit).is_some()
+    {
+        return Err(term_err(RvalueEvalError::UnsupportedMemoryAccess(
+            CROSS_FRAME_POINTER,
+        )));
+    }
+    let mut ret_val = ret.ret_val;
+    if let Some(limit) = ret.cross_frame_limit {
+        restore_caller_exposed_provenance(&mut ret_val, state, limit);
+    }
+    state
+        .write_place(ret.destination, ret.dest_ty, ret_val)
+        .map_err(term_err)?;
+    Ok(target)
+}
+
+/// Reason a value crossing a linked call boundary is rejected (see [`CallTable`]).
+const CROSS_FRAME_POINTER: &str = "a pointer into a frame-local synthetic allocation cannot cross \
+     a linked call boundary (every frame has its own synthetic address space)";
+
+/// The first pointer in `val` (at any depth) whose provenance names a synthetic local
+/// allocation of a frame with at most `limit` locals (allocation ids `1..=limit`, i.e. local
+/// `alloc_id - 1`).
+fn frame_local_pointer(val: &MirValue, limit: usize) -> Option<PointerValue> {
+    match val {
+        MirValue::Ptr { ptr, .. } => ptr
+            .provenance
+            .filter(|prov| usize::try_from(prov.alloc_id).is_ok_and(|id| id >= 1 && id <= limit))
+            .map(|_| *ptr),
+        MirValue::Array { elements, .. } => elements
+            .iter()
+            .find_map(|element| frame_local_pointer(element, limit)),
+        MirValue::Tuple(fields)
+        | MirValue::Adt {
+            active_field: None,
+            fields,
+            ..
+        } => fields
+            .iter()
+            .find_map(|field| frame_local_pointer(field, limit)),
+        MirValue::Adt {
+            active_field: Some(active),
+            fields,
+            ..
+        } => {
+            let active_val = if fields.len() == 1 {
+                fields.first()
+            } else {
+                fields.get(*active)
+            };
+            active_val.and_then(|field| frame_local_pointer(field, limit))
+        }
+        MirValue::Int { .. } | MirValue::Bool(_) | MirValue::Char(_) | MirValue::Unit => None,
+    }
+}
+
+/// Checks the entry requirements of [`eval_lowered_terminator`] for block `bb`: `state`
+/// matches `body` (`InvalidArguments`), `bb` exists (`InvalidBlock`), and it is a cleanup
+/// block iff the evaluation is unwinding (`InvalidUnwind`). Returns whether `bb` is a cleanup
+/// block.
+fn check_terminator_entry(
+    body: &LoweredBody,
+    bb: usize,
+    state: &StatementEvalState,
+    unwinding: &UnwindState,
+) -> Result<bool, CfgEvalError> {
+    check_state_matches_body(body, state)?;
+    let Some(block) = body.basic_blocks.get(bb) else {
+        return Err(CfgEvalError::InvalidBlock { bb });
+    };
+    if block.is_cleanup != unwinding.is_some() {
+        return Err(CfgEvalError::InvalidUnwind { bb });
+    }
+    Ok(block.is_cleanup)
+}
+
+/// `InvalidArguments` unless `state` matches `body` (`ptr_width`, `local_decls`, one slot per
+/// local, and a page-aligned `frame_addr_base`).
+fn check_state_matches_body(
+    body: &LoweredBody,
+    state: &StatementEvalState,
+) -> Result<(), CfgEvalError> {
+    if state.ptr_width != body.ptr_width
+        || state.local_decls != body.local_decls
+        || state.slots.len() != body.local_decls.len()
+        || !state.frame_addr_base.is_multiple_of(0x1000)
+    {
+        return Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(
+                "StatementEvalState local_decls, slots, ptr_width, or frame_addr_base do not match LoweredBody",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluates `body` from block `start_bb` in `state` with at most `fuel` executed basic blocks,
@@ -1009,56 +1362,831 @@ pub fn eval_lowered_terminator(
 /// [`CfgEvalOutcome::OutOfFuel`] at the block that would run next.
 pub fn eval_cfg_in_state(
     body: &LoweredBody,
-    mut state: StatementEvalState,
+    state: StatementEvalState,
     start_bb: usize,
-    mut fuel: usize,
-    mut call_handler: Option<&mut CallHandler<'_>>,
+    fuel: usize,
+    call_handler: Option<&mut CallHandler<'_>>,
 ) -> Result<CfgEvalOutcome, CfgEvalError> {
-    if state.ptr_width != body.ptr_width
-        || state.local_decls != body.local_decls
-        || state.slots.len() != body.local_decls.len()
-    {
-        return Err(CfgEvalError::InvalidArguments(
-            RvalueEvalError::TypeMismatch(
-                "StatementEvalState local_decls, slots, or ptr_width do not match LoweredBody",
-            ),
+    match call_handler {
+        None => eval_frames(body, state, start_bb, fuel, None, None),
+        Some(handler) => {
+            let mut external = |call: &ExternalCall<'_>| handler(call.bb, call.func, call.args);
+            eval_frames(body, state, start_bb, fuel, None, Some(&mut external))
+        }
+    }
+}
+
+/// Default [`CallTable::max_call_depth`].
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 64;
+
+/// A linked callee of a [`CallTable`]: its lowered body and its number of parameters
+/// (`_1..=arg_count`, which a call initializes with its arguments; `_0` is the return place and
+/// every other local starts storage-dead, as in [`StatementEvalState::from_body`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedCallee {
+    /// Number of parameters.
+    pub arg_count: usize,
+    /// The callee's lowered body.
+    pub body: LoweredBody,
+}
+
+/// Multi-callee call table: the linked intra-crate callees of an evaluation, keyed by
+/// [`CalleeSymbol`], and the maximum depth of nested callee frames.
+///
+/// [`eval_cfg_in_state_with_call_table`] runs a `Call` whose callee is the function item of a
+/// linked symbol ([`CallTarget::Fn`]) in a new frame of that callee's body, on an explicit
+/// (heap-allocated) frame stack, so neither self nor mutual recursion can overflow the Rust
+/// stack:
+/// - **Arguments.** After the caller has evaluated the callee, the arguments, and the
+///   destination exactly as for any call, the callee frame starts with `_1..=arg_count` set to
+///   the arguments, which must match the parameter types and be well formed; the argument
+///   count must be `arg_count`, the callee's return type must match the destination's type (or,
+///   on a diverging `target: None` call, be uninhabited, e.g. `-> !` coerced into an inhabited
+///   caller destination), and its pointer width must match the caller's (`Terminator` errors of
+///   the calling block otherwise).
+/// - **Fuel.** All frames share one fuel counter: every block executed in any frame consumes
+///   one unit, so the whole call tree executes at most `fuel` blocks; when it runs out inside a
+///   callee, the evaluation ends with [`CfgEvalOutcome::OutOfFuel`] at the evaluated body's
+///   calling block (see there).
+/// - **Depth.** A call made while `max_call_depth` callee frames are active fails with
+///   [`CfgEvalError::CallDepthExceeded`] (`0` forbids linked calls altogether).
+/// - **Outcomes.** A callee's `Returned(val)` completes the call like a handler's return:
+///   the caller's unwind action is checked, a call without `target` is undefined behavior
+///   (`UnreachableReached`), and `val` is written to the destination before jumping to
+///   `target`. A callee's `Panicked` panic continues in the caller along the call's
+///   `UnwindAction` (`Cleanup` enters the caller's cleanup block, `Continue` unwinds further,
+///   `Terminate` aborts, `Unreachable` is `UnwindIntoUnreachable`), and a callee's
+///   `Terminated` ends the whole evaluation at once (no caller cleanup block runs). Outcomes are
+///   re-attributed to the caller's calling block with their messages unchanged, and an error
+///   inside a callee is reported as [`CfgEvalError::InCallee`] with the call stack.
+/// - **Frame isolation.** Every frame has its own locals and synthetic stack allocations
+///   (provenance `alloc_id = local + 1`); it inherits the caller's transmute policy and
+///   `ub_checks`. Of the caller's exposed provenances, those of storage-dead caller locals are
+///   dropped, external ones with `alloc_id > max(caller_locals, callee_locals)` are inherited
+///   unchanged, and the others (live caller locals, and externals whose `alloc_id` would name a
+///   callee local) become one opaque non-local provenance, so `with_exposed_provenance`
+///   pointer arithmetic stays defined without aliasing callee locals. When the callee returns
+///   or unwinds, the external provenances it exposed outside
+///   `1..=max(caller_locals, callee_locals)` become exposed in the caller, and a returned
+///   pointer with the opaque provenance gets the caller's live exposed local containing its
+///   address, else a hidden external, else any live exposed local (unless the caller itself
+///   holds an outer frame's opaque provenance, which the pointer then keeps). A callee
+///   frame's allocations lie above all of its caller's
+///   ([`StatementEvalState::frame_addr_base`]; a frame that does not fit the address space is
+///   `UnsupportedMemoryAccess`), so the addresses of distinct active frames never coincide, not
+///   even as exposed integers. Because a synthetic pointer's provenance is only meaningful in
+///   its own frame, an argument or returned value holding a pointer whose provenance names a
+///   synthetic local allocation of either frame (`alloc_id` in
+///   `1..=max(caller_locals, callee_locals)`) is rejected with `UnsupportedMemoryAccess`
+///   (never reinterpreted as a pointer into the other frame); pointers without provenance, or
+///   with any other provenance, cross unchanged (but for the opaque provenance of a returned
+///   pointer, as above).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallTable {
+    callees: BTreeMap<CalleeSymbol, LinkedCallee>,
+    max_call_depth: usize,
+}
+
+impl Default for CallTable {
+    fn default() -> Self {
+        CallTable::new()
+    }
+}
+
+impl CallTable {
+    /// An empty table with [`DEFAULT_MAX_CALL_DEPTH`].
+    pub fn new() -> Self {
+        CallTable {
+            callees: BTreeMap::new(),
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
+        }
+    }
+
+    /// This table with a maximum of `max_call_depth` nested callee frames.
+    pub fn with_max_call_depth(mut self, max_call_depth: usize) -> Self {
+        self.max_call_depth = max_call_depth;
+        self
+    }
+
+    /// This table with `body` (taking `arg_count` parameters) linked as `symbol`.
+    pub fn with_callee(
+        mut self,
+        symbol: impl Into<CalleeSymbol>,
+        arg_count: usize,
+        body: LoweredBody,
+    ) -> Self {
+        self.insert(symbol, arg_count, body);
+        self
+    }
+
+    /// Maximum number of nested callee frames.
+    pub fn max_call_depth(&self) -> usize {
+        self.max_call_depth
+    }
+
+    /// Sets the maximum number of nested callee frames.
+    pub fn set_max_call_depth(&mut self, max_call_depth: usize) {
+        self.max_call_depth = max_call_depth;
+    }
+
+    /// Links `body` (taking `arg_count` parameters) as `symbol`, returning the callee it
+    /// replaces.
+    pub fn insert(
+        &mut self,
+        symbol: impl Into<CalleeSymbol>,
+        arg_count: usize,
+        body: LoweredBody,
+    ) -> Option<LinkedCallee> {
+        self.callees
+            .insert(symbol.into(), LinkedCallee { arg_count, body })
+    }
+
+    /// The callee linked as `symbol`.
+    pub fn get(&self, symbol: &CalleeSymbol) -> Option<&LinkedCallee> {
+        self.callees.get(symbol)
+    }
+
+    /// Returns true if `symbol` is linked.
+    pub fn contains(&self, symbol: &CalleeSymbol) -> bool {
+        self.callees.contains_key(symbol)
+    }
+
+    /// Number of linked callees.
+    pub fn len(&self) -> usize {
+        self.callees.len()
+    }
+
+    /// Returns true if no callee is linked.
+    pub fn is_empty(&self) -> bool {
+        self.callees.is_empty()
+    }
+
+    /// The linked callees in symbol order.
+    pub fn iter(&self) -> impl Iterator<Item = (&CalleeSymbol, &LinkedCallee)> {
+        self.callees.iter()
+    }
+}
+
+/// A call of a linked callee that is in progress: the caller's calling block and the callee.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CallSite {
+    /// The calling block (in the caller's body).
+    pub bb: usize,
+    /// The linked callee.
+    pub callee: CalleeSymbol,
+}
+
+/// A `Call` that a call-table evaluation hands to its [`ExternalCallHandler`]: one whose
+/// callee is neither an inline intrinsic nor linked in the [`CallTable`], made in any frame.
+///
+/// It identifies the call like `Trusted`'s `MirCallReq` (whose `defPath` is
+/// [`ExternalCall::callee`]): a block index alone is ambiguous across frames, and a function
+/// item evaluates to `MirValue::Unit` whatever it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalCall<'a> {
+    /// The linked calls in progress, outermost first (empty for a call made by the evaluated
+    /// body itself).
+    pub call_stack: &'a [CallSite],
+    /// The calling block, in the body of the innermost frame.
+    pub bb: usize,
+    /// The unlinked symbol a direct call names (`None` when the callee operand is not a direct
+    /// `Constant::FnDef(CallTarget::Fn(_))`, e.g. an indirect `Copy`/`Move` or pointer constant).
+    pub callee: Option<&'a CalleeSymbol>,
+    /// The evaluated callee operand.
+    pub func: &'a MirValue,
+    /// The evaluated arguments.
+    pub args: &'a [MirValue],
+}
+
+/// Caller-supplied handler of the [`ExternalCall`]s of a call-table evaluation (`Trusted`'s
+/// `ExternalCallHandler`): reports the call's outcome (or undefined behavior inside the callee),
+/// exactly like a [`CallHandler`].
+pub type ExternalCallHandler<'a> =
+    dyn FnMut(&ExternalCall<'_>) -> Result<CallOutcome, RvalueEvalError> + 'a;
+
+/// [`eval_cfg_in_state`] with the linked callees of `table` (see [`CallTable`]): a `Call` of
+/// a linked [`CallTarget::Fn`] symbol runs the callee's body in a new frame; inline intrinsics
+/// run in the calling frame; every other call (in any frame) goes to `call_handler` as an
+/// [`ExternalCall`], or fails with [`CfgEvalError::UnknownCallee`] (an unlinked symbol) or
+/// [`CfgEvalError::UnsupportedCall`] without one. `fuel` bounds the blocks executed across all
+/// frames.
+pub fn eval_cfg_in_state_with_call_table(
+    body: &LoweredBody,
+    state: StatementEvalState,
+    start_bb: usize,
+    fuel: usize,
+    table: &CallTable,
+    call_handler: Option<&mut ExternalCallHandler<'_>>,
+) -> Result<CfgEvalOutcome, CfgEvalError> {
+    eval_frames(body, state, start_bb, fuel, Some(table), call_handler)
+}
+
+/// [`eval_lowered_body_cfg`] with the linked callees of `table` (see
+/// [`eval_cfg_in_state_with_call_table`]; without a call handler).
+pub fn eval_lowered_body_cfg_with_call_table(
+    body: &LoweredBody,
+    args: &[MirValue],
+    fuel: usize,
+    table: &CallTable,
+) -> Result<CfgEvalOutcome, CfgEvalError> {
+    let state =
+        StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
+    eval_frames(body, state, 0, fuel, Some(table), None)
+}
+
+/// [`eval_lowered_body_cfg_with_call_table`] with `call_handler` deciding every
+/// [`ExternalCall`] (an unlinked or indirect `Call` in any frame), mirroring
+/// `Trusted.VerificationResult.mirHandledTreeWithCallees`.
+pub fn eval_lowered_body_cfg_with_call_table_and_calls<F>(
+    body: &LoweredBody,
+    args: &[MirValue],
+    fuel: usize,
+    table: &CallTable,
+    mut call_handler: F,
+) -> Result<CfgEvalOutcome, CfgEvalError>
+where
+    F: FnMut(&ExternalCall<'_>) -> Result<CallOutcome, RvalueEvalError>,
+{
+    let state =
+        StatementEvalState::from_body(body, args).map_err(CfgEvalError::InvalidArguments)?;
+    eval_frames(body, state, 0, fuel, Some(table), Some(&mut call_handler))
+}
+
+/// A linked call waiting in its caller's frame.
+struct PendingCall {
+    site: CallSite,
+    /// The destination as evaluated before the call (see [`prepare_call`]).
+    destination: Place,
+    dest_ty: Ty,
+    target: Option<usize>,
+    unwind: UnwindAction,
+}
+
+/// One activation on the frame stack of [`eval_frames`].
+struct Frame<'a> {
+    body: &'a LoweredBody,
+    state: StatementEvalState,
+    /// The block to execute next (or, while `pending`, the calling block).
+    bb: usize,
+    unwinding: UnwindState,
+    /// The linked call this frame waits for (every frame but the top one has one).
+    pending: Option<PendingCall>,
+}
+
+/// Result of executing one block of the top frame ([`run_block`]).
+enum BlockStep<'a> {
+    /// The frame continues at its (updated) `bb`.
+    Continue,
+    /// The frame calls a linked callee.
+    Call {
+        callee: &'a LinkedCallee,
+        args: Vec<MirValue>,
+        pending: PendingCall,
+    },
+    /// The frame finished.
+    Done(CfgEvalOutcome),
+}
+
+/// The linked callee that the terminator of `frame`'s current block calls, if any.
+fn linked_call_of<'a>(frame: &Frame<'_>, table: &'a CallTable) -> Option<&'a LinkedCallee> {
+    match frame.body.basic_blocks.get(frame.bb)?.terminator.as_ref()? {
+        LoweredTerminator::Call { func, .. } => match call_target_of(func)? {
+            CallTarget::Fn(symbol) => table.get(symbol),
+            CallTarget::Intrinsic(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Executes the statements and the terminator of the current block of `frame` (consuming no
+/// fuel), stopping before a linked call is entered. `callers` are the frames below `frame`.
+fn run_block<'a>(
+    frame: &mut Frame<'a>,
+    callers: &[Frame<'_>],
+    table: Option<&'a CallTable>,
+    call_handler: Option<&mut ExternalCallHandler<'_>>,
+) -> Result<BlockStep<'a>, CfgEvalError> {
+    let body = frame.body;
+    let bb = frame.bb;
+    let Some(block) = body.basic_blocks.get(bb) else {
+        return Err(CfgEvalError::InvalidBlock { bb });
+    };
+    for (index, stmt) in block.statements.iter().enumerate() {
+        eval_lowered_statement(stmt, &mut frame.state)
+            .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
+    }
+    let Some(term) = &block.terminator else {
+        return Err(CfgEvalError::MissingTerminator { bb });
+    };
+    let unlinked_symbol = match term {
+        LoweredTerminator::Call {
+            func,
+            func_ty,
+            args,
+            arg_tys,
+            destination,
+            dest_ty,
+            target,
+            unwind,
+        } => match (table, call_target_of(func)) {
+            (Some(table), Some(CallTarget::Fn(symbol))) => {
+                if let Some(callee) = table.get(symbol) {
+                    check_terminator_entry(body, bb, &frame.state, &frame.unwinding)?;
+                    let PreparedCall {
+                        arg_vals,
+                        dest_place,
+                        ..
+                    } = prepare_call(
+                        bb,
+                        func,
+                        func_ty,
+                        args,
+                        arg_tys,
+                        destination,
+                        dest_ty,
+                        *target,
+                        &mut frame.state,
+                    )?;
+                    return Ok(BlockStep::Call {
+                        callee,
+                        args: arg_vals,
+                        pending: PendingCall {
+                            site: CallSite {
+                                bb,
+                                callee: symbol.clone(),
+                            },
+                            destination: dest_place,
+                            dest_ty: dest_ty.clone(),
+                            target: *target,
+                            unwind: *unwind,
+                        },
+                    });
+                }
+                Some(symbol)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // Any other `Call` reaching the handler is an `ExternalCall` of this frame.
+    let mut external_call;
+    let call_handler: Option<&mut CallHandler<'_>> = match call_handler {
+        None => None,
+        Some(handler) => {
+            let callee = match term {
+                LoweredTerminator::Call { func, .. } => {
+                    func.call_target().and_then(CallTarget::as_callee)
+                }
+                _ => None,
+            };
+            external_call = move |bb: usize, func: &MirValue, args: &[MirValue]| {
+                let call_stack: Vec<CallSite> = callers
+                    .iter()
+                    .filter_map(|caller| caller.pending.as_ref().map(|p| p.site.clone()))
+                    .collect();
+                handler(&ExternalCall {
+                    call_stack: &call_stack,
+                    bb,
+                    callee,
+                    func,
+                    args,
+                })
+            };
+            Some(&mut external_call)
+        }
+    };
+    match eval_lowered_terminator(
+        body,
+        bb,
+        term,
+        &mut frame.state,
+        &mut frame.unwinding,
+        call_handler,
+    ) {
+        Ok(CfgStep::Goto(next)) => {
+            frame.bb = next;
+            Ok(BlockStep::Continue)
+        }
+        Ok(CfgStep::Done(outcome)) => Ok(BlockStep::Done(outcome)),
+        Err(CfgEvalError::UnsupportedCall { bb }) => Err(match unlinked_symbol {
+            Some(symbol) => CfgEvalError::UnknownCallee {
+                bb,
+                callee: symbol.clone(),
+            },
+            None => CfgEvalError::UnsupportedCall { bb },
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// `error`, raised in `frames[frame_index]`, with the linked call stack leading to that frame.
+fn in_frames(frames: &[Frame<'_>], frame_index: usize, error: CfgEvalError) -> CfgEvalError {
+    if frame_index == 0 {
+        return error;
+    }
+    let call_stack = frames[..frame_index]
+        .iter()
+        .filter_map(|frame| frame.pending.as_ref().map(|pending| pending.site.clone()))
+        .collect();
+    CfgEvalError::InCallee {
+        call_stack,
+        error: Box::new(error),
+    }
+}
+
+/// Synthetic non-local `alloc_id` representing an exposed allocation from an outer caller
+/// frame inside a linked callee's [`ExposedProvenanceTracker`]: keeps `with_exposed_provenance`
+/// and `BinOp::Offset` defined across call boundaries without colliding with any frame-local
+/// allocation id (`1..=local_decls.len()`).
+const CALLER_EXPOSED_ALLOC_ID: u64 = u64::MAX;
+
+/// Restores [`CALLER_EXPOSED_ALLOC_ID`] provenances in `val` when a linked callee returns to
+/// `caller_state`: pointers matching one of `caller_state`'s live exposed locals recover that
+/// local's provenance (so dereferencing, `copy_nonoverlapping`, and `write_bytes` in the caller
+/// observe the local allocation); if the caller itself holds an outer frame's
+/// [`CALLER_EXPOSED_ALLOC_ID`], any other pointer keeps it until it reaches that frame;
+/// otherwise it recovers a shielded external provenance (`alloc_id` in
+/// `(caller_locals + 1)..=limit`), or else any live exposed local's provenance (the last resort
+/// of `with_exposed_provenance` prediction in a single frame).
+fn restore_caller_exposed_provenance(
+    val: &mut MirValue,
+    caller_state: &StatementEvalState,
+    limit: usize,
+) {
+    match val {
+        MirValue::Ptr { ptr, ty }
+            if ptr
+                .provenance
+                .is_some_and(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID) =>
+        {
+            if let Some(local_prov) =
+                caller_state.match_exposed_local_provenance(u128::from(ptr.addr), ty)
+            {
+                ptr.provenance = Some(local_prov);
+            } else if caller_state
+                .tracker
+                .exposed
+                .iter()
+                .any(|prov| prov.alloc_id == CALLER_EXPOSED_ALLOC_ID)
+            {
+                // Keep `CALLER_EXPOSED_ALLOC_ID` for an outer caller frame lower on the stack.
+            } else if let Some(&ext_prov) = caller_state.tracker.exposed.iter().find(|prov| {
+                usize::try_from(prov.alloc_id)
+                    .is_ok_and(|id| id > caller_state.local_decls.len() && id <= limit)
+            }) {
+                ptr.provenance = Some(ext_prov);
+            } else {
+                ptr.provenance = caller_state.tracker.exposed.iter().copied().find(|prov| {
+                    prov.alloc_id
+                        .checked_sub(1)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .is_some_and(|loc| {
+                            loc < caller_state.local_decls.len()
+                                && !matches!(
+                                    caller_state.slots.get(loc),
+                                    Some(LocalSlotState::Dead)
+                                )
+                        })
+                });
+            }
+        }
+        MirValue::Array { elements, .. } => {
+            for element in elements {
+                restore_caller_exposed_provenance(element, caller_state, limit);
+            }
+        }
+        MirValue::Tuple(fields)
+        | MirValue::Adt {
+            active_field: None,
+            fields,
+            ..
+        } => {
+            for field in fields {
+                restore_caller_exposed_provenance(field, caller_state, limit);
+            }
+        }
+        MirValue::Adt {
+            active_field: Some(active),
+            fields,
+            ..
+        } => {
+            let active_val = if fields.len() == 1 {
+                fields.first_mut()
+            } else {
+                fields.get_mut(*active)
+            };
+            if let Some(field) = active_val {
+                restore_caller_exposed_provenance(field, caller_state, limit);
+            }
+        }
+        MirValue::Ptr { .. }
+        | MirValue::Int { .. }
+        | MirValue::Bool(_)
+        | MirValue::Char(_)
+        | MirValue::Unit => {}
+    }
+}
+
+/// Creates the state of a frame of the linked `callee` called from `caller` with `args`
+/// (into a destination of type `dest_ty`, with a return target iff `has_return_target`); see
+/// [`CallTable`].
+fn enter_callee(
+    caller: &Frame<'_>,
+    callee: &LinkedCallee,
+    args: &[MirValue],
+    dest_ty: &Ty,
+    has_return_target: bool,
+) -> Result<StatementEvalState, RvalueEvalError> {
+    if callee.body.ptr_width != caller.body.ptr_width {
+        return Err(RvalueEvalError::TypeMismatch(
+            "linked callee targets a different pointer width than its caller",
         ));
     }
-    let mut bb = start_bb;
-    match body.basic_blocks.get(bb) {
-        None => return Err(CfgEvalError::InvalidBlock { bb }),
+    if args.len() != callee.arg_count {
+        return Err(RvalueEvalError::TypeMismatch(
+            "argument count does not match the linked callee's arg_count",
+        ));
+    }
+    let Some(callee_ret_ty) = callee.body.local_decls.first() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "linked callee body has no return local _0",
+        ));
+    };
+    let ret_ty_compatible = callee_ret_ty == dest_ty
+        || (!has_return_target && !callee_ret_ty.is_inhabited_for(caller.body.ptr_width));
+    if !ret_ty_compatible {
+        return Err(RvalueEvalError::TypeMismatch(
+            "linked callee return type does not match the call destination type",
+        ));
+    }
+    let limit = caller
+        .state
+        .local_decls
+        .len()
+        .max(callee.body.local_decls.len());
+    if args
+        .iter()
+        .any(|arg| frame_local_pointer(arg, limit).is_some())
+    {
+        return Err(RvalueEvalError::UnsupportedMemoryAccess(
+            CROSS_FRAME_POINTER,
+        ));
+    }
+    let mut state = StatementEvalState::from_body(&callee.body, args)?;
+    state.policy = caller.state.policy;
+    state.ub_checks = caller.state.ub_checks;
+    for &prov in &caller.state.tracker.exposed {
+        if prov
+            .alloc_id
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .is_some_and(|loc| {
+                loc < caller.state.local_decls.len()
+                    && matches!(caller.state.slots.get(loc), Some(LocalSlotState::Dead))
+            })
+        {
+            continue;
+        }
+        let mapped = if usize::try_from(prov.alloc_id).is_ok_and(|id| id >= 1 && id <= limit) {
+            Provenance {
+                alloc_id: CALLER_EXPOSED_ALLOC_ID,
+                tag: 0,
+            }
+        } else {
+            prov
+        };
+        state.tracker.expose(mapped);
+    }
+    // The callee's synthetic allocations lie above all of its caller's, so addresses of
+    // distinct active frames never coincide (also through exposed addresses).
+    state.frame_addr_base = caller.state.frame_addr_end()?;
+    state.frame_addr_end()?;
+    Ok(state)
+}
+
+/// The out-of-fuel outcome for `frames` (see [`CfgEvalOutcome::OutOfFuel`]): the top frame's
+/// next block and state when it is the evaluated body's frame, and otherwise the body's calling
+/// block with its state on entry to that block (`root_call_entry`).
+fn out_of_fuel(
+    mut frames: Vec<Frame<'_>>,
+    root_call_entry: Option<StatementEvalState>,
+) -> CfgEvalOutcome {
+    let has_callees = frames.len() > 1;
+    let root = frames.swap_remove(0);
+    match (has_callees, root.pending, root_call_entry) {
+        (true, Some(pending), Some(state)) => CfgEvalOutcome::OutOfFuel {
+            bb: pending.site.bb,
+            state,
+        },
+        _ => CfgEvalOutcome::OutOfFuel {
+            bb: root.bb,
+            state: root.state,
+        },
+    }
+}
+
+/// The fuel-bounded evaluation loop over an explicit frame stack shared by
+/// [`eval_cfg_in_state`] (no table: a single frame) and
+/// [`eval_cfg_in_state_with_call_table`].
+fn eval_frames<'a>(
+    body: &'a LoweredBody,
+    state: StatementEvalState,
+    start_bb: usize,
+    mut fuel: usize,
+    table: Option<&'a CallTable>,
+    mut call_handler: Option<&mut ExternalCallHandler<'_>>,
+) -> Result<CfgEvalOutcome, CfgEvalError> {
+    check_state_matches_body(body, &state)?;
+    match body.basic_blocks.get(start_bb) {
+        None => return Err(CfgEvalError::InvalidBlock { bb: start_bb }),
         Some(block) if block.is_cleanup => {
-            return Err(CfgEvalError::InvalidEdge { from: bb, to: bb });
+            return Err(CfgEvalError::InvalidEdge {
+                from: start_bb,
+                to: start_bb,
+            });
         }
         Some(_) => {}
     }
-    let mut unwinding: UnwindState = None;
+    let mut frames = vec![Frame {
+        body,
+        state,
+        bb: start_bb,
+        unwinding: None,
+        pending: None,
+    }];
+    // The root frame's state on entry to the block of its pending linked call: the resumption
+    // point reported when fuel runs out inside a callee.
+    let mut root_call_entry: Option<StatementEvalState> = None;
     loop {
         if fuel == 0 {
-            return Ok(CfgEvalOutcome::OutOfFuel { bb, state });
+            return Ok(out_of_fuel(frames, root_call_entry));
         }
         fuel -= 1;
-        let block = &body.basic_blocks[bb];
-        for (index, stmt) in block.statements.iter().enumerate() {
-            eval_lowered_statement(stmt, &mut state).map_err(|error| CfgEvalError::Statement {
-                bb,
-                index,
-                error,
-            })?;
+        let top = frames.len() - 1;
+        let (callers, top_frame) = frames.split_at_mut(top);
+        let frame = &mut top_frame[0];
+        if top == 0
+            && let Some(table) = table
+            && linked_call_of(frame, table).is_some()
+        {
+            root_call_entry = Some(frame.state.clone());
         }
-        let Some(term) = &block.terminator else {
-            return Err(CfgEvalError::MissingTerminator { bb });
-        };
-        match eval_lowered_terminator(
-            body,
-            bb,
-            term,
-            &mut state,
-            &mut unwinding,
-            call_handler.as_deref_mut(),
-        )? {
-            CfgStep::Goto(next) => bb = next,
-            CfgStep::Done(outcome) => return Ok(outcome),
+        match run_block(frame, callers, table, call_handler.as_deref_mut()) {
+            Err(error) => return Err(in_frames(&frames, top, error)),
+            Ok(BlockStep::Continue) => {}
+            Ok(BlockStep::Call {
+                callee,
+                args,
+                pending,
+            }) => {
+                let max_call_depth = table.map_or(0, CallTable::max_call_depth);
+                if top >= max_call_depth {
+                    return Err(in_frames(
+                        &frames,
+                        top,
+                        CfgEvalError::CallDepthExceeded {
+                            bb: pending.site.bb,
+                            max_call_depth,
+                        },
+                    ));
+                }
+                let callee_state = match enter_callee(
+                    &frames[top],
+                    callee,
+                    &args,
+                    &pending.dest_ty,
+                    pending.target.is_some(),
+                ) {
+                    Ok(callee_state) => callee_state,
+                    Err(error) => {
+                        let bb = pending.site.bb;
+                        return Err(in_frames(
+                            &frames,
+                            top,
+                            CfgEvalError::Terminator { bb, error },
+                        ));
+                    }
+                };
+                frames[top].pending = Some(pending);
+                let entry_error = match callee.body.basic_blocks.first() {
+                    None => Some(CfgEvalError::InvalidBlock { bb: 0 }),
+                    Some(block) if block.is_cleanup => {
+                        Some(CfgEvalError::InvalidEdge { from: 0, to: 0 })
+                    }
+                    Some(_) => None,
+                };
+                if let Some(error) = entry_error {
+                    return Err(in_frames(&frames, top + 1, error));
+                }
+                frames.push(Frame {
+                    body: &callee.body,
+                    state: callee_state,
+                    bb: 0,
+                    unwinding: None,
+                    pending: None,
+                });
+            }
+            Ok(BlockStep::Done(mut outcome)) => loop {
+                if frames.len() == 1 {
+                    return Ok(outcome);
+                }
+                let callee_frame = frames.pop().expect("a callee frame is above the root");
+                let callee_locals = callee_frame.state.local_decls.len();
+                let callee_exposed = callee_frame.state.tracker.exposed;
+                let caller_index = frames.len() - 1;
+                if caller_index == 0 {
+                    root_call_entry = None;
+                }
+                let Some(pending) = frames[caller_index].pending.take() else {
+                    let bb = frames[caller_index].bb;
+                    return Err(in_frames(
+                        &frames,
+                        caller_index,
+                        CfgEvalError::InvalidUnwind { bb },
+                    ));
+                };
+                let caller = &mut frames[caller_index];
+                let bb = pending.site.bb;
+                let limit = caller.state.local_decls.len().max(callee_locals);
+                if matches!(
+                    outcome,
+                    CfgEvalOutcome::Returned(_) | CfgEvalOutcome::Panicked { .. }
+                ) {
+                    for prov in callee_exposed {
+                        if prov.alloc_id != CALLER_EXPOSED_ALLOC_ID
+                            && !usize::try_from(prov.alloc_id)
+                                .is_ok_and(|id| id >= 1 && id <= limit)
+                        {
+                            caller.state.tracker.expose(prov);
+                        }
+                    }
+                }
+                let resumed: Result<Option<CfgEvalOutcome>, CfgEvalError> = match outcome {
+                    CfgEvalOutcome::Returned(ret_val) => {
+                        let in_cleanup = caller
+                            .body
+                            .basic_blocks
+                            .get(bb)
+                            .is_some_and(|block| block.is_cleanup);
+                        complete_call_return(
+                            caller.body,
+                            bb,
+                            in_cleanup,
+                            CallReturn {
+                                ret_val,
+                                destination: &pending.destination,
+                                dest_ty: &pending.dest_ty,
+                                target: pending.target,
+                                unwind: pending.unwind,
+                                cross_frame_limit: Some(limit),
+                            },
+                            &mut caller.state,
+                        )
+                        .and_then(|next| check_goto(caller.body, bb, next, &caller.unwinding))
+                        .map(|next| {
+                            caller.bb = next;
+                            None
+                        })
+                    }
+                    CfgEvalOutcome::Panicked { msg, .. } => {
+                        match start_panic(
+                            bb,
+                            msg,
+                            pending.unwind,
+                            &caller.body.basic_blocks,
+                            &mut caller.unwinding,
+                        ) {
+                            Ok(PanicFlow::Cleanup(cleanup)) => {
+                                check_goto(caller.body, bb, cleanup, &caller.unwinding).map(
+                                    |next| {
+                                        caller.bb = next;
+                                        None
+                                    },
+                                )
+                            }
+                            Ok(PanicFlow::Done(done)) => Ok(Some(done)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    // An abort ends the program: no caller cleanup block runs (an ill-formed
+                    // unwind action of a hand-built caller is still rejected, as for every
+                    // completed call).
+                    CfgEvalOutcome::Terminated { msg, .. } => check_unwind_action(
+                        bb,
+                        pending.unwind,
+                        caller.unwinding.is_some(),
+                        &caller.body.basic_blocks,
+                    )
+                    .map(|()| Some(CfgEvalOutcome::Terminated { bb, msg })),
+                    // Frames never finish out of fuel (the loop checks fuel before each block).
+                    CfgEvalOutcome::OutOfFuel { .. } => Ok(Some(outcome)),
+                };
+                match resumed {
+                    Ok(None) => break,
+                    Ok(Some(done)) => outcome = done,
+                    Err(error) => return Err(in_frames(&frames, caller_index, error)),
+                }
+            },
         }
     }
 }

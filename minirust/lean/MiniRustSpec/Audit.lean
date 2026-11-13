@@ -48,6 +48,33 @@ sub-place audit hook `subplace_audit_closure` of `Correspondence.DeinitBridge`
 — the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl` — and
 their witnesses), ending in `sorry_free=true`. A group that depends on `sorryAx` or
 on any other non-standard axiom fails the build instead.
+
+`#assert_minirustspec_import_isolation` (`[IMPORT-ISOLATION]`) fails the build unless the
+module import graph satisfies the `MiniRustSpec` import-isolation invariant of
+`Correspondence.DeinitBridge` across **every** `Anneal.*` module in the graph (`[adv ep2-A3]`):
+`DeinitBridge` is the only `MiniRustSpec` module that directly imports an `Anneal.*` module, every
+import path from another `MiniRustSpec` module to *any* `Anneal.*` module passes through
+`DeinitBridge`, its only client is `Correspondence.IntrinsicBoundary`, and the core modules
+(`Interp`, `Generated`, `Correspondence.Translate`, `Correspondence.Simulation`,
+`Correspondence.IntrinsicFallback`) reach neither `DeinitBridge` nor any `Anneal.*` module. The
+checker validates itself on five synthetic negative-control graphs (including transitive reachability
+to non-`AdtAndControl` `Anneal.*` modules and bypasses from an allowed bridge client) and one
+conforming multi-`Anneal` positive-control graph.
+
+`#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`, `[ANNEAL-AXIOMS]`, `[adv ep2-B4]` /
+`[adv ep2-A4]`) fails the build unless:
+1. every public, user-declared theorem of `Anneal.Mir.AdtAndControl` lies in the dependency closure
+   of the three `[DEINIT-AUDIT]` closures (`subplace_audit_closure`, `call_intrinsic_audit_closure`,
+   `adt_control_residual_audit_closure`) together with the `MiniRustSpec` declarations audited by
+   `#assert_all_minirustspec_standard_axioms` — and in particular **every** Episode 2 Section 5
+   public theorem of `Anneal.Mir.AdtAndControl` is reachable from `call_intrinsic_audit_closure`
+   alone;
+2. both `adt_control_residual_audit_closure` and `call_intrinsic_audit_closure` are non-vacuously
+   required (negative controls); and
+3. every declaration across **every** imported `Anneal.*` module (`Anneal.Mir.AdtAndControl` and
+   `Anneal.Mir.PlaceAndRvalue`, including private and compiler-generated ones) is `unsafe`-free and
+   depends only on the standard axioms (`propext`, `Quot.sound`, `Classical.choice`) via both
+   `Lean.collectAxioms` and `dependencyClosureWithAxioms`.
 -/
 
 namespace MiniRustSpec.Audit
@@ -92,6 +119,231 @@ elab "#check_theorem_deps " tag:str ids:ident* : command => do
       unless union.contains a do
         union := union.push a
   logInfo m!"{tag.getString} decls={ids.size} axioms={union.toList} sorry_free=true"
+
+/-- Reachability in a module import graph given by its direct-import adjacency `direct`: whether
+`target` is reachable from `start` along import edges without passing through module `avoid`
+(pass `.anonymous` to avoid nothing). -/
+def importGraphReaches (direct : Std.HashMap Lean.Name (Array Lean.Name))
+    (start target avoid : Lean.Name) : Bool := Id.run do
+  let mut visited : Lean.NameSet := {}
+  let mut stack : Array Lean.Name := #[start]
+  while !stack.isEmpty do
+    let n := stack.back!
+    stack := stack.pop
+    if n == target then
+      return true
+    if n == avoid || visited.contains n then
+      continue
+    visited := visited.insert n
+    for imp in direct.getD n #[] do
+      stack := stack.push imp
+  return false
+
+/-- Violations of the `MiniRustSpec` import-isolation invariant in the module import graph
+`graph` (every module paired with its direct imports, hardened in `[adv ep2-A3]` across **all**
+`Anneal.*` modules in `graph` and without `else if` suppression):
+1. no `MiniRustSpec` module other than `bridge` directly imports any `Anneal.*` module;
+2. no `MiniRustSpec` module other than `bridge` reaches *any* `Anneal.*` module (including `adt`
+   and upstream dependencies such as `Anneal.Mir.PlaceAndRvalue`) along an import path that avoids
+   `bridge`;
+3. no `MiniRustSpec` module other than `bridge` and its `allowed` clients reaches `bridge` or any
+   `Anneal.*` module;
+4. every `core` module is present in `graph` and reaches neither `bridge` nor any `Anneal.*` module. -/
+def importIsolationViolations (graph : Array (Lean.Name × Array Lean.Name))
+    (bridge adt : Lean.Name) (allowed core : List Lean.Name) : Array String := Id.run do
+  let direct : Std.HashMap Lean.Name (Array Lean.Name) :=
+    graph.foldl (fun m p => m.insert p.1 p.2) {}
+  let mut annealTargets : Array Lean.Name := #[adt]
+  for (mName, imps) in graph do
+    if (`Anneal).isPrefixOf mName && !annealTargets.contains mName then
+      annealTargets := annealTargets.push mName
+    for imp in imps do
+      if (`Anneal).isPrefixOf imp && !annealTargets.contains imp then
+        annealTargets := annealTargets.push imp
+  let mut out : Array String := #[]
+  for (mod, imps) in graph do
+    if (`MiniRustSpec).isPrefixOf mod && mod != bridge then
+      for imp in imps do
+        if (`Anneal).isPrefixOf imp then
+          out := out.push s!"{mod} directly imports {imp}"
+      for ann in annealTargets do
+        if importGraphReaches direct mod ann bridge then
+          out := out.push s!"{mod} reaches {ann} along a path avoiding {bridge}"
+      let reachesBridgeOrAnneal :=
+        importGraphReaches direct mod bridge .anonymous ||
+        annealTargets.any (fun ann => importGraphReaches direct mod ann .anonymous)
+      if reachesBridgeOrAnneal && !allowed.contains mod then
+        out := out.push s!"{mod} reaches {bridge}/Anneal.* but is not an allowed client of {bridge}"
+  for c in core do
+    if !direct.contains c then
+      out := out.push s!"core module {c} is missing from the import graph"
+    else
+      if importGraphReaches direct c bridge .anonymous then
+        out := out.push s!"core module {c} reaches {bridge}"
+      for ann in annealTargets do
+        if importGraphReaches direct c ann .anonymous then
+          out := out.push s!"core module {c} reaches {ann}"
+  return out
+
+/-- `[IMPORT-ISOLATION]`: fail unless the module import graph of this environment satisfies the
+`MiniRustSpec` import-isolation invariant (`importIsolationViolations`), after first checking
+that the checker rejects five synthetic violating graphs (negative controls: direct `Anneal.*`
+import, bypass from an unlisted module, bypass from an *allowed* bridge client, transitive
+reachability to a non-`AdtAndControl` `Anneal.*` module via a non-`MiniRustSpec` shim, and an
+unlisted client of `DeinitBridge`) and accepts a synthetic multi-`Anneal` conforming graph
+(positive control). -/
+elab "#assert_minirustspec_import_isolation" : command => do
+  let env ← getEnv
+  let graph : Array (Lean.Name × Array Lean.Name) :=
+    (env.header.moduleNames.zip env.header.moduleData).map fun (n, d) =>
+      (n, d.imports.map (·.module))
+  let bridge := `MiniRustSpec.Correspondence.DeinitBridge
+  let adt := `Anneal.Mir.AdtAndControl
+  let par := `Anneal.Mir.PlaceAndRvalue
+  let ib := `MiniRustSpec.Correspondence.IntrinsicBoundary
+  let allowed := [ib]
+  let core := [`MiniRustSpec.Correspondence.Translate, `MiniRustSpec.Correspondence.Simulation,
+    `MiniRustSpec.Correspondence.IntrinsicFallback, `MiniRustSpec.Interp, `MiniRustSpec.Generated]
+  let translate := `MiniRustSpec.Correspondence.Translate
+  let negDirect : Array (Lean.Name × Array Lean.Name) :=
+    #[(translate, #[`Anneal.Scalars]), (`Anneal.Scalars, #[])]
+  let negBypass : Array (Lean.Name × Array Lean.Name) :=
+    #[(`MiniRustSpec.Leaky, #[bridge, `Trusted.Shim]), (bridge, #[adt]), (`Trusted.Shim, #[adt]),
+      (adt, #[])]
+  let negAllowedBypass : Array (Lean.Name × Array Lean.Name) :=
+    #[(ib, #[bridge, `Trusted.Shim]), (bridge, #[adt]), (`Trusted.Shim, #[adt]), (adt, #[])]
+  let negOtherAnneal : Array (Lean.Name × Array Lean.Name) :=
+    #[(translate, #[`Trusted.Shim]), (`Trusted.Shim, #[par]), (par, #[])]
+  let negClient : Array (Lean.Name × Array Lean.Name) :=
+    #[(translate, #[bridge]), (bridge, #[adt]), (adt, #[])]
+  let pos : Array (Lean.Name × Array Lean.Name) :=
+    #[(ib, #[bridge]), (bridge, #[adt]), (adt, #[par]), (par, #[]), (translate, #[])]
+  for (label, g) in [("direct", negDirect), ("bypass", negBypass),
+      ("allowed-bypass", negAllowedBypass), ("other-anneal", negOtherAnneal),
+      ("client", negClient)] do
+    if (importIsolationViolations g bridge adt allowed []).isEmpty then
+      throwError "[IMPORT-ISOLATION] negative control `{label}` was not rejected"
+  unless (importIsolationViolations pos bridge adt allowed [translate]).isEmpty do
+    throwError "[IMPORT-ISOLATION] positive control was rejected"
+  let violations := importIsolationViolations graph bridge adt allowed core
+  unless violations.isEmpty do
+    throwError "[IMPORT-ISOLATION] violations: {violations.toList}"
+  let direct : Std.HashMap Lean.Name (Array Lean.Name) :=
+    graph.foldl (fun m p => m.insert p.1 p.2) {}
+  let mrs := graph.filter fun p => (`MiniRustSpec).isPrefixOf p.1
+  let clients := mrs.filterMap fun p =>
+    if p.1 != bridge && importGraphReaches direct p.1 adt .anonymous then some p.1 else none
+  unless importGraphReaches direct bridge adt .anonymous do
+    throwError "[IMPORT-ISOLATION] {bridge} does not import {adt}"
+  logInfo m!"[IMPORT-ISOLATION] minirustspec_modules={mrs.size} anneal_importer={bridge} bridge_clients={clients.toList} core_checked={core.length} controls=6/6 ok=true"
+
+/-- Dependency closure of `seeds` in the environment `env` (through the types and the values of
+definitions **and** theorems), together with every axiom it reaches. -/
+def dependencyClosureWithAxioms (env : Lean.Environment) (seeds : Array Lean.Name) :
+    Lean.NameSet × Array Lean.Name := Id.run do
+  let mut visited : Lean.NameSet := {}
+  let mut axs : Array Lean.Name := #[]
+  let mut stack := seeds
+  while !stack.isEmpty do
+    let n := stack.back!
+    stack := stack.pop
+    if visited.contains n then
+      continue
+    visited := visited.insert n
+    if let some ci := env.find? n then
+      if ci matches .axiomInfo _ then
+        axs := axs.push n
+      for c in ci.type.getUsedConstants do
+        unless visited.contains c do
+          stack := stack.push c
+      if let some v := ci.value? (allowOpaque := true) then
+        for c in v.getUsedConstants do
+          unless visited.contains c do
+            stack := stack.push c
+  return (visited, axs)
+
+/-- `[ADT-AUDIT-COVERAGE]` and `[ANNEAL-AXIOMS]` (`[adv ep2-B4]` / `[adv ep2-A4]`): fail unless
+1. every public, user-declared theorem of `Anneal.Mir.AdtAndControl` lies in the dependency closure
+   of the three `[DEINIT-AUDIT]` closures (`subplace_audit_closure`, `call_intrinsic_audit_closure`,
+   `adt_control_residual_audit_closure`) together with the `MiniRustSpec` declarations whose axioms
+   `#assert_all_minirustspec_standard_axioms` checks — AND every Episode 2 Section 5 public theorem
+   of `Anneal.Mir.AdtAndControl` (starting at `LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind`)
+   is reachable from `call_intrinsic_audit_closure` **alone**;
+2. (negative controls) dropping `adt_control_residual_audit_closure` leaves residual theorems
+   uncovered, and dropping `call_intrinsic_audit_closure` leaves Section 5 theorems uncovered; and
+3. every declaration across **every** imported `Anneal.*` module (`Anneal.Mir.AdtAndControl` and
+   `Anneal.Mir.PlaceAndRvalue`, including private and compiler-generated ones) is `!ci.isUnsafe` and
+   depends only on `propext`, `Quot.sound`, and `Classical.choice` under both `Lean.collectAxioms`
+   and `dependencyClosureWithAxioms`. -/
+elab "#assert_adt_control_audit_coverage" : command => do
+  let env ← getEnv
+  let adt := `Anneal.Mir.AdtAndControl
+  let par := `Anneal.Mir.PlaceAndRvalue
+  let subplaceClosure := `MiniRustSpec.Correspondence.DeinitBridge.subplace_audit_closure
+  let callClosure := `MiniRustSpec.Correspondence.DeinitBridge.call_intrinsic_audit_closure
+  let residual := `MiniRustSpec.Correspondence.DeinitBridge.adt_control_residual_audit_closure
+  let sec5Anchor := `Anneal.Mir.AdtAndControl.LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind
+  let some idx := env.getModuleIdx? adt
+    | throwError "[ADT-AUDIT-COVERAGE] {adt} is not imported"
+  unless (env.getModuleIdx? par).isSome do
+    throwError "[ADT-AUDIT-COVERAGE] {par} is not imported"
+  let some sec5Dr := Lean.declRangeExt.find? env sec5Anchor
+    | throwError "[ADT-AUDIT-COVERAGE] missing declaration range for Section 5 anchor {sec5Anchor}"
+  let sec5StartLine := sec5Dr.range.pos.line
+  let consts := env.header.moduleData[idx.toNat]!.constNames
+  let targets := consts.filter fun c =>
+    (env.find? c matches some (.thmInfo _)) && !Lean.isPrivateName c && !c.isInternalDetail &&
+      !env.isProjectionFn c && (Lean.declRangeExt.find? env c).isSome
+  let sec5Targets := targets.filter fun c =>
+    match Lean.declRangeExt.find? env c with
+    | some dr => dr.range.pos.line >= sec5StartLine
+    | none => false
+  if sec5Targets.isEmpty then
+    throwError "[ADT-AUDIT-COVERAGE] Section 5 theorem list is unexpectedly empty"
+  let mut seeds : Array Lean.Name := #[]
+  for i in [:env.header.moduleNames.size] do
+    if (`MiniRustSpec).isPrefixOf env.header.moduleNames[i]! then
+      seeds := seeds ++ env.header.moduleData[i]!.constNames
+  for req in [subplaceClosure, callClosure, residual] do
+    unless seeds.contains req do
+      throwError "[ADT-AUDIT-COVERAGE] {req} is not an imported MiniRustSpec declaration"
+  let (coveredByCall, _) := dependencyClosureWithAxioms env #[callClosure]
+  let missingSec5 := sec5Targets.filter fun n => !coveredByCall.contains n
+  unless missingSec5.isEmpty do
+    throwError "[ADT-AUDIT-COVERAGE] {missingSec5.size} Section 5 theorems of {adt} missing from {callClosure}: {missingSec5.toList.take 25}"
+  let (covered, _) := dependencyClosureWithAxioms env seeds
+  let missing := targets.filter fun n => !covered.contains n
+  unless missing.isEmpty do
+    throwError "[ADT-AUDIT-COVERAGE] {missing.size} public theorems of {adt} escape the axiom audit: {missing.toList.take 25}"
+  let (coveredWithoutResidual, _) := dependencyClosureWithAxioms env (seeds.filter (· != residual))
+  let needed := (targets.filter fun n => !coveredWithoutResidual.contains n).size
+  if needed == 0 then
+    throwError "[ADT-AUDIT-COVERAGE] negative control failed: {residual} covers nothing new"
+  let (coveredWithoutCall, _) := dependencyClosureWithAxioms env (seeds.filter (· != callClosure))
+  let neededCall := (sec5Targets.filter fun n => !coveredWithoutCall.contains n).size
+  if neededCall == 0 then
+    throwError "[ADT-AUDIT-COVERAGE] negative control failed: {callClosure} covers nothing new in Section 5"
+  let mut annealMods : Array Lean.Name := #[]
+  let mut annealConsts : Array Lean.Name := #[]
+  for i in [:env.header.moduleNames.size] do
+    let modName := env.header.moduleNames[i]!
+    if (`Anneal).isPrefixOf modName then
+      annealMods := annealMods.push modName
+      for c in env.header.moduleData[i]!.constNames do
+        annealConsts := annealConsts.push c
+        if let some ci := env.find? c then
+          if ci.isUnsafe then
+            throwError "[ANNEAL-AXIOMS] unsafe declaration {c} in {modName}"
+        let cAxs ← liftCoreM <| Lean.collectAxioms c
+        for a in cAxs do
+          unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+            throwError "[ANNEAL-AXIOMS] {c} (in {modName}) depends on the non-standard axiom {a}"
+  let (_, axs) := dependencyClosureWithAxioms env annealConsts
+  for a in axs do
+    unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+      throwError "[ANNEAL-AXIOMS] transitive closure of Anneal.* depends on the non-standard axiom {a}"
+  logInfo m!"[ADT-AUDIT-COVERAGE] adt_public_theorems={targets.size} audited={targets.size} sec5_theorems={sec5Targets.size} sec5_via_call_closure={sec5Targets.size} only_via_call_closure={neededCall} only_via_residual_closure={needed} ok=true"
+  logInfo m!"[ANNEAL-AXIOMS] modules={annealMods.toList} decls={annealConsts.size} axioms={axs.toList} unsafe_free=true sorry_free=true"
 
 open MiniRustSpec.LibSpecr in
 #assert_standard_axioms
@@ -5432,6 +5684,47 @@ open MiniRustSpec.Correspondence in
   bdPolymorphicCallee_rejected
   bdPolymorphicCall_anneal_failClosed
   bdUnmonoParamAliasBody_failClosed
+  ctpopLoop_eq_popcountBits
+  optScalarIs_iff
+  evalLIntrinsic_ctpop_eq_minirust
+  evalLIntrinsic_bitops_fallback_correspondence
+  lowerIntrinsicKind_boundary_correspondence
+  evalIntBinOp_ok_or_ub
+  evalBinOp_int_ok_or_ub
+  evalLIntrinsic_unchecked_binop_isSome_iff_minirust_ok
+  evalLIntrinsic_unchecked_shift_isSome_iff_minirust_ok
+  evalLIntrinsic_exactDiv_isSome_iff_minirust_ok
+  evalLIntrinsic_threeWayCompare_ordering_tag
+  evalLIntrinsic_ubChecks_bool_encoding
+  evalLIntrinsic_abort_minirust_correspondence
+  evalLIntrinsic_unreachable_minirust_correspondence
+  evalLIntrinsic_nonzero_minirust_assume
+  minirust_intrinsic_negative_controls
+  evalLIntrinsic_bitops_i8_signedness_independent
+  leValue_append
+  leValue_lt
+  leBytes_leValue
+  bswapLoop_eq_leValue_reverse
+  evalLIntrinsic_bswap_minirust_endianness_all_widths
+  leBits_length
+  leBitValue_append
+  leBitValue_lt
+  leBitValue_leBits
+  leBits_leBitValue
+  bitreverseLoop_eq_leBitValue_reverse
+  cttzLoop_eq_takeWhile_leBits
+  popcountBits_eq_countP_leBits
+  evalLIntrinsic_bitops_symbolic_all_widths
+  evalLIntrinsic_unchecked_and_exactDiv_value_iff_minirust
+  evalLIntrinsic_saturating_valOf_minirust
+  evalLIntrinsic_threeWayCompare_char_minirust
+  evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
+  evalLIntrinsic_panicUnwind_minirust_correspondence
+  minirust_bitops_char_and_layout_negative_controls
+  minirust_unwind_terminators_unsupported
+  evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
+  evalLoweredIntrinsicCall_target_none_minirust_ub
+  lintrinsicOp_exhaustive_minirust_classification
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 
@@ -5440,7 +5733,11 @@ open MiniRustSpec.Correspondence in
 `step_correspondence_D`, and the whole-execution lifts), the byte-store bridge of
 `Correspondence.DeinitLemmas` / `Correspondence.DeinitBridge` (including
 `subplace_audit_closure`, whose proof term mentions every Episode 2 theorem of
-`Anneal.Mir.AdtAndControl` Section 4 and its Stage-1 `Retag` reconciliation), the
+`Anneal.Mir.AdtAndControl` Section 4 and its Stage-1 `Retag` reconciliation), the Episode 2
+lowered-intrinsic ↔ `MiniRustSpec.Interp` bridges of `Correspondence.DeinitBridge`, the audit hooks
+`call_intrinsic_audit_closure` (every Episode 2 `.call` / `LIntrinsicOp` / `LCallTable` theorem of
+`Anneal.Mir.AdtAndControl`) and `adt_control_residual_audit_closure` (every remaining public
+`Anneal.Mir.AdtAndControl` theorem; see `[ADT-AUDIT-COVERAGE]`), the
 `Rvalue::Discriminant` lowering and its gating characterizations, and the concrete
 projected-`Deinit`, projected-`Retag` (Stage-1 parity and `inFragmentD` admission), and
 `Discriminant` witnesses of
@@ -5514,6 +5811,18 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   evalDeinitPlace_spec_minirust_store_simulation
   paddedDeinitSiblingReinit_anneal_shell_agreement
   subplace_audit_closure
+  intTyBytes_intrinsic_props
+  evalLIntrinsic_wrapping_eq_minirust
+  evalLIntrinsic_unchecked_binop_iff_minirust
+  evalLIntrinsic_unchecked_shift_iff_minirust
+  evalLIntrinsic_exactDiv_iff_minirust
+  evalLIntrinsic_saturating_eq_minirust
+  evalLIntrinsic_threeWayCompare_eq_minirust
+  evalLIntrinsic_ubChecks_eq_minirust
+  evalLIntrinsic_arithOffset_eq_minirust
+  evalLoweredTerminator_diverging_intrinsics_correspondence
+  call_intrinsic_audit_closure
+  adt_control_residual_audit_closure
   translateRvalue_discriminant
   evalValue_orderingDiscrExpr
   evalValue_orderingDiscrExpr_ub
@@ -5581,6 +5890,10 @@ elab "#assert_all_minirustspec_standard_axioms" : command => do
             throwError "{c} (in {modName}) depends on the non-standard axiom {a}"
         checked := checked + 1
   logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
+
+#assert_minirustspec_import_isolation
+
+#assert_adt_control_audit_coverage
 
 #assert_all_minirustspec_standard_axioms
 
