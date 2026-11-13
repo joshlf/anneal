@@ -1469,6 +1469,16 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.witness_projected_and_partialShell_call_destinations
   let _ := @Anneal.Mir.AdtAndControl.witnessWidePtrAndChar_bodyCorr
   let _ := @Anneal.Mir.AdtAndControl.witness_wide_ptr_char_and_bodyCorr_ub_parity
+  -- `[adv ep2-A2]` Section 5i: per-projection `NoUninitExplosionOnProj`, exact outermost
+  -- abort-site characterization (`terminateLCallStack_eq_some_iff`), cross-frame pointer
+  -- isolation (`crossFrameValueOk_ptr_iff`), `unwindLCallStack_cleanup_exact`, multi-frame
+  -- projected `Deinit` bridge, and Witness Suite 10.
+  let _ := @Anneal.Mir.AdtAndControl.noUninitExplosionOnProj_of_eq_none
+  let _ := @Anneal.Mir.AdtAndControl.terminateLCallStack_eq_some_iff
+  let _ := @Anneal.Mir.AdtAndControl.crossFrameValueOk_ptr_iff
+  let _ := @Anneal.Mir.AdtAndControl.unwindLCallStack_cleanup_exact
+  let _ := @Anneal.Mir.AdtAndControl.stepMirFn_multi_deinit_projected_trustedRun
+  let _ := @Anneal.Mir.AdtAndControl.witness_diverging_proj_move_cleanup_and_protectors
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge

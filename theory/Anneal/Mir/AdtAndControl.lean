@@ -9132,12 +9132,47 @@ def LTerminator.Refinable : LTerminator → Prop
   | .unwindResume => True
   | .unwindTerminate => True
 
+/-- Per-projection non-explosion guard for `.call` destinations (`[adv ep2-A2]`, resolving `B2`'s
+whole-body `projCallArity` critique): along `proj`, `writeToFieldSlot` cannot materialize a brand-new
+`PartialAggregate.newUninit` out of a bare `.uninit` slot (where `Trusted.writePlaceValue` faults
+with `.ub`). Holds trivially whenever `proj = []`, whenever `arityOf = fun _ _ _ => none`, OR
+whenever `containerTy` (`destTy` at a `.call` site) and any intermediate projected field types have
+`arityOf ... = none` — so a body with non-trivial `env.arityOf = tupleArityOf` keeps full
+statement-level tuple shell writes across the body while `.call`ing into projected scalar/non-shell
+fields such as `_1.1 : u32`! -/
+def NoUninitExplosionOnProj (arityOf : Ty → VariantIdx → Bool → Option Nat) :
+    Ty → List ProjectionElem → Prop
+  | _, [] => True
+  | containerTy, .field _ fieldTy :: rest =>
+    arityOf containerTy 0 false = none ∧ NoUninitExplosionOnProj arityOf fieldTy rest
+  | containerTy, .downcast _ variantIdx :: .field _ fieldTy :: tail =>
+    arityOf containerTy variantIdx true = none ∧ NoUninitExplosionOnProj arityOf fieldTy tail
+  | _, _ => True
+
+/-- `NoUninitExplosionOnProj` holds universally whenever `arityOf = fun _ _ _ => none`. -/
+theorem noUninitExplosionOnProj_of_eq_none {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    (hNone : arityOf = fun _ _ _ => none) :
+    ∀ (ty : Ty) (proj : List ProjectionElem), NoUninitExplosionOnProj arityOf ty proj := by
+  subst hNone
+  intro ty proj
+  induction proj generalizing ty with
+  | nil => trivial
+  | cons p rest ih =>
+    cases p with
+    | field _ fieldTy => exact ⟨rfl, ih fieldTy⟩
+    | downcast _ _ =>
+      rcases rest with _ | ⟨p2, tail⟩
+      · trivial
+      · cases p2 with
+        | field _ fieldTy => exact ⟨rfl, (ih fieldTy).2⟩
+        | _ => trivial
+    | _ => trivial
+
 /-- A lowered body corresponds to a captured Trusted body: a runtime phase, the same layouts and
 local declarations, the same blocks (statement-free on both sides, so a block is its terminator),
 the same terminators and cleanup flags, and refinable terminators. Projected call destinations
-(`dest.projection ≠ []`) require `env.arityOf = fun _ _ _ => none` so a call cannot materialize a
-`PartialShell` out of a bare `.uninit` root (where Trusted's `writePlaceValue` faults); initialized
-and `PartialShell` roots refine `writePlaceValue` (`[adv ep2-A1]`). -/
+(`dest.projection ≠ []`) require `NoUninitExplosionOnProj env.arityOf dty dest.projection` (scoped per
+call site rather than forcing `env.arityOf` trivial for the whole body, `[adv ep2-A2]`). -/
 structure BodyCorr (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
   phase : ∀ tag, cm.phase ≠ .other tag
   layouts : cm.layouts = env.layouts
@@ -9153,8 +9188,8 @@ structure BodyCorr (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
       body.blocks[i]? = some b →
       b.terminator = .call func args dest dty t u →
       dest.projection ≠ [] →
-      env.arityOf = fun _ _ _ => none) := by
-    intros; first | rfl | contradiction
+      NoUninitExplosionOnProj env.arityOf dty dest.projection) := by
+    intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction
 
 /-- **`StateCorr`**: the lowered state at block `bb` with frame `slots` corresponds to the Trusted
 machine state `s`: `s` is at the start of `bb` (its terminator, since blocks are statement-free),
@@ -9323,16 +9358,18 @@ theorem promoteShellToFieldSlot_below {sh : PartialAggregate} {tv : Nat} {tfs : 
     rcases sh with ⟨var, adt, disc, fs⟩
     exact ⟨hV, hB⟩
 
-/-- With `arityOf = fun _ _ _ => none` (no shell materialization out of `.uninit`), every successful
-`writeToFieldSlot` along `proj` on a slot below `t` refines `evalValueProjWrite` and produces a
-non-`.uninit` slot below `t'`. -/
+/-- Under `NoUninitExplosionOnProj arityOf rootTy proj` (no shell materialization out of `.uninit`
+along `proj`), every successful `writeToFieldSlot` along `proj` on a slot below `t` refines
+`evalValueProjWrite` and produces a non-`.uninit` slot below `t'` (`[adv ep2-A2]`). -/
 theorem writeToFieldSlot_noExplode_below_refines
+    {arityOf : Ty → VariantIdx → Bool → Option Nat}
     {slots : List LocalSlotState} {locals : List LocalSlot}
     (hSame : SameScalarLocals (slotsToTrustedLocals slots) locals) :
     ∀ (n : Nat) (proj : List ProjectionElem), proj.length ≤ n →
       ∀ (slot nextSlot : FieldSlot) (t : Value) (rootTy : Ty) (rv : Value),
+        NoUninitExplosionOnProj arityOf rootTy proj →
         FieldSlotBelow slot t →
-        writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none)
+        writeToFieldSlot (slotsToTrustedLocals slots) arityOf
           slot rootTy proj rv = .ok nextSlot →
         ∃ t',
           evalValueProjWrite locals t proj rv = .ok t' ∧
@@ -9341,14 +9378,14 @@ theorem writeToFieldSlot_noExplode_below_refines
   intro n
   induction n with
   | zero =>
-    intro proj hLen slot nextSlot t rootTy rv _ hW
+    intro proj hLen slot nextSlot t rootTy rv _ _ hW
     have hNil : proj = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
     subst hNil
     simp only [writeToFieldSlot, SlotWriteResult.ok.injEq] at hW
     subst hW
     exact ⟨rv, rfl, rfl, by intro hc; cases hc⟩
   | succ n ih =>
-    intro proj hLen slot nextSlot t rootTy rv hB hW
+    intro proj hLen slot nextSlot t rootTy rv hNoExp hB hW
     rcases proj with _ | ⟨p, rest⟩
     · simp only [writeToFieldSlot, SlotWriteResult.ok.injEq] at hW
       subst hW
@@ -9370,11 +9407,13 @@ theorem writeToFieldSlot_noExplode_below_refines
           exact ⟨updatedVal, hEv, rfl, by intro hc; cases hc⟩
       | uninit =>
         cases p with
-        | field _ _ => simp [writeToFieldSlot] at hW
+        | field _ _ => simp [writeToFieldSlot, hNoExp.1] at hW
         | downcast _ _ =>
           rcases rest with _ | ⟨p2, tail⟩
           · simp [writeToFieldSlot] at hW
-          · cases p2 <;> simp [writeToFieldSlot] at hW
+          · cases p2 with
+            | field _ _ => simp [writeToFieldSlot, hNoExp.1] at hW
+            | _ => simp [writeToFieldSlot] at hW
         | index _ | constantIndex _ _ _ | subslice _ _ _
         | deref | opaqueCast _ | unwrapUnsafeBinder _ =>
           simp [writeToFieldSlot] at hW
@@ -9392,7 +9431,7 @@ theorem writeToFieldSlot_noExplode_below_refines
               | none =>
                 exfalso; cases sAdt <;> simp_all [shellVariant, writeToFieldSlot]
               | some oldChild =>
-                cases hCW : writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none)
+                cases hCW : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
                     oldChild fieldTy rest rv with
                 | ub =>
                   exfalso; cases sAdt <;> simp_all [shellVariant, writeToFieldSlot]
@@ -9410,7 +9449,7 @@ theorem writeToFieldSlot_noExplode_below_refines
                       simpa [get?_eq_getElem?] using hGet
                     obtain ⟨tc, htc, hChildB⟩ := FieldListBelow.getElem? hFBelow hsIdx
                     obtain ⟨tc', hTcW, hNewChildB, _⟩ :=
-                      ih rest (by omega) oldChild newChild tc fieldTy rv hChildB hCW
+                      ih rest (by omega) oldChild newChild tc fieldTy rv hNoExp.2 hChildB hCW
                     obtain ⟨_, rfl⟩ := set?_eq_some_iff.mp hSet
                     have hTfsLt : idx < tfs.length := (List.getElem?_eq_some_iff.mp htc).1
                     have hTfsSet : set? tfs idx tc' = some (tfs.set idx tc') :=
@@ -9435,7 +9474,7 @@ theorem writeToFieldSlot_noExplode_below_refines
                   | none =>
                     exfalso; cases sAdt <;> simp_all [shellVariant, writeToFieldSlot]
                   | some oldChild =>
-                    cases hCW : writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none)
+                    cases hCW : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
                         oldChild fieldTy tail rv with
                     | ub =>
                       exfalso; cases sAdt <;> simp_all [shellVariant, writeToFieldSlot]
@@ -9454,7 +9493,7 @@ theorem writeToFieldSlot_noExplode_below_refines
                           simpa [get?_eq_getElem?] using hGet
                         obtain ⟨tc, htc, hChildB⟩ := FieldListBelow.getElem? hFBelow hsIdx
                         obtain ⟨tc', hTcW, hNewChildB, _⟩ :=
-                          ih tail (by omega) oldChild newChild tc fieldTy rv hChildB hCW
+                          ih tail (by omega) oldChild newChild tc fieldTy rv hNoExp.2 hChildB hCW
                         obtain ⟨_, rfl⟩ := set?_eq_some_iff.mp hSet
                         have hTfsLt : idx < tfs.length := (List.getElem?_eq_some_iff.mp htc).1
                         have hTfsSet : set? tfs idx tc' = some (tfs.set idx tc') :=
@@ -9475,151 +9514,151 @@ theorem writeToFieldSlot_noExplode_below_refines
 
 /-- **General call-destination write refinement (`writePlaceState_dest_below_refines`)**:
 writing a return value `rv` into `dest` via `writePlaceState` refines Trusted's `writePlaceValue`
-under `SlotsRefine SlotBelow` whenever either `dest.projection = []` (bare local, any `arityOf`)
-or `arityOf = fun _ _ _ => none` (any non-`Deref` projected place on an initialized or
-`PartialShell` local, including reinitializing a `Deinit`'d field!). -/
+under `SlotsRefine SlotBelow` whenever `NoUninitExplosionOnProj arityOf destTy dest.projection` holds
+(automatic for bare locals `dest.projection = []`, for `arityOf = fun _ _ _ => none`, and for
+projected destinations whose `destTy`/intermediate field types do not explode `.uninit` — even when
+`arityOf` such as `tupleArityOf` actively supports statement-level shell writes on aggregates!). -/
 theorem writePlaceState_dest_below_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
     {slots slots' : List LocalSlotState} {locals : List LocalSlot}
     {borrows : List BorrowEntry} {dest : Place} {destTy : Ty} {rv : Value}
     (hRel : SlotsRefine SlotBelow slots locals)
-    (hDestOk : dest.projection = [] ∨ arityOf = fun _ _ _ => none)
+    (hDestOk : NoUninitExplosionOnProj arityOf destTy dest.projection)
     (hWrite : writePlaceState arityOf slots dest destTy rv = .ok slots') :
     ∃ locals',
       writePlaceValue locals borrows dest rv = .ok locals' ∧
       SlotsRefine SlotBelow slots' locals' := by
   rcases dest with ⟨loc, _ | ⟨pHead, pTail⟩⟩
   · exact writePlaceState_bare_below_refines hRel rfl hWrite
-  · rcases hDestOk with hNil | hArity
-    · nomatch hNil
-    · subst hArity
-      have hSame := sameScalarLocals_of_slotBelow hRel
-      unfold writePlaceState at hWrite
-      cases hDeref : projectionHasDeref (pHead :: pTail) with
-      | true => rw [hDeref] at hWrite; nomatch hWrite
-      | false =>
-        rw [hDeref] at hWrite
-        dsimp only at hWrite
-        have hNotDeref : pHead ≠ .deref := by
-          intro hD; subst hD; simp [projectionHasDeref] at hDeref
-        rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨st, t, hGetS, hGetT, hAT⟩
-        · rw [hNoneS] at hWrite; nomatch hWrite
-        · rw [hGetS] at hWrite
-          cases st with
-          | dead => nomatch hWrite
-          | uninit =>
-            dsimp only at hWrite
-            have hImpossible :
-                ∀ next, writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none) .uninit
-                  destTy (pHead :: pTail) rv ≠ .ok next := by
-              intro next hOk
-              cases pHead with
-              | field _ _ => simp [writeToFieldSlot] at hOk
-              | downcast _ _ =>
-                rcases pTail with _ | ⟨p2, _⟩
-                · simp [writeToFieldSlot] at hOk
-                · cases p2 <;> simp [writeToFieldSlot] at hOk
-              | _ => simp [writeToFieldSlot] at hOk
-            split at hWrite
-            · rename_i next hOk
-              exact absurd hOk (hImpossible next)
-            · nomatch hWrite
-            · nomatch hWrite
-          | init existingVal =>
-            dsimp only at hWrite
-            cases t with
-            | init rootVal =>
-              cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none)
-                  (.init existingVal) destTy (pHead :: pTail) rv with
-              | ub => rw [hWT] at hWrite; nomatch hWrite
-              | unsupported => rw [hWT] at hWrite; nomatch hWrite
-              | ok nextSlot =>
-                rw [hWT] at hWrite
-                simp only [SlotWriteResult.ok.injEq] at hWrite
-                subst hWrite
-                obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
-                  writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
-                    (pHead :: pTail) (Nat.le_refl _) (.init existingVal) nextSlot rootVal destTy rv
-                    hAT hWT
-                have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hEvW
-                have hLt : loc < locals.length :=
-                  (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
-                have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
-                  set?_eq_some_iff.mpr ⟨hLt, rfl⟩
-                have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
-                  cases nextSlot with
-                  | uninit => exact absurd rfl hNotU
-                  | init v => exact hNextB
-                  | nested var adt disc fs =>
-                    simp only [fieldSlotToLocalSlotState]
-                    cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
-                    | none => exact hNextB
-                    | some fullVal =>
-                      cases rootVal' with
-                      | aggregate tv tfs =>
-                        obtain ⟨hV, hBs⟩ := hNextB
-                        obtain ⟨_, vals, hF, rfl⟩ :=
-                          (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
-                        simp only at hF
-                        subst hF
-                        have hEq := FieldListBelow.eq_of_map_init hBs
-                        subst hEq
-                        show Value.aggregate _ vals = .aggregate tv vals
-                        rw [← hV]; rfl
-                      | _ => exact absurd hNextB id
-                exact ⟨locals.set loc (.init rootVal'),
-                  writePlaceValue_proj_of_noUnion locals borrows loc pHead pTail rv rootVal rootVal'
-                    _ [] emptyLayoutTable hNotDeref (placeTouchesUnion_nil_decls emptyLayoutTable _)
-                    rfl hGetT hWP hSet,
-                  SlotsRefine.set hSB loc hRel⟩
-            | _ => simp [SlotBelow] at hAT
-          | partialShell shell =>
-            dsimp only at hWrite
-            cases t with
-            | init rootVal =>
-              cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) (fun _ _ _ => none)
-                  shell.toFieldSlot destTy (pHead :: pTail) rv with
-              | ub => rw [hWT] at hWrite; nomatch hWrite
-              | unsupported => rw [hWT] at hWrite; nomatch hWrite
-              | ok nextSlot =>
-                rw [hWT] at hWrite
-                simp only [SlotWriteResult.ok.injEq] at hWrite
-                subst hWrite
-                obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
-                  writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
-                    (pHead :: pTail) (Nat.le_refl _) shell.toFieldSlot nextSlot rootVal destTy rv
-                    hAT hWT
-                have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hEvW
-                have hLt : loc < locals.length :=
-                  (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
-                have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
-                  set?_eq_some_iff.mpr ⟨hLt, rfl⟩
-                have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
-                  cases nextSlot with
-                  | uninit => exact absurd rfl hNotU
-                  | init v => exact hNextB
-                  | nested var adt disc fs =>
-                    simp only [fieldSlotToLocalSlotState]
-                    cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
-                    | none => exact hNextB
-                    | some fullVal =>
-                      cases rootVal' with
-                      | aggregate tv tfs =>
-                        obtain ⟨hV, hBs⟩ := hNextB
-                        obtain ⟨_, vals, hF, rfl⟩ :=
-                          (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
-                        simp only at hF
-                        subst hF
-                        have hEq := FieldListBelow.eq_of_map_init hBs
-                        subst hEq
-                        show Value.aggregate _ vals = .aggregate tv vals
-                        rw [← hV]; rfl
-                      | _ => exact absurd hNextB id
-                exact ⟨locals.set loc (.init rootVal'),
-                  writePlaceValue_proj_of_noUnion locals borrows loc pHead pTail rv rootVal rootVal'
-                    _ [] emptyLayoutTable hNotDeref (placeTouchesUnion_nil_decls emptyLayoutTable _)
-                    rfl hGetT hWP hSet,
-                  SlotsRefine.set hSB loc hRel⟩
-            | _ => simp [SlotBelow] at hAT
+  · have hSame := sameScalarLocals_of_slotBelow hRel
+    unfold writePlaceState at hWrite
+    cases hDeref : projectionHasDeref (pHead :: pTail) with
+    | true => rw [hDeref] at hWrite; nomatch hWrite
+    | false =>
+      rw [hDeref] at hWrite
+      dsimp only at hWrite
+      have hNotDeref : pHead ≠ .deref := by
+        intro hD; subst hD; simp [projectionHasDeref] at hDeref
+      rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨st, t, hGetS, hGetT, hAT⟩
+      · rw [hNoneS] at hWrite; nomatch hWrite
+      · rw [hGetS] at hWrite
+        cases st with
+        | dead => nomatch hWrite
+        | uninit =>
+          dsimp only at hWrite
+          have hImpossible :
+              ∀ next, writeToFieldSlot (slotsToTrustedLocals slots) arityOf .uninit
+                destTy (pHead :: pTail) rv ≠ .ok next := by
+            intro next hOk
+            cases pHead with
+            | field _ _ => simp [writeToFieldSlot, hDestOk.1] at hOk
+            | downcast _ _ =>
+              rcases pTail with _ | ⟨p2, _⟩
+              · simp [writeToFieldSlot] at hOk
+              · cases p2 with
+                | field _ _ => simp [writeToFieldSlot, hDestOk.1] at hOk
+                | _ => simp [writeToFieldSlot] at hOk
+            | _ => simp [writeToFieldSlot] at hOk
+          split at hWrite
+          · rename_i next hOk
+            exact absurd hOk (hImpossible next)
+          · nomatch hWrite
+          · nomatch hWrite
+        | init existingVal =>
+          dsimp only at hWrite
+          cases t with
+          | init rootVal =>
+            cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
+                (.init existingVal) destTy (pHead :: pTail) rv with
+            | ub => rw [hWT] at hWrite; nomatch hWrite
+            | unsupported => rw [hWT] at hWrite; nomatch hWrite
+            | ok nextSlot =>
+              rw [hWT] at hWrite
+              simp only [SlotWriteResult.ok.injEq] at hWrite
+              subst hWrite
+              obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
+                writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
+                  (pHead :: pTail) (Nat.le_refl _) (.init existingVal) nextSlot rootVal destTy rv
+                  hDestOk hAT hWT
+              have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hEvW
+              have hLt : loc < locals.length :=
+                (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
+              have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
+                set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+              have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
+                cases nextSlot with
+                | uninit => exact absurd rfl hNotU
+                | init v => exact hNextB
+                | nested var adt disc fs =>
+                  simp only [fieldSlotToLocalSlotState]
+                  cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
+                  | none => exact hNextB
+                  | some fullVal =>
+                    cases rootVal' with
+                    | aggregate tv tfs =>
+                      obtain ⟨hV, hBs⟩ := hNextB
+                      obtain ⟨_, vals, hF, rfl⟩ :=
+                        (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
+                      simp only at hF
+                      subst hF
+                      have hEq := FieldListBelow.eq_of_map_init hBs
+                      subst hEq
+                      show Value.aggregate _ vals = .aggregate tv vals
+                      rw [← hV]; rfl
+                    | _ => exact absurd hNextB id
+              exact ⟨locals.set loc (.init rootVal'),
+                writePlaceValue_proj_of_noUnion locals borrows loc pHead pTail rv rootVal rootVal'
+                  _ [] emptyLayoutTable hNotDeref (placeTouchesUnion_nil_decls emptyLayoutTable _)
+                  rfl hGetT hWP hSet,
+                SlotsRefine.set hSB loc hRel⟩
+          | _ => simp [SlotBelow] at hAT
+        | partialShell shell =>
+          dsimp only at hWrite
+          cases t with
+          | init rootVal =>
+            cases hWT : writeToFieldSlot (slotsToTrustedLocals slots) arityOf
+                shell.toFieldSlot destTy (pHead :: pTail) rv with
+            | ub => rw [hWT] at hWrite; nomatch hWrite
+            | unsupported => rw [hWT] at hWrite; nomatch hWrite
+            | ok nextSlot =>
+              rw [hWT] at hWrite
+              simp only [SlotWriteResult.ok.injEq] at hWrite
+              subst hWrite
+              obtain ⟨rootVal', hEvW, hNextB, hNotU⟩ :=
+                writeToFieldSlot_noExplode_below_refines hSame (pHead :: pTail).length
+                  (pHead :: pTail) (Nat.le_refl _) shell.toFieldSlot nextSlot rootVal destTy rv
+                  hDestOk hAT hWT
+              have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hEvW
+              have hLt : loc < locals.length :=
+                (List.getElem?_eq_some_iff.mp (by simpa [get?_eq_getElem?] using hGetT)).1
+              have hSet : set? locals loc (.init rootVal') = some (locals.set loc (.init rootVal')) :=
+                set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+              have hSB : SlotBelow (fieldSlotToLocalSlotState nextSlot) (.init rootVal') := by
+                cases nextSlot with
+                | uninit => exact absurd rfl hNotU
+                | init v => exact hNextB
+                | nested var adt disc fs =>
+                  simp only [fieldSlotToLocalSlotState]
+                  cases hTry : PartialAggregate.tryIntoValue? ⟨var, adt, disc, fs⟩ with
+                  | none => exact hNextB
+                  | some fullVal =>
+                    cases rootVal' with
+                    | aggregate tv tfs =>
+                      obtain ⟨hV, hBs⟩ := hNextB
+                      obtain ⟨_, vals, hF, rfl⟩ :=
+                        (tryIntoValue?_eq_some_iff ⟨var, adt, disc, fs⟩ fullVal).mp hTry
+                      simp only at hF
+                      subst hF
+                      have hEq := FieldListBelow.eq_of_map_init hBs
+                      subst hEq
+                      show Value.aggregate _ vals = .aggregate tv vals
+                      rw [← hV]; rfl
+                    | _ => exact absurd hNextB id
+              exact ⟨locals.set loc (.init rootVal'),
+                writePlaceValue_proj_of_noUnion locals borrows loc pHead pTail rv rootVal rootVal'
+                  _ [] emptyLayoutTable hNotDeref (placeTouchesUnion_nil_decls emptyLayoutTable _)
+                  rfl hGetT hWP hSet,
+                SlotsRefine.set hSB loc hRel⟩
+          | _ => simp [SlotBelow] at hAT
 
 /-- `resolveIntrinsicIsSigned` depends only on `target.typeArgs`, never on `target.defPath` or
 `target.isIndirect`. -/
@@ -10088,8 +10127,8 @@ theorem evalLoweredTerminator_call_refines_evalTerminator
     (hRel1 : SlotsRefine SlotBelow slots1 locals1)
     (hBodyCall : evalLoweredCall env body bb inCleanup func args slots1 dest destTy t u unwinding =
       some step)
-    (hDestOk : dest.projection = [] ∨ env.arityOf = fun _ _ _ => none := by
-      first | exact Or.inl rfl | exact Or.inr rfl) :
+    (hDestOk : NoUninitExplosionOnProj env.arityOf destTy dest.projection := by
+      first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial) :
     let sEnd : MachineState := { s with frame := ⟨bb, sIdx, locals1⟩ }
     match step with
     | .goto next slots' _ =>
@@ -10461,10 +10500,10 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
           simp only at hbEq hsEq
           subst hbEq hsEq
           rfl
-        have hDestOk : dest.projection = [] ∨ env.arityOf = fun _ _ _ => none := by
+        have hDestOk : NoUninitExplosionOnProj env.arityOf destTy dest.projection := by
           by_cases hPN : dest.projection = []
-          · exact Or.inl hPN
-          · exact Or.inr (hBody.projCallArity bb b func args dest destTy t u hb hT hPN)
+          · rw [hPN]; trivial
+          · exact hBody.projCallArity bb b func args dest destTy t u hb hT hPN
         have hCall := evalLoweredTerminator_call_refines_evalTerminator
           (sIdx := 0) (span := span) (inCleanup := b.isCleanup)
           hBody.layouts hBody.localDecls hBody.ubChecksTrue hBody.callTargetDefault
@@ -11674,8 +11713,8 @@ structure BodyCorrWithStmts (env : CfgEnv) (body : LBody) (cm : CapturedMir) : P
       body.blocks[i]? = some b →
       b.terminator = .call func args dest dty t u →
       dest.projection ≠ [] →
-      env.arityOf = fun _ _ _ => none) := by
-    intros; first | rfl | contradiction
+      NoUninitExplosionOnProj env.arityOf dty dest.projection) := by
+    intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction
 
 /-- At the end of a basic block's statement list (`stmtIdx = tStmts.length`), Trusted's
 `stepMirFn` evaluates the block's terminator. -/
@@ -11715,8 +11754,8 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
         (t : Option Nat) (u : UnwindAction),
         b.terminator = .call func args dest dty t u →
         dest.projection ≠ [] →
-        env.arityOf = fun _ _ _ => none := by
-      intros; first | rfl | contradiction) :
+        NoUninitExplosionOnProj env.arityOf dty dest.projection := by
+      intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction) :
     match step with
     | .goto next slots' _ =>
       ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
@@ -11859,10 +11898,10 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
     | call func args dest destTy t u =>
       rw [hT] at hRef h
       dsimp only at h
-      have hDestOk : dest.projection = [] ∨ env.arityOf = fun _ _ _ => none := by
+      have hDestOk : NoUninitExplosionOnProj env.arityOf destTy dest.projection := by
         by_cases hPN : dest.projection = []
-        · exact Or.inl hPN
-        · exact Or.inr (hProjArity func args dest destTy t u hT hPN)
+        · rw [hPN]; trivial
+        · exact hProjArity func args dest destTy t u hT hPN
       have hCall := evalLoweredTerminator_call_refines_evalTerminator
         (sIdx := tStmts.length) (span := span) (inCleanup := b.isCleanup)
         hLayouts hDecls hUb hCallTgt hRef hCorr hRel1 h hDestOk
@@ -19281,10 +19320,15 @@ structure LLinkedCallee : Type where
   body : LBody
 
 /-- Multi-callee call table (`CallTable` in `crates/anneal-mir/src/lower/cfg.rs`), keyed by
-`(sym, typeArgs)` with bounded nested callee depth `maxCallDepth`. -/
+`(sym, typeArgs)` with bounded nested callee depth `maxCallDepth` and optional cross-frame pointer
+isolation hooks (`crossFrameArgOk`, `crossFrameRetOk` — mirroring `enter_callee`'s and
+`complete_call_return`'s `frame_local_pointer` check over `max(caller_locals, callee_locals)`,
+`[adv ep2-A2]`). -/
 structure LCallTable : Type where
   lookup : String → List RigidTy → Option LLinkedCallee
   maxCallDepth : Nat := 64
+  crossFrameArgOk : Nat → Nat → Value → Bool := fun _ _ _ => true
+  crossFrameRetOk : Nat → Nat → Value → Bool := fun _ _ _ => true
 
 /-- Linked-callee-aware `Operand -> Option LCallTarget` extractor for `V2026_06_01`
 (`classify_linked_call_target_v2026_06_01`). -/
@@ -19417,7 +19461,9 @@ def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Opti
                 if target.isSome && !st.activeEnv.inhabited destTy then none else
                 if table.maxCallDepth ≤ st.stack.length then
                   some (.done (.maxCallDepthExceeded st.bb table.maxCallDepth))
-                else if avs.length ≠ callee.argCount then none else
+                else if avs.length ≠ callee.argCount || callee.localCount = 0 ||
+                    !(avs.all (table.crossFrameArgOk slots2.length callee.localCount)) then none
+                else
                 match callee.body.blocks[0]? with
                 | none => none
                 | some entryBlock =>
@@ -19458,7 +19504,9 @@ def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Opti
               match caller.returnTarget with
               | none => none
               | some retBb =>
-                if !caller.callerEnv.wf v then none else
+                if !(caller.callerEnv.wf v &&
+                    table.crossFrameRetOk caller.slotsAfterArgs.length slots1.length v) then none
+                else
                 match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
                     caller.destination caller.destTy v with
                 | .ok callerSlots' =>
@@ -19482,7 +19530,9 @@ def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Opti
             match caller.returnTarget with
             | none => none
             | some retBb =>
-              if !caller.callerEnv.wf v then none else
+              if !(caller.callerEnv.wf v &&
+                  table.crossFrameRetOk caller.slotsAfterArgs.length slots1.length v) then none
+              else
               match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
                   caller.destination caller.destTy v with
               | .ok callerSlots' =>
@@ -19560,8 +19610,8 @@ structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
       body.blocks[i]? = some b →
       b.terminator = .call func args dest dty t u →
       dest.projection ≠ [] →
-      env.arityOf = fun _ _ _ => none) := by
-    intros; first | rfl | contradiction
+      NoUninitExplosionOnProj env.arityOf dty dest.projection) := by
+    intros; first | exact noUninitExplosionOnProj_of_eq_none rfl _ _ | trivial | contradiction
 
 /-- Correspondence between Anneal's `LCallTable` and Trusted's `Memory.callees` / `traitImpls`. -/
 structure CallTableCorr (table : LCallTable) (rootCm : CapturedMir)
@@ -19585,7 +19635,7 @@ structure CallerFrameCorr (table : LCallTable) (rootCm : CapturedMir)
   body : MultiBodyCorr table rootCm sharedLayouts sharedGlobals cf.callerEnv cf.callerBody tf.callerBody
   slots : SlotsRefine SlotBelow cf.slotsAfterArgs tf.frame.locals
   destEq : cf.destination = tf.destination
-  destOk : cf.destination.projection = [] ∨ cf.callerEnv.arityOf = fun _ _ _ => none
+  destOk : NoUninitExplosionOnProj cf.callerEnv.arityOf cf.destTy cf.destination.projection
   unwindEq : cf.returnUnwind = tf.returnUnwind
   targetRel :
     match cf.returnTarget with
@@ -19830,7 +19880,9 @@ private theorem returnPop_refines_trusted
         match caller.returnTarget with
         | none => none
         | some retBb =>
-          if !caller.callerEnv.wf v then none else
+          if !(caller.callerEnv.wf v &&
+              table.crossFrameRetOk caller.slotsAfterArgs.length slots1.length v) then none
+          else
           match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
               caller.destination caller.destTy v with
           | .ok callerSlots' =>
@@ -20294,11 +20346,11 @@ theorem stepLoweredWithCallTable_refines_trusted
             obtain ⟨_, rfl⟩ := terminateLCallStack_eq_some h
             exact ⟨sEnd, hRun1, by rw [hStepEnd]; rfl⟩
         | call func args dest destTy target unwind =>
-          have hDestOk : dest.projection = [] ∨ st.activeEnv.arityOf = fun _ _ _ => none := by
+          have hDestOk : NoUninitExplosionOnProj st.activeEnv.arityOf destTy dest.projection := by
             by_cases hPN : dest.projection = []
-            · exact Or.inl hPN
-            · exact Or.inr (hCorr.body.projCallArity st.bb block func args dest destTy target
-                unwind hb hT hPN)
+            · rw [hPN]; trivial
+            · exact hCorr.body.projCallArity st.bb block func args dest destTy target
+                unwind hb hT hPN
           rw [hT] at h hRef hStepEnd
           obtain ⟨hArgsND, _hDestNoDeref, defPath, typeArgs, layoutIdx, rfl, hCallDisj⟩ := hRef
           rw [hCorr.body.callTargetLinked] at h
@@ -24499,5 +24551,734 @@ theorem witness_maxCallDepth_checkpoint :
   obtain ⟨s', activeCm', st', hRun, hC, hBb, _, hLen⟩ :=
     runLoweredWithCallTable_refines_trusted 12 stRoot sRoot witnessRootCm _ hCorr hDepth1
   exact ⟨hDepth1, s', activeCm', st', hRun, hC, hBb, hLen⟩
+
+
+/-! ### Section 5i: `[adv ep2-A2]` Per-Projection `NoUninitExplosionOnProj`, Exact Abort-Site Characterization, `slotsAfterArgs` / `restoreCallerProtectors` Invariants, Cross-Frame Pointer Isolation, and Witness Suite 10
+
+`[adv ep2-A2]` hardening of `B2` (`7b18d19e`) across multi-callee `LCallTable` execution:
+1. **Per-projection `NoUninitExplosionOnProj` (resolving `B2` Critique #5).** `projCallArity` in
+   `BodyCorr`, `BodyCorrWithStmts`, `MultiBodyCorr`, and `CallerFrameCorr.destOk` no longer forces
+   `env.arityOf = fun _ _ _ => none` across the whole body whenever any `.call` destination is
+   projected: it requires `NoUninitExplosionOnProj env.arityOf destTy dest.projection` at each call
+   site, so a body with `env.arityOf = tupleArityOf` retains full statement-level tuple shell writes
+   while `.call`ing into projected scalar/non-shell fields (`_1.1 : u32`).
+2. **Exact `terminateLCallStack` characterization (`terminateLCallStack_eq_some_iff`).** Strengthens
+   `B2`'s existential `terminateLCallStack_eq_some` (`∃ bb'`) to an exact `↔`: every frame on
+   `stack` passes `unwindActionOk` and the reported block is
+   `((stack.getLast?.map LCallerFrame.callBb).getD bb)` (the outermost caller's call site).
+3. **Cross-frame synthetic local pointer isolation (`hasFrameLocalPointer`, `crossFrameValueOk`).**
+   Formalizes Episode 1's `frame_local_pointer` (`crates/anneal-mir/src/lower/cfg.rs:1284-1315`) and
+   wires `crossFrameArgOk` / `crossFrameRetOk` + `callee.localCount ≥ 1` into `LCallTable` and
+   `stepLoweredWithCallTable`.
+4. **Live caller state (`caller.slotsAfterArgs`) & `restoreCallerProtectors` invariants (`B2` Open
+   Item #1).** `unwindLCallStack_cleanup_exact` proves across arbitrary intermediate `.continue_`
+   frames that `.cleanup cleanupBb` resumes the catching caller with its exact post-argument
+   `slotsAfterArgs` (preserving `Operand.move` deinitializations and `PartialShell` caller slots)
+   while Trusted restores `tfCatch.frame.locals` and `restoreCallerProtectors tfCatch`.
+5. **Witness Suite 10 (`witness_diverging_proj_move_cleanup_and_protectors`, closing `B2` Open Items
+   #1 & #2).** Exercises (a) a **diverging** linked call into a projected `PartialShell` field
+   `_1.1` with `Operand.move _2`, catching the callee panic in `.cleanup 1` where moved `_2` faults
+   (`.ub`), `_1.0` survives (`100`), and a **nested linked call from inside the cleanup block**
+   (`inCleanup = true, unwinding = some 0`) returns into `bb2: unwindResume`; (b) a root body with
+   non-trivial `arityOf := tupleArityOf` calling `mid -> leaf` (2-deep) into projected `_1.1` while
+   preserving non-empty `activeProtectors = [7, 11]` via `restoreCallerProtectors`; and (c)
+   `crossFrameValueOk` rejecting frame-local pointer arguments/returns (`allocId ∈ 1..=limit`) while
+   allowing global-provenance pointers (`allocId = 100`) and refining `TrustedRun`. -/
+
+/-- **Exact outermost-call-site characterization of `terminateLCallStack`
+(`terminateLCallStack_eq_some_iff`)**: `terminateLCallStack bb stack = some m` iff every frame on
+`stack` passes `unwindActionOk` and `m` reports `((stack.getLast?.map LCallerFrame.callBb).getD bb)`. -/
+theorem terminateLCallStack_eq_some_iff : ∀ {bb : Nat} {stack : List LCallerFrame}
+    {m : LMultiCfgStep},
+    terminateLCallStack bb stack = some m ↔
+      (∀ cf ∈ stack, unwindActionOk cf.callerBody cf.inCleanup cf.returnUnwind = true) ∧
+      m = .done (.terminated ((stack.getLast?.map LCallerFrame.callBb).getD bb))
+  | bb, [], m => by
+    constructor
+    · intro h
+      simp only [terminateLCallStack, Option.some.injEq] at h
+      exact And.intro (fun _ hm => by cases hm) h.symm
+    · rintro ⟨_, hM⟩
+      subst hM
+      rfl
+  | bb, caller :: restStack, m => by
+    unfold terminateLCallStack
+    have hLast :
+        ((caller :: restStack).getLast?.map LCallerFrame.callBb).getD bb =
+          (restStack.getLast?.map LCallerFrame.callBb).getD caller.callBb := by
+      cases restStack with
+      | nil => rfl
+      | cons x xs =>
+        have hNE : x :: xs ≠ [] := List.cons_ne_nil x xs
+        simp only [List.getLast?_cons_cons, List.getLast?_eq_some_getLast hNE, Option.map_some,
+          Option.getD_some]
+    rw [hLast]
+    cases hOk : unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind with
+    | false =>
+      simp only [Bool.not_false, ↓reduceIte, reduceCtorEq, false_iff, not_and]
+      intro hAll _
+      have := hAll caller (.head restStack)
+      rw [hOk] at this
+      nomatch this
+    | true =>
+      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+      rw [terminateLCallStack_eq_some_iff]
+      constructor
+      · rintro ⟨hRest, hm⟩
+        refine ⟨fun cf hMem => ?_, hm⟩
+        rcases List.mem_cons.mp hMem with rfl | hIn
+        · exact hOk
+        · exact hRest cf hIn
+      · rintro ⟨hAll, hm⟩
+        exact ⟨fun cf hIn => hAll cf (.tail caller hIn), hm⟩
+
+mutual
+/-- Recursive check (`frame_local_pointer` in `crates/anneal-mir/src/lower/cfg.rs:1284-1315`)
+detecting whether `v` carries at any aggregate nesting depth a pointer whose synthetic provenance
+(`ptrAllocId? ptr`) names a frame-local allocation `1 ≤ id ≤ limit`. -/
+def hasFrameLocalPointer (ptrAllocId? : ProvenancePtr → Option Nat) (limit : Nat) : Value → Bool
+  | .unit | .scalar _ => false
+  | .ptr p _ =>
+    match ptrAllocId? p with
+    | some id => decide (1 ≤ id ∧ id ≤ limit)
+    | none => false
+  | .aggregate _ fields => hasFrameLocalPointerList ptrAllocId? limit fields
+
+/-- Pointwise disjunction of `hasFrameLocalPointer` across aggregate `fields`. -/
+def hasFrameLocalPointerList (ptrAllocId? : ProvenancePtr → Option Nat) (limit : Nat) :
+    List Value → Bool
+  | [] => false
+  | v :: vs =>
+    hasFrameLocalPointer ptrAllocId? limit v || hasFrameLocalPointerList ptrAllocId? limit vs
+end
+
+/-- Cross-frame value isolation (`enter_callee` / `complete_call_return` in `cfg.rs`): a value
+crossing between a caller with `callerLocals` locals and a linked callee with `calleeLocals` locals
+must carry no pointer into synthetic local allocations `1 ..= max callerLocals calleeLocals`. -/
+def crossFrameValueOk (ptrAllocId? : ProvenancePtr → Option Nat)
+    (callerLocals calleeLocals : Nat) (v : Value) : Bool :=
+  !hasFrameLocalPointer ptrAllocId? (max callerLocals calleeLocals) v
+
+/-- Exact characterization of `crossFrameValueOk` on thin pointers: accepted iff provenance is
+absent, `0`, or strictly above `max callerLocals calleeLocals`. -/
+theorem crossFrameValueOk_ptr_iff (ptrAllocId? : ProvenancePtr → Option Nat)
+    (callerLocals calleeLocals : Nat) (p : ProvenancePtr) (sz : Nat) :
+    crossFrameValueOk ptrAllocId? callerLocals calleeLocals (.ptr p sz) = true ↔
+      ∀ id, ptrAllocId? p = some id → id = 0 ∨ max callerLocals calleeLocals < id := by
+  simp only [crossFrameValueOk, hasFrameLocalPointer]
+  cases hP : ptrAllocId? p with
+  | none => simp
+  | some id =>
+    simp only [Option.some.injEq, Bool.not_eq_true', decide_eq_false_iff_not]
+    constructor
+    · intro hNot id' hEq; subst hEq; omega
+    · intro hImp; have := hImp id rfl; omega
+
+/-- **Exact multi-frame `.cleanup` unwinding & `slotsAfterArgs` / `restoreCallerProtectors`
+theorem (`unwindLCallStack_cleanup_exact`)**: across any prefix `pre` of `.continue_` caller frames
+above a catching `.cleanup cleanupBb` frame `(cfCatch, tfCatch)`:
+1. `unwindLCallStack` pops `pre` and resumes `cfCatch` at `cleanupBb` with `slots = cfCatch.slotsAfterArgs`
+   and `unwinding = some cfCatch.callBb` (matching Episode 1's live caller state in `eval_frames`,
+   which evaluated `func` and `args` — including `Operand.move` deinitializations — before pushing
+   the callee and never mutated caller frames below the top frame);
+2. `Trusted.unwindFromCallStack` pops `tPre` and resumes `tfCatch` at `cleanupBb` with
+   `locals = tfCatch.frame.locals` and `activeProtectors = restoreCallerProtectors tfCatch`. -/
+theorem unwindLCallStack_cleanup_exact :
+    ∀ (pre : List LCallerFrame) (tPre : List SavedCallerFrame)
+      (cfCatch : LCallerFrame) (tfCatch : SavedCallerFrame)
+      (restCfs : List LCallerFrame) (restTfs : List SavedCallerFrame)
+      (panicBb cleanupBb : Nat) (mem : Memory),
+      pre.length = tPre.length →
+      (∀ (i : Nat) (cf : LCallerFrame) (tf : SavedCallerFrame),
+        pre[i]? = some cf → tPre[i]? = some tf →
+        unwindActionOk cf.callerBody cf.inCleanup cf.returnUnwind = true ∧
+          cf.returnUnwind = .continue_ ∧ tf.returnUnwind = .continue_ ∧ cf.unwinding = none) →
+      unwindActionOk cfCatch.callerBody cfCatch.inCleanup cfCatch.returnUnwind = true →
+      cfCatch.returnUnwind = .cleanup cleanupBb →
+      tfCatch.returnUnwind = .cleanup cleanupBb →
+      cfCatch.unwinding = none →
+      cfgGoto cfCatch.callerBody cleanupBb cfCatch.slotsAfterArgs (some cfCatch.callBb) =
+        some (.goto cleanupBb cfCatch.slotsAfterArgs (some cfCatch.callBb)) →
+      unwindLCallStack panicBb (pre ++ cfCatch :: restCfs) =
+        some (.next ⟨cfCatch.callerEnv, cfCatch.callerBody, cleanupBb, cfCatch.slotsAfterArgs,
+          some cfCatch.callBb, restCfs⟩) ∧
+      unwindFromCallStack (tPre ++ tfCatch :: restTfs) mem =
+        .running {
+          frame := { tfCatch.frame with blockIdx := cleanupBb, stmtIdx := 0 }
+          memory := { mem with
+                      callStack := restTfs
+                      activeCallee := some tfCatch.callerBody
+                      activeProtectors := restoreCallerProtectors tfCatch } }
+  | [], [], cfCatch, tfCatch, restCfs, restTfs, panicBb, cleanupBb, mem, _, _,
+      hOkC, hUC, hTUC, hUnwC, hGotoC => by
+    rw [hUC] at hOkC
+    simp only [List.nil_append]
+    unfold unwindLCallStack unwindFromCallStack
+    simp only [hUC, hTUC, hOkC, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+      hUnwC, Option.isSome_none, hGotoC, and_self]
+  | _ :: _, [], _, _, _, _, _, _, _, hLen, _, _, _, _, _, _ => nomatch hLen
+  | [], _ :: _, _, _, _, _, _, _, _, hLen, _, _, _, _, _, _ => nomatch hLen
+  | cf :: pre, tf :: tPre, cfCatch, tfCatch, restCfs, restTfs, panicBb, cleanupBb, mem,
+      hLen, hPre, hOkC, hUC, hTUC, hUnwC, hGotoC => by
+    obtain ⟨hOk0, hU0, hTU0, hUnw0⟩ := hPre 0 cf tf rfl rfl
+    have hSub := unwindLCallStack_cleanup_exact pre tPre cfCatch tfCatch restCfs restTfs
+      cf.callBb cleanupBb
+      { mem with
+        callStack := tPre ++ tfCatch :: restTfs
+        activeCallee := some tf.callerBody
+        activeProtectors := restoreCallerProtectors tf }
+      (Nat.succ.inj hLen)
+      (fun i c t hc ht => hPre (i + 1) c t hc ht)
+      hOkC hUC hTUC hUnwC hGotoC
+    rw [hU0] at hOk0
+    unfold unwindLCallStack unwindFromCallStack
+    simp only [List.cons_append, hU0, hTU0, hOk0, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+      hUnw0, Option.isSome_none]
+    exact ⟨hSub.1, by simpa using hSub.2⟩
+
+/-- Multi-frame projected `Deinit` statement bridge: executing `[Deinit(place)]` (`place.projection ≠ []`)
+at the start of basic block `bb` in an active root or linked callee body (`activeCallee.getD rootCm = cm`)
+steps `stepMirFn rootCm` to `stmtIdx = 1` while preserving `SlotsRefine SlotBelow`. -/
+theorem stepMirFn_multi_deinit_projected_trustedRun {rootCm cm : CapturedMir} {bb : Nat}
+    {ts : Bool} {slots slots1 : List LocalSlotState} {place : Place} {span : String}
+    {term : Terminator} {isCleanup : Bool} {s : MachineState} {rootVal tv : Value}
+    (hPhase : ∀ tag, cm.phase ≠ .other tag)
+    (hBlock : s.frame.blockIdx = bb) (hStmt0 : s.frame.stmtIdx = 0)
+    (hAct : s.memory.activeCallee.getD rootCm = cm)
+    (hSlots : SlotsRefine SlotBelow slots s.frame.locals)
+    (hcm : cm.basicBlocks[bb]? = some ⟨[⟨.deinit place, span⟩], term, isCleanup⟩)
+    (hProj : place.projection ≠ [])
+    (hDeinit : evalDeinitPlace ts slots place = some slots1)
+    (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
+    (hTRead : readProjectedValue s.frame.locals rootVal place.projection = .ok tv) :
+    TrustedRun rootCm s { s with frame := ⟨bb, 1, s.frame.locals⟩ } ∧
+      SlotsRefine SlotBelow slots1 s.frame.locals := by
+  obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_projected_refines (s := s) (span := span)
+    (localDecls := cm.localDecls) (layouts := cm.layouts) hSlots hProj hDeinit hTRoot hTRead
+  refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
+  unfold stepMirFn
+  dsimp only
+  rw [hAct]
+  split
+  · rename_i tag hP
+    exact absurd hP (hPhase tag)
+  · simp only [get?_eq_getElem?, hBlock, hcm, hStmt0, List.getElem?_cons_zero]
+    rw [hStmt]
+    simp only [advanceStmt, hBlock, hStmt0]
+
+/-! #### Witness Suite 10 (`[adv ep2-A2]`): Diverging Projected Call + `Operand.move` + Cleanup-Block Linked Call, `tupleArityOf` Coexistence + `restoreCallerProtectors`, and Cross-Frame Pointer Isolation -/
+
+/-- `panic_take_u32(x: u32) -> !`: 1-argument diverging linked callee that panics via `core::panicking::panic`. -/
+def witnessPanicTakeU32Body : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::panicking::panic" []) [] ⟨0, []⟩ ep2TyNever none .continue_,
+       false⟩ ]⟩
+
+def witnessPanicTakeU32Decls : List LocalDecl := [ep2Decl ep2TyNever, ep2Decl ep2TyU32]
+
+/-- `cleanup_inc(x: u32) -> u32`: 1-argument linked helper called from inside a cleanup block! -/
+def witnessCleanupIncBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::wrapping_add" [.uint .u32])
+         [.copy ⟨1, []⟩, ep2ConstSc ep2TyU32 1 4] ⟨0, []⟩ ep2TyU32 (some 1) .terminate, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- `id_ptr(p: *const u32) -> *const u32`: 1-argument linked identity callee (`bb0: return` with
+`_0` or `_1` copied via `arith_offset(p, 0)`). -/
+def witnessIdPtrBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::arith_offset" [.uint .u32])
+         [.copy ⟨1, []⟩, ep2ConstSc ep2TyIsize 0 8] ⟨0, []⟩ ep2TyRawConstU32 (some 1) .continue_,
+       false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- `ret_local_ptr() -> *const u32`: linked callee returning a synthetic frame-local pointer
+`.ptr ⟨2, 0⟩ 8` (`allocId = 2 ≤ max callerLocals calleeLocals`) loaded from a local slot. -/
+def witnessRetPtrBody : LBody := ⟨[ ⟨[], .return_, false⟩ ]⟩
+
+def witnessIdPtrDecls : List LocalDecl := [ep2Decl ep2TyRawConstU32, ep2Decl ep2TyRawConstU32]
+
+def witnessA2Syms : List DefPath :=
+  ["witness::leaf", "witness::mid", "witness::panic_take_u32", "witness::cleanup_inc",
+   "witness::id_ptr"]
+
+private def witnessA2CallTargetOf (func : Operand) : Option LCallTarget :=
+  match extractCalleeDefPath? func with
+  | some defPath =>
+    let typeArgs := extractCalleeTypeArgs func
+    some (classifyLinkedCallTarget_V2026_06_01
+      (typeArgs.isEmpty && witnessA2Syms.any (stringEq defPath)) defPath typeArgs)
+  | none => none
+
+def witnessA2Env (decls : List LocalDecl) : CfgEnv :=
+  { ep2MakeEnv decls with callTargetOf := witnessA2CallTargetOf }
+
+private def ep2a2PtrAllocId? (p : ProvenancePtr) : Option Nat :=
+  if p.allocId = 0 then none else some p.allocId
+
+def witnessA2Table (isolatePtrs : Bool := false) : LCallTable where
+  maxCallDepth := 8
+  crossFrameArgOk :=
+    if isolatePtrs then crossFrameValueOk ep2a2PtrAllocId? else fun _ _ _ => true
+  crossFrameRetOk :=
+    if isolatePtrs then crossFrameValueOk ep2a2PtrAllocId? else fun _ _ _ => true
+  lookup sym typeArgs :=
+    if !typeArgs.isEmpty then none
+    else if stringEq sym "witness::leaf" then
+      some ⟨1, 2, witnessA2Env witnessDecls2U32, witnessLeafBody⟩
+    else if stringEq sym "witness::mid" then
+      some ⟨1, 2, witnessA2Env witnessDecls2U32, witnessMidBody⟩
+    else if stringEq sym "witness::panic_take_u32" then
+      some ⟨1, 2, witnessA2Env witnessPanicTakeU32Decls, witnessPanicTakeU32Body⟩
+    else if stringEq sym "witness::cleanup_inc" then
+      some ⟨1, 2, witnessA2Env witnessDecls2U32, witnessCleanupIncBody⟩
+    else if stringEq sym "witness::id_ptr" then
+      some ⟨1, 2, witnessA2Env witnessIdPtrDecls, witnessIdPtrBody⟩
+    else none
+
+private theorem witnessA2CallTargetOf_eq (isolatePtrs : Bool) :
+    witnessA2CallTargetOf =
+      extractLinkedLCallTarget_V2026_06_01? (witnessA2Table isolatePtrs) := by
+  funext func
+  unfold witnessA2CallTargetOf extractLinkedLCallTarget_V2026_06_01?
+  cases extractCalleeDefPath? func with
+  | none => rfl
+  | some dp =>
+    dsimp only
+    have hIsSome :
+        ((witnessA2Table isolatePtrs).lookup dp (extractCalleeTypeArgs func)).isSome =
+          ((extractCalleeTypeArgs func).isEmpty && witnessA2Syms.any (stringEq dp)) := by
+      unfold witnessA2Table witnessA2Syms
+      simp only [List.any_cons, List.any_nil, Bool.or_false]
+      cases (extractCalleeTypeArgs func).isEmpty <;>
+        cases stringEq dp "witness::leaf" <;>
+        cases stringEq dp "witness::mid" <;>
+        cases stringEq dp "witness::panic_take_u32" <;>
+        cases stringEq dp "witness::cleanup_inc" <;>
+        cases stringEq dp "witness::id_ptr" <;> rfl
+    rw [hIsSome]
+
+private def witnessA2Callees : List CapturedMir :=
+  [ ep2MakeCaptured "witness::leaf" 1 witnessDecls2U32 witnessLeafBody
+  , ep2MakeCaptured "witness::mid" 1 witnessDecls2U32 witnessMidBody
+  , ep2MakeCaptured "witness::panic_take_u32" 1 witnessPanicTakeU32Decls witnessPanicTakeU32Body
+  , ep2MakeCaptured "witness::cleanup_inc" 1 witnessDecls2U32 witnessCleanupIncBody
+  , ep2MakeCaptured "witness::id_ptr" 1 witnessIdPtrDecls witnessIdPtrBody ]
+
+private theorem witnessA2Table_corr (rootCm : CapturedMir) (isolatePtrs : Bool) :
+    CallTableCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable [] witnessA2Callees [] where
+  linked dp tys callee hLk := by
+    have hCT := witnessA2CallTargetOf_eq isolatePtrs
+    have hLeaf : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
+        (witnessA2Env witnessDecls2U32) witnessLeafBody
+        (ep2MakeCaptured "witness::leaf" 1 witnessDecls2U32 witnessLeafBody) := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
+      simp only [witnessLeafBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, trivial⟩
+    have hMid : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
+        (witnessA2Env witnessDecls2U32) witnessMidBody
+        (ep2MakeCaptured "witness::mid" 1 witnessDecls2U32 witnessMidBody) := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
+      simp only [witnessMidBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl | rfl
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, ep2a1_ops_nonDeref _ rfl, rfl, "witness::leaf", [], 0, rfl, Or.inl rfl⟩
+      · exact ⟨rfl, trivial⟩
+    have hPan : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
+        (witnessA2Env witnessPanicTakeU32Decls) witnessPanicTakeU32Body
+        (ep2MakeCaptured "witness::panic_take_u32" 1 witnessPanicTakeU32Decls
+          witnessPanicTakeU32Body) := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
+      simp only [witnessPanicTakeU32Body, List.mem_cons, List.not_mem_nil, or_false] at hb
+      subst hb
+      exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+        (by decide) (fun _ hm => nomatch hm) rfl⟩
+    have hCln : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
+        (witnessA2Env witnessDecls2U32) witnessCleanupIncBody
+        (ep2MakeCaptured "witness::cleanup_inc" 1 witnessDecls2U32 witnessCleanupIncBody) := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
+      simp only [witnessCleanupIncBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, trivial⟩
+    have hIdP : MultiBodyCorr (witnessA2Table isolatePtrs) rootCm emptyLayoutTable []
+        (witnessA2Env witnessIdPtrDecls) witnessIdPtrBody
+        (ep2MakeCaptured "witness::id_ptr" 1 witnessIdPtrDecls witnessIdPtrBody) := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ hCT (fun b hb => ?_)
+      simp only [witnessIdPtrBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact ⟨rfl, LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+          (by decide) (ep2a1_ops_nonDeref _ rfl) rfl⟩
+      · exact ⟨rfl, trivial⟩
+    unfold witnessA2Table at hLk
+    cases hE : tys.isEmpty with
+    | false => simp [hE] at hLk
+    | true =>
+      have hNil : tys = [] := List.isEmpty_iff.mp hE
+      subst hNil
+      simp only [List.isEmpty_nil, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hLk
+      by_cases h1 : stringEq dp "witness::leaf" = true
+      · obtain rfl := stringEq_eq_true_iff.mp h1
+        simp only [h1, ↓reduceIte, Option.some.injEq] at hLk; subst hLk
+        exact ⟨_, by with_unfolding_all rfl, rfl, hLeaf⟩
+      · simp only [Bool.not_eq_true] at h1; simp only [h1, Bool.false_eq_true, ↓reduceIte] at hLk
+        by_cases h2 : stringEq dp "witness::mid" = true
+        · obtain rfl := stringEq_eq_true_iff.mp h2
+          simp only [h2, ↓reduceIte, Option.some.injEq] at hLk; subst hLk
+          exact ⟨_, by with_unfolding_all rfl, rfl, hMid⟩
+        · simp only [Bool.not_eq_true] at h2; simp only [h2, Bool.false_eq_true, ↓reduceIte] at hLk
+          by_cases h3 : stringEq dp "witness::panic_take_u32" = true
+          · obtain rfl := stringEq_eq_true_iff.mp h3
+            simp only [h3, ↓reduceIte, Option.some.injEq] at hLk; subst hLk
+            exact ⟨_, by with_unfolding_all rfl, rfl, hPan⟩
+          · simp only [Bool.not_eq_true] at h3; simp only [h3, Bool.false_eq_true, ↓reduceIte] at hLk
+            by_cases h4 : stringEq dp "witness::cleanup_inc" = true
+            · obtain rfl := stringEq_eq_true_iff.mp h4
+              simp only [h4, ↓reduceIte, Option.some.injEq] at hLk; subst hLk
+              exact ⟨_, by with_unfolding_all rfl, rfl, hCln⟩
+            · simp only [Bool.not_eq_true] at h4; simp only [h4, Bool.false_eq_true, ↓reduceIte] at hLk
+              by_cases h5 : stringEq dp "witness::id_ptr" = true
+              · obtain rfl := stringEq_eq_true_iff.mp h5
+                simp only [h5, ↓reduceIte, Option.some.injEq] at hLk; subst hLk
+                exact ⟨_, by with_unfolding_all rfl, rfl, hIdP⟩
+              · simp only [Bool.not_eq_true] at h5; simp [h5] at hLk
+  unlinkedIntrinsic _ _ _ _ hIntr :=
+    lookupCallee_none_of_lowerIntrinsicKind (by decide) rfl hIntr
+
+/-- Part (a) root body (`decls = [_0: !, _1: (u32, u32), _2: u32, _3: u32]`):
+- `bb0` (`isCleanup = false`): `Deinit(_1.1)` (`_1` becomes `PartialShell (100, uninit)`); then
+  **diverging** linked call `panic_take_u32(move _2)` with **projected destination `_1.1`**,
+  `target = none`, `unwind = .cleanup 1`;
+- `bb1` (`isCleanup = true`): nested linked call `cleanup_inc(copy _1.0) -> [return: bb2, unwind: terminate]`
+  into `_3` (proving `_1.0` survived inside `_1`'s `PartialShell` and linked calls work inside
+  cleanup blocks with `unwinding = some 0`);
+- `bb2` (`isCleanup = true`): `unwindResume`. -/
+def witnessDivProjCleanupRootBody : LBody :=
+  ⟨[ ⟨[⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩],
+      .call (ep2FnOp "witness::panic_take_u32" []) [.move ⟨2, []⟩]
+        ⟨1, [.field 1 ep2TyU32]⟩ ep2TyU32 none (.cleanup 1), false⟩
+   , ⟨[], .call (ep2FnOp "witness::cleanup_inc" []) [.copy ⟨1, [.field 0 ep2TyU32]⟩]
+        ⟨3, []⟩ ep2TyU32 (some 2) .terminate, true⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+def witnessDivProjCleanupDecls : List LocalDecl :=
+  [ep2Decl ep2TyNever, ep2Decl ep2a1TyPairU32, ep2Decl ep2TyU32, ep2Decl ep2TyU32]
+
+def witnessDivProjCleanupEnv : CfgEnv :=
+  { witnessA2Env witnessDivProjCleanupDecls with evalStmts := evalSingleReadableProjDeinitStmts }
+
+def witnessDivProjCleanupCm : CapturedMir :=
+  ep2MakeCaptured "witness::div_proj_cleanup_root" 0 witnessDivProjCleanupDecls
+    witnessDivProjCleanupBody
+where
+  witnessDivProjCleanupBody := witnessDivProjCleanupRootBody
+
+private theorem witnessDivProjCleanup_multiBodyCorr :
+    MultiBodyCorr (witnessA2Table false) witnessDivProjCleanupCm emptyLayoutTable []
+      witnessDivProjCleanupEnv witnessDivProjCleanupRootBody witnessDivProjCleanupCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessA2CallTargetOf_eq false
+  block i b hb := by
+    match i with
+    | 0 =>
+      simp only [witnessDivProjCleanupRootBody, List.getElem?_cons_zero, Option.some.injEq] at hb
+      subst hb
+      refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::panic_take_u32", [], 0, rfl, Or.inl rfl⟩,
+        [⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩], "", rfl,
+        fun slots slots1 s hB hS hAct _ hRel hEv => ?_⟩
+      simp only [witnessDivProjCleanupEnv, evalSingleReadableProjDeinitStmts] at hEv
+      cases hRd : readPlaceState slots ⟨1, [.field 1 ep2TyU32]⟩ with
+      | ub => rw [hRd] at hEv; nomatch hEv
+      | unsupported => rw [hRd] at hEv; nomatch hEv
+      | ok tv =>
+        rw [hRd] at hEv
+        dsimp only at hEv
+        obtain ⟨rootVal, htRoot, htRead⟩ := readPlaceState_below_refines hRel hRd
+        have htRoot' : s.frame.locals[1]? = some (.init rootVal) := by
+          simpa [get?_eq_getElem?] using htRoot
+        have hStep := stepMirFn_multi_deinit_projected_trustedRun
+          (rootCm := witnessDivProjCleanupCm) (cm := witnessDivProjCleanupCm)
+          (fun _ h => nomatch h) hB hS hAct hRel rfl (by decide) hEv htRoot' htRead
+        exact ⟨s.frame.locals, hStep.1, hStep.2⟩
+    | 1 =>
+      simp only [witnessDivProjCleanupRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::cleanup_inc", [], 0, rfl, Or.inl rfl⟩,
+        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      injection hEv with hEq; subst hEq
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
+      simp only at hB hS; subst hB hS; exact .refl _
+    | 2 =>
+      simp only [witnessDivProjCleanupRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      injection hEv with hEq; subst hEq
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
+      simp only at hB hS; subst hB hS; exact .refl _
+    | n + 3 =>
+      simp [witnessDivProjCleanupRootBody] at hb
+
+/-- Part (b) root body with **non-trivial `arityOf := tupleArityOf`**: calls 2-deep `mid(84)` (`mid ->
+leaf`, returning `(84 / 2) + 10 = 52`) into projected tuple field `_1.1`, then adds `_1.0 + _1.1`
+(`7 + 52 = 59`) into `_0` and returns, while preserving non-empty `activeProtectors = [7, 11]`. -/
+def witnessTupleArityProj2DeepBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::mid" []) [ep2ConstSc ep2TyU32 84 4]
+        ⟨1, [.field 1 ep2TyU32]⟩ ep2TyU32 (some 1) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::wrapping_add" [.uint .u32])
+        [.copy ⟨1, [.field 0 ep2TyU32]⟩, .copy ⟨1, [.field 1 ep2TyU32]⟩]
+        ⟨0, []⟩ ep2TyU32 (some 2) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+def witnessTupleArityProj2DeepEnv : CfgEnv :=
+  { witnessA2Env witnessProjCallerRootDecls with arityOf := tupleArityOf }
+
+def witnessTupleArityProj2DeepCm : CapturedMir :=
+  ep2MakeCaptured "witness::tuple_arity_proj_2deep" 0 witnessProjCallerRootDecls
+    witnessTupleArityProj2DeepBody
+
+private theorem witnessTupleArityProj2Deep_multiBodyCorr :
+    MultiBodyCorr (witnessA2Table false) witnessTupleArityProj2DeepCm emptyLayoutTable []
+      witnessTupleArityProj2DeepEnv witnessTupleArityProj2DeepBody witnessTupleArityProj2DeepCm := by
+  refine
+    { phase := fun _ h => nomatch h
+      cmLayouts := rfl
+      envLayouts := rfl
+      envGlobals := rfl
+      localDecls := rfl
+      ubChecksTrue := rfl
+      callTargetLinked := witnessA2CallTargetOf_eq false
+      block := fun i b hb => ?_
+      projCallArity := fun i b func args dest dty t u hb hT hPN => ?_ }
+  · match i with
+    | 0 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_zero, Option.some.injEq] at hb
+      subst hb
+      refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::mid", [], 0, rfl, Or.inl rfl⟩,
+        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      injection hEv with hEq; subst hEq
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
+    | 1 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (by decide)
+        (by decide) (ep2a1_ops_nonDeref _ rfl) rfl,
+        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      injection hEv with hEq; subst hEq
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
+    | 2 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      injection hEv with hEq; subst hEq
+      refine ⟨s.frame.locals, ?_, hRel⟩
+      rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
+    | n + 3 =>
+      simp [witnessTupleArityProj2DeepBody] at hb
+  · match i with
+    | 0 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_zero, Option.some.injEq] at hb
+      subst hb
+      cases hT
+      exact ⟨rfl, trivial⟩
+    | 1 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      cases hT
+      exact absurd rfl hPN
+    | 2 =>
+      simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        Option.some.injEq] at hb
+      subst hb
+      nomatch hT
+    | n + 3 =>
+      simp [witnessTupleArityProj2DeepBody] at hb
+
+/-- Part (c) root body calling linked `id_ptr(copy _1)` into `_0` and returning. -/
+def witnessCrossPtrRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::id_ptr" []) [.copy ⟨1, []⟩]
+        ⟨0, []⟩ ep2TyRawConstU32 (some 1) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+def witnessCrossPtrRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::cross_ptr_root" 1 witnessIdPtrDecls witnessCrossPtrRootBody
+
+/-- **Concrete Non-Vacuity Witness 10 (`witness_diverging_proj_move_cleanup_and_protectors`)**:
+1. **Diverging Linked Call into Projected `PartialShell` + `Operand.move` + Cleanup-Block Linked
+   Call**: `bb0` runs `Deinit(_1.1)` (`_1 = PartialShell (100, uninit)`) and calls diverging
+   `panic_take_u32(move _2)` into `_1.1` with `.cleanup 1`; at cleanup entry `bb1`, moved `_2`
+   reads as `.ub`, `_1.0` reads as `100`, `_1.1` remains `.ub`, and `bb1` calls linked
+   `cleanup_inc(copy _1.0)` inside cleanup mode (`unwinding = some 0`), returning `101` into `bb2:
+   unwindResume` -> `.panicked 0` and refining `TrustedRun` -> `.retOutcome .panic`;
+2. **Non-Trivial `tupleArityOf` + 2-Deep Projected Linked Call + `restoreCallerProtectors`**:
+   `witnessTupleArityProj2DeepEnv` (`arityOf := tupleArityOf`) both materializes a `PartialShell`
+   when writing `_1.0` on an `.uninit` pair AND refines 2-deep `root -> mid -> leaf` into projected
+   `_1.1` returning `59` while preserving non-empty `activeProtectors = [7, 11]` across both callee
+   frames;
+3. **Cross-Frame Synthetic Local Pointer Isolation (`crossFrameValueOk`)**: under
+   `witnessA2Table true`, passing a frame-local pointer `.ptr ⟨1, 0⟩ 8` (`allocId = 1 ≤ 2`) to
+   linked `id_ptr` fails closed (`= none`), whereas passing global pointer `.ptr ⟨100, 0⟩ 8`
+   (`allocId = 100 > 2`) returns `some (.returned (.ptr ⟨100, 0⟩ 8))` and refines `TrustedRun`. -/
+theorem witness_diverging_proj_move_cleanup_and_protectors :
+    -- (a) Diverging projected call + move + cleanup-block linked call:
+    (let slots0 : List LocalSlotState :=
+       [.uninit, .init (.aggregate 0 [.scalar ⟨100, 4⟩, .scalar ⟨200, 4⟩]),
+        .init (.scalar ⟨77, 4⟩), .uninit]
+     let st0 : LMultiFrameState :=
+       { activeEnv := witnessDivProjCleanupEnv
+         activeBody := witnessDivProjCleanupRootBody
+         bb := 0, slots := slots0, unwinding := none, stack := [] }
+     let locs0 : List LocalSlot :=
+       [.uninit, .init (.aggregate 0 [.scalar ⟨100, 4⟩, .scalar ⟨200, 4⟩]),
+        .init (.scalar ⟨77, 4⟩), .uninit]
+     let s0 : MachineState :=
+       { (initMachineStateWithCallees witnessDivProjCleanupCm [] witnessA2Callees) with
+         frame := ⟨0, 0, locs0⟩ }
+     (∃ stClean,
+        runLoweredWithCallTable (witnessA2Table false) 2 st0 = some (.outOfFuel stClean) ∧
+        stClean.bb = 1 ∧ stClean.unwinding = some 0 ∧
+        readPlaceState stClean.slots ⟨2, []⟩ = .ub ∧
+        readPlaceState stClean.slots ⟨1, [.field 0 ep2TyU32]⟩ = .ok (.scalar ⟨100, 4⟩) ∧
+        readPlaceState stClean.slots ⟨1, [.field 1 ep2TyU32]⟩ = .ub) ∧
+     runLoweredWithCallTable (witnessA2Table false) 8 st0 = some (.panicked 0) ∧
+     (∃ s', TrustedRun witnessDivProjCleanupCm s0 s' ∧
+        stepMirFn witnessDivProjCleanupCm s' = .retOutcome .panic)) ∧
+    -- (b) Non-trivial `tupleArityOf` + 2-deep projected call + `restoreCallerProtectors`:
+    ((∃ sh, writePlaceState witnessTupleArityProj2DeepEnv.arityOf [.uninit, .uninit]
+        ⟨1, [.field 0 ep2TyU32]⟩ ep2a1TyPairU32 (.scalar ⟨10, 4⟩) =
+        .ok [.uninit, .partialShell sh]) ∧
+     let stB : LMultiFrameState :=
+       { activeEnv := witnessTupleArityProj2DeepEnv
+         activeBody := witnessTupleArityProj2DeepBody
+         bb := 0
+         slots := [.uninit, .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨99, 4⟩])]
+         unwinding := none, stack := [] }
+     let sB0 := initMachineStateWithCallees witnessTupleArityProj2DeepCm [] witnessA2Callees
+     let sB : MachineState :=
+       { frame := ⟨0, 0, [.uninit, .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨99, 4⟩])]⟩
+         memory := { sB0.memory with activeProtectors := [7, 11] } }
+     runLoweredWithCallTable (witnessA2Table false) 12 stB = some (.returned (.scalar ⟨59, 4⟩)) ∧
+     (∃ s', TrustedRun witnessTupleArityProj2DeepCm sB s' ∧
+        stepMirFn witnessTupleArityProj2DeepCm s' = .retNormal (.scalar ⟨59, 4⟩) s'.memory) ∧
+     (∃ s' mem', TrustedRun witnessTupleArityProj2DeepCm sB s' ∧
+        stepMirFn witnessTupleArityProj2DeepCm s' = .retNormal (.scalar ⟨59, 4⟩) mem' ∧
+        mem'.activeProtectors = [7, 11])) ∧
+    -- (c) Cross-frame pointer isolation (both arg push AND callee return):
+    (let stLocalPtr : LMultiFrameState :=
+       { activeEnv := witnessA2Env witnessIdPtrDecls
+         activeBody := witnessCrossPtrRootBody
+         bb := 0, slots := initLCalleeSlots 2 [.ptr ⟨1, 0⟩ 8], unwinding := none, stack := [] }
+     let stCalleeRetLocalPtr : LMultiFrameState :=
+       { activeEnv := witnessA2Env witnessIdPtrDecls
+         activeBody := witnessRetPtrBody
+         bb := 0, slots := [.init (.ptr ⟨2, 0⟩ 8), .uninit], unwinding := none
+         stack := [{ callerEnv := witnessA2Env witnessIdPtrDecls
+                     callerBody := witnessCrossPtrRootBody
+                     callBb := 0, inCleanup := false
+                     slotsAfterArgs := [.uninit, .uninit], unwinding := none
+                     destination := ⟨0, []⟩, destTy := ep2TyRawConstU32
+                     returnTarget := some 1, returnUnwind := .continue_ }] }
+     let stGlobalPtr : LMultiFrameState :=
+       { activeEnv := witnessA2Env witnessIdPtrDecls
+         activeBody := witnessCrossPtrRootBody
+         bb := 0, slots := initLCalleeSlots 2 [.ptr ⟨100, 0⟩ 8], unwinding := none, stack := [] }
+     let sGlobalPtr : MachineState :=
+       initMachineStateWithCallees witnessCrossPtrRootCm [.ptr ⟨100, 0⟩ 8] witnessA2Callees
+     runLoweredWithCallTable (witnessA2Table true) 8 stLocalPtr = none ∧
+     stepLoweredWithCallTable (witnessA2Table true) stCalleeRetLocalPtr = none ∧
+     runLoweredWithCallTable (witnessA2Table true) 8 stGlobalPtr =
+       some (.returned (.ptr ⟨100, 0⟩ 8)) ∧
+     (∃ s', TrustedRun witnessCrossPtrRootCm sGlobalPtr s' ∧
+        stepMirFn witnessCrossPtrRootCm s' = .retNormal (.ptr ⟨100, 0⟩ 8) s'.memory)) := by
+  refine ⟨?_, ?_, ?_⟩
+  · -- Part (a)
+    intro slots0 st0 locs0 s0
+    let stClean : LMultiFrameState :=
+      { activeEnv := witnessDivProjCleanupEnv
+        activeBody := witnessDivProjCleanupRootBody
+        bb := 1
+        slots := [.uninit,
+          .partialShell ⟨0, true, true, [.init (.scalar ⟨100, 4⟩), .uninit]⟩,
+          .uninit, .uninit]
+        unwinding := some 0
+        stack := [] }
+    have hClean : runLoweredWithCallTable (witnessA2Table false) 2 st0 =
+        some (.outOfFuel stClean) := by
+      with_unfolding_all rfl
+    have hPan : runLoweredWithCallTable (witnessA2Table false) 8 st0 = some (.panicked 0) := by
+      with_unfolding_all rfl
+    have hCorr0 : MultiFrameStateCorr (witnessA2Table false) witnessDivProjCleanupCm
+        emptyLayoutTable [] st0 s0 witnessDivProjCleanupCm :=
+      { block := rfl, stmt := rfl
+        slots := ⟨trivial, rfl, rfl, trivial, trivial⟩
+        active := rfl, body := witnessDivProjCleanup_multiBodyCorr
+        stack := trivial, globals := rfl
+        tableCorr := witnessA2Table_corr witnessDivProjCleanupCm false }
+    exact ⟨⟨stClean, hClean, rfl, rfl,
+            by with_unfolding_all rfl, by with_unfolding_all rfl, by with_unfolding_all rfl⟩,
+           hPan,
+           runLoweredWithCallTable_refines_trusted 8 st0 s0 witnessDivProjCleanupCm _ hCorr0 hPan⟩
+  · -- Part (b)
+    refine ⟨⟨_, by with_unfolding_all rfl⟩, ?_⟩
+    intro stB sB0 sB
+    have hRetB : runLoweredWithCallTable (witnessA2Table false) 12 stB =
+        some (.returned (.scalar ⟨59, 4⟩)) := by
+      with_unfolding_all rfl
+    have hCorrB : MultiFrameStateCorr (witnessA2Table false) witnessTupleArityProj2DeepCm
+        emptyLayoutTable [] stB sB witnessTupleArityProj2DeepCm :=
+      { block := rfl, stmt := rfl, slots := ⟨trivial, rfl, trivial⟩
+        active := rfl, body := witnessTupleArityProj2Deep_multiBodyCorr
+        stack := trivial, globals := rfl
+        tableCorr := witnessA2Table_corr witnessTupleArityProj2DeepCm false }
+    obtain ⟨s', hRunB, hFinB⟩ := trustedIter_run (cm := witnessTupleArityProj2DeepCm) 10 sB
+      (.retNormal (.scalar ⟨59, 4⟩)
+        { (initMachineStateWithCallees witnessTupleArityProj2DeepCm [] witnessA2Callees).memory with
+          activeCallee := some witnessTupleArityProj2DeepCm
+          activeProtectors := [7, 11] })
+      (by with_unfolding_all rfl) rfl
+    exact ⟨hRetB,
+      runLoweredWithCallTable_refines_trusted 12 stB sB witnessTupleArityProj2DeepCm _
+        hCorrB hRetB,
+      ⟨s', _, hRunB, hFinB, rfl⟩⟩
+  · -- Part (c)
+    intro stLocalPtr stCalleeRetLocalPtr stGlobalPtr sGlobalPtr
+    have hRej : runLoweredWithCallTable (witnessA2Table true) 8 stLocalPtr = none := by
+      with_unfolding_all rfl
+    have hRejRet : stepLoweredWithCallTable (witnessA2Table true) stCalleeRetLocalPtr = none := by
+      with_unfolding_all rfl
+    have hAcc : runLoweredWithCallTable (witnessA2Table true) 8 stGlobalPtr =
+        some (.returned (.ptr ⟨100, 0⟩ 8)) := by
+      with_unfolding_all rfl
+    have hBodyC : MultiBodyCorr (witnessA2Table true) witnessCrossPtrRootCm emptyLayoutTable []
+        (witnessA2Env witnessIdPtrDecls) witnessCrossPtrRootBody witnessCrossPtrRootCm := by
+      refine ep2b2_multiBodyCorr _ _ _ _ _ (witnessA2CallTargetOf_eq true) (fun b hb => ?_)
+      simp only [witnessCrossPtrRootBody, List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact ⟨rfl, ep2a1_ops_nonDeref _ rfl, rfl, "witness::id_ptr", [], 0, rfl, Or.inl rfl⟩
+      · exact ⟨rfl, trivial⟩
+    have hCorrC : MultiFrameStateCorr (witnessA2Table true) witnessCrossPtrRootCm emptyLayoutTable []
+        stGlobalPtr sGlobalPtr witnessCrossPtrRootCm :=
+      { block := rfl, stmt := rfl
+        slots := initLCalleeSlots_below_initLocals witnessCrossPtrRootCm [.ptr ⟨100, 0⟩ 8]
+        active := rfl, body := hBodyC, stack := trivial, globals := rfl
+        tableCorr := witnessA2Table_corr witnessCrossPtrRootCm true }
+    exact ⟨hRej, hRejRet, hAcc,
+      runLoweredWithCallTable_refines_trusted 8 stGlobalPtr sGlobalPtr witnessCrossPtrRootCm _
+        hCorrC hAcc⟩
 
 end Anneal.Mir.AdtAndControl
