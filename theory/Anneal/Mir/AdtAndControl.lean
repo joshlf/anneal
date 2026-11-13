@@ -18380,7 +18380,21 @@ This section completes the Episode 2 formalization of `crates/anneal-mir`:
   `writePlaceValue` + `restoreCallerProtectors`, and `unwindFromCallStack`) across 2+-deep call
   chains with explicit `maxCallDepthExceeded` vs `outOfFuel`.
 - **Section 5e**: Four concrete executable non-vacuity witness suites discharging every premise by
-  kernel computation (`rfl` / `decide`). -/
+  kernel computation (`rfl` / `decide`).
+- **Sections 5f–5i** (adversarial hardening rounds `[adv ep2-B1]`, `[adv ep2-A1]`, `[adv ep2-B2]`,
+  `[adv ep2-A2]`): Episode 1-exact adapter parity and `trustedSupportsIntrinsicDefPath` premise
+  elimination with value-intrinsic fault parity (5f, Witness Suites 5–6); exact `.ub` fault parity,
+  the target-presence boundary, `Ordering` ADT encoding, and projected / `PartialShell` call
+  destinations (5g, Witness Suites 7–8); multi-frame unwinding, diverging linked calls,
+  non-vacuous depth-limit checkpoints, and callee shadowing (5h, Witness Suite 9); and
+  per-projection `NoUninitExplosionOnProj`, the exact abort-site characterization,
+  `slotsAfterArgs` / `restoreCallerProtectors` invariants, and cross-frame pointer isolation
+  (5i, Witness Suite 10).
+
+Every public theorem of this module is in the axiom audit of `MiniRustSpec.Audit`
+(`call_intrinsic_audit_closure`, `subplace_audit_closure`, and
+`adt_control_residual_audit_closure` of `MiniRustSpec.Correspondence.DeinitBridge`, checked by
+`[ADT-AUDIT-COVERAGE]`). -/
 
 /-! ### Section 5a: `V2026_06_01` Adapter Round-Trip, Linked Precedence & Call-Destination Lemmas -/
 

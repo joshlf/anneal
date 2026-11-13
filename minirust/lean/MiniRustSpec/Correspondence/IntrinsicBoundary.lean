@@ -74,7 +74,9 @@ MiniRust `Endianness.decode .BigEndian` + involution, `bitreverse` / `cttz` / `c
 characterizations + `CountOnes` conservation, full value-level two-sided `some v ↔ .ok` &
 `none ↔ .ub` parity, `saturating` `valOf` clamping, `three_way_compare::<char>`, `size_of_val` /
 `align_of_val` ↔ `Type.layout` & `LayoutStrategy.compute_size_and_align`, symbolic `panicUnwind`,
-and multi-byte / `char` / slice-layout negative controls).
+and multi-byte / `char` / slice-layout negative controls). Section 10 (`[adv ep2-B4]`) pins the
+remaining boundary: MiniRust's executable spec rejects every unwinding terminator (`StartUnwind`,
+`StopUnwind`, `ResumeUnwind`) as `unsupported`, so `panicUnwind` corresponds to `Trusted` only.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -1082,7 +1084,7 @@ theorem optScalarIs_iff (ov : Option Value) (bits sz : Nat) :
   connect end-to-end to MiniRust machine execution);
 - `ctlzNonzero` and `cttzNonzero` fault (`none`) at `0` and agree with `fbCtlzSpec` / `fbCttzSpec`
   for all `1 ≤ a < 256`;
-- `bswap` agrees with `fbBswapSpec` across all `fbU32Samples` (`fbBswap_minirust_all`);
+- `bswap` agrees with `fbBswapSpec` across all `fbU32Samples` (`fbBswap_minirust_samples`);
 - `saturatingAdd` (`u8`) and `saturatingSub` (`i8`) agree with `fbSatAddSpec` and `fbSatSubSpec`
   across the full 256-input `b = 128` rows (`fbSatAdd_minirust_row`, `fbSatSub_minirust_row`). -/
 theorem evalLIntrinsic_bitops_fallback_correspondence :
@@ -2313,7 +2315,10 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
   `unwind = .cleanup c`, whereas Section 8c's `.abort` bypasses `c` and returns `some (.terminated
   bb)`!);
 - canonical `V2026_06_01` unwinding panic entry points (`core::panicking::panic`, `panic_fmt`,
-  `assert_failed`) lower to `.panicUnwind`. -/
+  `assert_failed`) lower to `.panicUnwind`.
+The statement itself mentions no MiniRust term: MiniRust's executable spec has no unwinding, and
+`minirust_unwind_terminators_unsupported` (Section 10) pins that fail-closed boundary, so the
+semantic counterpart of `panicUnwind` is `Trusted`'s `startPanic` / `applyUnwindAction` only. -/
 theorem evalLIntrinsic_panicUnwind_minirust_correspondence
     (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
     (bb : Nat) (inCleanup : Bool) (args : List Operand) (avs : List Value)
@@ -2368,5 +2373,28 @@ theorem minirust_bitops_char_and_layout_negative_controls
   ⟨⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
 
 end AdvEp2A3
+
+/-! ## 10. `[adv ep2-B4]` MiniRust unwinding boundary -/
+
+section AdvEp2B4
+
+set_option autoImplicit false
+
+/-- **MiniRust's executable spec has no unwinding (`minirust_unwind_terminators_unsupported`)**:
+`Interp.evalTerminator` stops with `.unsupported` on every `StartUnwind`, `StopUnwind`, and
+`ResumeUnwind` terminator, for every machine, payload, and target block. Anneal's lowered
+`panicUnwind` (routed to `startPanic` by `evalLIntrinsic_panicUnwind_minirust_correspondence`)
+and its cleanup / `UnwindResume` / `unwindLCallStack` machinery therefore have no executable
+MiniRust counterpart; their correspondence is with `Trusted`'s `startPanic` /
+`applyUnwindAction` / `unwindFromCallStack` only, while `abort` (`IntrinsicOp::Abort`) and
+`unreachable_unchecked` (`Terminator::Unreachable`) do have MiniRust counterparts (Section 8c). -/
+theorem minirust_unwind_terminators_unsupported (m : Mach) (payload : Gen.ValueExpr)
+    (blk : Gen.BbName) :
+    (∃ what, Interp.evalTerminator m (.StartUnwind payload blk) = .error (.unsupported what)) ∧
+      (∃ what, Interp.evalTerminator m (.StopUnwind blk) = .error (.unsupported what)) ∧
+      (∃ what, Interp.evalTerminator m .ResumeUnwind = .error (.unsupported what)) :=
+  ⟨⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl⟩⟩
+
+end AdvEp2B4
 
 end MiniRustSpec.Correspondence

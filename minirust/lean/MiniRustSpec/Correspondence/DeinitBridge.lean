@@ -1350,8 +1350,9 @@ theorem evalLIntrinsic_arithOffset_eq_minirust
    `MirStepNode.retOutcome .abort` in `Trusted.stepMirFn`, bypassing `UnwindAction.cleanup 1`;
 3. By contrast, `panicUnwind` on the identical cleanup-equipped CFG enters `bb1` in unwinding mode
    (`some (.goto 1 [.uninit] (some 0))`), runs through `UnwindResume` to `some (.panicked 0)`, and
-   refines `TrustedRun` to `MirStepNode.retOutcome .panic` (see `IntrinsicBoundary` Section 9 for
-   the fully symbolic `panicUnwind` vs `abort` dispatch theorem). -/
+   refines `TrustedRun` to a state that steps to `MirStepNode.retOutcome .panic` (the last
+   conjunct, stated since `[adv ep2-B4]`; see `IntrinsicBoundary` Section 9 for the fully symbolic
+   `panicUnwind` vs `abort` dispatch theorem). -/
 theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach)
     (arguments : List (Val × Gen.Type)) (retTy : Gen.Type) :
     Interp.evalTerminator m .Unreachable = .error (.ub "reached unreachable code") ∧
@@ -1370,9 +1371,12 @@ theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach)
       Anneal.Mir.AdtAndControl.runLoweredCfgSteps
           Anneal.Mir.AdtAndControl.witnessDivergingEnv
           Anneal.Mir.AdtAndControl.witnessPanicCleanupBody 4 0 [.uninit] none =
-        some (.panicked 0) := by
+        some (.panicked 0) ∧
+      ∃ s', Anneal.Mir.AdtAndControl.TrustedRun Anneal.Mir.AdtAndControl.witnessPanicCleanupCm
+          (initMachineState Anneal.Mir.AdtAndControl.witnessPanicCleanupCm []) s' ∧
+        stepMirFn Anneal.Mir.AdtAndControl.witnessPanicCleanupCm s' = .retOutcome .panic := by
   have hw := Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind
-  exact ⟨rfl, rfl, hw.1, hw.2.2.1, hw.2.2.2.1, hw.2.2.2.2.1⟩
+  exact ⟨rfl, rfl, hw.1, hw.2.2.1, hw.2.2.2.1, hw.2.2.2.2.1, hw.2.2.2.2.2⟩
 
 /-- **Axiom-audit hook for Episode 2's `.call`, `LIntrinsicOp`, and `LCallTable` multi-callee model
 (`call_intrinsic_audit_closure`)**: references every Episode 2 theorem of
@@ -1496,6 +1500,209 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.unwindLCallStack_cleanup_exact
   let _ := @Anneal.Mir.AdtAndControl.stepMirFn_multi_deinit_projected_trustedRun
   let _ := @Anneal.Mir.AdtAndControl.witness_diverging_proj_move_cleanup_and_protectors
+  trivial
+
+/-- **Residual axiom-audit hook for the rest of `Anneal.Mir.AdtAndControl`
+(`adt_control_residual_audit_closure`, `[adv ep2-B4]`)**: references every public,
+user-declared theorem of `Anneal.Mir.AdtAndControl` that neither `subplace_audit_closure`,
+`call_intrinsic_audit_closure`, nor any other `MiniRustSpec` declaration reaches (192 theorems of the
+scalar-validity, ADT layout, place, `Deinit` / `Retag`, and lowered-CFG layers that predate
+Episode 2). With those closures it puts **all 607** public theorems of `Anneal.Mir.AdtAndControl`
+inside the dependency closure whose axioms `MiniRustSpec.Audit` checks, which
+`#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`) re-verifies mechanically. -/
+theorem adt_control_residual_audit_closure : True :=
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.contains_eq_true_iff
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.contains_lt_pow
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.contains_eq_wrappingRangeContains
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.full_contains
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.full_contains_iff
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.nonZero_contains_iff
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.nonZero_not_contains_zero
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.isEmpty_iff_forall_not_contains
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.isWrapping_contains_zero
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.isFull_iff_forall_contains
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.containsNiche_iff_exists_excluded
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.nonZero_containsNiche
+  let _ := @Anneal.Mir.AdtAndControl.ScalarValidRange.complement_contains
+  let _ := @Anneal.Mir.AdtAndControl.cOffset?_monotone
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_union_eq_zero
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_transparent_nonZst
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_reprC_monotone
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOfChain_bounds_and_align
+  let _ := @Anneal.Mir.AdtAndControl.cOffset?_ge_start
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_taggedEnum_ge_tagSize
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_uninhabited_variant_none
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_niche_shell_none
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_tag_apart_shell
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_niche_init_ill_formed_none
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_uninit
+  let _ := @Anneal.Mir.AdtAndControl.placeTy_eq_none_imp_placeTyResolved_eq_none
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_init_agrees_trusted
+  let _ := @Anneal.Mir.AdtAndControl.allFieldsUninit_getElem?
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_read_root_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_read_extension_ub
+  let _ := @Anneal.Mir.AdtAndControl.shellFieldRead_of_allFieldsUninit
+  let _ := @Anneal.Mir.AdtAndControl.readFieldSlot_init_field
+  let _ := @Anneal.Mir.AdtAndControl.readFieldSlot_init_downcast_field
+  let _ := @Anneal.Mir.AdtAndControl.readFieldSlot_normalizeShell_field
+  let _ := @Anneal.Mir.AdtAndControl.readFieldSlot_normalizeShell_downcast_field
+  let _ := @Anneal.Mir.AdtAndControl.shellFieldRead_set_ne
+  let _ := @Anneal.Mir.AdtAndControl.shellFieldRead_set_self
+  let _ := @Anneal.Mir.AdtAndControl.shellFieldRead_of_getElem?
+  let _ := @Anneal.Mir.AdtAndControl.Diverges.cons_left
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_read_diverges_eq
+  let _ := @Anneal.Mir.AdtAndControl.SameScalarLocals.symm
+  let _ := @Anneal.Mir.AdtAndControl.deinit_root_not_scalar
+  let _ := @Anneal.Mir.AdtAndControl.UninitAt.not_scalar
+  let _ := @Anneal.Mir.AdtAndControl.readPlaceState_congr_unchanged
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_read_disjoint_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_root_read_other_local_eq
+  let _ := @Anneal.Mir.AdtAndControl.map_init_set_set
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_write_reinit
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_uninit_constantIndex_oob_none
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_uninit_subslice_oob_none
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_write_reinit
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_niche_write_needs_setDiscriminant
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_init_read_ok
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_root_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_init_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_uninit_root_divergence
+  let _ := @Anneal.Mir.AdtAndControl.length_deinitBytes
+  let _ := @Anneal.Mir.AdtAndControl.fieldBytes_frame
+  let _ := @Anneal.Mir.AdtAndControl.structBytes_deinit
+  let _ := @Anneal.Mir.AdtAndControl.fieldSlotToLocalSlotState_toFieldSlot
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_field_shell
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_bytes_simulation
+  let _ := @Anneal.Mir.AdtAndControl.specFieldLayout_eq_some
+  let _ := @Anneal.Mir.AdtAndControl.reprC_layoutDisjoint
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_reprC_bytes_simulation
+  let _ := @Anneal.Mir.AdtAndControl.valuesBytes_iff_slotsBytes_map_init
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_enum_field_preserves_discriminant
+  let _ := @Anneal.Mir.AdtAndControl.cOffset?_isSome
+  let _ := @Anneal.Mir.AdtAndControl.adtLayout?_reprC_struct
+  let _ := @Anneal.Mir.AdtAndControl.reprC_struct_placed
+  let _ := @Anneal.Mir.AdtAndControl.rustOffset?_isSome
+  let _ := @Anneal.Mir.AdtAndControl.rustOffset?_ge_start
+  let _ := @Anneal.Mir.AdtAndControl.rustOffset?_monotone
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_reprRust_struct
+  let _ := @Anneal.Mir.AdtAndControl.reprRust_canonical_struct_placed
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_reprInt_enum
+  let _ := @Anneal.Mir.AdtAndControl.resolveAdtOffsetOf_reprCInt_enum
+  let _ := @Anneal.Mir.AdtAndControl.adtLayout?_taggedEnum_isSome
+  let _ := @Anneal.Mir.AdtAndControl.taggedEnum_placed
+  let _ := @Anneal.Mir.AdtAndControl.pathRange_struct_field
+  let _ := @Anneal.Mir.AdtAndControl.pathRange_struct_downcast_field
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_taggedEnum_bytes_simulation
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_downcast_inactive_variant_none
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_downcast_active_variant_eq
+  let _ := @Anneal.Mir.AdtAndControl.univariantEnum_present_reprRust_placed
+  let _ := @Anneal.Mir.AdtAndControl.univariantEnum_absent_placed
+  let _ := @Anneal.Mir.AdtAndControl.noPresentEnum_placed
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_univariantEnum_bytes_simulation
+  let _ := @Anneal.Mir.AdtAndControl.union_field_uninit_bytes
+  let _ := @Anneal.Mir.AdtAndControl.evalRetagPlace_dead
+  let _ := @Anneal.Mir.AdtAndControl.evalRetagPlace_bad_index_false
+  let _ := @Anneal.Mir.AdtAndControl.evalRetagPlace_inactive_variant_false
+  let _ := @Anneal.Mir.AdtAndControl.evalRetagPlace_deref_false
+  let _ := @Anneal.Mir.AdtAndControl.evalRetagPlace_uninit_ref
+  let _ := @Anneal.Mir.AdtAndControl.ValueListEqUpToTag.refl
+  let _ := @Anneal.Mir.AdtAndControl.retagSlotOk_enum_niche_shell_false
+  let _ := @Anneal.Mir.AdtAndControl.retagValueOk_enum_niche_ill_formed_false
+  let _ := @Anneal.Mir.AdtAndControl.retagVariant_rejected_false
+  let _ := @Anneal.Mir.AdtAndControl.retagSlotOk_enum_variant_rejected_false
+  let _ := @Anneal.Mir.AdtAndControl.retagVariantOk_eq_true
+  let _ := @Anneal.Mir.AdtAndControl.retagValueOk_enum_sound
+  let _ := @Anneal.Mir.AdtAndControl.projectFieldSlot_of_uninitAt_aux
+  let _ := @Anneal.Mir.AdtAndControl.projectFieldSlot_of_uninitAt
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_then_retag_same_false
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_sound
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_no_union
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_through_init_union_none
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_init_union_root_none
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_union_field_divergence
+  let _ := @Anneal.Mir.AdtAndControl.projectFieldSlot_uninit_ne_init
+  let _ := @Anneal.Mir.AdtAndControl.deinitReachesInitUnion_uninit
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_uninit_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_uninit_union_ok
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlaceTyped_nested_init_union_none
+  let _ := @Anneal.Mir.AdtAndControl.deinitTailOk_indexLocalsOk
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_indexLocalsOk
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_indexLocalsOk
+  let _ := @Anneal.Mir.AdtAndControl.evalDeinitPlace_bad_index_none
+  let _ := @Anneal.Mir.AdtAndControl.copyNonOverlappingChecks_zero_len_sound
+  let _ := @Anneal.Mir.AdtAndControl.copyNonOverlappingChecks_null_src
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingWithCount_zero
+  let _ := @Anneal.Mir.AdtAndControl.provenanceLocal_spec
+  let _ := @Anneal.Mir.AdtAndControl.resolveSyntheticLocal_spec
+  let _ := @Anneal.Mir.AdtAndControl.copyWholeLocal_spec
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_zero_count
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_dead_none
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_zst_bulk_noop
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_whole_local_copies_slot
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_zst_copies_uninit
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_same_local_non_zst_none
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_zst_non_whole_noop
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_non_whole_unsupported
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_whole_local_below
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_read_dst_bare
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingState_read_other_bare
+  let _ := @Anneal.Mir.AdtAndControl.evalCopySingleDirect_same_local_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalCopySingleDirect_dead_or_uninit_src_ub
+  let _ := @Anneal.Mir.AdtAndControl.copyWholeLocal_live_of_not_copyTargetDead
+  let _ := @Anneal.Mir.AdtAndControl.evalCopySingleDirect_whole_local_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalCopySingleDirect_whole_local_invalid_bool_char_divergence
+  let _ := @Anneal.Mir.AdtAndControl.validPointerCoercion_no_mut_gain
+  let _ := @Anneal.Mir.AdtAndControl.evalPointerCoercion_preserves
+  let _ := @Anneal.Mir.AdtAndControl.evalShallowInitBox_preserves
+  let _ := @Anneal.Mir.AdtAndControl.evalWrapUnsafeBinder_preserves
+  let _ := @Anneal.Mir.AdtAndControl.evalWrapUnsafeBinder_rejects_niche
+  let _ := @Anneal.Mir.AdtAndControl.evalAdtDiscriminant_refines_evalRvalue
+  let _ := @Anneal.Mir.AdtAndControl.evalRvalue_wrapUnsafeBinder_copy
+  let _ := @Anneal.Mir.AdtAndControl.evalWrapUnsafeBinder_identity_refines_evalRvalue
+  let _ := @Anneal.Mir.AdtAndControl.evalWrapUnsafeBinder_wrap_vs_evalRvalue
+  let _ := @Anneal.Mir.AdtAndControl.placeRuntimeAccessOk_iff
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredCfgSteps_zero_fuel
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredCfgSteps_add_fuel
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredCfgSteps_mono
+  let _ := @Anneal.Mir.AdtAndControl.stepMirState_running
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_unreachable_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_switch_invalid_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_switch_bad_targets_none
+  let _ := @Anneal.Mir.AdtAndControl.SwitchTy.validBits_bool
+  let _ := @Anneal.Mir.AdtAndControl.SwitchTy.validBits_char_iff
+  let _ := @Anneal.Mir.AdtAndControl.SwitchTy.validBits_lt_two_pow
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_assert_bad_msg_none
+  let _ := @Anneal.Mir.AdtAndControl.assert_unreachable_unwind_ub
+  let _ := @Anneal.Mir.AdtAndControl.placeFrameAccessOk_live
+  let _ := @Anneal.Mir.AdtAndControl.placeFrameAccessOk_index
+  let _ := @Anneal.Mir.AdtAndControl.slotProjectionAccessOk_noDeref
+  let _ := @Anneal.Mir.AdtAndControl.slotPlaceProjectionOk_noDeref
+  let _ := @Anneal.Mir.AdtAndControl.slotPlaceProjectionOk_inactive_variant_false
+  let _ := @Anneal.Mir.AdtAndControl.slotPlaceProjectionOk_field_oob_false
+  let _ := @Anneal.Mir.AdtAndControl.slotProjectionAccessOk_of_deinitFieldSlot
+  let _ := @Anneal.Mir.AdtAndControl.slotPlaceProjectionOk_of_evalDeinitPlace
+  let _ := @Anneal.Mir.AdtAndControl.placeFrameAccessOk_of_evalDeinitPlace
+  let _ := @Anneal.Mir.AdtAndControl.checkSlotProjectionOk_of_slotProjectionAccessOk
+  let _ := @Anneal.Mir.AdtAndControl.checkPlaceSlotOk_of_slotPlaceProjectionOk
+  let _ := @Anneal.Mir.AdtAndControl.checkPlaceSlotOk_of_evalDeinitPlace
+  let _ := @Anneal.Mir.AdtAndControl.checkPlaceSlotOk_inactive_variant_false
+  let _ := @Anneal.Mir.AdtAndControl.checkPlaceSlotOk_array_index_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_sound
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_dead_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_bad_index_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_dead_agrees_trusted
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_trusted_live
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_bare_divergence
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_refines
+  let _ := @Anneal.Mir.AdtAndControl.checkPlaceSlotOk_uninit
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_inactive_variant_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_index_oob_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_deref_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_init_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_drop_projected_uninit_divergence
+  let _ := @Anneal.Mir.AdtAndControl.BodyCorr.toBodyCorrWithStmts
+  let _ := @Anneal.Mir.AdtAndControl.stepMirFn_deinit_root_trustedRun
+  let _ := @Anneal.Mir.AdtAndControl.stripUnitElems_append_unit
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge
