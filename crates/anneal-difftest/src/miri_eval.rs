@@ -2372,23 +2372,21 @@ fn collect_ident_tokens(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<Str
     }
 }
 
-/// Names of the top-level functions of a staged `src/lib.rs` that its
-/// candidates reach, transitively.
+/// Names of the top-level functions of a staged `src/lib.rs` that the
+/// evaluated `items` (or the candidate portion after
+/// [`MIRI_CORPUS_MODULE_PREAMBLE`] when `items` is empty) reach, transitively.
 ///
-/// The candidates are the text after [`MIRI_CORPUS_MODULE_PREAMBLE`] when the
-/// staged crate embeds it (generated batches and reproducers), and the whole
-/// crate otherwise (the identity corpus). A function is reached when its name
-/// occurs as an identifier token in a candidate or in the body of a reached
-/// function, so a depth-`k` model-helper chain (`helper_reborrow_mid` calling
-/// `helper_reborrow_leaf`) is linked without a hard-coded helper list.
-fn staged_helper_fns_reachable_from_candidates(lib_rs: &str) -> BTreeSet<String> {
-    let candidate_portion = lib_rs
-        .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
-        .map_or(lib_rs, |(_, rest)| rest);
-    let mut mentioned = BTreeSet::new();
-    if let Ok(tokens) = candidate_portion.parse::<proc_macro2::TokenStream>() {
-        collect_ident_tokens(tokens, &mut mentioned);
-    }
+/// When `items` names one or more parsed functions in `lib_rs`, the reachability
+/// worklist starts from those functions directly so evaluating a subset of
+/// `tests/miri-diff/corpus/src/lib.rs` links only the model-marked helpers that
+/// subset actually calls. When `items` is empty or does not match parsed
+/// functions in `lib_rs`, the worklist starts from identifiers in the text after
+/// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
+/// embedded verbatim).
+fn staged_helper_fns_reachable_from_candidates(
+    lib_rs: &str,
+    items: &[OracleItemSpec],
+) -> BTreeSet<String> {
     let fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = syn::parse_file(lib_rs)
         .map(|file| {
             file.items
@@ -2403,11 +2401,27 @@ fn staged_helper_fns_reachable_from_candidates(lib_rs: &str) -> BTreeSet<String>
                 .collect()
         })
         .unwrap_or_default();
-    let mut reached = BTreeSet::new();
-    let mut worklist: Vec<String> = mentioned
-        .into_iter()
+    let item_seeds: Vec<String> = items
+        .iter()
+        .map(|spec| spec.name.clone())
         .filter(|name| fn_bodies.contains_key(name))
         .collect();
+    let mut worklist: Vec<String> = if !item_seeds.is_empty() {
+        item_seeds
+    } else {
+        let candidate_portion = lib_rs
+            .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
+            .map_or(lib_rs, |(_, rest)| rest);
+        let mut mentioned = BTreeSet::new();
+        if let Ok(tokens) = candidate_portion.parse::<proc_macro2::TokenStream>() {
+            collect_ident_tokens(tokens, &mut mentioned);
+        }
+        mentioned
+            .into_iter()
+            .filter(|name| fn_bodies.contains_key(name))
+            .collect()
+    };
+    let mut reached = BTreeSet::new();
     while let Some(name) = worklist.pop() {
         if !reached.insert(name.clone()) {
             continue;
@@ -2952,8 +2966,8 @@ fn run_linked_difftest_oracle_pipeline(
     let lib_rs = fs::read_to_string(&lib_rs_path)
         .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
     // Model-marked (`__ANNEAL_MODEL_<name>`) helper functions are linked as
-    // intra-crate callees exactly when the staged candidates reach them.
-    let reachable_helpers = staged_helper_fns_reachable_from_candidates(&lib_rs);
+    // intra-crate callees exactly when the evaluated items reach them.
+    let reachable_helpers = staged_helper_fns_reachable_from_candidates(&lib_rs, items);
 
     let subject_records: Vec<_> = records
         .iter()
@@ -3168,16 +3182,20 @@ fn run_linked_difftest_oracle_pipeline(
             .current_dir(&dot_anneal)
             .arg("env")
             .arg("lean")
+            .arg("-M")
+            .arg("4096")
             .arg("oracle/MiriOracleConfirm.lean")
             .output()
             .map_err(|err| {
                 format!(
-                    "failed to execute '{} env lean oracle/MiriOracleConfirm.lean': {}",
+                    "failed to execute '{} env lean -M 4096 oracle/MiriOracleConfirm.lean': {}",
                     lake_bin.display(),
                     err
                 )
             })?;
-        if !confirm_out.status.success() {
+        if confirm_out.status.success() {
+            Some(confirm_path)
+        } else if to_confirm.len() == 1 {
             let stdout = String::from_utf8_lossy(&confirm_out.stdout);
             let stderr = String::from_utf8_lossy(&confirm_out.stderr);
             return Err(format!(
@@ -3187,8 +3205,71 @@ fn run_linked_difftest_oracle_pipeline(
                 stdout,
                 stderr
             ));
+        } else {
+            // Isolate per-item kernel confirmation so a single candidate whose
+            // `by rfl` exceeds `-M 4096` marks only itself `kernel_confirmed = false`
+            // instead of aborting the entire batch.
+            let mut confirmed_items = Vec::new();
+            let mut unconfirmed_names = BTreeSet::new();
+            for entry in &to_confirm {
+                let single_src = render_linked_anneal_confirm_module(
+                    &crate_camel,
+                    std::slice::from_ref(entry),
+                    &helper_module_suffixes,
+                    &anneal_panic_frames,
+                    &anneal_panic_messages,
+                )?;
+                fs::write(&confirm_path, &single_src).map_err(|err| {
+                    format!("failed to write {}: {}", confirm_path.display(), err)
+                })?;
+                let single_out = Command::new(&lake_bin)
+                    .current_dir(&dot_anneal)
+                    .arg("env")
+                    .arg("lean")
+                    .arg("-M")
+                    .arg("4096")
+                    .arg("oracle/MiriOracleConfirm.lean")
+                    .output()
+                    .map_err(|err| {
+                        format!(
+                            "failed to execute '{} env lean -M 4096 oracle/MiriOracleConfirm.lean': {}",
+                            lake_bin.display(),
+                            err
+                        )
+                    })?;
+                if single_out.status.success() {
+                    confirmed_items.push(entry.clone());
+                } else {
+                    unconfirmed_names.insert(entry.0.name.clone());
+                }
+            }
+            for rep in &mut reports {
+                if unconfirmed_names.contains(&rep.name) {
+                    rep.kernel_confirmed = false;
+                }
+            }
+            if confirmed_items.is_empty() {
+                let stdout = String::from_utf8_lossy(&confirm_out.stdout);
+                let stderr = String::from_utf8_lossy(&confirm_out.stderr);
+                return Err(format!(
+                    "Lean kernel confirmation failed in {} ({}):\n{}\n{}",
+                    confirm_path.display(),
+                    confirm_out.status,
+                    stdout,
+                    stderr
+                ));
+            }
+            let merged_src = render_linked_anneal_confirm_module(
+                &crate_camel,
+                &confirmed_items,
+                &helper_module_suffixes,
+                &anneal_panic_frames,
+                &anneal_panic_messages,
+            )?;
+            fs::write(&confirm_path, &merged_src)
+                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
+            Some(confirm_path)
         }
-        Some(confirm_path)
     };
 
     Ok(LinkedDifftestOracleRun {
@@ -4269,15 +4350,16 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
     if !report.findings.is_empty() {
         out.push_str("\n## Divergences Detected\n\n");
         out.push_str(
-            "| Finding ID | Function | Class | Miri | Anneal | Kernel Confirmed | Shrink |\n",
+            "| Finding ID | Function | Class | Polarity | Miri | Anneal | Kernel Confirmed | Shrink |\n",
         );
-        out.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+        out.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
         for f in &report.findings {
             out.push_str(&format!(
-                "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` ({} -> {} mutators) |\n",
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` ({} -> {} mutators) |\n",
                 f.finding_id,
                 f.fn_name,
                 f.divergence_class,
+                f.witness_polarity,
                 f.miri_outcome_tag,
                 f.anneal_outcome_tag,
                 f.kernel_confirmed,
@@ -7471,7 +7553,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                  helper_reborrow_mid(&mut s, 2u32)\n\
              }}\n"
         );
-        let reached = staged_helper_fns_reachable_from_candidates(&staged);
+        let reached = staged_helper_fns_reachable_from_candidates(&staged, &[]);
         for helper in ["helper_reborrow_mid", "helper_reborrow_leaf"] {
             assert!(reached.contains(helper), "missing {helper}: {reached:?}");
         }
@@ -7489,16 +7571,36 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n\
              pub fn helper_shared_mid_like() -> u32 {{ 3u32 }}\n"
         );
-        let reached = staged_helper_fns_reachable_from_candidates(&staged_substring);
+        let reached = staged_helper_fns_reachable_from_candidates(&staged_substring, &[]);
         assert!(!reached.contains("helper_shared_mid"), "{reached:?}");
         assert!(reached.contains("helper_shared_mid_like"), "{reached:?}");
-        // The identity corpus does not embed the preamble verbatim, so every
-        // function it mentions is reachable from its candidates.
+        // The identity corpus does not embed the preamble verbatim; when `items`
+        // is empty every function it mentions is reachable, and when `items`
+        // names a specific subset (`pass_direct_fn_call`), only the helpers
+        // reachable from that subset (`helper_add_ten`) are linked.
         let corpus_reached = staged_helper_fns_reachable_from_candidates(
             crate::mutators_miri::RAW_MIRI_DIFF_CORPUS_RS,
+            &[],
         );
         for helper in ["helper_add_ten", "helper_reborrow_mid", "helper_reborrow_leaf"] {
             assert!(corpus_reached.contains(helper), "corpus misses {helper}");
+        }
+        let subset_reached = staged_helper_fns_reachable_from_candidates(
+            crate::mutators_miri::RAW_MIRI_DIFF_CORPUS_RS,
+            &[OracleItemSpec::with_fuel("pass_direct_fn_call", 256)],
+        );
+        assert!(subset_reached.contains("helper_add_ten"), "{subset_reached:?}");
+        for unrelated in [
+            "helper_reborrow_mid",
+            "helper_reborrow_leaf",
+            "helper_shared_mid",
+            "helper_unwind_mid",
+            "helper_unwind_guarded",
+        ] {
+            assert!(
+                !subset_reached.contains(unrelated),
+                "subset run unexpectedly linked {unrelated}: {subset_reached:?}"
+            );
         }
     }
 
@@ -7585,12 +7687,48 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         drifted.not_compared_count += 1;
         assert!(!witness_polarity_accounting_holds(&drifted));
 
-        // The rendered JSON and Markdown expose every canonical polarity key.
-        let json = render_eval_report_json(&report);
-        let md = render_eval_report_markdown(&report);
+        // The rendered JSON and Markdown expose every canonical polarity key,
+        // including the `Polarity` column in `## Divergences Detected`.
+        let mut report_with_finding = report.clone();
+        report_with_finding.findings.push(MiriFindingBundle {
+            finding_id: "finding_0000_cand".to_string(),
+            fn_name: "cand".to_string(),
+            seed_name: "seed".to_string(),
+            applied_mutators: Vec::new(),
+            original_mutator_chain: Vec::new(),
+            minimized_mutator_chain: Vec::new(),
+            shrink_evaluations: 0,
+            executed_oracle_runs: 0,
+            shrink_status: "shrunk_to_1_minimal".to_string(),
+            divergence_class: "missed_ub".to_string(),
+            witness_polarity: "unsound_missed_fault".to_string(),
+            miri_outcome_tag: "ub@src/lib.rs:10:5".to_string(),
+            miri_excerpt: String::new(),
+            miri_pos: Some("src/lib.rs:10:5".to_string()),
+            batch_miri_pos: Some("src/lib.rs:10:5".to_string()),
+            anneal_outcome_tag: "pass:scalar:0:4".to_string(),
+            anneal_lean_tag: "MirDiffTag.passScalar 0 4".to_string(),
+            anneal_span: None,
+            batch_anneal_span: None,
+            mir_neighborhood: String::new(),
+            kernel_confirmed: true,
+            kernel_confirm_theorems: String::new(),
+            mutant_source: String::new(),
+            repro_path: None,
+        });
+        let json = render_eval_report_json(&report_with_finding);
+        let md = render_eval_report_markdown(&report_with_finding);
         for slug in WITNESS_POLARITY_NAMES {
             assert!(json.contains(&format!("\"{slug}\"")), "JSON missing {slug}");
             assert!(md.contains(&format!("| `{slug}` |")), "Markdown missing {slug}");
         }
+        assert!(
+            md.contains("| Finding ID | Function | Class | Polarity | Miri | Anneal | Kernel Confirmed | Shrink |"),
+            "Markdown findings table missing Polarity column:\n{md}"
+        );
+        assert!(
+            md.contains("| `finding_0000_cand` | `cand` | `missed_ub` | `unsound_missed_fault` |"),
+            "Markdown findings row missing witness_polarity:\n{md}"
+        );
     }
 }

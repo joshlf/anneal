@@ -3278,7 +3278,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                 },
                 // Child write followed by parent read/write (legal in Tree
                 // Borrows, exercises parent/child borrow-tree transitions).
-                MutationMode::PerturbAst => match rng.gen_range(6) {
+                MutationMode::PerturbAst => match rng.gen_range(9) {
                     0 => syn::parse_quote! {
                         let mut __tb_slot: u32 = #init_val;
                         let __tb_root: *mut u32 = &raw mut __tb_slot;
@@ -3330,7 +3330,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     },
                     // Two-stage `RetagKind::FnEntry` protector release across
                     // `helper_reborrow_mid` -> `helper_reborrow_leaf`.
-                    _ => syn::parse_quote! {
+                    5 => syn::parse_quote! {
                         let mut __fn_slot: u32 = #init_val;
                         let __fn_raw: *mut u32 = &raw mut __fn_slot;
                         let __fn_r0: &mut u32 = unsafe { &mut *__fn_raw };
@@ -3340,6 +3340,36 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             *__fn_raw = (*__fn_r0) ^ #write_val;
                         }
                         let #probe_ident: u32 = unsafe { *__fn_raw };
+                    },
+                    // Multi-callee shared reference reborrow chain (`&u32`) with
+                    // `RetagKind::FnEntry` protector release followed by parent write.
+                    6 => syn::parse_quote! {
+                        let mut __fns_slot: u32 = #init_val;
+                        let __fns_shr: &u32 = &__fns_slot;
+                        let __fns_seen: u32 = helper_shared_mid(__fns_shr, #write_val);
+                        __fns_slot = __fns_seen ^ #write_val;
+                        let #probe_ident: u32 = __fns_slot;
+                    },
+                    // `Operand::Copy` contrast to variant 4's `Operand::Move`: a
+                    // by-value copy of the `Copy` parent is a foreign read that
+                    // leaves the prior `Reserved` `&mut u32` writable.
+                    7 => syn::parse_quote! {
+                        let mut __cp_x: u32 = #init_val;
+                        let __cp_root: *mut u32 = &raw mut __cp_x;
+                        let __cp_res: &mut u32 = unsafe { &mut *__cp_root };
+                        let __cp_copied: u32 = __cp_x;
+                        *__cp_res = __cp_copied ^ #write_val;
+                        let #probe_ident: u32 = (*__cp_res) ^ __cp_copied;
+                    },
+                    // A reborrowed child returned from an `FnEntry`-protected
+                    // `&mut u32` argument outlives the callee frame; a later
+                    // parent write disables the dead child without UB.
+                    _ => syn::parse_quote! {
+                        let mut __rt_slot: u32 = #init_val;
+                        let __rt_child: &mut u32 = helper_reborrow_return(&mut __rt_slot);
+                        *__rt_child = (*__rt_child) ^ #write_val;
+                        __rt_slot = __rt_slot ^ #init_val;
+                        let #probe_ident: u32 = __rt_slot;
                     },
                 },
                 MutationMode::Panic => match rng.gen_range(3) {

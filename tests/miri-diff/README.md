@@ -124,33 +124,45 @@ memory intrinsics:
 Category 9 leaves out the following constructs, on which Anneal currently
 disagrees with Miri. `ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live`
 in [`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
-pins the first four, kernel-confirmed, as `sound_conservative_abstraction`
-divergences. `miri-difftest` mutators avoid all five: no Category 9 helper
-dereferences a reference argument, so the call-chain tests check reference
-passing, reborrow return, frame cleanup, and unwinding, but not Anneal's
-`FnEntry` protector enforcement.
+pins all five, kernel-confirmed (`4` `sound_conservative_abstraction` and `1`
+`unsound_missed_fault`, alongside the provenance `unsound_missed_fault` pin).
+`miri-difftest` mutators avoid all five: no Category 9 helper dereferences a
+reference argument, so the call-chain tests check reference passing, reborrow
+return, frame cleanup, and unwinding, but not Anneal's `FnEntry` protector
+enforcement.
 
 - A callee that dereferences a reference argument pointing into its caller's
-  frame (`fn f(r: &u32) -> u32 { *r }` called as `f(&x)`): Miri passes, and
-  Anneal reports UB at the dereference.
+  frame (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as
+  `f(&x, 1)`): Miri passes, and Anneal reports UB at the dereference because
+  `pushCalleeFrame` saves the caller's locals on `s.memory.callStack` leaving
+  `s.memory.callerLocals = []` and `BorrowEntry.targetLocal` indexes into the
+  callee's own `s.frame.locals[targetLocal]`.
 - A callee that writes caller memory through a raw pointer while the caller
-  holds a shared borrow of it, even one that is never used again or passed:
-  Miri passes, and Anneal reports UB at the write.
+  holds a shared borrow of it (`let _r = &x; f(raw)`): Miri passes, and Anneal
+  reports UB at the write because `&x`'s `Frozen` borrow entry remains active
+  in `s.memory.borrows` and `targetLocal` indexes into `s.frame.locals`.
 - A write to `x` through a raw pointer in the caller after a callee that
   received `&x` has returned: Miri passes (the callee's protector is released
-  on return), and Anneal reports UB at the write.
+  on return, and `_r` was only a call temporary), and Anneal reports UB at the
+  write because `&x`'s `Frozen` borrow entry remains active in
+  `s.memory.borrows`.
 - A raw-pointer read of a moved-from local that is still in scope: Miri passes
   (it evaluates `Operand::Move` like `Operand::Copy`), and Anneal reports UB
   because it de-initializes the moved-from place.
 - A foreign write, during the call, to a reference argument reborrowed from a
-  raw pointer (`f(&*raw, raw)` or `f(&mut *raw, raw)`, where `f` writes through
-  `raw`): Miri reports a protector violation at the write, and Anneal passes
-  (`missed_ub`, an `unsound_missed_fault`) because it puts no `FnEntry`
-  protector on such a reborrow. This gap has no live pin yet: the Lean kernel
-  confirmation of these candidates (`MiriOracleConfirm.lean`) exceeds the
-  `anneal-lean-run` memory limit. Passing `&x` or `&mut x` directly agrees
-  (both report UB at the write), but by the second item Anneal reports that UB
-  even without a protector.
+  raw pointer (`f(&*raw, raw, pad)` or `f(&mut *raw, raw, pad)`, where `f`
+  writes through `raw`): Miri reports a `RetagKind::FnEntry` protector violation
+  at the write, and Anneal passes (`missed_ub`, an `unsound_missed_fault`,
+  pinned live in `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` when the
+  caller local `x` at `_3` aligns with a `u32` parameter slot `_3` in the
+  callee; when `targetLocal` instead collides with an 8-byte reference slot in
+  the callee whose `ScalarLayout` carries `validRange.end_ = u64::MAX`, a 4-byte
+  write triggers byte-level layout re-decoding). `rustc-capture` with
+  `-Zmir-opt-level=0` does not emit `StatementKind::Retag(FnEntry)` on callee
+  entry, so Anneal puts no `FnEntry` protector on `&*raw`. Passing `&x` or
+  `&mut x` directly agrees (both report UB at the write), because `&x`'s borrow
+  entry in `s.memory.borrows` already faults on the raw write without a
+  protector.
 
 ## Policy on `known_anneal_bug` Entries
 

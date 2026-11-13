@@ -2469,20 +2469,36 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 /// classified by `WitnessPolarity`, and `witness_polarity_counts` satisfies the
 /// accounting identity.
 ///
-/// Pinned gaps (all `false_positive_ub`, `sound_conservative_abstraction`):
-/// - `cat9_gap_callee_deref_ref_arg`: a callee reading through a `&u32`
-///   argument that points into the caller's frame is UB in Anneal.
-/// - `cat9_gap_callee_raw_write_with_caller_borrow`: a callee writing caller
-///   memory through a raw pointer while the caller holds a (never used again,
-///   never passed) shared borrow of it is UB in Anneal.
+/// Pinned `sound_conservative_abstraction` (`false_positive_ub`) gaps:
+/// - `cat9_gap_callee_deref_ref_arg`: `pushCalleeFrame` saves caller locals on
+///   `s.memory.callStack` leaving `s.memory.callerLocals = []`, and
+///   `BorrowEntry.targetLocal : LocalIdx` is an unqualified local index into
+///   `s.frame.locals`, so dereferencing a reference argument in a callee whose
+///   local at `entry.targetLocal` has an incompatible type/layout faults in
+///   Anneal where Miri passes.
+/// - `cat9_gap_callee_raw_write_with_caller_borrow`: a callee writing through a
+///   raw pointer whose `BorrowEntry.targetLocal` aliases a caller local with an
+///   active `Frozen` borrow entry in `s.memory.borrows` (or a callee local of
+///   incompatible layout) is UB in Anneal where Miri passes.
 /// - `cat9_gap_post_return_raw_write_after_ref_arg`: after `&x` was passed to a
-///   callee that has returned, a raw-pointer write to `x` in the caller is UB in
-///   Anneal.
+///   callee that has returned, a raw-pointer write to `x` in the caller still
+///   sees the `Frozen` borrow entry from `&x` in `s.memory.borrows` and faults
+///   in Anneal where Miri passes.
 /// - `cat9_in_scope_move_raw_read_conservative`: Anneal de-initializes the
-///   source of `Operand::Move`; Miri copies.
+///   source of `Operand::Move`; Miri evaluates `Operand::Move` like
+///   `Operand::Copy`.
 ///
-/// `cat9_provenance_overwritten_byte_missed_ub` is the known provenance gap
-/// (`missed_ub`, `unsound_missed_fault`).
+/// Pinned `unsound_missed_fault` (`missed_ub`) gaps:
+/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub`: passing a reference
+///   reborrowed from a raw pointer (`&*raw`) alongside `raw` to a callee that
+///   writes `*raw` during the call (`fn f(_r: &u32, alias: *mut u32, _slot_pad: u32)`)
+///   triggers a `RetagKind::FnEntry` protector violation in Miri, whereas
+///   Anneal (`rustc-capture` with `-Zmir-opt-level=0`, which emits no
+///   `StatementKind::Retag(FnEntry)` in the callee) puts no `FnEntry` protector
+///   on `&*raw` and passes when `x`'s `targetLocal` (`_3`) aligns with a `u32`
+///   slot (`_3`) in the callee frame.
+/// - `cat9_provenance_overwritten_byte_missed_ub`: overwriting one byte of a
+///   pointer strips provenance in Miri; Anneal preserves pointer provenance.
 #[test]
 fn ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live() {
     let dir = unique_temp_dir("ep1_cat9");
@@ -2588,6 +2604,34 @@ fn ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live() {
 "#,
         ),
         (
+            "cat9_gap_fn_entry_protector_raw_reborrow_missed_ub",
+            r#"#[inline(never)]
+fn cat9_gap_write_alias_during_protected_reborrow(
+    _r: &u32,
+    alias: *mut u32,
+    _slot_pad: u32,
+) -> u32 {
+    unsafe {
+        *alias = 8u32;
+    }
+    3u32
+}
+
+pub fn cat9_gap_fn_entry_protector_raw_reborrow_missed_ub() -> u32 {
+    let _pad1: u32 = 1u32;
+    let _pad2: u32 = 2u32;
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_write_alias_during_protected_reborrow(
+        unsafe { &*raw },
+        raw,
+        _pad1 + _pad2,
+    );
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
             "cat9_gap_callee_deref_ref_arg",
             r#"#[inline(never)]
 fn cat9_gap_read_ref_arg(r: &u32, bonus: u32) -> u32 {
@@ -2674,14 +2718,14 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     )
     .expect("evaluate Category 9 live batch");
 
-    assert_eq!(report.total_candidates, 10);
-    assert_eq!(report.compiled_candidates, 10);
+    assert_eq!(report.total_candidates, 11);
+    assert_eq!(report.compiled_candidates, 11);
     assert_eq!(report.agree_count, 5, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 5, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 6, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
-        ("unsound_missed_fault", 1usize),
+        ("unsound_missed_fault", 2usize),
         ("sound_conservative_abstraction", 4),
         ("value_mismatch", 0),
         ("harness_or_extraction_error", 0),
@@ -2693,7 +2737,7 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 5);
+    assert_eq!(report.findings.len(), 6);
     for f in &report.findings {
         assert!(f.kernel_confirmed, "finding `{}` must be kernel-confirmed", f.fn_name);
         assert_eq!(
@@ -2734,9 +2778,33 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             .find(|f| f.fn_name == name)
             .unwrap_or_else(|| panic!("missing finding `{name}`"))
     };
-    let unsound = finding("cat9_provenance_overwritten_byte_missed_ub");
-    assert_eq!(unsound.divergence_class, "missed_ub");
-    assert_eq!(unsound.witness_polarity, "unsound_missed_fault");
+    for name in [
+        "cat9_provenance_overwritten_byte_missed_ub",
+        "cat9_gap_fn_entry_protector_raw_reborrow_missed_ub",
+    ] {
+        let unsound = finding(name);
+        assert_eq!(unsound.divergence_class, "missed_ub", "`{name}`");
+        assert_eq!(unsound.witness_polarity, "unsound_missed_fault", "`{name}`");
+        assert!(unsound.kernel_confirmed, "`{name}` must be kernel-confirmed");
+    }
+    let prot_rep = item("cat9_gap_fn_entry_protector_raw_reborrow_missed_ub");
+    let prot_ub_line = cat9_line_of(&staged, "        *alias = 8u32;");
+    assert!(
+        matches!(
+            &prot_rep.miri,
+            MiriOutcome::Ub { pos: Some(p), message }
+                if p.line == prot_ub_line && message.contains("is forbidden")
+        ),
+        "expected Miri FnEntry protector UB at line {prot_ub_line}, got {:?}",
+        prot_rep.miri
+    );
+    assert_eq!(
+        prot_rep.anneal,
+        AnnealOutcome::PassScalar {
+            bits: 13,
+            size_bytes: 4
+        }
+    );
 
     // Each conservative pin is a Miri pass and an Anneal UB at exactly the
     // documented statement.

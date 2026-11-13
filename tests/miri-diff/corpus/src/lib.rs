@@ -893,11 +893,11 @@ pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
 //
 // Anneal currently mishandles memory that a reference argument points into
 // across a call boundary (see "Category 9 engine gaps" in
-// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins those it can
-// kernel-confirm). Every helper here therefore takes its `FnEntry`-protected
-// reference without dereferencing it, and only forwards or returns reborrows
-// of it: these seeds check reference-argument passing, reborrow return, frame
-// cleanup, and unwinding, not Anneal's protector enforcement.
+// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins all five gaps
+// with live kernel confirmation). Every helper here therefore takes its
+// `FnEntry`-protected reference without dereferencing it, and only forwards or
+// returns reborrows of it: these seeds check reference-argument passing,
+// reborrow return, frame cleanup, and unwinding, not protector enforcement.
 // ============================================================================
 
 use core::intrinsics::{
