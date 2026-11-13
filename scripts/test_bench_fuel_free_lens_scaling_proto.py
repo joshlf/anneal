@@ -295,6 +295,15 @@ class LeanSourceAuditTests(unittest.TestCase):
             "LatchEquiv.of_active", "applyReleaseProtector_read_eraseLatch",
             "stage1_vs_stage2Only_two_arg_release_unobservable",
             "stage1_vs_stage2Only_two_arg_release_same_verdicts",
+            "runUntilTarget_not_reached_iff_live_runMirToBlock_none",
+            "live_runMirToBlock_conflates_halt_stuck_outOfFuel",
+            "setSpineChecked?_eq_live_set?", "setSpineChecked?_eq_live_bind_forcePureEnv?",
+            "setSpineChecked?_symbolic_slot_rfl",
+            "applySlotUpdatesChecked_eq_live?", "applySlotUpdates_eq_of_checked",
+            "fieldsTyped_of_fieldsValid", "fieldsTyped_nested_init_padding_not_fieldsValid",
+            "not_lawfulMutLens_fieldLens_laidOutPair_typedAt", "applyFieldWrites_fieldsTyped_spec",
+            "stage1_write_release_observable_ub_separation",
+            "reborrow_return_after_parent_write_stage2Only_unique_write_perm",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
@@ -309,6 +318,19 @@ class LeanSourceAuditTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIn("(Trusted.Sequence.set? env u.1 u.2).bind forceSpine?", m.group(0))
         self.assertIn("applySlotUpdates_eq_of_twoPass", bench.proof("local_slots", "live_two_pass_rfl", 5))
+
+    def test_checked_single_pass_variant_and_stage1_separation(self):
+        """`local_slots/checked_single_pass_rfl` must measure bounds-checked `setSpineChecked?`
+        (matching `Trusted.Sequence.set?` unconditionally), and `stage1_write_release_observable_ub_separation`
+        must exhibit an observable `TreeAccessNoUB` separation."""
+        self.assertIn("checked_single_pass_rfl", bench.FAMILIES["local_slots"])
+        self.assertIn("applySlotUpdates_eq_of_checked",
+                      bench.proof("local_slots", "checked_single_pass_rfl", 5))
+        m = re.search(r"theorem stage1_write_release_observable_ub_separation\b(.*?):= by",
+                      self.code, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("¬ TreeAccessNoUB treeStage12", m.group(1))
+        self.assertIn("TreeAccessNoUB treeStage2Only", m.group(1))
 
     def test_live_hierarchy_and_return_bridges_present(self):
         for sym in (

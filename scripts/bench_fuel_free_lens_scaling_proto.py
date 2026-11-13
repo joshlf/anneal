@@ -70,7 +70,7 @@ DECISIONS = ("GO", "CONDITIONAL GO", "NO-GO")
 
 FAMILIES: dict[str, tuple[str, ...]] = {
     "local_slots": ("naive_rfl", "naive_simp", "ablation_projection_rfl", "live_two_pass_rfl",
-                    "optimized_forcePureEnv"),
+                    "checked_single_pass_rfl", "optimized_forcePureEnv"),
     "struct_fields": ("naive_rfl", "naive_simp", "optimized_typedAt_lens"),
     "loop_trip": ("naive_fuel_rfl", "naive_fuel_simp", "optimized_runCfgToBlock_forRangeUp"),
 }
@@ -209,6 +209,9 @@ def proof(family: str, variant: str, k: int) -> str:
             # The live `evalPureStmtNorm` strategy: bounds-checked `Trusted.Sequence.set?`
             # followed by a full spine-forcing pass after every update.
             return "applySlotUpdates_eq_of_twoPass rfl"
+        if variant == "checked_single_pass_rfl":
+            # Bounds-checked single-pass `setSpineChecked?` (`= Trusted.Sequence.set?` on all inputs).
+            return "applySlotUpdates_eq_of_checked rfl"
         if variant == "optimized_forcePureEnv":
             return "applySlotUpdates_eq_of_forced rfl"
     if family == "struct_fields":

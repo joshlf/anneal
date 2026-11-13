@@ -1311,6 +1311,44 @@ theorem runMirToBlock_reached_iff_step_and_live (body : CapturedMir)
   | fault =>
     exact Iff.intro (fun h => by cases h) (fun ⟨_, hs₁, _⟩ => by cases hs₁)
 
+/-- **Outcome-collapse characterization of live `Anneal.FunctionalTranslation.runMirToBlock`**:
+the live stepper returns `none` iff `runUntilTarget` does not return `.reached _`,
+thereby collapsing `.halted`, `.stuck`, and `.outOfFuel` into a single `none`. -/
+theorem runUntilTarget_not_reached_iff_live_runMirToBlock_none (body : CapturedMir)
+    (target : BasicBlockIdx) (bound : Nat) (s : MachineState) :
+    (∀ s_hit, runUntilTarget (mirStep body)
+      (fun ms => ms.frame.blockIdx == target && ms.frame.stmtIdx == 0) bound s ≠ .reached s_hit) ↔
+      Anneal.FunctionalTranslation.runMirToBlock (bound + 1) body target s = none := by
+  cases hlive : Anneal.FunctionalTranslation.runMirToBlock (bound + 1) body target s with
+  | none =>
+    refine Iff.intro (fun _ => rfl) (fun _ s_hit hreach => ?_)
+    have hsome := (runUntilTarget_reached_iff_live_runMirToBlock body target bound s s_hit).mp hreach
+    rw [hlive] at hsome
+    cases hsome
+  | some s_hit =>
+    refine Iff.intro (fun hall => ?_) (fun hnone => by cases hnone)
+    have hreach := (runUntilTarget_reached_iff_live_runMirToBlock body target bound s s_hit).mpr hlive
+    exact absurd hreach (hall s_hit)
+
+/-- **Concrete witness that live `Anneal.FunctionalTranslation.runMirToBlock` conflates
+normal halting, faulting, and out-of-fuel**: on the live `Anneal.MirLoops.countToNBody n`,
+stepping from the return block `bb3`, from an invalid block `bb99`, and from `bb0` with
+insufficient fuel all evaluate to `none` in the live stepper, whereas `runUntilTarget`
+distinguishes `.halted`, `.stuck`, and `.outOfFuel`. -/
+theorem live_runMirToBlock_conflates_halt_stuck_outOfFuel (n : Nat) :
+    let body := Anneal.MirLoops.countToNBody n
+    let atHdr := fun (ms : MachineState) => ms.frame.blockIdx == 1 && ms.frame.stmtIdx == 0
+    let sHalt := Anneal.MirLoops.countStateMem 3 0 n emptyMemory
+    let sFault := Anneal.MirLoops.countStateMem 99 0 0 emptyMemory
+    let sOOF := Anneal.MirLoops.countStateMem 0 0 0 emptyMemory
+    runUntilTarget (mirStep body) atHdr 7 sHalt = .halted (.normal (.scalar ⟨n, 4⟩, emptyMemory)) ∧
+      Anneal.FunctionalTranslation.runMirToBlock 8 body 1 sHalt = none ∧
+      runUntilTarget (mirStep body) atHdr 7 sFault = .stuck ∧
+      Anneal.FunctionalTranslation.runMirToBlock 8 body 1 sFault = none ∧
+      runUntilTarget (mirStep body) atHdr 1 sOOF = .outOfFuel ∧
+      Anneal.FunctionalTranslation.runMirToBlock 2 body 1 sOOF = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end LiveMirBridge
 
 /-! ## 6. Toy CFG shapes and the live `Anneal.PureMirExec.MirFragment` lattice -/
@@ -1890,6 +1928,96 @@ theorem evalPureStmtNorm_eq_bind_forceSpine?
   cases Anneal.MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt with
   | none => rfl
   | some rawEnv => exact (forceSpine?_eq_live rawEnv).symm
+
+/-- **Bounds-checked single-pass spine-forcing slot update**: unlike `setSpine?`
+(which returns `some []` out of bounds, matching `List.set` rather than
+`Trusted.Sequence.set?`), `setSpineChecked?` returns `none` out of bounds and
+forces the modified prefix `[0..loc]` in a single pass without calling
+`env.length` or traversing the suffix `[loc+1..)`, and without pattern-matching
+on untouched `LocalSlot` elements.  Benchmarked as
+`local_slots/checked_single_pass_rfl`. -/
+def setSpineChecked? {α : Type} : List α → Nat → α → Option (List α)
+  | [], _, _ => none
+  | _ :: xs, 0, v => some (v :: xs)
+  | x :: xs, i + 1, v =>
+    match setSpineChecked? xs i v with
+    | some xs' => some (x :: xs')
+    | none => none
+
+/-- **Exact unconditional agreement with live `Trusted.Sequence.set?`**:
+`setSpineChecked?` equals `Trusted.Sequence.set?` on every list and index
+(both in-bounds and out-of-bounds, with no `loc < env.length` side condition). -/
+theorem setSpineChecked?_eq_live_set? {α : Type} :
+    ∀ (env : List α) (loc : Nat) (v : α),
+      setSpineChecked? env loc v = Trusted.Sequence.set? env loc v
+  | [], loc, v => by
+    simp [setSpineChecked?, Trusted.Sequence.set?]
+  | x :: xs, 0, v => by
+    unfold Trusted.Sequence.set?
+    have h0 : 0 < (x :: xs).length := Nat.zero_lt_succ xs.length
+    rw [ite_eq_left h0]
+    rfl
+  | x :: xs, i + 1, v => by
+    have ih := setSpineChecked?_eq_live_set? xs i v
+    unfold Trusted.Sequence.set? at ih ⊢
+    by_cases hlt : i < xs.length
+    · have hlt' : i + 1 < (x :: xs).length := Nat.succ_lt_succ hlt
+      rw [ite_eq_left hlt] at ih
+      rw [ite_eq_left hlt']
+      simp only [setSpineChecked?, ih, List.set_cons_succ]
+    · have hlt' : ¬ i + 1 < (x :: xs).length := fun h => hlt (Nat.lt_of_succ_lt_succ h)
+      rw [ite_eq_right hlt] at ih
+      rw [ite_eq_right hlt']
+      simp only [setSpineChecked?, ih]
+
+/-- **Drop-in single-pass replacement for live `(set? env loc s).bind forcePureEnv?`**
+that also works when untouched prefix slots are symbolic `LocalSlot` variables. -/
+theorem setSpineChecked?_eq_live_bind_forcePureEnv? (env : Anneal.MirLiftCore.PureEnv)
+    (loc : Nat) (s : Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot) :
+    setSpineChecked? env loc s =
+      (Trusted.Sequence.set? env loc s).bind Anneal.MirLiftCore.forcePureEnv? := by
+  rw [setSpineChecked?_eq_live_set?]
+  cases Trusted.Sequence.set? env loc s with
+  | none => rfl
+  | some env' => exact (Anneal.MirLiftCore.forcePureEnv?_eq_some env').symm
+
+/-- **Symbolic `LocalSlot` framing by `rfl`**: unlike live `forcePureEnv?` and
+`setPureEnvSlot?` (both of which pattern-match on `.dead`/`.uninit`/`.init` at
+every prefix element and get stuck when an untouched slot is a symbolic
+`s₀ : LocalSlot`), `setSpineChecked?` reduces to `some [...]` by `rfl`. -/
+theorem setSpineChecked?_symbolic_slot_rfl
+    (s₀ s₁ : Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot)
+    (v₂ v₂' : Trusted.Rustc.V2026_06_01.MirSemantics.Value) :
+    setSpineChecked? [s₀, s₁, .init v₂] 2 (.init v₂') = some [s₀, s₁, .init v₂'] :=
+  rfl
+
+/-- Bounds-checked single-pass step-wise update chain (benchmarked as
+`local_slots/checked_single_pass_rfl`). -/
+def applySlotUpdatesChecked {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match setSpineChecked? env u.1 u.2 with
+    | some env' => applySlotUpdatesChecked ups env'
+    | none => none
+
+/-- `applySlotUpdatesChecked` equals the live `Trusted.Sequence.set?` chain on
+every update list (both in-bounds and out-of-bounds). -/
+theorem applySlotUpdatesChecked_eq_live? {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α),
+      applySlotUpdatesChecked ups env = applySlotUpdatesLive? ups env
+  | [], _ => rfl
+  | u :: ups, env => by
+    simp only [applySlotUpdatesChecked, applySlotUpdatesLive?, setSpineChecked?_eq_live_set?]
+    cases Trusted.Sequence.set? env u.1 u.2 with
+    | none => rfl
+    | some env' => exact applySlotUpdatesChecked_eq_live? ups env'
+
+/-- **Soundness of bounds-checked single-pass normalization**: a `rfl` proof of
+`applySlotUpdatesChecked` proves the unnormalized `applySlotUpdates` chain. -/
+theorem applySlotUpdates_eq_of_checked {α : Type} {ups : List (Nat × α)} {env flat : List α}
+    (h : applySlotUpdatesChecked ups env = some flat) : applySlotUpdates env ups = flat := by
+  rw [applySlotUpdatesChecked_eq_live?, ← applySlotUpdatesTwoPass_eq_live?] at h
+  exact applySlotUpdates_eq_of_twoPass h
 
 end ForcePureEnv
 
@@ -2754,6 +2882,136 @@ theorem subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous
       exact Or.inr (Or.inl rfl)
   · rw [ite_eq_right h₁]
     exact Or.inl rfl
+
+/-- Relational two-field validity (`TypedAt` at each field window, permitting
+arbitrary initialized or uninitialized internal padding inside nested padded
+field codecs, unlike `FieldsValid` / `CanonicalAt`). -/
+def FieldsTyped {α β : Type} {n₁ n₂ : Nat} (c₁ : FixedByteCodec α n₁) (base₁ : Nat)
+    (c₂ : FixedByteCodec β n₂) (base₂ : Nat) (mem : Mem) : Prop :=
+  (∃ a, TypedAt c₁ base₁ a mem) ∧ (∃ b, TypedAt c₂ base₂ b mem)
+
+theorem fieldsTyped_of_fieldsValid {α β : Type} {n₁ n₂ : Nat} (c₁ : FixedByteCodec α n₁)
+    (base₁ : Nat) (c₂ : FixedByteCodec β n₂) (base₂ : Nat) {mem : Mem}
+    (d₁ : α) (d₂ : β) (hv : FieldsValid c₁ base₁ c₂ base₂ mem) :
+    FieldsTyped c₁ base₁ c₂ base₂ mem :=
+  ⟨⟨_, typedAt_of_canonicalAt hv.1 d₁⟩, ⟨_, typedAt_of_canonicalAt hv.2 d₂⟩⟩
+
+/-- **Nested padded sub-structs separate `FieldsTyped` from `FieldsValid`**:
+when field 1 is itself a padded pair `laidOutPair u8 1 u8` with an initialized
+padding byte `.init p none`, relational `FieldsTyped` holds while canonical
+`FieldsValid` fails. -/
+theorem fieldsTyped_nested_init_padding_not_fieldsValid (a b p c : UInt8) :
+    let c₁ := laidOutPair Anneal.ByteCodec.FixedByteCodec.u8 1 Anneal.ByteCodec.FixedByteCodec.u8
+    let c₂ := Anneal.ByteCodec.FixedByteCodec.u8
+    let mem : Mem := [.init a none, .init p none, .init b none, .init c none]
+    FieldsTyped c₁ 0 c₂ 3 mem ∧ ¬ FieldsValid c₁ 0 c₂ 3 mem := by
+  intro c₁ c₂ mem
+  refine ⟨⟨⟨(a, b), rfl⟩, ⟨c, rfl⟩⟩, ?_⟩
+  rintro ⟨⟨⟨a', b'⟩, hslice⟩, _⟩
+  have hsl : sliceAbstractBytes mem 0 3 = some [.init a none, .init p none, .init b none] := rfl
+  rw [hsl, Option.some.injEq] at hslice
+  have henc := laidOutPair_encode_eq Anneal.ByteCodec.FixedByteCodec.u8 1
+    Anneal.ByteCodec.FixedByteCodec.u8 a' b'
+  rw [← hslice] at henc
+  simp [Anneal.ByteCodec.FixedByteCodec.u8, Anneal.ByteCodec.FixedByteCodec.ofRoundTrip] at henc
+
+/-- **Exact obstruction to `LawfulMutLens` without `CanonicalAt`**: on a padded
+codec `laidOutPair u8 1 u8`, `fieldLens` is *not* a `LawfulMutLens` over
+relational `∃ ab, TypedAt … mem`, because `writeBack_readView` overwrites an
+initialized padding byte `.init 1 none` with `.uninit`. -/
+theorem not_lawfulMutLens_fieldLens_laidOutPair_typedAt (d : UInt8 × UInt8) :
+    let c := laidOutPair Anneal.ByteCodec.FixedByteCodec.u8 1 Anneal.ByteCodec.FixedByteCodec.u8
+    ¬ Anneal.FunctionalTranslation.LawfulMutLens (fieldLens c 0 d)
+        (fun mem => ∃ ab, TypedAt c 0 ab mem) := by
+  intro c hLaw
+  have hv : ∃ ab, TypedAt c 0 ab ([.init 0 none, .init 1 none, .init 2 none] : Mem) := ⟨(0, 2), rfl⟩
+  have hgetput := hLaw.writeBack_readView ([.init 0 none, .init 1 none, .init 2 none] : Mem) hv
+  change ([.init 0 none, .uninit, .init 2 none] : Mem) = [.init 0 none, .init 1 none, .init 2 none] at hgetput
+  injection hgetput with _ htl
+  injection htl with hmid _
+  cases hmid
+
+/-- **Relational `FieldsTyped` suffices for `K` sequential `fieldLens` writes**:
+because `applyFieldWrites` uses only put-get and disjoint-field framing (never
+`writeBack_readView`), `applyFieldWrites` preserves `FieldsTyped` and computes
+`lastLeft`/`lastRight` even when the field codecs contain internal padding with
+non-canonical initialized bytes. -/
+theorem applyFieldWrites_fieldsTyped_spec {α β : Type} {n₁ n₂ : Nat}
+    (c₁ : FixedByteCodec α n₁) (c₂ : FixedByteCodec β n₂) (base₁ base₂ : Nat)
+    (d₁ : α) (d₂ : β) (hd : DisjointSlice base₁ n₁ base₂ n₂) :
+    ∀ (ws : List (α ⊕ β)) (mem : Mem),
+      FieldsTyped c₁ base₁ c₂ base₂ mem →
+      FieldsTyped c₁ base₁ c₂ base₂
+          (applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) ws mem) ∧
+        (fieldLens c₁ base₁ d₁).readView
+          (applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) ws mem) =
+          lastLeft ws ((fieldLens c₁ base₁ d₁).readView mem) ∧
+        (fieldLens c₂ base₂ d₂).readView
+          (applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) ws mem) =
+          lastRight ws ((fieldLens c₂ base₂ d₂).readView mem)
+  | [], _, hv => ⟨hv, rfl, rfl⟩
+  | .inl a :: ws, m, ⟨⟨a₀, ha₀⟩, ⟨b₀, hb₀⟩⟩ => by
+    have hb₁ : base₁ + n₁ ≤ m.length := ((typedAt_iff c₁ base₁ a₀ m).mp ha₀).1
+    have hwb : (fieldLens c₁ base₁ d₁).writeBack a m = splice m base₁ (c₁.encode a) :=
+      fieldLens_writeBack_eq c₁ d₁ a hb₁
+    have ha' : TypedAt c₁ base₁ a (splice m base₁ (c₁.encode a)) :=
+      readTyped_splice_same c₁ a hb₁
+    have hb' : TypedAt c₂ base₂ b₀ (splice m base₁ (c₁.encode a)) := by
+      show readTyped c₂ base₂ (splice m base₁ (c₁.encode a)) = some b₀
+      rw [readTyped_splice_disjoint c₁ c₂ a hb₁ hd]
+      exact hb₀
+    have ih := applyFieldWrites_fieldsTyped_spec c₁ c₂ base₁ base₂ d₁ d₂ hd ws
+      (splice m base₁ (c₁.encode a)) ⟨⟨a, ha'⟩, ⟨b₀, hb'⟩⟩
+    rw [show applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) (.inl a :: ws) m =
+        applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) ws (splice m base₁ (c₁.encode a))
+      from by simp only [applyFieldWrites, hwb]]
+    refine ⟨ih.1, ?_, ?_⟩
+    · rw [ih.2.1]
+      have hr : (fieldLens c₁ base₁ d₁).readView (splice m base₁ (c₁.encode a)) = a := by
+        show (readTyped c₁ base₁ (splice m base₁ (c₁.encode a))).getD d₁ = a
+        rw [ha']
+        rfl
+      rw [hr]
+      rfl
+    · rw [ih.2.2]
+      have hr : (fieldLens c₂ base₂ d₂).readView (splice m base₁ (c₁.encode a)) =
+          (fieldLens c₂ base₂ d₂).readView m := by
+        show (readTyped c₂ base₂ (splice m base₁ (c₁.encode a))).getD d₂ =
+          (readTyped c₂ base₂ m).getD d₂
+        rw [readTyped_splice_disjoint c₁ c₂ a hb₁ hd]
+      rw [hr]
+      rfl
+  | .inr b :: ws, m, ⟨⟨a₀, ha₀⟩, ⟨b₀, hb₀⟩⟩ => by
+    have hb₂ : base₂ + n₂ ≤ m.length := ((typedAt_iff c₂ base₂ b₀ m).mp hb₀).1
+    have hwb : (fieldLens c₂ base₂ d₂).writeBack b m = splice m base₂ (c₂.encode b) :=
+      fieldLens_writeBack_eq c₂ d₂ b hb₂
+    have hb' : TypedAt c₂ base₂ b (splice m base₂ (c₂.encode b)) :=
+      readTyped_splice_same c₂ b hb₂
+    have ha' : TypedAt c₁ base₁ a₀ (splice m base₂ (c₂.encode b)) := by
+      show readTyped c₁ base₁ (splice m base₂ (c₂.encode b)) = some a₀
+      rw [readTyped_splice_disjoint c₂ c₁ b hb₂ hd.symm]
+      exact ha₀
+    have ih := applyFieldWrites_fieldsTyped_spec c₁ c₂ base₁ base₂ d₁ d₂ hd ws
+      (splice m base₂ (c₂.encode b)) ⟨⟨a₀, ha'⟩, ⟨b, hb'⟩⟩
+    rw [show applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) (.inr b :: ws) m =
+        applyFieldWrites (fieldLens c₁ base₁ d₁) (fieldLens c₂ base₂ d₂) ws (splice m base₂ (c₂.encode b))
+      from by simp only [applyFieldWrites, hwb]]
+    refine ⟨ih.1, ?_, ?_⟩
+    · rw [ih.2.1]
+      have hr : (fieldLens c₁ base₁ d₁).readView (splice m base₂ (c₂.encode b)) =
+          (fieldLens c₁ base₁ d₁).readView m := by
+        show (readTyped c₁ base₁ (splice m base₂ (c₂.encode b))).getD d₁ =
+          (readTyped c₁ base₁ m).getD d₁
+        rw [readTyped_splice_disjoint c₂ c₁ b hb₂ hd.symm]
+      rw [hr]
+      rfl
+    · rw [ih.2.2]
+      have hr : (fieldLens c₂ base₂ d₂).readView (splice m base₂ (c₂.encode b)) = b := by
+        show (readTyped c₂ base₂ (splice m base₂ (c₂.encode b))).getD d₂ = b
+        rw [hb']
+        rfl
+      rw [hr]
+      rfl
 
 end TypedAtLenses
 
@@ -6256,6 +6514,166 @@ theorem restoreCallerProtectors_eq_live
   unfold Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors
   rw [hNoCallerProt]
 
+/-- **Observable post-return UB separation between Miri's stage-1 + stage-2
+release and stage-2-only release under function-entry + LIFO protector
+discipline**: on `rootTree 0`, a callee enters (`callId = 0`) with a protected
+`&mut` argument `t_arg = 1` on `⟨0, 1⟩`, writes byte `0` through `t_arg`
+(promoting `t_arg` to `Active` on byte `0`), and then reborrows an unprotected
+sibling `t_sib = 2` from `0` on neighboring range `⟨1, 2⟩` before returning.
+Every step in the callee and at return is UB-free, yet:
+- under Miri's two-stage release (`applyReleaseProtector` + `endCall`),
+  `t_arg`'s `Active` permission fires an implicit `AccessKind.write` at exit
+  that disables `t_sib` on byte `0` (`⟨.disabled, false⟩`), so post-return
+  caller reads and writes of byte `0` through `t_sib` fault with UB;
+- under stage-2-only release (`removeActiveProtector` / `restoreCallerProtectors`
+  without stage 1), `t_sib` remains `⟨.reservedFrz false, false⟩` on byte `0`,
+  so the identical post-return caller reads and writes succeed UB-free. -/
+theorem stage1_write_release_observable_ub_separation :
+    let active0 : ActiveProtectors := fun _ => false
+    let active1 := insertActiveProtector active0 0
+    let r0 : ByteRange := ⟨0, 1⟩
+    let r1 : ByteRange := ⟨1, 2⟩
+    let tree0 := rootTree 0
+    let tree1 := retagChild tree0 0 1 (some (.strong 0)) (.reservedFrz false) r0 active1
+    let tree2 := applyTreeAccess tree1 1 .write r0 active1 .visitChildrenOfAccessed
+    let tree3 := retagChild tree2 0 2 none (.reservedFrz false) r1 active1
+    let activePost := removeActiveProtector active1 0
+    let treeStage12 := applyReleaseProtector tree3 1 active1
+    let treeStage2Only := tree3
+    TreeAccessNoUB (insertChildNode tree0 0 1 (some (.strong 0)) (.reservedFrz false))
+        1 .read r0 active1 .visitChildrenOfAccessed ∧
+      TreeAccessNoUB tree1 1 .write r0 active1 .visitChildrenOfAccessed ∧
+      TreeAccessNoUB (insertChildNode tree2 0 2 none (.reservedFrz false))
+        2 .read r1 active1 .visitChildrenOfAccessed ∧
+      releaseProtectorNoUB tree3 1 active1 ∧
+      treeStage12.locState 2 0 = ⟨.disabled, false⟩ ∧
+      treeStage2Only.locState 2 0 = ⟨.reservedFrz false, false⟩ ∧
+      ¬ TreeAccessNoUB treeStage12 2 .read r0 activePost .visitChildrenOfAccessed ∧
+      ¬ TreeAccessNoUB treeStage12 2 .write r0 activePost .visitChildrenOfAccessed ∧
+      TreeAccessNoUB treeStage2Only 2 .read r0 activePost .visitChildrenOfAccessed ∧
+      TreeAccessNoUB treeStage2Only 2 .write r0 activePost .visitChildrenOfAccessed := by
+  intro active0 active1 r0 r1 tree0 tree1 tree2 tree3 activePost treeStage12 treeStage2Only
+  have hb0 : ∀ b, r0.contains b = true → b = 0 := by
+    intro b hb
+    have h := (ByteRange.contains_iff r0 b).mp hb
+    dsimp [r0] at h
+    omega
+  have hb1 : ∀ b, r1.contains b = true → b = 1 := by
+    intro b hb
+    have h := (ByteRange.contains_iff r1 b).mp hb
+    dsimp [r1] at h
+    omega
+  have hPres1 : ∀ n, (insertChildNode tree0 0 1 (some (.strong 0)) (.reservedFrz false)).present n = true →
+      n = 1 ∨ n = 0 := by
+    intro n hn
+    simp only [insertChildNode, tree0, rootTree, Bool.or_eq_true, decide_eq_true_eq] at hn
+    exact hn
+  have hPres2 : ∀ n, tree1.present n = true → n = 1 ∨ n = 0 := hPres1
+  have hPres3I : ∀ n, (insertChildNode tree2 0 2 none (.reservedFrz false)).present n = true →
+      n = 2 ∨ n = 1 ∨ n = 0 := by
+    intro n hn
+    simp only [insertChildNode, tree2, applyTreeAccess, tree1, retagChild, tree0, rootTree,
+      Bool.or_eq_true, decide_eq_true_eq] at hn
+    exact hn
+  have hPres3 : ∀ n, tree3.present n = true → n = 2 ∨ n = 1 ∨ n = 0 := hPres3I
+  have hAcc3 : ∀ b, (tree3.locState 1 b).accessed = true → b = 0 := by
+    intro b hAcc
+    by_cases hb : b = 0
+    · exact hb
+    · exfalso
+      have hnr0 : r0.contains b = false := by
+        cases hc : r0.contains b with
+        | false => rfl
+        | true => exact absurd (hb0 b hc) hb
+      by_cases h1 : b = 1
+      · subst h1
+        cases hAcc
+      · have hnr1 : r1.contains b = false := by
+          cases hc : r1.contains b with
+          | false => rfl
+          | true => exact absurd (hb1 b hc) h1
+        have h3 : tree3.locState 1 b = tree2.locState 1 b := by
+          show (applyTreeAccess (insertChildNode tree2 0 2 none (.reservedFrz false)) 2 .read r1
+            active1 .visitChildrenOfAccessed).locState 1 b = _
+          rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hnr1,
+            insertChildNode_locState_of_ne _ _ _ _ _ (by decide)]
+        rw [h3] at hAcc
+        have h2 : tree2.locState 1 b = tree1.locState 1 b :=
+          applyTreeAccess_locState_out tree1 1 .write r0 active1 .visitChildrenOfAccessed 1 b hnr0
+        rw [h2] at hAcc
+        have h1' : tree1.locState 1 b = ⟨.reservedFrz false, false⟩ := by
+          show (retagChild tree0 0 1 (some (.strong 0)) (.reservedFrz false) r0 active1).locState 1 b = _
+          rw [retagChild_locState_out _ _ _ _ _ _ _ _ _ hnr0, insertChildNode_locState_child]
+        rw [h1'] at hAcc
+        cases hAcc
+  refine ⟨?_, ?_, ?_, ?_, rfl, rfl, ?_, ?_, ?_, ?_⟩
+  · intro n b hP hb
+    have h := hb0 b hb; subst h
+    rcases hPres1 n hP with rfl | rfl <;> rfl
+  · intro n b hP hb
+    have h := hb0 b hb; subst h
+    rcases hPres2 n hP with rfl | rfl <;> rfl
+  · intro n b hP hb
+    have h := hb1 b hb; subst h
+    rcases hPres3I n hP with rfl | rfl | rfl <;> rfl
+  · intro n b hP hAcc
+    have h := hAcc3 b hAcc; subst h
+    rcases hPres3 n hP with rfl | rfl | rfl <;> rfl
+  · intro hNoUB
+    have h := hNoUB 2 0 rfl rfl
+    cases h
+  · intro hNoUB
+    have h := hNoUB 2 0 rfl rfl
+    cases h
+  · intro n b hP hb
+    have h := hb0 b hb; subst h
+    rcases hPres3 n hP with rfl | rfl | rfl <;> rfl
+  · intro n b hP hb
+    have h := hb0 b hb; subst h
+    rcases hPres3 n hP with rfl | rfl | rfl <;> rfl
+
+/-- **Child reborrows remain sound under stage-2-only release even after the
+callee activates `t_arg`**: unlike foreign sibling tags (which separate stage-1
+from stage-2-only in `stage1_write_release_observable_ub_separation`), a child
+`t_ret` reborrowed *under* `t_arg` after the callee writes through `t_arg` is a
+descendant skipped by `ChildrenVisitMode.skipChildrenOfAccessed` and retains
+`HasUniqueWritePerm` under stage-2-only `removeActiveProtector`. -/
+theorem reborrow_return_after_parent_write_stage2Only_unique_write_perm {tree0 : BorrowTree}
+    {t_parent t_arg t_ret : BorTag} {parentRange subRange : ByteRange}
+    {activeCaller : ActiveProtectors} {callId : CallId}
+    (hPerm0 : HasUniqueWritePerm tree0 t_parent parentRange activeCaller)
+    (hSub : subRange.Sub parentRange)
+    (hFreshArg : tree0.present t_arg = false) (hFreshRet : tree0.present t_ret = false)
+    (hRetNeArg : t_ret ≠ t_arg)
+    (hFreshCallId : ∀ n, tree0.present n = true → ∀ p, tree0.protector n = some p → p.callId ≠ callId)
+    (hCallFresh : activeCaller callId = false) :
+    let active1 := insertActiveProtector activeCaller callId
+    let tree1 := retagChild tree0 t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+      parentRange active1
+    let tree2 := applyTreeAccess tree1 t_arg .write parentRange active1 .visitChildrenOfAccessed
+    let tree3 := retagChild tree2 t_arg t_ret none (initPermOf .mut) subRange active1
+    let active_post := removeActiveProtector active1 callId
+    TreeAccessNoUB tree1 t_arg .write parentRange active1 .visitChildrenOfAccessed ∧
+      HasUniqueWritePerm tree3 t_ret subRange active_post ∧
+      TreeAccessNoUB tree3 t_ret .write subRange active_post .visitChildrenOfAccessed := by
+  intro active1 tree1 tree2 tree3 active_post
+  have hPerm0' := hasUniqueWritePerm_insert_fresh_callId hFreshCallId hPerm0
+  have hTree1Perm : HasUniqueWritePerm tree1 t_arg parentRange active1 :=
+    (retagChild_hasUniqueWritePerm (some (.strong callId)) fnEntry_writable hPerm0'
+      (ByteRange.Sub.refl _) hFreshArg).2
+  obtain ⟨hParentWriteNoUB, hTree2ArgPerm⟩ :=
+    local_access_preserves_hasUniqueWritePerm .write hTree1Perm (ByteRange.Sub.refl _)
+  have hFreshRet2 : tree2.present t_ret = false := by
+    show tree1.present t_ret = false
+    rw [retagChild_present, decide_eq_false hRetNeArg, Bool.false_or]
+    exact hFreshRet
+  have hTree3RetPerm : HasUniqueWritePerm tree3 t_ret subRange active1 :=
+    (retagChild_hasUniqueWritePerm none initPermOf_mut_writable hTree2ArgPerm hSub hFreshRet2).2
+  have hPost : HasUniqueWritePerm tree3 t_ret subRange active_post :=
+    hasUniqueWritePerm_remove_callId hCallFresh hTree3RetPerm
+  exact ⟨hParentWriteNoUB, hPost,
+    (local_access_preserves_hasUniqueWritePerm .write hPost (ByteRange.Sub.refl _)).1⟩
+
 end TreeBorrows
 
 /-! ## 10. Kernel axiom audit (`#guard_msgs in #print axioms`) -/
@@ -7485,5 +7903,57 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.restoreCallerProtectors_eq_live' depends on axioms: [Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms restoreCallerProtectors_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_not_reached_iff_live_runMirToBlock_none' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runUntilTarget_not_reached_iff_live_runMirToBlock_none
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_conflates_halt_stuck_outOfFuel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_conflates_halt_stuck_outOfFuel
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_set?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_eq_live_set?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_eq_live_bind_forcePureEnv?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpineChecked?_symbolic_slot_rfl' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpineChecked?_symbolic_slot_rfl
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesChecked_eq_live?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesChecked_eq_live?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdates_eq_of_checked' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdates_eq_of_checked
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_of_fieldsValid' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms fieldsTyped_of_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.fieldsTyped_nested_init_padding_not_fieldsValid' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms fieldsTyped_nested_init_padding_not_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.not_lawfulMutLens_fieldLens_laidOutPair_typedAt' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms not_lawfulMutLens_fieldLens_laidOutPair_typedAt
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyFieldWrites_fieldsTyped_spec' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyFieldWrites_fieldsTyped_spec
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_write_release_observable_ub_separation' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stage1_write_release_observable_ub_separation
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.reborrow_return_after_parent_write_stage2Only_unique_write_perm' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms reborrow_return_after_parent_write_stage2Only_unique_write_perm
 
 end Anneal.FuelFreeLoopAndTypedAtLensPrototype
