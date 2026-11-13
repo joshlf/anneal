@@ -240,19 +240,43 @@ class LeanSourceAuditTests(unittest.TestCase):
             "wpConverges_of_runCfgToBlock_halted", "runCfgToBlock_selfLoop_no_overshoot",
             "firstHitIn_of_runToTarget_reached", "forRangeUp_induction", "wpConverges_forRangeUp",
             "forRangeUp_eq_live", "no_uniform_fuel_countUp", "countUp_wpConverges_all_n",
-            "mirWpConverges_of_wpConverges", "mirStepsConverges_of_stepsTo", "inferMinFragment_toMirShape",
-            "forcePureEnv_eq_self", "getElem?_forcePureEnv", "forcePureEnv_set_comm", "chained_sets_collapse_rfl",
-            "forceSpine?_eq_live", "TypedAt.read_write_same", "TypedAt.frame_write", "writeTyped_eq_none_of_oob",
+            "evalFuel_infiniteLoop_outOfFuel", "not_wpConverges_infiniteLoop",
+            "runToTarget_infiniteLoop_outOfFuel",
+            "mirWpConverges_of_wpConverges", "mirStepsConverges_of_stepsTo",
+            "runMirToBlock_countToN_entry", "runMirToBlock_countToN_iter", "runMirToBlock_countToN_exit",
+            "live_countToN_mirWpConverges_all_n", "inferMinFragment_toMirShape",
+            "forcePureEnv_eq_self", "forcePureEnvD_eq_take_append_replicate",
+            "forcePureEnv_ne_self_of_length_ne", "forcePureEnv_eq_self_iff",
+            "getElem?_forcePureEnv", "forcePureEnv_set_comm", "chained_sets_collapse_rfl",
+            "forceSpine?_eq_live", "setSpine?_eq_some_set", "setSpine?_eq_forceSpine?_set",
+            "TypedAt.read_write_same", "TypedAt.frame_write", "writeTyped_eq_none_of_oob",
             "writeTyped_zero_width", "typedAt_zero_width_iff", "TypedAt.frame_write_adjacent",
-            "typedAt_laidOutPair_iff", "typedAt_laidOutPair_padding_write", "subplaceFieldLens_disjoint",
+            "typedAt_laidOutPair_iff", "typedAt_laidOutPair_padding_write",
+            "typedAt_of_canonicalAt", "typedAt_laidOutPair_of_fieldsValid",
+            "subplaceFieldLens_disjoint", "subplaceFieldLens_of_borrowSubplace_disjointOn",
             "reborrow_return_unique_write_perm", "reborrow_return_after_callee_write_unique_write_perm",
+            "reborrow_return_after_parent_write_unique_write_perm",
+            "callee_parent_write_after_reborrow_disables_child",
             "split_at_mut_unique_write_perm", "split_at_mut_mid_zero", "split_at_mut_mid_len",
             "trustedSpec_reborrow_equivalence", "same_tag_split_unsound_control",
-            "split_at_mut_rootTree_nonvacuous",
+            "overlapping_reborrowFootprint_write_disables_sibling",
+            "ofLiveTreeBorrowPerm?_toLiveTreeBorrowPerm", "toLiveTreeBorrowPerm_ofLiveTreeBorrowPerm?",
+            "liveBorrowEntryRange_contains_iff", "split_at_mut_rootTree_nonvacuous",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_mirStep_handles_emit_observations(self):
+        m = re.search(r"def mirStep .*? :=.*?\n\n", self.code, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn(".vis (.inr (.inl (.emit", m.group(0))
+
+    def test_live_bridges_present(self):
+        self.assertIn("Anneal.SepLogicLenses.BorrowSubplace.disjointOn", self.code)
+        self.assertIn("Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm", self.code)
+        self.assertIn("Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry", self.code)
+        self.assertIn("Anneal.MirLoops.countToNBody", self.code)
 
     def test_countUp_statement_has_no_fuel_numeral(self):
         m = re.search(r"theorem countUp_wpConverges_all_n (.*?) :=", self.code, re.S)

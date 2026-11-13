@@ -9,18 +9,17 @@ Everything here is validated directly against the live signatures of `Anneal.Pur
 **Decision: CONDITIONAL GO**
 
 Proceed with `ws-fuel-free-loop-lifting-and-typed-at-lenses` under the conditions in
-[Section 7](#7-decision-rationale-and-conditions): adopt fuel-free range-loop lifting and the
-`TypedAt` field lenses as designed (both win asymptotically and by a constant factor at every
-measured size), but adopt `forcePureEnv` only in its *step-wise spine-forcing* form (the live
-`forcePureEnv?` discipline), because the measurements show that end-of-chain projection does not
-by itself defeat the `Meta.whnf` smart-unfolding blow-up and that `simp` remains competitive for
-plain slot updates.
+[Section 7](#7-decision-rationale-and-conditions): adopt fuel-free range-loop lifting,
+`TypedAt` field lenses, and step-wise single-pass `setSpine?` / `forcePureEnv` normalization
+(all three now win both asymptotically and by a constant factor over `rfl` and `simp` at every
+measured size `K ∈ {5, 10, 20, 30}`), while ensuring `forcePureEnv` is applied step-wise rather
+than as an end-of-chain projection over an unforced `List.set` tower.
 
 ## 1. Deliverables
 
 | File | Contents |
 |---|---|
-| `theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean` | 217 kernel-checked theorems (0 `sorry`, 0 warnings), each audited by a `#guard_msgs in #print axioms` block (`propext` / `Quot.sound` only) |
+| `theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean` | 240 kernel-checked theorems (0 `sorry`, 0 warnings), each audited by a `#guard_msgs in #print axioms` block (`propext` / `Quot.sound` only) |
 | `scripts/bench_fuel_free_lens_scaling_proto.py` | Benchmark harness (`--dry-run`, `--verify-report`, `--update-report`) |
 | `scripts/test_bench_fuel_free_lens_scaling_proto.py` | Unit, negative/edge-case, proof-health, axiom-guard, hygiene, isolation, and report-consistency tests |
 | `PROTOTYPE_REPORT.md` | This report (tables + embedded JSON receipt are generated and machine-verified) |
@@ -46,8 +45,10 @@ plain slot updates.
   `runToTarget_of_firstHitIn` (completeness for every sufficient ceiling). Concrete witnesses:
   `runCfgToBlock_selfLoop_no_overshoot` (a self-looping header stops after exactly one
   iteration), `runCfgToBlock_countUp_iter` (re-entrant multi-block header),
-  `runCfgToBlock_stuck_example`, and `runToTarget_outOfFuel_vs_reached` (out-of-fuel is
-  inconclusive and ceiling-sensitive, never a fault or a halt).
+  `runCfgToBlock_stuck_example`, `runToTarget_outOfFuel_vs_reached` (out-of-fuel is
+  inconclusive and ceiling-sensitive, never a fault or a halt), and the non-terminating loop
+  `infiniteLoopCfg` (`evalFuel_infiniteLoop_outOfFuel`, `not_wpConverges_infiniteLoop`,
+  `runToTarget_infiniteLoop_outOfFuel`).
 * **`[lo, hi)` loops.** Structural `forRangeUp` with `forRangeUp_induction` and the fuel-free loop
   rule `wpConverges_forRangeUp`; **bridge** `forRangeUp_eq_live` proves it equal to the live
   well-founded `Anneal.MirLoops.forRangeUp` (and `live_forRangeUp_induction` transports
@@ -58,24 +59,32 @@ plain slot updates.
   `countUp_wpConverges_all_n` proves total correctness for every symbolic `n` (and accumulator)
   with no fuel numeral in the statement; `selfLoop_wpConverges_all_n` does the same for the
   self-loop.
-* **Live bridges.** `mirStep` embeds the trusted `stepMirFn` (silent steps continue, root returns
-  halt, everything else is conservatively a fault); `mirStepsConverges_of_stepsTo` and
+* **Live bridges.** `mirStep` embeds the trusted `stepMirFn` across both silent `.tau` steps and
+  `.switchInt` observation steps (`.vis (.inr (.inl (.emit (.event _))))`, matching live
+  `Anneal.FunctionalTranslation.runMirToBlock`), while root returns halt and external calls/faults
+  map conservatively to `.fault`; `mirStepsConverges_of_stepsTo` and
   `mirWpConverges_of_wpConverges` transport generic proofs to the live
   `Anneal.MirFuelFree.MirStepsConverges` / `MirWpConverges`; `mirWpConverges_of_stepsTo_bind`,
   `runMirToBlock` (+ soundness), and `mirWpConverges_forRangeUp` (stated with the live
-  `Anneal.MirLoops.forRangeUp`) complete the live API. `inferMinFragment_toMirShape` proves, for
+  `Anneal.MirLoops.forRangeUp`) complete the live API and are exercised end-to-end on the live
+  `CapturedMir` loop `Anneal.MirLoops.countToNBody n` (`runMirToBlock_countToN_entry`,
+  `runMirToBlock_countToN_iter`, `runMirToBlock_countToN_exit`, and
+  `live_countToN_mirWpConverges_all_n`). `inferMinFragment_toMirShape` proves, for
   *every* toy CFG, that the live classifier assigns its shape `.pureBoundedLoop` iff it has a
   back-edge and `.pureLoopFree` otherwise (via `hasCfgBackedge_toMirShape`);
   `inferMinFragment_refShape` shows a local `&mut` borrow lifts a shape to `.treeBorrowsLocal`.
 
 ### Pillar 2 — `forcePureEnv` slot-list normalization (Section 7)
 
-`forcePureEnv n env` projects the `n`-slot prefix (padding with `default`); proven:
-`forcePureEnv_eq_self`, `getElem?_forcePureEnv`, `length_forcePureEnvD`, `forcePureEnv_set_comm`
+`forcePureEnv n env` projects the `n`-slot prefix (padding with `default`) by single-pass pattern
+matching on `env`; proven: `forcePureEnv_eq_self`, `forcePureEnvD_eq_take_append_replicate`,
+`forcePureEnv_ne_self_of_length_ne`, `forcePureEnv_eq_self_iff` (exact length-mismatch
+characterization), `getElem?_forcePureEnv`, `length_forcePureEnvD`, `forcePureEnv_set_comm`
 (with the necessary side condition; `forcePureEnv_set_comm_counterexample` shows it cannot be
 dropped), and `chained_sets_collapse_rfl` (nested symbolic `List.set` updates collapse to a flat
 literal by `rfl`, no commutation lemmas). The step-wise form `applySlotUpdatesForced` re-forces the
-frame after every update with `forceSpine?`; `applySlotUpdates_eq_of_forced` makes a single `rfl`
+modified prefix after every update with `setSpine?` (proven equal to `forceSpine? (env.set i v)` via
+`setSpine?_eq_forceSpine?_set`); `applySlotUpdates_eq_of_forced` makes a single `rfl`
 prove the whole update sequence (`slotUpdates_collapse_forced`: 12 updates). Live bridges:
 `forceSpine?_eq_live` (agrees with `Anneal.MirLiftCore.forcePureEnv?` on every `PureEnv`),
 `forcePureEnvSlots_eq_self`, and `forcePureEnvSlots_set?` (commutes with the trusted
@@ -95,25 +104,35 @@ arbitrary bytes. Proven: `TypedAt.read_write_same`, `TypedAt.frame_write` and
 `typedAt_append_encode` (bridge to the live `sliceAbstractBytes_append_encode`), and for the padded
 codec `laidOutPair` (live `prod` + `padRight`): `typedAt_laidOutPair_iff`,
 `typedAt_laidOutPair_write_snd`, `typedAt_laidOutPair_padding_write` (arbitrary padding writes
-preserve the struct), `laidOutPair_encode_eq`, and `typedAt_laidOutPair_init_padding` (an
-initialized padding byte is still typed). `subplaceFieldLens_disjoint` builds live
+preserve the struct), `laidOutPair_encode_eq`, `typedAt_laidOutPair_init_padding` (an
+initialized padding byte is still typed), `typedAt_of_canonicalAt`, and
+`typedAt_laidOutPair_of_fieldsValid` (bridging `FieldsValid` to whole-struct `TypedAt` across
+arbitrary padding bytes). `subplaceFieldLens_disjoint` builds live
 `Anneal.FunctionalTranslation.LawfulMutLens` witnesses for both field lenses and a live
-`Anneal.SepLogicLenses.IndependentLenses` witness; `structLens_lawful` reuses the live
+`Anneal.SepLogicLenses.IndependentLenses` witness; `subplaceFieldLens_of_borrowSubplace_disjointOn`
+bridges live `Anneal.SepLogicLenses.BorrowSubplace.disjointOn` directly to `DisjointSlice`,
+`LawfulMutLens`, and `IndependentLenses`; `structLens_lawful` reuses the live
 `prodMutLens_lawful`; `applyFieldWrites_spec` discharges `K` sequential field writes with one lens
 law per write.
 
 ### Pillar 4 — pre-release `reborrowFootprint` protector specs (Section 9)
 
-Tree Borrows permissions `ReservedFrz`, `ReservedIM`, `Active`, `Frozen`, `Disabled` with the
+Tree Borrows permissions `ReservedFrz`, `ReservedIM`, `Active`, `Frozen`, `Disabled` (bridged
+injectively to the live `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm` via
+`ofLiveTreeBorrowPerm?_toLiveTreeBorrowPerm` / `toLiveTreeBorrowPerm_ofLiveTreeBorrowPerm?` and
+`BorrowEntry` via `liveBorrowEntryRange_contains_iff`) with the
 per-location automaton `performTransition`, a well-formed arbitrary-depth `BorrowTree`, the active
 call-id set, two-stage release (`applyReleaseProtector` with `ChildrenVisitMode.skipChildrenOfAccessed`
 while the call id is active, then `removeActiveProtector` = `GlobalState.endCall`), and
 `TrustedFnSpec` whose `reborrowFootprint : List (ByteRange × Mutability)` (live
 `Trusted.Rustc.V2026_06_01.MirAst.Mutability`) is applied before release. Proven:
 
-* `reborrow_return_unique_write_perm` and `reborrow_return_after_callee_write_unique_write_perm`
-  (`get_mut`; `HasUniqueWritePerm` includes the `NonAncestorSafe` isolation clause; both are stated
-  for the actual post-`endCall` protector set);
+* `reborrow_return_unique_write_perm`, `reborrow_return_after_callee_write_unique_write_perm`
+  (callee writes through child `t_ret` before return),
+  `reborrow_return_after_parent_write_unique_write_perm` (callee writes through parent `t_arg`
+  before reborrowing `t_ret`), and the negative dual
+  `callee_parent_write_after_reborrow_disables_child` (callee writing through parent `t_arg` on
+  `subRange` *after* reborrowing `t_ret` disables `t_ret`);
 * `split_at_mut_unique_write_perm` for every `mid ≤ len`: release is UB-free, both halves are
   uniquely writable, writing either half preserves the other's permission, after both writes the
   halves are `Active` on disjoint footprints, and a cross-half write through the left slice is UB;
@@ -125,9 +144,11 @@ while the call id is active, then `removeActiveProtector` = `GlobalState.endCall
   (progress) and every concrete outcome equals it (determinism), so concrete calls inherit the
   spec's `HasUniqueWritePerm` postconditions; `concreteSplitAtMut_requires_mid_le` shows the body
   panics otherwise;
-* `same_tag_split_unsound_control`: `TrustedFnSpec.runNoFootprint` returns both slices with the
-  argument tag, under which the cross-slice write is UB-free, while the faithful pre-release
-  footprint mints distinct tags under which the same access is UB.
+* `same_tag_split_unsound_control` and `overlapping_reborrowFootprint_write_disables_sibling`:
+  `TrustedFnSpec.runNoFootprint` returns both slices with the argument tag (allowing UB-free
+  cross-slice aliasing writes), whereas `TrustedFnSpec.run` with disjoint footprints rejects
+  cross-slice writes and `TrustedFnSpec.run` with overlapping `&mut` footprints disables the
+  sibling reference upon writing the overlap byte.
 
 ## 3. Receipts (pass A0)
 
@@ -180,26 +201,26 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_rfl` | 15 ms / 145 k | 90 ms / 1105 k | timeout (> 200 M hb) | skipped (censored) |
-| `naive_simp` | 20 ms / 156 k | 31 ms / 245 k | 47 ms / 423 k | 66 ms / 609 k |
-| `ablation_projection_rfl` | 85 ms / 847 k | 1318 ms / 14581 k | timeout (> 200 M hb) | skipped (censored) |
-| `optimized_forcePureEnv` | 21 ms / 207 k | 35 ms / 349 k | 62 ms / 633 k | 90 ms / 929 k |
+| `naive_rfl` | 16 ms / 145 k | 109 ms / 1105 k | timeout (> 200 M hb) | skipped (censored) |
+| `naive_simp` | 16 ms / 156 k | 24 ms / 245 k | 48 ms / 423 k | 64 ms / 609 k |
+| `ablation_projection_rfl` | 27 ms / 249 k | 193 ms / 2140 k | timeout (> 200 M hb) | skipped (censored) |
+| `optimized_forcePureEnv` | 15 ms / 137 k | 22 ms / 214 k | 38 ms / 366 k | 55 ms / 525 k |
 
 #### `struct_fields`
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_rfl` | 86 ms / 848 k | 2084 ms / 21109 k | timeout (> 200 M hb) | skipped (censored) |
-| `naive_simp` | 57 ms / 409 k | 81 ms / 507 k | 93 ms / 695 k | 116 ms / 889 k |
-| `optimized_typedAt_lens` | 16 ms / 133 k | 21 ms / 201 k | 37 ms / 338 k | 50 ms / 475 k |
+| `naive_rfl` | 90 ms / 848 k | 2157 ms / 21109 k | timeout (> 200 M hb) | skipped (censored) |
+| `naive_simp` | 55 ms / 409 k | 66 ms / 507 k | 90 ms / 695 k | 113 ms / 889 k |
+| `optimized_typedAt_lens` | 15 ms / 133 k | 22 ms / 201 k | 37 ms / 338 k | 50 ms / 475 k |
 
 #### `loop_trip`
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_fuel_rfl` | 5203 ms / 56665 k | timeout (> 200 M hb) | skipped (censored) | skipped (censored) |
-| `naive_fuel_simp` | 306 ms / 1979 k | 679 ms / 4308 k | 1892 ms / 11172 k | 4167 ms / 21063 k |
-| `optimized_runCfgToBlock_forRangeUp` | 21 ms / 158 k | 21 ms / 158 k | 20 ms / 158 k | 22 ms / 158 k |
+| `naive_fuel_rfl` | 4747 ms / 56665 k | timeout (> 200 M hb) | skipped (censored) | skipped (censored) |
+| `naive_fuel_simp` | 317 ms / 1979 k | 743 ms / 4308 k | 2032 ms / 11172 k | 4186 ms / 21063 k |
+| `optimized_runCfgToBlock_forRangeUp` | 21 ms / 158 k | 22 ms / 158 k | 22 ms / 158 k | 23 ms / 158 k |
 
 <details><summary>Embedded JSON receipt (verified by <code>--verify-report</code>)</summary>
 
@@ -207,18 +228,18 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
 {
  "cpu_count": 8,
  "file_wall_ms_median": {
-  "local_slots/ablation_projection_rfl": 21819,
-  "local_slots/naive_rfl": 19344,
-  "local_slots/naive_simp": 2642,
-  "local_slots/optimized_forcePureEnv": 2809,
-  "loop_trip/naive_fuel_rfl": 31151,
-  "loop_trip/naive_fuel_simp": 9665,
-  "loop_trip/optimized_runCfgToBlock_forRangeUp": 2587,
-  "struct_fields/naive_rfl": 24030,
-  "struct_fields/naive_simp": 2944,
-  "struct_fields/optimized_typedAt_lens": 2751
+  "local_slots/ablation_projection_rfl": 20219,
+  "local_slots/naive_rfl": 20106,
+  "local_slots/naive_simp": 2697,
+  "local_slots/optimized_forcePureEnv": 2694,
+  "loop_trip/naive_fuel_rfl": 28639,
+  "loop_trip/naive_fuel_simp": 9824,
+  "loop_trip/optimized_runCfgToBlock_forRangeUp": 2639,
+  "struct_fields/naive_rfl": 27106,
+  "struct_fields/naive_simp": 2947,
+  "struct_fields/optimized_typedAt_lens": 2644
  },
- "generated_at_utc": "2026-11-13T16:26:37Z",
+ "generated_at_utc": "2026-11-13T16:59:15Z",
  "heartbeat_budget": 200000,
  "ks": [
   5,
@@ -228,8 +249,8 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
  ],
  "lean_toolchain": "leanprover/lean4:v4.34.1",
  "prototype": "theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean",
- "prototype_compile_ms": 7755,
- "prototype_sha256": "3c5ae89bc701b461c8d7ac5b6172965e1a3f0ebe1cd2c0640dceb8f3eb7b4d4f",
+ "prototype_compile_ms": 7793,
+ "prototype_sha256": "fe530bc8b5fb341d7dd58835e2106e97c7682bd02bf63d21aab73b8feffd409f",
  "repetitions": 3,
  "results": [
   {
@@ -241,10 +262,10 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 145,
-   "median_ms": 15,
+   "median_ms": 16,
    "ms_samples": [
-    15,
-    14,
+    16,
+    13,
     16
    ],
    "status": "ok",
@@ -259,11 +280,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 1105,
-   "median_ms": 90,
+   "median_ms": 109,
    "ms_samples": [
-    94,
-    89,
-    90
+    112,
+    91,
+    109
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -297,11 +318,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 156,
-   "median_ms": 20,
+   "median_ms": 16,
    "ms_samples": [
-    20,
     16,
-    23
+    16,
+    17
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -315,11 +336,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 245,
-   "median_ms": 31,
+   "median_ms": 24,
    "ms_samples": [
-    31,
-    28,
-    37
+    23,
+    24,
+    29
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -333,11 +354,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 423,
-   "median_ms": 47,
+   "median_ms": 48,
    "ms_samples": [
-    46,
-    47,
-    59
+    42,
+    61,
+    48
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -351,11 +372,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 609,
-   "median_ms": 66,
+   "median_ms": 64,
    "ms_samples": [
-    66,
-    61,
-    78
+    58,
+    78,
+    64
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -363,17 +384,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    847151,
-    847151,
-    847151
+    249487,
+    249487,
+    249487
    ],
    "k": 5,
-   "kilo_heartbeats": 847,
-   "median_ms": 85,
+   "kilo_heartbeats": 249,
+   "median_ms": 27,
    "ms_samples": [
-    86,
-    85,
-    82
+    25,
+    27,
+    32
    ],
    "status": "ok",
    "variant": "ablation_projection_rfl"
@@ -381,17 +402,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    14580910,
-    14580910,
-    14580910
+    2140284,
+    2140284,
+    2140284
    ],
    "k": 10,
-   "kilo_heartbeats": 14581,
-   "median_ms": 1318,
+   "kilo_heartbeats": 2140,
+   "median_ms": 193,
    "ms_samples": [
-    1289,
-    1365,
-    1318
+    193,
+    181,
+    226
    ],
    "status": "ok",
    "variant": "ablation_projection_rfl"
@@ -419,17 +440,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    206931,
-    206931,
-    206931
+    137212,
+    137212,
+    137212
    ],
    "k": 5,
-   "kilo_heartbeats": 207,
-   "median_ms": 21,
+   "kilo_heartbeats": 137,
+   "median_ms": 15,
    "ms_samples": [
-    22,
-    19,
-    21
+    15,
+    15,
+    13
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -437,17 +458,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    349436,
-    349436,
-    349436
+    214428,
+    214428,
+    214428
    ],
    "k": 10,
-   "kilo_heartbeats": 349,
-   "median_ms": 35,
+   "kilo_heartbeats": 214,
+   "median_ms": 22,
    "ms_samples": [
-    38,
-    32,
-    35
+    28,
+    21,
+    22
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -455,17 +476,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    632658,
-    632658,
-    632658
+    365881,
+    365881,
+    365881
    ],
    "k": 20,
-   "kilo_heartbeats": 633,
-   "median_ms": 62,
+   "kilo_heartbeats": 366,
+   "median_ms": 38,
    "ms_samples": [
-    64,
-    62,
-    62
+    41,
+    38,
+    37
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -473,17 +494,17 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
   {
    "family": "local_slots",
    "hb_samples": [
-    928658,
-    928658,
-    928658
+    525001,
+    525001,
+    525001
    ],
    "k": 30,
-   "kilo_heartbeats": 929,
-   "median_ms": 90,
+   "kilo_heartbeats": 525,
+   "median_ms": 55,
    "ms_samples": [
-    108,
-    90,
-    89
+    57,
+    55,
+    53
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -497,11 +518,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 848,
-   "median_ms": 86,
+   "median_ms": 90,
    "ms_samples": [
-    97,
-    83,
-    86
+    82,
+    90,
+    93
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -515,11 +536,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 21109,
-   "median_ms": 2084,
+   "median_ms": 2157,
    "ms_samples": [
-    2132,
-    2084,
-    1947
+    1929,
+    2157,
+    2278
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -553,11 +574,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 409,
-   "median_ms": 57,
+   "median_ms": 55,
    "ms_samples": [
-    74,
-    56,
-    57
+    54,
+    59,
+    55
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -571,11 +592,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 507,
-   "median_ms": 81,
+   "median_ms": 66,
    "ms_samples": [
-    88,
-    72,
-    81
+    66,
+    68,
+    64
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -589,11 +610,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 695,
-   "median_ms": 93,
+   "median_ms": 90,
    "ms_samples": [
-    96,
-    86,
-    93
+    83,
+    90,
+    92
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -607,11 +628,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 889,
-   "median_ms": 116,
+   "median_ms": 113,
    "ms_samples": [
-    128,
-    107,
-    116
+    110,
+    113,
+    115
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -625,11 +646,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 133,
-   "median_ms": 16,
+   "median_ms": 15,
    "ms_samples": [
-    16,
     14,
-    20
+    15,
+    15
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -643,11 +664,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 201,
-   "median_ms": 21,
+   "median_ms": 22,
    "ms_samples": [
-    21,
-    21,
-    29
+    25,
+    22,
+    22
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -663,9 +684,9 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    "kilo_heartbeats": 338,
    "median_ms": 37,
    "ms_samples": [
+    37,
     39,
-    34,
-    37
+    35
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -681,8 +702,8 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    "kilo_heartbeats": 475,
    "median_ms": 50,
    "ms_samples": [
+    50,
     54,
-    49,
     50
    ],
    "status": "ok",
@@ -697,11 +718,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 56665,
-   "median_ms": 5203,
+   "median_ms": 4747,
    "ms_samples": [
-    5203,
-    5445,
-    4654
+    5364,
+    4747,
+    4669
    ],
    "status": "ok",
    "variant": "naive_fuel_rfl"
@@ -745,11 +766,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 1979,
-   "median_ms": 306,
+   "median_ms": 317,
    "ms_samples": [
-    313,
-    306,
-    289
+    317,
+    400,
+    271
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -763,11 +784,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 4308,
-   "median_ms": 679,
+   "median_ms": 743,
    "ms_samples": [
-    630,
-    804,
-    679
+    743,
+    785,
+    676
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -781,11 +802,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 11172,
-   "median_ms": 1892,
+   "median_ms": 2032,
    "ms_samples": [
-    1892,
-    2120,
-    1878
+    1833,
+    2042,
+    2032
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -799,11 +820,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 21063,
-   "median_ms": 4167,
+   "median_ms": 4186,
    "ms_samples": [
-    3949,
-    4167,
-    4253
+    4186,
+    4727,
+    3881
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -819,9 +840,9 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    "kilo_heartbeats": 158,
    "median_ms": 21,
    "ms_samples": [
-    21,
-    24,
-    20
+    20,
+    26,
+    21
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -835,10 +856,10 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 158,
-   "median_ms": 21,
+   "median_ms": 22,
    "ms_samples": [
-    21,
-    24,
+    22,
+    28,
     21
    ],
    "status": "ok",
@@ -853,11 +874,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 158,
-   "median_ms": 20,
+   "median_ms": 22,
    "ms_samples": [
-    20,
-    23,
-    20
+    22,
+    28,
+    19
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -871,11 +892,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 158,
-   "median_ms": 22,
+   "median_ms": 23,
    "ms_samples": [
-    21,
-    25,
-    22
+    23,
+    32,
+    19
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -891,51 +912,54 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
 
 Measured claims (quoted verbatim from the receipt by `--verify-report`):
 
-- `local_slots/optimized_forcePureEnv` at K = 30: 929 k heartbeats
+- `local_slots/optimized_forcePureEnv` at K = 30: 525 k heartbeats
 - `struct_fields/optimized_typedAt_lens` at K = 30: 475 k heartbeats
 - `loop_trip/optimized_runCfgToBlock_forRangeUp` at K = 30: 158 k heartbeats
 
-Interpretation (A0 receipt):
+Interpretation (B1 receipt):
 
 * **Loops.** The fuel-free proof costs 158 k heartbeats at every trip count, while explicit fuel
   grows from 1979 k to 21063 k (K = 5 → 30) under `simp` and needs 56665 k at K = 5 and times out
   from K = 10 under `rfl`.
 * **Struct fields.** The `TypedAt` lens proof (133 k → 475 k) is 1.9–3.1× cheaper than byte-list
   `simp` (409 k → 889 k); byte-level `rfl` grows from 848 k to 21109 k and times out from K = 20.
-* **Local slots.** Step-wise `forcePureEnv` forcing is linear (207 k → 929 k) but 1.3–1.5× more
-  expensive than `simp` (156 k → 609 k); plain `rfl` (145 k → 1105 k) and the end-of-chain
-  projection ablation (847 k → 14581 k) both time out from K = 20.
+* **Local slots.** After B1's single-pass `setSpine?` fix (replacing A0's two-pass
+  `forceSpine? (env.set ...)` traversal) and single-match `forcePureEnvD`, step-wise
+  `optimized_forcePureEnv` scales linearly (137 k → 525 k, 15 ms → 55 ms) and **beats** `naive_simp`
+  (156 k → 609 k, 16 ms → 64 ms) at every measured `K ∈ {5, 10, 20, 30}`, while plain `rfl`
+  (145 k → 1105 k) and end-of-chain projection (249 k → 2140 k, improved 6.8× at K = 10 by removing
+  `headD`/`tail` duplication) both time out from K = 20.
 
 ## 6. Track A integration mapping
 
 | Live module | Prototype artifact | Track A action |
 |---|---|---|
-| `MirFuelFree.lean` | `mirStep`, `mirWpConverges_of_wpConverges`, `mirStepsConverges_of_stepsTo`, `mirWpConverges_of_stepsTo_bind`, `runMirToBlock` | Add a `runMirToBlock`-style header stepper next to `MirStepsConverges.step_tau`; reuse the generic `StepsTo` / `FirstHitIn` lemmas (stated over any deterministic step) |
-| `MirLoops.lean` | `forRangeUp_eq_live`, `live_forRangeUp_induction`, `wpConverges_forRangeUp`, `mirWpConverges_forRangeUp` | Either replace the well-founded `forRangeUp` by the structural one (kernel-reducible; proven equal) or keep both with `forRangeUp_eq_live` as the bridge; add the tau-fragment range rule beside `mirTraceWpConverges_forRangeUp` |
+| `MirFuelFree.lean` | `mirStep`, `mirWpConverges_of_wpConverges`, `mirStepsConverges_of_stepsTo`, `mirWpConverges_of_stepsTo_bind`, `runMirToBlock` | Add a `runMirToBlock`-style header stepper next to `MirStepsConverges.step_emit`; reuse the generic `StepsTo` / `FirstHitIn` lemmas |
+| `MirLoops.lean` | `forRangeUp_eq_live`, `live_forRangeUp_induction`, `wpConverges_forRangeUp`, `mirWpConverges_forRangeUp`, `live_countToN_mirWpConverges_all_n` | Either replace the well-founded `forRangeUp` by the structural one (kernel-reducible; proven equal) or keep both with `forRangeUp_eq_live` as the bridge |
 | `PureMirExec.lean` | `toMirShape`, `hasCfgBackedge_toMirShape`, `inferMinFragment_toMirShape`, `inferMinFragment_refShape`, `fragment_levels_strict` | Route Pillar 1 obligations by `inferMinFragment` (`.pureLoopFree` / `.pureBoundedLoop`) and Pillar 4 obligations to `.treeBorrowsLocal` |
-| `MirLiftCore.lean` | `forcePureEnv`, `forceSpine?`, `forceSpine?_eq_live`, `applySlotUpdatesForced`, `forcePureEnvSlots_set?` | Keep `forcePureEnv?` as the normalizer of record and make every `LiftStmt` step re-force the frame (as `evalPureStmtNorm` already does); add the projection lemmas for slot reads |
-| `ByteCodec.lean` | `TypedAt`, `readTyped`, `writeTyped`, `DisjointSlice`, `laidOutPair`, `typedAt_append_encode`, `typedAt_laidOutPair_iff` | Host the relational `TypedAt` and frame rules over the trusted byte primitives; add the `laidOutPair` field-projection lemmas |
-| `SepLogicLenses.lean` | `fieldLens`, `subplaceFieldLens_disjoint`, `structLens_lawful`, `applyFieldWrites_spec`, Tree Borrows model and `TrustedFnSpec` | Instantiate `IndependentLenses` for byte-addressed fields; connect `BorrowSubplace` disjointness to `DisjointSlice`; host `TrustedFnSpec.reborrowFootprint` with the pre-release ordering |
+| `MirLiftCore.lean` | `forcePureEnv`, `forceSpine?`, `setSpine?`, `forceSpine?_eq_live`, `applySlotUpdatesForced`, `forcePureEnvSlots_set?` | Use single-pass `setSpine?` (or `forcePureEnv?`) after each `LiftStmt` step (`evalPureStmtNorm`); add the projection and length-mismatch lemmas |
+| `ByteCodec.lean` | `TypedAt`, `readTyped`, `writeTyped`, `DisjointSlice`, `laidOutPair`, `typedAt_append_encode`, `typedAt_laidOutPair_iff`, `typedAt_laidOutPair_of_fieldsValid` | Host the relational `TypedAt` and frame rules over the trusted byte primitives; add the `laidOutPair` field-projection lemmas |
+| `SepLogicLenses.lean` | `fieldLens`, `subplaceFieldLens_disjoint`, `subplaceFieldLens_of_borrowSubplace_disjointOn`, `structLens_lawful`, `applyFieldWrites_spec`, Tree Borrows model and `TrustedFnSpec` | Instantiate `IndependentLenses` for byte-addressed fields via `BorrowSubplace.disjointOn`; host `TrustedFnSpec.reborrowFootprint` with the pre-release ordering |
 
 ## 7. Decision rationale and conditions
 
-**CONDITIONAL GO.** Pillars 1, 3, and 4 are proven end-to-end against the live signatures with
-constructive axioms, and the optimized strategies dominate the naive ones at every measured size
-(see the tables): the fuel-free loop proof is constant in the trip count while explicit-fuel proofs
-grow or time out, and the `TypedAt` lens proof scales linearly with a smaller constant than byte-list
-`simp` while byte-level `rfl` blows up. Conditions:
+**CONDITIONAL GO.** All four pillars are proven end-to-end against the live signatures with
+constructive axioms, and after Round B1's `setSpine?` and `mirStep` fixes, the optimized strategy in
+**every** benchmark family (`local_slots`, `struct_fields`, `loop_trip`) dominates both `naive_rfl`
+and `naive_simp` at every measured size `K ∈ {5, 10, 20, 30}`. Conditions:
 
-1. **`forcePureEnv` must be step-wise.** Projection of a fully nested `List.set` chain re-evaluates
-   the chain under smart unfolding (row `ablation_projection_rfl`); only re-forcing after every
-   update (the live `forcePureEnv?` discipline, `applySlotUpdatesForced`) is linear. Plain `simp`
-   is also linear and 1.3–1.5× cheaper, so `forcePureEnv` is justified for `rfl`/reflection-driven
-   lifting (`LiftStmtsTerminator.cons_eval_norm`), not as a general replacement for `simp`.
-2. **Generalize the MIR bridge beyond the silent fragment.** `mirStep` maps visible events, calls,
-   and faults to `.fault`, so only call-free silent executions transfer; Track A must add the event
-   and call cases (or route those bodies through the existing trace-based rules).
-3. **Connect the Tree Borrows model to the live memory state.** The Pillar 4 model is an
-   independent mechanization (no `Cell`, contiguous ranges, functional trees); Track A must refine
-   the live borrow state (`BorrowEntry`, protectors) to it or port the lemmas.
+1. **`forcePureEnv` must be applied step-wise (`setSpine?` / `forcePureEnv?`), not only at the end
+   of an unforced `List.set` chain.** Projection of an already-nested `List.set` chain still incurs
+   smart-unfolding blow-up in `Meta.whnf` (row `ablation_projection_rfl`); only forcing the spine at
+   each update (`setSpine?` / `applySlotUpdatesForced`) achieves linear scaling and beats `simp`.
+2. **Extend `mirStep` with external call handling when lifting `.fullMir` bodies.** Round B1 fixed
+   `mirStep` to step across `.switchInt` observation events (`.vis (.inr (.inl (.emit (.event _))))`)
+   and verified live `Anneal.MirLoops.countToNBody n` end-to-end; bodies that make external calls
+   still require the full `MirTraceWpConverges` / call-spec rules.
+3. **Integrate `TrustedFnSpec.reborrowFootprint` with the live `BorrowEntry` table.** Round B1 added
+   the explicit permission bijection (`ofLiveTreeBorrowPerm?_toLiveTreeBorrowPerm`,
+   `toLiveTreeBorrowPerm_ofLiveTreeBorrowPerm?`) and `BorrowEntry` range/protector projections;
+   Track A must wire `TrustedFnSpec.run` into `evalTerminator` call handling.
 4. **Keep the constructive-axiom audit.** The core `List.drop_take` uses `Classical.choice`, and
    `omega` inserts `Classical.byContradiction` on non-atomic goals; the prototype avoids both
    (`drop_take_add`, split conjunctions), and Track A should keep a `#guard_msgs` axiom audit.
@@ -951,15 +975,16 @@ grow or time out, and the `TypedAt` lens proof scales linearly with a smaller co
   (`zeroWidth_write_read_asymmetry`); Track A specs over zero-sized types must account for it.
 * **Relational vs exact typing.** Exact-encoding predicates reject initialized padding; the
   relational `TypedAt` accepts it (`typedAt_laidOutPair_init_padding`), while lens lawfulness
-  requires canonical encodings (`CanonicalAt`, `FieldsValid`).
-* **`omega` and abbreviations.** `omega` does not see through `abbrev BorTag := Nat`; tag
-  arithmetic uses explicit `Nat` lemmas.
-* **Limitations.** The CFG language of Pillar 1 is a toy (one instruction per block) related to live
-  MIR by the `mirStep` bridge and by shape (`toMirShape`), not by a semantic compiler; no concrete
-  live `CapturedMir` is executed through `mirStep`. Heartbeats are thread-local elaboration
-  heartbeats; wall-clock figures are single-host medians. The struct-field optimized proof applies
-  `applyFieldWrites_spec`, which is proven once in the prototype module (compile time recorded in the
-  receipt as `prototype_compile_ms`).
+  requires canonical encodings (`CanonicalAt`, `FieldsValid`, bridged to whole-struct `TypedAt` by
+  `typedAt_laidOutPair_of_fieldsValid`).
+* **Overlapping `reborrowFootprint` vs omitted footprint.** Omitting `reborrowFootprint` aliases the
+  parent tag and unsoundly permits cross-slice writes (`same_tag_split_unsound_control`), whereas an
+  overlapping `reborrowFootprint` mints sibling tags where writing the overlap byte through one
+  sibling disables the other (`overlapping_reborrowFootprint_write_disables_sibling`).
+* **Limitations.** Heartbeats are thread-local elaboration heartbeats; wall-clock figures are
+  single-host medians. The struct-field optimized proof applies `applyFieldWrites_spec`, which is
+  proven once in the prototype module (compile time recorded in the receipt as
+  `prototype_compile_ms`).
 
 ## 9. Adversarial round log
 
@@ -972,3 +997,16 @@ forcing after measuring the blow-up, made `TypedAt` relational so padding conten
 stated the `get_mut` / `split_at_mut` results for the true post-`endCall` protector set, proved the
 first-hit characterization of `runToTarget` (no overshoot), and added non-vacuity witnesses
 (`split_at_mut_rootTree_nonvacuous`, concrete `countUp` / self-loop examples).
+
+### Round B1 (Agent B, Model Y) — critique and fixes against A0 (`9029805b`)
+
+1. **[CRITICAL — Pillar 1 Live MIR Bridge Bug] `mirStep` & `runMirToBlock` faulted on every `.switchInt` loop header in live MIR.**
+   In `Trusted.Rustc.V2026_06_01.MirSemantics`, `.switchInt` emits `.vis (.inr (.inl (.emit (.event sc.bits)))) (fun _ => .running s')` (`MirStepNode.emitStep`). A0's `mirStep` matched only `.tau (.running s')` and mapped every `.vis` node to `.fault`, causing `runMirToBlock` to return `.stuck` on every conditional branch and loop in live MIR. Fixed `mirStep` to continue on `.vis (.inr (.inl (.emit (.event _))))` (matching live `Anneal.FunctionalTranslation.runMirToBlock`), updated `stepMirFn_of_mirStep_cont` / `mirStepsConverges_of_stepsTo` / `mirWpConverges_of_evalFuel` via `step_emit`, and proved end-to-end live `CapturedMir` execution on `Anneal.MirLoops.countToNBody n` (`runMirToBlock_countToN_entry`, `runMirToBlock_countToN_iter`, `runMirToBlock_countToN_exit`, `live_countToN_mirWpConverges_all_n`).
+2. **[CRITICAL — Pillar 2 Performance & Spec Flaws in `forcePureEnvD` and `applySlotUpdatesForced`.]**
+   A0 defined `forcePureEnvD` as `env.headD d :: forcePureEnvD d n env.tail`, duplicating `env` across `headD` and `tail` at every recursion level (causing `ablation_projection_rfl` at `K = 10` to take 14,581 k heartbeats), and defined `applySlotUpdatesForced` using two-pass `forceSpine? (env.set u.1 u.2)` (929 k heartbeats at `K = 30`, 1.5× slower than `naive_simp`'s 609 k). Replaced `forcePureEnvD` with single-match recursion (cutting `ablation_projection_rfl` at `K = 10` by 6.8× to 2,140 k heartbeats), introduced single-pass `setSpine?` + `setSpine?_eq_forceSpine?_set` in `applySlotUpdatesForced` (cutting `optimized_forcePureEnv` at `K = 30` to 525 k heartbeats / 55 ms, beating `naive_simp` at every `K`), and proved the missing length-mismatch characterization (`forcePureEnvD_eq_take_append_replicate`, `forcePureEnv_ne_self_of_length_ne`, `forcePureEnv_eq_self_iff`).
+3. **[HIGH — Pillar 1 Missing Non-Terminating Loop Characterization.]**
+   Added `infiniteLoopCfg` (`[.goto 0]`) and proved `evalFuel_infiniteLoop_outOfFuel`, `not_wpConverges_infiniteLoop`, and `runToTarget_infiniteLoop_outOfFuel`.
+4. **[HIGH — Pillar 3 Missing `FieldsValid` → `laidOutPair` & Live `BorrowSubplace` Bridges.]**
+   Proved `typedAt_of_canonicalAt`, `typedAt_laidOutPair_of_fieldsValid` (bridging `FieldsValid` to whole-struct `TypedAt` across arbitrary padding bytes), and `subplaceFieldLens_of_borrowSubplace_disjointOn` (bridging live `Anneal.SepLogicLenses.BorrowSubplace.disjointOn` to `DisjointSlice`, `LawfulMutLens`, and `IndependentLenses`).
+5. **[HIGH — Pillar 4 Missing Overlapping `reborrowFootprint`, Parent-Write Variants & Live `TreeBorrowPerm`/`BorrowEntry` Bridges.]**
+   Proved `reborrow_return_after_parent_write_unique_write_perm` (callee writes through parent `t_arg` before reborrowing `t_ret`), `callee_parent_write_after_reborrow_disables_child` (negative dual: parent write after reborrowing disables `t_ret`), `overlapping_reborrowFootprint_write_disables_sibling` (overlapping `&mut` footprint ranges disable sibling on write), and the live `TreeBorrowPerm` / `BorrowEntry` bridges (`ofLiveTreeBorrowPerm?_toLiveTreeBorrowPerm`, `toLiveTreeBorrowPerm_ofLiveTreeBorrowPerm?`, `liveBorrowEntryRange_contains_iff`).
