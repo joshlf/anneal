@@ -116,9 +116,9 @@ Within the Lean 4 kernel environment, every compiled theorem
 Anneal's architecture enforces **Statement-Origin Separation** between the two:
 
 - Every constant referenced in the *statement* (`ConstantInfo.type`) of
-  `Trusted.CrateTheorem Mir.crate` originates in `Trusted.*` (or the allowlisted
-  Lean `Init.*` foundation) and the generated `Mir.crate`. No definition from
-  `theory/` ever appears in the theorem statement.
+  `Trusted.CrateTheorem Mir.crate` originates in `Trusted.*`, the locked
+  foundation, admitted checked libraries, or the generated `Mir.crate`. No
+  definition from `theory/` ever appears in the theorem statement.
 - Declarations from `theory/` appear only inside the *proof term*
   (`ConstantInfo.value?`). Because `anneal-audit` verifies in CI that `theory/`
   is pure, effect-free, and free of custom axioms, and the Lean 4 kernel checks
@@ -162,9 +162,10 @@ automatically inherits its defining module's trust tier via
 
 To prevent unreviewed candidate modules from contaminating audited definitions,
 `TrustedBoundary.lean` enforces a strict one-way dependency rule across all
-compiled constants: constants in a `vetted` module may reference only the
-locked `Init.*` foundation and other `vetted` modules, never a
-`candidate:<feature>` module.
+compiled repository constants: constants in a `vetted` module may reference the
+locked foundation, admitted library declarations and other `vetted` modules,
+never a `candidate:<feature>` module. Library dependencies remain subject to the
+logical checks below; admitting their bytes does not add foundation axioms.
 
 ## 2. Repository CI boundary enforcement (`anneal-audit`)
 
@@ -172,9 +173,16 @@ locked `Init.*` foundation and other `vetted` modules, never a
 (`anneal-audit` and
 [`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean)) that audits
 the Anneal repository. It classifies every module into a single `ModuleRole`
-(`.foundation`, `.trusted .vetted`, `.trusted (.candidate f)`, or `.theory`)
-and enforces five invariants across two phases over an isolated staging
-directory.
+(`.foundation`, `.library`, `.trusted .vetted`, `.trusted (.candidate f)`,
+or `.theory`) and enforces five invariants across two phases over an
+isolated staging directory.
+
+The toolchain roles follow lock membership, not namespace prefixes. The
+foundation is the module set in `foundation-lock.json`; `library-lock.json`
+admits additional modules, including further `Init.*` modules. Library runtime
+initializers and parser extensions are authenticated runtime TCB inputs.
+Logically reached library declarations are checked separately and do not join
+the foundation replay base or expand its axiom allowlist.
 
 ### Cargo workspace containment
 
@@ -191,9 +199,11 @@ Before compiling any `.lean` file in `trusted/lean/` or `theory/`,
 `anneal-audit` stages the source files into a private temporary directory,
 verifies that no pre-existing `.olean` or `.ir` files exist in the source tree,
 and parses every file using `Parser.parseHeader` and `Parser.parseCommand`
-against the locked `Init.*` foundation parser environment (without invoking
-Lean's Turing-complete elaborator). Rather than relying on an open-ended
-blocklist of dangerous Lean features, `TrustedBoundary.lean` classifies each
+against the authenticated foundation and admitted libraries' parser
+environment, without elaborating the inspected source commands. Loading this
+environment executes authenticated initializers and parser extensions, which
+belong to the runtime TCB. Kernel replay separately checks logical library
+declarations reached by audited code. `TrustedBoundary.lean` classifies each
 source file into a `SourceRole` (`trusted (tier : TrustTier)` vs. `theory`) and
 validates the module header and every top-level command in a single top-down
 traversal (`inspectSyntax` and `inspectNodeKind`) against a closed, role-aware
@@ -221,33 +231,36 @@ traversal (`inspectSyntax` and `inspectNodeKind`) against a closed, role-aware
 After compiling the staged `.lean` modules synchronously with kernel checking
 enabled (`-t0 -DElab.async=false -Ddebug.skipKernelTC=false`), `anneal-audit`
 loads the resulting `.olean` files with `trustLevel := 0`, `plugins := #[]`,
-and `loadExts := false` (so no `[init]` initializers or persistent environment
-extensions from audited modules are deserialized or executed) and performs a
-full kernel-level audit:
+and `loadExts := false`. This import skips module initializers and persistent
+extension-state reconstruction callbacks; raw serialized extension entries
+remain in imported module data. It then audits repository declarations and
+their logical dependencies:
 
 1. **Module, namespace, and axiom verification (`verifyAndCollectLocals`):**
-   Verifies that only allowlisted modules are loaded; that every constant's
-   recorded module origin (`env.getModuleIdxFor?`) matches its module's
-   `ModuleRole`; that non-`Trusted` modules declare no constants in the
-   `Trusted` root namespace (`(privateToUserName ci.name).getRoot == `Trusted`)
-   and no `opaque` definitions; that no non-foundation declaration in
-   `Trusted.*` or `theory/` is `unsafe`, `partial`, an `axiom`, or a quotient
-   primitive (`.quotInfo`); and that the transitive dependency closure reaches
-   only the locked foundation axiom allowlist
-   (`{Classical.choice, Quot.sound, propext}`).
+   Verifies that loaded modules have admitted roles and repository declaration
+   inventories agree with their recorded origins (`env.getModuleIdxFor?`).
+   Repository `theory/` modules may declare neither constants in the `Trusted`
+   root namespace (`(privateToUserName ci.name).getRoot == `Trusted`) nor
+   `opaque` definitions. Repository declarations in `Trusted.*` or `theory/`
+   must not be `unsafe`, `partial`, an `axiom`, or a quotient primitive
+   (`.quotInfo`). Any axioms reached from the audit roots must belong to the
+   locked foundation allowlist (`{Classical.choice, Quot.sound, propext}`).
 2. **Origin and trust-tier separation (`checkTierReferences`):** Traverses
    every kernel dependency edge `c → dep` (`declarationEdges`) across all
    `Trusted.*` constants and enforces two rules:
-   - **Origin rule:** A `.trusted _` constant may reference only `.foundation`
-     or `.trusted _` constants (never `.theory`).
+   - **Origin rule:** A `.trusted _` constant may reference only `.foundation`,
+     `.library` or `.trusted _` constants (never `.theory`).
    - **Vetted rule:** A `.trusted .vetted` constant may reference only
-     `.foundation` or `.trusted .vetted` constants (never
+     `.foundation`, `.library` or `.trusted .vetted` constants (never
      `.trusted (.candidate _)`).
 3. **Fresh kernel replay (`base.toKernelEnv.replay locals`):** Finally,
-   `TrustedBoundary.lean` constructs a clean kernel environment containing only
-   the pinned `Init.*` foundation (`base`) and replays every non-foundation
-   constant (`Trusted.*` and `theory/`) through the standalone Lean 4 kernel
-   typechecker from scratch.
+   `TrustedBoundary.lean` constructs `base` from only the modules selected by
+   `foundation-lock.json`. It replays every repository constant (`Trusted.*` and
+   `theory/`) plus library declarations logically reached from the audit roots
+   through the standalone Lean 4 kernel typechecker. Unused library declarations
+   are not thereby claimed to have been replayed. Collected alternate theorem
+   proof bodies are checked separately under fresh names; libraries never enter
+   the foundation base merely because their artifacts are authenticated.
 
 ### Including external files in the `trusted/` boundary via hashes
 
@@ -262,11 +275,11 @@ effective TCB cannot practically reside inside the `trusted/` subdirectory:
   `Cargo.lock`, `flake.nix`, and `flake.lock`) to sit at the repository root;
   moving them into `trusted/` would require symlinks or custom wrapper flags
   for every Cargo and Nix command.
-- Pre-built upstream toolchain artifacts (the `lean` binary and its `Init.*`
-  standard prelude) live outside the repository altogether.
+- Pre-built upstream toolchain artifacts (the `lean` binary, locked foundation
+  and admitted libraries) live outside the repository altogether.
 
 To include these files in `trusted/`'s effective TCB without relocating them,
-`trusted/` stores their SHA-256 digests in two checked-in lock files:
+`trusted/` stores their SHA-256 digests in checked-in lock files:
 
 - **[`trusted/root-manifest.sha256`](../trusted/root-manifest.sha256):** Pins
   the SHA-256 digests of the repository's root build files (`Cargo.toml`,
@@ -274,13 +287,18 @@ To include these files in `trusted/`'s effective TCB without relocating them,
   `anneal-audit`.
 - **[`foundation-lock.json`](../trusted/lean/foundation-lock.json)**
   (`trusted/lean/foundation-lock.json`): Pins the SHA-256 digests of the `lean`
-  executable and all `Init.*` prelude source and `.olean` companion files,
+  executable and the source/artifact parts of the locked foundation modules,
   verified by both the Nix toolchain build (`flake.nix`) and `anneal-audit`.
+- **[`library-lock.json`](../trusted/audit/library-lock.json)**
+  (`trusted/audit/library-lock.json`): Records additional installed modules'
+  source and artifact hashes and import graph. The runner authenticates each
+  requested library import closure before using its artifacts. These hashes
+  authenticate runtime inputs; logical declarations still require the reached
+  dependency checks and replay described above.
 
-Because CI and `anneal-audit` reject any mismatch against these files, changing
-a root manifest or toolchain artifact requires a corresponding diff inside
-`trusted/`, ensuring an auditor inspecting `trusted/` sees every change to the
-effective TCB.
+CI and `anneal-audit` reject mismatches when admitting these inputs. Changing a
+root manifest or an admitted toolchain artifact requires a corresponding diff
+inside `trusted/`, making changes to those effective TCB inputs visible there.
 
 ## 3. External dependencies and commenting in `trusted/`
 

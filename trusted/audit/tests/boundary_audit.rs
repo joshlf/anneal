@@ -1049,3 +1049,183 @@ fn enforces_module_level_trust_tiers_and_namespace_hygiene() {
         "unexpected error: {err_opaque}"
     );
 }
+
+/// Locked math declarations are checked dependencies, while repository source
+/// syntax and candidate trust tiers retain their existing restrictions.
+#[test]
+fn replays_checked_bitvec_math_without_relaxing_repository_syntax() {
+    let source = "-- anneal-trust-tier: candidate:mvp\nprelude\nimport Init.Data.BitVec.Lemmas\nnamespace Trusted\ndef reversed (x : BitVec 8) : BitVec 8 := BitVec.reverse x\nend Trusted\n";
+    let mut fix = TempFixture::new(Some(source));
+    fs::copy(
+        repo_root().join("trusted/audit/library-lock.json"),
+        fix.root.join("trusted/audit/library-lock.json"),
+    )
+    .unwrap();
+    let report = fix.check_expected(None, None, None).unwrap();
+    assert_eq!(report["replay"], true);
+    assert!(report["checkedAlternateProofs"].as_u64().unwrap() > 0);
+    assert!(
+        report["replayedDeclarations"].as_u64().unwrap()
+            > report["kernelDeclarations"].as_u64().unwrap()
+    );
+    fs::write(
+        fix.root.join("trusted/lean/Trusted.lean"),
+        format!("{source}\nset_option debug.skipKernelTC true\n"),
+    )
+    .unwrap();
+    let _ = fix.check_expected(Some(1), Some("preflight"), Some(false));
+}
+
+/// A differing pinned theorem inventory body is never ignored merely because
+/// another module supplies a valid theorem of the same proposition. This
+/// fixture bypasses artifact admission to inject a forged alternate export and
+/// directly exercises the inspector's final kernel gate.
+fn forged_pinned_body_rejection(library_name: &str) {
+    let fix = TempFixture::new(None);
+    let mut checker = Checker::new(&fix.root, None).unwrap();
+    checker.tool_admission().unwrap();
+    let catalog: Json = serde_json::from_slice(
+        &fs::read(repo_root().join("trusted/audit/library-lock.json")).unwrap(),
+    )
+    .unwrap();
+    let prefix = checker.admitted().unwrap().prefix.clone();
+    let graph: BTreeMap<String, Vec<ImportEdge>> =
+        serde_json::from_value(catalog["graph"].clone()).unwrap();
+    for (module, record) in catalog["modules"].as_object().unwrap() {
+        let mut available = BTreeMap::new();
+        for part in PARTS {
+            if record["parts"][part].is_string() {
+                available.insert(
+                    part,
+                    prefix
+                        .join("lib/lean")
+                        .join(format!("{}.{part}", module.replace('.', "/")))
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        let artifacts = ModuleArtifacts::from_available(&available, "fixture", || {
+            "missing math artifact".into()
+        })
+        .unwrap();
+        let adm = checker.admitted_mut().unwrap();
+        adm.artifacts.insert(module.clone(), artifacts);
+        adm.graph.insert(module.clone(), graph[module].clone());
+        adm.library_modules.insert(module.clone());
+    }
+    let adm = checker.admitted().unwrap();
+    let foundation: Vec<String> = adm
+        .foundation_modules()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let artifacts: Vec<_> = adm
+        .artifacts
+        .iter()
+        .map(|(n, a)| json!([n, a.to_wire()]))
+        .collect();
+    let input = checker.stage.join("alternate-input.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"sysroot": prefix, "foundation": foundation,
+        "artifacts": artifacts}))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = checker.stage.join(format!("{library_name}.olean"));
+    let producer = checker.stage.join("ForgeAlternate.lean");
+    fs::write(&producer, r#"
+import Lean
+open Lean
+
+def main (args : List String) : IO Unit := do
+  let [input, output] := args | throw <| IO.userError "expected paths"
+  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile input)
+  let sysroot ← IO.ofExcept <| j.getObjValAs? String "sysroot"
+  initSearchPath sysroot
+  let names ← IO.ofExcept <| j.getObjValAs? (Array String) "foundation"
+  let roots := names.map fun n => { module := n.toName : Import }
+  let entries ← IO.ofExcept <| j.getObjValAs? (Array (String × Array (Array String))) "artifacts"
+  let arts := entries.foldl (init := ({} : NameMap ImportArtifacts)) fun acc (n,parts) =>
+    acc.insert n.toName (.ofArrays (parts.map (·.map System.FilePath.mk)))
+  let privateEnv ← importModules roots {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private) (arts := arts)
+  let some (.thmInfo original) := privateEnv.checked.get.find? `List.drop.eq_def
+    | throw <| IO.userError "missing genuine theorem"
+  let publicEnv ← importModules roots {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .exported) (arts := arts)
+  let publicEnv := publicEnv.setMainModule `AAAAAlternate |>.setExporting false
+  let forged := Declaration.thmDecl { original with value := mkConst `True.intro }
+  let publicEnv ← match publicEnv.addDeclCore 0 0 forged none false with
+    | .ok next => pure next
+    | .error _ => throw <| IO.userError "could not add alternate theorem"
+  writeModule publicEnv output false
+"#.replace("AAAAAlternate", library_name)).unwrap();
+    checker
+        .process(
+            "alternate-fixture",
+            &[
+                "--run".into(),
+                producer.to_string_lossy().into_owned(),
+                input.to_string_lossy().into_owned(),
+                output.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+    let adm = checker.admitted_mut().unwrap();
+    let mut available = BTreeMap::new();
+    for part in PARTS {
+        let path = output
+            .parent()
+            .unwrap()
+            .join(format!("{library_name}.{part}"));
+        if path.exists() {
+            available.insert(part, path.to_string_lossy().into_owned());
+        }
+    }
+    adm.artifacts.insert(
+        library_name.into(),
+        ModuleArtifacts::from_available(&available, "fixture", || {
+            "missing alternate artifact".into()
+        })
+        .unwrap(),
+    );
+    adm.library_modules.insert(library_name.into());
+    adm.graph.insert(
+        library_name.into(),
+        foundation
+            .into_iter()
+            .map(|module| ImportEdge {
+                module,
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            })
+            .collect(),
+    );
+    let failure = checker
+        .inspect(InspectorRequest::Audit {
+            trusted: vec![],
+            theory: vec![],
+            module_tiers: BTreeMap::new(),
+        })
+        .unwrap_err();
+    // A kernel exception still refuses this malformed serialized proof; it
+    // shares the operational channel with resource and internal failures.
+    assert_eq!(failure.code, 2, "{failure}");
+    assert!(
+        failure
+            .message
+            .contains("alternate pinned theorem proof check List.drop.eq_def"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn rejects_forged_alternate_pinned_theorem_body() {
+    forged_pinned_body_rejection("AAAAAlternate");
+}
+
+#[test]
+fn rejects_forged_selected_pinned_theorem_body() {
+    forged_pinned_body_rejection("ZZZZAlternate");
+}

@@ -9,6 +9,9 @@
 import Lean.Elab.Import
 import Lean.Parser.Tactic
 import Lean.Replay
+import Lean.Compiler.ImplementedByAttr
+import Lean.Compiler.ExternAttr
+import Lean.Compiler.CSimpAttr
 
 /-!
 # Trusted Boundary and Kernel Environment Inspector (`TrustedBoundary.lean`)
@@ -23,22 +26,27 @@ invokes this file in two phases over JSON IPC (`run` and `main`):
   `include_str` can execute arbitrary code or read host files during
   compilation, while attributes such as `@[implemented_by]` and `@[extern]`
   alter code generation without appearing in kernel proof terms. `"preflight"`
-  therefore parses every non-foundation `.lean` file using `Parser.parseHeader`
-  and `Parser.parseCommand`—which never invoke the elaborator—against the locked
-  foundation parser environment only. Rather than maintaining an open-ended
-  block-list of dangerous Lean features, `"preflight"` enforces a closed,
-  role-aware `SyntaxNodeKind` allow-list (`allowedTrustedSyntaxKinds` for
-  tactic-free `trusted/lean/` specifications and `allowedTheorySyntaxKinds` for
+  therefore parses every repository `.lean` source using `Parser.parseHeader`
+  and `Parser.parseCommand`—which never elaborate the inspected commands—against
+  the authenticated foundation and admitted libraries' parser environment.
+  Building this environment executes authenticated initializers and parser
+  extensions; these belong to the runtime TCB. Kernel replay below separately
+  checks the logical library declarations reached by audited code. Preflight
+  enforces a closed, role-aware `SyntaxNodeKind` allow-list
+  (`allowedTrustedSyntaxKinds` for tactic-free `trusted/lean/` specifications
+  and `allowedTheorySyntaxKinds` for
   `theory/` proofs) together with closed attribute and identifier grammars, and
   extracts each `Trusted` module's `-- anneal-trust-tier: <tier>` directive
   before `lean` compiles any file.
 - **`"audit"` (kernel `.olean` inspection and replay):**
   Loads the compiled `.olean` files with `trustLevel := 0`, `plugins := #[]`,
-  and `loadExts := false` (so no `[init]` initializers or persistent environment
-  extensions from audited modules are deserialized or executed). It verifies
+  and `loadExts := false`. This skips module initializers and persistent
+  extension-state reconstruction callbacks for that import; raw serialized
+  extension entries remain in the imported module data. It verifies
   module-level trust-tier separation, `Trusted` namespace hygiene, the
-  foundation axiom allowlist, and a full kernel replay of every non-foundation
-  constant against the foundation environment (`base.toKernelEnv.replay`).
+  foundation axiom allowlist, and kernel replay of every repository constant
+  and logically reached library declaration against the foundation environment
+  (`base.toKernelEnv.replay`).
 
 ## Module roles and trust tiers
 
@@ -47,10 +55,14 @@ Every admitted module in the environment is classified into a single
 
 | `ModuleRole` | Directory / Source | Meaning |
 | :--- | :--- | :--- |
-| `.foundation` | Toolchain `Init.*` (`foundation-lock.json`) | Pinned Lean 4 standard prelude and core types |
+| `.foundation` | Selected modules in `foundation-lock.json` | Pinned foundation replay base |
+| `.library` | Additional modules in `trusted/audit/library-lock.json` | Authenticated runtime inputs; logical declarations replayed when reached |
 | `.trusted .vetted` | `trusted/lean/` (`-- anneal-trust-tier: vetted`) | Human-audited TCB definitions |
 | `.trusted (.candidate f)` | `trusted/lean/` (`-- anneal-trust-tier: candidate:<f>`) | Alpha TCB definitions gated behind opt-in feature `f` |
 | `.theory` | `theory/` (`Anneal.*`) | Untrusted proof automation checked by the kernel |
+
+Lock membership, not the `Init` namespace, determines the two toolchain roles:
+additional `Init.*` modules may be libraries without joining the foundation.
 
 Every kernel constant `c` has a unique defining module (`origin env c`, read
 directly from `env.getModuleIdxFor? c` in the `.olean`), and therefore a unique
@@ -64,11 +76,13 @@ prediction or suffix heuristics.
 On every kernel dependency edge `c → dep` (`declarationEdges`),
 `checkTierReferences` enforces two rules:
 
-- **Origin rule:** a `.trusted _` constant may only reference `.foundation` or
-  `.trusted _` constants (never `.theory`).
-- **Vetted rule:** a `.trusted .vetted` constant may only reference
-  `.foundation` or `.trusted .vetted` constants (never
-  `.trusted (.candidate _)`).
+- **Origin rule:** a `.trusted _` constant may only reference `.foundation`,
+  `.library`, or `.trusted _` constants (never `.theory`).
+- **Vetted rule:** a `.trusted .vetted` constant may only reference `.foundation`,
+  `.library`, or `.trusted .vetted` constants (never `.trusted (.candidate _)`).
+
+Logical library dependencies pass axiom-policy and kernel-replay checks; their
+library role does not add assumptions to the foundation.
 -/
 
 open Lean
@@ -123,11 +137,12 @@ inductive SourceRole where
   deriving BEq, DecidableEq
 
 /-- Partition of every admitted module in the kernel environment into its
-repository role. Representing these three roles as mutually exclusive
+repository role. Representing these roles as mutually exclusive
 constructors of one sum type makes overlapping or missing module classifications
 unrepresentable. -/
 inductive ModuleRole where
   | foundation
+  | library
   | trusted (tier : TrustTier)
   | theory
   deriving BEq, DecidableEq
@@ -137,6 +152,31 @@ inductive ModuleRole where
 /-- Throw a policy-rejection error prefixed with `"policy:"` (exit code 1). -/
 def fail (message : String) : IO α :=
   throw <| IO.userError s!"policy:{message}"
+
+/-- Preserve the kernel's result/error distinction in inspector reporting.
+The pinned API calls these "Exceptions that can be raised by the kernel when
+type checking new declarations" and includes resource and internal failures.
+Treat the entire exception channel conservatively as operational, including
+validation errors on deliberately malformed serialized proofs. All still reject;
+only a completed comparison or an explicit policy check justifies policy:.
+https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Environment.lean#L259-L279
+-/
+def kernelResult (operation : String) (result : Except Kernel.Exception α) : IO α := do
+  match result with
+  | .ok value => return value
+  | .error error =>
+    let detail ← (error.toMessageData {}).toString
+    -- Keep a fixed operational prefix even if diagnostic names contain policy:.
+    throw <| IO.userError s!"kernel operation failed ({operation}): {detail}"
+
+/-- A completed false comparison is a policy mismatch; an exception is not.
+The pinned isDefEqGuarded uses "else false" for errors, so it erases precisely
+this reporting distinction. Call the unguarded Except API at each equality gate.
+https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Environment.lean#L2795-L2799
+-/
+def requireKernelEquality (operation mismatch : String)
+    (result : Except Kernel.Exception Bool) : IO Unit := do
+  unless (← kernelResult operation result) do fail mismatch
 
 /-- Extract and deserialize required field `key` from JSON object `j`. -/
 def field [FromJson α] (j : Json) (key : String) : IO α :=
@@ -165,10 +205,20 @@ def graph (env : Environment) : Json :=
 
 /-- Import `roots` from the explicit artifact map in `j` at `trustLevel := 0`
 with `level := .private`.
-- In `"preflight"`, `extensions := true` loads the locked `Init.*` parser
-  extensions so `Parser.parseCommand` can parse standard Lean syntax.
-- In `"audit"`, `extensions := false` disables loading persistent environment
-  extensions or `[init]` initializers from compiled `.olean` files. -/
+- In `"preflight"`, `extensions := true` loads the authenticated foundation
+  and admitted libraries' parser extensions and initializers. Parsing source
+  commands does not elaborate them, but this imported runtime code is trusted.
+- In `"audit"`, `extensions := false` skips module initializers and persistent
+  extension-state reconstruction callbacks. Raw serialized extension entries
+  remain in module data; logically reached library declarations still undergo
+  kernel replay.
+- Target metadata checks also use `extensions := true` to read compiler
+  attributes, under the target's declared intact-host assumption.
+
+The pinned importer warns that loading extensions "may use the interpreter"
+and requires `enableInitializersExecution`. These are runtime effects, distinct
+from checking declarations in a kernel environment.
+https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Environment.lean#L2427-L2431 -/
 def importEnv (j : Json) (roots : Array Name)
     (extensions := false) : IO Environment := do
   let arts ← artifacts j
@@ -269,8 +319,8 @@ def allowedTermSyntaxKinds : List Name := [
   ``Parser.Attr.simple, ``Parser.Attr.instance, `Lean.Parser.Attr.simp,
   `fieldIdx, `group, `hygieneInfo, `num, `str, `char, `scientific]
 
-/-- Closed allowlist of standard `Init.*` notation syntax kinds expanded by the
-locked foundation parser. -/
+/-- Closed allowlist of standard `Init.*` notation syntax kinds admitted from
+the authenticated parser environment. Library extensions do not widen it. -/
 def allowedNotationSyntaxKinds : List Name := [
   `term!_, `termIfThenElse, `termDepIfThenElse, `«term[_]»,
   `«term_&&_», `«term_||_», `«term_+_», `«term_-_», `«term_*_»,
@@ -458,7 +508,8 @@ partial def inspectSyntax (allowedKinds : NameSet) (s : Syntax) : IO Unit := do
       inspectSyntax allowedKinds child
 
 /-- Parse and validate all commands in `ctx` starting from `initial` and `log`
-using the pure foundation `parserEnv` and the role's `allowedKinds`. -/
+using the authenticated foundation/library `parserEnv` and the role's
+`allowedKinds`, without elaborating the inspected commands. -/
 partial def parseAndInspectCommands (ctx : Parser.InputContext)
     (parserEnv : Environment) (moduleName : Name) (allowedKinds : NameSet)
     (state : Parser.ModuleParserState) (messages : MessageLog) : IO Unit := do
@@ -608,8 +659,8 @@ partial def closure (lookup : Name → IO ConstantInfo)
         reachedAxioms
 
 /-- Build the complete map from module name to `ModuleRole`, verifying that
-`foundation`, `trusted`, and `theory` are pairwise disjoint and that every
-`Trusted` module has a valid `TrustTier`. -/
+the foundation, library, trusted and theory module sets are pairwise disjoint
+and every `Trusted` module has a valid `TrustTier`. -/
 def buildModuleRoles (j : Json) (foundation trusted theory : Array Name) :
     IO (Std.HashMap Name ModuleRole) := do
   let tierEntries ← field (α := Array (String × String)) j "moduleTiers"
@@ -624,6 +675,10 @@ def buildModuleRoles (j : Json) (foundation trusted theory : Array Name) :
       return acc.insert m tier
   let roles0 := foundation.foldl (init := ({} : Std.HashMap Name ModuleRole))
     fun acc m => acc.insert m .foundation
+  let libraries ← names j "libraries"
+  let roles0 ← libraries.foldlM (init := roles0) fun acc m => do
+    if acc.contains m then fail s!"overlapping module role for {m}"
+    return acc.insert m .library
   let roles1 ← trusted.foldlM (init := roles0) fun acc m => do
     if acc.contains m then fail s!"overlapping module role for {m}"
     let some tier := tierMap.get? m
@@ -663,13 +718,68 @@ def validateLocalConstant (m : Name) (role : ModuleRole)
   if ci.hasValue true && (ci.value? true).isNone then
     fail s!"missing stored body {ci.name}"
 
-/-- Verify module allowlists, declaration provenance, `Trusted` namespace
-hygiene, and the absence of axioms and `unsafe`/`partial` declarations across
-all loaded modules. Return every non-foundation constant and the compiler-only
-(IR) names of `Trusted` modules. -/
+/-- Reconcile one serialized inventory value with the selected declaration.
+Pinned modules may repeat a theorem with another proof of the same proposition;
+every such proof still needs its own dependency closure and fresh kernel check.
+Definitions and source declarations cannot change their stored meaning. -/
+def inventoryAlternates (stored ci : ConstantInfo) (pinned : Bool) :
+    IO (Array ConstantInfo) := do
+  unless stored.type == ci.type do
+    fail s!"stored declaration type differs from inventory {ci.name}"
+  -- Equal proof expressions do not establish equal universes or mutual-block
+  -- dependencies: declarationEdges also follows ci.all. Check this metadata
+  -- before the equal-value fast path, so it cannot discard an unexamined edge.
+  -- The pinned importer also requires matching levelParams and all, while
+  -- saying "we do not check whether the theorem `value` field match". Preserve
+  -- that distinction locally rather than relying on an earlier import check.
+  -- https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Environment.lean#L2261-L2278
+  match pinned, stored, ci with
+  | true, .thmInfo a, .thmInfo b =>
+    unless a.levelParams == b.levelParams && a.all == b.all do
+      fail s!"inconsistent pinned theorem metadata {ci.name}"
+  | _, _, _ => pure ()
+  if stored.value? true == ci.value? true then return #[]
+  match pinned, stored, ci with
+  | true, .thmInfo _, .thmInfo _ =>
+    -- Replay may reuse a selected theorem already in its foundation base.
+    -- Retain both values so that optimization cannot hide either proof body.
+    return #[stored, ci]
+  | _, _, _ => fail s!"stored declaration differs from inventory {ci.name}"
+
+/-- Check each alternate under a fresh name, bypassing replay's duplicate
+optimization while preserving the declaration's type and universe parameters.
+The pinned replay rule says "Ignore duplicate theorems" after comparing their
+metadata; it does not check the duplicate proof value:
+https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Replay.lean#L88-L101
+-/
+def checkAlternateProofs (replayed : Kernel.Environment)
+    (alternateProofs : Array ConstantInfo) : IO Unit := do
+  let checkedEnv := Environment.ofKernelEnv replayed
+  let mut freshIndex := 0
+  for ci in alternateProofs do
+    let .thmInfo info := ci | fail "non-theorem alternate inventory body"
+    let typeOfType ← kernelResult s!"alternate theorem type check {ci.name}"
+      (Kernel.check checkedEnv {} info.type)
+    requireKernelEquality s!"alternate theorem proposition comparison {ci.name}"
+      s!"alternate theorem is not a proposition {ci.name}"
+      (Kernel.isDefEq checkedEnv {} typeOfType (.sort .zero))
+    let mut fresh := Name.num `_anneal_checked_alternate freshIndex
+    while (replayed.find? fresh).isSome do
+      freshIndex := freshIndex + 1
+      fresh := Name.num `_anneal_checked_alternate freshIndex
+    freshIndex := freshIndex + 1
+    discard <| kernelResult s!"alternate pinned theorem proof check {ci.name}"
+      (replayed.addDeclCore 0 0 (.thmDecl { info with name := fresh })
+        (cancelTk? := none))
+
+/-- Verify admitted module inventories and declaration origins, and apply
+namespace and logical-admission rules to repository declarations. Return all
+repository constants, the compiler-only (IR) names of `Trusted` modules, and
+alternate serialized theorem proofs for later checking. Library logical
+dependencies are checked when reached from the audit roots. -/
 def verifyAndCollectLocals (env : Environment)
     (roles : Std.HashMap Name ModuleRole) :
-    IO (Std.HashMap Name ConstantInfo × NameSet) := do
+    IO (Std.HashMap Name ConstantInfo × NameSet × Array ConstantInfo) := do
   let loadedMods : NameSet :=
     .ofList (env.header.modules.toList.map (·.module))
   for (reqMod, _) in roles do
@@ -677,6 +787,7 @@ def verifyAndCollectLocals (env : Environment)
       fail s!"missing required module {reqMod}"
   let mut locals : Std.HashMap Name ConstantInfo := {}
   let mut extraNames : NameSet := {}
+  let mut alternateProofs : Array ConstantInfo := #[]
   for m in env.header.modules, data in env.header.moduleData do
     unless data.constNames == data.constants.map ConstantInfo.name do
       fail s!"invalid inventory {m.module}"
@@ -685,8 +796,8 @@ def verifyAndCollectLocals (env : Environment)
     for ci in data.constants do
       let (orig, origRole) ← constProvenance env roles ci.name
       match role with
-      | .foundation =>
-        unless origRole == .foundation do
+      | .foundation | .library =>
+        unless origRole == .foundation || origRole == .library do
           fail s!"inventory origin mismatch {ci.name}"
       | .trusted _ | .theory =>
         if locals.contains ci.name then
@@ -695,16 +806,16 @@ def verifyAndCollectLocals (env : Environment)
           fail s!"inventory origin mismatch {ci.name}"
       let some stored := env.checked.get.find? ci.name
         | fail s!"missing stored declaration {ci.name}"
-      unless stored.type == ci.type && stored.value? true == ci.value? true do
-        fail s!"stored declaration differs from inventory {ci.name}"
-      if role != .foundation then
+      alternateProofs := alternateProofs ++
+        (← inventoryAlternates stored ci (role == .foundation || role == .library))
+      if role != .foundation && role != .library then
         validateLocalConstant m.module role ci
         locals := locals.insert ci.name ci
     for n in data.extraConstNames do
       let (orig, origRole) ← constProvenance env roles n
       match role with
-      | .foundation =>
-        unless origRole == .foundation do
+      | .foundation | .library =>
+        unless origRole == .foundation || origRole == .library do
           fail s!"IR helper provenance mismatch {n}"
       | .trusted _ | .theory =>
         unless orig == m.module do
@@ -716,16 +827,18 @@ def verifyAndCollectLocals (env : Environment)
           extraNames := extraNames.insert n
   for (n, _) in env.checked.get.constants do
     let (_, origRole) ← constProvenance env roles n
-    if origRole != .foundation && !locals.contains n then
+    if origRole != .foundation && origRole != .library && !locals.contains n then
       fail s!"uninventoried constant {n}"
-  return (locals, extraNames)
+  return (locals, extraNames, alternateProofs)
 
 /-- Enforce the origin rule and the vetted rule on every `Trusted` constant:
-- **Origin rule:** a `.trusted _` constant may only reference `.foundation` or
-  `.trusted _` constants (never `.theory`).
-- **Vetted rule:** a `.trusted .vetted` constant may only reference
-  `.foundation` or `.trusted .vetted` constants (never
-  `.trusted (.candidate _)`). -/
+- **Origin rule:** a `.trusted _` constant may only reference `.foundation`,
+  `.library`, or `.trusted _` constants (never `.theory`).
+- **Vetted rule:** a `.trusted .vetted` constant may only reference `.foundation`,
+  `.library`, or `.trusted .vetted` constants (never `.trusted (.candidate _)`).
+
+Logical library dependencies pass axiom-policy and kernel-replay checks; their
+library role does not add assumptions to the foundation. -/
 def checkTierReferences (env : Environment)
     (roles : Std.HashMap Name ModuleRole)
     (locals : Std.HashMap Name ConstantInfo) : IO Unit := do
@@ -735,7 +848,7 @@ def checkTierReferences (env : Environment)
       for dep in ← declarationEdges ci do
         let (depOrigin, depRole) ← constProvenance env roles dep
         match depRole with
-        | .foundation => pure ()
+        | .foundation | .library => pure ()
         | .trusted depTier =>
           if tier == .vetted && depTier != .vetted then
             fail s!"vetted constant {cName} references {depTier.render} constant {dep}"
@@ -748,7 +861,7 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
   validateGraph j env
   let axiomPolicy ← field (α := Array (String × String)) j "axioms"
   let roles ← buildModuleRoles j foundation trusted theory
-  let (locals, extraNames) ← verifyAndCollectLocals env roles
+  let (locals, extraNames, alternateProofs) ← verifyAndCollectLocals env roles
   let lookup n :=
     match env.checked.get.find? n with
     | some ci => pure ci
@@ -763,30 +876,346 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
         ("name", toJson cName), ("module", toJson orig),
         ("kind", toJson (kind ci)), ("trustStatus", toJson tier.render),
         ("dependencies", toJson deps)]
-    | .foundation | .theory => return acc
-  let allLocalRoots := locals.fold (init := []) fun acc n _ => n :: acc
+    | .foundation | .library | .theory => return acc
+  let mut allLocalRoots := locals.fold (init := []) fun acc n _ => n :: acc
+  for ci in alternateProofs do
+    allLocalRoots := ci.name :: (← declarationEdges ci).toList ++ allLocalRoots
   let (allAxioms, allVisited) ←
     closure lookup (origin env) axiomPolicy allLocalRoots
-  -- Replay every non-foundation constant from scratch through the Lean kernel
-  -- against the locked foundation environment (`loadExts := false`).
+  -- Replay repository constants and their reached library dependencies through
+  -- the kernel against only the locked foundation (`loadExts := false`).
   let base ← importEnv j foundation
-  discard <| base.toKernelEnv.replay locals
+  let mut replayMap := locals
+  for n in allVisited do
+    if (← origin env n) ∈ (← names j "libraries") then
+      let ci ← lookup n
+      if ci.isUnsafe || ci.isPartial then
+        fail s!"unsafe/partial logical library dependency {n}"
+      if ci matches .quotInfo _ then fail s!"unexpected quotient primitive {n}"
+      if ci.hasValue true && (ci.value? true).isNone then
+        fail s!"missing stored body {n}"
+      replayMap := replayMap.insert n ci
+  -- Replay renders Kernel.Exception as IO.userError, losing its typed result.
+  -- Keep every replay exception operational instead of inferring rejection
+  -- from its text. A fixed prefix protects that reporting category.
+  -- https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Replay.lean#L54-L63
+  let replayed ← try base.toKernelEnv.replay replayMap
+    catch error => throw <| IO.userError s!"kernel replay failed: {error}"
+  -- Replay may reuse an existing theorem of the same type by proof
+  -- irrelevance. Add each alternative under a fresh name so the kernel must
+  -- check that body, including its declared universes, against the same type.
+  -- https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Replay.lean#L88-L101
+  checkAlternateProofs replayed alternateProofs
   return Json.mkObj [
     ("graph", graph env), ("declarations", .arr inventory),
     ("kernelDeclarations", toJson inventory.size),
-    ("replayedDeclarations", toJson locals.size),
+    ("replayedDeclarations", toJson replayMap.size),
+    ("checkedAlternateProofs", toJson alternateProofs.size),
     ("compilerOnlyNames", toJson extraNames.size),
     ("reachableDeclarations", toJson allVisited.size),
     ("axioms", toJson allAxioms), ("replay", toJson true)]
 
-/-- Dispatch `"preflight"` or `"audit"` from the JSON request `j`. -/
+/-- Read only a source header. Target elaboration is deliberately separate from
+repository command admission: authored macros and tactics may use arbitrary
+syntax, while their final logical dependencies must pass kernel replay. -/
+def inspectHeader (moduleName : Name) (path : System.FilePath) : IO Json := do
+  let text ← IO.FS.readFile path
+  let ctx := Parser.mkInputContext text path.toString
+  let (header, state, messages) ← Parser.parseHeader ctx
+  if messages.hasErrors || state.recovering then
+    fail s!"header parser error in {moduleName}"
+  return Json.mkObj [("module", toJson moduleName),
+    ("imports", toJson (Elab.HeaderSyntax.imports header))]
+
+/-- Authority of an authenticated target source, independent of its namespace. -/
+inductive TargetRole where
+  | model | specification | capture | expected | proof
+  deriving BEq
+
+/-- Parse the closed role vocabulary shared with the Rust runner. -/
+def targetRole (raw : String) : IO TargetRole :=
+  match raw with
+  | "model" => pure .model
+  | "specification" => pure .specification
+  | "capture" => pure .capture
+  | "expected" => pure .expected
+  | "proof" => pure .proof
+  | _ => fail s!"unknown target role {raw}"
+
+/-- Model and specification meanings cannot depend on unreviewed proof helpers.
+Capture is independent of specifications, and Expected may use all reviewed
+roles. The same rule is enforced on imports by the Rust runner. -/
+def TargetRole.allows (role dep : TargetRole) : Bool :=
+  match role with
+  | .model => dep == .model
+  | .specification => dep == .model || dep == .specification
+  | .capture => dep == .model || dep == .capture
+  | .expected => dep != .proof
+  | .proof => true
+
+/-- Module origins partition foundation, checked libraries and target sources. -/
+inductive TargetOrigin where
+  | foundation | library | source (role : TargetRole)
+
+/-- Target auditing checks actual stored declarations, including private helpers
+and generated inductive members. It imports no unvalidated declaration into the
+replay base. Metadata loading below is target-only and subject to the same
+experimental intact-host assumption as arbitrary target elaboration. -/
+def targetAudit (j : Json) (foundation : Array Name) : IO Json := do
+  let target ← field (α := Json) j "target"
+  let libraries ← names j "libraries"
+  let modules ← field (α := Array Json) target "modules"
+  let mut roles : Std.HashMap Name TargetOrigin := {}
+  for m in foundation do roles := roles.insert m .foundation
+  for m in libraries do
+    if roles.contains m then fail s!"overlapping target module {m}"
+    roles := roles.insert m .library
+  let mut roots := foundation ++ libraries
+  for item in modules do
+    let m := (← field (α := String) item "module").toName
+    let role ← targetRole (← field item "role")
+    if roles.contains m then fail s!"overlapping target module {m}"
+    roles := roles.insert m (.source role)
+    roots := roots.push m
+  let env ← importEnv j roots
+  validateGraph j env
+  let provenance n := do
+    let m ← origin env n
+    let some role := roles.get? m | fail s!"foreign target module {m}"
+    return (m, role)
+  let lookup n := do
+    let some ci := env.checked.get.find? n
+      | fail s!"missing target dependency {n}"
+    return ci
+  -- Cross-check source inventory and the environment's actual stored values.
+  -- Library declarations are checked when reached, so irrelevant metaprogram
+  -- implementation constants do not become restrictions on authored proofs.
+  let mut sourceInventory : NameSet := {}
+  let mut libraryInventories : Std.HashMap Name NameSet := {}
+  let mut libraryExports : Std.HashMap Name (Array ConstantInfo) := {}
+  for m in env.header.modules, data in env.header.moduleData do
+    let some role := roles.get? m.module | fail s!"foreign target module {m.module}"
+    if let .library := role then
+      -- Record all exports, including repeats whose selected origin belongs
+      -- to another pinned module. Only logically reached names are compared
+      -- below; unused tactic implementation constants remain unrestricted.
+      unless data.constNames == data.constants.map ConstantInfo.name do
+        fail s!"invalid target library inventory {m.module}"
+      libraryInventories := libraryInventories.insert m.module
+        (.ofList data.constNames.toList)
+      for ci in data.constants do
+        libraryExports := libraryExports.insert ci.name
+          ((libraryExports.getD ci.name #[]).push ci)
+    if let .source _ := role then
+      unless data.constNames == data.constants.map ConstantInfo.name do
+        fail s!"invalid target inventory {m.module}"
+      for ci in data.constants do
+        if sourceInventory.contains ci.name then
+          fail s!"duplicate target declaration {ci.name}"
+        unless (← origin env ci.name) == m.module do
+          fail s!"target inventory origin mismatch {ci.name}"
+        let stored ← lookup ci.name
+        unless stored.type == ci.type && stored.value? true == ci.value? true do
+          fail s!"stored target declaration differs {ci.name}"
+        sourceInventory := sourceInventory.insert ci.name
+  let theoremName := (← field (α := String) target "theoremName").toName
+  let theoremModule := (← field (α := String) target "theoremModule").toName
+  let expectedName := (← field (α := String) target "expectedDeclaration").toName
+  let expectedModule := (← field (α := String) target "expectedModule").toName
+  match roles.get? theoremModule, roles.get? expectedModule with
+  | some (.source .proof), some (.source .expected) => pure ()
+  | _, _ => fail "incorrect target/expected authority roles"
+  let theoremInfo ← lookup theoremName
+  let expectedInfo ← lookup expectedName
+  unless (← origin env theoremName) == theoremModule &&
+      (← origin env expectedName) == expectedModule do
+    fail "incorrect target/expected declaration origin"
+  -- Names and namespaces do not establish authority or the kind of claim.
+  -- The later canonical comparison covers the entire submitted type, including
+  -- any binders, after these declarations have passed origin checks and replay.
+  unless theoremInfo matches .thmInfo _ do fail "target root must be a theorem"
+  unless expectedInfo matches .defnInfo _ do fail "Expected must be a definition"
+  unless theoremInfo.levelParams.isEmpty && expectedInfo.levelParams.isEmpty do
+    fail "target and Expected must have no universe parameters"
+  unless expectedInfo.type == .sort .zero do fail "Expected must have type Prop"
+  let canonicalRoot := (← field (α := String) target "canonicalRoot").toName
+  let subjectName := (← field (α := String) target "subjectDeclaration").toName
+  let specName := (← field (α := String) target "specificationDeclaration").toName
+  for (n, requiredRole) in [(canonicalRoot, TargetRole.model),
+      (subjectName, TargetRole.capture), (specName, TargetRole.specification)] do
+    let (_, role) ← provenance n
+    match role with
+    | .source actual =>
+      unless actual == requiredRole do fail s!"incorrect canonical input origin {n}"
+    | _ => fail s!"incorrect canonical input origin {n}"
+    unless (← lookup n).levelParams.isEmpty do
+      fail s!"canonical input has universe parameters {n}"
+  -- Build the proposition directly from authenticated kernel names. Imported
+  -- syntax, namespaces and elaborators may change the compiled Expected body;
+  -- that convenience definition is therefore checked against this expression.
+  let canonical := mkApp2 (mkConst canonicalRoot) (mkConst subjectName) (mkConst specName)
+  -- The request cannot widen the logical foundation by listing more axioms.
+  -- Checked libraries contribute replayed declarations, not new assumptions.
+  let axiomPolicy ← field (α := Array (String × String)) j "axioms"
+  unless axiomPolicy == #[("Classical.choice", "Init.Prelude"),
+      ("Quot.sound", "Init.Prelude"), ("propext", "Init.Core")] do
+    fail "target axiom policy differs from the original foundation"
+  -- A library name can occur in several serialized inventories while the
+  -- imported environment selects only one value. Reconcile every reached
+  -- variant before replay. Alternate proofs can introduce further logical
+  -- dependencies, so extend the same closure until no new roots remain.
+  let mut pending := [theoremName, expectedName, canonicalRoot, subjectName, specName]
+  let mut axioms : Array Name := #[]
+  let mut reached : NameSet := {}
+  let mut alternateProofs : Array ConstantInfo := #[]
+  repeat
+    let previous := reached
+    let (allAxioms, allReached) ← closure lookup (origin env) axiomPolicy
+      pending reached (.ofList axioms.toList)
+    axioms := allAxioms
+    reached := allReached
+    pending := []
+    for n in reached do
+      unless previous.contains n do
+        let (orig, role) ← provenance n
+        if let .library := role then
+          unless (libraryInventories.getD orig {}).contains n do
+            fail s!"uninventoried target library dependency {n}"
+        for ci in libraryExports.getD n #[] do
+          match role with
+          | .foundation | .library => pure ()
+          | .source _ => fail s!"target library inventory origin mismatch {n}"
+          let alternatives ← inventoryAlternates (← lookup n) ci true
+          for proof in alternatives do
+            let deps ← declarationEdges proof
+            -- A discarded proof is still a library export. Its own edges
+            -- cannot acquire target-source authority merely because the
+            -- selected body has no such dependency.
+            for dep in deps do
+              if let .source _ := (← provenance dep).2 then
+                fail s!"installed library {n} references target source {dep}"
+            pending := deps.toList ++ pending
+          alternateProofs := alternateProofs ++ alternatives
+    if pending.isEmpty then break
+  -- Meaning surfaces follow the canonical claim's dependencies, independently
+  -- of which proof helpers establish it. Those helpers still belong to reached
+  -- and undergo replay, but editing them must not redefine the reviewed claim.
+  let (_, expectedReached) ← closure lookup (origin env) axiomPolicy
+    [canonicalRoot, subjectName, specName]
+  let mut replayMap : Std.HashMap Name ConstantInfo := {}
+  let mut modelRoots : List Name := []
+  let mut specRoots : List Name := []
+  for n in reached do
+    let ci ← lookup n
+    let (_, role) ← provenance n
+    match role with
+    | .foundation => pure ()
+    | .library | .source _ =>
+      if ci.isUnsafe || ci.isPartial then
+        fail s!"unsafe/partial logical dependency {n}"
+      if ci matches .quotInfo _ then fail s!"unexpected quotient primitive {n}"
+      if ci.hasValue true && (ci.value? true).isNone then
+        fail s!"missing stored body {n}"
+      if let .source _ := role then
+        unless sourceInventory.contains n do
+          fail s!"uninventoried target dependency {n}"
+      -- Parsed imports are only the early authority gate. Recheck the actual
+      -- type/body edges, including private and generated helpers, so the stored
+      -- declarations' meanings obey the same authority boundary.
+      for dep in ← declarationEdges ci do
+        let (_, depRole) ← provenance dep
+        match role, depRole with
+        | .source r, .source d =>
+          unless r.allows d do fail s!"target authority violation {n} references {dep}"
+        | .library, .source _ =>
+          fail s!"installed library {n} references target source {dep}"
+        | _, _ => pure ()
+      replayMap := replayMap.insert n ci
+    if expectedReached.contains n then
+      match role with
+      | .source .model => modelRoots := n :: modelRoots
+      | .source .specification => specRoots := n :: specRoots
+      | _ => pure ()
+  -- Lean 4.34.1 replay skips unsafe and partial declarations; the explicit
+  -- checks above are necessary before handing this complete map to replay.
+  -- https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Replay.lean#L176-L185
+  -- Origin and axiom inventories do not type-check stored proof bodies.
+  -- Rebuild from the original foundation before comparing the root, so neither
+  -- the proof nor its specification is validated using unchecked target data.
+  let base ← importEnv j foundation
+  let replayed ← try base.toKernelEnv.replay replayMap
+    catch error => throw <| IO.userError s!"kernel replay rejected target dependency: {error}"
+  -- Every alternate dependency has now passed the same axiom, role and
+  -- logical-safety checks as the selected proof. Fresh names force the kernel
+  -- to inspect discarded bodies even when replay reused a foundation theorem.
+  checkAlternateProofs replayed alternateProofs
+  let checkedEnv := Environment.ofKernelEnv replayed
+  let canonicalType ← kernelResult "canonical root type check"
+    (Kernel.check checkedEnv {} canonical)
+  unless canonicalType == .sort .zero do
+    fail "canonical root application must have type Prop"
+  let some expectedBody := expectedInfo.value? true
+    | fail "Expected has no stored body"
+  requireKernelEquality "compiled Expected comparison"
+    "compiled Expected body differs from the canonical root"
+    (Kernel.isDefEq checkedEnv {} expectedBody canonical)
+  requireKernelEquality "target theorem type comparison"
+    "target theorem type differs from Expected"
+    (Kernel.isDefEq checkedEnv {} theoremInfo.type canonical)
+  -- Compiler replacement attributes do not affect logical reduction. Reject
+  -- authored changes nevertheless, including changes to an imported helper.
+  -- Compare against authenticated toolchain metadata so ordinary pinned extern
+  -- implementations of Nat/BitVec operations remain available. These metadata
+  -- imports execute under the target's declared intact-host assumption.
+  -- Repository preflight separately executes authenticated foundation/library
+  -- parser extensions; its logical inspection and replay disable extensions.
+  let fixedMetadata ← importEnv j (foundation ++ libraries) true
+  let targetMetadata ← importEnv j roots true
+  for n in reached do
+    unless Compiler.getImplementedBy? fixedMetadata n ==
+        Compiler.getImplementedBy? targetMetadata n &&
+        getExternAttrData? fixedMetadata n == getExternAttrData? targetMetadata n do
+      fail s!"unchecked compiler override on logical dependency {n}"
+    let replacement (metadata : Environment) :=
+      (Compiler.CSimp.ext.getState metadata).map.find? n |>.map fun e =>
+        (e.toDeclName, e.thmName)
+    unless replacement fixedMetadata == replacement targetMetadata do
+      fail s!"authored compiler replacement on logical dependency {n}"
+  -- Subject helpers can determine captured program data without appearing in
+  -- the model or specification. Report their own logical closure as well, so
+  -- those installed artifacts receive identities without including proof-only
+  -- helpers or every imported module. declarationEdges follows stored values:
+  -- Lean's value? "Returns the value of a definition."
+  -- https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Declaration.lean#L479-L488
+  let (_, subjectClosure) ← closure lookup (origin env) axiomPolicy [subjectName]
+  let (_, modelClosure) ← closure lookup (origin env) axiomPolicy modelRoots
+  let (_, specClosure) ← closure lookup (origin env) axiomPolicy specRoots
+  let describe (nodes : NameSet) := nodes.toArray.qsort Name.lt |>.mapM fun n => do
+    return Json.mkObj [("name", toJson n), ("module", toJson (← origin env n))]
+  return Json.mkObj [("theorem", toJson theoremName),
+    ("canonicalRoot", toJson canonicalRoot), ("subject", toJson subjectName),
+    ("specification", toJson specName), ("graph", graph env),
+    ("expected", toJson expectedName), ("axioms", toJson axioms),
+    ("replay", toJson true), ("exactType", toJson true),
+    ("replayedDeclarations", toJson replayMap.size),
+    ("checkedAlternateProofs", toJson alternateProofs.size),
+    ("subjectClosure", .arr (← describe subjectClosure)),
+    ("modelClosure", .arr (← describe modelClosure)),
+    ("specificationClosure", .arr (← describe specClosure))]
+
+/-- Dispatch a repository or target inspection request. -/
 def run (j : Json) : IO Json := do
   let mode ← field (α := String) j "mode"
   initSearchPath (← field (α := String) j "sysroot")
   let foundation ← names j "foundation"
   match mode with
+  | "headers" =>
+    let sources ← field (α := Array (String × String)) j "sources"
+    let headers ← sources.mapM fun (n,p) => inspectHeader n.toName p
+    return Json.mkObj [("headers", .arr headers)]
   | "preflight" =>
-    let env ← importEnv j foundation true
+    let libraries ← names j "libraries"
+    let env ← importEnv j (foundation ++ libraries) true
     validateGraph j env
     let sources ← field (α := Array (String × String)) j "sources"
     let headers ← sources.mapM fun (n, p) => inspectSource env n.toName p
@@ -794,8 +1223,10 @@ def run (j : Json) : IO Json := do
   | "audit" =>
     let trusted ← names j "trusted"
     let theory ← names j "theory"
-    let env ← importEnv j (foundation ++ trusted ++ theory)
+    let libraries ← names j "libraries"
+    let env ← importEnv j (foundation ++ libraries ++ trusted ++ theory)
     audit j env foundation trusted theory
+  | "target-audit" => targetAudit j foundation
   | _ => throw <| IO.userError s!"unknown inspector mode {mode}"
 
 end TrustedBoundary
