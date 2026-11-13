@@ -58,8 +58,10 @@ pub const MIRI_CORPUS_CRATE_HEADER: &str = "\
 pub const MIRI_CORPUS_MODULE_PREAMBLE: &str = "\
 use core::cell::UnsafeCell;
 use core::intrinsics::{
-    assume, copy_nonoverlapping, exact_div, offset, unchecked_add, unchecked_div, unchecked_mul,
-    unchecked_rem, unchecked_shl, unchecked_shr, unchecked_sub, unreachable,
+    align_of_val, arith_offset, assume, bitreverse, bswap, copy_nonoverlapping, ctlz, ctlz_nonzero,
+    ctpop, cttz, cttz_nonzero, exact_div, offset, saturating_add, saturating_sub, size_of_val,
+    three_way_compare, unchecked_add, unchecked_div, unchecked_mul, unchecked_rem, unchecked_shl,
+    unchecked_shr, unchecked_sub, unreachable, wrapping_add, wrapping_mul, wrapping_sub,
 };
 use core::mem::transmute;
 
@@ -110,6 +112,85 @@ pub enum SingleC {
 pub union OverlayU32 {
     pub word: u32,
     pub bytes: [u8; 4],
+}
+
+#[repr(C)]
+pub struct NonCopyU32(pub u32);
+
+#[repr(C)]
+pub struct NonCopyPairU32 {
+    pub a: NonCopyU32,
+    pub b: u32,
+}
+
+#[allow(unused_macros)]
+macro_rules! write_bytes {
+    ($dst:expr, $val:expr, $count:expr) => {{
+        let __wb_dst: *mut u32 = $dst;
+        let __wb_b: u8 = $val;
+        let __wb_cnt: usize = $count;
+        let __wb_pat: u32 = transmute::<[u8; 4], u32>([__wb_b, __wb_b, __wb_b, __wb_b]);
+        let mut __wb_i: usize = 0;
+        while __wb_i < __wb_cnt {
+            let __wb_slot: *mut u32 = offset(__wb_dst, __wb_i as isize);
+            copy_nonoverlapping(&raw const __wb_pat, __wb_slot, 1);
+            __wb_i += 1;
+        }
+    }};
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_leaf: &str = \"helper_reborrow_leaf\";
+#[inline(never)]
+pub fn helper_reborrow_leaf(v: u32) -> u32 {
+    v
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_mid: &str = \"helper_reborrow_mid\";
+#[inline(never)]
+pub fn helper_reborrow_mid(_r: &mut u32, _extra: u32) -> u32 {
+    helper_reborrow_leaf(22u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_shared_leaf: &str = \"helper_shared_leaf\";
+#[inline(never)]
+pub fn helper_shared_leaf(v: u32) -> u32 {
+    v
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_shared_mid: &str = \"helper_shared_mid\";
+#[inline(never)]
+pub fn helper_shared_mid(_r: &u32, _bonus: u32) -> u32 {
+    helper_shared_leaf(25u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_violate_fn_entry_protector: &str = \"helper_violate_fn_entry_protector\";
+#[inline(never)]
+pub fn helper_violate_fn_entry_protector(mut slot: u32) -> u32 {
+    let raw: *mut u32 = &raw mut slot;
+    let r: &mut u32 = unsafe { &mut *raw };
+    *r = helper_reborrow_leaf(55u32);
+    let _ = unsafe { *raw };
+    *r = 99u32;
+    *r
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_leaf: &str = \"helper_unwind_leaf\";
+#[inline(never)]
+pub fn helper_unwind_leaf(base: u32, delta: u32) -> u32 {
+    base + delta
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_mid: &str = \"helper_unwind_mid\";
+#[inline(never)]
+pub fn helper_unwind_mid(_protected: &u32, _base: u32) -> u32 {
+    helper_unwind_leaf(u32::MAX, 1u32)
 }
 ";
 
@@ -219,14 +300,29 @@ impl DetRng {
     }
 }
 
-/// Extract the 89 closed zero-argument test functions from
-/// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten`).
+/// Extract the 106 closed zero-argument test functions from
+/// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten` and model
+/// helpers).
 pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
     extract_closed_corpus_seeds(RAW_MIRI_DIFF_CORPUS_RS)
 }
 
+fn is_corpus_helper_fn_name(name: &str) -> bool {
+    matches!(
+        name,
+        "helper_add_ten"
+            | "helper_reborrow_leaf"
+            | "helper_reborrow_mid"
+            | "helper_shared_leaf"
+            | "helper_shared_mid"
+            | "helper_violate_fn_entry_protector"
+            | "helper_unwind_leaf"
+            | "helper_unwind_mid"
+    ) || name.starts_with("__ANNEAL_MODEL_")
+}
+
 /// Parse `corpus_source` and extract all zero-argument `pub fn` items other
-/// than `helper_add_ten`.
+/// than `helper_add_ten` and `__ANNEAL_MODEL_*` helpers.
 pub fn extract_closed_corpus_seeds(corpus_source: &str) -> Vec<MiriCorpusSeed> {
     let parsed = syn::parse_file(corpus_source)
         .expect("tests/miri-diff/corpus/src/lib.rs must parse as valid Rust");
@@ -234,7 +330,7 @@ pub fn extract_closed_corpus_seeds(corpus_source: &str) -> Vec<MiriCorpusSeed> {
     for item in parsed.items {
         if let Item::Fn(func) = item {
             let name = func.sig.ident.to_string();
-            if name == "helper_add_ten" || !func.sig.inputs.is_empty() {
+            if is_corpus_helper_fn_name(&name) || !func.sig.inputs.is_empty() {
                 continue;
             }
             let single_file = File {
@@ -989,6 +1085,10 @@ fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
             syn::parse_quote!(NonZeroMeters(unsafe { transmute::<u32, NonZeroU32>(#pick) }))
         }
         "SingleC" => syn::parse_quote!(SingleC::Only(#pick)),
+        "NonCopyU32" => syn::parse_quote!(NonCopyU32(#pick)),
+        "NonCopyPairU32" => {
+            syn::parse_quote!(NonCopyPairU32 { a: NonCopyU32(#pick), b: #pick ^ 3u32 })
+        }
         "PairU32" => syn::parse_quote!(PairU32 { a: #pick, b: #pick ^ 3u32 }),
         "PaddedU8U32" => {
             let b = (pick & 0x7F) as u8;
@@ -1018,7 +1118,22 @@ impl VisitMut for MethodCallNormalizer {
                     "wrapping_neg" => {
                         *expr = syn::parse_quote!((!(#recv)));
                     }
-                    "swap_bytes" | "to_le" | "to_be" => {
+                    "leading_zeros" => {
+                        *expr = syn::parse_quote!(ctlz(#recv));
+                    }
+                    "trailing_zeros" => {
+                        *expr = syn::parse_quote!(cttz(#recv));
+                    }
+                    "count_ones" => {
+                        *expr = syn::parse_quote!(ctpop(#recv));
+                    }
+                    "swap_bytes" => {
+                        *expr = syn::parse_quote!(bswap(#recv));
+                    }
+                    "reverse_bits" => {
+                        *expr = syn::parse_quote!(bitreverse(#recv));
+                    }
+                    "to_le" | "to_be" => {
                         *expr = syn::parse_quote!((#recv));
                     }
                     _ => {}
@@ -1026,13 +1141,22 @@ impl VisitMut for MethodCallNormalizer {
             } else if mc.args.len() == 1 {
                 let arg = &mc.args[0];
                 match method.as_str() {
-                    "wrapping_add" | "saturating_add" => {
-                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    "wrapping_add" => {
+                        *expr = syn::parse_quote!(wrapping_add(#recv, #arg));
                     }
-                    "wrapping_sub" | "saturating_sub" => {
-                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    "wrapping_sub" => {
+                        *expr = syn::parse_quote!(wrapping_sub(#recv, #arg));
                     }
-                    "wrapping_mul" | "saturating_mul" => {
+                    "wrapping_mul" => {
+                        *expr = syn::parse_quote!(wrapping_mul(#recv, #arg));
+                    }
+                    "saturating_add" => {
+                        *expr = syn::parse_quote!(saturating_add(#recv, #arg));
+                    }
+                    "saturating_sub" => {
+                        *expr = syn::parse_quote!(saturating_sub(#recv, #arg));
+                    }
+                    "saturating_mul" => {
                         *expr = syn::parse_quote!(((#recv) | (#arg)));
                     }
                     "rotate_left" | "wrapping_shl" => {
@@ -1153,7 +1277,11 @@ impl VisitMut for ArithAstPerturber<'_> {
                 || name.starts_with("__shl_")
                 || name.starts_with("__ub_")
                 || name.starts_with("__tb_ovf")
-                || name.starts_with("__miri_"))
+                || name.starts_with("__miri_")
+                || name.starts_with("__intr_")
+                || name.starts_with("__ediv_")
+                || name.starts_with("__wb_")
+                || name == "zero")
         {
             return;
         }
@@ -1162,7 +1290,8 @@ impl VisitMut for ArithAstPerturber<'_> {
 
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         // Preserve loop termination conditions, array index/repeat expressions,
-        // and intrinsic precondition arguments (`assume`, `exact_div`, shifts).
+        // and intrinsic precondition arguments (`assume`, `exact_div`, shifts,
+        // `ctlz_nonzero`, `cttz_nonzero`, `copy_nonoverlapping`, `arith_offset`).
         if matches!(
             expr,
             Expr::While(_) | Expr::ForLoop(_) | Expr::Index(_) | Expr::Repeat(_)
@@ -1174,7 +1303,16 @@ impl VisitMut for ArithAstPerturber<'_> {
             && let Some(seg) = ep.path.segments.last()
             && matches!(
                 seg.ident.to_string().as_str(),
-                "assume" | "exact_div" | "unchecked_shl" | "unchecked_shr" | "transmute" | "offset"
+                "assume"
+                    | "exact_div"
+                    | "unchecked_shl"
+                    | "unchecked_shr"
+                    | "transmute"
+                    | "offset"
+                    | "arith_offset"
+                    | "ctlz_nonzero"
+                    | "cttz_nonzero"
+                    | "copy_nonoverlapping"
             )
         {
             return;
@@ -1257,7 +1395,7 @@ impl MiriAstMutator for ArithmeticCastMutator {
 
         for item in &mut file.items {
             let Item::Fn(func) = item else { continue };
-            if func.sig.ident == "helper_add_ten" {
+            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
                 continue;
             }
             let locals = collect_initialized_locals(func);
@@ -1278,23 +1416,58 @@ impl MiriAstMutator for ArithmeticCastMutator {
                 };
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass | MutationMode::PerturbAst => {
-                    let cast_pairs: [(&str, &str); 6] = [
-                        ("i8", "i32"),
-                        ("u8", "u32"),
-                        ("i16", "i64"),
-                        ("u16", "i64"),
-                        ("i32", "i64"),
-                        ("isize", "usize"),
-                    ];
-                    let (inter_s, wide_s) = cast_pairs[rng.gen_range(cast_pairs.len())];
-                    let inter_ty: Type = syn::parse_str(inter_s).expect("valid inter_ty");
-                    let wide_ty: Type = syn::parse_str(wide_s).expect("valid wide_ty");
-                    syn::parse_quote! {
-                        let __miri_wide: #wide_ty = ((#base_expr as #inter_ty) as #wide_ty) ^ (#mask_lit as #wide_ty);
-                        let #probe_ident: u32 = ((__miri_wide as u32) << #shift_lit) ^ #mask_lit;
+                MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(5) {
+                    0 => {
+                        let cast_pairs: [(&str, &str); 6] = [
+                            ("i8", "i32"),
+                            ("u8", "u32"),
+                            ("i16", "i64"),
+                            ("u16", "i64"),
+                            ("i32", "i64"),
+                            ("isize", "usize"),
+                        ];
+                        let (inter_s, wide_s) = cast_pairs[rng.gen_range(cast_pairs.len())];
+                        let inter_ty: Type = syn::parse_str(inter_s).expect("valid inter_ty");
+                        let wide_ty: Type = syn::parse_str(wide_s).expect("valid wide_ty");
+                        syn::parse_quote! {
+                            let __miri_wide: #wide_ty = ((#base_expr as #inter_ty) as #wide_ty) ^ (#mask_lit as #wide_ty);
+                            let #probe_ident: u32 = ((__miri_wide as u32) << #shift_lit) ^ #mask_lit;
+                        }
                     }
-                }
+                    1 => syn::parse_quote! {
+                        let __intr_nz: u32 = (#base_expr) | 1u32;
+                        let __intr_bits: u32 = ctlz(#base_expr)
+                            ^ cttz(#base_expr)
+                            ^ ctpop(__intr_nz)
+                            ^ (bswap(__intr_nz) & 0xFFu32)
+                            ^ (bitreverse(__intr_nz) >> 24u32);
+                        let __intr_nz_cnt: u32 = unsafe { ctlz_nonzero(__intr_nz) ^ cttz_nonzero(__intr_nz) };
+                        let #probe_ident: u32 = __intr_bits ^ __intr_nz_cnt;
+                    },
+                    2 => syn::parse_quote! {
+                        let __sat_b: u8 = ((#base_expr) & 0xFFu32) as u8;
+                        let __sat_hi: u8 = saturating_add(__sat_b, 200u8);
+                        let __sat_lo: u8 = saturating_sub(__sat_b, 200u8);
+                        let __wrap_v: u32 = wrapping_mul(
+                            wrapping_add(#base_expr, #mask_lit),
+                            wrapping_sub(#shift_lit, 1u32),
+                        );
+                        let #probe_ident: u32 = (__sat_hi as u32) ^ (__sat_lo as u32) ^ __wrap_v;
+                    },
+                    3 => syn::parse_quote! {
+                        let __cmp_ord = three_way_compare(#base_expr, #mask_lit);
+                        let __cmp_tag: u32 = ((__cmp_ord as i8) + 1i8) as u32;
+                        let __ediv_num: u32 = ((#base_expr) & 0xFFu32) * #shift_lit;
+                        let __ediv_q: u32 = unsafe { exact_div(__ediv_num, #shift_lit) };
+                        let #probe_ident: u32 = __cmp_tag ^ __ediv_q;
+                    },
+                    _ => syn::parse_quote! {
+                        let __layout_pair: PairU32 = PairU32 { a: #base_expr, b: #mask_lit };
+                        let __sz: usize = unsafe { size_of_val(&raw const __layout_pair) };
+                        let __al: usize = unsafe { align_of_val(&raw const __layout_pair) };
+                        let #probe_ident: u32 = (__sz as u32) ^ (__al as u32) ^ __layout_pair.a;
+                    },
+                },
                 MutationMode::Panic => {
                     let variant = rng.gen_range(4);
                     match variant {
@@ -1321,7 +1494,7 @@ impl MiriAstMutator for ArithmeticCastMutator {
                     }
                 }
                 MutationMode::Ub => {
-                    let variant = rng.gen_range(4);
+                    let variant = rng.gen_range(8);
                     match variant {
                         0 => syn::parse_quote! {
                             let __ub_step: u32 = 1u32 + ((#base_expr) & 1u32);
@@ -1335,9 +1508,26 @@ impl MiriAstMutator for ArithmeticCastMutator {
                             let __ub_shl: u32 = 32u32 + ((#base_expr) & 1u32);
                             let #probe_ident: u32 = unsafe { unchecked_shl(1u32, __ub_shl) };
                         },
-                        _ => syn::parse_quote! {
+                        3 => syn::parse_quote! {
                             let __ub_zero: u32 = (#base_expr) & 0u32;
                             let #probe_ident: u32 = unsafe { unchecked_div(#mask_lit, __ub_zero) };
+                        },
+                        4 => syn::parse_quote! {
+                            let __ub_zero: u32 = (#base_expr) & 0u32;
+                            let #probe_ident: u32 = unsafe { ctlz_nonzero(__ub_zero) };
+                        },
+                        5 => syn::parse_quote! {
+                            let __ub_zero: u32 = (#base_expr) & 0u32;
+                            let #probe_ident: u32 = unsafe { cttz_nonzero(__ub_zero) };
+                        },
+                        6 => syn::parse_quote! {
+                            let __ub_odd: u32 = ((#base_expr) & 0u32) + 7u32;
+                            let #probe_ident: u32 = unsafe { exact_div(__ub_odd, 2u32) };
+                        },
+                        _ => syn::parse_quote! {
+                            let __ub_min_i8: i8 = i8::MIN;
+                            let __ub_neg1_i8: i8 = -1i8;
+                            let #probe_ident: u32 = unsafe { exact_div(__ub_min_i8, __ub_neg1_i8) as u32 };
                         },
                     }
                 }
@@ -2032,7 +2222,7 @@ impl MiriAstMutator for RawPtrOffsetMutator {
 
         for item in &mut file.items {
             let Item::Fn(func) = item else { continue };
-            if func.sig.ident == "helper_add_ten" {
+            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
                 continue;
             }
             let locals = collect_initialized_locals(func);
@@ -2045,22 +2235,72 @@ impl MiriAstMutator for RawPtrOffsetMutator {
             let c_b: u32 = [33u32, 66u32, 99u32, 132u32][rng.gen_range(4)];
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass => {
-                    syn::parse_quote! {
+                MutationMode::Pass => match rng.gen_range(4) {
+                    0 => syn::parse_quote! {
                         let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                         let __base_ptr: *const u32 = &raw const __ptr_pair.a;
                         let #probe_ident: u32 = unsafe { *offset(__base_ptr, 0isize) };
-                    }
-                }
-                MutationMode::PerturbAst => {
-                    // Cross-field offset 1isize exercises `pass_ptr_offset_within_array`.
-                    let step: isize = if rng.coin(1, 2) { 1 } else { 0 };
-                    syn::parse_quote! {
+                    },
+                    1 => syn::parse_quote! {
                         let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                         let __base_ptr: *const u32 = &raw const __ptr_pair.a;
-                        let #probe_ident: u32 = unsafe { *offset(__base_ptr, #step) };
+                        let __far_ptr: *const u32 = unsafe { arith_offset(__base_ptr, 5isize) };
+                        let __field_b_ptr: *const u32 = unsafe { arith_offset(__far_ptr, -4isize) };
+                        let #probe_ident: u32 = unsafe { (*__field_b_ptr) ^ __ptr_pair.a };
+                    },
+                    2 => {
+                        let fill_b: u8 = [0x01u8, 0x02u8, 0x05u8, 0x0Fu8][rng.gen_range(4)];
+                        syn::parse_quote! {
+                            let mut __wb_src: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let mut __wb_dst: u32 = 0u32;
+                            unsafe {
+                                write_bytes!(&raw mut __wb_src.a, #fill_b, 1usize);
+                                copy_nonoverlapping(&raw const __wb_src.a, &raw mut __wb_dst, 1usize);
+                            }
+                            let #probe_ident: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;
+                        }
                     }
-                }
+                    _ => syn::parse_quote! {
+                        let __cp_src: [u32; 2] = [#c_a, #c_b];
+                        let mut __cp_dst: [u32; 2] = [0u32, 0u32];
+                        unsafe {
+                            let __src_p: *const u32 = &raw const __cp_src[0];
+                            let __dst_p: *mut u32 = &raw mut __cp_dst[0];
+                            copy_nonoverlapping(__src_p, __dst_p, 2usize);
+                        }
+                        let #probe_ident: u32 = __cp_dst[0] ^ __cp_dst[1];
+                    },
+                },
+                MutationMode::PerturbAst => match rng.gen_range(3) {
+                    0 => {
+                        // Cross-field offset 1isize exercises `pass_ptr_offset_within_array`.
+                        let step: isize = if rng.coin(1, 2) { 1 } else { 0 };
+                        syn::parse_quote! {
+                            let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let __base_ptr: *const u32 = &raw const __ptr_pair.a;
+                            let #probe_ident: u32 = unsafe { *offset(__base_ptr, #step) };
+                        }
+                    }
+                    1 => syn::parse_quote! {
+                        let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                        let __base_ptr: *const u32 = &raw const __ptr_pair.a;
+                        let __far_ptr: *const u32 = unsafe { arith_offset(__base_ptr, 6isize) };
+                        let __back_ptr: *const u32 = unsafe { arith_offset(__far_ptr, -5isize) };
+                        let #probe_ident: u32 = unsafe { (*__back_ptr) ^ __ptr_pair.a };
+                    },
+                    _ => {
+                        let fill_b: u8 = [0x01u8, 0x03u8, 0x07u8, 0x0Fu8][rng.gen_range(4)];
+                        syn::parse_quote! {
+                            let mut __wb_src: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let mut __wb_dst: u32 = 0u32;
+                            unsafe {
+                                write_bytes!(&raw mut __wb_src.a, #fill_b, 1usize);
+                                copy_nonoverlapping(&raw const __wb_src.a, &raw mut __wb_dst, 1usize);
+                            }
+                            let #probe_ident: u32 = (__wb_dst & 0xFFu32) ^ __wb_src.b;
+                        }
+                    }
+                },
                 MutationMode::Panic => {
                     syn::parse_quote! {
                         let __ptr_arr: [u32; 2] = [#c_a, #c_b];
@@ -2069,7 +2309,7 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                     }
                 }
                 MutationMode::Ub => {
-                    let variant = rng.gen_range(4);
+                    let variant = rng.gen_range(5);
                     match variant {
                         0 => syn::parse_quote! {
                             let __null_p: *const u32 = 0usize as *const u32;
@@ -2087,11 +2327,21 @@ impl MiriAstMutator for RawPtrOffsetMutator {
                             let __neg_step: isize = -1isize;
                             let #probe_ident: u32 = unsafe { *offset(__neg_base, __neg_step) };
                         },
-                        _ => syn::parse_quote! {
+                        3 => syn::parse_quote! {
                             let __unaligned_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
                             let __u8_base: *const u8 = (&raw const __unaligned_pair.a) as *const u8;
                             let __unaligned_step: isize = 1isize;
                             let #probe_ident: u32 = unsafe { *(offset(__u8_base, __unaligned_step) as *const u32) };
+                        },
+                        _ => syn::parse_quote! {
+                            let mut __ovl_arr: [u32; 4] = [#c_a, #c_b, #c_a ^ 1u32, #c_b ^ 1u32];
+                            let __ovl_p: *mut u32 = &raw mut __ovl_arr[0];
+                            let __ovl_step: isize = 1isize;
+                            unsafe {
+                                let __ovl_dst: *mut u32 = offset(__ovl_p, __ovl_step);
+                                copy_nonoverlapping(__ovl_p as *const u32, __ovl_dst, 2usize);
+                            }
+                            let #probe_ident: u32 = __ovl_arr[1];
                         },
                     }
                 }
@@ -2860,7 +3110,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
 
         for item in &mut file.items {
             let Item::Fn(func) = item else { continue };
-            if func.sig.ident == "helper_add_ten" {
+            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
                 continue;
             }
             let locals = collect_initialized_locals(func);
@@ -2873,7 +3123,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
             let write_val: u32 = [1u32, 3u32, 7u32, 15u32][rng.gen_range(4)];
 
             let stmts: Vec<Stmt> = match mode {
-                MutationMode::Pass => match rng.gen_range(4) {
+                MutationMode::Pass => match rng.gen_range(8) {
                     // Reserved `&mut` coexisting with parent read before activation.
                     0 => syn::parse_quote! {
                         let mut __tb_slot: u32 = #init_val;
@@ -2905,7 +3155,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     },
                     // `&raw mut` payload pointer derived from `&mut SingleC`
                     // writes the payload before the parent enum is matched.
-                    _ => syn::parse_quote! {
+                    3 => syn::parse_quote! {
                         let mut __rr_sc: SingleC = SingleC::Only(#init_val);
                         let __rr_sc_p: *mut u32 = match &mut __rr_sc {
                             SingleC::Only(__rr_inner) => &raw mut *__rr_inner,
@@ -2917,10 +3167,55 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             SingleC::Only(__rr_v) => __rr_v,
                         };
                     },
+                    // `Operand::Move` whole-place deinitialization borrow-tree
+                    // invariance on `NonCopyU32` with a prior `Reserved` `&mut u32`
+                    // re-initializing the moved place.
+                    4 => syn::parse_quote! {
+                        let mut __mv_x: NonCopyU32 = NonCopyU32(#init_val);
+                        let __mv_root: *mut NonCopyU32 = &raw mut __mv_x;
+                        let __mv_res: &mut NonCopyU32 = unsafe { &mut *__mv_root };
+                        let __mv_moved: NonCopyU32 = __mv_x;
+                        *__mv_res = NonCopyU32(__mv_moved.0 ^ #write_val);
+                        let #probe_ident: u32 = ((*__mv_res).0) ^ __mv_moved.0;
+                    },
+                    // `Operand::Move` sub-place field move on `NonCopyPairU32`
+                    // preserving an active `Frozen` shared borrow on sibling `.b`.
+                    5 => syn::parse_quote! {
+                        let __mp_pair: NonCopyPairU32 = NonCopyPairU32 {
+                            a: NonCopyU32(#init_val),
+                            b: #write_val,
+                        };
+                        let __mp_rb: &u32 = &__mp_pair.b;
+                        let __mp_moved_a: NonCopyU32 = __mp_pair.a;
+                        let #probe_ident: u32 = __mp_moved_a.0 ^ (*__mp_rb);
+                    },
+                    // Two-stage `RetagKind::FnEntry` protector release across a
+                    // depth-2 `#[inline(never)]` mutable reborrow chain followed by
+                    // a post-return parent raw write.
+                    6 => syn::parse_quote! {
+                        let mut __fn_slot: u32 = #init_val;
+                        let __fn_raw: *mut u32 = &raw mut __fn_slot;
+                        let __fn_r0: &mut u32 = unsafe { &mut *__fn_raw };
+                        let __fn_delta: u32 = helper_reborrow_mid(__fn_r0, #write_val);
+                        *__fn_r0 = __fn_delta ^ #init_val;
+                        unsafe {
+                            *__fn_raw = (*__fn_r0) ^ #write_val;
+                        }
+                        let #probe_ident: u32 = unsafe { *__fn_raw };
+                    },
+                    // Multi-callee shared reference reborrow chain (`&u32`) with
+                    // `RetagKind::FnEntry` protector release followed by parent write.
+                    _ => syn::parse_quote! {
+                        let mut __fns_slot: u32 = #init_val;
+                        let __fns_shr: &u32 = &__fns_slot;
+                        let __fns_seen: u32 = helper_shared_mid(__fns_shr, #write_val);
+                        __fns_slot = __fns_seen ^ #write_val;
+                        let #probe_ident: u32 = __fns_slot;
+                    },
                 },
                 // Child write followed by parent read/write (legal in Tree
                 // Borrows, exercises parent/child borrow-tree transitions).
-                MutationMode::PerturbAst => match rng.gen_range(4) {
+                MutationMode::PerturbAst => match rng.gen_range(6) {
                     0 => syn::parse_quote! {
                         let mut __tb_slot: u32 = #init_val;
                         let __tb_root: *mut u32 = &raw mut __tb_slot;
@@ -2952,7 +3247,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                     },
                     // A write through `&raw mut (*m).b`, then parent reads of
                     // both fields.
-                    _ => syn::parse_quote! {
+                    3 => syn::parse_quote! {
                         let mut __rr_pair: PairU32 = PairU32 { a: #init_val, b: #write_val };
                         let __rr_fm: &mut PairU32 = &mut __rr_pair;
                         let __rr_fb: *mut u32 = &raw mut (*__rr_fm).b;
@@ -2961,15 +3256,41 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                         }
                         let #probe_ident: u32 = __rr_fm.a ^ __rr_fm.b;
                     },
+                    // `Operand::Move` borrow-tree invariance on `NonCopyU32`.
+                    4 => syn::parse_quote! {
+                        let mut __mv_x: NonCopyU32 = NonCopyU32(#init_val);
+                        let __mv_root: *mut NonCopyU32 = &raw mut __mv_x;
+                        let __mv_res: &mut NonCopyU32 = unsafe { &mut *__mv_root };
+                        let __mv_moved: NonCopyU32 = __mv_x;
+                        *__mv_res = NonCopyU32(__mv_moved.0 ^ #write_val);
+                        let #probe_ident: u32 = (*__mv_res).0 ^ __mv_moved.0;
+                    },
+                    // Two-stage `RetagKind::FnEntry` protector release across
+                    // `helper_reborrow_mid` -> `helper_reborrow_leaf`.
+                    _ => syn::parse_quote! {
+                        let mut __fn_slot: u32 = #init_val;
+                        let __fn_raw: *mut u32 = &raw mut __fn_slot;
+                        let __fn_r0: &mut u32 = unsafe { &mut *__fn_raw };
+                        let __fn_delta: u32 = helper_reborrow_mid(__fn_r0, #write_val);
+                        *__fn_r0 = __fn_delta ^ #init_val;
+                        unsafe {
+                            *__fn_raw = (*__fn_r0) ^ #write_val;
+                        }
+                        let #probe_ident: u32 = unsafe { *__fn_raw };
+                    },
                 },
-                MutationMode::Panic => {
-                    syn::parse_quote! {
+                MutationMode::Panic => match rng.gen_range(2) {
+                    0 => syn::parse_quote! {
                         let __tb_ovf: u32 = u32::MAX;
                         let #probe_ident: u32 = __tb_ovf + #write_val;
-                    }
-                }
+                    },
+                    _ => syn::parse_quote! {
+                        let __tb_u_slot: u32 = #init_val;
+                        let #probe_ident: u32 = helper_unwind_mid(&__tb_u_slot, u32::MAX);
+                    },
+                },
                 MutationMode::Ub => {
-                    let variant = rng.gen_range(8);
+                    let variant = rng.gen_range(10);
                     match variant {
                         0 => syn::parse_quote! {
                             let __tb_imm: u32 = #init_val;
@@ -3064,7 +3385,7 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                         // Whole-enum reinitialization (`Deinit` + aggregate
                         // write) through the parent `&mut SingleC` disables the
                         // child `&raw mut` payload pointer.
-                        _ => syn::parse_quote! {
+                        7 => syn::parse_quote! {
                             let mut __rr_sc: SingleC = SingleC::Only(#init_val);
                             let __rr_sc_m: &mut SingleC = &mut __rr_sc;
                             let __rr_sc_p: *mut u32 = match &mut *__rr_sc_m {
@@ -3077,6 +3398,34 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
                             let #probe_ident: u32 = match __rr_sc {
                                 SingleC::Only(__rr_v) => __rr_v,
                             };
+                        },
+                        // Explicit parent assignment `x = NonCopyU32(...)`
+                        // disables an active child borrow before subsequent write.
+                        8 => syn::parse_quote! {
+                            let mut __ub_nc: NonCopyU32 = NonCopyU32(#init_val);
+                            let __ub_nc_root: *mut NonCopyU32 = &raw mut __ub_nc;
+                            let __ub_nc_r: &mut u32 = unsafe { &mut (*__ub_nc_root).0 };
+                            {
+                                *__ub_nc_r = #write_val;
+                            }
+                            let __ub_nc_seen: u32 = *__ub_nc_r;
+                            __ub_nc = NonCopyU32(__ub_nc_seen ^ #init_val);
+                            let __ub_nc_after: u32 = __ub_nc.0;
+                            {
+                                *__ub_nc_r = __ub_nc_after ^ #write_val;
+                            }
+                            let #probe_ident: u32 = __ub_nc.0;
+                        },
+                        // Multi-callee reborrow chain followed by frozen write UB during call.
+                        _ => syn::parse_quote! {
+                            let mut __ub_prot_x: u32 = #init_val;
+                            let __ub_prot_raw: *mut u32 = &raw mut __ub_prot_x;
+                            let __ub_prot_d: u32 = helper_reborrow_mid(unsafe { &mut *__ub_prot_raw }, #write_val);
+                            unsafe {
+                                *__ub_prot_raw = __ub_prot_d;
+                            }
+                            let #probe_ident: u32 =
+                                helper_violate_fn_entry_protector(unsafe { *__ub_prot_raw });
                         },
                     }
                 }
@@ -3977,7 +4326,9 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
         .filter_map(|(idx, src)| {
             let parsed = syn::parse_str::<File>(src).ok()?;
             let fn_name = parsed.items.iter().rev().find_map(|it| match it {
-                Item::Fn(f) if f.sig.ident != "helper_add_ten" => Some(f.sig.ident.to_string()),
+                Item::Fn(f) if !is_corpus_helper_fn_name(&f.sig.ident.to_string()) => {
+                    Some(f.sig.ident.to_string())
+                }
                 _ => None,
             })?;
             if !fn_name.starts_with("panic_") && !fn_name.starts_with("ub_") {
@@ -4115,7 +4466,7 @@ fn close_miri_seed(
     parsed.attrs.clear();
     parsed.items.retain(|item| {
         if let Item::Fn(f) = item {
-            f.sig.ident != "helper_add_ten"
+            !is_corpus_helper_fn_name(&f.sig.ident.to_string())
         } else {
             false
         }
@@ -4422,12 +4773,12 @@ mod tests {
     }
 
     #[test]
-    fn corpus_seeds_load_all_89_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+    fn corpus_seeds_load_all_106_zero_arg_functions_and_do_not_blocklist_known_bugs() {
         let seeds = load_miri_diff_corpus_seeds();
         assert_eq!(
             seeds.len(),
-            89,
-            "expected 89 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+            106,
+            "expected 106 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
         );
         assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
         assert!(
@@ -4450,7 +4801,32 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "pass_option_some_niche_and_single_c_mut")
         );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "pass_move_deinit_preserves_reserved_child")
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "pass_fn_entry_protector_two_stage_reborrow_chain")
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "panic_multi_callee_unwind_chain")
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "pass_intrinsics_bit_count_and_reverse")
+        );
         assert!(!seeds.iter().any(|s| s.name == "helper_add_ten"));
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.name.starts_with("__ANNEAL_MODEL_"))
+        );
 
         let raw_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
         let non_fault_indices = collect_non_fault_seed_indices(&raw_refs);
@@ -5988,7 +6364,8 @@ pub fn usize_off() -> u32 {
                 out.contains("__null_p")
                     || out.contains("let __oob_step: isize = 2isize;")
                     || out.contains("let __neg_step: isize = -1isize;")
-                    || out.contains("let __unaligned_step: isize = 1isize;"),
+                    || out.contains("let __unaligned_step: isize = 1isize;")
+                    || out.contains("let __ovl_step: isize = 1isize;"),
                 "follow-up `RawPtrOffsetMutator::Pass` erased Pass 0 UB:\n{out}"
             );
         }
@@ -6161,5 +6538,149 @@ pub fn unsuffixed_off() -> u32 {
             }
         }
         assert!(saw_two);
+    }
+
+    #[test]
+    fn ep1_a0_synthesizes_category9_intrinsics_move_borrows_and_multi_callee_chains() {
+        let base_seed = "pub fn probe(x: u32) -> u32 {\n    let a = x.leading_zeros() + x.trailing_zeros() + x.count_ones();\n    let b = x.swap_bytes().reverse_bits();\n    a.saturating_add(b).wrapping_add(1u32)\n}\n";
+        let mut norm_file = syn::parse_file(base_seed).unwrap();
+        let mut norm_rng = DetRng::new(0xA0A0_0001);
+        close_miri_seed(&mut norm_file, &mut norm_rng, |s| s.to_string());
+        let norm_src = prettyplease::unparse(&norm_file);
+        for expected in [
+            "ctlz(",
+            "cttz(",
+            "ctpop(",
+            "bswap(",
+            "bitreverse(",
+            "saturating_add(",
+            "wrapping_add(",
+        ] {
+            assert!(
+                norm_src.contains(expected),
+                "MethodCallNormalizer must lower to `{expected}`:\n{norm_src}"
+            );
+        }
+
+        let simple_seed = "pub fn seed() -> u32 { 7u32 }\n";
+        let mut arith_seen = BTreeSet::new();
+        let mut ptr_seen = BTreeSet::new();
+        let mut tb_seen = BTreeSet::new();
+
+        for s in 0..128u64 {
+            for mode in [
+                MutationMode::Pass,
+                MutationMode::PerturbAst,
+                MutationMode::Panic,
+                MutationMode::Ub,
+            ] {
+                let mut f_a = syn::parse_file(simple_seed).unwrap();
+                let mut rng_a = DetRng::new(s);
+                let mut locals_a = Vec::new();
+                ArithmeticCastMutator.mutate_with_mode(&mut f_a, &mut rng_a, mode, &mut locals_a);
+                let src_a = prettyplease::unparse(&f_a);
+                for needle in [
+                    "ctlz(",
+                    "ctlz_nonzero(",
+                    "saturating_add(",
+                    "three_way_compare(",
+                    "size_of_val(",
+                    "exact_div(",
+                ] {
+                    if src_a.contains(needle) {
+                        arith_seen.insert((mode == MutationMode::Ub, needle));
+                    }
+                }
+
+                let mut f_p = syn::parse_file(simple_seed).unwrap();
+                let mut rng_p = DetRng::new(s);
+                let mut locals_p = Vec::new();
+                RawPtrOffsetMutator.mutate_with_mode(&mut f_p, &mut rng_p, mode, &mut locals_p);
+                let src_p = prettyplease::unparse(&f_p);
+                for needle in ["arith_offset(", "write_bytes!(", "copy_nonoverlapping("] {
+                    if src_p.contains(needle) {
+                        ptr_seen.insert((mode == MutationMode::Ub, needle));
+                    }
+                }
+
+                let mut f_t = syn::parse_file(simple_seed).unwrap();
+                let mut rng_t = DetRng::new(s);
+                let mut locals_t = Vec::new();
+                TreeBorrowsRetagInterleaver.mutate_with_mode(
+                    &mut f_t,
+                    &mut rng_t,
+                    mode,
+                    &mut locals_t,
+                );
+                let src_t = prettyplease::unparse(&f_t);
+                for needle in [
+                    "NonCopyU32(",
+                    "NonCopyPairU32",
+                    "helper_reborrow_mid(",
+                    "helper_shared_mid(",
+                    "helper_unwind_mid(",
+                    "helper_violate_fn_entry_protector(",
+                ] {
+                    if src_t.contains(needle) {
+                        tb_seen.insert(needle);
+                    }
+                }
+            }
+        }
+
+        for expected in [
+            (false, "ctlz("),
+            (false, "ctlz_nonzero("),
+            (false, "saturating_add("),
+            (false, "three_way_compare("),
+            (false, "size_of_val("),
+            (false, "exact_div("),
+            (true, "ctlz_nonzero("),
+            (true, "exact_div("),
+        ] {
+            assert!(
+                arith_seen.contains(&expected),
+                "ArithmeticCastMutator did not hit {expected:?}: {arith_seen:?}"
+            );
+        }
+        for expected in [
+            (false, "arith_offset("),
+            (false, "write_bytes!("),
+            (false, "copy_nonoverlapping("),
+            (true, "copy_nonoverlapping("),
+        ] {
+            assert!(
+                ptr_seen.contains(&expected),
+                "RawPtrOffsetMutator did not hit {expected:?}: {ptr_seen:?}"
+            );
+        }
+        for expected in [
+            "NonCopyU32(",
+            "NonCopyPairU32",
+            "helper_reborrow_mid(",
+            "helper_shared_mid(",
+            "helper_unwind_mid(",
+            "helper_violate_fn_entry_protector(",
+        ] {
+            assert!(
+                tb_seen.contains(expected),
+                "TreeBorrowsRetagInterleaver did not hit {expected:?}: {tb_seen:?}"
+            );
+        }
+
+        // Verify 100% deterministic replay across a 40-candidate corpus batch.
+        let corpus = load_miri_diff_corpus_seeds();
+        let raw_refs: Vec<&str> = corpus.iter().map(|s| s.fn_source.as_str()).collect();
+        let batch = generate_miri_corpus_batch(40, 0xE1A0_2026, 0);
+        assert_eq!(batch.len(), 40);
+        for cand in &batch {
+            let (base, steps) = reconstruct_miri_mutation_steps(cand, &raw_refs)
+                .expect("reconstruct steps for generated candidate");
+            assert!(
+                miri_candidate_replay_is_faithful(cand, &base, &steps),
+                "replay mismatch on candidate `{}`",
+                cand.fn_name
+            );
+        }
     }
 }

@@ -73,6 +73,232 @@ pub const NOT_COMPARED_REASON_NAMES: [&str; 6] = [
     "capture_failed",
 ];
 
+/// Canonical witness polarity slugs always included in `witness_polarity_counts`.
+pub const WITNESS_POLARITY_NAMES: [&str; 4] = [
+    "unsound_missed_fault",
+    "sound_conservative_abstraction",
+    "value_mismatch",
+    "harness_or_extraction_error",
+];
+
+/// Soundness direction of a `(MiriOutcome, AnnealOutcome)` comparison result.
+///
+/// Partitions every non-agreement into one of four mutually exclusive classes:
+/// - [`WitnessPolarity::UnsoundMissedFault`] (`"unsound_missed_fault"`): Miri
+///   faults (`ub` or `panic`) while Anneal returns normally (`pass`), indicating
+///   a P0 soundness bug (`missed_ub`, `panic_vs_return`).
+/// - [`WitnessPolarity::SoundConservativeAbstraction`]
+///   (`"sound_conservative_abstraction"`): Miri returns normally (`pass`) while
+///   Anneal conservatively rejects the execution with `ub` (`false_positive_ub`)
+///   or `unsupported` (`D1..D15` over-approximation).
+/// - [`WitnessPolarity::ValueMismatch`] (`"value_mismatch"`): Both Miri and
+///   Anneal terminate with conflicting normal values, fault classes, or fault
+///   locations (`wrong_value`, `return_vs_panic`, `ub_location_mismatch`,
+///   `panic_site_mismatch`, or `ub` vs `panic`/`abort`).
+/// - [`WitnessPolarity::HarnessOrExtractionError`]
+///   (`"harness_or_extraction_error"`): Capture failure, Miri oracle error,
+///   out-of-fuel exhaustion, unmodeled external call, compile failure, or
+///   `unsupported` when Miri itself did not return normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WitnessPolarity {
+    /// Miri reports `ub` or `panic` while Anneal reports `pass` (`missed_ub`,
+    /// `panic_vs_return`).
+    UnsoundMissedFault,
+    /// Miri reports `pass` while Anneal conservatively reports `ub` or
+    /// `unsupported` (`false_positive_ub`, or `unsupported` when Miri passes).
+    SoundConservativeAbstraction,
+    /// Both Miri and Anneal terminate with conflicting return values, fault
+    /// classes, or fault locations (`wrong_value`, `return_vs_panic`,
+    /// `ub_location_mismatch`, `panic_site_mismatch`).
+    ValueMismatch,
+    /// Capture error, Miri oracle error, out-of-fuel, external call, compile
+    /// failure, or `unsupported` when Miri did not pass.
+    HarnessOrExtractionError,
+}
+
+impl WitnessPolarity {
+    /// Canonical JSON / CLI slug for this polarity class.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnsoundMissedFault => "unsound_missed_fault",
+            Self::SoundConservativeAbstraction => "sound_conservative_abstraction",
+            Self::ValueMismatch => "value_mismatch",
+            Self::HarnessOrExtractionError => "harness_or_extraction_error",
+        }
+    }
+
+    /// Parse a canonical witness polarity slug back into [`WitnessPolarity`].
+    pub fn from_str_slug(slug: &str) -> Option<Self> {
+        match slug.trim() {
+            "unsound_missed_fault" => Some(Self::UnsoundMissedFault),
+            "sound_conservative_abstraction" => Some(Self::SoundConservativeAbstraction),
+            "value_mismatch" => Some(Self::ValueMismatch),
+            "harness_or_extraction_error" => Some(Self::HarnessOrExtractionError),
+            _ => None,
+        }
+    }
+
+    /// Whether this polarity represents an unsound missed fault (`missed_ub` or
+    /// `panic_vs_return`).
+    pub const fn is_unsound(&self) -> bool {
+        matches!(self, Self::UnsoundMissedFault)
+    }
+}
+
+impl std::fmt::Display for WitnessPolarity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify a [`DivergenceKind`] into its [`WitnessPolarity`].
+pub fn classify_divergence_kind_polarity(kind: &DivergenceKind) -> WitnessPolarity {
+    match kind {
+        DivergenceKind::MissedUb { .. } | DivergenceKind::PanicVsReturn { .. } => {
+            WitnessPolarity::UnsoundMissedFault
+        }
+        DivergenceKind::FalsePositiveUb { .. } => WitnessPolarity::SoundConservativeAbstraction,
+        DivergenceKind::WrongValue { .. }
+        | DivergenceKind::ReturnVsPanic { .. }
+        | DivergenceKind::UbLocationMismatch { .. }
+        | DivergenceKind::PanicSiteMismatch { .. } => WitnessPolarity::ValueMismatch,
+    }
+}
+
+/// Classify a `(MiriOutcome, AnnealOutcome)` pair together with its precomputed
+/// [`ComparisonVerdict`] (such as the panic-site reconciled verdict from
+/// [`compare_difftest_miri_and_anneal`]) into its [`WitnessPolarity`], returning
+/// `None` on agreement.
+pub fn classify_verdict_witness_polarity(
+    miri: &MiriOutcome,
+    anneal: &AnnealOutcome,
+    verdict: &ComparisonVerdict,
+) -> Option<WitnessPolarity> {
+    match verdict {
+        ComparisonVerdict::Agree => None,
+        ComparisonVerdict::Diverge(kind) => Some(classify_divergence_kind_polarity(kind)),
+        ComparisonVerdict::NotCompared(reason) => match reason {
+            NotComparedReason::Unsupported(_)
+                if matches!(
+                    miri,
+                    MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. }
+                ) =>
+            {
+                Some(WitnessPolarity::SoundConservativeAbstraction)
+            }
+            NotComparedReason::ExternalCall(_)
+            | NotComparedReason::Unsupported(_)
+            | NotComparedReason::OutOfFuel(_)
+            | NotComparedReason::MiriOracleError(_)
+            | NotComparedReason::CaptureFailed(_) => {
+                let _ = anneal;
+                Some(WitnessPolarity::HarnessOrExtractionError)
+            }
+        },
+    }
+}
+
+/// Classify a `(MiriOutcome, AnnealOutcome)` pair into its [`WitnessPolarity`]
+/// under strict [`compare_miri_and_anneal`] semantics, returning `None` on
+/// agreement.
+pub fn classify_witness_polarity(
+    miri: &MiriOutcome,
+    anneal: &AnnealOutcome,
+) -> Option<WitnessPolarity> {
+    let verdict = compare_miri_and_anneal(miri, anneal);
+    classify_verdict_witness_polarity(miri, anneal, &verdict)
+}
+
+/// Classify serialized outcome tags (`miri_outcome`, `anneal_outcome`) and an
+/// optional `divergence_class` or `not_compared` reason slug into
+/// [`WitnessPolarity`], returning `None` when the outcomes agree.
+pub fn classify_outcome_tags_polarity(
+    miri_tag: &str,
+    anneal_tag: &str,
+    divergence_or_reason: Option<&str>,
+) -> Option<WitnessPolarity> {
+    let m = miri_tag.trim();
+    let a = anneal_tag.trim();
+    if let Some(tag) = divergence_or_reason.map(str::trim).filter(|s| !s.is_empty()) {
+        match tag {
+            "agree" => return None,
+            "missed_ub" | "panic_vs_return" => return Some(WitnessPolarity::UnsoundMissedFault),
+            "false_positive_ub" => return Some(WitnessPolarity::SoundConservativeAbstraction),
+            "wrong_value" | "return_vs_panic" | "ub_location_mismatch" | "panic_site_mismatch" => {
+                return Some(WitnessPolarity::ValueMismatch);
+            }
+            "unsupported" | "not_compared_unsupported" => {
+                if m.starts_with("pass") {
+                    return Some(WitnessPolarity::SoundConservativeAbstraction);
+                }
+                return Some(WitnessPolarity::HarnessOrExtractionError);
+            }
+            "compile_failed"
+            | "external_call"
+            | "out_of_fuel"
+            | "miri_oracle_error"
+            | "capture_failed"
+            | "not_compared_external_call"
+            | "not_compared_out_of_fuel"
+            | "not_compared_miri_oracle_error"
+            | "not_compared_capture_failed" => {
+                return Some(WitnessPolarity::HarnessOrExtractionError);
+            }
+            _ => {}
+        }
+    }
+
+    let miri_is_pass = m.starts_with("pass");
+    let miri_is_ub = m == "ub" || m.starts_with("ub@") || m.starts_with("ub:");
+    let miri_is_panic = m == "panic" || m.starts_with("panic@") || m.starts_with("panic:");
+    let miri_is_error = m.starts_with("oracle_error") || m == "error";
+
+    let anneal_is_pass = a.starts_with("pass");
+    let anneal_is_ub = a == "ub" || a.starts_with("ub@") || a.starts_with("ub:");
+    let anneal_is_panic = a == "panic" || a.starts_with("panic@") || a.starts_with("panic:");
+    let anneal_is_abort = a == "abort" || a.starts_with("abort@") || a.starts_with("abort:");
+    let anneal_is_unsupported = a == "unsupported" || a.starts_with("unsupported@");
+    let anneal_is_harness = a.starts_with("externalCall")
+        || a.starts_with("external_call")
+        || a.starts_with("outOfFuel")
+        || a.starts_with("out_of_fuel")
+        || a.starts_with("capture_or_lean_error")
+        || a.starts_with("capture_error")
+        || a == "error";
+
+    if miri_is_error || anneal_is_harness {
+        return Some(WitnessPolarity::HarnessOrExtractionError);
+    }
+    if anneal_is_unsupported {
+        if miri_is_pass {
+            return Some(WitnessPolarity::SoundConservativeAbstraction);
+        }
+        return Some(WitnessPolarity::HarnessOrExtractionError);
+    }
+    if miri_is_ub && !anneal_is_ub {
+        return Some(WitnessPolarity::UnsoundMissedFault);
+    }
+    if miri_is_panic && (anneal_is_pass || anneal_is_abort) {
+        return Some(WitnessPolarity::UnsoundMissedFault);
+    }
+    if (miri_is_pass || miri_is_panic) && anneal_is_ub {
+        return Some(WitnessPolarity::SoundConservativeAbstraction);
+    }
+    if miri_is_pass && anneal_is_pass {
+        if m == a {
+            return None;
+        }
+        return Some(WitnessPolarity::ValueMismatch);
+    }
+    if (miri_is_ub && anneal_is_ub) || (miri_is_panic && anneal_is_panic) {
+        if m == a || !m.contains('@') || !a.contains('@') {
+            return None;
+        }
+        return Some(WitnessPolarity::ValueMismatch);
+    }
+    Some(WitnessPolarity::ValueMismatch)
+}
+
 /// `DefPath` spellings of the `core::fmt::Arguments` constructors that
 /// `panic!`, `assert!`, `unreachable!`, `todo!`, and `unimplemented!`
 /// expansions call before handing the result to `core::panicking::panic_fmt`.
@@ -1030,6 +1256,10 @@ pub struct MiriFindingBundle {
     /// `"missed_ub"`, `"panic_vs_return"`, `"return_vs_panic"`,
     /// `"ub_location_mismatch"`, or `"panic_site_mismatch"`).
     pub divergence_class: String,
+    /// Soundness direction slug ([`WitnessPolarity::as_str`]:
+    /// `"unsound_missed_fault"`, `"sound_conservative_abstraction"`,
+    /// `"value_mismatch"`, or `"harness_or_extraction_error"`).
+    pub witness_polarity: String,
     /// Concise Miri outcome tag.
     pub miri_outcome_tag: String,
     /// Human-readable Miri diagnostic excerpt (`MIRI_PASS:...`, panic message,
@@ -1134,6 +1364,10 @@ pub struct MiriCampaignEvalReport {
     pub anneal_outcomes: BTreeMap<String, usize>,
     /// Divergence counts by canonical class name.
     pub divergence_classes: BTreeMap<String, usize>,
+    /// Non-agreement counts by [`WitnessPolarity`] slug (`unsound_missed_fault`,
+    /// `sound_conservative_abstraction`, `value_mismatch`,
+    /// `harness_or_extraction_error`).
+    pub witness_polarity_counts: BTreeMap<String, usize>,
     /// Not-compared counts by reason (`compile_failed`, `external_call`,
     /// `unsupported`, `out_of_fuel`, `miri_oracle_error`, `capture_failed`).
     pub not_compared_reasons: BTreeMap<String, usize>,
@@ -2404,6 +2638,26 @@ struct LinkedDifftestOracleRun {
     anneal_panic_messages: BTreeMap<String, Vec<u8>>,
 }
 
+fn acquire_live_lean_oracle_lock() -> (
+    std::sync::MutexGuard<'static, ()>,
+    Option<fs::File>,
+) {
+    static LIVE_ORACLE_PIPELINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LIVE_ORACLE_PIPELINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(env::temp_dir().join("anneal_miri_difftest_live_oracle.lock"))
+        .ok();
+    if let Some(ref f) = lock_file {
+        let _ = f.lock();
+    }
+    (guard, lock_file)
+}
+
 fn run_linked_difftest_oracle_pipeline(
     config: &DifftestOracleConfig,
     items: &[OracleItemSpec],
@@ -2473,9 +2727,49 @@ fn run_linked_difftest_oracle_pipeline(
     };
     scaffold_workspace_with_config(&scaffold_cfg, &records)?;
 
+    let lib_rs_path = corpus_root.join("src/lib.rs");
+    let lib_rs = fs::read_to_string(&lib_rs_path)
+        .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
+    let candidate_portion = lib_rs
+        .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
+        .map(|(_, rest)| rest)
+        .unwrap_or(lib_rs.as_str());
+    let uses_reborrow_mid = candidate_portion.contains("helper_reborrow_mid");
+    let uses_violate_prot = candidate_portion.contains("helper_violate_fn_entry_protector");
+    let uses_reborrow_leaf = candidate_portion.contains("helper_reborrow_leaf")
+        || uses_reborrow_mid
+        || uses_violate_prot;
+    let uses_shared_mid = candidate_portion.contains("helper_shared_mid");
+    let uses_shared_leaf = candidate_portion.contains("helper_shared_leaf") || uses_shared_mid;
+    let uses_unwind_mid = candidate_portion.contains("helper_unwind_mid");
+    let uses_unwind_leaf = candidate_portion.contains("helper_unwind_leaf") || uses_unwind_mid;
+
     let subject_records: Vec<_> = records
         .iter()
-        .filter(|r| r.item_kind.as_str() == "subject")
+        .filter(|r| {
+            if r.item_kind.as_str() == "subject" {
+                return true;
+            }
+            if r.item_kind.as_str() == "model" && !r.target.def_id.contains("::__ANNEAL_MODEL_") {
+                let short = r
+                    .target
+                    .def_id
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&r.target.def_id);
+                return match short {
+                    "helper_reborrow_leaf" => uses_reborrow_leaf,
+                    "helper_reborrow_mid" => uses_reborrow_mid,
+                    "helper_shared_leaf" => uses_shared_leaf,
+                    "helper_shared_mid" => uses_shared_mid,
+                    "helper_unwind_leaf" => uses_unwind_leaf,
+                    "helper_unwind_mid" => uses_unwind_mid,
+                    "helper_violate_fn_entry_protector" => uses_violate_prot,
+                    other => candidate_portion.contains(other),
+                };
+            }
+            false
+        })
         .collect();
     if subject_records.is_empty() {
         return Err("zero subject functions captured from corpus crate".to_string());
@@ -2529,6 +2823,7 @@ fn run_linked_difftest_oracle_pipeline(
     let mut anneal_panic_messages: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
     if !present_items.is_empty() {
+        let _lean_guard = acquire_live_lean_oracle_lock();
         run_lake_build_with_bin(
             &lake_bin,
             &dot_anneal,
@@ -2587,9 +2882,6 @@ fn run_linked_difftest_oracle_pipeline(
         }
     }
 
-    let lib_rs_path = corpus_root.join("src/lib.rs");
-    let lib_rs = fs::read_to_string(&lib_rs_path)
-        .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
     let lib_src = StagedLibSource::parse(&lib_rs);
 
     let mut reports = Vec::with_capacity(items.len());
@@ -2669,6 +2961,7 @@ fn run_linked_difftest_oracle_pipeline(
         fs::write(&confirm_path, &confirm_src)
             .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
 
+        let _lean_guard = acquire_live_lean_oracle_lock();
         let confirm_out = Command::new(&lake_bin)
             .current_dir(&dot_anneal)
             .arg("env")
@@ -2769,6 +3062,7 @@ fn write_finding_bundle_to_dir(
          - **Shrink status**: `{}`\n\
          - **Shrink evaluations**: `{}` (live oracle runs executed: `{}`)\n\
          - **Divergence class**: `{}`\n\
+         - **Witness polarity**: `{}`\n\
          - **Miri outcome**: `{}` (repro position: `{}`)\n\
          - **Anneal outcome**: `{}` (`{}` at `{}`)\n\
          - **Lean 4 kernel confirmed (`by rfl`)**: `{}`\n\
@@ -2791,6 +3085,7 @@ fn write_finding_bundle_to_dir(
         finding.shrink_evaluations,
         finding.executed_oracle_runs,
         finding.divergence_class,
+        finding.witness_polarity,
         finding.miri_outcome_tag,
         finding.miri_pos.as_deref().unwrap_or("none"),
         finding.anneal_outcome_tag,
@@ -2901,6 +3196,14 @@ pub fn evaluate_miri_batches_with_options(
         .iter()
         .map(|k| (k.to_string(), 0))
         .collect();
+    let mut witness_polarity_counts: BTreeMap<String, usize> = WITNESS_POLARITY_NAMES
+        .iter()
+        .map(|k| (k.to_string(), 0))
+        .collect();
+    witness_polarity_counts.insert(
+        WitnessPolarity::HarnessOrExtractionError.as_str().to_string(),
+        compile_failed_candidates,
+    );
     let mut not_compared_reasons: BTreeMap<String, usize> = NOT_COMPARED_REASON_NAMES
         .iter()
         .map(|k| (k.to_string(), 0))
@@ -3076,6 +3379,14 @@ pub fn evaluate_miri_batches_with_options(
             AnnealOutcome::CaptureOrLeanError(_) => {
                 *anneal_outcomes.entry("error".to_string()).or_insert(0) += 1;
             }
+        }
+
+        if let Some(pol) =
+            classify_verdict_witness_polarity(&item_rep.miri, &item_rep.anneal, &item_rep.verdict)
+        {
+            *witness_polarity_counts
+                .entry(pol.as_str().to_string())
+                .or_insert(0) += 1;
         }
 
         match &item_rep.verdict {
@@ -3259,6 +3570,9 @@ pub fn evaluate_miri_batches_with_options(
                             .map_or(0, |sr| sr.executed_oracle_runs),
                         shrink_status,
                         divergence_class: class_slug,
+                        witness_polarity: classify_divergence_kind_polarity(div_kind)
+                            .as_str()
+                            .to_string(),
                         miri_outcome_tag,
                         miri_excerpt,
                         miri_pos: repro_miri_pos,
@@ -3310,6 +3624,7 @@ pub fn evaluate_miri_batches_with_options(
         miri_verdicts,
         anneal_outcomes,
         divergence_classes,
+        witness_polarity_counts,
         not_compared_reasons,
         unmodeled_external_calls,
         mutator_applications,
@@ -3454,6 +3769,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
          {inner}\"executed_oracle_runs\": {},\n\
          {inner}\"shrink_status\": {},\n\
          {inner}\"divergence_class\": {},\n\
+         {inner}\"witness_polarity\": {},\n\
          {inner}\"miri_outcome\": {},\n\
          {inner}\"miri_excerpt\": {},\n\
          {inner}\"miri_pos\": {},\n\
@@ -3475,6 +3791,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
         finding.executed_oracle_runs,
         json_escape(&finding.shrink_status),
         json_escape(&finding.divergence_class),
+        json_escape(&finding.witness_polarity),
         json_escape(&finding.miri_outcome_tag),
         json_escape(&finding.miri_excerpt),
         render_opt_str_json(&finding.miri_pos),
@@ -3534,6 +3851,7 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
          \x20 \"miri_verdicts\": {},\n\
          \x20 \"anneal_outcomes\": {},\n\
          \x20 \"divergence_classes\": {},\n\
+         \x20 \"witness_polarity_counts\": {},\n\
          \x20 \"not_compared_reasons\": {},\n\
          \x20 \"unmodeled_external_calls\": {},\n\
          \x20 \"mutator_applications\": {},\n\
@@ -3561,6 +3879,7 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
         render_usize_map_json(&report.miri_verdicts, 2),
         render_usize_map_json(&report.anneal_outcomes, 2),
         render_usize_map_json(&report.divergence_classes, 2),
+        render_usize_map_json(&report.witness_polarity_counts, 2),
         render_usize_map_json(&report.not_compared_reasons, 2),
         render_usize_map_json(&report.unmodeled_external_calls, 2),
         render_usize_map_json(&report.mutator_applications, 2),
@@ -3680,6 +3999,12 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
     out.push_str("\n## Divergence Breakdown by Class\n\n");
     out.push_str("| Divergence Class | Count |\n| :--- | ---: |\n");
     for (k, v) in &report.divergence_classes {
+        out.push_str(&format!("| `{k}` | {v} |\n"));
+    }
+
+    out.push_str("\n## Witness Polarity Breakdown\n\n");
+    out.push_str("| Witness Polarity | Count |\n| :--- | ---: |\n");
+    for (k, v) in &report.witness_polarity_counts {
         out.push_str(&format!("| `{k}` | {v} |\n"));
     }
 
@@ -6338,6 +6663,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             executed_oracle_runs: 3,
             shrink_status: MiriShrinkStatus::Minimized.slug().to_string(),
             divergence_class: "ub_location_mismatch".to_string(),
+            witness_polarity: WitnessPolarity::ValueMismatch.as_str().to_string(),
             miri_outcome_tag: "ub@src/lib.rs:52:17".to_string(),
             miri_excerpt: "error: Undefined Behavior".to_string(),
             miri_pos: Some("src/lib.rs:52:17".to_string()),
@@ -6369,6 +6695,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         assert!(finding_json.contains("\"shrink_evaluations\": 5"));
         assert!(finding_json.contains("\"executed_oracle_runs\": 3"));
         assert!(finding_json.contains("\"shrink_status\": \"minimized\""));
+        assert!(finding_json.contains("\"witness_polarity\": \"value_mismatch\""));
         assert!(summary_md.contains(
             "- **Original mutator chain**: `ArithmeticCastMutator, RawPtrOffsetMutator, PlaceProjectionWrapper`"
         ));
@@ -6377,5 +6704,274 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             "- **Shrink evaluations**: `5` (live oracle runs executed: `3`)"
         ));
         assert!(summary_md.contains("- **Shrink status**: `minimized`"));
+        assert!(summary_md.contains("- **Witness polarity**: `value_mismatch`"));
+    }
+
+    #[test]
+    fn witness_polarity_classifies_full_cartesian_product_and_slugs_roundtrip() {
+        for &slug in &WITNESS_POLARITY_NAMES {
+            let parsed = WitnessPolarity::from_str_slug(slug).expect("parse polarity slug");
+            assert_eq!(parsed.as_str(), slug);
+            assert_eq!(parsed.to_string(), slug);
+        }
+        assert_eq!(WitnessPolarity::from_str_slug("unknown"), None);
+        assert!(WitnessPolarity::UnsoundMissedFault.is_unsound());
+        assert!(!WitnessPolarity::SoundConservativeAbstraction.is_unsound());
+        assert!(!WitnessPolarity::ValueMismatch.is_unsound());
+        assert!(!WitnessPolarity::HarnessOrExtractionError.is_unsound());
+
+        let pos_a = SourcePos {
+            file: "src/lib.rs".to_string(),
+            line: 10,
+            col: 5,
+        };
+        let span_a = SourceSpan {
+            file: "src/lib.rs".to_string(),
+            start_line: 10,
+            start_col: 1,
+            end_line: 10,
+            end_col: 20,
+        };
+        let span_b = SourceSpan {
+            file: "src/lib.rs".to_string(),
+            start_line: 20,
+            start_col: 1,
+            end_line: 20,
+            end_col: 20,
+        };
+
+        // 1. Agreements return None.
+        assert_eq!(
+            classify_witness_polarity(&MiriOutcome::PassUnit, &AnnealOutcome::PassUnit),
+            None
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::PassScalar {
+                    bits: 42,
+                    size_bytes: 4
+                },
+                &AnnealOutcome::PassScalar {
+                    bits: 42,
+                    size_bytes: 4
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Ub {
+                    pos: Some(pos_a.clone()),
+                    message: "ub".to_string()
+                },
+                &AnnealOutcome::Ub {
+                    span: Some(span_a.clone())
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Panic {
+                    pos: Some(pos_a.clone()),
+                    message: "panic".to_string()
+                },
+                &AnnealOutcome::Panic {
+                    span: Some(span_a.clone())
+                }
+            ),
+            None
+        );
+
+        // 2. UnsoundMissedFault: Miri UB or Panic vs Anneal Pass.
+        for miri_fault in [
+            MiriOutcome::Ub {
+                pos: Some(pos_a.clone()),
+                message: "ub".to_string(),
+            },
+            MiriOutcome::Panic {
+                pos: Some(pos_a.clone()),
+                message: "panic".to_string(),
+            },
+        ] {
+            for anneal_pass in [
+                AnnealOutcome::PassUnit,
+                AnnealOutcome::PassScalar {
+                    bits: 0,
+                    size_bytes: 4,
+                },
+                AnnealOutcome::PassOther,
+            ] {
+                assert_eq!(
+                    classify_witness_polarity(&miri_fault, &anneal_pass),
+                    Some(WitnessPolarity::UnsoundMissedFault),
+                    "expected UnsoundMissedFault for ({miri_fault:?}, {anneal_pass:?})"
+                );
+            }
+        }
+
+        // 3. SoundConservativeAbstraction: Miri Pass vs Anneal UB or Unsupported.
+        for miri_pass in [
+            MiriOutcome::PassUnit,
+            MiriOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4,
+            },
+        ] {
+            for anneal_cons in [
+                AnnealOutcome::Ub {
+                    span: Some(span_a.clone()),
+                },
+                AnnealOutcome::Unsupported {
+                    span: Some(span_a.clone()),
+                },
+            ] {
+                assert_eq!(
+                    classify_witness_polarity(&miri_pass, &anneal_cons),
+                    Some(WitnessPolarity::SoundConservativeAbstraction),
+                    "expected SoundConservativeAbstraction for ({miri_pass:?}, {anneal_cons:?})"
+                );
+            }
+        }
+
+        // 4. ValueMismatch: wrong scalar value, ReturnVsPanic, UbLocationMismatch, PanicSiteMismatch, UB vs Panic.
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::PassScalar {
+                    bits: 1,
+                    size_bytes: 4
+                },
+                &AnnealOutcome::PassScalar {
+                    bits: 2,
+                    size_bytes: 4
+                }
+            ),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::PassUnit,
+                &AnnealOutcome::Panic {
+                    span: Some(span_a.clone())
+                }
+            ),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Ub {
+                    pos: Some(pos_a.clone()),
+                    message: "ub".to_string()
+                },
+                &AnnealOutcome::Ub {
+                    span: Some(span_b.clone())
+                }
+            ),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Panic {
+                    pos: Some(pos_a.clone()),
+                    message: "panic".to_string()
+                },
+                &AnnealOutcome::Panic {
+                    span: Some(span_b.clone())
+                }
+            ),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        // Miri UB vs Anneal Panic is MissedUb (UnsoundMissedFault), while
+        // Miri Panic vs Anneal UB is FalsePositiveUb (SoundConservativeAbstraction).
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Ub {
+                    pos: Some(pos_a.clone()),
+                    message: "ub".to_string()
+                },
+                &AnnealOutcome::Panic {
+                    span: Some(span_a.clone())
+                }
+            ),
+            Some(WitnessPolarity::UnsoundMissedFault)
+        );
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Panic {
+                    pos: Some(pos_a.clone()),
+                    message: "panic".to_string()
+                },
+                &AnnealOutcome::Ub {
+                    span: Some(span_a.clone())
+                }
+            ),
+            Some(WitnessPolarity::SoundConservativeAbstraction)
+        );
+
+        // 5. HarnessOrExtractionError: OracleError, ExternalCall, OutOfFuel, CaptureOrLeanError, or Unsupported when Miri faulted.
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::OracleError("err".to_string()),
+                &AnnealOutcome::PassUnit
+            ),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
+        for anneal_err in [
+            AnnealOutcome::ExternalCall {
+                def_path: "foo::bar".to_string(),
+                span: None,
+            },
+            AnnealOutcome::OutOfFuel { span: None },
+            AnnealOutcome::CaptureOrLeanError("err".to_string()),
+        ] {
+            assert_eq!(
+                classify_witness_polarity(&MiriOutcome::PassUnit, &anneal_err),
+                Some(WitnessPolarity::HarnessOrExtractionError)
+            );
+        }
+        assert_eq!(
+            classify_witness_polarity(
+                &MiriOutcome::Ub {
+                    pos: Some(pos_a),
+                    message: "ub".to_string()
+                },
+                &AnnealOutcome::Unsupported { span: Some(span_a) }
+            ),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
+
+        // 6. Tag-based classifier matches structured classifier across all classes.
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:unit", "pass:unit", Some("agree")),
+            None
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("ub@src/lib.rs:10:5", "pass:scalar:1:4", Some("missed_ub")),
+            Some(WitnessPolarity::UnsoundMissedFault)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("panic@src/lib.rs:10:5", "pass:unit", Some("panic_vs_return")),
+            Some(WitnessPolarity::UnsoundMissedFault)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:scalar:1:4", "ub@src/lib.rs:10:5", Some("false_positive_ub")),
+            Some(WitnessPolarity::SoundConservativeAbstraction)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:scalar:1:4", "unsupported", Some("unsupported")),
+            Some(WitnessPolarity::SoundConservativeAbstraction)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("ub@src/lib.rs:10:5", "unsupported", Some("unsupported")),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:scalar:1:4", "pass:scalar:2:4", Some("wrong_value")),
+            Some(WitnessPolarity::ValueMismatch)
+        );
+        assert_eq!(
+            classify_outcome_tags_polarity("pass:unit", "externalCall:foo", Some("external_call")),
+            Some(WitnessPolarity::HarnessOrExtractionError)
+        );
     }
 }

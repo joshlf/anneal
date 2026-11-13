@@ -151,11 +151,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 89
-assert data["compiled_candidates"] == 89
+assert data["total_candidates"] == 106
+assert data["compiled_candidates"] == 106
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 89
-assert data["agree_count"] == 89
+assert data["compared_candidates"] == 106
+assert data["agree_count"] == 106
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -685,7 +685,7 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
     // 2. Seeded batch containing `pass_direct_fn_call` mutants must record 0
     // `miri_diff_corpus::helper_add_ten` skips in `unmodeled_external_calls`.
     let mut seeded_with_helper = Vec::new();
-    for b_idx in 0..8usize {
+    for b_idx in 0..24usize {
         let batch = generate_miri_corpus_batch(10, 0x5EED_9900 + b_idx as u64, b_idx);
         for cand in batch {
             if cand.seed_name == "pass_direct_fn_call" {
@@ -2441,4 +2441,175 @@ fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
     }
     assert_eq!(shrunk_to_zero, 1, "expected one k -> 0 live shrink");
     assert_eq!(shrunk_to_one, 1, "expected one k -> 1 live shrink");
+}
+
+#[test]
+fn ep1_a0_category9_templates_and_witness_polarity_verify_live() {
+    let dir = unique_temp_dir("ep1_a0_cat9");
+    let findings_dir = dir.join("findings");
+    let root = repo_root();
+
+    let candidates: Vec<GeneratedMiriCandidate> = [
+        (
+            "cat9_move_deinit_pass",
+            r#"pub fn cat9_move_deinit_pass() -> u32 {
+    let mut x: NonCopyU32 = NonCopyU32(14u32);
+    let root: *mut NonCopyU32 = &raw mut x;
+    let r: &mut NonCopyU32 = unsafe { &mut *root };
+    let moved: NonCopyU32 = x;
+    *r = NonCopyU32(moved.0 ^ 7u32);
+    ((*r).0) ^ moved.0
+}
+"#,
+        ),
+        (
+            "cat9_fn_entry_chain_pass",
+            r#"pub fn cat9_fn_entry_chain_pass() -> u32 {
+    let mut slot: u32 = 20u32;
+    let raw: *mut u32 = &raw mut slot;
+    let r0: &mut u32 = unsafe { &mut *raw };
+    let delta: u32 = helper_reborrow_mid(r0, 5u32);
+    *r0 = delta ^ 20u32;
+    unsafe {
+        *raw = (*r0) ^ 3u32;
+        *raw
+    }
+}
+"#,
+        ),
+        (
+            "cat9_scalar_and_mem_intrinsics_pass",
+            r#"pub fn cat9_scalar_and_mem_intrinsics_pass() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 0u32, b: 90u32 };
+    let mut dst: u32 = 0u32;
+    unsafe {
+        write_bytes!(&raw mut pair.a, 0x02u8, 1usize);
+        copy_nonoverlapping(&raw const pair.a, &raw mut dst, 1usize);
+    }
+    let nz: u32 = (dst & 0xFFu32) | 1u32;
+    let bits: u32 = ctlz(nz) ^ cttz(nz) ^ ctpop(nz) ^ (bswap(nz) & 0xFFu32) ^ (bitreverse(nz) >> 24u32);
+    let nz_cnt: u32 = unsafe { ctlz_nonzero(nz) ^ cttz_nonzero(nz) };
+    let sat: u8 = saturating_add(saturating_sub(10u8, 20u8), 250u8);
+    let wrap: u32 = wrapping_mul(wrapping_add(u32::MAX, 2u32), wrapping_sub(4u32, 1u32));
+    let ord = three_way_compare(wrap, 10u32);
+    let q: u32 = unsafe { exact_div(36u32, 3u32) };
+    let base: *const u32 = &raw const pair.a;
+    let back: *const u32 = unsafe { arith_offset(arith_offset(base, 5isize), -4isize) };
+    bits ^ nz_cnt ^ (sat as u32) ^ wrap ^ (((ord as i8) + 1i8) as u32) ^ q ^ unsafe { *back }
+}
+"#,
+        ),
+        (
+            "cat9_fn_entry_protector_ub",
+            r#"pub fn cat9_fn_entry_protector_ub() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let delta: u32 = helper_reborrow_mid(unsafe { &mut *raw }, 1u32);
+    unsafe {
+        *raw = delta;
+    }
+    helper_violate_fn_entry_protector(unsafe { *raw })
+}
+"#,
+        ),
+        (
+            "cat9_in_scope_move_raw_read_conservative",
+            r#"pub fn cat9_in_scope_move_raw_read_conservative() -> u32 {
+    let x = NonCopyU32(15u32);
+    let raw: *const u32 = &raw const x.0;
+    let moved: NonCopyU32 = x;
+    let leaked: u32 = unsafe { *raw };
+    moved.0 + leaked
+}
+"#,
+        ),
+        (
+            "cat9_provenance_overwritten_byte_missed_ub",
+            r#"pub fn cat9_provenance_overwritten_byte_missed_ub() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;
+    unsafe {
+        *byte_ptr = 0u8;
+        *p
+    }
+}
+"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, (name, fn_src))| GeneratedMiriCandidate {
+        id,
+        seed_index: id,
+        seed_name: name.to_string(),
+        fn_name: name.to_string(),
+        seed_u64: id as u64,
+        applied_mutators: Vec::new(),
+        tracked_locals: Vec::new(),
+        fn_source: fn_src.to_string(),
+        source: build_standalone_candidate_source(fn_src),
+    })
+    .collect();
+
+    let options = MiriEvalOptions {
+        findings_dir: Some(findings_dir.clone()),
+        anneal_repo_root: Some(root),
+        shrink_seeds: None,
+    };
+    let report = evaluate_miri_batches_with_options(
+        "seeded",
+        0xCA79_0001,
+        std::slice::from_ref(&candidates),
+        candidates.len(),
+        &options,
+    )
+    .expect("evaluate Category 9 live batch");
+
+    assert_eq!(report.total_candidates, 6);
+    assert_eq!(report.compiled_candidates, 6);
+    assert_eq!(report.agree_count, 4);
+    assert_eq!(report.diverge_count, 2);
+    assert_eq!(report.not_compared_count, 0);
+    assert_eq!(
+        report.witness_polarity_counts.get("unsound_missed_fault"),
+        Some(&1)
+    );
+    assert_eq!(
+        report
+            .witness_polarity_counts
+            .get("sound_conservative_abstraction"),
+        Some(&1)
+    );
+    assert_eq!(
+        report.witness_polarity_counts.get("value_mismatch"),
+        Some(&0)
+    );
+    assert_eq!(
+        report
+            .witness_polarity_counts
+            .get("harness_or_extraction_error"),
+        Some(&0)
+    );
+    assert_eq!(report.findings.len(), 2);
+    let cons_finding = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "cat9_in_scope_move_raw_read_conservative")
+        .expect("conservative finding present");
+    assert_eq!(cons_finding.divergence_class, "false_positive_ub");
+    assert_eq!(
+        cons_finding.witness_polarity,
+        "sound_conservative_abstraction"
+    );
+    assert!(cons_finding.kernel_confirmed);
+
+    let unsound_finding = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "cat9_provenance_overwritten_byte_missed_ub")
+        .expect("unsound missed fault finding present");
+    assert_eq!(unsound_finding.divergence_class, "missed_ub");
+    assert_eq!(unsound_finding.witness_polarity, "unsound_missed_fault");
+    assert!(unsound_finding.kernel_confirmed);
 }

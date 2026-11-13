@@ -158,31 +158,83 @@ impl ItreeAstMutator for CallBoundaryOutliner {
     }
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
-        let tag = rng.next_u64() & 0xFFFF;
+        let raw_tag = rng.next_u64();
+        let tag = raw_tag & 0xFFFF;
+        let use_multi_callee = ((raw_tag >> 16) & 1) == 1;
         let helper_ident = format_ident!("__anneal_itree_outlined_{}", tag);
+        let stage2_ident = format_ident!("__anneal_itree_outlined_stage2_{}", tag);
+        let leaf_ident = format_ident!("__anneal_itree_leaf_{}", tag);
         let k_const = ((rng.next_u64() % 251) as u32).wrapping_add(1);
 
-        let helper_item: Item = syn::parse_quote! {
-            #[inline(never)]
-            pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
-                let sum = (seed >> 1) + (delta >> 1);
-                (sum >> 2) + #k_const
-            }
-        };
-
-        let target_idx = target_fn_index(file);
-        if let Some(idx) = target_idx
-            && let Item::Fn(func) = &mut file.items[idx]
-        {
-            let arg_expr = first_u32_param_expr(func, k_const);
-            let local_ident = format_ident!("__itree_call_res_{}", tag);
-            let injected: Vec<Stmt> = syn::parse_quote! {
-                let #local_ident: u32 = #helper_ident(#arg_expr, #k_const);
+        if use_multi_callee {
+            let helper_item1: Item = syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    #[inline(never)]
+                    fn #leaf_ident(v: u32, d: u32) -> u32 {
+                        let clamped: u32 = if v <= 0xFFFF_FF00u32 {
+                            v + (d & 0xFFu32)
+                        } else {
+                            0xFFFF_FFFFu32
+                        };
+                        (clamped >> 1) ^ (d & 0x7Fu32)
+                    }
+                    let inner: u32 = #leaf_ident(seed, delta);
+                    (((inner as u64) + (#k_const as u64)) & 0xFFFF_FFFFu64) as u32
+                }
             };
-            weave_into_fn_body(func, injected, &local_ident);
-        }
+            let helper_item2: Item = syn::parse_quote! {
+                #[inline(never)]
+                pub fn #stage2_ident(stage1_out: u32, bias: u32) -> u32 {
+                    let swapped_low: u32 = ((stage1_out & 0xFFu32) << 8) | ((stage1_out >> 8) & 0xFFu32);
+                    let sat_sub: u32 = if swapped_low >= (bias & 0x3Fu32) {
+                        swapped_low - (bias & 0x3Fu32)
+                    } else {
+                        0u32
+                    };
+                    (sat_sub >> 1) + #k_const
+                }
+            };
 
-        file.items.push(helper_item);
+            let target_idx = target_fn_index(file);
+            if let Some(idx) = target_idx
+                && let Item::Fn(func) = &mut file.items[idx]
+            {
+                let arg_expr = first_u32_param_expr(func, k_const);
+                let stage1_local = format_ident!("__itree_call_s1_{}", tag);
+                let local_ident = format_ident!("__itree_call_res_{}", tag);
+                let injected: Vec<Stmt> = syn::parse_quote! {
+                    let #stage1_local: u32 = #helper_ident(#arg_expr, #k_const);
+                    let #local_ident: u32 = #stage2_ident(#stage1_local, #k_const);
+                };
+                weave_into_fn_body(func, injected, &local_ident);
+            }
+
+            file.items.push(helper_item1);
+            file.items.push(helper_item2);
+        } else {
+            let helper_item: Item = syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    let sum = (seed >> 1) + (delta >> 1);
+                    (sum >> 2) + #k_const
+                }
+            };
+
+            let target_idx = target_fn_index(file);
+            if let Some(idx) = target_idx
+                && let Item::Fn(func) = &mut file.items[idx]
+            {
+                let arg_expr = first_u32_param_expr(func, k_const);
+                let local_ident = format_ident!("__itree_call_res_{}", tag);
+                let injected: Vec<Stmt> = syn::parse_quote! {
+                    let #local_ident: u32 = #helper_ident(#arg_expr, #k_const);
+                };
+                weave_into_fn_body(func, injected, &local_ident);
+            }
+
+            file.items.push(helper_item);
+        }
     }
 }
 
@@ -250,7 +302,9 @@ impl ItreeAstMutator for BranchLoopWeaver {
     }
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
-        let tag = rng.next_u64() & 0xFFFF;
+        let raw_tag = rng.next_u64();
+        let tag = raw_tag & 0xFFFF;
+        let use_bit_sat_perturb = ((raw_tag >> 16) & 1) == 1;
         let bound: u32 = 2;
 
         let target_idx = target_fn_index(file);
@@ -259,15 +313,35 @@ impl ItreeAstMutator for BranchLoopWeaver {
         {
             let step_ident = format_ident!("__itree_step_{}", tag);
             let acc_ident = format_ident!("__itree_acc_{}", tag);
-            let injected: Vec<Stmt> = syn::parse_quote! {
-                let mut #step_ident: u32 = 0;
-                let mut #acc_ident: u32 = 1;
-                while #step_ident < #bound {
-                    #acc_ident = match #step_ident % 2 {
-                        0 => if #acc_ident < 100 { #acc_ident + 3 } else { 7 },
-                        _ => if #acc_ident < 100 { #acc_ident + 5 } else { 11 },
-                    };
-                    #step_ident = #step_ident + 1;
+            let injected: Vec<Stmt> = if use_bit_sat_perturb {
+                syn::parse_quote! {
+                    let mut #step_ident: u32 = 0;
+                    let mut #acc_ident: u32 = 1;
+                    while #step_ident < #bound {
+                        let __bit_mix: u32 = ((#acc_ident & 0xFFu32) << 4) ^ (#acc_ident >> 2) ^ 1u32;
+                        let __sat_step: u32 = if __bit_mix <= 0xFFFF_F000u32 {
+                            __bit_mix + 7u32
+                        } else {
+                            0xFFFF_FFFFu32
+                        };
+                        #acc_ident = match #step_ident % 2 {
+                            0 => (((__sat_step as u64) + 3u64) & 0xFFFF_FFFFu64) as u32,
+                            _ => if __sat_step > 5u32 { __sat_step - 5u32 } else { 11u32 },
+                        };
+                        #step_ident = #step_ident + 1;
+                    }
+                }
+            } else {
+                syn::parse_quote! {
+                    let mut #step_ident: u32 = 0;
+                    let mut #acc_ident: u32 = 1;
+                    while #step_ident < #bound {
+                        #acc_ident = match #step_ident % 2 {
+                            0 => if #acc_ident < 100 { #acc_ident + 3 } else { 7 },
+                            _ => if #acc_ident < 100 { #acc_ident + 5 } else { 11 },
+                        };
+                        #step_ident = #step_ident + 1;
+                    }
                 }
             };
             weave_into_fn_body(func, injected, &acc_ident);
@@ -743,5 +817,40 @@ mod tests {
         ] {
             assert!(seen.contains(expected), "missing ITree mutator `{expected}`");
         }
+    }
+
+    #[test]
+    fn call_boundary_outliner_and_branch_loop_weaver_emit_multi_callee_and_safe_bit_sat_variants() {
+        let mut saw_multi_callee = false;
+        let mut saw_single_callee = false;
+        let mut saw_bit_sat_loop = false;
+
+        for s in 0..32u64 {
+            let mut f_call = syn::parse_file(SAFE_SEED).unwrap();
+            let mut rng_call = DetRng::new(s);
+            CallBoundaryOutliner.mutate(&mut f_call, &mut rng_call);
+            let src_call = prettyplease::unparse(&f_call);
+            assert!(!contains_unsafe_token(&src_call));
+            if src_call.contains("__anneal_itree_outlined_stage2_")
+                && src_call.contains("__anneal_itree_leaf_")
+            {
+                saw_multi_callee = true;
+            } else if src_call.contains("__anneal_itree_outlined_") {
+                saw_single_callee = true;
+            }
+
+            let mut f_loop = syn::parse_file(SAFE_SEED).unwrap();
+            let mut rng_loop = DetRng::new(s);
+            BranchLoopWeaver.mutate(&mut f_loop, &mut rng_loop);
+            let src_loop = prettyplease::unparse(&f_loop);
+            assert!(!contains_unsafe_token(&src_loop));
+            if src_loop.contains("__bit_mix") && src_loop.contains("__sat_step") {
+                saw_bit_sat_loop = true;
+            }
+        }
+
+        assert!(saw_multi_callee, "expected depth-2 multi-callee outline variant");
+        assert!(saw_single_callee, "expected single-callee outline variant");
+        assert!(saw_bit_sat_loop, "expected bit/saturating/wrapping loop variant");
     }
 }

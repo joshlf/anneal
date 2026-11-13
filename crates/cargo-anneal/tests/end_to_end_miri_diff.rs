@@ -134,7 +134,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         manifest.rustc_commit,
         "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
     );
-    assert_eq!(manifest.tests.len(), 89);
+    assert_eq!(manifest.tests.len(), 106);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
     // `miri_verdict` (either by tag or by `ub_location_mismatch`); none remain
@@ -429,17 +429,20 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         rustc_wrapper: Some(wrapper_bin.clone()),
     };
 
-    let report = run_miri_diff_suite(&config).expect("89-test Miri differential suite must pass");
-    assert_eq!(report.total_tests, 89);
-    assert_eq!(report.verified_pass_count, 41);
-    assert_eq!(report.verified_panic_count, 10);
-    assert_eq!(report.verified_strict_ub_count, 38);
+    let report = run_miri_diff_suite(&config).expect("106-test Miri differential suite must pass");
+    assert_eq!(report.total_tests, 106);
+    assert_eq!(report.verified_pass_count, 49);
+    assert_eq!(report.verified_panic_count, 11);
+    assert_eq!(report.verified_strict_ub_count, 46);
     assert_eq!(report.ratcheted_known_bug_count, 0);
-    // 41 pass + 10 panic + 1 helper (`helper_add_ten`) = 52 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 52);
+    // 49 pass + 11 panic + 1 helper (`helper_add_ten`) = 61 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 61);
     for module in [
         "Verify.MiriDiffCorpus.pass_direct_fn_call",
         "Verify.MiriDiffCorpus.panic_explicit_macro",
+        "Verify.MiriDiffCorpus.pass_move_deinit_preserves_reserved_child",
+        "Verify.MiriDiffCorpus.pass_fn_entry_protector_two_stage_reborrow_chain",
+        "Verify.MiriDiffCorpus.panic_multi_callee_unwind_chain",
     ] {
         assert!(
             report.audited_certificate_modules.iter().any(|m| m == module),
@@ -454,8 +457,8 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
 
     let summary = render_miri_diff_report(&report);
-    assert!(summary.contains("Total corpus tests:              89"));
-    assert!(summary.contains("Verified `panic` (SafePanic):    10"));
+    assert!(summary.contains("Total corpus tests:              106"));
+    assert!(summary.contains("Verified `panic` (SafePanic):    11"));
     assert!(summary.contains("of which modular (frame rely): 1"));
     assert!(summary.contains("Open Anneal bugs (ratcheted):    0"));
     assert!(summary.contains("TrustedBoundary kernel replay:   PASS"));

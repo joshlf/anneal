@@ -69,11 +69,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 89 tests: 41 `pass`, 10 `panic` (9 certified via
+The corpus holds 106 tests: 49 `pass`, 11 `panic` (10 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 38 `ub`, grouped into eight categories
+`verifyModularSafePanicMirBounded`), and 46 `ub`, grouped into nine categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 89 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 106 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -137,7 +137,7 @@ pin each of these divergences, and `miri-difftest` mutators avoid them:
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 89 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 106 tests agree with Miri.
 
 ## Running the Suite
 
