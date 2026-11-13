@@ -55,6 +55,8 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 import LeanMiriSpec.Correspondence.CopyLM4_2
 import LeanMiriSpec.Correspondence.SimLM4_2
 import LeanMiriSpec.Correspondence.WitLM4_2
+import LeanMiriSpec.Correspondence.Safety
+import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Audit
 
 /-!
@@ -413,6 +415,20 @@ import LeanMiriSpec.Audit
   ill-sized values on cross-type copies, clobbers the whole destination on partial
   distinct-local copies in 5-step lockstep, and rejects provenance-free `.scalar`
   pointers in `arith_offset`).
+* `LeanMiriSpec.Correspondence.Safety`: whole-program `Miri.OperationalSafety.System`
+  semantics of `lean-miri`'s `RunLoop` (`miriSystem`), the step-closed simulation
+  engine (`StepClosedSim`) with `step_universal_simulation`,
+  `runLoop_universal_simulation`, `treeSafe_iff_miriSafe`,
+  `reachesUB_iff_miriReachesUB`, and `partialCorrect_iff_annealPostcondition`
+  over Stage-1 `mirTree`, the unconditional closed fragment `InSafeScalarFragment`,
+  bridges from the `LM-1` … `LM-4.2` step relations, and the Stage-1 correspondence
+  scope and divergence ledger (`LM-4.3`).
+* `LeanMiriSpec.Correspondence.MiriDiffWitnesses`: kernel-checked whole-program
+  safe, partial-correctness, undefined-behavior, infinite-run, and divergence
+  witnesses across scalars, aggregates, raw pointers, Tree Borrows, calls, and
+  intrinsics, including Stage-1 lockstep upgrades (out-of-bounds and misaligned
+  raw-pointer reads, invalid `bool` reads through references) and the Stage-1
+  external-call boundary of `write_bytes` and `rotate_left` (`LM-4.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
