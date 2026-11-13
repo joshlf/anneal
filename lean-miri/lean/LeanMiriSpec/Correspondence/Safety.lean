@@ -192,7 +192,9 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
 * `LM-4.2` over Stage-1: `Assume` (`step_intrinsic_assume_simulation`),
   `exact_div` (`call_intrinsic_exact_div_simulation`), bit and saturating integer
   intrinsics (`call_intrinsic_bitops_simulation`), single-element `CopyNonOverlapping`
-  between same-typed scalar locals (`step_intrinsic_copyNonOverlapping_stage1_simulation`)
+  between same-typed scalar locals (`step_intrinsic_copyNonOverlapping_stage1_simulation`;
+  from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_disjoint_returns` and
+  `MiriDiffWitnesses.w6_copy_nonoverlapping_overlap_ub`)
   and full-local multi-element `copyViaBytes` copies between distinct integer
   locals of equal width
   (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`;
@@ -200,7 +202,9 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   Stage-1 provenance preservation across raw-pointer `CopyNonOverlapping`
   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
   `encodeUntypedValueToBytes_ptr_decode_roundtrip`), and `arith_offset` on
-  provenance-carrying raw pointers (`call_intrinsic_arithOffset_stage1_simulation`).
+  provenance-carrying raw pointers (`call_intrinsic_arithOffset_stage1_simulation`;
+  from-entry `MiriDiffWitnesses.w3_arith_offset_returns` and
+  `MiriDiffWitnesses.w3_arith_offset_uninit_ub`).
 
 Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
 

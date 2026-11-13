@@ -23912,13 +23912,17 @@ open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
     AgreeUB arithOffsetUninitBody (annealMiriHooks arithOffsetUninitBody)
-      (WitnessLM4_2.ptr4AnnealPre arithOffsetUninitBody)
-      (WitnessLM4_2.ptr4MiriPre arithOffsetUninitBody WitnessLM4_2.rawMutU64K) ∧
+      (initMachineState arithOffsetUninitBody [])
+      (miriEntryState arithOffsetUninitBody) ∧
+    AgreeUB copyOverlapEntryBody (annealMiriHooks copyOverlapEntryBody)
+      (initMachineState copyOverlapEntryBody [])
+      (miriEntryState copyOverlapEntryBody) ∧
     AgreeUB (exactDivBody 43) (annealMiriHooks (exactDivBody 43))
       (initMachineState (exactDivBody 43) []) (miriEntryState (exactDivBody 43)) ∧
     AgreeUB (assumeBody false) (annealMiriHooks (assumeBody false))
       (initMachineState (assumeBody false) []) (miriEntryState (assumeBody false)) :=
-  ⟨w3_arith_offset_uninit_ub, w6_exact_div_non_multiple_ub, w6_assume_false_ub⟩
+  ⟨w3_arith_offset_uninit_ub, w6_copy_nonoverlapping_overlap_ub,
+   w6_exact_div_non_multiple_ub, w6_assume_false_ub⟩
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
 example {body : CapturedMir} (hfrag : InSafeScalarFragment body) (postA : Value → Prop)
@@ -24048,18 +24052,19 @@ open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
     (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      AgreeReturns WitnessLM4_2.arithOffsetPosBody (annealMiriHooks WitnessLM4_2.arithOffsetPosBody)
-        (WitnessLM4_2.ptr4AnnealPre WitnessLM4_2.arithOffsetPosBody)
-        (WitnessLM4_2.ptr4MiriPre WitnessLM4_2.arithOffsetPosBody WitnessLM4_2.rawMutU64K)
+      AgreeReturns arithOffsetPosEntryBody (annealMiriHooks arithOffsetPosEntryBody)
+        (initMachineState arithOffsetPosEntryBody [])
+        (miriEntryState arithOffsetPosEntryBody)
         (.ptr { allocId := 1, offsetBytes := 40 } 8) (.immediate imm0) ∧
-      get? WitnessLM4_2.arithOffsetPosBody.localDecls 0 = some decl0 ∧
+      get? arithOffsetPosEntryBody.localDecls 0 = some decl0 ∧
       ImmediateRelLM3_1
-        [rawPtrAllocMapEntry WitnessLM4_2.arithOffsetPosBody.localDecls
-          WitnessLM4_2.arithOffsetPosBody.layouts .mut 1 1 Witness.lm31AllocId1]
-        decl0.ty WitnessLM4_2.arithOffsetPosBody.layouts
+        [rawPtrAllocMapEntry arithOffsetPosEntryBody.localDecls
+          arithOffsetPosEntryBody.layouts .mut 1 1 Witness.lm31AllocId1]
+        decl0.ty arithOffsetPosEntryBody.layouts
         (.ptr { allocId := 1, offsetBytes := 40 } 8) imm0) ∧
     (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      AgreeReturns retCopyBody (annealMiriHooks retCopyBody) retCopyAnnealPre retCopyMiriPre
+      AgreeReturns retCopyBody (annealMiriHooks retCopyBody)
+        (initMachineState retCopyBody []) (miriEntryState retCopyBody)
         (.scalar ⟨42, 8⟩) (.immediate imm0) ∧
       get? retCopyBody.localDecls 0 = some decl0 ∧
       ImmediateRel decl0.ty retCopyBody.layouts (.scalar ⟨42, 8⟩) imm0) :=
@@ -24139,8 +24144,8 @@ example :
       ImmediateRel Witness.lm24U8Ty Witness.lm24Layouts (.scalar ⟨5, 1⟩) imm0) ∧
     (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
       AgreeReturns rawPtrReturnBody (annealMiriHooks rawPtrReturnBody)
-        (WitnessLM4_2.ptr4AnnealPre rawPtrReturnBody)
-        (WitnessLM4_2.ptr4MiriPre rawPtrReturnBody WitnessLM4_2.rawMutU64K)
+        (initMachineState rawPtrReturnBody [])
+        (miriEntryState rawPtrReturnBody)
         (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
       get? rawPtrReturnBody.localDecls 0 = some decl0 ∧
       ImmediateRelLM3_1
@@ -24973,6 +24978,54 @@ example :
         (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody]) = .running s ∧
       s.memory.fnPtrs = [fiveFnPtrEntry] :=
   indirectCallFive_reify_fnPtrs
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false) (hret : bb.terminator.kind = .return_)
+    {decl0 : MirAst.LocalDecl} {S : Nat} (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
+    (hnot_uninit_ind :
+      ¬ (get? s.frame.locals 0 = some .uninit ∧
+          ∃ topFrame mp0 c0,
+            m.stack.frames = #[topFrame] ∧
+            topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
+    StepRelUnionReturnLM2_4 body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) :=
+  step_terminator_return_wellTypedUnion_lm2_4_simulation hstate hphase hbb hstmt_none hstmt_len
+    hcleanup hret hdecl0 hwt0 hnot_uninit_ind
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} (hbody : WellTypedBodyExt body) (hne : body.basicBlocks ≠ [])
+    (d : Nat) (hd : d < 256) (rhs : Nat) (hrhs : rhs < 65536) :
+    (TreeSafe (mirCallTree body []) ↔
+      (miriSystem (annealMiriHooks body)).Safe (miriEntryState body)) ∧
+    (TreeSafe (mirCallTree (Witness.lm12SwitchBody d) []) ↔
+      (miriSystem (annealMiriHooks (Witness.lm12SwitchBody d))).Safe
+        (miriEntryState (Witness.lm12SwitchBody d))) ∧
+    (TreeSafe (mirCallTree Witness.lm12CastBody []) ↔
+      (miriSystem (annealMiriHooks Witness.lm12CastBody)).Safe
+        (miriEntryState Witness.lm12CastBody)) ∧
+    ((TreeSafe (mirCallTree (checkedAddBody rhs) []) ↔
+      (miriSystem (annealMiriHooks (checkedAddBody rhs))).Safe
+        (miriEntryState (checkedAddBody rhs))) ∧
+     (MirReachesUB (mirCallTree (checkedAddBody rhs) []) ↔
+      ∃ e, (miriSystem (annealMiriHooks (checkedAddBody rhs))).ReachesOutcome
+        (miriEntryState (checkedAddBody rhs)) (.undefinedBehavior e))) ∧
+    AgreeUB callStuckBody (callHooks callStuckBody [stuckBody])
+      (initMachineStateWithCallees callStuckBody [] [stuckBody]) (miriEntryState callStuckBody) ∧
+    AgreeUB callNoRetBody (callHooks callNoRetBody [noRetBody])
+      (initMachineStateWithCallees callNoRetBody [] [noRetBody]) (miriEntryState callNoRetBody) :=
+  ⟨scalarFragmentExt_treeSafe_iff_miriSafe hbody hne,
+   w1_switch_treeSafe_iff_miriSafe d hd,
+   w1_cast_treeSafe_iff_miriSafe,
+   w1_checked_add_treeSafe_iff_miriSafe rhs hrhs,
+   w5_callee_unreachable_ub,
+   w5_callee_uninit_return_ub⟩
 
 end StatementPins
 
