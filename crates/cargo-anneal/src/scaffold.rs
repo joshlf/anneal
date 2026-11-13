@@ -2333,54 +2333,230 @@ const CAPTURED_MIR_FIELDS: &[&str] = &[
     "allocations", "typeParamCount", "genericParams", "traitImpls",
 ];
 
-/// Return the extent of the `basicBlocks` field value that starts at
-/// `after_bb` (just past `basicBlocks :=`) in comment/string-stripped text.
-///
-/// The value ends at the first depth-0 `,`, the first unmatched closing
-/// bracket (the end of the enclosing `CapturedMir` literal), or a depth-0
-/// `<CapturedMir field> :=` (newline-separated fields). Returns `None` when the
-/// value is empty, brackets are mismatched, or the text ends while a bracket is
-/// still open (e.g. a declaration truncated by `bound_to_top_level_decl`).
-fn basic_blocks_value_extent(after_bb: &str) -> Option<&str> {
+/// Byte index of the bracket closing the one that opens `s` (`s` starts with
+/// `(`, `[`, or `{`), in comment/string-stripped text.
+fn matching_bracket_end(s: &str) -> Result<usize, String> {
     let mut stack: Vec<char> = Vec::new();
-    let mut end = after_bb.len();
-    let mut prev: Option<char> = None;
-    for (idx, ch) in after_bb.char_indices() {
+    for (idx, ch) in s.char_indices() {
         match ch {
             '(' | '[' | '{' => stack.push(ch),
             ')' | ']' | '}' => {
                 let Some(open) = stack.pop() else {
-                    end = idx;
-                    break;
+                    return Err("unbalanced CapturedMir structure literal".to_string());
                 };
                 if !matches!((open, ch), ('(', ')') | ('[', ']') | ('{', '}')) {
-                    return None;
+                    return Err("mismatched brackets in CapturedMir structure literal".to_string());
                 }
-            }
-            ',' if stack.is_empty() => {
-                end = idx;
-                break;
-            }
-            _ if stack.is_empty()
-                && !prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                && CAPTURED_MIR_FIELDS.iter().any(|field| {
-                    after_bb[idx..]
-                        .strip_prefix(field)
-                        .is_some_and(|rest| rest.trim_start().starts_with(":="))
-                }) =>
-            {
-                end = idx;
-                break;
+                if stack.is_empty() {
+                    return Ok(idx);
+                }
             }
             _ => {}
         }
-        prev = Some(ch);
     }
-    if end == after_bb.len() && !stack.is_empty() {
-        return None;
+    Err("unbalanced or truncated CapturedMir structure literal".to_string())
+}
+
+/// Kind of a depth-1 token of a `CapturedMir` structure-instance literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructTokKind {
+    /// Identifier or keyword (Lean identifier characters and `.`).
+    Word,
+    /// Numeric literal.
+    Num,
+    /// Stripped string literal (`""`).
+    Str,
+    /// Balanced `( .. )`, `[ .. ]`, or `{ .. }` group, opaque at depth 1.
+    Group(char),
+    /// `:=`.
+    Assign,
+    /// `,`.
+    Comma,
+    /// Any other character.
+    Punct,
+}
+
+/// A depth-1 token of a `CapturedMir` structure-instance literal.
+#[derive(Debug, Clone, Copy)]
+struct StructTok {
+    kind: StructTokKind,
+    /// Byte range of the token in the literal.
+    start: usize,
+    end: usize,
+    /// A newline separates this token from the previous token (or from the
+    /// literal's opening `{`).
+    after_newline: bool,
+}
+
+/// Tokenize the interior of a balanced structure-instance literal (`literal`
+/// starts with `{` and ends with its matching `}`) at bracket depth 1, in
+/// comment/string-stripped text. Nested bracket groups are single opaque
+/// tokens, so nothing inside them (named arguments such as
+/// `.unevaluated (defPath := ..)`, nested structure literals, list elements)
+/// can be mistaken for a `CapturedMir` field.
+fn struct_literal_tokens(literal: &str) -> Result<Vec<StructTok>, String> {
+    let is_word_char = |c: char| crate::agent::is_lean_ident_char(c) || c == '.';
+    let inner_end = literal.len() - '}'.len_utf8();
+    let mut toks = Vec::new();
+    let mut i = '{'.len_utf8();
+    let mut after_newline = false;
+    while let Some(ch) = literal[i..inner_end].chars().next() {
+        if ch.is_whitespace() {
+            after_newline |= ch == '\n';
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        let kind = match ch {
+            '(' | '[' | '{' => {
+                i += matching_bracket_end(&literal[i..inner_end])? + 1;
+                StructTokKind::Group(ch)
+            }
+            ')' | ']' | '}' => {
+                return Err("unbalanced CapturedMir structure literal".to_string());
+            }
+            ':' if literal[i + 1..].starts_with('=') => {
+                i += 2;
+                StructTokKind::Assign
+            }
+            ',' => {
+                i += 1;
+                StructTokKind::Comma
+            }
+            '"' => {
+                let Some(close) = literal[i + 1..inner_end].find('"') else {
+                    return Err("unterminated string in CapturedMir structure literal".to_string());
+                };
+                i += close + 2;
+                StructTokKind::Str
+            }
+            c if crate::agent::is_lean_ident_char(c)
+                || (c == '.'
+                    && literal[i + 1..inner_end]
+                        .chars()
+                        .next()
+                        .is_some_and(crate::agent::is_lean_ident_char)) =>
+            {
+                i += c.len_utf8();
+                while let Some(next) = literal[i..inner_end].chars().next().filter(|&n| is_word_char(n)) {
+                    i += next.len_utf8();
+                }
+                if c.is_ascii_digit() {
+                    StructTokKind::Num
+                } else {
+                    StructTokKind::Word
+                }
+            }
+            other => {
+                i += other.len_utf8();
+                StructTokKind::Punct
+            }
+        };
+        toks.push(StructTok {
+            kind,
+            start,
+            end: i,
+            after_newline,
+        });
+        after_newline = false;
     }
-    let value = &after_bb[..end];
-    (!value.trim().is_empty()).then_some(value)
+    Ok(toks)
+}
+
+/// Lean keywords that can introduce a non-field `<ident> :=` at bracket depth
+/// 1 of a structure literal (`let` / `have` / do-block / tactic bindings,
+/// `where` declarations, ...) or otherwise change how the following lines
+/// parse. None occurs in an emitted `CapturedMir` field value, so any of them
+/// fails closed.
+const STRUCT_LITERAL_DENIED_WORDS: &[&str] = &[
+    "let", "let_fun", "let_delayed", "let_tmp", "letI", "have", "haveI", "show", "from",
+    "suffices", "fun", "λ", "match", "with", "if", "then", "else", "do", "by", "where", "calc",
+    "return", "for", "in", "unless", "try", "catch", "finally", "mut", "rec", "at", "open",
+    "nomatch", "nofun", "termination_by", "decreasing_by",
+];
+
+/// Maximal runs of Lean identifier characters, `.`, guillemet placeholders
+/// (`«ident»`), and `#` (for `#eval`-style commands) in stripped text.
+fn lean_word_tokens(clean: &str) -> impl Iterator<Item = &str> {
+    clean
+        .split(|c: char| {
+            !(crate::agent::is_lean_ident_char(c) || matches!(c, '.' | '«' | '»' | '#'))
+        })
+        .filter(|tok| !tok.is_empty())
+}
+
+/// Commands and attributes that can declare, alias, or elaborate a `body`
+/// constant without a plain `def body` header (`where` / `let rec` auxiliary
+/// declarations, `export` aliases, metaprograms, custom syntax), so a captured
+/// MIR module containing any of them fails closed.
+const MIR_MODULE_FORBIDDEN_WORDS: &[&str] = &[
+    "where", "rec", "export", "run_cmd", "run_elab", "run_meta", "#eval", "elab", "elab_rules",
+    "macro", "macro_rules", "syntax", "notation", "infix", "infixl", "infixr", "prefix",
+    "postfix", "initialize", "declare_syntax_cat", "command_elab", "term_elab",
+];
+
+/// Reject captured MIR modules whose `body` constant could come from somewhere
+/// other than a declaration in the module text: a forbidden command (see
+/// `MIR_MODULE_FORBIDDEN_WORDS`, plus every `builtin_*` attribute) or an
+/// `import` of anything but `Init` / `Trusted` modules (the emitter imports
+/// only `Trusted`).
+fn check_captured_mir_module_hygiene(clean: &str) -> Result<(), String> {
+    let toks: Vec<&str> = lean_word_tokens(clean).collect();
+    for (idx, &tok) in toks.iter().enumerate() {
+        if MIR_MODULE_FORBIDDEN_WORDS.contains(&tok) || tok.starts_with("builtin_") {
+            return Err(format!(
+                "`{tok}` in the captured MIR module can declare or alias `body` outside a plain `def`"
+            ));
+        }
+        if tok == "import" {
+            let module = toks.get(idx + 1).copied().unwrap_or("");
+            let allowed = ["Init", "Trusted"]
+                .iter()
+                .any(|root| module == *root || module.strip_prefix(root).is_some_and(|r| r.starts_with('.')));
+            if !allowed {
+                return Err(format!(
+                    "`import {module}` in the captured MIR module (only `Init` / `Trusted` modules are allowed)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count declarations of every kind whose declared name is `body` or ends in
+/// `.body` (annotated or not, parameterized or not), in stripped text.
+fn count_body_declarations(clean: &str) -> usize {
+    const DECL_KEYWORDS: &[&str] = &[
+        "def", "abbrev", "opaque", "axiom", "theorem", "lemma", "instance", "structure",
+        "inductive", "class",
+    ];
+    let toks: Vec<&str> = lean_word_tokens(clean).collect();
+    toks.windows(2)
+        .filter(|w| {
+            let name = w[1].trim_end_matches('.');
+            DECL_KEYWORDS.contains(&w[0]) && (name == "body" || name.ends_with(".body"))
+        })
+        .count()
+}
+
+/// Whether the original (unstripped) source contains a guillemet-quoted
+/// `«body»` / `«….body»` identifier, which Lean treats as `body` but the
+/// stripped-text scanners see only as an opaque `«ident»` placeholder.
+/// Conservatively includes occurrences inside comments and strings.
+fn has_guillemet_body_ident(src: &str) -> bool {
+    let mut rest = src;
+    while let Some(open) = rest.find('«') {
+        let after = &rest[open + '«'.len_utf8()..];
+        let Some(close) = after.find('»') else {
+            return false;
+        };
+        let content = &after[..close];
+        if content == "body" || content.ends_with(".body") {
+            return true;
+        }
+        rest = &after[close + '»'.len_utf8()..];
+    }
+    false
 }
 
 /// A `[modifiers] (def | abbrev) <name> : <CapturedMir type> :=` declaration
@@ -2469,66 +2645,100 @@ fn find_captured_mir_decls(clean: &str) -> Vec<CapturedMirDecl> {
     decls
 }
 
-/// Depth-1 field assignments of the single inline `CapturedMir` structure
+/// Exact depth-1 field values of the single inline `CapturedMir` structure
 /// literal selected by `locate_captured_mir_record`.
 #[derive(Debug)]
 struct CapturedMirRecord<'a> {
-    /// Literal text from its opening `{` through its matching `}` (inclusive).
-    literal: &'a str,
-    /// `(field, value_offset)` pairs, `value_offset` being the byte offset in
-    /// `literal` just past that field's `:=`.
-    fields: Vec<(&'a str, usize)>,
+    /// `(field, value)` pairs; each value is the exact text of the field's
+    /// value (from the first token after `:=` through its last token).
+    fields: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> CapturedMirRecord<'a> {
-    /// The text of `field`'s value up to the end of the literal (the value's
-    /// own extent is delimited by `basic_blocks_value_extent`).
     fn field_value(&self, field: &str) -> Option<&'a str> {
         self.fields
             .iter()
             .find(|(name, _)| *name == field)
-            .map(|&(_, offset)| &self.literal[offset..])
+            .map(|&(_, value)| value)
     }
 }
 
 /// Why `locate_captured_mir_record` could not select a scannable literal.
+#[derive(Debug)]
 enum CapturedMirRecordError {
-    /// No inline body to scan (no unique `CapturedMir` declaration, an alias /
-    /// `let` / helper-call RHS, or a literal inheriting `basicBlocks` from a
-    /// structure-update source).
+    /// No inline body to scan (no unique `body` declaration, an alias / `let` /
+    /// helper-call RHS, a literal inheriting `basicBlocks` from a
+    /// structure-update source, or a module that can define `body` elsewhere).
     NonInline(String),
     /// An inline literal exists but is malformed (unbalanced, trailing tokens,
-    /// duplicate or unknown fields).
+    /// duplicate or unknown fields, non-field syntax at depth 1, or a
+    /// `basicBlocks` value that is not a single list literal).
     Malformed(String),
 }
 
 /// Select the `CapturedMir` declaration to classify and parse its RHS as a
 /// single inline structure literal (`{ .. }` or `{ base with .. }`).
 ///
-/// The declaration named `body` is chosen when exactly one exists; otherwise a
-/// file must contain exactly one `CapturedMir` declaration (e.g. a witness
-/// `def`). Its RHS must be one balanced `{ .. }` literal followed by nothing but
-/// whitespace up to the next top-level command, whose depth-1 fields are known
-/// `CapturedMir` fields, each assigned at most once, including exactly one
-/// inline `basicBlocks :=`. Everything else fails closed, so neither a prefix
-/// (`let x : CapturedMir := { .. }; impure`, `mkImpure (basicBlocks := ..)`), a
-/// suffix (`{ .. } |> addCall`), nor an overriding duplicate field can make the
-/// scan read blocks that are not the body's.
+/// Selection: a module must not contain commands that can declare or alias
+/// `body` without a plain header (`check_captured_mir_module_hygiene`), and
+/// exactly one declaration of any kind may be named `body` / `*.body`; it must
+/// be a `def` / `abbrev` with an explicit `CapturedMir` type and no parameters.
+/// A differently-named lone `CapturedMir` declaration (a witness `def`) is
+/// classified only when it is the sole command of the source (a snippet).
+///
+/// Parsing: the RHS must be one balanced `{ .. }` literal followed by nothing
+/// but whitespace up to the next top-level command. At bracket depth 1 it must
+/// be `[<base> with] <field> := <value> ((, | newline) <field> := <value>)*`,
+/// where every field is a known `CapturedMir` field assigned at most once, a
+/// newline starts a field only when the line begins with `<ident> :=`, and
+/// every value is a non-empty sequence of identifiers, numerals, string
+/// literals, and bracket groups — never `:=`, other punctuation, or a
+/// binder / control keyword (`STRUCT_LITERAL_DENIED_WORDS`). The `basicBlocks`
+/// value must be a single `[ .. ]` / `( .. )` list literal or `List.nil`.
+/// Everything else fails closed, so neither a prefix (`let x : CapturedMir :=
+/// { .. }; impure`), a suffix (`{ .. } |> addCall`), a `let basicBlocks :=`
+/// smuggled into another field's value, a list with trailing tokens
+/// (`[..] ++ impure`), an overriding duplicate field, nor a decoy declaration
+/// can make the scan read blocks that are not the body's.
 fn locate_captured_mir_record(clean: &str) -> Result<CapturedMirRecord<'_>, CapturedMirRecordError> {
     use CapturedMirRecordError::{Malformed, NonInline};
+    check_captured_mir_module_hygiene(clean).map_err(NonInline)?;
     let decls = find_captured_mir_decls(clean);
+    let body_decls = count_body_declarations(clean);
     let named_body: Vec<&CapturedMirDecl> = decls
         .iter()
         .filter(|d| d.name == "body" || d.name.ends_with(".body"))
         .collect();
+    let is_sole_command = |decl: &CapturedMirDecl| {
+        let bound_end =
+            decl.line_start + bound_to_top_level_decl(&clean[decl.line_start..]).len();
+        clean[..decl.line_start].trim().is_empty() && clean[bound_end..].trim().is_empty()
+    };
     let decl = match (named_body.as_slice(), decls.as_slice()) {
-        ([only], _) => *only,
-        ([], [only]) => only,
+        ([only], _) if body_decls == 1 => *only,
+        ([_], _) => {
+            return Err(NonInline(format!(
+                "`body` is declared {body_decls} times; exactly one plain `def body : CapturedMir` declaration is classified"
+            )));
+        }
         ([_, _, ..], _) => {
             return Err(NonInline("multiple `body : CapturedMir` declarations".to_string()));
         }
+        ([], _) if body_decls > 0 => {
+            return Err(NonInline(
+                "`body` is not declared as a plain `def body : CapturedMir := ..` (unannotated, parameterized, opaque, or axiomatized)"
+                    .to_string(),
+            ));
+        }
         ([], []) => {
             return Err(NonInline("missing basicBlocks".to_string()));
+        }
+        ([], [only]) if is_sole_command(only) => only,
+        ([], [_]) => {
+            return Err(NonInline(
+                "no `body : CapturedMir` declaration (a differently-named declaration is classified only as a single-declaration snippet)"
+                    .to_string(),
+            ));
         }
         ([], _) => {
             return Err(NonInline(
@@ -2545,81 +2755,110 @@ fn locate_captured_mir_record(clean: &str) -> Result<CapturedMirRecord<'_>, Capt
             decl.name
         )));
     }
-
-    let mut stack: Vec<char> = Vec::new();
-    let mut close = None;
-    let mut fields: Vec<(&str, usize)> = Vec::new();
-    let mut prev: Option<char> = None;
-    let mut chars = rhs[open..].char_indices().peekable();
-    while let Some((rel, ch)) = chars.next() {
-        let idx = open + rel;
-        match ch {
-            '(' | '[' | '{' => stack.push(ch),
-            ')' | ']' | '}' => {
-                let Some(opener) = stack.pop() else {
-                    return Err(Malformed("unbalanced CapturedMir structure literal".to_string()));
-                };
-                if !matches!((opener, ch), ('(', ')') | ('[', ']') | ('{', '}')) {
-                    return Err(Malformed("mismatched brackets in CapturedMir structure literal".to_string()));
-                }
-                if stack.is_empty() {
-                    close = Some(idx);
-                    break;
-                }
-            }
-            c if stack.len() == 1
-                && (c.is_alphabetic() || c == '_')
-                && !prev.is_some_and(|p| crate::agent::is_lean_ident_char(p) || p == '.') =>
-            {
-                let mut end = idx + c.len_utf8();
-                while let Some(&(next_rel, next)) = chars.peek() {
-                    if !crate::agent::is_lean_ident_char(next) {
-                        break;
-                    }
-                    end = open + next_rel + next.len_utf8();
-                    chars.next();
-                }
-                let ident = &rhs[idx..end];
-                let after = &rhs[end..];
-                if let Some(after_assign) = after.trim_start().strip_prefix(":=") {
-                    fields.push((ident, rhs.len() - after_assign.len()));
-                }
-                prev = rhs[..end].chars().next_back();
-                continue;
-            }
-            _ => {}
-        }
-        prev = Some(ch);
-    }
-    let Some(close) = close else {
-        return Err(Malformed(
-            "unbalanced or truncated CapturedMir structure literal".to_string(),
-        ));
-    };
+    let close = open + matching_bracket_end(&rhs[open..]).map_err(Malformed)?;
     if !rhs[close + 1..].trim().is_empty() {
         return Err(Malformed(
             "trailing tokens after the CapturedMir structure literal".to_string(),
         ));
     }
-    let mut seen: Vec<&str> = Vec::new();
-    for &(field, _) in &fields {
-        if !CAPTURED_MIR_FIELDS.contains(&field) {
-            return Err(Malformed(format!("unknown CapturedMir field `{field}`")));
-        }
-        if seen.contains(&field) {
-            return Err(Malformed(format!("duplicate CapturedMir field `{field}`")));
-        }
-        seen.push(field);
-    }
     let literal = &rhs[open..=close];
-    let fields = fields
-        .into_iter()
-        .map(|(field, offset)| (field, offset - open))
-        .collect::<Vec<_>>();
-    if !seen.contains(&"basicBlocks") {
+    let toks = struct_literal_tokens(literal).map_err(Malformed)?;
+    let text = |tok: &StructTok| &literal[tok.start..tok.end];
+
+    let mut idx = 0;
+    // Optional single structure-update source: `{ <base> with .. }`.
+    if toks.len() >= 2
+        && toks[0].kind == StructTokKind::Word
+        && !STRUCT_LITERAL_DENIED_WORDS.contains(&text(&toks[0]))
+        && toks[1].kind == StructTokKind::Word
+        && text(&toks[1]) == "with"
+    {
+        idx = 2;
+    }
+    let mut fields: Vec<(&str, &str)> = Vec::new();
+    while idx < toks.len() {
+        let name = text(&toks[idx]);
+        if toks[idx].kind != StructTokKind::Word
+            || toks.get(idx + 1).map(|tok| tok.kind) != Some(StructTokKind::Assign)
+        {
+            return Err(Malformed(format!(
+                "expected `<field> :=` at `{name}` in the CapturedMir structure literal"
+            )));
+        }
+        if !CAPTURED_MIR_FIELDS.contains(&name) {
+            return Err(Malformed(format!("unknown CapturedMir field `{name}`")));
+        }
+        if fields.iter().any(|(field, _)| *field == name) {
+            return Err(Malformed(format!("duplicate CapturedMir field `{name}`")));
+        }
+        idx += 2;
+        let value_start = idx;
+        while let Some(tok) = toks.get(idx) {
+            match tok.kind {
+                StructTokKind::Comma => break,
+                // A newline-separated next field: `<ident> :=` opening a line.
+                StructTokKind::Word
+                    if tok.after_newline
+                        && toks
+                            .get(idx + 1)
+                            .is_some_and(|next| next.kind == StructTokKind::Assign) =>
+                {
+                    break;
+                }
+                StructTokKind::Word if STRUCT_LITERAL_DENIED_WORDS.contains(&text(tok)) => {
+                    return Err(Malformed(format!(
+                        "`{}` in the value of CapturedMir field `{name}`",
+                        text(tok)
+                    )));
+                }
+                StructTokKind::Word
+                | StructTokKind::Num
+                | StructTokKind::Str
+                | StructTokKind::Group(_) => idx += 1,
+                StructTokKind::Assign => {
+                    return Err(Malformed(format!(
+                        "`:=` outside a field position in the value of CapturedMir field `{name}`"
+                    )));
+                }
+                StructTokKind::Punct => {
+                    return Err(Malformed(format!(
+                        "unsupported token `{}` in the value of CapturedMir field `{name}`",
+                        text(tok)
+                    )));
+                }
+            }
+        }
+        let value = &toks[value_start..idx];
+        let (Some(first), Some(last)) = (value.first(), value.last()) else {
+            return Err(Malformed(format!("empty value for CapturedMir field `{name}`")));
+        };
+        if name == "basicBlocks" {
+            match value {
+                [tok] if matches!(tok.kind, StructTokKind::Group('[' | '(')) => {}
+                [tok] if tok.kind == StructTokKind::Word && ast_ctor(text(tok), "List") == Some("nil") => {}
+                [tok] if tok.kind == StructTokKind::Word => {
+                    return Err(NonInline(format!(
+                        "`basicBlocks := {}` is not an inline list literal",
+                        text(tok)
+                    )));
+                }
+                _ => {
+                    return Err(Malformed(
+                        "`basicBlocks` must be a single `[ .. ]` / `( .. )` list literal or `List.nil`"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        fields.push((name, &literal[first.start..last.end]));
+        if toks.get(idx).is_some_and(|tok| tok.kind == StructTokKind::Comma) {
+            idx += 1;
+        }
+    }
+    if !fields.iter().any(|(field, _)| *field == "basicBlocks") {
         return Err(NonInline("missing inline basicBlocks field".to_string()));
     }
-    Ok(CapturedMirRecord { literal, fields })
+    Ok(CapturedMirRecord { fields })
 }
 
 /// Fail-closed scan for a body the scanner cannot classify precisely.
@@ -2635,6 +2874,13 @@ fn fail_closed_scan(has_body: bool, reason: String) -> MirBodyScan {
 }
 
 fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
+    if has_guillemet_body_ident(mir_src) {
+        return fail_closed_scan(
+            false,
+            "non-inline or unparsed CapturedMir body (guillemet-quoted `«body»` identifier)"
+                .to_string(),
+        );
+    }
     let clean = strip_lean_comments_and_strings(mir_src);
     let record = match locate_captured_mir_record(&clean) {
         Ok(record) => record,
@@ -2660,18 +2906,15 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
                 .and_then(|s| s.parse::<usize>().ok())
         })
         .unwrap_or(0);
-    let local_decls_slice = record
-        .field_value("localDecls")
-        .map_or("", |value| basic_blocks_value_extent(value).unwrap_or(value));
-    let after_bb = record
+    // Exact field values: `locate_captured_mir_record` delimits each value by
+    // depth-1 structure (bracket groups are opaque), so named constructor
+    // arguments that reuse a `CapturedMir` field name (`.unevaluated (defPath
+    // := ..)`) cannot truncate a value, and `basicBlocks` is a single list
+    // literal with nothing before or after it.
+    let local_decls_slice = record.field_value("localDecls").unwrap_or("");
+    let blocks_slice = record
         .field_value("basicBlocks")
         .expect("locate_captured_mir_record guarantees an inline basicBlocks field");
-    // Delimit the `basicBlocks` value by bracket structure rather than by the
-    // first textual `<field> :=`, so named constructor arguments that reuse a
-    // `CapturedMir` field name (`.unevaluated (defPath := ..)`) cannot truncate
-    // the scan, and a truncated / unbalanced literal fails closed.
-    let blocks_value = basic_blocks_value_extent(after_bb);
-    let blocks_slice = blocks_value.unwrap_or(after_bb);
 
     let norm_decls = normalize_parens_and_ws(local_decls_slice);
     let norm_blocks = normalize_parens_and_ws(blocks_slice);
@@ -2679,11 +2922,7 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
 
     let (basic_block_count, has_cfg_back_edge, malformed_blocks_reason) =
         detect_blocks_and_back_edges(&norm_blocks, &block_toks);
-    let unscannable_token = blocks_value
-        .is_none()
-        .then(|| "unbalanced, truncated, or empty basicBlocks literal".to_string())
-        .or_else(|| first_unscannable_block_token(&block_toks))
-        .or(malformed_blocks_reason);
+    let unscannable_token = first_unscannable_block_token(&block_toks).or(malformed_blocks_reason);
     let has_unscannable_syntax = unscannable_token.is_some();
 
     let has_deref_projection = has_ast_ctor(&norm_blocks, "ProjectionElem", "deref");
@@ -2928,7 +3167,8 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
         // contain `"`, `--`, `/-`, `,`, `]`, or `terminator :=` without starting
         // a string, comment, bracket, or field delimiter. Replace with a single
         // opaque placeholder token `«ident»` so interior punctuation cannot
-        // confuse `basic_blocks_value_extent` or `normalize_parens_and_ws`.
+        // confuse `struct_literal_tokens` or `normalize_parens_and_ws`
+        // (`has_guillemet_body_ident` checks the original text for `«body»`).
         if src[i..].starts_with('«') {
             let end = src[i..].find('»').map_or(src.len(), |p| i + p + '»'.len_utf8());
             out.push_str(" «ident» ");
@@ -3278,7 +3518,7 @@ const MIR_BLOCK_FIELD_VOCAB: &[&str] = &[
     // String-valued named constructor argument (`ConstValue.unevaluated`,
     // `Rvalue.threadLocalRef`, `AggregateKind.adt`, `RigidTy.fnDef`, ...): its
     // value is a (stripped) string literal, it feeds no positional detector, and
-    // `basic_blocks_value_extent` ignores it at bracket depth > 0.
+    // `struct_literal_tokens` keeps it inside its opaque bracket group.
     "defPath",
 ];
 
@@ -3533,14 +3773,7 @@ fn detect_blocks_and_back_edges(
     let mut back_edge = false;
     let mut malformed = None;
     for (bb_idx, raw_part) in parts.iter().skip(1).enumerate() {
-        let padded = format!(" {raw_part} ");
-        let end = padded
-            .find(" isCleanup := ")
-            .into_iter()
-            .chain(padded.find(" statements := "))
-            .min()
-            .unwrap_or(padded.len());
-        let term = padded[..end].replace(" span := \"\" ", " ");
+        let term = terminator_slice(raw_part);
         match extract_terminator_targets(&term) {
             Some(targets) => {
                 for target in targets {
@@ -3558,6 +3791,22 @@ fn detect_blocks_and_back_edges(
         }
     }
     (term_count, back_edge, malformed)
+}
+
+/// The normalized `Terminator` text that follows one ` terminator := ` in
+/// `normalize_parens_and_ws` output, up to the block's next ` isCleanup := ` /
+/// ` statements := ` field, with every `span := ""` removed. The slice is
+/// re-padded before stripping because the separating space that follows a
+/// trailing `span := ""` belongs to the delimiter that ends the slice.
+fn terminator_slice(raw_part: &str) -> String {
+    let padded = format!(" {raw_part} ");
+    let end = padded
+        .find(" isCleanup := ")
+        .into_iter()
+        .chain(padded.find(" statements := "))
+        .min()
+        .unwrap_or(padded.len());
+    format!("{} ", &padded[..end]).replace(" span := \"\" ", " ")
 }
 
 fn is_unwind_action_tok(tok: &str) -> bool {
@@ -6094,12 +6343,37 @@ def body : CapturedMir :=
         let ld_defpath_mut = "def body : CapturedMir := { localDecls := [{ mutability := .not, ty := { kind := .adt (defPath := \"demo::S\") [], layoutIdx := 0 }, debugName := none }, { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 1 }, debugName := none }], basicBlocks := [{ statements := [{ kind := .assign { local_ := 0, projection := [] } (.use (.copy { local_ := 2, projection := [.deref] })), span := \"\" }], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }";
         let ld_scan = scan_captured_mir_body(ld_defpath_mut);
         assert!(ld_scan.has_mut_borrow, "defPath := inside localDecls must not truncate localDecls before &mut local: {ld_scan:?}");
-        assert_eq!(basic_blocks_value_extent(" [] }"), Some(" [] "));
-        assert_eq!(basic_blocks_value_extent(" (List.cons a List.nil),\n fnAbi := x"), Some(" (List.cons a List.nil)"));
-        assert_eq!(basic_blocks_value_extent(" [a]\n  fnAbi := x"), Some(" [a]\n  "));
-        assert_eq!(basic_blocks_value_extent(" [f (defPath := \"\")]\n  fnAbi := x"), Some(" [f (defPath := \"\")]\n  "));
-        assert_eq!(basic_blocks_value_extent(" [a"), None);
-        assert_eq!(basic_blocks_value_extent("  \n "), None);
+        // Exact depth-1 field values (bracket groups are opaque; `,` and
+        // `<ident> :=`-opening lines separate fields).
+        let fields = |literal: &str| -> Vec<(String, String)> {
+            let clean = strip_lean_comments_and_strings(&format!("def body : CapturedMir := {literal}"));
+            locate_captured_mir_record(&clean)
+                .unwrap_or_else(|err| panic!("{literal}: {err:?}"))
+                .fields
+                .iter()
+                .map(|(field, value)| (field.to_string(), value.to_string()))
+                .collect()
+        };
+        let pairs = |items: &[(&str, &str)]| -> Vec<(String, String)> {
+            items.iter().map(|(f, v)| (f.to_string(), v.to_string())).collect()
+        };
+        assert_eq!(fields("{ basicBlocks := [] }"), pairs(&[("basicBlocks", "[]")]));
+        assert_eq!(
+            fields("{ basicBlocks := (List.cons a List.nil),\n fnAbi := x }"),
+            pairs(&[("basicBlocks", "(List.cons a List.nil)"), ("fnAbi", "x")])
+        );
+        assert_eq!(
+            fields("{ base with basicBlocks := [a]\n  fnAbi := some x }"),
+            pairs(&[("basicBlocks", "[a]"), ("fnAbi", "some x")])
+        );
+        assert_eq!(
+            fields("{ basicBlocks := [f (defPath := \"\")]\n  fnAbi := x }"),
+            pairs(&[("basicBlocks", "[f (defPath := \"\")]"), ("fnAbi", "x")])
+        );
+        assert_eq!(
+            fields("{ defPath :=\n    \"x\"\n  basicBlocks := List.nil }"),
+            pairs(&[("defPath", "\"\""), ("basicBlocks", "List.nil")])
+        );
     }
 
     /// B1 (`ep2`) structural traps: the classified blocks must be the inline
@@ -6128,6 +6402,38 @@ def body : CapturedMir :=
             ("two unnamed declarations", format!("def a : CapturedMir := {{ basicBlocks := [{pure}] }}\ndef b : CapturedMir := {{ basicBlocks := [{call}] }}\n"), false),
             ("two body declarations", format!("namespace A\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend A\nnamespace B\ndef body : CapturedMir := {{ basicBlocks := [{call}] }}\nend B\n"), false),
             ("char literal inside basicBlocks", "def body : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .goto 'x', span := \"\" }, isCleanup := false }] }".to_string(), true),
+            // B2 (`ep2`) P1#1: a `basicBlocks :=` binding smuggled into another
+            // field's value of `{ witnessFullMir with .. }` (Lean: the body
+            // keeps `witnessFullMir.basicBlocks`, i.e. `full_mir`).
+            ("smuggled let in defPath", format!("def body : CapturedMir :=\n  {{ witnessFullMir with\n    defPath :=\n      let basicBlocks := [{pure}]\n      \"demo::f\"\n  }}\n"), true),
+            ("smuggled let in argCount", format!("def body : CapturedMir := {{ witnessFullMir with argCount := let basicBlocks := [{pure}]; 0 }}"), true),
+            ("smuggled let in layouts", format!("def body : CapturedMir := {{ witnessFullMir with layouts := let basicBlocks := [{pure}]; .nil }}"), true),
+            ("line-split let", format!("def body : CapturedMir :=\n  {{ witnessFullMir with\n    defPath := let\n    basicBlocks := [{pure}]\n    \"demo::f\"\n  }}\n"), true),
+            ("have binding", format!("def body : CapturedMir := {{ witnessFullMir with defPath := have basicBlocks := [{pure}]; \"x\" }}"), true),
+            ("do-block reassignment", format!("def body : CapturedMir :=\n  {{ witnessFullMir with\n    defPath := Id.run do\n      let mut basicBlocks := []\n      basicBlocks := [{pure}]\n      return \"x\"\n  }}\n"), true),
+            ("anonymous-constructor value", format!("def body : CapturedMir := {{ witnessFullMir with defPath := ⟨[], 0⟩, basicBlocks := [{pure}] }}"), true),
+            // B2 P1#1: trailing tokens after the `basicBlocks` list.
+            ("list ++ impure", format!("def body : CapturedMir := {{ basicBlocks := [{pure}] ++ impureBlocks }}"), true),
+            ("list then newline string", format!("def body : CapturedMir := {{\n  basicBlocks := [{pure}]\n    \"x\"\n}}"), true),
+            ("list piped", format!("def body : CapturedMir := {{ basicBlocks := [{pure}] |>.map id }}"), true),
+            ("applied list", format!("def body : CapturedMir := {{ basicBlocks := addImpureCall [{pure}] }}"), true),
+            ("aliased basicBlocks", "def body : CapturedMir := { basicBlocks := impureBlocks }".to_string(), false),
+            // B2 P1#1: `body` declared in a form `find_captured_mir_decls` does
+            // not parse must never let a lone helper be classified instead.
+            ("unannotated body + helper", format!("import Trusted\ndef helper : CapturedMir := {{ basicBlocks := [{pure}] }}\ndef body := {{ helper with basicBlocks := [{call}] }}\n"), false),
+            ("parameterized body + helper", format!("import Trusted\ndef helper : CapturedMir := {{ basicBlocks := [{pure}] }}\ndef body (_ : Unit := ()) : CapturedMir := witnessFullMir\n"), false),
+            ("opaque body + helper", format!("def helper : CapturedMir := {{ basicBlocks := [{pure}] }}\nopaque body : CapturedMir\n"), false),
+            ("lone helper in a module", format!("import Trusted\ndef helper : CapturedMir := {{ basicBlocks := [{pure}] }}\n"), false),
+            // Decoy `body` in another namespace while `Mir.<Item>.body` comes
+            // from a second declaration form, an import, or a metaprogram.
+            ("decoy + opaque body", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nnamespace Mir.Demo.f\nopaque body : CapturedMir\nend Mir.Demo.f\n"), false),
+            ("decoy + where body", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nnamespace Mir.Demo\ndef f : Nat := 0\nwhere\n  body : CapturedMir := witnessFullMir\nend Mir.Demo\n"), false),
+            ("decoy + foreign import", format!("import Trusted\nimport Evil.Bodies\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\n"), false),
+            ("decoy + export alias", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nnamespace Mir.Demo.f\nexport Evil (body)\nend Mir.Demo.f\n"), false),
+            ("decoy + run_cmd", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nrun_cmd addImpureBody\n"), false),
+            ("decoy + #eval", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\n#eval addImpureBody\n"), false),
+            ("decoy + macro", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nmacro \"mk\" : command => `(def body : CapturedMir := witnessFullMir)\n"), false),
+            ("decoy + guillemet body", format!("import Trusted\nnamespace Decoy\ndef body : CapturedMir := {{ basicBlocks := [{pure}] }}\nend Decoy\nnamespace Mir.Demo.f\ndef «body» : CapturedMir := {{ basicBlocks := [{call}] }}\nend Mir.Demo.f\n"), false),
         ];
         for (label, src, has_body) in &traps {
             let scan = scan_captured_mir_body(src);
@@ -6154,6 +6460,10 @@ def body : CapturedMir :=
             ("glued trailing decl after doc comment", format!("def body : CapturedMir := {{ basicBlocks := [{pure}] }} /-\n doc\n-/ def other : Nat := 0\n"), MirFragment::PureLoopFree),
             ("multi-line span string", "def body : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"line1\nline2\" }, isCleanup := false }] }".to_string(), MirFragment::PureLoopFree),
             ("CRLF lines and bare trailing `end`", format!("import Trusted\r\nnamespace Mir.X\r\ndef body : CapturedMir :=\r\n  {{ basicBlocks := [{pure}] }}\r\nend"), MirFragment::PureLoopFree),
+            ("rustc-capture emitter (List.cons, comma fields)", format!("import Trusted\n\nnamespace Mir.Demo.f\n\nopen Trusted.Rustc.V2026_06_01.MirAst\n\n-- TypeLayout[0]: size=0, align=1\ndef layouts : LayoutTable :=\n  []\n\n-- bb0: return\ndef body : CapturedMir :=\n  {{\n    defPath := \"demo::f\",\n    phase := .runtimePostCleanup,\n    role := .subject,\n    argCount := 0,\n    localDecls := List.nil,\n    basicBlocks := (List.cons {call} (List.cons {pure} List.nil)),\n    fnAbi := abi,\n    layouts := layouts,\n    allocations := List.nil\n  }}\n\ndef defaultClaim : Claim :=\n  {{ body := body, pre := fun _ => True, post := fun _ _ => True }}\n\nend Mir.Demo.f\n"), MirFragment::FullMir),
+            ("newline-separated base-with fields", format!("def body : CapturedMir :=\n  {{ protoBase with\n    defPath := \"x\"\n    basicBlocks :=\n      [{pure}] }}\n"), MirFragment::PureLoopFree),
+            ("empty List.nil blocks", "def body : CapturedMir := { basicBlocks := List.nil }".to_string(), MirFragment::PureLoopFree),
+            ("lone witness snippet", format!("def witnessX : CapturedMir :=\n  {{ protoBase with\n    basicBlocks := [{pure}] }}"), MirFragment::PureLoopFree),
         ];
         for (label, src, expected) in &controls {
             let scan = scan_captured_mir_body(src);
@@ -6189,6 +6499,17 @@ def body : CapturedMir :=
             assert_eq!(scan.has_mut_borrow, expect_mut, "{decl_ty}: {scan:?}");
             assert_eq!(scan.inferred_fragment, MirFragment::TreeBorrowsLocal, "{decl_ty}");
         }
+
+        // 5. B2 P2#2: a trailing `span := ""` right before the block's next
+        //    field is stripped from the terminator slice.
+        assert_eq!(
+            terminator_slice("kind := .goto 1 span := \"\" isCleanup := false"),
+            " kind := .goto 1 "
+        );
+        assert_eq!(
+            terminator_slice("span := \"\" kind := .return_ statements := [ ]"),
+            " kind := .return_ "
+        );
     }
 
     /// Differential Lean <-> Rust parity harness (opt-in, `#[ignore]`).

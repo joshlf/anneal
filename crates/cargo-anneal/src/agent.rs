@@ -905,15 +905,8 @@ pub(crate) fn verify_spec_lock_with_units_dir(
         format!("malformed spec-lock manifest {source_desc}: {err}")
     })?;
 
-    if manifest.schema != SPEC_LOCK_SCHEMA_V1 {
-        return Err(format!(
-            "unsupported schema '{}' in {source_desc} (expected '{}')",
-            manifest.schema,
-            SPEC_LOCK_SCHEMA_V1
-        ));
-    }
-
-    // 1. Integrity of the lock file itself (manifest-level `spec_digest`).
+    // 1. Integrity of the lock file itself (schema, duplicate entries, and
+    //    the manifest-level `spec_digest`).
     verify_spec_lock_manifest_integrity(&manifest, &source_desc)?;
 
     // 2. Captured records (identity, roles, and MIR digests).
@@ -963,9 +956,13 @@ pub(crate) fn verify_spec_lock_with_units_dir(
     Ok(manifest)
 }
 
-/// Verify the manifest-level certificate of a parsed `.anneal/spec-lock.json`.
+/// Verify the manifest-level invariants of a parsed `.anneal/spec-lock.json`;
+/// every consumer (`agent-verify`, `agent-sandbox`, and the `lock-specs`
+/// report) runs this same check before trusting any field.
 ///
-/// Certificates are all-or-nothing: either the manifest is a legacy
+/// The schema must be `anneal.spec-lock.v1`, and no record, locked file, or
+/// `mutable_subjects` entry may be duplicated (`lock-specs` writes each at
+/// most once). Certificates are all-or-nothing: either the manifest is a legacy
 /// certificate-free `anneal.spec-lock.v1` lock (no manifest `spec_digest` and no
 /// record `mir_fragment` / `spec_digest`), which verifies exactly as before, or
 /// it carries a manifest `spec_digest` *and* every record carries both
@@ -980,15 +977,30 @@ pub(crate) fn verify_spec_lock_manifest_integrity(
     manifest: &SpecLockManifest,
     source_desc: &str,
 ) -> Result<(), String> {
+    if manifest.schema != SPEC_LOCK_SCHEMA_V1 {
+        return Err(format!(
+            "unsupported schema '{}' in {source_desc} (expected '{}')",
+            manifest.schema, SPEC_LOCK_SCHEMA_V1
+        ));
+    }
     // `lock-specs` never writes duplicate entries (records are keyed by
-    // `def_id`, files by `rel_path`); a duplicate would be silently collapsed
-    // by the map-based comparisons below, so reject it outright.
+    // `def_id`, files by `rel_path`, `mutable_subjects` is a set); a duplicate
+    // would be silently collapsed by the map- and `any`-based comparisons
+    // below, so reject it outright.
     let mut seen_def_ids = BTreeSet::new();
     for rec in &manifest.locked_records {
         if !seen_def_ids.insert(rec.def_id.as_str()) {
             return Err(format!(
                 "spec-lock violation: duplicate locked record '{}' in {source_desc}",
                 rec.def_id
+            ));
+        }
+    }
+    let mut seen_subjects = BTreeSet::new();
+    for subject in &manifest.mutable_subjects {
+        if !seen_subjects.insert(subject.as_str()) {
+            return Err(format!(
+                "spec-lock violation: duplicate 'mutable_subjects' entry '{subject}' in {source_desc}"
             ));
         }
     }
@@ -4210,6 +4222,29 @@ end Mir.Demo.loop_fn
         fs::write(&lock_path, stripped.to_json_string()).expect("write stripped lock");
         let err = run_agent_sandbox(&ws, None, &command).expect_err("partially stripped lock");
         assert!(err.contains("manifest-level spec_digest is missing"), "{err}");
+        assert!(!marker.exists());
+
+        // B2 P2#3: the schema and duplicate-entry invariants are part of the
+        // shared integrity check, so the sandbox enforces them exactly like
+        // `agent-verify` — even when the (unkeyed) digest is recomputed.
+        let mut wrong_schema = parse_spec_lock_manifest(&raw).expect("parse lock");
+        wrong_schema.schema = "anneal.spec-lock.v0".to_string();
+        wrong_schema.spec_digest = Some(compute_spec_lock_manifest_digest(&wrong_schema));
+        fs::write(&lock_path, wrong_schema.to_json_string()).expect("write wrong-schema lock");
+        let err = run_agent_sandbox(&ws, None, &command).expect_err("unsupported schema");
+        assert!(err.contains("unsupported schema 'anneal.spec-lock.v0'"), "{err}");
+        let err = verify_spec_lock(&ws, &records).expect_err("unsupported schema (agent-verify)");
+        assert!(err.contains("unsupported schema 'anneal.spec-lock.v0'"), "{err}");
+        assert!(!marker.exists());
+
+        let mut duplicated = parse_spec_lock_manifest(&raw).expect("parse lock");
+        duplicated.mutable_subjects = vec!["demo::add".to_string(), "demo::add".to_string()];
+        duplicated.spec_digest = Some(compute_spec_lock_manifest_digest(&duplicated));
+        fs::write(&lock_path, duplicated.to_json_string()).expect("write duplicated lock");
+        let err = run_agent_sandbox(&ws, None, &command).expect_err("duplicate mutable_subjects");
+        assert!(err.contains("duplicate 'mutable_subjects' entry 'demo::add'"), "{err}");
+        let err = verify_spec_lock(&ws, &records).expect_err("duplicate mutable_subjects (agent-verify)");
+        assert!(err.contains("duplicate 'mutable_subjects' entry 'demo::add'"), "{err}");
         assert!(!marker.exists());
 
         let _ = fs::remove_dir_all(&ws);

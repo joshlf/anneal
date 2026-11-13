@@ -3623,6 +3623,14 @@ mod tests {
         let report_err =
             render_lock_specs_report(&ws, &lock_path).expect_err("tampered lock must not report");
         assert!(report_err.contains("manifest spec_digest mismatch"), "{report_err}");
+        // ... and one with an unsupported schema, even under a recomputed digest.
+        let mut wrong_schema = locked.clone();
+        wrong_schema.schema = "anneal.spec-lock.v0".to_string();
+        wrong_schema.spec_digest = Some(agent::compute_spec_lock_manifest_digest(&wrong_schema));
+        fs::write(&lock_path, wrong_schema.to_json_string()).expect("write wrong-schema lock");
+        let report_err = render_lock_specs_report(&ws, &lock_path)
+            .expect_err("unsupported schema must not report");
+        assert!(report_err.contains("unsupported schema 'anneal.spec-lock.v0'"), "{report_err}");
         let _ = fs::remove_dir_all(&ws);
 
         let verify_report = render_verification_report(&VerificationReport {
