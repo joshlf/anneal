@@ -24582,8 +24582,53 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   anneal_extCall_boundary
   wbAddrOfState
   w3_deref_oob_ub
+  w3_deref_type_pun_returns
+  w3_storage_revive_stale_deref_ub
+  derefMisalignedEntryBody
   w3_deref_misaligned_ub
+  derefOobWriteEntryBody
+  ptrOffsetNegOobEntryBody
+  invalidBoolPtrDerefEntryBody
+  w3_deref_oob_write_ub
+  w3_ptr_offset_neg_before_start_ub
+  w3_invalid_bool_ptr_deref_ub
+  ptrOffsetStrideEntryBody
+  w3_ptr_offset_stride_read_returns
+  retCopyFullBytesEntryBody
+  w6_copy_nonoverlapping_full_bytes_returns
+  copyRawPtrDerefEntryBody
+  w6_copy_nonoverlapping_rawPtr_tyId80_boundary
+  invalidBoolRefEntryBody
   w4_invalid_bool_ref_read_ub
+  unionValReturnBody
+  w2_union_return
+  unionOverlayPunBody
+  w2_union_overlay_type_punning_returns
+  w4_storage_dead_protected_ub
+  unwindLeafBody
+  unwindMidBody
+  unwindCatchRootBody
+  w5_unwind_cleanup_returns
+  unwindUnreachableRootBody
+  w5_unwind_unreachable_ub
+  unwindPastRootBody
+  w5_unwind_root_panic_vs_ub_divergence
+  indirectCallFiveBody
+  w5_indirect_fnPtr_call_returns
+  UnionRetRel
+  StepRelUnionReturnLM2_4
+  step_terminator_return_union_lm2_4_simulation
+  step_terminator_return_wellTypedUnion_lm2_4_simulation
+  StepRelUnionReturnLM2_4.toLockstep
+  stepClosedSim_of_stepRelLM2_4_unionReturn
+  StepObsRelLM3_2.toLockstep
+  stepClosedSim_of_stepObsRelLM3_2
+  StepObsRelLM3_2Tree.toLockstep
+  stepClosedSim_of_stepObsRelLM3_2Tree
+  UnwindingStateRel.frames_ne_empty
+  MiriUnwindSteps.toMiriPath_ok
+  MiriUnwindSteps.toMiriOutcome_error
+  treeBorrowsStateRel_entry
   step_assign_pairField0_simulation_ext
 
 /-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
@@ -24607,23 +24652,117 @@ example {body : CapturedMir} {s sₙ sᵣ sₖ : MachineState}
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
-    (∃ s₄ m₄,
-      StateRelLM3_1 Witness.lm31DerefOobRealBody s₄ m₄
-        [rawPtrAllocMapEntry Witness.lm31DerefOobRealBody.localDecls
-          Witness.lm31DerefOobRealBody.layouts .not 1 1 Witness.lm31AllocId1] ∧
-      AgreeUB Witness.lm31DerefOobRealBody (annealMiriHooks Witness.lm31DerefOobRealBody) s₄ m₄) ∧
-    (∃ s₄ m₄,
-      StateRelLM3_1 Witness.lm31DerefMisalignedRealBody s₄ m₄
-        [rawPtrAllocMapEntry Witness.lm31DerefMisalignedRealBody.localDecls
-          Witness.lm31DerefMisalignedRealBody.layouts .not 1 1 Witness.lm31AllocId1] ∧
-      get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 1, offsetBytes := 2 } 8)) ∧
-      AgreeUB Witness.lm31DerefMisalignedRealBody
-        (annealMiriHooks Witness.lm31DerefMisalignedRealBody) s₄ m₄) ∧
-    AgreeUB Witness.lm32InvalidBoolReadBody (annealMiriHooks Witness.lm32InvalidBoolReadBody)
-      (Witness.mkPre4AnnealLM32 Witness.lm32InvalidBoolReadBody (.init (.scalar ⟨2, 1⟩)))
-      (Witness.mkPre4MiriLM32 Witness.lm32InvalidBoolReadBody Witness.boolTyLM32
-        Witness.lm32MlsU8Two) :=
-  ⟨w3_deref_oob_ub, w3_deref_misaligned_ub, w4_invalid_bool_ref_read_ub⟩
+    AgreeUB Witness.lm31OffsetDerefBody (annealMiriHooks Witness.lm31OffsetDerefBody)
+      (initMachineState Witness.lm31OffsetDerefBody [])
+      (miriEntryState Witness.lm31OffsetDerefBody) ∧
+    AgreeUB derefMisalignedEntryBody (annealMiriHooks derefMisalignedEntryBody)
+      (initMachineState derefMisalignedEntryBody [])
+      (miriEntryState derefMisalignedEntryBody) ∧
+    AgreeUB derefOobWriteEntryBody (annealMiriHooks derefOobWriteEntryBody)
+      (initMachineState derefOobWriteEntryBody [])
+      (miriEntryState derefOobWriteEntryBody) ∧
+    AgreeUB ptrOffsetNegOobEntryBody (annealMiriHooks ptrOffsetNegOobEntryBody)
+      (initMachineState ptrOffsetNegOobEntryBody [])
+      (miriEntryState ptrOffsetNegOobEntryBody) ∧
+    AgreeUB invalidBoolPtrDerefEntryBody (annealMiriHooks invalidBoolPtrDerefEntryBody)
+      (initMachineState invalidBoolPtrDerefEntryBody [])
+      (miriEntryState invalidBoolPtrDerefEntryBody) ∧
+    AgreeUB invalidBoolRefEntryBody (annealMiriHooks invalidBoolRefEntryBody)
+      (initMachineState invalidBoolRefEntryBody [])
+      (miriEntryState invalidBoolRefEntryBody) ∧
+    AgreeUB Witness.lm31ReviveBody (annealMiriHooks Witness.lm31ReviveBody)
+      (initMachineState Witness.lm31ReviveBody [])
+      (miriEntryState Witness.lm31ReviveBody) :=
+  ⟨w3_deref_oob_ub, w3_deref_misaligned_ub, w3_deref_oob_write_ub,
+   w3_ptr_offset_neg_before_start_ub, w3_invalid_bool_ptr_deref_ub,
+   w4_invalid_bool_ref_read_ub, w3_storage_revive_stale_deref_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturns Witness.lm31TypePunBody (annealMiriHooks Witness.lm31TypePunBody)
+      (initMachineState Witness.lm31TypePunBody [])
+      (miriEntryState Witness.lm31TypePunBody)
+      (.scalar ⟨5, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 5)))) ∧
+    AgreeReturns ptrOffsetStrideEntryBody (annealMiriHooks ptrOffsetStrideEntryBody)
+      (initMachineState ptrOffsetStrideEntryBody [])
+      (miriEntryState ptrOffsetStrideEntryBody)
+      (.scalar ⟨300, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 300)))) ∧
+    (∃ mp0,
+      AgreeReturns unionValReturnBody
+        (.ofHooks (annealStepHooksLM2_4 unionValReturnBody.localDecls unionValReturnBody.layouts)
+          annealControlHooks)
+        (initMachineState unionValReturnBody [])
+        (miriEntryState unionValReturnBody)
+        (.aggregate 0 [.scalar ⟨5, 1⟩, .unit])
+        (.indirect mp0) ∧
+      UnionRetRel unionValReturnBody (.aggregate 0 [.scalar ⟨5, 1⟩, .unit]) (.indirect mp0)) ∧
+    (∃ imm0,
+      AgreeReturns unionOverlayPunBody
+        (.ofHooks (annealStepHooksLM2_4 unionOverlayPunBody.localDecls unionOverlayPunBody.layouts)
+          annealControlHooks)
+        (initMachineState unionOverlayPunBody [])
+        (miriEntryState unionOverlayPunBody)
+        (.scalar ⟨0x04030209, 4⟩)
+        (.immediate imm0) ∧
+      ImmediateRel Witness.lm24U32Ty Witness.lm24Layouts (.scalar ⟨0x04030209, 4⟩) imm0) ∧
+    AgreeReturnsBits unwindCatchRootBody
+      (callHooks unwindCatchRootBody [unwindMidBody, unwindLeafBody])
+      (initMachineStateWithCallees unwindCatchRootBody [] [unwindMidBody, unwindLeafBody])
+      (miriEntryState unwindCatchRootBody) 1 77 ∧
+    AgreeUB unwindUnreachableRootBody
+      (callHooks unwindUnreachableRootBody [unwindMidBody, unwindLeafBody])
+      (initMachineStateWithCallees unwindUnreachableRootBody [] [unwindMidBody, unwindLeafBody])
+      (miriEntryState unwindUnreachableRootBody) ∧
+    AgreeReturnsBits indirectCallFiveBody
+      (callHooks indirectCallFiveBody [fiveBody] [fiveFnPtrEntry])
+      (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody])
+      (miriEntryState indirectCallFiveBody) 1 5 :=
+  ⟨w3_deref_type_pun_returns, w3_ptr_offset_stride_read_returns, w2_union_return,
+   w2_union_overlay_type_punning_returns, w5_unwind_cleanup_returns,
+   w5_unwind_unreachable_ub, w5_indirect_fnPtr_call_returns⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns retCopyFullBytesEntryBody (annealMiriHooks retCopyFullBytesEntryBody)
+        (initMachineState retCopyFullBytesEntryBody [])
+        (miriEntryState retCopyFullBytesEntryBody)
+        (.scalar ⟨0x0102030405060708, 8⟩) (.immediate imm0) ∧
+      get? retCopyFullBytesEntryBody.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty retCopyFullBytesEntryBody.layouts
+        (.scalar ⟨0x0102030405060708, 8⟩) imm0) ∧
+    ((TreeSafe (mirCallTree copyRawPtrDerefEntryBody []) ∧
+      ∃ tr mem, ReachesRet (mirCallTree copyRawPtrDerefEntryBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+     (let b := WitnessLM4_2.copyStage1RawPtrCastLockstepBody
+      let s₀ := WitnessLM4_2.partialCopyLockstepAnnealPre b 0
+      let m₀ := WitnessLM4_2.partialCopyLockstepMiriPre b WitnessLM4_2.lm42ScalarZero
+      ∃ s₄ m₄,
+        AgreeReaches b (annealMiriHooks b) s₀ s₄ m₀ m₄ ∧
+        get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+        get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+        TreeSafe (mirTree b s₀) ∧
+        (∃ tr mem, ReachesRet (mirTree b s₀) tr
+          (.normal (.ptr { allocId := 1, offsetBytes := 0 } 8, mem))) ∧
+        (miriSystem (annealMiriHooks b)).ReachesOutcome m₀
+          (.unsupported (.unsupported "pointee of TyId 80 is not encoded")) ∧
+        ¬ (miriSystem (annealMiriHooks b)).Safe m₀)) ∧
+    (TreeSafe (mirTree unwindPastRootBody
+      (initMachineStateWithCallees unwindPastRootBody [] [unwindMidBody, unwindLeafBody])) ∧
+     (∃ e, (miriSystem (callHooks unwindPastRootBody [unwindMidBody, unwindLeafBody])).ReachesOutcome
+       (miriEntryState unwindPastRootBody) (.undefinedBehavior e)) ∧
+     ¬ (miriSystem (callHooks unwindPastRootBody [unwindMidBody, unwindLeafBody])).Safe
+       (miriEntryState unwindPastRootBody)) ∧
+    (∀ body : CapturedMir,
+      TreeBorrowsStateRel body (initMachineState body []) (miriEntryState body)) :=
+  ⟨w6_copy_nonoverlapping_full_bytes_returns,
+   w6_copy_nonoverlapping_rawPtr_tyId80_boundary,
+   w5_unwind_root_panic_vs_ub_divergence,
+   treeBorrowsStateRel_entry⟩
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in

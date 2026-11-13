@@ -16,6 +16,7 @@ import LeanMiriSpec.Correspondence.SimLM2_3
 import LeanMiriSpec.Correspondence.UnionLM2_4
 import LeanMiriSpec.Correspondence.SimLM2_4
 import LeanMiriSpec.Correspondence.RefLM3_2
+import LeanMiriSpec.Correspondence.SimLM3_2
 import LeanMiriSpec.Correspondence.CallLM4_1
 
 /-!
@@ -90,20 +91,26 @@ whole-program statements relating
    undefined behavior (`scalarFragmentExt_ubOnly`, `scalarFragment_outcomes`).
 6. Bridges from `StepObsRel`, `StepRel`, `StepRelLM2_2` with
    `StepRelStructReturnLM2_2` and scalar `StepRel` returns, `StepRelLM2_3` with
-   `StepRelEnumReturnLM2_3`, `StepRelLM2_4`, `StepRelLM3_1`, `StepObsRelLM3_1`
-   (raw-pointer returns, `SwitchInt`), `StepRelLM3_2`, `StepRelLM3_2Tree`, and
-   `StepRelMultiFrame` to `Lockstep`; the liftings
-   `stepClosedSim_of_stepRelLM2_2`, `stepClosedSim_of_stepRelLM2_3`,
+   `StepRelEnumReturnLM2_3`, `StepRelLM2_4` with `StepRelUnionReturnLM2_4`
+   (including single-field and Stage-1 `D13a` overlay union returns),
+   `StepRelLM3_1`, `StepObsRelLM3_1` (raw-pointer returns, `SwitchInt`),
+   `StepRelLM3_2`, `StepObsRelLM3_2`, `StepRelLM3_2Tree`, `StepObsRelLM3_2Tree`,
+   and `StepRelMultiFrame` to `Lockstep`, plus multi-step stack-unwinding
+   liftings (`MiriUnwindSteps.toMiriPath_ok`, `MiriUnwindSteps.toMiriOutcome_error`);
+   the liftings `stepClosedSim_of_stepRelLM2_2`, `stepClosedSim_of_stepRelLM2_3`,
    `stepClosedSim_of_stepRelLM2_3_enumReturn`, `stepClosedSim_of_stepRelLM2_4`,
-   `stepClosedSim_of_stepRelLM3_1`, `stepClosedSim_of_stepObsRelLM3_1`,
-   `stepClosedSim_of_stepRelLM3_2`, `stepClosedSim_of_stepRelLM3_2Tree`, and
+   `stepClosedSim_of_stepRelLM2_4_unionReturn`, `stepClosedSim_of_stepRelLM3_1`,
+   `stepClosedSim_of_stepObsRelLM3_1`, `stepClosedSim_of_stepRelLM3_2`,
+   `stepClosedSim_of_stepObsRelLM3_2`, `stepClosedSim_of_stepRelLM3_2Tree`,
+   `stepClosedSim_of_stepObsRelLM3_2Tree`, and
    `stepClosedSim_of_stepRelMultiFrame` turn any step-closed fragment of those
    relations into the whole-program theorems; and the entry pair is related by
    every relation (`stateRel_entry`, `stateRelLM2_2_entry`,
    `stateRelLM2_2_entry_env` for every struct environment and allocation
    budget, `stateRelLM2_3_entry` and `stateRelLM2_3_entry_of_budget`,
    `stateRelLM2_4_entry`, `stateRelLM3_1_entry`, `stateRelLM3_2_entry`,
-   `stateRelLM3_2Tree_entry`, `multiFrameStateRel_entry`).
+   `stateRelLM3_2Tree_entry`, `treeBorrowsStateRel_entry`,
+   `multiFrameStateRel_entry`).
 
 ## Correspondence Scope & Divergence Ledger (Stage-1 `Trusted`)
 
@@ -126,39 +133,74 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   prefixes, uninitialized bytes, active fields `f < n`) and in-bounds array
   `Subslice` projections (`evalProjection_subslice_simulation`,
   `step_subslice_assign_simulation`). Stage-1 upgrades: projected field writes
-  into uninitialized unions, sibling (type-punning) field reads, and nonzero-field
-  writes, including the raw-byte overlays of narrower writes
-  (`UnionLocalRel.unionOverlay`), step in lockstep
+  into uninitialized unions, sibling (type-punning) field reads, nonzero-field
+  writes, narrower projected writes splicing raw-byte overlays
+  (`UnionLocalRel.unionOverlay`, `step_union_narrower_field_write_simulation`,
+  `step_union_overlay_field_read_simulation`), and union-valued root returns
+  (`step_terminator_return_union_lm2_4_simulation`; whole-program
+  `MiriDiffWitnesses.w2_union_overlay_type_punning_returns` and
+  `MiriDiffWitnesses.w2_union_return`) step in lockstep
   (`step_union_field_write_uninit_simulation`,
   `step_union_type_punning_read_simulation`,
   `step_union_nonzero_field_write_simulation`).
-* `LM-3.1` raw pointers (`&raw`, `*ptr`, `StorageDead` use-after-free, and
-  `Offset` at every primitive stride, `step_binOp_offset_stride_simulation`).
-  Stage-1 upgrades: out-of-bounds, misaligned, null, and invalid-`bool` raw-pointer
-  dereferences are undefined behavior in both machines
-  (`step_deref_oob_simulation`, `step_deref_misaligned_simulation`,
-  `step_rawPtr_deref_null_simulation`, `step_deref_invalid_bool_simulation`;
-  whole-program `MiriDiffWitnesses.w3_deref_oob_ub` and
-  `MiriDiffWitnesses.w3_deref_misaligned_ub`, the former `known_anneal_bug`
-  ratchets `ub_ptr_offset_oob_read` and `ub_unaligned_ptr_read_u32`).
-* `LM-3.2` references and the Tree Borrows hierarchy. Stage-1 upgrades: reborrows
-  of dangling safe references and invalid scalars read through safe references
-  are undefined behavior in both machines
+* `LM-3.1` raw pointers (`&raw` on locals and `*ptr` deref reborrows, `*ptr`,
+  `PlaceMention(*ptr)`, `StorageDead` use-after-free and revival, `PtrToPtr`,
+  `PtrMetadata`, relational comparisons in same-allocation, `< 64` KiB
+  cross-local `Eq`/`Ne`, and low `< 2 ^ 32` integer-vs-live regimes, and
+  `Offset` at every primitive stride including zero-count offsets and negative
+  `isize` deltas, `step_binOp_offset_stride_simulation`,
+  `step_mir_lm3_1_state_simulation`). Stage-1 upgrades: out-of-bounds reads and
+  writes, misaligned reads and writes, null, invalid-`bool` / invalid-`char`
+  dereferences, and negative out-of-bounds `Offset` are undefined behavior in
+  both machines (`step_deref_oob_simulation`, `step_deref_write_oob_simulation`,
+  `step_deref_misaligned_simulation`, `step_rawPtr_deref_null_simulation`,
+  `step_deref_invalid_bool_simulation`,
+  `step_binOp_offset_neg_oob_ub_simulation`; from-entry whole-program
+  `MiriDiffWitnesses.w3_deref_oob_ub`, `MiriDiffWitnesses.w3_deref_oob_write_ub`,
+  `MiriDiffWitnesses.w3_deref_misaligned_ub`,
+  `MiriDiffWitnesses.w3_ptr_offset_neg_before_start_ub`,
+  `MiriDiffWitnesses.w3_invalid_bool_ptr_deref_ub`, and
+  `MiriDiffWitnesses.w3_ptr_offset_stride_read_returns`, covering the former
+  `known_anneal_bug` ratchets `ub_ptr_offset_oob_read`,
+  `ub_ptr_offset_oob_write`, `ub_unaligned_ptr_read_u32`,
+  `ub_ptr_offset_negative_before_start`, `ub_transmute_invalid_bool_through_ptr`,
+  and `pass_ptr_offset_within_array`).
+* `LM-3.2` references and the Tree Borrows hierarchy (`step_mir_lm3_2_state_simulation`,
+  `step_mir_lm3_2_tree_state_simulation`). Stage-1 upgrades: reborrows of
+  dangling safe references and invalid scalars read through safe references are
+  undefined behavior in both machines
   (`evalRvalue_reborrow_safeRef_dangling_simulation`,
-  `step_safeRef_deref_read_invalid_scalar_simulation`; whole-program
+  `step_safeRef_deref_read_invalid_scalar_simulation`; from-entry whole-program
   `MiriDiffWitnesses.w4_invalid_bool_ref_read_ub`). `LM-3.3` 6-state Tree Borrows
-  (`I-10`, `I-11`, protectors) at the level of
-  `Tree.NormalTreeState.performAccess`.
+  (`I-10`, `I-11`, protectors, and `StorageDead` protector UB vs. unprotected
+  local-borrow disable `sim_lm3_3_storage_dead_and_live_protector_step`) at the
+  level of `Tree.NormalTreeState.performAccess` and `TreeBorrowsRel`.
 * `LM-4.1` multi-frame `Call` / `Return` with `CallId` protectors and
-  `GlobalState.endCall` (`StepRelMultiFrame`), over Stage-1's linked callees.
+  `GlobalState.endCall` (`StepRelMultiFrame`), projected `Drop`
+  (`step_terminator_drop_projected_simulation`), multi-frame stack unwinding
+  across `.continue_` frames to `.cleanup` landing pads or `.unreachable` UB
+  (`step_terminator_unwindResume_callee_simulation`,
+  `step_terminator_unwindResume_multiFrame_simulation`,
+  `step_terminator_call_linked_panic_unwind_simulation`), diverging calls
+  (`step_terminator_call_diverging_simulation`), non-constant `FnDef` local calls,
+  and `ReifyFnPointer` + indirect `FnPtr` calls
+  (`step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation`,
+  `step_terminator_call_indirect_fnPtr_move_simulation`), with from-entry
+  whole-program witnesses `MiriDiffWitnesses.w5_unwind_cleanup_returns`,
+  `MiriDiffWitnesses.w5_unwind_unreachable_ub`, and
+  `MiriDiffWitnesses.w5_indirect_fnPtr_call_returns`.
 * `LM-4.2` over Stage-1: `Assume` (`step_intrinsic_assume_simulation`),
   `exact_div` (`call_intrinsic_exact_div_simulation`), bit and saturating integer
   intrinsics (`call_intrinsic_bitops_simulation`), single-element `CopyNonOverlapping`
   between same-typed scalar locals (`step_intrinsic_copyNonOverlapping_stage1_simulation`)
-  and full-local multi-element copies between distinct integer locals of equal width
-  (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`),
-  and `arith_offset` on provenance-carrying raw pointers
-  (`call_intrinsic_arithOffset_stage1_simulation`).
+  and full-local multi-element `copyViaBytes` copies between distinct integer
+  locals of equal width
+  (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`;
+  from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_full_bytes_returns`),
+  Stage-1 provenance preservation across raw-pointer `CopyNonOverlapping`
+  (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
+  `encodeUntypedValueToBytes_ptr_decode_roundtrip`), and `arith_offset` on
+  provenance-carrying raw pointers (`call_intrinsic_arithOffset_stage1_simulation`).
 
 Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
 
@@ -170,12 +212,26 @@ Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
   `BorrowEntry.targetLocal` is not scoped by frame, so a callee borrow survives
   the return and aliases caller locals, whereas `Stack.cleanupStackFrame`
   deallocates the callee's locals.
-* `H3` (`canonical_drop_no_glue_preserves_local_divergence`): Anneal's `Drop`
-  deinitializes the dropped local; canonical `lean-miri` treats `Drop` without
-  glue as `goToBlock` and keeps the value.
+* `H3` (`canonical_drop_no_glue_preserves_local_divergence`,
+  `step_terminator_drop_projected_uninit_divergence`): Anneal's `Drop`
+  deinitializes an unprojected local and validates projected `Drop` initialization;
+  canonical `lean-miri` treats `Drop` without glue as `goToBlock` and keeps the
+  value.
 * `H1` (`wit_lm4_1_zst_unit_return_simulation`): a zero-sized `_0` returns as
   `.init .unit` in Anneal and as `.live (.immediate .uninit)` in `lean-miri`
   (`RemoveZsts`), a representation difference the relations absorb.
+* `LM-4.1`: root-frame `UnwindResume` halts with `.retOutcome .panic` (`TreeSafe`)
+  in Stage-1 Anneal while `lean-miri` reports undefined behavior
+  (`step_terminator_unwindResume_root_panic_vs_ub_divergence`,
+  `MiriDiffWitnesses.w5_unwind_root_panic_vs_ub_divergence`); `UnwindTerminate`
+  aborts directly in Stage-1 while canonical `lean-miri` without linked `core`
+  reports `.unsupported` (`step_terminator_unwindTerminate_abort_vs_unsupported`);
+  Stage-1 ignores `FnAbi.canUnwind` when unwinding out of a nounwind callee
+  (`wit_lm4_1_nounwind_callee_unwind_divergence`); and indirect `FnPtr` calls
+  across `unsafe`-to-safe or `LayoutCompat`-only (`usize` vs. `u64`) signatures
+  fault in Stage-1 while stepping in `lean-miri`
+  (`step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`,
+  `step_terminator_call_indirect_layoutCompat_fnPtr_divergence`).
 * `LM-1.4` (`annealStepHooks_storageDead_returnPlace`): `StorageDead(_0)` on
   the return place fails in `lean-miri` (as in rustc) with
   `StackError.cannotMakeReturnPlaceDead`, a blocked (non-UB) outcome, so the
@@ -201,24 +257,36 @@ Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
   (`step_union_self_copy_overlap_divergence`,
   `step_union_copy_indirect_uninit_divergence`,
   `step_union_aggregate_smaller_overwrite_divergence`).
-* `LM-3.1`: exposed-provenance casts and raw-pointer comparisons
-  (`step_cast_with_exposed_provenance_divergence`,
-  `step_rawPtr_cmp_ptr_divergence`).
-* `LM-3.2`: reborrows of integer-valued raw pointers
-  (`evalRvalue_reborrow_rawPtr_int_divergence`) and dangling-reference copies,
-  which `lean-miri` validates eagerly
+* `LM-3.1`: exposed-provenance casts, cross-local relational ordering, `≥ 64` KiB
+  page-wrapping offsets, `≥ 2 ^ 32` scalar-pointer thresholds, and `Offset` on
+  disabled live tags (`step_cast_with_exposed_provenance_divergence`,
+  `step_rawPtr_cmp_ptr_divergence`,
+  `wit_lm3_1_d12_cross_local_order_divergence_real_steps`,
+  `wit_lm3_1_d12_page_wrap_eq_divergence_real_steps`,
+  `wit_lm3_1_d12_scalar_threshold_divergence_real_steps`,
+  `step_binOp_offset_disabled_stride_divergence`).
+* `LM-3.2` / `LM-3.3`: reborrows of integer-valued raw pointers
+  (`evalRvalue_reborrow_rawPtr_int_divergence`), dangling-reference copies
+  validated eagerly by `lean-miri`
   (`step_safeRef_copy_dangling_validity_divergence`,
-  `step_safeRef_use_dangling_post_validity_divergence`).
+  `step_safeRef_use_dangling_post_validity_divergence`), and `StorageDead` on a
+  local carrying a protected `Cell` borrow
+  (`sim_lm3_3_storage_dead_protected_cell_divergence`).
 * `LM-4.2` (Stage-1 `Trusted` behavior that `lean-miri/lean/**` cannot change):
   * `CopyNonOverlapping` from an uninitialized source and through a frozen
     borrow (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
-    `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), and Stage-1's
+    `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1's
     acceptance of zero-count misaligned copies, missing bounds check on distinct
     scalar locals (out-of-bounds acceptance, partial-copy clobbering, cross-type
     copies), and rejection of same-tag disjoint ranges (`WitLM4_2.lean` §6, §7,
-    §14, §15);
+    §14, §15), plus the `TyId 80` `lean-miri` encoding boundary on pointer-valued
+    `CopyNonOverlapping` (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`,
+    `MiriDiffWitnesses.w6_copy_nonoverlapping_rawPtr_tyId80_boundary`);
   * `arith_offset` on a provenance-free scalar pointer
-    (`call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`);
+    (`call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`), and non-canonical
+    offset aliases (`core::intrinsics::wrapping_offset`, `std::intrinsics::*`)
+    routed by Stage-1 to `MirStepNode.extCall`
+    (`stepMirFn_stage1_std_offset_alias_extCall`);
   * the Stage-1 external-call boundary: Stage-1 hands `write_bytes`,
     `rotate_left`, and `rotate_right` to the environment (`MirStepNode.extCall`,
     `stepMirFn_stage1_unmodeled_intrinsic_extCall`,
@@ -262,9 +330,14 @@ Return correspondence: the certified single-frame root-return steps are
 versions) for a sized immediate `_0`, `step_return_scalar_lm2_3_simulation`
 (`LM-2.3`) and `step_terminator_return_lm2_4_simulation` (`LM-2.4`, with live
 union locals) for a scalar `_0`, `step_terminator_return_rawPtr_lm3_1_simulation`
-for a raw-pointer `_0` (`StepObsRelLM3_1`, `PtrRetRel`), and the `LM-2.2` /
-`LM-2.3` aggregate returns; a zero-sized `()` root return is certified only
-for the `LM-4.1` interpreter (`wit_lm4_1_zst_unit_return_simulation`).
+for a raw-pointer `_0` (`StepObsRelLM3_1`, `PtrRetRel`),
+`step_terminator_goto_return_lm3_2_simulation` /
+`step_terminator_goto_return_tree_simulation` for a safe-reference `_0`
+(`StepObsRelLM3_2`, `StepObsRelLM3_2Tree`, `RefRetRel`), and the `LM-2.2` struct,
+`LM-2.3` enum, and `LM-2.4` union (`step_terminator_return_union_lm2_4_simulation`,
+`StepRelUnionReturnLM2_4`, `UnionRetRel`) aggregate returns; a zero-sized `()`
+root return is certified for the `LM-4.1` interpreter
+(`wit_lm4_1_zst_unit_return_simulation`).
 
 Further boundaries of the whole-program agreement:
 
@@ -5098,6 +5171,230 @@ theorem stepClosedSim_of_stepRelLM2_4 {body : CapturedMir}
   · exact StepRel.toLockstepRoot hstep fun s' m' hm hrel' =>
       ⟨hrel'.toLM2_4, hpres s' m' hm hrel'.toLM2_4⟩
 
+/-- Return relation for union-valued `_0` (`LM-2.4`): `lean-miri` returns an
+indirect `MemPlace` `mp0` related to Anneal's returned union value `retVal`
+by `UnionLocalRel` (covering single-active-field unions `UnionLocalRel.union`,
+Stage-1 `D13a` raw-byte-overlay unions `UnionLocalRel.unionOverlay`, and
+`MemPlaceRel`-backed indirect values). -/
+def UnionRetRel (body : CapturedMir) (retVal : Value)
+    (v : Miri.Interpreter.Operand AnnealProv) : Prop :=
+  ∃ decl0 mach mp0,
+    get? body.localDecls 0 = some decl0 ∧
+    v = .indirect mp0 ∧
+    UnionLocalRel mach decl0 body.layouts (.init retVal) ⟨.live (.indirect mp0), none⟩
+
+/-- One-step root-return correspondence under `StateRelLM2_4` covering both
+immediate returns (`retRootImm`) and memory-backed union returns
+(`retRootUnion`, including `UnionLocalRel.union` and Stage-1
+`UnionLocalRel.unionOverlay`), as well as dead or uninitialized `_0` undefined
+behavior (`ub`). -/
+inductive StepRelUnionReturnLM2_4
+    (body : CapturedMir)
+    (m : AnnealStepState) :
+    MirStepNode →
+    Miri.Interpreter.StepResult AnnealStepState Bool →
+    Prop where
+  | retRootImm (decl0 : LocalDecl) (retVal : Value)
+      (imm0 : Miri.Interpreter.Immediate AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) →
+      ImmediateRel decl0.ty body.layouts retVal imm0 →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepRelUnionReturnLM2_4 body m
+        (MirStepNode.retNormal retVal mem') (m', .ok true)
+  | retRootUnion (decl0 : LocalDecl) (retVal : Value)
+      (mp0 : Miri.Interpreter.MemPlace AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      annealControlHooks.returnOperand () m = (m, .ok (.indirect mp0)) →
+      UnionLocalRel m'.machine decl0 body.layouts (.init retVal) ⟨.live (.indirect mp0), none⟩ →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepRelUnionReturnLM2_4 body m
+        (MirStepNode.retNormal retVal mem') (m', .ok true)
+  | ub (m' : AnnealStepState) (msg : String) :
+      StepRelUnionReturnLM2_4 body m
+        (MirStepNode.fail .ub) (m', .error (.undefinedBehavior msg))
+
+/-- **`LM-2.4` union and immediate root return** (`StateRelLM2_4`,
+`annealStepHooksLM2_4`): root-frame `Return` steps both machines in lockstep
+(`StepRelUnionReturnLM2_4`) when `_0` is a union (`UnionLocalRel.union` or
+Stage-1 `UnionLocalRel.unionOverlay`), a sized immediate, or dead /
+uninitialized immediate, provided `_0` is not an uninitialized indirect local. -/
+theorem step_terminator_return_union_lm2_4_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : LocalDecl}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (hnot_uninit_ind :
+      ¬ (get? s.frame.locals 0 = some .uninit ∧
+          ∃ topFrame mp0 c0,
+            m.stack.frames = #[topFrame] ∧
+            topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
+    StepRelUnionReturnLM2_4 body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hcal, hstack, hbor, hprot, hcaller, _⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_at_terminator_lm2_4 hframes hframe.body_eq hframe.location_eq hbb hstmt_none]
+  obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, huloc0⟩ := hframe.lookup_local hdecl0
+  have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
+  have hctrl_eq :
+      (annealTerminatorHooksLM2_2 body.localDecls body.layouts).toControlHooks =
+        annealControlHooks := rfl
+  unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+  rw [hret, hstack, hctrl_eq, hslot0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  cases huloc0 with
+  | base _ _ hloc0 =>
+    cases hloc0 with
+    | dead _ _ =>
+      rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+        hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_dead hframes hget0)]
+      exact .ub _ _
+    | immediate _ imm0 _ _ hval =>
+      rcases hval with ⟨rfl, rfl⟩ | ⟨retVal, rfl, himmRel⟩
+      · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+          hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
+        exact .ub _ _
+      · cases himmRel with
+        | unit hzero => exact False.elim (hsz0 hzero)
+        | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
+          have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
+          rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+            hframe.location_eq hbb hcleanup hretCont hop0
+            (annealControlHooks_popFrame_singleton hframes)
+            (annealControlHooks_copyReturn_empty _ hretPlace)
+            (annealControlHooks_cleanupFrame_eq false topFrame _)]
+          exact .retRootImm decl0 _ _ s.memory _ hdecl0 hop0
+            (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc) rfl
+        | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
+          have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
+          rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+            hframe.location_eq hbb hcleanup hretCont hop0
+            (annealControlHooks_popFrame_singleton hframes)
+            (annealControlHooks_copyReturn_empty _ hretPlace)
+            (annealControlHooks_cleanupFrame_eq false topFrame _)]
+          exact .retRootImm decl0 _ _ s.memory _ hdecl0 hop0
+            (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair) rfl
+    | indirect _ mp0 c0 _ hne_dead hmem =>
+      cases slot0 with
+      | dead => exact False.elim (hne_dead rfl)
+      | uninit =>
+        exact False.elim (hnot_uninit_ind ⟨hslot0, topFrame, mp0, c0, hframes, hmls0⟩)
+      | init retVal =>
+        have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
+        rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+          hframe.location_eq hbb hcleanup hretCont hop0
+          (annealControlHooks_popFrame_singleton hframes)
+          (annealControlHooks_copyReturn_empty _ hretPlace)
+          (annealControlHooks_cleanupFrame_eq false topFrame _)]
+        exact .retRootUnion decl0 retVal mp0 s.memory _ hdecl0 hop0
+          (.base _ _ (.indirect (.init retVal) mp0 none (fun _ h => nomatch h)
+            (fun h => nomatch h) hmem)) rfl
+  | union S n f f0Ty sc mp0 _ _ hwt hfields hf hmem =>
+    have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
+    rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+      hframe.location_eq hbb hcleanup hretCont hop0
+      (annealControlHooks_popFrame_singleton hframes)
+      (annealControlHooks_copyReturn_empty _ hretPlace)
+      (annealControlHooks_cleanupFrame_eq false topFrame _)]
+    exact .retRootUnion decl0 _ mp0 s.memory _ hdecl0 hop0
+      (.union S n f f0Ty sc mp0 none (fun _ h => nomatch h) hwt hfields hf hmem) rfl
+  | unionOverlay S n j f0Ty sc sc_low mergedBytes mp0 _ _ hwt hfields hspec hmem =>
+    have hop0 := annealControlHooks_returnOperand_indirect hframes hget0
+    rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+      hframe.location_eq hbb hcleanup hretCont hop0
+      (annealControlHooks_popFrame_singleton hframes)
+      (annealControlHooks_copyReturn_empty _ hretPlace)
+      (annealControlHooks_cleanupFrame_eq false topFrame _)]
+    exact .retRootUnion decl0 _ mp0 s.memory _ hdecl0 hop0
+      (.unionOverlay S n j f0Ty sc sc_low mergedBytes mp0 none (fun _ h => nomatch h)
+        hwt hfields hspec hmem) rfl
+
+/-- Specialization of `step_terminator_return_union_lm2_4_simulation` when `_0`
+has a `WellTypedUnionTy` layout (automatically non-ZST). -/
+theorem step_terminator_return_wellTypedUnion_lm2_4_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : LocalDecl} {S : Nat}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
+    (hnot_uninit_ind :
+      ¬ (get? s.frame.locals 0 = some .uninit ∧
+          ∃ topFrame mp0 c0,
+            m.stack.frames = #[topFrame] ∧
+            topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
+    StepRelUnionReturnLM2_4 body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) := by
+  refine step_terminator_return_union_lm2_4_simulation hstate hphase hbb hstmt_none hstmt_len
+    hcleanup hret hdecl0 ?_ hnot_uninit_ind
+  rw [hwt0.size_eq]
+  rcases hwt0.size_valid with rfl | rfl | rfl | rfl | rfl <;> decide
+
+/-- `StepRelUnionReturnLM2_4` as `Lockstep` for `ImmediateRetRel ∨ UnionRetRel`. -/
+theorem StepRelUnionReturnLM2_4.toLockstep {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Inv : MachineState → AnnealStepState → Prop}
+    (h : StepRelUnionReturnLM2_4 body m aRes mRes) :
+    Lockstep (rootHooks core) Inv
+      (fun r v => ImmediateRetRel body r v ∨ UnionRetRel body r v) m aRes mRes := by
+  cases h with
+  | retRootImm decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.immediate imm0) rfl (retRoot_operand hop)
+      (Or.inl ⟨decl0, imm0, hdecl, rfl, himm⟩)
+  | retRootUnion decl0 retVal mp0 mem' m' hdecl hop huloc hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.indirect mp0) rfl (by
+      change (annealControlHooks.returnOperand () m).2 = _; rw [hop])
+      (Or.inr ⟨decl0, m.machine, mp0, hdecl, rfl, huloc⟩)
+  | ub m' msg => exact .fault .ub m' (.undefinedBehavior msg) (ub_faultAgrees msg)
+
+/-- `LM-2.4` lifting with union-valued root returns: intra-frame steps through
+`StepRelLM2_4` or `StepRel`, and root returns (both immediate and union-valued)
+through `StepRelUnionReturnLM2_4`. -/
+theorem stepClosedSim_of_stepRelLM2_4_unionReturn {body : CapturedMir}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m, StateRelLM2_4 body s m → Frag s m →
+      (((StepRelLM2_4 body m (stepMirFn body s) (core () m) ∨
+          StepRel body m (stepMirFn body s) (core () m)) ∧
+        ∀ s' m', core () m = (m', .ok true) → StateRelLM2_4 body s' m' → Frag s' m') ∨
+       StepRelUnionReturnLM2_4 body m (stepMirFn body s) (core () m))) :
+    StepClosedSim body (rootHooks core)
+      (fun s m => StateRelLM2_4 body s m ∧ Frag s m)
+      (fun r v => ImmediateRetRel body r v ∨ UnionRetRel body r v) := by
+  refine ⟨fun s m ⟨hrel, hfrag⟩ => ?_⟩
+  rcases h s m hrel hfrag with ⟨hstep | hstep, hpres⟩ | hret
+  · exact Lockstep.mono
+      (StepRelLM2_4.toLockstep hstep fun s' m' hm hrel' => ⟨hrel', hpres s' m' hm hrel'⟩)
+      (fun _ _ h => h) (fun _ _ h => Or.inl h)
+  · exact Lockstep.mono
+      (StepRel.toLockstepRoot hstep fun s' m' hm hrel' =>
+        ⟨hrel'.toLM2_4, hpres s' m' hm hrel'.toLM2_4⟩)
+      (fun _ _ h => h) (fun _ _ h => Or.inl h)
+  · exact StepRelUnionReturnLM2_4.toLockstep hret
+
 /-- `LM-3.2` lifting (`StateRelLM3_2`, any allocation map). -/
 theorem stepClosedSim_of_stepRelLM3_2 {body : CapturedMir}
     {Frag : MachineState → AnnealStepState → Prop}
@@ -5193,6 +5490,159 @@ theorem stepClosedSim_of_stepObsRelLM3_1 {body : CapturedMir}
     (StepObsRelLM3_1.toLockstep (Inv := fun s m => (∃ a, StateRelLM3_1 body s m a) ∧ Frag s m)
       hstep fun s' m' hm hrel' => ⟨⟨a', hrel'⟩, hpres s' m' hm hrel'⟩)
     (fun _ _ h => h) (fun _ _ h => ⟨a', h⟩)
+
+/-- `LM-3.2` `StepObsRelLM3_2` (safe-reference root returns and `SwitchInt`
+observations; the unified `step_mir_lm3_2_state_simulation`) as `Lockstep`. -/
+theorem StepObsRelLM3_2.toLockstep {body : CapturedMir} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {aRes : MirStepNode}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Inv : MachineState → AnnealStepState → Prop}
+    (h : StepObsRelLM3_2 body m allocMap aRes mRes)
+    (hinv : ∀ s' m', mRes = (m', .ok true) → StateRelLM3_2 body s' m' allocMap → Inv s' m') :
+    Lockstep (rootHooks core) Inv (RefRetRel body allocMap) m aRes mRes := by
+  cases h with
+  | emitStep obs s' m' hrel =>
+    obtain ⟨tf, hf, _⟩ := id hrel
+    exact .emitStep obs s' m' (hinv s' m' rfl hrel) (frames_ne_of_eq_singleton hf)
+  | retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.immediate imm0) rfl (retRoot_operand hop)
+      ⟨decl0, imm0, hdecl, rfl, himm⟩
+  | ub m' msg => exact .fault .ub m' (.undefinedBehavior msg) (ub_faultAgrees msg)
+
+/-- `LM-3.2` lifting through `StepObsRelLM3_2` (any allocation map), covering
+safe-reference root returns and `SwitchInt`. -/
+theorem stepClosedSim_of_stepObsRelLM3_2 {body : CapturedMir}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m a, StateRelLM3_2 body s m a → Frag s m → ∃ a',
+      StepObsRelLM3_2 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2 body s' m' a' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_2 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, RefRetRel body a r v) := by
+  refine ⟨fun s m ⟨⟨a, hrel⟩, hfrag⟩ => ?_⟩
+  obtain ⟨a', hstep, hpres⟩ := h s m a hrel hfrag
+  exact Lockstep.mono
+    (StepObsRelLM3_2.toLockstep (Inv := fun s m => (∃ a, StateRelLM3_2 body s m a) ∧ Frag s m)
+      hstep fun s' m' hm hrel' => ⟨⟨a', hrel'⟩, hpres s' m' hm hrel'⟩)
+    (fun _ _ h => h) (fun _ _ h => ⟨a', h⟩)
+
+/-- `LM-3.2` / `LM-3.3` `StepObsRelLM3_2Tree` (safe-reference root returns and
+`SwitchInt` observations across parent/child reborrow trees; the unified
+`step_mir_lm3_2_tree_state_simulation`) as `Lockstep`. -/
+theorem StepObsRelLM3_2Tree.toLockstep {body : CapturedMir} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry} {aRes : MirStepNode}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Inv : MachineState → AnnealStepState → Prop}
+    (h : StepObsRelLM3_2Tree body m treeMap aRes mRes)
+    (hinv : ∀ s' m', mRes = (m', .ok true) → StateRelLM3_2Tree body s' m' treeMap → Inv s' m') :
+    Lockstep (rootHooks core) Inv
+      (RefRetRel body (treeMap.map ReborrowMapEntry.toAllocMapEntry)) m aRes mRes := by
+  cases h with
+  | emitStep obs s' m' hrel =>
+    obtain ⟨tf, hf, _⟩ := id hrel.erased_rel
+    exact .emitStep obs s' m' (hinv s' m' rfl hrel) (frames_ne_of_eq_singleton hf)
+  | retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.immediate imm0) rfl (retRoot_operand hop)
+      ⟨decl0, imm0, hdecl, rfl, himm⟩
+  | ub m' msg => exact .fault .ub m' (.undefinedBehavior msg) (ub_faultAgrees msg)
+
+/-- `LM-3.2` / `LM-3.3` lifting through `StepObsRelLM3_2Tree` (any reborrow
+tree), covering safe-reference root returns and `SwitchInt`. -/
+theorem stepClosedSim_of_stepObsRelLM3_2Tree {body : CapturedMir}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m t, StateRelLM3_2Tree body s m t → Frag s m → ∃ t',
+      StepObsRelLM3_2Tree body m t' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_2Tree body s' m' t' → Frag s' m') :
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ t, StateRelLM3_2Tree body s m t) ∧ Frag s m)
+      (fun r v => ∃ t : List ReborrowMapEntry,
+        RefRetRel body (t.map ReborrowMapEntry.toAllocMapEntry) r v) := by
+  refine ⟨fun s m ⟨⟨t, hrel⟩, hfrag⟩ => ?_⟩
+  obtain ⟨t', hstep, hpres⟩ := h s m t hrel hfrag
+  exact Lockstep.mono
+    (StepObsRelLM3_2Tree.toLockstep
+      (Inv := fun s m => (∃ t, StateRelLM3_2Tree body s m t) ∧ Frag s m)
+      hstep fun s' m' hm hrel' => ⟨⟨t', hrel'⟩, hpres s' m' hm hrel'⟩)
+    (fun _ _ h => h) (fun _ _ h => ⟨t', h⟩)
+
+/-- Every `UnwindingStateRel` intermediate state has a non-empty `lean-miri`
+call stack (`Array.push` onto the caller prefix). -/
+theorem UnwindingStateRel.frames_ne_empty
+    {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (h : UnwindingStateRel rootBody s m) :
+    m.stack.frames ≠ #[] := by
+  rcases h with ⟨_, _, _, _, rfl, _⟩
+  intro hemp
+  have hsz := congrArg Array.size hemp
+  simp at hsz
+
+/-- Lift a `k`-step `MiriUnwindSteps` trace that catches at a cleanup block
+(`m'.stack.frames ≠ #[]`, e.g. `MultiFrameStateRel.frames_ne_empty`) into a
+whole-program `MiriPath` under any `AnnealMiriHooks` `H` whose `coreStep` agrees
+with `annealStepHooksForState` at the initial and intermediate unwinding states. -/
+theorem MiriUnwindSteps.toMiriPath_ok
+    {rootBody : CapturedMir} {H : AnnealMiriHooks} {k : Nat}
+    {s : MachineState} {m m' : AnnealStepState}
+    (h : MiriUnwindSteps rootBody k s m (m', .ok true))
+    (hne : m'.stack.frames ≠ #[])
+    (hhooks : ∀ sᵢ mᵢ,
+      ((sᵢ = s ∧ mᵢ = m) ∨ UnwindingStateRel rootBody sᵢ mᵢ) →
+      H.coreStep () mᵢ =
+        Miri.Interpreter.Step.step (annealStepHooksForState rootBody sᵢ) () mᵢ) :
+    MiriPath H m m' := by
+  generalize hres : (m', (Except.ok true : Except Miri.Interpreter.StepError Bool)) = res at h
+  induction h with
+  | single s₀ m₀ m₁ out hstep =>
+    injection hres with hm hout
+    subst m' out
+    have hcore : H.coreStep () m₀ = (m₁, .ok true) := by
+      rw [hhooks s₀ m₀ (Or.inl ⟨rfl, rfl⟩)]; exact hstep
+    exact .step hcore hne (.refl m₁)
+  | cons s₀ s₁ m₀ m₁ _ _ hstep hunw _ ih =>
+    have hcore : H.coreStep () m₀ = (m₁, .ok true) := by
+      rw [hhooks s₀ m₀ (Or.inl ⟨rfl, rfl⟩)]; exact hstep
+    have hrest : MiriPath H m₁ m' :=
+      ih (fun sᵢ mᵢ hor => by
+        rcases hor with ⟨hs_eq, hm_eq⟩ | hu
+        · rw [hs_eq, hm_eq]; exact hhooks s₁ m₁ (Or.inr hunw)
+        · exact hhooks sᵢ mᵢ (Or.inr hu)) hres
+    exact .step hcore (UnwindingStateRel.frames_ne_empty hunw) hrest
+
+/-- Lift a `k`-step `MiriUnwindSteps` trace ending in `StepError` `e` (such as
+unwinding into `.unreachable` UB or unwinding past the root frame) into a
+`MiriPath` prefix plus whole-program `ReachesOutcome (classifyError e)` and
+`¬ Safe` in `miriSystem H`. -/
+theorem MiriUnwindSteps.toMiriOutcome_error
+    {rootBody : CapturedMir} {H : AnnealMiriHooks} {k : Nat}
+    {s : MachineState} {m m' : AnnealStepState} {e : Miri.Interpreter.StepError}
+    (h : MiriUnwindSteps rootBody k s m (m', .error e))
+    (hhooks : ∀ sᵢ mᵢ,
+      ((sᵢ = s ∧ mᵢ = m) ∨ UnwindingStateRel rootBody sᵢ mᵢ) →
+      H.coreStep () mᵢ =
+        Miri.Interpreter.Step.step (annealStepHooksForState rootBody sᵢ) () mᵢ) :
+    ∃ mₙ, MiriPath H m mₙ ∧ H.coreStep () mₙ = (m', .error e) ∧
+      (miriSystem H).ReachesOutcome m (classifyError e) ∧ ¬ (miriSystem H).Safe m := by
+  suffices haux : ∃ mₙ, MiriPath H m mₙ ∧ H.coreStep () mₙ = (m', .error e) by
+    obtain ⟨mₙ, hpath, herr⟩ := haux
+    have hout := miri_outcome_of_path_error hpath herr
+    exact ⟨mₙ, hpath, herr, hout.1, hout.2⟩
+  generalize hres : (m', (Except.error e : Except Miri.Interpreter.StepError Bool)) = res at h
+  induction h with
+  | single s₀ m₀ m₁ out hstep =>
+    injection hres with hm hout
+    subst m' out
+    refine ⟨m₀, .refl m₀, ?_⟩
+    rw [hhooks s₀ m₀ (Or.inl ⟨rfl, rfl⟩)]
+    exact hstep
+  | cons s₀ s₁ m₀ m₁ _ _ hstep hunw _ ih =>
+    have hcore : H.coreStep () m₀ = (m₁, .ok true) := by
+      rw [hhooks s₀ m₀ (Or.inl ⟨rfl, rfl⟩)]; exact hstep
+    obtain ⟨mₙ, hpath, herr⟩ := ih (fun sᵢ mᵢ hor => by
+      rcases hor with ⟨hs_eq, hm_eq⟩ | hu
+      · rw [hs_eq, hm_eq]; exact hhooks s₁ m₁ (Or.inr hunw)
+      · exact hhooks sᵢ mᵢ (Or.inr hu)) hres
+    exact ⟨mₙ, .step hcore (UnwindingStateRel.frames_ne_empty hunw) hpath, herr⟩
 
 /-! ### Entry states of the `LM-2` … `LM-4.1` relations
 
@@ -5307,6 +5757,10 @@ theorem stateRelLM3_2_entry (body : CapturedMir) :
 theorem stateRelLM3_2Tree_entry (body : CapturedMir) :
     StateRelLM3_2Tree body (initMachineState body []) (miriEntryState body) [] :=
   (stateRelLM3_2_entry body).toTree
+
+theorem treeBorrowsStateRel_entry (body : CapturedMir) :
+    TreeBorrowsStateRel body (initMachineState body []) (miriEntryState body) :=
+  (stateRel_entry body).toTreeBorrowsStateRel
 
 theorem multiFrameStateRel_entry (body : CapturedMir) :
     MultiFrameStateRel body (initMachineState body []) (miriEntryState body) :=

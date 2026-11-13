@@ -421,14 +421,25 @@ import LeanMiriSpec.Audit
   `runLoop_universal_simulation`, `treeSafe_iff_miriSafe`,
   `reachesUB_iff_miriReachesUB`, and `partialCorrect_iff_annealPostcondition`
   over Stage-1 `mirTree`, the unconditional closed fragment `InSafeScalarFragment`,
-  bridges from the `LM-1` … `LM-4.2` step relations, and the Stage-1 correspondence
-  scope and divergence ledger (`LM-4.3`).
+  bridges from the `LM-1` … `LM-4.2` step relations (including `StepRelUnionReturnLM2_4` /
+  `stepClosedSim_of_stepRelLM2_4_unionReturn`, `StepObsRelLM3_2` / `StepObsRelLM3_2Tree`,
+  `treeBorrowsStateRel_entry`, and `MiriUnwindSteps.toMiriPath_ok` /
+  `MiriUnwindSteps.toMiriOutcome_error`), and the Stage-1 correspondence scope and
+  divergence ledger (`LM-4.3`).
 * `LeanMiriSpec.Correspondence.MiriDiffWitnesses`: kernel-checked whole-program
   safe, partial-correctness, undefined-behavior, infinite-run, and divergence
-  witnesses across scalars, aggregates, raw pointers, Tree Borrows, calls, and
-  intrinsics, including Stage-1 lockstep upgrades (out-of-bounds and misaligned
-  raw-pointer reads, invalid `bool` reads through references) and the Stage-1
-  external-call boundary of `write_bytes` and `rotate_left` (`LM-4.3`).
+  witnesses across scalars, aggregates, unions (`w2_union_return`,
+  `w2_union_overlay_type_punning_returns`), raw pointers (from-entry Stage-1
+  `BinOp.Offset` stride `w3_ptr_offset_stride_read_returns`, narrowing type-pun
+  `w3_deref_type_pun_returns`, storage revive `w3_storage_revive_stale_deref_ub`,
+  and out-of-bounds / misaligned / negative-offset / invalid-`bool` deref UB),
+  references and Tree Borrows (`w4_invalid_bool_ref_read_ub`,
+  `w4_storage_dead_protected_ub`), multi-frame calls, unwinding, and indirect `FnPtr`
+  calls (`w5_unwind_cleanup_returns`, `w5_unwind_unreachable_ub`,
+  `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`), and
+  intrinsics (`w6_copy_nonoverlapping_full_bytes_returns`,
+  `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, and the Stage-1 external-call
+  boundary of `write_bytes` and `rotate_left`) (`LM-4.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
