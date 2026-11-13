@@ -19,12 +19,17 @@
 #   ratchet:
 #     1. Every test WITHOUT `known_anneal_bug` must agree 100% between Miri
 #        and Anneal (`TotalVerificationResult` for `pass`,
-#        `verifySafePanicMirPointBounded` for `panic`, and
-#        `refuteMirPointByStrictUB` for `ub`, which rejects `FailureKind.unsupported`).
+#        `verifySafePanicMirPointBounded` for `panic` (or
+#        `verifyModularSafePanicMirBounded` when the panic follows a call to a
+#        function that is not captured, such as the `core::fmt::Arguments`
+#        constructor behind `panic!("...")`), and `refuteMirPointByStrictUB`
+#        for `ub`, which rejects `FailureKind.unsupported`).
 #     2. Every test WITH `known_anneal_bug` is checked against its exact
 #        `observed_anneal_tag` in the Lean 4 kernel. When an Anneal bug is fixed,
 #        the `known_anneal_bug` theorem fails to type-check until the entry is
 #        removed from this manifest, ratcheting the open bug count down toward 0.
+#        The theorem for a `panic` test also requires that the modular
+#        safe-panic checker reject the test.
 
 schema_version = 1
 rustc_commit = "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
@@ -605,12 +610,6 @@ category = "control_flow_and_calls"
 upstream_path = "tests/panic/panic1.rs"
 miri_verdict = "panic"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:core::fmt::Arguments::<'a>::from_str"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "Explicit panic!(...) first calls core::fmt::Arguments::from_str, which Trusted MirSemantics does not model and the corpus crate does not capture, so evaluation stops at that external call before reaching the diverging core::panicking::panic_fmt call that evalCallTerminator models as an unwinding panic."
 
 [[tests]]
 name = "pass_nonzero_u32_transmute_roundtrip"

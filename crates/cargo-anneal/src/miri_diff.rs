@@ -31,6 +31,14 @@
 //!      below).
 //!    - `panic`: proved via `verifySafePanicMirPointBounded`
 //!      (`StatefulVerificationResult` with `post := False` and `¬ TotalClaim.holds`).
+//!      A test whose body calls a function that is neither captured nor
+//!      linked (such as the `core::fmt::Arguments` constructor that
+//!      `panic!("...")` calls before `core::panicking::panic_fmt`) is instead
+//!      proved via `verifyModularSafePanicMirBounded`
+//!      (`ModularVerificationResult` with `post := False` under a
+//!      frame-preserving rely contract on external calls, and
+//!      `¬ TotalClaim.holds`), because `StatefulClaim.holds` lets an external
+//!      call return a memory on which the caller can fault.
 //!    - `ub`: refuted via `refuteMirPointByStrictUB`
 //!      (`¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` from
 //!      `reachesStrictUBBounded = true`, which rejects `FailureKind.unsupported`),
@@ -41,7 +49,10 @@
 //!    `by rfl` in the Lean 4 kernel. As soon as an Anneal bug is fixed so that
 //!    Anneal agrees with Miri (in both tag and UB fault location), the
 //!    `known_anneal_bug_ratchet` theorem fails to type-check until the entry
-//!    is removed from `manifest.toml`.
+//!    is removed from `manifest.toml`. Because `evalMirDiffTagBounded` stops
+//!    at the first external call, the ratchet of a `panic` test also requires
+//!    `reachesModularSafePanicBounded ... = false`, so it fails as soon as a
+//!    modular certificate discharges the test.
 //!
 //! ## Linked Intra-Crate Callees
 //!
@@ -70,7 +81,7 @@ use crate::miri_oracle::{
     parse_anneal_probe_output,
 };
 use crate::obligations::{derive_item_module_suffix, module_suffix_to_rel_path};
-use crate::scaffold::{ScaffoldConfig, scaffold_workspace_with_config};
+use crate::scaffold::{ScaffoldConfig, extract_called_fn_defs, scaffold_workspace_with_config};
 use crate::{
     normalize_path_against, resolve_lake_binary, run_lake_verify,
     run_trusted_boundary_verify_audit,
@@ -275,7 +286,8 @@ pub struct MiriDiffReport {
     pub total_tests: usize,
     /// Number of `pass` tests verified via `TotalVerificationResult`.
     pub verified_pass_count: usize,
-    /// Number of `panic` tests verified via `verifySafePanicMirPointBounded`.
+    /// Number of `panic` tests verified via `verifySafePanicMirPointBounded`
+    /// (or its callee-linked form) or `verifyModularSafePanicMirBounded`.
     pub verified_panic_count: usize,
     /// Number of `ub` tests refuted via `refuteMirPointByStrictUB`.
     pub verified_strict_ub_count: usize,
@@ -283,6 +295,10 @@ pub struct MiriDiffReport {
     pub ratcheted_known_bug_count: usize,
     /// `Verify.<Crate>.<Item>` certificate modules audited by `TrustedBoundary`.
     pub audited_certificate_modules: Vec<String>,
+    /// `Verify.<Crate>.<Item>` modules of `panic` tests certified by a
+    /// `ModularVerificationResult` ([`MiriDiffPanicCertificate::Modular`])
+    /// rather than a `StatefulVerificationResult`, in manifest order.
+    pub modular_panic_certificate_modules: Vec<String>,
 }
 
 /// Load and parse `tests/miri-diff/manifest.toml` from `path`.
@@ -933,6 +949,27 @@ pub fn render_miri_diff_verify_module(
     render_miri_diff_verify_module_with_callees(crate_camel, def_id, entry, &[])
 }
 
+/// Certificate shape for a `panic` entry without a `known_anneal_bug`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiriDiffPanicCertificate {
+    /// `StatefulVerificationResult` with `post := False`, and
+    /// `¬ TotalClaim.holds`, from direct bounded evaluation
+    /// (`reachesPanicBounded`), which stops at the first uninterpreted
+    /// external call.
+    Stateful,
+    /// `ModularVerificationResult` with `post := False` under a
+    /// frame-preserving rely contract on external calls, and
+    /// `¬ TotalClaim.holds`, from `verifyModularSafePanicMirBounded`.
+    ///
+    /// An entry that panics after an uninterpreted external call (such as the
+    /// `core::fmt::Arguments` constructor that `panic!("...")` calls before
+    /// `core::panicking::panic_fmt`) needs this shape: `StatefulClaim.holds`
+    /// lets that call return any answer, including a memory with a corrupted
+    /// call frame on which the caller can fault, so it is false for such an
+    /// entry.
+    Modular,
+}
+
 /// Render the `.anneal/generated/Verify/<Crate>/<test.name>.lean` module for a
 /// single differential test entry, linking the captured intra-crate bodies
 /// `Mir.<suffix>.body` for every `suffix` in `helper_module_suffixes` as
@@ -952,17 +989,46 @@ pub fn render_miri_diff_verify_module(
 /// - `known_anneal_bug` ratchets evaluate the entry with the callees linked, so
 ///   a ratchet recorded before linking fails once linking fixes the bug.
 ///
+/// A `panic` entry gets the [`MiriDiffPanicCertificate::Stateful`] shape; use
+/// [`render_miri_diff_verify_module_with_panic_certificate`] to choose the
+/// shape.
+///
 /// Returns `(module_source, is_trusted_certificate_module)` where
 /// `is_trusted_certificate_module` is `true` for non-bug `pass` and `panic`
-/// entries whose `theorem verified` has head type `TotalVerificationResult` or
-/// `StatefulVerificationResult`. Returns an error for an invalid or duplicated
-/// callee suffix, or for a non-bug entry whose Miri verdict has no certificate
-/// shape.
+/// entries whose `theorem verified` has head type `TotalVerificationResult`,
+/// `StatefulVerificationResult`, or `ModularVerificationResult`. Returns an
+/// error for an invalid or duplicated callee suffix, or for a non-bug entry
+/// whose Miri verdict has no certificate shape.
 pub fn render_miri_diff_verify_module_with_callees(
     crate_camel: &str,
     def_id: &str,
     entry: &MiriDiffTestEntry,
     helper_module_suffixes: &[String],
+) -> Result<(String, bool), String> {
+    render_miri_diff_verify_module_with_panic_certificate(
+        crate_camel,
+        def_id,
+        entry,
+        helper_module_suffixes,
+        MiriDiffPanicCertificate::Stateful,
+    )
+}
+
+/// Render the `.anneal/generated/Verify/<Crate>/<test.name>.lean` module for a
+/// single differential test entry exactly as
+/// [`render_miri_diff_verify_module_with_callees`] does, except that a non-bug
+/// `panic` entry gets the certificate shape `panic_certificate`.
+///
+/// `panic_certificate` has no effect on other entries. A
+/// `known_anneal_bug_ratchet` for a `panic` entry always also requires
+/// `reachesModularSafePanicBounded ... = false`, so reintroducing a bug entry
+/// for a test that a modular certificate discharges fails to build.
+pub fn render_miri_diff_verify_module_with_panic_certificate(
+    crate_camel: &str,
+    def_id: &str,
+    entry: &MiriDiffTestEntry,
+    helper_module_suffixes: &[String],
+    panic_certificate: MiriDiffPanicCertificate,
 ) -> Result<(String, bool), String> {
     let item = format!("{crate_camel}.{}", entry.name);
     let fuel = entry.fuel;
@@ -1027,27 +1093,152 @@ pub fn render_miri_diff_verify_module_with_callees(
              -- UNFIXED ANNEAL BUG ({} in `{}`):\n\
              -- {}\n\
              -- Reference Miri verdict: `{}`\n\
-             -- Observed Anneal tag:    `{}`\n\
-             theorem known_anneal_bug_ratchet :\n    \
-                 evalMirDiffTagBounded {fuel} Mir.{item}.body\n      \
-                   ({init_state}) =\n      \
-                 {tag_expr} := by\n  \
-               rfl\n\n\
-             end Verify.{item}\n",
+             -- Observed Anneal tag:    `{}`\n",
             bug.bug_class,
             bug.suspected_component,
             bug.summary,
             entry.miri_verdict.as_tag_str(),
             bug.observed_anneal_tag.as_tag_str()
         ));
+        if entry.miri_verdict == MiriDiffVerdictSpec::Panic {
+            // `evalMirDiffTagBounded` stops at the first uninterpreted external
+            // call, so on its own this ratchet would keep holding for a test
+            // that `verifyModularSafePanicMirBounded` certifies. Requiring the
+            // modular checker to reject the test makes the ratchet fail as soon
+            // as the modular certificate applies.
+            out.push_str(&format!(
+                "-- The ratchet of a `panic` test also requires the modular safe-panic\n\
+                 -- checker to reject it, so it fails once a modular certificate applies.\n\
+                 theorem known_anneal_bug_ratchet :\n    \
+                     evalMirDiffTagBounded {fuel} Mir.{item}.body\n      \
+                       ({init_state}) =\n      \
+                     {tag_expr} ∧\n    \
+                     reachesModularSafePanicBounded {fuel} Mir.{item}.body\n      \
+                       ({init_state}) =\n      \
+                     false := by\n  \
+                   exact ⟨rfl, rfl⟩\n\n\
+                 end Verify.{item}\n"
+            ));
+            return Ok((out, false));
+        }
+        out.push_str(&format!(
+            "theorem known_anneal_bug_ratchet :\n    \
+                 evalMirDiffTagBounded {fuel} Mir.{item}.body\n      \
+                   ({init_state}) =\n      \
+                 {tag_expr} := by\n  \
+               rfl\n\n\
+             end Verify.{item}\n"
+        ));
         return Ok((out, false));
     }
 
+    if entry.miri_verdict == MiriDiffVerdictSpec::Panic
+        && panic_certificate == MiriDiffPanicCertificate::Modular
+    {
+        render_modular_panic_certificate(
+            &mut out,
+            &item,
+            fuel,
+            callees.list_expr.as_deref(),
+        );
+        return Ok((out, true));
+    }
     let Some(ref callees_expr) = callees.list_expr else {
         return render_callee_free_certificate(&mut out, &item, fuel, entry)
             .map(|cert| (out, cert));
     };
     render_linked_certificate(&mut out, &item, fuel, entry, callees_expr).map(|cert| (out, cert))
+}
+
+/// Append the `ModularVerificationResult` statement of a modular `panic`
+/// certificate for `Mir.{item}.body`, indented by `indent`.
+///
+/// `TrustedBoundary.checkStatementOrigins` rejects a `theorem verified` whose
+/// statement mentions an `Anneal.*` constant, so the statement spells out
+/// `Anneal.Rustc.V2026_06_01.SymbolicEval.framePreservingCallContract` with
+/// `Trusted.*` constants only; the two agree by unfolding. `callees_expr`
+/// (`None` for an empty callee table) must match the table that the proof
+/// passes to `verifyModularSafePanicMirBounded`.
+fn push_modular_panic_claim(
+    out: &mut String,
+    item: &str,
+    callees_expr: Option<&str>,
+    indent: &str,
+) {
+    out.push_str(&format!(
+        "{indent}ModularVerificationResult {{\n\
+         {indent}  body := Mir.{item}.body\n\
+         {indent}  envAssumed := MirCallContract.holdsOn {{\n\
+         {indent}    pre := fun _ => True\n\
+         {indent}    post := fun req ans =>\n\
+         {indent}      match ans with\n\
+         {indent}      | .returned _ memAfter => callFramePreserved req.memory memAfter\n\
+         {indent}      | .panicked memAfter => callFramePreserved req.memory memAfter\n\
+         {indent}      | .aborted => True\n\
+         {indent}  }}\n\
+         {indent}  pre := fun args mem => args = [] ∧ mem = emptyMemory\n\
+         {indent}  post := fun _ _ _ _ => False\n"
+    ));
+    if let Some(callees_expr) = callees_expr {
+        out.push_str(&format!("{indent}  callees := {callees_expr}\n"));
+    }
+    out.push_str(&format!("{indent}}}"));
+}
+
+/// Append the refuted `TotalClaim` of a `panic` certificate for
+/// `Mir.{item}.body`, indented by `indent`.
+fn push_refuted_total_claim(
+    out: &mut String,
+    item: &str,
+    callees_expr: Option<&str>,
+    indent: &str,
+) {
+    out.push_str(&format!(
+        "{indent}¬ ({{\n\
+         {indent}  body := Mir.{item}.body\n\
+         {indent}  pre := fun args mem => args = [] ∧ mem = emptyMemory\n\
+         {indent}  post := fun _ _ _ _ => True\n"
+    ));
+    if let Some(callees_expr) = callees_expr {
+        out.push_str(&format!("{indent}  callees := {callees_expr}\n"));
+    }
+    out.push_str(&format!("{indent}}} : TotalClaim).holds"));
+}
+
+/// Append the modular certificate of a non-bug `panic` entry whose execution
+/// passes through an uninterpreted external call before it panics
+/// ([`MiriDiffPanicCertificate::Modular`]), linking the callee table
+/// `callees_expr` (`None` for an empty table).
+///
+/// `theorem verified` proves `ModularVerificationResult` with `post := False`
+/// under the frame-preserving rely contract on external calls, and
+/// `total_refuted` refutes `TotalClaim.holds` along the path on which every
+/// external call returns normally, both through
+/// `verifyModularSafePanicMirBounded`.
+fn render_modular_panic_certificate(
+    out: &mut String,
+    item: &str,
+    fuel: u32,
+    callees_expr: Option<&str>,
+) {
+    let proof = format!(
+        "verifyModularSafePanicMirBounded Mir.{item}.body {} {fuel} [] emptyMemory",
+        callees_expr.unwrap_or("[]")
+    );
+    out.push_str("-- @anneal-miri-diff-kind: panic_modular\ntheorem verified :\n");
+    push_modular_panic_claim(out, item, callees_expr, "    ");
+    out.push_str(&format!(" :=\n  ({proof}).1\n\ntheorem total_refuted :\n"));
+    push_refuted_total_claim(out, item, callees_expr, "    ");
+    out.push_str(&format!(" :=\n  ({proof}).2\n\nabbrev Certificate : Prop :=\n"));
+    push_modular_panic_claim(out, item, callees_expr, "  ");
+    out.push_str(" ∧\n");
+    push_refuted_total_claim(out, item, callees_expr, "  ");
+    out.push_str(&format!(
+        "\n\n\
+         theorem full_panic_certificate : Certificate :=\n  \
+           And.intro verified total_refuted\n\n\
+         end Verify.{item}\n"
+    ));
 }
 
 /// Append the certificate or refutation for a non-bug entry that links no
@@ -1534,11 +1725,16 @@ pub fn stage_miri_diff_workspace(
         let suffix = derive_item_module_suffix(helper);
         certificate_modules.push(format!("Verify.{suffix}"));
     }
+    let def_id_by_suffix: BTreeMap<String, String> = records
+        .iter()
+        .map(|r| (derive_item_module_suffix(r), r.target.def_id.clone()))
+        .collect();
 
     let mut verified_pass_count = 0usize;
     let mut verified_panic_count = 0usize;
     let mut verified_strict_ub_count = 0usize;
     let mut ratcheted_known_bug_count = 0usize;
+    let mut modular_panic_certificate_modules: Vec<String> = Vec::new();
 
     for entry in &manifest.tests {
         let Some(rec) = records_by_name.get(&entry.name) else {
@@ -1551,11 +1747,27 @@ pub fn stage_miri_diff_workspace(
         let rel_path = module_suffix_to_rel_path(&suffix);
         let verify_path = verify_root.join(rel_path);
         let linked_callees = read_scaffolded_default_callees(&dot_anneal, &suffix)?;
-        let (content, is_cert) = render_miri_diff_verify_module_with_callees(
+        let panic_certificate = if entry.miri_verdict == MiriDiffVerdictSpec::Panic
+            && entry.known_anneal_bug.is_none()
+        {
+            classify_panic_certificate(
+                &dot_anneal,
+                &suffix,
+                &linked_callees,
+                &def_id_by_suffix,
+            )?
+        } else {
+            MiriDiffPanicCertificate::Stateful
+        };
+        if panic_certificate == MiriDiffPanicCertificate::Modular {
+            modular_panic_certificate_modules.push(format!("Verify.{suffix}"));
+        }
+        let (content, is_cert) = render_miri_diff_verify_module_with_panic_certificate(
             &crate_camel,
             &rec.target.def_id,
             entry,
             &linked_callees,
+            panic_certificate,
         )?;
         fs::write(&verify_path, content).map_err(|err| {
             format!(
@@ -1609,8 +1821,155 @@ pub fn stage_miri_diff_workspace(
         verified_strict_ub_count,
         ratcheted_known_bug_count,
         audited_certificate_modules: certificate_modules.clone(),
+        modular_panic_certificate_modules,
     };
     Ok((report, certificate_modules))
+}
+
+/// `def_id`s of the call targets that
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators` models inline without
+/// emitting an external `MirCallE` interaction (`isUnwindingPanicDefPath`,
+/// `isAbortingPanicDefPath`, `isUnreachableCallTarget`,
+/// `isDirectExactDivTarget`, and `classifyRustIntrinsic?` other than
+/// `const_eval_select`, whose runtime target may be unlinked).
+///
+/// `Terminators` handles a direct call to a panic, abort, or unreachable entry
+/// point inline only when the call diverges (`target = .none`), which is how
+/// `rustc` calls these `!`-returning functions; a returning call to one of them
+/// would still be an external call. The unit test
+/// `trusted_inline_call_def_paths_match_trusted_terminators` fails when this
+/// list and those `Trusted` definitions diverge, and a stale list cannot make
+/// [`classify_panic_certificate`] unsound.
+const TRUSTED_INLINE_CALL_DEF_PATHS: &[&str] = &[
+    // `isUnwindingPanicDefPath`
+    "core::panicking::panic",
+    "core::panicking::panic_fmt",
+    "core::panicking::panic_fmt::panic_impl",
+    "core::panicking::const_panic_fmt",
+    "core::panicking::assert_failed",
+    "core::panicking::assert_failed_inner",
+    "core::panicking::assert_matches_failed",
+    "core::slice::index::slice_index_fail",
+    "core::panicking::panic_bounds_check",
+    "core::panicking::panic_explicit",
+    "core::panicking::panic_display",
+    "core::panicking::panic_str_2015",
+    "core::panicking::unreachable_display",
+    "core::option::unwrap_failed",
+    "core::option::expect_failed",
+    "core::result::unwrap_failed",
+    "core::panicking::panic_const::panic_const_add_overflow",
+    "core::panicking::panic_const::panic_const_sub_overflow",
+    "core::panicking::panic_const::panic_const_mul_overflow",
+    "core::panicking::panic_const::panic_const_div_overflow",
+    "core::panicking::panic_const::panic_const_rem_overflow",
+    "core::panicking::panic_const::panic_const_neg_overflow",
+    "core::panicking::panic_const::panic_const_shr_overflow",
+    "core::panicking::panic_const::panic_const_shl_overflow",
+    "core::panicking::panic_const::panic_const_div_by_zero",
+    "core::panicking::panic_const::panic_const_rem_by_zero",
+    // `isAbortingPanicDefPath`
+    "core::panicking::panic_nounwind",
+    "core::panicking::panic_nounwind_fmt",
+    "core::panicking::panic_nounwind_fmt::panic_impl",
+    "core::panicking::panic_nounwind_nobacktrace",
+    "core::panicking::panic_in_cleanup",
+    "core::panicking::panic_cannot_unwind",
+    "core::panicking::panic_misaligned_pointer_dereference",
+    "core::panicking::panic_null_pointer_dereference",
+    "core::panicking::panic_invalid_enum_construction",
+    "core::intrinsics::abort",
+    // `isUnreachableCallTarget`
+    "core::hint::unreachable_unchecked",
+    "std::hint::unreachable_unchecked",
+    "core::intrinsics::unreachable",
+    // `isDirectExactDivTarget` and non-dispatching `classifyRustIntrinsic?`
+    "core::intrinsics::exact_div",
+    "core::intrinsics::ub_checks",
+    "core::intrinsics::arith_offset",
+    "core::intrinsics::ctlz",
+    "core::intrinsics::ctlz_nonzero",
+    "core::intrinsics::cttz",
+    "core::intrinsics::cttz_nonzero",
+    "core::intrinsics::ctpop",
+    "core::intrinsics::bswap",
+    "core::intrinsics::bitreverse",
+    "core::intrinsics::wrapping_add",
+    "core::intrinsics::wrapping_sub",
+    "core::intrinsics::wrapping_mul",
+    "core::intrinsics::saturating_add",
+    "core::intrinsics::saturating_sub",
+    "core::intrinsics::unchecked_shl",
+    "core::intrinsics::unchecked_shr",
+    "core::intrinsics::unchecked_add",
+    "core::intrinsics::unchecked_sub",
+    "core::intrinsics::unchecked_mul",
+    "core::intrinsics::unchecked_div",
+    "core::intrinsics::unchecked_rem",
+    "core::intrinsics::three_way_compare",
+    "core::intrinsics::size_of_val",
+    "core::intrinsics::align_of_val",
+];
+
+/// Return `true` when `def_id` is one of [`TRUSTED_INLINE_CALL_DEF_PATHS`].
+fn is_trusted_inline_call_def_path(def_id: &str) -> bool {
+    TRUSTED_INLINE_CALL_DEF_PATHS.contains(&def_id)
+}
+
+/// Choose the certificate shape of the non-bug `panic` entry whose captured
+/// body has module suffix `item_suffix` and links the callee table
+/// `linked_callees`, using `def_id_by_suffix` to map captured module suffixes
+/// to `def_id`s.
+///
+/// Direct evaluation (`reachesPanicBounded`) stops at the first call to a
+/// function that is neither linked nor modeled inline by `Trusted`. The entry
+/// therefore gets the [`MiriDiffPanicCertificate::Modular`] certificate when
+/// its body or the body of a linked callee references a function (as
+/// scaffolding collects callee references, from `.fnDef "<def_id>"`) that is
+/// not the entry itself, not a linked callee, and not modeled inline by
+/// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators`
+/// ([`is_trusted_inline_call_def_path`]), and the
+/// [`MiriDiffPanicCertificate::Stateful`] certificate otherwise.
+///
+/// The classification only selects which certificate the Lean kernel checks,
+/// so a misclassification cannot produce an unsound certificate: a `Stateful`
+/// certificate for a body that reaches an external call fails to build, and a
+/// `Modular` certificate still holds for a body that panics without reaching
+/// one (it then costs only the stronger-looking `Stateful` statement).
+fn classify_panic_certificate(
+    dot_anneal: &Path,
+    item_suffix: &str,
+    linked_callees: &[String],
+    def_id_by_suffix: &BTreeMap<String, String>,
+) -> Result<MiriDiffPanicCertificate, String> {
+    let bodies: Vec<&str> = std::iter::once(item_suffix)
+        .chain(linked_callees.iter().map(String::as_str))
+        .collect();
+    let mut linked_def_ids = BTreeSet::new();
+    for suffix in &bodies {
+        let def_id = def_id_by_suffix.get(*suffix).ok_or_else(|| {
+            format!("no captured MIR record has module suffix '{suffix}'")
+        })?;
+        linked_def_ids.insert(def_id.as_str());
+    }
+    let mir_root = dot_anneal.join("generated").join("Mir");
+    for suffix in &bodies {
+        let mir_path = mir_root.join(module_suffix_to_rel_path(suffix));
+        let mir_text = fs::read_to_string(&mir_path).map_err(|err| {
+            format!(
+                "failed to read captured MIR module {}: {}",
+                mir_path.display(),
+                err
+            )
+        })?;
+        if extract_called_fn_defs(&mir_text).iter().any(|def_id| {
+            !linked_def_ids.contains(def_id.as_str())
+                && !is_trusted_inline_call_def_path(def_id.as_str())
+        }) {
+            return Ok(MiriDiffPanicCertificate::Modular);
+        }
+    }
+    Ok(MiriDiffPanicCertificate::Stateful)
 }
 
 /// Run the full Miri differential test suite: load `manifest.toml`, capture MIR
@@ -1828,18 +2187,25 @@ pub fn verify_miri_diff_ub_locations(
 
 /// Render a deterministic human-readable summary of a completed Miri
 /// differential test run.
+///
+/// The summary lists separately the `panic` certificates that are
+/// `ModularVerificationResult`s: `TrustedBoundary` reports them as
+/// unconditional because they use no `Assumptions.*` axiom, but each one holds
+/// only for external callees that return or unwind to the caller's call frame.
 pub fn render_miri_diff_report(report: &MiriDiffReport) -> String {
     format!(
         "Anneal <-> Miri Differential Testing Summary:\n\
          \x20 Total corpus tests:              {}\n\
          \x20 Verified `pass` (TotalClaim):    {}\n\
          \x20 Verified `panic` (SafePanic):    {}\n\
+         \x20   of which modular (frame rely): {}\n\
          \x20 Refuted `ub` (StrictUB):         {}\n\
          \x20 Open Anneal bugs (ratcheted):    {}\n\
          \x20 TrustedBoundary kernel replay:   PASS\n",
         report.total_tests,
         report.verified_pass_count,
         report.verified_panic_count,
+        report.modular_panic_certificate_modules.len(),
         report.verified_strict_ub_count,
         report.ratcheted_known_bug_count
     )
@@ -2032,5 +2398,346 @@ mod tests {
                 "callee table {bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn modular_panic_certificate_states_only_trusted_constants() {
+        let panic_entry = entry("panic_explicit_macro", MiriDiffVerdictSpec::Panic);
+        let def_id = "miri_diff_corpus::panic_explicit_macro";
+        let contract = "MirCallContract.holdsOn {\n        \
+                        pre := fun _ => True\n        \
+                        post := fun req ans =>\n          \
+                          match ans with\n          \
+                          | .returned _ memAfter => callFramePreserved req.memory memAfter\n          \
+                          | .panicked memAfter => callFramePreserved req.memory memAfter\n          \
+                          | .aborted => True\n      \
+                        }";
+
+        let (modular, modular_cert) = render_miri_diff_verify_module_with_panic_certificate(
+            "MiriDiffCorpus",
+            def_id,
+            &panic_entry,
+            &[],
+            MiriDiffPanicCertificate::Modular,
+        )
+        .expect("render modular panic certificate");
+        assert!(modular_cert, "a modular panic certificate is audited:\n{modular}");
+        assert!(modular.contains("-- @anneal-miri-diff-kind: panic_modular\n"));
+        assert!(modular.contains(&format!(
+            "theorem verified :\n    \
+             ModularVerificationResult {{\n      \
+               body := Mir.MiriDiffCorpus.panic_explicit_macro.body\n      \
+               envAssumed := {contract}\n"
+        )));
+        assert_eq!(
+            modular
+                .matches(
+                    "(verifyModularSafePanicMirBounded \
+                     Mir.MiriDiffCorpus.panic_explicit_macro.body [] 128 [] emptyMemory)"
+                )
+                .count(),
+            2,
+            "`verified` and `total_refuted` must both use the modular combinator:\n{modular}"
+        );
+        assert_eq!(modular.matches("match ans with").count(), 2);
+        assert_eq!(modular.matches("post := fun _ _ _ _ => False").count(), 2);
+        assert_eq!(modular.matches("} : TotalClaim).holds").count(), 2);
+        assert!(modular.contains("And.intro verified total_refuted"));
+        // Statements must not mention `Anneal.*` constants such as
+        // `framePreservingCallContract`, and a callee-free module links nothing.
+        assert!(!modular.contains("framePreservingCallContract"));
+        assert!(!modular.contains("StatefulVerificationResult"));
+        assert!(!modular.contains("callees :="));
+        assert!(!modular.contains("sorry"));
+
+        let helpers = vec!["MiriDiffCorpus.helper_add_ten".to_string()];
+        let (linked, linked_cert) = render_miri_diff_verify_module_with_panic_certificate(
+            "MiriDiffCorpus",
+            def_id,
+            &panic_entry,
+            &helpers,
+            MiriDiffPanicCertificate::Modular,
+        )
+        .expect("render callee-linked modular panic certificate");
+        assert!(linked_cert);
+        assert_eq!(
+            linked
+                .matches("callees := [Mir.MiriDiffCorpus.helper_add_ten.body]")
+                .count(),
+            4,
+            "every claim must carry the callee table:\n{linked}"
+        );
+        assert!(linked.contains(
+            "(verifyModularSafePanicMirBounded Mir.MiriDiffCorpus.panic_explicit_macro.body \
+             [Mir.MiriDiffCorpus.helper_add_ten.body] 128 [] emptyMemory).1"
+        ));
+
+        // The default rendering keeps the stateful certificate, and the shape
+        // does not affect other verdicts.
+        let (stateful, _) =
+            render_miri_diff_verify_module("MiriDiffCorpus", def_id, &panic_entry).expect("render");
+        assert!(stateful.contains(
+            "(verifySafePanicMirPointBounded Mir.MiriDiffCorpus.panic_explicit_macro.body \
+             128 [] emptyMemory).1"
+        ));
+        assert!(!stateful.contains("ModularVerificationResult"));
+        let pass = entry("pass_direct_fn_call", MiriDiffVerdictSpec::PassUnit);
+        let pass_def_id = "miri_diff_corpus::pass_direct_fn_call";
+        assert_eq!(
+            render_miri_diff_verify_module_with_panic_certificate(
+                "MiriDiffCorpus",
+                pass_def_id,
+                &pass,
+                &[],
+                MiriDiffPanicCertificate::Modular,
+            )
+            .expect("render pass"),
+            render_miri_diff_verify_module("MiriDiffCorpus", pass_def_id, &pass)
+                .expect("render pass")
+        );
+    }
+
+    #[test]
+    fn panic_ratchet_also_requires_modular_checker_to_reject() {
+        let mut panic_bug = entry("panic_explicit_macro", MiriDiffVerdictSpec::Panic);
+        panic_bug.known_anneal_bug = Some(KnownAnnealBugSpec {
+            status: "open_bug".to_string(),
+            bug_class: "incompleteness_unmodeled_intrinsic_or_call".to_string(),
+            observed_anneal_tag: MiriDiffVerdictSpec::ExternalCall(
+                "core::fmt::Arguments::<'a>::from_str".to_string(),
+            ),
+            observed_anneal_ub_span: None,
+            suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators".to_string(),
+            summary: "Reintroduced ratchet.".to_string(),
+        });
+        for shape in [MiriDiffPanicCertificate::Stateful, MiriDiffPanicCertificate::Modular] {
+            let (ratchet, ratchet_cert) = render_miri_diff_verify_module_with_panic_certificate(
+                "MiriDiffCorpus",
+                "miri_diff_corpus::panic_explicit_macro",
+                &panic_bug,
+                &[],
+                shape,
+            )
+            .expect("render panic ratchet");
+            assert!(!ratchet_cert);
+            assert!(
+                ratchet.contains(
+                    "theorem known_anneal_bug_ratchet :\n    \
+                     evalMirDiffTagBounded 128 Mir.MiriDiffCorpus.panic_explicit_macro.body\n      \
+                       (initMachineStateWithMemory Mir.MiriDiffCorpus.panic_explicit_macro.body [] emptyMemory) =\n      \
+                     (MirDiffTag.externalCall \"core::fmt::Arguments::<'a>::from_str\") ∧\n    \
+                     reachesModularSafePanicBounded 128 Mir.MiriDiffCorpus.panic_explicit_macro.body\n      \
+                       (initMachineStateWithMemory Mir.MiriDiffCorpus.panic_explicit_macro.body [] emptyMemory) =\n      \
+                     false := by\n  \
+                   exact ⟨rfl, rfl⟩\n"
+                ),
+                "unexpected panic ratchet:\n{ratchet}"
+            );
+            assert!(!ratchet.contains("theorem verified"));
+        }
+
+        // A ratchet for a non-`panic` verdict keeps the bare tag equality.
+        let mut pass_bug = entry("pass_direct_fn_call", MiriDiffVerdictSpec::PassUnit);
+        pass_bug.known_anneal_bug = panic_bug.known_anneal_bug.clone();
+        let (pass_ratchet, _) = render_miri_diff_verify_module(
+            "MiriDiffCorpus",
+            "miri_diff_corpus::pass_direct_fn_call",
+            &pass_bug,
+        )
+        .expect("render pass ratchet");
+        assert!(!pass_ratchet.contains("reachesModularSafePanicBounded"));
+        assert!(pass_ratchet.contains(
+            "(MirDiffTag.externalCall \"core::fmt::Arguments::<'a>::from_str\") := by\n  rfl\n"
+        ));
+    }
+
+    #[test]
+    fn classify_panic_certificate_requires_modular_shape_for_unlinked_calls() {
+        let root = std::env::temp_dir().join(format!(
+            "cargo-anneal-classify-panic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mir_dir = root.join("generated").join("Mir").join("MiriDiffCorpus");
+        fs::create_dir_all(&mir_dir).expect("create MIR dir");
+        let write_mir = |name: &str, refs: &[&str]| {
+            let mut text = format!("namespace Mir.MiriDiffCorpus.{name}\n");
+            for r in refs {
+                text.push_str(&format!(
+                    "-- call (RigidTy.fnDef \"{r}\" List.nil)\n"
+                ));
+            }
+            fs::write(mir_dir.join(format!("{name}.lean")), text).expect("write MIR");
+        };
+        write_mir("panic_assert", &[]);
+        write_mir(
+            "panic_inline_trusted_calls",
+            &[
+                "core::intrinsics::exact_div",
+                "core::intrinsics::wrapping_add",
+                "core::panicking::panic_explicit",
+                "core::panicking::panic_bounds_check",
+                "core::option::unwrap_failed",
+            ],
+        );
+        write_mir(
+            "panic_fmt_macro",
+            &["core::fmt::Arguments::<'a>::from_str", "core::panicking::panic_fmt"],
+        );
+        write_mir("panic_via_helper", &["miri_diff_corpus::helper"]);
+        write_mir("helper", &["core::panicking::panic"]);
+        write_mir("helper_calling_external", &["core::fmt::Arguments::<'a>::from_str"]);
+        write_mir("panic_via_external_helper", &["miri_diff_corpus::helper_calling_external"]);
+        let def_id_by_suffix: BTreeMap<String, String> = [
+            "panic_assert",
+            "panic_inline_trusted_calls",
+            "panic_fmt_macro",
+            "panic_via_helper",
+            "helper",
+            "helper_calling_external",
+            "panic_via_external_helper",
+        ]
+        .into_iter()
+        .map(|n| (format!("MiriDiffCorpus.{n}"), format!("miri_diff_corpus::{n}")))
+        .collect();
+        let classify = |item: &str, linked: &[&str]| {
+            let linked: Vec<String> =
+                linked.iter().map(|n| format!("MiriDiffCorpus.{n}")).collect();
+            classify_panic_certificate(
+                &root,
+                &format!("MiriDiffCorpus.{item}"),
+                &linked,
+                &def_id_by_suffix,
+            )
+        };
+
+        assert_eq!(classify("panic_assert", &[]), Ok(MiriDiffPanicCertificate::Stateful));
+        // Inline-modeled `Trusted` panic entrypoints and intrinsics never emit
+        // an external call, so they keep the stronger `Stateful` certificate.
+        assert_eq!(
+            classify("panic_inline_trusted_calls", &[]),
+            Ok(MiriDiffPanicCertificate::Stateful)
+        );
+        assert_eq!(classify("panic_fmt_macro", &[]), Ok(MiriDiffPanicCertificate::Modular));
+        // A linked callee (even one that calls an inline-modeled `Trusted`
+        // panic entrypoint) is not an external call, but an external call
+        // inside a linked callee is, and an unlinked captured function is too.
+        assert_eq!(
+            classify("panic_via_helper", &["helper"]),
+            Ok(MiriDiffPanicCertificate::Stateful)
+        );
+        assert_eq!(classify("panic_via_helper", &[]), Ok(MiriDiffPanicCertificate::Modular));
+        assert_eq!(
+            classify("panic_via_external_helper", &["helper_calling_external"]),
+            Ok(MiriDiffPanicCertificate::Modular)
+        );
+        // Missing MIR modules and unknown suffixes fail closed.
+        assert!(classify("missing_item", &[]).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Collect the string literal compared by each `stringEq` call inside the
+    /// body of each Lean definition `def <name> ` in `lean_src`.
+    ///
+    /// A body ends at the first later line that starts in column 0, which is
+    /// where the next top-level command, attribute, or doc comment begins. A
+    /// line may hold several calls, and a call may span lines.
+    fn trusted_string_eq_literals(lean_src: &str, names: &[&str]) -> BTreeSet<String> {
+        let mut literals = BTreeSet::new();
+        for name in names {
+            let pat = format!("def {name} ");
+            let start = lean_src
+                .find(&pat)
+                .unwrap_or_else(|| panic!("missing `{pat}` in Terminators.lean"));
+            let after_header = &lean_src[start + pat.len()..];
+            let mut end = after_header.len();
+            let mut offset = after_header.find('\n').map_or(after_header.len(), |i| i + 1);
+            while offset < after_header.len() {
+                let rest = &after_header[offset..];
+                let line_len = rest.find('\n').map_or(rest.len(), |i| i + 1);
+                if !rest[..line_len].trim().is_empty() && !rest.starts_with(char::is_whitespace) {
+                    end = offset;
+                    break;
+                }
+                offset += line_len;
+            }
+            for call in after_header[..end].split("stringEq").skip(1) {
+                let Some(open) = call.find('"') else {
+                    continue;
+                };
+                let literal = &call[open + 1..];
+                let close = literal.find('"').expect("unterminated string literal");
+                literals.insert(literal[..close].to_string());
+            }
+        }
+        literals
+    }
+
+    #[test]
+    fn trusted_string_eq_literals_reads_whole_definition_bodies() {
+        let lean_src = "\
+/-- Inline targets. -/
+def isInlineTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"a\" || stringEq defPath \"b\" ||
+
+  stringEq defPath
+    \"c\"
+@[inline]
+def isOtherTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"d\"
+set_option maxRecDepth 1000 in
+def isLastTarget (defPath : DefPath) : Bool :=
+  stringEq defPath \"e\"
+";
+        let expect = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            trusted_string_eq_literals(lean_src, &["isInlineTarget"]),
+            expect(&["a", "b", "c"])
+        );
+        assert_eq!(trusted_string_eq_literals(lean_src, &["isOtherTarget"]), expect(&["d"]));
+        assert_eq!(
+            trusted_string_eq_literals(lean_src, &["isLastTarget", "isInlineTarget"]),
+            expect(&["a", "b", "c", "e"])
+        );
+    }
+
+    #[test]
+    fn trusted_inline_call_def_paths_match_trusted_terminators() {
+        let terminators = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean");
+        let lean_src = fs::read_to_string(&terminators).expect("read Trusted Terminators.lean");
+        let mut trusted = trusted_string_eq_literals(
+            &lean_src,
+            &[
+                "isUnwindingPanicDefPath",
+                "isAbortingPanicDefPath",
+                "isUnreachableCallTarget",
+                "isDirectExactDivTarget",
+                "classifyRustIntrinsic?",
+            ],
+        );
+        // `const_eval_select` dispatches to a runtime target that may itself be
+        // an external call, so it is deliberately not treated as inline.
+        assert!(trusted.remove("core::intrinsics::const_eval_select"));
+        let listed: BTreeSet<String> = TRUSTED_INLINE_CALL_DEF_PATHS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            listed.len(),
+            TRUSTED_INLINE_CALL_DEF_PATHS.len(),
+            "TRUSTED_INLINE_CALL_DEF_PATHS has duplicates"
+        );
+        assert_eq!(
+            listed, trusted,
+            "TRUSTED_INLINE_CALL_DEF_PATHS must match the inline call targets of Terminators.lean"
+        );
+        assert!(!is_trusted_inline_call_def_path("core::intrinsics::const_eval_select"));
+        assert!(!is_trusted_inline_call_def_path("core::fmt::Arguments::<'a>::from_str"));
     }
 }
