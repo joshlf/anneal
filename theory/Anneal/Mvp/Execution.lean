@@ -96,6 +96,18 @@ theorem safeFrom_next {body : Body} {start next : State}
   | inr tail => exact rest finish tail reason
 
 /--
+Transport safety across a finite source segment, including into a divergent
+continuation. Reachability alone supplies no safety at the endpoint; the suffix
+still owes that obligation. This rule uses the deterministic source step.
+-/
+theorem safeFrom_of_reach {body : Body} {start checkpoint : State}
+    (segment : Reach body start checkpoint)
+    (suffix : SafeFrom body checkpoint) : SafeFrom body start := by
+  induction segment with
+  | refl => exact suffix
+  | next reached transition ih => exact ih (safeFrom_next transition suffix)
+
+/--
 A finite execution certificate names the exact source result. Each constructor
 requires a checked source-step equality, and the inductive chain ends at an
 actual return. A desired postcondition or exhausted evaluation fuel supplies no
@@ -107,6 +119,17 @@ inductive Executes (body : Body) : State → Word → Prop where
   | next {start next : State} {value : Word} :
       step body start = .next next → Executes body next value →
       Executes body start value
+
+/--
+Compose a checked source segment with a finite returning continuation. The
+suffix still supplies the actual source return, even for a reflexive segment.
+-/
+theorem executes_prepend {body : Body} {start checkpoint : State} {value : Word}
+    (segment : Reach body start checkpoint)
+    (suffix : Executes body checkpoint value) : Executes body start value := by
+  induction segment with
+  | refl => exact suffix
+  | next reached transition ih => exact ih (.next transition suffix)
 
 /--
 One finite certificate covers every reachable prefix because `step` has a

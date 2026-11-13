@@ -201,8 +201,15 @@ def returnSeven : Body :=
 theorem returnSeven_evaluates :
     run returnSeven 2 (initial returnSeven []) = some 7 := rfl
 
-theorem returnSeven_safe_and_returns : Safe returnSeven [] ∧ Returns returnSeven [] 7 :=
-  run_initial_success returnSeven_evaluates
+-- The nonempty segment pays only for reaching the checkpoint. Its suffix must
+-- still witness the actual return, preserving both prefix safety and the exact
+-- result used by wrong_result_refused below.
+theorem returnSeven_safe_and_returns : Safe returnSeven [] ∧ Returns returnSeven [] 7 := by
+  have segment : Reach returnSeven (initial returnSeven [])
+      ⟨0, 1, [.value 7]⟩ := .next .refl rfl
+  have execution : Executes returnSeven (initial returnSeven []) 7 :=
+    executes_prepend segment (.ret rfl)
+  exact ⟨executes_safe execution, executes_returns execution⟩
 
 theorem wrong_result_refused : ¬Returns returnSeven [] 0 := by
   intro returned

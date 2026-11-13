@@ -257,23 +257,18 @@ private theorem le8_suffix2 (value : Word) :
     Executes sourceBody (le8_state2 value) ((value &&& 255)) :=
   .next (by rfl) (le8_suffix3 value)
 
-private theorem le8_suffix1 (value : Word) :
-    Executes sourceBody (le8_state1 value) ((value &&& 255)) :=
-  .next (by rfl) (le8_suffix2 value)
-
-private theorem le8_suffix0 (value : Word) :
-    Executes sourceBody (le8_state0 value) ((value &&& 255)) :=
-  .next (by rfl) (le8_suffix1 value)
-
 theorem le8_actual (value : Word) :
     Safe sourceBody [0, 0, value] ∧
       Returns sourceBody [0, 0, value] ((value &&& 255)) := by
   have start : initial sourceBody [0, 0, value] =
       le8_state0 value := by rfl
+  have segment : Reach sourceBody (le8_state0 value)
+      (le8_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [0, 0, value]) ((value &&& 255)) := by
     rw [start]
-    exact le8_suffix0 value
+    exact executes_prepend segment (le8_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def le16_state0 (value : Word) : State :=
@@ -520,23 +515,18 @@ private theorem le16_suffix2 (value : Word) :
     Executes sourceBody (le16_state2 value) ((value &&& 65535)) :=
   .next (by rfl) (le16_suffix3 value)
 
-private theorem le16_suffix1 (value : Word) :
-    Executes sourceBody (le16_state1 value) ((value &&& 65535)) :=
-  .next (by rfl) (le16_suffix2 value)
-
-private theorem le16_suffix0 (value : Word) :
-    Executes sourceBody (le16_state0 value) ((value &&& 65535)) :=
-  .next (by rfl) (le16_suffix1 value)
-
 theorem le16_actual (value : Word) :
     Safe sourceBody [0, 1, value] ∧
       Returns sourceBody [0, 1, value] ((value &&& 65535)) := by
   have start : initial sourceBody [0, 1, value] =
       le16_state0 value := by rfl
+  have segment : Reach sourceBody (le16_state0 value)
+      (le16_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [0, 1, value]) ((value &&& 65535)) := by
     rw [start]
-    exact le16_suffix0 value
+    exact executes_prepend segment (le16_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def le32_state0 (value : Word) : State :=
@@ -783,23 +773,18 @@ private theorem le32_suffix2 (value : Word) :
     Executes sourceBody (le32_state2 value) ((value &&& 4294967295)) :=
   .next (by rfl) (le32_suffix3 value)
 
-private theorem le32_suffix1 (value : Word) :
-    Executes sourceBody (le32_state1 value) ((value &&& 4294967295)) :=
-  .next (by rfl) (le32_suffix2 value)
-
-private theorem le32_suffix0 (value : Word) :
-    Executes sourceBody (le32_state0 value) ((value &&& 4294967295)) :=
-  .next (by rfl) (le32_suffix1 value)
-
 theorem le32_actual (value : Word) :
     Safe sourceBody [0, 2, value] ∧
       Returns sourceBody [0, 2, value] ((value &&& 4294967295)) := by
   have start : initial sourceBody [0, 2, value] =
       le32_state0 value := by rfl
+  have segment : Reach sourceBody (le32_state0 value)
+      (le32_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [0, 2, value]) ((value &&& 4294967295)) := by
     rw [start]
-    exact le32_suffix0 value
+    exact executes_prepend segment (le32_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def le64_state0 (value : Word) : State :=
@@ -983,23 +968,18 @@ private theorem le64_suffix2 (value : Word) :
     Executes sourceBody (le64_state2 value) (value) :=
   .next (by rfl) (le64_suffix3 value)
 
-private theorem le64_suffix1 (value : Word) :
-    Executes sourceBody (le64_state1 value) (value) :=
-  .next (by rfl) (le64_suffix2 value)
-
-private theorem le64_suffix0 (value : Word) :
-    Executes sourceBody (le64_state0 value) (value) :=
-  .next (by rfl) (le64_suffix1 value)
-
 theorem le64_actual (value : Word) :
     Safe sourceBody [0, 3, value] ∧
       Returns sourceBody [0, 3, value] (value) := by
   have start : initial sourceBody [0, 3, value] =
       le64_state0 value := by rfl
+  have segment : Reach sourceBody (le64_state0 value)
+      (le64_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [0, 3, value]) (value) := by
     rw [start]
-    exact le64_suffix0 value
+    exact executes_prepend segment (le64_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def be8_state0 (value : Word) : State :=
@@ -1246,23 +1226,18 @@ private theorem be8_suffix2 (value : Word) :
     Executes sourceBody (be8_state2 value) ((value &&& 255)) :=
   .next (by rfl) (be8_suffix3 value)
 
-private theorem be8_suffix1 (value : Word) :
-    Executes sourceBody (be8_state1 value) ((value &&& 255)) :=
-  .next (by rfl) (be8_suffix2 value)
-
-private theorem be8_suffix0 (value : Word) :
-    Executes sourceBody (be8_state0 value) ((value &&& 255)) :=
-  .next (by rfl) (be8_suffix1 value)
-
 theorem be8_actual (value : Word) :
     Safe sourceBody [1, 0, value] ∧
       Returns sourceBody [1, 0, value] ((value &&& 255)) := by
   have start : initial sourceBody [1, 0, value] =
       be8_state0 value := by rfl
+  have segment : Reach sourceBody (be8_state0 value)
+      (be8_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [1, 0, value]) ((value &&& 255)) := by
     rw [start]
-    exact be8_suffix0 value
+    exact executes_prepend segment (be8_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def be16_state0 (value : Word) : State :=
@@ -1950,23 +1925,18 @@ private theorem be16_suffix2 (value : Word) :
     Executes sourceBody (be16_state2 value) (((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat)))) :=
   .next (by rfl) (be16_suffix3 value)
 
-private theorem be16_suffix1 (value : Word) :
-    Executes sourceBody (be16_state1 value) (((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat)))) :=
-  .next (by rfl) (be16_suffix2 value)
-
-private theorem be16_suffix0 (value : Word) :
-    Executes sourceBody (be16_state0 value) (((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat)))) :=
-  .next (by rfl) (be16_suffix1 value)
-
 theorem be16_actual (value : Word) :
     Safe sourceBody [1, 1, value] ∧
       Returns sourceBody [1, 1, value] (((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat)))) := by
   have start : initial sourceBody [1, 1, value] =
       be16_state0 value := by rfl
+  have segment : Reach sourceBody (be16_state0 value)
+      (be16_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [1, 1, value]) (((((value &&& 65535) &&& 255) <<< (8 : Nat)) ||| (((value &&& 65535) &&& 65280) >>> (8 : Nat)))) := by
     rw [start]
-    exact be16_suffix0 value
+    exact executes_prepend segment (be16_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def be32_state0 (value : Word) : State :=
@@ -3158,23 +3128,18 @@ private theorem be32_suffix2 (value : Word) :
     Executes sourceBody (be32_state2 value) (((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat)))) :=
   .next (by rfl) (be32_suffix3 value)
 
-private theorem be32_suffix1 (value : Word) :
-    Executes sourceBody (be32_state1 value) (((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat)))) :=
-  .next (by rfl) (be32_suffix2 value)
-
-private theorem be32_suffix0 (value : Word) :
-    Executes sourceBody (be32_state0 value) (((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat)))) :=
-  .next (by rfl) (be32_suffix1 value)
-
 theorem be32_actual (value : Word) :
     Safe sourceBody [1, 2, value] ∧
       Returns sourceBody [1, 2, value] (((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat)))) := by
   have start : initial sourceBody [1, 2, value] =
       be32_state0 value := by rfl
+  have segment : Reach sourceBody (be32_state0 value)
+      (be32_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [1, 2, value]) (((((((value &&& 4294967295) &&& 255) <<< (24 : Nat)) ||| (((value &&& 4294967295) &&& 65280) <<< (8 : Nat))) ||| (((value &&& 4294967295) &&& 16711680) >>> (8 : Nat))) ||| (((value &&& 4294967295) &&& 4278190080) >>> (24 : Nat)))) := by
     rw [start]
-    exact be32_suffix0 value
+    exact executes_prepend segment (be32_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 private def be64_state0 (value : Word) : State :=
@@ -5248,23 +5213,18 @@ private theorem be64_suffix2 (value : Word) :
     Executes sourceBody (be64_state2 value) ((((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat)))) :=
   .next (by rfl) (be64_suffix3 value)
 
-private theorem be64_suffix1 (value : Word) :
-    Executes sourceBody (be64_state1 value) ((((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat)))) :=
-  .next (by rfl) (be64_suffix2 value)
-
-private theorem be64_suffix0 (value : Word) :
-    Executes sourceBody (be64_state0 value) ((((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat)))) :=
-  .next (by rfl) (be64_suffix1 value)
-
 theorem be64_actual (value : Word) :
     Safe sourceBody [1, 3, value] ∧
       Returns sourceBody [1, 3, value] ((((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat)))) := by
   have start : initial sourceBody [1, 3, value] =
       be64_state0 value := by rfl
+  have segment : Reach sourceBody (be64_state0 value)
+      (be64_state2 value) :=
+    .next (.next (.refl) (by rfl)) (by rfl)
   have execution : Executes sourceBody
       (initial sourceBody [1, 3, value]) ((((((((((value &&& 255) <<< (56 : Nat)) ||| ((value &&& 65280) <<< (40 : Nat))) ||| ((value &&& 16711680) <<< (24 : Nat))) ||| ((value &&& 4278190080) <<< (8 : Nat))) ||| ((value &&& 1095216660480) >>> (8 : Nat))) ||| ((value &&& 280375465082880) >>> (24 : Nat))) ||| ((value &&& 71776119061217280) >>> (40 : Nat))) ||| ((value &&& 18374686479671623680) >>> (56 : Nat)))) := by
     rw [start]
-    exact be64_suffix0 value
+    exact executes_prepend segment (be64_suffix2 value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 end ProductionSteps
