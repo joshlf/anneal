@@ -5075,5 +5075,379 @@ class PassB1AdversarialRegressionTest(unittest.TestCase):
             self.assertFalse(r["passed"], r)
 
 
+
+def _with_one_reported_missed_ub(summary: dict[str, object], repro: Path) -> dict[str, object]:
+    """Turns `ub_item` of an all-agreeing `_with_consistent_item_outcomes(...,
+    direct_call="agree")` summary into a kernel-confirmed `missed_ub` divergence
+    with its finding, keeping every aggregate consistent."""
+    summary["item_outcomes"]["ub_item"] = {  # type: ignore[index]
+        "verdict": "diverge",
+        "miri_outcome": "ub@src/lib.rs:41:14",
+        "anneal_outcome": "pass:unit",
+        "anneal_lean_tag": "MirDiffTag.normalUnit",
+    }
+    summary["anneal_outcomes"]["pass"] = 7  # type: ignore[index]
+    summary["anneal_outcomes"]["ub"] = 0  # type: ignore[index]
+    summary["agree_count"] = 7
+    summary["diverge_count"] = 1
+    summary["kernel_confirmed_divergences"] = 1
+    summary["divergence_classes"]["missed_ub"] = 1  # type: ignore[index]
+    summary["findings"] = [
+        {
+            "finding_id": "finding_0000_ub_item",
+            "fn_name": "ub_item",
+            "seed_name": "ub_item",
+            "applied_mutators": [],
+            "divergence_class": "missed_ub",
+            "miri_outcome": "ub@src/lib.rs:4:14",
+            "anneal_outcome": "pass:unit",
+            "anneal_lean_tag": "MirDiffTag.normalUnit",
+            "miri_excerpt": "error: Undefined Behavior",
+            "repro_path": str(repro),
+            "kernel_confirmed": True,
+        }
+    ]
+    return summary
+
+
+class PassA1AdversarialRegressionTest(unittest.TestCase):
+    """Regression tests for issues found in adversarial pass A1."""
+
+    def test_toml_native_dates_expire_like_their_iso_text(self) -> None:
+        # `expires = 2099-01-01` (unquoted) is a TOML date that `tomllib` returns as
+        # `datetime.date`; it used to be rejected as `malformed_expires_date`.
+        with tempfile.TemporaryDirectory() as tmp:
+            q_file = Path(tmp) / "q.toml"
+            q_file.write_text(
+                '[[quarantined]]\n'
+                'fingerprint = "seed_a:missed_ub"\n'
+                'expires = 2099-01-01\n'
+                'reason = "native date"\n'
+                '[[quarantined]]\n'
+                'fingerprint = "seed_b:missed_ub"\n'
+                'expires = 2099-01-01T08:00:00Z\n'
+                'reason = "native offset datetime"\n'
+                '[[quarantined]]\n'
+                'fingerprint = "seed_c:missed_ub"\n'
+                'expires = 2020-01-01\n'
+                'reason = "native date, expired"\n'
+                '[[quarantined]]\n'
+                'fingerprint = "seed_d:missed_ub"\n'
+                'expires = 08:00:00\n'
+                'reason = "a time is not a date"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "seed_e"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "tracked"\n'
+                'expires = 2099-06-01\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                campaign.load_quarantine_rules(q_file),
+                {"seed_a:missed_ub", "seed_b:missed_ub", "seed_e"},
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file, reference_date="2026-11-13"
+            )
+            by_entry = {e["entry"]: e["reason"] for e in audit["stale_quarantine_entries"]}
+            self.assertEqual(sorted(by_entry), ["seed_c:missed_ub", "seed_d:missed_ub"])
+            self.assertEqual(
+                by_entry["seed_c:missed_ub"],
+                "expired_quarantine_entry: expires 2020-01-01 < 2026-11-13",
+            )
+            self.assertTrue(by_entry["seed_d:missed_ub"].startswith("malformed_expires_date"))
+            # The same holds for the manifest's own `known_anneal_bug` expiry.
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "open_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "tracked"\n'
+                'expires = 2026-01-01\n',
+                encoding="utf-8",
+            )
+            m_audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file, reference_date="2026-11-13"
+            )
+            self.assertEqual(
+                [e["reason"] for e in m_audit["stale_known_anneal_bugs"]],
+                ["expired_quarantine_entry: expires 2026-01-01 < 2026-11-13"],
+            )
+
+    def test_findings_must_map_one_to_one_onto_diverging_item_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("pub fn ub_item() {}\n", encoding="utf-8")
+
+            def fresh() -> dict:
+                return _with_one_reported_missed_ub(
+                    _with_consistent_item_outcomes(_make_valid_miri_summary(), direct_call="agree"),
+                    repro,
+                )
+
+            summary = fresh()
+            self.assertEqual(campaign.validate_performed_miri_summary(summary), (True, "ok"))
+            self.assertEqual(campaign.audit_item_outcomes_against_summary(summary), [])
+            rf = campaign.evaluate_miri_red_flags(summary, 0x5EED0001, {}, 50.0, 0)
+            self.assertTrue(rf.passed, rf.failure_reasons)
+
+            # The real divergence's finding attributed to an agreeing item: every count
+            # still adds up, and a quarantine of that item would have hidden the
+            # unquarantined `ub_item` divergence.
+            swapped = fresh()
+            swapped["findings"][0]["fn_name"] = "pass_item_0"
+            swapped["findings"][0]["seed_name"] = "pass_item_0"
+            _, unq, q = campaign.deduplicate_and_quarantine_findings(
+                swapped["findings"], set(), {"pass_item_0"}
+            )
+            self.assertEqual((len(unq), len(q)), (0, 1))
+            reasons = campaign.audit_item_outcomes_against_summary(swapped)
+            self.assertTrue(any("divergence of 'pass_item_0'" in r for r in reasons), reasons)
+            self.assertTrue(any("item 'ub_item' diverges (missed_ub) but has 0 findings" in r for r in reasons), reasons)
+            rf_swapped = campaign.evaluate_miri_red_flags(swapped, 0x5EED0001, {}, 50.0, 0)
+            self.assertFalse(rf_swapped.passed)
+            self.assertFalse(rf_swapped.checks["error_vs_unsupported_boundary"])
+
+            wrong_class = fresh()
+            wrong_class["findings"][0]["divergence_class"] = "wrong_value"
+            self.assertTrue(
+                any(
+                    "divergence_class 'wrong_value'" in r
+                    for r in campaign.audit_item_outcomes_against_summary(wrong_class)
+                )
+            )
+            unknown = fresh()
+            unknown["findings"][0]["fn_name"] = "not_an_item"
+            self.assertTrue(
+                any(
+                    "names 'not_an_item', which has no item_outcomes entry" in r
+                    for r in campaign.audit_item_outcomes_against_summary(unknown)
+                )
+            )
+            doubled = fresh()
+            doubled["findings"].append(dict(doubled["findings"][0], finding_id="finding_0001_ub_item"))
+            self.assertTrue(
+                any(
+                    "has 2 findings instead of exactly 1" in r
+                    for r in campaign.audit_item_outcomes_against_summary(doubled)
+                )
+            )
+
+    def test_itree_findings_must_reproduce_diag_tag_counts_and_name_each_trace_once(self) -> None:
+        fp = "CallBoundaryOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+        with tempfile.TemporaryDirectory() as tmp:
+            healthy = make_healthy_itree_report(Path(tmp), fingerprints=[fp, fp])
+            red = campaign.evaluate_itree_red_flags(healthy, 0x20020002, {}, 50.0)
+            self.assertTrue(red.passed, red.failure_reasons)
+
+            retagged = make_healthy_itree_report(Path(tmp), fingerprints=[fp, fp])
+            retagged["findings"][1]["diag_tag"] = "step_faulted"
+            retagged["findings"][1]["diag_repr"] = "TraceReplayDiag.step_faulted"
+            red = campaign.evaluate_itree_red_flags(retagged, 0x20020002, {}, 50.0)
+            self.assertFalse(red.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("findings per diag_tag" in r for r in red.failure_reasons), red.failure_reasons
+            )
+
+            repeated = make_healthy_itree_report(Path(tmp), fingerprints=[fp, fp])
+            repeated["findings"][1]["case_ident"] = repeated["findings"][0]["case_ident"]
+            red = campaign.evaluate_itree_red_flags(repeated, 0x20020002, {}, 50.0)
+            self.assertFalse(red.checks["itree_oracle_invoked"])
+            self.assertTrue(any("repeat traces ['case_0']" in r for r in red.failure_reasons))
+
+    def test_legacy_error_tags_count_as_errored_items_everywhere(self) -> None:
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        summary["item_outcomes"]["pass_direct_fn_call"]["miri_outcome"] = "error: driver crashed"  # type: ignore[index]
+        self.assertEqual(campaign.count_distinct_miri_errored_items(summary), 1)
+        self.assertEqual(
+            campaign._record_bucket(summary["item_outcomes"]["pass_direct_fn_call"]),  # type: ignore[index]
+            "miri_oracle_error",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\nname = "open_bug"\n[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\nsummary = "tracked"\n',
+                encoding="utf-8",
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file,
+                manifest_eval_results={
+                    "open_bug": {
+                        "verdict": "not_compared",
+                        "miri_outcome": "ub@src/lib.rs:3:5",
+                        "anneal_outcome": "error: lean crashed",
+                        "anneal_lean_tag": "none",
+                    }
+                },
+            )
+            self.assertTrue(
+                audit["stale_known_anneal_bugs"][0]["reason"].startswith(
+                    "stale_known_anneal_bug_unconfirmed"
+                ),
+                audit,
+            )
+
+    def test_gate_report_table_cells_cannot_break_rows(self) -> None:
+        report = campaign.render_gate_report_sections(
+            None,
+            {
+                "passed": False,
+                "checked_quarantine_count": 1,
+                "checked_known_bug_count": 0,
+                "stale_entries": [
+                    {
+                        "source": "/tmp/q|x.json",
+                        "entry": "a`b|c",
+                        "reason": "malformed_quarantine_file: unrecognized quarantine keys ['x|y']\nsecond line",
+                    }
+                ],
+            },
+        )
+        rows = [line for line in report.splitlines() if line.startswith("| `/tmp")]
+        self.assertEqual(len(rows), 1, report)
+        unescaped_pipes = re.findall(r"(?<!\\)\|", rows[0])
+        self.assertEqual(len(unescaped_pipes), 4, rows[0])
+        self.assertIn("`a'b\\|c`", rows[0])
+        self.assertNotIn("\nsecond line", report)
+
+    def test_identity_run_reports_known_anneal_bugs_it_did_not_evaluate(self) -> None:
+        # An identity run evaluates one candidate per manifest test, so a
+        # `known_anneal_bug` test missing from its `item_outcomes` (renamed, removed
+        # from the corpus, or failing to compile) did not reproduce its open bug.
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "pass_direct_fn_call"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "externalCall:miri_diff_corpus::helper_add_ten"\n'
+                'summary = "unlinked intra-crate callee"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "renamed_away_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "no corpus item carries this name any more"\n',
+                encoding="utf-8",
+            )
+            summary = _with_consistent_item_outcomes(
+                _make_valid_miri_summary(), direct_call="external_call"
+            )
+            summary["mode"] = "identity"
+            self.assertTrue(campaign.miri_summary_evaluates_every_manifest_test(summary))
+            self.assertFalse(
+                campaign.miri_summary_evaluates_every_manifest_test(dict(summary, mode="seeded"))
+            )
+            legacy = dict(summary)
+            del legacy["item_outcomes"]
+            self.assertFalse(campaign.miri_summary_evaluates_every_manifest_test(legacy))
+
+            extracted = campaign.extract_manifest_eval_results_from_miri_summary(summary)
+            assert extracted is not None
+            self.assertNotIn("renamed_away_bug", extracted)
+            exhaustive = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file,
+                manifest_eval_results=extracted,
+                reference_date="2026-11-13",
+                manifest_eval_exhaustive=True,
+            )
+            self.assertEqual(
+                [(e["entry"], e["reason"].split(":")[0]) for e in exhaustive["stale_entries"]],
+                [("renamed_away_bug", "stale_known_anneal_bug_unconfirmed")],
+            )
+            self.assertEqual(exhaustive["checked_known_bug_count"], 2)
+            # A partial (seeded) evaluation never judges tests it did not report.
+            partial = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file, manifest_eval_results=extracted, reference_date="2026-11-13"
+            )
+            self.assertTrue(partial["passed"], partial)
+
+            for mode, argv_extra, expected_rc in (
+                ("identity", ["--miri-identity"], campaign.EXIT_HARNESS_FAILED),
+                ("seeded", [], campaign.EXIT_SUCCESS),
+            ):
+                with self.subTest(mode=mode):
+                    run_summary = dict(summary, mode=mode)
+                    state_dir = Path(tmp) / f"state_{mode}"
+                    with mock.patch.object(campaign, "run_harness", return_value=run_summary):
+                        rc = _quiet_main(
+                            [
+                                "--profile",
+                                "smoke",
+                                "--miri-only",
+                                *argv_extra,
+                                "--check-stale-ratchet",
+                                "--manifest-path",
+                                str(m_file),
+                                "--state-dir",
+                                str(state_dir),
+                            ]
+                        )
+                    self.assertEqual(rc, expected_rc)
+                    report = _read_summary(state_dir)
+                    self.assertTrue(report["red_flags"]["passed"], report["red_flags"])
+                    stale = report["stale_ratchet_audit"]["stale_known_anneal_bugs"]
+                    if mode == "identity":
+                        self.assertEqual([e["entry"] for e in stale], ["renamed_away_bug"])
+                    else:
+                        self.assertEqual(stale, [])
+
+    def test_known_corpus_bug_seeds_need_a_known_anneal_bug_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "table_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "tracked"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "flag_bug"\n'
+                'known_anneal_bug = false\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "plain_test"\n',
+                encoding="utf-8",
+            )
+            # `known_anneal_bug = false` must not quarantine `flag_bug`'s findings.
+            self.assertEqual(
+                campaign.load_known_corpus_bug_seeds(Path(tmp), m_file), {"table_bug"}
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(manifest_path=m_file)
+            self.assertEqual(
+                [(e["entry"], e["reason"]) for e in audit["stale_entries"]],
+                [("flag_bug", "malformed_known_anneal_bug: expected table")],
+            )
+            for text in ("tests = 5\n", 'tests = "nope"\n', "tests = { name = \"t\" }\n"):
+                with self.subTest(tests=text):
+                    m_file.write_text(text, encoding="utf-8")
+                    self.assertEqual(campaign.load_known_corpus_bug_seeds(Path(tmp), m_file), set())
+
+    def test_simulated_summaries_bucket_legacy_error_tags_as_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("pub fn probe_p() {}\n", encoding="utf-8")
+            for miri_tag, anneal_tag, lean_tag in (
+                ("error: miri driver crashed", "pass:unit", "MirDiffTag.normalUnit"),
+                ("ub@src/lib.rs:3:5", "error: lean crashed", "none"),
+            ):
+                with self.subTest(miri=miri_tag, anneal=anneal_tag):
+                    summary = campaign.build_simulated_miri_summary(
+                        "p", miri_tag, anneal_tag, lean_tag, repro
+                    )
+                    self.assertEqual(
+                        campaign.validate_performed_miri_summary(summary), (True, "ok")
+                    )
+                    self.assertEqual(campaign.audit_item_outcomes_against_summary(summary), [])
+                    rc, kill_class, detail = campaign.campaign_exit_for_miri_summary(summary)
+                    self.assertEqual((rc, kill_class), (campaign.EXIT_HARNESS_FAILED, "harness_error"))
+                    self.assertIn("oracle_errors_exceeded", detail)
+
+
 if __name__ == "__main__":
     unittest.main()

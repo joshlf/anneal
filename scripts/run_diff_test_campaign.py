@@ -912,6 +912,36 @@ def evaluate_itree_red_flags(
                 f"itree_oracle_not_invoked: finding {f.get('finding_id') if isinstance(f, dict) else f!r} missing "
                 f"kernel confirmation or repro.rs ({repro_p})"
             )
+    # `itree-difftest` emits one finding per diverging distinct trace, tagged with
+    # that trace's `TraceReplayDiag` tag, so the findings must reproduce the
+    # non-`ok` `diag_tag_counts` exactly and name each trace (`case_ident`) once: a
+    # finding carrying another trace's tag would be fingerprinted and quarantined
+    # under the wrong class.
+    finding_tags: dict[str, int] = {}
+    seen_cases: set[str] = set()
+    duplicate_cases: set[str] = set()
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        tag = f.get("diag_tag")
+        if isinstance(tag, str):
+            finding_tags[tag] = finding_tags.get(tag, 0) + 1
+        case_ident = f.get("case_ident")
+        if isinstance(case_ident, str):
+            if case_ident in seen_cases:
+                duplicate_cases.add(case_ident)
+            seen_cases.add(case_ident)
+    tag_mismatches = {
+        tag: (finding_tags.get(tag, 0), int(diag_counts.get(tag, 0)))
+        for tag in sorted(set(diag_counts) | set(finding_tags))
+        if tag != "ok" and finding_tags.get(tag, 0) != int(diag_counts.get(tag, 0))
+    }
+    if tag_mismatches or duplicate_cases:
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: findings per diag_tag (findings, diag_tag_counts) "
+            f"{tag_mismatches} disagree or repeat traces {sorted(duplicate_cases)}"
+        )
 
     non_zero_compared = compared > 0 and distinct_traces > 0
     if not non_zero_compared:
@@ -1224,6 +1254,12 @@ _BOUNDARY_RECORD_LISTS: tuple[str, ...] = (
 # `miri-difftest` not-compared reasons that mean the item errored.
 MIRI_ERROR_NOT_COMPARED_REASONS: tuple[str, ...] = ("miri_oracle_error", "capture_failed")
 
+# Outcome-tag prefixes of an errored Miri run (`MiriOutcome::OracleError`) and of an
+# errored Anneal capture / Lean run (`AnnealOutcome::CaptureOrLeanError`), each
+# including the legacy `error:` spelling.
+MIRI_ERROR_TAG_PREFIXES: tuple[str, ...] = ("oracle_error", "error:")
+ANNEAL_ERROR_TAG_PREFIXES: tuple[str, ...] = ("capture_error", "error:")
+
 # Prefixes of the reasons `validate_error_vs_unsupported_boundary` fails on.
 _BOUNDARY_FAILURE_PREFIXES: tuple[str, ...] = (
     "error_masked_as_unsupported",
@@ -1256,7 +1292,7 @@ def _record_bucket(item: dict[str, Any]) -> str:
     if isinstance(verdict, str) and verdict.strip() and verdict.strip().lower() != "not_compared":
         return verdict
     miri_out = str(item.get("miri_outcome", ""))
-    if miri_out.startswith("oracle_error"):
+    if miri_out.startswith(MIRI_ERROR_TAG_PREFIXES):
         return "miri_oracle_error"
     return " ".join(str(item.get(k, "")) for k in ("anneal_outcome", "anneal_lean_tag"))
 
@@ -1301,8 +1337,8 @@ def count_distinct_miri_errored_items(summary: dict[str, Any]) -> int:
                 continue
             m_tag = entry.get("miri_outcome")
             a_tag = entry.get("anneal_outcome")
-            if (isinstance(m_tag, str) and m_tag.startswith("oracle_error")) or (
-                isinstance(a_tag, str) and a_tag.startswith("capture_error")
+            if (isinstance(m_tag, str) and m_tag.startswith(MIRI_ERROR_TAG_PREFIXES)) or (
+                isinstance(a_tag, str) and a_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES)
             ):
                 item_errored += 1
     return max(
@@ -1647,7 +1683,7 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
     """
     m_kind, m_sep, m_loc = miri_outcome.partition("@")
     m_pass = miri_outcome.startswith("pass:") and not m_sep
-    if miri_outcome.startswith(("oracle_error", "error:")) or not (
+    if miri_outcome.startswith(MIRI_ERROR_TAG_PREFIXES) or not (
         m_pass or m_kind in ("panic", "ub")
     ):
         return "not_compared", "miri_oracle_error"
@@ -1764,7 +1800,7 @@ def _anneal_lean_tag_problem(name: str, anneal_tag: str, lean_tag: Any) -> str |
             f"anneal_lean_tag {lean_tag!r}"
         )
     norm_lean = normalize_anneal_tag(lean_tag)
-    if anneal_tag.startswith(("capture_error", "error:")):
+    if anneal_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES):
         if norm_lean != "none":
             return (
                 f"item_accounting_mismatch: item_outcomes[{name!r}] has error anneal_outcome "
@@ -1822,7 +1858,9 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
     `compare_difftest_miri_and_anneal`: a `panic_site_mismatch` pair reported as
     `agree` is accepted only when `reconciled_panic_sites` lists the item with the
     same Miri position and Anneal span inside a standard panic-macro file, and
-    every listed site must be such an item. A capture/Lean or Miri error that the
+    every listed site must be such an item. Every finding must name an item whose
+    outcomes diverge with the finding's `divergence_class`, and every diverging item
+    must have exactly one finding. A capture/Lean or Miri error that the
     harness counted anywhere else (for example under `unsupported`) is reported as
     `error_masked_as_unsupported`; every other disagreement as
     `item_accounting_mismatch`. Summaries without `item_outcomes` are not audited.
@@ -1870,6 +1908,7 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             f"without reconciled_panic_sites"
         )
     reconciled_used: set[str] = set()
+    item_verdicts: dict[str, tuple[str, str]] = {}
 
     agree = 0
     classes: dict[str, int] = {}
@@ -1899,7 +1938,7 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                 reasons.append(lean_prob)
 
         m_prefix, m_sep, _ = miri_tag.partition("@")
-        if miri_tag.startswith(("oracle_error", "error:")):
+        if miri_tag.startswith(MIRI_ERROR_TAG_PREFIXES):
             miri_counts["error"] += 1
         elif miri_tag.startswith("pass:") and not m_sep:
             miri_counts["pass"] += 1
@@ -1909,7 +1948,7 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             miri_counts["error"] += 1
 
         a_prefix, a_sep, _ = anneal_tag.partition("@")
-        if anneal_tag.startswith(("capture_error", "error:")):
+        if anneal_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES):
             anneal_counts["error"] += 1
         elif anneal_tag.startswith("externalCall"):
             anneal_counts["external_call"] += 1
@@ -1952,12 +1991,52 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             classes[detail] = classes.get(detail, 0) + 1
         else:
             nc_counts[detail] = nc_counts.get(detail, 0) + 1
+        item_verdicts[name] = (verdict, detail)
 
     for name in sorted(set(reconciled) - reconciled_used):
         reasons.append(
             f"item_accounting_mismatch: reconciled_panic_sites lists {name!r}, but its item "
             f"outcome is not a panic-macro site agreement that the entry justifies"
         )
+
+    # `miri-difftest` emits exactly one finding per diverging item, named after the
+    # item and carrying the item's divergence class (its outcome tags may be the
+    # shrunk `repro.rs` ones, so only the class is compared). Dedup and quarantine
+    # judge divergences by their findings alone, so a finding attributed to the
+    # wrong item, or a divergence without its finding, would hide that divergence.
+    findings = summary.get("findings")
+    if isinstance(findings, list):
+        findings_per_item: dict[str, int] = {}
+        for idx, finding in enumerate(findings):
+            fn_name = finding.get("fn_name") if isinstance(finding, dict) else None
+            if not isinstance(fn_name, str):
+                continue  # `validate_performed_miri_summary` rejects such findings
+            findings_per_item[fn_name] = findings_per_item.get(fn_name, 0) + 1
+            recomputed = item_verdicts.get(fn_name)
+            if recomputed is None:
+                if fn_name not in items:
+                    reasons.append(
+                        f"item_accounting_mismatch: findings[{idx}] names {fn_name!r}, "
+                        f"which has no item_outcomes entry"
+                    )
+            elif recomputed[0] != "diverge":
+                reasons.append(
+                    f"item_accounting_mismatch: findings[{idx}] reports a divergence of "
+                    f"{fn_name!r}, whose outcomes classify as {recomputed[0]}:{recomputed[1]}"
+                )
+            elif finding.get("divergence_class") != recomputed[1]:
+                reasons.append(
+                    f"item_accounting_mismatch: findings[{idx}] gives {fn_name!r} "
+                    f"divergence_class {finding.get('divergence_class')!r}, but its outcomes "
+                    f"classify as diverge:{recomputed[1]}"
+                )
+        for name, (verdict, detail) in sorted(item_verdicts.items()):
+            count = findings_per_item.get(name, 0)
+            if verdict == "diverge" and count != 1:
+                reasons.append(
+                    f"item_accounting_mismatch: item {name!r} diverges ({detail}) but has "
+                    f"{count} findings instead of exactly 1"
+                )
 
     compiled = summary.get("compiled_candidates")
     if isinstance(compiled, int) and not isinstance(compiled, bool) and len(items) != compiled:
@@ -2044,6 +2123,11 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
 def load_known_corpus_bug_seeds(
     repo_root: Path, manifest_path: Path | None = None
 ) -> set[str]:
+    """Names of the manifest tests whose findings are quarantined as open Anneal
+    bugs: every `[[tests]]` entry with a `[tests.known_anneal_bug]` table. A
+    non-table `known_anneal_bug` value quarantines nothing (fail closed; the stale
+    ratchet reports it), and an unreadable manifest or a non-array `tests` key yields
+    no seeds instead of crashing the campaign."""
     eff_path = (
         manifest_path
         if manifest_path is not None
@@ -2055,9 +2139,12 @@ def load_known_corpus_bug_seeds(
         data = tomllib.loads(eff_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return set()
+    tests = data.get("tests", [])
+    if not isinstance(tests, list):
+        return set()
     seeds: set[str] = set()
-    for entry in data.get("tests", []):
-        if isinstance(entry, dict) and "known_anneal_bug" in entry:
+    for entry in tests:
+        if isinstance(entry, dict) and isinstance(entry.get("known_anneal_bug"), dict):
             name = entry.get("name")
             if isinstance(name, str) and name.strip():
                 seeds.add(name.strip())
@@ -2128,14 +2215,28 @@ def _is_well_formed_quarantine_token(token: Any) -> bool:
     return all(part.strip() for part in clean.split(":"))
 
 
+def _expires_as_iso_text(expires: Any) -> Any:
+    """Returns a TOML native date or datetime `expires` value (`expires =
+    2027-01-01`, which `tomllib` parses to `datetime.date`) as its `YYYY-MM-DD`
+    text, so it is judged exactly like the quoted form; any other value is
+    returned unchanged."""
+    if isinstance(expires, datetime.datetime):
+        return expires.date().isoformat()
+    if isinstance(expires, datetime.date):
+        return expires.isoformat()
+    return expires
+
+
 def quarantine_expiry_problem(expires: Any, today: str, required: bool) -> str | None:
     """Returns why a quarantine entry with this `expires` value is not in force
     (`missing_quarantine_expiry`, `malformed_expires_date`, or
-    `expired_quarantine_entry`), or `None` when it is."""
+    `expired_quarantine_entry`), or `None` when it is. A TOML native date counts
+    as its ISO text."""
     if expires is None:
         if required:
             return "missing_quarantine_expiry: table entries must carry an expires date"
         return None
+    expires = _expires_as_iso_text(expires)
     if not _is_valid_iso_date(expires):
         return f"malformed_expires_date: {expires!r}"
     if expires < today:
@@ -2423,8 +2524,8 @@ def _known_bug_eval_problem(
     miri_tag = ev.get("miri_outcome")
     anneal_tag = ev.get("anneal_outcome")
     if (
-        (isinstance(miri_tag, str) and miri_tag.startswith("oracle_error"))
-        or (isinstance(anneal_tag, str) and anneal_tag.startswith("capture_error"))
+        (isinstance(miri_tag, str) and miri_tag.startswith(MIRI_ERROR_TAG_PREFIXES))
+        or (isinstance(anneal_tag, str) and anneal_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES))
         or verdict not in ("diverge", "not_compared")
     ):
         return (
@@ -2488,6 +2589,7 @@ def verify_no_stale_quarantine_or_known_bugs(
     reference_date: str | None = None,
     observed_quarantine_keys: set[str] | list[str] | None = None,
     covered_harnesses: set[str] | list[str] | None = None,
+    manifest_eval_exhaustive: bool = False,
 ) -> dict[str, Any]:
     """Fail-closed ratchet audit flagging stale `--quarantine-file` entries and stale
     `tests/miri-diff/manifest.toml` `known_anneal_bug` entries.
@@ -2519,7 +2621,10 @@ def verify_no_stale_quarantine_or_known_bugs(
     agreeing verdict (`stale_known_anneal_bug_now_passes`), a drifted Anneal tag
     (`stale_known_anneal_bug_tag_mismatch`), or an errored evaluation
     (`stale_known_anneal_bug_unconfirmed`) is stale. Tests the run did not evaluate
-    are never assumed to agree.
+    are never assumed to agree; when the run evaluated every manifest test
+    (`manifest_eval_exhaustive`, see `miri_summary_evaluates_every_manifest_test`),
+    a `known_anneal_bug` test it reported nothing for did not reproduce its open bug
+    and is stale too (`stale_known_anneal_bug_unconfirmed`).
     """
     ref_date = reference_date if reference_date is not None else utc_date_prefix()
     ledger_obj = ledger if isinstance(ledger, dict) else {}
@@ -2689,6 +2794,13 @@ def verify_no_stale_quarantine_or_known_bugs(
                     )
                     if problem is not None:
                         stale_m(clean_name, problem)
+                elif manifest_eval_exhaustive:
+                    stale_m(
+                        clean_name,
+                        "stale_known_anneal_bug_unconfirmed: the identity run evaluated "
+                        "every corpus test but reported no outcome for this one, so the "
+                        "open bug was not reproduced",
+                    )
 
     stale_entries = [*stale_quarantine, *stale_manifest]
     return {
@@ -2752,6 +2864,15 @@ def extract_manifest_eval_results_from_miri_summary(
                             results[fn_key]["repro_anneal_outcome"] = rec["anneal_outcome"]
 
     return results if results else None
+
+
+def miri_summary_evaluates_every_manifest_test(miri: dict[str, Any]) -> bool:
+    """True for an identity-mode `miri-difftest` summary carrying `item_outcomes`:
+    the identity batch is the unmutated corpus, one candidate per manifest test, and
+    `item_outcomes` covers every compiled one, so a manifest test it does not report
+    was not evaluated (for example, it failed to compile). Seeded batches and legacy
+    summaries without `item_outcomes` say nothing about unreported tests."""
+    return miri.get("mode") == "identity" and isinstance(miri.get("item_outcomes"), dict)
 
 
 def normalize_anneal_tag(raw_tag: str) -> str:
@@ -3092,11 +3213,11 @@ def build_simulated_miri_summary(
     _bump(
         miri_verdicts,
         "error"
-        if miri_outcome.startswith("oracle_error")
+        if miri_outcome.startswith(MIRI_ERROR_TAG_PREFIXES)
         else ("pass" if m_kind.startswith("pass:") else m_kind),
     )
     a_kind = anneal_outcome.partition("@")[0]
-    if anneal_outcome.startswith("capture_error"):
+    if anneal_outcome.startswith(ANNEAL_ERROR_TAG_PREFIXES):
         _bump(anneal_outcomes, "error")
     elif anneal_outcome.startswith("externalCall"):
         _bump(anneal_outcomes, "external_call")
@@ -3698,6 +3819,7 @@ def run_campaign_gates(
     manifest_eval_results: dict[str, Any] | None = None,
     observed_quarantine_keys: set[str] | None = None,
     covered_harnesses: set[str] | None = None,
+    manifest_eval_exhaustive: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Runs the enabled gates and returns `(mutant_report, ratchet_report)`, each
     `None` when its gate is disabled. Without an evaluated run
@@ -3713,6 +3835,7 @@ def run_campaign_gates(
             manifest_eval_results=manifest_eval_results,
             observed_quarantine_keys=observed_quarantine_keys,
             covered_harnesses=covered_harnesses,
+            manifest_eval_exhaustive=manifest_eval_exhaustive,
         )
         if check_stale_ratchet
         else None
@@ -3726,6 +3849,16 @@ def gates_passed(
     return (mutant_report is None or mutant_report.get("passed") is True) and (
         ratchet_report is None or ratchet_report.get("passed") is True
     )
+
+
+def _md_table_cell(value: Any, code: bool = False) -> str:
+    """Renders `value` as one Markdown table cell: line breaks become spaces and `|`
+    is escaped so that a quarantine path, token, or reason cannot break the row (as
+    inline code, backticks become `'`)."""
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    if code:
+        return "`" + text.replace("`", "'") + "`"
+    return text
 
 
 def render_gate_report_sections(
@@ -3752,10 +3885,15 @@ def render_gate_report_sections(
                 f"{v.get('label')}: {v.get('exit_code')}, {v.get('kill_class')}"
                 for v in res.get("variants", [])
             )
+            baseline = (
+                f"{_md_table_cell(res.get('baseline_verdict', 'n/a'), code=True)} (exit "
+                f"{_md_table_cell(res.get('baseline_exit_code', 'n/a'), code=True)})"
+            )
             lines.append(
-                f"| `{res.get('id')}` | `{res.get('killed')}` | `{res.get('kill_class')}` | "
-                f"`{res.get('baseline_verdict', 'n/a')}` (exit "
-                f"`{res.get('baseline_exit_code', 'n/a')}`) | {variants or 'n/a'} |"
+                f"| {_md_table_cell(res.get('id'), code=True)} "
+                f"| {_md_table_cell(res.get('killed'), code=True)} "
+                f"| {_md_table_cell(res.get('kill_class'), code=True)} "
+                f"| {baseline} | {_md_table_cell(variants or 'n/a')} |"
             )
     if ratchet_report is not None:
         stale = ratchet_report.get("stale_entries", [])
@@ -3774,7 +3912,9 @@ def render_gate_report_sections(
             lines.extend(["", "| Source | Entry | Reason |", "| :--- | :--- | :--- |"])
             for e in stale:
                 lines.append(
-                    f"| `{e.get('source')}` | `{e.get('entry')}` | {e.get('reason')} |"
+                    f"| {_md_table_cell(e.get('source'), code=True)} "
+                    f"| {_md_table_cell(e.get('entry'), code=True)} "
+                    f"| {_md_table_cell(e.get('reason'))} |"
                 )
     return "\n".join(lines) + ("\n" if lines else "")
 
@@ -5958,6 +6098,11 @@ def main(argv: list[str] | None = None) -> int:
             ),
             observed_quarantine_keys=observed_quarantine_keys,
             covered_harnesses=covered_harnesses,
+            manifest_eval_exhaustive=bool(
+                miri_suite_healthy
+                and miri is not None
+                and miri_summary_evaluates_every_manifest_test(miri)
+            ),
         )
         gates_ok = gates_passed(mutant_report, ratchet_report)
         harness_or_red_flag_failed = (
