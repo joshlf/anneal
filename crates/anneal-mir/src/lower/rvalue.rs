@@ -14,9 +14,10 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::ir::{
-    AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, Constant, IntTy, IntrinsicOp,
-    LayoutError, Local, Mutability, NullOp, Operand, Place, PointerValue, ProjectionElem,
-    PtrWidth, RetagKind, Rvalue, Statement, Ty, UintTy, UnOp,
+    AdtDef, AdtKind, AggregateKind, BasicBlockData, BinOp, Body, CalleeSymbol, Constant, IntTy,
+    IntrinsicOp, LayoutError, Local, Mutability, NullOp, Operand, Place, PointerCoercionKind,
+    PointerValue, ProjectionElem, PtrWidth, RetagKind, Rvalue, Statement, Ty, UintTy, UnOp,
+    fn_ptr_addr, fn_ptr_provenance, fn_ptr_symbol, is_fn_ptr_provenance,
 };
 use crate::lower::cast::{
     AbstractByte, CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast,
@@ -24,7 +25,8 @@ use crate::lower::cast::{
     decode_int_bytes, decode_ptr_bytes, encode_int_bytes, encode_ptr_bytes,
     eval_char_to_int, eval_int_to_int, eval_int_to_ptr_with_ptr_width,
     eval_ptr_to_int_with_ptr_width, eval_transmute, is_valid_pointer_coercion,
-    lower_cast_rvalue_with_ptr_width,
+    lower_cast_rvalue_with_ptr_width, null_pointer_payload, reify_target, unsize_array_len,
+    wide_ptr_len_valid,
 };
 use crate::lower::cfg::{LoweredTerminator, TerminatorLowerError, lower_terminator};
 
@@ -146,6 +148,11 @@ pub enum RvalueLowerError {
         bb: usize,
         error: TerminatorLowerError,
     },
+    /// A dynamically sized type (`[T]`, `str`, or a type containing one by value) used where
+    /// a sized type is required: a local's declared type, a by-value `Copy`/`Move` operand, an
+    /// assigned, deinitialized, or retagged place, or a layout query (see
+    /// [`Ty::is_sized`]).
+    UnsizedType(Ty),
 }
 
 /// Maps a [`LayoutError`] of `ty` to the corresponding [`RvalueLowerError`].
@@ -157,6 +164,7 @@ pub(crate) fn lower_layout_error(ty: &Ty, err: LayoutError) -> RvalueLowerError 
             ty: ty.clone(),
             reason,
         },
+        LayoutError::Unsized => RvalueLowerError::UnsizedType(ty.clone()),
     }
 }
 
@@ -291,6 +299,9 @@ impl std::fmt::Display for RvalueLowerError {
             RvalueLowerError::InvalidTerminator { bb, error } => {
                 write!(f, "invalid terminator in bb{bb}: {error}")
             }
+            RvalueLowerError::UnsizedType(ty) => {
+                write!(f, "dynamically sized type {ty:?} cannot be used by value here")
+            }
         }
     }
 }
@@ -329,6 +340,12 @@ pub enum LoweredRvalue {
     Len {
         place: Place,
         static_len: usize,
+        ty: Ty,
+    },
+    /// `Rvalue::Len(place)` of a dynamically sized slice place (`*s` or `(*s)[a..b]` with `s` a
+    /// wide slice pointer), whose length is the dynamic metadata (typed `usize`).
+    SliceLen {
+        place: Place,
         ty: Ty,
     },
     Cast {
@@ -401,6 +418,7 @@ impl LoweredRvalue {
             | LoweredRvalue::Ref { ty, .. }
             | LoweredRvalue::RawPtr { ty, .. }
             | LoweredRvalue::Len { ty, .. }
+            | LoweredRvalue::SliceLen { ty, .. }
             | LoweredRvalue::Cast { ty, .. }
             | LoweredRvalue::BinaryOp { ty, .. }
             | LoweredRvalue::CheckedBinaryOp { ty, .. }
@@ -482,9 +500,12 @@ pub struct LoweredBody {
 /// Mirrors `rustc`'s MIR validator: `Deref` requires a `RawPtr`/`Ref`; `Field(i, ty)`
 /// requires a tuple whose field `i` has exactly type `ty` (arrays have no fields);
 /// `Index`/`ConstantIndex`/`Subslice` require an array (and a `usize` index local / in-bounds
-/// constant offsets); `Downcast(_)` selects an ADT variant, which Anneal models as the tuple of
-/// that variant's fields, so it leaves the tuple type unchanged and subsequent `Field`
-/// projections are still fully type-checked.
+/// constant offsets) or a slice `[T]` (whose dynamic bounds are checked at runtime;
+/// `Subslice` of a slice is again a slice); `Downcast(_)` selects an ADT variant, which Anneal
+/// models as the tuple of that variant's fields, so it leaves the tuple type unchanged and
+/// subsequent `Field` projections are still fully type-checked. A place may have an unsized
+/// type (`[T]` or `str`, after `Deref` of a wide pointer); its users decide whether that is
+/// allowed.
 ///
 /// On a `Ty::Adt`, `Field(i, ty)` selects field `i` of a struct or union, and of variant `v`
 /// of an enum only directly after `Downcast(v)` (with `v` in range); `Downcast` is invalid on
@@ -556,6 +577,36 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
                 };
                 Ty::Array(elem_ty, new_len as usize)
             }
+            // Projections of a dynamically sized slice `[T]` (after `Deref` of a wide pointer),
+            // whose bounds are checked against the dynamic length at runtime. Only the
+            // statically decidable parts are checked here: a `usize` index local, a 1-based
+            // `from_end` constant index, and an ordered `from <= to` front subslice.
+            (ProjectionElem::Index(idx_local), Ty::Slice(elem_ty)) => {
+                let Some(idx_ty) = local_decls.get(idx_local.0) else {
+                    return Err(RvalueLowerError::UnknownLocal(*idx_local));
+                };
+                if *idx_ty != Ty::Uint(UintTy::Usize) {
+                    return Err(RvalueLowerError::InvalidIndexType(idx_ty.clone()));
+                }
+                *elem_ty
+            }
+            (
+                ProjectionElem::ConstantIndex {
+                    offset, from_end, ..
+                },
+                Ty::Slice(elem_ty),
+            ) => {
+                if *from_end && *offset == 0 {
+                    return Err(invalid(Ty::Slice(elem_ty)));
+                }
+                *elem_ty
+            }
+            (ProjectionElem::Subslice { from, to, from_end }, Ty::Slice(elem_ty)) => {
+                if !*from_end && from > to {
+                    return Err(invalid(Ty::Slice(elem_ty)));
+                }
+                Ty::Slice(elem_ty)
+            }
             (ProjectionElem::Downcast(v), ty @ (Ty::Tuple(_) | Ty::Adt(_))) => {
                 if !matches!(place.projection.get(i + 1), Some(ProjectionElem::Field(..)))
                     || !downcast_allowed(&ty, *v)
@@ -604,10 +655,18 @@ fn union_fields_of(ty: &Ty) -> Option<&[Ty]> {
     }
 }
 
-/// Resolves the static `Ty` of an `Operand` against `local_decls`.
+/// Resolves the static `Ty` of an `Operand` against `local_decls`. A `Copy`/`Move` operand
+/// reads its place by value, so the place must have a sized type
+/// ([`RvalueLowerError::UnsizedType`] for `[T]` / `str`).
 pub fn resolve_operand_ty(operand: &Operand, local_decls: &[Ty]) -> Result<Ty, RvalueLowerError> {
     match operand {
-        Operand::Copy(place) | Operand::Move(place) => resolve_place_ty(place, local_decls),
+        Operand::Copy(place) | Operand::Move(place) => {
+            let ty = resolve_place_ty(place, local_decls)?;
+            if !ty.is_sized() {
+                return Err(RvalueLowerError::UnsizedType(ty));
+            }
+            Ok(ty)
+        }
         Operand::Constant(constant) => Ok(constant.ty()),
     }
 }
@@ -616,8 +675,8 @@ pub fn resolve_operand_ty(operand: &Operand, local_decls: &[Ty]) -> Result<Ty, R
 /// - `Constant::Int(bits, ty)` requires an `Int`/`Uint` type and `bits` within the type's
 ///   width (signed constants may also be given in sign-extended `i128` form, e.g.
 ///   `u128::MAX` for `-1i8`);
-/// - `Constant::Ptr(ptr, ty)` requires a `RawPtr`/`Ref` type, an address within the target
-///   pointer width, and a non-null address for references.
+/// - `Constant::Ptr(ptr, ty)` requires a thin `RawPtr`/`Ref` type, an address within the
+///   target pointer width, and a non-null address for references.
 fn check_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<(), &'static str> {
     match constant {
         Constant::Int(bits, ty) => {
@@ -639,6 +698,9 @@ fn check_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<(), &'stat
         Constant::Ptr(ptr, ty) => {
             if !ty.is_any_ptr() {
                 return Err("Constant::Ptr must carry a RawPtr or Ref type");
+            }
+            if ty.is_wide_ptr() {
+                return Err("Constant::Ptr must carry a thin pointer type (it has no metadata)");
             }
             if u128::from(ptr.addr) > ptr_width.mask() {
                 return Err("Constant::Ptr address exceeds the target pointer width");
@@ -721,6 +783,7 @@ pub fn resolve_offset_of(
                         ty: cur_ty.clone(),
                         reason,
                     },
+                    LayoutError::Unsized => RvalueLowerError::UnsizedType(cur_ty.clone()),
                 })?;
             total_offset = total_offset
                 .checked_add(offset)
@@ -816,7 +879,9 @@ fn validate_binop_types(
             Ok((lhs_ty.clone(), None))
         }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            if lhs_ty != rhs_ty || !lhs_ty.is_scalar() {
+            // Scalars (including thin pointers and function pointers) and wide pointers of the
+            // same type (compared lexicographically on `(data address, metadata)`).
+            if lhs_ty != rhs_ty || !(lhs_ty.is_scalar() || lhs_ty.is_wide_ptr()) {
                 return Err(RvalueLowerError::BinaryTypeMismatch {
                     op,
                     lhs_ty: lhs_ty.clone(),
@@ -826,9 +891,13 @@ fn validate_binop_types(
             Ok((Ty::Bool, None))
         }
         BinOp::Cmp => {
-            // Three-way comparison (`Cmp`) requires matching Int, Uint, Bool, or Char (rejects pointers).
-            let valid_scalar =
-                lhs_ty.is_integral() || matches!(lhs_ty, Ty::Bool | Ty::Char);
+            // Three-way comparison (`Cmp`) requires matching Int, Uint, Bool, or Char, or (as
+            // `Trusted`'s `evalWidePtrAggregateRelBinOp` / function pointer comparisons) matching
+            // wide pointers or function pointers; thin pointers are rejected.
+            let valid_scalar = lhs_ty.is_integral()
+                || matches!(lhs_ty, Ty::Bool | Ty::Char)
+                || lhs_ty.is_wide_ptr()
+                || lhs_ty.is_fn_ptr();
             if lhs_ty != rhs_ty || !valid_scalar {
                 return Err(RvalueLowerError::BinaryTypeMismatch {
                     op,
@@ -892,6 +961,11 @@ pub fn lower_rvalue_with_policy(
         Rvalue::Ref(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
             let ty = Ty::Ref(Box::new(pointee_ty), *mutability);
+            // A reference to an unsized place (`&*s`, `&(*s)[a..b]`) is a wide reference,
+            // whose slice element type must be valid.
+            if !ty.is_thin_ptr() {
+                check_layout(ty.clone(), ptr_width)?;
+            }
             Ok(LoweredRvalue::Ref {
                 mutability: *mutability,
                 place: place.clone(),
@@ -901,6 +975,9 @@ pub fn lower_rvalue_with_policy(
         Rvalue::RawPtr(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
             let ty = Ty::RawPtr(Box::new(pointee_ty), *mutability);
+            if !ty.is_thin_ptr() {
+                check_layout(ty.clone(), ptr_width)?;
+            }
             Ok(LoweredRvalue::RawPtr {
                 mutability: *mutability,
                 place: place.clone(),
@@ -918,6 +995,12 @@ pub fn lower_rvalue_with_policy(
                     })
                 }
                 Ty::Array(_, _) => Err(RvalueLowerError::LayoutTooLarge(place_ty)),
+                // A slice place is only reachable through `Deref` of a wide slice pointer
+                // (whose metadata is the dynamic length), optionally followed by `Subslice`s.
+                Ty::Slice(_) => Ok(LoweredRvalue::SliceLen {
+                    place: place.clone(),
+                    ty: Ty::Uint(UintTy::Usize),
+                }),
                 other => Err(RvalueLowerError::InvalidLenTarget(other)),
             }
         }
@@ -1049,7 +1132,11 @@ pub fn lower_rvalue_with_policy(
                     }
                 }
                 UnOp::PtrMetadata => {
-                    if operand_ty.is_any_ptr() {
+                    // Wide pointers carry their `usize` length; thin pointers, references, and
+                    // function pointers carry `()` metadata.
+                    if operand_ty.is_wide_ptr() {
+                        Ty::Uint(UintTy::Usize)
+                    } else if operand_ty.is_thin_ptr() || operand_ty.is_fn_ptr() {
                         Ty::unit()
                     } else {
                         return Err(RvalueLowerError::InvalidUnaryOp {
@@ -1182,6 +1269,36 @@ pub fn lower_rvalue_with_policy(
                 AggregateKind::RawPtr {
                     pointee,
                     mutability,
+                } if pointee.is_slice_like() => {
+                    // `ptr::slice_from_raw_parts(_mut)` / `ptr::from_raw_parts` of a slice or
+                    // `str` pointer (`Trusted`'s `evalAggregateRawPtr`): `rustc`'s validator
+                    // requires a thin raw data pointer of the same mutability and the pointee's
+                    // metadata type `usize`.
+                    if operands.len() != 2 {
+                        return Err(invalid(
+                            "wide RawPtr aggregate requires 2 operands (data_ptr, usize_len)",
+                        ));
+                    }
+                    let data_ok = matches!(
+                        &operand_tys[0],
+                        Ty::RawPtr(_, data_mutability)
+                            if data_mutability == mutability && operand_tys[0].is_thin_ptr()
+                    );
+                    if !data_ok {
+                        return Err(invalid(
+                            "wide RawPtr aggregate first operand must be a thin raw pointer of matching mutability",
+                        ));
+                    }
+                    if operand_tys[1] != Ty::Uint(UintTy::Usize) {
+                        return Err(invalid(
+                            "wide RawPtr aggregate second operand must be usize length metadata",
+                        ));
+                    }
+                    check_layout(Ty::RawPtr(Box::new(pointee.clone()), *mutability), ptr_width)?
+                }
+                AggregateKind::RawPtr {
+                    pointee,
+                    mutability,
                 } => {
                     if operands.len() != 2 {
                         return Err(invalid(
@@ -1192,7 +1309,9 @@ pub fn lower_rvalue_with_policy(
                     // mutability matches the constructed pointer's; Anneal additionally accepts a
                     // `usize` address (yielding a pointer without provenance).
                     let data_ok = match &operand_tys[0] {
-                        Ty::RawPtr(_, data_mutability) => data_mutability == mutability,
+                        Ty::RawPtr(_, data_mutability) => {
+                            data_mutability == mutability && operand_tys[0].is_thin_ptr()
+                        }
                         Ty::Uint(UintTy::Usize) => true,
                         _ => false,
                     };
@@ -1229,7 +1348,7 @@ pub fn lower_rvalue_with_policy(
         }
         Rvalue::ShallowInitBox(operand, inner_ty) => {
             let operand_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
-            if !operand_ty.is_raw_ptr() {
+            if !operand_ty.is_raw_ptr() || operand_ty.is_wide_ptr() {
                 return Err(RvalueLowerError::InvalidShallowInitBox {
                     operand_ty,
                     inner_ty: inner_ty.clone(),
@@ -1274,6 +1393,32 @@ fn wrapped_field_ty(ty: &Ty) -> Option<&Ty> {
     }
 }
 
+/// Returns true if `rvalue` initializes a place of the function item or closure carrier type
+/// `place_ty`, whose values Anneal represents exactly like the rvalue's: the (`()`-typed)
+/// function item constant `Constant::FnDef(t)` into `Ty::FnDef(t)`, and an
+/// `AggregateKind::Closure` of the upvars (typed as their tuple) into
+/// `Ty::Closure { upvars, .. }`.
+fn initializes_carrier_place(rvalue: &LoweredRvalue, place_ty: &Ty) -> bool {
+    match (rvalue, place_ty) {
+        (
+            LoweredRvalue::Use {
+                operand: Operand::Constant(Constant::FnDef(target)),
+                ..
+            },
+            Ty::FnDef(place_target),
+        ) => target == place_target,
+        (
+            LoweredRvalue::Aggregate {
+                kind: AggregateKind::Closure,
+                operand_tys,
+                ..
+            },
+            Ty::Closure { upvars, .. },
+        ) => operand_tys[..] == upvars[..],
+        _ => false,
+    }
+}
+
 /// Result type of `Rvalue::Discriminant` on a place of type `place_ty`: [`AdtDef::discr_ty`]
 /// for a `Ty::Adt` (the enum's `tag_ty` or `isize`; `u8` for structs and unions, as `rustc`'s
 /// `discriminant_ty`), and `isize` for every other type, matching the legacy model in which
@@ -1304,6 +1449,9 @@ pub fn lower_statement_with_policy(
     match stmt {
         Statement::Assign(place, rvalue) => {
             let place_ty = resolve_place_ty(place, local_decls)?;
+            if !place_ty.is_sized() {
+                return Err(RvalueLowerError::UnsizedType(place_ty));
+            }
             let lowered = lower_rvalue_with_policy(rvalue, local_decls, ptr_width, policy)?;
             let rvalue_ty = lowered.ty();
 
@@ -1329,7 +1477,7 @@ pub fn lower_statement_with_policy(
                         if operand_tys.len() == 1 && fields.get(*field_idx) == Some(&operand_tys[0])
                 )
             } else {
-                &place_ty == rvalue_ty
+                &place_ty == rvalue_ty || initializes_carrier_place(&lowered, &place_ty)
             };
 
             if !compatible {
@@ -1402,6 +1550,9 @@ pub fn lower_statement_with_policy(
         Statement::Nop => Ok(LoweredStatement::Nop),
         Statement::Deinit(place) => {
             let place_ty = resolve_place_ty(place, local_decls)?;
+            if !place_ty.is_sized() {
+                return Err(RvalueLowerError::UnsizedType(place_ty));
+            }
             Ok(LoweredStatement::Deinit {
                 place: place.clone(),
                 place_ty,
@@ -1409,6 +1560,9 @@ pub fn lower_statement_with_policy(
         }
         Statement::Retag(kind, place) => {
             let place_ty = resolve_place_ty(place, local_decls)?;
+            if !place_ty.is_sized() {
+                return Err(RvalueLowerError::UnsizedType(place_ty));
+            }
             if let RetagKind::Raw(mutability) = kind
                 && !matches!(&place_ty, Ty::RawPtr(_, m) if m == mutability)
             {
@@ -1550,6 +1704,20 @@ pub enum MirValue {
         fields: Vec<MirValue>,
         adt_def: Option<Arc<AdtDef>>,
     },
+    /// Wide pointer or reference to a slice or `str` (`ty` is `&[T]`, `&mut [T]`,
+    /// `*const [T]`, `*mut [T]`, or a `str` form; see [`Ty::is_wide_ptr`]): the data pointer
+    /// and the element count (byte count for `str`). A well-formed value has
+    /// `len <= ptr_width.max_usize()`, a data address within the pointer width, and, for a
+    /// reference, a non-null data pointer and a pointee of at most `isize::MAX` bytes.
+    WidePtr { data: PointerValue, len: usize, ty: Ty },
+    /// Function pointer (`ty` a [`Ty::FnPtr`]) reified from the callee `target`: its address
+    /// is [`crate::ir::fn_ptr_addr`]`(target)` (non-null) and, as a raw pointer, it carries
+    /// the provenance [`crate::ir::fn_ptr_provenance`]`(target)`.
+    FnPtr {
+        target: CalleeSymbol,
+        addr: u64,
+        ty: Ty,
+    },
 }
 
 /// Type alias for `MirValue`.
@@ -1643,6 +1811,21 @@ impl MirValue {
         }
     }
 
+    /// Extracts `(data, len)` if `self` is `MirValue::WidePtr`.
+    pub fn as_wide_ptr(&self) -> Option<(PointerValue, usize)> {
+        match self {
+            MirValue::WidePtr { data, len, .. } => Some((*data, *len)),
+            _ => None,
+        }
+    }
+
+    /// Constructs the function pointer value of type `ty` reified from `target` (at
+    /// [`crate::ir::fn_ptr_addr`]`(target)`).
+    pub fn fn_ptr(target: CalleeSymbol, ty: Ty) -> Self {
+        let addr = fn_ptr_addr(&target);
+        MirValue::FnPtr { target, addr, ty }
+    }
+
     /// Extracts `(wrapped_bits, overflowed)` from a checked binary operation tuple `(T, bool)`.
     pub fn as_checked_pair(&self) -> Option<(u128, bool)> {
         match self {
@@ -1664,7 +1847,9 @@ impl MirValue {
             MirValue::Int { ty, .. } => ty.clone(),
             MirValue::Bool(_) => Ty::Bool,
             MirValue::Char(_) => Ty::Char,
-            MirValue::Ptr { ty, .. } => ty.clone(),
+            MirValue::Ptr { ty, .. }
+            | MirValue::WidePtr { ty, .. }
+            | MirValue::FnPtr { ty, .. } => ty.clone(),
             MirValue::Unit => Ty::unit(),
             MirValue::Array { elements, elem_ty } => {
                 Ty::Array(Box::new(elem_ty.clone()), elements.len())
@@ -1802,6 +1987,21 @@ pub enum RvalueEvalError {
         op: IntrinsicOp,
         reason: &'static str,
     },
+    /// The memory range `[addr, addr + byte_len)` that a slice (or the array a slice is unsized
+    /// from) designates is not inside the synthetic allocation its pointer's provenance names
+    /// (undefined behavior: the pointer is dangling or out of bounds).
+    PointerOutOfBounds { addr: u64, byte_len: u128 },
+    /// A memory access through a pointer whose provenance is a function's (a function pointer
+    /// cast to a data pointer): functions have no readable or writable memory (undefined
+    /// behavior).
+    FnPtrMemoryAccess { addr: u64 },
+    /// A function pointer whose type is incompatible with the signature (argument count,
+    /// parameter or return types, or safety) of the linked function it points to was created
+    /// or called (undefined behavior).
+    FnPtrSignatureMismatch {
+        callee: CalleeSymbol,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for RvalueEvalError {
@@ -1931,6 +2131,21 @@ impl std::fmt::Display for RvalueEvalError {
             }
             RvalueEvalError::IntrinsicUb { op, reason } => {
                 write!(f, "intrinsic {op}: {reason} (UB)")
+            }
+            RvalueEvalError::PointerOutOfBounds { addr, byte_len } => {
+                write!(
+                    f,
+                    "memory range of {byte_len} bytes at {addr:#x} is outside its pointer's allocation (UB)"
+                )
+            }
+            RvalueEvalError::FnPtrMemoryAccess { addr } => {
+                write!(f, "memory access through function pointer {addr:#x} (UB)")
+            }
+            RvalueEvalError::FnPtrSignatureMismatch { callee, reason } => {
+                write!(
+                    f,
+                    "function pointer to `{callee}` has an incompatible signature: {reason} (UB)"
+                )
             }
         }
     }
@@ -2174,6 +2389,38 @@ pub(crate) fn compare_mir_values(
                 }));
             }
             Ok(aa.cmp(&ab))
+        }
+        // Wide pointers of one type compare lexicographically on `(data address, metadata)`
+        // (`Trusted`'s `evalWidePtrRelBinOp`), for every relational operator including `Cmp`.
+        (
+            lhs @ MirValue::WidePtr { ty: lhs_ty, .. },
+            rhs @ MirValue::WidePtr { ty: rhs_ty, .. },
+        ) if lhs_ty == rhs_ty && lhs_ty.is_wide_ptr() => {
+            check_value_well_formed(lhs, ptr_width)?;
+            check_value_well_formed(rhs, ptr_width)?;
+            let (MirValue::WidePtr { data: da, len: la, .. }, MirValue::WidePtr { data: db, len: lb, .. }) =
+                (lhs, rhs)
+            else {
+                unreachable!()
+            };
+            Ok((da.addr, *la).cmp(&(db.addr, *lb)))
+        }
+        // Function pointers of one type compare by address.
+        (
+            lhs @ MirValue::FnPtr {
+                addr: aa,
+                ty: lhs_ty,
+                ..
+            },
+            rhs @ MirValue::FnPtr {
+                addr: ab,
+                ty: rhs_ty,
+                ..
+            },
+        ) if lhs_ty == rhs_ty && lhs_ty.is_fn_ptr() => {
+            check_value_well_formed(lhs, ptr_width)?;
+            check_value_well_formed(rhs, ptr_width)?;
+            Ok(aa.cmp(ab))
         }
         _ => Err(RvalueEvalError::TypeMismatch(
             "comparison operands must have matching scalar types",
@@ -2590,7 +2837,7 @@ pub fn eval_unop(
             )),
         },
         UnOp::PtrMetadata => match val {
-            MirValue::Ptr { ptr, ty } if ty.is_any_ptr() => {
+            MirValue::Ptr { ptr, ty } if ty.is_thin_ptr() => {
                 let addr = checked_ptr_addr(ptr, ty, ptr_width)?;
                 if ty.is_ref() && addr == 0 {
                     return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -2600,8 +2847,19 @@ pub fn eval_unop(
                 }
                 Ok(MirValue::Unit)
             }
+            // The metadata of a wide pointer is its length, read without dereferencing the
+            // pointer (`Trusted`'s `evalUnaryPtrMetadata`) once the value is well formed (a
+            // null wide reference still faults).
+            MirValue::WidePtr { len, ty, .. } if ty.is_wide_ptr() => {
+                check_value_well_formed(val, ptr_width)?;
+                Ok(MirValue::unsigned(*len as u128, UintTy::Usize, ptr_width))
+            }
+            MirValue::FnPtr { ty, .. } if ty.is_fn_ptr() => {
+                check_value_well_formed(val, ptr_width)?;
+                Ok(MirValue::Unit)
+            }
             _ => Err(RvalueEvalError::TypeMismatch(
-                "UnOp::PtrMetadata requires pointer or reference operand",
+                "UnOp::PtrMetadata requires pointer, reference, or function pointer operand",
             )),
         },
     }
@@ -2707,6 +2965,52 @@ pub fn eval_aggregate(
         AggregateKind::RawPtr {
             pointee,
             mutability,
+        } if pointee.is_slice_like() => {
+            // `slice_from_raw_parts`: the thin data pointer (address and provenance) plus the
+            // `usize` length metadata (`Trusted`'s `evalAggregateRawPtr`).
+            let ty = Ty::RawPtr(Box::new(pointee.clone()), *mutability);
+            ty.check_representable(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(&ty, err)))?;
+            let [data_val, len_val] = operands.as_slice() else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "wide RawPtr aggregate requires 2 operands (data_ptr, usize_len)",
+                ));
+            };
+            let data = match data_val {
+                MirValue::Ptr {
+                    ptr,
+                    ty: data_ty @ Ty::RawPtr(_, data_mutability),
+                } if data_mutability == mutability && data_ty.is_thin_ptr() => {
+                    checked_ptr_addr(ptr, data_ty, ptr_width)?;
+                    *ptr
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "wide RawPtr aggregate data operand must be a thin raw pointer of matching mutability",
+                    ));
+                }
+            };
+            let len = match len_val {
+                MirValue::Int {
+                    bits,
+                    ty: len_ty @ Ty::Uint(UintTy::Usize),
+                } => {
+                    check_int_bits(*bits, len_ty, ptr_width)?;
+                    usize::try_from(*bits).map_err(|_| RvalueEvalError::EvaluationLimit {
+                        len: usize::MAX,
+                    })?
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "wide RawPtr aggregate metadata operand must be a usize length",
+                    ));
+                }
+            };
+            Ok(MirValue::WidePtr { data, len, ty })
+        }
+        AggregateKind::RawPtr {
+            pointee,
+            mutability,
         } => {
             if operands.len() != 2 {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -2721,8 +3025,8 @@ pub fn eval_aggregate(
             let ptr = match &operands[0] {
                 MirValue::Ptr {
                     ptr,
-                    ty: Ty::RawPtr(_, data_mutability),
-                } if data_mutability == mutability => PointerValue {
+                    ty: data_ty @ Ty::RawPtr(_, data_mutability),
+                } if data_mutability == mutability && data_ty.is_thin_ptr() => PointerValue {
                     addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
                     provenance: ptr.provenance,
                 },
@@ -2768,7 +3072,9 @@ fn encode_mir_value(
             }
             out.extend(encode_int_bytes(*bits, ty.byte_size_for(ptr_width)));
         }
-        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty })
+            if val_ty == ty && ty.is_thin_ptr() =>
+        {
             let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
             if !ty.is_valid_scalar_bits(addr_bits, ptr_width) {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -2777,6 +3083,27 @@ fn encode_mir_value(
                 }));
             }
             out.extend(encode_ptr_bytes(*ptr, ptr_width));
+        }
+        // A wide pointer is its data pointer followed by its `usize` metadata.
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::WidePtr { data, len, ty: val_ty })
+            if val_ty == ty && ty.is_wide_ptr() =>
+        {
+            check_value_well_formed(val, ptr_width)?;
+            out.extend(encode_ptr_bytes(*data, ptr_width));
+            out.extend(encode_int_bytes(*len as u128, ptr_width.byte_size()));
+        }
+        // A function pointer is its address with its function's provenance.
+        (Ty::FnPtr { .. }, MirValue::FnPtr { target, addr, ty: val_ty }) if val_ty == ty => {
+            check_value_well_formed(val, ptr_width)?;
+            out.extend(encode_ptr_bytes(fn_ptr_value(target, *addr)?, ptr_width));
+        }
+        // Function items occupy no bytes; closures are their upvar tuple.
+        (Ty::FnDef(_), MirValue::Unit) => {}
+        (Ty::Closure { upvars, .. }, MirValue::Unit) if upvars.is_empty() => {}
+        (Ty::Closure { upvars, .. }, MirValue::Tuple(values)) if values.len() == upvars.len() => {
+            for (value, field) in values.iter().zip(upvars) {
+                encode_mir_value(value, field, ptr_width, out)?;
+            }
         }
         (
             Ty::Array(elem, count),
@@ -2815,6 +3142,17 @@ fn encode_mir_value(
             else {
                 unreachable!()
             };
+            if let Some((niche, payload_ty)) = null_pointer_payload(def, ptr_width) {
+                return encode_null_pointer_niche_value(
+                    values,
+                    *variant_idx,
+                    def,
+                    niche,
+                    payload_ty,
+                    ptr_width,
+                    out,
+                );
+            }
             let field_tys = match &def.kind {
                 AdtKind::Enum {
                     tag_ty: Some(tag),
@@ -2857,6 +3195,98 @@ fn encode_mir_value(
     Ok(())
 }
 
+/// Reason a reifying coercion or function pointer encoding fails on a (theoretical) 64-bit
+/// tag collision of two callee symbols (see [`crate::ir::fn_ptr_provenance`]).
+const FN_PTR_TAG_COLLISION: &str =
+    "two callee symbols share a function-pointer provenance tag (FNV-1a collision)";
+
+/// The raw pointer of a function pointer to `target` at `addr`: the address with the
+/// function's provenance ([`crate::ir::fn_ptr_provenance`]).
+pub(crate) fn fn_ptr_value(target: &CalleeSymbol, addr: u64) -> Result<PointerValue, RvalueEvalError> {
+    let provenance =
+        fn_ptr_provenance(target).ok_or(RvalueEvalError::UnsupportedMemoryAccess(FN_PTR_TAG_COLLISION))?;
+    Ok(PointerValue {
+        addr,
+        provenance: Some(provenance),
+    })
+}
+
+/// Decodes the function pointer of type `ty` that the raw pointer `ptr` designates: it must be
+/// non-null (`InvalidBitPattern`, the function pointer niche) and carry the provenance of a
+/// reified function at offset `0` (its address [`crate::ir::fn_ptr_addr`]). Any other pointer
+/// (an integer without provenance, a data pointer, or an interior function address) is a
+/// function pointer value the value model cannot name a callee for (`UnsupportedMemoryAccess`;
+/// calling it would be undefined behavior).
+pub(crate) fn decode_fn_ptr(
+    ptr: PointerValue,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    let addr = checked_ptr_addr(&ptr, ty, ptr_width)?;
+    if addr == 0 {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ty.clone(),
+            bits: 0,
+        }));
+    }
+    let target = ptr
+        .provenance
+        .and_then(|prov| fn_ptr_symbol(&prov))
+        .filter(|target| u128::from(fn_ptr_addr(target)) == addr)
+        .ok_or(RvalueEvalError::UnsupportedMemoryAccess(
+            "function pointer without the provenance of a reified function at offset 0",
+        ))?;
+    Ok(MirValue::FnPtr {
+        target,
+        addr: addr as u64,
+        ty: ty.clone(),
+    })
+}
+
+/// [`encode_mir_value`] of the value of variant `variant_idx` (with field `values`) of the
+/// null-pointer-optimized enum `def` ([`AdtDef::null_pointer_niche`]): the payload variant is
+/// its payload pointer's bytes, the null variant all-zero bytes. The null variant of a wide
+/// payload leaves its metadata word uninitialized, which the abstract byte model (without
+/// uninitialized bytes) cannot represent, so it is `UnsupportedMemoryAccess` (reading those
+/// bytes as data would be undefined behavior).
+fn encode_null_pointer_niche_value(
+    values: &[MirValue],
+    variant_idx: usize,
+    def: &AdtDef,
+    niche: crate::ir::NullPointerNiche,
+    payload_ty: &Ty,
+    ptr_width: PtrWidth,
+    out: &mut Vec<AbstractByte>,
+) -> Result<(), RvalueEvalError> {
+    let Some(field_tys) = def.variant_fields(variant_idx) else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "transmute operand ADT variant out of range",
+        ));
+    };
+    if values.len() != field_tys.len() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "transmute operand ADT value does not match its field count",
+        ));
+    }
+    if variant_idx == niche.payload_variant {
+        encode_mir_value(&values[niche.payload_field], payload_ty, ptr_width, out)?;
+    } else {
+        if payload_ty.is_wide_ptr() {
+            return Err(RvalueEvalError::UnsupportedMemoryAccess(
+                "the null variant of a wide-pointer niche has uninitialized metadata bytes",
+            ));
+        }
+        out.extend(encode_int_bytes(0, payload_ty.byte_size_for(ptr_width)));
+    }
+    // The remaining fields are 1-ZSTs: they occupy no bytes but must match their types.
+    for (i, (value, field_ty)) in values.iter().zip(field_tys).enumerate() {
+        if variant_idx != niche.payload_variant || i != niche.payload_field {
+            encode_mir_value(value, field_ty, ptr_width, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Returns true if `ty` may contain a value restricted by a `scalar_valid_range` (a typed
 /// ADT with a range, directly or nested in arrays, tuples, or ADT fields).
 fn ty_has_scalar_range(ty: &Ty) -> bool {
@@ -2873,6 +3303,7 @@ fn ty_has_scalar_range(ty: &Ty) -> bool {
 fn scalar_value_bits(val: &MirValue) -> Option<u128> {
     match val {
         MirValue::Ptr { ptr, .. } => Some(u128::from(ptr.addr)),
+        MirValue::FnPtr { addr, .. } => Some(u128::from(*addr)),
         _ => val.as_bits(),
     }
 }
@@ -2935,8 +3366,10 @@ pub(crate) fn check_scalar_ranges(val: &MirValue, ptr_width: PtrWidth) -> Result
 
 /// Checks that a value entering the evaluator from outside (a body argument or a call
 /// handler's return value) is well formed: every integer leaf is a valid bit pattern of its
-/// type under `ptr_width`, every pointer address fits `ptr_width` (and `&T` is non-null), and
-/// every typed ADT respects its `scalar_valid_range` ([`check_scalar_ranges`]). Fails with
+/// type under `ptr_width`, every pointer address fits `ptr_width` (and `&T` is non-null),
+/// every wide pointer has a valid data pointer and length ([`MirValue::WidePtr`]), every
+/// function pointer is non-null at its callee's address ([`MirValue::FnPtr`]), and every typed
+/// ADT respects its `scalar_valid_range` ([`check_scalar_ranges`]). Fails with
 /// `CastEvalError::InvalidBitPattern` naming the offending leaf type and bits.
 pub(crate) fn check_value_well_formed(
     val: &MirValue,
@@ -2960,6 +3393,27 @@ pub(crate) fn check_value_well_formed(
                     || !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) =>
             {
                 invalid(ty, u128::from(ptr.addr))
+            }
+            MirValue::WidePtr { data, len, ty } => {
+                let addr = u128::from(data.addr);
+                if !ty.is_wide_ptr() || addr > ptr_width.mask() || (ty.is_ref() && addr == 0) {
+                    return invalid(ty, addr);
+                }
+                if !wide_ptr_len_valid(ty, *len as u128, ptr_width) {
+                    return invalid(ty, *len as u128);
+                }
+                Ok(())
+            }
+            MirValue::FnPtr { target, addr, ty } => {
+                let bits = u128::from(*addr);
+                if !ty.is_fn_ptr() || !ty.is_valid_scalar_bits(bits, ptr_width) {
+                    return invalid(ty, bits);
+                }
+                // A function pointer value always designates its callee's (offset-0) address.
+                if *addr != fn_ptr_addr(target) {
+                    return invalid(ty, bits);
+                }
+                Ok(())
             }
             MirValue::Array { elements, .. } => elements
                 .iter()
@@ -3019,7 +3473,9 @@ fn eval_identity_transmute_value(
                 ty: ty.clone(),
             })
         }
-        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty })
+            if val_ty == ty && ty.is_thin_ptr() =>
+        {
             let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
             if !ty.is_valid_scalar_bits(addr_bits, ptr_width) {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -3034,6 +3490,26 @@ fn eval_identity_transmute_value(
                 },
                 ty: ty.clone(),
             })
+        }
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::WidePtr { ty: val_ty, .. })
+            if val_ty == ty && ty.is_wide_ptr() =>
+        {
+            check_value_well_formed(val, ptr_width)?;
+            Ok(val.clone())
+        }
+        (Ty::FnPtr { .. }, MirValue::FnPtr { ty: val_ty, .. }) if val_ty == ty => {
+            check_value_well_formed(val, ptr_width)?;
+            Ok(val.clone())
+        }
+        (Ty::FnDef(_), MirValue::Unit) => Ok(MirValue::Unit),
+        (Ty::Closure { upvars, .. }, MirValue::Unit) if upvars.is_empty() => Ok(MirValue::Unit),
+        (Ty::Closure { upvars, .. }, MirValue::Tuple(values)) if values.len() == upvars.len() => {
+            let norm = values
+                .iter()
+                .zip(upvars)
+                .map(|(value, field)| eval_identity_transmute_value(value, field, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Tuple(norm))
         }
         (
             Ty::Array(elem, count),
@@ -3188,6 +3664,35 @@ fn decode_mir_value(
             bits: decode_int_bytes(bytes),
             ty: ty.clone(),
         }),
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) if ty.is_wide_ptr() => {
+            let ptr_bytes = ptr_width.byte_size();
+            let data = decode_ptr_bytes(&bytes[..ptr_bytes]);
+            let len_bits = decode_int_bytes(&bytes[ptr_bytes..2 * ptr_bytes]);
+            let len = usize::try_from(len_bits).map_err(|_| invalid(len_bits))?;
+            let val = MirValue::WidePtr {
+                data,
+                len,
+                ty: ty.clone(),
+            };
+            check_value_well_formed(&val, ptr_width)?;
+            Ok(val)
+        }
+        Ty::FnPtr { .. } => decode_fn_ptr(decode_ptr_bytes(bytes), ty, ptr_width),
+        Ty::FnDef(_) => Ok(MirValue::Unit),
+        Ty::Closure { upvars, .. } if upvars.is_empty() => Ok(MirValue::Unit),
+        Ty::Closure { upvars, .. } => {
+            let mut offset = 0usize;
+            let mut values = Vec::with_capacity(upvars.len());
+            for field in upvars {
+                let size = field.byte_size_for(ptr_width);
+                values.push(decode_mir_value(&bytes[offset..offset + size], field, ptr_width)?);
+                offset += size;
+            }
+            Ok(MirValue::Tuple(values))
+        }
+        Ty::Slice(_) | Ty::Str => Err(RvalueEvalError::CastEval(CastEvalError::UnsizedType {
+            ty: ty.clone(),
+        })),
         Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
             let ptr = decode_ptr_bytes(bytes);
             if !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) {
@@ -3230,6 +3735,30 @@ fn decode_mir_value(
                 return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
                     target_ty: ty.clone(),
                 }));
+            }
+            if let Some((niche, payload_ty)) = null_pointer_payload(def, ptr_width) {
+                // A null data pointer is the null variant, anything else the payload variant;
+                // the 1-ZST fields occupy no bytes.
+                let variant_idx = if decode_int_bytes(&bytes[..ptr_width.byte_size()]) == 0 {
+                    niche.null_variant
+                } else {
+                    niche.payload_variant
+                };
+                let field_tys = def.variant_fields(variant_idx).unwrap_or(&[]);
+                let values = field_tys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        if variant_idx == niche.payload_variant && i == niche.payload_field {
+                            decode_mir_value(bytes, payload_ty, ptr_width)
+                        } else {
+                            decode_mir_value(&[], field, ptr_width)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = MirValue::adt(def, variant_idx, values);
+                check_scalar_ranges(&value, ptr_width)?;
+                return Ok(value);
             }
             let (start, variant_idx, field_tys) = match &def.kind {
                 AdtKind::Enum {
@@ -3420,17 +3949,25 @@ fn eval_lowered_cast_with_decls(
             expose_provenance,
             ..
         } => {
-            let MirValue::Ptr { ptr, ty } = val else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "PtrToInt requires pointer value",
-                ));
+            // `lower_ptr_to_int` accepts thin raw pointers, thin references, and function
+            // pointers (exposing the function's provenance) as sources.
+            let ptr = match val {
+                MirValue::Ptr { ptr, ty } if ty == src_ty && src_ty.is_thin_ptr() => *ptr,
+                MirValue::FnPtr { target, addr, ty } if ty == src_ty && src_ty.is_fn_ptr() => {
+                    check_value_well_formed(val, ptr_width)?;
+                    fn_ptr_value(target, *addr)?
+                }
+                MirValue::Ptr { .. } | MirValue::FnPtr { .. } => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "PtrToInt operand type must match pointer or reference source type",
+                    ));
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "PtrToInt requires pointer value",
+                    ));
+                }
             };
-            // `lower_ptr_to_int` accepts raw pointers *and* references as sources.
-            if ty != src_ty || !src_ty.is_any_ptr() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "PtrToInt operand type must match pointer or reference source type",
-                ));
-            }
             if src_ty.is_ref() && (u128::from(ptr.addr) & ptr_width.mask()) == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: src_ty.clone(),
@@ -3444,7 +3981,7 @@ fn eval_lowered_cast_with_decls(
                 &mut suppressed
             };
             let bits =
-                eval_ptr_to_int_with_ptr_width(*ptr, target_ty, ptr_width, active_tracker)?;
+                eval_ptr_to_int_with_ptr_width(ptr, target_ty, ptr_width, active_tracker)?;
             Ok(MirValue::Int {
                 bits,
                 ty: target_ty.clone(),
@@ -3542,21 +4079,68 @@ fn eval_lowered_cast_with_decls(
         LoweredCast::PtrToPtr {
             src_ty, target_ty, ..
         } => {
-            let MirValue::Ptr { ptr, ty } = val else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "PtrToPtr requires pointer value",
-                ));
-            };
-            if ty != src_ty || !src_ty.is_raw_ptr() || !target_ty.is_raw_ptr() {
+            if !src_ty.is_raw_ptr() || !target_ty.is_raw_ptr() {
                 return Err(RvalueEvalError::TypeMismatch(
                     "PtrToPtr requires raw pointer source and target types matching operand",
                 ));
             }
+            match val {
+                MirValue::Ptr { ptr, ty } if ty == src_ty && src_ty.is_thin_ptr() => {
+                    if !target_ty.is_thin_ptr() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "PtrToPtr cannot cast a thin pointer to a wide pointer",
+                        ));
+                    }
+                    Ok(MirValue::Ptr {
+                        ptr: PointerValue {
+                            addr: (ptr.addr as u128 & ptr_width.mask()) as u64,
+                            provenance: ptr.provenance,
+                        },
+                        ty: target_ty.clone(),
+                    })
+                }
+                // Wide to thin drops the metadata; wide to wide keeps it unchanged (a
+                // `*const [u16]` of length 3 cast to `*const [u8]` has length 3).
+                MirValue::WidePtr { data, len, ty } if ty == src_ty => {
+                    check_value_well_formed(val, ptr_width)?;
+                    if target_ty.is_wide_ptr() {
+                        Ok(MirValue::WidePtr {
+                            data: *data,
+                            len: *len,
+                            ty: target_ty.clone(),
+                        })
+                    } else {
+                        Ok(MirValue::Ptr {
+                            ptr: *data,
+                            ty: target_ty.clone(),
+                        })
+                    }
+                }
+                MirValue::Ptr { .. } | MirValue::WidePtr { .. } => Err(RvalueEvalError::TypeMismatch(
+                    "PtrToPtr requires raw pointer source and target types matching operand",
+                )),
+                _ => Err(RvalueEvalError::TypeMismatch(
+                    "PtrToPtr requires pointer value",
+                )),
+            }
+        }
+        LoweredCast::FnPtrToPtr {
+            src_ty, target_ty, ..
+        } => {
+            let MirValue::FnPtr { target, addr, ty } = val else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "FnPtrToPtr requires a function pointer value",
+                ));
+            };
+            if ty != src_ty || !src_ty.is_fn_ptr() || !target_ty.is_raw_ptr() || !target_ty.is_thin_ptr()
+            {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "FnPtrToPtr requires a function pointer operand of the source type and a thin raw pointer target",
+                ));
+            }
+            check_value_well_formed(val, ptr_width)?;
             Ok(MirValue::Ptr {
-                ptr: PointerValue {
-                    addr: (ptr.addr as u128 & ptr_width.mask()) as u64,
-                    provenance: ptr.provenance,
-                },
+                ptr: fn_ptr_value(target, *addr)?,
                 ty: target_ty.clone(),
             })
         }
@@ -3578,18 +4162,32 @@ fn eval_lowered_cast_with_decls(
                 return eval_identity_transmute_value(val, src_ty, ptr_width);
             }
             let tv_in = match val {
-                MirValue::Ptr { ptr, ty } if ty == src_ty => TransmuteValue::Ptr(*ptr),
+                MirValue::Ptr { ptr, ty } if ty == src_ty && ty.is_thin_ptr() => {
+                    TransmuteValue::Ptr(*ptr)
+                }
+                MirValue::FnPtr { target, addr, ty } if ty == src_ty => {
+                    check_value_well_formed(val, ptr_width)?;
+                    TransmuteValue::Ptr(fn_ptr_value(target, *addr)?)
+                }
                 MirValue::Int { bits, ty } if ty == src_ty => TransmuteValue::Scalar(*bits),
                 MirValue::Bool(b) if *src_ty == Ty::Bool => TransmuteValue::Scalar(u128::from(*b)),
                 MirValue::Char(c) if *src_ty == Ty::Char => {
                     TransmuteValue::Scalar(u128::from(u32::from(*c)))
                 }
-                MirValue::Ptr { .. } | MirValue::Int { .. } | MirValue::Bool(_) | MirValue::Char(_) => {
+                MirValue::Ptr { .. }
+                | MirValue::FnPtr { .. }
+                | MirValue::Int { .. }
+                | MirValue::Bool(_)
+                | MirValue::Char(_) => {
                     return Err(RvalueEvalError::TypeMismatch(
                         "transmute operand value does not match its source type",
                     ));
                 }
-                MirValue::Unit | MirValue::Array { .. } | MirValue::Tuple(_) | MirValue::Adt { .. } => {
+                MirValue::Unit
+                | MirValue::Array { .. }
+                | MirValue::Tuple(_)
+                | MirValue::Adt { .. }
+                | MirValue::WidePtr { .. } => {
                     let mut bytes = Vec::with_capacity(src_ty.byte_size_for(ptr_width));
                     encode_mir_value(val, src_ty, ptr_width, &mut bytes)?;
                     TransmuteValue::AbstractBytes(bytes)
@@ -3597,6 +4195,11 @@ fn eval_lowered_cast_with_decls(
             };
             let tv_out = eval_transmute(tv_in, src_ty, target_ty, ptr_width, policy, tracker)?;
             match tv_out {
+                // A function pointer is decoded from its raw pointer: it must be non-null and
+                // carry a reified function's provenance at offset 0.
+                TransmuteValue::Ptr(ptr) if target_ty.is_fn_ptr() => {
+                    decode_fn_ptr(ptr, target_ty, ptr_width)
+                }
                 TransmuteValue::Ptr(ptr) => Ok(MirValue::Ptr {
                     ptr,
                     ty: target_ty.clone(),
@@ -3631,25 +4234,113 @@ fn eval_lowered_cast_with_decls(
             coercion,
             src_ty,
             target_ty,
-            ..
+            operand,
         } => {
-            let MirValue::Ptr { ptr, ty } = val else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "PointerCoercion requires pointer value",
-                ));
+            let mismatch = || {
+                RvalueEvalError::TypeMismatch(
+                    "PointerCoercion requires a valid source and target type pair matching the operand",
+                )
             };
-            if ty != src_ty || !is_valid_pointer_coercion(*coercion, src_ty, target_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "PointerCoercion requires valid raw pointer source and target types matching operand",
-                ));
+            if !is_valid_pointer_coercion(*coercion, src_ty, target_ty) {
+                return Err(mismatch());
             }
-            Ok(MirValue::Ptr {
-                ptr: PointerValue {
-                    addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
-                    provenance: ptr.provenance,
-                },
-                ty: target_ty.clone(),
-            })
+            match coercion {
+                PointerCoercionKind::MutToConstPointer | PointerCoercionKind::ArrayToPointer => {
+                    match val {
+                        MirValue::Ptr { ptr, ty } if ty == src_ty && ty.is_thin_ptr() => {
+                            Ok(MirValue::Ptr {
+                                ptr: PointerValue {
+                                    addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
+                                    provenance: ptr.provenance,
+                                },
+                                ty: target_ty.clone(),
+                            })
+                        }
+                        // `*mut [T] -> *const [T]` (and `str`) keeps the data pointer and length.
+                        MirValue::WidePtr { data, len, ty }
+                            if ty == src_ty
+                                && *coercion == PointerCoercionKind::MutToConstPointer =>
+                        {
+                            check_value_well_formed(val, ptr_width)?;
+                            Ok(MirValue::WidePtr {
+                                data: *data,
+                                len: *len,
+                                ty: target_ty.clone(),
+                            })
+                        }
+                        _ => Err(mismatch()),
+                    }
+                }
+                PointerCoercionKind::Unsize => {
+                    let MirValue::Ptr { ptr, ty } = val else {
+                        return Err(mismatch());
+                    };
+                    let Some(len) = unsize_array_len(src_ty, target_ty).filter(|_| ty == src_ty)
+                    else {
+                        return Err(mismatch());
+                    };
+                    if len as u128 > ptr_width.max_usize() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Unsize array length exceeds the target's usize::MAX",
+                        ));
+                    }
+                    let addr = checked_ptr_addr(ptr, src_ty, ptr_width)?;
+                    if src_ty.is_ref() && addr == 0 {
+                        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                            target_ty: src_ty.clone(),
+                            bits: 0,
+                        }));
+                    }
+                    let local_count =
+                        slots.map_or(local_decls.len(), |s| s.len().min(local_decls.len()));
+                    let is_dead = |loc: usize| {
+                        slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead)))
+                    };
+                    let frame = SliceFrame {
+                        decls: local_decls,
+                        local_count,
+                        is_dead: &is_dead,
+                        frame_addr_base,
+                        ptr_width,
+                    };
+                    check_slice_backing(&frame, ptr, len, target_ty, SliceUse::Create, None)?;
+                    Ok(MirValue::WidePtr {
+                        data: *ptr,
+                        len,
+                        ty: target_ty.clone(),
+                    })
+                }
+                PointerCoercionKind::UnsafeFnPointer => {
+                    let MirValue::FnPtr { target, addr, ty } = val else {
+                        return Err(mismatch());
+                    };
+                    if ty != src_ty {
+                        return Err(mismatch());
+                    }
+                    check_value_well_formed(val, ptr_width)?;
+                    Ok(MirValue::FnPtr {
+                        target: target.clone(),
+                        addr: *addr,
+                        ty: target_ty.clone(),
+                    })
+                }
+                PointerCoercionKind::ReifyFnPointer
+                | PointerCoercionKind::ReifyFnPointerWithSafety(_)
+                | PointerCoercionKind::ClosureFnPointer(_)
+                | PointerCoercionKind::ClosureFnPointerAnySafety => {
+                    let target = reify_target(*coercion, operand, src_ty).map_err(|_| mismatch())?;
+                    // A function item or non-capturing closure is a zero-sized value.
+                    if !val.is_unit() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "reifying coercion requires a zero-sized function item or closure value",
+                        ));
+                    }
+                    if fn_ptr_provenance(&target).is_none() {
+                        return Err(RvalueEvalError::UnsupportedMemoryAccess(FN_PTR_TAG_COLLISION));
+                    }
+                    Ok(MirValue::fn_ptr(target, target_ty.clone()))
+                }
+            }
         }
     }
 }
@@ -3682,8 +4373,21 @@ pub(crate) fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
         (MirValue::Int { ty, .. }, expected) => ty.is_integral() && ty == expected,
         (MirValue::Bool(_), Ty::Bool) => true,
         (MirValue::Char(_), Ty::Char) => true,
-        (MirValue::Ptr { ty, .. }, expected) => ty.is_any_ptr() && ty == expected,
+        (MirValue::Ptr { ty, .. }, expected) => ty.is_thin_ptr() && ty == expected,
+        (MirValue::WidePtr { ty, .. }, expected) => ty.is_wide_ptr() && ty == expected,
+        (MirValue::FnPtr { ty, .. }, expected) => ty.is_fn_ptr() && ty == expected,
         (MirValue::Unit, Ty::Tuple(fields)) => fields.is_empty(),
+        // Function items and closures are carried by value: a function item is zero-sized
+        // and a closure is the tuple of its captured upvars.
+        (MirValue::Unit, Ty::FnDef(_)) => true,
+        (MirValue::Unit, Ty::Closure { upvars, .. }) => upvars.is_empty(),
+        (MirValue::Tuple(vals), Ty::Closure { upvars, .. }) => {
+            vals.len() == upvars.len()
+                && vals
+                    .iter()
+                    .zip(upvars)
+                    .all(|(v, t)| mir_value_matches_ty(v, t))
+        }
         (
             MirValue::Array { elements, elem_ty },
             Ty::Array(expected_elem, expected_len),
@@ -3789,6 +4493,7 @@ fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
             elem_ty == &**expected_elem && elements.len() == *expected_len
         }
         (MirValue::Tuple(vals), Ty::Tuple(field_tys)) => vals.len() == field_tys.len(),
+        (MirValue::Tuple(vals), Ty::Closure { upvars, .. }) => vals.len() == upvars.len(),
         (
             MirValue::Adt {
                 active_field: None,
@@ -4020,10 +4725,16 @@ where
                     "Downcast projection must be followed by Field",
                 ));
             }
-            let Ty::Array(elem_ty, len) = cur_ty else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "array projection applied to a non-array place",
-                ));
+            // A slice `[T]` (after `Deref` of a wide pointer) has no static length: its
+            // bounds are checked against the wide pointer's length when it is dereferenced.
+            let (elem_ty, len) = match cur_ty {
+                Ty::Array(elem_ty, len) => (elem_ty, Some(*len)),
+                Ty::Slice(elem_ty) => (elem_ty, None),
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "array projection applied to a non-array place",
+                    ));
+                }
             };
             if let Some(decls) = local_decls
                 && decls.get(idx_local.0) != Some(&Ty::Uint(UintTy::Usize))
@@ -4034,17 +4745,19 @@ where
             }
             if let Some(read_idx) = read_index {
                 let idx_bits = read_idx(*idx_local)?;
-                let Ok(i) = usize::try_from(idx_bits) else {
-                    return Err(RvalueEvalError::IndexOutOfBounds {
-                        index: idx_bits,
-                        len: *len,
-                    });
-                };
-                if i >= *len {
-                    return Err(RvalueEvalError::IndexOutOfBounds {
-                        index: idx_bits,
-                        len: *len,
-                    });
+                if let Some(len) = len {
+                    let Ok(i) = usize::try_from(idx_bits) else {
+                        return Err(RvalueEvalError::IndexOutOfBounds {
+                            index: idx_bits,
+                            len,
+                        });
+                    };
+                    if i >= len {
+                        return Err(RvalueEvalError::IndexOutOfBounds {
+                            index: idx_bits,
+                            len,
+                        });
+                    }
                 }
             }
             validate_projection_tail(elem_ty, rest, local_decls, read_index, full_place, None)
@@ -4059,12 +4772,26 @@ where
                     "Downcast projection must be followed by Field",
                 ));
             }
-            let Ty::Array(elem_ty, len) = cur_ty else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "array projection applied to a non-array place",
-                ));
+            let elem_ty = match cur_ty {
+                Ty::Array(elem_ty, len) => {
+                    let _ = resolve_constant_index(*len, *offset, *min_length, *from_end)?;
+                    elem_ty
+                }
+                Ty::Slice(elem_ty) => {
+                    if *from_end && *offset == 0 {
+                        return Err(RvalueEvalError::IndexOutOfBounds {
+                            index: 0,
+                            len: 0,
+                        });
+                    }
+                    elem_ty
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "array projection applied to a non-array place",
+                    ));
+                }
             };
-            let _ = resolve_constant_index(*len, *offset, *min_length, *from_end)?;
             validate_projection_tail(elem_ty, rest, local_decls, read_index, full_place, None)
         }
         ProjectionElem::Subslice {
@@ -4077,13 +4804,26 @@ where
                     "Downcast projection must be followed by Field",
                 ));
             }
-            let Ty::Array(elem_ty, len) = cur_ty else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "array projection applied to a non-array place",
-                ));
+            let sub_ty = match cur_ty {
+                Ty::Array(elem_ty, len) => {
+                    let (start, end) = resolve_subslice_range(*len, *from, *to, *from_end)?;
+                    Ty::Array(elem_ty.clone(), end - start)
+                }
+                Ty::Slice(_) => {
+                    if !*from_end && from > to {
+                        return Err(RvalueEvalError::IndexOutOfBounds {
+                            index: u128::from(*from),
+                            len: 0,
+                        });
+                    }
+                    cur_ty.clone()
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "array projection applied to a non-array place",
+                    ));
+                }
             };
-            let (start, end) = resolve_subslice_range(*len, *from, *to, *from_end)?;
-            let sub_ty = Ty::Array(elem_ty.clone(), end - start);
             validate_projection_tail(&sub_ty, rest, local_decls, read_index, full_place, None)
         }
     }
@@ -5535,6 +6275,14 @@ pub fn eval_lowered_rvalue(
                     "Ref/RawPtr lowered ty does not match rvalue kind and mutability",
                 ));
             }
+            if ref_ty.is_wide_ptr() {
+                return eval_wide_ref_in(
+                    &ValuesFrame::new(locals, ptr_width),
+                    place,
+                    ref_ty,
+                    expected_ref,
+                );
+            }
             let ptr = match place.projection.as_slice() {
                 [] => {
                     // Synthetic, page-aligned per-local allocation with a fresh provenance.
@@ -5618,11 +6366,28 @@ pub fn eval_lowered_rvalue(
             }
             Ok(MirValue::unsigned(*static_len as u128, UintTy::Usize, ptr_width))
         }
+        LoweredRvalue::SliceLen { place, ty } => {
+            if *ty != Ty::Uint(UintTy::Usize) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "slice Len result type must be usize",
+                ));
+            }
+            let len = eval_slice_len_in(&ValuesFrame::new(locals, ptr_width), place)?;
+            Ok(MirValue::unsigned(len as u128, UintTy::Usize, ptr_width))
+        }
         LoweredRvalue::Cast { cast, ty } => {
             let op = cast.operand();
             let v = eval_op(op)?;
-            // Only `PointerWithExposedProvenance` consults the frame's (value-typed) layout.
-            let decls: Vec<Ty> = if matches!(cast, LoweredCast::IntToPtr { .. }) {
+            // Only `PointerWithExposedProvenance` and `Unsize` (checking the backing array of
+            // a frame-local pointer) consult the frame's (value-typed) layout.
+            let decls: Vec<Ty> = if matches!(
+                cast,
+                LoweredCast::IntToPtr { .. }
+                    | LoweredCast::PointerCoercion {
+                        coercion: PointerCoercionKind::Unsize,
+                        ..
+                    }
+            ) {
                 locals.iter().map(MirValue::ty).collect()
             } else {
                 Vec::new()
@@ -5895,6 +6660,10 @@ pub fn eval_lowered_rvalue(
                     },
                     ty: ty.clone(),
                 })
+            }
+            val @ MirValue::WidePtr { .. } if val.ty() == *ty => {
+                check_value_well_formed(&val, ptr_width)?;
+                Ok(val)
             }
             _ => Err(RvalueEvalError::TypeMismatch(
                 "CopyForDeref requires a pointer value matching the place type",
@@ -6843,8 +7612,11 @@ impl StatementEvalState {
             }
             return match self.read_resolved_place(target_local, &target_proj, &index_cache, place)? {
                 // A raw pointer may be null, unaligned, or dangling, but its address must still
-                // be a valid bit pattern of the target's pointer width.
-                val @ MirValue::Ptr { .. } => check_value_well_formed(&val, self.ptr_width),
+                // be a valid bit pattern of the target's pointer width (and a wide pointer's
+                // length a valid `usize`).
+                val @ (MirValue::Ptr { .. } | MirValue::WidePtr { .. }) => {
+                    check_value_well_formed(&val, self.ptr_width)
+                }
                 _ => Err(RvalueEvalError::TypeMismatch(
                     "Retag(Raw) place must hold a pointer value",
                 )),
@@ -8821,6 +9593,67 @@ fn check_retagged_reference(
     Ok(())
 }
 
+/// Validates the wide reference with data pointer `data` and length `len` of type `ref_ty`
+/// (`&[T]` / `&mut [T]` / `&str` / `&mut str`) for `Statement::Retag`: its data address must
+/// be non-null and within the pointer width (`InvalidBitPattern`), its length a valid `usize`
+/// (`InvalidBitPattern`), its data pointer aligned to `T` (`MisalignedPointer`), and its
+/// pointee `[addr, addr + len * size_of::<T>())` at most `isize::MAX` bytes without wrapping
+/// the address space (`PointerRangeOverflow`). A non-empty pointee in the synthetic allocation
+/// of a storage-dead local dangles (`DeadLocal`).
+fn check_retagged_wide_reference(
+    data: &PointerValue,
+    len: usize,
+    ref_ty: &Ty,
+    ctx: RetagCtx<'_>,
+) -> Result<(), RvalueEvalError> {
+    let ptr_width = ctx.ptr_width;
+    let Some(elem_ty) = ref_ty.wide_ptr_elem_ty() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "wide retag requires a slice or str reference type",
+        ));
+    };
+    let addr = u128::from(data.addr);
+    if addr == 0 || addr > ptr_width.mask() {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_ty.clone(),
+            bits: addr,
+        }));
+    }
+    if len as u128 > ptr_width.max_usize() {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Uint(UintTy::Usize),
+            bits: len as u128,
+        }));
+    }
+    let elem_layout = elem_ty
+        .layout_for(ptr_width)
+        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?;
+    if !addr.is_multiple_of(elem_layout.align as u128) {
+        return Err(RvalueEvalError::MisalignedPointer {
+            addr: addr as u64,
+            required_align: elem_layout.align,
+        });
+    }
+    let byte_len = len as u128 * elem_layout.size as u128;
+    if byte_len > ptr_width.max_isize() as u128
+        || addr
+            .checked_add(byte_len)
+            .is_none_or(|end| end > ptr_width.max_usize())
+    {
+        return Err(RvalueEvalError::PointerRangeOverflow {
+            addr: addr as u64,
+            byte_len,
+        });
+    }
+    if byte_len > 0
+        && let Some(local) = resolve_synthetic_alloc_local(data, ctx.slots.len())
+        && matches!(ctx.slots[local], LocalSlotState::Dead)
+    {
+        return Err(RvalueEvalError::DeadLocal(Local(local)));
+    }
+    Ok(())
+}
+
 /// Validates every reference reachable in the initialized value `val` of type `ty` for
 /// `Statement::Retag` (skipping union contents and subtrees without references).
 fn retag_value(val: &MirValue, ty: &Ty, ctx: RetagCtx<'_>) -> Result<(), RvalueEvalError> {
@@ -8833,6 +9666,9 @@ fn retag_value(val: &MirValue, ty: &Ty, ctx: RetagCtx<'_>) -> Result<(), RvalueE
     match (ty, val) {
         (Ty::Ref(pointee, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
             check_retagged_reference(ptr, ty, pointee, ctx)
+        }
+        (Ty::Ref(_, _), MirValue::WidePtr { data, len, ty: val_ty }) if val_ty == ty => {
+            check_retagged_wide_reference(data, *len, ty, ctx)
         }
         (Ty::Array(elem, _), MirValue::Array { elements, .. }) => {
             for element in elements {
@@ -9279,6 +10115,365 @@ fn read_frame_place<F: FrameView + ?Sized>(
     }
 }
 
+/// How a wide pointer's backing memory is used ([`check_slice_backing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceUse {
+    /// Creating a wide pointer (an `Unsize` coercion or a reborrow), which accesses no memory:
+    /// only a reference must be non-null, aligned, and dereferenceable.
+    Create,
+    /// Dereferencing a wide pointer for a place access or `Rvalue::Len`.
+    Access,
+}
+
+/// The frame against which a wide pointer's backing range is checked
+/// ([`check_slice_backing`]).
+struct SliceFrame<'a> {
+    decls: &'a [Ty],
+    local_count: usize,
+    is_dead: &'a dyn Fn(usize) -> bool,
+    frame_addr_base: u128,
+    ptr_width: PtrWidth,
+}
+
+/// Checks the backing range `[addr, addr + len * size_of::<T>())` of the wide pointer with
+/// data pointer `data` and length `len` of type `ptr_ty` (pointee `[T]` or `str`, whose
+/// element `u8`), following `Trusted`'s slice backing checks (`evalUnsizeCoercion`,
+/// `evalPlaceLen`):
+/// - `len` must fit the target's `usize` and the address its pointer width
+///   (`InvalidBitPattern`);
+/// - a reference, and any dereferenced pointer ([`SliceUse::Access`]), must be non-null
+///   (`InvalidBitPattern` for a reference, `NullPointerAccess` otherwise), aligned to `T`
+///   (`MisalignedPointer`), and designate at most `isize::MAX` bytes without wrapping the
+///   address space (`PointerRangeOverflow`);
+/// - with the synthetic provenance of a local of `frame`, that local must be live
+///   (`DeadLocal`) and its allocation must contain the range (`PointerOutOfBounds`), for raw
+///   pointers as well;
+/// - with a function's provenance ([`crate::ir::is_fn_ptr_provenance`]), a non-empty range of
+///   a reference or access is `FnPtrMemoryAccess` (functions have no data memory);
+/// - without provenance, a non-empty range of a reference dangles (`PointerOutOfBounds`) and
+///   a non-empty access cannot be resolved (`UnsupportedPlaceProjection` of `full_place`).
+///
+/// Provenance of an allocation outside `frame` (another frame or an external allocation) is
+/// not checked.
+fn check_slice_backing(
+    frame: &SliceFrame<'_>,
+    data: &PointerValue,
+    len: usize,
+    ptr_ty: &Ty,
+    use_: SliceUse,
+    full_place: Option<&Place>,
+) -> Result<(), RvalueEvalError> {
+    let ptr_width = frame.ptr_width;
+    let Some(elem_ty) = ptr_ty.wide_ptr_elem_ty() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "slice backing check requires a wide pointer type",
+        ));
+    };
+    let elem_layout = elem_ty
+        .layout_for(ptr_width)
+        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?;
+    let addr = checked_ptr_addr(data, ptr_ty, ptr_width)?;
+    if len as u128 > ptr_width.max_usize() {
+        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Uint(UintTy::Usize),
+            bits: len as u128,
+        }));
+    }
+    let byte_len = len as u128 * elem_layout.size as u128;
+    let constrained = ptr_ty.is_ref() || use_ == SliceUse::Access;
+    if constrained {
+        if addr == 0 {
+            if ptr_ty.is_ref() {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ptr_ty.clone(),
+                    bits: 0,
+                }));
+            }
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        if !addr.is_multiple_of(elem_layout.align as u128) {
+            return Err(RvalueEvalError::MisalignedPointer {
+                addr: addr as u64,
+                required_align: elem_layout.align,
+            });
+        }
+        if byte_len > ptr_width.max_isize() as u128
+            || addr
+                .checked_add(byte_len)
+                .is_none_or(|end| end > ptr_width.max_usize())
+        {
+            return Err(RvalueEvalError::PointerRangeOverflow {
+                addr: addr as u64,
+                byte_len,
+            });
+        }
+    }
+    match data.provenance {
+        Some(prov) if is_fn_ptr_provenance(&prov) => {
+            if constrained && byte_len > 0 {
+                return Err(RvalueEvalError::FnPtrMemoryAccess { addr: addr as u64 });
+            }
+            Ok(())
+        }
+        Some(_) => {
+            let Some(local) = resolve_synthetic_alloc_local(data, frame.local_count) else {
+                return Ok(());
+            };
+            if (frame.is_dead)(local) {
+                return Err(RvalueEvalError::DeadLocal(Local(local)));
+            }
+            let base = local_base_addr_in_frame(local, frame.decls, ptr_width, frame.frame_addr_base)?;
+            let decl_ty = &frame.decls[local];
+            let (alloc_size, _) = decl_ty
+                .alloc_size_and_align(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(decl_ty, err)))?;
+            let in_bounds = addr
+                .checked_sub(base)
+                .and_then(|rel| rel.checked_add(byte_len))
+                .is_some_and(|end| end <= alloc_size as u128);
+            if !in_bounds {
+                return Err(RvalueEvalError::PointerOutOfBounds {
+                    addr: addr as u64,
+                    byte_len,
+                });
+            }
+            Ok(())
+        }
+        None if constrained && byte_len > 0 => {
+            if ptr_ty.is_ref() {
+                return Err(RvalueEvalError::PointerOutOfBounds {
+                    addr: addr as u64,
+                    byte_len,
+                });
+            }
+            match full_place {
+                Some(place) => Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone())),
+                None => Ok(()),
+            }
+        }
+        None => Ok(()),
+    }
+}
+
+/// [`check_slice_backing`] against the locals of a [`FrameView`].
+fn check_slice_backing_in<F: FrameView + ?Sized>(
+    frame: &F,
+    data: &PointerValue,
+    len: usize,
+    ptr_ty: &Ty,
+    use_: SliceUse,
+    full_place: Option<&Place>,
+) -> Result<(), RvalueEvalError> {
+    let is_dead = |loc: usize| matches!(frame.frame_slot(loc), Some(FrameSlot::Dead));
+    let slice_frame = SliceFrame {
+        decls: frame.frame_decls(),
+        local_count: frame.frame_local_count(),
+        is_dead: &is_dead,
+        frame_addr_base: frame.frame_addr_base(),
+        ptr_width: frame.frame_ptr_width(),
+    };
+    check_slice_backing(&slice_frame, data, len, ptr_ty, use_, full_place)
+}
+
+/// The concrete pointer type and pointee of a dereferenced wide pointer of type `ptr_ty`
+/// with length `len`: the slice-like pointee `[T]` / `str` becomes the array `[T; len]` /
+/// `[u8; len]` the pointer designates, so a dereferenced slice resolves to (and projects
+/// within) the array or array window of a local like any thin array pointer.
+fn concretize_wide_ptr_ty(ptr_ty: &Ty, len: usize) -> Result<(Ty, Ty), RvalueEvalError> {
+    let Some(elem_ty) = ptr_ty.wide_ptr_elem_ty() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Deref of a wide pointer requires a slice or str pointee",
+        ));
+    };
+    let array_ty = Ty::Array(Box::new(elem_ty.clone()), len);
+    let Some(concrete_ptr_ty) = ptr_ty.with_pointee(array_ty.clone()) else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Deref of a wide pointer requires a pointer type",
+        ));
+    };
+    Ok((concrete_ptr_ty, array_ty))
+}
+
+/// Applies the `Subslice` projections `tail` (the projections after the last `Deref` of an
+/// unsized place) to a slice of length `len`, returning the window `(start, len)` in
+/// elements. Any other projection is a `TypeMismatch` (it would yield a sized place).
+fn apply_subslice_tail(
+    len: usize,
+    tail: &[ProjectionElem],
+) -> Result<(usize, usize), RvalueEvalError> {
+    let (mut start, mut cur_len) = (0usize, len);
+    for elem in tail {
+        let ProjectionElem::Subslice { from, to, from_end } = elem else {
+            return Err(RvalueEvalError::TypeMismatch(
+                "only Subslice projections keep a dereferenced slice unsized",
+            ));
+        };
+        let (s, e) = resolve_subslice_range(cur_len, *from, *to, *from_end)?;
+        start += s;
+        cur_len = e - s;
+    }
+    Ok((start, cur_len))
+}
+
+/// Reads the wide pointer that the unsized place `place` (of slice or `str` type) is
+/// dereferenced from: the value of the prefix before the last `Deref`, with the projections
+/// after it (only `Subslice`s keep the place unsized). Returns `(data, len, ptr_ty, tail)`.
+#[allow(clippy::type_complexity)]
+fn read_unsized_place_base<'p, F: FrameView + ?Sized>(
+    frame: &F,
+    place: &'p Place,
+) -> Result<(PointerValue, usize, Ty, &'p [ProjectionElem]), RvalueEvalError> {
+    let Some(last_deref_pos) = place
+        .projection
+        .iter()
+        .rposition(|p| matches!(p, ProjectionElem::Deref))
+    else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "an unsized place must be the Deref of a wide pointer",
+        ));
+    };
+    let ptr_place = Place {
+        local: place.local,
+        projection: place.projection[..last_deref_pos].to_vec(),
+    };
+    let (ptr_local, ptr_proj, ptr_index_cache) = resolve_deref_place_in(frame, &ptr_place, false)?;
+    let ptr_val = read_frame_place(frame, ptr_local, &ptr_proj, &ptr_index_cache, &ptr_place)?;
+    let MirValue::WidePtr { data, len, ty } = ptr_val else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Deref of an unsized place requires a wide pointer value",
+        ));
+    };
+    Ok((data, len, ty, &place.projection[last_deref_pos + 1..]))
+}
+
+/// Evaluates `Rvalue::Ref` / `Rvalue::RawPtr` (`expected_ref` for `Ref`) of type `ref_ty` of
+/// the unsized place `place` (`&(*s)`, `&(*s)[from..to]`, and the raw forms) in `frame`: the
+/// wide pointer `s` with its data pointer advanced by `start * size_of::<T>()` and the
+/// length of the `Subslice` window `[start, start + len)` (unchanged without `Subslice`s).
+///
+/// A reference base or result requires the base slice's backing range to be valid
+/// ([`check_slice_backing`]); a raw reborrow of a raw base computes the address only, and a
+/// non-zero offset needs provenance (`PointerArithmeticWithoutProvenance`).
+fn eval_wide_ref_in<F: FrameView + ?Sized>(
+    frame: &F,
+    place: &Place,
+    ref_ty: &Ty,
+    expected_ref: bool,
+) -> Result<MirValue, RvalueEvalError> {
+    let ptr_width = frame.frame_ptr_width();
+    let decls = frame.frame_decls();
+    let Some(base_decl_ty) = decls.get(place.local.0) else {
+        return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+    };
+    let Some(pointee_ty) = ref_ty.pointee_ty() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Ref/RawPtr lowered ty must have a pointee type",
+        ));
+    };
+    let leaf_ty = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+        base_decl_ty,
+        &place.projection,
+        Some(decls),
+        None,
+        place,
+        None,
+    )?;
+    if leaf_ty != *pointee_ty {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Ref/RawPtr projected place type does not match pointee type",
+        ));
+    }
+    if matches!(frame.frame_slot(place.local.0), Some(FrameSlot::Dead)) {
+        return Err(RvalueEvalError::DeadLocal(place.local));
+    }
+    let (data, len, base_ty, tail) = read_unsized_place_base(frame, place)?;
+    if base_ty.pointee_ty().and_then(Ty::slice_elem_ty) != pointee_ty.slice_elem_ty() {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Deref projection requires a wide pointer value with matching pointee type",
+        ));
+    }
+    let checked = expected_ref || base_ty.is_ref();
+    if checked {
+        check_slice_backing_in(frame, &data, len, &base_ty, SliceUse::Create, Some(place))?;
+    } else {
+        checked_ptr_addr(&data, &base_ty, ptr_width)?;
+    }
+    let (start, window_len) = apply_subslice_tail(len, tail)?;
+    let Some(elem_ty) = base_ty.wide_ptr_elem_ty() else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "Deref of a wide pointer requires a slice or str pointee",
+        ));
+    };
+    let elem_size = elem_ty
+        .layout_for(ptr_width)
+        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?
+        .size;
+    let byte_offset = start as u128 * elem_size as u128;
+    let base_addr = u128::from(data.addr);
+    if byte_offset != 0 && data.provenance.is_none() {
+        return Err(RvalueEvalError::PointerArithmeticWithoutProvenance {
+            addr: data.addr,
+            byte_offset: byte_offset as i128,
+        });
+    }
+    let Some(new_addr) = base_addr
+        .checked_add(byte_offset)
+        .filter(|end| *end <= ptr_width.max_usize())
+    else {
+        return Err(RvalueEvalError::PointerOffsetOverflow {
+            base_addr: data.addr,
+            offset: start as i128,
+            pointee_size: elem_size,
+        });
+    };
+    let new_data = PointerValue {
+        addr: new_addr as u64,
+        provenance: data.provenance,
+    };
+    if ref_ty.is_ref() {
+        check_slice_backing_in(frame, &new_data, window_len, ref_ty, SliceUse::Create, Some(place))?;
+    }
+    Ok(MirValue::WidePtr {
+        data: new_data,
+        len: window_len,
+        ty: ref_ty.clone(),
+    })
+}
+
+/// Evaluates `Rvalue::Len` of the slice place `place` (`Trusted`'s `evalPlaceLen` on `[T]`):
+/// the length of the wide pointer it is dereferenced from, narrowed by any `Subslice`
+/// projections after the `Deref`, after checking the slice's backing range
+/// ([`check_slice_backing`] for an access: a live, in-bounds allocation).
+fn eval_slice_len_in<F: FrameView + ?Sized>(
+    frame: &F,
+    place: &Place,
+) -> Result<usize, RvalueEvalError> {
+    let decls = frame.frame_decls();
+    let Some(base_decl_ty) = decls.get(place.local.0) else {
+        return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+    };
+    let leaf_ty = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+        base_decl_ty,
+        &place.projection,
+        Some(decls),
+        None,
+        place,
+        None,
+    )?;
+    if !matches!(leaf_ty, Ty::Slice(_)) {
+        return Err(RvalueEvalError::TypeMismatch(
+            "slice Len requires a place of slice type",
+        ));
+    }
+    if matches!(frame.frame_slot(place.local.0), Some(FrameSlot::Dead)) {
+        return Err(RvalueEvalError::DeadLocal(place.local));
+    }
+    let (data, len, base_ty, tail) = read_unsized_place_base(frame, place)?;
+    check_slice_backing_in(frame, &data, len, &base_ty, SliceUse::Access, Some(place))?;
+    let (_, window_len) = apply_subslice_tail(len, tail)?;
+    Ok(window_len)
+}
+
 /// Maps a synthetic local or sub-place pointer `ptr` (of type `ptr_ty` with pointee
 /// `pointee_ty`) back to `(Local(target_local), prefix_proj)` in `frame`.
 ///
@@ -9358,6 +10553,10 @@ fn resolve_synthetic_subplace_in<F: FrameView + ?Sized>(
             full_place.clone(),
         ));
     };
+    // A data pointer cast from a function pointer designates no readable or writable memory.
+    if is_fn_ptr_provenance(&prov) && pointee_size > 0 {
+        return Err(RvalueEvalError::FnPtrMemoryAccess { addr: addr as u64 });
+    }
     let Some(target_local) = prov
         .alloc_id
         .checked_sub(1)
@@ -9551,22 +10750,38 @@ fn resolve_deref_place_in<F: FrameView + ?Sized>(
     for (idx, elem) in place.projection.iter().enumerate() {
         if matches!(elem, ProjectionElem::Deref) {
             let ptr_val = read_frame_place(frame, cur_local, &cur_proj, &cur_index_cache, place)?;
-            let MirValue::Ptr { ptr, ty: ptr_ty } = ptr_val else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Deref projection requires a pointer value",
-                ));
-            };
-            let Some(pointee_ty) = ptr_ty.pointee_ty() else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Deref projection requires a pointer-typed place",
-                ));
+            let (ptr, ptr_ty, pointee_ty) = match ptr_val {
+                MirValue::Ptr { ptr, ty: ptr_ty } => {
+                    let Some(pointee_ty) = ptr_ty.pointee_ty().cloned() else {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Deref projection requires a pointer-typed place",
+                        ));
+                    };
+                    (ptr, ptr_ty, pointee_ty)
+                }
+                // A dereferenced slice designates the array `[T; len]` its backing range holds,
+                // which resolves (and projects) like the pointee of a thin array pointer.
+                MirValue::WidePtr {
+                    data,
+                    len,
+                    ty: ptr_ty,
+                } => {
+                    check_slice_backing_in(frame, &data, len, &ptr_ty, SliceUse::Access, Some(place))?;
+                    let (concrete_ptr_ty, array_ty) = concretize_wide_ptr_ty(&ptr_ty, len)?;
+                    (data, concrete_ptr_ty, array_ty)
+                }
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer value",
+                    ));
+                }
             };
             let allow_union_overwrite = allow_final_union_overwrite && idx + 1 == proj_len;
             let (next_local, next_proj) = resolve_synthetic_subplace_in(
                 frame,
                 &ptr,
                 &ptr_ty,
-                pointee_ty,
+                &pointee_ty,
                 place,
                 allow_union_overwrite,
             )?;
@@ -9635,20 +10850,37 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
         let tail = &place.projection[last_deref_pos + 1..];
         let (ptr_local, ptr_proj, ptr_index_cache) = resolve_deref_place_in(frame, &ptr_place, false)?;
         let ptr_val = read_frame_place(frame, ptr_local, &ptr_proj, &ptr_index_cache, &ptr_place)?;
-        let MirValue::Ptr {
-            ptr: base_ptr,
-            ty: base_ptr_ty,
-        } = ptr_val
-        else {
-            return Err(RvalueEvalError::TypeMismatch(
-                "Deref projection requires a pointer value",
-            ));
+        let (base_ptr, base_ptr_ty, deref_ty) = match ptr_val {
+            MirValue::Ptr {
+                ptr: base_ptr,
+                ty: base_ptr_ty,
+            } => {
+                let Some(deref_ty) = base_ptr_ty.pointee_ty().cloned() else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer-typed place",
+                    ));
+                };
+                (base_ptr, base_ptr_ty, deref_ty)
+            }
+            // `&(*s)[i]` / `&raw (*s)[i]` (a sized element of a slice): the slice is the
+            // array `[T; len]` its backing range holds (its sized tail is never empty).
+            MirValue::WidePtr { data, len, ty } if !tail.is_empty() => {
+                let use_ = if expected_ref || ty.is_ref() {
+                    SliceUse::Access
+                } else {
+                    SliceUse::Create
+                };
+                check_slice_backing_in(frame, &data, len, &ty, use_, Some(place))?;
+                let (concrete_ptr_ty, array_ty) = concretize_wide_ptr_ty(&ty, len)?;
+                (data, concrete_ptr_ty, array_ty)
+            }
+            _ => {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Deref projection requires a pointer value",
+                ));
+            }
         };
-        let Some(deref_ty) = base_ptr_ty.pointee_ty() else {
-            return Err(RvalueEvalError::TypeMismatch(
-                "Deref projection requires a pointer-typed place",
-            ));
-        };
+        let deref_ty = &deref_ty;
         if tail.is_empty() {
             if deref_ty != pointee_ty {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -12039,6 +13271,9 @@ pub fn eval_lowered_rvalue_in_state(
                     ));
                 }
             };
+            if ref_ty.is_wide_ptr() {
+                return eval_wide_ref_in(state, place, ref_ty, expected_ref);
+            }
             let ptr = match place.projection.as_slice() {
                 [] => {
                     if state.local_decls.get(place.local.0) != Some(pointee_ty) {
@@ -12126,6 +13361,15 @@ pub fn eval_lowered_rvalue_in_state(
                 UintTy::Usize,
                 state.ptr_width,
             ))
+        }
+        LoweredRvalue::SliceLen { place, ty } => {
+            if *ty != Ty::Uint(UintTy::Usize) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "slice Len result type must be usize",
+                ));
+            }
+            let len = eval_slice_len_in(&*state, place)?;
+            Ok(MirValue::unsigned(len as u128, UintTy::Usize, state.ptr_width))
         }
         LoweredRvalue::Cast { cast, ty } => {
             let op = cast.operand();
@@ -12363,6 +13607,10 @@ pub fn eval_lowered_rvalue_in_state(
                     ty: ty.clone(),
                 })
             }
+            val @ MirValue::WidePtr { .. } if val.ty() == *ty => {
+                check_value_well_formed(&val, state.ptr_width)?;
+                Ok(val)
+            }
             _ => Err(RvalueEvalError::TypeMismatch(
                 "CopyForDeref requires a pointer value matching the place type",
             )),
@@ -12477,6 +13725,8 @@ pub fn eval_lowered_statement(
                             ));
                         }
                     }
+                    // A wide pointer's data address and length must be well formed.
+                    val @ MirValue::WidePtr { .. } => check_value_well_formed(&val, state.ptr_width)?,
                     _ => {
                         return Err(RvalueEvalError::TypeMismatch(
                             "PlaceMention Deref requires an initialized pointer value",
