@@ -69,7 +69,8 @@ BENCH_END = "<!-- BENCH:END -->"
 DECISIONS = ("GO", "CONDITIONAL GO", "NO-GO")
 
 FAMILIES: dict[str, tuple[str, ...]] = {
-    "local_slots": ("naive_rfl", "naive_simp", "ablation_projection_rfl", "optimized_forcePureEnv"),
+    "local_slots": ("naive_rfl", "naive_simp", "ablation_projection_rfl", "live_two_pass_rfl",
+                    "optimized_forcePureEnv"),
     "struct_fields": ("naive_rfl", "naive_simp", "optimized_typedAt_lens"),
     "loop_trip": ("naive_fuel_rfl", "naive_fuel_simp", "optimized_runCfgToBlock_forRangeUp"),
 }
@@ -204,6 +205,10 @@ def proof(family: str, variant: str, k: int) -> str:
         if variant == "ablation_projection_rfl":
             return ("eq_of_forcePureEnv (n := 8)\n"
                     "    (by simp only [length_applySlotUpdates, List.length_cons, List.length_nil]) rfl")
+        if variant == "live_two_pass_rfl":
+            # The live `evalPureStmtNorm` strategy: bounds-checked `Trusted.Sequence.set?`
+            # followed by a full spine-forcing pass after every update.
+            return "applySlotUpdates_eq_of_twoPass rfl"
         if variant == "optimized_forcePureEnv":
             return "applySlotUpdates_eq_of_forced rfl"
     if family == "struct_fields":

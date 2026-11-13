@@ -1768,6 +1768,53 @@ theorem applySlotUpdatesLive?_oob {α : Type} (u : Nat × α) (ups : List (Nat �
     rw [ite_eq_right (Nat.not_lt.mpr h)]
   simp only [applySlotUpdatesLive?, hlive]
 
+/-- Two-pass step-wise forcing with the structure of the live
+`Anneal.MirLiftCore.evalPureStmtNorm` / `set?_of_forcePureEnv?` normalization: a
+bounds-checked `Trusted.Sequence.set?` followed by a full spine-forcing pass
+(`forceSpine?`, the generic form of `forcePureEnv?`, see `forceSpine?_eq_live`).
+Benchmarked as `local_slots/live_two_pass_rfl`. -/
+def applySlotUpdatesTwoPass {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match (Trusted.Sequence.set? env u.1 u.2).bind forceSpine? with
+    | some env' => applySlotUpdatesTwoPass ups env'
+    | none => none
+
+/-- The two-pass run computes exactly the live `Trusted.Sequence.set?` chain. -/
+theorem applySlotUpdatesTwoPass_eq_live? {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α),
+      applySlotUpdatesTwoPass ups env = applySlotUpdatesLive? ups env
+  | [], _ => rfl
+  | u :: ups, env => by
+    cases h : Trusted.Sequence.set? env u.1 u.2 with
+    | none => simp only [applySlotUpdatesTwoPass, applySlotUpdatesLive?, h, Option.bind_none]
+    | some e =>
+      simp only [applySlotUpdatesTwoPass, applySlotUpdatesLive?, h, Option.bind_some, forceSpine?_eq_some]
+      exact applySlotUpdatesTwoPass_eq_live? ups e
+
+/-- **Soundness of the live two-pass strategy**: a successful run (which implies
+that every update was in range) proves the unnormalized update sequence. -/
+theorem applySlotUpdates_eq_of_twoPass {α : Type} :
+    ∀ {ups : List (Nat × α)} {env flat : List α},
+      applySlotUpdatesTwoPass ups env = some flat → applySlotUpdates env ups = flat
+  | [], _, _, h => Option.some.inj h
+  | u :: ups, env, flat, h => by
+    have hset : ∀ e, Trusted.Sequence.set? env u.1 u.2 = some e → e = env.set u.1 u.2 := by
+      intro e he
+      unfold Trusted.Sequence.set? at he
+      by_cases hlt : u.1 < env.length
+      · rw [ite_eq_left hlt] at he
+        exact (Option.some.inj he).symm
+      · rw [ite_eq_right hlt] at he
+        cases he
+    cases hs : Trusted.Sequence.set? env u.1 u.2 with
+    | none => simp only [applySlotUpdatesTwoPass, hs, Option.bind_none] at h; cases h
+    | some e =>
+      simp only [applySlotUpdatesTwoPass, hs, Option.bind_some, forceSpine?_eq_some] at h
+      rw [show applySlotUpdates env (u :: ups) = applySlotUpdates (env.set u.1 u.2) ups from rfl,
+        ← hset e hs]
+      exact applySlotUpdates_eq_of_twoPass h
+
 /-- Single-pass constructor-forcing slot update over live `PureEnv`
 (`List LocalSlot`): checks bounds like `Trusted.Sequence.set?`, forces both the
 `List` spine and `LocalSlot` constructors (`.dead`, `.uninit`, `.init v`) along
@@ -5407,6 +5454,559 @@ theorem stage1_vs_stage2Only_two_arg_release_differs (r : ByteRange) (b : Nat)
   rw [hProt2]
   rfl
 
+/-! #### Conflict latches of unprotected tags are semantically inert (Round A2)
+
+The state difference exhibited by `stage1_vs_stage2Only_two_arg_release_differs` is a
+`ReservedFrz` conflict latch.  `LatchEquiv` relates trees that differ at most in the
+latches of tags that are unprotected; it is preserved by every tree operation of the
+model (accesses, retags, stage-1 release, call-id changes) and never changes a UB
+verdict, so such a difference is unobservable. -/
+
+/-- Erase the `ReservedFrz` conflict latch. -/
+def LocationState.eraseLatch (st : LocationState) : LocationState :=
+  match st.perm with
+  | .reservedFrz _ => ⟨.reservedFrz false, st.accessed⟩
+  | _ => st
+
+theorem LocationState.eraseLatch_accessed (st : LocationState) :
+    st.eraseLatch.accessed = st.accessed := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;> rfl
+
+theorem LocationState.eraseLatch_associatedAccess (st : LocationState) :
+    st.eraseLatch.perm.associatedAccess = st.perm.associatedAccess := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;> rfl
+
+theorem LocationState.ne_active_of_eraseLatch_eq {st st' : LocationState}
+    (h : st.eraseLatch = st'.eraseLatch) (h' : st'.perm ≠ .active) : st.perm ≠ .active := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;> rcases st' with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;>
+    first
+    | exact fun h₀ => Permission.noConfusion h₀
+    | exact absurd rfl h'
+    | exact absurd (congrArg LocationState.perm h) (fun h₀ => Permission.noConfusion h₀)
+
+/-- **Per-location latch inertness**: on an unprotected location the conflict latch
+changes neither the UB verdict nor the successor state (up to the latch). -/
+theorem performTransition_unprotected_eraseLatch (kind : AccessKind) (rel : AccessRelatedness)
+    (st : LocationState) :
+    (performTransition kind rel false st).map LocationState.eraseLatch =
+      (performTransition kind rel false st.eraseLatch).map LocationState.eraseLatch := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;> cases kind <;> cases rel <;> rfl
+
+theorem performTransition_unprotected_isSome_eraseLatch (kind : AccessKind)
+    (rel : AccessRelatedness) (st : LocationState) :
+    (performTransition kind rel false st).isSome =
+      (performTransition kind rel false st.eraseLatch).isSome := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _⟩ <;> cases kind <;> cases rel <;> rfl
+
+theorem eraseLatch_update_unprotected (kind : AccessKind) (rel : AccessRelatedness)
+    {st₁ st₂ : LocationState} (h : st₁.eraseLatch = st₂.eraseLatch) :
+    (match performTransition kind rel false st₁ with
+      | some st' => st' | none => st₁).eraseLatch =
+    (match performTransition kind rel false st₂ with
+      | some st' => st' | none => st₂).eraseLatch := by
+  have hmap : (performTransition kind rel false st₁).map LocationState.eraseLatch =
+      (performTransition kind rel false st₂).map LocationState.eraseLatch := by
+    rw [performTransition_unprotected_eraseLatch kind rel st₁, h,
+      ← performTransition_unprotected_eraseLatch kind rel st₂]
+  cases h₁ : performTransition kind rel false st₁ with
+  | none =>
+    cases h₂ : performTransition kind rel false st₂ with
+    | none => exact h
+    | some b => rw [h₁, h₂] at hmap; cases hmap
+  | some a =>
+    cases h₂ : performTransition kind rel false st₂ with
+    | none => rw [h₁, h₂] at hmap; cases hmap
+    | some b => rw [h₁, h₂] at hmap; exact Option.some.inj hmap
+
+theorem nodeAccessRelatedness_congr {t₁ t₂ : BorrowTree} (h : t₁.isAnc = t₂.isAnc)
+    (start : BorTag) (mode : ChildrenVisitMode) (n : BorTag) :
+    nodeAccessRelatedness t₁ start mode n = nodeAccessRelatedness t₂ start mode n := by
+  unfold nodeAccessRelatedness
+  rw [h]
+
+theorem isTagProtected_congr {t₁ t₂ : BorrowTree} (h : t₁.protector = t₂.protector)
+    (n : BorTag) (active : ActiveProtectors) :
+    t₁.isTagProtected n active = t₂.isTagProtected n active := by
+  unfold BorrowTree.isTagProtected
+  rw [h]
+
+theorem applyTreeAccess_locState_absent (tree : BorrowTree) (start : BorTag) (kind : AccessKind)
+    (range : ByteRange) (active : ActiveProtectors) (mode : ChildrenVisitMode) (n : BorTag)
+    (b : Nat) (h : tree.present n = false) :
+    (applyTreeAccess tree start kind range active mode).locState n b = tree.locState n b := by
+  simp only [applyTreeAccess, h, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
+theorem applyReleaseProtector_locState_absent (tree : BorrowTree) (t_rel : BorTag)
+    (active : ActiveProtectors) (n : BorTag) (b : Nat) (h : tree.present n = false) :
+    (applyReleaseProtector tree t_rel active).locState n b = tree.locState n b := by
+  simp only [applyReleaseProtector, h, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
+/-- Trees that agree except possibly on the conflict latches of tags that are
+unprotected under `active`. -/
+structure LatchEquiv (t₁ t₂ : BorrowTree) (active : ActiveProtectors) : Prop where
+  present_eq : t₁.present = t₂.present
+  isAnc_eq : t₁.isAnc = t₂.isAnc
+  protector_eq : t₁.protector = t₂.protector
+  erase_eq : ∀ n b, (t₁.locState n b).eraseLatch = (t₂.locState n b).eraseLatch
+  protected_eq : ∀ n b, t₁.isTagProtected n active = true → t₁.locState n b = t₂.locState n b
+
+theorem LatchEquiv.refl (t : BorrowTree) (active : ActiveProtectors) : LatchEquiv t t active :=
+  ⟨rfl, rfl, rfl, fun _ _ => rfl, fun _ _ _ => rfl⟩
+
+/-- Fewer protected tags (e.g. `GlobalState.endCall`, or a fresh call id that no
+existing tag uses) preserve the equivalence. -/
+theorem LatchEquiv.of_active {t₁ t₂ : BorrowTree} {active active' : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active)
+    (hact : ∀ n, t₁.isTagProtected n active' = true → t₁.isTagProtected n active = true) :
+    LatchEquiv t₁ t₂ active' :=
+  ⟨h.present_eq, h.isAnc_eq, h.protector_eq, h.erase_eq,
+    fun n b hn => h.protected_eq n b (hact n hn)⟩
+
+theorem LatchEquiv.transition_isSome {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (kind : AccessKind) (rel : AccessRelatedness) (n : BorTag)
+    (b : Nat) :
+    (performTransition kind rel (t₁.isTagProtected n active) (t₁.locState n b)).isSome =
+      (performTransition kind rel (t₂.isTagProtected n active) (t₂.locState n b)).isSome := by
+  rw [← isTagProtected_congr h.protector_eq]
+  cases hp : t₁.isTagProtected n active with
+  | true => rw [h.protected_eq n b hp]
+  | false =>
+    rw [performTransition_unprotected_isSome_eraseLatch kind rel (t₁.locState n b), h.erase_eq n b,
+      ← performTransition_unprotected_isSome_eraseLatch kind rel (t₂.locState n b)]
+
+/-- **Every access has the same UB verdict** on latch-equivalent trees. -/
+theorem LatchEquiv.noUB_iff {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (start : BorTag) (kind : AccessKind) (range : ByteRange)
+    (mode : ChildrenVisitMode) :
+    TreeAccessNoUB t₁ start kind range active mode ↔
+      TreeAccessNoUB t₂ start kind range active mode := by
+  constructor
+  · intro H n b hPres hb
+    have H₁ := H n b (by rw [h.present_eq]; exact hPres) hb
+    rw [nodeAccessRelatedness_congr h.isAnc_eq] at H₁
+    revert H₁
+    cases nodeAccessRelatedness t₂ start mode n with
+    | none => exact fun _ => trivial
+    | some rel =>
+      intro H₁
+      show (performTransition kind rel (t₂.isTagProtected n active) (t₂.locState n b)).isSome = true
+      rw [← h.transition_isSome kind rel n b]
+      exact H₁
+  · intro H n b hPres hb
+    have H₂ := H n b (by rw [← h.present_eq]; exact hPres) hb
+    rw [← nodeAccessRelatedness_congr h.isAnc_eq] at H₂
+    revert H₂
+    cases nodeAccessRelatedness t₁ start mode n with
+    | none => exact fun _ => trivial
+    | some rel =>
+      intro H₂
+      show (performTransition kind rel (t₁.isTagProtected n active) (t₁.locState n b)).isSome = true
+      rw [h.transition_isSome kind rel n b]
+      exact H₂
+
+/-- Accesses preserve latch equivalence. -/
+theorem LatchEquiv.access {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (start : BorTag) (kind : AccessKind) (range : ByteRange)
+    (mode : ChildrenVisitMode) :
+    LatchEquiv (applyTreeAccess t₁ start kind range active mode)
+      (applyTreeAccess t₂ start kind range active mode) active := by
+  have hstep : ∀ n b, t₁.present n = true → range.contains b = true →
+      (applyTreeAccess t₂ start kind range active mode).locState n b =
+        match nodeAccessRelatedness t₁ start mode n with
+        | some rel =>
+          match performTransition kind rel (t₁.isTagProtected n active) (t₂.locState n b) with
+          | some st' => st'
+          | none => t₂.locState n b
+        | none => t₂.locState n b := by
+    intro n b hP hb
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ (by rw [← h.present_eq]; exact hP) hb,
+      ← nodeAccessRelatedness_congr h.isAnc_eq, ← isTagProtected_congr h.protector_eq]
+  refine ⟨h.present_eq, h.isAnc_eq, h.protector_eq, fun n b => ?_, fun n b hn => ?_⟩
+  · cases hP : t₁.present n with
+    | false =>
+      rw [applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ hP,
+        applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ (by rw [← h.present_eq]; exact hP)]
+      exact h.erase_eq n b
+    | true =>
+      cases hb : range.contains b with
+      | false =>
+        rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb,
+          applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb]
+        exact h.erase_eq n b
+      | true =>
+        rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP hb, hstep n b hP hb]
+        cases nodeAccessRelatedness t₁ start mode n with
+        | none => exact h.erase_eq n b
+        | some rel =>
+          cases hx : t₁.isTagProtected n active with
+          | true => rw [h.protected_eq n b hx]
+          | false => exact eraseLatch_update_unprotected kind rel (h.erase_eq n b)
+  · have hn' : t₁.isTagProtected n active = true := hn
+    have hs := h.protected_eq n b hn'
+    cases hP : t₁.present n with
+    | false =>
+      rw [applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ hP,
+        applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ (by rw [← h.present_eq]; exact hP), hs]
+    | true =>
+      cases hb : range.contains b with
+      | false =>
+        rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb,
+          applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb, hs]
+      | true => rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP hb, hstep n b hP hb, hs]
+
+/-- Inserting the same fresh node preserves latch equivalence. -/
+theorem LatchEquiv.insert {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (t_parent t_child : BorTag) (prot : Option ProtectorKind)
+    (initPerm : Permission) :
+    LatchEquiv (insertChildNode t₁ t_parent t_child prot initPerm)
+      (insertChildNode t₂ t_parent t_child prot initPerm) active := by
+  refine ⟨?_, ?_, ?_, fun n b => ?_, fun n b hn => ?_⟩
+  · show (fun t => decide (t = t_child) || t₁.present t) = (fun t => decide (t = t_child) || t₂.present t)
+    rw [h.present_eq]
+  · show (fun a d => if d = t_child then decide (a = t_child) || t₁.isAnc a t_parent
+        else if a = t_child then false else t₁.isAnc a d) =
+      (fun a d => if d = t_child then decide (a = t_child) || t₂.isAnc a t_parent
+        else if a = t_child then false else t₂.isAnc a d)
+    rw [h.isAnc_eq]
+  · show (fun t => if t = t_child then prot else t₁.protector t) =
+      (fun t => if t = t_child then prot else t₂.protector t)
+    rw [h.protector_eq]
+  · by_cases hc : n = t_child
+    · rw [hc, insertChildNode_locState_child, insertChildNode_locState_child]
+    · rw [insertChildNode_locState_of_ne _ _ _ _ _ hc, insertChildNode_locState_of_ne _ _ _ _ _ hc]
+      exact h.erase_eq n b
+  · by_cases hc : n = t_child
+    · rw [hc, insertChildNode_locState_child, insertChildNode_locState_child]
+    · rw [insertChildNode_locState_of_ne _ _ _ _ _ hc, insertChildNode_locState_of_ne _ _ _ _ _ hc]
+      rw [insertChildNode_isTagProtected_of_ne _ _ _ _ _ hc] at hn
+      exact h.protected_eq n b hn
+
+/-- Retags preserve latch equivalence. -/
+theorem LatchEquiv.retag {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (t_parent t_child : BorTag) (prot : Option ProtectorKind)
+    (initPerm : Permission) (range : ByteRange) :
+    LatchEquiv (retagChild t₁ t_parent t_child prot initPerm range active)
+      (retagChild t₂ t_parent t_child prot initPerm range active) active :=
+  (h.insert t_parent t_child prot initPerm).access t_child .read range
+    .visitChildrenOfAccessed
+
+theorem LatchEquiv.released_eq {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (t_rel : BorTag) (b : Nat) :
+    (t₂.locState t_rel b).accessed = (t₁.locState t_rel b).accessed ∧
+      (t₂.locState t_rel b).perm.associatedAccess = (t₁.locState t_rel b).perm.associatedAccess := by
+  refine ⟨?_, ?_⟩
+  · rw [← LocationState.eraseLatch_accessed (t₂.locState t_rel b), ← h.erase_eq t_rel b,
+      LocationState.eraseLatch_accessed]
+  · rw [← LocationState.eraseLatch_associatedAccess (t₂.locState t_rel b), ← h.erase_eq t_rel b,
+      LocationState.eraseLatch_associatedAccess]
+
+/-- Stage-1 release preserves latch equivalence. -/
+theorem LatchEquiv.release {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (t_rel : BorTag) :
+    LatchEquiv (applyReleaseProtector t₁ t_rel active)
+      (applyReleaseProtector t₂ t_rel active) active := by
+  have hstep : ∀ n b, t₁.present n = true → (t₁.locState t_rel b).accessed = true →
+      (applyReleaseProtector t₂ t_rel active).locState n b =
+        match nodeAccessRelatedness t₁ t_rel .skipChildrenOfAccessed n with
+        | some rel =>
+          match performTransition (t₁.locState t_rel b).perm.associatedAccess rel
+              (t₁.isTagProtected n active) (t₂.locState n b) with
+          | some st' => st'
+          | none => t₂.locState n b
+        | none => t₂.locState n b := by
+    intro n b hP hA
+    obtain ⟨hacc, hkind⟩ := h.released_eq t_rel b
+    rw [applyReleaseProtector_locState_acc _ _ _ _ _ (by rw [← h.present_eq]; exact hP)
+      (by rw [hacc]; exact hA), ← nodeAccessRelatedness_congr h.isAnc_eq,
+      ← isTagProtected_congr h.protector_eq, hkind]
+  have hunacc : ∀ n b, (t₁.locState t_rel b).accessed = false →
+      (applyReleaseProtector t₂ t_rel active).locState n b = t₂.locState n b := by
+    intro n b hA
+    exact applyReleaseProtector_locState_unacc _ _ _ _ _
+      (by rw [(h.released_eq t_rel b).1]; exact hA)
+  refine ⟨h.present_eq, h.isAnc_eq, h.protector_eq, fun n b => ?_, fun n b hn => ?_⟩
+  · cases hP : t₁.present n with
+    | false =>
+      rw [applyReleaseProtector_locState_absent _ _ _ _ _ hP,
+        applyReleaseProtector_locState_absent _ _ _ _ _ (by rw [← h.present_eq]; exact hP)]
+      exact h.erase_eq n b
+    | true =>
+      cases hA : (t₁.locState t_rel b).accessed with
+      | false =>
+        rw [applyReleaseProtector_locState_unacc _ _ _ _ _ hA, hunacc n b hA]
+        exact h.erase_eq n b
+      | true =>
+        rw [applyReleaseProtector_locState_acc _ _ _ _ _ hP hA, hstep n b hP hA]
+        cases nodeAccessRelatedness t₁ t_rel .skipChildrenOfAccessed n with
+        | none => exact h.erase_eq n b
+        | some rel =>
+          cases hx : t₁.isTagProtected n active with
+          | true => rw [h.protected_eq n b hx]
+          | false => exact eraseLatch_update_unprotected _ rel (h.erase_eq n b)
+  · have hn' : t₁.isTagProtected n active = true := hn
+    have hs := h.protected_eq n b hn'
+    cases hP : t₁.present n with
+    | false =>
+      rw [applyReleaseProtector_locState_absent _ _ _ _ _ hP,
+        applyReleaseProtector_locState_absent _ _ _ _ _ (by rw [← h.present_eq]; exact hP), hs]
+    | true =>
+      cases hA : (t₁.locState t_rel b).accessed with
+      | false => rw [applyReleaseProtector_locState_unacc _ _ _ _ _ hA, hunacc n b hA, hs]
+      | true => rw [applyReleaseProtector_locState_acc _ _ _ _ _ hP hA, hstep n b hP hA, hs]
+
+/-- Stage-1 release has the same UB verdict on latch-equivalent trees. -/
+theorem LatchEquiv.releaseNoUB_iff {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) (t_rel : BorTag) :
+    releaseProtectorNoUB t₁ t_rel active ↔ releaseProtectorNoUB t₂ t_rel active := by
+  constructor
+  · intro H n b hPres hA
+    obtain ⟨hacc, hkind⟩ := h.released_eq t_rel b
+    have H₁ := H n b (by rw [h.present_eq]; exact hPres) (by rw [← hacc]; exact hA)
+    rw [nodeAccessRelatedness_congr h.isAnc_eq] at H₁
+    revert H₁
+    cases nodeAccessRelatedness t₂ t_rel .skipChildrenOfAccessed n with
+    | none => exact fun _ => trivial
+    | some rel =>
+      intro H₁
+      show (performTransition (t₂.locState t_rel b).perm.associatedAccess rel
+        (t₂.isTagProtected n active) (t₂.locState n b)).isSome = true
+      rw [hkind, ← h.transition_isSome _ rel n b]
+      exact H₁
+  · intro H n b hPres hA
+    obtain ⟨hacc, hkind⟩ := h.released_eq t_rel b
+    have H₂ := H n b (by rw [← h.present_eq]; exact hPres) (by rw [hacc]; exact hA)
+    rw [← nodeAccessRelatedness_congr h.isAnc_eq] at H₂
+    revert H₂
+    cases nodeAccessRelatedness t₁ t_rel .skipChildrenOfAccessed n with
+    | none => exact fun _ => trivial
+    | some rel =>
+      intro H₂
+      show (performTransition (t₁.locState t_rel b).perm.associatedAccess rel
+        (t₁.isTagProtected n active) (t₁.locState n b)).isSome = true
+      rw [h.transition_isSome _ rel n b, ← hkind]
+      exact H₂
+
+theorem nodeAccessRelatedness_isAnc_of_local {tree : BorrowTree} {start n : BorTag}
+    {mode : ChildrenVisitMode} (h : nodeAccessRelatedness tree start mode n = some .localAccess) :
+    tree.isAnc n start = true := by
+  cases hA : tree.isAnc n start with
+  | true => rfl
+  | false =>
+    unfold nodeAccessRelatedness at h
+    rw [ite_eq_right (by rw [hA]; exact Bool.false_ne_true)] at h
+    cases mode with
+    | visitChildrenOfAccessed => cases h
+    | skipChildrenOfAccessed =>
+      by_cases hd : tree.isAnc start n = true
+      · rw [ite_eq_left hd] at h
+        cases h
+      · rw [ite_eq_right hd] at h
+        cases h
+
+theorem nodeAccessRelatedness_not_isAnc_of_foreign {tree : BorrowTree} {start n : BorTag}
+    {mode : ChildrenVisitMode} (h : nodeAccessRelatedness tree start mode n = some .foreignAccess) :
+    tree.isAnc n start = false := by
+  cases hA : tree.isAnc n start with
+  | false => rfl
+  | true =>
+    rw [nodeAccessRelatedness_anc hA] at h
+    cases h
+
+theorem Permission.associatedAccess_of_ne_active {p : Permission} (h : p ≠ .active) :
+    p.associatedAccess = .read := by
+  cases p <;> first | rfl | exact absurd rfl h
+
+theorem eraseLatch_update_localRead (prot : Bool) {st : LocationState} (h : st.accessed = true) :
+    (match performTransition .read .localAccess prot st with
+      | some st' => st' | none => st).eraseLatch = st.eraseLatch := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> first | (cases prot <;> rfl) | cases h
+
+theorem eraseLatch_update_foreignRead (prot : Bool) {st : LocationState} (h : st.perm ≠ .active) :
+    (match performTransition .read .foreignAccess prot st with
+      | some st' => st' | none => st).eraseLatch = st.eraseLatch := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> first | (cases prot <;> rfl) | exact absurd rfl h
+
+theorem performTransition_update_accessed_mono (kind : AccessKind) (rel : AccessRelatedness)
+    (prot : Bool) {st : LocationState} (h : st.accessed = true) :
+    (match performTransition kind rel prot st with | some st' => st' | none => st).accessed = true := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> cases kind <;> cases rel <;> cases prot <;>
+    first | rfl | cases h
+
+theorem performTransition_update_read_ne_active (rel : AccessRelatedness) (prot : Bool)
+    {st : LocationState} (h : st.perm ≠ .active) :
+    (match performTransition .read rel prot st with | some st' => st' | none => st).perm ≠ .active := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> cases rel <;> cases prot <;>
+    first | decide | exact absurd rfl h
+
+/-- Accesses never clear the `accessed` flag. -/
+theorem applyTreeAccess_accessed_mono (tree : BorrowTree) (start : BorTag) (kind : AccessKind)
+    (range : ByteRange) (active : ActiveProtectors) (mode : ChildrenVisitMode) (n : BorTag)
+    (b : Nat) (h : (tree.locState n b).accessed = true) :
+    ((applyTreeAccess tree start kind range active mode).locState n b).accessed = true := by
+  cases hP : tree.present n with
+  | false => rw [applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ hP]; exact h
+  | true =>
+    cases hb : range.contains b with
+    | false => rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb]; exact h
+    | true =>
+      rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP hb]
+      cases nodeAccessRelatedness tree start mode n with
+      | none => exact h
+      | some rel => exact performTransition_update_accessed_mono kind rel _ h
+
+/-- Read accesses never create `Active`. -/
+theorem applyTreeAccess_read_ne_active (tree : BorrowTree) (start : BorTag) (range : ByteRange)
+    (active : ActiveProtectors) (mode : ChildrenVisitMode) (n : BorTag) (b : Nat)
+    (h : (tree.locState n b).perm ≠ .active) :
+    ((applyTreeAccess tree start .read range active mode).locState n b).perm ≠ .active := by
+  cases hP : tree.present n with
+  | false => rw [applyTreeAccess_locState_absent _ _ _ _ _ _ _ _ hP]; exact h
+  | true =>
+    cases hb : range.contains b with
+    | false => rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb]; exact h
+    | true =>
+      rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP hb]
+      cases nodeAccessRelatedness tree start mode n with
+      | none => exact h
+      | some rel => exact performTransition_update_read_ne_active rel _ h
+
+/-- **A protector-end read only flips conflict latches**: if the released tag is not
+`Active` where it is accessed (so the implicit access is a read), every local node is
+already accessed there, and no foreign node is `Active` there, then stage-1 release
+changes every location only up to its conflict latch. -/
+theorem applyReleaseProtector_read_eraseLatch {tree : BorrowTree} {t_rel : BorTag}
+    {active : ActiveProtectors}
+    (hRead : ∀ b, (tree.locState t_rel b).accessed = true → (tree.locState t_rel b).perm ≠ .active)
+    (hLocal : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = true → (tree.locState n b).accessed = true)
+    (hForeign : ∀ n b, tree.present n = true → (tree.locState t_rel b).accessed = true →
+      tree.isAnc n t_rel = false → (tree.locState n b).perm ≠ .active)
+    (n : BorTag) (b : Nat) :
+    ((applyReleaseProtector tree t_rel active).locState n b).eraseLatch =
+      (tree.locState n b).eraseLatch := by
+  cases hP : tree.present n with
+  | false => rw [applyReleaseProtector_locState_absent _ _ _ _ _ hP]
+  | true =>
+    cases hA : (tree.locState t_rel b).accessed with
+    | false => rw [applyReleaseProtector_locState_unacc _ _ _ _ _ hA]
+    | true =>
+      rw [applyReleaseProtector_locState_acc _ _ _ _ _ hP hA,
+        Permission.associatedAccess_of_ne_active (hRead b hA)]
+      cases hR : nodeAccessRelatedness tree t_rel .skipChildrenOfAccessed n with
+      | none => rfl
+      | some rel =>
+        cases rel with
+        | localAccess =>
+          exact eraseLatch_update_localRead _
+            (hLocal n b hP hA (nodeAccessRelatedness_isAnc_of_local hR))
+        | foreignAccess =>
+          exact eraseLatch_update_foreignRead _
+            (hForeign n b hP hA (nodeAccessRelatedness_not_isAnc_of_foreign hR))
+
+/-- **The stage-1 / stage-2-only separation of
+`stage1_vs_stage2Only_two_arg_release_differs` is unobservable**: after Miri's complete
+stage-1 release (both protected arguments, in order) and `GlobalState.endCall`, the tree
+is latch-equivalent to the stage-2-only tree under the post-call protector set, so every
+later access, retag, or release has the same UB verdict (`LatchEquiv.noUB_iff`,
+`LatchEquiv.access`, `LatchEquiv.retag`, `LatchEquiv.release`,
+`LatchEquiv.releaseNoUB_iff`). -/
+theorem stage1_vs_stage2Only_two_arg_release_unobservable (r : ByteRange) :
+    let active1 := insertActiveProtector (fun _ => false) 0
+    let tree1 := retagChild (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false) r active1
+    let tree2 := retagChild tree1 0 2 (some (.strong 0)) (.reservedFrz false) r active1
+    LatchEquiv (applyReleaseProtector (applyReleaseProtector tree2 1 active1) 2 active1) tree2
+      (removeActiveProtector active1 0) := by
+  intro active1 tree1 tree2
+  have hPres : ∀ n, tree2.present n = true → n = 0 ∨ n = 1 ∨ n = 2 := by
+    intro n hn
+    simp only [tree2, tree1, retagChild, applyTreeAccess, insertChildNode, rootTree,
+      Bool.or_eq_true, decide_eq_true_eq] at hn
+    rcases hn with rfl | rfl | rfl
+    · exact Or.inr (Or.inr rfl)
+    · exact Or.inr (Or.inl rfl)
+    · exact Or.inl rfl
+  have hAcc0 : ∀ b, (tree2.locState 0 b).accessed = true := by
+    intro b
+    show ((applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)) 2 .read
+      r active1 .visitChildrenOfAccessed).locState 0 b).accessed = true
+    apply applyTreeAccess_accessed_mono
+    rw [insertChildNode_locState_of_ne _ _ _ _ _ (by decide : (0 : Nat) ≠ 2)]
+    show ((applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false)) 1
+      .read r active1 .visitChildrenOfAccessed).locState 0 b).accessed = true
+    apply applyTreeAccess_accessed_mono
+    rw [insertChildNode_locState_of_ne _ _ _ _ _ (by decide : (0 : Nat) ≠ 1)]
+    rfl
+  have hNA1 : ∀ b, (tree2.locState 1 b).perm ≠ .active := by
+    intro b
+    show ((applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)) 2 .read
+      r active1 .visitChildrenOfAccessed).locState 1 b).perm ≠ .active
+    apply applyTreeAccess_read_ne_active
+    rw [insertChildNode_locState_of_ne _ _ _ _ _ (by decide : (1 : Nat) ≠ 2)]
+    show ((applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false)) 1
+      .read r active1 .visitChildrenOfAccessed).locState 1 b).perm ≠ .active
+    apply applyTreeAccess_read_ne_active
+    rw [insertChildNode_locState_child]
+    decide
+  have hNA2 : ∀ b, (tree2.locState 2 b).perm ≠ .active := by
+    intro b
+    show ((applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)) 2 .read
+      r active1 .visitChildrenOfAccessed).locState 2 b).perm ≠ .active
+    apply applyTreeAccess_read_ne_active
+    rw [insertChildNode_locState_child]
+    decide
+  have hE1 : ∀ n b, ((applyReleaseProtector tree2 1 active1).locState n b).eraseLatch =
+      (tree2.locState n b).eraseLatch := by
+    refine applyReleaseProtector_read_eraseLatch (fun b _ => hNA1 b) ?_ ?_
+    · intro n b hP hA hAnc
+      rcases hPres n hP with rfl | rfl | rfl
+      · exact hAcc0 b
+      · exact hA
+      · exact absurd hAnc (Bool.ne_true_of_eq_false rfl)
+    · intro n b hP _ hAnc
+      rcases hPres n hP with rfl | rfl | rfl
+      · exact absurd hAnc (Bool.ne_false_of_eq_true rfl)
+      · exact absurd hAnc (Bool.ne_false_of_eq_true rfl)
+      · exact hNA2 b
+  let tree3 := applyReleaseProtector tree2 1 active1
+  have hAcc3 : ∀ n b, (tree3.locState n b).accessed = (tree2.locState n b).accessed := by
+    intro n b
+    rw [← LocationState.eraseLatch_accessed (tree3.locState n b), hE1 n b,
+      LocationState.eraseLatch_accessed]
+  have hE2 : ∀ n b, ((applyReleaseProtector tree3 2 active1).locState n b).eraseLatch =
+      (tree3.locState n b).eraseLatch := by
+    refine applyReleaseProtector_read_eraseLatch
+      (fun b _ => LocationState.ne_active_of_eraseLatch_eq (hE1 2 b) (hNA2 b)) ?_ ?_
+    · intro n b hP hA hAnc
+      rcases hPres n hP with rfl | rfl | rfl
+      · rw [hAcc3]; exact hAcc0 b
+      · exact absurd hAnc (Bool.ne_true_of_eq_false rfl)
+      · exact hA
+    · intro n b hP _ hAnc
+      rcases hPres n hP with rfl | rfl | rfl
+      · exact absurd hAnc (Bool.ne_false_of_eq_true rfl)
+      · exact LocationState.ne_active_of_eraseLatch_eq (hE1 1 b) (hNA1 b)
+      · exact absurd hAnc (Bool.ne_false_of_eq_true rfl)
+  have hNoProt : ∀ n, (applyReleaseProtector tree3 2 active1).isTagProtected n
+      (removeActiveProtector active1 0) = false := by
+    intro n
+    rw [show removeActiveProtector active1 0 = (fun _ => false) from removeActiveProtector_insert rfl]
+    unfold BorrowTree.isTagProtected
+    cases (applyReleaseProtector tree3 2 active1).protector n <;> rfl
+  exact ⟨rfl, rfl, rfl, fun n b => (hE2 n b).trans (hE1 n b),
+    fun n b hn => by rw [hNoProt n] at hn; cases hn⟩
+
+/-- Consequence of `stage1_vs_stage2Only_two_arg_release_unobservable`: every later access
+has the same UB verdict after stage-1 + stage-2 release as after stage-2-only release. -/
+theorem stage1_vs_stage2Only_two_arg_release_same_verdicts (r : ByteRange) (start : BorTag)
+    (kind : AccessKind) (range : ByteRange) (mode : ChildrenVisitMode) :
+    let active1 := insertActiveProtector (fun _ => false) 0
+    let tree1 := retagChild (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false) r active1
+    let tree2 := retagChild tree1 0 2 (some (.strong 0)) (.reservedFrz false) r active1
+    TreeAccessNoUB (applyReleaseProtector (applyReleaseProtector tree2 1 active1) 2 active1) start
+        kind range (removeActiveProtector active1 0) mode ↔
+      TreeAccessNoUB tree2 start kind range (removeActiveProtector active1 0) mode :=
+  (stage1_vs_stage2Only_two_arg_release_unobservable r).noUB_iff start kind range mode
+
 /-- **Shared (`Mutability.not`) `reborrowFootprint` soundness**: when a
 `TrustedFnSpec` declares two overlapping shared `&` reborrows `[(r, .not), (r, .not)]`,
 both returned references emerge `Frozen` (`⟨.frozen, true⟩`) on `r`, reading
@@ -5930,9 +6530,17 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_of_mirStep_done
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirStepsConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirStepsConverges_of_mirStep_cont
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirStepsConverges_of_stepsTo' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms mirStepsConverges_of_stepsTo
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirWpConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirWpConverges_of_mirStep_cont
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirWpConverges_of_evalFuel' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -5973,6 +6581,22 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_countToN_mirWpConverges_all_n' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms live_countToN_mirWpConverges_all_n
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_stationary_at_target' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_stationary_at_target
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_step_of_not_target' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_step_of_not_target
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_reached_iff_live_runMirToBlock' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runUntilTarget_reached_iff_live_runMirToBlock
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_reached_iff_step_and_live' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runMirToBlock_reached_iff_step_and_live
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.blockTargets_toMirBlock' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
@@ -6141,6 +6765,26 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesLive?_oob' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms applySlotUpdatesLive?_oob
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesTwoPass_eq_live?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesTwoPass_eq_live?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdates_eq_of_twoPass' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdates_eq_of_twoPass
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_set?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setPureEnvSlot?_eq_set?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setPureEnvSlot?_eq_live_bind_forcePureEnv?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_eq_bind_forceSpine?' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalPureStmtNorm_eq_bind_forceSpine?
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.length_splice' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -6354,9 +6998,17 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms typedAt_of_canonicalAt
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_write_fst' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_laidOutPair_write_fst
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_of_fieldsValid' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms typedAt_laidOutPair_of_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_applyFieldWrites' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_laidOutPair_applyFieldWrites
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.subplaceFieldLens_of_borrowSubplace_disjointOn' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -6674,50 +7326,6 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms protected_reservedIM_foreign_fails_closed
 
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirStepsConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms mirStepsConverges_of_mirStep_cont
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirWpConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms mirWpConverges_of_mirStep_cont
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_stationary_at_target' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms live_runMirToBlock_stationary_at_target
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_step_of_not_target' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms live_runMirToBlock_step_of_not_target
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_reached_iff_live_runMirToBlock' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runUntilTarget_reached_iff_live_runMirToBlock
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_reached_iff_step_and_live' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runMirToBlock_reached_iff_step_and_live
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_set?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setPureEnvSlot?_eq_set?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setPureEnvSlot?_eq_live_bind_forcePureEnv?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_eq_bind_forceSpine?' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms evalPureStmtNorm_eq_bind_forceSpine?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_write_fst' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms typedAt_laidOutPair_write_fst
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_applyFieldWrites' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms typedAt_laidOutPair_applyFieldWrites
-
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.hasUniqueWritePerm_remove_callId' depends on axioms: [Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms hasUniqueWritePerm_remove_callId
@@ -6729,6 +7337,134 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_vs_stage2Only_two_arg_release_differs' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms stage1_vs_stage2Only_two_arg_release_differs
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LocationState.eraseLatch_accessed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LocationState.eraseLatch_accessed
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LocationState.eraseLatch_associatedAccess' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LocationState.eraseLatch_associatedAccess
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LocationState.ne_active_of_eraseLatch_eq' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LocationState.ne_active_of_eraseLatch_eq
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_unprotected_eraseLatch' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_unprotected_eraseLatch
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_unprotected_isSome_eraseLatch' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_unprotected_isSome_eraseLatch
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.eraseLatch_update_unprotected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms eraseLatch_update_unprotected
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_congr' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_congr
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.isTagProtected_congr' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms isTagProtected_congr
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyTreeAccess_locState_absent' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyTreeAccess_locState_absent
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_locState_absent' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyReleaseProtector_locState_absent
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.refl' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.refl
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.of_active' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.of_active
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.transition_isSome' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.transition_isSome
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.noUB_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.noUB_iff
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.access' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.access
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.insert' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.insert
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.retag' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.retag
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.released_eq' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.released_eq
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.release' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.release
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.LatchEquiv.releaseNoUB_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms LatchEquiv.releaseNoUB_iff
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_isAnc_of_local' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_isAnc_of_local
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_not_isAnc_of_foreign' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_not_isAnc_of_foreign
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.Permission.associatedAccess_of_ne_active' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Permission.associatedAccess_of_ne_active
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.eraseLatch_update_localRead' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms eraseLatch_update_localRead
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.eraseLatch_update_foreignRead' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms eraseLatch_update_foreignRead
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_update_accessed_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_update_accessed_mono
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_update_read_ne_active' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_update_read_ne_active
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyTreeAccess_accessed_mono' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyTreeAccess_accessed_mono
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyTreeAccess_read_ne_active' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyTreeAccess_read_ne_active
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_read_eraseLatch' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyReleaseProtector_read_eraseLatch
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_vs_stage2Only_two_arg_release_unobservable' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stage1_vs_stage2Only_two_arg_release_unobservable
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_vs_stage2Only_two_arg_release_same_verdicts' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stage1_vs_stage2Only_two_arg_release_same_verdicts
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.shared_reborrowFootprint_read_ok_write_ub' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in

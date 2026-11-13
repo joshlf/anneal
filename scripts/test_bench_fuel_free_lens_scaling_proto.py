@@ -289,10 +289,26 @@ class LeanSourceAuditTests(unittest.TestCase):
             "stage1_vs_stage2Only_two_arg_release_differs", "shared_reborrowFootprint_read_ok_write_ub",
             "isBorrowDescendantOrSelf_refl", "nodeAccessRelatedness_visit_eq_live_writer",
             "borrowEntryWriteConflicts_eq_live", "restoreCallerProtectors_eq_live",
+            "applySlotUpdatesTwoPass_eq_live?", "applySlotUpdates_eq_of_twoPass",
+            "performTransition_unprotected_eraseLatch", "LatchEquiv.noUB_iff", "LatchEquiv.access",
+            "LatchEquiv.insert", "LatchEquiv.retag", "LatchEquiv.release", "LatchEquiv.releaseNoUB_iff",
+            "LatchEquiv.of_active", "applyReleaseProtector_read_eraseLatch",
+            "stage1_vs_stage2Only_two_arg_release_unobservable",
+            "stage1_vs_stage2Only_two_arg_release_same_verdicts",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_live_two_pass_variant_mirrors_live_normalizer(self):
+        """`local_slots/live_two_pass_rfl` must measure the live `evalPureStmtNorm` structure:
+        bounds-checked `Trusted.Sequence.set?` followed by a full `forceSpine?` pass."""
+        self.assertIn("live_two_pass_rfl", bench.FAMILIES["local_slots"])
+        self.assertEqual(bench.FAMILIES["local_slots"][-1], "optimized_forcePureEnv")
+        m = re.search(r"def applySlotUpdatesTwoPass .*?:=?\n(.*?)\n\n", self.code, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("(Trusted.Sequence.set? env u.1 u.2).bind forceSpine?", m.group(0))
+        self.assertIn("applySlotUpdates_eq_of_twoPass", bench.proof("local_slots", "live_two_pass_rfl", 5))
 
     def test_live_hierarchy_and_return_bridges_present(self):
         for sym in (
@@ -469,7 +485,7 @@ class ReportTests(unittest.TestCase):
         "blockIdx", "stmtIdx", "parentTag", "t_sib", "t_arg_x", "t_arg_y",
         "Classical.byContradiction", "FuelFreeProtoBench.Prototype", "MirSemantics",
         "ProtectedDisabled", "ReservedFrz", "ReservedIM", "_", "countUp", "endCall",
-        "headD", "subRange",
+        "headD", "subRange", "addDecl", "debug.skipKernelTC",
     }
 
     @staticmethod
