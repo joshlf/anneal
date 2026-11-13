@@ -9680,6 +9680,14 @@ fn check_retagged_reference(
             },
         ));
     }
+    // A data pointer cast from a function pointer designates no readable or writable memory.
+    if ptr.provenance.is_some_and(|prov| is_fn_ptr_provenance(&prov))
+        && pointee
+            .layout_for(ptr_width)
+            .is_ok_and(|layout| layout.size > 0)
+    {
+        return Err(RvalueEvalError::FnPtrMemoryAccess { addr: addr as u64 });
+    }
     let (min_align, max_align) = pointee
         .align_bounds(ptr_width)
         .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(pointee, err)))?;
@@ -9734,9 +9742,8 @@ fn check_retagged_reference(
 /// be non-null and within the pointer width (`InvalidBitPattern`), its length a valid `usize`
 /// (`InvalidBitPattern`), its data pointer aligned to `T` (`MisalignedPointer`), and its
 /// pointee `[addr, addr + len * size_of::<T>())` at most `isize::MAX` bytes without wrapping
-/// the address space (`PointerRangeOverflow`). A non-empty pointee in the synthetic allocation
-/// of a local dangles if that local is storage-dead (`DeadLocal`) or the pointee does not fit
-/// inside its allocation (`PointerOutOfBounds`).
+/// the address space (`PointerRangeOverflow`) and backed by a live, in-bounds allocation
+/// ([`check_slice_backing`]).
 fn check_retagged_wide_reference(
     data: &PointerValue,
     len: usize,
@@ -9744,11 +9751,11 @@ fn check_retagged_wide_reference(
     ctx: RetagCtx<'_>,
 ) -> Result<(), RvalueEvalError> {
     let ptr_width = ctx.ptr_width;
-    let Some(elem_ty) = ref_ty.wide_ptr_elem_ty() else {
+    if ref_ty.wide_ptr_elem_ty().is_none() {
         return Err(RvalueEvalError::TypeMismatch(
             "wide retag requires a slice or str reference type",
         ));
-    };
+    }
     let addr = u128::from(data.addr);
     if addr == 0 || addr > ptr_width.mask() {
         return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -9756,58 +9763,15 @@ fn check_retagged_wide_reference(
             bits: addr,
         }));
     }
-    if len as u128 > ptr_width.max_usize() {
-        return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
-            target_ty: Ty::Uint(UintTy::Usize),
-            bits: len as u128,
-        }));
-    }
-    let elem_layout = elem_ty
-        .layout_for(ptr_width)
-        .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?;
-    if !addr.is_multiple_of(elem_layout.align as u128) {
-        return Err(RvalueEvalError::MisalignedPointer {
-            addr: addr as u64,
-            required_align: elem_layout.align,
-        });
-    }
-    let byte_len = len as u128 * elem_layout.size as u128;
-    if byte_len > ptr_width.max_isize() as u128
-        || addr
-            .checked_add(byte_len)
-            .is_none_or(|end| end > ptr_width.max_usize())
-    {
-        return Err(RvalueEvalError::PointerRangeOverflow {
-            addr: addr as u64,
-            byte_len,
-        });
-    }
-    // A non-empty pointee inside a frame-local allocation must be live and in bounds.
-    let local_count = ctx.slots.len().min(ctx.local_decls.len());
-    if byte_len > 0
-        && let Some(local) = resolve_synthetic_alloc_local(data, local_count)
-    {
-        if matches!(ctx.slots[local], LocalSlotState::Dead) {
-            return Err(RvalueEvalError::DeadLocal(Local(local)));
-        }
-        let local_base =
-            local_base_addr_in_frame(local, ctx.local_decls, ptr_width, ctx.frame_addr_base)?;
-        let decl_ty = &ctx.local_decls[local];
-        let (alloc_size, _) = decl_ty
-            .alloc_size_and_align(ptr_width)
-            .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(decl_ty, err)))?;
-        let in_bounds = addr
-            .checked_sub(local_base)
-            .and_then(|rel| rel.checked_add(byte_len))
-            .is_some_and(|end| end <= alloc_size as u128);
-        if !in_bounds {
-            return Err(RvalueEvalError::PointerOutOfBounds {
-                addr: addr as u64,
-                byte_len,
-            });
-        }
-    }
-    Ok(())
+    let is_dead = |loc: usize| matches!(ctx.slots.get(loc), Some(LocalSlotState::Dead));
+    let slice_frame = SliceFrame {
+        decls: ctx.local_decls,
+        local_count: ctx.slots.len().min(ctx.local_decls.len()),
+        is_dead: &is_dead,
+        frame_addr_base: ctx.frame_addr_base,
+        ptr_width,
+    };
+    check_slice_backing(&slice_frame, data, len, ref_ty, SliceUse::Create, None)
 }
 
 /// Validates every reference reachable in the initialized value `val` of type `ty` for
@@ -10624,15 +10588,26 @@ fn eval_wide_ref_in<F: FrameView + ?Sized>(
             byte_offset: byte_offset as i128,
         });
     }
+    let Some(new_addr) = (byte_offset <= ptr_width.max_isize() as u128)
+        .then(|| base_addr.checked_add(byte_offset))
+        .flatten()
+        .filter(|end| *end <= ptr_width.max_usize())
+    else {
+        return Err(RvalueEvalError::PointerOffsetOverflow {
+            base_addr: data.addr,
+            offset: start as i128,
+            pointee_size: elem_size,
+        });
+    };
     // An address-only raw reborrow still offsets the data pointer in bounds (MiniRust's
     // `offset_inbounds` of the `Subslice` projection): inside a frame-local allocation, which
     // must be live, or never past a function's (empty) allocation.
-    if !checked && byte_offset != 0 {
+    if !checked && (byte_offset != 0 || !tail.is_empty()) {
         let out_of_bounds = RvalueEvalError::PointerOutOfBounds {
             addr: data.addr,
             byte_len: byte_offset,
         };
-        if data.provenance.is_some_and(|prov| is_fn_ptr_provenance(&prov)) {
+        if byte_offset != 0 && data.provenance.is_some_and(|prov| is_fn_ptr_provenance(&prov)) {
             return Err(out_of_bounds);
         }
         if let Some(local) = resolve_synthetic_alloc_local(&data, frame.frame_local_count()) {
@@ -10654,16 +10629,6 @@ fn eval_wide_ref_in<F: FrameView + ?Sized>(
             }
         }
     }
-    let Some(new_addr) = base_addr
-        .checked_add(byte_offset)
-        .filter(|end| *end <= ptr_width.max_usize())
-    else {
-        return Err(RvalueEvalError::PointerOffsetOverflow {
-            base_addr: data.addr,
-            offset: start as i128,
-            pointee_size: elem_size,
-        });
-    };
     let new_data = PointerValue {
         addr: new_addr as u64,
         provenance: data.provenance,
@@ -11248,18 +11213,39 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
             // `&(*s)[i]` / `&raw (*s)[i]` (a sized element of a slice): the slice is the
             // array `[T; len]` its backing range holds (its sized tail is never empty).
             MirValue::WidePtr { data, len, ty } if !tail.is_empty() => {
-                let use_ = if expected_ref || ty.is_ref() {
-                    SliceUse::Access
+                if expected_ref || ty.is_ref() {
+                    check_slice_backing_in(
+                        frame,
+                        &data,
+                        len,
+                        &ty,
+                        SliceUse::Access,
+                        Some(place),
+                    )?;
+                    let slice_step = validate_slice_element_steps_in(frame, len, tail)?;
+                    if len == 1
+                        && let Some((consumed, 0)) = slice_step
+                        && let Some(elem_ty) = ty.wide_ptr_elem_ty()
+                    {
+                        single_elem_slice_step = Some((consumed, elem_ty.clone()));
+                    }
                 } else {
-                    SliceUse::Create
-                };
-                check_slice_backing_in(frame, &data, len, &ty, use_, Some(place))?;
-                let slice_step = validate_slice_element_steps_in(frame, len, tail)?;
-                if len == 1
-                    && let Some((consumed, 0)) = slice_step
-                    && let Some(elem_ty) = ty.wide_ptr_elem_ty()
-                {
-                    single_elem_slice_step = Some((consumed, elem_ty.clone()));
+                    checked_ptr_addr(&data, &ty, ptr_width)?;
+                    if len as u128 > ptr_width.max_usize() {
+                        return Err(RvalueEvalError::CastEval(
+                            CastEvalError::InvalidBitPattern {
+                                target_ty: Ty::Uint(UintTy::Usize),
+                                bits: len as u128,
+                            },
+                        ));
+                    }
+                    if len == 1
+                        && let Ok(Some((consumed, 0))) =
+                            validate_slice_element_steps_in(frame, len, tail)
+                        && let Some(elem_ty) = ty.wide_ptr_elem_ty()
+                    {
+                        single_elem_slice_step = Some((consumed, elem_ty.clone()));
+                    }
                 }
                 let (concrete_ptr_ty, array_ty) = concretize_wide_ptr_ty(&ty, len)?;
                 (data, concrete_ptr_ty, array_ty)
@@ -11455,11 +11441,8 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
         if base_addr == 0 {
             return Err(RvalueEvalError::NullPointerAccess);
         }
-        let Some(target_local) = target_local_opt else {
-            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-        };
-        if target_is_dead {
-            return Err(RvalueEvalError::DeadLocal(Local(target_local)));
+        if let Some(dead_loc) = target_local_opt.filter(|_| target_is_dead) {
+            return Err(RvalueEvalError::DeadLocal(Local(dead_loc)));
         }
     }
     // As for loads and stores (`resolve_deref_place_in` resolves a `Deref` before reading the
@@ -11483,6 +11466,17 @@ fn resolve_reborrow_with_tail_in<F: FrameView + ?Sized>(
         }
     }
     let read_index = |idx_local: Local| cached_index(&tail_index_cache, idx_local);
+    if !is_address_only_raw && target_local_opt.is_none() {
+        validate_projection_tail(
+            deref_ty,
+            tail,
+            Some(decls),
+            Some(&read_index),
+            place,
+            None,
+        )?;
+        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+    }
     if is_address_only_raw && (base_addr == 0 || target_local_opt.is_none() || target_is_dead) {
         validate_projection_tail(
             deref_ty,

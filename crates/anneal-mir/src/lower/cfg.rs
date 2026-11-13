@@ -66,13 +66,13 @@ use crate::ir::{
     PointerValue, Provenance, PtrWidth, Safety, SwitchTargets, Terminator, Ty, UintTy,
     UnwindAction,
 };
-use crate::lower::cast::{CastEvalError, LoweredCast, reify_target};
+use crate::lower::cast::{CastEvalError, LoweredCast, is_valid_pointer_coercion, reify_target};
 use crate::lower::intrinsic::{
     IntrinsicOutcome, IntrinsicTypeError, check_intrinsic_call_types, eval_intrinsic_call,
 };
 use crate::lower::rvalue::{
     LocalSlotState, LoweredBasicBlock, LoweredBody, LoweredRvalue, LoweredStatement, MirValue,
-    RvalueEvalError, RvalueLowerError, StatementEvalState, check_value_well_formed,
+    RvalueEvalError, RvalueLowerError, StatementEvalState, check_value_well_formed, eval_constant,
     eval_lowered_statement, lower_layout_error, lower_operand_ty, mir_value_matches_ty,
     resolve_place_ty,
 };
@@ -1797,7 +1797,7 @@ fn run_block<'a>(
     };
     for (index, stmt) in block.statements.iter().enumerate() {
         if let Some(table) = table {
-            check_reify_signature(stmt, table)
+            check_reify_signature(stmt, &frame.state, table)
                 .map_err(|error| CfgEvalError::Statement { bb, index, error })?;
         }
         eval_lowered_statement(stmt, &mut frame.state)
@@ -1954,8 +1954,15 @@ fn peek_operand(op: &Operand, state: &StatementEvalState) -> Option<MirValue> {
 /// Under a call table, checks that a statement reifying a linked function item or closure
 /// into a function pointer (`ReifyFnPointer*` / `ClosureFnPointer*`) gives it the callee's
 /// signature ([`LinkedCallee::check_fn_ptr_signature`]): creating a function pointer of
-/// another signature is undefined behavior. Unlinked callees are not checked.
-fn check_reify_signature(stmt: &LoweredStatement, table: &CallTable) -> Result<(), RvalueEvalError> {
+/// another signature is undefined behavior. Unlinked callees are not checked, and ill-typed
+/// or unreadable source operands defer to [`eval_lowered_statement`] so operand faults
+/// (`DeadLocal`, `UninitializedLocal`, `TypeMismatch`) precede `checkCalleeSig` as in
+/// `Trusted`'s `evalReifyFnPointer`.
+fn check_reify_signature(
+    stmt: &LoweredStatement,
+    state: &StatementEvalState,
+    table: &CallTable,
+) -> Result<(), RvalueEvalError> {
     let LoweredStatement::Assign {
         rvalue:
             LoweredRvalue::Cast {
@@ -1973,7 +1980,19 @@ fn check_reify_signature(stmt: &LoweredStatement, table: &CallTable) -> Result<(
     else {
         return Ok(());
     };
-    if !coercion.is_reify() && !coercion.is_closure_reify() {
+    if (!coercion.is_reify() && !coercion.is_closure_reify())
+        || !is_valid_pointer_coercion(*coercion, src_ty, target_ty)
+    {
+        return Ok(());
+    }
+    let val = match operand {
+        Operand::Copy(place) | Operand::Move(place) => state.read_place(place),
+        Operand::Constant(c) => eval_constant(c, state.ptr_width),
+    };
+    let Ok(val) = val else {
+        return Ok(());
+    };
+    if !val.is_unit() || !mir_value_matches_ty(&val, src_ty) {
         return Ok(());
     }
     let Ok(symbol) = reify_target(*coercion, operand, src_ty) else {

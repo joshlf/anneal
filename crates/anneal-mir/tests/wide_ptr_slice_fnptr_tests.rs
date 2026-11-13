@@ -3000,3 +3000,474 @@ fn a1_retag_checks_wide_reference_bounds() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// B2: `Retag` provenance/ZST/empty-offset validation, raw `Subslice` `isize::MAX` offset &
+// zero-offset bounds, and address-only raw slice element reborrows
+// ---------------------------------------------------------------------------------------------
+
+
+trait StatementEvalStateExt {
+    fn set_local(&mut self, local: Local, state: LocalSlotState);
+}
+impl StatementEvalStateExt for StatementEvalState {
+    fn set_local(&mut self, local: Local, state: LocalSlotState) {
+        self.slots[local.0] = state;
+    }
+}
+
+fn eval_statement(stmt: &Statement, state: &mut StatementEvalState) -> Result<(), RvalueEvalError> {
+    let lowered = lower_statement(stmt, &state.local_decls, state.ptr_width)
+        .unwrap_or_else(|err| panic!("lowering {stmt:?}: {err:?}"));
+    eval_lowered_statement(&lowered, state)
+}
+
+#[test]
+fn b2_retag_rejects_fn_provenance_provenanceless_and_oob_empty_or_zst_slices() {
+    for pw in PWS {
+        // 1. Function-pointer provenance: non-zero-byte thin `&u32` and wide `&[u8]` (len 4)
+        // fault with `FnPtrMemoryAccess` on `Retag`, while zero-byte `&()` and `&[u8]` (len 0)
+        // or `&[()]` (len 4) succeed.
+        let f_ty = fn_ty(vec![], unit());
+        let sym = CalleeSymbol::new("b2_retag_fn_target");
+        let fn_ptr_val = MirValue::fn_ptr(sym.clone(), f_ty.clone());
+        let fn_data_ptr = PointerValue {
+            addr: fn_ptr_addr(&sym),
+            provenance: fn_ptr_provenance(&sym),
+        };
+        let decls = vec![
+            unit(),
+            f_ty,
+            rf(u32_ty(), NOT),
+            rf(unit(), NOT),
+            rf(slice(u8_ty()), NOT),
+            rf(slice(unit()), NOT),
+        ];
+        let mut state = StatementEvalState::from_local_decls(decls.clone(), pw);
+        state.set_local(Local(1), LocalSlotState::Init(fn_ptr_val));
+        state.set_local(
+            Local(2),
+            LocalSlotState::Init(MirValue::ptr(fn_data_ptr, rf(u32_ty(), NOT))),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(2)), &mut state),
+            Err(RvalueEvalError::FnPtrMemoryAccess {
+                addr: fn_ptr_addr(&sym),
+            })
+        );
+        state.set_local(
+            Local(3),
+            LocalSlotState::Init(MirValue::ptr(fn_data_ptr, rf(unit(), NOT))),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(3)), &mut state),
+            Ok(())
+        );
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: fn_data_ptr,
+                len: 4,
+                ty: rf(slice(u8_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(4)), &mut state),
+            Err(RvalueEvalError::FnPtrMemoryAccess {
+                addr: fn_ptr_addr(&sym),
+            })
+        );
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: fn_data_ptr,
+                len: 0,
+                ty: rf(slice(u8_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(4)), &mut state),
+            Ok(())
+        );
+        state.set_local(
+            Local(5),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: fn_data_ptr,
+                len: 4,
+                ty: rf(slice(unit()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(5)), &mut state),
+            Ok(())
+        );
+
+        // 2. Provenance-less wide references: `len == 0` at a non-null aligned address succeeds,
+        // while `len > 0` faults with `PointerOutOfBounds` (both sized and ZST elements).
+        let dangling = PointerValue::without_provenance(0x40);
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: dangling,
+                len: 0,
+                ty: rf(slice(u8_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(4)), &mut state),
+            Ok(())
+        );
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: dangling,
+                len: 3,
+                ty: rf(slice(u8_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(4)), &mut state),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: 0x40,
+                byte_len: 3,
+            })
+        );
+        state.set_local(
+            Local(5),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: dangling,
+                len: 2,
+                ty: rf(slice(unit()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(&Statement::Retag(RetagKind::Default, local(5)), &mut state),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: 0x40,
+                byte_len: 0,
+            })
+        );
+
+        // 3. Out-of-bounds empty (`len == 0`) and ZST (`&[()]`) wide references into a stack local.
+        let local_decls = vec![
+            unit(),
+            arr(u32_ty(), 4),
+            arr(unit(), 2),
+            rf(slice(u32_ty()), NOT),
+            rf(slice(unit()), NOT),
+        ];
+        let mut local_state = StatementEvalState::from_local_decls(local_decls, pw);
+        local_state.set_local(Local(1), LocalSlotState::Init(array_val(u32_ty(), &[1, 2, 3, 4])));
+        local_state.set_local(
+            Local(2),
+            LocalSlotState::Init(MirValue::Array {
+                elements: vec![MirValue::Unit, MirValue::Unit],
+                elem_ty: unit(),
+            }),
+        );
+        // Empty slice one past the end of `_1` (offset 16) is in bounds; offset 20 is out of bounds.
+        local_state.set_local(
+            Local(3),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 16),
+                len: 0,
+                ty: rf(slice(u32_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(
+                &Statement::Retag(RetagKind::Default, local(3)),
+                &mut local_state
+            ),
+            Ok(())
+        );
+        local_state.set_local(
+            Local(3),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 20),
+                len: 0,
+                ty: rf(slice(u32_ty()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(
+                &Statement::Retag(RetagKind::Default, local(3)),
+                &mut local_state
+            ),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1) + 20,
+                byte_len: 0,
+            })
+        );
+        // ZST slice `&[()]` into `_2: [(); 2]`: `len = 2` is backed, `len = 3` is out of bounds.
+        local_state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(2, 0),
+                len: 2,
+                ty: rf(slice(unit()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(
+                &Statement::Retag(RetagKind::Default, local(4)),
+                &mut local_state
+            ),
+            Ok(())
+        );
+        local_state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(2, 0),
+                len: 3,
+                ty: rf(slice(unit()), NOT),
+            }),
+        );
+        assert_eq!(
+            eval_statement(
+                &Statement::Retag(RetagKind::Default, local(4)),
+                &mut local_state
+            ),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: base(2),
+                byte_len: 0,
+            })
+        );
+    }
+}
+
+#[test]
+fn b2_raw_subslice_enforces_isize_max_offset_and_zero_offset_local_bounds() {
+    for pw in PWS {
+        let max_isize = pw.max_isize();
+        let half_plus_one = (max_isize / 2) + 1;
+        let raw_u16_slice = raw(slice(u16_ty()), NOT);
+        let decls = vec![
+            unit(),
+            arr(u32_ty(), 4),
+            raw_u16_slice.clone(),
+            raw_u16_slice.clone(),
+            raw(slice(u32_ty()), NOT),
+            raw(slice(u32_ty()), NOT),
+        ];
+        let mut state = StatementEvalState::from_local_decls(decls, pw);
+        state.set_local(Local(1), LocalSlotState::Init(array_val(u32_ty(), &[1, 2, 3, 4])));
+        // 1. `start * size_of::<u16>() == max_isize + 1 > isize::MAX` (even though `addr + offset <= usize::MAX`).
+        state.set_local(
+            Local(2),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 0),
+                len: (half_plus_one + 1) as usize,
+                ty: raw_u16_slice,
+            }),
+        );
+        let overflow_sub = assign(
+            3,
+            Rvalue::RawPtr(
+                NOT,
+                proj(
+                    2,
+                    vec![
+                        ProjectionElem::Deref,
+                        ProjectionElem::Subslice {
+                            from: half_plus_one as u64,
+                            to: (half_plus_one + 1) as u64,
+                            from_end: false,
+                        },
+                    ],
+                ),
+            ),
+        );
+        assert_eq!(
+            eval_statement(&overflow_sub, &mut state),
+            Err(RvalueEvalError::PointerOffsetOverflow {
+                base_addr: base(1),
+                offset: half_plus_one,
+                pointee_size: 2,
+            })
+        );
+
+        // 2. Zero-offset raw `Subslice` (`[0..2]`) still checks that a local allocation is live
+        // and that `base_addr` is within `[local_base, local_base + alloc_size]`.
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 20),
+                len: 4,
+                ty: raw(slice(u32_ty()), NOT),
+            }),
+        );
+        let zero_sub = assign(
+            5,
+            Rvalue::RawPtr(
+                NOT,
+                proj(
+                    4,
+                    vec![
+                        ProjectionElem::Deref,
+                        ProjectionElem::Subslice {
+                            from: 0,
+                            to: 2,
+                            from_end: false,
+                        },
+                    ],
+                ),
+            ),
+        );
+        assert_eq!(
+            eval_statement(&zero_sub, &mut state),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1) + 20,
+                byte_len: 0,
+            })
+        );
+        state.set_local(
+            Local(4),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 0),
+                len: 4,
+                ty: raw(slice(u32_ty()), NOT),
+            }),
+        );
+        state.set_local(Local(1), LocalSlotState::Dead);
+        assert_eq!(
+            eval_statement(&zero_sub, &mut state),
+            Err(RvalueEvalError::DeadLocal(Local(1)))
+        );
+    }
+}
+
+#[test]
+fn b2_raw_slice_element_reborrow_checks_accessed_offset_and_fault_order() {
+    for pw in PWS {
+        let raw_u32_slice = raw(slice(u32_ty()), NOT);
+        let raw_u32 = raw(u32_ty(), NOT);
+        let ref_u32 = rf(u32_ty(), NOT);
+        let decls = vec![
+            unit(),
+            arr(u32_ty(), 4),
+            raw_u32_slice.clone(),
+            usize_ty(),
+            raw_u32.clone(),
+            ref_u32.clone(),
+            u32_ty(),
+        ];
+        let mut state = StatementEvalState::from_local_decls(decls, pw);
+        state.set_local(
+            Local(1),
+            LocalSlotState::Init(array_val(u32_ty(), &[10, 20, 30, 40])),
+        );
+        // 1. Overhanging raw slice `_2: *const [u32]` claiming `len = 10` over 4-element `_1`:
+        // `&raw const (*_2)[2]` offsets by 8 bytes (<= 16) and succeeds, while `&(*_2)[2]`
+        // requires the whole slice to be backed (`PointerOutOfBounds { byte_len: 40 }`), and
+        // `&raw const (*_2)[6]` (offset 24 > 16) is rejected.
+        state.set_local(
+            Local(2),
+            LocalSlotState::Init(MirValue::WidePtr {
+                data: stack_ptr(1, 0),
+                len: 10,
+                ty: raw_u32_slice.clone(),
+            }),
+        );
+        state.set_local(Local(3), LocalSlotState::Init(usizev(2)));
+        let idx_place = proj(2, vec![ProjectionElem::Deref, ProjectionElem::Index(Local(3))]);
+        assert_eq!(
+            eval_statement(
+                &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                &mut state
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            state.get_local(Local(4)),
+            Some(&LocalSlotState::Init(MirValue::ptr(
+                stack_ptr(1, 8),
+                raw_u32.clone()
+            )))
+        );
+        assert_eq!(
+            eval_statement(&assign(6, Rvalue::Use( Operand::Copy(deref(4)) )), &mut state),
+            Ok(())
+        );
+        assert_eq!(value(&state, 6), u32v(30));
+        assert_eq!(
+            eval_statement(&assign(5, Rvalue::Ref(NOT, idx_place.clone())), &mut state),
+            Err(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1),
+                byte_len: 40,
+            })
+        );
+        state.set_local(Local(3), LocalSlotState::Init(usizev(6)));
+        assert_eq!(
+            eval_statement(
+                &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                &mut state
+            ),
+            Err(RvalueEvalError::UnsupportedPlaceProjection(idx_place.clone()))
+        );
+
+        // 2. Fault ordering for `&raw const (*_2)[_3]` matches thin array pointer reborrows:
+        // null or dead base faults before an uninitialized index `_3`; with `_3 = 0`, offset-0
+        // address-only raw reborrow succeeds; with `_3 = 1`, it faults with `NullPointerAccess`
+        // or `DeadLocal(Local(1))`; with `_3 = 10` (`>= len`), it faults with `IndexOutOfBounds`.
+        for (base_ptr, expected_fault) in [
+            (
+                PointerValue::without_provenance(0),
+                RvalueEvalError::NullPointerAccess,
+            ),
+            (
+                stack_ptr(1, 0),
+                RvalueEvalError::DeadLocal(Local(1)),
+            ),
+        ] {
+            state.set_local(Local(1), LocalSlotState::Dead);
+            state.set_local(
+                Local(2),
+                LocalSlotState::Init(MirValue::WidePtr {
+                    data: base_ptr,
+                    len: 4,
+                    ty: raw_u32_slice.clone(),
+                }),
+            );
+            state.set_local(Local(3), LocalSlotState::Uninit);
+            assert_eq!(
+                eval_statement(
+                    &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                    &mut state
+                ),
+                Err(expected_fault.clone())
+            );
+            state.set_local(Local(3), LocalSlotState::Init(usizev(0)));
+            assert_eq!(
+                eval_statement(
+                    &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                    &mut state
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                state.get_local(Local(4)),
+                Some(&LocalSlotState::Init(MirValue::ptr(
+                    base_ptr,
+                    raw_u32.clone()
+                )))
+            );
+            state.set_local(Local(3), LocalSlotState::Init(usizev(1)));
+            assert_eq!(
+                eval_statement(
+                    &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                    &mut state
+                ),
+                Err(expected_fault)
+            );
+            state.set_local(Local(3), LocalSlotState::Init(usizev(4)));
+            assert_eq!(
+                eval_statement(
+                    &assign(4, Rvalue::RawPtr(NOT, idx_place.clone())),
+                    &mut state
+                ),
+                Err(RvalueEvalError::IndexOutOfBounds { index: 4, len: 4 })
+            );
+        }
+    }
+}
