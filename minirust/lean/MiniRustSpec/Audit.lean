@@ -51,12 +51,15 @@ on any other non-standard axiom fails the build instead.
 
 `#assert_minirustspec_import_isolation` (`[IMPORT-ISOLATION]`) fails the build unless the
 module import graph satisfies the `MiniRustSpec` import-isolation invariant of
-`Correspondence.DeinitBridge`: it is the only `MiniRustSpec` module that imports an `Anneal.*`
-module, every import path from another `MiniRustSpec` module to `Anneal.Mir.AdtAndControl` passes
-through it, its only client is `Correspondence.IntrinsicBoundary`, and the core modules
+`Correspondence.DeinitBridge` across **every** `Anneal.*` module in the graph (`[adv ep2-A3]`):
+`DeinitBridge` is the only `MiniRustSpec` module that directly imports an `Anneal.*` module, every
+import path from another `MiniRustSpec` module to *any* `Anneal.*` module passes through
+`DeinitBridge`, its only client is `Correspondence.IntrinsicBoundary`, and the core modules
 (`Interp`, `Generated`, `Correspondence.Translate`, `Correspondence.Simulation`,
-`Correspondence.IntrinsicFallback`) never reach `Anneal.Mir.AdtAndControl`. The checker first
-validates itself on synthetic negative and positive control graphs.
+`Correspondence.IntrinsicFallback`) reach neither `DeinitBridge` nor any `Anneal.*` module. The
+checker validates itself on five synthetic negative-control graphs (including transitive reachability
+to non-`AdtAndControl` `Anneal.*` modules and bypasses from an allowed bridge client) and one
+conforming multi-`Anneal` positive-control graph.
 -/
 
 namespace MiniRustSpec.Audit
@@ -122,39 +125,58 @@ def importGraphReaches (direct : Std.HashMap Lean.Name (Array Lean.Name))
   return false
 
 /-- Violations of the `MiniRustSpec` import-isolation invariant in the module import graph
-`graph` (every module paired with its direct imports):
-1. no `MiniRustSpec` module other than `bridge` directly imports an `Anneal.*` module;
-2. no `MiniRustSpec` module other than `bridge` reaches `adt` along an import path that avoids
+`graph` (every module paired with its direct imports, hardened in `[adv ep2-A3]` across **all**
+`Anneal.*` modules in `graph` and without `else if` suppression):
+1. no `MiniRustSpec` module other than `bridge` directly imports any `Anneal.*` module;
+2. no `MiniRustSpec` module other than `bridge` reaches *any* `Anneal.*` module (including `adt`
+   and upstream dependencies such as `Anneal.Mir.PlaceAndRvalue`) along an import path that avoids
    `bridge`;
-3. the only `MiniRustSpec` modules other than `bridge` that reach `adt` at all are the
-   `allowed` bridge clients;
-4. every `core` module is present in `graph` and does not reach `adt`. -/
+3. no `MiniRustSpec` module other than `bridge` and its `allowed` clients reaches `bridge` or any
+   `Anneal.*` module;
+4. every `core` module is present in `graph` and reaches neither `bridge` nor any `Anneal.*` module. -/
 def importIsolationViolations (graph : Array (Lean.Name × Array Lean.Name))
     (bridge adt : Lean.Name) (allowed core : List Lean.Name) : Array String := Id.run do
   let direct : Std.HashMap Lean.Name (Array Lean.Name) :=
     graph.foldl (fun m p => m.insert p.1 p.2) {}
+  let mut annealTargets : Array Lean.Name := #[adt]
+  for (mName, imps) in graph do
+    if (`Anneal).isPrefixOf mName && !annealTargets.contains mName then
+      annealTargets := annealTargets.push mName
+    for imp in imps do
+      if (`Anneal).isPrefixOf imp && !annealTargets.contains imp then
+        annealTargets := annealTargets.push imp
   let mut out : Array String := #[]
   for (mod, imps) in graph do
     if (`MiniRustSpec).isPrefixOf mod && mod != bridge then
       for imp in imps do
         if (`Anneal).isPrefixOf imp then
           out := out.push s!"{mod} directly imports {imp}"
-      if importGraphReaches direct mod adt bridge then
-        out := out.push s!"{mod} reaches {adt} along a path avoiding {bridge}"
-      else if importGraphReaches direct mod adt .anonymous && !allowed.contains mod then
-        out := out.push s!"{mod} reaches {adt} but is not an allowed client of {bridge}"
+      for ann in annealTargets do
+        if importGraphReaches direct mod ann bridge then
+          out := out.push s!"{mod} reaches {ann} along a path avoiding {bridge}"
+      let reachesBridgeOrAnneal :=
+        importGraphReaches direct mod bridge .anonymous ||
+        annealTargets.any (fun ann => importGraphReaches direct mod ann .anonymous)
+      if reachesBridgeOrAnneal && !allowed.contains mod then
+        out := out.push s!"{mod} reaches {bridge}/Anneal.* but is not an allowed client of {bridge}"
   for c in core do
     if !direct.contains c then
       out := out.push s!"core module {c} is missing from the import graph"
-    else if importGraphReaches direct c adt .anonymous then
-      out := out.push s!"core module {c} reaches {adt}"
+    else
+      if importGraphReaches direct c bridge .anonymous then
+        out := out.push s!"core module {c} reaches {bridge}"
+      for ann in annealTargets do
+        if importGraphReaches direct c ann .anonymous then
+          out := out.push s!"core module {c} reaches {ann}"
   return out
 
 /-- `[IMPORT-ISOLATION]`: fail unless the module import graph of this environment satisfies the
 `MiniRustSpec` import-isolation invariant (`importIsolationViolations`), after first checking
-that the checker rejects three synthetic violating graphs (negative controls: a direct `Anneal.*`
-import, a path to `Anneal.Mir.AdtAndControl` bypassing `DeinitBridge`, and an unlisted bridge
-client) and accepts a synthetic conforming graph (positive control). -/
+that the checker rejects five synthetic violating graphs (negative controls: direct `Anneal.*`
+import, bypass from an unlisted module, bypass from an *allowed* bridge client, transitive
+reachability to a non-`AdtAndControl` `Anneal.*` module via a non-`MiniRustSpec` shim, and an
+unlisted client of `DeinitBridge`) and accepts a synthetic multi-`Anneal` conforming graph
+(positive control). -/
 elab "#assert_minirustspec_import_isolation" : command => do
   let env ← getEnv
   let graph : Array (Lean.Name × Array Lean.Name) :=
@@ -162,7 +184,9 @@ elab "#assert_minirustspec_import_isolation" : command => do
       (n, d.imports.map (·.module))
   let bridge := `MiniRustSpec.Correspondence.DeinitBridge
   let adt := `Anneal.Mir.AdtAndControl
-  let allowed := [`MiniRustSpec.Correspondence.IntrinsicBoundary]
+  let par := `Anneal.Mir.PlaceAndRvalue
+  let ib := `MiniRustSpec.Correspondence.IntrinsicBoundary
+  let allowed := [ib]
   let core := [`MiniRustSpec.Correspondence.Translate, `MiniRustSpec.Correspondence.Simulation,
     `MiniRustSpec.Correspondence.IntrinsicFallback, `MiniRustSpec.Interp, `MiniRustSpec.Generated]
   let translate := `MiniRustSpec.Correspondence.Translate
@@ -171,14 +195,19 @@ elab "#assert_minirustspec_import_isolation" : command => do
   let negBypass : Array (Lean.Name × Array Lean.Name) :=
     #[(`MiniRustSpec.Leaky, #[bridge, `Trusted.Shim]), (bridge, #[adt]), (`Trusted.Shim, #[adt]),
       (adt, #[])]
+  let negAllowedBypass : Array (Lean.Name × Array Lean.Name) :=
+    #[(ib, #[bridge, `Trusted.Shim]), (bridge, #[adt]), (`Trusted.Shim, #[adt]), (adt, #[])]
+  let negOtherAnneal : Array (Lean.Name × Array Lean.Name) :=
+    #[(translate, #[`Trusted.Shim]), (`Trusted.Shim, #[par]), (par, #[])]
   let negClient : Array (Lean.Name × Array Lean.Name) :=
     #[(translate, #[bridge]), (bridge, #[adt]), (adt, #[])]
   let pos : Array (Lean.Name × Array Lean.Name) :=
-    #[(`MiniRustSpec.Correspondence.IntrinsicBoundary, #[bridge]), (bridge, #[adt]), (adt, #[]),
-      (translate, #[])]
-  for (label, g) in [("direct", negDirect), ("bypass", negBypass), ("client", negClient)] do
-    if (importIsolationViolations g bridge adt allowed []).size != 1 then
-      throwError "[IMPORT-ISOLATION] negative control `{label}` did not yield exactly one violation"
+    #[(ib, #[bridge]), (bridge, #[adt]), (adt, #[par]), (par, #[]), (translate, #[])]
+  for (label, g) in [("direct", negDirect), ("bypass", negBypass),
+      ("allowed-bypass", negAllowedBypass), ("other-anneal", negOtherAnneal),
+      ("client", negClient)] do
+    if (importIsolationViolations g bridge adt allowed []).isEmpty then
+      throwError "[IMPORT-ISOLATION] negative control `{label}` was not rejected"
   unless (importIsolationViolations pos bridge adt allowed [translate]).isEmpty do
     throwError "[IMPORT-ISOLATION] positive control was rejected"
   let violations := importIsolationViolations graph bridge adt allowed core
@@ -191,7 +220,7 @@ elab "#assert_minirustspec_import_isolation" : command => do
     if p.1 != bridge && importGraphReaches direct p.1 adt .anonymous then some p.1 else none
   unless importGraphReaches direct bridge adt .anonymous do
     throwError "[IMPORT-ISOLATION] {bridge} does not import {adt}"
-  logInfo m!"[IMPORT-ISOLATION] minirustspec_modules={mrs.size} anneal_importer={bridge} bridge_clients={clients.toList} core_checked={core.length} controls=4/4 ok=true"
+  logInfo m!"[IMPORT-ISOLATION] minirustspec_modules={mrs.size} anneal_importer={bridge} bridge_clients={clients.toList} core_checked={core.length} controls=6/6 ok=true"
 
 open MiniRustSpec.LibSpecr in
 #assert_standard_axioms
@@ -5549,6 +5578,26 @@ open MiniRustSpec.Correspondence in
   evalLIntrinsic_nonzero_minirust_assume
   minirust_intrinsic_negative_controls
   evalLIntrinsic_bitops_i8_signedness_independent
+  leValue_append
+  leValue_lt
+  leBytes_leValue
+  bswapLoop_eq_leValue_reverse
+  evalLIntrinsic_bswap_minirust_endianness_all_widths
+  leBits_length
+  leBitValue_append
+  leBitValue_lt
+  leBitValue_leBits
+  leBits_leBitValue
+  bitreverseLoop_eq_leBitValue_reverse
+  cttzLoop_eq_takeWhile_leBits
+  popcountBits_eq_countP_leBits
+  evalLIntrinsic_bitops_symbolic_all_widths
+  evalLIntrinsic_unchecked_and_exactDiv_value_iff_minirust
+  evalLIntrinsic_saturating_valOf_minirust
+  evalLIntrinsic_threeWayCompare_char_minirust
+  evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
+  evalLIntrinsic_panicUnwind_minirust_correspondence
+  minirust_bitops_char_and_layout_negative_controls
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 

@@ -1268,13 +1268,13 @@ theorem evalLIntrinsic_ubChecks_eq_minirust
   cases flag <;> exact ⟨rfl, rfl⟩
 
 /-- **Symbolic correspondence for `LIntrinsicOp.arithOffset`
-(`evalLIntrinsic_arithOffset_eq_minirust`)**: on any 64-bit pointer `ptrVal`
-(`ptrVal.offsetBytes < 2^64`) and `isize` count `countBits < 2^64` with pointee `rk` of byte stride
-`elemSz`, `evalLIntrinsicValue .arithOffset` preserves `ptrVal.allocId` provenance and computes the
-exact `2^64`-wrapped byte address produced by MiniRust's `evalPtrOffset m false`
+(`evalLIntrinsic_arithOffset_eq_minirust`)**: on any 64-bit pointer `ptrVal` (without restricting
+`ptrVal.offsetBytes`, `[adv ep2-A3]`) and `isize` count `countBits < 2^64` with pointee `rk` of byte
+stride `elemSz`, `evalLIntrinsicValue .arithOffset` preserves `ptrVal.allocId` provenance and
+computes the exact `2^64`-wrapped byte address produced by MiniRust's `evalPtrOffset m false`
 (`ptrOffsetWrapping` / `ThinPointer.wrapping_offset`). -/
 theorem evalLIntrinsic_arithOffset_eq_minirust
-    (m : Mach) (ptrVal : ProvenancePtr) (_hOff : ptrVal.offsetBytes < 2 ^ 64)
+    (m : Mach) (ptrVal : ProvenancePtr)
     (countBits : Nat) (hCnt : countBits < 2 ^ 64)
     {rk : RigidTy} {elemSz : Nat} (restTys : List RigidTy)
     (decls : List LocalDecl) (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
@@ -1342,24 +1342,37 @@ theorem evalLIntrinsic_arithOffset_eq_minirust
     rw [h2, Int.add_mul_emod_self_right, Int.sub_emod, Int.emod_emod, ← Int.sub_emod,
       Int.sub_eq_add_neg]
 
-/-- **Diverging `LIntrinsicOp.unreachableUnchecked` and `LIntrinsicOp.abort` correspondence
-(`evalLoweredTerminator_diverging_intrinsics_correspondence`)**:
-1. `unreachableUnchecked` rejects in `evalLoweredTerminator` (`= none`), faults with UB in
-   `Trusted.evalTerminator` (`= .fail .ub`), and matches MiniRust's `Interp.evalTerminator m .Unreachable`
-   (`= .error (.ub "reached unreachable code")`);
+/-- **Concrete 3-way diverging correspondence (`unreachableUnchecked` vs `abort` vs `panicUnwind`,
+`evalLoweredTerminator_diverging_intrinsics_correspondence`, strengthened in `[adv ep2-A3]`)**:
+1. MiniRust's `Interp.evalTerminator m .Unreachable` faults with `.ub` while `Interp.evalIntrinsic m
+   .Abort` halts with `.abort`;
 2. `abort` terminates immediately in `evalLoweredTerminator` (`= some (.terminated 0)`) and steps to
-   `MirStepNode.retOutcome .abort` in `Trusted.stepMirFn`, bypassing any `UnwindAction.cleanup` edge. -/
-theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach) :
+   `MirStepNode.retOutcome .abort` in `Trusted.stepMirFn`, bypassing `UnwindAction.cleanup 1`;
+3. By contrast, `panicUnwind` on the identical cleanup-equipped CFG enters `bb1` in unwinding mode
+   (`some (.goto 1 [.uninit] (some 0))`), runs through `UnwindResume` to `some (.panicked 0)`, and
+   refines `TrustedRun` to `MirStepNode.retOutcome .panic` (see `IntrinsicBoundary` Section 9 for
+   the fully symbolic `panicUnwind` vs `abort` dispatch theorem). -/
+theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach)
+    (arguments : List (Val × Gen.Type)) (retTy : Gen.Type) :
     Interp.evalTerminator m .Unreachable = .error (.ub "reached unreachable code") ∧
+      Interp.evalIntrinsic m .Abort arguments retTy = .error .abort ∧
       Anneal.Mir.AdtAndControl.evalLoweredTerminator
           Anneal.Mir.AdtAndControl.witnessDivergingEnv
           Anneal.Mir.AdtAndControl.witnessAbortCleanupBody 0 [.uninit] none =
         some (.terminated 0) ∧
       stepMirFn Anneal.Mir.AdtAndControl.witnessAbortCleanupCm
           (initMachineState Anneal.Mir.AdtAndControl.witnessAbortCleanupCm []) =
-        .retOutcome .abort := by
-  exact ⟨rfl, Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind.1,
-    Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind.2.2.1⟩
+        .retOutcome .abort ∧
+      Anneal.Mir.AdtAndControl.evalLoweredTerminator
+          Anneal.Mir.AdtAndControl.witnessDivergingEnv
+          Anneal.Mir.AdtAndControl.witnessPanicCleanupBody 0 [.uninit] none =
+        some (.goto 1 [.uninit] (some 0)) ∧
+      Anneal.Mir.AdtAndControl.runLoweredCfgSteps
+          Anneal.Mir.AdtAndControl.witnessDivergingEnv
+          Anneal.Mir.AdtAndControl.witnessPanicCleanupBody 4 0 [.uninit] none =
+        some (.panicked 0) := by
+  have hw := Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind
+  exact ⟨rfl, rfl, hw.1, hw.2.2.1, hw.2.2.2.1, hw.2.2.2.2.1⟩
 
 /-- **Axiom-audit hook for Episode 2's `.call`, `LIntrinsicOp`, and `LCallTable` multi-callee model
 (`call_intrinsic_audit_closure`)**: references every Episode 2 theorem of
