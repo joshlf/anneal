@@ -2084,9 +2084,10 @@ def evalPureStmtsUnforced
 
 /-- **Bridge from live multi-statement `Anneal.MirLiftCore.evalPureStmtsN` to
 unforced `evalPureStmt` execution**: extensionally identical on every block
-segment (while computationally `evalPureStmtsN` pays the two-pass `forcePureEnv?`
-overhead after every statement because `evalPureStmt` delegates to trusted
-`evalStmt`). -/
+segment.  Computationally they differ: the per-statement `forcePureEnv?` pass of
+`evalPureStmtsN` is what keeps `rfl` evaluation linear (without it the `set?` chain is
+exponential, `local_slots/ablation_live_set_only_rfl`), so the unforced form is a
+specification, not a faster evaluator. -/
 theorem evalPureStmtsN_eq_unforced
     (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
     (bbIdx : Trusted.Rustc.V2026_06_01.MirAst.BasicBlockIdx)
@@ -7254,6 +7255,221 @@ theorem trustedFnSpec_run_stage2Only_same_verdicts (spec : TrustedFnSpec) (tree�
   (trustedFnSpec_run_latchEquiv_stage2Only spec tree₀ activeCaller t_parent t_arg callId
     hCallFresh hNoUB).noUB_iff start kind range mode
 
+theorem performTransition_localRead_ne_disabled_of_isSome (prot : Bool) {st : LocationState}
+    (h : (performTransition .read .localAccess prot st).isSome = true) :
+    (match performTransition .read .localAccess prot st with | some st' => st' | none => st).perm ≠
+      .disabled := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> cases prot <;> first | decide | cases h
+
+theorem performTransition_localRead_isSome_of_ne_disabled (prot : Bool) {st : LocationState}
+    (h : st.perm ≠ .disabled) : (performTransition .read .localAccess prot st).isSome = true := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> cases prot <;> first | rfl | exact absurd rfl h
+
+/-- Foreign reads are UB-idempotent: a location that survived a foreign read survives
+another one under the same protector status. -/
+theorem performTransition_foreignRead_isSome_idem (prot : Bool) {st : LocationState}
+    (h : (performTransition .read .foreignAccess prot st).isSome = true) :
+    (performTransition .read .foreignAccess prot
+      (match performTransition .read .foreignAccess prot st with
+        | some st' => st' | none => st)).isSome = true := by
+  rcases st with ⟨(_ | _) | _ | _ | _ | _, _ | _⟩ <;> cases prot <;> first | rfl | cases h
+
+/-- Release-read UB-freedom invariant (Round A4): wherever `t_arg` is accessed, its
+ancestors are not `Disabled` and every foreign non-descendant tag survives a foreign read
+under the call's protector set `active₁`. -/
+structure ReleaseReadable (tree : BorrowTree) (t_arg : BorTag) (active₁ : ActiveProtectors) :
+    Prop where
+  local_ne_disabled : ∀ n b, tree.present n = true → (tree.locState t_arg b).accessed = true →
+    tree.isAnc n t_arg = true → (tree.locState n b).perm ≠ .disabled
+  foreign_readable : ∀ n b, tree.present n = true → (tree.locState t_arg b).accessed = true →
+    tree.isAnc n t_arg = false → tree.isAnc t_arg n = false →
+    (performTransition .read .foreignAccess (tree.isTagProtected n active₁)
+      (tree.locState n b)).isSome = true
+
+theorem releaseReadable_of_fnEntry {tree₀ : BorrowTree} {t_parent t_arg : BorTag}
+    {argRange : ByteRange} {activeCaller : ActiveProtectors} {callId : CallId}
+    (hEntryNoUB : TreeAccessNoUB
+      (insertChildNode tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false))
+      t_arg .read argRange (insertActiveProtector activeCaller callId) .visitChildrenOfAccessed) :
+    ReleaseReadable
+      (retagChild tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false) argRange
+        (insertActiveProtector activeCaller callId))
+      t_arg (insertActiveProtector activeCaller callId) := by
+  let active₁ := insertActiveProtector activeCaller callId
+  let treeI := insertChildNode tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+  have hAccIn : ∀ b, ((retagChild tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+      argRange active₁).locState t_arg b).accessed = true → argRange.contains b = true := by
+    intro b hAcc
+    cases hb : argRange.contains b with
+    | true => rfl
+    | false =>
+      rw [retagChild_locState_out _ _ _ _ _ _ _ _ _ hb, insertChildNode_locState_child] at hAcc
+      cases hAcc
+  refine ⟨?_, ?_⟩
+  · intro n b hP hAcc hAnc
+    have hb := hAccIn b hAcc
+    have hP' : treeI.present n = true := hP
+    have hAnc' : treeI.isAnc n t_arg = true := hAnc
+    have hSome := hEntryNoUB n b hP' hb
+    rw [nodeAccessRelatedness_anc hAnc'] at hSome
+    show ((applyTreeAccess treeI t_arg .read argRange active₁ .visitChildrenOfAccessed).locState n b).perm ≠
+      .disabled
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP' hb, nodeAccessRelatedness_anc hAnc']
+    exact performTransition_localRead_ne_disabled_of_isSome _ hSome
+  · intro n b hP hAcc hNotAnc _
+    have hb := hAccIn b hAcc
+    have hP' : treeI.present n = true := hP
+    have hNotAnc' : treeI.isAnc n t_arg = false := hNotAnc
+    have hSome := hEntryNoUB n b hP' hb
+    rw [nodeAccessRelatedness_visit_foreign hNotAnc'] at hSome
+    show (performTransition .read .foreignAccess (treeI.isTagProtected n active₁)
+      ((applyTreeAccess treeI t_arg .read argRange active₁ .visitChildrenOfAccessed).locState n b)).isSome =
+      true
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP' hb, nodeAccessRelatedness_visit_foreign hNotAnc']
+    exact performTransition_foreignRead_isSome_idem _ hSome
+
+theorem releaseReadable_retagChild {tree : BorrowTree} {t_arg next : BorTag}
+    {m : Mutability} {r : ByteRange} {active₁ : ActiveProtectors}
+    (hInv : ReleaseReadable tree t_arg active₁) (hArgRefl : tree.isAnc t_arg t_arg = true)
+    (hNe : next ≠ t_arg)
+    (hStepNoUB : TreeAccessNoUB (insertChildNode tree t_arg next none (initPermOf m))
+      next .read r active₁ .visitChildrenOfAccessed) :
+    ReleaseReadable (retagChild tree t_arg next none (initPermOf m) r active₁) t_arg active₁ := by
+  let treeI := insertChildNode tree t_arg next none (initPermOf m)
+  have hArgAncNext : treeI.isAnc t_arg next = true := by
+    rw [insertChildNode_isAnc_child, hArgRefl, Bool.or_true]
+  have hNextNotAncArg : treeI.isAnc next t_arg = false :=
+    insertChildNode_isAnc_from_child _ _ _ _ _ (Ne.symm hNe)
+  have hAccOld : ∀ b, r.contains b = false →
+      ((retagChild tree t_arg next none (initPermOf m) r active₁).locState t_arg b).accessed = true →
+      (tree.locState t_arg b).accessed = true := by
+    intro b hb hAcc
+    change ((applyTreeAccess treeI next .read r active₁ .visitChildrenOfAccessed).locState t_arg b).accessed =
+      true at hAcc
+    rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb,
+      insertChildNode_locState_of_ne _ _ _ _ _ (Ne.symm hNe)] at hAcc
+    exact hAcc
+  refine ⟨?_, ?_⟩
+  · intro n b hP hAcc hAnc
+    have hP' : treeI.present n = true := hP
+    have hAnc' : treeI.isAnc n t_arg = true := hAnc
+    have hnNe : n ≠ next := by
+      intro heq
+      rw [heq, hNextNotAncArg] at hAnc'
+      cases hAnc'
+    have hAncOld : tree.isAnc n t_arg = true := by
+      rwa [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hNe) hnNe] at hAnc'
+    cases hb : r.contains b with
+    | false =>
+      have hPresOld : tree.present n = true := by
+        rw [insertChildNode_present, decide_eq_false hnNe, Bool.false_or] at hP'
+        exact hP'
+      show ((applyTreeAccess treeI next .read r active₁ .visitChildrenOfAccessed).locState n b).perm ≠
+        .disabled
+      rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb, insertChildNode_locState_of_ne _ _ _ _ _ hnNe]
+      exact hInv.local_ne_disabled n b hPresOld (hAccOld b hb hAcc) hAncOld
+    | true =>
+      have hAncNext : treeI.isAnc n next = true := by
+        rw [insertChildNode_isAnc_child, hAncOld, Bool.or_true]
+      have hSome := hStepNoUB n b hP' hb
+      rw [nodeAccessRelatedness_anc hAncNext] at hSome
+      show ((applyTreeAccess treeI next .read r active₁ .visitChildrenOfAccessed).locState n b).perm ≠
+        .disabled
+      rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP' hb, nodeAccessRelatedness_anc hAncNext]
+      exact performTransition_localRead_ne_disabled_of_isSome _ hSome
+  · intro n b hP hAcc hNotAnc hNotDesc
+    have hP' : treeI.present n = true := hP
+    have hNotAnc' : treeI.isAnc n t_arg = false := hNotAnc
+    have hNotDesc' : treeI.isAnc t_arg n = false := hNotDesc
+    have hnNe : n ≠ next := by
+      intro heq
+      rw [heq, hArgAncNext] at hNotDesc'
+      cases hNotDesc'
+    have hNotAncOld : tree.isAnc n t_arg = false := by
+      rwa [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hNe) hnNe] at hNotAnc'
+    have hNotDescOld : tree.isAnc t_arg n = false := by
+      rwa [insertChildNode_isAnc_of_ne _ _ _ _ _ hnNe (Ne.symm hNe)] at hNotDesc'
+    have hProtEq : treeI.isTagProtected n active₁ = tree.isTagProtected n active₁ :=
+      insertChildNode_isTagProtected_of_ne _ _ _ _ _ hnNe active₁
+    cases hb : r.contains b with
+    | false =>
+      have hPresOld : tree.present n = true := by
+        rw [insertChildNode_present, decide_eq_false hnNe, Bool.false_or] at hP'
+        exact hP'
+      show (performTransition .read .foreignAccess (treeI.isTagProtected n active₁)
+        ((applyTreeAccess treeI next .read r active₁ .visitChildrenOfAccessed).locState n b)).isSome =
+        true
+      rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hb, insertChildNode_locState_of_ne _ _ _ _ _ hnNe,
+        hProtEq]
+      exact hInv.foreign_readable n b hPresOld (hAccOld b hb hAcc) hNotAncOld hNotDescOld
+    | true =>
+      have hNotAncNext : treeI.isAnc n next = false := by
+        rw [insertChildNode_isAnc_child, decide_eq_false hnNe, Bool.false_or]
+        exact hNotAncOld
+      have hSome := hStepNoUB n b hP' hb
+      rw [nodeAccessRelatedness_visit_foreign hNotAncNext] at hSome
+      show (performTransition .read .foreignAccess (treeI.isTagProtected n active₁)
+        ((applyTreeAccess treeI next .read r active₁ .visitChildrenOfAccessed).locState n b)).isSome =
+        true
+      rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hP' hb,
+        nodeAccessRelatedness_visit_foreign hNotAncNext]
+      exact performTransition_foreignRead_isSome_idem _ hSome
+
+theorem applyFootprint_preserves_releaseReadable {t_arg : BorTag} {active₁ : ActiveProtectors} :
+    ∀ (fps : List (ByteRange × Mutability)) (tree : BorrowTree) (next : BorTag),
+      t_arg < next → tree.isAnc t_arg t_arg = true →
+      ReleaseReadable tree t_arg active₁ →
+      ApplyFootprintNoUB t_arg active₁ tree next fps →
+      ReleaseReadable (applyFootprint t_arg active₁ tree next fps).1 t_arg active₁
+  | [], _, _, _, _, hInv, _ => hInv
+  | (r, m) :: rest, tree, next, hlt, hRefl, hInv, ⟨hStep, hRest⟩ =>
+    applyFootprint_preserves_releaseReadable rest
+      (retagChild tree t_arg next none (initPermOf m) r active₁) (next + 1) (Nat.lt_succ_of_lt hlt)
+      (by
+        show (insertChildNode tree t_arg next none (initPermOf m)).isAnc t_arg t_arg = true
+        rw [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm (Nat.ne_of_gt hlt))
+          (Ne.symm (Nat.ne_of_gt hlt))]
+        exact hRefl)
+      (releaseReadable_retagChild hInv hRefl (Nat.ne_of_gt hlt) hStep) hRest
+
+/-- The two invariants together make a stage-1 release UB-free. -/
+theorem releaseProtectorNoUB_of_readReleaseSafe {tree : BorrowTree} {t_arg : BorTag}
+    {activeCaller active₁ : ActiveProtectors} (hSafe : ReadReleaseSafe tree t_arg activeCaller)
+    (hInv : ReleaseReadable tree t_arg active₁) : releaseProtectorNoUB tree t_arg active₁ := by
+  intro n b hP hA
+  rw [Permission.associatedAccess_of_ne_active (hSafe.arg_ne_active b)]
+  cases hR : nodeAccessRelatedness tree t_arg .skipChildrenOfAccessed n with
+  | none => trivial
+  | some rel =>
+    cases rel with
+    | localAccess =>
+      exact performTransition_localRead_isSome_of_ne_disabled _
+        (hInv.local_ne_disabled n b hP hA (nodeAccessRelatedness_isAnc_of_local hR))
+    | foreignAccess =>
+      exact hInv.foreign_readable n b hP hA (nodeAccessRelatedness_not_isAnc_of_foreign hR)
+        (nodeAccessRelatedness_skip_not_desc_of_foreign hR)
+
+/-- **The stage-1 release of every UB-free `TrustedFnSpec` call is itself UB-free**
+(Round A4).  Without this, `trustedFnSpec_run_latchEquiv_stage2Only` would leave open that
+Miri's two-stage return reports UB at the release itself while the stage-2-only return
+continues; with it, the two returns agree on every step, including the return. -/
+theorem trustedFnSpec_release_noUB (spec : TrustedFnSpec) (tree₀ : BorrowTree)
+    (activeCaller : ActiveProtectors) (t_parent t_arg : BorTag) (callId : CallId)
+    (hNoUB : spec.NoUB tree₀ activeCaller t_parent t_arg callId) :
+    releaseProtectorNoUB
+      (applyFootprint t_arg (insertActiveProtector activeCaller callId)
+        (retagChild tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false) spec.argRange
+          (insertActiveProtector activeCaller callId))
+        (t_arg + 1) spec.reborrowFootprint).1
+      t_arg (insertActiveProtector activeCaller callId) := by
+  obtain ⟨hEntry, hFp⟩ := hNoUB
+  have hSafe0 := readReleaseSafe_of_fnEntry hEntry
+  exact releaseProtectorNoUB_of_readReleaseSafe
+    (applyFootprint_preserves_readReleaseSafe spec.reborrowFootprint _ (t_arg + 1)
+      (Nat.lt_succ_self t_arg) hSafe0 hFp)
+    (applyFootprint_preserves_releaseReadable spec.reborrowFootprint _ (t_arg + 1)
+      (Nat.lt_succ_self t_arg) hSafe0.arg_refl (releaseReadable_of_fnEntry hEntry) hFp)
+
 /-- **Concrete MIR callee execution under the live stage-2-only return path**
 (`restoreCallerProtectors`, without stage-1 `applyReleaseProtector`). -/
 inductive ConcreteCallStage2Only (tree₀ : BorrowTree) (activeCaller : ActiveProtectors)
@@ -7958,6 +8174,18 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms applySlotUpdates_eq_of_live?
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.set?_of_setSpineChecked?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms set?_of_setSpineChecked?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_assign_local_of_setSpineChecked?' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalPureStmtNorm_assign_local_of_setSpineChecked?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtsN_eq_unforced' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalPureStmtsN_eq_unforced
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.length_splice' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms length_splice
@@ -8642,6 +8870,10 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms applyTreeAccess_read_ne_active
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_skip_not_desc_of_foreign' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_skip_not_desc_of_foreign
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_read_eraseLatch' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms applyReleaseProtector_read_eraseLatch
@@ -8661,10 +8893,6 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.update_foreignRead_eq_self' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms update_foreignRead_eq_self
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_skip_not_desc_of_foreign' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms nodeAccessRelatedness_skip_not_desc_of_foreign
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyReleaseProtector_read_latchEquiv' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -8701,18 +8929,6 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.reborrow_return_after_parent_write_stage2Only_unique_write_perm' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms reborrow_return_after_parent_write_stage2Only_unique_write_perm
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.set?_of_setSpineChecked?' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms set?_of_setSpineChecked?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_assign_local_of_setSpineChecked?' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms evalPureStmtNorm_assign_local_of_setSpineChecked?
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtsN_eq_unforced' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms evalPureStmtsN_eq_unforced
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.read_latchEquiv_ignores_active_descendant' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -8753,6 +8969,38 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.trustedFnSpec_run_stage2Only_same_verdicts' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms trustedFnSpec_run_stage2Only_same_verdicts
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_localRead_ne_disabled_of_isSome' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_localRead_ne_disabled_of_isSome
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_localRead_isSome_of_ne_disabled' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_localRead_isSome_of_ne_disabled
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_foreignRead_isSome_idem' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_foreignRead_isSome_idem
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.releaseReadable_of_fnEntry' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms releaseReadable_of_fnEntry
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.releaseReadable_retagChild' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms releaseReadable_retagChild
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applyFootprint_preserves_releaseReadable' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applyFootprint_preserves_releaseReadable
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.releaseProtectorNoUB_of_readReleaseSafe' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms releaseProtectorNoUB_of_readReleaseSafe
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.trustedFnSpec_release_noUB' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms trustedFnSpec_release_noUB
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.trustedSpec_stage2Only_reborrow_equivalence' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in

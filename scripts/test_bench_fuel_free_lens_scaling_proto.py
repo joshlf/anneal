@@ -313,10 +313,24 @@ class LeanSourceAuditTests(unittest.TestCase):
             "trustedFnSpec_run_latchEquiv_stage2Only",
             "trustedFnSpec_run_stage2Only_same_verdicts",
             "trustedSpec_stage2Only_reborrow_equivalence",
+            "performTransition_foreignRead_isSome_idem", "releaseReadable_of_fnEntry",
+            "releaseReadable_retagChild", "applyFootprint_preserves_releaseReadable",
+            "releaseProtectorNoUB_of_readReleaseSafe", "trustedFnSpec_release_noUB",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_trustedFnSpec_stage1_release_is_ub_free(self):
+        """Observational equivalence of `TrustedFnSpec.run` and `runStage2Only` needs the stage-1
+        release itself to be UB-free; `trustedFnSpec_release_noUB` must derive that from `spec.NoUB`
+        alone (no extra hypotheses on the tree or the caller's protectors)."""
+        m = re.search(r"theorem trustedFnSpec_release_noUB\b(.*?):= by", self.code, re.S)
+        self.assertIsNotNone(m)
+        stmt = m.group(1)
+        self.assertIn("(hNoUB : spec.NoUB tree₀ activeCaller t_parent t_arg callId)", stmt)
+        self.assertIn("releaseProtectorNoUB", stmt)
+        self.assertEqual(stmt.count("(h"), 1, "only the spec.NoUB hypothesis is allowed")
 
     def test_lifo_read_release_mechanized_for_trustedFnSpec(self):
         """`trustedFnSpec_run_latchEquiv_stage2Only` must mechanize the LIFO discharge of

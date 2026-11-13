@@ -17,13 +17,15 @@ heartbeats, and 2.1–2.6× fewer than the two-pass normalization that the live 
 performs today—even with identical bounds checking in `checked_single_pass_rfl`—while plain `rfl`,
 the live chain without its forcing pass, and end-of-chain projection all time out from `K = 20`), and
 apply `forcePureEnv` step-wise rather than as an end-of-chain projection over an unforced `List.set`
-tower.
+tower. The one correctness item is the Tree Borrows return path: the trusted semantics omits Miri's
+stage-1 protector release, which is provably harmless for `TrustedFnSpec`-shaped calls but misses Miri
+UB after a callee writes through a protected `&mut` argument (Condition 3).
 
 ## 1. Deliverables
 
 | File | Contents |
 |---|---|
-| `theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean` | 339 kernel-checked theorems (0 `sorry`, 0 warnings), each audited by a `#guard_msgs in #print axioms` block (`propext` / `Quot.sound` only) |
+| `theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean` | 347 kernel-checked theorems (0 `sorry`, 0 warnings), each audited by a `#guard_msgs in #print axioms` block (`propext` / `Quot.sound` only) |
 | `scripts/bench_fuel_free_lens_scaling_proto.py` | Benchmark harness (`--dry-run`, `--verify-report`, `--update-report`) |
 | `scripts/test_bench_fuel_free_lens_scaling_proto.py` | Unit, negative/edge-case, proof-health, axiom-guard, hygiene, isolation, and report-consistency tests |
 | `PROTOTYPE_REPORT.md` | This report (tables + embedded JSON receipt are generated and machine-verified) |
@@ -211,7 +213,10 @@ while the call id is active, then `removeActiveProtector` = `GlobalState.endCall
   whose necessity is proven by `stage1_read_release_outliving_unconflicted_separates`). All four side
   conditions are **mechanically discharged** for every UB-free `TrustedFnSpec` execution under
   arbitrary outliving caller protectors by `trustedFnSpec_run_latchEquiv_stage2Only` and
-  `trustedFnSpec_run_stage2Only_same_verdicts` (via `ReadReleaseSafe`). By contrast, when a protected
+  `trustedFnSpec_run_stage2Only_same_verdicts` (via `ReadReleaseSafe`), and the stage-1 release of every
+  such call is itself UB-free (`trustedFnSpec_release_noUB`, via `ReleaseReadable` and the foreign-read
+  idempotence `performTransition_foreignRead_isSome_idem`), so the two return paths agree on every step
+  including the return itself. By contrast, when a protected
   `&mut` argument is *activated* (`Active`) by a callee write, stage-1 release performs an implicit
   `AccessKind.write` that **is observable** (`stage1_write_release_observable_ub_separation`): on a
   UB-free function-entry + LIFO call that writes byte `0` through `t_arg` and then reborrows an
@@ -233,7 +238,7 @@ while the call id is active, then `removeActiveProtector` = `GlobalState.endCall
   `TrustedFnSpec.run` with overlapping shared (`Mutability.not`) footprints keeps both references
   `Frozen` across reads while rejecting writes through either.
 
-## 3. Receipts (latest pass: B4)
+## 3. Receipts (final pass: A4)
 
 ```bash
 anneal-lean-run --mode file --concurrency 1 -- lake env lean theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean
@@ -244,7 +249,7 @@ git diff --name-only 2167b83c9bf782c337d7cec99d54249c52f865c9..HEAD
 git status --porcelain
 ```
 
-All six pass at B4: the Lean file elaborates with no output (0 errors, 0 warnings, 339 axiom guards
+All six pass at A4: the Lean file elaborates with no output (0 errors, 0 warnings, 347 axiom guards
 passing), the unit suite passes (including the report drift checks
 `test_report_theorem_counts_match_source` and `test_report_names_resolve`), `--dry-run` validates
 all generated benchmark files in milliseconds, `--verify-report` matches the embedded receipt (whose
@@ -295,29 +300,29 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_rfl` | 17 ms / 145 k | 105 ms / 1105 k | timeout (> 200 M hb) | skipped (censored) |
-| `naive_simp` | 29 ms / 156 k | 52 ms / 245 k | 100 ms / 423 k | 94 ms / 609 k |
-| `ablation_projection_rfl` | 42 ms / 249 k | 309 ms / 2140 k | timeout (> 200 M hb) | skipped (censored) |
-| `ablation_live_set_only_rfl` | 50 ms / 428 k | 653 ms / 6031 k | timeout (> 200 M hb) | skipped (censored) |
-| `live_two_pass_rfl` | 42 ms / 287 k | 61 ms / 498 k | 141 ms / 917 k | 192 ms / 1359 k |
-| `checked_single_pass_rfl` | 19 ms / 137 k | 27 ms / 214 k | 48 ms / 365 k | 72 ms / 524 k |
-| `optimized_forcePureEnv` | 19 ms / 137 k | 28 ms / 214 k | 49 ms / 366 k | 69 ms / 525 k |
+| `naive_rfl` | 19 ms / 145 k | 110 ms / 1105 k | timeout (> 200 M hb) | skipped (censored) |
+| `naive_simp` | 20 ms / 156 k | 34 ms / 245 k | 56 ms / 423 k | 81 ms / 609 k |
+| `ablation_projection_rfl` | 44 ms / 249 k | 309 ms / 2140 k | timeout (> 200 M hb) | skipped (censored) |
+| `ablation_live_set_only_rfl` | 48 ms / 428 k | 646 ms / 6031 k | timeout (> 200 M hb) | skipped (censored) |
+| `live_two_pass_rfl` | 36 ms / 287 k | 67 ms / 498 k | 122 ms / 917 k | 160 ms / 1359 k |
+| `checked_single_pass_rfl` | 18 ms / 137 k | 28 ms / 214 k | 47 ms / 365 k | 62 ms / 524 k |
+| `optimized_forcePureEnv` | 22 ms / 137 k | 28 ms / 214 k | 46 ms / 366 k | 73 ms / 525 k |
 
 #### `struct_fields`
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_rfl` | 113 ms / 848 k | 2781 ms / 21109 k | timeout (> 200 M hb) | skipped (censored) |
-| `naive_simp` | 67 ms / 409 k | 77 ms / 508 k | 105 ms / 696 k | 135 ms / 889 k |
-| `optimized_typedAt_lens` | 16 ms / 133 k | 23 ms / 201 k | 43 ms / 338 k | 61 ms / 475 k |
+| `naive_rfl` | 101 ms / 848 k | 2278 ms / 21109 k | timeout (> 200 M hb) | skipped (censored) |
+| `naive_simp` | 78 ms / 409 k | 101 ms / 508 k | 94 ms / 696 k | 128 ms / 889 k |
+| `optimized_typedAt_lens` | 20 ms / 133 k | 25 ms / 201 k | 39 ms / 338 k | 62 ms / 475 k |
 
 #### `loop_trip`
 
 | variant | K = 5 | K = 10 | K = 20 | K = 30 |
 |---|---|---|---|---|
-| `naive_fuel_rfl` | 5247 ms / 56665 k | timeout (> 200 M hb) | skipped (censored) | skipped (censored) |
-| `naive_fuel_simp` | 456 ms / 1979 k | 966 ms / 4308 k | 2635 ms / 11172 k | 5176 ms / 21063 k |
-| `optimized_runCfgToBlock_forRangeUp` | 29 ms / 158 k | 28 ms / 158 k | 25 ms / 158 k | 22 ms / 158 k |
+| `naive_fuel_rfl` | 6243 ms / 56665 k | timeout (> 200 M hb) | skipped (censored) | skipped (censored) |
+| `naive_fuel_simp` | 383 ms / 1979 k | 868 ms / 4308 k | 2469 ms / 11172 k | 5253 ms / 21063 k |
+| `optimized_runCfgToBlock_forRangeUp` | 27 ms / 158 k | 21 ms / 158 k | 22 ms / 158 k | 23 ms / 158 k |
 
 <details><summary>Embedded JSON receipt (verified by <code>--verify-report</code>)</summary>
 
@@ -325,21 +330,21 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
 {
  "cpu_count": 8,
  "file_wall_ms_median": {
-  "local_slots/ablation_live_set_only_rfl": 26259,
-  "local_slots/ablation_projection_rfl": 30709,
-  "local_slots/checked_single_pass_rfl": 3737,
-  "local_slots/live_two_pass_rfl": 3892,
-  "local_slots/naive_rfl": 23055,
-  "local_slots/naive_simp": 3864,
-  "local_slots/optimized_forcePureEnv": 3531,
-  "loop_trip/naive_fuel_rfl": 32314,
-  "loop_trip/naive_fuel_simp": 13024,
-  "loop_trip/optimized_runCfgToBlock_forRangeUp": 3267,
-  "struct_fields/naive_rfl": 33065,
-  "struct_fields/naive_simp": 3611,
-  "struct_fields/optimized_typedAt_lens": 3312
+  "local_slots/ablation_live_set_only_rfl": 23194,
+  "local_slots/ablation_projection_rfl": 22094,
+  "local_slots/checked_single_pass_rfl": 3114,
+  "local_slots/live_two_pass_rfl": 3476,
+  "local_slots/naive_rfl": 21467,
+  "local_slots/naive_simp": 3051,
+  "local_slots/optimized_forcePureEnv": 3221,
+  "loop_trip/naive_fuel_rfl": 35100,
+  "loop_trip/naive_fuel_simp": 12115,
+  "loop_trip/optimized_runCfgToBlock_forRangeUp": 2954,
+  "struct_fields/naive_rfl": 30093,
+  "struct_fields/naive_simp": 3349,
+  "struct_fields/optimized_typedAt_lens": 2954
  },
- "generated_at_utc": "2026-11-13T20:55:45Z",
+ "generated_at_utc": "2026-11-13T21:17:37Z",
  "heartbeat_budget": 200000,
  "ks": [
   5,
@@ -349,8 +354,8 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
  ],
  "lean_toolchain": "leanprover/lean4:v4.34.1",
  "prototype": "theory/Anneal/FuelFreeLoopAndTypedAtLensPrototype.lean",
- "prototype_compile_ms": 16799,
- "prototype_sha256": "6e0ff9d71c0b45c4ecc8d237a59e52538215557b32aca5d149cdd76b1e9953df",
+ "prototype_compile_ms": 31997,
+ "prototype_sha256": "8fc502193e772585c2b73735388048e71461618fc121b27980436f79d3202840",
  "repetitions": 3,
  "results": [
   {
@@ -362,11 +367,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 145,
-   "median_ms": 17,
+   "median_ms": 19,
    "ms_samples": [
-    18,
-    16,
-    17
+    27,
+    19,
+    16
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -380,11 +385,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 1105,
-   "median_ms": 105,
+   "median_ms": 110,
    "ms_samples": [
-    109,
-    105,
-    91
+    195,
+    110,
+    101
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -418,11 +423,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 156,
-   "median_ms": 29,
+   "median_ms": 20,
    "ms_samples": [
-    29,
     27,
-    37
+    20,
+    15
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -436,11 +441,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 245,
-   "median_ms": 52,
+   "median_ms": 34,
    "ms_samples": [
-    52,
-    28,
-    62
+    44,
+    34,
+    24
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -454,11 +459,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 423,
-   "median_ms": 100,
+   "median_ms": 56,
    "ms_samples": [
-    105,
-    60,
-    100
+    64,
+    56,
+    48
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -472,11 +477,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 609,
-   "median_ms": 94,
+   "median_ms": 81,
    "ms_samples": [
-    153,
-    89,
-    94
+    93,
+    81,
+    62
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -490,11 +495,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 249,
-   "median_ms": 42,
+   "median_ms": 44,
    "ms_samples": [
-    133,
-    29,
-    42
+    57,
+    44,
+    33
    ],
    "status": "ok",
    "variant": "ablation_projection_rfl"
@@ -510,9 +515,9 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    "kilo_heartbeats": 2140,
    "median_ms": 309,
    "ms_samples": [
-    554,
-    199,
-    309
+    309,
+    347,
+    209
    ],
    "status": "ok",
    "variant": "ablation_projection_rfl"
@@ -546,11 +551,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 428,
-   "median_ms": 50,
+   "median_ms": 48,
    "ms_samples": [
-    65,
-    46,
-    50
+    53,
+    42,
+    48
    ],
    "status": "ok",
    "variant": "ablation_live_set_only_rfl"
@@ -564,11 +569,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 6031,
-   "median_ms": 653,
+   "median_ms": 646,
    "ms_samples": [
-    653,
-    548,
-    664
+    689,
+    646,
+    636
    ],
    "status": "ok",
    "variant": "ablation_live_set_only_rfl"
@@ -602,11 +607,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 287,
-   "median_ms": 42,
+   "median_ms": 36,
    "ms_samples": [
-    43,
-    42,
-    32
+    36,
+    34,
+    45
    ],
    "status": "ok",
    "variant": "live_two_pass_rfl"
@@ -620,11 +625,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 498,
-   "median_ms": 61,
+   "median_ms": 67,
    "ms_samples": [
-    61,
-    72,
-    59
+    67,
+    53,
+    75
    ],
    "status": "ok",
    "variant": "live_two_pass_rfl"
@@ -638,11 +643,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 917,
-   "median_ms": 141,
+   "median_ms": 122,
    "ms_samples": [
-    145,
-    141,
-    100
+    171,
+    94,
+    122
    ],
    "status": "ok",
    "variant": "live_two_pass_rfl"
@@ -656,11 +661,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 1359,
-   "median_ms": 192,
+   "median_ms": 160,
    "ms_samples": [
-    219,
-    192,
-    154
+    285,
+    157,
+    160
    ],
    "status": "ok",
    "variant": "live_two_pass_rfl"
@@ -674,11 +679,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 137,
-   "median_ms": 19,
+   "median_ms": 18,
    "ms_samples": [
+    20,
     17,
-    19,
-    34
+    18
    ],
    "status": "ok",
    "variant": "checked_single_pass_rfl"
@@ -692,11 +697,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 214,
-   "median_ms": 27,
+   "median_ms": 28,
    "ms_samples": [
+    29,
     24,
-    27,
-    66
+    28
    ],
    "status": "ok",
    "variant": "checked_single_pass_rfl"
@@ -710,11 +715,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 365,
-   "median_ms": 48,
+   "median_ms": 47,
    "ms_samples": [
-    42,
-    48,
-    56
+    45,
+    47,
+    52
    ],
    "status": "ok",
    "variant": "checked_single_pass_rfl"
@@ -728,11 +733,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 524,
-   "median_ms": 72,
+   "median_ms": 62,
    "ms_samples": [
-    72,
-    77,
-    72
+    62,
+    69,
+    60
    ],
    "status": "ok",
    "variant": "checked_single_pass_rfl"
@@ -746,11 +751,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 137,
-   "median_ms": 19,
+   "median_ms": 22,
    "ms_samples": [
-    21,
-    18,
-    19
+    22,
+    23,
+    15
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -766,9 +771,9 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    "kilo_heartbeats": 214,
    "median_ms": 28,
    "ms_samples": [
-    28,
-    43,
-    24
+    27,
+    33,
+    28
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -782,11 +787,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 366,
-   "median_ms": 49,
+   "median_ms": 46,
    "ms_samples": [
-    66,
-    49,
-    42
+    45,
+    48,
+    46
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -800,11 +805,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 525,
-   "median_ms": 69,
+   "median_ms": 73,
    "ms_samples": [
-    86,
-    69,
-    55
+    71,
+    80,
+    73
    ],
    "status": "ok",
    "variant": "optimized_forcePureEnv"
@@ -818,11 +823,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 848,
-   "median_ms": 113,
+   "median_ms": 101,
    "ms_samples": [
-    113,
-    105,
-    122
+    114,
+    87,
+    101
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -836,11 +841,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 21109,
-   "median_ms": 2781,
+   "median_ms": 2278,
    "ms_samples": [
-    2789,
-    2781,
-    2503
+    2690,
+    2278,
+    2016
    ],
    "status": "ok",
    "variant": "naive_rfl"
@@ -874,11 +879,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 409,
-   "median_ms": 67,
+   "median_ms": 78,
    "ms_samples": [
-    70,
-    63,
-    67
+    88,
+    77,
+    78
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -892,11 +897,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 508,
-   "median_ms": 77,
+   "median_ms": 101,
    "ms_samples": [
-    77,
-    88,
-    73
+    123,
+    101,
+    68
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -910,11 +915,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 696,
-   "median_ms": 105,
+   "median_ms": 94,
    "ms_samples": [
-    105,
-    100,
-    107
+    178,
+    94,
+    88
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -928,11 +933,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 889,
-   "median_ms": 135,
+   "median_ms": 128,
    "ms_samples": [
-    124,
-    135,
-    141
+    243,
+    113,
+    128
    ],
    "status": "ok",
    "variant": "naive_simp"
@@ -946,11 +951,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 133,
-   "median_ms": 16,
+   "median_ms": 20,
    "ms_samples": [
-    16,
-    25,
-    14
+    26,
+    20,
+    16
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -964,11 +969,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 201,
-   "median_ms": 23,
+   "median_ms": 25,
    "ms_samples": [
-    23,
-    35,
-    22
+    28,
+    20,
+    25
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -982,11 +987,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 338,
-   "median_ms": 43,
+   "median_ms": 39,
    "ms_samples": [
-    35,
-    43,
-    45
+    47,
+    39,
+    38
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -1000,11 +1005,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 475,
-   "median_ms": 61,
+   "median_ms": 62,
    "ms_samples": [
-    68,
-    61,
-    46
+    58,
+    62,
+    63
    ],
    "status": "ok",
    "variant": "optimized_typedAt_lens"
@@ -1018,11 +1023,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 56665,
-   "median_ms": 5247,
+   "median_ms": 6243,
    "ms_samples": [
-    6508,
-    5247,
-    5003
+    6796,
+    6243,
+    4925
    ],
    "status": "ok",
    "variant": "naive_fuel_rfl"
@@ -1066,11 +1071,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 1979,
-   "median_ms": 456,
+   "median_ms": 383,
    "ms_samples": [
-    506,
-    380,
-    456
+    313,
+    383,
+    517
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -1084,11 +1089,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 4308,
-   "median_ms": 966,
+   "median_ms": 868,
    "ms_samples": [
-    1009,
-    922,
-    966
+    847,
+    1254,
+    868
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -1102,11 +1107,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 11172,
-   "median_ms": 2635,
+   "median_ms": 2469,
    "ms_samples": [
-    2561,
-    2635,
-    2661
+    2516,
+    2429,
+    2469
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -1120,11 +1125,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 21063,
-   "median_ms": 5176,
+   "median_ms": 5253,
    "ms_samples": [
-    5176,
-    4796,
-    5342
+    5253,
+    5671,
+    4617
    ],
    "status": "ok",
    "variant": "naive_fuel_simp"
@@ -1138,11 +1143,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 5,
    "kilo_heartbeats": 158,
-   "median_ms": 29,
+   "median_ms": 27,
    "ms_samples": [
-    23,
     29,
-    30
+    22,
+    27
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -1156,11 +1161,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 10,
    "kilo_heartbeats": 158,
-   "median_ms": 28,
+   "median_ms": 21,
    "ms_samples": [
-    28,
-    29,
-    27
+    27,
+    21,
+    21
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -1174,11 +1179,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 20,
    "kilo_heartbeats": 158,
-   "median_ms": 25,
+   "median_ms": 22,
    "ms_samples": [
-    24,
-    28,
-    25
+    32,
+    22,
+    21
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -1192,11 +1197,11 @@ Cells: median elaboration wall-clock / median elaboration kilo-heartbeats (`#mea
    ],
    "k": 30,
    "kilo_heartbeats": 158,
-   "median_ms": 22,
+   "median_ms": 23,
    "ms_samples": [
-    22,
-    26,
-    21
+    34,
+    21,
+    23
    ],
    "status": "ok",
    "variant": "optimized_runCfgToBlock_forRangeUp"
@@ -1216,27 +1221,27 @@ Measured claims (quoted verbatim from the receipt by `--verify-report`):
 - `struct_fields/optimized_typedAt_lens` at K = 30: 475 k heartbeats
 - `loop_trip/optimized_runCfgToBlock_forRangeUp` at K = 30: 158 k heartbeats
 
-Interpretation (B4 receipt; heartbeats are deterministic and identical across B3–B4 on every row,
-while wall-clock medians are re-measured on the B4 prototype revision):
+Interpretation (final A4 receipt; heartbeats are deterministic and identical to the A3 and B4 receipts
+on every row, while wall-clock medians are re-measured on the final prototype revision):
 
-* **Loops.** The fuel-free proof costs 158 k heartbeats (22–29 ms) at every trip count, while explicit
-  fuel under `simp` grows super-linearly from 1979 k to 21063 k heartbeats (about K^1.3; 456 ms →
-  5176 ms) and `rfl` needs 56665 k at K = 5 (5247 ms) and times out from K = 10. This is the only
+* **Loops.** The fuel-free proof costs 158 k heartbeats (21–27 ms) at every trip count, while explicit
+  fuel under `simp` grows super-linearly from 1979 k to 21063 k heartbeats (about K^1.3; 383 ms →
+  5253 ms) and `rfl` needs 56665 k at K = 5 (6243 ms) and times out from K = 10. This is the only
   *asymptotic* separation from `simp`.
 * **Struct fields.** The `TypedAt` lens proof (133 k → 475 k heartbeats) and byte-list `simp`
-  (409 k → 889 k) are both linear in K; the lens proof needs 1.9–3.1× fewer heartbeats (61 ms vs
-  135 ms at K = 30). Byte-level `rfl` grows from 848 k to 21109 k and times out from K = 20.
+  (409 k → 889 k) are both linear in K; the lens proof needs 1.9–3.1× fewer heartbeats (62 ms vs
+  128 ms at K = 30). Byte-level `rfl` grows from 848 k to 21109 k and times out from K = 20.
 * **Local slots.** Single-pass forcing, bounds-checked (`checked_single_pass_rfl`, 137 k → 524 k,
-  19 → 72 ms) or not (`optimized_forcePureEnv`, 137 k → 525 k, 19 → 69 ms), `List.set` `simp`
-  (156 k → 609 k, 29 → 94 ms), and the live two-pass normalization (`live_two_pass_rfl`,
-  287 k → 1359 k, 42 → 192 ms) are all linear: single-pass forcing needs 1.14–1.16× fewer heartbeats
+  18 → 62 ms) or not (`optimized_forcePureEnv`, 137 k → 525 k, 22 → 73 ms), `List.set` `simp`
+  (156 k → 609 k, 20 → 81 ms), and the live two-pass normalization (`live_two_pass_rfl`,
+  287 k → 1359 k, 36 → 160 ms) are all linear: single-pass forcing needs 1.14–1.16× fewer heartbeats
   than `simp` and 2.1–2.6× fewer than the live strategy, which needs 1.8–2.2× more than `simp`; the
   bounds check itself is free (within 1 k heartbeat). Without its forcing pass the live chain is
   exponential (`ablation_live_set_only_rfl`: 428 k → 6031 k from K = 5 to 10, timeout from K = 20),
-  exactly like plain `rfl` (145 k → 1105 k) and end-of-chain projection (249 k → 2140 k), so the
-  forcing pass is what makes the live normalizer linear and the saving comes from fusing it into the
-  update, not from removing it. Wall-clock ratios between the linear strategies vary between receipts,
-  so only the heartbeat ratios are stable signals.
+  like plain `rfl` (145 k → 1105 k) and end-of-chain projection (249 k → 2140 k), so the forcing pass
+  is what makes the live normalizer linear and the saving comes from fusing it into the update, not
+  from removing it. Wall-clock ratios between the linear strategies vary between receipts, so only the
+  heartbeat ratios are stable signals.
 
 ## 6. Track A integration mapping
 
@@ -1285,17 +1290,21 @@ bounds-checked single-pass forcing (`checked_single_pass_rfl`) beats the live tw
    on accessed locations (`performTransition_accessed_eq_live`, `performTransition_entry_eq_live`) and
    the `parentTag` / return-protector bookkeeping is bridged
    (`nodeAccessRelatedness_visit_eq_live_writer`, `borrowEntryWriteConflicts_eq_live`,
-   `restoreCallerProtectors_eq_live`). Every UB-free non-activating `TrustedFnSpec` call is now
-   **mechanically proven** observationally identical (`LatchEquiv`) under Miri's two-stage release and
-   the live stage-2-only `restoreCallerProtectors` path across arbitrary outliving caller protectors
+   `restoreCallerProtectors_eq_live`). Every UB-free `TrustedFnSpec` call (one protected argument, a
+   body of retags, hence never activating) is **mechanically proven** observationally identical under
+   Miri's two-stage release and the live stage-2-only `restoreCallerProtectors` path across arbitrary
+   outliving caller protectors: the stage-1 release is UB-free (`trustedFnSpec_release_noUB`) and the
+   post-call trees are `LatchEquiv` with equal verdicts for every later access
    (`trustedFnSpec_run_latchEquiv_stage2Only`, `trustedFnSpec_run_stage2Only_same_verdicts`,
-   `trustedSpec_stage2Only_reborrow_equivalence`), and child reborrows under `t_arg` also hold after
-   parent writes (`reborrow_return_after_parent_write_stage2Only_unique_write_perm`). **General
-   observational equivalence fails only when a protected argument is activated (`Active`) by a callee
-   write**: omitting Miri's stage-1 implicit write fails to disable foreign sibling tags on unaccessed
-   offsets and observably changes post-return UB (`stage1_write_release_observable_ub_separation`).
-   Track A must either add stage-1 release on activated protectors at return or restrict stage-2-only
-   call specs to non-activating `TrustedFnSpec` / descendant-only reborrows.
+   `trustedSpec_stage2Only_reborrow_equivalence`); child reborrows under `t_arg` also hold after parent
+   writes (`reborrow_return_after_parent_write_stage2Only_unique_write_perm`). **Observational
+   equivalence fails once a protected argument is activated (`Active`) by a callee write**: omitting
+   Miri's stage-1 implicit write fails to disable foreign sibling tags on unaccessed offsets and
+   observably changes post-return UB (`stage1_write_release_observable_ub_separation`), so the trusted
+   return path accepts executions that Miri rejects. All known separations need activation, but
+   equivalence is mechanized only for `TrustedFnSpec`-shaped calls. Track A must either add stage-1
+   release at return (at least for activated protectors) to the trusted semantics, or restrict
+   stage-2-only reasoning to `TrustedFnSpec`-shaped calls and descendant-only reborrows.
 4. **Keep the constructive-axiom audit.** The core `List.drop_take` uses `Classical.choice`, and
    `omega` inserts `Classical.byContradiction` on non-atomic goals; the prototype avoids both
    (`drop_take_add`, split conjunctions), and Track A should keep a `#guard_msgs` axiom audit.
@@ -1332,13 +1341,18 @@ bounds-checked single-pass forcing (`checked_single_pass_rfl`) beats the live tw
   trusted semantics drops callee protectors at return (`restoreCallerProtectors`) without Miri's
   protector-end implicit access. Every UB-free non-activating `TrustedFnSpec` call automatically
   satisfies `ReadReleaseSafe` and is proven `LatchEquiv` to stage-2-only release under arbitrary
-  outliving caller protectors (`trustedFnSpec_run_latchEquiv_stage2Only`,
-  `trustedFnSpec_run_stage2Only_same_verdicts`, discharging `applyReleaseProtector_read_latchEquiv`,
+  outliving caller protectors, with a UB-free stage-1 release (`trustedFnSpec_run_latchEquiv_stage2Only`,
+  `trustedFnSpec_run_stage2Only_same_verdicts`, `trustedFnSpec_release_noUB`, discharging
+  `applyReleaseProtector_read_latchEquiv`,
   whose `hOutlive` premise is proven necessary on non-LIFO states by
   `stage1_read_release_outliving_unconflicted_separates`). For `Active` protected tags, stage-1
   release is an implicit write that disables foreign sibling tags on unaccessed offsets, creating a
   genuine post-return UB separation under function-entry + LIFO protector discipline
-  (`stage1_write_release_observable_ub_separation`, corresponding to LLVM `noalias` store sinking).
+  (`stage1_write_release_observable_ub_separation`, corresponding to LLVM `noalias` store sinking):
+  the trusted return path accepts executions that Miri rejects. Equivalence is mechanized only for
+  `TrustedFnSpec`-shaped calls (one protected argument, a body of retags); other non-activating call
+  shapes (several protected arguments, callee accesses through unrelated pointers, nested calls) are
+  covered by the general side conditions but not by a mechanized invariant.
 * **The live slot normalizer is two-pass, and its forcing pass is load-bearing.**
   `Anneal.MirLiftCore.evalPureStmtNorm` forces the frame after every statement via
   `(set? env loc s).bind forcePureEnv?`, costing more than `List.set` `simp` (`live_two_pass_rfl`);
@@ -1499,3 +1513,29 @@ first-hit characterization of `runToTarget` (no overshoot), and added non-vacuit
    Round A3 left discharging the four side conditions of `applyReleaseProtector_read_latchEquiv` under UB-free function-entry / LIFO execution as *"an argument, not mechanized here"*, omitted `tree.isAnc t_rel n = false` from `hForeign` (unnecessarily rejecting active descendants of `t_rel` even though `ChildrenVisitMode.skipChildrenOfAccessed` skips all descendants), and stated the necessity of `hOutlive` only in prose. Weakened `hForeign` in `applyReleaseProtector_read_eraseLatch`, `applyReleaseProtector_read_latchEquiv`, and `applyReleaseProtector_read_same_verdicts` (with separating witness `read_latchEquiv_ignores_active_descendant`), proved `stage1_read_release_outliving_unconflicted_separates` (violating `hOutlive` while satisfying `hRead`, `hLocal`, and `hForeign` produces opposite `TreeAccessNoUB` verdicts), mechanized the inductive `ReadReleaseSafe` invariant across `FnEntry` and arbitrary `reborrowFootprint` lists (`trustedFnSpec_run_latchEquiv_stage2Only`, `trustedFnSpec_run_stage2Only_same_verdicts`) for arbitrary `BorrowTree` and outliving caller protectors, and proved `trustedSpec_stage2Only_reborrow_equivalence` for `ConcreteCallStage2Only`.
 2. **[MEDIUM — Pillar 2 Trusted/Untrusted Boundary in `MirLiftCore.lean` (`evalStmt` vs `set?_of_forcePureEnv?`) & Multi-Statement `evalPureStmtsN` Bridge.]**
    A3's §6 / Condition 1 grouped `set?_of_forcePureEnv?` and `evalPureStmtNorm` together as a direct replacement site for `setSpineChecked?`, overlooking that `evalPureStmtNorm` delegates to `evalPureStmt` → Tier-1 trusted `evalStmt` (`trusted/lean/`), whereas `set?_of_forcePureEnv?` and `evalPureStmtNorm_assign_local_of_evalRvalue` invoke `(set? …).bind forcePureEnv?` directly in untrusted `MirLiftCore.lean`. Proved `set?_of_setSpineChecked?`, `evalPureStmtNorm_assign_local_of_setSpineChecked?`, and `evalPureStmtsN_eq_unforced`, and sharpened §6 / Condition 1 so Track A fuses `setSpineChecked?` strictly inside untrusted `MirLiftCore.lean` without modifying `trusted/lean/`.
+
+### Round A4 (Agent A, Model X) — final critique and fixes against B4 (`276e3ef6`)
+
+1. **[HIGH — B4's "observationally identical" claim omitted the release step itself.]**
+   `trustedFnSpec_run_latchEquiv_stage2Only` compares the post-call trees, but `TrustedFnSpec.run`
+   applies stage-1 release without checking it, and the two-stage `ConcreteCall` additionally requires
+   `releaseProtectorNoUB`. If the release could be UB, Miri would stop at the return while the
+   stage-2-only path continues, so LatchEquiv alone does not give observational equivalence. Proved
+   `trustedFnSpec_release_noUB`: for every `spec` with `TrustedFnSpec.NoUB`, the stage-1 release is UB-free.
+   It uses a second inductive invariant, `ReleaseReadable` (`releaseReadable_of_fnEntry`,
+   `releaseReadable_retagChild`, `applyFootprint_preserves_releaseReadable`), the foreign-read
+   idempotence `performTransition_foreignRead_isSome_idem`, and the combination lemma
+   `releaseProtectorNoUB_of_readReleaseSafe`.
+2. **[MEDIUM — Condition 3 overgeneralized B4's theorem.]** "General observational equivalence fails
+   only when a protected argument is activated" claims more than `TrustedFnSpec` (one protected
+   argument, a body of retags) covers. Rewrote Condition 3 and Section 8: all known separations need
+   activation, and equivalence is mechanized only for `TrustedFnSpec`-shaped calls. The trusted return
+   path accepts executions that Miri rejects once a callee writes through a protected `&mut`, which
+   Track A must fix in the trusted semantics or confine its stage-2-only reasoning around.
+3. **[LOW — `evalPureStmtsN_eq_unforced` docstring contradicted the measured ablation.]** It called
+   the per-statement forcing pass "overhead". `ablation_live_set_only_rfl` shows that pass is what
+   keeps `rfl` linear, so the docstring now says the unforced form is a specification, not a faster
+   evaluator.
+4. Tests: `test_trustedFnSpec_stage1_release_is_ub_free` pins `trustedFnSpec_release_noUB` to the
+   `TrustedFnSpec.NoUB` hypothesis alone, and the required-theorem list is extended. All benchmarks were
+   re-measured on the final prototype revision (heartbeats unchanged on every row).
