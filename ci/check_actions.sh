@@ -11,11 +11,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-export PATH="$HOME/.cargo/bin:$PATH"
-if ! command -v action-validator >/dev/null 2>&1; then
-  cargo install -q action-validator --version 0.8.0 --locked
-fi
+# Use the provisioned validators. Installing missing tools here would make
+# the check depend on network state and versions outside the pinned shell.
+for tool in action-validator actionlint; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Missing $tool; run: nix develop .#static --command ./ci/check_actions.sh" >&2
+    exit 1
+  fi
+done
 
 shopt -s nullglob
 files=(.github/workflows/*.yml .github/workflows/*.yaml)
 action-validator "${files[@]}"
+actionlint "${files[@]}"
