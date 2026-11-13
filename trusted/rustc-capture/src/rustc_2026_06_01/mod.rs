@@ -17,7 +17,11 @@ use crate::manifest::{MIR_DIALECT_V2026_06_01, RUSTC_COMMIT_SHA, RUSTC_VERSION_S
 /// Returns the dialect identifier and pinned `rustc` commit SHA handled by this
 /// backend.
 pub const fn backend_descriptor() -> (&'static str, &'static str, &'static str) {
-    (MIR_DIALECT_V2026_06_01, RUSTC_VERSION_STRING, RUSTC_COMMIT_SHA)
+    (
+        MIR_DIALECT_V2026_06_01,
+        RUSTC_VERSION_STRING,
+        RUSTC_COMMIT_SHA,
+    )
 }
 
 #[cfg(test)]
@@ -32,8 +36,8 @@ mod tests {
         sha256_hex,
     };
     use crate::rustc_2026_06_01::driver::{
-        derive_unit_id, disambiguate_identifier, matches_capture_filter, normalize_wrapper_args,
-        parse_capture_filter, run_with_args, run_with_args_and_filter,
+        decode_os_args, derive_unit_id, disambiguate_identifier, matches_capture_filter,
+        normalize_wrapper_args, parse_capture_filter, run_with_args, run_with_args_and_filter,
         should_run_capture_for_args,
     };
     use crate::rustc_2026_06_01::mir_lower::{
@@ -224,7 +228,10 @@ pub fn MyCounter(val: u32) -> bool {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
         verify_captured_demo_artifacts(&capture_dir);
 
         // If the compiled binary is present alongside the test executable in
@@ -326,6 +333,33 @@ pub fn MyCounter(val: u32) -> bool {
             "expected packaged sysroot {expected_sysroot} in {normalized_direct:?}"
         );
         let _ = fs::remove_dir_all(&temp_install);
+
+        let valid_os = vec![
+            std::ffi::OsString::from("anneal-rustc-capture"),
+            std::ffi::OsString::from("--version"),
+        ];
+        assert_eq!(
+            decode_os_args(valid_os).expect("decode valid UTF-8 args"),
+            vec!["anneal-rustc-capture".to_owned(), "--version".to_owned()]
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad_prog = vec![
+                std::ffi::OsString::from_vec(vec![b'a', 0xff]),
+                std::ffi::OsString::from("--version"),
+            ];
+            let prog_err = decode_os_args(bad_prog).expect_err("reject non-UTF-8 program name");
+            assert!(prog_err.contains("compiler program name is not UTF-8"));
+
+            let bad_arg = vec![
+                std::ffi::OsString::from("anneal-rustc-capture"),
+                std::ffi::OsString::from_vec(vec![b'-', 0xfe]),
+            ];
+            let arg_err = decode_os_args(bad_arg).expect_err("reject non-UTF-8 argument");
+            assert!(arg_err.contains("compiler argument is not UTF-8"));
+        }
     }
 
     #[test]
@@ -409,7 +443,10 @@ pub fn caller_invoke(x: u32) -> u32 {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
         let manifest_path = capture_dir.join("rich").join("UnitCaptureManifest.json");
         let manifest_json =
@@ -458,9 +495,10 @@ pub fn caller_invoke(x: u32) -> u32 {
         assert!(eval_status_lean.contains("(ProjectionElem.field 0"));
 
         let make_status_lean = read_mir_module("rich::make_status_ok");
-        assert!(make_status_lean.contains(
-            "(Rvalue.aggregate (AggregateKind.adt \"rich::Status\" 0 Option.none)"
-        ));
+        assert!(
+            make_status_lean
+                .contains("(Rvalue.aggregate (AggregateKind.adt \"rich::Status\" 0 Option.none)")
+        );
 
         let set_discr_lean = read_mir_module("rich::set_status_discriminant");
         assert!(set_discr_lean.contains(
@@ -472,9 +510,11 @@ pub fn caller_invoke(x: u32) -> u32 {
         let array_lean = read_mir_module("rich::array_repeat_and_index");
         assert!(array_lean.contains("(RigidTy.array (RigidTy.uint UintTy.u32) 3)"));
         assert!(array_lean.contains("(FieldsShape.array { bytes := 4 } 3)"));
-        assert!(array_lean.contains(
-            "(Rvalue.repeat (Operand.copy { local_ := 1, projection := List.nil }) 3)"
-        ));
+        assert!(
+            array_lean.contains(
+                "(Rvalue.repeat (Operand.copy { local_ := 1, projection := List.nil }) 3)"
+            )
+        );
         assert!(array_lean.contains("(ProjectionElem.index"));
 
         // 3. References and dereferences (&u32, &mut u32, *r via Rvalue::Ref
@@ -486,9 +526,8 @@ pub fn caller_invoke(x: u32) -> u32 {
             "(Rvalue.ref (BorrowKind.mut false) { local_ := 1, projection := List.nil })"
         ));
         assert!(
-            ref_lean.contains(
-                "(Rvalue.ref BorrowKind.shared { local_ := 1, projection := List.nil })"
-            )
+            ref_lean
+                .contains("(Rvalue.ref BorrowKind.shared { local_ := 1, projection := List.nil })")
         );
         assert!(ref_lean.contains("ProjectionElem.deref"));
 
@@ -569,9 +608,14 @@ pub fn __anodized_fn_ensures_local_target_spec(x: u32, __anodized_output: u32) -
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
-        let manifest_path = capture_dir.join("spec_demo").join("UnitCaptureManifest.json");
+        let manifest_path = capture_dir
+            .join("spec_demo")
+            .join("UnitCaptureManifest.json");
         let manifest_json =
             fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
         let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
@@ -702,7 +746,10 @@ pub fn ext_trait_impl_op(s: &LocalStruct) -> u32 {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
         let manifest_path = capture_dir
             .join("ext_spec_demo")
@@ -821,9 +868,14 @@ pub fn __anodized_fn_requires___anneal_unsafe_impl_TrustedZeroable_for_NonZeroCo
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
-        let manifest_path = capture_dir.join("inv_demo").join("UnitCaptureManifest.json");
+        let manifest_path = capture_dir
+            .join("inv_demo")
+            .join("UnitCaptureManifest.json");
         let manifest_json =
             fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
         let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
@@ -937,10 +989,22 @@ pub fn __anodized_fn_requires___anneal_unsafe_impl_TrustedZeroable_for_NonZeroCo
 
         // The verification policy ignores the session for `UbChecks` and
         // defers to it for the other runtime checks.
-        assert!(verification_runtime_check_value(RuntimeChecks::UbChecks, |_| false));
-        assert!(!verification_runtime_check_value(RuntimeChecks::OverflowChecks, |_| false));
-        assert!(verification_runtime_check_value(RuntimeChecks::OverflowChecks, |_| true));
-        assert!(!verification_runtime_check_value(RuntimeChecks::ContractChecks, |_| false));
+        assert!(verification_runtime_check_value(
+            RuntimeChecks::UbChecks,
+            |_| false
+        ));
+        assert!(!verification_runtime_check_value(
+            RuntimeChecks::OverflowChecks,
+            |_| false
+        ));
+        assert!(verification_runtime_check_value(
+            RuntimeChecks::OverflowChecks,
+            |_| true
+        ));
+        assert!(!verification_runtime_check_value(
+            RuntimeChecks::ContractChecks,
+            |_| false
+        ));
 
         // End to end: with debug assertions and overflow checks disabled,
         // `rustc` evaluates both operands to `false`. `-Zmir-opt-level=0` keeps
@@ -983,9 +1047,14 @@ pub fn overflow_checks_flag() -> bool {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
-        let manifest_path = capture_dir.join("rt_checks").join("UnitCaptureManifest.json");
+        let manifest_path = capture_dir
+            .join("rt_checks")
+            .join("UnitCaptureManifest.json");
         let manifest_json =
             fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
         let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
@@ -1013,8 +1082,14 @@ pub fn overflow_checks_flag() -> bool {
         assert!(!ub_lean.contains(false_const), "ub_checks_flag:\n{ub_lean}");
 
         let overflow_lean = read_mir_module("rt_checks::overflow_checks_flag");
-        assert!(overflow_lean.contains(false_const), "overflow_checks_flag:\n{overflow_lean}");
-        assert!(!overflow_lean.contains(true_const), "overflow_checks_flag:\n{overflow_lean}");
+        assert!(
+            overflow_lean.contains(false_const),
+            "overflow_checks_flag:\n{overflow_lean}"
+        );
+        assert!(
+            !overflow_lean.contains(true_const),
+            "overflow_checks_flag:\n{overflow_lean}"
+        );
 
         let _ = fs::remove_dir_all(&temp_root);
     }
@@ -1069,7 +1144,10 @@ pub fn hint(x: bool) -> u32 {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
         let manifest_path = capture_dir.join("ipath").join("UnitCaptureManifest.json");
         let manifest_json =
@@ -1096,14 +1174,20 @@ pub fn hint(x: bool) -> u32 {
             pop_lean.contains("(RigidTy.fnDef \"core::intrinsics::ctpop\""),
             "pop:\n{pop_lean}"
         );
-        assert!(!pop_lean.contains("(RigidTy.fnDef \"std::intrinsics::"), "pop:\n{pop_lean}");
+        assert!(
+            !pop_lean.contains("(RigidTy.fnDef \"std::intrinsics::"),
+            "pop:\n{pop_lean}"
+        );
 
         let ediv_lean = read_mir_module("ipath::ediv");
         assert!(
             ediv_lean.contains("(RigidTy.fnDef \"core::intrinsics::exact_div\""),
             "ediv:\n{ediv_lean}"
         );
-        assert!(!ediv_lean.contains("(RigidTy.fnDef \"std::intrinsics::"), "ediv:\n{ediv_lean}");
+        assert!(
+            !ediv_lean.contains("(RigidTy.fnDef \"std::intrinsics::"),
+            "ediv:\n{ediv_lean}"
+        );
 
         let hint_lean = read_mir_module("ipath::hint");
         assert!(
@@ -1207,8 +1291,7 @@ pub fn unselected_helper(y: u32) -> u32 {
 
         // 1. Unfiltered capture: verify anonymous const skipping and collision
         // disambiguation.
-        let code_all =
-            run_with_args_and_filter(&args, Some(capture_all_dir.clone()), None, None);
+        let code_all = run_with_args_and_filter(&args, Some(capture_all_dir.clone()), None, None);
         assert_eq!(code_all, 0, "unfiltered capture must succeed");
 
         let all_manifest_path = capture_all_dir
@@ -1475,7 +1558,10 @@ pub mod inner {
         ];
 
         let code = run_with_args(&args, Some(capture_dir.clone()), None);
-        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        assert_eq!(
+            code, 0,
+            "expected run_with_args to succeed with exit code 0"
+        );
 
         let crate_capture_dir = capture_dir.join("demo_generics");
         let manifest_path = crate_capture_dir.join("UnitCaptureManifest.json");
@@ -1524,7 +1610,10 @@ pub mod inner {
         let pair_type_a = find_target("demo_generics::<Pair<T, TypeA>>::first");
         let pair_type_b = find_target("demo_generics::<Pair<T, TypeB>>::first");
         let pair_diagonal = find_target("demo_generics::<Pair<T, T>>::diag_first");
-        assert_eq!(wrapper_get.lean_module_name, "Mir.DemoGenerics.Wrapper_T_get");
+        assert_eq!(
+            wrapper_get.lean_module_name,
+            "Mir.DemoGenerics.Wrapper_T_get"
+        );
         assert_eq!(
             wrapper_pair_with.lean_module_name,
             "Mir.DemoGenerics.Wrapper_T_pair_with"
@@ -1606,7 +1695,9 @@ pub mod inner {
         assert_eq!(w_method.trait_impls[0].impl_path, w_method.target.def_id);
         assert_eq!(
             w_method.trait_impls[0].trait_args_lean,
-            vec!["(RigidTy.adt \"demo_generics::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil))"]
+            vec![
+                "(RigidTy.adt \"demo_generics::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil))"
+            ]
         );
 
         // 4. `TyKind::Alias` normalization (`<TypeA as MyTrait>::Assoc` -> `u32`) and unnormalized
@@ -1678,12 +1769,12 @@ pub mod inner {
         }
 
         let lean_bin = resolve_bin("lean");
-        std::fs::copy(examples_dir.join("lean-toolchain"), crate_capture_dir.join("lean-toolchain")).ok();
-        let lean_path_env = format!(
-            "{}:{}",
-            lean_lib_dir.display(),
-            crate_capture_dir.display()
-        );
+        std::fs::copy(
+            examples_dir.join("lean-toolchain"),
+            crate_capture_dir.join("lean-toolchain"),
+        )
+        .ok();
+        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), crate_capture_dir.display());
         let verified_modules = [
             "Mir/DemoGenerics/swap_pair.lean",
             "Mir/DemoGenerics/wrap_array.lean",
@@ -1797,7 +1888,8 @@ example :
              args := [.adt "demo_generics::Wrapper" [.uint .u32]] }
          implPath := "demo_generics::<Wrapper<T> as MyTrait>::method" }] := rfl
 "#;
-        fs::write(&verify_lean_path, verify_lean_src.as_bytes()).expect("write VerifyPolymorphicCapture.lean");
+        fs::write(&verify_lean_path, verify_lean_src.as_bytes())
+            .expect("write VerifyPolymorphicCapture.lean");
         let verify_out = Command::new(&lean_bin)
             .current_dir(&crate_capture_dir)
             .env("LEAN_PATH", &lean_path_env)
@@ -1894,7 +1986,7 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
         // 2. Verify reachable sysroot (`core`) MIR bodies are extracted from `.rmeta`
         // into `Mir/Core/*.lean` with `CapturedItemKind::Callee` and polymorphic
         // `genericParams`.
-        let core_targets: Vec<& crate::manifest::UnitTargetRecord> = manifest
+        let core_targets: Vec<&crate::manifest::UnitTargetRecord> = manifest
             .unit_targets
             .iter()
             .filter(|t| t.lean_module_name.starts_with("Mir.Core."))
@@ -1944,8 +2036,8 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
             .iter()
             .find(|t| t.target.def_id.ends_with("::len"))
             .expect("find <[T]>::len in core_targets");
-        let len_lean =
-            fs::read_to_string(unit_dir.join(&len_rec.target.mir_module_path)).expect("read len.lean");
+        let len_lean = fs::read_to_string(unit_dir.join(&len_rec.target.mir_module_path))
+            .expect("read len.lean");
         assert!(
             len_lean.contains("genericParams := (List.cons { idx := 0, name := \"T\" } List.nil)"),
             "<[T]>::len must preserve polymorphic genericParams:\n{len_lean}"
@@ -1981,7 +2073,11 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
         }
 
         let lean_bin = resolve_bin("lean");
-        std::fs::copy(examples_dir.join("lean-toolchain"), unit_dir.join("lean-toolchain")).ok();
+        std::fs::copy(
+            examples_dir.join("lean-toolchain"),
+            unit_dir.join("lean-toolchain"),
+        )
+        .ok();
         let lean_path_env = format!("{}:{}", lean_lib_dir.display(), unit_dir.display());
         for target_rec in &manifest.unit_targets {
             let src_lean = unit_dir.join(&target_rec.target.mir_module_path);

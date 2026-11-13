@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +18,8 @@ use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
+use rustc_session::EarlyDiagCtxt;
+use rustc_session::config::ErrorOutputType;
 use rustc_span::FileName;
 
 use crate::lean_emit::{IrContractRole, emit_mir_lean_module};
@@ -226,7 +229,10 @@ fn capture_crate_unit<'tcx>(
 
     let unit_dir = capture_dir.join(&unit_id);
     fs::create_dir_all(&unit_dir).map_err(|e| {
-        format!("failed to create unit capture directory `{}`: {e}", unit_dir.display())
+        format!(
+            "failed to create unit capture directory `{}`: {e}",
+            unit_dir.display()
+        )
     })?;
 
     let is_primary_package = is_primary_package_env(&crate_name);
@@ -238,7 +244,12 @@ fn capture_crate_unit<'tcx>(
         .iter()
         .copied()
         .filter(|&local_def_id| should_capture_mir_item(tcx, local_def_id))
-        .map(|local_def_id| (canonical_def_path(tcx, local_def_id.to_def_id()), local_def_id))
+        .map(|local_def_id| {
+            (
+                canonical_def_path(tcx, local_def_id.to_def_id()),
+                local_def_id,
+            )
+        })
         .collect();
     local_defs.sort_by(|(path_a, id_a), (path_b, id_b)| {
         path_a
@@ -389,7 +400,10 @@ fn capture_crate_unit<'tcx>(
             })?;
         }
         fs::write(&mir_full_path, lean_source.as_bytes()).map_err(|e| {
-            format!("failed to write MIR Lean module `{}`: {e}", mir_full_path.display())
+            format!(
+                "failed to write MIR Lean module `{}`: {e}",
+                mir_full_path.display()
+            )
         })?;
 
         let mut manifest_trait_impls = Vec::new();
@@ -465,11 +479,9 @@ fn capture_crate_unit<'tcx>(
             let crate_next_suffix = next_stem_suffix_by_crate
                 .entry(callee_crate_pascal.clone())
                 .or_default();
-            let item_stem =
-                disambiguate_identifier(&raw_stem, crate_used_stems, crate_next_suffix);
+            let item_stem = disambiguate_identifier(&raw_stem, crate_used_stems, crate_next_suffix);
 
-            let mut ir_captured =
-                lower_mir_body(tcx, callee_def_id, body, IrContractRole::Subject);
+            let mut ir_captured = lower_mir_body(tcx, callee_def_id, body, IrContractRole::Subject);
             ir_captured.def_path = def_path.clone();
             for ti in &mut ir_captured.trait_impls {
                 ti.impl_path = def_path.clone();
@@ -536,7 +548,10 @@ fn capture_crate_unit<'tcx>(
     let manifest_json = unit_manifest.to_json_string();
     let manifest_path = unit_dir.join("UnitCaptureManifest.json");
     fs::write(&manifest_path, manifest_json.as_bytes()).map_err(|e| {
-        format!("failed to write UnitCaptureManifest `{}`: {e}", manifest_path.display())
+        format!(
+            "failed to write UnitCaptureManifest `{}`: {e}",
+            manifest_path.display()
+        )
     })?;
 
     Ok(())
@@ -738,7 +753,8 @@ fn is_rustc_executable_arg(arg: &str) -> bool {
 }
 
 fn has_sysroot_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "--sysroot" || arg.starts_with("--sysroot="))
+    args.iter()
+        .any(|arg| arg == "--sysroot" || arg.starts_with("--sysroot="))
 }
 
 fn detect_sysroot(rustc_bin: &str) -> Option<String> {
@@ -769,13 +785,25 @@ fn detect_sysroot(rustc_bin: &str) -> Option<String> {
     }
 
     // Fallback to `rustc --print sysroot`.
-    let cmd_name = if is_rustc_executable_arg(rustc_bin) { rustc_bin } else { "rustc" };
-    let output = Command::new(cmd_name).arg("--print").arg("sysroot").output().ok()?;
+    let cmd_name = if is_rustc_executable_arg(rustc_bin) {
+        rustc_bin
+    } else {
+        "rustc"
+    };
+    let output = Command::new(cmd_name)
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
     let sysroot = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    if sysroot.is_empty() { None } else { Some(sysroot) }
+    if sysroot.is_empty() {
+        None
+    } else {
+        Some(sysroot)
+    }
 }
 
 /// Returns `true` if `rustc_args` represents a crate compilation that should
@@ -829,9 +857,7 @@ pub fn should_run_capture_for_args(rustc_args: &[String]) -> bool {
     }
 
     let normalized_input = input_rs.replace('\\', "/");
-    if normalized_input.contains("/.cargo/registry/")
-        || normalized_input.contains("/.cargo/git/")
-    {
+    if normalized_input.contains("/.cargo/registry/") || normalized_input.contains("/.cargo/git/") {
         return false;
     }
 
@@ -886,14 +912,54 @@ pub fn should_run_capture_for_args(rustc_args: &[String]) -> bool {
 /// >    }
 /// >}
 /// >```
+/// Validates that the process name and all forwarded OS arguments are valid
+/// UTF-8 before installing `rustc`'s ICE hook (which scans `std::env::args()`
+/// and would otherwise panic on non-Unicode OS bytes).
+pub fn decode_os_args<I>(raw_os_args: I) -> Result<Vec<String>, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut iter = raw_os_args.into_iter();
+    let mut decoded = Vec::new();
+    if let Some(program_name) = iter.next() {
+        match program_name.into_string() {
+            Ok(prog) => decoded.push(prog),
+            Err(bad) => {
+                return Err(format!("compiler program name is not UTF-8: {bad:?}"));
+            }
+        }
+    }
+    for arg in iter {
+        match arg.into_string() {
+            Ok(s) => decoded.push(s),
+            Err(bad) => {
+                return Err(format!("compiler argument is not UTF-8: {bad:?}"));
+            }
+        }
+    }
+    Ok(decoded)
+}
+
 pub fn run_from_env_args() -> i32 {
-    let raw_args: Vec<String> = env::args().collect();
+    let raw_args = match decode_os_args(env::args_os()) {
+        Ok(args) => args,
+        Err(msg) => {
+            let _ = rustc_driver::catch_with_exit_code(|| -> Result<(), ()> {
+                let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+                early_dcx.early_fatal(msg);
+            });
+            return rustc_driver::EXIT_FAILURE;
+        }
+    };
+    rustc_driver::install_ice_hook("https://github.com/joshlf/anneal/issues/new", |_| ());
+
     let capture_dir = env::var(ANNEAL_CAPTURE_DIR_ENV)
         .ok()
         .filter(|val| !val.trim().is_empty())
         .map(PathBuf::from);
-    let unit_id_override =
-        env::var("ANNEAL_UNIT_ID").ok().filter(|val| !val.trim().is_empty());
+    let unit_id_override = env::var("ANNEAL_UNIT_ID")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
 
     run_with_args(&raw_args, capture_dir, unit_id_override)
 }
