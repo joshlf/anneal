@@ -306,10 +306,32 @@ class LeanSourceAuditTests(unittest.TestCase):
             "reborrow_return_after_parent_write_stage2Only_unique_write_perm",
             "applySlotUpdates_eq_of_live?", "update_localRead_eq_self", "update_foreignRead_eq_self",
             "applyReleaseProtector_read_latchEquiv", "applyReleaseProtector_read_same_verdicts",
+            "set?_of_setSpineChecked?", "evalPureStmtNorm_assign_local_of_setSpineChecked?",
+            "evalPureStmtsN_eq_unforced",
+            "read_latchEquiv_ignores_active_descendant",
+            "stage1_read_release_outliving_unconflicted_separates",
+            "trustedFnSpec_run_latchEquiv_stage2Only",
+            "trustedFnSpec_run_stage2Only_same_verdicts",
+            "trustedSpec_stage2Only_reborrow_equivalence",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_lifo_read_release_mechanized_for_trustedFnSpec(self):
+        """`trustedFnSpec_run_latchEquiv_stage2Only` must mechanize the LIFO discharge of
+        `applyReleaseProtector_read_latchEquiv` for arbitrary `spec : TrustedFnSpec` and outliving
+        `activeCaller`, and `applyReleaseProtector_read_eraseLatch` must exclude descendants of `t_rel`."""
+        m = re.search(r"theorem trustedFnSpec_run_latchEquiv_stage2Only\b(.*?):= by",
+                      self.code, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("(spec : TrustedFnSpec)", m.group(1))
+        self.assertIn("(activeCaller : ActiveProtectors)", m.group(1))
+        self.assertIn("LatchEquiv", m.group(1))
+        m_erase = re.search(r"theorem applyReleaseProtector_read_eraseLatch\b(.*?):= by",
+                            self.code, re.S)
+        self.assertIsNotNone(m_erase)
+        self.assertIn("tree.isAnc t_rel n = false", m_erase.group(1))
 
     def test_live_two_pass_variant_mirrors_live_normalizer(self):
         """`local_slots/live_two_pass_rfl` must measure the live `evalPureStmtNorm` structure:
@@ -522,6 +544,7 @@ class ReportTests(unittest.TestCase):
         "Classical.byContradiction", "FuelFreeProtoBench.Prototype", "MirSemantics",
         "ProtectedDisabled", "ReservedFrz", "ReservedIM", "_", "countUp", "endCall",
         "headD", "subRange", "addDecl", "debug.skipKernelTC",
+        "FnEntry", "hForeign", "hLocal", "hOutlive", "hRead", "t_rel",
     }
 
     @staticmethod
