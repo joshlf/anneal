@@ -323,6 +323,9 @@
             '';
           };
 
+          # Release regressions need only Python and the pinned YAML parser.
+          release-check-python = pkgs.python3.withPackages (p: [ p.pyyaml ]);
+
           default = self.packages.${system}.omnibus-archive;
         });
 

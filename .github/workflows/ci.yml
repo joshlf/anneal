@@ -60,9 +60,12 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
       - name: Run todo check
         run: ./ci/check_todo.sh
-      - name: Test the Codex review gate
-        # These tests use fake GitHub responses and make no status writes.
-        run: python3 -B -m unittest discover -s ci -p 'test_codex_review.py' -v
+      - name: Test release tooling and the Codex review gate
+        # The review-gate tests use fake GitHub responses and make no status
+        # writes.
+        run: >-
+          nix shell .#release-check-python --max-jobs 1 --cores 2 --command
+          python3 -B -m unittest discover -s ci -p 'test_*.py' -v
       - name: Run job dependency check
         run: ./ci/check_job_dependencies.sh
       - name: Run GitHub Actions validator
