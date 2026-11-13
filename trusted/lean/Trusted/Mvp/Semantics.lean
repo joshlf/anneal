@@ -80,6 +80,10 @@ type" and return the LHS type. Bitwise operations accept matching integer or
 Boolean types and "return a value of that type". Addition, subtraction and
 multiplication accept matching integers and return that type.
 
+The successful operator cases are named explicitly in typing and evaluation.
+Adding a BinOp must expose the missing decisions: a wildcard success could
+otherwise assign a new operation an integer result and false comparison value.
+
 This fragment omits the compiler's other operand classes and operators. The
 admitted integer widths are checked by `Ty.admitted` above:
 https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_middle/src/mir/syntax.rs#L1412-L1423
@@ -99,7 +103,8 @@ def binaryTy (op : BinOp) (left right : Ty) : Option Ty :=
       if (bits == bits') && (signed == signed') then
         match op with
         | .eq | .ne | .lt | .le | .gt | .ge => some .bool
-        | _ => some (.int bits signed)
+        | .bitAnd | .bitOr | .bitXor | .shl | .shr | .add | .sub | .mul =>
+            some (.int bits signed)
       else none
   | _, _, _ => none
 
@@ -362,6 +367,9 @@ def shiftAmount (lhsBits : Nat) (rhsTy : Ty) (rhs : Word) : Nat :=
   | .int bits true => (Int.emod (signedValue bits rhs) (Int.ofNat lhsBits)).toNat
   | _ => Nat.mod rhs.toNat lhsBits
 
+-- This helper is total and returns false for listed noncomparison operators.
+-- evalBinary dispatches only its comparison cases here. Naming the remaining
+-- cases preserves that answer while exposing additions to the operator grammar.
 def comparison (op : BinOp) (signed : Bool) (bits : Nat)
     (left right : Word) : Bool :=
   match op with
@@ -375,10 +383,13 @@ def comparison (op : BinOp) (signed : Bool) (bits : Nat)
       else decide (right.toNat < left.toNat)
   | .ge => if signed then decide (signedValue bits right ≤ signedValue bits left)
       else decide (right.toNat ≤ left.toNat)
-  | _ => false
+  | .bitAnd | .bitOr | .bitXor | .shl | .shr | .add | .sub | .mul => false
 
 def boolWord (value : Bool) : Word := if value then 1 else 0
 
+-- Operand typing and result validity are separate checks. Knowing the result
+-- type does not prove that the computed 64-bit word encodes a value of that
+-- type, especially for narrower integers and booleans.
 def evalBinary (op : BinOp) (lt : Ty) (left : Word) (rt : Ty) (right : Word) :
     Except Fault (Ty × Word) :=
   match binaryTy op lt rt with
@@ -398,7 +409,8 @@ def evalBinary (op : BinOp) (lt : Ty) (left : Word) (rt : Ty) (right : Word) :
         | .add => truncate bits (left + right)
         | .sub => truncate bits (left - right)
         | .mul => truncate bits (BitVec.mul left right)
-        | op => boolWord (comparison op signed bits left right)
+        | .eq | .ne | .lt | .le | .gt | .ge =>
+            boolWord (comparison op signed bits left right)
       if validValue resultTy result then .ok (resultTy, result)
       else .error .invalidValue
 
