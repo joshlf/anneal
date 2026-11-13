@@ -10343,3 +10343,10 @@ theorem step_terminator_assert_failed_directUnwind_simulation
                   hdisj_cached htb hvalid hcid_pos hcid_act hcid_bor hbt
 
 end LeanMiriSpec.Correspondence
+
+/-!
+### Known Limitations and Future Work (Episode 1)
+1. **ReifyFnPointer Fresh Addresses**: The reification bridge `step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation` currently assumes `lookupBaseAddr mAllocId = some baseAddr`. Support for the fresh-address branch requires lifting `FrameRel` and `LocalRel` over `addBaseAddress`.
+2. **Linked Panic Unwinding**: `Assert` and `UnwindTerminate` simulation lockstep is currently verified under the non-canonical `annealStepHooksWithDirectUnwind` configuration. Modeling the full canonical linked panic machinery (execution control, lang item resolution, core::panicking stack frames) is left for future work.
+3. **Layout Compatibility for ADTs**: `annealRigidTyLayoutCompat` does not yet model `repr(transparent)` unpacking or null-pointer-optimized (`Option<&T>`) ABI layout equivalence.
+-/
