@@ -71,5 +71,9 @@ that as well.)
 
 ## Repository checks
 
+See [the scaffold contributor guide](docs/scaffolding.md) to build and install
+the current toolchain archive, run workspace and installed-tool tests, and check
+crate packaging.
+
 See [the Codex review gate guide](docs/codex-review.md) for enabling the required
 review status, diagnosing blocked PRs, and testing the evaluator locally.
