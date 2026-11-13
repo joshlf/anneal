@@ -1441,6 +1441,27 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.witnessSignWidth_bodyCorr
   let _ := @Anneal.Mir.AdtAndControl.witness_intrinsic_signedness_width_cfg_refines_trusted
   let _ := @Anneal.Mir.AdtAndControl.witness_signed_shift_overflow_ub_parity
+  -- `[adv ep2-A1]` Stage 1 + Section 5g: projected & `PartialShell` call destinations,
+  -- exact `.ub` fault parity (`IntrinsicResolvedInBody`), target-presence boundary,
+  -- `Ordering` ADT encoding (`orderingVariant?`), call-form `write_bytes` / `copy_nonoverlapping`
+  -- CFG witness, and Witness Suites 7–8.
+  let _ := @Anneal.Mir.AdtAndControl.FieldListBelow.set_both
+  let _ := @Anneal.Mir.AdtAndControl.promoteShellToFieldSlot_below
+  let _ := @Anneal.Mir.AdtAndControl.writeToFieldSlot_noExplode_below_refines
+  let _ := @Anneal.Mir.AdtAndControl.writePlaceState_dest_below_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalLIntrinsicValue_resolved_none_eq_ub
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_resolved_value_intrinsic_ub_parity
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_nonReturning_with_target_extCall
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_value_without_target_extCall
+  let _ := @Anneal.Mir.AdtAndControl.orderingVariant?_std_and_perm
+  let _ := @Anneal.Mir.AdtAndControl.orderingVariant?_rejects_invalid
+  let _ := @Anneal.Mir.AdtAndControl.evalThreeWayCompare_orderingVariant_discriminant_roundtrip
+  let _ := @Anneal.Mir.AdtAndControl.evalCopyNonOverlappingSubplace_single_nonzero
+  let _ := @Anneal.Mir.AdtAndControl.witness_cfg_call_writeBytes_and_copyNonOverlapping_subplace
+  let _ := @Anneal.Mir.AdtAndControl.witnessProjStmtCall_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_projected_and_partialShell_call_destinations
+  let _ := @Anneal.Mir.AdtAndControl.witnessWidePtrAndChar_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_wide_ptr_char_and_bodyCorr_ub_parity
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge
