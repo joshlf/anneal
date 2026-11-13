@@ -15,6 +15,10 @@ for configuring Claude Code, Gemini CLI, Antigravity, and Codex to load these sk
 
 ## Provenance
 
+Vendor only documents used to run a skill, including the references its
+instructions load. Keep supporting material, such as bibliographies and
+development notes, upstream. The provenance links below retain access to it.
+
 | Skill | Source | Upstream path & revision |
 | :--- | :--- | :--- |
 | [`anneal-prove`](anneal-prove/SKILL.md) | Repository-owned | Interactive and symbolic Lean 4 proof construction (`wpMirSym`, `runCfgSteps`, `SymReflect`, and kernel proof-scaling patterns) |
@@ -41,6 +45,14 @@ for configuring Claude Code, Gemini CLI, Antigravity, and Codex to load these sk
 Most vendored `joshlf/skills` packages are kept byte-for-byte identical to
 upstream. The following packages carry intentional, documented local
 modifications:
+
+- The reference documents in `robust-code/` and `tech-lead/` carry the
+  repository copyright and license header. Their upstream bodies remain
+  unchanged.
+
+- **`skills/williams-style/`:** The copy omits the upstream
+  `references/SOURCES.md` document and removes its optional link from
+  `SKILL.md`.
 
 - **`skills/robust-code/`:**
   - **Omitted file:** `references/agent-scaffolding.md`. (This reference file
