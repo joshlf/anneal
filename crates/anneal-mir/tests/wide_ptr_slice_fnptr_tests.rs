@@ -3966,3 +3966,325 @@ fn a2_calls_through_function_item_values_are_direct_calls() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A3: indirect calls with unwinding, projected return places, and reified closures
+// ---------------------------------------------------------------------------------------------
+
+/// `fn boom(x: u32) -> u32 { panic!() }` (an unwinding panic).
+fn boom_body(pw: PtrWidth) -> LoweredBody {
+    let body = Body {
+        local_decls: vec![u32_ty(), u32_ty()],
+        basic_blocks: vec![block(
+            vec![],
+            Terminator::Call {
+                func: Operand::intrinsic(IntrinsicOp::PanicUnwind),
+                args: vec![],
+                destination: local(0),
+                target: None,
+                unwind: UnwindAction::Continue,
+            },
+        )],
+    };
+    lower_body(&body, pw).unwrap()
+}
+
+#[test]
+fn a3_indirect_calls_unwind_into_caller_cleanup() {
+    for pw in PWS {
+        let f_ty = fn_ty(vec![u32_ty()], u32_ty());
+        // `main`: `_2 = boom as fn(u32) -> u32; _0 = _2(_1) -> [return: bb1, unwind: bb2]`,
+        // `bb1: return`, `bb2 (cleanup): _3 = 7; resume`.
+        let main = |unwind: UnwindAction| {
+            let body = Body {
+                local_decls: vec![u32_ty(), u32_ty(), f_ty.clone(), u32_ty()],
+                basic_blocks: vec![
+                    block(
+                        vec![
+                            Statement::StorageLive(Local(2)),
+                            assign(
+                                2,
+                                reify(
+                                    PointerCoercionKind::ReifyFnPointer,
+                                    Operand::callee("boom"),
+                                    f_ty.clone(),
+                                ),
+                            ),
+                        ],
+                        Terminator::Call {
+                            func: copy(2),
+                            args: vec![copy(1)],
+                            destination: local(0),
+                            target: Some(1),
+                            unwind,
+                        },
+                    ),
+                    block(vec![], Terminator::Return),
+                    BasicBlockData::with_terminator(
+                        vec![
+                            Statement::StorageLive(Local(3)),
+                            assign(3, Rvalue::Use(cint(7, u32_ty()))),
+                        ],
+                        Terminator::UnwindResume,
+                        true,
+                    ),
+                ],
+            };
+            lower_body(&body, pw).unwrap()
+        };
+        let table = CallTable::new().with_callee("boom", 1, boom_body(pw));
+        // The panic unwinds out of `boom`, runs the caller's cleanup block, and resumes.
+        assert!(matches!(
+            eval_lowered_body_cfg_with_call_table(
+                &main(UnwindAction::Cleanup(2)),
+                &[u32v(1)],
+                100,
+                &table
+            ),
+            Ok(CfgEvalOutcome::Panicked { bb: 0, .. })
+        ));
+        // `Terminate` aborts and `Unreachable` is undefined behavior, as for direct calls.
+        assert!(matches!(
+            eval_lowered_body_cfg_with_call_table(
+                &main(UnwindAction::Terminate),
+                &[u32v(1)],
+                100,
+                &table
+            ),
+            Ok(CfgEvalOutcome::Terminated { bb: 0, .. })
+        ));
+        assert!(matches!(
+            eval_lowered_body_cfg_with_call_table(
+                &main(UnwindAction::Unreachable),
+                &[u32v(1)],
+                100,
+                &table
+            ),
+            Err(CfgEvalError::UnwindIntoUnreachable { bb: 0, .. })
+        ));
+    }
+}
+
+#[test]
+fn a3_indirect_calls_write_projected_return_places() {
+    for pw in PWS {
+        let f_ty = fn_ty(vec![u32_ty()], u32_ty());
+        let pair = Ty::Tuple(vec![u32_ty(), u32_ty()]);
+        // `fn main(x: u32) -> (u32, u32) { _0.0 = 1; _0.1 = f(x); }` with `f = double`.
+        let body = Body {
+            local_decls: vec![pair.clone(), u32_ty(), f_ty.clone()],
+            basic_blocks: vec![
+                block(
+                    vec![
+                        Statement::StorageLive(Local(2)),
+                        Statement::Assign(
+                            proj(0, vec![ProjectionElem::Field(0, u32_ty())]),
+                            Rvalue::Use(cint(1, u32_ty())),
+                        ),
+                        assign(
+                            2,
+                            reify(
+                                PointerCoercionKind::ReifyFnPointer,
+                                Operand::callee("double"),
+                                f_ty.clone(),
+                            ),
+                        ),
+                    ],
+                    Terminator::Call {
+                        func: copy(2),
+                        args: vec![copy(1)],
+                        destination: proj(0, vec![ProjectionElem::Field(1, u32_ty())]),
+                        target: Some(1),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                block(vec![], Terminator::Return),
+            ],
+        };
+        let lowered = lower_body(&body, pw).unwrap();
+        let table = CallTable::new().with_callee("double", 1, double_body(pw));
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(&lowered, &[u32v(5)], 100, &table),
+            Ok(CfgEvalOutcome::Returned(MirValue::Tuple(vec![
+                u32v(1),
+                u32v(10)
+            ])))
+        );
+        // A projected destination of the wrong type is rejected statically.
+        let mut bad = body.clone();
+        if let Some(Terminator::Call { destination, .. }) = &mut bad.basic_blocks[0].terminator {
+            *destination = proj(
+                0,
+                vec![ProjectionElem::Field(0, u32_ty()), ProjectionElem::Deref],
+            );
+        }
+        assert!(lower_body(&bad, pw).is_err());
+    }
+}
+
+#[test]
+fn a3_reified_closures_call_their_linked_bodies() {
+    for pw in PWS {
+        let f_ty = fn_ty(vec![u32_ty()], u32_ty());
+        let closure_ty = Ty::closure("double", vec![]);
+        // `let c = || ..; let f: fn(u32) -> u32 = c; f(x)` with the closure's body linked as
+        // `double` (the reified closure is called with the function pointer's arguments).
+        let main = |coercion: PointerCoercionKind, ptr_ty: Ty| {
+            let body = Body {
+                local_decls: vec![u32_ty(), u32_ty(), closure_ty.clone(), ptr_ty.clone()],
+                basic_blocks: vec![
+                    block(
+                        vec![
+                            Statement::StorageLive(Local(2)),
+                            Statement::StorageLive(Local(3)),
+                            assign(2, Rvalue::Aggregate(AggregateKind::Closure, vec![])),
+                            assign(3, reify(coercion, Operand::Move(local(2)), ptr_ty.clone())),
+                        ],
+                        Terminator::Call {
+                            func: copy(3),
+                            args: vec![copy(1)],
+                            destination: local(0),
+                            target: Some(1),
+                            unwind: UnwindAction::Continue,
+                        },
+                    ),
+                    block(vec![], Terminator::Return),
+                ],
+            };
+            lower_body(&body, pw).unwrap()
+        };
+        let table = CallTable::new().with_callee("double", 1, double_body(pw));
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &main(
+                    PointerCoercionKind::ClosureFnPointer(Safety::Safe),
+                    f_ty.clone()
+                ),
+                &[u32v(8)],
+                100,
+                &table
+            ),
+            Ok(CfgEvalOutcome::Returned(u32v(16)))
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(
+                &main(
+                    PointerCoercionKind::ClosureFnPointerAnySafety,
+                    unsafe_fn_ty(vec![u32_ty()], u32_ty())
+                ),
+                &[u32v(8)],
+                100,
+                &table
+            ),
+            Ok(CfgEvalOutcome::Returned(u32v(16)))
+        );
+        // Reifying the closure at a signature its body does not have is undefined behavior.
+        let wrong_ty = fn_ty(vec![u32_ty()], u64_ty());
+        let body = Body {
+            local_decls: vec![u32_ty(), closure_ty.clone(), wrong_ty.clone()],
+            basic_blocks: vec![block(
+                vec![
+                    Statement::StorageLive(Local(1)),
+                    Statement::StorageLive(Local(2)),
+                    assign(1, Rvalue::Aggregate(AggregateKind::Closure, vec![])),
+                    assign(
+                        2,
+                        reify(
+                            PointerCoercionKind::ClosureFnPointerAnySafety,
+                            copy(1),
+                            wrong_ty.clone(),
+                        ),
+                    ),
+                    assign(0, Rvalue::Use(cint(0, u32_ty()))),
+                ],
+                Terminator::Return,
+            )],
+        };
+        assert!(matches!(
+            eval_lowered_body_cfg_with_call_table(
+                &lower_body(&body, pw).unwrap(),
+                &[],
+                100,
+                &table
+            ),
+            Err(CfgEvalError::Statement {
+                bb: 0,
+                index: 3,
+                error: RvalueEvalError::FnPtrSignatureMismatch { .. },
+            })
+        ));
+    }
+}
+
+#[test]
+fn a3_unsize_requires_an_initialized_backing_local() {
+    for pw in PWS {
+        // `_1: [u8; 3]` is live but uninitialized: `Trusted`'s `evalUnsizeCoercion` reads the
+        // backing array out of the borrowed local, so unsizing a pointer to it is undefined
+        // behavior for references and raw pointers alike (as `Len` is, see
+        // `eval_slice_len_in`), whereas only metadata-free raw pointer operations remain fine.
+        let a3 = arr(u8_ty(), 3);
+        let decls = vec![
+            unit(),
+            a3.clone(),
+            raw(a3.clone(), MUT),
+            raw(slice(u8_ty()), MUT),
+            rf(a3.clone(), MUT),
+            rf(slice(u8_ty()), MUT),
+        ];
+        let raw_unsize = vec![
+            assign(2, Rvalue::RawPtr(MUT, local(1))),
+            assign(3, unsize(copy(2), raw(slice(u8_ty()), MUT))),
+        ];
+        assert_eq!(
+            run(&decls, &raw_unsize, pw).err(),
+            Some(RvalueEvalError::UninitializedLocal(Local(1)))
+        );
+        let ref_unsize = vec![
+            assign(4, Rvalue::Ref(MUT, local(1))),
+            assign(5, unsize(copy(4), rf(slice(u8_ty()), MUT))),
+        ];
+        assert_eq!(
+            run(&decls, &ref_unsize, pw).err(),
+            Some(RvalueEvalError::UninitializedLocal(Local(1)))
+        );
+        // A raw slice built from parts (`ptr::slice_from_raw_parts_mut`) is not an `Unsize`.
+        let parts_decls = vec![
+            unit(),
+            a3.clone(),
+            raw(a3.clone(), MUT),
+            raw(u8_ty(), MUT),
+            raw(slice(u8_ty()), MUT),
+        ];
+        let parts = vec![
+            assign(2, Rvalue::RawPtr(MUT, local(1))),
+            assign(
+                3,
+                cast(
+                    CastKind::PointerCoercion(PointerCoercionKind::ArrayToPointer),
+                    copy(2),
+                    raw(u8_ty(), MUT),
+                ),
+            ),
+            assign(
+                4,
+                Rvalue::Aggregate(
+                    AggregateKind::RawPtr {
+                        pointee: slice(u8_ty()),
+                        mutability: MUT,
+                    },
+                    vec![copy(3), cusize(3)],
+                ),
+            ),
+        ];
+        let state = run(&parts_decls, &parts, pw).unwrap();
+        assert_eq!(value(&state, 4).as_wide_ptr(), Some((stack_ptr(1, 0), 3)));
+        // Once initialized, both unsizings succeed.
+        let init = assign(1, array_rv(u8_ty(), &[1, 2, 3]));
+        for stmts in [raw_unsize, ref_unsize] {
+            let mut all = vec![init.clone()];
+            all.extend(stmts);
+            assert!(run(&decls, &all, pw).is_ok());
+        }
+    }
+}

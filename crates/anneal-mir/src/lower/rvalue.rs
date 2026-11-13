@@ -4401,10 +4401,14 @@ fn eval_lowered_cast_with_decls(
                     let is_dead = |loc: usize| {
                         slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead)))
                     };
+                    let is_uninit = |loc: usize| {
+                        slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Uninit)))
+                    };
                     let frame = SliceFrame {
                         decls: local_decls,
                         local_count,
                         is_dead: &is_dead,
+                        is_uninit: &is_uninit,
                         frame_addr_base,
                         ptr_width,
                     };
@@ -9764,10 +9768,12 @@ fn check_retagged_wide_reference(
         }));
     }
     let is_dead = |loc: usize| matches!(ctx.slots.get(loc), Some(LocalSlotState::Dead));
+    let is_uninit = |loc: usize| matches!(ctx.slots.get(loc), Some(LocalSlotState::Uninit));
     let slice_frame = SliceFrame {
         decls: ctx.local_decls,
         local_count: ctx.slots.len().min(ctx.local_decls.len()),
         is_dead: &is_dead,
+        is_uninit: &is_uninit,
         frame_addr_base: ctx.frame_addr_base,
         ptr_width,
     };
@@ -10257,6 +10263,8 @@ struct SliceFrame<'a> {
     decls: &'a [Ty],
     local_count: usize,
     is_dead: &'a dyn Fn(usize) -> bool,
+    /// Whether a (live) local is entirely uninitialized (`LocalSlotState::Uninit`).
+    is_uninit: &'a dyn Fn(usize) -> bool,
     frame_addr_base: u128,
     ptr_width: PtrWidth,
 }
@@ -10272,8 +10280,8 @@ struct SliceFrame<'a> {
 ///   (`MisalignedPointer`), and designate at most `isize::MAX` bytes without wrapping the
 ///   address space (`PointerRangeOverflow`);
 /// - with the synthetic provenance of a local of `frame`, that local must be live
-///   (`DeadLocal`) and its allocation must contain the range (`PointerOutOfBounds`), for raw
-///   pointers as well;
+///   (`DeadLocal`; for an `Unsize`, also not entirely uninitialized: `UninitializedLocal`) and
+///   its allocation must contain the range (`PointerOutOfBounds`), for raw pointers as well;
 /// - with a function's provenance ([`crate::ir::is_fn_ptr_provenance`]), a non-empty range of
 ///   a reference or access is `FnPtrMemoryAccess` (functions have no data memory);
 /// - without provenance, a non-empty range of a reference dangles (`PointerOutOfBounds`) and
@@ -10353,6 +10361,12 @@ fn check_slice_backing(
             if (frame.is_dead)(local) {
                 return Err(RvalueEvalError::DeadLocal(Local(local)));
             }
+            // `Trusted`'s `evalUnsizeCoercion` reads the backing array out of the borrowed
+            // local, which must be initialized (`get? locals entry.targetLocal = .init _`), as
+            // `evalPlaceLen` requires for `Len` (see `eval_slice_len_in`).
+            if matches!(use_, SliceUse::Unsize { .. }) && (frame.is_uninit)(local) {
+                return Err(RvalueEvalError::UninitializedLocal(Local(local)));
+            }
             let base = local_base_addr_in_frame(local, frame.decls, ptr_width, frame.frame_addr_base)?;
             let decl_ty = &frame.decls[local];
             let (alloc_size, _) = decl_ty
@@ -10430,10 +10444,13 @@ fn check_slice_backing_in<F: FrameView + ?Sized>(
     full_place: Option<&Place>,
 ) -> Result<(), RvalueEvalError> {
     let is_dead = |loc: usize| matches!(frame.frame_slot(loc), Some(FrameSlot::Dead));
+    let is_uninit =
+        |loc: usize| matches!(frame.frame_slot(loc), Some(FrameSlot::Live(SlotRef::Uninit)));
     let slice_frame = SliceFrame {
         decls: frame.frame_decls(),
         local_count: frame.frame_local_count(),
         is_dead: &is_dead,
+        is_uninit: &is_uninit,
         frame_addr_base: frame.frame_addr_base(),
         ptr_width: frame.frame_ptr_width(),
     };
