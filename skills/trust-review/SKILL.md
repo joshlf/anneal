@@ -168,8 +168,10 @@ affected components against these requirements:
 ### 3. Boundary auditor and lock manifests (`trusted/audit/`, lock files)
 
 - **No silent weakening of `anneal-audit`:** Scrutinize any modification to
-  [`trusted/audit/src/lib.rs`](../../trusted/audit/src/lib.rs) or
-  [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean). Flag any
+  [`trusted/cargo-anneal/src/lib.rs`](../../trusted/cargo-anneal/src/lib.rs),
+  [`target.rs`](../../trusted/cargo-anneal/src/target.rs), or
+  [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean). The
+  `anneal-audit` library reexports this shared implementation. Flag any
   change that:
   - expands `allowedCommandKinds`, `allowedDeclarationKinds`,
     `allowedAttributeNames`, `allowedTrustedSyntaxKinds`,

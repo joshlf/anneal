@@ -169,13 +169,16 @@ logical checks below; admitting their bytes does not add foundation axioms.
 
 ## 2. Repository CI boundary enforcement (`anneal-audit`)
 
-[`trusted/audit/`](../trusted/audit) implements the CI gatekeeper
-(`anneal-audit` and
-[`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean)) that audits
-the Anneal repository. It classifies every module into a single `ModuleRole`
-(`.foundation`, `.library`, `.trusted .vetted`, `.trusted (.candidate f)`,
-or `.theory`) and enforces five invariants across two phases over an
-isolated staging directory.
+[`trusted/audit/`](../trusted/audit) supplies the standalone `anneal-audit`
+entry point and
+[`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean). Its shared Rust
+implementation lives in
+[`cargo-anneal/src/lib.rs`](../trusted/cargo-anneal/src/lib.rs) and
+[`target.rs`](../trusted/cargo-anneal/src/target.rs); both the standalone command
+and the verifier call that implementation. It classifies every module into a
+single `ModuleRole` (`.foundation`, `.library`, `.trusted .vetted`,
+`.trusted (.candidate f)`, or `.theory`) and enforces five invariants across two
+phases over an isolated staging directory.
 
 The toolchain roles follow lock membership, not namespace prefixes. The
 foundation is the module set in `foundation-lock.json`; `library-lock.json`

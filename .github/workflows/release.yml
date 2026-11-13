@@ -132,6 +132,11 @@ jobs:
           export LD_LIBRARY_PATH="$install_root/rust/lib"
           export RUSTFLAGS="-Lnative=$install_root/rust/lib -Clink-arg=-Wl,-rpath,$install_root/rust/lib"
           export ANNEAL_TEST_RUST_SYSROOT="$install_root/rust"
+          # Release tests exercise the capture binary shipped in this remote
+          # installation with its matching Rust libraries and Lean executable.
+          export ANNEAL_MVP_SYSROOT="$install_root/rust"
+          export ANNEAL_MVP_LEAN="$install_root/lean/bin/lean"
+          export ANNEAL_MVP_CAPTURE="$install_root/bin/anneal-rustc-capture"
           cargo test --workspace --locked --jobs 2 -- --test-threads=2
 
   release:

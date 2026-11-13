@@ -826,7 +826,7 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
     fs::write(fix.root.join("crates/untrusted-helper/src/lib.rs"), b"").unwrap();
     fs::write(
         fix.root.join("Cargo.toml"),
-        b"[workspace]\nresolver = \"2\"\nmembers = [\n    \"trusted/rustc-capture\",\n    \"trusted/cargo-anneal\",\n    \"crates/untrusted-helper\",\n]\n",
+        b"[workspace]\nresolver = \"2\"\nmembers = [\n    \"trusted/audit\",\n    \"trusted/rustc-capture\",\n    \"trusted/cargo-anneal\",\n    \"crates/untrusted-helper\",\n]\n",
     )
     .unwrap();
     let err_member = fix
@@ -835,7 +835,8 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
     assert!(
         err_member
             .message
-            .contains("workspace member outside trusted/: crates/untrusted-helper")
+            .contains("workspace member outside trusted/: crates/untrusted-helper"),
+        "{err_member}"
     );
 
     fs::copy(checkout.join("Cargo.toml"), fix.root.join("Cargo.toml")).unwrap();

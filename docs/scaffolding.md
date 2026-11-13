@@ -160,7 +160,9 @@ Information-only compiler requests do not establish that analysis ran.
 
 The driver uses compiler-private libraries, so build and test it with the same
 Rust distribution that the archive contains. Pin both Rust compiler tools, the
-runtime library directory, and the sysroot used by compiler-session tests:
+runtime library directory, and the sysroot used by compiler-session tests. The
+workspace also includes verification regressions; use this run's installed
+CLI, capture driver, Lean executable, and Rust sysroot for those tests:
 
 ```bash
 export RUSTC="$install_root/rust/bin/rustc"
@@ -168,6 +170,10 @@ export RUSTDOC="$install_root/rust/bin/rustdoc"
 export LD_LIBRARY_PATH="$install_root/rust/lib"
 export RUSTFLAGS="-Lnative=$install_root/rust/lib -Clink-arg=-Wl,-rpath,$install_root/rust/lib"
 export ANNEAL_TEST_RUST_SYSROOT="$install_root/rust"
+export ANNEAL_MVP_CLI="$scaffold_root/cli/bin/cargo-anneal"
+export ANNEAL_MVP_CAPTURE="$install_root/bin/anneal-rustc-capture"
+export ANNEAL_MVP_LEAN="$install_root/lean/bin/lean"
+export ANNEAL_MVP_SYSROOT="$install_root/rust"
 
 env XDG_CACHE_HOME="$scaffold_root/cache" \
   cargo test --locked --workspace --jobs 2 -- --test-threads=2
