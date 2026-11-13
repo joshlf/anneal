@@ -439,7 +439,8 @@ import LeanMiriSpec.Audit
   `w4_invalid_bool_ref_read_ub`, `w4_storage_dead_protected_ub`,
   `w4_disabled_read_divergence`), multi-frame calls, unwinding, and indirect `FnPtr`
   calls (`w5_call_return`, `w5_unwind_cleanup_returns`, `w5_unwind_unreachable_ub`,
-  `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`), and
+  `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`,
+  `w5_panic_explicit_macro_extCall_boundary`), and
   intrinsics (`w6_copy_nonoverlapping_full_bytes_returns`,
   `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, and the Stage-1 external-call
   boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,

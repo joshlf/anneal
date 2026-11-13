@@ -97,9 +97,12 @@ agreeing whole-program facts.
    cleanup pad), `w5_unwind_unreachable_ub` (multi-frame `UnwindResume` hitting
    `UnwindAction::Unreachable` UB), `w5_unwind_root_panic_vs_ub_divergence`
    (multi-frame `UnwindResume` unwinding past the root frame: `TreeSafe` `.panic`
-   in Anneal vs. undefined behavior in `lean-miri`), and
+   in Anneal vs. undefined behavior in `lean-miri`),
    `w5_indirect_fnPtr_call_returns` (`ReifyFnPointer` coercion and indirect
-   `FnPtr` call).
+   `FnPtr` call), and `w5_panic_explicit_macro_extCall_boundary` (the open
+   `known_anneal_bug` ratchet `panic_explicit_macro`, stopping at
+   `MirStepNode.extCall` for `core::fmt::Arguments::<'a>::from_str` before
+   `core::panicking::panic_fmt`).
 6. Intrinsics: `w6_assume_true`, `w6_assume_false_ub`, `w6_exact_div_valid`,
    `w6_exact_div_non_multiple_ub`, `w6_ctlz_returns`,
    `w6_saturating_add_returns`, `w6_copy_nonoverlapping_disjoint_returns`,
@@ -122,7 +125,7 @@ agreeing whole-program facts.
 
 Every other witness runs from program entry (`initMachineState` /
 `initMachineStateWithCallees` and `miriEntryState`) except `w2_enum_downcast_switch_returns`,
-`w2_array_index_oob_ub`, `w2_union_uninit_bytes_ub`, `w2_union_init_prefix_lockstep`,
+`w2_union_uninit_bytes_ub`, `w2_union_init_prefix_lockstep`,
 `w4_child_write_then_parent_read_returns`, `w4_unsafe_cell_vs_freeze`,
 `w4_protected_reservedFrz_conflict_ub`, `w4_storage_dead_protected_ub`,
 `w5_protector_release_returns`, and `w6_copy_nonoverlapping_disjoint_lockstep`, which
@@ -3422,11 +3425,14 @@ theorem w2_padded_struct_returns :
     ∃ v, AgreeReturns Witness.lm22PaddedBody
         (rootHooks (Miri.Interpreter.Step.step
           (annealStepHooksLM2_2 Witness.lm22PaddedBody.localDecls Witness.lm22PaddedBody.layouts)))
-        (initMachineState Witness.lm22PaddedBody []) Witness.lm22PaddedMiriInit (.scalar ⟨99, 4⟩) v ∧
+        (initMachineState Witness.lm22PaddedBody [])
+        (miriEntryState Witness.lm22PaddedBody) (.scalar ⟨99, 4⟩) v ∧
       operandScalarBits? 4 v = some 99 := by
   obtain ⟨_, _, ha, hm⟩ := Witness.lm22Padded_full_trace_and_returns_agree
   obtain ⟨m', v, hrun, hbits⟩ := miriOutcomeScalarBits_spec hm
+  have hentry : miriEntryState Witness.lm22PaddedBody = Witness.lm22PaddedMiriInit := rfl
   have hloop := runLoopFuel_of_runMiriBoundedLM2_2 hrun
+  rw [← hentry] at hloop
   obtain ⟨hts, hrr⟩ := anneal_returns_of_bits (body := Witness.lm22PaddedBody) (N := 9)
     (s := initMachineState Witness.lm22PaddedBody []) (b := 99) (sz := 4) ha
   obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_runLoopFuel_returned hloop
@@ -3477,14 +3483,146 @@ theorem w2_array_index_returns :
   have := huniq _ hv'
   injection this
 
+/-- Entry-to-UB MIR body for `LM-2.1` array `Index` out of bounds:
+`StorageLive(_1); StorageLive(_2); _2 = const 3_usize;
+_1 = [0x0102_u16, 0x0304_u16, 0x0506_u16]; _0 = copy _1[_2]; return`. -/
+def arrayIndexOobEntryBody : CapturedMir where
+  defPath := "lm_4_3_witness::array_index_oob_entry"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [Witness.lm21U16Decl, Witness.lm21U16Arr3Decl, Witness.lm21UsizeDecl]
+  basicBlocks := [{
+    statements := [
+      Witness.mkStmt (.storageLive 1),
+      Witness.mkStmt (.storageLive 2),
+      Witness.mkStmt (.assign (Witness.local_ 2) (.use (.constant (Witness.lm21ConstUsize 3)))),
+      Witness.mkStmt (.assign (Witness.local_ 1) (.aggregate (.array Witness.lm21U16Ty)
+        [.constant (Witness.lm21ConstU16 0x0102), .constant (Witness.lm21ConstU16 0x0304),
+         .constant (Witness.lm21ConstU16 0x0506)])),
+      Witness.mkStmt (.assign (Witness.local_ 0) (.use (.copy ⟨1, [.index 2]⟩)))]
+    terminator := Witness.mkTerm .return_, isCleanup := false }]
+  fnAbi := Witness.lm21FnAbi
+  layouts := emptyLayoutTable
+  allocations := []
+
+def arrayIndexOobPreAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 3,
+               locals := [.uninit, .uninit, .init (.scalar ⟨3, 8⟩)] }
+    memory := (initMachineState arrayIndexOobEntryBody []).memory }
+
+def arrayIndexOobPreMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { (miriEntryFrame arrayIndexOobEntryBody) with
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm21Usize3))),
+        layout := some (translateTy Witness.lm21UsizeTy emptyLayoutTable) }]
+    location := .mir ⟨0, 3⟩ }
+
+def arrayIndexOobPreMiri : AnnealStepState :=
+  { stack := ⟨#[arrayIndexOobPreMiriFrame]⟩, machine := AnnealMachine.empty }
+
+theorem arrayIndexOob_prefix_anneal :
+    runAnnealBounded arrayIndexOobEntryBody 3 (initMachineState arrayIndexOobEntryBody []) =
+      .running arrayIndexOobPreAnneal := rfl
+
+theorem arrayIndexOob_prefix_miri :
+    runLoopFuel (annealMiriHooks arrayIndexOobEntryBody) 3
+      (miriEntryState arrayIndexOobEntryBody) = .running arrayIndexOobPreMiri := rfl
+
+theorem arrayIndexOob_pre_stateRel_and_imm :
+    StateRel arrayIndexOobEntryBody arrayIndexOobPreAnneal arrayIndexOobPreMiri ∧
+    ∀ tf, arrayIndexOobPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+  refine ⟨?_, ?_⟩
+  · refine StateRel.mk arrayIndexOobPreMiriFrame rfl rfl
+      ⟨entryReturnLayout arrayIndexOobEntryBody, rfl⟩ ?_ rfl rfl rfl rfl rfl (by
+        intro i _ _ _ _ _ _ hi _
+        match i with | 0 | 1 | 2 | _ + 3 => simp [arrayIndexOobPreMiriFrame] at hi)
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 | 1 =>
+      have hs : slot = .uninit := by simpa [arrayIndexOobPreAnneal, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [arrayIndexOobPreMiriFrame] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 2 =>
+      have hd : decl = Witness.lm21UsizeDecl := by
+        simpa [arrayIndexOobEntryBody, get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨3, 8⟩) := by
+        simpa [arrayIndexOobPreAnneal, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm21Usize3))),
+            layout := some (translateTy Witness.lm21UsizeTy emptyLayoutTable) } := by
+        simpa [arrayIndexOobPreMiriFrame] using hmls.symm
+      subst hd hs hm
+      exact .immediate _ _ _ (by intro _ h; cases h; rfl)
+        (Or.inr ⟨.scalar ⟨3, 8⟩, rfl, Witness.lm21_idxRel_3⟩)
+    | _ + 3 => simp [arrayIndexOobEntryBody, get?] at hdecl
+  · intro tf htf k mls hmls mp hv
+    have htf' : tf = arrayIndexOobPreMiriFrame := by
+      simpa [arrayIndexOobPreMiri] using htf.symm
+    subst htf'
+    match k with
+    | 0 | 1 | 2 => simp [arrayIndexOobPreMiriFrame] at hmls; subst hmls; cases hv
+    | _ + 3 => simp [arrayIndexOobPreMiriFrame] at hmls
+
 /-- `LM-2.1` array `Index` out of bounds (`_2 = 3_usize` on `[u16; 3]`):
-both machines reach undefined behavior from the state before the read. -/
+from program entry, both machines reach undefined behavior (`AgreeUB`). -/
 theorem w2_array_index_oob_ub :
-    AgreeUB Witness.lm21Body (annealMiriHooks Witness.lm21Body)
-      (Witness.lm21ArrAnneal 4 (.init (.scalar ⟨3, 8⟩)))
-      (Witness.lm21ArrMiri 4 (.scalar (.fromScalarInt Witness.lm21Usize3))) := by
-  obtain ⟨hfail, m', msg, herr⟩ := Witness.lm21_index_oob_ub
-  exact agreeUB_of_paths (p := 0) rfl rfl (.refl _) hfail (.refl _) herr rfl
+    AgreeUB arrayIndexOobEntryBody (annealMiriHooks arrayIndexOobEntryBody)
+      (initMachineState arrayIndexOobEntryBody []) (miriEntryState arrayIndexOobEntryBody) := by
+  let b := arrayIndexOobEntryBody
+  let s₁ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 4,
+                 locals := [.uninit, .init (.aggregate 0 Witness.lm21ArrElems),
+                            .init (.scalar ⟨3, 8⟩)] }
+      memory := (initMachineState b []).memory }
+  have hs₀ : stepMirFn b arrayIndexOobPreAnneal = .step s₁ := rfl
+  obtain ⟨hrel₀, himm₀⟩ := arrayIndexOob_pre_stateRel_and_imm
+  have hcU16 : ∀ tf (n : Nat), n < 65536 →
+      WellTypedLM2_1ScalarOperand b tf (.constant (Witness.lm21ConstU16 n)) Witness.lm21U16Ty :=
+    fun _ n hn => .ofScalar (.constScalar (Witness.lm21ConstU16 n) ⟨n, 2⟩ rfl
+      Witness.lm21_isPrim_u16 (Or.inr (Or.inl rfl)) (by simpa [scalarModulus] using hn)
+      rfl (fun h => nomatch h) (fun h => nomatch h))
+  obtain ⟨hsim₁, hnd₁, himm₁, _⟩ := step_stmt_lm2_1_array_simulation hrel₀
+    Witness.lm21_nodup_empty (by intro p h; cases h) rfl rfl (fun tf htf => by
+      refine .aggregateArray 1 Witness.lm21U16Arr3Decl Witness.lm21U16Ty (.uint .u16) 3 _ _
+        rfl Witness.lm21_wf_u16Arr3 rfl
+        (Or.inr (Or.inl ⟨himm₀ tf htf 1, Witness.lm21_canReserve_empty⟩)) ?_
+        Witness.lm21_isPrim_u16
+      intro op hop
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+      rcases hop with rfl | rfl | rfl
+      · exact hcU16 tf 0x0102 (by decide)
+      · exact hcU16 tf 0x0304 (by decide)
+      · exact hcU16 tf 0x0506 (by decide))
+  rw [hs₀] at hsim₁
+  generalize hm₁ : Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+    arrayIndexOobPreMiri = r₁ at hsim₁ hnd₁ himm₁
+  cases hsim₁ with
+  | step _ m₁ hrel₁ =>
+    obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+    have hs₁ : stepMirFn b s₁ = .fail .ub := rfl
+    obtain ⟨hsim₂, _⟩ := step_stmt_lm2_1_array_simulation hrel₁ (hnd₁ rfl)
+      (by intro p h; cases h) rfl rfl (fun tf htf =>
+        .elemAssign (.readElem 0 1 Witness.lm21U16Decl Witness.lm21U16Arr3Decl (.uint .u16) 3
+          (.index 2) false _ rfl Witness.lm21_wf_u16Arr3 rfl rfl
+          (himm₁ rfl _ tf rfl htf 0 (by decide) (himm₀ _ rfl 0))
+          (.index 2 Witness.lm21UsizeDecl rfl rfl
+            (Or.inl (himm₁ rfl _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2))))
+          (Or.inr (Or.inr ⟨Witness.lm21ArrElems, rfl⟩))))
+    rw [hs₁] at hsim₂
+    generalize hm₂ : Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+      m₁ = r₂ at hsim₂
+    cases hsim₂ with
+    | ub m₂ msg =>
+      exact agreeUB_of_obs_path (N := 6) (by decide)
+        ((MiriPath.of_runLoopFuel arrayIndexOob_prefix_miri).trans
+          (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _))) hm₂ rfl
 
 /-- `LM-2.4` union (`I-11` initialized prefix): after `_1 = U { a: 5_u8 }` and
 `_4 = copy _1`, reading the larger field `_4.1 : u32` touches uninitialized
@@ -5120,6 +5258,77 @@ theorem indirectCallFive_reify_fnPtrs :
         (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody]) = .running s ∧
       s.memory.fnPtrs = [fiveFnPtrEntry] :=
   ⟨_, rfl, rfl⟩
+
+def fmtFromStrFnTy : Ty :=
+  { kind := .fnDef "core::fmt::Arguments::<'a>::from_str" [], layoutIdx := 0 }
+
+def panicFmtFnTy : Ty :=
+  { kind := .fnDef "core::panicking::panic_fmt" [], layoutIdx := 0 }
+
+/-- Root body modeled on the sole remaining open `known_anneal_bug` ratchet
+`panic_explicit_macro` (`tests/miri-diff/manifest.toml`): an explicit `panic!("...")`
+first calls `core::fmt::Arguments::<'a>::from_str` (`bb0 -> bb1`, `.continue_`)
+before calling the diverging `core::panicking::panic_fmt` (`bb1`, `target := none`,
+`.continue_`). -/
+def panicExplicitMacroBody : CapturedMir :=
+  mkBody "lm_4_3_witness::panic_explicit_macro" [dcl tyU8, dcl tyU8]
+    [blk [st (.storageLive 1)]
+       (.call (.constant { ty := fmtFromStrFnTy, val := .zeroSized }) []
+         (pl 1) (some 1) .continue_),
+     blk []
+       (.call (.constant { ty := panicFmtFnTy, val := .zeroSized }) [.copy (pl 1)]
+         (pl 0) none .continue_)]
+
+/-- **Open `known_anneal_bug` ratchet boundary (`panic_explicit_macro`), from entry**:
+after `StorageLive(_1)`, Stage-1 emits `MirStepNode.extCall` for
+`"core::fmt::Arguments::<'a>::from_str"` before reaching `bb1`'s diverging
+`core::panicking::panic_fmt`. When the environment returns while preserving the
+root stack, `panic_fmt` unwinds to `MirOutcome.panic`, whereas an unconstrained
+`MirCallAns.panicked` with a `.unreachable` frame in `callStack` triggers `.ub`
+(`MirReachesUB` ∧ `¬ TreeSafe`). `lean-miri` stops with `.unsupported` (`¬ Safe`). -/
+theorem w5_panic_explicit_macro_extCall_boundary :
+    (∃ s₁ req k,
+      stepMirFn panicExplicitMacroBody (initMachineState panicExplicitMacroBody []) = .step s₁ ∧
+      stepMirFn panicExplicitMacroBody s₁ = MirStepNode.extCall req k ∧
+      req.defPath = "core::fmt::Arguments::<'a>::from_str") ∧
+    (∃ tr, ReachesRet (mirCallTree panicExplicitMacroBody []) tr .panic) ∧
+    MirReachesUB (mirCallTree panicExplicitMacroBody []) ∧
+    ¬ TreeSafe (mirCallTree panicExplicitMacroBody []) ∧
+    (∃ e, (miriSystem (annealMiriHooks panicExplicitMacroBody)).ReachesOutcome
+      (miriEntryState panicExplicitMacroBody) (.unsupported e)) ∧
+    ¬ (miriSystem (annealMiriHooks panicExplicitMacroBody)).Safe
+      (miriEntryState panicExplicitMacroBody) := by
+  let s₀ := initMachineState panicExplicitMacroBody []
+  let s₁ : MachineState := { s₀ with frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .uninit] } }
+  let req : MirCallReq :=
+    { defPath := "core::fmt::Arguments::<'a>::from_str", typeArgs := [], args := [], memory := s₁.memory }
+  have hs₀ : stepMirFn panicExplicitMacroBody s₀ = .step s₁ := rfl
+  have hs₁ : stepMirFn panicExplicitMacroBody s₁ =
+      MirStepNode.extCall req (resumeExternalCall s₁ s₁.frame.locals (pl 1) 1 .continue_) := rfl
+  let s₂ : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨0, 1⟩)] },
+      memory := s₁.memory }
+  have hres : resumeExternalCall s₁ s₁.frame.locals (pl 1) 1 .continue_
+      (.returned (.scalar ⟨0, 1⟩) s₁.memory) = .running s₂ := rfl
+  have hs₂ : stepMirFn panicExplicitMacroBody s₂ = MirStepNode.retOutcome .panic := rfl
+  have hco₁ := (AnnealPath.step .silent hs₀ (.refl _)).coReach
+  have hco₂ : CoReach (stepMirState panicExplicitMacroBody) (.running s₀) (.running s₂) := by
+    have h := hco₁.tail (coStep_of_extCall hs₁ (.returned (.scalar ⟨0, 1⟩) s₁.memory))
+    rwa [hres] at h
+  let memBad : Memory :=
+    { s₁.memory with callStack :=
+        [{ callerBody := panicExplicitMacroBody, frame := s₁.frame,
+           destination := pl 0, returnUnwind := .unreachable }] }
+  have hco_ub := hco₁.tail (coStep_of_extCall hs₁ (.panicked memBad))
+  have hbad : resumeExternalCall s₁ s₁.frame.locals (pl 1) 1 .continue_ (.panicked memBad) =
+      .faulted .ub := rfl
+  rw [hbad] at hco_ub
+  obtain ⟨hub, hns⟩ := anneal_ub_of_coReach hco_ub rfl
+  obtain ⟨herr, hnm⟩ := miri_unsupported_of_obs (H := annealMiriHooks panicExplicitMacroBody)
+    (N := 3) (m := miriEntryState panicExplicitMacroBody) (by decide +kernel)
+  rw [mirCallTree, mirTree_eq_cofix]
+  exact ⟨⟨s₁, req, _, hs₀, hs₁, rfl⟩, reachesRet_cofix_iff.2 ⟨.running s₂, hco₂, hs₂⟩,
+    by rw [← mirTree_eq_cofix]; exact hub, by rw [← mirTree_eq_cofix]; exact hns, herr, hnm⟩
 
 /-! ## 7. Whole-program return traces for `LM-4.2` intrinsics and the
 checked-addition closed simulation -/

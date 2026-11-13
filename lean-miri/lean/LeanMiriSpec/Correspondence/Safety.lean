@@ -343,7 +343,8 @@ concrete real-step instances in the `Wit*` modules:
 * The open `known_anneal_bug` ratchet of `tests/miri-diff/manifest.toml`:
   `panic_explicit_macro` (an explicit `panic!` first calls
   `core::fmt::Arguments::from_str`, an external call that Stage-1 does not
-  model, before the diverging `core::panicking::panic_fmt`).
+  model, before the diverging `core::panicking::panic_fmt`;
+  `MiriDiffWitnesses.w5_panic_explicit_macro_extCall_boundary`).
 
 The multi-frame witnesses instantiate `annealStepHooksLM4_1` at the body of the
 active `lean-miri` frame (`MiriDiffWitnesses.callHooks`), a function of the

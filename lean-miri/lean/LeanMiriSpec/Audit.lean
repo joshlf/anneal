@@ -23903,9 +23903,8 @@ example :
       (initMachineState Witness.lm21FullFnBody []) (miriEntryState Witness.lm21FullFnBody)
       (.scalar ⟨22, 4⟩)
       (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22)))) ∧
-    AgreeUB Witness.lm21Body (annealMiriHooks Witness.lm21Body)
-      (Witness.lm21ArrAnneal 4 (.init (.scalar ⟨3, 8⟩)))
-      (Witness.lm21ArrMiri 4 (.scalar (.fromScalarInt Witness.lm21Usize3))) :=
+    AgreeUB arrayIndexOobEntryBody (annealMiriHooks arrayIndexOobEntryBody)
+      (initMachineState arrayIndexOobEntryBody []) (miriEntryState arrayIndexOobEntryBody) :=
   ⟨w2_array_index_returns, w2_array_index_oob_ub⟩
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
@@ -24040,7 +24039,8 @@ example :
     (∃ v, AgreeReturns Witness.lm22PaddedBody
         (rootHooks (Miri.Interpreter.Step.step
           (annealStepHooksLM2_2 Witness.lm22PaddedBody.localDecls Witness.lm22PaddedBody.layouts)))
-        (initMachineState Witness.lm22PaddedBody []) Witness.lm22PaddedMiriInit (.scalar ⟨99, 4⟩) v ∧
+        (initMachineState Witness.lm22PaddedBody [])
+        (miriEntryState Witness.lm22PaddedBody) (.scalar ⟨99, 4⟩) v ∧
       operandScalarBits? 4 v = some 99) ∧
     AgreeUB Witness.lm24Body
       (.ofHooks (annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts)
@@ -24686,6 +24686,17 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   copyStage1RawPtrCastEntry_prefix_miri
   copyStage1RawPtrCastEntry_stateRel_and_imm
   copyStage1RawPtrCastEntry_trace
+  arrayIndexOobEntryBody
+  arrayIndexOobPreAnneal
+  arrayIndexOobPreMiriFrame
+  arrayIndexOobPreMiri
+  arrayIndexOob_prefix_anneal
+  arrayIndexOob_prefix_miri
+  arrayIndexOob_pre_stateRel_and_imm
+  fmtFromStrFnTy
+  panicFmtFnTy
+  panicExplicitMacroBody
+  w5_panic_explicit_macro_extCall_boundary
 
 /-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
 
@@ -25152,6 +25163,33 @@ example :
       Miri.Interpreter.Step.step hooks () m₄ =
         (m₅, .error (.unsupported "pointee of TyId 80 is not encoded")) :=
   copyStage1RawPtrCastEntry_trace
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ s₁ req k,
+      stepMirFn panicExplicitMacroBody (initMachineState panicExplicitMacroBody []) = .step s₁ ∧
+      stepMirFn panicExplicitMacroBody s₁ = MirStepNode.extCall req k ∧
+      req.defPath = "core::fmt::Arguments::<'a>::from_str") ∧
+    (∃ tr, ReachesRet (mirCallTree panicExplicitMacroBody []) tr .panic) ∧
+    MirReachesUB (mirCallTree panicExplicitMacroBody []) ∧
+    ¬ TreeSafe (mirCallTree panicExplicitMacroBody []) ∧
+    (∃ e, (miriSystem (annealMiriHooks panicExplicitMacroBody)).ReachesOutcome
+      (miriEntryState panicExplicitMacroBody) (.unsupported e)) ∧
+    ¬ (miriSystem (annealMiriHooks panicExplicitMacroBody)).Safe
+      (miriEntryState panicExplicitMacroBody) :=
+  w5_panic_explicit_macro_extCall_boundary
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (StateRel arrayIndexOobEntryBody arrayIndexOobPreAnneal arrayIndexOobPreMiri ∧
+      ∀ tf, arrayIndexOobPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k) ∧
+    runAnnealBounded arrayIndexOobEntryBody 3 (initMachineState arrayIndexOobEntryBody []) =
+      .running arrayIndexOobPreAnneal ∧
+    runLoopFuel (annealMiriHooks arrayIndexOobEntryBody) 3
+      (miriEntryState arrayIndexOobEntryBody) = .running arrayIndexOobPreMiri :=
+  ⟨arrayIndexOob_pre_stateRel_and_imm, arrayIndexOob_prefix_anneal, arrayIndexOob_prefix_miri⟩
 
 end StatementPins
 
