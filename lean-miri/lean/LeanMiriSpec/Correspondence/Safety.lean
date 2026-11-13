@@ -206,7 +206,13 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   from-entry `MiriDiffWitnesses.w3_arith_offset_returns` and
   `MiriDiffWitnesses.w3_arith_offset_uninit_ub`).
 
-Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
+Kernel-certified divergences (outside every agreed fragment, as of Stage-1). The
+`MiriDiffWitnesses.*` entries are whole programs run from program entry
+(`initMachineState` / `initMachineStateWithCallees` and `miriEntryState`), except
+the `lean-miri` half of `MiriDiffWitnesses.w6_copy_nonoverlapping_rawPtr_tyId80_boundary`,
+which starts at `WitLM4_2` pre-states; the other entries are per-step divergence
+theorems over Stage-1 `stepMirFn`, most with concrete real-step instances in the
+`Wit*` modules:
 
 * `C2` (`cex_end_of_call_foreign_unique_frozen_divergence`): canonical Miri's
   end-of-call protector release performs an implicit read that freezes a
@@ -240,7 +246,9 @@ Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
   the return place fails in `lean-miri` (as in rustc) with
   `StackError.cannotMakeReturnPlaceDead`, a blocked (non-UB) outcome, so the
   fragments exclude it (`WellTypedScalarStmtSyn.storageDead` requires a
-  local other than `_0`).
+  local other than `_0`); whole program from entry:
+  `MiriDiffWitnesses.w1_storageDead_returnPlace_class_divergence` (`.blocked` in
+  `lean-miri`, undefined behavior in Anneal).
 * `LM-2.2` (`step_assign_self_copy_memory_struct_divergence`): a memory-backed
   struct self-copy `_1 = copy _1` steps in Anneal and is an overlapping-copy
   undefined behavior in `lean-miri`.
@@ -302,9 +310,10 @@ Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
     `TreeSafe` because the environment may unwind into `UnwindAction::Unreachable`),
     `MiriDiffWitnesses.w6_write_bytes_oob_extCall_divergence` (from program entry:
     undefined behavior in `lean-miri`, a normal return of the unchanged `42` in
-    Anneal), and `MiriDiffWitnesses.w6_rotate_left_extCall_boundary` (from entry);
-    `MiriDiffWitnesses.w6_write_bytes_extCall_boundary` certifies the lockstep
-    prefix from the `ptr4AnnealPre` / `ptr4MiriPre` states of `WitLM4_2`;
+    Anneal), `MiriDiffWitnesses.w6_write_bytes_extCall_boundary` (from program
+    entry: `lean-miri` writes the bytes inline while Anneal returns `()` or reaches
+    undefined behavior through the environment), and
+    `MiriDiffWitnesses.w6_rotate_left_extCall_boundary` (from entry);
   * the inline intrinsics outside `AnnealIntrinsic` that Stage-1 evaluates and
     `annealCallHooks` fails closed on
     (`step_call_nonAnnealIntrinsic_miri_unsupported`).

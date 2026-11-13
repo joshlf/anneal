@@ -24652,6 +24652,22 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   retWriteBytesOob_prefix_anneal
   retWriteBytesOob_prefix_miri
   retWriteBytesOob_stateRel
+  ptr4EntryBody
+  ptr4EntryPreAnneal
+  ptr4EntryPreMiriFrame
+  ptr4EntryPreMiri
+  ptr4Entry_stateRel_and_imm
+  arithOffsetEntryTerm
+  arithOffsetUninitBody
+  copyOverlapEntryBody
+  arithOffsetPosEntryBody
+  retCopy_prefix_anneal
+  retCopy_prefix_miri
+  agreeReaches_of_prefix_paths
+  writeBytesEntryTerm
+  writeBytesEntryBody
+  writeBytesEntry_prefix_anneal
+  writeBytesEntry_prefix_miri
 
 /-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
 
@@ -24790,28 +24806,25 @@ open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
     ∃ m₁ m₂,
-      AgreeReaches (WitnessLM4_2.writeBytesMutBody 0xAB 1)
-        (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 1))
-        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 1))
-        (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 1))
-        (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 1) WitnessLM4_2.unitK) m₁ ∧
-      stepMirFn (WitnessLM4_2.writeBytesMutBody 0xAB 1)
-          (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 1)) =
-        WitnessLM4_2.ptr4Stage1ExtCall "core::intrinsics::write_bytes" WitnessLM4_2.u64K
-          (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 1))
-          [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
-      (∃ tr mem, ReachesRet (mirTree (WitnessLM4_2.writeBytesMutBody 0xAB 1)
-        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 1))) tr
-          (.normal (.unit, mem))) ∧
-      MirReachesUB (mirTree (WitnessLM4_2.writeBytesMutBody 0xAB 1)
-        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 1))) ∧
-      ¬ TreeSafe (mirTree (WitnessLM4_2.writeBytesMutBody 0xAB 1)
-        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 1))) ∧
-      (miriSystem (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 1))).Reaches
-        (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 1) WitnessLM4_2.unitK) m₂ ∧
-      ∃ s₂, StateRelLM3_1 (WitnessLM4_2.writeBytesMutBody 0xAB 1) s₂ m₂
-          [rawPtrAllocMapEntry (WitnessLM4_2.writeBytesMutBody 0xAB 1).localDecls
-            (WitnessLM4_2.writeBytesMutBody 0xAB 1).layouts .mut 1 1 Witness.lm31AllocId1] ∧
+      AgreeReaches writeBytesEntryBody (annealMiriHooks writeBytesEntryBody)
+        (initMachineState writeBytesEntryBody []) (wbAddrOfState writeBytesEntryBody)
+        (miriEntryState writeBytesEntryBody) m₁ ∧
+      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) =
+        MirStepNode.extCall
+          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
+            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
+            memory := (wbAddrOfState writeBytesEntryBody).memory }
+          (resumeExternalCall (wbAddrOfState writeBytesEntryBody)
+            (wbAddrOfState writeBytesEntryBody).frame.locals (WitnessLM4_2.local42 0) 2
+            .unreachable) ∧
+      (∃ tr mem, ReachesRet (mirCallTree writeBytesEntryBody []) tr (.normal (.unit, mem))) ∧
+      MirReachesUB (mirCallTree writeBytesEntryBody []) ∧
+      ¬ TreeSafe (mirCallTree writeBytesEntryBody []) ∧
+      (miriSystem (annealMiriHooks writeBytesEntryBody)).Reaches
+        (miriEntryState writeBytesEntryBody) m₂ ∧
+      ∃ s₂, StateRelLM3_1 writeBytesEntryBody s₂ m₂
+          [rawPtrAllocMapEntry writeBytesEntryBody.localDecls writeBytesEntryBody.layouts .mut 1 1
+            Witness.lm31AllocId1] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
   w6_write_bytes_extCall_boundary
 
@@ -25026,6 +25039,41 @@ example {body : CapturedMir} (hbody : WellTypedBodyExt body) (hne : body.basicBl
    w1_checked_add_treeSafe_iff_miriSafe rhs hrhs,
    w5_callee_unreachable_ub,
    w5_callee_uninit_return_ub⟩
+
+/-! ### `LM-4.3` from-entry prefixes: `ptr4EntryBody`, `retCopyBody`, `AgreeReaches` -/
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (b : CapturedMir) (defPath : String) (d₀ d₂ d₃ : RigidTy)
+    (stmts : List MirAst.Statement) (term1 : TerminatorKind)
+    (hb : b = ptr4EntryBody defPath d₀ d₂ d₃ stmts term1) :
+    StateRel b (ptr4EntryPreAnneal b) (ptr4EntryPreMiri b) ∧
+    ∀ tf, (ptr4EntryPreMiri b).stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k :=
+  ptr4Entry_stateRel_and_imm b defPath d₀ d₂ d₃ stmts term1 hb
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    runAnnealBounded retCopyBody 7 (initMachineState retCopyBody []) =
+      .running retCopyAnnealPre ∧
+    runLoopFuel (annealMiriHooks retCopyBody) 7 (miriEntryState retCopyBody) =
+      .running retCopyMiriPre ∧
+    runAnnealBounded writeBytesEntryBody 5 (initMachineState writeBytesEntryBody []) =
+      .running (ptr4EntryPreAnneal writeBytesEntryBody) ∧
+    runLoopFuel (annealMiriHooks writeBytesEntryBody) 5 (miriEntryState writeBytesEntryBody) =
+      .running (ptr4EntryPreMiri writeBytesEntryBody) :=
+  ⟨retCopy_prefix_anneal, retCopy_prefix_miri, writeBytesEntry_prefix_anneal,
+   writeBytesEntry_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA preA sA : MachineState} {entryM preM mB : AnnealStepState} {p : Nat}
+    (hpa : runAnnealBounded body p entryA = .running preA)
+    (hpm : runLoopFuel H p entryM = .running preM)
+    (hA : AnnealPath body preA sA) (hM : MiriPath H preM mB) :
+    AgreeReaches body H entryA sA entryM mB :=
+  agreeReaches_of_prefix_paths hpa hpm hA hM
 
 end StatementPins
 
