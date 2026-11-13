@@ -381,11 +381,16 @@ import LeanMiriSpec.Audit
   lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation`,
   `step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap`), Stage-1
+  distinct-local multi-element `copyViaBytes` evaluation
+  (`evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq`,
+  `stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq`), Stage-1
   uninitialized-source and Tree Borrows divergences
   (`step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence`,
-  `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Anneal-side
-  Stage-1 provenance preservation
-  (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`), and reference-model
+  `step_intrinsic_copyNonOverlapping_stage1_perm_divergence`), Stage-1
+  provenance preservation across `evalCopySingleDirect` and byte-codec `copyViaBytes`
+  (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
+  `encodeUntypedValueToBytes_ptr_decode_roundtrip`) plus the `TyId 80` boundary
+  (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`), and reference-model
   multi-byte range simulations (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.SimLM4_2`: unified `LM-4.2` simulation theorems,
   over Stage-1 `stepMirFn` for `Assume`, `CopyNonOverlapping` (single-element /
@@ -393,12 +398,14 @@ import LeanMiriSpec.Audit
   bit-manipulation / saturating intrinsics, and the `rotate_left` / `rotate_right`
   boundary, and over the pre-Stage-1 reference model for multi-element / sub-range
   `CopyNonOverlapping`, `write_bytes`, and the offset aliases.
-* `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep, Stage-1
-  boundary (`extCall` and `Stage1ExtraIntrinsic`), and Stage-1 divergence witnesses
-  for `LM-4.2` (Stage-1 `Trusted` accepts zero-count misaligned and out-of-bounds
-  `copy_nonoverlapping`, rejects same-tag disjoint copies, stores ill-sized values
-  on cross-type copies, and rejects provenance-free `.scalar` pointers in
-  `arith_offset`).
+* `LeanMiriSpec.Correspondence.WitLM4_2`: concrete Stage-1 lockstep (including
+  full-byte multi-element `copyViaBytes`), Stage-1 boundary (`extCall`,
+  `Stage1ExtraIntrinsic`, and `TyId 80` pointer-valued `copy_nonoverlapping`), and
+  Stage-1 divergence witnesses for `LM-4.2` (Stage-1 `Trusted` accepts zero-count
+  misaligned and out-of-bounds `copy_nonoverlapping`, rejects same-tag disjoint
+  copies, stores ill-sized values on cross-type copies, clobbers the whole
+  destination on partial distinct-local copies in 5-step lockstep, and rejects
+  provenance-free `.scalar` pointers in `arith_offset`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

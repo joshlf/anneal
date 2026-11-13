@@ -28,18 +28,25 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
 * Lockstep witnesses (both machines step to related states, or both report
   undefined behavior): `assume`, the bit / saturating / `exact_div` /
   `arith_offset` calls, and the `copy_nonoverlapping` zero-count, overlap,
-  out-of-bounds same-local, overflow, and distinct-local witnesses.
+  out-of-bounds same-local, overflow, distinct-local single-element, and
+  distinct-local full-byte multi-element (`count * size_of::<u8>() = 8` via
+  `copyViaBytes`) witnesses.
 * Stage-1 boundary witnesses (`*_boundary`): Stage-1 hands `rotate_left`,
   `rotate_right`, `write_bytes`, and the `wrapping_offset` /
   `std::intrinsics::*` aliases to the environment (`MirStepNode.extCall`), while
-  `lean-miri` executes them inline or fails closed.
-* Stage-1 divergence witnesses (`*_divergence`, `*_stage1_steps`): concrete
-  programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
+  `lean-miri` executes them inline or fails closed; conversely, on
+  `Stage1ExtraIntrinsic` calls (`wrapping_add`) and pointer-valued
+  `copy_nonoverlapping::<*mut u64>` (`TyId 80`), Stage-1 steps while `annealStepHooks`
+  fails closed.
+* Stage-1 divergence witnesses (`*_divergence`, `*_stage1_steps`, `*_clobbers*`):
+  concrete programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
   Stage-1 accepts zero-count misaligned and out-of-bounds copies that Miri
-  rejects, rejects same-tag disjoint copies that Miri accepts, stores an
-  ill-sized value on cross-type copies, clobbers the whole destination on
-  partial distinct-local copies, and rejects uninitialized-source and
-  Tree Borrows-forbidden copies that the vendored hooks allow.
+  rejects, rejects same-tag disjoint copies and provenance-free `.scalar` pointers
+  in `arith_offset` that Miri accepts, stores an ill-sized value on cross-type
+  copies, clobbers the whole destination on partial distinct-local copies (both
+  Anneal-side and 5-step lockstep against `lean-miri`), and rejects
+  uninitialized-source and Tree Borrows-forbidden copies that the vendored hooks
+  allow.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -4075,6 +4082,530 @@ theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers :
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
   ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩⟩
 
+/-- `0x0102_0304_0506_0708_u64` as a `lean-miri` scalar. -/
+def lm42ScalarSrc : Miri.Memory.ScalarInt :=
+  Miri.Memory.ScalarInt.ofUInt64 0x0102030405060708
+
+theorem lm42_scalarRelSrc : ScalarRel ⟨0x0102030405060708, 8⟩ lm42ScalarSrc :=
+  ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+
+/-- `0_u64` as a `lean-miri` scalar. -/
+def lm42ScalarZero : Miri.Memory.ScalarInt :=
+  Miri.Memory.ScalarInt.ofUInt64 0
+
+theorem lm42_scalarRelZero : ScalarRel ⟨0, 8⟩ lm42ScalarZero :=
+  ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+
+/-- `0xFFFF_FFFF_FFFF_FFFF_u64` as a `lean-miri` scalar. -/
+def lm42ScalarMax : Miri.Memory.ScalarInt :=
+  Miri.Memory.ScalarInt.ofUInt64 0xFFFFFFFFFFFFFFFF
+
+theorem lm42_scalarRelMax : ScalarRel ⟨0xFFFFFFFFFFFFFFFF, 8⟩ lm42ScalarMax :=
+  ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+
+/-- 6-local MIR body (`_0 : *const u64, _1 : u64, _2 : u64, _3 : *mut u64,
+_4 : *const u8, _5 : *mut u8`) for 5-step byte-level `copy_nonoverlapping::<u8>`:
+`_0 = &raw const _1; _3 = &raw mut _2; _4 = copy _0 as *const u8;
+_5 = copy _3 as *mut u8; copy_nonoverlapping(copy _4, copy _5, count_usize)`. -/
+def partialCopyLockstepBody (count : Nat) : CapturedMir where
+  defPath := "lm_4_2_witness::partial_copy_lockstep"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [declOf rawConstU64K, declOf u64K, declOf u64K, declOf rawMutU64K,
+    declOf rawConstU8K, declOf rawMutU8K]
+  basicBlocks := [{
+    statements := [
+      mkStmt42 (.assign (local42 0) (.rawPtr .not (local42 1))),
+      mkStmt42 (.assign (local42 3) (.rawPtr .mut (local42 2))),
+      mkStmt42 (.assign (local42 4) (.cast .ptrToPtr (.copy (local42 0)) (tyOf rawConstU8K))),
+      mkStmt42 (.assign (local42 5) (.cast .ptrToPtr (.copy (local42 3)) (tyOf rawMutU8K))),
+      copyStmt 4 5 count]
+    terminator := mkTerm42 .return_
+    isCleanup := false }]
+  fnAbi := Witness.fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Pre-state of `partialCopyLockstepBody` with `_1 = 0x0102_0304_0506_0708_u64`
+and `_2 = dst0`. -/
+def partialCopyLockstepAnnealPre (b : CapturedMir) (dst0 : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨0x0102030405060708, 8⟩),
+          .init (.scalar ⟨dst0, 8⟩), .uninit, .uninit, .uninit] }
+    memory := (initMachineState b []).memory }
+
+def partialCopyLockstepMiriFramePre (b : CapturedMir) (mdst0 : Miri.Memory.ScalarInt) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody b
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy (tyOf rawConstU64K)) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt lm42ScalarSrc))),
+        layout := some (translateTy (tyOf u64K)) },
+      { value := .live (.immediate (.scalar (.fromScalarInt mdst0))),
+        layout := some (translateTy (tyOf u64K)) },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def partialCopyLockstepMiriPre (b : CapturedMir) (mdst0 : Miri.Memory.ScalarInt) :
+    AnnealStepState :=
+  { stack := ⟨#[partialCopyLockstepMiriFramePre b mdst0]⟩, machine := AnnealMachine.empty }
+
+theorem partialCopyLockstep_all_immediate (b : CapturedMir) (mdst0 : Miri.Memory.ScalarInt) :
+    ∀ tf, (partialCopyLockstepMiriPre b mdst0).stack.frames = #[tf] →
+      ∀ k, IsImmediateFrameLocal tf k := by
+  intro tf h k mls hmls mp hmp
+  injection h with h₁; injection h₁ with h₂; subst h₂
+  match k with
+  | 0 | 1 | 2 | 3 | 4 | 5 => simp [partialCopyLockstepMiriFramePre] at hmls; subst hmls; cases hmp
+  | _ + 6 => simp [partialCopyLockstepMiriFramePre] at hmls
+
+theorem partialCopyLockstep_stateRel (count dst0 : Nat) (mdst0 : Miri.Memory.ScalarInt)
+    (hdst0 : ScalarRel ⟨dst0, 8⟩ mdst0) :
+    StateRel (partialCopyLockstepBody count)
+      (partialCopyLockstepAnnealPre (partialCopyLockstepBody count) dst0)
+      (partialCopyLockstepMiriPre (partialCopyLockstepBody count) mdst0) := by
+  let b := partialCopyLockstepBody count
+  refine StateRel.mk (partialCopyLockstepMiriFramePre b mdst0) rfl rfl
+    ⟨translateTy (tyOf rawConstU64K), rfl⟩ ?_
+    rfl rfl rfl rfl rfl (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | 4 | 5 | _ + 6 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 3 | 4 | 5 =>
+    have hs : slot = .uninit := by simpa [partialCopyLockstepAnnealPre, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [partialCopyLockstepMiriFramePre] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = declOf u64K := by simpa [b, partialCopyLockstepBody, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨0x0102030405060708, 8⟩) := by
+      simpa [partialCopyLockstepAnnealPre, get?] using hslot.symm
+    have hm : mls =
+        { value := .live (.immediate (.scalar (.fromScalarInt lm42ScalarSrc))),
+          layout := some (translateTy (tyOf u64K)) } := by
+      simpa [partialCopyLockstepMiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy (tyOf u64K))) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ lm42_scalarRelSrc rfl
+        (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | 2 =>
+    have hd : decl = declOf u64K := by simpa [b, partialCopyLockstepBody, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨dst0, 8⟩) := by
+      simpa [partialCopyLockstepAnnealPre, get?] using hslot.symm
+    have hm : mls =
+        { value := .live (.immediate (.scalar (.fromScalarInt mdst0))),
+          layout := some (translateTy (tyOf u64K)) } := by
+      simpa [partialCopyLockstepMiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy (tyOf u64K))) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ hdst0 rfl
+        (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | _ + 6 => simp [partialCopyLockstepBody, get?] at hdecl
+
+/-- Shared 4-step setup + Step-5 simulation for `partialCopyLockstepBody count`
+(`1 ≤ count ≤ 8`):
+* Steps 1–4 (`_0 = &raw const _1; _3 = &raw mut _2; _4 = copy _0 as *const u8;
+  _5 = copy _3 as *mut u8`) execute in lockstep `StateRelLM3_1` on Stage-1
+  `stepMirFn` and `lean-miri`;
+* At Step 5 (`copy_nonoverlapping::<u8>(copy _4, copy _5, count_usize)`), Stage-1
+  `stepMirFn` always stores the whole source scalar `0x0102_0304_0506_0708_u64`
+  into `_2`, while `stepMirFnLM4_2` and `lean-miri` step in `StepRelLM3_1`
+  lockstep. -/
+theorem partialCopyLockstep_steps4_and_sim
+    (count dst0 : Nat) (mdst0 : Miri.Memory.ScalarInt)
+    (hdst0 : ScalarRel ⟨dst0, 8⟩ mdst0)
+    (hpos : 0 < count) (hle8 : count ≤ 8) :
+    let b := partialCopyLockstepBody count
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+    let s₄ := mkPtrState b 0 4
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    let s₅_stage1 := mkPtrState b 0 5
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    ∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b dst0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b mdst0) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      stepMirFn b s₄ = .step s₅_stage1 ∧
+      StepRelLM3_1 b m₄ [e₂, e₁] (stepMirFnLM4_2 b s₄)
+        (Miri.Interpreter.Step.step hooks () m₄) := by
+  intro b hooks e₁ e₂ ptr1 ptr2 s₄ s₅_stage1
+  have hrel₀ : StateRel b (partialCopyLockstepAnnealPre b dst0)
+      (partialCopyLockstepMiriPre b mdst0) :=
+    partialCopyLockstep_stateRel count dst0 mdst0 hdst0
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have himm₀ : ∀ tf, (partialCopyLockstepMiriPre b mdst0).stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 0 ∧ IsImmediateFrameLocal tf 1 :=
+    fun tf htf =>
+      ⟨partialCopyLockstep_all_immediate b mdst0 tf htf 0,
+       partialCopyLockstep_all_immediate b mdst0 tf htf 1⟩
+  let s₁ := mkPtrState b 0 1
+    [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
+     .uninit, .uninit, .uninit]
+    [e₁.toBorrowEntry] 2
+  have hs₁ : stepMirFn b (partialCopyLockstepAnnealPre b dst0) = .step s₁ := rfl
+  have hsim₁ := step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty
+  rw [hs₁] at hsim₁
+  obtain ⟨m₁, hm₁, hrel₁⟩ := hsim₁.miri_step_of_anneal_step
+  have htag₀ : (partialCopyLockstepAnnealPre b dst0).memory.nextTag = 1 := rfl
+  have hid₀ : (⟨(partialCopyLockstepMiriPre b mdst0).machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = Witness.lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨⟨hsupply₁, hnext₁, hsrc₁⟩, himm₁_step⟩ :=
+    step_rawPtr_addrOf_preserves_supply hrel₀.toLM3_1
+      rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀
+      AllocIdSupplyReady.empty (by show 1 + 1 < 2 ^ 32; decide) (fun h => nomatch h) hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne =>
+      himm₁_step _ tf₁ rfl htf₁ k hne (partialCopyLockstep_all_immediate b mdst0 _ rfl k)
+  let s₂ := mkPtrState b 0 2
+    [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
+     .init ptr2, .uninit, .uninit]
+    [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  have himm₁_pair : ∀ tf₁, m₁.stack.frames = #[tf₁] →
+      IsImmediateFrameLocal tf₁ 3 ∧ IsImmediateFrameLocal tf₁ 2 :=
+    fun tf₁ htf₁ => ⟨himm₁ tf₁ htf₁ 3 (by decide), himm₁ tf₁ htf₁ 2 (by decide)⟩
+  have hsim₂ := step_rawPtr_addrOf_lm3_1_simulation hrel₁ hphase rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_pair hsupply₁
+  rw [hs₂] at hsim₂
+  obtain ⟨m₂, hm₂, hrel₂⟩ := hsim₂.miri_step_of_anneal_step
+  have htag₁ : s₁.memory.nextTag = 2 := rfl
+  have hid₁ : (⟨m₁.machine.memory.nextAllocId, hsupply₁.nonzero⟩ : Miri.Memory.AllocId) =
+      Witness.lm31AllocId2 := by
+    generalize hsupply₁.nonzero = nz; revert nz; rw [hnext₁]; intro _; rfl
+  rw [htag₁, hid₁] at hrel₂
+  obtain ⟨_, himm₂_step⟩ := step_rawPtr_addrOf_preserves_supply hrel₁
+    rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₁_pair hsupply₁
+    (by rw [hnext₁]; show (1 + 1 : UInt32).toNat + 1 < 2 ^ 32; decide)
+    (by rw [hsrc₁]; intro h; cases h) hm₂
+  have himm₂ : ∀ tf₂, m₂.stack.frames = #[tf₂] →
+      ∀ k, k ≠ 1 → k ≠ 2 → IsImmediateFrameLocal tf₂ k := by
+    intro tf₂ htf₂ k hk₁ hk₂
+    obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+    exact himm₂_step tf₁ tf₂ htf₁ htf₂ k hk₂ (himm₁ tf₁ htf₁ k hk₁)
+  let s₃ := mkPtrState b 0 3
+    [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
+     .init ptr2, .init ptr1, .uninit]
+    [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+  have hs₃ : stepMirFn b s₂ = .step s₃ := rfl
+  have hsim₃ := step_cast_ptrToPtr_simulation hrel₂ hphase rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    (fun tf₂ htf₂ =>
+      ⟨himm₂ tf₂ htf₂ 4 (by decide) (by decide), himm₂ tf₂ htf₂ 0 (by decide) (by decide)⟩)
+    (fun _ h => by simp [s₂, mkPtrState, get?] at h)
+  rw [hs₃] at hsim₃
+  obtain ⟨m₃, hm₃, hrel₃⟩ := hsim₃.miri_step_of_anneal_step
+  obtain ⟨_, himm₃_step⟩ := Witness.step_assign_cast_ptrToPtr_preserves hrel₂ rfl rfl hm₃
+  have himm₃ : ∀ tf₃, m₃.stack.frames = #[tf₃] →
+      ∀ k, k ≠ 1 → k ≠ 2 → IsImmediateFrameLocal tf₃ k := by
+    intro tf₃ htf₃ k hk₁ hk₂
+    obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+    exact himm₃_step tf₂ tf₃ htf₂ htf₃ k (himm₂ tf₂ htf₂ k hk₁ hk₂)
+  have hs₄ : stepMirFn b s₃ = .step s₄ := rfl
+  have hsim₄ := step_cast_ptrToPtr_simulation hrel₃ hphase rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    (fun tf₃ htf₃ =>
+      ⟨himm₃ tf₃ htf₃ 5 (by decide) (by decide), himm₃ tf₃ htf₃ 3 (by decide) (by decide)⟩)
+    (fun _ h => by simp [s₃, mkPtrState, get?] at h)
+  rw [hs₄] at hsim₄
+  obtain ⟨m₄, hm₄, hrel₄⟩ := hsim₄.miri_step_of_anneal_step
+  obtain ⟨_, himm₄_step⟩ := Witness.step_assign_cast_ptrToPtr_preserves hrel₃ rfl rfl hm₄
+  have himm₄ : ∀ tf₄, m₄.stack.frames = #[tf₄] →
+      ∀ k, k ≠ 1 → k ≠ 2 → IsImmediateFrameLocal tf₄ k := by
+    intro tf₄ htf₄ k hk₁ hk₂
+    obtain ⟨tf₃, htf₃, _⟩ := id hrel₃
+    exact himm₄_step tf₃ tf₄ htf₃ htf₄ k (himm₃ tf₃ htf₃ k hk₁ hk₂)
+  have hcnt_lt : count < scalarModulus 8 := by
+    have : scalarModulus 8 = 2 ^ 64 := by decide
+    omega
+  have hs₅_stage1 : stepMirFn b s₄ = .step s₅_stage1 :=
+    stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+      (body := b) (s := s₄) (srcIdx := 4) (dstIdx := 5) (pointeeTy := tyOf u8K)
+      (e_s := e₁) (e_d := e₂) (srcBytes := 8)
+      rfl hphase rfl rfl u8_integral.prim rfl rfl rfl rfl rfl rfl rfl rfl
+      (Or.inl ⟨_, rfl, rfl⟩) hpos rfl rfl (by nofun) (Or.inl rfl)
+      (by decide) (by nofun) rfl rfl rfl rfl rfl rfl rfl (by decide) rfl (by decide)
+  have hsim₅ := step_intrinsic_copyNonOverlapping_simulation_same_allocMap (pointeeTy := tyOf u8K)
+    hrel₄ hphase rfl rfl rfl rfl (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 4 (by decide) (by decide))
+    rfl rfl (fun tf₄ htf₄ => himm₄ tf₄ htf₄ 5 (by decide) (by decide))
+    usize_integral (fun tf₄ _ => constInt_wellTyped usize_integral valid8 hcnt_lt rfl b rfl tf₄)
+    u8_copyPointee
+    (by
+      intro _ _ e_s e_d decl_s decl_d _ _ he_s _ he_d _ hd_s hd_d _
+      have hs_ty : decl_s = declOf u64K := by
+        rcases List.mem_cons.mp he_s with rfl | he'
+        · exact Option.some.inj hd_s.symm
+        · rcases List.mem_cons.mp he' with rfl | h
+          · exact Option.some.inj hd_s.symm
+          · cases h
+      have hd_ty : decl_d = declOf u64K := by
+        rcases List.mem_cons.mp he_d with rfl | he'
+        · exact Option.some.inj hd_d.symm
+        · rcases List.mem_cons.mp he' with rfl | h
+          · exact Option.some.inj hd_d.symm
+          · cases h
+      subst hs_ty hd_ty
+      exact Or.inl ⟨⟨.u64, u64_integral⟩, ⟨.u64, u64_integral⟩⟩)
+    (by
+      intro srcPtr dstPtr countSc e_s e_d decl_s decl_d srcBytes dstBytes
+        hsrc hdst hc _ _ he_s het_s he_d het_d hd_s hd_d hrig_s hrig_d _ _ _ _
+      have hpS : srcPtr = { allocId := 1, offsetBytes := 0 } := by
+        simpa [s₄, mkPtrState, ptr1, get?] using hsrc.symm
+      have hpD : dstPtr = { allocId := 2, offsetBytes := 0 } := by
+        simpa [s₄, mkPtrState, ptr2, get?] using hdst.symm
+      have hc' : countSc = ⟨count, 8⟩ := by
+        rcases hc with ⟨cc, hcc, hval⟩ | ⟨_, hidx, _⟩
+        · injection hcc with hcc'; subst hcc'; simpa [constInt] using hval.symm
+        · cases hidx
+      subst hpS hpD hc'
+      have hes : e_s = e₁ := by
+        rcases List.mem_cons.mp he_s with rfl | he'
+        · cases het_s
+        · rcases List.mem_cons.mp he' with rfl | h
+          · rfl
+          · cases h
+      have hed : e_d = e₂ := by
+        rcases List.mem_cons.mp he_d with rfl | he'
+        · rfl
+        · rcases List.mem_cons.mp he' with rfl | h
+          · cases het_d
+          · cases h
+      subst hes hed
+      have hs_ty : decl_s = declOf u64K := Option.some.inj hd_s.symm
+      have hd_ty : decl_d = declOf u64K := Option.some.inj hd_d.symm
+      subst hs_ty hd_ty
+      have hsb : srcBytes = 8 := Option.some.inj hrig_s.symm
+      have hdb : dstBytes = 8 := Option.some.inj hrig_d.symm
+      subst hsb hdb
+      exact ⟨by nofun, Or.inl rfl,
+        by simp [s₄, mkPtrState, e₁, rawPtrAllocMapEntry, get?],
+        Or.inr (by simp [s₄, mkPtrState, e₂, rawPtrAllocMapEntry, get?])⟩)
+    (by
+      intro dstPtr _ e_d hdst _ _ he_d het_d x hx hxl
+      have hpD : dstPtr = { allocId := 2, offsetBytes := 0 } := by
+        simpa [s₄, mkPtrState, ptr2, get?] using hdst.symm
+      subst hpD
+      have hed : e_d = e₂ := by
+        rcases List.mem_cons.mp he_d with rfl | he'
+        · rfl
+        · rcases List.mem_cons.mp he' with rfl | h
+          · cases het_d
+          · cases h
+      subst hed
+      rcases List.mem_cons.mp hx with rfl | hx'
+      · exact Or.inl ⟨rfl, rfl⟩
+      · rcases List.mem_cons.mp hx' with rfl | h
+        · cases hxl
+        · cases h)
+  exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+    hs₅_stage1, hsim₅⟩
+
+/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep`**:
+real 5-step lockstep execution of `partialCopyLockstepBody count` from
+`_1 = 0x0102_0304_0506_0708_u64` and `_2 = dst0` (`_0 = &raw const _1;
+_3 = &raw mut _2; _4 = copy _0 as *const u8; _5 = copy _3 as *mut u8;
+copy_nonoverlapping::<u8>(copy _4, copy _5, count_usize)`):
+1. For `dst0 = 0, count = 2`: Stage-1 `stepMirFn` (via `copyViaBytes`) stores the
+   entire source scalar `0x0102_0304_0506_0708_u64` into `_2`, whereas
+   `lean-miri`'s `Miri.Interpreter.Step.step` steps with `.ok true` to a
+   `StateRelLM3_1`-related state with `_2 = 0x0708_u64`.
+2. For `dst0 = 0xFFFF_FFFF_FFFF_FFFF, count = 1`: Stage-1 `stepMirFn` (via
+   `evalCopySingleDirect`) stores the entire source scalar
+   `0x0102_0304_0506_0708_u64` into `_2`, whereas `lean-miri`'s
+   `Miri.Interpreter.Step.step` steps with `.ok true` to a `StateRelLM3_1`-related
+   state with `_2 = 0xFFFF_FFFF_FFFF_FF08_u64`. -/
+theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep :
+    (let b := partialCopyLockstepBody 2
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (let b := partialCopyLockstepBody 1
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0xFFFFFFFFFFFFFFFF) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarMax) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) := by
+  refine ⟨?_, ?_⟩
+  · obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
+      hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+      hs₅_stage1, hsim₅⟩ :=
+      partialCopyLockstep_steps4_and_sim 2 0 lm42ScalarZero lm42_scalarRelZero
+        (by decide) (by decide)
+    let b := partialCopyLockstepBody 2
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+    let s₄ := mkPtrState b 0 4
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨0, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    let s₅_miri := mkPtrState b 0 5
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init (.scalar ⟨0x0708, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅_miri := rfl
+    rw [hs₅_lm42] at hsim₅
+    obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
+    exact ⟨s₁, s₂, s₃, s₄, _, s₅_miri, m₁, m₂, m₃, m₄, m₅,
+      hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+      hs₅_stage1, rfl, hm₅, hrel₅, rfl⟩
+  · obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
+      hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+      hs₅_stage1, hsim₅⟩ :=
+      partialCopyLockstep_steps4_and_sim 1 0xFFFFFFFFFFFFFFFF lm42ScalarMax lm42_scalarRelMax
+        (by decide) (by decide)
+    let b := partialCopyLockstepBody 1
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+    let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+    let s₄ := mkPtrState b 0 4
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    let s₅_miri := mkPtrState b 0 5
+      [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+       .init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩),
+       .init ptr2, .init ptr1, .init ptr2]
+      [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+    have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅_miri := rfl
+    rw [hs₅_lm42] at hsim₅
+    obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
+    exact ⟨s₁, s₂, s₃, s₄, _, s₅_miri, m₁, m₂, m₃, m₄, m₅,
+      hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+      hs₅_stage1, rfl, hm₅, hrel₅, rfl⟩
+
+/-- **`wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok`** (Stage-1 positive
+multi-element lockstep simulation): real 5-step lockstep execution of
+`partialCopyLockstepBody 8` (`copy_nonoverlapping::<u8>(copy _4, copy _5, 8_usize)`,
+copying `count * size_of::<u8>() = 8 = size_of::<u64>()` bytes from
+`_1 = 0x0102_0304_0506_0708_u64` into `_2 = 0_u64`): Stage-1 `stepMirFn` (via
+`copyViaBytes`) and `lean-miri`'s `Miri.Interpreter.Step.step` step in
+`StateRelLM3_1` lockstep to `_2 = 0x0102_0304_0506_0708_u64`. -/
+theorem wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok :
+    let b := partialCopyLockstepBody 8
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_1 b s₅ m₅ [e₂, e₁] ∧
+      get? s₅.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) := by
+  obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄,
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+    hs₅_stage1, hsim₅⟩ :=
+    partialCopyLockstep_steps4_and_sim 8 0 lm42ScalarZero lm42_scalarRelZero
+      (by decide) (by decide)
+  let b := partialCopyLockstepBody 8
+  let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+  let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+  let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  let ptr2 := Value.ptr { allocId := 2, offsetBytes := 0 } 8
+  let s₄ := mkPtrState b 0 4
+    [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨0, 8⟩),
+     .init ptr2, .init ptr1, .init ptr2]
+    [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+  let s₅ := mkPtrState b 0 5
+    [.init ptr1, .init (.scalar ⟨0x0102030405060708, 8⟩),
+     .init (.scalar ⟨0x0102030405060708, 8⟩),
+     .init ptr2, .init ptr1, .init ptr2]
+    [e₂.toBorrowEntry, e₁.toBorrowEntry] 3
+  have hs₅_lm42 : stepMirFnLM4_2 b s₄ = .step s₅ := rfl
+  rw [hs₅_lm42] at hsim₅
+  obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.miri_step_of_anneal_step
+  exact ⟨s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅,
+    hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄,
+    hs₅_stage1, hm₅, hrel₅, rfl⟩
+
 /-- Body for distinct-local out-of-bounds `copy_nonoverlapping`:
 `_3 = &raw const _1; _4 = &raw mut _2; copy_nonoverlapping(copy _3, copy _4, 2_usize)`,
 copying `16` bytes between the 8-byte locals `_1 : u64` and `_2 : u64`. -/
@@ -4261,6 +4792,67 @@ theorem wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok :
       (Or.inl ⟨_, rfl, rfl⟩) rfl rfl rfl (by nofun) (Or.inl rfl)
       (by decide) (by decide) rfl rfl (by nofun) rfl rfl rfl rfl,
     rfl⟩
+
+/-- **`wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip`**: Stage-1's byte-codec
+(`encodeUntypedValueToBytes` + `decodeValueFromBytes`, used by `copyViaBytes` on
+multi-byte copies) round-trips the concrete `ProvenancePtr` `⟨9, 16⟩` at type
+`*mut u64` with its provenance tag intact. -/
+theorem wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip :
+    let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+    ∃ bs,
+      encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
+      decodeValueFromBytes defaultCodecFuel emptyLayoutTable
+        { kind := rawMutU64K, layoutIdx := 0 } bs = some (.ptr p 8) :=
+  encodeUntypedValueToBytes_ptr_decode_roundtrip { allocId := 9, offsetBytes := 16 }
+    (by decide) .mut u64K 0 emptyLayoutTable rfl
+
+/-- Body for the two-machine `TyId 80` boundary on `copy_nonoverlapping::<*mut u64>`:
+`_2 : *const *mut u64`, `_3 : *mut *mut u64`. -/
+def copyStage1RawPtrBoundaryBody : CapturedMir :=
+  ptr4Body unitK (.rawPtr .not rawMutU64K) (.rawPtr .mut rawMutU64K)
+    [copyStmt 2 3 1] .return_
+
+/-- **`wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary`**: two-machine boundary
+for `copy_nonoverlapping::<*mut u64>`:
+* Stage-1 `stepMirFn` on `copyStage1RawPtrBody` copies `.init (.ptr ⟨9, 16⟩ 8)`
+  into `_2` with its `ProvenancePtr` intact (`wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok`);
+* From the `StateRelLM3_1`-related pre-state `(ptr4AnnealPre b, ptr4MiriPre b unitK)`
+  of `copyStage1RawPtrBoundaryBody`, `lean-miri`'s `Miri.Interpreter.Step.step`
+  under `annealStepHooks` fails closed at `annealPointeeTypeOf 80`
+  (`rawPtrPointeeEncodedTyId? 80 = none` in `Translate.lean:320`) with
+  `StepError.unsupported "pointee of TyId 80 is not encoded"`. -/
+theorem wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary :
+    (let b := copyStage1RawPtrBody
+     let e_p := rawPtrAllocMapEntry b.localDecls b.layouts .mut 0 9 Witness.lm31AllocId1
+     let e_s := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e_d := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+     let s : MachineState := {
+       frame := {
+         blockIdx := 0
+         stmtIdx := 0
+         locals := [.uninit, .init (.ptr p 8), .uninit,
+           .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+           .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] }
+       memory := {
+         emptyMemory with
+         borrows := [e_s.toBorrowEntry, e_d.toBorrowEntry, e_p.toBorrowEntry]
+         nextTag := 10 } }
+     ∃ s', stepMirFn b s = .step s' ∧ get? s'.frame.locals 2 = some (.init (.ptr p 8))) ∧
+    (let b := copyStage1RawPtrBoundaryBody
+     ∃ m',
+       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+         (ptr4MiriPre b unitK) =
+         (m', .error (.unsupported "pointee of TyId 80 is not encoded"))) := by
+  refine ⟨wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok, ?_⟩
+  let b := copyStage1RawPtrBoundaryBody
+  have hrel₀ := (ptr4_stateRel unitK (.rawPtr .not rawMutU64K) (.rawPtr .mut rawMutU64K)
+    [copyStmt 2 3 1] .return_).toLM3_1
+  exact step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
+    hrel₀ rfl rfl rfl rfl (fun tf htf => ptr4_all_immediate b unitK tf htf 2) (by nofun)
+    rfl rfl (fun tf htf => ptr4_all_immediate b unitK tf htf 3) (by nofun)
+    usize_integral (fun tf _ => constInt_wellTyped usize_integral valid8 (by decide) rfl b rfl tf)
+    (Or.inl ⟨_, rfl, rfl⟩)
 
 /-! ## 7. Stage-1 `arith_offset` on provenance-free `.scalar` pointer & `Stage1ExtraIntrinsic` witnesses -/
 

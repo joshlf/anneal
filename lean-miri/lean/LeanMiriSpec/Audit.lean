@@ -23182,6 +23182,156 @@ example :
         (m₁, .error (.unsupported "call of a function other than an AnnealIntrinsic is outside Anneal's intrinsic fragment"))) :=
   WitnessLM4_2.wit_lm4_2_wrapping_add_stage1_extra_boundary
 
+example (p : ProvenancePtr) (hoff : p.offsetBytes < scalarModulus 8)
+    (mutability : Mutability) (pk : RigidTy) (idx : Nat) (layouts : Layout.LayoutTable)
+    (hthin : (match pk with | .slice _ => true | .str => true | .dynamic _ => true | _ => false) =
+      false) :
+    ∃ bs,
+      encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
+      decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .rawPtr mutability pk, layoutIdx := idx } bs = some (.ptr p 8) :=
+  encodeUntypedValueToBytes_ptr_decode_roundtrip p hoff mutability pk idx layouts
+    (by cases pk <;> exact hthin)
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
+    {srcDecl dstDecl : MirAst.LocalDecl} {srcMut dstMut mutability : Mutability} {pk : RigidTy}
+    {countTy : Ty} {countSc : MirAst.ScalarInt}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
+        span⟩)
+    (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
+    (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut (.rawPtr mutability pk))
+    (hsrcImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf srcIdx)
+    (hsrc_live : get? s.frame.locals srcIdx ≠ some .dead)
+    (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
+    (hdstTy : dstDecl.ty.kind = .rawPtr dstMut (.rawPtr mutability pk))
+    (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hcountInt : IsIntegralTy countTy .usize)
+    (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
+    (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc) :
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
+    hstate hbb hstmt hsrcDecl hsrcTy hsrcImm hsrc_live
+    hdstDecl hdstTy hdstImm hdst_live hcountInt hcountOp hcnt_pre
+
+open WitnessLM4_2 in
+example :
+    (let b := partialCopyLockstepBody 2
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (let b := partialCopyLockstepBody 1
+     let hooks := annealStepHooks b.localDecls b.layouts
+     let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+       stepMirFn b (partialCopyLockstepAnnealPre b 0xFFFFFFFFFFFFFFFF) = .step s₁ ∧
+       Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarMax) =
+         (m₁, .ok true) ∧
+       StateRelLM3_1 b s₁ m₁ [e₁] ∧
+       stepMirFn b s₁ = .step s₂ ∧
+       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+       StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+       stepMirFn b s₂ = .step s₃ ∧
+       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+       stepMirFn b s₃ = .step s₄ ∧
+       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+       StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+       stepMirFn b s₄ = .step s₅_stage1 ∧
+       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+       StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
+       get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+
+open WitnessLM4_2 in
+example :
+    let b := partialCopyLockstepBody 8
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b (partialCopyLockstepAnnealPre b 0) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarZero) =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_1 b s₅ m₅ [e₂, e₁] ∧
+      get? s₅.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok
+
+open WitnessLM4_2 in
+example :
+    let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+    ∃ bs,
+      encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
+      decodeValueFromBytes defaultCodecFuel emptyLayoutTable
+        { kind := rawMutU64K, layoutIdx := 0 } bs = some (.ptr p 8) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
+
+open WitnessLM4_2 in
+example :
+    (let b := copyStage1RawPtrBody
+     let e_p := rawPtrAllocMapEntry b.localDecls b.layouts .mut 0 9 Witness.lm31AllocId1
+     let e_s := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+     let e_d := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+     let p : ProvenancePtr := { allocId := 9, offsetBytes := 16 }
+     let s : MachineState := {
+       frame := {
+         blockIdx := 0
+         stmtIdx := 0
+         locals := [.uninit, .init (.ptr p 8), .uninit,
+           .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+           .init (.ptr { allocId := 2, offsetBytes := 0 } 8)] }
+       memory := {
+         emptyMemory with
+         borrows := [e_s.toBorrowEntry, e_d.toBorrowEntry, e_p.toBorrowEntry]
+         nextTag := 10 } }
+     ∃ s', stepMirFn b s = .step s' ∧ get? s'.frame.locals 2 = some (.init (.ptr p 8))) ∧
+    (let b := copyStage1RawPtrBoundaryBody
+     ∃ m',
+       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) ()
+         (ptr4MiriPre b unitK) =
+         (m', .error (.unsupported "pointee of TyId 80 is not encoded"))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
+
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
   sliceScalarBytes
@@ -23238,12 +23388,19 @@ open LeanMiriSpec.Correspondence in
   step_intrinsic_copyNonOverlapping_perm_range_divergence
   evalCopySingleDirect_rawPtr_distinct_ok
   stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
+  mergeByteProvenance_some_left
+  decodeLittleEndianBytes_encodeLittleEndianBytes_some
+  encodeUntypedValueToBytes_ptr_decode_roundtrip
+  step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
   stepMirFn_copyNonOverlapping_stage1_eq_lm4_2
   step_intrinsic_copyNonOverlapping_stage1_simulation_explicit
   step_intrinsic_copyNonOverlapping_stage1_simulation
   step_intrinsic_copyNonOverlapping_stage1_simulation_same_allocMap
   step_intrinsic_copyNonOverlapping_stage1_uninit_src_divergence
   step_intrinsic_copyNonOverlapping_stage1_perm_divergence
+  decodeValueFromBytes_encodeLittleEndianBytes_int
+  evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
+  stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
   stepMirFnLM4_2
   stepMirFnLM4_2_eq_of_not_other
   evalTerminator_stage1_bitcount_call
@@ -23325,8 +23482,15 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.partialCopyDecls
   WitnessLM4_2.partialCopyState
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+  WitnessLM4_2.partialCopyLockstepBody
+  WitnessLM4_2.partialCopyLockstep_steps4_and_sim
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers_lockstep
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_full_bytes_stage1_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_codec_roundtrip
+  WitnessLM4_2.copyStage1RawPtrBoundaryBody
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_rawPtr_stage1_boundary
 
 end StatementPins
 
