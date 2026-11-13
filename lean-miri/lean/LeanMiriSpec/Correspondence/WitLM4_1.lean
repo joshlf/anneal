@@ -101,6 +101,18 @@ local deallocation & `CallId` protector release and root-frame return),
   `step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation`,
   `step_terminator_call_indirect_fnPtr_move_simulation`, and
   `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`.
+* (q) `wit_lm4_1_nounwind_callee_unwind_divergence`: genuine 2-step execution
+  certifying the Stage-1 `FnAbi.canUnwind`-blindness vs. canonical
+  `Call.initStackFrame` unwinding divergence.
+* (r) `wit_lm4_1_reifyFnPointer_chain_layoutCompat_and_directUnwind`: concrete
+  2-step `MultiFrameStateRel` → `ReifyFnPointer` → `IndirectFnPtrMovePre` →
+  `TerminatorKind.call (.move ⟨3, .nil⟩)` → `MultiFrameStateRel` simulation,
+  indirect `FnPtr` ABI mismatch UB (`fn() -> u64` called as `fn() -> u8`),
+  `LayoutCompat` (`usize` vs. `u64`) divergence
+  (`step_terminator_call_indirect_layoutCompat_fnPtr_divergence`), canonical
+  `Miri.Interpreter.FunctionPointers.Registry` lookup bridge, and linked
+  `"core::panicking::panic"` 2-step call + unwind & direct-unwind failed
+  `Assert` / `UnwindTerminate` simulations.
 -/
 
 namespace LeanMiriSpec.Correspondence.WitnessLM4_1
@@ -3256,5 +3268,596 @@ theorem wit_lm4_1_nounwind_callee_unwind_divergence :
           some "unwinding past a frame that does not allow unwinding") := by
   refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, ?_⟩
   decide
+
+/-! ## (r) `ReifyFnPointer` → `IndirectFnPtrMovePre` → Indirect `FnPtr` Call, `LayoutCompat` vs. `rigidTyEq` Divergence, & Linked Panic / Direct-Unwind Simulation -/
+
+def witFnEntryU64 : FnPtrEntry :=
+  { allocId := 1
+    defPath := "crate::callee_u64"
+    typeArgs := []
+    fnSig := some (.fnPtr [] (.uint .u64) .safe .rust) }
+
+def u64TyLM4 : Ty := { kind := .uint .u64, layoutIdx := 0 }
+def u64DeclLM4 : LocalDecl := { mutability := .mut, ty := u64TyLM4, debugName := none }
+def usizeTyLM4 : Ty := { kind := .uint .usize, layoutIdx := 0 }
+def usizeDeclLM4 : LocalDecl := { mutability := .mut, ty := usizeTyLM4, debugName := none }
+def safeFnPtrUsizeTy : Ty := { kind := .fnPtr [] (.uint .usize) .safe .rust, layoutIdx := 0 }
+def safeFnPtrUsizeDecl : LocalDecl := { mutability := .mut, ty := safeFnPtrUsizeTy, debugName := none }
+
+def u64LayoutLM4 : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiU64 : FnAbi :=
+  { args := []
+    ret := { layout := u64LayoutLM4, mode := .direct }
+    conv := .rust
+    canUnwind := true }
+
+def witU64CalleeBody : CapturedMir where
+  defPath := "crate::callee_u64"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64DeclLM4]
+  basicBlocks :=
+    [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+def witUsizeIndirectCallerBody : CapturedMir where
+  defPath := "crate::usize_indirect_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [usizeDeclLM4, usizeDeclLM4, calleeFnDecl, safeFnPtrUsizeDecl]
+  basicBlocks :=
+    [ { statements := []
+        terminator := mkTerm (.call (.move ⟨3, .nil⟩) [] ⟨1, .nil⟩ (some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+def mkWitUsizeIndirectCallerAnneal (slot3 : LocalSlot) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, slot3] }
+    memory :=
+      { callees := [witU64CalleeBody]
+        fnPtrs := [witFnEntryU64]
+        nextProtector := 1 } }
+
+abbrev witUsizeIndirectCallerAnneal : MachineState :=
+  mkWitUsizeIndirectCallerAnneal (.init (.ptr witFnPtrVal 8))
+
+def mkWitUsizeIndirectCallerMiriFrame
+    (ls3 : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody witUsizeIndirectCallerBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := ⟨.Item 0, #[]⟩
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace :=
+      .frameLocal 0 0 none (translateTy usizeTyLM4 emptyLayoutTable) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals :=
+      #[⟨.live (.immediate .uninit), none⟩,
+        ⟨.live (.immediate .uninit), none⟩,
+        ⟨.live (.immediate .uninit), none⟩,
+        ls3]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def mkWitUsizeIndirectCallerMiri
+    (ls3 : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) :
+    AnnealStepState :=
+  { stack := ⟨#[mkWitUsizeIndirectCallerMiriFrame ls3]⟩
+    machine := witFnPtrMachine }
+
+abbrev witUsizeIndirectCallerMiri : AnnealStepState :=
+  mkWitUsizeIndirectCallerMiri ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩
+
+theorem witUsizeIndirectCaller_rel
+    (slot3 : LocalSlot)
+    (ls3 : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
+    (h3 : LocalRel witFnPtrMachine safeFnPtrUsizeDecl emptyLayoutTable slot3 ls3)
+    (hno3 : ∀ mp, ls3.value ≠ .live (.indirect mp)) :
+    MultiFrameStateRel witUsizeIndirectCallerBody
+      (mkWitUsizeIndirectCallerAnneal slot3)
+      (mkWitUsizeIndirectCallerMiri ls3) := by
+  have hfr :
+      FrameRel witUsizeIndirectCallerBody witFnPtrMachine
+        (mkWitUsizeIndirectCallerAnneal slot3).frame
+        (mkWitUsizeIndirectCallerMiriFrame ls3) := by
+    refine ⟨rfl, rfl, rfl, rfl, fun i decl slot mls hdecl hslot hmls => ?_⟩
+    rcases i with _ | ⟨_ | ⟨_ | ⟨_ | i⟩⟩⟩
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact h3
+    · cases hdecl
+  have hlinks :
+      CallerStackLinksRel witUsizeIndirectCallerBody witFnPtrMachine
+        witUsizeIndirectCallerBody
+        (mkWitUsizeIndirectCallerAnneal slot3).frame [] []
+        [mkWitUsizeIndirectCallerMiriFrame ls3] :=
+    .root _ _ [] rfl ⟨translateTy usizeTyLM4 emptyLayoutTable, rfl⟩ hfr
+  have hdisj : MultiFrameAllocDisjoint (mkWitUsizeIndirectCallerMiri ls3).stack.frames := by
+    refine ⟨?_, ?_⟩
+    · intro mf hmf i _ mp₁ _ _ _ _ hi _
+      rcases List.mem_singleton.mp hmf with rfl
+      rcases i with _ | ⟨_ | ⟨_ | ⟨_ | i⟩⟩⟩
+      · cases hi
+      · cases hi
+      · cases hi
+      · injection hi with h; exact False.elim (hno3 mp₁ (congrArg Miri.Interpreter.LocalState.value h))
+      · cases hi
+    · intro f₁ f₂ _ _ _ _ _ _ _ _ hne hf₁ hf₂ _ _
+      rcases f₁ with _ | f₁ <;> rcases f₂ with _ | f₂
+      · exact False.elim (hne rfl)
+      · cases hf₂
+      · cases hf₁
+      · cases hf₁
+  exact .mk _ rfl (fun _ => Or.inl rfl) (fun h => False.elim (h rfl))
+    hlinks.toFrameStackRel hlinks hdisj
+    ⟨by dsimp only [mkWitUsizeIndirectCallerAnneal]; decide,
+     by dsimp only [mkWitUsizeIndirectCallerAnneal]; decide,
+     rfl, rfl, rfl⟩
+    (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
+    (fun _ h => nomatch h) (fun _ h => nomatch h)
+    (BorrowTrackerStackRel.of_none _ _ _)
+
+theorem witUsizeIndirectFnPtr_pre :
+    IndirectFnPtrMovePre witUsizeIndirectCallerBody
+      witUsizeIndirectCallerAnneal
+      witUsizeIndirectCallerMiri
+      (mkWitUsizeIndirectCallerMiriFrame ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)
+      [] 3 safeFnPtrUsizeDecl witFnPtrVal
+      Witness.witnessAllocId Witness.witnessTag Witness.witnessBaseAddr where
+  frames_eq := rfl
+  fn_lt_af := by dsimp only [witUsizeIndirectCallerAnneal, mkWitUsizeIndirectCallerAnneal]; decide
+  fn_lt_mf := by dsimp only [mkWitUsizeIndirectCallerMiriFrame]; decide
+  fn_decl := rfl
+  fn_slot := rfl
+  fn_mls := ⟨none, rfl, fun _ h => nomatch h⟩
+  allocId_eq := rfl
+  baseAddr_lookup := rfl
+  offset_no_wrap := ⟨by decide, by decide⟩
+  not_borrow := rfl
+  deinit_rel :=
+    witUsizeIndirectCaller_rel .uninit
+      ⟨.live (.immediate .uninit),
+       some (translateTy safeFnPtrUsizeDecl.ty emptyLayoutTable)⟩
+      (.immediate .uninit .uninit (some (translateTy safeFnPtrUsizeDecl.ty emptyLayoutTable))
+        (fun _ h => (Option.some.inj h).symm) (Or.inl ⟨rfl, rfl⟩))
+      (fun _ h => nomatch h)
+
+/-- Body exercising 2-step `MultiFrameStateRel` → `ReifyFnPointer` →
+`IndirectFnPtrMovePre` → `TerminatorKind.call (.move ⟨3, .nil⟩)` →
+`MultiFrameStateRel`:
+* `bb0`:
+  - `stmt 0`: `_3 = crate::callee as fn() -> u8 (PointerCoercion(ReifyFnPointer))`
+  - `terminator`: `_1 = call move _3() -> [return: bb1, unwind: continue]`
+* `bb1`: `return` -/
+def witReifyCallerBody : CapturedMir where
+  defPath := "crate::reify_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl, calleeFnDecl, safeFnPtrDecl]
+  basicBlocks :=
+    [ { statements :=
+          [{ kind :=
+               .assign ⟨3, .nil⟩
+                 (.cast (.pointerCoercion "ReifyFnPointer")
+                   calleeFuncOp
+                   safeFnPtrTy)
+             span := "" }]
+        terminator := mkTerm (.call (.move ⟨3, .nil⟩) [] ⟨1, .nil⟩ (some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+  fnAbi := fnAbiU8
+  layouts := emptyLayoutTable
+  allocations := []
+
+def witReifyCallerAnneal0 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, .uninit] }
+    memory :=
+      { callees := [witCalleeBody]
+        fnPtrs := []
+        nextProtector := 1 } }
+
+def witReifyCallerMiriFrame0 :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody witReifyCallerBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := ⟨.Item 0, #[]⟩
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace :=
+      .frameLocal 0 0 none (translateTy u8Ty emptyLayoutTable) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals :=
+      #[⟨.live (.immediate .uninit), none⟩,
+        ⟨.live (.immediate .uninit), none⟩,
+        ⟨.live (.immediate .uninit), none⟩,
+        ⟨.live (.immediate .uninit), none⟩]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def witReifyAllocId : Miri.Memory.AllocId :=
+  ⟨UInt64.ofNat fnPtrAllocBase, by decide⟩
+
+def witReifyFnPtrVal : ProvenancePtr :=
+  { allocId := fnPtrAllocBase, offsetBytes := 0 }
+
+def witReifyFnEntry : FnPtrEntry :=
+  { allocId := fnPtrAllocBase
+    defPath := "crate::callee"
+    typeArgs := []
+    fnSig := some (.fnPtr [] (.uint .u8) .safe .rust) }
+
+def witReifyMachine : AnnealMachine :=
+  { Witness.witnessMachineOf Witness.witnessUninitAlloc with
+    addresses :=
+      { (Witness.witnessMachineOf Witness.witnessUninitAlloc).addresses with
+        baseAddr := #[⟨witReifyAllocId, Witness.witnessBaseAddr⟩] } }
+
+def witReifyCallerMiri0 : AnnealStepState :=
+  { stack := ⟨#[witReifyCallerMiriFrame0]⟩
+    machine := witReifyMachine }
+
+theorem witReifyCaller0_rel :
+    MultiFrameStateRel witReifyCallerBody witReifyCallerAnneal0 witReifyCallerMiri0 := by
+  have hfr :
+      FrameRel witReifyCallerBody witReifyMachine
+        witReifyCallerAnneal0.frame witReifyCallerMiriFrame0 := by
+    refine ⟨rfl, rfl, rfl, rfl, fun i decl slot mls hdecl hslot hmls => ?_⟩
+    rcases i with _ | ⟨_ | ⟨_ | ⟨_ | i⟩⟩⟩
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · cases hdecl
+  have hlinks :
+      CallerStackLinksRel witReifyCallerBody witReifyMachine
+        witReifyCallerBody witReifyCallerAnneal0.frame [] [] [witReifyCallerMiriFrame0] :=
+    .root _ _ [] rfl ⟨translateTy u8Ty emptyLayoutTable, rfl⟩ hfr
+  have hdisj : MultiFrameAllocDisjoint witReifyCallerMiri0.stack.frames := by
+    refine ⟨?_, ?_⟩
+    · intro mf hmf i _ _ _ _ _ _ hi _
+      rcases List.mem_singleton.mp hmf with rfl
+      rcases i with _ | ⟨_ | ⟨_ | ⟨_ | i⟩⟩⟩ <;> cases hi
+    · intro f₁ f₂ _ _ _ _ _ _ _ _ hne hf₁ hf₂ _ _
+      rcases f₁ with _ | f₁ <;> rcases f₂ with _ | f₂
+      · exact False.elim (hne rfl)
+      · cases hf₂
+      · cases hf₁
+      · cases hf₁
+  exact .mk _ rfl (fun _ => Or.inl rfl) (fun h => False.elim (h rfl))
+    hlinks.toFrameStackRel hlinks hdisj
+    ⟨by decide, by decide, rfl, rfl, rfl⟩
+    (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
+    (fun _ h => nomatch h) (fun _ h => nomatch h)
+    (BorrowTrackerStackRel.of_none _ _ _)
+
+/-- Linked `"core::panicking::panic"` body whose entry block is a cleanup block
+that immediately executes `UnwindResume`. -/
+def witLinkedPanicBody : CapturedMir where
+  defPath := "core::panicking::panic"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl]
+  basicBlocks :=
+    [{ statements := [], terminator := mkTerm .unwindResume, isCleanup := true }]
+  fnAbi := { fnAbiU8 with canUnwind := true }
+  layouts := emptyLayoutTable
+  allocations := []
+
+def witLinkedPanicCallAnneal : MachineState :=
+  { frame := { blockIdx := 2, stmtIdx := 0, locals := [.uninit, .uninit] }
+    memory := { callees := [witLinkedPanicBody], nextProtector := 1 } }
+
+theorem witLinkedPanicCall_rel :
+    MultiFrameStateRel witAssertTermPanicBody witLinkedPanicCallAnneal
+      (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩) := by
+  have hfr :
+      FrameRel witAssertTermPanicBody AnnealMachine.empty
+        witLinkedPanicCallAnneal.frame
+        (mkWitAssertTermPanicMiriFrame 2 ⟨.live (.immediate .uninit), none⟩) := by
+    refine ⟨rfl, rfl, rfl, rfl, fun i decl slot mls hdecl hslot hmls => ?_⟩
+    rcases i with _ | ⟨_ | i⟩
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · injection hdecl with hd; subst hd
+      injection hslot with hs; subst hs
+      injection hmls with hm; subst hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    · cases hdecl
+  have hlinks :
+      CallerStackLinksRel witAssertTermPanicBody AnnealMachine.empty
+        witAssertTermPanicBody witLinkedPanicCallAnneal.frame [] []
+        [mkWitAssertTermPanicMiriFrame 2 ⟨.live (.immediate .uninit), none⟩] :=
+    .root _ _ [] rfl ⟨translateTy u8Ty emptyLayoutTable, rfl⟩ hfr
+  have hdisj :
+      MultiFrameAllocDisjoint
+        (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩).stack.frames := by
+    refine ⟨?_, ?_⟩
+    · intro mf hmf i _ _ _ _ _ _ hi _
+      rcases List.mem_singleton.mp hmf with rfl
+      rcases i with _ | ⟨_ | i⟩ <;> cases hi
+    · intro f₁ f₂ _ _ _ _ _ _ _ _ hne hf₁ hf₂ _ _
+      rcases f₁ with _ | f₁ <;> rcases f₂ with _ | f₂
+      · exact False.elim (hne rfl)
+      · cases hf₂
+      · cases hf₁
+      · cases hf₁
+  exact .mk _ rfl (fun _ => Or.inl rfl) (fun h => False.elim (h rfl))
+    hlinks.toFrameStackRel hlinks hdisj
+    ⟨by decide, by decide, rfl, rfl, rfl⟩
+    (ActiveProtectorsValid.nil _) (Nat.zero_lt_succ 0)
+    (fun _ h => nomatch h) (fun _ h => nomatch h)
+    (BorrowTrackerStackRel.of_none _ _ _)
+
+/-- **Witness (r)**:
+1. **2-step `MultiFrameStateRel` → `ReifyFnPointer` → `IndirectFnPtrMovePre` →
+   Indirect `FnPtr` Call → `MultiFrameStateRel`**:
+   starting from `witReifyCaller0_rel` (`MultiFrameStateRel witReifyCallerBody witReifyCallerAnneal0 witReifyCallerMiri0`),
+   Step 1 (`step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation`)
+   interns `"crate::callee"` in `fnPtrs` and establishes `IndirectFnPtrMovePre`,
+   and Step 2 (`step_terminator_call_indirect_fnPtr_move_simulation`) deinitializes
+   `_3` and pushes `witCalleeBody` in lockstep (`StepRelMultiFrame`);
+2. **Indirect `FnPtr` ABI mismatch UB (`fn() -> u64` called as `fn() -> u8`)**:
+   both Stage-1 and `lean-miri` fault with UB in lockstep
+   (`StepRelMultiFrame`);
+3. **Indirect `FnPtr` `LayoutCompat` (`usize` vs. `u64`) divergence**
+   (`step_terminator_call_indirect_layoutCompat_fnPtr_divergence`):
+   calling `fn() -> u64` (`witFnEntryU64`) through `fn() -> usize` faults with
+   `.fail .ub` in Stage-1 (`rigidTyEq (.uint .usize) (.uint .u64) = false`),
+   while `lean-miri` (`annealRigidTyLayoutCompat (.uint .usize) (.uint .u64) = true`)
+   pushes `witU64CalleeBody`;
+4. **Canonical `Miri.Interpreter.FunctionPointers.Registry` bridge**:
+   `((annealFnPtrRegistry [witFnEntrySafe]).extras.find? (·.1 == Witness.witnessAllocId)).map Prod.snd = some witFnEntrySafe`;
+5. **Linked `"core::panicking::panic"` 2-step call + unwind simulation**
+   (`step_terminator_call_linked_panic_unwind_simulation`) and **direct-unwind
+   failed `Assert` & `UnwindTerminate` simulation**
+   (`step_terminator_assert_failed_directUnwind_simulation`,
+   `step_terminator_unwindTerminate_termination_abort_simulation`). -/
+theorem wit_lm4_1_reifyFnPointer_chain_layoutCompat_and_directUnwind :
+    (∃ s₁ m₁ topFrame₁ restMfs,
+      stepMirFn witReifyCallerBody witReifyCallerAnneal0 = .step s₁ ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksForState witReifyCallerBody witReifyCallerAnneal0)
+        () witReifyCallerMiri0 = (m₁, .ok true) ∧
+      lookupFnPtr s₁.memory.fnPtrs fnPtrAllocBase = some witReifyFnEntry ∧
+      IndirectFnPtrMovePre witReifyCallerBody s₁ m₁ topFrame₁ restMfs 3 safeFnPtrDecl
+        witReifyFnPtrVal witReifyAllocId Miri.Memory.BorTag.one Witness.witnessBaseAddr ∧
+      StepRelMultiFrame witReifyCallerBody m₁
+        (stepMirFn witReifyCallerBody s₁)
+        (Miri.Interpreter.Step.step
+          (annealStepHooksForState witReifyCallerBody s₁) () m₁)) ∧
+    StepRelMultiFrame witIndirectCallerBody
+      (mkWitIndirectCallerMiri 2
+        ⟨.live (.immediate .uninit), none⟩
+        ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)
+      (stepMirFn witIndirectCallerBody
+        (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryU64]))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witIndirectCallerBody
+          (mkWitIndirectCallerAnneal 2 .uninit (.init (.ptr witFnPtrVal 8)) [witFnEntryU64]))
+        () (mkWitIndirectCallerMiri 2
+          ⟨.live (.immediate .uninit), none⟩
+          ⟨.live (.immediate (.scalar witFnPtrMiriScalar)), none⟩)) ∧
+    (stepMirFn witUsizeIndirectCallerBody witUsizeIndirectCallerAnneal = .fail .ub ∧
+      ∃ m' calleeMf,
+        Miri.Interpreter.Step.step
+          (annealStepHooksForState witUsizeIndirectCallerBody witUsizeIndirectCallerAnneal)
+          () witUsizeIndirectCallerMiri = (m', .ok true) ∧
+        m'.stack.frames.size = 2 ∧
+        m'.stack.frames.back? = some calleeMf ∧
+        calleeMf.body = translateBody witU64CalleeBody ∧
+        calleeMf.location = .mir ⟨0, 0⟩) ∧
+    ((annealFnPtrRegistry [witFnEntrySafe]).extras.find? (·.1 == Witness.witnessAllocId)).map Prod.snd =
+      some witFnEntrySafe ∧
+    (StepRelMultiFrame witAssertTermPanicBody
+      (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩)
+      (stepMirFn witAssertTermPanicBody witLinkedPanicCallAnneal)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksForState witAssertTermPanicBody witLinkedPanicCallAnneal)
+        () (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩)) ∧
+      ∃ s₁ m₁,
+        stepMirFn witAssertTermPanicBody witLinkedPanicCallAnneal = .step s₁ ∧
+        Miri.Interpreter.Step.step
+          (annealStepHooksForState witAssertTermPanicBody witLinkedPanicCallAnneal)
+          () (mkWitAssertTermPanicMiri 2 ⟨.live (.immediate .uninit), none⟩) = (m₁, .ok true) ∧
+        MultiFrameStateRel witAssertTermPanicBody s₁ m₁ ∧
+        StepRelMultiFrame witAssertTermPanicBody m₁
+          (stepMirFn witAssertTermPanicBody s₁)
+          (Miri.Interpreter.Step.step (annealStepHooksForState witAssertTermPanicBody s₁) () m₁)) ∧
+    (stepMirFn witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit) = .retOutcome .abort ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksWithDirectUnwind witAssertTermPanicBody (mkWitAssertTermPanicAnneal 0 .uninit))
+        () (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩) =
+        (mkWitAssertTermPanicMiri 0 ⟨.live (.immediate .uninit), none⟩,
+         .error (.termination (.abort "panic in a function that cannot unwind"))) ∧
+      (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").report =
+        .abnormalTermination ∧
+      (Miri.Concurrency.TerminationInfo.abort "panic in a function that cannot unwind").isUbReport =
+        false) ∧
+    StepRelMultiFrame witAssertTermPanicBody
+      (mkWitAssertTermPanicMiri 1
+        ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩)
+      (stepMirFn witAssertTermPanicBody
+        (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))))
+      (Miri.Interpreter.Step.step
+        (annealStepHooksWithDirectUnwind witAssertTermPanicBody
+          (mkWitAssertTermPanicAnneal 1 (.init (.scalar (boolToScalar false)))))
+        () (mkWitAssertTermPanicMiri 1
+          ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩)) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · obtain ⟨s₁, m₁, topFrame₁, restMfs, ha₁, hm₁, hblk₁, hstmt₁, hcal₁, hact₁, hfn₁, hpres₁, hpre₁⟩ :=
+      step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
+        witReifyCaller0_rel
+        (fun _ h => nomatch h)
+        (bb := (witReifyCallerBody.basicBlocks[0]))
+        (fnIdx := 3) (fnDecl := safeFnPtrDecl)
+        (defPath := "crate::callee") (span := "")
+        (callerInputs := []) (callerOut := .uint .u8) (callerAbi := .rust)
+        (allocId := fnPtrAllocBase) (mAllocId := witReifyAllocId)
+        (baseAddr := Witness.witnessBaseAddr)
+        rfl rfl rfl rfl rfl rfl rfl rfl
+        (by intro tf htf mls hmls mp hmp
+            injection htf with h; subst h
+            injection hmls with hm; subst hm; nomatch hmp)
+        (by intro h; nomatch h)
+        rfl rfl rfl rfl
+    have hbb₁ :
+        get? (activeMirBody witReifyCallerBody s₁).basicBlocks s₁.frame.blockIdx =
+          some (witReifyCallerBody.basicBlocks[0]) := by
+      rw [hact₁, hblk₁]; rfl
+    have hstmt_none₁ :
+        get? (witReifyCallerBody.basicBlocks[0]).statements s₁.frame.stmtIdx = none := by
+      rw [hstmt₁]; rfl
+    have hstmt_len₁ :
+        s₁.frame.stmtIdx = length (witReifyCallerBody.basicBlocks[0]).statements := by
+      rw [hstmt₁]; rfl
+    have hdest_decl₁ :
+        get? (activeMirBody witReifyCallerBody s₁).localDecls 1 = some u8Decl := by
+      rw [hact₁]; rfl
+    obtain ⟨himm1, hlive1⟩ :=
+      hpres₁ 1 (by
+        intro tf htf
+        injection htf with h; subst h
+        refine ⟨?_, ?_⟩
+        · intro mls hmls mp hmp
+          injection hmls with hm; subst hm; nomatch hmp
+        · intro mls hmls hdead
+          injection hmls with hm; subst hm; nomatch hdead)
+    have hsim₂ :=
+      (step_terminator_call_indirect_fnPtr_move_simulation
+        hpre₁
+        (by rw [hact₁]; exact fun _ h => nomatch h)
+        hbb₁ hstmt_none₁ hstmt_len₁ rfl rfl hdest_decl₁).2.2.2
+        witReifyFnEntry witCalleeBody u8Decl []
+        { statements := [], terminator := mkTerm .return_, isCleanup := false }
+        rfl hfn₁ rfl rfl rfl
+        (by rw [hcal₁]; rfl)
+        rfl rfl rfl rfl
+        (by intro tf htf
+            subst htf
+            exact ⟨CallerDestSlotWf.of_immediate
+              ((himm1.cache_layout hpre₁.fn_lt_mf _).set_immediate _ .uninit),
+              (hlive1.cache_layout hpre₁.fn_lt_mf _).set_immediate _ .uninit⟩)
+        (Or.inl rfl)
+    exact ⟨s₁, m₁, topFrame₁, restMfs, ha₁, hm₁, hfn₁, hpre₁, hsim₂⟩
+  · exact (step_terminator_call_indirect_fnPtr_move_simulation
+      (witIndirectFnPtr_pre [witFnEntryU64])
+      (fun _ h => nomatch h)
+      (bb := { statements := []
+               terminator := mkTerm (.call (.move ⟨3, .nil⟩) [] ⟨1, .nil⟩ (some 3) .continue_)
+               isCleanup := false })
+      (destDecl := u8Decl)
+      rfl rfl rfl rfl rfl rfl).2.2.1
+      witFnEntryU64 rfl rfl rfl rfl rfl
+  · exact step_terminator_call_indirect_layoutCompat_fnPtr_divergence
+      witUsizeIndirectFnPtr_pre
+      (fun _ h => nomatch h)
+      (bb := { statements := []
+               terminator := mkTerm (.call (.move ⟨3, .nil⟩) [] ⟨1, .nil⟩ (some 1) .continue_)
+               isCleanup := false })
+      (destDecl := usizeDeclLM4)
+      (fnEntry := witFnEntryU64) (calleeBody := witU64CalleeBody)
+      (retDecl := u64DeclLM4) (restDecls := [])
+      (calleeBb0 := { statements := [], terminator := mkTerm .return_, isCleanup := false })
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (by intro tf htf
+          subst htf
+          refine ⟨?_, ?_⟩
+          · apply CallerDestSlotWf.of_immediate
+            intro mls hmls mp hmp
+            injection hmls with hm; subst hm; nomatch hmp
+          · intro mls hmls hdead
+            injection hmls with hm; subst hm; nomatch hdead)
+  · exact annealFnPtrRegistry_singleton_find_eq witFnEntrySafe Witness.witnessAllocId rfl
+  · exact step_terminator_call_linked_panic_unwind_simulation
+      witLinkedPanicCall_rel
+      (fun _ h => nomatch h)
+      (bb := { statements := []
+               terminator := mkTerm (.call panicFuncOp [] ⟨0, .nil⟩ none (.cleanup 0))
+               isCleanup := false })
+      (defPath := "core::panicking::panic")
+      (panicBody := witLinkedPanicBody) (retDecl := u8Decl)
+      (panicBb0 := { statements := [], terminator := mkTerm .unwindResume, isCleanup := true })
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
+      (fun _ h => nomatch h)
+      rfl
+      (by intro tf htf
+          apply CallerDestSlotWf.of_immediate
+          intro mls hmls mp hmp
+          injection htf with h; subst h
+          injection hmls with hm; subst hm; nomatch hmp)
+      (by intro tf htf mls hmls hdead
+          injection htf with h; subst h
+          injection hmls with hm; subst hm; nomatch hdead)
+      (Or.inr ⟨0, rfl⟩)
+  · exact step_terminator_unwindTerminate_termination_abort_simulation
+      (witAssertTermPanic_rel 0 .uninit ⟨.live (.immediate .uninit), none⟩
+        (.immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩))
+        (fun _ h => nomatch h))
+      (fun _ h => nomatch h)
+      (bb := { statements := [], terminator := mkTerm .unwindTerminate, isCleanup := true })
+      rfl rfl rfl rfl
+  · have hstate_false :=
+      witAssertTermPanic_rel 1 (.init (.scalar (boolToScalar false)))
+        ⟨.live (.immediate (.scalar (.fromScalarInt (.ofBool false)))), none⟩
+        (.immediate (.init (.scalar (boolToScalar false)))
+          (.scalar (.fromScalarInt (.ofBool false))) none
+          (fun _ h => nomatch h)
+          (Or.inr ⟨.scalar (boolToScalar false), rfl,
+            .scalar (boolToScalar false) (.ofBool false) (ScalarRel.of_boolToScalar false) rfl
+              (fun _ => ⟨rfl, Or.inl rfl⟩) (fun h => nomatch h)⟩))
+        (fun _ h => nomatch h)
+    exact (step_terminator_assert_failed_directUnwind_simulation hstate_false
+      (fun _ h => nomatch h)
+      (bb := { statements := []
+               terminator := mkTerm (.assert (.copy ⟨1, .nil⟩) true 2 (.cleanup 0))
+               isCleanup := false })
+      (condDecl := boolDecl)
+      rfl rfl rfl rfl rfl rfl
+      (by intro tf htf mls hmls mp hmp
+          injection htf with h; subst h
+          injection hmls with hm; subst hm; nomatch hmp)
+      rfl (by decide)).1 0 rfl
 
 end LeanMiriSpec.Correspondence.WitnessLM4_1

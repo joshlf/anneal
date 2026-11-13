@@ -262,12 +262,22 @@ import LeanMiriSpec.Audit
   `unwindFromCallStack_running_releaseCallProtectors`,
   `borrowTree_releaseProtector_full_simulation`,
   `basedNormalTree_releaseProtector_chain3_and_branch3_simulation`, and
-  `cex_end_of_call_foreign_unique_frozen_divergence`), indirect `FnPtr` ABI checks
-  (`annealFnPtrAbiCompatible`, `annealCalleeAbiCompatible`,
-  `annealEvalNonConstCallLM4_1`), and `annealStepHooksLM4_1` /
-  `annealStepHooksForState` / `StepRelMultiFrame`.
-* `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator
-  simulations (`step_terminator_unreachable_ub_simulation`,
+  `cex_end_of_call_foreign_unique_frozen_divergence`), indirect `FnPtr` ABI
+  and layout-compatibility checks (`annealRigidTyLayoutCompat`,
+  `annealRigidTyListLayoutCompat`,
+  `annealRigidTyLayoutCompat_of_rigidTyEq`,
+  `annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq`,
+  `annealFnPtrAbiCompatible`,
+  `annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite`,
+  `annealCalleeAbiCompatible`, `annealEvalNonConstCallLM4_1`), canonical
+  `Miri.Interpreter.FunctionPointers.Registry` bridging (`annealFnPtrRegistry`,
+  `annealFnPtrRegistry_singleton_find_eq`), `ReifyFnPointer` coercion hooks
+  (`annealReifyFnPointerAlloc`, `annealCastHooksLM4_1`,
+  `annealRvalueHooksLM4_1`), and `annealStepHooksLM4_1` /
+  `annealStepHooksForState` / `annealStepHooksWithDirectUnwind` /
+  `StepRelMultiFrame`.
+* `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator and
+  `ReifyFnPointer` simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
   `step_terminator_drop_projected_simulation`,
   `step_terminator_drop_projected_uninit_divergence`,
@@ -280,17 +290,22 @@ import LeanMiriSpec.Audit
   `unwindFromCallStack_miri_multiStep_simulation`,
   `step_terminator_unwindResume_multiFrame_simulation`,
   `step_terminator_unwindTerminate_abort_vs_unsupported`,
+  `step_terminator_unwindTerminate_termination_abort_simulation`,
   `step_terminator_assert_local_simulation`,
+  `step_terminator_assert_failed_directUnwind_simulation`,
   `step_terminator_call_diverging_panic_vs_unlinked`,
+  `step_terminator_call_linked_panic_unwind_simulation`,
   `step_terminator_call_unreachable_unchecked_ub_simulation`,
   `step_terminator_call_simulation`,
   `step_terminator_call_diverging_simulation`,
   `step_terminator_call_fnDef_local_simulation`,
   `step_terminator_call_fnPtr_dangling_or_uninit_ub_simulation`,
-  `step_terminator_call_indirect_fnPtr_move_simulation`, and
-  `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`).
+  `step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation`,
+  `step_terminator_call_indirect_fnPtr_move_simulation`,
+  `step_terminator_call_indirect_unsafe_to_safe_fnPtr_divergence`, and
+  `step_terminator_call_indirect_layoutCompat_fnPtr_divergence`).
 * `LeanMiriSpec.Correspondence.WitLM4_1`: kernel-checked `LM-4.1` witnesses
-  `(a)..(q)` covering multi-frame call/return with `GlobalState.endCall`
+  `(a)..(r)` covering multi-frame call/return with `GlobalState.endCall`
   protector release, `.uninit` `_0` UB, unprojected & projected `Drop` (live vs.
   `.dead` UB on a realistic `ScalarPair` layout, projected-`.uninit` and
   unprojected canonical no-glue `Drop` divergences), `Unreachable` and
@@ -302,8 +317,13 @@ import LeanMiriSpec.Audit
   `UnwindResume` cleanup catch / `.unreachable` unwind ABI UB / root `.panic` vs. UB,
   3-frame `k = 2` `.continue_` unwinding + `UnwindTerminate` + `Assert` + diverging
   panic calls, non-constant `FnDef` local + indirect `FnPtr` calls +
-  `Safety` divergence, and the nounwind-callee unwinding divergence (`(q)`:
-  Stage-1 ignores `FnAbi.canUnwind`, canonical `Call.initStackFrame` does not).
+  `Safety` divergence, the nounwind-callee unwinding divergence (`(q)`:
+  Stage-1 ignores `FnAbi.canUnwind`, canonical `Call.initStackFrame` does not),
+  and 2-step `MultiFrameStateRel` → `ReifyFnPointer` → `IndirectFnPtrMovePre` →
+  indirect `FnPtr` call → `MultiFrameStateRel` + ABI mismatch UB +
+  `LayoutCompat` (`usize` vs. `u64`) divergence + `FunctionPointers.Registry`
+  bridge + linked `"core::panicking::panic"` unwind & direct-unwind failed
+  `Assert` / `UnwindTerminate` (`(r)`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

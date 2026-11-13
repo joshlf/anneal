@@ -2536,13 +2536,128 @@ def annealPushCalleeFrameLM4_1
           | .ok () => (finalState, .ok ())
           | .error e => (finalState, .error (.stack e))
 
+/-- 64-bit target integer ABI classification `(byteWidth, isSigned)` of an
+Anneal `RigidTy`, matching `Miri.Interpreter.LayoutCompat.integer`
+(`LayoutCompat.lean:193-206`, where `ptrSizedInteger = .ok .I64` equates `usize`
+with `u64` and `isize` with `i64`). Note that `char` (`0..=0x10FFFF`) is
+excluded here because `LayoutCompat.checkArgumentCompat` (`LayoutCompat.lean:236`)
+subsequently enforces `ArgAbi.eqAbi` (`validRange` equality), which rejects
+`char` ↔ `u32`. -/
+@[reducible]
+def annealIntAbiOfRigidTy : RigidTy → Option (Nat × Bool)
+  | .uint .u8 => some (1, false)
+  | .uint .u16 => some (2, false)
+  | .uint .u32 => some (4, false)
+  | .uint .u64 | .uint .usize => some (8, false)
+  | .uint .u128 => some (16, false)
+  | .int .i8 => some (1, true)
+  | .int .i16 => some (2, true)
+  | .int .i32 => some (4, true)
+  | .int .i64 | .int .isize => some (8, true)
+  | .int .i128 => some (16, true)
+  | _ => none
+
+/-- Trivial 1-ZST `RigidTy` check matching `Miri.Interpreter.LayoutCompat.hasTrivialAbi`
+(`LayoutCompat.lean:68-75`: `()`, `!`, `FnDef`, and zero-length arrays `[T; 0]`). -/
+@[reducible]
+def isTrivial1ZstRigidTy : RigidTy → Bool
+  | .tuple .nil | .never | .fnDef _ _ | .array _ 0 => true
+  | _ => false
+
+/-- Thin raw-pointer `RigidTy` check matching `Miri.Interpreter.LayoutCompat.thinPointer`
+(`LayoutCompat.lean:185-188, 218-220`: raw pointers `*const T` / `*mut T` to
+sized pointees share `Scalar(Pointer(AddressSpace(0)))` with full `validRange`). -/
+@[reducible]
+def isThinRawPtrRigidTy : RigidTy → Bool
+  | .rawPtr _ pt =>
+    match pt with
+    | .slice _ | .str | .dynamic _ => false
+    | _ => true
+  | _ => false
+
+/-- Runtime ABI layout compatibility between a caller `RigidTy` and a callee
+`RigidTy` on a 64-bit target, relaxing syntactic `rigidTyEq` to match canonical
+`Miri.Interpreter.LayoutCompat.layoutCompat` / `checkArgumentCompat`
+(`LayoutCompat.lean:185-238`):
+1. Syntactically equal types (`rigidTyEq callerTy calleeTy`);
+2. Trivial 1-ZST types (`isTrivial1ZstRigidTy`);
+3. Thin raw pointers to sized pointees (`isThinRawPtrRigidTy`, e.g.,
+   `*const u8` ↔ `*mut u32`);
+4. Same-width, same-signedness integers (`annealIntAbiOfRigidTy`, e.g.,
+   `usize` ↔ `u64` and `isize` ↔ `i64` on 64-bit targets). -/
+@[reducible]
+def annealRigidTyLayoutCompat (callerTy calleeTy : RigidTy) : Bool :=
+  Bool.or
+    (rigidTyEq callerTy calleeTy)
+    (Bool.or
+      (Bool.and (isTrivial1ZstRigidTy callerTy) (isTrivial1ZstRigidTy calleeTy))
+      (Bool.or
+        (Bool.and (isThinRawPtrRigidTy callerTy) (isThinRawPtrRigidTy calleeTy))
+        (match annealIntAbiOfRigidTy callerTy, annealIntAbiOfRigidTy calleeTy with
+         | some (w₁, s₁), some (w₂, s₂) => Bool.and (Nat.beq w₁ w₂) (s₁ == s₂)
+         | _, _ => false)))
+
+/-- Pointwise `annealRigidTyLayoutCompat` over argument type lists. -/
+@[reducible]
+def annealRigidTyListLayoutCompat : List RigidTy → List RigidTy → Bool
+  | .nil, .nil => true
+  | x :: xs, y :: ys =>
+    Bool.and (annealRigidTyLayoutCompat x y) (annealRigidTyListLayoutCompat xs ys)
+  | _, _ => false
+
+theorem annealRigidTyLayoutCompat_of_rigidTyEq
+    {a b : RigidTy} (h : rigidTyEq a b = true) :
+    annealRigidTyLayoutCompat a b = true := by
+  unfold annealRigidTyLayoutCompat
+  rw [h]
+  rfl
+
+theorem annealRigidTyListLayoutCompat_of_rigidTyListEq
+    {xs ys : List RigidTy} (h : rigidTyListEq xs ys = true) :
+    annealRigidTyListLayoutCompat xs ys = true := by
+  induction xs generalizing ys with
+  | nil =>
+    cases ys with
+    | nil => rfl
+    | cons _ _ => cases h
+  | cons x rest ih =>
+    cases ys with
+    | nil => cases h
+    | cons y restY =>
+      unfold rigidTyListEq rigidTyListEqAux at h
+      rcases Bool.and_eq_true_iff.mp h with ⟨hxy, hrest⟩
+      unfold annealRigidTyListLayoutCompat
+      rw [annealRigidTyLayoutCompat_of_rigidTyEq hxy, ih hrest]
+      rfl
+
+/-- `annealRigidTyLayoutCompat` is strictly coarser than syntactic `rigidTyEq`:
+it equates `usize` ↔ `u64`, `isize` ↔ `i64`, and `*const u8` ↔ `*mut u32`
+(where `rigidTyEq = false`), while still rejecting incompatible widths/signedness
+such as `u8` ↔ `u64` and `i32` ↔ `u32`. -/
+theorem annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq :
+    (annealRigidTyLayoutCompat (.uint .usize) (.uint .u64) = true ∧
+      rigidTyEq (.uint .usize) (.uint .u64) = false) ∧
+    (annealRigidTyLayoutCompat (.int .isize) (.int .i64) = true ∧
+      rigidTyEq (.int .isize) (.int .i64) = false) ∧
+    (annealRigidTyLayoutCompat (.rawPtr .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = true ∧
+      rigidTyEq (.rawPtr .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = false) ∧
+    annealRigidTyLayoutCompat (.uint .u8) (.uint .u64) = false ∧
+    annealRigidTyLayoutCompat (.int .i32) (.uint .u32) = false := by
+  decide
+
 /-- Runtime `FnAbi` compatibility check between a function-pointer registry
 entry `fnEntry` and the call site's `RigidTy.fnPtr callerInputs callerOutput _ callerAbi`
-signature (`Call.evalCalleeAndArgs` / `Call.initStackFrame` at `Call.lean:190-197, 254-264`).
+signature (`Call.evalCalleeAndArgs` / `Call.initStackFrame` at `Call.lean:190-197, 254-346`
+and `LayoutCompat.checkArgumentCompat` at `LayoutCompat.lean:208-238`).
 Unlike Stage-1 `fnEntryCompatibleWithCallSite` (`Terminators.lean:244-280`),
-canonical `lean-miri` checks runtime `FnAbi` convention, arity, and argument/return
-types without enforcing HIR/MIR `Safety` (`safetyCompatible`), because `unsafe fn()`
-and `fn()` share an identical runtime `FnAbi` in `rustc`. -/
+canonical `lean-miri`:
+1. checks runtime `FnAbi` convention and arity without enforcing HIR/MIR
+   `Safety` (`safetyCompatible`), because `unsafe fn()` and `fn()` share an
+   identical runtime `FnAbi` in `rustc`;
+2. checks argument and return ABI layout compatibility via
+   `annealRigidTyListLayoutCompat` / `annealRigidTyLayoutCompat` rather than
+   syntactic `rigidTyListEq` / `rigidTyEq` (permitting layout-compatible pairs
+   such as `usize` ↔ `u64`, `isize` ↔ `i64`, and `*const T` ↔ `*mut U`). -/
 def annealFnPtrAbiCompatible
     (fnEntry : FnPtrEntry)
     (callerInputs : List RigidTy)
@@ -2570,10 +2685,84 @@ def annealFnPtrAbiCompatible
              (Bool.and
                (callConvEq callerAbi sigAbi)
                (Bool.and
-                 (rigidTyListEq callerInputs sigInputs)
-                 (rigidTyEq callerOutput sigOutput)))
+                 (annealRigidTyListLayoutCompat callerInputs sigInputs)
+                 (annealRigidTyLayoutCompat callerOutput sigOutput)))
          | .some _ => false))
   Bool.and entryArityOk callerSigOk
+
+/-- Whenever Stage-1's stricter syntactic `fnEntryCompatibleWithCallSite`
+succeeds for a `RigidTy.fnPtr callerInputs callerOutput callerSafety callerAbi`
+call-site type, canonical Miri's layout-based `annealFnPtrAbiCompatible` also
+succeeds. -/
+theorem annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite
+    {fnEntry : FnPtrEntry} {argCount : Nat} {fnTy : Ty}
+    {callerInputs : List RigidTy} {callerOutput : RigidTy}
+    {callerSafety : Safety} {callerAbi : CallConv}
+    (hty : fnTy.kind = .fnPtr callerInputs callerOutput callerSafety callerAbi)
+    (hcompat : fnEntryCompatibleWithCallSite fnEntry argCount (some fnTy) = true) :
+    annealFnPtrAbiCompatible fnEntry callerInputs callerOutput callerAbi argCount = true := by
+  cases fnTy with
+  | mk k lidx =>
+    dsimp only at hty
+    subst hty
+    unfold fnEntryCompatibleWithCallSite at hcompat
+    unfold annealFnPtrAbiCompatible
+    cases hfnSig : fnEntry.fnSig with
+    | none =>
+      rw [hfnSig] at hcompat
+      dsimp only [Bool.true_and] at hcompat ⊢
+      exact hcompat
+    | some sigTy =>
+      rw [hfnSig] at hcompat
+      cases sigTy with
+      | fnPtr sigInputs sigOutput sigSafety sigAbi =>
+        dsimp only [] at hcompat ⊢
+        rcases Bool.and_eq_true_iff.mp hcompat with ⟨hentry, hcaller⟩
+        rw [hentry, Bool.true_and]
+        rcases Bool.and_eq_true_iff.mp hcaller with ⟨hnot_intr, hrest₁⟩
+        rcases Bool.and_eq_true_iff.mp hrest₁ with ⟨harity, hsig⟩
+        rcases Bool.and_eq_true_iff.mp hsig with ⟨hlen, hsig₂⟩
+        rcases Bool.and_eq_true_iff.mp hsig₂ with ⟨hconv, hsig₃⟩
+        rcases Bool.and_eq_true_iff.mp hsig₃ with ⟨_, hsig₄⟩
+        rcases Bool.and_eq_true_iff.mp hsig₄ with ⟨hin, hout⟩
+        rw [hnot_intr, harity, hlen, hconv,
+          annealRigidTyListLayoutCompat_of_rigidTyListEq hin,
+          annealRigidTyLayoutCompat_of_rigidTyEq hout]
+        rfl
+      | _ => cases hcompat
+
+/-- Embed Anneal's `fnPtrs : List FnPtrEntry` table into canonical `lean-miri`'s
+`Miri.Interpreter.FunctionPointers.Registry FnPtrEntry` (`FunctionPointers.lean:16-19`).
+Because `AnnealMachine` (`Translate.lean:923-928`) stores only `memory`,
+`addresses`, and `borrowTracker` (so `AnnealMachine` struct literals across
+`LM-1.1..LM-3.3` stay unchanged), `annealStepHooksLM4_1` takes `fnPtrs` as an
+explicit parameter representing the machine's `FunctionPointers.Registry`. -/
+def annealFnPtrRegistry (fnPtrs : List FnPtrEntry) :
+    Miri.Interpreter.FunctionPointers.Registry FnPtrEntry :=
+  { functions := #[]
+    extras :=
+      (fnPtrs.filterMap fun e =>
+        if h : UInt64.ofNat e.allocId ≠ 0 then
+          some (⟨UInt64.ofNat e.allocId, h⟩, e)
+        else
+          none).toArray }
+
+/-- Looking up `mAllocId` in `(annealFnPtrRegistry [fnEntry]).extras` (as
+`Miri.Interpreter.FunctionPointers.getFnAlloc` does at `FunctionPointers.lean:138`)
+agrees with `lookupFnPtr [fnEntry] mAllocId.value.toNat`. -/
+theorem annealFnPtrRegistry_singleton_find_eq
+    (fnEntry : FnPtrEntry) (mAllocId : Miri.Memory.AllocId)
+    (hid : mAllocId.value.toNat = fnEntry.allocId) :
+    ((annealFnPtrRegistry [fnEntry]).extras.find? (·.1 == mAllocId)).map Prod.snd =
+      lookupFnPtr [fnEntry] mAllocId.value.toNat := by
+  have hu64 : UInt64.ofNat fnEntry.allocId = mAllocId.value := by
+    rw [← hid, UInt64.ofNat_toNat]
+  have hnz : UInt64.ofNat fnEntry.allocId ≠ 0 := by
+    rw [hu64]; exact mAllocId.nonzero
+  have halloc_eq : (⟨UInt64.ofNat fnEntry.allocId, hnz⟩ : Miri.Memory.AllocId) = mAllocId := by
+    cases mAllocId; simp [hu64]
+  unfold annealFnPtrRegistry lookupFnPtr
+  simp [hnz, halloc_eq, hid]
 
 /-- Runtime `FnAbi` compatibility between a resolved `fnEntry : FnPtrEntry` and
 the linked `calleeBody : CapturedMir` (`Call.initStackFrame` at `Call.lean:254-264`,
@@ -2769,6 +2958,122 @@ def annealEvalCallLM4_1
                   argImms stateAfterArgs
         | _, _ => (state, .error (.invalidProgram "mismatched call terminator"))
 
+/-- Resolve the function-pointer allocation (`Miri.Interpreter.FunctionPointers.functionPointer`
+at `FunctionPointers.lean:117-118`, invoked by `Miri.Interpreter.Cast.cast` on
+`.PointerCoercion (.ReifyFnPointer _) .Implicit` at `Cast.lean:336-341`) for the
+active `StatementKind.assign _ (.cast (.pointerCoercion ck) op targetTy)` statement
+of `currentBody`, mirroring Stage-1 `evalReifyFnPointer` (`Places.lean:13784-13926`):
+1. Validates `isReifyFnPointerCoercion ck = true`, `stringEq ck "UnsafeFnPointer" = false`,
+   `targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi`,
+   `callConvEq fnAbi .rustIntrinsic = false`,
+   `reifyCoercionSafetyCompatible ck fnSafety = true`,
+   `extractReifyCoercionTarget? ck (operandTy currentBody.localDecls currentBody.layouts op) = some (defPath, [])`,
+   and `checkCalleeSig callees defPath fnInputs fnOutput fnAbi [] [] = true`;
+2. Resolves the interned function allocation ID
+   `allocId := match findFnPtrEntry? fnPtrs defPath [] (some targetTy.kind) with | some existing => existing.allocId | none => nextFnPtrAllocId fnPtrs`;
+3. Looks up `mAllocId := ⟨UInt64.ofNat allocId, _⟩`'s base address in
+   `st.machine.addresses` (caching `annealStackBaseAddr mAllocId` when absent) and
+   returns `⟨Miri.ABI.Size.ofBytes baseAddr, some (.concrete mAllocId Miri.Memory.BorTag.one)⟩`. -/
+def annealReifyFnPointerAlloc
+    (currentBody : CapturedMir)
+    (callees : List CapturedMir)
+    (fnPtrs : List FnPtrEntry) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Memory.Pointer (Option AnnealProv)) :=
+  fun st =>
+    match st.stack.currentFrame? with
+    | none => .error (.stack .emptyStack) st
+    | some frame =>
+      match frame.location with
+      | .unwinding _ => .error .expectedMirLocation st
+      | .mir loc =>
+        match get? currentBody.basicBlocks loc.block with
+        | none => .error (.invalidBlock loc.block) st
+        | some bb =>
+          match get? bb.statements loc.statementIndex with
+          | some { kind := .assign _ (.cast (.pointerCoercion ck) op targetTy), .. } =>
+            if !isReifyFnPointerCoercion ck || stringEq ck "UnsafeFnPointer" then
+              .error (.unsupported "non-ReifyFnPointer coercion") st
+            else
+              match targetTy.kind with
+              | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
+                if callConvEq fnAbi .rustIntrinsic || !reifyCoercionSafetyCompatible ck fnSafety then
+                  .error (.undefinedBehavior "invalid ReifyFnPointer target ABI or safety") st
+                else
+                  match extractReifyCoercionTarget? ck (operandTy currentBody.localDecls currentBody.layouts op) with
+                  | some (defPath, []) =>
+                    if !checkCalleeSig callees defPath fnInputs fnOutput fnAbi [] [] then
+                      .error (.undefinedBehavior "ReifyFnPointer callee signature mismatch") st
+                    else
+                      let allocId : Nat :=
+                        match findFnPtrEntry? fnPtrs defPath [] (some targetTy.kind) with
+                        | some existing => existing.allocId
+                        | none => nextFnPtrAllocId fnPtrs
+                      if h : UInt64.ofNat allocId ≠ 0 then
+                        let mAllocId : Miri.Memory.AllocId := ⟨UInt64.ofNat allocId, h⟩
+                        match st.machine.lookupBaseAddr mAllocId with
+                        | some baseAddr =>
+                          .ok ⟨Miri.ABI.Size.ofBytes (baseAddr + UInt64.ofNat 0),
+                               some (.concrete mAllocId Miri.Memory.BorTag.one)⟩ st
+                        | none =>
+                          let baseAddr := annealStackBaseAddr mAllocId
+                          let addresses' :=
+                            { st.machine.addresses with
+                              baseAddr := #[⟨mAllocId, baseAddr⟩] ++ st.machine.addresses.baseAddr }
+                          .ok ⟨Miri.ABI.Size.ofBytes (baseAddr + UInt64.ofNat 0),
+                               some (.concrete mAllocId Miri.Memory.BorTag.one)⟩
+                            { st with machine := { st.machine with addresses := addresses' } }
+                      else
+                        .error (.invalidProgram "ReifyFnPointer allocId wrap") st
+                  | _ => .error (.undefinedBehavior "ReifyFnPointer source is not monomorphic fnDef") st
+              | _ => .error (.undefinedBehavior "ReifyFnPointer target is not fnPtr") st
+          | _ => .error (.invalidProgram "expected ReifyFnPointer statement") st
+
+/-- `CastHooks` for `LM-4.1`, extending `annealCastHooks` with
+`CastKind.PointerCoercion (.ReifyFnPointer _) .Implicit` (`Miri.Interpreter.Cast.cast`
+at `Cast.lean:336-341`). -/
+def annealCastHooksLM4_1
+    (currentBody : CapturedMir)
+    (callees : List CapturedMir := .nil)
+    (fnPtrs : List FnPtrEntry := .nil) :
+    Miri.Interpreter.CastHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  { annealCastHooks currentBody.layouts with
+    typeInfo := fun _ tyId =>
+      if tyId == 51 then
+        pure (.fnDefinition 0 #[])
+      else
+        match castTypeInfoOfEncodedTyId tyId with
+        | .ok info => pure info
+        | .error err => throw err
+    resolveFunction := fun _ _ _ => pure (some ⟨.Item 0, #[]⟩)
+    functionPointer := fun _ _ => annealReifyFnPointerAlloc currentBody callees fnPtrs
+    writePointer := fun _ ptr dest =>
+      match ptr.provenance with
+      | some prov =>
+        annealWriteImmediate
+          (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨ptr.offset, prov⟩))
+          dest
+      | none =>
+        throw (.invalidProgram "ReifyFnPointer produced provenance-free pointer") }
+
+/-- `RvalueHooks` for `LM-4.1`, extending `annealRvalueHooks` with
+`annealCastHooksLM4_1` (`ReifyFnPointer` function-pointer casts). -/
+def annealRvalueHooksLM4_1
+    (currentBody : CapturedMir)
+    (callees : List CapturedMir := .nil)
+    (fnPtrs : List FnPtrEntry := .nil) :
+    Miri.Interpreter.RvalueHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  { annealRvalueHooks currentBody.localDecls currentBody.layouts with
+    cast := fun c src kind ty dest =>
+      Miri.Interpreter.Cast.cast (annealCastHooksLM4_1 currentBody callees fnPtrs) c 16 src kind ty dest }
+
 /-- `TerminatorHooks` for `LM-4.1`, extending `annealTerminatorHooks` with
 `annealControlHooksLM4_1`, `annealEvalCallLM4_1` (including non-constant `FnDef`
 and indirect `FnPtr` calls), `annealEvalDropLM4_1`, and `assertPanic` returning
@@ -2814,6 +3119,11 @@ def annealStepHooksLM4_1
       Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
   { annealStepHooks currentBody.localDecls currentBody.layouts with
+    assign := fun choice place rvalue state =>
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace
+          (annealRvalueHooksLM4_1 currentBody callees fnPtrs) choice rvalue place)
+        state
     returnFromCurrentFrame := fun choice unwinding state =>
       Miri.Interpreter.ControlFlow.returnFromCurrentFrame
         (annealControlHooksLM4_1 currentBody.localDecls currentBody.layouts poppedFrame)
@@ -2836,6 +3146,78 @@ def annealStepHooksForState (rootBody : CapturedMir) (s : MachineState) :
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
   annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees
     (annealPoppedFrameState s) s.memory.fnPtrs
+
+/-- `ControlHooks` variant (`annealControlHooksWithDirectUnwind`) where
+`unwindTerminate` halts with `StepError.termination (.abort "panic in a function that cannot unwind")`
+(`Miri.Concurrency.TerminationInfo.abort` at `Termination.lean:21`, matching Miri's
+`shims/panic.rs` abnormal termination outcome and Stage-1 `MirStepNode.retOutcome .abort`
+at `Terminators.lean:643, 681, 3004`). -/
+def annealControlHooksWithDirectUnwind
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (poppedFrame : Miri.TreeBorrows.FrameState := {}) :
+    Miri.Interpreter.ControlHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.Operand AnnealProv) :=
+  { annealControlHooksLM4_1 localDecls layouts poppedFrame with
+    unwindTerminate := fun _ _ state =>
+      (state, .error (.termination (.abort "panic in a function that cannot unwind"))) }
+
+/-- `TerminatorHooks` variant (`annealTerminatorHooksWithDirectUnwind`) where:
+1. `toControlHooks` uses `annealControlHooksWithDirectUnwind`
+   (`unwindTerminate` -> `StepError.termination (.abort ...)`), and
+2. `assertPanic` dispatches `Miri.Interpreter.ControlFlow.unwindToBlock` directly
+   on the assertion's `UnwindAction` (`ControlFlow.lean:42-60`), matching Stage-1
+   `Trusted`'s lang-item-free `applyUnwindAction` (`Terminators.lean:3272`). -/
+def annealTerminatorHooksWithDirectUnwind
+    (currentBody : CapturedMir)
+    (callees : List CapturedMir := .nil)
+    (poppedFrame : Miri.TreeBorrows.FrameState := {})
+    (fnPtrs : List FnPtrEntry := .nil) :
+    Miri.Interpreter.TerminatorHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.Operand AnnealProv)
+      (Miri.Interpreter.RvalueImmTy AnnealProv) :=
+  let ctrlHooks :=
+    annealControlHooksWithDirectUnwind currentBody.localDecls currentBody.layouts poppedFrame
+  { annealTerminatorHooksLM4_1 currentBody callees poppedFrame fnPtrs with
+    toControlHooks := ctrlHooks
+    assertPanic := fun choice _ unwind state =>
+      Miri.Interpreter.ControlFlow.unwindToBlock ctrlHooks choice unwind state }
+
+/-- `StepHooks` variant (`annealStepHooksWithDirectUnwind`) pairing
+`annealControlHooksWithDirectUnwind` and `annealTerminatorHooksWithDirectUnwind`
+for direct `applyUnwindAction` simulation on failed assertions and
+`TerminationInfo.abort` simulation on `.terminate` unwinding. -/
+def annealStepHooksWithDirectUnwind
+    (rootBody : CapturedMir)
+    (s : MachineState) :
+    Miri.Interpreter.StepHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  let currentBody := activeMirBody rootBody s
+  let poppedFrame := annealPoppedFrameState s
+  { annealStepHooksForState rootBody s with
+    returnFromCurrentFrame := fun choice unwinding state =>
+      Miri.Interpreter.ControlFlow.returnFromCurrentFrame
+        (annealControlHooksWithDirectUnwind currentBody.localDecls currentBody.layouts poppedFrame)
+        choice unwinding state
+    terminator := fun choice term state =>
+      Miri.Interpreter.ControlFlow.evalTerminator
+        (annealTerminatorHooksWithDirectUnwind currentBody s.memory.callees poppedFrame s.memory.fnPtrs)
+        choice term state }
 
 /-- A `k`-step (`k ≥ 1`) execution trace of `Miri.Interpreter.Step.step` for
 multi-frame stack unwinding where every step `i` uses the exact
