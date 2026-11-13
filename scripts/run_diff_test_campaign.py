@@ -914,33 +914,82 @@ def evaluate_itree_red_flags(
             )
     # `itree-difftest` emits one finding per diverging distinct trace, tagged with
     # that trace's `TraceReplayDiag` tag, so the findings must reproduce the
-    # non-`ok` `diag_tag_counts` exactly and name each trace (`case_ident`) once: a
-    # finding carrying another trace's tag would be fingerprinted and quarantined
-    # under the wrong class.
+    # non-`ok` `diag_tag_counts` exactly, cover `diverge_candidates` distinct
+    # `fn_name`s, carry distinct `finding_id`s, and name each batch trace
+    # (`case_ident`) once unless `assign_minimized_traces` reused a shrunk
+    # witness trace across findings of the same `(fn_name, diag_tag)` with
+    # `shrink_status == "minimized"`.
     finding_tags: dict[str, int] = {}
-    seen_cases: set[str] = set()
+    finding_fns: set[str] = set()
+    seen_finding_ids: set[str] = set()
+    duplicate_finding_ids: set[str] = set()
+    seen_unminimized_cases: set[str] = set()
+    seen_minimized_case_owner: dict[str, tuple[str, str]] = {}
     duplicate_cases: set[str] = set()
+    repr_mismatches: list[str] = []
     for f in findings:
         if not isinstance(f, dict):
             continue
+        fid = f.get("finding_id")
+        if isinstance(fid, str):
+            if fid in seen_finding_ids:
+                duplicate_finding_ids.add(fid)
+            seen_finding_ids.add(fid)
+        fn_name = f.get("fn_name")
+        if isinstance(fn_name, str) and fn_name.strip():
+            finding_fns.add(fn_name.strip())
         tag = f.get("diag_tag")
         if isinstance(tag, str):
             finding_tags[tag] = finding_tags.get(tag, 0) + 1
+            diag_repr = f.get("diag_repr")
+            if isinstance(diag_repr, str):
+                clean_repr = diag_repr.strip()
+                while clean_repr.startswith("(") and clean_repr.endswith(")"):
+                    clean_repr = clean_repr[1:-1].strip()
+                expected_prefix = f"TraceReplayDiag.{tag}"
+                if clean_repr != expected_prefix and not clean_repr.startswith(
+                    f"{expected_prefix} "
+                ):
+                    repr_mismatches.append(f"{fid}:{tag}!={diag_repr!r}")
         case_ident = f.get("case_ident")
         if isinstance(case_ident, str):
-            if case_ident in seen_cases:
-                duplicate_cases.add(case_ident)
-            seen_cases.add(case_ident)
+            if (
+                f.get("shrink_status") == "minimized"
+                and isinstance(fn_name, str)
+                and isinstance(tag, str)
+            ):
+                owner = (fn_name, tag)
+                prev_owner = seen_minimized_case_owner.get(case_ident)
+                if case_ident in seen_unminimized_cases or (
+                    prev_owner is not None and prev_owner != owner
+                ):
+                    duplicate_cases.add(case_ident)
+                seen_minimized_case_owner[case_ident] = owner
+            else:
+                if (
+                    case_ident in seen_unminimized_cases
+                    or case_ident in seen_minimized_case_owner
+                ):
+                    duplicate_cases.add(case_ident)
+                seen_unminimized_cases.add(case_ident)
     tag_mismatches = {
         tag: (finding_tags.get(tag, 0), int(diag_counts.get(tag, 0)))
         for tag in sorted(set(diag_counts) | set(finding_tags))
         if tag != "ok" and finding_tags.get(tag, 0) != int(diag_counts.get(tag, 0))
     }
-    if tag_mismatches or duplicate_cases:
+    if tag_mismatches or duplicate_cases or duplicate_finding_ids or repr_mismatches:
         oracle_invoked = False
         reasons.append(
             f"itree_oracle_not_invoked: findings per diag_tag (findings, diag_tag_counts) "
-            f"{tag_mismatches} disagree or repeat traces {sorted(duplicate_cases)}"
+            f"{tag_mismatches} disagree, repeat traces {sorted(duplicate_cases)}, "
+            f"repeat finding_ids {sorted(duplicate_finding_ids)}, or mismatch diag_repr "
+            f"{repr_mismatches}"
+        )
+    if finding_fns and len(finding_fns) != diverge_cands:
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: findings cover {len(finding_fns)} distinct "
+            f"candidate fn_name(s) ({sorted(finding_fns)}) != diverge_candidates ({diverge_cands})"
         )
 
     non_zero_compared = compared > 0 and distinct_traces > 0
@@ -1337,8 +1386,20 @@ def count_distinct_miri_errored_items(summary: dict[str, Any]) -> int:
                 continue
             m_tag = entry.get("miri_outcome")
             a_tag = entry.get("anneal_outcome")
-            if (isinstance(m_tag, str) and m_tag.startswith(MIRI_ERROR_TAG_PREFIXES)) or (
-                isinstance(a_tag, str) and a_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES)
+            lean_tag = entry.get("anneal_lean_tag")
+            if (
+                (isinstance(m_tag, str) and m_tag.startswith(MIRI_ERROR_TAG_PREFIXES))
+                or (isinstance(a_tag, str) and a_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES))
+                or (isinstance(lean_tag, str) and normalize_anneal_tag(lean_tag) == "none")
+                or (
+                    isinstance(m_tag, str)
+                    and isinstance(a_tag, str)
+                    and classify_oracle_outcome_tags(m_tag, a_tag)
+                    in (
+                        ("not_compared", "miri_oracle_error"),
+                        ("not_compared", "capture_failed"),
+                    )
+                )
             ):
                 item_errored += 1
     return max(
@@ -2000,18 +2061,48 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
         )
 
     # `miri-difftest` emits exactly one finding per diverging item, named after the
-    # item and carrying the item's divergence class (its outcome tags may be the
-    # shrunk `repro.rs` ones, so only the class is compared). Dedup and quarantine
-    # judge divergences by their findings alone, so a finding attributed to the
-    # wrong item, or a divergence without its finding, would hide that divergence.
+    # item, attributed to that item's `seed_name` (`fn_name == seed_name` or
+    # `fn_name.startswith(f"{seed_name}__")`), and carrying outcome tags and a
+    # `anneal_lean_tag` that reproduce the item's `divergence_class`. Dedup and
+    # quarantine judge divergences by their findings alone, so a finding attributed
+    # to the wrong item/seed/Lean tag, or a divergence without its finding, would
+    # hide that divergence.
     findings = summary.get("findings")
     if isinstance(findings, list):
         findings_per_item: dict[str, int] = {}
+        is_identity = summary.get("mode") == "identity"
         for idx, finding in enumerate(findings):
             fn_name = finding.get("fn_name") if isinstance(finding, dict) else None
             if not isinstance(fn_name, str):
                 continue  # `validate_performed_miri_summary` rejects such findings
             findings_per_item[fn_name] = findings_per_item.get(fn_name, 0) + 1
+            seed_name = finding.get("seed_name")
+            if (
+                not isinstance(seed_name, str)
+                or not seed_name.strip()
+                or (seed_name != fn_name and (is_identity or seed_name in items))
+            ):
+                reasons.append(
+                    f"item_accounting_mismatch: findings[{idx}] for {fn_name!r} has "
+                    f"inconsistent seed_name {seed_name!r}"
+                )
+            f_miri = finding.get("miri_outcome")
+            f_anneal = finding.get("anneal_outcome")
+            f_div_cls = finding.get("divergence_class")
+            if isinstance(f_miri, str) and isinstance(f_anneal, str):
+                f_verdict, f_sub = classify_oracle_outcome_tags(f_miri, f_anneal)
+                if f_verdict != "diverge" or f_sub != f_div_cls:
+                    reasons.append(
+                        f"item_accounting_mismatch: findings[{idx}] outcomes "
+                        f"({f_miri!r}, {f_anneal!r}) classify as {f_verdict}:{f_sub} "
+                        f"instead of diverge:{f_div_cls}"
+                    )
+                if "anneal_lean_tag" in finding:
+                    f_lean_prob = _anneal_lean_tag_problem(
+                        f"findings[{idx}]", f_anneal, finding.get("anneal_lean_tag")
+                    )
+                    if f_lean_prob is not None:
+                        reasons.append(f_lean_prob)
             recomputed = item_verdicts.get(fn_name)
             if recomputed is None:
                 if fn_name not in items:
@@ -2024,10 +2115,10 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                     f"item_accounting_mismatch: findings[{idx}] reports a divergence of "
                     f"{fn_name!r}, whose outcomes classify as {recomputed[0]}:{recomputed[1]}"
                 )
-            elif finding.get("divergence_class") != recomputed[1]:
+            elif f_div_cls != recomputed[1]:
                 reasons.append(
                     f"item_accounting_mismatch: findings[{idx}] gives {fn_name!r} "
-                    f"divergence_class {finding.get('divergence_class')!r}, but its outcomes "
+                    f"divergence_class {f_div_cls!r}, but its outcomes "
                     f"classify as diverge:{recomputed[1]}"
                 )
         for name, (verdict, detail) in sorted(item_verdicts.items()):
@@ -2037,6 +2128,8 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                     f"item_accounting_mismatch: item {name!r} diverges ({detail}) but has "
                     f"{count} findings instead of exactly 1"
                 )
+    elif "findings" in summary or any(v == "diverge" for v, _ in item_verdicts.values()):
+        reasons.append("item_accounting_mismatch: findings is missing or not a list")
 
     compiled = summary.get("compiled_candidates")
     if isinstance(compiled, int) and not isinstance(compiled, bool) and len(items) != compiled:
@@ -2142,12 +2235,15 @@ def load_known_corpus_bug_seeds(
     tests = data.get("tests", [])
     if not isinstance(tests, list):
         return set()
+    today = utc_date_prefix()
     seeds: set[str] = set()
-    for entry in tests:
+    for idx, entry in enumerate(tests):
         if isinstance(entry, dict) and isinstance(entry.get("known_anneal_bug"), dict):
-            name = entry.get("name")
-            if isinstance(name, str) and name.strip():
-                seeds.add(name.strip())
+            q_entry = _quarantine_known_bug_entry(f"tests[{idx}]", entry)
+            if q_entry.in_force(today):
+                name = entry.get("name")
+                if isinstance(name, str) and name.strip():
+                    seeds.add(name.strip())
     return seeds
 
 
@@ -2221,6 +2317,8 @@ def _expires_as_iso_text(expires: Any) -> Any:
     text, so it is judged exactly like the quoted form; any other value is
     returned unchanged."""
     if isinstance(expires, datetime.datetime):
+        if expires.tzinfo is not None:
+            expires = expires.astimezone(datetime.timezone.utc)
         return expires.date().isoformat()
     if isinstance(expires, datetime.date):
         return expires.isoformat()
@@ -2489,6 +2587,25 @@ def _resolved_ledger_fingerprints(ledger: dict[str, Any]) -> set[str]:
     return resolved
 
 
+def _strip_outer_parens(raw_tag: str) -> str:
+    clean = raw_tag.strip()
+    while clean.startswith("(") and clean.endswith(")"):
+        clean = clean[1:-1].strip()
+    return clean
+
+
+def _known_bug_tags_match(observed: str, expected_obs: str) -> bool:
+    """Checks whether `observed` matches `expected_obs`: outer parentheses are
+    stripped on both sides, and `MirDiffTag.normalScalar <bits> <size>` only
+    collapses to `MirDiffTag.normalScalar` when `expected_obs` itself is the
+    unparameterized `MirDiffTag.normalScalar`."""
+    obs_clean = _strip_outer_parens(observed)
+    exp_clean = _strip_outer_parens(expected_obs)
+    if exp_clean == "MirDiffTag.normalScalar":
+        return normalize_anneal_tag(obs_clean) == "MirDiffTag.normalScalar"
+    return obs_clean == exp_clean
+
+
 def _known_bug_eval_problem(
     obs_tag: Any, ev: Any, expected_div_class: str | None = None
 ) -> str | None:
@@ -2513,7 +2630,7 @@ def _known_bug_eval_problem(
                 f"({ev!r}), so the open bug was not reproduced"
             )
         if isinstance(obs_tag, str) and obs_tag.strip():
-            if normalize_anneal_tag(ev_clean) != normalize_anneal_tag(obs_tag):
+            if not _known_bug_tags_match(ev_clean, obs_tag):
                 return f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, got {ev!r}"
         return None
     if not isinstance(ev, dict):
@@ -2551,14 +2668,17 @@ def _known_bug_eval_problem(
                 "stale_known_anneal_bug_unconfirmed: evaluation lacks an Anneal outcome tag "
                 f"to confirm {obs_tag!r}"
             )
-        if not any(
-            normalize_anneal_tag(t) == normalize_anneal_tag(obs_tag) for t in candidate_tags
-        ):
+        if not any(_known_bug_tags_match(t, obs_tag) for t in candidate_tags):
             return (
                 f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
                 f"got {candidate_tags[0]!r}"
             )
     if expected_div_class is not None:
+        if verdict != "diverge":
+            return (
+                "stale_known_anneal_bug_divergence_class_mismatch: "
+                f"expected divergence {expected_div_class!r}, got verdict {verdict!r}"
+            )
         observed_div_cls = ev.get("divergence_class")
         if (
             (not isinstance(observed_div_cls, str) or not observed_div_cls.strip())

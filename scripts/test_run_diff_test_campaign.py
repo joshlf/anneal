@@ -5449,5 +5449,241 @@ class PassA1AdversarialRegressionTest(unittest.TestCase):
                     self.assertIn("oracle_errors_exceeded", detail)
 
 
+class PassB2AdversarialRegressionTest(unittest.TestCase):
+    """Regression tests for Pass B2 audit findings across ITree shrunk trace reuse,
+    Miri finding seed_name/outcome/Lean-tag cross-checks, distinct errored-item
+    counting, scalar known-bug tag matching, and UTC offset expiry dates."""
+
+    def test_itree_shrunk_multi_trace_candidate_reusing_minimized_case_ident_passes(self) -> None:
+        fp = "CallBoundaryOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+        with tempfile.TemporaryDirectory() as tmp:
+            # When one ITree candidate originally had 2 diverging traces (`itree_f0`,
+            # `itree_f1`) and `assign_minimized_traces` (`itree_eval.rs`) shrank both
+            # (`shrink_status == "minimized"`) to a 1-trace minimized witness
+            # (`case_b0_c0__kernel_step_t0`), both findings belong to `b0_c0__kernel_step`
+            # (`diverge_candidates == 1`, `agree_candidates == 7`) and share the minimized
+            # `case_ident` while keeping distinct `finding_id`s.
+            shrunk = make_healthy_itree_report(Path(tmp), fingerprints=[fp, fp])
+            shrunk["diverge_candidates"] = 1
+            shrunk["agree_candidates"] = 7
+            for f in shrunk["findings"]:
+                f["fn_name"] = "b0_c0__kernel_step"
+                f["case_ident"] = "case_b0_c0__kernel_step_t0"
+                f["shrink_status"] = "minimized"
+            red = campaign.evaluate_itree_red_flags(shrunk, 0x20020002, {}, 50.0)
+            self.assertTrue(red.passed, red.failure_reasons)
+
+            # Duplicate `finding_id` is rejected even when `shrink_status == "minimized"`.
+            dup_fid = copy.deepcopy(shrunk)
+            dup_fid["findings"][1]["finding_id"] = dup_fid["findings"][0]["finding_id"]
+            red_fid = campaign.evaluate_itree_red_flags(dup_fid, 0x20020002, {}, 50.0)
+            self.assertFalse(red_fid.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("repeat finding_ids" in r for r in red_fid.failure_reasons),
+                red_fid.failure_reasons,
+            )
+
+            # Sharing `case_ident` across two different candidates (`b0_c0` and `b0_c1`)
+            # is rejected even when both claim `shrink_status == "minimized"`.
+            cross_cand = make_healthy_itree_report(Path(tmp), fingerprints=[fp, fp])
+            for f in cross_cand["findings"]:
+                f["case_ident"] = "case_shared_t0"
+                f["shrink_status"] = "minimized"
+            red_cross = campaign.evaluate_itree_red_flags(cross_cand, 0x20020002, {}, 50.0)
+            self.assertFalse(red_cross.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("repeat traces ['case_shared_t0']" in r for r in red_cross.failure_reasons),
+                red_cross.failure_reasons,
+            )
+
+            # `diverge_candidates` disagreeing with the number of distinct `fn_name`s in
+            # `findings` or `diag_repr` disagreeing with `diag_tag` is rejected.
+            bad_cand_count = copy.deepcopy(shrunk)
+            bad_cand_count["diverge_candidates"] = 2
+            bad_cand_count["agree_candidates"] = 6
+            red_cnt = campaign.evaluate_itree_red_flags(bad_cand_count, 0x20020002, {}, 50.0)
+            self.assertFalse(red_cnt.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("distinct candidate fn_name(s)" in r for r in red_cnt.failure_reasons),
+                red_cnt.failure_reasons,
+            )
+
+            bad_repr = make_healthy_itree_report(Path(tmp), fingerprints=[fp])
+            bad_repr["findings"][0]["diag_repr"] = "TraceReplayDiag.step_faulted"
+            red_repr = campaign.evaluate_itree_red_flags(bad_repr, 0x20020002, {}, 50.0)
+            self.assertFalse(red_repr.checks["itree_oracle_invoked"])
+            self.assertTrue(
+                any("mismatch diag_repr" in r for r in red_repr.failure_reasons),
+                red_repr.failure_reasons,
+            )
+
+    def test_miri_finding_cannot_spoof_seed_name_or_lean_tag_to_quarantine_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("pub fn ub_item() {}\n", encoding="utf-8")
+
+            def fresh() -> dict:
+                return _with_one_reported_missed_ub(
+                    _with_consistent_item_outcomes(_make_valid_miri_summary(), direct_call="agree"),
+                    repro,
+                )
+
+            # 1. Keeping `fn_name = "ub_item"` while spoofing `seed_name = "pass_item_0"`
+            #    would let a quarantine rule on `pass_item_0` hide `ub_item`.
+            spoof_seed = fresh()
+            spoof_seed["findings"][0]["seed_name"] = "pass_item_0"
+            reasons_seed = campaign.audit_item_outcomes_against_summary(spoof_seed)
+            self.assertTrue(
+                any("inconsistent seed_name 'pass_item_0'" in r for r in reasons_seed),
+                reasons_seed,
+            )
+
+            # 2. Spoofing `anneal_lean_tag` on `findings[0]` (`MirDiffTag.normalScalar 0 4`
+            #    when `anneal_outcome` is `pass:unit`) or spoofing `findings[0]` outcomes
+            #    that do not classify as `diverge:missed_ub` is caught.
+            spoof_tag = fresh()
+            spoof_tag["findings"][0]["anneal_lean_tag"] = "(MirDiffTag.normalScalar 0 4)"
+            reasons_tag = campaign.audit_item_outcomes_against_summary(spoof_tag)
+            self.assertTrue(
+                any("findings[0]" in r and "does not match anneal_outcome" in r for r in reasons_tag),
+                reasons_tag,
+            )
+
+            spoof_outcomes = fresh()
+            spoof_outcomes["findings"][0]["miri_outcome"] = "pass:scalar:1:4"
+            spoof_outcomes["findings"][0]["anneal_outcome"] = "pass:scalar:2:4"
+            spoof_outcomes["findings"][0]["anneal_lean_tag"] = "(MirDiffTag.normalScalar 2 4)"
+            reasons_out = campaign.audit_item_outcomes_against_summary(spoof_outcomes)
+            self.assertTrue(
+                any("classify as diverge:wrong_value instead of diverge:missed_ub" in r for r in reasons_out),
+                reasons_out,
+            )
+
+    def test_count_distinct_miri_errored_items_counts_lean_tag_none_and_malformed_tags(self) -> None:
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        summary["item_outcomes"]["pass_direct_fn_call"]["anneal_lean_tag"] = "none"  # type: ignore[index]
+        summary["item_outcomes"]["pass_item_0"]["miri_outcome"] = "pass:unit@unexpected_span"  # type: ignore[index]
+        self.assertEqual(campaign.count_distinct_miri_errored_items(summary), 2)
+
+    def test_known_bug_eval_preserves_parameterized_scalar_tag_and_requires_diverge_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_scalar = Path(tmp) / "manifest_scalar.toml"
+            m_scalar.write_text(
+                '[[tests]]\n'
+                'name = "scalar_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "(MirDiffTag.normalScalar 42 4)"\n'
+                'divergence_class = "wrong_value"\n'
+                'summary = "returns 42 instead of 7"\n',
+                encoding="utf-8",
+            )
+            # Exact scalar value/size matches.
+            ok_audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_scalar,
+                manifest_eval_results={
+                    "scalar_bug": {
+                        "verdict": "diverge",
+                        "miri_outcome": "pass:scalar:7:4",
+                        "anneal_outcome": "pass:scalar:42:4",
+                        "anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+                    }
+                },
+            )
+            self.assertTrue(ok_audit["passed"], ok_audit)
+
+            # A different scalar value `(MirDiffTag.normalScalar 99 8)` must NOT match
+            # `(MirDiffTag.normalScalar 42 4)`.
+            drifted_audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_scalar,
+                manifest_eval_results={
+                    "scalar_bug": {
+                        "verdict": "diverge",
+                        "miri_outcome": "pass:scalar:7:4",
+                        "anneal_outcome": "pass:scalar:99:8",
+                        "anneal_lean_tag": "(MirDiffTag.normalScalar 99 8)",
+                    }
+                },
+            )
+            self.assertFalse(drifted_audit["passed"])
+            self.assertIn(
+                "stale_known_anneal_bug_tag_mismatch",
+                drifted_audit["stale_known_anneal_bugs"][0]["reason"],
+            )
+
+            # An entry with `divergence_class = "missed_ub"` evaluated as `not_compared`
+            # did not diverge and must fail closed.
+            m_div = Path(tmp) / "manifest_div.toml"
+            m_div.write_text(
+                '[[tests]]\n'
+                'name = "ub_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.unsupported"\n'
+                'divergence_class = "missed_ub"\n'
+                'summary = "tracked"\n',
+                encoding="utf-8",
+            )
+            nc_audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_div,
+                manifest_eval_results={
+                    "ub_bug": {
+                        "verdict": "not_compared",
+                        "miri_outcome": "ub@src/lib.rs:3:5",
+                        "anneal_outcome": "unsupported@src/lib.rs:3:5: 3:9",
+                        "anneal_lean_tag": "MirDiffTag.unsupported",
+                    }
+                },
+            )
+            self.assertFalse(nc_audit["passed"])
+            self.assertIn(
+                "stale_known_anneal_bug_divergence_class_mismatch",
+                nc_audit["stale_known_anneal_bugs"][0]["reason"],
+            )
+
+    def test_load_known_corpus_bug_seeds_requires_in_force_entry_and_utc_offset_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "active_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "active"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "incomplete_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'status = "missing tag and summary"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "expired_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "expired"\n'
+                'expires = 2020-01-01\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                campaign.load_known_corpus_bug_seeds(Path(tmp), m_file), {"active_bug"}
+            )
+            # Offset-aware TOML datetime `2026-11-13T01:00:00+05:00` is `2026-11-12T20:00:00Z`
+            # in UTC, so on UTC reference date `2026-11-13` it is expired.
+            q_file = Path(tmp) / "q.toml"
+            q_file.write_text(
+                '[[quarantined]]\n'
+                'fingerprint = "seed_tz:missed_ub"\n'
+                'expires = 2026-11-13T01:00:00+05:00\n'
+                'reason = "expired in UTC"\n',
+                encoding="utf-8",
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file, reference_date="2026-11-13"
+            )
+            self.assertFalse(audit["passed"])
+            self.assertEqual(
+                audit["stale_quarantine_entries"][0]["reason"],
+                "expired_quarantine_entry: expires 2026-11-12 < 2026-11-13",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
