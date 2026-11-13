@@ -838,11 +838,19 @@ def defaultInlineAsmOptions : Miri.MIR.InlineAsmOptions :=
     raw := false
     mayUnwind := false }
 
-/-- The `core::intrinsics` items whose calls Anneal's
-`MirSemantics.evalTerminator` evaluates inline (`exact_div`, and every intrinsic
-of `MirSemantics.evalInlineIntrinsicCall?`) and whose translated calls
-`annealCallHooks` dispatches through `lean-miri`'s
-`Miri.Interpreter.Intrinsics.eval` (`LM-4.2`). -/
+/-- The `core::intrinsics` items whose translated calls `annealCallHooks`
+dispatches through `lean-miri`'s `Miri.Interpreter.Intrinsics.eval` (`LM-4.2`).
+
+Stage-1 `Trusted` evaluates only some of them inline: `exact_div`
+(`isDirectExactDivTarget`) and `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`,
+`cttz`, `cttz_nonzero`, `bswap`, `bitreverse`, `saturating_add`, and
+`saturating_sub` (`classifyRustIntrinsic?`, `Terminators.lean:898`). Stage-1
+turns unlinked calls of `write_bytes`, `rotate_left`, `rotate_right`, and
+`wrapping_offset` into external calls (`MirStepNode.extCall`,
+`stepMirFn_stage1_unmodeled_intrinsic_extCall`). Conversely, Stage-1 also
+evaluates intrinsics that are not `AnnealIntrinsic`s (`wrapping_add` / `_sub` /
+`_mul`, `unchecked_*`, `three_way_compare`, `size_of_val`, `align_of_val`,
+`ub_checks`, `const_eval_select`), on which `annealCallHooks` fails closed. -/
 inductive AnnealIntrinsic where
   | exactDiv
   | writeBytes
@@ -954,7 +962,13 @@ def all : List AnnealIntrinsic :=
 
 /-- Recognize an intrinsic by the canonical `DefPath` of its function item (and
 `std::intrinsics::arith_offset` / `wrapping_offset` aliases), with the same byte
-comparison (`stringEq`) that `MirSemantics.evalTerminator` uses. -/
+comparison (`stringEq`) that `MirSemantics.evalTerminator` uses.
+
+`core::intrinsics::wrapping_offset` and the `std::intrinsics::*` aliases are not
+canonical intrinsic `DefPath`s (rustc-capture records the defining
+`core::intrinsics::*` path, and `<*const T>::wrapping_offset` is a library method
+whose body calls `arith_offset`); Stage-1 `classifyRustIntrinsic?` recognizes none
+of them (`stage1_std_offset_aliases_unclassified`). -/
 def ofDefPath? (p : DefPath) : Option AnnealIntrinsic :=
   match all.find? (fun k => stringEq p k.defPath) with
   | some k => some k

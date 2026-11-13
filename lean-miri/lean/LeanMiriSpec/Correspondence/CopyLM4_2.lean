@@ -13,25 +13,38 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 /-!
 # `copy_nonoverlapping` Statement Simulation for `LM-4.2`
 
-One-step correspondence between Anneal's `stepMirFn` (`evalCopyNonOverlapping` /
-`evalCopyNonOverlappingWithCount` / `evalCopyRootIntScalars`) and `lean-miri`'s
+> **Anneal side of §2–§7 is the pre-Stage-1 reference model, not Stage-1
+> `Trusted`.** Every `StepRelLM3_1` theorem below whose Anneal side is
+> `stepMirFnLM4_2` (`evalCopyNonOverlappingLM4_2` /
+> `evalCopyNonOverlappingWithCountLM4_2` / `evalCopyRootIntScalars`, defined in
+> `CallLM4_2.lean`) relates `lean-miri` to that reference model only. Stage-1
+> `evalCopyNonOverlapping` (`Statements.lean:1739`) disagrees with it on (at least)
+> zero-count misaligned copies, out-of-bounds distinct-local copies, same-local
+> disjoint sub-range copies, and cross-type single-element copies, each of which
+> `WitLM4_2.lean` §6 certifies as a concrete Stage-1 divergence from `lean-miri`.
+> §8 holds the only Stage-1 statement of this file, an Anneal-side evaluation
+> lemma (no Stage-1 lockstep simulation for `copy_nonoverlapping` exists yet).
+
+One-step correspondence between the pre-Stage-1 reference model's
+`evalCopyNonOverlappingLM4_2` and `lean-miri`'s
 `Miri.Interpreter.Step.step` (`Intrinsics.evalNondiverging (.CopyNonOverlapping ...)` /
 `annealCopyEval` / `annealCheckPtrAlign` / `annealMemCopy`) from `StateRelLM3_1`:
 
 * `step_intrinsic_copyNonOverlapping_simulation` (and its explicit-`allocMap'`
   counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`) proves
-  `StepRelLM3_1` lockstep across:
+  `StepRelLM3_1` lockstep (reference model vs `lean-miri`) across:
   1. uninitialized or dead `src`, `dst`, or `count` operands (UB in both);
   2. `count * size_of::<T>() > isize::MAX` (`isizeMaxBytes`) overflow (UB in
      both);
   3. misaligned `src` or `dst` (`offset % align_of::<T>() ≠ 0`), including when
-     `count = 0` or `size_of::<T>() = 0` (UB in both);
+     `count = 0` or `size_of::<T>() = 0` (UB in both; Stage-1 instead steps when
+     `count = 0`);
   4. aligned zero-byte copy (`count * size_of::<T>() = 0`), including on
      provenance-free, dead, or out-of-bounds pointers (no-op step preserving
      `StateRelLM3_1` in both);
   5. positive-byte copy with provenance-free `.scalar` `src` or `dst`, dead
      source or destination stack local, or out-of-bounds byte range (UB in
-     both);
+     both; Stage-1 instead steps on out-of-bounds distinct-local copies);
   6. positive-byte copy on overlapping byte ranges of the same live initialized
      allocation (`e_src.localIdx = e_dst.localIdx` with
      `srcStart < dstStart + total` and `dstStart < srcStart + total`): overlap UB
@@ -43,8 +56,10 @@ One-step correspondence between Anneal's `stepMirFn` (`evalCopyNonOverlapping` /
      of the same local, and `.bool` / `.char` same-type copies) with valid
      Tree Borrows permissions: copies `rawBytes`, `InitMask`, and
      `ProvenanceMap` byte-for-byte, invalidates conflicting borrows on `dst`,
-     and preserves `StateRelLM3_1`.
-* Characterized real-step divergences:
+     and preserves `StateRelLM3_1` (Stage-1 instead rejects same-tag disjoint
+     sub-ranges and copies whole source values across pointee types).
+* Characterized real-step divergences (which persist on Stage-1, see
+  `WitLM4_2.lean` §6):
   - `step_intrinsic_copyNonOverlapping_uninit_src_divergence`: copying from an
     `.uninit` scalar stack local rejects in Anneal (`MirStepNode.fail .ub`)
     while `lean-miri`'s untyped `Allocation.copyRepeatedly` copies uninitialized
@@ -6658,7 +6673,7 @@ theorem step_intrinsic_copyNonOverlapping_perm_range_divergence
           exact ⟨_, copyStep_miri_ok hframes hfr.body_eq hfr.location_eq hfr₃.location_eq
             hbb hstmt hm_act⟩
 
-/-! ## 8. Stage-1 `Trusted` Provenance-Preserving `CopyNonOverlapping` Simulation -/
+/-! ## 8. Stage-1 `Trusted` Provenance-Preserving `CopyNonOverlapping` Evaluation (Anneal Side Only) -/
 
 /-- Stage-1 `evalCopySingleDirect` (`Statements.lean:1464`) on a raw-pointer
 pointee type (`pointeeKind = .rawPtr mut pk`) copies `.init (.ptr p 8)` from
@@ -6717,22 +6732,27 @@ theorem evalCopySingleDirect_rawPtr_distinct_ok
   rw [hopS, hopD]; dsimp only [sameRigidTyShape]
   rw [writePlaceValue_root_ok hval_ok hslot_d hne_dead_d]
 
-/-- **`step_intrinsic_copyNonOverlapping_stage1_rawPtr_simulation` (`LM-4.2`)**:
-positive Stage-1 provenance-preserving `CopyNonOverlapping` forward simulation
-over **Stage-1 `stepMirFn`** (`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`).
-When `src` and `dst` are raw pointers to a raw-pointer pointee type `.rawPtr mutability pk`
-at root offset `0`, `count = 1`, `src` targets local `e_s.localIdx` holding
-`.init (.ptr p 8)` (`PtrRel allocMap p mptr`), and `dst` targets a distinct live
-local `e_d.localIdx` (`decl_d.ty.kind = .rawPtr mutability pk`), Stage-1 `stepMirFn`
-copies `.init (.ptr p 8)` into `e_d.localIdx` **preserving `ProvenancePtr` `p`
-intact** (`PtrRel allocMap p mptr`). -/
-theorem step_intrinsic_copyNonOverlapping_stage1_rawPtr_simulation
-    {body : CapturedMir} {s : MachineState} {allocMap : List AllocMapEntry}
+/-- **`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance` (`LM-4.2`,
+Stage-1, Anneal side only)**: one Stage-1 `stepMirFn` step
+(`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`) of
+`copy_nonoverlapping::<*mut T>(src, dst, 1)` when `src` and `dst` are raw pointers to
+a raw-pointer pointee type `.rawPtr mutability pk` at root offset `0`, `src`
+targets local `e_s.localIdx` holding `.init (.ptr p 8)`, and `dst` targets a
+distinct live local `e_d.localIdx` (`decl_d.ty.kind = .rawPtr mutability pk`):
+Stage-1 copies `.init (.ptr p 8)` into `e_d.localIdx` with its `ProvenancePtr` `p`
+intact.
+
+This is **not** a lockstep simulation: it says nothing about `lean-miri`. A
+Stage-1 `StepRelLM3_1` simulation of pointer-valued copies additionally needs a
+relation for memory-backed locals holding provenance-carrying pointers, which
+`StateRelLM3_1` (scalar-only `StackScalarAllocShape`) does not provide. -/
+theorem stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
+    {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
     {srcDecl dstDecl decl_d : LocalDecl} {srcMut dstMut mutability : Mutability} {pk : RigidTy}
-    {srcPtr dstPtr p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    {srcPtr dstPtr p : ProvenancePtr}
     {countSc : MirAst.ScalarInt} {e_s e_d : AllocMapEntry} {slot_d : LocalSlot}
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
@@ -6755,7 +6775,6 @@ theorem step_intrinsic_copyNonOverlapping_stage1_rawPtr_simulation
     (hne_tag : srcPtr.tag ≠ dstPtr.tag)
     (hne_loc : e_s.localIdx ≠ e_d.localIdx)
     (hslot_s : get? s.frame.locals e_s.localIdx = some (.init (.ptr p 8)))
-    (hptrRel : PtrRel allocMap p mptr)
     (hslot_d : get? s.frame.locals e_d.localIdx = some slot_d)
     (hne_dead_d : slot_d ≠ .dead)
     (hdecl_d : get? body.localDecls e_d.localIdx = some decl_d)
@@ -6767,9 +6786,7 @@ theorem step_intrinsic_copyNonOverlapping_stage1_rawPtr_simulation
         (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.ptr p 8)))
           { s.memory with
             borrows := invalidateConflictingBorrows s.memory.borrows e_d.localIdx
-              (some dstPtr.tag) }) ∧
-      PtrRel allocMap p mptr := by
-  refine ⟨?_, hptrRel⟩
+              (some dstPtr.tag) }) := by
   have hstep : stepMirFn body s =
       evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp
         body.localDecls body.layouts := by

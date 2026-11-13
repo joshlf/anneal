@@ -18,34 +18,45 @@ import LeanMiriSpec.Correspondence.CopyLM4_2
 /-!
 # Intrinsic Simulation for `LM-4.2`
 
-One-step correspondence between Anneal's `stepMirFn` and `lean-miri`'s
+One-step correspondence between Anneal and `lean-miri`'s
 `Miri.Interpreter.Step.step` (under `annealStepHooks`) for the non-diverging
-intrinsic statements and the inline intrinsic calls of `LM-4.2`:
+intrinsic statements and the inline intrinsic calls of `LM-4.2`.
+
+**Over Stage-1 `Trusted` `stepMirFn`:**
 
 * `step_intrinsic_assume_simulation`: `StatementKind.intrinsic (.assume op)`.
-* `step_intrinsic_copyNonOverlapping_simulation`:
-  `StatementKind.intrinsic (.copyNonOverlapping src dst count)` (with explicit
-  `allocMap'` counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`
-  and characterized divergences
-  `step_intrinsic_copyNonOverlapping_uninit_src_divergence` and
-  `step_intrinsic_copyNonOverlapping_perm_divergence`; proved in `CopyLM4_2`).
 * `call_intrinsic_exact_div_simulation`: `core::intrinsics::exact_div`.
-* `call_intrinsic_write_bytes_simulation`: `core::intrinsics::write_bytes`
-  (with `call_intrinsic_write_bytes_simulation_explicit` and Tree Borrows
-  permission divergence `call_intrinsic_write_bytes_perm_divergence`; proved in
-  `WriteBytesLM4_2`).
-* `call_intrinsic_offset_simulation`: `core::intrinsics::arith_offset`,
-  `std::intrinsics::arith_offset`, `core::intrinsics::wrapping_offset`, and
-  `std::intrinsics::wrapping_offset` (to which
-  `core::ptr::{const_ptr,mut_ptr}::wrapping_offset` lowers in `Runtime(PostCleanup)`
-  MIR; proved in `OffsetLM4_2`).
-* `call_intrinsic_bitops_simulation`: bundles
-  `call_intrinsic_bitcount_simulation` (`ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
-  `cttz_nonzero`, `bswap`, `bitreverse`), `call_intrinsic_saturating_simulation`
-  (`saturating_add`, `saturating_sub`), and `call_intrinsic_rotate_simulation`
-  (`rotate_left` / `rotate_right`, a characterized divergence where `lean-miri`
-  fails closed and Anneal's inline evaluation matches `BitVec.rotateLeft` /
-  `BitVec.rotateRight` with modular shift masking and a `ScalarRel` certificate).
+* `call_intrinsic_arithOffset_stage1_simulation`: `core::intrinsics::arith_offset`
+  (proved in `OffsetLM4_2`).
+* `call_intrinsic_bitcount_simulation` (`ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
+  `cttz_nonzero`, `bswap`, `bitreverse`) and `call_intrinsic_saturating_simulation`
+  (`saturating_add`, `saturating_sub`), bundled in
+  `call_intrinsic_bitops_simulation`.
+* `call_intrinsic_rotate_stage1_boundary`: `rotate_left` / `rotate_right`, which
+  Stage-1 turns into an external call while `lean-miri` fails closed (both
+  machines leave the intrinsic to their environment / fallback boundary).
+
+**Over the pre-Stage-1 reference model `stepMirFnLM4_2` only** (see
+`CallLM4_2.lean`; these do **not** describe Stage-1):
+
+* `step_intrinsic_copyNonOverlapping_simulation` (with explicit `allocMap'`
+  counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`; proved in
+  `CopyLM4_2`). Stage-1 `evalCopyNonOverlapping` diverges from the reference
+  model, see `WitLM4_2.lean` §6. The characterized divergences
+  `step_intrinsic_copyNonOverlapping_uninit_src_divergence` and
+  `step_intrinsic_copyNonOverlapping_perm_divergence` persist on Stage-1
+  (`wit_lm4_2_copy_nonoverlapping_uninit_src_divergence`,
+  `wit_lm4_2_copy_nonoverlapping_perm_divergence`).
+* `call_intrinsic_write_bytes_simulation` (with
+  `call_intrinsic_write_bytes_simulation_explicit` and
+  `call_intrinsic_write_bytes_perm_divergence`; proved in `WriteBytesLM4_2`):
+  Stage-1 turns `write_bytes` into an external call
+  (`stepMirFn_stage1_unmodeled_intrinsic_extCall`).
+* `call_intrinsic_offset_simulation` (`OffsetLM4_2`): the `wrapping_offset` and
+  `std::intrinsics::*` aliases and provenance-free scalar pointers, none of which
+  Stage-1 evaluates like the reference model.
+* `call_intrinsic_rotate_simulation`: the reference model's inline rotation
+  against `lean-miri`'s fail-closed step.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -283,11 +294,13 @@ theorem call_intrinsic_bitcount_simulation
         (fun h => absurd h hdstInt.ne_char), ?_, hev⟩
       cases op <;> simp only [h1, h2, h3, h4, h5, h6, h7, hsome] <;> rfl
 
-/-- **`call_intrinsic_rotate_simulation` (`LM-4.2`)**: one real step of a call of
+/-- **`call_intrinsic_rotate_simulation` (`LM-4.2`, pre-Stage-1 reference
+model)**: one real step of a call of
 `rotate_left` (`isLeft = true`) or `rotate_right` (`isLeft = false`) on an
-integer `x : T` and a `u32` shift, from `StateRelLM3_1`-related states.
+integer `x : T` and a `u32` shift, from `StateRelLM3_1`-related states, in the
+pre-Stage-1 reference model `stepMirFnLM4_2` and `lean-miri`.
 
-This is a characterized divergence. Anneal evaluates the intrinsic inline and
+The reference model evaluates the intrinsic inline and
 writes `evalRotate isLeft x shift` to the destination (or reports undefined
 behavior for an uninitialized or dead argument), with a kernel-checked semantic
 certificate equating `(evalRotate isLeft x shift).bits` to `BitVec.rotateLeft` /
@@ -298,7 +311,8 @@ and relating `evalRotate isLeft x shift` to a `lean-miri` `ScalarInt` via
 fallback body, which is outside Anneal's correspondence
 (`annealCallHooks.findMirOrEvalFn`), so the real `lean-miri` step fails closed
 with `StepError.unsupported`, except that a dead argument is undefined behavior
-in both machines. Neither machine's outcome is assumed. -/
+in both machines. Neither machine's outcome is assumed. Stage-1 `stepMirFn`
+does not rotate at all: see `call_intrinsic_rotate_stage1_boundary`. -/
 theorem call_intrinsic_rotate_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -400,6 +414,59 @@ theorem call_intrinsic_rotate_simulation
   · right
     refine ⟨m', msg, hm, ?_⟩
     rw [hstepA, hub]
+
+/-- **`call_intrinsic_rotate_stage1_boundary` (`LM-4.2`, Stage-1)**: one real step
+of a call of `rotate_left` / `rotate_right` from `StateRelLM3_1`-related states
+over Stage-1 `stepMirFn`. Stage-1 evaluates the arguments and turns the call into
+an external call (`MirStepNode.extCall`), or reports the arguments' undefined
+behavior; the real `lean-miri` step fails closed (`StepError.unsupported`) or
+reports undefined behavior. Neither machine rotates: each leaves the intrinsic to
+its boundary (Stage-1's environment, `lean-miri`'s MIR fallback body). -/
+theorem call_intrinsic_rotate_stage1_boundary
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {k : AnnealIntrinsic} {isLeft : Bool}
+    (hrot : (k = .rotateLeft ∧ isLeft = true) ∨ (k = .rotateRight ∧ isLeft = false))
+    {c : ConstOperand} {op₁ op₂ : MirAst.Operand} {dstIdx : Local} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    (hterm : bb.terminator.kind =
+      .call (.constant c) [op₁, op₂] ⟨dstIdx, []⟩ (some targetBb) unwind)
+    {ty shiftTy : Ty} {kind : Miri.MIR.IntegerKind} (hint : IsIntegralTy ty kind)
+    (hshift : IsIntegralTy shiftTy .u32)
+    (hc : c.ty.kind = .fnDef k.defPath [ty.kind])
+    (hcallee : lookupCallee s.memory.callees body.layouts k.defPath [ty.kind]
+      s.memory.traitImpls = none)
+    (hfind : findCallee? s.memory.callees k.defPath = none)
+    (hop₁ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₁ ty)
+    (hop₂ : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf op₂ shiftTy)
+    {dstDecl : LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl) :
+    stepMirFn body s =
+      (match evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+          body.layouts s.memory.callerLocals with
+      | .ok vs locals' =>
+        MirStepNode.extCall
+          { defPath := k.defPath, typeArgs := [ty.kind], args := vs, memory := s.memory }
+          (resumeExternalCall s locals' ⟨dstIdx, []⟩ targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported) ∧
+    ((∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.unsupported msg))) ∨
+      (∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior msg)))) := by
+  obtain ⟨_, _, _, _, _, hcal, _, _, _, _, _, _⟩ := id hstate
+  have hk : k.stage1Unmodeled = true := by rcases hrot with ⟨rfl, _⟩ | ⟨rfl, _⟩ <;> rfl
+  refine ⟨stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len
+    hk hterm hc hcallee, ?_⟩
+  rcases call_intrinsic_rotate_simulation hstate hphase hbb hstmt_none hstmt_len hrot hterm hint
+      hshift hc hfind hop₁ hop₂ hdst with ⟨hunsup, _⟩ | ⟨m', msg, hm, _⟩
+  · exact .inl hunsup
+  · exact .inr ⟨m', msg, hm⟩
 
 /-- Anneal's inline evaluation of `saturating_add` (`isAdd = true`) or
 `saturating_sub` (`isAdd = false`) on two scalar arguments. -/
@@ -611,10 +678,12 @@ each integer bit-manipulation or saturating intrinsic, from
    (`call_intrinsic_bitcount_simulation`);
 2. `saturating_add`, `saturating_sub`: lockstep `StepRelLM3_1` over Stage-1
    `stepMirFn` (`call_intrinsic_saturating_simulation`);
-3. `rotate_left`, `rotate_right`: `stepMirFnLM4_2` computes the rotation while
+3. `rotate_left`, `rotate_right`: the pre-Stage-1 reference model
+   `stepMirFnLM4_2` computes the rotation while
    the real `lean-miri` step fails closed (`StepError.unsupported`), except for
    dead arguments, which are undefined behavior in both
-   (`call_intrinsic_rotate_simulation`). -/
+   (`call_intrinsic_rotate_simulation`); Stage-1 `stepMirFn` instead makes an
+   external call (`call_intrinsic_rotate_stage1_boundary`). -/
 theorem call_intrinsic_bitops_simulation :
     (∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       {allocMap : List AllocMapEntry},

@@ -13,7 +13,17 @@ import LeanMiriSpec.Correspondence.CallLM4_2
 /-!
 # `write_bytes` Call Correspondence for `LM-4.2`
 
-One-step correspondence between Anneal's `stepMirFn` (`evalWriteBytesCall`) and
+> **Anneal side is the pre-Stage-1 reference model, not Stage-1 `Trusted`.**
+> Stage-1 `Trusted` has no `write_bytes` evaluator: Stage-1 `evalTerminator`
+> turns every unlinked `core::intrinsics::write_bytes` call into an external call
+> (`MirStepNode.extCall`, `stepMirFn_stage1_unmodeled_intrinsic_extCall`). The
+> theorems below relate `lean-miri` to the pre-Stage-1 reference model
+> `stepMirFnLM4_2` (`evalWriteBytesCall`, `CallLM4_2.lean`) only; on Stage-1,
+> `write_bytes` is an environment interaction that `lean-miri` executes inline
+> (`WitLM4_2.lean` §5).
+
+One-step correspondence between the pre-Stage-1 reference model's
+`evalWriteBytesCall` and
 `lean-miri`'s `Miri.Interpreter.Step.step` (`annealWriteBytesEval` /
 `annealWriteRepeatedBytes`) on a translated `TerminatorKind.call` to
 `core::intrinsics::write_bytes::<T>(dst, val, count)` from `StateRelLM3_1`:

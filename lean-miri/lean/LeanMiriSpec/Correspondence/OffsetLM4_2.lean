@@ -13,11 +13,23 @@ import LeanMiriSpec.Correspondence.CallLM4_2
 /-!
 # `arith_offset` Simulation for `LM-4.2`
 
-One-step correspondence between Anneal's `stepMirFn` (`evalArithOffsetCall`) and
-`lean-miri`'s `Miri.Interpreter.Step.step` (`Intrinsics.eval` under
-`annealStepHooks`) for translated calls of
+One-step correspondence for translated calls of
 `core::intrinsics::arith_offset::<T>(ptr, count)` from `StateRelLM3_1`-related
-states:
+states between `lean-miri`'s `Miri.Interpreter.Step.step` (`Intrinsics.eval`
+under `annealStepHooks`) and
+
+* **Stage-1 `Trusted`** `stepMirFn` (`evalArithOffset`, `Scalars.lean:2045`) in
+  §4: `call_intrinsic_arithOffset_stage1_simulation` covers dead, uninitialized,
+  and provenance-carrying `PtrRel` pointers. Stage-1 reports undefined behavior
+  on a provenance-free `.scalar` pointer argument, which `lean-miri` offsets like
+  any other address, so that case is excluded (`hptr_not_scalar`);
+* the **pre-Stage-1 reference model** `stepMirFnLM4_2` (`evalArithOffsetCall`,
+  `CallLM4_2.lean`) in §3: `call_intrinsic_offset_simulation` additionally
+  covers provenance-free 8-byte scalars and the `wrapping_offset` /
+  `std::intrinsics::*` aliases, none of which Stage-1 evaluates inline (Stage-1
+  turns the aliases into external calls). It says nothing about Stage-1.
+
+Shared lemmas:
 
 * `annealArithOffsetEval_ok` and `PtrRel.wrapping_offset`: two's-complement
   64-bit wrapping byte-offset arithmetic on positive and negative `isize`
@@ -25,10 +37,7 @@ states:
 * `annealEvalOperand_rawPtr_copy_lm3_1`, `StateRelLM3_1.write_immediate_return`,
   `StateRelLM3_1.write_rawPtr_return`, and
   `StateRelLM3_1.write_rawPtrScalar_return`: raw-pointer operand evaluation and
-  destination return-writes;
-* `call_intrinsic_offset_simulation`: end-to-end one-step simulation covering
-  provenance-tracked `PtrRel` pointers, provenance-free 8-byte scalars, and
-  uninitialized or dead operand/destination undefined behavior.
+  destination return-writes.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -650,12 +659,16 @@ theorem layoutOfEncodedTyId_size_of_scalarLayoutOfRigidTy
   | fnDef _ _ => exact Option.some.inj h
   | _ => simp [scalarLayoutOfRigidTy] at h
 
-/-- **`call_intrinsic_offset_simulation` (`LM-4.2`)**: one real step of a
+/-- **`call_intrinsic_offset_simulation` (`LM-4.2`, pre-Stage-1 reference model)**:
+one real step of a
 translated call of `{core,std}::intrinsics::arith_offset::<T>(ptr, count)` or
 its `{core,std}::intrinsics::wrapping_offset::<T>(ptr, count)` alias
 (`hpath : AnnealIntrinsic.ofDefPath? calleePath = some k`,
-`hk : k = .arithOffset ∨ k = .wrappingOffset`) in both machines, from any
-`StateRelLM3_1`-related states.
+`hk : k = .arithOffset ∨ k = .wrappingOffset`) in `stepMirFnLM4_2` and
+`lean-miri`, from any `StateRelLM3_1`-related states. The Anneal side is the
+pre-Stage-1 reference model; for Stage-1 see
+`call_intrinsic_arithOffset_stage1_simulation` (Stage-1 turns the aliases into
+external calls and rejects case `(b)` with undefined behavior).
 
 Pointee byte size `elemBytes` agrees across Anneal (`helem_anneal`) and
 `lean-miri` (`helem_miri`) and satisfies Rust's `isize::MAX` layout invariant
