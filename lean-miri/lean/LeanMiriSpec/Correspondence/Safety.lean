@@ -149,20 +149,26 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   cross-local `Eq`/`Ne`, and low `< 2 ^ 32` integer-vs-live regimes, and
   `Offset` at every primitive stride including zero-count offsets and negative
   `isize` deltas, `step_binOp_offset_stride_simulation`,
-  `step_mir_lm3_1_state_simulation`). Stage-1 upgrades: out-of-bounds reads and
-  writes, misaligned reads and writes, null, invalid-`bool` / invalid-`char`
-  dereferences, and negative out-of-bounds `Offset` are undefined behavior in
-  both machines (`step_deref_oob_simulation`, `step_deref_write_oob_simulation`,
-  `step_deref_misaligned_simulation`, `step_rawPtr_deref_null_simulation`,
-  `step_deref_invalid_bool_simulation`,
-  `step_binOp_offset_neg_oob_ub_simulation`; from-entry whole-program
-  `MiriDiffWitnesses.w3_deref_oob_ub`, `MiriDiffWitnesses.w3_deref_oob_write_ub`,
+  `step_mir_lm3_1_state_simulation`, including RFC 2582 null place-to-pointer
+  reborrows `step_rawPtr_deref_null_simulation` /
+  `MiriDiffWitnesses.w3_rawPtr_deref_null_reborrow_returns`). Stage-1 upgrades:
+  out-of-bounds reads and writes, misaligned reads and writes, null reads and
+  writes, invalid-`bool` / invalid-`char` dereferences, and negative out-of-bounds
+  `Offset` are undefined behavior in both machines (`step_deref_oob_simulation`,
+  `step_deref_write_oob_simulation`, `step_deref_misaligned_simulation`,
+  `step_deref_read_simulation`, `step_deref_write_simulation`,
+  `step_deref_invalid_bool_simulation`, `step_binOp_offset_neg_oob_ub_simulation`;
+  from-entry whole-program `MiriDiffWitnesses.w3_deref_oob_ub`,
+  `MiriDiffWitnesses.w3_deref_oob_write_ub`,
   `MiriDiffWitnesses.w3_deref_misaligned_ub`,
+  `MiriDiffWitnesses.w3_deref_null_ptr_read_ub`,
+  `MiriDiffWitnesses.w3_deref_null_ptr_write_ub`,
   `MiriDiffWitnesses.w3_ptr_offset_neg_before_start_ub`,
   `MiriDiffWitnesses.w3_invalid_bool_ptr_deref_ub`, and
   `MiriDiffWitnesses.w3_ptr_offset_stride_read_returns`, covering the former
   `known_anneal_bug` ratchets `ub_ptr_offset_oob_read`,
   `ub_ptr_offset_oob_write`, `ub_unaligned_ptr_read_u32`,
+  `ub_deref_null_ptr_read`, `ub_deref_null_ptr_write`,
   `ub_ptr_offset_negative_before_start`, `ub_transmute_invalid_bool_through_ptr`,
   and `pass_ptr_offset_within_array`).
 * `LM-3.2` references and the Tree Borrows hierarchy (`step_mir_lm3_2_state_simulation`,
@@ -171,6 +177,7 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   undefined behavior in both machines
   (`evalRvalue_reborrow_safeRef_dangling_simulation`,
   `step_safeRef_deref_read_invalid_scalar_simulation`; from-entry whole-program
+  `MiriDiffWitnesses.w4_reborrow_dangling_safeRef_ub` and
   `MiriDiffWitnesses.w4_invalid_bool_ref_read_ub`). `LM-3.3` 6-state Tree Borrows
   (`I-10`, `I-11`, protectors, and `StorageDead` protector UB vs. unprotected
   local-borrow disable `sim_lm3_3_storage_dead_and_live_protector_step`) at the
@@ -206,13 +213,11 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   from-entry `MiriDiffWitnesses.w3_arith_offset_returns` and
   `MiriDiffWitnesses.w3_arith_offset_uninit_ub`).
 
-Kernel-certified divergences (outside every agreed fragment, as of Stage-1). The
-`MiriDiffWitnesses.*` entries are whole programs run from program entry
-(`initMachineState` / `initMachineStateWithCallees` and `miriEntryState`), except
-the `lean-miri` half of `MiriDiffWitnesses.w6_copy_nonoverlapping_rawPtr_tyId80_boundary`,
-which starts at `WitLM4_2` pre-states; the other entries are per-step divergence
-theorems over Stage-1 `stepMirFn`, most with concrete real-step instances in the
-`Wit*` modules:
+Kernel-certified divergences (outside every agreed fragment, as of Stage-1). Every
+`MiriDiffWitnesses.*` entry below is a whole program run from program entry
+(`initMachineState` / `initMachineStateWithCallees` and `miriEntryState`); the
+other entries are per-step divergence theorems over Stage-1 `stepMirFn`, most with
+concrete real-step instances in the `Wit*` modules:
 
 * `C2` (`cex_end_of_call_foreign_unique_frozen_divergence`): canonical Miri's
   end-of-call protector release performs an implicit read that freezes a

@@ -24668,6 +24668,24 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   writeBytesEntryBody
   writeBytesEntry_prefix_anneal
   writeBytesEntry_prefix_miri
+  nullPtrReadEntryBody
+  w3_deref_null_ptr_read_ub
+  nullPtrWriteEntryBody
+  w3_deref_null_ptr_write_ub
+  nullPtrRawReborrowEntryBody
+  w3_rawPtr_deref_null_reborrow_returns
+  reborrowDanglingSafeRefEntryBody
+  reborrowDanglingSafeRef_prefix_anneal
+  reborrowDanglingSafeRef_prefix_miri
+  w4_reborrow_dangling_safeRef_ub
+  copyStage1RawPtrCastEntryBody
+  copyStage1RawPtrCastEntryPreAnneal
+  copyStage1RawPtrCastEntryPreMiriFrame
+  copyStage1RawPtrCastEntryPreMiri
+  copyStage1RawPtrCastEntry_prefix_anneal
+  copyStage1RawPtrCastEntry_prefix_miri
+  copyStage1RawPtrCastEntry_stateRel_and_imm
+  copyStage1RawPtrCastEntry_trace
 
 /-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
 
@@ -24776,19 +24794,17 @@ example :
     ((TreeSafe (mirCallTree copyRawPtrDerefEntryBody []) ∧
       ∃ tr mem, ReachesRet (mirCallTree copyRawPtrDerefEntryBody []) tr
         (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-     (let b := WitnessLM4_2.copyStage1RawPtrCastLockstepBody
-      let s₀ := WitnessLM4_2.partialCopyLockstepAnnealPre b 0
-      let m₀ := WitnessLM4_2.partialCopyLockstepMiriPre b WitnessLM4_2.lm42ScalarZero
+     (let b := copyStage1RawPtrCastEntryBody
       ∃ s₄ m₄,
-        AgreeReaches b (annealMiriHooks b) s₀ s₄ m₀ m₄ ∧
+        AgreeReaches b (annealMiriHooks b) (initMachineState b []) s₄ (miriEntryState b) m₄ ∧
         get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
         get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
-        TreeSafe (mirTree b s₀) ∧
-        (∃ tr mem, ReachesRet (mirTree b s₀) tr
+        TreeSafe (mirCallTree b []) ∧
+        (∃ tr mem, ReachesRet (mirCallTree b []) tr
           (.normal (.ptr { allocId := 1, offsetBytes := 0 } 8, mem))) ∧
-        (miriSystem (annealMiriHooks b)).ReachesOutcome m₀
+        (miriSystem (annealMiriHooks b)).ReachesOutcome (miriEntryState b)
           (.unsupported (.unsupported "pointee of TyId 80 is not encoded")) ∧
-        ¬ (miriSystem (annealMiriHooks b)).Safe m₀)) ∧
+        ¬ (miriSystem (annealMiriHooks b)).Safe (miriEntryState b))) ∧
     (TreeSafe (mirTree unwindPastRootBody
       (initMachineStateWithCallees unwindPastRootBody [] [unwindMidBody, unwindLeafBody])) ∧
      (∃ e, (miriSystem (callHooks unwindPastRootBody [unwindMidBody, unwindLeafBody])).ReachesOutcome
@@ -25074,6 +25090,29 @@ example {body : CapturedMir} {H : AnnealMiriHooks}
     (hA : AnnealPath body preA sA) (hM : MiriPath H preM mB) :
     AgreeReaches body H entryA sA entryM mB :=
   agreeReaches_of_prefix_paths hpa hpm hA hM
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeUB nullPtrReadEntryBody (annealMiriHooks nullPtrReadEntryBody)
+      (initMachineState nullPtrReadEntryBody []) (miriEntryState nullPtrReadEntryBody) ∧
+    AgreeUB nullPtrWriteEntryBody (annealMiriHooks nullPtrWriteEntryBody)
+      (initMachineState nullPtrWriteEntryBody []) (miriEntryState nullPtrWriteEntryBody) ∧
+    AgreeReturnsBits nullPtrRawReborrowEntryBody (annealMiriHooks nullPtrRawReborrowEntryBody)
+      (initMachineState nullPtrRawReborrowEntryBody [])
+      (miriEntryState nullPtrRawReborrowEntryBody) 8 0 ∧
+    AgreeUB reborrowDanglingSafeRefEntryBody (annealMiriHooks reborrowDanglingSafeRefEntryBody)
+      (initMachineState reborrowDanglingSafeRefEntryBody [])
+      (miriEntryState reborrowDanglingSafeRefEntryBody) ∧
+    runAnnealBounded copyStage1RawPtrCastEntryBody 8
+      (initMachineState copyStage1RawPtrCastEntryBody []) =
+      .running copyStage1RawPtrCastEntryPreAnneal ∧
+    runLoopFuel (annealMiriHooks copyStage1RawPtrCastEntryBody) 8
+      (miriEntryState copyStage1RawPtrCastEntryBody) =
+      .running copyStage1RawPtrCastEntryPreMiri :=
+  ⟨w3_deref_null_ptr_read_ub, w3_deref_null_ptr_write_ub,
+   w3_rawPtr_deref_null_reborrow_returns, w4_reborrow_dangling_safeRef_ub,
+   copyStage1RawPtrCastEntry_prefix_anneal, copyStage1RawPtrCastEntry_prefix_miri⟩
 
 end StatementPins
 
