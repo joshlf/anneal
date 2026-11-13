@@ -4288,3 +4288,29 @@ fn a3_unsize_requires_an_initialized_backing_local() {
         }
     }
 }
+
+#[test]
+fn a4_ty_stays_four_words() {
+    // `Ty::FnPtr`'s parameters and `Ty::Closure`'s payload are boxed so that adding them did not
+    // grow every `Ty` (and with it `MirValue` and the lowering/evaluation error types).
+    assert!(std::mem::size_of::<Ty>() <= 4 * std::mem::size_of::<usize>());
+    let f = Ty::fn_ptr(vec![u32_ty(), u64_ty()], u8_ty(), Safety::Unsafe);
+    let Ty::FnPtr {
+        inputs,
+        output,
+        safety,
+    } = &f
+    else {
+        unreachable!()
+    };
+    assert_eq!(&inputs[..], &[u32_ty(), u64_ty()]);
+    assert_eq!(**output, u8_ty());
+    assert_eq!(*safety, Safety::Unsafe);
+    let c = Ty::closure("body", vec![u8_ty()]);
+    assert_eq!(c.tuple_like_fields(), Some(&[u8_ty()][..]));
+    assert_eq!(
+        Ty::Tuple(vec![u8_ty()]).tuple_like_fields(),
+        Some(&[u8_ty()][..])
+    );
+    assert_eq!(u8_ty().tuple_like_fields(), None);
+}

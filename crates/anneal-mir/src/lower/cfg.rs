@@ -22,16 +22,20 @@
 //!   evaluated message;
 //! - `Call` evaluates the callee and arguments left to right (a `Move` of a bare local
 //!   deinitializes it), checks the destination place, and then runs the callee: a function
-//!   item of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`]) executes in
-//!   the calling frame ([`eval_intrinsic_call`]); a function item of a symbol linked in a
-//!   [`CallTable`] runs the callee's body in a new frame (under
+//!   item (a [`Constant::FnDef`](crate::ir::Constant::FnDef) or a value of type
+//!   [`Ty::FnDef`]) of an inline intrinsic ([`CallTarget::Intrinsic`], see [`IntrinsicOp`])
+//!   executes in the calling frame ([`eval_intrinsic_call`]); a function item of a symbol
+//!   linked in a [`CallTable`], or a function pointer ([`Ty::FnPtr`], an indirect call) to
+//!   one whose signature it matches ([`LinkedCallee::check_fn_ptr_signature`]), runs the
+//!   callee's body in a new frame (under
 //!   [`eval_cfg_in_state_with_call_table`], [`eval_lowered_body_cfg_with_call_table`], or
 //!   [`eval_lowered_body_cfg_with_call_table_and_calls`]); any other callee goes to the
 //!   caller-supplied call handler (a [`CallHandler`], or an [`ExternalCallHandler`] given the
 //!   [`ExternalCall`] under a call table; without a handler: [`CfgEvalError::UnsupportedCall`],
-//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol). A returned value must be well
-//!   formed and of the destination's type, and is written to the destination before jumping
-//!   to `target` (a return from a call without `target` is undefined behavior); a panicking
+//!   or [`CfgEvalError::UnknownCallee`] for an unlinked symbol or function pointer target). A
+//!   returned value must be well formed and of the destination's type, and is written to the
+//!   destination before jumping to `target` (a return from a call without `target` is
+//!   undefined behavior); a panicking
 //!   call leaves the destination unchanged. `UnreachableUnchecked` is undefined behavior
 //!   ([`CfgEvalError::UnreachableReached`]), `Abort` ends the evaluation with
 //!   [`CfgEvalOutcome::Terminated`] without running any cleanup block, and `PanicUnwind`
@@ -1488,6 +1492,13 @@ impl LinkedCallee {
 /// linked symbol ([`CallTarget::Fn`]) in a new frame of that callee's body, on an explicit
 /// (heap-allocated) frame stack, so neither self nor mutual recursion can overflow the Rust
 /// stack:
+/// - **Function pointers.** An indirect `Call` through a function pointer whose target is
+///   linked runs that callee likewise, once the evaluated callee and arguments pass
+///   [`LinkedCallee::check_fn_ptr_signature`] against the pointer's type
+///   ([`RvalueEvalError::FnPtrSignatureMismatch`] otherwise, undefined behavior); reifying a
+///   linked function item or closure (`ReifyFnPointer*` / `ClosureFnPointer*`) checks the
+///   same signature when the coercion executes. An unlinked target is an [`ExternalCall`]
+///   naming it ([`ExternalCall::callee`]), or [`CfgEvalError::UnknownCallee`].
 /// - **Arguments.** After the caller has evaluated the callee, the arguments, and the
 ///   destination exactly as for any call, the callee frame starts with `_1..=arg_count` set to
 ///   the arguments, which must match the parameter types and be well formed; the argument
