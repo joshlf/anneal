@@ -68,6 +68,41 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
   Stage-1 evaluates like the reference model.
 * `call_intrinsic_rotate_simulation`: the reference model's inline rotation
   against `lean-miri`'s fail-closed step.
+
+## Residual gaps of `LM-4.2` (Episode 2)
+
+1. **Pointer-valued copies.** No Stage-1 lockstep theorem exists for
+   `copy_nonoverlapping` of provenance-carrying pointer values. `lean-miri`'s hooks
+   fail closed at `annealPointeeTypeOf 80`, because `encodeTyId` collapses every
+   pointer-to-pointer type to `TyId 80`, and `StateRelLM3_1`'s
+   `StackScalarAllocShape` holds only primitive scalars
+   (`step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`,
+   `wit_lm4_2_copy_nonoverlapping_rawPtr_cast_lockstep_boundary`). Stage-1's
+   provenance preservation is proved on the Anneal side only
+   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`,
+   `encodeUntypedValueToBytes_ptr_decode_roundtrip`).
+2. **Non-canonical alias hooks.** `AnnealIntrinsic.ofDefPath?` maps
+   `core::intrinsics::wrapping_offset` (no such intrinsic) and the
+   `std::intrinsics::*` re-export paths (never recorded by rustc-capture) to
+   `lean-miri`'s `arith_offset`. Stage-1 treats them as external calls
+   (`stepMirFn_stage1_std_offset_alias_extCall`).
+3. **Stage-1 `Trusted` divergences** (certified, but not fixable under
+   `lean-miri/lean/**`):
+   * `copy_nonoverlapping` accepts zero-count misaligned copies;
+   * it does not bounds-check distinct scalar locals and copies the whole source
+     value: out-of-bounds acceptance, partial-copy clobbering, ill-sized values on
+     cross-type copies;
+   * it rejects same-tag disjoint ranges;
+   * `arith_offset` rejects provenance-free `.scalar` pointers.
+
+   See `WitLM4_2.lean` §6/§7/§14/§15.
+4. **Stage-1 external-call boundary.** Stage-1 hands `write_bytes`,
+   `rotate_left`, and `rotate_right` to the environment, while `lean-miri`
+   executes them or fails closed. The `Stage1ExtraIntrinsic` calls that Stage-1
+   evaluates inline fail closed in `annealCallHooks`.
+5. **Tree Borrows.** `annealMemoryCopyHooks` and `annealWriteRepeatedBytes` track
+   no Tree Borrows state, so the `*_perm_divergence` results compare Stage-1
+   against this instantiation, not against canonical Miri with Tree Borrows.
 -/
 
 namespace LeanMiriSpec.Correspondence

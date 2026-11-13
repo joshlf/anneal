@@ -4888,8 +4888,12 @@ def copyStage1RawPtrCastLockstepBody : CapturedMir where
         (.cast .ptrToPtr (.copy (local42 3)) (tyOf (.rawPtr .mut rawMutU64K)))),
       copyStmt 4 5 1
     ]
-    terminator := { kind := .return_, span := "span" }
+    terminator := mkTerm42 .return_
+    isCleanup := false
   }]
+  fnAbi := Witness.fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
 
 theorem copyStage1RawPtrCastLockstep_stateRel :
     StateRel copyStage1RawPtrCastLockstepBody
