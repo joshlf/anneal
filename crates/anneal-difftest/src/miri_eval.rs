@@ -5811,9 +5811,20 @@ pub fn parameterized_after(x: u32) -> u32 { x }
 
     /// Probes for the 5-family semantic-mutant self-check: each exercises one UB or
     /// panic check of Anneal's semantics (`bool` validity, `StorageDead`, pointer
-    /// provenance invalidation on byte-array overwrite, division by zero, and wide
-    /// shift exponents) on which the live engine agrees with Miri, so a mutant of
-    /// the semantics that omits that check diverges from Miri.
+    /// provenance, division by zero, and wide shift exponents) on which the live
+    /// engine agrees with Miri, so a mutant of the semantics that omits that check
+    /// diverges from Miri. `scripts/run_diff_test_campaign.py` embeds byte-identical
+    /// sources in `SEEDED_SEMANTIC_MUTANTS` (checked by
+    /// `scripts/test_run_diff_test_campaign.py`).
+    ///
+    /// `provenance_frag` overwrites all 8 bytes of the stored pointer `p` with the
+    /// integer `p as usize` through a `*mut usize` alias, so `p` keeps `x`'s live
+    /// address but its bytes carry no provenance, and `*p` is UB only because the
+    /// provenance is gone (Miri: "dangling pointer (it has no provenance)"). The
+    /// `PROVENANCE_FRAG_CONTROL_PROBES` pin that the rewritten bytes are `x`'s
+    /// address and that this address reads `x`'s value `7` once it has provenance,
+    /// so a mutant that accepts the provenance-free pointer returns `7`
+    /// (`missed_ub`) instead of trapping.
     const SEMANTIC_MUTANT_PROBES: [(&str, &str); 5] = [
         (
             "bool_valid_range",
@@ -5841,9 +5852,10 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             r#"pub fn probe_provenance_frag() -> u32 {
     let x: u32 = 7u32;
     let mut p: *const u32 = &raw const x;
-    let byte_ptr: *mut [u8; 8] = (&raw mut p) as *mut [u8; 8];
+    let addr: usize = p as usize;
+    let slot: *mut usize = (&raw mut p) as *mut usize;
     unsafe {
-        *byte_ptr = [4u8, 0, 0, 0, 0, 0, 0, 0];
+        *slot = addr;
         *p
     }
 }
@@ -5866,6 +5878,87 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     unsafe { unchecked_shl(lhs, rhs) }
 }
 "#,
+        ),
+    ];
+
+    /// Live outcome of every `SEMANTIC_MUTANT_PROBES` entry, as
+    /// `(id, miri_tag, anneal_tag, anneal_lean_tag)` with source positions relative
+    /// to the probe's first line (`ub@src/lib.rs:<line>:<col>`). These are the
+    /// `reference_miri_outcome`, `baseline_anneal_outcome`, and
+    /// `baseline_anneal_lean_tag` that `SEEDED_SEMANTIC_MUTANTS` in
+    /// `scripts/run_diff_test_campaign.py` replays as the unmutated baseline
+    /// (checked identical by `scripts/test_run_diff_test_campaign.py`), so the
+    /// simulated self-check baselines are the real engine's outcomes.
+    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 5] = [
+        (
+            "bool_valid_range",
+            "ub@src/lib.rs:5:5",
+            "ub@src/lib.rs:5:5: 5:6",
+            "MirDiffTag.ub",
+        ),
+        (
+            "storage_dead_tag",
+            "ub@src/lib.rs:6:14",
+            "ub@src/lib.rs:6:14: 6:23",
+            "MirDiffTag.ub",
+        ),
+        (
+            "provenance_frag",
+            "ub@src/lib.rs:8:9",
+            "ub@src/lib.rs:8:9: 8:11",
+            "MirDiffTag.ub",
+        ),
+        (
+            "div_by_zero",
+            "panic@src/lib.rs:4:5",
+            "panic@src/lib.rs:4:5: 4:14",
+            "MirDiffTag.panic",
+        ),
+        (
+            "wide_shift",
+            "ub@src/lib.rs:4:14",
+            "ub@src/lib.rs:4:14: 4:37",
+            "MirDiffTag.ub",
+        ),
+    ];
+
+    /// Controls for `probe_provenance_frag`, each `(name, source, returned value)`
+    /// and required to agree with Miri on that `u32` return value:
+    /// 1. `probe_ctrl_provenance_addr_preserved` rewrites `p` exactly as the probe
+    ///    does and returns `1` because `p` still holds `x`'s address: the probe
+    ///    dereferences `x`'s live allocation address, not an unmapped one.
+    /// 2. `probe_ctrl_provenance_exposed_addr` dereferences the same address after
+    ///    an exposing round trip (`addr as *const u32`), which restores
+    ///    provenance, and returns `x`'s value `7`: only the missing provenance
+    ///    makes the probe UB, so a semantics that accepts the provenance-free
+    ///    pointer returns `7` instead of trapping (`missed_ub`).
+    const PROVENANCE_FRAG_CONTROL_PROBES: [(&str, &str, u128); 2] = [
+        (
+            "probe_ctrl_provenance_addr_preserved",
+            r#"pub fn probe_ctrl_provenance_addr_preserved() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let addr: usize = p as usize;
+    let slot: *mut usize = (&raw mut p) as *mut usize;
+    unsafe {
+        *slot = addr;
+        ((p as usize) == addr) as u32
+    }
+}
+"#,
+            1,
+        ),
+        (
+            "probe_ctrl_provenance_exposed_addr",
+            r#"pub fn probe_ctrl_provenance_exposed_addr() -> u32 {
+    let x: u32 = 7u32;
+    let p: *const u32 = &raw const x;
+    let addr: usize = p as usize;
+    let forged: *const u32 = addr as *const u32;
+    unsafe { *forged }
+}
+"#,
+            7,
         ),
     ];
 
@@ -5986,31 +6079,87 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         u32::try_from(idx + 1).expect("line number fits u32")
     }
 
-    /// Pins the live behavior of the semantic-mutant and pointer-fragment
-    /// provenance probes, measured through both the helper-linked pipeline that
-    /// `miri-difftest` and the shrinker run and
+    /// Rewrite a live Miri outcome's `summary_tag` with its position relative to a
+    /// probe whose first line is line `start` of the staged `src/lib.rs` (the form
+    /// of `SEMANTIC_MUTANT_PROBE_OUTCOMES`).
+    fn probe_relative_miri_tag(miri: &MiriOutcome, start: u32) -> String {
+        match miri {
+            MiriOutcome::Ub { pos: Some(pos), .. } => {
+                format!(
+                    "ub@{}",
+                    translate_pos_to_repro(pos, start, 1).display_short()
+                )
+            }
+            MiriOutcome::Panic { pos: Some(pos), .. } => {
+                format!(
+                    "panic@{}",
+                    translate_pos_to_repro(pos, start, 1).display_short()
+                )
+            }
+            other => other.summary_tag(),
+        }
+    }
+
+    /// Rewrite a live Anneal outcome's `summary_tag` with its span relative to a
+    /// probe whose first line is line `start` of the staged `src/lib.rs`.
+    fn probe_relative_anneal_tag(anneal: &AnnealOutcome, start: u32) -> String {
+        let rel = |kind: &str, span: &SourceSpan| {
+            format!(
+                "{kind}@{}",
+                translate_span_to_repro(span, start, 1).display_short()
+            )
+        };
+        match anneal {
+            AnnealOutcome::Ub { span: Some(span) } => rel("ub", span),
+            AnnealOutcome::Panic { span: Some(span) } => rel("panic", span),
+            AnnealOutcome::Abort { span: Some(span) } => rel("abort", span),
+            AnnealOutcome::Unsupported { span: Some(span) } => rel("unsupported", span),
+            other => other.summary_tag(),
+        }
+    }
+
+    /// Pins the live behavior of the semantic-mutant, provenance-control, and
+    /// pointer-fragment provenance probes, measured through both the helper-linked
+    /// pipeline that `miri-difftest` and the shrinker run and
     /// `cargo_anneal::run_difftest_oracle_pipeline` (which must agree on every
     /// probe).
     ///
-    /// Every semantic-mutant probe must agree with Miri on a UB or panic, so a
-    /// mutant that omits the corresponding check is killable. The three provenance
-    /// probes are kernel-confirmed engine gaps, pinned exactly as measured: the
-    /// overwritten-byte and mixed-fragment probes are `missed_ub` (the engine
-    /// returns `7` and `9`), and the `u8` round trip is a `ub_location_mismatch`
-    /// (the engine flags the `u8` load of a pointer byte, Miri the later
-    /// dereference). When the engine changes on any probe, this test fails and
-    /// the pin must be updated (a ratchet, like a `known_anneal_bug` entry).
+    /// Every semantic-mutant probe must agree with Miri on a UB or panic, with
+    /// exactly the probe-relative Miri outcome, Anneal outcome (strict
+    /// `FailureKind.ub` for every UB probe), and Lean tag that
+    /// `SEMANTIC_MUTANT_PROBE_OUTCOMES` records, so a mutant that omits the
+    /// corresponding check is killable and `SEEDED_SEMANTIC_MUTANTS` replays the
+    /// real engine. `probe_provenance_frag` must fail in Miri for lack of
+    /// provenance, and both `PROVENANCE_FRAG_CONTROL_PROBES` must agree on their
+    /// return values (the rewritten pointer holds `x`'s address, which reads `7`
+    /// with provenance). The three provenance gap probes are kernel-confirmed
+    /// engine gaps, pinned exactly as measured: the overwritten-byte and
+    /// mixed-fragment probes are `missed_ub` (the engine returns `7` and `9`), and
+    /// the `u8` round trip is a `ub_location_mismatch` (the engine flags the `u8`
+    /// load of a pointer byte, Miri the later dereference). When the engine changes
+    /// on any probe, this test fails and the pin must be updated (a ratchet, like a
+    /// `known_anneal_bug` entry).
     #[test]
     fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
         let gap_probes = KNOWN_PROVENANCE_GAP_PROBES;
         let fn_sources: Vec<&str> = SEMANTIC_MUTANT_PROBES
             .iter()
             .map(|(_, src)| *src)
+            .chain(
+                PROVENANCE_FRAG_CONTROL_PROBES
+                    .iter()
+                    .map(|(_, src, _)| *src),
+            )
             .chain(gap_probes.iter().map(|(_, src)| *src))
             .collect();
         let names: Vec<String> = SEMANTIC_MUTANT_PROBES
             .iter()
             .map(|(id, _)| format!("probe_{id}"))
+            .chain(
+                PROVENANCE_FRAG_CONTROL_PROBES
+                    .iter()
+                    .map(|(name, _, _)| (*name).to_string()),
+            )
             .chain(gap_probes.iter().map(|(name, _)| (*name).to_string()))
             .collect();
         let (crate_source, linked) =
@@ -6042,26 +6191,85 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             );
         }
 
-        for (id, _) in SEMANTIC_MUTANT_PROBES {
-            let item = &linked[&format!("probe_{id}")];
-            assert_eq!(
-                item.verdict,
-                ComparisonVerdict::Agree,
-                "probe `{id}` must agree with the unmutated engine: miri={:?} anneal={:?}",
-                item.miri,
-                item.anneal
-            );
-            assert!(
-                matches!(item.miri, MiriOutcome::Ub { .. } | MiriOutcome::Panic { .. }),
-                "probe `{id}` must exercise a UB / panic check: {:?}",
-                item.miri
-            );
+        assert_eq!(
+            SEMANTIC_MUTANT_PROBE_OUTCOMES.map(|(id, ..)| id),
+            SEMANTIC_MUTANT_PROBES.map(|(id, _)| id),
+            "every semantic-mutant probe needs a pinned outcome"
+        );
+        for (id, miri_tag, anneal_tag, lean_tag) in SEMANTIC_MUTANT_PROBE_OUTCOMES {
+            let fn_name = format!("probe_{id}");
+            let start = line_of(&crate_source, &format!("pub fn {fn_name}()"));
+            for (label, reports) in [("linked", &linked), ("plain", &plain)] {
+                let item = &reports[&fn_name];
+                assert_eq!(
+                    item.verdict,
+                    ComparisonVerdict::Agree,
+                    "probe `{id}` must agree with the unmutated engine ({label}): miri={:?} \
+                     anneal={:?}",
+                    item.miri,
+                    item.anneal
+                );
+                assert!(
+                    matches!(
+                        item.miri,
+                        MiriOutcome::Ub { .. } | MiriOutcome::Panic { .. }
+                    ),
+                    "probe `{id}` must exercise a UB / panic check ({label}): {:?}",
+                    item.miri
+                );
+                assert_eq!(
+                    (
+                        probe_relative_miri_tag(&item.miri, start),
+                        probe_relative_anneal_tag(&item.anneal, start),
+                        item.anneal.to_lean_mir_diff_tag(),
+                    ),
+                    (
+                        miri_tag.to_string(),
+                        anneal_tag.to_string(),
+                        Some(lean_tag.to_string()),
+                    ),
+                    "probe `{id}` live outcome ({label}) drifted from \
+                     SEMANTIC_MUTANT_PROBE_OUTCOMES (and SEEDED_SEMANTIC_MUTANTS)"
+                );
+            }
         }
 
         let no_provenance = |item: &ItemOracleReport| {
             matches!(&item.miri, MiriOutcome::Ub { message, .. }
                 if message.contains("dangling pointer (it has no provenance)"))
         };
+        for (label, reports) in [("linked", &linked), ("plain", &plain)] {
+            let frag = &reports["probe_provenance_frag"];
+            assert!(
+                no_provenance(frag) && matches!(frag.anneal, AnnealOutcome::Ub { .. }),
+                "probe_provenance_frag must be UB for lack of provenance in Miri and strict UB \
+                 in Anneal ({label}): miri={:?} anneal={:?}",
+                frag.miri,
+                frag.anneal
+            );
+            for (name, _, returned) in PROVENANCE_FRAG_CONTROL_PROBES {
+                let item = &reports[name];
+                let expected = (
+                    MiriOutcome::PassScalar {
+                        bits: returned,
+                        size_bytes: 4,
+                    },
+                    AnnealOutcome::PassScalar {
+                        bits: returned,
+                        size_bytes: 4,
+                    },
+                );
+                assert!(
+                    item.verdict == ComparisonVerdict::Agree
+                        && (item.miri.clone(), item.anneal.clone()) == expected,
+                    "provenance control `{name}` must agree on returning {returned} ({label}): \
+                     verdict={:?} miri={:?} anneal={:?}",
+                    item.verdict,
+                    item.miri,
+                    item.anneal
+                );
+            }
+        }
         for (name, returned) in [
             ("probe_gap_provenance_overwritten_byte", 7u128),
             ("probe_gap_provenance_mixed_fragments", 9u128),
