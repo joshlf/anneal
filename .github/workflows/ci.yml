@@ -189,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Toolchain setup & workspace tests
     needs: [build-exocrate]
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       ANNEAL_TEST_INSPECTOR: ${{ github.workspace }}/trusted/audit/TrustedBoundary.lean
@@ -250,11 +250,11 @@ jobs:
           name: anneal-exocrate-archive
           path: target
 
-      - name: Check embedded verifier resources
-        id: resources
+      - name: Check the packaged verification bundle
+        id: bundle
         run: |
           set -euo pipefail
-          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/bundle-resources.log") 2>&1
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/bundle-check.log") 2>&1
           cargo run --locked --jobs 2 -p cargo-anneal \
             --example regenerate_bundle -- --root . --check
 
@@ -368,6 +368,17 @@ jobs:
           printf 'ANNEAL_TEST_AUDITOR=%s/bin/anneal-audit\n' \
             "$ANNEAL_TEST_TOOLS_ROOT" >> "$GITHUB_ENV"
 
+      - name: Build current capture with the installed compiler libraries
+        id: capture
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/capture-build.log") 2>&1
+          cargo build --locked --jobs 2 -p anneal-rustc-capture
+          test -x "$ANNEAL_MVP_CLI"
+          test -x "$ANNEAL_MVP_CAPTURE"
+          test -x "$ANNEAL_MVP_LEAN"
+          test -d "$ANNEAL_MVP_SYSROOT/lib"
+
       - name: Audit repository trusted boundary
         id: audit
         run: |
@@ -376,12 +387,15 @@ jobs:
           cargo run --locked -p anneal-audit -- \
             --lean "$ANNEAL_TEST_INSTALL_ROOT/lean/bin/lean"
 
-      - name: Test Rust workspace
+      - name: Test Rust workspace and installed CLI verification
         id: workspace
+        # Proof tests each launch Lean; serialize them to bound memory use.
+        env:
+          RUST_TEST_THREADS: '1'
         run: |
           set -euo pipefail
           exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/workspace.log") 2>&1
-          cargo test --workspace --locked
+          cargo test --workspace --locked --jobs 2
 
       - name: Check crate packaging
         id: package
