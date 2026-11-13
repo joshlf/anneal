@@ -262,10 +262,28 @@ class LeanSourceAuditTests(unittest.TestCase):
             "overlapping_reborrowFootprint_write_disables_sibling",
             "ofLiveTreeBorrowPerm?_toLiveTreeBorrowPerm", "toLiveTreeBorrowPerm_ofLiveTreeBorrowPerm?",
             "liveBorrowEntryRange_contains_iff", "split_at_mut_rootTree_nonvacuous",
+            "setSpine?_eq_some_forcePureEnv_set", "applySlotUpdatesForced_eq_forcePureEnv",
+            "liveSet?_eq_setSpine?", "applySlotUpdatesLive?_eq_forced", "applySlotUpdatesLive?_oob",
+            "subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous",
+            "performTransition_accessed_eq_live", "performTransition_unaccessed_eq_live",
+            "performTransition_accessed_isSome_eq_live", "isTagProtected_eq_live",
+            "performTransition_entry_eq_live", "foreign_write_disabled_protected_noop",
+            "protected_reservedIM_foreign_fails_closed",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_tree_borrows_bridge_is_semantic(self):
+        """The Tree Borrows bridge must relate *transitions*, not only rename permissions."""
+        live = "Trusted.Rustc.V2026_06_01.MirSemantics."
+        for name in ("treeBorrowNodeAccess", "treeBorrowPermTransition", "treeBorrowTransitionIsUB",
+                     "isBorrowProtected", "natListContainsBool"):
+            self.assertIn(live + name, self.code)
+        m = re.search(r"theorem performTransition_accessed_eq_live (.*?) :=", self.code, re.S)
+        self.assertIsNotNone(m)
+        # Universally quantified over every kind / relatedness / protector bit / permission.
+        self.assertRegex(m.group(1), r"\(kind : AccessKind\) \(rel : AccessRelatedness\)\s+\(isProt : Bool\) \(p : Permission\)")
 
     def test_mirStep_handles_emit_observations(self):
         m = re.search(r"def mirStep .*? :=.*?\n\n", self.code, re.S)
@@ -402,6 +420,104 @@ class ReportTests(unittest.TestCase):
         for pat in bench.INTERNAL_PATTERNS:
             self.assertIsNone(re.search(pat, text))
 
+    def test_report_theorem_counts_match_source(self):
+        code = strip_lean_comments(PROTO.read_text())
+        n = len(re.findall(r"^theorem\s", code, re.M))
+        counts = [int(c) for c in re.findall(r"\b(\d+) (?:kernel-checked theorems|axiom guards)\b",
+                                             REPORT.read_text())]
+        self.assertTrue(counts, "report must state the kernel-checked theorem / axiom guard count")
+        self.assertEqual(set(counts), {n}, f"report counts {counts} drifted from the {n} theorems")
+
+    # Report identifiers that are not Lean declarations (benchmark labels, receipt keys,
+    # Rust/Miri names, binder names, Lean keywords/core lemmas, workstream status).
+    NON_LEAN_NAMES = {
+        "split_at_mut", "get_mut", "t_arg", "t_ret", "termination_by", "List.drop_take",
+        "PROPOSED_HOLD", "skip_if_known_noop", "perform_access", "protector_end_access",
+    }
+
+    @staticmethod
+    def _decls(text: str) -> set[str]:
+        return set(re.findall(
+            r"^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+)*"
+            r"(?:theorem|lemma|def|abbrev|structure|inductive|instance|class)\s+([A-Za-z_][A-Za-z0-9_.'?!\u2080-\u2089]*)",
+            text, re.M))
+
+    @classmethod
+    def _declaration_index(cls) -> dict:
+        """Declared names of the prototype, of each live `theory/Anneal` module, and of the
+        trusted Lean tree (plus namespaces), cached across tests."""
+        if getattr(cls, "_index", None) is None:
+            live_files = [p for p in (REPO / "theory" / "Anneal").glob("*.lean") if p != PROTO]
+            namespaces = {f"Anneal.{p.stem}" for p in live_files}
+            trusted: set[str] = set()
+            for p in (REPO / "trusted" / "lean").rglob("*.lean"):
+                text = p.read_text()
+                trusted |= cls._decls(text)
+                namespaces |= set(re.findall(r"^namespace\s+(\S+)", text, re.M))
+
+            def with_suffixes(names: set[str]) -> set[str]:
+                return names | {n.rsplit(".", 1)[-1] for n in names}
+
+            by_module = {p.stem: with_suffixes(cls._decls(p.read_text())) for p in live_files}
+            trusted = with_suffixes(trusted)
+            cls._index = {
+                "proto": cls._decls(strip_lean_comments(PROTO.read_text())),
+                "by_module": by_module,
+                "trusted": trusted,
+                "live_all": trusted.union(*by_module.values()),
+                "namespaces": namespaces,
+            }
+        return cls._index
+
+    def unresolved_names(self, report: str) -> list[str]:
+        idx = self._declaration_index()
+        try:
+            receipt_keys = set(bench.extract_receipt(report))
+        except ValueError:
+            receipt_keys = set()
+        labels = set(bench.FAMILIES) | {v for vs in bench.FAMILIES.values() for v in vs}
+        unresolved = []
+        for tok in sorted(set(re.findall(r"`([^`\n]+)`", report))):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.'?\u2080-\u2089]*", tok):
+                continue
+            if tok.endswith((".lean", ".md", ".py", ".json")):
+                continue
+            qualified = tok.startswith(("Anneal.", "Trusted."))
+            if not qualified and "_" not in tok:
+                continue
+            if (tok in idx["proto"] or tok in labels or tok in receipt_keys or tok in self.NON_LEAN_NAMES
+                    or tok in idx["namespaces"]):
+                continue
+            if not qualified and hasattr(bench, tok):
+                continue  # harness function named in the methodology section
+            if not qualified and re.search(rf"^\s*def {re.escape(tok)}\(", pathlib.Path(__file__).read_text(), re.M):
+                continue  # unit test named in the round log
+            last = tok.rsplit(".", 1)[-1]
+            parts = tok.split(".")
+            if tok.startswith("Anneal.") and len(parts) > 2 and parts[1] in idx["by_module"]:
+                decls = idx["by_module"][parts[1]]
+                ok = ".".join(parts[2:]) in decls or last in decls
+            elif tok.startswith("Trusted."):
+                ok = last in idx["trusted"]
+            else:
+                ok = tok in idx["live_all"] or last in idx["live_all"]
+            if not ok:
+                unresolved.append(tok)
+        return unresolved
+
+    def test_report_names_resolve(self):
+        """Every Lean identifier cited in the report resolves to a prototype declaration or to a
+        declaration of the live module it names (catches report drift and invented live APIs)."""
+        self.assertEqual(self.unresolved_names(REPORT.read_text()), [],
+                         "report cites identifiers with no matching declaration")
+
+    def test_report_name_check_detects_invented_names(self):
+        fake = ("`Anneal.MirLoops.forRangeUp` `Anneal.MirLoops.forRangeUpMagic` `no_such_theorem_xyz` "
+                "`Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowNodeAccess` "
+                "`Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTeleport` `performTransition_accessed_eq_live`")
+        self.assertEqual(self.unresolved_names(fake),
+                         ["Anneal.MirLoops.forRangeUpMagic",
+                          "Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTeleport", "no_such_theorem_xyz"])
 
 if __name__ == "__main__":
     unittest.main()

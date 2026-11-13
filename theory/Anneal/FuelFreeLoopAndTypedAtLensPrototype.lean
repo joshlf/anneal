@@ -1545,6 +1545,19 @@ theorem length_applySlotUpdates {α : Type} :
     rw [show List.foldl (fun e u => e.set u.1 u.2) (env.set u.1 u.2) ups =
       applySlotUpdates (env.set u.1 u.2) ups from rfl, length_applySlotUpdates ups, List.length_set]
 
+/-- **Single-pass forcing is `forcePureEnv`-normalization of the update**:
+`setSpine?` returns exactly the `forcePureEnv` normal form of `env.set i v`. -/
+theorem setSpine?_eq_some_forcePureEnv_set {α : Type} [Inhabited α] (env : List α) (i : Nat)
+    (v : α) : setSpine? env i v = some (forcePureEnv env.length (env.set i v)) := by
+  rw [setSpine?_eq_some_set, forcePureEnv_eq_self env.length (env.set i v) List.length_set]
+
+/-- **The step-wise run computes the `forcePureEnv` normal form** of the
+unnormalized update sequence (`applySlotUpdates`). -/
+theorem applySlotUpdatesForced_eq_forcePureEnv {α : Type} [Inhabited α] (ups : List (Nat × α))
+    (env : List α) :
+    applySlotUpdatesForced ups env = some (forcePureEnv env.length (applySlotUpdates env ups)) := by
+  rw [applySlotUpdatesForced_eq, forcePureEnv_eq_self env.length _ (length_applySlotUpdates ups env)]
+
 /-- Twelve symbolic updates collapse by `rfl` through step-wise forcing. -/
 theorem slotUpdates_collapse_forced (a₀ a₁ a₂ a₃ a₄ a₅ x₁ x₂ x₃ x₄ x₅ x₆ : Nat) :
     applySlotUpdates [a₀, a₁, a₂, a₃, a₄, a₅]
@@ -1581,6 +1594,50 @@ theorem forcePureEnvSlots_set? {env env' : Anneal.MirLiftCore.PureEnv} {loc : Na
     exact forcePureEnvD_set_comm _ env.length env loc s (Or.inl hlt)
   · rw [ite_eq_right hlt] at h
     cases h
+
+/-- **Bridge from the live trusted slot update `Trusted.Sequence.set?`** (used by
+`Anneal.MirLiftCore.evalPureStmt`) to single-pass forcing: in range the live update
+*is* `setSpine?`, out of range it fails. -/
+theorem liveSet?_eq_setSpine? {α : Type} (env : List α) (loc : Nat) (v : α) :
+    Trusted.Sequence.set? env loc v = if loc < env.length then setSpine? env loc v else none := by
+  unfold Trusted.Sequence.set?
+  rw [setSpine?_eq_some_set]
+
+/-- Sequential live slot updates through `Trusted.Sequence.set?` (failing on the
+first out-of-range slot). -/
+def applySlotUpdatesLive? {α : Type} : List (Nat × α) → List α → Option (List α)
+  | [], env => some env
+  | u :: ups, env =>
+    match Trusted.Sequence.set? env u.1 u.2 with
+    | some env' => applySlotUpdatesLive? ups env'
+    | none => none
+
+/-- **Live update chains are computed by the step-wise forced run**: when every
+updated slot is in range, the live `Trusted.Sequence.set?` chain equals
+`applySlotUpdatesForced`, so the benchmarked `rfl` strategy proves live chains. -/
+theorem applySlotUpdatesLive?_eq_forced {α : Type} :
+    ∀ (ups : List (Nat × α)) (env : List α), (∀ u ∈ ups, u.1 < env.length) →
+      applySlotUpdatesLive? ups env = applySlotUpdatesForced ups env
+  | [], _, _ => rfl
+  | u :: ups, env, h => by
+    have hu : u.1 < env.length := h u (List.mem_cons_self ..)
+    have hrest : ∀ w ∈ ups, w.1 < (env.set u.1 u.2).length := fun w hw => by
+      rw [List.length_set]
+      exact h w (List.mem_cons_of_mem _ hw)
+    have hlive : Trusted.Sequence.set? env u.1 u.2 = some (env.set u.1 u.2) := by
+      unfold Trusted.Sequence.set?
+      rw [ite_eq_left hu]
+    simp only [applySlotUpdatesLive?, applySlotUpdatesForced, hlive, setSpine?_eq_some_set]
+    exact applySlotUpdatesLive?_eq_forced ups (env.set u.1 u.2) hrest
+
+/-- An out-of-range live update makes the live chain fail (where `List.set` would
+silently ignore it). -/
+theorem applySlotUpdatesLive?_oob {α : Type} (u : Nat × α) (ups : List (Nat × α)) (env : List α)
+    (h : env.length ≤ u.1) : applySlotUpdatesLive? (u :: ups) env = none := by
+  have hlive : Trusted.Sequence.set? env u.1 u.2 = none := by
+    unfold Trusted.Sequence.set?
+    rw [ite_eq_right (Nat.not_lt.mpr h)]
+  simp only [applySlotUpdatesLive?, hlive]
 
 end ForcePureEnv
 
@@ -2385,6 +2442,31 @@ theorem subplaceFieldLens_of_borrowSubplace_disjointOn
     exact ⟨f₁, ty₁, f₂, ty₂, hS₁, hS₂, hNeF, hSlice,
       fun c₁ c₂ d₁ d₂ => subplaceFieldLens_disjoint c₁ c₂ (fieldOff f₁) (fieldOff f₂) d₁ d₂ hSlice⟩
 
+/-- Non-vacuity of `subplaceFieldLens_of_borrowSubplace_disjointOn`: the layout
+hypothesis (quantified over *every* pair of distinct field indices) is satisfiable
+by a concrete two-field layout (field `f` at offset `2 f`, one byte wide for
+`f ≤ 1` and zero-width otherwise), and two distinctly tagged pointers into fields
+`0` and `1` of one allocation satisfy the live `BorrowSubplace.disjointOn`. -/
+theorem subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous
+    (ty : Trusted.Rustc.V2026_06_01.MirAst.Ty) :
+    (∀ f₁ f₂ : Trusted.Rustc.V2026_06_01.MirAst.FieldIdx, f₁ ≠ f₂ →
+      DisjointSlice (2 * f₁) (if f₁ ≤ 1 then 1 else 0) (2 * f₂) (if f₂ ≤ 1 then 1 else 0)) ∧
+    Anneal.SepLogicLenses.BorrowSubplace.disjointOn (fun k => .field k.offset ty)
+      { allocId := 0, offset := 0, tag := 1 } { allocId := 0, offset := 1, tag := 2 } := by
+  refine ⟨fun f₁ f₂ hne => ?_, ⟨by decide, Or.inr ⟨0, ty, 1, ty, rfl, rfl, by decide⟩⟩⟩
+  unfold DisjointSlice
+  by_cases h₁ : f₁ ≤ 1
+  · rw [ite_eq_left h₁]
+    by_cases h₂ : f₂ ≤ 1
+    · rw [ite_eq_left h₂]
+      rcases Nat.lt_or_gt_of_ne hne with hlt | hgt
+      · exact Or.inr (Or.inr (Or.inl (by omega)))
+      · exact Or.inr (Or.inr (Or.inr (by omega)))
+    · rw [ite_eq_right h₂]
+      exact Or.inr (Or.inl rfl)
+  · rw [ite_eq_right h₁]
+    exact Or.inl rfl
+
 end TypedAtLenses
 
 /-! ## 9. Two-stage Tree Borrows protector release with a pre-release `reborrowFootprint` -/
@@ -2511,7 +2593,14 @@ def Permission.associatedAccess : Permission → AccessKind
   | .active => .write
   | _ => .read
 
-/-- Per-location transition; `none` is undefined behavior. -/
+/-- Per-location transition; `none` is undefined behavior.  This is Miri's
+`perform_access` (per-permission transition, then the `ProtectedDisabled`
+protector check guarded by `accessed`), with Miri's `skip_if_known_noop` rule that
+a foreign access to a `Disabled` node is a no-op, and with a protected
+`ReservedIM` (an invariant violation that Miri asserts away) failing closed.
+`performTransition_accessed_eq_live` / `performTransition_unaccessed_eq_live`
+prove it equal to the live trusted `treeBorrowNodeAccess` /
+`treeBorrowPermTransition`. -/
 def performTransition (kind : AccessKind) (rel : AccessRelatedness) (isProtected : Bool)
     (st : LocationState) : Option LocationState :=
   match rel, kind with
@@ -2530,15 +2619,16 @@ def performTransition (kind : AccessKind) (rel : AccessRelatedness) (isProtected
   | .foreignAccess, .read =>
     match st.perm with
     | .reservedFrz c => some ⟨.reservedFrz (isProtected || c), st.accessed⟩
-    | .reservedIM => some ⟨.reservedIM, st.accessed⟩
-    | .active => if isProtected then none else some ⟨.frozen, st.accessed⟩
+    | .reservedIM => if isProtected then none else some ⟨.reservedIM, st.accessed⟩
+    | .active =>
+      if isProtected then (if st.accessed then none else some ⟨.disabled, st.accessed⟩)
+      else some ⟨.frozen, st.accessed⟩
     | .frozen => some ⟨.frozen, st.accessed⟩
     | .disabled => some ⟨.disabled, st.accessed⟩
   | .foreignAccess, .write =>
     match st.perm with
-    | .reservedIM =>
-      if isProtected then (if st.accessed then none else some ⟨.disabled, st.accessed⟩)
-      else some ⟨.reservedIM, st.accessed⟩
+    | .reservedIM => if isProtected then none else some ⟨.reservedIM, st.accessed⟩
+    | .disabled => some ⟨.disabled, st.accessed⟩
     | _ => if isProtected && st.accessed then none else some ⟨.disabled, st.accessed⟩
 
 inductive ChildrenVisitMode where
@@ -2700,12 +2790,14 @@ def AncestorWritable (st : LocationState) : Prop :=
 instance (st : LocationState) : Decidable (AncestorWritable st) :=
   inferInstanceAs (Decidable (st.perm = .active ∨ st.perm = .reservedFrz false ∨ st.perm = .reservedIM))
 
-/-- Non-ancestor states that never trap under foreign reads or writes. -/
+/-- Non-ancestor states that never trap under foreign reads or writes: unprotected,
+or unaccessed (Miri's `accessed` guard on the protector check) and not the
+fail-closed protected `ReservedIM`. -/
 def NonAncestorSafe (st : LocationState) (isProt : Bool) : Prop :=
-  isProt = false ∨ (st.accessed = false ∧ st.perm ≠ .active)
+  isProt = false ∨ (st.accessed = false ∧ st.perm ≠ .reservedIM)
 
 instance (st : LocationState) (isProt : Bool) : Decidable (NonAncestorSafe st isProt) :=
-  inferInstanceAs (Decidable (isProt = false ∨ (st.accessed = false ∧ st.perm ≠ .active)))
+  inferInstanceAs (Decidable (isProt = false ∨ (st.accessed = false ∧ st.perm ≠ .reservedIM)))
 
 /-- **`HasUniqueWritePerm`**: every ancestor of `tag` is writable on `range` and
 every non-ancestor is isolated (`NonAncestorSafe`). -/
@@ -3605,7 +3697,7 @@ theorem disjoint_access_preserves_hasUniqueWritePerm {tree : BorrowTree} {t_righ
 `HasUniqueWritePerm` of `t_right`. -/
 theorem disjoint_retagChild_preserves_hasUniqueWritePerm {tree : BorrowTree}
     {t_left t_child t_right : BorTag} {leftRange rightRange : ByteRange} {active : ActiveProtectors}
-    (prot : Option ProtectorKind) (initPerm : Permission) (hInit : initPerm ≠ .active)
+    (prot : Option ProtectorKind) (initPerm : Permission) (hInit : initPerm ≠ .reservedIM)
     (hRightPerm : HasUniqueWritePerm tree t_right rightRange active)
     (hDisj : leftRange.Disjoint rightRange) (hFresh : tree.present t_child = false) :
     HasUniqueWritePerm (retagChild tree t_left t_child prot initPerm leftRange active)
@@ -4673,6 +4765,103 @@ theorem liveBorrowEntryRange_contains_iff
       e.rangeOffset ≤ b ∧ b < e.rangeOffset + e.rangeLen :=
   ByteRange.contains_iff _ _
 
+/-- Live access kind of a prototype access. -/
+def AccessKind.toLive : AccessKind → Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowAccessKind
+  | .read => .read
+  | .write => .write
+
+/-- Live relatedness of a prototype relatedness. -/
+def AccessRelatedness.toLive :
+    AccessRelatedness → Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowRelatedness
+  | .localAccess => .localAccess
+  | .foreignAccess => .foreignAccess
+
+/-- Read a live per-node outcome back into the prototype: live UB (`.ub`) and the
+fail-closed `.protectedReservedIM` become `none`; a live transition to a
+non-`Cell` permission yields that permission with `accessed := acc`. -/
+def ofLiveTransition (acc : Bool) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowTransition → Option LocationState
+  | .transition q => (Permission.ofLiveTreeBorrowPerm? q).map (fun p => ⟨p, acc⟩)
+  | .ub => none
+  | .protectedReservedIM => none
+
+/-- **Semantic bridge to the live trusted Tree Borrows automaton**: on every
+accessed location (the live model's invariant: each live `BorrowEntry` stands for an
+accessed location), `performTransition` *is* the live `treeBorrowNodeAccess`
+(Miri's per-permission transition, the `ProtectedDisabled` protector check, and the
+foreign-access skip of `Disabled` nodes), for all access kinds, relatednesses,
+protector settings, and permissions. -/
+theorem performTransition_accessed_eq_live (kind : AccessKind) (rel : AccessRelatedness)
+    (isProt : Bool) (p : Permission) :
+    performTransition kind rel isProt ⟨p, true⟩ =
+      ofLiveTransition true
+        (Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowNodeAccess kind.toLive rel.toLive
+          p.toLiveTreeBorrowPerm isProt) := by
+  cases kind <;> cases rel <;> cases isProt <;> rcases p with (_ | _) | _ | _ | _ | _ <;> rfl
+
+/-- **Miri's `accessed` guard** on lazily initialized locations (which the live
+model does not represent): on an unaccessed location, a child access is the live
+per-permission transition (and marks the location accessed), and a foreign access is
+the live per-permission transition *without* the `ProtectedDisabled` check. -/
+theorem performTransition_unaccessed_eq_live (kind : AccessKind) (rel : AccessRelatedness)
+    (isProt : Bool) (p : Permission) :
+    performTransition kind rel isProt ⟨p, false⟩ =
+      ofLiveTransition (match rel with | .localAccess => true | .foreignAccess => false)
+        (Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowPermTransition kind.toLive rel.toLive
+          p.toLiveTreeBorrowPerm isProt) := by
+  cases kind <;> cases rel <;> cases isProt <;> rcases p with (_ | _) | _ | _ | _ | _ <;> rfl
+
+/-- UB detection on accessed locations coincides with the live
+`treeBorrowTransitionIsUB`. -/
+theorem performTransition_accessed_isSome_eq_live (kind : AccessKind) (rel : AccessRelatedness)
+    (isProt : Bool) (p : Permission) :
+    (performTransition kind rel isProt ⟨p, true⟩).isSome =
+      !Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTransitionIsUB
+        (Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowNodeAccess kind.toLive rel.toLive
+          p.toLiveTreeBorrowPerm isProt) := by
+  cases kind <;> cases rel <;> cases isProt <;> rcases p with (_ | _) | _ | _ | _ | _ <;> rfl
+
+/-- Protector-status bridge: a tag carrying a live entry's protector is protected
+under the active set `natListContainsBool l` exactly when the live
+`isBorrowProtected l e` holds. -/
+theorem isTagProtected_eq_live (tree : BorrowTree) (t : BorTag) (l : List Nat)
+    (e : Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (h : tree.protector t = liveBorrowEntryProtector e) :
+    tree.isTagProtected t (Trusted.Rustc.V2026_06_01.MirSemantics.natListContainsBool l) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected l e := by
+  unfold BorrowTree.isTagProtected Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected
+  rw [h]
+  unfold liveBorrowEntryProtector
+  cases e.protector <;> rfl
+
+/-- **Per-entry bridge**: for a tag mirroring a live `BorrowEntry` `e` (same
+non-`Cell` permission and protector), the prototype's per-location update under the
+live active-protector list `l` is the live per-entry outcome
+`treeBorrowNodeAccess … e.perm (isBorrowProtected l e)`. -/
+theorem performTransition_entry_eq_live (kind : AccessKind) (rel : AccessRelatedness)
+    (tree : BorrowTree) (t : BorTag) (l : List Nat) (p : Permission)
+    (e : Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (hPerm : e.perm = p.toLiveTreeBorrowPerm) (hProt : tree.protector t = liveBorrowEntryProtector e) :
+    performTransition kind rel
+        (tree.isTagProtected t (Trusted.Rustc.V2026_06_01.MirSemantics.natListContainsBool l))
+        ⟨p, true⟩ =
+      ofLiveTransition true
+        (Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowNodeAccess kind.toLive rel.toLive e.perm
+          (Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected l e)) := by
+  rw [isTagProtected_eq_live tree t l e hProt, hPerm]
+  exact performTransition_accessed_eq_live kind rel _ p
+
+/-- Regression (Round A1): a foreign write to a protected, accessed `Disabled`
+location is a no-op (Miri `skip_if_known_noop`, live `treeBorrowNodeAccess`), not UB. -/
+theorem foreign_write_disabled_protected_noop :
+    performTransition .write .foreignAccess true ⟨.disabled, true⟩ = some ⟨.disabled, true⟩ := rfl
+
+/-- Regression (Round A1): a protected `ReservedIM` fails closed under every foreign
+access, accessed or not (live `.protectedReservedIM`). -/
+theorem protected_reservedIM_foreign_fails_closed (kind : AccessKind) (acc : Bool) :
+    performTransition kind .foreignAccess true ⟨.reservedIM, acc⟩ = none := by
+  cases kind <;> rfl
+
 end TreeBorrows
 
 /-! ## 10. Kernel axiom audit (`#guard_msgs in #print axioms`) -/
@@ -4919,6 +5108,26 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms runToTarget_outOfFuel_vs_reached
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stepCfg_infiniteLoop' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stepCfg_infiniteLoop
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalFuel_infiniteLoop_outOfFuel' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalFuel_infiniteLoop_outOfFuel
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.not_wpConverges_infiniteLoop' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms not_wpConverges_infiniteLoop
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_infiniteLoop_unreached' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runUntilTarget_infiniteLoop_unreached
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runToTarget_infiniteLoop_outOfFuel' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runToTarget_infiniteLoop_outOfFuel
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stepMirFn_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_of_mirStep_cont
@@ -4954,6 +5163,22 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirWpConverges_forRangeUp' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms mirWpConverges_forRangeUp
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_entry' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runMirToBlock_countToN_entry
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_iter' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runMirToBlock_countToN_iter
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_exit' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runMirToBlock_countToN_exit
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_countToN_mirWpConverges_all_n' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_countToN_mirWpConverges_all_n
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.blockTargets_toMirBlock' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
@@ -5011,6 +5236,18 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms forcePureEnv_eq_self
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnvD_eq_take_append_replicate' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms forcePureEnvD_eq_take_append_replicate
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnv_ne_self_of_length_ne' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms forcePureEnv_ne_self_of_length_ne
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnv_eq_self_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms forcePureEnv_eq_self_iff
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.getD_zero_eq_headD' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms getD_zero_eq_headD
@@ -5055,6 +5292,14 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms forceSpine?_eq_some_forcePureEnv
 
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpine?_eq_some_set' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpine?_eq_some_set
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpine?_eq_forceSpine?_set' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpine?_eq_forceSpine?_set
+
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesForced_eq' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms applySlotUpdatesForced_eq
@@ -5066,6 +5311,14 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.length_applySlotUpdates' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms length_applySlotUpdates
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpine?_eq_some_forcePureEnv_set' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setSpine?_eq_some_forcePureEnv_set
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesForced_eq_forcePureEnv' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesForced_eq_forcePureEnv
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.slotUpdates_collapse_forced' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -5082,6 +5335,18 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnvSlots_set?' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms forcePureEnvSlots_set?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.liveSet?_eq_setSpine?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms liveSet?_eq_setSpine?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesLive?_eq_forced' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesLive?_eq_forced
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.applySlotUpdatesLive?_oob' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms applySlotUpdatesLive?_oob
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.length_splice' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
@@ -5290,6 +5555,22 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.u8Fields_six_mutations' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms u8Fields_six_mutations
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_of_canonicalAt' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_of_canonicalAt
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_of_fieldsValid' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_laidOutPair_of_fieldsValid
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.subplaceFieldLens_of_borrowSubplace_disjointOn' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms subplaceFieldLens_of_borrowSubplace_disjointOn
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms subplaceFieldLens_of_borrowSubplace_disjointOn_nonvacuous
 
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.ByteRange.contains_iff' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -5547,74 +5828,6 @@ end TreeBorrows
 #guard_msgs (whitespace := lax) in
 #print axioms split_at_mut_rootTree_nonvacuous
 
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stepCfg_infiniteLoop' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms stepCfg_infiniteLoop
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalFuel_infiniteLoop_outOfFuel' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms evalFuel_infiniteLoop_outOfFuel
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.not_wpConverges_infiniteLoop' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms not_wpConverges_infiniteLoop
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_infiniteLoop_unreached' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runUntilTarget_infiniteLoop_unreached
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runToTarget_infiniteLoop_outOfFuel' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runToTarget_infiniteLoop_outOfFuel
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_entry' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runMirToBlock_countToN_entry
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_iter' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runMirToBlock_countToN_iter
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_countToN_exit' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms runMirToBlock_countToN_exit
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_countToN_mirWpConverges_all_n' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms live_countToN_mirWpConverges_all_n
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnvD_eq_take_append_replicate' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms forcePureEnvD_eq_take_append_replicate
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnv_ne_self_of_length_ne' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms forcePureEnv_ne_self_of_length_ne
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.forcePureEnv_eq_self_iff' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms forcePureEnv_eq_self_iff
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpine?_eq_some_set' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setSpine?_eq_some_set
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setSpine?_eq_forceSpine?_set' depends on axioms: [propext] -/
-#guard_msgs (whitespace := lax) in
-#print axioms setSpine?_eq_forceSpine?_set
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_of_canonicalAt' depends on axioms: [Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms typedAt_of_canonicalAt
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_of_fieldsValid' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms typedAt_laidOutPair_of_fieldsValid
-
-/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.subplaceFieldLens_of_borrowSubplace_disjointOn' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs (whitespace := lax) in
-#print axioms subplaceFieldLens_of_borrowSubplace_disjointOn
-
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.reborrow_return_after_parent_write_unique_write_perm' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms reborrow_return_after_parent_write_unique_write_perm
@@ -5638,5 +5851,33 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.liveBorrowEntryRange_contains_iff' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms liveBorrowEntryRange_contains_iff
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_accessed_eq_live' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_accessed_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_unaccessed_eq_live' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_unaccessed_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_accessed_isSome_eq_live' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_accessed_isSome_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.isTagProtected_eq_live' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms isTagProtected_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.performTransition_entry_eq_live' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms performTransition_entry_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.foreign_write_disabled_protected_noop' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms foreign_write_disabled_protected_noop
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.protected_reservedIM_foreign_fails_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms protected_reservedIM_foreign_fails_closed
 
 end Anneal.FuelFreeLoopAndTypedAtLensPrototype
