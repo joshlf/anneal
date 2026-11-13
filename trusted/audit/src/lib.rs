@@ -29,20 +29,26 @@
 //!    pre-existing `.olean`/`.ilean`/`.ir` artifacts (preventing pre-compiled
 //!    `.olean` files from shadowing source compilation). The `lean` binary
 //!    version and SHA-256 digest must match `trusted/lean/foundation-lock.json`
-//!    (Lean v4.34.1), and every `Init.*` module's `.lean` source and
-//!    `.olean`/`.ir` companion parts must match the lock's presence/absence
-//!    specification, producing a verified [`AdmittedToolchain`].
+//!    (Lean v4.34.1), and each locked foundation module's source and artifact
+//!    parts must match the lock's presence/absence specification, producing a
+//!    verified [`AdmittedToolchain`]. Additional library import closures are
+//!    authenticated before use; their `Init.*` names do not add them to the
+//!    foundation base.
 //! 3. **Hermetic preflight and synchronous `--setup` compilation
 //!    ([`Checker::new_with_env`], [`Checker::inspect`],
 //!    [`Checker::compile_lean_module`]):** Ambient `LEAN_*`, `LAKE_*`,
 //!    `ELAN_*`, and `LD_*`/`DYLD_*` variables are stripped. Before any `.lean`
-//!    file is compiled, `TrustedBoundary.lean` runs in
-//!    [`InspectorRequest::Preflight`] mode using only the locked `foundation`
-//!    parser environment to reject forbidden syntax (`axiom`, `unsafe`,
+//!    repository source is compiled, `TrustedBoundary.lean` runs in
+//!    [`InspectorRequest::Preflight`] mode using the authenticated foundation
+//!    and admitted libraries' parser environment to reject forbidden syntax
+//!    (`axiom`, `unsafe`,
 //!    `partial`, `meta`, `native_decide`, `by_elab`, `#eval`, `set_option`,
 //!    compiler-override attributes, etc.) and extract each `Trusted` module's
-//!    typed [`TrustTier`] (`-- anneal-trust-tier:` directive). Admitted modules
-//!    are then compiled in topological order via `lean --setup
+//!    typed [`TrustTier`] (`-- anneal-trust-tier:` directive). Loading this
+//!    parser environment executes authenticated initializers and parser
+//!    extensions, which belong to the runtime TCB. Logical library dependencies
+//!    remain subject to kernel replay. Admitted source modules are then compiled
+//!    in topological order via `lean --setup
 //!    <module>.setup.json -DElab.async=false -Ddebug.skipKernelTC=false`,
 //!    binding every import directly to its staged `.olean` path.
 //! 4. **Module-level trust-tier separation and namespace hygiene
@@ -51,12 +57,15 @@
 //!    constant compiled into that module's `.olean` inherits its origin
 //!    module's tier. Constants in `vetted` modules never reference constants in
 //!    `candidate:<feature>` modules; `Trusted` modules never import or
-//!    reference `theory/` (`Anneal.*`); and non-`Trusted` modules cannot
-//!    declare constants in the `Trusted` namespace or `opaque` definitions.
-//! 5. **Zero custom axioms and full kernel replay ([`Checker::run`]):** All
-//!    non-foundation constants in `Trusted` and `Anneal` are checked against
-//!    the foundation axiom allowlist in `foundation-lock.json` and replayed
-//!    from scratch through `base.toKernelEnv.replay` with `loadExts := false`.
+//!    reference `theory/` (`Anneal.*`); and non-`Trusted` repository modules
+//!    cannot declare constants in the `Trusted` namespace or
+//!    `opaque` definitions.
+//! 5. **Zero custom axioms and full kernel replay ([`Checker::run`]):** Every
+//!    repository constant and its logically reached library declarations are
+//!    checked against the locked foundation axiom allowlist and replayed via
+//!    `base.toKernelEnv.replay` with `loadExts := false`. The base contains
+//!    only the foundation module set; authenticated libraries do not become
+//!    additional logical assumptions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -72,8 +81,69 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+/// Fields needed from Lean's JSON diagnostic stream, not inspector JSON IPC.
+#[derive(Deserialize)]
+struct LeanCompileDiagnostic {
+    severity: LeanDiagnosticSeverity,
+    kind: String,
+    data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LeanDiagnosticSeverity {
+    Information,
+    Warning,
+    Error,
+}
+
+// Exit 1 alone is ambiguous: the pinned runtime prints "INTERNAL PANIC" to
+// stderr and then calls std::exit(1), including on native allocation failure.
+// https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/runtime/object.cpp
+// Lean's --json option instead reports frontend messages as JSON, "one per
+// line". Require a complete diagnostic stream with an error and no stderr;
+// an earlier type error must not hide a later native failure on stderr.
+// https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Shell.lean#L172
+//
+// This is a conservative UX classification, not proof that a claim is false
+// or a complete taxonomy of compiler defects. Both failure classes reject
+// the run. Unknown output remains operational. Lean tags frontend resource
+// limits as runtime.*, but kernel exceptions become anonymous messages with
+// a "(kernel)" prefix; conservatively classify every kernel diagnostic as
+// operational, including kernel type errors, rather than infer its cause.
+// https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/CoreM.lean#L479-L485
+// https://github.com/leanprover/lean4/blob/5045d0056413266e57c625dcd7c365b10e377c52/src/Lean/Message.lean#L867-L893
+fn reports_frontend_rejection(output: &Output) -> bool {
+    if output.status.code() != Some(1) || !output.stderr.is_empty() {
+        return false;
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    let mut has_error = false;
+    for line in stdout.lines() {
+        let Ok(diagnostic) = serde_json::from_str::<LeanCompileDiagnostic>(line) else {
+            return false;
+        };
+        if diagnostic.kind.is_empty()
+            || diagnostic
+                .kind
+                .trim_start_matches("nested.")
+                .starts_with("runtime.")
+            || diagnostic.data.starts_with("(kernel)")
+        {
+            return false;
+        }
+        has_error |= matches!(diagnostic.severity, LeanDiagnosticSeverity::Error);
+    }
+    has_error
+}
+
 /// JSON value representation used at the `TrustedBoundary.lean` IPC boundary.
 pub type Json = serde_json::Value;
+
+mod target;
+pub use target::{TargetAuditRequest, TargetBindings, TargetModule, TargetRole};
 
 /// Pinned Lean 4 toolchain identifier required by `foundation-lock.json`.
 pub const TOOLCHAIN: &str = "leanprover/lean4:v4.34.1";
@@ -94,12 +164,14 @@ pub const PARTS: [&str; 5] = ["olean", "olean.server", "olean.private", "ir.sig"
 // Domain types
 // ---------------------------------------------------------------------------
 
-/// Structured audit failure distinguishing policy rejections (`code == 1`)
-/// from operational or environment failures (`code == 2`).
+/// Structured audit failure distinguishing reported frontend/source or policy
+/// rejections (`code == 1`) from operational or environment failures
+/// (`code == 2`).
+/// A rejection does not establish that the requested proposition is false.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct Failure {
-    /// Process exit code (`1` for policy rejection, `2` for operational error).
+    /// Process exit code: `1` for reported rejection, `2` for operational error.
     pub code: i32,
     /// Audit phase in which the failure occurred.
     pub phase: String,
@@ -273,16 +345,20 @@ pub struct ImportEdge {
     pub is_meta: bool,
 }
 
-/// Typed request sent to `TrustedBoundary.lean`.
+/// Typed request sent to the kernel inspector.
 ///
-/// Encoding the two inspector phases as a sum type ensures that `"preflight"`
-/// is always invoked with a source list against the foundation graph, and
-/// `"audit"` is always invoked with the full module inventory and validated
-/// [`TrustTier`] map.
+/// Repository syntax admission and target theorem acceptance remain distinct
+/// modes. Target sources cannot opt repository modules out of their closed
+/// syntax policy, and checked libraries never join the replay foundation.
 #[derive(Debug, Clone)]
 pub enum InspectorRequest {
+    /// Discover source imports without elaborating source commands.
+    Headers { sources: Vec<(String, PathBuf)> },
+    /// Inspect an exact external theorem against acceptance-owned inputs.
+    TargetAudit { request: TargetAuditRequest },
     /// Phase 1 (`"preflight"`): parse `(module_name, staged_path)` pairs
-    /// against the locked foundation parser environment before any elaboration.
+    /// against the authenticated foundation and admitted library parser
+    /// environment, without elaborating the source commands being inspected.
     Preflight { sources: Vec<(String, PathBuf)> },
     /// Phase 2 (`"audit"`): load compiled `.olean`s with `loadExts := false`,
     /// verify module-level trust tiers and namespace hygiene, and replay all
@@ -295,9 +371,11 @@ pub enum InspectorRequest {
 }
 
 impl InspectorRequest {
-    /// Return the wire mode tag (`"preflight"` or `"audit"`).
+    /// Return the inspector protocol mode tag.
     pub const fn mode(&self) -> &'static str {
         match self {
+            Self::Headers { .. } => "headers",
+            Self::TargetAudit { .. } => "target-audit",
             Self::Preflight { .. } => "preflight",
             Self::Audit { .. } => "audit",
         }
@@ -1101,6 +1179,16 @@ struct FoundationLock {
     axioms: Vec<(String, String)>,
 }
 
+/// Authenticated installed modules that must still be kernel replayed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryLock {
+    schema: i64,
+    toolchain: String,
+    modules: BTreeMap<String, FoundationModuleRecord>,
+    graph: BTreeMap<String, Vec<ImportEdge>>,
+}
+
 /// Verified toolchain, `foundation-lock.json` metadata, and staged source state
 /// produced by [`Checker::tool_admission`].
 ///
@@ -1132,6 +1220,10 @@ pub struct AdmittedToolchain {
     /// Staged `Anneal.*` (`theory/`) source files
     /// (`module_name -> staged_path`).
     pub theory_modules: BTreeMap<String, PathBuf>,
+    /// Installed module catalog, authenticated lazily for each import closure.
+    library_lock: Option<LibraryLock>,
+    /// Already authenticated checked libraries. These never join the base.
+    pub library_modules: BTreeSet<String>,
 }
 
 impl AdmittedToolchain {
@@ -1316,6 +1408,19 @@ impl Checker {
     /// Execute `self.lean` with `arguments` in the sanitized `self.environment`
     /// with `self.stage` as the working directory.
     pub fn process(&mut self, label: &str, arguments: &[String]) -> Result<String, Failure> {
+        self.process_with_exit_policy(label, arguments, false)
+    }
+
+    /// Target compilation recognizes a reported frontend/source rejection from
+    /// JSON diagnostics. Unknown output and resource/kernel reports remain
+    /// operational; this classification does not establish proof falsity.
+    /// Repository invocations preserve their existing all-operational policy.
+    fn process_with_exit_policy(
+        &mut self,
+        label: &str,
+        arguments: &[String],
+        ordinary_rejection: bool,
+    ) -> Result<String, Failure> {
         self.counter += 1;
         let output = self
             .launch_lean(arguments)
@@ -1323,13 +1428,16 @@ impl Checker {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr.trim().is_empty() {
-                stdout.trim()
+            // Keep both streams: a frontend error can precede a runtime
+            // failure, and dropping either stream hides that distinction.
+            let detail = format!("stdout:\n{}\nstderr:\n{}", stdout.trim(), stderr.trim());
+            let code = if ordinary_rejection && reports_frontend_rejection(&output) {
+                1
             } else {
-                stderr.trim()
+                2
             };
             return Err(Failure::new(
-                2,
+                code,
                 label,
                 format!("Lean exited {:?}: {detail}", output.status.code()),
             ));
@@ -1377,7 +1485,19 @@ impl Checker {
             .map(|(k, parts)| json!([k, parts.to_wire()]))
             .collect();
         let foundation = adm.foundation_modules();
+        let libraries: Vec<&str> = adm.library_modules.iter().map(String::as_str).collect();
         let req = match &request {
+            InspectorRequest::Headers { sources } => json!({
+                "mode": "headers", "sysroot": adm.prefix.to_string_lossy(),
+                "foundation": foundation, "sources": sources,
+            }),
+            InspectorRequest::TargetAudit { request } => json!({
+                "mode": "target-audit", "sysroot": adm.prefix.to_string_lossy(),
+                "artifacts": arts_arr, "foundation": foundation,
+                "libraries": libraries, "graph": &adm.graph,
+                "axioms": &adm.axioms,
+                "target": target::InspectorTargetAuditRequest::from(request),
+            }),
             InspectorRequest::Preflight { sources } => {
                 let src_pairs: Vec<(&str, std::borrow::Cow<'_, str>)> = sources
                     .iter()
@@ -1388,7 +1508,8 @@ impl Checker {
                     "sysroot": adm.prefix.to_string_lossy(),
                     "artifacts": arts_arr,
                     "foundation": foundation,
-                    "graph": &adm.foundation_graph,
+                    "graph": &adm.graph,
+                    "libraries": libraries,
                     "axioms": &adm.axioms,
                     "sources": src_pairs,
                 })
@@ -1408,6 +1529,7 @@ impl Checker {
                     "artifacts": arts_arr,
                     "foundation": foundation,
                     "graph": &adm.graph,
+                    "libraries": libraries,
                     "axioms": &adm.axioms,
                     "trusted": trusted,
                     "theory": theory,
@@ -1686,6 +1808,36 @@ impl Checker {
             artifacts.insert(module.clone(), mod_arts);
         }
 
+        let library_lock_path = self.checkout.join("trusted/audit/library-lock.json");
+        let library_lock = if library_lock_path.exists() {
+            regular(&library_lock_path, "library-lock")?;
+            let lock: LibraryLock = serde_json::from_slice(
+                &fs::read(&library_lock_path)
+                    .map_err(|e| Failure::operational("library-lock", e.to_string()))?,
+            )
+            .map_err(|e| Failure::operational("library-lock", e.to_string()))?;
+            if lock.schema != 1
+                || lock.toolchain != TOOLCHAIN
+                || !lock.modules.keys().eq(lock.graph.keys())
+                || lock
+                    .modules
+                    .keys()
+                    .any(|m| parsed_lock.modules.contains_key(m))
+                || lock.graph.values().flatten().any(|e| {
+                    !lock.modules.contains_key(&e.module)
+                        && !parsed_lock.modules.contains_key(&e.module)
+                })
+            {
+                return Err(Failure::operational(
+                    "library-lock",
+                    "invalid checked-library catalog",
+                ));
+            }
+            Some(lock)
+        } else {
+            None
+        };
+
         self.admitted = Some(AdmittedToolchain {
             inspector,
             version: actual_version,
@@ -1696,6 +1848,8 @@ impl Checker {
             artifacts,
             modules,
             theory_modules,
+            library_lock,
+            library_modules: BTreeSet::new(),
         });
         Ok(self.admitted.as_mut().unwrap())
     }
@@ -1787,6 +1941,7 @@ impl Checker {
         edge_list: Vec<ImportEdge>,
         lib_subdir: &str,
         warn_as_err: bool,
+        target_rejection: bool,
     ) -> Result<(), Failure> {
         let setup_path = self.write_setup_json(module, &edge_list)?;
         let output = self
@@ -1804,6 +1959,11 @@ impl Checker {
             "-DElab.async=false".to_string(),
             "-Ddebug.skipKernelTC=false".to_string(),
         ];
+        if target_rejection {
+            // Only compilation uses the diagnostic protocol. Inspector modes
+            // have their own explicit JSON response and failure categories.
+            compile_args.push("--json".to_string());
+        }
         if warn_as_err {
             compile_args.push("-DwarningAsError=true".to_string());
         }
@@ -1814,7 +1974,11 @@ impl Checker {
             output.to_string_lossy().into_owned(),
             src_path.to_string_lossy().into_owned(),
         ]);
-        self.process(&format!("compile-{module}"), &compile_args)?;
+        self.process_with_exit_policy(
+            &format!("compile-{module}"),
+            &compile_args,
+            target_rejection,
+        )?;
 
         let stem = output
             .file_name()
@@ -1847,6 +2011,25 @@ impl Checker {
         check_checkout_cargo_hygiene(&self.checkout)?;
         self.reset_stage()?;
         self.tool_admission()?;
+        if self.admitted()?.library_lock.is_some() {
+            let sources = {
+                let adm = self.admitted()?;
+                adm.modules
+                    .iter()
+                    .chain(adm.theory_modules.iter())
+                    .map(|(n, p)| (n.clone(), p.clone()))
+                    .collect()
+            };
+            let headers: PreflightResult =
+                serde_json::from_value(self.inspect(InspectorRequest::Headers { sources })?)
+                    .map_err(|e| Failure::operational("headers", e.to_string()))?;
+            self.admit_libraries(
+                headers
+                    .headers
+                    .iter()
+                    .flat_map(|h| h.imports.iter().map(|e| e.module.clone())),
+            )?;
+        }
         let preflight = self.preflight_repo_modules()?;
 
         let (trusted_set, theory_set) = {
@@ -1865,14 +2048,21 @@ impl Checker {
             let edge_list = preflight.imports[module].clone();
             let staged_src_path = self.admitted()?.modules[module].clone();
             self.execution_began = true;
-            self.compile_lean_module(module, &staged_src_path, edge_list, "lib", false)?;
+            self.compile_lean_module(module, &staged_src_path, edge_list, "lib", false, false)?;
         }
 
         for module in &theory_order {
             let edge_list = preflight.imports[module].clone();
             let staged_src_path = self.admitted()?.theory_modules[module].clone();
             self.execution_began = true;
-            self.compile_lean_module(module, &staged_src_path, edge_list, "theory-lib", true)?;
+            self.compile_lean_module(
+                module,
+                &staged_src_path,
+                edge_list,
+                "theory-lib",
+                true,
+                false,
+            )?;
         }
 
         let audit_req = {
@@ -2147,6 +2337,142 @@ mod process_tests {
         let error = checker.launch_lean(&[]).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn classifies_only_reported_frontend_rejection_as_policy_failure() {
+        let checkout = tempfile::tempdir().unwrap();
+        let mut checker = shell_checker(checkout.path());
+        let diagnostic = serde_json::json!({
+            "severity": "error", "kind": "[anonymous]", "data": "Type mismatch"
+        })
+        .to_string();
+        fs::write(checker.stage.join("diagnostic"), &diagnostic).unwrap();
+        for (script, target_rejection, expected_code) in [
+            ("cat diagnostic; exit 1", true, 1),
+            ("cat diagnostic; exit 1", false, 2),
+            (
+                "printf 'INTERNAL PANIC: out of memory' >&2; exit 1",
+                true,
+                2,
+            ),
+            (
+                "cat diagnostic; printf 'INTERNAL PANIC: out of memory' >&2; exit 1",
+                true,
+                2,
+            ),
+            ("printf rejected >&2; exit 1", true, 2),
+            ("printf 'unexpected output'; exit 1", true, 2),
+            (
+                "cat diagnostic; printf 'unexpected output'; exit 1",
+                true,
+                2,
+            ),
+            ("exit 1", true, 2),
+            ("cat diagnostic; exit 2", true, 2),
+            ("cat diagnostic; exit 37", true, 2),
+            ("kill -TERM $$", true, 2),
+        ] {
+            let error = checker
+                .process_with_exit_policy(
+                    "fixture",
+                    &["-c".to_string(), script.to_string()],
+                    target_rejection,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, expected_code, "{script}: {error}");
+            assert_eq!(error.phase, "fixture");
+            if script.contains("cat diagnostic") {
+                assert!(error.message.contains(&diagnostic), "{error}");
+            }
+            if script.contains("INTERNAL PANIC") {
+                assert!(error.message.contains("INTERNAL PANIC"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_resource_diagnostics_remain_operational() {
+        let checkout = tempfile::tempdir().unwrap();
+        let mut checker = shell_checker(checkout.path());
+        let ordinary = serde_json::json!({
+            "severity": "error", "kind": "[anonymous]", "data": "Type mismatch"
+        });
+        let warning = serde_json::json!({
+            "severity": "warning", "kind": "[anonymous]", "data": "warning"
+        });
+        for (stream, expected) in [
+            (warning.to_string(), 2),
+            (format!("{warning}\n{ordinary}"), 1),
+            (format!("{ordinary}\n{warning}"), 1),
+        ] {
+            fs::write(checker.stage.join("diagnostic"), &stream).unwrap();
+            let error = checker
+                .process_with_exit_policy(
+                    "fixture",
+                    &["-c".into(), "cat diagnostic; exit 1".into()],
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, expected, "{stream}: {error}");
+        }
+        for diagnostic in [
+            serde_json::json!({"severity": "unknown", "kind": "[anonymous]", "data": "new severity"}),
+            serde_json::json!({"severity": "error", "kind": "runtime.maxHeartbeats", "data": "timeout"}),
+            serde_json::json!({"severity": "error", "kind": "nested.runtime.maxRecDepth", "data": "depth"}),
+            serde_json::json!({"severity": "error", "kind": "[anonymous]", "data": "(kernel) excessive memory consumption detected"}),
+            serde_json::json!({"severity": "error", "data": "missing kind"}),
+            serde_json::json!({"severity": "error", "kind": "", "data": "missing category"}),
+        ] {
+            for prefix in [String::new(), format!("{ordinary}\n")] {
+                fs::write(
+                    checker.stage.join("diagnostic"),
+                    format!("{prefix}{diagnostic}\n"),
+                )
+                .unwrap();
+                let error = checker
+                    .process_with_exit_policy(
+                        "fixture",
+                        &["-c".into(), "cat diagnostic; exit 1".into()],
+                        true,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code, 2, "{diagnostic}: {error}");
+            }
+        }
+        for script in [
+            "printf '\\377'; exit 1",
+            "cat diagnostic; printf '\\377' >&2; exit 1",
+            "printf '{}'; exit 1",
+        ] {
+            let error = checker
+                .process_with_exit_policy("fixture", &["-c".into(), script.into()], true)
+                .unwrap_err();
+            assert_eq!(error.code, 2, "{script}: {error}");
+        }
+    }
+
+    #[test]
+    fn target_launch_and_output_errors_remain_operational() {
+        let checkout = tempfile::tempdir().unwrap();
+        let missing = checkout.path().join("missing-lean");
+        let mut checker = Checker::new_with_env(checkout.path(), Some(&missing), []).unwrap();
+        let error = checker
+            .process_with_exit_policy("fixture", &[], true)
+            .unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("could not execute Lean"));
+
+        let mut checker = shell_checker(checkout.path());
+        let error = checker
+            .process_with_exit_policy(
+                "fixture",
+                &["-c".to_string(), "printf '\\377'".to_string()],
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("invalid UTF-8 from Lean"));
     }
 
     #[test]
