@@ -1363,12 +1363,16 @@ theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach) :
 
 /-- **Axiom-audit hook for Episode 2's `.call`, `LIntrinsicOp`, and `LCallTable` multi-callee model
 (`call_intrinsic_audit_closure`)**: references every Episode 2 theorem of
-`Anneal.Mir.AdtAndControl` (Section 3b `.call` refinement + Sections 5a–5e: `LIntrinsicOp`,
-`LCallTarget`, `V2026_06_01` adapter, UB parity, `abort`/`panicUnwind`, call-form `write_bytes` /
-`copy_nonoverlapping`, `LCallTable` multi-frame linked-callee refinement, and concrete non-vacuity
-Witness Suites 1–4), ensuring `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` and
+`Anneal.Mir.AdtAndControl` (Section 3b `.call` refinement + Sections 5a–5i: `LIntrinsicOp`,
+`LCallTarget`, `V2026_06_01` adapter and its Episode 1 parity, UB / fault parity,
+`abort`/`panicUnwind`, call-form `write_bytes` / `copy_nonoverlapping`, projected and
+`PartialShell` call destinations, `LCallTable` multi-frame linked-callee refinement with
+depth-limit, abort-propagation, unwinding, and cross-frame isolation lemmas, and the concrete
+non-vacuity Witness Suites 1–10), ensuring `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` and
 `#assert_all_minirustspec_standard_axioms` verify standard-axiom purity (`sorry_free=true`, zero
-`Lean.ofReduceBool`) across all of them transitively. -/
+`Lean.ofReduceBool`) across all of them transitively. The symbolic `MiniRustSpec` bridges built on
+these theorems (`abort`, `unreachable_unchecked`, `*_nonzero` vs `Assume`, two-sided success
+parity, and negative controls) live in `Correspondence.IntrinsicBoundary` Section 8. -/
 theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalOperandsState_below_refines
   let _ := @Anneal.Mir.AdtAndControl.writePlaceState_bare_below_refines

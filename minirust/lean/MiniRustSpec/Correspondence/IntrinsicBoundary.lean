@@ -59,6 +59,16 @@ store), so that `lake build MiniRustSpec` builds it together with
 `Anneal.Mir.AdtAndControl` (guarding both against drift of the Trusted
 semantics they refine) and `MiniRustSpec.Audit` audits it together with the
 `Anneal.Mir.AdtAndControl` theorems that its `subplace_audit_closure` mentions.
+
+Sections 7 and 8 relate Episode 2's lowered `Anneal.Mir.AdtAndControl.LIntrinsicOp` evaluator to
+MiniRust: Section 7 gives the symbolic `ctpop` bridge, exhaustive bit-manipulation and saturating
+correspondences against the `IntrinsicFallback` specifications, and the `V2026_06_01` adapter
+classification; Section 8 (`[adv ep2-B3]`) proves MiniRust integer arithmetic total on the
+`ok`/UB dichotomy (upgrading the `DeinitBridge` unchecked, shift, and `exact_div` bridges to
+two-sided success parity), links the bits of `three_way_compare` / `ub_checks` to MiniRust's
+decoding of them, relates `abort`, `unreachable_unchecked`, and `ctlz_nonzero` / `cttz_nonzero` to
+MiniRust's `IntrinsicOp::Abort`, `Terminator::Unreachable`, and `IntrinsicOp::Assume` for all
+inputs, and records negative controls and `i8` signedness-independence checks.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -1174,5 +1184,374 @@ theorem lowerIntrinsicKind_boundary_correspondence :
           "core::intrinsics::ctlz" [.uint .u8] =
         .inlineIntrinsic .ctlz [.uint .u8] :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## 8. `[adv ep2-B3]` Two-sided success parity, bit-level value links, diverging intrinsics,
+`*_nonzero` vs MiniRust `Assume`, and negative controls
+
+The Section 7 / `DeinitBridge` bridges state one-directional implications (`MiniRust ok → Anneal
+some` and `MiniRust UB → Anneal none`). Those implications would hold vacuously if MiniRust's
+`evalBinOp` could return some third outcome (`specPanic`, `unsupported`, ...) on the operands in
+question. Section 8a closes that hole: `evalIntBinOp_ok_or_ub` proves MiniRust integer arithmetic
+is total on the `ok`/`UB` dichotomy, which upgrades the unchecked-arithmetic, unchecked-shift, and
+`exact_div` bridges to genuine `isSome ↔ ok` equivalences. Section 8b ties the *same bits* Anneal
+returns for `three_way_compare` and `ub_checks` to MiniRust's decoding of them (`valOf`),
+instead of pairing two independently computed results. Section 8c lifts the diverging
+`abort` / `unreachable_unchecked` correspondence from a single witness body to every
+`evalLoweredIntrinsicCall` input and connects `abort` to MiniRust's `IntrinsicOp::Abort` and
+`ctlz_nonzero` / `cttz_nonzero` to MiniRust's `IntrinsicOp::Assume`. Section 8d records concrete
+negative controls that a mis-wired bridge (wrapping vs unchecked vs saturating, signed vs
+unsigned, operand width) would fail, and Section 8e checks signedness independence of the
+bit-manipulation intrinsics exhaustively on `i8`. -/
+
+section AdvEp2B3
+
+set_option autoImplicit false
+
+/-! ### 8a. UB/ok dichotomy of MiniRust integer arithmetic and two-sided success parity -/
+
+/-- **MiniRust integer arithmetic is total on the `ok`/`UB` dichotomy
+(`evalIntBinOp_ok_or_ub`)**: for every `IntBinOp` and all mathematical integer operands,
+`evalIntBinOp` either returns `.ok z` or raises `.ub msg` — never `specPanic`, `unsupported`, or
+any other `Stop`. -/
+theorem evalIntBinOp_ok_or_ub (op : Gen.IntBinOp) (l r : Int) (it : Gen.IntType) :
+    (∃ z, evalIntBinOp op l r it = .ok z) ∨
+      (∃ msg, evalIntBinOp op l r it = .error (.ub msg)) := by
+  cases op <;> simp only [evalIntBinOp]
+  all_goals
+    first
+    | exact .inl ⟨_, rfl⟩
+    | (repeat' split) <;> first | exact .inl ⟨_, rfl⟩ | exact .inr ⟨_, rfl⟩
+
+/-- **`BinOp::Int` on integer operands is total on the `ok`/`UB` dichotomy
+(`evalBinOp_int_ok_or_ub`)**: for any right-operand type `rTy` (the heterogeneous shift case),
+`evalBinOp (.Int op)` either returns `.ok (.Int res, .Int it)` or raises `.ub msg`. -/
+theorem evalBinOp_int_ok_or_ub (op : Gen.IntBinOp) (l r : Int) (it : Gen.IntType)
+    (rTy : Gen.Type) :
+    (∃ res, evalBinOp (.Int op) (.Int l, .Int it) (.Int r, rTy) = .ok (.Int res, .Int it)) ∨
+      (∃ msg, evalBinOp (.Int op) (.Int l, .Int it) (.Int r, rTy) = .error (.ub msg)) := by
+  rcases evalIntBinOp_ok_or_ub op l r it with ⟨z, hz⟩ | ⟨msg, hm⟩
+  · exact .inl ⟨IntType.bring_in_bounds it z,
+      by simp [evalBinOp, hz, Bind.bind, Except.bind, Pure.pure, Except.pure]⟩
+  · exact .inr ⟨msg, by simp [evalBinOp, hm, Bind.bind, Except.bind]⟩
+
+/-- **Two-sided success parity for `uncheckedAdd` / `uncheckedSub` / `uncheckedMul` /
+`uncheckedDiv` / `uncheckedRem` (`evalLIntrinsic_unchecked_binop_isSome_iff_minirust_ok`)**:
+`evalLIntrinsicValue` succeeds **iff** MiniRust's `evalBinOp (.Int iop)` succeeds, across every
+integer `RigidTy` and all valid bit patterns (strengthening
+`DeinitBridge.evalLIntrinsic_unchecked_binop_iff_minirust` with `evalBinOp_int_ok_or_ub`). -/
+theorem evalLIntrinsic_unchecked_binop_isSome_iff_minirust_ok
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) (bop : MirAst.BinOp) (iop : Gen.IntBinOp)
+    (hop : DeinitBridge.uncheckedArithLIntrinsicPair op = some (bop, iop))
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    (Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts argOps
+        [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag).isSome = true ↔
+      ∃ res, evalBinOp (.Int iop) (.Int (intFromBits x it), .Int it)
+        (.Int (intFromBits y it), .Int it) = .ok (.Int res, .Int it) := by
+  have h := DeinitBridge.evalLIntrinsic_unchecked_binop_iff_minirust op bop iop hop hrk x y hx hy
+    restTys decls layouts argOps flag
+  dsimp only at h
+  constructor
+  · intro hs
+    rcases evalBinOp_int_ok_or_ub iop (intFromBits x it) (intFromBits y it) it (.Int it) with
+      hok | hub
+    · exact hok
+    · rw [h.2 hub] at hs; nomatch hs
+  · rintro ⟨res, hres⟩
+    rw [(h.1 res hres).2]; rfl
+
+/-- **Two-sided success parity for `uncheckedShl` / `uncheckedShr`, including heterogeneous
+right-operand widths and negative signed shift counts
+(`evalLIntrinsic_unchecked_shift_isSome_iff_minirust_ok`)**: `evalLIntrinsicValue` succeeds
+**iff** MiniRust's `evalBinOp (.Int .ShlUnchecked / .ShrUnchecked)` succeeds. -/
+theorem evalLIntrinsic_unchecked_shift_isSome_iff_minirust_ok
+    (isShr : Bool)
+    {lhsRk rhsRk : RigidTy} {it rhsIt : Gen.IntType}
+    (hLhs : intTyBytes lhsRk = some (it.signed, it.size.bytes))
+    (hRhs : intTyBytes rhsRk = some (rhsIt.signed, rhsIt.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * rhsIt.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        (if isShr then .uncheckedShr else .uncheckedShl) (lhsRk :: rhsRk :: restTys) decls
+        layouts argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag).isSome =
+        true ↔
+      ∃ res, evalBinOp (.Int (if isShr then .ShrUnchecked else .ShlUnchecked))
+        (.Int (intFromBits x it), .Int it) (.Int (intFromBits y rhsIt), .Int rhsIt) =
+          .ok (.Int res, .Int it) := by
+  have h := DeinitBridge.evalLIntrinsic_unchecked_shift_iff_minirust isShr hLhs hRhs x y hx hy
+    restTys decls layouts argOps flag
+  dsimp only at h
+  constructor
+  · intro hs
+    rcases evalBinOp_int_ok_or_ub (if isShr then .ShrUnchecked else .ShlUnchecked)
+      (intFromBits x it) (intFromBits y rhsIt) it (.Int rhsIt) with hok | hub
+    · exact hok
+    · rw [h.2 hub] at hs; nomatch hs
+  · rintro ⟨res, hres⟩
+    rw [(h.1 res hres).2]; rfl
+
+/-- **Two-sided success parity for `exactDiv` (`evalLIntrinsic_exactDiv_isSome_iff_minirust_ok`)**:
+`evalLIntrinsicValue .exactDiv` succeeds **iff** MiniRust's `evalBinOp (.Int .DivExact)` succeeds,
+i.e. Anneal faults on exactly MiniRust's three UB conditions (division by zero, signed
+`MIN / -1`, non-zero remainder) and on nothing else. -/
+theorem evalLIntrinsic_exactDiv_isSome_iff_minirust_ok
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    (Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv (rk :: restTys) decls layouts argOps
+        [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag).isSome = true ↔
+      ∃ q, evalBinOp (.Int .DivExact) (.Int (intFromBits x it), .Int it)
+        (.Int (intFromBits y it), .Int it) = .ok (.Int q, .Int it) := by
+  have h := DeinitBridge.evalLIntrinsic_exactDiv_iff_minirust hrk x y hx hy
+    restTys decls layouts argOps flag
+  dsimp only at h
+  constructor
+  · intro hs
+    rcases evalBinOp_int_ok_or_ub .DivExact (intFromBits x it) (intFromBits y it) it (.Int it) with
+      hok | hub
+    · exact hok
+    · rw [h.2 hub] at hs; nomatch hs
+  · rintro ⟨q, hq⟩
+    rw [(h.1 q hq).2]; rfl
+
+/-! ### 8b. Bit-level value links for `threeWayCompare` and `ubChecks` -/
+
+/-- **`threeWayCompare` returns exactly the `Ordering` tag MiniRust computes
+(`evalLIntrinsic_threeWayCompare_ordering_tag`)**: the 1-byte scalar `bits` that
+`evalLIntrinsicValue .threeWayCompare` returns is a valid `Ordering` tag, and MiniRust's
+`translateCmp` lowering (`BinOp::Rel(Cmp)` followed by `Transmute` to `Ordering`) evaluates to
+`valOf orderingTy bits` — MiniRust's decoding of those very bits — across every integer type and
+all valid operands. -/
+theorem evalLIntrinsic_threeWayCompare_ordering_tag
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    ∃ bits,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .threeWayCompare (rk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨bits, 1⟩) ∧
+      ValidBits orderingTy bits ∧
+      (evalBinOp (.Rel .Cmp) (.Int (intFromBits x it), .Int it) (.Int (intFromBits y it), .Int it)
+          >>= evalUnOp (.Cast (.Transmute orderingTy))) =
+        .ok (valOf orderingTy bits, orderingTy) := by
+  have h := DeinitBridge.evalLIntrinsic_threeWayCompare_eq_minirust hrk x y hx hy restTys decls
+    layouts argOps flag
+  dsimp only at h
+  refine ⟨ordBits (cmpOf (.Int it) x y), h.2, validBits_ordBits _, ?_⟩
+  rw [h.1]
+  exact evalUnOp_transmute_ordering _
+
+/-- **`ubChecks` returns exactly the bits MiniRust decodes as the session's `bool`
+(`evalLIntrinsic_ubChecks_bool_encoding`)**: the 1-byte scalar `bits` that
+`evalLIntrinsicValue .ubChecks` returns decodes (`valOf .Bool`) to the very `bool` constant that
+`minimize` emits for `ub_checks()` and MiniRust evaluates. -/
+theorem evalLIntrinsic_ubChecks_bool_encoding
+    (flag : Bool) (m : Mach) (tys : List RigidTy) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) :
+    ∃ bits,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ubChecks tys decls layouts argOps [] flag =
+        some (.scalar ⟨bits, 1⟩) ∧
+      Interp.evalValue m (.Constant (.Bool flag) .Bool) = .ok ((valOf .Bool bits, .Bool), m) := by
+  cases flag <;> exact ⟨_, rfl, rfl⟩
+
+/-! ### 8c. Diverging intrinsics and `*_nonzero` against MiniRust `Abort`, `Unreachable`, and
+`Assume` -/
+
+/-- **Symbolic `abort` correspondence (`evalLIntrinsic_abort_minirust_correspondence`)**: for
+every machine, argument list, and return type, MiniRust's `IntrinsicOp::Abort` stops with
+`.error .abort`; for every `evalLoweredIntrinsicCall` input, Anneal's lowered `abort` terminates
+the program at the current block (`.terminated bb`, bypassing any cleanup edge) exactly when the
+terminator's unwind action is admissible (`unwindActionOk`, mirroring Trusted's check), and is
+rejected whenever a return `target` is present (`abort` is diverging); and the adapter routes
+`core::intrinsics::abort`, which Trusted treats as an aborting panic path, to `.abort`. -/
+theorem evalLIntrinsic_abort_minirust_correspondence
+    (m : Mach) (arguments : List (Val × Gen.Type)) (retTy : Gen.Type)
+    (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
+    (bb : Nat) (inCleanup : Bool) (args : List Operand) (avs : List Value)
+    (slots2 : List Anneal.Mir.PlaceAndRvalue.LocalSlotState) (dest : Place) (destTy : Ty)
+    (unwind : UnwindAction) (unwinding : Option Nat) (typeArgs : List RigidTy) :
+    Interp.evalIntrinsic m .Abort arguments retTy = .error .abort ∧
+      Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 dest
+          destTy none unwind unwinding .abort typeArgs =
+        (if Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind then
+          some (.terminated bb) else none) ∧
+      (∀ t, Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall env body bb inCleanup args avs slots2
+          dest destTy (some t) unwind unwinding .abort typeArgs = none) ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::abort" =
+        some .abort ∧
+      isAbortingPanicDefPath "core::intrinsics::abort" = true := by
+  refine ⟨rfl, ?_, fun t => ?_, rfl, by decide⟩
+  · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
+    cases Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind <;> rfl
+  · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
+    cases Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind <;> rfl
+
+/-- **Symbolic `unreachable_unchecked` correspondence
+(`evalLIntrinsic_unreachable_minirust_correspondence`)**: MiniRust's `Terminator::Unreachable`
+raises UB on every machine, and Anneal's lowered `unreachableUnchecked` is rejected (`none`) for
+every `evalLoweredIntrinsicCall` input (any target, unwind action, operands, and destination);
+both `core::hint::unreachable_unchecked` and `core::intrinsics::unreachable` lower to it and are
+Trusted unreachable call targets. -/
+theorem evalLIntrinsic_unreachable_minirust_correspondence
+    (m : Mach) (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
+    (bb : Nat) (inCleanup : Bool) (args : List Operand) (avs : List Value)
+    (slots2 : List Anneal.Mir.PlaceAndRvalue.LocalSlotState) (dest : Place) (destTy : Ty)
+    (target : Option Nat) (unwind : UnwindAction) (unwinding : Option Nat)
+    (typeArgs : List RigidTy) :
+    Interp.evalTerminator m .Unreachable = .error (.ub "reached unreachable code") ∧
+      Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 dest
+          destTy target unwind unwinding .unreachableUnchecked typeArgs = none ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::hint::unreachable_unchecked" =
+        some .unreachableUnchecked ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::unreachable" =
+        some .unreachableUnchecked ∧
+      isUnreachableCallTarget "core::hint::unreachable_unchecked" = true ∧
+      isUnreachableCallTarget "core::intrinsics::unreachable" = true :=
+  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
+
+/-- **`ctlz_nonzero` / `cttz_nonzero` against MiniRust's `IntrinsicOp::Assume`
+(`evalLIntrinsic_nonzero_minirust_assume`)**: across every integer width (`GoodSize`) and valid
+bit pattern, Anneal's `ctlzNonzero` / `cttzNonzero` fault exactly at `0` and otherwise coincide
+with `ctlz` / `cttz`, while MiniRust's `Assume(x != 0)` (the precondition the `*_nonzero`
+intrinsics impose) raises UB exactly at `0` and otherwise returns `()`. -/
+theorem evalLIntrinsic_nonzero_minirust_assume
+    (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (bits : Nat) (hbits : bits < 2 ^ (8 * it.size.bytes))
+    (tys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) (m : Mach) :
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlzNonzero tys decls layouts argOps
+        [.scalar ⟨bits, it.size.bytes⟩] flag =
+      (if bits = 0 then none else
+        Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlz tys decls layouts argOps
+          [.scalar ⟨bits, it.size.bytes⟩] flag) ∧
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttzNonzero tys decls layouts argOps
+        [.scalar ⟨bits, it.size.bytes⟩] flag =
+      (if bits = 0 then none else
+        Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttz tys decls layouts argOps
+          [.scalar ⟨bits, it.size.bytes⟩] flag) ∧
+    Interp.evalIntrinsic m .Assume [(.Bool (!decide (bits = 0)), .Bool)]
+        (.Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none) =
+      (if bits = 0 then .error (.ub "`Assume` intrinsic called on condition that is violated")
+        else .ok (unitValue, m)) := by
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hWrap : wrapScalarBits bits (scalarModulus it.size.bytes) = bits := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hbits]
+  refine ⟨?_, ?_, ?_⟩
+  · by_cases h0 : bits = 0
+    · subst h0
+      simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalCtlzNonzero, hbeq, hWrap]
+    · simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalCtlzNonzero, evalCtlz, hbeq, hWrap,
+        h0, nat_beq_eq_decide]
+  · by_cases h0 : bits = 0
+    · subst h0
+      simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalCttzNonzero, hbeq, hWrap]
+    · simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalCttzNonzero, evalCttz, hbeq, hWrap,
+        h0, nat_beq_eq_decide]
+  · by_cases h0 : bits = 0
+    · subst h0; rfl
+    · simp [h0, Interp.evalIntrinsic]
+
+/-! ### 8d. Negative controls -/
+
+/-- **Negative controls for the lowered-intrinsic ↔ MiniRust bridges
+(`minirust_intrinsic_negative_controls`)**: concrete operand pairs on which the candidate
+semantics *disagree*, each checked on both sides, so that a bridge wired to the wrong operation,
+signedness, or width would fail to compile:
+1. `u8` `255 + 1`: wrapping (`IntBinOp::Add`) gives `0`, saturating gives `255`, while
+2. `unchecked_add` is UB in MiniRust and faults in Anneal;
+3. signed `i8` `127 + 1` overflows (UB / fault) although
+4. unsigned `u8` `127 + 1 = 128` does not;
+5. `exact_div(i8::MIN, -1)` is UB ("overflow in division") / faults, although
+6. the same mathematical operands in `i32` give `128`;
+7. `unchecked_shr(-128i8, 7) = -1` (arithmetic shift, bits `0xFF`), while
+8. `unchecked_shr(128u8, 7) = 1` (logical shift) on the same bit pattern `0x80`;
+9. `three_way_compare(-128i8, 1)` is `Less` (tag bits `255`), while
+10. `three_way_compare(128u8, 1)` is `Greater` (tag bits `1`) on the same bit patterns. -/
+theorem minirust_intrinsic_negative_controls :
+    (evalBinOp (.Int .Add) (.Int 255, .Int u8) (.Int 1, .Int u8) = .ok (.Int 0, .Int u8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .wrappingAdd [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩] true = some (.scalar ⟨0, 1⟩) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .saturatingAdd [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩] true = some (.scalar ⟨255, 1⟩)) ∧
+    (evalBinOp (.Int .AddUnchecked) (.Int 255, .Int u8) (.Int 1, .Int u8) =
+        .error (.ub "overflow in unchecked add") ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .uncheckedAdd [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩] true = none) ∧
+    (evalBinOp (.Int .AddUnchecked) (.Int 127, .Int i8) (.Int 1, .Int i8) =
+        .error (.ub "overflow in unchecked add") ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .uncheckedAdd [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨127, 1⟩, .scalar ⟨1, 1⟩] true = none) ∧
+    (evalBinOp (.Int .AddUnchecked) (.Int 127, .Int u8) (.Int 1, .Int u8) =
+        .ok (.Int 128, .Int u8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .uncheckedAdd [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨127, 1⟩, .scalar ⟨1, 1⟩] true = some (.scalar ⟨128, 1⟩)) ∧
+    (evalBinOp (.Int .DivExact) (.Int (-128), .Int i8) (.Int (-1), .Int i8) =
+        .error (.ub "overflow in division") ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨0x80, 1⟩, .scalar ⟨0xFF, 1⟩] true = none) ∧
+    (evalBinOp (.Int .DivExact) (.Int (-128), .Int i32) (.Int (-1), .Int i32) =
+        .ok (.Int 128, .Int i32) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv [.int .i32] [] emptyLayoutTable []
+        [.scalar ⟨0xFFFFFF80, 4⟩, .scalar ⟨0xFFFFFFFF, 4⟩] true = some (.scalar ⟨0x80, 4⟩)) ∧
+    (evalBinOp (.Int .ShrUnchecked) (.Int (-128), .Int i8) (.Int 7, .Int u32) =
+        .ok (.Int (-1), .Int i8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .uncheckedShr [.int .i8, .uint .u32] []
+        emptyLayoutTable [] [.scalar ⟨0x80, 1⟩, .scalar ⟨7, 4⟩] true = some (.scalar ⟨0xFF, 1⟩)) ∧
+    (evalBinOp (.Int .ShrUnchecked) (.Int 128, .Int u8) (.Int 7, .Int u32) =
+        .ok (.Int 1, .Int u8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .uncheckedShr [.uint .u8, .uint .u32] []
+        emptyLayoutTable [] [.scalar ⟨0x80, 1⟩, .scalar ⟨7, 4⟩] true = some (.scalar ⟨0x01, 1⟩)) ∧
+    (evalBinOp (.Rel .Cmp) (.Int (-128), .Int i8) (.Int 1, .Int i8) = .ok (.Int (-1), .Int i8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .threeWayCompare [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨0x80, 1⟩, .scalar ⟨1, 1⟩] true = some (.scalar ⟨255, 1⟩)) ∧
+    (evalBinOp (.Rel .Cmp) (.Int 128, .Int u8) (.Int 1, .Int u8) = .ok (.Int 1, .Int i8) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .threeWayCompare [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨0x80, 1⟩, .scalar ⟨1, 1⟩] true = some (.scalar ⟨1, 1⟩)) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩,
+    ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
+/-! ### 8e. Signedness independence of the bit-manipulation intrinsics on `i8` -/
+
+/-- **Signedness independence of `ctlz`, `cttz`, and `bitreverse`
+(`evalLIntrinsic_bitops_i8_signedness_independent`)**: on the signed `i8` type, exhaustively over
+all 256 bit patterns, `evalLIntrinsicValue` returns the same MiniRust-verified fallback
+specifications (`fbCtlzSpec`, `fbCttzSpec`, `fbBitrevSpec`) that
+`evalLIntrinsic_bitops_fallback_correspondence` establishes for `u8`: these intrinsics act on the
+raw bit pattern, never on the decoded signed value. -/
+theorem evalLIntrinsic_bitops_i8_signedness_independent :
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlz [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbCtlzSpec a, 4⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttz [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbCttzSpec a, 4⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .bitreverse [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbBitrevSpec a, 1⟩)) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .ctlz [.int .i8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbCtlzSpec x) 4)
+        (by decide +kernel) a ha)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .cttz [.int .i8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbCttzSpec x) 4)
+        (by decide +kernel) a ha)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .bitreverse [.int .i8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbBitrevSpec x) 1)
+        (by decide +kernel) a ha)
+
+end AdvEp2B3
 
 end MiniRustSpec.Correspondence
