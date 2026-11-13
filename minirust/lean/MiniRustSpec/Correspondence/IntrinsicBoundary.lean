@@ -74,9 +74,13 @@ MiniRust `Endianness.decode .BigEndian` + involution, `bitreverse` / `cttz` / `c
 characterizations + `CountOnes` conservation, full value-level two-sided `some v ↔ .ok` &
 `none ↔ .ub` parity, `saturating` `valOf` clamping, `three_way_compare::<char>`, `size_of_val` /
 `align_of_val` ↔ `Type.layout` & `LayoutStrategy.compute_size_and_align`, symbolic `panicUnwind`,
-and multi-byte / `char` / slice-layout negative controls). Section 10 (`[adv ep2-B4]`) pins the
-remaining boundary: MiniRust's executable spec rejects every unwinding terminator (`StartUnwind`,
-`StopUnwind`, `ResumeUnwind`) as `unsupported`, so `panicUnwind` corresponds to `Trusted` only.
+and multi-byte / `char` / slice-layout negative controls). Section 10 (`[adv ep2-B4]` /
+`[adv ep2-A4]`) pins the remaining boundaries and closes all 30 `LIntrinsicOp` variants: MiniRust's
+executable spec rejects every unwinding terminator (`StartUnwind`, `StopUnwind`, `ResumeUnwind`) as
+`unsupported`, `RigidTy.str` wide pointers (`&str` / `*const str`) match `Type.layout (.Slice
+(.Int u8))`, missing `nextBlock = none` / `target = none` raises UB on value-returning intrinsics in
+both semantics, and `lintrinsicOp_exhaustive_minirust_classification` partitions all 30
+`LIntrinsicOp` constructors across their four verified correspondence regimes.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -2374,7 +2378,8 @@ theorem minirust_bitops_char_and_layout_negative_controls
 
 end AdvEp2A3
 
-/-! ## 10. `[adv ep2-B4]` MiniRust unwinding boundary -/
+/-! ## 10. `[adv ep2-B4]` / `[adv ep2-A4]` MiniRust unwinding boundary, `str` layout bridge,
+`target = none` UB boundary, and exhaustive 30-variant `LIntrinsicOp` classification -/
 
 section AdvEp2B4
 
@@ -2394,6 +2399,157 @@ theorem minirust_unwind_terminators_unsupported (m : Mach) (payload : Gen.ValueE
       (∃ what, Interp.evalTerminator m (.StopUnwind blk) = .error (.unsupported what)) ∧
       (∃ what, Interp.evalTerminator m .ResumeUnwind = .error (.unsupported what)) :=
   ⟨⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl⟩⟩
+
+/-- **`sizeOfVal` & `alignOfVal` on unsized `RigidTy.str` (`&str` / `*const str`) ↔ MiniRust
+`Type.layout (.Slice (.Int u8))` (`evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout`,
+`[adv ep2-A4]`)**: completes Section 9b's `evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout`
+for `str` wide pointers (`ptr` + byte-length metadata `len < 2 ^ 64`):
+- MiniRust's `Type.layout (.Slice (.Int u8)) >>= LayoutStrategy.compute_size_and_align ...
+  (some (.ElementCount len))` computes `(⟨len⟩, ⟨1⟩)`;
+- Anneal's `.sizeOfVal` returns `some (.scalar ⟨len, 8⟩)` and `.alignOfVal` returns
+  `some (.scalar ⟨1, 8⟩)` iff `len < 2 ^ 63` (`isize::MAX` slice-size UB cutoff), faulting
+  (`none`) when `len ≥ 2 ^ 63`. -/
+theorem evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
+    (vtables : Interp.Ptr → Interp Gen.VTable)
+    (p : ProvenancePtr) (len : Nat) (hlen : len < 2 ^ 64)
+    (restTys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    (Interp.Type.layout (.Slice (.Int u8)) >>= fun ls =>
+        Interp.LayoutStrategy.compute_size_and_align vtables ls
+          (some (.ElementCount (len : Int)))) = .ok (⟨len⟩, ⟨1⟩) ∧
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .sizeOfVal (.str :: restTys) decls layouts
+        argOps [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] flag =
+      (if len < 2 ^ 63 then some (.scalar ⟨len, 8⟩) else none) ∧
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .alignOfVal (.str :: restTys) decls layouts
+        argOps [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] flag =
+      (if len < 2 ^ 63 then some (.scalar ⟨1, 8⟩) else none) := by
+  have hLenWrap : wrapScalarBits len (scalarModulus 8) = len := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hlen]
+  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hSlice1 : evalSliceSizeOfVal 1 ⟨len, 8⟩ =
+      if len < 2 ^ 63 then some ⟨len, 8⟩ else none := by
+    unfold evalSliceSizeOfVal
+    dsimp only
+    change (match Nat.ble (signedHalfModulus 8)
+        (1 * wrapScalarBits len (scalarModulus 8)) with
+      | true => (none : Option ScalarInt)
+      | false => some (ScalarInt.mk (1 * wrapScalarBits len (scalarModulus 8)) 8)) = _
+    rw [hLenWrap, Nat.one_mul, hHalf8, nat_ble_eq_decide]
+    by_cases hlt : len < 2 ^ 63
+    · rw [decide_eq_false (by omega : ¬(2 ^ 63 ≤ len))]
+      simp only [hlt, ↓reduceIte]
+    · rw [decide_eq_true (by omega : 2 ^ 63 ≤ len)]
+      simp only [hlt, ↓reduceIte]
+  refine ⟨?_, ?_, ?_⟩
+  · have hU8 := (evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout (rk := .uint .u8) (it := u8)
+      rfl vtables p len hlen restTys decls layouts argOps flag).2.1
+    dsimp only [u8] at hU8 ⊢
+    rwa [Nat.mul_one] at hU8
+  · change Option.map Value.scalar (evalSliceSizeOfVal 1 ⟨len, 8⟩) = _
+    rw [hSlice1]
+    by_cases hlt : len < 2 ^ 63 <;> simp [hlt]
+  · change (match evalSliceSizeOfVal 1 ⟨len, 8⟩ with
+      | some _ => some (Value.scalar ⟨1, 8⟩)
+      | none => none) = _
+    rw [hSlice1]
+    by_cases hlt : len < 2 ^ 63 <;> simp [hlt]
+
+/-- **Missing `target = none` / `nextBlock = none` UB correspondence for returning intrinsics
+(`evalLoweredIntrinsicCall_target_none_minirust_ub`, `[adv ep2-A4]`)**:
+1. In MiniRust (`Interp.evalTerminator`, `spec/lang/step/terminators.md`), whenever a
+   `Terminator.Intrinsic` evaluates `retExpr`, `arguments`, `evalIntrinsic`, and `placeStore`
+   successfully with `nextBlock = none`, execution raises `.error (.ub "return from an intrinsic
+   where caller did not specify next block")`;
+2. Correspondingly, in Anneal (`evalLoweredIntrinsicCall`), for **every** `op : LIntrinsicOp`
+   other than `.abort` and `.panicUnwind` (all 28 value-returning, memory, and `unreachableUnchecked`
+   intrinsics), calling `op` with `target = none` returns `none`. -/
+theorem evalLoweredIntrinsicCall_target_none_minirust_ub
+    (m m₁ m₂ m₃ m₄ : Mach) (mrOp : Gen.IntrinsicOp) (arguments : List Gen.ValueExpr)
+    (retExpr : Gen.PlaceExpr) (retPlace : Gen.Place Interp.BM) (retTy : Gen.Type)
+    (args : List (Val × Gen.Type)) (val : Val)
+    (hPl : Interp.evalPlace m retExpr = .ok ((retPlace, retTy), m₁))
+    (hArgs : Interp.evalArgs m₁ arguments = .ok (args, m₂))
+    (hInt : Interp.evalIntrinsic m₂ mrOp args retTy = .ok (val, m₃))
+    (hStore : Interp.placeStore m₃ retPlace val retTy = .ok m₄)
+    (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
+    (bb : Nat) (inCleanup : Bool) (argOps : List Operand) (avs : List Value)
+    (slots2 : List Anneal.Mir.PlaceAndRvalue.LocalSlotState) (dest : Place) (destTy : Ty)
+    (unwind : UnwindAction) (unwinding : Option Nat)
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) (typeArgs : List RigidTy)
+    (hNotAbort : op ≠ .abort) (hNotPanic : op ≠ .panicUnwind) :
+    Interp.evalTerminator m (.Intrinsic mrOp arguments retExpr none) =
+      .error (.ub "return from an intrinsic where caller did not specify next block") ∧
+    Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall env body bb inCleanup argOps avs slots2
+      dest destTy none unwind unwinding op typeArgs = none := by
+  refine ⟨?_, ?_⟩
+  · simp [Interp.evalTerminator, hPl, hArgs, hInt, hStore, ub, Bind.bind, Except.bind]
+  · cases op <;> simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
+    all_goals
+      first
+      | exact absurd rfl hNotAbort
+      | exact absurd rfl hNotPanic
+      | rfl
+      | (cases Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind <;> rfl)
+
+/-- Correspondence regime of each `Anneal.Mir.AdtAndControl.LIntrinsicOp` variant across
+`DeinitBridge` and `IntrinsicBoundary` (`[adv ep2-A4]`). -/
+inductive LIntrinsicBridgeClass : Type where
+  /-- Direct `MiniRustSpec.Interp` operator (`evalBinOp` / `evalUnOp` / `Endianness.decode`),
+  pointer/layout helper (`ptr_offset` / `Type.layout` + `LayoutStrategy.compute_size_and_align`),
+  or diverging primitive (`IntrinsicOp.Abort` / `Terminator.Unreachable`) — 22 variants. -/
+  | interpDirect
+  /-- Symbolic `leBits` + `CountOnes` conservation + `IntrinsicOp.Assume` nonzero precondition +
+  `IntrinsicFallback` MIR expansion — 5 variants (`ctlz`, `ctlzNonzero`, `cttz`, `cttzNonzero`,
+  `bitreverse`). -/
+  | symbolicBitAndFallback
+  /-- Call-form memory intrinsics (`copyNonOverlapping` shares `evalCopyNonOverlappingSubplace` with
+  MIR `StatementKind::CopyNonOverlapping`; `writeBytes` is pinned as external `MirCallReq` in
+  Section 3 and sub-place byte-fill in `AdtAndControl` Section 5c/5g) — 2 variants. -/
+  | callFormMemory
+  /-- `Trusted`-only unwinding panic (`minirust_unwind_terminators_unsupported` proves MiniRust's
+  `Interp.evalTerminator` stops with `.unsupported` on `StartUnwind`/`StopUnwind`/`ResumeUnwind`) —
+  1 variant (`panicUnwind`). -/
+  | trustedOnlyUnwind
+  deriving DecidableEq, Repr
+
+/-- Map every `LIntrinsicOp` constructor to its `MiniRustSpec` correspondence regime. -/
+def classifyLIntrinsicBridge : Anneal.Mir.AdtAndControl.LIntrinsicOp → LIntrinsicBridgeClass
+  | .ctpop | .bswap | .exactDiv
+  | .wrappingAdd | .wrappingSub | .wrappingMul
+  | .saturatingAdd | .saturatingSub
+  | .uncheckedAdd | .uncheckedSub | .uncheckedMul | .uncheckedDiv | .uncheckedRem
+  | .uncheckedShl | .uncheckedShr
+  | .threeWayCompare | .ubChecks | .arithOffset
+  | .sizeOfVal | .alignOfVal
+  | .unreachableUnchecked | .abort => .interpDirect
+  | .ctlz | .ctlzNonzero | .cttz | .cttzNonzero | .bitreverse => .symbolicBitAndFallback
+  | .copyNonOverlapping | .writeBytes => .callFormMemory
+  | .panicUnwind => .trustedOnlyUnwind
+
+/-- Canonical duplicate-free enumeration of all 30 `LIntrinsicOp` constructors. -/
+def allLIntrinsicOps : List Anneal.Mir.AdtAndControl.LIntrinsicOp :=
+  [.ctlz, .ctlzNonzero, .cttz, .cttzNonzero, .ctpop, .bswap, .bitreverse, .exactDiv,
+   .wrappingAdd, .wrappingSub, .wrappingMul, .saturatingAdd, .saturatingSub,
+   .uncheckedAdd, .uncheckedSub, .uncheckedMul, .uncheckedDiv, .uncheckedRem,
+   .uncheckedShl, .uncheckedShr, .threeWayCompare, .ubChecks, .arithOffset,
+   .sizeOfVal, .alignOfVal, .copyNonOverlapping, .writeBytes,
+   .unreachableUnchecked, .abort, .panicUnwind]
+
+/-- **Exhaustive 30-variant `LIntrinsicOp` classification (`lintrinsicOp_exhaustive_minirust_classification`,
+`[adv ep2-A4]`)**: `allLIntrinsicOps` contains every `LIntrinsicOp` constructor without duplicates
+(`30` total), partitioned into `22` direct `Interp` operator/layout/diverging ops, `5` symbolic
+`leBits` / `Assume` / `IntrinsicFallback` ops, `2` call-form memory ops, and `1` `Trusted`-only
+unwinding panic op. -/
+theorem lintrinsicOp_exhaustive_minirust_classification :
+    allLIntrinsicOps.length = 30 ∧
+    allLIntrinsicOps.Nodup ∧
+    (∀ op : Anneal.Mir.AdtAndControl.LIntrinsicOp, op ∈ allLIntrinsicOps) ∧
+    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .interpDirect)).length = 22 ∧
+    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .symbolicBitAndFallback)).length = 5 ∧
+    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .callFormMemory)).length = 2 ∧
+    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .trustedOnlyUnwind)).length = 1 := by
+  refine ⟨rfl, by decide, fun op => ?_, rfl, rfl, rfl, rfl⟩
+  cases op <;> decide
 
 end AdvEp2B4
 

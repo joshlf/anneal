@@ -61,13 +61,20 @@ checker validates itself on five synthetic negative-control graphs (including tr
 to non-`AdtAndControl` `Anneal.*` modules and bypasses from an allowed bridge client) and one
 conforming multi-`Anneal` positive-control graph.
 
-`#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`, `[ADT-AXIOMS]`, `[adv ep2-B4]`)
-fails the build unless every public, user-declared theorem of `Anneal.Mir.AdtAndControl` lies in the
-dependency closure of the `MiniRustSpec` declarations audited by
-`#assert_all_minirustspec_standard_axioms` (via `subplace_audit_closure`,
-`call_intrinsic_audit_closure`, and `adt_control_residual_audit_closure`), checks that the residual
-closure is actually needed (negative control), and verifies that every declaration of the module
-`Anneal.Mir.AdtAndControl` depends only on the standard axioms.
+`#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`, `[ANNEAL-AXIOMS]`, `[adv ep2-B4]` /
+`[adv ep2-A4]`) fails the build unless:
+1. every public, user-declared theorem of `Anneal.Mir.AdtAndControl` lies in the dependency closure
+   of the three `[DEINIT-AUDIT]` closures (`subplace_audit_closure`, `call_intrinsic_audit_closure`,
+   `adt_control_residual_audit_closure`) together with the `MiniRustSpec` declarations audited by
+   `#assert_all_minirustspec_standard_axioms` — and in particular **every** Episode 2 Section 5
+   public theorem of `Anneal.Mir.AdtAndControl` is reachable from `call_intrinsic_audit_closure`
+   alone;
+2. both `adt_control_residual_audit_closure` and `call_intrinsic_audit_closure` are non-vacuously
+   required (negative controls); and
+3. every declaration across **every** imported `Anneal.*` module (`Anneal.Mir.AdtAndControl` and
+   `Anneal.Mir.PlaceAndRvalue`, including private and compiler-generated ones) is `unsafe`-free and
+   depends only on the standard axioms (`propext`, `Quot.sound`, `Classical.choice`) via both
+   `Lean.collectAxioms` and `dependencyClosureWithAxioms`.
 -/
 
 namespace MiniRustSpec.Audit
@@ -255,34 +262,55 @@ def dependencyClosureWithAxioms (env : Lean.Environment) (seeds : Array Lean.Nam
             stack := stack.push c
   return (visited, axs)
 
-/-- `[ADT-AUDIT-COVERAGE]` and `[ADT-AXIOMS]`: fail unless
-1. every public, user-declared theorem of `Anneal.Mir.AdtAndControl` (a `theorem` with a source
-   declaration range that is neither private, internal, nor a structure projection) lies in the
-   dependency closure of the `MiniRustSpec` declarations whose axioms
-   `#assert_all_minirustspec_standard_axioms` checks — i.e. the audit closures
-   `subplace_audit_closure`, `call_intrinsic_audit_closure`, and
-   `adt_control_residual_audit_closure` of `Correspondence.DeinitBridge` jointly cover all of
-   them;
-2. (negative control) dropping `adt_control_residual_audit_closure` from those declarations leaves
-   some of them uncovered, so the check is not vacuous; and
-3. every declaration of the module `Anneal.Mir.AdtAndControl` (including private and
-   compiler-generated ones) depends only on `propext`, `Quot.sound`, and `Classical.choice`. -/
+/-- `[ADT-AUDIT-COVERAGE]` and `[ANNEAL-AXIOMS]` (`[adv ep2-B4]` / `[adv ep2-A4]`): fail unless
+1. every public, user-declared theorem of `Anneal.Mir.AdtAndControl` lies in the dependency closure
+   of the three `[DEINIT-AUDIT]` closures (`subplace_audit_closure`, `call_intrinsic_audit_closure`,
+   `adt_control_residual_audit_closure`) together with the `MiniRustSpec` declarations whose axioms
+   `#assert_all_minirustspec_standard_axioms` checks — AND every Episode 2 Section 5 public theorem
+   of `Anneal.Mir.AdtAndControl` (starting at `LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind`)
+   is reachable from `call_intrinsic_audit_closure` **alone**;
+2. (negative controls) dropping `adt_control_residual_audit_closure` leaves residual theorems
+   uncovered, and dropping `call_intrinsic_audit_closure` leaves Section 5 theorems uncovered; and
+3. every declaration across **every** imported `Anneal.*` module (`Anneal.Mir.AdtAndControl` and
+   `Anneal.Mir.PlaceAndRvalue`, including private and compiler-generated ones) is `!ci.isUnsafe` and
+   depends only on `propext`, `Quot.sound`, and `Classical.choice` under both `Lean.collectAxioms`
+   and `dependencyClosureWithAxioms`. -/
 elab "#assert_adt_control_audit_coverage" : command => do
   let env ← getEnv
   let adt := `Anneal.Mir.AdtAndControl
+  let par := `Anneal.Mir.PlaceAndRvalue
+  let subplaceClosure := `MiniRustSpec.Correspondence.DeinitBridge.subplace_audit_closure
+  let callClosure := `MiniRustSpec.Correspondence.DeinitBridge.call_intrinsic_audit_closure
   let residual := `MiniRustSpec.Correspondence.DeinitBridge.adt_control_residual_audit_closure
+  let sec5Anchor := `Anneal.Mir.AdtAndControl.LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind
   let some idx := env.getModuleIdx? adt
     | throwError "[ADT-AUDIT-COVERAGE] {adt} is not imported"
+  unless (env.getModuleIdx? par).isSome do
+    throwError "[ADT-AUDIT-COVERAGE] {par} is not imported"
+  let some sec5Dr := Lean.declRangeExt.find? env sec5Anchor
+    | throwError "[ADT-AUDIT-COVERAGE] missing declaration range for Section 5 anchor {sec5Anchor}"
+  let sec5StartLine := sec5Dr.range.pos.line
   let consts := env.header.moduleData[idx.toNat]!.constNames
   let targets := consts.filter fun c =>
     (env.find? c matches some (.thmInfo _)) && !Lean.isPrivateName c && !c.isInternalDetail &&
       !env.isProjectionFn c && (Lean.declRangeExt.find? env c).isSome
+  let sec5Targets := targets.filter fun c =>
+    match Lean.declRangeExt.find? env c with
+    | some dr => dr.range.pos.line >= sec5StartLine
+    | none => false
+  if sec5Targets.isEmpty then
+    throwError "[ADT-AUDIT-COVERAGE] Section 5 theorem list is unexpectedly empty"
   let mut seeds : Array Lean.Name := #[]
   for i in [:env.header.moduleNames.size] do
     if (`MiniRustSpec).isPrefixOf env.header.moduleNames[i]! then
       seeds := seeds ++ env.header.moduleData[i]!.constNames
-  unless seeds.contains residual do
-    throwError "[ADT-AUDIT-COVERAGE] {residual} is not an imported MiniRustSpec declaration"
+  for req in [subplaceClosure, callClosure, residual] do
+    unless seeds.contains req do
+      throwError "[ADT-AUDIT-COVERAGE] {req} is not an imported MiniRustSpec declaration"
+  let (coveredByCall, _) := dependencyClosureWithAxioms env #[callClosure]
+  let missingSec5 := sec5Targets.filter fun n => !coveredByCall.contains n
+  unless missingSec5.isEmpty do
+    throwError "[ADT-AUDIT-COVERAGE] {missingSec5.size} Section 5 theorems of {adt} missing from {callClosure}: {missingSec5.toList.take 25}"
   let (covered, _) := dependencyClosureWithAxioms env seeds
   let missing := targets.filter fun n => !covered.contains n
   unless missing.isEmpty do
@@ -291,12 +319,31 @@ elab "#assert_adt_control_audit_coverage" : command => do
   let needed := (targets.filter fun n => !coveredWithoutResidual.contains n).size
   if needed == 0 then
     throwError "[ADT-AUDIT-COVERAGE] negative control failed: {residual} covers nothing new"
-  let (_, axs) := dependencyClosureWithAxioms env consts
+  let (coveredWithoutCall, _) := dependencyClosureWithAxioms env (seeds.filter (· != callClosure))
+  let neededCall := (sec5Targets.filter fun n => !coveredWithoutCall.contains n).size
+  if neededCall == 0 then
+    throwError "[ADT-AUDIT-COVERAGE] negative control failed: {callClosure} covers nothing new in Section 5"
+  let mut annealMods : Array Lean.Name := #[]
+  let mut annealConsts : Array Lean.Name := #[]
+  for i in [:env.header.moduleNames.size] do
+    let modName := env.header.moduleNames[i]!
+    if (`Anneal).isPrefixOf modName then
+      annealMods := annealMods.push modName
+      for c in env.header.moduleData[i]!.constNames do
+        annealConsts := annealConsts.push c
+        if let some ci := env.find? c then
+          if ci.isUnsafe then
+            throwError "[ANNEAL-AXIOMS] unsafe declaration {c} in {modName}"
+        let cAxs ← liftCoreM <| Lean.collectAxioms c
+        for a in cAxs do
+          unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+            throwError "[ANNEAL-AXIOMS] {c} (in {modName}) depends on the non-standard axiom {a}"
+  let (_, axs) := dependencyClosureWithAxioms env annealConsts
   for a in axs do
     unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
-      throwError "[ADT-AXIOMS] a declaration of {adt} depends on the non-standard axiom {a}"
-  logInfo m!"[ADT-AUDIT-COVERAGE] adt_public_theorems={targets.size} audited={targets.size} only_via_residual_closure={needed} ok=true"
-  logInfo m!"[ADT-AXIOMS] decls={consts.size} axioms={axs.toList} sorry_free=true"
+      throwError "[ANNEAL-AXIOMS] transitive closure of Anneal.* depends on the non-standard axiom {a}"
+  logInfo m!"[ADT-AUDIT-COVERAGE] adt_public_theorems={targets.size} audited={targets.size} sec5_theorems={sec5Targets.size} sec5_via_call_closure={sec5Targets.size} only_via_call_closure={neededCall} only_via_residual_closure={needed} ok=true"
+  logInfo m!"[ANNEAL-AXIOMS] modules={annealMods.toList} decls={annealConsts.size} axioms={axs.toList} unsafe_free=true sorry_free=true"
 
 open MiniRustSpec.LibSpecr in
 #assert_standard_axioms
@@ -5675,6 +5722,9 @@ open MiniRustSpec.Correspondence in
   evalLIntrinsic_panicUnwind_minirust_correspondence
   minirust_bitops_char_and_layout_negative_controls
   minirust_unwind_terminators_unsupported
+  evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
+  evalLoweredIntrinsicCall_target_none_minirust_ub
+  lintrinsicOp_exhaustive_minirust_classification
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 

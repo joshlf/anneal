@@ -22,11 +22,13 @@ open Anneal.Mir.PlaceAndRvalue
 namespace Anneal.Mir.AdtAndControl
 
 /-!
-# ADT Layouts, Projected `Deinit`/`Retag`/`CopyNonOverlapping`, Multi-Block CFG Execution, and Synthetic Sub-Place Pointers
+# ADT Layouts, Projected `Deinit`/`Retag`/`CopyNonOverlapping`, Multi-Block CFG Execution, Synthetic Sub-Place Pointers, Inline Intrinsics, and Multi-Callee Linked Calls
 
-This module formalizes the Episode 1 semantic surface of `crates/anneal-mir`
-(`ws-mir-lower-adt-deinit-retag-terminators`, and in Section 4 the synthetic sub-place pointer,
-`Deref`, and `copy_nonoverlapping` surface of `ws-mir-lower-deref-subplace-and-minirust-adt-deinit`)
+This module formalizes the lowered MIR semantic surface of `crates/anneal-mir`
+(`ws-mir-lower-adt-deinit-retag-terminators`, in Section 4 the synthetic sub-place pointer,
+`Deref`, and `copy_nonoverlapping` surface of `ws-mir-lower-deref-subplace-and-minirust-adt-deinit`,
+and in Section 3b / Section 5 the syntax-version-independent inline intrinsics and multi-callee
+linked-call CFG surface of `ws-mir-lower-inline-intrinsics-and-multi-callee-cfg`)
 and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
 
 1. **Section 1 — `ScalarValidRange` niches, ADT layouts, `OffsetOf`, and `Discriminant`**
@@ -277,6 +279,32 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      and Anneal's accepting reference retag of `_1` instantiating `evalStmt_retag_ref_refines` (untyped
      mode), `evalStmt_retag_ref_typed_refines_upToTag` (`_1 : &mut u32`), and
      `evalStmt_retag_disabled_ub` (`disabled` child tag) (`witness_trusted_retag_ref_anneal`).
+
+5. **Section 5 (with Section 3b) — Syntax-version-independent inline intrinsics (`LIntrinsicOp`),
+   `V2026_06_01` adapter, multi-callee `LCallTable` CFG execution, and Witness Suites 1–10**
+   (`ws-mir-lower-inline-intrinsics-and-multi-callee-cfg` Episode 2,
+   `crates/anneal-mir/src/{ir.rs,rustc_v2026_06_01.rs,lower/intrinsic.rs,lower/cfg.rs}`):
+   - Syntax-version-independent `LIntrinsicOp` (30 variants) and `LCallTarget`, coupled to
+     `Trusted.Rustc.V2026_06_01` via the thin adapter `lowerIntrinsicKind_V2026_06_01` /
+     `lowerCallTarget_V2026_06_01`, with exact Episode 1 table parity
+     (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`) and `Trusted` inline-dispatch characterization
+     (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`).
+   - Value-returning, call-form memory (`copyNonOverlapping`, `writeBytes`), and diverging
+     (`unreachableUnchecked`, `abort`, `panicUnwind`) intrinsic evaluation (`evalLIntrinsicValue`,
+     `evalLoweredIntrinsicCall`) lifted into single-step and multi-step lowered-CFG refinement
+     (`evalLoweredTerminator_refines_trusted`, `evalLoweredTerminator_at_end_refines_trusted`,
+     `runLoweredCfgSteps_refines_trusted`, `runLoweredCfgSteps_with_stmts_refines_trusted`) across
+     bare, projected, and `PartialShell` call destinations (`NoUninitExplosionOnProj`), with exact
+     `.ub` fault parity (`evalLIntrinsicValue_resolved_none_eq_ub`).
+   - Multi-callee linked intra-crate calls (`LCallTable`, `LLinkedCallee`, `LCallerFrame`,
+     `stepLoweredWithCallTable`, `runLoweredWithCallTable`) with shared fuel, bounded call depth,
+     cross-frame stack-pointer isolation, multi-frame abort propagation (`terminateLCallStack`,
+     `terminateLCallStack_eq_some_iff`), and multi-frame panic unwinding (`unwindLCallStack`,
+     `unwindLCallStack_cleanup_exact`) refining `TrustedRun` (`runLoweredWithCallTable_refines_trusted`),
+     exercised end-to-end by ten kernel-checked non-vacuity witness suites
+     (`witness_value_returning_intrinsics_run`, `witness_ub_fault_parity`,
+     `witness_diverging_abort_vs_panicUnwind`, `witness_two_deep_linked_callees_and_unwind`,
+     ..., `witness_diverging_proj_move_cleanup_and_protectors`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/

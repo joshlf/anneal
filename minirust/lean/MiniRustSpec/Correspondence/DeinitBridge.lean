@@ -40,10 +40,11 @@ This is the only `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`.
 `Anneal.Mir.AdtAndControl` (which is not part of the default `Anneal` target), and
 `MiniRustSpec.Audit` audits it: `#assert_all_minirustspec_standard_axioms` covers every declaration
 of this module, and its `[DEINIT-AUDIT]` group pins its theorems, including
-`subplace_audit_closure` and `call_intrinsic_audit_closure` (which bridges
+`subplace_audit_closure`, `call_intrinsic_audit_closure` (which bridges
 `Anneal.Mir.AdtAndControl.LIntrinsicOp` / `evalLIntrinsicValue` / `LTerminator.call` to
-`MiniRustSpec.Interp` and transitively audits every Episode 2 theorem of
-`Anneal.Mir.AdtAndControl`).
+`MiniRustSpec.Interp` and transitively audits every Episode 2 Section 5 theorem of
+`Anneal.Mir.AdtAndControl`), and `adt_control_residual_audit_closure` (verified by
+`#assert_adt_control_audit_coverage` / `[ADT-AUDIT-COVERAGE]` and `[ANNEAL-AXIOMS]`).
 -/
 
 namespace MiniRustSpec.Correspondence.DeinitBridge
