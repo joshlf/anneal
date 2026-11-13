@@ -20866,18 +20866,25 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_1.wit_lm4_1_nounwind_callee_unwind_divergence
   annealIntAbiOfRigidTy
   isTrivial1ZstRigidTy
+  isTrivial1ZstRigidTy.isTrivial1ZstRigidTyList
   isThinRawPtrRigidTy
+  isThinPtrRigidTy
+  annealWidePtrMetadata
   annealRigidTyLayoutCompat
   annealRigidTyListLayoutCompat
   annealRigidTyLayoutCompat_of_rigidTyEq
   annealRigidTyListLayoutCompat_of_rigidTyListEq
   annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq
+  annealRigidTyLayoutCompat_canonical_cases
   annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite
   annealFnPtrRegistry
   annealFnPtrRegistry_singleton_find_eq
+  annealFnPtrRegistry_find_eq
   annealReifyFnPointerAlloc
   annealCastHooksLM4_1
   annealRvalueHooksLM4_1
+  annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast
+  annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer
   annealControlHooksWithDirectUnwind
   annealTerminatorHooksWithDirectUnwind
   annealStepHooksWithDirectUnwind
@@ -20891,6 +20898,13 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_1.witUsizeIndirectCallerBody
   WitnessLM4_1.witUsizeIndirectFnPtr_pre
   WitnessLM4_1.witReifyCallerBody
+  WitnessLM4_1.witReifyCallerAnneal0
+  WitnessLM4_1.witReifyCallerMiriFrame0
+  WitnessLM4_1.witReifyAllocId
+  WitnessLM4_1.witReifyFnPtrVal
+  WitnessLM4_1.witReifyFnEntry
+  WitnessLM4_1.witReifyMachine
+  WitnessLM4_1.witReifyCallerMiri0
   WitnessLM4_1.witReifyCaller0_rel
   WitnessLM4_1.witLinkedPanicBody
   WitnessLM4_1.witLinkedPanicCall_rel
@@ -21852,6 +21866,20 @@ example :
     annealRigidTyLayoutCompat (.int .i32) (.uint .u32) = false :=
   annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq
 
+example :
+    annealRigidTyLayoutCompat .char (.uint .u32) = true ∧
+    annealRigidTyLayoutCompat .char (.int .i32) = false ∧
+    annealRigidTyLayoutCompat (.array (.uint .u64) 0) (.tuple []) = false ∧
+    annealRigidTyLayoutCompat (.array (.uint .u8) 0) (.tuple []) = false ∧
+    annealRigidTyLayoutCompat (.tuple [.tuple [], .never]) (.array (.tuple []) 3) = true ∧
+    annealRigidTyLayoutCompat (.ref .not (.uint .u8)) (.rawPtr .mut (.uint .u32)) = true ∧
+    annealRigidTyLayoutCompat (.fnPtr [] (.tuple []) .safe .rust) (.rawPtr .not (.uint .u8)) = true ∧
+    annealRigidTyLayoutCompat (.ref .not .str) (.rawPtr .mut (.slice (.uint .u32))) = true ∧
+    annealRigidTyLayoutCompat (.ref .not (.slice (.uint .u8))) (.ref .not (.uint .u8)) = false ∧
+    annealRigidTyLayoutCompat (.ref .not (.dynamic "A")) (.ref .not (.dynamic "B")) = false ∧
+    annealRigidTyLayoutCompat (.ref .not (.dynamic "A")) (.rawPtr .mut (.dynamic "A")) = true :=
+  annealRigidTyLayoutCompat_canonical_cases
+
 example
     {fnEntry : FnPtrEntry} {argCount : Nat} {fnTy : Ty}
     {callerInputs : List RigidTy} {callerOutput : RigidTy}
@@ -22074,6 +22102,26 @@ example
   step_terminator_assert_failed_directUnwind_simulation
     hstate hphase hbb hstmt_none hstmt_len hterm hdecl hbool_ty himm hsc hne_exp
 
+example (fnPtrs : List FnPtrEntry) (mAllocId : Miri.Memory.AllocId)
+    (hrange : ∀ e ∈ fnPtrs, e.allocId < UInt64.size) :
+    ((annealFnPtrRegistry fnPtrs).extras.find? (·.1 == mAllocId)).map Prod.snd =
+      lookupFnPtr fnPtrs mAllocId.value.toNat :=
+  annealFnPtrRegistry_find_eq fnPtrs mAllocId hrange
+
+example (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry) :
+    { annealRvalueHooksLM4_1 currentBody fnPtrs with
+        cast := (annealRvalueHooks currentBody.localDecls currentBody.layouts).cast } =
+      annealRvalueHooks currentBody.localDecls currentBody.layouts :=
+  annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast currentBody fnPtrs
+
+example (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry)
+    (c : Unit) (src : Miri.Interpreter.OpTy AnnealProv) (kind : Miri.MIR.CastKind)
+    (ty : Miri.MIR.TyId) (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (hkind : ∀ sf cs, kind ≠ .PointerCoercion (.ReifyFnPointer sf) cs) :
+    (annealRvalueHooksLM4_1 currentBody fnPtrs).cast c src kind ty dest =
+      (annealRvalueHooks currentBody.localDecls currentBody.layouts).cast c src kind ty dest :=
+  annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer currentBody fnPtrs c src kind ty dest hkind
+
 open LeanMiriSpec.Correspondence.WitnessLM4_1 in
 example :
     (∃ s₁ m₁ topFrame₁ restMfs,
@@ -22081,9 +22129,9 @@ example :
       Miri.Interpreter.Step.step
         (annealStepHooksForState witReifyCallerBody witReifyCallerAnneal0)
         () witReifyCallerMiri0 = (m₁, .ok true) ∧
-      lookupFnPtr s₁.memory.fnPtrs 1 = some witFnEntrySafe ∧
+      lookupFnPtr s₁.memory.fnPtrs fnPtrAllocBase = some witReifyFnEntry ∧
       IndirectFnPtrMovePre witReifyCallerBody s₁ m₁ topFrame₁ restMfs 3 safeFnPtrDecl
-        witFnPtrVal Witness.witnessAllocId Miri.Memory.BorTag.one Witness.witnessBaseAddr ∧
+        witReifyFnPtrVal witReifyAllocId Miri.Memory.BorTag.one Witness.witnessBaseAddr ∧
       StepRelMultiFrame witReifyCallerBody m₁
         (stepMirFn witReifyCallerBody s₁)
         (Miri.Interpreter.Step.step

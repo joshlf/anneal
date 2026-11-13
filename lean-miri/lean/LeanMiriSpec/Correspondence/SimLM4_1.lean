@@ -9264,7 +9264,20 @@ Starting from any `MultiFrameStateRel rootBody s m` state at `(s.frame.blockIdx,
 steps both Stage-1 `stepMirFn rootBody s = .step s₁` and `lean-miri`
 `Miri.Interpreter.Step.step (annealStepHooksForState rootBody s) () m = (m₁, .ok true)`
 such that `(s₁, m₁)` satisfies `IndirectFnPtrMovePre` at `(s.frame.blockIdx, s.frame.stmtIdx + 1)`
-with `lookupFnPtr s₁.memory.fnPtrs allocId = some { allocId := allocId, defPath := defPath, typeArgs := .nil, fnSig := some fnDecl.ty.kind }`. -/
+with `lookupFnPtr s₁.memory.fnPtrs allocId = some { allocId := allocId, defPath := defPath, typeArgs := .nil, fnSig := some fnDecl.ty.kind }`.
+
+Scope of the hypotheses:
+* `hfn_ty` (`.safe` target), `hnot_intr`, `hcheck_sig`, and `htraits_nil` are
+  **Stage-1-only** preconditions of `evalReifyFnPointer` (`Places.lean:13784-13926`);
+  canonical `lean-miri` (`Cast.lean:336-341`, `annealReifyFnPointerAlloc`) performs no
+  reify-time signature, safety, or calling-convention validation, so its step does
+  not depend on them (they hold for every rustc-typed `ReifyFnPointer`).
+* `hfind_none` / `halloc_id` / `hmAlloc_eq` cover a first reification of `defPath`
+  at this type, with both machines naming the function allocation `allocId`.
+* `hbase_lookup` covers the case where `m.machine` already assigns `mAllocId` an
+  address (the address-reuse branch of `annealReifyFnPointerAlloc`); the
+  fresh-address branch, which records `annealStackBaseAddr mAllocId` in
+  `m.machine.addresses`, is not covered here. -/
 theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : MultiFrameStateRel rootBody s m)
@@ -9474,7 +9487,7 @@ theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
               layoutOfEncodedTyId]
             rfl
         have hreify_ok :
-            annealReifyFnPointerAlloc (activeMirBody rootBody s) s.memory.callees s.memory.fnPtrs
+            annealReifyFnPointerAlloc (activeMirBody rootBody s) s.memory.fnPtrs
               { m with stack := ⟨⟨restMfs.reverse ++ [tf₀]⟩⟩ } =
             .ok ⟨Miri.ABI.Size.ofBytes (baseAddr + UInt64.ofNat 0),
                  some (.concrete mAllocId Miri.Memory.BorTag.one)⟩
@@ -9488,18 +9501,12 @@ theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
             rw [hbb]
             dsimp only []
             rw [hstmt]
-            dsimp only []
-            rw [hreify_coerc, hnot_uns_coerc]
-            simp only [Bool.not_true, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
-            rw [hfn_ty]
             dsimp only [operandTy]
-            rw [hnot_intr, hsafe_coerc, hextr_coerc]
-            simp only [Bool.not_true, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
-            rw [hcheck_sig]
-            simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-            rw [← hfn_ty, hfind_none, halloc_id]
+            rw [hextr_coerc]
+            dsimp only []
+            rw [hfind_none, halloc_id]
             simp +zetaHave only [hma_eq, hbase_lookup]
-            exact if_pos hnz
+            exact ite_eq_left_iff.mpr fun h => absurd hnz h
         have hwrite_ok :
             annealWriteImmediate (.scalar msc_ptr)
               ⟨.local restMfs.length fnIdx none topFrame₀.localsIdentity, lay_fn⟩

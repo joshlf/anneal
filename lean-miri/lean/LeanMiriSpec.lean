@@ -263,19 +263,28 @@ import LeanMiriSpec.Audit
   `borrowTree_releaseProtector_full_simulation`,
   `basedNormalTree_releaseProtector_chain3_and_branch3_simulation`, and
   `cex_end_of_call_foreign_unique_frozen_divergence`), indirect `FnPtr` ABI
-  and layout-compatibility checks (`annealRigidTyLayoutCompat`,
+  and layout-compatibility checks ((`annealRigidTyLayoutCompat`,
   `annealRigidTyListLayoutCompat`,
   `annealRigidTyLayoutCompat_of_rigidTyEq`,
   `annealRigidTyLayoutCompat_strictly_coarser_than_rigidTyEq`,
+  `annealRigidTyLayoutCompat_canonical_cases`: trivial-ABI 1-ZSTs, thin and wide
+  pointers, and same-width integers including `char` ↔ `u32`, following canonical
+  `LayoutCompat.layoutCompat` on the non-ADT fragment),
   `annealFnPtrAbiCompatible`,
   `annealFnPtrAbiCompatible_of_fnEntryCompatibleWithCallSite`,
   `annealCalleeAbiCompatible`, `annealEvalNonConstCallLM4_1`), canonical
   `Miri.Interpreter.FunctionPointers.Registry` bridging (`annealFnPtrRegistry`,
-  `annealFnPtrRegistry_singleton_find_eq`), `ReifyFnPointer` coercion hooks
-  (`annealReifyFnPointerAlloc`, `annealCastHooksLM4_1`,
-  `annealRvalueHooksLM4_1`), and `annealStepHooksLM4_1` /
-  `annealStepHooksForState` / `annealStepHooksWithDirectUnwind` /
-  `StepRelMultiFrame`.
+  `annealFnPtrRegistry_singleton_find_eq`, and the general
+  `annealFnPtrRegistry_find_eq` for every `UInt64`-ranged table), `ReifyFnPointer` coercion hooks
+  (`annealReifyFnPointerAlloc`, which, like canonical `Cast.cast`, performs no
+  Stage-1 reify-time signature/safety validation; `annealCastHooksLM4_1`; and
+  `annealRvalueHooksLM4_1`, which differs from `annealRvalueHooks` only on
+  `ReifyFnPointer` casts: `annealRvalueHooksLM4_1_eq_annealRvalueHooks_with_cast`,
+  `annealRvalueHooksLM4_1_cast_eq_of_not_reifyFnPointer`), and
+  `annealStepHooksLM4_1` / `annealStepHooksForState` / `StepRelMultiFrame`, plus the
+  explicitly non-canonical, lang-item-free `annealStepHooksWithDirectUnwind`
+  (failed `Assert` unwinds directly and `UnwindTerminate` aborts directly, instead
+  of calling the `core::panicking` lang items as canonical `lean-miri` does).
 * `LeanMiriSpec.Correspondence.SimLM4_1`: `LM-4.1` multi-frame terminator and
   `ReifyFnPointer` simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
