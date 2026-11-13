@@ -44,32 +44,14 @@
       };
 
       forAllSystems = nixpkgs.lib.genAttrs (builtins.attrNames platforms);
-    in
-    {
-      packages = forAllSystems (system:
+
+      rustBuildEnvironment = system:
         let
           pkgs = import nixpkgs { inherit system; };
-          platform = platforms.${system};
-          rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
-
-          leanArchive = pkgs.fetchurl {
-            name = "lean-${leanVersion}-${platform.leanPlatform}.tar.zst";
-            url = "https://github.com/leanprover/lean4/releases/download/v${leanVersion}/lean-${leanVersion}-${platform.leanPlatform}.tar.zst";
-            sha256 = platform.leanSha256;
-          };
-
-          rustcCaptureSourceFiles = pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions [
-              ./Cargo.lock
-              ./trusted/rustc-capture
-            ];
-          };
-
           # rustc_private metadata and libLLVM must come from the same pinned
           # distribution as the compiler used to build the driver. Keep that
           # distribution unchanged: its Linux binaries use the host ELF loader,
-          # so use Nix's loader and linker only during the build.
+          # so use Nix's loader and linker for builds and compiler queries.
           rustToolchain = self.packages.${system}.rust-toolchain;
           rustRuntimeLibraryPath = pkgs.lib.makeLibraryPath (
             [ rustToolchain ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
@@ -94,6 +76,46 @@
                 -Clinker-features=-lld "$@"
             ''
           else "${rustToolchain}/bin/rustc";
+
+          # Compiler-session tests query bin/rustc in their sysroot. Keep the
+          # pinned libraries unchanged, but route that query through the same
+          # loader wrapper used to build the driver inside Nix's sandbox.
+          testSysroot = if pkgs.stdenv.isLinux then pkgs.symlinkJoin {
+            name = "anneal-test-sysroot";
+            paths = [ rustToolchain ];
+            postBuild = ''
+              rm "$out/bin/rustc"
+              ln -s "${rustCompilerForBuild}" "$out/bin/rustc"
+            '';
+          } else rustToolchain;
+        in
+        {
+          inherit rustToolchain rustRuntimeLibraryPath rustCompilerForBuild testSysroot;
+        };
+    in
+    {
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          platform = platforms.${system};
+          rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+
+          leanArchive = pkgs.fetchurl {
+            name = "lean-${leanVersion}-${platform.leanPlatform}.tar.zst";
+            url = "https://github.com/leanprover/lean4/releases/download/v${leanVersion}/lean-${leanVersion}-${platform.leanPlatform}.tar.zst";
+            sha256 = platform.leanSha256;
+          };
+
+          rustcCaptureSourceFiles = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.lock
+              ./trusted/rustc-capture
+            ];
+          };
+
+          rust = rustBuildEnvironment system;
+          inherit (rust) rustToolchain rustRuntimeLibraryPath rustCompilerForBuild;
         in
         {
           # Download and unpack the multi-component Rust toolchain as a
@@ -215,7 +237,7 @@
                 " -Clink-arg=-Wl,-rpath,@executable_path/../rust/lib";
             LD_LIBRARY_PATH = rustRuntimeLibraryPath;
             DYLD_LIBRARY_PATH = "${rustToolchain}/lib";
-            ANNEAL_TEST_RUST_SYSROOT = rustToolchain;
+            ANNEAL_TEST_RUST_SYSROOT = rust.testSysroot;
 
             # libLLVM loads zlib indirectly. Make it a direct dependency so
             # the driver's search path also resolves it on Linux, where an
@@ -307,6 +329,7 @@
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          rust = rustBuildEnvironment system;
         in
         {
           default = pkgs.mkShell {
@@ -317,6 +340,7 @@
               pkgs.zstd
               pkgs.jq
             ];
+            ANNEAL_TEST_RUST_SYSROOT = rust.testSysroot;
           };
         });
     };
