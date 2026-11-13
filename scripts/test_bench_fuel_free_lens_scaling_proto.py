@@ -453,7 +453,7 @@ class HygieneTests(unittest.TestCase):
                 self.assertIsNone(re.search(pat, text), f"{rel} matches internal pattern {pat}")
 
     def test_hygiene_patterns_catch_examples(self):
-        bad = ["host " + "cp" + "l-abc", "x.google" + "rs.com", "/home/" + "groupagent-x", "/x" + "20/teams",
+        bad = ["host " + "cp" + "l-abc", "x.google" + "rs.com", "/home/group" + "agent-x", "/x" + "20/teams",
                "/goo" + "gle/src", "see c" + "l/123", "bug b" + "/456", "opus" + "-5.5-max", "gem" + "ini-flash"]
         for s in bad:
             self.assertTrue(any(re.search(p, s) for p in bench.INTERNAL_PATTERNS), s)
