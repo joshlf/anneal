@@ -60,15 +60,16 @@ agreeing whole-program facts.
    overlay followed by sibling type-punning `u32` read returning `67305993`),
    `w2_union_init_prefix_lockstep`, and `w2_union_uninit_bytes_ub`.
 3. Raw pointers: `w3_rawPtr_write_read_returns`, `w3_rawPtr_return` (a returned
-   raw pointer, from entry), `w3_use_after_storageDead_ub`,
-   `w3_rawPtr_deref_null_reborrow_returns` (RFC 2582 `&raw const (*ptr::null())`
-   from entry), `w3_arith_offset_returns` (a returned Stage-1 `arith_offset`
-   pointer, from entry), `w3_arith_offset_uninit_ub` (from entry), and the
-   from-entry Stage-1 upgrades `w3_deref_oob_ub` (`ub_ptr_offset_oob_read` with
-   `BinOp.Offset` stride `8`), `w3_deref_oob_write_ub` (`ub_ptr_offset_oob_write`),
-   `w3_deref_misaligned_ub` (`ub_unaligned_ptr_read_u32`),
-   `w3_deref_null_ptr_read_ub` (`ub_deref_null_ptr_read`),
-   `w3_deref_null_ptr_write_ub` (`ub_deref_null_ptr_write`),
+   raw pointer, from entry), `w3_use_after_storageDead_ub`, the from-entry null
+   `*ptr` agreements `w3_deref_null_ptr_read_ub` (`ub_deref_null_ptr_read`) and
+   `w3_deref_null_ptr_write_ub` (`ub_deref_null_ptr_write`), undefined behavior
+   in both machines as before Stage-1, `w3_arith_offset_returns` (a returned
+   Stage-1 `arith_offset` pointer, from entry), `w3_arith_offset_uninit_ub` (from
+   entry), and the from-entry Stage-1 upgrades `w3_rawPtr_deref_null_reborrow_returns`
+   (RFC 2582 `&raw const (*ptr::null())`, which pre-Stage-1 Anneal rejected with
+   undefined behavior, `step_rawPtr_deref_null_divergence`), `w3_deref_oob_ub`
+   (`ub_ptr_offset_oob_read` with `BinOp.Offset` stride `8`), `w3_deref_oob_write_ub`
+   (`ub_ptr_offset_oob_write`), `w3_deref_misaligned_ub` (`ub_unaligned_ptr_read_u32`),
    `w3_ptr_offset_neg_before_start_ub` (`ub_ptr_offset_negative_before_start`),
    `w3_invalid_bool_ptr_deref_ub` (`ub_transmute_invalid_bool_through_ptr`),
    `w3_ptr_offset_stride_read_returns` (`pass_ptr_offset_within_array`),
@@ -82,14 +83,16 @@ agreeing whole-program facts.
    from-entry Stage-1 upgrades `w4_reborrow_dangling_safeRef_ub` (reborrowing a
    dangling `&u64` after `StorageDead` is undefined behavior in both machines) and
    `w4_invalid_bool_ref_read_ub` (an invalid `bool` read through `&bool` is
-   undefined behavior in both machines), and the boundary witness `w4_disabled_read_divergence` (from entry, a read through a `Disabled`
+   undefined behavior in both machines), and the boundary witness
+   `w4_disabled_read_divergence` (from entry, a read through a `Disabled`
    reference is undefined behavior in Anneal, while `lean-miri`'s whole program,
    which does not check Tree Borrows permissions, is `System.Safe` and returns
    the read value).
-5. Multi-frame calls and stack unwinding: `w5_call_return`,
+5. Multi-frame calls and stack unwinding: `w5_call_return` (from entry, modeled on
+   the former `known_anneal_bug` ratchet `pass_direct_fn_call`),
    `w5_protector_release_returns` (`GlobalState.endCall` releasing a live
    protector on the way to an agreeing root return), `w5_callee_unreachable_ub`,
-   `w5_callee_uninit_return_ub`, and the from-entry Stage-1 upgrades
+   `w5_callee_uninit_return_ub` (both from entry), and the from-entry Stage-1 upgrades
    `w5_unwind_cleanup_returns` (3-frame `UnwindResume` caught at a caller
    cleanup pad), `w5_unwind_unreachable_ub` (multi-frame `UnwindResume` hitting
    `UnwindAction::Unreachable` UB), `w5_unwind_root_panic_vs_ub_divergence`
@@ -116,6 +119,16 @@ agreeing whole-program facts.
    value and is not `TreeSafe`) and `w6_write_bytes_oob_extCall_divergence`
    (undefined behavior in `lean-miri`, a normal return of the unchanged value in
    Anneal).
+
+Every other witness runs from program entry (`initMachineState` /
+`initMachineStateWithCallees` and `miriEntryState`) except `w2_enum_downcast_switch_returns`,
+`w2_array_index_oob_ub`, `w2_union_uninit_bytes_ub`, `w2_union_init_prefix_lockstep`,
+`w4_child_write_then_parent_read_returns`, `w4_unsafe_cell_vs_freeze`,
+`w4_protected_reservedFrz_conflict_ub`, `w4_storage_dead_protected_ub`,
+`w5_protector_release_returns`, and `w6_copy_nonoverlapping_disjoint_lockstep`, which
+start at the pre-states of the `Wit*` modules named in their statements; none of
+these is a divergence witness of the `Safety.lean` ledger, whose `MiriDiffWitnesses`
+entries all run from program entry.
 
 `AgreeReturns` / `AgreeReturnsBits` (both machines `TreeSafe` / `System.Safe`
 and returning the same value), `AgreeUB` (both reach undefined behavior and
@@ -2019,8 +2032,9 @@ def nullPtrReadEntryBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- **Stage-1 lockstep from entry** (`ub_deref_null_ptr_read`, `nullPtrReadEntryBody`):
-dereferencing a null `*const u64` for a read is undefined behavior in both machines. -/
+/-- **Agreement from entry** (`ub_deref_null_ptr_read`, `nullPtrReadEntryBody`):
+dereferencing a null `*const u64` for a read is undefined behavior in both machines
+(as before Stage-1), checked by kernel evaluation of both whole-program runs. -/
 theorem w3_deref_null_ptr_read_ub :
     AgreeUB nullPtrReadEntryBody (annealMiriHooks nullPtrReadEntryBody)
       (initMachineState nullPtrReadEntryBody [])
@@ -2046,8 +2060,9 @@ def nullPtrWriteEntryBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- **Stage-1 lockstep from entry** (`ub_deref_null_ptr_write`, `nullPtrWriteEntryBody`):
-dereferencing a null `*mut u64` for a write is undefined behavior in both machines. -/
+/-- **Agreement from entry** (`ub_deref_null_ptr_write`, `nullPtrWriteEntryBody`):
+dereferencing a null `*mut u64` for a write is undefined behavior in both machines
+(as before Stage-1), checked by kernel evaluation of both whole-program runs. -/
 theorem w3_deref_null_ptr_write_ub :
     AgreeUB nullPtrWriteEntryBody (annealMiriHooks nullPtrWriteEntryBody)
       (initMachineState nullPtrWriteEntryBody [])
@@ -2074,10 +2089,13 @@ def nullPtrRawReborrowEntryBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- **RFC 2582 null place-to-pointer lockstep from entry**
+/-- **RFC 2582 null place-to-pointer agreement from entry, a Stage-1 upgrade**
 (`step_rawPtr_deref_null_simulation`, `nullPtrRawReborrowEntryBody`): unlike `*ptr`
 reads/writes, `&raw const (*ptr::null::<u64>())` steps without undefined behavior in
-both machines and returns the null pointer `0`. -/
+both machines and returns the null pointer `0` (checked by kernel evaluation of both
+whole-program runs). Pre-Stage-1 Anneal required a `Value.ptr` operand and rejected
+this reborrow with undefined behavior (`step_rawPtr_deref_null_divergence` of the
+pre-Stage-1 ledger). -/
 theorem w3_rawPtr_deref_null_reborrow_returns :
     AgreeReturnsBits nullPtrRawReborrowEntryBody (annealMiriHooks nullPtrRawReborrowEntryBody)
       (initMachineState nullPtrRawReborrowEntryBody [])
@@ -4567,7 +4585,8 @@ def callFiveBody : CapturedMir :=
      blk [st (.assign (pl 0) (.use (.copy (pl 1)))), st (.storageDead 1)] .return_]
 
 /-- **Multi-frame call and return** (`Terminator.Call` + `Terminator.Return`,
-`GlobalState.endCall` on the callee frame pop): the caller calls `crate::five`,
+`GlobalState.endCall` on the callee frame pop; modeled on `pass_direct_fn_call`, a
+former `known_anneal_bug` ratchet): the caller calls `crate::five`,
 which returns `5_u8` into `_1`; the caller returns `5_u8`. Both machines run the
 whole program from their entry states (Anneal with `crate::five` as a callee). -/
 theorem w5_call_return :

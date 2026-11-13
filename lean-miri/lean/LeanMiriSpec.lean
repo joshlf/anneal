@@ -428,18 +428,23 @@ import LeanMiriSpec.Audit
   divergence ledger (`LM-4.3`).
 * `LeanMiriSpec.Correspondence.MiriDiffWitnesses`: kernel-checked whole-program
   safe, partial-correctness, undefined-behavior, infinite-run, and divergence
-  witnesses across scalars, aggregates, unions (`w2_union_return`,
+  witnesses (each witness of the `Safety` divergence ledger runs from program entry)
+  across scalars, aggregates, unions (`w2_union_return`,
   `w2_union_overlay_type_punning_returns`), raw pointers (from-entry Stage-1
-  `BinOp.Offset` stride `w3_ptr_offset_stride_read_returns`, narrowing type-pun
+  `BinOp.Offset` stride `w3_ptr_offset_stride_read_returns`, RFC 2582 null
+  place-to-pointer `w3_rawPtr_deref_null_reborrow_returns`, narrowing type-pun
   `w3_deref_type_pun_returns`, storage revive `w3_storage_revive_stale_deref_ub`,
-  and out-of-bounds / misaligned / negative-offset / invalid-`bool` deref UB),
-  references and Tree Borrows (`w4_invalid_bool_ref_read_ub`,
-  `w4_storage_dead_protected_ub`), multi-frame calls, unwinding, and indirect `FnPtr`
-  calls (`w5_unwind_cleanup_returns`, `w5_unwind_unreachable_ub`,
+  and null / out-of-bounds / misaligned / negative-offset / invalid-`bool` deref UB),
+  references and Tree Borrows (`w4_reborrow_dangling_safeRef_ub`,
+  `w4_invalid_bool_ref_read_ub`, `w4_storage_dead_protected_ub`,
+  `w4_disabled_read_divergence`), multi-frame calls, unwinding, and indirect `FnPtr`
+  calls (`w5_call_return`, `w5_unwind_cleanup_returns`, `w5_unwind_unreachable_ub`,
   `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`), and
   intrinsics (`w6_copy_nonoverlapping_full_bytes_returns`,
   `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, and the Stage-1 external-call
-  boundary of `write_bytes` and `rotate_left`) (`LM-4.3`).
+  boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
+  `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
+  `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

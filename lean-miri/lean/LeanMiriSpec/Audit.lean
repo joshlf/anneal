@@ -25114,6 +25114,45 @@ example :
    w3_rawPtr_deref_null_reborrow_returns, w4_reborrow_dangling_safeRef_ub,
    copyStage1RawPtrCastEntry_prefix_anneal, copyStage1RawPtrCastEntry_prefix_miri⟩
 
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (StateRel copyStage1RawPtrCastEntryBody
+        copyStage1RawPtrCastEntryPreAnneal copyStage1RawPtrCastEntryPreMiri ∧
+      ∀ tf, copyStage1RawPtrCastEntryPreMiri.stack.frames = #[tf] →
+        ∀ k, IsImmediateFrameLocal tf k) ∧
+    runAnnealBounded reborrowDanglingSafeRefEntryBody 5
+        (initMachineState reborrowDanglingSafeRefEntryBody []) =
+      .running (ptr4EntryPreAnneal reborrowDanglingSafeRefEntryBody) ∧
+    runLoopFuel (annealMiriHooks reborrowDanglingSafeRefEntryBody) 5
+        (miriEntryState reborrowDanglingSafeRefEntryBody) =
+      .running (ptr4EntryPreMiri reborrowDanglingSafeRefEntryBody) :=
+  ⟨copyStage1RawPtrCastEntry_stateRel_and_imm, reborrowDanglingSafeRef_prefix_anneal,
+   reborrowDanglingSafeRef_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    let b := copyStage1RawPtrCastEntryBody
+    let hooks := annealStepHooks b.localDecls b.layouts
+    let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+    let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      stepMirFn b copyStage1RawPtrCastEntryPreAnneal = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () copyStage1RawPtrCastEntryPreMiri = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      get? s₄.frame.locals 4 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      get? s₄.frame.locals 5 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      Miri.Interpreter.Step.step hooks () m₄ =
+        (m₅, .error (.unsupported "pointee of TyId 80 is not encoded")) :=
+  copyStage1RawPtrCastEntry_trace
+
 end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
