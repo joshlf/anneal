@@ -214,6 +214,16 @@ class LeanSourceAuditTests(unittest.TestCase):
             self.assertIsNone(re.search(pat, self.code, re.M), f"forbidden pattern {pat}")
 
     def test_every_theorem_has_axiom_guard(self):
+        self.assertIsNone(
+            re.search(
+                r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|noncomputable)\s+)+theorem\b"
+                r"|^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+)*lemma\b"
+                r"|^\s*@\[[^\]]*\]\s*theorem\b",
+                self.code,
+                re.M,
+            ),
+            "all theorems must be plain top-level `theorem` declarations audited by `#print axioms`",
+        )
         theorems = re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M)
         self.assertGreater(len(theorems), 150)
         self.assertEqual(len(theorems), len(set(theorems)))
@@ -269,10 +279,31 @@ class LeanSourceAuditTests(unittest.TestCase):
             "performTransition_accessed_isSome_eq_live", "isTagProtected_eq_live",
             "performTransition_entry_eq_live", "foreign_write_disabled_protected_noop",
             "protected_reservedIM_foreign_fails_closed",
+            "mirStepsConverges_of_mirStep_cont", "mirWpConverges_of_mirStep_cont",
+            "live_runMirToBlock_stationary_at_target", "runUntilTarget_reached_iff_live_runMirToBlock",
+            "runMirToBlock_reached_iff_step_and_live",
+            "setPureEnvSlot?_eq_set?", "setPureEnvSlot?_eq_live_bind_forcePureEnv?",
+            "evalPureStmtNorm_eq_bind_forceSpine?",
+            "typedAt_laidOutPair_write_fst", "typedAt_laidOutPair_applyFieldWrites",
+            "hasUniqueWritePerm_remove_callId", "split_at_mut_stage2Only_unique_write_perm",
+            "stage1_vs_stage2Only_two_arg_release_differs", "shared_reborrowFootprint_read_ok_write_ub",
+            "isBorrowDescendantOrSelf_refl", "nodeAccessRelatedness_visit_eq_live_writer",
+            "borrowEntryWriteConflicts_eq_live", "restoreCallerProtectors_eq_live",
         ]
         theorems = set(re.findall(r"^theorem\s+([A-Za-z_0-9.'?]+)", self.code, re.M))
         for name in required:
             self.assertIn(name, theorems)
+
+    def test_live_hierarchy_and_return_bridges_present(self):
+        for sym in (
+            "Anneal.FunctionalTranslation.runMirToBlock",
+            "Anneal.MirLiftCore.evalPureStmtNorm",
+            "Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf",
+            "Trusted.Rustc.V2026_06_01.MirSemantics.resolveTreeBorrowWriterTag",
+            "Trusted.Rustc.V2026_06_01.MirSemantics.borrowEntryWriteConflicts",
+            "Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors",
+        ):
+            self.assertIn(sym, self.code)
 
     def test_tree_borrows_bridge_is_semantic(self):
         """The Tree Borrows bridge must relate *transitions*, not only rename permissions."""
@@ -433,14 +464,24 @@ class ReportTests(unittest.TestCase):
     NON_LEAN_NAMES = {
         "split_at_mut", "get_mut", "t_arg", "t_ret", "termination_by", "List.drop_take",
         "PROPOSED_HOLD", "skip_if_known_noop", "perform_access", "protector_end_access",
+        "maxHeartbeats", "maxRecDepth", "SkipChildrenOfAccessed", "GlobalState.endCall",
+        "hasFVar", "propext", "Quot.sound", "UInt8", "PUnit",
+        "blockIdx", "stmtIdx", "parentTag", "t_sib", "t_arg_x", "t_arg_y",
+        "Classical.byContradiction", "FuelFreeProtoBench.Prototype", "MirSemantics",
+        "ProtectedDisabled", "ReservedFrz", "ReservedIM", "_", "countUp", "endCall",
+        "headD", "subRange",
     }
 
     @staticmethod
     def _decls(text: str) -> set[str]:
-        return set(re.findall(
+        clean = strip_lean_comments(text)
+        top = re.findall(
             r"^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+)*"
             r"(?:theorem|lemma|def|abbrev|structure|inductive|instance|class)\s+([A-Za-z_][A-Za-z0-9_.'?!\u2080-\u2089]*)",
-            text, re.M))
+            clean, re.M)
+        ctors = re.findall(r"^\s*\|\s*([A-Za-z_][A-Za-z0-9_.'?!\u2080-\u2089]*)(?:\s|:|$)", clean, re.M)
+        fields = re.findall(r"^\s*([a-z][A-Za-z0-9_?!\u2080-\u2089]*)\s*:", clean, re.M)
+        return set(top) | set(ctors) | set(fields)
 
     @classmethod
     def _declaration_index(cls) -> dict:
@@ -483,17 +524,19 @@ class ReportTests(unittest.TestCase):
             if tok.endswith((".lean", ".md", ".py", ".json")):
                 continue
             qualified = tok.startswith(("Anneal.", "Trusted."))
-            if not qualified and "_" not in tok:
+            has_camel = bool(re.search(r"[a-z][A-Z]", tok))
+            if not qualified and "_" not in tok and not has_camel:
                 continue
-            if (tok in idx["proto"] or tok in labels or tok in receipt_keys or tok in self.NON_LEAN_NAMES
-                    or tok in idx["namespaces"]):
+            last = tok.rsplit(".", 1)[-1]
+            parts = tok.split(".")
+            if (tok in idx["proto"] or labels.__contains__(tok) or tok in receipt_keys
+                    or tok in self.NON_LEAN_NAMES or tok in idx["namespaces"]
+                    or (len(parts) == 2 and parts[0] in idx["proto"] and last in idx["proto"])):
                 continue
             if not qualified and hasattr(bench, tok):
                 continue  # harness function named in the methodology section
             if not qualified and re.search(rf"^\s*def {re.escape(tok)}\(", pathlib.Path(__file__).read_text(), re.M):
                 continue  # unit test named in the round log
-            last = tok.rsplit(".", 1)[-1]
-            parts = tok.split(".")
             if tok.startswith("Anneal.") and len(parts) > 2 and parts[1] in idx["by_module"]:
                 decls = idx["by_module"][parts[1]]
                 ok = ".".join(parts[2:]) in decls or last in decls
@@ -513,11 +556,13 @@ class ReportTests(unittest.TestCase):
 
     def test_report_name_check_detects_invented_names(self):
         fake = ("`Anneal.MirLoops.forRangeUp` `Anneal.MirLoops.forRangeUpMagic` `no_such_theorem_xyz` "
+                "`evalPureStmtNorm` `evalPureStmtMagic` "
                 "`Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowNodeAccess` "
                 "`Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTeleport` `performTransition_accessed_eq_live`")
         self.assertEqual(self.unresolved_names(fake),
                          ["Anneal.MirLoops.forRangeUpMagic",
-                          "Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTeleport", "no_such_theorem_xyz"])
+                          "Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowTeleport",
+                          "evalPureStmtMagic", "no_such_theorem_xyz"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -965,14 +965,14 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 
 /-- Embedding of the live trusted step function `stepMirFn` into the generic
 machine.  Both silent `.tau` transitions and `MirObsE` observation steps
-(`.vis (.inr (.inl (.emit (.event _))))`, emitted by live `.switchInt`
-terminators) continue, and root returns halt; external calls and faults are
-mapped conservatively to `.fault`, matching live
+(`.vis (.inr (.inl (.emit _)))`, including `.event _` emitted by live
+`.switchInt` terminators and `.silent`) continue, and root returns halt;
+external calls and faults are mapped conservatively to `.fault`, matching live
 `Anneal.FunctionalTranslation.runMirToBlock`. -/
 def mirStep (body : CapturedMir) (s : MachineState) : Step MachineState MirOutcome :=
   match stepMirFn body s with
   | .tau (.running s') => .cont s'
-  | .vis (.inr (.inl (.emit (.event _)))) k =>
+  | .vis (.inr (.inl (.emit _))) k =>
     match k PUnit.unit with
     | .running s' => .cont s'
     | _ => .fault
@@ -981,23 +981,18 @@ def mirStep (body : CapturedMir) (s : MachineState) : Step MachineState MirOutco
 
 theorem stepMirFn_of_mirStep_cont {body : CapturedMir} {s s' : MachineState}
     (h : mirStep body s = .cont s') :
-    ∃ obs, stepMirFn body s = MirStepNode.emitStep obs s' := by
+    stepMirFn body s = .tau (.running s') ∨
+      ∃ obs k, stepMirFn body s = .vis (.inr (.inl (.emit obs))) k ∧ k PUnit.unit = .running s' := by
   unfold mirStep at h
   split at h
   · rename_i s'' heq
     cases h
-    exact ⟨.silent, heq⟩
-  · rename_i tag k heq
+    exact Or.inl heq
+  · rename_i obs k heq
     split at h
     · rename_i s'' hk
       cases h
-      refine ⟨.event tag, ?_⟩
-      rw [heq]
-      dsimp only [MirStepNode.emitStep]
-      congr 1
-      funext u
-      cases u
-      exact hk
+      exact Or.inr ⟨obs, k, heq, hk⟩
     · cases h
   · cases h
   · cases h
@@ -1013,18 +1008,58 @@ theorem stepMirFn_of_mirStep_done {body : CapturedMir} {s : MachineState} {out :
     exact heq
   · cases h
 
+theorem mirStepsConverges_of_mirStep_cont {body : CapturedMir} {s s' : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (hs : mirStep body s = .cont s')
+    (hnext : Anneal.MirFuelFree.MirStepsConverges body s' mid post) :
+    Anneal.MirFuelFree.MirStepsConverges body s mid post := by
+  rcases stepMirFn_of_mirStep_cont hs with htau | ⟨obs, k, hvis, hk⟩
+  · exact Anneal.MirFuelFree.MirStepsConverges.step_tau htau hnext
+  · rcases hnext with ⟨fuel, h_wp⟩
+    refine ⟨fuel + 1, ?_⟩
+    unfold Anneal.MirFuelFree.wpMirStepsSym
+      Anneal.MirFuelFree.wpMirExecStepsSym
+    rw [Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeNoCall_eq,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree_eval,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalNodeNoCallWP_eq]
+    dsimp only [stepMirState]
+    cases obs <;> (
+      rw [hvis]
+      change Anneal.MirFuelFree.wpMirExecStepsSym fuel body (k PUnit.unit) _ post
+      rw [hk]
+      exact h_wp)
+
 /-- **Bridge to the live `Anneal.MirFuelFree.MirStepsConverges`**: generic
 segment reachability over `mirStep` is live fuel-free reachability (including
-across `.switchInt` observation steps). -/
+across all `MirObsE` observation steps). -/
 theorem mirStepsConverges_of_stepsTo {body : CapturedMir} {s : MachineState}
     {mid : MachineState → Prop} {post : MirOutcome → Prop}
     (h : StepsTo (mirStep body) s mid) :
     Anneal.MirFuelFree.MirStepsConverges body s mid post := by
   induction h with
   | refl hm => exact Anneal.MirFuelFree.MirStepsConverges.refl hm
-  | step hs _ ih =>
-    obtain ⟨obs, hstep⟩ := stepMirFn_of_mirStep_cont hs
-    exact Anneal.MirFuelFree.MirStepsConverges.step_emit hstep ih
+  | step hs _ ih => exact mirStepsConverges_of_mirStep_cont hs ih
+
+theorem mirWpConverges_of_mirStep_cont {body : CapturedMir} {s s' : MachineState}
+    {post : MirOutcome → Prop}
+    (hs : mirStep body s = .cont s')
+    (hnext : Anneal.MirFuelFree.MirWpConverges body s' post) :
+    Anneal.MirFuelFree.MirWpConverges body s post := by
+  rcases stepMirFn_of_mirStep_cont hs with htau | ⟨obs, k, hvis, hk⟩
+  · exact Anneal.MirFuelFree.MirWpConverges.step_tau htau hnext
+  · rcases hnext with ⟨fuel, h_wp⟩
+    refine ⟨fuel + 1, ?_⟩
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirSym
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym
+    rw [Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTree_eq,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree_eval,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalNodeWP_eq]
+    dsimp only [stepMirState]
+    cases obs <;> (
+      rw [hvis]
+      change Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body (k PUnit.unit) post
+      rw [hk]
+      exact h_wp)
 
 theorem mirWpConverges_of_evalFuel {body : CapturedMir} {post : MirOutcome → Prop} :
     ∀ (k : Nat) (s : MachineState) (v : MirOutcome),
@@ -1036,8 +1071,7 @@ theorem mirWpConverges_of_evalFuel {body : CapturedMir} {post : MirOutcome → P
     cases hs : mirStep body s with
     | cont s' =>
       rw [hs] at h
-      obtain ⟨obs, hstep⟩ := stepMirFn_of_mirStep_cont hs
-      exact Anneal.MirFuelFree.MirWpConverges.step_emit hstep
+      exact mirWpConverges_of_mirStep_cont hs
         (mirWpConverges_of_evalFuel k s' v h hp)
     | done out =>
       rw [hs] at h
@@ -1181,6 +1215,101 @@ theorem live_countToN_mirWpConverges_all_n (n : Nat) (hn : n < 4294967296) :
   · intro s_exit hs
     subst hs
     exact wpConverges_of_runToTarget_halted (runMirToBlock_countToN_exit n) rfl
+
+/-- **Stationary-at-header limitation of live `Anneal.FunctionalTranslation.runMirToBlock`**:
+because the live stepper checks `blockIdx == target && stmtIdx == 0` *before*
+stepping, calling it from a loop header `(target, 0)` immediately returns `some s`
+in zero steps without advancing through the loop body. -/
+theorem live_runMirToBlock_stationary_at_target (body : CapturedMir)
+    (target : BasicBlockIdx) (bound : Nat) (s : MachineState)
+    (hbb : s.frame.blockIdx = target) (hstmt : s.frame.stmtIdx = 0) :
+    Anneal.FunctionalTranslation.runMirToBlock (bound + 1) body target s = some s := by
+  unfold Anneal.FunctionalTranslation.runMirToBlock
+  have hcond : (Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0) = true := by
+    rw [hbb, hstmt, Nat.beq_refl, Nat.beq_refl]; rfl
+  rw [ite_eq_left hcond]
+
+theorem live_runMirToBlock_step_of_not_target (body : CapturedMir)
+    (target : BasicBlockIdx) (bound : Nat) (s : MachineState)
+    (hnt : (s.frame.blockIdx == target && s.frame.stmtIdx == 0) = false) :
+    Anneal.FunctionalTranslation.runMirToBlock (bound + 1) body target s =
+      match mirStep body s with
+      | .cont s' => Anneal.FunctionalTranslation.runMirToBlock bound body target s'
+      | _ => none := by
+  have hnt' : (Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0) = false := by
+    simpa [BEq.beq] using hnt
+  conv => lhs; unfold Anneal.FunctionalTranslation.runMirToBlock
+  unfold mirStep
+  rw [ite_eq_right (by rw [hnt']; exact Bool.false_ne_true)]
+  cases hstep : stepMirFn body s with
+  | ret _ => rfl
+  | tau st =>
+    cases st <;> rfl
+  | vis req k =>
+    rcases req with _ | (e | _)
+    · rfl
+    · cases e
+      cases hk : k PUnit.unit <;> simp only [hk]
+    · rfl
+
+/-- **Exact bridge between `runUntilTarget (mirStep body)` and live
+`Anneal.FunctionalTranslation.runMirToBlock`**: `runUntilTarget` reaches `s_hit`
+within `bound` steps iff the live `runMirToBlock (bound + 1)` returns `some s_hit`. -/
+theorem runUntilTarget_reached_iff_live_runMirToBlock (body : CapturedMir)
+    (target : BasicBlockIdx) :
+    ∀ (bound : Nat) (s s_hit : MachineState),
+      runUntilTarget (mirStep body)
+        (fun ms => ms.frame.blockIdx == target && ms.frame.stmtIdx == 0) bound s = .reached s_hit ↔
+        Anneal.FunctionalTranslation.runMirToBlock (bound + 1) body target s = some s_hit
+  | 0, s, s_hit => by
+    unfold runUntilTarget
+    cases ht : (s.frame.blockIdx == target && s.frame.stmtIdx == 0) with
+    | true =>
+      have ht' : (Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0) = true := by
+        simpa [BEq.beq] using ht
+      conv => rhs; lhs; unfold Anneal.FunctionalTranslation.runMirToBlock
+      simp only [↓reduceIte, ht']
+      exact Iff.intro (fun h => by cases h; rfl) (fun h => by cases h; rfl)
+    | false =>
+      rw [live_runMirToBlock_step_of_not_target body target 0 s ht]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      cases mirStep body s <;> exact Iff.intro (fun h => by cases h) (fun h => by cases h)
+  | bound + 1, s, s_hit => by
+    unfold runUntilTarget
+    cases ht : (s.frame.blockIdx == target && s.frame.stmtIdx == 0) with
+    | true =>
+      have ht' : (Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0) = true := by
+        simpa [BEq.beq] using ht
+      conv => rhs; lhs; unfold Anneal.FunctionalTranslation.runMirToBlock
+      simp only [↓reduceIte, ht']
+      exact Iff.intro (fun h => by cases h; rfl) (fun h => by cases h; rfl)
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [live_runMirToBlock_step_of_not_target body target (bound + 1) s ht]
+      cases hs : mirStep body s with
+      | cont s' =>
+        exact runUntilTarget_reached_iff_live_runMirToBlock body target bound s' s_hit
+      | done _ => exact Iff.intro (fun h => by cases h) (fun h => by cases h)
+      | fault => exact Iff.intro (fun h => by cases h) (fun h => by cases h)
+
+/-- **Exact bridge from header-advancing `runMirToBlock` to live
+`Anneal.FunctionalTranslation.runMirToBlock`**: the prototype's `runMirToBlock`
+reaches `s_hit` iff taking one mandatory `mirStep` (`mirStep body s = .cont s₁`)
+followed by the live `Anneal.FunctionalTranslation.runMirToBlock` reaches `s_hit`. -/
+theorem runMirToBlock_reached_iff_step_and_live (body : CapturedMir)
+    (target : BasicBlockIdx) (s s_hit : MachineState) :
+    runMirToBlock body target s = .reached s_hit ↔
+      ∃ s₁, mirStep body s = .cont s₁ ∧
+        Anneal.FunctionalTranslation.runMirToBlock (mirSegmentBound body + 1) body target s₁ = some s_hit := by
+  unfold runMirToBlock runToTarget
+  cases hs : mirStep body s with
+  | cont s₁ =>
+    rw [runUntilTarget_reached_iff_live_runMirToBlock]
+    exact Iff.intro (fun h => ⟨s₁, rfl, h⟩) (fun ⟨s₂, hs₂, h⟩ => by cases hs₂; exact h)
+  | done _ =>
+    exact Iff.intro (fun h => by cases h) (fun ⟨_, hs₁, _⟩ => by cases hs₁)
+  | fault =>
+    exact Iff.intro (fun h => by cases h) (fun ⟨_, hs₁, _⟩ => by cases hs₁)
 
 end LiveMirBridge
 
@@ -1638,6 +1767,82 @@ theorem applySlotUpdatesLive?_oob {α : Type} (u : Nat × α) (ups : List (Nat �
     unfold Trusted.Sequence.set?
     rw [ite_eq_right (Nat.not_lt.mpr h)]
   simp only [applySlotUpdatesLive?, hlive]
+
+/-- Single-pass constructor-forcing slot update over live `PureEnv`
+(`List LocalSlot`): checks bounds like `Trusted.Sequence.set?`, forces both the
+`List` spine and `LocalSlot` constructors (`.dead`, `.uninit`, `.init v`) along
+the prefix `[0..loc]`, and stops at `loc` without a second pass over the tail. -/
+def setPureEnvSlot? :
+    Anneal.MirLiftCore.PureEnv → Nat →
+      Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot → Option Anneal.MirLiftCore.PureEnv
+  | [], _, _ => none
+  | _ :: rest, 0, .dead => some (.dead :: rest)
+  | _ :: rest, 0, .uninit => some (.uninit :: rest)
+  | _ :: rest, 0, .init v => some (.init v :: rest)
+  | .dead :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.dead :: rest')
+    | none => none
+  | .uninit :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.uninit :: rest')
+    | none => none
+  | .init v :: rest, i + 1, s =>
+    match setPureEnvSlot? rest i s with
+    | some rest' => some (.init v :: rest')
+    | none => none
+
+/-- **Single-pass `setPureEnvSlot?` equals live `Trusted.Sequence.set?`**. -/
+theorem setPureEnvSlot?_eq_set? :
+    ∀ (env : Anneal.MirLiftCore.PureEnv) (loc : Nat)
+      (s : Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot),
+      setPureEnvSlot? env loc s = Trusted.Sequence.set? env loc s
+  | [], loc, s => by
+    simp [setPureEnvSlot?, Trusted.Sequence.set?]
+  | x :: rest, 0, s => by
+    unfold Trusted.Sequence.set?
+    have h0 : 0 < (x :: rest).length := Nat.zero_lt_succ rest.length
+    rw [ite_eq_left h0]
+    cases s <;> rfl
+  | x :: rest, i + 1, s => by
+    have ih := setPureEnvSlot?_eq_set? rest i s
+    unfold Trusted.Sequence.set? at ih ⊢
+    by_cases hlt : i < rest.length
+    · have hlt' : i + 1 < (x :: rest).length := Nat.succ_lt_succ hlt
+      rw [ite_eq_left hlt] at ih
+      rw [ite_eq_left hlt']
+      cases x <;> simp only [setPureEnvSlot?, ih, List.set_cons_succ]
+    · have hlt' : ¬ i + 1 < (x :: rest).length := fun h => hlt (Nat.lt_of_succ_lt_succ h)
+      rw [ite_eq_right hlt] at ih
+      rw [ite_eq_right hlt']
+      cases x <;> simp only [setPureEnvSlot?, ih]
+
+/-- **Drop-in single-pass replacement for live `Anneal.MirLiftCore.set?_of_forcePureEnv?`**:
+`setPureEnvSlot?` equals the two-pass `(set? env loc s).bind forcePureEnv?` used
+in `MirLiftCore.lean`, eliminating the second full-frame traversal over the suffix. -/
+theorem setPureEnvSlot?_eq_live_bind_forcePureEnv? (env : Anneal.MirLiftCore.PureEnv)
+    (loc : Nat) (s : Trusted.Rustc.V2026_06_01.MirSemantics.LocalSlot) :
+    setPureEnvSlot? env loc s =
+      (Trusted.Sequence.set? env loc s).bind Anneal.MirLiftCore.forcePureEnv? := by
+  rw [setPureEnvSlot?_eq_set?]
+  cases Trusted.Sequence.set? env loc s with
+  | none => rfl
+  | some env' => exact (Anneal.MirLiftCore.forcePureEnv?_eq_some env').symm
+
+/-- **Bridge from live `Anneal.MirLiftCore.evalPureStmtNorm` to `forceSpine?`**:
+the live statement normalizer in `MirLiftCore.lean` equals `evalPureStmt`
+followed by `forceSpine?`. -/
+theorem evalPureStmtNorm_eq_bind_forceSpine?
+    (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (bbIdx : Trusted.Rustc.V2026_06_01.MirAst.BasicBlockIdx) (stmtIdx : Nat)
+    (env : Anneal.MirLiftCore.PureEnv)
+    (stmt : Trusted.Rustc.V2026_06_01.MirAst.Statement) :
+    Anneal.MirLiftCore.evalPureStmtNorm body bbIdx stmtIdx env stmt =
+      (Anneal.MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt).bind forceSpine? := by
+  unfold Anneal.MirLiftCore.evalPureStmtNorm
+  cases Anneal.MirLiftCore.evalPureStmt body bbIdx stmtIdx env stmt with
+  | none => rfl
+  | some rawEnv => exact (forceSpine?_eq_live rawEnv).symm
 
 end ForcePureEnv
 
@@ -2393,6 +2598,22 @@ theorem typedAt_of_canonicalAt {α : Type} {n : Nat} {c : FixedByteCodec α n} {
   rw [hr]
   rfl
 
+/-- Writing the first field of a padded pair updates the pair value in place
+without disturbing the padding or second field. -/
+theorem typedAt_laidOutPair_write_fst {α β : Type} {n₁ n₂ : Nat} {c₁ : FixedByteCodec α n₁}
+    {pad : Nat} {c₂ : FixedByteCodec β n₂} {base : Nat} {a a' : α} {b : β} {mem mem' : Mem}
+    (h : TypedAt (laidOutPair c₁ pad c₂) base (a, b) mem)
+    (hw : writeTyped c₁ base a' mem = some mem') :
+    TypedAt (laidOutPair c₁ pad c₂) base (a', b) mem' := by
+  rw [typedAt_laidOutPair_iff] at h ⊢
+  obtain ⟨hb, h₁, h₂⟩ := h
+  have hlen := writeTyped_length hw
+  obtain ⟨m₁, hw₁, ht₁, _⟩ := TypedAt.read_write_same c₁ a' ((typedAt_iff _ _ _ _).mp h₁).1
+  rw [hw₁] at hw
+  cases hw
+  refine ⟨by omega, ht₁, ?_⟩
+  exact TypedAt.frame_write (by unfold DisjointSlice; omega) hw₁ h₂
+
 /-- **`FieldsValid` implies whole-struct `TypedAt` across a padded `laidOutPair`**:
 regardless of arbitrary initialized/uninitialized bytes in the padding window
 `[base + n₁, base + n₁ + pad)`, `FieldsValid` at `base` and `base + n₁ + pad`
@@ -2406,6 +2627,26 @@ theorem typedAt_laidOutPair_of_fieldsValid {α β : Type} {n₁ n₂ : Nat}
   rw [typedAt_laidOutPair_iff]
   obtain ⟨hb₂, _⟩ := (canonicalAt_iff c₂ (base + n₁ + pad) mem).mp hv.2
   exact ⟨by omega, typedAt_of_canonicalAt hv.1 d₁, typedAt_of_canonicalAt hv.2 d₂⟩
+
+/-- **End-to-end `applyFieldWrites` → whole-struct `TypedAt (laidOutPair …)`**:
+after any sequence `ws` of field-lens writes on a padded struct, the resulting
+memory satisfies `TypedAt (laidOutPair c₁ pad c₂)` for `(lastLeft ws a₀, lastRight ws b₀)`
+across arbitrary padding bytes. -/
+theorem typedAt_laidOutPair_applyFieldWrites {α β : Type} {n₁ n₂ : Nat}
+    (c₁ : FixedByteCodec α n₁) (pad : Nat) (c₂ : FixedByteCodec β n₂)
+    (base : Nat) (d₁ : α) (d₂ : β) (ws : List (α ⊕ β)) {mem : Mem}
+    (hv : FieldsValid c₁ base c₂ (base + n₁ + pad) mem) :
+    TypedAt (laidOutPair c₁ pad c₂) base
+      (lastLeft ws ((fieldLens c₁ base d₁).readView mem),
+       lastRight ws ((fieldLens c₂ (base + n₁ + pad) d₂).readView mem))
+      (applyFieldWrites (fieldLens c₁ base d₁) (fieldLens c₂ (base + n₁ + pad) d₂) ws mem) := by
+  have hd : DisjointSlice base n₁ (base + n₁ + pad) n₂ := by
+    unfold DisjointSlice
+    exact Or.inr (Or.inr (Or.inl (by omega)))
+  obtain ⟨hL₁, hL₂, hI⟩ := subplaceFieldLens_disjoint c₁ c₂ base (base + n₁ + pad) d₁ d₂ hd
+  obtain ⟨hv', h₁, h₂⟩ := applyFieldWrites_spec hL₁ hL₂ hI ws mem hv
+  rw [← h₁, ← h₂]
+  exact typedAt_laidOutPair_of_fieldsValid c₁ pad c₂ base d₁ d₂ hv'
 
 /-- **Bridge from live `Anneal.SepLogicLenses.BorrowSubplace.disjointOn` to
 `DisjointSlice`, `LawfulMutLens`, and `IndependentLenses`**: on a shared
@@ -4862,6 +5103,559 @@ theorem protected_reservedIM_foreign_fails_closed (kind : AccessKind) (acc : Boo
     performTransition kind .foreignAccess true ⟨.reservedIM, acc⟩ = none := by
   cases kind <;> rfl
 
+/-- Unprotecting a call id preserves `HasUniqueWritePerm`. -/
+theorem hasUniqueWritePerm_remove_callId {tree : BorrowTree} {tag : BorTag}
+    {range : ByteRange} {activeCaller : ActiveProtectors} {callId : CallId}
+    (hCallFresh : activeCaller callId = false)
+    (hPerm : HasUniqueWritePerm tree tag range (insertActiveProtector activeCaller callId)) :
+    HasUniqueWritePerm tree tag range
+      (removeActiveProtector (insertActiveProtector activeCaller callId) callId) := by
+  rw [removeActiveProtector_insert hCallFresh]
+  refine ⟨hPerm.wf, hPerm.tag_present, hPerm.ancestors_writable, ?_⟩
+  intro other b hPres hNotAnc hb
+  exact nonAncestorSafe_mono_unprotect _ _ _
+    (hPerm.non_ancestors_safe other b hPres hNotAnc hb) isTagProtected_insert_of_caller
+
+/-- Stage-2-only spec execution (modeling the live `restoreCallerProtectors`
+return path in `Terminators.lean`, which drops `callId` without stage-1
+`applyReleaseProtector`). -/
+def TrustedFnSpec.runStage2Only (spec : TrustedFnSpec) (tree₀ : BorrowTree)
+    (activeCaller : ActiveProtectors) (t_parent t_arg : BorTag) (callId : CallId) : CallOutcome :=
+  let active₁ := insertActiveProtector activeCaller callId
+  let tree₁ := retagChild tree₀ t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+    spec.argRange active₁
+  let fp := applyFootprint t_arg active₁ tree₁ (t_arg + 1) spec.reborrowFootprint
+  { tree := fp.1
+    active := removeActiveProtector active₁ callId
+    rets := fp.2 }
+
+/-- **`split_at_mut_stage2Only_unique_write_perm`**: under the live stage-2-only
+return path (`TrustedFnSpec.runStage2Only`, matching `restoreCallerProtectors`),
+`split_at_mut` still establishes `HasUniqueWritePerm` on both returned `&mut`
+slices and still faults on cross-half writes after activating both halves. -/
+theorem split_at_mut_stage2Only_unique_write_perm {tree0 : BorrowTree} {t_parent t_arg : BorTag}
+    {base mid len : Nat} {activeCaller : ActiveProtectors} {callId : CallId}
+    (hmid : mid ≤ len)
+    (hPerm0 : HasUniqueWritePerm tree0 t_parent (wholeRange base len) activeCaller)
+    (hFresh : ∀ t, t_arg ≤ t → tree0.present t = false)
+    (hFreshCallId : ∀ n, tree0.present n = true → ∀ p, tree0.protector n = some p → p.callId ≠ callId)
+    (hCallFresh : activeCaller callId = false) :
+    let out := (splitAtMutSpec base mid len).runStage2Only tree0 activeCaller t_parent t_arg callId
+    let tree_wl := applyTreeAccess out.tree (t_arg + 1) .write (splitLeft base mid) out.active
+      .visitChildrenOfAccessed
+    let tree_w := applyTreeAccess tree_wl (t_arg + 1 + 1) .write (splitRight base mid len) out.active
+      .visitChildrenOfAccessed
+    out.rets = [t_arg + 1, t_arg + 1 + 1] ∧
+      HasUniqueWritePerm out.tree (t_arg + 1) (splitLeft base mid) out.active ∧
+      HasUniqueWritePerm out.tree (t_arg + 1 + 1) (splitRight base mid len) out.active ∧
+      (∀ b, (splitRight base mid len).contains b = true →
+        ¬ TreeAccessNoUB tree_w (t_arg + 1) .write ⟨b, b + 1⟩ out.active .visitChildrenOfAccessed) := by
+  intro out tree_wl tree_w
+  have hFreshArg : tree0.present t_arg = false := hFresh t_arg (Nat.le_refl _)
+  have hFreshL : tree0.present (t_arg + 1) = false := hFresh (t_arg + 1) (Nat.le_succ _)
+  have hFreshR : tree0.present (t_arg + 1 + 1) = false :=
+    hFresh (t_arg + 1 + 1) (Nat.le_succ_of_le (Nat.le_succ t_arg))
+  have hne1 : t_arg + 1 ≠ t_arg := Nat.succ_ne_self t_arg
+  have hne2 : t_arg + 1 + 1 ≠ t_arg := Nat.ne_of_gt (Nat.lt_succ_of_lt (Nat.lt_succ_self t_arg))
+  have hne3 : t_arg + 1 + 1 ≠ t_arg + 1 := Nat.succ_ne_self (t_arg + 1)
+  have hDisj := split_disjoint base mid len
+  have hDisjSymm := hDisj.symm
+  have hPerm0' := hasUniqueWritePerm_insert_fresh_callId hFreshCallId hPerm0
+  let active1 := insertActiveProtector activeCaller callId
+  let tree1 := retagChild tree0 t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+    (wholeRange base len) active1
+  have hTree1Perm : HasUniqueWritePerm tree1 t_arg (wholeRange base len) active1 :=
+    (retagChild_hasUniqueWritePerm (some (.strong callId)) fnEntry_writable hPerm0'
+      (ByteRange.Sub.refl _) hFreshArg).2
+  have hFreshL1 : tree1.present (t_arg + 1) = false := by
+    rw [retagChild_present, decide_eq_false hne1, Bool.false_or]; exact hFreshL
+  let tree2 := retagChild tree1 t_arg (t_arg + 1) none (initPermOf .mut) (splitLeft base mid) active1
+  have hTree2ArgPerm : HasUniqueWritePerm tree2 t_arg (wholeRange base len) active1 :=
+    retagUnprotectedChild_preserves_parent_hasUniqueWritePerm hTree1Perm hFreshL1
+  have hTree2LPerm : HasUniqueWritePerm tree2 (t_arg + 1) (splitLeft base mid) active1 :=
+    (retagChild_hasUniqueWritePerm none initPermOf_mut_writable hTree1Perm
+      (splitLeft_sub (base := base) hmid) hFreshL1).2
+  have hFreshR2 : tree2.present (t_arg + 1 + 1) = false := by
+    rw [retagChild_present, decide_eq_false hne3, Bool.false_or, retagChild_present,
+      decide_eq_false hne2, Bool.false_or]
+    exact hFreshR
+  have hTree3RPerm : HasUniqueWritePerm out.tree (t_arg + 1 + 1) (splitRight base mid len) active1 :=
+    (retagChild_hasUniqueWritePerm none initPermOf_mut_writable hTree2ArgPerm
+      (splitRight_sub base mid len) hFreshR2).2
+  have hTree3LPerm : HasUniqueWritePerm out.tree (t_arg + 1) (splitLeft base mid) active1 :=
+    disjoint_retagChild_preserves_hasUniqueWritePerm (t_left := t_arg) (t_child := t_arg + 1 + 1)
+      none (initPermOf .mut) (by intro h; cases h) hTree2LPerm hDisjSymm hFreshR2
+  have hPostL : HasUniqueWritePerm out.tree (t_arg + 1) (splitLeft base mid) out.active :=
+    hasUniqueWritePerm_remove_callId hCallFresh hTree3LPerm
+  have hPostR : HasUniqueWritePerm out.tree (t_arg + 1 + 1) (splitRight base mid len) out.active :=
+    hasUniqueWritePerm_remove_callId hCallFresh hTree3RPerm
+  refine ⟨rfl, hPostL, hPostR, ?_⟩
+  intro b hb hNoUB
+  have hbL : (splitLeft base mid).contains b = false := hDisjSymm b hb
+  have hLnotAncR : out.tree.isAnc (t_arg + 1) (t_arg + 1 + 1) = false := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut)).isAnc
+      (t_arg + 1) (t_arg + 1 + 1) = false
+    rw [insertChildNode_isAnc_child, decide_eq_false (Ne.symm hne3), Bool.false_or]
+    exact retag_not_desc_of_new (Ne.symm hne1)
+  have hLprot : ∀ act, out.tree.isTagProtected (t_arg + 1) act = false := by
+    intro act
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut)).isTagProtected
+      (t_arg + 1) act = false
+    rw [insertChildNode_isTagProtected_of_ne _ _ _ _ _ (Ne.symm hne3)]
+    show (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .mut)).isTagProtected
+      (t_arg + 1) act = false
+    exact insertChildNode_isTagProtected_child_none _ _ _ _ _
+  have hLpres : out.tree.present (t_arg + 1) = true := hPostL.tag_present
+  have hL2 : tree2.locState (t_arg + 1) b = ⟨.reservedFrz false, false⟩ := by
+    show (retagChild tree1 t_arg (t_arg + 1) none (initPermOf .mut)
+      (splitLeft base mid) active1).locState (t_arg + 1) b = _
+    rw [retagChild_locState_out _ _ _ _ _ _ _ _ _ hbL, insertChildNode_locState_child]
+    rfl
+  have hLpresI : (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut)).present
+      (t_arg + 1) = true := hLpres
+  have hLnotAncRI : (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut)).isAnc
+      (t_arg + 1) (t_arg + 1 + 1) = false := hLnotAncR
+  have hL3 : out.tree.locState (t_arg + 1) b = ⟨.reservedFrz false, false⟩ := by
+    show (applyTreeAccess (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut))
+      (t_arg + 1 + 1) .read (splitRight base mid len) active1 .visitChildrenOfAccessed).locState
+      (t_arg + 1) b = _
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hLpresI hb,
+      nodeAccessRelatedness_visit_foreign hLnotAncRI]
+    show (match performTransition .read .foreignAccess (out.tree.isTagProtected (t_arg + 1) active1)
+      ((insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .mut)).locState (t_arg + 1) b)
+      with | some st' => st' | none => _) = _
+    rw [hLprot active1, insertChildNode_locState_of_ne _ _ _ _ _ (Ne.symm hne3), hL2]
+    rfl
+  have hLwl : tree_wl.locState (t_arg + 1) b = ⟨.reservedFrz false, false⟩ := by
+    show (applyTreeAccess out.tree (t_arg + 1) .write (splitLeft base mid) out.active
+      .visitChildrenOfAccessed).locState (t_arg + 1) b = _
+    rw [applyTreeAccess_locState_out _ _ _ _ _ _ _ _ hbL, hL3]
+  have hLpresWl : tree_wl.present (t_arg + 1) = true := hLpres
+  have hLnotAncRWl : tree_wl.isAnc (t_arg + 1) (t_arg + 1 + 1) = false := hLnotAncR
+  have hLw : tree_w.locState (t_arg + 1) b = ⟨.disabled, false⟩ := by
+    show (applyTreeAccess tree_wl (t_arg + 1 + 1) .write (splitRight base mid len) out.active
+      .visitChildrenOfAccessed).locState (t_arg + 1) b = _
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _ hLpresWl hb,
+      nodeAccessRelatedness_visit_foreign hLnotAncRWl]
+    show (match performTransition .write .foreignAccess
+      (out.tree.isTagProtected (t_arg + 1) out.active)
+      (tree_wl.locState (t_arg + 1) b) with | some st' => st' | none => _) = _
+    rw [hLprot out.active, hLwl]
+    rfl
+  have hReflL : tree_w.isAnc (t_arg + 1) (t_arg + 1) = true :=
+    hPostL.wf.isAnc_refl (t_arg + 1) hLpres
+  have hLpresW : tree_w.present (t_arg + 1) = true := hLpres
+  have hAt := hNoUB (t_arg + 1) b hLpresW
+    ((ByteRange.contains_iff _ _).mpr ⟨Nat.le_refl b, Nat.lt_succ_self b⟩)
+  rw [nodeAccessRelatedness_anc hReflL] at hAt
+  change (performTransition .write .localAccess _ (tree_w.locState (t_arg + 1) b)).isSome = true at hAt
+  rw [hLw] at hAt
+  cases hAt
+
+/-- **Exact separation between Miri's stage-1 protector release and stage-2-only
+release**: on a concrete UB-free two-argument call `foo(x, y)` receiving two
+two-phase `&mut` borrows under `rootTree 0`, releasing `t_arg_x`'s protector in
+stage 1 while `callId` is still active marks `t_arg_y` conflicted
+(`⟨.reservedFrz true, true⟩`), whereas stage-2-only release leaves `t_arg_y`
+unconflicted (`⟨.reservedFrz false, true⟩`). -/
+theorem stage1_vs_stage2Only_two_arg_release_differs (r : ByteRange) (b : Nat)
+    (hb : r.contains b = true) :
+    let active1 := insertActiveProtector (fun _ => false) 0
+    let tree1 := retagChild (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false) r active1
+    let tree2 := retagChild tree1 0 2 (some (.strong 0)) (.reservedFrz false) r active1
+    TreeAccessNoUB (insertChildNode (rootTree 0) 0 1 (some (.strong 0)) (.reservedFrz false))
+        1 .read r active1 .visitChildrenOfAccessed ∧
+      TreeAccessNoUB (insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false))
+        2 .read r active1 .visitChildrenOfAccessed ∧
+      releaseProtectorNoUB tree2 1 active1 ∧
+      (applyReleaseProtector tree2 1 active1).locState 2 b = ⟨.reservedFrz true, true⟩ ∧
+      tree2.locState 2 b = ⟨.reservedFrz false, true⟩ := by
+  intro active1 tree1 tree2
+  have hPerm0 := rootTree_hasUniqueWritePerm 0 r active1
+  obtain ⟨hNoUB1, _⟩ := retagChild_hasUniqueWritePerm (t_child := 1) (some (.strong 0)) fnEntry_writable
+    hPerm0 (ByteRange.Sub.refl r) rfl
+  have hNoUB2 : TreeAccessNoUB (insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false))
+      2 .read r active1 .visitChildrenOfAccessed := by
+    intro n b' hPres hb'
+    let tI := insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)
+    by_cases hn2 : n = 2
+    · subst hn2
+      have hAnc : tI.isAnc 2 2 = true := rfl
+      rw [nodeAccessRelatedness_anc hAnc]
+      rfl
+    · by_cases hn0 : n = 0
+      · subst hn0
+        have hAnc : tI.isAnc 0 2 = true := rfl
+        rw [nodeAccessRelatedness_anc hAnc]
+        have hLoc : tI.locState 0 b' = ⟨.active, true⟩ := by
+          show tree1.locState 0 b' = _
+          rw [show tree1 = applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0))
+            (.reservedFrz false)) 1 .read r active1 .visitChildrenOfAccessed from rfl,
+            applyTreeAccess_locState_in _ _ _ _ _ _ 0 b' rfl hb',
+            nodeAccessRelatedness_anc rfl]
+          rfl
+        show (performTransition .read .localAccess _ (tI.locState 0 b')).isSome = true
+        rw [hLoc]
+        rfl
+      · have hn1 : n = 1 := by
+          simp only [insertChildNode, tree1, retagChild, applyTreeAccess, rootTree,
+            Bool.or_eq_true, decide_eq_true_eq] at hPres
+          rcases hPres with rfl | rfl | rfl
+          · exact absurd rfl hn2
+          · rfl
+          · exact absurd rfl hn0
+        subst hn1
+        have hNotAnc : tI.isAnc 1 2 = false := rfl
+        rw [nodeAccessRelatedness_visit_foreign hNotAnc]
+        have hLoc : tI.locState 1 b' = ⟨.reservedFrz false, true⟩ := by
+          show tree1.locState 1 b' = _
+          rw [show tree1 = applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0))
+            (.reservedFrz false)) 1 .read r active1 .visitChildrenOfAccessed from rfl,
+            applyTreeAccess_locState_in _ _ _ _ _ _ 1 b' rfl hb',
+            nodeAccessRelatedness_anc rfl]
+          rfl
+        show (performTransition .read .foreignAccess (tI.isTagProtected 1 active1)
+          (tI.locState 1 b')).isSome = true
+        rw [hLoc]
+        rfl
+  have hAcc1 : ∀ b', (tree2.locState 1 b').accessed = true → r.contains b' = true := by
+    intro b' hAcc
+    cases hb' : r.contains b' with
+    | true => rfl
+    | false =>
+      have h2 : tree2.locState 1 b' = tree1.locState 1 b' := by
+        show (retagChild tree1 0 2 (some (.strong 0)) (.reservedFrz false) r active1).locState 1 b' = _
+        rw [retagChild_locState_out _ _ _ _ _ _ _ _ _ hb',
+          insertChildNode_locState_of_ne _ _ _ _ _ (by decide)]
+      have h1 : (tree1.locState 1 b').accessed = r.contains b' :=
+        retagChild_child_accessed (tree := rootTree 0) (t_parent := 0) (t_child := 1)
+          (prot := some (.strong 0)) (initPerm := .reservedFrz false) (range := r)
+          (active := active1) (by decide) b'
+      rw [h2, h1, hb'] at hAcc
+      cases hAcc
+  have hLoc1In : ∀ b', r.contains b' = true → tree2.locState 1 b' = ⟨.reservedFrz true, true⟩ := by
+    intro b' hb'
+    have h1 : tree1.locState 1 b' = ⟨.reservedFrz false, true⟩ := by
+      rw [show tree1 = applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0))
+        (.reservedFrz false)) 1 .read r active1 .visitChildrenOfAccessed from rfl,
+        applyTreeAccess_locState_in _ _ _ _ _ _ 1 b' rfl hb',
+        nodeAccessRelatedness_anc rfl]
+      rfl
+    rw [show tree2 = applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0))
+      (.reservedFrz false)) 2 .read r active1 .visitChildrenOfAccessed from rfl,
+      applyTreeAccess_locState_in _ _ _ _ _ _ 1 b' rfl hb',
+      nodeAccessRelatedness_visit_foreign rfl]
+    show (match performTransition .read .foreignAccess true
+      ((insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)).locState 1 b')
+      with | some st' => st' | none => _) = _
+    rw [insertChildNode_locState_of_ne _ _ _ _ _ (by decide), h1]
+    rfl
+  have hLoc2In : ∀ b', r.contains b' = true → tree2.locState 2 b' = ⟨.reservedFrz false, true⟩ := by
+    intro b' hb'
+    rw [show tree2 = applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0))
+      (.reservedFrz false)) 2 .read r active1 .visitChildrenOfAccessed from rfl,
+      applyTreeAccess_locState_in _ _ _ _ _ _ 2 b' rfl hb',
+      nodeAccessRelatedness_anc rfl]
+    rfl
+  have hLoc0In : ∀ b', r.contains b' = true → tree2.locState 0 b' = ⟨.active, true⟩ := by
+    intro b' hb'
+    have h1 : tree1.locState 0 b' = ⟨.active, true⟩ := by
+      rw [show tree1 = applyTreeAccess (insertChildNode (rootTree 0) 0 1 (some (.strong 0))
+        (.reservedFrz false)) 1 .read r active1 .visitChildrenOfAccessed from rfl,
+        applyTreeAccess_locState_in _ _ _ _ _ _ 0 b' rfl hb',
+        nodeAccessRelatedness_anc rfl]
+      rfl
+    rw [show tree2 = applyTreeAccess (insertChildNode tree1 0 2 (some (.strong 0))
+      (.reservedFrz false)) 2 .read r active1 .visitChildrenOfAccessed from rfl,
+      applyTreeAccess_locState_in _ _ _ _ _ _ 0 b' rfl hb',
+      nodeAccessRelatedness_anc rfl]
+    show (match performTransition .read .localAccess _
+      ((insertChildNode tree1 0 2 (some (.strong 0)) (.reservedFrz false)).locState 0 b')
+      with | some st' => st' | none => _) = _
+    rw [insertChildNode_locState_of_ne _ _ _ _ _ (by decide), h1]
+    rfl
+  have hRelNoUB : releaseProtectorNoUB tree2 1 active1 := by
+    intro n b' hPres hAcc
+    have hb' := hAcc1 b' hAcc
+    have h1 := hLoc1In b' hb'
+    simp only [tree2, retagChild, applyTreeAccess, insertChildNode, tree1, rootTree,
+      Bool.or_eq_true, decide_eq_true_eq] at hPres
+    rcases hPres with rfl | rfl | rfl
+    · rw [nodeAccessRelatedness_skip_foreign rfl rfl]
+      show (performTransition (tree2.locState 1 b').perm.associatedAccess .foreignAccess
+        (tree2.isTagProtected 2 active1) (tree2.locState 2 b')).isSome = true
+      rw [h1, hLoc2In b' hb']
+      rfl
+    · rw [nodeAccessRelatedness_anc rfl]
+      show (performTransition (tree2.locState 1 b').perm.associatedAccess .localAccess
+        (tree2.isTagProtected 1 active1) (tree2.locState 1 b')).isSome = true
+      rw [h1]
+      rfl
+    · rw [nodeAccessRelatedness_anc rfl]
+      show (performTransition (tree2.locState 1 b').perm.associatedAccess .localAccess
+        (tree2.isTagProtected 0 active1) (tree2.locState 0 b')).isSome = true
+      rw [h1, hLoc0In b' hb']
+      rfl
+  refine ⟨hNoUB1, hNoUB2, hRelNoUB, ?_, hLoc2In b hb⟩
+  have hAccB : (tree2.locState 1 b).accessed = true := by rw [hLoc1In b hb]
+  rw [applyReleaseProtector_locState_acc tree2 1 active1 2 b rfl hAccB,
+    nodeAccessRelatedness_skip_foreign rfl rfl]
+  show (match performTransition (tree2.locState 1 b).perm.associatedAccess .foreignAccess
+    (tree2.isTagProtected 2 active1) (tree2.locState 2 b) with | some st' => st' | none => _) = _
+  rw [hLoc1In b hb, hLoc2In b hb]
+  have hProt2 : tree2.isTagProtected 2 active1 = true := rfl
+  rw [hProt2]
+  rfl
+
+/-- **Shared (`Mutability.not`) `reborrowFootprint` soundness**: when a
+`TrustedFnSpec` declares two overlapping shared `&` reborrows `[(r, .not), (r, .not)]`,
+both returned references emerge `Frozen` (`⟨.frozen, true⟩`) on `r`, reading
+through the first preserves the second's `Frozen` permission (unlike overlapping
+`&mut` in `overlapping_reborrowFootprint_write_disables_sibling`), and writes
+through either reference fault with UB. -/
+theorem shared_reborrowFootprint_read_ok_write_ub {tree0 : BorrowTree}
+    {t_parent t_arg : BorTag} {argRange r : ByteRange}
+    {activeCaller : ActiveProtectors} {callId : CallId} {b : Nat}
+    (hb : r.contains b = true) :
+    let spec : TrustedFnSpec := ⟨argRange, [(r, .not), (r, .not)]⟩
+    let out := spec.run tree0 activeCaller t_parent t_arg callId
+    let tree_r1 := applyTreeAccess out.tree (t_arg + 1) .read r out.active .visitChildrenOfAccessed
+    out.rets = [t_arg + 1, t_arg + 1 + 1] ∧
+      out.tree.locState (t_arg + 1) b = ⟨.frozen, true⟩ ∧
+      out.tree.locState (t_arg + 1 + 1) b = ⟨.frozen, true⟩ ∧
+      tree_r1.locState (t_arg + 1 + 1) b = ⟨.frozen, true⟩ ∧
+      ¬ TreeAccessNoUB out.tree (t_arg + 1) .write ⟨b, b + 1⟩ out.active .visitChildrenOfAccessed ∧
+      ¬ TreeAccessNoUB tree_r1 (t_arg + 1 + 1) .write ⟨b, b + 1⟩ out.active .visitChildrenOfAccessed := by
+  intro spec out tree_r1
+  have hne10 : t_arg + 1 ≠ t_arg := Nat.succ_ne_self t_arg
+  have hne21 : t_arg + 1 + 1 ≠ t_arg + 1 := Nat.succ_ne_self (t_arg + 1)
+  have hne20 : t_arg + 1 + 1 ≠ t_arg := Nat.ne_of_gt (Nat.lt_succ_of_lt (Nat.lt_succ_self t_arg))
+  let active1 := insertActiveProtector activeCaller callId
+  let tree1 := retagChild tree0 t_parent t_arg (some (.strong callId)) (.reservedFrz false)
+    argRange active1
+  let tree2 := retagChild tree1 t_arg (t_arg + 1) none (initPermOf .not) r active1
+  let tree3 := retagChild tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not) r active1
+  have hLPres2 : tree2.present (t_arg + 1) = true := by
+    rw [retagChild_present, decide_eq_true rfl, Bool.true_or]
+  have hLPres3 : tree3.present (t_arg + 1) = true := by
+    rw [retagChild_present, hLPres2, Bool.or_true]
+  have hRPres3 : tree3.present (t_arg + 1 + 1) = true := by
+    rw [retagChild_present, decide_eq_true rfl, Bool.true_or]
+  have hArgRefl1 : tree1.isAnc t_arg t_arg = true := by
+    show (insertChildNode tree0 t_parent t_arg (some (.strong callId)) (.reservedFrz false)).isAnc
+      t_arg t_arg = true
+    rw [insertChildNode_isAnc_child, decide_eq_true rfl, Bool.true_or]
+  have hArgAncL2 : tree2.isAnc t_arg (t_arg + 1) = true := by
+    show (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .not)).isAnc t_arg (t_arg + 1) = true
+    rw [insertChildNode_isAnc_child, hArgRefl1, Bool.or_true]
+  have hArgAncL3 : tree3.isAnc t_arg (t_arg + 1) = true := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc t_arg (t_arg + 1) = true
+    rw [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hne21) (Ne.symm hne20)]
+    exact hArgAncL2
+  have hArgRefl2 : tree2.isAnc t_arg t_arg = true := by
+    show (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .not)).isAnc t_arg t_arg = true
+    rw [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hne10) (Ne.symm hne10)]
+    exact hArgRefl1
+  have hArgAncR3 : tree3.isAnc t_arg (t_arg + 1 + 1) = true := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc
+      t_arg (t_arg + 1 + 1) = true
+    rw [insertChildNode_isAnc_child, hArgRefl2, Bool.or_true]
+  have hLNotAncArg3 : tree3.isAnc (t_arg + 1) t_arg = false := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc
+      (t_arg + 1) t_arg = false
+    rw [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hne20) (Ne.symm hne21)]
+    exact retag_not_desc_of_new (Ne.symm hne10)
+  have hRNotAncArg3 : tree3.isAnc (t_arg + 1 + 1) t_arg = false :=
+    retag_not_desc_of_new (Ne.symm hne20)
+  have hLNotAncR : (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc
+      (t_arg + 1) (t_arg + 1 + 1) = false := by
+    rw [insertChildNode_isAnc_child, decide_eq_false (Ne.symm hne21), Bool.false_or]
+    exact retag_not_desc_of_new (Ne.symm hne10)
+  have hLProtI : (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isTagProtected
+      (t_arg + 1) active1 = false := by
+    rw [insertChildNode_isTagProtected_of_ne _ _ _ _ _ (Ne.symm hne21)]
+    show (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .not)).isTagProtected
+      (t_arg + 1) active1 = false
+    exact insertChildNode_isTagProtected_child_none _ _ _ _ _
+  have hLLoc2 : tree2.locState (t_arg + 1) b = ⟨.frozen, true⟩ := by
+    show (applyTreeAccess (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .not))
+      (t_arg + 1) .read r active1 .visitChildrenOfAccessed).locState (t_arg + 1) b = _
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _
+      (by rw [insertChildNode_present, decide_eq_true rfl, Bool.true_or]) hb,
+      nodeAccessRelatedness_anc (by rw [insertChildNode_isAnc_child, decide_eq_true rfl, Bool.true_or]),
+      insertChildNode_locState_child]
+    rfl
+  have hLLoc3 : tree3.locState (t_arg + 1) b = ⟨.frozen, true⟩ := by
+    show (applyTreeAccess (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not))
+      (t_arg + 1 + 1) .read r active1 .visitChildrenOfAccessed).locState (t_arg + 1) b = _
+    rw [applyTreeAccess_locState_in (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not))
+      _ _ _ _ _ _ _ hLPres3 hb,
+      nodeAccessRelatedness_visit_foreign hLNotAncR]
+    show (match performTransition .read .foreignAccess _ _ with | some st' => st' | none => _) = _
+    rw [hLProtI, insertChildNode_locState_of_ne _ _ _ _ _ (Ne.symm hne21), hLLoc2]
+    rfl
+  have hRLoc3 : tree3.locState (t_arg + 1 + 1) b = ⟨.frozen, true⟩ := by
+    show (applyTreeAccess (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not))
+      (t_arg + 1 + 1) .read r active1 .visitChildrenOfAccessed).locState (t_arg + 1 + 1) b = _
+    rw [applyTreeAccess_locState_in _ _ _ _ _ _ _ _
+      (by rw [insertChildNode_present, decide_eq_true rfl, Bool.true_or]) hb,
+      nodeAccessRelatedness_anc (by rw [insertChildNode_isAnc_child, decide_eq_true rfl, Bool.true_or]),
+      insertChildNode_locState_child]
+    rfl
+  have hLLocPost : out.tree.locState (t_arg + 1) b = ⟨.frozen, true⟩ := by
+    show (applyReleaseProtector tree3 t_arg active1).locState (t_arg + 1) b = _
+    cases hAcc : (tree3.locState t_arg b).accessed with
+    | false => rw [applyReleaseProtector_locState_unacc tree3 t_arg active1 _ b hAcc, hLLoc3]
+    | true =>
+      rw [applyReleaseProtector_locState_acc tree3 t_arg active1 _ b hLPres3 hAcc,
+        nodeAccessRelatedness_skip_desc hLNotAncArg3 hArgAncL3, hLLoc3]
+  have hRLocPost : out.tree.locState (t_arg + 1 + 1) b = ⟨.frozen, true⟩ := by
+    show (applyReleaseProtector tree3 t_arg active1).locState (t_arg + 1 + 1) b = _
+    cases hAcc : (tree3.locState t_arg b).accessed with
+    | false => rw [applyReleaseProtector_locState_unacc tree3 t_arg active1 _ b hAcc, hRLoc3]
+    | true =>
+      rw [applyReleaseProtector_locState_acc tree3 t_arg active1 _ b hRPres3 hAcc,
+        nodeAccessRelatedness_skip_desc hRNotAncArg3 hArgAncR3, hRLoc3]
+  have hRNotAncL : out.tree.isAnc (t_arg + 1 + 1) (t_arg + 1) = false :=
+    retag_not_desc_of_new (tree := tree2) (t_parent := t_arg) (t_child := t_arg + 1 + 1)
+      (prot := none) (initPerm := initPermOf .not) (range := r) (active := active1) (Ne.symm hne21)
+  have hRProt : out.tree.isTagProtected (t_arg + 1 + 1) out.active = false := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isTagProtected
+      (t_arg + 1 + 1) out.active = false
+    exact insertChildNode_isTagProtected_child_none _ _ _ _ _
+  have hRLocR1 : tree_r1.locState (t_arg + 1 + 1) b = ⟨.frozen, true⟩ := by
+    show (applyTreeAccess out.tree (t_arg + 1) .read r out.active
+      .visitChildrenOfAccessed).locState (t_arg + 1 + 1) b = _
+    rw [applyTreeAccess_locState_in out.tree _ _ _ _ _ _ _ hRPres3 hb,
+      nodeAccessRelatedness_visit_foreign hRNotAncL]
+    show (match performTransition .read .foreignAccess
+      (out.tree.isTagProtected (t_arg + 1 + 1) out.active)
+      (out.tree.locState (t_arg + 1 + 1) b) with | some st' => st' | none => _) = _
+    rw [hRProt, hRLocPost]
+    rfl
+  have hInB : (ByteRange.mk b (b + 1)).contains b = true :=
+    (ByteRange.contains_iff _ _).mpr ⟨Nat.le_refl b, Nat.lt_succ_self b⟩
+  have hReflL : out.tree.isAnc (t_arg + 1) (t_arg + 1) = true := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc
+      (t_arg + 1) (t_arg + 1) = true
+    rw [insertChildNode_isAnc_of_ne _ _ _ _ _ (Ne.symm hne21) (Ne.symm hne21)]
+    show (insertChildNode tree1 t_arg (t_arg + 1) none (initPermOf .not)).isAnc
+      (t_arg + 1) (t_arg + 1) = true
+    rw [insertChildNode_isAnc_child, decide_eq_true rfl, Bool.true_or]
+  have hReflR : tree_r1.isAnc (t_arg + 1 + 1) (t_arg + 1 + 1) = true := by
+    show (insertChildNode tree2 t_arg (t_arg + 1 + 1) none (initPermOf .not)).isAnc
+      (t_arg + 1 + 1) (t_arg + 1 + 1) = true
+    rw [insertChildNode_isAnc_child, decide_eq_true rfl, Bool.true_or]
+  refine ⟨rfl, hLLocPost, hRLocPost, hRLocR1, ?_, ?_⟩
+  · intro hNoUB
+    have hAt := hNoUB (t_arg + 1) b hLPres3 hInB
+    rw [nodeAccessRelatedness_anc hReflL] at hAt
+    change (performTransition .write .localAccess _ (out.tree.locState (t_arg + 1) b)).isSome = true at hAt
+    rw [hLLocPost] at hAt
+    cases hAt
+  · intro hNoUB
+    have hAt := hNoUB (t_arg + 1 + 1) b hRPres3 hInB
+    rw [nodeAccessRelatedness_anc hReflR] at hAt
+    change (performTransition .write .localAccess _ (tree_r1.locState (t_arg + 1 + 1) b)).isSome = true at hAt
+    rw [hRLocR1] at hAt
+    cases hAt
+
+/-- Reflexivity of the live `isBorrowDescendantOrSelf` hierarchy traversal. -/
+theorem isBorrowDescendantOrSelf_refl
+    (borrows : List Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry) (tag : Nat) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf borrows tag tag = true := by
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf
+  cases Trusted.Sequence.length borrows with
+  | zero => exact Nat.beq_refl tag
+  | succ f =>
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelfAux
+    rw [Nat.beq_refl]
+
+/-- **Live hierarchy relatedness bridge**: when `tree.isAnc e.tag wTag` agrees
+with live `isBorrowDescendantOrSelf allBorrows wTag e.tag`, the prototype's
+`nodeAccessRelatedness` under `.visitChildrenOfAccessed` equals the live
+`treeBorrowWriterRelatedness` after `resolveTreeBorrowWriterTag`. -/
+theorem nodeAccessRelatedness_visit_eq_live_writer (tree : BorrowTree)
+    (allBorrows : List Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (e : Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry) (wTag : BorTag)
+    (hAnc : tree.isAnc e.tag wTag =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf allBorrows wTag e.tag) :
+    (nodeAccessRelatedness tree wTag .visitChildrenOfAccessed e.tag).map AccessRelatedness.toLive =
+      some (Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowWriterRelatedness e
+        (Trusted.Rustc.V2026_06_01.MirSemantics.resolveTreeBorrowWriterTag allBorrows e (some wTag))) := by
+  unfold nodeAccessRelatedness
+    Trusted.Rustc.V2026_06_01.MirSemantics.resolveTreeBorrowWriterTag
+    Trusted.Rustc.V2026_06_01.MirSemantics.treeBorrowWriterRelatedness
+  rw [hAnc]
+  dsimp only
+  cases hDesc : Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf allBorrows wTag e.tag with
+  | true =>
+    dsimp only
+    rw [Nat.beq_refl]
+    rfl
+  | false =>
+    have hNe : Nat.beq e.tag wTag = false := by
+      cases hb : Nat.beq e.tag wTag with
+      | false => rfl
+      | true =>
+        have heq := Nat.eq_of_beq_eq_true hb
+        rw [heq, isBorrowDescendantOrSelf_refl] at hDesc
+        cases hDesc
+    dsimp only
+    rw [hNe]
+    rfl
+
+/-- **Live protected-write conflict bridge**: on any live `BorrowEntry` `e`
+matching permission `p`, `borrowEntryWriteConflicts` after
+`resolveTreeBorrowWriterTag` equals `!(performTransition .write rel true ⟨p, true⟩).isSome`. -/
+theorem borrowEntryWriteConflicts_eq_live (tree : BorrowTree)
+    (allBorrows : List Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry)
+    (e : Trusted.Rustc.V2026_06_01.MirSemantics.BorrowEntry) (wTag : BorTag) (p : Permission)
+    (hPerm : e.perm = p.toLiveTreeBorrowPerm)
+    (hAnc : tree.isAnc e.tag wTag =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowDescendantOrSelf allBorrows wTag e.tag) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.borrowEntryWriteConflicts e
+      (Trusted.Rustc.V2026_06_01.MirSemantics.resolveTreeBorrowWriterTag allBorrows e (some wTag)) =
+      !(performTransition .write
+        (if tree.isAnc e.tag wTag then .localAccess else .foreignAccess)
+        true ⟨p, true⟩).isSome := by
+  have hRel := nodeAccessRelatedness_visit_eq_live_writer tree allBorrows e wTag hAnc
+  unfold nodeAccessRelatedness at hRel
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.borrowEntryWriteConflicts
+  rw [hPerm]
+  cases hA : tree.isAnc e.tag wTag with
+  | true =>
+    rw [hA] at hRel
+    simp only [↓reduceIte, Option.map, Option.some.injEq] at hRel ⊢
+    rw [← hRel, performTransition_accessed_isSome_eq_live, Bool.not_not]
+    rfl
+  | false =>
+    rw [hA] at hRel
+    simp only [Bool.false_eq_true, ↓reduceIte, Option.map, Option.some.injEq] at hRel ⊢
+    rw [← hRel, performTransition_accessed_isSome_eq_live, Bool.not_not]
+    rfl
+
+/-- **Live return-path protector bridge**: when `caller.callerProtector = none`
+(as pushed by `pushCalleeFrame`), live `restoreCallerProtectors` equals
+`removeActiveProtector (insertActiveProtector … callId) callId` for any fresh
+callee protector `callId`. -/
+theorem restoreCallerProtectors_eq_live
+    (caller : Trusted.Rustc.V2026_06_01.MirSemantics.SavedCallerFrame)
+    (hNoCallerProt : caller.callerProtector = none)
+    (callId : CallId) (c : CallId)
+    (hFresh : Trusted.Rustc.V2026_06_01.MirSemantics.natListContainsBool
+      caller.calleeProtectors callId = false) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.natListContainsBool
+      (Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors caller) c =
+      removeActiveProtector
+        (insertActiveProtector
+          (Trusted.Rustc.V2026_06_01.MirSemantics.natListContainsBool caller.calleeProtectors)
+          callId)
+        callId c := by
+  rw [removeActiveProtector_insert hFresh]
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors
+  rw [hNoCallerProt]
+
 end TreeBorrows
 
 /-! ## 10. Kernel axiom audit (`#guard_msgs in #print axioms`) -/
@@ -5879,5 +6673,81 @@ end TreeBorrows
 /-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.protected_reservedIM_foreign_fails_closed' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms protected_reservedIM_foreign_fails_closed
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirStepsConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirStepsConverges_of_mirStep_cont
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.mirWpConverges_of_mirStep_cont' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms mirWpConverges_of_mirStep_cont
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_stationary_at_target' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_stationary_at_target
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.live_runMirToBlock_step_of_not_target' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms live_runMirToBlock_step_of_not_target
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runUntilTarget_reached_iff_live_runMirToBlock' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runUntilTarget_reached_iff_live_runMirToBlock
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.runMirToBlock_reached_iff_step_and_live' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms runMirToBlock_reached_iff_step_and_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_set?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setPureEnvSlot?_eq_set?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.setPureEnvSlot?_eq_live_bind_forcePureEnv?' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms setPureEnvSlot?_eq_live_bind_forcePureEnv?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.evalPureStmtNorm_eq_bind_forceSpine?' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms evalPureStmtNorm_eq_bind_forceSpine?
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_write_fst' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_laidOutPair_write_fst
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.typedAt_laidOutPair_applyFieldWrites' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms typedAt_laidOutPair_applyFieldWrites
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.hasUniqueWritePerm_remove_callId' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms hasUniqueWritePerm_remove_callId
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.split_at_mut_stage2Only_unique_write_perm' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms split_at_mut_stage2Only_unique_write_perm
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.stage1_vs_stage2Only_two_arg_release_differs' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms stage1_vs_stage2Only_two_arg_release_differs
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.shared_reborrowFootprint_read_ok_write_ub' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms shared_reborrowFootprint_read_ok_write_ub
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.isBorrowDescendantOrSelf_refl' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms isBorrowDescendantOrSelf_refl
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.nodeAccessRelatedness_visit_eq_live_writer' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms nodeAccessRelatedness_visit_eq_live_writer
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.borrowEntryWriteConflicts_eq_live' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms borrowEntryWriteConflicts_eq_live
+
+/-- info: 'Anneal.FuelFreeLoopAndTypedAtLensPrototype.restoreCallerProtectors_eq_live' depends on axioms: [Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms restoreCallerProtectors_eq_live
 
 end Anneal.FuelFreeLoopAndTypedAtLensPrototype
