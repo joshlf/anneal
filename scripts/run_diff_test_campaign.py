@@ -1204,6 +1204,13 @@ _DIAGNOSTIC_TEXT_FIELDS: tuple[str, ...] = (
     "message",
     "error",
     "stderr",
+    "stdout",
+    "output",
+    "detail",
+    "details",
+    "excerpt",
+    "diag_repr",
+    "summary",
 )
 
 # Record lists a harness summary may carry that the boundary audit scans.
@@ -1455,12 +1462,42 @@ def validate_itree_error_boundary(summary: dict[str, Any]) -> tuple[bool, list[s
     except `compile_failed` already counts against `--max-oracle-errors`
     (`ITREE_ORACLE_ERROR_REASONS`), so the only buckets in which an error can hide
     are `compile_failed` (never counted) and a stray `unsupported`
-    classification. A diagnostic or not-compared record classified as either whose
-    text carries a crash or malformed-input marker (a `rustc` internal compiler
-    error, a Lean crash, ...) is rejected as `itree_error_masked_as_compile_failed`.
+    classification:
+    1. By the union bound over `comp.opt0 && comp.opt2`, `comp.instrumented`, and
+       `contains_unsafe_token`, at most `(total - opt_both) + (total - instrumented)
+       + unsafe_token_violations` candidates can legitimately land in
+       `not_compared_reasons.compile_failed`. Exceeding that bound means an oracle
+       or staging failure on a compiled candidate was routed into `compile_failed`.
+    2. Any finding, item report, not-compared item, diagnostic, or `item_outcomes`
+       record classified as `compile_failed` or `unsupported` whose text carries a
+       crash or malformed-input marker (a `rustc` internal compiler error, a Lean
+       crash, ...) is rejected as `itree_error_masked_as_compile_failed`.
     """
     reasons: list[str] = []
-    for list_key in ("not_compared_items", "diagnostics"):
+    nc_reasons = summary.get("not_compared_reasons")
+    total = summary.get("total_candidates")
+    opt_both = summary.get("opt_level_0_and_2_compiled")
+    instrumented = summary.get("instrumented_compiled")
+    unsafe_v = _int_field(summary, "unsafe_token_violations")
+    if (
+        isinstance(nc_reasons, dict)
+        and is_nonneg_int(total)
+        and is_nonneg_int(opt_both)
+        and is_nonneg_int(instrumented)
+    ):
+        compile_failed = _int_field(nc_reasons, "compile_failed")
+        max_compile_failed = max(
+            0, (int(total) - int(opt_both)) + (int(total) - int(instrumented)) + unsafe_v
+        )
+        if compile_failed > max_compile_failed:
+            reasons.append(
+                f"itree_error_masked_as_compile_failed: not_compared_reasons.compile_failed "
+                f"({compile_failed}) exceeds maximum compile/unsafe rejections "
+                f"({max_compile_failed}) for total={total}, opt_both={opt_both}, "
+                f"instrumented={instrumented}, unsafe_violations={unsafe_v}"
+            )
+
+    for list_key in _BOUNDARY_RECORD_LISTS:
         items = summary.get(list_key)
         if not isinstance(items, list):
             continue
@@ -1481,6 +1518,21 @@ def validate_itree_error_boundary(summary: dict[str, Any]) -> tuple[bool, list[s
             if hit is not None:
                 reasons.append(
                     f"itree_error_masked_as_compile_failed: {list_key}[{idx}] ({label}) "
+                    f"masks '{hit}' under {classification.strip()}"
+                )
+    item_outcomes_map = summary.get("item_outcomes")
+    if isinstance(item_outcomes_map, dict):
+        for label, item in sorted(item_outcomes_map.items()):
+            if not isinstance(item, dict):
+                continue
+            classification = _record_bucket(item)
+            lowered = classification.lower()
+            if "compile_failed" not in lowered and "unsupported" not in lowered:
+                continue
+            hit = _crash_marker(_record_text(item))
+            if hit is not None:
+                reasons.append(
+                    f"itree_error_masked_as_compile_failed: item_outcomes[{label!r}] "
                     f"masks '{hit}' under {classification.strip()}"
                 )
     return not reasons, reasons
@@ -1538,14 +1590,17 @@ def _parse_src_span(raw: str) -> tuple[str, int, int, int, int] | None:
 
 def _is_valid_pass_scalar_tag(tag: str) -> bool:
     """Returns `True` iff `tag` is `pass:scalar:<bits>:<size_bytes>` with decimal
-    fields and `size_bytes > 0` (`MiriOutcome::PassScalar` / `AnnealOutcome::PassScalar`)."""
+    `u128` bits and positive `u32` `size_bytes` (`MiriOutcome::PassScalar` /
+    `AnnealOutcome::PassScalar`)."""
     parts = tag.split(":")
     if len(parts) != 4 or parts[0] != "pass" or parts[1] != "scalar":
         return False
     bits, size = parts[2], parts[3]
     if not (bits.isascii() and bits.isdigit() and size.isascii() and size.isdigit()):
         return False
-    return int(size) > 0
+    bits_val = int(bits, 10)
+    size_val = int(size, 10)
+    return 0 <= bits_val <= (1 << 128) - 1 and 0 < size_val <= 0xFFFF_FFFF
 
 
 def _normalize_file_for_match(raw: str) -> str:
@@ -1583,16 +1638,23 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
 
     Returns `("agree", "")`, `("diverge", <divergence class>)`, or
     `("not_compared", <not-compared reason>)`, using the same precedence as the Rust
-    comparator: a Miri oracle error wins over everything, then Anneal capture/Lean
-    errors, external calls, `unsupported`, and fuel exhaustion; only then are
-    executed outcomes compared (with span containment for panic and UB locations).
-    The panic-site reconciliation that `compare_difftest_miri_and_anneal` layers on
-    top is audited separately against `reconciled_panic_sites`.
+    comparator: a Miri oracle error (or unrecognized Miri tag) wins over everything,
+    then Anneal capture/Lean errors, external calls, `unsupported`, fuel exhaustion,
+    and unrecognized Anneal tags; only then are executed outcomes compared (with span
+    containment for panic and UB locations). The panic-site reconciliation that
+    `compare_difftest_miri_and_anneal` layers on top is audited separately against
+    `reconciled_panic_sites`.
     """
-    if miri_outcome.startswith("oracle_error"):
+    m_kind, m_sep, m_loc = miri_outcome.partition("@")
+    m_pass = miri_outcome.startswith("pass:") and not m_sep
+    if miri_outcome.startswith(("oracle_error", "error:")) or not (
+        m_pass or m_kind in ("panic", "ub")
+    ):
         return "not_compared", "miri_oracle_error"
+
     for prefix, reason in (
         ("capture_error", "capture_failed"),
+        ("error:", "capture_failed"),
         ("externalCall", "external_call"),
         ("unsupported", "unsupported"),
         ("outOfFuel", "out_of_fuel"),
@@ -1600,10 +1662,10 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
         if anneal_outcome.startswith(prefix):
             return "not_compared", reason
 
-    m_kind, _, m_loc = miri_outcome.partition("@")
-    a_kind, _, a_loc = anneal_outcome.partition("@")
-    m_pass = m_kind.startswith("pass:")
-    a_pass = a_kind.startswith("pass:") or a_kind == "abort"
+    a_kind, a_sep, a_loc = anneal_outcome.partition("@")
+    a_pass = (anneal_outcome.startswith("pass:") and not a_sep) or a_kind == "abort"
+    if not (a_pass or a_kind in ("panic", "ub")):
+        return "not_compared", "capture_failed"
 
     if m_pass:
         if a_kind == "panic":
@@ -1630,16 +1692,54 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
     return "not_compared", "miri_oracle_error"
 
 
-def _reconciled_panic_site_matches(site: dict[str, Any], miri_tag: str, anneal_tag: str) -> bool:
+def _is_rust_ident_segment(seg: str) -> bool:
+    return (
+        bool(seg)
+        and not seg[0].isdigit()
+        and all(c.isascii() and (c.isalnum() or c == "_") for c in seg)
+    )
+
+
+def _is_closure_def_path_segment(seg: str) -> bool:
+    if seg == "{closure}":
+        return True
+    if seg.startswith("{closure#") and seg.endswith("}"):
+        num = seg[len("{closure#") : -1]
+        return bool(num) and num.isascii() and num.isdigit()
+    return False
+
+
+def _is_valid_reconciled_panic_frame(frame: Any, fn_name: str) -> bool:
+    """Port of `miri_eval::frame_matches_scope`: `frame` must be `<user_crate>::<fn_name>`
+    (or a nested `fn`, closure, or `panic_cold_*` shim inside `<user_crate>::<fn_name>`)."""
+    if not isinstance(frame, str) or not frame.strip():
+        return False
+    parts = frame.strip().split("::")
+    if len(parts) < 2:
+        return False
+    crate_seg, root_fn = parts[0], parts[1]
+    if crate_seg in ("core", "std", "alloc") or not _is_rust_ident_segment(crate_seg):
+        return False
+    if root_fn != fn_name:
+        return False
+    return all(
+        _is_rust_ident_segment(seg) or _is_closure_def_path_segment(seg) for seg in parts[2:]
+    )
+
+
+def _reconciled_panic_site_matches(
+    site: dict[str, Any], fn_name: str, miri_tag: str, anneal_tag: str
+) -> bool:
     """Checks that a `reconciled_panic_sites` entry justifies reporting the panic
     pair `(miri_tag, anneal_tag)` as `agree` (`compare_difftest_miri_and_anneal`):
     both panicked with known positions recorded verbatim in the entry, Anneal's
     span lies in a standard panic-macro file, Miri's position lies in the staged
-    `src/lib.rs`, Anneal recovered the panic frame, and the kernel confirmed it."""
+    `src/lib.rs`, Anneal recovered a panic frame inside `<user_crate>::<fn_name>`,
+    and the kernel confirmed it."""
     if not (miri_tag.startswith("panic@") and anneal_tag.startswith("panic@")):
         return False
-    miri_loc = miri_tag[len("panic@"):]
-    anneal_loc = anneal_tag[len("panic@"):]
+    miri_loc = miri_tag[len("panic@") :]
+    anneal_loc = anneal_tag[len("panic@") :]
     if site.get("batch_miri_pos") != miri_loc or site.get("anneal_span") != anneal_loc:
         return False
     pos = _parse_src_pos(miri_loc)
@@ -1649,11 +1749,64 @@ def _reconciled_panic_site_matches(site: dict[str, Any], miri_tag: str, anneal_t
         pos is not None
         and span is not None
         and _is_std_panic_macro_file(span[0])
-        and _source_files_match(pos[0], "src/lib.rs")
-        and isinstance(frame, str)
-        and bool(frame.strip())
+        and _normalize_file_for_match(pos[0]) == "src/lib.rs"
+        and _is_valid_reconciled_panic_frame(frame, fn_name)
         and site.get("kernel_confirmed") is True
     )
+
+
+def _anneal_lean_tag_problem(name: str, anneal_tag: str, lean_tag: Any) -> str | None:
+    """Checks that an `item_outcomes` entry's `anneal_lean_tag` matches its
+    `anneal_outcome` (`AnnealOutcome::to_lean_mir_diff_tag`)."""
+    if not isinstance(lean_tag, str) or not lean_tag.strip():
+        return (
+            f"item_accounting_mismatch: item_outcomes[{name!r}] has missing or non-string "
+            f"anneal_lean_tag {lean_tag!r}"
+        )
+    norm_lean = normalize_anneal_tag(lean_tag)
+    if anneal_tag.startswith(("capture_error", "error:")):
+        if norm_lean != "none":
+            return (
+                f"item_accounting_mismatch: item_outcomes[{name!r}] has error anneal_outcome "
+                f"{anneal_tag!r} but anneal_lean_tag {lean_tag!r}"
+            )
+        return None
+    if norm_lean == "none":
+        return (
+            f"error_masked_as_unsupported: item_outcomes[{name!r}] has anneal_lean_tag "
+            f"'none' (capture/Lean error) masked under anneal_outcome {anneal_tag!r}"
+        )
+    a_prefix = anneal_tag.partition("@")[0]
+    if anneal_tag == "pass:unit":
+        ok = norm_lean == "MirDiffTag.normalUnit"
+    elif _is_valid_pass_scalar_tag(anneal_tag) and "@" not in anneal_tag:
+        _, _, bits, size = anneal_tag.split(":")
+        inner = lean_tag.strip()
+        while inner.startswith("(") and inner.endswith(")"):
+            inner = inner[1:-1].strip()
+        ok = inner == f"MirDiffTag.normalScalar {bits} {size}"
+    elif anneal_tag == "pass:other":
+        ok = norm_lean == "MirDiffTag.normalOther"
+    elif a_prefix == "panic":
+        ok = norm_lean == "MirDiffTag.panic"
+    elif a_prefix == "abort":
+        ok = norm_lean == "MirDiffTag.abort"
+    elif a_prefix == "ub":
+        ok = norm_lean == "MirDiffTag.ub"
+    elif anneal_tag.startswith("unsupported"):
+        ok = norm_lean == "MirDiffTag.unsupported"
+    elif anneal_tag.startswith("externalCall"):
+        ok = norm_lean.startswith("MirDiffTag.externalCall")
+    elif anneal_tag.startswith("outOfFuel"):
+        ok = norm_lean == "MirDiffTag.outOfFuel"
+    else:
+        ok = False
+    if not ok:
+        return (
+            f"item_accounting_mismatch: item_outcomes[{name!r}] anneal_lean_tag {lean_tag!r} "
+            f"does not match anneal_outcome {anneal_tag!r}"
+        )
+    return None
 
 
 def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
@@ -1674,13 +1827,16 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
     `error_masked_as_unsupported`; every other disagreement as
     `item_accounting_mismatch`. Summaries without `item_outcomes` are not audited.
     """
+    if "item_outcomes" not in summary or summary.get("item_outcomes") is None:
+        return []
     items = summary.get("item_outcomes")
     if not isinstance(items, dict):
-        return []
+        return ["item_accounting_mismatch: item_outcomes is not a dict"]
     reasons: list[str] = []
 
     reconciled: dict[str, dict[str, Any]] = {}
     sites_raw = summary.get("reconciled_panic_sites")
+    site_count = summary.get("reconciled_panic_sites_count")
     if sites_raw is not None:
         if not isinstance(sites_raw, list):
             reasons.append("item_accounting_mismatch: reconciled_panic_sites is not a list")
@@ -1697,12 +1853,22 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                     )
                 else:
                     reconciled[name_val] = site
-            site_count = summary.get("reconciled_panic_sites_count")
-            if site_count is not None and site_count != len(sites_raw):
+            if site_count is not None and (
+                isinstance(site_count, bool)
+                or not isinstance(site_count, int)
+                or site_count != len(sites_raw)
+            ):
                 reasons.append(
                     f"item_accounting_mismatch: reconciled_panic_sites_count is {site_count!r} "
                     f"but reconciled_panic_sites lists {len(sites_raw)}"
                 )
+    elif site_count is not None and (
+        isinstance(site_count, bool) or not isinstance(site_count, int) or site_count != 0
+    ):
+        reasons.append(
+            f"item_accounting_mismatch: reconciled_panic_sites_count is {site_count!r} "
+            f"without reconciled_panic_sites"
+        )
     reconciled_used: set[str] = set()
 
     agree = 0
@@ -1727,18 +1893,23 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                 f"miri_outcome / anneal_outcome"
             )
             continue
-        m_prefix = miri_tag.partition("@")[0]
-        if miri_tag.startswith("oracle_error"):
+        if "anneal_lean_tag" in entry:
+            lean_prob = _anneal_lean_tag_problem(name, anneal_tag, entry.get("anneal_lean_tag"))
+            if lean_prob is not None:
+                reasons.append(lean_prob)
+
+        m_prefix, m_sep, _ = miri_tag.partition("@")
+        if miri_tag.startswith(("oracle_error", "error:")):
             miri_counts["error"] += 1
-        elif m_prefix.startswith("pass:"):
+        elif miri_tag.startswith("pass:") and not m_sep:
             miri_counts["pass"] += 1
         elif m_prefix in ("panic", "ub"):
             miri_counts[m_prefix] += 1
         else:
             miri_counts["error"] += 1
 
-        a_prefix = anneal_tag.partition("@")[0]
-        if anneal_tag.startswith("capture_error"):
+        a_prefix, a_sep, _ = anneal_tag.partition("@")
+        if anneal_tag.startswith(("capture_error", "error:")):
             anneal_counts["error"] += 1
         elif anneal_tag.startswith("externalCall"):
             anneal_counts["external_call"] += 1
@@ -1746,7 +1917,7 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             anneal_counts["unsupported"] += 1
         elif anneal_tag.startswith("outOfFuel"):
             anneal_counts["out_of_fuel"] += 1
-        elif a_prefix.startswith("pass:"):
+        elif anneal_tag.startswith("pass:") and not a_sep:
             anneal_counts["pass"] += 1
         elif a_prefix in ("panic", "abort"):
             anneal_counts["panic"] += 1
@@ -1761,7 +1932,7 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             reported == "agree"
             and (verdict, detail) == ("diverge", "panic_site_mismatch")
             and name in reconciled
-            and _reconciled_panic_site_matches(reconciled[name], miri_tag, anneal_tag)
+            and _reconciled_panic_site_matches(reconciled[name], name, miri_tag, anneal_tag)
         ):
             verdict, detail = "agree", ""
             reconciled_used.add(name)
@@ -1795,10 +1966,35 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
             f"compiled_candidates is {compiled}"
         )
     reported_agree = summary.get("agree_count")
-    if isinstance(reported_agree, int) and reported_agree != agree:
+    if (
+        isinstance(reported_agree, int)
+        and not isinstance(reported_agree, bool)
+        and reported_agree != agree
+    ):
         reasons.append(
             f"item_accounting_mismatch: agree_count reported {reported_agree} but item "
             f"outcomes classify {agree} as agree"
+        )
+    total_diverge = sum(classes.values())
+    reported_diverge = summary.get("diverge_count")
+    if (
+        isinstance(reported_diverge, int)
+        and not isinstance(reported_diverge, bool)
+        and reported_diverge != total_diverge
+    ):
+        reasons.append(
+            f"item_accounting_mismatch: diverge_count reported {reported_diverge} but item "
+            f"outcomes classify {total_diverge} as diverge"
+        )
+    reported_compared = summary.get("compared_candidates")
+    if (
+        isinstance(reported_compared, int)
+        and not isinstance(reported_compared, bool)
+        and reported_compared != agree + total_diverge
+    ):
+        reasons.append(
+            f"item_accounting_mismatch: compared_candidates reported {reported_compared} but item "
+            f"outcomes classify {agree + total_diverge} as compared"
         )
     div_map = summary.get("divergence_classes")
     if isinstance(div_map, dict):
@@ -1845,20 +2041,26 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def load_known_corpus_bug_seeds(repo_root: Path) -> set[str]:
-    manifest_path = repo_root / "tests" / "miri-diff" / "manifest.toml"
-    if not manifest_path.is_file():
-        return set()
+def load_known_corpus_bug_seeds(
+    repo_root: Path, manifest_path: Path | None = None
+) -> set[str]:
+    eff_path = (
+        manifest_path
+        if manifest_path is not None
+        else repo_root / "tests" / "miri-diff" / "manifest.toml"
+    )
     try:
-        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        if not eff_path.is_file():
+            return set()
+        data = tomllib.loads(eff_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return set()
     seeds: set[str] = set()
     for entry in data.get("tests", []):
         if isinstance(entry, dict) and "known_anneal_bug" in entry:
             name = entry.get("name")
-            if isinstance(name, str):
-                seeds.add(name)
+            if isinstance(name, str) and name.strip():
+                seeds.add(name.strip())
     return seeds
 
 
@@ -1987,7 +2189,7 @@ def _quarantine_list_entry(location: str, item: Any) -> QuarantineEntry:
         raw_token = item.get("fingerprint", item.get("id"))
         token = raw_token.strip() if isinstance(raw_token, str) else None
         defects: tuple[str, ...] = ()
-        if token is None or not _is_well_formed_quarantine_token(token):
+        if token is None or not _is_well_formed_quarantine_token(token) or ":" not in token:
             defects = (f"malformed_or_missing_fingerprint: {raw_token!r}",)
             token = None
         reason_text = item.get("reason") or item.get("summary")
@@ -2161,6 +2363,8 @@ def quarantine_entry_harness(token: str) -> str | None:
     if head in MIRI_MUTATOR_NAMES:
         return "miri"
     parts = token.split(":")
+    if any(p in VALID_ITREE_DIAG_TAGS and p != "ok" for p in parts):
+        return "itree"
     if any(p in VALID_DIVERGENCE_CLASSES for p in parts) or "MirDiffTag." in token:
         return "miri"
     return None
@@ -2184,15 +2388,31 @@ def _resolved_ledger_fingerprints(ledger: dict[str, Any]) -> set[str]:
     return resolved
 
 
-def _known_bug_eval_problem(obs_tag: Any, ev: Any) -> str | None:
-    """Compares a `known_anneal_bug` entry's `observed_anneal_tag` with the live
-    evaluation `ev` of its test (a verdict string or an `item_outcomes` record)."""
+def _known_bug_eval_problem(
+    obs_tag: Any, ev: Any, expected_div_class: str | None = None
+) -> str | None:
+    """Compares a `known_anneal_bug` entry's `observed_anneal_tag` (and optional
+    `divergence_class`) with the live evaluation `ev` of its test (a verdict string
+    or an `item_outcomes` record)."""
     if isinstance(ev, str):
-        ev_lower = ev.strip().lower()
+        ev_clean = ev.strip()
+        ev_lower = ev_clean.lower()
+        if not ev_clean:
+            return "stale_known_anneal_bug_unconfirmed: empty evaluation string"
         if ev_lower in ("agree", "pass", "pass:unit") or ev_lower.startswith("pass:scalar"):
             return f"stale_known_anneal_bug_now_passes: observed {ev!r}"
+        if (
+            ev_lower in ("not_compared", "error")
+            or ev_lower.startswith("oracle_error")
+            or ev_lower.startswith("capture_error")
+            or ev_lower.startswith("error:")
+        ):
+            return (
+                "stale_known_anneal_bug_unconfirmed: the live evaluation errored "
+                f"({ev!r}), so the open bug was not reproduced"
+            )
         if isinstance(obs_tag, str) and obs_tag.strip():
-            if normalize_anneal_tag(ev) != normalize_anneal_tag(obs_tag):
+            if normalize_anneal_tag(ev_clean) != normalize_anneal_tag(obs_tag):
                 return f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, got {ev!r}"
         return None
     if not isinstance(ev, dict):
@@ -2202,32 +2422,60 @@ def _known_bug_eval_problem(obs_tag: Any, ev: Any) -> str | None:
         return "stale_known_anneal_bug_now_passes: verdict is Agree"
     miri_tag = ev.get("miri_outcome")
     anneal_tag = ev.get("anneal_outcome")
-    if (isinstance(miri_tag, str) and miri_tag.startswith("oracle_error")) or (
-        isinstance(anneal_tag, str) and anneal_tag.startswith("capture_error")
+    if (
+        (isinstance(miri_tag, str) and miri_tag.startswith("oracle_error"))
+        or (isinstance(anneal_tag, str) and anneal_tag.startswith("capture_error"))
+        or verdict not in ("diverge", "not_compared")
     ):
         return (
-            "stale_known_anneal_bug_unconfirmed: the live evaluation errored "
-            f"({miri_tag!r}, {anneal_tag!r}), so the open bug was not reproduced"
+            "stale_known_anneal_bug_unconfirmed: the live evaluation errored or had "
+            f"an unrecognized verdict ({verdict!r}, {miri_tag!r}, {anneal_tag!r}), "
+            "so the open bug was not reproduced"
         )
     candidate_tags: list[str] = []
-    for tag_key in ("observed_anneal_tag", "anneal_outcome", "anneal_lean_tag"):
+    for tag_key in (
+        "observed_anneal_tag",
+        "anneal_outcome",
+        "repro_anneal_outcome",
+        "anneal_lean_tag",
+    ):
         raw_t = ev.get(tag_key)
         if isinstance(raw_t, str) and raw_t.strip():
             candidate_tags.append(raw_t.strip())
             if "@" in raw_t and isinstance(obs_tag, str) and "@" not in obs_tag:
                 candidate_tags.append(raw_t.split("@", 1)[0].strip())
-    if (
-        isinstance(obs_tag, str)
-        and obs_tag.strip()
-        and candidate_tags
-        and not any(
+    if isinstance(obs_tag, str) and obs_tag.strip():
+        if not candidate_tags:
+            return (
+                "stale_known_anneal_bug_unconfirmed: evaluation lacks an Anneal outcome tag "
+                f"to confirm {obs_tag!r}"
+            )
+        if not any(
             normalize_anneal_tag(t) == normalize_anneal_tag(obs_tag) for t in candidate_tags
-        )
-    ):
-        return (
-            f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
-            f"got {candidate_tags[0]!r}"
-        )
+        ):
+            return (
+                f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
+                f"got {candidate_tags[0]!r}"
+            )
+    if expected_div_class is not None:
+        observed_div_cls = ev.get("divergence_class")
+        if (
+            (not isinstance(observed_div_cls, str) or not observed_div_cls.strip())
+            and isinstance(miri_tag, str)
+            and isinstance(anneal_tag, str)
+        ):
+            cls_verdict, cls_sub = classify_oracle_outcome_tags(miri_tag, anneal_tag)
+            if cls_verdict == "diverge":
+                observed_div_cls = cls_sub
+        if (
+            isinstance(observed_div_cls, str)
+            and observed_div_cls.strip()
+            and observed_div_cls.strip() != expected_div_class
+        ):
+            return (
+                "stale_known_anneal_bug_divergence_class_mismatch: "
+                f"expected {expected_div_class!r}, got {observed_div_cls.strip()!r}"
+            )
     return None
 
 
@@ -2309,7 +2557,10 @@ def verify_no_stale_quarantine_or_known_bugs(
         try:
             q_data = read_quarantine_document(quarantine_file)
         except ValueError as e:
-            missing = not quarantine_file.is_file()
+            try:
+                missing = not quarantine_file.is_file()
+            except OSError:
+                missing = False
             stale_q(
                 "<file>" if missing else "<parse>",
                 f"quarantine_file_missing: {quarantine_file}"
@@ -2335,7 +2586,10 @@ def verify_no_stale_quarantine_or_known_bugs(
                 if entry.defects:
                     continue
                 token = entry.token
-                if token in resolved_fps and token not in active_fps:
+                is_active = token in active_fps or any(
+                    act == token or act.startswith(f"{token}:") for act in active_fps
+                )
+                if token in resolved_fps and not is_active:
                     stale_q(
                         token,
                         "already_resolved_in_ledger: fingerprint in resolved_history and "
@@ -2366,9 +2620,15 @@ def verify_no_stale_quarantine_or_known_bugs(
 
     if manifest_path is not None:
         m_data: Any = None
-        if not manifest_path.is_file():
-            stale_m("<file>", f"manifest_file_missing: {manifest_path}")
+        try:
+            manifest_exists = manifest_path.is_file()
+        except OSError as e:
+            stale_m("<parse>", f"malformed_manifest_toml: {e}")
+            manifest_exists = False
         else:
+            if not manifest_exists:
+                stale_m("<file>", f"manifest_file_missing: {manifest_path}")
+        if manifest_exists:
             try:
                 m_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
@@ -2379,30 +2639,56 @@ def verify_no_stale_quarantine_or_known_bugs(
                 stale_m("tests", "malformed_manifest_toml: key 'tests' must be an array of tables")
                 tests = []
             for idx, test_entry in enumerate(tests):
-                if not isinstance(test_entry, dict) or "known_anneal_bug" not in test_entry:
+                if not isinstance(test_entry, dict):
+                    stale_m(f"tests[{idx}]", "malformed_manifest_toml: tests entry must be a table")
+                    continue
+                if "known_anneal_bug" not in test_entry:
                     continue
                 checked_known_bug_count += 1
                 test_name = test_entry.get("name")
                 if not isinstance(test_name, str) or not test_name.strip():
                     stale_m(f"tests[{idx}]", "missing_test_name_on_known_anneal_bug")
                     continue
+                clean_name = test_name.strip()
+                if not _is_well_formed_quarantine_token(clean_name):
+                    stale_m(clean_name, f"malformed_or_missing_fingerprint: {test_name!r}")
                 bug = test_entry.get("known_anneal_bug")
                 if not isinstance(bug, dict):
-                    stale_m(test_name, "malformed_known_anneal_bug: expected table")
+                    stale_m(clean_name, "malformed_known_anneal_bug: expected table")
                     continue
                 obs_tag = bug.get("observed_anneal_tag")
                 reason_text = bug.get("summary") or bug.get("reason")
                 if not isinstance(obs_tag, str) or not obs_tag.strip():
                     stale_m(
-                        test_name,
+                        clean_name,
                         "missing_known_anneal_bug_metadata: missing observed_anneal_tag",
                     )
                 if not isinstance(reason_text, str) or not reason_text.strip():
-                    stale_m(test_name, "missing_known_anneal_bug_metadata: missing summary/reason")
-                if isinstance(manifest_eval_results, dict) and test_name in manifest_eval_results:
-                    problem = _known_bug_eval_problem(obs_tag, manifest_eval_results[test_name])
+                    stale_m(clean_name, "missing_known_anneal_bug_metadata: missing summary/reason")
+                div_cls = bug.get("divergence_class")
+                valid_div_cls: str | None = None
+                if div_cls is not None:
+                    if (
+                        not isinstance(div_cls, str)
+                        or div_cls.strip() not in VALID_DIVERGENCE_CLASSES
+                    ):
+                        stale_m(
+                            clean_name,
+                            f"malformed_known_anneal_bug: invalid divergence_class {div_cls!r}",
+                        )
+                    else:
+                        valid_div_cls = div_cls.strip()
+                expiry_prob = quarantine_expiry_problem(
+                    bug.get("expires"), ref_date, required=False
+                )
+                if expiry_prob is not None:
+                    stale_m(clean_name, expiry_prob)
+                if isinstance(manifest_eval_results, dict) and clean_name in manifest_eval_results:
+                    problem = _known_bug_eval_problem(
+                        obs_tag, manifest_eval_results[clean_name], valid_div_cls
+                    )
                     if problem is not None:
-                        stale_m(test_name, problem)
+                        stale_m(clean_name, problem)
 
     stale_entries = [*stale_quarantine, *stale_manifest]
     return {
@@ -2451,10 +2737,19 @@ def extract_manifest_eval_results_from_miri_summary(
                     "anneal_lean_tag": str(f.get("anneal_lean_tag", "")),
                 }
                 # Identity candidates are the unmutated corpus seeds: `fn_name` is the
-                # manifest test name.
+                # manifest test name. Merge `divergence_class` and the repro-mapped
+                # `anneal_outcome` into any existing `item_outcomes` entry so both
+                # raw and repro-mapped tags can be checked.
                 name_val = f.get("fn_name")
                 if isinstance(name_val, str) and name_val.strip():
-                    results.setdefault(name_val.strip(), rec)
+                    fn_key = name_val.strip()
+                    if fn_key not in results:
+                        results[fn_key] = rec
+                    else:
+                        if rec["divergence_class"] and not results[fn_key].get("divergence_class"):
+                            results[fn_key]["divergence_class"] = rec["divergence_class"]
+                        if rec["anneal_outcome"]:
+                            results[fn_key]["repro_anneal_outcome"] = rec["anneal_outcome"]
 
     return results if results else None
 
@@ -3060,12 +3355,16 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                     "capture_error:INTERNAL PANIC: Nat.shiftl exponent is too big (SIGABRT)"
                 ),
                 "anneal_lean_tag": "none",
+                "expected_kill_class": "harness_error",
+                "expected_detail_substring": "oracle_errors_exceeded",
             },
             {
                 # The same abort misreported as an unmodeled construct must still fail.
                 "label": "guard_omitted_abort_masked_as_unsupported",
                 "anneal_outcome": "unsupported@src/lib.rs:4:14: 4:37",
                 "anneal_lean_tag": "MirDiffTag.unsupported",
+                "expected_kill_class": "harness_error",
+                "expected_detail_substring": "error_masked_as_unsupported",
                 "diagnostics": (
                     {
                         "fn_name": "probe_wide_shift",
@@ -3079,6 +3378,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "label": "guard_masks_exponent_silently",
                 "anneal_outcome": "pass:scalar:1:8",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 1 8)",
+                "expected_kill_class": "missed_ub",
             },
         ),
         "probe_rust_source": (
@@ -3136,6 +3436,7 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
             return result
 
         variant_results: list[dict[str, Any]] = []
+        observed_classes: set[str] = set()
         for variant in mutant.get("mutant_variants", ()):
             diagnostics = [dict(d) for d in variant.get("diagnostics", ())]
             summary = build_simulated_miri_summary(
@@ -3147,9 +3448,17 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
                 diagnostics=diagnostics or None,
             )
             v_exit, v_class, v_detail = campaign_exit_for_miri_summary(summary)
-            v_killed = v_exit in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED) and (
-                not expected or v_class in expected
+            v_expected_cls = variant.get("expected_kill_class")
+            v_expected_sub = variant.get("expected_detail_substring")
+            v_killed = (
+                v_exit in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
+                and bool(expected)
+                and v_class in expected
+                and (v_expected_cls is None or v_class == v_expected_cls)
+                and (v_expected_sub is None or str(v_expected_sub) in v_detail)
             )
+            if v_killed:
+                observed_classes.add(v_class)
             variant_results.append(
                 {
                     "label": str(variant.get("label", "")),
@@ -3163,7 +3472,13 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
                 }
             )
         result["variants"] = variant_results
-        all_killed = bool(variant_results) and all(v["killed"] for v in variant_results)
+        missing_classes = [c for c in expected if c not in observed_classes]
+        all_killed = (
+            bool(variant_results)
+            and bool(expected)
+            and all(v["killed"] for v in variant_results)
+            and not missing_classes
+        )
         survivors = [v for v in variant_results if not v["killed"]]
         first = survivors[0] if survivors else variant_results[0] if variant_results else None
         result.update(
@@ -3173,6 +3488,8 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
         )
         if survivors:
             result["survived_variants"] = [v["label"] for v in survivors]
+        if missing_classes:
+            result["missing_expected_kill_classes"] = missing_classes
         return result
 
 
@@ -3210,29 +3527,40 @@ def _normalize_evaluator_result(
         }
     if isinstance(raw_res, dict):
         if "killed" in raw_res:
-            is_killed = raw_res["killed"] is True
+            raw_exit = raw_res.get(
+                "exit_code",
+                EXIT_DIVERGENCE_DETECTED if raw_res["killed"] is True else EXIT_SUCCESS,
+            )
+            if isinstance(raw_exit, bool) or not isinstance(raw_exit, int):
+                raise ValueError(f"evaluator returned a non-integer exit_code {raw_exit!r}")
+            exit_c = raw_exit
+            is_killed = raw_res["killed"] is True and exit_c in (
+                EXIT_DIVERGENCE_DETECTED,
+                EXIT_HARNESS_FAILED,
+            )
             k_class = str(
                 raw_res.get(
                     "kill_class",
                     expected_classes[0] if (is_killed and expected_classes) else "survived",
                 )
             )
-            raw_exit = raw_res.get(
-                "exit_code", EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
-            )
-            if isinstance(raw_exit, bool) or not isinstance(raw_exit, int):
-                raise ValueError(f"evaluator returned a non-integer exit_code {raw_exit!r}")
-            exit_c = raw_exit
         elif "verdict" in raw_res:
             verdict_str = str(raw_res["verdict"]).strip().lower()
-            is_killed = verdict_str in ("diverge", "error", "harness_error")
-            k_class = str(
-                raw_res.get(
-                    "divergence_class",
-                    raw_res.get("kill_class", "harness_error" if is_killed else "survived"),
+            if verdict_str == "diverge":
+                div_cls = raw_res.get("divergence_class", raw_res.get("kill_class"))
+                is_killed = isinstance(div_cls, str) and bool(div_cls.strip())
+                k_class = div_cls.strip() if is_killed else "survived"
+                exit_c = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
+            elif verdict_str in ("error", "harness_error"):
+                is_killed = True
+                k_class = str(
+                    raw_res.get("divergence_class", raw_res.get("kill_class", "harness_error"))
                 )
-            )
-            exit_c = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
+                exit_c = EXIT_HARNESS_FAILED
+            else:
+                is_killed = False
+                k_class = "survived"
+                exit_c = EXIT_SUCCESS
         elif "diverge_count" in raw_res or "miri_verdicts" in raw_res:
             exit_c, k_class, _ = campaign_exit_for_miri_summary(raw_res)
             is_killed = exit_c in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
@@ -3302,10 +3630,8 @@ def run_semantic_mutant_self_check(
                 "detail": f"{type(e).__name__}: {e}",
             }
 
-        if (
-            outcome["killed"]
-            and expected_classes
-            and outcome.get("kill_class") not in expected_classes
+        if outcome["killed"] and (
+            not expected_classes or outcome.get("kill_class") not in expected_classes
         ):
             outcome["killed"] = False
             outcome["unexpected_kill_class"] = outcome.get("kill_class")
@@ -3501,6 +3827,7 @@ def write_standalone_gate_reports(
         "mode": "standalone_gate",
         "passed": gate_ok,
         "gates": {
+            "passed": gate_ok,
             "self_check_mutants": mutant_report is not None,
             "check_stale_ratchet": ratchet_report is not None,
         },
@@ -5145,11 +5472,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_HARNESS_FAILED
 
     default_manifest = repo_root / "tests" / "miri-diff" / "manifest.toml"
-    manifest_path = (
-        args.manifest_path
-        if args.manifest_path is not None
-        else (default_manifest if default_manifest.is_file() else None)
-    )
+    manifest_path = args.manifest_path if args.manifest_path is not None else default_manifest
 
     temp_ctx = (
         tempfile.TemporaryDirectory(prefix="anneal-diff-test-campaign-")
@@ -5576,7 +5899,7 @@ def main(argv: list[str] | None = None) -> int:
                     quarantine_rules,
                 )
 
-        known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root)
+        known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root, manifest_path)
         miri_all_dedup: list[DeduplicatedFinding] = []
         miri_unquarantined: list[DeduplicatedFinding] = []
         miri_quarantined: list[DeduplicatedFinding] = []

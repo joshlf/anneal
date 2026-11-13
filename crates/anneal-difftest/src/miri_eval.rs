@@ -5927,11 +5927,11 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// 1. `probe_ctrl_provenance_addr_preserved` rewrites `p` exactly as the probe
     ///    does and returns `1` because `p` still holds `x`'s address: the probe
     ///    dereferences `x`'s live allocation address, not an unmapped one.
-    /// 2. `probe_ctrl_provenance_exposed_addr` dereferences the same address after
-    ///    an exposing round trip (`addr as *const u32`), which restores
-    ///    provenance, and returns `x`'s value `7`: only the missing provenance
-    ///    makes the probe UB, so a semantics that accepts the provenance-free
-    ///    pointer returns `7` instead of trapping (`missed_ub`).
+    /// 2. `probe_ctrl_provenance_exposed_addr` rewrites `p` with the same `*slot = addr`
+    ///    overwrite and then dereferences `(p as usize) as *const u32`, which restores
+    ///    provenance via an exposing round trip and returns `x`'s value `7`: only the
+    ///    missing provenance makes `*p` UB, so a semantics that accepts the
+    ///    provenance-free pointer returns `7` instead of trapping (`missed_ub`).
     const PROVENANCE_FRAG_CONTROL_PROBES: [(&str, &str, u128); 2] = [
         (
             "probe_ctrl_provenance_addr_preserved",
@@ -5952,10 +5952,14 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             "probe_ctrl_provenance_exposed_addr",
             r#"pub fn probe_ctrl_provenance_exposed_addr() -> u32 {
     let x: u32 = 7u32;
-    let p: *const u32 = &raw const x;
+    let mut p: *const u32 = &raw const x;
     let addr: usize = p as usize;
-    let forged: *const u32 = addr as *const u32;
-    unsafe { *forged }
+    let slot: *mut usize = (&raw mut p) as *mut usize;
+    unsafe {
+        *slot = addr;
+        let forged: *const u32 = (p as usize) as *const u32;
+        *forged
+    }
 }
 "#,
             7,

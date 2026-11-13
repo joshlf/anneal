@@ -2724,6 +2724,8 @@ class StaleRatchetGateTest(unittest.TestCase):
                 'expires = "2026-01-15"\n'
                 'reason = "expired"\n'
                 '[[quarantined]]\n'
+                'fingerprint = "bad_no_colon"\n'
+                '[[quarantined]]\n'
                 'fingerprint = "bad no colon"\n'
                 '[[quarantined]]\n'
                 'fingerprint = "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar"\n'
@@ -3421,6 +3423,7 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
         for name, control_source, _ in controls:
             self.assertIn("let x: u32 = 7u32;", control_source, name)
             self.assertIn("let addr: usize = p as usize;", control_source, name)
+            self.assertIn("*slot = addr;", control_source, name)
         gaps = re.findall(r'\(\s*"(\w+)",', _rust_const_body("KNOWN_PROVENANCE_GAP_PROBES"))
         self.assertEqual(
             gaps,
@@ -4811,6 +4814,265 @@ class GateProfileAndModeTest(unittest.TestCase):
                 )
             )
             self.assertEqual((ledger_path.read_bytes(), ratchet_path.read_bytes()), before)
+
+
+class PassB1AdversarialRegressionTest(unittest.TestCase):
+    """Regression tests for Pass B1 audit findings across the Miri/ITree error boundaries,
+    oracle tag classification, item-outcome accounting, stale-ratchet audit, and
+    semantic-mutant self-check."""
+
+    def test_reconciled_panic_site_rejects_foreign_frame_and_prefixed_miri_path(self) -> None:
+        base = _with_reconciled_panic_macro_item(
+            _with_consistent_item_outcomes(_make_valid_miri_summary())
+        )
+        # 1. A frame belonging to std/core or another function must not reconcile `panic_item`.
+        for bad_frame in (
+            "core::panicking::panic_fmt",
+            "miri_diff_corpus::other_item",
+            "panic_item_other",
+        ):
+            with self.subTest(frame=bad_frame):
+                s = copy.deepcopy(base)
+                s["reconciled_panic_sites"][0]["anneal_panic_frame"] = bad_frame
+                reasons = campaign.audit_item_outcomes_against_summary(s)
+                self.assertTrue(
+                    any("item_accounting_mismatch" in r for r in reasons),
+                    f"{bad_frame}: {reasons}",
+                )
+
+        # 2. `batch_miri_pos` in `miri_eval.rs` must normalize to `"src/lib.rs"`, not an
+        #    arbitrary absolute prefix `/tmp/other/src/lib.rs`.
+        s_path = copy.deepcopy(base)
+        s_path["item_outcomes"]["panic_item"]["miri_outcome"] = "panic@/tmp/other/src/lib.rs:12:5"
+        s_path["reconciled_panic_sites"][0]["batch_miri_pos"] = "/tmp/other/src/lib.rs:12:5"
+        reasons_path = campaign.audit_item_outcomes_against_summary(s_path)
+        self.assertTrue(any("item_accounting_mismatch" in r for r in reasons_path), reasons_path)
+
+        # 3. Non-zero `reconciled_panic_sites_count` when `reconciled_panic_sites` is omitted
+        #    or boolean `reconciled_panic_sites_count = True` must fail closed.
+        s_no_list = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        s_no_list["reconciled_panic_sites_count"] = 1
+        self.assertTrue(
+            any(
+                "reconciled_panic_sites_count" in r
+                for r in campaign.audit_item_outcomes_against_summary(s_no_list)
+            )
+        )
+        s_bool_cnt = copy.deepcopy(base)
+        s_bool_cnt["reconciled_panic_sites_count"] = True
+        self.assertTrue(
+            any(
+                "reconciled_panic_sites_count" in r
+                for r in campaign.audit_item_outcomes_against_summary(s_bool_cnt)
+            )
+        )
+
+    def test_item_outcomes_non_dict_and_lean_tag_contradictions_fail_closed(self) -> None:
+        # Non-dict `item_outcomes` must not silently return `[]`.
+        s_list = _make_valid_miri_summary()
+        s_list["item_outcomes"] = []
+        reasons = campaign.audit_item_outcomes_against_summary(s_list)
+        self.assertTrue(any("item_outcomes is not a dict" in r for r in reasons), reasons)
+
+        # `anneal_lean_tag == "none"` masked under `anneal_outcome: "unsupported@..."` is an
+        # Anneal capture/Lean error disguised as unsupported.
+        s_masked = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        s_masked["item_outcomes"]["pass_direct_fn_call"]["anneal_lean_tag"] = "none"  # type: ignore[index]
+        reasons_masked = campaign.audit_item_outcomes_against_summary(s_masked)
+        self.assertTrue(
+            any(r.startswith("error_masked_as_unsupported") for r in reasons_masked),
+            reasons_masked,
+        )
+
+        # Contradictory `anneal_lean_tag` vs `anneal_outcome` (e.g. `MirDiffTag.ub` on `pass:unit`).
+        s_contradict = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        s_contradict["item_outcomes"]["pass_item_0"]["anneal_lean_tag"] = "MirDiffTag.ub"  # type: ignore[index]
+        reasons_contradict = campaign.audit_item_outcomes_against_summary(s_contradict)
+        self.assertTrue(
+            any("does not match anneal_outcome" in r for r in reasons_contradict),
+            reasons_contradict,
+        )
+
+    def test_classify_oracle_outcome_tags_strict_pass_and_error_precedence(self) -> None:
+        # `pass:` tags never carry `@span` suffixes and must not have `@...` stripped.
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("pass:unit@a", "pass:unit@b"),
+            ("not_compared", "miri_oracle_error"),
+        )
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("pass:unit", "pass:unit@b"),
+            ("not_compared", "capture_failed"),
+        )
+        # Scalar bits > u128::MAX or size == 0 are not valid `pass:scalar` tags and never agree.
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags(
+                f"pass:scalar:{1 << 128}:4", f"pass:scalar:{1 << 128}:4"
+            ),
+            ("diverge", "wrong_value"),
+        )
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("pass:scalar:1:0", "pass:scalar:1:0"),
+            ("diverge", "wrong_value"),
+        )
+        # Unrecognized Miri error tag takes precedence over Anneal `unsupported` / `capture_error`.
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags(
+                "error:miri_driver_failed", "unsupported@src/lib.rs:1:1: 1:5"
+            ),
+            ("not_compared", "miri_oracle_error"),
+        )
+        # Unrecognized Anneal error tag is `("not_compared", "capture_failed")`, matching
+        # `audit_item_outcomes_against_summary`'s `anneal_counts["error"]`.
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("pass:unit", "error:lean_crashed"),
+            ("not_compared", "capture_failed"),
+        )
+
+    def test_itree_compile_failed_exceeding_uncompiled_candidates_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            itree = make_healthy_itree_report(Path(tmp))
+            # All 8 candidates compiled `-O0`/`-O2` and `instrumented` with 0 unsafe tokens,
+            # so `max_compile_failed == 0`. Routing a dropped candidate into `compile_failed`
+            # must be caught by `validate_itree_error_boundary`.
+            itree["compared_candidates"] = 7
+            itree["agree_candidates"] = 7
+            itree["not_compared_candidates"] = 1
+            itree["not_compared_reasons"]["compile_failed"] = 1
+            ok, reasons = campaign.validate_itree_error_boundary(itree)
+            self.assertFalse(ok)
+            self.assertTrue(
+                any(
+                    "not_compared_reasons.compile_failed (1) exceeds maximum compile/unsafe rejections (0)"
+                    in r
+                    for r in reasons
+                ),
+                reasons,
+            )
+
+    def test_manifest_known_bug_expires_and_divergence_class_and_findings_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "expired_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'divergence_class = "missed_ub"\n'
+                'expires = "2020-01-01"\n'
+                'summary = "expired in manifest"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "bad_div_cls"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'divergence_class = "not_a_valid_class"\n'
+                'summary = "bad class"\n',
+                encoding="utf-8",
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file, reference_date="2026-11-09"
+            )
+            self.assertFalse(audit["passed"])
+            reasons = " | ".join(e["reason"] for e in audit["stale_known_anneal_bugs"])
+            self.assertIn("expired_quarantine_entry", reasons)
+            self.assertIn("invalid divergence_class", reasons)
+
+            # A dict evaluation with `verdict: "diverge"` but no Anneal outcome tags is
+            # `stale_known_anneal_bug_unconfirmed`, and a mismatched `divergence_class` is
+            # `stale_known_anneal_bug_divergence_class_mismatch`.
+            m_open = Path(tmp) / "manifest_open.toml"
+            m_open.write_text(
+                '[[tests]]\n'
+                'name = "open_bug"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "ub@repro.rs:4:1: 4:9"\n'
+                'divergence_class = "false_positive_ub"\n'
+                'summary = "tracked"\n',
+                encoding="utf-8",
+            )
+            unconfirmed = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_open,
+                manifest_eval_results={"open_bug": {"verdict": "diverge"}},
+            )
+            self.assertFalse(unconfirmed["passed"])
+            self.assertIn(
+                "stale_known_anneal_bug_unconfirmed",
+                unconfirmed["stale_known_anneal_bugs"][0]["reason"],
+            )
+
+            # When `item_outcomes` has the batch span (`src/lib.rs:40:1: 40:9`) and `findings`
+            # has the `repro.rs`-mapped span (`ub@repro.rs:4:1: 4:9`) plus `divergence_class`,
+            # `extract_manifest_eval_results_from_miri_summary` merges both so the repro tag
+            # matches and `divergence_class` is checked.
+            miri_summary = {
+                "mode": "identity",
+                "item_outcomes": {
+                    "open_bug": {
+                        "verdict": "diverge",
+                        "miri_outcome": "pass:unit",
+                        "anneal_outcome": "ub@src/lib.rs:40:1: 40:9",
+                        "anneal_lean_tag": "MirDiffTag.ub",
+                    }
+                },
+                "findings": [
+                    {
+                        "fn_name": "open_bug",
+                        "divergence_class": "false_positive_ub",
+                        "anneal_outcome": "ub@repro.rs:4:1: 4:9",
+                        "anneal_lean_tag": "MirDiffTag.ub",
+                    }
+                ],
+            }
+            merged = campaign.extract_manifest_eval_results_from_miri_summary(miri_summary)
+            audit_merged = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_open, manifest_eval_results=merged
+            )
+            self.assertTrue(audit_merged["passed"], audit_merged)
+
+            # If the live finding's `divergence_class` drifted to `missed_ub`, it fails closed.
+            miri_summary["findings"][0]["divergence_class"] = "missed_ub"  # type: ignore[index]
+            merged_drifted = campaign.extract_manifest_eval_results_from_miri_summary(miri_summary)
+            audit_drifted = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_open, manifest_eval_results=merged_drifted
+            )
+            self.assertFalse(audit_drifted["passed"])
+            self.assertIn(
+                "stale_known_anneal_bug_divergence_class_mismatch",
+                audit_drifted["stale_known_anneal_bugs"][0]["reason"],
+            )
+
+    def test_mutant_self_check_enforces_per_variant_kill_class_and_strict_normalization(self) -> None:
+        # If `wide_shift`'s `guard_masks_exponent_silently` variant fails with `harness_error`
+        # instead of `missed_ub`, the mutant must NOT be counted as killed even though
+        # `"harness_error"` is in `wide_shift`'s family-level `expected_kill_classes`.
+        wide = copy.deepcopy(
+            next(m for m in campaign.SEEDED_SEMANTIC_MUTANTS if m["id"] == "wide_shift")
+        )
+        wide["mutant_variants"] = tuple(
+            dict(v, anneal_outcome="capture_error:crash", anneal_lean_tag="none")
+            if v["label"] == "guard_masks_exponent_silently"
+            else dict(v)
+            for v in wide["mutant_variants"]
+        )
+        res = campaign.run_semantic_mutant_self_check(mutants=[wide])
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["survived_mutants"], ["wide_shift"])
+        self.assertEqual(
+            res["results"][0]["survived_variants"], ["guard_masks_exponent_silently"]
+        )
+        self.assertEqual(
+            res["results"][0]["missing_expected_kill_classes"], ["missed_ub"]
+        )
+
+        # Custom evaluator returning `{"killed": True, "exit_code": 0}` or
+        # `{"verdict": "diverge"}` without `divergence_class` must fail closed.
+        base = dict(campaign.SEEDED_SEMANTIC_MUTANTS[0])
+        for bad_eval in (
+            lambda _m: {"killed": True, "kill_class": "missed_ub", "exit_code": 0},
+            lambda _m: {"verdict": "diverge"},
+        ):
+            r = campaign.run_semantic_mutant_self_check(evaluator=bad_eval, mutants=[base])
+            self.assertFalse(r["passed"], r)
 
 
 if __name__ == "__main__":
