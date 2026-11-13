@@ -91,12 +91,6 @@ impl Callbacks for AnalysisCallbacks {
 /// Evidence appears only after the entire requested compilation succeeds. A
 /// compiler information request that returns without analysis fails this check.
 pub(super) fn run(args: Vec<OsString>) -> ExitCode {
-    // The hook will "print the ICE message on unexpected panics" and is
-    // "useable even by external tools". Ordinary compiler panics must retain
-    // rustc's context and bug-report guidance, including before analysis.
-    // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L1434-L1445
-    rustc_driver::install_ice_hook("https://github.com/joshlf/anneal/issues/new", |_| ());
-
     // catch_with_exit_code "also computes the exit code" for caught fatal
     // errors. Keep already-reported diagnostics without a wrapper error; other
     // panics unwind without callback evidence.
@@ -106,12 +100,29 @@ pub(super) fn run(args: Vec<OsString>) -> ExitCode {
         // compiler options, using the default early diagnostic format.
         // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L114-L134
         let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+        if let Some(program_name) = std::env::args_os().next()
+            && program_name.to_str().is_none()
+        {
+            early_dcx.early_fatal(format!(
+                "compiler program name is not UTF-8: {program_name:?}"
+            ));
+        }
         let mut compiler_args = vec!["anneal-rustc-capture".into()];
         compiler_args.extend(args.into_iter().map(|arg| {
             arg.into_string().unwrap_or_else(|arg| {
                 early_dcx.early_fatal(format!("compiler argument is not UTF-8: {arg:?}"))
             })
         }));
+
+        // The hook will "print the ICE message on unexpected panics" and is
+        // "useable even by external tools". It scans `std::env::args()` for
+        // "-Zui-testing" when RUST_BACKTRACE is unset, including the program
+        // name. Install it only after rejecting non-Unicode arguments and
+        // program names. Compiler panics still retain rustc's context and
+        // bug-report guidance, including before analysis.
+        // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L1434-L1461
+        rustc_driver::install_ice_hook("https://github.com/joshlf/anneal/issues/new", |_| ());
+
         let mut callbacks = AnalysisCallbacks {
             error_format: ErrorOutputType::default(),
             analysis_reached: false,
