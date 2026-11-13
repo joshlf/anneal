@@ -195,9 +195,16 @@ vs. `theory/`) and the separation between **language-agnostic verification
 machinery** (`Framework/`) and **Rust-specific semantics** (`Rust/`).
 [`trusted/`](../trusted) houses the CI boundary auditor (`trusted/audit/`), CLI
 orchestrator (`trusted/cargo-anneal/`), capture entrypoint
-(`trusted/rustc-capture/`), and foundational Lean prelude (`trusted/lean/`);
-the `Framework/`, `Rust/`, per-version capture subcrates, and `theory/`
-subdirectories below show the target layout as the pipeline is populated:
+(`trusted/rustc-capture/`), and foundational Lean prelude (`trusted/lean/`).
+
+The shared Rust auditor lives in
+[`cargo-anneal/src/lib.rs`](../trusted/cargo-anneal/src/lib.rs) and
+[`target.rs`](../trusted/cargo-anneal/src/target.rs), so the published CLI package
+can use it without depending on an unpublished crate. The standalone
+`anneal-audit` crate reexports that implementation and keeps its existing CLI
+and tests. The `Framework/`, `Rust/`, per-version capture subcrates, and
+`theory/` subdirectories below show the target layout as the pipeline is
+populated:
 
 ```text
 anneal/
@@ -219,10 +226,10 @@ anneal/
 │   │       └── Rust/               # Captured MIR AST, CaptureProfile, memory
 │   │           ├── Ast/            # models, reference semantics, & CrateTheorem
 │   │           └── Semantics/
-│   ├── audit/                      # CI-only .olean replay & boundary auditor
-│   │   ├── src/                    # anneal-audit Rust binary & manifest checks
+│   ├── audit/                      # Auditor CLI and Lean inspector
+│   │   ├── src/                    # Auditor CLI and compatibility library
 │   │   └── TrustedBoundary.lean    # Two-phase preflight & kernel DAG inspector
-│   └── cargo-anneal/               # CLI orchestrator (cargo anneal)
+│   └── cargo-anneal/               # CLI and shared Rust auditor library
 └── theory/                         # Stage 3: Untrusted, kernel-checked proofs
     ├── Framework/                  # Generic simulation & composition lemmas
     └── Rust/

@@ -111,10 +111,13 @@ pub struct TargetAuditRequest {
     pub bindings: TargetBindings,
 }
 
-// Module routing and selected declaration labels deliberately share the
-// documented protocol above. Do not mistake this bounded profile for Lean's
-// general naming rules or apply it to helper declarations inside source files.
-fn target_name_valid(name: &str) -> bool {
+/// Return whether `name` uses the bounded label protocol of [`TargetAuditRequest`].
+///
+/// Frontends use the same profile before capture that the auditor enforces for
+/// direct API callers. This checks names as data; it neither recognizes all Lean
+/// identifiers nor quotes source. Helpers inside authored files are unrestricted
+/// by this profile.
+pub fn target_name_valid(name: &str) -> bool {
     !name.is_empty() && name.split('.').all(is_lean_ident)
 }
 

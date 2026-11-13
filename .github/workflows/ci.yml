@@ -250,6 +250,14 @@ jobs:
           name: anneal-exocrate-archive
           path: target
 
+      - name: Check embedded verifier resources
+        id: resources
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/bundle-resources.log") 2>&1
+          cargo run --locked --jobs 2 -p cargo-anneal \
+            --example regenerate_bundle -- --root . --check
+
       - name: Install current CLI for toolchain setup and smoke tests
         id: installed_cli
         run: |
@@ -303,6 +311,12 @@ jobs:
           print(f"XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}")
           print(f"ANNEAL_TEST_INSTALL_ROOT={root}")
           print(f"ANNEAL_TEST_RUST_SYSROOT={root / 'rust'}")
+          # Proof tests must use this run's installed Rust/Lean pair. Capture
+          # names the current checkout's build, so those tests exercise
+          # the change under review rather than the archived capture binary.
+          print(f"ANNEAL_MVP_SYSROOT={root / 'rust'}")
+          print(f"ANNEAL_MVP_LEAN={root / 'lean/bin/lean'}")
+          print(f"ANNEAL_MVP_CAPTURE={Path(os.environ['CARGO_TARGET_DIR']) / 'debug/anneal-rustc-capture'}")
           print(f"RUSTC={root / 'rust/bin/rustc'}")
           print(f"RUSTDOC={root / 'rust/bin/rustdoc'}")
           print(f"LD_LIBRARY_PATH={root / 'rust/lib'}")
