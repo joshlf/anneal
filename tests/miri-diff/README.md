@@ -125,10 +125,11 @@ Category 9 leaves out the following constructs, on which Anneal currently
 disagrees with Miri. `ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live`
 in [`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
 pins each one, kernel-confirmed, with its exact Miri and Anneal outcomes.
-`miri-difftest` mutators avoid them all: no Category 9 helper or template
-accesses memory through a pointer into its caller's frame, so the call-chain
-tests check reference passing, reborrow return, frame cleanup, and unwinding,
-but not Anneal's `FnEntry` protector enforcement.
+The Category 9 seeds and the `miri-difftest` templates avoid them all: no
+helper or template accesses memory through a pointer into its caller's frame,
+or writes through a raw pointer after a sibling `&x` exists. The call-chain
+tests therefore check reference passing, reborrow return, frame cleanup, and
+unwinding, but not Anneal's `FnEntry` protector enforcement.
 
 **Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
 local index into the *running* frame (`get? locals entry.targetLocal`, falling
@@ -140,20 +141,11 @@ resolves to the callee's own local `_k`:
   and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
   through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
   callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
-  Miri `11`).
+  Miri `11`). A callee write that collides with its own pointer argument is
+  lost the same way (Anneal `13`, Miri `10`).
 - False UB (`false_positive_ub`): a callee dereferencing a reference argument
   (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
   `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
-  A callee writing through `raw = &raw mut x` while the caller holds an unused
-  shared borrow of `x` (`let _r = &x; f(raw)`) faults at `*alias = 7` because
-  `evalRvalueRawPtr` mints a separate root `BorrowEntry` (`tag = 1`,
-  `parentTag = .none`, `perm = .active`) for `raw`, and `Retag([default] _r)` on
-  the sibling root borrow `_r` (`tag = 2`, `parentTag = .none`) runs
-  `freezeTreeBorrowsOnReadAtProj` with `readerTag = .some 2`, which treats the
-  initial read of `_r` as a foreign read to `raw` and freezes `raw.perm` to
-  `.frozen` before the call; without `let _r = &x`, `raw.perm` stays `.active`
-  and the write instead overwrites `alias` in the callee frame (`wrong_value`,
-  Anneal `13`, Miri `10`). Both pass in Miri.
 - Missed UB (`missed_ub`, `unsound_missed_fault`): Miri reports a
   `RetagKind::FnEntry` protector violation when a callee writes through `raw`
   while `&*raw` (or `&mut *raw`) is one of its arguments. In Anneal the write
@@ -164,18 +156,28 @@ resolves to the callee's own local `_k`:
   `validRange.end_ = u64::MAX`, the 4-byte write sends the Lean kernel's
   `by rfl` confirmation into byte-level re-decoding, which exhausts memory.
   Passing `&x` or `&mut x` directly agrees with Miri (both report UB at the
-  write), but only because of the false-UB item above, not because of a
-  protector.
+  write), but only because creating `&x` freezes `raw` (see the next
+  paragraph), not because of a protector.
+
+**Raw-pointer sibling roots (no call needed).** `evalRvalueRawPtr` mints a
+separate root `BorrowEntry` (`perm = .active`) for `raw = &raw mut x`, while
+`&x` mints a sibling root whose retag read (`freezeTreeBorrowsOnReadAtProj`)
+counts as a foreign read of `raw` and freezes it. Any later write through `raw`
+is then UB in Anneal. Miri passes, because in Tree Borrows `raw` keeps `x`'s
+tag and the write only disables `&x`:
+
+- In one frame, with `&x` never used
+  (`let raw = &raw mut x; let _r = &x; unsafe { *raw = 11 }`): Anneal reports
+  UB at the write.
+- In a callee: the caller holds `let _r = &x;` and passes `raw`, and the callee
+  writes through it. Without `_r`, `raw` stays `.active` and the callee's write
+  is silently lost instead (the frame-relative item above).
+- After a call: `&x` is a call argument and the caller writes through `raw`
+  once the callee has returned. This also reproduces with a callee whose only
+  locals are `_0` and `_r`, so it does not depend on local-index collisions.
 
 **Other gaps.**
 
-- A write to `x` through `raw = &raw mut x` in the caller after a callee that
-  received `&x` has returned: Miri passes (the protector is released on
-  return), and Anneal reports UB at the write by the same sibling-root
-  `freezeTreeBorrowsOnReadAtProj` mechanism (creating and retag-reading the
-  call argument `&x` freezes `raw`'s sibling root `BorrowEntry` to `.frozen`
-  before the call begins). This gap does not depend on local-index collisions:
-  it reproduces with a callee whose only locals are `_0` and `_r`.
 - A raw-pointer read of a moved-from local that is still in scope: Miri passes
   (it evaluates `Operand::Move` like `Operand::Copy`), and Anneal reports UB
   because it de-initializes the moved-from place.

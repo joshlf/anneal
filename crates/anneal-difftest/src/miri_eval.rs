@@ -1516,7 +1516,10 @@ pub struct MiriCampaignEvalReport {
     pub diverge_count: usize,
     /// Count of candidates not compared (compile failures + oracle `NotCompared`).
     pub not_compared_count: usize,
-    /// Count of divergences confirmed in the Lean 4 kernel (`by rfl`).
+    /// Count of divergences whose reported evidence is confirmed in the Lean 4
+    /// kernel (`by rfl`): the finding's minimized reproducer when shrinking
+    /// reduced the candidate, else the original candidate. `item_reports` keep
+    /// each original candidate's own `kernel_confirmed`.
     pub kernel_confirmed_divergences: usize,
     /// Miri outcome counts (`pass`, `panic`, `ub`, `error`).
     pub miri_verdicts: BTreeMap<String, usize>,
@@ -3608,7 +3611,7 @@ pub fn evaluate_miri_batches_with_options(
     };
 
     let LinkedDifftestOracleRun {
-        report: mut oracle_report,
+        report: oracle_report,
         anneal_panic_frames,
         anneal_panic_messages,
     } = match run_linked_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
@@ -3638,7 +3641,7 @@ pub fn evaluate_miri_batches_with_options(
     };
     let shrink_seed_refs: Vec<&str> = shrink_seeds.iter().map(String::as_str).collect();
 
-    for item_rep in &mut oracle_report.items {
+    for item_rep in &oracle_report.items {
         let miri_sig_tag = match &item_rep.miri {
             MiriOutcome::PassUnit => "pass_unit".to_string(),
             MiriOutcome::PassScalar { size_bytes, .. } => format!("pass_scalar_{size_bytes}"),
@@ -3731,8 +3734,7 @@ pub fn evaluate_miri_batches_with_options(
                 .or_insert(0) += 1;
         }
 
-        let verdict = item_rep.verdict.clone();
-        match &verdict {
+        match &item_rep.verdict {
             ComparisonVerdict::Agree => {
                 if !compare_miri_and_anneal(&item_rep.miri, &item_rep.anneal).is_agree() {
                     let batch_miri_pos = match &item_rep.miri {
@@ -3807,7 +3809,7 @@ pub fn evaluate_miri_batches_with_options(
                     // stages the candidate alone), and the MIR neighborhood and
                     // kernel theorems of the oracle run that accepted it.
                     let reduced = shrink_res.as_ref().filter(|sr| sr.is_reduced());
-                    let eff_item_rep = reduced.map_or(&*item_rep, |sr| &sr.minimized_report);
+                    let eff_item_rep = reduced.map_or(item_rep, |sr| &sr.minimized_report);
                     item_kernel_confirmed = eff_item_rep.kernel_confirmed;
                     let eff_cand = reduced.map_or(*cand, |sr| &sr.minimized_candidate);
                     let eff_start_line = if reduced.is_some() {
@@ -3937,7 +3939,11 @@ pub fn evaluate_miri_batches_with_options(
                     }
                     findings.push(bundle);
                 }
-                item_rep.kernel_confirmed = item_kernel_confirmed;
+                // `item_rep` keeps describing the original candidate's oracle
+                // run (its `kernel_confirmed` is never overwritten), while the
+                // count follows the evidence each finding reports: the minimized
+                // reproducer when shrinking reduced the candidate, else the
+                // original.
                 if item_kernel_confirmed {
                     kernel_confirmed_divergences += 1;
                 }
@@ -5768,6 +5774,104 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         // `translate_span_to_repro` must not underflow when `batch_start_line < repro_start_line`.
         let translated = translate_span_to_repro(&lib_span(7), 5, 14);
         assert_eq!((translated.start_line, translated.end_line), (16, 16));
+    }
+
+    /// `ddmin` over generated multi-pass candidates whose chains synthesize the
+    /// Category 9 variants: a fake oracle reproduces the original discrepancy
+    /// signature exactly when the replayed program still contains the variant's
+    /// marker. The shrinker must return a replayable subsequence that keeps the
+    /// marker and is 1-minimal: replaying it with any single kept pass removed
+    /// loses the marker.
+    #[test]
+    fn ddmin_shrinks_category9_variant_chains_to_one_minimal_subsequences() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        const MARKERS: [&str; 6] = [
+            "helper_unwind_guarded(",
+            "helper_reborrow_return(",
+            "let __cp_copied: u32 = __cp_x;",
+            "NonCopyU32(",
+            "ctlz_nonzero(",
+            "write_bytes!(",
+        ];
+        let miri_msg = "constructing invalid value: encountered 0x02, but expected a boolean";
+        let anneal = AnnealOutcome::PassScalar {
+            bits: 1,
+            size_bytes: 4,
+        };
+        let mut covered = BTreeSet::new();
+        for batch_idx in 0..96usize {
+            for cand in generate_miri_corpus_batch(12, 0xC9D0_0000 + batch_idx as u64, batch_idx) {
+                if cand.applied_mutators.len() < 2 {
+                    continue;
+                }
+                let Some((base, steps)) = reconstruct_miri_mutation_steps(&cand, &seed_refs) else {
+                    continue;
+                };
+                let base_src = prettyplease::unparse(&base);
+                let Some(&marker) = MARKERS.iter().find(|m| {
+                    !covered.contains(*m) && cand.fn_source.contains(*m) && !base_src.contains(*m)
+                }) else {
+                    continue;
+                };
+                let original = missed_ub_report(&cand.fn_name, 50, miri_msg, anneal.clone(), true);
+                let res = minimize_miri_candidate_mutations_with_compile_check(
+                    &cand,
+                    &seed_refs,
+                    &original,
+                    |_| true,
+                    |sub| {
+                        Some(if sub.fn_source.contains(marker) {
+                            missed_ub_report(&sub.fn_name, 50, miri_msg, anneal.clone(), true)
+                        } else {
+                            agree_report(&sub.fn_name)
+                        })
+                    },
+                );
+                assert!(
+                    matches!(
+                        res.status,
+                        MiriShrinkStatus::Minimized | MiriShrinkStatus::AlreadyOneMinimal
+                    ),
+                    "`{marker}`: unexpected status {:?}",
+                    res.status
+                );
+                assert!(res.minimized_candidate.fn_source.contains(marker));
+                // Find the kept pass indices: the subsequences whose replay
+                // reproduces the minimized program byte for byte.
+                let n = steps.len();
+                let replay_mask = |mask: u32| {
+                    let kept: Vec<RecordedMutationStep> = (0..n)
+                        .filter(|i| mask & (1 << i) != 0)
+                        .map(|i| steps[i].clone())
+                        .collect();
+                    replay_miri_mutation_steps(&cand, &base, &kept)
+                };
+                let kept_masks: Vec<u32> = (0..(1u32 << n))
+                    .filter(|&mask| {
+                        replay_mask(mask).fn_source == res.minimized_candidate.fn_source
+                    })
+                    .collect();
+                assert!(
+                    !kept_masks.is_empty(),
+                    "`{marker}`: the minimized program is not a replayable subsequence"
+                );
+                assert!(
+                    kept_masks.iter().any(|&mask| {
+                        (0..n)
+                            .filter(|i| mask & (1 << i) != 0)
+                            .all(|i| !replay_mask(mask & !(1 << i)).fn_source.contains(marker))
+                    }),
+                    "`{marker}`: minimized chain {:?} is not 1-minimal",
+                    res.minimized_mutator_chain
+                );
+                covered.insert(marker);
+            }
+        }
+        assert!(
+            covered.len() == MARKERS.len(),
+            "expected ddmin coverage of every Category 9 variant, covered {covered:?}"
+        );
     }
 
     #[test]

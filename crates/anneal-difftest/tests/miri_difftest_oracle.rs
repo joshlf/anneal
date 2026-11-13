@@ -2483,10 +2483,10 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 ///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
 ///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
 ///   faults.
-/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): the
-///   misdirected write conflicts with the caller's unused `&x` borrow entry,
-///   which is matched by local index (without that borrow the write is
-///   silently lost instead).
+/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): see
+///   the raw-pointer sibling roots below; without the caller's `&x` the
+///   callee's write proceeds but is misdirected into its own frame (a silent
+///   `wrong_value`, Anneal `13` vs Miri `10`).
 /// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
 ///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
 ///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
@@ -2494,12 +2494,20 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 ///   reaches `x` or its borrow tree (and the capture emits no
 ///   `Retag(FnEntry)`, so no protector exists either).
 ///
+/// Raw-pointer sibling roots (no call needed): `&raw mut x` mints its own root
+/// borrow entry, and creating a later `&x` (a sibling root whose retag reads
+/// `x`) freezes it as a foreign read, so any later write through the raw
+/// pointer is UB in Anneal; Miri passes, because the raw pointer keeps `x`'s
+/// tag and the write only disables `&x`:
+/// - `cat9_gap_raw_write_after_unused_shared_borrow` (`false_positive_ub`): the
+///   minimal single-frame witness, with `&x` never used.
+/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): the
+///   frozen raw pointer is written inside a callee.
+/// - `cat9_gap_post_return_raw_write_after_ref_arg` (`false_positive_ub`): `&x`
+///   is a call argument and the raw write follows the call (it reproduces with
+///   a callee whose only locals are `_0` and `_r`).
+///
 /// Other pins:
-/// - `cat9_gap_post_return_raw_write_after_ref_arg` (`false_positive_ub`): a
-///   raw-pointer write to `x` in the caller after a callee that received `&x`
-///   has returned is UB in Anneal; this does not depend on local-index
-///   collisions (it reproduces with a callee whose only locals are `_0` and
-///   `_r`).
 /// - `cat9_in_scope_move_raw_read_conservative` (`false_positive_ub`): Anneal
 ///   de-initializes the source of `Operand::Move`; Miri evaluates
 ///   `Operand::Move` like `Operand::Copy`.
@@ -2724,6 +2732,19 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
 }
 "#,
         ),
+        (
+            "cat9_gap_raw_write_after_unused_shared_borrow",
+            r#"pub fn cat9_gap_raw_write_after_unused_shared_borrow() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let _r: &u32 = &x;
+    unsafe {
+        *raw = 11u32;
+        *raw
+    }
+}
+"#,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -2761,15 +2782,15 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     )
     .expect("evaluate Category 9 live batch");
 
-    assert_eq!(report.total_candidates, 13);
-    assert_eq!(report.compiled_candidates, 13);
+    assert_eq!(report.total_candidates, 14);
+    assert_eq!(report.compiled_candidates, 14);
     assert_eq!(report.agree_count, 5, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 8, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 9, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
         ("unsound_missed_fault", 2usize),
-        ("sound_conservative_abstraction", 4),
+        ("sound_conservative_abstraction", 5),
         ("value_mismatch", 2),
         ("harness_or_extraction_error", 0),
     ] {
@@ -2780,8 +2801,20 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 8);
-    assert_eq!(report.kernel_confirmed_divergences, 8);
+    assert_eq!(report.findings.len(), 9);
+    assert_eq!(report.kernel_confirmed_divergences, 9);
+    // With no shrinkable mutator chain, every finding reports its original
+    // candidate, so each original item report is itself kernel-confirmed.
+    for f in &report.findings {
+        assert!(
+            report
+                .item_reports
+                .iter()
+                .any(|r| r.name == f.fn_name && r.kernel_confirmed),
+            "item report for `{}` must stay kernel-confirmed",
+            f.fn_name
+        );
+    }
     for f in &report.findings {
         assert!(f.kernel_confirmed, "finding `{}` must be kernel-confirmed", f.fn_name);
         assert_eq!(
@@ -2885,6 +2918,7 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
         ("cat9_gap_callee_deref_ref_arg", 11, "    *r + bonus"),
         ("cat9_gap_callee_raw_write_with_caller_borrow", 10, "        *alias = 7u32;"),
         ("cat9_gap_post_return_raw_write_after_ref_arg", 10, "        *raw = 7u32 + seen;"),
+        ("cat9_gap_raw_write_after_unused_shared_borrow", 11, "        *raw = 11u32;"),
     ] {
         let f = finding(name);
         assert_eq!(f.divergence_class, "false_positive_ub", "`{name}`");

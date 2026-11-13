@@ -491,6 +491,65 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     let dot_anneal = temp_corpus.join(".anneal");
     let verify_dir = dot_anneal.join("generated/Verify/MiriDiffCorpus");
 
+    // Category 9's `Operand::Move` seeds move non-`Copy` `NonCopyU32` values, so
+    // the captured MIR that Anneal's kernel evaluates must move the source
+    // place, never copy it. The explicit-assignment contrast never moves `x`.
+    let mir_dir = dot_anneal.join("generated/Mir/MiriDiffCorpus");
+    let captured_mir = |name: &str| {
+        fs::read_to_string(mir_dir.join(format!("{name}.lean")))
+            .unwrap_or_else(|e| panic!("read captured MIR of `{name}`: {e}"))
+    };
+    let local_index = |mir: &str, debug_name: &str| {
+        let decls = mir
+            .lines()
+            .find(|l| l.trim_start().starts_with("localDecls :="))
+            .expect("captured MIR has localDecls");
+        let needle = format!("debugName := (Option.some \"{debug_name}\")");
+        assert_eq!(
+            decls.matches(&needle).count(),
+            1,
+            "`{debug_name}` must be one local"
+        );
+        decls[..decls.find(&needle).expect("local present")]
+            .matches("debugName :=")
+            .count()
+    };
+    for (name, source, projection) in [
+        (
+            "pass_move_deinit_preserves_reserved_child",
+            "x",
+            "List.nil }",
+        ),
+        (
+            "pass_move_deinit_subplace_preserves_sibling_frozen",
+            "p",
+            "(List.cons (ProjectionElem.field 0 ",
+        ),
+        ("ub_move_deinit_read_source_uninit", "x", "List.nil }"),
+    ] {
+        let mir = captured_mir(name);
+        let idx = local_index(&mir, source);
+        let operand =
+            |kind: &str| format!("Operand.{kind} {{ local_ := {idx}, projection := {projection}");
+        assert_eq!(
+            mir.matches(&operand("move")).count(),
+            1,
+            "`{name}` must move `{source}` (`_{idx}`) exactly once:\n{mir}"
+        );
+        assert!(
+            !mir.contains(&operand("copy")),
+            "`{name}` must not copy `{source}` (`_{idx}`):\n{mir}"
+        );
+    }
+    let assign_mir = captured_mir("ub_assign_after_reborrow_disables_child");
+    let assign_x = local_index(&assign_mir, "x");
+    assert!(
+        !assign_mir.contains(&format!(
+            "Operand.move {{ local_ := {assign_x}, projection := List.nil }}"
+        )),
+        "`ub_assign_after_reborrow_disables_child` must assign `x`, never move it:\n{assign_mir}"
+    );
+
     // The retired bug's certificate links only the captured `helper_add_ten`
     // body, through the general bounded combinator rather than the
     // callee-free point combinator.
