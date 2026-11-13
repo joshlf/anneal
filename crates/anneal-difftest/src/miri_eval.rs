@@ -103,7 +103,11 @@ pub const WITNESS_POLARITY_NAMES: [&str; 4] = [
 ///   normally and Anneal returns a different value, returns `pass:other`,
 ///   aborts, or panics (`wrong_value`, `return_vs_panic`), or both report the
 ///   same fault class at incompatible (or missing) source locations
-///   (`ub_location_mismatch`, `panic_site_mismatch`).
+///   (`ub_location_mismatch`, `panic_site_mismatch`). The class is not
+///   directional, but it is not benign either: a `wrong_value` means Anneal
+///   computed a result the program does not produce (for example, through the
+///   Category 9 frame-relative pointer gap in `tests/miri-diff/README.md`), so
+///   any value-level claim resting on it is unsound and needs triage.
 /// - [`WitnessPolarity::HarnessOrExtractionError`]
 ///   (`"harness_or_extraction_error"`): no semantic comparison was possible: a
 ///   candidate compile failure, Miri oracle error, MIR capture or Lean probe
@@ -2893,6 +2897,55 @@ fn acquire_live_lean_oracle_lock() -> (
     (guard, lock_file)
 }
 
+/// Lean's per-process memory cap (`lean -M`, in MiB) for kernel confirmation
+/// runs of `oracle/MiriOracleConfirm.lean`.
+const CONFIRM_LEAN_MEMORY_MB: &str = "4096";
+
+/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB oracle/MiriOracleConfirm.lean`
+/// in `dot_anneal`.
+fn run_lean_confirm_module(
+    lake_bin: &Path,
+    dot_anneal: &Path,
+) -> Result<std::process::Output, String> {
+    Command::new(lake_bin)
+        .current_dir(dot_anneal)
+        .arg("env")
+        .arg("lean")
+        .arg("-M")
+        .arg(CONFIRM_LEAN_MEMORY_MB)
+        .arg("oracle/MiriOracleConfirm.lean")
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
+                 oracle/MiriOracleConfirm.lean': {err}",
+                lake_bin.display()
+            )
+        })
+}
+
+/// Whether a failed Lean kernel confirmation run ran out of a resource
+/// (Lean's `-M` memory cap, `maxHeartbeats`, recursion depth, the stack, or
+/// termination by a signal such as the OOM killer) rather than rejecting a
+/// theorem.
+///
+/// Only resource exhaustion may downgrade a divergence to
+/// `kernel_confirmed = false`. Any other failure (a `rfl` mismatch between the
+/// compiled `#eval` probe and the kernel, or an elaboration or import error)
+/// is a harness inconsistency that must abort the run.
+fn lean_confirm_failure_is_resource_exhaustion(signal_terminated: bool, output: &str) -> bool {
+    const RESOURCE_MARKERS: [&str; 6] = [
+        "out of memory",
+        "(deterministic) timeout",
+        "maximum number of heartbeats",
+        "maximum recursion depth",
+        "deep recursion",
+        "stack overflow",
+    ];
+    let lower = output.to_ascii_lowercase();
+    signal_terminated || RESOURCE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn run_linked_difftest_oracle_pipeline(
     config: &DifftestOracleConfig,
     items: &[OracleItemSpec],
@@ -3167,80 +3220,65 @@ fn run_linked_difftest_oracle_pipeline(
         fs::create_dir_all(&oracle_dir)
             .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
         let confirm_path = oracle_dir.join("MiriOracleConfirm.lean");
-        let confirm_src = render_linked_anneal_confirm_module(
-            &crate_camel,
-            &to_confirm,
-            &helper_module_suffixes,
-            &anneal_panic_frames,
-            &anneal_panic_messages,
-        )?;
-        fs::write(&confirm_path, &confirm_src)
-            .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
+        let write_confirm_module = |entries: &[(OracleItemSpec, String, AnnealOutcome)]| {
+            let src = render_linked_anneal_confirm_module(
+                &crate_camel,
+                entries,
+                &helper_module_suffixes,
+                &anneal_panic_frames,
+                &anneal_panic_messages,
+            )?;
+            fs::write(&confirm_path, &src)
+                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))
+        };
+        write_confirm_module(&to_confirm)?;
 
         let _lean_guard = acquire_live_lean_oracle_lock();
-        let confirm_out = Command::new(&lake_bin)
-            .current_dir(&dot_anneal)
-            .arg("env")
-            .arg("lean")
-            .arg("-M")
-            .arg("4096")
-            .arg("oracle/MiriOracleConfirm.lean")
-            .output()
-            .map_err(|err| {
-                format!(
-                    "failed to execute '{} env lean -M 4096 oracle/MiriOracleConfirm.lean': {}",
-                    lake_bin.display(),
-                    err
-                )
-            })?;
-        if confirm_out.status.success() {
-            Some(confirm_path)
-        } else if to_confirm.len() == 1 {
-            let stdout = String::from_utf8_lossy(&confirm_out.stdout);
-            let stderr = String::from_utf8_lossy(&confirm_out.stderr);
-            return Err(format!(
-                "Lean kernel confirmation failed in {} ({}):\n{}\n{}",
-                confirm_path.display(),
-                confirm_out.status,
-                stdout,
-                stderr
-            ));
+        let batch_out = run_lean_confirm_module(&lake_bin, &dot_anneal)?;
+        if batch_out.status.success() {
+            Some(confirm_path.clone())
         } else {
-            // Isolate per-item kernel confirmation so a single candidate whose
-            // `by rfl` exceeds `-M 4096` marks only itself `kernel_confirmed = false`
-            // instead of aborting the entire batch.
+            // Re-confirm one item at a time. An item whose kernel confirmation
+            // exhausts a resource (`lean -M`, heartbeats, recursion depth, or a
+            // signal) is reported with `kernel_confirmed = false`; any other
+            // failure means the kernel rejected a theorem that the compiled
+            // probe produced (or the module did not elaborate), which is a
+            // harness inconsistency, so the run still fails closed.
             let mut confirmed_items = Vec::new();
             let mut unconfirmed_names = BTreeSet::new();
-            for entry in &to_confirm {
-                let single_src = render_linked_anneal_confirm_module(
-                    &crate_camel,
-                    std::slice::from_ref(entry),
-                    &helper_module_suffixes,
-                    &anneal_panic_frames,
-                    &anneal_panic_messages,
-                )?;
-                fs::write(&confirm_path, &single_src).map_err(|err| {
-                    format!("failed to write {}: {}", confirm_path.display(), err)
-                })?;
-                let single_out = Command::new(&lake_bin)
-                    .current_dir(&dot_anneal)
-                    .arg("env")
-                    .arg("lean")
-                    .arg("-M")
-                    .arg("4096")
-                    .arg("oracle/MiriOracleConfirm.lean")
-                    .output()
-                    .map_err(|err| {
-                        format!(
-                            "failed to execute '{} env lean -M 4096 oracle/MiriOracleConfirm.lean': {}",
-                            lake_bin.display(),
-                            err
-                        )
-                    })?;
-                if single_out.status.success() {
-                    confirmed_items.push(entry.clone());
+            let single_runs: Vec<(&(OracleItemSpec, String, AnnealOutcome), std::process::Output)> =
+                if to_confirm.len() == 1 {
+                    vec![(&to_confirm[0], batch_out)]
                 } else {
+                    let mut runs = Vec::with_capacity(to_confirm.len());
+                    for entry in &to_confirm {
+                        write_confirm_module(std::slice::from_ref(entry))?;
+                        runs.push((entry, run_lean_confirm_module(&lake_bin, &dot_anneal)?));
+                    }
+                    runs
+                };
+            for (entry, out) in single_runs {
+                if out.status.success() {
+                    confirmed_items.push(entry.clone());
+                    continue;
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let signal_terminated = out.status.code().is_none();
+                if lean_confirm_failure_is_resource_exhaustion(
+                    signal_terminated,
+                    &format!("{stdout}\n{stderr}"),
+                ) {
                     unconfirmed_names.insert(entry.0.name.clone());
+                } else {
+                    return Err(format!(
+                        "Lean kernel confirmation rejected `{}` in {} ({}):\n{}\n{}",
+                        entry.0.name,
+                        confirm_path.display(),
+                        out.status,
+                        stdout,
+                        stderr
+                    ));
                 }
             }
             for rep in &mut reports {
@@ -3249,26 +3287,12 @@ fn run_linked_difftest_oracle_pipeline(
                 }
             }
             if confirmed_items.is_empty() {
-                let stdout = String::from_utf8_lossy(&confirm_out.stdout);
-                let stderr = String::from_utf8_lossy(&confirm_out.stderr);
-                return Err(format!(
-                    "Lean kernel confirmation failed in {} ({}):\n{}\n{}",
-                    confirm_path.display(),
-                    confirm_out.status,
-                    stdout,
-                    stderr
-                ));
+                let _ = fs::remove_file(&confirm_path);
+                None
+            } else {
+                write_confirm_module(&confirmed_items)?;
+                Some(confirm_path.clone())
             }
-            let merged_src = render_linked_anneal_confirm_module(
-                &crate_camel,
-                &confirmed_items,
-                &helper_module_suffixes,
-                &anneal_panic_frames,
-                &anneal_panic_messages,
-            )?;
-            fs::write(&confirm_path, &merged_src)
-                .map_err(|err| format!("failed to write {}: {}", confirm_path.display(), err))?;
-            Some(confirm_path)
         }
     };
 
@@ -7600,6 +7624,42 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             assert!(
                 !subset_reached.contains(unrelated),
                 "subset run unexpectedly linked {unrelated}: {subset_reached:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lean_confirm_failures_downgrade_only_on_resource_exhaustion() {
+        for (signal, output) in [
+            (
+                false,
+                "MiriOracleConfirm.lean:220:2: error: (deterministic) timeout at `whnf`, maximum \
+                 number of heartbeats (2000000) has been reached\nUse `set_option maxHeartbeats \
+                 <num>` to set the limit.",
+            ),
+            (false, "INTERNAL PANIC: out of memory"),
+            (false, "error: (kernel) deep recursion detected"),
+            (false, "error: maximum recursion depth has been reached"),
+            (false, "Stack overflow detected. Aborting."),
+            (true, ""),
+        ] {
+            assert!(
+                lean_confirm_failure_is_resource_exhaustion(signal, output),
+                "resource exhaustion not recognized: signal={signal} output={output:?}"
+            );
+        }
+        for output in [
+            "MiriOracleConfirm.lean:221:2: error: The rfl tactic failed. Possible reasons:\n- The \
+             goal is not a reflexive relation",
+            "error: type mismatch\n  rfl\nhas type\n  evalMirDiffTagBounded 512 body s = \
+             evalMirDiffTagBounded 512 body s : Prop\nbut is expected to have type\n  \
+             evalMirDiffTagBounded 512 body s = MirDiffTag.ub : Prop",
+            "error: unknown identifier 'Mir.MiriDiffCorpus.cand.body'",
+            "error: unknown module prefix 'Mir'",
+        ] {
+            assert!(
+                !lean_confirm_failure_is_resource_exhaustion(false, output),
+                "a rejected or ill-formed confirmation must abort, not downgrade: {output:?}"
             );
         }
     }

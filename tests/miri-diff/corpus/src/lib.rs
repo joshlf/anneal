@@ -891,10 +891,10 @@ pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
 // differential suite links their captured bodies as intra-crate callees rather
 // than treating them as standalone zero-argument test entry points.
 //
-// Anneal currently mishandles memory that a reference argument points into
-// across a call boundary (see "Category 9 engine gaps" in
-// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins all five gaps
-// with live kernel confirmation). Every helper here therefore takes its
+// Inside a callee, Anneal resolves any pointer into the caller's frame against
+// the callee's own locals (see "Category 9 engine gaps" in
+// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins each gap with
+// live kernel confirmation). Every helper here therefore takes its
 // `FnEntry`-protected reference without dereferencing it, and only forwards or
 // returns reborrows of it: these seeds check reference-argument passing,
 // reborrow return, frame cleanup, and unwinding, not protector enforcement.

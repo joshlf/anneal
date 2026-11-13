@@ -2469,36 +2469,42 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 /// classified by `WitnessPolarity`, and `witness_polarity_counts` satisfies the
 /// accounting identity.
 ///
-/// Pinned `sound_conservative_abstraction` (`false_positive_ub`) gaps:
-/// - `cat9_gap_callee_deref_ref_arg`: `pushCalleeFrame` saves caller locals on
-///   `s.memory.callStack` leaving `s.memory.callerLocals = []`, and
-///   `BorrowEntry.targetLocal : LocalIdx` is an unqualified local index into
-///   `s.frame.locals`, so dereferencing a reference argument in a callee whose
-///   local at `entry.targetLocal` has an incompatible type/layout faults in
-///   Anneal where Miri passes.
-/// - `cat9_gap_callee_raw_write_with_caller_borrow`: a callee writing through a
-///   raw pointer whose `BorrowEntry.targetLocal` aliases a caller local with an
-///   active `Frozen` borrow entry in `s.memory.borrows` (or a callee local of
-///   incompatible layout) is UB in Anneal where Miri passes.
-/// - `cat9_gap_post_return_raw_write_after_ref_arg`: after `&x` was passed to a
-///   callee that has returned, a raw-pointer write to `x` in the caller still
-///   sees the `Frozen` borrow entry from `&x` in `s.memory.borrows` and faults
-///   in Anneal where Miri passes.
-/// - `cat9_in_scope_move_raw_read_conservative`: Anneal de-initializes the
-///   source of `Operand::Move`; Miri evaluates `Operand::Move` like
-///   `Operand::Copy`.
+/// Frame-relative pointer resolution: `BorrowEntry.targetLocal` is an index
+/// into the *running* frame's locals (`get? locals entry.targetLocal`, falling
+/// back to `memory.callerLocals`, which `pushCalleeFrame` never populates), so
+/// inside a callee a pointer to the caller's local `_k` resolves to the
+/// callee's own local `_k`:
+/// - `cat9_gap_callee_raw_read_wrong_value` / `cat9_gap_callee_raw_write_wrong_value`
+///   (`wrong_value`, `value_mismatch`): with the caller's `x` and the callee's
+///   `u32` parameter `pad2` both at local `_3`, the callee reads `pad2` (`200`)
+///   instead of `x` (`10`), and its write lands in `pad2`, leaving `x`
+///   unchanged (Anneal `13` vs Miri `11`): silent wrong values.
+/// - `cat9_gap_callee_deref_ref_arg` (`false_positive_ub`,
+///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
+///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
+///   faults.
+/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): the
+///   misdirected write conflicts with the caller's unused `&x` borrow entry,
+///   which is matched by local index (without that borrow the write is
+///   silently lost instead).
+/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
+///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
+///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
+///   write lands in the callee's `_slot_pad` (local `_3`, like `x`), so it never
+///   reaches `x` or its borrow tree (and the capture emits no
+///   `Retag(FnEntry)`, so no protector exists either).
 ///
-/// Pinned `unsound_missed_fault` (`missed_ub`) gaps:
-/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub`: passing a reference
-///   reborrowed from a raw pointer (`&*raw`) alongside `raw` to a callee that
-///   writes `*raw` during the call (`fn f(_r: &u32, alias: *mut u32, _slot_pad: u32)`)
-///   triggers a `RetagKind::FnEntry` protector violation in Miri, whereas
-///   Anneal (`rustc-capture` with `-Zmir-opt-level=0`, which emits no
-///   `StatementKind::Retag(FnEntry)` in the callee) puts no `FnEntry` protector
-///   on `&*raw` and passes when `x`'s `targetLocal` (`_3`) aligns with a `u32`
-///   slot (`_3`) in the callee frame.
-/// - `cat9_provenance_overwritten_byte_missed_ub`: overwriting one byte of a
-///   pointer strips provenance in Miri; Anneal preserves pointer provenance.
+/// Other pins:
+/// - `cat9_gap_post_return_raw_write_after_ref_arg` (`false_positive_ub`): a
+///   raw-pointer write to `x` in the caller after a callee that received `&x`
+///   has returned is UB in Anneal; this does not depend on local-index
+///   collisions (it reproduces with a callee whose only locals are `_0` and
+///   `_r`).
+/// - `cat9_in_scope_move_raw_read_conservative` (`false_positive_ub`): Anneal
+///   de-initializes the source of `Operand::Move`; Miri evaluates
+///   `Operand::Move` like `Operand::Copy`.
+/// - `cat9_provenance_overwritten_byte_missed_ub` (`missed_ub`): overwriting one
+///   byte of a pointer strips its provenance in Miri; Anneal keeps it.
 #[test]
 fn ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live() {
     let dir = unique_temp_dir("ep1_cat9");
@@ -2632,6 +2638,43 @@ pub fn cat9_gap_fn_entry_protector_raw_reborrow_missed_ub() -> u32 {
 "#,
         ),
         (
+            "cat9_gap_callee_raw_read_wrong_value",
+            r#"#[inline(never)]
+fn cat9_gap_read_through_raw_arg(alias: *const u32, pad: u32, pad2: u32) -> u32 {
+    let seen: u32 = unsafe { *alias };
+    seen + (pad & 0u32) + (pad2 & 0u32)
+}
+
+pub fn cat9_gap_callee_raw_read_wrong_value() -> u32 {
+    let _p1: u32 = 1u32;
+    let _p2: u32 = 2u32;
+    let x: u32 = 10u32;
+    let raw: *const u32 = &raw const x;
+    cat9_gap_read_through_raw_arg(raw, 100u32, 200u32)
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_write_wrong_value",
+            r#"#[inline(never)]
+fn cat9_gap_write_through_raw_arg(alias: *mut u32, pad: u32, pad2: u32) -> u32 {
+    unsafe {
+        *alias = 8u32;
+    }
+    3u32 + (pad & 0u32) + (pad2 & 0u32)
+}
+
+pub fn cat9_gap_callee_raw_write_wrong_value() -> u32 {
+    let _p1: u32 = 1u32;
+    let _p2: u32 = 2u32;
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_write_through_raw_arg(raw, 100u32, 200u32);
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
             "cat9_gap_callee_deref_ref_arg",
             r#"#[inline(never)]
 fn cat9_gap_read_ref_arg(r: &u32, bonus: u32) -> u32 {
@@ -2718,16 +2761,16 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
     )
     .expect("evaluate Category 9 live batch");
 
-    assert_eq!(report.total_candidates, 11);
-    assert_eq!(report.compiled_candidates, 11);
+    assert_eq!(report.total_candidates, 13);
+    assert_eq!(report.compiled_candidates, 13);
     assert_eq!(report.agree_count, 5, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 6, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 8, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
         ("unsound_missed_fault", 2usize),
         ("sound_conservative_abstraction", 4),
-        ("value_mismatch", 0),
+        ("value_mismatch", 2),
         ("harness_or_extraction_error", 0),
     ] {
         assert_eq!(
@@ -2737,7 +2780,8 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 6);
+    assert_eq!(report.findings.len(), 8);
+    assert_eq!(report.kernel_confirmed_divergences, 8);
     for f in &report.findings {
         assert!(f.kernel_confirmed, "finding `{}` must be kernel-confirmed", f.fn_name);
         assert_eq!(
@@ -2805,6 +2849,34 @@ pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
             size_bytes: 4
         }
     );
+
+    // Frame-relative pointer resolution yields silent wrong values: the callee
+    // reads (and writes) its own `pad2` at local `_3` instead of the caller's
+    // `x` at local `_3`.
+    for (name, miri_bits, anneal_bits) in [
+        ("cat9_gap_callee_raw_read_wrong_value", 10u128, 200u128),
+        ("cat9_gap_callee_raw_write_wrong_value", 11, 13),
+    ] {
+        let f = finding(name);
+        assert_eq!(f.divergence_class, "wrong_value", "`{name}`");
+        assert_eq!(f.witness_polarity, "value_mismatch", "`{name}`");
+        let rep = item(name);
+        assert_eq!(
+            (&rep.miri, &rep.anneal),
+            (
+                &MiriOutcome::PassScalar {
+                    bits: miri_bits,
+                    size_bytes: 4
+                },
+                &AnnealOutcome::PassScalar {
+                    bits: anneal_bits,
+                    size_bytes: 4
+                }
+            ),
+            "known Category 9 frame-relative pointer gap `{name}` changed (fixed?); update the \
+             pin and tests/miri-diff/README.md"
+        );
+    }
 
     // Each conservative pin is a Miri pass and an Anneal UB at exactly the
     // documented statement.

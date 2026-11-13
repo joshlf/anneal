@@ -124,45 +124,61 @@ memory intrinsics:
 Category 9 leaves out the following constructs, on which Anneal currently
 disagrees with Miri. `ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live`
 in [`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
-pins all five, kernel-confirmed (`4` `sound_conservative_abstraction` and `1`
-`unsound_missed_fault`, alongside the provenance `unsound_missed_fault` pin).
-`miri-difftest` mutators avoid all five: no Category 9 helper dereferences a
-reference argument, so the call-chain tests check reference passing, reborrow
-return, frame cleanup, and unwinding, but not Anneal's `FnEntry` protector
-enforcement.
+pins each one, kernel-confirmed, with its exact Miri and Anneal outcomes.
+`miri-difftest` mutators avoid them all: no Category 9 helper or template
+accesses memory through a pointer into its caller's frame, so the call-chain
+tests check reference passing, reborrow return, frame cleanup, and unwinding,
+but not Anneal's `FnEntry` protector enforcement.
 
-- A callee that dereferences a reference argument pointing into its caller's
-  frame (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as
-  `f(&x, 1)`): Miri passes, and Anneal reports UB at the dereference because
-  `pushCalleeFrame` saves the caller's locals on `s.memory.callStack` leaving
-  `s.memory.callerLocals = []` and `BorrowEntry.targetLocal` indexes into the
-  callee's own `s.frame.locals[targetLocal]`.
-- A callee that writes caller memory through a raw pointer while the caller
-  holds a shared borrow of it (`let _r = &x; f(raw)`): Miri passes, and Anneal
-  reports UB at the write because `&x`'s `Frozen` borrow entry remains active
-  in `s.memory.borrows` and `targetLocal` indexes into `s.frame.locals`.
+**Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
+local index into the *running* frame (`get? locals entry.targetLocal`, falling
+back to `memory.callerLocals`, which `pushCalleeFrame` never populates). Inside
+a callee, a reference or raw pointer to the caller's local `_k` therefore
+resolves to the callee's own local `_k`:
+
+- Silent wrong values (`wrong_value`, `value_mismatch`): when the caller's `x`
+  and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
+  through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
+  callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
+  Miri `11`).
+- False UB (`false_positive_ub`): a callee dereferencing a reference argument
+  (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
+  `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
+  A callee writing through a raw pointer to `x` while the caller holds an
+  unused shared borrow of `x` (`let _r = &x; f(raw)`) faults because the
+  misdirected write conflicts with that borrow's entry, which is matched by
+  local index; without the caller's borrow the same write is silently lost
+  (Anneal `13`, Miri `10`). Both pass in Miri.
+- Missed UB (`missed_ub`, `unsound_missed_fault`): Miri reports a
+  `RetagKind::FnEntry` protector violation when a callee writes through `raw`
+  while `&*raw` (or `&mut *raw`) is one of its arguments. In Anneal the write
+  lands in the callee's local with `x`'s index (the pin pads the callee so that
+  local is a `u32`), never reaching `x` or its borrow tree; the MIR capture
+  also emits no `Retag(FnEntry)`, so no protector would exist anyway. When the
+  colliding local is instead an 8-byte reference whose `ScalarLayout` has
+  `validRange.end_ = u64::MAX`, the 4-byte write sends the Lean kernel's
+  `by rfl` confirmation into byte-level re-decoding, which exhausts memory.
+  Passing `&x` or `&mut x` directly agrees with Miri (both report UB at the
+  write), but only because of the false-UB item above, not because of a
+  protector.
+
+**Other gaps.**
+
 - A write to `x` through a raw pointer in the caller after a callee that
-  received `&x` has returned: Miri passes (the callee's protector is released
-  on return, and `_r` was only a call temporary), and Anneal reports UB at the
-  write because `&x`'s `Frozen` borrow entry remains active in
-  `s.memory.borrows`.
+  received `&x` has returned: Miri passes (the protector is released on
+  return), and Anneal reports UB at the write. This gap does not depend on
+  local-index collisions: it reproduces with a callee whose only locals are
+  `_0` and `_r`.
 - A raw-pointer read of a moved-from local that is still in scope: Miri passes
   (it evaluates `Operand::Move` like `Operand::Copy`), and Anneal reports UB
   because it de-initializes the moved-from place.
-- A foreign write, during the call, to a reference argument reborrowed from a
-  raw pointer (`f(&*raw, raw, pad)` or `f(&mut *raw, raw, pad)`, where `f`
-  writes through `raw`): Miri reports a `RetagKind::FnEntry` protector violation
-  at the write, and Anneal passes (`missed_ub`, an `unsound_missed_fault`,
-  pinned live in `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` when the
-  caller local `x` at `_3` aligns with a `u32` parameter slot `_3` in the
-  callee; when `targetLocal` instead collides with an 8-byte reference slot in
-  the callee whose `ScalarLayout` carries `validRange.end_ = u64::MAX`, a 4-byte
-  write triggers byte-level layout re-decoding). `rustc-capture` with
-  `-Zmir-opt-level=0` does not emit `StatementKind::Retag(FnEntry)` on callee
-  entry, so Anneal puts no `FnEntry` protector on `&*raw`. Passing `&x` or
-  `&mut x` directly agrees (both report UB at the write), because `&x`'s borrow
-  entry in `s.memory.borrows` already faults on the raw write without a
-  protector.
+
+`miri-difftest` confirms each divergence in the Lean kernel with
+`lean -M 4096`. When the batched confirmation fails, every divergence is
+re-confirmed on its own: an item that exhausts a resource (`-M`, heartbeats,
+recursion depth, the stack, or a signal) is reported with
+`kernel_confirmed = false`, and any other failure (a theorem the kernel
+rejects, or an elaboration error) still aborts the run.
 
 ## Policy on `known_anneal_bug` Entries
 
