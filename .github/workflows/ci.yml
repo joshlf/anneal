@@ -266,9 +266,11 @@ jobs:
           tools_root="$(mktemp -d "$RUNNER_TEMP/anneal-tools.XXXXXX")"
           cargo install --locked --debug --path trusted/cargo-anneal \
             --root "$tools_root"
-          printf 'ANNEAL_TEST_CARGO_ANNEAL=%s/bin/cargo-anneal\n' \
-            "$tools_root" >> "$GITHUB_ENV"
-          printf 'ANNEAL_TEST_TOOLS_ROOT=%s\n' "$tools_root" >> "$GITHUB_ENV"
+          {
+            printf 'ANNEAL_TEST_CARGO_ANNEAL=%s/bin/cargo-anneal\n' "$tools_root"
+            printf 'ANNEAL_MVP_CLI=%s/bin/cargo-anneal\n' "$tools_root"
+            printf 'ANNEAL_TEST_TOOLS_ROOT=%s\n' "$tools_root"
+          } >> "$GITHUB_ENV"
           printf 'tools_root=%s\n' "$tools_root"
 
       - name: Install exocrate toolchain from local archive
@@ -430,6 +432,37 @@ jobs:
             "$ANNEAL_TEST_DIAGNOSTICS/installed-smoke-selection.stdout"
           cargo test --locked -p cargo-anneal --test installed_smoke -- \
             --ignored --exact installed_smoke --nocapture
+
+      # unittest discovery imports this helper without running main. Keep
+      # the direct invocation so production proofs and fresh source
+      # mutations remain a required part of this verification job.
+      - name: Verify original Starnix sources and reject fresh mutations
+        id: production
+        # The script is outside trusted/; strip cache and artifact credentials.
+        env:
+          ACTIONS_CACHE_URL: ''
+          ACTIONS_RESULTS_URL: ''
+          ACTIONS_RUNTIME_TOKEN: ''
+        run: |
+          set -euo pipefail
+          exec > >(tee "$ANNEAL_TEST_DIAGNOSTICS/production.log") 2>&1
+          python3 ci/test_mvp_starnix.py \
+            --cli "$ANNEAL_MVP_CLI" \
+            --capture "$ANNEAL_MVP_CAPTURE" \
+            --sysroot "$ANNEAL_MVP_SYSROOT" \
+            --lean "$ANNEAL_MVP_LEAN" \
+            --artifacts-dir "$RUNNER_TEMP/starnix-evidence"
+
+      # Preserve rejected receipts and generator logs on failure too, so an
+      # operational error can be distinguished from the expected rejection.
+      - name: Retain production proof and mutation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: starnix-verification-evidence
+          path: ${{ runner.temp }}/starnix-evidence
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Verify clean working tree
         id: clean_tree
