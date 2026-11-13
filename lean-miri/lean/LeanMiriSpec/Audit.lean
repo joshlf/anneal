@@ -22911,6 +22911,24 @@ example :
       (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub :=
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
 
+open WitnessLM4_2 in
+example :
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
+
 example {s : MachineState} {body : CapturedMir} {term : Terminator}
     {c : ConstOperand} {argOps : List MirAst.Operand} {destination : Place}
     {targetBb : BasicBlockIdx} {unwind : UnwindAction}
@@ -23304,6 +23322,9 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_adt_pointee_stage1_copy_offset
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps
+  WitnessLM4_2.partialCopyDecls
+  WitnessLM4_2.partialCopyState
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_distinct_oob_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_stage1_rawPtr_ok
 

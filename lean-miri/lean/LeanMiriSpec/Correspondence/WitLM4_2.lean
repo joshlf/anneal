@@ -37,7 +37,8 @@ simulation theorems, and in explicitly labeled contrast conjuncts.
   programs on which Stage-1 `Trusted` and canonical `lean-miri` disagree —
   Stage-1 accepts zero-count misaligned and out-of-bounds copies that Miri
   rejects, rejects same-tag disjoint copies that Miri accepts, stores an
-  ill-sized value on cross-type copies, and rejects uninitialized-source and
+  ill-sized value on cross-type copies, clobbers the whole destination on
+  partial distinct-local copies, and rejects uninitialized-source and
   Tree Borrows-forbidden copies that the vendored hooks allow.
 -/
 
@@ -4026,6 +4027,53 @@ theorem wit_lm4_2_copy_nonoverlapping_count2_oob_stage1_steps :
       (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub := by
   intro decls st
   exact ⟨⟨_, rfl, rfl⟩, rfl⟩
+
+/-- Locals of `wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers`:
+`_1 : u64`, `_2 : u64`, `_3 : *const u8`, `_4 : *mut u8`. -/
+def partialCopyDecls : List LocalDecl :=
+  [declOf unitK, declOf u64K, declOf u64K, declOf rawConstU8K, declOf rawMutU8K]
+
+/-- `_1 = 0x0102_0304_0506_0708_u64`, `_2 = dst0`, `_3` a `.frozen` pointer into
+`_1`, and `_4` an `.active` pointer into `_2`. -/
+def partialCopyState (dst0 : Nat) : MachineState :=
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals := [.uninit, .init (.scalar ⟨0x0102030405060708, 8⟩), .init (.scalar ⟨dst0, 8⟩),
+        .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+    memory := {
+      emptyMemory with
+      borrows :=
+        [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+         { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
+      nextTag := 3 } }
+
+/-- **`wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers`** (Stage-1
+divergence; Stage-1 computes a wrong value): `copy_nonoverlapping::<u8>(_3, _4,
+count)` from `_1 : u64 = 0x0102_0304_0506_0708` into the distinct, in-bounds
+local `_2 : u64` copies exactly the little-endian bytes `[0, count)` in Rust (and
+in the pre-Stage-1 reference model): `_2 := 0x0708` for `count = 2` from `_2 = 0`,
+and `_2 := 0xFFFF_FFFF_FFFF_FF08` for `count = 1` from `_2 = u64::MAX`. Stage-1
+`evalCopyNonOverlapping` instead stores the whole source value
+`0x0102_0304_0506_0708` into `_2` in both cases (through `copyViaBytes` for
+`count = 2` and `evalCopySingleDirect` for `count = 1`), clobbering destination
+bytes outside the copied range. -/
+theorem wit_lm4_2_copy_nonoverlapping_partial_stage1_clobbers :
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+    (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+        (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
+        .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
+  ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩⟩
 
 /-- Body for distinct-local out-of-bounds `copy_nonoverlapping`:
 `_3 = &raw const _1; _4 = &raw mut _2; copy_nonoverlapping(copy _3, copy _4, 2_usize)`,

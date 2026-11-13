@@ -20,10 +20,16 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 > `CallLM4_2.lean`) relates `lean-miri` to that reference model only. Stage-1
 > `evalCopyNonOverlapping` (`Statements.lean:1739`) disagrees with it on (at least)
 > zero-count misaligned copies, out-of-bounds distinct-local copies, same-local
-> disjoint sub-range copies, and cross-type single-element copies, each of which
-> `WitLM4_2.lean` §6 certifies as a concrete Stage-1 divergence from `lean-miri`.
-> §8 holds the only Stage-1 statement of this file, an Anneal-side evaluation
-> lemma (no Stage-1 lockstep simulation for `copy_nonoverlapping` exists yet).
+> disjoint sub-range copies, cross-type single-element copies, and partial
+> distinct-local copies (where Stage-1 stores the whole source value), each of
+> which `WitLM4_2.lean` §6/§14 certifies as a concrete Stage-1 divergence.
+> Stage-1 statements: §8 (an Anneal-side evaluation lemma for pointer-valued
+> copies; no lockstep simulation of provenance-carrying pointer copies exists
+> yet) and §9, which bridges `stepMirFn = stepMirFnLM4_2` on the aligned
+> zero-count / single-element same-type integer fragment
+> (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`) and transfers the lockstep
+> simulation and the uninitialized-source / Tree Borrows divergences to Stage-1
+> there.
 
 One-step correspondence between the pre-Stage-1 reference model's
 `evalCopyNonOverlappingLM4_2` and `lean-miri`'s
