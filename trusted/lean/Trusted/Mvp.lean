@@ -9,3 +9,4 @@
 -- anneal-trust-tier: candidate:mvp
 prelude
 import Trusted.Mvp.Syntax
+import Trusted.Mvp.Semantics
