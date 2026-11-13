@@ -40,11 +40,15 @@ This is the only `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl`.
 `Anneal.Mir.AdtAndControl` (which is not part of the default `Anneal` target), and
 `MiniRustSpec.Audit` audits it: `#assert_all_minirustspec_standard_axioms` covers every declaration
 of this module, and its `[DEINIT-AUDIT]` group pins its theorems, including
-`subplace_audit_closure`.
+`subplace_audit_closure` and `call_intrinsic_audit_closure` (which bridges
+`Anneal.Mir.AdtAndControl.LIntrinsicOp` / `evalLIntrinsicValue` / `LTerminator.call` to
+`MiniRustSpec.Interp` and transitively audits every Episode 2 theorem of
+`Anneal.Mir.AdtAndControl`).
 -/
 
 namespace MiniRustSpec.Correspondence.DeinitBridge
 
+open Trusted.Rustc.V2026_06_01
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open MiniRustSpec
@@ -387,6 +391,1040 @@ theorem subplace_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_typed_refines_upToTag
   let _ := @Anneal.Mir.AdtAndControl.evalStmt_retag_ref_fnEntry_refines_upToTag
   let _ := @Anneal.Mir.AdtAndControl.witness_trusted_retag_ref_anneal
+  trivial
+
+/-! ## Lowered inline intrinsics (`LIntrinsicOp`) and `MiniRustSpec.Interp` correspondence
+
+`Anneal.Mir.AdtAndControl.LIntrinsicOp` and `evalLIntrinsicValue` formalize `crates/anneal-mir`'s
+syntax-version-independent inline intrinsic evaluator (`crates/anneal-mir/src/ir.rs` and
+`crates/anneal-mir/src/lower/intrinsic.rs`), decoupled from `V2026_06_01` `DefPath` strings by
+`lowerIntrinsicKind_V2026_06_01` / `lowerCallTarget_V2026_06_01`. Because this module is the sole
+`MiniRustSpec` module importing `Anneal.Mir.AdtAndControl`, the theorems below connect
+`LIntrinsicOp` directly to `MiniRustSpec.Interp` (`evalBinOp`, `evalPtrOffset`, `evalValue`, and
+`Interp.evalTerminator .Unreachable`) and pin every Episode 2 `AdtAndControl` theorem in
+`call_intrinsic_audit_closure`. -/
+
+@[reducible] private def isSignedBool (s : LibSpecr.Signedness) : Bool :=
+  match s with
+  | .Unsigned => false
+  | .Signed => true
+
+/-- Every integer `RigidTy` accepted by `intTyBytes` has `GoodSize` byte width, resolves its
+signedness in `intrinsicIntSignedness?`, and resolves its byte size in
+`intrinsicRigidTyByteSize`. -/
+theorem intTyBytes_intrinsic_props {rk : RigidTy} {s : LibSpecr.Signedness} {n : Nat}
+    (h : intTyBytes rk = some (s, n)) (allowChar : Bool)
+    (decls : List LocalDecl) (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    GoodSize n ∧
+      intrinsicIntSignedness? allowChar rk = some (isSignedBool s) ∧
+      intrinsicRigidTyByteSize decls layouts rk = some n := by
+  cases rk with
+  | uint u => cases u <;> cases h <;> exact ⟨by simp [GoodSize], rfl, rfl⟩
+  | int i => cases i <;> cases h <;> exact ⟨by simp [GoodSize], rfl, rfl⟩
+  | _ => simp [intTyBytes] at h
+
+private theorem signedHalfModulus_eq_two_pow (sz : Nat) (hsz : sz ≠ 0) :
+    signedHalfModulus sz = 2 ^ (8 * sz - 1) := by
+  unfold signedHalfModulus
+  obtain ⟨hM, _⟩ := two_pow_byte_split sz hsz
+  rw [scalarModulus_eq, nat_div_eq_div, hM]
+  omega
+
+private theorem int_tmod_lt_bound (a b : Int) (M : Nat)
+    (hb0 : b ≠ 0) (hbLo : -(M : Int) < b) (hbHi : b < (M : Int)) :
+    -(M : Int) < Int.tmod a b ∧ Int.tmod a b < (M : Int) := by
+  cases a with
+  | ofNat m =>
+    cases b with
+    | ofNat n =>
+      simp only [Int.tmod, Int.ofNat_eq_natCast] at *
+      have hn : 0 < n := by omega
+      have hlt := Nat.mod_lt m hn
+      omega
+    | negSucc n =>
+      simp only [Int.tmod, Int.ofNat_eq_natCast] at *
+      have hlt := Nat.mod_lt m (Nat.succ_pos n)
+      omega
+  | negSucc m =>
+    cases b with
+    | ofNat n =>
+      simp only [Int.tmod, Int.ofNat_eq_natCast] at *
+      have hn : 0 < n := by omega
+      have hlt := Nat.mod_lt (m + 1) hn
+      generalize (m + 1) % n = r at hlt ⊢
+      cases r with
+      | zero => change -(M : Int) < 0 ∧ 0 < (M : Int); omega
+      | succ k => change -(M : Int) < Int.negSucc k ∧ Int.negSucc k < (M : Int); omega
+    | negSucc n =>
+      simp only [Int.tmod, Int.ofNat_eq_natCast] at *
+      have hlt := Nat.mod_lt (m + 1) (Nat.succ_pos n)
+      generalize (m + 1) % (n + 1) = r at hlt ⊢
+      cases r with
+      | zero => change -(M : Int) < 0 ∧ 0 < (M : Int); omega
+      | succ k => change -(M : Int) < Int.negSucc k ∧ Int.negSucc k < (M : Int); omega
+
+/-- Mapping from wrapping `LIntrinsicOp` variants to `(MirAst.BinOp, Gen.IntBinOp)`. -/
+def wrappingLIntrinsicPair :
+    Anneal.Mir.AdtAndControl.LIntrinsicOp → Option (MirAst.BinOp × Gen.IntBinOp)
+  | .wrappingAdd => some (.add, .Add)
+  | .wrappingSub => some (.sub, .Sub)
+  | .wrappingMul => some (.mul, .Mul)
+  | _ => none
+
+/-- **Symbolic correspondence for `wrappingAdd`, `wrappingSub`, and `wrappingMul`
+(`evalLIntrinsic_wrapping_eq_minirust`)**: across every integer type `it` (`GoodSize it.size.bytes`)
+and all valid operand bit patterns `x, y < 2 ^ (8 * it.size.bytes)`, `evalLIntrinsicValue` produces
+the exact two's-complement bit pattern whose `intFromBits` decoding equals MiniRust's
+`evalBinOp (.Int .Add / .Sub / .Mul)`. -/
+theorem evalLIntrinsic_wrapping_eq_minirust
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) (bop : MirAst.BinOp) (iop : Gen.IntBinOp)
+    (hop : wrappingLIntrinsicPair op = some (bop, iop))
+    (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (tys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let l := intFromBits x it
+    let r := intFromBits y it
+    ∃ z,
+      evalBinOp (.Int iop) (.Int l, .Int it) (.Int r, .Int it) =
+        .ok (.Int (IntType.bring_in_bounds it z), .Int it) ∧
+      IntType.bring_in_bounds it z = intFromBits (z % 2 ^ (8 * it.size.bytes)).toNat it ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op tys decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) := by
+  dsimp only
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hxWrap : wrapScalarBits x (scalarModulus it.size.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus it.size.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  cases op <;> simp [wrappingLIntrinsicPair] at hop
+  · obtain ⟨rfl, rfl⟩ := hop
+    refine ⟨intFromBits x it + intFromBits y it, rfl,
+      bringInBounds_eq_intFromBits it hgood _, ?_⟩
+    simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalWrappingAdd, hbeq, Nat.beq_refl,
+      hxWrap, hyWrap, Nat.add_eq, wrap_add_intFromBits it x y hx hy]
+  · obtain ⟨rfl, rfl⟩ := hop
+    refine ⟨intFromBits x it - intFromBits y it, rfl,
+      bringInBounds_eq_intFromBits it hgood _, ?_⟩
+    have hsub := wrap_sub_intFromBits it x y hx hy
+    dsimp only at hsub
+    rw [hxWrap, hyWrap] at hsub
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalWrappingSub, hbeq, Nat.beq_refl,
+      Bool.not_true, Bool.or_false, hxWrap, hyWrap, Nat.sub_eq, Nat.add_eq, Option.map]
+    cases hble : Nat.ble y x <;> simp only [hble] at hsub ⊢ <;> rw [hsub]
+  · obtain ⟨rfl, rfl⟩ := hop
+    refine ⟨intFromBits x it * intFromBits y it, rfl,
+      bringInBounds_eq_intFromBits it hgood _, ?_⟩
+    simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalWrappingMul, hbeq, Nat.beq_refl,
+      hxWrap, hyWrap, Nat.mul_eq, wrap_mul_intFromBits it x y hx hy]
+
+/-- Mapping from homogeneous unchecked arithmetic `LIntrinsicOp` variants to
+`(MirAst.BinOp, Gen.IntBinOp)`. -/
+def uncheckedArithLIntrinsicPair :
+    Anneal.Mir.AdtAndControl.LIntrinsicOp → Option (MirAst.BinOp × Gen.IntBinOp)
+  | .uncheckedAdd => some (.addUnchecked, .AddUnchecked)
+  | .uncheckedSub => some (.subUnchecked, .SubUnchecked)
+  | .uncheckedMul => some (.mulUnchecked, .MulUnchecked)
+  | .uncheckedDiv => some (.div, .Div)
+  | .uncheckedRem => some (.rem, .Rem)
+  | _ => none
+
+private theorem evalLIntrinsic_unchecked_to_scalarBinOp
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) (bop : MirAst.BinOp) (iop : Gen.IntBinOp)
+    (hop : uncheckedArithLIntrinsicPair op = some (bop, iop))
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    (match Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts argOps
+        [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag with
+      | some v => RvalueEvalResult.ok v [] {}
+      | none => .ub) =
+      evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {}
+        (isSignedBool it.signed) := by
+  obtain ⟨hgood, hSign, _⟩ := intTyBytes_intrinsic_props hrk false decls layouts
+  clear hrk
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hxWrap : wrapScalarBits x (scalarModulus it.size.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus it.size.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  cases op <;> simp [uncheckedArithLIntrinsicPair] at hop
+  · obtain ⟨rfl, rfl⟩ := hop
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalUncheckedAdd, evalScalarBinOp, hbeq, Nat.beq_refl, Bool.not_true, Bool.or_false,
+      hxWrap, hyWrap]
+    cases it.signed <;> dsimp only [isSignedBool]
+    · cases Nat.ble (scalarModulus it.size.bytes) (Nat.add x y) <;> rfl
+    · cases signedOverflowAdd x y it.size.bytes <;> rfl
+  · obtain ⟨rfl, rfl⟩ := hop
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalUncheckedSub, evalScalarBinOp, hbeq, Nat.beq_refl, Bool.not_true, Bool.or_false,
+      hxWrap, hyWrap]
+    cases it.signed <;> dsimp only [isSignedBool]
+    · cases Nat.ble y x
+      · rfl
+      · dsimp only
+        cases Nat.ble (scalarModulus it.size.bytes) (Nat.sub x y) <;> rfl
+    · cases signedOverflowSub x y it.size.bytes <;> rfl
+  · obtain ⟨rfl, rfl⟩ := hop
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalUncheckedMul, evalScalarBinOp, hbeq, Nat.beq_refl, Bool.not_true, Bool.or_false,
+      hxWrap, hyWrap]
+    cases it.signed <;> dsimp only [isSignedBool]
+    · cases Nat.ble (scalarModulus it.size.bytes) (Nat.mul x y) <;> rfl
+    · cases signedOverflowMul x y it.size.bytes <;> rfl
+  · obtain ⟨rfl, rfl⟩ := hop
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalUncheckedDiv, evalScalarBinOp, evalSignedDiv, hbeq, Nat.beq_refl, Bool.not_true,
+      Bool.or_false, hxWrap, hyWrap]
+    cases Nat.beq y 0
+    · cases it.signed <;> dsimp only [isSignedBool]
+      · rfl
+      · cases Bool.and (Nat.beq x (scalarPow2 (Nat.sub (Nat.mul it.size.bytes 8) 1)))
+            (Nat.beq y (Nat.sub (scalarModulus it.size.bytes) 1)) <;> rfl
+    · rfl
+  · obtain ⟨rfl, rfl⟩ := hop
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalUncheckedRem, evalScalarBinOp, evalSignedRem, hbeq, Nat.beq_refl, Bool.not_true,
+      Bool.or_false, hxWrap, hyWrap]
+    cases Nat.beq y 0
+    · cases it.signed <;> dsimp only [isSignedBool]
+      · rfl
+      · cases Bool.and (Nat.beq x (scalarPow2 (Nat.sub (Nat.mul it.size.bytes 8) 1)))
+            (Nat.beq y (Nat.sub (scalarModulus it.size.bytes) 1)) <;> rfl
+    · rfl
+
+/-- **Symbolic correspondence (both value-return and UB-fault) for `uncheckedAdd`, `uncheckedSub`,
+`uncheckedMul`, `uncheckedDiv`, and `uncheckedRem` (`evalLIntrinsic_unchecked_binop_iff_minirust`)**:
+across every integer `RigidTy` `rk` (`intTyBytes rk = some (it.signed, it.size.bytes)`) and all
+valid bit patterns `x, y < 2 ^ (8 * it.size.bytes)`:
+1. whenever MiniRust's `evalBinOp (.Int iop)` succeeds with `.ok (.Int res, .Int it)`,
+   `evalLIntrinsicValue op` returns the corresponding two's-complement scalar; and
+2. whenever MiniRust's `evalBinOp (.Int iop)` raises UB, `evalLIntrinsicValue op` returns `none`
+   (which `evalLoweredTerminator` rejects and `evalTerminator` maps to `MirStepNode.fail .ub`). -/
+theorem evalLIntrinsic_unchecked_binop_iff_minirust
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) (bop : MirAst.BinOp) (iop : Gen.IntBinOp)
+    (hop : uncheckedArithLIntrinsicPair op = some (bop, iop))
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let l := intFromBits x it
+    let r := intFromBits y it
+    (∀ res, evalBinOp (.Int iop) (.Int l, .Int it) (.Int r, .Int it) = .ok (.Int res, .Int it) →
+      res = intFromBits (res % 2 ^ (8 * it.size.bytes)).toNat it ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨(res % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩)) ∧
+    ((∃ msg, evalBinOp (.Int iop) (.Int l, .Int it) (.Int r, .Int it) = .error (.ub msg)) →
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag = none) := by
+  dsimp only
+  obtain ⟨hgood, _, _⟩ := intTyBytes_intrinsic_props hrk false decls layouts
+  have hTr : translateBinOp bop = some iop ∧ isShiftIntBinOp iop = false := by
+    cases op <;> simp [uncheckedArithLIntrinsicPair] at hop <;>
+      rcases hop with ⟨rfl, rfl⟩ <;> exact ⟨rfl, rfl⟩
+  have hFrag := evalScalarBinOp_frag bop iop hTr.1 it it hgood hgood (fun _ => rfl) x y hx hy [] {}
+  have hSpec := evalIntBinOp_spec bop iop hTr.1 (intFromBits x it) (intFromBits y it) it
+  have hBridge := evalLIntrinsic_unchecked_to_scalarBinOp op bop iop hop hrk x y hx hy
+    restTys decls layouts argOps flag
+  cases hIE : intBinEval iop (intFromBits x it) (intFromBits y it) it with
+  | some z =>
+    have hOkInt := hSpec.1 z hIE
+    have hOkSc :
+        evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+          .ok (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) [] {} := hFrag.1 z hIE
+    rw [hOkSc] at hBridge
+    have hLVal : Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts
+        argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) := by
+      cases hE : Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag with
+      | none => rw [hE] at hBridge; nomatch hBridge
+      | some v => rw [hE] at hBridge; injection hBridge with hv; rw [hv]
+    have hBringMod :
+        IntType.bring_in_bounds it z % 2 ^ (8 * it.size.bytes) = z % 2 ^ (8 * it.size.bytes) := by
+      rcases it with ⟨s, sz⟩
+      unfold IntType.bring_in_bounds bringInBounds Interp.Size.bits
+      dsimp only
+      cases s
+      · exact Int.emod_emod _ _
+      · dsimp only
+        split
+        · exact Int.emod_emod _ _
+        · rw [Int.sub_emod_right, Int.emod_emod]
+    refine ⟨fun res hRes => ?_, fun ⟨msg, hErr⟩ => ?_⟩
+    · simp [evalBinOp, hOkInt, Bind.bind, Except.bind, Pure.pure, Except.pure] at hRes
+      subst hRes
+      rw [hBringMod]
+      exact ⟨bringInBounds_eq_intFromBits it hgood z, hLVal⟩
+    · simp [evalBinOp, hOkInt, Bind.bind, Except.bind, Pure.pure, Except.pure] at hErr
+  | none =>
+    obtain ⟨msg0, hUbInt⟩ := hSpec.2 hIE
+    have hUbSc :
+        evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+          .ub := hFrag.2 hIE
+    rw [hUbSc] at hBridge
+    have hLNone : Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts
+        argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag = none := by
+      cases hE : Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag with
+      | none => rfl
+      | some v => rw [hE] at hBridge; nomatch hBridge
+    refine ⟨fun res hRes => ?_, fun _ => hLNone⟩
+    simp [evalBinOp, hUbInt, Bind.bind, Except.bind] at hRes
+
+/-- **Symbolic correspondence (both value-return and UB-fault, including negative signed shift
+counts) for `uncheckedShl` and `uncheckedShr` (`evalLIntrinsic_unchecked_shift_iff_minirust`)**:
+for any integer types `it` (`lhsRk`) and `rhsIt` (`rhsRk`) and valid bit patterns
+`x < 2 ^ (8 * it.size.bytes)` and `y < 2 ^ (8 * rhsIt.size.bytes)`, `evalLIntrinsicValue` matches
+MiniRust's `evalBinOp (.Int .ShlUnchecked / .ShrUnchecked)`. -/
+theorem evalLIntrinsic_unchecked_shift_iff_minirust
+    (isShr : Bool)
+    {lhsRk rhsRk : RigidTy} {it rhsIt : Gen.IntType}
+    (hLhs : intTyBytes lhsRk = some (it.signed, it.size.bytes))
+    (hRhs : intTyBytes rhsRk = some (rhsIt.signed, rhsIt.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * rhsIt.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let op : Anneal.Mir.AdtAndControl.LIntrinsicOp := if isShr then .uncheckedShr else .uncheckedShl
+    let iop : Gen.IntBinOp := if isShr then .ShrUnchecked else .ShlUnchecked
+    let l := intFromBits x it
+    let r := intFromBits y rhsIt
+    (∀ res, evalBinOp (.Int iop) (.Int l, .Int it) (.Int r, .Int rhsIt) = .ok (.Int res, .Int it) →
+      res = intFromBits (res % 2 ^ (8 * it.size.bytes)).toNat it ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (lhsRk :: rhsRk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag =
+        some (.scalar ⟨(res % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩)) ∧
+    ((∃ msg, evalBinOp (.Int iop) (.Int l, .Int it) (.Int r, .Int rhsIt) = .error (.ub msg)) →
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (lhsRk :: rhsRk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag = none) := by
+  dsimp only
+  obtain ⟨hgood, hLhsSign, _⟩ := intTyBytes_intrinsic_props hLhs false decls layouts
+  obtain ⟨hrhsGood, hRhsSign, _⟩ := intTyBytes_intrinsic_props hRhs false decls layouts
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hrhsSz : rhsIt.size.bytes ≠ 0 := Nat.ne_of_gt hrhsGood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hrhsBeq : Nat.beq rhsIt.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hrhsSz]
+  have hxWrap : wrapScalarBits x (scalarModulus it.size.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus rhsIt.size.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  -- Whenever `isSignedNegative y rhsIt.size.bytes = true`, `y ≥ 2^(8*rhsSz - 1) ≥ 128 ≥ 8*lhsSz`,
+  -- so `Nat.ble (it.size.bytes * 8) y` already subsumes `negShift`.
+  have hNegSubsumed : ∀ (rs : Bool),
+      Bool.or (Bool.and rs (isSignedNegative y rhsIt.size.bytes))
+        (Nat.ble (Nat.mul it.size.bytes 8) y) =
+      Nat.ble (Nat.mul it.size.bytes 8) y := by
+    intro rs
+    have hLhsMax : it.size.bytes ≤ 16 := by
+      rcases hgood with h | h | h | h | h <;> omega
+    have hHalfMin : 128 ≤ 2 ^ (8 * rhsIt.size.bytes - 1) := by
+      rcases hrhsGood with h | h | h | h | h <;> rw [h] <;> decide
+    rw [isSignedNegative_eq y rhsIt.size.bytes hrhsSz hy, Nat.mul_eq, nat_ble_eq_decide]
+    by_cases hge : 2 ^ (8 * rhsIt.size.bytes - 1) ≤ y
+    · rw [decide_eq_true hge, decide_eq_true (by omega : it.size.bytes * 8 ≤ y), Bool.or_true]
+    · rw [decide_eq_false hge, Bool.and_false, Bool.false_or]
+  let bop : MirAst.BinOp := if isShr then .shrUnchecked else .shlUnchecked
+  let iop : Gen.IntBinOp := if isShr then .ShrUnchecked else .ShlUnchecked
+  have hTr : translateBinOp bop = some iop := by cases isShr <;> rfl
+  have hBridge :
+      (match Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+          (if isShr then .uncheckedShr else .uncheckedShl)
+          (lhsRk :: rhsRk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag with
+        | some v => RvalueEvalResult.ok v [] {}
+        | none => .ub) =
+      evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, rhsIt.size.bytes⟩ [] {}
+        (isSignedBool it.signed) := by
+    dsimp only [bop]
+    cases isShr
+    · simp only [Bool.false_eq_true, ↓reduceIte, Anneal.Mir.AdtAndControl.evalLIntrinsicValue,
+        resolveIntrinsicShiftSigned, hRhsSign, evalUncheckedShl, evalScalarBinOp, hbeq, hrhsBeq,
+        Bool.or_self, hxWrap, hyWrap, hNegSubsumed]
+      cases Nat.ble (Nat.mul it.size.bytes 8) y <;> rfl
+    · simp only [↓reduceIte, Anneal.Mir.AdtAndControl.evalLIntrinsicValue,
+        resolveIntrinsicIsSigned, resolveIntrinsicShiftSigned, hLhsSign, hRhsSign,
+        evalUncheckedShr, evalScalarBinOp, hbeq, hrhsBeq, Bool.or_self, hxWrap, hyWrap,
+        hNegSubsumed]
+      cases Nat.ble (Nat.mul it.size.bytes 8) y <;> rfl
+  have hFrag := evalScalarBinOp_frag bop iop hTr it rhsIt hgood hrhsGood
+    (by cases isShr <;> intro h <;> nomatch h) x y hx hy [] {}
+  have hSpec := evalIntBinOp_spec bop iop hTr (intFromBits x it) (intFromBits y rhsIt) it
+  cases hIE : intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it with
+  | some z =>
+    have hOkInt := hSpec.1 z hIE
+    have hOkSc :
+        evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, rhsIt.size.bytes⟩ [] {}
+          (isSignedBool it.signed) =
+          .ok (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) [] {} := hFrag.1 z hIE
+    rw [hOkSc] at hBridge
+    have hLVal : Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        (if isShr then .uncheckedShr else .uncheckedShl)
+        (lhsRk :: rhsRk :: restTys) decls layouts argOps
+        [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag =
+        some (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) := by
+      cases hE : Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+          (if isShr then .uncheckedShr else .uncheckedShl)
+          (lhsRk :: rhsRk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag with
+      | none => rw [hE] at hBridge; nomatch hBridge
+      | some v => rw [hE] at hBridge; injection hBridge with hv; rw [hv]
+    have hBringMod :
+        IntType.bring_in_bounds it z % 2 ^ (8 * it.size.bytes) = z % 2 ^ (8 * it.size.bytes) := by
+      rcases it with ⟨s, sz⟩
+      unfold IntType.bring_in_bounds bringInBounds Interp.Size.bits
+      dsimp only
+      cases s
+      · exact Int.emod_emod _ _
+      · dsimp only
+        split
+        · exact Int.emod_emod _ _
+        · rw [Int.sub_emod_right, Int.emod_emod]
+    refine ⟨fun res hRes => ?_, fun ⟨msg, hErr⟩ => ?_⟩
+    · simp [evalBinOp, hOkInt, Bind.bind, Except.bind, Pure.pure, Except.pure, iop] at hRes
+      subst hRes
+      rw [hBringMod]
+      exact ⟨bringInBounds_eq_intFromBits it hgood z, hLVal⟩
+    · simp [evalBinOp, hOkInt, Bind.bind, Except.bind, Pure.pure, Except.pure, iop] at hErr
+  | none =>
+    obtain ⟨msg0, hUbInt⟩ := hSpec.2 hIE
+    have hUbSc :
+        evalScalarBinOp bop ⟨x, it.size.bytes⟩ ⟨y, rhsIt.size.bytes⟩ [] {}
+          (isSignedBool it.signed) = .ub := hFrag.2 hIE
+    rw [hUbSc] at hBridge
+    have hLNone : Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        (if isShr then .uncheckedShr else .uncheckedShl)
+        (lhsRk :: rhsRk :: restTys) decls layouts argOps
+        [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag = none := by
+      cases hE : Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+          (if isShr then .uncheckedShr else .uncheckedShl)
+          (lhsRk :: rhsRk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, rhsIt.size.bytes⟩] flag with
+      | none => rfl
+      | some v => rw [hE] at hBridge; nomatch hBridge
+    refine ⟨fun res hRes => ?_, fun _ => hLNone⟩
+    simp [evalBinOp, hUbInt, Bind.bind, Except.bind, iop] at hRes
+
+/-- **Symbolic correspondence (both exact quotient and all three UB conditions) for
+`LIntrinsicOp.exactDiv` (`evalLIntrinsic_exactDiv_iff_minirust`)**: across every integer `RigidTy`
+`rk` (`intTyBytes rk = some (it.signed, it.size.bytes)`) and all valid bit patterns
+`x, y < 2 ^ (8 * it.size.bytes)`:
+1. whenever MiniRust's `evalBinOp (.Int .DivExact)` returns `.ok (.Int q, .Int it)`,
+   `evalLIntrinsicValue .exactDiv` returns the matching scalar `⟨(q % 2^(8*sz)).toNat, sz⟩`; and
+2. whenever MiniRust's `evalBinOp (.Int .DivExact)` raises UB (division by zero, signed `MIN / -1`
+   overflow, or non-zero remainder), `evalLIntrinsicValue .exactDiv` returns `none`. -/
+theorem evalLIntrinsic_exactDiv_iff_minirust
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let l := intFromBits x it
+    let r := intFromBits y it
+    (∀ q, evalBinOp (.Int .DivExact) (.Int l, .Int it) (.Int r, .Int it) = .ok (.Int q, .Int it) →
+      q = intFromBits (q % 2 ^ (8 * it.size.bytes)).toNat it ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨(q % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩)) ∧
+    ((∃ msg, evalBinOp (.Int .DivExact) (.Int l, .Int it) (.Int r, .Int it) = .error (.ub msg)) →
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag = none) := by
+  dsimp only
+  obtain ⟨hgood, hSign, _⟩ := intTyBytes_intrinsic_props hrk false decls layouts
+  clear hrk
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hxWrap : wrapScalarBits x (scalarModulus it.size.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus it.size.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  -- Relate `evalExactDiv` directly to `(evalScalarBinOp .div, evalScalarBinOp .rem)`:
+  have hExEq :
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .exactDiv (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+      match evalScalarBinOp .div ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed),
+            evalScalarBinOp .rem ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) with
+      | .ok (.scalar qSc) _ _, .ok (.scalar rSc) _ _ =>
+        if rSc.bits = 0 then some (.scalar qSc) else none
+      | _, _ => none := by
+    simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+      evalExactDiv, evalScalarBinOp, hbeq, Nat.beq_refl, Bool.not_false, Bool.and_self,
+      hxWrap, hyWrap]
+    by_cases hy0 : y = 0
+    · subst hy0; simp
+    · have hyBeq : Nat.beq y 0 = false := by rw [nat_beq_eq_decide, decide_eq_false hy0]
+      simp only [hyBeq]
+      rcases it with ⟨s, ⟨sz⟩⟩
+      dsimp only at hgood hsz hbeq hx hy hxWrap hyWrap ⊢
+      cases s
+      · dsimp only
+        have hqlt : x / y < 2 ^ (8 * sz) := Nat.lt_of_le_of_lt (Nat.div_le_self x y) hx
+        have hrlt : x % y < 2 ^ (8 * sz) := Nat.lt_trans (Nat.mod_lt x (by omega)) hy
+        simp only [nat_div_eq_div, nat_mod_eq_mod, wrapScalarBits_eq, scalarModulus_eq,
+          Nat.mod_eq_of_lt hqlt, Nat.mod_eq_of_lt hrlt, nat_beq_eq_decide]
+        by_cases hrm : x % y = 0 <;> simp [hrm]
+      · dsimp only
+        obtain ⟨hM, hH⟩ := two_pow_byte_split sz hsz
+        have hHalfEq : signedHalfModulus sz = scalarPow2 (Nat.sub (Nat.mul sz 8) 1) := by
+          rw [signedHalfModulus_eq_two_pow sz hsz, scalarPow2_eq, Nat.mul_eq, Nat.sub_eq,
+            Nat.mul_comm sz 8]
+        simp only [evalSignedDiv, evalSignedRem, hHalfEq, hxWrap, hyWrap]
+        cases hOvf : Bool.and (Nat.beq x (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)))
+            (Nat.beq y (Nat.sub (scalarModulus sz) 1))
+        · dsimp only
+          have hNegX : Nat.ble (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)) x =
+              isSignedNegative x sz := by
+            simp [isSignedNegative_eq x sz hsz hx, scalarPow2_eq, Nat.mul_eq, Nat.sub_eq,
+              Nat.mul_comm sz 8, nat_ble_eq_decide]
+          have hNegY : Nat.ble (scalarPow2 (Nat.sub (Nat.mul sz 8) 1)) y =
+              isSignedNegative y sz := by
+            simp [isSignedNegative_eq y sz hsz hy, scalarPow2_eq, Nat.mul_eq, Nat.sub_eq,
+              Nat.mul_comm sz 8, nat_ble_eq_decide]
+          rw [hNegX, hNegY]
+          have hCore : ∀ (a b : Nat) (sx sy : Bool),
+              a ≤ 2 ^ (8 * sz - 1) → 0 < b → b ≤ 2 ^ (8 * sz - 1) →
+              Option.map Value.scalar
+                (match Nat.beq (Nat.mod a b) 0 with
+                | false => none
+                | true =>
+                  some {
+                    bits := match sx, sy with
+                      | false, false => Nat.div a b
+                      | true, true => Nat.div a b
+                      | _, _ => wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.div a b)) (scalarModulus sz),
+                    sizeBytes := sz }) =
+              (if (match Nat.beq (Nat.mod a b) 0 with
+                  | true => 0
+                  | false =>
+                    match sx with
+                    | false => wrapScalarBits (Nat.mod a b) (scalarModulus sz)
+                    | true => wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.mod a b)) (scalarModulus sz)) = 0
+                then some (Value.scalar {
+                  bits := match Nat.beq (Nat.div a b) 0 with
+                    | true => 0
+                    | false =>
+                      match sx, sy with
+                      | false, false => wrapScalarBits (Nat.div a b) (scalarModulus sz)
+                      | true, true => wrapScalarBits (Nat.div a b) (scalarModulus sz)
+                      | _, _ => wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.div a b)) (scalarModulus sz),
+                  sizeBytes := sz })
+                else none) := by
+            intro a b sx sy ha hb0 hb
+            simp only [nat_mod_eq_mod, nat_div_eq_div, Nat.sub_eq, wrapScalarBits_eq,
+              scalarModulus_eq]
+            cases hMod0 : Nat.beq (a % b) 0 with
+            | false =>
+              dsimp only
+              rw [nat_beq_eq_decide, decide_eq_false_iff_not] at hMod0
+              have hRLt : a % b < 2 ^ (8 * sz) := by
+                have := Nat.mod_lt a hb0; omega
+              have hSubLt : 2 ^ (8 * sz) - a % b < 2 ^ (8 * sz) := by omega
+              have hSubNz : 2 ^ (8 * sz) - a % b ≠ 0 := by omega
+              cases sx
+              · simp [Nat.mod_eq_of_lt hRLt, hMod0]
+              · simp [Nat.mod_eq_of_lt hSubLt, hSubNz]
+            | true =>
+              dsimp only
+              simp only [↓reduceIte]
+              have hQLt : a / b < 2 ^ (8 * sz) := by
+                have := Nat.div_le_self a b; omega
+              cases hQ0 : Nat.beq (a / b) 0 with
+              | true =>
+                rw [nat_beq_eq_decide, decide_eq_true_eq] at hQ0
+                cases sx <;> cases sy <;> simp [hQ0]
+              | false =>
+                cases sx <;> cases sy <;> simp [Nat.mod_eq_of_lt hQLt]
+          have hxSubWrap : isSignedNegative x sz = true →
+              wrapScalarBits (Nat.sub (scalarModulus sz) x) (scalarModulus sz) =
+                Nat.sub (scalarModulus sz) x := by
+            intro hnx
+            rw [isSignedNegative_eq x sz hsz hx, decide_eq_true_eq] at hnx
+            have := Nat.two_pow_pos (8 * sz - 1)
+            rw [wrapScalarBits_eq, scalarModulus_eq, Nat.sub_eq,
+              Nat.mod_eq_of_lt (by omega : 2 ^ (8 * sz) - x < 2 ^ (8 * sz))]
+          have hySubWrap : isSignedNegative y sz = true →
+              wrapScalarBits (Nat.sub (scalarModulus sz) y) (scalarModulus sz) =
+                Nat.sub (scalarModulus sz) y := by
+            intro hny
+            rw [isSignedNegative_eq y sz hsz hy, decide_eq_true_eq] at hny
+            rw [wrapScalarBits_eq, scalarModulus_eq, Nat.sub_eq,
+              Nat.mod_eq_of_lt (by omega : 2 ^ (8 * sz) - y < 2 ^ (8 * sz))]
+          cases hnx : isSignedNegative x sz <;> cases hny : isSignedNegative y sz
+          · dsimp only
+            rw [isSignedNegative_eq x sz hsz hx, decide_eq_false_iff_not] at hnx
+            rw [isSignedNegative_eq y sz hsz hy, decide_eq_false_iff_not] at hny
+            exact hCore x y false false (by omega) (by omega) (by omega)
+          · dsimp only
+            rw [hySubWrap hny]
+            rw [isSignedNegative_eq x sz hsz hx, decide_eq_false_iff_not] at hnx
+            rw [isSignedNegative_eq y sz hsz hy, decide_eq_true_eq] at hny
+            exact hCore x (Nat.sub (scalarModulus sz) y) false true (by omega)
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega)
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega)
+          · dsimp only
+            rw [hxSubWrap hnx]
+            rw [isSignedNegative_eq x sz hsz hx, decide_eq_true_eq] at hnx
+            rw [isSignedNegative_eq y sz hsz hy, decide_eq_false_iff_not] at hny
+            exact hCore (Nat.sub (scalarModulus sz) x) y true false
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega) (by omega) (by omega)
+          · dsimp only
+            rw [hxSubWrap hnx, hySubWrap hny]
+            rw [isSignedNegative_eq x sz hsz hx, decide_eq_true_eq] at hnx
+            rw [isSignedNegative_eq y sz hsz hy, decide_eq_true_eq] at hny
+            exact hCore (Nat.sub (scalarModulus sz) x) (Nat.sub (scalarModulus sz) y) true true
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega)
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega)
+              (by rw [scalarModulus_eq, Nat.sub_eq]; omega)
+        · rfl
+  rw [hExEq]
+  have hDivFrag := evalScalarBinOp_frag .div .Div rfl it it hgood hgood (fun _ => rfl) x y hx hy [] {}
+  have hRemFrag := evalScalarBinOp_frag .rem .Rem rfl it it hgood hgood (fun _ => rfl) x y hx hy [] {}
+  by_cases hr0 : intFromBits y it = 0
+  · have hDivNone : intBinEval .Div (intFromBits x it) (intFromBits y it) it = none := by
+      simp [intBinEval, hr0]
+    have hDivNoneSc :
+        evalScalarBinOp .div ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+          .ub := hDivFrag.2 hDivNone
+    rw [hDivNoneSc]
+    simp [evalBinOp, evalIntBinOp, hr0, ub]
+  · by_cases hrep : IntType.can_represent it (Int.tdiv (intFromBits x it) (intFromBits y it)) = true
+    · have hDivSome : intBinEval .Div (intFromBits x it) (intFromBits y it) it =
+          some (Int.tdiv (intFromBits x it) (intFromBits y it)) := by
+        simp [intBinEval, hr0, hrep]
+      have hRemSome : intBinEval .Rem (intFromBits x it) (intFromBits y it) it =
+          some (Int.tmod (intFromBits x it) (intFromBits y it)) := by
+        simp [intBinEval, hr0, hrep]
+      have hDivSomeSc :
+          evalScalarBinOp .div ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+            .ok (.scalar ⟨(Int.tdiv (intFromBits x it) (intFromBits y it) % 2 ^ (8 * it.size.bytes)).toNat,
+              it.size.bytes⟩) [] {} := hDivFrag.1 _ hDivSome
+      have hRemSomeSc :
+          evalScalarBinOp .rem ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+            .ok (.scalar ⟨(Int.tmod (intFromBits x it) (intFromBits y it) % 2 ^ (8 * it.size.bytes)).toNat,
+              it.size.bytes⟩) [] {} := hRemFrag.1 _ hRemSome
+      rw [hDivSomeSc, hRemSomeSc]
+      dsimp only
+      by_cases hrem : Int.tmod (intFromBits x it) (intFromBits y it) = 0
+      · have hBringMod :
+            IntType.bring_in_bounds it (Int.tdiv (intFromBits x it) (intFromBits y it)) %
+              2 ^ (8 * it.size.bytes) =
+            Int.tdiv (intFromBits x it) (intFromBits y it) % 2 ^ (8 * it.size.bytes) := by
+          rcases it with ⟨s, sz⟩
+          unfold IntType.bring_in_bounds bringInBounds Interp.Size.bits
+          dsimp only
+          cases s
+          · exact Int.emod_emod _ _
+          · dsimp only
+            split
+            · exact Int.emod_emod _ _
+            · rw [Int.sub_emod_right, Int.emod_emod]
+        simp only [↓reduceIte, evalBinOp, evalIntBinOp, hr0, hrep, hrem, ne_eq,
+          not_true_eq_false, Bool.not_true, Bool.false_eq_true, Int.zero_emod, Int.toNat_zero]
+        refine ⟨fun q hq => ?_, fun ⟨msg, hErr⟩ => ?_⟩
+        · simp [Bind.bind, Except.bind, Pure.pure, Except.pure] at hq
+          subst hq
+          rw [hBringMod]
+          exact ⟨bringInBounds_eq_intFromBits it hgood _, rfl⟩
+        · simp [Bind.bind, Except.bind, Pure.pure, Except.pure] at hErr
+      · -- Show `(tmod % 2^(8*sz)).toNat ≠ 0` when `tmod ≠ 0`:
+        have hRemBitsNz :
+            ((Int.tmod (intFromBits x it) (intFromBits y it) %
+              2 ^ (8 * it.size.bytes)).toNat ≠ 0) := by
+          have hyBound :
+              -((2 ^ (8 * it.size.bytes) : Nat) : Int) < intFromBits y it ∧
+                intFromBits y it < ((2 ^ (8 * it.size.bytes) : Nat) : Int) := by
+            rcases it with ⟨s, ⟨sz⟩⟩
+            dsimp only at hgood hsz hy hyWrap ⊢
+            cases s with
+            | Unsigned =>
+              simp only [intFromBits]
+              omega
+            | Signed =>
+              obtain ⟨hM, _⟩ := two_pow_byte_split sz hsz
+              have hcr := canRepresent_intFromBits ⟨.Signed, ⟨sz⟩⟩ y hgood hy
+              rw [canRepresent_signed sz hsz, decide_eq_true_eq] at hcr
+              omega
+          have hRmBound := int_tmod_lt_bound (intFromBits x it) (intFromBits y it)
+            (2 ^ (8 * it.size.bytes)) hr0 hyBound.1 hyBound.2
+          have hpM : (2 : Int) ^ (8 * it.size.bytes) =
+              ((2 ^ (8 * it.size.bytes) : Nat) : Int) := by push_cast; rfl
+          rw [hpM]
+          generalize Int.tmod (intFromBits x it) (intFromBits y it) = rm at hrem hRmBound ⊢
+          generalize (2 ^ (8 * it.size.bytes) : Nat) = M at hRmBound ⊢
+          by_cases hrm0 : 0 ≤ rm
+          · rw [Int.emod_eq_of_lt hrm0 hRmBound.2]
+            omega
+          · have h1 : (rm + 1 * (M : Int)) % (M : Int) = rm + 1 * (M : Int) :=
+              Int.emod_eq_of_lt (by omega) (by omega)
+            rw [Int.add_mul_emod_self_right] at h1
+            rw [h1]
+            omega
+        simp [hRemBitsNz, evalBinOp, evalIntBinOp, hr0, hrep, hrem, ub, Bind.bind, Except.bind]
+    · simp only [Bool.not_eq_true] at hrep
+      have hDivNone : intBinEval .Div (intFromBits x it) (intFromBits y it) it = none := by
+        simp [intBinEval, hr0, hrep]
+      have hDivNoneSc :
+          evalScalarBinOp .div ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ [] {} (isSignedBool it.signed) =
+            .ub := hDivFrag.2 hDivNone
+      rw [hDivNoneSc]
+      simp [evalBinOp, evalIntBinOp, hr0, hrep, ub, Bind.bind, Except.bind]
+
+/-- **Symbolic correspondence for `LIntrinsicOp.saturatingAdd` and `LIntrinsicOp.saturatingSub`
+(`evalLIntrinsic_saturating_eq_minirust`)**: across every integer `RigidTy` `rk`
+(`intTyBytes rk = some (it.signed, it.size.bytes)`) and all valid bit patterns
+`x, y < 2 ^ (8 * it.size.bytes)`, `evalLIntrinsicValue` agrees with MiniRust's
+`evalBinOp (.IntWithOverflow .Add / .Sub)`: when `IntType.can_represent` holds (`ovfBit = 0`), it
+returns the exact non-overflowing sum/difference `((res % 2^(8*sz)).toNat)`; when overflow occurs
+(`ovfBit = 1`), it clamps to unsigned `MAX` / `0` or signed `T::MIN` / `T::MAX`. -/
+theorem evalLIntrinsic_saturating_eq_minirust
+    (isSub : Bool)
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let op : Anneal.Mir.AdtAndControl.LIntrinsicOp := if isSub then .saturatingSub else .saturatingAdd
+    let cop : Gen.IntBinOpWithOverflow := if isSub then .Sub else .Add
+    let l := intFromBits x it
+    let r := intFromBits y it
+    let res := intCheckedArith cop l r
+    let clampedBits : Nat :=
+      if IntType.can_represent it res then
+        (res % 2 ^ (8 * it.size.bytes)).toNat
+      else match it.signed with
+        | .Unsigned => if isSub then 0 else 2 ^ (8 * it.size.bytes) - 1
+        | .Signed =>
+          if l < 0 then 2 ^ (8 * it.size.bytes - 1) else 2 ^ (8 * it.size.bytes - 1) - 1
+    evalBinOp (.IntWithOverflow cop) (.Int l, .Int it) (.Int r, .Int it) =
+        .ok (tupleVal it (res % 2 ^ (8 * it.size.bytes)).toNat
+              (if IntType.can_represent it res then 0 else 1), intBoolTupleTy it) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue op (rk :: restTys) decls layouts argOps
+          [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨clampedBits, it.size.bytes⟩) := by
+  dsimp only
+  obtain ⟨hgood, hSign, _⟩ := intTyBytes_intrinsic_props hrk false decls layouts
+  refine ⟨evalBinOp_intWithOverflow _ it hgood _ _, ?_⟩
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hxWrap : wrapScalarBits x (scalarModulus it.size.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus it.size.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  have hp : (2 : Int) ^ (8 * it.size.bytes) = ((2 ^ (8 * it.size.bytes) : Nat) : Int) := by
+    push_cast; rfl
+  rcases it with ⟨s, ⟨sz⟩⟩
+  dsimp only at hgood hsz hbeq hx hy hxWrap hyWrap hp hSign ⊢
+  cases isSub
+  · -- saturatingAdd
+    simp only [Bool.false_eq_true, ↓reduceIte, Anneal.Mir.AdtAndControl.evalLIntrinsicValue,
+      resolveIntrinsicIsSigned, hSign, evalSaturatingAdd, hbeq, Nat.beq_refl, Bool.not_true,
+      Bool.or_false, hxWrap, hyWrap, intCheckedArith]
+    cases s with
+    | Unsigned =>
+      simp only [canRepresent_unsigned sz hsz, intFromBits, scalarModulus_eq, Nat.add_eq,
+        Nat.sub_eq, nat_ble_eq_decide]
+      by_cases hlt : x + y < 2 ^ (8 * sz)
+      · rw [decide_eq_false (by omega : ¬(2 ^ (8 * sz) ≤ x + y)),
+          decide_eq_true (by omega : 0 ≤ (x : Int) + y ∧ (x : Int) + y < ((2 ^ (8 * sz) : Nat) : Int))]
+        simp only [↓reduceIte, Option.map]
+        have hcast : (x : Int) + (y : Int) = ((x + y : Nat) : Int) := by push_cast; rfl
+        rw [hcast, hp, nat_emod_toNat_of_lt (x + y) _ hlt]
+      · rw [decide_eq_true (by omega : 2 ^ (8 * sz) ≤ x + y),
+          decide_eq_false (by omega : ¬(0 ≤ (x : Int) + y ∧ (x : Int) + y < ((2 ^ (8 * sz) : Nat) : Int)))]
+        rfl
+    | Signed =>
+      simp only [signedOverflowAdd_eq x y sz hsz hx hy, Nat.add_eq]
+      cases hrep : IntType.can_represent ⟨.Signed, ⟨sz⟩⟩
+          (intFromBits x ⟨.Signed, ⟨sz⟩⟩ + intFromBits y ⟨.Signed, ⟨sz⟩⟩)
+      · simp only [Bool.not_false, Bool.false_eq_true, ↓reduceIte, Option.map,
+          isSignedNegative_eq x sz hsz hx, signedHalfModulus_eq_two_pow sz hsz, Nat.sub_eq]
+        by_cases hxH : x < 2 ^ (8 * sz - 1)
+        · have hlNonneg : ¬(intFromBits x ⟨.Signed, ⟨sz⟩⟩ < 0) := by
+            simp [intFromBits, hxH]
+          rw [decide_eq_false (by omega : ¬(2 ^ (8 * sz - 1) ≤ x))]
+          simp only [hlNonneg, ↓reduceIte]
+        · have hlNeg : intFromBits x ⟨.Signed, ⟨sz⟩⟩ < 0 := by
+            simp [intFromBits, hxH]; omega
+          rw [decide_eq_true (by omega : 2 ^ (8 * sz - 1) ≤ x)]
+          simp only [hlNeg, ↓reduceIte]
+      · simp [wrap_add_intFromBits ⟨.Signed, ⟨sz⟩⟩ x y hx hy]
+  · -- saturatingSub
+    simp only [↓reduceIte, Anneal.Mir.AdtAndControl.evalLIntrinsicValue,
+      resolveIntrinsicIsSigned, hSign, evalSaturatingSub, hbeq, Nat.beq_refl, Bool.not_true,
+      Bool.or_false, hxWrap, hyWrap, intCheckedArith]
+    cases s with
+    | Unsigned =>
+      simp only [canRepresent_unsigned sz hsz, intFromBits, Nat.sub_eq, nat_ble_eq_decide]
+      by_cases hle : y ≤ x
+      · have hlt : x - y < 2 ^ (8 * sz) := by omega
+        rw [decide_eq_true hle,
+          decide_eq_true (by omega : 0 ≤ (x : Int) - y ∧ (x : Int) - y < ((2 ^ (8 * sz) : Nat) : Int))]
+        simp only [↓reduceIte, Option.map]
+        have hcast : (x : Int) - (y : Int) = ((x - y : Nat) : Int) := by omega
+        rw [hcast, hp, nat_emod_toNat_of_lt (x - y) _ hlt]
+      · rw [decide_eq_false hle,
+          decide_eq_false (by omega : ¬(0 ≤ (x : Int) - y ∧ (x : Int) - y < ((2 ^ (8 * sz) : Nat) : Int)))]
+        rfl
+    | Signed =>
+      simp only [signedOverflowSub_eq x y sz hsz hx hy]
+      cases hrep : IntType.can_represent ⟨.Signed, ⟨sz⟩⟩
+          (intFromBits x ⟨.Signed, ⟨sz⟩⟩ - intFromBits y ⟨.Signed, ⟨sz⟩⟩)
+      · simp only [Bool.not_false, Bool.false_eq_true, ↓reduceIte, Option.map,
+          isSignedNegative_eq x sz hsz hx, signedHalfModulus_eq_two_pow sz hsz, Nat.sub_eq]
+        by_cases hxH : x < 2 ^ (8 * sz - 1)
+        · have hlNonneg : ¬(intFromBits x ⟨.Signed, ⟨sz⟩⟩ < 0) := by
+            simp [intFromBits, hxH]
+          rw [decide_eq_false (by omega : ¬(2 ^ (8 * sz - 1) ≤ x))]
+          simp only [hlNonneg, ↓reduceIte]
+        · have hlNeg : intFromBits x ⟨.Signed, ⟨sz⟩⟩ < 0 := by
+            simp [intFromBits, hxH]; omega
+          rw [decide_eq_true (by omega : 2 ^ (8 * sz - 1) ≤ x)]
+          simp only [hlNeg, ↓reduceIte]
+      · simp only [Bool.not_true, ↓reduceIte, Option.map]
+        have hsub := wrap_sub_intFromBits ⟨.Signed, ⟨sz⟩⟩ x y hx hy
+        dsimp only at hsub
+        rw [hxWrap, hyWrap] at hsub
+        rw [← hsub]
+        simp only [wrapScalarBits_eq, scalarModulus_eq, Nat.add_eq, Nat.sub_eq, nat_ble_eq_decide]
+        generalize 2 ^ (8 * sz) = M at hx hy ⊢
+        by_cases hle : y ≤ x
+        · rw [decide_eq_true hle]; dsimp only
+          have hsplit : x + (M - y) = M + (x - y) := by omega
+          rw [hsplit, Nat.add_mod_left]
+        · rw [decide_eq_false hle]; dsimp only
+          have hsplit : x + (M - y) = M + x - y := by omega
+          rw [hsplit]
+
+/-- **Symbolic correspondence for `LIntrinsicOp.threeWayCompare`
+(`evalLIntrinsic_threeWayCompare_eq_minirust`)**: across every integer `RigidTy` `rk`
+(`intTyBytes rk = some (it.signed, it.size.bytes)`) and all valid bit patterns
+`x, y < 2 ^ (8 * it.size.bytes)`, `evalLIntrinsicValue .threeWayCompare` returns the 1-byte
+`Ordering` scalar `⟨ordBits (cmpOf (.Int it) x y), 1⟩` matching MiniRust's `evalBinOp (.Rel .Cmp)`. -/
+theorem evalLIntrinsic_threeWayCompare_eq_minirust
+    {rk : RigidTy} {it : Gen.IntType} (hrk : intTyBytes rk = some (it.signed, it.size.bytes))
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (restTys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    let l := intFromBits x it
+    let r := intFromBits y it
+    evalBinOp (.Rel .Cmp) (.Int l, .Int it) (.Int r, .Int it) =
+        .ok (evalRelOp .Cmp (intCmp l r)) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .threeWayCompare (rk :: restTys) decls layouts
+          argOps [.scalar ⟨x, it.size.bytes⟩, .scalar ⟨y, it.size.bytes⟩] flag =
+        some (.scalar ⟨ordBits (cmpOf (.Int it) x y), 1⟩) := by
+  dsimp only
+  obtain ⟨hgood, hSign, _⟩ := intTyBytes_intrinsic_props hrk true decls layouts
+  clear hrk
+  refine ⟨rfl, ?_⟩
+  rcases it with ⟨s, sz⟩
+  dsimp only at hgood hSign hx hy ⊢
+  have hsz : sz.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq sz.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hxWrap : wrapScalarBits x (scalarModulus sz.bytes) = x := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hx]
+  have hyWrap : wrapScalarBits y (scalarModulus sz.bytes) = y := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hy]
+  have hCmp := evalScalarBinOp_cmp_int ⟨s, sz⟩ hgood x y hx hy [] {}
+  simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, resolveIntrinsicIsSigned, hSign,
+    evalThreeWayCompare, hbeq, Nat.beq_refl, Bool.not_true, Bool.or_false, hxWrap, hyWrap]
+  simp only [evalScalarBinOp, hbeq, Nat.beq_refl, hxWrap, hyWrap, u8Ty] at hCmp
+  cases s <;> cases hxy : Nat.beq x y <;> simp only [hxy] at hCmp ⊢
+  · cases hle : Nat.ble x y <;>
+      simp only [hle] at hCmp ⊢ <;> injection hCmp with hv <;> injection hv with hsc <;>
+      simp [← hsc]
+  · injection hCmp with hv; injection hv with hsc; simp [← hsc]
+  · cases hslt : signedLt x y sz.bytes <;>
+      simp only [hslt] at hCmp ⊢ <;> injection hCmp with hv <;> injection hv with hsc <;>
+      simp [← hsc]
+  · injection hCmp with hv; injection hv with hsc; simp [← hsc]
+
+/-- **Symbolic correspondence for `LIntrinsicOp.ubChecks`
+(`evalLIntrinsic_ubChecks_eq_minirust`)**: `evalLIntrinsicValue .ubChecks` returns the 1-byte
+boolean scalar `0` or `1` governed by `ubChecksFlag`, matching MiniRust's session-configured
+`ValueExpr.Constant (.Bool flag) .Bool`. -/
+theorem evalLIntrinsic_ubChecks_eq_minirust
+    (flag : Bool) (m : Mach) (tys : List RigidTy) (decls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (argOps : List Operand) :
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ubChecks tys decls layouts argOps [] flag =
+        some (.scalar ⟨if flag then 1 else 0, 1⟩) ∧
+      Interp.evalValue m (.Constant (.Bool flag) .Bool) = .ok ((.Bool flag, .Bool), m) := by
+  cases flag <;> exact ⟨rfl, rfl⟩
+
+/-- **Symbolic correspondence for `LIntrinsicOp.arithOffset`
+(`evalLIntrinsic_arithOffset_eq_minirust`)**: on any 64-bit pointer `ptrVal`
+(`ptrVal.offsetBytes < 2^64`) and `isize` count `countBits < 2^64` with pointee `rk` of byte stride
+`elemSz`, `evalLIntrinsicValue .arithOffset` preserves `ptrVal.allocId` provenance and computes the
+exact `2^64`-wrapped byte address produced by MiniRust's `evalPtrOffset m false`
+(`ptrOffsetWrapping` / `ThinPointer.wrapping_offset`). -/
+theorem evalLIntrinsic_arithOffset_eq_minirust
+    (m : Mach) (ptrVal : ProvenancePtr) (_hOff : ptrVal.offsetBytes < 2 ^ 64)
+    (countBits : Nat) (hCnt : countBits < 2 ^ 64)
+    {rk : RigidTy} {elemSz : Nat} (restTys : List RigidTy)
+    (decls : List LocalDecl) (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (hElem : intrinsicRigidTyByteSize decls layouts rk = some elemSz)
+    (argOps : List Operand) (flag : Bool)
+    (mrPtr : Ptr) (lTy : Gen.Type) (hAddr : mrPtr.addr = (ptrVal.offsetBytes : Int)) :
+    let isizeIt : Gen.IntType := ⟨.Signed, ⟨8⟩⟩
+    let byteDelta : Int := intFromBits countBits isizeIt * (elemSz : Int)
+    ∃ newOff,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .arithOffset (rk :: restTys) decls layouts
+          argOps [.ptr ptrVal 8, .scalar ⟨countBits, 8⟩] flag =
+        some (.ptr { ptrVal with offsetBytes := newOff } 8) ∧
+      evalPtrOffset m false (.Ptr ⟨mrPtr, none⟩, lTy) (.Int byteDelta, .Int isizeIt) =
+        .ok (.Ptr ⟨{ mrPtr with addr := (newOff : Int) }, none⟩, lTy) := by
+  dsimp only
+  have hCntWrap : wrapScalarBits countBits (scalarModulus 8) = countBits := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hCnt]
+  simp only [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, show Nat.beq 8 8 = true from rfl,
+    ↓reduceIte, hElem, evalArithOffset, Bool.and_self, hCntWrap]
+  refine ⟨_, rfl, ?_⟩
+  simp only [evalPtrOffset, Bool.false_eq_true, ↓reduceIte, ptrOffsetWrapping,
+    ThinPointer.wrapping_offset, ThinPointer.widen, Pure.pure, Except.pure, Bind.bind,
+    Except.bind, bringInBounds, x86_64.PTR_SIZE, Interp.Size.bits, hAddr]
+  congr 5
+  have hIsNeg := isSignedNegative_eq countBits 8 (by decide) hCnt
+  rw [hIsNeg]
+  simp only [wrapScalarBits_eq, scalarModulus_eq, Nat.add_eq, Nat.mul_eq, Nat.sub_eq, intFromBits]
+  have hp64 : (2 : Int) ^ (8 * 8) = ((2 ^ 64 : Nat) : Int) := by decide
+  rw [hp64]
+  by_cases hlt : countBits < 2 ^ (8 * 8 - 1)
+  · rw [decide_eq_false (by omega : ¬(2 ^ (8 * 8 - 1) ≤ countBits))]
+    simp only [hlt, ↓reduceIte]
+    have hcast : (ptrVal.offsetBytes : Int) + (countBits : Int) * (elemSz : Int) =
+        ((ptrVal.offsetBytes + countBits * elemSz : Nat) : Int) := by push_cast; rfl
+    rw [hcast]
+    exact (Int.natCast_emod (ptrVal.offsetBytes + countBits * elemSz) (2 ^ 64)).symm
+  · rw [decide_eq_true (by omega : 2 ^ (8 * 8 - 1) ≤ countBits)]
+    simp only [hlt, ↓reduceIte]
+    symm
+    change (((ptrVal.offsetBytes + (2 ^ 64 - (((2 ^ 64 - countBits) * elemSz) % 2 ^ 64))) % 2 ^ 64 : Nat) : Int) =
+      ((ptrVal.offsetBytes : Int) + ((countBits : Int) - ((2 ^ 64 : Nat) : Int)) * (elemSz : Int)) %
+        ((2 ^ 64 : Nat) : Int)
+    generalize hMDef : (2 ^ 64 : Nat) = M
+    have hMpos : 0 < M := by rw [← hMDef]; decide
+    have hCntLe : countBits ≤ M := by rw [← hMDef] at *; omega
+    generalize hMagDef : M - countBits = mag
+    generalize hdDef : (mag * elemSz) % M = d
+    have hdLt : d < M := by rw [← hdDef]; exact Nat.mod_lt _ hMpos
+    have hSubLt : M - d ≤ M := Nat.sub_le M d
+    rw [Int.natCast_emod (ptrVal.offsetBytes + (M - d)) M]
+    have h1 : ((ptrVal.offsetBytes + (M - d) : Nat) : Int) =
+        (ptrVal.offsetBytes : Int) + (M : Int) - (d : Int) := by omega
+    have hdCast : (d : Int) = ((mag * elemSz : Nat) : Int) % (M : Int) := by
+      rw [← hdDef]; exact Int.natCast_emod (mag * elemSz) M
+    have hMagCast : ((countBits : Int) - (M : Int)) * (elemSz : Int) =
+        -((mag * elemSz : Nat) : Int) := by
+      have hc : (countBits : Int) - (M : Int) = -(mag : Int) := by omega
+      rw [hc]
+      push_cast
+      exact Int.neg_mul (mag : Int) (elemSz : Int)
+    rw [h1, hdCast, hMagCast]
+    have h2 : (ptrVal.offsetBytes : Int) + (M : Int) - ((mag * elemSz : Nat) : Int) % (M : Int) =
+        ((ptrVal.offsetBytes : Int) - (((mag * elemSz : Nat) : Int) % (M : Int))) + 1 * (M : Int) := by
+      omega
+    rw [h2, Int.add_mul_emod_self_right, Int.sub_emod, Int.emod_emod, ← Int.sub_emod,
+      Int.sub_eq_add_neg]
+
+/-- **Diverging `LIntrinsicOp.unreachableUnchecked` and `LIntrinsicOp.abort` correspondence
+(`evalLoweredTerminator_diverging_intrinsics_correspondence`)**:
+1. `unreachableUnchecked` rejects in `evalLoweredTerminator` (`= none`), faults with UB in
+   `Trusted.evalTerminator` (`= .fail .ub`), and matches MiniRust's `Interp.evalTerminator m .Unreachable`
+   (`= .error (.ub "reached unreachable code")`);
+2. `abort` terminates immediately in `evalLoweredTerminator` (`= some (.terminated 0)`) and steps to
+   `MirStepNode.retOutcome .abort` in `Trusted.stepMirFn`, bypassing any `UnwindAction.cleanup` edge. -/
+theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach) :
+    Interp.evalTerminator m .Unreachable = .error (.ub "reached unreachable code") ∧
+      Anneal.Mir.AdtAndControl.evalLoweredTerminator
+          Anneal.Mir.AdtAndControl.witnessDivergingEnv
+          Anneal.Mir.AdtAndControl.witnessAbortCleanupBody 0 [.uninit] none =
+        some (.terminated 0) ∧
+      stepMirFn Anneal.Mir.AdtAndControl.witnessAbortCleanupCm
+          (initMachineState Anneal.Mir.AdtAndControl.witnessAbortCleanupCm []) =
+        .retOutcome .abort := by
+  exact ⟨rfl, Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind.1,
+    Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind.2.2.1⟩
+
+/-- **Axiom-audit hook for Episode 2's `.call`, `LIntrinsicOp`, and `LCallTable` multi-callee model
+(`call_intrinsic_audit_closure`)**: references every Episode 2 theorem of
+`Anneal.Mir.AdtAndControl` (Section 3b `.call` refinement + Sections 5a–5e: `LIntrinsicOp`,
+`LCallTarget`, `V2026_06_01` adapter, UB parity, `abort`/`panicUnwind`, call-form `write_bytes` /
+`copy_nonoverlapping`, `LCallTable` multi-frame linked-callee refinement, and concrete non-vacuity
+Witness Suites 1–4), ensuring `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` and
+`#assert_all_minirustspec_standard_axioms` verify standard-axiom purity (`sorry_free=true`, zero
+`Lean.ofReduceBool`) across all of them transitively. -/
+theorem call_intrinsic_audit_closure : True :=
+  let _ := @Anneal.Mir.AdtAndControl.evalOperandsState_below_refines
+  let _ := @Anneal.Mir.AdtAndControl.writePlaceState_bare_below_refines
+  let _ := @Anneal.Mir.AdtAndControl.resolveIntrinsicIsSigned_defPath_irrel
+  let _ := @Anneal.Mir.AdtAndControl.resolveIntrinsicShiftSigned_defPath_irrel
+  let _ := @Anneal.Mir.AdtAndControl.resolveIntrinsicPointeeTy?_defPath_irrel
+  let _ := @Anneal.Mir.AdtAndControl.evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_refines_evalTerminator
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredCfgSteps_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_goto_sound
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_uninhabited_dest_none
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall_goto_cleanup_invariant
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_goto_cleanup_invariant
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_at_end_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredCfgSteps_with_stmts_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.LIntrinsicOp.fromRustIntrinsicKind_constEvalSelect_none
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_exactDiv
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_of_classifyRustIntrinsic
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_unreachable_targets
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_abort_and_panic_targets
+  let _ := @Anneal.Mir.AdtAndControl.trustedSupportsIntrinsicDefPath_of_check
+  let _ := @Anneal.Mir.AdtAndControl.classifyLinkedCallTarget_V2026_06_01_linked_precedence
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_intrinsic_goto_sound
+  let _ := @Anneal.Mir.AdtAndControl.writePlaceState_init_proj_below_refines
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_unreachableUnchecked_ub_parity
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_exactDiv_ub_parity
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_abort_bypasses_cleanup
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_panicUnwind_cleanup
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_panicUnwind_unreachable_ub
+  let _ := @Anneal.Mir.AdtAndControl.repeatByteBits_lt_pow
+  let _ := @Anneal.Mir.AdtAndControl.evalWriteBytesSubplace_zero_count
+  let _ := @Anneal.Mir.AdtAndControl.evalWriteBytesSubplace_dead_none
+  let _ := @Anneal.Mir.AdtAndControl.evalWriteBytesSubplace_put_get
+  let _ := @Anneal.Mir.AdtAndControl.evalWriteBytesSubplace_refines_writePlaceValue
+  let _ := @Anneal.Mir.AdtAndControl.initLCalleeSlots_below_initLocals
+  let _ := @Anneal.Mir.AdtAndControl.CallStackCorr.length_eq
+  let _ := @Anneal.Mir.AdtAndControl.stepMirFn_multi_at_end_eq_evalTerminator
+  let _ := @Anneal.Mir.AdtAndControl.unwindLCallStack_refines_unwindFromCallStack
+  let _ := @Anneal.Mir.AdtAndControl.stepLoweredWithCallTable_maxCallDepth
+  let _ := @Anneal.Mir.AdtAndControl.stepLoweredWithCallTable_diverging_return_ub
+  let _ := @Anneal.Mir.AdtAndControl.stepLoweredWithCallTable_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.runLoweredWithCallTable_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.lookupCallee_eq_none_of_findCallee_none
+  let _ := @Anneal.Mir.AdtAndControl.witnessInlineIntrinsics_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_inline_intrinsics_cfg_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.witnessPtrIntrinsics_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_ptr_intrinsics_cfg_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.witness_call_writeBytes_and_copyNonOverlapping_subplace
+  let _ := @Anneal.Mir.AdtAndControl.witness_inline_intrinsics_ub_parity
+  let _ := @Anneal.Mir.AdtAndControl.witnessAbortCleanup_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witnessPanicCleanup_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind
+  let _ := @Anneal.Mir.AdtAndControl.witness_multi_callee_two_deep_and_unwind
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge

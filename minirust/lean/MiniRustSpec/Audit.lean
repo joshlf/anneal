@@ -5432,6 +5432,11 @@ open MiniRustSpec.Correspondence in
   bdPolymorphicCallee_rejected
   bdPolymorphicCall_anneal_failClosed
   bdUnmonoParamAliasBody_failClosed
+  ctpopLoop_eq_popcountBits
+  optScalarIs_iff
+  evalLIntrinsic_ctpop_eq_minirust
+  evalLIntrinsic_bitops_fallback_correspondence
+  lowerIntrinsicKind_boundary_correspondence
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 
@@ -5514,6 +5519,17 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   evalDeinitPlace_spec_minirust_store_simulation
   paddedDeinitSiblingReinit_anneal_shell_agreement
   subplace_audit_closure
+  intTyBytes_intrinsic_props
+  evalLIntrinsic_wrapping_eq_minirust
+  evalLIntrinsic_unchecked_binop_iff_minirust
+  evalLIntrinsic_unchecked_shift_iff_minirust
+  evalLIntrinsic_exactDiv_iff_minirust
+  evalLIntrinsic_saturating_eq_minirust
+  evalLIntrinsic_threeWayCompare_eq_minirust
+  evalLIntrinsic_ubChecks_eq_minirust
+  evalLIntrinsic_arithOffset_eq_minirust
+  evalLoweredTerminator_diverging_intrinsics_correspondence
+  call_intrinsic_audit_closure
   translateRvalue_discriminant
   evalValue_orderingDiscrExpr
   evalValue_orderingDiscrExpr_ub

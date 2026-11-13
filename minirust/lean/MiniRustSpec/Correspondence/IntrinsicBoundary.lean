@@ -1009,4 +1009,170 @@ theorem bdUnmonoParamAliasBody_failClosed :
         MirStepNode.unsupported :=
   ⟨by decide, rfl, rfl, by decide, rfl, rfl⟩
 
+/-! ## 7. Lowered `LIntrinsicOp` / `LCallTarget` boundary correspondence (`DeinitBridge`) -/
+
+/-- `MirSemantics.ctpopLoop` coincides identically with `popcountBits`. -/
+theorem ctpopLoop_eq_popcountBits : ∀ (n u : Nat), ctpopLoop n u = popcountBits n u
+  | 0, _ => rfl
+  | n + 1, u => by simp [ctpopLoop, popcountBits, Nat.add_eq, ctpopLoop_eq_popcountBits n (u / 2)]
+
+/-- **Symbolic correspondence for `LIntrinsicOp.ctpop` against MiniRust's `IntUnOp::CountOnes`
+(`evalLIntrinsic_ctpop_eq_minirust`)**: across every signed and unsigned `IntType` width
+(`GoodSize it.size.bytes`) and every valid bit pattern `bits < 2 ^ (8 * it.size.bytes)`,
+`evalLIntrinsicValue .ctpop` produces the 4-byte `u32` population count matching MiniRust's
+`evalUnOp (.Int .CountOnes)`. -/
+theorem evalLIntrinsic_ctpop_eq_minirust
+    (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (bits : Nat) (hbits : bits < 2 ^ (8 * it.size.bytes))
+    (tys : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (flag : Bool) :
+    evalUnOp (.Int .CountOnes) (.Int (intFromBits bits it), .Int it) =
+        .ok (.Int (evalCountOnes (intFromBits bits it) it), .Int ⟨.Unsigned, ⟨4⟩⟩) ∧
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctpop tys decls layouts argOps
+          [.scalar ⟨bits, it.size.bytes⟩] flag =
+        some (.scalar ⟨(evalCountOnes (intFromBits bits it) it).toNat, 4⟩) := by
+  refine ⟨evalUnOp_countOnes (intFromBits bits it) it hgood, ?_⟩
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hWrap : wrapScalarBits bits (scalarModulus it.size.bytes) = bits := by
+    rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hbits]
+  rw [evalCountOnes_intFromBits, Int.toNat_natCast]
+  simp [Anneal.Mir.AdtAndControl.evalLIntrinsicValue, evalCtpop, hbeq, hWrap,
+    Nat.mul_eq, Nat.mul_comm it.size.bytes 8, ctpopLoop_eq_popcountBits]
+
+/-- Boolean check that `ov` is `some (.scalar ⟨bits, sz⟩)`, used for fast kernel reduction over
+exhaustive `u8`/`i8` domains and `u32` boundary samples. -/
+def optScalarIs (ov : Option Value) (bits sz : Nat) : Bool :=
+  match ov with
+  | some (.scalar sc) => Nat.beq sc.bits bits && Nat.beq sc.sizeBytes sz
+  | _ => false
+
+theorem optScalarIs_iff (ov : Option Value) (bits sz : Nat) :
+    optScalarIs ov bits sz = true ↔ ov = some (.scalar ⟨bits, sz⟩) := by
+  cases ov with
+  | none => simp [optScalarIs]
+  | some v =>
+    cases v with
+    | scalar sc =>
+      rcases sc with ⟨b, s⟩
+      simp [optScalarIs, nat_beq_eq_decide]
+    | _ => simp [optScalarIs]
+
+/-- **Exhaustive bit-manipulation & saturating correspondence between `LIntrinsicOp` and
+`IntrinsicFallback`'s MiniRust-verified specifications (`evalLIntrinsic_bitops_fallback_correspondence`)**:
+- `ctlz`, `cttz`, and `bitreverse` agree with `fbCtlzSpec`, `fbCttzSpec`, and `fbBitrevSpec` for
+  all `a < 256` (which `fbCtlz_minirust_all`, `fbCttz_minirust_all`, and `fbBitrev_minirust_all`
+  connect end-to-end to MiniRust machine execution);
+- `ctlzNonzero` and `cttzNonzero` fault (`none`) at `0` and agree with `fbCtlzSpec` / `fbCttzSpec`
+  for all `1 ≤ a < 256`;
+- `bswap` agrees with `fbBswapSpec` across all `fbU32Samples` (`fbBswap_minirust_all`);
+- `saturatingAdd` (`u8`) and `saturatingSub` (`i8`) agree with `fbSatAddSpec` and `fbSatSubSpec`
+  across the full 256-input `b = 128` rows (`fbSatAdd_minirust_row`, `fbSatSub_minirust_row`). -/
+theorem evalLIntrinsic_bitops_fallback_correspondence :
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlz [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbCtlzSpec a, 4⟩)) ∧
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlzNonzero [.uint .u8] [] emptyLayoutTable []
+      [.scalar ⟨0, 1⟩] true = none ∧
+    (∀ i < 255,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .ctlzNonzero [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨i + 1, 1⟩] true = some (.scalar ⟨fbCtlzSpec (i + 1), 4⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttz [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbCttzSpec a, 4⟩)) ∧
+    Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttzNonzero [.uint .u8] [] emptyLayoutTable []
+      [.scalar ⟨0, 1⟩] true = none ∧
+    (∀ i < 255,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .cttzNonzero [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨i + 1, 1⟩] true = some (.scalar ⟨fbCttzSpec (i + 1), 4⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .bitreverse [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩] true = some (.scalar ⟨fbBitrevSpec a, 1⟩)) ∧
+    (∀ a ∈ fbU32Samples,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .bswap [.uint .u32] [] emptyLayoutTable []
+        [.scalar ⟨a, 4⟩] true = some (.scalar ⟨fbBswapSpec a, 4⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .saturatingAdd [.uint .u8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩, .scalar ⟨128, 1⟩] true = some (.scalar ⟨fbSatAddSpec a 128, 1⟩)) ∧
+    (∀ a < 256,
+      Anneal.Mir.AdtAndControl.evalLIntrinsicValue .saturatingSub [.int .i8] [] emptyLayoutTable []
+        [.scalar ⟨a, 1⟩, .scalar ⟨128, 1⟩] true = some (.scalar ⟨fbSatSubSpec a 128, 1⟩)) := by
+  refine ⟨?_, rfl, ?_, ?_, rfl, ?_, ?_, ?_, ?_, ?_⟩
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .ctlz [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbCtlzSpec x) 4)
+        (by decide +kernel) a ha)
+  · intro i hi
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .ctlzNonzero [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x + 1, 1⟩] true) (fbCtlzSpec (x + 1)) 4)
+        (by decide +kernel) i hi)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .cttz [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbCttzSpec x) 4)
+        (by decide +kernel) a ha)
+  · intro i hi
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .cttzNonzero [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x + 1, 1⟩] true) (fbCttzSpec (x + 1)) 4)
+        (by decide +kernel) i hi)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .bitreverse [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩] true) (fbBitrevSpec x) 1)
+        (by decide +kernel) a ha)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_mem_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .bswap [.uint .u32] [] emptyLayoutTable [] [.scalar ⟨x, 4⟩] true) (fbBswapSpec x) 4)
+        (by decide +kernel) a ha)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .saturatingAdd [.uint .u8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩, .scalar ⟨128, 1⟩] true)
+        (fbSatAddSpec x 128) 1) (by decide +kernel) a ha)
+  · intro a ha
+    exact (optScalarIs_iff _ _ _).mp
+      (fb_forall_lt_of_all (p := fun x => optScalarIs (Anneal.Mir.AdtAndControl.evalLIntrinsicValue
+        .saturatingSub [.int .i8] [] emptyLayoutTable [] [.scalar ⟨x, 1⟩, .scalar ⟨128, 1⟩] true)
+        (fbSatSubSpec x 128) 1) (by decide +kernel) a ha)
+
+/-- **`V2026_06_01` adapter classification on `IntrinsicBoundary` call targets
+(`lowerIntrinsicKind_boundary_correspondence`)**: verifies how `lowerIntrinsicKind_V2026_06_01` and
+`classifyLinkedCallTarget_V2026_06_01` partition inline intrinsics (`exact_div`, `arith_offset`,
+`ctpop`, `ub_checks`, `abort`, `unreachable_unchecked`, sub-place `write_bytes` /
+`copy_nonoverlapping`), unmodeled external intrinsics (`cold_path` -> `none` -> `.callee`), and
+linked fallback bodies (`hasLinkedBody = true` overrides `.inlineIntrinsic` with `.callee`,
+matching `lookupCallee` precedence in `IntrinsicFallback`). -/
+theorem lowerIntrinsicKind_boundary_correspondence :
+    Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::exact_div" =
+        some .exactDiv ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::arith_offset" =
+        some .arithOffset ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::ctpop" =
+        some .ctpop ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::ub_checks" =
+        some .ubChecks ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::abort" =
+        some .abort ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::hint::unreachable_unchecked" =
+        some .unreachableUnchecked ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::write_bytes" =
+        some .writeBytes ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01
+          "core::intrinsics::copy_nonoverlapping" =
+        some .copyNonOverlapping ∧
+      Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::cold_path" =
+        none ∧
+      Anneal.Mir.AdtAndControl.classifyLinkedCallTarget_V2026_06_01 true
+          "core::intrinsics::ctlz" [] =
+        .callee "core::intrinsics::ctlz" [] ∧
+      Anneal.Mir.AdtAndControl.classifyLinkedCallTarget_V2026_06_01 false
+          "core::intrinsics::ctlz" [.uint .u8] =
+        .inlineIntrinsic .ctlz [.uint .u8] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence

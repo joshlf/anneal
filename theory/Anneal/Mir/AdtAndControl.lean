@@ -8337,14 +8337,442 @@ theorem placeRuntimeAccessOk_iff {slots : List LocalSlotState} {place : Place} :
   cases projectionHasDeref place.projection <;> cases placeFrameAccessOk slots place <;>
     cases checkPlaceSlotOk slots place <;> simp
 
+/-- Syntax-version-independent lowered intrinsic operation (`IntrinsicOp` in
+`crates/anneal-mir/src/ir.rs`), decoupling CFG and intrinsic semantics from
+`rustc`-version-specific `DefPath` strings. -/
+inductive LIntrinsicOp : Type where
+  | ctlz
+  | ctlzNonzero
+  | cttz
+  | cttzNonzero
+  | ctpop
+  | bswap
+  | bitreverse
+  | exactDiv
+  | wrappingAdd
+  | wrappingSub
+  | wrappingMul
+  | saturatingAdd
+  | saturatingSub
+  | uncheckedAdd
+  | uncheckedSub
+  | uncheckedMul
+  | uncheckedDiv
+  | uncheckedRem
+  | uncheckedShl
+  | uncheckedShr
+  | threeWayCompare
+  | ubChecks
+  | arithOffset
+  | sizeOfVal
+  | alignOfVal
+  | copyNonOverlapping
+  | writeBytes
+  | unreachableUnchecked
+  | abort
+  | panicUnwind
+  deriving DecidableEq, Repr
+
+/-- Syntax-version-independent lowered call target (`CallTarget` in
+`crates/anneal-mir/src/ir.rs`): either a direct inline intrinsic or a named callee symbol with
+generic type arguments. -/
+inductive LCallTarget : Type where
+  | inlineIntrinsic (op : LIntrinsicOp) (typeArgs : List RigidTy := []) : LCallTarget
+  | callee (sym : String) (typeArgs : List RigidTy := []) : LCallTarget
+
+/-- Map a non-`constEvalSelect` `Trusted.Rustc.V2026_06_01.MirSemantics.RustIntrinsicKind` to
+its corresponding `LIntrinsicOp`. -/
+@[reducible]
+def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsicOp
+  | .ubChecks => some .ubChecks
+  | .arithOffset => some .arithOffset
+  | .ctlz => some .ctlz
+  | .ctlzNonzero => some .ctlzNonzero
+  | .cttz => some .cttz
+  | .cttzNonzero => some .cttzNonzero
+  | .ctpop => some .ctpop
+  | .bswap => some .bswap
+  | .bitreverse => some .bitreverse
+  | .wrappingAdd => some .wrappingAdd
+  | .wrappingSub => some .wrappingSub
+  | .wrappingMul => some .wrappingMul
+  | .saturatingAdd => some .saturatingAdd
+  | .saturatingSub => some .saturatingSub
+  | .uncheckedShl => some .uncheckedShl
+  | .uncheckedShr => some .uncheckedShr
+  | .uncheckedAdd => some .uncheckedAdd
+  | .uncheckedSub => some .uncheckedSub
+  | .uncheckedMul => some .uncheckedMul
+  | .uncheckedDiv => some .uncheckedDiv
+  | .uncheckedRem => some .uncheckedRem
+  | .threeWayCompare => some .threeWayCompare
+  | .sizeOfVal => some .sizeOfVal
+  | .alignOfVal => some .alignOfVal
+  | .constEvalSelect => none
+
+/-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
+`RustIntrinsicKind` counterpart. -/
+@[reducible]
+def LIntrinsicOp.toRustIntrinsicKind? : LIntrinsicOp → Option RustIntrinsicKind
+  | .ubChecks => some .ubChecks
+  | .arithOffset => some .arithOffset
+  | .ctlz => some .ctlz
+  | .ctlzNonzero => some .ctlzNonzero
+  | .cttz => some .cttz
+  | .cttzNonzero => some .cttzNonzero
+  | .ctpop => some .ctpop
+  | .bswap => some .bswap
+  | .bitreverse => some .bitreverse
+  | .wrappingAdd => some .wrappingAdd
+  | .wrappingSub => some .wrappingSub
+  | .wrappingMul => some .wrappingMul
+  | .saturatingAdd => some .saturatingAdd
+  | .saturatingSub => some .saturatingSub
+  | .uncheckedShl => some .uncheckedShl
+  | .uncheckedShr => some .uncheckedShr
+  | .uncheckedAdd => some .uncheckedAdd
+  | .uncheckedSub => some .uncheckedSub
+  | .uncheckedMul => some .uncheckedMul
+  | .uncheckedDiv => some .uncheckedDiv
+  | .uncheckedRem => some .uncheckedRem
+  | .threeWayCompare => some .threeWayCompare
+  | .sizeOfVal => some .sizeOfVal
+  | .alignOfVal => some .alignOfVal
+  | _ => none
+
+/-- `std::intrinsics::*` and `core::ptr::*` / `std::ptr::*` alias paths recognized by
+`crates/anneal-mir/src/rustc_v2026_06_01.rs` beyond `Terminators.lean`'s canonical
+`core::intrinsics::*` table. -/
+@[reducible]
+def classifyStdIntrinsicAlias_V2026_06_01? (defPath : DefPath) : Option LIntrinsicOp :=
+  if stringEq defPath "std::intrinsics::ub_checks" then some .ubChecks
+  else if stringEq defPath "std::intrinsics::arith_offset" then some .arithOffset
+  else if stringEq defPath "std::intrinsics::ctlz" then some .ctlz
+  else if stringEq defPath "std::intrinsics::ctlz_nonzero" then some .ctlzNonzero
+  else if stringEq defPath "std::intrinsics::cttz" then some .cttz
+  else if stringEq defPath "std::intrinsics::cttz_nonzero" then some .cttzNonzero
+  else if stringEq defPath "std::intrinsics::ctpop" then some .ctpop
+  else if stringEq defPath "std::intrinsics::bswap" then some .bswap
+  else if stringEq defPath "std::intrinsics::bitreverse" then some .bitreverse
+  else if stringEq defPath "std::intrinsics::wrapping_add" then some .wrappingAdd
+  else if stringEq defPath "std::intrinsics::wrapping_sub" then some .wrappingSub
+  else if stringEq defPath "std::intrinsics::wrapping_mul" then some .wrappingMul
+  else if stringEq defPath "std::intrinsics::saturating_add" then some .saturatingAdd
+  else if stringEq defPath "std::intrinsics::saturating_sub" then some .saturatingSub
+  else if stringEq defPath "std::intrinsics::unchecked_shl" then some .uncheckedShl
+  else if stringEq defPath "std::intrinsics::unchecked_shr" then some .uncheckedShr
+  else if stringEq defPath "std::intrinsics::unchecked_add" then some .uncheckedAdd
+  else if stringEq defPath "std::intrinsics::unchecked_sub" then some .uncheckedSub
+  else if stringEq defPath "std::intrinsics::unchecked_mul" then some .uncheckedMul
+  else if stringEq defPath "std::intrinsics::unchecked_div" then some .uncheckedDiv
+  else if stringEq defPath "std::intrinsics::unchecked_rem" then some .uncheckedRem
+  else if stringEq defPath "std::intrinsics::three_way_compare" then some .threeWayCompare
+  else if stringEq defPath "std::intrinsics::size_of_val" then some .sizeOfVal
+  else if stringEq defPath "std::intrinsics::align_of_val" then some .alignOfVal
+  else if stringEq defPath "core::intrinsics::copy_nonoverlapping" ||
+          stringEq defPath "std::intrinsics::copy_nonoverlapping" ||
+          stringEq defPath "core::ptr::copy_nonoverlapping" ||
+          stringEq defPath "std::ptr::copy_nonoverlapping" then some .copyNonOverlapping
+  else if stringEq defPath "core::intrinsics::write_bytes" ||
+          stringEq defPath "std::intrinsics::write_bytes" ||
+          stringEq defPath "core::ptr::write_bytes" ||
+          stringEq defPath "std::ptr::write_bytes" then some .writeBytes
+  else if stringEq defPath "std::intrinsics::unreachable" then some .unreachableUnchecked
+  else if stringEq defPath "std::intrinsics::abort" then some .abort
+  else none
+
+/-- Thin `V2026_06_01` `DefPath` -> `LIntrinsicOp` lowering adapter
+(`lower_intrinsic_kind_v2026_06_01` in `crates/anneal-mir/src/rustc_v2026_06_01.rs`). -/
+@[reducible]
+def lowerIntrinsicKind_V2026_06_01 (defPath : DefPath) : Option LIntrinsicOp :=
+  if stringEq defPath "core::intrinsics::exact_div" ||
+     stringEq defPath "std::intrinsics::exact_div" then
+    some .exactDiv
+  else match classifyRustIntrinsic? defPath with
+  | some kind => LIntrinsicOp.fromRustIntrinsicKind? kind
+  | none =>
+    if isUnreachableCallTarget defPath then
+      some .unreachableUnchecked
+    else if isAbortingPanicDefPath defPath then
+      some .abort
+    else if isUnwindingPanicDefPath defPath then
+      some .panicUnwind
+    else
+      classifyStdIntrinsicAlias_V2026_06_01? defPath
+
+/-- Thin `V2026_06_01` `DefPath` -> `LCallTarget` lowering adapter
+(`lower_call_target_v2026_06_01` / `classify_call_target_v2026_06_01` in
+`crates/anneal-mir/src/rustc_v2026_06_01.rs`). -/
+@[reducible]
+def lowerCallTarget_V2026_06_01 (defPath : DefPath) (typeArgs : List RigidTy := []) :
+    LCallTarget :=
+  match lowerIntrinsicKind_V2026_06_01 defPath with
+  | some op => .inlineIntrinsic op typeArgs
+  | none => .callee defPath typeArgs
+
+/-- Alias for `lowerCallTarget_V2026_06_01` matching `classify_call_target_v2026_06_01`. -/
+@[reducible]
+def classifyCallTarget_V2026_06_01 (defPath : DefPath) (typeArgs : List RigidTy := []) :
+    LCallTarget :=
+  lowerCallTarget_V2026_06_01 defPath typeArgs
+
+/-- Linked-callee-aware `V2026_06_01` call target classifier
+(`classify_linked_call_target_v2026_06_01` in `crates/anneal-mir/src/rustc_v2026_06_01.rs`):
+a linked transparent body in the call table takes precedence over inline intrinsic dispatch,
+matching `lookupCallee` in `Terminators.lean`. -/
+@[reducible]
+def classifyLinkedCallTarget_V2026_06_01 (hasLinkedBody : Bool) (defPath : DefPath)
+    (typeArgs : List RigidTy := []) : LCallTarget :=
+  if hasLinkedBody then .callee defPath typeArgs
+  else lowerCallTarget_V2026_06_01 defPath typeArgs
+
+/-- Extract an `LCallTarget` from a direct `Operand` (`extractCalleeDefPath?` +
+`extractCalleeTypeArgs`). -/
+@[reducible]
+def extractLCallTarget_V2026_06_01? (func : Operand) : Option LCallTarget :=
+  match extractCalleeDefPath? func with
+  | some defPath => some (lowerCallTarget_V2026_06_01 defPath (extractCalleeTypeArgs func))
+  | none => none
+
+/-- Syntax-version-independent evaluator for the 25 value-returning `LIntrinsicOp` variants
+(`eval_value_intrinsic` in `crates/anneal-mir/src/lower/intrinsic.rs`). Returns `some rv` when
+the intrinsic succeeds and `none` when it faults with UB or is unsupported. -/
+def evalLIntrinsicValue (op : LIntrinsicOp) (typeArgs : List RigidTy)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value)
+    (ubChecksFlag : Bool := true) : Option Value :=
+  let target : ResolvedCallTarget := { defPath := "", typeArgs := typeArgs, isIndirect := false }
+  match op with
+  | .ubChecks =>
+    match argVals with
+    | [] => some (.scalar ⟨if ubChecksFlag then 1 else 0, 1⟩)
+    | _ => none
+  | .arithOffset =>
+    match argVals with
+    | [.ptr ptrVal ptrSz, .scalar countSc] =>
+      if Nat.beq ptrSz 8 then
+        match resolveIntrinsicPointeeTy? target localDecls layouts argOps with
+        | some pointeeTy =>
+          match intrinsicRigidTyByteSize localDecls layouts pointeeTy with
+          | some elemSz =>
+            match evalArithOffset ptrVal ptrSz countSc elemSz with
+            | some retPtrVal => some (.ptr retPtrVal 8)
+            | none => none
+          | none => none
+        | none => none
+      else none
+    | _ => none
+  | .ctlz =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalCtlz sc)
+    | _ => none
+  | .ctlzNonzero =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalCtlzNonzero sc)
+    | _ => none
+  | .cttz =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalCttz sc)
+    | _ => none
+  | .cttzNonzero =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalCttzNonzero sc)
+    | _ => none
+  | .ctpop =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalCtpop sc)
+    | _ => none
+  | .bswap =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalBswap sc)
+    | _ => none
+  | .bitreverse =>
+    match argVals with
+    | [.scalar sc] => Option.map Value.scalar (evalBitreverse sc)
+    | _ => none
+  | .exactDiv =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalExactDiv lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .wrappingAdd =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] => Option.map Value.scalar (evalWrappingAdd lhs rhs)
+    | _ => none
+  | .wrappingSub =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] => Option.map Value.scalar (evalWrappingSub lhs rhs)
+    | _ => none
+  | .wrappingMul =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] => Option.map Value.scalar (evalWrappingMul lhs rhs)
+    | _ => none
+  | .saturatingAdd =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalSaturatingAdd lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .saturatingSub =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalSaturatingSub lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .uncheckedShl =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicShiftSigned target localDecls layouts argOps with
+      | some rhsSigned => Option.map Value.scalar (evalUncheckedShl lhs rhs rhsSigned)
+      | none => none
+    | _ => none
+  | .uncheckedShr =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match
+        resolveIntrinsicIsSigned target localDecls layouts argOps (sameRhsTy := false),
+        resolveIntrinsicShiftSigned target localDecls layouts argOps
+      with
+      | some lhsSigned, some rhsSigned =>
+        Option.map Value.scalar (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+      | _, _ => none
+    | _ => none
+  | .uncheckedAdd =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalUncheckedAdd lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .uncheckedSub =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalUncheckedSub lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .uncheckedMul =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalUncheckedMul lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .uncheckedDiv =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalUncheckedDiv lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .uncheckedRem =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps with
+      | some isSigned => Option.map Value.scalar (evalUncheckedRem lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .threeWayCompare =>
+    match argVals with
+    | [.scalar lhs, .scalar rhs] =>
+      match resolveIntrinsicIsSigned target localDecls layouts argOps (allowChar := true) with
+      | some isSigned => Option.map Value.scalar (evalThreeWayCompare lhs rhs isSigned)
+      | none => none
+    | _ => none
+  | .sizeOfVal =>
+    match argVals with
+    | [ptrArgVal] =>
+      match resolveIntrinsicPointeeTy? target localDecls layouts argOps with
+      | some (.slice elemTy) =>
+        match ptrArgVal with
+        | .aggregate 0 [.ptr _ ptrSz, .scalar lenSc] =>
+          if Nat.beq ptrSz 8 then
+            match intrinsicRigidTyByteSize localDecls layouts elemTy with
+            | some elemSz => Option.map Value.scalar (evalSliceSizeOfVal elemSz lenSc)
+            | none => none
+          else none
+        | _ => none
+      | some .str =>
+        match ptrArgVal with
+        | .aggregate 0 [.ptr _ ptrSz, .scalar lenSc] =>
+          if Nat.beq ptrSz 8 then
+            Option.map Value.scalar (evalSliceSizeOfVal 1 lenSc)
+          else none
+        | _ => none
+      | some (.dynamic _) => none
+      | some pointeeTy =>
+        match ptrArgVal with
+        | .ptr _ ptrSz =>
+          if Nat.beq ptrSz 8 then
+            if intrinsicTailIsExtern 8 pointeeTy then none
+            else
+              match intrinsicRigidTyByteSize localDecls layouts pointeeTy with
+              | some sz =>
+                if Nat.ble (signedHalfModulus 8) sz then none
+                else some (.scalar ⟨sz, 8⟩)
+              | none => none
+          else none
+        | _ => none
+      | none => none
+    | _ => none
+  | .alignOfVal =>
+    match argVals with
+    | [ptrArgVal] =>
+      match resolveIntrinsicPointeeTy? target localDecls layouts argOps with
+      | some (.slice elemTy) =>
+        match ptrArgVal with
+        | .aggregate 0 [.ptr _ ptrSz, .scalar lenSc] =>
+          if Nat.beq ptrSz 8 then
+            match
+              intrinsicRigidTyByteSize localDecls layouts elemTy,
+              intrinsicRigidTyAlign localDecls layouts elemTy
+            with
+            | some elemSz, some alignBytes =>
+              match evalSliceSizeOfVal elemSz lenSc with
+              | some _ => some (.scalar ⟨alignBytes, 8⟩)
+              | none => none
+            | _, _ => none
+          else none
+        | _ => none
+      | some .str =>
+        match ptrArgVal with
+        | .aggregate 0 [.ptr _ ptrSz, .scalar lenSc] =>
+          if Nat.beq ptrSz 8 then
+            match evalSliceSizeOfVal 1 lenSc with
+            | some _ => some (.scalar ⟨1, 8⟩)
+            | none => none
+          else none
+        | _ => none
+      | some (.dynamic _) => none
+      | some pointeeTy =>
+        match ptrArgVal with
+        | .ptr _ ptrSz =>
+          if Nat.beq ptrSz 8 then
+            if intrinsicTailIsExtern 8 pointeeTy then none
+            else
+              match intrinsicRigidTyAlign localDecls layouts pointeeTy with
+              | some alignBytes => some (.scalar ⟨alignBytes, 8⟩)
+              | none => none
+          else none
+        | _ => none
+      | none => none
+    | _ => none
+  | .copyNonOverlapping | .writeBytes | .unreachableUnchecked | .abort | .panicUnwind => none
+
 /-- The environment of CFG evaluation: layouts and globals for constants, the boundary
 well-formedness check `check_value_well_formed` (with the inhabitedness of the return type
 folded into `retOk`), the type-directed part of the place-access check of `Drop`/`Call`
 destinations (`check_place_access`; its value-dependent part is the concrete
 `placeRuntimeAccessOk`), the arity function of shell writes, the statement evaluator
 (`eval_lowered_statement` over a block's statements), the call handler (`none`:
-`UnsupportedCall`), and `Ty::is_inhabited_for` (a returning `Call` needs an inhabited
-destination type). -/
+`UnsupportedCall`), `Ty::is_inhabited_for` (a returning `Call` needs an inhabited
+destination type), local declarations and `ub_checks` flag for inline intrinsics, the
+call-target classifier (`extractLCallTarget_V2026_06_01?`), and the optional sub-place memory
+intrinsic evaluator for `copy_nonoverlapping` / `write_bytes` calls. -/
 structure CfgEnv : Type where
   layouts : LayoutTable
   globals : List CapturedAllocation
@@ -8355,6 +8783,12 @@ structure CfgEnv : Type where
   evalStmts : List Statement → List LocalSlotState → Option (List LocalSlotState)
   handler : Option (Nat → Value → List Value → Option CallOutcome)
   inhabited : Ty → Bool := fun _ => true
+  localDecls : List LocalDecl := []
+  ubChecks : Bool := true
+  callTargetOf : Operand → Option LCallTarget := extractLCallTarget_V2026_06_01?
+  memIntrinsic :
+    Option (LIntrinsicOp → List RigidTy → List LocalSlotState → List Value → Option (List LocalSlotState)) :=
+    none
 
 /-- The next control-flow step after a terminator (`CfgStep`): continue at a block with the new
 frame and unwinding state (`some bb` while unwinding a panic raised in `bb`), or finish. -/
@@ -8408,6 +8842,100 @@ def evalOperandsState (layouts : LayoutTable) (globals : List CapturedAllocation
       | none => none
     | _ => none
 
+/-- Dispatch a direct inline intrinsic call (`LCallTarget.inlineIntrinsic op typeArgs`) in
+`evalLoweredTerminator` after `func`, `args`, and destination access checks have succeeded. -/
+def evalLoweredIntrinsicCall (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
+    (args : List Operand) (avs : List Value) (slots2 : List LocalSlotState)
+    (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
+    (unwinding : Option Nat) (op : LIntrinsicOp) (typeArgs : List RigidTy) : Option CfgStep :=
+  match op with
+  | .unreachableUnchecked => none
+  | .abort =>
+    match target with
+    | none => some (.terminated bb)
+    | some _ => none
+  | .panicUnwind =>
+    match target with
+    | none => startPanic body bb unwind slots2 unwinding
+    | some _ => none
+  | .copyNonOverlapping | .writeBytes =>
+    if !unwindActionOk body inCleanup unwind then none else
+    match target, env.memIntrinsic with
+    | some t, some memFn =>
+      match memFn op typeArgs slots2 avs with
+      | some slotsMem =>
+        if !env.wf Value.unit then none else
+        match writePlaceState env.arityOf slotsMem destination destTy Value.unit with
+        | .ok slots3 => cfgGoto body t slots3 unwinding
+        | _ => none
+      | none => none
+    | _, _ => none
+  | _ =>
+    if !unwindActionOk body inCleanup unwind then none else
+    match target with
+    | none => none
+    | some t =>
+      match evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs env.ubChecks with
+      | some rv =>
+        if !env.wf rv then none else
+        match writePlaceState env.arityOf slots2 destination destTy rv with
+        | .ok slots3 => cfgGoto body t slots3 unwinding
+        | _ => none
+      | none => none
+
+/-- Dispatch a non-inline-intrinsic call via `CfgEnv.handler` after `func`, `args`, and
+destination access checks have succeeded. -/
+def evalLoweredHandlerCall (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
+    (fv : Value) (avs : List Value) (slots2 : List LocalSlotState)
+    (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
+    (unwinding : Option Nat) : Option CfgStep :=
+  match env.handler with
+  | none => none
+  | some h =>
+    match h bb fv avs with
+    | some (.ret rv) =>
+      if !unwindActionOk body inCleanup unwind then none else
+      match target with
+      | none => none
+      | some t =>
+        if !env.wf rv then none else
+        match writePlaceState env.arityOf slots2 destination destTy rv with
+        | .ok slots3 => cfgGoto body t slots3 unwinding
+        | _ => none
+    | some .panic => startPanic body bb unwind slots2 unwinding
+    | none => none
+
+/-- Post-operand call target dispatch (`evalLoweredIntrinsicCall` vs `evalLoweredHandlerCall`). -/
+def evalLoweredCallTargetDispatch (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
+    (func : Operand) (args : List Operand) (fv : Value) (avs : List Value)
+    (slots2 : List LocalSlotState) (destination : Place) (destTy : Ty)
+    (target : Option Nat) (unwind : UnwindAction) (unwinding : Option Nat) : Option CfgStep :=
+  match env.callTargetOf func with
+  | some (.inlineIntrinsic op typeArgs) =>
+    evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 destination
+      destTy target unwind unwinding op typeArgs
+  | _ =>
+    evalLoweredHandlerCall env body bb inCleanup fv avs slots2 destination
+      destTy target unwind unwinding
+
+/-- Full `.call` arm of `evalLoweredTerminator`. -/
+def evalLoweredCall (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
+    (func : Operand) (args : List Operand) (slots : List LocalSlotState)
+    (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
+    (unwinding : Option Nat) : Option CfgStep :=
+  match evalOperandState slots func env.layouts env.globals with
+  | (.ok fv, slots1) =>
+    if !env.wf fv then none else
+    match evalOperandsState env.layouts env.globals slots1 args with
+    | some (avs, slots2) =>
+      if !(avs.all env.wf && placeRuntimeAccessOk slots2 destination &&
+          env.placeAccessOk slots2 destination) then none else
+      if target.isSome && !env.inhabited destTy then none else
+      evalLoweredCallTargetDispatch env body bb inCleanup func args fv avs slots2 destination
+        destTy target unwind unwinding
+    | none => none
+  | _ => none
+
 /-- `eval_lowered_terminator`: evaluates the terminator of block `bb` (whose statements have
 run) in `slots` and unwinding mode `unwinding`. The block must exist and be a cleanup block iff
 the evaluation is unwinding. `none` is an error (undefined behavior, an ill-formed body, or an
@@ -8458,31 +8986,8 @@ def evalLoweredTerminator (env : CfgEnv) (body : LBody) (bb : Nat)
         else none
       | _ => none
     | .call func args destination destTy target unwind =>
-      match evalOperandState slots func env.layouts env.globals with
-      | (.ok fv, slots1) =>
-        if !env.wf fv then none else
-        match evalOperandsState env.layouts env.globals slots1 args with
-        | some (avs, slots2) =>
-          if !(avs.all env.wf && placeRuntimeAccessOk slots2 destination &&
-              env.placeAccessOk slots2 destination) then none else
-          if target.isSome && !env.inhabited destTy then none else
-          match env.handler with
-          | none => none
-          | some h =>
-            match h bb fv avs with
-            | some (.ret rv) =>
-              if !unwindActionOk body block.isCleanup unwind then none else
-              match target with
-              | none => none
-              | some t =>
-                if !env.wf rv then none else
-                match writePlaceState env.arityOf slots2 destination destTy rv with
-                | .ok slots3 => cfgGoto body t slots3 unwinding
-                | _ => none
-            | some .panic => startPanic body bb unwind slots2 unwinding
-            | none => none
-        | none => none
-      | _ => none
+      evalLoweredCall env body bb block.isCleanup func args slots destination destTy target
+        unwind unwinding
     | .unwindResume =>
       match unwinding with
       | some pbb => some (.panicked pbb)
@@ -8585,9 +9090,39 @@ def LTerminator.toTrusted : LTerminator → TerminatorKind
   | .unwindResume => .unwindResume
   | .unwindTerminate => .unwindTerminate
 
-/-- The terminators covered by the step refinement: all but `Call` (Anneal abstracts callees by a
-handler while Trusted links captured callee bodies) and `Drop` (whose divergence is
-`evalLoweredTerminator_drop_bare_divergence`); operands must not start with a `Deref`. -/
+/-- Predicate characterizing canonical `V2026_06_01` `DefPath` strings whose direct call semantics
+in `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator` matches `LIntrinsicOp`. -/
+def trustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Prop :=
+  match op with
+  | .exactDiv =>
+    stringEq defPath "core::intrinsics::exact_div" = true ∧
+      classifyRustIntrinsic? defPath = none
+  | .unreachableUnchecked =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = none ∧
+      isUnreachableCallTarget defPath = true
+  | .abort =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = none ∧
+      isUnreachableCallTarget defPath = false ∧
+      isAbortingPanicDefPath defPath = true
+  | .panicUnwind =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = none ∧
+      isUnreachableCallTarget defPath = false ∧
+      isAbortingPanicDefPath defPath = false ∧
+      isUnwindingPanicDefPath defPath = true
+  | .copyNonOverlapping | .writeBytes => False
+  | _ =>
+    ∃ kind, op.toRustIntrinsicKind? = some kind ∧
+      stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some kind
+
+/-- The terminators covered by the single-body step refinement: `Goto`, `SwitchInt`, `Return`,
+`Unreachable`, `Assert`, `UnwindResume`, `UnwindTerminate`, and direct inline-intrinsic `Call`
+terminators (linked multi-callee `Call` terminators are covered by `runLoweredWithCallTable_refines_trusted`,
+and `Drop`'s bare-local divergence is `evalLoweredTerminator_drop_bare_divergence`). Operands must
+not start with a `Deref`. -/
 def LTerminator.Refinable : LTerminator → Prop
   | .goto _ => True
   | .switchInt discr _ _ => OperandNonDeref discr
@@ -8595,24 +9130,34 @@ def LTerminator.Refinable : LTerminator → Prop
   | .unreachable => True
   | .drop _ _ _ => False
   | .assert cond _ _ _ _ => OperandNonDeref cond
-  | .call .. => False
+  | .call func args destination _ _ _ =>
+    (∃ defPath typeArgs layoutIdx op,
+      func = .constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩ ∧
+      lowerIntrinsicKind_V2026_06_01 defPath = some op ∧
+      trustedSupportsIntrinsicDefPath defPath op) ∧
+    (∀ arg ∈ args, OperandNonDeref arg) ∧
+    destination.projection = []
   | .unwindResume => True
   | .unwindTerminate => True
 
-/-- A lowered body corresponds to a captured Trusted body: a runtime phase, the same layouts,
-the same blocks (statement-free on both sides, so a block is its terminator), the same
-terminators and cleanup flags, and refinable terminators. -/
+/-- A lowered body corresponds to a captured Trusted body: a runtime phase, the same layouts and
+local declarations, the same blocks (statement-free on both sides, so a block is its terminator),
+the same terminators and cleanup flags, and refinable terminators. -/
 structure BodyCorr (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
   phase : ∀ tag, cm.phase ≠ .other tag
   layouts : cm.layouts = env.layouts
   block : ∀ (i : Nat) (b : LBlock), body.blocks[i]? = some b →
     b.statements = [] ∧ b.terminator.Refinable ∧
       ∃ span, cm.basicBlocks[i]? = some ⟨[], ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩
+  localDecls : cm.localDecls = env.localDecls := by rfl
+  ubChecksTrue : env.ubChecks = true := by rfl
+  callTargetDefault : env.callTargetOf = extractLCallTarget_V2026_06_01? := by rfl
 
 /-- **`StateCorr`**: the lowered state at block `bb` with frame `slots` corresponds to the Trusted
 machine state `s`: `s` is at the start of `bb` (its terminator, since blocks are statement-free),
 Anneal's frame is below Trusted's (`SlotBelow`: every Anneal read is a Trusted read), and `s`
-runs the root body (no active callee, empty call stack) with Anneal's globals. -/
+runs the root body (no active callee, empty call stack) with Anneal's globals and no linked body
+shadowing an inline intrinsic. -/
 structure StateCorr (env : CfgEnv) (bb : Nat) (slots : List LocalSlotState) (s : MachineState) :
     Prop where
   block : s.frame.blockIdx = bb
@@ -8621,6 +9166,11 @@ structure StateCorr (env : CfgEnv) (bb : Nat) (slots : List LocalSlotState) (s :
   callee : s.memory.activeCallee = none
   stack : s.memory.callStack = []
   globals : s.memory.globals = env.globals
+  noIntrinsicCallee :
+    ∀ defPath typeArgs op,
+      lowerIntrinsicKind_V2026_06_01 defPath = some op →
+      lookupCallee s.memory.callees env.layouts defPath typeArgs s.memory.traitImpls = none := by
+    intros; rfl
 
 /-- A Trusted transition that continues at `s'` (silently, or emitting a branch event). -/
 def TrustedStep (node : MirStepNode) (s' : MachineState) : Prop :=
@@ -8658,14 +9208,770 @@ theorem StateCorr.jump {env : CfgEnv} {bb : Nat} {slots slots' : List LocalSlotS
     {s : MachineState} (hCorr : StateCorr env bb slots s) (t : Nat) (locals' : List LocalSlot)
     (hRel : SlotsRefine SlotBelow slots' locals') :
     StateCorr env t slots' { s with frame := { blockIdx := t, stmtIdx := 0, locals := locals' } } :=
-  ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals⟩
+  ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee⟩
+
+/-- Left-to-right operand list evaluation `evalOperandsState` refines Trusted's `evalOperands`
+under `SlotsRefine SlotBelow` when no operand begins with `.deref`. -/
+theorem evalOperandsState_below_refines :
+    ∀ (args : List Operand) (slots slots' : List LocalSlotState) (locals : List LocalSlot)
+      (avs : List Value) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+      (layouts : LayoutTable) (callerLocals : List LocalSlot),
+      SlotsRefine SlotBelow slots locals →
+      (∀ op ∈ args, OperandNonDeref op) →
+      evalOperandsState layouts globals slots args = some (avs, slots') →
+      ∃ locals',
+        evalOperands locals args borrows globals layouts callerLocals = .ok avs locals' ∧
+        SlotsRefine SlotBelow slots' locals' := by
+  intro args
+  induction args with
+  | nil =>
+    intro slots slots' locals avs borrows globals layouts callerLocals hRel _ h
+    simp only [evalOperandsState, Option.some.injEq, Prod.mk.injEq] at h
+    rcases h with ⟨rfl, rfl⟩
+    exact ⟨locals, rfl, hRel⟩
+  | cons op ops ih =>
+    intro slots slots' locals avs borrows globals layouts callerLocals hRel hND h
+    simp only [evalOperandsState] at h
+    split at h
+    · rename_i v slots1 hOp
+      split at h
+      · rename_i vs slots2 hOps
+        simp only [Option.some.injEq, Prod.mk.injEq] at h
+        rcases h with ⟨rfl, rfl⟩
+        have hOpND : OperandNonDeref op := hND op (.head ops)
+        have hOpsND : ∀ x ∈ ops, OperandNonDeref x := fun x hx => hND x (.tail op hx)
+        obtain ⟨locals1, hTOp, hRel1⟩ := evalOperandState_below_refines slots slots1
+          locals op v borrows globals layouts callerLocals hRel hOpND hOp
+        obtain ⟨locals2, hTOps, hRel2⟩ := ih slots1 slots2 locals1 vs borrows globals
+          layouts callerLocals hRel1 hOpsND hOps
+        exact ⟨locals2, by simp [evalOperands, hTOp, hTOps], hRel2⟩
+      · nomatch h
+    · nomatch h
+
+/-- Writing a return value `rv` into a bare call destination `⟨loc, []⟩` via `writePlaceState`
+refines Trusted's `writePlaceValue` under `SlotsRefine SlotBelow`. -/
+theorem writePlaceState_bare_below_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot}
+    {borrows : List BorrowEntry} {dest : Place} {destTy : Ty} {rv : Value}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hBare : dest.projection = [])
+    (hWrite : writePlaceState arityOf slots dest destTy rv = .ok slots') :
+    ∃ locals',
+      writePlaceValue locals borrows dest rv = .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  rcases dest with ⟨loc, proj⟩
+  simp only at hBare
+  subst hBare
+  unfold writePlaceState at hWrite
+  simp only [projectionHasDeref, get?_eq_getElem?] at hWrite
+  rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+  · simp only [get?_eq_getElem?] at hA
+    rw [hA] at hWrite
+    nomatch hWrite
+  · simp only [get?_eq_getElem?] at hA hT
+    rw [hA] at hWrite
+    have hNotDead : a ≠ .dead := by
+      intro hD; subst hD; nomatch hWrite
+    have hTNotDead : t ≠ .dead := by
+      intro hTD; subst hTD
+      cases a with
+      | dead => exact hNotDead rfl
+      | _ => simp [SlotBelow] at hAT
+    have hSlots' : slots' = slots.set loc (.init rv) := by
+      cases a with
+      | dead => exact absurd rfl hNotDead
+      | uninit | init _ | partialShell _ =>
+        simp only [writeToFieldSlot, fieldSlotToLocalSlotState, SlotWriteResult.ok.injEq] at hWrite
+        exact hWrite.symm
+    subst hSlots'
+    have hLt : loc < locals.length := (List.getElem?_eq_some_iff.mp hT).1
+    have hSet : set? locals loc (.init rv) = some (locals.set loc (.init rv)) :=
+      set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+    have hWPV : writePlaceValue locals borrows ⟨loc, []⟩ rv = .ok (locals.set loc (.init rv)) :=
+      writePlaceValue_root_of_valid locals (locals.set loc (.init rv)) borrows loc t rv
+        [] emptyLayoutTable (by simp [get?_eq_getElem?, hT]) hTNotDead rfl hSet
+    exact ⟨locals.set loc (.init rv), hWPV,
+      SlotsRefine.set (a := .init rv) (t := .init rv) rfl loc hRel⟩
+
+/-- `resolveIntrinsicIsSigned` depends only on `target.typeArgs`, never on `target.defPath` or
+`target.isIndirect`. -/
+theorem resolveIntrinsicIsSigned_defPath_irrel (t1 t2 : ResolvedCallTarget)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (sameRhsTy allowChar : Bool) (h : t1.typeArgs = t2.typeArgs) :
+    resolveIntrinsicIsSigned t1 localDecls layouts argOps sameRhsTy allowChar =
+      resolveIntrinsicIsSigned t2 localDecls layouts argOps sameRhsTy allowChar := by
+  cases t1; cases t2; simp only at h; subst h; rfl
+
+/-- `resolveIntrinsicShiftSigned` depends only on `target.typeArgs`, never on `target.defPath`
+or `target.isIndirect`. -/
+theorem resolveIntrinsicShiftSigned_defPath_irrel (t1 t2 : ResolvedCallTarget)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (h : t1.typeArgs = t2.typeArgs) :
+    resolveIntrinsicShiftSigned t1 localDecls layouts argOps =
+      resolveIntrinsicShiftSigned t2 localDecls layouts argOps := by
+  cases t1; cases t2; simp only at h; subst h; rfl
+
+/-- `resolveIntrinsicPointeeTy?` depends only on `target.typeArgs`, never on `target.defPath`
+or `target.isIndirect`. -/
+theorem resolveIntrinsicPointeeTy?_defPath_irrel (t1 t2 : ResolvedCallTarget)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (h : t1.typeArgs = t2.typeArgs) :
+    resolveIntrinsicPointeeTy? t1 localDecls layouts argOps =
+      resolveIntrinsicPointeeTy? t2 localDecls layouts argOps := by
+  cases t1; cases t2; simp only at h; subst h; rfl
+
+private theorem evalSizeOfValSized_refines
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrSz : Nat) (pt : RigidTy) (rv : Value)
+    (hEvPt : (if Nat.beq ptrSz 8 then
+        if intrinsicTailIsExtern 8 pt then none
+        else
+          match intrinsicRigidTyByteSize localDecls layouts pt with
+          | some sz =>
+            if Nat.ble (signedHalfModulus 8) sz then none
+            else some (.scalar ⟨sz, 8⟩)
+          | none => none
+      else none) = some rv) :
+    (match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match intrinsicTailIsExtern 8 pt with
+        | true => MirStepNode.unsupported
+        | false =>
+          match intrinsicRigidTyByteSize localDecls layouts pt with
+          | .some sz =>
+            match Nat.ble (signedHalfModulus 8) sz with
+            | true => MirStepNode.fail .ub
+            | false =>
+              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
+          | .none => intrinsicUnresolvedLayoutStep pt) =
+      writeIntrinsicReturn s locals' destination targetBb rv := by
+  cases hSz : Nat.beq ptrSz 8
+  · rw [hSz] at hEvPt; simp at hEvPt
+  · simp only [hSz, ↓reduceIte] at hEvPt ⊢
+    cases hExt : intrinsicTailIsExtern 8 pt
+    · simp only [hExt, Bool.false_eq_true, ↓reduceIte] at hEvPt ⊢
+      cases hB : intrinsicRigidTyByteSize localDecls layouts pt with
+      | none => rw [hB] at hEvPt; cases hEvPt
+      | some sz =>
+        rw [hB] at hEvPt
+        dsimp only at hEvPt ⊢
+        cases hBle : Nat.ble (signedHalfModulus 8) sz
+        · simp only [hBle, Bool.false_eq_true, ↓reduceIte, Option.some.injEq] at hEvPt ⊢
+          subst hEvPt
+          rfl
+        · rw [hBle] at hEvPt; simp at hEvPt
+    · rw [hExt] at hEvPt; simp at hEvPt
+
+private theorem evalAlignOfValSized_refines
+    (s : MachineState) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrSz : Nat) (pt : RigidTy) (rv : Value)
+    (hEvPt : (if Nat.beq ptrSz 8 then
+        if intrinsicTailIsExtern 8 pt then none
+        else
+          match intrinsicRigidTyAlign localDecls layouts pt with
+          | some alignBytes => some (.scalar ⟨alignBytes, 8⟩)
+          | none => none
+      else none) = some rv) :
+    (match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match intrinsicTailIsExtern 8 pt with
+        | true => MirStepNode.unsupported
+        | false =>
+          match intrinsicRigidTyAlign localDecls layouts pt with
+          | .some alignBytes =>
+            writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨alignBytes, 8⟩)
+          | .none => intrinsicUnresolvedLayoutStep pt) =
+      writeIntrinsicReturn s locals' destination targetBb rv := by
+  cases hSz : Nat.beq ptrSz 8
+  · rw [hSz] at hEvPt; simp at hEvPt
+  · simp only [hSz, ↓reduceIte] at hEvPt ⊢
+    cases hExt : intrinsicTailIsExtern 8 pt
+    · simp only [hExt, Bool.false_eq_true, ↓reduceIte] at hEvPt ⊢
+      cases hAl : intrinsicRigidTyAlign localDecls layouts pt with
+      | none => rw [hAl] at hEvPt; cases hEvPt
+      | some alignBytes =>
+        rw [hAl] at hEvPt
+        simp only [Option.some.injEq] at hEvPt
+        subst hEvPt
+        rfl
+    · rw [hExt] at hEvPt; simp at hEvPt
+
+/-- Every successful evaluation of `evalLIntrinsicValue` on an `LIntrinsicOp` with
+`op.toRustIntrinsicKind? = some kind` agrees with Trusted's `evalNonSelectIntrinsicCall` up to
+`writeIntrinsicReturn`. -/
+theorem evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
+    {op : LIntrinsicOp} {kind : RustIntrinsicKind} {s : MachineState}
+    {target : ResolvedCallTarget} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    {destination : Place} {targetBb : BasicBlockIdx} {rv : Value}
+    (hKind : op.toRustIntrinsicKind? = some kind)
+    (hEval : evalLIntrinsicValue op target.typeArgs localDecls layouts argOps argVals true = some rv) :
+    evalNonSelectIntrinsicCall kind s target localDecls layouts argOps argVals
+      locals' destination targetBb =
+      writeIntrinsicReturn s locals' destination targetBb rv := by
+  have hSign (sr ac : Bool) :
+      resolveIntrinsicIsSigned target localDecls layouts argOps sr ac =
+        resolveIntrinsicIsSigned { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps sr ac :=
+    resolveIntrinsicIsSigned_defPath_irrel _ _ _ _ _ _ _ rfl
+  have hShift :
+      resolveIntrinsicShiftSigned target localDecls layouts argOps =
+        resolveIntrinsicShiftSigned
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps :=
+    resolveIntrinsicShiftSigned_defPath_irrel _ _ _ _ _ rfl
+  have hPt :
+      resolveIntrinsicPointeeTy? target localDecls layouts argOps =
+        resolveIntrinsicPointeeTy?
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps :=
+    resolveIntrinsicPointeeTy?_defPath_irrel _ _ _ _ _ rfl
+  cases op with
+  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+    nomatch hKind
+  | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · simp only [Option.map_eq_some_iff] at hEval
+      obtain ⟨sc, hSc, rfl⟩ := hEval
+      simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | wrappingAdd | wrappingSub | wrappingMul =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · simp only [Option.map_eq_some_iff] at hEval
+      obtain ⟨sc, hSc, rfl⟩ := hEval
+      simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | saturatingAdd | saturatingSub | uncheckedAdd | uncheckedSub | uncheckedMul
+  | uncheckedDiv | uncheckedRem =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · dsimp only at hEval ⊢
+      rw [hSign false true]
+      cases hS : resolveIntrinsicIsSigned
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps false true with
+      | none => rw [hS] at hEval; cases hEval
+      | some isSigned =>
+        rw [hS] at hEval
+        simp only [Option.map_eq_some_iff] at hEval
+        obtain ⟨sc, hSc, rfl⟩ := hEval
+        simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | uncheckedShl =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · dsimp only at hEval ⊢
+      rw [hShift]
+      cases hS : resolveIntrinsicShiftSigned
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps with
+      | none => rw [hS] at hEval; cases hEval
+      | some rhsSigned =>
+        rw [hS] at hEval
+        simp only [Option.map_eq_some_iff] at hEval
+        obtain ⟨sc, hSc, rfl⟩ := hEval
+        simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | uncheckedShr =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · dsimp only at hEval ⊢
+      rw [hSign false false, hShift]
+      cases hS1 : resolveIntrinsicIsSigned
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps false false with
+      | none => rw [hS1] at hEval; cases hEval
+      | some lhsSigned =>
+        cases hS2 : resolveIntrinsicShiftSigned
+            { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+            localDecls layouts argOps with
+        | none => rw [hS1, hS2] at hEval; cases hEval
+        | some rhsSigned =>
+          rw [hS1, hS2] at hEval
+          simp only [Option.map_eq_some_iff] at hEval
+          obtain ⟨sc, hSc, rfl⟩ := hEval
+          simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | threeWayCompare =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · dsimp only at hEval ⊢
+      rw [hSign true true]
+      cases hS : resolveIntrinsicIsSigned
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps true true with
+      | none => rw [hS] at hEval; cases hEval
+      | some isSigned =>
+        rw [hS] at hEval
+        simp only [Option.map_eq_some_iff] at hEval
+        obtain ⟨sc, hSc, rfl⟩ := hEval
+        simp [writeIntrinsicScalarResult, hSc]
+    · cases hEval
+  | ubChecks =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · simp only [↓reduceIte, Option.some.injEq] at hEval
+      subst hEval
+      rfl
+    · cases hEval
+  | arithOffset =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · dsimp only at hEval ⊢
+      rw [hPt]
+      rename_i ptrVal ptrSz countSc
+      cases hSz : Nat.beq ptrSz 8
+      · simp [hSz] at hEval
+      · simp only [hSz, ↓reduceIte] at hEval ⊢
+        cases hP : resolveIntrinsicPointeeTy?
+            { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+            localDecls layouts argOps with
+        | none => rw [hP] at hEval; cases hEval
+        | some pointeeTy =>
+          rw [hP] at hEval
+          dsimp only at hEval ⊢
+          cases hB : intrinsicRigidTyByteSize localDecls layouts pointeeTy with
+          | none => rw [hB] at hEval; cases hEval
+          | some elemSz =>
+            rw [hB] at hEval
+            dsimp only at hEval ⊢
+            cases hA : evalArithOffset ptrVal ptrSz countSc elemSz with
+            | none => rw [hA] at hEval; cases hEval
+            | some retPtrVal =>
+              rw [hA] at hEval
+              simp only [Option.some.injEq] at hEval
+              subst hEval
+              rfl
+    · cases hEval
+  | sizeOfVal =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · rename_i ptrArgVal
+      dsimp only at hEval ⊢
+      rw [hPt]
+      cases hP : resolveIntrinsicPointeeTy?
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps with
+      | none => rw [hP] at hEval; cases hEval
+      | some pointeeTy =>
+        rw [hP] at hEval
+        cases pointeeTy with
+        | slice elemTy =>
+          dsimp only at hEval ⊢
+          split at hEval
+          · rename_i ptrSz lenSc
+            cases hSz : Nat.beq ptrSz 8
+            · rw [hSz] at hEval; simp at hEval
+            · simp only [hSz, ↓reduceIte] at hEval ⊢
+              cases hB : intrinsicRigidTyByteSize localDecls layouts elemTy with
+              | none => rw [hB] at hEval; cases hEval
+              | some elemSz =>
+                rw [hB] at hEval
+                simp only [Option.map_eq_some_iff] at hEval
+                obtain ⟨sc, hSc, rfl⟩ := hEval
+                simp [writeIntrinsicScalarResult, hSc]
+          · cases hEval
+        | str =>
+          dsimp only at hEval ⊢
+          split at hEval
+          · rename_i ptrSz lenSc
+            cases hSz : Nat.beq ptrSz 8
+            · rw [hSz] at hEval; simp at hEval
+            · simp only [hSz, ↓reduceIte, Option.map_eq_some_iff] at hEval ⊢
+              obtain ⟨sc, hSc, rfl⟩ := hEval
+              simp [writeIntrinsicScalarResult, hSc]
+          · cases hEval
+        | dynamic _ => cases hEval
+        | bool | char | int _ | uint _ | float _ | adt _ _ | foreign _ | array _ _
+        | rawPtr _ _ | ref _ _ | fnDef _ _ | fnPtr _ | tuple _
+        | closure _ _ | never | param _ _ | alias _ _ | other _ =>
+          cases ptrArgVal <;> try cases hEval
+          dsimp only at hEval ⊢
+          exact evalSizeOfValSized_refines s localDecls layouts locals' destination targetBb
+            _ _ rv hEval
+    · cases hEval
+  | alignOfVal =>
+    simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
+    subst hKind
+    dsimp only [evalLIntrinsicValue] at hEval
+    dsimp only [evalNonSelectIntrinsicCall]
+    split at hEval
+    · rename_i ptrArgVal
+      dsimp only at hEval ⊢
+      rw [hPt]
+      cases hP : resolveIntrinsicPointeeTy?
+          { defPath := "", typeArgs := target.typeArgs, isIndirect := false }
+          localDecls layouts argOps with
+      | none => rw [hP] at hEval; cases hEval
+      | some pointeeTy =>
+        rw [hP] at hEval
+        cases pointeeTy with
+        | slice elemTy =>
+          dsimp only at hEval ⊢
+          split at hEval
+          · rename_i ptrSz lenSc
+            cases hSz : Nat.beq ptrSz 8
+            · rw [hSz] at hEval; simp at hEval
+            · simp only [hSz, ↓reduceIte] at hEval ⊢
+              cases hB : intrinsicRigidTyByteSize localDecls layouts elemTy with
+              | none => rw [hB] at hEval; cases hEval
+              | some elemSz =>
+                cases hAl : intrinsicRigidTyAlign localDecls layouts elemTy with
+                | none => rw [hB, hAl] at hEval; cases hEval
+                | some alignBytes =>
+                  rw [hB, hAl] at hEval
+                  dsimp only at hEval ⊢
+                  cases hSl : evalSliceSizeOfVal elemSz lenSc with
+                  | none => rw [hSl] at hEval; cases hEval
+                  | some _ =>
+                    rw [hSl] at hEval
+                    simp only [Option.some.injEq] at hEval
+                    subst hEval
+                    rfl
+          · cases hEval
+        | str =>
+          dsimp only at hEval ⊢
+          split at hEval
+          · rename_i ptrSz lenSc
+            cases hSz : Nat.beq ptrSz 8
+            · rw [hSz] at hEval; simp at hEval
+            · simp only [hSz, ↓reduceIte] at hEval ⊢
+              cases hSl : evalSliceSizeOfVal 1 lenSc with
+              | none => rw [hSl] at hEval; cases hEval
+              | some _ =>
+                rw [hSl] at hEval
+                simp only [Option.some.injEq] at hEval
+                subst hEval
+                rfl
+          · cases hEval
+        | dynamic _ => cases hEval
+        | bool | char | int _ | uint _ | float _ | adt _ _ | foreign _ | array _ _
+        | rawPtr _ _ | ref _ _ | fnDef _ _ | fnPtr _ | tuple _
+        | closure _ _ | never | param _ _ | alias _ _ | other _ =>
+          cases ptrArgVal <;> try cases hEval
+          dsimp only at hEval ⊢
+          exact evalAlignOfValSized_refines s localDecls layouts locals' destination targetBb
+            _ _ rv hEval
+    · cases hEval
+
+/-- Predicate identifying the 24 value-returning inline intrinsics routed through
+`classifyRustIntrinsic?` -> `evalNonSelectIntrinsicCall` in `Trusted`. -/
+private def LIntrinsicOp.isValueDirectIntrinsic : LIntrinsicOp → Bool
+  | .unreachableUnchecked | .abort | .panicUnwind
+  | .copyNonOverlapping | .writeBytes | .exactDiv => false
+  | _ => true
+
+private theorem evalLoweredIntrinsicCall_of_isValueDirectIntrinsic
+    {env : CfgEnv} {body : LBody} {bb : Nat} {inCleanup : Bool}
+    {args : List Operand} {avs : List Value} {slots2 : List LocalSlotState}
+    {destination : Place} {destTy : Ty} {target : Option Nat} {unwind : UnwindAction}
+    {unwinding : Option Nat} {op : LIntrinsicOp} {typeArgs : List RigidTy}
+    (hVal : op.isValueDirectIntrinsic = true) :
+    evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 destination destTy
+      target unwind unwinding op typeArgs =
+      (if !unwindActionOk body inCleanup unwind then none else
+       match target with
+       | none => none
+       | some t =>
+         match evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs env.ubChecks with
+         | some rv =>
+           if !env.wf rv then none else
+           match writePlaceState env.arityOf slots2 destination destTy rv with
+           | .ok slots3 => cfgGoto body t slots3 unwinding
+           | _ => none
+         | none => none) := by
+  cases op <;> first | contradiction | rfl
+
+private theorem trustedSupportsIntrinsicDefPath_of_isValueDirectIntrinsic
+    {defPath : String} {op : LIntrinsicOp}
+    (hVal : op.isValueDirectIntrinsic = true)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath op) :
+    ∃ kind,
+      op.toRustIntrinsicKind? = some kind ∧
+      stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some kind := by
+  cases op <;> first | contradiction | exact hSupp
+
+private theorem evalDirectRustIntrinsic_of_nonSelect
+    {s : MachineState} {body : Option CapturedMir} {target : ResolvedCallTarget}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {args : List Operand} {argVals : List Value}
+    {locals' : List LocalSlot} {destination : Place} {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction} {kind : RustIntrinsicKind}
+    (hClass : classifyRustIntrinsic? target.defPath = some kind)
+    (hNotSel : kind ≠ .constEvalSelect) :
+    evalDirectRustIntrinsic? s body target localDecls layouts args argVals locals'
+      destination targetBb unwind =
+      some (evalNonSelectIntrinsicCall kind s target localDecls layouts args argVals
+        locals' destination targetBb) := by
+  unfold evalDirectRustIntrinsic?
+  rw [hClass]
+  cases kind <;> first | contradiction | rfl
+
+/-- Shared `.call` refinement helper for `evalLoweredTerminator_refines_trusted` and
+`evalLoweredTerminator_at_end_refines_trusted`: under `LTerminator.Refinable`, a successful
+lowered `.call` step refines Trusted's `evalTerminator`. -/
+theorem evalLoweredTerminator_call_refines_evalTerminator
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat}
+    {slots slots1 : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {locals1 : List LocalSlot} {sIdx : Nat} {span : String}
+    {inCleanup : Bool} {func : Operand} {args : List Operand}
+    {dest : Place} {destTy : Ty} {t : Option Nat} {u : UnwindAction}
+    {step : CfgStep}
+    (hLayouts : cm.layouts = env.layouts)
+    (hDecls : cm.localDecls = env.localDecls)
+    (hUb : env.ubChecks = true)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hRef : (LTerminator.call func args dest destTy t u).Refinable)
+    (hCorr : StateCorr env bb slots s)
+    (hRel1 : SlotsRefine SlotBelow slots1 locals1)
+    (hBodyCall : evalLoweredCall env body bb inCleanup func args slots1 dest destTy t u unwinding =
+      some step) :
+    let sEnd : MachineState := { s with frame := ⟨bb, sIdx, locals1⟩ }
+    match step with
+    | .goto next slots' _ =>
+      ∃ s',
+        TrustedStep
+          (evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+            (some cm)) s' ∧
+        StateCorr env next slots' s'
+    | .returned v =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retNormal v s.memory
+    | .panicked _ =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retOutcome .panic
+    | .terminated _ =>
+      evalTerminator sEnd ⟨(LTerminator.call func args dest destTy t u).toTrusted, span⟩
+        (some cm) = .retOutcome .abort := by
+  intro sEnd
+  unfold evalLoweredCall evalLoweredCallTargetDispatch at hBodyCall
+  obtain ⟨⟨defPath, typeArgs, layoutIdx, op, rfl, hLowerOp, hSupp⟩, hArgsND, hDestNil⟩ := hRef
+  simp only [evalOperandState, evalConstValue] at hBodyCall
+  split at hBodyCall
+  · nomatch hBodyCall
+  · split at hBodyCall
+    · rename_i avs slots2 hArgsEval
+      split at hBodyCall
+      · nomatch hBodyCall
+      · split at hBodyCall
+        · nomatch hBodyCall
+        · rw [hCallTgt] at hBodyCall
+          simp only [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+            extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLowerOp] at hBodyCall
+          obtain ⟨locals2, hTOps, hRel2⟩ := evalOperandsState_below_refines args slots1 slots2
+            locals1 avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
+            hRel1 hArgsND hArgsEval
+          dsimp only [sEnd]
+          have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs op hLowerOp
+          have hResTgt :
+              ∀ (decls : List LocalDecl) (lays : LayoutTable),
+                resolveCallTarget { s with frame := ⟨bb, sIdx, locals1⟩ }
+                  (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+                  (length args) decls lays =
+                  .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } locals1 :=
+            fun _ _ => rfl
+          by_cases hValOp : op.isValueDirectIntrinsic = true
+          · rw [evalLoweredIntrinsicCall_of_isValueDirectIntrinsic hValOp] at hBodyCall
+            split at hBodyCall
+            · nomatch hBodyCall
+            · cases t with
+              | none => nomatch hBodyCall
+              | some targetBb =>
+                rw [hUb] at hBodyCall
+                cases hEv : evalLIntrinsicValue op typeArgs env.localDecls env.layouts
+                    args avs true with
+                | none => rw [hEv] at hBodyCall; nomatch hBodyCall
+                | some rv =>
+                  rw [hEv] at hBodyCall
+                  dsimp only at hBodyCall
+                  split at hBodyCall
+                  · nomatch hBodyCall
+                  · cases hWr : writePlaceState env.arityOf slots2 dest destTy rv with
+                    | ub => rw [hWr] at hBodyCall; nomatch hBodyCall
+                    | unsupported => rw [hWr] at hBodyCall; nomatch hBodyCall
+                    | ok slots3 =>
+                      rw [hWr] at hBodyCall
+                      obtain rfl := cfgGoto_eq_some hBodyCall
+                      obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
+                        writePlaceState_bare_below_refines (borrows := s.memory.borrows)
+                          hRel2 hDestNil hWr
+                      obtain ⟨kind, hKind, hNotEx, hClass⟩ :=
+                        trustedSupportsIntrinsicDefPath_of_isValueDirectIntrinsic hValOp hSupp
+                      have hNotSel : kind ≠ .constEvalSelect := by
+                        intro hEq; subst hEq; cases op <;> cases hKind
+                      rw [← hDecls] at hEv
+                      have hNonSel :=
+                        evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
+                          (s := { s with frame := ⟨bb, sIdx, locals1⟩ })
+                          (target := { defPath := defPath, typeArgs := typeArgs, isIndirect := false })
+                          (locals' := locals2) (destination := dest) (targetBb := targetBb) hKind hEv
+                      refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
+                        Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3⟩
+                      have hDir :=
+                        evalDirectRustIntrinsic_of_nonSelect
+                          (s := { s with frame := ⟨bb, sIdx, locals1⟩ })
+                          (body := some cm)
+                          (target := { defPath := defPath, typeArgs := typeArgs, isIndirect := false })
+                          (localDecls := cm.localDecls) (layouts := env.layouts)
+                          (args := args) (argVals := avs) (locals' := locals2)
+                          (destination := dest) (targetBb := targetBb) (unwind := u)
+                          hClass hNotSel
+                      have hStepEval :
+                          evalTerminator { s with frame := ⟨bb, sIdx, locals1⟩ }
+                            ⟨(LTerminator.call
+                              (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+                              args dest destTy (some targetBb) u).toTrusted, span⟩
+                            (some cm) =
+                            writeIntrinsicReturn { s with frame := ⟨bb, sIdx, locals1⟩ }
+                              locals2 dest targetBb rv := by
+                        simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
+                          hResTgt, hLayouts, hCorr.globals, hTOps, hNoCallee,
+                          isDirectExactDivTarget, hNotEx, hDir]
+                        exact hNonSel
+                      rw [hStepEval]
+                      simp [writeIntrinsicReturn, hWPV]
+          · cases op with
+          | unreachableUnchecked =>
+            nomatch hBodyCall
+          | copyNonOverlapping =>
+            simp [trustedSupportsIntrinsicDefPath] at hSupp
+          | writeBytes =>
+            simp [trustedSupportsIntrinsicDefPath] at hSupp
+          | abort =>
+            simp only [evalLoweredIntrinsicCall] at hBodyCall
+            cases t with
+            | some _ => nomatch hBodyCall
+            | none =>
+              simp only [Option.some.injEq] at hBodyCall
+              subst hBodyCall
+              obtain ⟨_, _, hUnrF, hAbT⟩ := hSupp
+              simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+                hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbT]
+          | panicUnwind =>
+            simp only [evalLoweredIntrinsicCall] at hBodyCall
+            cases t with
+            | some _ => nomatch hBodyCall
+            | none =>
+              obtain ⟨_, _, hUnrF, hAbF, hPanT⟩ := hSupp
+              cases u with
+              | unreachable => simp [startPanic] at hBodyCall
+              | terminate =>
+                simp only [startPanic] at hBodyCall
+                cases hBodyCall
+                simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+                  hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT, applyUnwindAction]
+              | continue_ =>
+                simp only [startPanic] at hBodyCall
+                split at hBodyCall
+                · nomatch hBodyCall
+                · cases hBodyCall
+                  simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+                    hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                    applyUnwindAction, hCorr.stack, unwindFromCallStack]
+              | cleanup c =>
+                simp only [startPanic] at hBodyCall
+                split at hBodyCall
+                · nomatch hBodyCall
+                · obtain rfl := cfgGoto_eq_some hBodyCall
+                  refine ⟨{ s with frame := { blockIdx := c, stmtIdx := 0, locals := locals2 } },
+                    Or.inl ?_, hCorr.jump c locals2 hRel2⟩
+                  simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+                    hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                    applyUnwindAction]
+          | exactDiv =>
+            simp only [evalLoweredIntrinsicCall] at hBodyCall
+            split at hBodyCall
+            · nomatch hBodyCall
+            · cases t with
+              | none => nomatch hBodyCall
+              | some targetBb =>
+                rw [hUb] at hBodyCall
+                cases hEv : evalLIntrinsicValue .exactDiv typeArgs env.localDecls env.layouts
+                    args avs true with
+                | none => rw [hEv] at hBodyCall; nomatch hBodyCall
+                | some rv =>
+                  rw [hEv] at hBodyCall
+                  simp only at hBodyCall
+                  split at hBodyCall
+                  · nomatch hBodyCall
+                  · cases hWr : writePlaceState env.arityOf slots2 dest destTy rv with
+                    | ub => rw [hWr] at hBodyCall; nomatch hBodyCall
+                    | unsupported => rw [hWr] at hBodyCall; nomatch hBodyCall
+                    | ok slots3 =>
+                      rw [hWr] at hBodyCall
+                      obtain rfl := cfgGoto_eq_some hBodyCall
+                      obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
+                        writePlaceState_bare_below_refines (borrows := s.memory.borrows)
+                          hRel2 hDestNil hWr
+                      obtain ⟨hExPath, _⟩ := hSupp
+                      dsimp only [evalLIntrinsicValue] at hEv
+                      rcases avs with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
+                      · cases hEv
+                      · cases v1 <;> cases hEv
+                      · cases v1 <;> cases v2 <;> try cases hEv
+                        dsimp only at hEv
+                        split at hEv
+                        · rename_i isSigned hSignSynth
+                          simp only [Option.map_eq_some_iff] at hEv
+                          obtain ⟨retScalar, hDiv, rfl⟩ := hEv
+                          refine ⟨{ s with frame := { blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals } },
+                            Or.inl ?_, hCorr.jump targetBb updatedLocals hRel3⟩
+                          simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
+                            hResTgt, hDecls, hLayouts, hCorr.globals, hTOps, hNoCallee,
+                            isDirectExactDivTarget, hExPath]
+                          rw [resolveIntrinsicIsSigned_defPath_irrel _ { defPath := "", typeArgs := typeArgs, isIndirect := false } _ _ _ _ _ rfl, hSignSynth]
+                          simp only [hDiv, hWPV]
+                        · cases hEv
+                      · cases v1 <;> cases v2 <;> cases hEv
+          | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse
+          | wrappingAdd | wrappingSub | wrappingMul | saturatingAdd | saturatingSub
+          | uncheckedAdd | uncheckedSub | uncheckedMul | uncheckedDiv | uncheckedRem
+          | uncheckedShl | uncheckedShr | threeWayCompare | ubChecks | arithOffset
+          | sizeOfVal | alignOfVal =>
+            exact False.elim (hValOp rfl)
+    · nomatch hBodyCall
 
 /-- **`evalLoweredTerminator_refines_trusted`**: under `BodyCorr` and `StateCorr`, every
 successful lowered terminator step is matched by Trusted's `stepMirFn`: a jump is a Trusted
 `.step`/`.emitStep` to a corresponding state (preserving `StateCorr` on `Goto`, `SwitchInt`,
-`Assert`-pass, and `Assert` cleanup jumps), `Return` is Trusted's `.retNormal` of the same value,
-and a panic that unwinds out of the body (or aborts) is Trusted's `.panic` (or `.abort`) outcome.
-In particular Trusted never faults with `.ub` where Anneal succeeds. -/
+`Assert`-pass, `Assert` cleanup jumps, and direct inline-intrinsic `Call`s), `Return` is Trusted's
+`.retNormal` of the same value, and a panic that unwinds out of the body (or aborts) is Trusted's
+`.panic` (or `.abort`) outcome. In particular Trusted never faults with `.ub` where Anneal
+succeeds. -/
 theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm : CapturedMir}
     {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
     {step : CfgStep} (hBody : BodyCorr env body cm) (hCorr : StateCorr env bb slots s)
@@ -8813,7 +10119,23 @@ theorem evalLoweredTerminator_refines_trusted {env : CfgEnv} {body : LBody} {cm 
               · nomatch h
           · nomatch h
         · nomatch h
-      | call func args dest destTy t u => rw [hT] at hRef; exact absurd hRef id
+      | call func args dest destTy t u =>
+        rw [hT] at hRef h
+        dsimp only at h
+        have hFrameEq : { s with frame := ⟨bb, 0, s.frame.locals⟩ } = s := by
+          rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
+          have hbEq := hCorr.block
+          have hsEq := hCorr.stmt
+          simp only at hbEq hsEq
+          subst hbEq hsEq
+          rfl
+        have hCall := evalLoweredTerminator_call_refines_evalTerminator
+          (sIdx := 0) (span := span) (inCleanup := b.isCleanup)
+          hBody.layouts hBody.localDecls hBody.ubChecksTrue hBody.callTargetDefault
+          hRef hCorr hCorr.slots h
+        dsimp only at hCall
+        rw [hFrameEq] at hCall
+        cases step <;> exact hCall
       | unwindResume =>
         rw [hT] at h
         simp only at h
@@ -9046,9 +10368,9 @@ theorem evalLoweredTerminator_assert_bad_msg_none {env : CfgEnv} {body : LBody} 
     · rfl
 
 /-- **Returning or cleanup-unwinding `Call` soundness (`evalLoweredTerminator_call_goto_sound`)**:
-whenever a `Call` terminator steps via `.goto next slots3 unwinding'`, the callee operand and all
-argument operands evaluated to well-formed values (`env.wf`), the destination place was accessible,
-the call handler `fn` was invoked, and either:
+whenever a non-inline-intrinsic `Call` terminator steps via `.goto next slots3 unwinding'`, the
+callee operand and all argument operands evaluated to well-formed values (`env.wf`), the
+destination place was accessible, the call handler `fn` was invoked, and either:
 - the callee returned `some (.ret rv)` with `env.wf rv = true`, `env.inhabited destTy = true`,
   `target = some next`, `unwinding' = unwinding`, and `writePlaceState` wrote `rv` into
   `destination` to produce `slots3`; or
@@ -9060,6 +10382,7 @@ theorem evalLoweredTerminator_call_goto_sound {env : CfgEnv} {body : LBody} {bb 
     {target : Option Nat} {unwind : UnwindAction}
     (hb : body.blocks[bb]? = some b)
     (hT : b.terminator = .call func args destination destTy target unwind)
+    (hNoIntr : ∀ op typeArgs, env.callTargetOf func ≠ some (.inlineIntrinsic op typeArgs))
     (h : evalLoweredTerminator env body bb slots unwinding =
       some (.goto next slots3 unwinding')) :
     ∃ fv slots1 avs slots2 fn,
@@ -9087,7 +10410,8 @@ theorem evalLoweredTerminator_call_goto_sound {env : CfgEnv} {body : LBody} {bb 
   simp only [hT] at h
   split at h
   · nomatch h
-  · split at h
+  · unfold evalLoweredCall evalLoweredCallTargetDispatch evalLoweredHandlerCall at h
+    split at h
     · rename_i fv slots1 hFunc
       split at h
       · nomatch h
@@ -9105,54 +10429,65 @@ theorem evalLoweredTerminator_call_goto_sound {env : CfgEnv} {body : LBody} {bb 
             split at h
             · nomatch h
             · rename_i hInhGuard
-              split at h
-              · nomatch h
-              · rename_i fn hHandler
-                refine ⟨fv, slots1, avs, slots2, fn, hFunc, hWfF', hArgs, hAllWf.1,
-                  hAllWf.2.1, hAllWf.2.2, hHandler, ?_⟩
+              have hCT_cases :
+                  env.callTargetOf func = none ∨
+                    ∃ sym tys, env.callTargetOf func = some (.callee sym tys) := by
+                cases hCT : env.callTargetOf func with
+                | none => exact Or.inl rfl
+                | some ct =>
+                  cases ct with
+                  | inlineIntrinsic op typeArgs => exact absurd hCT (hNoIntr op typeArgs)
+                  | callee sym tys => exact Or.inr ⟨sym, tys, rfl⟩
+              rcases hCT_cases with hCT | ⟨sym, tys, hCT⟩ <;> rw [hCT] at h <;> dsimp only at h
+              all_goals
                 split at h
-                · rename_i rv hRet
+                · nomatch h
+                · rename_i fn hHandler
+                  refine ⟨fv, slots1, avs, slots2, fn, hFunc, hWfF', hArgs, hAllWf.1,
+                    hAllWf.2.1, hAllWf.2.2, hHandler, ?_⟩
                   split at h
-                  · nomatch h
-                  · rename_i hUnwOk
-                    have hUnwOk' : unwindActionOk body b.isCleanup unwind = true := by
-                      cases hU : unwindActionOk body b.isCleanup unwind <;> simp_all
+                  · rename_i rv hRet
                     split at h
                     · nomatch h
-                    · have hInh' : env.inhabited destTy = true := by
-                        cases hI : env.inhabited destTy <;> simp_all
+                    · rename_i hUnwOk
+                      have hUnwOk' : unwindActionOk body b.isCleanup unwind = true := by
+                        cases hU : unwindActionOk body b.isCleanup unwind <;> simp_all
                       split at h
                       · nomatch h
-                      · rename_i hWfRv
-                        have hWfRv' : env.wf rv = true := by cases hR : env.wf rv <;> simp_all
+                      · have hInh' : env.inhabited destTy = true := by
+                          cases hI : env.inhabited destTy <;> simp_all
                         split at h
-                        · rename_i slots3' hWrite
-                          have hGoto := cfgGoto_eq_some h
-                          injection hGoto with hNext hSlots hUnw
-                          subst hNext hSlots hUnw
-                          exact Or.inl ⟨rv, hRet, hInh', hUnwOk', rfl, hWfRv', hWrite, rfl⟩
                         · nomatch h
-                · rename_i hPanic
-                  cases unwind with
-                  | unreachable => simp [startPanic] at h
-                  | terminate => simp [startPanic] at h
-                  | continue_ =>
-                    simp only [startPanic] at h
-                    split at h <;> nomatch h
-                  | cleanup c =>
-                    simp only [startPanic] at h
-                    split at h
-                    · nomatch h
-                    · rename_i hNotUnw
-                      have hUnwNone : unwinding = none := by
-                        cases unwinding with
-                        | none => rfl
-                        | some _ => simp at hNotUnw
-                      have hGoto := cfgGoto_eq_some h
-                      injection hGoto with hNext hSlots hUnw
-                      subst hNext hSlots hUnw
-                      exact Or.inr ⟨hPanic, hUnwNone, rfl, rfl, rfl⟩
-                · nomatch h
+                        · rename_i hWfRv
+                          have hWfRv' : env.wf rv = true := by cases hR : env.wf rv <;> simp_all
+                          split at h
+                          · rename_i slots3' hWrite
+                            have hGoto := cfgGoto_eq_some h
+                            injection hGoto with hNext hSlots hUnw
+                            subst hNext hSlots hUnw
+                            exact Or.inl ⟨rv, hRet, hInh', hUnwOk', rfl, hWfRv', hWrite, rfl⟩
+                          · nomatch h
+                  · rename_i hPanic
+                    cases unwind with
+                    | unreachable => simp [startPanic] at h
+                    | terminate => simp [startPanic] at h
+                    | continue_ =>
+                      simp only [startPanic] at h
+                      split at h <;> nomatch h
+                    | cleanup c =>
+                      simp only [startPanic] at h
+                      split at h
+                      · nomatch h
+                      · rename_i hNotUnw
+                        have hUnwNone : unwinding = none := by
+                          cases unwinding with
+                          | none => rfl
+                          | some _ => simp at hNotUnw
+                        have hGoto := cfgGoto_eq_some h
+                        injection hGoto with hNext hSlots hUnw
+                        subst hNext hSlots hUnw
+                        exact Or.inr ⟨hPanic, hUnwNone, rfl, rfl, rfl⟩
+                  · nomatch h
         · nomatch h
     · nomatch h
 
@@ -9164,7 +10499,7 @@ theorem evalLoweredTerminator_call_uninhabited_dest_none {env : CfgEnv} {body : 
     (hb : body.blocks[bb]? = some b) (hT : b.terminator = .call func args dest destTy (some t) u)
     (hInh : env.inhabited destTy = false) :
     evalLoweredTerminator env body bb slots unwinding = none := by
-  unfold evalLoweredTerminator
+  unfold evalLoweredTerminator evalLoweredCall
   rw [hb]
   simp only [hT, Option.isSome_some, hInh, Bool.not_false, Bool.and_true, ↓reduceIte, ite_self]
   split
@@ -9818,6 +11153,55 @@ theorem startPanic_goto_cleanup_invariant {body : LBody} {bb next : Nat} {u : Un
       obtain ⟨rfl, rfl, rfl, nb, hnb, hClean⟩ := cfgGoto_cleanup_invariant h
       exact ⟨hUnwNone, rfl, nb, hnb, hClean⟩
 
+/-- Every `.goto` transition produced by `evalLoweredIntrinsicCall` targets a valid basic block
+whose `isCleanup` flag matches `unwinding'.isSome`. -/
+theorem evalLoweredIntrinsicCall_goto_cleanup_invariant {env : CfgEnv} {body : LBody}
+    {bb next : Nat} {inCleanup : Bool} {args : List Operand} {avs : List Value}
+    {slots2 slots' : List LocalSlotState} {dest : Place} {destTy : Ty} {target : Option Nat}
+    {unwind : UnwindAction} {unwinding unwinding' : Option Nat}
+    {op : LIntrinsicOp} {typeArgs : List RigidTy}
+    (h : evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 dest destTy target
+      unwind unwinding op typeArgs = some (.goto next slots' unwinding')) :
+    ∃ nb, body.blocks[next]? = some nb ∧ nb.isCleanup = unwinding'.isSome := by
+  unfold evalLoweredIntrinsicCall at h
+  cases op with
+  | unreachableUnchecked => nomatch h
+  | abort => cases target <;> nomatch h
+  | panicUnwind =>
+    cases target with
+    | none =>
+      obtain ⟨_, hUnw', nb, hnb, hClean⟩ := startPanic_goto_cleanup_invariant h
+      exact ⟨nb, hnb, by simp [hUnw', hClean]⟩
+    | some _ => nomatch h
+  | copyNonOverlapping | writeBytes =>
+    dsimp only at h
+    split at h
+    · nomatch h
+    · split at h
+      · split at h
+        · split at h
+          · nomatch h
+          · split at h
+            · exact (cfgGoto_cleanup_invariant h).2.2.2
+            · nomatch h
+        · nomatch h
+      · nomatch h
+  | _ =>
+    dsimp only at h
+    split at h
+    · nomatch h
+    · cases target with
+      | none => nomatch h
+      | some t =>
+        dsimp only at h
+        split at h
+        · split at h
+          · nomatch h
+          · split at h
+            · exact (cfgGoto_cleanup_invariant h).2.2.2
+            · nomatch h
+        · nomatch h
+
 /-- **Target-block cleanup/unwind invariant (`evalLoweredTerminator_goto_cleanup_invariant`)**:
 every `.goto next slots' unwinding'` transition produced by `evalLoweredTerminator` targets a
 valid basic block `nb` in `body.blocks` whose `isCleanup` flag matches `unwinding'.isSome`
@@ -9882,6 +11266,7 @@ theorem evalLoweredTerminator_goto_cleanup_invariant {env : CfgEnv} {body : LBod
       | call func args dest destTy target unwind =>
         rw [hT] at h
         simp only at h
+        unfold evalLoweredCall evalLoweredCallTargetDispatch evalLoweredHandlerCall at h
         split at h
         · split at h
           · nomatch h
@@ -9891,20 +11276,22 @@ theorem evalLoweredTerminator_goto_cleanup_invariant {env : CfgEnv} {body : LBod
               · split at h
                 · nomatch h
                 · split at h
-                  · nomatch h
+                  · exact evalLoweredIntrinsicCall_goto_cleanup_invariant h
                   · split at h
+                    · nomatch h
                     · split at h
-                      · nomatch h
                       · split at h
                         · nomatch h
                         · split at h
                           · nomatch h
                           · split at h
-                            · exact (cfgGoto_cleanup_invariant h).2.2.2
                             · nomatch h
-                    · obtain ⟨_, hUnw', nb, hnb, hClean⟩ := startPanic_goto_cleanup_invariant h
-                      exact ⟨nb, hnb, by simp [hUnw', hClean]⟩
-                    · nomatch h
+                            · split at h
+                              · exact (cfgGoto_cleanup_invariant h).2.2.2
+                              · nomatch h
+                      · obtain ⟨_, hUnw', nb, hnb, hClean⟩ := startPanic_goto_cleanup_invariant h
+                        exact ⟨nb, hnb, by simp [hUnw', hClean]⟩
+                      · nomatch h
             · nomatch h
         · nomatch h
       | unwindResume =>
@@ -9941,6 +11328,9 @@ structure BodyCorrWithStmts (env : CfgEnv) (body : LBody) (cm : CapturedMir) : P
           ∃ (locals1 : List LocalSlot),
             TrustedRun cm s { s with frame := ⟨i, tStmts.length, locals1⟩ } ∧
             SlotsRefine SlotBelow slots1 locals1
+  localDecls : cm.localDecls = env.localDecls := by rfl
+  ubChecksTrue : env.ubChecks = true := by rfl
+  callTargetDefault : env.callTargetOf = extractLCallTarget_V2026_06_01? := by rfl
 
 /-- At the end of a basic block's statement list (`stmtIdx = tStmts.length`), Trusted's
 `stepMirFn` evaluates the block's terminator. -/
@@ -9971,7 +11361,10 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
     (hcm : cm.basicBlocks[bb]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩)
     (hCorr : StateCorr env bb slots s)
     (hRel1 : SlotsRefine SlotBelow slots1 locals1)
-    (h : evalLoweredTerminator env body bb slots1 unwinding = some step) :
+    (h : evalLoweredTerminator env body bb slots1 unwinding = some step)
+    (hDecls : cm.localDecls = env.localDecls := by rfl)
+    (hUb : env.ubChecks = true := by rfl)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01? := by rfl) :
     match step with
     | .goto next slots' _ =>
       ∃ s', TrustedStep (stepMirFn cm { s with frame := ⟨bb, tStmts.length, locals1⟩ }) s' ∧
@@ -10111,7 +11504,13 @@ theorem evalLoweredTerminator_at_end_refines_trusted {env : CfgEnv} {body : LBod
             · nomatch h
         · nomatch h
       · nomatch h
-    | call func args dest destTy t u => rw [hT] at hRef; exact absurd hRef id
+    | call func args dest destTy t u =>
+      rw [hT] at hRef h
+      dsimp only at h
+      have hCall := evalLoweredTerminator_call_refines_evalTerminator
+        (sIdx := tStmts.length) (span := span) (inCleanup := b.isCleanup)
+        hLayouts hDecls hUb hCallTgt hRef hCorr hRel1 h
+      cases step <;> exact hCall
     | unwindResume =>
       rw [hT] at h
       simp only at h
@@ -10169,6 +11568,7 @@ theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBo
           rw [hT] at h
           have hRef := evalLoweredTerminator_at_end_refines_trusted
             hBody.phase hBody.layouts hb hTermRef hcm hCorr hRel1 hT
+            hBody.localDecls hBody.ubChecksTrue hBody.callTargetDefault
           cases step with
           | goto next slots' unwinding' =>
             simp only at h hRef
@@ -10220,6 +11620,9 @@ theorem BodyCorr.toBodyCorrWithStmts {env : CfgEnv} {body : LBody} {cm : Capture
       rfl
     rw [hFrame]
     exact .refl s
+  localDecls := hBody.localDecls
+  ubChecksTrue := hBody.ubChecksTrue
+  callTargetDefault := hBody.callTargetDefault
 
 /-- Executing a single bare-local `Deinit` statement at the start of basic block `bb` produces a
 one-step `TrustedRun` to `stmtIdx = 1` while preserving `SlotsRefine SlotBelow` (discharging
@@ -16560,5 +17963,3287 @@ theorem witness_trusted_retag_ref_anneal :
     cases hRead
     exact hUB (by simp [witnessReborrowState, lookupBorrow, witnessChildEntry, witnessPtrT,
       ProvenancePtr.tag])
+
+/-! ## Section 5 — Syntax-Independent `LIntrinsicOp`, `LCallTarget`, Call-Form Memory Intrinsics,
+Multi-Callee `LCallTable`, and Concrete Non-Vacuity Witnesses (`ep2-lean-call-intrinsic-refinement-and-minirust-bridge`)
+
+This section completes the Episode 2 formalization of `crates/anneal-mir`:
+- **Section 5a**: `V2026_06_01` adapter round-trip, `classifyLinkedCallTarget_V2026_06_01`
+  linked-body precedence, inline-intrinsic `.goto` inversion, and projected call-destination
+  refinement (`writePlaceState_init_proj_below_refines`).
+- **Section 5b**: UB fault parity (`unreachableUnchecked`, `exactDiv` remainder/zero/`INT_MIN / -1`,
+  and value-returning scalar intrinsics such as `ctlzNonzero(0)` and `uncheckedShl`) and diverging
+  `abort` (bypassing cleanup) vs `panicUnwind` (entering cleanup / unwinding).
+- **Section 5c**: Call-form `copyNonOverlapping` and `writeBytes` (`repeatByteBits`,
+  `evalWriteBytesSubplace`, `memIntrinsicSubplace`) sub-place soundness and Trusted refinement.
+- **Section 5d**: Multi-callee `LCallTable`, `LLinkedCallee`, `LCallerFrame`, `unwindLCallStack`,
+  `stepLoweredWithCallTable`, and `runLoweredWithCallTable`, refining Trusted's multi-frame
+  `MachineState` (`lookupCallee`, `pushCalleeFrame`, `pushDivergingCalleeFrame`, `.return_` with
+  `writePlaceValue` + `restoreCallerProtectors`, and `unwindFromCallStack`) across 2+-deep call
+  chains with explicit `maxCallDepthExceeded` vs `outOfFuel`.
+- **Section 5e**: Four concrete executable non-vacuity witness suites discharging every premise by
+  kernel computation (`rfl` / `decide`). -/
+
+/-! ### Section 5a: `V2026_06_01` Adapter Round-Trip, Linked Precedence & Call-Destination Lemmas -/
+
+/-- Round-trip: every `LIntrinsicOp` mapped to `some kind` by `toRustIntrinsicKind?` is recovered
+by `fromRustIntrinsicKind?`. -/
+theorem LIntrinsicOp.fromRustIntrinsicKind_toRustIntrinsicKind {op : LIntrinsicOp}
+    {kind : RustIntrinsicKind} (h : op.toRustIntrinsicKind? = some kind) :
+    LIntrinsicOp.fromRustIntrinsicKind? kind = some op := by
+  cases op <;> simp only [LIntrinsicOp.toRustIntrinsicKind?] at h <;> cases h <;> rfl
+
+/-- Round-trip: every `RustIntrinsicKind` mapped to `some op` by `fromRustIntrinsicKind?` maps back
+to `some kind` under `toRustIntrinsicKind?` (all variants except `constEvalSelect`). -/
+theorem LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind {kind : RustIntrinsicKind}
+    {op : LIntrinsicOp} (h : LIntrinsicOp.fromRustIntrinsicKind? kind = some op) :
+    op.toRustIntrinsicKind? = some kind := by
+  cases kind <;> simp only [LIntrinsicOp.fromRustIntrinsicKind?] at h <;> cases h <;> rfl
+
+/-- `const_eval_select` is remapped before runtime MIR and is not lowered as an `LIntrinsicOp`. -/
+theorem LIntrinsicOp.fromRustIntrinsicKind_constEvalSelect_none :
+    LIntrinsicOp.fromRustIntrinsicKind? .constEvalSelect = none := rfl
+
+/-- Both `"core::intrinsics::exact_div"` and `"std::intrinsics::exact_div"` lower to `.exactDiv`,
+and `"core::intrinsics::exact_div"` satisfies `trustedSupportsIntrinsicDefPath`. -/
+theorem lowerIntrinsicKind_V2026_06_01_exactDiv :
+    lowerIntrinsicKind_V2026_06_01 "core::intrinsics::exact_div" = some .exactDiv ∧
+      lowerIntrinsicKind_V2026_06_01 "std::intrinsics::exact_div" = some .exactDiv ∧
+      trustedSupportsIntrinsicDefPath "core::intrinsics::exact_div" .exactDiv :=
+  ⟨by decide, by decide, ⟨by decide, by decide⟩⟩
+
+/-- Every non-`exact_div` `DefPath` classified by `Terminators.classifyRustIntrinsic?` as a
+non-`constEvalSelect` `RustIntrinsicKind` lowers to the matching `LIntrinsicOp` and satisfies
+`trustedSupportsIntrinsicDefPath`. -/
+theorem lowerIntrinsicKind_V2026_06_01_of_classifyRustIntrinsic {defPath : DefPath}
+    {kind : RustIntrinsicKind} {op : LIntrinsicOp}
+    (hNotCoreEx : stringEq defPath "core::intrinsics::exact_div" = false)
+    (hNotStdEx : stringEq defPath "std::intrinsics::exact_div" = false)
+    (hClass : classifyRustIntrinsic? defPath = some kind)
+    (hFrom : LIntrinsicOp.fromRustIntrinsicKind? kind = some op) :
+    lowerIntrinsicKind_V2026_06_01 defPath = some op ∧
+      trustedSupportsIntrinsicDefPath defPath op := by
+  have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind hFrom
+  refine ⟨?_, ?_⟩
+  · simp [lowerIntrinsicKind_V2026_06_01, hNotCoreEx, hNotStdEx, hClass, hFrom]
+  · cases op with
+    | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+      cases hTo
+    | _ => exact ⟨kind, hTo, hNotCoreEx, hClass⟩
+
+/-- All three `Terminators.isUnreachableCallTarget` entry points lower to `.unreachableUnchecked`
+and satisfy `trustedSupportsIntrinsicDefPath`. -/
+theorem lowerIntrinsicKind_V2026_06_01_unreachable_targets :
+    (lowerIntrinsicKind_V2026_06_01 "core::hint::unreachable_unchecked" =
+        some .unreachableUnchecked ∧
+      trustedSupportsIntrinsicDefPath "core::hint::unreachable_unchecked" .unreachableUnchecked) ∧
+    (lowerIntrinsicKind_V2026_06_01 "std::hint::unreachable_unchecked" =
+        some .unreachableUnchecked ∧
+      trustedSupportsIntrinsicDefPath "std::hint::unreachable_unchecked" .unreachableUnchecked) ∧
+    (lowerIntrinsicKind_V2026_06_01 "core::intrinsics::unreachable" =
+        some .unreachableUnchecked ∧
+      trustedSupportsIntrinsicDefPath "core::intrinsics::unreachable" .unreachableUnchecked) := by
+  dsimp only [trustedSupportsIntrinsicDefPath]
+  decide
+
+/-- Canonical aborting and unwinding `core` entry points lower to `.abort` and `.panicUnwind` and
+satisfy `trustedSupportsIntrinsicDefPath`. -/
+theorem lowerIntrinsicKind_V2026_06_01_abort_and_panic_targets :
+    (lowerIntrinsicKind_V2026_06_01 "core::intrinsics::abort" = some .abort ∧
+      trustedSupportsIntrinsicDefPath "core::intrinsics::abort" .abort) ∧
+    (lowerIntrinsicKind_V2026_06_01 "core::panicking::panic_nounwind" = some .abort ∧
+      trustedSupportsIntrinsicDefPath "core::panicking::panic_nounwind" .abort) ∧
+    (lowerIntrinsicKind_V2026_06_01 "core::panicking::panic" = some .panicUnwind ∧
+      trustedSupportsIntrinsicDefPath "core::panicking::panic" .panicUnwind) ∧
+    (lowerIntrinsicKind_V2026_06_01 "core::panicking::panic_fmt" = some .panicUnwind ∧
+      trustedSupportsIntrinsicDefPath "core::panicking::panic_fmt" .panicUnwind) := by
+  dsimp only [trustedSupportsIntrinsicDefPath]
+  decide
+
+/--Executable `Bool` checker for `trustedSupportsIntrinsicDefPath`, enabling kernel `by decide`
+discharge of `trustedSupportsIntrinsicDefPath defPath op` across all 30 `LIntrinsicOp` variants. -/
+def checkTrustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Bool :=
+  match op with
+  | .exactDiv =>
+    stringEq defPath "core::intrinsics::exact_div" && !(classifyRustIntrinsic? defPath).isSome
+  | .unreachableUnchecked =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      !(classifyRustIntrinsic? defPath).isSome &&
+      isUnreachableCallTarget defPath
+  | .abort =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      !(classifyRustIntrinsic? defPath).isSome &&
+      !isUnreachableCallTarget defPath &&
+      isAbortingPanicDefPath defPath
+  | .panicUnwind =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      !(classifyRustIntrinsic? defPath).isSome &&
+      !isUnreachableCallTarget defPath &&
+      !isAbortingPanicDefPath defPath &&
+      isUnwindingPanicDefPath defPath
+  | .copyNonOverlapping | .writeBytes => false
+  | _ =>
+    match classifyRustIntrinsic? defPath with
+    | some kind =>
+      !stringEq defPath "core::intrinsics::exact_div" &&
+        decide (LIntrinsicOp.fromRustIntrinsicKind? kind = some op)
+    | none => false
+
+theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntrinsicOp}
+    (h : checkTrustedSupportsIntrinsicDefPath defPath op = true) :
+    trustedSupportsIntrinsicDefPath defPath op := by
+  by_cases hVal : op.isValueDirectIntrinsic = true
+  · have hShape :
+        checkTrustedSupportsIntrinsicDefPath defPath op =
+          (match classifyRustIntrinsic? defPath with
+           | some kind =>
+             !stringEq defPath "core::intrinsics::exact_div" &&
+               decide (LIntrinsicOp.fromRustIntrinsicKind? kind = some op)
+           | none => false) := by
+      cases op <;> first | contradiction | rfl
+    rw [hShape] at h
+    cases hClass : classifyRustIntrinsic? defPath with
+    | none => rw [hClass] at h; nomatch h
+    | some kind =>
+      rw [hClass] at h
+      simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq] at h
+      have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind h.2
+      have hGoal :
+          trustedSupportsIntrinsicDefPath defPath op =
+            (∃ k, op.toRustIntrinsicKind? = some k ∧
+              stringEq defPath "core::intrinsics::exact_div" = false ∧
+              classifyRustIntrinsic? defPath = some k) := by
+        cases op <;> first | contradiction | rfl
+      rw [hGoal]
+      exact ⟨kind, hTo, h.1, hClass⟩
+  · cases op <;> try exact False.elim (hVal rfl)
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      exact h
+    · nomatch h
+    · nomatch h
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      exact ⟨h.1.1, h.1.2, h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
+        Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
+      exact ⟨h.1.1.1.1, h.1.1.1.2, h.1.1.2, h.1.2, h.2⟩
+
+/-- **Linked-body precedence (`classifyLinkedCallTarget_V2026_06_01_linked_precedence`)**: when a
+callee has a linked MIR body (`hasLinkedBody = true`), `classifyLinkedCallTarget_V2026_06_01`
+routes it to `.callee defPath typeArgs` even if `defPath` names a compiler intrinsic (matching
+`Trusted.lookupCallee` running before `evalDirectRustIntrinsic?` in `Terminators.lean`). When
+unlinked (`hasLinkedBody = false`), it delegates to `lowerCallTarget_V2026_06_01`. -/
+theorem classifyLinkedCallTarget_V2026_06_01_linked_precedence (defPath : DefPath)
+    (typeArgs : List RigidTy) :
+    classifyLinkedCallTarget_V2026_06_01 true defPath typeArgs = .callee defPath typeArgs ∧
+      classifyLinkedCallTarget_V2026_06_01 false defPath typeArgs =
+        lowerCallTarget_V2026_06_01 defPath typeArgs :=
+  ⟨rfl, rfl⟩
+
+/-- **Inline-intrinsic `Call` `.goto` inversion (`evalLoweredTerminator_call_intrinsic_goto_sound`)**:
+when an inline-intrinsic `Call` (`env.callTargetOf func = some (.inlineIntrinsic op typeArgs)`)
+steps via `.goto next slots3 unwinding'`, `func` and `args` evaluated to well-formed values, the
+destination passed runtime and typed access checks, and either:
+- `op = .panicUnwind`, `target = none`, `unwinding = none`, `unwinding' = some bb`,
+  `unwind = .cleanup next`, and `slots3 = slots2`; or
+- `op ∈ {.copyNonOverlapping, .writeBytes}`, `target = some next`, `unwinding' = unwinding`, and
+  `env.memIntrinsic` produced `slotsMem` followed by writing `()` into `destination`; or
+- `op` is one of the 25 value-returning intrinsics, `target = some next`, `unwinding' = unwinding`,
+  `evalLIntrinsicValue` produced `rv` with `env.wf rv = true`, and `writePlaceState` wrote `rv`
+  into `destination` to produce `slots3`. -/
+theorem evalLoweredTerminator_call_intrinsic_goto_sound {env : CfgEnv} {body : LBody}
+    {bb next : Nat} {slots slots3 : List LocalSlotState} {unwinding unwinding' : Option Nat}
+    {b : LBlock} {func : Operand} {args : List Operand} {destination : Place} {destTy : Ty}
+    {target : Option Nat} {unwind : UnwindAction} {op : LIntrinsicOp} {typeArgs : List RigidTy}
+    (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .call func args destination destTy target unwind)
+    (hIntr : env.callTargetOf func = some (.inlineIntrinsic op typeArgs))
+    (h : evalLoweredTerminator env body bb slots unwinding =
+      some (.goto next slots3 unwinding')) :
+    ∃ fv slots1 avs slots2,
+      evalOperandState slots func env.layouts env.globals = (.ok fv, slots1) ∧
+      env.wf fv = true ∧
+      evalOperandsState env.layouts env.globals slots1 args = some (avs, slots2) ∧
+      avs.all env.wf = true ∧
+      placeRuntimeAccessOk slots2 destination = true ∧
+      env.placeAccessOk slots2 destination = true ∧
+      ((op = .panicUnwind ∧ target = none ∧ unwinding = none ∧ unwinding' = some bb ∧
+          unwind = .cleanup next ∧ slots3 = slots2) ∨
+       ((op = .copyNonOverlapping ∨ op = .writeBytes) ∧
+          unwindActionOk body b.isCleanup unwind = true ∧
+          target = some next ∧ unwinding' = unwinding ∧
+          ∃ memFn slotsMem, env.memIntrinsic = some memFn ∧
+            memFn op typeArgs slots2 avs = some slotsMem ∧
+            writePlaceState env.arityOf slotsMem destination destTy Value.unit = .ok slots3) ∨
+       (op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind ∧
+          op ≠ .copyNonOverlapping ∧ op ≠ .writeBytes ∧
+          unwindActionOk body b.isCleanup unwind = true ∧
+          target = some next ∧ unwinding' = unwinding ∧
+          ∃ rv,
+            evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs env.ubChecks =
+              some rv ∧
+            env.wf rv = true ∧
+            writePlaceState env.arityOf slots2 destination destTy rv = .ok slots3)) := by
+  unfold evalLoweredTerminator at h
+  rw [hb] at h
+  simp only [hT] at h
+  split at h
+  · nomatch h
+  · unfold evalLoweredCall evalLoweredCallTargetDispatch at h
+    split at h
+    · rename_i fv slots1 hFunc
+      split at h
+      · nomatch h
+      · rename_i hWfF
+        have hWfF' : env.wf fv = true := by cases hW : env.wf fv <;> simp_all
+        split at h
+        · rename_i avs slots2 hArgs
+          split at h
+          · nomatch h
+          · rename_i hAccGuard
+            have hAllWf : avs.all env.wf = true ∧ placeRuntimeAccessOk slots2 destination = true ∧
+                env.placeAccessOk slots2 destination = true := by
+              cases h1 : avs.all env.wf <;> cases h2 : placeRuntimeAccessOk slots2 destination <;>
+                cases h3 : env.placeAccessOk slots2 destination <;> simp_all
+            split at h
+            · nomatch h
+            · rw [hIntr] at h
+              dsimp only at h
+              refine ⟨fv, slots1, avs, slots2, hFunc, hWfF', hArgs, hAllWf.1, hAllWf.2.1,
+                hAllWf.2.2, ?_⟩
+              have hValueBranch :
+                  (op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind ∧
+                    op ≠ .copyNonOverlapping ∧ op ≠ .writeBytes) →
+                  evalLoweredIntrinsicCall env body bb b.isCleanup args avs slots2 destination
+                    destTy target unwind unwinding op typeArgs =
+                    some (.goto next slots3 unwinding') →
+                  unwindActionOk body b.isCleanup unwind = true ∧
+                    target = some next ∧ unwinding' = unwinding ∧
+                    ∃ rv,
+                      evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs
+                        env.ubChecks = some rv ∧
+                      env.wf rv = true ∧
+                      writePlaceState env.arityOf slots2 destination destTy rv = .ok slots3 := by
+                rintro ⟨h1, h2, h3, h4, h5⟩ hValCall
+                have hEqDef :
+                    evalLoweredIntrinsicCall env body bb b.isCleanup args avs slots2 destination
+                      destTy target unwind unwinding op typeArgs =
+                    (if !unwindActionOk body b.isCleanup unwind then none else
+                     match target with
+                     | none => none
+                     | some t =>
+                       match evalLIntrinsicValue op typeArgs env.localDecls env.layouts args avs
+                           env.ubChecks with
+                       | some rv =>
+                         if !env.wf rv then none else
+                         match writePlaceState env.arityOf slots2 destination destTy rv with
+                         | .ok slots3 => cfgGoto body t slots3 unwinding
+                         | _ => none
+                       | none => none) := by
+                  cases op <;> first | contradiction | rfl
+                rw [hEqDef] at hValCall
+                split at hValCall
+                · nomatch hValCall
+                · have hUnwOk : unwindActionOk body b.isCleanup unwind = true := by
+                    cases hU : unwindActionOk body b.isCleanup unwind <;> simp_all
+                  cases target with
+                  | none => nomatch hValCall
+                  | some tgt =>
+                    dsimp only at hValCall
+                    cases hEv : evalLIntrinsicValue op typeArgs env.localDecls env.layouts args
+                        avs env.ubChecks with
+                    | none => rw [hEv] at hValCall; nomatch hValCall
+                    | some rv =>
+                      rw [hEv] at hValCall
+                      dsimp only at hValCall
+                      split at hValCall
+                      · nomatch hValCall
+                      · have hWfRv : env.wf rv = true := by cases hR : env.wf rv <;> simp_all
+                        cases hWr : writePlaceState env.arityOf slots2 destination destTy rv with
+                        | ub => rw [hWr] at hValCall; nomatch hValCall
+                        | unsupported => rw [hWr] at hValCall; nomatch hValCall
+                        | ok s3 =>
+                          rw [hWr] at hValCall
+                          have hGoto := cfgGoto_eq_some hValCall
+                          injection hGoto with hNext hSlots hUnw
+                          subst hNext hSlots hUnw
+                          exact ⟨hUnwOk, rfl, rfl, rv, rfl, hWfRv, hWr⟩
+              by_cases hNonMem :
+                  op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind ∧
+                    op ≠ .copyNonOverlapping ∧ op ≠ .writeBytes
+              · obtain ⟨hUnwOk, hTgt, hUnwEq, rv, hEv, hWfRv, hWr⟩ := hValueBranch hNonMem h
+                exact Or.inr (Or.inr ⟨hNonMem.1, hNonMem.2.1, hNonMem.2.2.1, hNonMem.2.2.2.1,
+                  hNonMem.2.2.2.2, hUnwOk, hTgt, hUnwEq, rv, hEv, hWfRv, hWr⟩)
+              · unfold evalLoweredIntrinsicCall at h
+                cases op with
+                | unreachableUnchecked => nomatch h
+                | abort => cases target <;> nomatch h
+                | panicUnwind =>
+                  cases target with
+                  | some _ => nomatch h
+                  | none =>
+                    cases unwind with
+                    | unreachable => simp [startPanic] at h
+                    | terminate => simp [startPanic] at h
+                    | continue_ => simp only [startPanic] at h; split at h <;> nomatch h
+                    | cleanup c =>
+                      simp only [startPanic] at h
+                      split at h
+                      · nomatch h
+                      · rename_i hNotUnw
+                        have hUnwNone : unwinding = none := by
+                          cases unwinding with
+                          | none => rfl
+                          | some _ => simp at hNotUnw
+                        have hGoto := cfgGoto_eq_some h
+                        injection hGoto with hNext hSlots hUnw
+                        subst hNext hSlots hUnw
+                        exact Or.inl ⟨rfl, rfl, hUnwNone, rfl, rfl, rfl⟩
+                | copyNonOverlapping | writeBytes =>
+                  dsimp only at h
+                  split at h
+                  · nomatch h
+                  · rename_i hUnwG
+                    have hUnwOk : unwindActionOk body b.isCleanup unwind = true := by
+                      cases hU : unwindActionOk body b.isCleanup unwind <;> simp_all
+                    cases target with
+                    | none => nomatch h
+                    | some tgt =>
+                      cases hMem : env.memIntrinsic with
+                      | none => rw [hMem] at h; nomatch h
+                      | some memFn =>
+                        rw [hMem] at h
+                        dsimp only at h
+                        cases hRun : memFn _ typeArgs slots2 avs with
+                        | none => rw [hRun] at h; nomatch h
+                        | some slotsMem =>
+                          rw [hRun] at h
+                          dsimp only at h
+                          split at h
+                          · nomatch h
+                          · cases hWr : writePlaceState env.arityOf slotsMem destination destTy Value.unit with
+                            | ub => rw [hWr] at h; nomatch h
+                            | unsupported => rw [hWr] at h; nomatch h
+                            | ok s3 =>
+                              rw [hWr] at h
+                              have hGoto := cfgGoto_eq_some h
+                              injection hGoto with hNext hSlots hUnw
+                              subst hNext hSlots hUnw
+                              exact Or.inr (Or.inl ⟨by simp, hUnwOk, rfl, rfl, memFn, slotsMem,
+                                rfl, hRun, hWr⟩)
+                | _ =>
+                  exfalso
+                  apply hNonMem
+                  exact ⟨by decide, by decide, by decide, by decide, by decide⟩
+        · nomatch h
+    · nomatch h
+
+/-- **Projected call-destination write refinement (`writePlaceState_init_proj_below_refines`)**:
+writing a return value `rv` into a non-`Deref` projected destination `⟨loc, pHead :: pTail⟩` of an
+initialized local (`slots[loc]? = some (.init root)`) via `writePlaceState` refines Trusted's
+`writePlaceValue` under `SlotsRefine SlotBelow`. -/
+theorem writePlaceState_init_proj_below_refines {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {slots slots' : List LocalSlotState} {locals : List LocalSlot}
+    {borrows : List BorrowEntry} {loc : Local} {pHead : ProjectionElem}
+    {pTail : List ProjectionElem} {destTy : Ty} {root rv : Value}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hInit : slots[loc]? = some (.init root))
+    (hNoDeref : projectionHasDeref (pHead :: pTail) = false)
+    (hWrite : writePlaceState arityOf slots ⟨loc, pHead :: pTail⟩ destTy rv = .ok slots') :
+    ∃ locals',
+      writePlaceValue locals borrows ⟨loc, pHead :: pTail⟩ rv = .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  obtain ⟨root', hWr, hEq⟩ := writePlaceState_init_root_inv hInit hNoDeref hWrite
+  subst hEq
+  have hSame := sameScalarLocals_of_slotBelow hRel
+  have hWT : evalValueProjWrite locals root (pHead :: pTail) rv = .ok root' := by
+    rw [← evalValueProjWrite_congr_scalar_locals hSame]; exact hWr
+  have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hWT
+  have hTT : locals[loc]? = some (.init root) := by
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
+    · simp only [get?_eq_getElem?] at hA; rw [hA] at hInit; nomatch hInit
+    · simp only [get?_eq_getElem?] at hA hT
+      rw [hA] at hInit; cases hInit
+      cases t with
+      | init w => have hvw : root = w := hAT; subst hvw; exact hT
+      | _ => simp [SlotBelow] at hAT
+  have hLt : loc < locals.length := (List.getElem?_eq_some_iff.mp hTT).1
+  have hSet : set? locals loc (.init root') = some (locals.set loc (.init root')) :=
+    set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+  have hNotDeref : pHead ≠ .deref := by
+    intro hD; subst hD; simp [projectionHasDeref] at hNoDeref
+  exact ⟨locals.set loc (.init root'),
+    writePlaceValue_proj_of_noUnion locals borrows loc pHead pTail rv root root' _
+      [] emptyLayoutTable hNotDeref (placeTouchesUnion_nil_decls emptyLayoutTable _) rfl
+      (by simp [get?_eq_getElem?, hTT]) hWP hSet,
+    SlotsRefine.set (a := .init root') (t := .init root') rfl loc hRel⟩
+
+/-! ### Section 5b: UB Fault Parity & Diverging `abort` vs `panicUnwind` -/
+
+/-- **`unreachable_unchecked` UB fault parity (`evalLoweredTerminator_call_unreachableUnchecked_ub_parity`)**:
+a diverging direct call to `unreachable_unchecked` (`core::hint::unreachable_unchecked`,
+`std::hint::unreachable_unchecked`, or `core::intrinsics::unreachable`) always returns `none` in
+`evalLoweredTerminator`, and under `StateCorr` (when operand evaluation succeeds) faults with
+`MirStepNode.fail .ub` in Trusted's `evalTerminator`. -/
+theorem evalLoweredTerminator_call_unreachableUnchecked_ub_parity
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {avs : List Value} {dest : Place} {destTy : Ty} {u : UnwindAction}
+    (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy none u)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some .unreachableUnchecked)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath .unreachableUnchecked)
+    (hLayouts : cm.layouts = env.layouts)
+    (hCorr : StateCorr env bb slots s)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
+    (span : String) :
+    evalLoweredTerminator env body bb slots unwinding = none ∧
+      evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = MirStepNode.fail .ub := by
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hT]
+    split
+    · rfl
+    · unfold evalLoweredCall evalLoweredCallTargetDispatch
+      simp only [evalOperandState, evalConstValue]
+      split
+      · rfl
+      · rw [hArgsEval]
+        dsimp only
+        split
+        · rfl
+        · split
+          · rfl
+          · rw [hCallTgt]
+            simp [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+              extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall]
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
+      hCorr.slots hArgsND hArgsEval
+    have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .unreachableUnchecked hLower
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+      fun _ _ => rfl
+    obtain ⟨_, _, hUnrT⟩ := hSupp
+    simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+      hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrT]
+
+/-- **`exact_div` UB fault parity (`evalLoweredTerminator_call_exactDiv_ub_parity`)**: whenever
+`evalExactDiv lhs rhs isSigned = none` (division by zero, `INT_MIN / -1` signed overflow, or
+non-zero remainder), `evalLoweredTerminator` returns `none` and Trusted's `evalTerminator` faults
+with `MirStepNode.fail .ub`. -/
+theorem evalLoweredTerminator_call_exactDiv_ub_parity
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb targetBb : Nat} {b : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {layoutIdx : LayoutIdx} {typeArgs : List RigidTy} {args : List Operand}
+    {lhs rhs : ScalarInt} {isSigned : Bool} {dest : Place} {destTy : Ty} {u : UnwindAction}
+    (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .call
+      (.constant ⟨⟨.fnDef "core::intrinsics::exact_div" typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy (some targetBb) u)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hLayouts : cm.layouts = env.layouts)
+    (hDecls : cm.localDecls = env.localDecls)
+    (hCorr : StateCorr env bb slots s)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args =
+      some ([.scalar lhs, .scalar rhs], slotsAfterArgs))
+    (hSign : resolveIntrinsicIsSigned
+      { defPath := "core::intrinsics::exact_div", typeArgs := typeArgs, isIndirect := false }
+      env.localDecls env.layouts args = some isSigned)
+    (hDivNone : evalExactDiv lhs rhs isSigned = none)
+    (span : String) :
+    evalLoweredTerminator env body bb slots unwinding = none ∧
+      evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = MirStepNode.fail .ub := by
+  have hLower : lowerIntrinsicKind_V2026_06_01 "core::intrinsics::exact_div" = some .exactDiv :=
+    by decide
+  have hExPath : stringEq "core::intrinsics::exact_div" "core::intrinsics::exact_div" = true :=
+    by decide
+  have hSignSynth :
+      resolveIntrinsicIsSigned
+        { defPath := "", typeArgs := typeArgs, isIndirect := false }
+        env.localDecls env.layouts args = some isSigned :=
+    (resolveIntrinsicIsSigned_defPath_irrel _ _ _ _ _ _ _ rfl).trans hSign
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hT]
+    split
+    · rfl
+    · unfold evalLoweredCall evalLoweredCallTargetDispatch
+      simp only [evalOperandState, evalConstValue]
+      split
+      · rfl
+      · rw [hArgsEval]
+        dsimp only
+        split
+        · rfl
+        · split
+          · rfl
+          · rw [hCallTgt]
+            simp only [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+              extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall]
+            split
+            · rfl
+            · simp [evalLIntrinsicValue, hSignSynth, hDivNone]
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+      s.frame.locals [.scalar lhs, .scalar rhs] s.memory.borrows env.globals env.layouts
+      s.memory.callerLocals hCorr.slots hArgsND hArgsEval
+    have hNoCallee := hCorr.noIntrinsicCallee "core::intrinsics::exact_div" typeArgs .exactDiv hLower
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s
+            (.constant ⟨⟨.fnDef "core::intrinsics::exact_div" typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := "core::intrinsics::exact_div", typeArgs := typeArgs, isIndirect := false }
+              s.frame.locals :=
+      fun _ _ => rfl
+    simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+      hDecls, hLayouts, hCorr.globals, hTOps, hNoCallee, isDirectExactDivTarget, hExPath]
+    rw [hSign]
+    simp [hDivNone]
+
+/-- **Diverging `abort` bypasses cleanup (`evalLoweredTerminator_call_abort_bypasses_cleanup`)**:
+even when a diverging `abort` call carries `UnwindAction.cleanup cleanupBb` pointing to a valid
+cleanup block, `evalLoweredTerminator` terminates immediately (`some (.terminated bb)`, never
+jumping to `cleanupBb`) and Trusted's `evalTerminator` produces `.retOutcome .abort`. -/
+theorem evalLoweredTerminator_call_abort_bypasses_cleanup
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb cleanupBb : Nat} {b : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {s : MachineState}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {avs : List Value} {dest : Place} {destTy : Ty}
+    (hb : body.blocks[bb]? = some b) (hNotClean : b.isCleanup = false)
+    (hT : b.terminator = .call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy none (.cleanup cleanupBb))
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some .abort)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath .abort)
+    (hWfUnit : env.wf Value.unit = true)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
+    (hAcc : (avs.all env.wf && placeRuntimeAccessOk slotsAfterArgs dest &&
+      env.placeAccessOk slotsAfterArgs dest) = true)
+    (hLayouts : cm.layouts = env.layouts)
+    (hCorr : StateCorr env bb slots s)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (span : String) :
+    evalLoweredTerminator env body bb slots none = some (.terminated bb) ∧
+      evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = .retOutcome .abort := by
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hNotClean, Option.isSome_none, ne_eq, not_true_eq_false, ↓reduceIte, hT]
+    unfold evalLoweredCall evalLoweredCallTargetDispatch
+    simp only [evalOperandState, evalConstValue, hWfUnit, Bool.not_true, Bool.false_eq_true,
+      ↓reduceIte, hArgsEval, hAcc, Option.isSome_none, Bool.false_and, hCallTgt,
+      extractLCallTarget_V2026_06_01?, extractCalleeDefPath?, extractCalleeTypeArgs,
+      lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall]
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
+      hCorr.slots hArgsND hArgsEval
+    have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .abort hLower
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+      fun _ _ => rfl
+    obtain ⟨_, _, hUnrF, hAbT⟩ := hSupp
+    simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+      hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbT]
+
+/-- **Diverging `panicUnwind` enters cleanup (`evalLoweredTerminator_call_panicUnwind_cleanup`)**:
+unlike `abort`, a diverging `panicUnwind` call with `UnwindAction.cleanup cleanupBb` (from a
+non-cleanup block `bb`, where `cleanupBb` is a cleanup block) transitions into unwinding mode at
+`cleanupBb` (`some (.goto cleanupBb slotsAfterArgs (some bb))`) and refines Trusted's `.step` into
+`cleanupBb`. -/
+theorem evalLoweredTerminator_call_panicUnwind_cleanup
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb cleanupBb : Nat} {b cb : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {s : MachineState}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {avs : List Value} {dest : Place} {destTy : Ty}
+    (hb : body.blocks[bb]? = some b) (hNotClean : b.isCleanup = false)
+    (hcb : body.blocks[cleanupBb]? = some cb) (hCleanCb : cb.isCleanup = true)
+    (hT : b.terminator = .call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy none (.cleanup cleanupBb))
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some .panicUnwind)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath .panicUnwind)
+    (hWfUnit : env.wf Value.unit = true)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
+    (hAcc : (avs.all env.wf && placeRuntimeAccessOk slotsAfterArgs dest &&
+      env.placeAccessOk slotsAfterArgs dest) = true)
+    (hLayouts : cm.layouts = env.layouts)
+    (hCorr : StateCorr env bb slots s)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (span : String) :
+    evalLoweredTerminator env body bb slots none =
+        some (.goto cleanupBb slotsAfterArgs (some bb)) ∧
+      ∃ locals2,
+        evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
+          .step { s with frame := ⟨cleanupBb, 0, locals2⟩ } ∧
+        StateCorr env cleanupBb slotsAfterArgs { s with frame := ⟨cleanupBb, 0, locals2⟩ } := by
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hNotClean, Option.isSome_none, ne_eq, not_true_eq_false, ↓reduceIte, hT]
+    unfold evalLoweredCall evalLoweredCallTargetDispatch
+    simp only [evalOperandState, evalConstValue, hWfUnit, Bool.not_true, Bool.false_eq_true,
+      ↓reduceIte, hArgsEval, hAcc, Option.isSome_none, Bool.false_and, hCallTgt,
+      extractLCallTarget_V2026_06_01?, extractCalleeDefPath?, extractCalleeTypeArgs,
+      lowerCallTarget_V2026_06_01, hLower, evalLoweredIntrinsicCall, startPanic,
+      cfgGoto, hcb, hCleanCb, Option.isSome_some]
+  · obtain ⟨locals2, hTOps, hRel2⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
+      hCorr.slots hArgsND hArgsEval
+    have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .panicUnwind hLower
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+      fun _ _ => rfl
+    obtain ⟨_, _, hUnrF, hAbF, hPanT⟩ := hSupp
+    refine ⟨locals2, ?_, hCorr.jump cleanupBb locals2 hRel2⟩
+    simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+      hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT, applyUnwindAction]
+
+/-- **Diverging `panicUnwind` into `UnwindAction.unreachable` is UB in both semantics
+(`evalLoweredTerminator_call_panicUnwind_unreachable_ub`)**. -/
+theorem evalLoweredTerminator_call_panicUnwind_unreachable_ub
+    {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
+    {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {avs : List Value} {dest : Place} {destTy : Ty}
+    (hb : body.blocks[bb]? = some b)
+    (hT : b.terminator = .call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+      args dest destTy none .unreachable)
+    (hCallTgt : env.callTargetOf = extractLCallTarget_V2026_06_01?)
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some .panicUnwind)
+    (hSupp : trustedSupportsIntrinsicDefPath defPath .panicUnwind)
+    (hLayouts : cm.layouts = env.layouts)
+    (hCorr : StateCorr env bb slots s)
+    (hArgsND : ∀ arg ∈ args, OperandNonDeref arg)
+    (hArgsEval : evalOperandsState env.layouts env.globals slots args = some (avs, slotsAfterArgs))
+    (span : String) :
+    evalLoweredTerminator env body bb slots unwinding = none ∧
+      evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) = MirStepNode.fail .ub := by
+  refine ⟨?_, ?_⟩
+  · unfold evalLoweredTerminator
+    rw [hb]
+    simp only [hT]
+    split
+    · rfl
+    · unfold evalLoweredCall evalLoweredCallTargetDispatch
+      simp only [evalOperandState, evalConstValue]
+      split
+      · rfl
+      · rw [hArgsEval]
+        dsimp only
+        split
+        · rfl
+        · split
+          · rfl
+          · rw [hCallTgt]
+            simp [extractLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+              extractCalleeTypeArgs, lowerCallTarget_V2026_06_01, hLower,
+              evalLoweredIntrinsicCall, startPanic]
+  · obtain ⟨locals2, hTOps, _⟩ := evalOperandsState_below_refines args slots slotsAfterArgs
+      s.frame.locals avs s.memory.borrows env.globals env.layouts s.memory.callerLocals
+      hCorr.slots hArgsND hArgsEval
+    have hNoCallee := hCorr.noIntrinsicCallee defPath typeArgs .panicUnwind hLower
+    have hResTgt :
+        ∀ (decls : List LocalDecl) (lays : LayoutTable),
+          resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+            (length args) decls lays =
+            .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+      fun _ _ => rfl
+    obtain ⟨_, _, hUnrF, hAbF, hPanT⟩ := hSupp
+    simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
+      hLayouts, hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT, applyUnwindAction]
+
+/-! ### Section 5c: Call-Form `copyNonOverlapping` & `writeBytes` Sub-Place Soundness -/
+
+/-- Fill `n` bytes with the low byte `byte % 256` (`write_bytes_values` in
+`crates/anneal-mir/src/lower/rvalue.rs`). -/
+def repeatByteBits (byte : Nat) : Nat → Nat
+  | 0 => 0
+  | n + 1 => (byte % 256) + 256 * repeatByteBits byte n
+
+/-- `repeatByteBits byte n` always fits in `8 * n` bits (`< 2 ^ (8 * n)`). -/
+theorem repeatByteBits_lt_pow (byte n : Nat) : repeatByteBits byte n < 2 ^ (8 * n) := by
+  induction n with
+  | zero => simp [repeatByteBits]
+  | succ n ih =>
+    have hMod : byte % 256 < 256 := Nat.mod_lt _ (by decide)
+    have hPow : 2 ^ (8 * (n + 1)) = 256 * 2 ^ (8 * n) := by
+      rw [show 8 * (n + 1) = 8 + 8 * n by omega, Nat.pow_add]
+    rw [repeatByteBits, hPow]
+    omega
+
+/-- Precondition checks for `write_bytes(dst, val, count)` (`rvalue.rs` / `intrinsic.rs`):
+non-null aligned destination pointer within `ptrBits`, `val < 256`, byte count fitting in
+`isize::MAX`, and non-wrapping `[dst.addr, dst.addr + count * elemSize)`. -/
+def writeBytesChecks (ptrBits : Nat) (dst : CopyPtr) (valBits count elemSize elemAlign : Nat) :
+    Bool :=
+  (ptrBits == 32 || ptrBits == 64) &&
+  (elemAlign > 0) &&
+  (valBits < 256) &&
+  (dst.addr > 0) &&
+  (dst.addr < 2 ^ ptrBits) &&
+  (count < 2 ^ ptrBits) &&
+  (dst.addr % elemAlign == 0) &&
+  (count * elemSize < 2 ^ (ptrBits - 1)) &&
+  (dst.addr + count * elemSize < 2 ^ ptrBits)
+
+/-- **Stateful sub-place `WriteBytes` (`evalWriteBytesSubplace`)**, mirroring `write_bytes_values`
+in `crates/anneal-mir/src/lower/rvalue.rs`:
+1. Runs `writeBytesChecks` (width, `u8` range, non-null, alignment, `isize::MAX` byte count, and
+   address non-overflow), even when `count = 0`; `count = 0` is then a no-op;
+2. Rejects non-empty or single-element writes through dead local provenance (`DeadLocal`);
+3. For `count = 1`, resolves `dst` in whole-place-write mode (`resolve dst true = .ok (dl, dp)`)
+   and writes `.unit` (when `elemSize = 0`) or `.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩`
+   via `writeSubplaceSlot`;
+4. Zero-byte bulk writes (`count * elemSize = 0`) are a no-op; other multi-element shapes fail
+   closed (`none`). -/
+def evalWriteBytesSubplace (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTyOf : Nat → Ty) (ts : Bool) (ptrBits : Nat) (slots : List LocalSlotState)
+    (resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)) (dst : SynPtr)
+    (valBits count elemSize elemAlign : Nat) : Option (List LocalSlotState) :=
+  if !writeBytesChecks ptrBits dst.toCopyPtr valBits count elemSize elemAlign then none
+  else if count = 0 then some slots
+  else if (count * elemSize != 0 || count == 1) && synthTargetDead slots dst then none
+  else
+    match resolve dst true with
+    | .ok (dl, dp) =>
+      if count = 1 then
+        let fillVal : Value :=
+          if elemSize = 0 then .unit else .scalar ⟨repeatByteBits valBits elemSize, elemSize⟩
+        writeSubplaceSlot arityOf rootTyOf ts slots dl dp (.init fillVal)
+      else if count * elemSize = 0 then some slots
+      else none
+    | .error _ => if count * elemSize = 0 then some slots else none
+
+/-- `count = 0` is a no-op after `writeBytesChecks`. -/
+theorem evalWriteBytesSubplace_zero_count {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {dst : SynPtr}
+    {valBits elemSize elemAlign : Nat}
+    (hChk : writeBytesChecks ptrBits dst.toCopyPtr valBits 0 elemSize elemAlign = true) :
+    evalWriteBytesSubplace arityOf rootTyOf ts ptrBits slots resolve dst valBits 0 elemSize
+      elemAlign = some slots := by
+  simp [evalWriteBytesSubplace, hChk]
+
+/-- Dead destination provenance faults (`DeadLocal`) for every non-empty or single-element
+`write_bytes`. -/
+theorem evalWriteBytesSubplace_dead_none {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {dst : SynPtr}
+    {valBits count elemSize elemAlign : Nat}
+    (hCount : count ≠ 0) (hLen : count * elemSize ≠ 0 ∨ count = 1)
+    (hDead : synthTargetDead slots dst = true) :
+    evalWriteBytesSubplace arityOf rootTyOf ts ptrBits slots resolve dst valBits count elemSize
+      elemAlign = none := by
+  unfold evalWriteBytesSubplace
+  cases hChk : writeBytesChecks ptrBits dst.toCopyPtr valBits count elemSize elemAlign with
+  | false => rfl
+  | true =>
+    have hGuard : ((count * elemSize != 0 || count == 1) && synthTargetDead slots dst) = true := by
+      rcases hLen with h | h <;> simp [h, hDead]
+    simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, hCount, hGuard]
+
+/-- **Put-Get & Frame for `evalWriteBytesSubplace` (`evalWriteBytesSubplace_put_get`)**: writing
+`count = 1` scalar element of non-zero size `elemSize` into sub-place `(dl, dp)` of an initialized
+local stores `.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩` at `⟨dl, dp⟩` and leaves every
+other local `j ≠ dl` unchanged. -/
+theorem evalWriteBytesSubplace_put_get {arityOf : Ty → VariantIdx → Bool → Option Nat}
+    {rootTyOf : Nat → Ty} {ts : Bool} {ptrBits : Nat} {slots slots' : List LocalSlotState}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {dst : SynPtr}
+    {valBits elemSize elemAlign dl : Nat} {dp : List ProjectionElem} {droot : Value}
+    (hElemPos : 0 < elemSize)
+    (hDstR : resolve dst true = .ok (dl, dp))
+    (hDst : slots[dl]? = some (.init droot))
+    (hDp : projectionHasDeref dp = false)
+    (h : evalWriteBytesSubplace arityOf rootTyOf ts ptrBits slots resolve dst valBits 1 elemSize
+      elemAlign = some slots') :
+    readPlaceState slots' ⟨dl, dp⟩ =
+        .ok (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) ∧
+      ∀ j, j ≠ dl → slots'[j]? = slots[j]? := by
+  unfold evalWriteBytesSubplace at h
+  split at h
+  · nomatch h
+  · split at h
+    · omega
+    · split at h
+      · nomatch h
+      · rw [hDstR] at h
+        have hNe0 : elemSize ≠ 0 := by omega
+        have hUn : isUninitSlot (readSubplaceSlot slots dl (stripUnitElems dp)) = false := by
+          simp [readSubplaceSlot, hDst, slotStateToFieldSlot]
+        simp only [↓reduceIte, hNe0, writeSubplaceSlot, hUn, Bool.false_eq_true] at h
+        cases hWS : writePlaceState arityOf slots ⟨dl, dp⟩ (rootTyOf dl)
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) with
+        | ok s =>
+          rw [hWS] at h
+          simp only [Option.some.injEq] at h
+          subst h
+          refine ⟨writePlaceState_put_get_init hDst hDp hWS, fun j hj => ?_⟩
+          obtain ⟨x, hx⟩ := writePlaceState_frame hWS
+          rw [hx]
+          exact List.getElem?_set_ne (Ne.symm hj)
+        | ub => rw [hWS] at h; nomatch h
+        | unsupported => rw [hWS] at h; nomatch h
+
+/-- **`evalWriteBytesSubplace` refines Trusted's `writePlaceValue`
+(`evalWriteBytesSubplace_refines_writePlaceValue`)**: on below-related frames, a single-element
+`evalWriteBytesSubplace` into sub-place `⟨dl, dp⟩` of an initialized local refines Trusted's
+`writePlaceValue` of the repeated-byte scalar at `⟨dl, dp⟩`, preserving `SlotsRefine SlotBelow`. -/
+theorem evalWriteBytesSubplace_refines_writePlaceValue
+    {arityOf : Ty → VariantIdx → Bool → Option Nat} {rootTyOf : Nat → Ty} {ts : Bool}
+    {ptrBits : Nat} {slots slots' : List LocalSlotState} {locals : List LocalSlot}
+    {borrows : List BorrowEntry}
+    {resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem)} {dst : SynPtr}
+    {valBits elemSize elemAlign dl : Nat} {dp : List ProjectionElem} {droot : Value}
+    (hRel : SlotsRefine SlotBelow slots locals)
+    (hElemPos : 0 < elemSize)
+    (hDstR : resolve dst true = .ok (dl, dp))
+    (hDst : slots[dl]? = some (.init droot))
+    (hDp : projectionHasDeref dp = false)
+    (h : evalWriteBytesSubplace arityOf rootTyOf ts ptrBits slots resolve dst valBits 1 elemSize
+      elemAlign = some slots') :
+    ∃ locals',
+      writePlaceValue locals borrows ⟨dl, dp⟩
+        (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) = .ok locals' ∧
+      SlotsRefine SlotBelow slots' locals' := by
+  unfold evalWriteBytesSubplace at h
+  split at h
+  · nomatch h
+  · split at h
+    · omega
+    · split at h
+      · nomatch h
+      · rw [hDstR] at h
+        have hNe0 : elemSize ≠ 0 := by omega
+        have hUn : isUninitSlot (readSubplaceSlot slots dl (stripUnitElems dp)) = false := by
+          simp [readSubplaceSlot, hDst, slotStateToFieldSlot]
+        simp only [↓reduceIte, hNe0, writeSubplaceSlot, hUn, Bool.false_eq_true] at h
+        cases hWS : writePlaceState arityOf slots ⟨dl, dp⟩ (rootTyOf dl)
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) with
+        | ub => rw [hWS] at h; nomatch h
+        | unsupported => rw [hWS] at h; nomatch h
+        | ok s =>
+          rw [hWS] at h
+          simp only [Option.some.injEq] at h
+          subst h
+          cases dp with
+          | nil => exact writePlaceState_bare_below_refines hRel rfl hWS
+          | cons ph pt => exact writePlaceState_init_proj_below_refines hRel hDst hDp hWS
+
+/-- Package `evalCopyNonOverlappingSubplace` and `evalWriteBytesSubplace` as a `CfgEnv.memIntrinsic`
+callback for call-form `LIntrinsicOp.copyNonOverlapping` and `LIntrinsicOp.writeBytes`. -/
+noncomputable def memIntrinsicSubplace (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTyOf : Nat → Ty) (ts : Bool) (ptrBits : Nat)
+    (ptrOf : ProvenancePtr → SynPtr)
+    (resolveElem : RigidTy → SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem))
+    (layoutOfElem : RigidTy → Option (Nat × Nat)) :
+    LIntrinsicOp → List RigidTy → List LocalSlotState → List Value → Option (List LocalSlotState)
+  | .copyNonOverlapping, [elemTy], slots, [.ptr srcPv 8, .ptr dstPv 8, .scalar ⟨count, 8⟩] =>
+    match layoutOfElem elemTy with
+    | some (elemSz, elemAl) =>
+      evalCopyNonOverlappingSubplace arityOf rootTyOf ts ptrBits slots (resolveElem elemTy)
+        (ptrOf srcPv) (ptrOf dstPv) count elemSz elemAl
+    | none => none
+  | .writeBytes, [elemTy], slots, [.ptr dstPv 8, .scalar ⟨valBits, 1⟩, .scalar ⟨count, 8⟩] =>
+    match layoutOfElem elemTy with
+    | some (elemSz, elemAl) =>
+      evalWriteBytesSubplace arityOf rootTyOf ts ptrBits slots (resolveElem elemTy)
+        (ptrOf dstPv) valBits count elemSz elemAl
+    | none => none
+  | _, _, _, _ => none
+
+/-! ### Section 5d: Multi-Callee `LCallTable` & Multi-Frame Linked-Callee Refinement -/
+
+/-- Auxiliary local-slot initializer matching `Trusted.initLocalsAux`: slot `0` starts `.uninit`,
+parameter slots `1 .. args.length` start `.init arg_i`, and remaining declared locals `< localCount`
+start `.dead` (`StatementEvalState::from_body` in `crates/anneal-mir/src/lower/rvalue.rs`). -/
+def initLCalleeSlotsAux : Nat → Nat → List Value → List LocalSlotState
+  | _, 0, _ => []
+  | 0, rem + 1, args => .uninit :: initLCalleeSlotsAux 1 rem args
+  | _ + 1, rem + 1, arg :: restArgs => .init arg :: initLCalleeSlotsAux 1 rem restArgs
+  | _ + 1, rem + 1, [] => .dead :: initLCalleeSlotsAux 1 rem []
+
+/-- Initialize the local frame of a linked callee with `localCount` declared locals on `args`. -/
+def initLCalleeSlots (localCount : Nat) (args : List Value) : List LocalSlotState :=
+  initLCalleeSlotsAux 0 localCount args
+
+private theorem initLCalleeSlotsAux_succ_below :
+    ∀ (decls : List LocalDecl) (idx : Nat) (args : List Value),
+      SlotsRefine SlotBelow (initLCalleeSlotsAux 1 decls.length args)
+        (initLocalsAux (idx + 1) decls args)
+  | [], _, _ => trivial
+  | _ :: ds, idx, [] => ⟨trivial, initLCalleeSlotsAux_succ_below ds idx []⟩
+  | _ :: ds, idx, _ :: as => ⟨rfl, initLCalleeSlotsAux_succ_below ds idx as⟩
+
+/-- `initLCalleeSlots cm.localDecls.length args` is below `Trusted.initLocals cm args` for every
+`CapturedMir` body and argument list `args`. -/
+theorem initLCalleeSlots_below_initLocals (cm : CapturedMir) (args : List Value) :
+    SlotsRefine SlotBelow (initLCalleeSlots cm.localDecls.length args) (initLocals cm args) := by
+  unfold initLCalleeSlots initLocals
+  cases cm.localDecls with
+  | nil => trivial
+  | cons d ds => exact ⟨trivial, initLCalleeSlotsAux_succ_below ds 0 args⟩
+
+/-- A linked callee entry in `LCallTable` (`LinkedCallee` in `crates/anneal-mir/src/lower/cfg.rs`). -/
+structure LLinkedCallee : Type where
+  argCount : Nat
+  localCount : Nat
+  env : CfgEnv
+  body : LBody
+
+/-- Multi-callee call table (`CallTable` in `crates/anneal-mir/src/lower/cfg.rs`), keyed by
+`(sym, typeArgs)` with bounded nested callee depth `maxCallDepth`. -/
+structure LCallTable : Type where
+  lookup : String → List RigidTy → Option LLinkedCallee
+  maxCallDepth : Nat := 64
+
+/-- Linked-callee-aware `Operand -> Option LCallTarget` extractor for `V2026_06_01`
+(`classify_linked_call_target_v2026_06_01`). -/
+def extractLinkedLCallTarget_V2026_06_01? (table : LCallTable) (func : Operand) :
+    Option LCallTarget :=
+  match extractCalleeDefPath? func with
+  | some defPath =>
+    let typeArgs := extractCalleeTypeArgs func
+    some (classifyLinkedCallTarget_V2026_06_01
+      (table.lookup defPath typeArgs).isSome defPath typeArgs)
+  | none => none
+
+/-- Saved caller activation frame on Anneal's explicit multi-callee frame stack (`Frame` +
+`PendingCall` in `crates/anneal-mir/src/lower/cfg.rs`). -/
+structure LCallerFrame : Type where
+  callerEnv : CfgEnv
+  callerBody : LBody
+  callBb : Nat
+  inCleanup : Bool
+  slotsAfterArgs : List LocalSlotState
+  unwinding : Option Nat
+  destination : Place
+  destTy : Ty
+  returnTarget : Option Nat
+  returnUnwind : UnwindAction
+
+/-- Active execution state of the multi-callee evaluator (`eval_frames` in `cfg.rs`). -/
+structure LMultiFrameState : Type where
+  activeEnv : CfgEnv
+  activeBody : LBody
+  bb : Nat
+  slots : List LocalSlotState
+  unwinding : Option Nat
+  stack : List LCallerFrame
+
+/-- Outcome of a multi-callee fuel-bounded CFG evaluation (`CfgEvalOutcome` + explicit
+`maxCallDepthExceeded` representing `CfgEvalError::CallDepthExceeded`). -/
+inductive LMultiCfgOutcome : Type where
+  | returned (v : Value) : LMultiCfgOutcome
+  | panicked (bb : Nat) : LMultiCfgOutcome
+  | terminated (bb : Nat) : LMultiCfgOutcome
+  | outOfFuel (st : LMultiFrameState) : LMultiCfgOutcome
+  | maxCallDepthExceeded (bb : Nat) (maxDepth : Nat) : LMultiCfgOutcome
+
+/-- One-block transition result of `stepLoweredWithCallTable`: either continue in an updated
+`LMultiFrameState` or finish with an `LMultiCfgOutcome`. -/
+inductive LMultiCfgStep : Type where
+  | next (st : LMultiFrameState) : LMultiCfgStep
+  | done (out : LMultiCfgOutcome) : LMultiCfgStep
+
+/-- Unwind out of a panicking frame across `stack` (`eval_frames`'s `Panicked` loop in `cfg.rs`,
+mirroring `Trusted.unwindFromCallStack`):
+- empty stack -> `.done (.panicked panicBb)`;
+- `returnUnwind = .unreachable` -> `none` (UB);
+- `returnUnwind = .terminate` -> `.done (.terminated caller.callBb)` (after `unwindActionOk`);
+- `returnUnwind = .cleanup c` -> enters cleanup block `c` in `caller` (`unwinding = some caller.callBb`);
+- `returnUnwind = .continue_` -> pops `caller` (when `!caller.inCleanup && !caller.unwinding.isSome`)
+  and continues unwinding up `restStack`. -/
+def unwindLCallStack (panicBb : Nat) : List LCallerFrame → Option LMultiCfgStep
+  | [] => some (.done (.panicked panicBb))
+  | caller :: restStack =>
+    if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none else
+    match caller.returnUnwind with
+    | .unreachable => none
+    | .terminate => some (.done (.terminated caller.callBb))
+    | .continue_ =>
+      if caller.unwinding.isSome then none
+      else unwindLCallStack caller.callBb restStack
+    | .cleanup cleanupBb =>
+      if caller.unwinding.isSome then none else
+      match cfgGoto caller.callerBody cleanupBb caller.slotsAfterArgs (some caller.callBb) with
+      | some (.goto nextBb slots' unw') =>
+        some (.next ⟨caller.callerEnv, caller.callerBody, nextBb, slots', unw', restStack⟩)
+      | _ => none
+
+/-- Execute one basic block of `st` under `table` (`run_block` + frame push/pop in `cfg.rs`):
+- Linked calls (`activeEnv.callTargetOf func = some (.callee sym typeArgs)` with
+  `table.lookup sym typeArgs = some callee`) evaluate `func` and `args`, check destination access
+  and `stack.length < table.maxCallDepth` (reporting `.done (.maxCallDepthExceeded ...)` if
+  exceeded), check `avs.length = callee.argCount` and non-cleanup `bb0`, and push `LCallerFrame`;
+- All other terminators run via `evalLoweredTerminator`, popping `st.stack` on `.returned` (faulting
+  with `none` if `caller.returnTarget = none` on a diverging call!) or unwinding via
+  `unwindLCallStack` on `.panicked`. -/
+def stepLoweredWithCallTable (table : LCallTable) (st : LMultiFrameState) : Option LMultiCfgStep :=
+  match st.activeBody.blocks[st.bb]? with
+  | none => none
+  | some block =>
+    if block.isCleanup ≠ st.unwinding.isSome then none else
+    match st.activeEnv.evalStmts block.statements st.slots with
+    | none => none
+    | some slots1 =>
+      match block.terminator with
+      | .call func args dest destTy target unwind =>
+        match st.activeEnv.callTargetOf func with
+        | some (.callee sym typeArgs) =>
+          match table.lookup sym typeArgs with
+          | some callee =>
+            match evalOperandState slots1 func st.activeEnv.layouts st.activeEnv.globals with
+            | (.ok fv, slotsAfterF) =>
+              if !st.activeEnv.wf fv then none else
+              match evalOperandsState st.activeEnv.layouts st.activeEnv.globals slotsAfterF args with
+              | some (avs, slots2) =>
+                if !(avs.all st.activeEnv.wf && placeRuntimeAccessOk slots2 dest &&
+                    st.activeEnv.placeAccessOk slots2 dest) then none else
+                if target.isSome && !st.activeEnv.inhabited destTy then none else
+                if table.maxCallDepth ≤ st.stack.length then
+                  some (.done (.maxCallDepthExceeded st.bb table.maxCallDepth))
+                else if avs.length ≠ callee.argCount then none else
+                match callee.body.blocks[0]? with
+                | none => none
+                | some entryBlock =>
+                  if entryBlock.isCleanup then none else
+                  let frame : LCallerFrame := {
+                    callerEnv := st.activeEnv
+                    callerBody := st.activeBody
+                    callBb := st.bb
+                    inCleanup := block.isCleanup
+                    slotsAfterArgs := slots2
+                    unwinding := st.unwinding
+                    destination := dest
+                    destTy := destTy
+                    returnTarget := target
+                    returnUnwind := unwind
+                  }
+                  some (.next {
+                    activeEnv := callee.env
+                    activeBody := callee.body
+                    bb := 0
+                    slots := initLCalleeSlots callee.localCount avs
+                    unwinding := none
+                    stack := frame :: st.stack
+                  })
+              | none => none
+            | _ => none
+          | none => none
+        | _ =>
+          match evalLoweredTerminator st.activeEnv st.activeBody st.bb slots1 st.unwinding with
+          | none => none
+          | some (.goto next slots' unwinding') =>
+            some (.next { st with bb := next, slots := slots', unwinding := unwinding' })
+          | some (.returned v) =>
+            match st.stack with
+            | [] => some (.done (.returned v))
+            | caller :: restStack =>
+              if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none else
+              match caller.returnTarget with
+              | none => none
+              | some retBb =>
+                if !caller.callerEnv.wf v then none else
+                match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
+                    caller.destination caller.destTy v with
+                | .ok callerSlots' =>
+                  match cfgGoto caller.callerBody retBb callerSlots' caller.unwinding with
+                  | some (.goto nextBb s' unw') =>
+                    some (.next ⟨caller.callerEnv, caller.callerBody, nextBb, s', unw', restStack⟩)
+                  | _ => none
+                | _ => none
+          | some (.panicked pbb) => unwindLCallStack pbb st.stack
+          | some (.terminated pbb) => some (.done (.terminated pbb))
+      | _ =>
+        match evalLoweredTerminator st.activeEnv st.activeBody st.bb slots1 st.unwinding with
+        | none => none
+        | some (.goto next slots' unwinding') =>
+          some (.next { st with bb := next, slots := slots', unwinding := unwinding' })
+        | some (.returned v) =>
+          match st.stack with
+          | [] => some (.done (.returned v))
+          | caller :: restStack =>
+            if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none else
+            match caller.returnTarget with
+            | none => none
+            | some retBb =>
+              if !caller.callerEnv.wf v then none else
+              match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
+                  caller.destination caller.destTy v with
+              | .ok callerSlots' =>
+                match cfgGoto caller.callerBody retBb callerSlots' caller.unwinding with
+                | some (.goto nextBb s' unw') =>
+                  some (.next ⟨caller.callerEnv, caller.callerBody, nextBb, s', unw', restStack⟩)
+                | _ => none
+              | _ => none
+        | some (.panicked pbb) => unwindLCallStack pbb st.stack
+        | some (.terminated pbb) => some (.done (.terminated pbb))
+
+/-- Fuel-bounded multi-callee CFG evaluation sharing one `fuel` counter across all active caller
+and callee frames (`eval_frames` in `crates/anneal-mir/src/lower/cfg.rs`). -/
+def runLoweredWithCallTable (table : LCallTable) :
+    Nat → LMultiFrameState → Option LMultiCfgOutcome
+  | 0, st => some (.outOfFuel st)
+  | fuel + 1, st =>
+    match stepLoweredWithCallTable table st with
+    | none => none
+    | some (.next st') => runLoweredWithCallTable table fuel st'
+    | some (.done out) => some out
+
+/-- Terminators covered by multi-callee refinement under `table`: every single-body refinable
+terminator plus direct linked `Call`s in `table`. -/
+def LTerminator.MultiRefinable (table : LCallTable) : LTerminator → Prop
+  | .goto _ => True
+  | .switchInt discr _ _ => OperandNonDeref discr
+  | .return_ => True
+  | .unreachable => True
+  | .drop _ _ _ => False
+  | .assert cond _ _ _ _ => OperandNonDeref cond
+  | .call func args destination _ _ _ =>
+    (∀ arg ∈ args, OperandNonDeref arg) ∧
+    destination.projection = [] ∧
+    ∃ defPath typeArgs layoutIdx,
+      func = .constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩ ∧
+      ((table.lookup defPath typeArgs).isSome = true ∨
+        ((table.lookup defPath typeArgs).isSome = false ∧
+          ∃ op, lowerIntrinsicKind_V2026_06_01 defPath = some op ∧
+            trustedSupportsIntrinsicDefPath defPath op))
+  | .unwindResume => True
+  | .unwindTerminate => True
+
+/-- Multi-callee body correspondence for an active or linked body `(env, body, cm)` sharing crate
+`layouts` and `globals`: allows non-empty statements (`TrustedRun` on `stepMirFn rootCm` whenever
+`s.memory.activeCallee.getD rootCm = cm`) and `LTerminator.MultiRefinable table`. -/
+structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (env : CfgEnv) (body : LBody) (cm : CapturedMir) : Prop where
+  phase : ∀ tag, cm.phase ≠ .other tag
+  cmLayouts : cm.layouts = sharedLayouts
+  envLayouts : env.layouts = sharedLayouts
+  envGlobals : env.globals = sharedGlobals
+  localDecls : cm.localDecls = env.localDecls
+  ubChecksTrue : env.ubChecks = true
+  callTargetLinked : env.callTargetOf = extractLinkedLCallTarget_V2026_06_01? table
+  block : ∀ (i : Nat) (b : LBlock), body.blocks[i]? = some b →
+    b.terminator.MultiRefinable table ∧
+      ∃ (tStmts : List Statement) (span : String),
+        cm.basicBlocks[i]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩ ∧
+        ∀ (slots slots1 : List LocalSlotState) (s : MachineState),
+          s.frame.blockIdx = i →
+          s.frame.stmtIdx = 0 →
+          s.memory.activeCallee.getD rootCm = cm →
+          s.memory.globals = sharedGlobals →
+          SlotsRefine SlotBelow slots s.frame.locals →
+          env.evalStmts b.statements slots = some slots1 →
+          ∃ (locals1 : List LocalSlot),
+            TrustedRun rootCm s { s with frame := ⟨i, tStmts.length, locals1⟩ } ∧
+            SlotsRefine SlotBelow slots1 locals1
+
+/-- Correspondence between Anneal's `LCallTable` and Trusted's `Memory.callees` / `traitImpls`. -/
+structure CallTableCorr (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (callees : List CapturedMir) (traitImpls : List TraitImplEntry) : Prop where
+  linked : ∀ defPath typeArgs callee,
+    table.lookup defPath typeArgs = some callee →
+    ∃ calleeCm,
+      lookupCallee callees sharedLayouts defPath typeArgs traitImpls = some calleeCm ∧
+      callee.localCount = calleeCm.localDecls.length ∧
+      MultiBodyCorr table rootCm sharedLayouts sharedGlobals callee.env callee.body calleeCm
+  unlinkedIntrinsic : ∀ defPath typeArgs op,
+    table.lookup defPath typeArgs = none →
+    lowerIntrinsicKind_V2026_06_01 defPath = some op →
+    lookupCallee callees sharedLayouts defPath typeArgs traitImpls = none
+
+/-- Correspondence between a saved Anneal caller frame `cf` and a saved Trusted caller frame `tf`. -/
+structure CallerFrameCorr (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (cf : LCallerFrame) (tf : SavedCallerFrame) : Prop where
+  body : MultiBodyCorr table rootCm sharedLayouts sharedGlobals cf.callerEnv cf.callerBody tf.callerBody
+  slots : SlotsRefine SlotBelow cf.slotsAfterArgs tf.frame.locals
+  destEq : cf.destination = tf.destination
+  destBare : cf.destination.projection = []
+  unwindEq : cf.returnUnwind = tf.returnUnwind
+  targetRel :
+    match cf.returnTarget with
+    | some retBb => tf.isDiverging = false ∧ tf.returnTarget = retBb
+    | none => tf.isDiverging = true
+
+/-- Pointwise correspondence between Anneal's `List LCallerFrame` and Trusted's
+`List SavedCallerFrame`. -/
+def CallStackCorr (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation) :
+    List LCallerFrame → List SavedCallerFrame → Prop
+  | [], [] => True
+  | cf :: cfs, tf :: tfs =>
+    CallerFrameCorr table rootCm sharedLayouts sharedGlobals cf tf ∧
+      CallStackCorr table rootCm sharedLayouts sharedGlobals cfs tfs
+  | _, _ => False
+
+theorem CallStackCorr.length_eq {table : LCallTable} {rootCm : CapturedMir}
+    {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation} :
+    ∀ {cfs : List LCallerFrame} {tfs : List SavedCallerFrame},
+      CallStackCorr table rootCm sharedLayouts sharedGlobals cfs tfs →
+      cfs.length = tfs.length := by
+  intro cfs
+  induction cfs with
+  | nil =>
+    intro tfs h
+    cases tfs with
+    | nil => rfl
+    | cons _ _ => nomatch h
+  | cons _ cfs ih =>
+    intro tfs h
+    cases tfs with
+    | nil => nomatch h
+    | cons _ tfs => exact congrArg Nat.succ (ih h.2)
+
+/-- Full multi-frame machine correspondence between Anneal's `LMultiFrameState` and Trusted's
+`MachineState` rooted at `rootCm`. -/
+structure MultiFrameStateCorr (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (st : LMultiFrameState) (s : MachineState) (activeCm : CapturedMir) : Prop where
+  block : s.frame.blockIdx = st.bb
+  stmt : s.frame.stmtIdx = 0
+  slots : SlotsRefine SlotBelow st.slots s.frame.locals
+  active : s.memory.activeCallee.getD rootCm = activeCm
+  body : MultiBodyCorr table rootCm sharedLayouts sharedGlobals st.activeEnv st.activeBody activeCm
+  stack : CallStackCorr table rootCm sharedLayouts sharedGlobals st.stack s.memory.callStack
+  globals : s.memory.globals = sharedGlobals
+  tableCorr : CallTableCorr table rootCm sharedLayouts sharedGlobals s.memory.callees s.memory.traitImpls
+
+/-- At `stmtIdx = tStmts.length` with `s.memory.activeCallee.getD rootCm = activeCm`, Trusted's
+`stepMirFn rootCm` evaluates the block's terminator in `(some activeCm)`. -/
+theorem stepMirFn_multi_at_end_eq_evalTerminator {rootCm activeCm : CapturedMir} {bb : Nat}
+    {tStmts : List Statement} {tKind : TerminatorKind} {span : String} {isCleanup : Bool}
+    {s : MachineState} {locals1 : List LocalSlot}
+    (hPhase : ∀ tag, activeCm.phase ≠ .other tag)
+    (hActive : s.memory.activeCallee.getD rootCm = activeCm)
+    (hcm : activeCm.basicBlocks[bb]? = some ⟨tStmts, ⟨tKind, span⟩, isCleanup⟩) :
+    stepMirFn rootCm { s with frame := ⟨bb, tStmts.length, locals1⟩ } =
+      evalTerminator { s with frame := ⟨bb, tStmts.length, locals1⟩ } ⟨tKind, span⟩
+        (some activeCm) := by
+  have hNone : tStmts[tStmts.length]? = none := List.getElem?_eq_none (Nat.le_refl _)
+  unfold stepMirFn
+  dsimp only
+  rw [hActive]
+  split
+  · rename_i tag hP
+    exact absurd hP (hPhase tag)
+  · simp only [get?_eq_getElem?, hcm, hNone, length_eq_list_length, BEq.rfl, ↓reduceIte]
+
+/-- **`unwindLCallStack` refines `Trusted.unwindFromCallStack`
+(`unwindLCallStack_refines_unwindFromCallStack`)**: across arbitrarily many `.continue_` caller
+frames, any successful `unwindLCallStack` transition matches `unwindFromCallStack` — resuming a
+catching `.cleanup cleanupBb` caller frame in `MultiFrameStateCorr` (restoring its protectors and
+`activeCallee`), halting with `.panic` at the root frame, or halting with `.abort` at a
+`.terminate` frame. -/
+theorem unwindLCallStack_refines_unwindFromCallStack
+    {table : LCallTable} {rootCm : CapturedMir}
+    {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation} :
+    ∀ (panicBb : Nat) (cfs : List LCallerFrame) (tfs : List SavedCallerFrame) (mem : Memory)
+      (res : LMultiCfgStep),
+      CallStackCorr table rootCm sharedLayouts sharedGlobals cfs tfs →
+      mem.globals = sharedGlobals →
+      CallTableCorr table rootCm sharedLayouts sharedGlobals mem.callees mem.traitImpls →
+      unwindLCallStack panicBb cfs = some res →
+      match res with
+      | .next st' =>
+        ∃ s' activeCm',
+          unwindFromCallStack tfs mem = .running s' ∧
+          MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm'
+      | .done (.panicked _) => unwindFromCallStack tfs mem = .halted .panic
+      | .done (.terminated _) => unwindFromCallStack tfs mem = .halted .abort
+      | .done (.returned _) => False
+      | .done (.outOfFuel _) => False
+      | .done (.maxCallDepthExceeded _ _) => False := by
+  intro panicBb cfs
+  induction cfs generalizing panicBb with
+  | nil =>
+    intro tfs mem res hStack _ _ hUnw
+    cases tfs with
+    | nil =>
+      simp only [unwindLCallStack, Option.some.injEq] at hUnw
+      subst hUnw
+      rfl
+    | cons _ _ => nomatch hStack
+  | cons cf restCfs ih =>
+    intro tfs mem res hStack hGlob hTab hUnw
+    cases tfs with
+    | nil => nomatch hStack
+    | cons tf restTfs =>
+      obtain ⟨hFrame, hRest⟩ := hStack
+      unfold unwindLCallStack at hUnw
+      split at hUnw
+      · nomatch hUnw
+      · cases hU : cf.returnUnwind with
+        | unreachable => rw [hU] at hUnw; nomatch hUnw
+        | terminate =>
+          rw [hU] at hUnw
+          simp only [Option.some.injEq] at hUnw
+          subst hUnw
+          simp [unwindFromCallStack, ← hFrame.unwindEq, hU]
+        | continue_ =>
+          rw [hU] at hUnw
+          dsimp only at hUnw
+          split at hUnw
+          · nomatch hUnw
+          · simp only [unwindFromCallStack, ← hFrame.unwindEq, hU]
+            exact ih cf.callBb restTfs
+              { mem with
+                callStack := restTfs
+                activeCallee := some tf.callerBody
+                activeProtectors := restoreCallerProtectors tf }
+              res hRest hGlob hTab hUnw
+        | cleanup cleanupBb =>
+          rw [hU] at hUnw
+          dsimp only at hUnw
+          split at hUnw
+          · nomatch hUnw
+          · cases hGoto : cfgGoto cf.callerBody cleanupBb cf.slotsAfterArgs (some cf.callBb) with
+            | none => rw [hGoto] at hUnw; nomatch hUnw
+            | some gStep =>
+              rw [hGoto] at hUnw
+              obtain rfl := cfgGoto_eq_some hGoto
+              simp only [Option.some.injEq] at hUnw
+              subst hUnw
+              let sNext : MachineState :=
+                { frame := { tf.frame with blockIdx := cleanupBb, stmtIdx := 0 }
+                  memory := { mem with
+                              callStack := restTfs
+                              activeCallee := some tf.callerBody
+                              activeProtectors := restoreCallerProtectors tf } }
+              refine ⟨sNext, tf.callerBody, ?_, ?_⟩
+              · simp [unwindFromCallStack, ← hFrame.unwindEq, hU, sNext]
+              · exact {
+                  block := rfl
+                  stmt := rfl
+                  slots := hFrame.slots
+                  active := rfl
+                  body := hFrame.body
+                  stack := hRest
+                  globals := hGlob
+                  tableCorr := hTab
+                }
+
+/-- Exceeding `table.maxCallDepth` reports `some (.done (.maxCallDepthExceeded st.bb table.maxCallDepth))`
+instead of `outOfFuel` or silent truncation. -/
+theorem stepLoweredWithCallTable_maxCallDepth
+    {table : LCallTable} {st : LMultiFrameState} {block : LBlock}
+    {func : Operand} {args : List Operand} {dest : Place} {destTy : Ty}
+    {target : Option Nat} {unwind : UnwindAction}
+    {sym : String} {typeArgs : List RigidTy} {callee : LLinkedCallee}
+    {slots1 slotsAfterF slots2 : List LocalSlotState} {fv : Value} {avs : List Value}
+    (hb : st.activeBody.blocks[st.bb]? = some block)
+    (hClean : block.isCleanup = st.unwinding.isSome)
+    (hStmts : st.activeEnv.evalStmts block.statements st.slots = some slots1)
+    (hT : block.terminator = .call func args dest destTy target unwind)
+    (hCT : st.activeEnv.callTargetOf func = some (.callee sym typeArgs))
+    (hLk : table.lookup sym typeArgs = some callee)
+    (hF : evalOperandState slots1 func st.activeEnv.layouts st.activeEnv.globals = (.ok fv, slotsAfterF))
+    (hWfF : st.activeEnv.wf fv = true)
+    (hArgs : evalOperandsState st.activeEnv.layouts st.activeEnv.globals slotsAfterF args = some (avs, slots2))
+    (hAcc : (avs.all st.activeEnv.wf && placeRuntimeAccessOk slots2 dest &&
+      st.activeEnv.placeAccessOk slots2 dest) = true)
+    (hInh : (target.isSome && !st.activeEnv.inhabited destTy) = false)
+    (hDepth : table.maxCallDepth ≤ st.stack.length) :
+    stepLoweredWithCallTable table st =
+      some (.done (.maxCallDepthExceeded st.bb table.maxCallDepth)) := by
+  unfold stepLoweredWithCallTable
+  rw [hb]
+  simp [hClean, hStmts, hT, hCT, hLk, hF, hWfF, hArgs, hAcc, hInh, hDepth]
+
+/-- Returning from a diverging linked callee (`caller.returnTarget = none` / `tf.isDiverging = true`)
+faults in both semantics (`stepLoweredWithCallTable = none` and `evalTerminator = .fail .ub`). -/
+theorem stepLoweredWithCallTable_diverging_return_ub
+    {table : LCallTable} {st : LMultiFrameState} {block : LBlock} {slots1 : List LocalSlotState}
+    {caller : LCallerFrame} {restStack : List LCallerFrame}
+    {s : MachineState} {tf : SavedCallerFrame} {restTfs : List SavedCallerFrame}
+    {retVal : Value} {span : String} {cmOpt : Option CapturedMir}
+    (hb : st.activeBody.blocks[st.bb]? = some block)
+    (hNotClean : block.isCleanup = false)
+    (hUnwNone : st.unwinding = none)
+    (hStmts : st.activeEnv.evalStmts block.statements st.slots = some slots1)
+    (hT : block.terminator = .return_)
+    (hStack : st.stack = caller :: restStack)
+    (hDiv : caller.returnTarget = none)
+    (hTStack : s.memory.callStack = tf :: restTfs)
+    (hTDiv : tf.isDiverging = true)
+    (hRet0 : get? s.frame.locals 0 = some (.init retVal)) :
+    stepLoweredWithCallTable table st = none ∧
+      evalTerminator s ⟨.return_, span⟩ cmOpt = MirStepNode.fail .ub := by
+  refine ⟨?_, ?_⟩
+  · unfold stepLoweredWithCallTable
+    rw [hb]
+    simp only [hNotClean, hUnwNone, Option.isSome_none, ne_eq, not_true_eq_false, ↓reduceIte,
+      hStmts, hT, evalLoweredTerminator, hb, hStack, hDiv]
+    cases readPlaceState slots1 ⟨0, []⟩ with
+    | ok v =>
+      dsimp only
+      cases st.activeEnv.retOk v
+      · rfl
+      · cases unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind <;> rfl
+    | ub => rfl
+    | unsupported => rfl
+  · simp only [evalTerminator, hRet0, hTStack, hTDiv]
+
+/-- Helper: return-pop refinement when `evalLoweredTerminator` yields `some (.returned v)` in
+`stepLoweredWithCallTable`. -/
+private theorem returnPop_refines_trusted
+    {table : LCallTable} {rootCm activeCm : CapturedMir}
+    {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation}
+    {st : LMultiFrameState} {s : MachineState} {locals1 : List LocalSlot}
+    {tStmts : List Statement} {span : String} {v : Value} {mStep : LMultiCfgStep}
+    (hCorr : MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st s activeCm)
+    (hRel1 : SlotsRefine SlotBelow slots1 locals1)
+    (hRead0 : readPlaceState slots1 ⟨0, []⟩ = .ok v)
+    (hStepEnd : stepMirFn rootCm { s with frame := ⟨st.bb, tStmts.length, locals1⟩ } =
+      evalTerminator { s with frame := ⟨st.bb, tStmts.length, locals1⟩ } ⟨.return_, span⟩
+        (some activeCm))
+    (hPop : (match st.stack with
+      | [] => some (.done (.returned v))
+      | caller :: restStack =>
+        if !unwindActionOk caller.callerBody caller.inCleanup caller.returnUnwind then none else
+        match caller.returnTarget with
+        | none => none
+        | some retBb =>
+          if !caller.callerEnv.wf v then none else
+          match writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
+              caller.destination caller.destTy v with
+          | .ok callerSlots' =>
+            match cfgGoto caller.callerBody retBb callerSlots' caller.unwinding with
+            | some (.goto nextBb s' unw') =>
+              some (.next ⟨caller.callerEnv, caller.callerBody, nextBb, s', unw', restStack⟩)
+            | _ => none
+          | _ => none) = some mStep) :
+    let sEnd : MachineState := { s with frame := ⟨st.bb, tStmts.length, locals1⟩ }
+    match mStep with
+    | .next st' =>
+      ∃ s' activeCm',
+        TrustedStep (stepMirFn rootCm sEnd) s' ∧
+        MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm'
+    | .done (.returned rv) => stepMirFn rootCm sEnd = .retNormal rv sEnd.memory
+    | .done _ => False := by
+  intro sEnd
+  obtain ⟨rootVal, hRoot0, hProj0⟩ := readPlaceState_below_refines hRel1 hRead0
+  simp only [readProjectedValue, ProjReadResult.ok.injEq] at hProj0
+  subst rootVal
+  simp only [get?_eq_getElem?] at hRoot0
+  rcases st with ⟨aEnv, aBody, aBb, aSlots, aUnw, aStack⟩
+  cases aStack with
+  | nil =>
+    dsimp only at hPop
+    have hCorrStack := hCorr.stack
+    dsimp only at hCorrStack
+    cases hTS : s.memory.callStack with
+    | nil =>
+      simp only [Option.some.injEq] at hPop
+      subst hPop
+      dsimp only [sEnd]
+      rw [hStepEnd]
+      simp [evalTerminator, get?_eq_getElem?, hRoot0, hTS]
+    | cons _ _ => rw [hTS] at hCorrStack; nomatch hCorrStack
+  | cons caller restStack =>
+    dsimp only at hPop
+    have hCorrStack := hCorr.stack
+    dsimp only at hCorrStack
+    cases hTS : s.memory.callStack with
+    | nil => rw [hTS] at hCorrStack; nomatch hCorrStack
+    | cons tf restTfs =>
+      rw [hTS] at hCorrStack
+      obtain ⟨hCF, hRestCorr⟩ := hCorrStack
+      split at hPop
+      · nomatch hPop
+      · cases hRT : caller.returnTarget with
+        | none => rw [hRT] at hPop; nomatch hPop
+        | some retBb =>
+          rw [hRT] at hPop
+          have hTR := hCF.targetRel
+          rw [hRT] at hTR
+          obtain ⟨hNotDiv, hTFRet⟩ := hTR
+          dsimp only at hPop
+          split at hPop
+          · nomatch hPop
+          · cases hWr : writePlaceState caller.callerEnv.arityOf caller.slotsAfterArgs
+                caller.destination caller.destTy v with
+            | ub => rw [hWr] at hPop; nomatch hPop
+            | unsupported => rw [hWr] at hPop; nomatch hPop
+            | ok callerSlots' =>
+              rw [hWr] at hPop
+              dsimp only at hPop
+              cases hG : cfgGoto caller.callerBody retBb callerSlots' caller.unwinding with
+              | none => rw [hG] at hPop; nomatch hPop
+              | some gStep =>
+                rw [hG] at hPop
+                obtain rfl := cfgGoto_eq_some hG
+                simp only [Option.some.injEq] at hPop
+                subst hPop
+                obtain ⟨updatedCallerLocals, hWPV, hRelCaller⟩ :=
+                  writePlaceState_bare_below_refines (borrows := s.memory.borrows)
+                    hCF.slots hCF.destBare hWr
+                rw [hCF.destEq] at hWPV
+                let sNext : MachineState :=
+                  { frame :=
+                      { tf.frame with
+                        blockIdx := tf.returnTarget
+                        stmtIdx := 0
+                        locals := updatedCallerLocals }
+                    memory :=
+                      { s.memory with
+                        callStack := restTfs
+                        activeCallee := some tf.callerBody
+                        activeProtectors := restoreCallerProtectors tf } }
+                refine ⟨sNext, tf.callerBody, Or.inl ?_, ?_⟩
+                · dsimp only [sEnd]
+                  rw [hStepEnd]
+                  simp [evalTerminator, get?_eq_getElem?, hRoot0, hTS, hNotDiv, hWPV, sNext]
+                · exact {
+                    block := hTFRet
+                    stmt := rfl
+                    slots := hRelCaller
+                    active := rfl
+                    body := hCF.body
+                    stack := hRestCorr
+                    globals := hCorr.globals
+                    tableCorr := hCorr.tableCorr
+                  }
+
+/-- Single-step refinement postcondition for `stepLoweredWithCallTable`. -/
+def MultiStepRefines (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (s : MachineState) (mStep : LMultiCfgStep) : Prop :=
+  match mStep with
+  | .next st' =>
+    ∃ s' activeCm',
+      TrustedRun rootCm s s' ∧
+      MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm'
+  | .done (.returned v) =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retNormal v s'.memory
+  | .done (.panicked _) =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .panic
+  | .done (.terminated _) =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .abort
+  | .done (.outOfFuel _) => False
+  | .done (.maxCallDepthExceeded _ _) => True
+
+/-- Multi-step outcome refinement postcondition for `runLoweredWithCallTable`. -/
+def MultiOutcomeRefines (table : LCallTable) (rootCm : CapturedMir)
+    (sharedLayouts : LayoutTable) (sharedGlobals : List CapturedAllocation)
+    (s : MachineState) (out : LMultiCfgOutcome) : Prop :=
+  match out with
+  | .outOfFuel st' =>
+    ∃ s' activeCm',
+      TrustedRun rootCm s s' ∧
+      MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st' s' activeCm'
+  | .returned v =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retNormal v s'.memory
+  | .panicked _ =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .panic
+  | .terminated _ =>
+    ∃ s', TrustedRun rootCm s s' ∧ stepMirFn rootCm s' = .retOutcome .abort
+  | .maxCallDepthExceeded _ _ => True
+
+/-- **`stepLoweredWithCallTable` refines `TrustedRun rootCm` (`stepLoweredWithCallTable_refines_trusted`)**:
+every single-block step of `stepLoweredWithCallTable` (unless it halts early with explicit
+`maxCallDepthExceeded`) is matched by a fault-free `TrustedRun rootCm` across the block's statements
+followed by the matching `stepMirFn rootCm` transition — pushing a normal or diverging callee frame,
+popping a returning callee frame (`writePlaceValue` + `restoreCallerProtectors`), unwinding across
+caller frames (`unwindFromCallStack`), jumping within the active frame, or halting with
+`.retNormal` / `.retOutcome .panic` / `.retOutcome .abort`. -/
+theorem stepLoweredWithCallTable_refines_trusted
+    {table : LCallTable} {rootCm activeCm : CapturedMir}
+    {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation}
+    {st : LMultiFrameState} {s : MachineState} {mStep : LMultiCfgStep}
+    (hCorr : MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st s activeCm)
+    (h : stepLoweredWithCallTable table st = some mStep) :
+    MultiStepRefines table rootCm sharedLayouts sharedGlobals s mStep := by
+  unfold stepLoweredWithCallTable at h
+  cases hb : st.activeBody.blocks[st.bb]? with
+  | none => rw [hb] at h; nomatch h
+  | some block =>
+    rw [hb] at h
+    dsimp only at h
+    split at h
+    · nomatch h
+    · rename_i hCleanEq
+      cases hStmts : st.activeEnv.evalStmts block.statements st.slots with
+      | none => rw [hStmts] at h; nomatch h
+      | some slots1 =>
+        rw [hStmts] at h
+        dsimp only at h
+        obtain ⟨hRef, tStmts, span, hcm, hRunStmts⟩ := hCorr.body.block st.bb block hb
+        obtain ⟨locals1, hRun1, hRel1⟩ := hRunStmts st.slots slots1 s hCorr.block hCorr.stmt
+          hCorr.active hCorr.globals hCorr.slots hStmts
+        let sEnd : MachineState := { s with frame := ⟨st.bb, tStmts.length, locals1⟩ }
+        have hStepEnd :
+            stepMirFn rootCm sEnd =
+              evalTerminator sEnd ⟨block.terminator.toTrusted, span⟩ (some activeCm) :=
+          stepMirFn_multi_at_end_eq_evalTerminator (s := s) (locals1 := locals1)
+            hCorr.body.phase hCorr.active hcm
+        have hUnwHelper : ∀ pbb,
+            unwindLCallStack pbb st.stack = some mStep →
+            evalTerminator sEnd ⟨block.terminator.toTrusted, span⟩ (some activeCm) =
+              (match unwindFromCallStack s.memory.callStack s.memory with
+               | .running nextState => MirStepNode.step nextState
+               | .halted out => MirStepNode.retOutcome out
+               | .faulted fk => MirStepNode.fail fk) →
+            MultiStepRefines table rootCm sharedLayouts sharedGlobals s mStep := by
+          intro pbb hUnw hEqMatch
+          have hURef := unwindLCallStack_refines_unwindFromCallStack pbb st.stack
+            s.memory.callStack s.memory mStep hCorr.stack hCorr.globals hCorr.tableCorr hUnw
+          cases mStep with
+          | next st' =>
+            obtain ⟨sNext, activeCm', hRunNext, hCorrNext⟩ := hURef
+            have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+              rw [hStepEnd, hEqMatch, hRunNext]; exact Or.inl rfl
+            exact ⟨sNext, activeCm', hRun1.trans (.step hTS (.refl sNext)), hCorrNext⟩
+          | done out =>
+            cases out with
+            | panicked _ =>
+              exact ⟨sEnd, hRun1, by rw [hStepEnd, hEqMatch, hURef]⟩
+            | terminated _ =>
+              exact ⟨sEnd, hRun1, by rw [hStepEnd, hEqMatch, hURef]⟩
+            | returned _ | outOfFuel _ => exact absurd hURef id
+            | maxCallDepthExceeded _ _ => trivial
+        cases hT : block.terminator with
+        | goto t =>
+          rw [hT] at h hStepEnd
+          simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+          cases hGoto : cfgGoto st.activeBody t slots1 st.unwinding with
+          | none => rw [hGoto] at h; nomatch h
+          | some cStep =>
+            rw [hGoto] at h
+            obtain rfl := cfgGoto_eq_some hGoto
+            simp only [Option.some.injEq] at h
+            subst h
+            let sNext : MachineState := { s with frame := ⟨t, 0, locals1⟩ }
+            have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+              rw [hStepEnd]
+              exact Or.inl rfl
+            exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+              { hCorr with block := rfl, stmt := rfl, slots := hRel1 }⟩
+        | switchInt discr dty targets =>
+          rw [hT] at h hRef hStepEnd
+          simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+          cases hSw : (if targets.values.length = targets.targets.length ∧ targets.values.Nodup ∧
+              ∀ x ∈ targets.values, dty.validBits x = true then
+            match evalOperandState slots1 discr st.activeEnv.layouts st.activeEnv.globals with
+            | (.ok (.scalar sc), slots') =>
+              if sc.sizeBytes = dty.bytes ∧ dty.validBits sc.bits = true then
+                cfgGoto st.activeBody (targetForValue targets.values targets.targets targets.otherwise sc.bits)
+                  slots' st.unwinding
+              else none
+            | _ => none
+          else none) with
+          | none => rw [hSw] at h; nomatch h
+          | some cStep =>
+            rw [hSw] at h
+            split at hSw
+            · split at hSw
+              · rename_i sc slots' hOp
+                split at hSw
+                · obtain rfl := cfgGoto_eq_some hSw
+                  simp only [Option.some.injEq] at h
+                  subst h
+                  obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines slots1 slots'
+                    locals1 discr (.scalar sc) s.memory.borrows st.activeEnv.globals
+                    st.activeEnv.layouts s.memory.callerLocals hRel1 hRef hOp
+                  let tgt := targetForValue targets.values targets.targets targets.otherwise sc.bits
+                  let sNext : MachineState := { s with frame := ⟨tgt, 0, locals'⟩ }
+                  have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                    rw [hStepEnd]
+                    refine Or.inr ⟨sc.bits, ?_⟩
+                    simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                      ← hCorr.body.envLayouts, hCorr.globals, ← hCorr.body.envGlobals, hTOp,
+                      evalSwitchTargets_eq_lookupSwitchTarget, sEnd, sNext, tgt]
+                  exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                    { hCorr with block := rfl, stmt := rfl, slots := hRel' }⟩
+                · nomatch hSw
+              · nomatch hSw
+            · nomatch hSw
+        | return_ =>
+          rw [hT] at h hStepEnd
+          simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+          cases hCleanB : block.isCleanup with
+          | true => rw [hCleanB] at h; simp at h
+          | false =>
+            rw [hCleanB] at h
+            simp only [Bool.false_eq_true, ↓reduceIte] at h
+            cases hRead0 : readPlaceState slots1 ⟨0, []⟩ with
+            | ub => rw [hRead0] at h; nomatch h
+            | unsupported => rw [hRead0] at h; nomatch h
+            | ok v =>
+              rw [hRead0] at h
+              dsimp only at h
+              cases hROk : st.activeEnv.retOk v with
+              | false => rw [hROk] at h; simp at h
+              | true =>
+                rw [hROk] at h
+                simp only [↓reduceIte] at h
+                have hPop := returnPop_refines_trusted hCorr hRel1 hRead0 hStepEnd h
+                cases mStep with
+                | next st' =>
+                  obtain ⟨s', activeCm', hTS, hCorr'⟩ := hPop
+                  exact ⟨s', activeCm', hRun1.trans (.step hTS (.refl s')), hCorr'⟩
+                | done out =>
+                  cases out with
+                  | returned rv => exact ⟨sEnd, hRun1, hPop⟩
+                  | _ => exact absurd hPop id
+        | unreachable =>
+          rw [hT] at h
+          simp [evalLoweredTerminator, hb, hCleanEq, hT] at h
+        | drop place t u =>
+          rw [hT] at hRef
+          exact absurd hRef id
+        | assert cond expected msg t u =>
+          rw [hT] at h hRef hStepEnd
+          dsimp only at h
+          cases hEvT : evalLoweredTerminator st.activeEnv st.activeBody st.bb slots1 st.unwinding with
+          | none => rw [hEvT] at h; nomatch h
+          | some cStep =>
+            rw [hEvT] at h
+            simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at hEvT
+            split at hEvT
+            · rename_i sc slots' hOp
+              obtain ⟨locals', hTOp, hRel'⟩ := evalOperandState_below_refines slots1 slots'
+                locals1 cond (.scalar sc) s.memory.borrows st.activeEnv.globals
+                st.activeEnv.layouts s.memory.callerLocals hRel1 hRef hOp
+              split at hEvT
+              · rename_i hBool
+                obtain ⟨bits, sz⟩ := sc
+                obtain ⟨_, hLe⟩ := hBool
+                have hB01 : bits = 0 ∨ bits = 1 := by simp only at hLe; omega
+                rcases hB01 with rfl | rfl <;> cases expected
+                · rw [show (((0 : Nat) == 1) == false) = true from rfl] at hEvT
+                  simp only [↓reduceIte] at hEvT
+                  split at hEvT
+                  · obtain rfl := cfgGoto_eq_some hEvT
+                    simp only [Option.some.injEq] at h
+                    subst h
+                    let sNext : MachineState := { s with frame := ⟨t, 0, locals'⟩ }
+                    have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                      rw [hStepEnd]
+                      refine Or.inl ?_
+                      simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                        ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                        hTOp, sNext]
+                    exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                      { hCorr with block := rfl, stmt := rfl, slots := hRel' }⟩
+                  · nomatch hEvT
+                · rw [show (((0 : Nat) == 1) == true) = false from rfl] at hEvT
+                  simp only [Bool.false_eq_true, ↓reduceIte] at hEvT
+                  split at hEvT
+                  · cases u with
+                    | unreachable => simp [startPanic] at hEvT
+                    | terminate =>
+                      simp only [startPanic, Option.some.injEq] at hEvT
+                      subst hEvT
+                      simp only [Option.some.injEq] at h
+                      subst h
+                      refine ⟨sEnd, hRun1, ?_⟩
+                      rw [hStepEnd]
+                      simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                        ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                        hTOp, applyUnwindAction]
+                    | continue_ =>
+                      simp only [startPanic] at hEvT
+                      split at hEvT
+                      · nomatch hEvT
+                      · simp only [Option.some.injEq] at hEvT
+                        subst hEvT
+                        apply hUnwHelper st.bb h
+                        simp only [hT, LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                          ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                          hTOp, applyUnwindAction]
+                        rfl
+                    | cleanup c =>
+                      simp only [startPanic] at hEvT
+                      split at hEvT
+                      · nomatch hEvT
+                      · obtain rfl := cfgGoto_eq_some hEvT
+                        simp only [Option.some.injEq] at h
+                        subst h
+                        let sNext : MachineState := { s with frame := ⟨c, 0, locals'⟩ }
+                        have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                          rw [hStepEnd]
+                          refine Or.inl ?_
+                          simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                            ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                            hTOp, applyUnwindAction, sNext]
+                        exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                          { hCorr with block := rfl, stmt := rfl, slots := hRel' }⟩
+                  · nomatch hEvT
+                · rw [show (((1 : Nat) == 1) == false) = false from rfl] at hEvT
+                  simp only [Bool.false_eq_true, ↓reduceIte] at hEvT
+                  split at hEvT
+                  · cases u with
+                    | unreachable => simp [startPanic] at hEvT
+                    | terminate =>
+                      simp only [startPanic, Option.some.injEq] at hEvT
+                      subst hEvT
+                      simp only [Option.some.injEq] at h
+                      subst h
+                      refine ⟨sEnd, hRun1, ?_⟩
+                      rw [hStepEnd]
+                      simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                        ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                        hTOp, applyUnwindAction]
+                    | continue_ =>
+                      simp only [startPanic] at hEvT
+                      split at hEvT
+                      · nomatch hEvT
+                      · simp only [Option.some.injEq] at hEvT
+                        subst hEvT
+                        apply hUnwHelper st.bb h
+                        simp only [hT, LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                          ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                          hTOp, applyUnwindAction]
+                        rfl
+                    | cleanup c =>
+                      simp only [startPanic] at hEvT
+                      split at hEvT
+                      · nomatch hEvT
+                      · obtain rfl := cfgGoto_eq_some hEvT
+                        simp only [Option.some.injEq] at h
+                        subst h
+                        let sNext : MachineState := { s with frame := ⟨c, 0, locals'⟩ }
+                        have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                          rw [hStepEnd]
+                          refine Or.inl ?_
+                          simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                            ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                            hTOp, applyUnwindAction, sNext]
+                        exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                          { hCorr with block := rfl, stmt := rfl, slots := hRel' }⟩
+                  · nomatch hEvT
+                · rw [show (((1 : Nat) == 1) == true) = true from rfl] at hEvT
+                  simp only [↓reduceIte] at hEvT
+                  split at hEvT
+                  · obtain rfl := cfgGoto_eq_some hEvT
+                    simp only [Option.some.injEq] at h
+                    subst h
+                    let sNext : MachineState := { s with frame := ⟨t, 0, locals'⟩ }
+                    have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                      rw [hStepEnd]
+                      refine Or.inl ?_
+                      simp only [LTerminator.toTrusted, evalTerminator, hCorr.body.cmLayouts,
+                        ← hCorr.body.envLayouts, sEnd, hCorr.globals, ← hCorr.body.envGlobals,
+                        hTOp, sNext]
+                    exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                      { hCorr with block := rfl, stmt := rfl, slots := hRel' }⟩
+                  · nomatch hEvT
+              · nomatch hEvT
+            · nomatch hEvT
+        | unwindResume =>
+          rw [hT] at h hStepEnd
+          simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+          cases hUnw : st.unwinding with
+          | none => rw [hUnw] at h; nomatch h
+          | some pbb =>
+            rw [hUnw] at h
+            dsimp only at h
+            apply hUnwHelper pbb h
+            rw [hT]
+            rfl
+        | unwindTerminate =>
+          rw [hT] at h hStepEnd
+          simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+          cases hUnw : st.unwinding with
+          | none => rw [hUnw] at h; nomatch h
+          | some pbb =>
+            rw [hUnw] at h
+            simp only [Option.some.injEq] at h
+            subst h
+            exact ⟨sEnd, hRun1, by rw [hStepEnd]; rfl⟩
+        | call func args dest destTy target unwind =>
+          rw [hT] at h hRef hStepEnd
+          obtain ⟨hArgsND, hDestBare, defPath, typeArgs, layoutIdx, rfl, hCallDisj⟩ := hRef
+          rw [hCorr.body.callTargetLinked] at h
+          simp only [extractLinkedLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+            extractCalleeTypeArgs] at h
+          rcases hCallDisj with hLinkedSome | ⟨hLinkedNone, op, hLowerOp, hSupp⟩
+          · -- Linked callee in `table`
+            cases hLk : table.lookup defPath typeArgs with
+            | none => simp [hLk] at hLinkedSome
+            | some callee =>
+              simp only [hLk, Option.isSome_some, classifyLinkedCallTarget_V2026_06_01,
+                ↓reduceIte, evalOperandState, evalConstValue] at h
+              split at h
+              · nomatch h
+              · cases hArgsEval : evalOperandsState st.activeEnv.layouts st.activeEnv.globals
+                    slots1 args with
+                | none => rw [hArgsEval] at h; nomatch h
+                | some pArgs =>
+                  rcases pArgs with ⟨avs, slots2⟩
+                  rw [hArgsEval] at h
+                  dsimp only at h
+                  split at h
+                  · nomatch h
+                  · split at h
+                    · nomatch h
+                    · split at h
+                      · simp only [Option.some.injEq] at h
+                        subst h
+                        trivial
+                      · split at h
+                        · nomatch h
+                        · cases hEntry : callee.body.blocks[0]? with
+                          | none => rw [hEntry] at h; nomatch h
+                          | some entryB =>
+                            rw [hEntry] at h
+                            dsimp only at h
+                            split at h
+                            · nomatch h
+                            · simp only [Option.some.injEq] at h
+                              subst h
+                              obtain ⟨calleeCm, hTCm, hLocCnt, hCalleeBody⟩ :=
+                                hCorr.tableCorr.linked defPath typeArgs callee hLk
+                              obtain ⟨locals2, hTOps, hRel2⟩ :=
+                                evalOperandsState_below_refines args slots1 slots2 locals1 avs
+                                  s.memory.borrows st.activeEnv.globals st.activeEnv.layouts
+                                  s.memory.callerLocals hRel1 hArgsND hArgsEval
+                              rw [hCorr.body.envLayouts, hCorr.body.envGlobals] at hTOps
+                              have hInitRel : SlotsRefine SlotBelow
+                                  (initLCalleeSlots callee.localCount avs)
+                                  (initLocals calleeCm avs) := by
+                                rw [hLocCnt]
+                                exact initLCalleeSlots_below_initLocals calleeCm avs
+                              cases target with
+                              | some targetBb =>
+                                let sNext := pushCalleeFrame sEnd activeCm locals2 dest targetBb
+                                  calleeCm avs unwind
+                                have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                                  rw [hStepEnd]
+                                  refine Or.inl ?_
+                                  simp [LTerminator.toTrusted, evalTerminator, resolveCallTarget,
+                                    extractCalleeDefPath?, extractCalleeTypeArgs,
+                                    hCorr.body.cmLayouts, hCorr.globals, hTOps, hTCm, sEnd, sNext]
+                                refine ⟨sNext, calleeCm, hRun1.trans (.step hTS (.refl sNext)), ?_⟩
+                                exact {
+                                  block := rfl
+                                  stmt := rfl
+                                  slots := hInitRel
+                                  active := rfl
+                                  body := hCalleeBody
+                                  stack := ⟨{
+                                    body := hCorr.body
+                                    slots := hRel2
+                                    destEq := rfl
+                                    destBare := hDestBare
+                                    unwindEq := rfl
+                                    targetRel := ⟨rfl, rfl⟩
+                                  }, hCorr.stack⟩
+                                  globals := hCorr.globals
+                                  tableCorr := hCorr.tableCorr
+                                }
+                              | none =>
+                                let sNext := pushDivergingCalleeFrame sEnd activeCm locals2 dest
+                                  unwind calleeCm avs
+                                have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                                  rw [hStepEnd]
+                                  refine Or.inl ?_
+                                  simp [LTerminator.toTrusted, evalTerminator, resolveCallTarget,
+                                    extractCalleeDefPath?, extractCalleeTypeArgs,
+                                    hCorr.body.cmLayouts, hCorr.globals, hTOps, hTCm, sEnd, sNext]
+                                refine ⟨sNext, calleeCm, hRun1.trans (.step hTS (.refl sNext)), ?_⟩
+                                exact {
+                                  block := rfl
+                                  stmt := rfl
+                                  slots := hInitRel
+                                  active := rfl
+                                  body := hCalleeBody
+                                  stack := ⟨{
+                                    body := hCorr.body
+                                    slots := hRel2
+                                    destEq := rfl
+                                    destBare := hDestBare
+                                    unwindEq := rfl
+                                    targetRel := rfl
+                                  }, hCorr.stack⟩
+                                  globals := hCorr.globals
+                                  tableCorr := hCorr.tableCorr
+                                }
+          · -- Inline intrinsic (unlinked in `table`)
+            cases hLk : table.lookup defPath typeArgs with
+            | some _ => simp [hLk] at hLinkedNone
+            | none =>
+              simp only [hLk, Option.isSome_none, classifyLinkedCallTarget_V2026_06_01,
+                Bool.false_eq_true, ↓reduceIte, lowerCallTarget_V2026_06_01, hLowerOp] at h
+              simp only [evalLoweredTerminator, hb, hCleanEq, hT, ↓reduceIte] at h
+              cases hCallEv : evalLoweredCall st.activeEnv st.activeBody st.bb block.isCleanup
+                  (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args slots1
+                  dest destTy target unwind st.unwinding with
+              | none => rw [hCallEv] at h; nomatch h
+              | some iStep =>
+                rw [hCallEv] at h
+                unfold evalLoweredCall at hCallEv
+                simp only [evalOperandState, evalConstValue] at hCallEv
+                split at hCallEv
+                · nomatch hCallEv
+                · cases hArgsEval : evalOperandsState st.activeEnv.layouts st.activeEnv.globals
+                      slots1 args with
+                  | none => rw [hArgsEval] at hCallEv; nomatch hCallEv
+                  | some pArgs =>
+                    rcases pArgs with ⟨avs, slots2⟩
+                    rw [hArgsEval] at hCallEv
+                    dsimp only at hCallEv
+                    split at hCallEv
+                    · nomatch hCallEv
+                    · split at hCallEv
+                      · nomatch hCallEv
+                      · simp only [evalLoweredCallTargetDispatch, hCorr.body.callTargetLinked,
+                          extractLinkedLCallTarget_V2026_06_01?, extractCalleeDefPath?,
+                          extractCalleeTypeArgs, hLk, Option.isSome_none,
+                          classifyLinkedCallTarget_V2026_06_01, Bool.false_eq_true, ↓reduceIte,
+                          lowerCallTarget_V2026_06_01, hLowerOp] at hCallEv
+                        rename_i hIntrEval_dummy1 hIntrEval_dummy2 hIntrEval_dummy3
+                        have hIntrEval := hCallEv
+                        obtain ⟨locals2, hTOps, hRel2⟩ :=
+                          evalOperandsState_below_refines args slots1 slots2 locals1 avs
+                            s.memory.borrows st.activeEnv.globals st.activeEnv.layouts
+                            s.memory.callerLocals hRel1 hArgsND hArgsEval
+                        rw [hCorr.body.envLayouts, hCorr.body.envGlobals] at hTOps
+                        have hNoCallee := hCorr.tableCorr.unlinkedIntrinsic defPath typeArgs op
+                          hLk hLowerOp
+                        have hResTgt :
+                            ∀ (decls : List LocalDecl) (lays : LayoutTable),
+                              resolveCallTarget sEnd
+                                (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+                                (length args) decls lays =
+                                .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+                                  locals1 := fun _ _ => rfl
+                        by_cases hValOp : op.isValueDirectIntrinsic = true
+                        · rw [evalLoweredIntrinsicCall_of_isValueDirectIntrinsic hValOp] at hIntrEval
+                          split at hIntrEval
+                          · nomatch hIntrEval
+                          · cases target with
+                            | none => nomatch hIntrEval
+                            | some targetBb =>
+                              rw [hCorr.body.ubChecksTrue] at hIntrEval
+                              cases hEv : evalLIntrinsicValue op typeArgs st.activeEnv.localDecls
+                                  st.activeEnv.layouts args avs true with
+                              | none => rw [hEv] at hIntrEval; nomatch hIntrEval
+                              | some rv =>
+                                rw [hEv] at hIntrEval
+                                dsimp only at hIntrEval
+                                split at hIntrEval
+                                · nomatch hIntrEval
+                                · cases hWr : writePlaceState st.activeEnv.arityOf slots2 dest
+                                      destTy rv with
+                                  | ub => rw [hWr] at hIntrEval; nomatch hIntrEval
+                                  | unsupported => rw [hWr] at hIntrEval; nomatch hIntrEval
+                                  | ok slots3 =>
+                                    rw [hWr] at hIntrEval
+                                    obtain rfl := cfgGoto_eq_some hIntrEval
+                                    simp only [Option.some.injEq] at h
+                                    subst h
+                                    obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
+                                      writePlaceState_bare_below_refines
+                                        (borrows := s.memory.borrows) hRel2 hDestBare hWr
+                                    obtain ⟨kind, hKind, hNotEx, hClass⟩ :=
+                                      trustedSupportsIntrinsicDefPath_of_isValueDirectIntrinsic
+                                        hValOp hSupp
+                                    have hNotSel : kind ≠ .constEvalSelect := by
+                                      intro hEq; subst hEq; cases op <;> cases hKind
+                                    rw [← hCorr.body.localDecls, hCorr.body.envLayouts] at hEv
+                                    have hNonSel :=
+                                      evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
+                                        (s := sEnd)
+                                        (target := { defPath := defPath, typeArgs := typeArgs,
+                                                     isIndirect := false })
+                                        (locals' := locals2) (destination := dest)
+                                        (targetBb := targetBb) hKind hEv
+                                    have hDir :=
+                                      evalDirectRustIntrinsic_of_nonSelect
+                                        (s := sEnd) (body := some activeCm)
+                                        (target := { defPath := defPath, typeArgs := typeArgs,
+                                                     isIndirect := false })
+                                        (localDecls := activeCm.localDecls)
+                                        (layouts := sharedLayouts)
+                                        (args := args) (argVals := avs) (locals' := locals2)
+                                        (destination := dest) (targetBb := targetBb)
+                                        (unwind := unwind) hClass hNotSel
+                                    let sNext : MachineState :=
+                                      { s with frame := ⟨targetBb, 0, updatedLocals⟩ }
+                                    have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                                      rw [hStepEnd]
+                                      refine Or.inl ?_
+                                      have hStepEval :
+                                          evalTerminator sEnd
+                                            ⟨(LTerminator.call
+                                              (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩,
+                                                .zeroSized⟩)
+                                              args dest destTy (some targetBb) unwind).toTrusted,
+                                              span⟩
+                                            (some activeCm) =
+                                            writeIntrinsicReturn sEnd locals2 dest targetBb rv := by
+                                        simp only [LTerminator.toTrusted, evalTerminator,
+                                          bodyLocalDeclsOf, hResTgt, hCorr.body.cmLayouts,
+                                          sEnd, hCorr.globals, hTOps, hNoCallee,
+                                          isDirectExactDivTarget, hNotEx]
+                                        erw [hDir]
+                                        exact hNonSel
+                                      rw [hStepEval]
+                                      simp [writeIntrinsicReturn, hWPV, sEnd, sNext]
+                                    exact ⟨sNext, activeCm,
+                                      hRun1.trans (.step hTS (.refl sNext)),
+                                      { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩
+                        · cases op with
+                          | unreachableUnchecked => nomatch hIntrEval
+                          | copyNonOverlapping => simp [trustedSupportsIntrinsicDefPath] at hSupp
+                          | writeBytes => simp [trustedSupportsIntrinsicDefPath] at hSupp
+                          | abort =>
+                            simp only [evalLoweredIntrinsicCall] at hIntrEval
+                            cases target with
+                            | some _ => nomatch hIntrEval
+                            | none =>
+                              simp only [Option.some.injEq] at hIntrEval
+                              subst hIntrEval
+                              simp only [Option.some.injEq] at h
+                              subst h
+                              obtain ⟨_, _, hUnrF, hAbT⟩ := hSupp
+                              refine ⟨sEnd, hRun1, ?_⟩
+                              rw [hStepEnd]
+                              simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
+                                hResTgt, hCorr.body.cmLayouts, sEnd, hCorr.globals, hTOps,
+                                hNoCallee, hUnrF, hAbT]
+                          | panicUnwind =>
+                            simp only [evalLoweredIntrinsicCall] at hIntrEval
+                            cases target with
+                            | some _ => nomatch hIntrEval
+                            | none =>
+                              obtain ⟨_, _, hUnrF, hAbF, hPanT⟩ := hSupp
+                              cases unwind with
+                              | unreachable => simp [startPanic] at hIntrEval
+                              | terminate =>
+                                simp only [startPanic, Option.some.injEq] at hIntrEval
+                                subst hIntrEval
+                                simp only [Option.some.injEq] at h
+                                subst h
+                                refine ⟨sEnd, hRun1, ?_⟩
+                                rw [hStepEnd]
+                                simp only [LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf,
+                                  hResTgt, hCorr.body.cmLayouts, sEnd, hCorr.globals, hTOps,
+                                  hNoCallee, hUnrF, hAbF, hPanT, applyUnwindAction]
+                              | continue_ =>
+                                simp only [startPanic] at hIntrEval
+                                split at hIntrEval
+                                · nomatch hIntrEval
+                                · simp only [Option.some.injEq] at hIntrEval
+                                  subst hIntrEval
+                                  apply hUnwHelper st.bb h
+                                  simp only [hT, LTerminator.toTrusted, evalTerminator,
+                                    bodyLocalDeclsOf, hResTgt, hCorr.body.cmLayouts, sEnd,
+                                    hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                                    applyUnwindAction]
+                                  rfl
+                              | cleanup c =>
+                                simp only [startPanic] at hIntrEval
+                                split at hIntrEval
+                                · nomatch hIntrEval
+                                · obtain rfl := cfgGoto_eq_some hIntrEval
+                                  simp only [Option.some.injEq] at h
+                                  subst h
+                                  let sNext : MachineState := { s with frame := ⟨c, 0, locals2⟩ }
+                                  have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                                    rw [hStepEnd]
+                                    refine Or.inl ?_
+                                    simp only [LTerminator.toTrusted, evalTerminator,
+                                      bodyLocalDeclsOf, hResTgt, hCorr.body.cmLayouts, sEnd, sNext,
+                                      hCorr.globals, hTOps, hNoCallee, hUnrF, hAbF, hPanT,
+                                      applyUnwindAction]
+                                  exact ⟨sNext, activeCm, hRun1.trans (.step hTS (.refl sNext)),
+                                    { hCorr with block := rfl, stmt := rfl, slots := hRel2 }⟩
+                          | exactDiv =>
+                            simp only [evalLoweredIntrinsicCall] at hIntrEval
+                            split at hIntrEval
+                            · nomatch hIntrEval
+                            · cases target with
+                              | none => nomatch hIntrEval
+                              | some targetBb =>
+                                rw [hCorr.body.ubChecksTrue] at hIntrEval
+                                cases hEv : evalLIntrinsicValue .exactDiv typeArgs
+                                    st.activeEnv.localDecls st.activeEnv.layouts args avs true with
+                                | none => rw [hEv] at hIntrEval; nomatch hIntrEval
+                                | some rv =>
+                                  rw [hEv] at hIntrEval
+                                  dsimp only at hIntrEval
+                                  split at hIntrEval
+                                  · nomatch hIntrEval
+                                  · cases hWr : writePlaceState st.activeEnv.arityOf slots2 dest
+                                        destTy rv with
+                                    | ub => rw [hWr] at hIntrEval; nomatch hIntrEval
+                                    | unsupported => rw [hWr] at hIntrEval; nomatch hIntrEval
+                                    | ok slots3 =>
+                                      rw [hWr] at hIntrEval
+                                      obtain rfl := cfgGoto_eq_some hIntrEval
+                                      simp only [Option.some.injEq] at h
+                                      subst h
+                                      obtain ⟨updatedLocals, hWPV, hRel3⟩ :=
+                                        writePlaceState_bare_below_refines
+                                          (borrows := s.memory.borrows) hRel2 hDestBare hWr
+                                      obtain ⟨hExPath, _⟩ := hSupp
+                                      rw [← hCorr.body.localDecls, hCorr.body.envLayouts] at hEv
+                                      dsimp only [evalLIntrinsicValue] at hEv
+                                      rcases avs with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
+                                      · cases hEv
+                                      · cases v1 <;> cases hEv
+                                      · cases v1 <;> cases v2 <;> try cases hEv
+                                        dsimp only at hEv
+                                        split at hEv
+                                        · rename_i isSigned hSignSynth
+                                          simp only [Option.map_eq_some_iff] at hEv
+                                          obtain ⟨retScalar, hDiv, rfl⟩ := hEv
+                                          let sNext : MachineState :=
+                                            { s with frame := ⟨targetBb, 0, updatedLocals⟩ }
+                                          have hTS : TrustedStep (stepMirFn rootCm sEnd) sNext := by
+                                            rw [hStepEnd]
+                                            refine Or.inl ?_
+                                            simp only [LTerminator.toTrusted, evalTerminator,
+                                              bodyLocalDeclsOf, hResTgt,
+                                              hCorr.body.cmLayouts, sEnd, hCorr.globals, hTOps,
+                                              hNoCallee, isDirectExactDivTarget, hExPath]
+                                            rw [resolveIntrinsicIsSigned_defPath_irrel _
+                                              { defPath := "", typeArgs := typeArgs, isIndirect := false }
+                                              _ _ _ _ _ rfl, hSignSynth]
+                                            simp [hDiv, hWPV, sNext]
+                                          exact ⟨sNext, activeCm,
+                                            hRun1.trans (.step hTS (.refl sNext)),
+                                            { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩
+                                        · cases hEv
+                                      · cases v1 <;> cases v2 <;> cases hEv
+                          | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse
+                          | wrappingAdd | wrappingSub | wrappingMul | saturatingAdd | saturatingSub
+                          | uncheckedAdd | uncheckedSub | uncheckedMul | uncheckedDiv | uncheckedRem
+                          | uncheckedShl | uncheckedShr | threeWayCompare | ubChecks | arithOffset
+                          | sizeOfVal | alignOfVal =>
+                            exact False.elim (hValOp rfl)
+
+/-- **`runLoweredWithCallTable` refines `TrustedRun rootCm` (`runLoweredWithCallTable_refines_trusted`)**:
+for any shared fuel budget `fuel`, multi-frame execution across linked callees, inline intrinsics,
+returns, and unwinds refines Trusted's `stepMirFn rootCm`. -/
+theorem runLoweredWithCallTable_refines_trusted
+    {table : LCallTable} {rootCm : CapturedMir}
+    {sharedLayouts : LayoutTable} {sharedGlobals : List CapturedAllocation} :
+    ∀ (fuel : Nat) (st : LMultiFrameState) (s : MachineState) (activeCm : CapturedMir)
+      (out : LMultiCfgOutcome),
+      MultiFrameStateCorr table rootCm sharedLayouts sharedGlobals st s activeCm →
+      runLoweredWithCallTable table fuel st = some out →
+      MultiOutcomeRefines table rootCm sharedLayouts sharedGlobals s out := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro st s activeCm out hCorr h
+    simp only [runLoweredWithCallTable, Option.some.injEq] at h
+    subst h
+    exact ⟨s, activeCm, .refl s, hCorr⟩
+  | succ fuel ih =>
+    intro st s activeCm out hCorr h
+    simp only [runLoweredWithCallTable] at h
+    cases hStep : stepLoweredWithCallTable table st with
+    | none => rw [hStep] at h; nomatch h
+    | some mStep =>
+      rw [hStep] at h
+      have hRef := stepLoweredWithCallTable_refines_trusted hCorr hStep
+      cases mStep with
+      | next st' =>
+        obtain ⟨s1, activeCm1, hRun1, hCorr1⟩ := hRef
+        have hSub := ih st' s1 activeCm1 out hCorr1 h
+        cases out with
+        | outOfFuel _ =>
+          obtain ⟨s2, activeCm2, hRun2, hCorr2⟩ := hSub
+          exact ⟨s2, activeCm2, hRun1.trans hRun2, hCorr2⟩
+        | returned _ | panicked _ | terminated _ =>
+          obtain ⟨s2, hRun2, hFinal⟩ := hSub
+          exact ⟨s2, hRun1.trans hRun2, hFinal⟩
+        | maxCallDepthExceeded _ _ => trivial
+      | done doneOut =>
+        simp only [Option.some.injEq] at h
+        subst h
+        cases doneOut with
+        | outOfFuel _ => exact absurd hRef id
+        | returned _ | panicked _ | terminated _ | maxCallDepthExceeded _ _ => exact hRef
+
+/-! ### Section 5e: Concrete Non-Vacuity Witnesses (Inline Intrinsics, UB Parity, Diverging `abort`/`panicUnwind`, and 2-Deep `LCallTable`) -/
+
+private def ep2TyU8 : Ty := { kind := .uint .u8, layoutIdx := 0 }
+private def ep2TyI8 : Ty := { kind := .int .i8, layoutIdx := 0 }
+private def ep2TyU32 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+private def ep2TyI32 : Ty := { kind := .int .i32, layoutIdx := 0 }
+private def ep2TyUsize : Ty := { kind := .uint .usize, layoutIdx := 0 }
+private def ep2TyIsize : Ty := { kind := .int .isize, layoutIdx := 0 }
+private def ep2TyBool : Ty := { kind := .bool, layoutIdx := 0 }
+private def ep2TyUnit : Ty := { kind := .tuple [], layoutIdx := 0 }
+private def ep2TyNever : Ty := { kind := .never, layoutIdx := 0 }
+private def ep2TyRawConstU32 : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+private def ep2TyRawMutU32 : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+
+private def ep2Decl (ty : Ty) : LocalDecl :=
+  { mutability := .mut, ty := ty, debugName := none }
+
+private def ep2FnOp (defPath : DefPath) (typeArgs : List RigidTy := []) : Operand :=
+  .constant ⟨⟨.fnDef defPath typeArgs, 0⟩, .zeroSized⟩
+
+private def ep2ConstSc (ty : Ty) (bits bytes : Nat) : Operand :=
+  .constant ⟨ty, .scalar (.int ⟨bits, bytes⟩)⟩
+
+private def ep2DummyLayout : TypeLayout :=
+  { size := ⟨4⟩
+    align := ⟨4⟩
+    backendRepr := .memory
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+private def ep2DummyAbi : FnAbi :=
+  { args := []
+    ret := { layout := ep2DummyLayout, mode := .direct }
+    conv := .rust
+    canUnwind := true }
+
+private def ep2LToCapturedBlocks (blocks : List LBlock) : List BasicBlockData :=
+  blocks.map fun b =>
+    { statements := b.statements
+      terminator := ⟨b.terminator.toTrusted, ""⟩
+      isCleanup := b.isCleanup }
+
+private def ep2MakeCaptured (defPath : DefPath) (argCount : Nat) (decls : List LocalDecl)
+    (body : LBody) : CapturedMir :=
+  { defPath := defPath
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := argCount
+    localDecls := decls
+    basicBlocks := ep2LToCapturedBlocks body.blocks
+    fnAbi := ep2DummyAbi
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+private def ep2MakeEnv (decls : List LocalDecl) : CfgEnv :=
+  { layouts := emptyLayoutTable
+    globals := []
+    wf := fun _ => true
+    retOk := fun _ => true
+    placeAccessOk := fun _ _ => true
+    arityOf := fun _ _ _ => none
+    evalStmts := fun stmts slots => if stmts.isEmpty then some slots else none
+    handler := none
+    inhabited := fun ty => match ty.kind with | .never => false | _ => true
+    localDecls := decls
+    ubChecks := true
+    callTargetOf := extractLCallTarget_V2026_06_01?
+    memIntrinsic := none }
+
+/-! #### Witness Suite 1: Value-Returning Inline Intrinsics & Call-Form Sub-Place Memory Intrinsics -/
+
+/-- 10-block concrete lowered body exercising `ctlz`, `ctpop`, `bswap`, `exact_div`,
+`saturating_add`, `unchecked_add`, `unchecked_shl`, `three_way_compare`, and `ub_checks` end-to-end
+before returning `_0 = 84_u32`. -/
+def witnessInlineIntrinsicsBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::ctlz" [.uint .u32])
+        [.copy ⟨1, []⟩] ⟨2, []⟩ ep2TyU32 (some 1) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::ctpop" [.uint .u32])
+        [.copy ⟨1, []⟩] ⟨2, []⟩ ep2TyU32 (some 2) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::bswap" [.uint .u32])
+        [ep2ConstSc ep2TyU32 0x12345678 4] ⟨3, []⟩ ep2TyU32 (some 3) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::exact_div" [.int .i32])
+        [ep2ConstSc ep2TyI32 0xFFFFFFD6 4, ep2ConstSc ep2TyI32 7 4]
+        ⟨4, []⟩ ep2TyI32 (some 4) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::saturating_add" [.uint .u8])
+        [ep2ConstSc ep2TyU8 250 1, ep2ConstSc ep2TyU8 20 1]
+        ⟨5, []⟩ ep2TyU8 (some 5) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::unchecked_add" [.uint .u32])
+        [.copy ⟨2, []⟩, ep2ConstSc ep2TyU32 38 4]
+        ⟨6, []⟩ ep2TyU32 (some 6) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::unchecked_shl" [.uint .u32, .int .i32])
+        [.copy ⟨6, []⟩, ep2ConstSc ep2TyI32 1 4]
+        ⟨0, []⟩ ep2TyU32 (some 7) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::three_way_compare" [.int .i32])
+        [.copy ⟨4, []⟩, ep2ConstSc ep2TyI32 0 4]
+        ⟨7, []⟩ ep2TyI8 (some 8) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::ub_checks" [])
+        [] ⟨8, []⟩ ep2TyBool (some 9) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+def witnessInlineIntrinsicsDecls : List LocalDecl :=
+  [ ep2Decl ep2TyU32, ep2Decl ep2TyU32, ep2Decl ep2TyU32, ep2Decl ep2TyU32, ep2Decl ep2TyI32
+  , ep2Decl ep2TyU8, ep2Decl ep2TyU32, ep2Decl ep2TyI8, ep2Decl ep2TyBool ]
+
+def witnessInlineIntrinsicsCm : CapturedMir :=
+  ep2MakeCaptured "witness::inline_intrinsics" 1 witnessInlineIntrinsicsDecls
+    witnessInlineIntrinsicsBody
+
+def witnessInlineIntrinsicsEnv : CfgEnv :=
+  ep2MakeEnv witnessInlineIntrinsicsDecls
+
+theorem lookupCallee_eq_none_of_findCallee_none {callees : List CapturedMir}
+    {layouts : LayoutTable} {dp : DefPath} {tys : List RigidTy}
+    (hFind : findCallee? callees dp = none)
+    (hTraits : flatMapTraitImpls callees = []) :
+    lookupCallee callees layouts dp tys [] = none := by
+  unfold lookupCallee resolveCalleeBodyAndArgs?
+  cases tys with
+  | nil => simp [hFind]
+  | cons hd tl =>
+    cases hd <;> simp [hFind, hTraits, collectMatchingTraitImpls]
+
+private def ep2OpNonDeref : Operand → Bool
+  | .constant _ => true
+  | .copy p => p.projection.isEmpty
+  | .move p => p.projection.isEmpty
+
+private theorem ep2OpNonDeref_sound {op : Operand} (h : ep2OpNonDeref op = true) :
+    OperandNonDeref op := by
+  cases op with
+  | constant _ => trivial
+  | copy p | move p =>
+    have hNil : p.projection = [] := List.isEmpty_iff.mp h
+    intro _ hc
+    rw [hNil] at hc
+    nomatch hc
+
+theorem witnessInlineIntrinsics_bodyCorr :
+    BodyCorr witnessInlineIntrinsicsEnv witnessInlineIntrinsicsBody witnessInlineIntrinsicsCm where
+  phase _ h := nomatch h
+  layouts := rfl
+  block i b hb := by
+    match i with
+    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 =>
+      simp only [witnessInlineIntrinsicsBody, List.getElem?_cons_zero,
+        List.getElem?_cons_succ, Option.some.injEq] at hb
+      subst hb
+      refine ⟨rfl, ?_, "", rfl⟩
+      first
+      | trivial
+      | dsimp only [LTerminator.Refinable]
+        exact ⟨⟨_, _, _, _, rfl, rfl, trustedSupportsIntrinsicDefPath_of_check (by decide)⟩,
+          (fun arg hMem => ep2OpNonDeref_sound (List.all_eq_true.mp (by decide) arg hMem)),
+          rfl⟩
+    | n + 10 =>
+      simp [witnessInlineIntrinsicsBody] at hb
+
+/-- **Concrete Non-Vacuity Witness 1a (`witness_inline_intrinsics_cfg_refines_trusted`)**:
+executes the 10-block inline-intrinsic chain (`ctlz`, `ctpop`, `bswap`, `exact_div`,
+`saturating_add`, `unchecked_add`, `unchecked_shl`, `three_way_compare`, `ub_checks`, `return`)
+through `runLoweredCfgSteps` to `some (.returned (.scalar ⟨84, 4⟩))` and instantiates
+`runLoweredCfgSteps_refines_trusted` to obtain a concrete `TrustedRun` ending in
+`stepMirFn = .retNormal (.scalar ⟨84, 4⟩)`. -/
+theorem witness_inline_intrinsics_cfg_refines_trusted :
+    let initSlots : List LocalSlotState :=
+      [.uninit, .init (.scalar ⟨0x00F00000, 4⟩), .uninit, .uninit, .uninit,
+       .uninit, .uninit, .uninit, .uninit]
+    let s0 : MachineState :=
+      { (initMachineState witnessInlineIntrinsicsCm [.scalar ⟨0x00F00000, 4⟩]) with
+        frame := ⟨0, 0,
+          [.uninit, .init (.scalar ⟨0x00F00000, 4⟩), .uninit, .uninit, .uninit,
+           .uninit, .uninit, .uninit, .uninit]⟩ }
+    runLoweredCfgSteps witnessInlineIntrinsicsEnv witnessInlineIntrinsicsBody 12 0 initSlots none =
+        some (.returned (.scalar ⟨84, 4⟩)) ∧
+      ∃ s',
+        TrustedRun witnessInlineIntrinsicsCm s0 s' ∧
+        stepMirFn witnessInlineIntrinsicsCm s' = .retNormal (.scalar ⟨84, 4⟩) s'.memory := by
+  intro initSlots s0
+  have hRun :
+      runLoweredCfgSteps witnessInlineIntrinsicsEnv witnessInlineIntrinsicsBody 12 0 initSlots none =
+        some (.returned (.scalar ⟨84, 4⟩)) := by
+    with_unfolding_all rfl
+  have hCorr : StateCorr witnessInlineIntrinsicsEnv 0 initSlots s0 :=
+    ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+  exact ⟨hRun, runLoweredCfgSteps_refines_trusted witnessInlineIntrinsics_bodyCorr
+    (fun _ => rfl) 12 0 initSlots none s0 (.returned (.scalar ⟨84, 4⟩)) hCorr hRun⟩
+
+/-- 4-block concrete lowered body exercising pointer-pointee inline intrinsics
+`arith_offset::<u32>`, `size_of_val::<u32>`, and `align_of_val::<u32>`. -/
+def witnessPtrIntrinsicsBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::arith_offset" [.uint .u32])
+        [.copy ⟨1, []⟩, ep2ConstSc ep2TyIsize 2 8]
+        ⟨2, []⟩ ep2TyRawConstU32 (some 1) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::size_of_val" [.uint .u32])
+        [.copy ⟨2, []⟩] ⟨3, []⟩ ep2TyUsize (some 2) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "core::intrinsics::align_of_val" [.uint .u32])
+        [.copy ⟨2, []⟩] ⟨0, []⟩ ep2TyUsize (some 3) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+def witnessPtrIntrinsicsDecls : List LocalDecl :=
+  [ep2Decl ep2TyUsize, ep2Decl ep2TyRawConstU32, ep2Decl ep2TyRawConstU32, ep2Decl ep2TyUsize]
+
+def witnessPtrIntrinsicsCm : CapturedMir :=
+  ep2MakeCaptured "witness::ptr_intrinsics" 1 witnessPtrIntrinsicsDecls witnessPtrIntrinsicsBody
+
+def witnessPtrIntrinsicsEnv : CfgEnv :=
+  ep2MakeEnv witnessPtrIntrinsicsDecls
+
+theorem witnessPtrIntrinsics_bodyCorr :
+    BodyCorr witnessPtrIntrinsicsEnv witnessPtrIntrinsicsBody witnessPtrIntrinsicsCm where
+  phase _ h := nomatch h
+  layouts := rfl
+  block i b hb := by
+    match i with
+    | 0 | 1 | 2 | 3 =>
+      simp only [witnessPtrIntrinsicsBody, List.getElem?_cons_zero,
+        List.getElem?_cons_succ, Option.some.injEq] at hb
+      subst hb
+      refine ⟨rfl, ?_, "", rfl⟩
+      first
+      | trivial
+      | dsimp only [LTerminator.Refinable]
+        refine ⟨⟨_, _, _, _, rfl, rfl, trustedSupportsIntrinsicDefPath_of_check (by decide)⟩,
+          ?_, rfl⟩
+        intro arg hMem
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hMem
+        rcases hMem with rfl | rfl <;> first | trivial | (intro _ hc; nomatch hc)
+    | n + 4 =>
+      simp [witnessPtrIntrinsicsBody] at hb
+
+/-- **Concrete Non-Vacuity Witness 1b (`witness_ptr_intrinsics_cfg_refines_trusted`)**:
+executes `arith_offset::<u32>(ptr(alloc=1, off=4), 2_isize) -> ptr(alloc=1, off=12)`,
+`size_of_val::<u32> -> 4_usize`, and `align_of_val::<u32> -> 4_usize` through `runLoweredCfgSteps`
+and proves `TrustedRun` refinement. -/
+theorem witness_ptr_intrinsics_cfg_refines_trusted :
+    let p0 : ProvenancePtr := { allocId := 1, offsetBytes := 4 }
+    let initSlots : List LocalSlotState := [.uninit, .init (.ptr p0 8), .uninit, .uninit]
+    let s0 : MachineState :=
+      { (initMachineState witnessPtrIntrinsicsCm [.ptr p0 8]) with
+        frame := ⟨0, 0, [.uninit, .init (.ptr p0 8), .uninit, .uninit]⟩ }
+    evalLIntrinsicValue .arithOffset [.uint .u32] witnessPtrIntrinsicsDecls emptyLayoutTable
+        [.copy ⟨1, []⟩, ep2ConstSc ep2TyIsize 2 8]
+        [.ptr p0 8, .scalar ⟨2, 8⟩] true =
+      some (.ptr { allocId := 1, offsetBytes := 12 } 8) ∧
+    evalLIntrinsicValue .sizeOfVal [.uint .u32] witnessPtrIntrinsicsDecls emptyLayoutTable
+        [.copy ⟨2, []⟩] [.ptr { allocId := 1, offsetBytes := 12 } 8] true =
+      some (.scalar ⟨4, 8⟩) ∧
+    runLoweredCfgSteps witnessPtrIntrinsicsEnv witnessPtrIntrinsicsBody 6 0 initSlots none =
+        some (.returned (.scalar ⟨4, 8⟩)) ∧
+    ∃ s',
+      TrustedRun witnessPtrIntrinsicsCm s0 s' ∧
+      stepMirFn witnessPtrIntrinsicsCm s' = .retNormal (.scalar ⟨4, 8⟩) s'.memory := by
+  intro p0 initSlots s0
+  have hArith :
+      evalLIntrinsicValue .arithOffset [.uint .u32] witnessPtrIntrinsicsDecls emptyLayoutTable
+        [.copy ⟨1, []⟩, ep2ConstSc ep2TyIsize 2 8]
+        [.ptr p0 8, .scalar ⟨2, 8⟩] true =
+      some (.ptr { allocId := 1, offsetBytes := 12 } 8) := by
+    with_unfolding_all rfl
+  have hSz :
+      evalLIntrinsicValue .sizeOfVal [.uint .u32] witnessPtrIntrinsicsDecls emptyLayoutTable
+        [.copy ⟨2, []⟩] [.ptr { allocId := 1, offsetBytes := 12 } 8] true =
+      some (.scalar ⟨4, 8⟩) := by
+    with_unfolding_all rfl
+  have hRun :
+      runLoweredCfgSteps witnessPtrIntrinsicsEnv witnessPtrIntrinsicsBody 6 0 initSlots none =
+        some (.returned (.scalar ⟨4, 8⟩)) := by
+    with_unfolding_all rfl
+  have hCorr : StateCorr witnessPtrIntrinsicsEnv 0 initSlots s0 :=
+    ⟨rfl, rfl, by simp [initSlots, s0, SlotsRefine, SlotBelow], rfl, rfl, rfl,
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+  exact ⟨hArith, hSz, hRun,
+    runLoweredCfgSteps_refines_trusted witnessPtrIntrinsics_bodyCorr (fun _ => rfl)
+      6 0 initSlots none s0 (.returned (.scalar ⟨4, 8⟩)) hCorr hRun⟩
+
+/-- **Concrete Non-Vacuity Witness 1c (`witness_call_writeBytes_and_copyNonOverlapping_subplace`)**:
+call-form `write_bytes::<u32>(dst, 0xAB_u8, 1_usize)` writes `0xABABABAB_u32` into field `.1` of an
+initialized `(u32, u32)` local (preserving sibling `.0 = 7` and refining Trusted's
+`writePlaceValue`), and `count = 0` is a checked no-op. -/
+theorem witness_call_writeBytes_and_copyNonOverlapping_subplace :
+    let dstPtr : SynPtr := ⟨0x1004, some (1, 0)⟩
+    let resolve : SynPtr → Bool → Except DerefErr (Nat × List ProjectionElem) :=
+      fun p _ => if p.addr == 0x1004 then .ok (0, [.field 1 ep2TyU32]) else .error .ub
+    let slots0 : List LocalSlotState :=
+      [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .uninit]
+    let locals0 : List LocalSlot :=
+      [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]), .uninit]
+    let slotsAfter : List LocalSlotState :=
+      [.init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨0xABABABAB, 4⟩]), .uninit]
+    evalWriteBytesSubplace (fun _ _ _ => none)
+        (fun _ => { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 })
+        false 64 slots0 resolve dstPtr 0xAB 1 4 4 = some slotsAfter ∧
+    evalWriteBytesSubplace (fun _ _ _ => none)
+        (fun _ => { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 })
+        false 64 slots0 resolve dstPtr 0xAB 0 4 4 = some slots0 ∧
+    ∃ localsAfter,
+      writePlaceValue locals0 [] ⟨0, [.field 1 ep2TyU32]⟩ (.scalar ⟨0xABABABAB, 4⟩) =
+        .ok localsAfter ∧
+      SlotsRefine SlotBelow slotsAfter localsAfter := by
+  intro dstPtr resolve slots0 locals0 slotsAfter
+  have hChk1 : writeBytesChecks 64 dstPtr.toCopyPtr 0xAB 1 4 4 = true := by decide
+  have hChk0 : writeBytesChecks 64 dstPtr.toCopyPtr 0xAB 0 4 4 = true := by decide
+  have hWB :
+      evalWriteBytesSubplace (fun _ _ _ => none)
+        (fun _ => { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 })
+        false 64 slots0 resolve dstPtr 0xAB 1 4 4 = some slotsAfter := by
+    unfold evalWriteBytesSubplace
+    rw [hChk1]
+    with_unfolding_all rfl
+  have hWB0 :
+      evalWriteBytesSubplace (fun _ _ _ => none)
+        (fun _ => { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 })
+        false 64 slots0 resolve dstPtr 0xAB 0 4 4 = some slots0 :=
+    evalWriteBytesSubplace_zero_count hChk0
+  have hRel0 : SlotsRefine SlotBelow slots0 locals0 := by
+    simp [slots0, locals0, SlotsRefine, SlotBelow]
+  exact ⟨hWB, hWB0,
+    evalWriteBytesSubplace_refines_writePlaceValue hRel0 (by decide) rfl rfl rfl hWB⟩
+
+/-! #### Witness Suite 2: UB Fault Parity Across All Required Precondition Violations -/
+
+private def ep2SingleCallTerm (defPath : DefPath) (typeArgs : List RigidTy)
+    (args : List Operand) (destTy : Ty) (target : Option Nat) (u : UnwindAction := .continue_) :
+    LTerminator :=
+  .call (ep2FnOp defPath typeArgs) args ⟨0, []⟩ destTy target u
+
+private def ep2SingleCallBody (defPath : DefPath) (typeArgs : List RigidTy)
+    (args : List Operand) (destTy : Ty) (target : Option Nat) (u : UnwindAction := .continue_) :
+    LBody :=
+  ⟨[ ⟨[], ep2SingleCallTerm defPath typeArgs args destTy target u, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- **Concrete Non-Vacuity Witness 2 (`witness_inline_intrinsics_ub_parity`)**:
+concrete `LBody` + `CapturedMir` witnesses proving by kernel reduction that BOTH
+`evalLoweredTerminator = none` AND Trusted's `evalTerminator = MirStepNode.fail .ub` on:
+1. `ctlz_nonzero::<u32>(0_u32)`
+2. `cttz_nonzero::<u32>(0_u32)`
+3. `exact_div::<u32>(7_u32, 2_u32)` (non-zero remainder)
+4. `exact_div::<i32>(7_i32, 0_i32)` (division by zero)
+5. `exact_div::<i8>(-128_i8, -1_i8)` (`INT_MIN / -1` signed overflow)
+6. `unchecked_add::<u8>(255_u8, 1_u8)` (unsigned overflow)
+7. `unchecked_shl::<u32, u32>(1_u32, 32_u32)` (shift count `>= bit_width`)
+8. `unchecked_shl::<u32, i32>(1_u32, -1_i32)` (negative signed shift count)
+9. `core::hint::unreachable_unchecked()` (diverging UB hint). -/
+theorem witness_inline_intrinsics_ub_parity :
+    let envU32 := ep2MakeEnv [ep2Decl ep2TyU32]
+    let cmU32 := ep2MakeCaptured "w" 0 [ep2Decl ep2TyU32] ⟨[]⟩
+    let sU32 : MachineState := initMachineState cmU32 []
+    -- 1. ctlz_nonzero(0)
+    let tCtlz := ep2SingleCallTerm "core::intrinsics::ctlz_nonzero" [.uint .u32]
+      [ep2ConstSc ep2TyU32 0 4] ep2TyU32 (some 1)
+    let bCtlz := ep2SingleCallBody "core::intrinsics::ctlz_nonzero" [.uint .u32]
+      [ep2ConstSc ep2TyU32 0 4] ep2TyU32 (some 1)
+    (evalLoweredTerminator envU32 bCtlz 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tCtlz.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 2. cttz_nonzero(0)
+    let tCttz := ep2SingleCallTerm "core::intrinsics::cttz_nonzero" [.uint .u32]
+      [ep2ConstSc ep2TyU32 0 4] ep2TyU32 (some 1)
+    let bCttz := ep2SingleCallBody "core::intrinsics::cttz_nonzero" [.uint .u32]
+      [ep2ConstSc ep2TyU32 0 4] ep2TyU32 (some 1)
+    (evalLoweredTerminator envU32 bCttz 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tCttz.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 3. exact_div(7u32, 2u32) non-zero remainder
+    let tExRem := ep2SingleCallTerm "core::intrinsics::exact_div" [.uint .u32]
+      [ep2ConstSc ep2TyU32 7 4, ep2ConstSc ep2TyU32 2 4] ep2TyU32 (some 1)
+    let bExRem := ep2SingleCallBody "core::intrinsics::exact_div" [.uint .u32]
+      [ep2ConstSc ep2TyU32 7 4, ep2ConstSc ep2TyU32 2 4] ep2TyU32 (some 1)
+    (evalLoweredTerminator envU32 bExRem 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tExRem.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 4. exact_div(7i32, 0i32) division by zero
+    let tExZero := ep2SingleCallTerm "core::intrinsics::exact_div" [.int .i32]
+      [ep2ConstSc ep2TyI32 7 4, ep2ConstSc ep2TyI32 0 4] ep2TyI32 (some 1)
+    let bExZero := ep2SingleCallBody "core::intrinsics::exact_div" [.int .i32]
+      [ep2ConstSc ep2TyI32 7 4, ep2ConstSc ep2TyI32 0 4] ep2TyI32 (some 1)
+    (evalLoweredTerminator (ep2MakeEnv [ep2Decl ep2TyI32]) bExZero 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tExZero.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 5. exact_div(-128i8, -1i8) INT_MIN / -1 overflow
+    let tExMin := ep2SingleCallTerm "core::intrinsics::exact_div" [.int .i8]
+      [ep2ConstSc ep2TyI8 0x80 1, ep2ConstSc ep2TyI8 0xFF 1] ep2TyI8 (some 1)
+    let bExMin := ep2SingleCallBody "core::intrinsics::exact_div" [.int .i8]
+      [ep2ConstSc ep2TyI8 0x80 1, ep2ConstSc ep2TyI8 0xFF 1] ep2TyI8 (some 1)
+    (evalLoweredTerminator (ep2MakeEnv [ep2Decl ep2TyI8]) bExMin 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tExMin.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 6. unchecked_add(255u8, 1u8) overflow
+    let tUnchAdd := ep2SingleCallTerm "core::intrinsics::unchecked_add" [.uint .u8]
+      [ep2ConstSc ep2TyU8 255 1, ep2ConstSc ep2TyU8 1 1] ep2TyU8 (some 1)
+    let bUnchAdd := ep2SingleCallBody "core::intrinsics::unchecked_add" [.uint .u8]
+      [ep2ConstSc ep2TyU8 255 1, ep2ConstSc ep2TyU8 1 1] ep2TyU8 (some 1)
+    (evalLoweredTerminator (ep2MakeEnv [ep2Decl ep2TyU8]) bUnchAdd 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tUnchAdd.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 7. unchecked_shl(1u32, 32u32) shift >= bit_width
+    let tShl32 := ep2SingleCallTerm "core::intrinsics::unchecked_shl" [.uint .u32, .uint .u32]
+      [ep2ConstSc ep2TyU32 1 4, ep2ConstSc ep2TyU32 32 4] ep2TyU32 (some 1)
+    let bShl32 := ep2SingleCallBody "core::intrinsics::unchecked_shl" [.uint .u32, .uint .u32]
+      [ep2ConstSc ep2TyU32 1 4, ep2ConstSc ep2TyU32 32 4] ep2TyU32 (some 1)
+    (evalLoweredTerminator envU32 bShl32 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tShl32.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 8. unchecked_shl(1u32, -1i32) negative signed shift
+    let tShlNeg := ep2SingleCallTerm "core::intrinsics::unchecked_shl" [.uint .u32, .int .i32]
+      [ep2ConstSc ep2TyU32 1 4, ep2ConstSc ep2TyI32 0xFFFFFFFF 4] ep2TyU32 (some 1)
+    let bShlNeg := ep2SingleCallBody "core::intrinsics::unchecked_shl" [.uint .u32, .int .i32]
+      [ep2ConstSc ep2TyU32 1 4, ep2ConstSc ep2TyI32 0xFFFFFFFF 4] ep2TyU32 (some 1)
+    (evalLoweredTerminator envU32 bShlNeg 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tShlNeg.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) ∧
+    -- 9. core::hint::unreachable_unchecked()
+    let tUnreach := ep2SingleCallTerm "core::hint::unreachable_unchecked" []
+      [] ep2TyNever none .unreachable
+    let bUnreach := ep2SingleCallBody "core::hint::unreachable_unchecked" []
+      [] ep2TyNever none .unreachable
+    (evalLoweredTerminator (ep2MakeEnv [ep2Decl ep2TyNever]) bUnreach 0 [.uninit] none = none ∧
+      evalTerminator sU32 ⟨tUnreach.toTrusted, ""⟩ (some cmU32) = MirStepNode.fail .ub) := by
+  refine ⟨⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩⟩ <;>
+    with_unfolding_all rfl
+
+/-! #### Witness Suite 3: Diverging `abort` (Bypassing Cleanup) vs `panicUnwind` (Entering Cleanup) -/
+
+def witnessAbortCleanupBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::abort" [])
+        [] ⟨0, []⟩ ep2TyNever none (.cleanup 1), false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+def witnessPanicCleanupBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::panicking::panic" [])
+        [] ⟨0, []⟩ ep2TyNever none (.cleanup 1), false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+def witnessDivergingDecls : List LocalDecl := [ep2Decl ep2TyNever]
+def witnessDivergingEnv : CfgEnv := ep2MakeEnv witnessDivergingDecls
+def witnessAbortCleanupCm : CapturedMir :=
+  ep2MakeCaptured "witness::abort_cleanup" 0 witnessDivergingDecls witnessAbortCleanupBody
+def witnessPanicCleanupCm : CapturedMir :=
+  ep2MakeCaptured "witness::panic_cleanup" 0 witnessDivergingDecls witnessPanicCleanupBody
+
+theorem witnessAbortCleanup_bodyCorr :
+    BodyCorr witnessDivergingEnv witnessAbortCleanupBody witnessAbortCleanupCm where
+  phase _ h := nomatch h
+  layouts := rfl
+  block i b hb := by
+    match i with
+    | 0 | 1 =>
+      simp only [witnessAbortCleanupBody, List.getElem?_cons_zero,
+        List.getElem?_cons_succ, Option.some.injEq] at hb
+      subst hb
+      refine ⟨rfl, ?_, "", rfl⟩
+      first
+      | trivial
+      | dsimp only [LTerminator.Refinable]
+        exact ⟨⟨_, _, _, _, rfl, rfl, trustedSupportsIntrinsicDefPath_of_check (by decide)⟩,
+          (fun _ hm => nomatch hm), rfl⟩
+    | n + 2 => simp [witnessAbortCleanupBody] at hb
+
+theorem witnessPanicCleanup_bodyCorr :
+    BodyCorr witnessDivergingEnv witnessPanicCleanupBody witnessPanicCleanupCm where
+  phase _ h := nomatch h
+  layouts := rfl
+  block i b hb := by
+    match i with
+    | 0 | 1 =>
+      simp only [witnessPanicCleanupBody, List.getElem?_cons_zero,
+        List.getElem?_cons_succ, Option.some.injEq] at hb
+      subst hb
+      refine ⟨rfl, ?_, "", rfl⟩
+      first
+      | trivial
+      | dsimp only [LTerminator.Refinable]
+        exact ⟨⟨_, _, _, _, rfl, rfl, trustedSupportsIntrinsicDefPath_of_check (by decide)⟩,
+          (fun _ hm => nomatch hm), rfl⟩
+    | n + 2 => simp [witnessPanicCleanupBody] at hb
+
+/-- **Concrete Non-Vacuity Witness 3 (`witness_diverging_abort_vs_panicUnwind`)**:
+on identical 2-block CFGs with `UnwindAction.cleanup 1` (`bb1: unwindResume`):
+- `core::intrinsics::abort` terminates immediately at `bb0` (`some (.terminated 0)` /
+  `.retOutcome .abort`), bypassing cleanup block `bb1`;
+- `core::panicking::panic` transitions into cleanup block `bb1` on step 1
+  (`some (.goto 1 [.uninit] (some 0))`), then unwinds at `bb1` to `some (.panicked 0)` and
+  refines `TrustedRun` to `stepMirFn = .retOutcome .panic`. -/
+theorem witness_diverging_abort_vs_panicUnwind :
+    let sAbort := initMachineState witnessAbortCleanupCm []
+    let sPanic := initMachineState witnessPanicCleanupCm []
+    evalLoweredTerminator witnessDivergingEnv witnessAbortCleanupBody 0 [.uninit] none =
+        some (.terminated 0) ∧
+      runLoweredCfgSteps witnessDivergingEnv witnessAbortCleanupBody 4 0 [.uninit] none =
+        some (.terminated 0) ∧
+      stepMirFn witnessAbortCleanupCm sAbort = .retOutcome .abort ∧
+      evalLoweredTerminator witnessDivergingEnv witnessPanicCleanupBody 0 [.uninit] none =
+        some (.goto 1 [.uninit] (some 0)) ∧
+      runLoweredCfgSteps witnessDivergingEnv witnessPanicCleanupBody 4 0 [.uninit] none =
+        some (.panicked 0) ∧
+      ∃ s',
+        TrustedRun witnessPanicCleanupCm sPanic s' ∧
+        stepMirFn witnessPanicCleanupCm s' = .retOutcome .panic := by
+  intro sAbort sPanic
+  have hAbStep :
+      evalLoweredTerminator witnessDivergingEnv witnessAbortCleanupBody 0 [.uninit] none =
+        some (.terminated 0) := by with_unfolding_all rfl
+  have hAbRun :
+      runLoweredCfgSteps witnessDivergingEnv witnessAbortCleanupBody 4 0 [.uninit] none =
+        some (.terminated 0) := by with_unfolding_all rfl
+  have hAbT : stepMirFn witnessAbortCleanupCm sAbort = .retOutcome .abort := by
+    with_unfolding_all rfl
+  have hPanStep :
+      evalLoweredTerminator witnessDivergingEnv witnessPanicCleanupBody 0 [.uninit] none =
+        some (.goto 1 [.uninit] (some 0)) := by with_unfolding_all rfl
+  have hPanRun :
+      runLoweredCfgSteps witnessDivergingEnv witnessPanicCleanupBody 4 0 [.uninit] none =
+        some (.panicked 0) := by with_unfolding_all rfl
+  have hCorrP : StateCorr witnessDivergingEnv 0 [.uninit] sPanic :=
+    ⟨rfl, rfl, by simp [sPanic, initMachineState, initLocalsAux, witnessPanicCleanupCm,
+      ep2MakeCaptured, witnessDivergingDecls, SlotsRefine, SlotBelow], rfl, rfl, rfl,
+      fun _ _ _ _ => lookupCallee_eq_none_of_findCallee_none rfl rfl⟩
+  exact ⟨hAbStep, hAbRun, hAbT, hPanStep, hPanRun,
+    runLoweredCfgSteps_refines_trusted witnessPanicCleanup_bodyCorr (fun _ => rfl)
+      4 0 [.uninit] none sPanic (.panicked 0) hCorrP hPanRun⟩
+
+/-! #### Witness Suite 4: Multi-Callee `LCallTable` 2-Deep Call Chain, Panicking Callee Caught by Caller Cleanup, Diverging Callee & Max-Depth Guard -/
+
+/-- `leaf(y: u32) -> u32`: `_0 = unchecked_add::<u32>(copy _1, 10_u32); return`. -/
+def witnessLeafBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::unchecked_add" [.uint .u32])
+        [.copy ⟨1, []⟩, ep2ConstSc ep2TyU32 10 4] ⟨0, []⟩ ep2TyU32 (some 1) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- `mid(x: u32) -> u32`: `_0 = exact_div::<u32>(copy _1, 2_u32); _0 = leaf(copy _0); return`. -/
+def witnessMidBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::intrinsics::exact_div" [.uint .u32])
+        [.copy ⟨1, []⟩, ep2ConstSc ep2TyU32 2 4] ⟨0, []⟩ ep2TyU32 (some 1) .continue_, false⟩
+   , ⟨[], .call (ep2FnOp "witness::leaf" [])
+        [.copy ⟨0, []⟩] ⟨0, []⟩ ep2TyU32 (some 2) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- `root(a: u32) -> u32`: `_0 = mid(copy _1); return`. -/
+def witnessRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::mid" [])
+        [.copy ⟨1, []⟩] ⟨0, []⟩ ep2TyU32 (some 1) .continue_, false⟩
+   , ⟨[], .return_, false⟩ ]⟩
+
+/-- `panic_callee() -> u32`: panics via `core::panicking::panic` with `.continue_`. -/
+def witnessPanicCalleeBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "core::panicking::panic" [])
+        [] ⟨0, []⟩ ep2TyNever none .continue_, false⟩ ]⟩
+
+/-- `catch_root() -> u32`: calls `panic_callee()` with `UnwindAction.cleanup 2`; `bb2` is a cleanup
+block ending in `unwindResume`. -/
+def witnessCatchRootBody : LBody :=
+  ⟨[ ⟨[], .call (ep2FnOp "witness::panic_callee" [])
+        [] ⟨0, []⟩ ep2TyU32 (some 1) (.cleanup 2), false⟩
+   , ⟨[], .return_, false⟩
+   , ⟨[], .unwindResume, true⟩ ]⟩
+
+def witnessDecls2U32 : List LocalDecl := [ep2Decl ep2TyU32, ep2Decl ep2TyU32]
+def witnessDecls3U32 : List LocalDecl := [ep2Decl ep2TyU32, ep2Decl ep2TyU32, ep2Decl ep2TyU32]
+def witnessDecls1U32 : List LocalDecl := [ep2Decl ep2TyU32]
+
+def witnessLeafCm : CapturedMir := ep2MakeCaptured "witness::leaf" 1 witnessDecls2U32 witnessLeafBody
+def witnessMidCm : CapturedMir := ep2MakeCaptured "witness::mid" 1 witnessDecls2U32 witnessMidBody
+def witnessRootCm : CapturedMir := ep2MakeCaptured "witness::root" 1 witnessDecls2U32 witnessRootBody
+def witnessPanicCalleeCm : CapturedMir :=
+  ep2MakeCaptured "witness::panic_callee" 0 witnessDivergingDecls witnessPanicCalleeBody
+def witnessCatchRootCm : CapturedMir :=
+  ep2MakeCaptured "witness::catch_root" 0 witnessDecls1U32 witnessCatchRootBody
+
+/-- Self-consistent `LCallTable` linking `witness::mid`, `witness::leaf`, and
+`witness::panic_callee`, whose `isSome` map is independent of inner `env`s so
+`callee.env.callTargetOf = extractLinkedLCallTarget_V2026_06_01? (witnessLinkedTable maxDepth)`! -/
+private def witnessIsLinkedSym (sym : String) (typeArgs : List RigidTy) : Bool :=
+  typeArgs.isEmpty &&
+    (stringEq sym "witness::leaf" || stringEq sym "witness::mid" ||
+      stringEq sym "witness::panic_callee")
+
+private def witnessLinkedCallTargetOf (func : Operand) : Option LCallTarget :=
+  match extractCalleeDefPath? func with
+  | some defPath =>
+    let typeArgs := extractCalleeTypeArgs func
+    some (classifyLinkedCallTarget_V2026_06_01 (witnessIsLinkedSym defPath typeArgs)
+      defPath typeArgs)
+  | none => none
+
+def witnessLeafEnv : CfgEnv :=
+  { ep2MakeEnv witnessDecls2U32 with callTargetOf := witnessLinkedCallTargetOf }
+def witnessMidEnv : CfgEnv :=
+  { ep2MakeEnv witnessDecls2U32 with callTargetOf := witnessLinkedCallTargetOf }
+def witnessRootEnv : CfgEnv :=
+  { ep2MakeEnv witnessDecls2U32 with callTargetOf := witnessLinkedCallTargetOf }
+def witnessPanicCalleeEnv : CfgEnv :=
+  { ep2MakeEnv witnessDivergingDecls with callTargetOf := witnessLinkedCallTargetOf }
+def witnessCatchRootEnv : CfgEnv :=
+  { ep2MakeEnv witnessDecls1U32 with callTargetOf := witnessLinkedCallTargetOf }
+
+def witnessLinkedTable (maxDepth : Nat := 8) : LCallTable where
+  maxCallDepth := maxDepth
+  lookup sym typeArgs :=
+    if !typeArgs.isEmpty then none
+    else if stringEq sym "witness::leaf" then
+      some ⟨1, 2, witnessLeafEnv, witnessLeafBody⟩
+    else if stringEq sym "witness::mid" then
+      some ⟨1, 2, witnessMidEnv, witnessMidBody⟩
+    else if stringEq sym "witness::panic_callee" then
+      some ⟨0, 1, witnessPanicCalleeEnv, witnessPanicCalleeBody⟩
+    else none
+
+private theorem witnessLinkedCallTargetOf_eq (maxDepth : Nat) :
+    witnessLinkedCallTargetOf = extractLinkedLCallTarget_V2026_06_01? (witnessLinkedTable maxDepth) := by
+  funext func
+  unfold witnessLinkedCallTargetOf extractLinkedLCallTarget_V2026_06_01?
+  cases extractCalleeDefPath? func with
+  | none => rfl
+  | some dp =>
+    dsimp only
+    have hIsSome :
+        ((witnessLinkedTable maxDepth).lookup dp (extractCalleeTypeArgs func)).isSome =
+          witnessIsLinkedSym dp (extractCalleeTypeArgs func) := by
+      unfold witnessLinkedTable witnessIsLinkedSym
+      dsimp only
+      cases (extractCalleeTypeArgs func).isEmpty <;>
+        cases stringEq dp "witness::leaf" <;>
+        cases stringEq dp "witness::mid" <;>
+        cases stringEq dp "witness::panic_callee" <;> rfl
+    rw [hIsSome]
+
+private theorem witnessNoStatementsTrustedRun {rootCm : CapturedMir} {i : Nat} {s : MachineState} :
+    { s with frame := ⟨i, ([] : List Statement).length, s.frame.locals⟩ } = s →
+    TrustedRun rootCm s { s with frame := ⟨i, ([] : List Statement).length, s.frame.locals⟩ } := by
+  intro hEq; rw [hEq]; exact .refl s
+
+private theorem witnessLeaf_multiBodyCorr (rootCm : CapturedMir) (maxDepth : Nat) :
+    MultiBodyCorr (witnessLinkedTable maxDepth) rootCm emptyLayoutTable []
+      witnessLeafEnv witnessLeafBody witnessLeafCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessLinkedCallTargetOf_eq maxDepth
+  block i b hb := by
+    match i with
+    | 0 | 1 =>
+      simp only [witnessLeafBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      · first
+        | trivial
+        | dsimp only [LTerminator.MultiRefinable]
+          refine ⟨?_, rfl, ⟨_, _, _, rfl,
+            Or.inr ⟨rfl, .uncheckedAdd, rfl,
+              trustedSupportsIntrinsicDefPath_of_check (by decide)⟩⟩⟩
+          intro arg hm
+          simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+          rcases hm with rfl | rfl <;> first | trivial | (intro _ hc; nomatch hc)
+      · injection hEv with hEq; subst hEq
+        refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
+    | n + 2 => simp [witnessLeafBody] at hb
+
+private theorem witnessMid_multiBodyCorr (rootCm : CapturedMir) (maxDepth : Nat) :
+    MultiBodyCorr (witnessLinkedTable maxDepth) rootCm emptyLayoutTable []
+      witnessMidEnv witnessMidBody witnessMidCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessLinkedCallTargetOf_eq maxDepth
+  block i b hb := by
+    match i with
+    | 0 | 1 | 2 =>
+      simp only [witnessMidBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      · first
+        | trivial
+        | dsimp only [LTerminator.MultiRefinable]
+          refine ⟨?_, rfl, ⟨_, _, _, rfl,
+            Or.inr ⟨rfl, .exactDiv, rfl,
+              trustedSupportsIntrinsicDefPath_of_check (by decide)⟩⟩⟩
+          intro arg hm
+          simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+          rcases hm with rfl | rfl <;> first | trivial | (intro _ hc; nomatch hc)
+        | dsimp only [LTerminator.MultiRefinable]
+          refine ⟨?_, rfl, ⟨_, _, _, rfl, Or.inl rfl⟩⟩
+          intro arg hm
+          simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+          subst hm; intro _ hc; nomatch hc
+      · injection hEv with hEq; subst hEq
+        refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
+    | n + 3 => simp [witnessMidBody] at hb
+
+private theorem witnessRoot_multiBodyCorr (maxDepth : Nat) :
+    MultiBodyCorr (witnessLinkedTable maxDepth) witnessRootCm emptyLayoutTable []
+      witnessRootEnv witnessRootBody witnessRootCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessLinkedCallTargetOf_eq maxDepth
+  block i b hb := by
+    match i with
+    | 0 | 1 =>
+      simp only [witnessRootBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      · first
+        | trivial
+        | dsimp only [LTerminator.MultiRefinable]
+          refine ⟨?_, rfl, ⟨_, _, _, rfl, Or.inl rfl⟩⟩
+          intro arg hm
+          simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+          subst hm; intro _ hc; nomatch hc
+      · injection hEv with hEq; subst hEq
+        refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
+    | n + 2 => simp [witnessRootBody] at hb
+
+private theorem witnessPanicCallee_multiBodyCorr (rootCm : CapturedMir) (maxDepth : Nat) :
+    MultiBodyCorr (witnessLinkedTable maxDepth) rootCm emptyLayoutTable []
+      witnessPanicCalleeEnv witnessPanicCalleeBody witnessPanicCalleeCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessLinkedCallTargetOf_eq maxDepth
+  block i b hb := by
+    match i with
+    | 0 =>
+      simp only [witnessPanicCalleeBody, List.getElem?_cons_zero, Option.some.injEq] at hb
+      subst hb
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      · dsimp only [LTerminator.MultiRefinable]
+        exact ⟨(fun _ hm => nomatch hm), rfl, ⟨_, _, _, rfl,
+          Or.inr ⟨rfl, .panicUnwind, rfl,
+            trustedSupportsIntrinsicDefPath_of_check (by decide)⟩⟩⟩
+      · injection hEv with hEq; subst hEq
+        refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
+    | n + 1 => simp [witnessPanicCalleeBody] at hb
+
+private theorem witnessCatchRoot_multiBodyCorr (maxDepth : Nat) :
+    MultiBodyCorr (witnessLinkedTable maxDepth) witnessCatchRootCm emptyLayoutTable []
+      witnessCatchRootEnv witnessCatchRootBody witnessCatchRootCm where
+  phase _ h := nomatch h
+  cmLayouts := rfl
+  envLayouts := rfl
+  envGlobals := rfl
+  localDecls := rfl
+  ubChecksTrue := rfl
+  callTargetLinked := witnessLinkedCallTargetOf_eq maxDepth
+  block i b hb := by
+    match i with
+    | 0 | 1 | 2 =>
+      simp only [witnessCatchRootBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
+        Option.some.injEq] at hb
+      subst hb
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      · first
+        | trivial
+        | dsimp only [LTerminator.MultiRefinable]
+          exact ⟨(fun _ hm => nomatch hm), rfl, ⟨_, _, _, rfl, Or.inl rfl⟩⟩
+      · injection hEv with hEq; subst hEq
+        refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
+        rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
+    | n + 3 => simp [witnessCatchRootBody] at hb
+
+private def witnessTrustedCallees : List CapturedMir :=
+  [witnessLeafCm, witnessMidCm, witnessPanicCalleeCm]
+
+private theorem listByteEq_refl : ∀ (xs : List UInt8), listByteEq xs xs = true
+  | [] => rfl
+  | b :: bs => by simp [listByteEq, listByteEq_refl bs]
+
+private theorem stringEq_symm_of_literal {dp lit : String} (hLit : stringEq lit lit = true) :
+    stringEq lit dp = stringEq dp lit := by
+  cases h : stringEq dp lit with
+  | true =>
+    have hc := stringEq_congr_left h dp
+    rw [← hc]
+    exact listByteEq_refl _
+  | false =>
+    cases h2 : stringEq lit dp with
+    | false => rfl
+    | true =>
+      have hc := stringEq_congr_left h2 lit
+      rw [← hc, hLit] at h
+      nomatch h
+
+private theorem witnessLinkedTable_corr (rootCm : CapturedMir) (maxDepth : Nat) :
+    CallTableCorr (witnessLinkedTable maxDepth) rootCm emptyLayoutTable []
+      witnessTrustedCallees [] where
+  linked dp tys callee hLk := by
+    unfold witnessLinkedTable at hLk
+    cases hE : tys.isEmpty with
+    | false => simp [hE] at hLk
+    | true =>
+      have hNil : tys = [] := List.isEmpty_iff.mp hE
+      subst hNil
+      simp only [List.isEmpty_nil, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hLk
+      have hSymLeaf : stringEq "witness::leaf" dp = stringEq dp "witness::leaf" :=
+        stringEq_symm_of_literal rfl
+      have hSymMid : stringEq "witness::mid" dp = stringEq dp "witness::mid" :=
+        stringEq_symm_of_literal rfl
+      have hSymPan : stringEq "witness::panic_callee" dp = stringEq dp "witness::panic_callee" :=
+        stringEq_symm_of_literal rfl
+      by_cases h1 : stringEq dp "witness::leaf" = true
+      · simp only [h1, ↓reduceIte, Option.some.injEq] at hLk
+        subst hLk
+        exact ⟨witnessLeafCm, by simp [lookupCallee, resolveCalleeBodyAndArgs?, findCallee?,
+          witnessTrustedCallees, witnessLeafCm, ep2MakeCaptured, hSymLeaf, h1], rfl,
+          witnessLeaf_multiBodyCorr rootCm maxDepth⟩
+      · simp only [Bool.not_eq_true] at h1
+        simp only [h1, Bool.false_eq_true, ↓reduceIte] at hLk
+        by_cases h2 : stringEq dp "witness::mid" = true
+        · simp only [h2, ↓reduceIte, Option.some.injEq] at hLk
+          subst hLk
+          exact ⟨witnessMidCm, by simp [lookupCallee, resolveCalleeBodyAndArgs?, findCallee?,
+            witnessTrustedCallees, witnessLeafCm, witnessMidCm, ep2MakeCaptured, hSymLeaf,
+            hSymMid, h1, h2], rfl,
+            witnessMid_multiBodyCorr rootCm maxDepth⟩
+        · simp only [Bool.not_eq_true] at h2
+          simp only [h2, Bool.false_eq_true, ↓reduceIte] at hLk
+          by_cases h3 : stringEq dp "witness::panic_callee" = true
+          · simp only [h3, ↓reduceIte, Option.some.injEq] at hLk
+            subst hLk
+            exact ⟨witnessPanicCalleeCm, by simp [lookupCallee, resolveCalleeBodyAndArgs?,
+              findCallee?, witnessTrustedCallees, witnessLeafCm, witnessMidCm, witnessPanicCalleeCm,
+              ep2MakeCaptured, hSymLeaf, hSymMid, hSymPan, h1, h2, h3], rfl,
+              witnessPanicCallee_multiBodyCorr rootCm maxDepth⟩
+          · simp only [Bool.not_eq_true] at h3
+            simp [h3] at hLk
+  unlinkedIntrinsic dp tys op _ hIntr := by
+    have hLowerCongr : ∀ (s : String), stringEq s dp = true →
+        lowerIntrinsicKind_V2026_06_01 dp = lowerIntrinsicKind_V2026_06_01 s := by
+      intro s hEq
+      have hCongr : ∀ c, stringEq dp c = stringEq s c :=
+        fun c => (stringEq_congr_left hEq c).symm
+      unfold lowerIntrinsicKind_V2026_06_01 classifyRustIntrinsic? isUnreachableCallTarget
+        isAbortingPanicDefPath isUnwindingPanicDefPath classifyStdIntrinsicAlias_V2026_06_01?
+      simp only [hCongr]
+    have hNeLeaf : stringEq "witness::leaf" dp = false := by
+      cases hEq : stringEq "witness::leaf" dp
+      · rfl
+      · have hL := hLowerCongr "witness::leaf" hEq
+        rw [hL] at hIntr
+        nomatch hIntr
+    have hNeMid : stringEq "witness::mid" dp = false := by
+      cases hEq : stringEq "witness::mid" dp
+      · rfl
+      · have hL := hLowerCongr "witness::mid" hEq
+        rw [hL] at hIntr
+        nomatch hIntr
+    have hNePan : stringEq "witness::panic_callee" dp = false := by
+      cases hEq : stringEq "witness::panic_callee" dp
+      · rfl
+      · have hL := hLowerCongr "witness::panic_callee" hEq
+        rw [hL] at hIntr
+        nomatch hIntr
+    exact lookupCallee_eq_none_of_findCallee_none
+      (by simp [findCallee?, witnessTrustedCallees, witnessLeafCm, witnessMidCm,
+        witnessPanicCalleeCm, ep2MakeCaptured, hNeLeaf, hNeMid, hNePan]) rfl
+
+/-- **Concrete Non-Vacuity Witness 4 (`witness_multi_callee_two_deep_and_unwind`)**:
+1. **2-deep call chain (`root -> mid -> leaf`)**: `root(84_u32)` calls `mid(84_u32)`, which runs
+   `exact_div(84, 2) = 42` and calls `leaf(42_u32)`, which runs `unchecked_add(42, 10) = 52` and
+   returns across both caller frames to `some (.returned (.scalar ⟨52, 4⟩))`, refining
+   `TrustedRun witnessRootCm` (`pushCalleeFrame` -> `pushCalleeFrame` -> `.return_` -> `.return_`
+   -> `.retNormal (.scalar ⟨52, 4⟩)`);
+2. **`maxCallDepthExceeded` vs `outOfFuel`**: running the same `root(84_u32)` with
+   `maxCallDepth := 1` stops at `mid`'s call to `leaf` with `some (.maxCallDepthExceeded 1 1)`,
+   whereas running with `fuel := 2` and `maxCallDepth := 8` stops with `some (.outOfFuel _)`;
+3. **Panicking callee caught by caller `UnwindAction.cleanup`**: `catch_root` calls
+   `panic_callee()`, whose panic unwinds out of `panic_callee`'s frame into `catch_root`'s cleanup
+   block `bb2` and then resumes unwinding to `some (.panicked 0)`, refining
+   `TrustedRun witnessCatchRootCm` (`pushCalleeFrame` -> `unwindFromCallStack` -> `.unwindResume`
+   -> `.retOutcome .panic`). -/
+theorem witness_multi_callee_two_deep_and_unwind :
+    let stRoot : LMultiFrameState :=
+      { activeEnv := witnessRootEnv
+        activeBody := witnessRootBody
+        bb := 0
+        slots := initLCalleeSlots 2 [.scalar ⟨84, 4⟩]
+        unwinding := none
+        stack := [] }
+    let sRoot : MachineState :=
+      initMachineStateWithCallees witnessRootCm [.scalar ⟨84, 4⟩] witnessTrustedCallees
+    let stCatch : LMultiFrameState :=
+      { activeEnv := witnessCatchRootEnv
+        activeBody := witnessCatchRootBody
+        bb := 0
+        slots := initLCalleeSlots 1 []
+        unwinding := none
+        stack := [] }
+    let sCatch : MachineState :=
+      initMachineStateWithCallees witnessCatchRootCm [] witnessTrustedCallees
+    runLoweredWithCallTable (witnessLinkedTable 8) 12 stRoot =
+        some (.returned (.scalar ⟨52, 4⟩)) ∧
+      (∃ s',
+        TrustedRun witnessRootCm sRoot s' ∧
+        stepMirFn witnessRootCm s' = .retNormal (.scalar ⟨52, 4⟩) s'.memory) ∧
+      runLoweredWithCallTable (witnessLinkedTable 1) 12 stRoot =
+        some (.maxCallDepthExceeded 1 1) ∧
+      (∃ stFuel, runLoweredWithCallTable (witnessLinkedTable 8) 2 stRoot =
+        some (.outOfFuel stFuel)) ∧
+      runLoweredWithCallTable (witnessLinkedTable 8) 12 stCatch =
+        some (.panicked 0) ∧
+      (∃ s',
+        TrustedRun witnessCatchRootCm sCatch s' ∧
+        stepMirFn witnessCatchRootCm s' = .retOutcome .panic) := by
+  intro stRoot sRoot stCatch sCatch
+  have hRun2Deep :
+      runLoweredWithCallTable (witnessLinkedTable 8) 12 stRoot =
+        some (.returned (.scalar ⟨52, 4⟩)) := by
+    with_unfolding_all rfl
+  have hDepth1 :
+      runLoweredWithCallTable (witnessLinkedTable 1) 12 stRoot =
+        some (.maxCallDepthExceeded 1 1) := by
+    with_unfolding_all rfl
+  have hFuel2 :
+      ∃ stFuel, runLoweredWithCallTable (witnessLinkedTable 8) 2 stRoot =
+        some (.outOfFuel stFuel) := by
+    with_unfolding_all exact ⟨_, rfl⟩
+  have hRunCatch :
+      runLoweredWithCallTable (witnessLinkedTable 8) 12 stCatch =
+        some (.panicked 0) := by
+    with_unfolding_all rfl
+  have hCorrRoot :
+      MultiFrameStateCorr (witnessLinkedTable 8) witnessRootCm emptyLayoutTable []
+        stRoot sRoot witnessRootCm :=
+    { block := rfl
+      stmt := rfl
+      slots := initLCalleeSlots_below_initLocals witnessRootCm [.scalar ⟨84, 4⟩]
+      active := rfl
+      body := witnessRoot_multiBodyCorr 8
+      stack := trivial
+      globals := rfl
+      tableCorr := witnessLinkedTable_corr witnessRootCm 8 }
+  have hCorrCatch :
+      MultiFrameStateCorr (witnessLinkedTable 8) witnessCatchRootCm emptyLayoutTable []
+        stCatch sCatch witnessCatchRootCm :=
+    { block := rfl
+      stmt := rfl
+      slots := initLCalleeSlots_below_initLocals witnessCatchRootCm []
+      active := rfl
+      body := witnessCatchRoot_multiBodyCorr 8
+      stack := trivial
+      globals := rfl
+      tableCorr := witnessLinkedTable_corr witnessCatchRootCm 8 }
+  exact ⟨hRun2Deep,
+    runLoweredWithCallTable_refines_trusted 12 stRoot sRoot witnessRootCm
+      (.returned (.scalar ⟨52, 4⟩)) hCorrRoot hRun2Deep,
+    hDepth1, hFuel2, hRunCatch,
+    runLoweredWithCallTable_refines_trusted 12 stCatch sCatch witnessCatchRootCm
+      (.panicked 0) hCorrCatch hRunCatch⟩
 
 end Anneal.Mir.AdtAndControl
