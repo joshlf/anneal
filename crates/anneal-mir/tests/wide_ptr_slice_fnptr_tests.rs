@@ -1927,3 +1927,699 @@ fn pointer_coercion_spellings_match_trusted_places() {
         Some(Safety::Safe)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// K. Adversarial Round B1 regressions
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn b1_unsize_and_slice_len_enforce_zst_provenance_and_backing_array_bounds() {
+    for pw in PWS {
+        let dangling = PointerValue::without_provenance(0x40);
+        // 1. Provenance-less ZST reference unsizing: `&[(); 3] -> &[()]` (`len = 3 > 0`,
+        // `byte_len = 0`) faults with `PointerOutOfBounds`, while `&[(); 0] -> &[()]` succeeds.
+        let decls_zst = vec![unit(), rf(slice(unit()), NOT), rf(slice(unit()), NOT)];
+        assert_eq!(
+            run(
+                &decls_zst,
+                &[assign(
+                    1,
+                    unsize(
+                        Operand::Constant(Constant::Ptr(dangling, rf(arr(unit(), 3), NOT))),
+                        rf(slice(unit()), NOT),
+                    ),
+                )],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: 0x40,
+                byte_len: 0,
+            })
+        );
+        let state_zst0 = run(
+            &decls_zst,
+            &[assign(
+                2,
+                unsize(
+                    Operand::Constant(Constant::Ptr(dangling, rf(arr(unit(), 0), NOT))),
+                    rf(slice(unit()), NOT),
+                ),
+            )],
+            pw,
+        )
+        .unwrap();
+        assert_eq!(value(&state_zst0, 2).as_wide_ptr(), Some((dangling, 0)));
+
+        // 2. Provenance-less `Rvalue::Len(*s)` on non-empty `*const [u32]` (`len = 2 > 0`) or
+        // `*const [()]` (`len = 3 > 0`) faults with `PointerOutOfBounds`, while `len == 0`
+        // returns `0`.
+        let decls_len = vec![
+            unit(),
+            raw(u32_ty(), NOT),
+            raw(slice(u32_ty()), NOT),
+            usize_ty(),
+        ];
+        let raw_ptr_const = Operand::Constant(Constant::Ptr(dangling, raw(u32_ty(), NOT)));
+        assert_eq!(
+            run(
+                &decls_len,
+                &[
+                    assign(1, Rvalue::Use(raw_ptr_const.clone())),
+                    assign(
+                        2,
+                        Rvalue::Aggregate(
+                            AggregateKind::RawPtr {
+                                pointee: slice(u32_ty()),
+                                mutability: NOT,
+                            },
+                            vec![copy(1), cusize(2)],
+                        ),
+                    ),
+                    assign(3, Rvalue::Len(deref(2))),
+                ],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: 0x40,
+                byte_len: 8,
+            })
+        );
+        let state_len0 = run(
+            &decls_len,
+            &[
+                assign(1, Rvalue::Use(raw_ptr_const)),
+                assign(
+                    2,
+                    Rvalue::Aggregate(
+                        AggregateKind::RawPtr {
+                            pointee: slice(u32_ty()),
+                            mutability: NOT,
+                        },
+                        vec![copy(1), cusize(0)],
+                    ),
+                ),
+                assign(3, Rvalue::Len(deref(2))),
+            ],
+            pw,
+        )
+        .unwrap();
+        assert_eq!(value(&state_len0, 3), usizev(0));
+
+        // 3. Unsizing `&[u32; 2] -> *const [u32]` (reference source, raw target) still enforces
+        // reference alignment and provenance!
+        let decls_ref_to_raw = vec![unit(), arr(u32_ty(), 4), raw(slice(u32_ty()), NOT)];
+        let misaligned_ref =
+            Operand::Constant(Constant::Ptr(stack_ptr(1, 2), rf(arr(u32_ty(), 2), NOT)));
+        assert_eq!(
+            run(
+                &decls_ref_to_raw,
+                &[
+                    assign(1, array_rv(u32_ty(), &[1, 2, 3, 4])),
+                    assign(2, unsize(misaligned_ref, raw(slice(u32_ty()), NOT))),
+                ],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::MisalignedPointer {
+                addr: base(1) + 2,
+                required_align: 4,
+            })
+        );
+        let dangling_ref =
+            Operand::Constant(Constant::Ptr(dangling, rf(arr(u32_ty(), 2), NOT)));
+        assert_eq!(
+            run(
+                &decls_ref_to_raw,
+                &[assign(2, unsize(dangling_ref, raw(slice(u32_ty()), NOT)))],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: 0x40,
+                byte_len: 8,
+            })
+        );
+
+        // 4. Cross-field unsizing inside `_1: ([u32; 2], [u32; 2])` (16 bytes total) or
+        // over-length ZST unsizing `&[(); 5]` inside `_1: [(); 2]` faults with
+        // `PointerOutOfBounds`.
+        let pair_arr = Ty::Tuple(vec![arr(u32_ty(), 2), arr(u32_ty(), 2)]);
+        let decls_pair = vec![unit(), pair_arr, rf(slice(u32_ty()), NOT)];
+        let init_pair = assign(
+            1,
+            Rvalue::Aggregate(
+                AggregateKind::Tuple,
+                vec![
+                    Operand::Constant(Constant::Int(0, u32_ty())), // dummy replaced below
+                ],
+            ),
+        );
+        let _ = init_pair;
+        let mut state_pair = StatementEvalState::from_local_decls(decls_pair.clone(), pw);
+        state_pair.slots[1] = LocalSlotState::Init(MirValue::Tuple(vec![
+            array_val(u32_ty(), &[1, 2]),
+            array_val(u32_ty(), &[3, 4]),
+        ]));
+        for (off, n) in [(0u64, 3usize), (4u64, 2usize)] {
+            let bad_ptr =
+                Operand::Constant(Constant::Ptr(stack_ptr(1, off), rf(arr(u32_ty(), n), NOT)));
+            let stmt = lower_statement(
+                &assign(2, unsize(bad_ptr, rf(slice(u32_ty()), NOT))),
+                &decls_pair,
+                pw,
+            )
+            .unwrap();
+            assert_eq!(
+                eval_lowered_statement(&stmt, &mut state_pair),
+                Err(RvalueEvalError::PointerOutOfBounds {
+                    addr: base(1) + off,
+                    byte_len: (n as u128) * 4,
+                })
+            );
+        }
+
+        let decls_zst_arr = vec![unit(), arr(unit(), 2), rf(slice(unit()), NOT)];
+        let over_zst =
+            Operand::Constant(Constant::Ptr(stack_ptr(1, 0), rf(arr(unit(), 5), NOT)));
+        assert_eq!(
+            run(
+                &decls_zst_arr,
+                &[
+                    assign(
+                        1,
+                        Rvalue::Repeat(Operand::Constant(Constant::Unit), 2),
+                    ),
+                    assign(2, unsize(over_zst, rf(slice(unit()), NOT))),
+                ],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1),
+                byte_len: 0,
+            })
+        );
+
+        // 5. `Rvalue::Len(*s)` on a slice whose backing local was deinitialized faults with
+        // `UninitializedLocal`.
+        let (decls_uninit, mut stmts_uninit) = slice_frame();
+        stmts_uninit.extend([
+            Statement::Deinit(local(1)),
+            assign(4, Rvalue::Len(deref(3))),
+        ]);
+        assert_eq!(
+            run(&decls_uninit, &stmts_uninit, pw).err(),
+            Some(RvalueEvalError::UninitializedLocal(Local(1)))
+        );
+    }
+}
+
+#[test]
+fn b1_slice_mutability_permissions_reject_mutable_reborrow_and_write_through_shared_or_const() {
+    for pw in PWS {
+        let (mut decls, mut stmts) = slice_frame();
+        // `_7: &[u32] = &*_3`, `_8: *const [u32] = &raw const *_3`.
+        stmts.extend([
+            assign(7, Rvalue::Ref(NOT, deref(3))),
+            assign(8, Rvalue::RawPtr(NOT, deref(3))),
+        ]);
+        let sub = ProjectionElem::Subslice {
+            from: 0,
+            to: 2,
+            from_end: false,
+        };
+        let elem0 = ProjectionElem::ConstantIndex {
+            offset: 0,
+            min_length: 1,
+            from_end: false,
+        };
+        for immut_local in [7usize, 8usize] {
+            // Static rejections: `&mut (*s)`, `&mut (*s)[0..2]`, `&raw mut (*s)[0..2]`,
+            // `&mut (*s)[0]`, `&raw mut (*s)[0]`, `(*s)[0] = 1`, `Deinit((*s)[0])`.
+            assert!(
+                lower_rvalue(&Rvalue::Ref(MUT, deref(immut_local)), &decls, pw).is_err()
+            );
+            assert!(
+                lower_rvalue(
+                    &Rvalue::Ref(MUT, proj(immut_local, vec![ProjectionElem::Deref, sub.clone()])),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(
+                lower_rvalue(
+                    &Rvalue::RawPtr(
+                        MUT,
+                        proj(immut_local, vec![ProjectionElem::Deref, sub.clone()]),
+                    ),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(
+                lower_rvalue(
+                    &Rvalue::Ref(
+                        MUT,
+                        proj(immut_local, vec![ProjectionElem::Deref, elem0.clone()]),
+                    ),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(
+                lower_rvalue(
+                    &Rvalue::RawPtr(
+                        MUT,
+                        proj(immut_local, vec![ProjectionElem::Deref, elem0.clone()]),
+                    ),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(
+                lower_statement(
+                    &Statement::Assign(
+                        proj(immut_local, vec![ProjectionElem::Deref, elem0.clone()]),
+                        Rvalue::Use(cint(1, u32_ty())),
+                    ),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+            assert!(
+                lower_statement(
+                    &Statement::Deinit(proj(
+                        immut_local,
+                        vec![ProjectionElem::Deref, elem0.clone()]
+                    )),
+                    &decls,
+                    pw,
+                )
+                .is_err()
+            );
+
+            // Runtime rejections on hand-built `LoweredRvalue` / `write_place`:
+            let mut state = run(&decls, &stmts, pw).unwrap();
+            let hand_wide_mut = LoweredRvalue::Ref {
+                mutability: MUT,
+                place: proj(immut_local, vec![ProjectionElem::Deref, sub.clone()]),
+                ty: rf(slice(u32_ty()), MUT),
+            };
+            assert!(matches!(
+                eval_lowered_rvalue_in_state(&hand_wide_mut, &mut state),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+            let hand_elem_mut = LoweredRvalue::Ref {
+                mutability: MUT,
+                place: proj(immut_local, vec![ProjectionElem::Deref, elem0.clone()]),
+                ty: rf(u32_ty(), MUT),
+            };
+            assert!(matches!(
+                eval_lowered_rvalue_in_state(&hand_elem_mut, &mut state),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+            assert!(matches!(
+                state.write_place(
+                    &proj(immut_local, vec![ProjectionElem::Deref, elem0.clone()]),
+                    &u32_ty(),
+                    u32v(1),
+                ),
+                Err(RvalueEvalError::TypeMismatch(_))
+            ));
+        }
+
+        // Double-deref `(**_9)[0] = 88` where `_9: &(&mut [u32])` is valid because the last
+        // `Deref` dereferences `&mut [u32]` (`MUT`), whereas `(**_10)[0] = 88` where
+        // `_10: &mut (&[u32])` is rejected because the last `Deref` dereferences `&[u32]` (`NOT`).
+        decls.push(rf(rf(slice(u32_ty()), MUT), NOT)); // _9
+        decls.push(rf(rf(slice(u32_ty()), NOT), MUT)); // _10
+        stmts.push(assign(9, Rvalue::Ref(NOT, local(3))));
+        stmts.push(assign(
+            10,
+            Rvalue::Ref(MUT, local(7)),
+        ));
+        let write_via_9 = Statement::Assign(
+            proj(
+                9,
+                vec![
+                    ProjectionElem::Deref,
+                    ProjectionElem::Deref,
+                    elem0.clone(),
+                ],
+            ),
+            Rvalue::Use(cint(88, u32_ty())),
+        );
+        stmts.push(write_via_9);
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(value(&state, 1), array_val(u32_ty(), &[88, 11, 12, 13]));
+
+        let write_via_10 = Statement::Assign(
+            proj(10, vec![ProjectionElem::Deref, ProjectionElem::Deref, elem0]),
+            Rvalue::Use(cint(99, u32_ty())),
+        );
+        assert!(lower_statement(&write_via_10, &decls, pw).is_err());
+    }
+}
+
+#[test]
+fn b1_empty_and_single_element_scalar_backed_slice_indexing_and_reborrows() {
+    for pw in PWS {
+        let dangling = PointerValue::without_provenance(0x40);
+        // 1. Indexing or element-borrowing an empty provenance-less slice `&[u32] = &[]`
+        // reports `IndexOutOfBounds { len: 0 }` (never `UnsupportedPlaceProjection`).
+        let decls_empty = vec![
+            unit(),
+            rf(slice(u32_ty()), NOT),
+            usize_ty(),
+            u32_ty(),
+            rf(u32_ty(), NOT),
+        ];
+        let empty_init = assign(
+            1,
+            unsize(
+                Operand::Constant(Constant::Ptr(dangling, rf(arr(u32_ty(), 0), NOT))),
+                rf(slice(u32_ty()), NOT),
+            ),
+        );
+        let idx_place = proj(
+            1,
+            vec![ProjectionElem::Deref, ProjectionElem::Index(Local(2))],
+        );
+        assert_eq!(
+            run(
+                &decls_empty,
+                &[
+                    empty_init.clone(),
+                    assign(2, Rvalue::Use(cusize(0))),
+                    assign(3, Rvalue::Use(Operand::Copy(idx_place.clone()))),
+                ],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::IndexOutOfBounds { index: 0, len: 0 })
+        );
+        assert_eq!(
+            run(
+                &decls_empty,
+                &[
+                    empty_init,
+                    assign(2, Rvalue::Use(cusize(0))),
+                    assign(4, Rvalue::Ref(NOT, idx_place)),
+                ],
+                pw,
+            )
+            .err(),
+            Some(RvalueEvalError::IndexOutOfBounds { index: 0, len: 0 })
+        );
+
+        // 2. A 1-element slice constructed over a non-array local (`slice::from_mut(&mut _1)`
+        // where `_1: (u32, u32)`) supports `Len`, `(*s)[0]` reads/writes, field projections,
+        // and element/field reborrows, while faulting with `IndexOutOfBounds` on index 1.
+        let pair_ty = Ty::Tuple(vec![u32_ty(), u32_ty()]);
+        let decls_one = vec![
+            unit(),
+            pair_ty.clone(),
+            raw(pair_ty.clone(), MUT),
+            raw(slice(pair_ty.clone()), MUT),
+            rf(slice(pair_ty.clone()), MUT),
+            usize_ty(),
+            u32_ty(),
+            rf(u32_ty(), NOT),
+        ];
+        let elem0 = ProjectionElem::ConstantIndex {
+            offset: 0,
+            min_length: 1,
+            from_end: false,
+        };
+        let stmts_one = vec![
+            assign(
+                1,
+                Rvalue::Aggregate(
+                    AggregateKind::Tuple,
+                    vec![cint(10, u32_ty()), cint(20, u32_ty())],
+                ),
+            ),
+            assign(2, Rvalue::RawPtr(MUT, local(1))),
+            assign(
+                3,
+                Rvalue::Aggregate(
+                    AggregateKind::RawPtr {
+                        pointee: slice(pair_ty.clone()),
+                        mutability: MUT,
+                    },
+                    vec![copy(2), cusize(1)],
+                ),
+            ),
+            assign(4, Rvalue::Ref(MUT, deref(3))),
+            assign(5, Rvalue::Len(deref(4))),
+            // `(*_4)[0].1 = 77`
+            Statement::Assign(
+                proj(
+                    4,
+                    vec![
+                        ProjectionElem::Deref,
+                        elem0.clone(),
+                        ProjectionElem::Field(1, u32_ty()),
+                    ],
+                ),
+                Rvalue::Use(cint(77, u32_ty())),
+            ),
+            // `_7 = &((*_4)[0].1)`
+            assign(
+                7,
+                Rvalue::Ref(
+                    NOT,
+                    proj(
+                        4,
+                        vec![
+                            ProjectionElem::Deref,
+                            elem0,
+                            ProjectionElem::Field(1, u32_ty()),
+                        ],
+                    ),
+                ),
+            ),
+            assign(6, Rvalue::Use(Operand::Copy(deref(7)))),
+        ];
+        let state_one = run(&decls_one, &stmts_one, pw).unwrap();
+        assert_eq!(value(&state_one, 5), usizev(1));
+        assert_eq!(value(&state_one, 6), u32v(77));
+        assert_eq!(
+            value(&state_one, 1),
+            MirValue::Tuple(vec![u32v(10), u32v(77)])
+        );
+
+        let mut oob_stmts = stmts_one;
+        oob_stmts.extend([
+            assign(5, Rvalue::Use(cusize(1))),
+            assign(
+                7,
+                Rvalue::Ref(
+                    NOT,
+                    proj(
+                        4,
+                        vec![
+                            ProjectionElem::Deref,
+                            ProjectionElem::Index(Local(5)),
+                            ProjectionElem::Field(0, u32_ty()),
+                        ],
+                    ),
+                ),
+            ),
+        ]);
+        assert_eq!(
+            run(&decls_one, &oob_stmts, pw).err(),
+            Some(RvalueEvalError::IndexOutOfBounds { index: 1, len: 1 })
+        );
+    }
+}
+
+#[test]
+fn b1_capturing_closure_upvar_projections_offset_of_and_retag() {
+    for pw in PWS {
+        let ref_u32 = rf(u32_ty(), NOT);
+        let closure_ty = Ty::closure("capturing_closure", vec![ref_u32.clone(), usize_ty()]);
+        let canon_closure_ty = Ty::closure("canon_closure", vec![u32_ty(), u32_ty()]);
+        let decls = vec![
+            unit(),
+            u32_ty(),
+            ref_u32.clone(),
+            closure_ty.clone(),
+            u32_ty(),
+            usize_ty(),
+        ];
+        let stmts = vec![
+            assign(1, Rvalue::Use(cint(42, u32_ty()))),
+            assign(2, Rvalue::Ref(NOT, local(1))),
+            assign(
+                3,
+                Rvalue::Aggregate(
+                    AggregateKind::Closure,
+                    vec![copy(2), cusize(9)],
+                ),
+            ),
+            Statement::Retag(RetagKind::Default, local(3)),
+            // Read `*(_3.0)` and `OffsetOf` of upvar 1 on a canonical closure layout.
+            assign(
+                4,
+                Rvalue::Use(Operand::Copy(proj(
+                    3,
+                    vec![
+                        ProjectionElem::Field(0, ref_u32.clone()),
+                        ProjectionElem::Deref,
+                    ],
+                ))),
+            ),
+            assign(
+                5,
+                Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 1)]), canon_closure_ty),
+            ),
+        ];
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(value(&state, 4), u32v(42));
+        assert_eq!(value(&state, 5), usizev(4));
+
+        // When the local referenced by upvar 0 dies, `Retag` on the closure faults with
+        // `DeadLocal(Local(1))`.
+        let mut dead_stmts = stmts;
+        dead_stmts.extend([
+            Statement::StorageDead(Local(1)),
+            Statement::Retag(RetagKind::Default, local(3)),
+        ]);
+        assert_eq!(
+            run(&decls, &dead_stmts, pw).err(),
+            Some(RvalueEvalError::DeadLocal(Local(1)))
+        );
+    }
+}
+
+#[test]
+fn b1_exposed_multiple_fn_ptr_provenances_recover_matching_callee_on_int_to_ptr_and_transmute() {
+    for pw in PWS {
+        let f_ty = fn_ty(vec![u32_ty()], u32_ty());
+        let add_one_body = {
+            let body = Body {
+                local_decls: vec![u32_ty(), u32_ty()],
+                basic_blocks: vec![block(
+                    vec![assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Add, copy(1), cint(1, u32_ty())),
+                    )],
+                    Terminator::Return,
+                )],
+            };
+            lower_body(&body, pw).unwrap()
+        };
+        let table = CallTable::new()
+            .with_callee("double", 1, double_body(pw))
+            .with_callee("add_one", 1, add_one_body);
+
+        // Expose both `double` and `add_one` (in that order), then recover each from its
+        // exposed integer address in reverse order (`add_one` first, then `double`) via
+        // `PointerWithExposedProvenance` -> `Transmute` -> `fn(u32) -> u32`, and call both!
+        let body = Body {
+            local_decls: vec![
+                u32_ty(),             // _0: return
+                u32_ty(),             // _1: arg
+                f_ty.clone(),         // _2: double fn ptr
+                f_ty.clone(),         // _3: add_one fn ptr
+                usize_ty(),           // _4: exposed addr of double
+                usize_ty(),           // _5: exposed addr of add_one
+                raw(unit(), NOT),     // _6: recovered *const () for add_one
+                raw(unit(), NOT),     // _7: recovered *const () for double
+                f_ty.clone(),         // _8: transmuted add_one fn ptr
+                f_ty.clone(),         // _9: transmuted double fn ptr
+                u32_ty(),             // _10: intermediate call result
+            ],
+            basic_blocks: vec![
+                block(
+                    vec![
+                        Statement::StorageLive(Local(2)),
+                        Statement::StorageLive(Local(3)),
+                        Statement::StorageLive(Local(4)),
+                        Statement::StorageLive(Local(5)),
+                        Statement::StorageLive(Local(6)),
+                        Statement::StorageLive(Local(7)),
+                        Statement::StorageLive(Local(8)),
+                        Statement::StorageLive(Local(9)),
+                        Statement::StorageLive(Local(10)),
+                        assign(
+                            2,
+                            reify(
+                                PointerCoercionKind::ReifyFnPointer,
+                                Operand::callee("double"),
+                                f_ty.clone(),
+                            ),
+                        ),
+                        assign(
+                            3,
+                            reify(
+                                PointerCoercionKind::ReifyFnPointer,
+                                Operand::callee("add_one"),
+                                f_ty.clone(),
+                            ),
+                        ),
+                        assign(
+                            4,
+                            cast(CastKind::PointerExposeProvenance, copy(2), usize_ty()),
+                        ),
+                        assign(
+                            5,
+                            cast(CastKind::PointerExposeProvenance, copy(3), usize_ty()),
+                        ),
+                        assign(
+                            6,
+                            cast(
+                                CastKind::PointerWithExposedProvenance,
+                                copy(5),
+                                raw(unit(), NOT),
+                            ),
+                        ),
+                        assign(
+                            7,
+                            cast(
+                                CastKind::PointerWithExposedProvenance,
+                                copy(4),
+                                raw(unit(), NOT),
+                            ),
+                        ),
+                        assign(8, cast(CastKind::Transmute, copy(6), f_ty.clone())),
+                        assign(9, cast(CastKind::Transmute, copy(7), f_ty.clone())),
+                    ],
+                    Terminator::Call {
+                        func: copy(8),
+                        args: vec![copy(1)],
+                        destination: local(10),
+                        target: Some(1),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                block(
+                    vec![],
+                    Terminator::Call {
+                        func: copy(9),
+                        args: vec![copy(10)],
+                        destination: local(0),
+                        target: Some(2),
+                        unwind: UnwindAction::Continue,
+                    },
+                ),
+                block(vec![], Terminator::Return),
+            ],
+        };
+        let lowered = lower_body(&body, pw).unwrap();
+        // `double(add_one(10)) == 22`.
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(&lowered, &[u32v(10)], 100, &table),
+            Ok(CfgEvalOutcome::Returned(u32v(22)))
+        );
+    }
+}
+

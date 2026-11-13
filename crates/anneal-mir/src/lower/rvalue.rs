@@ -525,7 +525,10 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
         };
         cur_ty = match (elem, cur_ty) {
             (ProjectionElem::Deref, Ty::RawPtr(inner, _) | Ty::Ref(inner, _)) => *inner,
-            (ProjectionElem::Field(idx, field_ty), ty @ (Ty::Tuple(_) | Ty::Adt(_))) => {
+            (
+                ProjectionElem::Field(idx, field_ty),
+                ty @ (Ty::Tuple(_) | Ty::Adt(_) | Ty::Closure { .. }),
+            ) => {
                 if projectable_field_tys(&ty, downcast).and_then(|fields| fields.get(*idx))
                     != Some(field_ty)
                 {
@@ -629,10 +632,51 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
 pub(crate) fn projectable_field_tys(ty: &Ty, downcast: Option<usize>) -> Option<&[Ty]> {
     match (ty, downcast) {
         (Ty::Tuple(fields), _) => Some(fields),
+        (Ty::Closure { upvars, .. }, None) => Some(upvars),
         (Ty::Adt(def), None) if !def.is_enum() => def.variant_fields(0),
         (Ty::Adt(def), Some(variant)) if def.is_enum() => def.variant_fields(variant),
         _ => None,
     }
+}
+
+fn tuple_or_closure_fields(ty: &Ty) -> Option<&[Ty]> {
+    match ty {
+        Ty::Tuple(fields) => Some(fields),
+        Ty::Closure { upvars, .. } => Some(upvars),
+        _ => None,
+    }
+}
+
+/// Checks that if `place` projects through any `ProjectionElem::Deref`, the pointer dereferenced
+/// by the last `ProjectionElem::Deref` in `place.projection` is mutable (`Mutability::Mut`).
+///
+/// In Rust MIR, projections before the last `Deref` only read intermediate pointers (e.g.
+/// `(**pp)` where `pp: &(&mut T)` is mutable), whereas the last `Deref` determines whether the
+/// resulting place can be mutated or mutably borrowed.
+fn check_place_last_deref_mutable(
+    place: &Place,
+    local_decls: &[Ty],
+) -> Result<(), RvalueLowerError> {
+    let Some(last_deref_pos) = place
+        .projection
+        .iter()
+        .rposition(|p| matches!(p, ProjectionElem::Deref))
+    else {
+        return Ok(());
+    };
+    let ptr_place = Place {
+        local: place.local,
+        projection: place.projection[..last_deref_pos].to_vec(),
+    };
+    let ptr_ty = resolve_place_ty(&ptr_place, local_decls)?;
+    if !matches!(ptr_ty, Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)) {
+        return Err(RvalueLowerError::InvalidProjection {
+            place: place.clone(),
+            current_ty: ptr_ty,
+            elem: ProjectionElem::Deref,
+        });
+    }
+    Ok(())
 }
 
 /// Returns true if `Downcast(variant)` is statically valid on a place of type `ty`: any variant
@@ -791,7 +835,7 @@ pub fn resolve_offset_of(
             cur_ty = &variant_fields[field_idx];
             continue;
         }
-        let Ty::Tuple(tuple_fields) = cur_ty else {
+        let Some(tuple_fields) = tuple_or_closure_fields(cur_ty) else {
             return Err(invalid_step(cur_ty));
         };
         if variant_idx != 0 || field_idx >= tuple_fields.len() {
@@ -960,12 +1004,10 @@ pub fn lower_rvalue_with_policy(
         }
         Rvalue::Ref(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
-            let ty = Ty::Ref(Box::new(pointee_ty), *mutability);
-            // A reference to an unsized place (`&*s`, `&(*s)[a..b]`) is a wide reference,
-            // whose slice element type must be valid.
-            if !ty.is_thin_ptr() {
-                check_layout(ty.clone(), ptr_width)?;
+            if *mutability == Mutability::Mut {
+                check_place_last_deref_mutable(place, local_decls)?;
             }
+            let ty = check_layout(Ty::Ref(Box::new(pointee_ty), *mutability), ptr_width)?;
             Ok(LoweredRvalue::Ref {
                 mutability: *mutability,
                 place: place.clone(),
@@ -974,10 +1016,10 @@ pub fn lower_rvalue_with_policy(
         }
         Rvalue::RawPtr(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
-            let ty = Ty::RawPtr(Box::new(pointee_ty), *mutability);
-            if !ty.is_thin_ptr() {
-                check_layout(ty.clone(), ptr_width)?;
+            if *mutability == Mutability::Mut {
+                check_place_last_deref_mutable(place, local_decls)?;
             }
+            let ty = check_layout(Ty::RawPtr(Box::new(pointee_ty), *mutability), ptr_width)?;
             Ok(LoweredRvalue::RawPtr {
                 mutability: *mutability,
                 place: place.clone(),
@@ -1325,7 +1367,7 @@ pub fn lower_rvalue_with_policy(
                             "thin RawPtr aggregate second operand must be unit metadata ()",
                         ));
                     }
-                    Ty::RawPtr(Box::new(pointee.clone()), *mutability)
+                    check_layout(Ty::RawPtr(Box::new(pointee.clone()), *mutability), ptr_width)?
                 }
             };
             Ok(LoweredRvalue::Aggregate {
@@ -1452,6 +1494,7 @@ pub fn lower_statement_with_policy(
             if !place_ty.is_sized() {
                 return Err(RvalueLowerError::UnsizedType(place_ty));
             }
+            check_place_last_deref_mutable(place, local_decls)?;
             let lowered = lower_rvalue_with_policy(rvalue, local_decls, ptr_width, policy)?;
             let rvalue_ty = lowered.ty();
 
@@ -1498,6 +1541,7 @@ pub fn lower_statement_with_policy(
             variant_index,
         } => {
             let place_ty = resolve_place_ty(place, local_decls)?;
+            check_place_last_deref_mutable(place, local_decls)?;
             match &place_ty {
                 Ty::Tuple(_) => {}
                 Ty::Adt(def) => {
@@ -1553,6 +1597,7 @@ pub fn lower_statement_with_policy(
             if !place_ty.is_sized() {
                 return Err(RvalueLowerError::UnsizedType(place_ty));
             }
+            check_place_last_deref_mutable(place, local_decls)?;
             Ok(LoweredStatement::Deinit {
                 place: place.clone(),
                 place_ty,
@@ -3012,6 +3057,9 @@ pub fn eval_aggregate(
             pointee,
             mutability,
         } => {
+            let ty = Ty::RawPtr(Box::new(pointee.clone()), *mutability);
+            ty.check_representable(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(&ty, err)))?;
             if operands.len() != 2 {
                 return Err(RvalueEvalError::TypeMismatch(
                     "RawPtr aggregate requires 2 operands (data_ptr_or_addr, unit_metadata)",
@@ -3043,10 +3091,7 @@ pub fn eval_aggregate(
                     ));
                 }
             };
-            Ok(MirValue::Ptr {
-                ptr,
-                ty: Ty::RawPtr(Box::new(pointee.clone()), *mutability),
-            })
+            Ok(MirValue::Ptr { ptr, ty })
         }
     }
 }
@@ -3893,6 +3938,11 @@ fn predict_exposed_provenance_for_decls(
         local_of(prov)
             .is_some_and(|loc| slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))))
     };
+    if let Some(&fn_prov) = tracker.exposed.iter().find(|&&prov| {
+        fn_ptr_symbol(&prov).is_some_and(|sym| u128::from(fn_ptr_addr(&sym)) == addr_bits)
+    }) {
+        return Some(fn_prov);
+    }
     if !local_decls.is_empty() {
         if let Some(prov) = match_exposed_local_provenance_for_decls(
             addr_bits,
@@ -3908,7 +3958,8 @@ fn predict_exposed_provenance_for_decls(
         if let Some(&ext) = tracker
             .exposed
             .iter()
-            .find(|&&prov| local_of(prov).is_none())
+            .find(|&&prov| local_of(prov).is_none() && !is_fn_ptr_provenance(&prov))
+            .or_else(|| tracker.exposed.iter().find(|&&prov| local_of(prov).is_none()))
         {
             return Some(ext);
         }
@@ -3917,7 +3968,14 @@ fn predict_exposed_provenance_for_decls(
         .exposed
         .iter()
         .copied()
-        .find(|&prov| !is_dead_local(prov))
+        .find(|&prov| !is_dead_local(prov) && !is_fn_ptr_provenance(&prov))
+        .or_else(|| {
+            tracker
+                .exposed
+                .iter()
+                .copied()
+                .find(|&prov| !is_dead_local(prov))
+        })
 }
 
 /// Evaluates a `LoweredCast` on an evaluated `MirValue` operand under `ptr_width` and `policy`.
@@ -4303,7 +4361,16 @@ fn eval_lowered_cast_with_decls(
                         frame_addr_base,
                         ptr_width,
                     };
-                    check_slice_backing(&frame, ptr, len, target_ty, SliceUse::Create, None)?;
+                    check_slice_backing(
+                        &frame,
+                        ptr,
+                        len,
+                        target_ty,
+                        SliceUse::Unsize {
+                            src_is_ref: src_ty.is_ref(),
+                        },
+                        None,
+                    )?;
                     Ok(MirValue::WidePtr {
                         data: *ptr,
                         len,
@@ -6301,6 +6368,16 @@ pub fn eval_lowered_rvalue(
                                 "Deref projection requires a pointer value with matching pointee type",
                             ));
                         }
+                        if *mutability == Mutability::Mut
+                            && !matches!(
+                                ty,
+                                Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
+                            )
+                        {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "mutable borrow through an immutable pointer",
+                            ));
+                        }
                         let masked_addr = checked_ptr_addr(&ptr, &ty, ptr_width)? as u64;
                         if ty.is_ref() && masked_addr == 0 {
                             return Err(RvalueEvalError::CastEval(
@@ -6332,6 +6409,7 @@ pub fn eval_lowered_rvalue(
                         place,
                         pointee_ty,
                         expected_ref,
+                        *mutability == Mutability::Mut,
                     )?
                 }
             };
@@ -7565,6 +7643,8 @@ impl StatementEvalState {
     /// initialization per field, like `rustc`'s move paths, rather than per byte).
     pub fn deinit_place(&mut self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
         let (target_local, target_proj, index_cache) = self.prepare_place_access(place, place_ty)?;
+        check_place_last_deref_mutable(place, &self.local_decls)
+            .map_err(|_| RvalueEvalError::TypeMismatch("deinit through an immutable pointer"))?;
         if target_proj.is_empty() {
             self.slots[target_local.0] = LocalSlotState::Uninit;
             return Ok(());
@@ -7930,6 +8010,9 @@ enum ProjectedShellRef<'a> {
 fn shell_matches_declared_ty(shell: &PartialAggregate, declared_ty: &Ty) -> bool {
     match declared_ty {
         Ty::Tuple(fields) => shell.adt_def.is_none() && shell.fields.len() == fields.len(),
+        Ty::Closure { upvars, .. } => {
+            shell.adt_def.is_none() && shell.fields.len() == upvars.len()
+        }
         Ty::Adt(def) => {
             !def.is_union()
                 && shell.is_adt
@@ -9676,16 +9759,18 @@ fn retag_value(val: &MirValue, ty: &Ty, ctx: RetagCtx<'_>) -> Result<(), RvalueE
             }
             Ok(())
         }
-        (Ty::Tuple(field_tys), MirValue::Tuple(vals))
-        | (
-            Ty::Tuple(field_tys),
-            MirValue::Adt {
+        (Ty::Closure { upvars, .. }, MirValue::Unit) if upvars.is_empty() => Ok(()),
+        (
+            ty @ (Ty::Tuple(_) | Ty::Closure { .. }),
+            MirValue::Tuple(vals)
+            | MirValue::Adt {
                 active_field: None,
                 fields: vals,
                 adt_def: None,
                 ..
             },
         ) => {
+            let field_tys = tuple_or_closure_fields(ty).unwrap();
             if vals.len() != field_tys.len() {
                 return Err(mismatch());
             }
@@ -9776,6 +9861,7 @@ fn retag_shell(
     }
     let field_tys = match ty {
         Ty::Tuple(fields) => Some(fields.as_slice()),
+        Ty::Closure { upvars, .. } => Some(upvars.as_ref()),
         Ty::Adt(def) => def.variant_fields(shell.variant_idx),
         _ => None,
     };
@@ -10118,9 +10204,12 @@ fn read_frame_place<F: FrameView + ?Sized>(
 /// How a wide pointer's backing memory is used ([`check_slice_backing`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SliceUse {
-    /// Creating a wide pointer (an `Unsize` coercion or a reborrow), which accesses no memory:
+    /// Creating a wide pointer (a reborrow), which accesses no memory:
     /// only a reference must be non-null, aligned, and dereferenceable.
     Create,
+    /// Unsizing `[T; N]` to `[T]` (`src_is_ref` when the source pointer is a reference `&[T; N]`
+    /// / `&mut [T; N]`, even if the target is `*const [T]` / `*mut [T]`).
+    Unsize { src_is_ref: bool },
     /// Dereferencing a wide pointer for a place access or `Rvalue::Len`.
     Access,
 }
@@ -10180,10 +10269,11 @@ fn check_slice_backing(
         }));
     }
     let byte_len = len as u128 * elem_layout.size as u128;
-    let constrained = ptr_ty.is_ref() || use_ == SliceUse::Access;
+    let is_ref_use = ptr_ty.is_ref() || matches!(use_, SliceUse::Unsize { src_is_ref: true });
+    let constrained = is_ref_use || use_ == SliceUse::Access;
     if constrained {
         if addr == 0 {
-            if ptr_ty.is_ref() {
+            if is_ref_use {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
                     target_ty: ptr_ty.clone(),
                     bits: 0,
@@ -10210,7 +10300,7 @@ fn check_slice_backing(
     }
     match data.provenance {
         Some(prov) if is_fn_ptr_provenance(&prov) => {
-            if constrained && byte_len > 0 {
+            if constrained && (byte_len > 0 || len > 0 || is_ref_use) {
                 return Err(RvalueEvalError::FnPtrMemoryAccess { addr: addr as u64 });
             }
             Ok(())
@@ -10227,9 +10317,14 @@ fn check_slice_backing(
             let (alloc_size, _) = decl_ty
                 .alloc_size_and_align(ptr_width)
                 .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(decl_ty, err)))?;
-            let in_bounds = addr
-                .checked_sub(base)
-                .and_then(|rel| rel.checked_add(byte_len))
+            let Some(rel) = addr.checked_sub(base) else {
+                return Err(RvalueEvalError::PointerOutOfBounds {
+                    addr: addr as u64,
+                    byte_len,
+                });
+            };
+            let in_bounds = rel
+                .checked_add(byte_len)
                 .is_some_and(|end| end <= alloc_size as u128);
             if !in_bounds {
                 return Err(RvalueEvalError::PointerOutOfBounds {
@@ -10237,10 +10332,39 @@ fn check_slice_backing(
                     byte_len,
                 });
             }
+            // When unsizing `[T; N] -> [T]` or when `T` is zero-sized (`byte_len == 0` for any
+            // `len > 0`), check that a local with a committed field layout actually contains a
+            // backing `[T; len]` array/window (or single `T` for a 1-element slice) at `rel`.
+            if constrained
+                && len > 0
+                && (elem_layout.size == 0 || matches!(use_, SliceUse::Unsize { .. }))
+                && (decl_ty.has_canonical_byte_layout(ptr_width) || matches!(decl_ty, Ty::Array(..)))
+            {
+                let Ok(rel_off) = usize::try_from(rel) else {
+                    return Err(RvalueEvalError::PointerOutOfBounds {
+                        addr: addr as u64,
+                        byte_len,
+                    });
+                };
+                let array_ty = Ty::Array(Box::new(elem_ty.clone()), len);
+                let has_backing = (rel_off == 0 && *decl_ty == array_ty)
+                    || !collect_subplace_paths(decl_ty, rel_off, &array_ty, ptr_width).is_empty()
+                    || (len == 1
+                        && !matches!(use_, SliceUse::Unsize { .. })
+                        && ((rel_off == 0 && decl_ty == elem_ty)
+                            || !collect_subplace_paths(decl_ty, rel_off, elem_ty, ptr_width)
+                                .is_empty()));
+                if !has_backing {
+                    return Err(RvalueEvalError::PointerOutOfBounds {
+                        addr: addr as u64,
+                        byte_len,
+                    });
+                }
+            }
             Ok(())
         }
-        None if constrained && byte_len > 0 => {
-            if ptr_ty.is_ref() {
+        None if constrained && len > 0 => {
+            if is_ref_use {
                 return Err(RvalueEvalError::PointerOutOfBounds {
                     addr: addr as u64,
                     byte_len,
@@ -10392,6 +10516,13 @@ fn eval_wide_ref_in<F: FrameView + ?Sized>(
             "Deref projection requires a wide pointer value with matching pointee type",
         ));
     }
+    if matches!(ref_ty, Ty::Ref(_, Mutability::Mut) | Ty::RawPtr(_, Mutability::Mut))
+        && !matches!(base_ty, Ty::Ref(_, Mutability::Mut) | Ty::RawPtr(_, Mutability::Mut))
+    {
+        return Err(RvalueEvalError::TypeMismatch(
+            "mutable reborrow of an immutable wide pointer",
+        ));
+    }
     let checked = expected_ref || base_ty.is_ref();
     if checked {
         check_slice_backing_in(frame, &data, len, &base_ty, SliceUse::Create, Some(place))?;
@@ -10469,7 +10600,42 @@ fn eval_slice_len_in<F: FrameView + ?Sized>(
         return Err(RvalueEvalError::DeadLocal(place.local));
     }
     let (data, len, base_ty, tail) = read_unsized_place_base(frame, place)?;
+    if data.provenance.is_none() && len > 0 {
+        let ptr_width = frame.frame_ptr_width();
+        let addr = checked_ptr_addr(&data, &base_ty, ptr_width)?;
+        if addr == 0 {
+            if base_ty.is_ref() {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: base_ty,
+                    bits: 0,
+                }));
+            }
+            return Err(RvalueEvalError::NullPointerAccess);
+        }
+        let elem_ty = base_ty.wide_ptr_elem_ty().ok_or(RvalueEvalError::TypeMismatch(
+            "slice Len requires a wide pointer to a slice",
+        ))?;
+        let elem_layout = elem_ty
+            .layout_for(ptr_width)
+            .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(elem_ty, err)))?;
+        if !addr.is_multiple_of(elem_layout.align as u128) {
+            return Err(RvalueEvalError::MisalignedPointer {
+                addr: addr as u64,
+                required_align: elem_layout.align,
+            });
+        }
+        let byte_len = len as u128 * elem_layout.size as u128;
+        return Err(RvalueEvalError::PointerOutOfBounds {
+            addr: addr as u64,
+            byte_len,
+        });
+    }
     check_slice_backing_in(frame, &data, len, &base_ty, SliceUse::Access, Some(place))?;
+    if let Some(local) = resolve_synthetic_alloc_local(&data, frame.frame_local_count())
+        && matches!(frame.frame_slot(local), Some(FrameSlot::Live(SlotRef::Uninit)))
+    {
+        return Err(RvalueEvalError::UninitializedLocal(Local(local)));
+    }
     let (_, window_len) = apply_subslice_tail(len, tail)?;
     Ok(window_len)
 }
@@ -10714,6 +10880,54 @@ fn select_subplace_candidate_in<F: FrameView + ?Sized>(
     Some(candidates.swap_remove(chosen))
 }
 
+/// Validates the slice `Subslice` and element-selecting `Index` / `ConstantIndex` projections
+/// at the start of `after_deref` against a dereferenced slice of length `len`, returning the
+/// number of projection steps consumed (`Subslice*` followed by `Index` or `ConstantIndex`)
+/// and the selected element's `0..len` index when `after_deref` selects an element.
+fn validate_slice_element_steps_in<F: FrameView + ?Sized>(
+    frame: &F,
+    len: usize,
+    after_deref: &[ProjectionElem],
+) -> Result<Option<(usize, usize)>, RvalueEvalError> {
+    let mut start = 0usize;
+    let mut cur_len = len;
+    for (step_idx, elem) in after_deref.iter().enumerate() {
+        match elem {
+            ProjectionElem::Subslice { from, to, from_end } => {
+                let (s, e) = resolve_subslice_range(cur_len, *from, *to, *from_end)?;
+                start += s;
+                cur_len = e - s;
+            }
+            ProjectionElem::Index(idx_local) => {
+                let idx_bits = frame.frame_index_operand(*idx_local)?;
+                let Ok(i) = usize::try_from(idx_bits) else {
+                    return Err(RvalueEvalError::IndexOutOfBounds {
+                        index: idx_bits,
+                        len: cur_len,
+                    });
+                };
+                if i >= cur_len {
+                    return Err(RvalueEvalError::IndexOutOfBounds {
+                        index: idx_bits,
+                        len: cur_len,
+                    });
+                }
+                return Ok(Some((step_idx + 1, start + i)));
+            }
+            ProjectionElem::ConstantIndex {
+                offset,
+                min_length,
+                from_end,
+            } => {
+                let i = resolve_constant_index(cur_len, *offset, *min_length, *from_end)?;
+                return Ok(Some((step_idx + 1, start + i)));
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 /// Resolves all `ProjectionElem::Deref` steps in `place` from left to right (reading each
 /// dereferenced pointer from the place resolved so far) and reads the `Index` operands in
 /// place-evaluation order, returning `(target_local, target_proj, index_cache)` where
@@ -10743,57 +10957,116 @@ fn resolve_deref_place_in<F: FrameView + ?Sized>(
         Some(FrameSlot::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
         Some(FrameSlot::Live(_)) => {}
     }
+    let last_deref_pos = place
+        .projection
+        .iter()
+        .rposition(|p| matches!(p, ProjectionElem::Deref));
     let mut cur_local = place.local;
     let mut cur_proj: Vec<ProjectionElem> = Vec::new();
     let mut cur_index_cache: Vec<(Local, u128)> = Vec::new();
     let proj_len = place.projection.len();
-    for (idx, elem) in place.projection.iter().enumerate() {
+    let mut idx = 0usize;
+    while idx < proj_len {
+        let elem = &place.projection[idx];
         if matches!(elem, ProjectionElem::Deref) {
             let ptr_val = read_frame_place(frame, cur_local, &cur_proj, &cur_index_cache, place)?;
-            let (ptr, ptr_ty, pointee_ty) = match ptr_val {
+            if allow_final_union_overwrite && last_deref_pos == Some(idx) {
+                let is_mut = matches!(
+                    ptr_val.ty(),
+                    Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
+                );
+                if !is_mut {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "write through an immutable pointer",
+                    ));
+                }
+            }
+            match ptr_val {
                 MirValue::Ptr { ptr, ty: ptr_ty } => {
                     let Some(pointee_ty) = ptr_ty.pointee_ty().cloned() else {
                         return Err(RvalueEvalError::TypeMismatch(
                             "Deref projection requires a pointer-typed place",
                         ));
                     };
-                    (ptr, ptr_ty, pointee_ty)
+                    let allow_union_overwrite = allow_final_union_overwrite && idx + 1 == proj_len;
+                    let (next_local, next_proj) = resolve_synthetic_subplace_in(
+                        frame,
+                        &ptr,
+                        &ptr_ty,
+                        &pointee_ty,
+                        place,
+                        allow_union_overwrite,
+                    )?;
+                    cur_local = next_local;
+                    cur_proj = next_proj;
+                    cur_index_cache.clear();
                 }
                 // A dereferenced slice designates the array `[T; len]` its backing range holds,
-                // which resolves (and projects) like the pointee of a thin array pointer.
+                // which resolves (and projects) like the pointee of a thin array pointer (or, for
+                // a 1-element slice created via `slice::from_ref(&x)` over a non-array sub-place,
+                // the single `T` sub-place itself). Dynamic slice bounds are checked against `len`
+                // before resolving the backing sub-place.
                 MirValue::WidePtr {
                     data,
                     len,
                     ty: ptr_ty,
                 } => {
                     check_slice_backing_in(frame, &data, len, &ptr_ty, SliceUse::Access, Some(place))?;
+                    let slice_step =
+                        validate_slice_element_steps_in(frame, len, &place.projection[idx + 1..])?;
                     let (concrete_ptr_ty, array_ty) = concretize_wide_ptr_ty(&ptr_ty, len)?;
-                    (data, concrete_ptr_ty, array_ty)
+                    let allow_union_overwrite = allow_final_union_overwrite && idx + 1 == proj_len;
+                    match resolve_synthetic_subplace_in(
+                        frame,
+                        &data,
+                        &concrete_ptr_ty,
+                        &array_ty,
+                        place,
+                        allow_union_overwrite,
+                    ) {
+                        Ok((next_local, next_proj)) => {
+                            cur_local = next_local;
+                            cur_proj = next_proj;
+                            cur_index_cache.clear();
+                        }
+                        Err(RvalueEvalError::UnsupportedPlaceProjection(_))
+                            if len == 1 && matches!(slice_step, Some((_, 0))) =>
+                        {
+                            let (consumed, _) = slice_step.unwrap();
+                            let elem_ty = ptr_ty.wide_ptr_elem_ty().unwrap().clone();
+                            let elem_ptr_ty = ptr_ty.with_pointee(elem_ty.clone()).unwrap();
+                            let elem_union_overwrite =
+                                allow_final_union_overwrite && idx + 1 + consumed == proj_len;
+                            let (next_local, next_proj) = resolve_synthetic_subplace_in(
+                                frame,
+                                &data,
+                                &elem_ptr_ty,
+                                &elem_ty,
+                                place,
+                                elem_union_overwrite,
+                            )?;
+                            cur_local = next_local;
+                            cur_proj = next_proj;
+                            cur_index_cache.clear();
+                            idx += 1 + consumed;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 _ => {
                     return Err(RvalueEvalError::TypeMismatch(
                         "Deref projection requires a pointer value",
                     ));
                 }
-            };
-            let allow_union_overwrite = allow_final_union_overwrite && idx + 1 == proj_len;
-            let (next_local, next_proj) = resolve_synthetic_subplace_in(
-                frame,
-                &ptr,
-                &ptr_ty,
-                &pointee_ty,
-                place,
-                allow_union_overwrite,
-            )?;
-            cur_local = next_local;
-            cur_proj = next_proj;
-            cur_index_cache.clear();
+            }
         } else {
             if let ProjectionElem::Index(idx_local) = elem {
                 cur_index_cache.push((*idx_local, frame.frame_index_operand(*idx_local)?));
             }
             cur_proj.push(elem.clone());
         }
+        idx += 1;
     }
     Ok((cur_local, cur_proj, cur_index_cache))
 }
@@ -10814,6 +11087,7 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
     place: &Place,
     pointee_ty: &Ty,
     expected_ref: bool,
+    require_mut: bool,
 ) -> Result<PointerValue, RvalueEvalError> {
     let decls = frame.frame_decls();
     let ptr_width = frame.frame_ptr_width();
@@ -10850,6 +11124,17 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
         let tail = &place.projection[last_deref_pos + 1..];
         let (ptr_local, ptr_proj, ptr_index_cache) = resolve_deref_place_in(frame, &ptr_place, false)?;
         let ptr_val = read_frame_place(frame, ptr_local, &ptr_proj, &ptr_index_cache, &ptr_place)?;
+        if require_mut
+            && !matches!(
+                ptr_val.ty(),
+                Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
+            )
+        {
+            return Err(RvalueEvalError::TypeMismatch(
+                "mutable borrow through an immutable pointer",
+            ));
+        }
+        let mut single_elem_slice_step: Option<(usize, Ty)> = None;
         let (base_ptr, base_ptr_ty, deref_ty) = match ptr_val {
             MirValue::Ptr {
                 ptr: base_ptr,
@@ -10871,6 +11156,13 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
                     SliceUse::Create
                 };
                 check_slice_backing_in(frame, &data, len, &ty, use_, Some(place))?;
+                let slice_step = validate_slice_element_steps_in(frame, len, tail)?;
+                if len == 1
+                    && let Some((consumed, 0)) = slice_step
+                    && let Some(elem_ty) = ty.wide_ptr_elem_ty()
+                {
+                    single_elem_slice_step = Some((consumed, elem_ty.clone()));
+                }
                 let (concrete_ptr_ty, array_ty) = concretize_wide_ptr_ty(&ty, len)?;
                 (data, concrete_ptr_ty, array_ty)
             }
@@ -10901,7 +11193,7 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
                 provenance: base_ptr.provenance,
             });
         }
-        return resolve_reborrow_with_tail_in(
+        match resolve_reborrow_with_tail_in(
             frame,
             place,
             &base_ptr,
@@ -10910,7 +11202,46 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
             tail,
             pointee_ty,
             expected_ref,
-        );
+        ) {
+            Ok(ptr) => return Ok(ptr),
+            Err(RvalueEvalError::UnsupportedPlaceProjection(_))
+                if single_elem_slice_step.is_some() =>
+            {
+                let (consumed, elem_ty) = single_elem_slice_step.unwrap();
+                let elem_ptr_ty = base_ptr_ty.with_pointee(elem_ty.clone()).unwrap();
+                let elem_tail = &tail[consumed..];
+                if elem_tail.is_empty() {
+                    if &elem_ty != pointee_ty {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Deref projection requires a pointer value with matching pointee type",
+                        ));
+                    }
+                    let _ = resolve_synthetic_subplace_in(
+                        frame,
+                        &base_ptr,
+                        &elem_ptr_ty,
+                        &elem_ty,
+                        place,
+                        false,
+                    )?;
+                    return Ok(PointerValue {
+                        addr: base_ptr.addr,
+                        provenance: base_ptr.provenance,
+                    });
+                }
+                return resolve_reborrow_with_tail_in(
+                    frame,
+                    place,
+                    &base_ptr,
+                    &elem_ptr_ty,
+                    &elem_ty,
+                    elem_tail,
+                    pointee_ty,
+                    expected_ref,
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
     let mut index_cache = Vec::new();
     for elem in &place.projection {
@@ -11205,11 +11536,14 @@ fn subplace_field_offset(
     ptr_width: PtrWidth,
 ) -> Option<usize> {
     let (off, field_ty, reorderable) = match container_ty {
-        Ty::Tuple(fields) => (
-            crate::ir::rust_field_offset(fields, idx, ptr_width).ok()?,
-            fields.get(idx)?,
-            true,
-        ),
+        Ty::Tuple(_) | Ty::Closure { .. } => {
+            let fields = tuple_or_closure_fields(container_ty)?;
+            (
+                crate::ir::rust_field_offset(fields, idx, ptr_width).ok()?,
+                fields.get(idx)?,
+                true,
+            )
+        }
         Ty::Adt(def) => {
             let off = def.field_offset(variant, idx, ptr_width).ok()?;
             let field_ty = def.variant_fields(variant)?.get(idx)?;
@@ -11300,7 +11634,8 @@ fn collect_subplace_paths_rec(
         return;
     }
     match cur_ty {
-        Ty::Tuple(fields) => {
+        Ty::Tuple(_) | Ty::Closure { .. } => {
+            let fields = tuple_or_closure_fields(cur_ty).unwrap();
             for (idx, field_ty) in fields.iter().enumerate() {
                 let Some(field_off) = subplace_field_offset(cur_ty, 0, idx, ptr_width)
                     .and_then(|off| cur_off.checked_add(off))
@@ -11524,7 +11859,8 @@ fn compute_subplace_offset_and_tag(
                         canonical_proj.push(ProjectionElem::Field(*idx, field_ty.clone()));
                         cur_ty = field_ty;
                     }
-                    Ty::Tuple(fields) => {
+                    Ty::Tuple(_) | Ty::Closure { .. } => {
+                        let fields = tuple_or_closure_fields(&cur_ty).unwrap();
                         if active_downcast.take().is_some() {
                             return Err(RvalueEvalError::UnsupportedPlaceProjection(
                                 full_place.clone(),
@@ -12040,7 +12376,9 @@ fn proj_traverses_union<'a>(mut cur_ty: &'a Ty, proj: &'a [ProjectionElem]) -> b
                     return true;
                 }
                 cur_ty = match cur_ty {
-                    Ty::Tuple(fields) => fields.get(*idx).unwrap_or(field_ty),
+                    Ty::Tuple(_) | Ty::Closure { .. } => tuple_or_closure_fields(cur_ty)
+                        .and_then(|fields| fields.get(*idx))
+                        .unwrap_or(field_ty),
                     Ty::Adt(def) => def
                         .variant_fields(v)
                         .and_then(|fs| fs.get(*idx))
@@ -13304,6 +13642,16 @@ pub fn eval_lowered_rvalue_in_state(
                                 "Deref projection requires a pointer value with matching pointee type",
                             ));
                         }
+                        if *mutability == Mutability::Mut
+                            && !matches!(
+                                ty,
+                                Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
+                            )
+                        {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "mutable borrow through an immutable pointer",
+                            ));
+                        }
                         let masked_addr =
                             checked_ptr_addr(&ptr, &ty, state.ptr_width)? as u64;
                         if ty.is_ref() && masked_addr == 0 {
@@ -13325,7 +13673,13 @@ pub fn eval_lowered_rvalue_in_state(
                         ));
                     }
                 },
-                _ => eval_projected_ref_in(state, place, pointee_ty, expected_ref)?,
+                _ => eval_projected_ref_in(
+                    state,
+                    place,
+                    pointee_ty,
+                    expected_ref,
+                    *mutability == Mutability::Mut,
+                )?,
             };
             if ref_ty.is_ref() && ptr.addr == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -13757,6 +14111,9 @@ pub fn eval_lowered_statement(
         } => {
             let (target_local, target_proj, index_cache) =
                 state.prepare_place_access(place, place_ty)?;
+            check_place_last_deref_mutable(place, &state.local_decls).map_err(|_| {
+                RvalueEvalError::TypeMismatch("SetDiscriminant through an immutable pointer")
+            })?;
             if !matches!(place_ty, Ty::Tuple(_) | Ty::Adt(_)) {
                 return Err(RvalueEvalError::InvalidSetDiscriminant(place.clone()));
             }
