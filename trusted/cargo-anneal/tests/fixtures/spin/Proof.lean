@@ -77,8 +77,11 @@ theorem noFault (state : State) (inv : invariant state) (reason : Fault) :
         | inr same => subst state; simp [step4]
 
 theorem safe (args : List Word) : Safe body args :=
-  safeFrom_invariant invariant (show invariant (initial body args) from .inl rfl)
-    closed noFault
+  safeFrom_of_reach
+    (show Reach body (initial body args) s2 from
+      .next (.next .refl step0) step1)
+    (safeFrom_invariant invariant
+      (show invariant s2 from .inr (.inr (.inl rfl))) closed noFault)
 
 theorem noReturnStep (state : State) (inv : invariant state) (value : Word) :
     step body state ≠ .ret value := by

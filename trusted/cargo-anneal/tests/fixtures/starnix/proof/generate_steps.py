@@ -121,12 +121,19 @@ def produce(body, flag, width):
             source += '\n'
         source += '  ]⟩\n\n'
     last = len(states) - 1
+    # Keep every intermediate state checked while composing a short entry
+    # segment with the returning suffix. Short source mutations can return
+    # before two transitions, so the checkpoint must stay on their actual path.
+    checkpoint = min(2, last)
+    segment = '.refl'
+    for _ in range(checkpoint):
+        segment = f'.next ({segment}) (by rfl)'
     source += f'''private theorem {label}_suffix{last} (value : Word) :
     Executes sourceBody ({label}_state{last} value) ({output}) :=
   .ret (by rfl)
 
 '''
-    for i in range(last - 1, -1, -1):
+    for i in range(last - 1, checkpoint - 1, -1):
         source += f'''private theorem {label}_suffix{i} (value : Word) :
     Executes sourceBody ({label}_state{i} value) ({output}) :=
   .next (by rfl) ({label}_suffix{i + 1} value)
@@ -137,10 +144,13 @@ def produce(body, flag, width):
       Returns sourceBody [{flag}, {width}, value] ({output}) := by
   have start : initial sourceBody [{flag}, {width}, value] =
       {label}_state0 value := by rfl
+  have segment : Reach sourceBody ({label}_state0 value)
+      ({label}_state{checkpoint} value) :=
+    {segment}
   have execution : Executes sourceBody
       (initial sourceBody [{flag}, {width}, value]) ({output}) := by
     rw [start]
-    exact {label}_suffix0 value
+    exact executes_prepend segment ({label}_suffix{checkpoint} value)
   exact ⟨executes_safe execution, executes_returns execution⟩
 
 '''

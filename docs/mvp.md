@@ -267,6 +267,32 @@ logical axioms are rejected. Installed math libraries supply checked
 declarations, not new trusted axioms. Arbitrary external Lean packages need an
 admitted import path.
 
+## Compose source proofs
+
+The checked library in `Anneal.Mvp.Execution` supports several proof routes:
+finite evaluation with `run`, explicit `Executes` witnesses, finite `WP` proofs,
+and invariants for prefix safety. The canonical theorem does not require one
+particular route.
+
+A finite source segment `Reach body start checkpoint` can precede either a
+returning or a safe continuation. `executes_prepend` combines that segment with
+`Executes body checkpoint value`, retaining an actual source return witness.
+`safeFrom_of_reach` combines it with `SafeFrom body checkpoint`, including a
+continuation that never returns. A segment can end at a faulting state, so
+reachability alone proves neither safety nor completion. A reflexive segment
+leaves the entire continuation obligation unpaid.
+
+A loop summary must preserve every storage condition needed by its segment.
+An unread local can still need allocation evidence if the segment writes it:
+assigning to a dead destination faults even when its old value is irrelevant.
+
+The endianness witness generator uses this composition at each path's entry.
+The Rust spin fixture uses safety transport before its loop invariant and
+proves no return separately. These consumers exercise the existing acceptance
+path; no speed or memory improvement is established. Safety transport and the
+execution-to-safety bridge rely on the deterministic source step. An extension
+to nondeterministic execution needs a bridge covering every relevant path.
+
 ## Supported fragment and results
 
 The operational fragment supports booleans, integers up to 64 bits, unit and
