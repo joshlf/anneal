@@ -147,6 +147,39 @@ pub trait ItreeAstMutator {
     fn mutate(&self, file: &mut File, rng: &mut DetRng);
 }
 
+fn disambiguate_itree_tag(file: &File, base_tag: u64) -> u64 {
+    let mut tag = base_tag & 0xFFFF;
+    let mut existing = BTreeSet::new();
+    for item in &file.items {
+        match item {
+            Item::Fn(f) => {
+                existing.insert(f.sig.ident.to_string());
+                for stmt in &f.block.stmts {
+                    if let Stmt::Local(loc) = stmt
+                        && let Pat::Type(pt) = &loc.pat
+                        && let Pat::Ident(pi) = &*pt.pat
+                    {
+                        existing.insert(pi.ident.to_string());
+                    }
+                }
+            }
+            Item::Struct(s) => {
+                existing.insert(s.ident.to_string());
+            }
+            _ => {}
+        }
+    }
+    while existing.contains(&format!("__anneal_itree_outlined_{tag}"))
+        || existing.contains(&format!("__anneal_itree_outlined_stage2_{tag}"))
+        || existing.contains(&format!("__AnnealSafePadded_{tag}"))
+        || existing.contains(&format!("__anneal_ext_oracle_{tag}"))
+        || existing.contains(&format!("__itree_step_{tag}"))
+    {
+        tag = (tag + 1) & 0xFFFF;
+    }
+    tag
+}
+
 /// 1. Outlines computation across a real function call boundary by synthesizing a pure
 /// top-level safe helper function and invoking it from the target function body.
 #[derive(Debug, Default, Clone, Copy)]
@@ -159,7 +192,7 @@ impl ItreeAstMutator for CallBoundaryOutliner {
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
         let raw_tag = rng.next_u64();
-        let tag = raw_tag & 0xFFFF;
+        let tag = disambiguate_itree_tag(file, raw_tag);
         let use_multi_callee = ((raw_tag >> 16) & 1) == 1;
         let helper_ident = format_ident!("__anneal_itree_outlined_{}", tag);
         let stage2_ident = format_ident!("__anneal_itree_outlined_stage2_{}", tag);
@@ -250,7 +283,7 @@ impl ItreeAstMutator for LayoutPaddingPerturber {
     }
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
-        let tag = rng.next_u64() & 0xFFFF;
+        let tag = disambiguate_itree_tag(file, rng.next_u64());
         let struct_ident = format_ident!("__AnnealSafePadded_{}", tag);
         let init_word = ((rng.next_u64() & 0xFFFF) as u32).wrapping_add(1);
 
@@ -303,7 +336,7 @@ impl ItreeAstMutator for BranchLoopWeaver {
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
         let raw_tag = rng.next_u64();
-        let tag = raw_tag & 0xFFFF;
+        let tag = disambiguate_itree_tag(file, raw_tag);
         let use_bit_sat_perturb = ((raw_tag >> 16) & 1) == 1;
         let bound: u32 = 2;
 
@@ -360,7 +393,7 @@ impl ItreeAstMutator for ExtOracleInjector {
     }
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
-        let tag = rng.next_u64() & 0xFFFF;
+        let tag = disambiguate_itree_tag(file, rng.next_u64());
         let oracle_ident = format_ident!("__anneal_ext_oracle_{}", tag);
         let mask = ((rng.next_u64() & 0xFF) as u32).wrapping_add(0x100);
 
@@ -886,5 +919,44 @@ mod tests {
         assert!(saw_multi_callee, "expected depth-2 multi-callee outline variant");
         assert!(saw_single_callee, "expected single-callee outline variant");
         assert!(saw_bit_sat_loop, "expected bit/saturating/wrapping loop variant");
+    }
+
+    #[test]
+    fn disambiguate_itree_tag_resolves_duplicate_rng_tags_without_advancing_rng() {
+        for mutator in ITREE_AST_MUTATORS {
+            let mut file = syn::parse_file(SAFE_SEED).unwrap();
+            let mut rng1 = DetRng::new(0xABCD_1234);
+            mutator.mutate(&mut file, &mut rng1);
+            let mut state_after_first = rng1;
+            let mut rng2 = DetRng::new(0xABCD_1234);
+            mutator.mutate(&mut file, &mut rng2);
+            assert_eq!(
+                rng2.next_u64(),
+                state_after_first.next_u64(),
+                "`{}` tag disambiguation must not consume extra PRNG draws",
+                mutator.name()
+            );
+            let rendered = prettyplease::unparse(&file);
+            assert!(!contains_unsafe_token(&rendered));
+            let reparsed = syn::parse_file(&rendered).unwrap();
+            let mut top_names = BTreeSet::new();
+            for item in &reparsed.items {
+                match item {
+                    Item::Fn(f) => assert!(
+                        top_names.insert(f.sig.ident.to_string()),
+                        "duplicate fn `{}` from `{}`",
+                        f.sig.ident,
+                        mutator.name()
+                    ),
+                    Item::Struct(s) => assert!(
+                        top_names.insert(s.ident.to_string()),
+                        "duplicate struct `{}` from `{}`",
+                        s.ident,
+                        mutator.name()
+                    ),
+                    _ => {}
+                }
+            }
+        }
     }
 }

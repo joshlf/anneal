@@ -2329,6 +2329,13 @@ fn extract_confirm_theorems(confirm_src: &str, fn_name: &str) -> String {
     let probe_block = extract_block(&format!("theorem confirm_probe_{fn_name} :"));
     let frame_block = extract_block(&format!("theorem confirm_frame_{fn_name} :"));
     let message_block = extract_block(&format!("theorem confirm_message_{fn_name} :"));
+    if tag_block.is_none()
+        && probe_block.is_none()
+        && frame_block.is_none()
+        && message_block.is_none()
+    {
+        return String::new();
+    }
     let callees_block = extract_block("def linkedCallees : List CapturedMir :=");
     let stub_block = match &callees_block {
         Some(callees) if callees.contains(FMT_ARGUMENTS_CTOR_STUB_NAME) => {
@@ -2391,20 +2398,40 @@ fn staged_helper_fns_reachable_from_candidates(
     lib_rs: &str,
     items: &[OracleItemSpec],
 ) -> BTreeSet<String> {
-    let fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = syn::parse_file(lib_rs)
-        .map(|file| {
-            file.items
-                .into_iter()
-                .filter_map(|item| match item {
-                    syn::Item::Fn(func) => Some((
+    let mut fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
+    let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
+    if let Ok(file) = syn::parse_file(lib_rs) {
+        for item in file.items {
+            match item {
+                syn::Item::Fn(func) => {
+                    fn_bodies.insert(
                         func.sig.ident.to_string(),
                         quote::ToTokens::to_token_stream(&func.block),
-                    )),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    );
+                }
+                syn::Item::Macro(mac) => {
+                    if let Some(id) = &mac.ident {
+                        aux_tokens
+                            .entry(id.to_string())
+                            .or_default()
+                            .push(quote::ToTokens::to_token_stream(&mac.mac));
+                    }
+                }
+                syn::Item::Impl(imp) => {
+                    let mut self_idents = BTreeSet::new();
+                    collect_ident_tokens(
+                        quote::ToTokens::to_token_stream(&imp.self_ty),
+                        &mut self_idents,
+                    );
+                    let ts = quote::ToTokens::to_token_stream(&imp);
+                    for id in self_idents {
+                        aux_tokens.entry(id).or_default().push(ts.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let item_seeds: Vec<String> = items
         .iter()
         .map(|spec| spec.name.clone())
@@ -2422,21 +2449,29 @@ fn staged_helper_fns_reachable_from_candidates(
         }
         mentioned
             .into_iter()
-            .filter(|name| fn_bodies.contains_key(name))
+            .filter(|name| fn_bodies.contains_key(name) || aux_tokens.contains_key(name))
             .collect()
     };
+    let mut visited_nodes = BTreeSet::new();
     let mut reached = BTreeSet::new();
     while let Some(name) = worklist.pop() {
-        if !reached.insert(name.clone()) {
+        if !visited_nodes.insert(name.clone()) {
             continue;
         }
         let mut callees = BTreeSet::new();
-        collect_ident_tokens(fn_bodies[&name].clone(), &mut callees);
-        worklist.extend(
-            callees
-                .into_iter()
-                .filter(|callee| fn_bodies.contains_key(callee) && !reached.contains(callee)),
-        );
+        if let Some(body_ts) = fn_bodies.get(&name) {
+            reached.insert(name.clone());
+            collect_ident_tokens(body_ts.clone(), &mut callees);
+        }
+        if let Some(aux_list) = aux_tokens.get(&name) {
+            for ts in aux_list {
+                collect_ident_tokens(ts.clone(), &mut callees);
+            }
+        }
+        worklist.extend(callees.into_iter().filter(|callee| {
+            (fn_bodies.contains_key(callee) || aux_tokens.contains_key(callee))
+                && !visited_nodes.contains(callee)
+        }));
     }
     reached
 }
@@ -3319,7 +3354,7 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
                 && func.sig.inputs.is_empty()
             {
                 let name = func.sig.ident.to_string();
-                if name != "helper_add_ten" {
+                if !crate::mutators_miri::is_corpus_helper_fn_name(&name) {
                     pub_zero_arg.push(name);
                 }
             }
@@ -3330,7 +3365,7 @@ fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
     }
     discover_zero_arg_pub_fns(source)
         .into_iter()
-        .filter(|name| name != "helper_add_ten")
+        .filter(|name| !crate::mutators_miri::is_corpus_helper_fn_name(name))
         .last()
 }
 
@@ -3573,7 +3608,7 @@ pub fn evaluate_miri_batches_with_options(
     };
 
     let LinkedDifftestOracleRun {
-        report: oracle_report,
+        report: mut oracle_report,
         anneal_panic_frames,
         anneal_panic_messages,
     } = match run_linked_difftest_oracle_pipeline(&oracle_cfg, &item_specs) {
@@ -3603,7 +3638,7 @@ pub fn evaluate_miri_batches_with_options(
     };
     let shrink_seed_refs: Vec<&str> = shrink_seeds.iter().map(String::as_str).collect();
 
-    for item_rep in &oracle_report.items {
+    for item_rep in &mut oracle_report.items {
         let miri_sig_tag = match &item_rep.miri {
             MiriOutcome::PassUnit => "pass_unit".to_string(),
             MiriOutcome::PassScalar { size_bytes, .. } => format!("pass_scalar_{size_bytes}"),
@@ -3696,7 +3731,8 @@ pub fn evaluate_miri_batches_with_options(
                 .or_insert(0) += 1;
         }
 
-        match &item_rep.verdict {
+        let verdict = item_rep.verdict.clone();
+        match &verdict {
             ComparisonVerdict::Agree => {
                 if !compare_miri_and_anneal(&item_rep.miri, &item_rep.anneal).is_agree() {
                     let batch_miri_pos = match &item_rep.miri {
@@ -3756,9 +3792,7 @@ pub fn evaluate_miri_batches_with_options(
             ComparisonVerdict::Diverge(div_kind) => {
                 let class_slug = divergence_class_slug(div_kind).to_string();
                 *divergence_classes.entry(class_slug.clone()).or_insert(0) += 1;
-                if item_rep.kernel_confirmed {
-                    kernel_confirmed_divergences += 1;
-                }
+                let mut item_kernel_confirmed = item_rep.kernel_confirmed;
 
                 if let Some((cand, batch_start_line)) = cand_by_name.get(&item_rep.name) {
                     let (shrink_res, shrink_status) = shrink_divergent_miri_candidate(
@@ -3773,7 +3807,8 @@ pub fn evaluate_miri_batches_with_options(
                     // stages the candidate alone), and the MIR neighborhood and
                     // kernel theorems of the oracle run that accepted it.
                     let reduced = shrink_res.as_ref().filter(|sr| sr.is_reduced());
-                    let eff_item_rep = reduced.map_or(item_rep, |sr| &sr.minimized_report);
+                    let eff_item_rep = reduced.map_or(&*item_rep, |sr| &sr.minimized_report);
+                    item_kernel_confirmed = eff_item_rep.kernel_confirmed;
                     let eff_cand = reduced.map_or(*cand, |sr| &sr.minimized_candidate);
                     let eff_start_line = if reduced.is_some() {
                         repro_start_line
@@ -3901,6 +3936,10 @@ pub fn evaluate_miri_batches_with_options(
                         }
                     }
                     findings.push(bundle);
+                }
+                item_rep.kernel_confirmed = item_kernel_confirmed;
+                if item_kernel_confirmed {
+                    kernel_confirmed_divergences += 1;
                 }
             }
         }
@@ -7790,5 +7829,56 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             md.contains("| `finding_0000_cand` | `cand` | `missed_ub` | `unsound_missed_fault` |"),
             "Markdown findings row missing witness_polarity:\n{md}"
         );
+    }
+
+    #[test]
+    fn extract_confirm_theorems_and_reachability_handle_unconfirmed_items_and_impl_macro_callees() {
+        let confirm_src = "\
+def linkedCallees : List CapturedMir :=
+  [Mir.MiriDiffCorpus.helper_add_ten.body]
+
+theorem confirm_tag_cand_ok :
+    evalMirDiffTagBounded 512 Mir.MiriDiffCorpus.cand_ok.body linkedCallees =
+      MirDiffTag.ub := by
+  rfl
+";
+        assert!(
+            extract_confirm_theorems(confirm_src, "cand_ok")
+                .contains("theorem confirm_tag_cand_ok :"),
+            "confirmed item must include its theorem and linkedCallees"
+        );
+        assert_eq!(
+            extract_confirm_theorems(confirm_src, "cand_unconfirmed"),
+            "",
+            "unconfirmed item in a multi-item confirm module must not emit orphaned linkedCallees"
+        );
+
+        let staged = "\
+macro_rules! call_via_macro {
+    ($e:expr) => { helper_from_macro($e) };
+}
+struct Guard(u32);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = helper_from_drop(self.0);
+    }
+}
+fn helper_from_macro(x: u32) -> u32 { x + 1 }
+fn helper_from_drop(x: u32) -> u32 { x + 2 }
+fn unrelated_helper(x: u32) -> u32 { x + 3 }
+pub fn cand_entry() -> u32 {
+    let _g = Guard(5);
+    call_via_macro!(10)
+}
+";
+        let specs = vec![OracleItemSpec {
+            name: "cand_entry".to_string(),
+            fuel: 512,
+        }];
+        let reached = staged_helper_fns_reachable_from_candidates(staged, &specs);
+        assert!(reached.contains("cand_entry"));
+        assert!(reached.contains("helper_from_macro"));
+        assert!(reached.contains("helper_from_drop"));
+        assert!(!reached.contains("unrelated_helper"));
     }
 }

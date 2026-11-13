@@ -357,7 +357,7 @@ fn corpus_model_helper_names() -> &'static std::collections::BTreeSet<String> {
 /// Whether `name` is a corpus helper rather than a test entry point:
 /// `helper_add_ten`, an `__ANNEAL_MODEL_*` marker, or a model-marked call-chain
 /// helper ([`corpus_model_helper_names`]).
-fn is_corpus_helper_fn_name(name: &str) -> bool {
+pub(crate) fn is_corpus_helper_fn_name(name: &str) -> bool {
     name == "helper_add_ten"
         || name.starts_with("__ANNEAL_MODEL_")
         || corpus_model_helper_names().contains(name)
@@ -1289,6 +1289,13 @@ struct ArithAstPerturber<'a> {
 }
 
 impl VisitMut for ArithAstPerturber<'_> {
+    fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+            return;
+        }
+        syn::visit_mut::visit_item_fn_mut(self, func);
+    }
+
     fn visit_type_mut(&mut self, _ty: &mut Type) {
         // Never mutate array lengths `[T; N]` inside type annotations.
     }
@@ -1854,6 +1861,9 @@ impl VisitMut for ProjectionAstPerturber<'_> {
     }
 
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+            return;
+        }
         let prev_borrowed = std::mem::take(&mut self.field_borrowed_bases);
         let prev_lens = std::mem::take(&mut self.known_array_lens);
         let prev_asym = self.has_asymmetric_ab_struct;
@@ -2017,7 +2027,7 @@ impl MiriAstMutator for PlaceProjectionWrapper {
 
         for item in &mut file.items {
             let Item::Fn(func) = item else { continue };
-            if func.sig.ident == "helper_add_ten" {
+            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
                 continue;
             }
             let locals = collect_initialized_locals(func);
@@ -2203,6 +2213,13 @@ fn offset_arg_lit_suffix(expr: &Expr) -> Option<&str> {
 }
 
 impl VisitMut for OffsetArgPerturber<'_> {
+    fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+            return;
+        }
+        syn::visit_mut::visit_item_fn_mut(self, func);
+    }
+
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
         if let Expr::Call(call) = expr
@@ -3112,6 +3129,9 @@ impl VisitMut for ScopedBlockReorderer<'_, '_> {
 
 impl VisitMut for AliasingAccessReorderer<'_> {
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+            return;
+        }
         let borrow_ctx = SafeBorrowContext::from_item_fn(func);
         ScopedBlockReorderer {
             rng: self.rng,
@@ -3942,6 +3962,9 @@ impl TransmuteValidityPerturber<'_> {
 
 impl VisitMut for TransmuteValidityPerturber<'_> {
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
+        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+            return;
+        }
         let prev_ret = self.fn_ret_target;
         self.fn_ret_target = match &func.sig.output {
             ReturnType::Type(_, ret_ty) => Some(TransmuteTarget::of_type(ret_ty)),
@@ -4072,7 +4095,7 @@ impl MiriAstMutator for BitValidityTransmuteMutator {
 
         for item in &mut file.items {
             let Item::Fn(func) = item else { continue };
-            if func.sig.ident == "helper_add_ten" {
+            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
                 continue;
             }
             let locals = collect_initialized_locals(func);
@@ -6890,6 +6913,57 @@ pub fn unsuffixed_off() -> u32 {
                 "replay mismatch on candidate `{}`",
                 cand.fn_name
             );
+        }
+    }
+
+    #[test]
+    fn mutators_never_modify_corpus_preamble_helpers_when_applied_to_standalone_file() {
+        let seed_fn = "pub fn cand_root() -> u32 {\n    let x: u32 = 10u32;\n    x + 1u32\n}\n";
+        let standalone = build_standalone_candidate_source(seed_fn);
+        let baseline_parsed = syn::parse_file(&standalone).unwrap();
+        let baseline_helpers: std::collections::BTreeMap<String, String> = baseline_parsed
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) if is_corpus_helper_fn_name(&f.sig.ident.to_string()) => Some((
+                    f.sig.ident.to_string(),
+                    f.to_token_stream().to_string(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            baseline_helpers.len() >= 10,
+            "expected all preamble helpers in baseline: {:?}",
+            baseline_helpers.keys().collect::<Vec<_>>()
+        );
+
+        for mutator in MIRI_AST_MUTATORS {
+            for mode in [
+                MutationMode::Pass,
+                MutationMode::PerturbAst,
+                MutationMode::Panic,
+                MutationMode::Ub,
+            ] {
+                let mut file = syn::parse_file(&standalone).unwrap();
+                let mut rng = DetRng::new(0x55AA_1234);
+                let mut locals_log = Vec::new();
+                mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals_log);
+                for item in &file.items {
+                    if let Item::Fn(f) = item {
+                        let name = f.sig.ident.to_string();
+                        if let Some(expected_tokens) = baseline_helpers.get(&name) {
+                            assert_eq!(
+                                &f.to_token_stream().to_string(),
+                                expected_tokens,
+                                "`{}` under {:?} mutated corpus helper `{name}`",
+                                mutator.name(),
+                                mode
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
