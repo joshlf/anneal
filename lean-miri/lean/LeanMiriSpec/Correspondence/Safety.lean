@@ -344,7 +344,9 @@ concrete real-step instances in the `Wit*` modules:
   `panic_explicit_macro` (an explicit `panic!` first calls
   `core::fmt::Arguments::from_str`, an external call that Stage-1 does not
   model, before the diverging `core::panicking::panic_fmt`;
-  `MiriDiffWitnesses.w5_panic_explicit_macro_extCall_boundary`).
+  `MiriDiffWitnesses.w5_panic_explicit_macro_extCall_boundary`, from entry: Stage-1
+  reaches the external call and, when the environment returns, panics in
+  `panic_fmt`, while `lean-miri` reports `.unsupported`).
 
 The multi-frame witnesses instantiate `annealStepHooksLM4_1` at the body of the
 active `lean-miri` frame (`MiriDiffWitnesses.callHooks`), a function of the
@@ -403,7 +405,15 @@ Further boundaries of the whole-program agreement:
   instantiations here model no external functions, so whole-program call
   agreement is stated for linked callees (`callHooks`), and the Stage-1
   external-call witnesses (`MiriDiffWitnesses.anneal_extCall_boundary`) fix the
-  environment's response explicitly.
+  environment's response explicitly. Each response carries a whole `Memory`,
+  including `Memory.callStack`: for a call with `UnwindAction::Continue`, a
+  `MirCallAns.panicked` answer unwinds through the answer's `callStack`
+  (`applyUnwindAction`, `unwindFromCallStack`), so an answer whose `callStack`
+  holds a caller frame with `UnwindAction::Unreachable`, a frame the program never
+  pushed, faults: every external call with `UnwindAction::Continue` that Anneal
+  reaches by silent steps (`AnnealPath`) makes `MirReachesUB` hold and `TreeSafe` fail
+  (`MiriDiffWitnesses.anneal_extCall_continue_unwind_ub`; instance
+  `MiriDiffWitnesses.w5_panic_explicit_macro_extCall_boundary`).
 * `AnnealMachine` has no function-pointer registry, so the `LM-4.1` hooks read
   function pointers from a static table (`annealStepHooksLM4_1 … fnPtrs`,
   `MiriDiffWitnesses.callHooks … fnPtrs`) instead of registering them at

@@ -24697,6 +24697,7 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   panicFmtFnTy
   panicExplicitMacroBody
   w5_panic_explicit_macro_extCall_boundary
+  anneal_extCall_continue_unwind_ub
 
 /-! ### `LM-4.3` over Stage-1: lockstep upgrades and external-call boundary pins -/
 
@@ -25190,6 +25191,18 @@ example :
     runLoopFuel (annealMiriHooks arrayIndexOobEntryBody) 3
       (miriEntryState arrayIndexOobEntryBody) = .running arrayIndexOobPreMiri :=
   ⟨arrayIndexOob_pre_stateRel_and_imm, arrayIndexOob_prefix_anneal, arrayIndexOob_prefix_miri⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example {body : CapturedMir} {s sₙ : MachineState}
+    {req : MirCallReq} {locals : List LocalSlot} {dest : Place} {targetBb : BasicBlockIdx}
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .continue_))
+    {memP : Memory} {caller : SavedCallerFrame} {rest : List SavedCallerFrame}
+    (hstack : memP.callStack = caller :: rest) (hcaller : caller.returnUnwind = .unreachable) :
+    MirReachesUB (mirTree body s) ∧ ¬ TreeSafe (mirTree body s) :=
+  anneal_extCall_continue_unwind_ub hA hs hstack hcaller
 
 end StatementPins
 

@@ -100,9 +100,10 @@ agreeing whole-program facts.
    in Anneal vs. undefined behavior in `lean-miri`),
    `w5_indirect_fnPtr_call_returns` (`ReifyFnPointer` coercion and indirect
    `FnPtr` call), and `w5_panic_explicit_macro_extCall_boundary` (the open
-   `known_anneal_bug` ratchet `panic_explicit_macro`, stopping at
-   `MirStepNode.extCall` for `core::fmt::Arguments::<'a>::from_str` before
-   `core::panicking::panic_fmt`).
+   `known_anneal_bug` ratchet `panic_explicit_macro`, from entry: Stage-1 stops at
+   `MirStepNode.extCall` for `core::fmt::Arguments::<'a>::from_str` and, when the
+   environment returns, panics in `core::panicking::panic_fmt`, while `lean-miri`
+   reports `.unsupported`).
 6. Intrinsics: `w6_assume_true`, `w6_assume_false_ub`, `w6_exact_div_valid`,
    `w6_exact_div_non_multiple_ub`, `w6_ctlz_returns`,
    `w6_saturating_add_returns`, `w6_copy_nonoverlapping_disjoint_returns`,
@@ -145,7 +146,9 @@ certify the lockstep segment (`AgreeReaches`) and state that Anneal's whole
 program then faults at the root return. Stage-1 external calls are followed
 through `coStep_of_extCall` for an explicit environment response
 (`MirCallAns`), after a running prefix from program entry
-(`anneal_extCall_boundary_of_prefix`). The `write_bytes` runs of `lean-miri` are
+(`anneal_extCall_boundary_of_prefix`); since a response carries a whole `Memory`,
+an unwinding response may also carry a caller frame the program never pushed
+(`anneal_extCall_continue_unwind_ub`). The `write_bytes` runs of `lean-miri` are
 certified against the pre-Stage-1 reference model `stepMirFnLM4_2`
 (`retWriteBytesRead_ref_trace`, `w6_write_bytes_oob_extCall_divergence`), which
 executes the intrinsic inline like `lean-miri`. Witnesses without a corpus program
@@ -464,6 +467,29 @@ theorem anneal_extCall_boundary_of_prefix {body : CapturedMir} {s₀ s sₙ sᵣ
     exact h.trans hAr.coReach
   have hp := (hpre.trans hA.coReach).tail (coStep_of_extCall hs (.panicked memP))
   exact ⟨anneal_reachesRet_of_coReach hr hret, anneal_ub_of_coReach hp rfl⟩
+
+/-- **Unwinding through an environment-chosen `callStack`**: a `MirCallAns.panicked`
+answer carries a whole `Memory`, and for an external call with
+`UnwindAction::Continue`, `applyUnwindAction` unwinds through that memory's
+`callStack` (`unwindFromCallStack`). So when Anneal reaches (`AnnealPath`) such a
+call, the answer whose `callStack` starts with a caller frame with
+`UnwindAction::Unreachable` (a frame the program never pushed) faults, and Anneal's
+whole program reaches undefined behavior and is not `TreeSafe`, whatever the
+program does after the call. -/
+theorem anneal_extCall_continue_unwind_ub {body : CapturedMir} {s sₙ : MachineState}
+    {req : MirCallReq} {locals : List LocalSlot} {dest : Place} {targetBb : BasicBlockIdx}
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .continue_))
+    {memP : Memory} {caller : SavedCallerFrame} {rest : List SavedCallerFrame}
+    (hstack : memP.callStack = caller :: rest) (hcaller : caller.returnUnwind = .unreachable) :
+    MirReachesUB (mirTree body s) ∧ ¬ TreeSafe (mirTree body s) := by
+  have hp := hA.coReach.tail (coStep_of_extCall hs (.panicked memP))
+  have hub : resumeExternalCall sₙ locals dest targetBb .continue_ (.panicked memP) =
+      .faulted .ub := by
+    simp only [resumeExternalCall, applyUnwindAction, hstack, unwindFromCallStack, hcaller]
+  rw [hub] at hp
+  exact anneal_ub_of_coReach hp rfl
 
 /-! ## 1. Scalar arithmetic, casts, `SwitchInt`, `Assert`, and a diverging loop -/
 
@@ -3506,11 +3532,14 @@ def arrayIndexOobEntryBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
+/-- Anneal's state of `arrayIndexOobEntryBody` after `StorageLive(_1)`,
+`StorageLive(_2)`, and `_2 = const 3_usize` (statement `3` of `bb0`). -/
 def arrayIndexOobPreAnneal : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 3,
                locals := [.uninit, .uninit, .init (.scalar ⟨3, 8⟩)] }
     memory := (initMachineState arrayIndexOobEntryBody []).memory }
 
+/-- `lean-miri`'s root frame matching `arrayIndexOobPreAnneal`. -/
 def arrayIndexOobPreMiriFrame :
     Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
   { (miriEntryFrame arrayIndexOobEntryBody) with
@@ -3521,17 +3550,22 @@ def arrayIndexOobPreMiriFrame :
         layout := some (translateTy Witness.lm21UsizeTy emptyLayoutTable) }]
     location := .mir ⟨0, 3⟩ }
 
+/-- `lean-miri`'s state matching `arrayIndexOobPreAnneal`. -/
 def arrayIndexOobPreMiri : AnnealStepState :=
   { stack := ⟨#[arrayIndexOobPreMiriFrame]⟩, machine := AnnealMachine.empty }
 
+/-- The allocation-free prefix of `arrayIndexOobEntryBody`, from `initMachineState`. -/
 theorem arrayIndexOob_prefix_anneal :
     runAnnealBounded arrayIndexOobEntryBody 3 (initMachineState arrayIndexOobEntryBody []) =
       .running arrayIndexOobPreAnneal := rfl
 
+/-- The allocation-free prefix of `arrayIndexOobEntryBody`, from `miriEntryState`. -/
 theorem arrayIndexOob_prefix_miri :
     runLoopFuel (annealMiriHooks arrayIndexOobEntryBody) 3
       (miriEntryState arrayIndexOobEntryBody) = .running arrayIndexOobPreMiri := rfl
 
+/-- The post-prefix states of `arrayIndexOobEntryBody` are `StateRel`-related, and
+every `lean-miri` local is immediate. -/
 theorem arrayIndexOob_pre_stateRel_and_imm :
     StateRel arrayIndexOobEntryBody arrayIndexOobPreAnneal arrayIndexOobPreMiri ∧
     ∀ tf, arrayIndexOobPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
@@ -5259,9 +5293,11 @@ theorem indirectCallFive_reify_fnPtrs :
       s.memory.fnPtrs = [fiveFnPtrEntry] :=
   ⟨_, rfl, rfl⟩
 
+/-- `FnDef` type of the external `core::fmt::Arguments::<'a>::from_str` (no linked body). -/
 def fmtFromStrFnTy : Ty :=
   { kind := .fnDef "core::fmt::Arguments::<'a>::from_str" [], layoutIdx := 0 }
 
+/-- `FnDef` type of the diverging `core::panicking::panic_fmt`. -/
 def panicFmtFnTy : Ty :=
   { kind := .fnDef "core::panicking::panic_fmt" [], layoutIdx := 0 }
 
@@ -5282,10 +5318,17 @@ def panicExplicitMacroBody : CapturedMir :=
 /-- **Open `known_anneal_bug` ratchet boundary (`panic_explicit_macro`), from entry**:
 after `StorageLive(_1)`, Stage-1 emits `MirStepNode.extCall` for
 `"core::fmt::Arguments::<'a>::from_str"` before reaching `bb1`'s diverging
-`core::panicking::panic_fmt`. When the environment returns while preserving the
-root stack, `panic_fmt` unwinds to `MirOutcome.panic`, whereas an unconstrained
-`MirCallAns.panicked` with a `.unreachable` frame in `callStack` triggers `.ub`
-(`MirReachesUB` ∧ `¬ TreeSafe`). `lean-miri` stops with `.unsupported` (`¬ Safe`). -/
+`core::panicking::panic_fmt`. When the environment returns (keeping the root
+`callStack`), Stage-1 panics in `panic_fmt` (`ReachesRet … .panic`). The
+`MirReachesUB` / `¬ TreeSafe` conjuncts do not come from the program: Stage-1's
+`MirCallAns.panicked` answer carries a whole `Memory`, and `applyUnwindAction` for
+the call's `UnwindAction::Continue` unwinds through that memory's `callStack`, so
+the answer `memBad`, whose `callStack` holds a caller frame (never pushed by the
+program) with `UnwindAction::Unreachable`, faults. Every reachable external call
+with `UnwindAction::Continue` is exposed to such answers
+(`anneal_extCall_continue_unwind_ub`; see the external-call boundary in
+`Safety.lean`). `lean-miri`, which models no external functions, stops
+with `.unsupported` (`¬ Safe`). -/
 theorem w5_panic_explicit_macro_extCall_boundary :
     (∃ s₁ req k,
       stepMirFn panicExplicitMacroBody (initMachineState panicExplicitMacroBody []) = .step s₁ ∧
