@@ -292,14 +292,15 @@ Kernel-certified divergences (outside every agreed fragment, as of Stage-1):
     `stepMirFn_stage1_unmodeled_intrinsic_extCall`,
     `call_intrinsic_rotate_stage1_boundary`), while `lean-miri` executes
     `write_bytes` and fails closed on the rotations. Whole programs:
-    `MiriDiffWitnesses.w6_write_bytes_read_extCall_divergence` (`lean-miri` is
-    `System.Safe` and returns `0xABABABABABABABAB`, while Anneal returns the
-    unchanged `42` when the environment returns `()`, and is not `TreeSafe`
-    because the environment may unwind into `UnwindAction::Unreachable`),
-    `MiriDiffWitnesses.w6_write_bytes_oob_extCall_divergence` (undefined
-    behavior in `lean-miri`, a normal return in Anneal),
-    `MiriDiffWitnesses.w6_write_bytes_extCall_boundary`, and
-    `MiriDiffWitnesses.w6_rotate_left_extCall_boundary`;
+    `MiriDiffWitnesses.w6_write_bytes_read_extCall_divergence` (from program entry:
+    `lean-miri` is `System.Safe` and returns `0xABABABABABABABAB`, while Anneal
+    returns the unchanged `42` when the environment returns `()`, and is not
+    `TreeSafe` because the environment may unwind into `UnwindAction::Unreachable`),
+    `MiriDiffWitnesses.w6_write_bytes_oob_extCall_divergence` (from program entry:
+    undefined behavior in `lean-miri`, a normal return of the unchanged `42` in
+    Anneal), and `MiriDiffWitnesses.w6_rotate_left_extCall_boundary` (from entry);
+    `MiriDiffWitnesses.w6_write_bytes_extCall_boundary` certifies the lockstep
+    prefix from the `ptr4AnnealPre` / `ptr4MiriPre` states of `WitLM4_2`;
   * the inline intrinsics outside `AnnealIntrinsic` that Stage-1 evaluates and
     `annealCallHooks` fails closed on
     (`step_call_nonAnnealIntrinsic_miri_unsupported`).
@@ -337,7 +338,17 @@ for a raw-pointer `_0` (`StepObsRelLM3_1`, `PtrRetRel`),
 `LM-2.3` enum, and `LM-2.4` union (`step_terminator_return_union_lm2_4_simulation`,
 `StepRelUnionReturnLM2_4`, `UnionRetRel`) aggregate returns; a zero-sized `()`
 root return is certified for the `LM-4.1` interpreter
-(`wit_lm4_1_zst_unit_return_simulation`).
+(`wit_lm4_1_zst_unit_return_simulation`). The union root return excludes an
+uninitialized memory-backed `_0` (`hnot_uninit_ind`): `annealControlHooks.returnOperand`
+returns the place of an indirect `_0` without reading its bytes, while Stage-1's
+`Return` of an uninitialized `_0` is undefined behavior. The memory-backed return
+relations (`StructRetRel`, `EnumRetRel`, `UnionRetRel`, and the indirect case of
+`MultiFrameRetRel`) relate the returned place to Anneal's value under some
+`AnnealMachine` (the return relation sees the returned operand, not the final
+memory), so for memory-backed `_0` the whole-program theorems certify the returned
+place's shape, and the per-step relations (`StepRelUnionReturnLM2_4.retRootUnion`,
+`StepRelStructReturnLM2_2`, `StepRelEnumReturnLM2_3`) certify its contents in the
+actual final machine.
 
 Further boundaries of the whole-program agreement:
 
@@ -368,6 +379,13 @@ Further boundaries of the whole-program agreement:
   agreement is stated for linked callees (`callHooks`), and the Stage-1
   external-call witnesses (`MiriDiffWitnesses.anneal_extCall_boundary`) fix the
   environment's response explicitly.
+* `AnnealMachine` has no function-pointer registry, so the `LM-4.1` hooks read
+  function pointers from a static table (`annealStepHooksLM4_1 … fnPtrs`,
+  `MiriDiffWitnesses.callHooks … fnPtrs`) instead of registering them at
+  `ReifyFnPointer` time: the whole-program indirect-call witness
+  `MiriDiffWitnesses.w5_indirect_fnPtr_call_returns` seeds that table with the entry
+  (`fiveFnPtrEntry`) that Stage-1's `ReifyFnPointer` adds to `Memory.fnPtrs` during
+  the run (`MiriDiffWitnesses.indirectCallFive_reify_fnPtrs`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Safety

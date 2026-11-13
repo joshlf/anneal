@@ -103,11 +103,13 @@ agreeing whole-program facts.
    `w6_copy_nonoverlapping_overlap_ub` (Stage-1 `copy_nonoverlapping`), and the
    Stage-1 external-call boundary, where Stage-1 hands the intrinsic to the
    environment (`anneal_extCall_boundary`): `w6_rotate_left_extCall_boundary`
-   (`.unsupported` in `lean-miri`), `w6_write_bytes_extCall_boundary`,
-   `w6_write_bytes_oob_extCall_divergence` (undefined behavior in `lean-miri`, a
-   normal return in Anneal), and `w6_write_bytes_read_extCall_divergence`
-   (`lean-miri` is `System.Safe` and returns the written bytes, while Anneal
-   returns the unchanged value and is not `TreeSafe`).
+   (from entry; `.unsupported` in `lean-miri`), `w6_write_bytes_extCall_boundary`
+   (lockstep prefix from `WitnessLM4_2.ptr4AnnealPre` / `ptr4MiriPre`), and, from
+   program entry, `w6_write_bytes_read_extCall_divergence` (`lean-miri` is
+   `System.Safe` and returns the written bytes, while Anneal returns the unchanged
+   value and is not `TreeSafe`) and `w6_write_bytes_oob_extCall_divergence`
+   (undefined behavior in `lean-miri`, a normal return of the unchanged value in
+   Anneal).
 
 `AgreeReturns` / `AgreeReturnsBits` (both machines `TreeSafe` / `System.Safe`
 and returning the same value), `AgreeUB` (both reach undefined behavior and
@@ -120,9 +122,13 @@ The `*_lockstep` witnesses reuse upstream bodies that never write `_0`; they
 certify the lockstep segment (`AgreeReaches`) and state that Anneal's whole
 program then faults at the root return. Stage-1 external calls are followed
 through `coStep_of_extCall` for an explicit environment response
-(`MirCallAns`). The `write_bytes` run of `lean-miri` is certified against the
-pre-Stage-1 reference model `stepMirFnLM4_2` (`retWriteBytesRead_ref_trace`), which
-executes the intrinsic inline like `lean-miri`.
+(`MirCallAns`), after a running prefix from program entry
+(`anneal_extCall_boundary_of_prefix`). The `write_bytes` runs of `lean-miri` are
+certified against the pre-Stage-1 reference model `stepMirFnLM4_2`
+(`retWriteBytesRead_ref_trace`, `w6_write_bytes_oob_extCall_divergence`), which
+executes the intrinsic inline like `lean-miri`. Witnesses without a corpus program
+of that name (the out-of-bounds `write_bytes` and overlapping
+`copy_nonoverlapping` bodies) are marked as such.
 -/
 
 namespace LeanMiriSpec.Correspondence.MiriDiffWitnesses
@@ -382,6 +388,47 @@ theorem anneal_extCall_boundary {body : CapturedMir} {s sₙ sᵣ sₖ : Machine
     rw [hres] at h
     exact h.trans hAr.coReach
   have hp := hA.coReach.tail (coStep_of_extCall hs (.panicked memP))
+  exact ⟨anneal_reachesRet_of_coReach hr hret, anneal_ub_of_coReach hp rfl⟩
+
+/-- A running `runAnnealBounded` prefix is a `CoReach` path of Anneal's
+coalgebra (used to start the Stage-1 external-call witnesses at program entry). -/
+theorem coReach_of_runAnnealBounded_running {body : CapturedMir} {n : Nat} {s s' : MachineState}
+    (h : runAnnealBounded body n s = .running s') :
+    CoReach (stepMirState body) (.running s) (.running s') := by
+  induction n generalizing s with
+  | zero => cases h; exact .refl _
+  | succ n ih =>
+    rcases anneal_step_classify body s with
+      ⟨s₁, hrun, hsucc⟩ | ⟨out, hrun, _, _⟩ | ⟨k', hrun, _⟩ | hrun
+    · rw [hrun] at h
+      exact .head ((hsucc _).2 rfl) (ih h)
+    · rw [hrun] at h
+      rcases out with ⟨rv, mm⟩ | _ | _ <;> cases h
+    · rw [hrun] at h; cases h
+    · rw [hrun] at h; cases h
+
+/-- `anneal_extCall_boundary` after a running `runAnnealBounded` prefix from `s₀`
+(e.g. `initMachineState body []`) to the start `s` of the Anneal path. -/
+theorem anneal_extCall_boundary_of_prefix {body : CapturedMir} {s₀ s sₙ sᵣ sₖ : MachineState}
+    {p : Nat} {req : MirCallReq} {locals : List LocalSlot} {dest : Place}
+    {targetBb : BasicBlockIdx}
+    (hpa : runAnnealBounded body p s₀ = .running s)
+    (hA : AnnealPath body s sₙ)
+    (hs : stepMirFn body sₙ =
+      MirStepNode.extCall req (resumeExternalCall sₙ locals dest targetBb .unreachable))
+    {retVal v : Value} {mem memR : Memory}
+    (hres : resumeExternalCall sₙ locals dest targetBb .unreachable (.returned retVal mem) =
+      .running sᵣ)
+    (hAr : AnnealPath body sᵣ sₖ)
+    (hret : stepMirFn body sₖ = MirStepNode.retNormal v memR) (memP : Memory) :
+    (∃ tr, ReachesRet (mirTree body s₀) tr (.normal (v, memR))) ∧
+    MirReachesUB (mirTree body s₀) ∧ ¬ TreeSafe (mirTree body s₀) := by
+  have hpre := coReach_of_runAnnealBounded_running hpa
+  have hr : CoReach (stepMirState body) (.running s₀) (.running sₖ) := by
+    have h := (hpre.trans hA.coReach).tail (coStep_of_extCall hs (.returned retVal mem))
+    rw [hres] at h
+    exact h.trans hAr.coReach
+  have hp := (hpre.trans hA.coReach).tail (coStep_of_extCall hs (.panicked memP))
   exact ⟨anneal_reachesRet_of_coReach hr hret, anneal_ub_of_coReach hp rfl⟩
 
 /-! ## 1. Scalar arithmetic, casts, `SwitchInt`, `Assert`, and a diverging loop -/
@@ -3705,8 +3752,9 @@ theorem w2_union_overlay_type_punning_returns :
 
 /-! ## 6. Intrinsics (memory) -/
 
-/-- `CopyNonOverlapping` with overlapping source and destination
-(`ub_copy_nonoverlapping_overlap`) is undefined behavior in both machines. -/
+/-- `CopyNonOverlapping` with overlapping source and destination (`src = dst`,
+`WitnessLM4_2.copySingleMutBody 1`; no `miri-diff` corpus program) is undefined
+behavior in both machines. -/
 theorem w6_copy_nonoverlapping_overlap_ub :
     AgreeUB (WitnessLM4_2.copySingleMutBody 1) (annealMiriHooks (WitnessLM4_2.copySingleMutBody 1))
       (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.copySingleMutBody 1))
@@ -3816,46 +3864,6 @@ theorem w6_write_bytes_extCall_boundary :
   exact ⟨m₁, m₂, agreeReaches_of_paths (.step .silent hs₁ (.refl _))
       (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _)),
     hext, ⟨tr, _, hrr⟩, hub, hns, hM₂.reaches, s₂, hrel₂, hget⟩
-
-/-- **Stage-1 external-call divergence** (`write_bytes::<u64>(ptr, 0xAB, 2)` past the
-end of `_1`, `ub_write_bytes_oob`): `lean-miri` reports the out-of-bounds write as
-undefined behavior (`miriSystem` reaches `.undefinedBehavior` and is not `Safe`),
-whereas Stage-1 `stepMirFn` hands the call to the environment without checking it
-(`WitnessLM4_2.wit_lm4_2_write_bytes_oob_boundary`), and Anneal's whole program
-returns `()` when the environment returns `()` without touching memory. (Before
-Stage-1, both machines reported undefined behavior.) -/
-theorem w6_write_bytes_oob_extCall_divergence :
-    (∃ tr mem, ReachesRet (mirTree (WitnessLM4_2.writeBytesMutBody 0xAB 2)
-        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 2))) tr
-          (.normal (.unit, mem))) ∧
-    (∃ e, (miriSystem (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 2))).ReachesOutcome
-      (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 2) WitnessLM4_2.unitK)
-      (.undefinedBehavior e)) ∧
-    ¬ (miriSystem (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 2))).Safe
-      (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 2) WitnessLM4_2.unitK) := by
-  obtain ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, hext, herr⟩ :=
-    WitnessLM4_2.wit_lm4_2_write_bytes_oob_boundary
-  have hs₁' : stepMirFn (WitnessLM4_2.writeBytesMutBody 0xAB 2)
-      (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 2)) =
-      .step (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 2)) := rfl
-  have hs_eq : s₁ = wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 2) := by
-    have h := hs₁.symm.trans hs₁'
-    unfold MirStepNode.step at h
-    injection h with h
-    injection h
-  subst hs_eq
-  obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
-  obtain ⟨⟨tr, hrr⟩, _, _⟩ := anneal_extCall_boundary
-    (retVal := .unit) (v := .unit)
-    (mem := (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 2)).memory)
-    (.step .silent hs₁ (.refl _)) hext rfl (.refl _) rfl
-    (wbAddrOfState (WitnessLM4_2.writeBytesMutBody 0xAB 2)).memory
-  have hM : MiriPath (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 2))
-      (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 2) WitnessLM4_2.unitK) m₁ :=
-    .step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _)
-  have h := miri_outcome_of_path_error hM herr
-  rw [classifyError_eq_ub_iff.2 ⟨rfl, rfl⟩] at h
-  exact ⟨⟨tr, _, hrr⟩, ⟨_, h.1⟩, h.2⟩
 
 /-- `I-11` (`pass_tb_unsafe_cell_shared_mutation`): through `&UnsafeCell<u32>`
 (a `Cell` tag), a foreign write through an unrelated raw pointer leaves the
@@ -4535,13 +4543,27 @@ def indirectCallFiveBody : CapturedMir :=
 
 /-- **Stage-1 `ReifyFnPointer` + indirect `FnPtr` call and return, from entry**:
 `indirectCallFiveBody` coerces `crate::five` to `fn() -> u8`, calls `move _2`
-indirectly, receives `5_u8`, and returns `5_u8` in both machines (`AgreeReturnsBits`). -/
+indirectly, receives `5_u8`, and returns `5_u8` in both machines (`AgreeReturnsBits`).
+`AnnealMachine` has no function-pointer registry, so the `lean-miri` hooks read the
+function pointer from the static table `[fiveFnPtrEntry]` (`callHooks … fnPtrs`),
+the entry that Stage-1's `ReifyFnPointer` registers in `Memory.fnPtrs` during the
+run (`indirectCallFive_reify_fnPtrs`). -/
 theorem w5_indirect_fnPtr_call_returns :
     AgreeReturnsBits indirectCallFiveBody
       (callHooks indirectCallFiveBody [fiveBody] [fiveFnPtrEntry])
       (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody])
       (miriEntryState indirectCallFiveBody) 1 5 :=
   agreeReturnsBits_of_obs (N := 12) (M := 12) (by decide) (by decide +kernel)
+
+/-- The static function-pointer table `[fiveFnPtrEntry]` of
+`w5_indirect_fnPtr_call_returns` is the one Stage-1 builds: after
+`StorageLive(_1); StorageLive(_2); _2 = crate::five as fn() -> u8 (ReifyFnPointer)`,
+Anneal's `Memory.fnPtrs` is exactly `[fiveFnPtrEntry]`. -/
+theorem indirectCallFive_reify_fnPtrs :
+    ∃ s, runAnnealBounded indirectCallFiveBody 3
+        (initMachineStateWithCallees indirectCallFiveBody [] [fiveBody]) = .running s ∧
+      s.memory.fnPtrs = [fiveFnPtrEntry] :=
+  ⟨_, rfl, rfl⟩
 
 /-! ## 7. Whole-program return traces for `LM-4.2` intrinsics and the
 checked-addition closed simulation -/
@@ -4905,14 +4927,14 @@ theorem retStepRelLM3_1_retNormal_rel
     exact ⟨decl0', imm0', hdecl', hop', himm', hm⟩
   | ub _ _ => cases ha
 
-/-- `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb1` into the unit local
-`_3`. -/
+/-- `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2` into the unit local
+`_3` (block `bb1` of `retWriteBytesReadBody`). -/
 def retWriteBytesTerm : TerminatorKind :=
   .call (.constant (WitnessLM4_2.fnItem "core::intrinsics::write_bytes" WitnessLM4_2.u64K))
     [.copy (WitnessLM4_2.local42 2),
      .constant (WitnessLM4_2.constInt WitnessLM4_2.u8K 0xAB 1),
      .constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 1 8)]
-    (WitnessLM4_2.local42 3) (some 1) .unreachable
+    (WitnessLM4_2.local42 3) (some 2) .unreachable
 
 /-! ### `write_bytes` return trace
 
@@ -5179,13 +5201,15 @@ theorem retWriteBytesCall_preserves_imm
     injection htf' with h₁; injection h₁ with h₁'; subst h₁'
     exact himm₄ j hj
 
-/-- Whole-program `write_bytes` witness that returns the written bytes
+/-- Whole-program `write_bytes` read-back witness, run from program entry
 (`_0 : u64`, `_1 : u64`, `_2 : *mut u64`, `_3 : ()`):
 
 ```text
-bb0: _2 = &raw mut _1;
-     _3 = write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb1;
-bb1: _0 = copy (*_2);
+bb0: StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 42_u64;
+     goto -> bb1;
+bb1: _2 = &raw mut _1;
+     _3 = write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2;
+bb2: _0 = copy (*_2);
      return
 ``` -/
 def retWriteBytesReadBody : CapturedMir where
@@ -5196,6 +5220,12 @@ def retWriteBytesReadBody : CapturedMir where
   localDecls := [WitnessLM4_2.declOf WitnessLM4_2.u64K, WitnessLM4_2.declOf WitnessLM4_2.u64K,
     WitnessLM4_2.declOf WitnessLM4_2.rawMutU64K, WitnessLM4_2.declOf WitnessLM4_2.unitK]
   basicBlocks := [
+    { statements := [WitnessLM4_2.mkStmt42 (.storageLive 1), WitnessLM4_2.mkStmt42 (.storageLive 2),
+        WitnessLM4_2.mkStmt42 (.storageLive 3),
+        WitnessLM4_2.mkStmt42 (.assign (WitnessLM4_2.local42 1)
+          (.use (.constant (WitnessLM4_2.constInt WitnessLM4_2.u64K 42 8))))]
+      terminator := WitnessLM4_2.mkTerm42 (.goto 1)
+      isCleanup := false },
     { statements := [WitnessLM4_2.mkStmt42
         (.assign (WitnessLM4_2.local42 2) (.rawPtr .mut (WitnessLM4_2.local42 1)))]
       terminator := WitnessLM4_2.mkTerm42 retWriteBytesTerm
@@ -5208,50 +5238,90 @@ def retWriteBytesReadBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- The `ptr4AnnealPre` / `ptr4MiriPre` pre-states of `retWriteBytesReadBody`
-(`_1 = 42_u64`, all other locals uninitialized) are `StateRel`-related. -/
-theorem retWriteBytesRead_stateRel :
-    StateRel retWriteBytesReadBody (WitnessLM4_2.ptr4AnnealPre retWriteBytesReadBody)
-      (WitnessLM4_2.ptr4MiriPre retWriteBytesReadBody WitnessLM4_2.u64K) := by
-  let b := retWriteBytesReadBody
-  refine StateRel.mk (WitnessLM4_2.ptr4MiriFramePre b WitnessLM4_2.u64K) rfl rfl
-    ⟨translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K), rfl⟩ ?_ rfl rfl rfl rfl rfl (by
-      intro i _ _ _ _ _ _ hi _
-      revert hi
-      match i with
-      | 0 | 1 | 2 | 3 | _ + 4 => rintro ⟨⟩)
-  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
-  intro i decl slot mls hdecl hslot hmls
-  match i with
-  | 0 | 2 | 3 =>
-    have hs : slot = .uninit := by simpa [WitnessLM4_2.ptr4AnnealPre, get?] using hslot.symm
-    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
-      simpa [WitnessLM4_2.ptr4MiriFramePre] using hmls.symm
-    subst hs hm
-    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
-  | 1 =>
-    have hd : decl = WitnessLM4_2.declOf WitnessLM4_2.u64K := by
-      simpa [b, retWriteBytesReadBody, get?] using hdecl.symm
-    have hs : slot = .init (.scalar ⟨42, 8⟩) := by
-      simpa [WitnessLM4_2.ptr4AnnealPre, get?] using hslot.symm
-    have hm : mls =
-        { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
-          layout := some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)) } := by
-      simpa [WitnessLM4_2.ptr4MiriFramePre] using hmls.symm
-    subst hd hs hm
-    exact .immediate _ _ (some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)))
-      (fun _ h => Option.some.inj h.symm)
-      (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl
-        (fun h => nomatch h) (fun h => nomatch h)⟩)
-  | _ + 4 => simp [retWriteBytesReadBody, get?] at hdecl
+/-- Anneal's state of `retWriteBytesReadBody` after the entry block `bb0`
+(`_1 = 42_u64`, every other local uninitialized, at `bb1`). -/
+def retWriteBytesReadPreAnneal : MachineState :=
+  { frame := { blockIdx := 1, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit, .uninit] }
+    memory := (initMachineState retWriteBytesReadBody []).memory }
 
-/-- **`retWriteBytesRead_ref_trace`**: `lean-miri`'s whole-program run of
-`retWriteBytesReadBody`, from `ptr4MiriPre`, to its root return, in lockstep with
-the pre-Stage-1 reference model `stepMirFnLM4_2` at the `write_bytes` call and with
-Stage-1 `stepMirFn` elsewhere, from `ptr4AnnealPre`:
+/-- `lean-miri`'s root frame of `retWriteBytesReadBody` after the entry block `bb0`. -/
+def retWriteBytesReadPreMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { (miriEntryFrame retWriteBytesReadBody) with
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)) },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    location := .mir ⟨1, 0⟩ }
+
+/-- `lean-miri`'s state of `retWriteBytesReadBody` after the entry block `bb0`. -/
+def retWriteBytesReadPreMiri : AnnealStepState :=
+  { stack := ⟨#[retWriteBytesReadPreMiriFrame]⟩, machine := AnnealMachine.empty }
+
+/-- The entry block (three `StorageLive`s, `_1 = const 42_u64`, `goto`) of
+`retWriteBytesReadBody`, from `initMachineState`. -/
+theorem retWriteBytesRead_prefix_anneal :
+    runAnnealBounded retWriteBytesReadBody 5 (initMachineState retWriteBytesReadBody []) =
+      .running retWriteBytesReadPreAnneal := rfl
+
+/-- The entry block of `retWriteBytesReadBody`, from `miriEntryState`. -/
+theorem retWriteBytesRead_prefix_miri :
+    runLoopFuel (annealMiriHooks retWriteBytesReadBody) 5 (miriEntryState retWriteBytesReadBody) =
+      .running retWriteBytesReadPreMiri := rfl
+
+/-- The post-entry-block states of `retWriteBytesReadBody` (`_1 = 42_u64`, all
+other locals uninitialized) are `StateRel`-related, and every `lean-miri` local is
+immediate. -/
+theorem retWriteBytesRead_stateRel :
+    StateRel retWriteBytesReadBody retWriteBytesReadPreAnneal retWriteBytesReadPreMiri ∧
+    ∀ tf, retWriteBytesReadPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+  refine ⟨?_, ?_⟩
+  · refine StateRel.mk retWriteBytesReadPreMiriFrame rfl rfl
+      ⟨translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K), rfl⟩ ?_ rfl rfl rfl rfl rfl (by
+        intro i _ _ _ _ _ _ hi _
+        match i with | 0 | 1 | 2 | 3 | _ + 4 => simp [retWriteBytesReadPreMiriFrame] at hi)
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 | 2 | 3 =>
+      have hs : slot = .uninit := by simpa [retWriteBytesReadPreAnneal, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [retWriteBytesReadPreMiriFrame] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 1 =>
+      have hd : decl = WitnessLM4_2.declOf WitnessLM4_2.u64K := by
+        simpa [retWriteBytesReadBody, get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨42, 8⟩) := by
+        simpa [retWriteBytesReadPreAnneal, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+            layout := some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)) } := by
+        simpa [retWriteBytesReadPreMiriFrame] using hmls.symm
+      subst hd hs hm
+      exact .immediate _ _ (some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)))
+        (fun _ h => Option.some.inj h.symm)
+        (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl
+          (fun h => nomatch h) (fun h => nomatch h)⟩)
+    | _ + 4 => simp [retWriteBytesReadBody, get?] at hdecl
+  · intro tf h k mls hmls mp hv
+    have htf : retWriteBytesReadPreMiriFrame = tf := by simpa [retWriteBytesReadPreMiri] using h
+    subst htf
+    match k with
+    | 0 | 1 | 2 | 3 => simp [retWriteBytesReadPreMiriFrame] at hmls; subst hmls; cases hv
+    | _ + 4 => simp [retWriteBytesReadPreMiriFrame] at hmls
+
+/-- **`retWriteBytesRead_ref_trace`**: `lean-miri`'s run of `retWriteBytesReadBody`
+from the post-entry-block state `retWriteBytesReadPreMiri` (reached from
+`miriEntryState`, `retWriteBytesRead_prefix_miri`) to its root return, in lockstep
+with the pre-Stage-1 reference model `stepMirFnLM4_2` at the `write_bytes` call
+and with Stage-1 `stepMirFn` elsewhere, from `retWriteBytesReadPreAnneal`:
 
 1. `_2 = &raw mut _1` (`stepMirFn`);
-2. `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb1`, which `lean-miri` and
+2. `write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2`, which `lean-miri` and
    the reference model execute inline, filling all 8 bytes of `_1` with `0xAB`
    (`0xABAB_ABAB_ABAB_ABAB = 12370169555311111083`); Stage-1 `stepMirFn` instead
    hands the call to the environment (`MirStepNode.extCall`, the conjunct after
@@ -5270,9 +5340,8 @@ theorem retWriteBytesRead_ref_trace :
       let b := retWriteBytesReadBody
       let hooks := annealStepHooks b.localDecls b.layouts
       let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
-      stepMirFn b (WitnessLM4_2.ptr4AnnealPre b) = .step s₁ ∧
-      Miri.Interpreter.Step.step hooks ()
-        (WitnessLM4_2.ptr4MiriPre b WitnessLM4_2.u64K) = (m₁, .ok true) ∧
+      stepMirFn b retWriteBytesReadPreAnneal = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () retWriteBytesReadPreMiri = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
       stepMirFnLM4_2 b s₁ = .step s₂ ∧
       stepMirFn b s₁ =
@@ -5280,7 +5349,7 @@ theorem retWriteBytesRead_ref_trace :
           { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
             args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
             memory := s₁.memory }
-          (resumeExternalCall s₁ s₁.frame.locals (WitnessLM4_2.local42 3) 1 .unreachable) ∧
+          (resumeExternalCall s₁ s₁.frame.locals (WitnessLM4_2.local42 3) 2 .unreachable) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       StateRelLM3_1 b s₂ m₂ [entry] ∧
       get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) ∧
@@ -5294,35 +5363,31 @@ theorem retWriteBytesRead_ref_trace :
       annealControlHooks.returnOperand () m₃ = (m₃, .ok (.immediate imm0)) ∧
       ImmediateRel decl0.ty b.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 := by
   let b := retWriteBytesReadBody
-  have hrel₀ : StateRel b (WitnessLM4_2.ptr4AnnealPre b)
-      (WitnessLM4_2.ptr4MiriPre b WitnessLM4_2.u64K) := retWriteBytesRead_stateRel
+  obtain ⟨hrel₀, himm₀_all⟩ := retWriteBytesRead_stateRel
   have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
-  have himm₀ : ∀ tf, (WitnessLM4_2.ptr4MiriPre b WitnessLM4_2.u64K).stack.frames = #[tf] →
+  have himm₀ : ∀ tf, retWriteBytesReadPreMiri.stack.frames = #[tf] →
       IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 1 :=
-    fun tf htf =>
-      ⟨WitnessLM4_2.ptr4_all_immediate b _ tf htf 2,
-       WitnessLM4_2.ptr4_all_immediate b _ tf htf 1⟩
+    fun tf htf => ⟨himm₀_all tf htf 2, himm₀_all tf htf 1⟩
   let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
   -- Step 1: `_2 = &raw mut _1`.
-  let s₁ := WitnessLM4_2.mkPtrState b 0 1
+  let s₁ := WitnessLM4_2.mkPtrState b 1 1
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
     [entry.toBorrowEntry] 2
-  have hs₁ : stepMirFn b (WitnessLM4_2.ptr4AnnealPre b) = .step s₁ := rfl
+  have hs₁ : stepMirFn b retWriteBytesReadPreAnneal = .step s₁ := rfl
   have hsim₁ := step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty
   rw [hs₁] at hsim₁
   obtain ⟨m₁, hm₁, hrel₁⟩ := hsim₁.miri_step_of_anneal_step
-  have htag₀ : (WitnessLM4_2.ptr4AnnealPre b).memory.nextTag = 1 := rfl
-  have hid₀ : (⟨(WitnessLM4_2.ptr4MiriPre b WitnessLM4_2.u64K).machine.memory.nextAllocId,
+  have htag₀ : retWriteBytesReadPreAnneal.memory.nextTag = 1 := rfl
+  have hid₀ : (⟨retWriteBytesReadPreMiri.machine.memory.nextAllocId,
       AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = Witness.lm31AllocId1 := rfl
   rw [htag₀, hid₀] at hrel₁
   obtain ⟨_, himm₁_step⟩ := Witness.step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
   have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
-    fun tf₁ htf₁ k hne =>
-      himm₁_step _ tf₁ rfl htf₁ k hne (WitnessLM4_2.ptr4_all_immediate b _ _ rfl k)
-  -- Step 2: `_3 = write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb1`.
-  let s₂ := WitnessLM4_2.mkPtrState b 1 0
+    fun tf₁ htf₁ k hne => himm₁_step _ tf₁ rfl htf₁ k hne (himm₀_all _ rfl k)
+  -- Step 2: `_3 = write_bytes::<u64>(copy _2, 0xAB_u8, 1_usize) -> bb2`.
+  let s₂ := WitnessLM4_2.mkPtrState b 2 0
     [.uninit, .init (.scalar ⟨0xABABABABABABABAB, 8⟩),
       .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
     [entry.toBorrowEntry] 2
@@ -5382,7 +5447,7 @@ theorem retWriteBytesRead_ref_trace :
       WitnessLM4_2.u8_integral hvalOp WitnessLM4_2.usize_integral hcountOp rfl hm₂
       tf₁ tf₂ htf₁ htf₂ k (himm₁ tf₁ htf₁ k hne)
   -- Step 3: `_0 = copy (*_2)`.
-  let s₃ := WitnessLM4_2.mkPtrState b 1 1
+  let s₃ := WitnessLM4_2.mkPtrState b 2 1
     [.init (.scalar ⟨0xABABABABABABABAB, 8⟩), .init (.scalar ⟨0xABABABABABABABAB, 8⟩),
       .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
     [entry.toBorrowEntry] 2
@@ -6977,15 +7042,16 @@ theorem w3_arith_offset_returns :
       (.refl _)))
     hmret rfl (by change (annealControlHooks.returnOperand () m₂).2 = _; rw [hop])
 
-/-- **Stage-1 external-call divergence, whole program** (`retWriteBytesReadBody`):
-`_2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 1) -> bb1;
-bb1: _0 = copy (*_2); return`.
+/-- **Stage-1 external-call divergence, whole program from entry**
+(`retWriteBytesReadBody`): `StorageLive(_1.._3); _1 = const 42_u64; goto bb1;
+bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 1) -> bb2;
+bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
 
 * `lean-miri` fills `_1` with `0xAB` bytes through the raw pointer, reads them back
   through it, and its whole program is `System.Safe`, returns
   `0xABABABABABABABAB_u64` (`ImmediateRel`), and is partially correct only for that
-  value (`retWriteBytesRead_ref_trace`, in lockstep with the pre-Stage-1 reference
-  model).
+  value (`retWriteBytesRead_prefix_miri`, then `retWriteBytesRead_ref_trace`, in
+  lockstep with the pre-Stage-1 reference model).
 * Stage-1 `stepMirFn` hands `write_bytes` to the environment, and an environment
   response cannot write Anneal's stack locals (`resumeExternalCall` keeps the
   caller's locals): when the environment returns `()` without touching memory,
@@ -6995,57 +7061,300 @@ bb1: _0 = copy (*_2); return`.
 theorem w6_write_bytes_read_extCall_divergence :
     ∃ (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
       (miriSystem (annealMiriHooks retWriteBytesReadBody)).Safe
-        (WitnessLM4_2.ptr4MiriPre retWriteBytesReadBody WitnessLM4_2.u64K) ∧
+        (miriEntryState retWriteBytesReadBody) ∧
       (miriSystem (annealMiriHooks retWriteBytesReadBody)).ReachesOutcome
-        (WitnessLM4_2.ptr4MiriPre retWriteBytesReadBody WitnessLM4_2.u64K)
-        (.returned (.immediate imm0)) ∧
+        (miriEntryState retWriteBytesReadBody) (.returned (.immediate imm0)) ∧
       (miriSystem (annealMiriHooks retWriteBytesReadBody)).PartialCorrect
-        (WitnessLM4_2.ptr4MiriPre retWriteBytesReadBody WitnessLM4_2.u64K) (· = .immediate imm0) ∧
+        (miriEntryState retWriteBytesReadBody) (· = .immediate imm0) ∧
       get? retWriteBytesReadBody.localDecls 0 = some decl0 ∧
       ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 ∧
-      (∃ tr mem, ReachesRet (mirTree retWriteBytesReadBody
-        (WitnessLM4_2.ptr4AnnealPre retWriteBytesReadBody)) tr (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-      MirReachesUB (mirTree retWriteBytesReadBody
-        (WitnessLM4_2.ptr4AnnealPre retWriteBytesReadBody)) ∧
-      ¬ TreeSafe (mirTree retWriteBytesReadBody
-        (WitnessLM4_2.ptr4AnnealPre retWriteBytesReadBody)) := by
+      (∃ tr mem, ReachesRet (mirCallTree retWriteBytesReadBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+      MirReachesUB (mirCallTree retWriteBytesReadBody []) ∧
+      ¬ TreeSafe (mirCallTree retWriteBytesReadBody []) := by
   obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, decl0, imm0, hs₁, hm₁, _, _, hext, hm₂, _, _, _, hm₃, _, _, _,
     hmret, hdecl0, hop, himm⟩ := retWriteBytesRead_ref_trace
-  -- `lean-miri`: the whole run is a `MiriPath` to the root pop.
+  -- `lean-miri`: the entry block, then the traced run to the root pop.
   have hpath : MiriPath (annealMiriHooks retWriteBytesReadBody)
-      (WitnessLM4_2.ptr4MiriPre retWriteBytesReadBody WitnessLM4_2.u64K) m₃ :=
-    .step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_step_ok_true hm₃)
-      (.step hm₃ (frames_ne_of_step_ok_true hmret) (.refl _)))
+      (miriEntryState retWriteBytesReadBody) m₃ :=
+    (MiriPath.of_runLoopFuel retWriteBytesRead_prefix_miri).trans
+      (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_step_ok_true hm₃)
+        (.step hm₃ (frames_ne_of_step_ok_true hmret) (.refl _))))
   obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_path_return hpath hmret rfl
     (by change (annealControlHooks.returnOperand () m₃).2 = _; rw [hop])
-  -- Anneal: the `&raw mut` step, the external call, and the read of the unchanged `_1`.
-  have hs₁' : stepMirFn retWriteBytesReadBody (WitnessLM4_2.ptr4AnnealPre retWriteBytesReadBody) =
-      .step (wbAddrOfState retWriteBytesReadBody) := rfl
-  have hs_eq : s₁ = wbAddrOfState retWriteBytesReadBody := by
+  -- Anneal: the entry block, the `&raw mut` step, the external call, and the read
+  -- of the unchanged `_1`.
+  let entry := rawPtrAllocMapEntry retWriteBytesReadBody.localDecls retWriteBytesReadBody.layouts
+    .mut 1 1 Witness.lm31AllocId1
+  have hs₁' : stepMirFn retWriteBytesReadBody retWriteBytesReadPreAnneal =
+      .step (WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 1
+        [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+          .uninit]
+        [entry.toBorrowEntry] 2) := rfl
+  have hs_eq : s₁ = WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 1
+      [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+        .uninit]
+      [entry.toBorrowEntry] 2 := by
     have h := hs₁.symm.trans hs₁'
     unfold MirStepNode.step at h
     injection h with h
     injection h
   subst hs_eq
-  let entry := rawPtrAllocMapEntry retWriteBytesReadBody.localDecls retWriteBytesReadBody.layouts
-    .mut 1 1 Witness.lm31AllocId1
-  let sᵣ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 0
+  let sᵣ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 2 0
     [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
       .init .unit]
     [entry.toBorrowEntry] 2
-  let sₖ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 1 1
+  let sₖ := WitnessLM4_2.mkPtrState retWriteBytesReadBody 2 1
     [.init (.scalar ⟨42, 8⟩), .init (.scalar ⟨42, 8⟩),
       .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init .unit]
     [entry.toBorrowEntry] 2
   have hk : stepMirFn retWriteBytesReadBody sᵣ = .step sₖ := rfl
-  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary (sᵣ := sᵣ) (sₖ := sₖ)
-    (retVal := .unit) (v := .scalar ⟨42, 8⟩)
-    (mem := (wbAddrOfState retWriteBytesReadBody).memory) (memR := sₖ.memory)
-    (.step .silent hs₁ (.refl _)) hext rfl (.step .silent hk (.refl _)) rfl
-    (wbAddrOfState retWriteBytesReadBody).memory
+  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
+    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory) (memR := sₖ.memory)
+    retWriteBytesRead_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
+    (.step .silent hk (.refl _)) rfl (initMachineState retWriteBytesReadBody []).memory
   refine ⟨decl0, imm0, hsafe, hreach, fun v' hv' => ?_, hdecl0, himm, ⟨tr, _, hrr⟩, hub, hns⟩
   have := huniq _ hv'
   injection this
+
+/-! ### Out-of-bounds `write_bytes`, from program entry -/
+
+/-- `write_bytes::<u64>(copy _2, 0xAB_u8, 2_usize) -> bb2` into the unit local `_3`:
+`16` bytes into the `8`-byte allocation of `_1` (block `bb1` of
+`retWriteBytesOobBody`). -/
+def retWriteBytesOobTerm : TerminatorKind :=
+  .call (.constant (WitnessLM4_2.fnItem "core::intrinsics::write_bytes" WitnessLM4_2.u64K))
+    [.copy (WitnessLM4_2.local42 2),
+     .constant (WitnessLM4_2.constInt WitnessLM4_2.u8K 0xAB 1),
+     .constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 2 8)]
+    (WitnessLM4_2.local42 3) (some 2) .unreachable
+
+/-- `retWriteBytesReadBody` with an out-of-bounds count (no `miri-diff` corpus
+program; the shape of `WitnessLM4_2.wit_lm4_2_write_bytes_oob_boundary`, run from
+program entry):
+
+```text
+bb0: StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 42_u64;
+     goto -> bb1;
+bb1: _2 = &raw mut _1;
+     _3 = write_bytes::<u64>(copy _2, 0xAB_u8, 2_usize) -> bb2;
+bb2: _0 = copy (*_2);
+     return
+``` -/
+def retWriteBytesOobBody : CapturedMir :=
+  { retWriteBytesReadBody with
+    defPath := "lm_4_3_witness::ret_write_bytes_oob"
+    basicBlocks := [
+      { statements := [WitnessLM4_2.mkStmt42 (.storageLive 1), WitnessLM4_2.mkStmt42 (.storageLive 2),
+          WitnessLM4_2.mkStmt42 (.storageLive 3),
+          WitnessLM4_2.mkStmt42 (.assign (WitnessLM4_2.local42 1)
+            (.use (.constant (WitnessLM4_2.constInt WitnessLM4_2.u64K 42 8))))]
+        terminator := WitnessLM4_2.mkTerm42 (.goto 1)
+        isCleanup := false },
+      { statements := [WitnessLM4_2.mkStmt42
+          (.assign (WitnessLM4_2.local42 2) (.rawPtr .mut (WitnessLM4_2.local42 1)))]
+        terminator := WitnessLM4_2.mkTerm42 retWriteBytesOobTerm
+        isCleanup := false },
+      { statements := [WitnessLM4_2.mkStmt42 (.assign (WitnessLM4_2.local42 0)
+          (.use (.copy { local_ := 2, projection := [.deref] })))]
+        terminator := WitnessLM4_2.mkTerm42 .return_
+        isCleanup := false }] }
+
+/-- Anneal's state of `retWriteBytesOobBody` after the entry block `bb0`. -/
+def retWriteBytesOobPreAnneal : MachineState :=
+  { frame := { blockIdx := 1, stmtIdx := 0,
+               locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit, .uninit] }
+    memory := (initMachineState retWriteBytesOobBody []).memory }
+
+/-- `lean-miri`'s root frame of `retWriteBytesOobBody` after the entry block `bb0`. -/
+def retWriteBytesOobPreMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { (miriEntryFrame retWriteBytesOobBody) with
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)) },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    location := .mir ⟨1, 0⟩ }
+
+/-- `lean-miri`'s state of `retWriteBytesOobBody` after the entry block `bb0`. -/
+def retWriteBytesOobPreMiri : AnnealStepState :=
+  { stack := ⟨#[retWriteBytesOobPreMiriFrame]⟩, machine := AnnealMachine.empty }
+
+/-- The entry block of `retWriteBytesOobBody`, from `initMachineState`. -/
+theorem retWriteBytesOob_prefix_anneal :
+    runAnnealBounded retWriteBytesOobBody 5 (initMachineState retWriteBytesOobBody []) =
+      .running retWriteBytesOobPreAnneal := rfl
+
+/-- The entry block of `retWriteBytesOobBody`, from `miriEntryState`. -/
+theorem retWriteBytesOob_prefix_miri :
+    runLoopFuel (annealMiriHooks retWriteBytesOobBody) 5 (miriEntryState retWriteBytesOobBody) =
+      .running retWriteBytesOobPreMiri := rfl
+
+/-- The post-entry-block states of `retWriteBytesOobBody` are `StateRel`-related, and
+every `lean-miri` local is immediate. -/
+theorem retWriteBytesOob_stateRel :
+    StateRel retWriteBytesOobBody retWriteBytesOobPreAnneal retWriteBytesOobPreMiri ∧
+    ∀ tf, retWriteBytesOobPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+  refine ⟨?_, ?_⟩
+  · refine StateRel.mk retWriteBytesOobPreMiriFrame rfl rfl
+      ⟨translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K), rfl⟩ ?_ rfl rfl rfl rfl rfl (by
+        intro i _ _ _ _ _ _ hi _
+        match i with | 0 | 1 | 2 | 3 | _ + 4 => simp [retWriteBytesOobPreMiriFrame] at hi)
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+    intro i decl slot mls hdecl hslot hmls
+    match i with
+    | 0 | 2 | 3 =>
+      have hs : slot = .uninit := by simpa [retWriteBytesOobPreAnneal, get?] using hslot.symm
+      have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+        simpa [retWriteBytesOobPreMiriFrame] using hmls.symm
+      subst hs hm
+      exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+    | 1 =>
+      have hd : decl = WitnessLM4_2.declOf WitnessLM4_2.u64K := by
+        simpa [retWriteBytesOobBody, retWriteBytesReadBody, get?] using hdecl.symm
+      have hs : slot = .init (.scalar ⟨42, 8⟩) := by
+        simpa [retWriteBytesOobPreAnneal, get?] using hslot.symm
+      have hm : mls =
+          { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+            layout := some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)) } := by
+        simpa [retWriteBytesOobPreMiriFrame] using hmls.symm
+      subst hd hs hm
+      exact .immediate _ _ (some (translateTy (WitnessLM4_2.tyOf WitnessLM4_2.u64K)))
+        (fun _ h => Option.some.inj h.symm)
+        (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl
+          (fun h => nomatch h) (fun h => nomatch h)⟩)
+    | _ + 4 => simp [retWriteBytesOobBody, retWriteBytesReadBody, get?] at hdecl
+  · intro tf h k mls hmls mp hv
+    have htf : retWriteBytesOobPreMiriFrame = tf := by simpa [retWriteBytesOobPreMiri] using h
+    subst htf
+    match k with
+    | 0 | 1 | 2 | 3 => simp [retWriteBytesOobPreMiriFrame] at hmls; subst hmls; cases hv
+    | _ + 4 => simp [retWriteBytesOobPreMiriFrame] at hmls
+
+/-- **Stage-1 external-call divergence, whole program from entry**
+(`retWriteBytesOobBody`): `StorageLive(_1.._3); _1 = const 42_u64; goto bb1;
+bb1: _2 = &raw mut _1; _3 = write_bytes::<u64>(copy _2, 0xAB, 2) -> bb2;
+bb2: _0 = copy (*_2); return`, run from `initMachineState` / `miriEntryState`.
+
+* `lean-miri` takes the entry block and `_2 = &raw mut _1` in lockstep with Anneal
+  (`step_rawPtr_addrOf_simulation`), then reports the `16`-byte write into the
+  `8`-byte allocation of `_1` as undefined behavior (in lockstep with the
+  pre-Stage-1 reference model `stepMirFnLM4_2`, `call_intrinsic_write_bytes_simulation`):
+  `miriSystem` reaches `.undefinedBehavior` and is not `System.Safe`.
+* Stage-1 `stepMirFn` hands `write_bytes` to the environment without checking it:
+  when the environment returns `()` without touching memory, Anneal's whole
+  program returns the unchanged `42_u64`; when it unwinds, the call's
+  `UnwindAction::Unreachable` is undefined behavior (`MirReachesUB`, not
+  `TreeSafe`). (Before Stage-1, both machines reported undefined behavior at the
+  call.) -/
+theorem w6_write_bytes_oob_extCall_divergence :
+    (∃ e, (miriSystem (annealMiriHooks retWriteBytesOobBody)).ReachesOutcome
+        (miriEntryState retWriteBytesOobBody) (.undefinedBehavior e)) ∧
+    ¬ (miriSystem (annealMiriHooks retWriteBytesOobBody)).Safe
+        (miriEntryState retWriteBytesOobBody) ∧
+    (∃ tr mem, ReachesRet (mirCallTree retWriteBytesOobBody []) tr
+        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
+    MirReachesUB (mirCallTree retWriteBytesOobBody []) ∧
+    ¬ TreeSafe (mirCallTree retWriteBytesOobBody []) := by
+  let b := retWriteBytesOobBody
+  obtain ⟨hrel₀, himm₀_all⟩ := retWriteBytesOob_stateRel
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  have himm₀ : ∀ tf, retWriteBytesOobPreMiri.stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 1 :=
+    fun tf htf => ⟨himm₀_all tf htf 2, himm₀_all tf htf 1⟩
+  let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+  -- Step 1: `_2 = &raw mut _1`, in lockstep.
+  let s₁ := WitnessLM4_2.mkPtrState b 1 1
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
+    [entry.toBorrowEntry] 2
+  have hs₁ : stepMirFn b retWriteBytesOobPreAnneal = .step s₁ := rfl
+  have hsim₁ := step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty
+  rw [hs₁] at hsim₁
+  obtain ⟨m₁, hm₁, hrel₁⟩ := hsim₁.miri_step_of_anneal_step
+  have htag₀ : retWriteBytesOobPreAnneal.memory.nextTag = 1 := rfl
+  have hid₀ : (⟨retWriteBytesOobPreMiri.machine.memory.nextAllocId,
+      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = Witness.lm31AllocId1 := rfl
+  rw [htag₀, hid₀] at hrel₁
+  obtain ⟨_, himm₁_step⟩ := Witness.step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
+  have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+    fun tf₁ htf₁ k hne => himm₁_step _ tf₁ rfl htf₁ k hne (himm₀_all _ rfl k)
+  -- Step 2: `write_bytes::<u64>(copy _2, 0xAB_u8, 2_usize)` is out of bounds.
+  have hs₂ : stepMirFnLM4_2 b s₁ = .fail .ub := rfl
+  have hvalOp : ∀ tf₁, m₁.stack.frames = #[tf₁] →
+      WellTypedScalarOperand b tf₁ (.constant (WitnessLM4_2.constInt WitnessLM4_2.u8K 0xAB 1))
+        (WitnessLM4_2.tyOf WitnessLM4_2.u8K) :=
+    fun tf₁ _ => WitnessLM4_2.constInt_wellTyped WitnessLM4_2.u8_integral WitnessLM4_2.valid1
+      (by decide) rfl b rfl tf₁
+  have hcountOp : ∀ tf₁, m₁.stack.frames = #[tf₁] →
+      WellTypedScalarOperand b tf₁ (.constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 2 8))
+        (WitnessLM4_2.tyOf WitnessLM4_2.usizeK) :=
+    fun tf₁ _ => WitnessLM4_2.constInt_wellTyped WitnessLM4_2.usize_integral WitnessLM4_2.valid8
+      (by decide) rfl b rfl tf₁
+  have hsim₂ := call_intrinsic_write_bytes_simulation
+    (pointeeTy := WitnessLM4_2.tyOf WitnessLM4_2.u64K)
+    hrel₁ hphase rfl rfl rfl rfl rfl rfl
+    (Or.inl (by decide)) rfl rfl (fun tf₁ htf₁ => himm₁ tf₁ htf₁ 2 (by decide))
+    WitnessLM4_2.u8_integral hvalOp WitnessLM4_2.usize_integral hcountOp
+    rfl WitnessLM4_2.u64_writeBytesPointee
+    (fun _ e tgtDecl _ he _ htgt => by
+      cases he with
+      | tail _ h => cases h
+      | head _ =>
+        have hd : tgtDecl = WitnessLM4_2.declOf WitnessLM4_2.u64K := Option.some.inj htgt.symm
+        subst hd; exact ⟨.u64, WitnessLM4_2.u64_integral⟩)
+    (fun ptrVal countSc e tgtDecl tgtKind hp hc _ _ he _ htgt ht _ hinb => by
+      have hp' : ptrVal = { allocId := 1, offsetBytes := 0 } := by
+        simpa [s₁, WitnessLM4_2.mkPtrState, get?] using hp.symm
+      have hc' : countSc = ⟨2, 8⟩ := by
+        rcases hc with ⟨cc, hcc, hval⟩ | ⟨idx, hidx, _⟩
+        · injection hcc with hcc'; subst hcc'
+          simpa [WitnessLM4_2.constInt] using hval.symm
+        · cases hidx
+      cases he with
+      | tail _ h => cases h
+      | head _ =>
+        have hd : tgtDecl = WitnessLM4_2.declOf WitnessLM4_2.u64K := Option.some.inj htgt.symm
+        subst hp' hc' hd
+        cases ht with
+        | int _ hk => cases hk
+        | uint ut hk =>
+          cases ut <;> try cases hk
+          exact absurd hinb (by decide))
+  rw [hs₂] at hsim₂
+  obtain ⟨m₂, msg, hm₂⟩ := hsim₂.miri_ub_of_anneal_ub
+  -- `lean-miri`: the entry block, the `&raw mut` step, then undefined behavior.
+  obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+  have hM : MiriPath (annealMiriHooks b) (miriEntryState b) m₁ :=
+    (MiriPath.of_runLoopFuel retWriteBytesOob_prefix_miri).trans
+      (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _))
+  have h := miri_outcome_of_path_error hM hm₂
+  rw [classifyError_eq_ub_iff.2 ⟨rfl, rfl⟩] at h
+  -- Anneal: the entry block, the `&raw mut` step, the external call, and the read
+  -- of the unchanged `_1`.
+  have hext : stepMirFn b s₁ =
+      MirStepNode.extCall
+        { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
+          args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩]
+          memory := s₁.memory }
+        (resumeExternalCall s₁ s₁.frame.locals (WitnessLM4_2.local42 3) 2 .unreachable) := rfl
+  let sᵣ := WitnessLM4_2.mkPtrState b 2 0
+    [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+      .init .unit]
+    [entry.toBorrowEntry] 2
+  let sₖ := WitnessLM4_2.mkPtrState b 2 1
+    [.init (.scalar ⟨42, 8⟩), .init (.scalar ⟨42, 8⟩),
+      .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init .unit]
+    [entry.toBorrowEntry] 2
+  have hk : stepMirFn b sᵣ = .step sₖ := rfl
+  obtain ⟨⟨tr, hrr⟩, hub, hns⟩ := anneal_extCall_boundary_of_prefix (sᵣ := sᵣ) (sₖ := sₖ)
+    (retVal := .unit) (v := .scalar ⟨42, 8⟩) (mem := sᵣ.memory) (memR := sₖ.memory)
+    retWriteBytesOob_prefix_anneal (.step .silent hs₁ (.refl _)) hext rfl
+    (.step .silent hk (.refl _)) rfl (initMachineState b []).memory
+  exact ⟨⟨_, h.1⟩, h.2, ⟨tr, _, hrr⟩, hub, hns⟩
 
 /-- **Valid `CopyNonOverlapping` returns** (`pass_copy_nonoverlapping_disjoint_locals`,
 `retCopyBody`): `_3 = &raw const _1; _4 = &raw mut _2;
