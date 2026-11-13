@@ -647,16 +647,57 @@ fn tuple_or_closure_fields(ty: &Ty) -> Option<&[Ty]> {
     }
 }
 
-/// Checks that if `place` projects through any `ProjectionElem::Deref`, the pointer dereferenced
-/// by the last `ProjectionElem::Deref` in `place.projection` is mutable (`Mutability::Mut`).
+/// Checks that `place` is a mutable place, as `rustc`'s borrow checker requires of the
+/// destination of a write (`Assign`, `SetDiscriminant`, `Deinit`) and of the place of a
+/// mutable borrow (`&mut place`, `&raw mut place`).
 ///
-/// In Rust MIR, projections before the last `Deref` only read intermediate pointers (e.g.
-/// `(**pp)` where `pp: &(&mut T)` is mutable), whereas the last `Deref` determines whether the
-/// resulting place can be mutated or mutably borrowed.
-fn check_place_last_deref_mutable(
+/// MIR locals carry no mutability, so a place without `Deref` is mutable. Each
+/// `ProjectionElem::Deref` of a pointer `p` decides the mutability of `*p`:
+/// - `p: *mut T`: mutable (whatever the place `p` was read from);
+/// - `p: *const T` or `p: &T`: immutable;
+/// - `p: &mut T`: mutable only if the place `p` itself is mutable, so a `&mut` reached through
+///   a shared reference cannot be written through (`(**pp)[0] = v` with `pp: &&mut [T]` is
+///   `rustc`'s E0594), while one reached through a `*mut`, a `&mut`, or a local can.
+///
+/// `Field`, `Index`, `ConstantIndex`, `Subslice`, and `Downcast` keep their base's mutability.
+fn check_place_mutable(
     place: &Place,
     local_decls: &[Ty],
 ) -> Result<(), RvalueLowerError> {
+    let mut mutable = true;
+    let mut immutable_ptr: Option<Ty> = None;
+    for (i, elem) in place.projection.iter().enumerate() {
+        if !matches!(elem, ProjectionElem::Deref) {
+            continue;
+        }
+        let ptr_place = Place {
+            local: place.local,
+            projection: place.projection[..i].to_vec(),
+        };
+        let ptr_ty = resolve_place_ty(&ptr_place, local_decls)?;
+        mutable = match &ptr_ty {
+            Ty::RawPtr(_, m) => *m == Mutability::Mut,
+            Ty::Ref(_, Mutability::Mut) => mutable,
+            _ => false,
+        };
+        immutable_ptr = (!mutable).then_some(ptr_ty);
+    }
+    match immutable_ptr {
+        Some(current_ty) => Err(RvalueLowerError::InvalidProjection {
+            place: place.clone(),
+            current_ty,
+            elem: ProjectionElem::Deref,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The evaluator's (weaker) runtime counterpart of [`check_place_mutable`] for hand-built
+/// lowered MIR: only the pointer dereferenced by the last `ProjectionElem::Deref` of `place`
+/// must be mutable (`*mut T` or `&mut T`). Writes through a `&mut` reached through a shared
+/// reference stay evaluable, as the evaluator has always allowed (e.g. `(**pp).0 = v` with
+/// `pp: &&mut (u32, u32)`); lowering rejects them.
+fn check_last_deref_mutable(place: &Place, local_decls: &[Ty]) -> Result<(), RvalueEvalError> {
     let Some(last_deref_pos) = place
         .projection
         .iter()
@@ -668,15 +709,15 @@ fn check_place_last_deref_mutable(
         local: place.local,
         projection: place.projection[..last_deref_pos].to_vec(),
     };
-    let ptr_ty = resolve_place_ty(&ptr_place, local_decls)?;
-    if !matches!(ptr_ty, Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)) {
-        return Err(RvalueLowerError::InvalidProjection {
-            place: place.clone(),
-            current_ty: ptr_ty,
-            elem: ProjectionElem::Deref,
-        });
+    match resolve_place_ty(&ptr_place, local_decls) {
+        Ok(Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)) => Ok(()),
+        Ok(_) => Err(RvalueEvalError::TypeMismatch(
+            "write or mutable borrow through an immutable pointer",
+        )),
+        Err(_) => Err(RvalueEvalError::TypeMismatch(
+            "Deref projection requires a pointer-typed place",
+        )),
     }
-    Ok(())
 }
 
 /// Returns true if `Downcast(variant)` is statically valid on a place of type `ty`: any variant
@@ -1005,7 +1046,7 @@ pub fn lower_rvalue_with_policy(
         Rvalue::Ref(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
             if *mutability == Mutability::Mut {
-                check_place_last_deref_mutable(place, local_decls)?;
+                check_place_mutable(place, local_decls)?;
             }
             let ty = check_layout(Ty::Ref(Box::new(pointee_ty), *mutability), ptr_width)?;
             Ok(LoweredRvalue::Ref {
@@ -1017,7 +1058,7 @@ pub fn lower_rvalue_with_policy(
         Rvalue::RawPtr(mutability, place) => {
             let pointee_ty = resolve_place_ty(place, local_decls)?;
             if *mutability == Mutability::Mut {
-                check_place_last_deref_mutable(place, local_decls)?;
+                check_place_mutable(place, local_decls)?;
             }
             let ty = check_layout(Ty::RawPtr(Box::new(pointee_ty), *mutability), ptr_width)?;
             Ok(LoweredRvalue::RawPtr {
@@ -1494,7 +1535,7 @@ pub fn lower_statement_with_policy(
             if !place_ty.is_sized() {
                 return Err(RvalueLowerError::UnsizedType(place_ty));
             }
-            check_place_last_deref_mutable(place, local_decls)?;
+            check_place_mutable(place, local_decls)?;
             let lowered = lower_rvalue_with_policy(rvalue, local_decls, ptr_width, policy)?;
             let rvalue_ty = lowered.ty();
 
@@ -1541,7 +1582,7 @@ pub fn lower_statement_with_policy(
             variant_index,
         } => {
             let place_ty = resolve_place_ty(place, local_decls)?;
-            check_place_last_deref_mutable(place, local_decls)?;
+            check_place_mutable(place, local_decls)?;
             match &place_ty {
                 Ty::Tuple(_) => {}
                 Ty::Adt(def) => {
@@ -1597,7 +1638,7 @@ pub fn lower_statement_with_policy(
             if !place_ty.is_sized() {
                 return Err(RvalueLowerError::UnsizedType(place_ty));
             }
-            check_place_last_deref_mutable(place, local_decls)?;
+            check_place_mutable(place, local_decls)?;
             Ok(LoweredStatement::Deinit {
                 place: place.clone(),
                 place_ty,
@@ -3938,10 +3979,16 @@ fn predict_exposed_provenance_for_decls(
         local_of(prov)
             .is_some_and(|loc| slots.is_some_and(|s| matches!(s.get(loc), Some(LocalSlotState::Dead))))
     };
-    if let Some(&fn_prov) = tracker.exposed.iter().find(|&&prov| {
+    // An exposed function's provenance is predicted only for that function's own address.
+    // Distinct functions may share a synthetic address (`fn_ptr_addr` hashes the symbol into
+    // the first page); when several exposed functions do, no provenance is predicted rather
+    // than guessing one (a function pointer decoded from the result is then unsupported,
+    // never a call of the wrong function).
+    let mut fn_matches = tracker.exposed.iter().filter(|&&prov| {
         fn_ptr_symbol(&prov).is_some_and(|sym| u128::from(fn_ptr_addr(&sym)) == addr_bits)
-    }) {
-        return Some(fn_prov);
+    });
+    if let Some(&fn_prov) = fn_matches.next() {
+        return fn_matches.next().is_none().then_some(fn_prov);
     }
     if !local_decls.is_empty() {
         if let Some(prov) = match_exposed_local_provenance_for_decls(
@@ -7643,7 +7690,7 @@ impl StatementEvalState {
     /// initialization per field, like `rustc`'s move paths, rather than per byte).
     pub fn deinit_place(&mut self, place: &Place, place_ty: &Ty) -> Result<(), RvalueEvalError> {
         let (target_local, target_proj, index_cache) = self.prepare_place_access(place, place_ty)?;
-        check_place_last_deref_mutable(place, &self.local_decls)
+        check_last_deref_mutable(place, &self.local_decls)
             .map_err(|_| RvalueEvalError::TypeMismatch("deinit through an immutable pointer"))?;
         if target_proj.is_empty() {
             self.slots[target_local.0] = LocalSlotState::Uninit;
@@ -7710,6 +7757,8 @@ impl StatementEvalState {
         let ctx = RetagCtx {
             ptr_width: self.ptr_width,
             slots: &self.slots,
+            local_decls: &self.local_decls,
+            frame_addr_base: self.frame_addr_base,
         };
         match &self.slots[target_local.0] {
             LocalSlotState::Dead => Err(RvalueEvalError::DeadLocal(target_local)),
@@ -9599,6 +9648,10 @@ fn deinit_in_slot(
 struct RetagCtx<'a> {
     ptr_width: PtrWidth,
     slots: &'a [LocalSlotState],
+    /// Declared types of the frame's locals (their synthetic allocations' sizes).
+    local_decls: &'a [Ty],
+    /// Offset of the frame's synthetic allocations ([`local_base_addr_in_frame`]).
+    frame_addr_base: u128,
 }
 
 /// Validates the reference `ptr` of type `ref_ty` (`&pointee`) for `Statement::Retag`: its
@@ -9682,7 +9735,8 @@ fn check_retagged_reference(
 /// (`InvalidBitPattern`), its data pointer aligned to `T` (`MisalignedPointer`), and its
 /// pointee `[addr, addr + len * size_of::<T>())` at most `isize::MAX` bytes without wrapping
 /// the address space (`PointerRangeOverflow`). A non-empty pointee in the synthetic allocation
-/// of a storage-dead local dangles (`DeadLocal`).
+/// of a local dangles if that local is storage-dead (`DeadLocal`) or the pointee does not fit
+/// inside its allocation (`PointerOutOfBounds`).
 fn check_retagged_wide_reference(
     data: &PointerValue,
     len: usize,
@@ -9728,11 +9782,30 @@ fn check_retagged_wide_reference(
             byte_len,
         });
     }
+    // A non-empty pointee inside a frame-local allocation must be live and in bounds.
+    let local_count = ctx.slots.len().min(ctx.local_decls.len());
     if byte_len > 0
-        && let Some(local) = resolve_synthetic_alloc_local(data, ctx.slots.len())
-        && matches!(ctx.slots[local], LocalSlotState::Dead)
+        && let Some(local) = resolve_synthetic_alloc_local(data, local_count)
     {
-        return Err(RvalueEvalError::DeadLocal(Local(local)));
+        if matches!(ctx.slots[local], LocalSlotState::Dead) {
+            return Err(RvalueEvalError::DeadLocal(Local(local)));
+        }
+        let local_base =
+            local_base_addr_in_frame(local, ctx.local_decls, ptr_width, ctx.frame_addr_base)?;
+        let decl_ty = &ctx.local_decls[local];
+        let (alloc_size, _) = decl_ty
+            .alloc_size_and_align(ptr_width)
+            .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(decl_ty, err)))?;
+        let in_bounds = addr
+            .checked_sub(local_base)
+            .and_then(|rel| rel.checked_add(byte_len))
+            .is_some_and(|end| end <= alloc_size as u128);
+        if !in_bounds {
+            return Err(RvalueEvalError::PointerOutOfBounds {
+                addr: addr as u64,
+                byte_len,
+            });
+        }
     }
     Ok(())
 }
@@ -10300,7 +10373,11 @@ fn check_slice_backing(
     }
     match data.provenance {
         Some(prov) if is_fn_ptr_provenance(&prov) => {
-            if constrained && (byte_len > 0 || len > 0 || is_ref_use) {
+            // A function has no data bytes: a non-empty byte range of a reference, or any
+            // element access, is out of its (empty) allocation. A zero-byte reference (e.g. an
+            // empty slice) to a function's address is valid, as for any non-null aligned
+            // pointer (and `Trusted`'s `evalUnsizeCoercion` accepts function provenance).
+            if constrained && (byte_len > 0 || (use_ == SliceUse::Access && len > 0)) {
                 return Err(RvalueEvalError::FnPtrMemoryAccess { addr: addr as u64 });
             }
             Ok(())
@@ -10517,7 +10594,7 @@ fn eval_wide_ref_in<F: FrameView + ?Sized>(
         ));
     }
     if matches!(ref_ty, Ty::Ref(_, Mutability::Mut) | Ty::RawPtr(_, Mutability::Mut))
-        && !matches!(base_ty, Ty::Ref(_, Mutability::Mut) | Ty::RawPtr(_, Mutability::Mut))
+        && check_last_deref_mutable(place, decls).is_err()
     {
         return Err(RvalueEvalError::TypeMismatch(
             "mutable reborrow of an immutable wide pointer",
@@ -10546,6 +10623,36 @@ fn eval_wide_ref_in<F: FrameView + ?Sized>(
             addr: data.addr,
             byte_offset: byte_offset as i128,
         });
+    }
+    // An address-only raw reborrow still offsets the data pointer in bounds (MiniRust's
+    // `offset_inbounds` of the `Subslice` projection): inside a frame-local allocation, which
+    // must be live, or never past a function's (empty) allocation.
+    if !checked && byte_offset != 0 {
+        let out_of_bounds = RvalueEvalError::PointerOutOfBounds {
+            addr: data.addr,
+            byte_len: byte_offset,
+        };
+        if data.provenance.is_some_and(|prov| is_fn_ptr_provenance(&prov)) {
+            return Err(out_of_bounds);
+        }
+        if let Some(local) = resolve_synthetic_alloc_local(&data, frame.frame_local_count()) {
+            if matches!(frame.frame_slot(local), Some(FrameSlot::Dead)) {
+                return Err(RvalueEvalError::DeadLocal(Local(local)));
+            }
+            let local_base =
+                local_base_addr_in_frame(local, decls, ptr_width, frame.frame_addr_base())?;
+            let decl_ty = &decls[local];
+            let (alloc_size, _) = decl_ty
+                .alloc_size_and_align(ptr_width)
+                .map_err(|err| RvalueEvalError::CastEval(cast_eval_layout_error(decl_ty, err)))?;
+            let in_bounds = base_addr
+                .checked_sub(local_base)
+                .and_then(|rel| rel.checked_add(byte_offset))
+                .is_some_and(|end| end <= alloc_size as u128);
+            if !in_bounds {
+                return Err(out_of_bounds);
+            }
+        }
     }
     let Some(new_addr) = base_addr
         .checked_add(byte_offset)
@@ -10961,6 +11068,13 @@ fn resolve_deref_place_in<F: FrameView + ?Sized>(
         .projection
         .iter()
         .rposition(|p| matches!(p, ProjectionElem::Deref));
+    // A whole-place write through a `Deref` needs a mutable final pointer (see
+    // `check_last_deref_mutable`).
+    if allow_final_union_overwrite && last_deref_pos.is_some() {
+        check_last_deref_mutable(place, decls).map_err(|_| {
+            RvalueEvalError::TypeMismatch("write through an immutable pointer")
+        })?;
+    }
     let mut cur_local = place.local;
     let mut cur_proj: Vec<ProjectionElem> = Vec::new();
     let mut cur_index_cache: Vec<(Local, u128)> = Vec::new();
@@ -10970,17 +11084,6 @@ fn resolve_deref_place_in<F: FrameView + ?Sized>(
         let elem = &place.projection[idx];
         if matches!(elem, ProjectionElem::Deref) {
             let ptr_val = read_frame_place(frame, cur_local, &cur_proj, &cur_index_cache, place)?;
-            if allow_final_union_overwrite && last_deref_pos == Some(idx) {
-                let is_mut = matches!(
-                    ptr_val.ty(),
-                    Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
-                );
-                if !is_mut {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "write through an immutable pointer",
-                    ));
-                }
-            }
             match ptr_val {
                 MirValue::Ptr { ptr, ty: ptr_ty } => {
                     let Some(pointee_ty) = ptr_ty.pointee_ty().cloned() else {
@@ -11124,12 +11227,7 @@ fn eval_projected_ref_in<F: FrameView + ?Sized>(
         let tail = &place.projection[last_deref_pos + 1..];
         let (ptr_local, ptr_proj, ptr_index_cache) = resolve_deref_place_in(frame, &ptr_place, false)?;
         let ptr_val = read_frame_place(frame, ptr_local, &ptr_proj, &ptr_index_cache, &ptr_place)?;
-        if require_mut
-            && !matches!(
-                ptr_val.ty(),
-                Ty::RawPtr(_, Mutability::Mut) | Ty::Ref(_, Mutability::Mut)
-            )
-        {
+        if require_mut && check_last_deref_mutable(place, decls).is_err() {
             return Err(RvalueEvalError::TypeMismatch(
                 "mutable borrow through an immutable pointer",
             ));
@@ -14111,7 +14209,7 @@ pub fn eval_lowered_statement(
         } => {
             let (target_local, target_proj, index_cache) =
                 state.prepare_place_access(place, place_ty)?;
-            check_place_last_deref_mutable(place, &state.local_decls).map_err(|_| {
+            check_last_deref_mutable(place, &state.local_decls).map_err(|_| {
                 RvalueEvalError::TypeMismatch("SetDiscriminant through an immutable pointer")
             })?;
             if !matches!(place_ty, Ty::Tuple(_) | Ty::Adt(_)) {

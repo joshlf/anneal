@@ -2047,8 +2047,7 @@ fn b1_unsize_and_slice_len_enforce_zst_provenance_and_backing_array_bounds() {
                 required_align: 4,
             })
         );
-        let dangling_ref =
-            Operand::Constant(Constant::Ptr(dangling, rf(arr(u32_ty(), 2), NOT)));
+        let dangling_ref = Operand::Constant(Constant::Ptr(dangling, rf(arr(u32_ty(), 2), NOT)));
         assert_eq!(
             run(
                 &decls_ref_to_raw,
@@ -2101,16 +2100,12 @@ fn b1_unsize_and_slice_len_enforce_zst_provenance_and_backing_array_bounds() {
         }
 
         let decls_zst_arr = vec![unit(), arr(unit(), 2), rf(slice(unit()), NOT)];
-        let over_zst =
-            Operand::Constant(Constant::Ptr(stack_ptr(1, 0), rf(arr(unit(), 5), NOT)));
+        let over_zst = Operand::Constant(Constant::Ptr(stack_ptr(1, 0), rf(arr(unit(), 5), NOT)));
         assert_eq!(
             run(
                 &decls_zst_arr,
                 &[
-                    assign(
-                        1,
-                        Rvalue::Repeat(Operand::Constant(Constant::Unit), 2),
-                    ),
+                    assign(1, Rvalue::Repeat(Operand::Constant(Constant::Unit), 2),),
                     assign(2, unsize(over_zst, rf(slice(unit()), NOT))),
                 ],
                 pw,
@@ -2158,12 +2153,13 @@ fn b1_slice_mutability_permissions_reject_mutable_reborrow_and_write_through_sha
         for immut_local in [7usize, 8usize] {
             // Static rejections: `&mut (*s)`, `&mut (*s)[0..2]`, `&raw mut (*s)[0..2]`,
             // `&mut (*s)[0]`, `&raw mut (*s)[0]`, `(*s)[0] = 1`, `Deinit((*s)[0])`.
-            assert!(
-                lower_rvalue(&Rvalue::Ref(MUT, deref(immut_local)), &decls, pw).is_err()
-            );
+            assert!(lower_rvalue(&Rvalue::Ref(MUT, deref(immut_local)), &decls, pw).is_err());
             assert!(
                 lower_rvalue(
-                    &Rvalue::Ref(MUT, proj(immut_local, vec![ProjectionElem::Deref, sub.clone()])),
+                    &Rvalue::Ref(
+                        MUT,
+                        proj(immut_local, vec![ProjectionElem::Deref, sub.clone()])
+                    ),
                     &decls,
                     pw,
                 )
@@ -2255,33 +2251,44 @@ fn b1_slice_mutability_permissions_reject_mutable_reborrow_and_write_through_sha
             ));
         }
 
-        // Double-deref `(**_9)[0] = 88` where `_9: &(&mut [u32])` is valid because the last
-        // `Deref` dereferences `&mut [u32]` (`MUT`), whereas `(**_10)[0] = 88` where
-        // `_10: &mut (&[u32])` is rejected because the last `Deref` dereferences `&[u32]` (`NOT`).
+        // Double-deref `(**_9)[0] = 88` where `_9: &(&mut [u32])` writes through a `&mut`
+        // reached through a shared reference, which `rustc` rejects (E0594: the place is behind
+        // a `&` reference); `(**_10)[0] = 88` where `_10: &mut (&[u32])` is rejected because the
+        // last `Deref` dereferences `&[u32]`. (See `a1_place_mutability_follows_borrowck` for
+        // the accepted `*mut` / `&mut &mut` forms.)
         decls.push(rf(rf(slice(u32_ty()), MUT), NOT)); // _9
         decls.push(rf(rf(slice(u32_ty()), NOT), MUT)); // _10
         stmts.push(assign(9, Rvalue::Ref(NOT, local(3))));
-        stmts.push(assign(
-            10,
-            Rvalue::Ref(MUT, local(7)),
-        ));
+        stmts.push(assign(10, Rvalue::Ref(MUT, local(7))));
         let write_via_9 = Statement::Assign(
             proj(
                 9,
-                vec![
-                    ProjectionElem::Deref,
-                    ProjectionElem::Deref,
-                    elem0.clone(),
-                ],
+                vec![ProjectionElem::Deref, ProjectionElem::Deref, elem0.clone()],
             ),
             Rvalue::Use(cint(88, u32_ty())),
         );
-        stmts.push(write_via_9);
-        let state = run(&decls, &stmts, pw).unwrap();
+        assert!(lower_statement(&write_via_9, &decls, pw).is_err());
+        // The evaluator keeps its pre-existing leniency for hand-built writes whose last
+        // `Deref` is through a `&mut` (`subplace_deref_copy_tests` writes `(**pp).0` with
+        // `pp: &&mut (u32, u32)`): only lowering applies the full borrowck rule.
+        let mut state = run(&decls, &stmts, pw).unwrap();
+        state
+            .write_place(
+                &proj(
+                    9,
+                    vec![ProjectionElem::Deref, ProjectionElem::Deref, elem0.clone()],
+                ),
+                &u32_ty(),
+                u32v(88),
+            )
+            .unwrap();
         assert_eq!(value(&state, 1), array_val(u32_ty(), &[88, 11, 12, 13]));
 
         let write_via_10 = Statement::Assign(
-            proj(10, vec![ProjectionElem::Deref, ProjectionElem::Deref, elem0]),
+            proj(
+                10,
+                vec![ProjectionElem::Deref, ProjectionElem::Deref, elem0],
+            ),
             Rvalue::Use(cint(99, u32_ty())),
         );
         assert!(lower_statement(&write_via_10, &decls, pw).is_err());
@@ -2460,10 +2467,7 @@ fn b1_capturing_closure_upvar_projections_offset_of_and_retag() {
             assign(2, Rvalue::Ref(NOT, local(1))),
             assign(
                 3,
-                Rvalue::Aggregate(
-                    AggregateKind::Closure,
-                    vec![copy(2), cusize(9)],
-                ),
+                Rvalue::Aggregate(AggregateKind::Closure, vec![copy(2), cusize(9)]),
             ),
             Statement::Retag(RetagKind::Default, local(3)),
             // Read `*(_3.0)` and `OffsetOf` of upvar 1 on a canonical closure layout.
@@ -2526,17 +2530,17 @@ fn b1_exposed_multiple_fn_ptr_provenances_recover_matching_callee_on_int_to_ptr_
         // `PointerWithExposedProvenance` -> `Transmute` -> `fn(u32) -> u32`, and call both!
         let body = Body {
             local_decls: vec![
-                u32_ty(),             // _0: return
-                u32_ty(),             // _1: arg
-                f_ty.clone(),         // _2: double fn ptr
-                f_ty.clone(),         // _3: add_one fn ptr
-                usize_ty(),           // _4: exposed addr of double
-                usize_ty(),           // _5: exposed addr of add_one
-                raw(unit(), NOT),     // _6: recovered *const () for add_one
-                raw(unit(), NOT),     // _7: recovered *const () for double
-                f_ty.clone(),         // _8: transmuted add_one fn ptr
-                f_ty.clone(),         // _9: transmuted double fn ptr
-                u32_ty(),             // _10: intermediate call result
+                u32_ty(),         // _0: return
+                u32_ty(),         // _1: arg
+                f_ty.clone(),     // _2: double fn ptr
+                f_ty.clone(),     // _3: add_one fn ptr
+                usize_ty(),       // _4: exposed addr of double
+                usize_ty(),       // _5: exposed addr of add_one
+                raw(unit(), NOT), // _6: recovered *const () for add_one
+                raw(unit(), NOT), // _7: recovered *const () for double
+                f_ty.clone(),     // _8: transmuted add_one fn ptr
+                f_ty.clone(),     // _9: transmuted double fn ptr
+                u32_ty(),         // _10: intermediate call result
             ],
             basic_blocks: vec![
                 block(
@@ -2623,3 +2627,376 @@ fn b1_exposed_multiple_fn_ptr_provenances_recover_matching_callee_on_int_to_ptr_
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// A1: borrowck place mutability, ambiguous exposed function provenance, in-bounds raw
+// `Subslice` offsets, and zero-byte references at function addresses
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a1_place_mutability_follows_borrowck() {
+    for pw in PWS {
+        let elem = |i: u64| ProjectionElem::ConstantIndex {
+            offset: i,
+            min_length: i + 1,
+            from_end: false,
+        };
+        let (mut decls, mut stmts) = slice_frame();
+        // `_9: &&mut [u32] = &_3`, `_10: *mut [u32] = &raw mut *_3`, `_11: &*mut [u32] = &_10`,
+        // `_12: &mut &mut [u32] = &mut _3`, `_13: *const &mut [u32] = &raw const _3`.
+        decls.extend([
+            rf(rf(slice(u32_ty()), MUT), NOT),
+            raw(slice(u32_ty()), MUT),
+            rf(raw(slice(u32_ty()), MUT), NOT),
+            rf(rf(slice(u32_ty()), MUT), MUT),
+            raw(rf(slice(u32_ty()), MUT), NOT),
+        ]);
+        stmts.extend([
+            assign(9, Rvalue::Ref(NOT, local(3))),
+            assign(10, Rvalue::RawPtr(MUT, deref(3))),
+            assign(11, Rvalue::Ref(NOT, local(10))),
+            assign(12, Rvalue::Ref(MUT, local(3))),
+            assign(13, Rvalue::RawPtr(NOT, local(3))),
+        ]);
+        let dd = |i: usize, e: ProjectionElem| {
+            proj(i, vec![ProjectionElem::Deref, ProjectionElem::Deref, e])
+        };
+        // A `&mut` behind `&` or `*const` is immutable (E0594 / E0596).
+        for outer in [9usize, 13] {
+            assert!(
+                lower_statement(
+                    &Statement::Assign(dd(outer, elem(0)), Rvalue::Use(cint(1, u32_ty()))),
+                    &decls,
+                    pw
+                )
+                .is_err(),
+                "write through _{outer}"
+            );
+            assert!(
+                lower_rvalue(&Rvalue::Ref(MUT, dd(outer, elem(0))), &decls, pw).is_err(),
+                "&mut through _{outer}"
+            );
+            assert!(
+                lower_rvalue(
+                    &Rvalue::RawPtr(
+                        MUT,
+                        proj(outer, vec![ProjectionElem::Deref, ProjectionElem::Deref])
+                    ),
+                    &decls,
+                    pw
+                )
+                .is_err(),
+                "&raw mut through _{outer}"
+            );
+            // ... but readable.
+            assert!(
+                lower_rvalue(&Rvalue::Use(Operand::Copy(dd(outer, elem(0)))), &decls, pw).is_ok()
+            );
+        }
+        // A `*mut` is mutable wherever it is read from, and a `&mut` behind a `&mut` is too
+        // (writes, and a mutable reborrow `_6 = &mut **_12`).
+        stmts.extend([
+            Statement::Assign(dd(11, elem(1)), Rvalue::Use(cint(77, u32_ty()))),
+            Statement::Assign(dd(12, elem(2)), Rvalue::Use(cint(66, u32_ty()))),
+            assign(
+                6,
+                Rvalue::Ref(
+                    MUT,
+                    proj(12, vec![ProjectionElem::Deref, ProjectionElem::Deref]),
+                ),
+            ),
+        ]);
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(value(&state, 1), array_val(u32_ty(), &[10, 77, 66, 13]));
+        assert_eq!(value(&state, 6).as_wide_ptr(), Some((stack_ptr(1, 0), 4)));
+        // At runtime (hand-built lowered MIR), only the last `Deref` matters: a `&mut` behind a
+        // `*const` stays mutably borrowable (as for writes), a final `*const` `Deref` does not.
+        let mut state = run(&decls, &stmts, pw).unwrap();
+        let hand = LoweredRvalue::Ref {
+            mutability: MUT,
+            place: proj(13, vec![ProjectionElem::Deref, ProjectionElem::Deref]),
+            ty: rf(slice(u32_ty()), MUT),
+        };
+        assert!(eval_lowered_rvalue_in_state(&hand, &mut state).is_ok());
+        let hand_const = LoweredRvalue::RawPtr {
+            mutability: MUT,
+            place: proj(8, vec![ProjectionElem::Deref, elem(0)]),
+            ty: raw(u32_ty(), MUT),
+        };
+        stmts.push(assign(8, Rvalue::RawPtr(NOT, deref(3))));
+        let mut state = run(&decls, &stmts, pw).unwrap();
+        assert!(matches!(
+            eval_lowered_rvalue_in_state(&hand_const, &mut state),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+    }
+}
+
+/// Two distinct symbols whose function pointers share a synthetic address.
+fn colliding_fn_symbols() -> (CalleeSymbol, CalleeSymbol) {
+    let mut seen = std::collections::BTreeMap::new();
+    for i in 0.. {
+        let sym = CalleeSymbol::new(format!("collide_{i}"));
+        if let Some(prev) = seen.insert(fn_ptr_addr(&sym), sym.clone()) {
+            return (prev, sym);
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn a1_ambiguous_exposed_fn_provenances_are_not_guessed() {
+    let (f, g) = colliding_fn_symbols();
+    assert_ne!(f, g);
+    assert_eq!(fn_ptr_addr(&f), fn_ptr_addr(&g));
+    for pw in PWS {
+        let f_ty = fn_ty(vec![], unit());
+        let decls = vec![
+            unit(),
+            f_ty.clone(),
+            f_ty.clone(),
+            usize_ty(),
+            usize_ty(),
+            raw(unit(), NOT),
+            f_ty.clone(),
+        ];
+        let reify_f = assign(
+            1,
+            reify(
+                PointerCoercionKind::ReifyFnPointer,
+                Operand::callee(f.as_str()),
+                f_ty.clone(),
+            ),
+        );
+        let reify_g = assign(
+            2,
+            reify(
+                PointerCoercionKind::ReifyFnPointer,
+                Operand::callee(g.as_str()),
+                f_ty.clone(),
+            ),
+        );
+        let expose = |dst: usize, src: usize| {
+            assign(
+                dst,
+                cast(CastKind::PointerExposeProvenance, copy(src), usize_ty()),
+            )
+        };
+        let recover = [
+            assign(
+                5,
+                cast(
+                    CastKind::PointerWithExposedProvenance,
+                    copy(3),
+                    raw(unit(), NOT),
+                ),
+            ),
+            assign(6, cast(CastKind::Transmute, copy(5), f_ty.clone())),
+        ];
+        // Only `f` exposed: its provenance is recovered.
+        let mut stmts = vec![reify_f.clone(), reify_g.clone(), expose(3, 1)];
+        stmts.extend(recover.clone());
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(value(&state, 6), value(&state, 1));
+        // Both exposed at the same address: neither is guessed.
+        let mut stmts = vec![reify_f, reify_g, expose(3, 1), expose(4, 2)];
+        stmts.extend(recover);
+        let err = run(&decls, &stmts, pw).err();
+        assert!(
+            matches!(err, Some(RvalueEvalError::UnsupportedMemoryAccess(_))),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn a1_raw_subslice_reborrows_offset_in_bounds() {
+    for pw in PWS {
+        // `_4: *const [u32]` claims 10 elements of the 4-element `_1`.
+        let decls = vec![
+            unit(),
+            arr(u32_ty(), 4),
+            raw(arr(u32_ty(), 4), NOT),
+            raw(u32_ty(), NOT),
+            raw(slice(u32_ty()), NOT),
+            raw(slice(u32_ty()), NOT),
+        ];
+        let prelude = vec![
+            assign(1, array_rv(u32_ty(), &[1, 2, 3, 4])),
+            assign(2, Rvalue::RawPtr(NOT, local(1))),
+            assign(
+                3,
+                cast(
+                    CastKind::PointerCoercion(PointerCoercionKind::ArrayToPointer),
+                    copy(2),
+                    raw(u32_ty(), NOT),
+                ),
+            ),
+            assign(
+                4,
+                Rvalue::Aggregate(
+                    AggregateKind::RawPtr {
+                        pointee: slice(u32_ty()),
+                        mutability: NOT,
+                    },
+                    vec![copy(3), cusize(10)],
+                ),
+            ),
+        ];
+        let sub = |from: u64, to: u64| {
+            Rvalue::RawPtr(
+                NOT,
+                proj(
+                    4,
+                    vec![
+                        ProjectionElem::Deref,
+                        ProjectionElem::Subslice {
+                            from,
+                            to,
+                            from_end: false,
+                        },
+                    ],
+                ),
+            )
+        };
+        // An in-bounds offset is fine, even though the claimed length is not.
+        let mut stmts = prelude.clone();
+        stmts.push(assign(5, sub(2, 9)));
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(value(&state, 5).as_wide_ptr(), Some((stack_ptr(1, 8), 7)));
+        // One past the end is in bounds; beyond it is not.
+        let mut stmts = prelude.clone();
+        stmts.push(assign(5, sub(4, 4)));
+        assert!(run(&decls, &stmts, pw).is_ok());
+        let mut stmts = prelude.clone();
+        stmts.push(assign(5, sub(6, 8)));
+        assert_eq!(
+            run(&decls, &stmts, pw).err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1),
+                byte_len: 24
+            })
+        );
+        // The backing local must be live.
+        let mut stmts = prelude.clone();
+        stmts.extend([Statement::StorageDead(Local(1)), assign(5, sub(1, 2))]);
+        assert_eq!(
+            run(&decls, &stmts, pw).err(),
+            Some(RvalueEvalError::DeadLocal(Local(1)))
+        );
+    }
+}
+
+#[test]
+fn a1_zero_byte_slice_references_at_function_addresses() {
+    for pw in PWS {
+        let f_ty = fn_ty(vec![], unit());
+        let decls = vec![
+            unit(),
+            f_ty.clone(),
+            raw(arr(u8_ty(), 0), NOT),
+            rf(arr(u8_ty(), 0), NOT),
+            rf(slice(u8_ty()), NOT),
+            usize_ty(),
+            raw(arr(u8_ty(), 4), NOT),
+            rf(arr(u8_ty(), 4), NOT),
+        ];
+        let sym = CalleeSymbol::new("zero_byte_target");
+        let stmts = vec![
+            assign(
+                1,
+                reify(
+                    PointerCoercionKind::ReifyFnPointer,
+                    Operand::callee(sym.as_str()),
+                    f_ty.clone(),
+                ),
+            ),
+            assign(
+                2,
+                cast(CastKind::FnPtrToPtr, copy(1), raw(arr(u8_ty(), 0), NOT)),
+            ),
+            assign(
+                3,
+                cast(CastKind::Transmute, copy(2), rf(arr(u8_ty(), 0), NOT)),
+            ),
+            assign(4, unsize(copy(3), rf(slice(u8_ty()), NOT))),
+            assign(5, Rvalue::Len(deref(4))),
+        ];
+        let state = run(&decls, &stmts, pw).unwrap();
+        assert_eq!(
+            value(&state, 4).as_wide_ptr(),
+            Some((
+                PointerValue {
+                    addr: fn_ptr_addr(&sym),
+                    provenance: fn_ptr_provenance(&sym),
+                },
+                0
+            ))
+        );
+        assert_eq!(value(&state, 5), usizev(0));
+        // A non-empty reference to a function's bytes is invalid.
+        let stmts = vec![
+            stmts[0].clone(),
+            assign(
+                6,
+                cast(CastKind::FnPtrToPtr, copy(1), raw(arr(u8_ty(), 4), NOT)),
+            ),
+            assign(
+                7,
+                cast(CastKind::Transmute, copy(6), rf(arr(u8_ty(), 4), NOT)),
+            ),
+            assign(4, unsize(copy(7), rf(slice(u8_ty()), NOT))),
+        ];
+        assert_eq!(
+            run(&decls, &stmts, pw).err(),
+            Some(RvalueEvalError::FnPtrMemoryAccess {
+                addr: fn_ptr_addr(&sym)
+            })
+        );
+    }
+}
+
+#[test]
+fn a1_retag_checks_wide_reference_bounds() {
+    for pw in PWS {
+        let pair = Ty::Tuple(vec![raw(u32_ty(), NOT), usize_ty()]);
+        let decls = vec![
+            unit(),
+            arr(u32_ty(), 4),
+            raw(arr(u32_ty(), 4), NOT),
+            raw(u32_ty(), NOT),
+            pair.clone(),
+            rf(slice(u32_ty()), NOT),
+        ];
+        let with_len = |len: u128| {
+            vec![
+                assign(1, array_rv(u32_ty(), &[1, 2, 3, 4])),
+                assign(2, Rvalue::RawPtr(NOT, local(1))),
+                assign(
+                    3,
+                    cast(
+                        CastKind::PointerCoercion(PointerCoercionKind::ArrayToPointer),
+                        copy(2),
+                        raw(u32_ty(), NOT),
+                    ),
+                ),
+                assign(
+                    4,
+                    Rvalue::Aggregate(AggregateKind::Tuple, vec![copy(3), cusize(len)]),
+                ),
+                assign(
+                    5,
+                    cast(CastKind::Transmute, copy(4), rf(slice(u32_ty()), NOT)),
+                ),
+                Statement::Retag(RetagKind::Default, local(5)),
+            ]
+        };
+        assert!(run(&decls, &with_len(4), pw).is_ok());
+        assert_eq!(
+            run(&decls, &with_len(5), pw).err(),
+            Some(RvalueEvalError::PointerOutOfBounds {
+                addr: base(1),
+                byte_len: 20
+            })
+        );
+    }
+}
