@@ -1425,6 +1425,22 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.witnessPanicCleanup_bodyCorr
   let _ := @Anneal.Mir.AdtAndControl.witness_diverging_abort_vs_panicUnwind
   let _ := @Anneal.Mir.AdtAndControl.witness_multi_callee_two_deep_and_unwind
+  -- `[adv ep2-B1]` Section 5f: Episode 1 adapter parity, `trustedSupportsIntrinsicDefPath`
+  -- premise elimination, value-intrinsic fault parity, and Witness Suites 5–6.
+  let _ := @Anneal.Mir.AdtAndControl.stringEq_eq_true_iff
+  let _ := @Anneal.Mir.AdtAndControl.stringEq_eq_decide
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_eq_ep1Table
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_aliases_none
+  let _ := @Anneal.Mir.AdtAndControl.trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.LTerminator.refinable_call_of_lowerIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.LTerminator.multiRefinable_call_of_lowerIntrinsicKind
+  let _ := @Anneal.Mir.AdtAndControl.evalLIntrinsicValue_none_trusted_fault
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall_of_value
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredTerminator_call_value_intrinsic_fault_parity
+  let _ := @Anneal.Mir.AdtAndControl.slotsRefine_below_init_eq
+  let _ := @Anneal.Mir.AdtAndControl.witnessSignWidth_bodyCorr
+  let _ := @Anneal.Mir.AdtAndControl.witness_intrinsic_signedness_width_cfg_refines_trusted
+  let _ := @Anneal.Mir.AdtAndControl.witness_signed_shift_overflow_ub_parity
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge
