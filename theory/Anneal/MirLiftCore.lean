@@ -13176,11 +13176,32 @@ theorem runMirToBlock_selfLoopMir_exit (k : Nat) (hk : k + 1 < 4294967296) :
   simp only [runToTarget, hs1, runUntilTarget, hs2, hs3, hs4]
   rfl
 
+theorem checkPureMir_selfLoopMirBody (n : Nat) :
+    checkPureMir (selfLoopMirBody n) = true := rfl
+
+theorem inferMinFragment_selfLoopMirBody (n : Nat) :
+    inferMinFragment (selfLoopMirBody n) = .pureBoundedLoop := rfl
+
 theorem inferMinFragment_selfLoopMirBody_le_pureBoundedLoop (n : Nat) :
     inferMinFragment (selfLoopMirBody n) ≤ .pureBoundedLoop := by
-  have h : inferMinFragment (selfLoopMirBody n) = .pureBoundedLoop := rfl
-  rw [h]
+  rw [inferMinFragment_selfLoopMirBody]
   exact Nat.le_refl _
+
+/-- **First-hit uniqueness on the live single-block self-loop `selfLoopMirBody n`**:
+from `(bb1, 0, i)` with `i + 1 ≠ n`, the unique first re-entry to `(bb1, 0)` occurs
+at `(bb1, 0, i + 1)` after `m = 1` intermediate step (`(bb1, 1, i + 1)`). -/
+theorem selfLoopMir_firstHit_unique (n i : Nat) (hne : i + 1 ≠ n)
+    (hi : i + 1 < 4294967296) {m : Nat} {s' : MachineState}
+    (h : FirstHitIn (mirStep (selfLoopMirBody n))
+      (fun ms => ms.frame.blockIdx == 1 && ms.frame.stmtIdx == 0) m
+      ((countToNPureState 1 0 i).toMachineState emptyMemory) s') :
+    s' = (countToNPureState 1 0 (i + 1)).toMachineState emptyMemory ∧ m = 1 := by
+  have hbeq : Nat.beq (i + 1) n = false := (Bool.not_eq_true _).mp (hne ∘ Nat.eq_of_beq_eq_true)
+  have hs1 := selfLoopMir_incr_step n i hi
+  have hs2 : mirStep (selfLoopMirBody n) ((countToNPureState 1 1 (i + 1)).toMachineState emptyMemory) =
+      .cont ((countToNPureState (match Nat.beq (i + 1) n with | true => 2 | false => 1) 0 (i + 1)).toMachineState emptyMemory) := rfl
+  rw [hbeq] at hs2
+  exact FirstHitIn.unique h (.later hs1 rfl (.here hs2 rfl))
 
 /-- **End-to-end `VerificationResult` for the live self-loop** over every symbolic
 bound (fragment-routed `runMirToBlock` + `forRangeUp` gate, zero fuel numerals). -/
@@ -13200,6 +13221,106 @@ theorem verify_selfLoopMir_all_k (k : Nat) (hk : k + 1 < 4294967296) :
       runMirToBlock_selfLoopMir_iter (k + 1) i (by omega) (by omega))
     (fun _ _ => ⟨.scalar ⟨k + 1, 4⟩, emptyMemory, runMirToBlock_selfLoopMir_exit k hk, rfl⟩)
     rfl
+
+/-- **Constructive `StatefulVerificationResult` for the live self-loop `selfLoopMirBody (k + 1)`**
+(`⊆ {propext, Quot.sound}`) over every symbolic `k` (`k + 1 < 2^32`) and root-active memory. -/
+theorem verifyStateful_selfLoopMir_all_k (k : Nat) (hk : k + 1 < 4294967296) :
+    StatefulVerificationResult
+      { body := selfLoopMirBody (k + 1)
+        pre := fun args mem => (∃ v₀, args = [v₀]) ∧ RootActiveMemory mem
+        post := fun _ mem retVal mem' =>
+          mem' = mem ∧ retVal = .scalar ⟨k + 1, 4⟩
+        callees := [] } :=
+  verifyStatefulMirNoPanic_forRangeUp_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_selfLoopMirBody_le_pureBoundedLoop (k + 1))
+    (fun _ _ hp => hp.2) 1
+    (fun _ _ => 0) (fun _ _ => k) (fun _ _ => ()) (fun _ _ _ _ _ u => u)
+    (fun _ _ i _ => countToNPureState 1 0 i)
+    (fun _ _ _ => Nat.zero_le k)
+    (fun args _ ⟨⟨v₀, hargs⟩, _⟩ => by rw [hargs]; exact runMirToBlock_selfLoopMir_entry (k + 1) v₀)
+    (fun _ _ _ i _ hlt _ =>
+      runMirToBlock_selfLoopMir_iter (k + 1) i (by omega) (by omega))
+    (fun _ _ _ => ⟨.scalar ⟨k + 1, 4⟩, emptyMemory, runMirToBlock_selfLoopMir_exit k hk, rfl, rfl⟩)
+    rfl
+
+/-- Live non-terminating `CapturedMir` self-loop (`bb0: goto -> bb0`, 1 local `_0`). -/
+def infiniteLoopMirBody : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "Anneal::MirLiftCore::infinite_loop_mir" 0
+    [ { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "_0" } ]
+    [ { statements := []
+        terminator := { kind := .goto 0, span := "inf0" }
+        isCleanup := false } ]
+
+theorem checkPureMir_infiniteLoopMirBody :
+    checkPureMir infiniteLoopMirBody = true := rfl
+
+theorem inferMinFragment_infiniteLoopMirBody :
+    inferMinFragment infiniteLoopMirBody = .pureBoundedLoop := rfl
+
+theorem stepMirFn_infiniteLoopMirBody (env : PureEnv) :
+    stepMirFn infiniteLoopMirBody
+      (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) =
+      .tau (.running (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory)) :=
+  rfl
+
+theorem mirStep_infiniteLoopMirBody (env : PureEnv) :
+    mirStep infiniteLoopMirBody
+      (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) =
+      .cont (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) :=
+  rfl
+
+theorem evalFuel_infiniteLoopMirBody_outOfFuel :
+    ∀ (k : Nat) (env : PureEnv),
+      evalFuel (mirStep infiniteLoopMirBody) k
+        (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) =
+        .outOfFuel
+  | 0, _ => rfl
+  | k + 1, env => evalFuel_infiniteLoopMirBody_outOfFuel k env
+
+/-- **Non-terminating live `CapturedMir` loop refutes `WpConverges (mirStep _)`**. -/
+theorem not_wpConverges_infiniteLoopMirBody (env : PureEnv) (post : MirOutcome → Prop) :
+    ¬ WpConverges (mirStep infiniteLoopMirBody)
+        (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) post := by
+  rintro ⟨k, v, hk, _⟩
+  rw [evalFuel_infiniteLoopMirBody_outOfFuel k env] at hk
+  cases hk
+
+/-- Targeting an unreachable exit block (`bb1`) on `infiniteLoopMirBody` returns
+`.outOfFuel`, whereas targeting the self-looping header (`bb0`) stops after one
+mandatory step with `.reached`. -/
+theorem runMirToBlock_infiniteLoopMirBody_outOfFuel_vs_self (env : PureEnv) :
+    PureMirExec.runMirToBlock infiniteLoopMirBody 1
+        (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) = .outOfFuel ∧
+      PureMirExec.runMirToBlock infiniteLoopMirBody 0
+        (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) =
+        .reached (({ bb := 0, stmtIdx := 0, env := env } : PureState).toMachineState emptyMemory) :=
+  ⟨rfl, rfl⟩
+
+theorem not_wpMirExecSym_of_tau_self {body : CapturedMir} {s : MachineState}
+    (hs : stepMirFn body s = .tau (.running s)) (post : MirOutcome → Prop) :
+    ∀ (fuel : Nat),
+      ¬ Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym fuel body (.running s) post
+  | 0, h => h
+  | fuel + 1, h => by
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym at h
+    rw [Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTree_eq,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree_eval,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalNodeWP_eq] at h
+    dsimp only [stepMirState] at h
+    rw [hs] at h
+    exact not_wpMirExecSym_of_tau_self hs post fuel h
+
+/-- **General stationary `.tau` self-loop refutes live `MirWpConverges`**. -/
+theorem not_mirWpConverges_of_tau_self {body : CapturedMir} {s : MachineState}
+    (hs : stepMirFn body s = .tau (.running s)) (post : MirOutcome → Prop) :
+    ¬ Anneal.MirFuelFree.MirWpConverges body s post := by
+  rintro ⟨fuel, h⟩
+  exact not_wpMirExecSym_of_tau_self hs post fuel h
+
+/-- **Live non-terminating `infiniteLoopMirBody` refutes `MirWpConverges` and `PureMirConverges`**. -/
+theorem not_pureMirConverges_infiniteLoopMirBody (env : PureEnv) (post : Value → Prop) :
+    ¬ PureMirConverges infiniteLoopMirBody { bb := 0, stmtIdx := 0, env := env } post :=
+  not_mirWpConverges_of_tau_self (stepMirFn_infiniteLoopMirBody env) _
 
 end FuelFreeLoops
 
