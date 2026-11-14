@@ -7530,6 +7530,38 @@ theorem MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_su
         exact hValid.placed_in_bounds p hp)
 
 /--
+**Automatic Fallback Soundness for Any `ValidStructLayoutWorld` Span-Fallback Struct With Surjective
+Field Codecs**: generalizes `adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective` from
+`.memory` entries to every entry without `fieldLayouts` whose shape makes Trusted fall back to the span
+decoder (`usesSpanFallback`), e.g. `.scalar` structs with zero-sized marker fields such as
+`struct W(u32, PhantomData<T>)`; `hValid.placed_in_bounds` discharges the in-bounds hypothesis.
+
+Kind: refinement
+Witness: universal
+Assumes: S0
+Subject: Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound
+-/
+theorem MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+    {repr : AdtRepr} {reprAlign : Option Nat} {fs : List FieldLayout} {w : StructLayoutWorld}
+    (hValid : ValidStructLayoutWorld repr reprAlign fs w)
+    (layouts : LayoutTable) (l : TypeLayout) (varIdx : VariantIdx)
+    {k : RigidTy} {ks : List RigidTy} {αs : List Type} (pc : PlacedCodecSpine αs)
+    (fcs : TupleFieldCodecs layouts (k :: ks) pc)
+    (hPlaced : pc.placed = w.fieldOffsets.zip fs)
+    (hFl : l.fieldLayouts = [])
+    (hSpan : Anneal.ByteCodec.MirValueCodec.usesSpanFallback
+      (pc.placed.map fun p => ({ bytes := p.1 } : Size)) l.backendRepr = true)
+    (hSize : l.size = { bytes := w.totalSize })
+    (hSurj : pc.AllFieldsSurjective) :
+    Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound layouts l varIdx pc w.totalSize := by
+  cases fcs with
+  | @cons _ _ _ _ p₀ c₀ tail _ _ =>
+    exact Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_span_surjective
+      hFl hSpan hSize hSurj (fun p hp => by
+        rw [hPlaced] at hp
+        exact hValid.placed_in_bounds p hp)
+
+/--
 **Zero-Boilerplate `MirValueCodec` for Any `ValidStructLayoutWorld` `.memory` Struct With Surjective Field Codecs**
 (covering both in-order `#[repr(C)]`/`#[repr(Rust)]` structs and reordered `#[repr(Rust)]` structs
 without requiring a manual `AdtDecodeFallbackSound` proof).

@@ -1777,6 +1777,8 @@ theorem adt_control_residual_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_bitValidity
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_memory_surjective_bitValidity
+  -- `[adv ep1-B3]` span-fallback (`.scalar` / `.scalarPair` with marker fields, `.memory`) structs.
+  let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge

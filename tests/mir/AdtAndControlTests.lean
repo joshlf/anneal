@@ -436,6 +436,10 @@ theorem tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes :
 #guard_msgs (whitespace := lax) in
 #print axioms tightBoolU8ArrUnitWorld_isFromZeros_and_isIntoBytes
 
+/-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
+
 /-- info: 'Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_memory_surjective

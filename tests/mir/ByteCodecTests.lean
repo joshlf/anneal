@@ -1542,6 +1542,132 @@ theorem u8u32ScalarPairPermuted_fallbackSound :
     (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 1 (by decide))
     (FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder 4 (by decide))
 
+/-! ### `[adv ep1-B3]` Span-Fallback `.scalar` Structs With Marker Fields & Niche Newtypes
+
+Trusted uses the span fallback for every shape except a 1-field `.scalar` and a 2-field
+`.scalarPair` struct, so `struct W(u32, PhantomData<T>)` (2 fields, `.scalar`) needs
+`AdtDecodeFallbackSound.of_span_surjective`; and the `.scalar` fallback enforces the scalar's valid
+range, so `struct B(bool)` needs only `AdtDecodeFallbackSound.of_scalar` (not surjectivity).
+-/
+
+/-- `struct W(u32, PhantomData<T>)`: `u32 @ 0`, marker ZST `@ 4`, size 4, `.scalar` backend repr. -/
+def u32MarkerLayout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+def u32MarkerLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [u32MarkerLayout] }
+
+def u32MarkerPlaced :
+    PlacedCodecSpine [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }, Unit] :=
+  .cons (0, ⟨4, 4⟩)
+    (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize .u32) (MirValueCodec.uintByteSize_pos .u32))
+    (.cons (4, ⟨0, 1⟩) FixedByteCodec.unit .nil)
+
+/-- The 2-field `.scalar` shape takes Trusted's span fallback (neither special-cased branch). -/
+example : MirValueCodec.usesSpanFallback
+    (u32MarkerPlaced.placed.map fun p => ({ bytes := p.1 } : Size)) u32MarkerLayout.backendRepr = true :=
+  rfl
+
+theorem u32Marker_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound u32MarkerLayouts u32MarkerLayout 0 u32MarkerPlaced 4 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_span_surjective rfl rfl rfl
+    ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, FixedByteCodec.unit_isSurjectiveInitDecoder,
+     trivial⟩
+    (by decide)
+
+/-- `MirValueCodec` for `struct W(u32, PhantomData<T>)` through the general `.adt` constructor. -/
+def u32MarkerAdtCodec :
+    MirValueCodec u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 }
+      (FieldTuple [{ bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize .u32) }, Unit]) 4 :=
+  MirValueCodec.adtOfPlacedCodecSpine u32MarkerLayouts "W" 0 u32MarkerLayout 0 [0, 1]
+    u32MarkerPlaced 4 (.cons (TupleFieldCodec.uint _ .u32) (.cons (TupleFieldCodec.unit _) .nil))
+    rfl rfl rfl rfl rfl u32Marker_fallbackSound
+    (.cons (Nat.le_refl 0) (.cons (Nat.le_refl 4) (.nil (Nat.le_refl 4))))
+
+/-- `struct W(u32, PhantomData<T>)` is tight: `IsIntoBytes` and `IsFromBytes`. -/
+theorem u32MarkerAdt_isIntoBytes_and_isFromBytes :
+    IsIntoBytes u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 } ∧
+    IsFromBytes u32MarkerLayouts { kind := .adt "W" [.uint .u32, .tuple []], layoutIdx := 0 } :=
+  ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed u32MarkerPlaced 4 rfl
+      u32MarkerAdtCodec rfl rfl (by decide)
+      ⟨FixedByteCodec.uintBitsLE_isInitCodec _ _, FixedByteCodec.unit_isInitCodec, trivial⟩).2.1,
+   (MirValueCodec.ofPlacedCodecSpine_isFromBytes_all_pads u32MarkerPlaced 4 rfl u32MarkerAdtCodec rfl
+      ⟨FixedByteCodec.uintBitsLE_isSurjectiveInitDecoder _ _, FixedByteCodec.unit_isSurjectiveInitDecoder,
+       trivial⟩).2.1⟩
+
+/-- `struct B(bool)` with `bool`'s `.scalar` niche (`0 ..= 1`) and no `fieldLayouts`. -/
+def boolNewtypeLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false }
+
+def boolNewtypeLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [boolNewtypeLayout] }
+
+def boolNewtypePlaced : PlacedCodecSpine [Bool] :=
+  .cons (0, ⟨1, 1⟩) FixedByteCodec.boolByte .nil
+
+/-- The `.scalar` fallback enforces the niche: Trusted rejects `bool = 2` (kernel evaluation). -/
+example :
+    decodeValueFromBytes defaultCodecFuel boolNewtypeLayouts
+        { kind := .adt "B" [.bool], layoutIdx := 0 } [.init (UInt8.ofNat 2) none] = none :=
+  rfl
+
+theorem boolNewtype_fallbackSound :
+    MirValueCodec.AdtDecodeFallbackSound boolNewtypeLayouts boolNewtypeLayout 0 boolNewtypePlaced 1 :=
+  MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
+    (fun slice _ h => MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes slice h)
+
+/-- `MirValueCodec` for the niche newtype `struct B(bool)`. -/
+def boolNewtypeAdtCodec :
+    MirValueCodec boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } (FieldTuple [Bool]) 1 :=
+  MirValueCodec.adtOfPlacedCodecSpine boolNewtypeLayouts "B" 0 boolNewtypeLayout 0 [0]
+    boolNewtypePlaced 1 (.cons (TupleFieldCodec.bool _) .nil)
+    rfl rfl rfl rfl rfl boolNewtype_fallbackSound
+    (.cons (Nat.le_refl 0) (.nil (Nat.le_refl 1)))
+
+/-- `struct B(bool)`: `IsIntoBytes` and `IsFromZeros`, but not `IsFromBytes` (`0x02` is rejected). -/
+theorem boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes :
+    IsIntoBytes boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } ∧
+    IsFromZeros boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } ∧
+    ¬ IsFromBytes boolNewtypeLayouts { kind := .adt "B" [.bool], layoutIdx := 0 } := by
+  refine ⟨(MirValueCodec.ofPlacedCodecSpine_zero_pad_isIntoBytes_and_transmute_typed
+      boolNewtypePlaced 1 rfl boolNewtypeAdtCodec rfl rfl rfl
+      ⟨FixedByteCodec.boolByte_isInitCodec, trivial⟩).2.1,
+    (MirValueCodec.ofPlacedCodecSpine_isFromZeros_all_pads
+      boolNewtypePlaced 1 rfl boolNewtypeAdtCodec rfl
+      ⟨FixedByteCodec.boolByte_hasZeroValid, trivial⟩).2.1, ?_⟩
+  rintro ⟨sz, hSz, hAll⟩
+  injection hSz with hSzEq
+  subst hSzEq
+  obtain ⟨v, hv⟩ := hAll [.init (UInt8.ofNat 2) none] rfl rfl
+  nomatch hv
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_span_surjective' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_span_surjective
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalar' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalar
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_scalarPair' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.AdtDecodeFallbackSound.of_scalarPair
+
+/-- info: 'Anneal.ByteCodec.MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes
+
+/-- info: 'Anneal.ByteCodecTests.u32MarkerAdt_isIntoBytes_and_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms u32MarkerAdt_isIntoBytes_and_isFromBytes
+
+/-- info: 'Anneal.ByteCodecTests.boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms boolNewtypeAdt_isIntoBytes_and_isFromZeros_not_isFromBytes
+
 /-- info: 'Anneal.ByteCodec.MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms MirValueCodec.AdtDecodeFallbackSound.of_memory_surjective
