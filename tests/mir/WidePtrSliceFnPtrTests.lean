@@ -2053,6 +2053,121 @@ theorem unsafeFnPtr_structural_unsafe_source_ub_64 :
     (fun ⟨_, hSrc, _⟩ => by
       rcases hSrc with h | ⟨_, _, _, h, _⟩ <;> cases h)
 
+/-! ### Pass A3 witnesses: arithmetic `byteOffsetToElemIdx?`, structural global `Unsize`,
+global vs. stack misaligned `Unsize` / `Rvalue.len` asymmetry, cross-allocation wide-pointer
+ordering, `arrayPtrOrRefElemLen?`, and `rigidTyEq` soundness & depth-16 fuel boundary -/
+
+/-- Arithmetic `byteOffsetToElemIdx?` witnesses via `byteOffsetToElemIdx?_eq_some_iff` and
+`byteOffsetToElemIdx?_eq_none_iff`. -/
+theorem byteOffsetToElemIdx_arithmetic_witnesses :
+    byteOffsetToElemIdx? 12 4 = some 3 ∧
+    byteOffsetToElemIdx? 10 4 = none ∧
+    byteOffsetToElemIdx? 8 0 = none :=
+  ⟨(byteOffsetToElemIdx?_eq_some_iff 12 4 3).mpr
+      (Or.inr ⟨by decide, ⟨3, by decide⟩, by decide⟩),
+    (byteOffsetToElemIdx?_eq_none_iff 10 4).mpr
+      ⟨by decide, Or.inr (fun ⟨k, hk⟩ => by omega)⟩,
+    (byteOffsetToElemIdx?_eq_none_iff 8 0).mpr
+      ⟨by decide, Or.inl rfl⟩⟩
+
+/-- Structural global `Unsize` via `trusted_evalUnsizeCoercion_global_alloc_structural_iff`:
+1. Aligned offset `0` with `5 * 4 = 20 ≤ 20` on `testGlobal` succeeds (64-bit);
+2. Misaligned offset `2` (`¬ 4 ∣ 2`) on `testGlobal` faults with `.ub` (32-bit). -/
+theorem unsize_global_structural_ok_and_ub_witnesses :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 32) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem testDecls testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨9, 0⟩ 5 8) L64 testMem ∧
+    evalRvalue (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4)))
+        (.cast (.pointerCoercion "Unsize") (cp 32) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem testDecls testLayouts32 = .ub :=
+  ⟨(trusted_evalUnsizeCoercion_global_alloc_structural_iff L64 L64 (cp 32) testMem testDecls
+      testLayouts64 true .not u32Ty 3 { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 }
+      ⟨9, 0⟩ 5 testGlobal rfl rfl rfl rfl rfl).1.mpr
+      ⟨(fun h => by cases h), Or.inl rfl, by decide⟩,
+    (trusted_evalUnsizeCoercion_global_alloc_structural_iff
+      (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4))) (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4))) (cp 32)
+      testMem testDecls testLayouts32 true .not u32Ty 3
+      { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 }
+      ⟨9, 2⟩ 5 testGlobal rfl rfl rfl rfl rfl).2.mpr
+      (fun ⟨_, hAlign, _⟩ => by
+        rcases hAlign with h0 | ⟨_, ⟨k, hk⟩⟩
+        · cases h0
+        · change 2 = 4 * k at hk
+          omega)⟩
+
+/-- Asymmetry between `evalUnsizeCoercion` and `evalPlaceLen` on misaligned byte offsets (`offset = 2`,
+`u32` stride `4`):
+1. On a **stack borrow** (tag `1` on local `0`), both `Unsize` and `Rvalue.len` reject `offsetBytes = 2`
+   (`sliceLenBorrowOk_stack_misaligned`);
+2. On a **global allocation** (`testGlobal`, `allocId = 9`, 20 bytes), `Unsize` at `offsetBytes = 2`
+   faults with `.ub`, whereas `Rvalue.len` on a slice pointer `(⟨9, 2⟩, 3)` (`2 + 3 * 4 = 14 ≤ 20`)
+   succeeds with `.ok (.scalar ⟨3, 8⟩)` (`trusted_evalRvalue_len_deref_global_iff`), and faults at
+   length `5` (`2 + 5 * 4 = 22 > 20`). -/
+theorem stack_and_global_misaligned_len_witnesses :
+    evalRvalue (L64.set 15 (.init (.aggregate 0 [.ptr ⟨1, 2⟩ 8, .scalar ⟨3, 8⟩])))
+        (.len (derefPlace 15)) testMem testDecls testLayouts64 = .ub ∧
+    evalRvalue (L64.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 8, .scalar ⟨3, 8⟩])))
+        (.len (derefPlace 25)) testMem testDecls testLayouts64 =
+      .ok (.scalar ⟨3, 8⟩)
+        (L64.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 8, .scalar ⟨3, 8⟩]))) testMem ∧
+    evalRvalue (L32.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 4, .scalar ⟨5, 4⟩])))
+        (.len (derefPlace 25)) testMem testDecls testLayouts32 = .ub :=
+  ⟨(trusted_evalRvalue_len_deref_slice_iff
+      (L64.set 15 (.init (.aggregate 0 [.ptr ⟨1, 2⟩ 8, .scalar ⟨3, 8⟩])))
+      (L64.set 15 (.init (.aggregate 0 [.ptr ⟨1, 2⟩ 8, .scalar ⟨3, 8⟩])))
+      (derefPlace 15) testMem testDecls testLayouts64 [] u32Ty _ ⟨1, 2⟩ 8 ⟨3, 8⟩
+      rfl rfl rfl).2.mpr (fun ⟨_, _, h⟩ => by
+        rw [sliceLenBorrowOk_stack_misaligned
+          (L64.set 15 (.init (.aggregate 0 [.ptr ⟨1, 2⟩ 8, .scalar ⟨3, 8⟩])))
+          testMem testDecls testLayouts64 u32Ty ⟨1, 2⟩ ⟨3, 8⟩ activeEntry backing [] 0 backingElems
+          rfl (fun hc => by cases hc) (Or.inl rfl) rfl rfl] at h
+        cases h),
+    (trusted_evalRvalue_len_deref_global_iff
+      (L64.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 8, .scalar ⟨3, 8⟩])))
+      (L64.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 8, .scalar ⟨3, 8⟩])))
+      (derefPlace 25) testMem testDecls testLayouts64 [] u32Ty _ ⟨9, 2⟩ ⟨3, 8⟩ testGlobal 4
+      rfl rfl rfl rfl rfl rfl rfl).1.mpr (by decide),
+    (trusted_evalRvalue_len_deref_global_iff
+      (L32.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 4, .scalar ⟨5, 4⟩])))
+      (L32.set 25 (.init (.aggregate 0 [.ptr ⟨9, 2⟩ 4, .scalar ⟨5, 4⟩])))
+      (derefPlace 25) testMem testDecls testLayouts32 [] u32Ty _ ⟨9, 2⟩ ⟨5, 4⟩ testGlobal 4
+      rfl rfl rfl rfl rfl rfl rfl).2.mpr (by decide)⟩
+
+/-- Cross-allocation wide-pointer ordering (`allocId = 7` vs `allocId = 9` in locals `22` and `25`):
+even though local `22` has larger offset `8 > 0`, `7 < 9` decides `<` and `cmp` (`Less = 255`). -/
+theorem widePtr_diff_alloc_lt_and_cmp_witnesses :
+    evalRvalue L64 (.binaryOp .lt (cp 22) (cp 25)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar true)) L64 testMem ∧
+    evalRvalue L32 (.binaryOp .cmp (cp 25) (cp 22)) testMem testDecls testLayouts32 =
+      .ok (.scalar ⟨1, 1⟩) L32 testMem :=
+  ⟨(trusted_evalRvalue_binaryOp_wide_ptr_diff_alloc_ordering L64 L64 L64 .lt (cp 22) (cp 25)
+      testMem testDecls testLayouts64 7 9 8 0 1 5 rfl rfl rfl rfl rfl rfl
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+      (by decide)).trans rfl,
+    (trusted_evalRvalue_binaryOp_wide_ptr_diff_alloc_ordering L32 L32 L32 .cmp (cp 25) (cp 22)
+      testMem testDecls testLayouts32 9 7 0 8 5 1 rfl rfl rfl rfl rfl rfl
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
+      (by decide)).trans rfl⟩
+
+/-- `arrayPtrOrRefElemLen?_eq_some_iff`, `rigidTyEq_eq_true_imp_eq`, `rigidTyListEq_eq_true_imp_eq`,
+and the depth-15/depth-16 `rigidTyEq` fuel boundary (`defaultTyEqFuel = 16`). -/
+theorem arrayPtrOrRef_and_rigidTyEq_witnesses :
+    arrayPtrOrRefElemLen? (some { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 }) u32Ty =
+      some 5 ∧
+    (rigidTyEq u32Ty u32Ty = true → u32Ty = u32Ty) ∧
+    (rigidTyListEq [u32Ty] [u32Ty] = true → [u32Ty] = [u32Ty]) ∧
+    rigidTyEq (nestedSliceRigidTy 15) (nestedSliceRigidTy 15) = true ∧
+    rigidTyEq (nestedSliceRigidTy 16) (nestedSliceRigidTy 16) = false ∧
+    unsizeArrayToSliceSpec?
+        (.ref .not (.array (nestedSliceRigidTy 16) 5))
+        (.ref .not (.slice (nestedSliceRigidTy 16))) = .none :=
+  ⟨(arrayPtrOrRefElemLen?_eq_some_iff _ u32Ty 5).mpr ⟨.not, u32Ty, 1, Or.inr rfl, rfl⟩,
+    rigidTyEq_eq_true_imp_eq u32Ty u32Ty,
+    rigidTyListEq_eq_true_imp_eq [u32Ty] [u32Ty],
+    rigidTyEq_nested_slice_depth_15_and_16_boundary.1,
+    rigidTyEq_nested_slice_depth_15_and_16_boundary.2.1,
+    rigidTyEq_nested_slice_depth_15_and_16_boundary.2.2⟩
+
 end OrderingAndStructuralWitnesses
 
 /-! ## Kernel axiom audit -/

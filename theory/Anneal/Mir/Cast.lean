@@ -13967,6 +13967,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics (RvalueEvalResult TreeBorrowPerm FnP
   mutToConstTargetShape? isThinRawPtrTy isWideRawPtrTy thinRawPtrPointee?
   wideRawPtrIsDyn? isSliceOrStrPtrOrRefTy arrayPtrOrRefElemLen?
   readSliceBackingAggregate? inferElemListByteStride byteOffsetToElemIdx?
+  exactByteDivAux rigidTyEqAux rigidTyListEqAux defaultTyEqFuel intTyEq uintTyEq floatTyEq
   lookupBorrow lookupGlobalAlloc readProjectedValue wrapScalarBits scalarModulus
   isFnPtrAllocId lookupFnPtr internFnPtr findFnPtrEntry? nextFnPtrAllocId
   fnPtrAllocBase evalRvalue evalOperand operandTy stringEq safetyEq callConvEq
@@ -17365,6 +17366,450 @@ theorem trusted_evalRvalue_ptrToPtr_thin_nonarray_or_unborrowed
   · rw [hNoArr]
   · rw [hNoBor]
     cases arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem <;> rfl
+
+/-! ### 9.6 Exact Arithmetic Division (`byteOffsetToElemIdx?` / `exactByteDivAux`), Structural Global `Unsize`, `arrayPtrOrRefElemLen?` & Fuel-Bounded `rigidTyEq` Soundness / Depth-16 Boundary -/
+
+/-- **Soundness of `exactByteDivAux`**: whenever `exactByteDivAux fuel rem stride acc = .some k`,
+there exists a quotient `q` such that `rem = q * stride` and `k = acc + q`. -/
+theorem exactByteDivAux_eq_some_imp :
+    ∀ (fuel rem stride acc k : Nat),
+      exactByteDivAux fuel rem stride acc = .some k →
+      ∃ q, rem = q * stride ∧ k = acc + q := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro rem stride acc k h
+    cases rem with
+    | zero =>
+      injection h with hEq
+      exact ⟨0, by omega, by omega⟩
+    | succ r => cases h
+  | succ fuel ih =>
+    intro rem stride acc k h
+    cases rem with
+    | zero =>
+      injection h with hEq
+      exact ⟨0, by omega, by omega⟩
+    | succ r =>
+      unfold exactByteDivAux at h
+      cases hBle : Nat.ble stride (Nat.succ r)
+      · rw [hBle] at h
+        cases h
+      · rw [hBle] at h
+        have hLe : stride ≤ Nat.succ r := Nat.le_of_ble_eq_true hBle
+        obtain ⟨q, hRem, hAcc⟩ := ih (Nat.sub (Nat.succ r) stride) stride (Nat.succ acc) k h
+        have hSub : Nat.succ r - stride = q * stride := hRem
+        refine ⟨q + 1, ?_, by omega⟩
+        rw [Nat.add_mul, Nat.one_mul, ← hSub]
+        omega
+
+/-- **Completeness of `exactByteDivAux`**: for any positive `stride > 0` and quotient `q ≤ fuel`,
+`exactByteDivAux fuel (q * stride) stride acc = .some (acc + q)`. -/
+theorem exactByteDivAux_mul_eq_some :
+    ∀ (q fuel stride acc : Nat),
+      0 < stride → q ≤ fuel →
+      exactByteDivAux fuel (q * stride) stride acc = .some (acc + q) := by
+  intro q
+  induction q with
+  | zero =>
+    intro fuel stride acc _ _
+    rw [Nat.zero_mul, Nat.add_zero]
+    cases fuel <;> rfl
+  | succ q ih =>
+    intro fuel stride acc hPos hLe
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      have hPosMul : 0 < (q + 1) * stride := by
+        rw [Nat.add_mul, Nat.one_mul]
+        omega
+      obtain ⟨r, hr⟩ : ∃ r, (q + 1) * stride = Nat.succ r :=
+        ⟨(q + 1) * stride - 1, by omega⟩
+      have hGe : stride ≤ Nat.succ r := by
+        rw [← hr, Nat.add_mul, Nat.one_mul]
+        omega
+      have hSub : Nat.sub (Nat.succ r) stride = q * stride := by
+        change Nat.succ r - stride = q * stride
+        rw [← hr, Nat.add_mul, Nat.one_mul]
+        omega
+      rw [hr]
+      unfold exactByteDivAux
+      rw [Nat.ble_eq_true_of_le hGe]
+      dsimp only
+      rw [hSub, ih fuel stride (Nat.succ acc) hPos (by omega)]
+      congr 1
+      omega
+
+/-- **Exact multiplicative characterization of `byteOffsetToElemIdx?`**:
+`byteOffsetToElemIdx? offsetBytes elemSz = .some k ↔ (offsetBytes = 0 ∧ k = 0) ∨ (0 < elemSz ∧ offsetBytes = k * elemSz)`. -/
+theorem byteOffsetToElemIdx?_eq_some_iff_mul (offsetBytes elemSz k : Nat) :
+    byteOffsetToElemIdx? offsetBytes elemSz = .some k ↔
+      (offsetBytes = 0 ∧ k = 0) ∨ (0 < elemSz ∧ offsetBytes = k * elemSz) := by
+  unfold byteOffsetToElemIdx?
+  cases hOff : Nat.beq offsetBytes 0
+  · have hOffNe : offsetBytes ≠ 0 := fun h => by subst h; cases hOff
+    cases hSz : Nat.beq elemSz 0
+    · have hPos : 0 < elemSz := Nat.pos_of_ne_zero (fun h => by subst h; cases hSz)
+      constructor
+      · intro hSome
+        obtain ⟨q, hMul, hAcc⟩ := exactByteDivAux_eq_some_imp offsetBytes offsetBytes elemSz 0 k hSome
+        have hq : k = q := by omega
+        subst hq
+        exact Or.inr ⟨hPos, hMul⟩
+      · rintro (⟨h0, _⟩ | ⟨_, hMul⟩)
+        · exact absurd h0 hOffNe
+        · have hkLe : k ≤ offsetBytes := by
+            rw [hMul]
+            exact Nat.le_mul_of_pos_right k hPos
+          have hEval := exactByteDivAux_mul_eq_some k offsetBytes elemSz 0 hPos hkLe
+          rw [← hMul, Nat.zero_add] at hEval
+          exact hEval
+    · have hSz0 : elemSz = 0 := Nat.eq_of_beq_eq_true hSz
+      exact ⟨fun h => (by cases h), fun h => by
+        rcases h with ⟨h0, _⟩ | ⟨hPos, _⟩
+        · exact absurd h0 hOffNe
+        · omega⟩
+  · have hOff0 : offsetBytes = 0 := Nat.eq_of_beq_eq_true hOff
+    subst hOff0
+    constructor
+    · intro h
+      injection h with hk
+      exact Or.inl ⟨rfl, hk.symm⟩
+    · rintro (⟨_, rfl⟩ | ⟨hPos, hMul⟩)
+      · rfl
+      · have hk0 : k = 0 := by
+          rcases Nat.eq_zero_or_pos k with rfl | hkPos
+          · rfl
+          · have : 0 < k * elemSz := Nat.mul_pos hkPos hPos
+            omega
+        subst hk0
+        rfl
+
+/-- **Exact arithmetic divisibility & quotient characterization of `byteOffsetToElemIdx?`**:
+`byteOffsetToElemIdx? offsetBytes elemSz = .some k ↔ (offsetBytes = 0 ∧ k = 0) ∨ (0 < elemSz ∧ elemSz ∣ offsetBytes ∧ k = offsetBytes / elemSz)`. -/
+theorem byteOffsetToElemIdx?_eq_some_iff (offsetBytes elemSz k : Nat) :
+    byteOffsetToElemIdx? offsetBytes elemSz = .some k ↔
+      (offsetBytes = 0 ∧ k = 0) ∨
+        (0 < elemSz ∧ elemSz ∣ offsetBytes ∧ k = offsetBytes / elemSz) := by
+  rw [byteOffsetToElemIdx?_eq_some_iff_mul]
+  constructor
+  · rintro (h | ⟨hPos, hMul⟩)
+    · exact Or.inl h
+    · refine Or.inr ⟨hPos, ⟨k, by rw [hMul, Nat.mul_comm]⟩, ?_⟩
+      rw [hMul, Nat.mul_div_left k hPos]
+  · rintro (h | ⟨hPos, ⟨q, hq⟩, hk⟩)
+    · exact Or.inl h
+    · refine Or.inr ⟨hPos, ?_⟩
+      rw [hq, Nat.mul_comm] at hk ⊢
+      rw [Nat.mul_div_left q hPos] at hk
+      subst hk
+      rfl
+
+/-- **Exact `.none` (misalignment / zero-stride) characterization of `byteOffsetToElemIdx?`**:
+`byteOffsetToElemIdx? offsetBytes elemSz = .none ↔ offsetBytes ≠ 0 ∧ (elemSz = 0 ∨ ¬ elemSz ∣ offsetBytes)`. -/
+theorem byteOffsetToElemIdx?_eq_none_iff (offsetBytes elemSz : Nat) :
+    byteOffsetToElemIdx? offsetBytes elemSz = .none ↔
+      offsetBytes ≠ 0 ∧ (elemSz = 0 ∨ ¬ elemSz ∣ offsetBytes) := by
+  constructor
+  · intro hNone
+    refine ⟨fun h0 => ?_, ?_⟩
+    · have hSome : byteOffsetToElemIdx? offsetBytes elemSz = .some 0 :=
+        (byteOffsetToElemIdx?_eq_some_iff offsetBytes elemSz 0).mpr (Or.inl ⟨h0, rfl⟩)
+      rw [hNone] at hSome
+      cases hSome
+    · rcases Nat.eq_zero_or_pos elemSz with rfl | hPos
+      · exact Or.inl rfl
+      · refine Or.inr (fun hDvd => ?_)
+        have hSome : byteOffsetToElemIdx? offsetBytes elemSz = .some (offsetBytes / elemSz) :=
+          (byteOffsetToElemIdx?_eq_some_iff offsetBytes elemSz (offsetBytes / elemSz)).mpr
+            (Or.inr ⟨hPos, hDvd, rfl⟩)
+        rw [hNone] at hSome
+        cases hSome
+  · rintro ⟨hOffNe, hSz0 | hNotDvd⟩
+    · cases hOpt : byteOffsetToElemIdx? offsetBytes elemSz with
+      | none => rfl
+      | some k =>
+        rcases (byteOffsetToElemIdx?_eq_some_iff offsetBytes elemSz k).mp hOpt with
+          ⟨h0, _⟩ | ⟨hPos, _, _⟩
+        · exact absurd h0 hOffNe
+        · omega
+    · cases hOpt : byteOffsetToElemIdx? offsetBytes elemSz with
+      | none => rfl
+      | some k =>
+        rcases (byteOffsetToElemIdx?_eq_some_iff offsetBytes elemSz k).mp hOpt with
+          ⟨h0, _⟩ | ⟨_, hDvd, _⟩
+        · exact absurd h0 hOffNe
+        · exact absurd hDvd hNotDvd
+
+/-- Effective element stride used by `unsizeGlobalAllocValid` (`Places.lean:13364–13374`). -/
+def globalUnsizeElemStride (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (dstElem : RigidTy) : Nat :=
+  match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
+  | .some sz => sz
+  | .none => 1
+
+/-- **Structural two-sided characterization of `unsizeGlobalAllocValid`**:
+holds iff mutability is compatible (`dstMut = .mut → alloc.mutability = .mut`), `ptrVal.offsetBytes`
+is element-stride aligned (`ptrVal.offsetBytes = 0 ∨ (0 < elemSz ∧ elemSz ∣ ptrVal.offsetBytes)`),
+and `ptrVal.offsetBytes + n * elemSz ≤ length alloc.bytes`. -/
+theorem unsizeGlobalAllocValid_eq_true_iff
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (dstMut : Mutability) (dstElem : RigidTy)
+    (ptrVal : ProvenancePtr) (n : Nat) (alloc : CapturedAllocation) :
+    unsizeGlobalAllocValid localDecls layouts dstMut dstElem ptrVal n alloc = true ↔
+      (dstMut = .mut → alloc.mutability = .mut) ∧
+      (ptrVal.offsetBytes = 0 ∨
+        (0 < globalUnsizeElemStride localDecls layouts dstElem ∧
+          globalUnsizeElemStride localDecls layouts dstElem ∣ ptrVal.offsetBytes)) ∧
+      Nat.add ptrVal.offsetBytes
+        (Nat.mul n (globalUnsizeElemStride localDecls layouts dstElem)) ≤ length alloc.bytes := by
+  have hMutIff :
+      (match dstMut, alloc.mutability with | .mut, .not => false | _, _ => true) = true ↔
+        (dstMut = .mut → alloc.mutability = .mut) := by
+    cases dstMut <;> cases alloc.mutability
+    · exact ⟨fun _ h => h, fun _ => rfl⟩
+    · exact ⟨fun _ _ => rfl, fun _ => rfl⟩
+    · exact ⟨fun h => (by cases h), fun h => (by cases h rfl)⟩
+    · exact ⟨fun _ _ => rfl, fun _ => rfl⟩
+  have hAlignIff :
+      (match byteOffsetToElemIdx? ptrVal.offsetBytes
+        (globalUnsizeElemStride localDecls layouts dstElem) with
+       | .some _ => true
+       | .none => false) = true ↔
+        (ptrVal.offsetBytes = 0 ∨
+          (0 < globalUnsizeElemStride localDecls layouts dstElem ∧
+            globalUnsizeElemStride localDecls layouts dstElem ∣ ptrVal.offsetBytes)) := by
+    cases hIdx : byteOffsetToElemIdx? ptrVal.offsetBytes
+        (globalUnsizeElemStride localDecls layouts dstElem) with
+    | some k =>
+      simp only [true_iff]
+      rcases (byteOffsetToElemIdx?_eq_some_iff ptrVal.offsetBytes
+          (globalUnsizeElemStride localDecls layouts dstElem) k).mp hIdx with
+        ⟨h0, _⟩ | ⟨hPos, hDvd, _⟩
+      · exact Or.inl h0
+      · exact Or.inr ⟨hPos, hDvd⟩
+    | none =>
+      simp only [Bool.false_eq_true, false_iff]
+      obtain ⟨hOffNe, hBad⟩ := (byteOffsetToElemIdx?_eq_none_iff ptrVal.offsetBytes
+        (globalUnsizeElemStride localDecls layouts dstElem)).mp hIdx
+      rintro (h0 | ⟨hPos, hDvd⟩)
+      · exact hOffNe h0
+      · rcases hBad with hSz0 | hNotDvd
+        · omega
+        · exact hNotDvd hDvd
+  unfold unsizeGlobalAllocValid
+  dsimp only
+  unfold globalUnsizeElemStride at hAlignIff
+  rw [Bool.and_eq_true, Bool.and_eq_true, hMutIff, hAlignIff]
+  unfold globalUnsizeElemStride
+  constructor
+  · rintro ⟨hM, hA, hB⟩
+    exact ⟨hM, hA, Nat.le_of_ble_eq_true hB⟩
+  · rintro ⟨hM, hA, hB⟩
+    exact ⟨hM, hA, Nat.ble_eq_true_of_le hB⟩
+
+/-- **Fully structural two-sided characterization of global allocation `Unsize`**
+(`lookupBorrow = .none`, `lookupGlobalAlloc = .some alloc`): combines
+`trusted_evalUnsizeCoercion_global_alloc_iff` and `unsizeGlobalAllocValid_eq_true_iff`. -/
+theorem trusted_evalUnsizeCoercion_global_alloc_structural_iff
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (alloc : CapturedAllocation)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
+    (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
+    (hTy : operandTy localDecls layouts op = .some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
+      .some n) :
+    (evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal n (layoutPointerBytes layouts)) locals' mem ↔
+      ((dstMut = .mut → alloc.mutability = .mut) ∧
+        (ptrVal.offsetBytes = 0 ∨
+          (0 < globalUnsizeElemStride localDecls layouts dstElem ∧
+            globalUnsizeElemStride localDecls layouts dstElem ∣ ptrVal.offsetBytes)) ∧
+        Nat.add ptrVal.offsetBytes
+          (Nat.mul n (globalUnsizeElemStride localDecls layouts dstElem)) ≤ length alloc.bytes)) ∧
+    (evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub ↔
+      ¬ ((dstMut = .mut → alloc.mutability = .mut) ∧
+        (ptrVal.offsetBytes = 0 ∨
+          (0 < globalUnsizeElemStride localDecls layouts dstElem ∧
+            globalUnsizeElemStride localDecls layouts dstElem ∣ ptrVal.offsetBytes)) ∧
+        Nat.add ptrVal.offsetBytes
+          (Nat.mul n (globalUnsizeElemStride localDecls layouts dstElem)) ≤ length alloc.bytes)) := by
+  have hBase := trusted_evalUnsizeCoercion_global_alloc_iff locals locals' op mem localDecls layouts
+    isDstRef dstMut dstElem dstLIdx srcTy ptrVal n alloc hOp hNoBorrow hGlobal hTy hSpec
+  have hStruct := unsizeGlobalAllocValid_eq_true_iff localDecls layouts dstMut dstElem ptrVal n alloc
+  refine ⟨hBase.2.2.1.trans hStruct, ?_⟩
+  rw [hBase.2.2.2, ← hStruct]
+  cases unsizeGlobalAllocValid localDecls layouts dstMut dstElem ptrVal n alloc <;> decide
+
+/-- **Exact two-sided (`↔`) characterization of `arrayPtrOrRefElemLen?`** over arbitrary
+`srcTyOpt : Option Ty` (`Places.lean:17912–17922`). -/
+theorem arrayPtrOrRefElemLen?_eq_some_iff
+    (srcTyOpt : Option Ty) (dstElem : RigidTy) (arrLen : Nat) :
+    arrayPtrOrRefElemLen? srcTyOpt dstElem = .some arrLen ↔
+      ∃ srcMut srcElem lIdx,
+        (srcTyOpt = .some { kind := .rawPtr srcMut (.array srcElem arrLen), layoutIdx := lIdx } ∨
+         srcTyOpt = .some { kind := .ref srcMut (.array srcElem arrLen), layoutIdx := lIdx }) ∧
+        rigidTyEq srcElem dstElem = true := by
+  constructor
+  · intro h
+    rcases srcTyOpt with _ | ⟨kind, lIdx⟩
+    · cases h
+    · cases kind with
+      | rawPtr srcMut pt =>
+        cases pt with
+        | array srcElem n =>
+          unfold arrayPtrOrRefElemLen? at h
+          dsimp only at h
+          cases hEq : rigidTyEq srcElem dstElem
+          · rw [hEq] at h; cases h
+          · rw [hEq] at h
+            injection h with hn
+            subst hn
+            exact ⟨srcMut, srcElem, lIdx, Or.inl rfl, hEq⟩
+        | _ => cases h
+      | ref srcMut pt =>
+        cases pt with
+        | array srcElem n =>
+          unfold arrayPtrOrRefElemLen? at h
+          dsimp only at h
+          cases hEq : rigidTyEq srcElem dstElem
+          · rw [hEq] at h; cases h
+          · rw [hEq] at h
+            injection h with hn
+            subst hn
+            exact ⟨srcMut, srcElem, lIdx, Or.inr rfl, hEq⟩
+        | _ => cases h
+      | _ => cases h
+  · rintro ⟨srcMut, srcElem, lIdx, hTy | hTy, hEq⟩ <;>
+      (subst hTy; unfold arrayPtrOrRefElemLen?; dsimp only; rw [hEq])
+
+/-- `intTyEq` is propositional equality on `IntTy`. -/
+theorem intTyEq_eq_true_iff (a b : IntTy) : intTyEq a b = true ↔ a = b := by
+  cases a <;> cases b <;> first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- `uintTyEq` is propositional equality on `UintTy`. -/
+theorem uintTyEq_eq_true_iff (a b : UintTy) : uintTyEq a b = true ↔ a = b := by
+  cases a <;> cases b <;> first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- `floatTyEq` is propositional equality on `FloatTy`. -/
+theorem floatTyEq_eq_true_iff (a b : FloatTy) : floatTyEq a b = true ↔ a = b := by
+  cases a <;> cases b <;> first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- `mutabilityEq` is propositional equality on `Mutability`. -/
+theorem mutabilityEq_eq_true_iff (a b : Mutability) : mutabilityEq a b = true ↔ a = b := by
+  cases a <;> cases b <;> first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- `safetyEq` is propositional equality on `Safety`. -/
+theorem safetyEq_eq_true_iff (a b : Safety) : safetyEq a b = true ↔ a = b := by
+  cases a <;> cases b <;> first
+    | exact ⟨fun _ => rfl, fun _ => rfl⟩
+    | exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+
+/-- **Mutual propositional soundness of `rigidTyEqAux` and `rigidTyListEqAux`**: for every fuel
+budget `fuel`, `rigidTyEqAux fuel a b = true → a = b` and
+`rigidTyListEqAux fuel xs ys = true → xs = ys`. -/
+theorem rigidTyEqAux_and_list_sound :
+    ∀ fuel : Nat,
+      (∀ a b : RigidTy, rigidTyEqAux fuel a b = true → a = b) ∧
+      (∀ xs ys : List RigidTy, rigidTyListEqAux fuel xs ys = true → xs = ys) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    exact ⟨fun _ _ h => (by unfold rigidTyEqAux at h; cases h),
+      fun _ _ h => (by unfold rigidTyListEqAux at h; cases h)⟩
+  | succ fuel ih =>
+    have hSingle : ∀ a b : RigidTy, rigidTyEqAux (Nat.succ fuel) a b = true → a = b := by
+      intro a b h
+      cases a <;> cases b <;> dsimp only [rigidTyEqAux] at h <;> (try rfl) <;> (try cases h)
+      · rw [Bool.and_eq_true] at h
+        rw [Nat.eq_of_beq_eq_true h.1, LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h.2]
+      · rw [Bool.and_eq_true] at h
+        rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h.1, ih.2 _ _ h.2]
+      · rw [(intTyEq_eq_true_iff _ _).mp h]
+      · rw [(uintTyEq_eq_true_iff _ _).mp h]
+      · rw [(floatTyEq_eq_true_iff _ _).mp h]
+      · rw [ih.2 _ _ h]
+      · rw [Bool.and_eq_true] at h
+        rw [Nat.eq_of_beq_eq_true h.1, ih.1 _ _ h.2]
+      · rw [ih.1 _ _ h]
+      · rw [Bool.and_eq_true] at h
+        rw [(mutabilityEq_eq_true_iff _ _).mp h.1, ih.1 _ _ h.2]
+      · rw [Bool.and_eq_true] at h
+        rw [(mutabilityEq_eq_true_iff _ _).mp h.1, ih.1 _ _ h.2]
+      · rw [Bool.and_eq_true] at h
+        rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h.1, ih.2 _ _ h.2]
+      · rw [Bool.and_eq_true] at h
+        rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h.1, ih.2 _ _ h.2]
+      · rw [Bool.and_eq_true, Bool.and_eq_true, Bool.and_eq_true] at h
+        rcases h with ⟨hIn, hOut, hSaf, hAbi⟩
+        rw [ih.2 _ _ hIn, ih.1 _ _ hOut, (safetyEq_eq_true_iff _ _).mp hSaf,
+          (callConvEq_eq_true_iff _ _).mp hAbi]
+      · rw [Bool.and_eq_true] at h
+        rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h.1, ih.2 _ _ h.2]
+      · rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h]
+      · rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h]
+      · rw [LPointerCoercionKind.stringEq_eq_true_iff_eq.mp h]
+    refine ⟨hSingle, ?_⟩
+    intro xs
+    induction xs with
+    | nil =>
+      intro ys h
+      cases ys with
+      | nil => rfl
+      | cons _ _ => cases h
+    | cons x xs ihList =>
+      intro ys h
+      cases ys with
+      | nil => cases h
+      | cons y ys =>
+        unfold rigidTyListEqAux at h
+        rw [Bool.and_eq_true] at h
+        rw [hSingle x y h.1, ihList ys h.2]
+
+/-- **Soundness of `rigidTyEq`**: `rigidTyEq a b = true → a = b`. -/
+theorem rigidTyEq_eq_true_imp_eq (a b : RigidTy) (h : rigidTyEq a b = true) : a = b :=
+  (rigidTyEqAux_and_list_sound defaultTyEqFuel).1 a b h
+
+/-- **Soundness of `rigidTyListEq`**: `rigidTyListEq xs ys = true → xs = ys`. -/
+theorem rigidTyListEq_eq_true_imp_eq (xs ys : List RigidTy) (h : rigidTyListEq xs ys = true) :
+    xs = ys :=
+  (rigidTyEqAux_and_list_sound defaultTyEqFuel).2 xs ys h
+
+/-- Nested slice type `[[...[bool]...]]` of nesting depth `d`, used to witness the exact
+`defaultTyEqFuel = 16` completeness boundary of `rigidTyEq`. -/
+def nestedSliceRigidTy : Nat → RigidTy
+  | 0 => .bool
+  | n + 1 => .slice (nestedSliceRigidTy n)
+
+/-- **Exact `defaultTyEqFuel = 16` completeness boundary of `rigidTyEq`**:
+at nesting depth `15` (`< 16`), `rigidTyEq` is reflexive (`= true`), whereas at nesting depth `16`
+(`= defaultTyEqFuel`), `rigidTyEq (nestedSliceRigidTy 16) (nestedSliceRigidTy 16) = false` even
+though the two types are judgmentally identical, causing `unsizeArrayToSliceSpec?` to return `.none`. -/
+theorem rigidTyEq_nested_slice_depth_15_and_16_boundary :
+    rigidTyEq (nestedSliceRigidTy 15) (nestedSliceRigidTy 15) = true ∧
+    rigidTyEq (nestedSliceRigidTy 16) (nestedSliceRigidTy 16) = false ∧
+    unsizeArrayToSliceSpec?
+        (.ref .not (.array (nestedSliceRigidTy 16) 5))
+        (.ref .not (.slice (nestedSliceRigidTy 16))) = .none :=
+  ⟨rfl, rfl, rfl⟩
 
 end WidePtrSliceAndFnPtrCast
 

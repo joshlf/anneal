@@ -16589,6 +16589,37 @@ theorem sliceLenBorrowOk_callerLocals_backing (locals' : List LocalSlot) (mem : 
     | exact absurd rfl hPerm
     | (simp only [hNoLocal, hCallerRoot, hBacking, hOff] <;> rfl)
 
+/-- A live stack borrow (in `locals'` or cross-frame `mem.callerLocals`) whose byte offset is not
+aligned to the backing element stride (`byteOffsetToElemIdx? = .none`, `Places.lean:14462`) is
+rejected by `sliceLenBorrowOk`. -/
+theorem sliceLenBorrowOk_stack_misaligned (locals' : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (ptrVal : ProvenancePtr)
+    (lenSc : ScalarInt) (entry : BorrowEntry) (rootVal : Value)
+    (cProj : List ProjectionElem) (baseIdx : Nat) (elems : List Value)
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hRoot :
+      get? locals' entry.targetLocal = .some (.init rootVal) ∨
+      (get? locals' entry.targetLocal = .none ∧
+        get? mem.callerLocals entry.targetLocal = .some (.init rootVal)))
+    (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection lenSc.bits
+        (tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }) =
+      .some (cProj, baseIdx, elems))
+    (hMisalign : byteOffsetToElemIdx? ptrVal.offsetBytes (inferElemListByteStride elems) = .none) :
+    sliceLenBorrowOk locals' mem localDecls layouts elem ptrVal lenSc = false := by
+  unfold sliceLenBorrowOk
+  rw [hBorrow]
+  dsimp only
+  rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  dsimp only at hPerm hRoot hBacking ⊢
+  rcases hRoot with hLoc | ⟨hNoLoc, hCal⟩
+  · cases perm <;> first
+      | exact absurd rfl hPerm
+      | (simp only [hLoc, hBacking, hMisalign] <;> rfl)
+  · cases perm <;> first
+      | exact absurd rfl hPerm
+      | (simp only [hNoLoc, hCal, hBacking, hMisalign] <;> rfl)
+
 /-- An unborrowed pointer into a global allocation is valid for `Rvalue.len` iff
 `offsetBytes + len * elemSz ≤ length alloc.bytes`. -/
 theorem sliceLenBorrowOk_global (locals' : List LocalSlot) (mem : Memory)
@@ -16602,6 +16633,46 @@ theorem sliceLenBorrowOk_global (locals' : List LocalSlot) (mem : Memory)
       Nat.ble (Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz)) (length alloc.bytes) := by
   unfold sliceLenBorrowOk
   simp only [hNoBorrow, hGlobal, hSz] <;> rfl
+
+/-- **Two-sided characterization of `Rvalue.len` on a global slice pointer** (`Places.lean:14472–14483`):
+succeeds iff `ptrVal.offsetBytes + lenSc.bits * elemSz ≤ length alloc.bytes` and faults with `.ub`
+iff `length alloc.bytes < ptrVal.offsetBytes + lenSc.bits * elemSz`. Notably, unlike
+`evalUnsizeCoercion` (`Places.lean:13376`), `evalPlaceLen` on a global allocation does *not* check
+`byteOffsetToElemIdx? ptrVal.offsetBytes elemSz`. -/
+theorem trusted_evalRvalue_len_deref_global_iff
+    (locals locals' : List LocalSlot) (place : Place) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (initProj : List ProjectionElem)
+    (elem : RigidTy) (lIdx : LayoutIdx) (ptrVal : ProvenancePtr) (lenSc : ScalarInt)
+    (alloc : CapturedAllocation) (elemSz : Nat)
+    (hTy : placeTy localDecls layouts place = .some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = .some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+        mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ptrVal (layoutPointerBytes layouts) :: .scalar lenSc :: .nil)) locals')
+    (hMeta : lenSc.sizeBytes = layoutPointerBytes layouts)
+    (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
+    (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
+    (hSz : tyByteSize localDecls layouts { kind := elem, layoutIdx := unresolvedLayoutIdx layouts } =
+      .some elemSz) :
+    (evalRvalue locals (.len place) mem localDecls layouts =
+        .ok (.scalar ⟨lenSc.bits, layoutPointerBytes layouts⟩) locals' mem ↔
+      Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz) ≤ length alloc.bytes) ∧
+    (evalRvalue locals (.len place) mem localDecls layouts = .ub ↔
+      length alloc.bytes < Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz)) := by
+  have hBase := trusted_evalRvalue_len_deref_slice_iff locals locals' place mem localDecls layouts
+    initProj elem lIdx ptrVal (layoutPointerBytes layouts) lenSc hTy hSplit hRead
+  have hGlob := sliceLenBorrowOk_global locals' mem localDecls layouts elem ptrVal lenSc alloc
+    elemSz hNoBorrow hGlobal hSz
+  constructor
+  · rw [hBase.1, hGlob]
+    exact ⟨fun ⟨_, _, hBle⟩ => Nat.le_of_ble_eq_true hBle,
+      fun hLe => ⟨rfl, hMeta, Nat.ble_eq_true_of_le hLe⟩⟩
+  · rw [hBase.2, hGlob]
+    refine ⟨fun hNot => ?_, fun hLt ⟨_, _, hBle⟩ =>
+      Nat.not_le.mpr hLt (Nat.le_of_ble_eq_true hBle)⟩
+    cases hBle : Nat.ble (Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz)) (length alloc.bytes)
+    · exact Nat.gt_of_not_le (fun hLe => by rw [Nat.ble_eq_true_of_le hLe] at hBle; cases hBle)
+    · exact absurd ⟨rfl, hMeta, hBle⟩ hNot
 
 /-- A null-or-dangling unbacked pointer (`allocId = 0`, no global) is valid for `Rvalue.len` iff it
 is non-null (`offsetBytes ≠ 0`) and the slice is empty (`len = 0`). -/
@@ -17765,6 +17836,103 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_scalar_addr_ordering
       layouts hm₁)
     (resolveWideWordScalar?_scalar_canonical m₂ _ locals₂ mem.borrows mem.callerLocals localDecls
       layouts hm₂) hPb
+
+/-- Under `Trusted`'s 64-KiB page address scheme (`a * 65536 + o`), when both byte offsets lie within
+a single 64-KiB page (`o₁ < 65536` and `o₂ < 65536`), comparing `a₁ * 65536 + o₁` against
+`a₂ * 65536 + o₂` is lexicographic in `(a, o)`: `(compare a₁ a₂).then (compare o₁ o₂)`. -/
+theorem nat_compare_page_offset (a₁ a₂ o₁ o₂ : Nat)
+    (ho₁ : o₁ < 65536) (ho₂ : o₂ < 65536) :
+    compare (Nat.add (Nat.mul a₁ 65536) o₁) (Nat.add (Nat.mul a₂ 65536) o₂) =
+      (compare a₁ a₂).then (compare o₁ o₂) := by
+  rcases Nat.lt_trichotomy a₁ a₂ with h | h | h
+  · have hLt : Nat.add (Nat.mul a₁ 65536) o₁ < Nat.add (Nat.mul a₂ 65536) o₂ := by
+      change a₁ * 65536 + o₁ < a₂ * 65536 + o₂; omega
+    rw [Nat.compare_eq_lt.mpr h, Nat.compare_eq_lt.mpr hLt]
+    rfl
+  · subst h
+    rw [Nat.compare_eq_eq.mpr rfl, nat_compare_add_left]
+    rfl
+  · have hGt : Nat.add (Nat.mul a₂ 65536) o₂ < Nat.add (Nat.mul a₁ 65536) o₁ := by
+      change a₂ * 65536 + o₂ < a₁ * 65536 + o₁; omega
+    rw [Nat.compare_eq_gt.mpr h, Nat.compare_eq_gt.mpr hGt]
+    rfl
+
+/-- **Three-component lexicographic comparison `(allocId, offset, len)` of unborrowed wide pointers**:
+for any two unborrowed provenance-carrying wide pointers `(⟨a₁, o₁⟩, m₁)` and `(⟨a₂, o₂⟩, m₂)` with
+in-page offsets `o₁, o₂ < 65536` (same or distinct allocations), every relational `op` evaluates to
+`relOpOrderingScalar op (((compare a₁ a₂).then (compare o₁ o₂)).then (compare m₁ m₂))`. -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_unborrowed_ordering
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (a₁ a₂ o₁ o₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨a₁, o₁⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨a₂, o₂⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
+    (hRel : isRelationalBinOp op = true)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hNoB₁ : lookupBorrow mem.borrows a₁ = .none)
+    (hNoB₂ : lookupBorrow mem.borrows a₂ = .none)
+    (ho₁ : o₁ < 65536)
+    (ho₂ : o₂ < 65536)
+    (hW₁ : Nat.add (Nat.mul a₁ 65536) o₁ < scalarModulus (layoutPointerBytes layouts))
+    (hW₂ : Nat.add (Nat.mul a₂ 65536) o₂ < scalarModulus (layoutPointerBytes layouts))
+    (hm₁ : m₁ < scalarModulus (layoutPointerBytes layouts))
+    (hm₂ : m₂ < scalarModulus (layoutPointerBytes layouts))
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (relOpOrderingScalar op
+        (((compare a₁ a₂).then (compare o₁ o₂)).then (compare m₁ m₂)))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_ptr_rel_ordering locals locals₁ locals₂ op lhsOp rhsOp mem
+    localDecls layouts _ _ _ _ _ _ m₁ m₂ hL hR hRel hPtrOp rfl rfl
+    (Or.inr (Or.inl ⟨_, _, rfl⟩))
+    (resolveWideWordScalar?_unborrowed_ptr_canonical a₁ o₁ _ locals₂ mem.borrows mem.callerLocals
+      localDecls layouts hNoB₁ hW₁)
+    (resolveWideWordScalar?_unborrowed_ptr_canonical a₂ o₂ _ locals₂ mem.borrows mem.callerLocals
+      localDecls layouts hNoB₂ hW₂)
+    (resolveWideWordScalar?_scalar_canonical m₁ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₁)
+    (resolveWideWordScalar?_scalar_canonical m₂ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₂) hPb,
+    nat_compare_page_offset a₁ a₂ o₁ o₂ ho₁ ho₂]
+
+/-- **Cross-allocation wide-pointer comparison** (`a₁ ≠ a₂`, `o₁, o₂ < 65536`): when two unborrowed
+wide pointers point into *distinct* allocations `a₁ ≠ a₂` with in-page byte offsets, their relational
+comparison depends strictly on `compare a₁ a₂` (both the offsets `o₁, o₂` and metadata lengths
+`m₁, m₂` are tie-breakers that are never reached). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_diff_alloc_ordering
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (a₁ a₂ o₁ o₂ m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨a₁, o₁⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨a₂, o₂⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
+    (hRel : isRelationalBinOp op = true)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hNoB₁ : lookupBorrow mem.borrows a₁ = .none)
+    (hNoB₂ : lookupBorrow mem.borrows a₂ = .none)
+    (hNe : a₁ ≠ a₂)
+    (ho₁ : o₁ < 65536)
+    (ho₂ : o₂ < 65536)
+    (hW₁ : Nat.add (Nat.mul a₁ 65536) o₁ < scalarModulus (layoutPointerBytes layouts))
+    (hW₂ : Nat.add (Nat.mul a₂ 65536) o₂ < scalarModulus (layoutPointerBytes layouts))
+    (hm₁ : m₁ < scalarModulus (layoutPointerBytes layouts))
+    (hm₂ : m₂ < scalarModulus (layoutPointerBytes layouts))
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (relOpOrderingScalar op (compare a₁ a₂))) locals₂ mem := by
+  rw [trusted_evalRvalue_binaryOp_wide_ptr_unborrowed_ordering locals locals₁ locals₂ op lhsOp rhsOp
+    mem localDecls layouts a₁ a₂ o₁ o₂ m₁ m₂ hL hR hRel hPtrOp hNoB₁ hNoB₂ ho₁ ho₂ hW₁ hW₂ hm₁
+    hm₂ hPb]
+  rcases Nat.lt_trichotomy a₁ a₂ with h | h | h
+  · rw [Nat.compare_eq_lt.mpr h]
+    rfl
+  · exact absurd h hNe
+  · rw [Nat.compare_eq_gt.mpr h]
+    rfl
 
 end WidePtrSliceRvalueRefinement
 
