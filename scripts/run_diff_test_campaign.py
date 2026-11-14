@@ -693,6 +693,7 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
         "externalCall",
         "outOfFuel",
         "oracle_error",
+        "not_compared",
     )
     for idx, f in enumerate(findings):
         if not isinstance(f, dict):
@@ -716,14 +717,16 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
                 False,
                 f"finding[{idx}] has unknown divergence_class {f['divergence_class']!r}",
             )
-        if f["miri_outcome"] == f["anneal_outcome"]:
+        miri_out_trimmed = _rust_trim(f["miri_outcome"])
+        anneal_out_trimmed = _rust_trim(f["anneal_outcome"])
+        if miri_out_trimmed == anneal_out_trimmed:
             return (
                 False,
                 f"finding[{idx}] is not a divergence: miri_outcome == anneal_outcome",
             )
-        if f["miri_outcome"].startswith(not_compared_prefixes) or f[
-            "anneal_outcome"
-        ].startswith(not_compared_prefixes):
+        if miri_out_trimmed.startswith(not_compared_prefixes) or anneal_out_trimmed.startswith(
+            not_compared_prefixes
+        ):
             return (
                 False,
                 f"finding[{idx}] has a not-compared outcome instead of a divergence",
@@ -2278,21 +2281,36 @@ def witness_polarity_accounting_holds(summary: dict[str, Any]) -> bool:
     return not _witness_polarity_identity_problems(summary)
 
 
+def _is_legacy_mock_finding_tags(miri_tag: Any, anneal_tag: Any) -> bool:
+    """True only for the legacy synthetic unit-test finding format (`miri_outcome ==
+    "pass"` and `anneal_outcome == "ub:<lean_tag>"`), which predates `summary_tag`."""
+    return (
+        miri_tag == "pass"
+        and isinstance(anneal_tag, str)
+        and anneal_tag.startswith("ub:")
+    )
+
+
 def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
     """Fail-closed audit of a `miri-difftest` summary's witness polarities.
 
-    1. The accounting identities of `witness_polarity_accounting_holds`.
+    1. The accounting identities of `witness_polarity_accounting_holds`, plus the
+       `miri_verdicts` bounds on the split of `not_compared_reasons.unsupported`
+       between `sound_conservative_abstraction` (Miri `pass`) and
+       `harness_or_extraction_error` (Miri `panic`/`ub`).
     2. Every finding carries the `witness_polarity` of its `divergence_class`, and
-       (whenever the summary carries `item_outcomes`, or both of the finding's tags
-       parse as Rust summary tags) the polarity that its own outcome tags classify
-       to. The findings' per-polarity tallies must match the divergence classes
-       (`unsound_missed_fault` / `value_mismatch` / `sound_conservative_abstraction`
-       findings equal their divergence-class sums; no finding is a harness error).
-    3. With `item_outcomes`, every item's polarity is recomputed from its tags
-       (`classify_witness_polarity_from_tags`; a panic-site pair reported `agree`
-       counts as an agreement only when `reconciled_panic_sites` justifies it), the
-       `compile_failed_candidates` (which carry no item outcome) are added as
-       `harness_or_extraction_error`, and the result must equal
+       (except for legacy synthetic `"pass"` / `"ub:..."` unit-test fixtures without
+       `item_outcomes`) its outcome tags must parse, classify to `witness_polarity`,
+       and reproduce `("diverge", divergence_class)`. The findings' per-polarity
+       tallies must match the divergence classes (`unsound_missed_fault` /
+       `value_mismatch` / `sound_conservative_abstraction` findings equal their
+       divergence-class sums; no finding is a harness error).
+    3. With `item_outcomes` (which must be a `dict` of `compiled_candidates` entries
+       when present), every item's polarity and verdict are recomputed from its tags
+       (`classify_witness_polarity_from_tags` / `compare_parsed_outcomes`; a panic-site
+       pair reported `agree` counts as an agreement only when `reconciled_panic_sites`
+       justifies it), the `compile_failed_candidates` (which carry no item outcome) are
+       added as `harness_or_extraction_error`, and the result must equal
        `witness_polarity_counts` key by key: a forged map that preserves every
        identity but moves an `unsupported` item between
        `sound_conservative_abstraction` and `harness_or_extraction_error` (or any
@@ -2304,10 +2322,40 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
     if not is_int_map(pol_map, VALID_WITNESS_POLARITIES):
         return reasons
 
+    div_map = summary.get("divergence_classes")
+    nc_map = summary.get("not_compared_reasons")
+    miri_verdicts = summary.get("miri_verdicts")
+    if (
+        is_int_map(div_map)
+        and is_int_map(nc_map)
+        and is_int_map(miri_verdicts, ("pass", "panic", "ub", "error"))
+    ):
+        miri_pass = int(miri_verdicts["pass"])
+        miri_faults = int(miri_verdicts["panic"]) + int(miri_verdicts["ub"])
+        if miri_pass + miri_faults > 0:
+            false_pos = int(div_map.get("false_positive_ub", 0))
+            nc_unsupported = int(nc_map.get("unsupported", 0))
+            conservative_unsupported = int(pol_map[WITNESS_POLARITY_CONSERVATIVE]) - false_pos
+            fault_unsupported = nc_unsupported - conservative_unsupported
+            if 0 <= conservative_unsupported <= nc_unsupported:
+                if conservative_unsupported > miri_pass:
+                    reasons.append(
+                        f"{label}: sound_conservative_abstraction attributes "
+                        f"{conservative_unsupported} unsupported candidate(s) to Miri pass, "
+                        f"but miri_verdicts.pass is {miri_pass}"
+                    )
+                if fault_unsupported > miri_faults:
+                    reasons.append(
+                        f"{label}: harness_or_extraction_error attributes "
+                        f"{fault_unsupported} unsupported candidate(s) to Miri panic/ub, "
+                        f"but miri_verdicts.panic + miri_verdicts.ub is {miri_faults}"
+                    )
+
     items = summary.get("item_outcomes")
+    if "item_outcomes" in summary and items is not None and not isinstance(items, dict):
+        reasons.append(f"{label}: item_outcomes is not a dict")
     has_items = isinstance(items, dict)
     findings = summary.get("findings")
-    div_map = summary.get("divergence_classes")
     if isinstance(findings, list):
         tallies = empty_witness_polarity_counts()
         for idx, f in enumerate(findings):
@@ -2331,17 +2379,23 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                     f"divergence_class {div_cls!r} has polarity {expected!r}"
                 )
             f_miri, f_anneal = f.get("miri_outcome"), f.get("anneal_outcome")
-            tags_parse = (
-                parse_miri_summary_tag(f_miri) is not None
-                and parse_anneal_summary_tag(f_anneal) is not None
-            )
-            if has_items or tags_parse:
+            if has_items or not _is_legacy_mock_finding_tags(f_miri, f_anneal):
                 from_tags = classify_witness_polarity_from_tags(f_miri, f_anneal)
                 if from_tags != polarity:
                     reasons.append(
                         f"{label}: findings[{idx}] has witness_polarity {polarity!r}, but its "
                         f"outcomes ({f_miri!r}, {f_anneal!r}) classify as {from_tags!r}"
                     )
+                p_miri = parse_miri_summary_tag(f_miri)
+                p_anneal = parse_anneal_summary_tag(f_anneal)
+                if p_miri is not None and p_anneal is not None:
+                    tag_verdict, tag_cls = compare_parsed_outcomes(p_miri, p_anneal)
+                    if (tag_verdict, tag_cls) != ("diverge", div_cls):
+                        reasons.append(
+                            f"{label}: findings[{idx}] has divergence_class {div_cls!r}, but its "
+                            f"outcomes ({f_miri!r}, {f_anneal!r}) classify as "
+                            f"{tag_verdict}:{tag_cls}"
+                        )
         if is_int_map(div_map):
             expected_tallies = empty_witness_polarity_counts()
             for cls, pol in DIVERGENCE_CLASS_WITNESS_POLARITY.items():
@@ -2354,29 +2408,73 @@ def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
                     )
 
     if has_items:
+        compiled = summary.get("compiled_candidates")
+        if is_nonneg_int(compiled) and len(items) != compiled:
+            reasons.append(
+                f"{label}: item_outcomes covers {len(items)} items but compiled_candidates "
+                f"is {compiled}"
+            )
         reconciled: dict[str, Any] = {}
         sites = summary.get("reconciled_panic_sites")
-        if isinstance(sites, list):
-            for site in sites:
+        if sites is not None and not isinstance(sites, list):
+            reasons.append(f"{label}: reconciled_panic_sites is not a list")
+        elif isinstance(sites, list):
+            for site_idx, site in enumerate(sites):
                 name = site.get("fn_name") if isinstance(site, dict) else None
-                if isinstance(name, str) and name not in reconciled:
+                if not isinstance(name, str) or not name.strip():
+                    reasons.append(
+                        f"{label}: reconciled_panic_sites[{site_idx}] lacks a fn_name"
+                    )
+                elif name in reconciled:
+                    reasons.append(
+                        f"{label}: reconciled_panic_sites lists {name!r} twice"
+                    )
+                else:
                     reconciled[name] = site
         recount = empty_witness_polarity_counts()
         for name, entry in items.items():
-            m_tag = entry.get("miri_outcome") if isinstance(entry, dict) else None
-            a_tag = entry.get("anneal_outcome") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict):
+                reasons.append(f"{label}: item_outcomes[{name!r}] is not a JSON object")
+                recount[WITNESS_POLARITY_HARNESS] += 1
+                continue
+            m_tag = entry.get("miri_outcome")
+            a_tag = entry.get("anneal_outcome")
+            lean_tag = entry.get("anneal_lean_tag")
             polarity = classify_witness_polarity_from_tags(m_tag, a_tag)
-            reported = entry.get("verdict") if isinstance(entry, dict) else None
+            if (
+                isinstance(lean_tag, str)
+                and normalize_anneal_tag(lean_tag) == "none"
+                and not (isinstance(a_tag, str) and a_tag.startswith(ANNEAL_ERROR_TAG_PREFIXES))
+            ):
+                reasons.append(
+                    f"{label}: item_outcomes[{name!r}] has anneal_lean_tag 'none' masked "
+                    f"under anneal_outcome {a_tag!r}"
+                )
+                polarity = WITNESS_POLARITY_HARNESS
+            reported_raw = entry.get("verdict")
+            reported = reported_raw.strip().lower() if isinstance(reported_raw, str) else None
+            p_miri = parse_miri_summary_tag(m_tag)
+            p_anneal = parse_anneal_summary_tag(a_tag)
+            expected_verdict = (
+                compare_parsed_outcomes(p_miri, p_anneal)[0]
+                if p_miri is not None and p_anneal is not None
+                else "not_compared"
+            )
             if (
                 polarity == WITNESS_POLARITY_VALUE_MISMATCH
-                and isinstance(reported, str)
-                and reported.strip().lower() == "agree"
+                and reported == "agree"
                 and isinstance(m_tag, str)
                 and isinstance(a_tag, str)
                 and name in reconciled
                 and _reconciled_panic_site_matches(reconciled[name], name, m_tag, a_tag)
             ):
                 polarity = None
+                expected_verdict = "agree"
+            if reported != expected_verdict:
+                reasons.append(
+                    f"{label}: item_outcomes[{name!r}] reported verdict {reported_raw!r}, "
+                    f"but its outcomes ({m_tag!r}, {a_tag!r}) have verdict {expected_verdict!r}"
+                )
             if polarity is not None:
                 recount[polarity] += 1
         compile_failed = summary.get("compile_failed_candidates")
@@ -2990,6 +3088,31 @@ class QuarantineEntry:
         return self.token is not None and not self.defects and self.expiry_problem(today) is None
 
 
+def _quarantine_token_witness_polarity_defect(
+    token: str | None, raw_polarity: Any, prefix: str
+) -> str | None:
+    """Validates an optional `witness_polarity` field on a quarantine or
+    `known_anneal_bug` entry against `VALID_WITNESS_POLARITIES`, the entry's harness,
+    and any `divergence_class` segment in `token`."""
+    if raw_polarity is None:
+        return None
+    if not isinstance(raw_polarity, str) or raw_polarity.strip() not in VALID_WITNESS_POLARITIES:
+        return f"{prefix}: invalid witness_polarity {raw_polarity!r}"
+    pol = raw_polarity.strip()
+    if token is not None:
+        if quarantine_entry_harness(token) == "itree":
+            return f"{prefix}: itree entry {token!r} cannot have witness_polarity {pol!r}"
+        for part in token.split(":"):
+            if part in DIVERGENCE_CLASS_WITNESS_POLARITY:
+                expected = DIVERGENCE_CLASS_WITNESS_POLARITY[part]
+                if pol != expected:
+                    return (
+                        f"{prefix}: witness_polarity {pol!r} contradicts "
+                        f"divergence_class {part!r} ({expected!r})"
+                    )
+    return None
+
+
 def _quarantine_list_entry(location: str, item: Any) -> QuarantineEntry:
     if isinstance(item, str):
         token = item.strip()
@@ -3001,17 +3124,24 @@ def _quarantine_list_entry(location: str, item: Any) -> QuarantineEntry:
     if isinstance(item, dict):
         raw_token = item.get("fingerprint", item.get("id"))
         token = raw_token.strip() if isinstance(raw_token, str) else None
-        defects: tuple[str, ...] = ()
+        defects_list: list[str] = []
         if token is None or not _is_well_formed_quarantine_token(token) or ":" not in token:
-            defects = (f"malformed_or_missing_fingerprint: {raw_token!r}",)
+            defects_list.append(f"malformed_or_missing_fingerprint: {raw_token!r}")
             token = None
+        pol_defect = _quarantine_token_witness_polarity_defect(
+            token, item.get("witness_polarity"), "malformed_quarantine_entry"
+        )
+        if pol_defect is not None:
+            defects_list.append(pol_defect)
         reason_text = item.get("reason") or item.get("summary")
         warnings: tuple[str, ...] = ()
         if not isinstance(reason_text, str) or not reason_text.strip():
             warnings = (
                 "missing_quarantine_metadata: table entries must carry a reason or summary",
             )
-        return QuarantineEntry(location, token, item.get("expires"), True, defects, warnings)
+        return QuarantineEntry(
+            location, token, item.get("expires"), True, tuple(defects_list), warnings
+        )
     return QuarantineEntry(
         location,
         None,
@@ -3025,7 +3155,8 @@ def _quarantine_known_bug_entry(location: str, test_entry: dict[str, Any]) -> Qu
     """Normalizes a `[[tests]]` entry carrying `known_anneal_bug`: the loader applies
     `name:divergence_class` when `divergence_class` is present (a valid
     `VALID_DIVERGENCE_CLASSES` member) and the bare test `name` otherwise, and only
-    when the bug carries `observed_anneal_tag` and `summary` / `reason`."""
+    when the bug carries `observed_anneal_tag` and `summary` / `reason` (and a
+    consistent `witness_polarity` when specified)."""
     name = test_entry.get("name")
     bug = test_entry.get("known_anneal_bug")
     if not isinstance(name, str) or not name.strip():
@@ -3057,6 +3188,11 @@ def _quarantine_known_bug_entry(location: str, test_entry: dict[str, Any]) -> Qu
             defects.append(f"malformed_known_anneal_bug: invalid divergence_class {div_cls!r}")
         else:
             token = f"{clean_name}:{div_cls.strip()}"
+    pol_defect = _quarantine_token_witness_polarity_defect(
+        token, bug.get("witness_polarity"), "malformed_known_anneal_bug"
+    )
+    if pol_defect is not None:
+        defects.append(pol_defect)
     return QuarantineEntry(
         f"{location} ({clean_name})", token, bug.get("expires"), False, tuple(defects)
     )
@@ -3221,11 +3357,14 @@ def _known_bug_tags_match(observed: str, expected_obs: str) -> bool:
 
 
 def _known_bug_eval_problem(
-    obs_tag: Any, ev: Any, expected_div_class: str | None = None
+    obs_tag: Any,
+    ev: Any,
+    expected_div_class: str | None = None,
+    expected_polarity: str | None = None,
 ) -> str | None:
     """Compares a `known_anneal_bug` entry's `observed_anneal_tag` (and optional
-    `divergence_class`) with the live evaluation `ev` of its test (a verdict string
-    or an `item_outcomes` record)."""
+    `divergence_class` / `witness_polarity`) with the live evaluation `ev` of its
+    test (a verdict string or an `item_outcomes` record)."""
     if isinstance(ev, str):
         ev_clean = ev.strip()
         ev_lower = ev_clean.lower()
@@ -3287,21 +3426,21 @@ def _known_bug_eval_problem(
                 f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
                 f"got {candidate_tags[0]!r}"
             )
+    observed_div_cls = ev.get("divergence_class")
+    if (
+        (not isinstance(observed_div_cls, str) or not observed_div_cls.strip())
+        and isinstance(miri_tag, str)
+        and isinstance(anneal_tag, str)
+    ):
+        cls_verdict, cls_sub = classify_oracle_outcome_tags(miri_tag, anneal_tag)
+        if cls_verdict == "diverge":
+            observed_div_cls = cls_sub
     if expected_div_class is not None:
         if verdict != "diverge":
             return (
                 "stale_known_anneal_bug_divergence_class_mismatch: "
                 f"expected divergence {expected_div_class!r}, got verdict {verdict!r}"
             )
-        observed_div_cls = ev.get("divergence_class")
-        if (
-            (not isinstance(observed_div_cls, str) or not observed_div_cls.strip())
-            and isinstance(miri_tag, str)
-            and isinstance(anneal_tag, str)
-        ):
-            cls_verdict, cls_sub = classify_oracle_outcome_tags(miri_tag, anneal_tag)
-            if cls_verdict == "diverge":
-                observed_div_cls = cls_sub
         if (
             isinstance(observed_div_cls, str)
             and observed_div_cls.strip()
@@ -3310,6 +3449,21 @@ def _known_bug_eval_problem(
             return (
                 "stale_known_anneal_bug_divergence_class_mismatch: "
                 f"expected {expected_div_class!r}, got {observed_div_cls.strip()!r}"
+            )
+    if expected_polarity is not None:
+        raw_ev_pol = ev.get("witness_polarity")
+        if isinstance(raw_ev_pol, str) and raw_ev_pol.strip() in VALID_WITNESS_POLARITIES:
+            observed_pol: str | None = raw_ev_pol.strip()
+        elif isinstance(observed_div_cls, str) and observed_div_cls.strip() in DIVERGENCE_CLASS_WITNESS_POLARITY:
+            observed_pol = DIVERGENCE_CLASS_WITNESS_POLARITY[observed_div_cls.strip()]
+        elif isinstance(miri_tag, str) and isinstance(anneal_tag, str):
+            observed_pol = classify_witness_polarity_from_tags(miri_tag, anneal_tag)
+        else:
+            observed_pol = None
+        if observed_pol != expected_polarity:
+            return (
+                "stale_known_anneal_bug_witness_polarity_mismatch: "
+                f"expected {expected_polarity!r}, got {observed_pol!r}"
             )
     return None
 
@@ -3517,6 +3671,17 @@ def verify_no_stale_quarantine_or_known_bugs(
                         )
                     else:
                         valid_div_cls = div_cls.strip()
+                raw_pol = bug.get("witness_polarity")
+                valid_polarity: str | None = None
+                if raw_pol is not None:
+                    pol_token = f"{clean_name}:{valid_div_cls}" if valid_div_cls else clean_name
+                    pol_prob = _quarantine_token_witness_polarity_defect(
+                        pol_token, raw_pol, "malformed_known_anneal_bug"
+                    )
+                    if pol_prob is not None:
+                        stale_m(clean_name, pol_prob)
+                    elif isinstance(raw_pol, str):
+                        valid_polarity = raw_pol.strip()
                 expiry_prob = quarantine_expiry_problem(
                     bug.get("expires"), ref_date, required=False
                 )
@@ -3524,7 +3689,10 @@ def verify_no_stale_quarantine_or_known_bugs(
                     stale_m(clean_name, expiry_prob)
                 if isinstance(manifest_eval_results, dict) and clean_name in manifest_eval_results:
                     problem = _known_bug_eval_problem(
-                        obs_tag, manifest_eval_results[clean_name], valid_div_cls
+                        obs_tag,
+                        manifest_eval_results[clean_name],
+                        valid_div_cls,
+                        valid_polarity,
                     )
                     if problem is not None:
                         stale_m(clean_name, problem)
@@ -3582,6 +3750,9 @@ def extract_manifest_eval_results_from_miri_summary(
                     "anneal_outcome": str(f.get("anneal_outcome", "")),
                     "anneal_lean_tag": str(f.get("anneal_lean_tag", "")),
                 }
+                raw_f_pol = f.get("witness_polarity")
+                if isinstance(raw_f_pol, str) and raw_f_pol.strip():
+                    rec["witness_polarity"] = raw_f_pol.strip()
                 # Identity candidates are the unmutated corpus seeds: `fn_name` is the
                 # manifest test name. Merge `divergence_class` and the repro-mapped
                 # `anneal_outcome` into any existing `item_outcomes` entry so both
@@ -3594,6 +3765,8 @@ def extract_manifest_eval_results_from_miri_summary(
                     else:
                         if rec["divergence_class"] and not results[fn_key].get("divergence_class"):
                             results[fn_key]["divergence_class"] = rec["divergence_class"]
+                        if rec.get("witness_polarity") and not results[fn_key].get("witness_polarity"):
+                            results[fn_key]["witness_polarity"] = rec["witness_polarity"]
                         if rec["anneal_outcome"]:
                             results[fn_key]["repro_anneal_outcome"] = rec["anneal_outcome"]
 
@@ -3845,9 +4018,13 @@ def deduplicate_and_quarantine_findings(
                 # class's; findings handed in without one (tests, legacy callers)
                 # take the class's polarity, which every finding of `fp` shares.
                 witness_polarity=(
-                    raw_polarity
-                    if raw_polarity in VALID_WITNESS_POLARITIES
-                    else DIVERGENCE_CLASS_WITNESS_POLARITY.get(div_class)
+                    DIVERGENCE_CLASS_WITNESS_POLARITY[div_class]
+                    if div_class in DIVERGENCE_CLASS_WITNESS_POLARITY
+                    else (
+                        raw_polarity
+                        if isinstance(raw_polarity, str) and raw_polarity in VALID_WITNESS_POLARITIES
+                        else None
+                    )
                 ),
             )
 
@@ -4541,18 +4718,30 @@ def semantic_mutant_variant_probe(
     mutant: dict[str, Any], variant: dict[str, Any]
 ) -> dict[str, Any]:
     """The probe a variant runs on: its own `probe` (which must carry an `id` and
-    every `SEMANTIC_MUTANT_PROBE_KEYS` entry), or else its mutant's probe (whose id
-    is the mutant id). Raises on a malformed override, which the self-check counts
-    as a surviving mutant."""
+    every `SEMANTIC_MUTANT_PROBE_KEYS` entry as non-empty strings), or else its
+    mutant's probe (whose id is the mutant id). Raises on a malformed probe or
+    override, which the self-check counts as a surviving mutant."""
     override = variant.get("probe")
     if override is None:
-        probe = {k: mutant[k] for k in SEMANTIC_MUTANT_PROBE_KEYS}
-        probe["id"] = str(mutant["id"])
-        return probe
-    if not isinstance(override, dict):
-        raise ValueError(f"variant {variant.get('label')!r} has a non-object probe")
-    probe = {k: override[k] for k in SEMANTIC_MUTANT_PROBE_KEYS}
-    probe["id"] = str(override["id"])
+        source_map = mutant
+        raw_id = mutant.get("id")
+    else:
+        if not isinstance(override, dict):
+            raise ValueError(f"variant {variant.get('label')!r} has a non-object probe")
+        source_map = override
+        raw_id = override.get("id")
+    if not isinstance(raw_id, str) or not raw_id.strip():
+        raise ValueError(f"probe has missing or invalid id {raw_id!r}")
+    probe: dict[str, Any] = {"id": raw_id.strip()}
+    for k in SEMANTIC_MUTANT_PROBE_KEYS:
+        val = source_map[k]
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(f"probe {probe['id']!r} has missing or empty {k!r}")
+        probe[k] = val
+    if "fn " not in probe["probe_rust_source"]:
+        raise ValueError(
+            f"probe {probe['id']!r} probe_rust_source lacks a function definition"
+        )
     return probe
 
 
@@ -4710,10 +4899,16 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
                 v_exit in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
                 and bool(expected)
                 and v_class in expected
-                and (v_expected_cls is None or v_class == v_expected_cls)
+                and isinstance(v_expected_cls, str)
+                and (
+                    v_expected_cls in VALID_DIVERGENCE_CLASSES
+                    or v_expected_cls == HARNESS_ERROR_KILL_CLASS
+                )
+                and v_class == v_expected_cls
                 and (v_expected_sub is None or str(v_expected_sub) in v_detail)
                 and v_expected_pol in VALID_WITNESS_POLARITIES
                 and v_expected_pol in expected_polarities
+                and kill_class_witness_polarity(v_expected_cls) == v_expected_pol
                 and v_polarity == tag_polarity == v_expected_pol
             )
             if v_killed:
@@ -4840,9 +5035,23 @@ def _normalize_evaluator_result(
                     expected_classes[0] if (is_killed and expected_classes) else "survived",
                 )
             )
-            return result(
+            out = result(
                 is_killed, k_class, exit_c, _explicit_or_implied_polarity(raw_res, k_class)
             )
+            for extra_key in (
+                "variants",
+                "baselines",
+                "baseline_verdict",
+                "baseline_exit_code",
+                "baseline_witness_polarity",
+                "survived_variants",
+                "missing_expected_kill_classes",
+                "missing_expected_witness_polarities",
+                "detail",
+            ):
+                if extra_key in raw_res:
+                    out[extra_key] = raw_res[extra_key]
+            return out
         if "verdict" in raw_res:
             verdict_str = str(raw_res["verdict"]).strip().lower()
             if verdict_str == "diverge":
@@ -4959,11 +5168,54 @@ def run_semantic_mutant_self_check(
             implied = kill_class_witness_polarity(outcome.get("kill_class"))
             if (
                 not expected_polarities
+                or polarity not in VALID_WITNESS_POLARITIES
                 or polarity not in expected_polarities
-                or (implied is not None and polarity != implied)
+                or implied is None
+                or polarity != implied
             ):
                 outcome["killed"] = False
                 outcome["unexpected_witness_polarity"] = polarity
+        if outcome["killed"] and "variants" in outcome:
+            variants = outcome.get("variants")
+            if not isinstance(variants, list) or not variants:
+                outcome["killed"] = False
+            else:
+                bad_variants: list[str] = []
+                obs_classes: set[str] = set()
+                obs_polarities: set[str] = set()
+                for v_idx, v in enumerate(variants):
+                    if not isinstance(v, dict):
+                        bad_variants.append(f"<variant[{v_idx}]>")
+                        continue
+                    v_label = str(v.get("label") or f"<variant[{v_idx}]>")
+                    v_cls = v.get("kill_class")
+                    v_pol = v.get("witness_polarity")
+                    v_imp = kill_class_witness_polarity(v_cls)
+                    v_ok = (
+                        v.get("killed") is True
+                        and isinstance(v_cls, str)
+                        and v_cls in expected_classes
+                        and v_pol in VALID_WITNESS_POLARITIES
+                        and v_pol in expected_polarities
+                        and v_imp is not None
+                        and v_pol == v_imp
+                    )
+                    if v_ok:
+                        obs_classes.add(v_cls)
+                        obs_polarities.add(v_pol)
+                    else:
+                        v["killed"] = False
+                        bad_variants.append(v_label)
+                missing_c = [c for c in expected_classes if c not in obs_classes]
+                missing_p = [p for p in expected_polarities if p not in obs_polarities]
+                if bad_variants or missing_c or missing_p:
+                    outcome["killed"] = False
+                    if bad_variants:
+                        outcome["survived_variants"] = bad_variants
+                    if missing_c:
+                        outcome["missing_expected_kill_classes"] = missing_c
+                    if missing_p:
+                        outcome["missing_expected_witness_polarities"] = missing_p
 
         per_mutant_results.append(outcome)
         if outcome["killed"]:
@@ -5661,23 +5913,68 @@ def update_suite_scoped_fingerprints(
         if isinstance(raw_fp_hist, dict)
         else {}
     )
-    raw_res_hist = ledger.get("resolved_history", {})
-    resolved_history: dict[str, dict[str, Any]] = (
-        {
-            str(k): copy.deepcopy(v)
-            for k, v in raw_res_hist.items()
-            if isinstance(k, str) and isinstance(v, dict)
-        }
-        if isinstance(raw_res_hist, dict)
-        else {}
-    )
-
     last_run = ledger.get("last_run_utc")
     legacy_seen_date = (
         last_run[:10]
         if isinstance(last_run, str) and len(last_run) >= 10
         else date_prefix
     )
+
+    raw_res_hist = ledger.get("resolved_history", {})
+    resolved_history: dict[str, dict[str, Any]] = {}
+    migrated_legacy_resolved: set[str] = set()
+    if isinstance(raw_res_hist, dict):
+        for k, v in raw_res_hist.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                resolved_history[str(k)] = copy.deepcopy(v)
+    elif isinstance(raw_res_hist, list):
+        for item in raw_res_hist:
+            if isinstance(item, str) and item.strip():
+                fp_key = item.strip()
+                resolved_history.setdefault(
+                    fp_key,
+                    {
+                        "first_seen_date": legacy_seen_date,
+                        "last_seen_date": legacy_seen_date,
+                        "campaigns_failing": 1,
+                        "resolved_date": legacy_seen_date,
+                        "suite": infer_fingerprint_suite(fp_key),
+                    },
+                )
+                migrated_legacy_resolved.add(fp_key)
+            elif isinstance(item, dict) and isinstance(item.get("fingerprint"), str):
+                fp_key = item["fingerprint"].strip()
+                if fp_key:
+                    entry_copy = {
+                        str(ek): copy.deepcopy(ev)
+                        for ek, ev in item.items()
+                        if ek != "fingerprint"
+                    }
+                    entry_copy.setdefault("first_seen_date", legacy_seen_date)
+                    entry_copy.setdefault("last_seen_date", legacy_seen_date)
+                    entry_copy.setdefault("campaigns_failing", 1)
+                    entry_copy.setdefault("resolved_date", legacy_seen_date)
+                    entry_copy.setdefault(
+                        "suite", infer_fingerprint_suite(fp_key, entry_copy)
+                    )
+                    resolved_history.setdefault(fp_key, entry_copy)
+                    migrated_legacy_resolved.add(fp_key)
+
+    raw_res_fps = ledger.get("resolved_fingerprints")
+    if isinstance(raw_res_fps, list):
+        for item in raw_res_fps:
+            if isinstance(item, str) and item.strip():
+                fp_key = item.strip()
+                if fp_key not in resolved_history:
+                    resolved_history[fp_key] = {
+                        "first_seen_date": legacy_seen_date,
+                        "last_seen_date": legacy_seen_date,
+                        "campaigns_failing": 1,
+                        "resolved_date": legacy_seen_date,
+                        "suite": infer_fingerprint_suite(fp_key),
+                    }
+                    migrated_legacy_resolved.add(fp_key)
+        ledger.pop("resolved_fingerprints", None)
 
     def suite_of(fp: str) -> str:
         return infer_fingerprint_suite(fp, fp_history.get(fp) or resolved_history.get(fp))
@@ -5801,6 +6098,10 @@ def update_suite_scoped_fingerprints(
                 fp,
                 suite_name,
             )
+
+        for fp in sorted(migrated_legacy_resolved):
+            if fp in resolved_history and infer_fingerprint_suite(fp, resolved_history[fp]) == suite_name:
+                tag_polarity(resolved_history[fp], fp, suite_name)
 
         new_active.extend(sorted(obs_unquar))
         new_quarantined.extend(sorted(obs_quar))
@@ -6898,7 +7199,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Fail unless the campaign verdict pipeline kills all 5 seeded semantic "
+            "Fail unless the campaign verdict pipeline kills all 8 seeded semantic "
             "mutants (`SEEDED_SEMANTIC_MUTANTS`) while passing their unmutated "
             "baselines (default: on for --profile nightly, off otherwise)."
         ),
@@ -6908,6 +7209,77 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if ns.profile is None:
         ns.profile = "quick"
     return ns
+
+
+def _write_not_evaluated_campaign_summary(
+    state_dir: Path,
+    profile: ProfileConfig,
+    date_prefix: str,
+    miri_seed: int,
+    itree_seed: int,
+    include_itree: bool,
+    miri: dict[str, Any] | None,
+    itree: dict[str, Any] | None,
+    ran_without_oracle: dict[str, bool],
+    mutant_report: dict[str, Any] | None,
+    ratchet_report: dict[str, Any] | None,
+    elapsed_sec: float,
+) -> list[Path]:
+    gates_ok = gates_passed(mutant_report, ratchet_report)
+    miri_ran = ran_without_oracle.get("miri-difftest", False)
+    itree_ran = ran_without_oracle.get("itree-difftest", False)
+    campaign_summary: dict[str, Any] = {
+        "profile": profile.name,
+        "date_utc": date_prefix,
+        "miri_seed": f"0x{miri_seed:08x}",
+        "itree_seed": f"0x{itree_seed:08x}" if include_itree else None,
+        "miri_oracle_comparison": "not_performed" if miri_ran else "failed",
+        "itree_oracle_comparison": (
+            "not_performed"
+            if (include_itree and itree_ran)
+            else ("failed" if include_itree else "skipped")
+        ),
+        "red_flags": {
+            "passed": False,
+            "checks": {"oracle_invoked": False},
+            "failure_reasons": (
+                ["compile_only_not_evaluated"]
+                if (miri_ran and (not include_itree or itree_ran))
+                else ["harness_failed"]
+            ),
+        },
+        "harness_diagnostics": copy.deepcopy(LAST_HARNESS_DIAGNOSTICS),
+        "coverage_ratchet_baseline_missing": False,
+        "witness_polarity_accounting_verified": False,
+        "witness_polarity_counts": None,
+        "unquarantined_witness_polarity_counts": None,
+        "quarantined_witness_polarity_counts": None,
+        "miri_summary": miri,
+        "itree_summary": itree if include_itree else None,
+        "deduplicated_findings": [],
+        "unquarantined_findings": [],
+        "quarantined_findings": [],
+        "elapsed_sec": round(elapsed_sec, 3),
+    }
+    if mutant_report is not None or ratchet_report is not None:
+        campaign_summary["gates"] = {
+            "passed": gates_ok,
+            "self_check_mutants": mutant_report is not None,
+            "check_stale_ratchet": ratchet_report is not None,
+        }
+    if mutant_report is not None:
+        campaign_summary["semantic_mutant_self_check"] = mutant_report
+    if ratchet_report is not None:
+        campaign_summary["stale_ratchet_audit"] = ratchet_report
+    summary_json_text = json.dumps(campaign_summary, indent=2) + "\n"
+    written_paths: list[Path] = []
+    for summary_path in [
+        state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_summary.json",
+        state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json",
+    ]:
+        summary_path.write_text(summary_json_text, encoding="utf-8")
+        written_paths.append(summary_path)
+    return written_paths
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -7191,6 +7563,22 @@ def main(argv: list[str] | None = None) -> int:
             ]:
                 report_path.write_text(report_md, encoding="utf-8")
                 written.append(report_path)
+            written.extend(
+                _write_not_evaluated_campaign_summary(
+                    state_dir,
+                    profile,
+                    date_prefix,
+                    miri_seed,
+                    itree_seed,
+                    include_itree,
+                    miri,
+                    itree,
+                    ran_without_oracle,
+                    mutant_report,
+                    ratchet_report,
+                    elapsed_sec,
+                )
+            )
 
             if args.junit_xml:
                 write_not_evaluated_junit_xml(
@@ -7297,6 +7685,22 @@ def main(argv: list[str] | None = None) -> int:
             ]:
                 report_path.write_text(report_md, encoding="utf-8")
                 written.append(report_path)
+            written.extend(
+                _write_not_evaluated_campaign_summary(
+                    state_dir,
+                    profile,
+                    date_prefix,
+                    miri_seed,
+                    itree_seed,
+                    include_itree,
+                    miri,
+                    itree,
+                    ran_without_oracle,
+                    mutant_report,
+                    ratchet_report,
+                    elapsed_sec,
+                )
+            )
             if args.junit_xml:
                 write_not_evaluated_junit_xml(
                     args.junit_xml.resolve(),
@@ -7677,12 +8081,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "unquarantined_witness_polarity_counts": (
                 count_dedup_witness_polarities(miri_unquarantined)
-                if miri_performed and miri is not None
+                if polarity_verified and miri is not None
                 else None
             ),
             "quarantined_witness_polarity_counts": (
                 count_dedup_witness_polarities(miri_quarantined)
-                if miri_performed and miri is not None
+                if polarity_verified and miri is not None
                 else None
             ),
             "miri_summary": miri,
