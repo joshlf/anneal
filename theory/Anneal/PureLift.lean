@@ -15,3 +15,4 @@ import Anneal.PureLift.Plan
 import Anneal.PureLift.BlockCfg
 import Anneal.PureLift.Adapter
 import Anneal.PureLift.Canaries
+import Anneal.PureLift.MirBridge
