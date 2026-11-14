@@ -3864,5 +3864,130 @@ class TestRules6And7Integration(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
+    """`[adv ep2-B1]`: incremental window splicing must equal a cold full scan, and a body line
+    indented deeper than its declaration must never end a pinned span."""
+
+    _SNIPPETS = [
+        '"', "/-", "-/", "--", "/--", "'", "«", "»", "\n", "theorem ", " (h : 0 = 1)", " (h : False)",
+        "\n/-- anneal:documented_intent x -/\ndef w : Nat := 0\n",
+        "\n/-- anneal:documented_intent kept\npin:sha256:0123456789ab\n-/\ndef wp : Nat := 1\n",
+        "private theorem dup : True := trivial\n", "simp [wpMirExecSym]",
+        "set_option trace.profiler.threshold 1\n", "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n",
+        "where\n  aux : Nat := 1\n", "@[simp] ", "  ", 'r#"', '"#', 's!"{', '}"',
+        "/-! anneal:documented_intent m -/\n", " := by\n  rfl\n",
+    ]
+
+    @staticmethod
+    def _corpus(rnd) -> str:
+        parts = []
+        for i in range(170):
+            kind = rnd.randrange(6)
+            doc = "/-- " + "long docstring words " * rnd.randint(1, 6) + "-/\n" if rnd.random() < 0.7 else ""
+            if kind == 0:
+                parts.append(doc + f"theorem t{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n")
+            elif kind == 1:
+                parts.append(doc + f"theorem v{i} (n : Nat) (h : 0 = 1) : n = n := rfl\n\n")
+            elif kind == 2:
+                parts.append(f"/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\ntheorem m{i} (n : Nat) : n = n := rfl\n\n")
+            elif kind == 3:
+                parts.append(doc + f"def d{i} : Nat :=\n  {i}\n\n")
+            elif kind == 4:
+                parts.append(doc + f"theorem s{i} : True := by\n  simp [foo{i}]\n\n")
+            else:
+                parts.append(f"/- plain comment {i} -/\ntheorem c{i} (x : Nat) (hx : x < x) : True := trivial\n\n")
+        text = "".join(parts)
+        return text if len(text) >= 32768 else text + text
+
+    @staticmethod
+    def _key(findings):
+        return [(f.rule, getattr(f, "subrule", ""), f.line, f.symbol, f.message) for f in findings]
+
+    def _incremental_vs_cold(self, text: str) -> tuple[list, list, list, list]:
+        inc = self._key(proof_health.scan_lean_text(text, file_path="F.lean", scan_siblings=False))
+        inc_a = self._key(proof_health.audit_lean_text(text, file_path="G.lean"))
+        saved = (dict(proof_health._LAST_LEAN_SCAN), dict(proof_health._LAST_LEAN_AUDIT))
+        proof_health.clear_in_process_caches()
+        cold = self._key(proof_health.scan_lean_text(text, file_path="F.lean", scan_siblings=False))
+        cold_a = self._key(proof_health.audit_lean_text(text, file_path="G.lean"))
+        proof_health._LAST_LEAN_SCAN.update(saved[0])
+        proof_health._LAST_LEAN_AUDIT.update(saved[1])
+        return inc, cold, inc_a, cold_a
+
+    def test_unterminated_string_in_window_falls_back_to_full_scan(self) -> None:
+        doc = "/-- " + "This docstring is long so a 64-byte lookahead sees only comment bytes. " * 2 + "-/\n"
+        parts = [doc + f"theorem t{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" for i in range(160)]
+        parts += [doc + f"theorem tail{i} (n : Nat) (h : 0 = 1) : n = n := rfl\n\n" for i in range(5)]
+        old_text = "".join(parts)
+        anchor = "theorem t80 (n : Nat) : n + 0 = n := Nat.add_zero n"
+        # The opened string swallows the rest of the file (no later `"`): every tail theorem
+        # becomes string contents, so a cold scan reports nothing after the edit.
+        new_text = old_text.replace(anchor, anchor.replace(":= Nat.add_zero", ':= "Nat.add_zero'), 1)
+        proof_health.clear_in_process_caches()
+        self.assertEqual(len(proof_health.scan_lean_text(old_text, file_path="F.lean", scan_siblings=False)), 5)
+        self.assertEqual(len(proof_health.audit_lean_text(old_text, file_path="G.lean")), 10)
+        inc, cold, inc_a, cold_a = self._incremental_vs_cold(new_text)
+        self.assertEqual(cold, [])
+        self.assertEqual(inc, cold)
+        self.assertEqual(inc_a, cold_a)
+
+    def test_randomized_incremental_edits_match_cold_full_scans(self) -> None:
+        import random
+
+        rnd = random.Random(20261114)
+        windows = []
+        original = proof_health._find_incremental_lean_window
+
+        def counting(*args, **kwargs):
+            result = original(*args, **kwargs)
+            windows.append(result is not None)
+            return result
+
+        mismatches = []
+        with patch.object(proof_health, "_find_incremental_lean_window", counting):
+            for trial in range(24):
+                text = self._corpus(random.Random(rnd.randrange(10**6)))
+                proof_health.clear_in_process_caches()
+                proof_health.scan_lean_text(text, file_path="F.lean", scan_siblings=False)
+                proof_health.audit_lean_text(text, file_path="G.lean")
+                for step in range(5):
+                    pos = rnd.randrange(len(text))
+                    if rnd.random() < 0.25:
+                        text = text[:pos] + text[pos + rnd.randint(1, 30):]
+                    else:
+                        text = text[:pos] + rnd.choice(self._SNIPPETS) + text[pos:]
+                    inc, cold, inc_a, cold_a = self._incremental_vs_cold(text)
+                    if inc != cold or inc_a != cold_a:
+                        mismatches.append((trial, step, pos))
+        self.assertEqual(mismatches, [])
+        self.assertGreaterEqual(sum(windows), 10, "too few incremental windows exercised")
+
+    def test_body_line_after_column0_comment_tail_never_ends_pinned_span(self) -> None:
+        # `/- comment` opened at column 0 closes at the start of an indented `where` member: the
+        # member must stay inside `pinned`'s span (A1 measured its indent from the opener: 0).
+        draft = (
+            "/-- anneal:documented_intent test\nPIN\n-/\n"
+            "def pinned : Nat :=\n  helper\nwhere\n/- comment\n-/  def helper : Nat := 1\n"
+        )
+        pinned = draft.replace("PIN", audit.compute_lean_decl_pins(draft.replace("PIN\n", ""))["pinned"])
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace(":= 1", ":= 999"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+        # The declaration's own indent is the smallest plausible column: its line starts at
+        # column 0 even though the comment it closes was opened at column 6.
+        draft2 = (
+            "/-- anneal:documented_intent test\nPIN\n-/\n"
+            "      /- comment\n-/ def pinned2 : Nat :=\n  helper\nwhere\n  def helper : Nat := 1\n"
+        )
+        pinned2 = draft2.replace("PIN", audit.compute_lean_decl_pins(draft2.replace("PIN\n", ""))["pinned2"])
+        self.assertEqual(audit.scan_lean_text(pinned2, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned2.replace(":= 1", ":= 999"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

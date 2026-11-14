@@ -700,6 +700,24 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         }))
         expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
                        "escapes checkout")
+        # rustc-capture keeps absolute paths for primary-package sources outside its working
+        # directory: those are digest-checked as recorded, while Mir targets must be relative.
+        mir_file.write_text("def claim : Prop := True\n")
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [[str(escape_rs.resolve()), runner.digest(escape_rs)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Foo.lean",
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        assert runner.verify_capture_manifest(manifest_path, manifest_dir)["compilation_succeeded"] is True
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [["src/lib.rs", runner.digest(rs_file)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": str(mir_file.resolve()),
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
+                       "mir_module_path escapes checkout")
         escape_rs.unlink()
         shutil.rmtree(manifest_dir)
 

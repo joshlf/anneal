@@ -205,17 +205,23 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         raise Failure(1, phase, "compilation_succeeded is not true in CaptureManifest.json")
     if not isinstance(manifest["rust_sources"], list) or not manifest["rust_sources"]:
         raise Failure(1, phase, "CaptureManifest.json must record at least one Rust source file")
-    root_resolved = root.resolve()
+
+    def climbs_above_root(rel: str) -> bool:
+        norm = os.path.normpath(rel)
+        return norm == os.pardir or norm.startswith(os.pardir + os.sep)
+
     for entry in manifest["rust_sources"]:
         if (not isinstance(entry, list) or len(entry) != 2
                 or not all(isinstance(x, str) and x for x in entry)
                 or not re.fullmatch(r"[0-9a-f]{64}", entry[1])):
             raise Failure(1, phase, "invalid rust_sources entry in CaptureManifest.json")
-        src_path = (root / entry[0]).resolve()
-        try:
-            src_path.relative_to(root_resolved)
-        except ValueError:
+        # rustc-capture records sources relative to its working directory and keeps the
+        # absolute path of a primary-package source outside it (`#[path]` modules, generated
+        # `include!` files), so absolute entries are digest-checked as recorded; a relative
+        # entry, however, must not climb above the manifest root (`../escape.rs`).
+        if not os.path.isabs(entry[0]) and climbs_above_root(entry[0]):
             raise Failure(1, phase, f"CaptureManifest.json rust_sources path escapes checkout: {entry[0]}")
+        src_path = (root / entry[0]).resolve()
         regular(src_path, phase)
         if digest(src_path) != entry[1]:
             raise Failure(1, phase, f"Rust source digest mismatch for {entry[0]}")
@@ -231,13 +237,13 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         if target["def_id"] in seen_defs:
             raise Failure(1, phase, f"duplicate target def_id {target['def_id']}")
         seen_defs.add(target["def_id"])
-        mir_path = (root / target["mir_module_path"]).resolve()
-        try:
-            mir_path.relative_to(root_resolved)
-        except ValueError:
+        # Generated `Mir/<Item>.lean` modules live under the manifest root (cargo-anneal derives
+        # their module names from the relative path): absolute or root-escaping paths fail.
+        if os.path.isabs(target["mir_module_path"]) or climbs_above_root(target["mir_module_path"]):
             raise Failure(
                 1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {target['mir_module_path']}"
             )
+        mir_path = (root / target["mir_module_path"]).resolve()
         regular(mir_path, phase)
         if digest(mir_path) != target["mir_module_sha256"]:
             raise Failure(1, phase, f"Mir module digest mismatch for {target['mir_module_path']}")
@@ -2750,7 +2756,13 @@ def _is_lean_command_start(code_only: str, cand: int) -> bool:
 
 def _lean_indent_of(code_only: str, offset: int, text: str | None = None) -> int:
     """Return the column offset (`0`-based) of `offset`'s line indentation (ignoring any
-    leading `/- ... -/` block comment on the same line when `text` is given)."""
+    leading `/- ... -/` block comment on the same line when `text` is given).
+
+    With `text`, this is the indentation used for a declaration's *own* start line, and it is
+    deliberately the smallest plausible column: the first non-blank `text` column of the line,
+    or, when the line opens with the tail of a block comment begun on an earlier line, the
+    smaller of that and the comment opener's line indentation. A smaller declaration indent
+    only keeps more following lines inside the span (conservative: never a pin bypass)."""
     nl = code_only.rfind("\n", 0, offset)
     line_start = 0 if nl == -1 else nl + 1
     if text is None:
@@ -2758,6 +2770,7 @@ def _lean_indent_of(code_only: str, offset: int, text: str | None = None) -> int
     p = line_start
     while p < offset and text[p] in " \t":
         p += 1
+    indent = p - line_start
     if p < offset and not text.startswith("/-", p):
         open_pos = text.rfind("/-", 0, offset)
         if open_pos != -1:
@@ -2766,9 +2779,9 @@ def _lean_indent_of(code_only: str, offset: int, text: str | None = None) -> int
             q = ls0
             while q < open_pos and text[q] in " \t":
                 q += 1
-            if q == open_pos:
-                return q - ls0
-    return p - line_start
+            if q == open_pos and q - ls0 < indent:
+                indent = q - ls0
+    return indent
 
 
 def _find_lean_decl_end(
@@ -2787,7 +2800,10 @@ def _find_lean_decl_end(
     """
     n = len(code_only)
     pos = after_hdr_pos
-    if decl_indent <= 0 and (text is None or "-/" not in text[after_hdr_pos:]):
+    # Without any `-/` after the header no line can start with a closed same-line block comment
+    # (`/- c -/ def next`), so column-0 `code_only` boundaries are exact. `find` (not `in` on a
+    # slice) keeps this O(distance) instead of copying the rest of the file per declaration.
+    if decl_indent <= 0 and (text is None or text.find("-/", after_hdr_pos) == -1):
         while pos < n:
             m = _LEAN_COL0_BOUNDARY_RE.search(code_only, pos)
             if m is None:
@@ -2807,11 +2823,20 @@ def _find_lean_decl_end(
             return n
         ws = m.group(1)
         cand = m.end()
-        line_indent = (
-            _lean_indent_of(code_only, cand, text)
-            if (text is not None and len(ws) > decl_indent and text[m.start() + 1 : cand] != ws)
-            else len(ws)
-        )
+        line_indent = len(ws)
+        if text is not None and line_indent > decl_indent:
+            # A block comment opened on this very line (`/- c -/ def next`) is blanked to spaces
+            # in `code_only`; its opening column is the line's indentation. Any other mismatch
+            # (the tail of a multi-line comment opened on an earlier line, a string continuation)
+            # keeps the `code_only` column, which is never smaller, so a body line indented deeper
+            # than the declaration is never misread as a sibling command (no premature span end,
+            # hence no pin bypass): over-inclusion is a false drift, under-inclusion a bypass.
+            line_start = m.start() + 1
+            q = line_start
+            while q < cand and text[q] in " \t":
+                q += 1
+            if q < cand and text.startswith("/-", q):
+                line_indent = q - line_start
         if line_indent > decl_indent:
             pos = cand + 1
             continue
@@ -4257,18 +4282,25 @@ def _find_incremental_lean_window(
     safe_hi_new = safe_hi_old + delta_len
     cut_hi_new = cut_hi_old + delta_len
 
-    look = 64 if n_old - safe_hi_old >= 64 else (n_old - safe_hi_old)
-    win_look_code, win_look_comments = _scan_lean_comments_and_strings(
-        text[safe_lo : safe_hi_new + look]
-    )
+    # The window must leave the lexer in its neutral state: the text after the window is
+    # unchanged and was lexed from a neutral state (`safe_hi_old` is a column-0 line start
+    # before a theorem's leading comments), so only then does the rest of the file lex exactly
+    # as before. A bounded lookahead cannot decide this when it covers only comment bytes (an
+    # unterminated string opened inside the window stays blank there and may swallow everything
+    # after it), so lex the window followed by a plain sentinel line, which survives verbatim
+    # exactly when no string literal or block comment is still open at the window end.
     win_len = safe_hi_new - safe_lo
-    if win_look_code[win_len:] != old_code[safe_hi_old : safe_hi_old + look]:
+    sentinel = "\nzzIncrementalLexSentinelzz"
+    win_sent_code, win_sent_comments = _scan_lean_comments_and_strings(
+        text[safe_lo:safe_hi_new] + sentinel
+    )
+    if len(win_sent_code) != win_len + len(sentinel) or not win_sent_code.endswith(sentinel):
         return None
-    if any(cs < win_len < ce for cs, ce, _, _, _ in win_look_comments):
+    if any(ce > win_len for _, ce, _, _, _ in win_sent_comments):
         return None
 
-    win_code = win_look_code[:win_len]
-    win_comments = [c for c in win_look_comments if c[1] <= win_len]
+    win_code = win_sent_code[:win_len]
+    win_comments = list(win_sent_comments)
     lo_line_offset = old_text.count("\n", 0, safe_lo)
     cut_lo_line = lo_line_offset + old_text.count("\n", safe_lo, cut_lo) + 1
     cut_hi_old_line = cut_lo_line - 1 + old_text.count("\n", cut_lo, cut_hi_old) + 1
