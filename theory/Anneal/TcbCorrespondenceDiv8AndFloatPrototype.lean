@@ -465,6 +465,11 @@ structure ProtoBorrowEntry : Type where
   parentTag : Option Nat := .none
   /-- Depth of the stack frame owning `targetLocal` (`DIV-MR-CALL-TARGET-LOCAL`). -/
   targetFrameDepth : Nat := 0
+  /-- True once the backing local allocation was deallocated (`StorageDead`/`StorageLive`/`Return`),
+  distinguishing a deallocated allocation from a tag whose Tree Borrows `perm` was `.disabled`
+  by a foreign write while the allocation remains live (`DIV-LM-D6-OFFSET-DISABLED-TAG` vs
+  `D2` storage-revival pointer offset). -/
+  allocDead : Bool := false
 
 /-- Saved caller activation record. -/
 structure ProtoSavedFrame : Type where
@@ -715,12 +720,15 @@ def hasProtectedLocalBorrowProto (cfg : ProtoConfig) (borrows : List ProtoBorrow
     Bool.and (entryTargetsProto e d loc)
       (Bool.and (isProtectedProto prots e) (deallocBlockedBy cfg e.perm)))
 
-/-- Frame-scoped `disableLocalBorrows`. -/
+/-- Frame-scoped `disableLocalBorrows` (`StorageDead` / `StorageLive`): disables every
+borrow of `(d, loc)` and marks its backing allocation deallocated (`allocDead := true`)
+so a subsequent `StorageLive(loc)` revival cannot make stale pointers appear live for
+non-zero `BinOp.offset`. -/
 def disableLocalBorrowsProto (borrows : List ProtoBorrowEntry) (d loc : Nat) :
     List ProtoBorrowEntry :=
   borrows.map (fun e =>
     match entryTargetsProto e d loc with
-    | true => { e with perm := .disabled }
+    | true => { e with perm := .disabled, allocDead := true }
     | false => e)
 
 /-- `Return` deallocation check across the returning frame's locals
@@ -729,12 +737,13 @@ def hasFrameDeallocProtectorConflictProto (cfg : ProtoConfig)
     (borrows : List ProtoBorrowEntry) (prots : List Nat) (d nLocals : Nat) : Bool :=
   (List.range nLocals).any (hasProtectedLocalBorrowProto cfg borrows prots d)
 
-/-- Disable every entry targeting a local `< nLocals` of the frame at depth `d`. -/
+/-- Disable every entry targeting a local `< nLocals` of the frame at depth `d` and mark
+its backing allocation deallocated (`allocDead := true`). -/
 def disableFrameBorrowsProto (borrows : List ProtoBorrowEntry) (d nLocals : Nat) :
     List ProtoBorrowEntry :=
   borrows.map (fun e =>
     match Bool.and (Nat.beq e.targetFrameDepth d) (Nat.blt e.targetLocal nLocals) with
-    | true => { e with perm := .disabled }
+    | true => { e with perm := .disabled, allocDead := true }
     | false => e)
 
 /-! ## §3. The prototype interpreter -/
@@ -1014,26 +1023,30 @@ def evalOperandsProto (cfg : ProtoConfig) (s : ProtoMachineState) : List Operand
     | .unsupported => .unsupported
 
 /-- Perm-independent allocation byte bound of a whole-local borrow: the byte size of
-the target local in its owning frame when live, `0` when dead or dangling, and `none`
-(unsupported) for sub-place borrows or unknown layouts. -/
+the target local in its owning frame when the entry's allocation has not been freed
+(`entry.allocDead = false`) and the slot is live (`.init _` or `.uninit`), `0` when
+deallocated or dead, and `none` (unsupported) for sub-place borrows or unknown layouts. -/
 def ptrAllocByteBoundProto (s : ProtoMachineState) (entry : ProtoBorrowEntry) : Option Nat :=
   match entry.targetProjection with
   | .nil =>
-    match readFrameLocalProto s entry.targetFrameDepth entry.targetLocal with
-    | .some (.init _) | .some .uninit =>
+    match entry.allocDead, readFrameLocalProto s entry.targetFrameDepth entry.targetLocal with
+    | false, .some (.init _) | false, .some .uninit =>
       match frameBodyAtDepth s entry.targetFrameDepth with
       | .some b =>
         match get? b.localDecls entry.targetLocal with
         | .some decl => rigidTyByteSize b.layouts decl.ty
         | .none => .none
       | .none => .none
-    | _ => .some 0
+    | _, _ => .some 0
   | _ :: _ => .none
 
 /-- `BinOp.Offset` decoupled from Tree Borrows permissions
 (`DIV-LM-D6-OFFSET-DISABLED-TAG`): only `evalBinOpOffset`'s live-allocation bounds
-and `isize` overflow checks apply; the tag is preserved. A `.disabled` tag is
-rejected later, at dereference. -/
+and `isize` overflow checks apply; the tag is preserved. A zero byte delta (`count == 0`
+or `stride == 0`) is valid at any `offsetBytes < 2^63` even after the allocation is dead
+(`WitLM3_1.lm31OffsetDisabledDeadZeroBody`); a non-zero byte delta requires a live
+allocation (`entry.allocDead = false`, so `StorageDead`+`StorageLive` revival rejects
+non-zero offsets on stale tags). A `.disabled` tag is rejected later, at dereference. -/
 def evalPtrOffsetBinOpProto (s : ProtoMachineState) (lhsOp : Operand) (ptrVal : ProvenancePtr)
     (sz : Nat) (offsetSc : ScalarInt) : ProtoValResult :=
   match lookupProtoBorrow s.memory.borrows ptrVal.tag with
@@ -1045,7 +1058,14 @@ def evalPtrOffsetBinOpProto (s : ProtoMachineState) (lhsOp : Operand) (ptrVal : 
       match ptrAllocByteBoundProto s entry with
       | .none => .unsupported
       | .some bound =>
-        match evalBinOpOffset ptrVal sz offsetSc stride (.some bound) (layoutPointerBytes s.body.layouts) with
+        let ptrBytes := layoutPointerBytes s.body.layouts
+        let effBound : Option Nat :=
+          match Bool.and (Nat.beq bound 0)
+            (Bool.or (Nat.beq (wrapScalarBits offsetSc.bits (scalarModulus ptrBytes)) 0)
+              (Nat.beq stride 0)) with
+          | true => .none
+          | false => .some bound
+        match evalBinOpOffset ptrVal sz offsetSc stride effBound ptrBytes with
         | .some p' => .ok (.ptr p' sz) s
         | .none => .ub
 
@@ -2562,6 +2582,63 @@ theorem ptrAllocByteBoundProto_perm_irrel (s : ProtoMachineState) (entry : Proto
     (p : TreeBorrowPerm) :
     ptrAllocByteBoundProto s { entry with perm := p } = ptrAllocByteBoundProto s entry := rfl
 
+theorem miriPtrOffsetInbounds_false_neg (bound o P : Nat) :
+    miriPtrOffsetInbounds false bound o (-(P : Int)) =
+      if P = 0 then some o else none := by
+  cases P with
+  | zero => simp [miriPtrOffsetInbounds]
+  | succ k =>
+    unfold miriPtrOffsetInbounds
+    have h0 : ¬ (-(Nat.succ k : Int) = 0) := by rintro ⟨⟩
+    simp only [Nat.succ_ne_zero, h0, ↓reduceIte, ite_self]
+
+theorem miriPtrOffsetInbounds_false_nonneg (bound o Q : Nat) :
+    miriPtrOffsetInbounds false bound o (Q : Int) =
+      if Q = 0 then some o else none := by
+  cases Q with
+  | zero => simp [miriPtrOffsetInbounds]
+  | succ k =>
+    unfold miriPtrOffsetInbounds
+    have h0 : ¬ ((Nat.succ k : Int) = 0) := by rintro ⟨⟩
+    simp only [Nat.succ_ne_zero, h0, ↓reduceIte, ite_self]
+
+/-- When `ptrVal.offsetBytes ≤ bound`, replacing `.some 0` with `.none` on a zero-delta
+offset leaves `evalBinOpOffset` unchanged. -/
+theorem evalBinOpOffset_effBound_eq_of_le (ptrVal : ProvenancePtr) (offsetSc : ScalarInt)
+    (stride bound : Nat) (hsz : offsetSc.sizeBytes = 8) (hin : ptrVal.offsetBytes ≤ bound) :
+    let effBound : Option Nat :=
+      match Bool.and (Nat.beq bound 0)
+        (Bool.or (Nat.beq (wrapScalarBits offsetSc.bits (scalarModulus 8)) 0)
+          (Nat.beq stride 0)) with
+      | true => .none
+      | false => .some bound
+    evalBinOpOffset ptrVal 8 offsetSc stride effBound 8 =
+      evalBinOpOffset ptrVal 8 offsetSc stride (.some bound) 8 := by
+  dsimp only
+  by_cases hb0 : bound = 0
+  · subst hb0
+    have ho0 : ptrVal.offsetBytes = 0 := Nat.eq_zero_of_le_zero hin
+    obtain ⟨a, o⟩ := ptrVal
+    obtain ⟨bits, sz⟩ := offsetSc
+    simp only at ho0 hsz
+    subst ho0 hsz
+    have hw2 : wrapScalarBits (bits % 18446744073709551616) 18446744073709551616 =
+        bits % 18446744073709551616 := by rw [wrap64, Nat.mod_mod]
+    simp only [evalBinOpOffset, isSignedNegative, scalarModulus_eight, signedHalfModulus_eight,
+      Nat.beq_refl, Bool.and_self, wrap64, hw2, nat_ble_eq_decide, nat_beq_eq_decide,
+      Nat.sub_eq, Nat.mul_eq, Nat.add_eq]
+    generalize bits % 18446744073709551616 = B
+    by_cases hB0 : B = 0
+    · subst hB0; simp
+    · by_cases hs0 : stride = 0
+      · subst hs0
+        simp only [hB0, decide_true, Bool.or_true, Nat.mul_zero]
+        cases decide (9223372036854775808 ≤ B) <;> simp
+      · simp [hB0, hs0]
+  · have hb : Nat.beq bound 0 = false := by
+      rw [nat_beq_eq_decide]; simp [hb0]
+    simp [hb]
+
 /-- **Repaired, universal lockstep** (`DIV-LM-D6-OFFSET-DISABLED-TAG`): for *every* borrow
 entry (in particular a `.disabled` one — no hypothesis constrains `entry.perm`), every
 in-bounds pointer, every 8-byte `isize` count (zero, positive, and negative), and every
@@ -2584,9 +2661,106 @@ theorem div_lm_d6_offset_disabled_tag_repaired_agrees (s : ProtoMachineState) (l
   rw [hstride]
   simp only
   rw [hbnd]
-  simp only
-  rw [hptr, evalBinOpOffset_lockstep_miri ptrVal offsetSc stride bound hsz hin hlt]
+  simp only [hptr]
+  rw [evalBinOpOffset_effBound_eq_of_le ptrVal offsetSc stride bound hsz hin,
+    evalBinOpOffset_lockstep_miri ptrVal offsetSc stride bound hsz hin hlt]
   cases miriPtrOffsetInbounds true bound ptrVal.offsetBytes (isizeValue offsetSc * (stride : Int)) <;> rfl
+
+/-- **Dead-allocation universal lockstep** (`DIV-LM-D6-OFFSET-DISABLED-TAG` +
+`WitLM3_1.lm31OffsetDisabledDeadZeroBody` + `D2` storage revival): when the target
+allocation is dead (`ptrAllocByteBoundProto s entry = .some 0`), at *any* in-range pointer
+offset `ptrVal.offsetBytes < 2^63` (including `offsetBytes > 0`, e.g. `offsetBytes = 8`
+after an earlier offset before `StorageDead`), `evalPtrOffsetBinOpProto` agrees with
+`miriPtrOffsetInbounds false allocSize ptrVal.offsetBytes (isizeValue offsetSc * stride)`:
+zero-delta offsets succeed and preserve `ptrVal`, while all non-zero-delta offsets fault
+with `.ub`. -/
+theorem div_lm_d6_offset_dead_alloc_lockstep_miri (s : ProtoMachineState) (lhsOp : Operand)
+    (ptrVal : ProvenancePtr) (offsetSc : ScalarInt) (entry : ProtoBorrowEntry)
+    (stride allocSize : Nat)
+    (hlook : lookupProtoBorrow s.memory.borrows ptrVal.tag = .some entry)
+    (hstride : pointeeElemByteStride s.body.localDecls s.body.layouts lhsOp = .some stride)
+    (hbnd : ptrAllocByteBoundProto s entry = .some 0)
+    (hptr : layoutPointerBytes s.body.layouts = 8) (hsz : offsetSc.sizeBytes = 8)
+    (hoff : ptrVal.offsetBytes < 2 ^ 63) :
+    evalPtrOffsetBinOpProto s lhsOp ptrVal 8 offsetSc =
+      match miriPtrOffsetInbounds false allocSize ptrVal.offsetBytes
+          (isizeValue offsetSc * (stride : Int)) with
+      | .some n => .ok (.ptr { ptrVal with offsetBytes := n } 8) s
+      | .none => .ub := by
+  unfold evalPtrOffsetBinOpProto
+  rw [hlook]; simp only; rw [hstride]; simp only; rw [hbnd]; simp only [hptr, Nat.beq_refl, Bool.true_and]
+  obtain ⟨a, o⟩ := ptrVal
+  obtain ⟨bits, sz⟩ := offsetSc
+  simp only at hsz hoff ⊢
+  subst hsz
+  simp only [Nat.reducePow] at hoff
+  have hB : bits % 18446744073709551616 < 18446744073709551616 := Nat.mod_lt _ (by decide)
+  have hw2 : wrapScalarBits (bits % 18446744073709551616) 18446744073709551616 =
+      bits % 18446744073709551616 := by rw [wrap64, Nat.mod_mod]
+  simp only [evalBinOpOffset, isSignedNegative, scalarModulus_eight, signedHalfModulus_eight,
+    Nat.beq_refl, Bool.and_self, wrap64, hw2, nat_ble_eq_decide, nat_beq_eq_decide,
+    isizeValue, intValueOfBits, Nat.reducePow, Nat.reduceSub,
+    true_and, Nat.sub_eq, Nat.mul_eq, Nat.add_eq]
+  generalize bits % 18446744073709551616 = B at hB ⊢
+  have ho_not : ¬ (9223372036854775808 ≤ o) := by omega
+  by_cases hneg : 9223372036854775808 ≤ B
+  · have hB0 : ¬ (B = 0) := by omega
+    simp only [hneg, hB0, decide_true, decide_false, Bool.false_or, ite_true]
+    have hInt : ((B : Int) - ((18446744073709551616 : Nat) : Int)) * (stride : Int) =
+        -((((18446744073709551616 - B) * stride : Nat)) : Int) := by
+      rw [Int.natCast_mul, Int.ofNat_sub (Nat.le_of_lt hB), ← Int.neg_mul, Int.neg_sub]
+    rw [hInt, miriPtrOffsetInbounds_false_neg]
+    by_cases hs0 : stride = 0
+    · subst hs0
+      simp only [Nat.mul_zero, Nat.sub_zero, Nat.zero_le, decide_true, ↓reduceIte, ho_not,
+        decide_false, Bool.not_false]
+      rfl
+    · simp only [hs0, decide_false]
+      generalize hP : (18446744073709551616 - B) * stride = P
+      have hPpos : 0 < P := by
+        rw [← hP]
+        exact Nat.mul_pos (Nat.sub_pos_of_lt hB) (Nat.pos_of_ne_zero hs0)
+      clear hP hs0 hB0
+      have hPne0 : ¬ (P = 0) := Nat.ne_of_gt hPpos
+      simp only [hPne0, ↓reduceIte]
+      by_cases h1 : 9223372036854775808 ≤ P
+      · simp only [h1, decide_true, Bool.not_true, Bool.false_and]
+      · simp only [h1, decide_false, Bool.not_false, Bool.true_and]
+        by_cases h2 : P ≤ o
+        · have ho_ne : ¬ (o - P = o) := by omega
+          have ho_le0 : ¬ (o ≤ 0) := by omega
+          simp only [h2, ho_ne, ho_le0, decide_true, decide_false, Bool.and_false, Bool.false_and,
+            Bool.or_false]
+        · simp only [h2, decide_false]
+  · simp only [hneg, decide_false, ite_false]
+    rw [← Int.natCast_mul, miriPtrOffsetInbounds_false_nonneg]
+    by_cases hB0 : B = 0
+    · subst hB0
+      simp only [Nat.zero_mul, Nat.add_zero, decide_true, Bool.true_or, ho_not,
+        decide_false, Bool.not_false, ↓reduceIte]
+      rfl
+    · by_cases hs0 : stride = 0
+      · subst hs0
+        simp only [Nat.mul_zero, Nat.add_zero, decide_true, Bool.or_true, ho_not,
+          decide_false, Bool.not_false, ↓reduceIte]
+        rfl
+      · simp only [hB0, hs0, decide_false, Bool.or_self]
+        generalize hQ : B * stride = Q
+        have hQpos : 0 < Q := by
+          rw [← hQ]
+          exact Nat.mul_pos (Nat.pos_of_ne_zero hB0) (Nat.pos_of_ne_zero hs0)
+        clear hQ hs0 hB0
+        have hQne0 : ¬ (Q = 0) := Nat.ne_of_gt hQpos
+        simp only [hQne0, ↓reduceIte]
+        by_cases h1 : 9223372036854775808 ≤ Q
+        · simp only [h1, decide_true]
+        · simp only [h1, decide_false]
+          by_cases h2 : 9223372036854775808 ≤ o + Q
+          · simp only [h2, decide_true]
+          · have hoQ_ne : ¬ (o + Q = o) := by omega
+            have hoQ_le0 : ¬ (o + Q ≤ 0) := by omega
+            simp only [h2, hoQ_ne, hoQ_le0, decide_false, Bool.and_false, Bool.false_and,
+              Bool.or_false]
 
 /-- Concrete lockstep instances: zero offset, positive stride, and a negative `isize`
 count, each agreeing with `miriPtrOffsetInbounds` on a 4-byte allocation. -/
@@ -3006,14 +3180,14 @@ theorem hasProtectedLocalBorrowProto_cell_exempt_reservedIM_blocks
 
 /-- **Frame isolation of `disableFrameBorrowsProto` on `Return`**: entries belonging to
 other frames (`targetFrameDepth ≠ d`) are untouched, while entries of the returning frame
-(`targetFrameDepth = d ∧ targetLocal < nLocals`) are disabled. -/
+(`targetFrameDepth = d ∧ targetLocal < nLocals`) are disabled and marked `allocDead = true`. -/
 theorem disableFrameBorrowsProto_frame_isolation (borrows : List ProtoBorrowEntry)
     (d nLocals i : Nat) (hi : i < borrows.length) :
     (borrows[i].targetFrameDepth ≠ d →
       (disableFrameBorrowsProto borrows d nLocals)[i]? = .some borrows[i]) ∧
     (borrows[i].targetFrameDepth = d ∧ borrows[i].targetLocal < nLocals →
       (disableFrameBorrowsProto borrows d nLocals)[i]? =
-        .some { borrows[i] with perm := .disabled }) := by
+        .some { borrows[i] with perm := .disabled, allocDead := true }) := by
   rw [disableFrameBorrowsProto, List.getElem?_map, List.getElem?_eq_getElem hi]
   constructor
   · intro hne
@@ -3347,6 +3521,461 @@ theorem overlay_coverage_canaries :
     | exact ProtoOutcome.eq_of_okScalar? (by decide +kernel)
     | exact ProtoOutcome.eq_ub_of_isUB (by decide +kernel)
     | decide +kernel
+
+/-! ### Additional B2 adversarial hardening: `WitLM3_1` D6 4-body suite + storage-revival offset,
+cross-frame local-slot isolation, read/stmt borrow isolation, `Return` destination write
+invalidation & protector check, and downstream TCB compatibility lemmas -/
+
+/-- `u64` local declaration. -/
+def u64DeclP : LocalDecl :=
+  { mutability := .mut, ty := { kind := .uint .u64, layoutIdx := 0 }, debugName := none }
+
+/-- `*mut u64` local declaration. -/
+def rawPtrMutU64DeclP : LocalDecl :=
+  { mutability := .mut, ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }, debugName := none }
+
+/-- `u64` constant operand. -/
+def constU64P (n : Nat) : Operand :=
+  .constant { ty := { kind := .uint .u64, layoutIdx := 0 }, val := .scalar (.int ⟨n, 8⟩) }
+
+/-- `usize` constant operand. -/
+def constUsizeP (n : Nat) : Operand :=
+  .constant { ty := { kind := .uint .usize, layoutIdx := 0 }, val := .scalar (.int ⟨n, 8⟩) }
+
+/-- `isize` constant operand. -/
+def constIsizeP (n : Nat) : Operand :=
+  .constant { ty := { kind := .int .isize, layoutIdx := 0 }, val := .scalar (.int ⟨n, 8⟩) }
+
+/-- `WitLM3_1.lm31OffsetDisabledLiveBody`: disable a live raw-pointer tag with a direct
+write `_1 = 7_u64` and offset it by `+1_usize` (stride `8`, reaching `offsetBytes = 8`). -/
+def lm31OffsetDisabledLiveMir : CapturedMir :=
+  { ptrBody "witness::lm31_offset_disabled_live_stride"
+      [u64DeclP, u64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+       .assign (local_ 1) (.use (constU64P 7)),
+       .assign (local_ 3) (.binaryOp .offset (.move (local_ 2)) (constUsizeP 1)),
+       .assign (local_ 0) (.use (constU64P 1)),
+       .storageDead 3, .storageDead 2] with
+    fnAbi := fnAbi 1 }
+
+/-- `WitLM3_1.lm31OffsetDisabledNegBody`: offset `_2` to `offsetBytes = 8`, disable its
+tag via `_1 = 7_u64` while `_1` stays live, and step backward by `-1_isize` to
+`offsetBytes = 0`. -/
+def lm31OffsetDisabledNegMir : CapturedMir :=
+  { ptrBody "witness::lm31_offset_disabled_live_neg_isize"
+      [u64DeclP, u64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP]
+      [.storageLive 2, .storageLive 3, .storageLive 4,
+       .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+       .assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (constUsizeP 1)),
+       .assign (local_ 1) (.use (constU64P 7)),
+       .assign (local_ 4) (.binaryOp .offset (.move (local_ 3)) (constIsizeP 18446744073709551615)),
+       .assign (local_ 0) (.use (constU64P 1)),
+       .storageDead 4, .storageDead 3, .storageDead 2] with
+    fnAbi := fnAbi 1 }
+
+/-- `WitLM3_1.lm31OffsetDisabledUsizeMaxBody`: disable `_2`'s tag via `_1 = 7_u64` and
+offset by `usize::MAX` from `offsetBytes = 0` (UB in both Miri and Anneal). -/
+def lm31OffsetDisabledUsizeMaxMir : CapturedMir :=
+  { ptrBody "witness::lm31_offset_disabled_usize_max"
+      [u64DeclP, u64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+       .assign (local_ 1) (.use (constU64P 7)),
+       .assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (constUsizeP 18446744073709551615)),
+       .assign (local_ 0) (.use (constU64P 1)),
+       .storageDead 3, .storageDead 2] with
+    fnAbi := fnAbi 1 }
+
+/-- `WitLM3_1.lm31OffsetDisabledDeadZeroBody`: advance `_3` to `offsetBytes = 8`, deallocate
+`_1` via `StorageDead(_1)`, and perform a zero-count `Offset(copy _3, 0_usize)` at
+`offsetBytes = 8` on the dead local. -/
+def lm31OffsetDisabledDeadZeroMir : CapturedMir :=
+  { ptrBody "witness::lm31_offset_disabled_dead_zero_at_8"
+      [u64DeclP, u64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP]
+      [.storageLive 2, .storageLive 3, .storageLive 4,
+       .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+       .assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (constUsizeP 1)),
+       .storageDead 1,
+       .assign (local_ 4) (.binaryOp .offset (.copy (local_ 3)) (constUsizeP 0)),
+       .assign (local_ 0) (.use (constU64P 1)),
+       .storageDead 4, .storageDead 3, .storageDead 2] with
+    fnAbi := fnAbi 1 }
+
+/-- `L5_ControlAndCalls.stmtDivRevivePtrOffsetBody`: mint `_2 = &raw mut _1`, deallocate
+`_1` (`StorageDead(_1)`), revive `_1` (`StorageLive(_1)`), and offset `_2` by `offCount`. -/
+def stmtDivRevivePtrOffsetMir (offCount : Nat) : CapturedMir :=
+  { ptrBody "witness::stmt_div_revive_ptr_offset"
+      [u64DeclP, u64DeclP, rawPtrMutU64DeclP, rawPtrMutU64DeclP]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 1) (.use (constU64P 10)),
+       .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+       .storageDead 1,
+       .storageLive 1,
+       .assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (constIsizeP offCount)),
+       .assign (local_ 0) (.use (constU64P 0)),
+       .storageDead 3, .storageDead 2, .storageDead 1] with
+    fnAbi := fnAbi 1 }
+
+/-- **`WitLM3_1` D6 4-witness suite & `StorageDead`+`StorageLive` revival offset canary**
+(`DIV-LM-D6-OFFSET-DISABLED-TAG` + `D2` storage revival):
+1. `lm31OffsetDisabledLiveMir` (`+1_usize` stride `8` on live `_1` after `_1 = 7` disabled
+   tag) succeeds in `runMirProto` (`.ok 1`) while unpatched `Trusted` faults with `.ub`;
+2. `lm31OffsetDisabledNegMir` (`-1_isize` stride `8` from `offsetBytes = 8` on live `_1`
+   after `_1 = 7` disabled tag) succeeds in `runMirProto` (`.ok 1`) while `Trusted` faults;
+3. `lm31OffsetDisabledUsizeMaxMir` (`usize::MAX` from `offsetBytes = 0`) faults with `.ub`
+   in both `runMirProto` and `Trusted` (matching Miri `"PointerArithOverflow"`);
+4. `lm31OffsetDisabledDeadZeroMir` (`0_usize` count at `offsetBytes = 8` after
+   `StorageDead(_1)`) succeeds in `runMirProto` (`.ok 1`, matching Miri) while `Trusted`
+   faults with `.ub`;
+5. `stmtDivRevivePtrOffsetMir 1` (non-zero `+1_isize` offset on stale tag `_2` after
+   `StorageDead(_1); StorageLive(_1)` revival) faults with `.ub` in both `runMirProto` and
+   `Trusted` (`L5_ControlAndCalls.stmt_div_storage_revive_ptr_offset_is_ub`), whereas a
+   zero offset `stmtDivRevivePtrOffsetMir 0` succeeds in `runMirProto` (`.ok 0`). -/
+theorem div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary :
+    runMirProto lm31OffsetDisabledLiveMir [] [.scalar ⟨42, 8⟩] = .ok (.scalar ⟨1, 8⟩) ∧
+    trustedFaults lm31OffsetDisabledLiveMir [] [.scalar ⟨42, 8⟩] 20 = true ∧
+    runMirProto lm31OffsetDisabledNegMir [] [.scalar ⟨42, 8⟩] = .ok (.scalar ⟨1, 8⟩) ∧
+    trustedFaults lm31OffsetDisabledNegMir [] [.scalar ⟨42, 8⟩] 20 = true ∧
+    runMirProto lm31OffsetDisabledUsizeMaxMir [] [.scalar ⟨42, 8⟩] = .ub ∧
+    trustedFaults lm31OffsetDisabledUsizeMaxMir [] [.scalar ⟨42, 8⟩] 20 = true ∧
+    runMirProto lm31OffsetDisabledDeadZeroMir [] [.scalar ⟨42, 8⟩] = .ok (.scalar ⟨1, 8⟩) ∧
+    trustedFaults lm31OffsetDisabledDeadZeroMir [] [.scalar ⟨42, 8⟩] 20 = true ∧
+    runMirProto (stmtDivRevivePtrOffsetMir 1) [] [.scalar ⟨10, 8⟩] = .ub ∧
+    trustedFaults (stmtDivRevivePtrOffsetMir 1) [] [.scalar ⟨10, 8⟩] 20 = true ∧
+    runMirProto (stmtDivRevivePtrOffsetMir 0) [] [.scalar ⟨10, 8⟩] = .ok (.scalar ⟨0, 8⟩) ∧
+    trustedFaults (stmtDivRevivePtrOffsetMir 0) [] [.scalar ⟨10, 8⟩] 20 = true := by
+  repeat' apply And.intro
+  all_goals first
+    | exact ProtoOutcome.eq_of_okScalar? (by decide +kernel)
+    | exact ProtoOutcome.eq_ub_of_isUB (by decide +kernel)
+    | decide +kernel
+
+/-- `writeFrameLocalProto` at `(d, loc)` preserves `currentFrameDepth`, preserves
+`callStack` when writing to the active frame (`d = currentFrameDepth s`), and preserves
+the active frame's `s.frame.locals` when writing to a caller frame (`d < currentFrameDepth s`). -/
+theorem writeFrameLocalProto_local_isolation {s s₁ : ProtoMachineState} {d loc : Nat}
+    {slot : LocalSlot} (h : writeFrameLocalProto s d loc slot = .some s₁) :
+    currentFrameDepth s₁ = currentFrameDepth s ∧
+    (d = currentFrameDepth s → s₁.memory.callStack = s.memory.callStack) ∧
+    (d < currentFrameDepth s → s₁.frame.locals = s.frame.locals) := by
+  unfold writeFrameLocalProto writeCallerLocalProto at h
+  dsimp only at h
+  split at h
+  · rename_i hd
+    split at h
+    · cases h; exact ⟨rfl, fun _ => rfl, fun hlt => absurd hd (Nat.ne_of_lt hlt)⟩
+    · split at h
+      · split at h <;> cases h
+        exact ⟨rfl, fun _ => rfl, fun hlt => absurd hd (Nat.ne_of_lt hlt)⟩
+      · cases h
+  · rename_i hnd
+    split at h
+    · rename_i hlt
+      split at h
+      · split at h
+        · split at h
+          · rename_i stack' hset2
+            cases h
+            have hlen : stack'.length = s.memory.callStack.length := by
+              unfold set? at hset2
+              split at hset2
+              · cases hset2; exact List.length_set
+              · cases hset2
+            exact ⟨hlen, fun heq => absurd heq hnd, fun _ => rfl⟩
+          · cases h
+        · split at h
+          · split at h <;> cases h
+            exact ⟨rfl, fun heq => absurd heq hnd, fun _ => rfl⟩
+          · cases h
+      · cases h
+    · cases h
+
+theorem commitFrameWriteProto_local_isolation {s s' : ProtoMachineState} {d loc : Nat}
+    {r : Value} {b : List ProtoBorrowEntry}
+    (h : commitFrameWriteProto s d loc r b = .ok s') :
+    currentFrameDepth s' = currentFrameDepth s ∧
+    (d = currentFrameDepth s → s'.memory.callStack = s.memory.callStack) ∧
+    (d < currentFrameDepth s → s'.frame.locals = s.frame.locals) := by
+  unfold commitFrameWriteProto at h
+  cases hw : writeFrameLocalProto s d loc (.init r) with
+  | none => rw [hw] at h; cases h
+  | some s₁ =>
+    rw [hw] at h; cases h
+    have hi := writeFrameLocalProto_local_isolation hw
+    exact ⟨hi.1, hi.2.1, hi.2.2⟩
+
+/-- **End-to-end local-slot frame isolation of `writePlaceProto`**
+(`DIV-MR-CALL-TARGET-LOCAL` + `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`):
+1. Every successful direct write (`projectionHasDeref proj = false`) leaves the entire
+   `callStack` untouched (`s'.memory.callStack = s.memory.callStack`);
+2. Every successful deref write (`⟨loc, .deref :: rest⟩`) whose pointer resolves to `entry`
+   preserves `currentFrameDepth`, leaves `s'.memory.callStack = s.memory.callStack` when
+   `entry.targetFrameDepth = currentFrameDepth s`, and leaves the active callee frame's
+   locals completely untouched (`s'.frame.locals = s.frame.locals`) when mutating a caller
+   frame (`entry.targetFrameDepth < currentFrameDepth s`). -/
+theorem writePlaceProto_frame_local_isolation (cfg : ProtoConfig) (s s' : ProtoMachineState)
+    (loc : Nat) (v : Value) :
+    (∀ proj, projectionHasDeref proj = false →
+      writePlaceProto cfg s ⟨loc, proj⟩ v = .ok s' →
+      currentFrameDepth s' = currentFrameDepth s ∧
+      s'.memory.callStack = s.memory.callStack) ∧
+    (∀ rest ptrVal sz entry,
+      get? s.frame.locals loc = .some (.init (.ptr ptrVal sz)) →
+      lookupProtoBorrow s.memory.borrows ptrVal.tag = .some entry →
+      writePlaceProto cfg s ⟨loc, .deref :: rest⟩ v = .ok s' →
+      currentFrameDepth s' = currentFrameDepth s ∧
+      (entry.targetFrameDepth = currentFrameDepth s →
+        s'.memory.callStack = s.memory.callStack) ∧
+      (entry.targetFrameDepth < currentFrameDepth s →
+        s'.frame.locals = s.frame.locals)) := by
+  constructor
+  · intro proj hnd h
+    have hc : ∃ r b, commitFrameWriteProto s (currentFrameDepth s) loc r b = .ok s' := by
+      unfold writePlaceProto at h
+      split at h
+      · rename_i rest heq; simp only at heq; subst heq; simp [projectionHasDeref] at hnd
+      · simp only [hnd] at h
+        repeat' split at h
+        all_goals first | exact ⟨_, _, h⟩ | cases h
+    obtain ⟨r, b, hc⟩ := hc
+    have hi := commitFrameWriteProto_local_isolation hc
+    exact ⟨hi.1, hi.2.1 rfl⟩
+  · intro rest ptrVal sz entry hloc hlook h
+    have hc : ∃ r b, commitFrameWriteProto s entry.targetFrameDepth entry.targetLocal r b = .ok s' := by
+      unfold writePlaceProto at h
+      simp only [hloc, hlook] at h
+      repeat' split at h
+      all_goals first | exact ⟨_, _, h⟩ | cases h
+    obtain ⟨r, b, hc⟩ := hc
+    exact commitFrameWriteProto_local_isolation hc
+
+/-- **Borrow-table frame isolation of `readPlaceProto`, `StorageLive`/`StorageDead`, and
+`SetDiscriminant`** (`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`):
+1. Every successful deref read `readPlaceProto cfg s ⟨loc, .deref :: rest⟩ = .ok v s'`
+   through `entry` leaves every borrow entry of every frame `≠ entry.targetFrameDepth`
+   unchanged;
+2. Every successful `evalStorageProto` (`StorageLive` / `StorageDead`) and
+   `evalSetDiscriminantProto` in the active frame leaves every borrow entry of every caller
+   frame (`targetFrameDepth ≠ currentFrameDepth s`) unchanged. -/
+theorem readPlaceProto_and_stmt_borrow_frame_isolation (cfg : ProtoConfig)
+    (s s' : ProtoMachineState) (i : Nat) (hi : i < s.memory.borrows.length) :
+    (∀ loc rest v ptrVal sz entry,
+      get? s.frame.locals loc = .some (.init (.ptr ptrVal sz)) →
+      lookupProtoBorrow s.memory.borrows ptrVal.tag = .some entry →
+      readPlaceProto cfg s ⟨loc, .deref :: rest⟩ = .ok v s' →
+      s.memory.borrows[i].targetFrameDepth ≠ entry.targetFrameDepth →
+      s'.memory.borrows[i]? = .some s.memory.borrows[i]) ∧
+    (∀ loc newSlot,
+      evalStorageProto cfg s loc newSlot = .step s' →
+      s.memory.borrows[i].targetFrameDepth ≠ currentFrameDepth s →
+      s'.memory.borrows[i]? = .some s.memory.borrows[i]) ∧
+    (∀ loc variantIdx,
+      evalSetDiscriminantProto cfg s loc variantIdx = .step s' →
+      s.memory.borrows[i].targetFrameDepth ≠ currentFrameDepth s →
+      s'.memory.borrows[i]? = .some s.memory.borrows[i]) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro loc rest v ptrVal sz entry hloc hlook h hd
+    have hb : s'.memory.borrows = accessUpdateProto cfg s.memory.borrows s.memory.activeProtectors
+        .read entry.targetFrameDepth entry.targetLocal
+        (appendProjections entry.targetProjection rest) (.some ptrVal.tag) := by
+      unfold readPlaceProto at h
+      simp only [hloc, hlook] at h
+      repeat' split at h
+      all_goals first | (cases h; rfl) | cases h
+    rw [hb, accessUpdateProto, List.getElem?_map, List.getElem?_eq_getElem hi]
+    dsimp only [Option.map]
+    rw [entryAccessTransitionProto_other_frame _ _ _ _ _ _ _ _ _ hd]
+    rfl
+  · intro loc newSlot h hd
+    have hb : s'.memory.borrows = disableLocalBorrowsProto s.memory.borrows (currentFrameDepth s) loc := by
+      unfold evalStorageProto at h
+      dsimp only at h
+      repeat' split at h
+      all_goals first | (cases h; rfl) | cases h
+    rw [hb, disableLocalBorrowsProto, List.getElem?_map, List.getElem?_eq_getElem hi]
+    dsimp only [Option.map]
+    have hne : Nat.beq s.memory.borrows[i].targetFrameDepth (currentFrameDepth s) = false := by
+      rw [nat_beq_eq_decide]; simp only [hd, decide_eq_false_iff_not, not_false_eq_true]
+    simp only [entryTargetsProto, hne, Bool.false_and]
+  · intro loc variantIdx h hd
+    have hb : s'.memory.borrows = invalidateConflictingBorrowsProto cfg s.memory.borrows
+        s.memory.activeProtectors (currentFrameDepth s) loc .none := by
+      unfold evalSetDiscriminantProto at h
+      dsimp only at h
+      repeat' split at h
+      all_goals first | (cases h; rfl) | cases h
+    rw [hb]
+    exact div_mr_caller_borrow_frame_isolation cfg _ _ _ _ _ _ i hi hd
+
+/-- **Kernel-checked 3-way agreement on `ProvenanceWitness.callerRefMutProtectedMir`**
+(`DIV-MR-CALL-TARGET-LOCAL` companion in `ProvenanceWitness.lean:1528`): passing
+`_2 = &mut _1` to `calleeAdd37RefMutMir` (which performs `Retag([fn entry], _1)` and
+`*_1 = *_1 + 37`) and returning `_3 + _1` yields `.ok (.scalar ⟨84, 4⟩)` in `runMirProto`,
+matching `Mach` and `MachTB` (`callRefMutProtectedRoundTrip_mach_and_tb`), whereas
+unpatched `Trusted` faults with `.ub` (`callRefMutProtected_anneal_ret`). -/
+theorem div_mr_call_ref_mut_protected_roundtrip_agrees :
+    runMirProto MiniRustSpec.Correspondence.ProvenanceWitness.callerRefMutProtectedMir
+      [MiniRustSpec.Correspondence.ProvenanceWitness.calleeAdd37RefMutMir]
+      [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨84, 4⟩) ∧
+    trustedFaults MiniRustSpec.Correspondence.ProvenanceWitness.callerRefMutProtectedMir
+      [MiniRustSpec.Correspondence.ProvenanceWitness.calleeAdd37RefMutMir]
+      [.scalar ⟨5, 4⟩] 25 = true :=
+  ⟨ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel⟩
+
+/-- Simple callee `fn ret_const42() -> u32 { 42 }` used to test `Return` destination
+write borrow invalidation and caller protector enforcement. -/
+def calleeRetConst42Mir : CapturedMir where
+  defPath := "witness::callee_ret_const42"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 42)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller taking `_2 = &_1` (optionally `FnEntry`-protected), calling
+`callee_ret_const42() -> _1` (`caller.destination = _1`), and then reading `*_2` (or `_1`). -/
+def callerRetDestConflictMir (protectBorrow : Bool) : CapturedMir where
+  defPath := "witness::caller_ret_dest_conflict"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, refSharedU32Decl]
+  basicBlocks := [
+    { statements :=
+        [mkStmt (.storageLive 2),
+         mkStmt (.assign (local_ 2) (.ref .shared (local_ 1)))] ++
+        (match protectBorrow with
+         | true => [mkStmt (.retag .fnEntry (local_ 2))]
+         | false => []),
+      terminator := mkTerm (.call (fnDefOp "witness::callee_ret_const42")
+        [] (local_ 1) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0)
+          (.use (.copy (match protectBorrow with | true => local_ 1 | false => derefPlace 2)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`Return` destination write borrow-invalidation & caller-protector canary**:
+when a callee returns and writes `_0` into `caller.destination = _1` (`evalReturnProto` vs
+unpatched `Terminators.lean:3015` `writePlaceValue`):
+1. An unprotected `.frozen` borrow `_2 = &_1` in the caller is disabled by the return
+   write into `_1`, so a subsequent read `*_2` faults with `.ub` in `runMirProto` (whereas
+   unpatched `Trusted.evalTerminator` calls `writePlaceValue` without
+   `invalidateConflictingBorrows` and wrongly returns `42`);
+2. A caller `FnEntry`-protected `.frozen` borrow `_2 = &_1` makes writing the return value
+   into `_1` fault immediately with `.ub` at `Return` in `runMirProto` (whereas unpatched
+   `Trusted.evalTerminator` omits `hasProtectedWriteConflict` on `caller.destination` and
+   wrongly returns `42`). -/
+theorem div_mr_return_destination_invalidation_and_protector_canary :
+    runMirProto (callerRetDestConflictMir false) [calleeRetConst42Mir] [.scalar ⟨5, 4⟩] = .ub ∧
+    trustedRunScalar? (callerRetDestConflictMir false) [calleeRetConst42Mir] [.scalar ⟨5, 4⟩] 20 =
+      .some (42, 4) ∧
+    runMirProto (callerRetDestConflictMir true) [calleeRetConst42Mir] [.scalar ⟨5, 4⟩] = .ub ∧
+    trustedRunScalar? (callerRetDestConflictMir true) [calleeRetConst42Mir] [.scalar ⟨5, 4⟩] 20 =
+      .some (42, 4) :=
+  ⟨ProtoOutcome.eq_ub_of_isUB (by decide +kernel), by decide +kernel,
+   ProtoOutcome.eq_ub_of_isUB (by decide +kernel), by decide +kernel⟩
+
+/-- Protected foreign-write UB coincides with `preventsDeallocation` across all 6
+`TreeBorrowPerm` states (`Places.lean:963` `borrowEntryWriteConflicts entry .none`). -/
+theorem treeBorrowProtectedForeignWriteUB_eq_preventsDeallocation (p : TreeBorrowPerm) :
+    treeBorrowTransitionIsUB (treeBorrowNodeAccess .write .foreignAccess p true) =
+      preventsDeallocation p := by
+  cases p <;> rfl
+
+/-- **Downstream TCB compatibility (`Statements.lean:1945`
+`hasProtectedLocalBorrow_of_hasProtectedWriteConflict`)**: even after exempting `.cell` and
+`.disabled` via `preventsDeallocation`, any direct write protector conflict on `(d, loc)`
+(`hasProtectedWriteConflictProto {} borrows prots d loc .none proj = true`) implies
+`hasProtectedLocalBorrowProto {} borrows prots d loc = true`. -/
+theorem hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto
+    (borrows : List ProtoBorrowEntry) (prots : List Nat) (d loc : Nat)
+    (proj : List ProjectionElem)
+    (h : hasProtectedWriteConflictProto {} borrows prots d loc .none proj = true) :
+    hasProtectedLocalBorrowProto {} borrows prots d loc = true := by
+  unfold hasProtectedWriteConflictProto at h
+  unfold hasProtectedLocalBorrowProto
+  rw [List.any_eq_true] at h ⊢
+  obtain ⟨e, he, hcond⟩ := h
+  refine ⟨e, he, ?_⟩
+  unfold entryAccessTransitionProto at hcond
+  cases hT : entryTargetsProto e d loc with
+  | false => simp [hT] at hcond
+  | true =>
+    cases hO : projectionsOverlap e.targetProjection proj with
+    | false => simp [hT, hO, treeBorrowTransitionIsUB] at hcond
+    | true =>
+      cases hP : isProtectedProto prots e with
+      | false => simp [hP] at hcond
+      | true =>
+        simp only [hT, hO, Bool.and_self, hP, Bool.true_and,
+          treeBorrowProtectedForeignWriteUB_eq_preventsDeallocation] at hcond
+        simp [deallocBlockedBy, hcond]
+
+/-- **Downstream TCB compatibility (`L5_ControlAndCalls.lean:278`
+`hasProtectedLocalBorrow_disableLocalBorrows`)**:
+1. Disabling `(d₁, loc₁)` clears all deallocation-blocking borrows on `(d₁, loc₁)` itself
+   (`hasProtectedLocalBorrowProto = false`, because `preventsDeallocation .disabled = false`);
+2. For any other frame/local `(d₂, loc₂) ≠ (d₁, loc₁)` — or for all `(d₂, loc₂)` when
+   `hasProtectedLocalBorrowProto {} borrows prots d₁ loc₁ = false` (the precondition of
+   `StorageDead(loc₁)` in `evalStmt_storageDead_then_storageLive_revive`) —
+   `disableLocalBorrowsProto` preserves `hasProtectedLocalBorrowProto`. -/
+theorem hasProtectedLocalBorrowProto_disableLocalBorrowsProto
+    (borrows : List ProtoBorrowEntry) (prots : List Nat) (d₁ loc₁ d₂ loc₂ : Nat) :
+    hasProtectedLocalBorrowProto {} (disableLocalBorrowsProto borrows d₁ loc₁) prots d₁ loc₁ = false ∧
+    (((d₁ ≠ d₂ ∨ loc₁ ≠ loc₂) ∨ hasProtectedLocalBorrowProto {} borrows prots d₁ loc₁ = false) →
+      hasProtectedLocalBorrowProto {} (disableLocalBorrowsProto borrows d₁ loc₁) prots d₂ loc₂ =
+        hasProtectedLocalBorrowProto {} borrows prots d₂ loc₂) := by
+  have hself : hasProtectedLocalBorrowProto {} (disableLocalBorrowsProto borrows d₁ loc₁) prots d₁ loc₁ = false := by
+    unfold hasProtectedLocalBorrowProto disableLocalBorrowsProto
+    rw [List.any_map]
+    apply List.any_eq_false.mpr
+    intro e _
+    have hT' : entryTargetsProto { e with perm := .disabled, allocDead := true } d₁ loc₁ =
+        entryTargetsProto e d₁ loc₁ := rfl
+    cases hT : entryTargetsProto e d₁ loc₁ <;>
+      simp [Function.comp, hT, hT', deallocBlockedBy, preventsDeallocation]
+  have hother : d₁ ≠ d₂ ∨ loc₁ ≠ loc₂ →
+      hasProtectedLocalBorrowProto {} (disableLocalBorrowsProto borrows d₁ loc₁) prots d₂ loc₂ =
+        hasProtectedLocalBorrowProto {} borrows prots d₂ loc₂ := by
+    intro hne
+    unfold hasProtectedLocalBorrowProto disableLocalBorrowsProto
+    rw [List.any_map]
+    congr 1; funext e
+    simp only [Function.comp]
+    cases hT1 : entryTargetsProto e d₁ loc₁ with
+    | false => rfl
+    | true =>
+      have hT2 : entryTargetsProto e d₂ loc₂ = false := by
+        unfold entryTargetsProto at hT1 ⊢
+        rw [Bool.and_eq_true, nat_beq_eq_decide, nat_beq_eq_decide,
+          decide_eq_true_eq, decide_eq_true_eq] at hT1
+        rcases hT1 with ⟨rfl, rfl⟩
+        rcases hne with hd | hl
+        · have : Nat.beq e.targetFrameDepth d₂ = false := by rw [nat_beq_eq_decide]; simp [hd]
+          simp [this]
+        · have : Nat.beq e.targetLocal loc₂ = false := by rw [nat_beq_eq_decide]; simp [hl]
+          simp [this]
+      have hT2' : entryTargetsProto { e with perm := .disabled, allocDead := true } d₂ loc₂ = false := hT2
+      simp [hT2, hT2']
+  refine ⟨hself, fun hcond => ?_⟩
+  rcases hcond with hne | hfalse
+  · exact hother hne
+  · by_cases hd : d₁ = d₂
+    · by_cases hl : loc₁ = loc₂
+      · subst hd hl; rw [hself, hfalse]
+      · exact hother (Or.inr hl)
+    · exact hother (Or.inl hd)
 
 end PartAWitnesses
 
@@ -5043,6 +5672,219 @@ theorem roundRatioTiesToEven_overflow_of (f : IeeeFormat) (neg : Bool) (n d : Na
     rw [if_neg' hnot]
     simp only [hs, Nat.le_refl, decide_true, ↓reduceIte, if_pos' hov]
 
+theorem decodeBits_zeroBits (f : IeeeFormat) (neg : Bool) :
+    decodeBits f (zeroBits f neg) = .zero neg := by
+  rw [zeroBits_eq_encodeBits,
+    decodeBits_encodeBits f neg 0 0 (Nat.two_pow_pos _) (Nat.two_pow_pos _),
+    if_neg' (IeeeFormat.max_exp_ne_zero f), if_pos' rfl, if_pos' rfl]
+
+theorem decodeBits_infBits (f : IeeeFormat) (neg : Bool) :
+    decodeBits f (infBits f neg) = .inf neg := by
+  simp only [infBits]
+  have hE : 2 ^ f.exponentBits - 1 < 2 ^ f.exponentBits :=
+    Nat.sub_lt (Nat.two_pow_pos _) (by decide)
+  rw [decodeBits_encodeBits f neg _ 0 hE (Nat.two_pow_pos _), if_pos' rfl, if_pos' rfl]
+
+/-- **Necessary and sufficient (`↔`) overflow characterization for `roundRatioTiesToEven`**
+(strengthens `roundRatioTiesToEven_overflow_of` to a full biconditional): for `0 < n` and
+`0 < d`, `roundRatioTiesToEven f neg n d` equals `infBits f neg` (and equivalently decodes
+to `.inf neg`) **if and only if** the clamped binade `exponent := max (ratioExponent n d)
+f.minExponent` exceeds `f.maxExponent`, or `exponent = f.maxExponent` and the rounded
+significand carries out to `2 ^ (f.fractionBits + 1)`. -/
+theorem roundRatioTiesToEven_overflow_iff (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hn : 0 < n) (hd : 0 < d) :
+    let exponent := max (ratioExponent n d) f.minExponent
+    let scaled := powScale n d ((f.fractionBits : Int) - exponent)
+    let sig := roundQuotientTiesToEven scaled.1 scaled.2
+    (roundRatioTiesToEven f neg n d = infBits f neg ↔
+      (f.maxExponent < exponent ∨ (exponent = f.maxExponent ∧ sig = 2 ^ (f.fractionBits + 1)))) ∧
+    (decodeBits f (roundRatioTiesToEven f neg n d) = .inf neg ↔
+      roundRatioTiesToEven f neg n d = infBits f neg) := by
+  dsimp only
+  have hnot_inf_of_not_ov :
+      ¬ (f.maxExponent < max (ratioExponent n d) f.minExponent) →
+      ¬ (max (ratioExponent n d) f.minExponent = f.maxExponent ∧
+          roundQuotientTiesToEven
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).1
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).2 =
+          2 ^ (f.fractionBits + 1)) →
+      decodeBits f (roundRatioTiesToEven f neg n d) ≠ .inf neg := by
+    intro hno1 hno2 hdec
+    have hd0 : d ≠ 0 := by omega
+    have hn0 : n ≠ 0 := by omega
+    have hmaxE := IeeeFormat.two_bias_lt f
+    have hnez := IeeeFormat.max_exp_ne_zero f
+    obtain ⟨hhi, hlo_ge, hlt_sub⟩ := powScale_roundRatio_scaled_bounds f n d hn hd
+    clear hlt_sub
+    generalize hexp : max (ratioExponent n d) f.minExponent = exponent at hhi hlo_ge hno1 hno2
+    generalize hsc : powScale n d ((f.fractionBits : Int) - exponent) = scaled at hhi hlo_ge hno2
+    have hds : 0 < scaled.2 := by rw [← hsc]; exact powScale_snd_pos_gen n d hd _
+    have hsig_le : roundQuotient .tiesToEven scaled.1 scaled.2 ≤ 2 ^ (f.fractionBits + 1) :=
+      roundQuotient_le_of_lt_mul .tiesToEven scaled.1 scaled.2 _ hds hhi
+    simp only [roundQuotient] at hsig_le
+    unfold roundRatioTiesToEven roundRatioBits at hdec
+    simp only [hd0, hn0, ↓reduceIte, hexp, hsc, roundQuotient] at hdec
+    rw [if_neg' hno1] at hdec
+    generalize hsig : roundQuotientTiesToEven scaled.1 scaled.2 = sig at hsig_le hno2 hdec
+    have hmin_le : f.minExponent ≤ exponent := by
+      rw [← hexp]; exact int_le_max_right _ _
+    by_cases hcarry : 2 ^ (f.fractionBits + 1) ≤ sig
+    · clear hlo_ge hexp hsc hsig
+      have hsig_eq : sig = 2 ^ (f.fractionBits + 1) := by clear hno2 hdec; omega
+      have hexp_ne : exponent ≠ f.maxExponent := fun he => hno2 ⟨he, hsig_eq⟩
+      clear hno2
+      have hov2 : ¬ (exponent + 1 > f.maxExponent) := by clear hdec; omega
+      have hdiv2 : sig / 2 = 2 ^ f.fractionBits := by rw [hsig_eq, Nat.pow_succ]; clear hdec; omega
+      simp only [hcarry, decide_true, ↓reduceIte, hdiv2] at hdec
+      rw [if_neg' hov2] at hdec
+      have hlt_false : ¬ (2 ^ f.fractionBits < 2 ^ f.fractionBits) := Nat.lt_irrefl _
+      have hge_false : ¬ (2 ^ (f.fractionBits + 1) ≤ 2 ^ f.fractionBits) := by
+        have := two_pow_lt_two_pow (Nat.lt_succ_self f.fractionBits); clear hdec; omega
+      rw [if_neg' hlt_false, if_neg' hge_false, Nat.sub_self] at hdec
+      simp only [IeeeFormat.minExponent, IeeeFormat.maxExponent] at hmin_le hov2
+      have hE : (exponent + 1 + (f.bias : Int)).toNat < 2 ^ f.exponentBits := by clear hdec; omega
+      have hEne : ¬ ((exponent + 1 + (f.bias : Int)).toNat = 2 ^ f.exponentBits - 1) := by clear hdec; omega
+      have hE0 : ¬ ((exponent + 1 + (f.bias : Int)).toNat = 0) := by clear hdec; omega
+      rw [decodeBits_encodeBits f neg _ 0 hE (Nat.two_pow_pos _), if_neg' hEne, if_neg' hE0] at hdec
+      cases hdec
+    · clear hno2
+      simp only [hcarry, decide_false, Bool.false_eq_true, ↓reduceIte, hno1] at hdec
+      by_cases hsub : sig < 2 ^ f.fractionBits
+      · rw [if_pos' hsub] at hdec
+        have hexp_min : exponent = f.minExponent := by
+          by_cases hge : f.minExponent ≤ ratioExponent n d
+          · have hge_sig : 2 ^ f.fractionBits ≤ sig := by
+              rw [← hsig]
+              exact roundQuotient_ge_of_mul_le .tiesToEven scaled.1 scaled.2 _ hds (hlo_ge hge)
+            clear hlo_ge hexp hsc hsig hdec; omega
+          · rw [← hexp]; exact int_max_eq_right hge
+        rw [if_pos' hexp_min, decodeBits_encodeBits f neg 0 sig (Nat.two_pow_pos _) hsub,
+          if_neg' hnez, if_pos' rfl] at hdec
+        by_cases hsig0 : sig = 0 <;> simp [hsig0] at hdec
+      · clear hlo_ge hexp hsc hsig
+        rw [if_neg' hsub] at hdec
+        simp only [IeeeFormat.minExponent, IeeeFormat.maxExponent] at hmin_le hno1
+        have hE : (exponent + (f.bias : Int)).toNat < 2 ^ f.exponentBits := by clear hdec; omega
+        have hEne : ¬ ((exponent + (f.bias : Int)).toNat = 2 ^ f.exponentBits - 1) := by clear hdec; omega
+        have hE0 : ¬ ((exponent + (f.bias : Int)).toNat = 0) := by clear hdec; omega
+        have hF : sig - 2 ^ f.fractionBits < 2 ^ f.fractionBits := by
+          have : 2 ^ (f.fractionBits + 1) = 2 * 2 ^ f.fractionBits := by
+            rw [Nat.pow_succ]; clear hdec; omega
+          clear hdec; omega
+        rw [decodeBits_encodeBits f neg _ _ hE hF, if_neg' hEne, if_neg' hE0] at hdec
+        cases hdec
+  have hiff1 : roundRatioTiesToEven f neg n d = infBits f neg ↔
+      (f.maxExponent < max (ratioExponent n d) f.minExponent ∨
+        (max (ratioExponent n d) f.minExponent = f.maxExponent ∧
+          roundQuotientTiesToEven
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).1
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).2 =
+          2 ^ (f.fractionBits + 1))) := by
+    constructor
+    · intro heq
+      have hdec : decodeBits f (roundRatioTiesToEven f neg n d) = .inf neg := by
+        rw [heq, decodeBits_infBits]
+      by_cases hov1 : f.maxExponent < max (ratioExponent n d) f.minExponent
+      · exact Or.inl hov1
+      · by_cases hov2 : max (ratioExponent n d) f.minExponent = f.maxExponent ∧
+            roundQuotientTiesToEven
+              (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).1
+              (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).2 =
+            2 ^ (f.fractionBits + 1)
+        · exact Or.inr hov2
+        · exact absurd hdec (hnot_inf_of_not_ov hov1 hov2)
+    · exact roundRatioTiesToEven_overflow_of f neg n d hn hd
+  refine ⟨hiff1, ?_⟩
+  constructor
+  · intro hdec
+    apply hiff1.mpr
+    by_cases hov1 : f.maxExponent < max (ratioExponent n d) f.minExponent
+    · exact Or.inl hov1
+    · by_cases hov2 : max (ratioExponent n d) f.minExponent = f.maxExponent ∧
+          roundQuotientTiesToEven
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).1
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).2 =
+          2 ^ (f.fractionBits + 1)
+      · exact Or.inr hov2
+      · exact absurd hdec (hnot_inf_of_not_ov hov1 hov2)
+  · intro heq
+    rw [heq, decodeBits_infBits]
+
+/-- **Universal signed-zero & gradual-underflow sign preservation**:
+1. `roundRatioBits mode f neg 0 d = zeroBits f neg` (decoding to `.zero neg`) for every
+   `0 < d`;
+2. Whenever `0 < n`, `0 < d`, and `roundQuotient mode scaled.1 scaled.2 = 0` (gradual
+   underflow past the smallest subnormal), `roundRatioBits mode f neg n d = zeroBits f neg`
+   and `decodeBits f (roundRatioBits mode f neg n d) = .zero neg` (preserving `-0.0` when
+   `neg = true`);
+3. `evalFloatToFloatRoundTiesToEven` preserves `.zero neg` and `.inf neg` (including their
+   sign `neg`) across all source and destination formats;
+4. Concrete negative-finite gradual-underflow canary: `-2^-150` (`0xB690_0000_0000_0000 : f64`)
+   narrows to `-0.0` (`0x8000_0000 : f32`, never `+0.0`), while `-(2^-150 + 2^-202)`
+   (`0xB690_0000_0000_0001 : f64`) narrows to negative smallest subnormal `0x8000_0001 : f32`. -/
+theorem roundRatioBits_sign_and_underflow_zero_preserved :
+    (∀ (mode : RoundingMode) (f : IeeeFormat) (neg : Bool) (d : Nat), 0 < d →
+      roundRatioBits mode f neg 0 d = zeroBits f neg ∧
+        decodeBits f (roundRatioBits mode f neg 0 d) = .zero neg) ∧
+    (∀ (mode : RoundingMode) (f : IeeeFormat) (neg : Bool) (n d : Nat), 0 < n → 0 < d →
+      let exponent := max (ratioExponent n d) f.minExponent
+      let scaled := powScale n d ((f.fractionBits : Int) - exponent)
+      roundQuotient mode scaled.1 scaled.2 = 0 →
+      roundRatioBits mode f neg n d = zeroBits f neg ∧
+        decodeBits f (roundRatioBits mode f neg n d) = .zero neg) ∧
+    (∀ (src dst : IeeeFormat) (bits : Nat) (neg : Bool),
+      decodeBits src bits = .zero neg →
+      decodeBits dst (evalFloatToFloatRoundTiesToEven src dst bits) = .zero neg) ∧
+    (∀ (src dst : IeeeFormat) (bits : Nat) (neg : Bool),
+      decodeBits src bits = .inf neg →
+      decodeBits dst (evalFloatToFloatRoundTiesToEven src dst bits) = .inf neg) ∧
+    f64ToF32 0xB690000000000000#64 = 0x80000000#32 ∧
+    f64ToF32 0xB690000000000001#64 = 0x80000001#32 := by
+  refine ⟨?_, ?_, ?_, ?_, by decide +kernel, by decide +kernel⟩
+  · intro mode f neg d hd
+    have hd0 : d ≠ 0 := by omega
+    have hz : roundRatioBits mode f neg 0 d = zeroBits f neg := by
+      simp [roundRatioBits, hd0]
+    rw [hz]
+    exact ⟨rfl, decodeBits_zeroBits f neg⟩
+  · intro mode f neg n d hn hd
+    dsimp only
+    intro hsig0
+    have hd0 : d ≠ 0 := by omega
+    have hn0 : n ≠ 0 := by omega
+    have hlo_ge := (powScale_roundRatio_scaled_bounds f n d hn hd).2.1
+    generalize hexp : max (ratioExponent n d) f.minExponent = exponent at hlo_ge hsig0
+    generalize hsc : powScale n d ((f.fractionBits : Int) - exponent) = scaled at hlo_ge hsig0
+    have hds : 0 < scaled.2 := by rw [← hsc]; exact powScale_snd_pos_gen n d hd _
+    have hexp_min : exponent = f.minExponent := by
+      by_cases hge : f.minExponent ≤ ratioExponent n d
+      · have hge_sig : 2 ^ f.fractionBits ≤ roundQuotient mode scaled.1 scaled.2 :=
+          roundQuotient_ge_of_mul_le mode scaled.1 scaled.2 _ hds (hlo_ge hge)
+        rw [hsig0] at hge_sig
+        have := Nat.two_pow_pos f.fractionBits
+        clear hlo_ge hexp hsc hds; omega
+      · rw [← hexp]; exact int_max_eq_right hge
+    have hov1 : ¬ (exponent > f.maxExponent) := by
+      rw [hexp_min]
+      cases f <;> decide
+    have hcarry : ¬ (2 ^ (f.fractionBits + 1) ≤ 0) := by
+      cases f <;> decide
+    have hsub : 0 < 2 ^ f.fractionBits := Nat.two_pow_pos _
+    have hr : roundRatioBits mode f neg n d = zeroBits f neg := by
+      unfold roundRatioBits
+      simp only [hd0, hn0, ↓reduceIte, hexp, hsc]
+      rw [if_neg' hov1]
+      simp only [hsig0, hcarry, decide_false, Bool.false_eq_true, ↓reduceIte, hov1]
+      rw [if_pos' hsub, if_pos' hexp_min, ← zeroBits_eq_encodeBits]
+    rw [hr]
+    exact ⟨rfl, decodeBits_zeroBits f neg⟩
+  · intro src dst bits neg h
+    unfold evalFloatToFloatRoundTiesToEven
+    rw [convertFloatBits_of_zero _ _ _ _ _ h, decodeBits_zeroBits]
+  · intro src dst bits neg h
+    unfold evalFloatToFloatRoundTiesToEven
+    rw [convertFloatBits_of_inf _ _ _ _ _ h, decodeBits_infBits]
+
 /-! ### Part B soundness bundles -/
 
 /-- **`evalIntToFloatRoundTiesToEven_sound`**: (1) every representable integer
@@ -5493,6 +6335,46 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioTiesToEven_overflow_of' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms roundRatioTiesToEven_overflow_of
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.div_lm_d6_offset_dead_alloc_lockstep_miri' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms div_lm_d6_offset_dead_alloc_lockstep_miri
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.writePlaceProto_frame_local_isolation' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms writePlaceProto_frame_local_isolation
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.readPlaceProto_and_stmt_borrow_frame_isolation' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms readPlaceProto_and_stmt_borrow_frame_isolation
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.div_mr_call_ref_mut_protected_roundtrip_agrees' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms div_mr_call_ref_mut_protected_roundtrip_agrees
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.div_mr_return_destination_invalidation_and_protector_canary' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms div_mr_return_destination_invalidation_and_protector_canary
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.hasProtectedLocalBorrowProto_disableLocalBorrowsProto' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms hasProtectedLocalBorrowProto_disableLocalBorrowsProto
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioTiesToEven_overflow_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioTiesToEven_overflow_iff
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioBits_sign_and_underflow_zero_preserved' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioBits_sign_and_underflow_zero_preserved
 
 end AxiomGuards
 

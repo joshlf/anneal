@@ -180,6 +180,19 @@ HEADLINE_THEOREMS = (
     "overlay_coverage_canaries",
     "roundRatioTiesToEven_correctly_rounded",
     "roundRatioTiesToEven_overflow_of",
+    # B2: dead-alloc offset lockstep, WitLM3_1 D6 4-witness + storage-revival suite,
+    # local-slot & read/stmt borrow frame isolation, Return destination write invalidation,
+    # downstream TCB compatibility, biconditional overflow, and signed-zero underflow
+    "div_lm_d6_offset_dead_alloc_lockstep_miri",
+    "div_lm_d6_wit_lm3_1_four_witnesses_and_revive_canary",
+    "writePlaceProto_frame_local_isolation",
+    "readPlaceProto_and_stmt_borrow_frame_isolation",
+    "div_mr_call_ref_mut_protected_roundtrip_agrees",
+    "div_mr_return_destination_invalidation_and_protector_canary",
+    "hasProtectedLocalBorrowProto_of_hasProtectedWriteConflictProto",
+    "hasProtectedLocalBorrowProto_disableLocalBorrowsProto",
+    "roundRatioTiesToEven_overflow_iff",
+    "roundRatioBits_sign_and_underflow_zero_preserved",
 )
 
 
@@ -662,6 +675,7 @@ def build_vectors(seed: int = 585733184):
         0, 1 << 63, 0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000,
         0x7FF0000000000001, 0xFFF8000000000123, 0x7FEFFFFFFFFFFFFF, 0x0000000000000001,
         0x000FFFFFFFFFFFFF, 0x0010000000000000, 0x3690000000000000, 0x3690000000000001,
+        0xB690000000000000, 0xB690000000000001,
         0x36A8000000000000, 0x47EFFFFFF0000000, 0x47EFFFFFEFFFFFFF, 0x3FF0000010000000,
         0x3FF0000030000000, 0x3FD5555555555555, 0x380000005FFFFFFF, 0x380FFFFFDFFFFFFF,
         0x380FFFFFE0000000,
@@ -1012,6 +1026,9 @@ class Ieee754DifferentialTests(unittest.TestCase):
         self.assertEqual(f2f_ref("binary64", "binary32", 0x380000005FFFFFFF), 0x00400001)
         self.assertEqual(f2f_ref("binary64", "binary32", 0x380FFFFFDFFFFFFF), 0x007FFFFF)
         self.assertEqual(f2f_ref("binary64", "binary32", 0x380FFFFFE0000000), 0x00800000)
+        # Negative finite gradual underflow to -0.0 vs negative smallest subnormal
+        self.assertEqual(f2f_ref("binary64", "binary32", 0xB690000000000000), 0x80000000)
+        self.assertEqual(f2f_ref("binary64", "binary32", 0xB690000000000001), 0x80000001)
         # u64 -> f32 direct vs u64 -> f64 -> f32 double-rounding
         self.assertEqual(i2f_ref(False, 64, 0x400000BFFFFFFF, "binary32"), 0x5A800001)
         self.assertEqual(
