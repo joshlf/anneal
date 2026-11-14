@@ -618,6 +618,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             assert f"[{subrule}]" in str(err) and "trusted/lean/Trusted.lean" in str(err), str(err)
         err = checked(fixture(header + vacuous), expected=1, phase="vacuity-audit", executed=False)
         assert "[syntactic_contradiction_hypothesis]" in str(err), str(err)
+        # `cmd in decl` is one command: a `set_option ... in` prefix added above a pinned
+        # declaration's docstring drifts its pin (the prefix is part of the pin pre-image).
+        err = checked(fixture(header + "set_option maxHeartbeats 1 in\n" + pinned), expected=1,
+                      phase="waiver-pin", executed=False)
+        assert "[drifted_waiver_pin]" in str(err), str(err)
         err_unann = checked(
             fixture(header + "theorem unannotatedVac (n : Nat) (h : 0 = 1) : n = 99 := by omega\n"),
             expected=1,

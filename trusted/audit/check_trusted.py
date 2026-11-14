@@ -4200,6 +4200,10 @@ def _lean_docstring_lines(c_list: list[tuple[int, str, str]], kind: str = "d") -
 _3AXIS_KEYS = frozenset(("kind", "witness", "assumes", "subject"))
 _META_CACHE: dict[str, tuple[dict[str, str], list[str]]] = {}
 _THM_AUDIT_CACHE: dict[tuple[str, str, str, bool], tuple[WaiverPinFinding, ...]] = {}
+# In-process incremental splicing (`_find_incremental_lean_window`): only a long-lived process
+# re-scanning edited files (the LSP daemon, a hook's before/after pair) benefits. A host that audits
+# every file once -- the TCB checker -- turns it off, keeping the splice logic out of its decisions.
+INCREMENTAL_SPLICING = True
 _LAST_LEAN_AUDIT: dict[
     tuple[str, bool, str],
     tuple[str, str, list[int], list[int], list[int], tuple[WaiverPinFinding, ...]],
@@ -4283,6 +4287,7 @@ def _find_incremental_lean_window(
                 or prev_line.startswith("where ")
                 or prev_line.endswith(" where")
                 or prev_line.endswith(" in")
+                or prev_line == "in"
                 or any(
                     prev_line == mod or prev_line.startswith(mod + " ") or prev_line.endswith(" " + mod)
                     for mod in _LEAN_MODIFIERS
@@ -4451,7 +4456,7 @@ def audit_lean_text(
         bool(check_3axis),
         vacuity_scope,
     )
-    if _preparsed is None and len(text) >= 32768:
+    if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
         prev = _LAST_LEAN_AUDIT.get(state_key)
         if prev is not None:
             old_text, old_code, c_starts, c_ends, col0_thms, old_findings = prev
@@ -4604,9 +4609,15 @@ def audit_lean_text(
             decl_comment_map[kw_off] = meta_text
         if comment_starts is None:
             comment_starts = [c[0] for c in comment_blocks]
+        # `<command> in` prefixes above the docstring belong to the pinned command.
+        p_start = _lean_in_prefix_start(code_only, grp_start)
         hash_input = waiver_hash_input(
             anns,
-            _normalize_lean_decl(_no_comments_slice(text, comment_blocks, comment_starts, d_start, d_end)),
+            _normalize_lean_decl(
+                _no_comments_slice(
+                    text, comment_blocks, comment_starts, p_start if p_start < grp_start else d_start, d_end
+                )
+            ),
         )
         findings.extend(_validate_waiver_block(anns, block_pins, d_name, hash_input))
 
@@ -4690,7 +4701,7 @@ def audit_lean_text(
                     )
 
     findings.sort(key=lambda f: (f.line, f.rule, f.symbol))
-    if _preparsed is None and len(text) >= 32768:
+    if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
         if not thms:
             thms = _iter_lean_theorem_headers(code_only)
         col0_thms = [kw for kw, _, _ in thms if kw == 0 or code_only[kw - 1] == "\n"]
@@ -4708,6 +4719,43 @@ def audit_lean_text(
     return findings
 
 
+_LEAN_IN_SUFFIX_RE = re.compile(r"(?<![\w'!?.\u00bb])in[ \t\r]*$")
+
+
+def _lean_in_prefix_start(code_only: str, pos: int) -> int:
+    """Start of the chain of `<command> in` prefixes (`open Foo in`, `set_option opt v in`,
+    `attribute [local simp] x in`, `variable (n : Nat) in`, ...) ending right before `pos` (a
+    declaration's leading docstring or its first token), else `pos`.
+
+    Lean parses `cmd in decl` as one command, so a waiver pin must bind these prefixes too:
+    otherwise `set_option debug.skipKernelTC true in` (or `open Other in`, re-resolving every
+    name of the statement) could be added before or edited above a pinned declaration's
+    docstring without drifting its pin. A prefix may span several lines; its first line is the
+    nearest command start above the `in` line (bounded walk, over-including when unbounded).
+    """
+    start = pos
+    while True:
+        q = start
+        while q > 0 and code_only[q - 1] in " \t\r\n":
+            q -= 1
+        if q == 0:
+            return start
+        line_start = code_only.rfind("\n", 0, q) + 1
+        if _LEAN_IN_SUFFIX_RE.search(code_only, line_start, q) is None:
+            return start
+        cmd = line_start
+        for _ in range(64):
+            k = cmd
+            while k < q and code_only[k] in " \t":
+                k += 1
+            if cmd == 0 or _is_lean_command_start(code_only, k):
+                break
+            cmd = code_only.rfind("\n", 0, cmd - 1) + 1
+        if cmd >= start:
+            return start
+        start = cmd
+
+
 def compute_lean_decl_pins(text: str) -> dict[str, str]:
     """Map each top-level Lean declaration name in `text` to its `pin:sha256:<12hex>` tag
     (the hash binds the declaration's `/-- -/` directives and its normalized text)."""
@@ -4715,12 +4763,14 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
     comment_starts = [c[0] for c in comment_blocks]
     n = len(code_only)
     anns_by_decl: dict[int, list[WaiverAnnotation]] = {}
-    for _, grp_end, c_list in _lean_comment_groups(code_only, comment_blocks):
+    grp_start_by_decl: dict[int, int] = {}
+    for grp_start, grp_end, c_list in _lean_comment_groups(code_only, comment_blocks):
         d = grp_end
         while d < n and code_only[d] in " \t\r\n":
             d += 1
         anns, _ = _collect_block_directives(_lean_docstring_lines(c_list, "d"))
         anns_by_decl[d] = anns
+        grp_start_by_decl[d] = grp_start
     pins: dict[str, str] = {}
     pos = 0
     while pos < n:
@@ -4738,9 +4788,15 @@ def compute_lean_decl_pins(text: str) -> dict[str, str]:
             continue
         hdr_end, _, d_name = hit
         d_end = _find_lean_decl_end(code_only, hdr_end, _lean_indent_of(code_only, d_start, text), text)
+        lead = grp_start_by_decl.get(d_start, d_start)
+        p_start = _lean_in_prefix_start(code_only, lead)
         hash_input = waiver_hash_input(
             anns_by_decl.get(d_start, []),
-            _normalize_lean_decl(_no_comments_slice(text, comment_blocks, comment_starts, d_start, d_end)),
+            _normalize_lean_decl(
+                _no_comments_slice(
+                    text, comment_blocks, comment_starts, p_start if p_start < lead else d_start, d_end
+                )
+            ),
         )
         pins[d_name] = format_pin_tag(compute_sha256_pin12(hash_input))
         pos = d_end
@@ -4803,6 +4859,9 @@ BASE_SNAPSHOT_PHASE = "base-snapshot"
 _WAIVER_RULE_SET = frozenset(ALL_WAIVER_RULES)
 _MAX_REPORTED_FINDINGS = 5
 _WRITE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+# The TCB checker audits every staged file exactly once per process, so findings are never
+# spliced from an earlier scan: each audit is a cold, full pass over the exact staged bytes.
+INCREMENTAL_SPLICING = False
 
 
 def audit_waivers_and_vacuity(

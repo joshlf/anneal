@@ -67,7 +67,9 @@ one in `tools/anneal-lsp/server/proof_health.py`) the `S0`-`S3` waiver auditor:
   grammar) in staged `trusted/lean/**/*.lean`, `trusted/rustc-capture/**/*.rs`,
   staged `DOWNSTREAM_TARGETS`, and `CaptureManifest.json` `rust_sources` /
   `Mir/<Item>.lean` targets must carry a standalone `pin:sha256:<12hex>` doc line
-  whose pre-image (canonical directives + normalized item) still matches. Unpinned,
+  whose pre-image (canonical directives + normalized item, including any Lean
+  `<command> in` prefixes such as `set_option ... in` above the docstring, since
+  `cmd in decl` is one command) still matches. Unpinned,
   malformed, drifted, dangling (module-doc), and unauditable (computed `#[doc]`)
   waivers fail. `python3 tools/anneal-lsp/server/proof_health.py --compute-pins FILE`
   prints the expected pins.
@@ -88,3 +90,10 @@ one in `tools/anneal-lsp/server/proof_health.py`) the `S0`-`S3` waiver auditor:
   with `--expected-tcb-drift RELPATH`.
 - **`--audit-vacuity`:** runs only the pure-Python waiver and vacuity audit over the
   checkout (no Lean process).
+- **`CaptureManifest.json` paths:** relative `rust_sources` must not climb above the
+  manifest root; absolute entries (rustc-capture records primary-package sources outside
+  its working directory that way) are digest-checked as recorded and audited as Rust
+  whatever their extension; `mir_module_path` must be a relative `.lean` path inside the
+  root. Final-component symlinks are rejected for both.
+- The embedded auditor never splices findings across scans here
+  (`INCREMENTAL_SPLICING = False`): every staged file gets one cold, full audit.

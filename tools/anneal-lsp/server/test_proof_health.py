@@ -3876,13 +3876,18 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
         "set_option trace.profiler.threshold 1\n", "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n",
         "where\n  aux : Nat := 1\n", "@[simp] ", "  ", 'r#"', '"#', 's!"{', '}"',
         "/-! anneal:documented_intent m -/\n", " := by\n  rfl\n",
+        # `[adv ep2-A2]` boundary classes: modifiers / attributes between a docstring and its
+        # theorem, metadata separated by blank lines, and quotes inside comments.
+        "noncomputable\n", "@[simp]\n", "private ", "open Foo in\n", '/-- " -/', '-- " quote\n',
+        "\n\n\n\n\n", "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n\n\n\n",
+        "@[aesop safe\n  [constructors]]\n", '/- " -/', "where\n/- c -/  def helper : Nat := 1\n",
     ]
 
     @staticmethod
     def _corpus(rnd) -> str:
         parts = []
         for i in range(170):
-            kind = rnd.randrange(6)
+            kind = rnd.randrange(9)
             doc = "/-- " + "long docstring words " * rnd.randint(1, 6) + "-/\n" if rnd.random() < 0.7 else ""
             if kind == 0:
                 parts.append(doc + f"theorem t{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n")
@@ -3894,8 +3899,20 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
                 parts.append(doc + f"def d{i} : Nat :=\n  {i}\n\n")
             elif kind == 4:
                 parts.append(doc + f"theorem s{i} : True := by\n  simp [foo{i}]\n\n")
-            else:
+            elif kind == 5:
                 parts.append(f"/- plain comment {i} -/\ntheorem c{i} (x : Nat) (hx : x < x) : True := trivial\n\n")
+            elif kind == 6:
+                parts.append(doc + f"noncomputable\ntheorem nc{i} (n : Nat) (h : 2 = 3) : n = n := rfl\n\n")
+            elif kind == 7:
+                parts.append(
+                    f"/-- anneal:documented_intent kept {i}\npin:sha256:0123456789ab\n-/\n@[simp]\n"
+                    f"theorem pw{i} : True := trivial\n\n"
+                )
+            else:
+                parts.append(
+                    "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n\n\n\n" + " " * 70
+                    + f"\ntheorem far{i} (n : Nat) : n = n := rfl\n\n"
+                )
         text = "".join(parts)
         return text if len(text) >= 32768 else text + text
 
@@ -3961,6 +3978,57 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
                         mismatches.append((trial, step, pos))
         self.assertEqual(mismatches, [])
         self.assertGreaterEqual(sum(windows), 10, "too few incremental windows exercised")
+
+    def test_command_in_prefixes_are_bound_by_waiver_pins(self) -> None:
+        # `cmd in decl` is one Lean command: prefixes above a pinned declaration's docstring
+        # (including multi-line and chained ones) are part of the pin pre-image, so editing or
+        # adding one drifts the pin, while edits to neighbouring declarations do not.
+        body = "/-- anneal:documented_intent kept\nPIN\n-/\ntheorem t : True := trivial\n"
+        for prefix, old, new in (
+            ("open Foo in\n", "open Foo in", "open Bar in"),
+            ("set_option debug.skipKernelTC false in\n", "false in", "true in"),
+            ("attribute [local simp] foo in\n", "foo in", "bar in"),
+            ("variable (n : Nat) in\n", "(n : Nat) in", "(n : Int) in"),
+            ("open Foo in\nset_option pp.all true in\n", "open Foo in", "open Bar in"),
+            ("set_option maxHeartbeats\n  400000 in\n", "400000 in", "1 in"),
+        ):
+            draft = "def before : Nat := 0\n\n" + prefix + body + "\ndef after : Nat := 1\n"
+            pinned = draft.replace("PIN", audit.compute_lean_decl_pins(draft.replace("PIN\n", ""))["t"])
+            self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [], prefix)
+            self.assertEqual(
+                _rules(audit.scan_lean_text(pinned.replace(old, new, 1), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                prefix,
+            )
+            neighbours = pinned.replace("before : Nat := 0", "before : Nat := 5").replace("after : Nat := 1", "after : Nat := 7")
+            self.assertEqual(audit.scan_lean_text(neighbours, check_3axis=False), [], prefix)
+        plain = body.replace("PIN", audit.compute_lean_decl_pins(body.replace("PIN\n", ""))["t"])
+        self.assertEqual(audit.scan_lean_text(plain, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text("set_option debug.skipKernelTC true in\n" + plain, check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+        ct = _load_check_trusted()
+        prefixed = "open Foo in\nset_option pp.all true in\n" + plain
+        self.assertEqual(ct.compute_lean_decl_pins(prefixed), proof_health.compute_lean_decl_pins(prefixed))
+
+    def test_check_trusted_never_splices_incremental_findings(self) -> None:
+        ct = _load_check_trusted()
+        self.assertIs(ct.INCREMENTAL_SPLICING, False)
+        self.assertIs(proof_health.INCREMENTAL_SPLICING, True)
+        import random
+
+        text = self._corpus(random.Random(5))
+        edited = text.replace(" := Nat.add_zero n", ' := "Nat.add_zero n', 1)
+        first = [(f.rule, f.line, f.symbol) for f in ct.audit_lean_text(text, file_path="G.lean")]
+        second = [(f.rule, f.line, f.symbol) for f in ct.audit_lean_text(edited, file_path="G.lean")]
+        self.assertFalse(ct._LAST_LEAN_AUDIT)
+        proof_health.clear_in_process_caches()
+        self.assertEqual(first, [(f.rule, f.line, f.symbol) for f in proof_health.audit_lean_text(text, file_path="G.lean")])
+        proof_health.clear_in_process_caches()
+        self.assertEqual(
+            second, [(f.rule, f.line, f.symbol) for f in proof_health.audit_lean_text(edited, file_path="G.lean")]
+        )
 
     def test_body_line_after_column0_comment_tail_never_ends_pinned_span(self) -> None:
         # `/- comment` opened at column 0 closes at the start of an indented `where` member: the
