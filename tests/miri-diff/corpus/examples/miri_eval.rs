@@ -192,6 +192,54 @@ fn main() {
             print_u32(pass_option_some_niche_and_single_c_mut())
         }
 
+        // Category 9: Move-deinit borrow invariance, two-stage FnEntry protector release,
+        // multi-callee chains, and inline scalar & memory intrinsics
+        "pass_move_deinit_preserves_reserved_child" => {
+            print_u32(pass_move_deinit_preserves_reserved_child())
+        }
+        "pass_move_deinit_subplace_preserves_sibling_frozen" => {
+            print_u32(pass_move_deinit_subplace_preserves_sibling_frozen())
+        }
+        "ub_move_deinit_read_source_uninit" => print_u32(ub_move_deinit_read_source_uninit()),
+        "ub_assign_after_reborrow_disables_child" => {
+            print_u32(ub_assign_after_reborrow_disables_child())
+        }
+        "pass_fn_entry_protector_two_stage_reborrow_chain" => {
+            print_u32(pass_fn_entry_protector_two_stage_reborrow_chain())
+        }
+        "pass_fn_entry_shared_reborrow_chain" => print_u32(pass_fn_entry_shared_reborrow_chain()),
+        "ub_frozen_reborrow_write_in_callee_frame" => {
+            print_u32(ub_frozen_reborrow_write_in_callee_frame())
+        }
+        "panic_multi_callee_unwind_chain" => print_u32(panic_multi_callee_unwind_chain()),
+        "pass_fn_entry_returns_reborrowed_child" => {
+            print_u32(pass_fn_entry_returns_reborrowed_child())
+        }
+        "panic_multi_callee_unwind_cleanup_guard" => {
+            print_u32(panic_multi_callee_unwind_cleanup_guard())
+        }
+        "pass_intrinsics_bit_count_and_reverse" => {
+            print_u32(pass_intrinsics_bit_count_and_reverse())
+        }
+        "pass_intrinsics_saturating_and_wrapping" => {
+            print_u32(pass_intrinsics_saturating_and_wrapping())
+        }
+        "pass_intrinsics_three_way_compare_and_exact_div" => {
+            print_u32(pass_intrinsics_three_way_compare_and_exact_div())
+        }
+        "pass_intrinsics_write_bytes_copy_and_arith_offset" => {
+            print_u32(pass_intrinsics_write_bytes_copy_and_arith_offset())
+        }
+        "ub_ctlz_nonzero_zero" => print_u32(ub_ctlz_nonzero_zero()),
+        "ub_cttz_nonzero_zero" => print_u32(ub_cttz_nonzero_zero()),
+        "ub_exact_div_non_exact_u32" => print_u32(ub_exact_div_non_exact_u32()),
+        "ub_exact_div_signed_min_overflow_i8" => {
+            print_i32(ub_exact_div_signed_min_overflow_i8())
+        }
+        "ub_copy_nonoverlapping_partial_overlap_array" => {
+            print_u32(ub_copy_nonoverlapping_partial_overlap_array())
+        }
+
         other => {
             eprintln!("unknown test: {other}");
             std::process::exit(2);

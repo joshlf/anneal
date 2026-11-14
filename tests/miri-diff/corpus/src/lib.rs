@@ -880,3 +880,374 @@ pub fn pass_option_some_niche_and_single_c_mut() -> u32 {
         SingleC::Only(v) => v,
     }
 }
+
+// ============================================================================
+// Category 9: `Operand::Move` Deinitialization Borrow-Tree Invariance,
+// `RetagKind::FnEntry` Reference Arguments Across `#[inline(never)]`
+// Multi-Callee Chains (Including an `UnwindAction::Cleanup` Unwind Edge), and
+// Inline Scalar & Memory Intrinsics.
+//
+// The call-chain helpers below carry `__ANNEAL_MODEL_<name>` markers, so the
+// differential suite links their captured bodies as intra-crate callees rather
+// than treating them as standalone zero-argument test entry points.
+//
+// Inside a callee, Anneal resolves any pointer into the caller's frame against
+// the callee's own locals (see "Category 9 engine gaps" in
+// `tests/miri-diff/README.md`; `miri_difftest_oracle.rs` pins each gap with
+// live kernel confirmation). Every helper here therefore takes its
+// `FnEntry`-protected reference without dereferencing it, and only forwards or
+// returns reborrows of it: these seeds check reference-argument passing,
+// reborrow return, frame cleanup, and unwinding, not protector enforcement.
+// ============================================================================
+
+use core::intrinsics::{
+    arith_offset, bitreverse, bswap, ctlz, ctlz_nonzero, ctpop, cttz, cttz_nonzero, saturating_add,
+    saturating_sub, three_way_compare, wrapping_add, wrapping_mul, wrapping_sub,
+};
+
+#[repr(C)]
+pub struct NonCopyU32(pub u32);
+
+#[repr(C)]
+pub struct NonCopyPairU32 {
+    pub a: NonCopyU32,
+    pub b: u32,
+}
+
+/// Byte-fill emulation of `write_bytes(dst, val, count)` for `*mut u32`
+/// destinations, built from `transmute`, `offset`, and `copy_nonoverlapping`.
+///
+/// `core::intrinsics::write_bytes` is not one of the intrinsics that Anneal's
+/// `MirSemantics` interprets inline (`classifyRustIntrinsic?`), so a direct call
+/// would stop at an uninterpreted external call; the emulation keeps the byte
+/// pattern observable to both Miri and Anneal.
+#[allow(unused_macros)]
+macro_rules! write_bytes {
+    ($dst:expr, $val:expr, $count:expr) => {{
+        let __wb_dst: *mut u32 = $dst;
+        let __wb_b: u8 = $val;
+        let __wb_cnt: usize = $count;
+        let __wb_pat: u32 = transmute::<[u8; 4], u32>([__wb_b, __wb_b, __wb_b, __wb_b]);
+        let mut __wb_i: usize = 0;
+        while __wb_i < __wb_cnt {
+            let __wb_slot: *mut u32 = offset(__wb_dst, __wb_i as isize);
+            copy_nonoverlapping(&raw const __wb_pat, __wb_slot, 1);
+            __wb_i += 1;
+        }
+    }};
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_leaf: &str = "helper_reborrow_leaf";
+/// Depth-2 leaf of the `helper_reborrow_mid` chain.
+#[inline(never)]
+pub fn helper_reborrow_leaf(v: u32) -> u32 {
+    v
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_mid: &str = "helper_reborrow_mid";
+/// Takes an `FnEntry`-protected `&mut u32` (Miri retags and protects it on
+/// entry and releases the protector on return) and calls `helper_reborrow_leaf`
+/// while the protector is active. It does not dereference `_r` (see the
+/// Category 9 header).
+#[inline(never)]
+pub fn helper_reborrow_mid(_r: &mut u32, _extra: u32) -> u32 {
+    helper_reborrow_leaf(22u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_reborrow_return: &str = "helper_reborrow_return";
+/// Returns a reborrowed child of its `FnEntry`-protected `&mut u32` argument;
+/// the child outlives the callee frame and its protector.
+#[inline(never)]
+pub fn helper_reborrow_return(r: &mut u32) -> &mut u32 {
+    &mut *r
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_shared_leaf: &str = "helper_shared_leaf";
+/// Depth-2 leaf of the `helper_shared_mid` chain.
+#[inline(never)]
+pub fn helper_shared_leaf(v: u32) -> u32 {
+    v
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_shared_mid: &str = "helper_shared_mid";
+/// Takes an `FnEntry`-protected `&u32` and calls `helper_shared_leaf` while the
+/// protector is active, without dereferencing `_r`.
+#[inline(never)]
+pub fn helper_shared_mid(_r: &u32, _bonus: u32) -> u32 {
+    helper_shared_leaf(25u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_frozen_reborrow_write_in_callee: &str =
+    "helper_frozen_reborrow_write_in_callee";
+/// Tree Borrows UB confined to the callee's own frame: a `&mut` reborrow of
+/// the by-value parameter `slot` is activated by a write, frozen by a read
+/// through the parent raw pointer, and then written again. No reference
+/// argument or `FnEntry` protector is involved.
+#[inline(never)]
+pub fn helper_frozen_reborrow_write_in_callee(mut slot: u32) -> u32 {
+    let raw: *mut u32 = &raw mut slot;
+    let r: &mut u32 = unsafe { &mut *raw };
+    *r = helper_reborrow_leaf(55u32);
+    let _ = unsafe { *raw };
+    *r = 99u32;
+    *r
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_leaf: &str = "helper_unwind_leaf";
+/// Panics (`attempt to add with overflow`) when `base + delta` overflows.
+#[inline(never)]
+pub fn helper_unwind_leaf(base: u32, delta: u32) -> u32 {
+    base + delta
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_mid: &str = "helper_unwind_mid";
+/// Calls the overflowing `helper_unwind_leaf(u32::MAX, 1)` while holding an
+/// `FnEntry`-protected `&u32`, so the panic unwinds through two frames.
+#[inline(never)]
+pub fn helper_unwind_mid(_protected: &u32, _base: u32) -> u32 {
+    helper_unwind_leaf(u32::MAX, 1u32)
+}
+
+/// Guard with an empty `Drop` impl, since Anneal never runs `Drop::drop` bodies:
+/// while one is live, a call unwinds through an `UnwindAction::Cleanup` landing pad.
+pub struct UnwindCleanupGuard(pub u32);
+
+impl Drop for UnwindCleanupGuard {
+    fn drop(&mut self) {}
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_helper_unwind_guarded: &str = "helper_unwind_guarded";
+/// Calls `helper_unwind_leaf(base, delta)` while an `UnwindCleanupGuard` is
+/// live, so the call unwinds through an `UnwindAction::Cleanup` landing pad.
+#[inline(never)]
+pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {
+    let _guard = UnwindCleanupGuard(base);
+    helper_unwind_leaf(base, delta)
+}
+
+/// `Operand::Move` deinitialization borrow-tree invariance: moving a non-`Copy`
+/// wrapper does not emit a foreign `.Write`, so a prior `Reserved` `&mut u32`
+/// child borrow remains `Reserved` and can re-initialize the moved place.
+pub fn pass_move_deinit_preserves_reserved_child() -> u32 {
+    let mut x = NonCopyU32(10u32);
+    let root: *mut NonCopyU32 = &raw mut x;
+    let r: &mut NonCopyU32 = unsafe { &mut *root };
+    let moved: NonCopyU32 = x;
+    *r = NonCopyU32(32u32);
+    (*r).0 + moved.0
+}
+
+/// `Operand::Move` sub-place deinitialization: moving field `a` leaves an
+/// active `Frozen` shared borrow on sibling field `b` valid.
+pub fn pass_move_deinit_subplace_preserves_sibling_frozen() -> u32 {
+    let p = NonCopyPairU32 {
+        a: NonCopyU32(20u32),
+        b: 30u32,
+    };
+    let r_b: &u32 = &p.b;
+    let moved_a: NonCopyU32 = p.a;
+    moved_a.0 + *r_b
+}
+
+/// Reading a moved-from source place through a raw pointer once its storage is
+/// dead is UB in both Miri and Anneal.
+///
+/// Miri evaluates `Operand::Move` like `Operand::Copy` and leaves the source
+/// bytes initialized, while Anneal de-initializes them, so a raw read of `x`
+/// while `x` is still in scope (after `let moved = x;`) passes in Miri but is UB
+/// in Anneal (a sound conservative `false_positive_ub`, pinned in
+/// `miri_difftest_oracle.rs`). Ending `x`'s scope (`StorageDead`) before the
+/// read makes the read UB under both semantics.
+pub fn ub_move_deinit_read_source_uninit() -> u32 {
+    let (raw, moved) = {
+        let x = NonCopyU32(15u32);
+        let raw: *const u32 = &raw const x.0;
+        let moved: NonCopyU32 = x;
+        (raw, moved)
+    };
+    let leaked: u32 = unsafe { *raw };
+    moved.0 + leaked
+}
+
+/// Contrasting parent assignment vs. `Operand::Move`: an explicit assignment
+/// `x = NonCopyU32(...)` emits a foreign `.Write` that disables an active child
+/// borrow before subsequent child use.
+pub fn ub_assign_after_reborrow_disables_child() -> u32 {
+    let mut x = NonCopyU32(10u32);
+    let root: *mut NonCopyU32 = &raw mut x;
+    let r: &mut u32 = unsafe { &mut (*root).0 };
+    *r = 11u32;
+    let seen: u32 = *r;
+    x = NonCopyU32(seen + 1u32);
+    let after: u32 = x.0;
+    *r = after + 87u32;
+    x.0
+}
+
+/// A raw-derived `&mut u32` is reborrowed into the depth-2 `#[inline(never)]`
+/// chain `helper_reborrow_mid` -> `helper_reborrow_leaf` (Miri protects the
+/// reborrow for the duration of the call and releases the protector on return),
+/// then written through the child and the parent raw pointer after the callee
+/// frames are gone.
+pub fn pass_fn_entry_protector_two_stage_reborrow_chain() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let r0: &mut u32 = unsafe { &mut *raw };
+    let delta: u32 = helper_reborrow_mid(r0, 7u32);
+    *r0 = 20u32;
+    unsafe {
+        *raw = *r0 + delta;
+        *raw
+    }
+}
+
+/// A shared `&u32` passes through the `FnEntry`-protected depth-2 chain
+/// `helper_shared_mid` -> `helper_shared_leaf`; once the call returns, writing
+/// the parent local is legal.
+pub fn pass_fn_entry_shared_reborrow_chain() -> u32 {
+    let mut x: u32 = 19u32;
+    let r_shared: &u32 = &x;
+    let read_val: u32 = helper_shared_mid(r_shared, 3u32);
+    x = read_val;
+    x
+}
+
+/// After the `helper_reborrow_mid` chain returns (releasing its protector), the
+/// result is passed by value to `helper_frozen_reborrow_write_in_callee`, whose
+/// write through a frozen callee-local reborrow is UB inside the callee frame.
+pub fn ub_frozen_reborrow_write_in_callee_frame() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw_alias: *mut u32 = &raw mut x;
+    let delta: u32 = helper_reborrow_mid(unsafe { &mut *raw_alias }, 1u32);
+    unsafe {
+        *raw_alias = delta;
+    }
+    helper_frozen_reborrow_write_in_callee(unsafe { *raw_alias })
+}
+
+/// Unwinding panic across a depth-2 `#[inline(never)]` helper call chain with
+/// an `FnEntry`-protected reference argument (`UnwindAction::Continue` edges).
+pub fn panic_multi_callee_unwind_chain() -> u32 {
+    let x: u32 = 1u32;
+    helper_unwind_mid(&x, u32::MAX)
+}
+
+/// A reborrowed child returned by `helper_reborrow_return` outlives the callee
+/// frame and its released `FnEntry` protector: the caller writes through the
+/// child, and a later parent write disables the (dead) child without UB.
+pub fn pass_fn_entry_returns_reborrowed_child() -> u32 {
+    let mut x: u32 = 3u32;
+    let child: &mut u32 = helper_reborrow_return(&mut x);
+    *child = *child + 4u32;
+    x = x + 1u32;
+    x
+}
+
+/// Unwinding panic whose depth-2 call edge `helper_unwind_guarded` ->
+/// `helper_unwind_leaf` is `UnwindAction::Cleanup`: the landing pad drops the
+/// live `UnwindCleanupGuard` before the panic propagates to the caller.
+pub fn panic_multi_callee_unwind_cleanup_guard() -> u32 {
+    let start: u32 = u32::MAX;
+    helper_unwind_guarded(start, 1u32)
+}
+
+/// Inline bit-counting and byte/bit-reversal intrinsics (`ctlz`, `ctlz_nonzero`,
+/// `cttz`, `cttz_nonzero`, `ctpop`, `bswap`, `bitreverse`).
+pub fn pass_intrinsics_bit_count_and_reverse() -> u32 {
+    let v: u32 = 0x00F0_0800u32;
+    let lz: u32 = ctlz(v);
+    let lz_nz: u32 = unsafe { ctlz_nonzero(v) };
+    let tz: u32 = cttz(v);
+    let tz_nz: u32 = unsafe { cttz_nonzero(v) };
+    let pop: u32 = ctpop(v);
+    let swapped: u32 = bswap(0x0102_0304u32);
+    let rev_back: u32 = bitreverse(bitreverse(9u32));
+    lz + lz_nz + tz + tz_nz + pop + (swapped & 0xFFu32) + rev_back
+}
+
+/// Inline saturating and wrapping arithmetic intrinsics (`saturating_add`,
+/// `saturating_sub`, `wrapping_add`, `wrapping_sub`, `wrapping_mul`).
+pub fn pass_intrinsics_saturating_and_wrapping() -> u32 {
+    let sat_hi: u8 = saturating_add(250u8, 20u8);
+    let sat_lo: u8 = saturating_sub(5u8, 12u8);
+    let wrap_a: u32 = wrapping_add(u32::MAX, 10u32);
+    let wrap_s: u32 = wrapping_sub(3u32, 4u32);
+    let wrap_m: u32 = wrapping_mul(wrap_s, 0u32);
+    let signed_sat: i8 = saturating_sub(-120i8, 20i8);
+    let signed_min_flag: u32 = if signed_sat == i8::MIN { 1u32 } else { 0u32 };
+    (sat_hi as u32) + (sat_lo as u32) + wrap_a + wrap_m + signed_min_flag
+}
+
+/// Inline `three_way_compare` and `exact_div` across signed and unsigned
+/// integer types.
+pub fn pass_intrinsics_three_way_compare_and_exact_div() -> u32 {
+    let cmp_lt = three_way_compare(3u32, 9u32);
+    let cmp_eq = three_way_compare(5i32, 5i32);
+    let cmp_gt = three_way_compare(7i32, -2i32);
+    let q_u: u32 = unsafe { exact_div(84u32, 4u32) };
+    let q_s: i32 = unsafe { exact_div(-36i32, -6i32) };
+    let ord_score: u32 = if (cmp_lt as i8) < 0 && (cmp_eq as i8) == 0 && (cmp_gt as i8) > 0 {
+        4u32
+    } else {
+        0u32
+    };
+    q_u + (q_s as u32) + ord_score
+}
+
+/// Memory and pointer intrinsics: `write_bytes!`, disjoint `copy_nonoverlapping`,
+/// and wrapping `arith_offset` pointer arithmetic.
+pub fn pass_intrinsics_write_bytes_copy_and_arith_offset() -> u32 {
+    let mut src = PairU32 { a: 0u32, b: 200u32 };
+    let mut dst: u32 = 0u32;
+    unsafe {
+        write_bytes!(&raw mut src.a, 0x01u8, 1usize);
+        copy_nonoverlapping(&raw const src.a, &raw mut dst, 1usize);
+        let base: *const u32 = &raw const src.a;
+        let far: *const u32 = arith_offset(base, 6isize);
+        let back_to_b: *const u32 = arith_offset(far, -5isize);
+        (dst & 0xFFu32) + *back_to_b
+    }
+}
+
+/// `ctlz_nonzero(0u32)` violates the non-zero precondition.
+pub fn ub_ctlz_nonzero_zero() -> u32 {
+    let zero: u32 = 0u32;
+    unsafe { ctlz_nonzero(zero) }
+}
+
+/// `cttz_nonzero(0u32)` violates the non-zero precondition.
+pub fn ub_cttz_nonzero_zero() -> u32 {
+    let zero: u32 = 0u32;
+    unsafe { cttz_nonzero(zero) }
+}
+
+/// `exact_div(7u32, 2u32)` violates the exact-divisibility precondition.
+pub fn ub_exact_div_non_exact_u32() -> u32 {
+    unsafe { exact_div(7u32, 2u32) }
+}
+
+/// `exact_div(i8::MIN, -1i8)` overflows signed 8-bit two's-complement range.
+pub fn ub_exact_div_signed_min_overflow_i8() -> i32 {
+    unsafe { exact_div(i8::MIN, -1i8) as i32 }
+}
+
+/// `copy_nonoverlapping` with overlapping source and destination ranges in the
+/// same array allocation is UB.
+pub fn ub_copy_nonoverlapping_partial_overlap_array() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2]
+}

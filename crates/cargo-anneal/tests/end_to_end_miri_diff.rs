@@ -134,7 +134,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         manifest.rustc_commit,
         "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
     );
-    assert_eq!(manifest.tests.len(), 89);
+    assert_eq!(manifest.tests.len(), 108);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
     // `miri_verdict` (either by tag or by `ub_location_mismatch`); none remain
@@ -429,17 +429,45 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         rustc_wrapper: Some(wrapper_bin.clone()),
     };
 
-    let report = run_miri_diff_suite(&config).expect("89-test Miri differential suite must pass");
-    assert_eq!(report.total_tests, 89);
-    assert_eq!(report.verified_pass_count, 41);
-    assert_eq!(report.verified_panic_count, 10);
-    assert_eq!(report.verified_strict_ub_count, 38);
+    let report = run_miri_diff_suite(&config).expect("108-test Miri differential suite must pass");
+    assert_eq!(report.total_tests, 108);
+    assert_eq!(report.verified_pass_count, 50);
+    assert_eq!(report.verified_panic_count, 12);
+    assert_eq!(report.verified_strict_ub_count, 46);
     assert_eq!(report.ratcheted_known_bug_count, 0);
-    // 41 pass + 10 panic + 1 helper (`helper_add_ten`) = 52 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 52);
+    // 50 pass + 12 panic + 2 helper subjects (`helper_add_ten` and the empty
+    // `Drop::drop` of Category 9's `UnwindCleanupGuard`) = 64 certificate
+    // modules. Category 9's call-chain helpers are `__ANNEAL_MODEL_*` model
+    // items: linked as callees, never certified on their own.
+    assert_eq!(report.audited_certificate_modules.len(), 64);
+    for helper in [
+        "Verify.MiriDiffCorpus.helper_add_ten",
+        "Verify.MiriDiffCorpus.UnwindCleanupGuard_as_core_ops_Drop_drop",
+    ] {
+        assert!(
+            report.audited_certificate_modules.iter().any(|m| m == helper),
+            "{helper} must be an audited helper certificate: {:?}",
+            report.audited_certificate_modules
+        );
+    }
+    assert!(
+        !report.audited_certificate_modules.iter().any(|m| {
+            ["helper_reborrow", "helper_shared", "helper_frozen", "helper_unwind"]
+                .iter()
+                .any(|h| m.contains(h))
+        }),
+        "model-marked call-chain helpers are linked as callees, never certified on \
+         their own: {:?}",
+        report.audited_certificate_modules
+    );
     for module in [
         "Verify.MiriDiffCorpus.pass_direct_fn_call",
         "Verify.MiriDiffCorpus.panic_explicit_macro",
+        "Verify.MiriDiffCorpus.pass_move_deinit_preserves_reserved_child",
+        "Verify.MiriDiffCorpus.pass_fn_entry_protector_two_stage_reborrow_chain",
+        "Verify.MiriDiffCorpus.panic_multi_callee_unwind_chain",
+        "Verify.MiriDiffCorpus.pass_fn_entry_returns_reborrowed_child",
+        "Verify.MiriDiffCorpus.panic_multi_callee_unwind_cleanup_guard",
     ] {
         assert!(
             report.audited_certificate_modules.iter().any(|m| m == module),
@@ -454,14 +482,138 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
 
     let summary = render_miri_diff_report(&report);
-    assert!(summary.contains("Total corpus tests:              89"));
-    assert!(summary.contains("Verified `panic` (SafePanic):    10"));
+    assert!(summary.contains("Total corpus tests:              108"));
+    assert!(summary.contains("Verified `panic` (SafePanic):    12"));
     assert!(summary.contains("of which modular (frame rely): 1"));
     assert!(summary.contains("Open Anneal bugs (ratcheted):    0"));
     assert!(summary.contains("TrustedBoundary kernel replay:   PASS"));
 
     let dot_anneal = temp_corpus.join(".anneal");
     let verify_dir = dot_anneal.join("generated/Verify/MiriDiffCorpus");
+
+    // Category 9's `Operand::Move` seeds move non-`Copy` `NonCopyU32` values, so
+    // the captured MIR that Anneal's kernel evaluates must move the source
+    // place, never copy it. The explicit-assignment contrast never moves `x`.
+    let mir_dir = dot_anneal.join("generated/Mir/MiriDiffCorpus");
+    let captured_mir = |name: &str| {
+        fs::read_to_string(mir_dir.join(format!("{name}.lean")))
+            .unwrap_or_else(|e| panic!("read captured MIR of `{name}`: {e}"))
+    };
+    let local_index = |mir: &str, debug_name: &str| {
+        let decls = mir
+            .lines()
+            .find(|l| l.trim_start().starts_with("localDecls :="))
+            .expect("captured MIR has localDecls");
+        let needle = format!("debugName := (Option.some \"{debug_name}\")");
+        assert_eq!(
+            decls.matches(&needle).count(),
+            1,
+            "`{debug_name}` must be one local"
+        );
+        decls[..decls.find(&needle).expect("local present")]
+            .matches("debugName :=")
+            .count()
+    };
+    for (name, source, projection) in [
+        (
+            "pass_move_deinit_preserves_reserved_child",
+            "x",
+            "List.nil }",
+        ),
+        (
+            "pass_move_deinit_subplace_preserves_sibling_frozen",
+            "p",
+            "(List.cons (ProjectionElem.field 0 ",
+        ),
+        ("ub_move_deinit_read_source_uninit", "x", "List.nil }"),
+    ] {
+        let mir = captured_mir(name);
+        let idx = local_index(&mir, source);
+        let operand =
+            |kind: &str| format!("Operand.{kind} {{ local_ := {idx}, projection := {projection}");
+        assert_eq!(
+            mir.matches(&operand("move")).count(),
+            1,
+            "`{name}` must move `{source}` (`_{idx}`) exactly once:\n{mir}"
+        );
+        assert!(
+            !mir.contains(&operand("copy")),
+            "`{name}` must not copy `{source}` (`_{idx}`):\n{mir}"
+        );
+    }
+    let assign_mir = captured_mir("ub_assign_after_reborrow_disables_child");
+    let assign_x = local_index(&assign_mir, "x");
+    assert!(
+        !assign_mir.contains(&format!(
+            "Operand.move {{ local_ := {assign_x}, projection := List.nil }}"
+        )),
+        "`ub_assign_after_reborrow_disables_child` must assign `x`, never move it:\n{assign_mir}"
+    );
+
+    // Category 9's guarded unwind helper lowers its call edge to
+    // `UnwindAction.cleanup` with a landing pad that drops `UnwindCleanupGuard`
+    // and resumes unwinding (`TerminatorKind.unwindResume`), whereas the
+    // unguarded unwind helper uses `UnwindAction.continue_`.
+    let guarded_mir = captured_mir("helper_unwind_guarded");
+    assert!(
+        guarded_mir.contains("UnwindAction.cleanup ")
+            && guarded_mir.contains("TerminatorKind.unwindResume"),
+        "`helper_unwind_guarded` must capture an `UnwindAction.cleanup` landing pad:\n{guarded_mir}"
+    );
+    let unguarded_mir = captured_mir("helper_unwind_mid");
+    assert!(
+        unguarded_mir.contains("UnwindAction.continue_")
+            && !unguarded_mir.contains("UnwindAction.cleanup "),
+        "`helper_unwind_mid` must use `UnwindAction.continue_`:\n{unguarded_mir}"
+    );
+
+    // Category 9's `copy_nonoverlapping` seeds lower to the inline MIR statement
+    // `StatementKind.intrinsic (NonDivergingIntrinsic.copyNonOverlapping ...)`.
+    for name in [
+        "pass_intrinsics_write_bytes_copy_and_arith_offset",
+        "ub_copy_nonoverlapping_partial_overlap_array",
+    ] {
+        let mir = captured_mir(name);
+        assert!(
+            mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
+            "`{name}` must lower to `NonDivergingIntrinsic.copyNonOverlapping`:\n{mir}"
+        );
+    }
+
+    // Category 9's multi-callee `Verify` modules link their transitive helper
+    // bodies in `callees := [...]`.
+    for (verify_name, expected_callees) in [
+        (
+            "pass_fn_entry_protector_two_stage_reborrow_chain",
+            &[
+                "Mir.MiriDiffCorpus.helper_reborrow_leaf.body",
+                "Mir.MiriDiffCorpus.helper_reborrow_mid.body",
+            ][..],
+        ),
+        (
+            "pass_fn_entry_shared_reborrow_chain",
+            &[
+                "Mir.MiriDiffCorpus.helper_shared_leaf.body",
+                "Mir.MiriDiffCorpus.helper_shared_mid.body",
+            ][..],
+        ),
+        (
+            "panic_multi_callee_unwind_cleanup_guard",
+            &[
+                "Mir.MiriDiffCorpus.helper_unwind_guarded.body",
+                "Mir.MiriDiffCorpus.helper_unwind_leaf.body",
+            ][..],
+        ),
+    ] {
+        let verify_src = fs::read_to_string(verify_dir.join(format!("{verify_name}.lean")))
+            .unwrap_or_else(|e| panic!("read `{verify_name}.lean`: {e}"));
+        for callee in expected_callees {
+            assert!(
+                verify_src.contains(callee),
+                "`{verify_name}.lean` must link `{callee}`:\n{verify_src}"
+            );
+        }
+    }
 
     // The retired bug's certificate links only the captured `helper_add_ten`
     // body, through the general bounded combinator rather than the

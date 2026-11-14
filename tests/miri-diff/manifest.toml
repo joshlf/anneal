@@ -699,3 +699,144 @@ category = "places_projections_and_pointers"
 upstream_path = "tests/pass/enums.rs"
 miri_verdict = "pass:scalar:10:4"
 fuel = 128
+
+[[tests]]
+name = "pass_move_deinit_preserves_reserved_child"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/tree-borrows.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+
+[[tests]]
+name = "pass_move_deinit_subplace_preserves_sibling_frozen"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/tree-borrows.rs"
+miri_verdict = "pass:scalar:50:4"
+fuel = 128
+
+[[tests]]
+name = "ub_move_deinit_read_source_uninit"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/uninit/uninit_byte_read.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1077:32"
+fuel = 128
+
+[[tests]]
+name = "ub_assign_after_reborrow_disables_child"
+category = "tree_borrows"
+upstream_path = "tests/fail/tree_borrows/write-during-2phase.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1092:5"
+fuel = 128
+
+[[tests]]
+name = "pass_fn_entry_protector_two_stage_reborrow_chain"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/protector.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+
+[[tests]]
+name = "pass_fn_entry_shared_reborrow_chain"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/protector.rs"
+miri_verdict = "pass:scalar:25:4"
+fuel = 128
+
+[[tests]]
+name = "ub_frozen_reborrow_write_in_callee_frame"
+category = "tree_borrows"
+upstream_path = "tests/fail/tree_borrows/write-during-2phase.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:998:5"
+fuel = 128
+
+[[tests]]
+name = "panic_multi_callee_unwind_chain"
+category = "control_flow_and_calls"
+upstream_path = "tests/panic/overflow_add.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "pass_fn_entry_returns_reborrowed_child"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reborrow-is-read.rs"
+miri_verdict = "pass:scalar:8:4"
+fuel = 128
+
+[[tests]]
+name = "panic_multi_callee_unwind_cleanup_guard"
+category = "control_flow_and_calls"
+upstream_path = "tests/panic/overflow_add.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "pass_intrinsics_bit_count_and_reverse"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/intrinsics/integer.rs"
+miri_verdict = "pass:scalar:53:4"
+fuel = 128
+
+[[tests]]
+name = "pass_intrinsics_saturating_and_wrapping"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/intrinsics/integer.rs"
+miri_verdict = "pass:scalar:265:4"
+fuel = 128
+
+[[tests]]
+name = "pass_intrinsics_three_way_compare_and_exact_div"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/intrinsics/integer.rs"
+miri_verdict = "pass:scalar:31:4"
+fuel = 128
+
+[[tests]]
+name = "pass_intrinsics_write_bytes_copy_and_arith_offset"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/ptr_offset.rs"
+miri_verdict = "pass:scalar:201:4"
+fuel = 128
+
+[[tests]]
+name = "ub_ctlz_nonzero_zero"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/ctlz_nonzero.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1224:14"
+fuel = 128
+
+[[tests]]
+name = "ub_cttz_nonzero_zero"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/cttz_nonzero.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1230:14"
+fuel = 128
+
+[[tests]]
+name = "ub_exact_div_non_exact_u32"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/exact_div1.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1235:14"
+fuel = 128
+
+[[tests]]
+name = "ub_exact_div_signed_min_overflow_i8"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/exact_div2.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1240:14"
+fuel = 128
+
+[[tests]]
+name = "ub_copy_nonoverlapping_partial_overlap_array"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/intrinsics/copy_overlapping.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1250:9"
+fuel = 128

@@ -19,14 +19,16 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::miri_eval::{
-    MiriEvalOptions, divergence_class_slug, evaluate_miri_batches,
-    evaluate_miri_batches_with_options, reproduce_miri_finding,
+    MiriEvalOptions, WitnessPolarity, classify_outcome_tags_polarity, divergence_class_slug,
+    evaluate_miri_batches, evaluate_miri_batches_with_options, reproduce_miri_finding,
+    witness_polarity_accounting_holds,
 };
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
-    MiriAstMutator, MutationMode, PlaceProjectionWrapper, TreeBorrowsRetagInterleaver,
-    build_standalone_candidate_source, generate_miri_batch, generate_miri_corpus_batch,
-    reconstruct_miri_mutation_steps, replay_miri_mutation_steps,
+    MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode,
+    PlaceProjectionWrapper, TreeBorrowsRetagInterleaver, build_standalone_candidate_source,
+    generate_miri_batch, generate_miri_corpus_batch, reconstruct_miri_mutation_steps,
+    replay_miri_mutation_steps,
 };
 use cargo_anneal::{
     AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
@@ -151,11 +153,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 89
-assert data["compiled_candidates"] == 89
+assert data["total_candidates"] == 108
+assert data["compiled_candidates"] == 108
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 89
-assert data["agree_count"] == 89
+assert data["compared_candidates"] == 108
+assert data["agree_count"] == 108
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -189,6 +191,14 @@ assert nc == {
 
 ext = data["unmodeled_external_calls"]
 assert ext == {}, f"unexpected ext: {ext}"
+
+wp = data["witness_polarity_counts"]
+assert wp == {
+    "harness_or_extraction_error": 0,
+    "sound_conservative_abstraction": 0,
+    "unsound_missed_fault": 0,
+    "value_mismatch": 0,
+}, f"unexpected witness_polarity_counts: {wp}"
 
 expected_findings = {}
 
@@ -478,10 +488,11 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
             r#"
 import json, pathlib, sys
 rep = json.loads(pathlib.Path(sys.argv[1]).read_text())
-_, _, fn_name, exp_class, exp_miri, exp_anneal, exp_lean = sys.argv
+_, _, fn_name, exp_class, exp_polarity, exp_miri, exp_anneal, exp_lean = sys.argv
 assert rep["fn_name"] == fn_name, f"{rep['fn_name']} != {fn_name}"
 assert rep["verdict"] == "diverge", f"expected diverge, got {rep}"
 assert rep["divergence_class"] == exp_class, f"{rep['divergence_class']} != {exp_class}"
+assert rep["witness_polarity"] == exp_polarity, f"{rep['witness_polarity']} != {exp_polarity}"
 assert rep["miri_outcome"] == exp_miri, f"{rep['miri_outcome']} != {exp_miri}"
 assert rep["anneal_outcome"] == exp_anneal, f"{rep['anneal_outcome']} != {exp_anneal}"
 assert rep["anneal_lean_tag"] == exp_lean, f"{rep['anneal_lean_tag']} != {exp_lean}"
@@ -492,6 +503,7 @@ assert rep["kernel_confirmed"] is True, f"expected kernel_confirmed=True, got {r
         .args([
             &f.fn_name,
             &f.divergence_class,
+            &f.witness_polarity,
             &f.miri_outcome_tag,
             &f.anneal_outcome_tag,
             &f.anneal_lean_tag,
@@ -685,7 +697,7 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
     // 2. Seeded batch containing `pass_direct_fn_call` mutants must record 0
     // `miri_diff_corpus::helper_add_ten` skips in `unmodeled_external_calls`.
     let mut seeded_with_helper = Vec::new();
-    for b_idx in 0..8usize {
+    for b_idx in 0..24usize {
         let batch = generate_miri_corpus_batch(10, 0x5EED_9900 + b_idx as u64, b_idx);
         for cand in batch {
             if cand.seed_name == "pass_direct_fn_call" {
@@ -2441,4 +2453,675 @@ fn seeded_divergent_findings_shrink_live_and_minimized_repros_reproduce() {
     }
     assert_eq!(shrunk_to_zero, 1, "expected one k -> 0 live shrink");
     assert_eq!(shrunk_to_one, 1, "expected one k -> 1 live shrink");
+}
+
+/// 1-based line of the unique line of `haystack` that contains `needle`.
+fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
+    let matches: Vec<u32> = haystack
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| l.contains(needle).then_some(i as u32 + 1))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "`{needle}` must match a unique line in staged crate, matched lines: {matches:?}"
+    );
+    matches[0]
+}
+
+/// Category 9 templates must agree with Miri live, and the Category 9 engine
+/// gaps that `tests/miri-diff/README.md` documents stay pinned exactly as
+/// measured (a ratchet: when Anneal changes on a pin, this test fails and the
+/// README and pin must be updated). Every divergence is kernel-confirmed and
+/// classified by `WitnessPolarity`, and `witness_polarity_counts` satisfies the
+/// accounting identity.
+///
+/// Frame-relative pointer resolution: `BorrowEntry.targetLocal` is an index
+/// into the *running* frame's locals (`get? locals entry.targetLocal`, falling
+/// back to `memory.callerLocals`, which `pushCalleeFrame` never populates), so
+/// inside a callee a pointer to the caller's local `_k` resolves to the
+/// callee's own local `_k`:
+/// - `cat9_gap_callee_raw_read_wrong_value` / `cat9_gap_callee_raw_write_wrong_value`
+///   (`wrong_value`, `value_mismatch`): with the caller's `x` and the callee's
+///   `u32` parameter `pad2` both at local `_3`, the callee reads `pad2` (`200`)
+///   instead of `x` (`10`), and its write lands in `pad2`, leaving `x`
+///   unchanged (Anneal `13` vs Miri `11`): silent wrong values.
+/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`wrong_value`,
+///   `value_mismatch`): the caller's `x` and the callee's pointer argument
+///   `alias` are both local `_1`, so the callee's write through `alias`
+///   overwrites `alias` itself and `x` stays `10` (Anneal `13` vs Miri `9`).
+/// - `cat9_gap_callee_deref_ref_arg` (`false_positive_ub`,
+///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
+///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
+///   faults.
+/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): see
+///   the raw-pointer sibling roots below; without the caller's `&x` the
+///   callee's write proceeds but is misdirected into its own frame, as in
+///   `cat9_gap_callee_raw_write_collides_with_ptr_arg`.
+/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
+///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
+///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
+///   write lands in the callee's `_slot_pad` (local `_3`, like `x`), so it never
+///   reaches `x` or its borrow tree (and the capture emits no
+///   `Retag(FnEntry)`, so no protector exists either).
+///
+/// Raw-pointer sibling roots (no call needed): `&raw mut x` mints its own root
+/// borrow entry, and creating a later `&x` (a sibling root whose retag reads
+/// `x`) freezes it as a foreign read, so any later write through the raw
+/// pointer is UB in Anneal; Miri passes, because the raw pointer keeps `x`'s
+/// tag and the write only disables `&x`:
+/// - `cat9_gap_raw_write_after_unused_shared_borrow` (`false_positive_ub`): the
+///   minimal single-frame witness, with `&x` never used.
+/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): the
+///   frozen raw pointer is written inside a callee.
+/// - `cat9_gap_post_return_raw_write_after_ref_arg` (`false_positive_ub`): `&x`
+///   is a call argument and the raw write follows the call (it reproduces with
+///   a callee whose only locals are `_0` and `_r`).
+///
+/// User `Drop` impls never run: Anneal's `.drop` terminator only de-initializes
+/// the dropped place (the capture's `TerminatorKind::Drop` names no drop impl),
+/// while Miri calls `Drop::drop` (Category 9's `UnwindCleanupGuard` has an
+/// empty `drop` for this reason):
+/// - `cat9_gap_drop_impl_side_effect_skipped` (`wrong_value`,
+///   `value_mismatch`): a write through the guard's raw pointer is lost
+///   (Anneal `1` vs Miri `7`).
+/// - `cat9_gap_drop_impl_panic_missed` (`panic_vs_return`,
+///   `unsound_missed_fault`): an overflow panic inside `drop` is missed.
+/// - `cat9_gap_drop_impl_ub_missed` (`missed_ub`, `unsound_missed_fault`):
+///   `ctlz_nonzero(0)` inside `drop` is missed.
+///
+/// Other pins:
+/// - `cat9_in_scope_move_raw_read_conservative` (`false_positive_ub`): Anneal
+///   de-initializes the source of `Operand::Move`; Miri evaluates
+///   `Operand::Move` like `Operand::Copy`.
+/// - `cat9_provenance_overwritten_byte_missed_ub` (`missed_ub`): overwriting one
+///   byte of a pointer strips its provenance in Miri; Anneal keeps it.
+#[test]
+fn ep1_category9_templates_engine_gap_pins_and_witness_polarity_verify_live() {
+    let dir = unique_temp_dir("ep1_cat9");
+    let findings_dir = dir.join("findings");
+    let root = repo_root();
+
+    let candidates: Vec<GeneratedMiriCandidate> = [
+        (
+            "cat9_move_deinit_pass",
+            r#"pub fn cat9_move_deinit_pass() -> u32 {
+    let mut x: NonCopyU32 = NonCopyU32(14u32);
+    let root: *mut NonCopyU32 = &raw mut x;
+    let r: &mut NonCopyU32 = unsafe { &mut *root };
+    let moved: NonCopyU32 = x;
+    *r = NonCopyU32(moved.0 ^ 7u32);
+    ((*r).0) ^ moved.0
+}
+"#,
+        ),
+        (
+            "cat9_fn_entry_chain_pass",
+            r#"pub fn cat9_fn_entry_chain_pass() -> u32 {
+    let mut slot: u32 = 20u32;
+    let raw: *mut u32 = &raw mut slot;
+    let r0: &mut u32 = unsafe { &mut *raw };
+    let delta: u32 = helper_reborrow_mid(r0, 5u32);
+    *r0 = delta ^ 20u32;
+    unsafe {
+        *raw = (*r0) ^ 3u32;
+        *raw
+    }
+}
+"#,
+        ),
+        (
+            "cat9_returned_child_pass",
+            r#"pub fn cat9_returned_child_pass() -> u32 {
+    let mut x: u32 = 5u32;
+    let child: &mut u32 = helper_reborrow_return(&mut x);
+    *child = *child ^ 6u32;
+    x = x + 1u32;
+    x
+}
+"#,
+        ),
+        (
+            "cat9_scalar_and_mem_intrinsics_pass",
+            r#"pub fn cat9_scalar_and_mem_intrinsics_pass() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 0u32, b: 90u32 };
+    let mut dst: u32 = 0u32;
+    unsafe {
+        write_bytes!(&raw mut pair.a, 0x02u8, 1usize);
+        copy_nonoverlapping(&raw const pair.a, &raw mut dst, 1usize);
+    }
+    let nz: u32 = (dst & 0xFFu32) | 1u32;
+    let bits: u32 = ctlz(nz) ^ cttz(nz) ^ ctpop(nz) ^ (bswap(nz) & 0xFFu32) ^ (bitreverse(nz) >> 24u32);
+    let nz_cnt: u32 = unsafe { ctlz_nonzero(nz) ^ cttz_nonzero(nz) };
+    let sat: u8 = saturating_add(saturating_sub(10u8, 20u8), 250u8);
+    let wrap: u32 = wrapping_mul(wrapping_add(u32::MAX, 2u32), wrapping_sub(4u32, 1u32));
+    let ord = three_way_compare(wrap, 10u32);
+    let q: u32 = unsafe { exact_div(36u32, 3u32) };
+    let base: *const u32 = &raw const pair.a;
+    let back: *const u32 = unsafe { arith_offset(arith_offset(base, 5isize), -4isize) };
+    bits ^ nz_cnt ^ (sat as u32) ^ wrap ^ (((ord as i8) + 1i8) as u32) ^ q ^ unsafe { *back }
+}
+"#,
+        ),
+        (
+            "cat9_frozen_reborrow_write_in_callee_ub",
+            r#"pub fn cat9_frozen_reborrow_write_in_callee_ub() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let delta: u32 = helper_reborrow_mid(unsafe { &mut *raw }, 1u32);
+    unsafe {
+        *raw = delta;
+    }
+    helper_frozen_reborrow_write_in_callee(unsafe { *raw })
+}
+"#,
+        ),
+        (
+            "cat9_unwind_cleanup_guard_panic",
+            r#"pub fn cat9_unwind_cleanup_guard_panic() -> u32 {
+    let start: u32 = u32::MAX;
+    helper_unwind_guarded(start, 1u32)
+}
+"#,
+        ),
+        (
+            "cat9_in_scope_move_raw_read_conservative",
+            r#"pub fn cat9_in_scope_move_raw_read_conservative() -> u32 {
+    let x = NonCopyU32(15u32);
+    let raw: *const u32 = &raw const x.0;
+    let moved: NonCopyU32 = x;
+    let leaked: u32 = unsafe { *raw };
+    moved.0 + leaked
+}
+"#,
+        ),
+        (
+            "cat9_provenance_overwritten_byte_missed_ub",
+            r#"pub fn cat9_provenance_overwritten_byte_missed_ub() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;
+    unsafe {
+        *byte_ptr = 0u8;
+        *p
+    }
+}
+"#,
+        ),
+        (
+            "cat9_gap_fn_entry_protector_raw_reborrow_missed_ub",
+            r#"#[inline(never)]
+fn cat9_gap_write_alias_during_protected_reborrow(
+    _r: &u32,
+    alias: *mut u32,
+    _slot_pad: u32,
+) -> u32 {
+    unsafe {
+        *alias = 8u32;
+    }
+    3u32
+}
+
+pub fn cat9_gap_fn_entry_protector_raw_reborrow_missed_ub() -> u32 {
+    let _pad1: u32 = 1u32;
+    let _pad2: u32 = 2u32;
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_write_alias_during_protected_reborrow(
+        unsafe { &*raw },
+        raw,
+        _pad1 + _pad2,
+    );
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_read_wrong_value",
+            r#"#[inline(never)]
+fn cat9_gap_read_through_raw_arg(alias: *const u32, pad: u32, pad2: u32) -> u32 {
+    let seen: u32 = unsafe { *alias };
+    seen + (pad & 0u32) + (pad2 & 0u32)
+}
+
+pub fn cat9_gap_callee_raw_read_wrong_value() -> u32 {
+    let _p1: u32 = 1u32;
+    let _p2: u32 = 2u32;
+    let x: u32 = 10u32;
+    let raw: *const u32 = &raw const x;
+    cat9_gap_read_through_raw_arg(raw, 100u32, 200u32)
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_write_wrong_value",
+            r#"#[inline(never)]
+fn cat9_gap_write_through_raw_arg(alias: *mut u32, pad: u32, pad2: u32) -> u32 {
+    unsafe {
+        *alias = 8u32 + 0u32;
+    }
+    3u32 + (pad & 0u32) + (pad2 & 0u32)
+}
+
+pub fn cat9_gap_callee_raw_write_wrong_value() -> u32 {
+    let _p1: u32 = 1u32;
+    let _p2: u32 = 2u32;
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_write_through_raw_arg(raw, 100u32, 200u32);
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_write_collides_with_ptr_arg",
+            r#"#[inline(never)]
+fn cat9_gap_alias_write_no_caller_borrow(alias: *mut u32) -> u32 {
+    unsafe {
+        *alias = 6u32;
+    }
+    3u32
+}
+
+pub fn cat9_gap_callee_raw_write_collides_with_ptr_arg() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = cat9_gap_alias_write_no_caller_borrow(raw);
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_deref_ref_arg",
+            r#"#[inline(never)]
+fn cat9_gap_read_ref_arg(r: &u32, bonus: u32) -> u32 {
+    *r + bonus
+}
+
+pub fn cat9_gap_callee_deref_ref_arg() -> u32 {
+    let x: u32 = 10u32;
+    cat9_gap_read_ref_arg(&x, 1u32)
+}
+"#,
+        ),
+        (
+            "cat9_gap_callee_raw_write_with_caller_borrow",
+            r#"#[inline(never)]
+fn cat9_gap_alias_write_only(alias: *mut u32) -> u32 {
+    unsafe {
+        *alias = 7u32;
+    }
+    3u32
+}
+
+pub fn cat9_gap_callee_raw_write_with_caller_borrow() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let _r: &u32 = &x;
+    let v: u32 = cat9_gap_alias_write_only(raw);
+    v + unsafe { *raw }
+}
+"#,
+        ),
+        (
+            "cat9_gap_post_return_raw_write_after_ref_arg",
+            r#"#[inline(never)]
+fn cat9_gap_take_shared_arg(_r: &u32) -> u32 {
+    3u32
+}
+
+pub fn cat9_gap_post_return_raw_write_after_ref_arg() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let seen: u32 = cat9_gap_take_shared_arg(&x);
+    unsafe {
+        *raw = 7u32 + seen;
+        *raw
+    }
+}
+"#,
+        ),
+        (
+            "cat9_gap_raw_write_after_unused_shared_borrow",
+            r#"pub fn cat9_gap_raw_write_after_unused_shared_borrow() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let _r: &u32 = &x;
+    unsafe {
+        *raw = 11u32;
+        *raw
+    }
+}
+"#,
+        ),
+        (
+            "cat9_gap_drop_impl_side_effect_skipped",
+            r#"pub struct Cat9WriteOnDrop(pub *mut u32);
+
+impl Drop for Cat9WriteOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            *self.0 = 7u32;
+        }
+    }
+}
+
+pub fn cat9_gap_drop_impl_side_effect_skipped() -> u32 {
+    let mut x: u32 = 1u32;
+    {
+        let _guard = Cat9WriteOnDrop(&raw mut x);
+    }
+    x
+}
+"#,
+        ),
+        (
+            "cat9_gap_drop_impl_panic_missed",
+            r#"pub struct Cat9OverflowOnDrop(pub u32);
+
+impl Drop for Cat9OverflowOnDrop {
+    fn drop(&mut self) {
+        let _sum: u32 = self.0 + u32::MAX;
+    }
+}
+
+pub fn cat9_gap_drop_impl_panic_missed() -> u32 {
+    let _bomb = Cat9OverflowOnDrop(1u32);
+    5u32
+}
+"#,
+        ),
+        (
+            "cat9_gap_drop_impl_ub_missed",
+            r#"pub struct Cat9CtlzOnDrop(pub u32);
+
+impl Drop for Cat9CtlzOnDrop {
+    fn drop(&mut self) {
+        let _zeros: u32 = unsafe { ctlz_nonzero(self.0 - 1u32) };
+    }
+}
+
+pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
+    let _bomb = Cat9CtlzOnDrop(1u32);
+    5u32
+}
+"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, (name, fn_src))| GeneratedMiriCandidate {
+        id,
+        seed_index: id,
+        seed_name: name.to_string(),
+        fn_name: name.to_string(),
+        seed_u64: id as u64,
+        applied_mutators: Vec::new(),
+        tracked_locals: Vec::new(),
+        fn_source: fn_src.to_string(),
+        source: build_standalone_candidate_source(fn_src),
+    })
+    .collect();
+    // The batch stages every candidate after the shared header and preamble,
+    // in order, exactly as `evaluate_miri_batches_with_options` does.
+    let mut staged = format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+    for cand in &candidates {
+        staged.push_str(cand.fn_source.trim());
+        staged.push_str("\n\n");
+    }
+
+    let options = MiriEvalOptions {
+        findings_dir: Some(findings_dir.clone()),
+        anneal_repo_root: Some(root),
+        shrink_seeds: None,
+    };
+    let report = evaluate_miri_batches_with_options(
+        "seeded",
+        0xCA79_0001,
+        std::slice::from_ref(&candidates),
+        candidates.len(),
+        &options,
+    )
+    .expect("evaluate Category 9 live batch");
+
+    assert_eq!(report.total_candidates, 19);
+    assert_eq!(report.compiled_candidates, 19);
+    assert_eq!(report.agree_count, 6, "agreements: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 13, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.not_compared_count, 0);
+    assert!(witness_polarity_accounting_holds(&report));
+    for (slug, expected) in [
+        ("unsound_missed_fault", 4usize),
+        ("sound_conservative_abstraction", 5),
+        ("value_mismatch", 4),
+        ("harness_or_extraction_error", 0),
+    ] {
+        assert_eq!(
+            report.witness_polarity_counts.get(slug),
+            Some(&expected),
+            "witness_polarity_counts[{slug}]: {:?}",
+            report.witness_polarity_counts
+        );
+    }
+    assert_eq!(report.findings.len(), 13);
+    assert_eq!(report.kernel_confirmed_divergences, 13);
+    // With no shrinkable mutator chain, every finding reports its original
+    // candidate, so each original item report is itself kernel-confirmed.
+    for f in &report.findings {
+        assert!(
+            report
+                .item_reports
+                .iter()
+                .any(|r| r.name == f.fn_name && r.kernel_confirmed),
+            "item report for `{}` must stay kernel-confirmed",
+            f.fn_name
+        );
+        // None of the diverging pins call preamble `helper_*` functions or
+        // construct `UnwindCleanupGuard`; `MiriOracleConfirm.lean` must not
+        // link helpers or `Drop` impls reachable only from the agreeing
+        // candidates in the batch.
+        assert!(
+            !f.kernel_confirm_theorems.contains("helper_reborrow_")
+                && !f.kernel_confirm_theorems.contains("helper_unwind_")
+                && !f.kernel_confirm_theorems.contains("UnwindCleanupGuard"),
+            "confirm module for `{}` linked unrelated batch helpers:\n{}",
+            f.fn_name,
+            f.kernel_confirm_theorems
+        );
+    }
+    for f in &report.findings {
+        assert!(f.kernel_confirmed, "finding `{}` must be kernel-confirmed", f.fn_name);
+        assert_eq!(
+            WitnessPolarity::from_str_slug(&f.witness_polarity),
+            Some(classify_outcome_tags_polarity(
+                &f.miri_outcome_tag,
+                &f.anneal_outcome_tag,
+                Some(&f.divergence_class),
+            ))
+            .flatten(),
+            "finding `{}` polarity disagrees with its tags",
+            f.fn_name
+        );
+    }
+
+    let item = |name: &str| {
+        report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report `{name}`"))
+    };
+    for name in [
+        "cat9_move_deinit_pass",
+        "cat9_fn_entry_chain_pass",
+        "cat9_returned_child_pass",
+        "cat9_scalar_and_mem_intrinsics_pass",
+        "cat9_frozen_reborrow_write_in_callee_ub",
+        "cat9_unwind_cleanup_guard_panic",
+    ] {
+        assert_eq!(item(name).verdict, ComparisonVerdict::Agree, "`{name}` must agree");
+    }
+    assert!(matches!(item("cat9_frozen_reborrow_write_in_callee_ub").miri, MiriOutcome::Ub { .. }));
+    assert!(matches!(item("cat9_unwind_cleanup_guard_panic").miri, MiriOutcome::Panic { .. }));
+    assert!(matches!(item("cat9_unwind_cleanup_guard_panic").anneal, AnnealOutcome::Panic { .. }));
+
+    let finding = |name: &str| {
+        report
+            .findings
+            .iter()
+            .find(|f| f.fn_name == name)
+            .unwrap_or_else(|| panic!("missing finding `{name}`"))
+    };
+    for name in [
+        "cat9_provenance_overwritten_byte_missed_ub",
+        "cat9_gap_fn_entry_protector_raw_reborrow_missed_ub",
+    ] {
+        let unsound = finding(name);
+        assert_eq!(unsound.divergence_class, "missed_ub", "`{name}`");
+        assert_eq!(unsound.witness_polarity, "unsound_missed_fault", "`{name}`");
+        assert!(unsound.kernel_confirmed, "`{name}` must be kernel-confirmed");
+    }
+    let prot_rep = item("cat9_gap_fn_entry_protector_raw_reborrow_missed_ub");
+    let prot_ub_line = cat9_line_of(&staged, "        *alias = 8u32;");
+    assert!(
+        matches!(
+            &prot_rep.miri,
+            MiriOutcome::Ub { pos: Some(p), message }
+                if p.line == prot_ub_line && message.contains("is forbidden")
+        ),
+        "expected Miri FnEntry protector UB at line {prot_ub_line}, got {:?}",
+        prot_rep.miri
+    );
+    assert_eq!(
+        prot_rep.anneal,
+        AnnealOutcome::PassScalar {
+            bits: 13,
+            size_bytes: 4
+        }
+    );
+
+    // Frame-relative pointer resolution yields silent wrong values: the callee
+    // reads (and writes) its own `pad2` at local `_3` instead of the caller's
+    // `x` at local `_3`.
+    for (name, miri_bits, anneal_bits) in [
+        ("cat9_gap_callee_raw_read_wrong_value", 10u128, 200u128),
+        ("cat9_gap_callee_raw_write_wrong_value", 11, 13),
+        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9, 13),
+    ] {
+        let f = finding(name);
+        assert_eq!(f.divergence_class, "wrong_value", "`{name}`");
+        assert_eq!(f.witness_polarity, "value_mismatch", "`{name}`");
+        let rep = item(name);
+        assert_eq!(
+            (&rep.miri, &rep.anneal),
+            (
+                &MiriOutcome::PassScalar {
+                    bits: miri_bits,
+                    size_bytes: 4
+                },
+                &AnnealOutcome::PassScalar {
+                    bits: anneal_bits,
+                    size_bytes: 4
+                }
+            ),
+            "known Category 9 frame-relative pointer gap `{name}` changed (fixed?); update the \
+             pin and tests/miri-diff/README.md"
+        );
+    }
+
+    // Each conservative pin is a Miri pass and an Anneal UB at exactly the
+    // documented statement.
+    for (name, miri_bits, ub_marker) in [
+        ("cat9_in_scope_move_raw_read_conservative", 30u128, "let leaked: u32 = unsafe { *raw };"),
+        ("cat9_gap_callee_deref_ref_arg", 11, "    *r + bonus"),
+        ("cat9_gap_callee_raw_write_with_caller_borrow", 10, "        *alias = 7u32;"),
+        ("cat9_gap_post_return_raw_write_after_ref_arg", 10, "        *raw = 7u32 + seen;"),
+        ("cat9_gap_raw_write_after_unused_shared_borrow", 11, "        *raw = 11u32;"),
+    ] {
+        let f = finding(name);
+        assert_eq!(f.divergence_class, "false_positive_ub", "`{name}`");
+        assert_eq!(f.witness_polarity, "sound_conservative_abstraction", "`{name}`");
+        let rep = item(name);
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits: miri_bits,
+                size_bytes: 4
+            },
+            "`{name}` Miri outcome changed"
+        );
+        let expected_line = cat9_line_of(&staged, ub_marker);
+        assert!(
+            matches!(&rep.anneal, AnnealOutcome::Ub { span: Some(s) } if s.start_line == expected_line),
+            "known Category 9 engine gap `{name}` changed (fixed?): expected Anneal UB at \
+             staged line {expected_line} (`{}`), got {:?}; update the pin and \
+             tests/miri-diff/README.md",
+            ub_marker.trim(),
+            rep.anneal
+        );
+    }
+
+    // Anneal never runs a user `Drop` impl: its `.drop` terminator only
+    // de-initializes the dropped place, so the side effect, panic, and UB of a
+    // `Drop::drop` body are all invisible to it.
+    let skipped = item("cat9_gap_drop_impl_side_effect_skipped");
+    assert_eq!(
+        finding("cat9_gap_drop_impl_side_effect_skipped").divergence_class,
+        "wrong_value"
+    );
+    assert_eq!(
+        finding("cat9_gap_drop_impl_side_effect_skipped").witness_polarity,
+        "value_mismatch"
+    );
+    assert_eq!(
+        (&skipped.miri, &skipped.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 7,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 1,
+                size_bytes: 4
+            }
+        ),
+        "known Category 9 `Drop` gap changed (fixed?); update the pin and tests/miri-diff/README.md"
+    );
+    for (name, class, fault_marker) in [
+        (
+            "cat9_gap_drop_impl_panic_missed",
+            "panic_vs_return",
+            "        let _sum: u32 = self.0 + u32::MAX;",
+        ),
+        (
+            "cat9_gap_drop_impl_ub_missed",
+            "missed_ub",
+            "        let _zeros: u32 = unsafe { ctlz_nonzero(self.0 - 1u32) };",
+        ),
+    ] {
+        let f = finding(name);
+        assert_eq!(f.divergence_class, class, "`{name}`");
+        assert_eq!(f.witness_polarity, "unsound_missed_fault", "`{name}`");
+        let rep = item(name);
+        let fault_line = cat9_line_of(&staged, fault_marker);
+        let miri_line = match &rep.miri {
+            MiriOutcome::Panic { pos: Some(p), .. } if class == "panic_vs_return" => p.line,
+            MiriOutcome::Ub { pos: Some(p), .. } if class == "missed_ub" => p.line,
+            other => panic!("`{name}`: unexpected Miri outcome {other:?}"),
+        };
+        assert_eq!(
+            miri_line, fault_line,
+            "`{name}`: Miri must fault inside `Drop::drop`"
+        );
+        assert_eq!(
+            rep.anneal,
+            AnnealOutcome::PassScalar {
+                bits: 5,
+                size_bytes: 4
+            },
+            "known Category 9 `Drop` gap `{name}` changed (fixed?); update the pin and \
+             tests/miri-diff/README.md"
+        );
+    }
 }
