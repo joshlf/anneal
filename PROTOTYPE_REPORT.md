@@ -6,10 +6,11 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **B1 adversarial critique & hardening pass** (to be finalized in round A4 with the
-GO / CONDITIONAL GO / NO-GO recommendation). All declarations of the overlay (including all
-84 pinned headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` —
-zero `Classical.choice`, zero `sorry`, zero `native_decide` (see §5).
+Status: **A1 critique & fix pass** (to be finalized in round A4 with the GO / CONDITIONAL GO /
+NO-GO recommendation). All declarations of the overlay (including all 89 pinned headline
+theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero `Classical.choice`,
+zero `sorry`, zero `native_decide` (see §5). The overlay is differentially tested against the
+unpatched `Trusted` stepper on all 235 MiniRust witness bodies (§2b).
 
 ## 1. What was built
 
@@ -25,6 +26,15 @@ witness bodies) and reuses the unmodified `Trusted` helpers (`treeBorrowNodeAcce
 `projectionsOverlap`, `readProjectedValue`, `writeProjectedValue`, `evalScalarBinOp`,
 `evalBinOpOffset`, `sharedBorrowPerm`, `mutableBorrowPerm`, `retagPerm`, `initLocals`, …).
 Unmodeled constructs fail closed with `.unsupported`.
+
+Besides the constructs needed by the eight items, the overlay executes (A1, mirroring
+`Trusted.evalRvalue` / `Trusted.evalStmt`): `UnOp.{Not, Neg}` (`evalUnaryNot`),
+`CopyForDeref`, `Repeat`, `WrapUnsafeBinder`, array / closure aggregates, `IntToInt` casts,
+thin `PtrToPtr` casts, the layout-aware `Discriminant` (`evalPlaceDiscriminant`: single-variant
+layouts, variant bounds, `core::cmp::Ordering`), `Deinit`, `PlaceMention`
+(`placeMentionOperandsInit`), `Assume`, and `BackwardIncompatibleDropHint`. A safe reference
+`&*p` through a pointer with a non-zero byte offset fails closed (the overlay has no
+sub-local addresses, so it cannot check alignment: `RefWitness.misalignedRef`).
 
 ### Part B — pure `BitVec 32` / `BitVec 64` IEEE-754 casts
 
@@ -82,6 +92,34 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
      `hasFrameDeallocProtectorConflict` and `disableFrameBorrows` before popping the frame /
      restoring caller protectors.
 
+## 2b. Corpus differential: overlay vs. unpatched `Trusted` (235 MiniRust witness bodies)
+
+`CorpusDifferentialTests` runs `runMirProto` and the unpatched `Trusted` stepper (`runA` /
+`faultsA`) on every `def _ : CapturedMir` of `Witness`, `PointerWitness`, `RefWitness`,
+`TbWitness`, and `ProvenanceWitness` (all corpus bodies as callees, default scalar
+arguments), and pins the outcome classes:
+
+| Outcome | Bodies |
+|---------|--------|
+| identical outcome (value / UB / both indefinite) | 138 + 11 |
+| definite divergence, overlay = MiniRust ground truth | 7 |
+| overlay fails closed, `Trusted` definite (`FAIL_CLOSED_CORPUS`) | 30 |
+| skipped (non-scalar arguments) | 49 |
+
+The 7 definite divergences (`EXPECTED_CORPUS_DIVERGENCES`; every one is an overlay *fix*):
+`callerRefMutSilentWrongLocalMir` (42 vs 137) and `callerBorrowAcrossScalarCallMir` (42 vs
+UB) — tracked items 1–2; **`callerRefMutProtectedMir` (84 vs UB; `Mach`/`MachTB` = 84 by
+`callRefMutProtectedRoundTrip_mach_and_tb`) and `callerRefMutProtectedBadCallDstMir` (42 vs
+UB)** — further instances of the `DIV-MR-CALL-TARGET-LOCAL` frame bug not listed in the
+tracker; `retagFnEntryLocalDeallocUb` (UB vs 5) — tracked item 4; and two out-of-fragment
+`Trusted` divergences that the overlay happens to fix: `argCountMismatchCaller` (UB vs 5;
+`argCountMismatch_minirust_ub`) and `uninitProjCallDestCaller` (251 vs UB;
+`uninitProjCallDest_minirust_ret`). The 30 fail-closed bodies are exactly the unmodeled
+exposed-provenance / int-to-pointer casts (19), `transmute` (8), array-element `PtrToPtr`
+re-derivation (1), and sub-local byte offsets (2). No body yields a definite overlay result
+where `Trusted` is indefinite. `overlay_coverage_canaries` re-proves 15 of these agreements
+(values and UB) in the kernel.
+
 ## 3. Track A edit plan (draft)
 
 | File | Edit |
@@ -99,6 +137,8 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 | `…/MirSemantics/Places.lean` (`evalRvalue .cast`) | `CastKind.{floatToInt, intToFloat, floatToFloat}` via the Part B functions |
 | `V2026_08_01` mirror of every edit above | same |
 | Downstream (`DIV-LM-RAW-OVERWRITE-CHAR-COPY`) | `SimLM2_1.lean` (`WellTypedLM2_1ScalarOperand.validateLoadedValue_true`), `SimLM2_4.lean` (`validateLoadedValue_unionField_true`), `SymReflect.lean` (symbolic `.char` arguments), `MiniRustSpec/Correspondence/AnnealEval.lean` |
+| `minirust/lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean` | the frame fix also flips `callRefMutProtected_anneal_ret` (`Trusted` UB → 84 = `Mach`/`MachTB`) and the `callerRefMutProtectedBadCallDstMir` caller; update those statements together with items 1–2 (§2b) |
+| `…/MirSemantics/Terminators.lean` (`Call` / `Return`) | as in the overlay: check the callee's arity at `Call` (MiniRust "call ABI violation", flips `argCountMismatch_*`) and write `_0` back with the general place write (uninit-field shell; flips `uninitProjCallDest_*`) — optional, outside the eight items |
 | Tracker | retire the 8 IDs in `scripts/run_nightly_verification_suite.py` once the witnesses flip |
 
 ## 4. Part B specification summary
@@ -122,12 +162,19 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
   (`convertFloatBits_nan_quiet`), signaling-NaN canary (`f64ToF32_signaling_nan_quietized`),
   subnormal/overflow/underflow/signed-zero canaries, and single-rounding vs double-rounding /
   subnormal-to-normal carry-out canaries (`f64ToF32_subnormal_and_double_rounding_canaries`).
+* **Correct rounding (A1)**: `roundRatioTiesToEven_correctly_rounded` pins the rounding quantum
+  to the IEEE-754 ULP (`ratioExponent = ⌊log2 (n/d)⌋`; `2^fb ≤ scaled < 2^(fb+1)` in the
+  normal range, subnormal quantum below it) on top of the ½-ULP / ties-to-even / exact-value
+  statements of `roundRatioTiesToEven_float_half_ulp`; `roundRatioTiesToEven_overflow_of`
+  proves overflow to `±∞` past the top binade and on carry-out at `maxExponent`; both cast
+  bundles now state that every int→float cast and every finite float→float conversion *is*
+  `roundRatioTiesToEven` of the exact source value.
 * `CastKind` wiring: `castKind_end_to_end` (`runMirProto` on real `Rvalue.cast` bodies);
   unpatched `Trusted.evalRvalue` returns `.unsupported` (`castKind_trusted_unsupported`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 84 headline theorems (§7 of the Lean file); the
+* `#guard_msgs in #print axioms` pins all 89 headline theorems (§7 of the Lean file); the
   audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,
@@ -150,9 +197,11 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 
 ## 6. Known limitations of the prototype
 
-* Fail-closed (`.unsupported`): globals / untracked provenance, deref of a non-zero
-  pointer offset, index/subslice borrow projections, unwinding, external calls,
-  `f16` / `f128`.
+* Fail-closed (`.unsupported`): globals / untracked provenance, exposed provenance and
+  int-to-pointer casts, `transmute`, wide-pointer and array-element `PtrToPtr` casts, deref
+  or `&*p` at a non-zero pointer offset, index/subslice borrow projections, unions
+  (`Aggregate` with an active field), `Len`, unwinding, external calls, `f16` / `f128`
+  (30 of the 235 corpus bodies; `FAIL_CLOSED_CORPUS`).
 * Direct (non-deref) local reads do not apply Tree Borrows foreign-read transitions —
   identical to `Trusted` (pre-existing; out of scope of the eight items).
 * No `rangeOffset` / `rangeLen` byte-ranged entries.

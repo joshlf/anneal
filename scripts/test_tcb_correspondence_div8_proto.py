@@ -174,6 +174,12 @@ HEADLINE_THEOREMS = (
     "f64ToF32_subnormal_and_double_rounding_canaries",
     "roundRatioBits_valid_and_not_nan",
     "roundRatioTiesToEven_float_half_ulp",
+    # A1: end-to-end write frame isolation, corpus coverage, correct rounding, overflow
+    "writePlaceProto_direct_frame_isolation",
+    "writePlaceProto_deref_frame_isolation",
+    "overlay_coverage_canaries",
+    "roundRatioTiesToEven_correctly_rounded",
+    "roundRatioTiesToEven_overflow_of",
 )
 
 
@@ -192,6 +198,164 @@ MINIRUST_BRIDGES = (
 )
 BRIDGE_NAMESPACE = "TcbDiv8ProtoBridge"
 BRIDGE_ALLOWED_AXIOMS = ALLOWED_AXIOMS | {"Classical.choice"}
+
+
+# ---------------------------------------------------------------------------
+# MiniRust witness corpus: prototype vs. unpatched `Trusted` differential
+# ---------------------------------------------------------------------------
+
+CORPUS_DIR = REPO / "minirust" / "lean" / "MiniRustSpec" / "Correspondence"
+CORPUS_MODULES = {
+    "Witness.lean": "MiniRustSpec.Correspondence.Witness",
+    "PointerWitness.lean": "MiniRustSpec.Correspondence.PointerWitness",
+    "RefWitness.lean": "MiniRustSpec.Correspondence.RefWitness",
+    "TbWitness.lean": "MiniRustSpec.Correspondence.TbWitness",
+    "ProvenanceWitness.lean": "MiniRustSpec.Correspondence.ProvenanceWitness",
+}
+CORPUS_PREFIX = "MiniRustSpec.Correspondence."
+
+# Bodies on which the prototype and the unpatched `Trusted` stepper both produce a
+# definite outcome (value or UB) but disagree. Each entry is (prototype, Trusted) and is
+# justified by an upstream MiniRust ground-truth theorem that the prototype agrees with.
+EXPECTED_CORPUS_DIVERGENCES = {
+    # DIV-MR-CALL-TARGET-LOCAL (`callerRefMutSilentWrongLocal_divergence`: Mach/MachTB = 42).
+    "ProvenanceWitness.callerRefMutSilentWrongLocalMir": ("ok 42/4", "ok 137/4"),
+    # DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL (Mach/MachTB = 42).
+    "ProvenanceWitness.callerBorrowAcrossScalarCallMir": ("ok 42/4", "ub"),
+    # Same frame-qualification bug (`callRefMutProtectedRoundTrip_mach_and_tb`: 84).
+    "ProvenanceWitness.callerRefMutProtectedMir": ("ok 84/4", "ub"),
+    # Same frame-qualification bug; the call writes its result to the borrowed `_1`.
+    "ProvenanceWitness.callerRefMutProtectedBadCallDstMir": ("ok 42/4", "ub"),
+    # DIV-MR-TB-FNENTRY-LOCAL-DEALLOC (`retagFnEntryLocalDeallocUb_tb_direct`: UB).
+    "RefWitness.retagFnEntryLocalDeallocUb": ("ub", "ok 5/4"),
+    # `argCountMismatch_minirust_ub`: MiniRust reports a call-ABI arity violation.
+    "Witness.argCountMismatchCaller": ("ub", "ok 5/4"),
+    # `uninitProjCallDest_minirust_ret`: MiniRust writes the field of the uninit tuple.
+    "Witness.uninitProjCallDestCaller": ("ok 251/1", "ub"),
+}
+
+# Bodies that `Trusted` evaluates definitively but on which the prototype fails closed
+# (`.unsupported`): the deliberately unmodeled exposed-provenance / int-to-pointer /
+# transmute / wide-pointer / sub-local byte-offset constructs (PROTOTYPE_REPORT.md §6).
+FAIL_CLOSED_CORPUS: frozenset[str] = frozenset({
+    # `pointerExposeProvenance` / `pointerWithExposedProvenance` (exposed provenance,
+    # int-to-pointer casts): not modeled by the frame-qualified borrow table.
+    "PointerWitness.exposeTwice",
+    "ProvenanceWitness.assumeReborrowExposeRoundTrip",
+    "ProvenanceWitness.calleeBorrowAssumeAddMir",
+    "ProvenanceWitness.callerBorrowExposeAndScalarCallMir",
+    "ProvenanceWitness.callerCrossFrameExposeMir",
+    "ProvenanceWitness.callerLoopCallExposeCalleeMir",
+    "ProvenanceWitness.callerPrePostCallExposeMir",
+    "ProvenanceWitness.int2ptrAdjacentArgsAmbiguous",
+    "ProvenanceWitness.int2ptrAfterStorageDeadTwoExposed",
+    "ProvenanceWitness.int2ptrAfterStorageDeadUb",
+    "ProvenanceWitness.int2ptrForgedTag",
+    "ProvenanceWitness.transmuteExposedAddrToRawPtrDerefUb",
+    "TbWitness.exposeSharedRefWriteUb",
+    "TbWitness.exposeSingleRefMutRoundTrip",
+    "TbWitness.exposeTwoRefMutAngelicUnsupported",
+    "TbWitness.int2ptrDeadAllocDerefUb",
+    "TbWitness.int2ptrMultiAllocBoundaryUnsupported",
+    "TbWitness.int2ptrRawRoundTripOk",
+    "TbWitness.int2ptrUnexposedDerefUb",
+    # `CastKind.transmute` (byte-level reinterpretation, `Trusted.evalByteCast`).
+    "RefWitness.refRawTransmuteChain",
+    "RefWitness.transmuteDanglingIntToRawPtrNoDerefOk",
+    "RefWitness.transmuteDanglingIntToRefDiscrepancy",
+    "RefWitness.transmuteSharedRefToMutWriteDiscrepancy",
+    "RefWitness.transmuteUninitRefUb",
+    "TbWitness.boolInvalidByteRefUb",
+    "TbWitness.boolInvalidLoadDirectUb",
+    "TbWitness.stdOrderingMutRefCmp",
+    # Array-element pointer re-derivation in `ptrToPtr` (`deriveStackElemThinPtr`).
+    "PointerWitness.arrayElemPtr",
+    # Sub-local byte offsets: deref / `&*p` with `offsetBytes ≠ 0` (misaligned pointers).
+    "PointerWitness.misaligned",
+    "RefWitness.misalignedRef",
+})
+
+CORPUS_LEAN = r"""
+namespace TcbDiv8ProtoCorpus
+open Trusted.Rustc.V2026_06_01 Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics
+open Anneal.TcbCorrespondenceDiv8AndFloatPrototype
+
+def defaultArgOfTy : RigidTy → Option Value
+  | .bool => some (.scalar ⟨1, 1⟩)
+  | .char => some (.scalar ⟨0x41, 4⟩)
+  | .uint .u8 => some (.scalar ⟨5, 1⟩)
+  | .int .i8 => some (.scalar ⟨5, 1⟩)
+  | .uint .u16 => some (.scalar ⟨5, 2⟩)
+  | .int .i16 => some (.scalar ⟨5, 2⟩)
+  | .uint .u32 => some (.scalar ⟨5, 4⟩)
+  | .int .i32 => some (.scalar ⟨5, 4⟩)
+  | .uint .u64 => some (.scalar ⟨5, 8⟩)
+  | .int .i64 => some (.scalar ⟨5, 8⟩)
+  | .uint .usize => some (.scalar ⟨5, 8⟩)
+  | .int .isize => some (.scalar ⟨5, 8⟩)
+  | .uint .u128 => some (.scalar ⟨5, 16⟩)
+  | .int .i128 => some (.scalar ⟨5, 16⟩)
+  | _ => none
+
+def defaultArgs (body : CapturedMir) : Option (List Value) :=
+  ((body.localDecls.drop 1).take body.argCount).mapM (fun d => defaultArgOfTy d.ty.kind)
+
+partial def valStr : Value → String
+  | .unit => "unit"
+  | .scalar sc => s!"{sc.bits}/{sc.sizeBytes}"
+  | .ptr _ sz => s!"ptr/{sz}"
+  | .aggregate i vs => s!"agg{i}(" ++ ",".intercalate (vs.map valStr) ++ ")"
+
+def protoClass : ProtoOutcome → String
+  | .ok v => "ok " ++ valStr v
+  | .ub => "ub"
+  | .unsupported => "unsupported"
+  | .outOfFuel => "fuel"
+
+def trustedClass (callees : List CapturedMir) (body : CapturedMir) (args : List Value) : String :=
+  match MiniRustSpec.Correspondence.runA body 256 (initMachineStateWithCallees body args callees) with
+  | some (_, .normal (v, _)) => "ok " ++ valStr v
+  | some _ => "other"
+  | none =>
+    if MiniRustSpec.Correspondence.faultsA body 256 (initMachineStateWithCallees body args callees)
+    then "ub" else "none"
+
+def line (callees : List CapturedMir) (name : String) (body : CapturedMir) : String :=
+  match defaultArgs body with
+  | none => s!"CORPUS|{name}|skip|skip"
+  | some a => s!"CORPUS|{name}|{protoClass (runMirProto body callees a)}|{trustedClass callees body a}"
+"""
+
+
+def corpus_bodies() -> list[str]:
+    """Every `def _ : CapturedMir` body of the five MiniRust witness modules."""
+    bodies: list[str] = []
+    for fname, ns in CORPUS_MODULES.items():
+        text = (CORPUS_DIR / fname).read_text(encoding="utf-8")
+        for m in re.finditer(r"(?m)^def (\w+) : CapturedMir(?: :=| where)", text):
+            bodies.append(f"{ns}.{m.group(1)}")
+    return bodies
+
+
+def corpus_harness_lines(bodies: list[str]) -> list[str]:
+    lines = [CORPUS_LEAN, "def corpus : List CapturedMir := [", "  " + ",\n  ".join(bodies) + "]"]
+    lines.append("end TcbDiv8ProtoCorpus")
+    for b in bodies:
+        lines.append(f'#eval IO.println (TcbDiv8ProtoCorpus.line TcbDiv8ProtoCorpus.corpus "{b}" {b})')
+    return lines
+
+
+def _parse_corpus(stdout: str) -> dict[str, tuple[str, str]]:
+    out: dict[str, tuple[str, str]] = {}
+    for line in stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 4 and parts[0] == "CORPUS":
+            out[parts[1].removeprefix(CORPUS_PREFIX)] = (parts[2], parts[3])
+    return out
+
+
+def _definite(outcome: str) -> bool:
+    return outcome == "ub" or outcome.startswith("ok ")
 
 
 def declared_names(source: str) -> list[str]:
@@ -558,7 +722,9 @@ def build_harness(source: str, f64_vals, f32_vals, ints) -> tuple[str, list[tupl
             f"MiniRustSpec.Correspondence.ProvenanceWitness.{theirs} := rfl"
         )
         lines.append(f"#print axioms bridge_{theirs}")
-    lines += [f"end {BRIDGE_NAMESPACE}", "", "open Trusted.Rustc.V2026_06_01.MirAst", f"open {NAMESPACE}", ""]
+    lines += [f"end {BRIDGE_NAMESPACE}", ""]
+    lines += corpus_harness_lines(corpus_bodies())
+    lines += ["", "open Trusted.Rustc.V2026_06_01.MirAst", f"open {NAMESPACE}", ""]
     # float -> int
     for fmt, vals in (("binary64", f64_vals), ("binary32", f32_vals)):
         for spec in INT_SPECS:
@@ -721,6 +887,49 @@ class KernelReplayTests(unittest.TestCase):
             self.assertIn(full, axioms, f"bridge {full} failed to elaborate")
             used = axioms[full]
             self.assertTrue(used <= BRIDGE_ALLOWED_AXIOMS, f"{full} uses unexpected axioms {used}")
+
+
+class CorpusDifferentialTests(unittest.TestCase):
+    """Prototype vs. unpatched `Trusted` on every MiniRust witness body (default args)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.results = _parse_corpus(_HarnessCache.get().stdout)
+        cls.bodies = [b.removeprefix(CORPUS_PREFIX) for b in corpus_bodies()]
+
+    def test_every_corpus_body_executed(self) -> None:
+        self.assertGreater(len(self.bodies), 200)
+        missing = [b for b in self.bodies if b not in self.results]
+        self.assertEqual(missing, [], f"corpus bodies without a result: {missing}")
+
+    def test_no_unexpected_definite_divergence(self) -> None:
+        unexpected = {}
+        for body, (proto, trusted) in self.results.items():
+            if proto != trusted and _definite(proto) and _definite(trusted):
+                if EXPECTED_CORPUS_DIVERGENCES.get(body) != (proto, trusted):
+                    unexpected[body] = (proto, trusted)
+        self.assertEqual(unexpected, {}, f"unexpected prototype/Trusted divergences: {unexpected}")
+
+    def test_expected_divergences_observed(self) -> None:
+        for body, expected in EXPECTED_CORPUS_DIVERGENCES.items():
+            self.assertEqual(self.results.get(body), expected, body)
+
+    def test_fail_closed_boundary(self) -> None:
+        fail_closed = {
+            body for body, (proto, trusted) in self.results.items()
+            if not _definite(proto) and _definite(trusted)
+        }
+        self.assertEqual(sorted(fail_closed - FAIL_CLOSED_CORPUS), [],
+                         "prototype newly fails closed where Trusted is definite")
+        self.assertEqual(sorted(FAIL_CLOSED_CORPUS - fail_closed), [],
+                         "stale FAIL_CLOSED_CORPUS entries (now executed: shrink the allowlist)")
+
+    def test_no_definite_prototype_result_where_trusted_is_indefinite(self) -> None:
+        extra = {
+            body: res for body, res in self.results.items()
+            if _definite(res[0]) and res[1] in ("none", "other")
+        }
+        self.assertEqual(extra, {}, f"prototype defines behavior Trusted does not: {extra}")
 
 
 class Ieee754DifferentialTests(unittest.TestCase):

@@ -1102,7 +1102,37 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
   let decls := s.body.localDecls
   let layouts := s.body.layouts
   match rv with
-  | .use op => evalOperandProto cfg s op
+  | .use op | .wrapUnsafeBinder op _ => evalOperandProto cfg s op
+  | .copyForDeref place =>
+    -- `Trusted.evalRvalue .copyForDeref`: an unvalidated copy of the (pointer) place.
+    readPlaceProto cfg s place
+  | .repeat op count =>
+    match evalOperandProto cfg s op with
+    | .ok v s₁ => .ok (.aggregate 0 (replicateValue count v)) s₁
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .unaryOp .not op =>
+    match evalOperandProto cfg s op with
+    | .ok (.scalar sc) s₁ =>
+      match evalUnaryNot sc (operandTy decls layouts op) s₁.frame.locals emptyMemory with
+      | .ok v _ _ => .ok v s₁
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ok _ _ => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .unaryOp .neg op =>
+    match evalOperandProto cfg s op with
+    | .ok (.scalar sc) s₁ =>
+      match Nat.beq sc.sizeBytes 0 with
+      | true => .unsupported
+      | false =>
+        let modulus := scalarModulus sc.sizeBytes
+        let canonical := wrapScalarBits sc.bits modulus
+        .ok (.scalar ⟨wrapScalarBits (Nat.sub modulus canonical) modulus, sc.sizeBytes⟩) s₁
+    | .ok _ _ => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
   | .binaryOp op lhsOp rhsOp =>
     match evalOperandProto cfg s lhsOp with
     | .ok lhsVal s₁ =>
@@ -1146,7 +1176,10 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
           match eagerReject with
           | true => .ub
           | false =>
-            match isFieldOnlyProj rest with
+            -- Safe references need an aligned, dereferenceable address; the overlay models
+            -- no sub-local byte offsets, so `&*p` with `offsetBytes ≠ 0` fails closed
+            -- (e.g. `RefWitness.misalignedRef`, where MiniRust and `Trusted` raise UB).
+            match Bool.and (isFieldOnlyProj rest) (Nat.beq ptrVal.offsetBytes 0) with
             | false => .unsupported
             | true =>
               let fullProj := appendProjections parent.targetProjection rest
@@ -1235,9 +1268,14 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
           .ok (.ptr { allocId := tag, offsetBytes := 0 } ptrBytes)
             { s with memory := { s.memory with borrows := entry :: s.memory.borrows, nextTag := tag + 1 } }
   | .discriminant place =>
+    -- Layout-aware discriminant (`Trusted.evalPlaceDiscriminant`: single-variant layouts,
+    -- variant bounds, `core::cmp::Ordering` encoding, scalar-represented enums).
     match readPlaceProto cfg s place with
-    | .ok (.aggregate variantIdx _) s' => .ok (.scalar ⟨variantIdx, 8⟩) s'
-    | .ok _ _ => .unsupported
+    | .ok val s₁ =>
+      match evalPlaceDiscriminant val s₁.frame.locals emptyMemory place decls layouts with
+      | .ok v _ _ => .ok v s₁
+      | .ub => .ub
+      | .unsupported => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
   | .cast kind op targetTy =>
@@ -1250,8 +1288,47 @@ def evalRvalueProto (cfg : ProtoConfig) (s : ProtoMachineState) (rv : Rvalue) : 
         | .none => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported
+    | .intToInt =>
+      -- `Trusted.evalRvalue (.cast .intToInt ..)`: wrap / sign-extend to the target width.
+      match evalOperandProto cfg s op with
+      | .ok (.scalar sc) s₁ =>
+        match Nat.beq sc.sizeBytes 0 with
+        | true => .unsupported
+        | false =>
+          match intCastTargetBytes targetTy.kind with
+          | .some targetBytes =>
+            let modulus := scalarModulus targetBytes
+            let castedBits :=
+              match operandIsSigned decls op layouts with
+              | false => wrapScalarBits sc.bits modulus
+              | true =>
+                match Nat.ble targetBytes sc.sizeBytes with
+                | true => wrapScalarBits sc.bits modulus
+                | false => signExtendBits sc.bits sc.sizeBytes targetBytes
+            .ok (.scalar ⟨castedBits, targetBytes⟩) s₁
+          | .none => .unsupported
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ptrToPtr =>
+      -- Thin raw-pointer casts keep the provenance tag (`Trusted.evalCastPtrToPtr`); the
+      -- array-element re-derivation and wide-pointer cases fail closed.
+      match evalOperandProto cfg s op with
+      | .ok (.ptr ptrVal sz) s₁ =>
+        match Nat.beq sz (layoutPointerBytes layouts) with
+        | false => .ub
+        | true =>
+          match thinRawPtrPointee? targetTy with
+          | .none => .ub
+          | .some dstElem =>
+            match arrayPtrOrRefElemLen? (operandTy decls layouts op) dstElem with
+            | .some _ => .unsupported
+            | .none => .ok (.ptr ptrVal sz) s₁
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported
     | _ => .unsupported
-  | .aggregate .tuple ops =>
+  | .aggregate .tuple ops | .aggregate (.array _) ops | .aggregate (.closure _) ops =>
     match evalOperandsProto cfg s ops with
     | .ok vals s₁ => .ok (.aggregate 0 vals) s₁
     | .ub => .ub
@@ -1431,6 +1508,49 @@ def evalStmtProto (cfg : ProtoConfig) (s : ProtoMachineState) (stmt : Statement)
     | .nil => evalSetDiscriminantProto cfg s p.local_ variantIdx
     | _ :: _ => .unsupported
   | .retag kind place => evalRetagProto cfg s kind place
+  | .backwardIncompatibleDropHint _ => .step (advanceStmtProto s)
+  | .deinit p =>
+    -- `Trusted.evalStmt .deinit` on the active frame.
+    match p.projection with
+    | .nil =>
+      match get? s.frame.locals p.local_ with
+      | .some .dead => .ub
+      | .some _ =>
+        match set? s.frame.locals p.local_ .uninit with
+        | .some locals' => .step (advanceStmtProto { s with frame := { s.frame with locals := locals' } })
+        | .none => .ub
+      | .none => .ub
+    | proj :: rest =>
+      match projectionHasDeref (proj :: rest) with
+      | true => .unsupported
+      | false =>
+        match get? s.frame.locals p.local_ with
+        | .some (.init rootVal) =>
+          match readProjectedValue s.frame.locals rootVal (proj :: rest) with
+          | .ok _ => .step (advanceStmtProto s)
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | _ => .ub
+  | .placeMention place =>
+    -- `Trusted.evalStmt .placeMention`: the root local must be live and every index
+    -- operand initialized; no memory access is performed.
+    match get? s.frame.locals place.local_ with
+    | .none => .ub
+    | .some .dead => .ub
+    | .some rootSlot =>
+      match placeMentionOperandsInit s.frame.locals rootSlot place.projection with
+      | true => .step (advanceStmtProto s)
+      | false => .ub
+  | .intrinsic (.assume op) =>
+    -- `Trusted.evalStmt (.intrinsic (.assume op))`: `op` must evaluate to `true`.
+    match evalOperandProto cfg s op with
+    | .ok (.scalar sc) s₁ =>
+      match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+      | true => .step (advanceStmtProto s₁)
+      | false => .ub
+    | .ok _ _ => .ub
+    | .ub => .ub
+    | .unsupported => .unsupported
   | _ => .unsupported
 
 /-- Find an inline callee body by `defPath`. -/
@@ -2623,6 +2743,63 @@ theorem entryAccessTransitionProto_other_frame (cfg : ProtoConfig) (borrows : Li
     rw [nat_beq_eq_decide]; simp [h]
   simp [entryAccessTransitionProto, entryTargetsProto, hb]
 
+/-- `commitFrameWriteProto` installs exactly the given borrow table. -/
+theorem commitFrameWriteProto_borrows {s s' : ProtoMachineState} {d loc : Nat} {r : Value}
+    {b : List ProtoBorrowEntry} (h : commitFrameWriteProto s d loc r b = .ok s') :
+    s'.memory.borrows = b := by
+  unfold commitFrameWriteProto at h
+  split at h
+  · cases h; rfl
+  · cases h
+
+/-- **End-to-end frame isolation of direct writes** (`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`):
+every *successful* `writePlaceProto` to a deref-free place `_loc.proj` of the active frame
+(depth `currentFrameDepth s`) leaves every borrow entry of every other frame unchanged,
+position by position. -/
+theorem writePlaceProto_direct_frame_isolation (cfg : ProtoConfig) (s s' : ProtoMachineState)
+    (loc : Nat) (proj : List ProjectionElem) (v : Value)
+    (hnd : projectionHasDeref proj = false)
+    (h : writePlaceProto cfg s ⟨loc, proj⟩ v = .ok s')
+    (i : Nat) (hi : i < s.memory.borrows.length)
+    (hd : s.memory.borrows[i].targetFrameDepth ≠ currentFrameDepth s) :
+    s'.memory.borrows[i]? = .some s.memory.borrows[i] := by
+  have hb : s'.memory.borrows = invalidateConflictingBorrowsAtProjProto cfg s.memory.borrows
+      s.memory.activeProtectors (currentFrameDepth s) loc proj .none := by
+    unfold writePlaceProto at h
+    split at h
+    · rename_i rest heq
+      simp only at heq
+      subst heq
+      simp [projectionHasDeref] at hnd
+    · simp only [hnd] at h
+      repeat' split at h
+      all_goals first | exact commitFrameWriteProto_borrows h | cases h
+  rw [hb]
+  exact div_mr_caller_borrow_frame_isolation cfg _ _ _ _ _ _ i hi hd
+
+/-- **End-to-end frame isolation of deref writes** (`DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`
++ `DIV-MR-CALL-TARGET-LOCAL`): every *successful* write through `*_loc` whose tag resolves
+to `entry` leaves every borrow entry of every frame other than the pointee's frame
+`entry.targetFrameDepth` unchanged, position by position. -/
+theorem writePlaceProto_deref_frame_isolation (cfg : ProtoConfig) (s s' : ProtoMachineState)
+    (loc : Nat) (rest : List ProjectionElem) (v : Value) (ptrVal : ProvenancePtr) (sz : Nat)
+    (entry : ProtoBorrowEntry)
+    (hloc : get? s.frame.locals loc = .some (.init (.ptr ptrVal sz)))
+    (hlook : lookupProtoBorrow s.memory.borrows ptrVal.tag = .some entry)
+    (h : writePlaceProto cfg s ⟨loc, .deref :: rest⟩ v = .ok s')
+    (i : Nat) (hi : i < s.memory.borrows.length)
+    (hd : s.memory.borrows[i].targetFrameDepth ≠ entry.targetFrameDepth) :
+    s'.memory.borrows[i]? = .some s.memory.borrows[i] := by
+  have hb : s'.memory.borrows = invalidateConflictingBorrowsAtProjProto cfg s.memory.borrows
+      s.memory.activeProtectors entry.targetFrameDepth entry.targetLocal
+      (appendProjections entry.targetProjection rest) (.some ptrVal.tag) := by
+    unfold writePlaceProto at h
+    simp only [hloc, hlook] at h
+    repeat' split at h
+    all_goals first | exact commitFrameWriteProto_borrows h | cases h
+  rw [hb]
+  exact div_mr_caller_borrow_frame_isolation cfg _ _ _ _ _ _ i hi hd
+
 /-- The deallocation rule agrees with MiniRust's `PermissionProt::prevents_deallocation`
 under the embedding of Anneal's six states (every entry has had its initial local read;
 `.reservedIM` fails closed). -/
@@ -3128,6 +3305,49 @@ theorem div_lm_enum_set_discr_borrow_invalidation_and_protector_canary :
    ProtoOutcome.eq_ub_of_isUB (by decide +kernel), ProtoOutcome.eq_ub_of_isUB (by decide +kernel),
    by decide +kernel⟩
 
+/-- **Overlay coverage canaries** (A1 corpus differential): the MIR constructs added so that
+the overlay executes the MiniRust witness corpus like `Trusted` — `UnOp.{Not, Neg}`,
+`CopyForDeref`, `Deinit`, `PlaceMention`, `Assume`, `IntToInt` casts, and the layout-aware
+`Discriminant` — agree with the unpatched `Trusted` stepper on real corpus bodies, both on
+values and on UB. (`scripts/test_tcb_correspondence_div8_proto.py` replays the full
+235-body corpus differential.) -/
+theorem overlay_coverage_canaries :
+    runMirProto MiniRustSpec.Correspondence.Witness.negMention [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨4294967291, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.negMention [] [.scalar ⟨5, 4⟩] 256 = .some (4294967291, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.signedEdge [] [.scalar ⟨5, 1⟩] = .ok (.scalar ⟨251, 1⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.signedEdge [] [.scalar ⟨5, 1⟩] 256 = .some (251, 1) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.tempMove [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨12, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.tempMove [] [.scalar ⟨5, 4⟩] 256 = .some (12, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.assumeSub [] [.scalar ⟨5, 4⟩, .scalar ⟨1, 1⟩] = .ok (.scalar ⟨4, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.assumeSub [] [.scalar ⟨5, 4⟩, .scalar ⟨1, 1⟩] 256 = .some (4, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.ordBoolCastTempMove [] [.scalar ⟨5, 1⟩, .scalar ⟨5, 1⟩, .scalar ⟨1, 1⟩] = .ok (.scalar ⟨0, 1⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.ordBoolCastTempMove [] [.scalar ⟨5, 1⟩, .scalar ⟨5, 1⟩, .scalar ⟨1, 1⟩] 256 = .some (0, 1) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.cmpDiscrSwitch [] [.scalar ⟨5, 1⟩, .scalar ⟨5, 1⟩, .scalar ⟨1, 1⟩] = .ok (.scalar ⟨0, 1⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.cmpDiscrSwitch [] [.scalar ⟨5, 1⟩, .scalar ⟨5, 1⟩, .scalar ⟨1, 1⟩] 256 = .some (0, 1) ∧
+    runMirProto MiniRustSpec.Correspondence.RefWitness.refMutReborrowWrite [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨15, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.RefWitness.refMutReborrowWrite [] [.scalar ⟨5, 4⟩] 256 = .some (15, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.RefWitness.refLoopCountdown [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨15, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.RefWitness.refLoopCountdown [] [.scalar ⟨5, 4⟩] 256 = .some (15, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.TbWitness.swapRefs [] [.scalar ⟨5, 4⟩, .scalar ⟨5, 4⟩] = .ok (.scalar ⟨505, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.TbWitness.swapRefs [] [.scalar ⟨5, 4⟩, .scalar ⟨5, 4⟩] 256 = .some (505, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.TbWitness.loopDerefCopyCountdown [] [.scalar ⟨5, 4⟩, .scalar ⟨5, 4⟩] = .ok (.scalar ⟨20, 4⟩) ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.TbWitness.loopDerefCopyCountdown [] [.scalar ⟨5, 4⟩, .scalar ⟨5, 4⟩] 256 = .some (20, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.castBitNot [] [.scalar ⟨5, 1⟩] = .ub ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.castBitNot [] [.scalar ⟨5, 1⟩] 256 = true ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.deadDeinit [] [] = .ub ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.deadDeinit [] [] 256 = true ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.deadPlaceMention [] [] = .ub ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.deadPlaceMention [] [] 256 = true ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.uninitBoolNot [] [] = .ub ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.uninitBoolNot [] [] 256 = true ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.assumeDeadLocal [] [.scalar ⟨5, 4⟩] = .ub ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.assumeDeadLocal [] [.scalar ⟨5, 4⟩] 256 = true := by
+  repeat' apply And.intro
+  all_goals first
+    | exact ProtoOutcome.eq_of_okScalar? (by decide +kernel)
+    | exact ProtoOutcome.eq_ub_of_isUB (by decide +kernel)
+    | decide +kernel
+
 end PartAWitnesses
 
 /-! ## §5. Part B witnesses: IEEE-754 casts on raw bit patterns -/
@@ -3290,18 +3510,19 @@ theorem evalFloatToFloatRoundTiesToEven_canaries :
   repeat' apply And.intro
   all_goals decide +kernel
 
-/-- **Subnormal single-rounding (no double-rounding) & carry-out canaries**:
-1. At `e = -127` (`f32.minExponent - 1`), `0x3800000017FFFFFF : f64` (`(2^22 + 0.5 - 2^-30) * 2^-149`)
-   rounds directly in one step to subnormal `0x00400000 : f32` (`2^22 * 2^-149`), whereas
-   first rounding the 53-bit significand to 24 bits (`roundQuotientTiesToEven (2^52 + 2^28 + 2^27 - 1) (2^29) = 2^23 + 1`)
-   and then shifting right into the subnormal slot (`roundQuotientTiesToEven (2^23 + 1) 2 = 2^22 + 1`)
-   would double-round up to `0x00400001`;
-2. Subnormal-to-normal carry-out boundary: `0x380FFFFFDFFFFFFF` rounds to greatest `f32`
-   subnormal `0x007FFFFF`, while `0x380FFFFFE0000000` (`2^-126 - 2^-150`) carries into
-   minimum normal `f32` `0x00800000` (`2^-126`);
-3. `u64 -> f32` single-rounding vs `u64 -> f64 -> f32` double-rounding separation on
-   `0x2000002FFFFFFF`: direct `evalIntToFloatRoundTiesToEven` yields `0x5A000001`, whereas
-   routing through `f64` double-rounds to `0x5A000002`. -/
+/-- **Subnormal single-rounding (no double rounding) & carry-out canaries**:
+1. At `e = -127` (`f32.minExponent - 1`), `0x3800_0000_5FFF_FFFF : f64`
+   (`(2^22 + 1.5 - 2^-30) * 2^-149`) rounds in one step to the subnormal
+   `0x0040_0001 : f32` (`(2^22 + 1) * 2^-149`), whereas first rounding the 53-bit
+   significand to 24 bits (`roundQuotientTiesToEven (2^52 + 2^30 + 2^29 - 1) (2^29) = 2^23 + 3`)
+   and then shifting into the subnormal slot (`roundQuotientTiesToEven (2^23 + 3) 2 = 2^22 + 2`,
+   a tie broken to even) would double-round to `0x0040_0002`;
+2. subnormal-to-normal carry-out: `0x380F_FFFF_DFFF_FFFF` rounds to the greatest `f32`
+   subnormal `0x007F_FFFF`, while `0x380F_FFFF_E000_0000` (`2^-126 - 2^-150`, an exact tie)
+   carries into the minimum normal `0x0080_0000` (`2^-126`);
+3. `u64 -> f32` single rounding vs `u64 -> f64 -> f32` double rounding on
+   `0x0040_0000_BFFF_FFFF = 2^54 + 3 * 2^30 - 1`: the direct cast yields `0x5A80_0001`,
+   whereas routing through `f64` (`2^54 + 3 * 2^30`) double-rounds to `0x5A80_0002`. -/
 theorem f64ToF32_subnormal_and_double_rounding_canaries :
     f64ToF32 0x380000005FFFFFFF#64 = 0x00400001#32 ∧
     roundQuotientTiesToEven
@@ -4762,6 +4983,66 @@ theorem roundRatioTiesToEven_float_half_ulp (f : IeeeFormat) (neg : Bool) (n d :
         rw [ht]
         exact ⟨rfl, rfl, powScale_snd_pos _ _, powScale_snd_pos _ _⟩
 
+/-- **Correct rounding of `roundRatioTiesToEven`** (strengthens
+`roundRatioTiesToEven_float_half_ulp` by pinning the rounding quantum to the IEEE-754 ULP):
+for `0 < n`, `0 < d`, with `e := ratioExponent n d`, `exponent := max e minExponent`,
+`scaled := powScale n d (fb - exponent)` (`scaled.1 / scaled.2 = (n/d) / 2^(exponent - fb)`)
+and `sig := roundQuotientTiesToEven scaled.1 scaled.2`:
+1. `e = ⌊log2 (n/d)⌋`, i.e. `1 ≤ (n/d) / 2^e < 2`;
+2. the quantum `2^(exponent - fb)` is the ULP of the binade of `n/d`:
+   `scaled < 2^(fb+1)`, and `2^fb ≤ scaled` whenever `n/d` is in the normal range
+   (`minExponent ≤ e`; otherwise `exponent = minExponent` is the subnormal quantum);
+3. `sig` is within `½` of `scaled`, resolving exact ties to an even significand;
+4. unless the result overflows to `±∞`, it decodes to exactly
+   `(-1)^neg * sig * 2^(exponent - fb)`. -/
+theorem roundRatioTiesToEven_correctly_rounded (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hn : 0 < n) (hd : 0 < d) :
+    let e := ratioExponent n d
+    let exponent := max e f.minExponent
+    let scaled := powScale n d ((f.fractionBits : Int) - exponent)
+    let sig := roundQuotientTiesToEven scaled.1 scaled.2
+    ((powScale n d (-e)).2 ≤ (powScale n d (-e)).1 ∧
+      (powScale n d (-e)).1 < 2 * (powScale n d (-e)).2) ∧
+    scaled.1 < 2 ^ (f.fractionBits + 1) * scaled.2 ∧
+    (f.minExponent ≤ e → 2 ^ f.fractionBits * scaled.2 ≤ scaled.1) ∧
+    2 * (((sig * scaled.2 : Nat) : Int) - (scaled.1 : Int)).natAbs ≤ scaled.2 ∧
+    (2 * (((sig * scaled.2 : Nat) : Int) - (scaled.1 : Int)).natAbs = scaled.2 → sig % 2 = 0) ∧
+    (decodeBits f (roundRatioTiesToEven f neg n d) ≠ .inf neg →
+      (decodeBits f (roundRatioTiesToEven f neg n d)).sameValue
+        (if sig = 0 then .zero neg
+         else .finite neg (powScale sig 1 (exponent - f.fractionBits)).1
+           (powScale sig 1 (exponent - f.fractionBits)).2)) := by
+  intro e exponent scaled sig
+  have hb := powScale_roundRatio_scaled_bounds f n d hn hd
+  have hh := roundRatioTiesToEven_float_half_ulp f neg n d hn hd
+  exact ⟨powScale_neg_ratioExponent_bounds n d hn hd, hb.1, hb.2.1, hh.1, hh.2.1, hh.2.2⟩
+
+/-- **Overflow to `±∞`** (sufficiency): `roundRatioTiesToEven` returns `±∞` when the exact
+value's binade exceeds `maxExponent`, or when it lies in the top binade and rounds up to
+`2^(fb+1) * 2^(maxExponent - fb) = 2^(maxExponent + 1)` (carry-out past the largest
+finite value, e.g. the `binary32` tie `2^128 - 2^103`). -/
+theorem roundRatioTiesToEven_overflow_of (f : IeeeFormat) (neg : Bool) (n d : Nat)
+    (hn : 0 < n) (hd : 0 < d)
+    (h : f.maxExponent < max (ratioExponent n d) f.minExponent ∨
+      (max (ratioExponent n d) f.minExponent = f.maxExponent ∧
+        roundQuotientTiesToEven
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).1
+            (powScale n d ((f.fractionBits : Int) - max (ratioExponent n d) f.minExponent)).2 =
+          2 ^ (f.fractionBits + 1))) :
+    roundRatioTiesToEven f neg n d = infBits f neg := by
+  have hd0 : d ≠ 0 := by omega
+  have hn0 : n ≠ 0 := by omega
+  unfold roundRatioTiesToEven roundRatioBits
+  simp only [hd0, hn0, ↓reduceIte, roundQuotient]
+  generalize hexp : max (ratioExponent n d) f.minExponent = exponent at h ⊢
+  generalize hsc : powScale n d ((f.fractionBits : Int) - exponent) = scaled at h ⊢
+  rcases h with h | ⟨he, hs⟩
+  · rw [if_pos' h]
+  · have hnot : ¬ (exponent > f.maxExponent) := by omega
+    have hov : exponent + 1 > f.maxExponent := by omega
+    rw [if_neg' hnot]
+    simp only [hs, Nat.le_refl, decide_true, ↓reduceIte, if_pos' hov]
+
 /-! ### Part B soundness bundles -/
 
 /-- **`evalIntToFloatRoundTiesToEven_sound`**: (1) every representable integer
@@ -4771,7 +5052,9 @@ theorem roundRatioTiesToEven_float_half_ulp (f : IeeeFormat) (neg : Bool) (n d :
 even significand, and at the float level `roundRatioTiesToEven` never produces NaN (`inconsistentRounding`
 is unreachable) and every non-overflowing result decodes to `sig * 2 ^ (exponent - fb)` within
 `½` ULP; (4) `u128::MAX` and the exact tie `2^128 - 2^103` overflow to `+∞` in `binary32`,
-while `2^128 - 2^103 - 1` rounds down to `f32::MAX`. -/
+while `2^128 - 2^103 - 1` rounds down to `f32::MAX`; (5) every int-to-float cast *is*
+`roundRatioTiesToEven` of the exact integer (so `roundRatioTiesToEven_correctly_rounded`
+applies verbatim). -/
 theorem evalIntToFloatRoundTiesToEven_sound :
     (∀ (signed : Bool) (w bits : Nat) (dst : IeeeFormat),
       (intValueOfBits signed w bits).natAbs < 2 ^ (dst.fractionBits + 1) →
@@ -4800,19 +5083,26 @@ theorem evalIntToFloatRoundTiesToEven_sound :
             (if sig = 0 then .zero neg
              else .finite neg (powScale sig 1 (exponent - f.fractionBits)).1
                (powScale sig 1 (exponent - f.fractionBits)).2))) ∧
+    (∀ (signed : Bool) (w bits : Nat) (dst : IeeeFormat),
+      evalIntToFloatRoundTiesToEven signed w bits dst =
+        roundRatioTiesToEven dst (decide (intValueOfBits signed w bits < 0))
+          (intValueOfBits signed w bits).natAbs 1) ∧
     evalIntToFloatRoundTiesToEven false 128 (2 ^ 128 - 1) .binary32 = 0x7F800000 ∧
     evalIntToFloatRoundTiesToEven false 128 (2 ^ 128 - 2 ^ 103) .binary32 = 0x7F800000 ∧
     evalIntToFloatRoundTiesToEven false 128 (2 ^ 128 - 2 ^ 103 - 1) .binary32 = 0x7F7FFFFF :=
   ⟨evalIntToFloatRoundTiesToEven_exact, evalIntToFloat_i32_u32_to_f64_exact,
    roundQuotientTiesToEven_half_ulp, roundQuotientTiesToEven_tie_even,
    roundRatioBits_valid_and_not_nan, roundRatioTiesToEven_float_half_ulp,
+   fun _ _ _ _ => rfl,
    by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- **`evalFloatToFloatRoundTiesToEven_sound`**: (1) `f32 → f64` preserves the exact value
 of, and round-trips, every non-NaN `F32Bits`; (2) every NaN input converts to a quiet NaN
 in every direction; (3) the signaling-NaN quietization canary (`0x7FF0_0000_0000_0001 ↦
 0x7FC0_0000`, never `+∞`); (4) `f64 → f32` narrowing of `-0.0`, gradual underflow to `+0`,
-the smallest subnormal at the half-way boundary, and overflow to `+∞` at the exact tie. -/
+the smallest subnormal at the half-way boundary, and overflow to `+∞` at the exact tie;
+(5) every finite nonzero input converts to `roundRatioTiesToEven` of its exact rational value
+(so `roundRatioTiesToEven_correctly_rounded` applies verbatim to `f64 → f32` narrowing). -/
 theorem evalFloatToFloatRoundTiesToEven_sound :
     (∀ x : F32Bits, isNaNBits .binary32 x.toNat = false →
       (decodeBits .binary64 (f32ToF64 x).toNat).sameValue (decodeBits .binary32 x.toNat) ∧
@@ -4825,11 +5115,15 @@ theorem evalFloatToFloatRoundTiesToEven_sound :
     f64ToF32 0x8000000000000000#64 = 0x80000000#32 ∧
     f64ToF32 0x3690000000000000#64 = 0x00000000#32 ∧
     f64ToF32 0x3690000000000001#64 = 0x00000001#32 ∧
-    f64ToF32 0x47EFFFFFF0000000#64 = 0x7F800000#32 :=
+    f64ToF32 0x47EFFFFFF0000000#64 = 0x7F800000#32 ∧
+    (∀ (src dst : IeeeFormat) (bits : Nat) (neg : Bool) (n d : Nat),
+      decodeBits src bits = .finite neg n d →
+      evalFloatToFloatRoundTiesToEven src dst bits = roundRatioTiesToEven dst neg n d) :=
   ⟨f32ToF64_exact_and_roundtrip,
    fun src dst bits h => convertFloatBits_nan_quiet .tiesToEven src dst bits h,
    ⟨f64ToF32_signaling_nan_quietized.1, f64ToF32_signaling_nan_quietized.2.1⟩,
-   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   fun src dst bits neg n d h => convertFloatBits_of_finite .tiesToEven src dst bits neg n d h⟩
 
 end PartBTheorems
 
@@ -5179,6 +5473,26 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioTiesToEven_float_half_ulp' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms roundRatioTiesToEven_float_half_ulp
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.writePlaceProto_direct_frame_isolation' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms writePlaceProto_direct_frame_isolation
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.writePlaceProto_deref_frame_isolation' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms writePlaceProto_deref_frame_isolation
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.overlay_coverage_canaries' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms overlay_coverage_canaries
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioTiesToEven_correctly_rounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioTiesToEven_correctly_rounded
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioTiesToEven_overflow_of' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms roundRatioTiesToEven_overflow_of
 
 end AxiomGuards
 
