@@ -214,6 +214,22 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
             "red-flag check `{check}` must PASS in live smoke report:\n{report1}"
         );
     }
+    // Python's fail-closed polarity audit accepts the live harness's
+    // `witness_polarity_counts` (a clean run has no non-agreement to classify).
+    assert!(
+        report1.contains("| `witness_polarity_accounting` | PASS |")
+            && report1.contains("## Witness Polarity Breakdown (`miri-difftest`)")
+            && report1.contains("| `unsound_missed_fault` | 0 | 0 | 0 |")
+            && report1.contains("| `harness_or_extraction_error` | 0 | 0 | 0 |"),
+        "live smoke report must pass and render the witness polarity breakdown:\n{report1}"
+    );
+    let summary1 = fs::read_to_string(state_dir.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
+        .expect("read live smoke LATEST_CAMPAIGN_SUMMARY.json");
+    assert!(
+        summary1.contains("\"witness_polarity_counts\": {")
+            && summary1.contains("\"unquarantined_witness_polarity_counts\": {"),
+        "LATEST_CAMPAIGN_SUMMARY.json must carry witness polarity counts:\n{summary1}"
+    );
     let ratchet_json = fs::read_to_string(state_dir.join("state/coverage_ratchet.json"))
         .expect("read coverage_ratchet.json");
     assert!(
@@ -299,6 +315,21 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
         ),
         "report must list deduplicated BitValidityTransmuteMutator missed_ub fingerprint:\n{report_div}"
     );
+    // The live `missed_ub` finding is an `unsound_missed_fault`, end to end: Rust's
+    // `witness_polarity_counts` and finding polarity pass Python's per-item recount,
+    // and the report, JUnit text, and summary JSON surface the polarity.
+    assert!(
+        live_div_payload.contains("\"witness_polarity\": \"unsound_missed_fault\""),
+        "live finding must carry its polarity:\n{live_div_payload}"
+    );
+    assert!(
+        report_div.contains(
+            "| `BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar` | `missed_ub` | 1 | `unsound_missed_fault` |"
+        ) && report_div.contains("**Soundness alert**: `1` unquarantined distinct `unsound_missed_fault`")
+            && report_div.contains("| `unsound_missed_fault` | 1 | 1 | 0 |")
+            && report_div.contains("| `witness_polarity_accounting` | PASS |"),
+        "report must surface the finding's witness polarity:\n{report_div}"
+    );
 
     let junit1 = fs::read_to_string(&junit).expect("read JUnit XML");
     assert!(
@@ -318,6 +349,17 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
     assert!(summary_json.contains(
         "\"fingerprint\": \"BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar\""
     ));
+    assert!(
+        summary_json.contains("\"witness_polarity\": \"unsound_missed_fault\"")
+            && summary_json.contains(
+                "\"unquarantined_witness_polarity_counts\": {\n    \"unsound_missed_fault\": 1,"
+            ),
+        "LATEST_CAMPAIGN_SUMMARY.json must record the finding's polarity:\n{summary_json}"
+    );
+    assert!(
+        junit1.contains("witness_polarity=unsound_missed_fault"),
+        "JUnit failure text must name the polarity:\n{junit1}"
+    );
 
     // Extract primary_repro_path values from the summary JSON and run `--reproduce` on each.
     let repro_paths: Vec<PathBuf> = summary_json
@@ -578,6 +620,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 0, "panic": 0, "ub": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 8, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 8},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 8},
         "unmodeled_external_calls": {"foo::bar": 8},
         "mutator_applications": {"ArithmeticCastMutator": 8},
         "findings": [],
@@ -604,6 +647,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 5, "panic": 2, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 0},
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": 8},
         "findings": [],
@@ -630,6 +674,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 4, "panic": 2, "ub": 2, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 0},
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": 4, "BitValidityTransmuteMutator": 2, "PlaceProjectionWrapper": 2, "RawPtrOffsetMutator": 2, "TreeBorrowsRetagInterleaver": 2},
         "findings": [],
@@ -656,6 +701,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 5, "panic": 2, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 0},
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": 8},
         "findings": [],
@@ -682,6 +728,36 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 6, "panic": 1, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 1},
+        "unmodeled_external_calls": {},
+        "mutator_applications": {"ArithmeticCastMutator": 8},
+        "findings": [],
+        "elapsed_ms": 500.0
+    }"#;
+
+    // 6. `witness_polarity_accounting_mismatch`: a forged `value_mismatch` count on a
+    // run with no divergence breaks `sum(witness_polarity_counts) == diverge_count +
+    // not_compared_count`.
+    let forged_polarity = r#"{
+        "harness": "miri-difftest",
+        "oracle_comparison": "performed",
+        "mode": "seeded",
+        "seed": "0x00000022",
+        "batches": 1,
+        "batch_size": 8,
+        "total_candidates": 8,
+        "compiled_candidates": 8,
+        "compile_failed_candidates": 0,
+        "compared_candidates": 8,
+        "agree_count": 8,
+        "diverge_count": 0,
+        "not_compared_count": 0,
+        "kernel_confirmed_divergences": 0,
+        "miri_verdicts": {"pass": 5, "panic": 2, "ub": 1, "error": 0},
+        "anneal_outcomes": {"pass": 5, "panic": 2, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
+        "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
+        "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 1, "harness_or_extraction_error": 0},
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": 8},
         "findings": [],
@@ -689,6 +765,12 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     }"#;
 
     for (label, check_col, reason_token, payload) in [
+        (
+            "forged_polarity",
+            "witness_polarity_accounting",
+            "witness_polarity_accounting_mismatch",
+            forged_polarity,
+        ),
         (
             "zero_compared",
             "non_zero_compared",
@@ -775,7 +857,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         );
     }
 
-    // 6. Fingerprint-collision quarantine resistance and earliest-fault-line
+    // 7. Fingerprint-collision quarantine resistance and earliest-fault-line
     // cause attribution:
     // - Finding 0 (`pass_array_index_and_mutation__b0_c6`) is quarantined by
     //   `fn_name`, while Finding 1 (`pass_unchecked_arith_in_bounds__b0_c7`)
@@ -815,6 +897,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {{"pass": 7, "panic": 0, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0}},
         "divergence_classes": {{"wrong_value": 0, "false_positive_ub": 1, "missed_ub": 2, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0}},
         "not_compared_reasons": {{"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0}},
+        "witness_polarity_counts": {{"unsound_missed_fault": 2, "sound_conservative_abstraction": 1, "value_mismatch": 0, "harness_or_extraction_error": 0}},
         "unmodeled_external_calls": {{}},
         "mutator_applications": {{"RawPtrOffsetMutator": 2, "BitValidityTransmuteMutator": 1}},
         "findings": [
@@ -824,6 +907,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "seed_name": "pass_array_index_and_mutation",
                 "applied_mutators": ["RawPtrOffsetMutator"],
                 "divergence_class": "missed_ub",
+                "witness_polarity": "unsound_missed_fault",
                 "miri_outcome": "ub@src/lib.rs:2:5",
                 "miri_excerpt": "UB",
                 "miri_pos": "src/lib.rs:2:5",
@@ -840,6 +924,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "seed_name": "pass_unchecked_arith_in_bounds",
                 "applied_mutators": ["RawPtrOffsetMutator"],
                 "divergence_class": "missed_ub",
+                "witness_polarity": "unsound_missed_fault",
                 "miri_outcome": "ub@src/lib.rs:2:5",
                 "miri_excerpt": "UB",
                 "miri_pos": "src/lib.rs:2:5",
@@ -856,6 +941,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "seed_name": "pass_ptr_offset_within_array",
                 "applied_mutators": ["BitValidityTransmuteMutator"],
                 "divergence_class": "false_positive_ub",
+                "witness_polarity": "sound_conservative_abstraction",
                 "miri_outcome": "panic@src/lib.rs:4:5",
                 "miri_excerpt": "panicked",
                 "miri_pos": "src/lib.rs:4:5",
@@ -918,7 +1004,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "RawPtrOffsetMutator row must point to the unquarantined repro1.rs:\n{stdout_coll}"
     );
 
-    // 7. ITree red-flag failure (`itree_oracle_invoked` fail) and ITree divergence
+    // 8. ITree red-flag failure (`itree_oracle_invoked` fail) and ITree divergence
     // deduplication + quarantine:
     let clean_miri_payload = r#"{
         "harness": "miri-difftest",
@@ -939,13 +1025,14 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "anneal_outcomes": {"pass": 6, "panic": 1, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
         "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
         "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "witness_polarity_counts": {"unsound_missed_fault": 0, "sound_conservative_abstraction": 0, "value_mismatch": 0, "harness_or_extraction_error": 0},
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": 8},
         "findings": [],
         "elapsed_ms": 500.0
     }"#;
 
-    // 7a. `itree_oracle_not_invoked`: `kernel_confirmed_traces` (0) != `distinct_traces_checked` (8).
+    // 8a. `itree_oracle_not_invoked`: `kernel_confirmed_traces` (0) != `distinct_traces_checked` (8).
     let bad_itree_payload = r#"{
         "harness": "itree-difftest",
         "oracle_comparison": "performed",
@@ -1001,7 +1088,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         "report must flag `itree_oracle_invoked` as FAIL:\n{stdout_itree_rf}"
     );
 
-    // 7b. ITree divergence deduplication and quarantine (`BranchLoopWeaver:itree_branch_tag_mismatch:TraceReplayDiag.branch_tag_mismatch`).
+    // 8b. ITree divergence deduplication and quarantine (`BranchLoopWeaver:itree_branch_tag_mismatch:TraceReplayDiag.branch_tag_mismatch`).
     let itree_repro_dir = dir.join("itree_repros");
     fs::create_dir_all(&itree_repro_dir).expect("create itree_repros");
     let itree_repro0 = itree_repro_dir.join("repro.rs");
@@ -1110,4 +1197,405 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         Some(0),
         "quarantined ITree divergence must exit 0"
     );
+}
+
+/// Loads `scripts/run_diff_test_campaign.py` as a module and prints
+/// `classify_witness_polarity_from_tags(miri, anneal, slug)` (or `null`) for every
+/// `[miri, anneal, slug]` case of the JSON file in `sys.argv[2]`, one per line.
+const POLARITY_DRIVER: &str = r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
+runner = importlib.util.module_from_spec(spec)
+sys.modules["runner"] = runner
+spec.loader.exec_module(runner)
+with open(sys.argv[2], encoding="utf-8") as fh:
+    cases = json.load(fh)
+mode = sys.argv[3]
+for case in cases:
+    if mode == "tags":
+        out = runner.classify_witness_polarity_from_tags(*case)
+        print("null" if out is None else out)
+    else:
+        print("true" if runner.witness_polarity_accounting_holds(case) else "false")
+"#;
+
+fn run_polarity_driver(label: &str, cases_json: &str, mode: &str) -> Vec<String> {
+    let dir = unique_temp_dir(label);
+    let cases_path = dir.join("cases.json");
+    fs::write(&cases_path, cases_json).expect("write polarity cases");
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(POLARITY_DRIVER)
+        .arg(repo_root().join("scripts/run_diff_test_campaign.py"))
+        .arg(&cases_path)
+        .arg(mode)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run polarity driver");
+    assert!(
+        out.status.success(),
+        "polarity driver failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+    String::from_utf8(out.stdout)
+        .expect("utf-8 driver output")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Python's `classify_witness_polarity_from_tags` agrees with Rust's
+/// `classify_outcome_tags_polarity` on the full Cartesian product of Miri tags x
+/// Anneal tags x verdict slugs: the summary tags of every `MiriOutcome` /
+/// `AnnealOutcome` shape (located, unlocated, contained, and not contained), plus
+/// adversarial spellings that only an exact port of the Rust parsers classifies
+/// identically (Unicode `White_Space` vs U+001F, leading zeros and `+` signs,
+/// `u128` / `u32` overflow, empty or `none` locations, family-prefix lookalikes).
+#[test]
+fn python_witness_polarity_classifier_matches_rust_over_the_full_tag_product() {
+    use anneal_difftest::miri_eval::classify_outcome_tags_polarity;
+    use anneal_difftest::miri_eval::json_escape;
+    use cargo_anneal::{AnnealOutcome, MiriOutcome, SourcePos, SourceSpan};
+
+    let pos = |line: u32, col: u32| SourcePos {
+        file: "src/lib.rs".to_string(),
+        line,
+        col,
+    };
+    let span = |file: &str, line: u32, start_col: u32, end_line: u32, end_col: u32| SourceSpan {
+        file: file.to_string(),
+        start_line: line,
+        start_col,
+        end_line,
+        end_col,
+    };
+    let mut miri_tags: Vec<String> = [
+        MiriOutcome::PassUnit,
+        MiriOutcome::PassScalar {
+            bits: 42,
+            size_bytes: 4,
+        },
+        MiriOutcome::PassScalar {
+            bits: 42,
+            size_bytes: 8,
+        },
+        MiriOutcome::PassScalar {
+            bits: u128::MAX,
+            size_bytes: 16,
+        },
+        MiriOutcome::Panic {
+            pos: Some(pos(10, 5)),
+            message: String::new(),
+        },
+        MiriOutcome::Panic {
+            pos: None,
+            message: String::new(),
+        },
+        MiriOutcome::Ub {
+            pos: Some(pos(10, 5)),
+            message: String::new(),
+        },
+        MiriOutcome::Ub {
+            pos: Some(SourcePos {
+                file: "/tmp/anneal_miri_eval_seeded/src/lib.rs".to_string(),
+                line: 10,
+                col: 20,
+            }),
+            message: String::new(),
+        },
+        MiriOutcome::Ub {
+            pos: None,
+            message: String::new(),
+        },
+        MiriOutcome::OracleError("driver failed".to_string()),
+    ]
+    .iter()
+    .map(MiriOutcome::summary_tag)
+    .collect();
+    miri_tags.extend(
+        [
+            " pass:unit\u{3000}",
+            "\u{1f}pass:unit",
+            "pass:scalar:042:4",
+            "pass:scalar:+42:4",
+            "pass:scalar: 42 :4",
+            "pass:scalar:340282366920938463463374607431768211456:16",
+            "pass:scalar:0:0",
+            "pass:scalar:1:4:5",
+            "pass",
+            "panic@",
+            "panicky",
+            "ub@none",
+            "ub@src/lib.rs:0:5",
+            "ub@src/lib.rs:10:5:",
+            "oracle_error",
+            "error: legacy",
+        ]
+        .map(str::to_string),
+    );
+    let mut anneal_tags: Vec<String> = [
+        AnnealOutcome::PassUnit,
+        AnnealOutcome::PassScalar {
+            bits: 42,
+            size_bytes: 4,
+        },
+        AnnealOutcome::PassScalar {
+            bits: 7,
+            size_bytes: 4,
+        },
+        AnnealOutcome::PassOther,
+        AnnealOutcome::Panic {
+            span: Some(span("src/lib.rs", 10, 1, 10, 20)),
+        },
+        AnnealOutcome::Panic {
+            span: Some(span("src/lib.rs", 20, 1, 20, 20)),
+        },
+        AnnealOutcome::Panic {
+            span: Some(span("/rustc/abc/library/core/src/panic.rs", 57, 9, 57, 51)),
+        },
+        AnnealOutcome::Panic { span: None },
+        AnnealOutcome::Abort {
+            span: Some(span("src/lib.rs", 10, 1, 10, 20)),
+        },
+        AnnealOutcome::Ub {
+            span: Some(span("src/lib.rs", 10, 1, 10, 20)),
+        },
+        AnnealOutcome::Ub {
+            span: Some(span("src/lib.rs", 9, 30, 11, 2)),
+        },
+        AnnealOutcome::Ub {
+            span: Some(span("src/lib.rs", 20, 1, 20, 20)),
+        },
+        AnnealOutcome::Ub { span: None },
+        AnnealOutcome::Unsupported {
+            span: Some(span("src/lib.rs", 10, 1, 10, 20)),
+        },
+        AnnealOutcome::Unsupported { span: None },
+        AnnealOutcome::ExternalCall {
+            def_path: "core::panicking::panic_fmt".to_string(),
+            span: None,
+        },
+        AnnealOutcome::OutOfFuel { span: None },
+        AnnealOutcome::CaptureOrLeanError("lake failed".to_string()),
+    ]
+    .iter()
+    .map(AnnealOutcome::summary_tag)
+    .collect();
+    anneal_tags.extend(
+        [
+            "pass:scalar:0042:4",
+            "pass:scalar:42:4\u{1c}",
+            "ub@src/lib.rs:10:1:10:20",
+            "ub@src/lib.rs:10:1: 10:20:3",
+            "ub@none",
+            "unsupported@",
+            "abort",
+            "externalCall",
+            "capture_error",
+            "outOfFuel@src/lib.rs:1:1",
+            "passed",
+        ]
+        .map(str::to_string),
+    );
+    let slugs: Vec<Option<&str>> = vec![
+        None,
+        Some("agree"),
+        Some("missed_ub"),
+        Some("panic_vs_return"),
+        Some("false_positive_ub"),
+        Some("wrong_value"),
+        Some("panic_site_mismatch"),
+        Some("unsupported"),
+        Some("not_compared_unsupported"),
+        Some(" unsupported "),
+        Some("not_compared_ unsupported"),
+        Some("compile_failed"),
+        Some("not_compared_external_call"),
+        Some("diverge"),
+        Some("not_compared"),
+        Some(""),
+    ];
+
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    for m in &miri_tags {
+        for a in &anneal_tags {
+            for slug in &slugs {
+                let slug_json = slug.map_or_else(|| "null".to_string(), json_escape);
+                cases.push(format!(
+                    "[{}, {}, {slug_json}]",
+                    json_escape(m),
+                    json_escape(a)
+                ));
+                expected.push(
+                    classify_outcome_tags_polarity(m, a, *slug)
+                        .map_or_else(|| "null".to_string(), |p| p.as_str().to_string()),
+                );
+            }
+        }
+    }
+    let got = run_polarity_driver("polarity_tags", &format!("[{}]", cases.join(",\n")), "tags");
+    assert_eq!(got.len(), expected.len(), "one Python result per case");
+    let mismatches: Vec<String> = cases
+        .iter()
+        .zip(expected.iter().zip(got.iter()))
+        .filter(|(_, (rust, py))| rust != py)
+        .map(|(case, (rust, py))| format!("{case}: rust={rust} python={py}"))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} cases disagree:\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
+    );
+    // The product reaches agreement and every polarity class.
+    for slug in [
+        "null",
+        "unsound_missed_fault",
+        "sound_conservative_abstraction",
+        "value_mismatch",
+        "harness_or_extraction_error",
+    ] {
+        assert!(
+            expected.iter().any(|e| e == slug),
+            "product never produced {slug}"
+        );
+    }
+}
+
+/// Python's `witness_polarity_accounting_holds` agrees with Rust's over
+/// pseudo-random count maps: consistent reports built from per-item outcomes, and
+/// the same reports with one count perturbed (including an extra or missing
+/// polarity key).
+#[test]
+fn python_witness_polarity_accounting_matches_rust() {
+    use anneal_difftest::miri_eval::{
+        DIVERGENCE_CLASS_NAMES, MiriCampaignEvalReport, NOT_COMPARED_REASON_NAMES,
+        WITNESS_POLARITY_NAMES, witness_polarity_accounting_holds,
+    };
+    use std::collections::BTreeMap;
+
+    let mut state: u64 = 0x5eed_0002;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    let render = |map: &BTreeMap<String, usize>| {
+        let rows: Vec<String> = map.iter().map(|(k, v)| format!("\"{k}\": {v}")).collect();
+        format!("{{{}}}", rows.join(", "))
+    };
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    for case_idx in 0..400u64 {
+        let mut div: BTreeMap<String, usize> = DIVERGENCE_CLASS_NAMES
+            .iter()
+            .map(|k| (k.to_string(), 0))
+            .collect();
+        let mut nc: BTreeMap<String, usize> = NOT_COMPARED_REASON_NAMES
+            .iter()
+            .map(|k| (k.to_string(), 0))
+            .collect();
+        let mut pol: BTreeMap<String, usize> = WITNESS_POLARITY_NAMES
+            .iter()
+            .map(|k| (k.to_string(), 0))
+            .collect();
+        for _ in 0..next(12) {
+            let cls = DIVERGENCE_CLASS_NAMES[next(DIVERGENCE_CLASS_NAMES.len() as u64) as usize];
+            *div.get_mut(cls).unwrap() += 1;
+            let p = match cls {
+                "missed_ub" | "panic_vs_return" => "unsound_missed_fault",
+                "false_positive_ub" => "sound_conservative_abstraction",
+                _ => "value_mismatch",
+            };
+            *pol.get_mut(p).unwrap() += 1;
+        }
+        for _ in 0..next(8) {
+            let reason =
+                NOT_COMPARED_REASON_NAMES[next(NOT_COMPARED_REASON_NAMES.len() as u64) as usize];
+            *nc.get_mut(reason).unwrap() += 1;
+            let p = if reason == "unsupported" && next(2) == 0 {
+                "sound_conservative_abstraction"
+            } else {
+                "harness_or_extraction_error"
+            };
+            *pol.get_mut(p).unwrap() += 1;
+        }
+        let diverge_count: usize = div.values().sum();
+        let mut not_compared_count: usize = nc.values().sum();
+        match case_idx % 5 {
+            0 => {}
+            1 => {
+                let k = WITNESS_POLARITY_NAMES[next(4) as usize];
+                let v = pol.get_mut(k).unwrap();
+                *v = if next(2) == 0 {
+                    *v + 1
+                } else {
+                    v.saturating_sub(1)
+                };
+            }
+            2 => {
+                let from = WITNESS_POLARITY_NAMES[next(4) as usize];
+                let to = WITNESS_POLARITY_NAMES[next(4) as usize];
+                if pol[from] > 0 {
+                    *pol.get_mut(from).unwrap() -= 1;
+                    *pol.get_mut(to).unwrap() += 1;
+                }
+            }
+            3 => {
+                if next(2) == 0 {
+                    pol.insert("unsound".to_string(), 0);
+                } else {
+                    pol.remove(WITNESS_POLARITY_NAMES[next(4) as usize]);
+                }
+            }
+            _ => not_compared_count += 1,
+        }
+        let report = MiriCampaignEvalReport {
+            mode: "seeded".to_string(),
+            seed: 0,
+            batches: 1,
+            batch_size: 1,
+            total_candidates: 0,
+            compiled_candidates: 0,
+            compile_failed_candidates: 0,
+            compile_pass_rate_pct: 0.0,
+            compared_candidates: 0,
+            agree_count: 0,
+            diverge_count,
+            not_compared_count,
+            kernel_confirmed_divergences: 0,
+            miri_verdicts: BTreeMap::new(),
+            anneal_outcomes: BTreeMap::new(),
+            divergence_classes: div.clone(),
+            witness_polarity_counts: pol.clone(),
+            not_compared_reasons: nc.clone(),
+            unmodeled_external_calls: BTreeMap::new(),
+            mutator_applications: BTreeMap::new(),
+            findings: Vec::new(),
+            reconciled_panic_sites: Vec::new(),
+            obs_path_signatures: Vec::new(),
+            item_reports: Vec::new(),
+            elapsed_ms: 0.0,
+        };
+        expected.push(witness_polarity_accounting_holds(&report).to_string());
+        cases.push(format!(
+            "{{\"witness_polarity_counts\": {}, \"divergence_classes\": {}, \
+             \"not_compared_reasons\": {}, \"diverge_count\": {diverge_count}, \
+             \"not_compared_count\": {not_compared_count}}}",
+            render(&pol),
+            render(&div),
+            render(&nc)
+        ));
+    }
+    let got = run_polarity_driver(
+        "polarity_accounting",
+        &format!("[{}]", cases.join(",\n")),
+        "accounting",
+    );
+    assert_eq!(got, expected, "Python and Rust accounting verdicts differ");
+    assert!(expected.iter().any(|e| e == "true") && expected.iter().any(|e| e == "false"));
 }

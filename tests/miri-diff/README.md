@@ -197,6 +197,16 @@ Category 9's `UnwindCleanupGuard` has an empty `drop`:
 - A raw-pointer read of a moved-from local that is still in scope: Miri passes
   (it evaluates `Operand::Move` like `Operand::Copy`), and Anneal reports UB
   because it de-initializes the moved-from place.
+- A write through a `&mut u32` child reborrowed from the sub-place pointer
+  `&raw mut x.0` after the parent is moved (`let moved = x;`, with `x` a
+  `NonCopyU32`): Miri returns normally (the move is a foreign read, which leaves
+  the `Reserved` child usable), and Anneal reports UB at the child write
+  (`false_positive_ub`). Reborrowing the whole place (`&raw mut x`, as
+  `pass_move_deinit_preserves_reserved_child` does) agrees, so the
+  `move_triggers_tb_write` semantic-mutant probe uses that form;
+  `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` in
+  [`miri_eval.rs`](../../crates/anneal-difftest/src/miri_eval.rs) pins the
+  sub-place form (`probe_gap_move_subplace_reborrow_write`).
 
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is

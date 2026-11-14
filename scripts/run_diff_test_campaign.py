@@ -12,9 +12,10 @@
 
 Runs `miri-difftest` (live Miri + Anneal MIR-in-Lean oracle with Lean 4 kernel
 confirmation) and `itree-difftest` under a campaign profile, validates red-flag
-vacuity checks, deduplicates and optionally quarantines divergence findings,
-updates the persistent campaign ledger, and writes Markdown, JSON, and JUnit
-XML reports.
+vacuity checks (including the `WitnessPolarity` accounting of every
+`miri-difftest` non-agreement), deduplicates and optionally quarantines
+divergence findings, updates the persistent campaign ledger, and writes Markdown,
+JSON, and JUnit XML reports.
 
 Exit status:
   0  `miri-difftest` performed real oracle comparisons, passed all red-flag
@@ -24,9 +25,10 @@ Exit status:
   2  invalid command line, harness crash, missing Miri/Lean toolchain,
      malformed harness JSON, red-flag vacuity failure (`zero_compared_items`,
      `impossible_wall_clock`, `identical_metrics_across_seeds`,
-     `oracle_not_invoked`), or oracle errors above `--max-oracle-errors`
-     (in either suite). Ledger state of a suite that completed a healthy live
-     oracle run is still committed when the other suite fails;
+     `oracle_not_invoked`, `witness_polarity_accounting_mismatch`), or oracle
+     errors above `--max-oracle-errors` (in either suite). Ledger state of a
+     suite that completed a healthy live oracle run is still committed when the
+     other suite fails;
   3  compile-only mode (`--compile-only`): neither harness crashed, and both
      harnesses reported `"oracle_comparison": "not_performed"`;
   4  one or more unquarantined divergences were detected by a live oracle run.
@@ -127,6 +129,44 @@ VALID_NOT_COMPARED_REASONS = (
     "out_of_fuel",
     "external_call",
 )
+
+# Canonical `WitnessPolarity` slugs, in `WITNESS_POLARITY_NAMES` order
+# (`crates/anneal-difftest/src/miri_eval.rs`). Every non-agreement of a
+# `miri-difftest` run has exactly one polarity, and agreement has none:
+# - `unsound_missed_fault`: Miri faults (`ub` / `panic`) and Anneal does not
+#   report that fault (`missed_ub`, `panic_vs_return`), the P0 soundness direction;
+# - `sound_conservative_abstraction`: Miri reports no UB while Anneal reports `ub`
+#   (`false_positive_ub`), or Miri returns normally while Anneal is `unsupported`;
+# - `value_mismatch`: different values or fault locations (`wrong_value`,
+#   `return_vs_panic`, `ub_location_mismatch`, `panic_site_mismatch`);
+# - `harness_or_extraction_error`: no semantic comparison was possible (compile,
+#   Miri, capture or Lean failure, fuel, external call, or `unsupported` when Miri
+#   itself faulted).
+WITNESS_POLARITY_UNSOUND = "unsound_missed_fault"
+WITNESS_POLARITY_CONSERVATIVE = "sound_conservative_abstraction"
+WITNESS_POLARITY_VALUE_MISMATCH = "value_mismatch"
+WITNESS_POLARITY_HARNESS = "harness_or_extraction_error"
+VALID_WITNESS_POLARITIES = (
+    WITNESS_POLARITY_UNSOUND,
+    WITNESS_POLARITY_CONSERVATIVE,
+    WITNESS_POLARITY_VALUE_MISMATCH,
+    WITNESS_POLARITY_HARNESS,
+)
+
+# `classify_divergence_kind_polarity`: each divergence class has one polarity.
+DIVERGENCE_CLASS_WITNESS_POLARITY: dict[str, str] = {
+    "wrong_value": WITNESS_POLARITY_VALUE_MISMATCH,
+    "false_positive_ub": WITNESS_POLARITY_CONSERVATIVE,
+    "missed_ub": WITNESS_POLARITY_UNSOUND,
+    "ub_location_mismatch": WITNESS_POLARITY_VALUE_MISMATCH,
+    "panic_vs_return": WITNESS_POLARITY_UNSOUND,
+    "return_vs_panic": WITNESS_POLARITY_VALUE_MISMATCH,
+    "panic_site_mismatch": WITNESS_POLARITY_VALUE_MISMATCH,
+}
+
+# Kill class that the semantic-mutant self-check reports when the campaign
+# pipeline rejects a run as a harness failure (`EXIT_HARNESS_FAILED`).
+HARNESS_ERROR_KILL_CLASS = "harness_error"
 
 VALID_ITREE_DIAG_TAGS = (
     "ok",
@@ -250,6 +290,10 @@ class DeduplicatedFinding:
     miri_outcome: str
     anneal_outcome: str
     kernel_confirmed: bool
+    # `WitnessPolarity` slug of a `miri-difftest` fingerprint (determined by its
+    # divergence class); `None` for `itree-difftest` fingerprints, whose
+    # `TraceReplayDiag` tags carry no Miri / Anneal soundness direction.
+    witness_polarity: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -257,6 +301,7 @@ class DeduplicatedFinding:
             "cause": self.cause,
             "seed_name": self.seed_name,
             "divergence_class": self.divergence_class,
+            "witness_polarity": self.witness_polarity,
             "normalized_anneal_tag": self.normalized_anneal_tag,
             "quarantined": self.quarantined,
             "occurrences": self.occurrences,
@@ -615,6 +660,11 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
         return False, "missing or invalid 'divergence_classes' map"
     if not is_int_map(summary.get("not_compared_reasons"), VALID_NOT_COMPARED_REASONS):
         return False, "missing or invalid 'not_compared_reasons' map"
+    # `miri-difftest` always emits `witness_polarity_counts` with exactly the four
+    # `WITNESS_POLARITY_NAMES` keys; a summary without it comes from a stale or
+    # foreign harness binary and is rejected rather than trusted.
+    if not is_int_map(summary.get("witness_polarity_counts"), VALID_WITNESS_POLARITIES):
+        return False, "missing or invalid 'witness_polarity_counts' map"
     if not is_int_map(summary.get("unmodeled_external_calls")):
         return False, "missing or invalid 'unmodeled_external_calls' map"
     if not is_int_map(summary.get("mutator_applications")):
@@ -680,6 +730,16 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
             )
         if not isinstance(f.get("kernel_confirmed"), bool):
             return False, f"finding[{idx}] has non-boolean 'kernel_confirmed'"
+        polarity = f.get("witness_polarity")
+        if not isinstance(polarity, str) or polarity not in VALID_WITNESS_POLARITIES:
+            return False, f"finding[{idx}] has missing or invalid 'witness_polarity' {polarity!r}"
+        expected_polarity = DIVERGENCE_CLASS_WITNESS_POLARITY[f["divergence_class"]]
+        if polarity != expected_polarity:
+            return (
+                False,
+                f"finding[{idx}] has witness_polarity {polarity!r}, but its divergence_class "
+                f"{f['divergence_class']!r} has polarity {expected_polarity!r}",
+            )
 
     return True, "ok"
 
@@ -1257,6 +1317,14 @@ def evaluate_miri_red_flags(
         if reason not in reasons:
             reasons.append(reason)
 
+    # 7. `WitnessPolarity` accounting: the identities of Rust's
+    #    `witness_polarity_accounting_holds` plus per-finding and (with
+    #    `item_outcomes`) per-item recomputation of every polarity from its tags.
+    polarity_failures = witness_polarity_accounting_problems(summary)
+    for reason in polarity_failures:
+        if reason not in reasons:
+            reasons.append(reason)
+
     checks = {
         "oracle_invoked": oracle_invoked,
         "non_zero_compared": non_zero_compared,
@@ -1264,6 +1332,7 @@ def evaluate_miri_red_flags(
         "seed_sensitivity": seed_sensitive,
         "oracle_error_threshold": within_error_threshold,
         "error_vs_unsupported_boundary": not boundary_failures,
+        "witness_polarity_accounting": not polarity_failures,
     }
     return RedFlagResult(
         passed=all(checks.values()),
@@ -1673,23 +1742,49 @@ def validate_itree_error_boundary(summary: dict[str, Any]) -> tuple[bool, list[s
 
 _RUST_U32_RE = re.compile(r"\+?[0-9]+")
 
+# Code points with the Unicode `White_Space` property: exactly what Rust's
+# `str::trim` (`char::is_whitespace`) strips. Python's `str.strip()` also strips
+# U+001C..U+001F (bidi class B/S), which Rust keeps, so every port of a Rust
+# parser below trims with `_rust_trim` instead.
+_RUST_WHITESPACE = frozenset(
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    + "".join(chr(c) for c in range(0x2000, 0x200B))
+    + "\u2028\u2029\u202f\u205f\u3000"
+)
 
-def _parse_rust_u32(raw: str) -> int | None:
-    """Port of `str::parse::<u32>`: an optional `+`, ASCII digits, at most `u32::MAX`."""
+
+def _rust_trim(raw: str) -> str:
+    """Port of `str::trim` (strips Unicode `White_Space` from both ends)."""
+    start, end = 0, len(raw)
+    while start < end and raw[start] in _RUST_WHITESPACE:
+        start += 1
+    while end > start and raw[end - 1] in _RUST_WHITESPACE:
+        end -= 1
+    return raw[start:end]
+
+
+def _parse_rust_uint(raw: str, bits: int) -> int | None:
+    """Port of `str::parse::<u{bits}>`: an optional `+`, ASCII digits only (no
+    `-`, no surrounding whitespace), at most `2**bits - 1`."""
     if not _RUST_U32_RE.fullmatch(raw):
         return None
     val = int(raw[1:] if raw.startswith("+") else raw, 10)
-    return val if val <= 0xFFFF_FFFF else None
+    return val if val < (1 << bits) else None
+
+
+def _parse_rust_u32(raw: str) -> int | None:
+    """Port of `str::parse::<u32>`: an optional `+`, ASCII digits, at most `u32::MAX`."""
+    return _parse_rust_uint(raw, 32)
 
 
 def _parse_src_pos(raw: str) -> tuple[str, int, int] | None:
     """Port of `SourcePos::parse_rustc_pos`: 1-based `<file>:<line>:<col>`."""
-    parts = raw.strip().rstrip(":").rsplit(":", 2)
+    parts = _rust_trim(raw).rstrip(":").rsplit(":", 2)
     if len(parts) != 3:
         return None
-    file_str = parts[0].strip()
-    line = _parse_rust_u32(parts[1].strip())
-    col = _parse_rust_u32(parts[2].strip())
+    file_str = _rust_trim(parts[0])
+    line = _parse_rust_u32(_rust_trim(parts[1]))
+    col = _parse_rust_u32(_rust_trim(parts[2]))
     if not file_str or line is None or col is None or line == 0 or col == 0:
         return None
     return file_str, line, col
@@ -1699,7 +1794,7 @@ def _parse_src_span(raw: str) -> tuple[str, int, int, int, int] | None:
     """Port of `SourceSpan::parse_anneal_span`: `<file>:<l>:<c>: <l>:<c>` (split at
     the first `": "`, as `SourceSpan::display_short` renders it) or a single point
     `<file>:<line>:<col>`."""
-    trimmed = raw.strip()
+    trimmed = _rust_trim(raw)
     if not trimmed or trimmed == "none":
         return None
     if ": " in trimmed:
@@ -1707,11 +1802,11 @@ def _parse_src_span(raw: str) -> tuple[str, int, int, int, int] | None:
         start = _parse_src_pos(left)
         if start is None:
             return None
-        end_parts = right.strip().split(":")
+        end_parts = _rust_trim(right).split(":")
         if len(end_parts) != 2:
             return None
-        end_line = _parse_rust_u32(end_parts[0].strip())
-        end_col = _parse_rust_u32(end_parts[1].strip())
+        end_line = _parse_rust_u32(_rust_trim(end_parts[0]))
+        end_col = _parse_rust_u32(_rust_trim(end_parts[1]))
         if end_line is None or end_col is None or end_line == 0 or end_col == 0:
             return None
         return start[0], start[1], start[2], end_line, end_col
@@ -1738,7 +1833,7 @@ def _is_valid_pass_scalar_tag(tag: str) -> bool:
 
 def _normalize_file_for_match(raw: str) -> str:
     """Port of `cargo_anneal::miri_oracle::normalize_file_for_match`."""
-    trimmed = raw.replace("\\", "/").strip()
+    trimmed = _rust_trim(raw.replace("\\", "/"))
     return trimmed[2:] if trimmed.startswith("./") else trimmed
 
 
@@ -1751,13 +1846,23 @@ def _source_files_match(a: str, b: str) -> bool:
     return na == nb or na.endswith(f"/{nb}") or nb.endswith(f"/{na}")
 
 
+def _span_tuple_contains_pos(
+    span: tuple[str, int, int, int, int], pos: tuple[str, int, int]
+) -> bool:
+    """Port of `SourceSpan::contains_pos` over parsed `_parse_src_span` /
+    `_parse_src_pos` tuples."""
+    if not _source_files_match(span[0], pos[0]):
+        return False
+    return (span[1], span[2]) <= (pos[1], pos[2]) <= (span[3], span[4])
+
+
 def _span_contains_pos(span_raw: str, pos_raw: str) -> bool:
     """Port of `SourceSpan::contains_pos`."""
     span = _parse_src_span(span_raw)
     pos = _parse_src_pos(pos_raw)
-    if span is None or pos is None or not _source_files_match(span[0], pos[0]):
+    if span is None or pos is None:
         return False
-    return (span[1], span[2]) <= (pos[1], pos[2]) <= (span[3], span[4])
+    return _span_tuple_contains_pos(span, pos)
 
 
 def _is_std_panic_macro_file(file: str) -> bool:
@@ -1823,6 +1928,472 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
             return "diverge", "ub_location_mismatch"
         return "diverge", "missed_ub"
     return "not_compared", "miri_oracle_error"
+
+
+# ---------------------------------------------------------------------------
+# `WitnessPolarity`: exact ports of the classifier and accounting identity in
+# `crates/anneal-difftest/src/miri_eval.rs` (`parse_miri_summary_tag`,
+# `parse_anneal_summary_tag`, `compare_miri_and_anneal`,
+# `classify_verdict_witness_polarity`, `classify_outcome_tags_polarity`, and
+# `witness_polarity_accounting_holds`). `classify_oracle_outcome_tags` above
+# predates them and tolerates legacy tag spellings; the polarity functions below
+# accept exactly the summary tags that the Rust parsers accept, so a tag Rust
+# cannot parse is a `harness_or_extraction_error` here too.
+# ---------------------------------------------------------------------------
+
+_NOT_THIS_TAG_FAMILY = object()
+_PARSED_MIRI_KINDS = ("pass_unit", "pass_scalar", "panic", "ub", "oracle_error")
+_PARSED_ANNEAL_KINDS = (
+    "pass_unit",
+    "pass_scalar",
+    "pass_other",
+    "panic",
+    "abort",
+    "ub",
+    "unsupported",
+    "external_call",
+    "out_of_fuel",
+    "capture_error",
+)
+_PARSED_PASS_KINDS = ("pass_unit", "pass_scalar")
+# Not-compared reasons that are `harness_or_extraction_error` regardless of the
+# Miri outcome (`classify_outcome_tags_polarity`).
+_HARNESS_NOT_COMPARED_SLUGS = (
+    "compile_failed",
+    "external_call",
+    "out_of_fuel",
+    "miri_oracle_error",
+    "capture_failed",
+)
+
+
+def _split_located_outcome_tag(tag: str, family: str) -> Any:
+    """Port of `split_located_outcome_tag`: `None` for the bare `family` tag, the
+    location text after `<family>@`, or `_NOT_THIS_TAG_FAMILY` for another family
+    (so `panicky` and `ubx` are never `panic` / `ub` tags)."""
+    if tag == family:
+        return None
+    if tag.startswith(family) and tag[len(family) :].startswith("@"):
+        return tag[len(family) + 1 :]
+    return _NOT_THIS_TAG_FAMILY
+
+
+def _parse_scalar_tag_fields(rest: str) -> tuple[int, int] | None:
+    """Port of `parse_scalar_tag_fields`: `<bits>:<size_bytes>` split at the first
+    `:`, each field trimmed, `bits` a `u128` and `size_bytes` a `u32` (so leading
+    zeros, a `+` sign, and `size_bytes == 0` parse, exactly as in Rust)."""
+    bits_raw, sep, size_raw = rest.partition(":")
+    if not sep:
+        return None
+    bits = _parse_rust_uint(_rust_trim(bits_raw), 128)
+    size = _parse_rust_uint(_rust_trim(size_raw), 32)
+    if bits is None or size is None:
+        return None
+    return bits, size
+
+
+def parse_miri_summary_tag(tag: Any) -> tuple[Any, ...] | None:
+    """Port of `parse_miri_summary_tag`: parses a `MiriOutcome::summary_tag` into
+    `("pass_unit",)`, `("pass_scalar", bits, size_bytes)`, `("panic", pos)`,
+    `("ub", pos)` (`pos` a `_parse_src_pos` tuple or `None`), or
+    `("oracle_error", message)`. Returns `None` for any other spelling (including
+    a malformed location, legacy `pass` / `error:` tags, and non-`str` JSON)."""
+    if not isinstance(tag, str):
+        return None
+    t = _rust_trim(tag)
+    if t == "pass:unit":
+        return ("pass_unit",)
+    if t.startswith("pass:scalar:"):
+        fields = _parse_scalar_tag_fields(t[len("pass:scalar:") :])
+        return None if fields is None else ("pass_scalar", fields[0], fields[1])
+    if t.startswith("oracle_error:"):
+        return ("oracle_error", t[len("oracle_error:") :])
+    for family in ("panic", "ub"):
+        loc = _split_located_outcome_tag(t, family)
+        if loc is _NOT_THIS_TAG_FAMILY:
+            continue
+        if loc is None:
+            return (family, None)
+        pos = _parse_src_pos(loc)
+        return None if pos is None else (family, pos)
+    return None
+
+
+def parse_anneal_summary_tag(tag: Any) -> tuple[Any, ...] | None:
+    """Port of `parse_anneal_summary_tag`: parses an `AnnealOutcome::summary_tag`
+    into `("pass_unit",)`, `("pass_scalar", bits, size_bytes)`, `("pass_other",)`,
+    `(<panic|abort|ub|unsupported>, span)` (`span` a `_parse_src_span` tuple or
+    `None`), `("external_call", def_path)`, `("out_of_fuel", None)`, or
+    `("capture_error", message)`. Returns `None` for any other spelling."""
+    if not isinstance(tag, str):
+        return None
+    t = _rust_trim(tag)
+    if t == "pass:unit":
+        return ("pass_unit",)
+    if t == "pass:other":
+        return ("pass_other",)
+    if t == "outOfFuel":
+        return ("out_of_fuel", None)
+    if t.startswith("pass:scalar:"):
+        fields = _parse_scalar_tag_fields(t[len("pass:scalar:") :])
+        return None if fields is None else ("pass_scalar", fields[0], fields[1])
+    if t.startswith("externalCall:"):
+        return ("external_call", t[len("externalCall:") :])
+    if t.startswith("capture_error:"):
+        return ("capture_error", t[len("capture_error:") :])
+    for family in ("panic", "abort", "ub", "unsupported"):
+        loc = _split_located_outcome_tag(t, family)
+        if loc is _NOT_THIS_TAG_FAMILY:
+            continue
+        if loc is None:
+            return (family, None)
+        span = _parse_src_span(loc)
+        return None if span is None else (family, span)
+    return None
+
+
+def compare_parsed_outcomes(
+    miri: tuple[Any, ...], anneal: tuple[Any, ...]
+) -> tuple[str, str]:
+    """Port of `compare_miri_and_anneal` over `parse_miri_summary_tag` /
+    `parse_anneal_summary_tag` outcomes: `("agree", "")`, `("diverge", <class>)`,
+    or `("not_compared", <reason>)`, with span containment for `panic` / `ub`."""
+    m_kind, a_kind = miri[0], anneal[0]
+    if m_kind not in _PARSED_MIRI_KINDS or a_kind not in _PARSED_ANNEAL_KINDS:
+        raise ValueError(f"not a parsed outcome pair: {miri!r}, {anneal!r}")
+    if m_kind == "oracle_error":
+        return "not_compared", "miri_oracle_error"
+    if a_kind == "capture_error":
+        return "not_compared", "capture_failed"
+    if a_kind == "external_call":
+        return "not_compared", "external_call"
+    if a_kind == "unsupported":
+        return "not_compared", "unsupported"
+    if a_kind == "out_of_fuel":
+        return "not_compared", "out_of_fuel"
+    anneal_returns = a_kind in ("pass_unit", "pass_scalar", "pass_other", "abort")
+    if m_kind in _PARSED_PASS_KINDS:
+        if m_kind == a_kind == "pass_unit":
+            return "agree", ""
+        if m_kind == a_kind == "pass_scalar":
+            return ("agree", "") if miri[1:] == anneal[1:] else ("diverge", "wrong_value")
+        if anneal_returns:
+            return "diverge", "wrong_value"
+        if a_kind == "panic":
+            return "diverge", "return_vs_panic"
+        return "diverge", "false_positive_ub"
+    def located() -> bool:
+        # Only called for a `panic`/`panic` or `ub`/`ub` pair, whose second
+        # components are a position and a span (or `None`).
+        return (
+            miri[1] is not None
+            and anneal[1] is not None
+            and _span_tuple_contains_pos(anneal[1], miri[1])
+        )
+
+    if m_kind == "panic":
+        if anneal_returns:
+            return "diverge", "panic_vs_return"
+        if a_kind == "ub":
+            return "diverge", "false_positive_ub"
+        return ("agree", "") if located() else ("diverge", "panic_site_mismatch")
+    if a_kind == "ub":
+        return ("agree", "") if located() else ("diverge", "ub_location_mismatch")
+    return "diverge", "missed_ub"
+
+
+def classify_not_compared_polarity(miri: tuple[Any, ...] | None, reason: str) -> str:
+    """Port of `classify_not_compared_polarity`: `unsupported` is a
+    `sound_conservative_abstraction` exactly when Miri returned normally; every
+    other not-compared case is a `harness_or_extraction_error`."""
+    if reason == "unsupported" and miri is not None and miri[0] in _PARSED_PASS_KINDS:
+        return WITNESS_POLARITY_CONSERVATIVE
+    return WITNESS_POLARITY_HARNESS
+
+
+def classify_verdict_witness_polarity(
+    miri: tuple[Any, ...] | None, verdict: str, detail: str
+) -> str | None:
+    """Port of `classify_verdict_witness_polarity` over a `compare_parsed_outcomes`
+    verdict: `None` on agreement."""
+    if verdict == "agree":
+        return None
+    if verdict == "diverge":
+        return DIVERGENCE_CLASS_WITNESS_POLARITY[detail]
+    if verdict == "not_compared":
+        return classify_not_compared_polarity(miri, detail)
+    raise ValueError(f"unknown verdict {verdict!r}")
+
+
+def classify_witness_polarity_from_tags(
+    miri_tag: Any, anneal_tag: Any, divergence_or_reason: Any = None
+) -> str | None:
+    """Port of `classify_outcome_tags_polarity`: the `WitnessPolarity` slug of a
+    serialized `(MiriOutcome, AnnealOutcome)` pair, or `None` on agreement.
+
+    A recognized `divergence_or_reason` slug decides the class (`"agree"`, a
+    divergence class, or a not-compared reason, optionally prefixed with
+    `not_compared_`; so a panic-site reconciled `"agree"` stays an agreement), and
+    `unsupported` additionally consults the Miri tag. Otherwise both tags are parsed
+    exactly as Rust parses them and compared with span containment for `panic` and
+    `ub`; tags that do not parse (or non-`str` JSON values) cannot be compared and
+    classify as `harness_or_extraction_error`.
+    """
+    miri = parse_miri_summary_tag(miri_tag)
+    if isinstance(divergence_or_reason, str):
+        slug = _rust_trim(divergence_or_reason)
+        if slug:
+            if slug.startswith("not_compared_"):
+                slug = slug[len("not_compared_") :]
+            if slug == "agree":
+                return None
+            if slug in DIVERGENCE_CLASS_WITNESS_POLARITY:
+                return DIVERGENCE_CLASS_WITNESS_POLARITY[slug]
+            if slug == "unsupported":
+                return classify_not_compared_polarity(miri, "unsupported")
+            if slug in _HARNESS_NOT_COMPARED_SLUGS:
+                return WITNESS_POLARITY_HARNESS
+    anneal = parse_anneal_summary_tag(anneal_tag)
+    if miri is None or anneal is None:
+        return WITNESS_POLARITY_HARNESS
+    verdict, detail = compare_parsed_outcomes(miri, anneal)
+    return classify_verdict_witness_polarity(miri, verdict, detail)
+
+
+def empty_witness_polarity_counts() -> dict[str, int]:
+    return {p: 0 for p in VALID_WITNESS_POLARITIES}
+
+
+def kill_class_witness_polarity(kill_class: Any) -> str | None:
+    """Polarity implied by a semantic-mutant kill class: the divergence class's
+    polarity, `harness_or_extraction_error` for `harness_error`, else `None`."""
+    if kill_class == HARNESS_ERROR_KILL_CLASS:
+        return WITNESS_POLARITY_HARNESS
+    if isinstance(kill_class, str):
+        return DIVERGENCE_CLASS_WITNESS_POLARITY.get(kill_class)
+    return None
+
+
+def fingerprint_witness_polarity(fingerprint: str) -> str | None:
+    """Polarity of a `miri-difftest` fingerprint `<cause>:<class>:<tag>` (from its
+    divergence class), or `None` for an `itree-difftest` or malformed one."""
+    parts = fingerprint.split(":", 2)
+    return DIVERGENCE_CLASS_WITNESS_POLARITY.get(parts[1]) if len(parts) >= 2 else None
+
+
+def count_dedup_witness_polarities(findings: list[DeduplicatedFinding]) -> dict[str, int]:
+    """Counts distinct fingerprints by `witness_polarity` (`itree-difftest`
+    fingerprints, which carry none, are not counted)."""
+    counts = empty_witness_polarity_counts()
+    for d in findings:
+        if d.witness_polarity in counts:
+            counts[d.witness_polarity] += 1
+    return counts
+
+
+def _witness_polarity_identity_problems(summary: dict[str, Any]) -> list[str]:
+    """The accounting identities of Rust's `witness_polarity_accounting_holds`, each
+    reported as a `witness_polarity_accounting_mismatch` reason: the keys are
+    exactly `VALID_WITNESS_POLARITIES` (non-negative, non-`bool` ints); the counts
+    sum to `diverge_count + not_compared_count`; `unsound_missed_fault ==
+    missed_ub + panic_vs_return`; `value_mismatch == wrong_value +
+    return_vs_panic + ub_location_mismatch + panic_site_mismatch`;
+    `false_positive_ub <= sound_conservative_abstraction <= false_positive_ub +
+    not_compared_reasons.unsupported`; and `sound_conservative_abstraction +
+    harness_or_extraction_error == false_positive_ub + sum(not_compared_reasons)`.
+    """
+    label = "witness_polarity_accounting_mismatch"
+    pol_map = summary.get("witness_polarity_counts")
+    if not is_int_map(pol_map, VALID_WITNESS_POLARITIES):
+        return [
+            f"{label}: witness_polarity_counts must map exactly {list(VALID_WITNESS_POLARITIES)} "
+            f"to non-negative integers, got {pol_map!r}"
+        ]
+    div_map = summary.get("divergence_classes")
+    nc_map = summary.get("not_compared_reasons")
+    diverged = summary.get("diverge_count")
+    not_compared = summary.get("not_compared_count")
+    if not (
+        is_int_map(div_map)
+        and is_int_map(nc_map)
+        and is_nonneg_int(diverged)
+        and is_nonneg_int(not_compared)
+    ):
+        return [
+            f"{label}: divergence_classes, not_compared_reasons, diverge_count, and "
+            "not_compared_count must be well-formed to account for witness polarities"
+        ]
+    pol = dict(pol_map)
+
+    def div(cls: str) -> int:
+        return int(div_map.get(cls, 0))
+
+    reasons: list[str] = []
+    total = sum(pol.values())
+    if total != diverged + not_compared:
+        reasons.append(
+            f"{label}: sum(witness_polarity_counts)={total} != diverge_count ({diverged}) + "
+            f"not_compared_count ({not_compared})"
+        )
+    unsound = div("missed_ub") + div("panic_vs_return")
+    if pol[WITNESS_POLARITY_UNSOUND] != unsound:
+        reasons.append(
+            f"{label}: unsound_missed_fault={pol[WITNESS_POLARITY_UNSOUND]} != missed_ub + "
+            f"panic_vs_return ({unsound})"
+        )
+    value = (
+        div("wrong_value")
+        + div("return_vs_panic")
+        + div("ub_location_mismatch")
+        + div("panic_site_mismatch")
+    )
+    if pol[WITNESS_POLARITY_VALUE_MISMATCH] != value:
+        reasons.append(
+            f"{label}: value_mismatch={pol[WITNESS_POLARITY_VALUE_MISMATCH]} != wrong_value + "
+            f"return_vs_panic + ub_location_mismatch + panic_site_mismatch ({value})"
+        )
+    conservative = pol[WITNESS_POLARITY_CONSERVATIVE]
+    false_pos = div("false_positive_ub")
+    nc_unsupported = int(nc_map.get("unsupported", 0))
+    if not false_pos <= conservative <= false_pos + nc_unsupported:
+        reasons.append(
+            f"{label}: sound_conservative_abstraction={conservative} outside "
+            f"[false_positive_ub ({false_pos}), false_positive_ub + "
+            f"not_compared_reasons.unsupported ({false_pos + nc_unsupported})]"
+        )
+    nc_total = sum(int(v) for v in nc_map.values())
+    if conservative + pol[WITNESS_POLARITY_HARNESS] != false_pos + nc_total:
+        reasons.append(
+            f"{label}: sound_conservative_abstraction + harness_or_extraction_error="
+            f"{conservative + pol[WITNESS_POLARITY_HARNESS]} != false_positive_ub + "
+            f"sum(not_compared_reasons) ({false_pos + nc_total})"
+        )
+    return reasons
+
+
+def witness_polarity_accounting_holds(summary: dict[str, Any]) -> bool:
+    """Port of `witness_polarity_accounting_holds` over a `miri-difftest` JSON
+    summary (`witness_polarity_counts`, `divergence_classes`,
+    `not_compared_reasons`, `diverge_count`, `not_compared_count`)."""
+    return not _witness_polarity_identity_problems(summary)
+
+
+def witness_polarity_accounting_problems(summary: dict[str, Any]) -> list[str]:
+    """Fail-closed audit of a `miri-difftest` summary's witness polarities.
+
+    1. The accounting identities of `witness_polarity_accounting_holds`.
+    2. Every finding carries the `witness_polarity` of its `divergence_class`, and
+       (whenever the summary carries `item_outcomes`, or both of the finding's tags
+       parse as Rust summary tags) the polarity that its own outcome tags classify
+       to. The findings' per-polarity tallies must match the divergence classes
+       (`unsound_missed_fault` / `value_mismatch` / `sound_conservative_abstraction`
+       findings equal their divergence-class sums; no finding is a harness error).
+    3. With `item_outcomes`, every item's polarity is recomputed from its tags
+       (`classify_witness_polarity_from_tags`; a panic-site pair reported `agree`
+       counts as an agreement only when `reconciled_panic_sites` justifies it), the
+       `compile_failed_candidates` (which carry no item outcome) are added as
+       `harness_or_extraction_error`, and the result must equal
+       `witness_polarity_counts` key by key: a forged map that preserves every
+       identity but moves an `unsupported` item between
+       `sound_conservative_abstraction` and `harness_or_extraction_error` (or any
+       other bucket) is rejected.
+    """
+    label = "witness_polarity_accounting_mismatch"
+    reasons = _witness_polarity_identity_problems(summary)
+    pol_map = summary.get("witness_polarity_counts")
+    if not is_int_map(pol_map, VALID_WITNESS_POLARITIES):
+        return reasons
+
+    items = summary.get("item_outcomes")
+    has_items = isinstance(items, dict)
+    findings = summary.get("findings")
+    div_map = summary.get("divergence_classes")
+    if isinstance(findings, list):
+        tallies = empty_witness_polarity_counts()
+        for idx, f in enumerate(findings):
+            if not isinstance(f, dict):
+                reasons.append(f"{label}: findings[{idx}] is not a JSON object")
+                continue
+            polarity = f.get("witness_polarity")
+            div_cls = f.get("divergence_class")
+            expected = (
+                DIVERGENCE_CLASS_WITNESS_POLARITY.get(div_cls) if isinstance(div_cls, str) else None
+            )
+            if not isinstance(polarity, str) or polarity not in VALID_WITNESS_POLARITIES:
+                reasons.append(
+                    f"{label}: findings[{idx}] has missing or invalid witness_polarity {polarity!r}"
+                )
+                continue
+            tallies[polarity] += 1
+            if polarity != expected:
+                reasons.append(
+                    f"{label}: findings[{idx}] has witness_polarity {polarity!r}, but its "
+                    f"divergence_class {div_cls!r} has polarity {expected!r}"
+                )
+            f_miri, f_anneal = f.get("miri_outcome"), f.get("anneal_outcome")
+            tags_parse = (
+                parse_miri_summary_tag(f_miri) is not None
+                and parse_anneal_summary_tag(f_anneal) is not None
+            )
+            if has_items or tags_parse:
+                from_tags = classify_witness_polarity_from_tags(f_miri, f_anneal)
+                if from_tags != polarity:
+                    reasons.append(
+                        f"{label}: findings[{idx}] has witness_polarity {polarity!r}, but its "
+                        f"outcomes ({f_miri!r}, {f_anneal!r}) classify as {from_tags!r}"
+                    )
+        if is_int_map(div_map):
+            expected_tallies = empty_witness_polarity_counts()
+            for cls, pol in DIVERGENCE_CLASS_WITNESS_POLARITY.items():
+                expected_tallies[pol] += int(div_map.get(cls, 0))
+            for pol in VALID_WITNESS_POLARITIES:
+                if tallies[pol] != expected_tallies[pol]:
+                    reasons.append(
+                        f"{label}: {tallies[pol]} findings have witness_polarity {pol!r}, but "
+                        f"divergence_classes account for {expected_tallies[pol]}"
+                    )
+
+    if has_items:
+        reconciled: dict[str, Any] = {}
+        sites = summary.get("reconciled_panic_sites")
+        if isinstance(sites, list):
+            for site in sites:
+                name = site.get("fn_name") if isinstance(site, dict) else None
+                if isinstance(name, str) and name not in reconciled:
+                    reconciled[name] = site
+        recount = empty_witness_polarity_counts()
+        for name, entry in items.items():
+            m_tag = entry.get("miri_outcome") if isinstance(entry, dict) else None
+            a_tag = entry.get("anneal_outcome") if isinstance(entry, dict) else None
+            polarity = classify_witness_polarity_from_tags(m_tag, a_tag)
+            reported = entry.get("verdict") if isinstance(entry, dict) else None
+            if (
+                polarity == WITNESS_POLARITY_VALUE_MISMATCH
+                and isinstance(reported, str)
+                and reported.strip().lower() == "agree"
+                and isinstance(m_tag, str)
+                and isinstance(a_tag, str)
+                and name in reconciled
+                and _reconciled_panic_site_matches(reconciled[name], name, m_tag, a_tag)
+            ):
+                polarity = None
+            if polarity is not None:
+                recount[polarity] += 1
+        compile_failed = summary.get("compile_failed_candidates")
+        if is_nonneg_int(compile_failed):
+            recount[WITNESS_POLARITY_HARNESS] += compile_failed
+        else:
+            reasons.append(
+                f"{label}: compile_failed_candidates {compile_failed!r} is not a non-negative "
+                "integer"
+            )
+        for pol in VALID_WITNESS_POLARITIES:
+            if int(pol_map[pol]) != recount[pol]:
+                reasons.append(
+                    f"{label}: witness_polarity_counts.{pol} reported {pol_map[pol]} but item "
+                    f"outcomes (plus compile failures) classify {recount[pol]}"
+                )
+    return reasons
 
 
 def _is_rust_ident_segment(seg: str) -> bool:
@@ -3255,6 +3826,7 @@ def deduplicate_and_quarantine_findings(
                 existing.miri_outcome = str(f["miri_outcome"])
                 existing.anneal_outcome = str(f["anneal_outcome"])
         else:
+            raw_polarity = f.get("witness_polarity")
             by_fp[fp] = DeduplicatedFinding(
                 fingerprint=fp,
                 cause=cause,
@@ -3269,6 +3841,14 @@ def deduplicate_and_quarantine_findings(
                 miri_outcome=str(f["miri_outcome"]),
                 anneal_outcome=str(f["anneal_outcome"]),
                 kernel_confirmed=bool(f.get("kernel_confirmed", False)),
+                # `validate_performed_miri_summary` pins a reported polarity to the
+                # class's; findings handed in without one (tests, legacy callers)
+                # take the class's polarity, which every finding of `fp` shares.
+                witness_polarity=(
+                    raw_polarity
+                    if raw_polarity in VALID_WITNESS_POLARITIES
+                    else DIVERGENCE_CLASS_WITNESS_POLARITY.get(div_class)
+                ),
             )
 
     all_dedup = list(by_fp.values())
@@ -3394,6 +3974,12 @@ def build_simulated_miri_summary(
         _bump(anneal_outcomes, a_kind)
 
     verdict, detail = classify_oracle_outcome_tags(miri_outcome, anneal_outcome)
+    # The probe's polarity comes from the exact Rust-tag classifier, as
+    # `miri-difftest` derives it, and is the only non-agreement in the summary.
+    probe_polarity = classify_witness_polarity_from_tags(miri_outcome, anneal_outcome)
+    polarity_counts = empty_witness_polarity_counts()
+    if probe_polarity is not None:
+        polarity_counts[probe_polarity] = 1
     div_map = {k: 0 for k in VALID_DIVERGENCE_CLASSES}
     nc_reasons = {k: 0 for k in VALID_NOT_COMPARED_REASONS}
     findings: list[dict[str, Any]] = []
@@ -3406,6 +3992,7 @@ def build_simulated_miri_summary(
                 "seed_name": f"probe_{probe_id}",
                 "applied_mutators": [],
                 "divergence_class": detail,
+                "witness_polarity": DIVERGENCE_CLASS_WITNESS_POLARITY[detail],
                 "miri_outcome": miri_outcome,
                 "anneal_outcome": anneal_outcome,
                 "anneal_lean_tag": anneal_lean_tag,
@@ -3436,6 +4023,7 @@ def build_simulated_miri_summary(
         "anneal_outcomes": anneal_outcomes,
         "divergence_classes": div_map,
         "not_compared_reasons": nc_reasons,
+        "witness_polarity_counts": polarity_counts,
         "unmodeled_external_calls": {},
         "mutator_applications": {"ArithmeticCastMutator": total},
         "findings": findings,
@@ -3462,45 +4050,83 @@ def build_simulated_miri_summary(
     return summary
 
 
-def campaign_exit_for_miri_summary(summary: dict[str, Any]) -> tuple[int, str, str]:
+def campaign_verdict_for_miri_summary(summary: dict[str, Any]) -> dict[str, Any]:
     """Runs a performed `miri-difftest` summary through the campaign's verdict pipeline
     (`validate_performed_miri_summary`, `evaluate_miri_red_flags` including the
-    `error` vs. `unsupported` boundary, and `deduplicate_and_quarantine_findings`).
+    `error` vs. `unsupported` boundary and the witness-polarity accounting, and
+    `deduplicate_and_quarantine_findings`).
 
-    Returns `(exit_code, kill_class, detail)`: `EXIT_HARNESS_FAILED` with
-    `"harness_error"`, `EXIT_DIVERGENCE_DETECTED` with the unquarantined divergence
-    class, or `EXIT_SUCCESS` with `"agree"`.
+    Returns `{"exit_code", "kill_class", "detail", "witness_polarity"}`:
+    `EXIT_HARNESS_FAILED` with `"harness_error"` and `harness_or_extraction_error`,
+    `EXIT_DIVERGENCE_DETECTED` with the first unquarantined fingerprint's divergence
+    class and witness polarity, or `EXIT_SUCCESS` with `"agree"` and no polarity.
     """
     valid, reason = validate_performed_miri_summary(summary)
     if not valid:
-        return EXIT_HARNESS_FAILED, "harness_error", reason
+        return {
+            "exit_code": EXIT_HARNESS_FAILED,
+            "kill_class": HARNESS_ERROR_KILL_CLASS,
+            "detail": reason,
+            "witness_polarity": WITNESS_POLARITY_HARNESS,
+        }
     rf = evaluate_miri_red_flags(
         summary, 0x5EED0001, {}, DEFAULT_MIN_ORACLE_ELAPSED_MS, DEFAULT_MAX_ORACLE_ERRORS
     )
     if not rf.passed:
-        return EXIT_HARNESS_FAILED, "harness_error", "; ".join(rf.failure_reasons)
+        return {
+            "exit_code": EXIT_HARNESS_FAILED,
+            "kill_class": HARNESS_ERROR_KILL_CLASS,
+            "detail": "; ".join(rf.failure_reasons),
+            "witness_polarity": WITNESS_POLARITY_HARNESS,
+        }
     _, unquarantined, _ = deduplicate_and_quarantine_findings(summary["findings"], set(), set())
     if unquarantined:
-        return (
-            EXIT_DIVERGENCE_DETECTED,
-            unquarantined[0].divergence_class,
-            unquarantined[0].fingerprint,
-        )
-    return EXIT_SUCCESS, "agree", "no divergence"
+        return {
+            "exit_code": EXIT_DIVERGENCE_DETECTED,
+            "kill_class": unquarantined[0].divergence_class,
+            "detail": unquarantined[0].fingerprint,
+            "witness_polarity": unquarantined[0].witness_polarity,
+        }
+    return {
+        "exit_code": EXIT_SUCCESS,
+        "kill_class": "agree",
+        "detail": "no divergence",
+        "witness_polarity": None,
+    }
+
+
+def campaign_exit_for_miri_summary(summary: dict[str, Any]) -> tuple[int, str, str]:
+    """`(exit_code, kill_class, detail)` of `campaign_verdict_for_miri_summary`:
+    `EXIT_HARNESS_FAILED` with `"harness_error"`, `EXIT_DIVERGENCE_DETECTED` with the
+    unquarantined divergence class, or `EXIT_SUCCESS` with `"agree"`."""
+    verdict = campaign_verdict_for_miri_summary(summary)
+    return verdict["exit_code"], verdict["kill_class"], verdict["detail"]
 
 
 # Each probe below is staged and run through the live, *unmutated* Miri + Anneal
 # pipeline by `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned`
 # (`crates/anneal-difftest/src/miri_eval.rs`), which embeds byte-identical probe
-# sources (`SEMANTIC_MUTANT_PROBES`) and pins, relative to each probe's first line,
-# the exact Miri outcome (`reference_miri_outcome`) and Anneal outcome and Lean tag
+# sources (`SEMANTIC_MUTANT_PROBES`, keyed by probe id: the mutant id, or a
+# variant's own `probe["id"]`) and pins, relative to each probe's first line, the
+# exact Miri outcome (`reference_miri_outcome`) and Anneal outcome and Lean tag
 # (`baseline_anneal_outcome`, `baseline_anneal_lean_tag`) that the simulation below
 # replays; `test_run_diff_test_campaign.py` checks that both tables stay identical.
 # So every simulated baseline is the real engine's outcome, re-measured on every
 # `cargo test -p anneal-difftest`. Partial-pointer-byte provenance variants are not
 # probes: the live engine already diverges on them (kernel-confirmed), so a "check
 # omitted" mutant would be equivalent to the current engine there and could never be
-# killed; the same Rust test pins them as known engine gaps instead.
+# killed; the same Rust test pins them as known engine gaps instead (as it pins the
+# sub-place `&raw mut x.0` form of `move_triggers_tb_write`, a live
+# `false_positive_ub`).
+#
+# A variant that needs a different program than its mutant's probe carries its own
+# `probe` (`id`, `probe_rust_source`, `reference_miri_outcome`,
+# `baseline_anneal_outcome`, `baseline_anneal_lean_tag`), whose baseline must pass
+# the campaign pipeline too: `protector_release_order` kills both soundness
+# directions, so it needs one probe on which Miri returns normally and one on which
+# Miri faults. Every variant declares the `expected_kill_class` and the
+# `expected_witness_polarity` with which it must be killed; a kill with any other
+# class or polarity is a survivor.
 SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
     {
         "id": "bool_valid_range",
@@ -3509,6 +4135,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.BitValidity",
         "description": "Omit bool validRange [0, 1] check on typed scalar load of 2u8 as bool",
         "expected_kill_classes": ("missed_ub",),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND,),
         "reference_miri_outcome": "ub@src/lib.rs:5:5",
         "baseline_anneal_outcome": "ub@src/lib.rs:5:5: 5:6",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
@@ -3517,6 +4144,8 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "label": "validity_check_omitted",
                 "anneal_outcome": "pass:scalar:2:4",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 2 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
             },
         ),
         "probe_rust_source": (
@@ -3537,6 +4166,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "Omit allocation liveness / StorageDead deallocation check on raw pointer dereference"
         ),
         "expected_kill_classes": ("missed_ub",),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND,),
         "reference_miri_outcome": "ub@src/lib.rs:6:14",
         "baseline_anneal_outcome": "ub@src/lib.rs:6:14: 6:23",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
@@ -3545,6 +4175,8 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "label": "liveness_check_omitted",
                 "anneal_outcome": "pass:scalar:42:4",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
             },
         ),
         "probe_rust_source": (
@@ -3568,6 +4200,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "the provenance of the live allocation at that address"
         ),
         "expected_kill_classes": ("missed_ub",),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND,),
         "reference_miri_outcome": "ub@src/lib.rs:8:9",
         "baseline_anneal_outcome": "ub@src/lib.rs:8:9: 8:11",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
@@ -3578,6 +4211,8 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "label": "integer_bytes_keep_provenance",
                 "anneal_outcome": "pass:scalar:7:4",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 7 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
             },
         ),
         "probe_rust_source": (
@@ -3600,6 +4235,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Eval",
         "description": "Omit divisor == 0 and INT_MIN / -1 guard in checked integer division",
         "expected_kill_classes": ("panic_vs_return",),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND,),
         "reference_miri_outcome": "panic@src/lib.rs:4:5",
         "baseline_anneal_outcome": "panic@src/lib.rs:4:5: 4:14",
         "baseline_anneal_lean_tag": "MirDiffTag.panic",
@@ -3608,6 +4244,8 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "label": "zero_divisor_guard_omitted",
                 "anneal_outcome": "pass:scalar:0:4",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 0 4)",
+                "expected_kill_class": "panic_vs_return",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
             },
         ),
         "probe_rust_source": (
@@ -3627,7 +4265,8 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "Omit rhs.toNat < w guard on 64/128-bit shift with rhs >= 2^32 "
             "(GMP lean_nat_shiftl abort)"
         ),
-        "expected_kill_classes": ("missed_ub", "harness_error"),
+        "expected_kill_classes": ("missed_ub", HARNESS_ERROR_KILL_CLASS),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND, WITNESS_POLARITY_HARNESS),
         "reference_miri_outcome": "ub@src/lib.rs:4:14",
         "baseline_anneal_outcome": "ub@src/lib.rs:4:14: 4:37",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
@@ -3639,15 +4278,19 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                     "capture_error:INTERNAL PANIC: Nat.shiftl exponent is too big (SIGABRT)"
                 ),
                 "anneal_lean_tag": "none",
-                "expected_kill_class": "harness_error",
+                "expected_kill_class": HARNESS_ERROR_KILL_CLASS,
+                "expected_witness_polarity": WITNESS_POLARITY_HARNESS,
                 "expected_detail_substring": "oracle_errors_exceeded",
             },
             {
-                # The same abort misreported as an unmodeled construct must still fail.
+                # The same abort misreported as an unmodeled construct must still fail
+                # (Miri faulted, so this `unsupported` is a harness error, not a
+                # conservative abstraction).
                 "label": "guard_omitted_abort_masked_as_unsupported",
                 "anneal_outcome": "unsupported@src/lib.rs:4:14: 4:37",
                 "anneal_lean_tag": "MirDiffTag.unsupported",
-                "expected_kill_class": "harness_error",
+                "expected_kill_class": HARNESS_ERROR_KILL_CLASS,
+                "expected_witness_polarity": WITNESS_POLARITY_HARNESS,
                 "expected_detail_substring": "error_masked_as_unsupported",
                 "diagnostics": (
                     {
@@ -3663,6 +4306,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
                 "anneal_outcome": "pass:scalar:1:8",
                 "anneal_lean_tag": "(MirDiffTag.normalScalar 1 8)",
                 "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
             },
         ),
         "probe_rust_source": (
@@ -3673,95 +4317,432 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "}\n"
         ),
     },
+    {
+        # `let moved: NonCopyU32 = x;` lowers to `_6 = move _1` (`Rvalue::Use(
+        # Operand::Move)`, since `NonCopyU32` is not `Copy`). Miri evaluates the move
+        # as a read, a foreign read of `r` that leaves the `Reserved` reborrow
+        # usable, so the later write through `r` is valid and the probe returns
+        # `32 + 10`. A semantics that also emits a foreign `.Write` on the moved
+        # place (`tb_write_on_move_breaks_borrow_tree_equiv`) disables `r` and faults
+        # at that write.
+        "id": "move_triggers_tb_write",
+        "name": "move_triggers_tb_write",
+        "bug_class": "operand_move_emits_tree_borrows_write",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
+        "description": (
+            "Emit a Tree Borrows `.Write` foreign access on `Rvalue::Use(Operand::Move)` of a "
+            "non-`Copy` wrapper (`let moved: NonCopyU32 = x;`), disabling the `Reserved` "
+            "`&mut NonCopyU32` child `r` reborrowed from `&raw mut x`, so the valid child "
+            "write `*r = NonCopyU32(32u32)` faults with spurious Tree Borrows UB"
+        ),
+        "expected_kill_classes": ("false_positive_ub",),
+        "expected_witness_polarities": (WITNESS_POLARITY_CONSERVATIVE,),
+        "reference_miri_outcome": "pass:scalar:42:4",
+        "baseline_anneal_outcome": "pass:scalar:42:4",
+        "baseline_anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+        "mutant_variants": (
+            {
+                # The disabled `r` faults at `*r = NonCopyU32(32u32)` (line 6).
+                "label": "move_emits_foreign_write",
+                "anneal_outcome": "ub@src/lib.rs:6:5: 6:27",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "expected_kill_class": "false_positive_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_CONSERVATIVE,
+            },
+        ),
+        "probe_rust_source": (
+            "pub fn probe_move_triggers_tb_write() -> u32 {\n"
+            "    let mut x: NonCopyU32 = NonCopyU32(10u32);\n"
+            "    let root: *mut NonCopyU32 = &raw mut x;\n"
+            "    let r: &mut NonCopyU32 = unsafe { &mut *root };\n"
+            "    let moved: NonCopyU32 = x;\n"
+            "    *r = NonCopyU32(32u32);\n"
+            "    (*r).0 + moved.0\n"
+            "}\n"
+        ),
+    },
+    {
+        # Each probe calls the inline intrinsic (`exact_div::<u32>`,
+        # `exact_div::<i8>`, `ctlz_nonzero::<u32>` call terminators) on operands that
+        # violate exactly one precondition; the live engine reports UB at the call,
+        # and a semantics without that guard returns the unguarded result.
+        "id": "exact_div_rem_omitted",
+        "name": "exact_div_rem_omitted",
+        "bug_class": "inline_intrinsic_ub_guard_omitted",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "description": (
+            "Omit the inline intrinsic UB guards: the `lhs % rhs == 0` remainder guard of "
+            "`exact_div(7u32, 2u32)`, the signed `INT_MIN / -1` overflow guard of "
+            "`exact_div(i8::MIN, -1i8)`, and the zero guard of `ctlz_nonzero(0u32)`"
+        ),
+        "expected_kill_classes": ("missed_ub",),
+        "expected_witness_polarities": (WITNESS_POLARITY_UNSOUND,),
+        "reference_miri_outcome": "ub@src/lib.rs:4:14",
+        "baseline_anneal_outcome": "ub@src/lib.rs:4:14: 4:33",
+        "baseline_anneal_lean_tag": "MirDiffTag.ub",
+        "mutant_variants": (
+            {
+                # Truncating `7 / 2`.
+                "label": "remainder_guard_omitted",
+                "anneal_outcome": "pass:scalar:3:4",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 3 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
+            },
+            {
+                # `i8::MIN % -1 == 0` passes the remainder guard; without the overflow
+                # guard `-128 / -1` wraps to `i8::MIN` (bits `0x80`).
+                "label": "signed_overflow_guard_omitted",
+                "probe": {
+                    "id": "exact_div_signed_overflow",
+                    "reference_miri_outcome": "ub@src/lib.rs:4:14",
+                    "baseline_anneal_outcome": "ub@src/lib.rs:4:14: 4:33",
+                    "baseline_anneal_lean_tag": "MirDiffTag.ub",
+                    "probe_rust_source": (
+                        "pub fn probe_exact_div_signed_overflow() -> i8 {\n"
+                        "    let lhs: i8 = i8::MIN;\n"
+                        "    let rhs: i8 = -1i8;\n"
+                        "    unsafe { exact_div(lhs, rhs) }\n"
+                        "}\n"
+                    ),
+                },
+                "anneal_outcome": "pass:scalar:128:1",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 128 1)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
+            },
+            {
+                # `ctlz(0u32) == 32`.
+                "label": "nonzero_guard_omitted",
+                "probe": {
+                    "id": "ctlz_nonzero_zero",
+                    "reference_miri_outcome": "ub@src/lib.rs:3:14",
+                    "baseline_anneal_outcome": "ub@src/lib.rs:3:14: 3:32",
+                    "baseline_anneal_lean_tag": "MirDiffTag.ub",
+                    "probe_rust_source": (
+                        "pub fn probe_ctlz_nonzero_zero() -> u32 {\n"
+                        "    let zero: u32 = 0u32;\n"
+                        "    unsafe { ctlz_nonzero(zero) }\n"
+                        "}\n"
+                    ),
+                },
+                "anneal_outcome": "pass:scalar:32:4",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 32 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
+            },
+        ),
+        "probe_rust_source": (
+            "pub fn probe_exact_div_rem_omitted() -> u32 {\n"
+            "    let lhs: u32 = 7u32;\n"
+            "    let rhs: u32 = 2u32;\n"
+            "    unsafe { exact_div(lhs, rhs) }\n"
+            "}\n"
+        ),
+    },
+    {
+        # Two-stage `FnEntry` protector handling in both soundness directions. The
+        # probe passes a reborrow of the raw-derived `r0` to `helper_reborrow_mid`,
+        # whose `&mut u32` argument Miri retags and protects for the call; the
+        # protector is released on return, so the caller's foreign write through
+        # `r0` afterwards is valid (Miri returns `20 + 22`). The variant probe passes
+        # `&x` as a protected `&u32` argument while the callee writes `x` through an
+        # aliasing raw pointer: Miri reports the protector violation at that write
+        # (the protected tag would become `Disabled`; with `&x` an unprotected local
+        # the same write passes, see `miri_eval.rs`). The live engine agrees at the
+        # same write, through its sibling-root retag freeze of `raw` (the capture
+        # emits no `Retag(FnEntry)`; `tests/miri-diff/README.md`, Category 9 engine
+        # gaps), so the variant models the missed fault of a semantics without that
+        # conflict check.
+        "id": "protector_release_order",
+        "name": "protector_release_order",
+        "bug_class": "fn_entry_protector_release_order_and_conflict",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        "description": (
+            "Release `frame.protectedTags` after `cleanupStackFrame` / `StorageDead` on "
+            "return, so the caller's valid post-return write through the protected "
+            "reborrow's parent faults (`false_positive_ub`), or omit the `FnEntry` "
+            "protector conflict check on a write through a conflicting raw alias during "
+            "the protected call (`missed_ub`)"
+        ),
+        "expected_kill_classes": ("false_positive_ub", "missed_ub"),
+        "expected_witness_polarities": (WITNESS_POLARITY_CONSERVATIVE, WITNESS_POLARITY_UNSOUND),
+        "reference_miri_outcome": "pass:scalar:42:4",
+        "baseline_anneal_outcome": "pass:scalar:42:4",
+        "baseline_anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+        "mutant_variants": (
+            {
+                # A protector still active after the return makes the caller's foreign
+                # write `*r0 = 20u32` (line 6) fault.
+                "label": "release_after_frame_cleanup",
+                "anneal_outcome": "ub@src/lib.rs:6:5: 6:16",
+                "anneal_lean_tag": "MirDiffTag.ub",
+                "expected_kill_class": "false_positive_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_CONSERVATIVE,
+            },
+            {
+                # Without the conflict check the write lands: `3 + 8`.
+                "label": "protector_conflict_omitted",
+                "probe": {
+                    "id": "protector_conflict",
+                    "reference_miri_outcome": "ub@src/lib.rs:11:9",
+                    "baseline_anneal_outcome": "ub@src/lib.rs:11:9: 11:22",
+                    "baseline_anneal_lean_tag": "MirDiffTag.ub",
+                    "probe_rust_source": (
+                        "pub fn probe_protector_conflict() -> u32 {\n"
+                        "    let mut x: u32 = 10u32;\n"
+                        "    let raw: *mut u32 = &raw mut x;\n"
+                        "    let v: u32 = probe_helper_protected_alias_write(&x, raw);\n"
+                        "    v + unsafe { *raw }\n"
+                        "}\n"
+                        "\n"
+                        "#[inline(never)]\n"
+                        "fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32)"
+                        " -> u32 {\n"
+                        "    unsafe {\n"
+                        "        *alias = 8u32;\n"
+                        "    }\n"
+                        "    3u32\n"
+                        "}\n"
+                    ),
+                },
+                "anneal_outcome": "pass:scalar:11:4",
+                "anneal_lean_tag": "(MirDiffTag.normalScalar 11 4)",
+                "expected_kill_class": "missed_ub",
+                "expected_witness_polarity": WITNESS_POLARITY_UNSOUND,
+            },
+        ),
+        "probe_rust_source": (
+            "pub fn probe_protector_release_order() -> u32 {\n"
+            "    let mut x: u32 = 10u32;\n"
+            "    let raw: *mut u32 = &raw mut x;\n"
+            "    let r0: &mut u32 = unsafe { &mut *raw };\n"
+            "    let delta: u32 = helper_reborrow_mid(r0, 7u32);\n"
+            "    *r0 = 20u32;\n"
+            "    unsafe {\n"
+            "        *raw = *r0 + delta;\n"
+            "        *raw\n"
+            "    }\n"
+            "}\n"
+        ),
+    },
 )
+
+# Keys of a probe: a mutant's own probe, or a variant's `probe` override.
+SEMANTIC_MUTANT_PROBE_KEYS: tuple[str, ...] = (
+    "probe_rust_source",
+    "reference_miri_outcome",
+    "baseline_anneal_outcome",
+    "baseline_anneal_lean_tag",
+)
+
+
+def semantic_mutant_variant_probe(
+    mutant: dict[str, Any], variant: dict[str, Any]
+) -> dict[str, Any]:
+    """The probe a variant runs on: its own `probe` (which must carry an `id` and
+    every `SEMANTIC_MUTANT_PROBE_KEYS` entry), or else its mutant's probe (whose id
+    is the mutant id). Raises on a malformed override, which the self-check counts
+    as a surviving mutant."""
+    override = variant.get("probe")
+    if override is None:
+        probe = {k: mutant[k] for k in SEMANTIC_MUTANT_PROBE_KEYS}
+        probe["id"] = str(mutant["id"])
+        return probe
+    if not isinstance(override, dict):
+        raise ValueError(f"variant {variant.get('label')!r} has a non-object probe")
+    probe = {k: override[k] for k in SEMANTIC_MUTANT_PROBE_KEYS}
+    probe["id"] = str(override["id"])
+    return probe
+
+
+def semantic_mutant_probes(
+    mutants: tuple[dict[str, Any], ...] | list[dict[str, Any]] = SEEDED_SEMANTIC_MUTANTS,
+) -> list[dict[str, Any]]:
+    """Every distinct probe of `mutants`, in table order: each mutant's own probe,
+    followed by its variants' `probe` overrides. Raises when two probes share an
+    `id` but differ, since a probe id names exactly one live-pinned program."""
+    probes: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for mutant in mutants:
+        candidates = [semantic_mutant_variant_probe(mutant, {})]
+        candidates.extend(
+            semantic_mutant_variant_probe(mutant, v)
+            for v in mutant.get("mutant_variants", ())
+            if v.get("probe") is not None
+        )
+        for probe in candidates:
+            prior = by_id.get(probe["id"])
+            if prior is None:
+                by_id[probe["id"]] = probe
+                probes.append(probe)
+            elif prior != probe:
+                raise ValueError(
+                    f"conflicting definitions of semantic-mutant probe {probe['id']!r}"
+                )
+    return probes
+
+
+def _simulate_probe_baseline(probe: dict[str, Any], repro_path: Path) -> dict[str, Any]:
+    """Runs a probe's *unmutated* outcome through the campaign pipeline: it is clean
+    only when the pipeline exits `EXIT_SUCCESS`, the outcome tags classify as
+    `agree`, and they carry no witness polarity."""
+    probe_id = str(probe["id"])
+    miri_outcome = str(probe["reference_miri_outcome"])
+    anneal_outcome = str(probe["baseline_anneal_outcome"])
+    summary = build_simulated_miri_summary(
+        probe_id,
+        miri_outcome,
+        anneal_outcome,
+        str(probe["baseline_anneal_lean_tag"]),
+        repro_path,
+    )
+    verdict = campaign_verdict_for_miri_summary(summary)
+    tag_verdict = classify_oracle_outcome_tags(miri_outcome, anneal_outcome)[0]
+    polarity = classify_witness_polarity_from_tags(miri_outcome, anneal_outcome)
+    return {
+        "probe_id": probe_id,
+        "verdict": tag_verdict,
+        "exit_code": verdict["exit_code"],
+        "witness_polarity": polarity,
+        "clean": (
+            verdict["exit_code"] == EXIT_SUCCESS
+            and tag_verdict == "agree"
+            and polarity is None
+            and verdict["witness_polarity"] is None
+        ),
+        "detail": f"{verdict['kill_class']}: {verdict['detail']}",
+    }
 
 
 def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[str, Any]:
     """Differential (baseline vs. mutant) simulation of one seeded semantic mutant.
 
-    The probe is first evaluated with the *unmutated* Anneal semantics
-    (`baseline_anneal_outcome`), which must agree with the reference Miri outcome and
-    pass the full campaign pipeline with `EXIT_SUCCESS`; otherwise the probe proves
-    nothing and the mutant is reported as not killed. Each mutant variant (the Anneal
-    outcome with the guard omitted or mutated) must then be rejected by the campaign
-    pipeline (`EXIT_DIVERGENCE_DETECTED` or `EXIT_HARNESS_FAILED`) with an expected kill
-    class. Verdicts are derived by `classify_oracle_outcome_tags`, never hard-coded.
+    Every probe the mutant uses (its own and each variant's `probe` override) is first
+    evaluated with the *unmutated* Anneal semantics (`baseline_anneal_outcome`), which
+    must agree with the reference Miri outcome, carry no witness polarity, and pass the
+    full campaign pipeline with `EXIT_SUCCESS`; otherwise the probe proves nothing and
+    the mutant is reported as not killed. Each mutant variant (the Anneal outcome with
+    the guard omitted or mutated, on its probe) must then be rejected by the campaign
+    pipeline (`EXIT_DIVERGENCE_DETECTED` or `EXIT_HARNESS_FAILED`) with its expected
+    kill class and with its `expected_witness_polarity`, which both the pipeline's
+    verdict and the exact Rust-tag classifier must report. Verdicts and polarities are
+    derived by `classify_oracle_outcome_tags` / `classify_witness_polarity_from_tags`
+    and the campaign pipeline, never hard-coded.
     """
     mutant_id = str(mutant["id"])
     expected = tuple(mutant.get("expected_kill_classes", ()))
-    miri_outcome = str(mutant["reference_miri_outcome"])
+    expected_polarities = tuple(mutant.get("expected_witness_polarities", ()))
+    variants = list(mutant.get("mutant_variants", ()))
+    own_probe = semantic_mutant_variant_probe(mutant, {})
+    variant_probes = [semantic_mutant_variant_probe(mutant, v) for v in variants]
     with tempfile.TemporaryDirectory(prefix=f"anneal-mutant-{mutant_id}-") as tmp:
-        repro_path = Path(tmp) / "repro.rs"
-        repro_path.write_text(str(mutant["probe_rust_source"]), encoding="utf-8")
+        repro_paths: dict[str, Path] = {}
+        probes_by_id: dict[str, dict[str, Any]] = {}
+        baselines: list[dict[str, Any]] = []
+        for probe in [own_probe, *variant_probes]:
+            prior = probes_by_id.get(probe["id"])
+            if prior is not None:
+                # One id, one program: a variant may not reuse a probe id with
+                # different outcomes and so skip that program's baseline check.
+                if prior != probe:
+                    raise ValueError(
+                        f"conflicting definitions of semantic-mutant probe {probe['id']!r}"
+                    )
+                continue
+            probes_by_id[probe["id"]] = probe
+            repro_path = Path(tmp) / f"{len(repro_paths)}_repro.rs"
+            repro_path.write_text(str(probe["probe_rust_source"]), encoding="utf-8")
+            repro_paths[probe["id"]] = repro_path
+            baselines.append(_simulate_probe_baseline(probe, repro_path))
 
-        baseline_summary = build_simulated_miri_summary(
-            mutant_id,
-            miri_outcome,
-            str(mutant["baseline_anneal_outcome"]),
-            str(mutant["baseline_anneal_lean_tag"]),
-            repro_path,
-        )
-        base_exit, base_class, base_detail = campaign_exit_for_miri_summary(baseline_summary)
+        own = baselines[0]
         result: dict[str, Any] = {
             "id": mutant_id,
-            "baseline_verdict": classify_oracle_outcome_tags(
-                miri_outcome, str(mutant["baseline_anneal_outcome"])
-            )[0],
-            "baseline_exit_code": base_exit,
+            "baseline_verdict": own["verdict"],
+            "baseline_exit_code": own["exit_code"],
+            "baseline_witness_polarity": own["witness_polarity"],
+            "baselines": baselines,
             "variants": [],
         }
-        if base_exit != EXIT_SUCCESS:
+        unclean = [b for b in baselines if not b["clean"]]
+        if unclean:
+            first = unclean[0]
             result.update(
                 killed=False,
                 kill_class="baseline_not_clean",
-                exit_code=base_exit,
-                detail=f"unmutated semantics fail the probe ({base_class}): {base_detail}",
+                exit_code=first["exit_code"],
+                witness_polarity=first["witness_polarity"],
+                detail=(
+                    f"unmutated semantics fail probe {first['probe_id']!r} "
+                    f"({first['detail']})"
+                ),
             )
             return result
 
         variant_results: list[dict[str, Any]] = []
         observed_classes: set[str] = set()
-        for variant in mutant.get("mutant_variants", ()):
+        observed_polarities: set[str] = set()
+        for variant, probe in zip(variants, variant_probes):
+            miri_outcome = str(probe["reference_miri_outcome"])
+            anneal_outcome = str(variant["anneal_outcome"])
             diagnostics = [dict(d) for d in variant.get("diagnostics", ())]
             summary = build_simulated_miri_summary(
-                mutant_id,
+                str(probe["id"]),
                 miri_outcome,
-                str(variant["anneal_outcome"]),
+                anneal_outcome,
                 str(variant["anneal_lean_tag"]),
-                repro_path,
+                repro_paths[probe["id"]],
                 diagnostics=diagnostics or None,
             )
-            v_exit, v_class, v_detail = campaign_exit_for_miri_summary(summary)
+            verdict = campaign_verdict_for_miri_summary(summary)
+            v_exit, v_class, v_detail = (
+                verdict["exit_code"],
+                verdict["kill_class"],
+                verdict["detail"],
+            )
+            v_polarity = verdict["witness_polarity"]
+            tag_polarity = classify_witness_polarity_from_tags(miri_outcome, anneal_outcome)
             v_expected_cls = variant.get("expected_kill_class")
             v_expected_sub = variant.get("expected_detail_substring")
+            v_expected_pol = variant.get("expected_witness_polarity")
             v_killed = (
                 v_exit in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
                 and bool(expected)
                 and v_class in expected
                 and (v_expected_cls is None or v_class == v_expected_cls)
                 and (v_expected_sub is None or str(v_expected_sub) in v_detail)
+                and v_expected_pol in VALID_WITNESS_POLARITIES
+                and v_expected_pol in expected_polarities
+                and v_polarity == tag_polarity == v_expected_pol
             )
             if v_killed:
                 observed_classes.add(v_class)
+                observed_polarities.add(v_polarity)
             variant_results.append(
                 {
                     "label": str(variant.get("label", "")),
-                    "verdict": list(
-                        classify_oracle_outcome_tags(miri_outcome, str(variant["anneal_outcome"]))
-                    ),
+                    "probe_id": str(probe["id"]),
+                    "verdict": list(classify_oracle_outcome_tags(miri_outcome, anneal_outcome)),
                     "exit_code": v_exit,
                     "kill_class": v_class,
+                    "witness_polarity": v_polarity,
+                    "tag_witness_polarity": tag_polarity,
+                    "expected_witness_polarity": v_expected_pol,
                     "killed": v_killed,
                     "detail": v_detail,
                 }
             )
         result["variants"] = variant_results
         missing_classes = [c for c in expected if c not in observed_classes]
+        missing_polarities = [p for p in expected_polarities if p not in observed_polarities]
         all_killed = (
             bool(variant_results)
             and bool(expected)
+            and bool(expected_polarities)
             and all(v["killed"] for v in variant_results)
             and not missing_classes
+            and not missing_polarities
         )
         survivors = [v for v in variant_results if not v["killed"]]
         first = survivors[0] if survivors else variant_results[0] if variant_results else None
@@ -3769,46 +4750,77 @@ def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[s
             killed=all_killed,
             kill_class=(first["kill_class"] if first else "no_variants"),
             exit_code=(first["exit_code"] if first else EXIT_SUCCESS),
+            witness_polarity=(first["witness_polarity"] if first else None),
         )
         if survivors:
             result["survived_variants"] = [v["label"] for v in survivors]
         if missing_classes:
             result["missing_expected_kill_classes"] = missing_classes
+        if missing_polarities:
+            result["missing_expected_witness_polarities"] = missing_polarities
         return result
+
+
+def _explicit_or_implied_polarity(raw_res: dict[str, Any], kill_class: str) -> str | None:
+    """A dict result's `witness_polarity` when it reports one (which must be a valid
+    slug or `None`), else the polarity its kill class implies."""
+    if "witness_polarity" in raw_res:
+        polarity = raw_res["witness_polarity"]
+        if polarity is not None and polarity not in VALID_WITNESS_POLARITIES:
+            raise ValueError(f"evaluator returned an invalid witness_polarity {polarity!r}")
+        return polarity
+    return kill_class_witness_polarity(kill_class)
 
 
 def _normalize_evaluator_result(
     mutant_id: str, expected_classes: tuple[str, ...], raw_res: Any
 ) -> dict[str, Any]:
-    """Normalizes a custom evaluator's result (bool, exit code, verdict string, or dict)."""
+    """Normalizes a custom evaluator's result (bool, exit code, verdict string, or dict)
+    into `{"id", "killed", "kill_class", "exit_code", "witness_polarity"}`. The
+    polarity is the one a dict result reports explicitly, the campaign verdict's for a
+    full `miri-difftest` summary, or else the one its kill class implies
+    (`kill_class_witness_polarity`); a survivor carries none."""
+
+    def result(killed: bool, k_class: str, exit_c: int, polarity: str | None) -> dict[str, Any]:
+        return {
+            "id": mutant_id,
+            "killed": killed,
+            "kill_class": k_class,
+            "exit_code": exit_c,
+            "witness_polarity": polarity if killed else None,
+        }
+
     if isinstance(raw_res, bool):
-        return {
-            "id": mutant_id,
-            "killed": raw_res,
-            "kill_class": expected_classes[0] if (raw_res and expected_classes) else "survived",
-            "exit_code": EXIT_DIVERGENCE_DETECTED if raw_res else EXIT_SUCCESS,
-        }
+        k_class = expected_classes[0] if (raw_res and expected_classes) else "survived"
+        return result(
+            raw_res,
+            k_class,
+            EXIT_DIVERGENCE_DETECTED if raw_res else EXIT_SUCCESS,
+            kill_class_witness_polarity(k_class),
+        )
     if isinstance(raw_res, int):
-        is_killed = raw_res in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
-        return {
-            "id": mutant_id,
-            "killed": is_killed,
-            "kill_class": (
-                expected_classes[0]
-                if (is_killed and expected_classes)
-                else ("harness_error" if is_killed else "survived")
-            ),
-            "exit_code": raw_res,
-        }
+        # A bare exit code names only its verdict family: `EXIT_HARNESS_FAILED` is a
+        # `harness_error` kill, and `EXIT_DIVERGENCE_DETECTED` is credited to the
+        # mutant's first expected divergence class.
+        divergence_classes = [c for c in expected_classes if c != HARNESS_ERROR_KILL_CLASS]
+        if raw_res == EXIT_HARNESS_FAILED:
+            k_class = HARNESS_ERROR_KILL_CLASS
+        elif raw_res == EXIT_DIVERGENCE_DETECTED and divergence_classes:
+            k_class = divergence_classes[0]
+        else:
+            k_class = "survived"
+        is_killed = k_class != "survived"
+        return result(is_killed, k_class, raw_res, kill_class_witness_polarity(k_class))
     if isinstance(raw_res, str):
         clean = raw_res.strip().lower()
         is_killed = clean not in ("agree", "pass", "survived", "ok", "")
-        return {
-            "id": mutant_id,
-            "killed": is_killed,
-            "kill_class": raw_res.strip() if is_killed else "survived",
-            "exit_code": EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS,
-        }
+        k_class = raw_res.strip() if is_killed else "survived"
+        return result(
+            is_killed,
+            k_class,
+            EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS,
+            kill_class_witness_polarity(k_class),
+        )
     if isinstance(raw_res, dict):
         if "killed" in raw_res:
             raw_exit = raw_res.get(
@@ -3828,63 +4840,75 @@ def _normalize_evaluator_result(
                     expected_classes[0] if (is_killed and expected_classes) else "survived",
                 )
             )
-        elif "verdict" in raw_res:
+            return result(
+                is_killed, k_class, exit_c, _explicit_or_implied_polarity(raw_res, k_class)
+            )
+        if "verdict" in raw_res:
             verdict_str = str(raw_res["verdict"]).strip().lower()
             if verdict_str == "diverge":
                 div_cls = raw_res.get("divergence_class", raw_res.get("kill_class"))
                 is_killed = isinstance(div_cls, str) and bool(div_cls.strip())
                 k_class = div_cls.strip() if is_killed else "survived"
                 exit_c = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
-            elif verdict_str in ("error", "harness_error"):
+            elif verdict_str in ("error", HARNESS_ERROR_KILL_CLASS):
                 is_killed = True
                 k_class = str(
-                    raw_res.get("divergence_class", raw_res.get("kill_class", "harness_error"))
+                    raw_res.get(
+                        "divergence_class", raw_res.get("kill_class", HARNESS_ERROR_KILL_CLASS)
+                    )
                 )
                 exit_c = EXIT_HARNESS_FAILED
             else:
-                is_killed = False
-                k_class = "survived"
-                exit_c = EXIT_SUCCESS
-        elif "diverge_count" in raw_res or "miri_verdicts" in raw_res:
-            exit_c, k_class, _ = campaign_exit_for_miri_summary(raw_res)
+                return result(False, "survived", EXIT_SUCCESS, None)
+            return result(
+                is_killed, k_class, exit_c, _explicit_or_implied_polarity(raw_res, k_class)
+            )
+        if "diverge_count" in raw_res or "miri_verdicts" in raw_res:
+            verdict = campaign_verdict_for_miri_summary(raw_res)
+            exit_c = verdict["exit_code"]
             is_killed = exit_c in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
-            if not is_killed:
-                k_class = "survived"
-        else:
-            is_killed = False
-            k_class = "survived"
-            exit_c = EXIT_SUCCESS
-        return {"id": mutant_id, "killed": is_killed, "kill_class": k_class, "exit_code": exit_c}
-    return {"id": mutant_id, "killed": False, "kill_class": "survived", "exit_code": EXIT_SUCCESS}
+            return result(
+                is_killed,
+                verdict["kill_class"] if is_killed else "survived",
+                exit_c,
+                verdict["witness_polarity"],
+            )
+    return result(False, "survived", EXIT_SUCCESS, None)
 
 
 def run_semantic_mutant_self_check(
     evaluator: Any = None,
     mutants: tuple[dict[str, Any], ...] | list[dict[str, Any]] = SEEDED_SEMANTIC_MUTANTS,
 ) -> dict[str, Any]:
-    """Runs the seeded semantic mutant probes (by default the 5 families
-    `bool_valid_range`, `storage_dead_tag`, `provenance_frag`, `div_by_zero`, and
-    `wide_shift`) through the campaign oracle verdict pipeline and fails closed
-    (`EXIT_HARNESS_FAILED`) unless every mutant is killed.
+    """Runs the seeded semantic mutant probes (by default the 8 families
+    `bool_valid_range`, `storage_dead_tag`, `provenance_frag`, `div_by_zero`,
+    `wide_shift`, `move_triggers_tb_write`, `exact_div_rem_omitted`, and
+    `protector_release_order`) through the campaign oracle verdict pipeline and fails
+    closed (`EXIT_HARNESS_FAILED`) unless every mutant is killed.
 
     Without `evaluator`, each mutant is checked differentially by
-    `_simulate_mutant_through_campaign_pipeline` (unmutated semantics must pass, every
-    mutated variant must be rejected with an expected kill class). A custom
-    `evaluator(mutant)` (for example a live run against mutated Lean sources) may
-    return a bool, an exit code, a verdict string, a result dict, or a full
-    `miri-difftest` summary. Any exception raised while evaluating a mutant (by the
-    simulation, a custom evaluator, or while normalizing its result) counts as a
-    surviving mutant (`evaluator_error`), never as a kill, and a kill whose class is
-    not among the mutant's `expected_kill_classes` counts as a survivor too.
+    `_simulate_mutant_through_campaign_pipeline` (unmutated semantics must pass on
+    every probe, every mutated variant must be rejected with its expected kill class
+    and witness polarity). A custom `evaluator(mutant)` (for example a live run against
+    mutated Lean sources) may return a bool, an exit code, a verdict string, a result
+    dict, or a full `miri-difftest` summary. Any exception raised while evaluating a
+    mutant (by the simulation, a custom evaluator, or while normalizing its result)
+    counts as a surviving mutant (`evaluator_error`), never as a kill, and so does a
+    kill whose class is not among the mutant's `expected_kill_classes` or whose witness
+    polarity is not among its `expected_witness_polarities` (or contradicts the polarity
+    its kill class implies). `witness_polarity_counts` tallies the polarities of the
+    killed variants (or of killed custom-evaluator mutants).
     """
     killed_mutants: list[str] = []
     survived_mutants: list[str] = []
     per_mutant_results: list[dict[str, Any]] = []
+    polarity_counts = empty_witness_polarity_counts()
 
     for idx, mutant in enumerate(mutants):
         try:
             mutant_id = str(mutant["id"])
             expected_classes = tuple(mutant.get("expected_kill_classes", ()))
+            expected_polarities = tuple(mutant.get("expected_witness_polarities", ()))
         except Exception as e:  # noqa: BLE001 - fail closed on a malformed mutant
             mutant_id = f"<mutant[{idx}]>"
             per_mutant_results.append(
@@ -3893,6 +4917,7 @@ def run_semantic_mutant_self_check(
                     "killed": False,
                     "kill_class": "evaluator_error",
                     "exit_code": EXIT_INTERNAL_ERROR,
+                    "witness_polarity": None,
                     "detail": f"malformed mutant: {type(e).__name__}: {e}",
                 }
             )
@@ -3911,6 +4936,7 @@ def run_semantic_mutant_self_check(
                 "killed": False,
                 "kill_class": "evaluator_error",
                 "exit_code": EXIT_INTERNAL_ERROR,
+                "witness_polarity": None,
                 "detail": f"{type(e).__name__}: {e}",
             }
 
@@ -3919,10 +4945,36 @@ def run_semantic_mutant_self_check(
         ):
             outcome["killed"] = False
             outcome["unexpected_kill_class"] = outcome.get("kill_class")
+        # A kill's exit code and class must name the same verdict: the campaign exits
+        # `EXIT_HARNESS_FAILED` exactly for a `harness_error` and
+        # `EXIT_DIVERGENCE_DETECTED` for a divergence class.
+        if outcome["killed"] and (
+            (outcome.get("exit_code") == EXIT_HARNESS_FAILED)
+            != (outcome.get("kill_class") == HARNESS_ERROR_KILL_CLASS)
+        ):
+            outcome["killed"] = False
+            outcome["inconsistent_exit_code"] = outcome.get("exit_code")
+        if outcome["killed"]:
+            polarity = outcome.get("witness_polarity")
+            implied = kill_class_witness_polarity(outcome.get("kill_class"))
+            if (
+                not expected_polarities
+                or polarity not in expected_polarities
+                or (implied is not None and polarity != implied)
+            ):
+                outcome["killed"] = False
+                outcome["unexpected_witness_polarity"] = polarity
 
         per_mutant_results.append(outcome)
         if outcome["killed"]:
             killed_mutants.append(mutant_id)
+            variants = outcome.get("variants")
+            if isinstance(variants, list) and variants:
+                for v in variants:
+                    if v.get("killed") and v.get("witness_polarity") in polarity_counts:
+                        polarity_counts[v["witness_polarity"]] += 1
+            elif outcome.get("witness_polarity") in polarity_counts:
+                polarity_counts[outcome["witness_polarity"]] += 1
         else:
             survived_mutants.append(mutant_id)
 
@@ -3934,6 +4986,7 @@ def run_semantic_mutant_self_check(
         "killed_count": len(killed_mutants),
         "killed_mutants": killed_mutants,
         "survived_mutants": survived_mutants,
+        "witness_polarity_counts": polarity_counts,
         "results": per_mutant_results,
         "exit_code": EXIT_SUCCESS if passed else EXIT_HARNESS_FAILED,
     }
@@ -4030,6 +5083,12 @@ def render_gate_report_sections(
     """Renders the Markdown sections for the enabled gates (empty when none ran)."""
     lines: list[str] = []
     if mutant_report is not None:
+        killed_polarities = mutant_report.get("witness_polarity_counts")
+        polarity_line = (
+            ", ".join(f"`{p}`={killed_polarities.get(p, 0)}" for p in VALID_WITNESS_POLARITIES)
+            if isinstance(killed_polarities, dict)
+            else "n/a"
+        )
         lines.extend(
             [
                 "",
@@ -4038,24 +5097,41 @@ def render_gate_report_sections(
                 f"- **Passed**: `{mutant_report['passed']}` "
                 f"(`{mutant_report['killed_count']}/{mutant_report['total_mutants']}` killed)",
                 f"- **Survived mutants**: `{mutant_report['survived_mutants']}`",
+                f"- **Killed-variant witness polarities**: {polarity_line}",
                 "",
-                "| Mutant | Killed | Kill class | Baseline | Variants (label: exit, class) |",
-                "| :--- | :--- | :--- | :--- | :--- |",
+                "| Mutant | Killed | Kill class | Witness polarities | Baseline | "
+                "Variants (label: exit, class, polarity) |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
         for res in mutant_report.get("results", []):
             variants = "; ".join(
-                f"{v.get('label')}: {v.get('exit_code')}, {v.get('kill_class')}"
+                f"{v.get('label')}: {v.get('exit_code')}, {v.get('kill_class')}, "
+                f"{v.get('witness_polarity')}"
                 for v in res.get("variants", [])
             )
+            probe_count = len(res.get("baselines") or [])
+            probes_note = f"; {probe_count} probes" if probe_count > 1 else ""
             baseline = (
                 f"{_md_table_cell(res.get('baseline_verdict', 'n/a'), code=True)} (exit "
-                f"{_md_table_cell(res.get('baseline_exit_code', 'n/a'), code=True)})"
+                f"{_md_table_cell(res.get('baseline_exit_code', 'n/a'), code=True)}"
+                f"{probes_note})"
+            )
+            # Every distinct variant polarity, in variant order (a family such as
+            # `protector_release_order` kills in both soundness directions).
+            variant_polarities = list(
+                dict.fromkeys(str(v.get("witness_polarity")) for v in res.get("variants", []))
+            )
+            polarity_cell = (
+                ", ".join(variant_polarities)
+                if variant_polarities
+                else res.get("witness_polarity")
             )
             lines.append(
                 f"| {_md_table_cell(res.get('id'), code=True)} "
                 f"| {_md_table_cell(res.get('killed'), code=True)} "
                 f"| {_md_table_cell(res.get('kill_class'), code=True)} "
+                f"| {_md_table_cell(polarity_cell, code=True)} "
                 f"| {baseline} | {_md_table_cell(variants or 'n/a')} |"
             )
     if ratchet_report is not None:
@@ -4088,12 +5164,33 @@ def gate_junit_cases(
     """JUnit test cases `(name, failure, skipped)` for the enabled gates."""
     cases: list[tuple[str, tuple[str, str] | None, str | None]] = []
     if mutant_report is not None:
+        survivor_details = [
+            f"{r.get('id')}: kill_class={r.get('kill_class')}, "
+            f"witness_polarity={r.get('witness_polarity')}"
+            + (
+                f", survived_variants={r['survived_variants']}"
+                if r.get("survived_variants")
+                else ""
+            )
+            + (
+                f", unexpected_witness_polarity={r['unexpected_witness_polarity']}"
+                if "unexpected_witness_polarity" in r
+                else ""
+            )
+            for r in mutant_report.get("results", [])
+            if isinstance(r, dict) and not r.get("killed")
+        ]
         failure = (
             None
             if mutant_report.get("passed") is True
             else (
                 "semantic mutant survived",
-                f"survived mutants: {mutant_report.get('survived_mutants')}",
+                "\n".join(
+                    [
+                        f"survived mutants: {mutant_report.get('survived_mutants')}",
+                        *survivor_details,
+                    ]
+                ),
             )
         )
         cases.append(("semantic-mutant-self-check", failure, None))
@@ -4136,6 +5233,10 @@ def write_standalone_gate_reports(
         },
         "semantic_mutant_self_check": mutant_report,
         "stale_ratchet_audit": ratchet_report,
+        # No harness ran, so no `miri-difftest` non-agreement has a polarity; the
+        # self-check's killed-variant polarities are in
+        # `semantic_mutant_self_check.witness_polarity_counts`.
+        "witness_polarity_counts": None,
         "elapsed_sec": round(elapsed_sec, 3),
     }
     reports_dir = state_dir / "reports"
@@ -4364,7 +5465,8 @@ def write_oracle_junit_xml(
         )
     elif len(miri_unquarantined) > 0:
         summary_lines = [
-            f"{d.fingerprint} (occurrences={d.occurrences}, repro={d.primary_repro_path})"
+            f"{d.fingerprint} (occurrences={d.occurrences}, "
+            f"witness_polarity={d.witness_polarity}, repro={d.primary_repro_path})"
             for d in miri_unquarantined
         ]
         cases.append(
@@ -4532,6 +5634,10 @@ def update_suite_scoped_fingerprints(
     - Legacy ledgers without `fingerprint_history` get entries for their active
       fingerprints dated by the ledger's `last_run_utc` (when they were last
       observed), never by today's date.
+    - Every `miri-difftest` entry a healthy run writes (observed or resolved) records
+      the `witness_polarity` of its fingerprint's divergence class; legacy entries
+      without one load unchanged and gain it the next time a healthy run touches
+      them.
     """
     prev_active_raw = ledger.get("active_fingerprints", [])
     prev_active_list: list[str] = (
@@ -4575,6 +5681,14 @@ def update_suite_scoped_fingerprints(
 
     def suite_of(fp: str) -> str:
         return infer_fingerprint_suite(fp, fp_history.get(fp) or resolved_history.get(fp))
+
+    def tag_polarity(entry: dict[str, Any], fp: str, suite_name: str) -> dict[str, Any]:
+        polarity = (
+            fingerprint_witness_polarity(fp) if suite_name == "miri-difftest" else None
+        )
+        if polarity is not None:
+            entry["witness_polarity"] = polarity
+        return entry
 
     new_active: list[str] = []
     new_quarantined: list[str] = []
@@ -4632,12 +5746,16 @@ def update_suite_scoped_fingerprints(
             else:
                 first_seen = date_prefix
                 failing_cnt = 1
-            fp_history[fp] = {
-                "first_seen_date": first_seen,
-                "last_seen_date": date_prefix,
-                "campaigns_failing": failing_cnt,
-                "suite": suite_name,
-            }
+            fp_history[fp] = tag_polarity(
+                {
+                    "first_seen_date": first_seen,
+                    "last_seen_date": date_prefix,
+                    "campaigns_failing": failing_cnt,
+                    "suite": suite_name,
+                },
+                fp,
+                suite_name,
+            )
             resolved_history.pop(fp, None)
 
         # Still observed, but quarantined: not resolved; refresh `last_seen_date`
@@ -4653,12 +5771,16 @@ def update_suite_scoped_fingerprints(
             else:
                 first_seen = date_prefix
                 failing_cnt = 0
-            fp_history[fp] = {
-                "first_seen_date": first_seen,
-                "last_seen_date": date_prefix,
-                "campaigns_failing": failing_cnt,
-                "suite": suite_name,
-            }
+            fp_history[fp] = tag_polarity(
+                {
+                    "first_seen_date": first_seen,
+                    "last_seen_date": date_prefix,
+                    "campaigns_failing": failing_cnt,
+                    "suite": suite_name,
+                },
+                fp,
+                suite_name,
+            )
             resolved_history.pop(fp, None)
 
         to_resolve = (
@@ -4668,13 +5790,17 @@ def update_suite_scoped_fingerprints(
         )
         for fp in sorted(to_resolve):
             prev_meta = fp_history.pop(fp, None) or {}
-            resolved_history[fp] = {
-                "first_seen_date": str(prev_meta.get("first_seen_date") or legacy_seen_date),
-                "last_seen_date": str(prev_meta.get("last_seen_date") or legacy_seen_date),
-                "campaigns_failing": _safe_nonneg_int(prev_meta.get("campaigns_failing"), 1),
-                "resolved_date": date_prefix,
-                "suite": suite_name,
-            }
+            resolved_history[fp] = tag_polarity(
+                {
+                    "first_seen_date": str(prev_meta.get("first_seen_date") or legacy_seen_date),
+                    "last_seen_date": str(prev_meta.get("last_seen_date") or legacy_seen_date),
+                    "campaigns_failing": _safe_nonneg_int(prev_meta.get("campaigns_failing"), 1),
+                    "resolved_date": date_prefix,
+                    "suite": suite_name,
+                },
+                fp,
+                suite_name,
+            )
 
         new_active.extend(sorted(obs_unquar))
         new_quarantined.extend(sorted(obs_quar))
@@ -5397,6 +6523,15 @@ def render_oracle_campaign_report(
             "> `miri-difftest` failed to complete a valid live oracle comparison.",
         ]
 
+    unquarantined_polarities = count_dedup_witness_polarities(unquarantined)
+    quarantined_polarities = count_dedup_witness_polarities(quarantined)
+    if miri_performed and unquarantined_polarities[WITNESS_POLARITY_UNSOUND] > 0:
+        banner_lines.append(
+            f"> **Soundness alert**: `{unquarantined_polarities[WITNESS_POLARITY_UNSOUND]}` "
+            "unquarantined distinct `unsound_missed_fault` divergence(s): Miri faulted and "
+            "Anneal did not report the fault."
+        )
+
     if itree_performed and itree is not None:
         banner_lines.append(
             f"> `itree-difftest` evaluated `{itree['compared_candidates']}/{itree['total_candidates']}` "
@@ -5490,6 +6625,34 @@ def render_oracle_campaign_report(
             )
             for callee, count in sorted(ext_calls.items(), key=lambda kv: (-kv[1], kv[0])):
                 lines.append(f"| `{callee}` | {count} |")
+
+        pol_counts = miri.get("witness_polarity_counts")
+        lines.extend(["", "## Witness Polarity Breakdown (`miri-difftest`)", ""])
+        if isinstance(pol_counts, dict) and miri_red_flags.checks.get(
+            "witness_polarity_accounting", False
+        ):
+            lines.extend(
+                [
+                    "Every non-agreement has exactly one soundness direction "
+                    f"(`{sum(int(v) for v in pol_counts.values())}` = "
+                    f"`{miri['diverge_count']}` diverged + `{miri['not_compared_count']}` "
+                    "not compared).",
+                    "",
+                    "| Witness Polarity | Count | Unquarantined distinct | Quarantined distinct |",
+                    "| :--- | ---: | ---: | ---: |",
+                ]
+            )
+            for pol in VALID_WITNESS_POLARITIES:
+                lines.append(
+                    f"| `{pol}` | {pol_counts.get(pol, 0)} | "
+                    f"{unquarantined_polarities[pol]} | {quarantined_polarities[pol]} |"
+                )
+        else:
+            lines.append(
+                "The harness's `witness_polarity_counts` failed the accounting audit "
+                "(`witness_polarity_accounting` red flag), so no per-polarity counts are "
+                "reported."
+            )
 
     if itree_performed and itree is not None:
         lines.extend(
@@ -5585,15 +6748,17 @@ def render_oracle_campaign_report(
     else:
         lines.extend(
             [
-                "| Fingerprint | Class | Occurrences | Miri | Anneal | Kernel Confirmed | Reproducer |",
-                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- |",
+                "| Fingerprint | Class | Occurrences | Polarity | Miri | Anneal | Kernel Confirmed "
+                "| Reproducer |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
         for d in unquarantined:
+            polarity_cell = f"`{d.witness_polarity}`" if d.witness_polarity else "n/a"
             lines.append(
                 f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
-                f"`{d.miri_outcome}` | `{d.anneal_outcome}` | `{str(d.kernel_confirmed).lower()}` | "
-                f"`{d.primary_repro_path}` |"
+                f"{polarity_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
+                f"`{str(d.kernel_confirmed).lower()}` | `{d.primary_repro_path}` |"
             )
 
     lines.extend(
@@ -5608,15 +6773,17 @@ def render_oracle_campaign_report(
     else:
         lines.extend(
             [
-                "| Fingerprint | Class | Occurrences | Miri | Anneal | Kernel Confirmed | Reproducer |",
-                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- |",
+                "| Fingerprint | Class | Occurrences | Polarity | Miri | Anneal | Kernel Confirmed "
+                "| Reproducer |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
         for d in quarantined:
+            polarity_cell = f"`{d.witness_polarity}`" if d.witness_polarity else "n/a"
             lines.append(
                 f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
-                f"`{d.miri_outcome}` | `{d.anneal_outcome}` | `{str(d.kernel_confirmed).lower()}` | "
-                f"`{d.primary_repro_path}` |"
+                f"{polarity_cell} | `{d.miri_outcome}` | `{d.anneal_outcome}` | "
+                f"`{str(d.kernel_confirmed).lower()}` | `{d.primary_repro_path}` |"
             )
 
     return "\n".join(lines) + "\n"
@@ -6463,6 +7630,11 @@ def main(argv: list[str] | None = None) -> int:
 
         combined_checks = dict(miri_red_flags.checks)
         combined_reasons = list(miri_red_flags.failure_reasons)
+        polarity_verified = bool(
+            miri_performed
+            and miri is not None
+            and miri_red_flags.checks.get("witness_polarity_accounting") is True
+        )
         if itree_red_flags is not None:
             combined_checks.update(itree_red_flags.checks)
             combined_reasons.extend(itree_red_flags.failure_reasons)
@@ -6491,6 +7663,28 @@ def main(argv: list[str] | None = None) -> int:
             },
             "harness_diagnostics": copy.deepcopy(LAST_HARNESS_DIAGNOSTICS),
             "coverage_ratchet_baseline_missing": ratchet_baseline_missing,
+            # Per-candidate `WitnessPolarity` counts of the `miri-difftest` run (every
+            # non-agreement has exactly one), reported only once they pass the
+            # accounting audit (`witness_polarity_accounting`; the raw harness map
+            # stays in `miri_summary`), and the polarities of its distinct
+            # unquarantined / quarantined fingerprints; `None` when no valid
+            # performed `miri-difftest` summary exists.
+            "witness_polarity_accounting_verified": polarity_verified,
+            "witness_polarity_counts": (
+                {p: int(miri["witness_polarity_counts"][p]) for p in VALID_WITNESS_POLARITIES}
+                if polarity_verified and miri is not None
+                else None
+            ),
+            "unquarantined_witness_polarity_counts": (
+                count_dedup_witness_polarities(miri_unquarantined)
+                if miri_performed and miri is not None
+                else None
+            ),
+            "quarantined_witness_polarity_counts": (
+                count_dedup_witness_polarities(miri_quarantined)
+                if miri_performed and miri is not None
+                else None
+            ),
             "miri_summary": miri,
             "itree_summary": itree if include_itree else None,
             "deduplicated_findings": [d.to_dict() for d in all_dedup],

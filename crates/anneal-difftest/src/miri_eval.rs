@@ -6812,12 +6812,21 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         );
     }
 
-    /// Probes for the 5-family semantic-mutant self-check: each exercises one UB or
-    /// panic check of Anneal's semantics (`bool` validity, `StorageDead`, pointer
-    /// provenance, division by zero, and wide shift exponents) on which the live
-    /// engine agrees with Miri, so a mutant of the semantics that omits that check
-    /// diverges from Miri. `scripts/run_diff_test_campaign.py` embeds byte-identical
-    /// sources in `SEEDED_SEMANTIC_MUTANTS` (checked by
+    /// Probes for the 8-family semantic-mutant self-check, keyed by probe id (a
+    /// mutant id, or the `probe["id"]` of a variant that needs its own program).
+    /// Each exercises one check of Anneal's semantics on which the live engine
+    /// agrees with Miri, so a mutant of the semantics that omits or perturbs that
+    /// check diverges from Miri: the UB / panic probes (`bool` validity,
+    /// `StorageDead`, pointer provenance, division by zero, wide shift exponents,
+    /// the inline `exact_div` remainder and signed-overflow guards, the
+    /// `ctlz_nonzero` zero guard, and an `FnEntry`-protected call whose callee
+    /// writes the protected place through a raw alias) are killed by a mutant that
+    /// returns normally (`missed_ub` / `panic_vs_return`), and the probes on which
+    /// Miri returns normally (`Operand::Move` of a non-`Copy` wrapper under a
+    /// `Reserved` child reborrow, and a caller write after an `FnEntry`-protected
+    /// call returns) are killed by a mutant that faults spuriously
+    /// (`false_positive_ub`). `scripts/run_diff_test_campaign.py` embeds
+    /// byte-identical sources in `SEEDED_SEMANTIC_MUTANTS` (checked by
     /// `scripts/test_run_diff_test_campaign.py`).
     ///
     /// `provenance_frag` overwrites all 8 bytes of the stored pointer `p` with the
@@ -6828,7 +6837,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// address and that this address reads `x`'s value `7` once it has provenance,
     /// so a mutant that accepts the provenance-free pointer returns `7`
     /// (`missed_ub`) instead of trapping.
-    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 5] = [
+    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 11] = [
         (
             "bool_valid_range",
             r#"pub fn probe_bool_valid_range() -> u32 {
@@ -6882,7 +6891,87 @@ pub fn parameterized_after(x: u32) -> u32 { x }
 }
 "#,
         ),
+        (
+            "move_triggers_tb_write",
+            r#"pub fn probe_move_triggers_tb_write() -> u32 {
+    let mut x: NonCopyU32 = NonCopyU32(10u32);
+    let root: *mut NonCopyU32 = &raw mut x;
+    let r: &mut NonCopyU32 = unsafe { &mut *root };
+    let moved: NonCopyU32 = x;
+    *r = NonCopyU32(32u32);
+    (*r).0 + moved.0
+}
+"#,
+        ),
+        (
+            "exact_div_rem_omitted",
+            r#"pub fn probe_exact_div_rem_omitted() -> u32 {
+    let lhs: u32 = 7u32;
+    let rhs: u32 = 2u32;
+    unsafe { exact_div(lhs, rhs) }
+}
+"#,
+        ),
+        (
+            "exact_div_signed_overflow",
+            r#"pub fn probe_exact_div_signed_overflow() -> i8 {
+    let lhs: i8 = i8::MIN;
+    let rhs: i8 = -1i8;
+    unsafe { exact_div(lhs, rhs) }
+}
+"#,
+        ),
+        (
+            "ctlz_nonzero_zero",
+            r#"pub fn probe_ctlz_nonzero_zero() -> u32 {
+    let zero: u32 = 0u32;
+    unsafe { ctlz_nonzero(zero) }
+}
+"#,
+        ),
+        (
+            "protector_release_order",
+            r#"pub fn probe_protector_release_order() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let r0: &mut u32 = unsafe { &mut *raw };
+    let delta: u32 = helper_reborrow_mid(r0, 7u32);
+    *r0 = 20u32;
+    unsafe {
+        *raw = *r0 + delta;
+        *raw
+    }
+}
+"#,
+        ),
+        (
+            "protector_conflict",
+            r#"pub fn probe_protector_conflict() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let v: u32 = probe_helper_protected_alias_write(&x, raw);
+    v + unsafe { *raw }
+}
+
+#[inline(never)]
+fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
+    unsafe {
+        *alias = 8u32;
+    }
+    3u32
+}
+"#,
+        ),
     ];
+
+    /// Semantic-mutant probes that call a crate helper (`helper_reborrow_mid` from
+    /// the corpus preamble, or the probe's own `probe_helper_protected_alias_write`).
+    /// Only the helper-linked pipeline that `miri-difftest` and the shrinker run
+    /// links intra-crate callees; `cargo_anneal::run_difftest_oracle_pipeline`
+    /// stops at the call (`externalCall`), so these probes are pinned through the
+    /// linked pipeline alone.
+    const HELPER_LINKED_SEMANTIC_MUTANT_PROBES: [&str; 2] =
+        ["protector_release_order", "protector_conflict"];
 
     /// Live outcome of every `SEMANTIC_MUTANT_PROBES` entry, as
     /// `(id, miri_tag, anneal_tag, anneal_lean_tag)` with source positions relative
@@ -6892,7 +6981,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
     /// `scripts/run_diff_test_campaign.py` replays as the unmutated baseline
     /// (checked identical by `scripts/test_run_diff_test_campaign.py`), so the
     /// simulated self-check baselines are the real engine's outcomes.
-    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 5] = [
+    const SEMANTIC_MUTANT_PROBE_OUTCOMES: [(&str, &str, &str, &str); 11] = [
         (
             "bool_valid_range",
             "ub@src/lib.rs:5:5",
@@ -6922,6 +7011,85 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             "ub@src/lib.rs:4:14",
             "ub@src/lib.rs:4:14: 4:37",
             "MirDiffTag.ub",
+        ),
+        (
+            "move_triggers_tb_write",
+            "pass:scalar:42:4",
+            "pass:scalar:42:4",
+            "(MirDiffTag.normalScalar 42 4)",
+        ),
+        (
+            "exact_div_rem_omitted",
+            "ub@src/lib.rs:4:14",
+            "ub@src/lib.rs:4:14: 4:33",
+            "MirDiffTag.ub",
+        ),
+        (
+            "exact_div_signed_overflow",
+            "ub@src/lib.rs:4:14",
+            "ub@src/lib.rs:4:14: 4:33",
+            "MirDiffTag.ub",
+        ),
+        (
+            "ctlz_nonzero_zero",
+            "ub@src/lib.rs:3:14",
+            "ub@src/lib.rs:3:14: 3:32",
+            "MirDiffTag.ub",
+        ),
+        (
+            "protector_release_order",
+            "pass:scalar:42:4",
+            "pass:scalar:42:4",
+            "(MirDiffTag.normalScalar 42 4)",
+        ),
+        (
+            "protector_conflict",
+            "ub@src/lib.rs:11:9",
+            "ub@src/lib.rs:11:9: 11:22",
+            "MirDiffTag.ub",
+        ),
+    ];
+
+    /// Controls and known gaps for the probes on which Miri returns normally or
+    /// faults through a protector, each `(name, source)`:
+    /// 1. `probe_gap_move_subplace_reborrow_write` is `move_triggers_tb_write` with
+    ///    `r` reborrowed from the sub-place pointer `&raw mut x.0` (an `&mut u32`)
+    ///    instead of `&raw mut x`. Miri still returns `42`, but the live engine
+    ///    already reports UB at the child write `*r = 32u32` (`false_positive_ub`),
+    ///    so a "move emits a foreign write" mutant would be equivalent to the
+    ///    current engine on that form and could never be killed: the probe uses the
+    ///    whole-place reborrow, and this known gap stays pinned (kernel-confirmed).
+    /// 2. `probe_ctrl_protector_unprotected_alias_write` performs the
+    ///    `protector_conflict` write with `&x` an unprotected, unused local instead
+    ///    of a protected argument: Miri returns `3 + 8`, so Miri's UB in
+    ///    `probe_protector_conflict` is the `FnEntry` protector violation. The live
+    ///    engine reports UB at the write either way (its sibling-root retag freeze
+    ///    of `raw`, `tests/miri-diff/README.md`), a known `false_positive_ub`.
+    const SEMANTIC_MUTANT_CONTROL_PROBES: [(&str, &str); 2] = [
+        (
+            "probe_gap_move_subplace_reborrow_write",
+            r#"pub fn probe_gap_move_subplace_reborrow_write() -> u32 {
+    let mut x: NonCopyU32 = NonCopyU32(10u32);
+    let root: *mut u32 = &raw mut x.0;
+    let r: &mut u32 = unsafe { &mut *root };
+    let moved: NonCopyU32 = x;
+    *r = 32u32;
+    *r + moved.0
+}
+"#,
+        ),
+        (
+            "probe_ctrl_protector_unprotected_alias_write",
+            r#"pub fn probe_ctrl_protector_unprotected_alias_write() -> u32 {
+    let mut x: u32 = 10u32;
+    let raw: *mut u32 = &raw mut x;
+    let _r: &u32 = &x;
+    unsafe {
+        *raw = 8u32;
+    }
+    3u32 + unsafe { *raw }
+}
+"#,
         ),
     ];
 
@@ -7125,27 +7293,34 @@ pub fn parameterized_after(x: u32) -> u32 { x }
         }
     }
 
-    /// Pins the live behavior of the semantic-mutant, provenance-control, and
-    /// pointer-fragment provenance probes, measured through both the helper-linked
-    /// pipeline that `miri-difftest` and the shrinker run and
-    /// `cargo_anneal::run_difftest_oracle_pipeline` (which must agree on every
-    /// probe).
+    /// Pins the live behavior of the semantic-mutant, provenance-control,
+    /// semantic-mutant control, and pointer-fragment provenance probes, measured
+    /// through both the helper-linked pipeline that `miri-difftest` and the
+    /// shrinker run and `cargo_anneal::run_difftest_oracle_pipeline` (which must
+    /// agree on every probe that calls no crate helper; the
+    /// `HELPER_LINKED_SEMANTIC_MUTANT_PROBES` stop at an `externalCall` there).
     ///
-    /// Every semantic-mutant probe must agree with Miri on a UB or panic, with
-    /// exactly the probe-relative Miri outcome, Anneal outcome (strict
-    /// `FailureKind.ub` for every UB probe), and Lean tag that
-    /// `SEMANTIC_MUTANT_PROBE_OUTCOMES` records, so a mutant that omits the
-    /// corresponding check is killable and `SEEDED_SEMANTIC_MUTANTS` replays the
-    /// real engine. `probe_provenance_frag` must fail in Miri for lack of
-    /// provenance, and both `PROVENANCE_FRAG_CONTROL_PROBES` must agree on their
+    /// Every semantic-mutant probe must agree with Miri, with exactly the
+    /// probe-relative Miri outcome, Anneal outcome (strict `FailureKind.ub` for
+    /// every UB probe), and Lean tag that `SEMANTIC_MUTANT_PROBE_OUTCOMES` records,
+    /// so a mutant that omits or perturbs the corresponding check is killable and
+    /// `SEEDED_SEMANTIC_MUTANTS` replays the real engine: a probe pinned on a Miri
+    /// UB or panic must exercise that fault, and a probe pinned on a Miri return
+    /// must return a scalar. Each UB probe's Miri diagnostic names the check it
+    /// exercises (the missing provenance, the `exact_div` remainder, the signed
+    /// remainder overflow, `ctlz_nonzero` of zero, or the forbidden write access of
+    /// the protector conflict). `probe_provenance_frag` must fail in Miri for lack
+    /// of provenance, and both `PROVENANCE_FRAG_CONTROL_PROBES` must agree on their
     /// return values (the rewritten pointer holds `x`'s address, which reads `7`
-    /// with provenance). The three provenance gap probes are kernel-confirmed
-    /// engine gaps, pinned exactly as measured: the overwritten-byte and
-    /// mixed-fragment probes are `missed_ub` (the engine returns `7` and `9`), and
-    /// the `u8` round trip is a `ub_location_mismatch` (the engine flags the `u8`
-    /// load of a pointer byte, Miri the later dereference). When the engine changes
-    /// on any probe, this test fails and the pin must be updated (a ratchet, like a
-    /// `known_anneal_bug` entry).
+    /// with provenance). The three provenance gap probes and the two
+    /// `SEMANTIC_MUTANT_CONTROL_PROBES` are kernel-confirmed engine gaps, pinned
+    /// exactly as measured: the overwritten-byte and mixed-fragment probes are
+    /// `missed_ub` (the engine returns `7` and `9`), the `u8` round trip is a
+    /// `ub_location_mismatch` (the engine flags the `u8` load of a pointer byte,
+    /// Miri the later dereference), and the sub-place move and unprotected alias
+    /// write are `false_positive_ub` at the child / raw write on which Miri returns
+    /// `42` / `11`. When the engine changes on any probe, this test fails and the
+    /// pin must be updated (a ratchet, like a `known_anneal_bug` entry).
     #[test]
     fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
         let gap_probes = KNOWN_PROVENANCE_GAP_PROBES;
@@ -7158,6 +7333,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                     .map(|(_, src, _)| *src),
             )
             .chain(gap_probes.iter().map(|(_, src)| *src))
+            .chain(SEMANTIC_MUTANT_CONTROL_PROBES.iter().map(|(_, src)| *src))
             .collect();
         let names: Vec<String> = SEMANTIC_MUTANT_PROBES
             .iter()
@@ -7168,6 +7344,15 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                     .map(|(name, _, _)| (*name).to_string()),
             )
             .chain(gap_probes.iter().map(|(name, _)| (*name).to_string()))
+            .chain(
+                SEMANTIC_MUTANT_CONTROL_PROBES
+                    .iter()
+                    .map(|(name, _)| (*name).to_string()),
+            )
+            .collect();
+        let helper_linked: BTreeSet<String> = HELPER_LINKED_SEMANTIC_MUTANT_PROBES
+            .iter()
+            .map(|id| format!("probe_{id}"))
             .collect();
         let (crate_source, linked) =
             run_probe_pipeline("probes_linked", &fn_sources, &names, |cfg, specs| {
@@ -7191,6 +7376,18 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             )
         };
         for name in &names {
+            if helper_linked.contains(name) {
+                assert!(
+                    matches!(
+                        &plain[name].verdict,
+                        ComparisonVerdict::NotCompared(NotComparedReason::ExternalCall(_))
+                    ),
+                    "the plain pipeline links no crate helper, so `{name}` must stop at an \
+                     external call there: {:?}",
+                    plain[name].verdict
+                );
+                continue;
+            }
             assert_eq!(
                 summarize(&linked[name]),
                 summarize(&plain[name]),
@@ -7207,6 +7404,9 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             let fn_name = format!("probe_{id}");
             let start = line_of(&crate_source, &format!("pub fn {fn_name}()"));
             for (label, reports) in [("linked", &linked), ("plain", &plain)] {
+                if label == "plain" && helper_linked.contains(&fn_name) {
+                    continue;
+                }
                 let item = &reports[&fn_name];
                 assert_eq!(
                     item.verdict,
@@ -7216,14 +7416,22 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                     item.miri,
                     item.anneal
                 );
-                assert!(
-                    matches!(
-                        item.miri,
-                        MiriOutcome::Ub { .. } | MiriOutcome::Panic { .. }
-                    ),
-                    "probe `{id}` must exercise a UB / panic check ({label}): {:?}",
-                    item.miri
-                );
+                if miri_tag.starts_with("pass:") {
+                    assert!(
+                        matches!(item.miri, MiriOutcome::PassScalar { .. }),
+                        "probe `{id}` must return normally in Miri ({label}): {:?}",
+                        item.miri
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            item.miri,
+                            MiriOutcome::Ub { .. } | MiriOutcome::Panic { .. }
+                        ),
+                        "probe `{id}` must exercise a UB / panic check ({label}): {:?}",
+                        item.miri
+                    );
+                }
                 assert_eq!(
                     (
                         probe_relative_miri_tag(&item.miri, start),
@@ -7239,6 +7447,66 @@ pub fn parameterized_after(x: u32) -> u32 { x }
                      SEMANTIC_MUTANT_PROBE_OUTCOMES (and SEEDED_SEMANTIC_MUTANTS)"
                 );
             }
+        }
+
+        // Each UB probe's Miri diagnostic names the check that its mutant omits.
+        for (id, needles) in [
+            (
+                "exact_div_rem_omitted",
+                &["exact_div", "without remainder"][..],
+            ),
+            (
+                "exact_div_signed_overflow",
+                &["overflow in signed remainder (dividing MIN by -1)"][..],
+            ),
+            ("ctlz_nonzero_zero", &["`ctlz_nonzero` called on 0"][..]),
+            (
+                "protector_conflict",
+                &["write access through", "is forbidden"][..],
+            ),
+        ] {
+            let item = &linked[&format!("probe_{id}")];
+            assert!(
+                matches!(&item.miri, MiriOutcome::Ub { message, .. }
+                    if needles.iter().all(|n| message.contains(n))),
+                "probe `{id}` must fail in Miri with {needles:?}: {:?}",
+                item.miri
+            );
+        }
+
+        // Known gaps and controls of the probes on which Miri returns normally or
+        // faults through a protector (`SEMANTIC_MUTANT_CONTROL_PROBES`).
+        for (name, returned, fault_line_needle) in [
+            (
+                "probe_gap_move_subplace_reborrow_write",
+                42u128,
+                "    *r = 32u32;",
+            ),
+            (
+                "probe_ctrl_protector_unprotected_alias_write",
+                11u128,
+                "        *raw = 8u32;",
+            ),
+        ] {
+            let fault_line = line_of(&crate_source, fault_line_needle);
+            let item = &linked[name];
+            assert!(
+                matches!(
+                    (&item.verdict, &item.miri, &item.anneal),
+                    (
+                        ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. }),
+                        MiriOutcome::PassScalar { bits, size_bytes: 4 },
+                        AnnealOutcome::Ub { span: Some(span) },
+                    ) if *bits == returned && span.start_line == fault_line
+                ) && item.kernel_confirmed,
+                "known engine gap `{name}` changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
+                 kernel_confirmed={}; update the pin and the probe notes in \
+                 SEEDED_SEMANTIC_MUTANTS",
+                item.verdict,
+                item.miri,
+                item.anneal,
+                item.kernel_confirmed
+            );
         }
 
         let no_provenance = |item: &ItemOracleReport| {
