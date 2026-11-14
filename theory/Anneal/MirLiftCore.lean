@@ -7865,39 +7865,36 @@ protected theorem forRangeUp_eq_init_of_ge {α : Type} (lo hi : Nat) (init : α)
     simp [forRangeUpAux]
   · simp [hle]
 
-theorem wpConverges_forRangeUpAux {σ out α : Type} (stepOp : σ → Step σ out)
-    (lo hi : Nat) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
-    (inv : Nat → α → σ → Prop) (post : out → Prop) :
-    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (a : α) (s : σ),
-      inv i a s →
-      (∀ j (hjlo : lo ≤ j) (hjlt : j < hi) acc s₀,
-        inv j acc s₀ → StepsTo stepOp s₀ (inv (j + 1) (f j hjlo hjlt acc))) →
-      (∀ s_exit, inv hi (forRangeUpAux lo hi f i rem hlo hsum a) s_exit →
-        WpConverges stepOp s_exit post) →
-      WpConverges stepOp s post
-  | i, 0, _, hsum, _, s, hinv, _, hexit => by
-    have hi_eq : i = hi := by omega
-    subst hi_eq
-    exact hexit s hinv
-  | i, rem + 1, hlo, hsum, a, s, hinv, hiter, hexit => by
-    have hlt : i < hi := by omega
-    exact StepsTo.bind_wp (hiter i hlo hlt a s hinv) (fun s₁ hinv₁ =>
-      wpConverges_forRangeUpAux stepOp lo hi f inv post (i + 1) rem _ _
-        (f i hlo hlt a) s₁ hinv₁ hiter hexit)
+theorem forRangeUpAux_eq_live {α : Type} (lo hi : Nat)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
+    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (acc : α),
+      forRangeUpAux lo hi step i rem hlo hsum acc =
+        Anneal.MirLoops.forRangeUp i hi acc
+          (fun j hj hlt a => step j (Nat.le_trans hlo hj) hlt a)
+  | i, 0, _, _, _ => by
+    rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
+    rfl
+  | i, rem + 1, _, _, _ => by
+    rw [Anneal.MirLoops.forRangeUp_step_of_lt _ _ _ _ (by omega)]
+    exact forRangeUpAux_eq_live lo hi step (i + 1) rem _ _ _
 
-/-- **Fuel-free range-loop rule**: per-iteration segment reachability plus an
-exit obligation imply convergence, with no step count or fuel numeral. -/
-theorem wpConverges_forRangeUp {σ out α : Type} (stepOp : σ → Step σ out)
-    (lo hi : Nat) (init : α) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
-    (inv : Nat → α → σ → Prop) (s₀ : σ) (post : out → Prop)
-    (hle : lo ≤ hi) (hinit : inv lo init s₀)
-    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
-      inv i a s → StepsTo stepOp s (inv (i + 1) (f i hlo hlt a)))
-    (hexit : ∀ s_exit, inv hi (PureMirExec.forRangeUp lo hi init f) s_exit → WpConverges stepOp s_exit post) :
-    WpConverges stepOp s₀ post := by
-  unfold PureMirExec.forRangeUp at hexit
-  simp only [hle, ↓reduceDIte] at hexit
-  exact wpConverges_forRangeUpAux stepOp lo hi f inv post lo (hi - lo) _ _ init s₀ hinit hiter hexit
+/-- **Bridge to the live `Anneal.MirLoops.forRangeUp`** in `Anneal.PureMirExec`. -/
+protected theorem forRangeUp_eq_live {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
+    PureMirExec.forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step := by
+  unfold PureMirExec.forRangeUp
+  split
+  · next hle => exact forRangeUpAux_eq_live lo hi step lo (hi - lo) _ _ init
+  · next hgt => rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
+
+/-- Non-empty step-unrolling identity (`lo < hi`) for `PureMirExec.forRangeUp`. -/
+protected theorem forRangeUp_step_of_lt {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) (h : lo < hi) :
+    PureMirExec.forRangeUp lo hi init step =
+      PureMirExec.forRangeUp (lo + 1) hi (step lo (Nat.le_refl _) h init)
+        (fun i h_le h_lt a => step i (Nat.le_trans (Nat.le_succ _) h_le) h_lt a) := by
+  rw [PureMirExec.forRangeUp_eq_live, PureMirExec.forRangeUp_eq_live,
+    Anneal.MirLoops.forRangeUp_step_of_lt lo hi init step h]
 
 theorem stepsTo_forRangeUpAux {σ out α : Type} (stepOp : σ → Step σ out)
     (lo hi : Nat) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
@@ -7930,6 +7927,31 @@ theorem stepsTo_forRangeUp {σ out α : Type} (stepOp : σ → Step σ out)
   unfold PureMirExec.forRangeUp
   simp only [hle, ↓reduceDIte]
   exact stepsTo_forRangeUpAux stepOp lo hi f inv lo (hi - lo) _ _ init s₀ hinit hiter
+
+theorem wpConverges_forRangeUpAux {σ out α : Type} (stepOp : σ → Step σ out)
+    (lo hi : Nat) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → σ → Prop) (post : out → Prop)
+    (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (a : α) (s : σ)
+    (hinv : inv i a s)
+    (hiter : ∀ j (hjlo : lo ≤ j) (hjlt : j < hi) acc s₀,
+      inv j acc s₀ → StepsTo stepOp s₀ (inv (j + 1) (f j hjlo hjlt acc)))
+    (hexit : ∀ s_exit, inv hi (forRangeUpAux lo hi f i rem hlo hsum a) s_exit →
+      WpConverges stepOp s_exit post) :
+    WpConverges stepOp s post :=
+  (stepsTo_forRangeUpAux stepOp lo hi f inv i rem hlo hsum a s hinv hiter).bind_wp hexit
+
+/-- **Fuel-free range-loop rule**: per-iteration segment reachability plus an
+exit obligation imply convergence, with no step count or fuel numeral
+(factored directly through `stepsTo_forRangeUp` and `StepsTo.bind_wp`). -/
+theorem wpConverges_forRangeUp {σ out α : Type} (stepOp : σ → Step σ out)
+    (lo hi : Nat) (init : α) (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → σ → Prop) (s₀ : σ) (post : out → Prop)
+    (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s,
+      inv i a s → StepsTo stepOp s (inv (i + 1) (f i hlo hlt a)))
+    (hexit : ∀ s_exit, inv hi (PureMirExec.forRangeUp lo hi init f) s_exit → WpConverges stepOp s_exit post) :
+    WpConverges stepOp s₀ post :=
+  (stepsTo_forRangeUp stepOp lo hi init f inv s₀ hle hinit hiter).bind_wp hexit
 
 /-! #### Live `CapturedMir` Small-Step Embedding (`mirStep`) & Header-Targeted `runMirToBlock` -/
 
@@ -11166,28 +11188,20 @@ protected def forRangeUp {α : Type} (lo hi : Nat) (init : α)
     (step : (i : Nat) → lo ≤ i → i < hi → α → α) : α :=
   PureMirExec.forRangeUp lo hi init step
 
-theorem forRangeUpAux_eq_live {α : Type} (lo hi : Nat)
-    (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
-    ∀ (i rem : Nat) (hlo : lo ≤ i) (hsum : i + rem = hi) (acc : α),
-      forRangeUpAux lo hi step i rem hlo hsum acc =
-        Anneal.MirLoops.forRangeUp i hi acc
-          (fun j hj hlt a => step j (Nat.le_trans hlo hj) hlt a)
-  | i, 0, _, _, _ => by
-    rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
-    rfl
-  | i, rem + 1, _, _, _ => by
-    rw [Anneal.MirLoops.forRangeUp_step_of_lt _ _ _ _ (by omega)]
-    exact forRangeUpAux_eq_live lo hi step (i + 1) rem _ _ _
-
 /-- **Bridge to the live `Anneal.MirLoops.forRangeUp`**: the structural fold is
 extensionally identical to the live well-founded definition. -/
 theorem forRangeUp_eq_live {α : Type} (lo hi : Nat) (init : α)
     (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
-    MirLiftCore.forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step := by
-  unfold MirLiftCore.forRangeUp PureMirExec.forRangeUp
-  split
-  · next hle => exact forRangeUpAux_eq_live lo hi step lo (hi - lo) _ _ init
-  · next hgt => rw [Anneal.MirLoops.forRangeUp_eq_init_of_ge _ _ _ _ (by omega)]
+    MirLiftCore.forRangeUp lo hi init step = Anneal.MirLoops.forRangeUp lo hi init step :=
+  PureMirExec.forRangeUp_eq_live lo hi init step
+
+/-- Non-empty step-unrolling identity (`lo < hi`) for `MirLiftCore.forRangeUp`. -/
+protected theorem forRangeUp_step_of_lt {α : Type} (lo hi : Nat) (init : α)
+    (step : (i : Nat) → lo ≤ i → i < hi → α → α) (h : lo < hi) :
+    MirLiftCore.forRangeUp lo hi init step =
+      MirLiftCore.forRangeUp (lo + 1) hi (step lo (Nat.le_refl _) h init)
+        (fun i h_le h_lt a => step i (Nat.le_trans (Nat.le_succ _) h_le) h_lt a) :=
+  PureMirExec.forRangeUp_step_of_lt lo hi init step h
 
 /-- **Structural `[lo, hi)` loop induction** (re-exported in `MirLiftCore`). -/
 protected theorem forRangeUp_induction {α : Type} (lo hi : Nat) (init : α)
@@ -11447,6 +11461,120 @@ theorem mirStepsConverges_forRangeUp {α : Type} (body : CapturedMir) (lo hi : N
   change StepsTo (mirStep body) s₀ (inv hi (MirLiftCore.forRangeUp lo hi init f)) at h
   rw [forRangeUp_eq_live] at h
   exact mirStepsConverges_of_stepsTo h
+
+/-- **Header-targeted `runMirToBlock` range loop as a segment (`StepsTo`)**:
+when each iteration `[lo, hi)` steps from `stateAt i a` back to `headerBb` at
+`stateAt (i + 1) (f i a)` via `PureMirExec.runMirToBlock`, the entire loop is a
+single `StepsTo (mirStep body)` segment from `stateAt lo init` to
+`stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)` with zero fuel numerals. -/
+theorem stepsTo_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → MachineState)
+    (hle : lo ≤ hi)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      PureMirExec.runMirToBlock body headerBb (stateAt i a) =
+        .reached (stateAt (i + 1) (f i hlo hlt a))) :
+    StepsTo (mirStep body) (stateAt lo init)
+      (fun s => s = stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) := by
+  have h := stepsTo_forRangeUp (mirStep body) lo hi init f
+    (fun i a s => s = stateAt i a) (stateAt lo init) hle rfl
+    (fun i hlo hlt a s hs => by
+      subst hs
+      exact stepsTo_of_runToTarget_reached (hiter i hlo hlt a))
+  change StepsTo (mirStep body) (stateAt lo init)
+    (fun s => s = stateAt hi (MirLiftCore.forRangeUp lo hi init f)) at h
+  rwa [forRangeUp_eq_live] at h
+
+/-- **Invariant-based `runMirToBlock` range loop as a segment (`StepsTo`)**:
+reaches a loop-exit state satisfying `inv hi (Anneal.MirLoops.forRangeUp lo hi init f)`
+from any header state satisfying `inv lo init`. -/
+theorem stepsTo_forRangeUp_of_runMirToBlock_inv {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, inv i a s →
+      ∃ s', PureMirExec.runMirToBlock body headerBb s = .reached s' ∧
+        inv (i + 1) (f i hlo hlt a) s') :
+    StepsTo (mirStep body) s₀ (inv hi (Anneal.MirLoops.forRangeUp lo hi init f)) := by
+  have h := stepsTo_forRangeUp (mirStep body) lo hi init f inv s₀ hle hinit
+    (fun i hlo hlt a s h_inv => by
+      obtain ⟨s', h_step, h_inv'⟩ := hiter i hlo hlt a s h_inv
+      exact (stepsTo_of_runToTarget_reached h_step).mono (by rintro _ rfl; exact h_inv'))
+  change StepsTo (mirStep body) s₀ (inv hi (MirLiftCore.forRangeUp lo hi init f)) at h
+  rwa [forRangeUp_eq_live] at h
+
+/-- **Live-MIR `MirStepsConverges` range-loop segment via `runMirToBlock`**. -/
+theorem mirStepsConverges_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → MachineState)
+    (post : MirOutcome → Prop)
+    (hle : lo ≤ hi)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      PureMirExec.runMirToBlock body headerBb (stateAt i a) =
+        .reached (stateAt (i + 1) (f i hlo hlt a))) :
+    Anneal.MirFuelFree.MirStepsConverges body (stateAt lo init)
+      (fun s => s = stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) post :=
+  mirStepsConverges_of_stepsTo
+    (stepsTo_forRangeUp_of_runMirToBlock body headerBb lo hi init f stateAt hle hiter)
+
+/-- **Invariant-based live-MIR `MirStepsConverges` range-loop segment via `runMirToBlock`**. -/
+theorem mirStepsConverges_forRangeUp_of_runMirToBlock_inv {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState) (post : MirOutcome → Prop)
+    (hle : lo ≤ hi) (hinit : inv lo init s₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a s, inv i a s →
+      ∃ s', PureMirExec.runMirToBlock body headerBb s = .reached s' ∧
+        inv (i + 1) (f i hlo hlt a) s') :
+    Anneal.MirFuelFree.MirStepsConverges body s₀
+      (inv hi (Anneal.MirLoops.forRangeUp lo hi init f)) post :=
+  mirStepsConverges_of_stepsTo
+    (stepsTo_forRangeUp_of_runMirToBlock_inv body headerBb lo hi init f inv s₀ hle hinit hiter)
+
+/-- **Alias-erased `PureMirStepsConverges` range-loop segment via `runMirToBlock`**. -/
+theorem pureMirStepsConverges_forRangeUp_of_runMirToBlock {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (stateAt : Nat → α → PureState)
+    (post : Value → Prop)
+    (hle : lo ≤ hi)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a,
+      PureMirExec.runMirToBlock body headerBb ((stateAt i a).toMachineState emptyMemory) =
+        .reached ((stateAt (i + 1) (f i hlo hlt a)).toMachineState emptyMemory)) :
+    PureMirStepsConverges body (stateAt lo init)
+      (fun ps => ps = stateAt hi (Anneal.MirLoops.forRangeUp lo hi init f)) post := by
+  have hs := stepsTo_forRangeUp_of_runMirToBlock body headerBb lo hi init f
+    (fun i a => (stateAt i a).toMachineState emptyMemory) hle hiter
+  refine pureMirStepsConverges_of_stepsTo (hs.mono ?_)
+  intro ms' hms'
+  rw [hms', PureState.ofMachineState_toMachineState]
+
+/-- **Invariant-based alias-erased `PureMirStepsConverges` range-loop segment via `runMirToBlock`**. -/
+theorem pureMirStepsConverges_forRangeUp_of_runMirToBlock_inv {α : Type}
+    (body : CapturedMir) (headerBb : BasicBlockIdx) (lo hi : Nat) (init : α)
+    (f : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (inv : Nat → α → PureState → Prop)
+    (ps₀ : PureState) (post : Value → Prop)
+    (hle : lo ≤ hi) (hinit : inv lo init ps₀)
+    (hiter : ∀ i (hlo : lo ≤ i) (hlt : i < hi) a ps, inv i a ps →
+      ∃ ps', PureMirExec.runMirToBlock body headerBb (ps.toMachineState emptyMemory) =
+        .reached (ps'.toMachineState emptyMemory) ∧ inv (i + 1) (f i hlo hlt a) ps') :
+    PureMirStepsConverges body ps₀
+      (inv hi (Anneal.MirLoops.forRangeUp lo hi init f)) post := by
+  have hs := stepsTo_forRangeUp_of_runMirToBlock_inv body headerBb lo hi init f
+    (fun i a ms => ∃ ps, ms = ps.toMachineState emptyMemory ∧ inv i a ps)
+    (ps₀.toMachineState emptyMemory) hle ⟨ps₀, rfl, hinit⟩
+    (fun i hlo hlt a _ ⟨ps, hms, hps⟩ => by
+      subst hms
+      obtain ⟨ps', hstep, hinv'⟩ := hiter i hlo hlt a ps hps
+      exact ⟨ps'.toMachineState emptyMemory, hstep, ps', rfl, hinv'⟩)
+  refine pureMirStepsConverges_of_stepsTo (hs.mono ?_)
+  rintro _ ⟨ps', rfl, hinv⟩
+  rwa [PureState.ofMachineState_toMachineState]
 
 /-- **Fuel-free range-loop rule for live MIR**, stated with the live
 `Anneal.MirLoops.forRangeUp`. -/
@@ -12649,6 +12777,304 @@ theorem verifyStateful_countToNWithTemp_all_n (n : Nat) (hn : n < 4294967296) :
     (fun _ _ _ ps ⟨s₂, _, hps⟩ => by
       subst hps
       exact ⟨.scalar ⟨n, 4⟩, emptyMemory, runMirToBlock_countToNWithTemp_exit n s₂, rfl, rfl⟩)
+    rfl
+
+/--
+Live 2D nested-loop `CapturedMir` body (`nestedCountToNMBody n m`, 3 locals:
+`_0` accumulator/return, `_1` outer counter `i`, `_2` inner counter `j`):
+- `bb0`: `StorageLive(_2); _0 = const 0_u32; _1 = const 0_u32; goto -> bb1`
+- `bb1` (outer header): `switchInt(Copy(_1)) [n => bb6, otherwise => bb2]`
+- `bb2` (inner init): `_2 = const 0_u32; goto -> bb3`
+- `bb3` (inner header): `switchInt(Copy(_2)) [m => bb5, otherwise => bb4]`
+- `bb4` (inner body): `_0 = Add(Copy(_0), const 1_u32); _2 = Add(Copy(_2), const 1_u32); goto -> bb3`
+- `bb5` (outer latch): `_1 = Add(Copy(_1), const 1_u32); goto -> bb1`
+- `bb6` (outer exit): `StorageDead(_2); return_`
+-/
+def nestedCountToNMBody (n m : Nat) : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "Anneal::MirLiftCore::nested_count_to_n_m" 1
+    [ { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "i" }
+    , { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "j" } ]
+    [ -- bb0: StorageLive(_2); _0 = 0; _1 = 0; goto bb1
+      { statements :=
+          [ { kind := .storageLive 2, span := "n0" }
+          , { kind := .assign { local_ := 0, projection := [] }
+                (.use (Anneal.MirLoops.constU32 0)),
+              span := "n1" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.use (Anneal.MirLoops.constU32 0)),
+              span := "n2" } ]
+        terminator := { kind := .goto 1, span := "n3" }
+        isCleanup := false }
+    , -- bb1 (outer header): switchInt(Copy(_1)) [n => bb6, otherwise => bb2]
+      { statements := []
+        terminator :=
+          { kind := .switchInt (.copy { local_ := 1, projection := [] })
+              { branches := [(n, 6)], otherwise := 2 }
+            span := "n4" }
+        isCleanup := false }
+    , -- bb2 (inner init): _2 = 0; goto bb3
+      { statements :=
+          [ { kind := .assign { local_ := 2, projection := [] }
+                (.use (Anneal.MirLoops.constU32 0)),
+              span := "n5" } ]
+        terminator := { kind := .goto 3, span := "n6" }
+        isCleanup := false }
+    , -- bb3 (inner header): switchInt(Copy(_2)) [m => bb5, otherwise => bb4]
+      { statements := []
+        terminator :=
+          { kind := .switchInt (.copy { local_ := 2, projection := [] })
+              { branches := [(m, 5)], otherwise := 4 }
+            span := "n7" }
+        isCleanup := false }
+    , -- bb4 (inner body): _0 = Add(Copy(_0), 1); _2 = Add(Copy(_2), 1); goto bb3
+      { statements :=
+          [ { kind := .assign { local_ := 0, projection := [] }
+                (.binaryOp .add (.copy { local_ := 0, projection := [] })
+                  (Anneal.MirLoops.constU32 1)),
+              span := "n8" }
+          , { kind := .assign { local_ := 2, projection := [] }
+                (.binaryOp .add (.copy { local_ := 2, projection := [] })
+                  (Anneal.MirLoops.constU32 1)),
+              span := "n9" } ]
+        terminator := { kind := .goto 3, span := "n10" }
+        isCleanup := false }
+    , -- bb5 (outer latch): _1 = Add(Copy(_1), 1); goto bb1
+      { statements :=
+          [ { kind := .assign { local_ := 1, projection := [] }
+                (.binaryOp .add (.copy { local_ := 1, projection := [] })
+                  (Anneal.MirLoops.constU32 1)),
+              span := "n11" } ]
+        terminator := { kind := .goto 1, span := "n12" }
+        isCleanup := false }
+    , -- bb6 (outer exit): StorageDead(_2); return
+      { statements :=
+          [ { kind := .storageDead 2, span := "n13" } ]
+        terminator := { kind := .return_, span := "n14" }
+        isCleanup := false } ]
+
+theorem checkPureMir_nestedCountToNMBody (n m : Nat) :
+    checkPureMir (nestedCountToNMBody n m) = true := rfl
+
+theorem inferMinFragment_nestedCountToNMBody (n m : Nat) :
+    inferMinFragment (nestedCountToNMBody n m) = .pureBoundedLoop := rfl
+
+theorem inferMinFragment_nestedCountToNMBody_le_pureBoundedLoop (n m : Nat) :
+    inferMinFragment (nestedCountToNMBody n m) ≤ .pureBoundedLoop := by
+  rw [inferMinFragment_nestedCountToNMBody]
+  exact Nat.le_refl _
+
+/-- Frame of `nestedCountToNMBody n m` with accumulator `acc`, outer counter `i`,
+and inner counter slot `s₂`. -/
+def nestedCountState (bb stmt acc i : Nat) (s₂ : LocalSlot) : PureState :=
+  { bb := bb, stmtIdx := stmt,
+    env := [.init (.scalar ⟨acc, 4⟩), .init (.scalar ⟨i, 4⟩), s₂] }
+
+theorem runMirToBlock_nestedCountToNM_entry (n m : Nat) (v₀ : Value) :
+    PureMirExec.runMirToBlock (nestedCountToNMBody n m) 1
+      ((initPureState (nestedCountToNMBody n m) [v₀]).toMachineState emptyMemory) =
+      .reached ((nestedCountState 1 0 0 0 .uninit).toMachineState emptyMemory) := rfl
+
+theorem runMirToBlock_nestedCountToNM_outer_to_inner (n m acc i : Nat) (s₂ : LocalSlot)
+    (hs₂ : s₂ ≠ .dead) (hi : i < n) :
+    PureMirExec.runMirToBlock (nestedCountToNMBody n m) 3
+      ((nestedCountState 1 0 acc i s₂).toMachineState emptyMemory) =
+      .reached ((nestedCountState 3 0 acc i (.init (.scalar ⟨0, 4⟩))).toMachineState emptyMemory) := by
+  have hbeq : Nat.beq i n = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hi ∘ Nat.eq_of_beq_eq_true)
+  have hs1 : mirStep (nestedCountToNMBody n m) ((nestedCountState 1 0 acc i s₂).toMachineState emptyMemory) =
+      .cont ((nestedCountState (match Nat.beq i n with | true => 6 | false => 2) 0 acc i s₂).toMachineState emptyMemory) := rfl
+  rw [hbeq] at hs1
+  have hs2 : mirStep (nestedCountToNMBody n m) ((nestedCountState 2 0 acc i s₂).toMachineState emptyMemory) =
+      .cont ((nestedCountState 2 1 acc i (.init (.scalar ⟨0, 4⟩))).toMachineState emptyMemory) := by
+    cases s₂ with
+    | dead => exact absurd rfl hs₂
+    | uninit | init _ => rfl
+  have hs3 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 2 1 acc i (.init (.scalar ⟨0, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 3 0 acc i (.init (.scalar ⟨0, 4⟩))).toMachineState emptyMemory) := rfl
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (nestedCountToNMBody n m) = 15 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+theorem runMirToBlock_nestedCountToNM_inner_iter (n m acc i j : Nat)
+    (hj : j < m) (hacc : acc + 1 < 4294967296) (hm : m < 4294967296) :
+    PureMirExec.runMirToBlock (nestedCountToNMBody n m) 3
+      ((nestedCountState 3 0 acc i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) =
+      .reached ((nestedCountState 3 0 (acc + 1) i (.init (.scalar ⟨j + 1, 4⟩))).toMachineState emptyMemory) := by
+  have hbeq : Nat.beq j m = false := (Bool.not_eq_true _).mp (Nat.ne_of_lt hj ∘ Nat.eq_of_beq_eq_true)
+  have hs1 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 3 0 acc i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState (match Nat.beq j m with | true => 5 | false => 4) 0 acc i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) := rfl
+  rw [hbeq] at hs1
+  have hs2 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 4 0 acc i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 4 1 (acc + 1) i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) := by
+    have hmod : (acc + 1) % 4294967296 = acc + 1 := Nat.mod_eq_of_lt hacc
+    unfold mirStep stepMirFn
+    dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
+    simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
+      Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+    rfl
+  have hs3 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 4 1 (acc + 1) i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 4 2 (acc + 1) i (.init (.scalar ⟨j + 1, 4⟩))).toMachineState emptyMemory) := by
+    have hmod : (j + 1) % 4294967296 = j + 1 := Nat.mod_eq_of_lt (by omega)
+    unfold mirStep stepMirFn
+    dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
+    simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
+      Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+    rfl
+  have hs4 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 4 2 (acc + 1) i (.init (.scalar ⟨j + 1, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 3 0 (acc + 1) i (.init (.scalar ⟨j + 1, 4⟩))).toMachineState emptyMemory) := rfl
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (nestedCountToNMBody n m) = 15 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3, hs4]
+  rfl
+
+/-- **Inner `[0, m)` loop of `nestedCountToNMBody n m` lifted as a `StepsTo` segment**
+via `stepsTo_forRangeUp_of_runMirToBlock`. -/
+theorem stepsTo_nestedCountToNM_inner (n m acc i : Nat)
+    (haccm : acc + m < 4294967296) (hm : m < 4294967296) :
+    StepsTo (mirStep (nestedCountToNMBody n m))
+      ((nestedCountState 3 0 acc i (.init (.scalar ⟨0, 4⟩))).toMachineState emptyMemory)
+      (fun s => s = (nestedCountState 3 0 (acc + m) i (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) :=
+  stepsTo_forRangeUp_of_runMirToBlock (nestedCountToNMBody n m) 3 0 m () (fun _ _ _ u => u)
+    (fun j _ => (nestedCountState 3 0 (acc + j) i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory)
+    (Nat.zero_le m)
+    (fun j _ hj _ =>
+      runMirToBlock_nestedCountToNM_inner_iter n m (acc + j) i j hj (by omega) hm)
+
+theorem runMirToBlock_nestedCountToNM_inner_to_outer (n m acc i : Nat)
+    (hi : i < n) (hn : n < 4294967296) :
+    PureMirExec.runMirToBlock (nestedCountToNMBody n m) 1
+      ((nestedCountState 3 0 acc i (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) =
+      .reached ((nestedCountState 1 0 acc (i + 1) (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) := by
+  have hs1 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 3 0 acc i (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState (match Nat.beq m m with | true => 5 | false => 4) 0 acc i (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) := rfl
+  rw [Nat.beq_refl] at hs1
+  have hs2 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 5 0 acc i (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 5 1 acc (i + 1) (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) := by
+    have hmod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
+    unfold mirStep stepMirFn
+    dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
+    simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
+      Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+    rfl
+  have hs3 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 5 1 acc (i + 1) (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) =
+      .cont ((nestedCountState 1 0 acc (i + 1) (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) := rfl
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (nestedCountToNMBody n m) = 15 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+theorem runMirToBlock_nestedCountToNM_exit (n m acc : Nat) (s₂ : LocalSlot) :
+    PureMirExec.runMirToBlock (nestedCountToNMBody n m) 1
+      ((nestedCountState 1 0 acc n s₂).toMachineState emptyMemory) =
+      .halted (.normal (.scalar ⟨acc, 4⟩, emptyMemory)) := by
+  have hs1 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 1 0 acc n s₂).toMachineState emptyMemory) =
+      .cont ((nestedCountState (match Nat.beq n n with | true => 6 | false => 2) 0 acc n s₂).toMachineState emptyMemory) := rfl
+  rw [Nat.beq_refl] at hs1
+  have hs2 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 6 0 acc n s₂).toMachineState emptyMemory) =
+      .cont ((nestedCountState 6 1 acc n .dead).toMachineState emptyMemory) := rfl
+  have hs3 : mirStep (nestedCountToNMBody n m)
+      ((nestedCountState 6 1 acc n .dead).toMachineState emptyMemory) =
+      .done (.normal (.scalar ⟨acc, 4⟩, emptyMemory)) := rfl
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (nestedCountToNMBody n m) = 15 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3]
+  rfl
+
+/-- **Fuel-free `PureMirConverges` for the live 2D nested-loop `nestedCountToNMBody n m`**
+over all symbolic bounds `n, m` (`n < 2^32`, `m < 2^32`, `n * m < 2^32`):
+composes `mirWpConverges_forRangeUp` (outer `[0, n)` loop with relational header
+invariant over `s₂ : LocalSlot`) with `stepsTo_nestedCountToNM_inner` (inner
+`[0, m)` loop lifted via `stepsTo_forRangeUp_of_runMirToBlock`). -/
+theorem live_nestedCountToNM_pureMirConverges_all (n m : Nat)
+    (hn : n < 4294967296) (hm : m < 4294967296) (hnm : n * m < 4294967296)
+    (v₀ : Value) :
+    PureMirConverges (nestedCountToNMBody n m)
+      (initPureState (nestedCountToNMBody n m) [v₀])
+      (fun retVal => retVal = .scalar ⟨n * m, 4⟩) := by
+  refine mirWpConverges_of_stepsTo_bind
+    (stepsTo_of_runToTarget_reached (runMirToBlock_nestedCountToNM_entry n m v₀))
+    (fun s_start hs => ?_)
+  cases hs
+  refine MirLiftCore.mirWpConverges_forRangeUp (nestedCountToNMBody n m) 0 n () (fun _ _ _ u => u)
+    (fun i _ ms => ∃ s₂ : LocalSlot, s₂ ≠ .dead ∧
+      ms = (nestedCountState 1 0 (m * i) i s₂).toMachineState emptyMemory)
+    ((nestedCountState 1 0 0 0 .uninit).toMachineState emptyMemory)
+    (mirNormalPost (fun retVal _ => retVal = .scalar ⟨n * m, 4⟩))
+    (Nat.zero_le n) ⟨.uninit, ⟨(by intro h; nomatch h), rfl⟩⟩ ?_ ?_
+  · intro i _ hi _ s ⟨s₂, hs₂, hs⟩
+    subst hs
+    have h_le : m * (i + 1) ≤ m * n := Nat.mul_le_mul_left m hi
+    have h_accm : m * i + m < 4294967296 := by
+      rw [Nat.mul_comm] at hnm
+      exact Nat.lt_of_le_of_lt h_le hnm
+    refine (stepsTo_of_runToTarget_reached
+      (runMirToBlock_nestedCountToNM_outer_to_inner n m (m * i) i s₂ hs₂ hi)).trans
+      (fun s₁ hs₁ => ?_)
+    subst hs₁
+    refine (stepsTo_nestedCountToNM_inner n m (m * i) i h_accm hm).trans
+      (fun s₂' hs₂' => ?_)
+    subst hs₂'
+    exact (stepsTo_of_runToTarget_reached
+      (runMirToBlock_nestedCountToNM_inner_to_outer n m (m * (i + 1)) i hi hn)).mono
+      (by rintro _ rfl; exact ⟨.init (.scalar ⟨m, 4⟩), ⟨(by intro h; nomatch h), rfl⟩⟩)
+  · intro s_exit ⟨s₂, _, hs⟩
+    subst hs
+    rw [Nat.mul_comm m n]
+    exact wpConverges_of_runToTarget_halted
+      (runMirToBlock_nestedCountToNM_exit n m (n * m) s₂) rfl
+
+/-- **End-to-end `VerificationResult` for the live 2D nested-loop `nestedCountToNMBody n m`**
+over all symbolic bounds `n, m` (`n < 2^32`, `m < 2^32`, `n * m < 2^32`), with
+zero fuel numerals and purely constructive axioms (`⊆ {propext, Quot.sound}`). -/
+theorem verify_nestedCountToNM_all_n_m (n m : Nat)
+    (hn : n < 4294967296) (hm : m < 4294967296) (hnm : n * m < 4294967296) :
+    VerificationResult
+      { body := nestedCountToNMBody n m
+        pre := fun args => ∃ v₀, args = [v₀]
+        post := fun _ retVal => retVal = .scalar ⟨n * m, 4⟩
+        callees := [] } :=
+  verifyMirNoPanic_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_nestedCountToNMBody_le_pureBoundedLoop n m)
+    (fun args ⟨v₀, hargs⟩ => by
+      subst hargs
+      exact live_nestedCountToNM_pureMirConverges_all n m hn hm hnm v₀)
+    rfl
+
+/-- **Constructive `StatefulVerificationResult` for the live 2D nested-loop
+`nestedCountToNMBody n m`** (`⊆ {propext, Quot.sound}`). -/
+theorem verifyStateful_nestedCountToNM_all_n_m (n m : Nat)
+    (hn : n < 4294967296) (hm : m < 4294967296) (hnm : n * m < 4294967296) :
+    StatefulVerificationResult
+      { body := nestedCountToNMBody n m
+        pre := fun args mem => (∃ v₀, args = [v₀]) ∧ RootActiveMemory mem
+        post := fun _ mem retVal mem' =>
+          mem' = mem ∧ retVal = .scalar ⟨n * m, 4⟩
+        callees := [] } :=
+  verifyStatefulMirNoPanic_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_nestedCountToNMBody_le_pureBoundedLoop n m)
+    (fun _ _ hp => hp.2)
+    (fun args _ ⟨⟨v₀, hargs⟩, _⟩ => by
+      subst hargs
+      exact (live_nestedCountToNM_pureMirConverges_all n m hn hm hnm v₀).mono
+        (fun _ h => ⟨rfl, h⟩))
     rfl
 
 end FuelFreeLoops
