@@ -13,6 +13,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
+open Anneal.SepLogicLenses
 open Specs.WireframeDemo.decode_wire_header
 
 /-!
@@ -22,25 +23,6 @@ open Specs.WireframeDemo.decode_wire_header
 `LiftBlockToJoin` path from `bb0` to `bb9` over symbolic header bytes (split only at
 the three `switchInt` guards), and `verified` proves `bb9` once under `RetInv`.
 -/
-
-/-- Little-endian `u16` decode of the payload-length bytes `[b2, b3]`. -/
-private theorem decodeU16 (b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) :
-    decodeScalarLayoutBytesNoForge
-      (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 })
-      [.init (UInt8.ofNat b2) none, .init (UInt8.ofNat b3) none] =
-    some (.scalar { bits := b2 + 256 * b3, sizeBytes := 2 }) := by
-  let rawBits :=
-    Nat.add (UInt8.ofNat b2).toBitVec.toNat
-      (Nat.mul 256 (Nat.add (UInt8.ofNat b3).toBitVec.toNat 0))
-  have h_ble : Nat.ble rawBits 65535 = true :=
-    Nat.ble_eq_true_of_le (by dsimp [rawBits]; omega)
-  have h_val : rawBits = b2 + 256 * b3 := by
-    dsimp [rawBits]; omega
-  change
-    (match Nat.ble rawBits 65535 with
-     | false => Option.none
-     | true => Option.some (Value.scalar { bits := rawBits, sizeBytes := 2 })) = _
-  rw [h_ble, h_val]
 
 /-- The trusted `transmute` of the `[1, b1, b2, b3] : [u8; 4]` header into
 `WireHeader { version, flag, payload_len }` (byte-cast through
@@ -72,7 +54,7 @@ private theorem evalByteCastAfterOperand_wireHeader
       | some vs => some (.scalar { bits := 1, sizeBytes := 1 } :: vs) | none => none) with
     | some vals => some (Value.aggregate 0 vals) | none => none) with
     | some v' => RvalueEvalResult.ok v' locals' mem | none => .ub) = _
-  rw [h_b1, decodeU16 b2 b3 hb2 hb3]
+  rw [h_b1, decodeScalarLayoutBytesNoForge_u16_le b2 b3 hb2 hb3]
 
 /-- Return-join invariant shared by every path into `bb9`: slot `_0` holds a
 value satisfying the claim postcondition. -/
@@ -95,12 +77,6 @@ private theorem retInv_of {b0 b1 b2 b3 v : Nat} {env : PureEnv}
 
 private theorem ready : checkMirLiftReady Mir.WireframeDemo.decode_wire_header.body = true := rfl
 
-private theorem beq_false {a b : Nat} (h : ¬ a = b) : Nat.beq a b = false :=
-  Bool.eq_false_iff.mpr (h ∘ Nat.eq_of_beq_eq_true)
-
-private theorem ble_false {a b : Nat} (h : ¬ a ≤ b) : Nat.ble a b = false :=
-  Bool.eq_false_iff.mpr (h ∘ Nat.le_of_ble_eq_true)
-
 private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) :
     LiftBlockToJoin Mir.WireframeDemo.decode_wire_header.body 0
       (initPureEnv Mir.WireframeDemo.decode_wire_header.body [rawHeaderValue b0 b1 b2 b3]) 9
@@ -112,8 +88,9 @@ private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) 
       (LiftStmtsToJoin.term_assert_ready hr (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
         (liftBlock_switchInt_diamond_toJoin (thenBb := 3) (elseBb := 2) (b0 = 1)
           hr (by rfl) (by rfl) (by rfl) (by rfl) ?_ fun h =>
-            ⟨by rw [beq_false h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
-              (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.1).symm rfl))⟩)))
+            ⟨by rw [Bool.eq_false_iff.mpr (h ∘ Nat.eq_of_beq_eq_true)]; rfl,
+              liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+                (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.1).symm rfl))⟩)))
   intro h
   subst h
   refine ⟨rfl, ?_⟩
@@ -123,7 +100,7 @@ private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) 
       (LiftStmtsToJoin.term_assert_ready hr (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
         (liftBlock_switchInt_diamond_toJoin (thenBb := 6) (elseBb := 5) (b1 ≤ 1)
           hr (by rfl) (by rfl) (by rfl) (by rfl) ?_ fun h =>
-            ⟨by rw [ble_false h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+            ⟨by rw [nat_ble_eq_false_of_not_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
               (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.2.1).symm rfl))⟩)))
   intro h1
   refine ⟨by rw [Nat.ble_eq_true_of_le h1]; rfl, ?_⟩
@@ -141,7 +118,7 @@ private theorem lift_path (b0 b1 b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) 
     exact ⟨by rw [Nat.ble_eq_true_of_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
       (LiftBlockToJoin.refl (retInv_of (ite_eq_left ⟨rfl, h1, h⟩).symm rfl))⟩
   · intro h
-    exact ⟨by rw [ble_false h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
+    exact ⟨by rw [nat_ble_eq_false_of_not_le h]; rfl, liftBlock_goto_toJoin hr (by rfl) (by rfl) rfl
       (LiftBlockToJoin.refl (retInv_of (ite_eq_right fun hc => h hc.2.2).symm rfl))⟩
 
 /-- Universal verification certificate for `decode_wire_header` via `MirLiftCore`

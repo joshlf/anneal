@@ -18,6 +18,7 @@ open Trusted.VerificationResult
 open Anneal.Scalars
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
+open Anneal.SepLogicLenses
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Specs.WireframeDemo.parse_compression_flag
@@ -32,17 +33,19 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
       [.scalar { bits := b, sizeBytes := 1 }] rfl rfl h_req.2
   revert h_hold
   -- The companion reads `flags_byte` through its closure capture (`*(*_8).0`):
-  -- `dsimp` steps the CFG, and each typed deref read (`evalOperandFallback`) and
-  -- its Tree Borrows read check (`derefReadTreeUB`) is evaluated in place by `whnf`.
+  -- `dsimp` steps the CFG (without unfolding untaken `wpExecFallback` branches),
+  -- and each typed deref read (`evalOperandFallback`) is evaluated in place by `whnf`.
   repeat (first
     | dsimp only [
         Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
         Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
         defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-        wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-        stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
+        wpBlockLinear, wpCfgStep, dispatchBlock,
+        evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
         finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue,
-        evalOperandFast,
+        evalOperandFast, derefReadTreeUB, hasTreeReadUB, borrowEntryReadUB,
+        treeBorrowTransitionIsUB, placeTouchesUnion, tyProjTouchesUnion,
+        resolveTyWithLocalDecls, isUnresolvedLayoutIdx, isUnionLayout, LayoutTable.lookup,
         evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
         evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
         rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
@@ -59,6 +62,9 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
         freezeTreeBorrowsOnReadAtProj, updateBorrowPermOnReadAtProj,
         isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, boolToScalar,
         disableLocalBorrows,
+        treeBorrowWriterRelatedness, applyTreeBorrowTransition, treeBorrowNodeAccess,
+        treeBorrowPermTransition, treeBorrowProtectorCheck, treeBorrowChildRead,
+        treeBorrowForeignRead, treeBorrowChildWrite, treeBorrowForeignWrite,
         GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
         HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
         List.replicate, List.append, List.length, List.set, List.map, Option.getD,
@@ -66,8 +72,7 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
         Bool.not, bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
         ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
         Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-    | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf
-    | conv in (derefReadTreeUB _ _ _ _ _) => whnf)
+    | conv in (evalOperandFallback _ _ _ _ _ _ _) => whnf)
   intro h_hold
   cases h_eq : Nat.beq (b % 2) b with
   | false =>

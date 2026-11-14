@@ -4052,9 +4052,13 @@ theorem mirWpConverges_return_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  simp only [beq_self_eq_true, ↓reduceIte]
-  unfold evalTerminator
-  rw [hTerm, hRet, hStack]
+  rw [ite_eq_left (beq_self_eq_true _)]
+  rcases h_t : bb.terminator with ⟨kind, span⟩
+  rw [h_t] at hTerm
+  dsimp only at hTerm
+  subst hTerm
+  dsimp only [evalTerminator]
+  rw [hRet, hStack]
   rfl
 
 /-- A `goto` terminator continues at the first statement of its target. -/
@@ -4085,9 +4089,11 @@ theorem mirWpConverges_goto_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  simp only [beq_self_eq_true, ↓reduceIte]
-  unfold evalTerminator
-  rw [hTerm]
+  rw [ite_eq_left (beq_self_eq_true _)]
+  rcases h_t : bb.terminator with ⟨kind, span⟩
+  rw [h_t] at hTerm
+  dsimp only at hTerm
+  subst hTerm
   rfl
 
 /--
@@ -4126,10 +4132,12 @@ theorem mirWpConverges_assert_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  simp only [beq_self_eq_true, ↓reduceIte]
-  unfold evalTerminator
-  rw [hTerm]
-  dsimp only
+  rw [ite_eq_left (beq_self_eq_true _)]
+  rcases h_t : bb.terminator with ⟨kind, span⟩
+  rw [h_t] at hTerm
+  dsimp only at hTerm
+  subst hTerm
+  dsimp only [evalTerminator]
   rw [hEval]
   dsimp only
   rw [hBit]
@@ -4172,10 +4180,12 @@ theorem mirWpConverges_switchInt_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  simp only [beq_self_eq_true, ↓reduceIte]
-  unfold evalTerminator
-  rw [hTerm]
-  dsimp only
+  rw [ite_eq_left (beq_self_eq_true _)]
+  rcases h_t : bb.terminator with ⟨kind, span⟩
+  rw [h_t] at hTerm
+  dsimp only at hTerm
+  subst hTerm
+  dsimp only [evalTerminator]
   rw [hEval]
   dsimp only
   rw [hTarget]
@@ -4217,10 +4227,12 @@ theorem mirWpConverges_drop_of_lens
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
   unfold length
-  simp only [beq_self_eq_true, ↓reduceIte]
-  unfold evalTerminator
-  rw [hTerm]
-  dsimp only
+  rw [ite_eq_left (beq_self_eq_true _)]
+  rcases h_t : bb.terminator with ⟨kind, span⟩
+  rw [h_t] at hTerm
+  dsimp only at hTerm
+  subst hTerm
+  dsimp only [evalTerminator]
   rw [hGet]
   cases oldSlot with
   | dead => exact absurd rfl hNotDead
@@ -4446,11 +4458,16 @@ theorem verifyStatefulMir_of_sepLenses
             LensFramePreserved entries₀ m₀ m_final →
             Post args m₀ retVal m_final) :
     StatefulVerificationResult { body := body, pre := Pre, post := Post } := by
-  refine verifyStatefulMirNoPanic_of_wpConverges { body := body, pre := Pre, post := Post } ?_
-  intro args m₀ hPre
+  refine ⟨fun args m₀ hPre => ?_⟩
   rcases hStep args m₀ hPre with
     ⟨entries₀, entries', retVal, hBlock, hInv₀, hPost⟩
-  exact mirWpConverges_of_sepLenses hBlock hInv₀ hPost
+  have ⟨h_safe, h_ret⟩ :=
+    Anneal.PureMirExec.treeSafe_and_ret_of_mirWpConverges
+      (mirWpConverges_of_sepLenses (Φ := mirNormalPost (Post args m₀)) hBlock hInv₀ hPost)
+  exact ⟨h_safe, fun outPair h_r _ rVal m' h_out => by
+    have h_np := h_ret outPair.1 outPair.2 h_r
+    rw [h_out] at h_np
+    exact h_np⟩
 
 /--
 Bridge from `mirWpConverges_of_sepLenses` to `TotalVerificationResult`.
@@ -15623,6 +15640,9 @@ abbrev u16LE : ByteLensCodec {v : Nat // v < 256 ^ 2} 2 := uintLE 2
 /-- Little-endian `u32` codec. -/
 abbrev u32LE : ByteLensCodec {v : Nat // v < 256 ^ 4} 4 := uintLE 4
 
+/-- Little-endian `u64` codec. -/
+abbrev u64LE : ByteLensCodec {v : Nat // v < 256 ^ 8} 8 := uintLE 8
+
 /-- **Trusted scalar-encoder bridge**: the trusted `encodeScalarBytes` maps the
 scalar `{ bits := v, sizeBytes := sz }` to the `uintLE sz` byte encoding of `v`. -/
 theorem encodeScalarBytes_uintLE_encode {sz : Nat} (hsz : 0 < sz)
@@ -15966,6 +15986,14 @@ def writeTyped {α : Type} {n : Nat} (c : ByteLensCodec α n) (base : Nat) (v : 
 def TypedAt {α : Type} {n : Nat} (c : ByteLensCodec α n) (base : Nat) (v : α) (mem : ByteMem) : Prop :=
   readTyped c base mem = some v
 
+/-- `TypedAt` determines the decoded value uniquely. -/
+theorem TypedAt.unique {α : Type} {n : Nat} {c : ByteLensCodec α n} {base : Nat}
+    {v₁ v₂ : α} {mem : ByteMem}
+    (h₁ : TypedAt c base v₁ mem) (h₂ : TypedAt c base v₂ mem) : v₁ = v₂ := by
+  unfold TypedAt at h₁ h₂
+  rw [h₁] at h₂
+  exact Option.some.inj h₂
+
 /-- **`DisjointSlice`**: empty windows are disjoint from everything; otherwise
 the half-open windows do not overlap. -/
 def DisjointSlice (base₁ len₁ base₂ len₂ : Nat) : Prop :=
@@ -16244,6 +16272,16 @@ theorem canonicalAt_iff {α : Type} {n : Nat} (c : ByteLensCodec α n) (base : N
     exact ⟨(fun ⟨v, hv⟩ => ⟨h, v, Option.some.inj hv⟩), (fun ⟨_, v, hv⟩ => ⟨v, by rw [hv]⟩)⟩
   · rw [ite_eq_right h]
     exact ⟨(fun ⟨_, hv⟩ => nomatch hv), (fun hd => absurd hd.1 h)⟩
+
+/-- `CanonicalAt` implies `TypedAt` for the canonical witness. -/
+theorem CanonicalAt.toTypedAt {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    {base : Nat} {mem : ByteMem} (h : CanonicalAt c base mem) :
+    ∃ v, sliceAbstractBytes mem base n = some (c.encode v) ∧ TypedAt c base v mem := by
+  rcases h with ⟨v, hv⟩
+  refine ⟨v, hv, ?_⟩
+  unfold TypedAt readTyped
+  rw [hv]
+  exact c.decode_encode v
 
 theorem fieldLens_writeBack_eq {α : Type} {n : Nat} (c : ByteLensCodec α n) {base : Nat}
     (dflt v : α) {mem : ByteMem} (h : base + n ≤ mem.length) :
@@ -19606,6 +19644,20 @@ structure LatchEquiv (t₁ t₂ : BorrowTree) (active : ActiveProtectors) : Prop
 theorem LatchEquiv.refl (t : BorrowTree) (active : ActiveProtectors) : LatchEquiv t t active :=
   ⟨rfl, rfl, rfl, fun _ _ => rfl, fun _ _ _ => rfl⟩
 
+theorem LatchEquiv.symm {t₁ t₂ : BorrowTree} {active : ActiveProtectors}
+    (h : LatchEquiv t₁ t₂ active) : LatchEquiv t₂ t₁ active :=
+  ⟨h.present_eq.symm, h.isAnc_eq.symm, h.protector_eq.symm, fun n b => (h.erase_eq n b).symm,
+    fun n b hn => (h.protected_eq n b (by rwa [isTagProtected_congr h.protector_eq])).symm⟩
+
+theorem LatchEquiv.trans {t₁ t₂ t₃ : BorrowTree} {active : ActiveProtectors}
+    (h₁₂ : LatchEquiv t₁ t₂ active) (h₂₃ : LatchEquiv t₂ t₃ active) :
+    LatchEquiv t₁ t₃ active :=
+  ⟨h₁₂.present_eq.trans h₂₃.present_eq, h₁₂.isAnc_eq.trans h₂₃.isAnc_eq,
+    h₁₂.protector_eq.trans h₂₃.protector_eq,
+    fun n b => (h₁₂.erase_eq n b).trans (h₂₃.erase_eq n b),
+    fun n b hn => (h₁₂.protected_eq n b hn).trans
+      (h₂₃.protected_eq n b (by rwa [← isTagProtected_congr h₁₂.protector_eq]))⟩
+
 /-- Fewer protected tags (e.g. `GlobalState.endCall`, or a fresh call id that no
 existing tag uses) preserve the equivalence. -/
 theorem LatchEquiv.of_active {t₁ t₂ : BorrowTree} {active active' : ActiveProtectors}
@@ -21425,5 +21477,112 @@ theorem LiftLensBlock.goto_return {body : CapturedMir} {bbIdx retBb : BasicBlock
     LiftLensBlock body bbIdx env entries retVal entries' :=
   .goto hPhase hBb hTerm hStmts
     (.return_ hPhase hRetBb hRetTerm (by rw [hRetNil]; exact .nil) hRet)
+
+/-! ### Constructive `MirBoolPredicateHolds` adequacy & signature combinators -/
+
+open Anneal.PureMirExec
+open Anneal.Scalars
+open Anneal.Rustc.V2026_06_01.Lower
+
+/-- Constructive (`⊆ {propext, Quot.sound}`) sufficiency bridge from symbolic
+`wpMirSym` to `MirBoolPredicateHolds`, routing through `treeSafe_and_ret_of_mirWpConverges`
+rather than classical `dwlp_pure_adequacy`. -/
+theorem mirBoolPredicateHolds_of_wpMirSym_true_constructive
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
+    (h : Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirSym fuel specBody
+      (initMachineState specBody args) boolTruePost) :
+    MirBoolPredicateHolds specBody args := by
+  intro a ha
+  subst ha
+  have ⟨h_safe, h_ret⟩ :=
+    Anneal.PureMirExec.treeSafe_and_ret_of_mirWpConverges
+      (body := specBody) (s := initMachineState specBody a) (post := boolTruePost) ⟨fuel, h⟩
+  refine ⟨h_safe, fun outPair h_r _ retVal mem' h_out => ?_⟩
+  have h_bp : boolTruePost outPair.2 := h_ret outPair.1 outPair.2 h_r
+  exact h_bp retVal mem' h_out
+
+/-- Standard 2-byte `u16` `TypeLayout` emitted by `cargo-anneal` for `u16` locals. -/
+def u16TypeLayout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 2 },
+    backendRepr := .scalar (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 }),
+    fields := .primitive, variants := .single 0,
+    isUninhabited := false, fieldLayouts := [] }
+
+set_option maxHeartbeats 500000 in
+/-- Extract a 2-byte scalar below `2^16` from a `valueMatchesRigidTyAndLayout` hypothesis
+on a `u16` local declaration. -/
+theorem u16_of_valueMatchesRigid {fuel' : Nat} {body : CapturedMir} {layoutIdx : LayoutIdx}
+    {v : Value} {mem : Memory}
+    (h : valueMatchesRigidTyAndLayout (fuel' + 1) body (.uint .u16)
+      (some u16TypeLayout) layoutIdx v mem) :
+    ∃ b, v = .scalar { bits := b, sizeBytes := 2 } ∧ b < 65536 := by
+  rcases v with _ | ⟨b, sz⟩ | _ | _ <;>
+    simp only [valueMatchesRigidTyAndLayout] at h
+  all_goals first
+    | exact h.2.2.elim
+    | (obtain ⟨-, -, rfl, -, h_lt, -⟩ := h; exact ⟨b, rfl, h_lt⟩)
+
+/-- Establish `scalarMatchesBackendRepr` for a 2-byte scalar below `2^16` on `u16TypeLayout`. -/
+theorem u16_scalarMatchesBackendRepr {r : Nat} (h_lt : r < 65536) :
+    scalarMatchesBackendRepr u16TypeLayout.backendRepr r := by
+  show (Nat.ble 0 r && Nat.ble r 65535) = true
+  rw [Nat.ble_eq_true_of_le (Nat.zero_le r), Nat.ble_eq_true_of_le (Nat.le_of_lt_succ h_lt)]
+  rfl
+
+/-- Extract a 2-byte scalar below `2^16` from `valueMatchesTyAndLayout` without unfolding
+`valueMatchesRigidTyAndLayout` at the call site. -/
+theorem u16_of_valueMatchesTy {fuel' : Nat} {body : CapturedMir} {ty : Ty}
+    {layoutIdx : LayoutIdx} {v : Value} {mem : Memory}
+    (h_kind : ty.kind = .uint .u16)
+    (h_get : sigGet? body.layouts.entries layoutIdx = some u16TypeLayout)
+    (h : valueMatchesTyAndLayout (fuel' + 1) body ty layoutIdx v mem) :
+    ∃ b, v = .scalar { bits := b, sizeBytes := 2 } ∧ b < 65536 := by
+  unfold valueMatchesTyAndLayout at h
+  rw [h_kind, h_get] at h
+  exact u16_of_valueMatchesRigid h
+
+/-- Establish `retMatchesSignature` for a 2-byte scalar below `2^16` when return local `_0`
+has type `u16` and layout `u16TypeLayout`. -/
+theorem u16_retMatchesSignature {body : CapturedMir} {retDecl : LocalDecl}
+    {restDecls : List LocalDecl} {r : Nat} (mem : Memory)
+    (h_decls : body.localDecls = retDecl :: restDecls)
+    (h_kind : retDecl.ty.kind = .uint .u16)
+    (h_get : sigGet? body.layouts.entries retDecl.ty.layoutIdx = some u16TypeLayout)
+    (h_lt : r < 65536) :
+    retMatchesSignature body (.scalar { bits := r, sizeBytes := 2 }) mem := by
+  unfold retMatchesSignature valueMatchesTyAndLayout
+  rw [h_decls]
+  dsimp only []
+  rw [h_kind, h_get]
+  dsimp only [defaultSignatureFuel, valueMatchesRigidTyAndLayout]
+  exact ⟨rfl, rfl, rfl, Nat.two_pos, h_lt, u16_scalarMatchesBackendRepr h_lt⟩
+
+/-- `Nat.ble a b = false` from `¬ a ≤ b`. -/
+theorem nat_ble_eq_false_of_not_le {a b : Nat} (h : ¬ a ≤ b) : Nat.ble a b = false :=
+  Bool.eq_false_iff.mpr (h ∘ Nat.le_of_ble_eq_true)
+
+/-- Little-endian `u16` decode of two initialized provenance-free bytes `[b2, b3]`. -/
+theorem decodeScalarLayoutBytesNoForge_u16_le (b2 b3 : Nat) (hb2 : b2 < 256) (hb3 : b3 < 256) :
+    decodeScalarLayoutBytesNoForge
+      (ScalarLayout.initialized (.int 16 false) { start := 0, end_ := 65535 })
+      [.init (UInt8.ofNat b2) none, .init (UInt8.ofNat b3) none] =
+    some (.scalar { bits := b2 + 256 * b3, sizeBytes := 2 }) := by
+  have hb2' : (UInt8.ofNat b2).toBitVec.toNat = b2 :=
+    (BitVec.toNat_ofNat b2 8).trans (Nat.mod_eq_of_lt hb2)
+  have hb3' : (UInt8.ofNat b3).toBitVec.toNat = b3 :=
+    (BitVec.toNat_ofNat b3 8).trans (Nat.mod_eq_of_lt hb3)
+  let rawBits :=
+    Nat.add (UInt8.ofNat b2).toBitVec.toNat
+      (Nat.mul 256 (Nat.add (UInt8.ofNat b3).toBitVec.toNat 0))
+  have h_val : rawBits = b2 + 256 * b3 := by
+    dsimp [rawBits]
+    rw [hb2', hb3']
+  have h_ble : Nat.ble rawBits 65535 = true :=
+    Nat.ble_eq_true_of_le (by omega)
+  change
+    (match Nat.ble rawBits 65535 with
+     | false => Option.none
+     | true => Option.some (Value.scalar { bits := rawBits, sizeBytes := 2 })) = _
+  rw [h_ble, h_val]
 
 end Anneal.SepLogicLenses

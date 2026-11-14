@@ -64,7 +64,7 @@ private theorem advance_cursor_lift
     · rw [Nat.ble_eq_true_of_le h_le, ite_eq_left h_le]; rfl
     · rw [(nat_ble_eq_false_iff _ _).2 (Nat.lt_of_not_le h_le), ite_eq_right h_le]; rfl
   by_cases h_le : step ≤ limit - offset
-  · simp only [h_le, ↓reduceIte]
+  · rw [ite_eq_left h_le, ite_eq_left h_le, ite_eq_left h_le]
     have h_add : offset + step < scalarModulus 2 := by change offset + step < 65536; omega
     -- bb2: `_8 = copy ((*_1).0); _9 = AddWithOverflow(copy _8, copy _2);
     -- assert(!move (_9.1)) -> bb3`
@@ -85,7 +85,7 @@ private theorem advance_cursor_lift
       (.derefWrite (.field (.use_pure (.move_field rfl rfl rfl) rfl) (rp := cursorRp) rfl rfl rfl))
       (.cons (.pureAssign_uninit_checked (.use_pure .const_scalar rfl) rfl rfl) .nil))
       rfl rfl rfl rfl
-  · simp only [h_le, ↓reduceIte]
+  · rw [ite_eq_right h_le, ite_eq_right h_le, ite_eq_right h_le]
     -- bb4: `_0 = const false; goto -> bb5`
     exact .goto_return rfl rfl rfl
       (.cons (.pureAssign_uninit_checked (.use_pure .const_scalar rfl) rfl rfl) .nil)
