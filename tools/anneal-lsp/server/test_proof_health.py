@@ -7,6 +7,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SERVER_DIR = Path(__file__).resolve().parent
 HOOK_PATH = SERVER_DIR.parent / "hooks" / "post_tool_use.py"
@@ -74,6 +76,8 @@ def clear_in_process_caches() -> None:
     proof_health._DIR_LEAN_FILES_CACHE.clear()
     proof_health._FILE_TEXTS_CACHE.clear()
     proof_health._NORM_SIG_CACHE.clear()
+    # Also the `scan_lean_text` result memo and the shared auditor's memo tables.
+    proof_health.clear_in_process_caches()
 
 
 class TestStripLeanCommentsAndStrings(unittest.TestCase):
@@ -1938,6 +1942,1827 @@ class TestPostToolUseHookIntegration(unittest.TestCase):
                 self.hook_env(tmp_dir / "flat-cache.json"),
             )
             self.assertIn("`dsimp_forbidden_sym` (+1 at L2)", out["overwriteResult"])
+
+
+# ---------------------------------------------------------------------------
+# Rules 6 & 7: shared waiver-pin & 3-axis auditor. The 100 unit / mutation tests below are
+# ported from the validated prototype suite (`test_waiver_pin_audit_proto.py`, `2dd38e6d`)
+# and run through `audit`, which serves the prototype's API names from `proof_health`.
+# ---------------------------------------------------------------------------
+
+
+class _SharedAuditorAPI:
+    """Prototype `waiver_pin_audit_proto` names, resolved against `proof_health`."""
+
+    _RENAMED = {
+        "scan_lean_text": "audit_lean_text",
+        "scan_rust_text": "audit_rust_text",
+        "scan_file": "audit_file",
+        "count_findings_by_rule": "count_audit_findings_by_rule",
+        "ALL_RULES": "ALL_WAIVER_AUDIT_RULES",
+    }
+
+    def __getattr__(self, name: str):
+        return getattr(proof_health, self._RENAMED.get(name, name))
+
+
+audit = _SharedAuditorAPI()
+EPISODE1_BYTECODEC = REPO_ROOT / "theory" / "Anneal" / "ByteCodec.lean"
+EPISODE1_ADT_AND_CONTROL = REPO_ROOT / "theory" / "Anneal" / "Mir" / "AdtAndControl.lean"
+
+
+def pin_rust_snippet(directive_prefix: str, item_code: str) -> str:
+    """Pin `item_code` with a standalone `/// pin:sha256:<12hex>` doc line (the only placement
+    spec.rs accepts for every waiver directive)."""
+    draft = f"{directive_prefix}\n{item_code}\n"
+    pins = audit.compute_rust_item_pins(draft)
+    assert pins, "expected at least one Rust item pin"
+    pin_tag = next(iter(pins.values()))
+    return f"{directive_prefix}\n/// {pin_tag}\n{item_code}\n"
+
+
+def pin_lean_decl(doc_lines: list[str], decl: str) -> str:
+    """Pin a Lean declaration with a standalone `pin:` line inside its `/-- -/` docstring."""
+    body = "\n".join(doc_lines)
+    draft = f"/--\n{body}\n-/\n{decl}"
+    pin_tag = audit.compute_lean_decl_pins(draft)[_lean_decl_name(decl)]
+    return f"/--\n{body}\n{pin_tag}\n-/\n{decl}"
+
+
+def _lean_decl_name(decl: str) -> str:
+    head = decl.split("\n", 1)[0].split()
+    return head[1].split("(")[0].split(":")[0]
+
+
+class TestWaiverPinRecordImmutability(unittest.TestCase):
+    def test_finding_immutability_and_value_equality(self) -> None:
+        f1 = audit.WaiverPinFinding(
+            rule=audit.RULE_UNPINNED_WAIVER,
+            line=10,
+            message="msg",
+            suggestion="sug",
+            symbol="foo",
+            expected_pin="pin:sha256:0123456789ab",
+            actual_pin="",
+            tier="S1",
+        )
+        f2 = audit.WaiverPinFinding(
+            rule=audit.RULE_UNPINNED_WAIVER,
+            line=10,
+            message="msg",
+            suggestion="sug",
+            symbol="foo",
+            expected_pin="pin:sha256:0123456789ab",
+            actual_pin="",
+            tier="S1",
+        )
+        self.assertEqual(f1, f2)
+        self.assertEqual(hash(f1), hash(f2))
+        self.assertIn("WaiverPinFinding", repr(f1))
+        self.assertEqual(f1.to_dict()["rule"], audit.RULE_UNPINNED_WAIVER)
+        with self.assertRaises(AttributeError):
+            f1.line = 20  # type: ignore[misc]
+
+    def test_annotation_and_metadata_record_immutability(self) -> None:
+        ann = audit.WaiverAnnotation(
+            directive="allow_compile_time_guard",
+            tier="S1",
+            reason="guard",
+            pin_tokens=("pin:sha256:0123456789ab",),
+            line=1,
+            raw_line="anneal:allow_compile_time_guard pin:sha256:0123456789ab",
+        )
+        with self.assertRaises(AttributeError):
+            ann.tier = "S3"  # type: ignore[misc]
+
+        rec = audit.TheoremMetadataRecord(
+            name="thm",
+            line=5,
+            kind="safety",
+            witness="universal",
+            assumes="S0",
+            subject="foo",
+            hypotheses=("x : Nat",),
+            conclusion="x = x",
+        )
+        with self.assertRaises(AttributeError):
+            rec.kind = "helper"  # type: ignore[misc]
+
+
+class TestRustWaiverPinningAndMutations(unittest.TestCase):
+    def test_valid_rust_s1_allow_compile_time_guard_pin(self) -> None:
+        s1_src = pin_rust_snippet(
+            "/// anneal:allow_compile_time_guard",
+            "pub fn guarded_transmute(x: [u8; 4]) -> u32 {\n"
+            "    const { assert!(core::mem::size_of::<u32>() == 4); }\n"
+            "    u32::from_le_bytes(x)\n"
+            "}",
+        )
+        self.assertEqual(audit.scan_rust_text(s1_src), [])
+
+    def test_valid_rust_s2_documented_intent_pin(self) -> None:
+        s2_src = pin_rust_snippet(
+            "/// anneal:documented_intent Upstream RFC guarantees niche layout",
+            "pub fn niche_opt(x: core::num::NonZeroU32) -> Option<core::num::NonZeroU32> {\n"
+            "    Some(x)\n"
+            "}",
+        )
+        self.assertEqual(audit.scan_rust_text(s2_src), [])
+
+    def test_valid_rust_s3_pinned_compiler_coupled_pin(self) -> None:
+        s3_src = pin_rust_snippet(
+            "/// anneal:pinned_compiler_coupled Tuple layout pinned to rustc 1.98",
+            "pub fn pair_bytes(p: (u16, u16)) -> u32 {\n"
+            "    (p.0 as u32) | ((p.1 as u32) << 16)\n"
+            "}",
+        )
+        self.assertEqual(audit.scan_rust_text(s3_src), [])
+
+    def test_valid_rust_tcb_trusted_reason_pin(self) -> None:
+        tcb_src = pin_rust_snippet(
+            '/// anneal:trusted reason = "Hardware MMIO volatile register read"',
+            "pub unsafe fn read_mmio(addr: *const u32) -> u32 {\n"
+            "    unsafe { core::ptr::read_volatile(addr) }\n"
+            "}",
+        )
+        self.assertEqual(audit.scan_rust_text(tcb_src), [])
+
+    def test_valid_rust_multi_directive_doc_block(self) -> None:
+        item = "pub unsafe fn multi_dir(x: usize) -> usize { x }"
+        draft = (
+            "/// anneal:requires x != 0\n"
+            "/// anneal:spec ensures(ret == x)\n"
+            "/// anneal:allow_compile_time_guard\n"
+            "/// anneal:documented_intent Non-zero identity check\n"
+            f"{item}\n"
+        )
+        pin = audit.compute_rust_item_pins(draft)["multi_dir"]
+        pinned = (
+            "/// anneal:requires x != 0\n"
+            "/// anneal:spec ensures(ret == x)\n"
+            "/// anneal:allow_compile_time_guard\n"
+            "/// anneal:documented_intent Non-zero identity check\n"
+            f"/// {pin}\n"
+            f"{item}\n"
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        # One standalone pin line covers every waiver of the block; an extra inline pin on the
+        # free-form rationale must agree with it.
+        agreeing = pinned.replace("identity check\n", f"identity check {pin}\n")
+        self.assertEqual(audit.scan_rust_text(agreeing), [])
+
+    def test_rust_comment_only_edits_preserve_pin(self) -> None:
+        base_item = (
+            "#[repr(C)]\n"
+            "pub struct Packet {\n"
+            "    pub tag: u16,\n"
+            "    pub payload: u16,\n"
+            "}"
+        )
+        pinned_src = pin_rust_snippet(
+            "/// anneal:pinned_compiler_coupled C ABI packet header",
+            base_item,
+        )
+        self.assertEqual(audit.scan_rust_text(pinned_src), [])
+
+        commented_src = pinned_src.replace(
+            "pub tag: u16,",
+            "// interior line comment\n    /* outer /* nested { } ; */ comment */\n    pub   tag : u16 ,",
+        )
+        self.assertEqual(audit.scan_rust_text(commented_src), [])
+
+    def test_rust_code_mutation_breaks_pin(self) -> None:
+        base_item = (
+            "#[repr(C)]\n"
+            "pub struct Packet {\n"
+            "    pub tag: u16,\n"
+            "    pub payload: u16,\n"
+            "}"
+        )
+        pinned_src = pin_rust_snippet(
+            "/// anneal:pinned_compiler_coupled C ABI packet header",
+            base_item,
+        )
+        drifted_field = pinned_src.replace("pub payload: u16", "pub payload: u32")
+        findings = audit.scan_rust_text(drifted_field)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+        self.assertEqual(findings[0].symbol, "Packet")
+        self.assertEqual(findings[0].tier, "S3")
+
+    def test_rust_repr_c_to_repr_rust_mutation_breaks_pin(self) -> None:
+        base_item = (
+            "#[repr(C)]\n"
+            "pub struct Packet {\n"
+            "    pub tag: u16,\n"
+            "    pub payload: u16,\n"
+            "}"
+        )
+        pinned_src = pin_rust_snippet(
+            "/// anneal:pinned_compiler_coupled C ABI packet header",
+            base_item,
+        )
+        drifted_repr = pinned_src.replace("#[repr(C)]", "#[repr(Rust)]")
+        findings = audit.scan_rust_text(drifted_repr)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_rust_repr_attribute_above_doc_comment_is_pinned_and_detects_drift(self) -> None:
+        draft = (
+            "#[repr(C)]\n"
+            "/// anneal:pinned_compiler_coupled C layout above doc comment\n"
+            "pub struct Header(pub u32, pub u32);\n"
+        )
+        pin = audit.compute_rust_item_pins(draft)["Header"]
+        pinned = draft.replace(
+            "C layout above doc comment",
+            f"C layout above doc comment {pin}",
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+
+        drifted = pinned.replace("#[repr(C)]", "#[repr(transparent)]")
+        findings = audit.scan_rust_text(drifted)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_rust_string_literal_mutation_breaks_pin(self) -> None:
+        pinned = pin_rust_snippet(
+            '/// anneal:trusted reason = "Panic message contract"',
+            'pub fn fail_with() { panic!("expected message A"); }',
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        drifted = pinned.replace("expected message A", "expected message B")
+        findings = audit.scan_rust_text(drifted)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_rust_semicolon_tuple_and_unit_structs_and_trait_methods(self) -> None:
+        s_tuple = pin_rust_snippet(
+            "/// anneal:pinned_compiler_coupled Newtype tuple struct",
+            "#[repr(transparent)]\npub struct Wrapper(pub u64);",
+        )
+        self.assertEqual(audit.scan_rust_text(s_tuple), [])
+
+        s_unit = pin_rust_snippet(
+            "/// anneal:documented_intent ZST marker struct",
+            "pub struct Marker;",
+        )
+        self.assertEqual(audit.scan_rust_text(s_unit), [])
+
+    def test_rust_lifetimes_char_literals_and_raw_strings(self) -> None:
+        item = (
+            "pub fn lifetime_and_chars<'a, 'b>(buf: &'a [u8], fallback: &'b u8) -> &'a u8 {\n"
+            "    let open_brace: char = '{';\n"
+            "    let close_brace: char = '}';\n"
+            "    let escaped_quote: char = '\\'';\n"
+            "    let semi_byte: u8 = b';';\n"
+            '    let fake_doc = r##"/// anneal:trusted reason = "fake inside raw string"}"##;\n'
+            "    let _ = (open_brace, close_brace, escaped_quote, semi_byte, fake_doc);\n"
+            "    if buf.is_empty() { fallback } else { &buf[0] }\n"
+            "}"
+        )
+        pinned = pin_rust_snippet(
+            '/// anneal:trusted reason = "Lifetime-heavy slice indexing"',
+            item,
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+
+        drifted = pinned.replace("&buf[0]", "&buf[1]")
+        findings = audit.scan_rust_text(drifted)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_rust_raw_byte_and_c_strings_do_not_trigger_false_positives(self) -> None:
+        src = (
+            'pub const RAW_BYTES: &[u8] = br#"/// anneal:trusted reason = "ignored""#;\n'
+            'pub const RAW_CSTR: &core::ffi::CStr = cr#"/// anneal:allow_compile_time_guard"#;\n'
+        )
+        self.assertEqual(audit.scan_rust_text(src), [])
+
+    def test_rust_non_doc_comments_and_strings_ignored(self) -> None:
+        src = (
+            "// anneal:trusted reason = \"plain line comment is ignored by rustc\"\n"
+            "//// anneal:allow_compile_time_guard\n"
+            "/* anneal:pinned_compiler_coupled ignored block comment\n"
+            "   /* nested /// anneal:trusted reason = \"ignored\" */ */\n"
+            "/*** anneal:documented_intent ignored 3-star comment */\n"
+            'pub const MSG: &str = "/// anneal:trusted reason = \\"inside string\\"";\n'
+        )
+        self.assertEqual(audit.scan_rust_text(src), [])
+
+    def test_rust_doc_attribute_and_raw_doc_attribute_syntax(self) -> None:
+        draft = (
+            '#[doc = "anneal:allow_compile_time_guard"]\n'
+            "pub fn attr_guarded(x: u64) -> u64 { x }\n"
+        )
+        pin = audit.compute_rust_item_pins(draft)["attr_guarded"]
+        pinned = (
+            '#[doc = "anneal:allow_compile_time_guard"]\n'
+            f'#[doc = "{pin}"]\n'
+            "pub fn attr_guarded(x: u64) -> u64 { x }\n"
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+
+        pinned_raw = (
+            '#[doc = r#"anneal:allow_compile_time_guard"#]\n'
+            f"/// {pin}\n"
+            "pub fn attr_guarded(x: u64) -> u64 { x }\n"
+        )
+        self.assertEqual(audit.scan_rust_text(pinned_raw), [])
+
+    def test_rust_unpinned_waiver_detection(self) -> None:
+        unpinned = (
+            "/// anneal:allow_compile_time_guard\n"
+            "pub fn f1(x: u32) -> u32 { x }\n"
+        )
+        f_unpinned = audit.scan_rust_text(unpinned)
+        self.assertEqual(len(f_unpinned), 1)
+        self.assertEqual(f_unpinned[0].rule, audit.RULE_UNPINNED_WAIVER)
+        self.assertEqual(f_unpinned[0].tier, "S1")
+
+    def test_rust_malformed_pin_short_hex(self) -> None:
+        src = "/// anneal:allow_compile_time_guard\n/// pin:sha256:12345\npub fn f() {}\n"
+        res = audit.scan_rust_text(src)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].rule, audit.RULE_MALFORMED_WAIVER_PIN)
+
+    def test_rust_malformed_pin_uppercase_hex(self) -> None:
+        src = "/// anneal:allow_compile_time_guard\n/// pin:sha256:ABCDEF012345\npub fn f() {}\n"
+        res = audit.scan_rust_text(src)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].rule, audit.RULE_MALFORMED_WAIVER_PIN)
+
+    def test_rust_malformed_pin_wrong_algorithm(self) -> None:
+        src = "/// anneal:allow_compile_time_guard\n/// pin:md5:0123456789ab\npub fn f() {}\n"
+        res = audit.scan_rust_text(src)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].rule, audit.RULE_MALFORMED_WAIVER_PIN)
+
+    def test_rust_malformed_pin_conflicting_multiple_pins(self) -> None:
+        src = (
+            "/// anneal:allow_compile_time_guard\n"
+            "/// pin:sha256:0123456789ab\n"
+            "/// pin:sha256:fedcba987654\n"
+            "pub fn f() {}\n"
+        )
+        res = audit.scan_rust_text(src)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].rule, audit.RULE_MALFORMED_WAIVER_PIN)
+
+    def test_rust_dangling_waiver_at_eof(self) -> None:
+        dangling_eof = '/// anneal:trusted reason = "eof"\n/// pin:sha256:0123456789ab\n'
+        res_eof = audit.scan_rust_text(dangling_eof)
+        self.assertEqual(len(res_eof), 1)
+        self.assertEqual(res_eof[0].rule, audit.RULE_DANGLING_WAIVER)
+
+    def test_rust_dangling_waiver_before_closing_brace(self) -> None:
+        dangling_mod = (
+            "mod m {\n"
+            '    /// anneal:trusted reason = "end of mod"\n'
+            "    /// pin:sha256:0123456789ab\n"
+            "}\n"
+        )
+        res_mod = audit.scan_rust_text(dangling_mod)
+        self.assertEqual(len(res_mod), 1)
+        self.assertEqual(res_mod[0].rule, audit.RULE_DANGLING_WAIVER)
+
+    def test_rust_invalid_waiver_syntax_not_at_line_start(self) -> None:
+        src = (
+            "/// prefix text anneal:allow_compile_time_guard pin:sha256:0123456789ab\n"
+            "pub fn f(x: usize) -> usize { x }\n"
+        )
+        res = audit.scan_rust_text(src)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].rule, audit.RULE_INVALID_WAIVER_SYNTAX)
+
+    def test_rust_invalid_waiver_syntax_missing_or_empty_reason(self) -> None:
+        for bad_line in (
+            "/// anneal:trusted pin:sha256:0123456789ab",
+            '/// anneal:trusted reason = "" pin:sha256:0123456789ab',
+            "/// anneal:documented_intent pin:sha256:0123456789ab",
+            "/// anneal:pinned_compiler_coupled pin:sha256:0123456789ab",
+        ):
+            src = f"{bad_line}\npub fn f(x: usize) -> usize {{ x }}\n"
+            res = audit.scan_rust_text(src)
+            self.assertEqual(len(res), 1, f"failed on {bad_line}")
+            self.assertEqual(res[0].rule, audit.RULE_INVALID_WAIVER_SYNTAX)
+
+    def test_rust_invalid_waiver_syntax_unknown_directive_and_bad_requires(self) -> None:
+        for bad_line in (
+            "/// anneal:unknown_directive foo pin:sha256:0123456789ab",
+            "/// anneal:requires x == 0",
+        ):
+            src = f"{bad_line}\npub fn f(x: usize) -> usize {{ x }}\n"
+            res = audit.scan_rust_text(src)
+            self.assertEqual(len(res), 1, f"failed on {bad_line}")
+            self.assertEqual(res[0].rule, audit.RULE_INVALID_WAIVER_SYNTAX)
+
+
+class TestLeanWaiverPinningAnd3AxisVacuity(unittest.TestCase):
+    def test_lean_waiver_pin_and_nested_comment_insensitivity(self) -> None:
+        decl = (
+            "theorem demo_pinned (n : Nat) (h : 0 < n) : 1 ≤ n := by\n"
+            "  omega\n"
+        )
+        doc = [
+            "anneal:pinned_compiler_coupled Demo layout theorem",
+            "Kind: safety",
+            "Witness: universal",
+            "Assumes: S3",
+        ]
+        src = pin_lean_decl(doc, decl)
+        self.assertEqual(audit.scan_lean_text(src), [])
+        # The pin binds the directive set: a bare-declaration hash no longer validates.
+        bare_pin = audit.compute_lean_decl_pins(decl)["demo_pinned"]
+        self.assertNotIn(bare_pin, src)
+
+        with_comments = src.replace(
+            "omega",
+            "-- line comment\n  /- outer /- inner -/ block -/\n  omega",
+        )
+        self.assertEqual(audit.scan_lean_text(with_comments), [])
+
+        drifted = src.replace("1 ≤ n", "2 ≤ n + 1")
+        findings = audit.scan_lean_text(drifted)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_lean_where_structure_and_def_waiver_pinning(self) -> None:
+        struct_decl = (
+            "structure PinnedStruct where\n"
+            "  a : Nat\n"
+            "  b : Nat\n"
+        )
+        src = pin_lean_decl(["anneal:pinned_compiler_coupled Layout structure"], struct_decl)
+        self.assertEqual(audit.scan_lean_text(src), [])
+
+        drifted = src.replace("b : Nat", "b : UInt32")
+        findings = audit.scan_lean_text(drifted)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, audit.RULE_DRIFTED_WAIVER_PIN)
+
+    def test_lean_guillemet_identifiers_and_primes_lexing(self) -> None:
+        src = (
+            "def «item--with--dashes» (st' : Nat) : Char := '\"'\n"
+            "theorem «thm--ok» (st' fuel' : Nat) (h : st' < fuel') : st' ≤ fuel' := by\n"
+            "  have c : Char := '«'\n"
+            "  omega\n"
+        )
+        self.assertEqual(audit.scan_lean_text(src), [])
+
+    def test_lean_dangling_waiver_before_end_and_eof(self) -> None:
+        src_end = (
+            "namespace Foo\n"
+            "/-- anneal:allow_compile_time_guard\npin:sha256:0123456789ab -/\n"
+            "end Foo\n"
+        )
+        f_end = audit.scan_lean_text(src_end)
+        self.assertEqual(len(f_end), 1)
+        self.assertEqual(f_end[0].rule, audit.RULE_DANGLING_WAIVER)
+
+        src_eof = "/-- anneal:allow_compile_time_guard\npin:sha256:0123456789ab -/\n"
+        f_eof = audit.scan_lean_text(src_eof)
+        self.assertEqual(len(f_eof), 1)
+        self.assertEqual(f_eof[0].rule, audit.RULE_DANGLING_WAIVER)
+
+    def test_lean_syntactic_contradiction_false_and_bool(self) -> None:
+        for src in (
+            "theorem t_false (x : Nat) (h : False) : x = 42 := False.elim h",
+            "theorem t_bool (x : Nat) (h : true = false) : x = 42 := by nomatch h",
+        ):
+            findings = audit.scan_lean_text(src)
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                [f.rule for f in findings],
+            )
+
+    def test_lean_syntactic_contradiction_numeric_and_nat_lt_zero(self) -> None:
+        for src in (
+            "theorem t_zero_one (x : Nat) (h : 0 = 1) : x = 42 := by omega",
+            "theorem t_num_neq (x : Nat) (h : 2 = 4) : x = 42 := by omega",
+            "theorem t_nat_lt_zero (n : Nat) (h : n < 0) : n = 99 := by omega",
+        ):
+            findings = audit.scan_lean_text(src)
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                [f.rule for f in findings],
+            )
+
+    def test_lean_syntactic_contradiction_irreflexive_and_option_clash(self) -> None:
+        for src in (
+            "theorem t_irrefl_ne (x : Nat) (h : x ≠ x) : x = 42 := False.elim (h rfl)",
+            "theorem t_irrefl_not_eq (x : Nat) (h : ¬ (x = x)) : x = 42 := False.elim (h rfl)",
+            "theorem t_opt_clash (x : Nat) (h : some x = none) : x = 0 := by nomatch h",
+        ):
+            findings = audit.scan_lean_text(src)
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                [f.rule for f in findings],
+            )
+
+    def test_lean_syntactic_contradiction_simultaneous_pos_and_neg_hyps(self) -> None:
+        src = "theorem t_both (x : Nat) (h1 : x = 5) (h2 : x ≠ 5) : x = 99 := False.elim (h2 h1)\n"
+        findings = audit.scan_lean_text(src)
+        self.assertIn(
+            audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+            [f.rule for f in findings],
+        )
+
+    def test_lean_trivial_conclusion_true_and_reflexive_eq(self) -> None:
+        f_true = audit.scan_lean_text("theorem bad_true (x : Nat) : True := trivial\n")
+        self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, [f.rule for f in f_true])
+
+        f_refl = audit.scan_lean_text("theorem bad_refl (x : Nat) : x + 1 = x + 1 := rfl\n")
+        self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, [f.rule for f in f_refl])
+
+    def test_lean_trivial_conclusion_helper_exemption(self) -> None:
+        src_helper = (
+            "/--\nKind: helper\nWitness: universal\nAssumes: S0\n-/\n"
+            "theorem ok_helper (x : Nat) : x = x := rfl\n"
+        )
+        self.assertEqual(audit.scan_lean_text(src_helper), [])
+
+    def test_lean_tautological_implication_detection(self) -> None:
+        src = "theorem taut_imp (P Q : Prop) (hP : P) (hQ : Q) : P := hP\n"
+        findings = audit.scan_lean_text(src)
+        self.assertIn(audit.RULE_TAUTOLOGICAL_IMPLICATION, [f.rule for f in findings])
+
+    def test_lean_unused_subject_explicit_and_bound_param(self) -> None:
+        src_explicit = (
+            "/--\n"
+            "Kind: safety\n"
+            "Witness: universal\n"
+            "Assumes: S0\n"
+            "Subject: evalDeinitPlace\n"
+            "-/\n"
+            "theorem disconnected_subject (n : Nat) (h : 0 < n) : 0 ≤ n := by omega\n"
+        )
+        f1 = audit.scan_lean_text(src_explicit)
+        self.assertIn(audit.RULE_UNUSED_SUBJECT_IN_CONCLUSION, [f.rule for f in f1])
+
+        src_bound = (
+            "/--\n"
+            "Kind: safety\n"
+            "Witness: universal\n"
+            "Assumes: S0\n"
+            "-/\n"
+            "theorem unused_param (body : MirBody) (n : Nat) (h : 0 < n) : 1 ≤ n := by omega\n"
+        )
+        f2 = audit.scan_lean_text(src_bound)
+        self.assertIn(audit.RULE_UNUSED_SUBJECT_IN_CONCLUSION, [f.rule for f in f2])
+
+    def test_lean_tier_assumption_mismatch_s0_with_pinned_rust_padding(self) -> None:
+        src_s0_pad = (
+            "/--\n"
+            "Kind: safety\n"
+            "Witness: universal\n"
+            "Assumes: S0\n"
+            "-/\n"
+            "theorem bad_s0_pinned (fs : List FieldLayout) (hRepr : spec.repr = .rust)\n"
+            "    (hPad : paddingFree 0 fs = true) : fs.length = fs.length + 0 := by omega\n"
+        )
+        f1 = audit.scan_lean_text(src_s0_pad)
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, [f.rule for f in f1])
+
+    def test_lean_tier_assumption_mismatch_s0_with_compile_time_guard(self) -> None:
+        src_s0_cte = (
+            "/--\n"
+            "Kind: safety\n"
+            "Witness: universal\n"
+            "Assumes: S0\n"
+            "-/\n"
+            "theorem bad_s0_cte (w : SymbolicPairPad)\n"
+            "    (h : evalConstGuard cond k ≠ .compileTimeError) : w.pad0 = 0 := by sorry\n"
+        )
+        f2 = audit.scan_lean_text(src_s0_cte)
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, [f.rule for f in f2])
+
+    def test_lean_tier_assumption_mismatch_invalid_witness_and_axes(self) -> None:
+        for src in (
+            "/--\nKind: safety\nWitness: vacuous\nAssumes: S0\n-/\n"
+            "theorem bad_witness (n : Nat) : n ≤ n + 1 := by omega\n",
+            "/--\nKind: safety\nWitness: exists-sat\nAssumes: S0\n-/\n"
+            "theorem bad_exists (n : Nat) : n ≤ n + 1 := by omega\n",
+            "/--\nKind: safety\nWitness: negative\nAssumes: S0\n-/\n"
+            "theorem bad_neg (n : Nat) : n ≤ n + 1 := by omega\n",
+            "/--\nKind: invalid_kind\nWitness: universal\nAssumes: S9\n-/\n"
+            "theorem bad_axes (n : Nat) : n ≤ n + 1 := by omega\n",
+        ):
+            res = audit.scan_lean_text(src)
+            self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, [f.rule for f in res])
+
+
+class TestCliBenchmarkAndLivePrototypeSelfAudit(unittest.TestCase):
+    """Prototype CLI / benchmark / live self-audit tests, retargeted at the promoted
+    `proof_health.py` CLI and at Episode 1's promoted Lean files (the prototype Lean file
+    itself is not promoted)."""
+
+    def test_cli_exit_codes_and_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_p = Path(tmp) / "clean.lean"
+            clean_p.write_text(
+                "theorem ok_add (n : Nat) : n + 0 = n := Nat.add_zero n\n",
+                encoding="utf-8",
+            )
+            bad_p = Path(tmp) / "bad.lean"
+            bad_p.write_text(
+                "theorem bad_vac (n : Nat) (h : 0 = 1) : n = 99 := by omega\n",
+                encoding="utf-8",
+            )
+
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                rc_clean = proof_health.main(["--json", str(clean_p)])
+            self.assertEqual(rc_clean, 0)
+            payload_clean = json.loads(buf.getvalue())
+            self.assertTrue(payload_clean["ok"])
+            self.assertEqual(payload_clean["finding_count"], 0)
+
+            buf_bad = io.StringIO()
+            with patch("sys.stdout", buf_bad):
+                rc_bad = proof_health.main(["--json", str(bad_p)])
+            self.assertEqual(rc_bad, 1)
+            payload_bad = json.loads(buf_bad.getvalue())
+            self.assertFalse(payload_bad["ok"])
+            self.assertEqual(payload_bad["finding_count"], 1)
+            self.assertEqual(payload_bad["findings"][0]["rule"], proof_health.RULE_TRIVIAL_OR_VACUOUS_CLAIM)
+            self.assertEqual(
+                payload_bad["findings"][0]["subrule"],
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+            )
+
+            err_buf = io.StringIO()
+            with patch("sys.stderr", err_buf):
+                rc_missing = proof_health.main([str(Path(tmp) / "nonexistent.lean")])
+                rc_no_args = proof_health.main([])
+                rc_bad_flag = proof_health.main(["--unknown-flag"])
+            self.assertEqual(rc_missing, 2)
+            self.assertEqual(rc_no_args, 2)
+            self.assertEqual(rc_bad_flag, 2)
+
+    def test_live_self_audit_on_episode1_lean_files(self) -> None:
+        for path in (EPISODE1_BYTECODEC, EPISODE1_ADT_AND_CONTROL):
+            self.assertTrue(path.is_file(), f"missing {path}")
+            # Every theorem, every check (`vacuity_scope="all"`, the prototype default).
+            self.assertEqual(audit.scan_file(path, check_3axis=True), [], path.name)
+            self.assertEqual(proof_health.scan_lean_file(path), [], path.name)
+            self.assertEqual(
+                proof_health.scan_lean_file(path, include_unannotated_vacuity=True), [], path.name
+            )
+
+        pins = audit.compute_lean_decl_pins(EPISODE1_BYTECODEC.read_text(encoding="utf-8"))
+        self.assertIn("pinnedZeroPadPair_isIntoBytes_and_transmute_sound", pins)
+        pins = audit.compute_lean_decl_pins(EPISODE1_ADT_AND_CONTROL.read_text(encoding="utf-8"))
+        self.assertIn("evalConst_size_eq_forces_zero_pad_and_intoBytes", pins)
+
+    def test_sub_5ms_runtime_benchmark(self) -> None:
+        text = EPISODE1_BYTECODEC.read_text(encoding="utf-8")
+        n_lines = text.count("\n") + 1
+        # Cold waiver pass (every module cache cleared before each timed run, what a fresh CLI
+        # process pays) over a file that does carry a waiver, so the `anneal:` fast path is off.
+        waived = text + "\n/-- anneal:documented_intent benchmark waiver -/\ndef benchWaiver : Nat := 0\n"
+        cold_waiver_ms = best_of_ms(
+            lambda: (_clear_audit_caches(), audit.scan_lean_text(waived, check_3axis=False)), budget_ms=5.0
+        )
+        self.assertLess(cold_waiver_ms, 5.0, f"cold waiver-pin pass took {cold_waiver_ms:.2f} ms")
+        # Warm/incremental (LSP keystroke) = re-scan after editing ONE theorem: exactly one
+        # audit-cache miss per run (a fresh hypothesis each time), every other theorem a sound hit.
+        anchor = "theorem scalarValidRange_isExactWidth (sz : Nat)"
+        self.assertIn(anchor, text)
+        counter = iter(range(10**6))
+
+        def edited_scan() -> None:
+            k = next(counter)
+            audit.scan_lean_text(text.replace(anchor, f"{anchor} (hEdit{k} : {k} ≤ {k} + 1)", 1))
+
+        warm_ms = best_of_ms(edited_scan, budget_ms=5.0)
+        self.assertLess(warm_ms, 5.0, f"incremental full scan took {warm_ms:.2f} ms (expected < 5.0 ms)")
+        # Cold full 3-axis scan: throughput regression guard (the flat `< 5 ms` holds warm, not
+        # cold, on files of this size -- see PROTOTYPE_REPORT.md §3.4).
+        cold_full_ms = best_of_ms(
+            lambda: (_clear_audit_caches(), audit.scan_lean_text(text, check_3axis=True)), budget_ms=0.0
+        )
+        self.assertLess(
+            cold_full_ms * 1000.0 / n_lines,
+            1.75,
+            f"cold full scan took {cold_full_ms:.2f} ms ({cold_full_ms * 1000.0 / n_lines:.2f} us/line)",
+        )
+
+
+def _clear_audit_caches() -> None:
+    audit._THM_AUDIT_CACHE.clear()
+    audit._META_CACHE.clear()
+    audit._NORM_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# [adv B1] spec.rs fidelity, directive-bound pins, lexer bypasses, Lean doc-only waivers
+# ---------------------------------------------------------------------------
+
+
+def _rules(findings: list) -> list[str]:
+    return [f.rule for f in findings]
+
+
+class TestB1SpecRsDirectiveFidelity(unittest.TestCase):
+    """`b1f15f743c:trusted/rustc-capture/src/spec.rs` (`parse_doc`) grammar fidelity."""
+
+    ITEM = "pub fn f(x: usize) -> usize { x }"
+
+    def _scan(self, doc: str) -> list:
+        return audit.scan_rust_text(f"{doc}\n{self.ITEM}\n")
+
+    def test_inline_pin_on_allow_compile_time_guard_is_rejected_like_spec_rs(self) -> None:
+        res = self._scan("/// anneal:allow_compile_time_guard pin:sha256:0123456789ab")
+        self.assertEqual(_rules(res), [audit.RULE_INVALID_WAIVER_SYNTAX])
+        self.assertIn("entire doc line", res[0].message)
+        self.assertIn("pin:sha256:", res[0].suggestion)
+
+    def test_inline_pin_after_trusted_reason_is_rejected_like_spec_rs(self) -> None:
+        res = self._scan('/// anneal:trusted reason = "MMIO" pin:sha256:0123456789ab')
+        self.assertEqual(_rules(res), [audit.RULE_INVALID_WAIVER_SYNTAX])
+        self.assertIn("breaks the spec.rs grammar", res[0].message)
+
+    def test_allow_compile_time_guard_accepts_no_rationale_or_reason(self) -> None:
+        for doc in (
+            '/// anneal:allow_compile_time_guard reason = "size guard"',
+            "/// anneal:allow_compile_time_guard because the const assert prunes padding",
+        ):
+            self.assertEqual(_rules(self._scan(doc)), [audit.RULE_INVALID_WAIVER_SYNTAX], doc)
+
+    def test_free_form_rationale_uses_untrimmed_strip_prefix(self) -> None:
+        # spec.rs strips `documented_intent` from the *untrimmed* remainder, so a space after
+        # `anneal:` falls through to the structured lexer and is rejected.
+        self.assertEqual(
+            _rules(self._scan("/// anneal: documented_intent Upstream RFC 1234")),
+            [audit.RULE_INVALID_WAIVER_SYNTAX],
+        )
+        # `anneal: allow_compile_time_guard` IS accepted (spec.rs trims for that comparison).
+        self.assertEqual(
+            _rules(self._scan("/// anneal: allow_compile_time_guard")), [audit.RULE_UNPINNED_WAIVER]
+        )
+
+    def test_structured_lexer_is_ascii_only_and_u128_bounded(self) -> None:
+        for doc in (
+            "/// anneal:requires x != ٣",  # Arabic-Indic digit: Python isdigit() but not ASCII
+            "/// anneal:requires é != 0",  # non-ASCII identifier
+            "/// anneal:requires x != 340282366920938463463374607431768211456",  # u128::MAX + 1
+        ):
+            self.assertEqual(_rules(self._scan(doc)), [audit.RULE_INVALID_WAIVER_SYNTAX], doc)
+        self.assertEqual(self._scan("/// anneal:requires x != 340282366920938463463374607431768211455"), [])
+
+    def test_valid_non_waiver_directives_need_no_pin(self) -> None:
+        self.assertEqual(self._scan("/// anneal:requires x != 0\n/// anneal:spec well_formed"), [])
+
+
+class TestB1DirectiveBoundPins(unittest.TestCase):
+    """The pin binds the doc block's directives as well as the item."""
+
+    ITEM = "pub fn layout_dependent(p: (u16, u16)) -> u32 { (p.0 as u32) | ((p.1 as u32) << 16) }"
+
+    def test_tier_swap_with_unchanged_pin_is_drift(self) -> None:
+        pinned = pin_rust_snippet("/// anneal:documented_intent Upstream layout RFC", self.ITEM)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        swapped = pinned.replace("anneal:documented_intent", "anneal:pinned_compiler_coupled")
+        res = audit.scan_rust_text(swapped)
+        self.assertEqual(_rules(res), [audit.RULE_DRIFTED_WAIVER_PIN])
+        self.assertEqual(res[0].tier, "S3")
+
+    def test_adding_a_waiver_to_a_pinned_block_is_drift(self) -> None:
+        pinned = pin_rust_snippet("/// anneal:documented_intent Upstream layout RFC", self.ITEM)
+        escalated = "/// anneal:allow_compile_time_guard\n" + pinned
+        self.assertEqual(
+            sorted(_rules(audit.scan_rust_text(escalated))), [audit.RULE_DRIFTED_WAIVER_PIN] * 2
+        )
+
+    def test_trusted_reason_edit_is_drift_but_prose_edit_is_not(self) -> None:
+        pinned = pin_rust_snippet(
+            '/// Reads a register.\n/// anneal:trusted reason = "MMIO volatile read"', self.ITEM
+        )
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned.replace("volatile read", "plain read"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+        self.assertEqual(
+            audit.scan_rust_text(pinned.replace("Reads a register.", "Reads a 32-bit register.")), []
+        )
+
+    def test_doc_comment_and_doc_attribute_forms_hash_identically(self) -> None:
+        pinned = pin_rust_snippet("/// anneal:documented_intent Upstream layout RFC", self.ITEM)
+        as_attr = pinned.replace(
+            "/// anneal:documented_intent Upstream layout RFC",
+            '#[doc = "anneal:documented_intent   Upstream layout RFC"]',
+        )
+        self.assertEqual(audit.scan_rust_text(as_attr), [])
+
+
+class TestB1RustLexerAndSpanBypasses(unittest.TestCase):
+    def test_escaped_quote_char_literals_do_not_desync_normalization(self) -> None:
+        item = (
+            "pub fn quotes(x: u8) -> (char, char, u8, u8) {\n"
+            "    let a = '\\'';\n"
+            "    let b = '\"';\n"
+            "    let c = b'\"';\n"
+            "    (a, b, c, x)\n"
+            "}"
+        )
+        pinned = pin_rust_snippet('/// anneal:trusted reason = "quote-heavy literals"', item)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        # Whitespace-only edits after a `'"'` literal must keep the pin...
+        self.assertEqual(audit.scan_rust_text(pinned.replace("(a, b, c, x)", "( a , b , c , x )")), [])
+        # ...while a real edit after it must break the pin.
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned.replace("(a, b, c, x)", "(a, b, c, x + 1)"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_const_generic_block_in_signature_does_not_truncate_the_pinned_span(self) -> None:
+        item = (
+            "pub fn sized() -> Wrapper<{ SIZE }> {\n"
+            "    unsafe { core::mem::transmute(make()) }\n"
+            "}"
+        )
+        pinned = pin_rust_snippet("/// anneal:allow_compile_time_guard", item)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned.replace("make()", "make_other()"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_struct_literal_initializer_tail_stays_inside_const_and_type_spans(self) -> None:
+        const_item = "pub const CFG: Config = Config { mode: 1 }.with_padding(2);"
+        pinned = pin_rust_snippet("/// anneal:pinned_compiler_coupled pinned config", const_item)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned.replace("with_padding(2)", "with_padding(3)"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+        type_item = "pub type Buf = Wrapper<{ N }, u8>;"
+        pinned_t = pin_rust_snippet("/// anneal:documented_intent alias layout", type_item)
+        self.assertEqual(audit.scan_rust_text(pinned_t), [])
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned_t.replace("u8>", "u16>"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_hex_escaped_doc_attribute_cannot_hide_a_waiver(self) -> None:
+        src = '#[doc = "anneal\\x3atrusted reason = \\"hidden\\""]\npub fn f() {}\n'
+        self.assertNotIn("anneal:", src)
+        self.assertEqual(_rules(audit.scan_rust_text(src)), [audit.RULE_UNPINNED_WAIVER])
+
+    def test_computed_doc_attributes_are_flagged_unauditable(self) -> None:
+        for attr in (
+            '#[cfg_attr(all(), doc = "anneal:trusted reason = \\"x\\"")]',
+            '#[doc = concat!("anneal:", "trusted reason = \\"x\\"")]',
+            '#[doc = include_str!("waivers.md")]',
+        ):
+            res = audit.scan_rust_text(f"{attr}\npub fn f() {{}}\n")
+            self.assertEqual(_rules(res), [audit.RULE_INVALID_WAIVER_SYNTAX], attr)
+        # Semantic `doc(...)` attributes are not doc text, and `#[doc = #var]` inside a
+        # proc-macro `quote!` body is a token template, not an attribute: both stay unflagged.
+        self.assertEqual(audit.scan_rust_text("#[doc(hidden)]\npub fn f() {}\n"), [])
+        self.assertEqual(
+            audit.scan_rust_text("fn gen() -> T { quote! { #[doc = #marker] pub fn g() {} } }\n"), []
+        )
+
+    def test_inner_doc_directives_are_dangling(self) -> None:
+        for src in (
+            '//! anneal:trusted reason = "crate-level"\npub fn f() {}\n',
+            '#![doc = "anneal:allow_compile_time_guard"]\npub fn f() {}\n',
+        ):
+            self.assertEqual(_rules(audit.scan_rust_text(src)), [audit.RULE_DANGLING_WAIVER], src)
+
+
+class TestB1LeanDocstringOnlyWaiversAndWhitespaceSemantics(unittest.TestCase):
+    def test_plain_lean_comments_never_carry_waivers(self) -> None:
+        src = (
+            "-- anneal:trusted reason = \"line comment\"\n"
+            "/- anneal:allow_compile_time_guard -/\n"
+            "theorem plain_comments (n : Nat) : n + 0 = n := Nat.add_zero n\n"
+        )
+        self.assertEqual(audit.scan_lean_text(src), [])
+
+    def test_module_docstring_directive_is_dangling(self) -> None:
+        src = "/-! anneal:pinned_compiler_coupled module-wide -/\ndef x : Nat := 1\n"
+        self.assertEqual(_rules(audit.scan_lean_text(src)), [audit.RULE_DANGLING_WAIVER])
+
+    def _pinned(self, decl: str) -> str:
+        return pin_lean_decl(["anneal:documented_intent Lean whitespace semantics"], decl)
+
+    def test_index_vs_application_whitespace_is_semantic(self) -> None:
+        pinned = self._pinned("def pick (xs : Array Nat) (i : Nat) : Nat := xs[i]!\n")
+        self.assertEqual(audit.scan_lean_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace("xs[i]!", "xs [i]!"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_projection_vs_leading_dot_whitespace_is_semantic(self) -> None:
+        pinned = self._pinned("def proj (f : Nat → Nat) (x : Nat × Nat) : Nat := f x.1\n")
+        self.assertEqual(audit.scan_lean_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace("f x.1", "f x .1"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_tactic_indentation_is_semantic_but_trailing_comments_are_not(self) -> None:
+        decl = (
+            "theorem indent_demo (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n"
+            "  refine ⟨?_, ?_⟩\n"
+            "  · exact hp\n"
+            "  · exact hq\n"
+        )
+        pinned = self._pinned(decl)
+        self.assertEqual(audit.scan_lean_text(pinned), [])
+        self.assertEqual(
+            audit.scan_lean_text(pinned.replace("exact hp\n", "exact hp -- left conjunct\n")), []
+        )
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace("  · exact hq\n", "    · exact hq\n"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_column_zero_where_block_is_part_of_the_pinned_declaration(self) -> None:
+        decl = "def outer : Nat := helper + 1\nwhere\n  helper : Nat := 41\n"
+        pinned = self._pinned(decl)
+        self.assertEqual(audit.scan_lean_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace(":= 41", ":= 42"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_lean_quote_char_literal_keeps_whitespace_normalization_in_sync(self) -> None:
+        decl = "def quoteChar : Char × Nat := ('\"', 1 + 2)\n"
+        pinned = self._pinned(decl)
+        self.assertEqual(audit.scan_lean_text(pinned), [])
+        self.assertEqual(audit.scan_lean_text(pinned.replace("1 + 2", "1  +  2")), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace("1 + 2", "1 + 3"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+
+class TestB1ThreeAxisHardening(unittest.TestCase):
+    def test_conflicting_duplicate_axis_lines_are_flagged(self) -> None:
+        src = (
+            "/--\nKind: safety\nWitness: universal\nAssumes: S0\nKind: helper\n-/\n"
+            "theorem sneaky (x : Nat) : x = x := rfl\n"
+        )
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, _rules(audit.scan_lean_text(src)))
+
+    def test_conjunction_of_trivial_facts_is_a_trivial_conclusion(self) -> None:
+        for conc in ("True ∧ x = x", "x + 1 = x + 1 ∧ (p ↔ p)", "¬ False ∧ x ≤ x"):
+            src = f"theorem padded_triv (x : Nat) (p : Prop) : {conc} := by simp\n"
+            self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), conc)
+        self.assertNotIn(
+            audit.RULE_TRIVIAL_CONCLUSION,
+            _rules(audit.scan_lean_text("theorem real (x : Nat) : x = x ∧ x < x + 1 := by omega\n")),
+        )
+
+    def test_int_negative_bound_is_not_a_contradiction(self) -> None:
+        src = "theorem neg_int (x : Int) (h : x < 0) : x ≤ -1 := by omega\n"
+        self.assertNotIn(audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src)))
+        src_nat = "theorem neg_nat (x : Nat) (h : x < 0) : x = 7 := by omega\n"
+        self.assertIn(audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src_nat)))
+
+    def test_struct_literal_canonical_order_pin_on_s0_is_a_tier_mismatch(self) -> None:
+        src = (
+            "/--\nKind: safety\nWitness: universal\nAssumes: S0\n-/\n"
+            "theorem reprRust_literal_pin (fs : List FieldLayout)\n"
+            "    (hWF : ({ shape := .struct fs, repr := .rust, reprAlign := none,\n"
+            "              rustOrderCanonical := true } : AdtLayoutSpec).WF) :\n"
+            "    fs.length = fs.length + 0 := by omega\n"
+        )
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, _rules(audit.scan_lean_text(src)))
+
+
+# ---------------------------------------------------------------------------
+# [adv A1] Rust attribute whitespace/string-bracket bypasses, angle-depth `<<`/`<=`,
+#          Lean multi-attribute/modifier 3-axis lookup, disjunctive & inequality vacuity
+# ---------------------------------------------------------------------------
+
+
+class TestA1AdversarialHardening(unittest.TestCase):
+    def test_rust_spaced_hash_bracket_doc_and_inner_doc_attributes(self) -> None:
+        outer_spaced = '# [doc = "anneal:trusted reason = \\"spaced hash\\""]\npub fn f() {}\n'
+        self.assertEqual(_rules(audit.scan_rust_text(outer_spaced)), [audit.RULE_UNPINNED_WAIVER])
+        inner_spaced = '# ! [doc = "anneal:allow_compile_time_guard"]\npub fn f() {}\n'
+        self.assertEqual(_rules(audit.scan_rust_text(inner_spaced)), [audit.RULE_DANGLING_WAIVER])
+        computed_spaced = '#\n[doc = include_str!("waiver.md")]\npub fn f() {}\n'
+        self.assertEqual(_rules(audit.scan_rust_text(computed_spaced)), [audit.RULE_INVALID_WAIVER_SYNTAX])
+
+    def test_rust_preceding_attribute_with_brackets_inside_string_literal(self) -> None:
+        item = "pub struct S { pub a: u8, pub b: u32 }"
+        pre_attrs = '#[repr(C)]\n#[deprecated(note = "use foo[0] or bar[1")]\n'
+        doc = "/// anneal:pinned_compiler_coupled C ABI layout"
+        anns, _ = audit._collect_block_directives([(1, "anneal:pinned_compiler_coupled C ABI layout")])
+        norm = audit._normalize_rust_item(pre_attrs + "\n" + item)
+        pin = audit.format_pin_tag(audit.compute_sha256_pin12(audit.waiver_hash_input(anns, norm)))
+        full = f"{pre_attrs}{doc}\n/// {pin}\n{item}\n"
+        self.assertEqual(audit.scan_rust_text(full), [])
+        # Mutating `#[repr(C)]` above `#[deprecated(note = "use foo[0] or bar[1")]` MUST break the pin!
+        mutated = full.replace("#[repr(C)]", "#[repr(Rust)]")
+        self.assertEqual(_rules(audit.scan_rust_text(mutated)), [audit.RULE_DRIFTED_WAIVER_PIN])
+
+    def test_rust_where_clause_shift_and_le_operators_do_not_desync_angle_depth(self) -> None:
+        item = (
+            "pub fn shifted<const N: usize>(x: u32) -> u32\n"
+            "where\n"
+            "    [(); 1 << N]: Sized,\n"
+            "    [(); (N <= 4) as usize]: Sized,\n"
+            "{\n"
+            "    x + 1\n"
+            "}"
+        )
+        pinned = pin_rust_snippet("/// anneal:allow_compile_time_guard", item)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        self.assertEqual(
+            _rules(audit.scan_rust_text(pinned.replace("x + 1", "x + 2"))),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_rust_raw_identifier_item_names_extracted(self) -> None:
+        item = "pub fn r#try(x: u8) -> u8 { x }"
+        pinned = pin_rust_snippet("/// anneal:documented_intent raw ident fn", item)
+        self.assertEqual(audit.scan_rust_text(pinned), [])
+        pins = audit.compute_rust_item_pins(pinned)
+        self.assertIn("r#try", pins)
+
+    def test_lean_multi_attribute_and_modifier_lines_preserve_3axis_metadata(self) -> None:
+        src = (
+            "/--\n"
+            "Kind: safety\n"
+            "Witness: exists-sat\n"
+            "Assumes: S0\n"
+            "-/\n"
+            "@[simp]\n"
+            "@[nolint unusedArguments]\n"
+            "private\n"
+            "theorem multi_attr_bad_exists (n : Nat) : n ≤ n + 1 := by omega\n"
+        )
+        self.assertIn(audit.RULE_TIER_ASSUMPTION_MISMATCH, _rules(audit.scan_lean_text(src)))
+
+    def test_lean_disjunctive_and_standalone_reflexive_trivial_conclusions(self) -> None:
+        for conc in (
+            "x ≤ x",
+            "p ↔ p",
+            "p ∨ True",
+            "True ∨ p",
+            "x = x ∨ p",
+            "p ∨ ¬ False",
+        ):
+            src = f"theorem triv_conc (x : Nat) (p : Prop) : {conc} := by sorry\n"
+            self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), conc)
+        # Non-trivial disjunction must NOT be flagged
+        clean_or = "theorem real_or (x : Nat) : x = 0 ∨ 0 < x := by omega\n"
+        self.assertEqual(audit.scan_lean_text(clean_or), [])
+
+    def test_lean_numeric_inequality_and_constructor_contradictions(self) -> None:
+        for hyp in (
+            "5 < 3",
+            "3 < 3",
+            "5 ≤ 3",
+            "3 > 5",
+            "x > x",
+            "0 > x",
+            "¬ True",
+            "[] = x :: xs",
+            "[x] = []",
+            "Sum.inl x = Sum.inr y",
+            "Except.ok x = Except.error y",
+        ):
+            src = f"theorem bad_hyp (x y : Nat) (xs : List Nat) (h : {hyp}) : x = 42 := by sorry\n"
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                hyp,
+            )
+
+
+# ---------------------------------------------------------------------------
+# [adv B2] Cross-scan audit-cache soundness, parse clamping, and `∧`/`∨` precedence
+# ---------------------------------------------------------------------------
+
+
+class TestB2AuditCacheSoundnessAndPrecedence(unittest.TestCase):
+    """A1 made `_THM_AUDIT_CACHE` survive across scans but keyed it on the header text truncated
+    at the first `:=`, which can sit inside a binder's structure literal: later edits to the
+    conclusion or to a later hypothesis then hit a stale entry (false negatives in one process)."""
+
+    def test_struct_literal_binder_edit_to_conclusion_is_not_served_stale(self) -> None:
+        v1 = "theorem t (h : ({ a := 1 } : Foo).P) : x = 1 := sorry\n"
+        v2 = "theorem t (h : ({ a := 1 } : Foo).P) : True := sorry\n"
+        self.assertEqual(audit.scan_lean_text(v1), [])
+        self.assertEqual(_rules(audit.scan_lean_text(v2)), [audit.RULE_TRIVIAL_CONCLUSION])
+
+    def test_struct_literal_binder_edit_to_later_hypothesis_is_not_served_stale(self) -> None:
+        w1 = "theorem u (s : ({ k := 0 } : S).Q) (h : 0 < 1) : y = 2 := sorry\n"
+        w2 = "theorem u (s : ({ k := 0 } : S).Q) (h : 1 = 2) : y = 2 := sorry\n"
+        self.assertEqual(audit.scan_lean_text(w1), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(w2)), [audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS]
+        )
+
+    def test_header_parse_never_reads_past_the_next_theorem(self) -> None:
+        # A body-less statement used to run (via `_find_lean_decl_end`) into the indented next
+        # theorem, hiding `x = x` and making `t1`'s result depend on text outside its cache key.
+        for t2_conc in ("y = 3", "y = 4", "True"):
+            src = f"theorem t1 : x = x\n  theorem t2 : {t2_conc} := trivial\n"
+            findings = audit.scan_lean_text(src)
+            t1_rules = [f.rule for f in findings if f.symbol == "t1"]
+            self.assertEqual(t1_rules, [audit.RULE_TRIVIAL_CONCLUSION], t2_conc)
+
+    def test_cached_findings_track_shifted_line_numbers(self) -> None:
+        src = "theorem bad (h : False) : 1 = 2 := sorry\n"
+        first = audit.scan_lean_text(src)
+        shifted = audit.scan_lean_text("\n\n\n" + src)
+        self.assertEqual([f.line for f in first], [1])
+        self.assertEqual([f.line for f in shifted], [4])
+        self.assertEqual(_rules(first), _rules(shifted))
+
+    def test_metadata_edit_invalidates_cached_audit(self) -> None:
+        base = "theorem m (n : Nat) : ∃ k, k = n := ⟨n, rfl⟩\n"
+        good = "/--\nKind: refinement\nWitness: exists-sat\nAssumes: S0\n-/\n" + base
+        bad = "/--\nKind: refinement\nWitness: negative\nAssumes: S0\n-/\n" + base
+        self.assertEqual(audit.scan_lean_text(good), [])
+        self.assertEqual(_rules(audit.scan_lean_text(bad)), [audit.RULE_TIER_ASSUMPTION_MISMATCH])
+
+    def test_looser_connectives_and_binders_do_not_fake_a_top_level_disjunction(self) -> None:
+        # `↔` (20) and `→` (25) bind looser than `∨` (30) / `∧` (35); binder bodies extend right.
+        for conc in (
+            "p ↔ q ∨ True",
+            "x = x ∨ p ↔ q",
+            "p ↔ x = x ∧ True",
+            "f = fun y => y ∨ True",
+            "∃ y : Nat, y = y ∨ p",
+            "g <| p ∨ True",
+        ):
+            src = f"theorem prec (p q : Prop) (x : Nat) (f g : Prop → Prop) : {conc} := sorry\n"
+            self.assertNotIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), conc)
+        for conc in ("p ∨ True", "(p ↔ q) ∨ True", "x = x ∧ (p → p) = (p → p)", "(fun y => y) = (fun y => y)"):
+            src = f"theorem prec (p q : Prop) (x : Nat) : {conc} := sorry\n"
+            self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), conc)
+
+    def test_negative_bound_rule_fires_only_on_nat_valued_operands(self) -> None:
+        # A0-A1 flagged every `e < 0` / `0 > e` whose operand was not a declared `Int` binder.
+        for binders, hyp in (
+            ("(x : Real)", "x < 0"),
+            ("(f : Nat → Int)", "f 0 < 0"),
+            ("(z : ℚ)", "0 > z"),
+            ("(n : Nat) (g : Nat → Int)", "g n < 0"),
+        ):
+            src = f"theorem nb {binders} (h : {hyp}) (w : Nat) : w = w + 0 := by omega\n"
+            self.assertNotIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src)), hyp
+            )
+        for binders, hyp in (
+            ("(xs : List Nat)", "xs.length < 0"),
+            ("(i : Fin 4)", "i < 0"),
+            ("{n : ℕ}", "0 > n"),
+            ("(u : UInt32)", "u < 0"),
+        ):
+            src = f"theorem nb {binders} (h : {hyp}) (w : Nat) : w = w + 0 := by omega\n"
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src)), hyp
+            )
+
+
+    def test_nested_bracket_attribute_waiver_is_pinned_not_dangling(self) -> None:
+        decl = "@[aesop safe [constructors]]\ntheorem nestedAttr : 1 + 1 = 2 := rfl\n"
+        doc = "/--\nanneal:documented_intent nested attribute arguments\n"
+        pin_tag = audit.compute_lean_decl_pins(f"{doc}-/\n{decl}")["nestedAttr"]
+        pinned = f"{doc}{pin_tag}\n-/\n{decl}"
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        for old, new in (("1 + 1 = 2", "2 + 0 = 2"), ("[constructors]", "[cases]")):
+            self.assertEqual(
+                _rules(audit.scan_lean_text(pinned.replace(old, new), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                old,
+            )
+
+
+# ---------------------------------------------------------------------------
+# [adv A2] Prefix-binder scope vs. looser infix precedence, compound Nat bounds,
+# and indented namespace/section declaration boundaries
+# ---------------------------------------------------------------------------
+
+
+class TestA2AdversarialHardening(unittest.TestCase):
+    def test_prefix_binder_after_top_level_or_and_is_caught_not_suppressed(self) -> None:
+        # B2's `_has_looser_top_level_structure` returned True whenever `∀`, `∃`, `fun`, `if`, or
+        # `match` appeared anywhere at depth 0, missing `True ∨ ∀ x, P x` (provable by `Or.inl trivial`)
+        # and `True ∧ ∀ x, x = x` (provable by `⟨trivial, fun _ => rfl⟩`).
+        for conc in (
+            "True ∨ ∀ y : Nat, P y",
+            "x = x ∨ ∃ y : Nat, y > x",
+            "True ∨ if c then P x else P 0",
+            "¬ False ∨ match x with | 0 => P 0 | n + 1 => P n",
+            "True ∧ ∀ y : Nat, y = y",
+            "x = x ∧ ∀ (a b : Nat), a + b = a + b",
+            "∀ y : Nat, y = y",
+        ):
+            src = (
+                "/--\nKind: safety\nWitness: universal\nAssumes: S0\nSubject: P\n-/\n"
+                f"theorem t_triv (P : Nat → Prop) (c : Bool) (x : Nat) : {conc} := by sorry\n"
+            )
+            self.assertIn(
+                audit.RULE_TRIVIAL_CONCLUSION,
+                _rules(audit.scan_lean_text(src)),
+                conc,
+            )
+        # Non-trivial right-hand universal conjunct or prefix binder / looser `↔` before `∨` must NOT be flagged:
+        for conc in (
+            "True ∧ ∀ y : Nat, P y",
+            "∃ y : Nat, y = y ∨ P y",
+            "P x ↔ ∀ y : Nat, y = y ∨ P y",
+        ):
+            src = (
+                "/--\nKind: safety\nWitness: universal\nAssumes: S0\nSubject: P\n-/\n"
+                f"theorem t_ok (P : Nat → Prop) (x : Nat) : {conc} := by sorry\n"
+            )
+            self.assertNotIn(
+                audit.RULE_TRIVIAL_CONCLUSION,
+                _rules(audit.scan_lean_text(src)),
+                conc,
+            )
+
+    def test_compound_nat_expressions_and_domain_projections_in_negative_bounds(self) -> None:
+        for binders, hyp in (
+            ("(n m : Nat)", "n + m < 0"),
+            ("(n : Nat)", "n + 1 < 0"),
+            ("(xs : List Nat)", "xs.length + 1 < 0"),
+            ("(w : SymbolicPairPad)", "w.totalPad < 0"),
+            ("(w : StructLayoutWorld)", "w.totalSize < 0"),
+            ("(fs : List FieldLayout)", "0 > sumSizes fs"),
+            ("(n : Nat)", "0 > n * 2 + 1"),
+        ):
+            src = f"theorem bad_nat {binders} (h : {hyp}) (k : Nat) : k = k + 0 := by omega\n"
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                hyp,
+            )
+        for binders, hyp in (
+            ("(x : Int)", "x + 1 < 0"),
+            ("(f : Nat → Int)", "f 0 + 1 < 0"),
+            ("(x y : Real)", "x + y < 0"),
+        ):
+            src = f"theorem ok_signed {binders} (h : {hyp}) (k : Nat) : k = k + 0 := by omega\n"
+            self.assertNotIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                hyp,
+            )
+
+    def test_indented_namespace_declarations_do_not_merge_into_pinned_span(self) -> None:
+        draft = (
+            "namespace IndentedTest\n"
+            "  /--\n"
+            "  anneal:allow_compile_time_guard\n"
+            "  -/\n"
+            "  def guardedFn (x : Nat) : Nat := x + 1\n\n"
+            "  def siblingHelper (y : Nat) : Nat := y + 2\n"
+            "end IndentedTest\n"
+        )
+        pins = audit.compute_lean_decl_pins(draft)
+        self.assertIn("guardedFn", pins)
+        self.assertIn("siblingHelper", pins)
+        pinned = draft.replace(
+            "  anneal:allow_compile_time_guard\n",
+            f"  anneal:allow_compile_time_guard\n  {pins['guardedFn']}\n",
+        )
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        # Editing `siblingHelper` or `end IndentedTest` must NOT break `guardedFn`'s pin:
+        edited_sibling = pinned.replace("y + 2", "y + 99")
+        self.assertEqual(audit.scan_lean_text(edited_sibling, check_3axis=False), [])
+        # Editing `guardedFn` itself MUST trigger `RULE_DRIFTED_WAIVER_PIN`:
+        edited_target = pinned.replace("x + 1", "x + 99")
+        self.assertEqual(
+            _rules(audit.scan_lean_text(edited_target, check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+
+# ---------------------------------------------------------------------------
+# [adv B3] Indented-boundary pin bypasses and generic-projection `Nat` false positives
+# ---------------------------------------------------------------------------
+
+
+def _pin_lean_named(doc_line: str, decl: str, name: str) -> str:
+    doc = f"/--\n{doc_line}\n"
+    pin_tag = audit.compute_lean_decl_pins(f"{doc}-/\n{decl}")[name]
+    return f"{doc}{pin_tag}\n-/\n{decl}"
+
+
+class TestB3IndentedBoundariesAndNatProjections(unittest.TestCase):
+    def test_indented_modifier_fields_and_where_attributes_stay_in_the_pinned_span(self) -> None:
+        # A2 ended a declaration at ANY indented `private`/`protected`/`@[` line, so the fields
+        # after `protected b` (or a `where` auxiliary's body) fell outside the pin: edits there
+        # were silently accepted.
+        for decl, name, old, new in (
+            ("structure S where\n  a : Nat\n  protected b : Nat\n  c : Nat\n", "S", "c : Nat", "c : Int"),
+            (
+                "class C (α : Type) where\n  op : α → α\n  private aux : α\n  law : ∀ x, op x = x\n",
+                "C",
+                "op x = x",
+                "op x = op x",
+            ),
+            (
+                "theorem w : 1 = 1 := by\n  exact aux\nwhere\n  @[simp] aux : 1 = 1 := rfl\n",
+                "w",
+                ":= rfl",
+                ":= by rfl",
+            ),
+        ):
+            pinned = _pin_lean_named("anneal:documented_intent indented members", decl, name)
+            self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [], name)
+            self.assertEqual(
+                _rules(audit.scan_lean_text(pinned.replace(old, new), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                name,
+            )
+
+    def test_indented_sibling_commands_behind_modifiers_still_end_the_span(self) -> None:
+        src_tpl = (
+            "namespace Foo\n  /--\n  anneal:documented_intent demo\n  PIN\n  -/\n  def pinned : Nat := 1\n"
+            "  private def sibling : Nat := 2\n  @[simp] theorem sib2 : sibling = 2 := rfl\n"
+            "  #check sibling\nend Foo\n"
+        )
+        tag = audit.compute_lean_decl_pins(src_tpl.replace("  PIN\n", ""))["pinned"]
+        src = src_tpl.replace("PIN", tag)
+        self.assertEqual(audit.scan_lean_text(src, check_3axis=False), [])
+        for old, new in ((":= 2", ":= 3"), ("sibling = 2", "sibling = 3"), ("#check sibling", "#check pinned")):
+            self.assertEqual(audit.scan_lean_text(src.replace(old, new), check_3axis=False), [], old)
+        self.assertEqual(
+            _rules(audit.scan_lean_text(src.replace(":= 1", ":= 5"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_generic_fst_and_val_projections_are_not_nat_valued(self) -> None:
+        for binders, hyp in (
+            ("(p : Int × Nat)", "p.fst < 0"),
+            ("(x : {z : Int // z < 5})", "x.val < 0"),
+            ("(q : Int × Int)", "0 > q.fst"),
+        ):
+            src = f"theorem nb {binders} (h : {hyp}) (w : Nat) : w = w + 0 := by omega\n"
+            self.assertNotIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src)), hyp
+            )
+        src = "theorem nb (n m : Nat) (h : n + m < 0) (w : Nat) : w = w + 0 := by omega\n"
+        self.assertIn(audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, _rules(audit.scan_lean_text(src)))
+
+
+# ---------------------------------------------------------------------------
+# [adv A3] Indented `decl_indent` boundaries with nested-bracket / multi-line
+# attributes, `where` `def` auxiliaries, and quantified conjunctive/disjunctive conclusions
+# ---------------------------------------------------------------------------
+
+
+class TestA3AdversarialHardening(unittest.TestCase):
+    def test_indented_namespace_sibling_with_nested_bracket_or_multiline_attribute(self) -> None:
+        # B3's `(?:@\[[^\n]*?\][ \t]*)*` boundary regex stopped at the first `]` in nested
+        # `@[aesop safe [constructors]] def sib1` and failed on multi-line `  @[simp]\n  def sib2`,
+        # merging `sib1` or `  @[simp]` into `pinned`'s span.
+        src_tpl = (
+            "namespace Foo\n"
+            "  /--\n"
+            "  anneal:documented_intent demo\n"
+            "  PIN1\n"
+            "  -/\n"
+            "  def pinned : Nat := 1\n"
+            "  @[aesop safe [constructors]] def sib1 : Nat := 2\n"
+            "  /--\n"
+            "  anneal:documented_intent sib2-doc\n"
+            "  PIN2\n"
+            "  -/\n"
+            "  @[simp]\n"
+            "  def sib2 : Nat := 3\n"
+            "end Foo\n"
+        )
+        pins = audit.compute_lean_decl_pins(src_tpl.replace("  PIN1\n", "").replace("  PIN2\n", ""))
+        self.assertIn("pinned", pins)
+        self.assertIn("sib1", pins)
+        self.assertIn("sib2", pins)
+        src = src_tpl.replace("PIN1", pins["pinned"]).replace("PIN2", pins["sib2"])
+        self.assertEqual(audit.scan_lean_text(src, check_3axis=False), [])
+        # Editing `sib1` must NOT break `pinned`'s pin:
+        self.assertEqual(
+            audit.scan_lean_text(src.replace("sib1 : Nat := 2", "sib1 : Nat := 99"), check_3axis=False),
+            [],
+        )
+        # Editing `sib2`'s `@[simp]` attribute must break `sib2`'s pin, NOT `pinned`'s pin:
+        drift_sib2 = audit.scan_lean_text(src.replace("@[simp]", "@[inline]"), check_3axis=False)
+        self.assertEqual([(f.symbol, f.rule) for f in drift_sib2], [("sib2", audit.RULE_DRIFTED_WAIVER_PIN)])
+
+    def test_where_auxiliary_with_def_keyword_stays_inside_pinned_span(self) -> None:
+        # B3's `_LEAN_TOPLEVEL_BOUNDARY_RE` matched any indented `def` keyword regardless of
+        # whether its indentation exceeded `decl_indent`, cutting `where\n  def aux` out of the pin.
+        decl = "def parentFn (x : Nat) : Nat :=\n  aux x\nwhere\n  def aux (n : Nat) : Nat := n + 1\n"
+        pinned = _pin_lean_named("anneal:documented_intent where-def", decl, "parentFn")
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace("n + 1", "n + 99"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_universal_quantifier_wrapping_conjunctive_or_disjunctive_trivial_body(self) -> None:
+        for conc in (
+            "True ∧ ∀ y : Nat, (y = y ∧ True)",
+            "True ∧ ∀ y : Nat, (True ∨ P y)",
+        ):
+            src = (
+                "/--\nKind: safety\nWitness: universal\nAssumes: S0\nSubject: P\n-/\n"
+                f"theorem t_q (P : Nat → Prop) : {conc} := by sorry\n"
+            )
+            self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), conc)
+
+
+# ---------------------------------------------------------------------------
+# [adv B4] Column-0 term bodies stay inside the pinned span
+# ---------------------------------------------------------------------------
+
+
+class TestB4ColumnZeroBodies(unittest.TestCase):
+    def test_column_zero_term_bodies_are_pinned(self) -> None:
+        # Lean accepts term bodies at column 0 (`def layoutSize : Nat :=\n8` elaborates); A0-A3 ended
+        # the span at ANY column-0 line, so editing such a body kept the old pin valid.
+        for decl, name, old, new in (
+            ("def layoutSize : Nat :=\n8\n", "layoutSize", ":=\n8", ":=\n16"),
+            ("def f (n : Nat) : Nat :=\nn + 1\n\ntheorem next : True := trivial\n", "f", "n + 1", "n + 2"),
+            ("def p : Nat × Nat := (1,\n2)\n", "p", "\n2)", "\n3)"),
+        ):
+            pinned = _pin_lean_named("anneal:pinned_compiler_coupled column-0 body", decl, name)
+            self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [], name)
+            self.assertEqual(
+                _rules(audit.scan_lean_text(pinned.replace(old, new, 1), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                name,
+            )
+
+    def test_column_zero_commands_still_end_the_span(self) -> None:
+        decl = (
+            "def q : Nat := 1\n\nopen Nat in\ntheorem next2 : True := trivial\n"
+            "set_option maxHeartbeats 1000 in\n#check q\nattribute [simp] q\n"
+        )
+        pinned = _pin_lean_named("anneal:pinned_compiler_coupled command boundaries", decl, "q")
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        for old, new in (
+            ("True := trivial", "True := True.intro"),
+            ("maxHeartbeats 1000", "maxHeartbeats 2000"),
+            ("#check q", "#check (q)"),
+            ("[simp] q", "[reducible] q"),
+            ("open Nat in", "open List in"),
+        ):
+            self.assertEqual(audit.scan_lean_text(pinned.replace(old, new), check_3axis=False), [], old)
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace(":= 1", ":= 2"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+
+# ---------------------------------------------------------------------------
+# [adv A4] Column-0 `protected`/`private`/`@[...]` structure fields and `where`
+# auxiliaries stay inside the pinned span (require a command keyword after modifiers)
+# ---------------------------------------------------------------------------
+
+
+class TestA4FinalHardening(unittest.TestCase):
+    def test_column_zero_structure_fields_and_where_auxiliaries_with_modifiers_stay_pinned(self) -> None:
+        # B4's `_LEAN_COMMAND_START_RE` matched bare `@\[` and `private`/`protected` at column 0
+        # without requiring a following command keyword (`theorem`, `def`, ...), so a column-0
+        # `protected b : Nat` field or `@[simp] aux : 1 = 1 := rfl` in a column-0 `where` block
+        # prematurely terminated the pinned span!
+        for decl, name, old, new in (
+            (
+                "structure S0 where\na : Nat\nprotected b : Nat\nc : Nat\n",
+                "S0",
+                "c : Nat",
+                "c : Int",
+            ),
+            (
+                "theorem w0 : 1 = 1 := by\n  exact aux\nwhere\n@[simp] aux : 1 = 1 := rfl\n",
+                "w0",
+                ":= rfl",
+                ":= by rfl",
+            ),
+        ):
+            pinned = _pin_lean_named("anneal:documented_intent col0-modifier-member", decl, name)
+            self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [], name)
+            self.assertEqual(
+                _rules(audit.scan_lean_text(pinned.replace(old, new), check_3axis=False)),
+                [audit.RULE_DRIFTED_WAIVER_PIN],
+                name,
+            )
+
+    def test_column_zero_and_indented_modifiers_followed_by_commands_end_the_span(self) -> None:
+        decl = (
+            "def first : Nat := 1\n"
+            "@[simp]\nprivate theorem second : first = 1 := rfl\n"
+        )
+        pinned = _pin_lean_named("anneal:documented_intent mod-cmd-boundary", decl, "first")
+        self.assertEqual(audit.scan_lean_text(pinned, check_3axis=False), [])
+        self.assertEqual(
+            audit.scan_lean_text(pinned.replace("first = 1", "1 = 1"), check_3axis=False),
+            [],
+        )
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned.replace(":= 1", ":= 9"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rules 6 & 7 integration: `ProofHealthFinding` extras, scoping, Rust, post-edit deltas,
+# CLI, result-cache soundness, shared-section identity with `check_trusted.py`, dogfood.
+# ---------------------------------------------------------------------------
+
+R6 = proof_health.RULE_UNPINNED_OR_DRIFTED_WAIVER
+R7 = proof_health.RULE_TRIVIAL_OR_VACUOUS_CLAIM
+CHECK_TRUSTED_PATH = REPO_ROOT / "trusted" / "audit" / "check_trusted.py"
+_SHARED_BEGIN = "# ===========================================================================\n# BEGIN SHARED WAIVER-PIN & 3-AXIS AUDITOR\n"
+_SHARED_END = "# END SHARED WAIVER-PIN & 3-AXIS AUDITOR\n# ===========================================================================\n"
+
+
+def _shared_section(text: str) -> str:
+    begin = text.index(_SHARED_BEGIN)
+    return text[begin : text.index(_SHARED_END, begin) + len(_SHARED_END)]
+
+
+def _load_check_trusted():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_trusted_under_test", CHECK_TRUSTED_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def scan67(src: str, **kw) -> list[tuple[str, str, int]]:
+    return [
+        (f.rule, f.subrule, f.line)
+        for f in proof_health.scan_lean_text(src, scan_siblings=False, **kw)
+        if f.rule in (R6, R7)
+    ]
+
+
+_PINNED_DOC = ["Pinned layout constant.", "anneal:pinned_compiler_coupled rustc 1.90 layout"]
+_META = "/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n"
+
+
+class TestRules6And7Integration(unittest.TestCase):
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_finding_positional_compat_extras_and_dict(self) -> None:
+        a = proof_health.ProofHealthFinding(R1, 3, "m", "s", "sym")
+        b = proof_health.ProofHealthFinding(rule=R1, line=3, message="m", suggestion="s", symbol="sym")
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        self.assertEqual(a.to_dict(), {"rule": R1, "line": 3, "message": "m", "suggestion": "s", "symbol": "sym"})
+        self.assertNotIn("subrule", repr(a))
+        c = proof_health.ProofHealthFinding(
+            R6, 3, "m", "s", "sym", subrule="drifted_waiver_pin", expected_pin="pin:sha256:0123456789ab"
+        )
+        self.assertNotEqual(c, proof_health.ProofHealthFinding(R6, 3, "m", "s", "sym"))
+        self.assertEqual(c.to_dict()["subrule"], "drifted_waiver_pin")
+        self.assertNotIn("actual_pin", c.to_dict())
+        self.assertIn("expected_pin='pin:sha256:0123456789ab'", repr(c))
+        with self.assertRaises(AttributeError):
+            c.subrule = "x"  # type: ignore[misc]
+        with self.assertRaises(TypeError):
+            proof_health.ProofHealthFinding(R1, 3, "m", "s", "sym", "positional-subrule")  # type: ignore[misc]
+
+    def test_rule_registry_and_cache_format_version(self) -> None:
+        self.assertEqual(proof_health.ALL_RULES[:5], (R1, R2, R3, R4, R5))
+        self.assertEqual(proof_health.ALL_RULES[5:], (R6, R7))
+        self.assertGreaterEqual(proof_health.CACHE_FORMAT_VERSION, 7)
+        counts = proof_health.count_findings_by_rule([])
+        self.assertEqual(counts[R6], 0)
+        self.assertEqual(counts[R7], 0)
+
+    def test_rule6_waiver_subrules_in_scan_lean_text(self) -> None:
+        pinned = pin_lean_decl(_PINNED_DOC, "def pinnedMagic : Nat := 7\n")
+        self.assertEqual(scan67(pinned), [])
+        cases = {
+            "unpinned_waiver": "/-- anneal:documented_intent kept for ABI parity -/\ndef unpinnedMagic : Nat := 7\n",
+            "drifted_waiver_pin": pinned.replace(":= 7", ":= 8"),
+            "malformed_waiver_pin": pinned.replace("pin:sha256:", "pin:sha256:zz", 1),
+            "dangling_waiver": "/-! anneal:documented_intent module-wide -/\ndef x : Nat := 0\n",
+            "invalid_waiver_syntax": "/-- anneal:trusted reason = -/\ndef y : Nat := 0\n",
+        }
+        for subrule, src in cases.items():
+            got = scan67(src)
+            self.assertEqual([(r, s) for r, s, _ in got], [(R6, subrule)], (subrule, got))
+        drifted = [
+            f for f in proof_health.scan_lean_text(cases["drifted_waiver_pin"], scan_siblings=False) if f.rule == R6
+        ][0]
+        self.assertTrue(drifted.expected_pin.startswith("pin:sha256:"))
+        self.assertTrue(drifted.actual_pin.startswith("pin:sha256:"))
+        self.assertNotEqual(drifted.expected_pin, drifted.actual_pin)
+        self.assertEqual(drifted.tier, "S3")
+
+    def test_rule7_default_scope_vs_all_theorems(self) -> None:
+        smoke = "theorem trivial_witness : True := trivial\n"
+        self.assertEqual(scan67(smoke), [])
+        self.assertEqual(
+            scan67(smoke, include_unannotated_vacuity=True), [(R7, audit.RULE_TRIVIAL_CONCLUSION, 1)]
+        )
+        # Named contradictory hypotheses are always flagged; anonymous `→` premises only in
+        # the full audit (annotated theorems or `--all-theorems`).
+        self.assertEqual(
+            scan67("theorem v (n : Nat) (h : 5 < 3) : n = n := rfl\n"),
+            [(R7, audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, 1)],
+        )
+        arrow = "theorem a : False → True := fun h => False.elim h\n"
+        self.assertEqual(scan67(arrow), [])
+        self.assertIn(
+            (R7, audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, 1),
+            scan67(arrow, include_unannotated_vacuity=True),
+        )
+        # Annotated theorems get every check by default.
+        self.assertEqual(
+            scan67(_META + "theorem t (n : Nat) : n = n := rfl\n"),
+            [(R7, audit.RULE_TRIVIAL_CONCLUSION, 4)],
+        )
+        helper = "/-- Kind: helper\nWitness: universal\nAssumes: S0 -/\ntheorem t (n : Nat) : n = n := rfl\n"
+        self.assertEqual(scan67(helper), [])
+        negative = "/-- Kind: safety\nWitness: negative\nAssumes: S0 -/\ntheorem t : ¬ False := fun h => h\n"
+        self.assertEqual(scan67(negative), [])
+        # `Proof/` claim theorems (`verified`, `prove_*`) get every check by default.
+        claim = "theorem verified : True := trivial\n"
+        self.assertEqual(scan67(claim, file_path="proofs/Proof/Demo/Foo.lean"), [(R7, audit.RULE_TRIVIAL_CONCLUSION, 1)])
+        self.assertEqual(scan67(claim, file_path="theory/Demo/Foo.lean"), [])
+        self.assertEqual(scan67("theorem helper_lemma : True := trivial\n", file_path="proofs/Proof/Foo.lean"), [])
+
+    def test_scan_rust_text_rule6_and_fast_path_soundness(self) -> None:
+        item = "/// anneal:documented_intent kept for FFI parity\npub fn ffi_magic() -> u32 { 7 }\n"
+        self.assertEqual([(f.rule, f.subrule) for f in proof_health.scan_rust_text(item)], [(R6, "unpinned_waiver")])
+        self.assertEqual(proof_health.scan_rust_text(pin_rust_snippet(item.split("\n")[0], "pub fn ffi_magic() -> u32 { 7 }")), [])
+        escaped = '#[doc = "anneal\\x3adocumented_intent hidden"]\npub fn g() {}\n'
+        self.assertEqual([f.subrule for f in proof_health.scan_rust_text(escaped)], ["unpinned_waiver"])
+        computed = '#[doc = include_str!("README.md")]\npub fn f() {}\n'
+        self.assertEqual([f.subrule for f in proof_health.scan_rust_text(computed)], ["invalid_waiver_syntax"])
+        self.assertEqual(proof_health.scan_rust_text("pub fn plain() {}\n"), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "lib.rs"
+            p.write_text(item, encoding="utf-8")
+            self.assertEqual([f.rule for f in proof_health.scan_file(p)], [R6])
+
+    def test_post_edit_deltas_for_rule6_and_rule7_on_lean_and_rust(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache.json"
+            lean = Path(tmp) / "Demo.lean"
+            before = "theorem ok (n : Nat) : n + 0 = n := Nat.add_zero n\n"
+            after = before + "/-- anneal:documented_intent kept -/\ndef magic : Nat := 7\n"
+            after += "theorem vac (n : Nat) (h : 0 = 1) : n = n := rfl\n"
+            lean.write_text(after, encoding="utf-8")
+            res = proof_health.evaluate_post_edit_proof_health(
+                lean, None, after_text=after, before_text=before, cache_path=cache, scan_siblings=False
+            )
+            self.assertEqual(res["deltas"][R6], 1)
+            self.assertEqual(res["deltas"][R7], 1)
+            self.assertIn(R6, res["feedback"])
+            self.assertIn(R7, res["feedback"])
+            self.assertEqual({f.subrule for f in res["new_findings"]}, {"unpinned_waiver", "syntactic_contradiction_hypothesis"})
+
+            rs = Path(tmp) / "lib.rs"
+            rs_before = "pub fn f() {}\n"
+            rs_after = "/// anneal:documented_intent kept\npub fn f() {}\n"
+            rs.write_text(rs_after, encoding="utf-8")
+            res_rs = proof_health.evaluate_post_edit_proof_health(
+                rs, None, after_text=rs_after, before_text=rs_before, cache_path=cache
+            )
+            self.assertEqual(res_rs["deltas"][R6], 1)
+            self.assertEqual([f.subrule for f in res_rs["new_findings"]], ["unpinned_waiver"])
+
+    def test_cli_compute_pins_all_theorems_and_directory_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg" / ".hidden").mkdir(parents=True)
+            (root / "pkg" / "target").mkdir()
+            (root / "pkg" / "A.lean").write_text("theorem smoke : True := trivial\n", encoding="utf-8")
+            item = "/// anneal:documented_intent kept for FFI parity"
+            (root / "pkg" / "lib.rs").write_text(pin_rust_snippet(item, "pub fn f() {}"), encoding="utf-8")
+            (root / "pkg" / ".hidden" / "B.lean").write_text("theorem v (h : 0 = 1) : True := trivial\n")
+            (root / "pkg" / "target" / "gen.rs").write_text("/// anneal:documented_intent x\npub fn g() {}\n")
+
+            def run(*argv: str) -> tuple[int, dict]:
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    rc = proof_health.main(list(argv))
+                return rc, json.loads(buf.getvalue())
+
+            rc, payload = run("--json", str(root / "pkg"))
+            self.assertEqual((rc, payload["ok"], payload["files_scanned"]), (0, True, 2))
+            rc, payload = run("--json", "--all-theorems", str(root / "pkg"))
+            self.assertEqual((rc, payload["finding_count"]), (1, 1))
+            self.assertEqual(payload["findings"][0]["subrule"], audit.RULE_TRIVIAL_CONCLUSION)
+            self.assertEqual(payload["counts"][R7], 1)
+            rc, pins = run("--compute-pins", "--json", str(root / "pkg" / "A.lean"))
+            self.assertEqual(rc, 0)
+            text = (root / "pkg" / "A.lean").read_text(encoding="utf-8")
+            self.assertEqual(pins, {str(root / "pkg" / "A.lean"): proof_health.compute_lean_decl_pins(text)})
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                self.assertEqual(proof_health.main([str(root / "pkg" / "A.lean"), "--all-theorems"]), 1)
+            self.assertIn(f"[{R7}/{audit.RULE_TRIVIAL_CONCLUSION}]", buf.getvalue())
+            result = subprocess.run(
+                [sys.executable, "-B", str(SERVER_DIR / "proof_health.py"), "--json", str(root / "pkg")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["ok"])
+
+    def test_scan_result_cache_tracks_content_and_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "A.lean", Path(tmp) / "B.lean"
+            a.write_text("private theorem dup_name : 1 + 1 = 2 := rfl\n", encoding="utf-8")
+            b.write_text("private theorem dup_name : 1 + 1 = 2 := rfl\n", encoding="utf-8")
+            first = proof_health.scan_lean_file(a)
+            self.assertTrue(any(f.rule == R5 for f in first))
+            self.assertEqual(proof_health.scan_lean_file(a), first)  # memo hit
+            self.assertTrue(proof_health._SCAN_RESULT_CACHE)
+            # Same-size sibling rewrite inside the racy mtime window must invalidate the memo.
+            b.write_text("private theorem dup_nam2 : 1 + 1 = 3 := rfl\n", encoding="utf-8")
+            self.assertFalse(any(f.rule == R5 for f in proof_health.scan_lean_file(a)))
+            # Content edits of the scanned file are separate memo keys.
+            a.write_text("private theorem other : 2 + 2 = 4 := rfl\n", encoding="utf-8")
+            self.assertEqual(proof_health.scan_lean_file(a), [])
+            proof_health.clear_in_process_caches()
+            self.assertFalse(proof_health._SCAN_RESULT_CACHE)
+            self.assertFalse(proof_health._THM_AUDIT_CACHE)
+
+    def test_dogfood_bytecodec_and_adt_and_control_warm_under_5ms(self) -> None:
+        for path in (EPISODE1_BYTECODEC, EPISODE1_ADT_AND_CONTROL):
+            self.assertEqual(proof_health.scan_lean_file(path), [], path.name)
+            elapsed_ms = best_of_ms(lambda: proof_health.scan_lean_file(path, scan_siblings=True))
+            self.assertLess(elapsed_ms, 5.0, f"{path.name} warm scan took {elapsed_ms:.2f} ms")
+
+    def test_shared_auditor_section_byte_identical_and_check_trusted_stdlib_only(self) -> None:
+        import ast
+
+        ph_text = (SERVER_DIR / "proof_health.py").read_text(encoding="utf-8")
+        ct_text = CHECK_TRUSTED_PATH.read_text(encoding="utf-8")
+        self.assertEqual(_shared_section(ph_text), _shared_section(ct_text))
+        allowed = {
+            "__future__", "argparse", "bisect", "hashlib", "json", "os", "pathlib", "re", "shutil",
+            "stat", "subprocess", "sys", "tempfile", "time", "tomllib", "typing",
+            # `--self-test` only: the fixture harness in `tests/trusted-boundary/`.
+            "test_boundary",
+        }
+        imported = set()
+        for node in ast.walk(ast.parse(ct_text)):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertLessEqual(imported, allowed, imported - allowed)
+        self.assertNotIn("importlib", imported)  # no dynamic loading of untrusted helpers
+
+    def test_check_trusted_auditor_agrees_with_proof_health(self) -> None:
+        ct = _load_check_trusted()
+        lean_corpus = [
+            pin_lean_decl(_PINNED_DOC, "def pinnedMagic : Nat := 7\n"),
+            "/-- anneal:documented_intent kept -/\ndef m : Nat := 7\n",
+            _META + "theorem t (n : Nat) (h : 0 = 1) : n = n := rfl\n",
+            "theorem smoke : True := trivial\n",
+            EPISODE1_BYTECODEC.read_text(encoding="utf-8"),
+        ]
+        for text in lean_corpus:
+            self.assertEqual(ct.compute_lean_decl_pins(text), proof_health.compute_lean_decl_pins(text))
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line) for f in ct.audit_lean_text(text, vacuity_scope=scope)],
+                    [(f.rule, f.line) for f in proof_health.audit_lean_text(text, vacuity_scope=scope)],
+                )
+        rust = "/// anneal:documented_intent kept\npub fn f() {}\n"
+        self.assertEqual(ct.compute_rust_item_pins(rust), proof_health.compute_rust_item_pins(rust))
+        self.assertEqual(
+            [(f.rule, f.line) for f in ct.audit_rust_text(rust)],
+            [(f.rule, f.line) for f in proof_health.audit_rust_text(rust)],
+        )
+
+    def test_repo_lean_files_default_scope_has_no_rule6_or_rule7_findings(self) -> None:
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "ls-files", "*.lean"], capture_output=True, text=True, check=True
+            ).stdout.split("\n")
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git ls-files unavailable")
+        hits = []
+        for rel in filter(None, listed):
+            path = REPO_ROOT / rel
+            if not path.is_file():
+                continue
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            hits.extend(
+                (rel, f.line, f.subrule)
+                for f in proof_health._lean_waiver_and_vacuity_findings(text, file_path=path)
+            )
+        self.assertEqual(hits, [])
 
 
 if __name__ == "__main__":

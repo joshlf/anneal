@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -269,6 +270,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             policy.write_bytes(policy_bytes)
             tool.write_bytes(tool_bytes)
         staged_source = checker.source_copy / "Trusted.lean"
+        # Staged inputs are read-only (Group 18); model a child that defeats the mode bits.
+        staged_source.chmod(0o644)
         staged_source.write_text(header + "def changedInStage : Nat := 9\n")
         try:
             checker.freshness()
@@ -576,6 +579,153 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             raise AssertionError("Specs.Demo.foo with native_decide was accepted under allowProvisionalNative=True")
         shutil.rmtree(prov_checker.stage)
         done("provisional native_decide rejected by default and scoped to Proof.* in preflight")
+
+        # Group 18: S0-S3 waiver pins (`waiver-pin`), annotated-claim non-vacuity
+        # (`vacuity-audit`), read-only staged inputs, and `--base-snapshot` TCB drift.
+        def lean_pinned(doc_lines, decl):
+            body = "\n".join(doc_lines)
+            name = decl.split()[1]
+            tag = runner.compute_lean_decl_pins(f"/--\n{body}\n-/\n{decl}")[name]
+            return f"/--\n{body}\n{tag}\n-/\n{decl}"
+
+        def expect_failure(action, code, phase, *needles):
+            try:
+                action()
+            except runner.Failure as error:
+                assert error.code == code and error.phase == phase, (error.code, error.phase, str(error))
+                for needle in needles:
+                    assert needle in str(error), (needle, str(error))
+                return error
+            raise AssertionError(f"expected {code}/{phase} rejection, got success")
+
+        pinned = lean_pinned(["Pinned layout constant.", "anneal:pinned_compiler_coupled rustc 1.90 layout"],
+                             "def pinnedMagic : Nat := 7\n")
+        vacuous = ("/-- Kind: safety\nWitness: universal\nAssumes: S0 -/\n"
+                   "theorem vacuousClaim (n : Nat) (h : 0 = 1) : n = n := rfl\n")
+        # 18a. A pinned waiver and an unannotated smoke lemma in a staged Trusted source pass.
+        report = checked(fixture(header + pinned + "theorem trivial_witness : True := trivial\n"))
+        assert report["waiverVacuityAudit"]["trusted"] == {"leanFiles": 1, "rustFiles": 0}
+        # 18b. Unpinned / drifted / malformed / dangling / unauditable waivers and an annotated
+        # vacuous claim in staged Trusted sources are rejected before any compilation.
+        for subrule, source in {
+            "unpinned_waiver": "/-- anneal:documented_intent kept for ABI parity -/\ndef unpinnedMagic : Nat := 7\n",
+            "drifted_waiver_pin": pinned.replace(":= 7", ":= 8"),
+            "malformed_waiver_pin": pinned.replace("pin:sha256:", "pin:sha256:zz", 1),
+            "dangling_waiver": "/-! anneal:documented_intent module-wide -/\ndef x : Nat := 0\n",
+            "invalid_waiver_syntax": "/-- anneal:trusted reason = -/\ndef y : Nat := 0\n",
+        }.items():
+            err = checked(fixture(header + source), expected=1, phase="waiver-pin", executed=False)
+            assert f"[{subrule}]" in str(err) and "trusted/lean/Trusted.lean" in str(err), str(err)
+        err = checked(fixture(header + vacuous), expected=1, phase="vacuity-audit", executed=False)
+        assert "[syntactic_contradiction_hypothesis]" in str(err), str(err)
+
+        # 18c. trusted/rustc-capture Rust sources: an unpinned `///` waiver and an escaped
+        # `#[doc = "anneal\x3a..."]` directive are rejected; the pinned item passes the audit.
+        rs_item = "/// anneal:documented_intent kept for FFI parity\npub fn ffi_magic() -> u32 { 7 }\n"
+        rs_tag = next(iter(runner.compute_rust_item_pins(rs_item).values()))
+        rs_pinned = rs_item.replace("\npub fn", f"\n/// {rs_tag}\npub fn", 1)
+        for rs_source, needle in ((rs_item, "[unpinned_waiver]"),
+                                  ('#[doc = "anneal\\x3adocumented_intent hidden"]\npub fn g() {}\n', "[unpinned_waiver]")):
+            root = fixture()
+            (root / "trusted/rustc-capture/src").mkdir(parents=True)
+            (root / "trusted/rustc-capture/src/lib.rs").write_text(rs_source)
+            err = checked(root, expected=1, phase="waiver-pin", executed=False)
+            assert needle in str(err) and "trusted/rustc-capture/src/lib.rs" in str(err), str(err)
+        (root / "trusted/rustc-capture/src/lib.rs").write_text(rs_pinned)
+        assert runner.audit_waivers_and_vacuity(runner.rustc_capture_sources(root), vacuity=False) == {
+            "leanFiles": 0, "rustFiles": 1}
+
+        # 18d. DOWNSTREAM_TARGETS: staged downstream copies are read-only and audited before
+        # downstream compilation (unpinned waiver in the claim module, vacuous annotated test).
+        for claim_extra, test_a, phase, needle in (
+            ("/-- anneal:documented_intent smoke -/\ndef smokeMagic : Nat := 1\n", None, "waiver-pin", "[unpinned_waiver]"),
+            ("", "prelude\nimport Anneal\n" + vacuous, "vacuity-audit", "[syntactic_contradiction_hypothesis]"),
+        ):
+            root, targets = setup_downstream_fixture(
+                "prelude\nimport Anneal\ntheorem valid_claim : TrustedClaim := Anneal.witness\n" + claim_extra,
+                test_a_source=test_a,
+            )
+            with patch.object(runner, "DOWNSTREAM_TARGETS", targets):
+                ds_checker = runner.Checker(root, lean, temp_parent=suite, fast=("--fast" in sys.argv))
+                disposable.append(ds_checker.stage)
+                expect_failure(lambda: ds_checker.run(check_downstream=True), 1, phase, needle)
+            staged_downstream = [p for p in (ds_checker.stage / "downstream-source").rglob("*") if p.is_file()]
+            assert staged_downstream and all(stat.S_IMODE(p.stat().st_mode) == 0o444 for p in staged_downstream)
+            assert not any(name.endswith("-compile-SmokeTest.status.json")
+                           for name in (p.name for p in ds_checker.stage.glob("*.status.json")))
+
+        # 18e. CaptureManifest.json: Rust sources and Mir/<Item>.lean targets are audited after
+        # their digests match.
+        manifest_dir = suite / "manifest-waiver-fixture"
+        (manifest_dir / "src").mkdir(parents=True)
+        (manifest_dir / "Mir").mkdir(parents=True)
+        rs_file, mir_file = manifest_dir / "src/lib.rs", manifest_dir / "Mir/Foo.lean"
+        manifest_path = manifest_dir / "CaptureManifest.json"
+
+        def write_manifest(rs_text, mir_text):
+            rs_file.write_text(rs_text)
+            mir_file.write_text(mir_text)
+            manifest_path.write_text(json.dumps({
+                "schema": 1, "compilation_succeeded": True,
+                "rust_sources": [["src/lib.rs", runner.digest(rs_file)]],
+                "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Foo.lean",
+                             "mir_module_sha256": runner.digest(mir_file)}],
+            }))
+
+        write_manifest(rs_pinned, "def claim : Prop := True\n")
+        assert runner.verify_capture_manifest(manifest_path, manifest_dir)["compilation_succeeded"] is True
+        write_manifest(rs_item, "def claim : Prop := True\n")
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "waiver-pin",
+                       "src/lib.rs", "[unpinned_waiver]")
+        write_manifest(rs_pinned, vacuous)
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "vacuity-audit",
+                       "Mir/Foo.lean", "[syntactic_contradiction_hypothesis]")
+        shutil.rmtree(manifest_dir)
+
+        # 18f. Staged inspector and Trusted source copies are read-only (0444) from admission on.
+        ro_checker = runner.Checker(fixture(), lean, temp_parent=suite)
+        disposable.append(ro_checker.stage)
+        ro_checker.tool_admission()
+        staged_inputs = [ro_checker.inspector, *(p for p in ro_checker.source_copy.rglob("*") if p.is_file())]
+        assert len(staged_inputs) >= 2 and all(stat.S_IMODE(p.stat().st_mode) == 0o444 for p in staged_inputs)
+        if os.geteuid() != 0:
+            try:
+                (ro_checker.source_copy / "Trusted.lean").write_text(header + "def tampered : Nat := 1\n")
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("staged Trusted source copy was writable")
+        runner.make_tree_writable(ro_checker.stage)
+        assert all(p.stat().st_mode & stat.S_IWUSR for p in staged_inputs)
+
+        # 18g. --base-snapshot: identical TCB passes; drift, additions, writable snapshots fail;
+        # explicitly expected drift passes.
+        root = fixture(header + pinned)
+        snap = suite / "base-snapshot"
+        for rel, path in runner.tcb_snapshot_files(root).items():
+            (snap / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, snap / rel)
+            (snap / rel).chmod(0o444)
+        base_checker = runner.Checker(root, lean, temp_parent=suite, fast=("--fast" in sys.argv), base_snapshot=snap)
+        disposable.append(base_checker.stage)
+        assert len(base_checker.run()["baseSnapshotSha256"]) == 64
+        (root / "trusted/lean/Trusted.lean").write_text(header + pinned + "def drifted : Nat := 1\n")
+        drift_checker = runner.Checker(root, lean, temp_parent=suite, base_snapshot=snap)
+        disposable.append(drift_checker.stage)
+        expect_failure(drift_checker.run, 1, "base-snapshot", "changed: trusted/lean/Trusted.lean")
+        assert drift_checker.execution_began is False and not list(drift_checker.stage.glob("*.status.json"))
+        (root / "trusted/lean/Trusted/Extra.lean").parent.mkdir(parents=True)
+        (root / "trusted/lean/Trusted/Extra.lean").write_text(header)
+        expect_failure(lambda: runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",)),
+                       1, "base-snapshot", "absent from base snapshot: trusted/lean/Trusted/Extra.lean")
+        shutil.rmtree(root / "trusted/lean/Trusted")
+        assert set(runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",))) == set(
+            runner.tcb_snapshot_files(snap))
+        (snap / "trusted/lean/lean-toolchain").chmod(0o644)
+        expect_failure(lambda: runner.verify_base_snapshot(root, snap, ("trusted/lean/Trusted.lean",)),
+                       2, "base-snapshot", "not read-only")
+        shutil.rmtree(snap)
+        done("waiver pins, annotated-claim vacuity, read-only staged inputs, and --base-snapshot TCB drift")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

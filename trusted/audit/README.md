@@ -54,3 +54,36 @@ When verifying a Rust crate, `trusted/audit/` is invoked as the final gate on
 5. **Deterministic TCB Audit Log emission:** Evaluates
    `(Mir.<Item>.claim.tcb).map (TCBEntry.render Crate.capture)` and emits the
    audit log.
+
+## Waiver pins, claim non-vacuity, read-only staging, and base snapshots
+
+`check_trusted.py` also embeds (as a single stdlib-only file; the section between
+the `BEGIN/END SHARED WAIVER-PIN & 3-AXIS AUDITOR` banners is byte-identical to the
+one in `tools/anneal-lsp/server/proof_health.py`) the `S0`-`S3` waiver auditor:
+
+- **`waiver-pin` (exit 1):** every `anneal:` waiver (`trusted reason = "..."`,
+  `allow_compile_time_guard`, `documented_intent <rationale>`,
+  `pinned_compiler_coupled <reason>`, the `trusted/rustc-capture/src/spec.rs`
+  grammar) in staged `trusted/lean/**/*.lean`, `trusted/rustc-capture/**/*.rs`,
+  staged `DOWNSTREAM_TARGETS`, and `CaptureManifest.json` `rust_sources` /
+  `Mir/<Item>.lean` targets must carry a standalone `pin:sha256:<12hex>` doc line
+  whose pre-image (canonical directives + normalized item) still matches. Unpinned,
+  malformed, drifted, dangling (module-doc), and unauditable (computed `#[doc]`)
+  waivers fail. `python3 tools/anneal-lsp/server/proof_health.py --compute-pins FILE`
+  prints the expected pins.
+- **`vacuity-audit` (exit 1):** theorems carrying 3-axis metadata (`Kind:`,
+  `Witness:`, `Assumes:`, `Subject:`) or an `anneal:` waiver docstring, and `Proof/`
+  claim theorems (`verified`, `prove_*`), must not have syntactically contradictory
+  hypotheses, trivial conclusions, tautological implications, unused subjects,
+  invalid or conflicting metadata, or `S0` padding-pin tier mismatches.
+- **Read-only staging:** staged copies of `TrustedBoundary.lean`, `trusted/lean/`,
+  and downstream sources are `0444` from the moment they are copied.
+- **`--base-snapshot DIR` / `ANNEAL_TRUSTED_BASE_SNAPSHOT` (`base-snapshot`):**
+  `DIR` mirrors checkout-relative paths of the TCB files
+  (`trusted/audit/{check_trusted.py,TrustedBoundary.lean}`, `trusted/lean/` lock
+  files, `lean-toolchain`, `Trusted.lean`, `Trusted/**/*.lean`,
+  `trusted/rustc-capture/Cargo.toml`) and must be read-only (exit 2 otherwise). Any
+  TCB file missing, added, or changed relative to it fails with exit 1 unless listed
+  with `--expected-tcb-drift RELPATH`.
+- **`--audit-vacuity`:** runs only the pure-Python waiver and vacuity audit over the
+  checkout (no Lean process).
