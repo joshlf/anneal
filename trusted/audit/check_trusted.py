@@ -210,6 +210,8 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         norm = os.path.normpath(rel)
         return norm == os.pardir or norm.startswith(os.pardir + os.sep)
 
+    root_resolved = root.resolve()
+    rust_audit_sources: list[tuple[str, Path]] = []
     for entry in manifest["rust_sources"]:
         if (not isinstance(entry, list) or len(entry) != 2
                 or not all(isinstance(x, str) and x for x in entry)
@@ -221,13 +223,17 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
         # entry, however, must not climb above the manifest root (`../escape.rs`).
         if not os.path.isabs(entry[0]) and climbs_above_root(entry[0]):
             raise Failure(1, phase, f"CaptureManifest.json rust_sources path escapes checkout: {entry[0]}")
-        src_path = (root / entry[0]).resolve()
+        raw_src = root / entry[0]
+        regular(raw_src, phase)
+        src_path = raw_src.resolve()
         regular(src_path, phase)
         if digest(src_path) != entry[1]:
             raise Failure(1, phase, f"Rust source digest mismatch for {entry[0]}")
+        rust_audit_sources.append((entry[0], src_path))
     if not isinstance(manifest["targets"], list) or not manifest["targets"]:
         raise Failure(1, phase, "CaptureManifest.json must record at least one verification target")
     seen_defs = set()
+    lean_audit_targets: list[tuple[str, Path]] = []
     for target in manifest["targets"]:
         if (not isinstance(target, dict)
                 or set(target) != {"def_id", "mir_module_path", "mir_module_sha256"}
@@ -238,21 +244,35 @@ def verify_capture_manifest(manifest_path: Path, root: Path) -> dict:
             raise Failure(1, phase, f"duplicate target def_id {target['def_id']}")
         seen_defs.add(target["def_id"])
         # Generated `Mir/<Item>.lean` modules live under the manifest root (cargo-anneal derives
-        # their module names from the relative path): absolute or root-escaping paths fail.
-        if os.path.isabs(target["mir_module_path"]) or climbs_above_root(target["mir_module_path"]):
+        # their module names from the relative path): absolute, root-escaping, symlinked, or
+        # non-`.lean` paths fail.
+        mir_rel = target["mir_module_path"]
+        if os.path.isabs(mir_rel) or climbs_above_root(mir_rel):
             raise Failure(
-                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {target['mir_module_path']}"
+                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}"
             )
-        mir_path = (root / target["mir_module_path"]).resolve()
+        if not mir_rel.endswith(".lean"):
+            raise Failure(
+                1, phase, f"CaptureManifest.json mir_module_path must be a .lean file: {mir_rel}"
+            )
+        raw_mir = root / mir_rel
+        regular(raw_mir, phase)
+        mir_path = raw_mir.resolve()
+        try:
+            mir_path.relative_to(root_resolved)
+        except ValueError:
+            raise Failure(
+                1, phase, f"CaptureManifest.json mir_module_path escapes checkout: {mir_rel}"
+            )
         regular(mir_path, phase)
         if digest(mir_path) != target["mir_module_sha256"]:
-            raise Failure(1, phase, f"Mir module digest mismatch for {target['mir_module_path']}")
-    # Waiver pins on the captured Rust sources; waiver pins plus annotated-claim
-    # non-vacuity on the `Mir/<Item>.lean` targets (after their digests matched).
-    audit_waivers_and_vacuity(
-        [(entry[0], (root / entry[0]).resolve()) for entry in manifest["rust_sources"]]
-        + [(t["mir_module_path"], (root / t["mir_module_path"]).resolve()) for t in manifest["targets"]]
-    )
+            raise Failure(1, phase, f"Mir module digest mismatch for {mir_rel}")
+        lean_audit_targets.append((mir_rel, mir_path))
+    # Waiver pins on the captured Rust sources (`lang="rust"` so included non-`.rs` files
+    # cannot evade `audit_rust_text`); waiver pins plus annotated-claim non-vacuity on the
+    # `Mir/<Item>.lean` targets (`lang="lean"`, after their digests matched).
+    audit_waivers_and_vacuity(rust_audit_sources, vacuity=False, lang="rust")
+    audit_waivers_and_vacuity(lean_audit_targets, vacuity=True, lang="lean")
     return manifest
 
 
@@ -2826,17 +2846,24 @@ def _find_lean_decl_end(
         line_indent = len(ws)
         if text is not None and line_indent > decl_indent:
             # A block comment opened on this very line (`/- c -/ def next`) is blanked to spaces
-            # in `code_only`; its opening column is the line's indentation. Any other mismatch
-            # (the tail of a multi-line comment opened on an earlier line, a string continuation)
-            # keeps the `code_only` column, which is never smaller, so a body line indented deeper
-            # than the declaration is never misread as a sibling command (no premature span end,
-            # hence no pin bypass): over-inclusion is a false drift, under-inclusion a bypass.
+            # in `code_only`; its opening column is the line's indentation only when at most one
+            # space separates `-/` from the command token and the preceding non-empty line in
+            # `code_only` is not `where` (so `where\n/- c -/  def helper` keeps `def helper`
+            # inside the declaration's `where` block).
             line_start = m.start() + 1
             q = line_start
             while q < cand and text[q] in " \t":
                 q += 1
-            if q < cand and text.startswith("/-", q):
-                line_indent = q - line_start
+            if q < cand and text.startswith("/-", q) and (
+                text.endswith("-/", line_start, cand) or text.endswith("-/ ", line_start, cand)
+            ):
+                prev_end = m.start()
+                while prev_end > after_hdr_pos and code_only[prev_end - 1] in " \t\r\n":
+                    prev_end -= 1
+                prev_nl = code_only.rfind("\n", after_hdr_pos, prev_end)
+                prev_line = code_only[prev_nl + 1 if prev_nl != -1 else after_hdr_pos : prev_end].strip()
+                if prev_line != "where" and not prev_line.endswith(" where"):
+                    line_indent = q - line_start
         if line_indent > decl_indent:
             pos = cand + 1
             continue
@@ -4227,23 +4254,48 @@ def _find_incremental_lean_window(
 
     def _backup_col0_decl(kw_pos: int) -> int | None:
         pos = kw_pos
+        first_step = True
         while True:
             idx = _wa_bisect_right(c_ends, pos) - 1
-            if idx >= 0 and pos - c_ends[idx] <= 64 and old_code[c_ends[idx] : pos].strip() == "":
+            if (
+                idx >= 0
+                and (first_step or pos - c_ends[idx] <= 64)
+                and old_code[c_ends[idx] : pos].strip() == ""
+            ):
                 c0 = c_starts[idx]
                 nl = old_code.rfind("\n", 0, c0)
                 pos = 0 if nl == -1 else nl + 1
+                first_step = False
             else:
                 break
         if pos > 0 and (old_text[pos - 1] != "\n" or old_code[pos - 1] != "\n"):
             return None
-        prev_nl = old_code.rfind("\n", 0, pos - 1) if pos > 0 else -1
-        prev_line = old_code[prev_nl + 1 : pos - 1].strip() if pos > 0 else ""
-        if prev_line.startswith("@") or prev_line.startswith("where"):
-            return None
+        if pos > 0:
+            q = pos - 1
+            while q > 0 and old_code[q - 1] in " \t\r\n":
+                q -= 1
+            prev_nl = old_code.rfind("\n", 0, q)
+            prev_line = old_code[prev_nl + 1 : q].strip()
+            if (
+                prev_line.startswith("@")
+                or prev_line.endswith("]")
+                or prev_line == "where"
+                or prev_line.startswith("where ")
+                or prev_line.endswith(" where")
+                or prev_line.endswith(" in")
+                or any(
+                    prev_line == mod or prev_line.startswith(mod + " ") or prev_line.endswith(" " + mod)
+                    for mod in _LEAN_MODIFIERS
+                )
+            ):
+                return None
         return pos
 
-    i_lo = _wa_bisect_right(col0_thms, p) - 1
+    # `col0_thms[i_lo]` may be the theorem whose body/header contains `p`, so skip `i_lo`
+    # and start searching for `cut_lo` at `i_lo - 1` (ensuring at least one full unmodified
+    # theorem sits between `cut_lo` and `col0_thms[i_lo]`, keeping all of `col0_thms[i_lo]`'s
+    # preceding docstrings, attributes, and modifiers strictly inside `[cut_lo, cut_hi_old)`).
+    i_lo = _wa_bisect_right(col0_thms, p) - 2
     cut_lo: int | None = None
     safe_lo: int | None = None
     while i_lo >= 0:
@@ -4256,8 +4308,11 @@ def _find_incremental_lean_window(
                 break
         i_lo -= 1
 
+    # Similarly, an edit ending at `s` may edit or insert a docstring/attribute that attaches
+    # forward across whitespace/modifiers to `col0_thms[i_hi]`, so skip `i_hi` and start
+    # searching for `cut_hi_old` at `i_hi + 1`.
     n_thms = len(col0_thms)
-    i_hi = _wa_bisect_right(col0_thms, s - 1 if s > 0 else 0)
+    i_hi = _wa_bisect_right(col0_thms, s - 1 if s > 0 else 0) + 1
     cut_hi_old: int | None = None
     safe_hi_old: int | None = None
     while i_hi < n_thms:
@@ -4282,21 +4337,23 @@ def _find_incremental_lean_window(
     safe_hi_new = safe_hi_old + delta_len
     cut_hi_new = cut_hi_old + delta_len
 
-    # The window must leave the lexer in its neutral state: the text after the window is
-    # unchanged and was lexed from a neutral state (`safe_hi_old` is a column-0 line start
-    # before a theorem's leading comments), so only then does the rest of the file lex exactly
-    # as before. A bounded lookahead cannot decide this when it covers only comment bytes (an
-    # unterminated string opened inside the window stays blank there and may swallow everything
-    # after it), so lex the window followed by a plain sentinel line, which survives verbatim
-    # exactly when no string literal or block comment is still open at the window end.
+    # Both `cut_hi_new` and `safe_hi_new` must be in the neutral lexer state: the outer ring
+    # `text[cut_hi_new:safe_hi_new]` must lex identically to `old_code[cut_hi_old:safe_hi_old]`
+    # with no comment crossing `cut_hi_new`, and the sentinel after `safe_hi_new` must survive
+    # verbatim with no comment crossing `win_len` (catching both strings that stay open past
+    # `safe_hi_new` and strings that swallow `cut_hi_new` before closing at a quote inside a
+    # comment in `[cut_hi_new, safe_hi_new)`).
     win_len = safe_hi_new - safe_lo
+    cut_hi_rel = cut_hi_new - safe_lo
     sentinel = "\nzzIncrementalLexSentinelzz"
     win_sent_code, win_sent_comments = _scan_lean_comments_and_strings(
         text[safe_lo:safe_hi_new] + sentinel
     )
     if len(win_sent_code) != win_len + len(sentinel) or not win_sent_code.endswith(sentinel):
         return None
-    if any(ce > win_len for _, ce, _, _, _ in win_sent_comments):
+    if win_sent_code[cut_hi_rel:win_len] != old_code[cut_hi_old:safe_hi_old]:
+        return None
+    if any((cs < cut_hi_rel < ce) or (ce > win_len) for cs, ce, _, _, _ in win_sent_comments):
         return None
 
     win_code = win_sent_code[:win_len]
@@ -4748,10 +4805,13 @@ _MAX_REPORTED_FINDINGS = 5
 _WRITE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
 
 
-def audit_waivers_and_vacuity(sources, *, vacuity: bool = True) -> dict[str, int]:
+def audit_waivers_and_vacuity(
+    sources, *, vacuity: bool = True, lang: str | None = None
+) -> dict[str, int]:
     """Enforce waiver pins and annotated-claim non-vacuity on `(label, path)` sources.
 
-    `.rs` sources get the waiver-pin audit; `.lean` sources get the waiver-pin audit plus
+    `.rs` sources (or `lang="rust"`) get the waiver-pin audit; `.lean` sources (or
+    `lang="lean"`) get the waiver-pin audit plus
     (with `vacuity`) every 3-axis / `TRIVIAL_PROOF` check on theorems carrying 3-axis
     metadata (`Kind:` / `Witness:` / `Assumes:` / `Subject:`) or an `anneal:` waiver
     docstring, and on `Proof/` claim theorems, plus the syntactic hypothesis-contradiction
@@ -4771,7 +4831,8 @@ def audit_waivers_and_vacuity(sources, *, vacuity: bool = True) -> dict[str, int
             text = path.read_bytes().decode("utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as error:
             raise Failure(1, WAIVER_PIN_PHASE, f"cannot read {label} as UTF-8: {error}") from error
-        if path.suffix == ".rs":
+        is_rust = (lang == "rust") if lang is not None else (path.suffix == ".rs")
+        if is_rust:
             n_rust += 1
             findings = audit_rust_text(text, file_path=label)
         else:

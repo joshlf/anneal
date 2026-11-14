@@ -718,6 +718,37 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         }))
         expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
                        "mir_module_path escapes checkout")
+        # Non-.rs Rust source files (e.g. `include!("waivers.inc")`) in `rust_sources` are still
+        # audited as Rust, and non-.lean or symlinked `mir_module_path` entries are rejected.
+        inc_file = manifest_dir / "src/waivers.inc"
+        inc_file.write_text('/// anneal:trusted reason = "unpinned include"\npub unsafe fn bad() {}\n')
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [["src/waivers.inc", runner.digest(inc_file)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Foo.lean",
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "waiver-pin",
+                       "src/waivers.inc", "[unpinned_waiver]")
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [["src/lib.rs", runner.digest(rs_file)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Foo.rs",
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
+                       "must be a .lean file")
+        mir_link = manifest_dir / "Mir/Link.lean"
+        mir_link.symlink_to(mir_file)
+        manifest_path.write_text(json.dumps({
+            "schema": 1, "compilation_succeeded": True,
+            "rust_sources": [["src/lib.rs", runner.digest(rs_file)]],
+            "targets": [{"def_id": "crate::ffi_magic", "mir_module_path": "Mir/Link.lean",
+                         "mir_module_sha256": runner.digest(mir_file)}],
+        }))
+        expect_failure(lambda: runner.verify_capture_manifest(manifest_path, manifest_dir), 1, "manifest",
+                       "regular file")
+        mir_link.unlink()
         escape_rs.unlink()
         shutil.rmtree(manifest_dir)
 

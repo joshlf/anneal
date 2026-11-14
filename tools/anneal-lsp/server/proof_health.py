@@ -5182,17 +5182,24 @@ def _find_lean_decl_end(
         line_indent = len(ws)
         if text is not None and line_indent > decl_indent:
             # A block comment opened on this very line (`/- c -/ def next`) is blanked to spaces
-            # in `code_only`; its opening column is the line's indentation. Any other mismatch
-            # (the tail of a multi-line comment opened on an earlier line, a string continuation)
-            # keeps the `code_only` column, which is never smaller, so a body line indented deeper
-            # than the declaration is never misread as a sibling command (no premature span end,
-            # hence no pin bypass): over-inclusion is a false drift, under-inclusion a bypass.
+            # in `code_only`; its opening column is the line's indentation only when at most one
+            # space separates `-/` from the command token and the preceding non-empty line in
+            # `code_only` is not `where` (so `where\n/- c -/  def helper` keeps `def helper`
+            # inside the declaration's `where` block).
             line_start = m.start() + 1
             q = line_start
             while q < cand and text[q] in " \t":
                 q += 1
-            if q < cand and text.startswith("/-", q):
-                line_indent = q - line_start
+            if q < cand and text.startswith("/-", q) and (
+                text.endswith("-/", line_start, cand) or text.endswith("-/ ", line_start, cand)
+            ):
+                prev_end = m.start()
+                while prev_end > after_hdr_pos and code_only[prev_end - 1] in " \t\r\n":
+                    prev_end -= 1
+                prev_nl = code_only.rfind("\n", after_hdr_pos, prev_end)
+                prev_line = code_only[prev_nl + 1 if prev_nl != -1 else after_hdr_pos : prev_end].strip()
+                if prev_line != "where" and not prev_line.endswith(" where"):
+                    line_indent = q - line_start
         if line_indent > decl_indent:
             pos = cand + 1
             continue
@@ -6583,23 +6590,48 @@ def _find_incremental_lean_window(
 
     def _backup_col0_decl(kw_pos: int) -> int | None:
         pos = kw_pos
+        first_step = True
         while True:
             idx = _wa_bisect_right(c_ends, pos) - 1
-            if idx >= 0 and pos - c_ends[idx] <= 64 and old_code[c_ends[idx] : pos].strip() == "":
+            if (
+                idx >= 0
+                and (first_step or pos - c_ends[idx] <= 64)
+                and old_code[c_ends[idx] : pos].strip() == ""
+            ):
                 c0 = c_starts[idx]
                 nl = old_code.rfind("\n", 0, c0)
                 pos = 0 if nl == -1 else nl + 1
+                first_step = False
             else:
                 break
         if pos > 0 and (old_text[pos - 1] != "\n" or old_code[pos - 1] != "\n"):
             return None
-        prev_nl = old_code.rfind("\n", 0, pos - 1) if pos > 0 else -1
-        prev_line = old_code[prev_nl + 1 : pos - 1].strip() if pos > 0 else ""
-        if prev_line.startswith("@") or prev_line.startswith("where"):
-            return None
+        if pos > 0:
+            q = pos - 1
+            while q > 0 and old_code[q - 1] in " \t\r\n":
+                q -= 1
+            prev_nl = old_code.rfind("\n", 0, q)
+            prev_line = old_code[prev_nl + 1 : q].strip()
+            if (
+                prev_line.startswith("@")
+                or prev_line.endswith("]")
+                or prev_line == "where"
+                or prev_line.startswith("where ")
+                or prev_line.endswith(" where")
+                or prev_line.endswith(" in")
+                or any(
+                    prev_line == mod or prev_line.startswith(mod + " ") or prev_line.endswith(" " + mod)
+                    for mod in _LEAN_MODIFIERS
+                )
+            ):
+                return None
         return pos
 
-    i_lo = _wa_bisect_right(col0_thms, p) - 1
+    # `col0_thms[i_lo]` may be the theorem whose body/header contains `p`, so skip `i_lo`
+    # and start searching for `cut_lo` at `i_lo - 1` (ensuring at least one full unmodified
+    # theorem sits between `cut_lo` and `col0_thms[i_lo]`, keeping all of `col0_thms[i_lo]`'s
+    # preceding docstrings, attributes, and modifiers strictly inside `[cut_lo, cut_hi_old)`).
+    i_lo = _wa_bisect_right(col0_thms, p) - 2
     cut_lo: int | None = None
     safe_lo: int | None = None
     while i_lo >= 0:
@@ -6612,8 +6644,11 @@ def _find_incremental_lean_window(
                 break
         i_lo -= 1
 
+    # Similarly, an edit ending at `s` may edit or insert a docstring/attribute that attaches
+    # forward across whitespace/modifiers to `col0_thms[i_hi]`, so skip `i_hi` and start
+    # searching for `cut_hi_old` at `i_hi + 1`.
     n_thms = len(col0_thms)
-    i_hi = _wa_bisect_right(col0_thms, s - 1 if s > 0 else 0)
+    i_hi = _wa_bisect_right(col0_thms, s - 1 if s > 0 else 0) + 1
     cut_hi_old: int | None = None
     safe_hi_old: int | None = None
     while i_hi < n_thms:
@@ -6638,21 +6673,23 @@ def _find_incremental_lean_window(
     safe_hi_new = safe_hi_old + delta_len
     cut_hi_new = cut_hi_old + delta_len
 
-    # The window must leave the lexer in its neutral state: the text after the window is
-    # unchanged and was lexed from a neutral state (`safe_hi_old` is a column-0 line start
-    # before a theorem's leading comments), so only then does the rest of the file lex exactly
-    # as before. A bounded lookahead cannot decide this when it covers only comment bytes (an
-    # unterminated string opened inside the window stays blank there and may swallow everything
-    # after it), so lex the window followed by a plain sentinel line, which survives verbatim
-    # exactly when no string literal or block comment is still open at the window end.
+    # Both `cut_hi_new` and `safe_hi_new` must be in the neutral lexer state: the outer ring
+    # `text[cut_hi_new:safe_hi_new]` must lex identically to `old_code[cut_hi_old:safe_hi_old]`
+    # with no comment crossing `cut_hi_new`, and the sentinel after `safe_hi_new` must survive
+    # verbatim with no comment crossing `win_len` (catching both strings that stay open past
+    # `safe_hi_new` and strings that swallow `cut_hi_new` before closing at a quote inside a
+    # comment in `[cut_hi_new, safe_hi_new)`).
     win_len = safe_hi_new - safe_lo
+    cut_hi_rel = cut_hi_new - safe_lo
     sentinel = "\nzzIncrementalLexSentinelzz"
     win_sent_code, win_sent_comments = _scan_lean_comments_and_strings(
         text[safe_lo:safe_hi_new] + sentinel
     )
     if len(win_sent_code) != win_len + len(sentinel) or not win_sent_code.endswith(sentinel):
         return None
-    if any(ce > win_len for _, ce, _, _, _ in win_sent_comments):
+    if win_sent_code[cut_hi_rel:win_len] != old_code[cut_hi_old:safe_hi_old]:
+        return None
+    if any((cs < cut_hi_rel < ce) or (ce > win_len) for cs, ce, _, _, _ in win_sent_comments):
         return None
 
     win_code = win_sent_code[:win_len]

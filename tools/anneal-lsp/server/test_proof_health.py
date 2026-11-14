@@ -3987,6 +3987,93 @@ class TestB1IncrementalAndSpanSoundness(unittest.TestCase):
             _rules(audit.scan_lean_text(pinned2.replace(":= 1", ":= 999"), check_3axis=False)),
             [audit.RULE_DRIFTED_WAIVER_PIN],
         )
+        # Same-line `/- comment -/` at column 0 before an indented `where` auxiliary `def helper`
+        # must also keep `def helper` inside `pinned`'s span.
+        draft3 = (
+            "/-- anneal:documented_intent test\nPIN\n-/\n"
+            "def pinned3 : Nat :=\n  helper\nwhere\n/- single-line comment at col 0 -/  def helper : Nat := 1\n"
+        )
+        pinned3 = draft3.replace("PIN", audit.compute_lean_decl_pins(draft3.replace("PIN\n", ""))["pinned3"])
+        self.assertEqual(audit.scan_lean_text(pinned3, check_3axis=False), [])
+        self.assertEqual(
+            _rules(audit.scan_lean_text(pinned3.replace(":= 1", ":= 999"), check_3axis=False)),
+            [audit.RULE_DRIFTED_WAIVER_PIN],
+        )
+
+    def test_incremental_window_preserves_waivers_and_metadata_across_modifiers_and_blank_lines(self) -> None:
+        pad = "".join(f"theorem pad{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" for i in range(500))
+        binders = " ".join(f"(x{k} : Nat)" for k in range(15))
+
+        # 1. Editing the body of a waiver-pinned `noncomputable\ntheorem` or multi-line
+        # `@[aesop safe\n  [constructors]]\ntheorem` must not drop `RULE_DRIFTED_WAIVER_PIN`.
+        for prefix in ("noncomputable\n", "@[aesop safe\n  [constructors]]\n"):
+            draft_decl = (
+                "/-- anneal:documented_intent pinned theorem\nPIN_HERE\n-/\n"
+                + prefix
+                + f"theorem target_thm (n : Nat) {binders} : n + 0 = n := Nat.add_zero n\n\n"
+            )
+            pin_tag = proof_health.compute_lean_decl_pins(draft_decl.replace("PIN_HERE\n", ""))["target_thm"]
+            old_text = pad + draft_decl.replace("PIN_HERE", pin_tag) + pad
+            proof_health.clear_in_process_caches()
+            self.assertEqual(proof_health.scan_lean_text(old_text, file_path="F.lean", scan_siblings=False), [])
+            self.assertEqual(proof_health.audit_lean_text(old_text, file_path="G.lean"), [])
+            new_text = old_text.replace(":= Nat.add_zero n\n\ntheorem pad0", ":= by omega\n\ntheorem pad0", 1)
+            inc, cold, inc_a, cold_a = self._incremental_vs_cold(new_text)
+            self.assertTrue(any(r == R6 and s == audit.RULE_DRIFTED_WAIVER_PIN for r, s, *_ in cold))
+            self.assertEqual(inc, cold, prefix)
+            self.assertEqual(inc_a, cold_a, prefix)
+
+        # 2. Editing or inserting a 3-axis docstring above `noncomputable\ntheorem` or across
+        # >64 whitespace bytes before a plain column-0 `theorem` must not drop `RULE_TRIVIAL_CONCLUSION`.
+        for mid_block in (
+            "/-- Plain doc.\n-/\nnoncomputable\ntheorem target_thm (n : Nat) : n = n := rfl\n\n",
+            "/-- Plain doc.\n-/\n" + (" \n" * 40) + "theorem target_thm (n : Nat) : n = n := rfl\n\n",
+        ):
+            old_text = pad + mid_block + pad
+            proof_health.clear_in_process_caches()
+            self.assertEqual(proof_health.scan_lean_text(old_text, file_path="F.lean", scan_siblings=False), [])
+            self.assertEqual(
+                proof_health.audit_lean_text(old_text, file_path="G.lean", vacuity_scope="annotated"), []
+            )
+            new_text = old_text.replace(
+                "/-- Plain doc.\n-/",
+                "/-- Kind: safety\nWitness: universal\nAssumes: S0\nSubject: n -/",
+                1,
+            )
+            inc_s = self._key(proof_health.scan_lean_text(new_text, file_path="F.lean", scan_siblings=False))
+            inc_au = self._key(
+                proof_health.audit_lean_text(new_text, file_path="G.lean", vacuity_scope="annotated")
+            )
+            proof_health.clear_in_process_caches()
+            cold_s = self._key(proof_health.scan_lean_text(new_text, file_path="F.lean", scan_siblings=False))
+            cold_au = self._key(
+                proof_health.audit_lean_text(new_text, file_path="G.lean", vacuity_scope="annotated")
+            )
+            self.assertTrue(any(s == audit.RULE_TRIVIAL_CONCLUSION for _, s, *_ in cold_s))
+            self.assertEqual(inc_s, cold_s)
+            self.assertEqual(inc_au, cold_au)
+
+    def test_unterminated_string_closing_in_outer_ring_comment_falls_back(self) -> None:
+        # When an edit opens an unclosed string literal that swallows `cut_hi_new` and closes
+        # at a `"` inside a comment between `cut_hi_new` and `safe_hi_new`, the lexer is back in
+        # the neutral state at `safe_hi_new`, so checking only the end sentinel would miss that
+        # `cut_hi_new` was swallowed into the string literal.
+        pad = "".join(f"theorem pad{i} (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" for i in range(400))
+        mid = (
+            "theorem mid0 (n : Nat) : n + 0 = n := Nat.add_zero n\n\n"
+            "theorem mid1 (n : Nat) : n + 0 = n := Nat.add_zero n\n\n"
+            'theorem mid2 (n : Nat) (h : 0 = 1) : n = n := rfl -- one " quote here!\n\n'
+            "theorem mid3 (n : Nat) : n + 0 = n := Nat.add_zero n\n\n"
+        )
+        old_text = pad + "theorem target_edit (n : Nat) : n + 0 = n := Nat.add_zero n\n\n" + mid + pad
+        proof_health.clear_in_process_caches()
+        self.assertEqual(len(proof_health.scan_lean_text(old_text, file_path="F.lean", scan_siblings=False)), 1)
+        self.assertEqual(len(proof_health.audit_lean_text(old_text, file_path="G.lean")), 2)
+        new_text = old_text.replace(":= Nat.add_zero n\n\ntheorem mid0", ':= "at.add_zero n\n\ntheorem mid0', 1)
+        inc, cold, inc_a, cold_a = self._incremental_vs_cold(new_text)
+        self.assertEqual(cold, [])
+        self.assertEqual(inc, cold)
+        self.assertEqual(inc_a, cold_a)
 
 
 if __name__ == "__main__":
