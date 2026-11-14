@@ -2036,12 +2036,14 @@ def scan_lean_text(
 ) -> list[ProofHealthFinding]:
     """Scan Lean 4 source `text` and return all structural proof-health findings.
 
-    Results are memoized in `_SCAN_RESULT_CACHE`, keyed by the exact text, the options,
-    and (when the text can declare `private` items and siblings are scanned) the identity
-    of every sibling's cached declaration list, which is replaced whenever that sibling's
-    bytes change; an explicit `sibling_decls` list bypasses the memo.
+    Results are memoized in `_SCAN_RESULT_CACHE` for the exact text (looked up by a cheap
+    length / head / tail key, then confirmed by full text equality, so a hit never hashes a
+    megabyte-sized string), the options, and (when the text can declare `private` items and
+    siblings are scanned) the identity of every sibling's cached declaration list, which is
+    replaced whenever that sibling's bytes change; an explicit `sibling_decls` list bypasses
+    the memo.
     """
-    cache_key: tuple[str, str, bool, bool] | None = None
+    cache_key: tuple[int, str, str, str, bool, bool] | None = None
     sib_lists: tuple[list[PrivateDecl], ...] = ()
     sib_names: tuple[str, ...] = ()
     computed_siblings = False
@@ -2052,7 +2054,9 @@ def scan_lean_text(
             sib_lists = tuple(lst for _, lst in pairs)
             computed_siblings = True
         cache_key = (
-            text,
+            len(text),
+            text[:128],
+            text[-128:],
             str(file_path) if file_path is not None else "",
             bool(scan_siblings),
             bool(include_unannotated_vacuity),
@@ -2060,11 +2064,12 @@ def scan_lean_text(
         hit = _SCAN_RESULT_CACHE.get(cache_key)
         if (
             hit is not None
-            and hit[0] == sib_names
-            and len(hit[1]) == len(sib_lists)
-            and all(a is b for a, b in zip(hit[1], sib_lists))
+            and hit[0] == text
+            and hit[1] == sib_names
+            and len(hit[2]) == len(sib_lists)
+            and all(a is b for a, b in zip(hit[2], sib_lists))
         ):
-            return list(hit[2])
+            return list(hit[3])
     findings = _scan_lean_text_uncached(
         text,
         file_path=file_path,
@@ -2076,17 +2081,18 @@ def scan_lean_text(
     )
     if cache_key is not None:
         _SCAN_RESULT_CACHE.pop(cache_key, None)
-        _SCAN_RESULT_CACHE[cache_key] = (sib_names, sib_lists, tuple(findings))
+        _SCAN_RESULT_CACHE[cache_key] = (text, sib_names, sib_lists, tuple(findings))
         while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
             del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
     return findings
 
 
-# `scan_lean_text` memo: `(text, file_path, scan_siblings, include_unannotated_vacuity)` ->
-# `(sibling paths, sibling declaration lists, findings)`, least recently stored first.
+# `scan_lean_text` memo: `(len(text), text[:128], text[-128:], file_path, scan_siblings,
+# include_unannotated_vacuity)` -> `(text, sibling paths, sibling declaration lists, findings)`,
+# least recently stored first; a hit additionally requires full `text` equality.
 _SCAN_RESULT_CACHE: dict[
-    tuple[str, str, bool, bool],
-    tuple[tuple[str, ...], tuple[list[PrivateDecl], ...], tuple[ProofHealthFinding, ...]],
+    tuple[int, str, str, str, bool, bool],
+    tuple[str, tuple[str, ...], tuple[list[PrivateDecl], ...], tuple[ProofHealthFinding, ...]],
 ] = {}
 _SCAN_RESULT_CACHE_MAX = 32
 

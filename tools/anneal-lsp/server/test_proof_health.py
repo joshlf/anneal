@@ -3697,6 +3697,18 @@ class TestRules6And7Integration(unittest.TestCase):
             self.assertFalse(proof_health._SCAN_RESULT_CACHE)
             self.assertFalse(proof_health._THM_AUDIT_CACHE)
 
+    def test_scan_memo_never_confuses_same_length_texts(self) -> None:
+        # The memo is looked up by length / head / tail and confirmed by full text equality:
+        # two texts differing only in the middle (same length) keep their own results.
+        head = "theorem h0 : True := trivial\n" * 20
+        tail = "theorem t0 : True := trivial\n" * 20
+        bad = head + "theorem mid (n : Nat) (h : 0 = 1) : n = n := rfl\n" + tail
+        good = head + "theorem mid (n : Nat) (h : 0 = 0) : n = n := rfl\n" + tail
+        self.assertEqual(len(bad), len(good))
+        self.assertEqual([f.rule for f in proof_health.scan_lean_text(bad, scan_siblings=False)], [R7])
+        self.assertEqual(proof_health.scan_lean_text(good, scan_siblings=False), [])
+        self.assertEqual([f.rule for f in proof_health.scan_lean_text(bad, scan_siblings=False)], [R7])
+
     def test_dogfood_bytecodec_and_adt_and_control_warm_under_5ms(self) -> None:
         for path, anchor in (
             (EPISODE1_BYTECODEC, "theorem scalarValidRange_isExactWidth (sz : Nat)"),
