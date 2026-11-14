@@ -6,10 +6,10 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **A0 initial build** (to be finalized in round A4 with the GO / CONDITIONAL GO /
-NO-GO recommendation). All 299 declarations of the overlay are kernel-checked with axioms
-`⊆ {propext, Quot.sound}` — zero `Classical.choice`, zero `sorry`, zero `native_decide`
-(see §5).
+Status: **B1 adversarial critique & hardening pass** (to be finalized in round A4 with the
+GO / CONDITIONAL GO / NO-GO recommendation). All declarations of the overlay (including all
+84 pinned headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` —
+zero `Classical.choice`, zero `sorry`, zero `native_decide` (see §5).
 
 ## 1. What was built
 
@@ -41,14 +41,14 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 
 | ID | Severity | Unpatched baseline (theorem) | Repaired agreement (theorem) | Canaries |
 |----|----------|------------------------------|------------------------------|----------|
-| `DIV-MR-CALL-TARGET-LOCAL` | P0_soundness | `div_mr_call_target_local_trusted_baseline` / `_trusted_137` (Trusted returns **137**) | `div_mr_call_target_local_repaired_agrees` (`.ok 42`, 3-way with `Mach` / `MachTB`) | `div_mr_call_target_local_write_back_canary` (caller `_1`: 5→42, callee `_1 = 100` untouched; Trusted returns 5137 instead of 42100) |
+| `DIV-MR-CALL-TARGET-LOCAL` | P0_soundness | `div_mr_call_target_local_trusted_baseline` / `_trusted_137` (Trusted returns **137**) | `div_mr_call_target_local_repaired_agrees` (`.ok 42`, 3-way with `Mach` / `MachTB`) | `div_mr_call_target_local_write_back_canary` (caller `_1`: 5→42, callee `_1 = 100` untouched; Trusted returns 5137), `div_mr_call_target_local_reborrow_in_callee_canary` (`&mut *_2` + `Retag` inside callee), `reborrow_inherits_targetFrameDepth` (universal) |
 | `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` | P1_false_positive_ub | `div_mr_caller_borrow_across_scalar_call_trusted_ub` | `div_mr_caller_borrow_across_scalar_call_repaired_agrees` (`.ok 42`, 3-way) | `div_mr_caller_borrow_frame_isolation` (universal), `updateBorrowPermAtProjProto_other_frame`, `entryAccessTransitionProto_other_frame` |
-| `DIV-MR-TB-TWOPHASE-DIRECT-WRITE` | P1_soundness | already UB in `LM-3.3` `Trusted` (`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`) | `div_mr_tb_twophase_direct_write_repaired_agrees` (`.ub`, = `MachTB`, = `Trusted`) | pre-`LM-3.3` model `preserveReservedOnDirectWrite` returns 99 |
-| `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC` | P1_soundness | `div_mr_tb_fnentry_local_dealloc_trusted_ret` (Trusted returns 5) | `div_mr_tb_fnentry_local_dealloc_repaired_agrees` (`.ub` at root `Return`, = `MachTB`) | `_ub_at_return` (fault is exactly the terminator), `_callee_return_canary` (callee-frame `Return` faults; Trusted returns 5) |
-| `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` | P2_false_positive_ub | `Trusted.hasProtectedLocalBorrow` reports `true` (`div_mr_tb_unsafecell_storage_dead_canary`) | `div_mr_tb_unsafecell_protected_im_repaired_agrees` (`.ok 77`, = `Mach`/`MachTB`) | `div_mr_tb_unsafecell_coupling_legacy_breaks` (legacy rule ⇒ UB at `Return`), StorageDead canary (`.ok 5`) |
-| `DIV-LM-RAW-OVERWRITE-CHAR-COPY` | P1_soundness | `div_lm_raw_overwrite_char_copy_trusted_steps` (Trusted copies/moves and returns surrogate `0xD800`) | `div_lm_raw_overwrite_char_copy_repaired_ub` (`.ub` on `0xD800`, `0xDFFF`, `0x110000`, copy and move) | `_ub_at_load`, `_valid_accepted` (`0x41`, `0xD7FF`, `0xE000`, `0x10FFFF`), `validateLoadedValueProto_char_eq_miri` (universal), `isValidCharCode_iff_isValidChar` |
-| `DIV-LM-D6-OFFSET-DISABLED-TAG` | P2_false_positive_ub | `div_lm_d6_offset_disabled_trusted_ub`, `div_lm_d6_offset_trusted_evalPtrOffsetBinOp` | `div_lm_d6_offset_disabled_tag_repaired_agrees` (universal lockstep with `miriPtrOffsetInbounds`, every entry permission) | `div_lm_d6_offset_disabled_deref_canary` (read/write through the offset pointer is still UB), `evalBinOpOffset_lockstep_miri` |
-| `DIV-LM-ENUM-SET-DISCR-UNINIT` | P2_precision | `div_lm_enum_set_discr_trusted_uninit_ub` (universal), `_trusted_faults` | `div_lm_enum_set_discr_uninit_repaired_agrees` (universal lockstep with `miriWriteDiscriminant` over `.uninit` / `.init (.aggregate _ _)` / `.dead`) | `_observed` (`Rvalue.discriminant` sees the variant), `_payload_canary` (payload read is UB), `_dead_and_init` |
+| `DIV-MR-TB-TWOPHASE-DIRECT-WRITE` | P1_soundness | already UB in `LM-3.3` `Trusted` (`twoPhaseDirectWriteTreeBorrowsGap_anneal_ub`) | `div_mr_tb_twophase_direct_write_repaired_agrees` (`.ub`, = `MachTB`, = `Trusted`) | pre-`LM-3.3` model `preserveReservedOnDirectWrite` returns 99; `direct_write_disables_reservedFrz_preserves_cell_and_reservedIM` (universal); `div_mr_tb_twophase_direct_write_reservedIM_and_cell_survive_canary` (`.ok 88`) |
+| `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC` | P1_soundness | `div_mr_tb_fnentry_local_dealloc_trusted_ret` (Trusted returns 5) | `div_mr_tb_fnentry_local_dealloc_repaired_agrees` (`.ub` at root `Return`, = `MachTB`) | `_ub_at_return` (fault is exactly the terminator), `_callee_return_canary` (callee-frame `Return` faults; Trusted returns 5), `disableFrameBorrowsProto_frame_isolation` (universal), `div_mr_tb_fnentry_dangling_callee_raw_ptr_return_ub` (dangling callee raw pointer deref faults; Trusted returns 5) |
+| `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` | P2_false_positive_ub | `Trusted.hasProtectedLocalBorrow` reports `true` (`div_mr_tb_unsafecell_storage_dead_canary`) | `div_mr_tb_unsafecell_protected_im_repaired_agrees` (`.ok 77`, = `Mach`/`MachTB`) | `div_mr_tb_unsafecell_coupling_legacy_breaks` (legacy rule ⇒ UB at `Return`), StorageDead canary (`.ok 5`), `hasProtectedLocalBorrowProto_cell_exempt_reservedIM_blocks` (universal `.cell` vs `.reservedIM`) |
+| `DIV-LM-RAW-OVERWRITE-CHAR-COPY` | P1_soundness | `div_lm_raw_overwrite_char_copy_trusted_steps` (Trusted copies/moves and returns surrogate `0xD800`) | `div_lm_raw_overwrite_char_copy_repaired_ub` (`.ub` on `0xD800`, `0xDFFF`, `0x110000`, copy and move) | `_ub_at_load`, `_valid_accepted` (`0x41`, `0xD7FF`, `0xE000`, `0x10FFFF` for both copy & move), `div_lm_raw_overwrite_char_projected_move_canary` (`move (*_3)`), `validateLoadedValueProto_char_eq_miri` (universal), `isValidCharCode_iff_isValidChar` |
+| `DIV-LM-D6-OFFSET-DISABLED-TAG` | P2_false_positive_ub | `div_lm_d6_offset_disabled_trusted_ub`, `div_lm_d6_offset_trusted_evalPtrOffsetBinOp` | `div_lm_d6_offset_disabled_tag_repaired_agrees` (universal lockstep with `miriPtrOffsetInbounds`, every entry permission) | `div_lm_d6_offset_disabled_deref_canary` (read/write through the offset pointer is still UB), `disabled_tag_deref_and_reborrow_ub` (universal across deref read/write/reborrow at any offset), `evalBinOpOffset_lockstep_miri` |
+| `DIV-LM-ENUM-SET-DISCR-UNINIT` | P2_precision | `div_lm_enum_set_discr_trusted_uninit_ub` (universal), `_trusted_faults` | `div_lm_enum_set_discr_uninit_repaired_agrees` (universal lockstep with `miriWriteDiscriminant` over `.uninit` / `.init (.aggregate _ _)` / `.dead`) | `_observed` (`Rvalue.discriminant` sees the variant), `_payload_canary` (payload read is UB), `_dead_and_init`, `div_lm_enum_set_discr_protected_conflict_ub` (universal), `div_lm_enum_set_discr_borrow_invalidation_and_protector_canary` |
 
 ### Coupled findings
 
@@ -68,6 +68,19 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 * `Trusted.hasProtectedWriteConflict` already exempts a protected `.cell` from foreign
   writes (that is why `unsafeCellProtectedInteriorMut` already returns 77 in `Trusted`); the
   remaining false positive is in `hasProtectedLocalBorrow` (`StorageDead` / `StorageLive`).
+* **Additional Track A soundness gaps uncovered in B1**:
+  1. `Trusted.evalStmt` on `.setDiscriminant ⟨loc, .nil⟩ variantIdx` (`Statements.lean:3359-3364`)
+     omits *both* `hasProtectedWriteConflict` and `invalidateConflictingBorrows` even when
+     `locals[loc] = .some (.init (.aggregate _ fields))`! Thus Track A must add the
+     frame-scoped protector check and borrow invalidation to **both** the `.uninit` and
+     `.init (.aggregate _ fields)` branches (proved in
+     `div_lm_enum_set_discr_borrow_invalidation_and_protector_canary`).
+  2. `Trusted.evalTerminator` on `.return_` (`Terminators.lean:3006-3039`) does not disable
+     borrows targeting the returning frame's locals (`disableFrameBorrowsProto`), allowing a
+     returned raw pointer to a callee local to alias a caller local after return (proved in
+     `div_mr_tb_fnentry_dangling_callee_raw_ptr_return_ub`). Track A must run both
+     `hasFrameDeallocProtectorConflict` and `disableFrameBorrows` before popping the frame /
+     restoring caller protectors.
 
 ## 3. Track A edit plan (draft)
 
@@ -93,25 +106,29 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 * `decodeBits` ≡ Miri `decode` (`decodeBits_agrees_miriDecode`, all in-width patterns).
 * `evalFloatToIntSaturating`: NaN ↦ 0, ±∞ ↦ max/min, finite ↦ clamp(trunc); canonical
   two's-complement `ScalarInt` (`evalFloatToIntSaturating_sound`, `_nan`, `_canaries`).
-* `evalIntToFloatRoundTiesToEven` (`evalIntToFloatRoundTiesToEven_sound` bundle): ≤ ½ ULP +
-  even-LSB ties of the rounding core (`roundQuotientTiesToEven_half_ulp`, `_tie_even`); exact
-  on every integer with `|v| < 2^(fb+1)` (`evalIntToFloatRoundTiesToEven_exact`), hence every
-  `i32`/`u32` → `f64` (`evalIntToFloat_i32_u32_to_f64_exact`); `u128::MAX → f32 = +∞` and the
-  exact overflow threshold `2^128 − 2^103` (`evalIntToFloatRoundTiesToEven_canaries`).
+* `evalIntToFloatRoundTiesToEven` (`evalIntToFloatRoundTiesToEven_sound` bundle):
+  - Integer-quotient and **float-level** ≤ ½ ULP + even-LSB ties (`roundQuotientTiesToEven_half_ulp`,
+    `_tie_even`, `roundRatioTiesToEven_float_half_ulp`), plus universal unreachability of the
+    `inconsistentRounding` (`preferredNaNBits`) branches (`roundRatioBits_valid_and_not_nan`);
+  - Exact on every integer with `|v| < 2^(fb+1)` (`evalIntToFloatRoundTiesToEven_exact`), hence
+    every `i32`/`u32` → `f64` (`evalIntToFloat_i32_u32_to_f64_exact`);
+  - `u128::MAX → f32 = +∞` and the exact overflow threshold `2^128 − 2^103`
+    (`evalIntToFloatRoundTiesToEven_canaries`).
 * `b/585733184`: `b585733184_ties_to_even_separation` (`0.5↦0` vs `1`, `−0.5↦−0` vs `−1`,
   `2.5↦2` vs `3`, `3.5↦4`, `16777217→0x4B800000` vs `0x4B800001`, `16777219→0x4B800002`,
   `2^53+1→0x4340000000000000` vs `…01`).
 * `evalFloatToFloatRoundTiesToEven` (`evalFloatToFloatRoundTiesToEven_sound` bundle): exact
   widening + round trip (`f32ToF64_exact_and_roundtrip`), universal quiet-NaN output
   (`convertFloatBits_nan_quiet`), signaling-NaN canary (`f64ToF32_signaling_nan_quietized`),
-  subnormal/overflow/underflow/signed-zero canaries.
+  subnormal/overflow/underflow/signed-zero canaries, and single-rounding vs double-rounding /
+  subnormal-to-normal carry-out canaries (`f64ToF32_subnormal_and_double_rounding_canaries`).
 * `CastKind` wiring: `castKind_end_to_end` (`runMirProto` on real `Rvalue.cast` bodies);
   unpatched `Trusted.evalRvalue` returns `.unsupported` (`castKind_trusted_unsupported`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 69 headline theorems (§7 of the Lean file); the
-  audit suite replays `#print axioms` for **every** `theorem` / `def` of the file (299).
+* `#guard_msgs in #print axioms` pins all 84 headline theorems (§7 of the Lean file); the
+  audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,
   `Nat.mul_lt_mul_left/right`, `Nat.div_lt_of_lt_mul`, `Nat.log2_two_pow`,
@@ -131,7 +148,7 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
   **Track A recommendation:** replace that `String.toList` match upstream so the MiniRust
   witnesses themselves become classical-free.
 
-## 6. Known limitations of the prototype (A0)
+## 6. Known limitations of the prototype
 
 * Fail-closed (`.unsupported`): globals / untracked provenance, deref of a non-zero
   pointer offset, index/subslice borrow projections, unwinding, external calls,
@@ -139,10 +156,9 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 * Direct (non-deref) local reads do not apply Tree Borrows foreign-read transitions —
   identical to `Trusted` (pre-existing; out of scope of the eight items).
 * No `rangeOffset` / `rangeLen` byte-ranged entries.
-* Part B ≤ ½ ULP / even-tie guarantees are proved for the integer rounding core used by
-  `roundRatioTiesToEven` plus float-level exactness theorems; a float-level ½-ULP statement
-  over arbitrary rationals (lifting through the exponent / carry / subnormal branches of
-  `roundRatioBits`) is not yet stated (planned for a later round).
+* *(Resolved in B1)*: Float-level ≤ ½ ULP + even-tie guarantees and unreachability of the
+  `inconsistentRounding` (`preferredNaNBits`) branches of `roundRatioBits` are now proved
+  universally in `roundRatioBits_valid_and_not_nan` and `roundRatioTiesToEven_float_half_ulp`.
 
 ## 7. Recommendation
 

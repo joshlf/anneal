@@ -158,6 +158,22 @@ HEADLINE_THEOREMS = (
     "evalFloatToFloatRoundTiesToEven_sound",
     "castKind_end_to_end",
     "castKind_trusted_unsupported",
+    # B1 adversarial hardening theorems (Part A & Part B)
+    "div_mr_call_target_local_reborrow_in_callee_canary",
+    "reborrow_inherits_targetFrameDepth",
+    "direct_write_disables_reservedFrz_preserves_cell_and_reservedIM",
+    "div_mr_tb_twophase_direct_write_reservedIM_and_cell_survive_canary",
+    "hasProtectedLocalBorrowProto_cell_exempt_reservedIM_blocks",
+    "disableFrameBorrowsProto_frame_isolation",
+    "div_mr_tb_fnentry_dangling_callee_raw_ptr_return_ub",
+    "div_lm_raw_overwrite_char_projected_move_canary",
+    "evalRetagProto_raw_uninit_or_dead_ub",
+    "disabled_tag_deref_and_reborrow_ub",
+    "div_lm_enum_set_discr_protected_conflict_ub",
+    "div_lm_enum_set_discr_borrow_invalidation_and_protector_canary",
+    "f64ToF32_subnormal_and_double_rounding_canaries",
+    "roundRatioBits_valid_and_not_nan",
+    "roundRatioTiesToEven_float_half_ulp",
 )
 
 
@@ -483,7 +499,8 @@ def build_vectors(seed: int = 585733184):
         0x7FF0000000000001, 0xFFF8000000000123, 0x7FEFFFFFFFFFFFFF, 0x0000000000000001,
         0x000FFFFFFFFFFFFF, 0x0010000000000000, 0x3690000000000000, 0x3690000000000001,
         0x36A8000000000000, 0x47EFFFFFF0000000, 0x47EFFFFFEFFFFFFF, 0x3FF0000010000000,
-        0x3FF0000030000000, 0x3FD5555555555555,
+        0x3FF0000030000000, 0x3FD5555555555555, 0x380000005FFFFFFF, 0x380FFFFFDFFFFFFF,
+        0x380FFFFFE0000000,
     ]
     for x in (0.5, -0.5, 1.5, 2.5, -2.5, 2.7, -2.7, 0.999999, -0.999999, 1e-300, 1e300, 255.5,
               -128.5, 127.99, 2.0**31, -2.0**31, 2.0**31 - 0.5, 2.0**63, -2.0**63, 2.0**64,
@@ -496,7 +513,7 @@ def build_vectors(seed: int = 585733184):
     f32_vals = [
         0, 1 << 31, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001, 0xFFC00123, 0x7F7FFFFF,
         0x00000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0xBF000000, 0x4B800000, 0xCF000000,
-        0x4F800000, 0x5F000000, 0xDF000000,
+        0x4F800000, 0x5F000000, 0xDF000000, 0x7F000000, 0xFF000000,
     ] + [rng.getrandbits(32) for _ in range(48)]
     ints = []
     for signed in (False, True):
@@ -511,6 +528,8 @@ def build_vectors(seed: int = 585733184):
                             cands.add(base + k)
                         if signed and 0 < base + k < m // 2:
                             cands.add(m - (base + k))
+            if width == 64:
+                cands.add(0x400000BFFFFFFF)
             if width == 128:
                 cands |= {m - (1 << 103), m - (1 << 103) - 1, m - (1 << 104), m - 1}
             for c in sorted(cands):
@@ -773,13 +792,23 @@ class Ieee754DifferentialTests(unittest.TestCase):
                 self.assertEqual(g, miri_convert(src, b, dst), f"{tag} {hex(b)}")
 
     def test_brief_witness_values(self) -> None:
-        # b/585733184 separation witnesses and signaling-NaN canary (Python side).
+        # b/585733184 separation witnesses, signaling-NaN canary, and subnormal/double-rounding canaries.
         self.assertEqual(i2f_ref(False, 32, 16777217, "binary32"), 0x4B800000)
         self.assertEqual(round_ref("binary32", 0, Fraction(16777217), ties_even=False), 0x4B800001)
         self.assertEqual(i2f_ref(False, 32, 16777219, "binary32"), 0x4B800002)
         self.assertEqual(i2f_ref(False, 64, 2**53 + 1, "binary64"), 0x4340000000000000)
         self.assertEqual(f2f_ref("binary64", "binary32", 0x7FF0000000000001), 0x7FC00000)
         self.assertEqual(i2f_ref(False, 128, 2**128 - 1, "binary32"), 0x7F800000)
+        # Subnormal single-rounding vs normal-then-subnormal double-rounding
+        self.assertEqual(f2f_ref("binary64", "binary32", 0x380000005FFFFFFF), 0x00400001)
+        self.assertEqual(f2f_ref("binary64", "binary32", 0x380FFFFFDFFFFFFF), 0x007FFFFF)
+        self.assertEqual(f2f_ref("binary64", "binary32", 0x380FFFFFE0000000), 0x00800000)
+        # u64 -> f32 direct vs u64 -> f64 -> f32 double-rounding
+        self.assertEqual(i2f_ref(False, 64, 0x400000BFFFFFFF, "binary32"), 0x5A800001)
+        self.assertEqual(
+            f2f_ref("binary64", "binary32", i2f_ref(False, 64, 0x400000BFFFFFFF, "binary64")),
+            0x5A800002,
+        )
 
     def test_miri_float_source_pinned(self) -> None:
         text = MIRI_FLOAT.read_text(encoding="utf-8")
