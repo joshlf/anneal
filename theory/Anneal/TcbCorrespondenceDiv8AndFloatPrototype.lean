@@ -4496,6 +4496,38 @@ theorem corpus_out_of_fragment_fixes :
   refine ⟨ProtoOutcome.eq_ub_of_isUB (by decide +kernel), by decide +kernel,
     ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel⟩
 
+
+/-! ### Known Tree Borrows gap shared with `Trusted` (outside the eight tracked items) -/
+
+/-- `fn tb_direct_read_freeze(mut x: u32) -> u32 { let r = &mut x; *r = 6; let t = x;
+*r = 7; x }` (`_2 = &mut _1; *_2 = 6; _3 = copy _1; *_2 = 7; _0 = copy _1`). -/
+def tbDirectReadFreezeMir : CapturedMir :=
+  ptrBody "witness::tb_direct_read_freeze"
+    [u32Decl, u32Decl, refMutU32Decl, u32Decl]
+    [.storageLive 2, .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (derefPlace 2) (.use (constU32 6)),
+     .storageLive 3, .assign (local_ 3) (.use (.copy (local_ 1))),
+     .assign (derefPlace 2) (.use (constU32 7)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+/-- **Known Tree Borrows gap shared with `Trusted`** (not one of the eight tracked items;
+documented as a Track A follow-up in `PROTOTYPE_REPORT.md` §6): a direct read of a local is
+a *foreign read* for its outstanding borrows, so after `*_2 = 6` activates the `&mut _1`
+borrow `_2`, the direct read `_3 = copy _1` freezes it and the second write `*_2 = 7` is UB in
+`MachTB` (`"Tree Borrows: local write of Frozen reference"`). The unpatched `Trusted` stepper
+and the overlay — which, exactly like `Trusted`, applies no Tree Borrows transition on direct
+(non-deref) local accesses — both return `7`. The overlay neither introduces nor fixes this
+missed UB. -/
+theorem tb_direct_read_freeze_gap_shared_with_trusted :
+    runMirProto tbDirectReadFreezeMir [] [.scalar ⟨5, 4⟩] = .ok (.scalar ⟨7, 4⟩) ∧
+    trustedRunScalar? tbDirectReadFreezeMir [] [.scalar ⟨5, 4⟩] 40 = .some (7, 4) ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReadFreezeMir [.scalar ⟨5, 4⟩] 7 =
+      .some "Tree Borrows: local write of Frozen reference" ∧
+    MiniRustSpec.Correspondence.RefWitness.ubAfterTB tbDirectReadFreezeMir [.scalar ⟨5, 4⟩] 6 =
+      .none :=
+  ⟨ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel, by decide +kernel,
+   by decide +kernel⟩
+
 end PartAWitnesses
 
 /-! ## §5. Part B witnesses: IEEE-754 casts on raw bit patterns -/
@@ -7003,6 +7035,10 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.evalFloatToIntSaturating_roundtrip_of_intToFloat' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalFloatToIntSaturating_roundtrip_of_intToFloat
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.tb_direct_read_freeze_gap_shared_with_trusted' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms tb_direct_read_freeze_gap_shared_with_trusted
 
 end AxiomGuards
 

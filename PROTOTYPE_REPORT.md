@@ -6,9 +6,8 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **B3 adversarial critique & hardening pass** (to be finalized in round A4 with the GO /
-CONDITIONAL GO / NO-GO recommendation). All declarations of the overlay (including all 105 pinned
-headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
+Status: **A3 critique & fix pass** (draft recommendation in §7, finalized in round A4). All
+declarations of the overlay (including all 106 pinned headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
 `Classical.choice`, zero `sorry`, zero `native_decide` (see §5). The overlay is differentially
 tested against the unpatched `Trusted` stepper on all 235 MiniRust witness bodies × 3 argument
 vectors (705 runs), and its definite agreement on all 138 scalar-argument bodies (`114`
@@ -228,7 +227,7 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 105 headline theorems (§7 of the Lean file); the
+* `#guard_msgs in #print axioms` pins all 106 headline theorems (§7 of the Lean file); the
   audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,
@@ -256,13 +255,59 @@ theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
   or `&*p` at a non-zero pointer offset, index/subslice borrow projections, unions
   (`Aggregate` with an active field), `Len`, unwinding, external calls, `f16` / `f128`
   (30 of the 235 corpus bodies; `FAIL_CLOSED_CORPUS`).
-* Direct (non-deref) local reads do not apply Tree Borrows foreign-read transitions —
-  identical to `Trusted` (pre-existing; out of scope of the eight items).
+* **Tree Borrows gap shared with `Trusted` (not fixed, not introduced):** direct (non-deref)
+  local accesses apply no Tree Borrows transition. `tb_direct_read_freeze_gap_shared_with_trusted`
+  pins a concrete missed UB: `_2 = &mut _1; *_2 = 6; _3 = copy _1; *_2 = 7` — the direct read
+  `copy _1` is a foreign read that freezes the active `_2`, so `MachTB` raises `"Tree Borrows:
+  local write of Frozen reference"` while `Trusted` and the overlay both return `7`. It is not
+  one of the eight tracked items and is not in `TRACKED_CORRESPONDENCE_DIVERGENCES`; Track A
+  should file it as a new soundness item (`DIV-MR-TB-DIRECT-LOCAL-ACCESS`) rather than claim
+  Tree Borrows completeness.
+* Return values (`_0`) are not re-validated at `Return` (same as `Trusted`); a typed load of
+  the caller's destination validates them later.
 * No `rangeOffset` / `rangeLen` byte-ranged entries.
 * *(Resolved in B1)*: Float-level ≤ ½ ULP + even-tie guarantees and unreachability of the
   `inconsistentRounding` (`preferredNaNBits`) branches of `roundRatioBits` are now proved
   universally in `roundRatioBits_valid_and_not_nan` and `roundRatioTiesToEven_float_half_ulp`.
 
-## 7. Recommendation
+## 7. Recommendation (A3 draft — finalized in A4)
 
-*Pending (finalized in A4).*
+**CONDITIONAL GO** for the Track A TCB update `ws-tcb-correspondence-div8-and-ieee-float`.
+
+Evidence: all eight tracked divergences flip to agreement with their MiniRust / lean-miri
+ground truth (§2); the overlay does not regress `Trusted` on the 235-body MiniRust witness
+corpus under three argument vectors — every definite divergence is a fix with ground truth,
+171 agreements are kernel theorems, and the 30 fail-closed bodies are exactly the unmodeled
+construct families (§2b); Part B is pure, kernel-reducible, and proved correctly rounded with
+exact overflow, signed-zero, quiet-NaN, exactness, and round-trip guarantees, and is
+differentially tested against `fractions` / `struct` and a lean-miri `Float.lean` port (§4);
+every declaration is classical-free (§5).
+
+Conditions:
+1. **Land Part A as one unit.** Items 1–2 need `targetFrameDepth` threaded through *every*
+   borrow-table operation and frame-qualified deref access; item 4 (`Return` dealloc check)
+   breaks `unsafeCellProtectedInteriorMut` without item 5 (`preventsDeallocation` exemption)
+   (`div_mr_tb_unsafecell_coupling_legacy_breaks`); item 7 needs `allocDead` together with
+   the frame-qualified liveness bound.
+2. **Update the dependent proofs and witnesses listed in §3** (char-validation sites
+   `SimLM2_1` / `SimLM2_4` / `SymReflect` / `AnnealEval`; `hasProtectedLocalBorrow` /
+   `disableLocalBorrows` lemma hypotheses in `Statements.lean` and `L5_ControlAndCalls.lean`;
+   the `ProvenanceWitness` / `RefWitness` statements that flip, including
+   `callRefMutProtected_anneal_ret`), mirror every edit into `V2026_08_01`, and retire the eight
+   IDs in `scripts/run_nightly_verification_suite.py`.
+3. **Do not claim Tree Borrows completeness**: file the direct-local-access gap (§6) as a new
+   tracker item.
+4. **Part B scope**: wire `CastKind.{floatToInt, intToFloat, floatToFloat}` for `f32` / `f64`
+   only (`f16` / `f128` stay unsupported); NaN results follow the deterministic
+   `rustc_apfloat` / Miri rule (quiet bit set, payload shifted), one admissible choice under
+   Rust's non-deterministic NaN semantics.
+5. **Upstream hygiene**: replace the `String.toList` match in `translateIntrinsicOrNone` so the
+   MiniRust witnesses themselves become `Classical.choice`-free (§5).
+
+Track A roadmap (in order): (1) `BorrowEntry.targetFrameDepth` + `allocDead` and frame-qualified
+local access helpers; (2) frame-scoped borrow-table operations, `Return` dealloc check +
+frame-borrow disabling, `preventsDeallocation`; (3) `validateLoadedValue` `.char` case,
+`evalPtrOffsetBinOp` decoupling, `SetDiscriminant` on `.uninit`; (4) Part B float casts in
+`evalRvalue`; (5) dependent proof / witness / tracker updates and the `V2026_08_01` mirror;
+(6) re-run this suite's corpus differential against the patched `Trusted` (expected: the 7
+divergences of §2b become agreements).

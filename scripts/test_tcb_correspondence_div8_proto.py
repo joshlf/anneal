@@ -202,6 +202,8 @@ HEADLINE_THEOREMS = (
     "corpus_multifn_agreement_kernel",
     "corpus_composite_agreement_kernel",
     "evalFloatToIntSaturating_roundtrip_of_intToFloat",
+    # A3: known Tree Borrows gap shared with Trusted (negative canary)
+    "tb_direct_read_freeze_gap_shared_with_trusted",
 )
 
 
