@@ -13077,6 +13077,130 @@ theorem verifyStateful_nestedCountToNM_all_n_m (n m : Nat)
         (fun _ h => ⟨rfl, h⟩))
     rfl
 
+/-- Live single-block self-loop (`do { i += 1 } while i != n`): the loop header
+`bb1` jumps back to itself, so the next target re-entry is reached immediately
+after one body execution. -/
+def selfLoopMirBody (n : Nat) : CapturedMir :=
+  Anneal.MirLoops.mkMirBody "Anneal::MirLiftCore::self_loop_mir" 0
+    [ { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "i" } ]
+    [ { statements :=
+          [ { kind := .assign { local_ := 1, projection := [] } (.use (Anneal.MirLoops.constU32 0)),
+              span := "l0" } ]
+        terminator := { kind := .goto 1, span := "l1" }
+        isCleanup := false }
+    , { statements :=
+          [ { kind := .assign { local_ := 1, projection := [] }
+                (.binaryOp .add (.copy { local_ := 1, projection := [] }) (Anneal.MirLoops.constU32 1)),
+              span := "l2" } ]
+        terminator :=
+          { kind := .switchInt (.copy { local_ := 1, projection := [] })
+              { branches := [(n, 2)], otherwise := 1 }
+            span := "l3" }
+        isCleanup := false }
+    , { statements :=
+          [ { kind := .assign { local_ := 0, projection := [] }
+                (.use (.copy { local_ := 1, projection := [] })),
+              span := "l4" } ]
+        terminator := { kind := .return_, span := "l5" }
+        isCleanup := false } ]
+
+/-- The increment statement of the self-looping header. -/
+theorem selfLoopMir_incr_step (n i : Nat) (hi : i + 1 < 4294967296) :
+    mirStep (selfLoopMirBody n) ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+      .cont ((countToNPureState 1 1 (i + 1)).toMachineState emptyMemory) := by
+  have hmod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt hi
+  unfold mirStep stepMirFn
+  dsimp [countToNPureState, PureState.toMachineState, emptyMemory]
+  simp [selfLoopMirBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
+    Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
+    evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+  rfl
+
+/-- **No overshoot on a live self-loop**: from the header `(bb1, 0)` the
+header-targeted stepper stops at the *first* re-entry, one iteration later. -/
+theorem runMirToBlock_selfLoopMir_iter (n i : Nat) (hne : i + 1 ≠ n) (hi : i + 1 < 4294967296) :
+    PureMirExec.runMirToBlock (selfLoopMirBody n) 1 ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+      .reached ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) := by
+  have hbeq : Nat.beq (i + 1) n = false := (Bool.not_eq_true _).mp (hne ∘ Nat.eq_of_beq_eq_true)
+  have hs1 := selfLoopMir_incr_step n i hi
+  have hs2 : mirStep (selfLoopMirBody n) ((countToNPureState 1 1 (i + 1)).toMachineState emptyMemory) =
+      .cont ((countToNPureState (match Nat.beq (i + 1) n with | true => 2 | false => 1) 0 (i + 1)).toMachineState emptyMemory) := rfl
+  rw [hbeq] at hs2
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (selfLoopMirBody n) = 6 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2]
+  rfl
+
+/-- On the same live self-loop header, `PureMirExec.runMirToBlock` (mandatory first
+step) advances exactly one iteration, while live
+`Anneal.FunctionalTranslation.runMirToBlock` stays put. -/
+theorem selfLoopMir_no_overshoot_vs_live_stationary (n i bound : Nat) (hne : i + 1 ≠ n)
+    (hi : i + 1 < 4294967296) :
+    PureMirExec.runMirToBlock (selfLoopMirBody n) 1 ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+        .reached ((countToNPureState 1 0 (i + 1)).toMachineState emptyMemory) ∧
+      Anneal.FunctionalTranslation.runMirToBlock (bound + 1) (selfLoopMirBody n) 1
+        ((countToNPureState 1 0 i).toMachineState emptyMemory) =
+        some ((countToNPureState 1 0 i).toMachineState emptyMemory) :=
+  ⟨runMirToBlock_selfLoopMir_iter n i hne hi,
+   live_runMirToBlock_stationary_at_target _ 1 bound _ rfl rfl⟩
+
+/-- Entry segment (`bb0 -> bb1`). -/
+theorem runMirToBlock_selfLoopMir_entry (n : Nat) (v₀ : Value) :
+    PureMirExec.runMirToBlock (selfLoopMirBody n) 1
+      ((initPureState (selfLoopMirBody n) [v₀]).toMachineState emptyMemory) =
+      .reached ((countToNPureState 1 0 0).toMachineState emptyMemory) := rfl
+
+/-- Final iteration from counter `k` exits through `bb2` and returns `k + 1`. -/
+theorem runMirToBlock_selfLoopMir_exit (k : Nat) (hk : k + 1 < 4294967296) :
+    PureMirExec.runMirToBlock (selfLoopMirBody (k + 1)) 1
+      ((countToNPureState 1 0 k).toMachineState emptyMemory) =
+      .halted (.normal (.scalar ⟨k + 1, 4⟩, emptyMemory)) := by
+  have hs1 := selfLoopMir_incr_step (k + 1) k hk
+  have hs2 : mirStep (selfLoopMirBody (k + 1)) ((countToNPureState 1 1 (k + 1)).toMachineState emptyMemory) =
+      .cont ((countToNPureState (match Nat.beq (k + 1) (k + 1) with | true => 2 | false => 1) 0 (k + 1)).toMachineState emptyMemory) := rfl
+  rw [Nat.beq_refl] at hs2
+  have hs3 : mirStep (selfLoopMirBody (k + 1)) ((countToNPureState 2 0 (k + 1)).toMachineState emptyMemory) =
+      .cont { frame := { blockIdx := 2, stmtIdx := 1,
+                         locals := [.init (.scalar ⟨k + 1, 4⟩), .init (.scalar ⟨k + 1, 4⟩)] },
+              memory := emptyMemory } := rfl
+  have hs4 : mirStep (selfLoopMirBody (k + 1))
+      { frame := { blockIdx := 2, stmtIdx := 1,
+                   locals := [.init (.scalar ⟨k + 1, 4⟩), .init (.scalar ⟨k + 1, 4⟩)] },
+        memory := emptyMemory } =
+      .done (.normal (.scalar ⟨k + 1, 4⟩, emptyMemory)) := rfl
+  unfold PureMirExec.runMirToBlock
+  have hmb : mirSegmentBound (selfLoopMirBody (k + 1)) = 6 := rfl
+  rw [hmb]
+  simp only [runToTarget, hs1, runUntilTarget, hs2, hs3, hs4]
+  rfl
+
+theorem inferMinFragment_selfLoopMirBody_le_pureBoundedLoop (n : Nat) :
+    inferMinFragment (selfLoopMirBody n) ≤ .pureBoundedLoop := by
+  have h : inferMinFragment (selfLoopMirBody n) = .pureBoundedLoop := rfl
+  rw [h]
+  exact Nat.le_refl _
+
+/-- **End-to-end `VerificationResult` for the live self-loop** over every symbolic
+bound (fragment-routed `runMirToBlock` + `forRangeUp` gate, zero fuel numerals). -/
+theorem verify_selfLoopMir_all_k (k : Nat) (hk : k + 1 < 4294967296) :
+    VerificationResult
+      { body := selfLoopMirBody (k + 1)
+        pre := fun args => ∃ v₀, args = [v₀]
+        post := fun _ retVal => retVal = .scalar ⟨k + 1, 4⟩
+        callees := [] } :=
+  verifyMirNoPanic_forRangeUp_of_inferMinFragment_le_pureBoundedLoop _
+    (inferMinFragment_selfLoopMirBody_le_pureBoundedLoop (k + 1)) 1
+    (fun _ => 0) (fun _ => k) (fun _ => ()) (fun _ _ _ _ u => u)
+    (fun _ i _ => countToNPureState 1 0 i)
+    (fun _ _ => Nat.zero_le k)
+    (fun args ⟨v₀, hargs⟩ => by subst hargs; exact runMirToBlock_selfLoopMir_entry (k + 1) v₀)
+    (fun _ _ i _ hlt _ =>
+      runMirToBlock_selfLoopMir_iter (k + 1) i (by omega) (by omega))
+    (fun _ _ => ⟨.scalar ⟨k + 1, 4⟩, emptyMemory, runMirToBlock_selfLoopMir_exit k hk, rfl⟩)
+    rfl
+
 end FuelFreeLoops
 
 end Anneal.MirLiftCore
