@@ -901,13 +901,14 @@ fn ensure_miri_sysroot_initialized_from_env(
     candidate: &Path,
     get_env: EnvLookup<'_>,
 ) -> Result<PathBuf, String> {
+    let candidate = absolutize(candidate)?;
     // Fast path first, so a populated sysroot never depends on the setup knobs.
     if candidate.join("lib/rustlib").is_dir() {
-        return Ok(candidate.to_path_buf());
+        return Ok(candidate);
     }
     let setup_timeout = miri_setup_timeout(get_env)?;
     let lock_wait = miri_setup_lock_wait(get_env, setup_timeout)?;
-    ensure_miri_sysroot_initialized_bounded(candidate, lock_wait, |dir| {
+    ensure_miri_sysroot_initialized_bounded(&candidate, lock_wait, |dir| {
         run_miri_setup(dir, get_env, setup_timeout)
     })
 }
@@ -943,6 +944,8 @@ fn ensure_miri_sysroot_initialized_bounded<F>(
 where
     F: FnOnce(&Path) -> Result<(), String>,
 {
+    let candidate = absolutize(candidate)?;
+    let candidate = candidate.as_path();
     if candidate.join("lib/rustlib").is_dir() {
         return Ok(candidate.to_path_buf());
     }
@@ -1269,9 +1272,11 @@ fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, 
         // resolved path is what gets spawned (`Command::new("name")` would search
         // PATH even if `./name` exists, so checking `is_file()` on a bare name
         // validated a different file than the one executed). Anything with a
-        // separator is a path that must exist.
+        // separator is a path that must exist. All returned paths are absolutized
+        // so `cargo-miri` / `rustc-build-sysroot` changing directories cannot
+        // shift a relative binary or `PATH` entry.
         let resolved = if val.chars().any(std::path::is_separator) {
-            let p = PathBuf::from(&val);
+            let p = absolutize(Path::new(&val))?;
             if !p.is_file() {
                 return Err(format!(
                     "{MIRI_SETUP_BIN_ENV} points to non-existent binary: {}",
@@ -1280,9 +1285,10 @@ fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, 
             }
             p
         } else {
-            find_executable_in_path_with(get_env, &val).ok_or_else(|| {
+            let found = find_executable_in_path_with(get_env, &val).ok_or_else(|| {
                 format!("{MIRI_SETUP_BIN_ENV} command `{val}` was not found on PATH")
-            })?
+            })?;
+            absolutize(&found)?
         };
         return Ok(MiriSetupCommand {
             cargo_bin: resolved,
@@ -1311,6 +1317,7 @@ fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, 
             .collect();
         candidates.sort();
         if let Some((toolchain, bin_dir)) = candidates.into_iter().next() {
+            let bin_dir = absolutize(&bin_dir)?;
             return Ok(MiriSetupCommand {
                 cargo_bin: bin_dir.join("cargo"),
                 pass_toolchain_arg: false,
@@ -1325,6 +1332,7 @@ fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, 
     if let Some(cargo_home) = cargo_home {
         let cargo_proxy = cargo_home.join("bin/cargo");
         if cargo_proxy.is_file() {
+            let cargo_proxy = absolutize(&cargo_proxy)?;
             return Ok(MiriSetupCommand {
                 cargo_bin: cargo_proxy,
                 pass_toolchain_arg: true,
@@ -1334,6 +1342,7 @@ fn resolve_miri_setup_cargo(get_env: EnvLookup<'_>) -> Result<MiriSetupCommand, 
         }
     }
     if let Some(path_cargo) = find_executable_in_path_with(get_env, "cargo") {
+        let path_cargo = absolutize(&path_cargo)?;
         let direct_toolchain = path_cargo
             .parent()
             .and_then(Path::parent)
@@ -3224,6 +3233,22 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             .expect("relative ANNEAL_MIRI_RUSTC resolves");
         assert_eq!(rustc, cwd.join("src/../Cargo.toml"));
 
+        // `resolve_miri_setup_cargo` also absolutizes relative `ANNEAL_MIRI_SETUP_BIN`
+        // overrides and names the absolute path on failure.
+        let get_setup_env = env_map(&[(MIRI_SETUP_BIN_ENV, OsStr::new("src/../Cargo.toml"))]);
+        let setup_cmd =
+            resolve_miri_setup_cargo(&get_setup_env).expect("relative ANNEAL_MIRI_SETUP_BIN");
+        assert_eq!(setup_cmd.cargo_bin, cwd.join("src/../Cargo.toml"));
+        let err = resolve_miri_setup_cargo(&env_map(&[(
+            MIRI_SETUP_BIN_ENV,
+            OsStr::new("src/../no-such-setup-cargo"),
+        )]))
+        .expect_err("missing relative ANNEAL_MIRI_SETUP_BIN must fail closed");
+        assert!(
+            err.contains(&cwd.join("src/../no-such-setup-cargo").display().to_string()),
+            "unexpected error: {err}"
+        );
+
         // Diagnostics name the absolute location that was actually checked.
         let err = resolve_sysroot_path_with(
             None,
@@ -3422,13 +3447,13 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
     /// `EnvLookup`) and pass `Command::current_dir` to children.
     #[test]
     fn cargo_anneal_sources_never_mutate_the_process_environment() {
-        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = [
             concat!("set", "_var("),
             concat!("remove", "_var("),
             concat!("set_current", "_dir("),
         ];
-        let mut stack = vec![src_dir];
+        let mut stack = vec![manifest_dir.join("src"), manifest_dir.join("tests")];
         let mut offenders = Vec::new();
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).expect("read src dir") {
