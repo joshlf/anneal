@@ -2170,6 +2170,90 @@ theorem arrayPtrOrRef_and_rigidTyEq_witnesses :
 
 end OrderingAndStructuralWitnesses
 
+/-! ## Ill-typed `Unsize`, the `rigidTyEq` fuel boundary on a well-formed type, exposed addresses,
+and empty provenance-less `len` -/
+
+section IllTypedAndExposedWitnesses
+
+open Anneal.Mir.PlaceAndRvalue
+
+/-- `&[u32; 5] -> &mut [u32]` (mutability escalation) faults at execution, not just in
+`unsizeArrayToSliceSpec?` (64-bit). -/
+theorem unsize_mutability_escalation_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .mut (.slice u32Ty))))
+        testMem testDecls testLayouts64 = .ub :=
+  (trusted_evalUnsizeCoercion_spec_none_ub L64 L64 (cp 1) testMem testDecls testLayouts64 true .mut
+    u32Ty 3 { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨1, 0⟩ rfl rfl
+    (unsizeArrayToSliceSpec?_mutability_escalation_eq_none u32Ty u32Ty 5).1).2
+
+/-- `&[u32; 5] -> &[u8]` (element-type mismatch) faults at execution (32-bit). -/
+theorem unsize_elem_mismatch_ub_32 :
+    evalRvalue L32
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice (.uint .u8)))))
+        testMem testDecls testLayouts32 = .ub :=
+  (trusted_evalUnsizeCoercion_spec_none_ub L32 L32 (cp 1) testMem testDecls testLayouts32 true .not
+    (.uint .u8) 3 { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨1, 0⟩ rfl rfl rfl).2
+
+/-- `&[&^16 bool; 5]`, a well-formed Rust type. -/
+def deepRefArrayDecl : LocalDecl :=
+  { mutability := .not
+    ty := { kind := .ref .not (.array (nestedRefRigidTy 16) 5), layoutIdx := 1 }
+    debugName := none }
+
+/-- Local `1` re-typed as `&[&^16 bool; 5]`. -/
+def declsDeepRef : List LocalDecl := testDecls.set 1 deepRefArrayDecl
+
+/-- The well-typed `&[&^16 bool; 5] -> &[&^16 bool]` unsizing faults in `Trusted` because
+`rigidTyEq` runs out of fuel on the 16-deep element type, whereas the 15-deep coercion is accepted by
+`unsizeArrayToSliceSpec?` (64-bit). -/
+theorem unsize_deep_ref_elem_fuel_boundary_64 :
+    unsizeArrayToSliceSpec? (.ref .not (.array (nestedRefRigidTy 15) 5))
+        (.ref .not (.slice (nestedRefRigidTy 15))) = some 5 ∧
+    evalRvalue L64
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice (nestedRefRigidTy 16)))))
+        testMem declsDeepRef testLayouts64 = .ub :=
+  ⟨rigidTyEq_nested_ref_depth_boundary.2.1,
+    (trusted_evalUnsizeCoercion_spec_none_ub L64 L64 (cp 1) testMem declsDeepRef testLayouts64 true
+      .not (nestedRefRigidTy 16) 3 { kind := .ref .not (.array (nestedRefRigidTy 16) 5), layoutIdx := 1 }
+      ⟨1, 0⟩ rfl rfl rigidTyEq_nested_ref_depth_boundary.2.2.2).2⟩
+
+/-- Local `27` overwritten with the exposed address `7 * 65536 + 4 = 458756` of local `20`'s
+provenance pointer `⟨7, 4⟩`, with the same length `5`. -/
+def exposedPairLocals (pb : Nat) : List LocalSlot :=
+  (testLocals pb).set 27 (.init (.aggregate 0 [.scalar ⟨458756, pb⟩, .scalar ⟨5, pb⟩]))
+
+/-- A provenance pointer and the exposed integer form of its own address compare `==` (64-bit). -/
+theorem widePtr_ptr_eq_exposed_addr_64 :
+    evalRvalue (exposedPairLocals 8) (.binaryOp .eq (cp 20) (cp 27)) testMem testDecls
+        testLayouts64 =
+      .ok (.scalar (boolToScalar true)) (exposedPairLocals 8) testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering (exposedPairLocals 8)
+    (exposedPairLocals 8) (exposedPairLocals 8) .eq (cp 20) (cp 27) testMem testDecls testLayouts64
+    7 4 458756 5 5 rfl rfl rfl rfl rfl (by decide) (by decide) (by decide) (by decide)
+    (by decide)).trans rfl
+
+/-- … and a smaller exposed address (`4096`, local `27` of `testLocals`) is below the provenance
+pointer `⟨7, 4⟩` under `cmp` (`Greater` from the pointer's side; 32-bit). -/
+theorem widePtr_ptr_cmp_exposed_addr_32 :
+    evalRvalue L32 (.binaryOp .cmp (cp 20) (cp 27)) testMem testDecls testLayouts32 =
+      .ok (.scalar ⟨1, 1⟩) L32 testMem :=
+  (trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering L32 L32 L32 .cmp (cp 20) (cp 27)
+    testMem testDecls testLayouts32 7 4 4096 5 5 rfl rfl rfl rfl rfl (by decide) (by decide)
+    (by decide) (by decide) (by decide)).trans rfl
+
+/-- `Rvalue.len` through a provenance-less wide pointer faults even for an *empty* slice: `Trusted`
+has no `.ok` case for `[.scalar addr, .scalar len]` data words, so the brief's `lenSc.bits = 0`
+success case for provenance-less pointers does not exist in `Trusted` (64-bit). -/
+theorem len_scalar_wide_empty_ub_64 :
+    evalRvalue (L64.set 27 (.init (.aggregate 0 [.scalar ⟨4096, 8⟩, .scalar ⟨0, 8⟩])))
+        (.len (derefPlace 27)) testMem testDecls testLayouts64 = .ub :=
+  trusted_evalRvalue_len_deref_wide_scalar_ub
+    (L64.set 27 (.init (.aggregate 0 [.scalar ⟨4096, 8⟩, .scalar ⟨0, 8⟩])))
+    (L64.set 27 (.init (.aggregate 0 [.scalar ⟨4096, 8⟩, .scalar ⟨0, 8⟩]))) (derefPlace 27) testMem
+    testDecls testLayouts64 [] u32Ty _ ⟨4096, 8⟩ ⟨0, 8⟩ rfl rfl rfl
+
+end IllTypedAndExposedWitnesses
+
 /-! ## Kernel axiom audit -/
 
 /-! Audits every declaration added by Episode 2 to `Anneal.Mir.Cast` (Section 9, starting at

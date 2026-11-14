@@ -17934,6 +17934,42 @@ theorem trusted_evalRvalue_binaryOp_wide_ptr_diff_alloc_ordering
   · rw [Nat.compare_eq_gt.mpr h]
     rfl
 
+/-- **Provenance pointer vs. exposed integer address** (on `evalRvalue`): an unborrowed provenance
+pointer `⟨allocId, o⟩` is compared with a provenance-less (exposed) address `x` through its synthetic
+address `allocId * 65536 + o`, so under every relational `op` the result is
+`relOpOrderingScalar op ((compare (allocId * 65536 + o) x).then (compare m₁ m₂))`. In particular a
+wide pointer compares equal to the exposed form of its own address (provenance is ignored). -/
+theorem trusted_evalRvalue_binaryOp_wide_ptr_exposed_addr_ordering
+    (locals locals₁ locals₂ : List LocalSlot) (op : BinOp) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (allocId o x m₁ m₂ : Nat)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.ptr ⟨allocId, o⟩ (layoutPointerBytes layouts) ::
+        .scalar ⟨m₁, layoutPointerBytes layouts⟩ :: .nil)) locals₁)
+    (hR : evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.aggregate 0 (.scalar ⟨x, layoutPointerBytes layouts⟩ ::
+        .scalar ⟨m₂, layoutPointerBytes layouts⟩ :: .nil)) locals₂)
+    (hRel : isRelationalBinOp op = true)
+    (hPtrOp : isPtrOrUntypedOperand localDecls layouts lhsOp = true)
+    (hNoBorrow : lookupBorrow mem.borrows allocId = .none)
+    (hW : Nat.add (Nat.mul allocId 65536) o < scalarModulus (layoutPointerBytes layouts))
+    (hx : x < scalarModulus (layoutPointerBytes layouts))
+    (hm₁ : m₁ < scalarModulus (layoutPointerBytes layouts))
+    (hm₂ : m₂ < scalarModulus (layoutPointerBytes layouts))
+    (hPb : layoutPointerBytes layouts ≠ 0) :
+    evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts =
+      .ok (.scalar (relOpOrderingScalar op
+        ((compare (Nat.add (Nat.mul allocId 65536) o) x).then (compare m₁ m₂)))) locals₂ mem :=
+  trusted_evalRvalue_binaryOp_wide_ptr_rel_ordering locals locals₁ locals₂ op lhsOp rhsOp mem
+    localDecls layouts _ _ _ _ _ x m₁ m₂ hL hR hRel hPtrOp rfl rfl (Or.inr (Or.inl ⟨_, _, rfl⟩))
+    (resolveWideWordScalar?_unborrowed_ptr_canonical allocId o _ locals₂ mem.borrows
+      mem.callerLocals localDecls layouts hNoBorrow hW)
+    (resolveWideWordScalar?_scalar_canonical x _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hx)
+    (resolveWideWordScalar?_scalar_canonical m₁ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₁)
+    (resolveWideWordScalar?_scalar_canonical m₂ _ locals₂ mem.borrows mem.callerLocals localDecls
+      layouts hm₂) hPb
+
 end WidePtrSliceRvalueRefinement
 
 end Anneal.Mir.PlaceAndRvalue

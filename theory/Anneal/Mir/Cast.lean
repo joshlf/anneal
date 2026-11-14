@@ -14459,6 +14459,45 @@ theorem trusted_evalUnsizeCoercion_stack_borrow_misaligned_ub
         Bool.and_true, Bool.not_false] <;> rfl
   exact ⟨hUb, hUb⟩
 
+/-- **Ill-typed `Unsize` faults (step and `evalRvalue`)**: when the operand's declared type `srcTy`
+admits no array-to-slice coercion into the slice-pointer target (`unsizeArrayToSliceSpec? = .none`:
+mutability escalation such as `&[T; N] -> &mut [T]`, raw-to-reference, element-type mismatch, or an
+element type beyond `rigidTyEq`'s fuel), coercing a pointer-width provenance pointer faults with
+`.ub`, whatever its borrow state. This lifts the `.none` cases of `unsizeArrayToSliceSpec?` to
+execution. -/
+theorem trusted_evalUnsizeCoercion_spec_none_ub
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (srcTy : Ty) (ptrVal : ProvenancePtr)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hTy : operandTy localDecls layouts op = .some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
+      .none) :
+    evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts = .ub ∧
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub := by
+  have hUb :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts = .ub := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    cases hB : lookupBorrow mem.borrows ptrVal.tag with
+    | none =>
+      cases isDstRef <;> cases dstMut <;>
+        simp only [hOp, Nat.beq_refl, hB, hTy, hSpec] <;> rfl
+    | some entry =>
+      rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+      cases isDstRef <;> cases dstMut <;> cases perm <;>
+        simp only [hOp, Nat.beq_refl, hB, hTy, hSpec] <;> rfl
+  exact ⟨hUb, hUb⟩
+
 /-- Stack-borrowed ZST `.unit` `evalUnsizeCoercion` two-sided characterization: when
 `readSliceBackingAggregate? = .none` and `readProjectedValue = .ok .unit`, unsizing succeeds iff
 `ptrVal.offsetBytes = 0 ∧ n = 0`. -/
@@ -17810,6 +17849,27 @@ theorem rigidTyEq_nested_slice_depth_15_and_16_boundary :
         (.ref .not (.array (nestedSliceRigidTy 16) 5))
         (.ref .not (.slice (nestedSliceRigidTy 16))) = .none :=
   ⟨rfl, rfl, rfl⟩
+
+/-- Nested shared-reference type `&&…&bool` with `d` references. Unlike `nestedSliceRigidTy` (whose
+slice-of-slice levels are not `Sized`, hence not well-formed Rust element types), this is a
+well-formed Rust type at every depth. -/
+def nestedRefRigidTy : Nat → RigidTy
+  | 0 => .bool
+  | n + 1 => .ref .not (nestedRefRigidTy n)
+
+/-- **`rigidTyEq` fuel boundary on a well-formed Rust type**: with 15 references `&…&bool` is
+`rigidTyEq`-reflexive and `&[&^15 bool; 5] -> &[&^15 bool]` is an `Unsize` coercion of length `5`;
+with 16 references `rigidTyEq` is `false`, so `unsizeArrayToSliceSpec?` rejects the well-typed
+`&[&^16 bool; 5] -> &[&^16 bool]` coercion (and `trusted_evalUnsizeCoercion_spec_none_ub` turns it
+into `.ub`). -/
+theorem rigidTyEq_nested_ref_depth_boundary :
+    rigidTyEq (nestedRefRigidTy 15) (nestedRefRigidTy 15) = true ∧
+    unsizeArrayToSliceSpec? (.ref .not (.array (nestedRefRigidTy 15) 5))
+        (.ref .not (.slice (nestedRefRigidTy 15))) = .some 5 ∧
+    rigidTyEq (nestedRefRigidTy 16) (nestedRefRigidTy 16) = false ∧
+    unsizeArrayToSliceSpec? (.ref .not (.array (nestedRefRigidTy 16) 5))
+        (.ref .not (.slice (nestedRefRigidTy 16))) = .none :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end WidePtrSliceAndFnPtrCast
 
