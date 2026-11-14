@@ -1553,6 +1553,250 @@ theorem widePtr_add_unsupported_32 :
     testMem testDecls testLayouts32 (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 4⟩) (.ptr ⟨7, 4⟩ 4) (.scalar ⟨3, 4⟩)
     rfl rfl rfl
 
+/-! ### Pass A2 witnesses: `.dead` locals, nested-`.ptr` asymmetry, untyped global/ZST `.ub`,
+`deriveStackElemThinPtr` subslice-reuse & union-field branches, thin-array `PtrToPtr` narrowing,
+same-place distinct borrow tags, and untyped / width-mismatched wide-pointer comparisons -/
+
+/-- Stack borrow of a `.dead` (`StorageDead`) local slot: `Unsize` faults with `.ub` (64-bit). -/
+theorem unsize_dead_local_ub_64 :
+    evalRvalue (L64.set 13 .dead)
+        (.cast (.pointerCoercion "Unsize") (cp 31) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem testDecls testLayouts64 = .ub :=
+  (trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
+    (L64.set 13 .dead) (L64.set 13 .dead) (cp 31) testMem testDecls testLayouts64
+    true .not u32Ty 3 { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨4, 0⟩ 5
+    uninitEntry rfl rfl rfl rfl rfl (Or.inl rfl)).2
+
+/-- Cross-frame `callerLocals` borrow where `mem.callerLocals` is empty (`get? = .none`):
+`Unsize` faults with `.ub` (32-bit). -/
+theorem unsize_callerLocals_missing_ub_32 :
+    evalRvalue [.init (.ptr ⟨99, 0⟩ 4)]
+        (.cast (.pointerCoercion "Unsize") (cp 0) (sliceTy (.ref .not (.slice u32Ty))))
+        { testMem with borrows := callerBorrowEntry :: testMem.borrows }
+        [refArray5Decl] testLayouts32 = .ub :=
+  (trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
+    [.init (.ptr ⟨99, 0⟩ 4)] [.init (.ptr ⟨99, 0⟩ 4)] (cp 0)
+    { testMem with borrows := callerBorrowEntry :: testMem.borrows }
+    [refArray5Decl] testLayouts32 true .not u32Ty 3
+    { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨99, 0⟩ 5
+    callerBorrowEntry rfl rfl rfl rfl rfl (Or.inr ⟨rfl, Or.inl rfl⟩)).2
+
+/-- Asymmetry finding between `evalUnsizeCoercion` (`Places.lean:13432`) and `evalPlaceLen`
+(`sliceLenBorrowOk`, `Places.lean:14449`): when a stack borrow's target local holds a nested thin
+pointer `.ptr ⟨7, 0⟩ 8` (local `11`, borrowed by tag `60`), `Unsize` accepts it (`stackTargetValid =
+true`), whereas `Rvalue.len` on the resulting dereferenced slice pointer faults with `.ub`! -/
+def nestedPtrEntry : BorrowEntry :=
+  { tag := 60, targetLocal := 11, targetProjection := [], perm := .active }
+
+def memWithNestedPtrBorrow : Memory :=
+  { testMem with borrows := nestedPtrEntry :: testMem.borrows }
+
+theorem unsize_vs_len_nested_ptr_asymmetry_64 :
+    evalRvalue (L64.set 1 (.init (.ptr ⟨60, 0⟩ 8)))
+        (.cast (.pointerCoercion "Unsize") (cp 1) (sliceTy (.ref .not (.slice u32Ty))))
+        memWithNestedPtrBorrow testDecls testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨60, 0⟩ 5 8) (L64.set 1 (.init (.ptr ⟨60, 0⟩ 8)))
+        memWithNestedPtrBorrow ∧
+    evalRvalue (L64.set 15 (.init (LWidePtr.encodeProv ⟨60, 0⟩ 5 8)))
+        (.len (derefPlace 15)) memWithNestedPtrBorrow testDecls testLayouts64 = .ub :=
+  ⟨(trusted_evalUnsizeCoercion_stack_borrow_nested_ptr_ok
+      (L64.set 1 (.init (.ptr ⟨60, 0⟩ 8))) (L64.set 1 (.init (.ptr ⟨60, 0⟩ 8))) (cp 1)
+      memWithNestedPtrBorrow testDecls testLayouts64 true .not u32Ty 3
+      { kind := .ref .not (.array u32Ty 5), layoutIdx := 1 } ⟨60, 0⟩ ⟨7, 0⟩ 5 8
+      nestedPtrEntry (.ptr ⟨7, 0⟩ 8) rfl rfl rfl rfl rfl rfl rfl rfl).2,
+    (trusted_evalRvalue_len_deref_slice_iff
+      (L64.set 15 (.init (LWidePtr.encodeProv ⟨60, 0⟩ 5 8)))
+      (L64.set 15 (.init (LWidePtr.encodeProv ⟨60, 0⟩ 5 8)))
+      (derefPlace 15) memWithNestedPtrBorrow testDecls testLayouts64 [] u32Ty _ ⟨60, 0⟩ 8 ⟨5, 8⟩
+      rfl rfl rfl).2.mpr (fun ⟨_, _, h⟩ => by
+        rw [sliceLenBorrowOk_nested_ptr_eq_false
+          (L64.set 15 (.init (LWidePtr.encodeProv ⟨60, 0⟩ 5 8)))
+          memWithNestedPtrBorrow testDecls testLayouts64 u32Ty ⟨60, 0⟩ ⟨5, 8⟩
+          nestedPtrEntry (.ptr ⟨7, 0⟩ 8) ⟨7, 0⟩ 8 rfl (fun hc => by cases hc) rfl rfl rfl] at h
+        cases h)⟩
+
+/-- Untyped (`localDecls = []`) stack borrow of a ZST `.unit` slot (tag `5` on local `19`):
+succeeds with length `0` at byte offset `0`, and faults with `.ub` at byte offset `4`. -/
+theorem unsize_untyped_zst_unit_ok_and_ub_64 :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 30) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts64 =
+      .ok (LWidePtr.encodeProv ⟨5, 0⟩ 0 8) L64 testMem ∧
+    evalRvalue (L64.set 30 (.init (.ptr ⟨5, 4⟩ 8)))
+        (.cast (.pointerCoercion "Unsize") (cp 30) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts64 = .ub :=
+  ⟨(trusted_evalUnsizeCoercion_untyped_zst_unit_iff L64 L64 (cp 30) testMem [] testLayouts64
+      true .not u32Ty 3 ⟨5, 0⟩ zstEntry .unit rfl rfl rfl rfl rfl rfl rfl).2.2.1.mpr rfl,
+    (trusted_evalUnsizeCoercion_untyped_zst_unit_iff
+      (L64.set 30 (.init (.ptr ⟨5, 4⟩ 8))) (L64.set 30 (.init (.ptr ⟨5, 4⟩ 8))) (cp 30)
+      testMem [] testLayouts64 true .not u32Ty 3 ⟨5, 4⟩ zstEntry .unit
+      rfl rfl rfl rfl rfl rfl rfl).2.2.2.mpr rfl⟩
+
+/-- Untyped (`localDecls = []`) global allocation `Unsize` `.ub` witnesses:
+1. Read-only global coerced to `*mut [u32]`;
+2. Misaligned byte offset (`offsetBytes = 2`, `elemSz = 4`);
+3. ZST element type `()` (`elemSz = 0`). -/
+theorem unsize_untyped_global_ub_witnesses :
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 34) (sliceTy (.rawPtr .mut (.slice u32Ty))))
+        testMem [] testLayouts64 = .ub ∧
+    evalRvalue (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4)))
+        (.cast (.pointerCoercion "Unsize") (cp 32) (sliceTy (.ref .not (.slice u32Ty))))
+        testMem [] testLayouts32 = .ub ∧
+    evalRvalue L64 (.cast (.pointerCoercion "Unsize") (cp 32)
+        (sliceTy (.ref .not (.slice (.tuple [])))))
+        testMem [] testLayouts64 = .ub :=
+  ⟨(trusted_evalUnsizeCoercion_untyped_global_alloc_ub L64 L64 (cp 34) testMem [] testLayouts64
+      false .mut u32Ty 3 ⟨9, 0⟩ testGlobal rfl rfl rfl rfl (Or.inl ⟨rfl, rfl⟩)).2,
+    (trusted_evalUnsizeCoercion_untyped_global_alloc_ub
+      (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4))) (L32.set 32 (.init (.ptr ⟨9, 2⟩ 4))) (cp 32)
+      testMem [] testLayouts32 true .not u32Ty 3 ⟨9, 2⟩ testGlobal
+      rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨4, rfl, Or.inl rfl⟩)))).2,
+    (trusted_evalUnsizeCoercion_untyped_global_alloc_ub L64 L64 (cp 32) testMem [] testLayouts64
+      true .not (.tuple []) 3 ⟨9, 0⟩ testGlobal rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inl rfl)))).2⟩
+
+/-- `deriveStackElemThinPtr` on `narrowedEntry` (whose `targetProjection = [.subslice 0 5 false]`
+already ends with a `.subslice` covering `[0 .. 5)`): reuses tag `10` without allocating a fresh
+tag (`memAfterNarrow.nextTag` remains `11`). -/
+theorem deriveStackElemThinPtr_already_subslice_witness :
+    deriveStackElemThinPtr L64 memAfterNarrow ⟨10, 0⟩ narrowedEntry (some 5) 8 =
+      .ok (.ptr ⟨10, 0⟩ 8) L64 memAfterNarrow :=
+  deriveStackElemThinPtr_already_subslice L64 memAfterNarrow ⟨10, 0⟩ narrowedEntry 5 8 backing
+    [.subslice 0 5 false] 0 backingElems 0 (fun h => by cases h) rfl rfl rfl rfl rfl
+
+/-- Borrow entry projecting an uninitialized union array field `.field 0 [u32; 5]` on a `.aggregate 0
+[.unit]` union local (local `19` overridden to `.aggregate 0 [.unit]`). -/
+def unionFieldBorrowEntry : BorrowEntry :=
+  { tag := 70
+    targetLocal := 19
+    targetProjection := [.field 0 { kind := .array u32Ty 5, layoutIdx := 2 }]
+    perm := .active }
+
+/-- `deriveStackElemThinPtr` on an uninitialized union array field of capacity `5`: succeeds at
+`offsetBytes = 0` when `n = 5 ≤ 5`, and faults with `.ub` when `n = 6 > 5` or `offsetBytes = 4`. -/
+theorem deriveStackElemThinPtr_union_field_ok_and_ub_64 :
+    deriveStackElemThinPtr (L64.set 19 (.init (.aggregate 0 [.unit]))) testMem ⟨70, 0⟩
+        unionFieldBorrowEntry (some 5) 8 =
+      .ok (.ptr ⟨70, 0⟩ 8) (L64.set 19 (.init (.aggregate 0 [.unit]))) testMem ∧
+    deriveStackElemThinPtr (L64.set 19 (.init (.aggregate 0 [.unit]))) testMem ⟨70, 0⟩
+        unionFieldBorrowEntry (some 6) 8 = .ub :=
+  ⟨(deriveStackElemThinPtr_uninit_union_field_array_iff
+      (L64.set 19 (.init (.aggregate 0 [.unit]))) testMem ⟨70, 0⟩ unionFieldBorrowEntry 5 8
+      (.aggregate 0 [.unit]) 0 { kind := .array u32Ty 5, layoutIdx := 2 } [] 5
+      (fun h => by cases h) rfl rfl rfl rfl rfl rfl).1.mpr rfl,
+    (deriveStackElemThinPtr_uninit_union_field_array_iff
+      (L64.set 19 (.init (.aggregate 0 [.unit]))) testMem ⟨70, 0⟩ unionFieldBorrowEntry 6 8
+      (.aggregate 0 [.unit]) 0 { kind := .array u32Ty 5, layoutIdx := 2 } [] 5
+      (fun h => by cases h) rfl rfl rfl rfl rfl rfl).2.mpr rfl⟩
+
+/-- `deriveStackElemThinPtr` faults on `.disabled`, `.uninit`, and `.dead` stack borrows. -/
+theorem deriveStackElemThinPtr_disabled_uninit_dead_witnesses :
+    deriveStackElemThinPtr L64 testMem ⟨2, 0⟩ disabledEntry (some 5) 8 = .ub ∧
+    deriveStackElemThinPtr L64 testMem ⟨4, 0⟩ uninitEntry (some 5) 8 = .ub ∧
+    deriveStackElemThinPtr (L64.set 13 .dead) testMem ⟨4, 0⟩ uninitEntry (some 5) 8 = .ub :=
+  ⟨deriveStackElemThinPtr_disabled_or_uninit_or_dead_ub L64 testMem ⟨2, 0⟩ disabledEntry (some 5) 8
+      (Or.inl rfl),
+    deriveStackElemThinPtr_disabled_or_uninit_or_dead_ub L64 testMem ⟨4, 0⟩ uninitEntry (some 5) 8
+      (Or.inr (Or.inl rfl)),
+    deriveStackElemThinPtr_disabled_or_uninit_or_dead_ub (L64.set 13 .dead) testMem ⟨4, 0⟩
+      uninitEntry (some 5) 8 (Or.inr (Or.inr rfl))⟩
+
+/-- Concrete thin-to-thin `PtrToPtr` stack-borrowed array narrowing (`&[u32; 5] as *const u32` on
+local `1`, tag `1`): refines via `trusted_evalRvalue_ptrToPtr_thin_array_stack_borrow` and
+`deriveStackElemThinPtr_fresh_subslice` to `.ok (.ptr ⟨10, 0⟩ 8)` with `memAfterNarrow`. -/
+theorem ptrToPtr_thin_array_stack_narrowing_64 :
+    evalRvalue L64 (.cast .ptrToPtr (cp 1) { kind := .rawPtr .not u32Ty, layoutIdx := 1 })
+        testMem testDecls testLayouts64 =
+      .ok (.ptr ⟨10, 0⟩ 8) L64 memAfterNarrow ∧
+    evalRvalue L32 (.cast .ptrToPtr (cp 11) { kind := .rawPtr .not u32Ty, layoutIdx := 1 })
+        testMem testDecls testLayouts32 =
+      .ok (.ptr ⟨7, 0⟩ 4) L32 testMem :=
+  ⟨(trusted_evalRvalue_ptrToPtr_thin_array_stack_borrow L64 L64 (cp 1)
+      { kind := .rawPtr .not u32Ty, layoutIdx := 1 } testMem testDecls testLayouts64 ⟨1, 0⟩ u32Ty 5
+      activeEntry rfl rfl
+      ((arrayPtrOrRefElemLen?_rawPtr_or_ref .not u32Ty u32Ty 5 1).2.trans rfl) rfl).trans
+      (deriveStackElemThinPtr_fresh_subslice L64 testMem ⟨1, 0⟩ activeEntry 5 8 backing [] 0
+        backingElems 0 (fun h => by cases h) rfl rfl rfl rfl rfl),
+    trusted_evalRvalue_ptrToPtr_thin_nonarray_or_unborrowed L32 L32 (cp 11)
+      { kind := .rawPtr .not u32Ty, layoutIdx := 1 } testMem testDecls testLayouts32 ⟨7, 0⟩ u32Ty
+      rfl rfl (Or.inl rfl)⟩
+
+/-- `Rvalue.len` on a `.dead` backing local or missing `callerLocals` entry faults with `.ub`. -/
+theorem len_dead_and_missing_caller_ub_witnesses :
+    evalRvalue (L64.set 13 .dead) (.len (derefPlace 28)) testMem testDecls testLayouts64 = .ub ∧
+    evalRvalue [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 4, .scalar ⟨5, 4⟩])]
+        (.len (derefPlace 0)) { testMem with borrows := callerBorrowEntry :: testMem.borrows }
+        [refSliceU32Decl] testLayouts32 = .ub :=
+  ⟨(trusted_evalRvalue_len_deref_slice_iff (L64.set 13 .dead) (L64.set 13 .dead) (derefPlace 28)
+      testMem testDecls testLayouts64 [] u32Ty _ ⟨4, 0⟩ 8 ⟨5, 8⟩ rfl rfl rfl).2.mpr
+      (fun ⟨_, _, h⟩ => by
+        rw [sliceLenBorrowOk_dead (L64.set 13 .dead) testMem testDecls testLayouts64 u32Ty ⟨4, 0⟩
+          ⟨5, 8⟩ uninitEntry rfl (fun hc => by cases hc) rfl] at h
+        cases h),
+    (trusted_evalRvalue_len_deref_slice_iff
+      [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 4, .scalar ⟨5, 4⟩])]
+      [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 4, .scalar ⟨5, 4⟩])]
+      (derefPlace 0) { testMem with borrows := callerBorrowEntry :: testMem.borrows }
+      [refSliceU32Decl] testLayouts32 [] u32Ty _ ⟨99, 0⟩ 4 ⟨5, 4⟩ rfl rfl rfl).2.mpr
+      (fun ⟨_, _, h⟩ => by
+        rw [sliceLenBorrowOk_callerLocals_missing
+          [.init (.aggregate 0 [.ptr ⟨99, 0⟩ 4, .scalar ⟨5, 4⟩])]
+          { testMem with borrows := callerBorrowEntry :: testMem.borrows }
+          [refSliceU32Decl] testLayouts32 u32Ty ⟨99, 0⟩ ⟨5, 4⟩ callerBorrowEntry
+          rfl (fun hc => by cases hc) rfl (Or.inl rfl)] at h
+        cases h)⟩
+
+/-- Distinct stack-borrow tags (`activeEntry` tag `1` and `frozenEntry` tag `3`) targeting the same
+stack local `0` at offset `0` resolve to the *exact same* canonical address via
+`resolveWideWordScalar?_stack_borrow_eq_of_same_place`, so wide slice pointers carrying tag `1` and
+tag `3` with equal length `5` compare equal (`==` evaluates to `true`). -/
+theorem widePtr_distinct_borrow_tags_same_place_eq_64 :
+    resolveWideWordScalar? (.ptr ⟨1, 0⟩ 8) L64 testMem.borrows testMem.callerLocals testDecls
+        testLayouts64 8 =
+      resolveWideWordScalar? (.ptr ⟨3, 0⟩ 8) L64 testMem.borrows testMem.callerLocals testDecls
+        testLayouts64 8 ∧
+    evalRvalue (L64.set 6 (.init (.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨5, 8⟩])))
+        (.binaryOp .eq (cp 5) (cp 6)) testMem testDecls testLayouts64 =
+      .ok (.scalar (boolToScalar true))
+        (L64.set 6 (.init (.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨5, 8⟩]))) testMem :=
+  ⟨resolveWideWordScalar?_stack_borrow_eq_of_same_place ⟨1, 0⟩ ⟨3, 0⟩ activeEntry frozenEntry L64
+      testMem.borrows testMem.callerLocals testDecls testLayouts64 8 rfl rfl rfl rfl rfl,
+    (trusted_evalRvalue_binaryOp_wide_ptr_eq_lex
+      (L64.set 6 (.init (.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨5, 8⟩])))
+      (L64.set 6 (.init (.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨5, 8⟩])))
+      (L64.set 6 (.init (.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨5, 8⟩])))
+      (cp 5) (cp 6) testMem testDecls testLayouts64 (.ptr ⟨1, 0⟩ 8) (.scalar ⟨5, 8⟩)
+      (.ptr ⟨3, 0⟩ 8) (.scalar ⟨5, 8⟩) 68719476736 68719476736 5 5
+      rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide)).trans rfl⟩
+
+/-- Untyped (`localDecls = []`, so `isExplicitWidePtrTy = false`) wide-pointer comparisons:
+1. When at least one data word is `.ptr _ _`, `evalRvalue` still dispatches to `evalWidePtrRelBinOp`;
+2. When both data words are `.scalar`, `evalRvalue` returns `.unsupported` (avoiding misinterpreting
+   a 2-integer struct/tuple as a wide pointer);
+3. When any word has mismatched byte width (`resolveWideWordScalar? = .none`), `evalRvalue` returns
+   `.unsupported`. -/
+theorem widePtr_untyped_and_resolve_none_witnesses :
+    resolveWideWordScalar? (.ptr ⟨7, 4⟩ 8) L64 testMem.borrows testMem.callerLocals [] testLayouts64
+        8 = some ⟨458756, 8⟩ ∧
+    evalRvalue L64 (.binaryOp .lt (cp 20) (cp 21)) testMem [] testLayouts64 =
+      .ok (.scalar (boolToScalar false)) L64 testMem ∧
+    evalRvalue L64 (.binaryOp .eq (cp 27) (cp 27)) testMem [] testLayouts64 = .unsupported ∧
+    evalRvalue (L64.set 20 (.init (.aggregate 0 [.ptr ⟨7, 4⟩ 4, .scalar ⟨5, 8⟩])))
+        (.binaryOp .eq (cp 20) (cp 21)) testMem testDecls testLayouts64 = .unsupported :=
+  ⟨resolveWideWordScalar?_unborrowed_ptr ⟨7, 4⟩ L64 testMem.borrows testMem.callerLocals []
+      testLayouts64 8 rfl,
+    (trusted_evalRvalue_binaryOp_wide_ptr_untyped_rel_eq L64 L64 L64 .lt (cp 20) (cp 21) testMem []
+      testLayouts64 (.ptr ⟨7, 4⟩ 8) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩)
+      rfl rfl rfl rfl rfl rfl rfl (Or.inl ⟨⟨7, 4⟩, 8, rfl⟩)).trans rfl,
+    trusted_evalRvalue_binaryOp_untyped_two_scalars_unsupported L64 L64 L64 .eq (cp 27) (cp 27)
+      testMem [] testLayouts64 ⟨4096, 8⟩ ⟨4096, 8⟩ (.scalar ⟨5, 8⟩) (.scalar ⟨5, 8⟩) rfl rfl rfl,
+    trusted_evalRvalue_binaryOp_wide_ptr_resolve_none_unsupported
+      (L64.set 20 (.init (.aggregate 0 [.ptr ⟨7, 4⟩ 4, .scalar ⟨5, 8⟩])))
+      (L64.set 20 (.init (.aggregate 0 [.ptr ⟨7, 4⟩ 4, .scalar ⟨5, 8⟩])))
+      (L64.set 20 (.init (.aggregate 0 [.ptr ⟨7, 4⟩ 4, .scalar ⟨5, 8⟩])))
+      .eq (cp 20) (cp 21) testMem testDecls testLayouts64
+      (.ptr ⟨7, 4⟩ 4) (.scalar ⟨5, 8⟩) (.ptr ⟨7, 4⟩ 8) (.scalar ⟨3, 8⟩) rfl rfl
+      (Or.inl ((resolveWideWordScalar?_width_mismatch_eq_none _ _ _ _ _ 8).1 ⟨7, 4⟩ 4 (by decide)))⟩
+
 end DispatchAndRangeWitnesses
 
 /-! ## Kernel axiom audit -/

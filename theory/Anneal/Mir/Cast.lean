@@ -13963,6 +13963,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics (RvalueEvalResult TreeBorrowPerm FnP
   extractFnItemTarget? checkCalleeSig evalUnsafeFnPointer unsizeArrayToSliceSpec?
   rawPtrUnsizeArrayToSliceLen? unsizeMutabilityCompatible evalUnsizeCoercion
   evalReifyFnPointer evalFnPtrToPtr deriveStackElemThinPtr arrayToPointerElemLen?
+  projLastFieldArrayCap?
   mutToConstTargetShape? isThinRawPtrTy isWideRawPtrTy thinRawPtrPointee?
   wideRawPtrIsDyn? isSliceOrStrPtrOrRefTy arrayPtrOrRefElemLen?
   readSliceBackingAggregate? inferElemListByteStride byteOffsetToElemIdx?
@@ -14914,6 +14915,209 @@ theorem trusted_evalUnsizeCoercion_untyped_unbacked_ub
       simp only [hOp, Nat.beq_refl, hNoBorrow, hUntyped, hNoGlobal, Bool.and_true] <;> rfl
   exact ⟨hUb, hUb⟩
 
+/-- Stack-borrowed `evalUnsizeCoercion` faults with `.ub` when the borrowed local slot is `.dead`
+(`StorageDead`), or when `get? locals' entry.targetLocal = .none` and `mem.callerLocals` has no
+initialized slot (`Places.lean:13395–13401`). -/
+theorem trusted_evalUnsizeCoercion_stack_borrow_dead_or_missing_ub
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (srcTy : Ty) (ptrVal : ProvenancePtr) (n : Nat) (entry : BorrowEntry)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
+    (hTy : operandTy localDecls layouts op = .some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
+      .some n)
+    (hDeadOrMissing :
+      get? locals' entry.targetLocal = .some .dead ∨
+      (get? locals' entry.targetLocal = .none ∧
+        (get? mem.callerLocals entry.targetLocal = .none ∨
+         get? mem.callerLocals entry.targetLocal = .some .uninit ∨
+         get? mem.callerLocals entry.targetLocal = .some .dead))) :
+    evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts = .ub ∧
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub := by
+  have hUb :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts = .ub := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    dsimp only at hPerm hDeadOrMissing
+    rcases hDeadOrMissing with hDead | ⟨hNoLoc, hC | hC | hC⟩
+    · cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
+        simp only [hOp, hSpec, Bool.and_true, Bool.not_false, Nat.beq_refl, hBorrow, hTy, hDead] <;> rfl
+    all_goals
+      (cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
+        simp only [hOp, hSpec, Bool.and_true, Bool.not_false, Nat.beq_refl, hBorrow, hTy,
+          hNoLoc, hC] <;> rfl)
+  exact ⟨hUb, hUb⟩
+
+/-- Stack-borrowed `evalUnsizeCoercion` on a nested pointer projection (`readSliceBackingAggregate? = .none`
+and `readProjectedValue = .ok (.ptr nestedPtr nestedSz)`, `Places.lean:13432`): `Trusted`'s `Unsize`
+accepts it (`stackTargetValid = true`), whereas `sliceLenBorrowOk` (`Places.lean:14449`) rejects it. -/
+theorem trusted_evalUnsizeCoercion_stack_borrow_nested_ptr_ok
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (srcTy : Ty) (ptrVal nestedPtr : ProvenancePtr) (n nestedSz : Nat)
+    (entry : BorrowEntry) (rootVal : Value)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
+    (hTy : operandTy localDecls layouts op = .some srcTy)
+    (hSpec : unsizeArrayToSliceSpec? srcTy.kind (slicePtrTargetKind isDstRef dstMut dstElem) =
+      .some n)
+    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hNoAgg :
+      readSliceBackingAggregate? locals' rootVal entry.targetProjection n
+        (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
+        .none)
+    (hNestedPtr :
+      readProjectedValue locals' rootVal entry.targetProjection = .ok (.ptr nestedPtr nestedSz)) :
+    evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal n (layoutPointerBytes layouts)) locals' mem ∧
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal n (layoutPointerBytes layouts)) locals' mem := by
+  have hOk :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts =
+        .ok (LWidePtr.encodeProv ptrVal n (layoutPointerBytes layouts)) locals' mem := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
+      simp only [hOp, Nat.beq_refl, hBorrow, hTy, hSpec, hRoot, hNoAgg, hNestedPtr,
+        LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
+  exact ⟨hOk, hOk⟩
+
+/-- Untyped-operand fallback (`operandTy = .none`) on a stack-borrowed ZST `.unit` slot
+(`Places.lean:13496–13508`): four-way two-sided characterization; succeeds with length `0` iff
+`ptrVal.offsetBytes = 0`, and faults with `.ub` iff `ptrVal.offsetBytes ≠ 0`. -/
+theorem trusted_evalUnsizeCoercion_untyped_zst_unit_iff
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (ptrVal : ProvenancePtr) (entry : BorrowEntry) (rootVal : Value)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some entry)
+    (hPerm : unsizeBorrowPermValid entry.perm dstMut = true)
+    (hUntyped : operandTy localDecls layouts op = .none)
+    (hRoot : get? locals' entry.targetLocal = .some (.init rootVal))
+    (hNoAgg :
+      readSliceBackingAggregate? locals' rootVal entry.targetProjection 0
+        (tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }) =
+        .none)
+    (hUnit : readProjectedValue locals' rootVal entry.targetProjection = .ok .unit) :
+    (evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal 0 (layoutPointerBytes layouts)) locals' mem ↔
+      Nat.beq ptrVal.offsetBytes 0 = true) ∧
+    (evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts = .ub ↔
+      Nat.beq ptrVal.offsetBytes 0 = false) ∧
+    (evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts =
+      .ok (LWidePtr.encodeProv ptrVal 0 (layoutPointerBytes layouts)) locals' mem ↔
+      Nat.beq ptrVal.offsetBytes 0 = true) ∧
+    (evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub ↔
+      Nat.beq ptrVal.offsetBytes 0 = false) := by
+  have hStep :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts =
+        match Nat.beq ptrVal.offsetBytes 0 with
+        | true => .ok (LWidePtr.encodeProv ptrVal 0 (layoutPointerBytes layouts)) locals' mem
+        | false => .ub := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    rcases entry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    cases isDstRef <;> cases dstMut <;> cases perm <;> (try cases hPerm) <;>
+      simp only [hOp, Nat.beq_refl, hBorrow, hUntyped, hRoot, hNoAgg, hUnit,
+        LWidePtr.encodeProv, Bool.and_true, Bool.not_false] <;> rfl
+  exact rvalueOk_and_ub_four_iff_of_bool_match _ _ _ _ rfl hStep
+
+/-- Untyped-operand fallback (`operandTy = .none`) on a global allocation (`Places.lean:13512–13545`):
+faults with `.ub` whenever the global is read-only and the target is mutable, `ptrVal.offsetBytes`
+exceeds `length alloc.bytes`, `elemSz = 0`, or either `ptrVal.offsetBytes` or the remaining byte
+count is not a multiple of `elemSz`. -/
+theorem trusted_evalUnsizeCoercion_untyped_global_alloc_ub
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (isDstRef : Bool) (dstMut : Mutability) (dstElem : RigidTy) (dstLIdx : LayoutIdx)
+    (ptrVal : ProvenancePtr) (alloc : CapturedAllocation)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
+    (hUntyped : operandTy localDecls layouts op = .none)
+    (hGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .some alloc)
+    (hBad :
+      (dstMut = .mut ∧ alloc.mutability = .not) ∨
+      Nat.ble ptrVal.offsetBytes (length alloc.bytes) = false ∨
+      tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } =
+        .some 0 ∨
+      (∃ elemSz,
+        tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } =
+          .some elemSz ∧
+        (byteOffsetToElemIdx? ptrVal.offsetBytes elemSz = .none ∨
+         byteOffsetToElemIdx? (Nat.sub (length alloc.bytes) ptrVal.offsetBytes) elemSz = .none))) :
+    evalUnsizeCoercion locals op
+        { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+        mem localDecls layouts = .ub ∧
+    evalRvalue locals
+        (.cast (.pointerCoercion "Unsize") op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx })
+        mem localDecls layouts = .ub := by
+  have hUb :
+      evalUnsizeCoercion locals op
+          { kind := slicePtrTargetKind isDstRef dstMut dstElem, layoutIdx := dstLIdx }
+          mem localDecls layouts = .ub := by
+    unfold evalUnsizeCoercion
+    dsimp only [slicePtrTargetKind] at *
+    rcases alloc with ⟨allocId, bytes, relocations, align, mutability⟩
+    dsimp only at hBad
+    cases isDstRef <;>
+      simp only [hOp, Nat.beq_refl, hNoBorrow, hUntyped, hGlobal, Bool.and_true]
+    all_goals
+      rcases hBad with ⟨rfl, rfl⟩ | hOff | hZst | ⟨elemSz, hSz, hMisOff | hMisRem⟩
+      · rfl
+      · cases dstMut <;> cases mutability <;> simp only [hOff, Bool.and_false] <;> rfl
+      · cases dstMut <;> cases mutability <;>
+          cases Nat.ble ptrVal.offsetBytes (length bytes) <;>
+          simp only [hZst, Bool.and_true, Bool.and_false] <;> rfl
+      · cases dstMut <;> cases mutability <;>
+          cases Nat.ble ptrVal.offsetBytes (length bytes) <;>
+          simp only [hSz, hMisOff, Bool.and_true, Bool.and_false] <;>
+          (try cases Nat.beq elemSz 0) <;> rfl
+      · cases dstMut <;> cases mutability <;>
+          cases Nat.ble ptrVal.offsetBytes (length bytes) <;>
+          simp only [hSz, hMisRem, Bool.and_true, Bool.and_false] <;>
+          (try cases Nat.beq elemSz 0) <;>
+          (try cases byteOffsetToElemIdx? ptrVal.offsetBytes elemSz) <;> rfl
+  exact ⟨hUb, hUb⟩
+
 /-- Exact two-sided (`↔`) characterization of `rawPtrUnsizeArrayToSliceLen?` on raw pointer array
 types (`*const [T; N]` / `*mut [T; N]` -> `*const [U]` / `*mut [U]`). -/
 theorem rawPtrUnsizeArrayToSliceLen?_eq_some_iff
@@ -15699,6 +15903,88 @@ theorem deriveStackElemThinPtr_fresh_subslice
   all_goals first
     | exact absurd rfl hPerm
     | (simp only [hRoot, hRead, hOff, hBound, hFresh] <;> rfl)
+
+/-- `deriveStackElemThinPtr` already-subslice identity (`Places.lean:13652–13653`): when the
+container projection already ends with a `.subslice` covering the exact `[0 .. length elems)` window
+(`elemOffset = 0 ∧ n = length elems`), `deriveStackElemThinPtr` returns `.ok (.ptr ptrVal ptrBytes)
+locals mem` unchanged without allocating a fresh tag (`mem.nextTag` is not incremented). -/
+theorem deriveStackElemThinPtr_already_subslice
+    (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry)
+    (n ptrBytes : Nat) (rootVal : Value) (containerProj : List ProjectionElem) (baseIdx : Nat)
+    (elems : List Value) (rawElemOffset : Nat)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : get? locals parentEntry.targetLocal = .some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals rootVal
+        (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection)) n =
+      .some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? ptrVal.offsetBytes (inferElemListByteStride elems) =
+      .some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) n) (length elems) = true)
+    (hAlready : Bool.and (endsWithSubslice containerProj)
+        (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq n (length elems))) = true) :
+    deriveStackElemThinPtr locals mem ptrVal parentEntry (.some n) ptrBytes =
+      .ok (.ptr ptrVal ptrBytes) locals mem := by
+  unfold deriveStackElemThinPtr
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  dsimp only at hPerm hRoot hRead ⊢
+  cases perm
+  all_goals first
+    | exact absurd rfl hPerm
+    | (simp only [hRoot, hRead, hOff, hBound, hAlready] <;> rfl)
+
+/-- `deriveStackElemThinPtr` on an uninitialized union array field (`Places.lean:13677–13691`):
+when `readSliceBackingAggregate? = .none`, `readProjectedValue = .ok .unit`, and the normalized
+projection starts with `.field fIdx fTy` and has trailing array capacity `cap ≥ 1`, the cast
+succeeds preserving `ptrVal` iff `ptrVal.offsetBytes = 0 ∧ n ≤ cap`, and faults with `.ub`
+otherwise. -/
+theorem deriveStackElemThinPtr_uninit_union_field_array_iff
+    (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry)
+    (n ptrBytes : Nat) (rootVal : Value) (fIdx : Nat) (fTy : Ty) (rest : List ProjectionElem)
+    (cap : Nat)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : get? locals parentEntry.targetLocal = .some (.init rootVal))
+    (hNorm : normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection) =
+      .field fIdx fTy :: rest)
+    (hNoAgg : readSliceBackingAggregate? locals rootVal (.field fIdx fTy :: rest) n = .none)
+    (hUnit : readProjectedValue locals rootVal (.field fIdx fTy :: rest) = .ok .unit)
+    (hCap : projLastFieldArrayCap? (.field fIdx fTy :: rest) = .some cap)
+    (hPosCap : Nat.ble 1 cap = true) :
+    (deriveStackElemThinPtr locals mem ptrVal parentEntry (.some n) ptrBytes =
+      .ok (.ptr ptrVal ptrBytes) locals mem ↔
+      Bool.and (Nat.beq ptrVal.offsetBytes 0) (Nat.ble n cap) = true) ∧
+    (deriveStackElemThinPtr locals mem ptrVal parentEntry (.some n) ptrBytes = .ub ↔
+      Bool.and (Nat.beq ptrVal.offsetBytes 0) (Nat.ble n cap) = false) := by
+  have hStep :
+      deriveStackElemThinPtr locals mem ptrVal parentEntry (.some n) ptrBytes =
+        match Bool.and (Nat.beq ptrVal.offsetBytes 0) (Nat.ble n cap) with
+        | true => .ok (.ptr ptrVal ptrBytes) locals mem
+        | false => .ub := by
+    unfold deriveStackElemThinPtr
+    rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+    dsimp only at hPerm hRoot hNorm ⊢
+    cases perm
+    all_goals first
+      | exact absurd rfl hPerm
+      | (simp only [hRoot, hNorm, hNoAgg, hUnit, hCap, hPosCap] <;> rfl)
+  rw [hStep]
+  exact rvalueOk_and_ub_iff_of_bool_match _ _ _ _
+
+/-- `deriveStackElemThinPtr` faults with `.ub` whenever the borrow entry is `.disabled` or the
+target local slot is `.uninit` or `.dead`. -/
+theorem deriveStackElemThinPtr_disabled_or_uninit_or_dead_ub
+    (locals : List LocalSlot) (mem : Memory) (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry)
+    (elemCountOpt : Option Nat) (ptrBytes : Nat)
+    (hBad : parentEntry.perm = .disabled ∨
+      get? locals parentEntry.targetLocal = .some .uninit ∨
+      get? locals parentEntry.targetLocal = .some .dead) :
+    deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt ptrBytes = .ub := by
+  unfold deriveStackElemThinPtr
+  rcases parentEntry with ⟨tag, tLoc, tProj, perm, rOff, rLen, prot, pTag⟩
+  dsimp only at hBad ⊢
+  rcases hBad with rfl | hSlot | hSlot
+  · rfl
+  · cases perm <;> simp only [hSlot] <;> rfl
+  · cases perm <;> simp only [hSlot] <;> rfl
 
 /-- `Value` is a reifiable zero-sized function-item / closure value (`.unit` or `.aggregate 0 []`). -/
 def isReifyZstValue : Value → Bool
@@ -16635,6 +16921,60 @@ theorem trusted_evalRvalue_ptrToPtr_dyn_to_slice_ub
   cases Bool.and (Nat.beq sz (layoutPointerBytes layouts))
     (Nat.beq vtSz (layoutPointerBytes layouts)) <;>
     cases isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) <;> rfl
+
+/-- Exact characterization of `arrayPtrOrRefElemLen?` on `*const [T; N]` / `*mut [T; N]` /
+`&[T; N]` / `&mut [T; N]` vs `dstElem` (`Places.lean:17912–17922`). -/
+theorem arrayPtrOrRefElemLen?_rawPtr_or_ref
+    (srcMut : Mutability) (srcElem dstElem : RigidTy) (arrLen : Nat) (lIdx : LayoutIdx) :
+    arrayPtrOrRefElemLen? (.some { kind := .rawPtr srcMut (.array srcElem arrLen), layoutIdx := lIdx })
+        dstElem =
+      (match rigidTyEq srcElem dstElem with | true => .some arrLen | false => .none) ∧
+    arrayPtrOrRefElemLen? (.some { kind := .ref srcMut (.array srcElem arrLen), layoutIdx := lIdx })
+        dstElem =
+      (match rigidTyEq srcElem dstElem with | true => .some arrLen | false => .none) :=
+  ⟨rfl, rfl⟩
+
+/-- **Thin -> thin stack-borrowed array-to-element `PtrToPtr` narrowing**
+(`*const [T; N] as *const T` on a stack borrow, `Places.lean:17969–17972`): refines to
+`deriveStackElemThinPtr` with element count `arrLen`. -/
+theorem trusted_evalRvalue_ptrToPtr_thin_array_stack_borrow
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
+    (dstElem : RigidTy) (arrLen : Nat) (parentEntry : BorrowEntry)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hThin : thinRawPtrPointee? targetTy = .some dstElem)
+    (hArr : arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem = .some arrLen)
+    (hBorrow : lookupBorrow mem.borrows ptrVal.tag = .some parentEntry) :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen)
+        (layoutPointerBytes layouts) := by
+  rw [trusted_evalRvalue_ptrToPtr_thin_ptr_eq locals locals' op targetTy mem localDecls layouts
+    ptrVal _ hOp, Nat.beq_refl, hThin]
+  dsimp only
+  rw [hArr, hBorrow]
+
+/-- **Thin -> thin non-array or unborrowed `PtrToPtr`**: when `thinRawPtrPointee? targetTy = .some dstElem`
+and either the source is not an array of `dstElem` (`arrayPtrOrRefElemLen? = .none`) or the pointer
+is unborrowed (`lookupBorrow = .none`), `PtrToPtr` is the identity on `.ptr ptrVal ptrBytes`. -/
+theorem trusted_evalRvalue_ptrToPtr_thin_nonarray_or_unborrowed
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrVal : ProvenancePtr)
+    (dstElem : RigidTy)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals')
+    (hThin : thinRawPtrPointee? targetTy = .some dstElem)
+    (hId : arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem = .none ∨
+      lookupBorrow mem.borrows ptrVal.tag = .none) :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      .ok (.ptr ptrVal (layoutPointerBytes layouts)) locals' mem := by
+  rw [trusted_evalRvalue_ptrToPtr_thin_ptr_eq locals locals' op targetTy mem localDecls layouts
+    ptrVal _ hOp, Nat.beq_refl, hThin]
+  dsimp only
+  rcases hId with hNoArr | hNoBor
+  · rw [hNoArr]
+  · rw [hNoBor]
+    cases arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem <;> rfl
 
 end WidePtrSliceAndFnPtrCast
 
