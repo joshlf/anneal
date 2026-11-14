@@ -6,11 +6,12 @@
 > All semantics live in the overlay `theory/Anneal/TcbCorrespondenceDiv8AndFloatPrototype.lean`;
 > the regression/audit suite is `scripts/test_tcb_correspondence_div8_proto.py`.
 
-Status: **B2 adversarial critique & hardening pass** (to be finalized in round A4 with the GO /
-CONDITIONAL GO / NO-GO recommendation). All declarations of the overlay (including all 99 pinned
-headline theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero
-`Classical.choice`, zero `sorry`, zero `native_decide` (see §5). The overlay is differentially
-tested against the unpatched `Trusted` stepper on all 235 MiniRust witness bodies (§2b).
+Status: **A2 critique & fix pass** (to be finalized in round A4 with the GO / CONDITIONAL GO /
+NO-GO recommendation). All declarations of the overlay (including all 101 pinned headline
+theorems) are kernel-checked with axioms `⊆ {propext, Quot.sound}` — zero `Classical.choice`,
+zero `sorry`, zero `native_decide` (see §5). The overlay is differentially tested against the
+unpatched `Trusted` stepper on all 235 MiniRust witness bodies × 3 argument vectors (705 runs),
+and its agreement on 114 single-function bodies is a kernel theorem (§2b).
 
 ## 1. What was built
 
@@ -118,8 +119,12 @@ transliteration of `Miri.Interpreter.FloatBits.decode`), `roundQuotientTiesToEve
 
 `CorpusDifferentialTests` runs `runMirProto` and the unpatched `Trusted` stepper (`runA` /
 `faultsA`) on every `def _ : CapturedMir` of `Witness`, `PointerWitness`, `RefWitness`,
-`TbWitness`, and `ProvenanceWitness` (all corpus bodies as callees, default scalar
-arguments), and pins the outcome classes:
+`TbWitness`, and `ProvenanceWitness` (all corpus bodies as callees) under three scalar
+argument vectors — small positive (`5`, `true`, `'A'`), all-zero bits, and all-one bits
+(`-1` / `MAX`, `char::MAX`) — 705 runs in total, and pins every outcome class. Default
+vector shown; the all-zero / all-one vectors give 139 + 10 and 133 + 16 identical outcomes
+with exactly the same 7 divergent bodies (values pinned per vector in
+`EXPECTED_CORPUS_DIVERGENCES`) and the same 30 fail-closed bodies:
 
 | Outcome | Bodies |
 |---------|--------|
@@ -144,7 +149,15 @@ fixes: `argCountMismatchCaller` (UB vs 5; `argCountMismatch_minirust_ub`) and
 fail-closed bodies are exactly the unmodeled exposed-provenance / int-to-pointer casts (19),
 `transmute` (8), array-element `PtrToPtr` re-derivation (1), and sub-local byte offsets (2).
 No body yields a definite overlay result where `Trusted` is indefinite.
-`overlay_coverage_canaries` re-proves 15 of these agreements (values and UB) in the kernel.
+
+**Kernel-checked:** `corpus_agreement_kernel` proves by `decide +kernel` that the overlay and
+the unpatched `Trusted` stepper produce the same outcome (same pointer-abstracted value, or
+UB) on all 114 single-function corpus bodies that agree at the default arguments
+(`corpusAgreementBodies`, cross-checked against the differential by
+`test_kernel_agreement_list_consistent`); `overlay_coverage_canaries` pins 15 representative
+values / UB verdicts; `corpus_out_of_fragment_fixes` re-proves the `argCountMismatchCaller` /
+`uninitProjCallDestCaller` fixes with their callees; the frame-bug divergences are headline
+theorems (items 1–2, `div_mr_call_ref_mut_protected_roundtrip_agrees`).
 
 ## 3. Track A edit plan (draft)
 
@@ -200,12 +213,13 @@ No body yields a definite overlay result where `Trusted` is indefinite.
   and `.inf neg` (plus negative-finite gradual underflow to `-0.0`,
   `0xB690_0000_0000_0000 ↦ 0x8000_0000`); both cast bundles state that every int→float cast
   and every finite float→float conversion *is* `roundRatioTiesToEven` of the exact source value.
-* `CastKind` wiring: `castKind_end_to_end` (`runMirProto` on real `Rvalue.cast` bodies);
+* `CastKind` wiring: `castKind_end_to_end` (`runMirProto` on real `Rvalue.cast` bodies, every
+  conjunct proved by `rfl`);
   unpatched `Trusted.evalRvalue` returns `.unsupported` (`castKind_trusted_unsupported`).
 
 ## 5. Axiom hygiene (zero `Classical.choice`)
 
-* `#guard_msgs in #print axioms` pins all 99 headline theorems (§7 of the Lean file); the
+* `#guard_msgs in #print axioms` pins all 101 headline theorems (§7 of the Lean file); the
   audit suite replays `#print axioms` for **every** `theorem` / `def` of the file.
 * Lean `v4.34.1` core lemmas that silently pull `Classical.choice` and were replaced by
   constructive versions: `Nat.pow_lt_pow_right`, `Nat.pow_lt_pow_iff_right`,

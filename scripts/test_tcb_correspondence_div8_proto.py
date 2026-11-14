@@ -193,6 +193,9 @@ HEADLINE_THEOREMS = (
     "hasProtectedLocalBorrowProto_disableLocalBorrowsProto",
     "roundRatioTiesToEven_overflow_iff",
     "roundRatioBits_sign_and_underflow_zero_preserved",
+    # A2: kernel-checked corpus agreement and out-of-fragment fixes
+    "corpus_agreement_kernel",
+    "corpus_out_of_fragment_fixes",
 )
 
 
@@ -226,25 +229,43 @@ CORPUS_MODULES = {
     "ProvenanceWitness.lean": "MiniRustSpec.Correspondence.ProvenanceWitness",
 }
 CORPUS_PREFIX = "MiniRustSpec.Correspondence."
+# Argument vectors (see `argOfTy`): small positive, all-zero bits, all-one bits.
+CORPUS_ARG_VARIANTS = (0, 1, 2)
 
 # Bodies on which the prototype and the unpatched `Trusted` stepper both produce a
 # definite outcome (value or UB) but disagree. Each entry is (prototype, Trusted) and is
 # justified by an upstream MiniRust ground-truth theorem that the prototype agrees with.
 EXPECTED_CORPUS_DIVERGENCES = {
-    # DIV-MR-CALL-TARGET-LOCAL (`callerRefMutSilentWrongLocal_divergence`: Mach/MachTB = 42).
-    "ProvenanceWitness.callerRefMutSilentWrongLocalMir": ("ok 42/4", "ok 137/4"),
+    # DIV-MR-CALL-TARGET-LOCAL (`callerRefMutSilentWrongLocal_divergence`: Mach/MachTB = 42 at
+    # x = 5): the callee's `*r = *r + 37` lands in the caller's `x`; Trusted returns 137.
+    "ProvenanceWitness.callerRefMutSilentWrongLocalMir#0": ("ok 42/4", "ok 137/4"),
+    "ProvenanceWitness.callerRefMutSilentWrongLocalMir#1": ("ok 37/4", "ok 137/4"),
+    "ProvenanceWitness.callerRefMutSilentWrongLocalMir#2": ("ok 36/4", "ok 137/4"),
     # DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL (Mach/MachTB = 42).
-    "ProvenanceWitness.callerBorrowAcrossScalarCallMir": ("ok 42/4", "ub"),
-    # Same frame-qualification bug (`callRefMutProtectedRoundTrip_mach_and_tb`: 84).
-    "ProvenanceWitness.callerRefMutProtectedMir": ("ok 84/4", "ub"),
+    "ProvenanceWitness.callerBorrowAcrossScalarCallMir#0": ("ok 42/4", "ub"),
+    "ProvenanceWitness.callerBorrowAcrossScalarCallMir#1": ("ok 42/4", "ub"),
+    "ProvenanceWitness.callerBorrowAcrossScalarCallMir#2": ("ok 42/4", "ub"),
+    # Same frame-qualification bug (`callRefMutProtectedRoundTrip_mach_and_tb`: 84 at x = 5).
+    "ProvenanceWitness.callerRefMutProtectedMir#0": ("ok 84/4", "ub"),
+    "ProvenanceWitness.callerRefMutProtectedMir#1": ("ok 74/4", "ub"),
+    "ProvenanceWitness.callerRefMutProtectedMir#2": ("ok 72/4", "ub"),
     # Same frame-qualification bug; the call writes its result to the borrowed `_1`.
-    "ProvenanceWitness.callerRefMutProtectedBadCallDstMir": ("ok 42/4", "ub"),
+    "ProvenanceWitness.callerRefMutProtectedBadCallDstMir#0": ("ok 42/4", "ub"),
+    "ProvenanceWitness.callerRefMutProtectedBadCallDstMir#1": ("ok 37/4", "ub"),
+    "ProvenanceWitness.callerRefMutProtectedBadCallDstMir#2": ("ok 36/4", "ub"),
     # DIV-MR-TB-FNENTRY-LOCAL-DEALLOC (`retagFnEntryLocalDeallocUb_tb_direct`: UB).
-    "RefWitness.retagFnEntryLocalDeallocUb": ("ub", "ok 5/4"),
+    "RefWitness.retagFnEntryLocalDeallocUb#0": ("ub", "ok 5/4"),
+    "RefWitness.retagFnEntryLocalDeallocUb#1": ("ub", "ok 0/4"),
+    "RefWitness.retagFnEntryLocalDeallocUb#2": ("ub", "ok 4294967295/4"),
     # `argCountMismatch_minirust_ub`: MiniRust reports a call-ABI arity violation.
-    "Witness.argCountMismatchCaller": ("ub", "ok 5/4"),
-    # `uninitProjCallDest_minirust_ret`: MiniRust writes the field of the uninit tuple.
-    "Witness.uninitProjCallDestCaller": ("ok 251/1", "ub"),
+    "Witness.argCountMismatchCaller#0": ("ub", "ok 5/4"),
+    "Witness.argCountMismatchCaller#1": ("ub", "ok 5/4"),
+    "Witness.argCountMismatchCaller#2": ("ub", "ok 5/4"),
+    # `uninitProjCallDest_minirust_ret`: MiniRust writes the field of the uninit tuple
+    # (`neg_i8(5) = 251` at x = 5).
+    "Witness.uninitProjCallDestCaller#0": ("ok 251/1", "ub"),
+    "Witness.uninitProjCallDestCaller#1": ("ok 0/1", "ub"),
+    "Witness.uninitProjCallDestCaller#2": ("ok 1/1", "ub"),
 }
 
 # Bodies that `Trusted` evaluates definitively but on which the prototype fails closed
@@ -293,25 +314,30 @@ namespace TcbDiv8ProtoCorpus
 open Trusted.Rustc.V2026_06_01 Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.TcbCorrespondenceDiv8AndFloatPrototype
 
-def defaultArgOfTy : RigidTy → Option Value
-  | .bool => some (.scalar ⟨1, 1⟩)
-  | .char => some (.scalar ⟨0x41, 4⟩)
-  | .uint .u8 => some (.scalar ⟨5, 1⟩)
-  | .int .i8 => some (.scalar ⟨5, 1⟩)
-  | .uint .u16 => some (.scalar ⟨5, 2⟩)
-  | .int .i16 => some (.scalar ⟨5, 2⟩)
-  | .uint .u32 => some (.scalar ⟨5, 4⟩)
-  | .int .i32 => some (.scalar ⟨5, 4⟩)
-  | .uint .u64 => some (.scalar ⟨5, 8⟩)
-  | .int .i64 => some (.scalar ⟨5, 8⟩)
-  | .uint .usize => some (.scalar ⟨5, 8⟩)
-  | .int .isize => some (.scalar ⟨5, 8⟩)
-  | .uint .u128 => some (.scalar ⟨5, 16⟩)
-  | .int .i128 => some (.scalar ⟨5, 16⟩)
+/-- Argument vectors: `0` = small positive (`5`, `true`, `'A'`), `1` = all-zero bits,
+`2` = all-one bits (`-1` / `MAX`, `true`, `char::MAX`). -/
+def scalarArg (variant bytes : Nat) : Value :=
+  .scalar ⟨match variant with | 0 => 5 | 1 => 0 | _ => 2 ^ (8 * bytes) - 1, bytes⟩
+
+def argOfTy (variant : Nat) : RigidTy → Option Value
+  | .bool => some (.scalar ⟨match variant with | 1 => 0 | _ => 1, 1⟩)
+  | .char => some (.scalar ⟨match variant with | 0 => 0x41 | 1 => 0 | _ => 0x10FFFF, 4⟩)
+  | .uint .u8 => some (scalarArg variant 1)
+  | .int .i8 => some (scalarArg variant 1)
+  | .uint .u16 => some (scalarArg variant 2)
+  | .int .i16 => some (scalarArg variant 2)
+  | .uint .u32 => some (scalarArg variant 4)
+  | .int .i32 => some (scalarArg variant 4)
+  | .uint .u64 => some (scalarArg variant 8)
+  | .int .i64 => some (scalarArg variant 8)
+  | .uint .usize => some (scalarArg variant 8)
+  | .int .isize => some (scalarArg variant 8)
+  | .uint .u128 => some (scalarArg variant 16)
+  | .int .i128 => some (scalarArg variant 16)
   | _ => none
 
-def defaultArgs (body : CapturedMir) : Option (List Value) :=
-  ((body.localDecls.drop 1).take body.argCount).mapM (fun d => defaultArgOfTy d.ty.kind)
+def argsFor (variant : Nat) (body : CapturedMir) : Option (List Value) :=
+  ((body.localDecls.drop 1).take body.argCount).mapM (fun d => argOfTy variant d.ty.kind)
 
 partial def valStr : Value → String
   | .unit => "unit"
@@ -333,10 +359,12 @@ def trustedClass (callees : List CapturedMir) (body : CapturedMir) (args : List 
     if MiniRustSpec.Correspondence.faultsA body 256 (initMachineStateWithCallees body args callees)
     then "ub" else "none"
 
-def line (callees : List CapturedMir) (name : String) (body : CapturedMir) : String :=
-  match defaultArgs body with
-  | none => s!"CORPUS|{name}|skip|skip"
-  | some a => s!"CORPUS|{name}|{protoClass (runMirProto body callees a)}|{trustedClass callees body a}"
+def line (callees : List CapturedMir) (variant : Nat) (name : String) (body : CapturedMir) :
+    String :=
+  match argsFor variant body with
+  | none => s!"CORPUS|{name}#{variant}|skip|skip"
+  | some a =>
+    s!"CORPUS|{name}#{variant}|{protoClass (runMirProto body callees a)}|{trustedClass callees body a}"
 """
 
 
@@ -354,7 +382,10 @@ def corpus_harness_lines(bodies: list[str]) -> list[str]:
     lines = [CORPUS_LEAN, "def corpus : List CapturedMir := [", "  " + ",\n  ".join(bodies) + "]"]
     lines.append("end TcbDiv8ProtoCorpus")
     for b in bodies:
-        lines.append(f'#eval IO.println (TcbDiv8ProtoCorpus.line TcbDiv8ProtoCorpus.corpus "{b}" {b})')
+        for variant in CORPUS_ARG_VARIANTS:
+            lines.append(
+                f'#eval IO.println (TcbDiv8ProtoCorpus.line TcbDiv8ProtoCorpus.corpus {variant} "{b}" {b})'
+            )
     return lines
 
 
@@ -904,43 +935,58 @@ class KernelReplayTests(unittest.TestCase):
 
 
 class CorpusDifferentialTests(unittest.TestCase):
-    """Prototype vs. unpatched `Trusted` on every MiniRust witness body (default args)."""
+    """Prototype vs. unpatched `Trusted` on every MiniRust witness body, three argument vectors."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.results = _parse_corpus(_HarnessCache.get().stdout)
         cls.bodies = [b.removeprefix(CORPUS_PREFIX) for b in corpus_bodies()]
+        cls.keys = [f"{b}#{v}" for b in cls.bodies for v in CORPUS_ARG_VARIANTS]
 
     def test_every_corpus_body_executed(self) -> None:
         self.assertGreater(len(self.bodies), 200)
-        missing = [b for b in self.bodies if b not in self.results]
-        self.assertEqual(missing, [], f"corpus bodies without a result: {missing}")
+        missing = [k for k in self.keys if k not in self.results]
+        self.assertEqual(missing, [], f"corpus runs without a result: {missing}")
 
     def test_no_unexpected_definite_divergence(self) -> None:
         unexpected = {}
-        for body, (proto, trusted) in self.results.items():
+        for key, (proto, trusted) in self.results.items():
             if proto != trusted and _definite(proto) and _definite(trusted):
-                if EXPECTED_CORPUS_DIVERGENCES.get(body) != (proto, trusted):
-                    unexpected[body] = (proto, trusted)
+                if EXPECTED_CORPUS_DIVERGENCES.get(key) != (proto, trusted):
+                    unexpected[key] = (proto, trusted)
         self.assertEqual(unexpected, {}, f"unexpected prototype/Trusted divergences: {unexpected}")
 
     def test_expected_divergences_observed(self) -> None:
-        for body, expected in EXPECTED_CORPUS_DIVERGENCES.items():
-            self.assertEqual(self.results.get(body), expected, body)
+        for key, expected in EXPECTED_CORPUS_DIVERGENCES.items():
+            self.assertEqual(self.results.get(key), expected, key)
 
     def test_fail_closed_boundary(self) -> None:
-        fail_closed = {
-            body for body, (proto, trusted) in self.results.items()
-            if not _definite(proto) and _definite(trusted)
-        }
-        self.assertEqual(sorted(fail_closed - FAIL_CLOSED_CORPUS), [],
-                         "prototype newly fails closed where Trusted is definite")
-        self.assertEqual(sorted(FAIL_CLOSED_CORPUS - fail_closed), [],
-                         "stale FAIL_CLOSED_CORPUS entries (now executed: shrink the allowlist)")
+        for variant in CORPUS_ARG_VARIANTS:
+            fail_closed = {
+                key.rsplit("#", 1)[0] for key, (proto, trusted) in self.results.items()
+                if key.endswith(f"#{variant}") and not _definite(proto) and _definite(trusted)
+            }
+            self.assertEqual(sorted(fail_closed - FAIL_CLOSED_CORPUS), [],
+                             f"prototype newly fails closed where Trusted is definite (#{variant})")
+            self.assertEqual(sorted(FAIL_CLOSED_CORPUS - fail_closed), [],
+                             f"stale FAIL_CLOSED_CORPUS entries (#{variant}; shrink the allowlist)")
+
+    def test_kernel_agreement_list_consistent(self) -> None:
+        """`corpusAgreementBodies` (kernel-checked by `corpus_agreement_kernel`) lists exactly
+        the single-function bodies that agree at the default arguments."""
+        source = LEAN_FILE.read_text(encoding="utf-8")
+        m = re.search(r"def corpusAgreementBodies : List CapturedMir := \[(.*?)\]", source, re.S)
+        self.assertIsNotNone(m)
+        kernel = [n.strip().removeprefix(CORPUS_PREFIX) for n in m.group(1).split(",") if n.strip()]
+        self.assertGreaterEqual(len(kernel), 100)
+        self.assertEqual(len(kernel), len(set(kernel)))
+        for body in kernel:
+            proto, trusted = self.results[f"{body}#0"]
+            self.assertTrue(proto == trusted and _definite(proto), f"{body}: {proto} vs {trusted}")
 
     def test_no_definite_prototype_result_where_trusted_is_indefinite(self) -> None:
         extra = {
-            body: res for body, res in self.results.items()
+            key: res for key, res in self.results.items()
             if _definite(res[0]) and res[1] in ("none", "other")
         }
         self.assertEqual(extra, {}, f"prototype defines behavior Trusted does not: {extra}")

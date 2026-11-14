@@ -3977,6 +3977,218 @@ theorem hasProtectedLocalBorrowProto_disableLocalBorrowsProto
       · exact hother (Or.inr hl)
     · exact hother (Or.inl hd)
 
+
+/-! ### Kernel-checked corpus agreement with the unpatched `Trusted` stepper -/
+
+/-- Default scalar argument of a corpus body parameter (`5`, `true`, `'A'`). -/
+def corpusArgOfTy : RigidTy → Option Value
+  | .bool => .some (.scalar ⟨1, 1⟩)
+  | .char => .some (.scalar ⟨0x41, 4⟩)
+  | .uint .u8 => .some (.scalar ⟨5, 1⟩)
+  | .int .i8 => .some (.scalar ⟨5, 1⟩)
+  | .uint .u16 => .some (.scalar ⟨5, 2⟩)
+  | .int .i16 => .some (.scalar ⟨5, 2⟩)
+  | .uint .u32 => .some (.scalar ⟨5, 4⟩)
+  | .int .i32 => .some (.scalar ⟨5, 4⟩)
+  | .uint .u64 => .some (.scalar ⟨5, 8⟩)
+  | .int .i64 => .some (.scalar ⟨5, 8⟩)
+  | .uint .usize => .some (.scalar ⟨5, 8⟩)
+  | .int .isize => .some (.scalar ⟨5, 8⟩)
+  | .uint .u128 => .some (.scalar ⟨5, 16⟩)
+  | .int .i128 => .some (.scalar ⟨5, 16⟩)
+  | _ => .none
+
+/-- Default scalar arguments of a corpus body (`none` for non-scalar parameters). -/
+def corpusArgs (body : CapturedMir) : Option (List Value) :=
+  ((body.localDecls.drop 1).take body.argCount).mapM (fun d => corpusArgOfTy d.ty.kind)
+
+mutual
+/-- Pointer-abstracting serialization of a `Value` (provenance tags are
+implementation-specific, so pointers keep only their width). -/
+def corpusEncodeVal : Value → List Nat
+  | .unit => [0]
+  | .scalar sc => [1, sc.bits, sc.sizeBytes]
+  | .ptr _ sz => [2, sz]
+  | .aggregate i vs => 3 :: i :: vs.length :: corpusEncodeVals vs
+/-- Serialization of a field list. -/
+def corpusEncodeVals : List Value → List Nat
+  | [] => []
+  | v :: vs => corpusEncodeVal v ++ corpusEncodeVals vs
+end
+
+/-- Outcome class of a run: a (pointer-abstracted) returned value, UB, or indefinite
+(unsupported / out of fuel). -/
+inductive CorpusOutcome : Type where
+  | ok (enc : List Nat) : CorpusOutcome
+  | ub : CorpusOutcome
+  | indefinite : CorpusOutcome
+  deriving DecidableEq
+
+/-- Overlay outcome class (no callees). -/
+def protoCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
+  match runMirProto body [] args with
+  | .ok v => .ok (corpusEncodeVal v)
+  | .ub => .ub
+  | _ => .indefinite
+
+/-- Unpatched `Trusted` outcome class (`runA` / `faultsA`, fuel `256`, no callees). -/
+def trustedCorpusOutcome (body : CapturedMir) (args : List Value) : CorpusOutcome :=
+  match runA body 256 (initMachineStateWithCallees body args []) with
+  | .some (_, .normal (v, _)) => .ok (corpusEncodeVal v)
+  | .some _ => .indefinite
+  | .none =>
+    match faultsA body 256 (initMachineStateWithCallees body args []) with
+    | true => .ub
+    | false => .indefinite
+
+/-- The overlay and the unpatched `Trusted` stepper agree on `body` at its default args. -/
+def corpusAgrees (body : CapturedMir) : Bool :=
+  match corpusArgs body with
+  | .some args => decide (protoCorpusOutcome body args = trustedCorpusOutcome body args)
+  | .none => false
+
+/-- The single-function MiniRust witness bodies (default scalar arguments) on which the
+overlay and the unpatched `Trusted` stepper both produce a definite outcome. -/
+def corpusAgreementBodies : List CapturedMir := [
+    MiniRustSpec.Correspondence.Witness.sumTo,
+    MiniRustSpec.Correspondence.Witness.retUninit,
+    MiniRustSpec.Correspondence.Witness.negMention,
+    MiniRustSpec.Correspondence.Witness.signedEdge,
+    MiniRustSpec.Correspondence.Witness.castBitNot,
+    MiniRustSpec.Correspondence.Witness.divRemI8,
+    MiniRustSpec.Correspondence.Witness.remOnlyI8,
+    MiniRustSpec.Correspondence.Witness.uncheckedArithI8,
+    MiniRustSpec.Correspondence.Witness.shiftI8,
+    MiniRustSpec.Correspondence.Witness.shlUncheckedI8,
+    MiniRustSpec.Correspondence.Witness.bitwiseI8,
+    MiniRustSpec.Correspondence.Witness.heteroShiftSwitch,
+    MiniRustSpec.Correspondence.Witness.uninitOperandUb,
+    MiniRustSpec.Correspondence.Witness.cmpNotSwitch,
+    MiniRustSpec.Correspondence.Witness.leNeGe,
+    MiniRustSpec.Correspondence.Witness.boolCastI8,
+    MiniRustSpec.Correspondence.Witness.uninitBool,
+    MiniRustSpec.Correspondence.Witness.uninitBoolNot,
+    MiniRustSpec.Correspondence.Witness.uninitBoolRel,
+    MiniRustSpec.Correspondence.Witness.cmpSel,
+    MiniRustSpec.Correspondence.Witness.uninitOrdering,
+    MiniRustSpec.Correspondence.Witness.uninitBoolBitAnd,
+    MiniRustSpec.Correspondence.Witness.uninitBoolBitOrRhs,
+    MiniRustSpec.Correspondence.Witness.checkedTupleU32,
+    MiniRustSpec.Correspondence.Witness.uninitTupleField0,
+    MiniRustSpec.Correspondence.Witness.uninitTupleField1,
+    MiniRustSpec.Correspondence.Witness.tempMove,
+    MiniRustSpec.Correspondence.Witness.deadRead,
+    MiniRustSpec.Correspondence.Witness.moveReuse,
+    MiniRustSpec.Correspondence.Witness.crossBlockMove,
+    MiniRustSpec.Correspondence.Witness.crossBlockMoveReuse,
+    MiniRustSpec.Correspondence.Witness.unmarkedTempAssign,
+    MiniRustSpec.Correspondence.Witness.loopTempMove,
+    MiniRustSpec.Correspondence.Witness.loopBackEdgeReuse,
+    MiniRustSpec.Correspondence.Witness.deadAssign,
+    MiniRustSpec.Correspondence.Witness.deadDeinit,
+    MiniRustSpec.Correspondence.Witness.deadPlaceMention,
+    MiniRustSpec.Correspondence.Witness.storageDeadRet,
+    MiniRustSpec.Correspondence.Witness.sameRvalueMoveReuse,
+    MiniRustSpec.Correspondence.Witness.moveRetPlace,
+    MiniRustSpec.Correspondence.Witness.storageLiveArgRet,
+    MiniRustSpec.Correspondence.Witness.storageDeadArg,
+    MiniRustSpec.Correspondence.Witness.storageDeadArgReadAfter,
+    MiniRustSpec.Correspondence.Witness.diamondMoveJoin,
+    MiniRustSpec.Correspondence.Witness.diamondHalfMoveReuse,
+    MiniRustSpec.Correspondence.Witness.tupleAggCastMove,
+    MiniRustSpec.Correspondence.Witness.projFieldMoveReuse,
+    MiniRustSpec.Correspondence.Witness.ordBoolCastTempMove,
+    MiniRustSpec.Correspondence.Witness.negI8Callee,
+    MiniRustSpec.Correspondence.Witness.flipBoolCallee,
+    MiniRustSpec.Correspondence.Witness.chainLeaf,
+    MiniRustSpec.Correspondence.Witness.idU32Callee,
+    MiniRustSpec.Correspondence.Witness.divTenI8Callee,
+    MiniRustSpec.Correspondence.Witness.cAbiCallee,
+    MiniRustSpec.Correspondence.Witness.badCallConvCallee,
+    MiniRustSpec.Correspondence.Witness.badCallConvSysvBody,
+    MiniRustSpec.Correspondence.Witness.idI8Callee,
+    MiniRustSpec.Correspondence.Witness.const5Callee,
+    MiniRustSpec.Correspondence.Witness.retUninitCallee,
+    MiniRustSpec.Correspondence.Witness.assumeSub,
+    MiniRustSpec.Correspondence.Witness.assumeChainCallee,
+    MiniRustSpec.Correspondence.Witness.assumeDeadLocal,
+    MiniRustSpec.Correspondence.Witness.assumeMoveReuse,
+    MiniRustSpec.Correspondence.Witness.assumeAfterMove,
+    MiniRustSpec.Correspondence.Witness.cmpDiscrSwitch,
+    MiniRustSpec.Correspondence.PointerWitness.ptrRoundTrip,
+    MiniRustSpec.Correspondence.PointerWitness.ptrCountdown,
+    MiniRustSpec.Correspondence.PointerWitness.constBorrowLoop,
+    MiniRustSpec.Correspondence.PointerWitness.uninitPtrReadUb,
+    MiniRustSpec.Correspondence.PointerWitness.uninitPtrWriteUb,
+    MiniRustSpec.Correspondence.PointerWitness.deadPtrReadUb,
+    MiniRustSpec.Correspondence.PointerWitness.uninitPtrOffsetUb,
+    MiniRustSpec.Correspondence.PointerWitness.derefWriteRhsUb,
+    MiniRustSpec.Correspondence.PointerWitness.dangling,
+    MiniRustSpec.Correspondence.PointerWitness.directWrite,
+    MiniRustSpec.Correspondence.PointerWitness.frozenWrite,
+    MiniRustSpec.Correspondence.RefWitness.refSharedRead,
+    MiniRustSpec.Correspondence.RefWitness.refMutRoundTrip,
+    MiniRustSpec.Correspondence.RefWitness.refMutReborrowWrite,
+    MiniRustSpec.Correspondence.RefWitness.refLoopCountdown,
+    MiniRustSpec.Correspondence.RefWitness.uninitRefReadUb,
+    MiniRustSpec.Correspondence.RefWitness.uninitRefReborrowUb,
+    MiniRustSpec.Correspondence.RefWitness.refMutDivZeroUb,
+    MiniRustSpec.Correspondence.RefWitness.danglingRef,
+    MiniRustSpec.Correspondence.RefWitness.refTwoPhaseBorrowRoundTrip,
+    MiniRustSpec.Correspondence.RefWitness.twoPhaseForeignWriteDiscrepancy,
+    MiniRustSpec.Correspondence.RefWitness.twoPhaseDirectWriteTreeBorrowsGap,
+    MiniRustSpec.Correspondence.RefWitness.frozenRefMutReborrow,
+    MiniRustSpec.Correspondence.RefWitness.disabledRefReborrow,
+    MiniRustSpec.Correspondence.RefWitness.childReborrowWriteDisablesParent,
+    MiniRustSpec.Correspondence.RefWitness.retagRefReborrowChain,
+    MiniRustSpec.Correspondence.RefWitness.retagUninitRefUb,
+    MiniRustSpec.Correspondence.RefWitness.retagFnEntryProtectorWrite,
+    MiniRustSpec.Correspondence.RefWitness.retagDisabledRefDiscrepancy,
+    MiniRustSpec.Correspondence.RefWitness.retagScalarDiscrepancy,
+    MiniRustSpec.Correspondence.RefWitness.frozenRefMutReborrowWrite,
+    MiniRustSpec.Correspondence.RefWitness.retagTrulyDisabledRefUb,
+    MiniRustSpec.Correspondence.RefWitness.misalignedRaw,
+    MiniRustSpec.Correspondence.RefWitness.rawAddrOfUninit,
+    MiniRustSpec.Correspondence.RefWitness.retagRawOnRefLocal,
+    MiniRustSpec.Correspondence.TbWitness.swapRefs,
+    MiniRustSpec.Correspondence.TbWitness.derefCopyUninitSrcUb,
+    MiniRustSpec.Correspondence.TbWitness.derefWriteMoveUninitUb,
+    MiniRustSpec.Correspondence.TbWitness.boolMutRefToggle,
+    MiniRustSpec.Correspondence.TbWitness.selfDerefCopyOk,
+    MiniRustSpec.Correspondence.TbWitness.parentDerefCopyDisablesChild,
+    MiniRustSpec.Correspondence.TbWitness.loopDerefCopyCountdown,
+    MiniRustSpec.Correspondence.TbWitness.unitTupleMutRefRoundTrip,
+    MiniRustSpec.Correspondence.TbWitness.storageCycleDisablesBorrowUb,
+    MiniRustSpec.Correspondence.TbWitness.derefReadFreezesActiveMutUb,
+    MiniRustSpec.Correspondence.TbWitness.mutReborrowForeignReadRoundTrip,
+    MiniRustSpec.Correspondence.TbWitness.storageLiveReallocDisablesBorrowUb,
+    MiniRustSpec.Correspondence.ProvenanceWitness.assumeReborrowFalseUb,
+    MiniRustSpec.Correspondence.ProvenanceWitness.calleeScalarAssignLocal1Mir]
+
+/-- **Kernel-checked corpus agreement**: on every one of these single-function MiniRust
+witness bodies, the overlay `runMirProto` and the unpatched `Trusted` stepper (`runA` /
+`faultsA`) produce the same outcome — the same returned value (pointer tags abstracted) or
+UB — so the overlay's fixes do not perturb `Trusted`'s behavior outside the tracked
+divergences. -/
+theorem corpus_agreement_kernel : corpusAgreementBodies.all corpusAgrees = true := by
+  decide +kernel
+
+/-- **Out-of-fragment `Trusted` divergences fixed by the overlay** (found by the corpus
+differential): `argCountMismatchCaller` calls the 0-argument `const5Callee` with a
+mismatched argument list — the overlay faults with UB like MiniRust
+(`Witness.argCountMismatch_minirust_ub`: "call ABI violation") while `Trusted` returns `5`;
+`uninitProjCallDestCaller` writes a call result into a field of a live but uninitialized
+tuple — the overlay returns `neg_i8(5) = 251` like MiniRust
+(`Witness.uninitProjCallDest_minirust_ret`) while `Trusted` faults. -/
+theorem corpus_out_of_fragment_fixes :
+    runMirProto MiniRustSpec.Correspondence.Witness.argCountMismatchCaller [MiniRustSpec.Correspondence.Witness.const5Callee] [] = .ub ∧
+    trustedRunScalar? MiniRustSpec.Correspondence.Witness.argCountMismatchCaller [MiniRustSpec.Correspondence.Witness.const5Callee] [] 20 = .some (5, 4) ∧
+    runMirProto MiniRustSpec.Correspondence.Witness.uninitProjCallDestCaller [MiniRustSpec.Correspondence.Witness.negI8Callee] [.scalar ⟨5, 1⟩] =
+      .ok (.scalar ⟨251, 1⟩) ∧
+    trustedFaults MiniRustSpec.Correspondence.Witness.uninitProjCallDestCaller [MiniRustSpec.Correspondence.Witness.negI8Callee] [.scalar ⟨5, 1⟩] 20 = true := by
+  refine ⟨ProtoOutcome.eq_ub_of_isUB (by decide +kernel), by decide +kernel,
+    ProtoOutcome.eq_of_okScalar? (by decide +kernel), by decide +kernel⟩
+
 end PartAWitnesses
 
 /-! ## §5. Part B witnesses: IEEE-754 casts on raw bit patterns -/
@@ -4186,7 +4398,8 @@ def castBody (kind : CastKind) (srcDecl dstDecl : LocalDecl) : CapturedMir :=
 
 /-- **End-to-end MIR `Rvalue.cast`**: `2.7_f64 as i32 = 2`, `-2.7_f64 as i32 = -2`,
 `NaN as u32 = 0`, `16777217_u32 as f32 = 16777216.0`, `-1_i32 as f64 = -1.0`,
-`sNaN_f64 as f32 = qNaN`, `1e-50_f64 as f32 = 0.0`, and `f32::MAX as f64`. -/
+`sNaN_f64 as f32 = qNaN`, `1e-50_f64 as f32 = 0.0`, and `f32::MAX as f64` — each proved
+by `rfl` (definitional unfolding of `runMirProto` on the real `CapturedMir`). -/
 theorem castKind_end_to_end :
     runMirProto (castBody .floatToInt f64DeclP i32DeclP) [] [.scalar ⟨0x400599999999999A, 8⟩] =
       .ok (.scalar ⟨2, 4⟩) ∧
@@ -4204,10 +4417,7 @@ theorem castKind_end_to_end :
       .ok (.scalar ⟨0, 4⟩) ∧
     runMirProto (castBody .floatToFloat f32DeclP f64DeclP) [] [.scalar ⟨0x7F7FFFFF, 4⟩] =
       .ok (.scalar ⟨0x47EFFFFFE0000000, 8⟩) :=
-  ⟨ProtoOutcome.eq_of_okScalar? (by decide +kernel), ProtoOutcome.eq_of_okScalar? (by decide +kernel),
-   ProtoOutcome.eq_of_okScalar? (by decide +kernel), ProtoOutcome.eq_of_okScalar? (by decide +kernel),
-   ProtoOutcome.eq_of_okScalar? (by decide +kernel), ProtoOutcome.eq_of_okScalar? (by decide +kernel),
-   ProtoOutcome.eq_of_okScalar? (by decide +kernel), ProtoOutcome.eq_of_okScalar? (by decide +kernel)⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- The unpatched `Trusted.evalRvalue` has no float casts at all (`.unsupported`). -/
 theorem castKind_trusted_unsupported :
@@ -6375,6 +6585,14 @@ section AxiomGuards
 /-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.roundRatioBits_sign_and_underflow_zero_preserved' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms roundRatioBits_sign_and_underflow_zero_preserved
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.corpus_agreement_kernel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms corpus_agreement_kernel
+
+/-- info: 'Anneal.TcbCorrespondenceDiv8AndFloatPrototype.corpus_out_of_fragment_fixes' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms corpus_out_of_fragment_fixes
 
 end AxiomGuards
 
